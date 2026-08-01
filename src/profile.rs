@@ -35,9 +35,11 @@ impl Profile {
     pub fn idle_regex(&self) -> Result<Option<regex::Regex>> {
         match &self.idle_pattern {
             None => Ok(None),
-            Some(p) => Ok(Some(
-                regex::Regex::new(p).with_context(|| format!("idle_pattern 不是合法正则: {p}"))?,
-            )),
+            Some(p) => {
+                Ok(Some(regex::Regex::new(p).with_context(|| {
+                    format!("idle_pattern 不是合法正则: {p}")
+                })?))
+            }
         }
     }
 }
@@ -65,7 +67,9 @@ mod tests {
     #[test]
     fn builtin_claude_uses_bypass_flag() {
         let p = Profile::builtin("claude").unwrap();
-        assert!(p.command.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(p
+            .command
+            .contains(&"--dangerously-skip-permissions".to_string()));
         assert!(p.is_agent);
     }
 
