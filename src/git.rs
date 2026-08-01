@@ -80,7 +80,6 @@ pub fn remove_worktree(wt: &Worktree) -> Result<()> {
             wt.path.to_str().context("worktree 路径不是合法 UTF-8")?,
         ],
     )?;
-    let _ = git(&wt.repo, &["branch", "-D", &wt.branch]);
     Ok(())
 }
 
@@ -103,6 +102,8 @@ pub fn reset_to(wt: &Worktree, sha: &str) -> Result<()> {
 }
 
 pub fn diff_stat(wt: &Worktree, base: &str) -> Result<Vec<FileStat>> {
+    // 标记新文件意图（仅登记，不真正暂存），这样未跟踪的新文件也会出现在 diff 里
+    let _ = git(&wt.path, &["add", "-N", "."]);
     let out = git(&wt.path, &["diff", "--numstat", base])?;
     let mut stats = Vec::new();
     for line in out.lines() {
@@ -161,6 +162,13 @@ mod tests {
         assert!(wt.path.to_string_lossy().contains("dct-worktrees"));
         remove_worktree(&wt).unwrap();
         assert!(!wt.path.exists());
+        // 分支必须保留：上面存的是这个会话干的活
+        let branches = std::process::Command::new("git")
+            .args(["branch", "--list", "dct/s1"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branches.stdout).contains("dct/s1"));
     }
 
     #[test]
@@ -208,6 +216,25 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].path, "a.txt");
         assert_eq!(stats[0].added, 1);
+        assert_eq!(stats[0].removed, 0);
+    }
+
+    #[test]
+    fn diff_stat_includes_untracked_new_files() {
+        let repo = init_repo();
+        let wt = create_worktree(repo.path(), "s5").unwrap();
+        let base = checkpoint(&wt, "c0").unwrap();
+
+        fs::write(wt.path.join("brand-new.txt"), "one\ntwo\n").unwrap();
+
+        let stats = diff_stat(&wt, &base).unwrap();
+        assert_eq!(
+            stats.len(),
+            1,
+            "新建文件必须出现在 diff 里，实际: {stats:?}"
+        );
+        assert_eq!(stats[0].path, "brand-new.txt");
+        assert_eq!(stats[0].added, 2);
         assert_eq!(stats[0].removed, 0);
     }
 }
