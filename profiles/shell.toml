@@ -1,0 +1,3 @@
+name = "shell"
+command = ["/bin/zsh"]
+is_agent = false
