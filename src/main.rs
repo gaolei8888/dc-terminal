@@ -1,8 +1,4 @@
-mod git;
-mod profile;
-mod pty;
-mod session;
-
-fn main() {
+fn main() -> anyhow::Result<()> {
     println!("dct");
+    Ok(())
 }
