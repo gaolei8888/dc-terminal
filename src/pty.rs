@@ -84,14 +84,39 @@ impl PtySession {
                 self.alive.store(false, Ordering::SeqCst);
                 false
             }
-            _ => true,
+            Ok(None) => true,
+            Err(_) => {
+                // 子进程已经被回收（比如已经 wait 过一次），try_wait 会报错
+                // 而不是返回 Ok(Some(_))：这种情况也必须判定为已死，不能默认存活。
+                self.alive.store(false, Ordering::SeqCst);
+                false
+            }
         }
     }
 
     pub fn kill(&mut self) -> Result<()> {
-        self.child.lock().unwrap().kill().ok();
+        let mut child = self.child.lock().unwrap();
+        // portable-pty 在 unix 上的 kill() 先发 SIGHUP 并给约 200ms 宽限期
+        // 自行退出被回收；超时后退化为 SIGKILL，这条路径不会再 wait()。
+        // 因此这里必须显式 wait 一次，否则子进程会变成僵尸。
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(child);
         self.alive.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.lock().unwrap().process_id()
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        // 会话被丢弃时必须回收子进程，否则常驻的守护进程每关一个
+        // 会话就会留一个僵尸，直到进程重启才被清空。Drop 里不能 panic，
+        // 所有错误都吞掉。
+        let _ = self.kill();
     }
 }
 
@@ -142,5 +167,36 @@ mod tests {
             sleep(Duration::from_millis(50));
         }
         assert!(!p.is_alive());
+    }
+
+    #[test]
+    fn drop_reaps_child_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = {
+            let p = PtySession::spawn(&["cat".to_string()], dir.path(), 24, 80).unwrap();
+            p.write(b"alive\n").unwrap();
+            assert!(wait_for(&p, "alive"));
+            p.process_id().expect("需要拿到子进程 pid")
+        }; // 这里 drop
+
+        // 给 Drop 一点时间完成回收
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // 进程完全消失（ps 无输出）才算回收干净；Z 开头是僵尸
+            if stat.is_empty() {
+                break;
+            }
+            assert!(!stat.starts_with('Z'), "drop 之后子进程是僵尸: {stat}");
+            assert!(
+                Instant::now() < deadline,
+                "drop 之后子进程没有被回收: {stat}"
+            );
+            sleep(Duration::from_millis(50));
+        }
     }
 }
