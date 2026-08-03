@@ -220,6 +220,12 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
             continue;
         }
 
+        // 处理这次按键前拍个快照，处理完之后用来判断 message 该不该清——
+        // 见 message_after_transition 的注释。
+        let view_kind_before = std::mem::discriminant(&view);
+        let message_text_before = message.text.clone();
+        let message_error_before = message.error;
+
         // 必须 clone：分支里要给 view 赋值，match &view 会被借用检查器拒掉
         match view.clone() {
             View::Board => match key.code {
@@ -478,6 +484,13 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 }
             }
         }
+
+        // 视图变了就把上一屏的残留消息清掉，好让「按视图给提示」的 idle_help
+        // 露出来；除非这条消息本身就是这次切换的操作结果（见函数注释）。
+        let view_changed = std::mem::discriminant(&view) != view_kind_before;
+        let message_changed =
+            message.text != message_text_before || message.error != message_error_before;
+        message = message_after_transition(view_changed, message_changed, message);
     };
 
     res
@@ -660,6 +673,28 @@ fn act(
             Ok(Response::Error(e)) => Msg::err(e),
             _ => Msg::err("请求失败".into()),
         },
+    }
+}
+
+/// 视图切换后，底部消息该不该清掉。抽成纯函数是因为 `run()` 的按键循环里有
+/// 十几处给 `message` 赋值，没法在每处都补一行清空逻辑——漏一处就会有一个
+/// 视图继续顶着上一屏的残留话术（比如看板「已开会话 3」被 `Enter` 带进会话
+/// 视图后，盖住了「F2 回看板」的提示）。调用方在处理一次按键前后各拍一次
+/// 「视图种类」和「消息内容」的快照，传进来比较：
+///
+/// - 视图没变：这条规则不归它管，原样保留消息——哪怕消息也在这次按键里
+///   变了，那是当前视图自己的操作反馈（比如看板按 `d` 看改动）。
+/// - 视图变了、消息也跟着变了：这条新消息就是这次切换本身的结果反馈
+///   （比如手输路径 `Enter` 成功后的「已切到 X」），必须保留——清掉等于
+///   用户按了 `Enter` 什么反馈都没有。
+/// - 视图变了、消息没变：这条消息是切换前就挂在那儿的旧消息（比如
+///   「已开会话 3」还没被看一眼就被 `Enter` 带进了新视图），新视图不该继续
+///   顶着别的视图留下的话，清成空，好让「按视图给提示」的 `idle_help` 露出来。
+fn message_after_transition(view_changed: bool, message_changed: bool, message: Msg) -> Msg {
+    if view_changed && !message_changed {
+        "".into()
+    } else {
+        message
     }
 }
 
@@ -1479,6 +1514,32 @@ mod tests {
             )
         })
         .unwrap();
+    }
+
+    #[test]
+    fn message_after_transition_keeps_message_when_view_unchanged() {
+        // 视图没变：即便这次按键也顺手改了消息（比如看板按 d 看改动），
+        // 这条规则不该插手，原样保留。
+        let m = message_after_transition(false, true, "完成".into());
+        assert_eq!(m.text, "完成");
+    }
+
+    #[test]
+    fn message_after_transition_clears_stale_message_when_view_changes() {
+        // 视图变了，但消息跟按键之前一模一样——说明是更早挂上的旧消息
+        // （比如「已开会话 3」还没被看一眼就被 Enter 带进了会话），要清掉，
+        // 好让新视图自己的 idle_help 露出来。
+        let m = message_after_transition(true, false, "已开会话 3".into());
+        assert_eq!(m.text, "", "视图变了、消息是旧的，就该清空");
+    }
+
+    #[test]
+    fn message_after_transition_keeps_message_that_is_the_transition_result() {
+        // 视图变了，消息也跟着变了——这条新消息就是这次切换本身的结果反馈
+        // （比如手输路径 Enter 成功后的「已切到 X」），必须保留，
+        // 不然用户按了 Enter 什么反馈都看不到。
+        let m = message_after_transition(true, true, "已切到 ~/work/x".into());
+        assert_eq!(m.text, "已切到 ~/work/x");
     }
 
     #[test]
