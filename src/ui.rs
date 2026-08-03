@@ -367,7 +367,7 @@ fn draw(
             let project = sessions
                 .iter()
                 .find(|s| s.id == *id)
-                .map(|s| short_path(&s.project))
+                .map(|s| short_path(&s.dir))
                 .unwrap_or_default();
             let title = if connected {
                 format!("会话 {id} · {project} —— Esc 返回看板")
@@ -428,7 +428,7 @@ fn draw(
                         ),
                         Span::raw(format!("{:<10}", s.profile)),
                         Span::styled(
-                            format!("{:<22}", truncate(&short_path(&s.project), 22)),
+                            format!("{:<22}", truncate(&short_path(&s.dir), 22)),
                             Style::default().fg(Color::DarkGray),
                         ),
                         Span::raw(truncate(&s.activity, 60)),
@@ -553,8 +553,7 @@ mod tests {
             SessionInfo {
                 id: 1,
                 profile: "claude".into(),
-                dir: "/tmp/a/.git/dct-worktrees/s1".into(),
-                project: "/tmp/a".into(),
+                dir: "/tmp/a".into(),
                 state: SessionState::Working,
                 activity: "正在读取 src/main.rs".into(),
             },
@@ -562,7 +561,6 @@ mod tests {
                 id: 2,
                 profile: "shell".into(),
                 dir: "/tmp/b".into(),
-                project: "/tmp/b".into(),
                 state: SessionState::Asking,
                 activity: "要用哪个方案？".into(),
             },

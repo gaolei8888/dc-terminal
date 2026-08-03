@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::git::{self, FileStat, Worktree};
+use crate::git::{self, FileStat};
 use crate::profile::Profile;
 use crate::pty::{PtySession, ScreenSpan};
 
@@ -22,11 +22,8 @@ pub enum SessionState {
 pub struct SessionInfo {
     pub id: u32,
     pub profile: String,
-    /// agent 实际跑在里面的目录（worktree）。是内部实现细节，不该直接展示给用户。
+    /// agent 干活的目录，就是用户指定的真实项目目录。
     pub dir: String,
-    /// 用户当初指定的那个项目目录。界面上要显示的是这个——
-    /// 给用户看 `.git/dct-worktrees/s2` 只会让他不知道自己在哪。
-    pub project: String,
     pub state: SessionState,
     /// 这个 agent 此刻在干什么（屏幕最后一行有内容的文字）。
     /// 看板靠它做"扫一眼全局"，不需要打开每个会话。
@@ -37,8 +34,7 @@ struct Session {
     id: u32,
     profile: Profile,
     dir: PathBuf,
-    project: PathBuf,
-    worktree: Option<Worktree>,
+    is_agent: bool,
     checkpoints: Vec<String>,
     state: SessionState,
     idle_re: Option<regex::Regex>,
@@ -105,30 +101,26 @@ impl SessionManager {
         // 以下全是慢操作（可能牵扯好几个 git 子进程），刻意不持有任何锁：
         // 这个新会话在插入 `sessions` 之前，对其它请求完全不可见，
         // 没有并发正确性需要靠锁来保护。
-        let (workdir, worktree) = if profile.is_agent {
-            if !git::is_repo(dir) {
-                bail!("{} 不是 git 仓库，无法开 agent 会话", dir.display());
-            }
-            let wt = git::create_worktree(dir, &format!("s{id}"))?;
-            (wt.path.clone(), Some(wt))
-        } else {
-            (dir.to_path_buf(), None)
-        };
+        // agent 直接在用户的真实项目里干活。检查点是隐藏快照，不动分支和历史，
+        // 所以仍然要求是 git 仓库——没有 git 就没有撤销。
+        if profile.is_agent && !git::is_repo(dir) {
+            bail!("{} 不是 git 仓库，无法开 agent 会话", dir.display());
+        }
 
         let idle_re = profile.idle_regex()?;
-        let pty = PtySession::spawn(&profile.command, &workdir, 40, 120)?;
+        let is_agent = profile.is_agent;
+        let pty = PtySession::spawn(&profile.command, dir, 40, 120)?;
 
         let mut checkpoints = Vec::new();
-        if let Some(wt) = &worktree {
-            checkpoints.push(git::checkpoint(wt, "会话开始")?);
+        if is_agent {
+            checkpoints.push(git::checkpoint(dir, id, 0)?);
         }
 
         let session = Session {
             id,
             profile,
-            dir: workdir,
-            project: dir.to_path_buf(),
-            worktree,
+            dir: dir.to_path_buf(),
+            is_agent,
             checkpoints,
             state: SessionState::Working,
             idle_re,
@@ -167,7 +159,6 @@ impl SessionManager {
                     id: s.id,
                     profile: s.profile.name.clone(),
                     dir: s.dir.display().to_string(),
-                    project: s.project.display().to_string(),
                     state: s.state,
                     activity: s.pty.last_line(),
                 }
@@ -183,8 +174,8 @@ impl SessionManager {
         let is_enter = text.is_empty();
         self.with_session(id, |s| {
             if is_enter {
-                if let Some(wt) = &s.worktree {
-                    let sha = git::checkpoint(wt, "turn")?;
+                if s.is_agent {
+                    let sha = git::checkpoint(&s.dir, s.id, s.checkpoints.len())?;
                     if s.checkpoints.last() != Some(&sha) {
                         s.checkpoints.push(sha);
                     }
@@ -214,29 +205,27 @@ impl SessionManager {
 
     pub fn undo(&self, id: u32) -> Result<()> {
         self.with_session(id, |s| {
-            let wt = s
-                .worktree
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("shell 会话没有检查点"))?;
+            if !s.is_agent {
+                anyhow::bail!("这个会话没有检查点");
+            }
             let sha = s
                 .checkpoints
                 .last()
                 .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
-            git::reset_to(wt, sha)
+            git::restore(&s.dir, sha)
         })
     }
 
     pub fn diff(&self, id: u32) -> Result<Vec<FileStat>> {
         self.with_session(id, |s| {
-            let wt = s
-                .worktree
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("shell 会话没有 diff"))?;
+            if !s.is_agent {
+                anyhow::bail!("这个会话没有改动记录");
+            }
             let base = s
                 .checkpoints
                 .last()
                 .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
-            git::diff_stat(wt, base)
+            git::diff_stat(&s.dir, base)
         })
     }
 
@@ -306,19 +295,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_session_runs_in_worktree_not_main_tree() {
+    fn agent_session_runs_in_the_real_project_dir() {
+        // agent 就在用户的真项目里干活，不再是某个副本——不然干完的活
+        // 躺在一条分支上，用户拿不回来。
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
         let id = m.create(repo.path(), "fake").unwrap();
 
         let dir = m.list().iter().find(|s| s.id == id).unwrap().dir.clone();
-        assert!(
-            dir.contains("dct-worktrees"),
-            "会话必须跑在 worktree 里，实际是 {dir}"
+        let want = repo.path().canonicalize().unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(&dir).canonicalize().unwrap(),
+            want,
+            "会话目录必须就是用户给的项目目录，实际是 {dir}"
         );
+        assert!(!dir.contains("dct-worktrees"), "不该再建副本了：{dir}");
     }
-
     #[test]
     fn rejects_agent_session_outside_repo() {
         let plain = tempfile::tempdir().unwrap();

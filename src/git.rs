@@ -1,14 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-#[derive(Debug, Clone)]
-pub struct Worktree {
-    pub path: PathBuf,
-    pub branch: String,
-    pub repo: PathBuf,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileStat {
@@ -31,6 +24,21 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .with_context(|| format!("执行 git {args:?} 失败"))?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn is_repo(dir: &Path) -> bool {
     Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -40,105 +48,49 @@ pub fn is_repo(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn create_worktree(repo: &Path, name: &str) -> Result<Worktree> {
-    if !is_repo(repo) {
-        bail!("{} 不是 git 仓库，无法开 agent 会话", repo.display());
+/// 给项目当前状态拍一张隐藏快照，返回快照的 commit sha。
+///
+/// **不动用户的分支、提交历史和暂存区**——agent 在你的真项目里干活，
+/// 检查点不能顺手往你的历史里塞一堆 commit。做法是用一个临时索引把当前
+/// 全部内容（含未跟踪文件，尊重 .gitignore）写成一个 tree，再造一个游离的
+/// commit，最后用 refs/dct/... 挂住防止被 gc 回收。用户 `git log` 里看不到它。
+pub fn checkpoint(dir: &Path, session: u32, seq: usize) -> Result<String> {
+    let index = git(dir, &["rev-parse", "--git-dir"])
+        .map(|d| dir.join(d).join(format!("dct-index-{session}")))?;
+    let index = index
+        .to_str()
+        .context("索引路径不是合法 UTF-8")?
+        .to_string();
+
+    git_env(dir, &["add", "-A"], &[("GIT_INDEX_FILE", &index)])?;
+    let tree = git_env(dir, &["write-tree"], &[("GIT_INDEX_FILE", &index)])?;
+
+    let head = git(dir, &["rev-parse", "HEAD"]).ok();
+    let mut args: Vec<&str> = vec!["commit-tree", &tree, "-m", "dct checkpoint"];
+    if let Some(h) = head.as_deref() {
+        args.push("-p");
+        args.push(h);
     }
-    let root = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?);
+    let commit = git(dir, &args)?;
 
-    // 会话编号在守护进程重启后会从 1 重来，而上次留下的分支和 worktree
-    // 按设计是不清理的（保住 agent 干过的活）。所以名字必须自动避让，
-    // 否则重启后每次新建都必然撞名失败。
-    let (branch, path) = free_name(&root, name)?;
-
-    git(
-        &root,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            &branch,
-            path.to_str().context("worktree 路径不是合法 UTF-8")?,
-        ],
-    )
-    .with_context(|| format!("在 {} 里建工作副本失败", root.display()))?;
-
-    Ok(Worktree {
-        path,
-        branch,
-        repo: root,
-    })
+    let refname = format!("refs/dct/{session}/{seq}");
+    git(dir, &["update-ref", &refname, &commit])?;
+    Ok(commit)
 }
 
-fn branch_exists(root: &Path, branch: &str) -> bool {
-    Command::new("git")
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .current_dir(root)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// 找一个既没有同名分支、目录也不存在的名字。`s3` 被占了就试 `s3-2`、`s3-3`……
-fn free_name(root: &Path, name: &str) -> Result<(String, PathBuf)> {
-    // 放在 .git 里面：主工作树的 git status 看不见它，git clean -fd 也不会误删
-    let base = root.join(".git").join("dct-worktrees");
-    for i in 1..1000 {
-        let candidate = if i == 1 {
-            name.to_string()
-        } else {
-            format!("{name}-{i}")
-        };
-        let branch = format!("dct/{candidate}");
-        let path = base.join(&candidate);
-        if !branch_exists(root, &branch) && !path.exists() {
-            return Ok((branch, path));
-        }
-    }
-    bail!("这个仓库里遗留的会话工作副本太多了，清理一些再试")
-}
-
-pub fn remove_worktree(wt: &Worktree) -> Result<()> {
-    git(
-        &wt.repo,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            wt.path.to_str().context("worktree 路径不是合法 UTF-8")?,
-        ],
-    )?;
+/// 恢复到某张快照：工作区内容和暂存区都回到拍照那一刻，
+/// 快照之后新建的文件被清掉。分支和提交历史不受影响。
+pub fn restore(dir: &Path, commit: &str) -> Result<()> {
+    let tree = format!("{commit}^{{tree}}");
+    git(dir, &["read-tree", "-u", "--reset", &tree])?;
+    git(dir, &["clean", "-fdq"])?;
     Ok(())
 }
 
-pub fn checkpoint(wt: &Worktree, label: &str) -> Result<String> {
-    git(&wt.path, &["add", "-A"])?;
-    let dirty = !git(&wt.path, &["status", "--porcelain"])?.is_empty();
-    if dirty {
-        git(
-            &wt.path,
-            &["commit", "-q", "-m", &format!("checkpoint: {label}")],
-        )?;
-    }
-    git(&wt.path, &["rev-parse", "HEAD"])
-}
-
-pub fn reset_to(wt: &Worktree, sha: &str) -> Result<()> {
-    git(&wt.path, &["reset", "--hard", "-q", sha])?;
-    git(&wt.path, &["clean", "-fdq"])?;
-    Ok(())
-}
-
-pub fn diff_stat(wt: &Worktree, base: &str) -> Result<Vec<FileStat>> {
+pub fn diff_stat(dir: &Path, base: &str) -> Result<Vec<FileStat>> {
     // 标记新文件意图（仅登记，不真正暂存），这样未跟踪的新文件也会出现在 diff 里
-    let _ = git(&wt.path, &["add", "-N", "."]);
-    let out = git(&wt.path, &["diff", "--numstat", base])?;
+    let _ = git(dir, &["add", "-N", "."]);
+    let out = git(dir, &["diff", "--numstat", base])?;
     let mut stats = Vec::new();
     for line in out.lines() {
         let cols: Vec<&str> = line.split('\t').collect();
@@ -179,6 +131,15 @@ mod tests {
         dir
     }
 
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
     #[test]
     fn detects_repo() {
         let repo = init_repo();
@@ -188,87 +149,84 @@ mod tests {
     }
 
     #[test]
-    fn creates_and_removes_worktree() {
+    fn restore_undoes_changes_including_new_files() {
         let repo = init_repo();
-        let wt = create_worktree(repo.path(), "s1").unwrap();
-        assert!(wt.path.join("a.txt").exists());
-        assert_eq!(wt.branch, "dct/s1");
-        assert!(wt.path.to_string_lossy().contains("dct-worktrees"));
-        remove_worktree(&wt).unwrap();
-        assert!(!wt.path.exists());
-        // 分支必须保留：上面存的是这个会话干的活
-        let branches = std::process::Command::new("git")
-            .args(["branch", "--list", "dct/s1"])
+        let base = checkpoint(repo.path(), 1, 0).unwrap();
+
+        fs::write(repo.path().join("a.txt"), "agent 改的\n").unwrap();
+        fs::write(repo.path().join("new.txt"), "agent 新建的\n").unwrap();
+
+        restore(repo.path(), &base).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(
+            !repo.path().join("new.txt").exists(),
+            "新建的文件必须被清掉"
+        );
+    }
+
+    #[test]
+    fn checkpoint_does_not_touch_branch_or_history() {
+        // 这是"在真项目里干活"的前提：检查点不能往用户的历史里塞东西
+        let repo = init_repo();
+        let before_head = git_out(repo.path(), &["rev-parse", "HEAD"]);
+        let before_count = git_out(repo.path(), &["rev-list", "--count", "HEAD"]);
+        let before_branch = git_out(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        fs::write(repo.path().join("a.txt"), "改了\n").unwrap();
+        checkpoint(repo.path(), 7, 0).unwrap();
+        fs::write(repo.path().join("b.txt"), "又加了一个\n").unwrap();
+        checkpoint(repo.path(), 7, 1).unwrap();
+
+        assert_eq!(git_out(repo.path(), &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            git_out(repo.path(), &["rev-list", "--count", "HEAD"]),
+            before_count,
+            "用户的提交历史里不能多出任何东西"
+        );
+        assert_eq!(
+            git_out(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            before_branch
+        );
+        // 工作区内容也不能被检查点动过
+        assert_eq!(
+            fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "改了\n"
+        );
+        assert!(repo.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn checkpoint_snapshots_are_kept_alive_after_gc() {
+        // 快照是游离 commit，必须靠 refs/dct 挂住，否则 gc 一跑撤销就失效
+        let repo = init_repo();
+        fs::write(repo.path().join("a.txt"), "v1\n").unwrap();
+        let snap = checkpoint(repo.path(), 3, 0).unwrap();
+
+        Command::new("git")
+            .args(["gc", "--prune=now", "--aggressive", "-q"])
             .current_dir(repo.path())
             .output()
             .unwrap();
-        assert!(String::from_utf8_lossy(&branches.stdout).contains("dct/s1"));
-    }
 
-    #[test]
-    fn checkpoint_then_reset_discards_changes() {
-        let repo = init_repo();
-        let wt = create_worktree(repo.path(), "s2").unwrap();
-
-        let base = checkpoint(&wt, "before").unwrap();
-
-        fs::write(wt.path.join("a.txt"), "changed\n").unwrap();
-        fs::write(wt.path.join("new.txt"), "new\n").unwrap();
-
-        reset_to(&wt, &base).unwrap();
-
+        fs::write(repo.path().join("a.txt"), "v2\n").unwrap();
+        restore(repo.path(), &snap).expect("gc 之后快照必须还在");
         assert_eq!(
-            fs::read_to_string(wt.path.join("a.txt")).unwrap(),
-            "hello\n"
+            fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "v1\n"
         );
-        assert!(!wt.path.join("new.txt").exists());
-    }
-
-    #[test]
-    fn checkpoint_commits_pending_changes() {
-        let repo = init_repo();
-        let wt = create_worktree(repo.path(), "s3").unwrap();
-        let first = checkpoint(&wt, "c0").unwrap();
-
-        fs::write(wt.path.join("a.txt"), "v2\n").unwrap();
-        let second = checkpoint(&wt, "c1").unwrap();
-
-        assert_ne!(first, second);
-        // 提交之后工作区干净，再 checkpoint 应当返回同一个 sha
-        let third = checkpoint(&wt, "c2").unwrap();
-        assert_eq!(second, third);
-    }
-
-    #[test]
-    fn reuses_name_by_suffixing_when_branch_exists() {
-        // 守护进程重启后会话编号从 1 重来，而分支按设计不清理。
-        // 同一个名字必须能自动避让，否则重启后每次新建都失败。
-        let repo = init_repo();
-        let a = create_worktree(repo.path(), "s1").unwrap();
-        assert_eq!(a.branch, "dct/s1");
-
-        let b = create_worktree(repo.path(), "s1").unwrap();
-        assert_eq!(
-            b.branch, "dct/s1-2",
-            "撞名时必须自动换一个，实际 {}",
-            b.branch
-        );
-        assert!(b.path.exists());
-        assert_ne!(a.path, b.path);
-
-        // 原来那个必须原封不动——它上面是 agent 干过的活
-        assert!(a.path.exists());
-        assert!(branch_exists(&a.repo, "dct/s1"));
     }
 
     #[test]
     fn diff_stat_reports_changes() {
         let repo = init_repo();
-        let wt = create_worktree(repo.path(), "s4").unwrap();
-        let base = checkpoint(&wt, "c0").unwrap();
-        fs::write(wt.path.join("a.txt"), "hello\nworld\n").unwrap();
+        let base = checkpoint(repo.path(), 4, 0).unwrap();
+        fs::write(repo.path().join("a.txt"), "hello\nworld\n").unwrap();
 
-        let stats = diff_stat(&wt, &base).unwrap();
+        let stats = diff_stat(repo.path(), &base).unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].path, "a.txt");
         assert_eq!(stats[0].added, 1);
@@ -278,12 +236,10 @@ mod tests {
     #[test]
     fn diff_stat_includes_untracked_new_files() {
         let repo = init_repo();
-        let wt = create_worktree(repo.path(), "s5").unwrap();
-        let base = checkpoint(&wt, "c0").unwrap();
+        let base = checkpoint(repo.path(), 5, 0).unwrap();
+        fs::write(repo.path().join("brand-new.txt"), "one\ntwo\n").unwrap();
 
-        fs::write(wt.path.join("brand-new.txt"), "one\ntwo\n").unwrap();
-
-        let stats = diff_stat(&wt, &base).unwrap();
+        let stats = diff_stat(repo.path(), &base).unwrap();
         assert_eq!(
             stats.len(),
             1,
@@ -291,6 +247,5 @@ mod tests {
         );
         assert_eq!(stats[0].path, "brand-new.txt");
         assert_eq!(stats[0].added, 2);
-        assert_eq!(stats[0].removed, 0);
     }
 }
