@@ -68,6 +68,15 @@ enum View {
     Board,
     Attached(u32),
     PickProfile(Vec<String>),
+    PickProject {
+        /// 守护进程返回的完整列表，过滤不改动它
+        all: Vec<String>,
+        /// 用户打的字
+        filter: String,
+        state: ListState,
+        /// Some 表示正处在「手输路径」的输入态
+        typing_path: Option<String>,
+    },
 }
 
 /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
@@ -145,10 +154,12 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
             let area = term.size()?;
             let rows = area.height.saturating_sub(2 + 3);
             let cols = area.width.saturating_sub(2);
-            if sent_size != Some((id, rows, cols)) && rows > 0 && cols > 0 {
-                if client.call(Request::Resize { id, rows, cols }).is_ok() {
-                    sent_size = Some((id, rows, cols));
-                }
+            if sent_size != Some((id, rows, cols))
+                && rows > 0
+                && cols > 0
+                && client.call(Request::Resize { id, rows, cols }).is_ok()
+            {
+                sent_size = Some((id, rows, cols));
             }
             match client.call(Request::Screen { id }) {
                 Ok(Response::Screen { lines, cursor }) => {
@@ -183,10 +194,20 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         let ev = event::read()?;
         // 粘贴整段一次发完，不能拆成一个个字符
         if let Event::Paste(text) = ev {
-            if let View::Attached(id) = view {
-                if !text.is_empty() && client.call(Request::Input { id, text }).is_err() {
-                    message = Msg::err("守护进程连不上，粘贴的内容没发出去".into());
+            match &mut view {
+                View::Attached(id) => {
+                    if !text.is_empty() && client.call(Request::Input { id: *id, text }).is_err() {
+                        message = Msg::err("守护进程连不上，粘贴的内容没发出去".into());
+                    }
                 }
+                // 手输路径态：粘贴直接进输入框。从别处拷一条路径粘进来一步到位，
+                // 这是不做目录浏览器的底气。trim 掉换行——从终端或文件管理器
+                // 拷路径经常带一个尾随换行，不去掉会拼出一个不存在的目录。
+                View::PickProject {
+                    typing_path: Some(buf),
+                    ..
+                } => buf.push_str(text.trim()),
+                _ => {}
             }
             continue;
         }
@@ -206,6 +227,30 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 KeyCode::Char('n') => {
                     if let Ok(Response::Profiles(p)) = client.call(Request::Profiles) {
                         view = View::PickProfile(p);
+                    }
+                }
+                KeyCode::Char('p') => {
+                    // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
+                    // 自己从来没开过项目。
+                    match client.call(Request::Projects) {
+                        Ok(Response::Projects(mut all)) => {
+                            // 全新守护进程列表是空的，补上启动目录，
+                            // 保证第一次用也不会看到空列表。
+                            let start = start_dir.display().to_string();
+                            if !all.contains(&start) {
+                                all.push(start);
+                            }
+                            let mut state = ListState::default();
+                            state.select(Some(0));
+                            view = View::PickProject {
+                                all,
+                                filter: String::new(),
+                                state,
+                                typing_path: None,
+                            };
+                        }
+                        Ok(Response::Error(e)) => message = Msg::err(e),
+                        _ => message = Msg::err("拿不到项目列表".into()),
                     }
                 }
                 KeyCode::Enter => {
@@ -259,6 +304,144 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     }
                 }
                 _ => {}
+            },
+            View::PickProject {
+                all,
+                mut filter,
+                mut state,
+                typing_path,
+            } => match typing_path {
+                // ——手输路径态：可见字符全进输入框，不再当过滤用——
+                Some(mut buf) => match key.code {
+                    KeyCode::Esc => {
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: None,
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let p = expand_path(&buf, &start_dir);
+                        if p.is_dir() {
+                            // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
+                            message =
+                                format!("已切到 {}", short_path(&p.display().to_string())).into();
+                            current_dir = p;
+                            view = View::Board;
+                        } else {
+                            // 不是 git 仓库这件事不在这里判——留给 create()
+                            message = Msg::err(format!("{} 不是一个目录", p.display()));
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: Some(buf),
+                            };
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: Some(buf),
+                        };
+                    }
+                    KeyCode::Char(c) => {
+                        buf.push(c);
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: Some(buf),
+                        };
+                    }
+                    _ => {
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: Some(buf),
+                        }
+                    }
+                },
+                // ——列表态——
+                None => match key.code {
+                    KeyCode::Esc => view = View::Board,
+                    KeyCode::Down | KeyCode::Up => {
+                        let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                        // +1 是末行那个「手输路径…」，它不参与过滤，永远在
+                        let n = filter_projects(&all, &filter).len() + 1;
+                        move_sel_n(&mut state, n, delta);
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: None,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        let shown = filter_projects(&all, &filter);
+                        let i = state.selected().unwrap_or(0);
+                        if i >= shown.len() {
+                            // 选中的是末行「手输路径…」
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: Some(String::new()),
+                            };
+                        } else {
+                            let p = PathBuf::from(&shown[i]);
+                            if p.is_dir() {
+                                message = format!("已切到 {}", short_path(&shown[i])).into();
+                                current_dir = p;
+                                view = View::Board;
+                            } else {
+                                // 列表里那条不删——可能只是外置盘没挂
+                                message =
+                                    Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
+                                view = View::PickProject {
+                                    all,
+                                    filter,
+                                    state,
+                                    typing_path: None,
+                                };
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        state.select(Some(0));
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: None,
+                        };
+                    }
+                    KeyCode::Char(c) => {
+                        filter.push(c);
+                        // 过滤变了就回到第一项，否则光标可能停在已被过滤掉的行号上
+                        state.select(Some(0));
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: None,
+                        };
+                    }
+                    _ => {
+                        view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: None,
+                        }
+                    }
+                },
             },
             View::Attached(id) => {
                 // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
@@ -536,6 +719,69 @@ fn draw(
                 chunks[0],
             );
         }
+        View::PickProject {
+            all,
+            filter,
+            state,
+            typing_path,
+        } => {
+            if let Some(buf) = typing_path {
+                f.render_widget(
+                    Paragraph::new(format!("{buf}▌")).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(border_style)
+                            .title("输入项目路径（Enter 确认，Esc 返回列表）"),
+                    ),
+                    chunks[0],
+                );
+            } else {
+                let shown = filter_projects(all, filter);
+                let mut items: Vec<ListItem> = shown
+                    .iter()
+                    .map(|p| {
+                        let short = short_path(p);
+                        let name = std::path::Path::new(p)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| short.clone());
+                        ListItem::new(Line::from(vec![
+                            Span::raw(format!("{:<20}", truncate(&name, 20))),
+                            Span::styled(
+                                truncate(&short, 50),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]))
+                    })
+                    .collect();
+                // 兜底入口不参与过滤，永远在最后一行
+                items.push(ListItem::new(Line::from(Span::styled(
+                    "手输路径…",
+                    Style::default().fg(Color::Cyan),
+                ))));
+
+                let title = if filter.is_empty() {
+                    "选项目（↑↓ 选，Enter 确认，直接打字过滤，Esc 取消）".to_string()
+                } else {
+                    format!("选项目（过滤：{filter}）")
+                };
+                // state 是 View 里那份的副本，draw 只读不写，所以这里克隆一份给
+                // render_stateful_widget 用，不去动 `st`（那是看板的光标）。
+                let mut s = state.clone();
+                f.render_stateful_widget(
+                    List::new(items)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(border_style)
+                                .title(title),
+                        )
+                        .highlight_symbol("▶ "),
+                    chunks[0],
+                    &mut s,
+                );
+            }
+        }
         View::Board => {
             let title = if connected {
                 "dct 会话看板".to_string()
@@ -581,7 +827,12 @@ fn draw(
     let idle_help = match view {
         View::Attached(_) => "F2 回看板（回看板后按 n 新建会话）　其余按键都发给 agent",
         View::PickProfile(_) => "按数字选 agent，Esc 取消",
-        View::Board => "n 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
+        View::PickProject {
+            typing_path: Some(_),
+            ..
+        } => "输入路径后 Enter 确认，Esc 返回列表",
+        View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
+        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
     };
 
     let (help, style) = if !connected {
@@ -1028,6 +1279,136 @@ mod tests {
         // Ctrl+B 是 Claude Code 的「转后台」，也必须透传
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
         assert_eq!(key_to_input(&ctrl_b).as_deref(), Some("\u{2}"));
+    }
+
+    #[test]
+    fn draw_does_not_panic_for_project_picker() {
+        use ratatui::backend::TestBackend;
+
+        let mut st = ListState::default();
+        st.select(Some(0));
+        let all = vec![
+            "/Users/lei/work/dc/dc-terminal".to_string(),
+            "/Users/lei/work/dc/dc_workbench".to_string(),
+        ];
+
+        // 列表态。每一段都新建一个 Terminal：ratatui 画中文这种宽字符时只写
+        // 首格、第二格保留旧值，同一个 TestBackend 连画两帧再断言，上一帧的
+        // 残字会拼进来，产生假阳性/假阴性（见 bottom_bar_help_follows_the_view
+        // 的注释）。这里每段内容长度、宽字符落点都不同，实测确实会踩上，
+        // 所以都换新的 TestBackend，跟既有测试的写法保持一致。
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::PickProject {
+                    all: all.clone(),
+                    filter: String::new(),
+                    state: st.clone(),
+                    typing_path: None,
+                },
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp",
+            )
+        })
+        .unwrap();
+
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(content.contains("dc-terminal"), "列表要显示项目：{content}");
+        assert!(
+            content.contains("手输路径"),
+            "末行兜底入口必须在：{content}"
+        );
+
+        // 过滤到无匹配：只剩兜底那一行，不能 panic
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::PickProject {
+                    all: all.clone(),
+                    filter: "没有这个".to_string(),
+                    state: st.clone(),
+                    typing_path: None,
+                },
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp",
+            )
+        })
+        .unwrap();
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains("手输路径"),
+            "无匹配时兜底入口仍要在：{content}"
+        );
+
+        // 手输态
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::PickProject {
+                    all: all.clone(),
+                    filter: String::new(),
+                    state: st.clone(),
+                    typing_path: Some("~/work/x".to_string()),
+                },
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp",
+            )
+        })
+        .unwrap();
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains("~/work/x"),
+            "手输态要回显已输入的路径：{content}"
+        );
+
+        // 空列表（全新守护进程）也不能 panic
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::PickProject {
+                    all: Vec::new(),
+                    filter: String::new(),
+                    state: ListState::default(),
+                    typing_path: None,
+                },
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp",
+            )
+        })
+        .unwrap();
     }
 
     #[test]
