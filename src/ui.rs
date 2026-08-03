@@ -322,22 +322,36 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         }
                     }
                     KeyCode::Enter => {
-                        let p = expand_path(&buf, &start_dir);
-                        if p.is_dir() {
-                            // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
-                            message =
-                                format!("已切到 {}", short_path(&p.display().to_string())).into();
-                            current_dir = p;
-                            view = View::Board;
-                        } else {
-                            // 不是 git 仓库这件事不在这里判——留给 create()
-                            message = Msg::err(format!("{} 不是一个目录", p.display()));
+                        if buf.trim().is_empty() {
+                            // expand_path("", base) 会解析成 base 自己（非绝对路径走
+                            // base.join("")），is_dir() 照样为真——空输入不挡住的话，
+                            // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
+                            message = Msg::err("还没输入路径".into());
                             view = View::PickProject {
                                 all,
                                 filter,
                                 state,
                                 typing_path: Some(buf),
                             };
+                        } else {
+                            let p = expand_path(&buf, &start_dir);
+                            if p.is_dir() {
+                                // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
+                                message =
+                                    format!("已切到 {}", short_path(&p.display().to_string()))
+                                        .into();
+                                current_dir = p;
+                                view = View::Board;
+                            } else {
+                                // 不是 git 仓库这件事不在这里判——留给 create()
+                                message = Msg::err(format!("{} 不是一个目录", p.display()));
+                                view = View::PickProject {
+                                    all,
+                                    filter,
+                                    state,
+                                    typing_path: Some(buf),
+                                };
+                            }
                         }
                     }
                     KeyCode::Backspace => {
@@ -1144,6 +1158,17 @@ mod tests {
             expand_path("~foo", base),
             std::path::PathBuf::from("/base/~foo")
         );
+    }
+
+    #[test]
+    fn expand_path_of_empty_string_is_base_itself() {
+        // 空串不是绝对路径，走 base.join("")，结果就是 base 本身——而且
+        // base 本身通常是存在的目录，is_dir() 照样为真。这不是 bug，是
+        // Path::join 的正常语义，但意味着调用方（手输路径的 Enter 处理）
+        // 必须自己在展开之前挡住空输入，不能指望 expand_path 或
+        // is_dir() 帮忙识别"用户什么都没输"。
+        let base = std::path::Path::new("/base");
+        assert_eq!(expand_path("", base), base);
     }
 
     #[test]

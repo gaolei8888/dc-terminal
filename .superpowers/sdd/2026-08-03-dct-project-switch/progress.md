@@ -74,3 +74,22 @@ Task 4: minor (deferred): task-4-report.md 只记了 a3015e1，主体实现 00b4
 Task 4: 偏离已裁定为合理 — bottom_bar_help_follows_the_view 没照抄 brief，第二次 draw 换了新的 TestBackend。
   理由：ratatui 画宽字符只写首格、第二格留旧值，复用同一 backend 会把上一帧残字拼进来产生假阳性。未削弱断言。
 Task 4: complete (commits 4e1b518..a3015e1, review clean)
+
+Task 5: 实现完成 (commit 4b18a79, 全套测试通过；client_timeout 仍是既有偶发)
+Task 5: review — 需求符合性 ✅；Critical 0；Important 1
+  Important: 手输框空输入按 Enter 会静默把项目切回启动目录（expand_path("", base) == base 且 is_dir() 为真）
+  复审独立验证：p 键只在看板生效（全文件 Char('p') 仅一处，Attached 只截 F2）；末行「手输路径…」三处口径一致、
+  任何过滤词下都在；手输态 filter 只被搬运不被追加；只判 is_dir()，无 git 判断；12 处状态搬运无一漏；
+  光标恒不越界（n 恒 ≥1，Enter 用 i >= shown.len() 兜底）；粘贴在会话视图行为等价
+Task 5: 偏离已裁定为合理 — draw_does_not_panic_for_project_picker 每段新建 TestBackend，与 Task 4 同一裁定
+Task 5: minor (deferred): 手输失败提示用裸绝对路径，同分支的成功路径与列表态都用 short_path，口径不一且可能被截断
+Task 5: minor (deferred): 按 p 时补的是 start_dir 而非 current_dir，刚手输切过去、还没建过会话的项目不在列表里
+Task 5: minor (deferred): 手输框没有横向滚动，长路径超出面板后右侧连同光标符一起看不见——正撞在「能粘贴长路径」这条设计理由上
+Task 5: minor (deferred): KeyCode::Char(c) 不看修饰键，Ctrl+P 也会弹选择器、Ctrl+C 会往输入框塞字母 c（与看板既有 n/q/u/s/d 写法一致，非本次引入）
+Task 5: minor (deferred): 按键状态机与新 idle_help 分支零测试覆盖（run() 不抽 reducer 测不了，结构性限制）
+Task 5: 待办 — brief Step 5 的 14 条真人手动验证一条未跑，需在真终端由用户执行
+Task 5: 计划完成标准冲突（待用户裁定）— `cargo clippy -- -D warnings` 有 4 条：
+  session.rs 的 new_without_default / type_complexity（本计划之前就有）、ui.rs draw() 9 个参数
+  （Task 4 按计划逐字写成这样）、tests/projects_flow.rs 的 &PathBuf（Task 2 的计划代码）。
+  计划的「完成标准」要求 clippy 全绿，但其中两条正是计划自己逐字规定的代码所致。
+Task 5: fix round 1/5 dispatched — 空输入按 Enter 改为无操作 + 补 expand_path 空串契约测试
