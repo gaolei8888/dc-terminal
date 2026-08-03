@@ -677,7 +677,7 @@ git commit -m "feat: 路径展开、项目过滤与通用光标移动"
 
 ---
 
-### Task 4: 底部状态栏 —— 当前项目与错误红字
+### Task 4: 底部状态栏 —— 当前项目、错误红字、按视图给提示、逆转键改 F2
 
 **Files:**
 - Modify: `src/ui.rs`
@@ -688,11 +688,34 @@ git commit -m "feat: 路径展开、项目过滤与通用光标移动"
   - `ui::Msg { pub text: String, pub error: bool }`，带 `Msg::err(String) -> Msg`、`impl From<&str> for Msg`、`impl From<String> for Msg`
   - `draw()` 签名新增两个参数：`message: &Msg`（原为 `&str`）、`current: &str`
 
-**说明：** 现在所有提示——包括守护进程返回的错误——都用同一种灰字显示，
-出错和成功长得一模一样。选择器要报「这不是一个目录」，必须让用户一眼看出是错误。
-顺带把守护进程返回的 `Response::Error` 也标红，与已有的「断连时边框变红」是同一套语言。
+**说明：** 这个任务收三件互相纠缠的界面债，都落在同一段底部栏代码上，分开做会改两遍。
 
-这个任务做完，界面看得见的变化只有一条：底部多了「当前项目：…」。`p` 键在 Task 5 才有。
+**（1）错误看不出是错误。** 现在所有提示——包括守护进程返回的错误——都用同一种灰字。
+Task 5 的选择器要报「这不是一个目录」，必须一眼能看出是错误。顺带把 `Response::Error`
+也标红，与已有的「断连时边框变红」是同一套语言。
+
+**（2）会话视图显示的是看板的按键表。** 底部栏现在不分视图，进了会话仍然写着
+`n 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出`——而这些键在会话视图里
+**全部会被转发给 agent**。用户照着按 `n`，字母 n 落进 Claude Code 的输入框。这不是提示
+缺失，是提示在骗人。改成提示跟着视图走。
+
+**（3）逆转键与标题栏不一致，且偷了 Esc。** 实测当前行为：
+
+| 位置 | 现状 |
+|---|---|
+| `src/ui.rs:232` | 会话视图截走 **`Esc`** 回看板 |
+| `src/ui.rs:417,419` | 标题栏写「**Ctrl+B** 返回看板」——按了没反应 |
+| `src/ui.rs:569` | 测试注释写「返回看板改用 Ctrl+B」，并断言 Esc 会转发给 agent |
+
+`ff1e37d` 改了文案和测试注释，没改按键处理。结果是 Esc 被吞（Claude Code 里按 Esc
+取消不掉任何东西），而标题栏宣传的键什么也不做。
+
+**裁定：逆转键改成 `F2`。** `Esc` 和 `Ctrl+B` 一律还给 agent——Esc 是 agent 的取消键，
+`Ctrl+B` 是 Claude Code 的「转后台」。F2 没有任何 CLI agent 在用，不需要双击透传这种
+隐形状态，对非程序员也更直白。
+
+这个任务做完，界面可见变化：底部多了「当前项目：…」、会话视图的提示换成 F2 那句、
+标题栏改说 F2。`p` 键在 Task 5 才有。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -770,12 +793,85 @@ git commit -m "feat: 路径展开、项目过滤与通用光标移动"
         });
         assert!(red, "错误提示必须用红字，否则跟成功提示长得一样");
     }
+
+    #[test]
+    fn f2_is_not_forwarded_but_esc_is() {
+        // F2 是逆转键，dct 自己吃掉；Esc 必须还给 agent——
+        // Claude Code 靠 Esc 取消/清空/关弹窗。
+        assert_eq!(key_to_input(&key(KeyCode::F(2))), None);
+        assert_eq!(key_to_input(&key(KeyCode::Esc)).as_deref(), Some("\u{1b}"));
+        // Ctrl+B 是 Claude Code 的「转后台」，也必须透传
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_input(&ctrl_b).as_deref(), Some("\u{2}"));
+    }
+
+    #[test]
+    fn bottom_bar_help_follows_the_view() {
+        use ratatui::backend::TestBackend;
+
+        let sessions = vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/tmp/a".into(),
+            state: SessionState::Working,
+            activity: String::new(),
+        }];
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut st = ListState::default();
+
+        let text_of = |term: &Terminal<TestBackend>| -> String {
+            buffer_text(term.backend().buffer())
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+
+        // 会话视图：绝不能显示看板的按键表——那些键在这里全被转给 agent
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Attached(1),
+                &sessions,
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp/a",
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(c.contains("F2回看板"), "会话视图要给出逆转键提示：{c}");
+        assert!(c.contains("新建会话"), "还要说清新建会话怎么走：{c}");
+        assert!(!c.contains("u回滚"), "会话视图不能显示看板按键表：{c}");
+
+        // 看板视图：仍然显示看板的按键表
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &sessions,
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp/a",
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(c.contains("u回滚"), "看板要显示自己的按键表：{c}");
+    }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test --lib ui -- --test-threads=1`
-Expected: 编译失败，`Msg` 未定义、`draw` 参数个数不对。
+Expected: 编译失败，`Msg` 未定义、`draw` 参数个数不对；`bottom_bar_help_follows_the_view` 断言失败
+（现在的底部栏不分视图，会话视图里照样显示看板按键表）；`f2_is_not_forwarded_but_esc_is` 通过
+（`key_to_input` 本来就这么写的——真正的缺陷在 `View::Attached` 分支截了 `Esc`，见 Step 3g）。
 
 - [ ] **Step 3: 实现**
 
@@ -882,6 +978,15 @@ fn draw(
 **3e.** `draw()` 末尾那段底部栏整个替换成：
 
 ```rust
+    // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
+    // 而那些键在会话视图里全部被转发给 agent——用户照着按 n，字母 n 会落进
+    // Claude Code 的输入框。显示做不到的操作比不显示更糟。
+    let idle_help = match view {
+        View::Attached(_) => "F2 回看板（回看板后按 n 新建会话）　其余按键都发给 agent",
+        View::PickProfile(_) => "按数字选 agent，Esc 取消",
+        View::Board => "n 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
+    };
+
     let (help, style) = if !connected {
         (
             "守护进程连不上，界面数据可能已过期".to_string(),
@@ -889,10 +994,7 @@ fn draw(
         )
     } else if message.text.is_empty() {
         (
-            format!(
-                "当前项目：{}\nn 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
-                short_path(current)
-            ),
+            format!("当前项目：{}\n{}", short_path(current), idle_help),
             Style::default(),
         )
     } else {
@@ -964,6 +1066,47 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
 ```
 
 `start_dir` 此时还没有调用点，会有 `unused_variable` 警告——Task 5 接线后消失。
+
+**3g. 逆转键改成 F2，`Esc` 还给 agent。** 找到 `View::Attached(id)` 那个分支
+（`src/ui.rs:228-242`），把开头的注释与条件整个换掉：
+
+```rust
+            View::Attached(id) => {
+                // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
+                // 送进去。Esc 必须还给 agent——Claude Code 靠它取消/清空/关弹窗；
+                // Ctrl+B 也必须还回去，那是 Claude Code 的「转后台」。
+                // 逆转键挑 F2 是因为没有 CLI agent 在用它，不必搞双击透传。
+                if key.code == KeyCode::F(2) {
+                    view = View::Board;
+                    need_sessions = true;
+                } else if let Some(text) = key_to_input(&key) {
+```
+
+后面的函数体（发送失败的错误提示那几行）保持原样，只是那句赋值按 3c 的规则改成
+`Msg::err(...)`。
+
+**3h. 标题栏改说 F2。** `draw()` 的 `View::Attached` 分支里（`src/ui.rs:417,419`）
+两处字面量把 `Ctrl+B` 换成 `F2`：
+
+```rust
+            let title = if connected {
+                format!("会话 {id} · {project} —— F2 返回看板")
+            } else {
+                format!("会话 {id} · {project}（连接已断开，画面可能过期）—— F2 返回看板")
+            };
+```
+
+**3i. 修掉那条会误导人的测试注释。** `mod tests` 里 `esc_is_forwarded_to_the_agent`
+的注释写着「返回看板改用 Ctrl+B」，是错的（`ff1e37d` 只改了文案没改代码）。改成：
+
+```rust
+    #[test]
+    fn esc_is_forwarded_to_the_agent() {
+        // agent 靠 Esc 做取消/清空/关弹窗，抢走它会让 agent 的交互失灵。
+        // 返回看板用 F2。
+        assert_eq!(key_to_input(&key(KeyCode::Esc)).as_deref(), Some("\u{1b}"));
+    }
+```
 
 **3g.** `mod tests` 里已有的 `draw_does_not_panic_for_all_views` 和
 `disconnected_state_shows_warning_in_bottom_bar` 每个 `draw(...)` 调用都要补参数：
@@ -1387,11 +1530,21 @@ enum View {
         }
 ```
 
-**3e.** 底部帮助文案加上 `p 换项目`——`draw()` 里那句：
+**3e.** 底部提示：Task 4 建的 `idle_help` match 要补一个 `PickProject` 分支，
+`Board` 那句加上 `p 换项目`：
 
 ```rust
-                "当前项目：{}\nn 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
+    let idle_help = match view {
+        View::Attached(_) => "F2 回看板（回看板后按 n 新建会话）　其余按键都发给 agent",
+        View::PickProfile(_) => "按数字选 agent，Esc 取消",
+        View::PickProject { typing_path: Some(_), .. } => "输入路径后 Enter 确认，Esc 返回列表",
+        View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
+        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
+    };
 ```
+
+注意分支顺序：`typing_path: Some(_)` 必须排在通配的 `PickProject { .. }` 之前，
+否则永远命中不到。
 
 **3f.** 让粘贴在手输路径态里可用。现在主循环顶部的 `Event::Paste` 分支**只认会话视图**
 （`src/ui.rs:151-158`），在选择器里粘贴会被整段吞掉——而「能粘贴路径」正是不做目录浏览器
@@ -1434,7 +1587,9 @@ cd ~/work/dc/dc-terminal && ./target/release/dct
 逐条确认：
 
 1. 底部显示 `当前项目：~/work/dc/dc-terminal`
-2. 按 `n` 开一个 shell 会话 → 成功；`Ctrl+B` 回看板
+2. 按 `n` 开一个 shell 会话 → 成功。会话里底部提示应当是 `F2 回看板…` 而**不是**看板按键表；
+   按 `Esc` 和 `Ctrl+B` 都应当落进 agent（在 claude 会话里最容易验：Esc 能取消、Ctrl+B 能转后台）；
+   按 `F2` 回看板
 3. 按 `p` → 弹出列表，至少有 `dc-terminal` 一条，末行是「手输路径…」
 4. 打 `work` → 列表被过滤；`Backspace` 删掉 → 恢复
 5. 打 `没有这个` → 列表只剩「手输路径…」一行，**兜底入口没消失**
