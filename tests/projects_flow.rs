@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
 use dct::client::Client;
 use dct::proto::{Request, Response};
 
-fn start_daemon(sock: &PathBuf) {
-    let s = sock.clone();
+fn start_daemon(sock: &Path) {
+    let s = sock.to_path_buf();
     std::thread::spawn(move || {
         let _ = dct::daemon::run(&s);
     });

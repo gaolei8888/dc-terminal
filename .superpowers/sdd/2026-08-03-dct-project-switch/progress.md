@@ -93,3 +93,8 @@ Task 5: 计划完成标准冲突（待用户裁定）— `cargo clippy -- -D war
   （Task 4 按计划逐字写成这样）、tests/projects_flow.rs 的 &PathBuf（Task 2 的计划代码）。
   计划的「完成标准」要求 clippy 全绿，但其中两条正是计划自己逐字规定的代码所致。
 Task 5: fix round 1/5 dispatched — 空输入按 Enter 改为无操作 + 补 expand_path 空串契约测试
+Task 5: fix round 1/5 (1 addressed, 0 open — 空输入按 Enter 已改为无操作并停在手输态，expand_path 未被改动;
+  commits 4b18a79..093f019)
+Task 5: complete (commits e9483af..093f019, review clean)
+用户裁定（clippy 冲突）：选「全部修干净，draw() 参数打包成结构体」。作为计划外的独立收尾提交处理，
+  随后再跑全分支最终评审。

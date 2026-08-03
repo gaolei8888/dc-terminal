@@ -9,6 +9,10 @@ use crate::git::{self, FileStat};
 use crate::profile::Profile;
 use crate::pty::{PtySession, ScreenSpan};
 
+/// 一屏文字加光标位置：`screen()` 的返回值，行的集合按 (行, 列) 排布 span，
+/// 光标是 (行, 列)。type_complexity 报警要求给这个组合起个名字。
+pub type ScreenSnapshot = (Vec<Vec<ScreenSpan>>, (u16, u16));
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     Working,
@@ -64,6 +68,12 @@ pub struct SessionManager {
 /// 中毒了就是永久瘫痪，必须能自愈）。
 pub(crate) fn recover<T>(r: std::sync::LockResult<T>) -> T {
     r.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionManager {
@@ -204,7 +214,7 @@ impl SessionManager {
 
     /// 返回 agent 屏幕文本和光标位置 (行, 列)。光标必须跟文本一起取，
     /// 否则界面只是一张死截图，用户看不出自己打的字落在哪。
-    pub fn screen(&self, id: u32) -> Result<(Vec<Vec<ScreenSpan>>, (u16, u16))> {
+    pub fn screen(&self, id: u32) -> Result<ScreenSnapshot> {
         self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor())))
     }
 
