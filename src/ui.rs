@@ -75,15 +75,23 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     // 不能让用户以为界面上的“干活中”还代表当前真实状态。每次循环开头的
     // List（以及 Attached 视图下的 Screen）调用是唯一的真相来源——它总在
     // 当次的 term.draw 之前重新算一遍，所以不需要（也不应该）预置初值。
-    let mut connected;
+    let mut connected = true;
+
+    // 进了会话就不用再每轮拉 List：它是给看板用的，而且服务端要逐个锁会话、
+    // 取每个会话的最后一行，纯属浪费。只在看板上、或刚从会话里退出来时拉一次。
+    let mut need_sessions = true;
 
     let res = loop {
-        match client.call(Request::List) {
-            Ok(Response::Sessions(v)) => {
-                sessions = v;
-                connected = true;
+        let attached = matches!(view, View::Attached(_));
+        if need_sessions || !attached {
+            match client.call(Request::List) {
+                Ok(Response::Sessions(v)) => {
+                    sessions = v;
+                    connected = true;
+                }
+                _ => connected = false,
             }
-            _ => connected = false,
+            need_sessions = false;
         }
         if list_state.selected().is_none() && !sessions.is_empty() {
             list_state.select(Some(0));
@@ -113,7 +121,10 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
             )
         })?;
 
-        if !event::poll(Duration::from_millis(150))? {
+        // 会话里要跟手：刷新慢了，你敲的字要等下一轮才显示，每次按键都像卡了一下。
+        // 看板不需要这么勤快，150ms 足够，也省得每轮都去锁一遍所有会话。
+        let tick = if attached { 16 } else { 150 };
+        if !event::poll(Duration::from_millis(tick))? {
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -137,6 +148,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 KeyCode::Enter => {
                     if let Some(s) = selected(&sessions, &list_state) {
                         view = View::Attached(s.id);
+                        need_sessions = true; // 会话标题要显示项目名
                     }
                 }
                 KeyCode::Char('u') => {
@@ -190,6 +202,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 // 否则在 Claude Code 里连打错字都退不了格。
                 if key.code == KeyCode::Esc {
                     view = View::Board;
+                    need_sessions = true;
                 } else if let Some(text) = key_to_input(&key) {
                     // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
                     // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
