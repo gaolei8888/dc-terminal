@@ -286,260 +286,280 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         let message_text_before = message.text.clone();
         let message_error_before = message.error;
 
-        // 必须 clone：分支里要给 view 赋值，match &view 会被借用检查器拒掉
-        match view.clone() {
-            View::Board => match key.code {
-                KeyCode::Char('q') => break Ok(()),
-                KeyCode::Down => move_sel(&mut list_state, &sessions, 1),
-                KeyCode::Up => move_sel(&mut list_state, &sessions, -1),
-                KeyCode::Char('n') => {
-                    if let Ok(Response::Profiles(p)) = client.call(Request::Profiles) {
-                        view = View::PickProfile(p);
-                    }
+        // Ctrl+Q 在所有视图里都是「退一层，一直按就退到头」。
+        //
+        // 加这个键是因为真实事故：用户不知道有 F2，在会话里怎么按都出不去，
+        // 只能去别的窗口 kill 进程。`Q = quit` 是非程序员唯一猜得到的组合，
+        // 而 Claude Code 不占用它——代价只是从 agent 手里拿走 0x11。
+        //
+        // 拦截**必须**留在 `match view.clone()` 之前，别挪进去：`PickProject`
+        // 的打字过滤和手输路径都靠 `Char(c)` 累加，而 Ctrl+Q 在 crossterm 里
+        // 就是 `Char('q')` 带 CONTROL——挪进去就会往过滤框里塞一个 q。
+        if is_ctrl_q(&key) {
+            match back_one_level(view.clone()) {
+                None => break Ok(()),
+                Some(next) => {
+                    // 回看板要重新拉一次会话列表，否则看板显示的是进会话之前的旧快照
+                    need_sessions = matches!(next, View::Board);
+                    view = next;
                 }
-                KeyCode::Char('p') => {
-                    // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
-                    // 自己从来没开过项目。
-                    match client.call(Request::Projects) {
-                        Ok(Response::Projects(mut all)) => {
-                            // 全新守护进程列表是空的，补上启动目录，
-                            // 保证第一次用也不会看到空列表。
-                            let start = start_dir.display().to_string();
-                            if !all.contains(&start) {
-                                all.push(start);
-                            }
-                            let mut state = ListState::default();
-                            state.select(Some(0));
-                            view = View::PickProject {
-                                all,
-                                filter: String::new(),
-                                state,
-                                typing_path: None,
-                            };
+            }
+        } else {
+            // 必须 clone：分支里要给 view 赋值，match &view 会被借用检查器拒掉
+            match view.clone() {
+                View::Board => match key.code {
+                    KeyCode::Char('q') => break Ok(()),
+                    KeyCode::Down => move_sel(&mut list_state, &sessions, 1),
+                    KeyCode::Up => move_sel(&mut list_state, &sessions, -1),
+                    KeyCode::Char('n') => {
+                        if let Ok(Response::Profiles(p)) = client.call(Request::Profiles) {
+                            view = View::PickProfile(p);
                         }
-                        Ok(Response::Error(e)) => message = Msg::err(e),
-                        _ => message = Msg::err("拿不到项目列表".into()),
                     }
-                }
-                KeyCode::Enter => {
-                    if let Some(s) = selected(&sessions, &list_state) {
-                        view = View::Attached(s.id);
-                        need_sessions = true; // 会话标题要显示项目名
-                    }
-                }
-                KeyCode::Char('u') => {
-                    message = act(&mut client, &sessions, &list_state, |id| Request::Undo {
-                        id,
-                    });
-                }
-                KeyCode::Char('s') => {
-                    message = act(&mut client, &sessions, &list_state, |id| Request::Stop {
-                        id,
-                    });
-                }
-                KeyCode::Char('d') => {
-                    if let Some(s) = selected(&sessions, &list_state) {
-                        message = match client.call(Request::Diff { id: s.id }) {
-                            Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
-                            Ok(Response::Diff(v)) => v
-                                .iter()
-                                .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
-                                .collect::<Vec<_>>()
-                                .join("  ")
-                                .into(),
-                            Ok(Response::Error(e)) => Msg::err(e),
-                            _ => Msg::err("请求失败".into()),
-                        };
-                    }
-                }
-                _ => {}
-            },
-            View::PickProfile(profiles) => match key.code {
-                KeyCode::Esc => view = View::Board,
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    let idx = c.to_digit(10).unwrap() as usize;
-                    if idx >= 1 && idx <= profiles.len() {
-                        let profile = profiles[idx - 1].clone();
-                        message = match client.call(Request::Create {
-                            dir: current_dir.display().to_string(),
-                            profile,
-                        }) {
-                            Ok(Response::Created { id }) => format!("已开会话 {id}").into(),
-                            Ok(Response::Error(e)) => Msg::err(e),
-                            _ => Msg::err("创建失败".into()),
-                        };
-                        view = View::Board;
-                    }
-                }
-                _ => {}
-            },
-            View::PickProject {
-                all,
-                mut filter,
-                mut state,
-                typing_path,
-            } => match typing_path {
-                // ——手输路径态：可见字符全进输入框，不再当过滤用——
-                Some(mut buf) => match key.code {
-                    KeyCode::Esc => {
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: None,
+                    KeyCode::Char('p') => {
+                        // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
+                        // 自己从来没开过项目。
+                        match client.call(Request::Projects) {
+                            Ok(Response::Projects(mut all)) => {
+                                // 全新守护进程列表是空的，补上启动目录，
+                                // 保证第一次用也不会看到空列表。
+                                let start = start_dir.display().to_string();
+                                if !all.contains(&start) {
+                                    all.push(start);
+                                }
+                                let mut state = ListState::default();
+                                state.select(Some(0));
+                                view = View::PickProject {
+                                    all,
+                                    filter: String::new(),
+                                    state,
+                                    typing_path: None,
+                                };
+                            }
+                            Ok(Response::Error(e)) => message = Msg::err(e),
+                            _ => message = Msg::err("拿不到项目列表".into()),
                         }
                     }
                     KeyCode::Enter => {
-                        if buf.trim().is_empty() {
-                            // expand_path("", base) 会解析成 base 自己（非绝对路径走
-                            // base.join("")），is_dir() 照样为真——空输入不挡住的话，
-                            // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
-                            message = Msg::err("还没输入路径".into());
+                        if let Some(s) = selected(&sessions, &list_state) {
+                            view = View::Attached(s.id);
+                            need_sessions = true; // 会话标题要显示项目名
+                        }
+                    }
+                    KeyCode::Char('u') => {
+                        message = act(&mut client, &sessions, &list_state, |id| Request::Undo {
+                            id,
+                        });
+                    }
+                    KeyCode::Char('s') => {
+                        message = act(&mut client, &sessions, &list_state, |id| Request::Stop {
+                            id,
+                        });
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(s) = selected(&sessions, &list_state) {
+                            message = match client.call(Request::Diff { id: s.id }) {
+                                Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
+                                Ok(Response::Diff(v)) => v
+                                    .iter()
+                                    .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
+                                    .collect::<Vec<_>>()
+                                    .join("  ")
+                                    .into(),
+                                Ok(Response::Error(e)) => Msg::err(e),
+                                _ => Msg::err("请求失败".into()),
+                            };
+                        }
+                    }
+                    _ => {}
+                },
+                View::PickProfile(profiles) => match key.code {
+                    KeyCode::Esc => view = View::Board,
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        let idx = c.to_digit(10).unwrap() as usize;
+                        if idx >= 1 && idx <= profiles.len() {
+                            let profile = profiles[idx - 1].clone();
+                            message = match client.call(Request::Create {
+                                dir: current_dir.display().to_string(),
+                                profile,
+                            }) {
+                                Ok(Response::Created { id }) => format!("已开会话 {id}").into(),
+                                Ok(Response::Error(e)) => Msg::err(e),
+                                _ => Msg::err("创建失败".into()),
+                            };
+                            view = View::Board;
+                        }
+                    }
+                    _ => {}
+                },
+                View::PickProject {
+                    all,
+                    mut filter,
+                    mut state,
+                    typing_path,
+                } => match typing_path {
+                    // ——手输路径态：可见字符全进输入框，不再当过滤用——
+                    Some(mut buf) => match key.code {
+                        KeyCode::Esc => {
                             view = View::PickProject {
                                 all,
                                 filter,
                                 state,
-                                typing_path: Some(buf),
-                            };
-                        } else {
-                            let p = expand_path(&buf, &start_dir);
-                            if p.is_dir() {
-                                // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
-                                message =
-                                    format!("已切到 {}", short_path(&p.display().to_string()))
-                                        .into();
-                                current_dir = p;
-                                view = View::Board;
-                            } else {
-                                // 不是 git 仓库这件事不在这里判——留给 create()
-                                message = Msg::err(format!("{} 不是一个目录", p.display()));
+                                typing_path: None,
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if buf.trim().is_empty() {
+                                // expand_path("", base) 会解析成 base 自己（非绝对路径走
+                                // base.join("")），is_dir() 照样为真——空输入不挡住的话，
+                                // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
+                                message = Msg::err("还没输入路径".into());
                                 view = View::PickProject {
                                     all,
                                     filter,
                                     state,
                                     typing_path: Some(buf),
                                 };
+                            } else {
+                                let p = expand_path(&buf, &start_dir);
+                                if p.is_dir() {
+                                    // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
+                                    message =
+                                        format!("已切到 {}", short_path(&p.display().to_string()))
+                                            .into();
+                                    current_dir = p;
+                                    view = View::Board;
+                                } else {
+                                    // 不是 git 仓库这件事不在这里判——留给 create()
+                                    message = Msg::err(format!("{} 不是一个目录", p.display()));
+                                    view = View::PickProject {
+                                        all,
+                                        filter,
+                                        state,
+                                        typing_path: Some(buf),
+                                    };
+                                }
                             }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: Some(buf),
-                        };
-                    }
-                    KeyCode::Char(c) => {
-                        buf.push(c);
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: Some(buf),
-                        };
-                    }
-                    _ => {
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: Some(buf),
-                        }
-                    }
-                },
-                // ——列表态——
-                None => match key.code {
-                    KeyCode::Esc => view = View::Board,
-                    KeyCode::Down | KeyCode::Up => {
-                        let delta = if key.code == KeyCode::Down { 1 } else { -1 };
-                        // +1 是末行那个「手输路径…」，它不参与过滤，永远在
-                        let n = filter_projects(&all, &filter).len() + 1;
-                        move_sel_n(&mut state, n, delta);
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: None,
-                        };
-                    }
-                    KeyCode::Enter => {
-                        let shown = filter_projects(&all, &filter);
-                        let i = state.selected().unwrap_or(0);
-                        if i >= shown.len() {
-                            // 选中的是末行「手输路径…」
+                        KeyCode::Backspace => {
+                            buf.pop();
                             view = View::PickProject {
                                 all,
                                 filter,
                                 state,
-                                typing_path: Some(String::new()),
+                                typing_path: Some(buf),
                             };
-                        } else {
-                            let p = PathBuf::from(&shown[i]);
-                            if p.is_dir() {
-                                message = format!("已切到 {}", short_path(&shown[i])).into();
-                                current_dir = p;
-                                view = View::Board;
-                            } else {
-                                // 列表里那条不删——可能只是外置盘没挂
-                                message =
-                                    Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
+                        }
+                        KeyCode::Char(c) => {
+                            buf.push(c);
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: Some(buf),
+                            };
+                        }
+                        _ => {
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: Some(buf),
+                            }
+                        }
+                    },
+                    // ——列表态——
+                    None => match key.code {
+                        KeyCode::Esc => view = View::Board,
+                        KeyCode::Down | KeyCode::Up => {
+                            let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                            // +1 是末行那个「手输路径…」，它不参与过滤，永远在
+                            let n = filter_projects(&all, &filter).len() + 1;
+                            move_sel_n(&mut state, n, delta);
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: None,
+                            };
+                        }
+                        KeyCode::Enter => {
+                            let shown = filter_projects(&all, &filter);
+                            let i = state.selected().unwrap_or(0);
+                            if i >= shown.len() {
+                                // 选中的是末行「手输路径…」
                                 view = View::PickProject {
                                     all,
                                     filter,
                                     state,
-                                    typing_path: None,
+                                    typing_path: Some(String::new()),
                                 };
+                            } else {
+                                let p = PathBuf::from(&shown[i]);
+                                if p.is_dir() {
+                                    message = format!("已切到 {}", short_path(&shown[i])).into();
+                                    current_dir = p;
+                                    view = View::Board;
+                                } else {
+                                    // 列表里那条不删——可能只是外置盘没挂
+                                    message =
+                                        Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
+                                    view = View::PickProject {
+                                        all,
+                                        filter,
+                                        state,
+                                        typing_path: None,
+                                    };
+                                }
                             }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        filter.pop();
-                        state.select(Some(0));
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: None,
-                        };
-                    }
-                    KeyCode::Char(c) => {
-                        filter.push(c);
-                        // 过滤变了就回到第一项，否则光标可能停在已被过滤掉的行号上
-                        state.select(Some(0));
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: None,
-                        };
-                    }
-                    _ => {
-                        view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: None,
+                        KeyCode::Backspace => {
+                            filter.pop();
+                            state.select(Some(0));
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: None,
+                            };
                         }
-                    }
+                        KeyCode::Char(c) => {
+                            filter.push(c);
+                            // 过滤变了就回到第一项，否则光标可能停在已被过滤掉的行号上
+                            state.select(Some(0));
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: None,
+                            };
+                        }
+                        _ => {
+                            view = View::PickProject {
+                                all,
+                                filter,
+                                state,
+                                typing_path: None,
+                            }
+                        }
+                    },
                 },
-            },
-            View::Attached(id) => {
-                // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
-                // 送进去——方向键、退格、Tab、Ctrl 组合都要能用，否则在 Claude Code
-                // 里连打错字都退不了格。Esc 必须还给 agent——Claude Code 靠它
-                // 取消/清空/关弹窗（底部那句 "Esc to cancel"）；Ctrl+B 也必须还回去，
-                // 那是 Claude Code 的「转后台」。逆转键挑 F2 是因为没有 CLI agent
-                // 在用它，不必搞双击透传那种隐形状态。
-                if key.code == KeyCode::F(2) {
-                    view = View::Board;
-                    need_sessions = true;
-                } else if let Some(text) = key_to_input(&key) {
-                    // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
-                    // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
-                    if client.call(Request::Input { id, text }).is_err() {
-                        message = Msg::err("守护进程连不上，刚才那次输入没发出去".into());
+                View::Attached(id) => {
+                    // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
+                    // 送进去——方向键、退格、Tab、Ctrl 组合都要能用，否则在 Claude Code
+                    // 里连打错字都退不了格。Esc 必须还给 agent——Claude Code 靠它
+                    // 取消/清空/关弹窗（底部那句 "Esc to cancel"）；Ctrl+B 也必须还回去，
+                    // 那是 Claude Code 的「转后台」。逆转键挑 F2 是因为没有 CLI agent
+                    // 在用它，不必搞双击透传那种隐形状态。
+                    if key.code == KeyCode::F(2) {
+                        view = View::Board;
+                        need_sessions = true;
+                    } else if let Some(text) = key_to_input(&key) {
+                        // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
+                        // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
+                        if client.call(Request::Input { id, text }).is_err() {
+                            message = Msg::err("守护进程连不上，刚才那次输入没发出去".into());
+                        }
                     }
                 }
             }
@@ -556,6 +576,37 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     res
 }
 
+/// Ctrl+Q —— dct 的全局逃生键。
+///
+/// crossterm 把它报成 `Char('q')` 带 `CONTROL` 修饰，有的终端送大写。
+/// 判断必须放在任何 `Char(c)` 分支**之前**：项目选择器的打字过滤是靠
+/// `Char(c)` 累加的，判晚了会往过滤框里塞一个 `q`。
+fn is_ctrl_q(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+}
+
+/// Ctrl+Q 从当前视图退到哪一层。`None` 表示「退到头了，该退出 dct」。
+///
+/// 抽成纯函数是为了能单测——`run()` 的按键循环要连真 socket，测不了。
+fn back_one_level(view: View) -> Option<View> {
+    match view {
+        View::Board => None,
+        View::PickProject {
+            all,
+            filter,
+            state,
+            typing_path: Some(_),
+        } => Some(View::PickProject {
+            all,
+            filter,
+            state,
+            typing_path: None,
+        }),
+        _ => Some(View::Board),
+    }
+}
+
 /// 把一次按键翻译成要送进 agent 的字节。返回 `None` 表示这个键不转发。
 ///
 /// 空串是与 `session::send_input` 约定的"回车"信号——只有它会触发检查点，
@@ -565,6 +616,10 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
     let s = match key.code {
         KeyCode::Enter => String::new(),
         KeyCode::Char(c) if ctrl => {
+            // Ctrl+Q 是 dct 自己的逃生键，绝不透传——见 is_ctrl_q 的注释
+            if c.eq_ignore_ascii_case(&'q') {
+                return None;
+            }
             // Ctrl+A..Ctrl+Z -> 0x01..0x1a，其余 Ctrl 组合不转发
             let lower = c.to_ascii_lowercase();
             if lower.is_ascii_lowercase() {
@@ -993,6 +1048,91 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_q_is_never_forwarded_to_the_agent() {
+        // 调用点已经拦了 Ctrl+Q，这层是兜底：万一哪天调用点漏改，
+        // 也不能把 0x11 悄悄发进 agent——那会变成一个「按了逃生键，
+        // 结果字符落进了 Claude Code 输入框」的怪现象。
+        assert_eq!(key_to_input(&ctrl('q')), None);
+        assert_eq!(key_to_input(&ctrl('Q')), None);
+    }
+
+    #[test]
+    fn other_ctrl_combos_still_reach_the_agent() {
+        // 别误伤：Ctrl+C 是 Claude Code 的中断键，Ctrl+B 是它的「转后台」，
+        // 两个都必须继续透传。
+        assert_eq!(key_to_input(&ctrl('c')), Some("\u{3}".to_string()));
+        assert_eq!(key_to_input(&ctrl('b')), Some("\u{2}".to_string()));
+    }
+
+    #[test]
+    fn ctrl_q_is_recognised_in_both_cases() {
+        // 有的终端在 Ctrl 组合里送大写字母
+        assert!(is_ctrl_q(&ctrl('q')));
+        assert!(is_ctrl_q(&ctrl('Q')));
+        // 不带 Ctrl 的裸 q 不算——否则在项目选择器里打字过滤会退出界面
+        assert!(!is_ctrl_q(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn ctrl_q_backs_out_one_level_at_a_time() {
+        // 会话 / 两个选择器 -> 看板
+        assert!(matches!(
+            back_one_level(View::Attached(1)),
+            Some(View::Board)
+        ));
+        assert!(matches!(
+            back_one_level(View::PickProfile(vec!["claude".into()])),
+            Some(View::Board)
+        ));
+        assert!(matches!(
+            back_one_level(View::PickProject {
+                all: Vec::new(),
+                filter: String::new(),
+                state: ListState::default(),
+                typing_path: None,
+            }),
+            Some(View::Board)
+        ));
+    }
+
+    #[test]
+    fn ctrl_q_leaves_the_typing_state_before_leaving_the_picker() {
+        // 手输路径态退一层是回列表，不是一步退回看板
+        let back = back_one_level(View::PickProject {
+            all: vec!["/tmp/a".into()],
+            filter: "a".into(),
+            state: ListState::default(),
+            typing_path: Some("/tmp/b".into()),
+        });
+        match back {
+            Some(View::PickProject {
+                typing_path,
+                filter,
+                all,
+                ..
+            }) => {
+                assert_eq!(typing_path, None, "应当退出手输态");
+                assert_eq!(filter, "a", "退一层不该顺手清掉过滤词");
+                assert_eq!(all, vec!["/tmp/a".to_string()], "项目列表不该丢");
+            }
+            other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn ctrl_q_on_the_board_quits() {
+        // 退到头了。看板上退出不杀会话，守护进程继续跑。
+        assert!(back_one_level(View::Board).is_none());
     }
 
     #[test]
