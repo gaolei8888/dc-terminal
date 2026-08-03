@@ -16,6 +16,7 @@ pub enum Request {
     Undo { id: u32 },
     Diff { id: u32 },
     Profiles,
+    Projects,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,6 +31,7 @@ pub enum Response {
     },
     Diff(Vec<FileStat>),
     Profiles(Vec<String>),
+    Projects(Vec<String>),
     Ok,
     Error(String),
 }
