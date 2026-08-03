@@ -35,6 +35,34 @@ pub fn status_color(s: SessionState) -> Color {
     }
 }
 
+/// 底部状态栏要显示的一句话。`error` 决定它是灰字还是红字——
+/// 出错和成功用同一种颜色，用户分不出刚才那步到底成没成。
+pub struct Msg {
+    pub text: String,
+    pub error: bool,
+}
+
+impl Msg {
+    pub fn err(text: String) -> Msg {
+        Msg { text, error: true }
+    }
+}
+
+impl From<&str> for Msg {
+    fn from(s: &str) -> Msg {
+        Msg {
+            text: s.to_string(),
+            error: false,
+        }
+    }
+}
+
+impl From<String> for Msg {
+    fn from(text: String) -> Msg {
+        Msg { text, error: false }
+    }
+}
+
 #[derive(Clone)]
 enum View {
     Board,
@@ -62,6 +90,11 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
+    // start_dir 是 dct 启动时的目录，只用来解析用户敲进来的相对路径，永不改变。
+    // current_dir 是「新会话开在哪」，Task 5 的选择器会改它。
+    let start_dir = default_dir.clone();
+    let mut current_dir = default_dir;
+
     enable_raw_mode()?;
     // 必须在 EnterAlternateScreen / Terminal::new 之前构造：这样即便它们俩失败，
     // raw mode 也还是能被 Drop 恢复。
@@ -75,7 +108,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     let mut view = View::Board;
     let mut list_state = ListState::default();
     let mut sessions: Vec<SessionInfo> = Vec::new();
-    let mut message = String::new();
+    let mut message: Msg = "".into();
     let mut screen: Vec<Vec<ScreenSpan>> = Vec::new();
     let mut screen_cursor = (0u16, 0u16);
     // 上次告诉 agent 的画面尺寸，变了才发 Resize，避免每帧一次多余请求
@@ -137,6 +170,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 screen_cursor,
                 &message,
                 connected,
+                &current_dir.display().to_string(),
             )
         })?;
 
@@ -151,7 +185,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         if let Event::Paste(text) = ev {
             if let View::Attached(id) = view {
                 if !text.is_empty() && client.call(Request::Input { id, text }).is_err() {
-                    message = "守护进程连不上，粘贴的内容没发出去".into();
+                    message = Msg::err("守护进程连不上，粘贴的内容没发出去".into());
                 }
             }
             continue;
@@ -198,9 +232,10 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 .iter()
                                 .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
                                 .collect::<Vec<_>>()
-                                .join("  "),
-                            Ok(Response::Error(e)) => e,
-                            _ => "请求失败".into(),
+                                .join("  ")
+                                .into(),
+                            Ok(Response::Error(e)) => Msg::err(e),
+                            _ => Msg::err("请求失败".into()),
                         };
                     }
                 }
@@ -213,12 +248,12 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     if idx >= 1 && idx <= profiles.len() {
                         let profile = profiles[idx - 1].clone();
                         message = match client.call(Request::Create {
-                            dir: default_dir.display().to_string(),
+                            dir: current_dir.display().to_string(),
                             profile,
                         }) {
-                            Ok(Response::Created { id }) => format!("已开会话 {id}"),
-                            Ok(Response::Error(e)) => e,
-                            _ => "创建失败".into(),
+                            Ok(Response::Created { id }) => format!("已开会话 {id}").into(),
+                            Ok(Response::Error(e)) => Msg::err(e),
+                            _ => Msg::err("创建失败".into()),
                         };
                         view = View::Board;
                     }
@@ -226,17 +261,20 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 _ => {}
             },
             View::Attached(id) => {
-                // Esc 留给"回看板"，不转发给 agent。其余按键一律走 key_to_input
-                // 翻译成终端字节序列送进去——方向键、退格、Tab、Ctrl 组合都要能用，
-                // 否则在 Claude Code 里连打错字都退不了格。
-                if key.code == KeyCode::Esc {
+                // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
+                // 送进去——方向键、退格、Tab、Ctrl 组合都要能用，否则在 Claude Code
+                // 里连打错字都退不了格。Esc 必须还给 agent——Claude Code 靠它
+                // 取消/清空/关弹窗（底部那句 "Esc to cancel"）；Ctrl+B 也必须还回去，
+                // 那是 Claude Code 的「转后台」。逆转键挑 F2 是因为没有 CLI agent
+                // 在用它，不必搞双击透传那种隐形状态。
+                if key.code == KeyCode::F(2) {
                     view = View::Board;
                     need_sessions = true;
                 } else if let Some(text) = key_to_input(&key) {
                     // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
                     // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
                     if client.call(Request::Input { id, text }).is_err() {
-                        message = "守护进程连不上，刚才那次输入没发出去".into();
+                        message = Msg::err("守护进程连不上，刚才那次输入没发出去".into());
                     }
                 }
             }
@@ -415,13 +453,13 @@ fn act(
     sessions: &[SessionInfo],
     st: &ListState,
     make: impl Fn(u32) -> Request,
-) -> String {
+) -> Msg {
     match selected(sessions, st) {
         None => "没有选中会话".into(),
         Some(s) => match client.call(make(s.id)) {
             Ok(Response::Ok) => "完成".into(),
-            Ok(Response::Error(e)) => e,
-            _ => "请求失败".into(),
+            Ok(Response::Error(e)) => Msg::err(e),
+            _ => Msg::err("请求失败".into()),
         },
     }
 }
@@ -433,10 +471,11 @@ fn draw(
     st: &mut ListState,
     screen: &[Vec<ScreenSpan>],
     cursor: (u16, u16),
-    message: &str,
+    message: &Msg,
     connected: bool,
+    current: &str,
 ) {
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(f.area());
 
     // 断连时用红色边框给出明确的视觉提示：界面上的数据是上一次成功请求
     // 留下的陈旧快照，不代表守护进程现在的真实状态。
@@ -456,9 +495,9 @@ fn draw(
                 .map(|s| short_path(&s.dir))
                 .unwrap_or_default();
             let title = if connected {
-                format!("会话 {id} · {project} —— Ctrl+B 返回看板")
+                format!("会话 {id} · {project} —— F2 返回看板")
             } else {
-                format!("会话 {id} · {project}（连接已断开，画面可能过期）—— Ctrl+B 返回看板")
+                format!("会话 {id} · {project}（连接已断开，画面可能过期）—— F2 返回看板")
             };
             let area = chunks[0];
             f.render_widget(
@@ -536,15 +575,40 @@ fn draw(
         }
     }
 
-    let help = if !connected {
-        "守护进程连不上，界面数据可能已过期".to_string()
-    } else if message.is_empty() {
-        "n 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出".to_string()
+    // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
+    // 而那些键在会话视图里全部被转发给 agent——用户照着按 n，字母 n 会落进
+    // Claude Code 的输入框。显示做不到的操作比不显示更糟。
+    let idle_help = match view {
+        View::Attached(_) => "F2 回看板（回看板后按 n 新建会话）　其余按键都发给 agent",
+        View::PickProfile(_) => "按数字选 agent，Esc 取消",
+        View::Board => "n 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
+    };
+
+    let (help, style) = if !connected {
+        (
+            "守护进程连不上，界面数据可能已过期".to_string(),
+            Style::default().fg(Color::Red),
+        )
+    } else if message.text.is_empty() {
+        (
+            format!("当前项目：{}\n{}", short_path(current), idle_help),
+            Style::default(),
+        )
     } else {
-        message.to_string()
+        let s = if message.error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        (
+            format!("当前项目：{}\n{}", short_path(current), message.text),
+            s,
+        )
     };
     f.render_widget(
-        Paragraph::new(help).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(help)
+            .style(style)
+            .block(Block::default().borders(Borders::ALL)),
         chunks[1],
     );
 }
@@ -608,7 +672,7 @@ mod tests {
     #[test]
     fn esc_is_forwarded_to_the_agent() {
         // agent 靠 Esc 做取消/清空/关弹窗，抢走它会让 agent 的交互失灵。
-        // 返回看板改用 Ctrl+B。
+        // 返回看板用 F2。
         assert_eq!(key_to_input(&key(KeyCode::Esc)).as_deref(), Some("\u{1b}"));
     }
 
@@ -658,8 +722,20 @@ mod tests {
         st.select(Some(0));
 
         // 看板视图，含空消息
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, &[], (0, 0), "", true))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &sessions,
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp/proj",
+            )
+        })
+        .unwrap();
         // 看板视图，带提示消息
         term.draw(|f| {
             draw(
@@ -669,17 +745,42 @@ mod tests {
                 &mut st,
                 &[],
                 (0, 0),
-                "完成",
+                &Msg::from("完成"),
                 true,
+                "/tmp/proj",
             )
         })
         .unwrap();
         // 看板为空列表也不能 panic
-        term.draw(|f| draw(f, &View::Board, &[], &mut st, &[], (0, 0), "", true))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp/proj",
+            )
+        })
+        .unwrap();
         // 断连状态：底部提示和边框都要切到断连样式，也不能 panic
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, &[], (0, 0), "", false))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &sessions,
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                false,
+                "/tmp/proj",
+            )
+        })
+        .unwrap();
         // profile 选择弹窗
         let profiles = vec!["claude".to_string(), "shell".to_string()];
         term.draw(|f| {
@@ -690,8 +791,9 @@ mod tests {
                 &mut st,
                 &[],
                 (0, 0),
-                "",
+                &Msg::from(""),
                 true,
+                "/tmp/proj",
             )
         })
         .unwrap();
@@ -704,8 +806,9 @@ mod tests {
                 &mut st,
                 &[],
                 (0, 0),
-                "",
+                &Msg::from(""),
                 true,
+                "/tmp/proj",
             )
         })
         .unwrap();
@@ -718,8 +821,9 @@ mod tests {
                 &mut st,
                 &[],
                 (0, 0),
-                "",
+                &Msg::from(""),
                 false,
+                "/tmp/proj",
             )
         })
         .unwrap();
@@ -744,8 +848,9 @@ mod tests {
                 &mut st,
                 &[],
                 (0, 0),
-                "完成",
+                &Msg::from("完成"),
                 false,
+                "/tmp/proj",
             )
         })
         .unwrap();
@@ -844,5 +949,153 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    #[test]
+    fn msg_from_str_is_not_an_error() {
+        let m: Msg = "完成".into();
+        assert!(!m.error);
+        assert_eq!(m.text, "完成");
+        assert!(Msg::err("炸了".into()).error);
+    }
+
+    #[test]
+    fn bottom_bar_shows_current_project() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/Users/lei/work/dc/dc-terminal",
+            )
+        })
+        .unwrap();
+
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains("dc-terminal"),
+            "底部必须显示当前项目，实际（已去空白）: {content}"
+        );
+    }
+
+    #[test]
+    fn error_message_is_red() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &[],
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::err("不是一个目录".into()),
+                true,
+                "/tmp",
+            )
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        let red = (0..area.height).any(|y| {
+            (0..area.width).any(|x| {
+                buf.cell((x, y))
+                    .map(|c| c.style().fg == Some(Color::Red) && c.symbol() != " ")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(red, "错误提示必须用红字，否则跟成功提示长得一样");
+    }
+
+    #[test]
+    fn f2_is_not_forwarded_but_esc_is() {
+        // F2 是逆转键，dct 自己吃掉；Esc 必须还给 agent——
+        // Claude Code 靠 Esc 取消/清空/关弹窗。
+        assert_eq!(key_to_input(&key(KeyCode::F(2))), None);
+        assert_eq!(key_to_input(&key(KeyCode::Esc)).as_deref(), Some("\u{1b}"));
+        // Ctrl+B 是 Claude Code 的「转后台」，也必须透传
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_input(&ctrl_b).as_deref(), Some("\u{2}"));
+    }
+
+    #[test]
+    fn bottom_bar_help_follows_the_view() {
+        use ratatui::backend::TestBackend;
+
+        let sessions = vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/tmp/a".into(),
+            state: SessionState::Working,
+            activity: String::new(),
+        }];
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut st = ListState::default();
+
+        let text_of = |term: &Terminal<TestBackend>| -> String {
+            buffer_text(term.backend().buffer())
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+
+        // 会话视图：绝不能显示看板的按键表——那些键在这里全被转给 agent
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Attached(1),
+                &sessions,
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp/a",
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(c.contains("F2回看板"), "会话视图要给出逆转键提示：{c}");
+        assert!(c.contains("新建会话"), "还要说清新建会话怎么走：{c}");
+        assert!(!c.contains("u回滚"), "会话视图不能显示看板按键表：{c}");
+
+        // 看板视图：仍然显示看板的按键表。
+        // 必须换一个全新的 TestBackend：ratatui 画宽字符（中文）时只写首个 cell，
+        // 跳过被覆盖的第二个 cell，所以复用同一个 backend 时上一帧的残字会留在
+        // 那些空位里，拼出「n新回建看…」这种把两帧混在一起的假文本。真实终端上
+        // 宽字符本来就盖住两列，不存在这个问题——这纯粹是测试后端的假象。
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &sessions,
+                &mut st,
+                &[],
+                (0, 0),
+                &Msg::from(""),
+                true,
+                "/tmp/a",
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(c.contains("u回滚"), "看板要显示自己的按键表：{c}");
     }
 }
