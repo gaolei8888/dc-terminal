@@ -41,8 +41,12 @@ impl Store {
     pub fn list(&self) -> Vec<String>;          // 最近使用的在最前
 }
 
-pub fn store_path() -> PathBuf;                 // $HOME/.dct/projects.json
+pub fn store_path_for_socket(socket: &Path) -> PathBuf;   // socket 同目录下的 projects.json
 ```
+
+**路径从 socket 推导，不从 `$HOME` 推导。** socket 是 `~/.dct/daemon.sock`，推出来的
+`~/.dct/projects.json` 与直接用 `$HOME` 拼是同一个文件；但集成测试把 socket 建在临时目录里，
+于是自动拿到一份隔离的 store，不会污染你真实的 `~/.dct/projects.json`。
 
 磁盘格式：
 
