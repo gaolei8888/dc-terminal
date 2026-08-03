@@ -78,6 +78,8 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     let mut message = String::new();
     let mut screen: Vec<Vec<ScreenSpan>> = Vec::new();
     let mut screen_cursor = (0u16, 0u16);
+    // 上次告诉 agent 的画面尺寸，变了才发 Resize，避免每帧一次多余请求
+    let mut sent_size: Option<(u32, u16, u16)> = None;
     // 连不上守护进程 / 请求失败时置 false，看板上要能看出数据是陈旧的，
     // 不能让用户以为界面上的“干活中”还代表当前真实状态。每次循环开头的
     // List（以及 Attached 视图下的 Screen）调用是唯一的真相来源——它总在
@@ -105,6 +107,16 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         }
         if let View::Attached(id) = &view {
             let id = *id;
+            // 把 agent 画面区的真实大小告诉它。不做的话它永远按初始宽度排版，
+            // 窗口再宽也只用左边一块。减 2 是边框。
+            let area = term.size()?;
+            let rows = area.height.saturating_sub(2 + 3);
+            let cols = area.width.saturating_sub(2);
+            if sent_size != Some((id, rows, cols)) && rows > 0 && cols > 0 {
+                if client.call(Request::Resize { id, rows, cols }).is_ok() {
+                    sent_size = Some((id, rows, cols));
+                }
+            }
             match client.call(Request::Screen { id }) {
                 Ok(Response::Screen { lines, cursor }) => {
                     screen = lines;

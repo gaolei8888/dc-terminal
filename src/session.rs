@@ -208,6 +208,11 @@ impl SessionManager {
         self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor())))
     }
 
+    /// 改会话的显示尺寸。界面尺寸变了就要跟着调，否则 agent 按错的宽度排版。
+    pub fn resize(&self, id: u32, rows: u16, cols: u16) -> Result<()> {
+        self.with_session(id, |s| s.pty.resize(rows, cols))
+    }
+
     pub fn stop(&self, id: u32) -> Result<()> {
         self.with_session(id, |s| {
             s.pty.kill()?;
@@ -437,6 +442,22 @@ mod tests {
         let stats = m.diff(id).unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].added, 1);
+    }
+
+    #[test]
+    fn resize_changes_the_screen_size() {
+        // agent 必须按界面的真实宽度排版，否则窗口再宽也只用得到左边一块
+        let dir = tempfile::tempdir().unwrap();
+        let m = SessionManager::new();
+        let id = m.create(dir.path(), "shell").unwrap();
+
+        m.resize(id, 30, 200).unwrap();
+
+        let (lines, _) = m.screen(id).unwrap();
+        assert_eq!(lines.len(), 30, "行数应当跟着改");
+
+        let width: usize = lines[0].iter().map(|sp| sp.text.chars().count()).sum();
+        assert_eq!(width, 200, "列数应当跟着改，实际 {width}");
     }
 
     #[test]

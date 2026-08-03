@@ -84,6 +84,7 @@ fn handle(req: Request, mgr: &Arc<SessionManager>) -> Response {
         Request::Screen { id } => mgr
             .screen(id)
             .map(|(lines, cursor)| Response::Screen { lines, cursor }),
+        Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
         Request::Diff { id } => mgr.diff(id).map(Response::Diff),

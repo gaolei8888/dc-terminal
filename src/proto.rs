@@ -11,6 +11,7 @@ pub enum Request {
     Create { dir: String, profile: String },
     Input { id: u32, text: String },
     Screen { id: u32 },
+    Resize { id: u32, rows: u16, cols: u16 },
     Stop { id: u32 },
     Undo { id: u32 },
     Diff { id: u32 },
