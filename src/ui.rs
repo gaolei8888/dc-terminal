@@ -287,6 +287,22 @@ fn screen_to_lines(screen: &[Vec<ScreenSpan>]) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// 按显示宽度截断，超出的用 … 收尾。看板一行放不下就裁，不能让它换行把表格冲乱。
+fn truncate(s: &str, max: usize) -> String {
+    let mut w = 0;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let cw = if (ch as u32) > 0x1100 { 2 } else { 1 };
+        if w + cw > max {
+            out.push('…');
+            return out;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out
+}
+
 /// 把 $HOME 缩成 ~，界面上路径太长会被裁掉。
 fn short_path(p: &str) -> String {
     match std::env::var("HOME") {
@@ -411,7 +427,11 @@ fn draw(
                             Style::default().fg(status_color(s.state)),
                         ),
                         Span::raw(format!("{:<10}", s.profile)),
-                        Span::raw(short_path(&s.project)),
+                        Span::styled(
+                            format!("{:<22}", truncate(&short_path(&s.project), 22)),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::raw(truncate(&s.activity, 60)),
                     ]))
                 })
                 .collect();
@@ -536,6 +556,7 @@ mod tests {
                 dir: "/tmp/a/.git/dct-worktrees/s1".into(),
                 project: "/tmp/a".into(),
                 state: SessionState::Working,
+                activity: "正在读取 src/main.rs".into(),
             },
             SessionInfo {
                 id: 2,
@@ -543,6 +564,7 @@ mod tests {
                 dir: "/tmp/b".into(),
                 project: "/tmp/b".into(),
                 state: SessionState::Asking,
+                activity: "要用哪个方案？".into(),
             },
         ];
 
