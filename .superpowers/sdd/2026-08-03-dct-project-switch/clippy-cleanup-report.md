@@ -86,7 +86,9 @@ $ cargo test -- --test-threads=1
 test result: ok. 55 passed; 0 failed        (unittests src/lib.rs)
 test result: ok. 0 passed                   (unittests src/main.rs)
 test result: ok. 2 passed  (tests/cli.rs)
-test result: ok. 1 passed  (tests/client_timeout.rs)   ← 历史已知偶发时序测试，这次单独/串行都过
+test result: ok. 1 passed  (tests/client_timeout.rs)   ← 历史已知偶发时序测试；提交前那次串行全跑
+                                                            确实撞到一次偶发失败，单独重跑/再跑一次
+                                                            全套都过，跟已知的时序敏感表现一致，未改动
 test result: ok. 1 passed  (tests/concurrency.rs)
 test result: ok. 1 passed  (tests/daemon_detach.rs)
 test result: ok. 2 passed  (tests/daemon_roundtrip.rs)
