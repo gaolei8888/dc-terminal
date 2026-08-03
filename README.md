@@ -57,7 +57,7 @@ idle_pattern = "> $"
 ```
 
 - `command` 里要带上这个 agent 自己的权限绕过参数，否则它还是会停下来问
-- `is_agent = true` 的会话会自动建 worktree 和检查点；`false`（比如普通 shell）不会
+- `is_agent = true` 的会话会自动拍快照、支持撤销；`false`（比如普通 shell）不会
 - `idle_pattern` 是判断"干完活了"的正则，匹配的是屏幕文本
 
 ## 已知限制
