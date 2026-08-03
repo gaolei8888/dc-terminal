@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,11 +21,16 @@ pub fn run(socket: &Path) -> Result<()> {
 /// （见 `session.rs` 的注释），各方法自己负责该锁多细的粒度。如果外面再套一把大锁，
 /// 就白做了那些细粒度设计——一个连接处理慢请求时又会把其它连接一起卡住。
 pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+    // 权限必须收紧到只有属主可访问。这个 socket 能开会话、能往会话里发任意
+    // 输入——谁连得上，谁就能在这台机器上以你的身份执行任意命令。默认的 0755
+    // 意味着同机器的其它账号都能连。
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
