@@ -20,7 +20,7 @@ pub enum Request {
 pub enum Response {
     Sessions(Vec<SessionInfo>),
     Created { id: u32 },
-    Screen(String),
+    Screen { text: String, cursor: (u16, u16) },
     Diff(Vec<FileStat>),
     Profiles(Vec<String>),
     Ok,

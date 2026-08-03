@@ -75,7 +75,9 @@ fn handle(req: Request, mgr: &Arc<SessionManager>) -> Response {
             .create(&PathBuf::from(dir), &profile)
             .map(|id| Response::Created { id }),
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
-        Request::Screen { id } => mgr.screen(id).map(Response::Screen),
+        Request::Screen { id } => mgr
+            .screen(id)
+            .map(|(text, cursor)| Response::Screen { text, cursor }),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
         Request::Diff { id } => mgr.diff(id).map(Response::Diff),
