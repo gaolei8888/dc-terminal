@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::client::Client;
 use crate::proto::{Request, Response};
+use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
 use crate::session::{SessionInfo, SessionState};
 
 pub fn status_label(s: SessionState) -> &'static str {
@@ -68,7 +69,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     let mut list_state = ListState::default();
     let mut sessions: Vec<SessionInfo> = Vec::new();
     let mut message = String::new();
-    let mut screen = String::new();
+    let mut screen: Vec<Vec<ScreenSpan>> = Vec::new();
     let mut screen_cursor = (0u16, 0u16);
     // 连不上守护进程 / 请求失败时置 false，看板上要能看出数据是陈旧的，
     // 不能让用户以为界面上的“干活中”还代表当前真实状态。每次循环开头的
@@ -90,8 +91,8 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         if let View::Attached(id) = &view {
             let id = *id;
             match client.call(Request::Screen { id }) {
-                Ok(Response::Screen { text, cursor }) => {
-                    screen = text;
+                Ok(Response::Screen { lines, cursor }) => {
+                    screen = lines;
                     screen_cursor = cursor;
                     connected = true;
                 }
@@ -239,6 +240,53 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
     Some(s)
 }
 
+fn to_color(c: ScreenColor) -> Option<Color> {
+    match c {
+        ScreenColor::Default => None,
+        ScreenColor::Idx(i) => Some(Color::Indexed(i)),
+        ScreenColor::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+fn to_style(s: &ScreenStyle) -> Style {
+    let mut st = Style::default();
+    if let Some(c) = to_color(s.fg) {
+        st = st.fg(c);
+    }
+    if let Some(c) = to_color(s.bg) {
+        st = st.bg(c);
+    }
+    let mut m = Modifier::empty();
+    if s.bold {
+        m |= Modifier::BOLD;
+    }
+    if s.italic {
+        m |= Modifier::ITALIC;
+    }
+    if s.underline {
+        m |= Modifier::UNDERLINED;
+    }
+    if s.inverse {
+        m |= Modifier::REVERSED;
+    }
+    st.add_modifier(m)
+}
+
+/// agent 屏幕的样式化内容转成 ratatui 的行。丢掉样式的话 Claude Code
+/// 那种靠颜色区分的输出会退化成一片单色，基本没法看。
+fn screen_to_lines(screen: &[Vec<ScreenSpan>]) -> Vec<Line<'static>> {
+    screen
+        .iter()
+        .map(|row| {
+            Line::from(
+                row.iter()
+                    .map(|sp| Span::styled(sp.text.clone(), to_style(&sp.style)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 /// 把 $HOME 缩成 ~，界面上路径太长会被裁掉。
 fn short_path(p: &str) -> String {
     match std::env::var("HOME") {
@@ -281,7 +329,7 @@ fn draw(
     view: &View,
     sessions: &[SessionInfo],
     st: &mut ListState,
-    screen: &str,
+    screen: &[Vec<ScreenSpan>],
     cursor: (u16, u16),
     message: &str,
     connected: bool,
@@ -312,7 +360,7 @@ fn draw(
             };
             let area = chunks[0];
             f.render_widget(
-                Paragraph::new(screen).block(
+                Paragraph::new(screen_to_lines(screen)).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(border_style)
@@ -503,7 +551,7 @@ mod tests {
         st.select(Some(0));
 
         // 看板视图，含空消息
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", (0, 0), "", true))
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, &[], (0, 0), "", true))
             .unwrap();
         // 看板视图，带提示消息
         term.draw(|f| {
@@ -512,7 +560,7 @@ mod tests {
                 &View::Board,
                 &sessions,
                 &mut st,
-                "",
+                &[],
                 (0, 0),
                 "完成",
                 true,
@@ -520,10 +568,10 @@ mod tests {
         })
         .unwrap();
         // 看板为空列表也不能 panic
-        term.draw(|f| draw(f, &View::Board, &[], &mut st, "", (0, 0), "", true))
+        term.draw(|f| draw(f, &View::Board, &[], &mut st, &[], (0, 0), "", true))
             .unwrap();
         // 断连状态：底部提示和边框都要切到断连样式，也不能 panic
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", (0, 0), "", false))
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, &[], (0, 0), "", false))
             .unwrap();
         // profile 选择弹窗
         let profiles = vec!["claude".to_string(), "shell".to_string()];
@@ -533,7 +581,7 @@ mod tests {
                 &View::PickProfile(profiles.clone()),
                 &sessions,
                 &mut st,
-                "",
+                &[],
                 (0, 0),
                 "",
                 true,
@@ -547,7 +595,7 @@ mod tests {
                 &View::Attached(1),
                 &sessions,
                 &mut st,
-                "$ echo hi\nhi\n",
+                &[],
                 (0, 0),
                 "",
                 true,
@@ -561,7 +609,7 @@ mod tests {
                 &View::Attached(1),
                 &sessions,
                 &mut st,
-                "$ echo hi\nhi\n",
+                &[],
                 (0, 0),
                 "",
                 false,
@@ -587,7 +635,7 @@ mod tests {
                 &View::Board,
                 &sessions,
                 &mut st,
-                "",
+                &[],
                 (0, 0),
                 "完成",
                 false,

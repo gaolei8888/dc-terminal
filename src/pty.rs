@@ -1,9 +1,47 @@
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// 终端颜色。跟 vt100 的表示一一对应，额外实现序列化好走协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScreenColor {
+    #[default]
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl From<vt100::Color> for ScreenColor {
+    fn from(c: vt100::Color) -> Self {
+        match c {
+            vt100::Color::Default => ScreenColor::Default,
+            vt100::Color::Idx(i) => ScreenColor::Idx(i),
+            vt100::Color::Rgb(r, g, b) => ScreenColor::Rgb(r, g, b),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ScreenStyle {
+    pub fg: ScreenColor,
+    pub bg: ScreenColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+/// 一段样式相同的连续文字。按样式做游程合并，这样一屏通常只有几十个片段，
+/// 而不是几千个 cell —— 走协议的开销才不会失控。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSpan {
+    pub text: String,
+    pub style: ScreenStyle,
+}
 
 pub struct PtySession {
     parser: Arc<Mutex<vt100::Parser>>,
@@ -82,6 +120,49 @@ impl PtySession {
             .unwrap_or_else(|e| e.into_inner())
             .screen()
             .cursor_position()
+    }
+
+    /// 带颜色和粗体等属性的整屏内容，一行一个 `Vec<ScreenSpan>`。
+    /// 只传纯文本的话 agent 界面会变成单色，Claude Code 那种靠颜色区分的
+    /// 输出基本没法看。
+    pub fn screen_spans(&self) -> Vec<Vec<ScreenSpan>> {
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+
+        (0..rows)
+            .map(|r| {
+                let mut line: Vec<ScreenSpan> = Vec::new();
+                for c in 0..cols {
+                    let Some(cell) = screen.cell(r, c) else {
+                        continue;
+                    };
+                    // 宽字符占两格，第二格是延续位，再输出一次会把整行推歪
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    let text = cell.contents();
+                    let text = if text.is_empty() {
+                        " ".to_string()
+                    } else {
+                        text
+                    };
+                    let style = ScreenStyle {
+                        fg: cell.fgcolor().into(),
+                        bg: cell.bgcolor().into(),
+                        bold: cell.bold(),
+                        italic: cell.italic(),
+                        underline: cell.underline(),
+                        inverse: cell.inverse(),
+                    };
+                    match line.last_mut() {
+                        Some(last) if last.style == style => last.text.push_str(&text),
+                        _ => line.push(ScreenSpan { text, style }),
+                    }
+                }
+                line
+            })
+            .collect()
     }
 
     pub fn screen_text(&self) -> String {
