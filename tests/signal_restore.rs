@@ -1,0 +1,183 @@
+//! kill 掉 TUI 之后，终端必须还是能用的。
+//!
+//! `TerminalGuard` 的 `Drop` 盖不住信号：SIGTERM/SIGHUP 直接终止进程，不展开栈。
+//! 少了这条保障，用户「退不出去只好去别的窗口 kill」之后会拿到一个停在
+//! raw mode 的终端——回显和行缓冲全关，看上去像第二次卡死，得知道敲 `reset`
+//! 才救得回来。而「知道敲 reset」正是不该要求用户具备的知识。
+
+use std::os::unix::io::FromRawFd;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+/// 把测试用的二进制复制成一个独一无二的名字，收尾时按名字杀进程
+/// 不会误伤开发机上真正在跑的 dct 守护进程。
+fn unique_binary(dir: &Path, tag: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_BIN_EXE_dct"));
+    let dst = dir.join(format!("dct-{tag}-probe-{}", std::process::id()));
+    std::fs::copy(&src, &dst).unwrap();
+    dst
+}
+
+fn wait_for(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// raw mode 的特征：回显关、行缓冲关。任一为真就说明终端还没还回来。
+///
+/// 读的是 **master** 那一端，不是 slave。macOS（BSD）在会话首进程退出时会对
+/// 控制终端做一次 `revoke()`，之后 slave 的 fd 全部失效，`tcgetattr` 直接返回
+/// ENOTTY——而「进程死了之后终端什么状态」恰好是这个测试唯一想问的事，
+/// 从 slave 上根本问不出来。master 不受 revoke 影响，且 pty 会把 TIOCGETA
+/// 转给 slave 的 termios，读到的就是用户那一端的真实状态。
+unsafe fn is_raw(master: libc::c_int) -> bool {
+    let mut t: libc::termios = std::mem::zeroed();
+    assert_eq!(libc::tcgetattr(master, &mut t), 0, "读不到 termios");
+    (t.c_lflag & libc::ECHO) == 0 || (t.c_lflag & libc::ICANON) == 0
+}
+
+/// 在一个我们自己持有 fd 的 pty 里把 dct 跑起来，返回 (子进程, master fd)。
+///
+/// 必须 `setsid` + `TIOCSCTTY`：crossterm 的 `enable_raw_mode` 优先操作
+/// `/dev/tty`，也就是**控制终端**。不给子进程把这个 pty 设成控制终端的话，
+/// 它动的是 cargo test 自己的终端，这个测试就测了个寂寞。
+fn spawn_dct_in_pty(bin: &Path, home: &Path, cwd: &Path) -> (std::process::Child, libc::c_int) {
+    let (mut master, mut slave) = (0, 0);
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0,
+            "openpty 失败"
+        );
+    }
+
+    // 还没拉起任何进程，此刻必然不是 raw mode。这条断言是 `is_raw` 从 master
+    // 读 termios 这个做法的守门人：万一哪天 master 不再转发 TIOCGETA、恒返回
+    // 一份全零的 termios，下面的 `wait_until_raw` 会立刻为真，两个测试都会
+    // 变成永远通过的假绿。这里先钉死「空 pty 读出来是非 raw」。
+    assert!(
+        !unsafe { is_raw(master) },
+        "刚开出来的 pty 就被判成 raw mode，说明 master 读到的不是真 termios"
+    );
+
+    let (si, so, se) = unsafe {
+        (
+            Stdio::from_raw_fd(libc::dup(slave)),
+            Stdio::from_raw_fd(libc::dup(slave)),
+            Stdio::from_raw_fd(libc::dup(slave)),
+        )
+    };
+
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(cwd)
+        .env("HOME", home)
+        .env("TERM", "xterm-256color")
+        .stdin(si)
+        .stdout(so)
+        .stderr(se);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("拉不起 dct");
+    // 父进程这份 slave 没用了，早点还掉：留着它，子进程死后 master 读不到 EOF，
+    // 下面那条 drain 线程就永远挂着。
+    unsafe { libc::close(slave) };
+
+    // 必须有人一直读 master，否则 TUI 画第一帧就把 pty 缓冲写满、卡在 write 里
+    // 出不来——实测那样连 SIGTERM 都收拾不干净，进程会停在 ps 的 `?E`
+    //「正在退出」状态上十几秒不动。真终端本来就一直在读，这条只是把它补上。
+    // 读 dup 出来的副本：收尾时主线程 close(master) 不会跟这个线程抢同一个 fd。
+    let drain = unsafe { libc::dup(master) };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while unsafe { libc::read(drain, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
+        unsafe { libc::close(drain) };
+    });
+
+    (child, master)
+}
+
+/// 等 TUI 真的进了 raw mode。不等就发信号的话，测试可能在它还没设置终端时
+/// 就把它杀了——那样即使有 bug 也会「通过」。
+fn wait_until_raw(master: libc::c_int) -> bool {
+    wait_for(|| unsafe { is_raw(master) }, 20)
+}
+
+#[test]
+fn sigterm_restores_the_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let workdir = tempfile::tempdir().unwrap();
+    let bin = unique_binary(home.path(), "sigterm");
+
+    let (mut child, master) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
+    assert!(
+        wait_until_raw(master),
+        "TUI 始终没进 raw mode，测试前提不成立"
+    );
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert!(
+        wait_for(
+            || child.try_wait().map(|s| s.is_some()).unwrap_or(false),
+            10
+        ),
+        "SIGTERM 之后 TUI 应当退出"
+    );
+
+    assert!(
+        !unsafe { is_raw(master) },
+        "SIGTERM 之后终端仍停在 raw mode——用户会拿到一个不回显、不换行的死终端"
+    );
+
+    unsafe { libc::close(master) };
+}
+
+#[test]
+fn sighup_restores_the_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let workdir = tempfile::tempdir().unwrap();
+    let bin = unique_binary(home.path(), "sighup");
+
+    let (mut child, master) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
+    assert!(
+        wait_until_raw(master),
+        "TUI 始终没进 raw mode，测试前提不成立"
+    );
+
+    // 关终端窗口、tmux 杀 pane 走的都是这条
+    unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+    assert!(
+        wait_for(
+            || child.try_wait().map(|s| s.is_some()).unwrap_or(false),
+            10
+        ),
+        "SIGHUP 之后 TUI 应当退出"
+    );
+
+    assert!(!unsafe { is_raw(master) }, "SIGHUP 之后终端仍停在 raw mode");
+
+    unsafe { libc::close(master) };
+}
