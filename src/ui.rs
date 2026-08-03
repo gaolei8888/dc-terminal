@@ -1,7 +1,7 @@
 // Task 6 实现
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -180,40 +180,60 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 }
                 _ => {}
             },
-            View::Attached(id) => match key.code {
-                KeyCode::Esc => view = View::Board,
-                // 逐字符/回车发送失败时不能像原来那样用 `let _ =` 静默吞掉——
-                // 用户打字没反应会分不清是卡顿还是断连。这里只负责给出提示文字，
-                // “连不上”这个视觉状态（红色边框、底部横幅）统一交给循环顶部
-                // 每轮都会重新做的 List/Screen 探测去判定，不在这里单独维护。
-                KeyCode::Enter => {
-                    if client
-                        .call(Request::Input {
-                            id,
-                            text: String::new(),
-                        })
-                        .is_err()
-                    {
-                        message = "守护进程连不上，刚才那次回车没发出去".into();
+            View::Attached(id) => {
+                // Esc 留给"回看板"，不转发给 agent。其余按键一律走 key_to_input
+                // 翻译成终端字节序列送进去——方向键、退格、Tab、Ctrl 组合都要能用，
+                // 否则在 Claude Code 里连打错字都退不了格。
+                if key.code == KeyCode::Esc {
+                    view = View::Board;
+                } else if let Some(text) = key_to_input(&key) {
+                    // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
+                    // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
+                    if client.call(Request::Input { id, text }).is_err() {
+                        message = "守护进程连不上，刚才那次输入没发出去".into();
                     }
                 }
-                KeyCode::Char(c) => {
-                    if client
-                        .call(Request::Input {
-                            id,
-                            text: c.to_string(),
-                        })
-                        .is_err()
-                    {
-                        message = format!("守护进程连不上，'{c}' 没发出去");
-                    }
-                }
-                _ => {}
-            },
+            }
         }
     };
 
     res
+}
+
+/// 把一次按键翻译成要送进 agent 的字节。返回 `None` 表示这个键不转发。
+///
+/// 空串是与 `session::send_input` 约定的"回车"信号——只有它会触发检查点，
+/// 逐字符输入不会产生提交。所以回车必须返回 `Some(String::new())` 而不是 "\r"。
+pub fn key_to_input(key: &KeyEvent) -> Option<String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let s = match key.code {
+        KeyCode::Enter => String::new(),
+        KeyCode::Char(c) if ctrl => {
+            // Ctrl+A..Ctrl+Z -> 0x01..0x1a，其余 Ctrl 组合不转发
+            let lower = c.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                char::from(lower as u8 - b'a' + 1).to_string()
+            } else {
+                return None;
+            }
+        }
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Backspace => "\x7f".into(),
+        KeyCode::Tab => "\t".into(),
+        KeyCode::BackTab => "\x1b[Z".into(),
+        KeyCode::Up => "\x1b[A".into(),
+        KeyCode::Down => "\x1b[B".into(),
+        KeyCode::Right => "\x1b[C".into(),
+        KeyCode::Left => "\x1b[D".into(),
+        KeyCode::Home => "\x1b[H".into(),
+        KeyCode::End => "\x1b[F".into(),
+        KeyCode::PageUp => "\x1b[5~".into(),
+        KeyCode::PageDown => "\x1b[6~".into(),
+        KeyCode::Delete => "\x1b[3~".into(),
+        KeyCode::Insert => "\x1b[2~".into(),
+        _ => return None,
+    };
+    Some(s)
 }
 
 fn selected<'a>(sessions: &'a [SessionInfo], st: &ListState) -> Option<&'a SessionInfo> {
@@ -349,6 +369,63 @@ fn draw(
 mod tests {
     use super::*;
     use crate::session::SessionState;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn arrow_keys_are_forwarded_as_escape_sequences() {
+        assert_eq!(key_to_input(&key(KeyCode::Up)).as_deref(), Some("\x1b[A"));
+        assert_eq!(key_to_input(&key(KeyCode::Down)).as_deref(), Some("\x1b[B"));
+        assert_eq!(
+            key_to_input(&key(KeyCode::Right)).as_deref(),
+            Some("\x1b[C")
+        );
+        assert_eq!(key_to_input(&key(KeyCode::Left)).as_deref(), Some("\x1b[D"));
+    }
+
+    #[test]
+    fn editing_keys_are_forwarded() {
+        assert_eq!(
+            key_to_input(&key(KeyCode::Backspace)).as_deref(),
+            Some("\x7f")
+        );
+        assert_eq!(key_to_input(&key(KeyCode::Tab)).as_deref(), Some("\t"));
+        assert_eq!(
+            key_to_input(&key(KeyCode::Delete)).as_deref(),
+            Some("\x1b[3~")
+        );
+    }
+
+    #[test]
+    fn enter_sends_empty_string_so_checkpoint_fires() {
+        // 空串是与 session::send_input 约定的回车信号，只有它会打检查点
+        assert_eq!(key_to_input(&key(KeyCode::Enter)).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn ctrl_letters_become_control_bytes() {
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_input(&c).as_deref(), Some("\u{3}"));
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_input(&a).as_deref(), Some("\u{1}"));
+    }
+
+    #[test]
+    fn plain_chars_pass_through() {
+        assert_eq!(key_to_input(&key(KeyCode::Char('x'))).as_deref(), Some("x"));
+        assert_eq!(
+            key_to_input(&key(KeyCode::Char('中'))).as_deref(),
+            Some("中")
+        );
+    }
+
+    #[test]
+    fn esc_is_not_forwarded() {
+        // Esc 保留给"回看板"，不能送给 agent
+        assert!(key_to_input(&key(KeyCode::Esc)).is_none());
+    }
 
     #[test]
     fn status_labels_are_chinese() {
