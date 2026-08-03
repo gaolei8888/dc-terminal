@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -35,15 +36,28 @@ fn run_ui() -> Result<()> {
     let sock = socket_path();
 
     if Client::connect(&sock).is_err() {
-        // 守护进程的输出必须全部丢弃：它和 TUI 共用同一个终端，
-        // 任何一行 stderr 都会直接糊在界面上。
-        Command::new(std::env::current_exe()?)
-            .arg("daemon")
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("daemon")
+            // 守护进程的输出必须全部丢弃：它和 TUI 共用同一个终端，
+            // 任何一行 stderr 都会直接糊在界面上。
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("拉起守护进程失败")?;
+            .stderr(Stdio::null());
+
+        // setsid：让守护进程脱离当前终端会话，自成一个新会话。
+        // 不这么做的话它跟 TUI 在同一个 session 里，关掉终端窗口时
+        // SIGHUP 会把它一起带走——而"关掉窗口不影响会话"正是这个产品
+        // 存在的理由。
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        cmd.spawn().context("拉起守护进程失败")?;
 
         for _ in 0..50 {
             if Client::connect(&sock).is_ok() {
