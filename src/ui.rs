@@ -475,7 +475,7 @@ fn draw(
     connected: bool,
     current: &str,
 ) {
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(f.area());
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
 
     // 断连时用红色边框给出明确的视觉提示：界面上的数据是上一次成功请求
     // 留下的陈旧快照，不代表守护进程现在的真实状态。
@@ -590,25 +590,21 @@ fn draw(
             Style::default().fg(Color::Red),
         )
     } else if message.text.is_empty() {
-        (
-            format!("当前项目：{}\n{}", short_path(current), idle_help),
-            Style::default(),
-        )
+        (idle_help.to_string(), Style::default())
+    } else if message.error {
+        (message.text.clone(), Style::default().fg(Color::Red))
     } else {
-        let s = if message.error {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default()
-        };
-        (
-            format!("当前项目：{}\n{}", short_path(current), message.text),
-            s,
-        )
+        (message.text.clone(), Style::default())
     };
+    // 当前项目放在边框标题里，框内只留一行字。中文是双宽字符，
+    // 「当前项目：~/work/dc/dc-terminal」加上看板按键表在 80 列终端里放不下同一行，
+    // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
     f.render_widget(
-        Paragraph::new(help)
-            .style(style)
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(help).style(style).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("当前项目：{}", short_path(current))),
+        ),
         chunks[1],
     );
 }
