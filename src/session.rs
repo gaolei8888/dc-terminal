@@ -169,24 +169,37 @@ impl SessionManager {
     }
 
     /// 送内容给 agent。`text` 为空表示回车，也就是一轮的开始。
-    /// **只有回车才打检查点**——逐字符输入不能每敲一下就产生一个提交。
+    /// **只有回车才打检查点**——逐字符输入不能每敲一下就拍一次快照。
+    ///
+    /// 拍快照可能很慢（大仓库要跑好几个 git 子进程），所以**全程不持会话锁**：
+    /// 先拿到需要的信息就放锁，慢活做完再回来把结果写进去。持锁做慢活会让
+    /// 这个会话卡住整个看板——`list()` 要逐个锁会话取状态。
     pub fn send_input(&self, id: u32, text: &str) -> Result<()> {
-        let is_enter = text.is_empty();
-        self.with_session(id, |s| {
-            if is_enter {
-                if s.is_agent {
-                    let sha = git::checkpoint(&s.dir, s.id, s.checkpoints.len())?;
-                    if s.checkpoints.last() != Some(&sha) {
-                        s.checkpoints.push(sha);
-                    }
+        let arc = self.get_arc(id)?;
+
+        if text.is_empty() {
+            let (dir, sid, seq, is_agent) = {
+                let s = recover(arc.lock());
+                (s.dir.clone(), s.id, s.checkpoints.len(), s.is_agent)
+            };
+
+            if is_agent {
+                let sha = git::checkpoint(&dir, sid, seq)?; // 慢，无锁
+                let mut s = recover(arc.lock());
+                if s.checkpoints.last() != Some(&sha) {
+                    s.checkpoints.push(sha);
                 }
                 s.state = SessionState::Working;
+            } else {
+                recover(arc.lock()).state = SessionState::Working;
             }
 
-            let payload = if is_enter { "\r" } else { text };
-            s.pty.write(payload.as_bytes())?;
-            Ok(())
-        })
+            let g = recover(arc.lock());
+            return g.pty.write(b"\r");
+        }
+
+        let g = recover(arc.lock());
+        g.pty.write(text.as_bytes())
     }
 
     /// 返回 agent 屏幕文本和光标位置 (行, 列)。光标必须跟文本一起取，
@@ -203,30 +216,31 @@ impl SessionManager {
         })
     }
 
+    /// 恢复到最后一张快照。git 操作同样不持会话锁，理由见 `send_input`。
     pub fn undo(&self, id: u32) -> Result<()> {
-        self.with_session(id, |s| {
-            if !s.is_agent {
-                anyhow::bail!("这个会话没有检查点");
-            }
-            let sha = s
-                .checkpoints
-                .last()
-                .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
-            git::restore(&s.dir, sha)
-        })
+        let (dir, sha) = self.checkpoint_base(id, "这个会话没有检查点")?;
+        git::restore(&dir, &sha)
     }
 
+    /// 相对最后一张快照改了哪些文件。git 操作不持会话锁。
     pub fn diff(&self, id: u32) -> Result<Vec<FileStat>> {
-        self.with_session(id, |s| {
-            if !s.is_agent {
-                anyhow::bail!("这个会话没有改动记录");
-            }
-            let base = s
-                .checkpoints
-                .last()
-                .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
-            git::diff_stat(&s.dir, base)
-        })
+        let (dir, base) = self.checkpoint_base(id, "这个会话没有改动记录")?;
+        git::diff_stat(&dir, &base)
+    }
+
+    /// 取出做 git 操作需要的信息后立刻放锁。
+    fn checkpoint_base(&self, id: u32, not_agent: &str) -> Result<(PathBuf, String)> {
+        let arc = self.get_arc(id)?;
+        let s = recover(arc.lock());
+        if !s.is_agent {
+            anyhow::bail!("{not_agent}");
+        }
+        let sha = s
+            .checkpoints
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
+        Ok((s.dir.clone(), sha))
     }
 
     /// 扫一遍所有会话，更新状态。由守护进程定时调用。
