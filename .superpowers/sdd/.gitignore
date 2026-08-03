@@ -1,4 +1,1 @@
-# 评审用的 diff 快照不入库：它们是 `git diff <a>..<b>` 的产物，
-# 两个 commit 都在历史里，随时能一字不差地重新生成。
-# brief / report / progress 是人工判断的记录，重建不出来，必须跟踪。
-*.diff
+*
