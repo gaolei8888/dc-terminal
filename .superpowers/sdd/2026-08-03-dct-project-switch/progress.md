@@ -55,3 +55,13 @@ Task 3: review — 需求符合性 ✅；Critical 0；Important 0
   且修掉了一个潜在的陈旧选中项问题，非回归
 Task 3: minor (deferred): move_sel 空列表语义变化值得加一行注释，免得将来看 blame 误判为回归
 Task 3: complete (commits 5742970..4e1b518, review clean)
+
+Task 4: 实现完成 (commit 00b4ce4)。原实现者的 report 文件缺失（上一次会话在提交后中断），
+  控制者已自行跑过全量测试：只有 tests/client_timeout.rs 偶发失败，单独跑通过，
+  是既有的时序敏感测试，与本任务无关。
+计划修订 2 (未提交时机: 与 Task 4 修复同批)：用户看到实际界面后指出底部栏占了两行，要求「用一行」。
+  裁定：当前项目移到底部框的边框标题里，框内只留一行（提示或消息）。中文双宽，
+  「当前项目：~/work/dc/dc-terminal」+ 看板按键表在 80 列里同一行必被截断，标题行本来就空着。
+  Task 5 里选中项目后的提示随之从「当前项目：X」改成「已切到 X」，免得和标题重复。
+  计划正文 Task 4 步骤 3e 与 Task 5 步骤 3c 已同步修改，task-4-brief.md 已重新生成。
+Task 4: fix round 1/5 dispatched — 底部栏改一行（新实现者，原实现者已不在）
