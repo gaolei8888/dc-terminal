@@ -79,23 +79,78 @@ enum View {
     },
 }
 
+/// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
+///
+/// 抽成自由函数是因为有两个调用方——`TerminalGuard::drop` 和信号线程。
+/// 两份各自维护的清理代码迟早会漂移，而漂移的后果是用户拿到一个半还原的终端。
+///
+/// 两步都 `let _ =` 吞错：`Drop` 里不能 panic，而且这里能做的补救本来就只有
+/// 「尽量多还原一点」。
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+}
+
 /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
 /// mode / alternate screen；`run()` 的主循环里到处都是 `?`，一旦某次
 /// `client.call`/`term.draw` 出错就会直接从函数返回，跳过写在循环末尾的清理代码，
 /// 把用户的终端卡在 raw mode（回显、行缓冲全关）。这个 guard 保证不管是提前
-/// `return`/`?`、正常 `break`，还是 panic 展开，`Drop` 都会跑一次——`Drop` 里不能
-/// panic，所以两步清理都用 `let _ =` 吞掉错误。
+/// `return`/`?`、正常 `break`，还是 panic 展开，`Drop` 都会跑一次。
+///
+/// 它盖不住的只剩信号——那条交给 `spawn_signal_restore`。
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        restore_terminal();
     }
+}
+
+/// 让 SIGTERM / SIGINT / SIGHUP 也能还原终端。
+///
+/// 为什么不是信号 handler：handler 里能调的函数必须 async-signal-safe，而
+/// crossterm 的 `disable_raw_mode()` 内部要锁一把全局 Mutex 去取原始 termios——
+/// 信号打断的正好是持锁的主线程时就死锁。`sigwait` 在普通线程上下文里返回，
+/// 之后跑的是普通代码，这个约束整个消失，也才谈得上跟 `TerminalGuard` 共用
+/// 同一个 `restore_terminal()`。
+///
+/// 为什么不是「置个标志位让主循环自己退」：主循环卡在 `client.call` 上
+/// （守护进程死了、socket 不回）时永远轮不到下一个 tick，而那正是用户会去
+/// 别的窗口 kill 的场景——恰好是最需要它工作的时候不工作。
+///
+/// 屏蔽掩码会被子进程继承（`execve` 之后仍保留），但这里不用担心：TUI 进程
+/// 在 `run()` 里不 fork 任何东西，PTY 全在守护进程里（`src/pty.rs`），而守护
+/// 进程在 `src/main.rs:60` 就已经拉起，早于 `src/main.rs:72` 的 `ui::run`。
+///
+/// raw mode 下 Ctrl+C 不产生 SIGINT（termios 关了 ISIG），所以屏蔽 SIGINT
+/// 不影响 Ctrl+C 透传给 agent；这条只对外部 `kill -INT` 生效。
+fn spawn_signal_restore() {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        // 主线程先屏蔽，之后 spawn 出来的线程继承这份掩码，
+        // 于是这三个信号只会被下面的 sigwait 取走，不会走默认处置直接杀进程。
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+
+    std::thread::spawn(move || {
+        let mut signo: libc::c_int = 0;
+        if unsafe { libc::sigwait(&set, &mut signo) } != 0 {
+            return;
+        }
+        restore_terminal();
+        // 不能用 `exit`：它会跑 atexit 和静态析构，而主线程此刻还在跑自己的事，
+        // 两边可能同时清理终端或撞上同一把锁。终端已经在上一行还原好了，立刻走人。
+        // 退出码 128 + signo 是 shell 惯例，SIGTERM 就是 143，脚本还能判断死因。
+        unsafe { libc::_exit(128 + signo) };
+    });
 }
 
 pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
@@ -104,6 +159,11 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     let start_dir = default_dir.clone();
     let mut current_dir = default_dir;
 
+    // 必须在 enable_raw_mode 之前装：装早了无害（还没进 raw mode 时
+    // restore_terminal() 没有副作用，多发一次 LeaveAlternateScreen 也无害），
+    // 装晚了就有一个「已经进 raw mode 但信号还没被接管」的真空窗口。
+    // 跟 TerminalGuard 提前构造是同一个理由。
+    spawn_signal_restore();
     enable_raw_mode()?;
     // 必须在 EnterAlternateScreen / Terminal::new 之前构造：这样即便它们俩失败，
     // raw mode 也还是能被 Drop 恢复。
