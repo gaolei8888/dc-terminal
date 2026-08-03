@@ -24,11 +24,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("执行 git {args:?} 失败"))?;
     if !out.status.success() {
-        bail!(
-            "git {:?} 失败: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        // 不要把命令数组和 git 的英文原文原样甩到界面上——用户看不懂，
+        // 也不知道该做什么。调用方负责给出中文的上下文。
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -47,9 +45,11 @@ pub fn create_worktree(repo: &Path, name: &str) -> Result<Worktree> {
         bail!("{} 不是 git 仓库，无法开 agent 会话", repo.display());
     }
     let root = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?);
-    let branch = format!("dct/{name}");
-    // 放在 .git 里面：主工作树的 git status 看不见它，git clean -fd 也不会误删
-    let path = root.join(".git").join("dct-worktrees").join(name);
+
+    // 会话编号在守护进程重启后会从 1 重来，而上次留下的分支和 worktree
+    // 按设计是不清理的（保住 agent 干过的活）。所以名字必须自动避让，
+    // 否则重启后每次新建都必然撞名失败。
+    let (branch, path) = free_name(&root, name)?;
 
     git(
         &root,
@@ -61,13 +61,47 @@ pub fn create_worktree(repo: &Path, name: &str) -> Result<Worktree> {
             &branch,
             path.to_str().context("worktree 路径不是合法 UTF-8")?,
         ],
-    )?;
+    )
+    .with_context(|| format!("在 {} 里建工作副本失败", root.display()))?;
 
     Ok(Worktree {
         path,
         branch,
         repo: root,
     })
+}
+
+fn branch_exists(root: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 找一个既没有同名分支、目录也不存在的名字。`s3` 被占了就试 `s3-2`、`s3-3`……
+fn free_name(root: &Path, name: &str) -> Result<(String, PathBuf)> {
+    // 放在 .git 里面：主工作树的 git status 看不见它，git clean -fd 也不会误删
+    let base = root.join(".git").join("dct-worktrees");
+    for i in 1..1000 {
+        let candidate = if i == 1 {
+            name.to_string()
+        } else {
+            format!("{name}-{i}")
+        };
+        let branch = format!("dct/{candidate}");
+        let path = base.join(&candidate);
+        if !branch_exists(root, &branch) && !path.exists() {
+            return Ok((branch, path));
+        }
+    }
+    bail!("这个仓库里遗留的会话工作副本太多了，清理一些再试")
 }
 
 pub fn remove_worktree(wt: &Worktree) -> Result<()> {
@@ -203,6 +237,28 @@ mod tests {
         // 提交之后工作区干净，再 checkpoint 应当返回同一个 sha
         let third = checkpoint(&wt, "c2").unwrap();
         assert_eq!(second, third);
+    }
+
+    #[test]
+    fn reuses_name_by_suffixing_when_branch_exists() {
+        // 守护进程重启后会话编号从 1 重来，而分支按设计不清理。
+        // 同一个名字必须能自动避让，否则重启后每次新建都失败。
+        let repo = init_repo();
+        let a = create_worktree(repo.path(), "s1").unwrap();
+        assert_eq!(a.branch, "dct/s1");
+
+        let b = create_worktree(repo.path(), "s1").unwrap();
+        assert_eq!(
+            b.branch, "dct/s1-2",
+            "撞名时必须自动换一个，实际 {}",
+            b.branch
+        );
+        assert!(b.path.exists());
+        assert_ne!(a.path, b.path);
+
+        // 原来那个必须原封不动——它上面是 agent 干过的活
+        assert!(a.path.exists());
+        assert!(branch_exists(&a.repo, "dct/s1"));
     }
 
     #[test]
