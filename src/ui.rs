@@ -69,6 +69,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     let mut sessions: Vec<SessionInfo> = Vec::new();
     let mut message = String::new();
     let mut screen = String::new();
+    let mut screen_cursor = (0u16, 0u16);
     // 连不上守护进程 / 请求失败时置 false，看板上要能看出数据是陈旧的，
     // 不能让用户以为界面上的“干活中”还代表当前真实状态。每次循环开头的
     // List（以及 Attached 视图下的 Screen）调用是唯一的真相来源——它总在
@@ -89,8 +90,9 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         if let View::Attached(id) = &view {
             let id = *id;
             match client.call(Request::Screen { id }) {
-                Ok(Response::Screen(s)) => {
-                    screen = s;
+                Ok(Response::Screen { text, cursor }) => {
+                    screen = text;
+                    screen_cursor = cursor;
                     connected = true;
                 }
                 _ => connected = false,
@@ -104,6 +106,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 &sessions,
                 &mut list_state,
                 &screen,
+                screen_cursor,
                 &message,
                 connected,
             )
@@ -236,6 +239,14 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
     Some(s)
 }
 
+/// 把 $HOME 缩成 ~，界面上路径太长会被裁掉。
+fn short_path(p: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
+        _ => p.to_string(),
+    }
+}
+
 fn selected<'a>(sessions: &'a [SessionInfo], st: &ListState) -> Option<&'a SessionInfo> {
     st.selected().and_then(|i| sessions.get(i))
 }
@@ -271,6 +282,7 @@ fn draw(
     sessions: &[SessionInfo],
     st: &mut ListState,
     screen: &str,
+    cursor: (u16, u16),
     message: &str,
     connected: bool,
 ) {
@@ -286,11 +298,19 @@ fn draw(
 
     match view {
         View::Attached(id) => {
+            // 标题显示用户当初指定的项目目录，不是内部的 worktree 路径——
+            // 给用户看 .git/dct-worktrees/s2 只会让他不知道自己在哪。
+            let project = sessions
+                .iter()
+                .find(|s| s.id == *id)
+                .map(|s| short_path(&s.project))
+                .unwrap_or_default();
             let title = if connected {
-                format!("会话 {id} —— Esc 返回看板")
+                format!("会话 {id} · {project} —— Esc 返回看板")
             } else {
-                format!("会话 {id}（连接已断开，画面可能过期）—— Esc 返回看板")
+                format!("会话 {id} · {project}（连接已断开，画面可能过期）—— Esc 返回看板")
             };
+            let area = chunks[0];
             f.render_widget(
                 Paragraph::new(screen).block(
                     Block::default()
@@ -298,8 +318,18 @@ fn draw(
                         .border_style(border_style)
                         .title(title),
                 ),
-                chunks[0],
+                area,
             );
+            // 把 agent 屏幕里的光标位置映射到真实终端上。没有这一步用户
+            // 看到的只是一张死截图，不知道自己打的字会落在哪。+1 是边框。
+            let (row, col) = cursor;
+            let x = area.x + 1 + col;
+            let y = area.y + 1 + row;
+            if x < area.x + area.width.saturating_sub(1)
+                && y < area.y + area.height.saturating_sub(1)
+            {
+                f.set_cursor_position((x, y));
+            }
         }
         View::PickProfile(profiles) => {
             let text: Vec<Line> = profiles
@@ -333,7 +363,7 @@ fn draw(
                             Style::default().fg(status_color(s.state)),
                         ),
                         Span::raw(format!("{:<10}", s.profile)),
-                        Span::raw(s.dir.clone()),
+                        Span::raw(short_path(&s.project)),
                     ]))
                 })
                 .collect();
@@ -455,13 +485,15 @@ mod tests {
             SessionInfo {
                 id: 1,
                 profile: "claude".into(),
-                dir: "/tmp/a".into(),
+                dir: "/tmp/a/.git/dct-worktrees/s1".into(),
+                project: "/tmp/a".into(),
                 state: SessionState::Working,
             },
             SessionInfo {
                 id: 2,
                 profile: "shell".into(),
                 dir: "/tmp/b".into(),
+                project: "/tmp/b".into(),
                 state: SessionState::Asking,
             },
         ];
@@ -471,16 +503,27 @@ mod tests {
         st.select(Some(0));
 
         // 看板视图，含空消息
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "", true))
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", (0, 0), "", true))
             .unwrap();
         // 看板视图，带提示消息
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "完成", true))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &sessions,
+                &mut st,
+                "",
+                (0, 0),
+                "完成",
+                true,
+            )
+        })
+        .unwrap();
         // 看板为空列表也不能 panic
-        term.draw(|f| draw(f, &View::Board, &[], &mut st, "", "", true))
+        term.draw(|f| draw(f, &View::Board, &[], &mut st, "", (0, 0), "", true))
             .unwrap();
         // 断连状态：底部提示和边框都要切到断连样式，也不能 panic
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "", false))
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", (0, 0), "", false))
             .unwrap();
         // profile 选择弹窗
         let profiles = vec!["claude".to_string(), "shell".to_string()];
@@ -491,6 +534,7 @@ mod tests {
                 &sessions,
                 &mut st,
                 "",
+                (0, 0),
                 "",
                 true,
             )
@@ -504,6 +548,7 @@ mod tests {
                 &sessions,
                 &mut st,
                 "$ echo hi\nhi\n",
+                (0, 0),
                 "",
                 true,
             )
@@ -517,6 +562,7 @@ mod tests {
                 &sessions,
                 &mut st,
                 "$ echo hi\nhi\n",
+                (0, 0),
                 "",
                 false,
             )
@@ -535,8 +581,19 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut st = ListState::default();
 
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "完成", false))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Board,
+                &sessions,
+                &mut st,
+                "",
+                (0, 0),
+                "完成",
+                false,
+            )
+        })
+        .unwrap();
         // ratatui 给宽字符（中文）后面那个 cell 塞的是 " "（`Cell::reset`），
         // 不是空串，所以逐 cell 拼出来的文本每个汉字后面都夹了一个空格
         // （"守 护 进 程..."）。去掉空白之后再做子串匹配，两边都做同样的

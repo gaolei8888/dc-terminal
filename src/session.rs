@@ -22,7 +22,11 @@ pub enum SessionState {
 pub struct SessionInfo {
     pub id: u32,
     pub profile: String,
+    /// agent 实际跑在里面的目录（worktree）。是内部实现细节，不该直接展示给用户。
     pub dir: String,
+    /// 用户当初指定的那个项目目录。界面上要显示的是这个——
+    /// 给用户看 `.git/dct-worktrees/s2` 只会让他不知道自己在哪。
+    pub project: String,
     pub state: SessionState,
 }
 
@@ -30,6 +34,7 @@ struct Session {
     id: u32,
     profile: Profile,
     dir: PathBuf,
+    project: PathBuf,
     worktree: Option<Worktree>,
     checkpoints: Vec<String>,
     state: SessionState,
@@ -119,6 +124,7 @@ impl SessionManager {
             id,
             profile,
             dir: workdir,
+            project: dir.to_path_buf(),
             worktree,
             checkpoints,
             state: SessionState::Working,
@@ -158,6 +164,7 @@ impl SessionManager {
                     id: s.id,
                     profile: s.profile.name.clone(),
                     dir: s.dir.display().to_string(),
+                    project: s.project.display().to_string(),
                     state: s.state,
                 }
             })
@@ -187,8 +194,10 @@ impl SessionManager {
         })
     }
 
-    pub fn screen(&self, id: u32) -> Result<String> {
-        self.with_session(id, |s| Ok(s.pty.screen_text()))
+    /// 返回 agent 屏幕文本和光标位置 (行, 列)。光标必须跟文本一起取，
+    /// 否则界面只是一张死截图，用户看不出自己打的字落在哪。
+    pub fn screen(&self, id: u32) -> Result<(String, (u16, u16))> {
+        self.with_session(id, |s| Ok((s.pty.screen_text(), s.pty.cursor())))
     }
 
     pub fn stop(&self, id: u32) -> Result<()> {

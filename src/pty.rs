@@ -49,7 +49,10 @@ impl PtySession {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => rp.lock().unwrap().process(&buf[..n]),
+                    Ok(n) => rp
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .process(&buf[..n]),
                 }
             }
             ra.store(false, Ordering::SeqCst);
@@ -65,21 +68,40 @@ impl PtySession {
     }
 
     pub fn write(&self, data: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         w.write_all(data)?;
         w.flush()?;
         Ok(())
     }
 
+    /// agent 屏幕里光标所在的 (行, 列)，0 起算。没有它 TUI 只能显示一张死截图，
+    /// 用户看不出自己打的字会落在哪。
+    pub fn cursor(&self) -> (u16, u16) {
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .cursor_position()
+    }
+
     pub fn screen_text(&self) -> String {
-        self.parser.lock().unwrap().screen().contents()
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .contents()
     }
 
     pub fn is_alive(&self) -> bool {
         if !self.alive.load(Ordering::SeqCst) {
             return false;
         }
-        match self.child.lock().unwrap().try_wait() {
+        match self
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_wait()
+        {
             Ok(Some(_)) => {
                 self.alive.store(false, Ordering::SeqCst);
                 false
@@ -95,7 +117,7 @@ impl PtySession {
     }
 
     pub fn kill(&mut self) -> Result<()> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         // portable-pty 在 unix 上的 kill() 先发 SIGHUP 并给约 200ms 宽限期
         // 自行退出被回收；超时后退化为 SIGKILL，这条路径不会再 wait()。
         // 因此这里必须显式 wait 一次，否则子进程会变成僵尸。
@@ -107,7 +129,10 @@ impl PtySession {
     }
 
     pub fn process_id(&self) -> Option<u32> {
-        self.child.lock().unwrap().process_id()
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process_id()
     }
 }
 
