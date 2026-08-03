@@ -40,8 +40,26 @@ enum View {
     PickProfile(Vec<String>),
 }
 
+/// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
+/// mode / alternate screen；`run()` 的主循环里到处都是 `?`，一旦某次
+/// `client.call`/`term.draw` 出错就会直接从函数返回，跳过写在循环末尾的清理代码，
+/// 把用户的终端卡在 raw mode（回显、行缓冲全关）。这个 guard 保证不管是提前
+/// `return`/`?`、正常 `break`，还是 panic 展开，`Drop` 都会跑一次——`Drop` 里不能
+/// panic，所以两步清理都用 `let _ =` 吞掉错误。
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     enable_raw_mode()?;
+    // 必须在 EnterAlternateScreen / Terminal::new 之前构造：这样即便它们俩失败，
+    // raw mode 也还是能被 Drop 恢复。
+    let _guard = TerminalGuard;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
@@ -51,22 +69,45 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     let mut sessions: Vec<SessionInfo> = Vec::new();
     let mut message = String::new();
     let mut screen = String::new();
+    // 连不上守护进程 / 请求失败时置 false，看板上要能看出数据是陈旧的，
+    // 不能让用户以为界面上的“干活中”还代表当前真实状态。每次循环开头的
+    // List（以及 Attached 视图下的 Screen）调用是唯一的真相来源——它总在
+    // 当次的 term.draw 之前重新算一遍，所以不需要（也不应该）预置初值。
+    let mut connected;
 
     let res = loop {
-        if let Ok(Response::Sessions(v)) = client.call(Request::List) {
-            sessions = v;
+        match client.call(Request::List) {
+            Ok(Response::Sessions(v)) => {
+                sessions = v;
+                connected = true;
+            }
+            _ => connected = false,
         }
         if list_state.selected().is_none() && !sessions.is_empty() {
             list_state.select(Some(0));
         }
         if let View::Attached(id) = &view {
             let id = *id;
-            if let Ok(Response::Screen(s)) = client.call(Request::Screen { id }) {
-                screen = s;
+            match client.call(Request::Screen { id }) {
+                Ok(Response::Screen(s)) => {
+                    screen = s;
+                    connected = true;
+                }
+                _ => connected = false,
             }
         }
 
-        term.draw(|f| draw(f, &view, &sessions, &mut list_state, &screen, &message))?;
+        term.draw(|f| {
+            draw(
+                f,
+                &view,
+                &sessions,
+                &mut list_state,
+                &screen,
+                &message,
+                connected,
+            )
+        })?;
 
         if !event::poll(Duration::from_millis(150))? {
             continue;
@@ -141,25 +182,37 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
             },
             View::Attached(id) => match key.code {
                 KeyCode::Esc => view = View::Board,
+                // 逐字符/回车发送失败时不能像原来那样用 `let _ =` 静默吞掉——
+                // 用户打字没反应会分不清是卡顿还是断连。这里只负责给出提示文字，
+                // “连不上”这个视觉状态（红色边框、底部横幅）统一交给循环顶部
+                // 每轮都会重新做的 List/Screen 探测去判定，不在这里单独维护。
                 KeyCode::Enter => {
-                    let _ = client.call(Request::Input {
-                        id,
-                        text: String::new(),
-                    });
+                    if client
+                        .call(Request::Input {
+                            id,
+                            text: String::new(),
+                        })
+                        .is_err()
+                    {
+                        message = "守护进程连不上，刚才那次回车没发出去".into();
+                    }
                 }
                 KeyCode::Char(c) => {
-                    let _ = client.call(Request::Input {
-                        id,
-                        text: c.to_string(),
-                    });
+                    if client
+                        .call(Request::Input {
+                            id,
+                            text: c.to_string(),
+                        })
+                        .is_err()
+                    {
+                        message = format!("守护进程连不上，'{c}' 没发出去");
+                    }
                 }
                 _ => {}
             },
         }
     };
 
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
     res
 }
 
@@ -199,14 +252,32 @@ fn draw(
     st: &mut ListState,
     screen: &str,
     message: &str,
+    connected: bool,
 ) {
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
 
+    // 断连时用红色边框给出明确的视觉提示：界面上的数据是上一次成功请求
+    // 留下的陈旧快照，不代表守护进程现在的真实状态。
+    let border_style = if connected {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
     match view {
         View::Attached(id) => {
-            let title = format!("会话 {id} —— Esc 返回看板");
+            let title = if connected {
+                format!("会话 {id} —— Esc 返回看板")
+            } else {
+                format!("会话 {id}（连接已断开，画面可能过期）—— Esc 返回看板")
+            };
             f.render_widget(
-                Paragraph::new(screen).block(Block::default().borders(Borders::ALL).title(title)),
+                Paragraph::new(screen).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style)
+                        .title(title),
+                ),
                 chunks[0],
             );
         }
@@ -220,12 +291,18 @@ fn draw(
                 Paragraph::new(text).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_style(border_style)
                         .title("选 agent（按数字，Esc 取消）"),
                 ),
                 chunks[0],
             );
         }
         View::Board => {
+            let title = if connected {
+                "dct 会话看板".to_string()
+            } else {
+                "dct 会话看板（连接已断开，数据可能已过期）".to_string()
+            };
             let items: Vec<ListItem> = sessions
                 .iter()
                 .map(|s| {
@@ -242,7 +319,12 @@ fn draw(
                 .collect();
             f.render_stateful_widget(
                 List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title("dct 会话看板"))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(border_style)
+                            .title(title),
+                    )
                     .highlight_symbol("▶ "),
                 chunks[0],
                 st,
@@ -250,7 +332,9 @@ fn draw(
         }
     }
 
-    let help = if message.is_empty() {
+    let help = if !connected {
+        "守护进程连不上，界面数据可能已过期".to_string()
+    } else if message.is_empty() {
         "n 新建  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出".to_string()
     } else {
         message.to_string()
@@ -310,13 +394,16 @@ mod tests {
         st.select(Some(0));
 
         // 看板视图，含空消息
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", ""))
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "", true))
             .unwrap();
         // 看板视图，带提示消息
-        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "完成"))
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "完成", true))
             .unwrap();
         // 看板为空列表也不能 panic
-        term.draw(|f| draw(f, &View::Board, &[], &mut st, "", ""))
+        term.draw(|f| draw(f, &View::Board, &[], &mut st, "", "", true))
+            .unwrap();
+        // 断连状态：底部提示和边框都要切到断连样式，也不能 panic
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "", false))
             .unwrap();
         // profile 选择弹窗
         let profiles = vec!["claude".to_string(), "shell".to_string()];
@@ -328,6 +415,7 @@ mod tests {
                 &mut st,
                 "",
                 "",
+                true,
             )
         })
         .unwrap();
@@ -340,8 +428,67 @@ mod tests {
                 &mut st,
                 "$ echo hi\nhi\n",
                 "",
+                true,
             )
         })
         .unwrap();
+        // 已进入会话但断连了
+        term.draw(|f| {
+            draw(
+                f,
+                &View::Attached(1),
+                &sessions,
+                &mut st,
+                "$ echo hi\nhi\n",
+                "",
+                false,
+            )
+        })
+        .unwrap();
+    }
+
+    /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
+    /// 一句“完成”或按键提示看，误以为守护进程还活着。这里不渲染像素，只检查
+    /// `draw()` 写进 buffer 的文字内容确实包含断连提示。
+    #[test]
+    fn disconnected_state_shows_warning_in_bottom_bar() {
+        use ratatui::backend::TestBackend;
+
+        let sessions: Vec<SessionInfo> = Vec::new();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+
+        term.draw(|f| draw(f, &View::Board, &sessions, &mut st, "", "完成", false))
+            .unwrap();
+        // ratatui 给宽字符（中文）后面那个 cell 塞的是 " "（`Cell::reset`），
+        // 不是空串，所以逐 cell 拼出来的文本每个汉字后面都夹了一个空格
+        // （"守 护 进 程..."）。去掉空白之后再做子串匹配，两边都做同样的
+        // 归一化，不影响判断力。
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains("守护进程连不上"),
+            "断连时底部应显示明确提示，实际内容（已去空白）: {content}"
+        );
+        assert!(
+            !content.contains("完成"),
+            "断连提示必须盖过残留的旧 action 消息，实际内容（已去空白）: {content}"
+        );
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    s.push_str(cell.symbol());
+                }
+            }
+            s.push('\n');
+        }
+        s
     }
 }
