@@ -39,3 +39,19 @@ Task 2: review — 需求符合性 ✅；Critical 0；Important 0
   没有跨慢 git 子进程持锁；无裸 .lock().unwrap()；Cargo.toml 未动；session.rs 只改了 recover 可见性
 Task 2: minor (deferred): handle() 参数增至 3 个，将来再加状态应考虑上下文结构体而非继续加参数
 Task 2: complete (commits c9eeb13..942a706, review clean)
+
+计划修订 (commit 5742970)：用户指出会话视图缺明确操作提示。查证发现 ff1e37d 只改了标题栏文案和
+  测试注释，没改按键处理——实际截走的是 Esc（Claude Code 里取消失灵），标题栏宣传的 Ctrl+B 按了没反应。
+  用户裁定：逆转键改 F2，Esc 与 Ctrl+B 一律还给 agent；提示改成跟着视图走。两项并入 Task 4
+  （Task 4 本就在重写同一段底部栏代码，分开做要改两遍）。spec 也已补记。
+
+Task 3: 实现完成 (commit 4e1b518, 48/48 通过)
+Task 3: 计划文本缺陷 — brief 的 filter_projects 测试断言 "WORK" 命中 3 条，实际只有 2 条含 work。
+  实现者自行改成 2 并在报告里披露。复审逐条验证：算术正确、大写针匹配小写草堆仍能证明不区分大小写、
+  且只改了那一个数字（diff:164），其余断言逐字未动。裁定：修正有效，非缺陷。计划正文已同步修正。
+Task 3: review — 需求符合性 ✅；Critical 0；Important 0
+  复审具名风险核查：move_sel 委托给 move_sel_n 后，非空列表路径逐字符等价（同一 clamp 公式、
+  同一 unwrap_or(0)）；空列表路径由「不动」变成「select(None)」，是 spec 明文要求的契约，
+  且修掉了一个潜在的陈旧选中项问题，非回归
+Task 3: minor (deferred): move_sel 空列表语义变化值得加一行注释，免得将来看 blame 误判为回归
+Task 3: complete (commits 5742970..4e1b518, review clean)
