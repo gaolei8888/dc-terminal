@@ -98,3 +98,23 @@ Task 5: fix round 1/5 (1 addressed, 0 open — 空输入按 Enter 已改为无�
 Task 5: complete (commits e9483af..093f019, review clean)
 用户裁定（clippy 冲突）：选「全部修干净，draw() 参数打包成结构体」。作为计划外的独立收尾提交处理，
   随后再跑全分支最终评审。
+
+收尾提交 9be1850：按用户裁定把 draw() 的 9 个参数收进 DrawInput 结构体，session.rs 加 Default + ScreenSnapshot
+  别名，测试里 &PathBuf 改 &Path。cargo clippy --all-targets -- -D warnings 现已零警告。
+
+最终全分支评审 (bb0954f..7908f6d, 14 个提交) — Critical 0；Important 2；判断「能合」
+  Important 1: 残留 message 盖掉「按视图给提示」——n 建会话后进会话，底部仍显示「已开会话 3」，
+    idle_help 分支永远走不到。根因在计划正文 3d/3e 逐字规定的 `else if message.text.is_empty()`，非实现者偏离
+  Important 2: README 仍教用户按 Esc 回看板（Esc 已还给 agent），且没提 F2 和 p
+  跨层核查结论：三层职责边界干净；is_repo 全仓只在 session.rs:116 判一处；current_dir/start_dir 生命周期正确；
+    store 锁只在两个单语句内、create() 完全返回后才取；底部栏两轮改动后四态自洽
+  台账 minor 分诊：全部判「可以留着」，无一条阻塞合入。T4-a（unused_mut）已随 Task 5 自愈
+  硬门槛：按键状态机零自动化覆盖（run() 不抽 reducer 测不了），Step 5 的 14 条真人验证不能省
+最终修复 (commit 06a8bc8)：抽出纯函数 message_after_transition，按键分发前后各拍一次视图/消息快照，
+  视图变了且消息本次未变才清空——「切换即操作结果」（已切到 X / 已开会话 N）因此得以保留。补 3 个单测。
+  README 按键表改 F2、补 p 换项目、说明 Esc 转发给 agent。
+最终修复复审 (7908f6d..06a8bc8)：两条均 ADDRESSED，无新引入破坏。
+  复审独立核了 13 个赋值点，确认实现者自陈的「背靠背相同文本被误判」在现有控制流下不可达
+  （进入 PickProfile/PickProject 时不设消息，走到那 3 个转场赋值点时旧消息必为空串）
+计划完成：全部 5 个任务 complete，最终评审 clean。
+待办（唯一）：Task 5 Step 5 的 14 条真人手动验证，需用户在真终端跑 ./target/release/dct。
