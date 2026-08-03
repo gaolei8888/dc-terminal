@@ -165,6 +165,20 @@ impl PtySession {
             .collect()
     }
 
+    /// 屏幕上最后一行有内容的文字。看板靠它显示"这个 agent 此刻在干什么"——
+    /// 只传一行，比整屏便宜得多，扫一眼全局时不需要完整画面。
+    pub fn last_line(&self) -> String {
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let screen = parser.screen();
+        let (rows, _) = screen.size();
+        (0..rows)
+            .rev()
+            .map(|r| screen.contents_between(r, 0, r + 1, 0))
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default()
+    }
+
     pub fn screen_text(&self) -> String {
         self.parser
             .lock()

@@ -28,6 +28,9 @@ pub struct SessionInfo {
     /// 给用户看 `.git/dct-worktrees/s2` 只会让他不知道自己在哪。
     pub project: String,
     pub state: SessionState,
+    /// 这个 agent 此刻在干什么（屏幕最后一行有内容的文字）。
+    /// 看板靠它做"扫一眼全局"，不需要打开每个会话。
+    pub activity: String,
 }
 
 struct Session {
@@ -166,6 +169,7 @@ impl SessionManager {
                     dir: s.dir.display().to_string(),
                     project: s.project.display().to_string(),
                     state: s.state,
+                    activity: s.pty.last_line(),
                 }
             })
             .collect();
