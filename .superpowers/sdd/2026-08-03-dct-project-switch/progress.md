@@ -32,3 +32,10 @@ Task 1: fix round 1/5 (1 addressed, 0 open; commits 8263cab..1e22398)
 Task 1: complete (commits bb0954f..1e22398, review clean)
 Task 1: 后续操作提醒 — review-package 脚本同样会重写 .gitignore。每次跑完 SDD 脚本后
   `git checkout -- .superpowers/sdd/.gitignore` 复原；新产出的 .md 用 `git add -f` 入库。
+
+Task 2: 实现完成 (commit 942a706, 62/62 通过，含 3 个新集成测试)
+Task 2: review — 需求符合性 ✅；Critical 0；Important 0
+  复审独立验证：store 锁只在 .list() 和 .touch() 两处单语句内持有，mgr.create() 完全返回后才取锁，
+  没有跨慢 git 子进程持锁；无裸 .lock().unwrap()；Cargo.toml 未动；session.rs 只改了 recover 可见性
+Task 2: minor (deferred): handle() 参数增至 3 个，将来再加状态应考虑上下文结构体而非继续加参数
+Task 2: complete (commits c9eeb13..942a706, review clean)
