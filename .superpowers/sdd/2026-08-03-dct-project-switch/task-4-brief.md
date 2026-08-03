@@ -314,34 +314,26 @@ fn draw(
             Style::default().fg(Color::Red),
         )
     } else if message.text.is_empty() {
-        (
-            format!("当前项目：{}\n{}", short_path(current), idle_help),
-            Style::default(),
-        )
+        (idle_help.to_string(), Style::default())
+    } else if message.error {
+        (message.text.clone(), Style::default().fg(Color::Red))
     } else {
-        let s = if message.error {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default()
-        };
-        (
-            format!("当前项目：{}\n{}", short_path(current), message.text),
-            s,
-        )
+        (message.text.clone(), Style::default())
     };
+    // 当前项目放在边框标题里，框内只留一行字。中文是双宽字符，
+    // 「当前项目：~/work/dc/dc-terminal」加上看板按键表在 80 列终端里放不下同一行，
+    // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
     f.render_widget(
-        Paragraph::new(help)
-            .style(style)
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(help).style(style).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("当前项目：{}", short_path(current))),
+        ),
         chunks[1],
     );
 ```
 
-底部栏现在是两行文字，把它的高度从 3 改到 4——找到 `draw()` 开头的 `Layout::vertical`：
-
-```rust
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(f.area());
-```
+底部栏框内仍是一行文字，`Layout::vertical` 的 `Constraint::Length(3)` 不用动。
 
 **3f.** `run()` 里调用 `draw` 的地方补上新参数。`run()` 的 `default_dir` 现在既是当前项目、
 又是相对路径的解析基准，先改名并留出可变性（Task 5 会真正改它）：
