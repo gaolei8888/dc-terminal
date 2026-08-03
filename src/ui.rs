@@ -813,6 +813,28 @@ fn message_after_transition(view_changed: bool, message_changed: bool, message: 
     }
 }
 
+/// 底栏左段：逃生键提示。
+///
+/// 这是唯一一条「不管出什么事都必须还在」的信息——用户找不到它就只能去
+/// 别的窗口 kill 进程，而 kill 会把终端留在 raw mode。文案必须跟
+/// `back_one_level` 逐行对上：底栏说什么就得真能做到什么，
+/// 手输路径态退的是一层（回列表），不能写成「回看板」。
+fn escape_hint(view: &View) -> &'static str {
+    match view {
+        View::Board => "q 退出",
+        View::PickProject {
+            typing_path: Some(_),
+            ..
+        } => "Ctrl+Q 回列表",
+        _ => "Ctrl+Q 回看板",
+    }
+}
+
+/// 左段固定占的列数：「Ctrl+Q 回看板」= 6 + 1 + 中文 3 字 × 2 = 13。
+/// 三条文案里最长的就是它（「Ctrl+Q 回列表」同宽，「q 退出」更短）。
+/// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
+const ESCAPE_HINT_COLS: u16 = 13;
+
 /// 画一帧界面所需的全部输入。`draw()` 本身不产生任何状态，纯粹是把这些
 /// 只读快照（加一个看板光标的可变借用）铺到屏幕上——打包成结构体只是为了
 /// 让参数个数别再撞 clippy 的 `too_many_arguments`，不代表这些字段之间
@@ -1005,15 +1027,17 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
     // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
     // 而那些键在会话视图里全部被转发给 agent——用户照着按 n，字母 n 会落进
     // Claude Code 的输入框。显示做不到的操作比不显示更糟。
+    //
+    // 逃生键那一截已经挪进左段常驻，这里不再重复。
     let idle_help = match view {
-        View::Attached(_) => "F2 回看板（回看板后按 n 新建会话）　其余按键都发给 agent",
+        View::Attached(_) => "F2 同效　回看板后按 n 新建会话　其余按键都发给 agent",
         View::PickProfile(_) => "按数字选 agent，Esc 取消",
         View::PickProject {
             typing_path: Some(_),
             ..
         } => "输入路径后 Enter 确认，Esc 返回列表",
         View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
-        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动  q 退出",
+        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
     };
 
     let (help, style) = if !connected {
@@ -1029,15 +1053,32 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
         (message.text.clone(), Style::default())
     };
     // 当前项目放在边框标题里，框内只留一行字。中文是双宽字符，
-    // 「当前项目：~/work/dc/dc-terminal」加上看板按键表在 80 列终端里放不下同一行，
+    // 「当前项目：~/work/dc/dc-terminal」加上按键表在 80 列终端里放不下同一行，
     // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("当前项目：{}", short_path(current)));
+    let inner = block.inner(chunks[1]);
+    f.render_widget(block, chunks[1]);
+
+    // 横向拆两段：左段是逃生键，永不让位；断连提示和消息只能吃掉右段。
+    //
+    // 拆之前的写法是一整行按优先级二选一，于是「已切到 X」这类完全正常的
+    // 操作反馈会把整张按键表连同「q 退出」一起顶掉，而消息只在切视图时才清——
+    // 用户不知道怎么切视图正是他卡住的原因，于是退出提示永久消失。
+    // 拆成两段之后这件事在结构上不可能再发生。
+    let bar = Layout::horizontal([
+        Constraint::Length(ESCAPE_HINT_COLS + 2), // +2 是和右段之间的间隔
+        Constraint::Min(0),
+    ])
+    .split(inner);
     f.render_widget(
-        Paragraph::new(help).style(style).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("当前项目：{}", short_path(current))),
-        ),
-        chunks[1],
+        Paragraph::new(escape_hint(view)).style(Style::default().fg(Color::Cyan)),
+        bar[0],
+    );
+    f.render_widget(
+        Paragraph::new(truncate(&help, bar[1].width as usize)).style(style),
+        bar[1],
     );
 }
 
@@ -1491,6 +1532,103 @@ mod tests {
         s
     }
 
+    /// 底栏左段的文字。宽字符在 TestBackend 里只占首个 cell，
+    /// 所以统一滤掉空白再找子串，跟既有的 bottom_bar_help_follows_the_view 一致。
+    fn bar_text(term: &Terminal<ratatui::backend::TestBackend>) -> String {
+        buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn escape_hint_survives_a_long_message() {
+        use ratatui::backend::TestBackend;
+
+        // 真实事故：在看板上按 p 换项目，「已切到 …」这条消息把整张按键表
+        // 顶掉，其中就包括「q 退出」。用户从此没有任何地方能看到怎么退出。
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut st = ListState::default();
+        let long = Msg::from(
+            "已切到 ~/work/dc/dc-terminal，这条消息故意写得很长很长很长很长很长".to_string(),
+        );
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &long,
+                    connected: true,
+                    current: "/tmp",
+                },
+            )
+        })
+        .unwrap();
+        let c = bar_text(&term);
+        assert!(
+            c.contains("q退出"),
+            "消息再长也不能把退出提示挤掉——这正是用户卡住的那一屏：{c}"
+        );
+    }
+
+    #[test]
+    fn escape_hint_survives_a_disconnect() {
+        use ratatui::backend::TestBackend;
+
+        // 出事的那一刻恰恰是最需要逃生提示的时候，断连提示不能把它顶掉。
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut st = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::Attached(1),
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: false,
+                    current: "/tmp",
+                },
+            )
+        })
+        .unwrap();
+        let c = bar_text(&term);
+        assert!(c.contains("Ctrl+Q回看板"), "断连时逃生提示必须还在：{c}");
+        assert!(c.contains("连不上"), "断连提示本身也要显示：{c}");
+    }
+
+    #[test]
+    fn escape_hint_matches_what_the_key_actually_does() {
+        // 底栏说什么就必须真能做到什么。手输路径态的 Ctrl+Q 是回列表
+        // 不是回看板（见 back_one_level），文案不能写成「回看板」。
+        assert_eq!(escape_hint(&View::Board), "q 退出");
+        assert_eq!(escape_hint(&View::Attached(1)), "Ctrl+Q 回看板");
+        assert_eq!(
+            escape_hint(&View::PickProject {
+                all: Vec::new(),
+                filter: String::new(),
+                state: ListState::default(),
+                typing_path: None,
+            }),
+            "Ctrl+Q 回看板"
+        );
+        assert_eq!(
+            escape_hint(&View::PickProject {
+                all: Vec::new(),
+                filter: String::new(),
+                state: ListState::default(),
+                typing_path: Some(String::new()),
+            }),
+            "Ctrl+Q 回列表"
+        );
+    }
+
     #[test]
     fn msg_from_str_is_not_an_error() {
         let m: Msg = "完成".into();
@@ -1781,7 +1919,11 @@ mod tests {
         })
         .unwrap();
         let c = text_of(&term);
-        assert!(c.contains("F2回看板"), "会话视图要给出逆转键提示：{c}");
+        assert!(c.contains("Ctrl+Q回看板"), "会话视图要给出逆转键提示：{c}");
+        assert!(
+            c.contains("F2同效"),
+            "F2 是老用户的肌肉记忆，也要留在提示里：{c}"
+        );
         assert!(c.contains("新建会话"), "还要说清新建会话怎么走：{c}");
         assert!(!c.contains("u回滚"), "会话视图不能显示看板按键表：{c}");
 
