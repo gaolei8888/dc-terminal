@@ -77,7 +77,7 @@ fn handle(req: Request, mgr: &Arc<SessionManager>) -> Response {
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
         Request::Screen { id } => mgr
             .screen(id)
-            .map(|(text, cursor)| Response::Screen { text, cursor }),
+            .map(|(lines, cursor)| Response::Screen { lines, cursor }),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
         Request::Diff { id } => mgr.diff(id).map(Response::Diff),

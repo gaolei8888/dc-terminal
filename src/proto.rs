@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::git::FileStat;
+use crate::pty::ScreenSpan;
 use crate::session::SessionInfo;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,8 +20,13 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Sessions(Vec<SessionInfo>),
-    Created { id: u32 },
-    Screen { text: String, cursor: (u16, u16) },
+    Created {
+        id: u32,
+    },
+    Screen {
+        lines: Vec<Vec<ScreenSpan>>,
+        cursor: (u16, u16),
+    },
     Diff(Vec<FileStat>),
     Profiles(Vec<String>),
     Ok,

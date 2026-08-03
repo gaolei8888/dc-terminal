@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::git::{self, FileStat, Worktree};
 use crate::profile::Profile;
-use crate::pty::PtySession;
+use crate::pty::{PtySession, ScreenSpan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
@@ -196,8 +196,8 @@ impl SessionManager {
 
     /// 返回 agent 屏幕文本和光标位置 (行, 列)。光标必须跟文本一起取，
     /// 否则界面只是一张死截图，用户看不出自己打的字落在哪。
-    pub fn screen(&self, id: u32) -> Result<(String, (u16, u16))> {
-        self.with_session(id, |s| Ok((s.pty.screen_text(), s.pty.cursor())))
+    pub fn screen(&self, id: u32) -> Result<(Vec<Vec<ScreenSpan>>, (u16, u16))> {
+        self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor())))
     }
 
     pub fn stop(&self, id: u32) -> Result<()> {
