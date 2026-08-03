@@ -65,3 +65,12 @@ Task 4: 实现完成 (commit 00b4ce4)。原实现者的 report 文件缺失（�
   Task 5 里选中项目后的提示随之从「当前项目：X」改成「已切到 X」，免得和标题重复。
   计划正文 Task 4 步骤 3e 与 Task 5 步骤 3c 已同步修改，task-4-brief.md 已重新生成。
 Task 4: fix round 1/5 dispatched — 底部栏改一行（新实现者，原实现者已不在）
+Task 4: fix round 1/5 (1 addressed, 0 open — 底部栏收成一行; commits 00b4ce4..a3015e1)
+Task 4: review — 需求符合性 ✅；Critical 0；Important 0
+  复审独立验证：View::Attached 只截 F2，Esc→"\x1b"、Ctrl+B→"\u{2}" 都确实进 key_to_input 转发给 agent；
+  底部栏一行化后四态（断连/错误/普通消息/按视图提示）互斥且各有测试把关，不是同一断言换皮
+Task 4: minor (deferred): `let mut current_dir` 目前触发 unused_mut，属计划预期警告但漏列在清单里，Task 5 接线后消失
+Task 4: minor (deferred): task-4-report.md 只记了 a3015e1，主体实现 00b4ce4 的过程记录缺失（原实现者会话中断）
+Task 4: 偏离已裁定为合理 — bottom_bar_help_follows_the_view 没照抄 brief，第二次 draw 换了新的 TestBackend。
+  理由：ratatui 画宽字符只写首格、第二格留旧值，复用同一 backend 会把上一帧残字拼进来产生假阳性。未削弱断言。
+Task 4: complete (commits 4e1b518..a3015e1, review clean)
