@@ -110,3 +110,54 @@ Brief 里"Step 4 Expected: 全绿，且 Task 3/4 留下的 dead_code/unused_vari
   决定后续怎么处理（不属于本次隐瞒或遗漏，是主动核实后确认的范围外问题）。
 - brief 的 Step 5（14 条真人手动验证）按指示跳过，未执行，需要真人在真终端里跑
   `./target/release/dct` 验证。
+
+## 追加：评审 Important 修复（手输框空输入按 Enter 会静默切回启动目录）
+
+评审发现 `src/ui.rs` 手输态的 `KeyCode::Enter` 分支有一个陷阱：`expand_path("", &start_dir)`
+因为空串不是绝对路径，走的是 `base.join("")`，结果就是 `start_dir` 本身，而
+`start_dir.is_dir()` 通常为真。于是用户切到项目 B 后，再进手输框、犹豫多按一次 Enter
+（或误触），项目会被无声切回启动目录 A，`current_dir` 还带一个尾随斜杠——用户没输入
+任何内容却触发了一次静默切换。
+
+**只改了这一条**，其余台账里记的 Minor 没有顺手一起动。
+
+### 改了什么
+
+- `src/ui.rs` 手输态 `KeyCode::Enter` 分支：先判 `buf.trim().is_empty()`。为空时不展开、
+  不切换、不回看板，停在手输态，`message = Msg::err("还没输入路径".into())`；非空时行为
+  不变（原来的 `expand_path` → `is_dir()` → 切换/报错逻辑照旧）。
+- `src/ui.rs` `mod tests` 新增 `expand_path_of_empty_string_is_base_itself`：断言
+  `expand_path("", base) == base`（`base` 用字面路径 `/base`），注释写明这正是
+  `Path::join` 的正常语义、不是要改 `expand_path` 的行为，调用方必须自己挡空输入——
+  没有动 `expand_path` 本身。
+
+### 跑了哪些命令，结果摘要
+
+```
+export PATH="$HOME/.cargo/bin:$PATH"
+
+cargo test --lib ui -- --test-threads=1
+  → 24 passed（含新增的 expand_path_of_empty_string_is_base_itself），0 failed
+
+cargo fmt
+  → 把 Enter 分支里新拆出的 if/else 和一处过长的 message 赋值重新排版
+    （单纯格式化，行为不变）
+
+cargo test -- --test-threads=1
+  → 全绿：lib 55 passed（比修复前多一条新测试）；cli 2 passed；
+    client_timeout 1 passed；concurrency 1 passed；daemon_detach 1 passed；
+    daemon_roundtrip 2 passed；projects_flow 3 passed；slow_input 1 passed；
+    socket_perms 1 passed；doc-tests 0 passed；全程 0 failed
+
+cargo fmt --check
+  → 干净
+```
+
+### 自查
+
+- 非空输入路径（存在/不存在两种情况）的行为跟修复前完全一致，只是套了一层
+  `if buf.trim().is_empty() { .. } else { 原逻辑 }`，没有改动 `expand_path`、
+  `is_dir()` 判断或成功/失败两支的消息文案。
+- 空输入分支保留在 `typing_path: Some(buf)`（原样传回未 trim 的 `buf`，不是清空），
+  用户按 Enter 之后光标停在原来打的（可能只有空格的）内容后面，不会丢字。
+- 没有碰其余评审记在台账里的 Minor 项，符合"只修这一条"的要求。
