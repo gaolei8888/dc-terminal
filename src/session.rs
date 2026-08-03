@@ -62,7 +62,7 @@ pub struct SessionManager {
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
 /// 而不是让后续所有请求都跟着报错卡死（守护进程没有 supervisor 帮忙重启，
 /// 中毒了就是永久瘫痪，必须能自愈）。
-fn recover<T>(r: std::sync::LockResult<T>) -> T {
+pub(crate) fn recover<T>(r: std::sync::LockResult<T>) -> T {
     r.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
