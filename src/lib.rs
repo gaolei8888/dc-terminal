@@ -1,4 +1,5 @@
 pub mod client;
+pub mod clipboard;
 pub mod daemon;
 pub mod git;
 pub mod profile;

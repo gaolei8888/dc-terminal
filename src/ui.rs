@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,7 +53,11 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -62,7 +67,9 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     // raw mode 也还是能被 Drop 恢复。
     let _guard = TerminalGuard;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // 开括号粘贴：不开的话粘贴的文字会一个字符一个事件地进来，
+    // 粘一段话就是几百次往返，慢到没法用。
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut view = View::Board;
@@ -127,7 +134,17 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         if !event::poll(Duration::from_millis(tick))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let ev = event::read()?;
+        // 粘贴整段一次发完，不能拆成一个个字符
+        if let Event::Paste(text) = ev {
+            if let View::Attached(id) = view {
+                if !text.is_empty() && client.call(Request::Input { id, text }).is_err() {
+                    message = "守护进程连不上，粘贴的内容没发出去".into();
+                }
+            }
+            continue;
+        }
+        let Event::Key(key) = ev else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -248,6 +265,8 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
         KeyCode::PageDown => "\x1b[6~".into(),
         KeyCode::Delete => "\x1b[3~".into(),
         KeyCode::Insert => "\x1b[2~".into(),
+        // Esc 必须转发：agent 拿它做取消、清空、关弹窗
+        KeyCode::Esc => "\x1b".into(),
         _ => return None,
     };
     Some(s)
@@ -383,9 +402,9 @@ fn draw(
                 .map(|s| short_path(&s.dir))
                 .unwrap_or_default();
             let title = if connected {
-                format!("会话 {id} · {project} —— Esc 返回看板")
+                format!("会话 {id} · {project} —— Ctrl+B 返回看板")
             } else {
-                format!("会话 {id} · {project}（连接已断开，画面可能过期）—— Esc 返回看板")
+                format!("会话 {id} · {project}（连接已断开，画面可能过期）—— Ctrl+B 返回看板")
             };
             let area = chunks[0];
             f.render_widget(
@@ -533,9 +552,10 @@ mod tests {
     }
 
     #[test]
-    fn esc_is_not_forwarded() {
-        // Esc 保留给"回看板"，不能送给 agent
-        assert!(key_to_input(&key(KeyCode::Esc)).is_none());
+    fn esc_is_forwarded_to_the_agent() {
+        // agent 靠 Esc 做取消/清空/关弹窗，抢走它会让 agent 的交互失灵。
+        // 返回看板改用 Ctrl+B。
+        assert_eq!(key_to_input(&key(KeyCode::Esc)).as_deref(), Some("\u{1b}"));
     }
 
     #[test]
