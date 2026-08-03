@@ -557,7 +557,9 @@ Task 5 的交互代码就只剩接线。
         ];
 
         assert_eq!(filter_projects(&all, "").len(), 3, "空过滤词返回全部");
-        assert_eq!(filter_projects(&all, "WORK").len(), 3, "不区分大小写");
+        // 三条里只有两条含 work（scratch 那条不含）。需要为 2 而不是 3——
+        // 大写的 WORK 匹配到小写的 work，正是这条断言要证的事。
+        assert_eq!(filter_projects(&all, "WORK").len(), 2, "不区分大小写");
         assert_eq!(
             filter_projects(&all, "dc-term"),
             vec!["/Users/lei/work/dc/dc-terminal".to_string()],
