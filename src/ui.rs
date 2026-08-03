@@ -174,14 +174,16 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         term.draw(|f| {
             draw(
                 f,
-                &view,
-                &sessions,
-                &mut list_state,
-                &screen,
-                screen_cursor,
-                &message,
-                connected,
-                &current_dir.display().to_string(),
+                &mut DrawInput {
+                    view: &view,
+                    sessions: &sessions,
+                    st: &mut list_state,
+                    screen: &screen,
+                    cursor: screen_cursor,
+                    message: &message,
+                    connected,
+                    current: &current_dir.display().to_string(),
+                },
             )
         })?;
 
@@ -661,17 +663,32 @@ fn act(
     }
 }
 
-fn draw(
-    f: &mut Frame,
-    view: &View,
-    sessions: &[SessionInfo],
-    st: &mut ListState,
-    screen: &[Vec<ScreenSpan>],
+/// 画一帧界面所需的全部输入。`draw()` 本身不产生任何状态，纯粹是把这些
+/// 只读快照（加一个看板光标的可变借用）铺到屏幕上——打包成结构体只是为了
+/// 让参数个数别再撞 clippy 的 `too_many_arguments`，不代表这些字段之间
+/// 有什么共同的生命周期或所有权关系。
+struct DrawInput<'a> {
+    view: &'a View,
+    sessions: &'a [SessionInfo],
+    st: &'a mut ListState,
+    screen: &'a [Vec<ScreenSpan>],
     cursor: (u16, u16),
-    message: &Msg,
+    message: &'a Msg,
     connected: bool,
-    current: &str,
-) {
+    current: &'a str,
+}
+
+fn draw(f: &mut Frame, ui: &mut DrawInput) {
+    // 除 `st` 外都是引用/Copy 类型，读一份出来不算移动；`st` 是 `&mut`，
+    // 得显式重借用，不然会撞上“不能从可变引用背后移走字段”。
+    let view = ui.view;
+    let sessions = ui.sessions;
+    let st: &mut ListState = &mut *ui.st;
+    let screen = ui.screen;
+    let cursor = ui.cursor;
+    let message = ui.message;
+    let connected = ui.connected;
+    let current = ui.current;
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
 
     // 断连时用红色边框给出明确的视觉提示：界面上的数据是上一次成功请求
@@ -986,14 +1003,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1001,14 +1020,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from("完成"),
-                true,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from("完成"),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1016,14 +1037,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1031,14 +1054,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                false,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: false,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1047,14 +1072,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::PickProfile(profiles.clone()),
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::PickProfile(profiles.clone()),
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1062,14 +1089,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Attached(1),
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Attached(1),
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1077,14 +1106,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Attached(1),
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                false,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Attached(1),
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: false,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1104,14 +1135,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from("完成"),
-                false,
-                "/tmp/proj",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from("完成"),
+                    connected: false,
+                    current: "/tmp/proj",
+                },
             )
         })
         .unwrap();
@@ -1240,14 +1273,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/Users/lei/work/dc/dc-terminal",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/Users/lei/work/dc/dc-terminal",
+                },
             )
         })
         .unwrap();
@@ -1271,14 +1306,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::err("不是一个目录".into()),
-                true,
-                "/tmp",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::err("不是一个目录".into()),
+                    connected: true,
+                    current: "/tmp",
+                },
             )
         })
         .unwrap();
@@ -1326,19 +1363,21 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::PickProject {
-                    all: all.clone(),
-                    filter: String::new(),
-                    state: st.clone(),
-                    typing_path: None,
+                &mut DrawInput {
+                    view: &View::PickProject {
+                        all: all.clone(),
+                        filter: String::new(),
+                        state: st.clone(),
+                        typing_path: None,
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp",
                 },
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp",
             )
         })
         .unwrap();
@@ -1358,19 +1397,21 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::PickProject {
-                    all: all.clone(),
-                    filter: "没有这个".to_string(),
-                    state: st.clone(),
-                    typing_path: None,
+                &mut DrawInput {
+                    view: &View::PickProject {
+                        all: all.clone(),
+                        filter: "没有这个".to_string(),
+                        state: st.clone(),
+                        typing_path: None,
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp",
                 },
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp",
             )
         })
         .unwrap();
@@ -1388,19 +1429,21 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::PickProject {
-                    all: all.clone(),
-                    filter: String::new(),
-                    state: st.clone(),
-                    typing_path: Some("~/work/x".to_string()),
+                &mut DrawInput {
+                    view: &View::PickProject {
+                        all: all.clone(),
+                        filter: String::new(),
+                        state: st.clone(),
+                        typing_path: Some("~/work/x".to_string()),
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp",
                 },
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp",
             )
         })
         .unwrap();
@@ -1418,19 +1461,21 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::PickProject {
-                    all: Vec::new(),
-                    filter: String::new(),
-                    state: ListState::default(),
-                    typing_path: None,
+                &mut DrawInput {
+                    view: &View::PickProject {
+                        all: Vec::new(),
+                        filter: String::new(),
+                        state: ListState::default(),
+                        typing_path: None,
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp",
                 },
-                &[],
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp",
             )
         })
         .unwrap();
@@ -1461,14 +1506,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Attached(1),
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp/a",
+                &mut DrawInput {
+                    view: &View::Attached(1),
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/a",
+                },
             )
         })
         .unwrap();
@@ -1486,14 +1533,16 @@ mod tests {
         term.draw(|f| {
             draw(
                 f,
-                &View::Board,
-                &sessions,
-                &mut st,
-                &[],
-                (0, 0),
-                &Msg::from(""),
-                true,
-                "/tmp/a",
+                &mut DrawInput {
+                    view: &View::Board,
+                    sessions: &sessions,
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/a",
+                },
             )
         })
         .unwrap();
