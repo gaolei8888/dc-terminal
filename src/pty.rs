@@ -105,6 +105,26 @@ impl PtySession {
         })
     }
 
+    /// 跟着界面尺寸改 PTY 大小。不做这件事的话 agent 永远按初始宽度排版，
+    /// 窗口再宽也只用得到左边那一块。vt100 解析器也要一起改，否则屏幕缓冲
+    /// 和真实终端对不上。
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        self._master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_size(rows, cols);
+        Ok(())
+    }
+
     pub fn write(&self, data: &[u8]) -> Result<()> {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         w.write_all(data)?;
