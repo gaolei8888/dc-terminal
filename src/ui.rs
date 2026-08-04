@@ -250,7 +250,19 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     // 一次阻塞就是整个界面冻住。丢给后台线程，主循环每轮 try_recv。
     // 放在 View 外面是因为 View 要 Clone（`match view.clone()`），而
     // `mpsc::Receiver` 不能 Clone，没法塞进一个要 Clone 的枚举里。
-    let mut verify_rx: Option<std::sync::mpsc::Receiver<VerifyOutcome>> = None;
+    //
+    // 元组里带着发起这次验证时的 (profile, buf)，不是只传一个 `VerifyOutcome`
+    // ——这是 CRITICAL 1 code review 发现的事故的修复：验证是异步的，结果
+    // 送回来的这一刻，屏幕上未必还是发起验证时的那个视图。用户可能已经
+    // Ctrl+Q/Esc 退出去，甚至绕回来在另一个 agent 身上重新填了密钥；旧写法
+    // 只看"现在还是不是 EnterSecret 视图"，对不上具体是哪一个 profile、哪一份
+    // 密钥，就会把一次过期的验证结果套在一个完全不相干的 profile 上，
+    // 写出一份用户从没见过、甚至是空的"密钥"。把发起时的身份跟结果一起带
+    // 回来，收的时候现比对一遍（见 `verify_outcome_applies_to`），这样不管
+    // 是哪条退出路径忘了清 `verify_rx`，错位的结果都应用不到屏幕上去——
+    // 不必把这条防线押在"每个退出分支都记得清 receiver"这种容易漏改的
+    // 纪律上。
+    let mut verify_rx: Option<std::sync::mpsc::Receiver<(String, String, VerifyOutcome)>> = None;
     // 后台验证线程要自己开一条到守护进程的连接——主循环这条 client 正忙着
     // 画界面。`socket_path()` 是纯函数（只读 $HOME），比把 Client 内部
     // 私有的 socket 字段掏出来更省事。
@@ -260,7 +272,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
         if let Some(rx) = &verify_rx {
-            if let Ok(outcome) = rx.try_recv() {
+            if let Ok((sent_profile, sent_buf, outcome)) = rx.try_recv() {
                 // 不管接下来用不用得上这个结果，先把 Receiver 收掉：
                 // 它已经出结果了，没有第二次可读。
                 verify_rx = None;
@@ -273,53 +285,81 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     ..
                 } = view.clone()
                 {
-                    view = match verify_message(outcome) {
-                        Some(m) => View::EnterSecret {
-                            profile,
-                            label,
-                            prompt,
-                            buf,
-                            phase: SecretPhase::Failed(m),
-                            return_to_settings,
-                        },
-                        // 通过：先存盘。存密钥必须先于「开会话」/「回设置页」两条
-                        // 后续路径都成立的前提——回设置页要读一份刷新过的 has_secret
-                        // 才能显示「已配」，开会话是从磁盘上已经存好的密钥里现读
-                        // 一份给新会话用的（见 daemon.rs），顺序反了新会话拿到的
-                        // 还是空密钥。
-                        None => match client.call(Request::SetSecret {
-                            profile: profile.clone(),
-                            value: buf.clone(),
-                        }) {
-                            Ok(Response::Ok) if return_to_settings => {
-                                // 从设置页进来的是「改配置」，不是「开工」——
-                                // 存完直接回设置页，不建会话。这里**不能**甩一个
-                                // 空壳指望循环收尾那段通用重拉逻辑去补：那段逻辑
-                                // 挂在按键处理之后，而这整段 verify_rx 分支跑在
-                                // 循环顶部、不受「这一轮有没有按键」摆布——如果
-                                // 用户这时候没再按键，`event::poll` 超时会直接
-                                // `continue` 到下一轮循环顶部，跳过收尾，空壳会
-                                // 一直空着，直到用户偶然按下一个键才被补上（手测
-                                // 时真的复现了：改完密钥，界面卡在一屏空列表，
-                                // 直到按了 Ctrl+Q 再按 c 才刷出来）。直接现查一遍，
-                                // 光标顺手定在刚改的这一行上。
-                                //
-                                // 改完给一句确认：这一行本身会从「未配」翻成
-                                // 「已配」，但删除那条路径有「已删除 X 的密钥」
-                                // 的消息条打底，改密钥这条路径原来什么都不说，
-                                // 是同一对镜像操作里唯一没反馈的一半——补齐。
-                                message = format!("已保存 {label} 的密钥").into();
-                                refetch_secrets(&mut client, Some(&profile))
-                            }
-                            Ok(Response::Ok) => match client.call(Request::Create {
-                                dir: current_dir.display().to_string(),
+                    // 这条结果只有在「发起验证时的 (profile, buf)」跟「此刻
+                    // 屏幕上这一份 (profile, buf)」完全一致时才有落点——见
+                    // 上面声明 `verify_rx` 时的注释和
+                    // `verify_outcome_applies_to` 的文档注释。用户可能在这次
+                    // 网络探测跑着的时候已经 Ctrl+Q/Esc 退出去，甚至绕回来
+                    // 在另一个 agent 身上重新填了密钥；这时候视图仍然是
+                    // `EnterSecret`，光看"是不是这个变体"分不出是不是同一个
+                    // 请求，必须把 profile 和 buf 都比对上。不满足就直接
+                    // 扔掉，不切视图——套在一个不相干的 profile/密钥上
+                    // 比什么都不做更危险（见 CRITICAL 1 的复现步骤）。
+                    if verify_outcome_applies_to(&sent_profile, &sent_buf, &profile, &buf) {
+                        view = match verify_message(outcome) {
+                            Some(m) => View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Failed(m),
+                                return_to_settings,
+                            },
+                            // 通过：先存盘。存密钥必须先于「开会话」/「回设置页」两条
+                            // 后续路径都成立的前提——回设置页要读一份刷新过的 has_secret
+                            // 才能显示「已配」，开会话是从磁盘上已经存好的密钥里现读
+                            // 一份给新会话用的（见 daemon.rs），顺序反了新会话拿到的
+                            // 还是空密钥。
+                            None => match client.call(Request::SetSecret {
                                 profile: profile.clone(),
-                                remember: true,
+                                value: buf.clone(),
                             }) {
-                                Ok(Response::Created { id }) => {
-                                    need_sessions = true; // 会话标题要显示项目名
-                                    View::Attached(id)
+                                Ok(Response::Ok) if return_to_settings => {
+                                    // 从设置页进来的是「改配置」，不是「开工」——
+                                    // 存完直接回设置页，不建会话。这里**不能**甩一个
+                                    // 空壳指望循环收尾那段通用重拉逻辑去补：那段逻辑
+                                    // 挂在按键处理之后，而这整段 verify_rx 分支跑在
+                                    // 循环顶部、不受「这一轮有没有按键」摆布——如果
+                                    // 用户这时候没再按键，`event::poll` 超时会直接
+                                    // `continue` 到下一轮循环顶部，跳过收尾，空壳会
+                                    // 一直空着，直到用户偶然按下一个键才被补上（手测
+                                    // 时真的复现了：改完密钥，界面卡在一屏空列表，
+                                    // 直到按了 Ctrl+Q 再按 c 才刷出来）。直接现查一遍，
+                                    // 光标顺手定在刚改的这一行上。
+                                    //
+                                    // 改完给一句确认：这一行本身会从「未配」翻成
+                                    // 「已配」，但删除那条路径有「已删除 X 的密钥」
+                                    // 的消息条打底，改密钥这条路径原来什么都不说，
+                                    // 是同一对镜像操作里唯一没反馈的一半——补齐。
+                                    message = format!("已保存 {label} 的密钥").into();
+                                    refetch_secrets(&mut client, Some(&profile))
                                 }
+                                Ok(Response::Ok) => match client.call(Request::Create {
+                                    dir: current_dir.display().to_string(),
+                                    profile: profile.clone(),
+                                    remember: true,
+                                }) {
+                                    Ok(Response::Created { id }) => {
+                                        need_sessions = true; // 会话标题要显示项目名
+                                        View::Attached(id)
+                                    }
+                                    Ok(Response::Error(e)) => View::EnterSecret {
+                                        profile,
+                                        label,
+                                        prompt,
+                                        buf,
+                                        phase: SecretPhase::Failed(e),
+                                        return_to_settings,
+                                    },
+                                    _ => View::EnterSecret {
+                                        profile,
+                                        label,
+                                        prompt,
+                                        buf,
+                                        phase: SecretPhase::Failed("开不了会话，再试一次".into()),
+                                        return_to_settings,
+                                    },
+                                },
                                 Ok(Response::Error(e)) => View::EnterSecret {
                                     profile,
                                     label,
@@ -333,32 +373,17 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                     label,
                                     prompt,
                                     buf,
-                                    phase: SecretPhase::Failed("开不了会话，再试一次".into()),
+                                    phase: SecretPhase::Failed("密钥没存上，再试一次".into()),
                                     return_to_settings,
                                 },
                             },
-                            Ok(Response::Error(e)) => View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase: SecretPhase::Failed(e),
-                                return_to_settings,
-                            },
-                            _ => View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase: SecretPhase::Failed("密钥没存上，再试一次".into()),
-                                return_to_settings,
-                            },
-                        },
-                    };
+                        };
+                    }
+                    // else：profile 或 buf 对不上——这条结果对应的是一个用户
+                    // 已经离开的请求，扔了，不切视图。
                 }
-                // else：视图已经不是 EnterSecret 了（比如用户 Esc/Ctrl+Q 提前
-                // 离开了）。这条结果没有落点，扔了——它对应的是一个用户已经
-                // 不在的视图，套在别的视图上没有意义。
+                // else：视图现在压根就不是 EnterSecret 了（比如用户 Esc/Ctrl+Q
+                // 提前离开，切到了看板/选择器/设置页）。同样没有落点，扔了。
             }
         }
 
@@ -992,6 +1017,12 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             let sock = socket.to_path_buf();
                             let p = profile.clone();
                             let v = buf.clone();
+                            // 结果送回来时要能比对"这还是不是当初发起这次验证的
+                            // 那个请求"（见 `verify_outcome_applies_to`），所以
+                            // 在 `p`/`v` 被移进 `Request::VerifySecret` 之前先
+                            // 各留一份拷贝，跟结果一起送回主循环。
+                            let stamped_profile = p.clone();
+                            let stamped_buf = v.clone();
                             std::thread::spawn(move || {
                                 // 另开一条连接：主循环那条还要继续画界面
                                 let outcome = Client::connect(&sock)
@@ -1006,7 +1037,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                         _ => VerifyOutcome::Unreachable,
                                     })
                                     .unwrap_or(VerifyOutcome::Unreachable);
-                                let _ = tx.send(outcome);
+                                let _ = tx.send((stamped_profile, stamped_buf, outcome));
                             });
                             verify_rx = Some(rx);
                             view = View::EnterSecret {
@@ -1506,6 +1537,29 @@ pub fn verify_message(o: VerifyOutcome) -> Option<String> {
         VerifyOutcome::BadKey => Some("这个密钥用不了，可能是复制的时候少了一段".into()),
         VerifyOutcome::Unreachable => Some("连不上服务器，检查一下网络".into()),
     }
+}
+
+/// 一次密钥验证的结果，还能不能用在眼前这一屏上。
+///
+/// CRITICAL 1（最终整分支 code review）：验证是异步的——发起时把
+/// `(profile, buf)` 交给后台线程，结果送回来可能是好几秒之后。这几秒里
+/// 用户完全可能已经 Ctrl+Q/Esc 退出这一屏，甚至绕回来在**另一个** agent
+/// 身上重新填了密钥。旧代码收结果时只看"现在还是不是 `EnterSecret`
+/// 视图"，对不上具体是哪个 profile、填的是哪份密钥——于是一次迟到的
+/// 「Kimi 的密钥验证通过了」被套在了此刻屏幕上「GLM，密钥框还是空的」
+/// 这一份状态上，`SetSecret { profile: "glm", value: "" }` 直接把 GLM
+/// 已经存好的密钥用空串冲掉，界面还告诉用户「已保存」。
+///
+/// 抽成纯函数是为了能直接单测这条判断本身——通过真实的 5 秒验证窗口去
+/// 人工踩这个时间窗口不现实，但「发起时的身份」和「此刻屏幕上的身份」
+/// 要不要相等，是一次纯粹的比较，不需要真连 daemon 就能覆盖。
+pub fn verify_outcome_applies_to(
+    issued_profile: &str,
+    issued_buf: &str,
+    current_profile: &str,
+    current_buf: &str,
+) -> bool {
+    issued_profile == current_profile && issued_buf == current_buf
 }
 
 /// 把一次按键翻译成要送进 agent 的字节。返回 `None` 表示这个键不转发。
@@ -3523,6 +3577,40 @@ mod tests {
     #[test]
     fn ok_has_no_message() {
         assert!(verify_message(VerifyOutcome::Ok).is_none());
+    }
+
+    // ———— CRITICAL 1（最终整分支 code review）：验证结果不能套错屏幕 ————
+    //
+    // `verify_outcome_applies_to` 是这条修复的核心：验证异步跑完之后，
+    // 只有发起时的 (profile, buf) 跟此刻屏幕上的 (profile, buf) 完全一样，
+    // 这条结果才有落点。下面三条测试直接覆盖它的判断本身——真实的时间
+    // 窗口（几秒钟的网络探测 + 用户手速）没法在单测里稳定踩中，但这条
+    // 判断是一次纯粹的相等性比较，值得也应该被直接单测覆盖。
+
+    #[test]
+    fn verify_outcome_applies_when_profile_and_buffer_still_match() {
+        assert!(verify_outcome_applies_to(
+            "kimi", "sk-abc", "kimi", "sk-abc"
+        ));
+    }
+
+    #[test]
+    fn verify_outcome_does_not_apply_to_a_different_profile() {
+        // CRITICAL 1 的复现：Kimi 的验证还在飞，用户已经绕回来在 GLM 身上
+        // 重新填了密钥——这条结果绝不能套在 GLM 头上，哪怕两边这时候都是
+        // `EnterSecret` 视图。
+        assert!(!verify_outcome_applies_to(
+            "kimi", "sk-abc", "glm", "sk-abc"
+        ));
+    }
+
+    #[test]
+    fn verify_outcome_does_not_apply_when_the_buffer_changed_on_the_same_profile() {
+        // profile 没变，但填的密钥不是当初那一份——同样不能用这条结果去
+        // 决定"这份新密钥"能不能存。
+        assert!(!verify_outcome_applies_to(
+            "kimi", "sk-old", "kimi", "sk-new"
+        ));
     }
 
     #[test]
