@@ -1,3 +1,9 @@
 name = "shell"
 command = ["/bin/zsh"]
 is_agent = false
+
+[label]
+zh = "命令行"
+
+[note]
+zh = "普通终端，不带 AI"

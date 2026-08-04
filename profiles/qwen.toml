@@ -1,0 +1,16 @@
+name = "qwen"
+command = ["qwen"]
+is_agent = true
+# 同 opencode，未实测
+
+[label]
+zh = "Qwen Code"
+
+[note]
+zh = "阿里通义，独立命令行"
+
+[install]
+command = ["npm", "i", "-g", "@qwen-code/qwen-code"]
+
+[install.note]
+zh = "需要先装 Node.js"

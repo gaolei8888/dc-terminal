@@ -1,0 +1,23 @@
+name = "qwen-api"
+command = ["claude", "--dangerously-skip-permissions"]
+is_agent = true
+idle_pattern = "\\? for shortcuts"
+
+[label]
+zh = "Qwen API"
+
+[note]
+zh = "阿里通义，套用 Claude 界面"
+
+[env]
+ANTHROPIC_BASE_URL = "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy"
+
+[secret]
+env = "ANTHROPIC_AUTH_TOKEN"
+url = "https://bailian.console.aliyun.com/?tab=model#/api-key"
+
+[secret.hint]
+zh = "在阿里云百炼控制台创建 API Key"
+
+[secret.verify]
+url = "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1/messages"
