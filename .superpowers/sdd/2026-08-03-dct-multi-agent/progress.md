@@ -44,3 +44,7 @@ Task 11: 注意 src/ui.rs 已 2948 行（本任务 +511），视图状态机 / �
 Task 12: complete (commits 3c13825..a771e45, review clean)
 Task 12: minor (deferred): quick_start_target 的「非 Ready 就回退」只用 NeedsSecret 测过，NeedsDependency / NotInstalled 没覆盖；判定是整体相等比较，风险低
 Task 12: minor (deferred): Ctrl+N 会落进和裸 n 相同的分支（看板上除 Ctrl+Q / Ctrl+O 外都不检查修饰键）；仓库既有行为，非本任务引入
+Task 13: fix round 1/5 (2 addressed 1 minor addressed, 0 open; commits 20b0f0f..f8ab275)
+Task 13: complete (commits 26b9ff8..f8ab275, review clean)
+Task 13: minor (deferred): Up/Down 与兜底分支的解除逻辑在 run() 里，只能靠 decide_delete_key 的纯函数测试 + 手工验证覆盖
+=== 全部 13 个任务完成，进入全分支评审 ===
