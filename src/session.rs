@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use crate::git::{self, FileStat};
 use crate::profile::Profile;
 use crate::pty::{PtySession, ScreenSpan};
-use crate::secrets::SecretStore;
 
 /// 一屏文字加光标位置：`screen()` 的返回值，行的集合按 (行, 列) 排布 span，
 /// 光标是 (行, 列)。type_complexity 报警要求给这个组合起个名字。
@@ -102,7 +101,12 @@ impl SessionManager {
         Profile::builtin(name).ok_or_else(|| anyhow::anyhow!("没有这个 profile: {name}"))
     }
 
-    pub fn create(&self, dir: &Path, profile_name: &str, secrets: &SecretStore) -> Result<u32> {
+    /// `secret` 是调用方已经查好的那一条密钥（如果这个 profile 需要密钥、且用户填过的话），
+    /// 不是整个密钥仓。`create()` 本身只用得上这一条，让它捧着整仓密钥走完这段慢流程，
+    /// 是在放大暴露面而不是缩小它；调用方（`daemon.rs`）在查这一条的时候也只需要
+    /// 极短暂地持锁，不必在 PTY 起进程、git checkpoint 这些慢操作期间攥着锁不放
+    /// （原则见下面「以下全是慢操作」那段注释，和调用方 `daemon.rs::handle` 的注释）。
+    pub fn create(&self, dir: &Path, profile_name: &str, secret: Option<&str>) -> Result<u32> {
         let profile = self.resolve_profile(profile_name)?;
 
         if !dir.is_dir() {
@@ -133,7 +137,7 @@ impl SessionManager {
         // create() 拦一遍会让「先装上 CLI 试试能不能跑」这种路径莫名其妙失败。
         let mut env = profile.env.clone();
         if let Some(spec) = &profile.secret {
-            if let Some(key) = secrets.get(&profile.name) {
+            if let Some(key) = secret {
                 env.insert(spec.env.clone(), key.to_string());
             }
         }
@@ -342,11 +346,9 @@ mod tests {
         dir
     }
 
-    /// 大多数测试不关心密钥，只是要满足 `create()` 新增的形参。指向一个
-    /// 从没写过的路径，`SecretStore::load` 对不存在的文件视为「空」，不是错误。
-    fn empty_secrets() -> SecretStore {
-        let tmp = tempfile::tempdir().unwrap();
-        SecretStore::load(&tmp.path().join("secrets.toml"))
+    /// 大多数测试不关心密钥，只是要满足 `create()` 新增的形参。
+    fn empty_secrets() -> Option<&'static str> {
+        None
     }
 
     // 用 cat 冒充 agent：能收输入、不会自己退出
@@ -372,7 +374,7 @@ mod tests {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
-        let id = m.create(repo.path(), "fake", &empty_secrets()).unwrap();
+        let id = m.create(repo.path(), "fake", empty_secrets()).unwrap();
 
         let dir = m.list().iter().find(|s| s.id == id).unwrap().dir.clone();
         let want = repo.path().canonicalize().unwrap();
@@ -389,7 +391,7 @@ mod tests {
         let m = SessionManager::new();
         m.register_profile(fake_agent());
         let err = m
-            .create(plain.path(), "fake", &empty_secrets())
+            .create(plain.path(), "fake", empty_secrets())
             .unwrap_err()
             .to_string();
         assert!(err.contains("不是 git 仓库"), "实际错误: {err}");
@@ -399,7 +401,7 @@ mod tests {
     fn shell_session_runs_in_place() {
         let plain = tempfile::tempdir().unwrap();
         let m = SessionManager::new();
-        let id = m.create(plain.path(), "shell", &empty_secrets()).unwrap();
+        let id = m.create(plain.path(), "shell", empty_secrets()).unwrap();
         let dir = m.list().iter().find(|s| s.id == id).unwrap().dir.clone();
         assert!(!dir.contains("dct-worktrees"));
     }
@@ -409,7 +411,7 @@ mod tests {
         let m = SessionManager::new();
         let missing = std::path::PathBuf::from("/definitely/does/not/exist/dct-test-dir");
         let err = m
-            .create(&missing, "shell", &empty_secrets())
+            .create(&missing, "shell", empty_secrets())
             .unwrap_err()
             .to_string();
         assert!(err.contains("目录不存在"), "实际错误: {err}");
@@ -431,7 +433,7 @@ mod tests {
 
         let plain = tempfile::tempdir().unwrap();
         let id = m
-            .create(plain.path(), "shell", &empty_secrets())
+            .create(plain.path(), "shell", empty_secrets())
             .expect("锁中毒之后 create() 应该还能正常工作，而不是永远失败");
         assert_eq!(m.list().iter().find(|s| s.id == id).unwrap().id, id);
     }
@@ -441,7 +443,7 @@ mod tests {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
-        let id = m.create(repo.path(), "fake", &empty_secrets()).unwrap();
+        let id = m.create(repo.path(), "fake", empty_secrets()).unwrap();
 
         m.send_input(id, "READY").unwrap();
         m.send_input(id, "").unwrap(); // 空字符串 = 回车
@@ -463,7 +465,7 @@ mod tests {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
-        let id = m.create(repo.path(), "fake", &empty_secrets()).unwrap();
+        let id = m.create(repo.path(), "fake", empty_secrets()).unwrap();
 
         let wt_dir: std::path::PathBuf = m
             .list()
@@ -486,7 +488,7 @@ mod tests {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
-        let id = m.create(repo.path(), "fake", &empty_secrets()).unwrap();
+        let id = m.create(repo.path(), "fake", empty_secrets()).unwrap();
         let wt_dir: std::path::PathBuf = m
             .list()
             .iter()
@@ -507,7 +509,7 @@ mod tests {
         // agent 必须按界面的真实宽度排版，否则窗口再宽也只用得到左边一块
         let dir = tempfile::tempdir().unwrap();
         let m = SessionManager::new();
-        let id = m.create(dir.path(), "shell", &empty_secrets()).unwrap();
+        let id = m.create(dir.path(), "shell", empty_secrets()).unwrap();
 
         m.resize(id, 30, 200).unwrap();
 
@@ -523,7 +525,7 @@ mod tests {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
-        let id = m.create(repo.path(), "fake", &empty_secrets()).unwrap();
+        let id = m.create(repo.path(), "fake", empty_secrets()).unwrap();
         m.stop(id).unwrap();
         let st = m.list().iter().find(|s| s.id == id).unwrap().state;
         assert_eq!(st, SessionState::Stopped);
@@ -556,7 +558,9 @@ mod tests {
         let mut secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
         secrets.set("fake-api", "sk-xyz").unwrap();
 
-        let id = mgr.create(&proj, "fake-api", &secrets).unwrap();
+        let id = mgr
+            .create(&proj, "fake-api", secrets.get("fake-api"))
+            .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -596,7 +600,9 @@ mod tests {
         );
 
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
-        assert!(mgr.create(&proj, "fake-api", &secrets).is_ok());
+        assert!(mgr
+            .create(&proj, "fake-api", secrets.get("fake-api"))
+            .is_ok());
     }
 
     #[test]
@@ -610,7 +616,10 @@ mod tests {
             Profile::from_toml("name = \"gone\"\ncommand = [\"/绝对不存在/x9\"]\n").unwrap(),
         );
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
-        let err = mgr.create(&proj, "gone", &secrets).unwrap_err().to_string();
+        let err = mgr
+            .create(&proj, "gone", secrets.get("gone"))
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("启动不了"), "要说人话：{err}");
         assert!(
