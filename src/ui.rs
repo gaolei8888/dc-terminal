@@ -326,7 +326,13 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         match client.call(Request::Profiles) {
                             Ok(Response::Profiles { entries, warning }) => {
                                 let mut state = ListState::default();
-                                state.select(Some(0));
+                                // daemon 目前总是至少返回九个内置 profile，这里
+                                // 空表分支基本走不到；但选中一个不存在的下标，
+                                // 按 Enter 就是 entries[0] 越界 panic——这种最坏
+                                // 结果不该只靠"实践中到不了"兜底，一行守卫不值钱。
+                                if !entries.is_empty() {
+                                    state.select(Some(0));
+                                }
                                 view = View::PickProfile {
                                     entries,
                                     state,
@@ -861,12 +867,27 @@ fn screen_to_lines(screen: &[Vec<ScreenSpan>]) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// 一个字符在等宽终端里占几列。CJK/全角字符占两列——`truncate`/`pad_to`
+/// 都得按这份宽度算，两边对「宽」的定义不能悄悄分叉，否则裁的地方和
+/// 补空格的地方就对不上。
+fn char_width(ch: char) -> usize {
+    if (ch as u32) > 0x1100 {
+        2
+    } else {
+        1
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
 /// 按显示宽度截断，超出的用 … 收尾。看板一行放不下就裁，不能让它换行把表格冲乱。
 fn truncate(s: &str, max: usize) -> String {
     let mut w = 0;
     let mut out = String::new();
     for ch in s.chars() {
-        let cw = if (ch as u32) > 0x1100 { 2 } else { 1 };
+        let cw = char_width(ch);
         if w + cw > max {
             out.push('…');
             return out;
@@ -874,6 +895,17 @@ fn truncate(s: &str, max: usize) -> String {
         w += cw;
         out.push(ch);
     }
+    out
+}
+
+/// 按显示宽度右补空格，对齐到 `width` 列。不能用 `format!("{:<N}")`——
+/// 那是按字符数补的，中文字符占两列却只算一个字符，中英文标签混排时
+/// 后面的列就会跟着漂移（`命令行` 3 个字符 6 列，`Claude` 6 个字符也是
+/// 6 列，`{:<14}` 会让前者多出 3 格空白）。agent 选择器这一屏中英文
+/// 标签常年混着出现（`Claude`/`Codex` 和 `命令行`），不是边角情况。
+fn pad_to(s: &str, width: usize) -> String {
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(width.saturating_sub(display_width(s))));
     out
 }
 
@@ -1119,24 +1151,20 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(num, base),
-                        Span::styled(format!("{:<14}", truncate(&e.label, 14)), base),
-                        Span::styled(
-                            format!("{:<26}", truncate(&e.note, 26)),
-                            base.fg(Color::DarkGray),
-                        ),
+                        Span::styled(pad_to(&truncate(&e.label, 14), 14), base),
+                        Span::styled(pad_to(&truncate(&e.note, 26), 26), base.fg(Color::DarkGray)),
                         Span::styled(reason, base.fg(Color::DarkGray)),
                     ]))
                 })
                 .collect();
 
-            // ⚠️ 已知缺口：warning 有时会夹带英文——SecretStore::load() 对
-            // io::Error 直接 `format!("{e}")`，权限错之类会漏出系统原话
-            // 「Permission denied (os error 13)」；toml 解析错误的「expected
-            // ...」半句本身也是英文（profile.rs::describe_toml_error 的注释
-            // 里承认了这点，为了保留可操作性特意没吞掉）。真要治本得去
-            // secrets.rs / profile.rs 把这些错误分类翻成中文，这个任务的
-            // 文件范围只到 ui.rs——先如实显示、用红色边框提醒「有异常」，
-            // 不在这里瞎猜一套字符串替换规则去掩饰它。
+            // warning 这里直接原样显示，不做字符串加工——分类翻译成人话是
+            // secrets.rs（load_error）/ profile.rs（load_dir）的责任，
+            // 到这里的时候应该已经是完整的中文句子。唯一保留的例外是
+            // profile.rs::describe_toml_error 里「expected ...」那半句可能
+            // 是英文：那是用户自己写的 profile TOML 解析报错，行号已经是
+            // 中文「第 N 行」，用户本来就在手改 TOML 文件，英文的语法期望
+            // 提示比吞掉更有用（详见该函数的注释）。
             let title = match warning {
                 Some(w) => format!("选 agent —— {w}"),
                 None => "选 agent".to_string(),
@@ -1321,6 +1349,31 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn pad_to_aligns_cjk_and_ascii_labels_to_the_same_display_width() {
+        // 回归测试，对应审查发现「中英混排的列对不齐」：`format!("{:<N}")`
+        // 按字符数补空格，中文字符占两列却只算一个字符，`命令行`（3 字符）
+        // 和 `Claude`（6 字符）补到同样的字符数时，显示宽度会差 3 列。
+        // agent 选择器里这两种标签常年混排，不是边角情况。
+        let cjk = pad_to("命令行", 14);
+        let ascii = pad_to("Claude", 14);
+        assert_eq!(
+            display_width(&cjk),
+            display_width(&ascii),
+            "CJK 标签和 ASCII 标签补齐后显示宽度必须相等：{cjk:?} vs {ascii:?}"
+        );
+        assert_eq!(display_width(&cjk), 14);
+        assert_eq!(display_width(&ascii), 14);
+    }
+
+    #[test]
+    fn pad_to_never_shrinks_a_string_already_at_or_over_width() {
+        // saturating_sub 保底：显示宽度已经达到/超过目标时不能倒扣出负数
+        // 长度导致 panic（`" ".repeat()` 拿到下溢的 usize 会直接崩）。
+        assert_eq!(pad_to("一二三四五六七", 10), "一二三四五六七");
+        assert_eq!(pad_to("abc", 2), "abc");
     }
 
     #[test]

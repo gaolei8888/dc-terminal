@@ -171,6 +171,19 @@ pub fn profiles_dir_for_socket(socket: &Path) -> PathBuf {
     }
 }
 
+/// `io::Error` 的 `Display` 是系统原话（英文，常年带 `os error N` 这种
+/// 只有程序员看得懂的后缀），直接甩给零编程经验的用户就是一份变相栈追踪。
+/// 这里按 `ErrorKind` 挑几种用户分得清、也做得了什么的说法；分不清的
+/// 归到一句笼统的「读取失败」——原始详情不丢，调用方负责写到 stderr，
+/// 不冒泡到界面上。
+pub(crate) fn describe_io_error(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "没有权限读取".to_string(),
+        std::io::ErrorKind::NotADirectory => "不是一个文件夹".to_string(),
+        _ => "读取失败".to_string(),
+    }
+}
+
 /// 读一个目录下所有 `*.toml`。第二个返回值是每个读不了的文件的人话错误——
 /// **不能静默跳过**：用户自己写的 profile 没出现在菜单里，他需要知道为什么。
 pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
@@ -185,7 +198,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (found, errs),
         Err(e) => {
             let name = dir.to_string_lossy();
-            errs.push(format!("{name} 打不开：{e}"));
+            // 原始系统错误写到 stderr 留个诊断痕迹，界面上只给人话——
+            // 见 describe_io_error 的注释。
+            eprintln!("{name} 打不开：{e}");
+            errs.push(format!("{name} 打不开：{}", describe_io_error(&e)));
             return (found, errs);
         }
     };
@@ -201,7 +217,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
     for path in paths {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         match std::fs::read_to_string(&path) {
-            Err(e) => errs.push(format!("{name} 读不了：{e}")),
+            Err(e) => {
+                eprintln!("{name} 读不了：{e}");
+                errs.push(format!("{name} 读不了：{}", describe_io_error(&e)));
+            }
             Ok(src) => match Profile::from_toml(&src) {
                 // `Profile::from_toml` 用 `.context()` 包了一层，anyhow 的
                 // Display 对 context 错误只吐 context 那句话，底层
@@ -234,7 +253,7 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
 /// 这行菜单状态栏只能放一行字，两行糊在一起在等宽终端上会错位换行，看着又是
 /// 一份变相的栈追踪。这里把内部换行拍平成中文顿号式的分隔符——两句话都留着，
 /// 「expected ...」那半句是真正告诉用户该怎么改的部分，直接丢掉可惜。
-fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
+pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
     let reason = err
         .message()
         .lines()
@@ -819,6 +838,48 @@ mod tests {
             assert!(
                 errs[0].contains("locked"),
                 "错误里要指出是哪个目录：{}",
+                errs[0]
+            );
+            // io::Error 的 Display 是英文系统原话（"Permission denied (os
+            // error 13)"），零编程经验的用户看不懂 errno——这行必须只剩
+            // 中文说法，原文只写 stderr。
+            assert!(
+                !errs[0].contains("os error") && !errs[0].contains("Permission denied"),
+                "不能把系统原话漏给用户：{}",
+                errs[0]
+            );
+            assert!(errs[0].contains("权限"), "要点名是权限问题：{}", errs[0]);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_file_reports_an_error_in_plain_chinese() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("locked.toml");
+        std::fs::write(&f, "name = \"x\"\ncommand = [\"echo\"]\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        struct RestorePerms<'a>(&'a std::path::Path);
+        impl Drop for RestorePerms<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        let _restore = RestorePerms(&f);
+
+        // root（常见于容器化 CI）不受文件权限位约束，跳过而不是硬跑出一个
+        // 和权限无关的 flaky 失败——同上面 unreadable_dir 那条测试的理由。
+        if std::fs::read_to_string(&f).is_err() {
+            let (found, errs) = load_dir(tmp.path());
+            assert!(found.is_empty());
+            assert_eq!(errs.len(), 1);
+            assert!(errs[0].contains("locked.toml"));
+            assert!(
+                !errs[0].contains("os error") && !errs[0].contains("Permission denied"),
+                "不能把系统原话漏给用户：{}",
                 errs[0]
             );
         }
