@@ -13,6 +13,7 @@ use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
 use crate::secrets::{secrets_path_for_socket, SecretStore};
 use crate::session::{recover, SessionManager};
+use crate::verify::{send_probe, verify_with, VerifyOutcome};
 
 pub fn run(socket: &Path) -> Result<()> {
     run_with_manager(socket, Arc::new(SessionManager::new()))
@@ -189,6 +190,19 @@ fn handle(
         Request::LastProfile => Ok(Response::LastProfile(
             recover(store.lock()).last_profile().map(str::to_string),
         )),
+        Request::VerifySecret { profile, value } => {
+            let (all, _) = all_profiles(profiles_dir);
+            let spec = all
+                .iter()
+                .find(|p| p.name == profile)
+                .and_then(|p| p.secret.as_ref())
+                .and_then(|s| s.verify.as_ref());
+            match spec {
+                // 没声明 verify 的 profile 直接放行，不是错误
+                None => Ok(Response::Verify(VerifyOutcome::Ok)),
+                Some(v) => Ok(Response::Verify(verify_with(&v.url, &value, &send_probe))),
+            }
+        }
     };
     r.unwrap_or_else(|e| Response::Error(e.to_string()))
 }

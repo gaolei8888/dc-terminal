@@ -78,6 +78,10 @@ pub enum Request {
         profile: String,
     },
     LastProfile,
+    VerifySecret {
+        profile: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +102,7 @@ pub enum Response {
     },
     Projects(Vec<String>),
     LastProfile(Option<String>),
+    Verify(crate::verify::VerifyOutcome),
     Ok,
     Error(String),
 }
