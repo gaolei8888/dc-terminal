@@ -104,12 +104,15 @@ fn handle(
             let sec = recover(secrets.lock());
             if let Some(e) = sec.load_error() {
                 // 密钥文件读不了要顶到界面上。静默的话用户会以为密钥丢了，
-                // 而且这时候所有写入都被拒，他改什么都没反应。带上路径是
-                // 因为「读不了」本身不可操作——用户得知道去看哪个文件。
-                warnings.insert(
-                    0,
-                    format!("密钥文件读不了：{e}，检查一下 {}", sec.path().display()),
-                );
+                // 而且这时候所有写入都被拒，他改什么都没反应。
+                //
+                // IMPORTANT 4（最终整分支 code review）：以前这里无条件拼一句
+                // 「检查一下 {path}」——对权限错误说得通（去看看那个文件），
+                // 但套在密钥文件损坏的情形上就是让用户去手改一个 README 明说
+                // 不支持手改的文件。`load_error()` 现在返回的已经是一句自足、
+                // 说清楚该干什么的中文（见 `SecretStore::load` 的注释），这里
+                // 只负责把路径带上，不再叠加任何暗示"去编辑它"的措辞。
+                warnings.insert(0, format!("{e}（{}）", sec.path().display()));
             }
             let entries = all
                 .iter()
