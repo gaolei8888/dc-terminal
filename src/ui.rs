@@ -1384,14 +1384,18 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
 /// 这一下是不带 Alt/Meta 的「光板」按键吗。
 ///
 /// 用在看板和密钥页那些一个字母就干实事的分支上（退出、删除、跳走）。
-/// 两层理由：
+/// 理由是语义本身：`Alt+c` 不是 `c`，让它触发 `c` 的动作是 bug——这个守卫
+/// 只管这一件事，也正因为这件事本身就该管，所以要留着。
 ///
-/// 1. 语义本来就该这样——`Alt+c` 不是 `c`，让它触发 `c` 的动作是 bug。
-/// 2. 更要紧的是它是一道兜底：漏进 stdin 的转义序列字节被 crossterm 报成
-///    **带 Alt 的** `Char` 事件（它不解析 OSC，`\x1b]` 落到兜底分支就变成
-///    `Alt+']'`）。要求「不带 Alt」就等于要求这不是漏进来的转义字节，
-///    于是万一以后哪次改动重新漏出了终端回复（见 `theme.rs` 里 DA1 哨兵的
-///    注释），漏出来的也只是一串什么都不做的按键，而不是删掉一把密钥。
+/// 这**不是**防「转义序列漏进 stdin 被当成按键」的第二道防线——之前的
+/// 注释这么说过，是错的。crossterm 0.28.1 只把 ESC 后紧跟的那一个字节
+/// 标成 Alt（`event/sys/unix/parse.rs`），发出这个事件后立刻清空解析
+/// 缓冲区（`event/source/unix/tty.rs`），后面的字节是从头重新解析、不带
+/// 任何修饰符的。所以 `\x1b]11;rgb:cdcd/dddd/dddd\x07` 一旦漏出来，`]`
+/// 是 `Alt+']'`，但紧跟着的 `cdcd`、`dddd` 里每个 `c`/`d` 都是光板
+/// `Char('c')`/`Char('d')` 事件——这个守卫在那条路径上完全拦不住。真正
+/// 防「回复变按键」的是 `theme.rs` 里的 DA1 哨兵和 isatty 判断，不是这
+/// 里；别指望这层守卫替哨兵兜底，也别因为这层守卫在就去削弱哨兵。
 fn is_plain_key(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::META)
 }
@@ -2428,10 +2432,13 @@ mod tests {
         assert_eq!(key_to_input(&ctrl('b')), Some("\u{2}".to_string()));
     }
 
-    /// 看板和密钥页那些「一个字母就干实事」的分支都挂了这个守卫。
-    /// 漏进 stdin 的转义序列字节会被 crossterm 报成带 Alt 的 `Char`，
-    /// 要求「不带 Alt」就把那种误触挡在外面；正常按键（含 Shift、Ctrl）
-    /// 一个都不能被挡——挡了就是把用户的键吃掉。
+    /// 看板和密钥页那些「一个字母就干实事」的分支都挂了这个守卫，为的是
+    /// 不让 Alt/Meta 组合键触发同名光板字母的动作（`Alt+c` 不是 `c`）。
+    /// 它不是防「转义序列漏进 stdin」的防线——crossterm 只把 ESC 后紧跟
+    /// 的那一个字节标成 Alt，后面的字节都是光板 `Char` 事件，这个守卫
+    /// 拦不住；防漏进按键靠的是 `theme.rs` 里的 DA1 哨兵。这里只测它该
+    /// 管的语义：挡住 Alt/Meta，放行正常按键（含 Shift、Ctrl）——挡了
+    /// 正常按键就是把用户的键吃掉。
     #[test]
     fn is_plain_key_rejects_alt_but_passes_normal_keypresses() {
         assert!(is_plain_key(&KeyEvent::new(

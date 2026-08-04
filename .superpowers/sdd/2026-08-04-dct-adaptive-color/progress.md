@@ -31,3 +31,11 @@ Task 5: BLOCKED on human — 步骤 2/3/4 的肉眼验收需要真实 tty + 真�
 FINAL REVIEW (opus, 7402767..553f65c): merge-ready-with-caveats. 1 Important + 3 Minor.
   Important: OSC 11 迟到的回复没人排空 -> crossterm 当按键读走。十六进制含 c/d，Board 视图里 c 开密钥页、d 武装删除；背景如 #cddddd 会产出 c 加五个 d。从「终端慢了 200ms」到「密钥被删」，用户没按任何键。分支引入的新失败模式。
   Fix wave dispatched (FIX_BASE=553f65c): DA1 哨兵 + isatty 门 + ALT/META 按键防护 + reader-called-once 断言 + 设计文档措辞更正。
+FINAL FIX re-review (opus, 553f65c..6ea8c01): 5/5 findings ADDRESSED, no functional regression. 但引入 1 个 Important：
+  src/ui.rs:1390-1393 的注释声称漏出的转义字节会被报成「带 Alt 的 Char」，因此 ALT 门能让泄漏无害。这是错的。
+  crossterm 0.28 只给紧跟 ESC 的那一个字节加 ALT（parse.rs:78-86），发出事件后立刻清空解析缓冲（tty.rs:244-265），
+  所以 `11;rgb:cdcd/dddd/dddd` 之后每个字节都是**不带修饰键**的 Char。演示过的 c -> d -> d 删除链条照样触发，
+  is_plain_key 一次都不会挡住。=> 1c 不是 1a 的后备层，1a 是单点。
+  两条残余泄漏路径（必须记录为已知风险）：(1) 256 字节上限在 DA1 之前返回；(2) 终端/多路复用器本地应答 DA1
+  但把 OSC 11 代理到上游，破坏「按顺序应答」的前提。
+  裁定：注释是在断言一个不存在的安全属性，未来读者会依赖它去削弱 1a。派一次纯文字修正（不改行为，无需再评审）。
