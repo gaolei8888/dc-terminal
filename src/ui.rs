@@ -438,26 +438,74 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     KeyCode::Char('q') => break Ok(()),
                     KeyCode::Down => move_sel(&mut list_state, &sessions, 1),
                     KeyCode::Up => move_sel(&mut list_state, &sessions, -1),
-                    KeyCode::Char('n') => {
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
                         // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
                         // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
-                        // pick_action 和下面 View::PickProfile 的按键分支。
+                        // pick_action 和下面 View::PickProfile 的按键分支。n 和 N
+                        // 都要这份列表——n 拿它判断上次那个 agent 现在还在不在
+                        // Ready，N 拿它渲染选择器——所以只拉一次，不分两条路各拉各的。
                         match client.call(Request::Profiles) {
                             Ok(Response::Profiles { entries, warning }) => {
-                                let mut state = ListState::default();
-                                // daemon 目前总是至少返回九个内置 profile，这里
-                                // 空表分支基本走不到；但选中一个不存在的下标，
-                                // 按 Enter 就是 entries[0] 越界 panic——这种最坏
-                                // 结果不该只靠"实践中到不了"兜底，一行守卫不值钱。
-                                if !entries.is_empty() {
-                                    state.select(Some(0));
-                                }
-                                view = View::PickProfile {
-                                    entries,
-                                    state,
-                                    warning,
+                                // 把「拉完列表但没能直开」的三种落点（选择器为空、
+                                // 建会话失败两种）收在一处，省得同一段 ListState
+                                // 初始化抄三遍——那种抄法迟早有一份漏了空表守卫。
+                                let picker =
+                                    |entries: Vec<ProfileEntry>, warning: Option<String>| {
+                                        let mut state = ListState::default();
+                                        // daemon 目前总是至少返回九个内置 profile，这里
+                                        // 空表分支基本走不到；但选中一个不存在的下标，
+                                        // 按 Enter 就是 entries[0] 越界 panic——这种最坏
+                                        // 结果不该只靠"实践中到不了"兜底，一行守卫不值钱。
+                                        if !entries.is_empty() {
+                                            state.select(Some(0));
+                                        }
+                                        View::PickProfile {
+                                            entries,
+                                            state,
+                                            warning,
+                                        }
+                                    };
+                                // 大写 N 一定要看一眼选择器，不查上次用的是谁；
+                                // 小写 n 才去问 daemon 上次记的是哪个 agent。
+                                let last = if key.code == KeyCode::Char('n') {
+                                    match client.call(Request::LastProfile) {
+                                        Ok(Response::LastProfile(l)) => l,
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
                                 };
+                                match quick_start_target(last.as_deref(), &entries) {
+                                    Some(name) => {
+                                        // 同 View::PickProfile 里 PickAction::Start 那支：
+                                        // 「n」等价于「已经替用户选好了上次那个」，
+                                        // 建完直接进会话，不用再让他确认一遍。
+                                        match client.call(Request::Create {
+                                            dir: current_dir.display().to_string(),
+                                            profile: name,
+                                            remember: true,
+                                        }) {
+                                            Ok(Response::Created { id }) => {
+                                                need_sessions = true; // 会话标题要显示项目名
+                                                view = View::Attached(id);
+                                            }
+                                            Ok(Response::Error(e)) => {
+                                                message = Msg::err(e);
+                                                view = picker(entries, warning);
+                                            }
+                                            _ => {
+                                                message = Msg::err("创建失败".into());
+                                                view = picker(entries, warning);
+                                            }
+                                        }
+                                    }
+                                    None => view = picker(entries, warning),
+                                }
                             }
+                            // 列表都拿不到，直开和选择器都没法走，只能告诉用户
+                            // 这次干瞪眼——留在 Board 上，视图没变，走到循环
+                            // 末尾 message_after_transition 会把这条消息原样
+                            // 留住（同其他分支，不用 continue 抢跑跳过收尾）。
                             Ok(Response::Error(e)) => message = Msg::err(e),
                             _ => message = Msg::err("拿不到 agent 列表".into()),
                         }
@@ -1057,6 +1105,20 @@ pub fn pick_action(e: &ProfileEntry) -> PickAction {
     }
 }
 
+/// `n` 该直接开哪个 agent。`None` = 没得直开，进选择器。
+///
+/// 目标用户是非程序员：让他每次在九个 agent 里挑一个是设计失败——他不知道区别。
+/// 日常路径压成一个按键，想换的人按 N。只有「上次那个现在仍然 Ready」才直开：
+/// 密钥被删、CLI 被卸、自定义 profile 被改没了，都不是 Ready，直开只会把人
+/// 扔进一个起不来的窗口，还不如回选择器让他看见状态和原因。
+pub fn quick_start_target(last: Option<&str>, entries: &[ProfileEntry]) -> Option<String> {
+    let last = last?;
+    entries
+        .iter()
+        .find(|e| e.name == last && e.status == ProfileStatus::Ready)
+        .map(|e| e.name.clone())
+}
+
 /// `'1'..'9'` → `0..8`。`'0'` 不算——第 10 项要用 ↑↓ 选。
 pub fn digit_index(c: char) -> Option<usize> {
     match c {
@@ -1354,7 +1416,7 @@ fn idle_help(view: &View) -> &'static str {
             ..
         } => "输入路径后 Enter 确认，Esc 返回列表",
         View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
-        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
+        View::Board => "n 新建  N 换 agent  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
         View::EnterSecret {
@@ -2834,6 +2896,51 @@ mod tests {
             }
             other => panic!("得到 {other:?}"),
         }
+    }
+
+    // ———— Task 12：n 直连上次的 agent 、N 才进选择器 ————
+
+    #[test]
+    fn quick_start_uses_the_last_agent_when_it_is_ready() {
+        let entries = vec![
+            entry("claude", ProfileStatus::Ready),
+            entry("kimi", ProfileStatus::Ready),
+        ];
+        assert_eq!(
+            quick_start_target(Some("kimi"), &entries),
+            Some("kimi".to_string())
+        );
+    }
+
+    #[test]
+    fn quick_start_falls_back_when_the_last_agent_is_no_longer_usable() {
+        // 密钥被删了、CLI 被卸了。直接开会话只会得到一个起不来的窗口，
+        // 退回选择器让用户重新挑。
+        let entries = vec![
+            entry("claude", ProfileStatus::Ready),
+            entry("kimi", ProfileStatus::NeedsSecret),
+        ];
+        assert_eq!(quick_start_target(Some("kimi"), &entries), None);
+    }
+
+    #[test]
+    fn quick_start_falls_back_when_the_last_agent_is_gone() {
+        // 用户删掉了自己那个自定义 profile
+        let entries = vec![entry("claude", ProfileStatus::Ready)];
+        assert_eq!(quick_start_target(Some("mine"), &entries), None);
+    }
+
+    #[test]
+    fn quick_start_falls_back_on_first_ever_run() {
+        let entries = vec![entry("claude", ProfileStatus::Ready)];
+        assert_eq!(quick_start_target(None, &entries), None);
+    }
+
+    #[test]
+    fn board_help_mentions_both_n_and_capital_n() {
+        let help = idle_help(&View::Board);
+        assert!(help.contains("n 新建"));
+        assert!(help.contains("N 换 agent"));
     }
 
     #[test]
