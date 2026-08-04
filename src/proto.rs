@@ -42,7 +42,7 @@ pub struct ProfileEntry {
     pub has_secret: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum Request {
     List,
     Create {
@@ -90,6 +90,63 @@ pub enum Request {
     },
 }
 
+/// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
+/// `value` 是用户的明文密钥。今天没有任何地方真的 `{req:?}` 打印一个
+/// `Request`（已核实），但 `serve()` 解析失败那条分支离
+/// `eprintln!("bad request: {req:?}")` 只有一行距离——一旦有人图省事加了
+/// 这行调试日志，密钥就会写进守护进程的 stderr（很可能重定向进一个存活
+/// 比进程本身久得多的日志文件）。这里把 `value` 换成占位符，`profile`
+/// 这种不敏感的字段照常打印，排查问题时还能看出是哪个 profile 出的请求。
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Request::List => write!(f, "List"),
+            Request::Create {
+                dir,
+                profile,
+                remember,
+            } => f
+                .debug_struct("Create")
+                .field("dir", dir)
+                .field("profile", profile)
+                .field("remember", remember)
+                .finish(),
+            Request::Input { id, text } => f
+                .debug_struct("Input")
+                .field("id", id)
+                .field("text", text)
+                .finish(),
+            Request::Screen { id } => f.debug_struct("Screen").field("id", id).finish(),
+            Request::Resize { id, rows, cols } => f
+                .debug_struct("Resize")
+                .field("id", id)
+                .field("rows", rows)
+                .field("cols", cols)
+                .finish(),
+            Request::Stop { id } => f.debug_struct("Stop").field("id", id).finish(),
+            Request::Undo { id } => f.debug_struct("Undo").field("id", id).finish(),
+            Request::Diff { id } => f.debug_struct("Diff").field("id", id).finish(),
+            Request::Profiles => write!(f, "Profiles"),
+            Request::Projects => write!(f, "Projects"),
+            Request::SetSecret { profile, .. } => f
+                .debug_struct("SetSecret")
+                .field("profile", profile)
+                .field("value", &"<redacted>")
+                .finish(),
+            Request::DeleteSecret { profile } => f
+                .debug_struct("DeleteSecret")
+                .field("profile", profile)
+                .finish(),
+            Request::LastProfile => write!(f, "LastProfile"),
+            Request::VerifySecret { profile, .. } => f
+                .debug_struct("VerifySecret")
+                .field("profile", profile)
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Sessions(Vec<SessionInfo>),
@@ -116,4 +173,37 @@ pub enum Response {
 pub fn socket_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".dct").join("daemon.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_secret_on_set_secret() {
+        let req = Request::SetSecret {
+            profile: "kimi".into(),
+            value: "sk-super-secret-value".into(),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("sk-super-secret-value"),
+            "密钥不能出现在 Debug 输出里：{s}"
+        );
+        assert!(s.contains("kimi"), "profile 名字留着帮排查：{s}");
+    }
+
+    #[test]
+    fn debug_redacts_the_secret_on_verify_secret() {
+        let req = Request::VerifySecret {
+            profile: "glm".into(),
+            value: "sk-another-secret-value".into(),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("sk-another-secret-value"),
+            "密钥不能出现在 Debug 输出里：{s}"
+        );
+        assert!(s.contains("glm"), "profile 名字留着帮排查：{s}");
+    }
 }
