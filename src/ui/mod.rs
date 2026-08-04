@@ -625,17 +625,17 @@ const ESCAPE_HINT_COLS: u16 = 13;
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
 
-    if matches!(app.view, View::Board) {
-        board::draw(f, chunks[0], app);
-    } else if matches!(app.view, View::Attached(_)) {
-        attach::draw(f, chunks[0], app);
-    } else if matches!(
-        app.view,
-        View::PickProfile { .. } | View::PickProject { .. }
-    ) {
-        pick::draw(f, chunks[0], app);
-    } else {
-        secret::draw(f, chunks[0], app);
+    // 穷尽匹配而不是 if/else 链：少一个 View 变体的分支，if/else 链的兜底
+    // `else` 会悄悄把新变体也归给 secret::draw，画出一片空白也照样编译通过；
+    // match 会在加变体的那一刻直接编译报错，逼着调用点补上。跟 `run()` 里
+    // 按键分发那个 `match app.view.clone()` 用的是同一个理由，这里同样
+    // 必须 `.clone()`——各分支要把 `app` 借给 `board::draw`/`pick::draw`
+    // 等函数，`match &app.view` 留着的借用会跟这些调用打架。
+    match app.view.clone() {
+        View::Board => board::draw(f, chunks[0], app),
+        View::Attached(_) => attach::draw(f, chunks[0], app),
+        View::PickProfile { .. } | View::PickProject { .. } => pick::draw(f, chunks[0], app),
+        View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
     }
 
     // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
@@ -766,9 +766,13 @@ mod tests {
     /// 把几种 View（看板 / profile 选择弹窗 / 会话屏幕 / 填密钥）实际渲染
     /// 一遍，确认不 panic。这不是端到端验证（没有真的起 daemon、走键盘事件
     /// 循环），但能拦住“布局越界”“空列表 unwrap”这类会在真实交互里当场
-    /// 炸掉的问题。各视图内容本身的渲染细节测试跟着各自的模块走
-    /// （`board.rs`/`attach.rs`/`pick.rs`/`secret.rs`），这里只覆盖
-    /// 顶层 `draw()` 分派本身。
+    /// 炸掉的问题。这里只是把每种 View 都过一遍顶层 `draw()` 的分派，
+    /// 用的多是空/最小 fixture；某个视图内容本身的渲染细节（置灰、原因
+    /// 文案、红字警告、密钥打点、二次确认提示……）需要更讲究的 fixture，
+    /// 那类测试跟着各自的模块走——目前 `pick.rs` 有 `PickProfile`/
+    /// `PickProject` 的渲染细节测试，`secret.rs` 有 `EnterSecret`/
+    /// `Secrets` 的；`board.rs`/`attach.rs` 还没有自己的渲染细节测试，
+    /// 它们的内容渲染目前只被这条烟雾测试覆盖到"不 panic"这一层。
     #[test]
     fn draw_does_not_panic_for_all_views() {
         use ratatui::backend::TestBackend;
@@ -791,7 +795,7 @@ mod tests {
         ];
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.list_state.select(Some(0));
         app.current_dir = PathBuf::from("/tmp/proj");
 
@@ -861,7 +865,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/tmp/proj");
         app.view = View::Board;
         app.message = Msg::from("完成");
@@ -935,7 +939,7 @@ mod tests {
         // 真实事故：在看板上按 p 换项目，「已切到 …」这条消息把整张按键表
         // 顶掉，其中就包括「q 退出」。用户从此没有任何地方能看到怎么退出。
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/tmp");
         app.view = View::Board;
         app.message = Msg::from(
@@ -955,7 +959,7 @@ mod tests {
 
         // 出事的那一刻恰恰是最需要逃生提示的时候，断连提示不能把它顶掉。
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/tmp");
         app.view = View::Attached(1);
         app.connected = false;
@@ -970,7 +974,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/Users/lei/work/dc/dc-terminal");
         app.view = View::Board;
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -990,7 +994,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/tmp");
         app.view = View::Board;
         app.message = Msg::err("不是一个目录".into());
@@ -1031,7 +1035,7 @@ mod tests {
             activity: String::new(),
         }];
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/tmp/a");
         app.sessions = sessions;
 

@@ -101,10 +101,20 @@ impl App {
     /// 只给测试用：`board`/`attach`/`pick`/`secret` 里 `draw()`/`handle_key()`
     /// 的单测要喂一个 `App`，但用不上真实守护进程，也不关心 `current_dir`
     /// 具体是哪——用临时目录垫一个就行。
+    ///
+    /// 必须把 `TempDir` guard 跟 `App` 一起交出去：`tempfile::tempdir()` 返回的
+    /// 目录在 guard 被 drop 的那一刻就从磁盘上删掉。如果这里只取
+    /// `dir.path()` 垫两个字段就让 `dir` 在函数结束时被丢弃，`current_dir`
+    /// 存的会是一个刚被删除的路径——大多数单测只是把这个路径当字符串用，
+    /// 不会踩到，但只要有一天哪个测试真的碰了文件系统（`is_dir()`、
+    /// `expand_path` 之类），就会在一个已经不存在的目录上悄无声息地失败。
+    /// 调用方把返回的 `TempDir` 存在自己的局部变量里，让它活到测试函数
+    /// 结束——不接住这个返回值，目录一样会被立刻删掉。
     #[cfg(test)]
-    pub(crate) fn test_app() -> App {
+    pub(crate) fn test_app() -> (App, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        Self::new_disconnected(dir.path().join("s.sock"), dir.path().to_path_buf())
+        let app = Self::new_disconnected(dir.path().join("s.sock"), dir.path().to_path_buf());
+        (app, dir)
     }
 
     /// 拿到活的守护进程连接；构造时没能连上（目前只有测试会这样构造）就

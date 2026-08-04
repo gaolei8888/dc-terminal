@@ -28,6 +28,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 }
 
+/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
+/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
+/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
+/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
+/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::PickProfile {
         entries,
@@ -164,6 +169,11 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
+/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
+/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
+/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
+/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::PickProject {
         all,
@@ -502,6 +512,114 @@ mod tests {
         s
     }
 
+    /// 覆盖选 agent 弹窗四种状态（`Ready`/`NeedsSecret`/`NeedsDependency`/
+    /// `NotInstalled`）加一条 `warning` 同屏渲染的情况——这份 fixture 原来
+    /// 挂在 `mod.rs` 的 `draw_does_not_panic_for_all_views` 上，那条测试在
+    /// Task 5 把 `DrawInput` 换成 `App` 时被换成了空 `entries`，equivalent
+    /// coverage 悄悄消失了：置灰整行的逻辑、三条原因文案
+    /// （`（未填密钥）`/`（需要先装 X）`/`（未安装）`）、`pad_to`/`truncate`
+    /// 对 label/note 的处理、以及 `warning` 触发的红色边框，全都没人再画
+    /// 一遍。搬回来，并且不止断言不 panic——三条原因文案和 warning 文案
+    /// 都要求真的出现在屏幕上，边框颜色也要求是红的。
+    #[test]
+    fn draw_renders_all_profile_statuses_and_the_warning_border() {
+        use crate::profile::ProfileStatus;
+        use crate::proto::{InstallPrompt, ProfileEntry};
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (mut app, _dir) = App::test_app();
+        let mut pick_state = ListState::default();
+        pick_state.select(Some(0));
+        let profile_entries = vec![
+            ProfileEntry {
+                name: "claude".into(),
+                label: "Claude Code".into(),
+                note: "官方 CLI".into(),
+                status: ProfileStatus::Ready,
+                secret: None,
+                install: None,
+                has_secret: false,
+            },
+            ProfileEntry {
+                name: "kimi".into(),
+                label: "Kimi".into(),
+                note: "月之暗面".into(),
+                status: ProfileStatus::NeedsSecret,
+                secret: None,
+                install: None,
+                has_secret: false,
+            },
+            ProfileEntry {
+                name: "glm".into(),
+                label: "GLM".into(),
+                note: "智谱".into(),
+                status: ProfileStatus::NeedsDependency {
+                    label: "Claude".into(),
+                },
+                secret: None,
+                install: None,
+                has_secret: false,
+            },
+            ProfileEntry {
+                name: "codex".into(),
+                label: "Codex".into(),
+                note: "OpenAI".into(),
+                status: ProfileStatus::NotInstalled {
+                    command: "codex".into(),
+                },
+                secret: None,
+                install: Some(InstallPrompt {
+                    command: vec![
+                        "npm".into(),
+                        "i".into(),
+                        "-g".into(),
+                        "@openai/codex".into(),
+                    ],
+                    note: String::new(),
+                }),
+                has_secret: false,
+            },
+        ];
+        app.view = View::PickProfile {
+            entries: profile_entries,
+            state: pick_state,
+            warning: Some("secrets.toml 读不了".into()),
+        };
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains("未填密钥"),
+            "NeedsSecret 的原因文案要画出来：{content}"
+        );
+        assert!(
+            content.contains("需要先装Claude"),
+            "NeedsDependency 的原因文案要点名依赖：{content}"
+        );
+        assert!(
+            content.contains("未安装"),
+            "NotInstalled 的原因文案要画出来：{content}"
+        );
+        assert!(
+            content.contains("secrets.toml读不了"),
+            "warning 要显示在标题里：{content}"
+        );
+
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        let red = (0..area.height).any(|y| {
+            (0..area.width).any(|x| {
+                buf.cell((x, y))
+                    .map(|c| c.style().fg == Some(Color::Red) && c.symbol() != " ")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(red, "有 warning 时边框要是红的");
+    }
+
     #[test]
     fn draw_does_not_panic_for_project_picker() {
         let mut st = ListState::default();
@@ -510,7 +628,7 @@ mod tests {
             "/Users/lei/work/dc/dc-terminal".to_string(),
             "/Users/lei/work/dc/dc_workbench".to_string(),
         ];
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
 
         // 列表态。每一段都新建一个 Terminal：ratatui 画中文这种宽字符时只写
         // 首格、第二格保留旧值，同一个 TestBackend 连画两帧再断言，上一帧的

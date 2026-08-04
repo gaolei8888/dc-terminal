@@ -25,6 +25,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 }
 
+/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
+/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
+/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
+/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
+/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::EnterSecret {
         profile,
@@ -183,6 +188,11 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
+/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
+/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
+/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
+/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::Secrets {
         entries,
@@ -540,7 +550,7 @@ mod tests {
     #[test]
     fn secret_view_dots_line_does_not_panic_when_wider_than_the_terminal() {
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.view = View::EnterSecret {
             profile: "kimi".into(),
             label: "Kimi".into(),
@@ -563,7 +573,7 @@ mod tests {
     #[test]
     fn secret_view_masks_the_key_on_screen() {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         app.view = View::EnterSecret {
             profile: "kimi".into(),
             label: "Kimi".into(),
@@ -592,7 +602,7 @@ mod tests {
     fn secret_view_title_agrees_with_escape_hint_for_both_origins() {
         let render = |return_to_settings: bool| -> String {
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            let mut app = App::test_app();
+            let (mut app, _dir) = App::test_app();
             app.view = View::EnterSecret {
                 profile: "kimi".into(),
                 label: "Kimi".into(),
@@ -626,7 +636,7 @@ mod tests {
         // 空列表不该让渲染 panic，也不该显示成一片空白无提示——至少标题
         // 「密钥设置」得画出来。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         let entries = vec![entry("claude", ProfileStatus::Ready)];
         app.view = View::Secrets {
             entries,
@@ -644,7 +654,7 @@ mod tests {
     #[test]
     fn secrets_view_renders_configured_and_unconfigured_rows() {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         let mut state = ListState::default();
         state.select(Some(0));
         let entries = vec![
@@ -676,7 +686,7 @@ mod tests {
         // 武装之后这一行不该再显示「已配」，而要显示明确的「再按 d 删除」
         // 警告——这是 finding 里点名要求的「inline prompt on that row」。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut app = App::test_app();
+        let (mut app, _dir) = App::test_app();
         let mut state = ListState::default();
         state.select(Some(0));
         let entries = vec![with_secret(entry("kimi", ProfileStatus::Ready))];
