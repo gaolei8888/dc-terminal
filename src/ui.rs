@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::client::Client;
-use crate::proto::{Request, Response};
+use crate::profile::ProfileStatus;
+use crate::proto::{ProfileEntry, Request, Response};
 use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
 use crate::session::{SessionInfo, SessionState};
 
@@ -69,7 +70,12 @@ impl From<String> for Msg {
 enum View {
     Board,
     Attached(u32),
-    PickProfile(Vec<String>),
+    PickProfile {
+        entries: Vec<ProfileEntry>,
+        state: ListState,
+        /// 密钥文件读不了、自定义 profile 写错了。顶部红字。
+        warning: Option<String>,
+    },
     PickProject {
         /// 守护进程返回的完整列表，过滤不改动它
         all: Vec<String>,
@@ -314,14 +320,21 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     KeyCode::Down => move_sel(&mut list_state, &sessions, 1),
                     KeyCode::Up => move_sel(&mut list_state, &sessions, -1),
                     KeyCode::Char('n') => {
-                        // 协议现在带的是完整的 ProfileEntry（label/status/密钥提示…），
-                        // 但真正用它们画新版选择器是 Task 10 的事。这里先只取 name，
-                        // 让现有的 View::PickProfile(Vec<String>) 和按数字选择的逻辑
-                        // 保持原样跑通——不在这一步动 UI 形状。
-                        if let Ok(Response::Profiles { entries, .. }) =
-                            client.call(Request::Profiles)
-                        {
-                            view = View::PickProfile(entries.into_iter().map(|e| e.name).collect());
+                        // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
+                        // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
+                        // pick_action 和下面 View::PickProfile 的按键分支。
+                        match client.call(Request::Profiles) {
+                            Ok(Response::Profiles { entries, warning }) => {
+                                let mut state = ListState::default();
+                                state.select(Some(0));
+                                view = View::PickProfile {
+                                    entries,
+                                    state,
+                                    warning,
+                                };
+                            }
+                            Ok(Response::Error(e)) => message = Msg::err(e),
+                            _ => message = Msg::err("拿不到 agent 列表".into()),
                         }
                     }
                     KeyCode::Char('p') => {
@@ -381,40 +394,117 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     }
                     _ => {}
                 },
-                View::PickProfile(profiles) => match key.code {
-                    KeyCode::Esc => view = View::Board,
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        let idx = c.to_digit(10).unwrap() as usize;
-                        if idx >= 1 && idx <= profiles.len() {
-                            let profile = profiles[idx - 1].clone();
-                            // 选完直接进会话。用户按数字的意图就是「我要用这个
-                            // agent 干活」，先弹回看板再让他找一遍自己刚建的会话
-                            // 是白让人做第二次选择。建失败才回看板——那儿有报错。
-                            match client.call(Request::Create {
-                                dir: current_dir.display().to_string(),
-                                profile,
-                                // 从选择器里按数字选的就是用户真的要用的 agent——
-                                // 与「帮你装 CLI」那条 remember=false 的路径（Task 9）
-                                // 区分开。
-                                remember: true,
-                            }) {
-                                Ok(Response::Created { id }) => {
-                                    view = View::Attached(id);
-                                    need_sessions = true; // 会话标题要显示项目名
-                                }
-                                Ok(Response::Error(e)) => {
-                                    message = Msg::err(e);
-                                    view = View::Board;
-                                }
-                                _ => {
-                                    message = Msg::err("创建失败".into());
-                                    view = View::Board;
+                View::PickProfile {
+                    entries,
+                    mut state,
+                    warning,
+                } => {
+                    if key.code == KeyCode::Esc {
+                        view = View::Board;
+                    } else {
+                        // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
+                        // 挪完直接落到 chosen = None，不会误触发下面的路由。
+                        let chosen: Option<usize> = match key.code {
+                            KeyCode::Down | KeyCode::Up => {
+                                let d = if key.code == KeyCode::Down { 1 } else { -1 };
+                                move_sel_n(&mut state, entries.len(), d);
+                                None
+                            }
+                            KeyCode::Enter => state.selected(),
+                            KeyCode::Char(c) => digit_index(c).filter(|i| *i < entries.len()),
+                            _ => None,
+                        };
+                        // 四条分支的落点：pick_action 只是个纯函数分类器，真正
+                        // 建会话/开安装窗口这些带副作用的活儿在这里做。
+                        view = match chosen.map(|i| (i, pick_action(&entries[i]))) {
+                            None => View::PickProfile {
+                                entries,
+                                state,
+                                warning,
+                            },
+                            Some((_, PickAction::Start(name))) => {
+                                // 选完直接进会话。用户选中的意图就是「我要用这个
+                                // agent 干活」，先弹回看板再让他找一遍自己刚建的
+                                // 会话是白让人做第二次选择。建失败才回选择器。
+                                match client.call(Request::Create {
+                                    dir: current_dir.display().to_string(),
+                                    profile: name,
+                                    // 选择器里选的就是用户真的要用的 agent——
+                                    // 与「帮你装 CLI」那条 remember=false 的路径区分开。
+                                    remember: true,
+                                }) {
+                                    Ok(Response::Created { id }) => {
+                                        need_sessions = true; // 会话标题要显示项目名
+                                        View::Attached(id)
+                                    }
+                                    Ok(Response::Error(e)) => {
+                                        message = Msg::err(e);
+                                        View::PickProfile {
+                                            entries,
+                                            state,
+                                            warning,
+                                        }
+                                    }
+                                    _ => {
+                                        message = Msg::err("创建失败".into());
+                                        View::PickProfile {
+                                            entries,
+                                            state,
+                                            warning,
+                                        }
+                                    }
                                 }
                             }
-                        }
+                            Some((_, PickAction::AskSecret(_))) => {
+                                // 真正的填密钥视图是 Task 11 的事；这里先占位提示，
+                                // 免得用户选中「未填密钥」的行按了却像没反应一样。
+                                message = Msg::err("还没做".into());
+                                View::PickProfile {
+                                    entries,
+                                    state,
+                                    warning,
+                                }
+                            }
+                            Some((_, PickAction::Install { profile, command })) => {
+                                // 用命令行会话跑安装命令，让用户看着它装，而不是
+                                // 干等一句「装不了」。remember: false —— 这不是
+                                // 用户选的 agent，记了下次按 n 会掉进命令行。
+                                match client.call(Request::Create {
+                                    dir: current_dir.display().to_string(),
+                                    profile: "shell".into(),
+                                    remember: false,
+                                }) {
+                                    Ok(Response::Created { id }) => {
+                                        let line = format!("{}\n", command.join(" "));
+                                        let _ = client.call(Request::Input { id, text: line });
+                                        message = format!(
+                                            "正在安装 {profile}，装完按 Ctrl+Q 回看板再按 N"
+                                        )
+                                        .into();
+                                        need_sessions = true;
+                                        View::Attached(id)
+                                    }
+                                    _ => {
+                                        message = Msg::err("开不了安装窗口".into());
+                                        View::PickProfile {
+                                            entries,
+                                            state,
+                                            warning,
+                                        }
+                                    }
+                                }
+                            }
+                            Some((_, PickAction::Blocked(msg))) => {
+                                message = Msg::err(msg);
+                                View::PickProfile {
+                                    entries,
+                                    state,
+                                    warning,
+                                }
+                            }
+                        };
                     }
-                    _ => {}
-                },
+                }
                 View::PickProject {
                     all,
                     mut filter,
@@ -627,6 +717,58 @@ fn back_one_level(view: View) -> Option<View> {
             typing_path: None,
         }),
         _ => Some(View::Board),
+    }
+}
+
+/// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥
+/// （Task 11 才有真视图）；没装但有安装命令的去装；没装又没法自动装的、
+/// 或者缺别的 profile 依赖的，只能告诉用户一句话，不切视图。
+#[derive(Debug)]
+pub enum PickAction {
+    Start(String),
+    /// 下标是占位——`pick_action` 只拿得到一个 `&ProfileEntry`，不知道它在
+    /// 列表里排第几，这里永远填 0。真下标只有调用方知道（它是从 `entries[i]`
+    /// 拿到这个 entry 的），必须由调用方在按键分支里覆盖，不能信这个值。
+    AskSecret(usize),
+    Install {
+        profile: String,
+        command: Vec<String>,
+    },
+    Blocked(String),
+}
+
+/// 按下某一项时该干什么。抽成纯函数是为了能单测——`run()` 的按键循环
+/// 要连真 socket，测不了（同 `back_one_level`）。
+pub fn pick_action(e: &ProfileEntry) -> PickAction {
+    match &e.status {
+        ProfileStatus::Ready => PickAction::Start(e.name.clone()),
+        ProfileStatus::NeedsSecret => PickAction::AskSecret(0),
+        ProfileStatus::NeedsDependency { label } => {
+            PickAction::Blocked(format!("要先装 {label} 才能用 {}", e.label))
+        }
+        ProfileStatus::NotInstalled { command } => match &e.install {
+            Some(i) => PickAction::Install {
+                profile: e.name.clone(),
+                command: i.command.clone(),
+            },
+            // 手写的自定义 profile 可能整个没填 command（TOML 里写
+            // `command = []`），`status_of` 兜底成 `NotInstalled { command: "" }`。
+            // 这时候「本机没有找到 」后面空着一截，用户看了不知道该找什么——
+            // 干脆点名是这个 profile 本身没配置要跑什么，而不是暗示去装一个
+            // 不存在的空名字命令。
+            None if command.is_empty() => {
+                PickAction::Blocked(format!("{} 没配置要运行的程序，用不了", e.label))
+            }
+            None => PickAction::Blocked(format!("本机没有找到 {command}")),
+        },
+    }
+}
+
+/// `'1'..'9'` → `0..8`。`'0'` 不算——第 10 项要用 ↑↓ 选。
+pub fn digit_index(c: char) -> Option<usize> {
+    match c {
+        '1'..='9' => Some(c as usize - '1' as usize),
+        _ => None,
     }
 }
 
@@ -853,6 +995,23 @@ fn escape_hint(view: &View) -> &'static str {
     }
 }
 
+/// 底部提示条：没有消息覆盖时，按当前视图告诉用户能按什么键。
+///
+/// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
+/// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
+fn idle_help(view: &View) -> &'static str {
+    match view {
+        View::Attached(_) => "F2 同效　回看板后按 n 新建会话　其余按键都发给 agent",
+        View::PickProfile { .. } => "↑↓ 选  Enter 确认  或直接按数字  Esc 取消",
+        View::PickProject {
+            typing_path: Some(_),
+            ..
+        } => "输入路径后 Enter 确认，Esc 返回列表",
+        View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
+        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
+    }
+}
+
 /// 左段固定占的列数：「Ctrl+Q 回看板」= 6 + 1 + 中文 3 字 × 2 = 13。
 /// 三条文案里最长的就是它（「Ctrl+Q 回列表」同宽，「q 退出」更短）。
 /// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
@@ -929,20 +1088,76 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                 f.set_cursor_position((x, y));
             }
         }
-        View::PickProfile(profiles) => {
-            let text: Vec<Line> = profiles
+        View::PickProfile {
+            entries,
+            state,
+            warning,
+        } => {
+            let items: Vec<ListItem> = entries
                 .iter()
                 .enumerate()
-                .map(|(i, p)| Line::from(format!("{}. {}", i + 1, p)))
+                .map(|(i, e)| {
+                    let num = if i < 9 {
+                        format!("{}. ", i + 1)
+                    } else {
+                        "   ".to_string()
+                    };
+                    let reason = match &e.status {
+                        ProfileStatus::Ready => String::new(),
+                        ProfileStatus::NeedsSecret => "（未填密钥）".into(),
+                        ProfileStatus::NeedsDependency { label } => {
+                            format!("（需要先装 {label}）")
+                        }
+                        ProfileStatus::NotInstalled { .. } => "（未安装）".into(),
+                    };
+                    // 不可用的整行压暗，不只是把原因压暗——用户是先看名字再看原因的，
+                    // 名字亮着会让他先以为能用
+                    let base = if matches!(e.status, ProfileStatus::Ready) {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(num, base),
+                        Span::styled(format!("{:<14}", truncate(&e.label, 14)), base),
+                        Span::styled(
+                            format!("{:<26}", truncate(&e.note, 26)),
+                            base.fg(Color::DarkGray),
+                        ),
+                        Span::styled(reason, base.fg(Color::DarkGray)),
+                    ]))
+                })
                 .collect();
-            f.render_widget(
-                Paragraph::new(text).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(border_style)
-                        .title("选 agent（按数字，Esc 取消）"),
-                ),
+
+            // ⚠️ 已知缺口：warning 有时会夹带英文——SecretStore::load() 对
+            // io::Error 直接 `format!("{e}")`，权限错之类会漏出系统原话
+            // 「Permission denied (os error 13)」；toml 解析错误的「expected
+            // ...」半句本身也是英文（profile.rs::describe_toml_error 的注释
+            // 里承认了这点，为了保留可操作性特意没吞掉）。真要治本得去
+            // secrets.rs / profile.rs 把这些错误分类翻成中文，这个任务的
+            // 文件范围只到 ui.rs——先如实显示、用红色边框提醒「有异常」，
+            // 不在这里瞎猜一套字符串替换规则去掩饰它。
+            let title = match warning {
+                Some(w) => format!("选 agent —— {w}"),
+                None => "选 agent".to_string(),
+            };
+            let border = if warning.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                border_style
+            };
+            let mut s = state.clone();
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(border)
+                            .title(title),
+                    )
+                    .highlight_symbol("▶ "),
                 chunks[0],
+                &mut s,
             );
         }
         View::PickProject {
@@ -1052,24 +1267,13 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
     // Claude Code 的输入框。显示做不到的操作比不显示更糟。
     //
     // 逃生键那一截已经挪进左段常驻，这里不再重复。
-    let idle_help = match view {
-        View::Attached(_) => "F2 同效　回看板后按 n 新建会话　其余按键都发给 agent",
-        View::PickProfile(_) => "按数字选 agent，Esc 取消",
-        View::PickProject {
-            typing_path: Some(_),
-            ..
-        } => "输入路径后 Enter 确认，Esc 返回列表",
-        View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
-        View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
-    };
-
     let (help, style) = if !connected {
         (
             "守护进程连不上，界面数据可能已过期".to_string(),
             Style::default().fg(Color::Red),
         )
     } else if message.text.is_empty() {
-        (idle_help.to_string(), Style::default())
+        (idle_help(view).to_string(), Style::default())
     } else if message.error {
         (message.text.clone(), Style::default().fg(Color::Red))
     } else {
@@ -1108,6 +1312,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::InstallPrompt;
     use crate::session::SessionState;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1155,7 +1360,11 @@ mod tests {
             Some(View::Board)
         ));
         assert!(matches!(
-            back_one_level(View::PickProfile(vec!["claude".into()])),
+            back_one_level(View::PickProfile {
+                entries: Vec::new(),
+                state: ListState::default(),
+                warning: None,
+            }),
             Some(View::Board)
         ));
         assert!(matches!(
@@ -1371,13 +1580,65 @@ mod tests {
             )
         })
         .unwrap();
-        // profile 选择弹窗
-        let profiles = vec!["claude".to_string(), "shell".to_string()];
+        // profile 选择弹窗：混一点 Ready/未装/未填密钥/缺依赖，外加一条
+        // warning，把置灰、原因文案、红色边框都过一遍，确认都不 panic。
+        let mut pick_state = ListState::default();
+        pick_state.select(Some(0));
+        let profile_entries = vec![
+            ProfileEntry {
+                name: "claude".into(),
+                label: "Claude Code".into(),
+                note: "官方 CLI".into(),
+                status: ProfileStatus::Ready,
+                secret: None,
+                install: None,
+            },
+            ProfileEntry {
+                name: "kimi".into(),
+                label: "Kimi".into(),
+                note: "月之暗面".into(),
+                status: ProfileStatus::NeedsSecret,
+                secret: None,
+                install: None,
+            },
+            ProfileEntry {
+                name: "glm".into(),
+                label: "GLM".into(),
+                note: "智谱".into(),
+                status: ProfileStatus::NeedsDependency {
+                    label: "Claude".into(),
+                },
+                secret: None,
+                install: None,
+            },
+            ProfileEntry {
+                name: "codex".into(),
+                label: "Codex".into(),
+                note: "OpenAI".into(),
+                status: ProfileStatus::NotInstalled {
+                    command: "codex".into(),
+                },
+                secret: None,
+                install: Some(InstallPrompt {
+                    command: vec![
+                        "npm".into(),
+                        "i".into(),
+                        "-g".into(),
+                        "@openai/codex".into(),
+                    ],
+                    note: String::new(),
+                }),
+            },
+        ];
         term.draw(|f| {
             draw(
                 f,
                 &mut DrawInput {
-                    view: &View::PickProfile(profiles.clone()),
+                    view: &View::PickProfile {
+                        entries: profile_entries.clone(),
+                        state: pick_state.clone(),
+                        warning: Some("secrets.toml 读不了".into()),
+                    },
                     sessions: &sessions,
                     st: &mut st,
                     screen: &[],
@@ -1979,5 +2240,144 @@ mod tests {
         .unwrap();
         let c = text_of(&term);
         assert!(c.contains("u回滚"), "看板要显示自己的按键表：{c}");
+    }
+
+    // ———— pick_action / digit_index：选择器四种状态各自路由到哪 ————
+
+    fn entry(name: &str, status: ProfileStatus) -> ProfileEntry {
+        ProfileEntry {
+            name: name.into(),
+            label: name.into(),
+            note: String::new(),
+            status,
+            secret: None,
+            install: None,
+        }
+    }
+
+    #[test]
+    fn ready_entry_starts_a_session() {
+        let e = entry("claude", ProfileStatus::Ready);
+        assert!(matches!(pick_action(&e), PickAction::Start(n) if n == "claude"));
+    }
+
+    #[test]
+    fn needs_secret_entry_opens_the_secret_view() {
+        let e = entry("kimi", ProfileStatus::NeedsSecret);
+        assert!(matches!(pick_action(&e), PickAction::AskSecret(_)));
+    }
+
+    #[test]
+    fn not_installed_with_an_installer_offers_to_install() {
+        let mut e = entry(
+            "codex",
+            ProfileStatus::NotInstalled {
+                command: "codex".into(),
+            },
+        );
+        e.install = Some(InstallPrompt {
+            command: vec![
+                "npm".into(),
+                "i".into(),
+                "-g".into(),
+                "@openai/codex".into(),
+            ],
+            note: String::new(),
+        });
+        match pick_action(&e) {
+            PickAction::Install { profile, command } => {
+                assert_eq!(profile, "codex");
+                assert_eq!(command[0], "npm");
+            }
+            other => panic!("有安装命令就该给一条路，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_installed_without_an_installer_just_explains() {
+        let e = entry(
+            "weird",
+            ProfileStatus::NotInstalled {
+                command: "weird".into(),
+            },
+        );
+        match pick_action(&e) {
+            PickAction::Blocked(msg) => {
+                assert!(msg.contains("weird"), "要说清是哪个命令找不到：{msg}");
+                assert!(!msg.contains("PATH"), "别对非程序员说 PATH");
+            }
+            other => panic!("得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_installed_with_empty_command_names_the_profile_not_a_blank_command() {
+        // 手写 profile 可能整个没填 command（TOML 里 `command = []`），
+        // status_of 兜底成 NotInstalled { command: "" }。这时候不能拼出
+        // 「本机没有找到 」这种后面空着一截的死胡同文案。
+        let e = entry(
+            "weird",
+            ProfileStatus::NotInstalled {
+                command: String::new(),
+            },
+        );
+        match pick_action(&e) {
+            PickAction::Blocked(msg) => {
+                assert!(msg.contains("weird"), "要点名是哪个 profile：{msg}");
+                assert!(
+                    !msg.trim_end().ends_with("找到"),
+                    "不能留一截空白收尾：{msg}"
+                );
+            }
+            other => panic!("得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_dependency_names_what_to_install_first() {
+        let e = entry(
+            "kimi",
+            ProfileStatus::NeedsDependency {
+                label: "Claude".into(),
+            },
+        );
+        match pick_action(&e) {
+            PickAction::Blocked(msg) => {
+                assert!(msg.contains("Claude"), "要点名先装什么：{msg}");
+            }
+            other => panic!("得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digit_keys_still_pick_the_first_nine() {
+        // 数字保留是因为快；置灰项也占编号——编号跳号比编号漂移更难受
+        assert_eq!(digit_index('1'), Some(0));
+        assert_eq!(digit_index('9'), Some(8));
+        assert_eq!(digit_index('0'), None);
+        assert_eq!(digit_index('a'), None);
+    }
+
+    #[test]
+    fn picker_help_mentions_both_ways_to_choose() {
+        let help = idle_help(&View::PickProfile {
+            entries: vec![],
+            state: ListState::default(),
+            warning: None,
+        });
+        assert!(help.contains("↑↓"));
+        assert!(help.contains("数字"));
+    }
+
+    #[test]
+    fn back_one_level_from_picker_goes_to_board() {
+        assert!(matches!(
+            back_one_level(View::PickProfile {
+                entries: vec![],
+                state: ListState::default(),
+                warning: None,
+            }),
+            Some(View::Board)
+        ));
     }
 }
