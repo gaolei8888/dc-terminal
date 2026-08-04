@@ -433,8 +433,10 @@ pub(crate) fn idle_help(view: &View) -> &'static str {
         // `q 退出` 必须写出来：在看板上它常驻左段（escape_hint），到了九宫格
         // 左段换成了 `Ctrl+Q 回列表`，可 q 照样直接退出整个 dct。屏幕上没写
         // 却真的管用的键，就是等着用户误按——尤其是这个键会关掉一切。
+        // 排在前三而不是句尾，理由跟看板那句里的 `g 九宫格` 一样：这一整句
+        // 在 80 列终端上放不下，句尾那几个键会被右端截掉，写了等于没写。
         View::Grid { .. } => {
-            "方向键移动  Enter 放大  n 新建  N 换 agent  p 换项目  c 密钥  u 回滚  s 停止  d 改动  q 退出"
+            "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  c 密钥  u 回滚  s 停止  d 改动"
         }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
@@ -566,6 +568,13 @@ mod tests {
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
+        // 80 列终端上右段只剩 63 列（80 − 2 边框 − 15 左段），整句放不下会被
+        // 截断。`q 退出` 必须落在截断线之前，不然写了也看不见。
+        let visible = crate::ui::truncate(help, 63);
+        assert!(
+            visible.contains("q 退出"),
+            "80 列终端上看不到「q 退出」：{visible}"
+        );
     }
 
     #[test]
