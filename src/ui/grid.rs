@@ -1,13 +1,20 @@
-//! 九宫格的布局数学。全是纯函数，跟终端、协议、会话都没关系——
-//! 能独立测，也只在这里测。
+//! 九宫格视图：平铺所有会话的实时画面，只读。
 //!
-//! 这些函数是 Task 5（视图接线）的接口，本任务里还没有调用方——
-//! `mod grid;` 是私有的，函数体只在自己的测试里跑，所以 clippy 会把
-//! 它们当成死代码。等 Task 5 接上视图就不需要这条 allow 了。
-#![allow(dead_code)]
+//! 上半截是布局数学，全是纯函数，跟终端、协议、会话都没关系，能独立测；
+//! 下半截是按键和渲染，跟 `board.rs`/`pick.rs` 一样的 `handle_key` + `draw`。
 
-use super::widgets::char_width;
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Paragraph};
+
+use super::app::App;
+use super::view::View;
+use super::widgets::{char_width, screen_to_lines, status_color, status_label};
+use super::{session_action, DIM};
+use crate::proto::ScreenEntry;
 use crate::pty::ScreenSpan;
+use crate::session::SessionInfo;
 
 pub const TILES_PER_PAGE: usize = 9;
 
@@ -49,6 +56,11 @@ pub fn move_focus(focus: usize, total: usize, dir: Dir) -> usize {
     if total == 0 {
         return 0;
     }
+    // 焦点必须指向一个真实存在的会话。真会踩到的场景是「会话被停掉/清掉了，
+    // 但 focus 还没重新收拢」——那时 `total - page_start` 会下溢，release 下
+    // 不 panic，只是算出一个天文数字的页长，格子跟着乱。调用方（`run()` 每轮
+    // 拉完会话列表之后）负责先把 focus 收进范围，这条断言是那份纪律的哨兵。
+    debug_assert!(focus < total, "焦点 {focus} 越出会话总数 {total}");
     let page_start = page_of(focus) * TILES_PER_PAGE;
     let in_page = focus - page_start;
     let page_len = (total - page_start).min(TILES_PER_PAGE);
@@ -94,10 +106,185 @@ pub fn crop_line(spans: &[ScreenSpan], max_cols: usize) -> Vec<ScreenSpan> {
     out
 }
 
+/// 小于这个尺寸就不画格子。九格里每格还要各扣掉两行边框，再小下去
+/// 屏幕上只剩框线，用户看不出那是九宫格，也看不出出了什么事。
+const MIN_COLS: u16 = 60;
+const MIN_ROWS: u16 = 20;
+
+/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
+/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
+/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
+/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
+/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
+///
+/// 这里**没有**一条把按键转发给 agent 的路径，这是设计约束：格子只读，
+/// 想打字按 Enter 放大（见 `View::Grid` 的注释）。
+pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::Grid { focus } = app.view else {
+        return Ok(());
+    };
+    let total = app.sessions.len();
+    match key.code {
+        KeyCode::Up => {
+            app.view = View::Grid {
+                focus: move_focus(focus, total, Dir::Up),
+            }
+        }
+        KeyCode::Down => {
+            app.view = View::Grid {
+                focus: move_focus(focus, total, Dir::Down),
+            }
+        }
+        KeyCode::Left => {
+            app.view = View::Grid {
+                focus: move_focus(focus, total, Dir::Left),
+            }
+        }
+        // F3 = 「下一个」，跟会话视图里的 F3 是同一个动作，肌肉记忆只练一次
+        KeyCode::Right | KeyCode::F(3) => {
+            app.view = View::Grid {
+                focus: move_focus(focus, total, Dir::Right),
+            }
+        }
+        KeyCode::Char('g') => app.view = View::Board,
+        KeyCode::Enter => {
+            if let Some(id) = app.sessions.get(focus).map(|s| s.id) {
+                app.need_sessions = true; // 会话标题要显示项目名
+                app.view = View::Attached(id);
+            }
+        }
+        // 跟看板同一套动作，作用在焦点格上——共用 `session_action`，
+        // 不各抄一份（抄了将来只会改一半）。
+        KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') => {
+            app.message = match app.sessions.get(focus).map(|s| s.id) {
+                Some(id) => session_action(app, key.code, id),
+                None => "还没有会话".into(),
+            };
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+    let View::Grid { focus } = app.view else {
+        return;
+    };
+    draw_grid(f, area, &app.sessions, &app.grid_screens, focus);
+}
+
+/// 画九宫格。格子的顺序 = 当页会话的顺序；画面按 id 跟 `screens` 配对，
+/// 一时没配上的格子只画标题和空白——下一轮 300ms 就有了，比画错内容强。
+///
+/// 跟 `App` 解耦（只吃它真正用得上的三样）是为了能在测试里直接喂 fixture，
+/// 不必为了断言一句「窗口太小」去拼一个完整的 `App`。
+fn draw_grid(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[SessionInfo],
+    screens: &[ScreenEntry],
+    focus: usize,
+) {
+    if area.width < MIN_COLS || area.height < MIN_ROWS {
+        // 说人话说清下一步做什么：这是用户自己能修好的事
+        f.render_widget(
+            Paragraph::new("窗口太小，放大终端窗口后再看九宫格").centered(),
+            centered_line(area),
+        );
+        return;
+    }
+    if sessions.is_empty() {
+        f.render_widget(
+            Paragraph::new("还没有会话，按 Ctrl+Q 回列表，再按 n 开一个").centered(),
+            centered_line(area),
+        );
+        return;
+    }
+
+    let total = sessions.len();
+    let page = page_of(focus);
+    let start = (page * TILES_PER_PAGE).min(total);
+    let page_sessions = &sessions[start..(start + TILES_PER_PAGE).min(total)];
+    let (rows, cols) = grid_shape(page_sessions.len());
+
+    let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows as usize])
+        .split(area)
+        .to_vec();
+    let tile_areas: Vec<Rect> = row_areas
+        .iter()
+        .flat_map(|r| {
+            Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols as usize])
+                .split(*r)
+                .to_vec()
+        })
+        .collect();
+
+    for (i, info) in page_sessions.iter().enumerate() {
+        let tile = tile_areas[i];
+        let focused = start + i == focus;
+        // 标题就是状态指示器：状态词用 status_color 上色，跟列表同一套颜色
+        // （已停止是灰的），扫一眼九个格子就知道谁在干活、谁停了。
+        let title = Line::from(vec![
+            Span::raw(format!(" {} {} ", info.id, info.profile)),
+            Span::styled(
+                format!("{} ", status_label(info.state)),
+                Style::default().fg(status_color(info.state)),
+            ),
+        ]);
+        // 焦点格用青色边框；其余用 DIM 而不是 DarkGray——后者是 ANSI 亮黑，
+        // 有些主题把它设成背景同色，整圈边框会隐形（见 mod.rs 里 DIM 的注释）。
+        let border = if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let block = Block::bordered().title(title).border_style(border);
+        let inner = block.inner(tile);
+        f.render_widget(block, tile);
+
+        if let Some(entry) = screens.iter().find(|e| e.id == info.id) {
+            // 取底部 N 行：agent 的输入框和最新输出都在屏幕底部
+            let skip = entry.lines.len().saturating_sub(inner.height as usize);
+            let cropped: Vec<Vec<ScreenSpan>> = entry.lines[skip..]
+                .iter()
+                .map(|l| crop_line(l, inner.width as usize))
+                .collect();
+            // 不画光标：只读的格子画光标只会误导用户在这里打字
+            f.render_widget(Paragraph::new(screen_to_lines(&cropped)), inner);
+        }
+    }
+
+    // 页码画在右下角，只有多页才画——单页画一个 1/1 纯属噪音
+    let pages = page_count(total);
+    if pages > 1 {
+        let label = format!("{}/{}", page + 1, pages);
+        let w = label.len() as u16; // 纯 ASCII 数字和斜杠，字符数就是列数
+        let corner = Rect {
+            x: area.x + area.width.saturating_sub(w + 1),
+            y: area.y + area.height.saturating_sub(1),
+            width: w,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(label), corner);
+    }
+}
+
+/// 整块区域里垂直居中的那一行。一句话的提示贴在最上面像是画残了，
+/// 居中才像是「这一屏就是想告诉你这句话」。
+fn centered_line(area: Rect) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y + area.height / 2,
+        width: area.width,
+        height: 1.min(area.height),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pty::{ScreenSpan, ScreenStyle};
+    use crate::session::SessionState;
 
     #[test]
     fn shape_scales_with_session_count() {
@@ -148,6 +335,19 @@ mod tests {
     }
 
     #[test]
+    fn focus_moves_up_within_the_page() {
+        // 5 个会话 → 2×3：3 在第二行第一列，上移回到 0
+        assert_eq!(move_focus(3, 5, Dir::Up), 0);
+        assert_eq!(move_focus(4, 5, Dir::Up), 1);
+        // 第一行往上收到本页第一格、不回绕（回绕的是左右，见 move_focus
+        // 的注释）——跟 Down 越出末行收到最后一格是对称的。
+        assert_eq!(move_focus(1, 5, Dir::Up), 0);
+        assert_eq!(move_focus(0, 5, Dir::Up), 0);
+        // 第二页的格子上移仍留在第二页：页内坐标是 in_page，不是全局下标
+        assert_eq!(move_focus(12, 14, Dir::Up), 9);
+    }
+
+    #[test]
     fn crop_cuts_at_display_width_without_splitting_wide_chars() {
         // "干活中" 每个字占 2 列。上限 5 列 → 只装得下 2 个字（4 列），
         // 第 3 个字会跨过边界，整个丢掉。
@@ -162,5 +362,276 @@ mod tests {
         // 不超限的原样保留
         let out = crop_line(&[sp("ok")], 80);
         assert_eq!(out[0].text, "ok");
+
+        // 正好装满：一列不多一列不少，不该被误裁掉最后一个字
+        let out = crop_line(&[sp("干活")], 4);
+        assert_eq!(out[0].text, "干活");
+
+        // 零宽的格子（边框吃光了内部宽度）什么都画不下，也不能 panic
+        assert!(crop_line(&[sp("abc")], 0).is_empty());
+    }
+
+    // ———— 视图：按键 ————
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn session(id: u32, state: SessionState) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: "/tmp/a".into(),
+            state,
+            activity: String::new(),
+        }
+    }
+
+    /// 焦点从 0 一路走到 2 再走回来，视图始终留在九宫格里。
+    #[test]
+    fn arrows_move_the_focus_and_stay_in_the_grid() {
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.view = View::Grid { focus: 0 };
+
+        handle_key(&mut app, key(KeyCode::Right)).unwrap();
+        assert!(matches!(app.view, View::Grid { focus: 1 }));
+        handle_key(&mut app, key(KeyCode::Down)).unwrap();
+        assert!(matches!(app.view, View::Grid { focus: 2 }));
+        handle_key(&mut app, key(KeyCode::Left)).unwrap();
+        assert!(matches!(app.view, View::Grid { focus: 1 }));
+        handle_key(&mut app, key(KeyCode::Up)).unwrap();
+        assert!(matches!(app.view, View::Grid { focus: 0 }));
+    }
+
+    #[test]
+    fn f3_moves_to_the_next_tile_like_the_right_arrow() {
+        // 跟会话视图里的 F3 是同一个动作，两处语义一致
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.view = View::Grid { focus: 2 };
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+        assert!(matches!(app.view, View::Grid { focus: 0 }), "到头回绕");
+    }
+
+    #[test]
+    fn enter_zooms_into_the_focused_session() {
+        // 格子只读，交互全靠放大——这条路径断了，九宫格就没法用了
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.view = View::Grid { focus: 2 };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.view, View::Attached(3)));
+        assert!(app.need_sessions, "会话标题要显示项目名，得重拉一次列表");
+    }
+
+    #[test]
+    fn g_goes_back_to_the_list() {
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![session(1, SessionState::Idle)];
+        app.view = View::Grid { focus: 0 };
+        handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
+        assert!(matches!(app.view, View::Board));
+    }
+
+    #[test]
+    fn typing_in_a_tile_does_nothing_at_all() {
+        // 格子里任何按键都不会送进 agent（设计约束，见 View::Grid 的注释）。
+        // 这里能验证的是「什么都没发生」：视图没变，也没冒出一句消息。
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![session(1, SessionState::Idle)];
+        app.view = View::Grid { focus: 0 };
+        for c in ['x', '中', 'n'] {
+            handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
+            assert!(matches!(app.view, View::Grid { focus: 0 }));
+            assert_eq!(app.message.text, "");
+        }
+    }
+
+    #[test]
+    fn actions_on_an_empty_board_say_so_instead_of_panicking() {
+        // 会话全没了还按 s：不能拿 sessions[focus] 直接索引
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Grid { focus: 0 };
+        handle_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        assert_eq!(app.message.text, "还没有会话");
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.view, View::Grid { .. }), "空看板放大不了");
+    }
+
+    // ———— 视图：渲染 ————
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    s.push_str(cell.symbol());
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    /// 去掉空白再比：ratatui 给宽字符后面那个 cell 塞的是空格，逐 cell 拼
+    /// 出来的文本每个汉字后面都夹一个空格（同 mod.rs 里既有的做法）。
+    fn squashed(term: &Terminal<ratatui::backend::TestBackend>) -> String {
+        buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    fn entry(id: u32, text: &str) -> ScreenEntry {
+        ScreenEntry {
+            id,
+            lines: vec![vec![sp(text)]],
+        }
+    }
+
+    #[test]
+    fn tiles_show_the_session_status_in_the_title() {
+        use ratatui::backend::TestBackend;
+
+        // 标题就是状态指示器：扫一眼就要知道谁在干活、谁停了。
+        let sessions = vec![
+            session(1, SessionState::Working),
+            session(2, SessionState::Stopped),
+        ];
+        let screens = vec![entry(1, "hello-from-one"), entry(2, "hello-from-two")];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &screens, 0))
+            .unwrap();
+
+        let c = squashed(&term);
+        assert!(c.contains("干活中"), "干活中的会话要标出来：{c}");
+        assert!(c.contains("已停止"), "停掉的会话格子留着、标题写明：{c}");
+        assert!(c.contains("hello-from-one"), "格子里要有真实画面：{c}");
+        assert!(
+            c.contains("hello-from-two"),
+            "停掉的会话画面冻在最后一帧：{c}"
+        );
+    }
+
+    #[test]
+    fn the_focused_tile_is_the_only_one_with_a_cyan_border() {
+        use ratatui::backend::TestBackend;
+
+        let sessions = vec![
+            session(1, SessionState::Idle),
+            session(2, SessionState::Idle),
+        ];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1))
+            .unwrap();
+
+        let buf = term.backend().buffer();
+        // 焦点在第二格（右半屏），青色边框只该出现在右半边
+        let cyan_xs: Vec<u16> = (0..buf.area.width)
+            .filter(|x| {
+                (0..buf.area.height).any(|y| {
+                    buf.cell((*x, y))
+                        .map(|c| c.style().fg == Some(Color::Cyan))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        assert!(!cyan_xs.is_empty(), "焦点格必须看得出来");
+        assert!(
+            cyan_xs.iter().all(|x| *x >= 40),
+            "只有焦点格该高亮，实际高亮的列：{cyan_xs:?}"
+        );
+    }
+
+    #[test]
+    fn a_tile_never_draws_a_cursor() {
+        use ratatui::backend::TestBackend;
+
+        // 只读的格子画光标只会误导用户在这里打字
+        // Frame 上的 cursor_position 是 pub(crate)，测不到；换个等价的问法：
+        // 先把光标停在一个哨兵位置，画完之后它必须还在原地——挪动它的
+        // 唯一途径是 `set_cursor_position`，而九宫格根本不该调它
+        // （附加视图会调，那边才有人打字）。
+        let sessions = vec![session(1, SessionState::Working)];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.set_cursor_position((7, 7)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(1, "x")], 0))
+            .unwrap();
+        assert_eq!(
+            term.get_cursor_position().unwrap(),
+            ratatui::layout::Position { x: 7, y: 7 },
+            "格子里不该有光标"
+        );
+    }
+
+    #[test]
+    fn page_number_shows_up_only_when_there_is_more_than_one_page() {
+        use ratatui::backend::TestBackend;
+
+        let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0))
+            .unwrap();
+        assert!(squashed(&term).contains("1/2"), "多页要画页码");
+
+        // 翻到第二页：页码跟着走
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 9))
+            .unwrap();
+        assert!(squashed(&term).contains("2/2"));
+
+        // 单页画 1/1 是噪音
+        let few: Vec<SessionInfo> = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &few, &[], 0)).unwrap();
+        assert!(!squashed(&term).contains("1/1"), "单页不画页码");
+    }
+
+    #[test]
+    fn a_tiny_terminal_gets_a_sentence_instead_of_a_mangled_grid() {
+        use ratatui::backend::TestBackend;
+
+        let sessions: Vec<SessionInfo> = (1..=9).map(|i| session(i, SessionState::Idle)).collect();
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 0))
+            .unwrap();
+        let c = squashed(&term);
+        assert!(c.contains("窗口太小"), "画不下就直说：{c}");
+        assert!(c.contains("放大终端窗口"), "还要说清下一步怎么办：{c}");
+        assert!(!c.contains("干活"), "这时候不该再画格子：{c}");
+    }
+
+    #[test]
+    fn an_empty_board_explains_how_to_get_a_session() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &[], &[], 0)).unwrap();
+        let c = squashed(&term);
+        assert!(
+            c.contains("还没有会话"),
+            "空看板要说话，不能只画一个空框：{c}"
+        );
+        assert!(c.contains("n"), "还要说清怎么开一个：{c}");
+    }
+
+    #[test]
+    fn a_tile_without_a_screen_yet_still_draws_its_title() {
+        use ratatui::backend::TestBackend;
+
+        // 画面和会话列表是两路请求，慢一拍很正常：配不上的格子只画标题，
+        // 不能因为找不到画面就整格消失。
+        let sessions = vec![session(7, SessionState::Working)];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(99, "别人的画面")], 0))
+            .unwrap();
+        let c = squashed(&term);
+        assert!(c.contains("干活中"), "标题照画：{c}");
+        assert!(
+            !c.contains("别人的画面"),
+            "id 对不上的画面绝不能画进来：{c}"
+        );
     }
 }

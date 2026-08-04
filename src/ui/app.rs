@@ -27,6 +27,14 @@ pub struct App {
     pub message: Msg,
     pub screen: Vec<Vec<ScreenSpan>>,
     pub screen_cursor: (u16, u16),
+    // 九宫格当前页那几个会话的画面，按 id 跟格子配对。跟 `screen` 分开存：
+    // 那一份是附加视图正在放大的**单个**会话，两者的刷新节奏和来源消息
+    // 都不一样（16ms 的 `Screen` vs 300ms 的 `Screens`），共用一个字段
+    // 只会让退出九宫格再进会话时看到上一屏的残影。
+    pub grid_screens: Vec<crate::proto::ScreenEntry>,
+    // 上一次批量取画面的时刻，用来把九宫格的刷新压到 300ms 一轮。
+    // `None` = 还没取过，下一轮立刻取。
+    pub grid_last_fetch: Option<std::time::Instant>,
     // 上次告诉 agent 的画面尺寸，变了才发 Resize，避免每帧一次多余请求
     pub sent_size: Option<(u32, u16, u16)>,
     // 连不上守护进程 / 请求失败时置 false，看板上要能看出数据是陈旧的，
@@ -76,6 +84,8 @@ impl App {
             message: "".into(),
             screen: Vec::new(),
             screen_cursor: (0, 0),
+            grid_screens: Vec::new(),
+            grid_last_fetch: None,
             sent_size: None,
             // 每轮循环开头的 List 调用是唯一的真相来源，它总在当次
             // term.draw 之前重新算一遍，所以这里给什么都会被立刻覆盖。

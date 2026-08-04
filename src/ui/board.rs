@@ -8,7 +8,7 @@ use crate::proto::{ProfileEntry, Request, Response};
 use super::app::App;
 use super::view::{quick_start_target, secret_rows, View};
 use super::widgets::{short_path, status_color, status_label, truncate, Msg};
-use super::{act, move_sel, selected, DIM};
+use super::{move_sel, selected, session_action, DIM};
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -144,26 +144,21 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.need_sessions = true; // 会话标题要显示项目名
             }
         }
-        KeyCode::Char('u') => {
-            app.message = act(app, |id| Request::Undo { id });
+        KeyCode::Char('g') => {
+            // 进九宫格时焦点落在列表当前选中的那一行：两个视图对「当前是
+            // 哪个会话」的认知必须一致，不然按完 g 焦点跳到别处，用户会
+            // 以为自己按错了键。
+            app.view = View::Grid {
+                focus: app.list_state.selected().unwrap_or(0),
+            };
         }
-        KeyCode::Char('s') => {
-            app.message = act(app, |id| Request::Stop { id });
-        }
-        KeyCode::Char('d') => {
-            if let Some(id) = selected(&app.sessions, &app.list_state).map(|s| s.id) {
-                app.message = match app.client().and_then(|c| c.call(Request::Diff { id })) {
-                    Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
-                    Ok(Response::Diff(v)) => v
-                        .iter()
-                        .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                        .into(),
-                    Ok(Response::Error(e)) => Msg::err(e),
-                    _ => Msg::err("请求失败".into()),
-                };
-            }
+        // 三个动作跟九宫格共用 session_action，区别只在「当前会话」是
+        // 选中行还是焦点格
+        KeyCode::Char('u') | KeyCode::Char('s') | KeyCode::Char('d') => {
+            app.message = match selected(&app.sessions, &app.list_state).map(|s| s.id) {
+                Some(id) => session_action(app, key.code, id),
+                None => "没有选中会话".into(),
+            };
         }
         _ => {}
     }
@@ -214,4 +209,34 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         area,
         &mut app.list_state,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionInfo, SessionState};
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn g_enters_the_grid_focused_on_the_selected_session() {
+        // 两个视图对「当前是哪个会话」的认知必须一致：列表选中第三行，
+        // 按 g 之后焦点就该落在第三格，不能弹回第一格。
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=4)
+            .map(|id| SessionInfo {
+                id,
+                profile: "claude".into(),
+                dir: "/tmp/a".into(),
+                state: SessionState::Idle,
+                activity: String::new(),
+            })
+            .collect();
+        app.list_state.select(Some(2));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(app.view, View::Grid { focus: 2 }));
+    }
 }

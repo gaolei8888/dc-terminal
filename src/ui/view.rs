@@ -13,6 +13,15 @@ use super::Msg;
 pub(crate) enum View {
     Board,
     Attached(u32),
+    /// 九宫格：平铺所有会话的实时画面，只读。`focus` 是**全体会话**里的
+    /// 下标（不是当页内的），当前页从它推导，见 `grid::page_of`。
+    ///
+    /// 只读是设计约束不是偷懒：一个会话的 PTY 只有一份尺寸，格子里能打字
+    /// 就得把会话缩到格子那么小（见 tile-grid 设计文档）。要交互按 Enter
+    /// 放大成附加视图。
+    Grid {
+        focus: usize,
+    },
     PickProfile {
         entries: Vec<ProfileEntry>,
         state: ListState,
@@ -125,8 +134,8 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
             state: ListState::default(),
             warning: None,
         }),
-        // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
-        // 退一层就是看板。
+        // Secrets 和 Grid 落在这条兜底里：它们跟 Attached/PickProject 一样
+        // 只有一层，退一层就是看板。
         _ => Some(View::Board),
     }
 }
@@ -387,6 +396,9 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
         } => "Ctrl+Q 回设置",
         // 从选择器进来的填密钥，退出回的是选择器，不是看板
         View::EnterSecret { .. } => "Ctrl+Q 回列表",
+        // 九宫格退回的也是看板，但对用户来说那一屏就是「列表」——
+        // 站在格子里说「回看板」，用户会以为格子不算看板的一部分。
+        View::Grid { .. } => "Ctrl+Q 回列表",
         _ => "Ctrl+Q 回看板",
     }
 }
@@ -404,8 +416,16 @@ pub(crate) fn idle_help(view: &View) -> &'static str {
             ..
         } => "输入路径后 Enter 确认，Esc 返回列表",
         View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
+        // `g 九宫格` 插在切换类按键那一段里，不放句尾：这一整句在 80 列
+        // 终端上放不下会被右端截断，而 `g` 是九宫格唯一的入口——排在被截
+        // 掉的那一截里等于没写。
         View::Board => {
-            "n 新建  N 换 agent  p 换项目  c 密钥  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
+            "n 新建  N 换 agent  p 换项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
+        }
+        // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
+        // 跟会话视图不同（那边除了 F2 全转发，列按键表等于教人按错）。
+        View::Grid { .. } => {
+            "方向键移动　Enter 放大　F3 下一格　g 回列表　s 停止　u 回滚　d 看改动"
         }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
@@ -504,6 +524,38 @@ mod tests {
             }
             other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
         }
+    }
+
+    #[test]
+    fn grid_backs_out_to_the_board() {
+        // 九宫格跟会话视图一样只有一层，Ctrl+Q 退回列表
+        assert!(matches!(
+            back_one_level(View::Grid { focus: 3 }),
+            Some(View::Board)
+        ));
+    }
+
+    #[test]
+    fn grid_hints_match_what_the_keys_actually_do() {
+        // 底栏说什么就得真能做到什么：九宫格的 Ctrl+Q 回的是列表那一屏
+        assert_eq!(escape_hint(&View::Grid { focus: 0 }), "Ctrl+Q 回列表");
+        let help = idle_help(&View::Grid { focus: 0 });
+        for k in [
+            "Enter 放大",
+            "F3",
+            "g 回列表",
+            "s 停止",
+            "u 回滚",
+            "d 看改动",
+        ] {
+            assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
+        }
+    }
+
+    #[test]
+    fn board_help_mentions_the_grid() {
+        // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
+        assert!(idle_help(&View::Board).contains("g 九宫格"));
     }
 
     #[test]

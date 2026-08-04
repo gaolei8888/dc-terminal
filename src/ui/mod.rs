@@ -279,6 +279,58 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         if app.list_state.selected().is_none() && !app.sessions.is_empty() {
             app.list_state.select(Some(0));
         }
+        // 会话可能在两轮之间消失（自己退了、被 s 停掉清了），焦点必须跟着
+        // 收回来。不收的话 grid::move_focus 会拿到一个越界的下标——它的
+        // debug_assert 就是为这条路径设的，而 release 下越界会算出一个荒唐
+        // 的页长，格子全乱。收在这里（拉完列表、画之前）是唯一能保证
+        // 渲染和按键看到的是同一个合法焦点的地方。
+        if let View::Grid { focus } = app.view {
+            let last = app.sessions.len().saturating_sub(1);
+            if focus > last {
+                app.view = View::Grid { focus: last };
+            }
+        }
+        if let View::Grid { focus } = app.view {
+            let start = grid::page_of(focus) * grid::TILES_PER_PAGE;
+            let ids: Vec<u32> = app
+                .sessions
+                .iter()
+                .skip(start)
+                .take(grid::TILES_PER_PAGE)
+                .map(|s| s.id)
+                .collect();
+            // 300ms 一轮就够：格子是扫一眼的东西，不是打字的地方（附加视图
+            // 的 16ms 是为了跟手，这里没有手要跟）。但刚进九宫格、或者翻页
+            // 之后，手里这批画面根本对不上要显示的格子——那时候不等这 300ms，
+            // 立刻取一次，否则新的一页会空白着晾用户小半秒。
+            let missing = ids
+                .iter()
+                .any(|id| !app.grid_screens.iter().any(|e| e.id == *id));
+            let due = missing
+                || app
+                    .grid_last_fetch
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
+            if due {
+                match app.client().and_then(|c| c.call(Request::Screens { ids })) {
+                    Ok(Response::Screens { screens }) => {
+                        app.grid_screens = screens;
+                        app.connected = true;
+                    }
+                    // 老守护进程不认识 Screens。列表视图还能用，退回去并
+                    // 说清怎么修——别让用户对着一屏空格子猜。（`dct restart`
+                    // 还不存在，所以只能说退出再启动。）
+                    Ok(Response::Error(_)) => {
+                        app.message = Msg::err(
+                            "后台服务是旧版本，看不到画面。退出 dct 再重新打开就好".into(),
+                        );
+                        app.view = View::Board;
+                        app.need_sessions = true;
+                    }
+                    _ => app.connected = false,
+                }
+                app.grid_last_fetch = Some(std::time::Instant::now());
+            }
+        }
         if let View::Attached(id) = &app.view {
             let id = *id;
             // 把 agent 画面区的真实大小告诉它。不做的话它永远按初始宽度排版，
@@ -389,6 +441,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                 View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
                 View::PickProject { .. } => pick::handle_key(&mut app, key)?,
                 View::Attached(_) => attach::handle_key(&mut app, key)?,
+                View::Grid { .. } => grid::handle_key(&mut app, key)?,
                 View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
                 View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             }
@@ -562,13 +615,30 @@ fn move_sel(st: &mut ListState, sessions: &[SessionInfo], delta: i32) {
     move_sel_n(st, sessions.len(), delta);
 }
 
-fn act(app: &mut App, make: impl Fn(u32) -> Request) -> Msg {
-    let id = match selected(&app.sessions, &app.list_state) {
-        None => return "没有选中会话".into(),
-        Some(s) => s.id,
+/// 对某个会话做 `s`（停止）/ `u`（回滚）/ `d`（看改动），返回要显示的消息。
+///
+/// 看板和九宫格是同一套语义作用在不同的「当前会话」上（列表是选中行，
+/// 九宫格是焦点格），所以发请求和拼消息这段只留一份：两边各抄一份的话，
+/// 哪天改了 diff 的措辞或者错误分支，只会改到其中一半。
+///
+/// `code` 之外的按键返回空消息——调用方只在这三个键上调它，落到那条兜底
+/// 说明分派写漏了；这时候不动 `message` 比编一句话给用户看更诚实。
+pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
+    let req = match code {
+        KeyCode::Char('s') => Request::Stop { id },
+        KeyCode::Char('u') => Request::Undo { id },
+        KeyCode::Char('d') => Request::Diff { id },
+        _ => return "".into(),
     };
-    match app.client().and_then(|c| c.call(make(id))) {
+    match app.client().and_then(|c| c.call(req)) {
         Ok(Response::Ok) => "完成".into(),
+        Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
+        Ok(Response::Diff(v)) => v
+            .iter()
+            .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .into(),
         Ok(Response::Error(e)) => Msg::err(e),
         _ => Msg::err("请求失败".into()),
     }
@@ -635,6 +705,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     match app.view.clone() {
         View::Board => board::draw(f, chunks[0], app),
         View::Attached(_) => attach::draw(f, chunks[0], app),
+        View::Grid { .. } => grid::draw(f, chunks[0], app),
         View::PickProfile { .. } | View::PickProject { .. } => pick::draw(f, chunks[0], app),
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
     }
@@ -818,6 +889,11 @@ mod tests {
         app.connected = false;
         term.draw(|f| draw(f, &mut app)).unwrap();
         app.connected = true;
+
+        // 九宫格：格子内容的渲染细节在 grid.rs 自己的测试里，这里只过一遍
+        // 顶层分派（含底栏那截）
+        app.view = View::Grid { focus: 0 };
+        term.draw(|f| draw(f, &mut app)).unwrap();
 
         // profile 选择弹窗
         let mut pick_state = ListState::default();
