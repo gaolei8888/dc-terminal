@@ -635,6 +635,11 @@ mod tests {
             .is_ok());
     }
 
+    // 下面两个测试踩的是同一块地雷：只要 profile 配了任意 pattern，create() 就把初始状态
+    // 直接定成 Working（见 create() 里「有 pattern 才敢说干活中」那段注释）。所以「刚建完号
+    // 就轮询等 Working」这个动作本身证明不了 tick() 的判定逻辑真的跑对了——它完全可能是撞上
+    // 构造函数给的默认值退出循环的，tick() 一次都没被断言检验过。想让测试真的验到 tick()，
+    // 断言目标得选 Idle、Unknown，或者「状态没被 tick 动过」这类够不到默认值的东西。
     #[test]
     fn busy_pattern_marks_working_then_idle() {
         let tmp = tempfile::tempdir().unwrap();
@@ -688,12 +693,18 @@ mod tests {
         std::fs::create_dir(&proj).unwrap();
 
         let mgr = SessionManager::new();
-        // 两个 pattern 同时命中。busy 优先 → Working。
+        // 先只打出 IDLE，等一秒再把 BUSY 追加上去（不清屏，两个串同时留在屏幕上）。
+        // 不能一开始就把 BUSY 和 IDLE 一起打出来：那样的话 create() 的默认初始状态
+        // 已经是 Working（见上面那条注释），下面等 Working 的循环第一轮就会命中，
+        // 根本没逼 tick() 真正算过一次——busy 优先于 idle 这条规则完全没被验证。
+        // 先等出一次 Idle，就是先逼一次相对默认值的真实翻转，证明 tick() 确实跑过；
+        // 然后 BUSY 追加上去必须翻回 Working，只有「busy_re 先判定」才会翻回去，
+        // 如果实现改成先看 idle_re，屏上 IDLE 还在，状态会一直卡在 Idle 直到超时。
         mgr.register_profile(
             Profile::from_toml(
                 r#"
                 name = "both"
-                command = ["/bin/sh", "-c", "echo BUSY IDLE; sleep 5"]
+                command = ["/bin/sh", "-c", "echo IDLE; sleep 1; echo BUSY; sleep 5"]
                 is_agent = false
                 busy_pattern = "BUSY"
                 idle_pattern = "IDLE"
@@ -704,6 +715,18 @@ mod tests {
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
         let id = mgr.create(&proj, "both", secrets.get("both")).unwrap();
 
+        // 只有 IDLE 在屏上 → Idle。这一步是相对 create() 默认值 Working 的真实翻转。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "只有 IDLE 串时应该是 Idle");
+            sleep(Duration::from_millis(50));
+        }
+
+        // BUSY 追加上去，IDLE 仍在屏上（两个串同时可见）→ 必须翻回 Working。
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             mgr.tick();
