@@ -34,6 +34,12 @@ pub struct ProfileEntry {
     pub status: ProfileStatus,
     pub secret: Option<SecretPrompt>,
     pub install: Option<InstallPrompt>,
+    /// 密钥仓里现在是不是真有这个 profile 的密钥。跟 `status` 分开存是因为
+    /// `status_of` 里「装没装排在密钥前面」（见 profile.rs），一个 CLI 没装的
+    /// profile 不管密钥填没填都会报 `NeedsDependency`/`NotInstalled`——从
+    /// `status` 反推不出真实的密钥状态。密钥设置页要的是这个事实本身，
+    /// 不是「现在能不能开会话」，两者在这种情况下会给出不同答案。
+    pub has_secret: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
