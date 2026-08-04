@@ -1062,8 +1062,15 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         }
                         // Ctrl+O 不用 o：o 得留给密钥输入本身
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // MINOR 8（最终整分支 code review）：`open` 只在 macOS
+                            // 上存在，Linux 桌面环境一般是 `xdg-open`；两边都
+                            // 打不开的话必须告诉用户，不能让「Ctrl+O 打开申领
+                            // 页面」这行提示看着能按、按下去却悄无声息——用户
+                            // 会以为是自己按错了键。
                             if let Some(url) = &prompt.url {
-                                let _ = std::process::Command::new("open").arg(url).spawn();
+                                if !open_url(url) {
+                                    message = Msg::err(format!("打不开浏览器，自己去访问 {url}"));
+                                }
                             }
                             view = View::EnterSecret {
                                 profile,
@@ -1512,6 +1519,18 @@ pub fn digit_index(c: char) -> Option<usize> {
         '1'..='9' => Some(c as usize - '1' as usize),
         _ => None,
     }
+}
+
+/// 用系统默认方式打开一个网址，成功了返回 `true`。
+///
+/// `open` 只在 macOS 上存在；Linux 桌面环境的等价物一般是 `xdg-open`。
+/// 两个都试一遍失败了才认输——用户按下 Ctrl+O 是在等申领页面弹出来，
+/// 悄无声息什么都不做，他分不清是自己按错了键还是这台机器就是打不开
+/// 浏览器（调用方在拿到 `false` 时要把这句话说出来，见按键处理里的注释）。
+fn open_url(url: &str) -> bool {
+    ["open", "xdg-open"]
+        .iter()
+        .any(|cmd| std::process::Command::new(cmd).arg(url).spawn().is_ok())
 }
 
 /// 粘进来的密钥清洗一遍。用户从网页或接口文档里拷贝，经常带上引号、
