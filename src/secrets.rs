@@ -37,18 +37,48 @@ impl SecretStore {
             Err(e) => {
                 // 系统原话（比如「Permission denied (os error 13)」）只写
                 // stderr 留痕迹，不能冒泡到界面上——见 describe_io_error
-                // 的注释，非程序员看不懂 errno。
+                // 的注释，非程序员看不懂 errno。「密钥文件读不了：」这半句
+                // 前缀在这里加，不留给调用方——`load_error()` 对外必须永远
+                // 是一句自足、说清楚是在说哪个文件出了什么问题的中文，
+                // daemon.rs 组装 warning 时才能只管拼路径，不用关心
+                // 这条错误具体是哪一类（见 daemon.rs 里的注释）。
                 eprintln!("密钥文件读取失败（{}）：{e}", path.display());
-                (BTreeMap::new(), Some(crate::profile::describe_io_error(&e)))
+                (
+                    BTreeMap::new(),
+                    Some(format!(
+                        "密钥文件读不了：{}",
+                        crate::profile::describe_io_error(&e)
+                    )),
+                )
             }
             Ok(src) => match toml::from_str::<Disk>(&src) {
                 Ok(d) => (d.secrets, None),
-                // 密钥文件也是 TOML，复用 profile.rs 那套「行号 + 人话原因」
-                // 的翻译，没必要另起一套分类逻辑。
-                Err(e) => (
-                    BTreeMap::new(),
-                    Some(crate::profile::describe_toml_error(&e, &src)),
-                ),
+                // IMPORTANT 4（最终整分支 code review）：以前这里复用
+                // `profile.rs` 的 `describe_toml_error`（「第 N 行：原因」），
+                // 跟处理 profile 文件用的是同一套逻辑。那对 profile 文件是
+                // 对的——用户确实在手编一份配置，行号和「原因」半句（哪怕
+                // 是 toml 库的原始英文，比如 `invalid key`/`expected ...`）
+                // 都能帮他改对。但密钥文件不是 profile 文件：README 明确写
+                // 着「密钥只该在这里改，不需要也不支持手动去改
+                // secrets.toml」，而 `save()` 的 `load_error` 守卫会拒绝
+                // 任何写入（保护还能手工救回的文件），也就是说 `c` 进来的
+                // 改/删两条路径全都是死的——用户能做的唯一有效动作是删掉
+                // 这个文件、回 dct 里重新粘贴一遍密钥，不是照着行号去抠
+                // 一份他被告知不该碰的 TOML 语法。继续把 toml 库的英文
+                // 「原因」糊给他，等于把他往一条错误的路上支。
+                //
+                // 原始错误（行号、toml 库原文）只留一份在 stderr 方便排查，
+                // 界面上的话完全不提这些细节，直接给一句做得到的下一步。
+                Err(e) => {
+                    eprintln!("密钥文件解析失败（{}）：{e}", path.display());
+                    (
+                        BTreeMap::new(),
+                        Some(
+                            "密钥文件坏了，读不出来。删掉这个文件，回 dct 里重新粘贴一遍密钥就行，不用手动修它。"
+                                .to_string(),
+                        ),
+                    )
+                }
             },
         };
         SecretStore {
@@ -263,7 +293,19 @@ mod tests {
         // 之前的实现对 toml::de::Error 直接 format!("{e}")：那是给等宽
         // 终端排版看的多行 ASCII 图（"TOML parse error at line 1, column
         // 1\n  |\n1 | ...\n  |  ^\n..."），糊在选择器标题上就是一份变相
-        // 栈追踪。现在要求单行、带中文「第 N 行」，不能有内嵌换行。
+        // 栈追踪。
+        //
+        // IMPORTANT 4（最终整分支 code review）：这条测试原来只检查了
+        // *格式*（单行、没有 toml 库的图形化 Display、带中文「第 N 行」），
+        // 从没检查过*内容*本身是不是真的说人话——中间那版实现把
+        // `describe_toml_error` 的「原因」半句原样接了过来，那半句是 toml
+        // 库的原始英文（`invalid key`/`expected \`"\`, \`'\`` 这种），
+        // 格式检查全部通过，糊出来的整句照样是「第 2 行：invalid
+        // string；expected..」，用户一个字都读不懂。密钥文件跟 profile
+        // 文件不一样：`save()` 会拒绝任何写入（见 `corrupt_file_refuses_to_write`），
+        // 而 README 又明说不支持手改这个文件，所以行号 + 英文语法原因对
+        // 这个场景没有任何可操作性——这里直接要求整句话不含 toml 库会吐出
+        // 来的任何英文技术词，并且要给一个真正做得到的下一步（删掉重填）。
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("secrets.toml");
         std::fs::write(&f, "这不是 TOML {{{").unwrap();
@@ -271,10 +313,19 @@ mod tests {
         let s = SecretStore::load(&f);
         let err = s.load_error().expect("要记住读失败了");
         assert!(!err.contains('\n'), "不能是多行栈追踪：{err}");
-        assert!(err.contains("第"), "要带中文行号：{err}");
         assert!(
             !err.contains("TOML parse error"),
             "toml 库自带的图形化 Display 不能漏出来：{err}"
+        );
+        for jargon in ["invalid", "expected", "line", "column"] {
+            assert!(
+                !err.to_lowercase().contains(jargon),
+                "不能夹带 toml 库的原始英文原因，那半句不该出现在这个文件的错误里：{err}"
+            );
+        }
+        assert!(
+            err.contains("删") && err.contains("重新"),
+            "要给一个真正做得到的下一步——删掉文件、重新填一遍密钥：{err}"
         );
     }
 
