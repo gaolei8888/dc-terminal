@@ -4,7 +4,27 @@ use std::time::Duration;
 /// 探测请求的超时。**必须小于 `client::READ_TIMEOUT`（5 秒）**：
 /// 守护进程在这里等多久，界面那条连接就等多久，超过 5 秒界面会判定
 /// 连接错位并丢弃重连，用户看到的是「连不上守护进程」而不是验证结果。
+///
+/// 这个预算必须同时喂给 `.timeout()` 和 `.timeout_connect()`（见
+/// `build_probe_agent`）——只设前者管不到建连阶段：ureq 的 `AgentBuilder`
+/// 默认把 `timeout_connect` 设成 30 秒，且建连阶段优先认 `timeout_connect`
+/// 而不是 `.timeout()` 的整体截止时间（`ureq-2.12.1/src/stream.rs`
+/// `connect_host`）。两个字段共用同一个 `PROBE_TIMEOUT` 不会把预算翻倍：
+/// ureq 内部对整条请求只算一个起点相同的 `Instant` 截止时间，建连阶段跑掉的
+/// 时间会从后续读写阶段的剩余预算里扣，两者近似共享同一个 4 秒窗口，不是
+/// 顺序叠加的两个 4 秒。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// 探测用的 `ureq::Agent`。单独拆出来是为了让 `.timeout_connect()` 这类
+/// 配置能在不发真实请求的前提下被测试用 `Debug` 输出核实到——
+/// `send_probe` 本身不能被测试调用（会打真网络），但构建 `Agent` 这一步
+/// 不涉及任何 I/O。
+fn build_probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(PROBE_TIMEOUT)
+        .timeout_connect(PROBE_TIMEOUT)
+        .build()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerifyOutcome {
@@ -38,9 +58,7 @@ pub fn send_probe(url: &str, key: &str) -> Result<u16, String> {
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "hi"}],
     });
-    let resp = ureq::AgentBuilder::new()
-        .timeout(PROBE_TIMEOUT)
-        .build()
+    let resp = build_probe_agent()
         .post(url)
         .set("content-type", "application/json")
         .set("x-api-key", key)
@@ -101,5 +119,23 @@ mod tests {
             Ok(200)
         });
         assert_eq!(*seen.borrow(), "sk-abc");
+    }
+
+    /// 建 `Agent` 不发请求，不碰网络——`ureq::Agent` 派生了 `Debug`，
+    /// 内部的 `AgentConfig` 字段虽是 `pub(crate)`，但会原样进 `Debug`
+    /// 输出，所以能在不打真网络的前提下核实 `timeout_connect` 真的被
+    /// 设置了，而不只是相信注释。这就是本次修复要守住的回归点：
+    /// 之前只设了 `.timeout()`，建连阶段会退回 ureq 默认的 30 秒。
+    #[test]
+    fn probe_agent_bounds_the_connect_phase_too() {
+        let debug = format!("{:?}", build_probe_agent());
+        assert!(
+            debug.contains("timeout_connect: Some(4s)"),
+            "connect 阶段没有被 PROBE_TIMEOUT 兜住，可能退回 ureq 默认的 30 秒: {debug}"
+        );
+        assert!(
+            debug.contains("timeout: Some(4s)"),
+            "整体超时没有被设置: {debug}"
+        );
     }
 }
