@@ -12,3 +12,6 @@ Task 4: fix round 1/5 (1 addressed, 0 open; commits a781cbe..8941ee0)
 Task 4: complete (commits f1a867f..8941ee0, review clean)
 Task 4: minor (deferred): 回滚只测到「原本没这条」分支；「恢复原值」分支靠代码审读，load_error 守卫拦掉所有写，测不出「先写成功再写失败」
 Task 4: minor (deferred): bail! 把底层 io/toml 错误原文插进用户可见文案；Disk 的 Default derive 没人用；tmp 文件名固定，并发 set 会撞
+Task 5: fix round 1/5 (1 addressed, 0 open; commits 405c6ee..e58da5a)
+Task 5: complete (commits a746e81..e58da5a, review clean)
+Task 5: minor (deferred): daemon 现在按请求里的原始 profile 名查密钥，而不是 resolve 之后的 Profile.name；当前九个内置和 register_profile 路径都保证两者一致，但这是新引入的耦合
