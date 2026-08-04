@@ -21,3 +21,6 @@ Task 7: complete (commits 071935a..bde09c6, review clean)
 Task 7: minor (deferred): is_exec 用 mode & 0o111，任意 execute 位都算；0700 且属主不是 daemon 的二进制会误报可用。与 which(1) 同样的近似，可接受，值得加一行注释
 Task 7: minor (deferred): status_of 对 command = [] 返回 NotInstalled { command: "" }，渲染层要特判，别显示空括号（Task 10）
 Task 7: 注意 src/profile.rs 已 842 行（约 490 行是测试模块）；暂不拆，但后续任务再往里加东西要重新评估
+Task 8: complete (commits a4fbf71..99dcb24, review clean)
+Task 8: minor (deferred): warning 通道把 io::Error / 解析错误的原文（多半是英文 OS 文案，如 "No such file or directory (os error 2)"）直送用户可见红字；Task 10 负责渲染，要在那儿收口
+Task 8: minor (deferred): client_timeout.rs 的偶发失败与本改动无逻辑因果，但新增的测试二进制提高了并行负载，可能是诱因
