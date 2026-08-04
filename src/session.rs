@@ -287,6 +287,22 @@ impl SessionManager {
         self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor())))
     }
 
+    /// 一次取多个会话的屏幕，九宫格用。锁的纪律跟 `list()` 一致：
+    /// 逐个短暂拿锁，不跨会话持有任何东西。不存在的 id 跳过——
+    /// 会话可能在两次轮询之间被停掉，这不是错误。
+    pub fn screens(&self, ids: &[u32]) -> Vec<crate::proto::ScreenEntry> {
+        ids.iter()
+            .filter_map(|id| {
+                let arc = self.get_arc(*id).ok()?;
+                let s = recover(arc.lock());
+                Some(crate::proto::ScreenEntry {
+                    id: *id,
+                    lines: s.pty.screen_spans(),
+                })
+            })
+            .collect()
+    }
+
     /// 改会话的显示尺寸。界面尺寸变了就要跟着调，否则 agent 按错的宽度排版。
     pub fn resize(&self, id: u32, rows: u16, cols: u16) -> Result<()> {
         self.with_session(id, |s| s.pty.resize(rows, cols))
@@ -809,6 +825,27 @@ mod tests {
             SessionState::Unknown,
             "tick 也不该把它改成 Working"
         );
+    }
+
+    #[test]
+    fn screens_returns_entries_for_known_ids_and_skips_unknown() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        let id1 = mgr
+            .create(dir1.path(), "shell", empty_secrets(), &[])
+            .unwrap();
+        let id2 = mgr
+            .create(dir2.path(), "shell", empty_secrets(), &[])
+            .unwrap();
+
+        let entries = mgr.screens(&[id1, id2, 9999]);
+
+        assert_eq!(entries.len(), 2, "9999 不存在，应该被跳过而不是报错");
+        assert_eq!(entries[0].id, id1);
+        assert_eq!(entries[1].id, id2);
+        // 屏幕是 40 行的 vt100 缓冲，行数应该等于会话的行数
+        assert_eq!(entries[0].lines.len(), 40);
     }
 
     #[test]
