@@ -27,7 +27,8 @@ Running `dct` opens the board — one line per session, with what each agent is 
 
 | Key | What it does |
 |---|---|
-| `n` | Start a new session (pick an agent) |
+| `n` | Start a new session with the agent you used last time (no menu) |
+| `N` | Start a new session and pick which agent |
 | `p` | Switch project — which directory the next session opens in |
 | `↑` `↓` | Move between sessions |
 | `Enter` | Open a session; `F2` gets you back to the board |
@@ -41,7 +42,7 @@ Inside a session, everything you type goes to the agent — including `Esc`, whi
 
 ## Agents
 
-Press `n` and you get all of them, whether or not they work on this machine. Ones that can't run yet are dimmed with the reason, and choosing one takes you toward fixing it rather than turning you away.
+Press `N` and you get all of them, whether or not they work on this machine. Ones that can't run yet are dimmed with the reason, and choosing one takes you toward fixing it rather than turning you away. The first time you pick one, `n` remembers it — press `n` next time and you go straight back in, no menu.
 
 | Agent | What it is | Needs |
 |---|---|---|
