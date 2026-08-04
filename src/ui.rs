@@ -379,15 +379,26 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         let idx = c.to_digit(10).unwrap() as usize;
                         if idx >= 1 && idx <= profiles.len() {
                             let profile = profiles[idx - 1].clone();
-                            message = match client.call(Request::Create {
+                            // 选完直接进会话。用户按数字的意图就是「我要用这个
+                            // agent 干活」，先弹回看板再让他找一遍自己刚建的会话
+                            // 是白让人做第二次选择。建失败才回看板——那儿有报错。
+                            match client.call(Request::Create {
                                 dir: current_dir.display().to_string(),
                                 profile,
                             }) {
-                                Ok(Response::Created { id }) => format!("已开会话 {id}").into(),
-                                Ok(Response::Error(e)) => Msg::err(e),
-                                _ => Msg::err("创建失败".into()),
-                            };
-                            view = View::Board;
+                                Ok(Response::Created { id }) => {
+                                    view = View::Attached(id);
+                                    need_sessions = true; // 会话标题要显示项目名
+                                }
+                                Ok(Response::Error(e)) => {
+                                    message = Msg::err(e);
+                                    view = View::Board;
+                                }
+                                _ => {
+                                    message = Msg::err("创建失败".into());
+                                    view = View::Board;
+                                }
+                            }
                         }
                     }
                     _ => {}
