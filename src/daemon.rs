@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::profile::Profile;
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{Request, Response};
+use crate::secrets::{secrets_path_for_socket, SecretStore};
 use crate::session::{recover, SessionManager};
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -34,8 +35,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
 
     // 存放位置跟着 socket 走，测试把 socket 放临时目录就自动隔离，
-    // 不会去动真实的 ~/.dct/projects.json。
+    // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml。
     let store = Arc::new(Mutex::new(Store::load(&store_path_for_socket(socket))));
+    let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path_for_socket(
+        socket,
+    ))));
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
@@ -47,8 +51,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let conn = conn?;
         let m = mgr.clone();
         let s = store.clone();
+        let sec = secrets.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s) {
+            if let Err(e) = serve(conn, m, s, sec) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -56,7 +61,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     Ok(())
 }
 
-fn serve(stream: UnixStream, mgr: Arc<SessionManager>, store: Arc<Mutex<Store>>) -> Result<()> {
+fn serve(
+    stream: UnixStream,
+    mgr: Arc<SessionManager>,
+    store: Arc<Mutex<Store>>,
+    secrets: Arc<Mutex<SecretStore>>,
+) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
     for line in reader.lines() {
@@ -65,7 +75,7 @@ fn serve(stream: UnixStream, mgr: Arc<SessionManager>, store: Arc<Mutex<Store>>)
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(req, &mgr, &store),
+            Ok(req) => handle(req, &mgr, &store, &secrets),
             Err(e) => Response::Error(format!("请求解析失败: {e}")),
         };
         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
@@ -74,7 +84,12 @@ fn serve(stream: UnixStream, mgr: Arc<SessionManager>, store: Arc<Mutex<Store>>)
     Ok(())
 }
 
-fn handle(req: Request, mgr: &Arc<SessionManager>, store: &Arc<Mutex<Store>>) -> Response {
+fn handle(
+    req: Request,
+    mgr: &Arc<SessionManager>,
+    store: &Arc<Mutex<Store>>,
+    secrets: &Arc<Mutex<SecretStore>>,
+) -> Response {
     let r: anyhow::Result<Response> = match req {
         Request::List => Ok(Response::Sessions(mgr.list())),
         Request::Profiles => Ok(Response::Profiles(
@@ -86,8 +101,9 @@ fn handle(req: Request, mgr: &Arc<SessionManager>, store: &Arc<Mutex<Store>>) ->
         Request::Projects => Ok(Response::Projects(recover(store.lock()).list())),
         Request::Create { dir, profile } => {
             let dir = PathBuf::from(dir);
+            let secrets_guard = recover(secrets.lock());
             let r = mgr
-                .create(&dir, &profile)
+                .create(&dir, &profile, &secrets_guard)
                 .map(|id| Response::Created { id });
             // 只有建成功了才记账。建失败的目录进了「最近项目」，
             // 下次还会被选中、还会失败。
