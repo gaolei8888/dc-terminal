@@ -56,13 +56,43 @@ impl SecretStore {
     }
 
     pub fn set(&mut self, profile: &str, value: &str) -> Result<()> {
+        // daemon 会在整个生命周期内保持这个 store 实例。内存改动必须和
+        // 磁盘写保持同步，否则 save 失败后，get() 会虚报密钥已保存，
+        // 用户以为没问题，但下次重启密钥就没了。这里先记住改动前的值，
+        // 若 save 失败就恢复，保证内存状态始终只反映已落盘的数据。
+        let old_value = self.secrets.get(profile).cloned();
         self.secrets.insert(profile.to_string(), value.to_string());
-        self.save()
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // save 失败，回滚内存改动
+                if let Some(v) = old_value {
+                    self.secrets.insert(profile.to_string(), v);
+                } else {
+                    self.secrets.remove(profile);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn remove(&mut self, profile: &str) -> Result<()> {
+        // daemon 会在整个生命周期内保持这个 store 实例。内存改动必须和
+        // 磁盘写保持同步，否则 save 失败后，密钥看起来被删了但其实没有，
+        // 用户以为没问题，但下次重启密钥又回来了。这里先记住改动前是否
+        // 存在该键，若 save 失败就恢复。
+        let old_value = self.secrets.get(profile).cloned();
         self.secrets.remove(profile);
-        self.save()
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // save 失败，回滚内存改动
+                if let Some(v) = old_value {
+                    self.secrets.insert(profile.to_string(), v);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// 和 `projects::Store::save` 不同，这里**落盘失败要报错**：那边丢的是
@@ -210,5 +240,47 @@ mod tests {
             "这不是 TOML {{{",
             "原文件必须一个字节都没动"
         );
+    }
+
+    #[test]
+    fn set_rolls_back_memory_on_save_failure() {
+        // set 失败时必须回滚内存改动。这在 daemon 场景中很关键：
+        // 如果 set 后 save 失败，内存里有新值但磁盘没有，get() 会虚报
+        // 密钥已保存，用户以为没问题，但重启后发现密钥没了。
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secrets.toml");
+        std::fs::write(&f, "这不是 TOML {{{").unwrap();
+
+        let mut s = SecretStore::load(&f);
+        // 预期：文件坏了，加载时 load_error 被设置，secrets 是空的
+        assert_eq!(s.get("key"), None, "初始状态无此键");
+
+        // set 会因为 load_error 而失败
+        let err = s.set("key", "value").unwrap_err();
+        assert!(err.to_string().contains("密钥文件"));
+
+        // 关键检验：失败后内存应该恢复到改动前的状态
+        assert_eq!(s.get("key"), None, "set 失败后，新键不能出现在内存");
+    }
+
+    #[test]
+    fn remove_rolls_back_memory_on_save_failure() {
+        // remove 失败时也必须回滚内存改动。这在 daemon 场景中很关键：
+        // 如果 remove 后 save 失败，内存里没有该键但磁盘还有，get() 会虚报
+        // 密钥已删除，但重启后发现密钥还在，造成混淆。
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secrets.toml");
+        std::fs::write(&f, "这不是 TOML {{{").unwrap();
+
+        let mut s = SecretStore::load(&f);
+        // 预期：文件坏了，加载时 load_error 被设置，secrets 是空的
+        assert_eq!(s.get("key"), None, "初始状态无此键");
+
+        // remove 会因为 load_error 而失败
+        let err = s.remove("key").unwrap_err();
+        assert!(err.to_string().contains("密钥文件"));
+
+        // 关键检验：失败后内存应该恢复到改动前的状态（依旧无此键）
+        assert_eq!(s.get("key"), None, "remove 失败后，状态应该不变");
     }
 }
