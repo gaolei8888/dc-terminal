@@ -23,6 +23,7 @@ pub fn status_label(s: SessionState) -> &'static str {
         SessionState::Asking => "等你回答",
         SessionState::Idle => "空闲",
         SessionState::Stopped => "已停止",
+        SessionState::Unknown => "—",
     }
 }
 
@@ -32,6 +33,7 @@ pub fn status_color(s: SessionState) -> Color {
         SessionState::Asking => Color::Yellow,
         SessionState::Idle => Color::Green,
         SessionState::Stopped => Color::DarkGray,
+        SessionState::Unknown => Color::DarkGray,
     }
 }
 
@@ -1247,6 +1249,11 @@ mod tests {
         assert_eq!(status_label(SessionState::Asking), "等你回答");
         assert_eq!(status_label(SessionState::Idle), "空闲");
         assert_eq!(status_label(SessionState::Stopped), "已停止");
+    }
+
+    #[test]
+    fn unknown_state_shows_a_dash() {
+        assert_eq!(status_label(SessionState::Unknown), "—");
     }
 
     #[test]
