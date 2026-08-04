@@ -227,14 +227,26 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
 /// 把 `toml::de::Error` 拍成人话的一行：保留它的原因（缺字段、类型不对……）
 /// 和大致的行号，丢掉它自带的 `TOML parse error at line X, column Y\n  |\n...`
 /// 那套多行图形化 Display——那是给等宽终端排版看的，直接甩给用户就是一份栈追踪。
+///
+/// `err.message()` 本身看着像纯文字，但不保证不含换行：底层 winnow 在错误里同时
+/// 带了「标签」和「期望是什么」两条上下文时，会用换行把两句拼在一起（比如
+/// 写错转义符会得到 `"invalid escape sequence\nexpected \`b\`, \`f\`, ..."`）。
+/// 这行菜单状态栏只能放一行字，两行糊在一起在等宽终端上会错位换行，看着又是
+/// 一份变相的栈追踪。这里把内部换行拍平成中文顿号式的分隔符——两句话都留着，
+/// 「expected ...」那半句是真正告诉用户该怎么改的部分，直接丢掉可惜。
 fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
-    let reason = err.message();
+    let reason = err
+        .message()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("；");
     match err.span() {
         Some(span) => {
             let line = src[..span.start.min(src.len())].matches('\n').count() + 1;
             format!("第 {line} 行：{reason}")
         }
-        None => reason.to_string(),
+        None => reason,
     }
 }
 
@@ -569,6 +581,40 @@ mod tests {
     }
 
     #[test]
+    fn toml_error_with_embedded_newline_still_collapses_to_one_line() {
+        // 非程序员很可能在字符串里写 Windows 路径这类带反斜杠的东西，
+        // 比如 `name = "C:\Users\x"`——TOML 里反斜杠是转义符起始，
+        // 这种写法不合法。toml::de::Error::message() 对「转义符不认识」
+        // 这类错误会把「哪里错了」和「该写什么」拼成两行（中间一个 \n），
+        // describe_toml_error 必须把这两行拍平，不能让换行漏到 errs 里——
+        // 状态栏只有一行，漏了换行在等宽终端上就是错位的半份栈追踪。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("windows_path.toml"),
+            "name = \"C:\\x\"\ncommand = [\"echo\"]\n",
+        )
+        .unwrap();
+
+        let (_, errs) = load_dir(tmp.path());
+        assert_eq!(errs.len(), 1);
+        assert!(
+            !errs[0].contains('\n'),
+            "错误要是单行，不能带换行糊到状态栏上：{}",
+            errs[0]
+        );
+        assert!(
+            errs[0].contains("invalid escape sequence"),
+            "第一句原因不能丢：{}",
+            errs[0]
+        );
+        assert!(
+            errs[0].contains("expected"),
+            "该怎么改的那半句不能丢：{}",
+            errs[0]
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn unreadable_dir_reports_an_error_instead_of_going_silent() {
         use std::os::unix::fs::PermissionsExt;
@@ -577,6 +623,18 @@ mod tests {
         let locked = tmp.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // 权限位落在 Drop 里恢复，而不是函数末尾的一条语句——下面几个 assert!
+        // 失败会 panic 并直接展开出函数，末尾的语句根本执行不到。用 RAII 保证
+        // 不管走正常路径还是 panic 都会把目录改回可读可写，否则 tempdir 自己
+        // 的 Drop 删不掉这个目录，会在这条测试之外拖出一片脏临时文件。
+        struct RestorePerms<'a>(&'a std::path::Path);
+        impl Drop for RestorePerms<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = RestorePerms(&locked);
 
         // root（常见于容器化的 CI）不受目录权限位约束，读得穿。那种环境下这条
         // 测试验证的分支根本触发不了，硬跑只会得到一个和权限无关的 flaky 失败——
@@ -597,9 +655,6 @@ mod tests {
                 errs[0]
             );
         }
-
-        // 改回可读可写，否则 tempdir 的 Drop 删不掉这个目录
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
