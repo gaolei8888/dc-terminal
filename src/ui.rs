@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use crate::client::Client;
 use crate::profile::ProfileStatus;
-use crate::proto::{ProfileEntry, Request, Response};
+use crate::proto::{socket_path, ProfileEntry, Request, Response, SecretPrompt};
 use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
 use crate::session::{SessionInfo, SessionState};
+use crate::verify::VerifyOutcome;
 
 pub fn status_label(s: SessionState) -> &'static str {
     match s {
@@ -85,6 +86,27 @@ enum View {
         /// Some 表示正处在「手输路径」的输入态
         typing_path: Option<String>,
     },
+    EnterSecret {
+        /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
+        profile: String,
+        /// 界面上给用户看的名字（比如 "Kimi"）——profile 是内部标识，不能直接出现在标题里
+        label: String,
+        /// daemon 给的填写提示：一句人话 + 可能有的申领页链接
+        prompt: SecretPrompt,
+        /// 用户正在打的密钥，明文只活在这一份里，渲染时永远转成圆点
+        buf: String,
+        phase: SecretPhase,
+    },
+}
+
+/// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
+/// 后台线程了，这时候改它不会影响正在飞的那次验证，只会让用户误以为
+/// 下一次回车用的是新值。`Failed` 带着人话版的失败原因，渲染在圆点行下面。
+#[derive(Clone)]
+pub enum SecretPhase {
+    Typing,
+    Verifying,
+    Failed(String),
 }
 
 /// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
@@ -200,7 +222,95 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     // 取每个会话的最后一行，纯属浪费。只在看板上、或刚从会话里退出来时拉一次。
     let mut need_sessions = true;
 
+    // 密钥验证是网络调用，不能在按键循环里直接跑——会话视图 16ms 一刷，
+    // 一次阻塞就是整个界面冻住。丢给后台线程，主循环每轮 try_recv。
+    // 放在 View 外面是因为 View 要 Clone（`match view.clone()`），而
+    // `mpsc::Receiver` 不能 Clone，没法塞进一个要 Clone 的枚举里。
+    let mut verify_rx: Option<std::sync::mpsc::Receiver<VerifyOutcome>> = None;
+    // 后台验证线程要自己开一条到守护进程的连接——主循环这条 client 正忙着
+    // 画界面。`socket_path()` 是纯函数（只读 $HOME），比把 Client 内部
+    // 私有的 socket 字段掏出来更省事。
+    let socket = socket_path();
+
     let res = loop {
+        // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
+        // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
+        if let Some(rx) = &verify_rx {
+            if let Ok(outcome) = rx.try_recv() {
+                // 不管接下来用不用得上这个结果，先把 Receiver 收掉：
+                // 它已经出结果了，没有第二次可读。
+                verify_rx = None;
+                if let View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    ..
+                } = view.clone()
+                {
+                    view = match verify_message(outcome) {
+                        Some(m) => View::EnterSecret {
+                            profile,
+                            label,
+                            prompt,
+                            buf,
+                            phase: SecretPhase::Failed(m),
+                        },
+                        // 通过：先存盘，再开会话，直接进去——中途不再多问一句确认。
+                        // 存密钥必须先于建会话：daemon 的 Create 是从磁盘上已经
+                        // 存好的密钥里现读一份给新会话用的（见 daemon.rs），
+                        // 顺序反了新会话拿到的还是空密钥。
+                        None => match client.call(Request::SetSecret {
+                            profile: profile.clone(),
+                            value: buf.clone(),
+                        }) {
+                            Ok(Response::Ok) => match client.call(Request::Create {
+                                dir: current_dir.display().to_string(),
+                                profile: profile.clone(),
+                                remember: true,
+                            }) {
+                                Ok(Response::Created { id }) => {
+                                    need_sessions = true; // 会话标题要显示项目名
+                                    View::Attached(id)
+                                }
+                                Ok(Response::Error(e)) => View::EnterSecret {
+                                    profile,
+                                    label,
+                                    prompt,
+                                    buf,
+                                    phase: SecretPhase::Failed(e),
+                                },
+                                _ => View::EnterSecret {
+                                    profile,
+                                    label,
+                                    prompt,
+                                    buf,
+                                    phase: SecretPhase::Failed("开不了会话，再试一次".into()),
+                                },
+                            },
+                            Ok(Response::Error(e)) => View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Failed(e),
+                            },
+                            _ => View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Failed("密钥没存上，再试一次".into()),
+                            },
+                        },
+                    };
+                }
+                // else：视图已经不是 EnterSecret 了（比如用户 Esc/Ctrl+Q 提前
+                // 离开了）。这条结果没有落点，扔了——它对应的是一个用户已经
+                // 不在的视图，套在别的视图上没有意义。
+            }
+        }
+
         let attached = matches!(view, View::Attached(_));
         if need_sessions || !attached {
             match client.call(Request::List) {
@@ -277,6 +387,15 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     typing_path: Some(buf),
                     ..
                 } => buf.push_str(text.trim()),
+                // 密钥十有八九是粘进来的，不是敲的——用户拿到手的字符串通常带
+                // 引号、Bearer 前缀、尾随换行，clean_secret 统一洗一遍。
+                // Verifying 期间不接：那次验证已经把当时的 buf 发出去了，
+                // 这时候再改只会让用户误以为下一次回车用的是新值。
+                View::EnterSecret { buf, phase, .. }
+                    if !matches!(phase, SecretPhase::Verifying) =>
+                {
+                    buf.push_str(&clean_secret(&text));
+                }
                 _ => {}
             }
             continue;
@@ -461,14 +580,24 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                     }
                                 }
                             }
-                            Some((_, PickAction::AskSecret(_))) => {
-                                // 真正的填密钥视图是 Task 11 的事；这里先占位提示，
-                                // 免得用户选中「未填密钥」的行按了却像没反应一样。
-                                message = Msg::err("还没做".into());
-                                View::PickProfile {
-                                    entries,
-                                    state,
-                                    warning,
+                            Some((i, PickAction::AskSecret(_))) => {
+                                // AskSecret(usize) 里那个下标只是占位——pick_action
+                                // 只拿得到一个 &ProfileEntry，不知道它在列表里排第几
+                                // （见 PickAction 的注释）。真下标是这里的 i，
+                                // 从 entries[i] 取出来的正是被选中的这一行。
+                                let e = &entries[i];
+                                View::EnterSecret {
+                                    profile: e.name.clone(),
+                                    label: e.label.clone(),
+                                    // NeedsSecret 状态却没带 SecretPrompt 是数据不一致
+                                    // （daemon 那边的 bug），兜底成空提示而不是 panic——
+                                    // 用户最多看到少一行说明，不该因为这个直接崩溃。
+                                    prompt: e.secret.clone().unwrap_or(SecretPrompt {
+                                        hint: String::new(),
+                                        url: None,
+                                    }),
+                                    buf: String::new(),
+                                    phase: SecretPhase::Typing,
                                 }
                             }
                             Some((_, PickAction::Install { profile, command })) => {
@@ -681,7 +810,152 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         }
                     }
                 }
+                View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    mut buf,
+                    phase,
+                } => match phase.clone() {
+                    SecretPhase::Verifying => {
+                        // 验证在后台线程跑，buf 已经发出去了，这期间敲字符/回车
+                        // 都改不了那次正在飞的请求，只会让用户误以为在做别的事。
+                        // 只留 Esc：想退就现在退，且必须现在就扔掉 verify_rx——
+                        // 不然迟到的结果会套在一个用户已经不认得的视图上。
+                        if key.code == KeyCode::Esc {
+                            verify_rx = None;
+                            view = View::PickProfile {
+                                entries: Vec::new(),
+                                state: ListState::default(),
+                                warning: None,
+                            };
+                        } else {
+                            view = View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Verifying,
+                            };
+                        }
+                    }
+                    SecretPhase::Typing | SecretPhase::Failed(_) => match key.code {
+                        KeyCode::Esc => {
+                            view = View::PickProfile {
+                                entries: Vec::new(),
+                                state: ListState::default(),
+                                warning: None,
+                            };
+                        }
+                        KeyCode::Enter => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let sock = socket.to_path_buf();
+                            let p = profile.clone();
+                            let v = buf.clone();
+                            std::thread::spawn(move || {
+                                // 另开一条连接：主循环那条还要继续画界面
+                                let outcome = Client::connect(&sock)
+                                    .and_then(|mut c| {
+                                        c.call(Request::VerifySecret {
+                                            profile: p,
+                                            value: v,
+                                        })
+                                    })
+                                    .map(|r| match r {
+                                        Response::Verify(o) => o,
+                                        _ => VerifyOutcome::Unreachable,
+                                    })
+                                    .unwrap_or(VerifyOutcome::Unreachable);
+                                let _ = tx.send(outcome);
+                            });
+                            verify_rx = Some(rx);
+                            view = View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Verifying,
+                            };
+                        }
+                        KeyCode::Backspace => {
+                            buf.pop();
+                            view = View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Typing,
+                            };
+                        }
+                        // Ctrl+O 不用 o：o 得留给密钥输入本身
+                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(url) = &prompt.url {
+                                let _ = std::process::Command::new("open").arg(url).spawn();
+                            }
+                            view = View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase,
+                            };
+                        }
+                        KeyCode::Char(c) => {
+                            buf.push(c);
+                            view = View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase: SecretPhase::Typing,
+                            };
+                        }
+                        _ => {
+                            view = View::EnterSecret {
+                                profile,
+                                label,
+                                prompt,
+                                buf,
+                                phase,
+                            };
+                        }
+                    },
+                },
             }
+        }
+
+        // 好几条路都能把 view 换成一个空的 PickProfile——Ctrl+Q 走
+        // back_one_level（它是纯函数，拿不到 daemon 连接，只能给个
+        // entries: vec![] 的空壳，约定见它的文档注释），EnterSecret 自己的
+        // Esc 分支也直接手搭了同一个空壳。两条路都得补，所以放在这里统一
+        // 收口，而不是在每个「退回选择器」的地方各查一次——漏一个分支就是
+        // 一屏空白，用户会以为自己一个 agent 都没装。
+        let needs_profile_refetch =
+            matches!(&view, View::PickProfile { entries, .. } if entries.is_empty());
+        if needs_profile_refetch {
+            view = match client.call(Request::Profiles) {
+                Ok(Response::Profiles { entries, warning }) => {
+                    let mut state = ListState::default();
+                    if !entries.is_empty() {
+                        state.select(Some(0));
+                    }
+                    View::PickProfile {
+                        entries,
+                        state,
+                        warning,
+                    }
+                }
+                Ok(Response::Error(e)) => View::PickProfile {
+                    entries: Vec::new(),
+                    state: ListState::default(),
+                    warning: Some(e),
+                },
+                _ => View::PickProfile {
+                    entries: Vec::new(),
+                    state: ListState::default(),
+                    warning: Some("拿不到 agent 列表".into()),
+                },
+            };
         }
 
         // 视图变了就把上一屏的残留消息清掉，好让「按视图给提示」的 idle_help
@@ -708,6 +982,14 @@ fn is_ctrl_q(key: &KeyEvent) -> bool {
 /// Ctrl+Q 从当前视图退到哪一层。`None` 表示「退到头了，该退出 dct」。
 ///
 /// 抽成纯函数是为了能单测——`run()` 的按键循环要连真 socket，测不了。
+///
+/// `EnterSecret` 退回的是 `PickProfile` 而不是看板——用户很可能只是选错了
+/// agent，回选择器比回看板更顺手。但这里是个纯函数，拿不到 daemon 连接，
+/// 现查不出一份新的条目列表，只能给一个 `entries: vec![]` 的空壳。
+/// **调用方必须知道这个约定**：`run()` 的按键循环里，只要处理完一次按键后
+/// 发现 `view` 变成了空的 `PickProfile`（不管是走这个函数的 Ctrl+Q，还是
+/// `EnterSecret` 自己的 Esc 分支），就要补一次 `Request::Profiles` 把条目
+/// 填上——不然用户看到的是一屏空白，会以为自己一个 agent 都没有。
 fn back_one_level(view: View) -> Option<View> {
     match view {
         View::Board => None,
@@ -722,13 +1004,18 @@ fn back_one_level(view: View) -> Option<View> {
             state,
             typing_path: None,
         }),
+        View::EnterSecret { .. } => Some(View::PickProfile {
+            entries: Vec::new(),
+            state: ListState::default(),
+            warning: None,
+        }),
         _ => Some(View::Board),
     }
 }
 
-/// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥
-/// （Task 11 才有真视图）；没装但有安装命令的去装；没装又没法自动装的、
-/// 或者缺别的 profile 依赖的，只能告诉用户一句话，不切视图。
+/// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥；
+/// 没装但有安装命令的去装；没装又没法自动装的、或者缺别的 profile 依赖的，
+/// 只能告诉用户一句话，不切视图。
 #[derive(Debug)]
 pub enum PickAction {
     Start(String),
@@ -775,6 +1062,31 @@ pub fn digit_index(c: char) -> Option<usize> {
     match c {
         '1'..='9' => Some(c as usize - '1' as usize),
         _ => None,
+    }
+}
+
+/// 粘进来的密钥清洗一遍。用户从网页或接口文档里拷贝，经常带上引号、
+/// `Bearer ` 前缀和尾随换行——让他自己发现并删掉是不现实的。
+pub fn clean_secret(s: &str) -> String {
+    let t = s.trim();
+    let t = t.strip_prefix('"').unwrap_or(t);
+    let t = t.strip_suffix('"').unwrap_or(t);
+    let t = t.strip_prefix('\'').unwrap_or(t);
+    let t = t.strip_suffix('\'').unwrap_or(t);
+    let t = t.trim();
+    t.strip_prefix("Bearer ").unwrap_or(t).trim().to_string()
+}
+
+/// 验证结果给用户看的话。`None` 表示放行。
+///
+/// `Unreachable` 必须说网络的问题，不能说密钥的问题——用户的密钥可能
+/// 完全没问题，只是这台机器连不上服务器；把锅甩给密钥会让他白跑一趟
+/// 去重新生成一个根本不需要换的 key。
+pub fn verify_message(o: VerifyOutcome) -> Option<String> {
+    match o {
+        VerifyOutcome::Ok => None,
+        VerifyOutcome::BadKey => Some("这个密钥用不了，可能是复制的时候少了一段".into()),
+        VerifyOutcome::Unreachable => Some("连不上服务器，检查一下网络".into()),
     }
 }
 
@@ -1023,6 +1335,8 @@ fn escape_hint(view: &View) -> &'static str {
             typing_path: Some(_),
             ..
         } => "Ctrl+Q 回列表",
+        // 跟 back_one_level 保持一致：退出填密钥回的是选择器，不是看板
+        View::EnterSecret { .. } => "Ctrl+Q 回列表",
         _ => "Ctrl+Q 回看板",
     }
 }
@@ -1041,6 +1355,13 @@ fn idle_help(view: &View) -> &'static str {
         } => "输入路径后 Enter 确认，Esc 返回列表",
         View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
         View::Board => "n 新建  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
+        // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
+        // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
+        View::EnterSecret {
+            phase: SecretPhase::Verifying,
+            ..
+        } => "正在验证，请稍候　Esc 可取消",
+        View::EnterSecret { .. } => "粘贴或输入密钥　Enter 确认　Esc 返回列表",
     }
 }
 
@@ -1186,6 +1507,52 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                     .highlight_symbol("▶ "),
                 chunks[0],
                 &mut s,
+            );
+        }
+        View::EnterSecret {
+            label,
+            prompt,
+            buf,
+            phase,
+            ..
+        } => {
+            let mut lines: Vec<Line> = Vec::new();
+            if !prompt.hint.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    prompt.hint.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+            }
+            // 显示成圆点：密钥不该以明文停在屏幕上，用户可能在录屏或在办公室
+            lines.push(Line::from(format!("{}▌", "•".repeat(buf.chars().count()))));
+            lines.push(Line::from(""));
+            match phase {
+                SecretPhase::Typing => {}
+                SecretPhase::Verifying => lines.push(Line::from(Span::styled(
+                    "正在验证…",
+                    Style::default().fg(Color::Cyan),
+                ))),
+                SecretPhase::Failed(m) => lines.push(Line::from(Span::styled(
+                    m.clone(),
+                    Style::default().fg(Color::Red),
+                ))),
+            }
+            if prompt.url.is_some() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Ctrl+O 打开申领页面",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            f.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style)
+                        .title(format!("填 {label} 的密钥（Enter 确认，Esc 返回列表）")),
+                ),
+                chunks[0],
             );
         }
         View::PickProject {
@@ -1733,6 +2100,73 @@ mod tests {
                     message: &Msg::from(""),
                     connected: false,
                     current: "/tmp/proj",
+                },
+            )
+        })
+        .unwrap();
+        // 填密钥视图，三个阶段各画一遍：打字中 / 验证中 / 失败
+        for phase in [
+            SecretPhase::Typing,
+            SecretPhase::Verifying,
+            SecretPhase::Failed("这个密钥用不了，可能是复制的时候少了一段".into()),
+        ] {
+            term.draw(|f| {
+                draw(
+                    f,
+                    &mut DrawInput {
+                        view: &View::EnterSecret {
+                            profile: "kimi".into(),
+                            label: "Kimi".into(),
+                            prompt: SecretPrompt {
+                                hint: "去 platform.moonshot.cn 生成一个".into(),
+                                url: Some("https://platform.moonshot.cn".into()),
+                            },
+                            buf: "sk-abc123".into(),
+                            phase,
+                        },
+                        sessions: &sessions,
+                        st: &mut st,
+                        screen: &[],
+                        cursor: (0, 0),
+                        message: &Msg::from(""),
+                        connected: true,
+                        current: "/tmp/proj",
+                    },
+                )
+            })
+            .unwrap();
+        }
+    }
+
+    /// 密钥比窄终端还宽的时候，圆点行不能把 ratatui 的 buffer 写出界——
+    /// 真实场景：40 列的分屏终端 + 一个 100 字符的长 token。
+    #[test]
+    fn secret_view_dots_line_does_not_panic_when_wider_than_the_terminal() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut st = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::EnterSecret {
+                        profile: "kimi".into(),
+                        label: "Kimi".into(),
+                        prompt: SecretPrompt {
+                            hint: String::new(),
+                            url: None,
+                        },
+                        buf: "x".repeat(200),
+                        phase: SecretPhase::Typing,
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp",
                 },
             )
         })
@@ -2432,5 +2866,83 @@ mod tests {
             }),
             Some(View::Board)
         ));
+    }
+
+    // ———— Task 11：填密钥界面 ————
+
+    #[test]
+    fn paste_is_trimmed() {
+        assert_eq!(clean_secret("  sk-abc\n"), "sk-abc");
+    }
+
+    #[test]
+    fn paste_strips_surrounding_quotes() {
+        assert_eq!(clean_secret("\"sk-abc\""), "sk-abc");
+        assert_eq!(clean_secret("'sk-abc'"), "sk-abc");
+    }
+
+    #[test]
+    fn paste_strips_bearer_prefix() {
+        // 从接口文档里整段拷贝经常带上它
+        assert_eq!(clean_secret("Bearer sk-abc"), "sk-abc");
+        assert_eq!(clean_secret("\"Bearer sk-abc\"\n"), "sk-abc");
+    }
+
+    #[test]
+    fn paste_leaves_a_normal_key_alone() {
+        assert_eq!(clean_secret("sk-abc123"), "sk-abc123");
+    }
+
+    #[test]
+    fn bad_key_gets_a_human_message() {
+        let m = verify_message(VerifyOutcome::BadKey).unwrap();
+        assert!(m.contains("密钥"));
+        assert!(!m.contains("401"), "别把状态码甩给用户：{m}");
+    }
+
+    #[test]
+    fn unreachable_blames_the_network_not_the_key() {
+        let m = verify_message(VerifyOutcome::Unreachable).unwrap();
+        assert!(
+            m.contains("网络"),
+            "连不上要说是网络，不能让用户去怀疑密钥：{m}"
+        );
+    }
+
+    #[test]
+    fn ok_has_no_message() {
+        assert!(verify_message(VerifyOutcome::Ok).is_none());
+    }
+
+    #[test]
+    fn secret_view_escapes_back_to_the_picker() {
+        // 回选择器而不是回看板：用户可能只是选错了 agent
+        let back = back_one_level(View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase: SecretPhase::Typing,
+        });
+        assert!(matches!(back, Some(View::PickProfile { .. })));
+    }
+
+    #[test]
+    fn secret_view_escape_hint_says_back_to_the_list() {
+        // 底栏说什么就得真能做到什么
+        let h = escape_hint(&View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase: SecretPhase::Typing,
+        });
+        assert!(h.contains("列表"), "底栏说什么就得真能做到什么：{h}");
     }
 }
