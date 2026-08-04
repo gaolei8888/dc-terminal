@@ -35,3 +35,9 @@ Task 10: complete (commits 8fe647d..dd3db67, review clean)
 Task 10: minor (deferred): char_width 的 (ch as u32) > 0x1100 => 2 是粗略近似，部分非 CJK 码位会被误判成双宽；旧逻辑，本轮只是提取成函数
 Task 10: minor (deferred): load_dir 里 from_toml 错误的 unwrap_or_else(|| e.to_string()) 兜底目前不可达，但若 from_toml 的包装方式变了会漏原始文案
 Task 10: 注意 src/ui.rs 已 2383 行，Task 11/12/13 还要往里加
+Task 11: complete (commits 15c67f3..753e415, review clean)
+Task 11: minor (deferred): Ctrl+Q 在 Verifying 期间会绕过「只有 Esc 能出去」的限制（全局退一层早于视图 match）；结果丢弃有守卫，不是缺陷，但与 brief 的字面表述不符
+Task 11: minor (deferred): 空 PickProfile 的集中重取没有自动化回归测试（逻辑在 run() 里，要真 socket）；设计上靠状态判断而非枚举路径，风险已结构性缓解
+Task 11: minor (deferred): Request::Profiles 持续失败时重取没有退避；沿用仓库既有模式，用户仍可 Ctrl+Q 脱身
+Task 11: minor (deferred): SetSecret / Create 的 Response::Error 原文直接进 Failed(e) 给用户看，没有净化；沿用既有模式
+Task 11: 注意 src/ui.rs 已 2948 行（本任务 +511），视图状态机 / 事件循环 / 纯函数 / draw / 90+ 内联测试全在一个文件；累积债务，留给最终评审判断
