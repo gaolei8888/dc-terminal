@@ -96,6 +96,17 @@ enum View {
         /// 用户正在打的密钥，明文只活在这一份里，渲染时永远转成圆点
         buf: String,
         phase: SecretPhase,
+        /// 从设置页进来的要回设置页（意图是改配置），从选择器进来的直接开会话
+        /// （意图是开工）。两条路都会落到这同一个视图，成功之后该去哪不能靠
+        /// 猜——建这个视图的地方必须显式填它，别指望靠别的字段反推。
+        return_to_settings: bool,
+    },
+    /// 密钥设置页：看板按 `c` 进，只列声明了密钥的 profile（见 `secret_rows`）。
+    /// 跟 `PickProfile` 分开是两码事——那边是「选一个能干活的 agent」，
+    /// 这边是「管理密钥本身」，选中的动作也完全不同（改/删，而不是开会话）。
+    Secrets {
+        entries: Vec<ProfileEntry>,
+        state: ListState,
     },
 }
 
@@ -245,6 +256,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     label,
                     prompt,
                     buf,
+                    return_to_settings,
                     ..
                 } = view.clone()
                 {
@@ -255,15 +267,31 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             prompt,
                             buf,
                             phase: SecretPhase::Failed(m),
+                            return_to_settings,
                         },
-                        // 通过：先存盘，再开会话，直接进去——中途不再多问一句确认。
-                        // 存密钥必须先于建会话：daemon 的 Create 是从磁盘上已经
-                        // 存好的密钥里现读一份给新会话用的（见 daemon.rs），
-                        // 顺序反了新会话拿到的还是空密钥。
+                        // 通过：先存盘。存密钥必须先于「开会话」/「回设置页」两条
+                        // 后续路径都成立的前提——回设置页要读一份刷新过的 has_secret
+                        // 才能显示「已配」，开会话是从磁盘上已经存好的密钥里现读
+                        // 一份给新会话用的（见 daemon.rs），顺序反了新会话拿到的
+                        // 还是空密钥。
                         None => match client.call(Request::SetSecret {
                             profile: profile.clone(),
                             value: buf.clone(),
                         }) {
+                            Ok(Response::Ok) if return_to_settings => {
+                                // 从设置页进来的是「改配置」，不是「开工」——
+                                // 存完直接回设置页，不建会话。这里**不能**甩一个
+                                // 空壳指望循环收尾那段通用重拉逻辑去补：那段逻辑
+                                // 挂在按键处理之后，而这整段 verify_rx 分支跑在
+                                // 循环顶部、不受「这一轮有没有按键」摆布——如果
+                                // 用户这时候没再按键，`event::poll` 超时会直接
+                                // `continue` 到下一轮循环顶部，跳过收尾，空壳会
+                                // 一直空着，直到用户偶然按下一个键才被补上（手测
+                                // 时真的复现了：改完密钥，界面卡在一屏空列表，
+                                // 直到按了 Ctrl+Q 再按 c 才刷出来）。直接现查一遍，
+                                // 光标顺手定在刚改的这一行上。
+                                refetch_secrets(&mut client, Some(&profile))
+                            }
                             Ok(Response::Ok) => match client.call(Request::Create {
                                 dir: current_dir.display().to_string(),
                                 profile: profile.clone(),
@@ -279,6 +307,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                     prompt,
                                     buf,
                                     phase: SecretPhase::Failed(e),
+                                    return_to_settings,
                                 },
                                 _ => View::EnterSecret {
                                     profile,
@@ -286,6 +315,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                     prompt,
                                     buf,
                                     phase: SecretPhase::Failed("开不了会话，再试一次".into()),
+                                    return_to_settings,
                                 },
                             },
                             Ok(Response::Error(e)) => View::EnterSecret {
@@ -294,6 +324,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase: SecretPhase::Failed(e),
+                                return_to_settings,
                             },
                             _ => View::EnterSecret {
                                 profile,
@@ -301,6 +332,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase: SecretPhase::Failed("密钥没存上，再试一次".into()),
+                                return_to_settings,
                             },
                         },
                     };
@@ -534,6 +566,22 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             _ => message = Msg::err("拿不到项目列表".into()),
                         }
                     }
+                    KeyCode::Char('c') => {
+                        // 拿不到列表就不进设置页：留在看板上给一句错误，总比
+                        // 弹进一个既没数据、又没地方显示错误的空白页强
+                        // （`View::Secrets` 没有 `warning` 字段，见其字段注释）。
+                        match client.call(Request::Profiles) {
+                            Ok(Response::Profiles { entries, .. }) => {
+                                let mut state = ListState::default();
+                                if !secret_rows(&entries).is_empty() {
+                                    state.select(Some(0));
+                                }
+                                view = View::Secrets { entries, state };
+                            }
+                            Ok(Response::Error(e)) => message = Msg::err(e),
+                            _ => message = Msg::err("拿不到密钥列表".into()),
+                        }
+                    }
                     KeyCode::Enter => {
                         if let Some(s) = selected(&sessions, &list_state) {
                             view = View::Attached(s.id);
@@ -646,6 +694,9 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                     }),
                                     buf: String::new(),
                                     phase: SecretPhase::Typing,
+                                    // 从选择器进来的意图是「开工」，存完直接建会话，
+                                    // 不回这里。
+                                    return_to_settings: false,
                                 }
                             }
                             Some((_, PickAction::Install { profile, command })) => {
@@ -864,6 +915,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     prompt,
                     mut buf,
                     phase,
+                    return_to_settings,
                 } => match phase.clone() {
                     SecretPhase::Verifying => {
                         // 验证在后台线程跑，buf 已经发出去了，这期间敲字符/回车
@@ -872,10 +924,17 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         // 不然迟到的结果会套在一个用户已经不认得的视图上。
                         if key.code == KeyCode::Esc {
                             verify_rx = None;
-                            view = View::PickProfile {
-                                entries: Vec::new(),
-                                state: ListState::default(),
-                                warning: None,
+                            view = if return_to_settings {
+                                View::Secrets {
+                                    entries: Vec::new(),
+                                    state: ListState::default(),
+                                }
+                            } else {
+                                View::PickProfile {
+                                    entries: Vec::new(),
+                                    state: ListState::default(),
+                                    warning: None,
+                                }
                             };
                         } else {
                             view = View::EnterSecret {
@@ -884,15 +943,23 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase: SecretPhase::Verifying,
+                                return_to_settings,
                             };
                         }
                     }
                     SecretPhase::Typing | SecretPhase::Failed(_) => match key.code {
                         KeyCode::Esc => {
-                            view = View::PickProfile {
-                                entries: Vec::new(),
-                                state: ListState::default(),
-                                warning: None,
+                            view = if return_to_settings {
+                                View::Secrets {
+                                    entries: Vec::new(),
+                                    state: ListState::default(),
+                                }
+                            } else {
+                                View::PickProfile {
+                                    entries: Vec::new(),
+                                    state: ListState::default(),
+                                    warning: None,
+                                }
                             };
                         }
                         KeyCode::Enter => {
@@ -923,6 +990,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase: SecretPhase::Verifying,
+                                return_to_settings,
                             };
                         }
                         KeyCode::Backspace => {
@@ -933,6 +1001,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase: SecretPhase::Typing,
+                                return_to_settings,
                             };
                         }
                         // Ctrl+O 不用 o：o 得留给密钥输入本身
@@ -946,6 +1015,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase,
+                                return_to_settings,
                             };
                         }
                         KeyCode::Char(c) => {
@@ -956,6 +1026,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase: SecretPhase::Typing,
+                                return_to_settings,
                             };
                         }
                         _ => {
@@ -965,9 +1036,87 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 prompt,
                                 buf,
                                 phase,
+                                return_to_settings,
                             };
                         }
                     },
+                },
+                View::Secrets { entries, mut state } => match key.code {
+                    KeyCode::Esc => view = View::Board,
+                    KeyCode::Down | KeyCode::Up => {
+                        let d = if key.code == KeyCode::Down { 1 } else { -1 };
+                        move_sel_n(&mut state, secret_rows(&entries).len(), d);
+                        view = View::Secrets { entries, state };
+                    }
+                    KeyCode::Enter => {
+                        let rows = secret_rows(&entries);
+                        // find 而不是直接 entries[i]：rows 是 entries 过滤掉不需要密钥
+                        // 的行之后的结果，下标不对应；按名字在 entries 里找回
+                        // 完整的那一条，才拿得到 label/secret 提示。
+                        let target = state
+                            .selected()
+                            .and_then(|i| rows.get(i))
+                            .and_then(|(name, _)| entries.iter().find(|e| &e.name == name));
+                        view = match target {
+                            Some(e) => View::EnterSecret {
+                                profile: e.name.clone(),
+                                label: e.label.clone(),
+                                // 这一页只列了 secret.is_some() 的行（见 secret_rows），
+                                // 所以这里的 unwrap_or 只是跟 AskSecret 那条路径的兜底
+                                // 手法保持一致，实际不会被这个默认值命中。
+                                prompt: e.secret.clone().unwrap_or(SecretPrompt {
+                                    hint: String::new(),
+                                    url: None,
+                                }),
+                                buf: String::new(),
+                                phase: SecretPhase::Typing,
+                                // 从设置页进来，改完要回设置页
+                                return_to_settings: true,
+                            },
+                            None => View::Secrets { entries, state },
+                        };
+                    }
+                    KeyCode::Char('d') => {
+                        let rows = secret_rows(&entries);
+                        let target = state.selected().and_then(|i| rows.get(i)).cloned();
+                        view = match target {
+                            // 没配过的密钥没什么可删的——照样发一次 DeleteSecret
+                            // 只会得到一句空洞的「已删除」，用户会怀疑自己是不是
+                            // 删错了别的东西。
+                            Some((_, false)) => {
+                                message = "这个还没配密钥，没什么可删的".into();
+                                View::Secrets { entries, state }
+                            }
+                            Some((name, true)) => {
+                                match client.call(Request::DeleteSecret {
+                                    profile: name.clone(),
+                                }) {
+                                    Ok(Response::Ok) => {
+                                        message = format!(
+                                            "已删除 {} 的密钥",
+                                            entries
+                                                .iter()
+                                                .find(|e| e.name == name)
+                                                .map(|e| e.label.clone())
+                                                .unwrap_or(name.clone())
+                                        )
+                                        .into();
+                                        refetch_secrets(&mut client, Some(&name))
+                                    }
+                                    Ok(Response::Error(e)) => {
+                                        message = Msg::err(e);
+                                        View::Secrets { entries, state }
+                                    }
+                                    _ => {
+                                        message = Msg::err("密钥没删掉，再试一次".into());
+                                        View::Secrets { entries, state }
+                                    }
+                                }
+                            }
+                            None => View::Secrets { entries, state },
+                        };
+                    }
+                    _ => view = View::Secrets { entries, state },
                 },
             }
         }
@@ -1006,6 +1155,34 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
             };
         }
 
+        // 同样的空壳套路用在 Secrets 上：EnterSecret 的 Esc/Ctrl+Q 从设置页
+        // 那条分支进来时、以及验证成功后回设置页时，都是先甩一个空壳占位，
+        // 这里补一次 Profiles 把数据填上。`Secrets` 没有 `warning` 字段
+        // （跟 `PickProfile` 不一样，见它的字段注释——密钥页的错误反馈走的
+        // 是 `message`），拉取失败就直接退回看板并把原因放进 `message`，
+        // 总比让用户卡在一屏永远拉不出数据的空列表上强。
+        let needs_secrets_refetch =
+            matches!(&view, View::Secrets { entries, .. } if entries.is_empty());
+        if needs_secrets_refetch {
+            view = match client.call(Request::Profiles) {
+                Ok(Response::Profiles { entries, .. }) => {
+                    let mut state = ListState::default();
+                    if !secret_rows(&entries).is_empty() {
+                        state.select(Some(0));
+                    }
+                    View::Secrets { entries, state }
+                }
+                Ok(Response::Error(e)) => {
+                    message = Msg::err(e);
+                    View::Board
+                }
+                _ => {
+                    message = Msg::err("拿不到密钥列表".into());
+                    View::Board
+                }
+            };
+        }
+
         // 视图变了就把上一屏的残留消息清掉，好让「按视图给提示」的 idle_help
         // 露出来；除非这条消息本身就是这次切换的操作结果（见函数注释）。
         let view_changed = std::mem::discriminant(&view) != view_kind_before;
@@ -1031,13 +1208,15 @@ fn is_ctrl_q(key: &KeyEvent) -> bool {
 ///
 /// 抽成纯函数是为了能单测——`run()` 的按键循环要连真 socket，测不了。
 ///
-/// `EnterSecret` 退回的是 `PickProfile` 而不是看板——用户很可能只是选错了
-/// agent，回选择器比回看板更顺手。但这里是个纯函数，拿不到 daemon 连接，
-/// 现查不出一份新的条目列表，只能给一个 `entries: vec![]` 的空壳。
+/// `EnterSecret` 退回哪一层要看 `return_to_settings`：从密钥设置页进来的
+/// 回设置页（用户在管理配置），从选择器进来的回选择器（用户很可能只是
+/// 选错了 agent，回选择器比回看板更顺手）。但这里是个纯函数，拿不到 daemon
+/// 连接，现查不出一份新的条目列表，只能给一个 `entries: vec![]` 的空壳。
 /// **调用方必须知道这个约定**：`run()` 的按键循环里，只要处理完一次按键后
-/// 发现 `view` 变成了空的 `PickProfile`（不管是走这个函数的 Ctrl+Q，还是
-/// `EnterSecret` 自己的 Esc 分支），就要补一次 `Request::Profiles` 把条目
-/// 填上——不然用户看到的是一屏空白，会以为自己一个 agent 都没有。
+/// 发现 `view` 变成了空的 `PickProfile`/`Secrets`（不管是走这个函数的
+/// Ctrl+Q，还是 `EnterSecret` 自己的 Esc 分支），就要补一次
+/// `Request::Profiles` 把条目填上——不然用户看到的是一屏空白，会以为自己
+/// 一个 agent/密钥都没有。
 fn back_one_level(view: View) -> Option<View> {
     match view {
         View::Board => None,
@@ -1052,11 +1231,20 @@ fn back_one_level(view: View) -> Option<View> {
             state,
             typing_path: None,
         }),
+        View::EnterSecret {
+            return_to_settings: true,
+            ..
+        } => Some(View::Secrets {
+            entries: Vec::new(),
+            state: ListState::default(),
+        }),
         View::EnterSecret { .. } => Some(View::PickProfile {
             entries: Vec::new(),
             state: ListState::default(),
             warning: None,
         }),
+        // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
+        // 退一层就是看板。
         _ => Some(View::Board),
     }
 }
@@ -1103,6 +1291,23 @@ pub fn pick_action(e: &ProfileEntry) -> PickAction {
             None => PickAction::Blocked(format!("本机没有找到 {command}")),
         },
     }
+}
+
+/// 密钥设置页要列哪些行：只列声明了密钥的 profile——`claude`/`codex`/`命令行`
+/// 这种不需要密钥的东西出现在这一页只会让用户以为自己也得配点什么。
+///
+/// 「已配」读的是 `has_secret`，不是拿 `status != NeedsSecret` 反推。后者
+/// 有个边界：`status_of` 里「装没装排在密钥前面」（见 profile.rs），一个
+/// CLI 还没装的 profile，不管密钥填没填，`status` 都会报
+/// `NeedsDependency`/`NotInstalled`，从它反推不出真实的密钥状态。
+/// `has_secret` 是 daemon 直接从密钥仓查出来的事实，不掺这层判断，
+/// 这也是为什么它作为独立字段搭在 `ProfileEntry` 上而不是从 `status` 算出来。
+pub fn secret_rows(entries: &[ProfileEntry]) -> Vec<(String, bool)> {
+    entries
+        .iter()
+        .filter(|e| e.secret.is_some())
+        .map(|e| (e.name.clone(), e.has_secret))
+        .collect()
 }
 
 /// `n` 该直接开哪个 agent。`None` = 没得直开，进选择器。
@@ -1362,6 +1567,35 @@ fn act(
     }
 }
 
+/// 密钥页要展示的数据总在变——改完一条、删完一条都要照一份新的 `has_secret`
+/// 才对得上。改/删/刚打开页面这三个调用点都要拉同一份数据，区别只在光标
+/// 该落在哪：`focus` 给了 profile 名字就尽量把光标定在它原来那一行上
+/// （删完/改完还盯着同一个 profile，比每次都弹回第一行顺手），不给就落在
+/// 第一行（刚打开页面，没有"原来"）。
+///
+/// 拉取失败时退化成一个空 `entries` 的壳——同 `back_one_level` 对
+/// `PickProfile`/`Secrets` 的约定：循环收尾那段通用重拉逻辑看到空壳会自己
+/// 再补一次，这里不需要重复一份「失败了怎么办」的判断。
+fn refetch_secrets(client: &mut Client, focus: Option<&str>) -> View {
+    match client.call(Request::Profiles) {
+        Ok(Response::Profiles { entries, .. }) => {
+            let rows = secret_rows(&entries);
+            let mut state = ListState::default();
+            if !rows.is_empty() {
+                let idx = focus
+                    .and_then(|name| rows.iter().position(|(n, _)| n == name))
+                    .unwrap_or(0);
+                state.select(Some(idx));
+            }
+            View::Secrets { entries, state }
+        }
+        _ => View::Secrets {
+            entries: Vec::new(),
+            state: ListState::default(),
+        },
+    }
+}
+
 /// 视图切换后，底部消息该不该清掉。抽成纯函数是因为 `run()` 的按键循环里有
 /// 十几处给 `message` 赋值，没法在每处都补一行清空逻辑——漏一处就会有一个
 /// 视图继续顶着上一屏的残留话术（比如看板「已开会话 3」被 `Enter` 带进会话
@@ -1397,7 +1631,13 @@ fn escape_hint(view: &View) -> &'static str {
             typing_path: Some(_),
             ..
         } => "Ctrl+Q 回列表",
-        // 跟 back_one_level 保持一致：退出填密钥回的是选择器，不是看板
+        // 跟 back_one_level 保持一致：从密钥设置页进来的填密钥，退出回设置页，
+        // 不是选择器，也不是看板——三条路各回各的，文案不能含糊成一句话。
+        View::EnterSecret {
+            return_to_settings: true,
+            ..
+        } => "Ctrl+Q 回设置",
+        // 从选择器进来的填密钥，退出回的是选择器，不是看板
         View::EnterSecret { .. } => "Ctrl+Q 回列表",
         _ => "Ctrl+Q 回看板",
     }
@@ -1416,14 +1656,24 @@ fn idle_help(view: &View) -> &'static str {
             ..
         } => "输入路径后 Enter 确认，Esc 返回列表",
         View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
-        View::Board => "n 新建  N 换 agent  p 换项目  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动",
+        View::Board => {
+            "n 新建  N 换 agent  p 换项目  c 密钥  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
+        }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
         View::EnterSecret {
             phase: SecretPhase::Verifying,
             ..
         } => "正在验证，请稍候　Esc 可取消",
+        // 跟 escape_hint 一样要分 return_to_settings：从设置页进来的 Esc
+        // 回设置页，不是「列表」——两处文案哪怕只有半句话不一致，都是
+        // 「底栏说什么就得真能做到什么」这条原则被破坏了一半。
+        View::EnterSecret {
+            return_to_settings: true,
+            ..
+        } => "粘贴或输入密钥　Enter 确认　Esc 返回设置",
         View::EnterSecret { .. } => "粘贴或输入密钥　Enter 确认　Esc 返回列表",
+        View::Secrets { .. } => "↑↓ 选  Enter 改  d 删  Esc 返回",
     }
 }
 
@@ -1715,6 +1965,45 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                     .highlight_symbol("▶ "),
                 chunks[0],
                 st,
+            );
+        }
+        View::Secrets { entries, state } => {
+            let rows = secret_rows(entries);
+            let items: Vec<ListItem> = rows
+                .iter()
+                .map(|(name, configured)| {
+                    // 按名字回 entries 里找 label：rows 只是「名字 + 配没配」
+                    // 这两列的投影，界面上要给用户看的是人话名字，不是内部标识。
+                    let label = entries
+                        .iter()
+                        .find(|e| &e.name == name)
+                        .map(|e| e.label.clone())
+                        .unwrap_or_else(|| name.clone());
+                    ListItem::new(Line::from(vec![
+                        Span::raw(pad_to(&truncate(&label, 14), 14)),
+                        Span::styled(
+                            if *configured { "已配" } else { "未配" },
+                            Style::default().fg(if *configured {
+                                Color::Green
+                            } else {
+                                Color::DarkGray
+                            }),
+                        ),
+                    ]))
+                })
+                .collect();
+            let mut s = state.clone();
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(border_style)
+                            .title("密钥设置"),
+                    )
+                    .highlight_symbol("▶ "),
+                chunks[0],
+                &mut s,
             );
         }
     }
@@ -2074,6 +2363,7 @@ mod tests {
                 status: ProfileStatus::Ready,
                 secret: None,
                 install: None,
+                has_secret: false,
             },
             ProfileEntry {
                 name: "kimi".into(),
@@ -2082,6 +2372,7 @@ mod tests {
                 status: ProfileStatus::NeedsSecret,
                 secret: None,
                 install: None,
+                has_secret: false,
             },
             ProfileEntry {
                 name: "glm".into(),
@@ -2092,6 +2383,7 @@ mod tests {
                 },
                 secret: None,
                 install: None,
+                has_secret: false,
             },
             ProfileEntry {
                 name: "codex".into(),
@@ -2110,6 +2402,7 @@ mod tests {
                     ],
                     note: String::new(),
                 }),
+                has_secret: false,
             },
         ];
         term.draw(|f| {
@@ -2185,6 +2478,7 @@ mod tests {
                             },
                             buf: "sk-abc123".into(),
                             phase,
+                            return_to_settings: false,
                         },
                         sessions: &sessions,
                         st: &mut st,
@@ -2221,6 +2515,7 @@ mod tests {
                         },
                         buf: "x".repeat(200),
                         phase: SecretPhase::Typing,
+                        return_to_settings: false,
                     },
                     sessions: &[],
                     st: &mut st,
@@ -2798,10 +3093,24 @@ mod tests {
             name: name.into(),
             label: name.into(),
             note: String::new(),
+            has_secret: status != ProfileStatus::NeedsSecret,
             status,
             secret: None,
             install: None,
         }
+    }
+
+    /// 给一个 entry 挂上密钥提示——`secret_rows` 只列 `secret.is_some()` 的
+    /// 行，光靠 `status` 不够，得真的声明了密钥这件事才会出现在密钥页上。
+    /// `has_secret` 不在这里动，沿用 `entry()` 按 `status` 给的默认值——
+    /// 两个测试用例恰好落在 `has_secret` 跟 `status` 一致的那一半（见
+    /// `secret_rows` 的注释里 `NeedsDependency`/`NotInstalled` 那个反例）。
+    fn with_secret(mut e: ProfileEntry) -> ProfileEntry {
+        e.secret = Some(SecretPrompt {
+            hint: String::new(),
+            url: None,
+        });
+        e
     }
 
     #[test]
@@ -2943,6 +3252,13 @@ mod tests {
         assert!(help.contains("N 换 agent"));
     }
 
+    // ———— Task 13：密钥设置页 ————
+
+    #[test]
+    fn board_help_mentions_the_settings_key() {
+        assert!(idle_help(&View::Board).contains("c 密钥"));
+    }
+
     #[test]
     fn digit_keys_still_pick_the_first_nine() {
         // 数字保留是因为快；置灰项也占编号——编号跳号比编号漂移更难受
@@ -2970,6 +3286,17 @@ mod tests {
                 entries: vec![],
                 state: ListState::default(),
                 warning: None,
+            }),
+            Some(View::Board)
+        ));
+    }
+
+    #[test]
+    fn secrets_view_escapes_to_the_board() {
+        assert!(matches!(
+            back_one_level(View::Secrets {
+                entries: vec![],
+                state: ListState::default(),
             }),
             Some(View::Board)
         ));
@@ -3033,6 +3360,7 @@ mod tests {
             },
             buf: String::new(),
             phase: SecretPhase::Typing,
+            return_to_settings: false,
         });
         assert!(matches!(back, Some(View::PickProfile { .. })));
     }
@@ -3049,7 +3377,162 @@ mod tests {
             },
             buf: String::new(),
             phase: SecretPhase::Typing,
+            return_to_settings: false,
         });
         assert!(h.contains("列表"), "底栏说什么就得真能做到什么：{h}");
+    }
+
+    #[test]
+    fn secret_view_from_settings_escapes_back_to_settings_not_the_picker() {
+        // return_to_settings 是「从哪儿进来的」——从密钥设置页进来的填密钥，
+        // 退出必须回设置页，不能像从选择器进来的那样落回 PickProfile。
+        let back = back_one_level(View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase: SecretPhase::Typing,
+            return_to_settings: true,
+        });
+        assert!(matches!(back, Some(View::Secrets { .. })));
+    }
+
+    #[test]
+    fn secret_view_from_settings_escape_hint_says_back_to_settings() {
+        let h = escape_hint(&View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase: SecretPhase::Typing,
+            return_to_settings: true,
+        });
+        assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+    }
+
+    #[test]
+    fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
+        // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
+        // 一处还说着旧的「列表」。
+        let help = idle_help(&View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase: SecretPhase::Typing,
+            return_to_settings: true,
+        });
+        assert!(
+            help.contains("返回设置"),
+            "底栏说什么就得真能做到什么：{help}"
+        );
+    }
+
+    #[test]
+    fn secret_rows_only_lists_profiles_that_need_a_key() {
+        let entries = vec![
+            entry("claude", ProfileStatus::Ready), // 不需要密钥
+            with_secret(entry("kimi", ProfileStatus::Ready)),
+            with_secret(entry("glm", ProfileStatus::NeedsSecret)),
+        ];
+        let rows = secret_rows(&entries);
+        assert_eq!(rows.len(), 2, "claude 不该出现在密钥页");
+        assert_eq!(rows[0], ("kimi".to_string(), true), "Ready 说明密钥已配");
+        assert_eq!(rows[1], ("glm".to_string(), false));
+    }
+
+    #[test]
+    fn secrets_page_help_lists_its_own_keys() {
+        let help = idle_help(&View::Secrets {
+            entries: vec![],
+            state: ListState::default(),
+        });
+        assert!(help.contains("Enter 改"));
+        assert!(help.contains("d 删"));
+    }
+
+    #[test]
+    fn secrets_view_renders_without_panicking_when_nothing_needs_a_key() {
+        // 边界情况：所有 profile 都不需要密钥（或者用户碰巧只装了这类）。
+        // 空列表不该让渲染 panic，也不该显示成一片空白无提示——至少标题
+        // 「密钥设置」得画出来。
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+        let text_of = |term: &Terminal<TestBackend>| -> String {
+            buffer_text(term.backend().buffer())
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let entries = vec![entry("claude", ProfileStatus::Ready)];
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::Secrets {
+                        entries,
+                        state: ListState::default(),
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(c.contains("密钥设置"));
+    }
+
+    #[test]
+    fn secrets_view_renders_configured_and_unconfigured_rows() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+        let text_of = |term: &Terminal<TestBackend>| -> String {
+            buffer_text(term.backend().buffer())
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let entries = vec![
+            with_secret(entry("kimi", ProfileStatus::Ready)),
+            with_secret(entry("glm", ProfileStatus::NeedsSecret)),
+        ];
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::Secrets { entries, state },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(c.contains("已配"), "配过的那行要显示已配：{c}");
+        assert!(c.contains("未配"), "没配的那行要显示未配：{c}");
     }
 }

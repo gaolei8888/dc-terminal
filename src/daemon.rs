@@ -113,25 +113,28 @@ fn handle(
             }
             let entries = all
                 .iter()
-                .map(|p| ProfileEntry {
-                    name: p.name.clone(),
-                    label: p.display_label(Lang::Zh),
-                    note: p.display_note(Lang::Zh),
-                    status: status_of(
-                        p,
-                        &all,
-                        sec.get(&p.name).is_some(),
-                        &command_exists,
-                        Lang::Zh,
-                    ),
-                    secret: p.secret.as_ref().map(|s| SecretPrompt {
-                        hint: s.hint.get(Lang::Zh).unwrap_or("").to_string(),
-                        url: s.url.clone(),
-                    }),
-                    install: p.install.as_ref().map(|i| InstallPrompt {
-                        command: i.command.clone(),
-                        note: i.note.get(Lang::Zh).unwrap_or("").to_string(),
-                    }),
+                .map(|p| {
+                    // 只查一次，分别喂给 status_of（装没装排在密钥前面，见
+                    // profile.rs 的注释）和 has_secret（密钥页要的是这个事实
+                    // 本身，不能从 status 反推——见 ProfileEntry::has_secret
+                    // 的注释）。两处用同一次查询结果，不会因为中间密钥文件
+                    // 被并发改过而看到两个不一致的答案。
+                    let has_secret = sec.get(&p.name).is_some();
+                    ProfileEntry {
+                        name: p.name.clone(),
+                        label: p.display_label(Lang::Zh),
+                        note: p.display_note(Lang::Zh),
+                        status: status_of(p, &all, has_secret, &command_exists, Lang::Zh),
+                        secret: p.secret.as_ref().map(|s| SecretPrompt {
+                            hint: s.hint.get(Lang::Zh).unwrap_or("").to_string(),
+                            url: s.url.clone(),
+                        }),
+                        install: p.install.as_ref().map(|i| InstallPrompt {
+                            command: i.command.clone(),
+                            note: i.note.get(Lang::Zh).unwrap_or("").to_string(),
+                        }),
+                        has_secret,
+                    }
                 })
                 .collect();
             Ok(Response::Profiles {

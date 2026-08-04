@@ -30,6 +30,7 @@ Running `dct` opens the board — one line per session, with what each agent is 
 | `n` | Start a new session with the agent you used last time (no menu) |
 | `N` | Start a new session and pick which agent |
 | `p` | Switch project — which directory the next session opens in |
+| `c` | Manage keys — change or delete a saved one |
 | `↑` `↓` | Move between sessions |
 | `Enter` | Open a session; `F2` gets you back to the board |
 | `u` | Undo — roll back to the last checkpoint |
@@ -63,6 +64,8 @@ The last four aren't separate programs. They run `claude` pointed at that vendor
 **No key yet?** Pick it anyway. You get a box to paste the key into, with a link to the page where you get one — press `Ctrl+O` to open that page in your browser. The key is checked before it's saved, so a bad paste is caught right there instead of turning into a wall of English errors ten seconds later.
 
 Keys are stored in `~/.dct/secrets.toml`, owner-readable only. They are never written into profile files, so those stay safe to copy and share.
+
+**Changed your mind, or a key stopped working?** Press `c` on the board. It lists only the agents that actually need a key, with each one marked configured or not — pick one and `Enter` to replace it, or `d` to delete it. This is the only place you should ever touch a saved key; editing `secrets.toml` by hand isn't necessary and isn't supported.
 
 ## Adding your own agent
 
