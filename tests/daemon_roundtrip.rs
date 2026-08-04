@@ -1,35 +1,19 @@
-use std::path::PathBuf;
-use std::thread::sleep;
-use std::time::Duration;
-
-use dct::client::Client;
 use dct::proto::{Request, Response};
+
+mod common;
 
 #[test]
 fn daemon_serves_create_list_and_stop() {
-    let dir = tempfile::tempdir().unwrap();
-    let sock: PathBuf = dir.path().join("d.sock");
-
-    let s = sock.clone();
-    std::thread::spawn(move || {
-        dct::daemon::run(&s).unwrap();
-    });
-
-    // 等 socket 出现
-    for _ in 0..50 {
-        if sock.exists() {
-            break;
-        }
-        sleep(Duration::from_millis(50));
-    }
+    let h = common::start_daemon();
 
     let workdir = tempfile::tempdir().unwrap();
-    let mut c = Client::connect(&sock).unwrap();
+    let mut c = h.client();
 
     let resp = c
         .call(Request::Create {
             dir: workdir.path().display().to_string(),
             profile: "shell".into(),
+            remember: true,
         })
         .unwrap();
     let id = match resp {
@@ -54,20 +38,8 @@ fn daemon_serves_create_list_and_stop() {
 
 #[test]
 fn unknown_session_returns_error_not_panic() {
-    let dir = tempfile::tempdir().unwrap();
-    let sock: PathBuf = dir.path().join("e.sock");
-    let s = sock.clone();
-    std::thread::spawn(move || {
-        dct::daemon::run(&s).unwrap();
-    });
-    for _ in 0..50 {
-        if sock.exists() {
-            break;
-        }
-        sleep(Duration::from_millis(50));
-    }
-
-    let mut c = Client::connect(&sock).unwrap();
+    let h = common::start_daemon();
+    let mut c = h.client();
     match c.call(Request::Stop { id: 999 }).unwrap() {
         Response::Error(msg) => assert!(msg.contains("没有这个会话")),
         other => panic!("预期 Error，实际 {other:?}"),

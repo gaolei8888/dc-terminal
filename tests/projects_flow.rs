@@ -1,25 +1,9 @@
-use std::path::Path;
-use std::thread::sleep;
-use std::time::Duration;
-
 use dct::client::Client;
 use dct::proto::{Request, Response};
 
-fn start_daemon(sock: &Path) {
-    let s = sock.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = dct::daemon::run(&s);
-    });
-    for _ in 0..50 {
-        if sock.exists() {
-            return;
-        }
-        sleep(Duration::from_millis(50));
-    }
-    panic!("守护进程没起来：{}", sock.display());
-}
+mod common;
 
-fn canon(p: &Path) -> String {
+fn canon(p: &std::path::Path) -> String {
     std::fs::canonicalize(p).unwrap().display().to_string()
 }
 
@@ -32,13 +16,11 @@ fn projects(c: &mut Client) -> Vec<String> {
 
 #[test]
 fn create_records_project_most_recent_first() {
-    let home = tempfile::tempdir().unwrap();
-    let sock = home.path().join("daemon.sock");
-    start_daemon(&sock);
+    let h = common::start_daemon();
 
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
-    let mut c = Client::connect(&sock).unwrap();
+    let mut c = h.client();
 
     // shell profile 不要求 git 仓库，普通临时目录就够
     for d in [a.path(), b.path()] {
@@ -46,6 +28,7 @@ fn create_records_project_most_recent_first() {
             .call(Request::Create {
                 dir: d.display().to_string(),
                 profile: "shell".into(),
+                remember: true,
             })
             .unwrap()
         {
@@ -63,16 +46,15 @@ fn create_records_project_most_recent_first() {
 
 #[test]
 fn failed_create_is_not_recorded() {
-    let home = tempfile::tempdir().unwrap();
-    let sock = home.path().join("daemon.sock");
-    start_daemon(&sock);
+    let h = common::start_daemon();
 
-    let mut c = Client::connect(&sock).unwrap();
+    let mut c = h.client();
     let missing = "/tmp/dct-这个目录不存在-9f3a2b";
     match c
         .call(Request::Create {
             dir: missing.into(),
             profile: "shell".into(),
+            remember: true,
         })
         .unwrap()
     {
@@ -85,10 +67,8 @@ fn failed_create_is_not_recorded() {
 
 #[test]
 fn projects_is_empty_on_a_fresh_daemon() {
-    let home = tempfile::tempdir().unwrap();
-    let sock = home.path().join("daemon.sock");
-    start_daemon(&sock);
+    let h = common::start_daemon();
 
-    let mut c = Client::connect(&sock).unwrap();
+    let mut c = h.client();
     assert!(projects(&mut c).is_empty(), "全新守护进程的列表应为空");
 }
