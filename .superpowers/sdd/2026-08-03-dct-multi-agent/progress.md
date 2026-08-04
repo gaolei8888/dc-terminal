@@ -41,3 +41,6 @@ Task 11: minor (deferred): 空 PickProfile 的集中重取没有自动化回归�
 Task 11: minor (deferred): Request::Profiles 持续失败时重取没有退避；沿用仓库既有模式，用户仍可 Ctrl+Q 脱身
 Task 11: minor (deferred): SetSecret / Create 的 Response::Error 原文直接进 Failed(e) 给用户看，没有净化；沿用既有模式
 Task 11: 注意 src/ui.rs 已 2948 行（本任务 +511），视图状态机 / 事件循环 / 纯函数 / draw / 90+ 内联测试全在一个文件；累积债务，留给最终评审判断
+Task 12: complete (commits 3c13825..a771e45, review clean)
+Task 12: minor (deferred): quick_start_target 的「非 Ready 就回退」只用 NeedsSecret 测过，NeedsDependency / NotInstalled 没覆盖；判定是整体相等比较，风险低
+Task 12: minor (deferred): Ctrl+N 会落进和裸 n 相同的分支（看板上除 Ctrl+Q / Ctrl+O 外都不检查修饰键）；仓库既有行为，非本任务引入
