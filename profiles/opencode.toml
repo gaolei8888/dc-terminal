@@ -1,0 +1,16 @@
+name = "opencode"
+command = ["opencode"]
+is_agent = true
+# TUI 没实测过，不填 pattern —— 状态显示「—」比编一个假状态好
+
+[label]
+zh = "OpenCode"
+
+[note]
+zh = "开源，可接多种模型"
+
+[install]
+command = ["npm", "i", "-g", "opencode-ai"]
+
+[install.note]
+zh = "需要先装 Node.js"

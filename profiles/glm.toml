@@ -1,0 +1,23 @@
+name = "glm"
+command = ["claude", "--dangerously-skip-permissions"]
+is_agent = true
+idle_pattern = "\\? for shortcuts"
+
+[label]
+zh = "GLM"
+
+[note]
+zh = "智谱，套用 Claude 界面"
+
+[env]
+ANTHROPIC_BASE_URL = "https://open.bigmodel.cn/api/anthropic"
+
+[secret]
+env = "ANTHROPIC_AUTH_TOKEN"
+url = "https://open.bigmodel.cn/usercenter/apikeys"
+
+[secret.hint]
+zh = "在 open.bigmodel.cn 的用户中心复制 API Key"
+
+[secret.verify]
+url = "https://open.bigmodel.cn/api/anthropic/v1/messages"

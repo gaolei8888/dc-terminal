@@ -1,0 +1,18 @@
+name = "codex"
+command = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+is_agent = true
+# 实测自 codex v0.146.0：干活时底部一定有「(12s • esc to interrupt)」。
+# 空闲时只有输入框占位符，用户一打字就没了，不能拿来当 idle_pattern。
+busy_pattern = "esc to interrupt"
+
+[label]
+zh = "Codex"
+
+[note]
+zh = "OpenAI 官方"
+
+[install]
+command = ["npm", "i", "-g", "@openai/codex"]
+
+[install.note]
+zh = "需要先装 Node.js"

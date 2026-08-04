@@ -81,6 +81,13 @@ pub struct Profile {
 }
 
 const CLAUDE: &str = include_str!("../profiles/claude.toml");
+const CODEX: &str = include_str!("../profiles/codex.toml");
+const OPENCODE: &str = include_str!("../profiles/opencode.toml");
+const QWEN: &str = include_str!("../profiles/qwen.toml");
+const KIMI: &str = include_str!("../profiles/kimi.toml");
+const GLM: &str = include_str!("../profiles/glm.toml");
+const DEEPSEEK: &str = include_str!("../profiles/deepseek.toml");
+const QWEN_API: &str = include_str!("../profiles/qwen-api.toml");
 const SHELL: &str = include_str!("../profiles/shell.toml");
 
 impl Profile {
@@ -91,14 +98,32 @@ impl Profile {
     pub fn builtin(name: &str) -> Option<Profile> {
         let src = match name {
             "claude" => CLAUDE,
+            "codex" => CODEX,
+            "opencode" => OPENCODE,
+            "qwen" => QWEN,
+            "kimi" => KIMI,
+            "glm" => GLM,
+            "deepseek" => DEEPSEEK,
+            "qwen-api" => QWEN_API,
             "shell" => SHELL,
             _ => return None,
         };
         Some(Profile::from_toml(src).expect("内置 profile 必须能解析"))
     }
 
+    /// 返回顺序就是菜单顺序：先独立 CLI，再 API 形态，命令行垫底。
+    /// 命令行放最后是因为它对目标用户价值最低——非程序员不需要裸终端。
     pub fn builtin_names() -> Vec<&'static str> {
-        vec!["claude", "shell"]
+        vec![
+            "claude", "codex", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api", "shell",
+        ]
+    }
+
+    pub fn builtins() -> Vec<Profile> {
+        Profile::builtin_names()
+            .into_iter()
+            .filter_map(Profile::builtin)
+            .collect()
     }
 
     pub fn idle_regex(&self) -> Result<Option<regex::Regex>> {
@@ -172,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_names_lists_both() {
+    fn builtin_names_includes_claude_and_shell() {
         let names = Profile::builtin_names();
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"shell"));
@@ -303,5 +328,77 @@ mod tests {
         )
         .unwrap();
         assert!(p.busy_regex().is_err(), "非法正则要报错，不能静默当没有");
+    }
+
+    #[test]
+    fn every_builtin_parses_and_is_well_formed() {
+        for name in Profile::builtin_names() {
+            let p = Profile::builtin(name).unwrap_or_else(|| panic!("{name} 应当是内置 profile"));
+            assert_eq!(p.name, name, "{name}: 文件里的 name 必须和清单一致");
+            assert!(!p.command.is_empty(), "{name}: command 不能为空");
+            assert!(
+                p.label.get(Lang::Zh).is_some(),
+                "{name}: 必须有中文 label，九个选项摆在非程序员面前没说明等于没得选"
+            );
+            // 正则必须能编译，否则一到 tick 就报错
+            p.idle_regex().unwrap();
+            p.busy_regex().unwrap();
+        }
+    }
+
+    #[test]
+    fn builtin_names_are_in_menu_order() {
+        assert_eq!(
+            Profile::builtin_names(),
+            vec![
+                "claude", "codex", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api",
+                "shell",
+            ]
+        );
+    }
+
+    #[test]
+    fn api_shaped_profiles_run_claude_and_need_a_secret() {
+        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.command[0], "claude", "{name}: API 形态跑的是 claude");
+            assert!(
+                p.env.contains_key("ANTHROPIC_BASE_URL"),
+                "{name}: 要换 base_url"
+            );
+            let s = p
+                .secret
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: 要声明密钥"));
+            assert_eq!(s.env, "ANTHROPIC_AUTH_TOKEN");
+            assert!(s.verify.is_some(), "{name}: 要能验证密钥");
+        }
+    }
+
+    #[test]
+    fn codex_detects_busy_not_idle() {
+        // codex 空闲时屏幕上没有稳定的固定串，干活时一定有 esc to interrupt。
+        // 实测自 codex v0.146.0。
+        let p = Profile::builtin("codex").unwrap();
+        assert!(p.busy_pattern.is_some());
+        assert!(p.idle_pattern.is_none());
+        assert!(p
+            .busy_regex()
+            .unwrap()
+            .unwrap()
+            .is_match("(12s • esc to interrupt)"));
+    }
+
+    #[test]
+    fn unverified_profiles_have_no_pattern() {
+        // opencode / qwen 的 TUI 没实测过。宁可状态显示「—」，不能瞎猜一个 pattern
+        // 然后在看板上编状态。
+        for name in ["opencode", "qwen"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.idle_pattern.is_none() && p.busy_pattern.is_none(),
+                "{name}: 没实测就别填 pattern"
+            );
+        }
     }
 }
