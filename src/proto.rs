@@ -42,6 +42,14 @@ pub struct ProfileEntry {
     pub has_secret: bool,
 }
 
+/// 九宫格一格的内容。跟 `Response::Screen` 不同，不带光标——
+/// 只读的格子画光标只会误导人去打字。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenEntry {
+    pub id: u32,
+    pub lines: Vec<Vec<ScreenSpan>>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     List,
@@ -59,6 +67,11 @@ pub enum Request {
     },
     Screen {
         id: u32,
+    },
+    /// 一次取多个会话的屏幕。九宫格九个格子要是一个个问，
+    /// 一问一答的串行连接上就是九个来回。
+    Screens {
+        ids: Vec<u32>,
     },
     Resize {
         id: u32,
@@ -117,6 +130,7 @@ impl std::fmt::Debug for Request {
                 .field("text", text)
                 .finish(),
             Request::Screen { id } => f.debug_struct("Screen").field("id", id).finish(),
+            Request::Screens { ids } => f.debug_struct("Screens").field("ids", ids).finish(),
             Request::Resize { id, rows, cols } => f
                 .debug_struct("Resize")
                 .field("id", id)
@@ -156,6 +170,9 @@ pub enum Response {
     Screen {
         lines: Vec<Vec<ScreenSpan>>,
         cursor: (u16, u16),
+    },
+    Screens {
+        screens: Vec<ScreenEntry>,
     },
     Diff(Vec<FileStat>),
     Profiles {
@@ -205,5 +222,40 @@ mod tests {
             "密钥不能出现在 Debug 输出里：{s}"
         );
         assert!(s.contains("glm"), "profile 名字留着帮排查：{s}");
+    }
+
+    #[test]
+    fn screens_request_round_trips() {
+        let req = Request::Screens { ids: vec![1, 3, 7] };
+        let s = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&s).unwrap();
+        match back {
+            Request::Screens { ids } => assert_eq!(ids, vec![1, 3, 7]),
+            other => panic!("解回来不是 Screens：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn screens_response_round_trips() {
+        use crate::pty::{ScreenSpan, ScreenStyle};
+        let resp = Response::Screens {
+            screens: vec![ScreenEntry {
+                id: 4,
+                lines: vec![vec![ScreenSpan {
+                    text: "干活中".into(),
+                    style: ScreenStyle::default(),
+                }]],
+            }],
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&s).unwrap();
+        match back {
+            Response::Screens { screens } => {
+                assert_eq!(screens.len(), 1);
+                assert_eq!(screens[0].id, 4);
+                assert_eq!(screens[0].lines[0][0].text, "干活中");
+            }
+            other => panic!("解回来不是 Screens：{other:?}"),
+        }
     }
 }

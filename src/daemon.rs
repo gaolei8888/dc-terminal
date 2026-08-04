@@ -187,6 +187,7 @@ fn handle(
         Request::Screen { id } => mgr
             .screen(id)
             .map(|(lines, cursor)| Response::Screen { lines, cursor }),
+        Request::Screens { .. } => Err(anyhow::anyhow!("Screens not yet implemented")),
         Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
