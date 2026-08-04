@@ -2039,6 +2039,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
             prompt,
             buf,
             phase,
+            return_to_settings,
             ..
         } => {
             let mut lines: Vec<Line> = Vec::new();
@@ -2070,12 +2071,22 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                     Style::default().fg(Color::DarkGray),
                 )));
             }
+            // IMPORTANT 3（最终整分支 code review）：Task 13 把「回哪」这句话
+            // 在 `escape_hint`/`idle_help` 上按 `return_to_settings` 分了岔，
+            // 唯独漏了这个标题——它照旧硬编码「回列表」，跟低一行的底栏
+            // 「Esc 回设置」当场自相矛盾，而标题字号更大，用户会先信错的
+            // 那句。这里补上同样的分支，别让第三处文案再单独漂移。
+            let title = if *return_to_settings {
+                format!("填 {label} 的密钥（Enter 确认，Esc 返回设置）")
+            } else {
+                format!("填 {label} 的密钥（Enter 确认，Esc 返回列表）")
+            };
             f.render_widget(
                 Paragraph::new(lines).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(border_style)
-                        .title(format!("填 {label} 的密钥（Enter 确认，Esc 返回列表）")),
+                        .title(title),
                 ),
                 chunks[0],
             );
@@ -2758,6 +2769,103 @@ mod tests {
             )
         })
         .unwrap();
+    }
+
+    /// MINOR 7（最终整分支 code review）：`draw_does_not_panic_for_all_views`
+    /// 拿 `"sk-abc123"` 渲染过填密钥的三个阶段，但只断言了不 panic——真正
+    /// 要守住的那一行（`"•".repeat(...)`）没人盯着。这条测试直接确认明文
+    /// 不会出现在屏幕上，把这条这个分支上最要紧的安全属性变成一个真正的
+    /// 回归测试，而不是"看代码觉得应该没问题"。
+    #[test]
+    fn secret_view_masks_the_key_on_screen() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::EnterSecret {
+                        profile: "kimi".into(),
+                        label: "Kimi".into(),
+                        prompt: SecretPrompt {
+                            hint: String::new(),
+                            url: None,
+                        },
+                        buf: "sk-abc123".into(),
+                        phase: SecretPhase::Typing,
+                        return_to_settings: false,
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp",
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            !buffer_text(term.backend().buffer()).contains("sk-abc123"),
+            "密钥不能以明文出现在屏幕上"
+        );
+    }
+
+    /// IMPORTANT 3（最终整分支 code review）：Task 13 把「Esc 回哪」这句话
+    /// 按 `return_to_settings` 分了岔，但只改了 `escape_hint`/`idle_help`
+    /// 两处，标题（画面里字号最大的那句话）被漏掉了，硬编码成「回列表」，
+    /// 从设置页进来的这一屏会同时印着「回列表」（标题）和「回设置」
+    /// （底栏）——两句自相矛盾。两种来源各画一遍，断言画面上只出现跟
+    /// 这次来源匹配的那句话，另一句完全不出现，防止标题再单独漂移一次。
+    #[test]
+    fn secret_view_title_agrees_with_escape_hint_for_both_origins() {
+        use ratatui::backend::TestBackend;
+
+        let render = |return_to_settings: bool| -> String {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut st = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &mut DrawInput {
+                        view: &View::EnterSecret {
+                            profile: "kimi".into(),
+                            label: "Kimi".into(),
+                            prompt: SecretPrompt {
+                                hint: String::new(),
+                                url: None,
+                            },
+                            buf: String::new(),
+                            phase: SecretPhase::Typing,
+                            return_to_settings,
+                        },
+                        sessions: &[],
+                        st: &mut st,
+                        screen: &[],
+                        cursor: (0, 0),
+                        message: &Msg::from(""),
+                        connected: true,
+                        current: "/tmp",
+                    },
+                )
+            })
+            .unwrap();
+            buffer_text(term.backend().buffer())
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+
+        let from_picker = render(false);
+        assert!(from_picker.contains("返回列表"), "{from_picker}");
+        assert!(!from_picker.contains("返回设置"), "{from_picker}");
+
+        let from_settings = render(true);
+        assert!(from_settings.contains("返回设置"), "{from_settings}");
+        assert!(!from_settings.contains("返回列表"), "{from_settings}");
     }
 
     /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
