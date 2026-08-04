@@ -424,8 +424,13 @@ pub(crate) fn idle_help(view: &View) -> &'static str {
         }
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
         // 跟会话视图不同（那边除了 F2 全转发，列按键表等于教人按错）。
+        //
+        // 跟看板那一句列的是同一批键（它们在两个视图里做的是同一件事），
+        // 只把不一样的两处换掉：选择靠方向键、Enter 是放大而不是进入。
+        // 九宫格独有的两个排在最前——`Ctrl+Q 回列表` 已经常驻左段，
+        // 这里不再重复。
         View::Grid { .. } => {
-            "方向键移动　Enter 放大　F3 下一格　g 回列表　s 停止　u 回滚　d 看改动"
+            "方向键移动  Enter 放大  n 新建  N 换 agent  p 换项目  c 密钥  u 回滚  s 停止  d 改动"
         }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
@@ -541,12 +546,15 @@ mod tests {
         assert_eq!(escape_hint(&View::Grid { focus: 0 }), "Ctrl+Q 回列表");
         let help = idle_help(&View::Grid { focus: 0 });
         for k in [
+            "方向键移动",
             "Enter 放大",
-            "F3",
-            "g 回列表",
-            "s 停止",
+            "n 新建",
+            "N 换 agent",
+            "p 换项目",
+            "c 密钥",
             "u 回滚",
-            "d 看改动",
+            "s 停止",
+            "d 改动",
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }

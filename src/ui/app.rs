@@ -35,6 +35,11 @@ pub struct App {
     // 上一次批量取画面的时刻，用来把九宫格的刷新压到 300ms 一轮。
     // `None` = 还没取过，下一轮立刻取。
     pub grid_last_fetch: Option<std::time::Instant>,
+    // `grid_screens` 装的是哪一页。翻页之后要立刻取一次新页的画面，否则
+    // 新的一页会空白着晾用户小半秒；用「页码变了」这个一次性信号来触发，
+    // 而不是「有哪个格子还没有画面」——后者在会话刚好消失的那一瞬会一直
+    // 为真，把 300ms 的节流整个绕过去，退化成每个 tick 一次阻塞往返。
+    pub grid_page: Option<usize>,
     // 上次告诉 agent 的画面尺寸，变了才发 Resize，避免每帧一次多余请求
     pub sent_size: Option<(u32, u16, u16)>,
     // 连不上守护进程 / 请求失败时置 false，看板上要能看出数据是陈旧的，
@@ -86,6 +91,7 @@ impl App {
             screen_cursor: (0, 0),
             grid_screens: Vec::new(),
             grid_last_fetch: None,
+            grid_page: None,
             sent_size: None,
             // 每轮循环开头的 List 调用是唯一的真相来源，它总在当次
             // term.draw 之前重新算一遍，所以这里给什么都会被立刻覆盖。

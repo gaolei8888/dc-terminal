@@ -147,6 +147,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Char('g') => app.view = View::Board,
+        // 九宫格是看板的另一种画法，不是另一个世界：开会话、换项目、
+        // 管密钥、退出这几个键跟列表里一模一样（共用同一份实现，见
+        // mod.rs 里这几个函数的注释）。用户不该因为切了个视图就得先退
+        // 回去才能新建会话。
+        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('n') | KeyCode::Char('N') => super::open_new_session(app, key.code),
+        KeyCode::Char('p') => super::open_project_picker(app),
+        KeyCode::Char('c') => super::open_secrets(app),
         KeyCode::Enter => {
             if let Some(id) = app.sessions.get(focus).map(|s| s.id) {
                 app.need_sessions = true; // 会话标题要显示项目名
@@ -194,8 +202,10 @@ fn draw_grid(
         return;
     }
     if sessions.is_empty() {
+        // `n` 在九宫格里跟在列表里是同一个键，直接说怎么开，别让用户
+        // 先绕回列表
         f.render_widget(
-            Paragraph::new("还没有会话，按 Ctrl+Q 回列表，再按 n 开一个").centered(),
+            Paragraph::new("还没有会话，按 n 开一个").centered(),
             centered_line(area),
         );
         return;
@@ -207,8 +217,20 @@ fn draw_grid(
     let page_sessions = &sessions[start..(start + TILES_PER_PAGE).min(total)];
     let (rows, cols) = grid_shape(page_sessions.len());
 
+    // 多页时先从底部切一行出来放页码。不切、直接把页码画在 area 右下角的话，
+    // 它会盖在最底下那一排格子的边框上，看起来像边框破了个洞。
+    let pages = page_count(total);
+    let (tiles_area, footer) = if pages > 1 {
+        let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+            .split(area)
+            .to_vec();
+        (parts[0], Some(parts[1]))
+    } else {
+        (area, None)
+    };
+
     let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows as usize])
-        .split(area)
+        .split(tiles_area)
         .to_vec();
     let tile_areas: Vec<Rect> = row_areas
         .iter()
@@ -254,18 +276,12 @@ fn draw_grid(
         }
     }
 
-    // 页码画在右下角，只有多页才画——单页画一个 1/1 纯属噪音
-    let pages = page_count(total);
-    if pages > 1 {
-        let label = format!("{}/{}", page + 1, pages);
-        let w = label.len() as u16; // 纯 ASCII 数字和斜杠，字符数就是列数
-        let corner = Rect {
-            x: area.x + area.width.saturating_sub(w + 1),
-            y: area.y + area.height.saturating_sub(1),
-            width: w,
-            height: 1,
-        };
-        f.render_widget(Paragraph::new(label), corner);
+    // 页码贴在自己那一行的右端，只有多页才画——单页画一个 1/1 纯属噪音
+    if let Some(footer) = footer {
+        f.render_widget(
+            Paragraph::new(format!("{}/{} ", page + 1, pages)).right_aligned(),
+            footer,
+        );
     }
 }
 
@@ -438,13 +454,56 @@ mod tests {
     fn typing_in_a_tile_does_nothing_at_all() {
         // 格子里任何按键都不会送进 agent（设计约束，见 View::Grid 的注释）。
         // 这里能验证的是「什么都没发生」：视图没变，也没冒出一句消息。
+        // 挑的都是九宫格没有绑定的键——绑了的那几个（n/N/p/c/q/s/u/d）
+        // 做的是看板上同名键的那件事，不是「打字」。
         let (mut app, _dir) = App::test_app();
         app.sessions = vec![session(1, SessionState::Idle)];
         app.view = View::Grid { focus: 0 };
-        for c in ['x', '中', 'n'] {
+        for c in ['x', '中', 'z'] {
             handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
             assert!(matches!(app.view, View::Grid { focus: 0 }));
             assert_eq!(app.message.text, "");
+        }
+    }
+
+    #[test]
+    fn q_quits_from_the_grid_just_like_from_the_list() {
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![session(1, SessionState::Idle)];
+        app.view = View::Grid { focus: 0 };
+        handle_key(&mut app, key(KeyCode::Char('q'))).unwrap();
+        assert!(app.quit);
+    }
+
+    /// `n`/`N`/`p`/`c` 在九宫格里跟在列表里必须是同一件事（设计文档的按键表
+    /// 里它们标着「不变」）。四个键实际要开的视图都得先问守护进程要数据，
+    /// 而单测里没有守护进程——所以这里断言的是「两个视图的结果一模一样」：
+    /// 同一句失败提示、都没有把用户甩到别的屏幕上。两边共用同一个函数
+    /// （`open_new_session`/`open_project_picker`/`open_secrets`），拿到数据
+    /// 之后开哪个视图这件事由「共用」本身保证，不会分叉。
+    #[test]
+    fn the_board_keys_behave_identically_in_the_grid() {
+        for c in ['n', 'N', 'p', 'c'] {
+            let (mut on_board, _d1) = App::test_app();
+            on_board.sessions = vec![session(1, SessionState::Idle)];
+            on_board.list_state.select(Some(0));
+            on_board.view = View::Board;
+            super::super::board::handle_key(&mut on_board, key(KeyCode::Char(c))).unwrap();
+
+            let (mut on_grid, _d2) = App::test_app();
+            on_grid.sessions = vec![session(1, SessionState::Idle)];
+            on_grid.view = View::Grid { focus: 0 };
+            handle_key(&mut on_grid, key(KeyCode::Char(c))).unwrap();
+
+            assert_eq!(
+                on_grid.message.text, on_board.message.text,
+                "「{c}」在两个视图里给的反馈必须一样"
+            );
+            assert!(!on_grid.message.text.is_empty(), "失败了要说话：{c}");
+            assert!(
+                matches!(on_grid.view, View::Grid { focus: 0 }),
+                "拿不到数据就留在原地，不能把用户甩到别的屏幕上：{c}"
+            );
         }
     }
 
@@ -614,7 +673,31 @@ mod tests {
             c.contains("还没有会话"),
             "空看板要说话，不能只画一个空框：{c}"
         );
-        assert!(c.contains("n"), "还要说清怎么开一个：{c}");
+        assert!(c.contains("按n开一个"), "n 在这一屏就能按，直接说：{c}");
+        assert!(
+            !c.contains("回列表"),
+            "别让用户先绕回列表——n 在这儿就管用：{c}"
+        );
+    }
+
+    #[test]
+    fn the_page_number_does_not_sit_on_a_tile_border() {
+        use ratatui::backend::TestBackend;
+
+        // 页码原来直接画在 area 右下角，正好压在最底下那排格子的边框上，
+        // 看起来像边框破了个洞。现在先从底部切一行出来给它。
+        let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0))
+            .unwrap();
+
+        let text = buffer_text(term.backend().buffer());
+        let last_row = text.lines().last().unwrap();
+        assert!(last_row.contains("1/2"), "页码就在这一行：{last_row:?}");
+        assert!(
+            !last_row.contains('─') && !last_row.contains('└') && !last_row.contains('│'),
+            "页码那一行不该有任何格子边框：{last_row:?}"
+        );
     }
 
     #[test]

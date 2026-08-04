@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::client::Client;
-use crate::proto::{Request, Response};
+use crate::proto::{ProfileEntry, Request, Response};
 use crate::session::SessionInfo;
 
 mod widgets;
@@ -291,7 +291,8 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
             }
         }
         if let View::Grid { focus } = app.view {
-            let start = grid::page_of(focus) * grid::TILES_PER_PAGE;
+            let page = grid::page_of(focus);
+            let start = page * grid::TILES_PER_PAGE;
             let ids: Vec<u32> = app
                 .sessions
                 .iter()
@@ -300,13 +301,12 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                 .map(|s| s.id)
                 .collect();
             // 300ms 一轮就够：格子是扫一眼的东西，不是打字的地方（附加视图
-            // 的 16ms 是为了跟手，这里没有手要跟）。但刚进九宫格、或者翻页
-            // 之后，手里这批画面根本对不上要显示的格子——那时候不等这 300ms，
-            // 立刻取一次，否则新的一页会空白着晾用户小半秒。
-            let missing = ids
-                .iter()
-                .any(|id| !app.grid_screens.iter().any(|e| e.id == *id));
-            let due = missing
+            // 的 16ms 是为了跟手，这里没有手要跟）。只有「翻了页（或刚进来）」
+            // 才插队立刻取一次——那时候手里这批画面画的是别的会话，等满
+            // 300ms 就是让新的一页空白着晾用户小半秒。这个条件取完就自己
+            // 消掉，绕过节流最多一次。
+            let page_changed = app.grid_page != Some(page);
+            let due = page_changed
                 || app
                     .grid_last_fetch
                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
@@ -328,8 +328,17 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                     }
                     _ => app.connected = false,
                 }
+                app.grid_page = Some(page);
                 app.grid_last_fetch = Some(std::time::Instant::now());
             }
+        } else if !app.grid_screens.is_empty() {
+            // 离开九宫格就把画面扔掉。留着的话，下次再按 g 进来的第一帧画的
+            // 是上一次的旧画面（可能是几分钟前的，甚至是已经没了的会话）。
+            // 收在这里而不是在每个「离开九宫格」的按键分支里各清一次：出口
+            // 有 g、Ctrl+Q、Enter 放大、n/p/c 弹出的那几个视图……漏一个就是
+            // 一帧残影，而这一条判断覆盖了全部。
+            app.grid_screens.clear();
+            app.grid_page = None;
         }
         if let View::Attached(id) = &app.view {
             let id = *id;
@@ -613,6 +622,133 @@ fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
 
 fn move_sel(st: &mut ListState, sessions: &[SessionInfo], delta: i32) {
     move_sel_n(st, sessions.len(), delta);
+}
+
+/// `n`（开上次那个 agent）/ `N`（挑一个 agent）。
+///
+/// 看板和九宫格是同一块看板的两种画法，这四个「开东西」的键
+/// （`n`/`N`/`p`/`c`）在两边必须一模一样，所以整段逻辑只留一份。
+/// `code` 区分大小写 n：小写才去问 daemon 上次记的是哪个 agent。
+pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
+    // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
+    // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
+    // pick_action 和 View::PickProfile 的按键分支。n 和 N 都要这份
+    // 列表——n 拿它判断上次那个 agent 现在还在不在 Ready，N 拿它渲染
+    // 选择器——所以只拉一次，不分两条路各拉各的。
+    match app.client().and_then(|c| c.call(Request::Profiles)) {
+        Ok(Response::Profiles { entries, warning }) => {
+            // 把「拉完列表但没能直开」的三种落点（选择器为空、建会话失败
+            // 两种）收在一处，省得同一段 ListState 初始化抄三遍——那种
+            // 抄法迟早有一份漏了空表守卫。
+            let picker = |entries: Vec<ProfileEntry>, warning: Option<String>| {
+                let mut state = ListState::default();
+                // daemon 目前总是至少返回九个内置 profile，这里空表分支
+                // 基本走不到；但选中一个不存在的下标，按 Enter 就是
+                // entries[0] 越界 panic——这种最坏结果不该只靠"实践中
+                // 到不了"兜底，一行守卫不值钱。
+                if !entries.is_empty() {
+                    state.select(Some(0));
+                }
+                View::PickProfile {
+                    entries,
+                    state,
+                    warning,
+                }
+            };
+            // 大写 N 一定要看一眼选择器，不查上次用的是谁；
+            // 小写 n 才去问 daemon 上次记的是哪个 agent。
+            let last = if code == KeyCode::Char('n') {
+                match app.client().and_then(|c| c.call(Request::LastProfile)) {
+                    Ok(Response::LastProfile(l)) => l,
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match quick_start_target(last.as_deref(), &entries) {
+                Some(name) => {
+                    // 同 View::PickProfile 里 PickAction::Start 那支：
+                    // 「n」等价于「已经替用户选好了上次那个」，建完直接
+                    // 进会话，不用再让他确认一遍。
+                    let dir = app.current_dir.display().to_string();
+                    match app.client().and_then(|c| {
+                        c.call(Request::Create {
+                            dir,
+                            profile: name,
+                            remember: true,
+                        })
+                    }) {
+                        Ok(Response::Created { id }) => {
+                            app.need_sessions = true; // 会话标题要显示项目名
+                            app.view = View::Attached(id);
+                        }
+                        Ok(Response::Error(e)) => {
+                            app.message = Msg::err(e);
+                            app.view = picker(entries, warning);
+                        }
+                        _ => {
+                            app.message = Msg::err("创建失败".into());
+                            app.view = picker(entries, warning);
+                        }
+                    }
+                }
+                None => app.view = picker(entries, warning),
+            }
+        }
+        // 列表都拿不到，直开和选择器都没法走，只能告诉用户这次干瞪眼——
+        // 视图不变，走到循环末尾 message_after_transition 会把这条消息
+        // 原样留住（同其他分支，不用 continue 抢跑跳过收尾）。
+        Ok(Response::Error(e)) => app.message = Msg::err(e),
+        _ => app.message = Msg::err("拿不到 agent 列表".into()),
+    }
+}
+
+/// `p`：换项目。看板和九宫格共用，同 `open_new_session`。
+pub(crate) fn open_project_picker(app: &mut App) {
+    // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
+    // 自己从来没开过项目。
+    match app.client().and_then(|c| c.call(Request::Projects)) {
+        Ok(Response::Projects(mut all)) => {
+            // 全新守护进程列表是空的，补上启动目录，
+            // 保证第一次用也不会看到空列表。
+            let start = app.start_dir.display().to_string();
+            if !all.contains(&start) {
+                all.push(start);
+            }
+            let mut state = ListState::default();
+            state.select(Some(0));
+            app.view = View::PickProject {
+                all,
+                filter: String::new(),
+                state,
+                typing_path: None,
+            };
+        }
+        Ok(Response::Error(e)) => app.message = Msg::err(e),
+        _ => app.message = Msg::err("拿不到项目列表".into()),
+    }
+}
+
+/// `c`：密钥设置页。看板和九宫格共用，同 `open_new_session`。
+pub(crate) fn open_secrets(app: &mut App) {
+    // 拿不到列表就不进设置页：留在原地给一句错误，总比弹进一个既没数据、
+    // 又没地方显示错误的空白页强（`View::Secrets` 没有 `warning` 字段，
+    // 见其字段注释）。
+    match app.client().and_then(|c| c.call(Request::Profiles)) {
+        Ok(Response::Profiles { entries, .. }) => {
+            let mut state = ListState::default();
+            if !secret_rows(&entries).is_empty() {
+                state.select(Some(0));
+            }
+            app.view = View::Secrets {
+                entries,
+                state,
+                pending_delete: None,
+            };
+        }
+        Ok(Response::Error(e)) => app.message = Msg::err(e),
+        _ => app.message = Msg::err("拿不到密钥列表".into()),
+    }
 }
 
 /// 对某个会话做 `s`（停止）/ `u`（回滚）/ `d`（看改动），返回要显示的消息。
