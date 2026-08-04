@@ -15,3 +15,5 @@ Task 4: minor (deferred): bail! 把底层 io/toml 错误原文插进用户可见
 Task 5: fix round 1/5 (1 addressed, 0 open; commits 405c6ee..e58da5a)
 Task 5: complete (commits a746e81..e58da5a, review clean)
 Task 5: minor (deferred): daemon 现在按请求里的原始 profile 名查密钥，而不是 resolve 之后的 Profile.name；当前九个内置和 register_profile 路径都保证两者一致，但这是新引入的耦合
+Task 6: fix round 1/5 (1 addressed, 0 open; commits d874a04..7789467)
+Task 6: complete (commits b9f68d6..7789467, review clean)
