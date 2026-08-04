@@ -177,9 +177,17 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
     let mut found = Vec::new();
     let mut errs = Vec::new();
 
-    // 目录不存在是常态（大多数用户不会建），不是错误
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (found, errs);
+    // 目录不存在是绝大多数用户的正常状态（没建过自定义 profile），不该报错；
+    // 但权限之类的其它读取失败不能悄悄吞掉——那和这个函数「不能静默跳过」的
+    // 初衷正好相反，只是从「文件」这一层挪到了「目录」这一层。
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (found, errs),
+        Err(e) => {
+            let name = dir.to_string_lossy();
+            errs.push(format!("{name} 打不开：{e}"));
+            return (found, errs);
+        }
     };
 
     // read_dir 的顺序由文件系统决定，不排序的话菜单每次启动都可能换序
@@ -195,12 +203,39 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
         match std::fs::read_to_string(&path) {
             Err(e) => errs.push(format!("{name} 读不了：{e}")),
             Ok(src) => match Profile::from_toml(&src) {
-                Err(e) => errs.push(format!("{name} 写错了：{e}")),
+                // `Profile::from_toml` 用 `.context()` 包了一层，anyhow 的
+                // Display 对 context 错误只吐 context 那句话，底层
+                // toml::de::Error 的行号和具体原因（缺字段/写错类型……）都被吞了。
+                // 把它挖出来才对用户有用；root_cause() 拿到的还是同一个
+                // toml::de::Error，span/message 都在，只是不走它自带的多行
+                // ASCII 图 Display（那是给等宽终端排版看的，不是人话）。
+                Err(e) => {
+                    let detail = e
+                        .root_cause()
+                        .downcast_ref::<toml::de::Error>()
+                        .map(|te| describe_toml_error(te, &src))
+                        .unwrap_or_else(|| e.to_string());
+                    errs.push(format!("{name} 写错了：{detail}"));
+                }
                 Ok(p) => found.push(p),
             },
         }
     }
     (found, errs)
+}
+
+/// 把 `toml::de::Error` 拍成人话的一行：保留它的原因（缺字段、类型不对……）
+/// 和大致的行号，丢掉它自带的 `TOML parse error at line X, column Y\n  |\n...`
+/// 那套多行图形化 Display——那是给等宽终端排版看的，直接甩给用户就是一份栈追踪。
+fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
+    let reason = err.message();
+    match err.span() {
+        Some(span) => {
+            let line = src[..span.start.min(src.len())].matches('\n').count() + 1;
+            format!("第 {line} 行：{reason}")
+        }
+        None => reason.to_string(),
+    }
 }
 
 /// 内置 + 磁盘。同名以磁盘为准（用户改了就是要改），新名字追加在后面。
@@ -523,6 +558,48 @@ mod tests {
             "错误里要说是哪个文件：{}",
             errs[0]
         );
+        // anyhow 的 `.context()` 会把底层 toml::de::Error 的行号和原因吞掉，
+        // 只剩一句「profile TOML 解析失败」——那等于把「坏了」重说一遍，
+        // 用户本来就知道坏了。这里要证明详细原因确实透出来了。
+        assert!(
+            errs[0].contains("第 1 行") && errs[0].contains("invalid key"),
+            "错误里要带解析细节（行号+原因），不能退化成一句空话：{}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_dir_reports_an_error_instead_of_going_silent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root（常见于容器化的 CI）不受目录权限位约束，读得穿。那种环境下这条
+        // 测试验证的分支根本触发不了，硬跑只会得到一个和权限无关的 flaky 失败——
+        // 与其那样，不如老实跳过。
+        let root_ignores_permissions = std::fs::read_dir(&locked).is_ok();
+
+        if !root_ignores_permissions {
+            let (found, errs) = load_dir(&locked);
+            assert!(found.is_empty(), "目录读不了，不该假装读到了空目录");
+            assert!(
+                !errs.is_empty(),
+                "目录存在但读不了（比如权限不对）不能和「目录不存在」一样静默——\
+                 用户既拿不到自定义 profile，也拿不到任何解释"
+            );
+            assert!(
+                errs[0].contains("locked"),
+                "错误里要指出是哪个目录：{}",
+                errs[0]
+            );
+        }
+
+        // 改回可读可写，否则 tempdir 的 Drop 删不掉这个目录
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
