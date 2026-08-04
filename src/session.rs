@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -173,7 +173,14 @@ impl SessionManager {
 
         let mut checkpoints = Vec::new();
         if is_agent {
-            checkpoints.push(git::checkpoint(dir, id, 0)?);
+            // IMPORTANT 5（最终整分支 code review）：`git::checkpoint` 失败时
+            // 甩出来的是 git 命令行的原始英文 stderr——`git.rs` 的注释说
+            // 「调用方负责给出中文的上下文」，这里补上，别让一句
+            // 「fatal: detected dubious ownership in repository at …」
+            // 原样飘到选择器/密钥失败提示上（后者尤其误导，会被用户读成
+            // 「我的密钥不对」）。
+            checkpoints
+                .push(git::checkpoint(dir, id, 0).context("拍不了检查点，这个会话没法安全撤销")?);
         }
 
         let session = Session {
@@ -253,7 +260,10 @@ impl SessionManager {
             };
 
             if is_agent {
-                let sha = git::checkpoint(&dir, sid, seq)?; // 慢，无锁
+                // 慢，无锁。失败时给中文上下文，理由同 create() 里那处——
+                // 见那边的注释。
+                let sha = git::checkpoint(&dir, sid, seq)
+                    .context("拍检查点失败，这一步的改动可能没法撤销")?;
                 let mut s = recover(arc.lock());
                 if s.checkpoints.last() != Some(&sha) {
                     s.checkpoints.push(sha);
@@ -293,13 +303,15 @@ impl SessionManager {
     /// 恢复到最后一张快照。git 操作同样不持会话锁，理由见 `send_input`。
     pub fn undo(&self, id: u32) -> Result<()> {
         let (dir, sha) = self.checkpoint_base(id, "这个会话没有检查点")?;
-        git::restore(&dir, &sha)
+        // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
+        git::restore(&dir, &sha).context("撤销失败，工作区可能停在了改到一半的状态")
     }
 
     /// 相对最后一张快照改了哪些文件。git 操作不持会话锁。
     pub fn diff(&self, id: u32) -> Result<Vec<FileStat>> {
         let (dir, base) = self.checkpoint_base(id, "这个会话没有改动记录")?;
-        git::diff_stat(&dir, &base)
+        // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
+        git::diff_stat(&dir, &base).context("算不出改了哪些文件，再试一次")
     }
 
     /// 取出做 git 操作需要的信息后立刻放锁。
