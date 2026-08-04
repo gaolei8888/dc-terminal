@@ -29,6 +29,63 @@ let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
 两个真实 agent 在这两个维度上正好相反。任何「agent 都用备用屏」或者
 「内联的才要鼠标」的设计都会挑错一边。
 
+## 零、两个先决条件
+
+这两件事本身不是滚屏，但滚屏压在它们上面。先做，各自独立可测、独立提交。
+
+### 0.1 协议握手版本号
+
+`Response` 是裸 enum，序列化一变就静默失败。已经被咬两次：多 agent 那轮
+`Profiles` 从元组变体改成结构体变体，界面报「拿不到 agent 列表」——一句既没说
+原因也没说下一步的废话。第三节要加 `ScrollState`，这是第三次。
+
+```rust
+pub const PROTOCOL_VERSION: u32 = 1;
+
+Request::Hello { version: u32 },
+Response::Hello { version: u32 },
+```
+
+`Client::reconnect()` 连上之后先发 `Hello`。三种结果：
+
+| 守护进程回什么 | 含义 | 界面 |
+|---|---|---|
+| `Response::Hello { version }` 且相等 | 正常 | 继续 |
+| `Response::Hello { version }` 但不等 | 版本不匹配 | 「后台服务是 X 版、界面是 Y 版，重启后台服务：`<命令>`」 |
+| 别的（老守护进程回 `Error("请求解析失败: …")`） | 老到不认识 Hello | 同上 |
+
+第三行天然可用：老守护进程收到不认识的请求会回 `Response::Error`（`daemon.rs:85`），
+而 `Error` 变体新老都有，新界面解得开。不用改老代码就能认出老代码。
+
+版本号只在**破坏性**改动时 +1。加 `#[serde(default)]` 的新字段不算。
+
+### 0.2 `ui.rs` 拆分
+
+4061 行，全项目 172 个测试里 80 个在这一个文件。`run()` 一个函数 1130 行，
+同时握着六个视图的全部局部状态。滚屏要往里加鼠标事件分流和一套滚动状态，
+加完只会更糟。
+
+分两步，各自独立提交、独立评审：
+
+**第一步：纯搬家，零行为改动。** 拆成模块，测试跟着自己的代码走，
+`cargo test` 数量必须还是 172。
+
+```
+src/ui/mod.rs       run() 外壳 + 终端生命周期（TerminalGuard、restore_terminal、spawn_signal_restore）
+src/ui/view.rs      View enum 及其纯函数（back_one_level、escape_hint、message_after_transition……）
+src/ui/board.rs     看板：按键 + 渲染
+src/ui/attach.rs    会话视图：按键 + 渲染（滚屏最终落这里）
+src/ui/pick.rs      PickProfile / PickProject
+src/ui/secret.rs    EnterSecret / Secrets
+src/ui/widgets.rs   pad_to / display_width / truncate / status_label / status_color / Msg
+```
+
+**第二步：把 `run()` 的局部变量收进 `App`。** 这一步有语义风险，单独做。
+`run()` 循环末尾清理陈旧 `message` 的那段逻辑必须原样保留——`e0ba1ec` 就是
+在这里翻的车，一句普通的「已切到 X」盖掉了屏幕上唯一告诉用户怎么退出的行。
+房规「按键分支里永远不要 `continue`」在拆分之后依然成立，而且更难一眼看出来，
+搬家时要把这条注释跟着搬到每个新文件的按键处理函数上方。
+
 ## 一、谁拥有滚动
 
 一条规则，每帧从会话当前状态读，不写死在 profile 里：
@@ -172,14 +229,12 @@ pub struct ScrollState {
 
 ### 契约又变了
 
-老守护进程 + 新界面 = 反序列化失败，跟上一轮「拿不到 agent 列表」是同一个坑。
-两手都要：
+老守护进程 + 新界面 = 反序列化失败。这就是 0.1 存在的原因：握手先跑，
+版本对不上就直接给一句说人话的提示，用户不会走到「界面画出来了但每次请求
+都失败」那个状态。
 
-1. 新字段全部 `#[serde(default)]`，能兜一半；
-2. 客户端认出反序列化失败时，错误文案改成说人话的
-   「后台服务还是旧版本，重启一下就好」，并给出怎么重启。
-
-第 2 条本来就是待办，跟这件事捆在一起做。
+`ScreenSnapshot` 从元组别名改成结构体是破坏性改动，`PROTOCOL_VERSION` 要 +1。
+`ScrollState` 内部的字段全部加 `#[serde(default)]`，往后再加字段就不用再动版本号。
 
 ## 四、归零的两个时刻
 
@@ -210,6 +265,14 @@ pub struct ScrollState {
 倒退，不能只在设计文档里提一句。
 
 ## 六、怎么测
+
+**先决条件（0.1 / 0.2）**
+
+- `src/client.rs`：握手版本相等时正常返回；版本不等时错误文案里同时出现两个
+  版本号和重启命令；守护进程回 `Error("请求解析失败: …")` 时走同一条提示
+  （模拟老守护进程——起一个只会回这一句的假 socket，不需要真守护进程）
+- `src/ui.rs` 拆分：`cargo test` 计数在拆分前后一致（172）。这是纯搬家步骤
+  唯一的验收标准，不新增测试
 
 **`src/pty.rs`（真 PTY，跟现有测试一个路子）**
 
