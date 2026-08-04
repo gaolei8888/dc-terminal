@@ -548,11 +548,13 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
         } else {
             // 必须 clone：分支里要给 view 赋值，match &view 会被借用检查器拒掉
             match view.clone() {
+                // 看板上每个字母键都直接干实事（退出、跳走、撤销、停止），
+                // 所以字母分支一律加 `is_plain_key` 守卫——理由见那个函数。
                 View::Board => match key.code {
-                    KeyCode::Char('q') => break Ok(()),
+                    KeyCode::Char('q') if is_plain_key(&key) => break Ok(()),
                     KeyCode::Down => move_sel(&mut list_state, &sessions, 1),
                     KeyCode::Up => move_sel(&mut list_state, &sessions, -1),
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                    KeyCode::Char('n') | KeyCode::Char('N') if is_plain_key(&key) => {
                         // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
                         // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
                         // pick_action 和下面 View::PickProfile 的按键分支。n 和 N
@@ -624,7 +626,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             _ => message = Msg::err("拿不到 agent 列表".into()),
                         }
                     }
-                    KeyCode::Char('p') => {
+                    KeyCode::Char('p') if is_plain_key(&key) => {
                         // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
                         // 自己从来没开过项目。
                         match client.call(Request::Projects) {
@@ -648,7 +650,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             _ => message = Msg::err("拿不到项目列表".into()),
                         }
                     }
-                    KeyCode::Char('c') => {
+                    KeyCode::Char('c') if is_plain_key(&key) => {
                         // 拿不到列表就不进设置页：留在看板上给一句错误，总比
                         // 弹进一个既没数据、又没地方显示错误的空白页强
                         // （`View::Secrets` 没有 `warning` 字段，见其字段注释）。
@@ -674,17 +676,17 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             need_sessions = true; // 会话标题要显示项目名
                         }
                     }
-                    KeyCode::Char('u') => {
+                    KeyCode::Char('u') if is_plain_key(&key) => {
                         message = act(&mut client, &sessions, &list_state, |id| Request::Undo {
                             id,
                         });
                     }
-                    KeyCode::Char('s') => {
+                    KeyCode::Char('s') if is_plain_key(&key) => {
                         message = act(&mut client, &sessions, &list_state, |id| Request::Stop {
                             id,
                         });
                     }
-                    KeyCode::Char('d') => {
+                    KeyCode::Char('d') if is_plain_key(&key) => {
                         if let Some(s) = selected(&sessions, &list_state) {
                             message = match client.call(Request::Diff { id: s.id }) {
                                 Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
@@ -1200,7 +1202,9 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             },
                         };
                     }
-                    KeyCode::Char('d') => {
+                    // 守卫在这里最要紧：这是整棵按键树里唯一真删数据的一支。
+                    // 带 Alt 的 `d` 落到下面的 `_`，也就是「取消武装」，比忽略更好。
+                    KeyCode::Char('d') if is_plain_key(&key) => {
                         let rows = secret_rows(&entries);
                         let target = state.selected().and_then(|i| rows.get(i)).cloned();
                         // 判断这半是纯函数（见 decide_delete_key 的文档注释，
@@ -1375,6 +1379,21 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     };
 
     res
+}
+
+/// 这一下是不带 Alt/Meta 的「光板」按键吗。
+///
+/// 用在看板和密钥页那些一个字母就干实事的分支上（退出、删除、跳走）。
+/// 两层理由：
+///
+/// 1. 语义本来就该这样——`Alt+c` 不是 `c`，让它触发 `c` 的动作是 bug。
+/// 2. 更要紧的是它是一道兜底：漏进 stdin 的转义序列字节被 crossterm 报成
+///    **带 Alt 的** `Char` 事件（它不解析 OSC，`\x1b]` 落到兜底分支就变成
+///    `Alt+']'`）。要求「不带 Alt」就等于要求这不是漏进来的转义字节，
+///    于是万一以后哪次改动重新漏出了终端回复（见 `theme.rs` 里 DA1 哨兵的
+///    注释），漏出来的也只是一串什么都不做的按键，而不是删掉一把密钥。
+fn is_plain_key(key: &KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::META)
 }
 
 /// Ctrl+Q —— dct 的全局逃生键。
@@ -2407,6 +2426,39 @@ mod tests {
         // 两个都必须继续透传。
         assert_eq!(key_to_input(&ctrl('c')), Some("\u{3}".to_string()));
         assert_eq!(key_to_input(&ctrl('b')), Some("\u{2}".to_string()));
+    }
+
+    /// 看板和密钥页那些「一个字母就干实事」的分支都挂了这个守卫。
+    /// 漏进 stdin 的转义序列字节会被 crossterm 报成带 Alt 的 `Char`，
+    /// 要求「不带 Alt」就把那种误触挡在外面；正常按键（含 Shift、Ctrl）
+    /// 一个都不能被挡——挡了就是把用户的键吃掉。
+    #[test]
+    fn is_plain_key_rejects_alt_but_passes_normal_keypresses() {
+        assert!(is_plain_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_plain_key(&KeyEvent::new(
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT
+        )));
+        // Ctrl 组合照旧放过：Ctrl+Q 在这层之前就被 is_ctrl_q 接走了，
+        // 这里再挡一遍只会改掉和本次修复无关的行为。
+        assert!(is_plain_key(&ctrl('c')));
+
+        assert!(!is_plain_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_plain_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT
+        )));
+        // 有的终端把 Option/Command 报成 META
+        assert!(!is_plain_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::META
+        )));
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! 存在的理由是一个真实事故：界面上所有弱化文字原本用 `Color::DarkGray`
 //! （ANSI 亮黑，8 号色），而 Solarized 一类主题把 8 号色定义成和背景同色，
 //! 于是选 agent 菜单在这些主题下渲染成一片空白——六个不可用的 agent、
-//! 每行的说明栏、底部提示全部隐形，只剩一个悬空的 `▶`。
+//! 每行的说明栏全部隐形，只剩一个悬空的 `▶`。（底部那条操作提示栏不在其中，
+//! 它用的是具名色，不走 `DarkGray`。）
 //!
 //! 换成写死的 256 色灰能治好深色背景，但那个灰在浅色背景上同样接近隐形。
 //! 一个写死的灰不可能同时适配深浅两种底色，所以这里让它跟着背景走。
@@ -132,10 +133,38 @@ pub(crate) fn theme_from_override(v: Option<&str>) -> Option<Theme> {
     }
 }
 
-/// OSC 11 查询的最长等待。不答这个查询的终端只付一次性的 150ms 启动代价，
-/// 而不是挂在那里等。本地终端的往返是亚毫秒级，150ms 绰绰有余；对用户来说
-/// 也还在「启动」这个心理窗口里面。
+/// OSC 11 查询的最长等待。这是**兜底**，不是常规路径：正常情况下读取由
+/// 下面的 DA1 哨兵结束，比这快得多（本地终端往返亚毫秒级）。只有既不答
+/// OSC 11、又不答 DA1 的终端才会真的等满 150ms——付一次性的启动代价，
+/// 而不是挂在那里等，对用户来说也还在「启动」这个心理窗口里面。
 const QUERY_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// 缓冲区里有没有一条完整的 DA1（Device Attributes）回复。
+///
+/// 形如 `ESC [ ? 62 ; 1 ; 6 c`（主 DA），有的终端还会用 `ESC [ > ... c`
+/// （次 DA）的形式，两种都认。参数段只允许数字和分号，末尾必须是 `c`。
+///
+/// 判据里「末尾的 `c` 必须已经到齐」这一点是刻意的：回复可能被分成几次
+/// `read` 送来，参数段读了一半时这里返回 false，调用方继续读，不会把半条
+/// 回复当成读完。
+pub(crate) fn contains_da1(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' && matches!(bytes[i + 2], b'?' | b'>') {
+            let mut j = i + 3;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'c' {
+                return true;
+            }
+            // 参数段被别的字节打断（或者还没读完）：这一处不算 DA1，
+            // 往后挪一格继续找，不要就此认定整个缓冲区里没有。
+        }
+        i += 1;
+    }
+    false
+}
 
 /// 把「发查询、在 deadline 内读回复」抽出来，只为了让 `detect_with` 能在
 /// 测试里跑完整的四级降级——真实实现要一个 tty 和一个会答话的终端，
@@ -147,17 +176,47 @@ pub(crate) trait ReplyReader {
     fn read_reply(&mut self, deadline: Duration) -> Vec<u8>;
 }
 
-/// 真实实现：往 stdout 写 OSC 11 查询，用 `poll(2)` 在 deadline 内读 stdin。
+/// 真实实现：往 stdout 写 OSC 11 查询 + 一条 DA1 哨兵，用 `poll(2)` 在
+/// deadline 内读 stdin，读到 DA1 回复为止。
 ///
 /// 必须在 `enable_raw_mode()` 之后用：非 raw 模式下这段回复会被行缓冲
 /// （它不带换行，读不出来）并且被回显到屏幕上（用户会看见一串乱码）。
+///
+/// **为什么要有 DA1 哨兵**（`\x1b[c`，跟在 OSC 11 查询后面）：
+/// 只靠超时结束读取，会在终端答得比 deadline 慢时（ssh/mosh 延迟、tmux
+/// 透传、机器负载高）留下一份**没人读的回复**躺在 tty 队列里，界面起来后
+/// 被 crossterm 当成用户输入读进去。crossterm 0.28 不解析 OSC，`\x1b]` 落到
+/// 兜底分支变成 `Alt+']'`，后面每个字节各自变成一个 `Char` 事件——而回复里
+/// 的十六进制位包含 `c` 和 `d`，看板上 `c` 是进密钥管理页、`d` 是删除密钥的
+/// 第一下。也就是说「终端慢了 200ms」能一路走到「一把存好的 API key 被删」，
+/// 用户什么都没做。
+///
+/// 哨兵能治好它，靠的是两条终端行为：DA1 是**所有**终端都答的，而且终端
+/// **按顺序**答。所以「DA1 的回复到了」就等于「OSC 11 的回复要么已经在
+/// 手上、要么永远不会来」——读到 DA1 就可以安全收工，队列里不会剩下东西。
+/// 顺带还去掉了不答 OSC 11 的终端那份固定 150ms 开销：它们照样立刻答 DA1。
+///
+/// 别把它「简化」掉：删了它就把上面那条从慢终端到误删密钥的路重新打开。
 pub(crate) struct StdinReader;
 
 impl ReplyReader for StdinReader {
     fn read_reply(&mut self, deadline: Duration) -> Vec<u8> {
+        // stdin 不是 tty 时什么都别做。两个理由：一是不能拿 `libc::read` 去
+        // 吞掉一段被重定向进来的 stdin（那是别人的数据）；二是这种情况下
+        // crossterm 会退回去打开 `/dev/tty` 读键——它和我们写查询的这个
+        // stdout 不是同一条队列，回复必然没人接，上面那个「回复变按键」的
+        // 竞态就从「可能」变成「一定」。
+        //
+        // SAFETY: `isatty` 只读一个 fd 号，不碰内存、不改进程状态；
+        // STDIN_FILENO 是常量 0，无论它是否有效都只影响返回值。
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+            return Vec::new();
+        }
+
         let mut out = std::io::stdout();
-        // 写失败（stdout 被重定向/关闭）就没有查询可言，直接空手而归
-        if out.write_all(b"\x1b]11;?\x07").is_err() || out.flush().is_err() {
+        // 写失败（stdout 被重定向/关闭）就没有查询可言，直接空手而归。
+        // 两条查询一次写出去：中间不能插别的输出，否则顺序保证就没了。
+        if out.write_all(b"\x1b]11;?\x07\x1b[c").is_err() || out.flush().is_err() {
             return Vec::new();
         }
 
@@ -165,8 +224,9 @@ impl ReplyReader for StdinReader {
         let mut buf = Vec::new();
         loop {
             let Some(left) = deadline.checked_sub(start.elapsed()) else {
-                // 超时。buf 里可能有半个回复，照样交出去——`parse_osc11`
-                // 要求终止符必须在，残缺的会被它判成 None。
+                // 超时：终端既不答 OSC 11 也不答 DA1。buf 里可能有半个回复，
+                // 照样交出去——`parse_osc11` 要求终止符必须在，残缺的会被它
+                // 判成 None。
                 return buf;
             };
 
@@ -191,8 +251,10 @@ impl ReplyReader for StdinReader {
                 n => {
                     let n = n as usize;
                     buf.extend_from_slice(&chunk[..n]);
-                    // 收到终止符就够了，不等满 deadline
-                    if buf.contains(&0x07) || buf.windows(2).any(|w| w == b"\x1b\\") {
+                    // 结束条件是 DA1 回复到了，**不是**见到 BEL/ST：按 BEL 收工
+                    // 的话，一个走神敲进来的 Ctrl-G 就能把读取截断，真正的 OSC 11
+                    // 回复留在队列里没人读——正是哨兵要防的那件事。
+                    if contains_da1(&buf) {
                         return buf;
                     }
                     // 封顶：用户在界面出来之前狂敲键盘的话，这里会一直有
@@ -379,6 +441,66 @@ mod tests {
         assert_eq!(parse_osc11(b"some stray text rgb:0000/0000/0000\x07"), None);
     }
 
+    /// DA1 哨兵的两种形式都要认：主 DA（`ESC [ ? ... c`）和次 DA
+    /// （`ESC [ > ... c`）。认不出来就等于哨兵失效，读取退回到只靠超时结束，
+    /// 慢终端的回复又会漏成按键。
+    #[test]
+    fn recognizes_both_da1_reply_forms() {
+        assert!(contains_da1(b"\x1b[?1;2c"));
+        assert!(contains_da1(b"\x1b[?62;1;6;9;15;22c"));
+        assert!(contains_da1(b"\x1b[>0;95;0c")); // 次 DA
+        assert!(contains_da1(b"\x1b[?c")); // 参数段空的
+    }
+
+    /// 终端按顺序答，所以两条回复常常在同一次 `read` 里一起到。
+    /// 这时既要认出哨兵，也要照样把 OSC 11 那半解析出来。
+    #[test]
+    fn recognizes_da1_arriving_together_with_the_osc11_reply() {
+        let both = b"\x1b]11;rgb:0000/2b2b/3636\x07\x1b[?62;1;6c";
+        assert!(contains_da1(both));
+        assert_eq!(parse_osc11(both), Some((0x0000, 0x2b2b, 0x3636)));
+    }
+
+    /// 只有 OSC 11、哨兵还没到：必须返回 false，让读循环继续读下去。
+    /// 回复里的十六进制位含 `c`，`3636\x07` 这种尾巴不能被误当成 DA1。
+    #[test]
+    fn does_not_mistake_an_osc11_only_buffer_for_da1() {
+        assert!(!contains_da1(b"\x1b]11;rgb:cdcd/dddd/dddd\x07"));
+        assert!(!contains_da1(b""));
+        assert!(!contains_da1(b"\x1b[?62;1;6")); // 末尾的 c 还没到
+        assert!(!contains_da1(b"\x1b[?62;1;6x")); // 结尾字符不对
+        assert!(!contains_da1(b"\x1b[6n")); // 别的 CSI
+        assert!(!contains_da1(b"cccc")); // 光秃秃的 c
+    }
+
+    /// 半条 DA1 被拆成两次 `read` 送来：先认不出，拼齐之后要认出来。
+    /// 这一条守的是「不能把半条回复当成读完」。
+    #[test]
+    fn recognizes_da1_split_across_reads() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b]11;rgb:fdfd/f6f6/e3e3\x07\x1b[?62;");
+        assert!(!contains_da1(&buf));
+        buf.extend_from_slice(b"1;6c");
+        assert!(contains_da1(&buf));
+    }
+
+    /// 缓冲区里带着哨兵的尾巴也要能正常解析出背景色——真实读取拿回来的
+    /// 就是这个形状（OSC 11 回复 + DA1 回复拼在一起）。
+    #[test]
+    fn detects_theme_from_a_buffer_that_includes_the_da1_sentinel() {
+        let mut r = CannedReader::answering(b"\x1b]11;rgb:0000/2b2b/3636\x07\x1b[?62;1;6c");
+        assert_eq!(detect_with(&mut r, None, None), Theme::Dark);
+    }
+
+    /// 只有哨兵回复、终端没答 OSC 11：降级到 COLORFGBG，不能把 DA1 的
+    /// 数字当成颜色解析出来。
+    #[test]
+    fn da1_only_reply_falls_through_to_colorfgbg() {
+        assert_eq!(parse_osc11(b"\x1b[?62;1;6c"), None);
+        let mut r = CannedReader::answering(b"\x1b[?62;1;6c");
+        assert_eq!(detect_with(&mut r, None, Some("0;15")), Theme::Light);
+    }
+
     /// COLORFGBG 是 rxvt/urxvt/konsole 这些不答 OSC 11 的终端留下的线索。
     /// 取**最后**一段当背景色号：rxvt 有时给三段（前景;default;背景）。
     #[test]
@@ -467,6 +589,9 @@ mod tests {
     fn uses_osc11_reply_when_terminal_answers() {
         let mut dark = CannedReader::answering(b"\x1b]11;rgb:0000/2b2b/3636\x07");
         assert_eq!(detect_with(&mut dark, None, None), Theme::Dark);
+        // 只许查一次：查两遍会把启动代价翻倍（而且真实读端每次都要写一遍
+        // 查询、等一遍回复），这条拦的是以后某次重构顺手多调一次。
+        assert_eq!(dark.calls, 1);
 
         let mut light = CannedReader::answering(b"\x1b]11;rgb:fdfd/f6f6/e3e3\x07");
         assert_eq!(detect_with(&mut light, None, None), Theme::Light);
