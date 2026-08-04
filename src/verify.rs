@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// 探测请求的超时（TCP 建连 + 请求/响应）。**TCP 阶段被限在 4 秒以下**
-/// `client::READ_TIMEOUT`（5 秒）之内。守护进程在这里等多久，界面那条连接就等多久，
+/// 探测请求的超时（TCP 建连 + 请求/响应）为 4 秒，在 `client::READ_TIMEOUT`（5 秒）之内。
+/// 守护进程在这里等多久，界面那条连接就等多久，
 /// 超过 5 秒界面会判定连接错位并丢弃重连，用户看到的是「连不上守护进程」。
 ///
 /// 这个预算必须同时喂给 `.timeout()` 和 `.timeout_connect()`（见 `build_probe_agent`）：
