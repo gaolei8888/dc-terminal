@@ -9,12 +9,16 @@ const MAX: usize = 20;
 struct Disk {
     #[serde(default)]
     recent: Vec<String>,
+    /// 上次开会话用的 agent。`n` 键直连它。
+    #[serde(default)]
+    last_profile: Option<String>,
 }
 
-/// 最近开过会话的项目目录，最近使用的在最前。
+/// 最近开过会话的项目目录，最近使用的在最前；外加上次用的 agent。
 pub struct Store {
     path: PathBuf,
     recent: Vec<String>,
+    last_profile: Option<String>,
 }
 
 /// 存放位置跟着 socket 走，而不是直接拼 `$HOME`。生产环境 socket 在
@@ -32,19 +36,30 @@ impl Store {
     /// 文件不存在、JSON 语法错、字段类型不对——一律当空列表。
     /// 这是便利性缓存，不值得为它让守护进程起不来。
     pub fn load(path: &Path) -> Store {
-        let recent = std::fs::read_to_string(path)
+        let disk = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<Disk>(&s).ok())
-            .map(|d| d.recent)
             .unwrap_or_default();
         Store {
             path: path.to_path_buf(),
-            recent,
+            recent: disk.recent,
+            last_profile: disk.last_profile,
         }
     }
 
     pub fn list(&self) -> Vec<String> {
         self.recent.clone()
+    }
+
+    pub fn last_profile(&self) -> Option<&str> {
+        self.last_profile.as_deref()
+    }
+
+    /// 记一笔「上次用的 agent」。跟 `touch()` 一样立即落盘——守护进程没有
+    /// 干净关闭的钩子，内存里的改动不落盘就等于没发生过。
+    pub fn set_last_profile(&mut self, name: &str) {
+        self.last_profile = Some(name.to_string());
+        self.save();
     }
 
     /// 记一笔：去重、提到最前、截断、落盘。
@@ -71,6 +86,7 @@ impl Store {
         }
         let Ok(json) = serde_json::to_string(&Disk {
             recent: self.recent.clone(),
+            last_profile: self.last_profile.clone(),
         }) else {
             return;
         };
@@ -184,5 +200,26 @@ mod tests {
     fn store_path_sits_next_to_socket() {
         let p = store_path_for_socket(std::path::Path::new("/home/x/.dct/daemon.sock"));
         assert_eq!(p, std::path::PathBuf::from("/home/x/.dct/projects.json"));
+    }
+
+    #[test]
+    fn last_profile_survives_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("projects.json");
+        let mut s = Store::load(&f);
+        s.set_last_profile("kimi");
+        drop(s);
+        assert_eq!(Store::load(&f).last_profile(), Some("kimi"));
+    }
+
+    #[test]
+    fn old_file_without_last_profile_still_loads() {
+        // 已经在用 dct 的人，projects.json 里没有这个字段
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("projects.json");
+        std::fs::write(&f, r#"{"recent":["/a"]}"#).unwrap();
+        let s = Store::load(&f);
+        assert_eq!(s.list(), vec!["/a".to_string()]);
+        assert_eq!(s.last_profile(), None);
     }
 }

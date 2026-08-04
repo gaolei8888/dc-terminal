@@ -82,6 +82,7 @@ fn list_is_not_blocked_by_slow_create() {
             .call(Request::Create {
                 dir: repo_path,
                 profile: "concurrency-fake".into(),
+                remember: true,
             })
             .unwrap();
         (start.elapsed(), resp)

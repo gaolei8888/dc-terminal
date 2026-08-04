@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
 use crate::profile::Profile;
+use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of, Lang};
 use crate::projects::{store_path_for_socket, Store};
-use crate::proto::{Request, Response};
+use crate::proto::{InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
 use crate::secrets::{secrets_path_for_socket, SecretStore};
 use crate::session::{recover, SessionManager};
 
@@ -35,11 +37,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
 
     // 存放位置跟着 socket 走，测试把 socket 放临时目录就自动隔离，
-    // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml。
+    // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml / ~/.dct/profiles/。
     let store = Arc::new(Mutex::new(Store::load(&store_path_for_socket(socket))));
     let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path_for_socket(
         socket,
     ))));
+    let profiles_dir = profiles_dir_for_socket(socket);
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
@@ -52,8 +55,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let m = mgr.clone();
         let s = store.clone();
         let sec = secrets.clone();
+        let pd = profiles_dir.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec) {
+            if let Err(e) = serve(conn, m, s, sec, pd) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -66,6 +70,7 @@ fn serve(
     mgr: Arc<SessionManager>,
     store: Arc<Mutex<Store>>,
     secrets: Arc<Mutex<SecretStore>>,
+    profiles_dir: PathBuf,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -75,7 +80,7 @@ fn serve(
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(req, &mgr, &store, &secrets),
+            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir),
             Err(e) => Response::Error(format!("请求解析失败: {e}")),
         };
         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
@@ -89,17 +94,56 @@ fn handle(
     mgr: &Arc<SessionManager>,
     store: &Arc<Mutex<Store>>,
     secrets: &Arc<Mutex<SecretStore>>,
+    profiles_dir: &Path,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         Request::List => Ok(Response::Sessions(mgr.list())),
-        Request::Profiles => Ok(Response::Profiles(
-            Profile::builtin_names()
+        Request::Profiles => {
+            let (all, mut warnings) = all_profiles(profiles_dir);
+            let sec = recover(secrets.lock());
+            if let Some(e) = sec.load_error() {
+                // 密钥文件读不了要顶到界面上。静默的话用户会以为密钥丢了，
+                // 而且这时候所有写入都被拒，他改什么都没反应。
+                warnings.insert(0, format!("密钥文件读不了：{e}"));
+            }
+            let entries = all
                 .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        )),
+                .map(|p| ProfileEntry {
+                    name: p.name.clone(),
+                    label: p.display_label(Lang::Zh),
+                    note: p.display_note(Lang::Zh),
+                    status: status_of(
+                        p,
+                        &all,
+                        sec.get(&p.name).is_some(),
+                        &command_exists,
+                        Lang::Zh,
+                    ),
+                    secret: p.secret.as_ref().map(|s| SecretPrompt {
+                        hint: s.hint.get(Lang::Zh).unwrap_or("").to_string(),
+                        url: s.url.clone(),
+                    }),
+                    install: p.install.as_ref().map(|i| InstallPrompt {
+                        command: i.command.clone(),
+                        note: i.note.get(Lang::Zh).unwrap_or("").to_string(),
+                    }),
+                })
+                .collect();
+            Ok(Response::Profiles {
+                entries,
+                warning: if warnings.is_empty() {
+                    None
+                } else {
+                    Some(warnings.join("；"))
+                },
+            })
+        }
         Request::Projects => Ok(Response::Projects(recover(store.lock()).list())),
-        Request::Create { dir, profile } => {
+        Request::Create {
+            dir,
+            profile,
+            remember,
+        } => {
             let dir = PathBuf::from(dir);
             // 只借一眼这一个 profile 对应的密钥，锁拿完立刻放：`create()` 接下来要
             // 起 PTY 子进程，agent profile 还要跑一次 git checkpoint，这些都是慢
@@ -108,14 +152,23 @@ fn handle(
             // SetSecret/DeleteSecret 就会被一个正在建的慢会话挡在门外——
             // 而这两个操作本身其实只需要极短时间。
             let secret = recover(secrets.lock()).get(&profile).map(str::to_string);
+            // resolve_profile 要认得磁盘上的自定义 profile，不止内置那九个——
+            // 否则「UI 上看着能用」和「create() 说没这个 profile」会对不上。
+            let (all, _) = all_profiles(profiles_dir);
             let r = mgr
-                .create(&dir, &profile, secret.as_deref())
+                .create(&dir, &profile, secret.as_deref(), &all)
                 .map(|id| Response::Created { id });
             // 只有建成功了才记账。建失败的目录进了「最近项目」，
             // 下次还会被选中、还会失败。这把 store 锁跟上面的 secrets 锁完全无关，
             // 特意没有嵌套在一起拿，理由同上：不能让一把锁的持有时间绑架另一把。
             if r.is_ok() {
-                recover(store.lock()).touch(&dir);
+                let mut st = recover(store.lock());
+                st.touch(&dir);
+                // remember=false 是「帮你装 CLI」那条路径：它开的 shell 会话
+                // 不是用户选的 agent，记了下次按 n 会掉进命令行。
+                if remember {
+                    st.set_last_profile(&profile);
+                }
             }
             r
         }
@@ -127,6 +180,15 @@ fn handle(
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
         Request::Diff { id } => mgr.diff(id).map(Response::Diff),
+        Request::SetSecret { profile, value } => recover(secrets.lock())
+            .set(&profile, &value)
+            .map(|_| Response::Ok),
+        Request::DeleteSecret { profile } => recover(secrets.lock())
+            .remove(&profile)
+            .map(|_| Response::Ok),
+        Request::LastProfile => Ok(Response::LastProfile(
+            recover(store.lock()).last_profile().map(str::to_string),
+        )),
     };
     r.unwrap_or_else(|e| Response::Error(e.to_string()))
 }
@@ -181,12 +243,12 @@ mod tests {
 
     /// 回归测试，对应审查发现「密钥仓的锁被握过了整个 create()」：以前 `handle()`
     /// 会在建会话的整段慢流程（PTY 起进程、agent 场景下的 git checkpoint）期间
-    /// 一直攥着 secrets 锁。Task 8 要加 SetSecret/DeleteSecret，到时候这两个本该
-    /// 极快的操作就会被一个正在建的慢会话堵住排队。
+    /// 一直攥着 secrets 锁。Task 8 加了 SetSecret/DeleteSecret，这两个本该极快的
+    /// 操作绝不能被一个正在建的慢会话堵住排队。
     ///
-    /// 这里没法走真实的 wire protocol 测（`SetSecret` 请求还不存在，Task 8 才加），
-    /// 所以直接量最本质的东西：慢 `Create` 跑在一个线程时，另一个线程单纯去锁
-    /// `secrets` 这把 `Mutex` 本身，应该几乎立即拿到，不必等 `Create` 收工。
+    /// 直接调用 `handle()` 而不是走真实 socket，是为了最直接地量最本质的东西：
+    /// 慢 `Create` 跑在一个线程时，另一个线程单纯去锁 `secrets` 这把 `Mutex`
+    /// 本身，应该几乎立即拿到，不必等 `Create` 收工。
     #[test]
     fn create_does_not_hold_the_secrets_lock_across_the_slow_work() {
         let repo = tempfile::tempdir().unwrap();
@@ -203,21 +265,27 @@ mod tests {
         let store = Arc::new(Mutex::new(Store::load(
             &store_dir.path().join("projects.json"),
         )));
+        // 空目录：这条测试不关心磁盘 profile，`daemon-lock-fake` 只在
+        // `mgr` 的 `extra_profiles` 里注册过。
+        let profiles_dir = tempfile::tempdir().unwrap();
 
         let mgr2 = mgr.clone();
         let store2 = store.clone();
         let secrets2 = secrets.clone();
         let repo_path = repo.path().display().to_string();
+        let profiles_dir_path = profiles_dir.path().to_path_buf();
         let create_handle = std::thread::spawn(move || {
             let t = Instant::now();
             let resp = handle(
                 Request::Create {
                     dir: repo_path,
                     profile: "daemon-lock-fake".into(),
+                    remember: true,
                 },
                 &mgr2,
                 &store2,
                 &secrets2,
+                &profiles_dir_path,
             );
             (t.elapsed(), resp)
         });

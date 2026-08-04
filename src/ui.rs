@@ -314,8 +314,14 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     KeyCode::Down => move_sel(&mut list_state, &sessions, 1),
                     KeyCode::Up => move_sel(&mut list_state, &sessions, -1),
                     KeyCode::Char('n') => {
-                        if let Ok(Response::Profiles(p)) = client.call(Request::Profiles) {
-                            view = View::PickProfile(p);
+                        // 协议现在带的是完整的 ProfileEntry（label/status/密钥提示…），
+                        // 但真正用它们画新版选择器是 Task 10 的事。这里先只取 name，
+                        // 让现有的 View::PickProfile(Vec<String>) 和按数字选择的逻辑
+                        // 保持原样跑通——不在这一步动 UI 形状。
+                        if let Ok(Response::Profiles { entries, .. }) =
+                            client.call(Request::Profiles)
+                        {
+                            view = View::PickProfile(entries.into_iter().map(|e| e.name).collect());
                         }
                     }
                     KeyCode::Char('p') => {
@@ -387,6 +393,10 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                             match client.call(Request::Create {
                                 dir: current_dir.display().to_string(),
                                 profile,
+                                // 从选择器里按数字选的就是用户真的要用的 agent——
+                                // 与「帮你装 CLI」那条 remember=false 的路径（Task 9）
+                                // 区分开。
+                                remember: true,
                             }) {
                                 Ok(Response::Created { id }) => {
                                     view = View::Attached(id);
