@@ -62,9 +62,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: Client, default_dir: PathBuf) -> App {
+    /// 两个构造函数共用的字段初值——除了 `client` 之外的每一项，`new` 和
+    /// `new_disconnected` 必须给出完全一样的答案。拆出来是因为一旦两份
+    /// 分开抄，改 `new` 忘了同步改测试用的那份，测试就会在悄悄测一个跟
+    /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
+    /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
+    fn new_inner(client: Option<Client>, default_dir: PathBuf) -> App {
         App {
-            client: Some(client),
+            client,
             view: View::Board,
             list_state: ListState::default(),
             sessions: Vec::new(),
@@ -83,25 +88,14 @@ impl App {
         }
     }
 
+    pub fn new(client: Client, default_dir: PathBuf) -> App {
+        Self::new_inner(Some(client), default_dir)
+    }
+
     /// 只给测试用：不需要一个活的守护进程就能构造。
     #[cfg(test)]
     pub fn new_disconnected(_sock: PathBuf, default_dir: PathBuf) -> App {
-        App {
-            client: None,
-            view: View::Board,
-            list_state: ListState::default(),
-            sessions: Vec::new(),
-            message: "".into(),
-            screen: Vec::new(),
-            screen_cursor: (0, 0),
-            sent_size: None,
-            connected: true,
-            need_sessions: true,
-            verify_rx: None,
-            start_dir: default_dir.clone(),
-            current_dir: default_dir,
-            quit: false,
-        }
+        Self::new_inner(None, default_dir)
     }
 
     /// 拿到活的守护进程连接；构造时没能连上（目前只有测试会这样构造）就

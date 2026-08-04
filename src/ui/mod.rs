@@ -1170,6 +1170,18 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
             }
         }
 
+        // 退出必须在这里落地，不能拖到循环末尾的收尾代码之后：quit 只在
+        // view 还是 Board 的两条路上置位（Ctrl+Q 在顶层 back_one_level 返回
+        // None、或者看板上按 q），今天确实是走到下面 needs_*_refetch /
+        // message_after_transition 也不会有副作用——但那是因为"只有 Board
+        // 会置 quit"这条事实，不是这段代码本身保证的。往后随便一个新退出点
+        // 从别的 view 置位 quit，就会在退出前多打一次 Request::Profiles、
+        // 多改一次 app.message。在这里 break 直接还原了原来 `break Ok(())`
+        // 的位置——退出这件事不依赖任何视图不变的假设。
+        if app.quit {
+            break;
+        }
+
         // 好几条路都能把 view 换成一个空的 PickProfile——Ctrl+Q 走
         // back_one_level（它是纯函数，拿不到 daemon 连接，只能给个
         // entries: vec![] 的空壳，约定见它的文档注释），EnterSecret 自己的
@@ -1241,16 +1253,12 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         //
         // CRITICAL：这段清理必须原样留在循环末尾，不能挪进任何按键分支——
         // e0ba1ec 就是在这里翻的车：一句普通的「已切到 X」盖掉了屏幕上
-        // 唯一告诉用户怎么退出的行。两处 Ctrl+Q/q 退出只置 `app.quit`，
-        // 不提前 `break`，正是为了让这段清理照样跑一遍再退出循环。
+        // 唯一告诉用户怎么退出的行。退出本身在上面已经 `break` 掉了，走不到
+        // 这里；这段清理只服务于还要继续循环的那些迭代。
         let view_changed = std::mem::discriminant(&app.view) != view_kind_before;
         let message_changed =
             app.message.text != message_text_before || app.message.error != message_error_before;
         app.message = message_after_transition(view_changed, message_changed, app.message);
-
-        if app.quit {
-            break;
-        }
     }
 
     Ok(())
