@@ -24,3 +24,9 @@ Task 7: 注意 src/profile.rs 已 842 行（约 490 行是测试模块）；暂�
 Task 8: complete (commits a4fbf71..99dcb24, review clean)
 Task 8: minor (deferred): warning 通道把 io::Error / 解析错误的原文（多半是英文 OS 文案，如 "No such file or directory (os error 2)"）直送用户可见红字；Task 10 负责渲染，要在那儿收口
 Task 8: minor (deferred): client_timeout.rs 的偶发失败与本改动无逻辑因果，但新增的测试二进制提高了并行负载，可能是诱因
+Task 9: fix round 1/5 (1 addressed, 1 new open — 注释仍承诺 DNS 也被兜住；commits 4d8b1de..3fb94b0)
+Task 9: fix round 2/5 (内容已补，但开句中文不通；commits 3fb94b0..3f6aa78)
+Task 9: fix round 3/5 (1 addressed, 0 open；commits 3f6aa78..9a3c0f5)
+Task 9: complete (commits ba845e1..9a3c0f5, review clean)
+Task 9: 已知限制（非缺陷，已在注释里写明）：ureq 2.12.1 无法给 DNS 查询设超时（stream.rs:364 自带 TODO），resolver 卡住时探测可能超过 5 秒；缓解是 UI 在后台线程验证，不冻界面
+Task 9: 依赖增加 —— ureq + tls 引入 43 个传递 crate（rustls / ring / webpki / idna / icu）
