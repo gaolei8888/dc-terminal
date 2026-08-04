@@ -1,18 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// 探测请求的超时。**必须小于 `client::READ_TIMEOUT`（5 秒）**：
-/// 守护进程在这里等多久，界面那条连接就等多久，超过 5 秒界面会判定
-/// 连接错位并丢弃重连，用户看到的是「连不上守护进程」而不是验证结果。
+/// 探测请求的超时（TCP 建连 + 请求/响应）。**TCP 阶段被限在 4 秒以下**
+/// `client::READ_TIMEOUT`（5 秒）之内。守护进程在这里等多久，界面那条连接就等多久，
+/// 超过 5 秒界面会判定连接错位并丢弃重连，用户看到的是「连不上守护进程」。
 ///
-/// 这个预算必须同时喂给 `.timeout()` 和 `.timeout_connect()`（见
-/// `build_probe_agent`）——只设前者管不到建连阶段：ureq 的 `AgentBuilder`
-/// 默认把 `timeout_connect` 设成 30 秒，且建连阶段优先认 `timeout_connect`
-/// 而不是 `.timeout()` 的整体截止时间（`ureq-2.12.1/src/stream.rs`
-/// `connect_host`）。两个字段共用同一个 `PROBE_TIMEOUT` 不会把预算翻倍：
-/// ureq 内部对整条请求只算一个起点相同的 `Instant` 截止时间，建连阶段跑掉的
-/// 时间会从后续读写阶段的剩余预算里扣，两者近似共享同一个 4 秒窗口，不是
-/// 顺序叠加的两个 4 秒。
+/// 这个预算必须同时喂给 `.timeout()` 和 `.timeout_connect()`（见 `build_probe_agent`）：
+/// ureq 的 `AgentBuilder` 默认把 `timeout_connect` 设成 30 秒，且建连阶段优先认它而不是
+/// `.timeout()` 的整体截止时间（`ureq-2.12.1/src/stream.rs` `connect_host`）。两个字段
+/// 共用同一个 `PROBE_TIMEOUT` 不会把预算翻倍——ureq 内部对整条请求只算一个起点相同的
+/// `Instant` 截止时间，建连阶段跑掉的时间会从后续读写阶段的剩余预算里扣。
+///
+/// **DNS 查询不被这个超时保护**。ureq 2.12.1 的 `stream.rs:364` 无法为 DNS 设置截止时间
+/// （代码注释里有 TODO），所以如果 resolver 响应缓慢或 UDP 丢包，发送可能会卡超过 5 秒。
+/// 为了完全挡住这个风险需要实现自定义 `Resolver`，但实际好处有限：(1) resolver 本身有超时，
+/// 不会无限卡；(2) UI 在独立后台线程验证（见 Task 11 设计），不会冻结主界面，最坏情况是
+/// 这条后台连接超时、用户刷新再试。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// 探测用的 `ureq::Agent`。单独拆出来是为了让 `.timeout_connect()` 这类
