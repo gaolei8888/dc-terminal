@@ -1,5 +1,3 @@
-// Task 6 实现
-
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
@@ -319,6 +317,14 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                     // 老守护进程不认识 Screens。列表视图还能用，退回去并
                     // 说清怎么修——别让用户对着一屏空格子猜。（`dct restart`
                     // 还不存在，所以只能说退出再启动。）
+                    //
+                    // 敢把 Error 一律诊断成「守护进程是旧版本」而不看里面写了
+                    // 什么，靠的是一条事实：daemon 侧 `Screens` 那条分支
+                    // （`daemon.rs` 的 `handle`）返回的永远是 `Ok`，`mgr.screens()`
+                    // 不会失败——所以能走到这里的 Error 只可能是 `serve` 的
+                    // 请求解析失败，而新客户端发的请求老守护进程解析不了，就是
+                    // 版本对不上。**哪天 `screens()` 变成可能失败的，这句诊断就
+                    // 成了假话**，那时必须改成把 Error 里的原文说给用户听。
                     Ok(Response::Error(_)) => {
                         app.message = Msg::err(
                             "后台服务是旧版本，看不到画面。退出 dct 再重新打开就好".into(),
@@ -331,14 +337,19 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                 app.grid_page = Some(page);
                 app.grid_last_fetch = Some(std::time::Instant::now());
             }
-        } else if !app.grid_screens.is_empty() {
-            // 离开九宫格就把画面扔掉。留着的话，下次再按 g 进来的第一帧画的
-            // 是上一次的旧画面（可能是几分钟前的，甚至是已经没了的会话）。
-            // 收在这里而不是在每个「离开九宫格」的按键分支里各清一次：出口
-            // 有 g、Ctrl+Q、Enter 放大、n/p/c 弹出的那几个视图……漏一个就是
-            // 一帧残影，而这一条判断覆盖了全部。
-            app.grid_screens.clear();
+        } else {
+            // 离开九宫格就把「手里这批画面是哪一页的」忘掉，这样下次进来
+            // `page_changed` 一定成立，第一帧插队立刻取一次，不用干等 300ms。
+            // 这一句在 `grid_screens` 空不空之外：第一次取画面就失败的时候，
+            // 画面是空的而 `grid_page` 已经被写上了，若跟着 `is_empty` 一起
+            // 跳过重置，300ms 内退出再进来就是对着一屏空白熬满节流。
             app.grid_page = None;
+            // 画面也扔掉。留着的话，下次再按 g 进来的第一帧画的是上一次的
+            // 旧画面（可能是几分钟前的，甚至是已经没了的会话）。收在这里
+            // 而不是在每个「离开九宫格」的按键分支里各清一次：出口有 g、
+            // Ctrl+Q、Enter 放大、n/p/c 弹出的那几个视图……漏一个就是一帧
+            // 残影，而这一条判断覆盖了全部。
+            app.grid_screens.clear();
         }
         if let View::Attached(id) = &app.view {
             let id = *id;
@@ -435,6 +446,10 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         // 的打字过滤和手输路径都靠 `Char(c)` 累加，而 Ctrl+Q 在 crossterm 里
         // 就是 `Char('q')` 带 CONTROL——挪进去就会往过滤框里塞一个 q。
         if is_ctrl_q(&key) {
+            // 从九宫格退回列表时，列表光标要落在刚才那个焦点格上（见
+            // `sync_board_cursor_from_grid`）。必须在 `back_one_level` 之前调，
+            // 那之后 `app.view` 已经不是 Grid 了。
+            sync_board_cursor_from_grid(&mut app);
             match back_one_level(app.view.clone()) {
                 None => app.quit = true,
                 Some(next) => {
@@ -456,14 +471,14 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
             }
         }
 
-        // 退出必须在这里落地，不能拖到循环末尾的收尾代码之后：quit 只在
-        // view 还是 Board 的两条路上置位（Ctrl+Q 在顶层 back_one_level 返回
-        // None、或者看板上按 q），今天确实是走到下面 needs_*_refetch /
-        // message_after_transition 也不会有副作用——但那是因为"只有 Board
-        // 会置 quit"这条事实，不是这段代码本身保证的。往后随便一个新退出点
-        // 从别的 view 置位 quit，就会在退出前多打一次 Request::Profiles、
-        // 多改一次 app.message。在这里 break 直接还原了原来 `break Ok(())`
-        // 的位置——退出这件事不依赖任何视图不变的假设。
+        // 退出必须在这里落地，不能拖到循环末尾的收尾代码之后。现在有三条路
+        // 会置 quit：Ctrl+Q 在顶层（`back_one_level` 返回 None）、看板上按 q、
+        // 九宫格里按 q。走到下面的 needs_*_refetch / message_after_transition
+        // 也不会有副作用，但那是这三条路各自的巧合，不是那段代码保证的——
+        // 而且退出点还会再增加（九宫格那条就是后加的）。在这里 break 直接
+        // 还原了原来 `break Ok(())` 的位置：退出这件事不依赖任何关于「谁能
+        // 置 quit」的假设，往后新加的退出点也不会在退出前多打一次
+        // Request::Profiles、多改一次 app.message。
         if app.quit {
             break;
         }
@@ -622,6 +637,22 @@ fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
 
 fn move_sel(st: &mut ListState, sessions: &[SessionInfo], delta: i32) {
     move_sel_n(st, sessions.len(), delta);
+}
+
+/// 离开九宫格之前，把列表光标挪到当前焦点格上。
+///
+/// 两个视图对「当前是哪个会话」的认知必须一致——`board.rs` 的 `g` 分支
+/// 已经做了列表→九宫格那一半，这是反过来的另一半。少了它，用户盯着第 5 格
+/// 按 Ctrl+Q 回到列表，光标还停在第一行，下一个 `s`（停止）或 `u`（回滚）
+/// 就毁在另一个会话上——这两个键都不可撤销，不能指望用户自己看出来。
+///
+/// 抽成函数是因为出口不止一个（`g`、Ctrl+Q、Enter 放大），而 Ctrl+Q 那条
+/// 走的是 `back_one_level`——它是纯函数，手里根本没有 `list_state`。
+/// 不在九宫格里就什么都不做，调用方不必先判视图。
+pub(crate) fn sync_board_cursor_from_grid(app: &mut App) {
+    if let View::Grid { focus } = app.view {
+        app.list_state.select(Some(focus));
+    }
 }
 
 /// `n`（开上次那个 agent）/ `N`（挑一个 agent）。

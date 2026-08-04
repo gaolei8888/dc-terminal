@@ -91,8 +91,10 @@ pub fn next_running(sessions: &[SessionInfo], current: u32) -> Option<u32> {
 }
 
 /// 按显示宽度裁一行。宽字符（CJK 占两列）跨过边界就整个丢掉——
-/// 裁一半会把后面所有列推歪。宽度的定义必须跟 widgets 里的
-/// `char_width` 是同一份，两边悄悄分叉的话裁的位置就对不上。
+/// 裁一半会把后面所有列推歪。宽度用 widgets 里的 `char_width`，跟
+/// `truncate`/`pad_to` 是同一份定义：裁的地方和补空格的地方对「宽」的
+/// 理解一旦分叉，列就对不上了。这里喂进来的是 agent 屏幕的任意内容，
+/// 制表符、箭头、省略号都是常客，宽度必须按 Unicode 的正式宽度算。
 pub fn crop_line(spans: &[ScreenSpan], max_cols: usize) -> Vec<ScreenSpan> {
     let mut out: Vec<ScreenSpan> = Vec::new();
     let mut used = 0usize;
@@ -159,7 +161,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 focus: move_focus(focus, total, Dir::Right),
             }
         }
-        KeyCode::Char('g') => app.view = View::Board,
+        // 回列表前把列表光标对到焦点格上，理由见 sync_board_cursor_from_grid
+        KeyCode::Char('g') => {
+            super::sync_board_cursor_from_grid(app);
+            app.view = View::Board;
+        }
         // 九宫格是看板的另一种画法，不是另一个世界：开会话、换项目、
         // 管密钥、退出这几个键跟列表里一模一样（共用同一份实现，见
         // mod.rs 里这几个函数的注释）。用户不该因为切了个视图就得先退
@@ -170,7 +176,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('c') => super::open_secrets(app),
         KeyCode::Enter => {
             if let Some(id) = app.sessions.get(focus).map(|s| s.id) {
-                app.need_sessions = true; // 会话标题要显示项目名
+                // 会话标题要显示项目名
+                app.need_sessions = true;
+                // 放大也是一条离开九宫格的路：从会话里再退出来就到了列表，
+                // 那时候光标同样得落在这个会话上（见 sync_board_cursor_from_grid）
+                super::sync_board_cursor_from_grid(app);
                 app.view = View::Attached(id);
             }
         }
@@ -191,13 +201,20 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let View::Grid { focus } = app.view else {
         return;
     };
-    draw_grid(f, area, &app.sessions, &app.grid_screens, focus);
+    draw_grid(
+        f,
+        area,
+        &app.sessions,
+        &app.grid_screens,
+        focus,
+        app.connected,
+    );
 }
 
 /// 画九宫格。格子的顺序 = 当页会话的顺序；画面按 id 跟 `screens` 配对，
 /// 一时没配上的格子只画标题和空白——下一轮 300ms 就有了，比画错内容强。
 ///
-/// 跟 `App` 解耦（只吃它真正用得上的三样）是为了能在测试里直接喂 fixture，
+/// 跟 `App` 解耦（只吃它真正用得上的那几样）是为了能在测试里直接喂 fixture，
 /// 不必为了断言一句「窗口太小」去拼一个完整的 `App`。
 fn draw_grid(
     f: &mut Frame,
@@ -205,6 +222,7 @@ fn draw_grid(
     sessions: &[SessionInfo],
     screens: &[ScreenEntry],
     focus: usize,
+    connected: bool,
 ) {
     if area.width < MIN_COLS || area.height < MIN_ROWS {
         // 说人话说清下一步做什么：这是用户自己能修好的事
@@ -266,9 +284,23 @@ fn draw_grid(
                 Style::default().fg(status_color(info.state)),
             ),
         ]);
-        // 焦点格用青色边框；其余用 DIM 而不是 DarkGray——后者是 ANSI 亮黑，
-        // 有些主题把它设成背景同色，整圈边框会隐形（见 mod.rs 里 DIM 的注释）。
-        let border = if focused {
+        // 断连时整屏格子一律红框：九个静止的画面看上去跟活的一模一样，
+        // 不给个视觉提示，用户会以为 agent 都不动了（列表和会话视图断连时
+        // 也是转红框，三处一致）。焦点格用青色；其余用 DIM 而不是 DarkGray——
+        // 后者是 ANSI 亮黑，有些主题把它设成背景同色，整圈边框会隐形
+        // （见 mod.rs 里 DIM 的注释）。
+        //
+        // 断连时焦点格是红色加粗，不是青色：颜色已经被「数据过期」这件事
+        // 占用了，焦点只能换一个维度来标。全都染成同一种红的话，用户就找不到
+        // 自己按方向键移到哪儿了。
+        let border = if !connected {
+            let red = Style::default().fg(Color::Red);
+            if focused {
+                red.add_modifier(Modifier::BOLD)
+            } else {
+                red
+            }
+        } else if focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(DIM)
@@ -417,6 +449,25 @@ mod tests {
         assert!(crop_line(&[sp("abc")], 0).is_empty());
     }
 
+    #[test]
+    fn box_drawing_lines_crop_at_their_real_width() {
+        // 回归测试：Claude Code 这类 agent 的输入框是一整行制表符画出来的。
+        // 早年的宽度表把 U+1100 以上的字符一律当双宽，38 列的横线被算成 76 列，
+        // 只画得出 19 个——屏幕上那条框线短了一半，`│` 开头的行还会少一列内容。
+        let rule: String = "─".repeat(38);
+        let out = crop_line(&[sp(&rule)], 38);
+        assert_eq!(
+            out[0].text.chars().count(),
+            38,
+            "38 列的格子要装得下 38 个制表符"
+        );
+
+        // `│` 前缀的一行：边框加内容合起来正好占满，一个字符都不该丢
+        let out = crop_line(&[sp("│"), sp("hello")], 6);
+        assert_eq!(out[0].text, "│");
+        assert_eq!(out[1].text, "hello");
+    }
+
     // ———— 视图：按键 ————
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -478,6 +529,57 @@ mod tests {
         app.view = View::Grid { focus: 0 };
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
         assert!(matches!(app.view, View::Board));
+    }
+
+    /// `g` 回列表要把光标带到焦点格上。反方向（列表 → 九宫格）由 `board.rs`
+    /// 的 `g_enters_the_grid_focused_on_the_selected_session` 盯着。
+    #[test]
+    fn g_moves_the_list_cursor_to_the_focused_tile() {
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
+        app.list_state.select(Some(0));
+        app.view = View::Grid { focus: 4 };
+        handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(
+            app.list_state.selected(),
+            Some(4),
+            "从第 5 格回列表，光标必须停在第 5 行——\
+             不然接下来的 s/u 会停掉、回滚另一个会话"
+        );
+    }
+
+    /// Ctrl+Q 那条出口的同步只能做在 `run()` 的按键循环里（`back_one_level`
+    /// 是纯函数，拿不到 `list_state`），而循环要真终端才跑得起来、测不了。
+    /// 能测的是它调的那个函数：在九宫格里对齐焦点、不在九宫格里一动不动
+    /// （Ctrl+Q 是全局键，每次按都会经过它）。
+    #[test]
+    fn the_cursor_sync_follows_the_focus_and_leaves_other_views_alone() {
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
+        app.list_state.select(Some(0));
+        app.view = View::Grid { focus: 4 };
+        super::super::sync_board_cursor_from_grid(&mut app);
+        assert_eq!(app.list_state.selected(), Some(4));
+
+        // 从别的视图按 Ctrl+Q 时它也会被调到，那时候不该动光标
+        app.view = View::Attached(1);
+        app.list_state.select(Some(2));
+        super::super::sync_board_cursor_from_grid(&mut app);
+        assert_eq!(app.list_state.selected(), Some(2), "不在九宫格就别碰光标");
+    }
+
+    #[test]
+    fn zooming_in_also_leaves_the_list_cursor_on_that_session() {
+        // Enter 放大也是离开九宫格的一条路：从会话里 Ctrl+Q 出来就到列表，
+        // 那时候光标得在刚才看的那个会话上。
+        let (mut app, _dir) = App::test_app();
+        app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
+        app.list_state.select(Some(0));
+        app.view = View::Grid { focus: 3 };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.view, View::Attached(4)));
+        assert_eq!(app.list_state.selected(), Some(3));
     }
 
     #[test]
@@ -573,6 +675,22 @@ mod tests {
             .collect()
     }
 
+    /// 满足条件的格子坐标。断言颜色时逐 cell 找比按行列硬算稳。
+    fn cells_with(
+        buf: &ratatui::buffer::Buffer,
+        pred: impl Fn(&ratatui::buffer::Cell) -> bool,
+    ) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).map(&pred).unwrap_or(false) {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
     fn entry(id: u32, text: &str) -> ScreenEntry {
         ScreenEntry {
             id,
@@ -591,7 +709,7 @@ mod tests {
         ];
         let screens = vec![entry(1, "hello-from-one"), entry(2, "hello-from-two")];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &screens, 0))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &screens, 0, true))
             .unwrap();
 
         let c = squashed(&term);
@@ -613,7 +731,7 @@ mod tests {
             session(2, SessionState::Idle),
         ];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, true))
             .unwrap();
 
         let buf = term.backend().buffer();
@@ -635,6 +753,43 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_tiles_turn_red_like_the_other_views() {
+        use ratatui::backend::TestBackend;
+
+        // 断连时九个静止的画面看上去跟活的一模一样。列表和会话视图都靠
+        // 红边框说「这是过期快照」，格子不能例外。
+        let sessions = vec![
+            session(1, SessionState::Working),
+            session(2, SessionState::Working),
+        ];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, false))
+            .unwrap();
+
+        let buf = term.backend().buffer();
+        // 只看框线本身：标题里的状态词是另一套颜色（干活中就是青的），
+        // 它跟连没连上没关系。
+        let is_border = |c: &ratatui::buffer::Cell| "─│┌┐└┘".contains(c.symbol());
+        let borders = cells_with(buf, is_border);
+        assert!(!borders.is_empty(), "格子总该有边框");
+        let red_borders = cells_with(buf, |c| is_border(c) && c.style().fg == Some(Color::Red));
+        assert_eq!(
+            red_borders.len(),
+            borders.len(),
+            "断连时每一格的边框都得是红的，不能有格子还留着「一切正常」的颜色"
+        );
+        // 焦点格（右半屏）靠加粗区分：颜色已经被「数据过期」占用了
+        let bold_xs = cells_with(buf, |c| {
+            c.style().fg == Some(Color::Red) && c.style().add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(!bold_xs.is_empty(), "断连时也要看得出焦点在哪一格");
+        assert!(
+            bold_xs.iter().all(|(x, _)| *x >= 40),
+            "只有焦点格该加粗，实际加粗的列：{bold_xs:?}"
+        );
+    }
+
+    #[test]
     fn a_tile_never_draws_a_cursor() {
         use ratatui::backend::TestBackend;
 
@@ -646,7 +801,7 @@ mod tests {
         let sessions = vec![session(1, SessionState::Working)];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.set_cursor_position((7, 7)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(1, "x")], 0))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(1, "x")], 0, true))
             .unwrap();
         assert_eq!(
             term.get_cursor_position().unwrap(),
@@ -661,20 +816,21 @@ mod tests {
 
         let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0))
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true))
             .unwrap();
         assert!(squashed(&term).contains("1/2"), "多页要画页码");
 
         // 翻到第二页：页码跟着走
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 9))
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 9, true))
             .unwrap();
         assert!(squashed(&term).contains("2/2"));
 
         // 单页画 1/1 是噪音
         let few: Vec<SessionInfo> = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &few, &[], 0)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &few, &[], 0, true))
+            .unwrap();
         assert!(!squashed(&term).contains("1/1"), "单页不画页码");
     }
 
@@ -684,7 +840,7 @@ mod tests {
 
         let sessions: Vec<SessionInfo> = (1..=9).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 0))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 0, true))
             .unwrap();
         let c = squashed(&term);
         assert!(c.contains("窗口太小"), "画不下就直说：{c}");
@@ -697,7 +853,8 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &[], &[], 0)).unwrap();
+        term.draw(|f| draw_grid(f, f.area(), &[], &[], 0, true))
+            .unwrap();
         let c = squashed(&term);
         assert!(
             c.contains("还没有会话"),
@@ -718,7 +875,7 @@ mod tests {
         // 看起来像边框破了个洞。现在先从底部切一行出来给它。
         let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0))
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true))
             .unwrap();
 
         let text = buffer_text(term.backend().buffer());
@@ -738,7 +895,7 @@ mod tests {
         // 不能因为找不到画面就整格消失。
         let sessions = vec![session(7, SessionState::Working)];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(99, "别人的画面")], 0))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(99, "别人的画面")], 0, true))
             .unwrap();
         let c = squashed(&term);
         assert!(c.contains("干活中"), "标题照画：{c}");

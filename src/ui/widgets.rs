@@ -100,15 +100,18 @@ pub(crate) fn screen_to_lines(screen: &[Vec<ScreenSpan>]) -> Vec<Line<'static>> 
         .collect()
 }
 
-/// 一个字符在等宽终端里占几列。CJK/全角字符占两列——`truncate`/`pad_to`
-/// 都得按这份宽度算，两边对「宽」的定义不能悄悄分叉，否则裁的地方和
-/// 补空格的地方就对不上。
+/// 一个字符在等宽终端里占几列。CJK/全角字符占两列，其余占一列。
+///
+/// 这里必须用 Unicode 的正式宽度表，不能拿「码位大于 U+1100 就算两列」
+/// 糊弄：制表符（`─ │ ╭ ╰`，U+2500 段）、省略号 `…`、箭头这些码位都在
+/// U+1100 之上，实际只占一列。agent 画的边框全是这类字符，按两列算等于
+/// 把一行的宽度算成两倍，裁到一半就断了。
+///
+/// `truncate`/`pad_to`/九宫格的 `crop_line` 共用这一份定义——裁的地方和
+/// 补空格的地方对「宽」的理解不能分叉，否则列会漂。
 pub(crate) fn char_width(ch: char) -> usize {
-    if (ch as u32) > 0x1100 {
-        2
-    } else {
-        1
-    }
+    // 控制字符没有宽度（`width()` 返回 None），当零列算：它们本来就不占格子。
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 fn display_width(s: &str) -> usize {
@@ -177,6 +180,19 @@ mod tests {
         // 长度导致 panic（`" ".repeat()` 拿到下溢的 usize 会直接崩）。
         assert_eq!(pad_to("一二三四五六七", 10), "一二三四五六七");
         assert_eq!(pad_to("abc", 2), "abc");
+    }
+
+    #[test]
+    fn box_drawing_and_ellipsis_are_one_column_wide() {
+        // 回归测试：早年的 char_width 是「码位 > U+1100 就算两列」，制表符
+        // （agent 画的提示框边框）和省略号被算成双宽，一行的宽度算成两倍，
+        // 九宫格的 crop_line 会把边框裁掉一半。
+        for ch in ['─', '│', '╭', '╰', '…', '→', '▶'] {
+            assert_eq!(char_width(ch), 1, "{ch:?} 在终端里只占一列");
+        }
+        // CJK 仍然是两列，这才是这个函数存在的理由
+        assert_eq!(char_width('干'), 2);
+        assert_eq!(char_width('ａ'), 2, "全角字母也是两列");
     }
 
     #[test]
