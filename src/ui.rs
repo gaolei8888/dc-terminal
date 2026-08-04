@@ -10,6 +10,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::client::Client;
@@ -17,6 +18,7 @@ use crate::profile::ProfileStatus;
 use crate::proto::{socket_path, ProfileEntry, Request, Response, SecretPrompt};
 use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
 use crate::session::{SessionInfo, SessionState};
+use crate::theme::Theme;
 use crate::verify::VerifyOutcome;
 
 pub fn status_label(s: SessionState) -> &'static str {
@@ -29,21 +31,40 @@ pub fn status_label(s: SessionState) -> &'static str {
     }
 }
 
-/// 弱化文字（说明栏、提示、不可用项）统一用这个灰。不能用
-/// `Color::DarkGray`：它是 ANSI 亮黑（8 号色），Solarized Dark 等主题
-/// 把 8 号色设成和背景同色，整段文字直接隐形——选 agent 菜单里
-/// 所有不可用项和说明栏就这样消失过，只剩一个悬空的 ▶。
-/// `Indexed` 走 256 色表的固定灰，不经过终端主题的 16 色映射，
-/// 深浅背景下都可见。
-const DIM: Color = Color::Indexed(245);
+/// 启动时探测出来的终端背景。`ui::run()` 设一次，之后只读。
+///
+/// 用全局而不是给 `DrawInput` 加字段：主题是进程级配置，启动后不变，
+/// 塞进 `DrawInput` 是把一个常量伪装成每帧的状态。而且 `DrawInput` 有
+/// 26 个构造点（25 个在测试里），加一个必填字段就是 26 处纯噪音的改动。
+static THEME: OnceLock<Theme> = OnceLock::new();
 
-pub fn status_color(s: SessionState) -> Color {
+/// 探测终端背景并记下来。`run()` 在 `enable_raw_mode()` 之后、
+/// `EnterAlternateScreen` 之前调，只调一次。
+pub fn init_theme() {
+    let _ = THEME.set(crate::theme::detect());
+}
+
+/// 弱化文字（说明栏、不可用项、操作提示、没在干活的状态）的样式。
+///
+/// 没探测过就按 `Unknown` 算——那是三种取值里最保守的一个（只用 DIM
+/// 修饰符，不钉任何颜色），所以测试和任何绕过 `run()` 的路径都能正常渲染。
+pub fn dim() -> Style {
+    THEME.get().copied().unwrap_or(Theme::Unknown).dim()
+}
+
+/// 状态在界面上的样式。返回 `Style` 而不是 `Color`：Stopped/Unknown 要用
+/// `dim()`，而 `dim()` 在 `Theme::Unknown` 下表达的是 DIM 修饰符、不是某个
+/// 颜色，`Color` 装不下。
+///
+/// 干活中/等你回答/空闲仍用具名 ANSI 色：终端主题本来就保证这几个色在自己
+/// 背景上可读，我们再去重映射等于跟用户自己的配色打架。
+pub fn status_style(s: SessionState) -> Style {
     match s {
-        SessionState::Working => Color::Cyan,
-        SessionState::Asking => Color::Yellow,
-        SessionState::Idle => Color::Green,
-        SessionState::Stopped => DIM,
-        SessionState::Unknown => DIM,
+        SessionState::Working => Style::default().fg(Color::Cyan),
+        SessionState::Asking => Style::default().fg(Color::Yellow),
+        SessionState::Idle => Style::default().fg(Color::Green),
+        SessionState::Stopped => dim(),
+        SessionState::Unknown => dim(),
     }
 }
 
@@ -230,6 +251,15 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
     // 必须在 EnterAlternateScreen / Terminal::new 之前构造：这样即便它们俩失败，
     // raw mode 也还是能被 Drop 恢复。
     let _guard = TerminalGuard;
+    // 探测终端背景，位置被两头夹死：
+    // - 必须在 enable_raw_mode() 之后：OSC 11 的回复是终端塞进 stdin 的
+    //   一串字节，非 raw 模式下会被行缓冲（它不带换行，读不出来）并且被
+    //   回显到屏幕上（用户会看见乱码）。
+    // - 必须在 EnterAlternateScreen 之前：万一有字节漏到屏幕上，此刻还在
+    //   主屏、还没开始画界面，脏字符会被随后的 alternate screen 切换盖掉；
+    //   反过来就是把乱码糊在已经画好的界面上。
+    // 在 TerminalGuard 之后是为了万一探测里有什么 panic，raw mode 仍能恢复。
+    init_theme();
     let mut stdout = std::io::stdout();
     // 开括号粘贴：不开的话粘贴的文字会一个字符一个事件地进来，
     // 粘一段话就是几百次往返，慢到没法用。
@@ -2020,13 +2050,13 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                     let base = if matches!(e.status, ProfileStatus::Ready) {
                         Style::default()
                     } else {
-                        Style::default().fg(DIM)
+                        dim()
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(num, base),
                         Span::styled(pad_to(&truncate(&e.label, 14), 14), base),
-                        Span::styled(pad_to(&truncate(&e.note, 26), 26), base.fg(DIM)),
-                        Span::styled(reason, base.fg(DIM)),
+                        Span::styled(pad_to(&truncate(&e.note, 26), 26), base.patch(dim())),
+                        Span::styled(reason, base.patch(dim())),
                     ]))
                 })
                 .collect();
@@ -2073,7 +2103,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
             if !prompt.hint.is_empty() {
                 lines.push(Line::from(Span::styled(
                     prompt.hint.clone(),
-                    Style::default().fg(DIM),
+                    dim(),
                 )));
                 lines.push(Line::from(""));
             }
@@ -2095,7 +2125,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "Ctrl+O 打开申领页面",
-                    Style::default().fg(DIM),
+                    dim(),
                 )));
             }
             // IMPORTANT 3（最终整分支 code review）：Task 13 把「回哪」这句话
@@ -2148,7 +2178,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                             Span::raw(format!("{:<20}", truncate(&name, 20))),
                             Span::styled(
                                 truncate(&short, 50),
-                                Style::default().fg(DIM),
+                                dim(),
                             ),
                         ]))
                     })
@@ -2194,12 +2224,12 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                         Span::raw(format!("{:>3}  ", s.id)),
                         Span::styled(
                             format!("{:<8}", status_label(s.state)),
-                            Style::default().fg(status_color(s.state)),
+                            status_style(s.state),
                         ),
                         Span::raw(format!("{:<10}", s.profile)),
                         Span::styled(
                             format!("{:<22}", truncate(&short_path(&s.dir), 22)),
-                            Style::default().fg(DIM),
+                            dim(),
                         ),
                         Span::raw(truncate(&s.activity, 60)),
                     ]))
@@ -2250,11 +2280,11 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                             Span::raw(pad_to(&truncate(&label, 14), 14)),
                             Span::styled(
                                 if *configured { "已配" } else { "未配" },
-                                Style::default().fg(if *configured {
-                                    Color::Green
+                                if *configured {
+                                    Style::default().fg(Color::Green)
                                 } else {
-                                    DIM
-                                }),
+                                    dim()
+                                },
                             ),
                         ]))
                     }
@@ -2517,9 +2547,26 @@ mod tests {
     #[test]
     fn asking_and_working_use_different_colors() {
         assert_ne!(
-            status_color(SessionState::Asking),
-            status_color(SessionState::Working)
+            status_style(SessionState::Asking),
+            status_style(SessionState::Working)
         );
+    }
+
+    /// Stopped/Unknown 这两个「没在干活」的状态要走弱化样式，跟说明栏、
+    /// 不可用项用的是同一套自适应灰，不能再自己钉一个写死的颜色。
+    #[test]
+    fn inactive_states_use_the_adaptive_dim_style() {
+        let dim = dim();
+        assert_eq!(status_style(SessionState::Stopped), dim);
+        assert_eq!(status_style(SessionState::Unknown), dim);
+    }
+
+    /// 测试进程里没人调过 `init_theme`，`dim()` 必须给出 `Unknown` 的样式，
+    /// 而不是 panic 或者某个写死的灰。这条同时守着「探测没跑过也能正常渲染」
+    /// 这个前提——`draw()` 的那批渲染测试全靠它。
+    #[test]
+    fn dim_falls_back_to_unknown_before_detection() {
+        assert_eq!(dim(), crate::theme::Theme::Unknown.dim());
     }
 
     /// `draw()` 是唯一没有靠 client/daemon 就能跑起来的部分——用 `TestBackend`
