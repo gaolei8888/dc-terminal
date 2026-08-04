@@ -1237,6 +1237,14 @@ mod tests {
     }
 
     #[test]
+    fn f3_is_never_forwarded_to_the_agent() {
+        // F3 在附加视图里被 dct 自己吃掉（跳到下一个在跑的会话），
+        // 落进 key_to_input 的通配臂本来就返回 None——这条测试钉住这件事，
+        // 免得以后有人改这个函数时不小心让它开始转发。
+        assert_eq!(key_to_input(&key(KeyCode::F(3))), None);
+    }
+
+    #[test]
     fn bottom_bar_help_follows_the_view() {
         use ratatui::backend::TestBackend;
 

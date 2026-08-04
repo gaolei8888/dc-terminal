@@ -409,7 +409,7 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
 pub(crate) fn idle_help(view: &View) -> &'static str {
     match view {
-        View::Attached(_) => "F2 同效　回看板后按 n 新建会话　其余按键都发给 agent",
+        View::Attached(_) => "F2 同效　F3 下一个会话　回看板后按 n 新建会话　其余按键都发给 agent",
         View::PickProfile { .. } => "↑↓ 选  Enter 确认  或直接按数字  Esc 取消",
         View::PickProject {
             typing_path: Some(_),

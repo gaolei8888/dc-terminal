@@ -28,6 +28,16 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::F(2) {
         app.view = View::Board;
         app.need_sessions = true;
+    } else if key.code == KeyCode::F(3) {
+        // F3 = 直接切到下一个在跑的会话，不用先退回看板。选 F3 沿用
+        // F2 的理由：没有 CLI agent 用 F 功能键，偷它不踩任何人。
+        match super::grid::next_running(&app.sessions, id) {
+            Some(next) => {
+                app.view = View::Attached(next);
+                app.need_sessions = true; // 会话标题要显示新会话的项目名
+            }
+            None => app.message = "没有其他正在跑的会话".into(),
+        }
     } else if let Some(text) = key_to_input(&key) {
         // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
         // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
@@ -83,5 +93,55 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let y = area.y + 1 + row;
     if x < area.x + area.width.saturating_sub(1) && y < area.y + area.height.saturating_sub(1) {
         f.set_cursor_position((x, y));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionInfo, SessionState};
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn session(id: u32, state: SessionState) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: "/tmp/a".into(),
+            state,
+            activity: String::new(),
+        }
+    }
+
+    #[test]
+    fn f3_jumps_straight_to_the_next_running_session() {
+        // 不用先退回看板：从会话 1 按 F3 直接落在下一个在跑的会话上。
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![
+            session(1, SessionState::Working),
+            session(2, SessionState::Stopped),
+            session(3, SessionState::Idle),
+        ];
+        app.view = View::Attached(1);
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+        assert!(
+            matches!(app.view, View::Attached(3)),
+            "跳过停掉的 2，落在 3 上"
+        );
+        assert!(app.need_sessions, "会话标题要显示新会话的项目名");
+    }
+
+    #[test]
+    fn f3_says_so_when_this_is_the_only_running_session() {
+        // 唯一在跑的会话按 F3：不能跳回自己，也不能悄无声息什么都不做。
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![session(1, SessionState::Working)];
+        app.view = View::Attached(1);
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+        assert!(matches!(app.view, View::Attached(1)), "不能跳回自己");
+        assert!(!app.message.text.is_empty(), "得说一句，不能默不作声");
     }
 }

@@ -14,7 +14,7 @@ use super::widgets::{char_width, screen_to_lines, status_color, status_label};
 use super::{session_action, DIM};
 use crate::proto::ScreenEntry;
 use crate::pty::ScreenSpan;
-use crate::session::SessionInfo;
+use crate::session::{SessionInfo, SessionState};
 
 pub const TILES_PER_PAGE: usize = 9;
 
@@ -75,6 +75,19 @@ pub fn move_focus(focus: usize, total: usize, dir: Dir) -> usize {
         }
         Dir::Up => page_start + in_page.saturating_sub(cols),
     }
+}
+
+/// 下一个还在跑的会话，按 id 在 `sessions` 里的顺序，到尾回绕，跳过已停止
+/// 的（停了的没画面可看，列表视图处理那种情况）。附加视图的 F3 靠它从
+/// 当前会话直接跳到下一个能看的会话，不用先退回看板。当前会话是唯一
+/// 在跑的（或者 `current` 压根不在 `sessions` 里）→ `None`，调用方原地不动。
+pub fn next_running(sessions: &[SessionInfo], current: u32) -> Option<u32> {
+    let cur = sessions.iter().position(|s| s.id == current)?;
+    let n = sessions.len();
+    (1..n)
+        .map(|off| &sessions[(cur + off) % n])
+        .find(|s| !matches!(s.state, SessionState::Stopped))
+        .map(|s| s.id)
 }
 
 /// 按显示宽度裁一行。宽字符（CJK 占两列）跨过边界就整个丢掉——
@@ -348,6 +361,23 @@ mod tests {
             text: text.into(),
             style: ScreenStyle::default(),
         }
+    }
+
+    #[test]
+    fn next_running_wraps_and_skips_stopped() {
+        let sessions = vec![
+            session(1, SessionState::Working),
+            session(2, SessionState::Stopped),
+            session(3, SessionState::Idle),
+        ];
+        assert_eq!(next_running(&sessions, 1), Some(3), "2 停了要跳过");
+        assert_eq!(next_running(&sessions, 3), Some(1), "到尾回绕");
+        let only = vec![session(1, SessionState::Working)];
+        assert_eq!(
+            next_running(&only, 1),
+            None,
+            "没有别的会话就别跳，跳回自己是噪音"
+        );
     }
 
     #[test]
