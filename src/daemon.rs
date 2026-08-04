@@ -104,8 +104,12 @@ fn handle(
             let sec = recover(secrets.lock());
             if let Some(e) = sec.load_error() {
                 // 密钥文件读不了要顶到界面上。静默的话用户会以为密钥丢了，
-                // 而且这时候所有写入都被拒，他改什么都没反应。
-                warnings.insert(0, format!("密钥文件读不了：{e}"));
+                // 而且这时候所有写入都被拒，他改什么都没反应。带上路径是
+                // 因为「读不了」本身不可操作——用户得知道去看哪个文件。
+                warnings.insert(
+                    0,
+                    format!("密钥文件读不了：{e}，检查一下 {}", sec.path().display()),
+                );
             }
             let entries = all
                 .iter()
@@ -252,6 +256,49 @@ mod tests {
             install: None,
             label: Default::default(),
             note: Default::default(),
+        }
+    }
+
+    /// 回归测试，对应审查发现「原始 OS 报错会红字出现在选择器标题上」：
+    /// `Request::Profiles` 拼 warning 时不能只把 `SecretStore::load_error()`
+    /// 的文案接上就完事——那句话本身已经是人话了（见 secrets.rs），但这里
+    /// 还要点名是哪个文件，且组装出来的整句不能再夹带任何英文系统原话。
+    #[test]
+    fn profiles_warning_names_the_broken_secrets_file_in_chinese() {
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let secrets_path = secrets_dir.path().join("secrets.toml");
+        std::fs::write(&secrets_path, "这不是 TOML {{{").unwrap();
+
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path)));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Store::load(
+            &store_dir.path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let resp = handle(
+            Request::Profiles,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+        );
+
+        match resp {
+            Response::Profiles { warning, .. } => {
+                let w = warning.expect("密钥文件读坏了必须有 warning");
+                assert!(
+                    w.contains(&secrets_path.display().to_string()),
+                    "要点名是哪个文件：{w}"
+                );
+                assert!(!w.contains('\n'), "不能是多行栈追踪：{w}");
+                assert!(
+                    !w.contains("TOML parse error"),
+                    "toml 库自带的图形化 Display 不能漏出来：{w}"
+                );
+            }
+            other => panic!("期待 Response::Profiles，得到 {other:?}"),
         }
     }
 

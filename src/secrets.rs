@@ -34,10 +34,21 @@ impl SecretStore {
         let (secrets, load_error) = match std::fs::read_to_string(path) {
             // 文件还没建过是常态，不是错误
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), None),
-            Err(e) => (BTreeMap::new(), Some(format!("{e}"))),
+            Err(e) => {
+                // 系统原话（比如「Permission denied (os error 13)」）只写
+                // stderr 留痕迹，不能冒泡到界面上——见 describe_io_error
+                // 的注释，非程序员看不懂 errno。
+                eprintln!("密钥文件读取失败（{}）：{e}", path.display());
+                (BTreeMap::new(), Some(crate::profile::describe_io_error(&e)))
+            }
             Ok(src) => match toml::from_str::<Disk>(&src) {
                 Ok(d) => (d.secrets, None),
-                Err(e) => (BTreeMap::new(), Some(format!("{e}"))),
+                // 密钥文件也是 TOML，复用 profile.rs 那套「行号 + 人话原因」
+                // 的翻译，没必要另起一套分类逻辑。
+                Err(e) => (
+                    BTreeMap::new(),
+                    Some(crate::profile::describe_toml_error(&e, &src)),
+                ),
             },
         };
         SecretStore {
@@ -49,6 +60,11 @@ impl SecretStore {
 
     pub fn load_error(&self) -> Option<&str> {
         self.load_error.as_deref()
+    }
+
+    /// 密钥文件路径。daemon 组装警告文案时要点名是哪个文件，让用户去看。
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn get(&self, profile: &str) -> Option<&str> {
@@ -240,6 +256,70 @@ mod tests {
             "这不是 TOML {{{",
             "原文件必须一个字节都没动"
         );
+    }
+
+    #[test]
+    fn corrupt_file_load_error_is_plain_chinese_not_a_toml_stack_dump() {
+        // 之前的实现对 toml::de::Error 直接 format!("{e}")：那是给等宽
+        // 终端排版看的多行 ASCII 图（"TOML parse error at line 1, column
+        // 1\n  |\n1 | ...\n  |  ^\n..."），糊在选择器标题上就是一份变相
+        // 栈追踪。现在要求单行、带中文「第 N 行」，不能有内嵌换行。
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secrets.toml");
+        std::fs::write(&f, "这不是 TOML {{{").unwrap();
+
+        let s = SecretStore::load(&f);
+        let err = s.load_error().expect("要记住读失败了");
+        assert!(!err.contains('\n'), "不能是多行栈追踪：{err}");
+        assert!(err.contains("第"), "要带中文行号：{err}");
+        assert!(
+            !err.contains("TOML parse error"),
+            "toml 库自带的图形化 Display 不能漏出来：{err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_file_load_error_has_no_raw_os_error_text() {
+        // 权限错误的 io::Error Display 是英文系统原话，比如
+        // "Permission denied (os error 13)"——零编程经验的用户看不懂
+        // "os error 13" 是什么。load_error() 只能给中文，原文只写 stderr。
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secrets.toml");
+        std::fs::write(&f, "[secrets]\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        struct RestorePerms<'a>(&'a std::path::Path);
+        impl Drop for RestorePerms<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        let _restore = RestorePerms(&f);
+
+        // root（常见于容器化 CI）不受文件权限位约束，这条测试验证的分支
+        // 触发不了——老实跳过，好过硬跑出一个和权限无关的 flaky 失败。
+        if std::fs::read_to_string(&f).is_err() {
+            let s = SecretStore::load(&f);
+            let err = s.load_error().expect("要记住读失败了");
+            assert!(!err.contains("os error"), "不能漏出 errno：{err}");
+            assert!(
+                !err.contains("Permission denied"),
+                "不能漏出英文原话：{err}"
+            );
+            assert!(err.contains("权限"), "要点名是权限问题：{err}");
+        }
+    }
+
+    #[test]
+    fn path_exposes_the_underlying_file() {
+        // daemon 组装警告文案时要点名是哪个文件，用户才知道去哪修。
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secrets.toml");
+        let s = SecretStore::load(&f);
+        assert_eq!(s.path(), f);
     }
 
     #[test]
