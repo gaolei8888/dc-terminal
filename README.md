@@ -12,7 +12,7 @@ An agent terminal built for vibe coding. Start a task, walk away from the comput
 
 ## Install
 
-You need a recent stable Rust toolchain (1.80 or newer).
+You need a recent stable Rust toolchain (1.80 or newer) and a C toolchain (Xcode Command Line Tools on macOS, `build-essential` or equivalent on Linux) — one of the TLS dependencies compiles native code during the build.
 
 ```
 cargo build --release

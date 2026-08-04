@@ -12,7 +12,7 @@
 
 ## 安装
 
-需要一个较新的 stable Rust（1.80 或更高）。
+需要一个较新的 stable Rust（1.80 或更高），以及一套 C 工具链（macOS 装 Xcode 命令行工具，Linux 装 build-essential 或等价包）——依赖里有一份 TLS 库要在构建时编译原生代码。
 
 ```
 cargo build --release
