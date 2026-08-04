@@ -30,3 +30,8 @@ Task 9: fix round 3/5 (1 addressed, 0 open；commits 3f6aa78..9a3c0f5)
 Task 9: complete (commits ba845e1..9a3c0f5, review clean)
 Task 9: 已知限制（非缺陷，已在注释里写明）：ureq 2.12.1 无法给 DNS 查询设超时（stream.rs:364 自带 TODO），resolver 卡住时探测可能超过 5 秒；缓解是 UI 在后台线程验证，不冻界面
 Task 9: 依赖增加 —— ureq + tls 引入 43 个传递 crate（rustls / ring / webpki / idna / icu）
+Task 10: fix round 1/5 (2 addressed 1 minor addressed, 0 open; commits c3d6965..dd3db67)
+Task 10: complete (commits 8fe647d..dd3db67, review clean)
+Task 10: minor (deferred): char_width 的 (ch as u32) > 0x1100 => 2 是粗略近似，部分非 CJK 码位会被误判成双宽；旧逻辑，本轮只是提取成函数
+Task 10: minor (deferred): load_dir 里 from_toml 错误的 unwrap_or_else(|| e.to_string()) 兜底目前不可达，但若 from_toml 的包装方式变了会漏原始文案
+Task 10: 注意 src/ui.rs 已 2383 行，Task 11/12/13 还要往里加
