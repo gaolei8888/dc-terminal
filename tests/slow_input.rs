@@ -76,7 +76,7 @@ fn slow_checkpoint_does_not_block_the_board() {
     m.register_profile(fake_agent());
     let secrets_dir = tempfile::tempdir().unwrap();
     let secrets = SecretStore::load(&secrets_dir.path().join("secrets.toml"));
-    let id = m.create(repo.path(), "fake", &secrets).unwrap();
+    let id = m.create(repo.path(), "fake", secrets.get("fake")).unwrap();
 
     // 模拟 agent 干了一大堆活：快照必须重新哈希这些文件，才会真的慢。
     // 不这么做的话 git 的索引缓存会让第二次快照快到测不出东西。
