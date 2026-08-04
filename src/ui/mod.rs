@@ -1276,6 +1276,10 @@ mod tests {
             c.contains("F2同效"),
             "F2 是老用户的肌肉记忆，也要留在提示里：{c}"
         );
+        assert!(
+            c.contains("F3下一个会话"),
+            "F3 是九宫格快速跳转的入口，提示里丢了就没人知道：{c}"
+        );
         assert!(c.contains("新建会话"), "还要说清新建会话怎么走：{c}");
         assert!(!c.contains("u回滚"), "会话视图不能显示看板按键表：{c}");
 
