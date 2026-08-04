@@ -48,3 +48,13 @@ Task 13: fix round 1/5 (2 addressed 1 minor addressed, 0 open; commits 20b0f0f..
 Task 13: complete (commits 26b9ff8..f8ab275, review clean)
 Task 13: minor (deferred): Up/Down 与兜底分支的解除逻辑在 run() 里，只能靠 decide_delete_key 的纯函数测试 + 手工验证覆盖
 === 全部 13 个任务完成，进入全分支评审 ===
+=== 全分支评审 ===
+最终评审: 1 Critical + 4 Important + 4 Minor；一轮修复 9 个 commit（0f0cb6c..4696761）
+最终复审: 8/9 已解决。CRITICAL 1（验证结果串到别的 profile）已用身份戳修好并有判别性测试
+最终复审 parked: IMPORTANT 4 残留 —— src/secrets.rs:151 的 save() 守卫仍写「先修好 {path} 再改」，
+  与它自己嵌进去的「删掉这个文件…不用手动修它」自相矛盾。secrets.toml 坏掉时每次 SetSecret /
+  DeleteSecret 都会显示这句。裁定：真问题，一行字符串，非承重（没有任何东西依赖它），
+  按流程不再开第二轮修复波；已上报给用户决定是否合并前补掉。
+最终复审 note: CRITICAL 1 的修复正确且完整，但报告里「receiver 塞进 variant 行不通」的论证是错的
+  （view 重新赋值会 drop 掉旧 View 连同 receiver）。真正成立的理由是 View: Clone 与 Receiver: !Clone。
+  代码无问题，只是写作里的推理瑕疵。
