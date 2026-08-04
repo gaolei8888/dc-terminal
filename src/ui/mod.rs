@@ -25,6 +25,7 @@ use app::App;
 
 mod attach;
 mod board;
+mod grid;
 mod pick;
 mod secret;
 

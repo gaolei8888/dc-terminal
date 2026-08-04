@@ -103,7 +103,7 @@ pub(crate) fn screen_to_lines(screen: &[Vec<ScreenSpan>]) -> Vec<Line<'static>> 
 /// 一个字符在等宽终端里占几列。CJK/全角字符占两列——`truncate`/`pad_to`
 /// 都得按这份宽度算，两边对「宽」的定义不能悄悄分叉，否则裁的地方和
 /// 补空格的地方就对不上。
-fn char_width(ch: char) -> usize {
+pub(crate) fn char_width(ch: char) -> usize {
     if (ch as u32) > 0x1100 {
         2
     } else {
