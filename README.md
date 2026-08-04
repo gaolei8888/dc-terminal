@@ -1,75 +1,67 @@
 # dc-terminal
 
-An agent terminal built for vibe coding. Start a task, walk away from the computer, keep steering it from your phone.
+I wanted to kick off a coding agent, shut the laptop, and keep an eye on it from my phone. That's the goal. Today `dct` does the local half of it well and the phone half not at all.
 
-[中文文档](README.zh-CN.md) · Design notes: `docs/superpowers/specs/2026-08-01-dc-terminal-design.md`
+What works: a board with several agents on it, each one working in its own project directory. They run with permission prompts turned off, so they don't sit there waiting for you to say yes. Before every turn `dct` takes a hidden snapshot of the project, so if an agent makes a mess you press one key and it's gone. Your branches and your commit history never see any of this.
 
-`dct` runs several coding agents side by side, each in its own project directory, and shows them on one board. Agents run with permission prompts turned off, so they don't stall waiting for you. Before every turn it takes a hidden snapshot, so one keystroke undoes whatever an agent just did — without touching your branches or your commit history.
+[中文](README.zh-CN.md) · design notes live in `docs/superpowers/specs/2026-08-01-dc-terminal-design.md`
 
----
+## Getting it running
 
-# For users
-
-## Install
-
-You need a recent stable Rust toolchain (1.80 or newer) and a C toolchain (Xcode Command Line Tools on macOS, `build-essential` or equivalent on Linux) — one of the TLS dependencies compiles native code during the build.
+Rust 1.80 or newer, and a C toolchain (Xcode command line tools, or `build-essential`) because the TLS stack compiles some C.
 
 ```
 cargo build --release
 ./target/release/dct
 ```
 
-That's the whole install. `dct` starts a background daemon the first time you run it; closing the terminal window does not stop your sessions.
+The first run starts a background daemon. That daemon is the point: close the terminal, close the laptop lid, come back tomorrow, your sessions are still running. `dct` on its own just reattaches to them.
 
 ## The board
 
-Running `dct` opens the board — one line per session, with what each agent is doing right now.
-
-| Key | What it does |
+| Key | |
 |---|---|
-| `n` | Start a new session with the agent you used last time (no menu) |
-| `N` | Start a new session and pick which agent |
-| `p` | Switch project — which directory the next session opens in |
-| `c` | Manage keys — change or delete a saved one |
-| `↑` `↓` | Move between sessions |
-| `Enter` | Open a session; `F2` gets you back to the board |
-| `u` | Undo — roll back to the last checkpoint |
-| `s` | Stop a session |
-| `d` | Show which files this session changed |
-| `q` | Quit the board (the daemon and your sessions keep running) |
-| `Ctrl+Q` | Back out one level. In a session it returns to the board; on the board it quits. |
+| `n` | new session with whatever agent you used last, straight in, no menu |
+| `N` | new session, pick the agent |
+| `p` | switch project — sets where the *next* session opens |
+| `↑` `↓` | move around |
+| `Enter` | open a session |
+| `u` | undo, back to the last snapshot |
+| `s` | stop a session |
+| `d` | what did this session change |
+| `c` | API keys |
+| `q` | quit the board; sessions keep running |
+| `Ctrl+Q` | back out one level, wherever you are |
 
-Inside a session, everything you type goes to the agent — including `Esc`, which agents use to cancel and to close their own popups. `F2` and `Ctrl+Q` are the two keys `dct` keeps for itself.
+Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2` and `Ctrl+Q` are the only two keys `dct` keeps.
 
-## Agents
+A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
 
-Press `N` and you get all of them, whether or not they work on this machine. Ones that can't run yet are dimmed with the reason, and choosing one takes you toward fixing it rather than turning you away. The first time you pick one, `n` remembers it — press `n` next time and you go straight back in, no menu.
+## The agents
 
-| Agent | What it is | Needs |
+Press `N` and you get all nine, including the ones that don't work on this machine. Those show up greyed out with the reason, and picking one takes you toward fixing it instead of just saying no.
+
+| | | needs |
 |---|---|---|
-| Claude | Anthropic's own CLI | `claude` installed |
-| Codex | OpenAI's own CLI | `codex` installed |
-| OpenCode | Open source, works with many models | `opencode` installed |
-| Qwen Code | Alibaba Qwen, its own CLI | `qwen` installed |
-| Kimi | Moonshot AI, through the Claude interface | `claude` installed + an API key |
-| GLM | Zhipu AI, through the Claude interface | `claude` installed + an API key |
-| DeepSeek | DeepSeek, through the Claude interface | `claude` installed + an API key |
-| Qwen API | Alibaba Qwen, through the Claude interface | `claude` installed + an API key |
-| Command line | A plain shell, no AI | — |
+| Claude | Anthropic's CLI | `claude` |
+| Codex | OpenAI's CLI | `codex` |
+| OpenCode | open source, many models | `opencode` |
+| Qwen Code | Alibaba, its own CLI | `qwen` |
+| Kimi | Moonshot, wearing Claude's face | `claude` + a key |
+| GLM | Zhipu, same trick | `claude` + a key |
+| DeepSeek | same trick | `claude` + a key |
+| Qwen API | same trick | `claude` + a key |
+| Command line | a plain shell | |
 
-The last four aren't separate programs. They run `claude` pointed at that vendor's Anthropic-compatible endpoint, which is why they need `claude` installed *and* a key of their own.
+Those last four aren't separate programs at all. They're `claude` pointed at somebody else's Anthropic-compatible endpoint, which is why they want both the binary and a key.
 
-**Not installed?** Pick it anyway. If `dct` knows how to install it, it opens a session and runs the installer where you can watch it.
+Pick something that isn't installed and `dct` opens a session running the installer, so you can watch it work rather than being told to go away and come back. Pick something with no key and you get a box to paste into, plus a link to wherever you get one (`Ctrl+O` opens it). The key gets checked against the endpoint before it's saved — paste half a key and you find out immediately, not ten seconds later inside a session full of English error text.
 
-**No key yet?** Pick it anyway. You get a box to paste the key into, with a link to the page where you get one — press `Ctrl+O` to open that page in your browser. The key is checked before it's saved, so a bad paste is caught right there instead of turning into a wall of English errors ten seconds later.
+Keys live in `~/.dct/secrets.toml`, mode 0600. They never go anywhere near the profile files, which is deliberate: those you can copy between machines or hand to a colleague.
 
-Keys are stored in `~/.dct/secrets.toml`, owner-readable only. They are never written into profile files, so those stay safe to copy and share.
+## Your own agents
 
-**Changed your mind, or a key stopped working?** Press `c` on the board. It lists only the agents that actually need a key, with each one marked configured or not — pick one and `Enter` to replace it, or `d` to delete it. This is the only place you should ever touch a saved key; editing `secrets.toml` by hand isn't necessary and isn't supported.
-
-## Adding your own agent
-
-Drop a TOML file in `~/.dct/profiles/`. No code changes, no restart — `dct` re-reads the directory on every request. A file whose `name` matches a built-in replaces it; any other name is added to the list.
+Drop a TOML file in `~/.dct/profiles/`. Nothing to recompile, nothing to restart — the directory gets re-read on every request. Use a built-in's name and yours wins; use a new one and it joins the list.
 
 ```toml
 name = "myagent"
@@ -85,59 +77,53 @@ en = "My agent"
 en = "What this one is good at"
 ```
 
-| Field | Meaning |
-|---|---|
-| `command` | Include the agent's own permission-bypass flag, or it will still stop and ask |
-| `is_agent` | `true` gets snapshots and undo; `false` (a plain shell, say) doesn't |
-| `busy_pattern` | Regex matched against the screen. Matches → working, doesn't → idle |
-| `idle_pattern` | The other direction: matches → idle. `busy_pattern` wins if both are set |
-| `env` | Environment variables for the process — a different base URL, for instance |
-| `secret` | Declares that this agent needs a user-supplied key, and which variable it goes into |
-| `install` | How to install it, if it isn't on this machine |
+Put the agent's own permission-bypass flag in `command`, or it'll stop and ask you things. `is_agent = true` turns on snapshots and undo; leave it off for anything that isn't really an agent.
 
-Prefer `busy_pattern` over `idle_pattern` when you can. An agent's "press esc to interrupt" line is stable; the placeholder text in its input box disappears the moment the user types. With neither, the board honestly shows `—` rather than inventing a status.
+The two pattern fields are how the board knows whether an agent is busy. `busy_pattern` matches the screen while it's working; `idle_pattern` is the other way round. Use `busy_pattern` when you can — "esc to interrupt" stays put, whereas the placeholder text in an input box vanishes the second someone types. If you give neither, the board shows `—`. That's on purpose. Making up a status is worse than admitting you don't know.
 
-If a file you wrote doesn't show up, the picker says why, with the line number.
+There's also `env` for environment variables, `secret` if your agent needs a key from the user, and `install` for how to install it. Get the TOML wrong and the picker tells you which file and which line.
 
-## Known limits
+## Things that will annoy you
 
-- Two agents in the same project will step on each other's edits. Different projects are fine.
-- A session is bound to one directory for its lifetime. Switching projects means a new session.
-- Permissions are auto-accepted, so an agent can write outside the project directory. Those changes are outside the snapshot and undo will not bring them back.
-- `opencode` and `qwen` ship without screen patterns — nobody has observed their interfaces yet, so their sessions show `—` instead of a status.
-- The four vendor endpoints are written from public documentation and **have not been tested against live accounts**. See `docs/superpowers/specs/2026-08-03-dct-multi-agent-design.md`.
+Two agents in one project will fight over the same files. Different projects, no problem.
+
+Scrolling back doesn't work yet, and in iTerm2 it actively garbles the screen. Scroll to the bottom and it repaints. The underlying reason is that `dct` currently keeps zero scrollback, so there's nothing to scroll to; that's on the list.
+
+Permissions are auto-accepted, which means an agent can write outside the project directory. Those writes are outside the snapshot and undo won't bring them back.
+
+`opencode` and `qwen` are in the list but I've never run either one, so they have no screen patterns and their sessions just show `—`.
+
+And the big one: **the four vendor endpoints are copied out of public documentation and have never been tested with a real account.** A key can verify fine and the session still fail to start. Until somebody runs them with real credentials, treat those four as untested.
 
 ---
 
-# For developers
+# For anyone working on the code
 
-## Shape of the thing
-
-Two processes talking newline-delimited JSON over a Unix socket at `~/.dct/daemon.sock`, owner-only:
+Two processes, newline-delimited JSON over a Unix socket at `~/.dct/daemon.sock`, owner-only.
 
 ```
-src/ui.rs        TUI: view state machine + rendering (ratatui + crossterm)
-src/client.rs      |  one connection, 5s read timeout, reconnects on any error
-src/daemon.rs    request dispatch, one thread per connection
-src/session.rs   session lifecycle, 200ms tick deriving status from screen text
-src/pty.rs       PTY + vt100 screen buffer
+src/ui.rs        the TUI — view state machine, event loop, rendering
+src/client.rs      one connection, 5s read timeout, reconnects on any error
+src/daemon.rs    request dispatch, thread per connection
+src/session.rs   session lifecycle, 200ms tick that reads status off the screen
+src/pty.rs       PTY plus a vt100 screen buffer
 src/profile.rs   profile schema, built-ins, disk loading, availability
-src/secrets.rs   ~/.dct/secrets.toml, 0600, atomic replace
-src/verify.rs    API-key probe, injectable transport
+src/secrets.rs   ~/.dct/secrets.toml
+src/verify.rs    the API-key probe
 src/git.rs       hidden snapshots
 src/projects.rs  recent projects, last agent used
 src/proto.rs     the wire contract
 ```
 
-The daemon outlives the UI. Kill the terminal, reattach later, sessions are still there.
+Three decisions worth knowing before you change things.
 
-**Why the daemon computes availability.** Whether `codex` is on `PATH` is answered where the child will actually be spawned. A UI-side check could report "ready" for something that then fails to start.
+Availability is computed in the daemon, never in the UI, because the daemon's `PATH` is the one the child actually gets spawned with. Ask the question anywhere else and you can cheerfully report "ready" for something that then fails to start.
 
-**Why no lock is held across `create()`.** Starting a session spawns a PTY and shells out to git. Holding a shared lock across that stalls every other client — `src/session.rs` has the long version, and there's a regression test.
+Nothing holds a lock across `create()`. Starting a session spawns a PTY and shells out to git, and if you're holding a shared lock while that happens every other client waits on you. There's a long comment in `src/session.rs` and a test that measures it.
 
-**Why the protocol carries resolved strings.** `ProfileEntry.label` and friends are `String`, already picked for the current language daemon-side, rather than `LocalizedText`. One place decides how user-facing text gets composed.
+The protocol carries strings that are already in the user's language. `ProfileEntry.label` is a `String`, not a `LocalizedText`. Exactly one place decides how user-facing text gets built, and it's the daemon.
 
-## Build and test
+## Building
 
 ```
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -146,15 +132,18 @@ cargo fmt --check
 cargo clippy --all-targets
 ```
 
-Tests create real git repositories, spawn real child processes, and bind real Unix sockets, so they are steadier run serially. No test touches the network, and none touches your real `~/.dct` — data paths are derived from the socket path, which tests point at a temp directory.
+Tests make real git repos, spawn real processes, and bind real sockets, so they're steadier one at a time. Nothing hits the network. Nothing touches your actual `~/.dct` either — every data path is derived from the socket path, and tests point that at a temp directory.
 
-## Conventions
+## House style
 
-- Comments explain **why**, not what. The density here is deliberate; match it.
-- Every user-facing string is written for someone with no programming background. No jargon, no stack traces, no raw OS error text. Errors name the next step.
-- **No emoji as icons.**
-- In the UI's key-handling branches, never `continue` — it skips the loop tail that clears stale status messages, and this repo has already shipped and fixed that bug once (`e0ba1ec`).
+Comments explain why, not what. The density in this codebase is deliberate, and it's saved us more than once; match it.
 
-## Not built yet
+Every string a user can see is written for someone who has never programmed. No jargon, no stack traces, no raw OS error text, and an error that doesn't tell you what to do next isn't finished.
 
-The `ask_human` bridge; phone channels (Telegram / Feishu / WeCom / SMS); context compaction and classification via `dc_llm`; phone-side commands; interface languages beyond Chinese (the profile schema is already per-language, the interface strings are not).
+No emoji as icons.
+
+Never `continue` in a key-handling branch. It skips the bottom of the loop, which is where stale status messages get cleared, and we've already shipped that bug once — `e0ba1ec`, where a routine "switched to X" message covered up the only line on screen telling the user how to quit.
+
+## Not there yet
+
+The `ask_human` bridge. Phone channels — Telegram, Feishu, WeCom, SMS. Context compaction through `dc_llm`. Commands from the phone side. Scrollback. And the interface itself is Chinese-only: profiles are already per-language, the UI strings aren't.
