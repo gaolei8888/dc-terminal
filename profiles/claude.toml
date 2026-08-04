@@ -8,3 +8,9 @@ zh = "Claude"
 
 [note]
 zh = "Anthropic 官方"
+
+[install]
+command = ["npm", "i", "-g", "@anthropic-ai/claude-code"]
+
+[install.note]
+zh = "需要先装 Node.js"
