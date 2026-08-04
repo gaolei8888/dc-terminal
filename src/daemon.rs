@@ -186,7 +186,11 @@ fn handle(
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
         Request::Screen { id } => mgr
             .screen(id)
-            .map(|(lines, cursor)| Response::Screen { lines, cursor }),
+            .map(|(lines, cursor, state)| Response::Screen {
+                lines,
+                cursor,
+                state,
+            }),
         Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),

@@ -454,10 +454,30 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                 sent_size = Some((id, rows, cols));
             }
             match client.call(Request::Screen { id }) {
-                Ok(Response::Screen { lines, cursor }) => {
+                Ok(Response::Screen {
+                    lines,
+                    cursor,
+                    state,
+                }) => {
                     screen = lines;
                     screen_cursor = cursor;
                     connected = true;
+                    // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
+                    // （agent 在 alternate screen 里画，退出时恢复的主屏从来
+                    // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
+                    // 每个键都掉进一个死掉的 pty 里无声消失。
+                    if let Some(notice) = session_ended_notice(id, state) {
+                        view = View::Board;
+                        // 回看板得重新拉一次 List：贴在会话里这一路都没拉，
+                        // 手里的 sessions 是进会话之前那份，缺的正是「这个
+                        // 会话已经没了」这条更新。
+                        need_sessions = true;
+                        // 会话正常结束不是错误，用普通提示，不是红字
+                        message = notice.into();
+                        // 下一个会话的尺寸要重新协商：sent_size 记的是刚退出
+                        // 的这个 id，留着会让新会话第一帧按错的宽度排版。
+                        sent_size = None;
+                    }
                 }
                 _ => connected = false,
             }
@@ -1398,6 +1418,26 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
 /// 里；别指望这层守卫替哨兵兜底，也别因为这层守卫在就去削弱哨兵。
 fn is_plain_key(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::META)
+}
+
+/// 贴在会话里、`Screen` 捎回状态之后：这个会话是不是已经结束了，该把用户
+/// 送回看板？返回 `Some(提示语)` 就是「回看板并把这句话显示在底栏」。
+///
+/// 为什么要有这一步：agent 自己退出（`/exit`、shell 里的 `exit`）之后，
+/// 界面留在会话视图里是一片空白——agent 在 alternate screen 里画，退出时恢复
+/// 主屏，主屏从来没被写过。用户看到的是一张没有任何信息的空页，底栏还写着
+/// 「其余按键都发给 agent」，而他敲的每个键都掉进一个死掉的 pty 里无声消失。
+///
+/// 只认 `Stopped`。别的状态（包括 `Unknown`——profile 没给 pattern，我们不知道
+/// 它在干什么）都得留在会话里：把一个好端端的会话判成结束，会把用户从他正在
+/// 用的 agent 里踢出去，比空白页糟得多。
+///
+/// 抽成纯函数是为了能单测（同 `escape_hint`、`idle_help`、`back_one_level`）。
+fn session_ended_notice(id: u32, state: SessionState) -> Option<String> {
+    match state {
+        SessionState::Stopped => Some(format!("会话 {id} 已结束，回到看板。按 n 再建一个")),
+        _ => None,
+    }
 }
 
 /// Ctrl+Q —— dct 的全局逃生键。
@@ -2609,6 +2649,35 @@ mod tests {
             status_style(SessionState::Asking),
             status_style(SessionState::Working)
         );
+    }
+
+    /// agent 自己退出之后必须把用户送回看板：留在会话视图里就是一张空白页
+    /// （agent 在 alternate screen 里画，退出时恢复的主屏从来没被写过），
+    /// 底栏还写着「其余按键都发给 agent」，而键全掉进死掉的 pty。
+    #[test]
+    fn stopped_session_sends_the_user_back_to_the_board() {
+        let notice = session_ended_notice(4, SessionState::Stopped);
+        let notice = notice.expect("Stopped 必须回看板");
+        assert!(notice.contains('4'), "提示要说清是哪个会话结束了：{notice}");
+    }
+
+    /// 活着的会话一个都不能被判成结束——把用户从正在用的 agent 里踢出去，
+    /// 比停在空白页糟得多。`Unknown` 尤其要留下：那只是 profile 没给 pattern，
+    /// 我们不知道它在干什么，不是它死了。
+    #[test]
+    fn live_sessions_are_never_treated_as_ended() {
+        for state in [
+            SessionState::Working,
+            SessionState::Asking,
+            SessionState::Idle,
+            SessionState::Unknown,
+        ] {
+            assert_eq!(
+                session_ended_notice(1, state),
+                None,
+                "{state:?} 不该被当成已结束"
+            );
+        }
     }
 
     /// Stopped/Unknown 这两个「没在干活」的状态要走弱化样式，跟说明栏、
