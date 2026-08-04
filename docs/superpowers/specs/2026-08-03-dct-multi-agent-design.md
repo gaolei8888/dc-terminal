@@ -204,10 +204,10 @@ zh = "需要先装 Node.js"
 | 项 | 状态 |
 |---|---|
 | `codex` 的命令与 `busy_pattern` | **已实测**（v0.146.0，PTY 抓屏确认 `esc to interrupt`） |
-| `claude` 的 `idle_pattern` | 现状已在用 |
-| `opencode` 的命令、安装包名、pattern | **未实测**，本机没装 |
-| `qwen` 的命令、安装包名、pattern | **未实测**，本机没装 |
-| kimi / glm / deepseek / qwen-api 的 base_url 与 verify url | **未实测**，照公开文档写 |
+| `claude` 的 `idle_pattern` | **已实测**——`claude` 本身已安装，在开发机上日常使用中 |
+| `opencode` 的命令、安装包名、pattern | **未实测**，本机没装，也没找到能装的机器；pattern 依旧刻意留空，跟文档最初的决定一致 |
+| `qwen` 的命令、安装包名、pattern | **未实测**，本机没装，也没找到能装的机器；pattern 依旧刻意留空，跟文档最初的决定一致 |
+| kimi / glm / deepseek / qwen-api 的 base_url 与 verify url | **仍未实测**——照公开文档写，没拿真实密钥探测过；这四项是发布前最后一个阻塞项，需要各家的真实 API key 才能验 |
 
 未实测的 pattern 一律留空，状态显示 `—`（见「状态判定」），不瞎猜。
 
