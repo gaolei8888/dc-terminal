@@ -135,10 +135,6 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(client, default_dir);
-    // 后台验证线程要自己开一条到守护进程的连接——主循环这条 client 正忙着
-    // 画界面。`socket_path()` 是纯函数（只读 $HOME），比把 Client 内部
-    // 私有的 socket 字段掏出来更省事。
-    let socket = socket_path();
 
     loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
@@ -402,771 +398,12 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         } else {
             // 必须 clone：分支里要给 view 赋值，match &view 会被借用检查器拒掉
             match app.view.clone() {
-                View::Board => match key.code {
-                    KeyCode::Char('q') => app.quit = true,
-                    KeyCode::Down => move_sel(&mut app.list_state, &app.sessions, 1),
-                    KeyCode::Up => move_sel(&mut app.list_state, &app.sessions, -1),
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
-                        // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
-                        // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
-                        // pick_action 和下面 View::PickProfile 的按键分支。n 和 N
-                        // 都要这份列表——n 拿它判断上次那个 agent 现在还在不在
-                        // Ready，N 拿它渲染选择器——所以只拉一次，不分两条路各拉各的。
-                        match app.client().and_then(|c| c.call(Request::Profiles)) {
-                            Ok(Response::Profiles { entries, warning }) => {
-                                // 把「拉完列表但没能直开」的三种落点（选择器为空、
-                                // 建会话失败两种）收在一处，省得同一段 ListState
-                                // 初始化抄三遍——那种抄法迟早有一份漏了空表守卫。
-                                let picker =
-                                    |entries: Vec<ProfileEntry>, warning: Option<String>| {
-                                        let mut state = ListState::default();
-                                        // daemon 目前总是至少返回九个内置 profile，这里
-                                        // 空表分支基本走不到；但选中一个不存在的下标，
-                                        // 按 Enter 就是 entries[0] 越界 panic——这种最坏
-                                        // 结果不该只靠"实践中到不了"兜底，一行守卫不值钱。
-                                        if !entries.is_empty() {
-                                            state.select(Some(0));
-                                        }
-                                        View::PickProfile {
-                                            entries,
-                                            state,
-                                            warning,
-                                        }
-                                    };
-                                // 大写 N 一定要看一眼选择器，不查上次用的是谁；
-                                // 小写 n 才去问 daemon 上次记的是哪个 agent。
-                                let last = if key.code == KeyCode::Char('n') {
-                                    match app.client().and_then(|c| c.call(Request::LastProfile)) {
-                                        Ok(Response::LastProfile(l)) => l,
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                };
-                                match quick_start_target(last.as_deref(), &entries) {
-                                    Some(name) => {
-                                        // 同 View::PickProfile 里 PickAction::Start 那支：
-                                        // 「n」等价于「已经替用户选好了上次那个」，
-                                        // 建完直接进会话，不用再让他确认一遍。
-                                        let dir = app.current_dir.display().to_string();
-                                        match app.client().and_then(|c| {
-                                            c.call(Request::Create {
-                                                dir,
-                                                profile: name,
-                                                remember: true,
-                                            })
-                                        }) {
-                                            Ok(Response::Created { id }) => {
-                                                app.need_sessions = true; // 会话标题要显示项目名
-                                                app.view = View::Attached(id);
-                                            }
-                                            Ok(Response::Error(e)) => {
-                                                app.message = Msg::err(e);
-                                                app.view = picker(entries, warning);
-                                            }
-                                            _ => {
-                                                app.message = Msg::err("创建失败".into());
-                                                app.view = picker(entries, warning);
-                                            }
-                                        }
-                                    }
-                                    None => app.view = picker(entries, warning),
-                                }
-                            }
-                            // 列表都拿不到，直开和选择器都没法走，只能告诉用户
-                            // 这次干瞪眼——留在 Board 上，视图没变，走到循环
-                            // 末尾 message_after_transition 会把这条消息原样
-                            // 留住（同其他分支，不用 continue 抢跑跳过收尾）。
-                            Ok(Response::Error(e)) => app.message = Msg::err(e),
-                            _ => app.message = Msg::err("拿不到 agent 列表".into()),
-                        }
-                    }
-                    KeyCode::Char('p') => {
-                        // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
-                        // 自己从来没开过项目。
-                        match app.client().and_then(|c| c.call(Request::Projects)) {
-                            Ok(Response::Projects(mut all)) => {
-                                // 全新守护进程列表是空的，补上启动目录，
-                                // 保证第一次用也不会看到空列表。
-                                let start = app.start_dir.display().to_string();
-                                if !all.contains(&start) {
-                                    all.push(start);
-                                }
-                                let mut state = ListState::default();
-                                state.select(Some(0));
-                                app.view = View::PickProject {
-                                    all,
-                                    filter: String::new(),
-                                    state,
-                                    typing_path: None,
-                                };
-                            }
-                            Ok(Response::Error(e)) => app.message = Msg::err(e),
-                            _ => app.message = Msg::err("拿不到项目列表".into()),
-                        }
-                    }
-                    KeyCode::Char('c') => {
-                        // 拿不到列表就不进设置页：留在看板上给一句错误，总比
-                        // 弹进一个既没数据、又没地方显示错误的空白页强
-                        // （`View::Secrets` 没有 `warning` 字段，见其字段注释）。
-                        match app.client().and_then(|c| c.call(Request::Profiles)) {
-                            Ok(Response::Profiles { entries, .. }) => {
-                                let mut state = ListState::default();
-                                if !secret_rows(&entries).is_empty() {
-                                    state.select(Some(0));
-                                }
-                                app.view = View::Secrets {
-                                    entries,
-                                    state,
-                                    pending_delete: None,
-                                };
-                            }
-                            Ok(Response::Error(e)) => app.message = Msg::err(e),
-                            _ => app.message = Msg::err("拿不到密钥列表".into()),
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(id) = selected(&app.sessions, &app.list_state).map(|s| s.id) {
-                            app.view = View::Attached(id);
-                            app.need_sessions = true; // 会话标题要显示项目名
-                        }
-                    }
-                    KeyCode::Char('u') => {
-                        app.message = act(&mut app, |id| Request::Undo { id });
-                    }
-                    KeyCode::Char('s') => {
-                        app.message = act(&mut app, |id| Request::Stop { id });
-                    }
-                    KeyCode::Char('d') => {
-                        if let Some(id) = selected(&app.sessions, &app.list_state).map(|s| s.id) {
-                            app.message =
-                                match app.client().and_then(|c| c.call(Request::Diff { id })) {
-                                    Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
-                                    Ok(Response::Diff(v)) => v
-                                        .iter()
-                                        .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
-                                        .collect::<Vec<_>>()
-                                        .join("  ")
-                                        .into(),
-                                    Ok(Response::Error(e)) => Msg::err(e),
-                                    _ => Msg::err("请求失败".into()),
-                                };
-                        }
-                    }
-                    _ => {}
-                },
-                View::PickProfile {
-                    entries,
-                    mut state,
-                    warning,
-                } => {
-                    if key.code == KeyCode::Esc {
-                        app.view = View::Board;
-                    } else {
-                        // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
-                        // 挪完直接落到 chosen = None，不会误触发下面的路由。
-                        let chosen: Option<usize> = match key.code {
-                            KeyCode::Down | KeyCode::Up => {
-                                let d = if key.code == KeyCode::Down { 1 } else { -1 };
-                                move_sel_n(&mut state, entries.len(), d);
-                                None
-                            }
-                            KeyCode::Enter => state.selected(),
-                            KeyCode::Char(c) => digit_index(c).filter(|i| *i < entries.len()),
-                            _ => None,
-                        };
-                        // 四条分支的落点：pick_action 只是个纯函数分类器，真正
-                        // 建会话/开安装窗口这些带副作用的活儿在这里做。
-                        app.view = match chosen.map(|i| (i, pick_action(&entries[i]))) {
-                            None => View::PickProfile {
-                                entries,
-                                state,
-                                warning,
-                            },
-                            Some((_, PickAction::Start(name))) => {
-                                // 选完直接进会话。用户选中的意图就是「我要用这个
-                                // agent 干活」，先弹回看板再让他找一遍自己刚建的
-                                // 会话是白让人做第二次选择。建失败才回选择器。
-                                let dir = app.current_dir.display().to_string();
-                                match app.client().and_then(|c| {
-                                    c.call(Request::Create {
-                                        dir,
-                                        profile: name,
-                                        // 选择器里选的就是用户真的要用的 agent——
-                                        // 与「帮你装 CLI」那条 remember=false 的路径区分开。
-                                        remember: true,
-                                    })
-                                }) {
-                                    Ok(Response::Created { id }) => {
-                                        app.need_sessions = true; // 会话标题要显示项目名
-                                        View::Attached(id)
-                                    }
-                                    Ok(Response::Error(e)) => {
-                                        app.message = Msg::err(e);
-                                        View::PickProfile {
-                                            entries,
-                                            state,
-                                            warning,
-                                        }
-                                    }
-                                    _ => {
-                                        app.message = Msg::err("创建失败".into());
-                                        View::PickProfile {
-                                            entries,
-                                            state,
-                                            warning,
-                                        }
-                                    }
-                                }
-                            }
-                            Some((i, PickAction::AskSecret(_))) => {
-                                // AskSecret(usize) 里那个下标只是占位——pick_action
-                                // 只拿得到一个 &ProfileEntry，不知道它在列表里排第几
-                                // （见 PickAction 的注释）。真下标是这里的 i，
-                                // 从 entries[i] 取出来的正是被选中的这一行。
-                                let e = &entries[i];
-                                View::EnterSecret {
-                                    profile: e.name.clone(),
-                                    label: e.label.clone(),
-                                    // NeedsSecret 状态却没带 SecretPrompt 是数据不一致
-                                    // （daemon 那边的 bug），兜底成空提示而不是 panic——
-                                    // 用户最多看到少一行说明，不该因为这个直接崩溃。
-                                    prompt: e.secret.clone().unwrap_or(SecretPrompt {
-                                        hint: String::new(),
-                                        url: None,
-                                    }),
-                                    buf: String::new(),
-                                    phase: SecretPhase::Typing,
-                                    // 从选择器进来的意图是「开工」，存完直接建会话，
-                                    // 不回这里。
-                                    return_to_settings: false,
-                                }
-                            }
-                            Some((_, PickAction::Install { profile, command })) => {
-                                // 用命令行会话跑安装命令，让用户看着它装，而不是
-                                // 干等一句「装不了」。remember: false —— 这不是
-                                // 用户选的 agent，记了下次按 n 会掉进命令行。
-                                let dir = app.current_dir.display().to_string();
-                                match app.client().and_then(|c| {
-                                    c.call(Request::Create {
-                                        dir,
-                                        profile: "shell".into(),
-                                        remember: false,
-                                    })
-                                }) {
-                                    Ok(Response::Created { id }) => {
-                                        let line = format!("{}\n", command.join(" "));
-                                        let _ = app.client().and_then(|c| {
-                                            c.call(Request::Input { id, text: line })
-                                        });
-                                        app.message = format!(
-                                            "正在安装 {profile}，装完按 Ctrl+Q 回看板再按 N"
-                                        )
-                                        .into();
-                                        app.need_sessions = true;
-                                        View::Attached(id)
-                                    }
-                                    _ => {
-                                        app.message = Msg::err("开不了安装窗口".into());
-                                        View::PickProfile {
-                                            entries,
-                                            state,
-                                            warning,
-                                        }
-                                    }
-                                }
-                            }
-                            Some((_, PickAction::Blocked(msg))) => {
-                                app.message = Msg::err(msg);
-                                View::PickProfile {
-                                    entries,
-                                    state,
-                                    warning,
-                                }
-                            }
-                        };
-                    }
-                }
-                View::PickProject {
-                    all,
-                    mut filter,
-                    mut state,
-                    typing_path,
-                } => match typing_path {
-                    // ——手输路径态：可见字符全进输入框，不再当过滤用——
-                    Some(mut buf) => match key.code {
-                        KeyCode::Esc => {
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: None,
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if buf.trim().is_empty() {
-                                // expand_path("", base) 会解析成 base 自己（非绝对路径走
-                                // base.join("")），is_dir() 照样为真——空输入不挡住的话，
-                                // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
-                                app.message = Msg::err("还没输入路径".into());
-                                app.view = View::PickProject {
-                                    all,
-                                    filter,
-                                    state,
-                                    typing_path: Some(buf),
-                                };
-                            } else {
-                                let p = expand_path(&buf, &app.start_dir);
-                                if p.is_dir() {
-                                    // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
-                                    app.message =
-                                        format!("已切到 {}", short_path(&p.display().to_string()))
-                                            .into();
-                                    app.current_dir = p;
-                                    app.view = View::Board;
-                                } else {
-                                    // 不是 git 仓库这件事不在这里判——留给 create()
-                                    app.message = Msg::err(format!("{} 不是一个目录", p.display()));
-                                    app.view = View::PickProject {
-                                        all,
-                                        filter,
-                                        state,
-                                        typing_path: Some(buf),
-                                    };
-                                }
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            buf.pop();
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: Some(buf),
-                            };
-                        }
-                        KeyCode::Char(c) => {
-                            buf.push(c);
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: Some(buf),
-                            };
-                        }
-                        _ => {
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: Some(buf),
-                            }
-                        }
-                    },
-                    // ——列表态——
-                    None => match key.code {
-                        KeyCode::Esc => app.view = View::Board,
-                        KeyCode::Down | KeyCode::Up => {
-                            let delta = if key.code == KeyCode::Down { 1 } else { -1 };
-                            // +1 是末行那个「手输路径…」，它不参与过滤，永远在
-                            let n = filter_projects(&all, &filter).len() + 1;
-                            move_sel_n(&mut state, n, delta);
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: None,
-                            };
-                        }
-                        KeyCode::Enter => {
-                            let shown = filter_projects(&all, &filter);
-                            let i = state.selected().unwrap_or(0);
-                            if i >= shown.len() {
-                                // 选中的是末行「手输路径…」
-                                app.view = View::PickProject {
-                                    all,
-                                    filter,
-                                    state,
-                                    typing_path: Some(String::new()),
-                                };
-                            } else {
-                                let p = PathBuf::from(&shown[i]);
-                                if p.is_dir() {
-                                    app.message =
-                                        format!("已切到 {}", short_path(&shown[i])).into();
-                                    app.current_dir = p;
-                                    app.view = View::Board;
-                                } else {
-                                    // 列表里那条不删——可能只是外置盘没挂
-                                    app.message =
-                                        Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
-                                    app.view = View::PickProject {
-                                        all,
-                                        filter,
-                                        state,
-                                        typing_path: None,
-                                    };
-                                }
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            filter.pop();
-                            state.select(Some(0));
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: None,
-                            };
-                        }
-                        KeyCode::Char(c) => {
-                            filter.push(c);
-                            // 过滤变了就回到第一项，否则光标可能停在已被过滤掉的行号上
-                            state.select(Some(0));
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: None,
-                            };
-                        }
-                        _ => {
-                            app.view = View::PickProject {
-                                all,
-                                filter,
-                                state,
-                                typing_path: None,
-                            }
-                        }
-                    },
-                },
-                View::Attached(id) => {
-                    // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
-                    // 送进去——方向键、退格、Tab、Ctrl 组合都要能用，否则在 Claude Code
-                    // 里连打错字都退不了格。Esc 必须还给 agent——Claude Code 靠它
-                    // 取消/清空/关弹窗（底部那句 "Esc to cancel"）；Ctrl+B 也必须还回去，
-                    // 那是 Claude Code 的「转后台」。逆转键挑 F2 是因为没有 CLI agent
-                    // 在用它，不必搞双击透传那种隐形状态。
-                    if key.code == KeyCode::F(2) {
-                        app.view = View::Board;
-                        app.need_sessions = true;
-                    } else if let Some(text) = key_to_input(&key) {
-                        // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
-                        // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
-                        if app
-                            .client()
-                            .and_then(|c| c.call(Request::Input { id, text }))
-                            .is_err()
-                        {
-                            app.message = Msg::err("守护进程连不上，刚才那次输入没发出去".into());
-                        }
-                    }
-                }
-                View::EnterSecret {
-                    profile,
-                    label,
-                    prompt,
-                    mut buf,
-                    phase,
-                    return_to_settings,
-                } => match phase.clone() {
-                    SecretPhase::Verifying => {
-                        // 验证在后台线程跑，buf 已经发出去了，这期间敲字符/回车
-                        // 都改不了那次正在飞的请求，只会让用户误以为在做别的事。
-                        // 只留 Esc：想退就现在退，且必须现在就扔掉 verify_rx——
-                        // 不然迟到的结果会套在一个用户已经不认得的视图上。
-                        if key.code == KeyCode::Esc {
-                            app.verify_rx = None;
-                            app.view = if return_to_settings {
-                                View::Secrets {
-                                    entries: Vec::new(),
-                                    state: ListState::default(),
-                                    pending_delete: None,
-                                }
-                            } else {
-                                View::PickProfile {
-                                    entries: Vec::new(),
-                                    state: ListState::default(),
-                                    warning: None,
-                                }
-                            };
-                        } else {
-                            app.view = View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase: SecretPhase::Verifying,
-                                return_to_settings,
-                            };
-                        }
-                    }
-                    SecretPhase::Typing | SecretPhase::Failed(_) => match key.code {
-                        KeyCode::Esc => {
-                            app.view = if return_to_settings {
-                                View::Secrets {
-                                    entries: Vec::new(),
-                                    state: ListState::default(),
-                                    pending_delete: None,
-                                }
-                            } else {
-                                View::PickProfile {
-                                    entries: Vec::new(),
-                                    state: ListState::default(),
-                                    warning: None,
-                                }
-                            };
-                        }
-                        KeyCode::Enter => {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            let sock = socket.to_path_buf();
-                            let p = profile.clone();
-                            let v = buf.clone();
-                            // 结果送回来时要能比对"这还是不是当初发起这次验证的
-                            // 那个请求"（见 `verify_outcome_applies_to`），所以
-                            // 在 `p`/`v` 被移进 `Request::VerifySecret` 之前先
-                            // 各留一份拷贝，跟结果一起送回主循环。
-                            let stamped_profile = p.clone();
-                            let stamped_buf = v.clone();
-                            std::thread::spawn(move || {
-                                // 另开一条连接：主循环那条还要继续画界面
-                                let outcome = Client::connect(&sock)
-                                    .and_then(|mut c| {
-                                        c.call(Request::VerifySecret {
-                                            profile: p,
-                                            value: v,
-                                        })
-                                    })
-                                    .map(|r| match r {
-                                        Response::Verify(o) => o,
-                                        _ => VerifyOutcome::Unreachable,
-                                    })
-                                    .unwrap_or(VerifyOutcome::Unreachable);
-                                let _ = tx.send((stamped_profile, stamped_buf, outcome));
-                            });
-                            app.verify_rx = Some(rx);
-                            app.view = View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase: SecretPhase::Verifying,
-                                return_to_settings,
-                            };
-                        }
-                        KeyCode::Backspace => {
-                            buf.pop();
-                            app.view = View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase: SecretPhase::Typing,
-                                return_to_settings,
-                            };
-                        }
-                        // Ctrl+O 不用 o：o 得留给密钥输入本身
-                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // MINOR 8（最终整分支 code review）：`open` 只在 macOS
-                            // 上存在，Linux 桌面环境一般是 `xdg-open`；两边都
-                            // 打不开的话必须告诉用户，不能让「Ctrl+O 打开申领
-                            // 页面」这行提示看着能按、按下去却悄无声息——用户
-                            // 会以为是自己按错了键。
-                            if let Some(url) = &prompt.url {
-                                if !open_url(url) {
-                                    app.message =
-                                        Msg::err(format!("打不开浏览器，自己去访问 {url}"));
-                                }
-                            }
-                            app.view = View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase,
-                                return_to_settings,
-                            };
-                        }
-                        KeyCode::Char(c) => {
-                            buf.push(c);
-                            app.view = View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase: SecretPhase::Typing,
-                                return_to_settings,
-                            };
-                        }
-                        _ => {
-                            app.view = View::EnterSecret {
-                                profile,
-                                label,
-                                prompt,
-                                buf,
-                                phase,
-                                return_to_settings,
-                            };
-                        }
-                    },
-                },
-                View::Secrets {
-                    entries,
-                    mut state,
-                    pending_delete,
-                } => match key.code {
-                    KeyCode::Esc => app.view = View::Board,
-                    KeyCode::Down | KeyCode::Up => {
-                        let d = if key.code == KeyCode::Down { 1 } else { -1 };
-                        move_sel_n(&mut state, secret_rows(&entries).len(), d);
-                        // 光标一动就撤销武装状态：武装的是「这一行」，挪开之后
-                        // 再按第二次 d，落地的必须是新选中行的第一次按键，不能让
-                        // 上一行攒的「再按一次就删」悄悄延续到新行头上（见 Finding 1）。
-                        // 顺带清掉「再按一次删除 X」那句消息——行内提示已经跟着
-                        // 光标挪走了，底部消息栏要是还留着旧行的名字，用户会
-                        // 搞不清这次挪动到底有没有把武装状态带走。
-                        if pending_delete.is_some() {
-                            app.message = "".into();
-                        }
-                        app.view = View::Secrets {
-                            entries,
-                            state,
-                            pending_delete: None,
-                        };
-                    }
-                    KeyCode::Enter => {
-                        let rows = secret_rows(&entries);
-                        // find 而不是直接 entries[i]：rows 是 entries 过滤掉不需要密钥
-                        // 的行之后的结果，下标不对应；按名字在 entries 里找回
-                        // 完整的那一条，才拿得到 label/secret 提示。
-                        let target = state
-                            .selected()
-                            .and_then(|i| rows.get(i))
-                            .and_then(|(name, _)| entries.iter().find(|e| &e.name == name));
-                        app.view = match target {
-                            Some(e) => View::EnterSecret {
-                                profile: e.name.clone(),
-                                label: e.label.clone(),
-                                // 这一页只列了 secret.is_some() 的行（见 secret_rows），
-                                // 所以这里的 unwrap_or 只是跟 AskSecret 那条路径的兜底
-                                // 手法保持一致，实际不会被这个默认值命中。
-                                prompt: e.secret.clone().unwrap_or(SecretPrompt {
-                                    hint: String::new(),
-                                    url: None,
-                                }),
-                                buf: String::new(),
-                                phase: SecretPhase::Typing,
-                                // 从设置页进来，改完要回设置页
-                                return_to_settings: true,
-                            },
-                            // Enter 也是「其他键」，没找到目标（没有选中行）时
-                            // 留在原地也要把武装状态清掉。
-                            None => View::Secrets {
-                                entries,
-                                state,
-                                pending_delete: None,
-                            },
-                        };
-                    }
-                    KeyCode::Char('d') => {
-                        let rows = secret_rows(&entries);
-                        let target = state.selected().and_then(|i| rows.get(i)).cloned();
-                        // 判断这半是纯函数（见 decide_delete_key 的文档注释，
-                        // 它是这个任务的单测入口）；发不发 DeleteSecret 请求
-                        // 这半必须留在这里，因为它要碰 daemon 连接。
-                        app.view = match decide_delete_key(target, &pending_delete) {
-                            // 没配过的密钥没什么可删的——照样发一次 DeleteSecret
-                            // 只会得到一句空洞的「已删除」，用户会怀疑自己是不是
-                            // 删错了别的东西。
-                            DeleteKeyAction::NotConfigured => {
-                                app.message = "这个还没配密钥，没什么可删的".into();
-                                View::Secrets {
-                                    entries,
-                                    state,
-                                    pending_delete: None,
-                                }
-                            }
-                            // 第二次按 d：武装记的名字正是当前选中行，才真删。
-                            DeleteKeyAction::Confirm(name) => {
-                                match app.client().and_then(|c| {
-                                    c.call(Request::DeleteSecret {
-                                        profile: name.clone(),
-                                    })
-                                }) {
-                                    Ok(Response::Ok) => {
-                                        app.message = format!(
-                                            "已删除 {} 的密钥",
-                                            entries
-                                                .iter()
-                                                .find(|e| e.name == name)
-                                                .map(|e| e.label.clone())
-                                                .unwrap_or(name.clone())
-                                        )
-                                        .into();
-                                        refetch_secrets(&mut app, Some(&name))
-                                    }
-                                    Ok(Response::Error(e)) => {
-                                        app.message = Msg::err(e);
-                                        View::Secrets {
-                                            entries,
-                                            state,
-                                            pending_delete: None,
-                                        }
-                                    }
-                                    _ => {
-                                        app.message = Msg::err("密钥没删掉，再试一次".into());
-                                        View::Secrets {
-                                            entries,
-                                            state,
-                                            pending_delete: None,
-                                        }
-                                    }
-                                }
-                            }
-                            // 第一次按 d：武装，不发任何请求。行内会画出「再按
-                            // d 删除」（见 draw() 里 pending_delete 那一支）；
-                            // 消息栏再重复一遍是双保险，行内提示万一没看到，
-                            // 底栏还有一句。
-                            DeleteKeyAction::Arm(name) => {
-                                app.message = format!(
-                                    "再按一次 d 删除 {} 的密钥，按其他键取消",
-                                    entries
-                                        .iter()
-                                        .find(|e| e.name == name)
-                                        .map(|e| e.label.clone())
-                                        .unwrap_or_else(|| name.clone())
-                                )
-                                .into();
-                                View::Secrets {
-                                    entries,
-                                    state,
-                                    pending_delete: Some(name),
-                                }
-                            }
-                            DeleteKeyAction::NoSelection => View::Secrets {
-                                entries,
-                                state,
-                                pending_delete: None,
-                            },
-                        };
-                    }
-                    // 任何其他键都取消武装——这是 Finding 1 要求的「反应性按键
-                    // 不该踩中确认」的核心：只有原地再按一次 d 才算确认，别的
-                    // 任何输入都当作取消，而不是悄悄忽略武装状态继续挂着。
-                    _ => {
-                        // 同 ↑↓ 分支：武装期间挂着的「再按一次删除 X」提示要
-                        // 跟着武装状态一起清掉，不然取消之后底部还留着一句
-                        // 半真半假的话。
-                        if pending_delete.is_some() {
-                            app.message = "".into();
-                        }
-                        app.view = View::Secrets {
-                            entries,
-                            state,
-                            pending_delete: None,
-                        }
-                    }
-                },
+                View::Board => handle_board(&mut app, key)?,
+                View::PickProfile { .. } => handle_pick_profile(&mut app, key)?,
+                View::PickProject { .. } => handle_pick_project(&mut app, key)?,
+                View::Attached(_) => handle_attached(&mut app, key)?,
+                View::EnterSecret { .. } => handle_enter_secret(&mut app, key)?,
+                View::Secrets { .. } => handle_secrets(&mut app, key)?,
             }
         }
 
@@ -1261,6 +498,815 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         app.message = message_after_transition(view_changed, message_changed, app.message);
     }
 
+    Ok(())
+}
+
+/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
+/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
+/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
+/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
+/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
+fn handle_board(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Down => move_sel(&mut app.list_state, &app.sessions, 1),
+        KeyCode::Up => move_sel(&mut app.list_state, &app.sessions, -1),
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
+            // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
+            // pick_action 和下面 View::PickProfile 的按键分支。n 和 N
+            // 都要这份列表——n 拿它判断上次那个 agent 现在还在不在
+            // Ready，N 拿它渲染选择器——所以只拉一次，不分两条路各拉各的。
+            match app.client().and_then(|c| c.call(Request::Profiles)) {
+                Ok(Response::Profiles { entries, warning }) => {
+                    // 把「拉完列表但没能直开」的三种落点（选择器为空、
+                    // 建会话失败两种）收在一处，省得同一段 ListState
+                    // 初始化抄三遍——那种抄法迟早有一份漏了空表守卫。
+                    let picker = |entries: Vec<ProfileEntry>, warning: Option<String>| {
+                        let mut state = ListState::default();
+                        // daemon 目前总是至少返回九个内置 profile，这里
+                        // 空表分支基本走不到；但选中一个不存在的下标，
+                        // 按 Enter 就是 entries[0] 越界 panic——这种最坏
+                        // 结果不该只靠"实践中到不了"兜底，一行守卫不值钱。
+                        if !entries.is_empty() {
+                            state.select(Some(0));
+                        }
+                        View::PickProfile {
+                            entries,
+                            state,
+                            warning,
+                        }
+                    };
+                    // 大写 N 一定要看一眼选择器，不查上次用的是谁；
+                    // 小写 n 才去问 daemon 上次记的是哪个 agent。
+                    let last = if key.code == KeyCode::Char('n') {
+                        match app.client().and_then(|c| c.call(Request::LastProfile)) {
+                            Ok(Response::LastProfile(l)) => l,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    match quick_start_target(last.as_deref(), &entries) {
+                        Some(name) => {
+                            // 同 View::PickProfile 里 PickAction::Start 那支：
+                            // 「n」等价于「已经替用户选好了上次那个」，
+                            // 建完直接进会话，不用再让他确认一遍。
+                            let dir = app.current_dir.display().to_string();
+                            match app.client().and_then(|c| {
+                                c.call(Request::Create {
+                                    dir,
+                                    profile: name,
+                                    remember: true,
+                                })
+                            }) {
+                                Ok(Response::Created { id }) => {
+                                    app.need_sessions = true; // 会话标题要显示项目名
+                                    app.view = View::Attached(id);
+                                }
+                                Ok(Response::Error(e)) => {
+                                    app.message = Msg::err(e);
+                                    app.view = picker(entries, warning);
+                                }
+                                _ => {
+                                    app.message = Msg::err("创建失败".into());
+                                    app.view = picker(entries, warning);
+                                }
+                            }
+                        }
+                        None => app.view = picker(entries, warning),
+                    }
+                }
+                // 列表都拿不到，直开和选择器都没法走，只能告诉用户
+                // 这次干瞪眼——留在 Board 上，视图没变，走到循环
+                // 末尾 message_after_transition 会把这条消息原样
+                // 留住（同其他分支，不用 continue 抢跑跳过收尾）。
+                Ok(Response::Error(e)) => app.message = Msg::err(e),
+                _ => app.message = Msg::err("拿不到 agent 列表".into()),
+            }
+        }
+        KeyCode::Char('p') => {
+            // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
+            // 自己从来没开过项目。
+            match app.client().and_then(|c| c.call(Request::Projects)) {
+                Ok(Response::Projects(mut all)) => {
+                    // 全新守护进程列表是空的，补上启动目录，
+                    // 保证第一次用也不会看到空列表。
+                    let start = app.start_dir.display().to_string();
+                    if !all.contains(&start) {
+                        all.push(start);
+                    }
+                    let mut state = ListState::default();
+                    state.select(Some(0));
+                    app.view = View::PickProject {
+                        all,
+                        filter: String::new(),
+                        state,
+                        typing_path: None,
+                    };
+                }
+                Ok(Response::Error(e)) => app.message = Msg::err(e),
+                _ => app.message = Msg::err("拿不到项目列表".into()),
+            }
+        }
+        KeyCode::Char('c') => {
+            // 拿不到列表就不进设置页：留在看板上给一句错误，总比
+            // 弹进一个既没数据、又没地方显示错误的空白页强
+            // （`View::Secrets` 没有 `warning` 字段，见其字段注释）。
+            match app.client().and_then(|c| c.call(Request::Profiles)) {
+                Ok(Response::Profiles { entries, .. }) => {
+                    let mut state = ListState::default();
+                    if !secret_rows(&entries).is_empty() {
+                        state.select(Some(0));
+                    }
+                    app.view = View::Secrets {
+                        entries,
+                        state,
+                        pending_delete: None,
+                    };
+                }
+                Ok(Response::Error(e)) => app.message = Msg::err(e),
+                _ => app.message = Msg::err("拿不到密钥列表".into()),
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(id) = selected(&app.sessions, &app.list_state).map(|s| s.id) {
+                app.view = View::Attached(id);
+                app.need_sessions = true; // 会话标题要显示项目名
+            }
+        }
+        KeyCode::Char('u') => {
+            app.message = act(app, |id| Request::Undo { id });
+        }
+        KeyCode::Char('s') => {
+            app.message = act(app, |id| Request::Stop { id });
+        }
+        KeyCode::Char('d') => {
+            if let Some(id) = selected(&app.sessions, &app.list_state).map(|s| s.id) {
+                app.message = match app.client().and_then(|c| c.call(Request::Diff { id })) {
+                    Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
+                    Ok(Response::Diff(v)) => v
+                        .iter()
+                        .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                        .into(),
+                    Ok(Response::Error(e)) => Msg::err(e),
+                    _ => Msg::err("请求失败".into()),
+                };
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// **这个函数里永远不要 `continue`。** 见 `handle_board` 的文档注释。
+fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::PickProfile {
+        entries,
+        mut state,
+        warning,
+    } = app.view.clone()
+    else {
+        return Ok(());
+    };
+    if key.code == KeyCode::Esc {
+        app.view = View::Board;
+    } else {
+        // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
+        // 挪完直接落到 chosen = None，不会误触发下面的路由。
+        let chosen: Option<usize> = match key.code {
+            KeyCode::Down | KeyCode::Up => {
+                let d = if key.code == KeyCode::Down { 1 } else { -1 };
+                move_sel_n(&mut state, entries.len(), d);
+                None
+            }
+            KeyCode::Enter => state.selected(),
+            KeyCode::Char(c) => digit_index(c).filter(|i| *i < entries.len()),
+            _ => None,
+        };
+        // 四条分支的落点：pick_action 只是个纯函数分类器，真正
+        // 建会话/开安装窗口这些带副作用的活儿在这里做。
+        app.view = match chosen.map(|i| (i, pick_action(&entries[i]))) {
+            None => View::PickProfile {
+                entries,
+                state,
+                warning,
+            },
+            Some((_, PickAction::Start(name))) => {
+                // 选完直接进会话。用户选中的意图就是「我要用这个
+                // agent 干活」，先弹回看板再让他找一遍自己刚建的
+                // 会话是白让人做第二次选择。建失败才回选择器。
+                let dir = app.current_dir.display().to_string();
+                match app.client().and_then(|c| {
+                    c.call(Request::Create {
+                        dir,
+                        profile: name,
+                        // 选择器里选的就是用户真的要用的 agent——
+                        // 与「帮你装 CLI」那条 remember=false 的路径区分开。
+                        remember: true,
+                    })
+                }) {
+                    Ok(Response::Created { id }) => {
+                        app.need_sessions = true; // 会话标题要显示项目名
+                        View::Attached(id)
+                    }
+                    Ok(Response::Error(e)) => {
+                        app.message = Msg::err(e);
+                        View::PickProfile {
+                            entries,
+                            state,
+                            warning,
+                        }
+                    }
+                    _ => {
+                        app.message = Msg::err("创建失败".into());
+                        View::PickProfile {
+                            entries,
+                            state,
+                            warning,
+                        }
+                    }
+                }
+            }
+            Some((i, PickAction::AskSecret(_))) => {
+                // AskSecret(usize) 里那个下标只是占位——pick_action
+                // 只拿得到一个 &ProfileEntry，不知道它在列表里排第几
+                // （见 PickAction 的注释）。真下标是这里的 i，
+                // 从 entries[i] 取出来的正是被选中的这一行。
+                let e = &entries[i];
+                View::EnterSecret {
+                    profile: e.name.clone(),
+                    label: e.label.clone(),
+                    // NeedsSecret 状态却没带 SecretPrompt 是数据不一致
+                    // （daemon 那边的 bug），兜底成空提示而不是 panic——
+                    // 用户最多看到少一行说明，不该因为这个直接崩溃。
+                    prompt: e.secret.clone().unwrap_or(SecretPrompt {
+                        hint: String::new(),
+                        url: None,
+                    }),
+                    buf: String::new(),
+                    phase: SecretPhase::Typing,
+                    // 从选择器进来的意图是「开工」，存完直接建会话，
+                    // 不回这里。
+                    return_to_settings: false,
+                }
+            }
+            Some((_, PickAction::Install { profile, command })) => {
+                // 用命令行会话跑安装命令，让用户看着它装，而不是
+                // 干等一句「装不了」。remember: false —— 这不是
+                // 用户选的 agent，记了下次按 n 会掉进命令行。
+                let dir = app.current_dir.display().to_string();
+                match app.client().and_then(|c| {
+                    c.call(Request::Create {
+                        dir,
+                        profile: "shell".into(),
+                        remember: false,
+                    })
+                }) {
+                    Ok(Response::Created { id }) => {
+                        let line = format!("{}\n", command.join(" "));
+                        let _ = app
+                            .client()
+                            .and_then(|c| c.call(Request::Input { id, text: line }));
+                        app.message =
+                            format!("正在安装 {profile}，装完按 Ctrl+Q 回看板再按 N").into();
+                        app.need_sessions = true;
+                        View::Attached(id)
+                    }
+                    _ => {
+                        app.message = Msg::err("开不了安装窗口".into());
+                        View::PickProfile {
+                            entries,
+                            state,
+                            warning,
+                        }
+                    }
+                }
+            }
+            Some((_, PickAction::Blocked(msg))) => {
+                app.message = Msg::err(msg);
+                View::PickProfile {
+                    entries,
+                    state,
+                    warning,
+                }
+            }
+        };
+    }
+    Ok(())
+}
+
+/// **这个函数里永远不要 `continue`。** 见 `handle_board` 的文档注释。
+fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::PickProject {
+        all,
+        mut filter,
+        mut state,
+        typing_path,
+    } = app.view.clone()
+    else {
+        return Ok(());
+    };
+    match typing_path {
+        // ——手输路径态：可见字符全进输入框，不再当过滤用——
+        Some(mut buf) => match key.code {
+            KeyCode::Esc => {
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: None,
+                }
+            }
+            KeyCode::Enter => {
+                if buf.trim().is_empty() {
+                    // expand_path("", base) 会解析成 base 自己（非绝对路径走
+                    // base.join("")），is_dir() 照样为真——空输入不挡住的话，
+                    // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
+                    app.message = Msg::err("还没输入路径".into());
+                    app.view = View::PickProject {
+                        all,
+                        filter,
+                        state,
+                        typing_path: Some(buf),
+                    };
+                } else {
+                    let p = expand_path(&buf, &app.start_dir);
+                    if p.is_dir() {
+                        // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
+                        app.message =
+                            format!("已切到 {}", short_path(&p.display().to_string())).into();
+                        app.current_dir = p;
+                        app.view = View::Board;
+                    } else {
+                        // 不是 git 仓库这件事不在这里判——留给 create()
+                        app.message = Msg::err(format!("{} 不是一个目录", p.display()));
+                        app.view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: Some(buf),
+                        };
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: Some(buf),
+                };
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: Some(buf),
+                };
+            }
+            _ => {
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: Some(buf),
+                }
+            }
+        },
+        // ——列表态——
+        None => match key.code {
+            KeyCode::Esc => app.view = View::Board,
+            KeyCode::Down | KeyCode::Up => {
+                let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                // +1 是末行那个「手输路径…」，它不参与过滤，永远在
+                let n = filter_projects(&all, &filter).len() + 1;
+                move_sel_n(&mut state, n, delta);
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: None,
+                };
+            }
+            KeyCode::Enter => {
+                let shown = filter_projects(&all, &filter);
+                let i = state.selected().unwrap_or(0);
+                if i >= shown.len() {
+                    // 选中的是末行「手输路径…」
+                    app.view = View::PickProject {
+                        all,
+                        filter,
+                        state,
+                        typing_path: Some(String::new()),
+                    };
+                } else {
+                    let p = PathBuf::from(&shown[i]);
+                    if p.is_dir() {
+                        app.message = format!("已切到 {}", short_path(&shown[i])).into();
+                        app.current_dir = p;
+                        app.view = View::Board;
+                    } else {
+                        // 列表里那条不删——可能只是外置盘没挂
+                        app.message = Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
+                        app.view = View::PickProject {
+                            all,
+                            filter,
+                            state,
+                            typing_path: None,
+                        };
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                filter.pop();
+                state.select(Some(0));
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: None,
+                };
+            }
+            KeyCode::Char(c) => {
+                filter.push(c);
+                // 过滤变了就回到第一项，否则光标可能停在已被过滤掉的行号上
+                state.select(Some(0));
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: None,
+                };
+            }
+            _ => {
+                app.view = View::PickProject {
+                    all,
+                    filter,
+                    state,
+                    typing_path: None,
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+/// **这个函数里永远不要 `continue`。** 见 `handle_board` 的文档注释。
+fn handle_attached(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::Attached(id) = app.view.clone() else {
+        return Ok(());
+    };
+    // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
+    // 送进去——方向键、退格、Tab、Ctrl 组合都要能用，否则在 Claude Code
+    // 里连打错字都退不了格。Esc 必须还给 agent——Claude Code 靠它
+    // 取消/清空/关弹窗（底部那句 "Esc to cancel"）；Ctrl+B 也必须还回去，
+    // 那是 Claude Code 的「转后台」。逆转键挑 F2 是因为没有 CLI agent
+    // 在用它，不必搞双击透传那种隐形状态。
+    if key.code == KeyCode::F(2) {
+        app.view = View::Board;
+        app.need_sessions = true;
+    } else if let Some(text) = key_to_input(&key) {
+        // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
+        // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
+        if app
+            .client()
+            .and_then(|c| c.call(Request::Input { id, text }))
+            .is_err()
+        {
+            app.message = Msg::err("守护进程连不上，刚才那次输入没发出去".into());
+        }
+    }
+    Ok(())
+}
+
+/// **这个函数里永远不要 `continue`。** 见 `handle_board` 的文档注释。
+fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::EnterSecret {
+        profile,
+        label,
+        prompt,
+        mut buf,
+        phase,
+        return_to_settings,
+    } = app.view.clone()
+    else {
+        return Ok(());
+    };
+    match phase.clone() {
+        SecretPhase::Verifying => {
+            // 验证在后台线程跑，buf 已经发出去了，这期间敲字符/回车
+            // 都改不了那次正在飞的请求，只会让用户误以为在做别的事。
+            // 只留 Esc：想退就现在退，且必须现在就扔掉 verify_rx——
+            // 不然迟到的结果会套在一个用户已经不认得的视图上。
+            if key.code == KeyCode::Esc {
+                app.verify_rx = None;
+                app.view = if return_to_settings {
+                    View::Secrets {
+                        entries: Vec::new(),
+                        state: ListState::default(),
+                        pending_delete: None,
+                    }
+                } else {
+                    View::PickProfile {
+                        entries: Vec::new(),
+                        state: ListState::default(),
+                        warning: None,
+                    }
+                };
+            } else {
+                app.view = View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    phase: SecretPhase::Verifying,
+                    return_to_settings,
+                };
+            }
+        }
+        SecretPhase::Typing | SecretPhase::Failed(_) => match key.code {
+            KeyCode::Esc => {
+                app.view = if return_to_settings {
+                    View::Secrets {
+                        entries: Vec::new(),
+                        state: ListState::default(),
+                        pending_delete: None,
+                    }
+                } else {
+                    View::PickProfile {
+                        entries: Vec::new(),
+                        state: ListState::default(),
+                        warning: None,
+                    }
+                };
+            }
+            KeyCode::Enter => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                // 后台验证线程要自己开一条到守护进程的连接——主循环这条 client
+                // 正忙着画界面。`socket_path()` 是纯函数（只读 $HOME），比把
+                // Client 内部私有的 socket 字段掏出来更省事。
+                let sock = socket_path();
+                let p = profile.clone();
+                let v = buf.clone();
+                // 结果送回来时要能比对"这还是不是当初发起这次验证的
+                // 那个请求"（见 `verify_outcome_applies_to`），所以
+                // 在 `p`/`v` 被移进 `Request::VerifySecret` 之前先
+                // 各留一份拷贝，跟结果一起送回主循环。
+                let stamped_profile = p.clone();
+                let stamped_buf = v.clone();
+                std::thread::spawn(move || {
+                    // 另开一条连接：主循环那条还要继续画界面
+                    let outcome = Client::connect(&sock)
+                        .and_then(|mut c| {
+                            c.call(Request::VerifySecret {
+                                profile: p,
+                                value: v,
+                            })
+                        })
+                        .map(|r| match r {
+                            Response::Verify(o) => o,
+                            _ => VerifyOutcome::Unreachable,
+                        })
+                        .unwrap_or(VerifyOutcome::Unreachable);
+                    let _ = tx.send((stamped_profile, stamped_buf, outcome));
+                });
+                app.verify_rx = Some(rx);
+                app.view = View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    phase: SecretPhase::Verifying,
+                    return_to_settings,
+                };
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.view = View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    phase: SecretPhase::Typing,
+                    return_to_settings,
+                };
+            }
+            // Ctrl+O 不用 o：o 得留给密钥输入本身
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // MINOR 8（最终整分支 code review）：`open` 只在 macOS
+                // 上存在，Linux 桌面环境一般是 `xdg-open`；两边都
+                // 打不开的话必须告诉用户，不能让「Ctrl+O 打开申领
+                // 页面」这行提示看着能按、按下去却悄无声息——用户
+                // 会以为是自己按错了键。
+                if let Some(url) = &prompt.url {
+                    if !open_url(url) {
+                        app.message = Msg::err(format!("打不开浏览器，自己去访问 {url}"));
+                    }
+                }
+                app.view = View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    phase,
+                    return_to_settings,
+                };
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.view = View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    phase: SecretPhase::Typing,
+                    return_to_settings,
+                };
+            }
+            _ => {
+                app.view = View::EnterSecret {
+                    profile,
+                    label,
+                    prompt,
+                    buf,
+                    phase,
+                    return_to_settings,
+                };
+            }
+        },
+    }
+    Ok(())
+}
+
+/// **这个函数里永远不要 `continue`。** 见 `handle_board` 的文档注释。
+fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::Secrets {
+        entries,
+        mut state,
+        pending_delete,
+    } = app.view.clone()
+    else {
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Esc => app.view = View::Board,
+        KeyCode::Down | KeyCode::Up => {
+            let d = if key.code == KeyCode::Down { 1 } else { -1 };
+            move_sel_n(&mut state, secret_rows(&entries).len(), d);
+            // 光标一动就撤销武装状态：武装的是「这一行」，挪开之后
+            // 再按第二次 d，落地的必须是新选中行的第一次按键，不能让
+            // 上一行攒的「再按一次就删」悄悄延续到新行头上（见 Finding 1）。
+            // 顺带清掉「再按一次删除 X」那句消息——行内提示已经跟着
+            // 光标挪走了，底部消息栏要是还留着旧行的名字，用户会
+            // 搞不清这次挪动到底有没有把武装状态带走。
+            if pending_delete.is_some() {
+                app.message = "".into();
+            }
+            app.view = View::Secrets {
+                entries,
+                state,
+                pending_delete: None,
+            };
+        }
+        KeyCode::Enter => {
+            let rows = secret_rows(&entries);
+            // find 而不是直接 entries[i]：rows 是 entries 过滤掉不需要密钥
+            // 的行之后的结果，下标不对应；按名字在 entries 里找回
+            // 完整的那一条，才拿得到 label/secret 提示。
+            let target = state
+                .selected()
+                .and_then(|i| rows.get(i))
+                .and_then(|(name, _)| entries.iter().find(|e| &e.name == name));
+            app.view = match target {
+                Some(e) => View::EnterSecret {
+                    profile: e.name.clone(),
+                    label: e.label.clone(),
+                    // 这一页只列了 secret.is_some() 的行（见 secret_rows），
+                    // 所以这里的 unwrap_or 只是跟 AskSecret 那条路径的兜底
+                    // 手法保持一致，实际不会被这个默认值命中。
+                    prompt: e.secret.clone().unwrap_or(SecretPrompt {
+                        hint: String::new(),
+                        url: None,
+                    }),
+                    buf: String::new(),
+                    phase: SecretPhase::Typing,
+                    // 从设置页进来，改完要回设置页
+                    return_to_settings: true,
+                },
+                // Enter 也是「其他键」，没找到目标（没有选中行）时
+                // 留在原地也要把武装状态清掉。
+                None => View::Secrets {
+                    entries,
+                    state,
+                    pending_delete: None,
+                },
+            };
+        }
+        KeyCode::Char('d') => {
+            let rows = secret_rows(&entries);
+            let target = state.selected().and_then(|i| rows.get(i)).cloned();
+            // 判断这半是纯函数（见 decide_delete_key 的文档注释，
+            // 它是这个任务的单测入口）；发不发 DeleteSecret 请求
+            // 这半必须留在这里，因为它要碰 daemon 连接。
+            app.view = match decide_delete_key(target, &pending_delete) {
+                // 没配过的密钥没什么可删的——照样发一次 DeleteSecret
+                // 只会得到一句空洞的「已删除」，用户会怀疑自己是不是
+                // 删错了别的东西。
+                DeleteKeyAction::NotConfigured => {
+                    app.message = "这个还没配密钥，没什么可删的".into();
+                    View::Secrets {
+                        entries,
+                        state,
+                        pending_delete: None,
+                    }
+                }
+                // 第二次按 d：武装记的名字正是当前选中行，才真删。
+                DeleteKeyAction::Confirm(name) => {
+                    match app.client().and_then(|c| {
+                        c.call(Request::DeleteSecret {
+                            profile: name.clone(),
+                        })
+                    }) {
+                        Ok(Response::Ok) => {
+                            app.message = format!(
+                                "已删除 {} 的密钥",
+                                entries
+                                    .iter()
+                                    .find(|e| e.name == name)
+                                    .map(|e| e.label.clone())
+                                    .unwrap_or(name.clone())
+                            )
+                            .into();
+                            refetch_secrets(app, Some(&name))
+                        }
+                        Ok(Response::Error(e)) => {
+                            app.message = Msg::err(e);
+                            View::Secrets {
+                                entries,
+                                state,
+                                pending_delete: None,
+                            }
+                        }
+                        _ => {
+                            app.message = Msg::err("密钥没删掉，再试一次".into());
+                            View::Secrets {
+                                entries,
+                                state,
+                                pending_delete: None,
+                            }
+                        }
+                    }
+                }
+                // 第一次按 d：武装，不发任何请求。行内会画出「再按
+                // d 删除」（见 draw() 里 pending_delete 那一支）；
+                // 消息栏再重复一遍是双保险，行内提示万一没看到，
+                // 底栏还有一句。
+                DeleteKeyAction::Arm(name) => {
+                    app.message = format!(
+                        "再按一次 d 删除 {} 的密钥，按其他键取消",
+                        entries
+                            .iter()
+                            .find(|e| e.name == name)
+                            .map(|e| e.label.clone())
+                            .unwrap_or_else(|| name.clone())
+                    )
+                    .into();
+                    View::Secrets {
+                        entries,
+                        state,
+                        pending_delete: Some(name),
+                    }
+                }
+                DeleteKeyAction::NoSelection => View::Secrets {
+                    entries,
+                    state,
+                    pending_delete: None,
+                },
+            };
+        }
+        // 任何其他键都取消武装——这是 Finding 1 要求的「反应性按键
+        // 不该踩中确认」的核心：只有原地再按一次 d 才算确认，别的
+        // 任何输入都当作取消，而不是悄悄忽略武装状态继续挂着。
+        _ => {
+            // 同 ↑↓ 分支：武装期间挂着的「再按一次删除 X」提示要
+            // 跟着武装状态一起清掉，不然取消之后底部还留着一句
+            // 半真半假的话。
+            if pending_delete.is_some() {
+                app.message = "".into();
+            }
+            app.view = View::Secrets {
+                entries,
+                state,
+                pending_delete: None,
+            }
+        }
+    }
     Ok(())
 }
 
