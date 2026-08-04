@@ -320,6 +320,12 @@ mod tests {
             command: vec!["cat".into()],
             is_agent: true,
             idle_pattern: Some("READY".into()),
+            busy_pattern: None,
+            env: Default::default(),
+            secret: None,
+            install: None,
+            label: Default::default(),
+            note: Default::default(),
         }
     }
 

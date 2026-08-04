@@ -15,6 +15,12 @@ fn fake_agent() -> Profile {
         command: vec!["cat".into()],
         is_agent: true,
         idle_pattern: None,
+        busy_pattern: None,
+        env: Default::default(),
+        secret: None,
+        install: None,
+        label: Default::default(),
+        note: Default::default(),
     }
 }
 
