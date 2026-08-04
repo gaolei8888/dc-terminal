@@ -103,7 +103,7 @@ cargo build --release
 | `q` | quit the board; sessions keep running |
 | `Ctrl+Q` | back out one level, wherever you are |
 
-The grid is read-only — arrows move focus, `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), `F3` jumps to the next running session, and `n`/`N`/`p`/`c`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator.
+The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), and `n`/`N`/`p`/`c`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator.
 
 Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
 
