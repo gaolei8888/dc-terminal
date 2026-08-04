@@ -29,13 +29,21 @@ pub fn status_label(s: SessionState) -> &'static str {
     }
 }
 
+/// 弱化文字（说明栏、提示、不可用项）统一用这个灰。不能用
+/// `Color::DarkGray`：它是 ANSI 亮黑（8 号色），Solarized Dark 等主题
+/// 把 8 号色设成和背景同色，整段文字直接隐形——选 agent 菜单里
+/// 所有不可用项和说明栏就这样消失过，只剩一个悬空的 ▶。
+/// `Indexed` 走 256 色表的固定灰，不经过终端主题的 16 色映射，
+/// 深浅背景下都可见。
+const DIM: Color = Color::Indexed(245);
+
 pub fn status_color(s: SessionState) -> Color {
     match s {
         SessionState::Working => Color::Cyan,
         SessionState::Asking => Color::Yellow,
         SessionState::Idle => Color::Green,
-        SessionState::Stopped => Color::DarkGray,
-        SessionState::Unknown => Color::DarkGray,
+        SessionState::Stopped => DIM,
+        SessionState::Unknown => DIM,
     }
 }
 
@@ -2012,13 +2020,13 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                     let base = if matches!(e.status, ProfileStatus::Ready) {
                         Style::default()
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(DIM)
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(num, base),
                         Span::styled(pad_to(&truncate(&e.label, 14), 14), base),
-                        Span::styled(pad_to(&truncate(&e.note, 26), 26), base.fg(Color::DarkGray)),
-                        Span::styled(reason, base.fg(Color::DarkGray)),
+                        Span::styled(pad_to(&truncate(&e.note, 26), 26), base.fg(DIM)),
+                        Span::styled(reason, base.fg(DIM)),
                     ]))
                 })
                 .collect();
@@ -2065,7 +2073,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
             if !prompt.hint.is_empty() {
                 lines.push(Line::from(Span::styled(
                     prompt.hint.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(DIM),
                 )));
                 lines.push(Line::from(""));
             }
@@ -2087,7 +2095,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "Ctrl+O 打开申领页面",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(DIM),
                 )));
             }
             // IMPORTANT 3（最终整分支 code review）：Task 13 把「回哪」这句话
@@ -2140,7 +2148,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                             Span::raw(format!("{:<20}", truncate(&name, 20))),
                             Span::styled(
                                 truncate(&short, 50),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(DIM),
                             ),
                         ]))
                     })
@@ -2191,7 +2199,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                         Span::raw(format!("{:<10}", s.profile)),
                         Span::styled(
                             format!("{:<22}", truncate(&short_path(&s.dir), 22)),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(DIM),
                         ),
                         Span::raw(truncate(&s.activity, 60)),
                     ]))
@@ -2245,7 +2253,7 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                                 Style::default().fg(if *configured {
                                     Color::Green
                                 } else {
-                                    Color::DarkGray
+                                    DIM
                                 }),
                             ),
                         ]))
