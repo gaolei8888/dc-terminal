@@ -20,6 +20,9 @@ pub enum SessionState {
     Asking,
     Idle,
     Stopped,
+    /// profile 没给任何 pattern，我们不知道它在干什么。
+    /// 显示「—」而不是猜一个——`shell` 以前就是被猜成「干活中」的。
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,9 +45,8 @@ struct Session {
     checkpoints: Vec<String>,
     state: SessionState,
     idle_re: Option<regex::Regex>,
-    /// 干活时屏幕上一定有的串（Task 6 的 tick 才会读）。跟 idle_re 一起在
+    /// 干活时屏幕上一定有的串，tick() 里判定状态用。跟 idle_re 一起在
     /// 构造时编译好，profile 的正则错误在起会话这一刻就暴露，不拖到 tick。
-    #[allow(dead_code)]
     busy_re: Option<regex::Regex>,
     pty: PtySession,
 }
@@ -130,6 +132,14 @@ impl SessionManager {
         let busy_re = profile.busy_regex()?;
         let is_agent = profile.is_agent;
 
+        // 有 pattern 才敢说「干活中」：agent 刚起来确实在初始化。
+        // 没 pattern 就一直是 Unknown，tick 也不会改它。
+        let state = if idle_re.is_some() || busy_re.is_some() {
+            SessionState::Working
+        } else {
+            SessionState::Unknown
+        };
+
         // profile 的静态 env 打底，密钥覆盖上去。密钥不在 profile 文件里，
         // 只在这一步才和命令合到一起——profile 文件因此可以随便拷贝分享。
         //
@@ -155,7 +165,7 @@ impl SessionManager {
             dir: dir.to_path_buf(),
             is_agent,
             checkpoints,
-            state: SessionState::Working,
+            state,
             idle_re,
             busy_re,
             pty,
@@ -307,13 +317,27 @@ impl SessionManager {
             if s.state == SessionState::Asking {
                 continue;
             }
-            if let Some(re) = &s.idle_re {
-                s.state = if re.is_match(&s.pty.screen_text()) {
-                    SessionState::Idle
-                } else {
-                    SessionState::Working
-                };
+            // busy 优先：agent 干活时的「按 esc 中断」提示是稳定的，
+            // 而空闲时的输入框占位符用户一打字就没了。
+            // screen_text() 只取一次，两个分支共用——它要扫一遍整屏文字，
+            // 每个会话每秒被 tick 5 次，没必要算两遍。
+            if s.busy_re.is_some() || s.idle_re.is_some() {
+                let text = s.pty.screen_text();
+                if let Some(re) = &s.busy_re {
+                    s.state = if re.is_match(&text) {
+                        SessionState::Working
+                    } else {
+                        SessionState::Idle
+                    };
+                } else if let Some(re) = &s.idle_re {
+                    s.state = if re.is_match(&text) {
+                        SessionState::Idle
+                    } else {
+                        SessionState::Working
+                    };
+                }
             }
+            // 两个都没有：状态不动，保持 Unknown
         }
     }
 }
@@ -349,6 +373,12 @@ mod tests {
     /// 大多数测试不关心密钥，只是要满足 `create()` 新增的形参。
     fn empty_secrets() -> Option<&'static str> {
         None
+    }
+
+    /// 测试专用：查一个会话此刻的状态。跟 `screen_text_for_test` 一样，
+    /// 省得每条断言都重新拼一遍 `list().iter().find(...)`。
+    fn state_of(mgr: &SessionManager, id: u32) -> SessionState {
+        mgr.list().into_iter().find(|s| s.id == id).unwrap().state
     }
 
     // 用 cat 冒充 agent：能收输入、不会自己退出
@@ -603,6 +633,126 @@ mod tests {
         assert!(mgr
             .create(&proj, "fake-api", secrets.get("fake-api"))
             .is_ok());
+    }
+
+    #[test]
+    fn busy_pattern_marks_working_then_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "busy-demo"
+                command = ["/bin/sh", "-c", "echo esc to interrupt; sleep 1; clear; echo done; sleep 5"]
+                is_agent = false
+                busy_pattern = "esc to interrupt"
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr
+            .create(&proj, "busy-demo", secrets.get("busy-demo"))
+            .unwrap();
+
+        // 屏幕上有 busy 串 → 干活中
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Working {
+                break;
+            }
+            assert!(Instant::now() < deadline, "busy 串在屏上就该是 Working");
+            sleep(Duration::from_millis(50));
+        }
+
+        // 串消失 → 空闲
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "busy 串没了就该是 Idle");
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn busy_pattern_wins_over_idle_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let mgr = SessionManager::new();
+        // 两个 pattern 同时命中。busy 优先 → Working。
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "both"
+                command = ["/bin/sh", "-c", "echo BUSY IDLE; sleep 5"]
+                is_agent = false
+                busy_pattern = "BUSY"
+                idle_pattern = "IDLE"
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr.create(&proj, "both", secrets.get("both")).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Working {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "busy_pattern 必须压过 idle_pattern"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn no_pattern_stays_unknown() {
+        // shell 就是这种。以前它永远显示「干活中」，是明确的假信息。
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "quiet"
+                command = ["/bin/sh", "-c", "sleep 5"]
+                is_agent = false
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr.create(&proj, "quiet", secrets.get("quiet")).unwrap();
+
+        assert_eq!(
+            state_of(&mgr, id),
+            SessionState::Unknown,
+            "没 pattern 就别编状态"
+        );
+        for _ in 0..5 {
+            mgr.tick();
+            sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state_of(&mgr, id),
+            SessionState::Unknown,
+            "tick 也不该把它改成 Working"
+        );
     }
 
     #[test]
