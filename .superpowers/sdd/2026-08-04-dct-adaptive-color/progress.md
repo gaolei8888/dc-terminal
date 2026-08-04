@@ -39,3 +39,9 @@ FINAL FIX re-review (opus, 553f65c..6ea8c01): 5/5 findings ADDRESSED, no functio
   两条残余泄漏路径（必须记录为已知风险）：(1) 256 字节上限在 DA1 之前返回；(2) 终端/多路复用器本地应答 DA1
   但把 OSC 11 代理到上游，破坏「按顺序应答」的前提。
   裁定：注释是在断言一个不存在的安全属性，未来读者会依赖它去削弱 1a。派一次纯文字修正（不改行为，无需再评审）。
+Prose fix: 5e83ecb（is_plain_key 的安全理由改写为真实机制；DA1 哨兵记为唯一防线；两条残余泄漏路径 + 无测试覆盖写进设计文档「已知风险」）
+  验证：git diff 6ea8c01..HEAD -- src/ 只有 /// 注释行变动，零非注释改动；cargo build 0 warning；222 测试全绿。
+BRANCH STATE: feat/adaptive-color，7 个提交（7402767..5e83ecb），零 warning，222 测试全绿。未合并。
+  未完成：Task 5 步骤 2/3 的肉眼验收（深色/浅色终端各跑一次）。需要真实 tty，controller 做不了。
+  这一项不是可选的收尾——StdinReader::read_reply 至今没有任何测试执行过，poll/read/DA1 哨兵全靠读代码验证。
+  当初那个 bug 也正是测试全绿没拦住的。合并前值得花一分钟在真终端上跑一次。
