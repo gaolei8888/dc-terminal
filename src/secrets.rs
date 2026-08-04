@@ -148,7 +148,7 @@ impl SecretStore {
         // 读坏了就不写。当空覆盖的话，用户手改坏的文件（也许只是少个引号，
         // 完全能救回来）会被我们内存里那份残缺数据彻底盖掉。
         if let Some(e) = &self.load_error {
-            bail!("密钥文件读不了（{e}），先修好 {} 再改", self.path.display());
+            bail!("改不了 {}：{e}", self.path.display());
         }
 
         let parent = self.path.parent().context("密钥文件没有上级目录")?;
@@ -388,7 +388,17 @@ mod tests {
 
         // set 会因为 load_error 而失败
         let err = s.set("key", "value").unwrap_err();
-        assert!(err.to_string().contains("密钥文件"));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("改不了"));
+        // 错误要告诉用户删掉文件重新填，不能建议手动修复
+        assert!(
+            err_msg.contains("删"),
+            "密钥文件坏了时，错误消息要指向删掉文件这个解决方案：{err_msg}"
+        );
+        assert!(
+            !err_msg.contains("先修") && !err_msg.contains("修好"),
+            "不能建议用户手动修复密钥文件：{err_msg}"
+        );
 
         // 关键检验：失败后内存应该恢复到改动前的状态
         assert_eq!(s.get("key"), None, "set 失败后，新键不能出现在内存");
@@ -409,7 +419,17 @@ mod tests {
 
         // remove 会因为 load_error 而失败
         let err = s.remove("key").unwrap_err();
-        assert!(err.to_string().contains("密钥文件"));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("改不了"));
+        // 错误要告诉用户删掉文件重新填，不能建议手动修复
+        assert!(
+            err_msg.contains("删"),
+            "密钥文件坏了时，错误消息要指向删掉文件这个解决方案：{err_msg}"
+        );
+        assert!(
+            !err_msg.contains("先修") && !err_msg.contains("修好"),
+            "不能建议用户手动修复密钥文件：{err_msg}"
+        );
 
         // 关键检验：失败后内存应该恢复到改动前的状态（依旧无此键）
         assert_eq!(s.get("key"), None, "remove 失败后，状态应该不变");
