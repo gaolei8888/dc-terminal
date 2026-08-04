@@ -8,3 +8,7 @@ Task 3: fix round 1/5 (2 addressed, 1 open — describe_toml_error 仍可能吐�
 Task 3: minor (deferred): load_dir 的 filter_map(|e| e.ok()) 静默丢掉单个 DirEntry 失败；use std::path 插在文件中部；权限测试的 assert 失败时不会恢复 0o700
 Task 3: fix round 2/5 (1 addressed, 0 open; commits c673212..9264a85)
 Task 3: complete (commits fc25970..9264a85, review clean)
+Task 4: fix round 1/5 (1 addressed, 0 open; commits a781cbe..8941ee0)
+Task 4: complete (commits f1a867f..8941ee0, review clean)
+Task 4: minor (deferred): 回滚只测到「原本没这条」分支；「恢复原值」分支靠代码审读，load_error 守卫拦掉所有写，测不出「先写成功再写失败」
+Task 4: minor (deferred): bail! 把底层 io/toml 错误原文插进用户可见文案；Disk 的 Default derive 没人用；tmp 文件名固定，并发 set 会撞
