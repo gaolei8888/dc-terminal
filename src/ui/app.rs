@@ -98,6 +98,15 @@ impl App {
         Self::new_inner(None, default_dir)
     }
 
+    /// 只给测试用：`board`/`attach`/`pick`/`secret` 里 `draw()`/`handle_key()`
+    /// 的单测要喂一个 `App`，但用不上真实守护进程，也不关心 `current_dir`
+    /// 具体是哪——用临时目录垫一个就行。
+    #[cfg(test)]
+    pub(crate) fn test_app() -> App {
+        let dir = tempfile::tempdir().unwrap();
+        Self::new_disconnected(dir.path().join("s.sock"), dir.path().to_path_buf())
+    }
+
     /// 拿到活的守护进程连接；构造时没能连上（目前只有测试会这样构造）就
     /// 报「守护进程连不上」——跟真实断线共用同一条错误路径，调用方不用
     /// 为“压根没连过”单独判一次。
