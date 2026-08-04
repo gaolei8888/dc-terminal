@@ -9,6 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use dct::profile::Profile;
+use dct::secrets::SecretStore;
 use dct::session::SessionManager;
 
 /// 造一个文件足够多的仓库，让快照慢到能测出来
@@ -73,7 +74,9 @@ fn slow_checkpoint_does_not_block_the_board() {
 
     let m = Arc::new(SessionManager::new());
     m.register_profile(fake_agent());
-    let id = m.create(repo.path(), "fake").unwrap();
+    let secrets_dir = tempfile::tempdir().unwrap();
+    let secrets = SecretStore::load(&secrets_dir.path().join("secrets.toml"));
+    let id = m.create(repo.path(), "fake", &secrets).unwrap();
 
     // 模拟 agent 干了一大堆活：快照必须重新哈希这些文件，才会真的慢。
     // 不这么做的话 git 的索引缓存会让第二次快照快到测不出东西。

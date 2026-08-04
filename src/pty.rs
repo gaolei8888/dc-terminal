@@ -52,7 +52,13 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    pub fn spawn(cmd: &[String], cwd: &Path, rows: u16, cols: u16) -> Result<PtySession> {
+    pub fn spawn(
+        cmd: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtySession> {
         anyhow::ensure!(!cmd.is_empty(), "启动命令为空");
 
         let pty = NativePtySystem::default()
@@ -70,10 +76,17 @@ impl PtySession {
         }
         builder.cwd(cwd);
 
-        let child = pty
-            .slave
-            .spawn_command(builder)
-            .with_context(|| format!("启动 {} 失败", cmd[0]))?;
+        // 只加不减：不清空继承来的环境。ANTHROPIC_BASE_URL 这类是覆盖上去的，
+        // 但 PATH / HOME / 各家 CLI 自己的登录态都得留着，清了 agent 就起不来。
+        for (k, v) in env {
+            builder.env(k, v);
+        }
+
+        let child = pty.slave.spawn_command(builder).with_context(|| {
+            // 用户看得懂的话。命令确实在 PATH 上但起不来（权限不对、
+            // 架构不匹配、脚本头写错），底层错误对非程序员没有意义。
+            format!("启动不了 {}，它可能装坏了", cmd[0])
+        })?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let writer = Arc::new(Mutex::new(pty.master.take_writer()?));
@@ -282,6 +295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
             &["echo".to_string(), "hello-dct".to_string()],
+            &Default::default(),
             dir.path(),
             24,
             80,
@@ -293,7 +307,14 @@ mod tests {
     #[test]
     fn writes_input_to_process() {
         let dir = tempfile::tempdir().unwrap();
-        let p = PtySession::spawn(&["cat".to_string()], dir.path(), 24, 80).unwrap();
+        let p = PtySession::spawn(
+            &["cat".to_string()],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
         p.write(b"ping-dct\n").unwrap();
         assert!(wait_for(&p, "ping-dct"));
     }
@@ -301,7 +322,14 @@ mod tests {
     #[test]
     fn reports_death() {
         let dir = tempfile::tempdir().unwrap();
-        let p = PtySession::spawn(&["true".to_string()], dir.path(), 24, 80).unwrap();
+        let p = PtySession::spawn(
+            &["true".to_string()],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && p.is_alive() {
             sleep(Duration::from_millis(50));
@@ -310,10 +338,43 @@ mod tests {
     }
 
     #[test]
+    fn spawn_passes_env_to_the_child() {
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("DCT_TEST_MARKER".to_string(), "看得见我".to_string());
+
+        let p = PtySession::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo $DCT_TEST_MARKER; sleep 5".to_string(),
+            ],
+            &env,
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+
+        assert!(
+            wait_for(&p, "看得见我"),
+            "profile 里的 env 必须传给子进程，否则换 base_url 的 agent 全起不来"
+        );
+    }
+
+    #[test]
     fn drop_reaps_child_process() {
         let dir = tempfile::tempdir().unwrap();
         let pid = {
-            let p = PtySession::spawn(&["cat".to_string()], dir.path(), 24, 80).unwrap();
+            let p = PtySession::spawn(
+                &["cat".to_string()],
+                &Default::default(),
+                dir.path(),
+                24,
+                80,
+            )
+            .unwrap();
             p.write(b"alive\n").unwrap();
             assert!(wait_for(&p, "alive"));
             p.process_id().expect("需要拿到子进程 pid")
