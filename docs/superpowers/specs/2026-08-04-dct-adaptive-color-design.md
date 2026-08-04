@@ -69,9 +69,13 @@ impl Theme {
    判 `Dark`，7 和 9–15 判 `Light`。rxvt / urxvt / konsole 这些不答 OSC 11 的终端设它。
 4. **都不行 → `Unknown`**。
 
-亮度阈值取 0.5：这是 sRGB 相对亮度的中点，深浅背景在实际终端配色里离这个中点都很远
-（Solarized Dark 的背景约 0.02，Solarized Light 约 0.93），不存在需要精调阈值的
+亮度阈值取 0.5，深浅背景在实际终端配色里离这个中点都很远：Solarized Dark 的背景
+`#002b36` 算出来约 0.14，Solarized Light 的 `#fdf6e3` 约 0.97。不存在需要精调阈值的
 边界情形。
+
+用的是**不做 sRGB 反伽马**的简化式——直接在 0–1 的归一化通道值上加权。判深浅只需要
+一个把两类背景分得开的标量，不需要真的物理亮度；省掉三次 `powf` 也省掉一处以后会
+有人想「优化」的复杂度。
 
 ### 接到 ui.rs
 
@@ -126,7 +130,8 @@ impl Theme {
 
 纯函数拿真单测，覆盖到边界：
 
-- `luminance_is_light(rgb)`：阈值两侧、纯黑、纯白、Solarized Dark/Light 的实际背景值
+- `is_light(r, g, b)`：阈值两侧、纯黑、纯白、Solarized Dark/Light 的实际背景值，
+  以及纯红/纯绿/纯蓝（三个通道权重差得远，写错位置会被这一条抓住）
 - `parse_osc11`：4 位十六进制（`rgb:0000/0000/0000`）、2 位变体（`rgb:00/00/00`）、
   BEL 终止、ST 终止、垃圾输入、截断的回复、少一个通道
 - `parse_colorfgbg`：`"15;0"`、`"0;15"`、`"default;0"`、空串、没有分号的垃圾
@@ -134,8 +139,13 @@ impl Theme {
   前景色（这条断言防的是以后有人「顺手」给它补一个写死的灰，把安全网拆了）
 - 环境变量优先级：`DCT_THEME` 压过 OSC 回复；非法值被忽略而不是当成 `Dark`
 
-I/O 那部分（发查询、带 deadline 地读）做成一个接受 `Read + Write` 的薄包装，测试
-喂两种情形：一个预设好的回复，和一个一直沉默直到超时的读端。
+I/O 那部分（发查询、带 deadline 地读）藏在一个窄 trait `ReplyReader` 后面
+（`fn read_reply(&mut self, deadline: Duration) -> Vec<u8>`，读不到就返回空，不返回
+`Result`——调用方对所有失败的处理都一样，用错误类型区分它们只会诱导出没人需要的
+分支）。测试实现喂两种情形：一个预设好的回复，和一个一直沉默的读端。
+
+不做成泛型的 `Read + Write`：超时靠 `poll(2)`，它要的是一个裸 fd，而泛型 `Read`
+给不出 fd。一个窄 trait 既保住了可测性，也不用假装 stdin 是任意的读端。
 
 ## 落地顺序
 
