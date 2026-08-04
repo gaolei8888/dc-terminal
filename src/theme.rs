@@ -9,7 +9,7 @@
 //! 一个写死的灰不可能同时适配深浅两种底色，所以这里让它跟着背景走。
 
 use ratatui::style::{Color, Modifier, Style};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// 终端背景的深浅。`Unknown` 不是错误状态，是一个一等公民：
@@ -175,9 +175,21 @@ impl ReplyReader for StdinReader {
             }
 
             let mut chunk = [0u8; 64];
-            match std::io::stdin().read(&mut chunk) {
-                Ok(0) | Err(_) => return buf,
-                Ok(n) => {
+            // 直接对裸 fd 用 `libc::read`，不走 `std::io::stdin()`：后者背后是
+            // 标准库的全局 `BufReader`，一次系统调用可能比这 64 字节的目标缓冲
+            // 读进更多字节，多出来的部分会滞留在那个缓冲区里——`poll` 看不到
+            // 它（内核队列已经空了，下一轮 poll 会误判成「不可读」，探测因此
+            // 白白降级），crossterm 的事件源也看不到它（它直接读裸 fd，不经过
+            // `std::io::stdin`）。滞留在那儿的字节就是用户之后敲的键，界面起
+            // 来后再也读不到——和当初不让开线程去阻塞读，要防的是同一类
+            // 「吃键」故障，只是换了个门进来。
+            let n = unsafe {
+                libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len())
+            };
+            match n {
+                i if i <= 0 => return buf,
+                n => {
+                    let n = n as usize;
                     buf.extend_from_slice(&chunk[..n]);
                     // 收到终止符就够了，不等满 deadline
                     if buf.contains(&0x07) || buf.windows(2).any(|w| w == b"\x1b\\") {
