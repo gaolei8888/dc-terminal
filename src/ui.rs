@@ -107,6 +107,19 @@ enum View {
     Secrets {
         entries: Vec<ProfileEntry>,
         state: ListState,
+        /// `d` 在密钥页是真删除，但物理按键跟看板上「看 diff」那个无害的 `d`
+        /// 完全一样——肌肉记忆会跨屏幕迁移，反应性的一按不该直接删掉一份
+        /// 用户可能只粘贴过一次、关掉网页就找不回来的密钥。两段式确认：
+        /// 第一次 `d` 把这里填成 `Some(profile 名字)`（武装），行内画出
+        /// 「再按 d 删除」；第二次 `d` 打在同一行上才真的发
+        /// `Request::DeleteSecret`。存名字而不是下标是因为列表会因为增删
+        /// 重新排列，下标会指错行，名字不会。
+        ///
+        /// 武装状态和「光标选中哪一行」必须永远同步——除了确认删除的第二次
+        /// `d` 本身，任何按键（包括 ↑↓）都要把这里清回 `None`，不然挪开
+        /// 光标之后按下的第二次 `d` 删的会是用户已经不记得自己武装过的
+        /// 那一行。
+        pending_delete: Option<String>,
     },
 }
 
@@ -290,6 +303,12 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 // 时真的复现了：改完密钥，界面卡在一屏空列表，
                                 // 直到按了 Ctrl+Q 再按 c 才刷出来）。直接现查一遍，
                                 // 光标顺手定在刚改的这一行上。
+                                //
+                                // 改完给一句确认：这一行本身会从「未配」翻成
+                                // 「已配」，但删除那条路径有「已删除 X 的密钥」
+                                // 的消息条打底，改密钥这条路径原来什么都不说，
+                                // 是同一对镜像操作里唯一没反馈的一半——补齐。
+                                message = format!("已保存 {label} 的密钥").into();
                                 refetch_secrets(&mut client, Some(&profile))
                             }
                             Ok(Response::Ok) => match client.call(Request::Create {
@@ -576,7 +595,11 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 if !secret_rows(&entries).is_empty() {
                                     state.select(Some(0));
                                 }
-                                view = View::Secrets { entries, state };
+                                view = View::Secrets {
+                                    entries,
+                                    state,
+                                    pending_delete: None,
+                                };
                             }
                             Ok(Response::Error(e)) => message = Msg::err(e),
                             _ => message = Msg::err("拿不到密钥列表".into()),
@@ -928,6 +951,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 View::Secrets {
                                     entries: Vec::new(),
                                     state: ListState::default(),
+                                    pending_delete: None,
                                 }
                             } else {
                                 View::PickProfile {
@@ -953,6 +977,7 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 View::Secrets {
                                     entries: Vec::new(),
                                     state: ListState::default(),
+                                    pending_delete: None,
                                 }
                             } else {
                                 View::PickProfile {
@@ -1041,12 +1066,29 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                         }
                     },
                 },
-                View::Secrets { entries, mut state } => match key.code {
+                View::Secrets {
+                    entries,
+                    mut state,
+                    pending_delete,
+                } => match key.code {
                     KeyCode::Esc => view = View::Board,
                     KeyCode::Down | KeyCode::Up => {
                         let d = if key.code == KeyCode::Down { 1 } else { -1 };
                         move_sel_n(&mut state, secret_rows(&entries).len(), d);
-                        view = View::Secrets { entries, state };
+                        // 光标一动就撤销武装状态：武装的是「这一行」，挪开之后
+                        // 再按第二次 d，落地的必须是新选中行的第一次按键，不能让
+                        // 上一行攒的「再按一次就删」悄悄延续到新行头上（见 Finding 1）。
+                        // 顺带清掉「再按一次删除 X」那句消息——行内提示已经跟着
+                        // 光标挪走了，底部消息栏要是还留着旧行的名字，用户会
+                        // 搞不清这次挪动到底有没有把武装状态带走。
+                        if pending_delete.is_some() {
+                            message = "".into();
+                        }
+                        view = View::Secrets {
+                            entries,
+                            state,
+                            pending_delete: None,
+                        };
                     }
                     KeyCode::Enter => {
                         let rows = secret_rows(&entries);
@@ -1073,21 +1115,35 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                 // 从设置页进来，改完要回设置页
                                 return_to_settings: true,
                             },
-                            None => View::Secrets { entries, state },
+                            // Enter 也是「其他键」，没找到目标（没有选中行）时
+                            // 留在原地也要把武装状态清掉。
+                            None => View::Secrets {
+                                entries,
+                                state,
+                                pending_delete: None,
+                            },
                         };
                     }
                     KeyCode::Char('d') => {
                         let rows = secret_rows(&entries);
                         let target = state.selected().and_then(|i| rows.get(i)).cloned();
-                        view = match target {
+                        // 判断这半是纯函数（见 decide_delete_key 的文档注释，
+                        // 它是这个任务的单测入口）；发不发 DeleteSecret 请求
+                        // 这半必须留在这里，因为它要碰 daemon 连接。
+                        view = match decide_delete_key(target, &pending_delete) {
                             // 没配过的密钥没什么可删的——照样发一次 DeleteSecret
                             // 只会得到一句空洞的「已删除」，用户会怀疑自己是不是
                             // 删错了别的东西。
-                            Some((_, false)) => {
+                            DeleteKeyAction::NotConfigured => {
                                 message = "这个还没配密钥，没什么可删的".into();
-                                View::Secrets { entries, state }
+                                View::Secrets {
+                                    entries,
+                                    state,
+                                    pending_delete: None,
+                                }
                             }
-                            Some((name, true)) => {
+                            // 第二次按 d：武装记的名字正是当前选中行，才真删。
+                            DeleteKeyAction::Confirm(name) => {
                                 match client.call(Request::DeleteSecret {
                                     profile: name.clone(),
                                 }) {
@@ -1105,18 +1161,65 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                                     }
                                     Ok(Response::Error(e)) => {
                                         message = Msg::err(e);
-                                        View::Secrets { entries, state }
+                                        View::Secrets {
+                                            entries,
+                                            state,
+                                            pending_delete: None,
+                                        }
                                     }
                                     _ => {
                                         message = Msg::err("密钥没删掉，再试一次".into());
-                                        View::Secrets { entries, state }
+                                        View::Secrets {
+                                            entries,
+                                            state,
+                                            pending_delete: None,
+                                        }
                                     }
                                 }
                             }
-                            None => View::Secrets { entries, state },
+                            // 第一次按 d：武装，不发任何请求。行内会画出「再按
+                            // d 删除」（见 draw() 里 pending_delete 那一支）；
+                            // 消息栏再重复一遍是双保险，行内提示万一没看到，
+                            // 底栏还有一句。
+                            DeleteKeyAction::Arm(name) => {
+                                message = format!(
+                                    "再按一次 d 删除 {} 的密钥，按其他键取消",
+                                    entries
+                                        .iter()
+                                        .find(|e| e.name == name)
+                                        .map(|e| e.label.clone())
+                                        .unwrap_or_else(|| name.clone())
+                                )
+                                .into();
+                                View::Secrets {
+                                    entries,
+                                    state,
+                                    pending_delete: Some(name),
+                                }
+                            }
+                            DeleteKeyAction::NoSelection => View::Secrets {
+                                entries,
+                                state,
+                                pending_delete: None,
+                            },
                         };
                     }
-                    _ => view = View::Secrets { entries, state },
+                    // 任何其他键都取消武装——这是 Finding 1 要求的「反应性按键
+                    // 不该踩中确认」的核心：只有原地再按一次 d 才算确认，别的
+                    // 任何输入都当作取消，而不是悄悄忽略武装状态继续挂着。
+                    _ => {
+                        // 同 ↑↓ 分支：武装期间挂着的「再按一次删除 X」提示要
+                        // 跟着武装状态一起清掉，不然取消之后底部还留着一句
+                        // 半真半假的话。
+                        if pending_delete.is_some() {
+                            message = "".into();
+                        }
+                        view = View::Secrets {
+                            entries,
+                            state,
+                            pending_delete: None,
+                        }
+                    }
                 },
             }
         }
@@ -1170,7 +1273,11 @@ pub fn run(mut client: Client, default_dir: PathBuf) -> Result<()> {
                     if !secret_rows(&entries).is_empty() {
                         state.select(Some(0));
                     }
-                    View::Secrets { entries, state }
+                    View::Secrets {
+                        entries,
+                        state,
+                        pending_delete: None,
+                    }
                 }
                 Ok(Response::Error(e)) => {
                     message = Msg::err(e);
@@ -1237,6 +1344,7 @@ fn back_one_level(view: View) -> Option<View> {
         } => Some(View::Secrets {
             entries: Vec::new(),
             state: ListState::default(),
+            pending_delete: None,
         }),
         View::EnterSecret { .. } => Some(View::PickProfile {
             entries: Vec::new(),
@@ -1308,6 +1416,49 @@ pub fn secret_rows(entries: &[ProfileEntry]) -> Vec<(String, bool)> {
         .filter(|e| e.secret.is_some())
         .map(|e| (e.name.clone(), e.has_secret))
         .collect()
+}
+
+/// 密钥页 `d` 键该干什么——判断这一半抽成纯函数，是因为它不碰网络，
+/// 值得单测；真发 `Request::DeleteSecret` 那一半留在 `run()` 里，因为
+/// 那需要 daemon 连接，这个模块里所有 `client.call` 分支都是这样处理的。
+///
+/// `d` 在这一页是真删除，但物理键跟看板上「看 diff」那个无害的 `d` 完全
+/// 一样，肌肉记忆会带过来——所以这里是两段式：第一次按 `d` 只武装
+/// （[`DeleteKeyAction::Arm`]），必须选中同一行再按第二次才会
+/// [`DeleteKeyAction::Confirm`]。`target` 是当前选中行的
+/// `(名字, 是否已配)`，`pending_delete` 是武装状态（存名字，不存下标，
+/// 因为列表会因为增删重新排列，下标会指错行）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteKeyAction {
+    /// 光标没落在任何一行上（比如列表是空的）
+    NoSelection,
+    /// 选中的行还没配密钥，删不出什么名堂，只提示
+    NotConfigured,
+    /// 第一次按 d：武装到这个名字，不发任何请求
+    Arm(String),
+    /// 第二次按 d，且武装的名字跟当前选中行一致：真删
+    Confirm(String),
+}
+
+pub fn decide_delete_key(
+    target: Option<(String, bool)>,
+    pending_delete: &Option<String>,
+) -> DeleteKeyAction {
+    match target {
+        None => DeleteKeyAction::NoSelection,
+        Some((_, false)) => DeleteKeyAction::NotConfigured,
+        // 按名字比对而不是「只要武装了就删」：这条不变量（武装状态永远
+        // 等于选中行）本该由「挪光标必须清空 pending_delete」保证，但
+        // 名字比对是最后一道保险——就算别处哪天漏改了一条清空分支，
+        // 这里也不会把武装的确认动作错按到另一行头上。
+        Some((name, true)) => {
+            if pending_delete.as_deref() == Some(name.as_str()) {
+                DeleteKeyAction::Confirm(name)
+            } else {
+                DeleteKeyAction::Arm(name)
+            }
+        }
+    }
 }
 
 /// `n` 该直接开哪个 agent。`None` = 没得直开，进选择器。
@@ -1587,11 +1738,19 @@ fn refetch_secrets(client: &mut Client, focus: Option<&str>) -> View {
                     .unwrap_or(0);
                 state.select(Some(idx));
             }
-            View::Secrets { entries, state }
+            // 重拉之后不管改的还是删的都已经落定，武装状态没有意义可言了
+            // ——不管刚才 pending_delete 是什么，新的一屏都从「没有武装」
+            // 开始。
+            View::Secrets {
+                entries,
+                state,
+                pending_delete: None,
+            }
         }
         _ => View::Secrets {
             entries: Vec::new(),
             state: ListState::default(),
+            pending_delete: None,
         },
     }
 }
@@ -1967,7 +2126,11 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                 st,
             );
         }
-        View::Secrets { entries, state } => {
+        View::Secrets {
+            entries,
+            state,
+            pending_delete,
+        } => {
             let rows = secret_rows(entries);
             let items: Vec<ListItem> = rows
                 .iter()
@@ -1979,17 +2142,30 @@ fn draw(f: &mut Frame, ui: &mut DrawInput) {
                         .find(|e| &e.name == name)
                         .map(|e| e.label.clone())
                         .unwrap_or_else(|| name.clone());
-                    ListItem::new(Line::from(vec![
-                        Span::raw(pad_to(&truncate(&label, 14), 14)),
-                        Span::styled(
-                            if *configured { "已配" } else { "未配" },
-                            Style::default().fg(if *configured {
-                                Color::Green
-                            } else {
-                                Color::DarkGray
-                            }),
-                        ),
-                    ]))
+                    // 武装了删除的那一行不显示「已配」——显示「再按 d 删除」，
+                    // 让用户在犯下第二次按键之前，眼睛里看到的就是明确的警告，
+                    // 而不是靠底部消息栏一句可能被扫过的小字（见 Finding 1）。
+                    if pending_delete.as_deref() == Some(name.as_str()) {
+                        ListItem::new(Line::from(vec![
+                            Span::raw(pad_to(&truncate(&label, 14), 14)),
+                            Span::styled(
+                                "再按 d 删除，按其他键取消",
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            ),
+                        ]))
+                    } else {
+                        ListItem::new(Line::from(vec![
+                            Span::raw(pad_to(&truncate(&label, 14), 14)),
+                            Span::styled(
+                                if *configured { "已配" } else { "未配" },
+                                Style::default().fg(if *configured {
+                                    Color::Green
+                                } else {
+                                    Color::DarkGray
+                                }),
+                            ),
+                        ]))
+                    }
                 })
                 .collect();
             let mut s = state.clone();
@@ -3297,6 +3473,7 @@ mod tests {
             back_one_level(View::Secrets {
                 entries: vec![],
                 state: ListState::default(),
+                pending_delete: None,
             }),
             Some(View::Board)
         ));
@@ -3455,6 +3632,7 @@ mod tests {
         let help = idle_help(&View::Secrets {
             entries: vec![],
             state: ListState::default(),
+            pending_delete: None,
         });
         assert!(help.contains("Enter 改"));
         assert!(help.contains("d 删"));
@@ -3482,6 +3660,7 @@ mod tests {
                     view: &View::Secrets {
                         entries,
                         state: ListState::default(),
+                        pending_delete: None,
                     },
                     sessions: &[],
                     st: &mut st,
@@ -3519,7 +3698,11 @@ mod tests {
             draw(
                 f,
                 &mut DrawInput {
-                    view: &View::Secrets { entries, state },
+                    view: &View::Secrets {
+                        entries,
+                        state,
+                        pending_delete: None,
+                    },
                     sessions: &[],
                     st: &mut st,
                     screen: &[],
@@ -3534,5 +3717,130 @@ mod tests {
         let c = text_of(&term);
         assert!(c.contains("已配"), "配过的那行要显示已配：{c}");
         assert!(c.contains("未配"), "没配的那行要显示未配：{c}");
+    }
+
+    // ———— Finding 1（Task 13 code review）：删密钥的二次确认 ————
+    //
+    // `d` 在密钥页是真删除，物理键跟看板上「看 diff」那个无害的 `d` 完全
+    // 一样，肌肉记忆会带过来。下面这组测试覆盖两段式确认的骨架：武装、
+    // 确认、以及每一条取消路径——尤其是挪动光标必须让武装状态和选中行
+    // 保持同步，不能分叉。
+
+    #[test]
+    fn secrets_view_renders_the_armed_delete_prompt_on_its_row() {
+        // 武装之后这一行不该再显示「已配」，而要显示明确的「再按 d 删除」
+        // 警告——这是 finding 里点名要求的「inline prompt on that row」。
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut st = ListState::default();
+        let text_of = |term: &Terminal<TestBackend>| -> String {
+            buffer_text(term.backend().buffer())
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let entries = vec![with_secret(entry("kimi", ProfileStatus::Ready))];
+        term.draw(|f| {
+            draw(
+                f,
+                &mut DrawInput {
+                    view: &View::Secrets {
+                        entries,
+                        state,
+                        pending_delete: Some("kimi".to_string()),
+                    },
+                    sessions: &[],
+                    st: &mut st,
+                    screen: &[],
+                    cursor: (0, 0),
+                    message: &Msg::from(""),
+                    connected: true,
+                    current: "/tmp/proj",
+                },
+            )
+        })
+        .unwrap();
+        let c = text_of(&term);
+        assert!(
+            c.contains("再按") && c.contains('d') && c.contains("删除"),
+            "武装状态要在行内画出明确提示：{c}"
+        );
+        assert!(
+            !c.contains("已配"),
+            "武装的这一行不该继续显示「已配」，会跟警告混在一起：{c}"
+        );
+    }
+
+    // decide_delete_key 是「按 d 该做什么」的判断骨架（见其文档注释）：
+    // 不碰网络，run() 里的 KeyCode::Char('d') 分支直接调用它来分类，这里
+    // 覆盖它的四条分支。真正发 DeleteSecret 请求那半留在 run() 里，需要
+    // daemon 连接，测不到——跟这个文件里所有别的 client.call 分支一样。
+
+    #[test]
+    fn decide_delete_key_arms_on_first_press() {
+        // 第一次按 d：没有武装状态，选中的行已配——应该武装到这个名字，
+        // 而不是直接判定为「确认删除」。
+        let action = decide_delete_key(Some(("kimi".into(), true)), &None);
+        assert_eq!(action, DeleteKeyAction::Arm("kimi".into()));
+    }
+
+    #[test]
+    fn decide_delete_key_confirms_on_second_press_of_the_same_row() {
+        // 第二次按 d，且武装的名字和当前选中行一致——这才是真正的删除信号。
+        let action = decide_delete_key(Some(("kimi".into(), true)), &Some("kimi".to_string()));
+        assert_eq!(action, DeleteKeyAction::Confirm("kimi".into()));
+    }
+
+    #[test]
+    fn moving_the_cursor_must_disarm_pending_delete() {
+        // 这是 finding 里最强调的一条：光标挪到另一行之后，即使武装状态
+        // 字面上还留着旧名字（模拟「移动后没有及时清空」的疏漏），只要
+        // 选中行换了，decide_delete_key 也必须判定成「重新武装」而不是
+        // 「确认删除」——武装状态和选中行绝不能分叉。run() 里 Up/Down
+        // 分支额外把 pending_delete 显式清成 None，这里验证的是就算那道
+        // 防线失效，名字比对这道防线也不会把新行误判成确认。
+        let action = decide_delete_key(
+            Some(("glm".into(), true)), // 光标挪到了 glm 这一行
+            &Some("kimi".to_string()),  // 但武装状态还留着 kimi
+        );
+        assert_eq!(
+            action,
+            DeleteKeyAction::Arm("glm".into()),
+            "光标挪开之后，旧的武装状态不该跨行生效"
+        );
+    }
+
+    #[test]
+    fn decide_delete_key_on_unconfigured_row_just_notifies() {
+        // 对着一个「未配」的行按 d：不武装、不删，只提示——照抄原有行为，
+        // 这条不是本次 finding 新加的，但纳入同一组判断骨架的测试里。
+        let action = decide_delete_key(Some(("glm".into(), false)), &None);
+        assert_eq!(action, DeleteKeyAction::NotConfigured);
+    }
+
+    #[test]
+    fn decide_delete_key_with_nothing_selected_is_a_no_op() {
+        let action = decide_delete_key(None, &Some("kimi".to_string()));
+        assert_eq!(action, DeleteKeyAction::NoSelection);
+    }
+
+    #[test]
+    fn back_one_level_from_secrets_clears_any_armed_delete() {
+        // Esc/Ctrl+Q 从密钥页退到看板，整个 View::Secrets 都被扔掉，
+        // 武装状态自然作废——这里确认 back_one_level 走的是「退到看板」
+        // 这条通用兜底，而不是哪天有人给 Secrets 加了专属分支却忘了清
+        // pending_delete。
+        let armed = View::Secrets {
+            entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
+            state: {
+                let mut s = ListState::default();
+                s.select(Some(0));
+                s
+            },
+            pending_delete: Some("kimi".to_string()),
+        };
+        assert!(matches!(back_one_level(armed), Some(View::Board)));
     }
 }
