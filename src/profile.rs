@@ -70,6 +70,13 @@ pub struct Profile {
     /// 比 `idle_pattern` 可靠：空闲时的输入框占位符用户一打字就没了。
     #[serde(default)]
     pub busy_pattern: Option<String>,
+    /// agent 失败时屏幕上一定会出现的串（比如 Claude Code 的 `API Error`）。
+    ///
+    /// **只给见过真实错误文案的 profile 写。** 凭想象编正则会造出误报，
+    /// 而误报比不报更糟：一个好端端的会话被标成失败，用户跑去看一个根本
+    /// 没出事的东西，然后就不再相信这个标记了。没写 = 这个功能对它关着。
+    #[serde(default)]
+    pub error_pattern: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -145,6 +152,17 @@ impl Profile {
             Some(p) => {
                 Ok(Some(regex::Regex::new(p).with_context(|| {
                     format!("busy_pattern 不是合法正则: {p}")
+                })?))
+            }
+        }
+    }
+
+    pub fn error_regex(&self) -> Result<Option<regex::Regex>> {
+        match &self.error_pattern {
+            None => Ok(None),
+            Some(p) => {
+                Ok(Some(regex::Regex::new(p).with_context(|| {
+                    format!("error_pattern 不是合法正则: {p}")
                 })?))
             }
         }
@@ -562,6 +580,50 @@ mod tests {
         assert_eq!(p.note.get(Lang::Zh), Some("月之暗面"));
     }
 
+    /// 声明了 `error_pattern` 的内置 profile，那条正则必须编得过——
+    /// 编不过的话，会话建起来直接失败（`create()` 会 `?` 掉它），
+    /// 而用户什么都没做错。
+    #[test]
+    fn every_builtin_error_pattern_compiles() {
+        for p in Profile::builtins() {
+            assert!(
+                p.error_regex().is_ok(),
+                "{} 的 error_pattern 不是合法正则",
+                p.name
+            );
+        }
+    }
+
+    /// claude 系那几个的 `command` 就是 `claude`，界面完全一样，所以
+    /// 错误文案也一样。漏掉任何一个，那个 agent 就会静默地坏着。
+    #[test]
+    fn every_claude_based_profile_detects_the_same_errors() {
+        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            let re = p
+                .error_regex()
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} 应当声明 error_pattern"));
+            assert!(
+                re.is_match("API Error: Connection closed mid-response."),
+                "{name} 认不出用户实际撞到的那句话"
+            );
+        }
+    }
+
+    /// **没见过错误文案的 agent 一条都不许编。** 凭想象写正则会造出误报，
+    /// 而误报比不报更糟：好端端的会话被标成失败，用户跑去看一个没出事的
+    /// 东西，然后就不再相信这个标记了。
+    #[test]
+    fn profiles_with_unknown_error_text_declare_nothing() {
+        for name in ["codex", "opencode", "qwen", "shell"] {
+            assert!(
+                Profile::builtin(name).unwrap().error_pattern.is_none(),
+                "{name} 的错误文案还没见过实物，不该凭空编一条"
+            );
+        }
+    }
+
     /// 内置 profile 的每一条 `en` 里都不许出现汉字。
     ///
     /// 这条不是洁癖：补英文那次我用脚本批量加 `en =`，品牌名（`Claude`/`Kimi`）
@@ -600,6 +662,26 @@ mod tests {
     /// profile 的 TOML 里 `[note]` 下同时写了 `zh` 和 `en`，两边都要取得到。
     /// 这是 i18n 那一期之前唯一说不通的地方：`Lang` 只有 `Zh` 一个变体，
     /// 用户写了 `en = "..."` 也永远没人读。
+    /// agent 失败时屏幕上那句话。没写 `error_pattern` 的 profile
+    /// 这个功能就是关着的，行为跟改之前完全一样。
+    #[test]
+    fn parses_and_compiles_the_error_pattern() {
+        let p =
+            Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\nerror_pattern = \"API Error\"\n")
+                .unwrap();
+        assert_eq!(p.error_pattern.as_deref(), Some("API Error"));
+        let re = p.error_regex().unwrap().unwrap();
+        assert!(re.is_match("API Error: Connection closed mid-response"));
+        assert!(!re.is_match("一切正常"));
+    }
+
+    #[test]
+    fn a_profile_without_an_error_pattern_has_no_error_regex() {
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.error_pattern.is_none());
+        assert!(p.error_regex().unwrap().is_none());
+    }
+
     #[test]
     fn localized_text_serves_both_languages() {
         let p = Profile::from_toml(

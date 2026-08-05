@@ -192,8 +192,41 @@ impl App {
     /// 主循环走这条路而不是直接写 `app.sessions = v`——直接赋值的话，
     /// 这一帧还会拿着上一轮的 `visible` 去画，刚开的会话要等下一轮才出现。
     pub fn set_sessions(&mut self, v: Vec<SessionInfo>) {
+        self.announce_new_failures(&v);
         self.sessions = v;
         self.refresh_visible();
+    }
+
+    /// 刚进入失败态的会话，说一句。
+    ///
+    /// 在界面这一侧做，**不改协议**：这里本来就同时拿得到新旧两份列表，
+    /// 「谁刚坏的」是一次减法。守护进程侧不需要记「通知过没有」——那会引出
+    /// 「通知给谁」的问题，而它可能同时服务多个界面。
+    ///
+    /// 只在**转变**的那一刻说：还留在失败态里的会话不会每轮再喊一遍，
+    /// 否则底栏会变成噪音，还会盖住用户正需要看的别的提示。
+    ///
+    /// 用 `sessions`（全量）而不是 `visible`：别的项目的会话出错了照样要说。
+    /// 过滤只决定看板列什么，不该让一个真出了事的会话彻底无声——用户不知道
+    /// 它坏了，就不会去看它，而那正是这个功能要解决的事。
+    fn announce_new_failures(&mut self, next: &[SessionInfo]) {
+        use crate::session::SessionState::Failed;
+        let was_failed = |id: u32| {
+            self.sessions
+                .iter()
+                .any(|s| s.id == id && s.state == Failed)
+        };
+        let newly: Vec<&SessionInfo> = next
+            .iter()
+            .filter(|s| s.state == Failed && !was_failed(s.id))
+            .collect();
+        // 同一轮里坏了好几个时只报第一个：底栏只有两行，堆几句话反而
+        // 一个都读不清。剩下的在列表/格子里都标着红色，跑不掉。
+        if let Some(s) = newly.first() {
+            self.message = Msg::err(crate::i18n::msg::session_failed(
+                self.lang, s.id, &s.profile,
+            ));
+        }
     }
 
     /// 从 `sessions` 重算 `visible`，然后把光标和焦点收拢进新的范围。
@@ -330,6 +363,76 @@ mod tests {
             vec![1],
             "拿到新列表的同一时刻就要筛好，不能留到下一帧"
         );
+    }
+
+    fn failing(id: u32, dir: &str) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: crate::session::SessionState::Failed,
+            activity: String::new(),
+        }
+    }
+
+    /// agent 出错时要**主动说一句**，而且点名是哪个会话——用户可能正在别的
+    /// 会话里，或者根本在看别的项目。这是 E 的全部意义：一屏管好几个 agent
+    /// 时，「以为在跑其实早断了」是最贵的失败模式。
+    #[test]
+    fn a_session_that_just_failed_announces_itself() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.set_sessions(vec![sess(1, "/w/a")]);
+        assert!(app.message.text.is_empty(), "前提：还没出错");
+
+        app.set_sessions(vec![failing(1, "/w/a")]);
+        assert!(
+            app.message.text.contains("出错") && app.message.text.contains('1'),
+            "要说一句并点名是哪个会话：{}",
+            app.message.text
+        );
+        assert!(app.message.error, "要是红字，不能跟普通反馈长得一样");
+    }
+
+    /// 同一个会话连着几轮都失败，只说一次。每轮都喊会把底栏变成噪音，
+    /// 而且会盖住用户正需要看的别的提示。
+    #[test]
+    fn a_session_that_stays_failed_only_announces_once() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.set_sessions(vec![sess(1, "/w/a")]);
+        app.set_sessions(vec![failing(1, "/w/a")]);
+        app.message = "".into();
+
+        app.set_sessions(vec![failing(1, "/w/a")]);
+        assert!(app.message.text.is_empty(), "还在失败态里，不该再喊一遍");
+    }
+
+    /// 别的项目的会话出错了，照样要说——过滤只影响**看板列什么**，
+    /// 不该让一个真出了事的会话彻底无声。用户不知道它坏了就不会去看它。
+    #[test]
+    fn a_failure_in_another_project_is_still_announced() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.set_sessions(vec![sess(2, "/w/b")]);
+        app.set_sessions(vec![failing(2, "/w/b")]);
+        assert!(
+            app.message.text.contains("出错"),
+            "别的项目的失败也要提示：{}",
+            app.message.text
+        );
+    }
+
+    /// 从失败态恢复不提示。「恢复了」是噪音——用户没有要做的事。
+    #[test]
+    fn recovering_from_a_failure_says_nothing() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.set_sessions(vec![failing(1, "/w/a")]);
+        app.message = "".into();
+
+        app.set_sessions(vec![sess(1, "/w/a")]);
+        assert!(app.message.text.is_empty(), "恢复不该说话");
     }
 
     /// 从会话按 F2 回来，落点必须是**用户选的模式**，不是永远的列表。

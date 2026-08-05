@@ -2,6 +2,7 @@ name = "glm"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
 idle_pattern = "\\? for shortcuts"
+error_pattern = "API Error|Connection closed mid-response"
 
 [label]
 zh = "GLM"

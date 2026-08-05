@@ -329,7 +329,16 @@ fn draw_grid(
         // 断连时焦点格是红色加粗，不是青色：颜色已经被「数据过期」这件事
         // 占用了，焦点只能换一个维度来标。全都染成同一种红的话，用户就找不到
         // 自己按方向键移到哪儿了。
-        let border = if !connected {
+        // 出错的格子边框转红，跟断连时那一屏红框区分得开：那是整屏都红，
+        // 这是九个里的某一个红。用户扫一眼九宫格就该看见是哪一格出事了——
+        // 光靠标题里那两个字太容易漏。
+        let border = if matches!(info.state, SessionState::Failed) && connected {
+            Style::default().fg(Color::Red).add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            })
+        } else if !connected {
             let red = Style::default().fg(Color::Red);
             if focused {
                 red.add_modifier(Modifier::BOLD)
@@ -542,6 +551,32 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect()
+    }
+
+    /// 出错的格子边框转红。九个格子长得都一样，光靠标题里那两个字太容易
+    /// 漏——用户扫一眼就该看见是哪一格出事了。
+    #[test]
+    fn a_failed_tile_gets_a_red_border() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        let mut s = session(1, SessionState::Failed);
+        s.dir = "/tmp/a".into();
+        app.sessions = vec![s];
+        app.refresh_visible();
+        app.view = View::Grid { focus: 0 };
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        let red = (0..a.height).any(|y| {
+            (0..a.width).any(|x| {
+                buf.cell((x, y))
+                    .map(|c| c.style().fg == Some(Color::Red) && c.symbol() != " ")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(red, "出错的格子必须有红色，扫一眼就看得见");
     }
 
     /// 九宫格跟列表必须看到同一批会话。只修列表不修格子的话，用户按 `g`

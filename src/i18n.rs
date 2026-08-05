@@ -154,6 +154,7 @@ pub enum Key {
     StatusAsking,
     StatusIdle,
     StatusStopped,
+    StatusFailed,
     StatusUnknown,
     // —— 密钥页 ——
     SecretsTitle,
@@ -295,6 +296,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         StatusAsking => t!(lang, en: "asking you", zh: "等你回答"),
         StatusIdle => t!(lang, en: "idle", zh: "空闲"),
         StatusStopped => t!(lang, en: "stopped", zh: "已停止"),
+        StatusFailed => t!(lang, en: "error", zh: "出错了"),
         StatusUnknown => t!(lang, en: "—", zh: "—"),
 
         SecretsTitle => t!(lang, en: "Keys", zh: "密钥设置"),
@@ -504,6 +506,16 @@ pub mod msg {
 
     pub fn reason_needs_dependency(lang: Lang, label: &str) -> String {
         t!(lang, en: format!("(install {label} first)"), zh: format!("（需要先装 {label}）"))
+    }
+
+    /// 刚出错的那一刻说的一句话。**点名是哪个会话**——用户可能正在别的
+    /// 会话里，或者根本在看别的项目，只说「出错了」他不知道该去哪。
+    pub fn session_failed(lang: Lang, id: u32, profile: &str) -> String {
+        t!(
+            lang,
+            en: format!("Session {id} ({profile}) hit an error — go and take a look"),
+            zh: format!("会话 {id}（{profile}）出错了，去看一眼"),
+        )
     }
 
     pub fn session_title(lang: Lang, id: u32, project: &str) -> String {

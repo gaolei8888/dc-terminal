@@ -13,6 +13,7 @@ pub fn status_label(s: SessionState, lang: crate::i18n::Lang) -> &'static str {
             SessionState::Asking => Key::StatusAsking,
             SessionState::Idle => Key::StatusIdle,
             SessionState::Stopped => Key::StatusStopped,
+            SessionState::Failed => Key::StatusFailed,
             SessionState::Unknown => Key::StatusUnknown,
         },
         lang,
@@ -31,6 +32,8 @@ pub fn status_style(s: SessionState) -> Style {
         SessionState::Working => Style::default().fg(Color::Cyan),
         SessionState::Asking => Style::default().fg(Color::Yellow),
         SessionState::Idle => Style::default().fg(Color::Green),
+        // 出错了用红色：这是屏幕上唯一需要用户立刻做点什么的状态。
+        SessionState::Failed => Style::default().fg(Color::Red),
         SessionState::Stopped => dim(),
         SessionState::Unknown => dim(),
     }
@@ -285,6 +288,20 @@ mod tests {
         // CJK 仍然是两列，这才是这个函数存在的理由
         assert_eq!(char_width('干'), 2);
         assert_eq!(char_width('ａ'), 2, "全角字母也是两列");
+    }
+
+    /// 出错是屏幕上唯一需要用户立刻做点什么的状态，必须是红的——
+    /// 跟「已停止」的灰区分开：停了是他自己按的，出错不是。
+    #[test]
+    fn the_failed_state_is_red_and_named_in_both_languages() {
+        use crate::i18n::Lang;
+        assert_eq!(
+            status_style(SessionState::Failed).fg,
+            Some(Color::Red),
+            "出错必须是红的"
+        );
+        assert_eq!(status_label(SessionState::Failed, Lang::Zh), "出错了");
+        assert_eq!(status_label(SessionState::Failed, Lang::En), "error");
     }
 
     #[test]

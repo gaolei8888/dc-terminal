@@ -26,6 +26,9 @@ pub enum SessionState {
     Asking,
     Idle,
     Stopped,
+    /// agent 报错了（`error_pattern` 命中）。会话还活着、进程还在，
+    /// 但屏幕上摆着一句失败——这跟「空闲」是两回事。
+    Failed,
     /// profile 没给任何 pattern，我们不知道它在干什么。
     /// 显示「—」而不是猜一个——`shell` 以前就是被猜成「干活中」的。
     Unknown,
@@ -54,6 +57,9 @@ struct Session {
     /// 干活时屏幕上一定有的串，tick() 里判定状态用。跟 idle_re 一起在
     /// 构造时编译好，profile 的正则错误在起会话这一刻就暴露，不拖到 tick。
     busy_re: Option<regex::Regex>,
+    /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
+    /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
+    error_re: Option<regex::Regex>,
     pty: PtySession,
 }
 
@@ -153,6 +159,7 @@ impl SessionManager {
 
         let idle_re = profile.idle_regex()?;
         let busy_re = profile.busy_regex()?;
+        let error_re = profile.error_regex()?;
         let is_agent = profile.is_agent;
 
         // 有 pattern 才敢说「干活中」：agent 刚起来确实在初始化。
@@ -200,6 +207,7 @@ impl SessionManager {
             state,
             idle_re,
             busy_re,
+            error_re,
             pty,
         };
 
@@ -372,11 +380,17 @@ impl SessionManager {
             }
             // busy 优先：agent 干活时的「按 esc 中断」提示是稳定的，
             // 而空闲时的输入框占位符用户一打字就没了。
-            // screen_text() 只取一次，两个分支共用——它要扫一遍整屏文字，
-            // 每个会话每秒被 tick 5 次，没必要算两遍。
-            if s.busy_re.is_some() || s.idle_re.is_some() {
+            // screen_text() 只取一次，三个分支共用——它要扫一遍整屏文字，
+            // 每个会话每秒被 tick 5 次，没必要算三遍。
+            if s.busy_re.is_some() || s.idle_re.is_some() || s.error_re.is_some() {
                 let text = s.pty.screen_text();
-                if let Some(re) = &s.busy_re {
+                // **错误压过一切。** 出错时屏幕上同时有错误和输入框提示，
+                // idle_pattern 一样匹得上；判定顺序反过来的话，最要紧的那个
+                // 事实会被一句「空闲」盖掉——用户以为 agent 在等他，
+                // 其实那一轮已经废了。
+                if s.error_re.as_ref().is_some_and(|re| re.is_match(&text)) {
+                    s.state = SessionState::Failed;
+                } else if let Some(re) = &s.busy_re {
                     s.state = if re.is_match(&text) {
                         SessionState::Working
                     } else {
@@ -442,6 +456,7 @@ mod tests {
             is_agent: true,
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
+            error_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -534,6 +549,116 @@ mod tests {
             .create(plain.path(), "shell", empty_secrets(), &[])
             .expect("锁中毒之后 create() 应该还能正常工作，而不是永远失败");
         assert_eq!(m.list().iter().find(|s| s.id == id).unwrap().id, id);
+    }
+
+    /// **出错时屏幕上同时有错误和输入框提示**——`idle_pattern` 一样匹得上。
+    /// 判定顺序把 `Failed` 排在前面，否则最要紧的那个事实会被一句「空闲」
+    /// 盖掉，而那正是用户实际撞到的 bug：以为 agent 在等他，其实那一轮废了。
+    #[test]
+    fn an_error_on_screen_wins_over_the_idle_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mgr = SessionManager::new();
+        // 先只打 READY（空闲），一秒后追加错误行，两句同时留在屏幕上。
+        // 先等出一次 Idle 是为了逼 tick() 真正算过一次——否则这条测试
+        // 可能只是撞上了某个默认值（同 busy_pattern_wins_over_idle_pattern）。
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "boom"
+                command = ["/bin/sh", "-c", "echo READY; sleep 1; echo 'API Error: closed'; sleep 5"]
+                is_agent = false
+                idle_pattern = "READY"
+                error_pattern = "API Error"
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr.create(&proj, "boom", secrets.get("boom"), &[]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "只有 READY 时应当是 Idle");
+            sleep(Duration::from_millis(50));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "错误和空闲提示同屏时，error_pattern 必须压过 idle_pattern"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 没写 `error_pattern` 的 profile 行为完全不变——功能对它是关着的。
+    /// 这条保证给别的 agent 补文案之前，它们一点都不会被误伤。
+    #[test]
+    fn a_profile_without_an_error_pattern_never_reports_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "quiet"
+                command = ["/bin/sh", "-c", "echo 'API Error: closed'; echo READY; sleep 5"]
+                is_agent = false
+                idle_pattern = "READY"
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr
+            .create(&proj, "quiet", secrets.get("quiet"), &[])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "该判成 Idle");
+            sleep(Duration::from_millis(50));
+        }
+        assert_ne!(
+            state_of(&mgr, id),
+            SessionState::Failed,
+            "没声明错误文案的 agent 不该被判失败"
+        );
+    }
+
+    #[test]
+    fn a_stopped_session_is_not_reclassified_as_failed() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        let mut p = fake_agent();
+        p.error_pattern = Some("API Error".into());
+        m.register_profile(p);
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+        m.send_input(id, "API Error").unwrap();
+        m.send_input(id, "").unwrap();
+        m.stop(id).unwrap();
+        m.tick();
+
+        assert_eq!(
+            m.list().iter().find(|s| s.id == id).unwrap().state,
+            SessionState::Stopped
+        );
     }
 
     #[test]
