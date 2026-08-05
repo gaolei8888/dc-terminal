@@ -139,7 +139,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::Grid { focus } = app.view else {
         return Ok(());
     };
-    let total = app.visible.len();
+    let total = app.grid_visible.len();
     match key.code {
         KeyCode::Up => {
             app.view = View::Grid {
@@ -179,7 +179,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 跟看板同一个键、同一个 app.scope：作用域跟着用户走，不跟着视图走
         KeyCode::Char('a') if is_plain_key(&key) => super::toggle_scope(app),
         KeyCode::Enter => {
-            if let Some(id) = app.visible.get(focus).map(|s| s.id) {
+            if let Some(id) = app.grid_visible.get(focus).map(|s| s.id) {
                 // 放大也是一条离开九宫格的路：从会话里再退出来就到了列表，
                 // 那时候光标同样得落在这个会话上（见 sync_board_cursor_from_grid）
                 super::sync_board_cursor_from_grid(app);
@@ -189,7 +189,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 跟看板同一套动作，作用在焦点格上——共用 `session_action`，
         // 不各抄一份（抄了将来只会改一半）。
         KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') if is_plain_key(&key) => {
-            app.message = match app.visible.get(focus).map(|s| s.id) {
+            app.message = match app.grid_visible.get(focus).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
                 None => text(Key::NoSessionsAtAll, app.lang).into(),
             };
@@ -206,7 +206,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     draw_grid(
         f,
         area,
-        &app.visible,
+        &app.grid_visible,
         &app.grid_screens,
         focus,
         Chrome {
@@ -214,6 +214,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             scope: app.scope,
             lang: app.lang,
         },
+        !app.visible.is_empty(),
     );
 }
 
@@ -239,6 +240,8 @@ fn draw_grid(
     screens: &[ScreenEntry],
     focus: usize,
     chrome: Chrome,
+    // 作用域里有会话，只是全停了——空状态那句话要说得不一样
+    has_stopped: bool,
 ) {
     let Chrome {
         connected,
@@ -254,6 +257,16 @@ fn draw_grid(
         return;
     }
     if sessions.is_empty() {
+        // 「一个会话都没有」和「有会话但都停了」是两回事。后者说成前者
+        // 会让用户以为自己的会话丢了——它们其实好端端在列表里，还能
+        // 回滚、看改动。这一句要说清它们在哪。
+        if has_stopped {
+            f.render_widget(
+                Paragraph::new(text(Key::AllSessionsStopped, lang)).centered(),
+                centered_line(area),
+            );
+            return;
+        }
         // `n` 在九宫格里跟在列表里是同一个键，直接说怎么开，别让用户
         // 先绕回列表。
         //
@@ -304,7 +317,20 @@ fn draw_grid(
         // 标题就是状态指示器：状态词用 status_style 上色，跟列表同一套颜色
         // （已停止是灰的），扫一眼九个格子就知道谁在干活、谁停了。
         let mut title = vec![
-            Span::raw(format!(" {} {} ", info.id, info.profile)),
+            // 跟列表的 `highlight_symbol` 同一个符号：两个模式看起来才是
+            // 同一件事。只靠边框换色不够——一条 1 格宽的线在浅色主题上跟
+            // 灰线几乎一样，而且用户得先知道「有选中这回事」才会去找它。
+            Span::styled(
+                if focused { "▶" } else { " " },
+                if focused {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(format!("{} {} ", info.id, info.profile)),
             Span::styled(
                 format!("{} ", status_label(info.state, lang)),
                 status_style(info.state),
@@ -346,7 +372,10 @@ fn draw_grid(
                 red
             }
         } else if focused {
-            Style::default().fg(Color::Cyan)
+            // 加粗：颜色在各种终端主题下的对比度差别很大，笔画粗细不受主题影响
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             dim()
         };
@@ -551,6 +580,45 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect()
+    }
+
+    /// **焦点必须一眼看得出来。** 只靠边框换色不够：一条 1 格宽的线在浅色
+    /// 主题上跟灰线几乎一样，而且用户得先知道「有选中这回事」才会去找它。
+    /// 用跟列表同一个 `▶` 符号，两个模式看起来才是一件事。
+    #[test]
+    fn the_focused_tile_is_marked_with_the_same_arrow_the_list_uses() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3)
+            .map(|i| {
+                let mut s = session(i, SessionState::Idle);
+                s.dir = "/tmp/a".into();
+                s
+            })
+            .collect();
+        app.refresh_visible();
+        app.view = View::Grid { focus: 1 };
+
+        let c = grid_text(&mut app);
+        assert_eq!(c.matches('▶').count(), 1, "有且只有一个格子带标记：{c}");
+        // 标记要在焦点那一格的标题上：格子 2 是 `▶2claude`
+        assert!(c.contains("▶2claude"), "标记要落在焦点格上：{c}");
+    }
+
+    /// 「一个会话都没有」和「有会话但都停了」是两回事。后者说成前者会让
+    /// 用户以为自己的会话丢了——它们其实好端端在列表里，还能回滚、看改动。
+    #[test]
+    fn a_grid_of_only_stopped_sessions_says_where_they_went() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        let mut s1 = session(1, SessionState::Stopped);
+        s1.dir = "/tmp/a".into();
+        app.set_sessions(vec![s1]);
+        app.view = View::Grid { focus: 0 };
+
+        let c = grid_text(&mut app);
+        assert!(c.contains("都停了"), "要说清是「停了」不是「没有」：{c}");
+        assert!(c.contains("g"), "要指路：按 g 回列表能看到它们：{c}");
     }
 
     /// 出错的格子边框转红。九个格子长得都一样，光靠标题里那两个字太容易
@@ -911,6 +979,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -946,6 +1015,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -991,6 +1061,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1042,6 +1113,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1070,6 +1142,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1089,6 +1162,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1109,6 +1183,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1133,6 +1208,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1159,6 +1235,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1194,6 +1271,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();
@@ -1227,6 +1305,7 @@ mod tests {
                     scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
+                false,
             )
         })
         .unwrap();

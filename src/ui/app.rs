@@ -34,6 +34,15 @@ pub struct App {
     // 每一处都记得转换一次，漏一处就是「选中第 3 行、停掉第 5 个会话」
     // 这种最难查的 bug。
     pub visible: Vec<SessionInfo>,
+    /// 九宫格真正画出来的那些：`visible` 去掉已停止的。
+    ///
+    /// 九宫格是「看几个 agent 此刻在干什么」的地方——kill 掉的会话没有
+    /// 「此刻」，一格给它就是一格静止截图或者一片空白。列表那边不筛：
+    /// 停掉的会话还剩唯一一点价值，`u` 回滚它做过的改动、`d` 看它改了什么。
+    ///
+    /// 两个模式看到的集合因此不同，所以**光标和焦点只能按会话 id 对应，
+    /// 不能按下标**（见 `mod.rs` 的 `home_view` / `sync_board_cursor_from_grid`）。
+    pub grid_visible: Vec<SessionInfo>,
     pub scope: super::view::Scope,
     /// 用户选的看板画法。列表和九宫格是**平级**的两个模式，不是一个视图
     /// 加一个附属页面——所以每一处「回看板」都得问它（见 `mod.rs::home_view`）。
@@ -121,6 +130,7 @@ impl App {
             list_state: ListState::default(),
             sessions: Vec::new(),
             visible: Vec::new(),
+            grid_visible: Vec::new(),
             // 每次启动都从「只看当前项目」开始。作用域不持久化：它是个
             // 临时的查看动作，不是配置。
             scope: super::view::Scope::CurrentProject,
@@ -235,30 +245,33 @@ impl App {
     /// 拉到新的会话列表之后、`scope` 被切换时、`current_dir` 被改变时。
     pub fn refresh_visible(&mut self) {
         self.visible = super::view::visible_sessions(&self.sessions, self.scope, &self.current_dir);
+        self.grid_visible = self
+            .visible
+            .iter()
+            .filter(|s| s.state != crate::session::SessionState::Stopped)
+            .cloned()
+            .collect();
 
         // 收拢到**末项**而不是首项：用户的注意力在列表尾部时，弹回第一行
         // 会让他以为自己选中的会话被删了。
+        // 列表光标按 `visible` 收，九宫格焦点按 `grid_visible` 收——
+        // 两个集合长度不同，共用一个上界会让其中一个越界。
         match self.visible.len() {
-            0 => {
-                // 零个 item 上还留着 Some(0)，List 会画一条悬空的高亮
-                self.list_state.select(None);
-                if let View::Grid { focus } = &mut self.view {
-                    *focus = 0;
-                }
-            }
+            // 零个 item 上还留着 Some(0)，List 会画一条悬空的高亮
+            0 => self.list_state.select(None),
             n => {
-                let last = n - 1;
                 // 只在越界时才动它。没选中过就保持没选中——这里不负责
                 // 「替用户选一个」，那是 `move_sel` 和进入视图时的事。
                 if let Some(i) = self.list_state.selected() {
-                    if i > last {
-                        self.list_state.select(Some(last));
+                    if i > n - 1 {
+                        self.list_state.select(Some(n - 1));
                     }
                 }
-                if let View::Grid { focus } = &mut self.view {
-                    *focus = (*focus).min(last);
-                }
             }
+        }
+        let grid_last = self.grid_visible.len().saturating_sub(1);
+        if let View::Grid { focus } = &mut self.view {
+            *focus = (*focus).min(grid_last);
         }
     }
 
@@ -373,6 +386,82 @@ mod tests {
             state: crate::session::SessionState::Failed,
             activity: String::new(),
         }
+    }
+
+    fn stopped(id: u32, dir: &str) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "opencode".into(),
+            dir: dir.into(),
+            state: crate::session::SessionState::Stopped,
+            activity: String::new(),
+        }
+    }
+
+    /// 九宫格是「看几个 agent 此刻在干什么」的地方——已经 kill 掉的会话
+    /// 没有「此刻」。一格停掉的会话最好的情况是一张静止截图，最坏是一片
+    /// 空白，而它占的是整整一格。
+    #[test]
+    fn the_grid_leaves_out_stopped_sessions() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.set_sessions(vec![
+            stopped(1, "/w/a"),
+            sess(2, "/w/a"),
+            stopped(3, "/w/a"),
+            sess(4, "/w/a"),
+        ]);
+
+        assert_eq!(
+            app.visible.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "列表要留着它们：停掉的会话还能 u 回滚、d 看改动"
+        );
+        assert_eq!(
+            app.grid_visible.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 4],
+            "九宫格只画还活着的"
+        );
+    }
+
+    /// 两个模式看到的集合不同之后，光标和焦点**不能再按下标对应**。
+    /// 按下标对的话，列表选中第 4 行（会话 4）切到九宫格会落在第 5 格——
+    /// 越界或者对到另一个会话上，而接下来的 `s`/`u` 都不可撤销。
+    #[test]
+    fn switching_modes_keeps_the_same_session_under_the_cursor() {
+        use super::super::{home_view, sync_board_cursor_from_grid};
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.set_sessions(vec![
+            stopped(1, "/w/a"),
+            sess(2, "/w/a"),
+            stopped(3, "/w/a"),
+            sess(4, "/w/a"),
+        ]);
+        app.view_mode = crate::ui::ViewMode::Grid;
+
+        // 列表选中会话 4（下标 3）→ 九宫格该落在会话 4（格子下标 1）
+        app.list_state.select(Some(3));
+        assert!(
+            matches!(home_view(&app), View::Grid { focus: 1 }),
+            "焦点要落在同一个**会话**上，不是同一个下标"
+        );
+
+        // 反方向：焦点在第 2 格（会话 4）→ 列表光标回到会话 4 那一行
+        app.view = View::Grid { focus: 1 };
+        sync_board_cursor_from_grid(&mut app);
+        assert_eq!(app.list_state.selected(), Some(3));
+    }
+
+    /// 全都停掉时九宫格是空的——不能 panic，焦点收拢到 0。
+    #[test]
+    fn a_grid_where_everything_is_stopped_is_empty_not_broken() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.view = View::Grid { focus: 2 };
+        app.set_sessions(vec![stopped(1, "/w/a"), stopped(2, "/w/a")]);
+        assert!(app.grid_visible.is_empty());
+        assert!(matches!(app.view, View::Grid { focus: 0 }));
     }
 
     /// agent 出错时要**主动说一句**，而且点名是哪个会话——用户可能正在别的

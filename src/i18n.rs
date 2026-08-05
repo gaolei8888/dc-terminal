@@ -142,6 +142,7 @@ pub enum Key {
     // —— 状态与提示 ——
     NoSessionsHere,
     NoSessionsAtAll,
+    AllSessionsStopped,
     WindowTooSmall,
     Verifying,
     PasteOrTypeKey,
@@ -210,7 +211,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         Back => t!(lang, en: "back", zh: "返回"),
         Edit => t!(lang, en: "edit", zh: "改"),
         Delete => t!(lang, en: "delete", zh: "删"),
-        MoveArrows => t!(lang, en: "arrow keys move", zh: "方向键移动"),
+        MoveArrows => t!(lang, en: "arrow keys pick a tile", zh: "方向键选格子"),
         NextSession => t!(lang, en: "next session", zh: "下一个会话"),
         NewSessionFromBoard => t!(
             lang,
@@ -264,6 +265,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "No sessions in this project yet. Press n to start one, or a to see every project.",
             zh: "这个项目还没有会话，按 n 开一个，按 a 看全部项目",
+        ),
+        AllSessionsStopped => t!(
+            lang,
+            en: "Every session here has stopped. Press g for the list to see them, or n to start one.",
+            zh: "这里的会话都停了。按 g 回列表能看到它们，按 n 开一个新的",
         ),
         NoSessionsAtAll => t!(
             lang,

@@ -882,7 +882,7 @@ mod tests {
         // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
         let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
         for k in [
-            "方向键移动",
+            "方向键选格子",
             "Enter 放大",
             "n 新建",
             "N 换 agent",

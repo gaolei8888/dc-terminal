@@ -351,7 +351,7 @@ pub fn run(
             let page = grid::page_of(focus);
             let start = page * grid::TILES_PER_PAGE;
             let ids: Vec<u32> = app
-                .visible
+                .grid_visible
                 .iter()
                 .skip(start)
                 .take(grid::TILES_PER_PAGE)
@@ -847,12 +847,17 @@ pub(crate) fn toggle_view_mode(app: &mut App) {
 pub(crate) fn home_view(app: &App) -> View {
     match app.view_mode {
         ViewMode::List => View::Board,
+        // 同样按会话 id 对——理由见 `sync_board_cursor_from_grid`。
+        // 光标停在一个已停止的会话上时（九宫格里没有它）落回第一格：
+        // 那是个「它在九宫格里不存在」的诚实答案，比对到旁边某个无关的
+        // 会话上强。
         ViewMode::Grid => View::Grid {
             focus: app
                 .list_state
                 .selected()
-                .unwrap_or(0)
-                .min(app.visible.len().saturating_sub(1)),
+                .and_then(|i| app.visible.get(i))
+                .and_then(|s| app.grid_visible.iter().position(|g| g.id == s.id))
+                .unwrap_or(0),
         },
     }
 }
@@ -910,7 +915,15 @@ fn move_sel(st: &mut ListState, sessions: &[SessionInfo], delta: i32) {
 /// 不在九宫格里就什么都不做，调用方不必先判视图。
 pub(crate) fn sync_board_cursor_from_grid(app: &mut App) {
     if let View::Grid { focus } = app.view {
-        app.list_state.select(Some(focus));
+        // **按会话 id 对，不按下标。** 九宫格不画已停止的会话，所以两个
+        // 集合的下标根本对不上——第 2 格可能是列表的第 4 行。对错了的话，
+        // 回列表后接下来的 `s`（停止）或 `u`（回滚）就毁在另一个会话上，
+        // 而这两个键都不可撤销。
+        if let Some(id) = app.grid_visible.get(focus).map(|s| s.id) {
+            if let Some(i) = app.visible.iter().position(|s| s.id == id) {
+                app.list_state.select(Some(i));
+            }
+        }
     }
 }
 
