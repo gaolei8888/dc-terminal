@@ -10,7 +10,7 @@ fn profiles_returns_entries_with_labels_and_status() {
     let h = common::start_daemon();
     let mut c = h.client();
 
-    let Response::Profiles { entries, warning } = c
+    let Response::Profiles { entries, warnings } = c
         .call(Request::Profiles {
             lang: dct::i18n::Lang::Zh,
         })
@@ -18,7 +18,7 @@ fn profiles_returns_entries_with_labels_and_status() {
     else {
         panic!("应当返回 Profiles");
     };
-    assert!(warning.is_none(), "干净环境不该有告警");
+    assert!(warnings.is_empty(), "干净环境不该有告警");
     assert_eq!(entries.len(), 9);
     assert_eq!(entries[0].name, "claude");
     assert_eq!(entries[0].label, "Claude", "要带中文 label");

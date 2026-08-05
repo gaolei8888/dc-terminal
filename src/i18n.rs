@@ -556,7 +556,143 @@ pub mod msg {
                 en: format!("git failed: {raw}"),
                 zh: format!("git 操作失败：{raw}"),
             ),
+            CannotStart(cmd) => t!(
+                lang,
+                en: format!("{cmd} would not start — it may be installed incorrectly"),
+                zh: format!("启动不了 {cmd}，它可能装坏了"),
+            ),
+            DaemonNotResponding => t!(
+                lang,
+                en: "The dct service is not responding".to_string(),
+                zh: "守护进程没有回应".to_string(),
+            ),
+            OperationFailed(op) => operation(lang, *op),
+            SecretsFileBroken { path } => t!(
+                lang,
+                en: format!(
+                    "The key file is damaged, so dct will not overwrite it. Delete it and paste \
+                     your keys in again. ({path})"
+                ),
+                zh: format!(
+                    "密钥文件坏了，所以没有改它。删掉这个文件，回 dct 里重新粘贴一遍密钥就行。（{path}）"
+                ),
+            ),
             Internal(raw) => raw.clone(),
+        }
+    }
+
+    fn operation(lang: Lang, op: crate::proto::Operation) -> String {
+        use crate::proto::Operation::*;
+        match op {
+            FirstCheckpoint => t!(
+                lang,
+                en: "Could not take the first checkpoint, so this session cannot be undone safely",
+                zh: "拍不了检查点，这个会话没法安全撤销",
+            ),
+            Checkpoint => t!(
+                lang,
+                en: "Could not take a checkpoint — this step may not be undoable",
+                zh: "拍检查点失败，这一步的改动可能没法撤销",
+            ),
+            // 必须点明后果：用户需要知道工作区可能停在改到一半的状态，
+            // 光说「失败了」他会以为什么都没发生。
+            Undo => t!(
+                lang,
+                en: "Undo failed — your files may be left half-changed",
+                zh: "撤销失败，工作区可能停在了改到一半的状态",
+            ),
+            Diff => t!(
+                lang,
+                en: "Could not work out which files changed — try again",
+                zh: "算不出改了哪些文件，再试一次",
+            ),
+            SaveSecret => t!(
+                lang,
+                en: "The key could not be written — try again",
+                zh: "密钥没写进去，再试一次",
+            ),
+            SpawnPty => t!(
+                lang,
+                en: "Could not start that program",
+                zh: "启动不了那个程序",
+            ),
+            ReadClipboard => t!(
+                lang,
+                en: "Could not read the clipboard",
+                zh: "读不了剪贴板",
+            ),
+            SaveSettings => t!(
+                lang,
+                en: "The setting could not be saved — try again",
+                zh: "设置没存下来，再试一次",
+            ),
+        }
+        .to_string()
+    }
+
+    fn io_reason(lang: Lang, r: crate::proto::IoReason) -> &'static str {
+        use crate::proto::IoReason::*;
+        match r {
+            PermissionDenied => t!(lang, en: "no permission to read it", zh: "没有权限读取"),
+            NotADirectory => t!(lang, en: "it is not a folder", zh: "不是一个文件夹"),
+            Other => t!(lang, en: "it could not be read", zh: "读取失败"),
+        }
+    }
+
+    /// 把一条警告码组成人话。跟 `error` 同样的道理：守护进程报码，
+    /// 句子在界面成形。
+    pub fn warning(lang: Lang, w: &crate::proto::WarningCode) -> String {
+        use crate::proto::WarningCode::*;
+        match w {
+            ProfileDirUnreadable { name, reason } => {
+                let why = io_reason(lang, *reason);
+                t!(
+                    lang,
+                    en: format!("{name} could not be opened: {why}"),
+                    zh: format!("{name} 打不开：{why}"),
+                )
+            }
+            ProfileUnreadable { name, reason } => {
+                let why = io_reason(lang, *reason);
+                t!(
+                    lang,
+                    en: format!("{name} could not be read: {why}"),
+                    zh: format!("{name} 读不了：{why}"),
+                )
+            }
+            ProfileMalformed { name, line, reason } => match line {
+                Some(n) => t!(
+                    lang,
+                    en: format!("{name} has a mistake on line {n}: {reason}"),
+                    zh: format!("{name} 写错了：第 {n} 行：{reason}"),
+                ),
+                None => t!(
+                    lang,
+                    en: format!("{name} has a mistake: {reason}"),
+                    zh: format!("{name} 写错了：{reason}"),
+                ),
+            },
+            SecretsUnreadable { path, reason } => {
+                let why = io_reason(lang, *reason);
+                t!(
+                    lang,
+                    en: format!("The key file could not be read: {why} ({path})"),
+                    zh: format!("密钥文件读不了：{why}（{path}）"),
+                )
+            }
+            // 不给行号也不给 toml 原文：密钥文件不该手改，照着行号抠语法
+            // 是把用户往错路上支。只给一句他做得到的下一步。
+            SecretsCorrupt { path } => t!(
+                lang,
+                en: format!(
+                    "The key file is damaged and cannot be read. Delete it and paste your keys \
+                     into dct again — there is no need to repair it by hand. ({path})"
+                ),
+                zh: format!(
+                    "密钥文件坏了，读不出来。删掉这个文件，回 dct 里重新粘贴一遍密钥就行，\
+                     不用手动修它。（{path}）"
+                ),
+            ),
         }
     }
 
@@ -720,6 +856,19 @@ mod tests {
             NotAnAgentSession,
             BadRequest("bad json".into()),
             Git("fatal: not a repository".into()),
+            SecretsFileBroken {
+                path: "/h/.dct/secrets.toml".into(),
+            },
+            OperationFailed(crate::proto::Operation::FirstCheckpoint),
+            OperationFailed(crate::proto::Operation::Checkpoint),
+            OperationFailed(crate::proto::Operation::Undo),
+            OperationFailed(crate::proto::Operation::Diff),
+            OperationFailed(crate::proto::Operation::SaveSecret),
+            OperationFailed(crate::proto::Operation::SaveSettings),
+            OperationFailed(crate::proto::Operation::SpawnPty),
+            OperationFailed(crate::proto::Operation::ReadClipboard),
+            CannotStart("claude".into()),
+            DaemonNotResponding,
         ];
         for c in &codes {
             for l in Lang::all() {
@@ -735,6 +884,52 @@ mod tests {
         // `Internal` 是刻意的例外：它照抄原文（多半是还没归类的内部错误
         // 或 git 的 stderr），翻不动也不该翻。
         assert_eq!(msg::error(Lang::En, &Internal("原文".into())), "原文");
+    }
+
+    /// 警告码跟错误码同样的要求：两种语言都组得出话，英文里不许有汉字。
+    #[test]
+    fn every_warning_code_composes_in_both_languages() {
+        use crate::proto::{IoReason, WarningCode::*};
+        let codes = [
+            ProfileDirUnreadable {
+                name: "profiles".into(),
+                reason: IoReason::PermissionDenied,
+            },
+            ProfileUnreadable {
+                name: "x.toml".into(),
+                reason: IoReason::Other,
+            },
+            ProfileMalformed {
+                name: "x.toml".into(),
+                line: Some(3),
+                reason: "invalid key".into(),
+            },
+            ProfileMalformed {
+                name: "x.toml".into(),
+                line: None,
+                reason: "invalid key".into(),
+            },
+            SecretsUnreadable {
+                path: "/h/.dct/secrets.toml".into(),
+                reason: IoReason::NotADirectory,
+            },
+            SecretsCorrupt {
+                path: "/h/.dct/secrets.toml".into(),
+            },
+        ];
+        for c in &codes {
+            for l in Lang::all() {
+                let s = msg::warning(*l, c);
+                assert!(!s.trim().is_empty(), "{c:?} 在 {l:?} 下组不出话");
+                // 底栏只有一行，警告绝不能带换行——带了会在等宽终端上
+                // 错位换行，看着像一份栈追踪。
+                assert!(!s.contains('\n'), "{c:?} 在 {l:?} 下带了换行：{s}");
+            }
+            let en = msg::warning(Lang::En, c);
+            // `reason` 是 toml 库自己的说法，可能是英文也可能带别的字符，
+            // 但我们自己那部分不能有汉字。
+            assert!(!has_han(&en), "{c:?} 的英文里有汉字：{en}");
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -68,7 +68,11 @@ impl PtySession {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .context("打开 PTY 失败")?;
+            .map_err(|_| {
+                crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
+                    crate::proto::Operation::SpawnPty,
+                ))
+            })?;
 
         let mut builder = CommandBuilder::new(&cmd[0]);
         for a in &cmd[1..] {
@@ -82,10 +86,11 @@ impl PtySession {
             builder.env(k, v);
         }
 
-        let child = pty.slave.spawn_command(builder).with_context(|| {
-            // 用户看得懂的话。命令确实在 PATH 上但起不来（权限不对、
-            // 架构不匹配、脚本头写错），底层错误对非程序员没有意义。
-            format!("启动不了 {}，它可能装坏了", cmd[0])
+        // 报码不报句子。命令确实在 PATH 上但起不来（权限不对、架构不匹配、
+        // 脚本头写错），底层错误对非程序员没有意义——带上命令名就够，
+        // 他至少知道该去修哪个。
+        let child = pty.slave.spawn_command(builder).map_err(|_| {
+            crate::proto::coded(crate::proto::ErrorCode::CannotStart(cmd[0].clone()))
         })?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));

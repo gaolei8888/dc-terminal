@@ -577,7 +577,8 @@ pub fn run(
                 .client()
                 .and_then(|c| c.call(Request::Profiles { lang }))
             {
-                Ok(Response::Profiles { entries, warning }) => {
+                Ok(Response::Profiles { entries, warnings }) => {
+                    let warning = join_warnings(&warnings, lang);
                     let mut state = ListState::default();
                     if !entries.is_empty() {
                         state.select(Some(0));
@@ -758,6 +759,30 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     app.view = View::Attached(id);
 }
 
+/// 把守护进程报回来的一串警告码组成一行人话。
+///
+/// 拼接（`；`）发生在这里而不是 daemon 侧：daemon 连用哪种语言都不知道，
+/// 更不知道该用哪个分隔符——中文用顿号式的全角分号，英文该用 `; `。
+fn join_warnings(
+    warnings: &[crate::proto::WarningCode],
+    lang: crate::i18n::Lang,
+) -> Option<String> {
+    if warnings.is_empty() {
+        return None;
+    }
+    let sep = match lang {
+        crate::i18n::Lang::Zh => "；",
+        crate::i18n::Lang::En => "; ",
+    };
+    Some(
+        warnings
+            .iter()
+            .map(|w| crate::i18n::msg::warning(lang, w))
+            .collect::<Vec<_>>()
+            .join(sep),
+    )
+}
+
 /// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到
 /// 「现在是哪个」，而不是从头找。
 pub(crate) fn open_settings(app: &mut App) {
@@ -831,7 +856,8 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
         .client()
         .and_then(|c| c.call(Request::Profiles { lang }))
     {
-        Ok(Response::Profiles { entries, warning }) => {
+        Ok(Response::Profiles { entries, warnings }) => {
+            let warning = join_warnings(&warnings, app.lang);
             // 把「拉完列表但没能直开」的三种落点（选择器为空、建会话失败
             // 两种）收在一处，省得同一段 ListState 初始化抄三遍——那种
             // 抄法迟早有一份漏了空表守卫。

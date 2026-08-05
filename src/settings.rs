@@ -4,10 +4,11 @@
 //! 用哪种语言由 `i18n::resolve` 一处说了算。优先级规则散在两个文件里各写一半，
 //! 是这类 bug 最常见的来源。
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use crate::i18n::Lang;
+use crate::proto::{coded, ErrorCode, Operation};
 
 /// 盘上格式：`{"lang":"zh"}`。包一层对象而不是直接存字符串，是为了将来加设置项
 /// 时老文件仍能读（跟 `projects.rs` 的 `Disk` 同一个理由）。
@@ -42,8 +43,9 @@ pub fn load_lang(path: &Path) -> Option<Lang> {
 pub fn save_lang(path: &Path, lang: Lang) -> Result<()> {
     let parent = path
         .parent()
-        .context("设置文件路径没有上级目录，存不了语言设置")?;
-    std::fs::create_dir_all(parent).context("建不了设置目录，语言设置没存下来")?;
+        .ok_or_else(|| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
 
     // 先读回来再写，不是直接覆盖：将来多一个设置项时，存语言不能顺手把别的
     // 设置抹掉。现在只有一项，但这个坑要在只有一项的时候就填上。
@@ -53,11 +55,14 @@ pub fn save_lang(path: &Path, lang: Lang) -> Result<()> {
         .unwrap_or_default();
     disk.lang = Some(lang.code().to_string());
 
-    let json = serde_json::to_string(&disk).context("设置序列化失败")?;
+    let json = serde_json::to_string(&disk)
+        .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
     // 原子写：直接覆写的话，写到一半断电会留下半截 JSON，下次读就当成没设置过。
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).context("写不了设置文件，语言设置没存下来")?;
-    std::fs::rename(&tmp, path).context("设置文件换名失败，语言设置没存下来")?;
+    std::fs::write(&tmp, json)
+        .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
     Ok(())
 }
 

@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 pub use crate::i18n::Lang;
+use crate::proto::{IoReason, WarningCode};
 
 /// 一段可翻译的文案。TOML 里写成子表：`[label]` 下面 `zh = "..."`。
 ///
@@ -177,17 +178,17 @@ pub fn profiles_dir_for_socket(socket: &Path) -> PathBuf {
 /// 这里按 `ErrorKind` 挑几种用户分得清、也做得了什么的说法；分不清的
 /// 归到一句笼统的「读取失败」——原始详情不丢，调用方负责写到 stderr，
 /// 不冒泡到界面上。
-pub(crate) fn describe_io_error(e: &std::io::Error) -> String {
+pub(crate) fn io_reason(e: &std::io::Error) -> IoReason {
     match e.kind() {
-        std::io::ErrorKind::PermissionDenied => "没有权限读取".to_string(),
-        std::io::ErrorKind::NotADirectory => "不是一个文件夹".to_string(),
-        _ => "读取失败".to_string(),
+        std::io::ErrorKind::PermissionDenied => IoReason::PermissionDenied,
+        std::io::ErrorKind::NotADirectory => IoReason::NotADirectory,
+        _ => IoReason::Other,
     }
 }
 
 /// 读一个目录下所有 `*.toml`。第二个返回值是每个读不了的文件的人话错误——
 /// **不能静默跳过**：用户自己写的 profile 没出现在菜单里，他需要知道为什么。
-pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
+pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<WarningCode>) {
     let mut found = Vec::new();
     let mut errs = Vec::new();
 
@@ -202,7 +203,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
             // 原始系统错误写到 stderr 留个诊断痕迹，界面上只给人话——
             // 见 describe_io_error 的注释。
             eprintln!("{name} 打不开：{e}");
-            errs.push(format!("{name} 打不开：{}", describe_io_error(&e)));
+            errs.push(WarningCode::ProfileDirUnreadable {
+                name: name.to_string(),
+                reason: io_reason(&e),
+            });
             return (found, errs);
         }
     };
@@ -220,7 +224,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
         match std::fs::read_to_string(&path) {
             Err(e) => {
                 eprintln!("{name} 读不了：{e}");
-                errs.push(format!("{name} 读不了：{}", describe_io_error(&e)));
+                errs.push(WarningCode::ProfileUnreadable {
+                    name: name.to_string(),
+                    reason: io_reason(&e),
+                });
             }
             Ok(src) => match Profile::from_toml(&src) {
                 // `Profile::from_toml` 用 `.context()` 包了一层，anyhow 的
@@ -230,12 +237,16 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
                 // toml::de::Error，span/message 都在，只是不走它自带的多行
                 // ASCII 图 Display（那是给等宽终端排版看的，不是人话）。
                 Err(e) => {
-                    let detail = e
+                    let (line, reason) = e
                         .root_cause()
                         .downcast_ref::<toml::de::Error>()
                         .map(|te| describe_toml_error(te, &src))
-                        .unwrap_or_else(|| e.to_string());
-                    errs.push(format!("{name} 写错了：{detail}"));
+                        .unwrap_or((None, e.to_string()));
+                    errs.push(WarningCode::ProfileMalformed {
+                        name: name.to_string(),
+                        line,
+                        reason,
+                    });
                 }
                 Ok(p) => found.push(p),
             },
@@ -254,7 +265,7 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
 /// 这行菜单状态栏只能放一行字，两行糊在一起在等宽终端上会错位换行，看着又是
 /// 一份变相的栈追踪。这里把内部换行拍平成中文顿号式的分隔符——两句话都留着，
 /// 「expected ...」那半句是真正告诉用户该怎么改的部分，直接丢掉可惜。
-pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
+pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> (Option<usize>, String) {
     let reason = err
         .message()
         .lines()
@@ -262,16 +273,16 @@ pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
         .collect::<Vec<_>>()
         .join("；");
     match err.span() {
-        Some(span) => {
-            let line = src[..span.start.min(src.len())].matches('\n').count() + 1;
-            format!("第 {line} 行：{reason}")
-        }
-        None => reason,
+        Some(span) => (
+            Some(src[..span.start.min(src.len())].matches('\n').count() + 1),
+            reason,
+        ),
+        None => (None, reason),
     }
 }
 
 /// 内置 + 磁盘。同名以磁盘为准（用户改了就是要改），新名字追加在后面。
-pub fn all_profiles(dir: &Path) -> (Vec<Profile>, Vec<String>) {
+pub fn all_profiles(dir: &Path) -> (Vec<Profile>, Vec<WarningCode>) {
     let (disk, errs) = load_dir(dir);
     let mut out = Profile::builtins();
     for p in disk {
@@ -828,17 +839,16 @@ mod tests {
             "一个坏文件不能连累其它的"
         );
         assert_eq!(errs.len(), 1);
-        assert!(
-            errs[0].contains("bad.toml"),
-            "错误里要说是哪个文件：{}",
-            errs[0]
-        );
+        let WarningCode::ProfileMalformed { name, line, reason } = &errs[0] else {
+            panic!("应当是「写错了」这一类：{:?}", errs[0]);
+        };
+        assert_eq!(name, "bad.toml", "错误里要说是哪个文件");
         // anyhow 的 `.context()` 会把底层 toml::de::Error 的行号和原因吞掉，
         // 只剩一句「profile TOML 解析失败」——那等于把「坏了」重说一遍，
         // 用户本来就知道坏了。这里要证明详细原因确实透出来了。
         assert!(
-            errs[0].contains("第 1 行") && errs[0].contains("invalid key"),
-            "错误里要带解析细节（行号+原因），不能退化成一句空话：{}",
+            *line == Some(1) && reason.contains("invalid key"),
+            "错误里要带解析细节（行号+原因），不能退化成一句空话：{:?}",
             errs[0]
         );
     }
@@ -860,20 +870,20 @@ mod tests {
 
         let (_, errs) = load_dir(tmp.path());
         assert_eq!(errs.len(), 1);
+        let WarningCode::ProfileMalformed { reason, .. } = &errs[0] else {
+            panic!("应当是「写错了」这一类：{:?}", errs[0]);
+        };
         assert!(
-            !errs[0].contains('\n'),
-            "错误要是单行，不能带换行糊到状态栏上：{}",
-            errs[0]
+            !reason.contains('\n'),
+            "原因要是单行，不能带换行糊到状态栏上：{reason}"
         );
         assert!(
-            errs[0].contains("invalid escape sequence"),
-            "第一句原因不能丢：{}",
-            errs[0]
+            reason.contains("invalid escape sequence"),
+            "第一句原因不能丢：{reason}"
         );
         assert!(
-            errs[0].contains("expected"),
-            "该怎么改的那半句不能丢：{}",
-            errs[0]
+            reason.contains("expected"),
+            "该怎么改的那半句不能丢：{reason}"
         );
     }
 
@@ -912,20 +922,20 @@ mod tests {
                 "目录存在但读不了（比如权限不对）不能和「目录不存在」一样静默——\
                  用户既拿不到自定义 profile，也拿不到任何解释"
             );
-            assert!(
-                errs[0].contains("locked"),
-                "错误里要指出是哪个目录：{}",
-                errs[0]
-            );
+            let WarningCode::ProfileDirUnreadable { name, reason } = &errs[0] else {
+                panic!("应当是「目录打不开」这一类：{:?}", errs[0]);
+            };
+            assert!(name.contains("locked"), "错误里要指出是哪个目录：{name}");
             // io::Error 的 Display 是英文系统原话（"Permission denied (os
-            // error 13)"），零编程经验的用户看不懂 errno——这行必须只剩
-            // 中文说法，原文只写 stderr。
+            // error 13)"），零编程经验的用户看不懂 errno。现在结构上就没有
+            // 地方能塞进原文——码里只有一个分类枚举。
+            assert_eq!(*reason, IoReason::PermissionDenied, "要点名是权限问题");
+            let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, &errs[0]);
             assert!(
-                !errs[0].contains("os error") && !errs[0].contains("Permission denied"),
-                "不能把系统原话漏给用户：{}",
-                errs[0]
+                !line.contains("os error") && !line.contains("Permission denied"),
+                "组出来的话里不能有系统原话：{line}"
             );
-            assert!(errs[0].contains("权限"), "要点名是权限问题：{}", errs[0]);
+            assert!(line.contains("权限"), "中文下要说「权限」：{line}");
         }
     }
 
@@ -953,11 +963,15 @@ mod tests {
             let (found, errs) = load_dir(tmp.path());
             assert!(found.is_empty());
             assert_eq!(errs.len(), 1);
-            assert!(errs[0].contains("locked.toml"));
+            let WarningCode::ProfileUnreadable { name, reason } = &errs[0] else {
+                panic!("应当是「文件读不了」这一类：{:?}", errs[0]);
+            };
+            assert_eq!(name, "locked.toml");
+            assert_eq!(*reason, IoReason::PermissionDenied);
+            let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, &errs[0]);
             assert!(
-                !errs[0].contains("os error") && !errs[0].contains("Permission denied"),
-                "不能把系统原话漏给用户：{}",
-                errs[0]
+                !line.contains("os error") && !line.contains("Permission denied"),
+                "不能把系统原话漏给用户：{line}"
             );
         }
     }

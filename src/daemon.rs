@@ -112,7 +112,7 @@ fn handle(
                 // 不支持手改的文件。`load_error()` 现在返回的已经是一句自足、
                 // 说清楚该干什么的中文（见 `SecretStore::load` 的注释），这里
                 // 只负责把路径带上，不再叠加任何暗示"去编辑它"的措辞。
-                warnings.insert(0, format!("{e}（{}）", sec.path().display()));
+                warnings.insert(0, e.clone());
             }
             let entries = all
                 .iter()
@@ -140,14 +140,7 @@ fn handle(
                     }
                 })
                 .collect();
-            Ok(Response::Profiles {
-                entries,
-                warning: if warnings.is_empty() {
-                    None
-                } else {
-                    Some(warnings.join("；"))
-                },
-            })
+            Ok(Response::Profiles { entries, warnings })
         }
         Request::Projects => Ok(Response::Projects(recover(store.lock()).list())),
         Request::Create {
@@ -228,7 +221,7 @@ fn handle(
 /// 照抄原文走 `Internal`，界面原样显示。这样迁移可以一条一条来，不必等到
 /// 每一条都归好类才敢合并。
 fn to_code(e: anyhow::Error) -> ErrorCode {
-    match e.downcast::<crate::session::CodedError>() {
+    match e.downcast::<crate::proto::CodedError>() {
         Ok(c) => c.0,
         Err(e) => ErrorCode::Internal(e.to_string()),
     }
@@ -311,16 +304,29 @@ mod tests {
         );
 
         match resp {
-            Response::Profiles { warning, .. } => {
-                let w = warning.expect("密钥文件读坏了必须有 warning");
-                assert!(
-                    w.contains(&secrets_path.display().to_string()),
-                    "要点名是哪个文件：{w}"
+            Response::Profiles { warnings, .. } => {
+                // 守护进程报的是**码**。它点名了是哪个文件，但一个字的
+                // 文案都不组——句子由界面用 `i18n::msg::warning` 组出来。
+                let w = warnings
+                    .iter()
+                    .find(|w| matches!(w, crate::proto::WarningCode::SecretsCorrupt { .. }))
+                    .expect("密钥文件读坏了必须有 warning");
+                let crate::proto::WarningCode::SecretsCorrupt { path } = w else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    path,
+                    &secrets_path.display().to_string(),
+                    "要点名是哪个文件"
                 );
-                assert!(!w.contains('\n'), "不能是多行栈追踪：{w}");
+
+                // 组出来的那句话仍然要满足原来的两条约束：一行、不带
+                // toml 库自带的图形化 Display。
+                let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+                assert!(!line.contains('\n'), "不能是多行栈追踪：{line}");
                 assert!(
-                    !w.contains("TOML parse error"),
-                    "toml 库自带的图形化 Display 不能漏出来：{w}"
+                    !line.contains("TOML parse error"),
+                    "toml 库自带的图形化 Display 不能漏出来：{line}"
                 );
             }
             other => panic!("期待 Response::Profiles，得到 {other:?}"),

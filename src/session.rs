@@ -1,5 +1,5 @@
-use crate::proto::ErrorCode;
-use anyhow::{Context, Result};
+use crate::proto::{coded, ErrorCode, Operation};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,29 +69,6 @@ struct Session {
 /// 每个会话又单独包一层 `Mutex`，所以不同会话之间的操作（比如两个会话各自的
 /// `send_input`）也互不阻塞；只有同一个会话的并发操作会互相排队，这本来就是
 /// 应该的。
-/// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。
-///
-/// 不把 `SessionManager` 的错误类型整个换成 `ErrorCode`，是因为它内部到处
-/// 在 `?` io/git 错误，全换要动的地方远多于本次收益；而 daemon 边界那一处
-/// `downcast` 就能把码取回来（见 `daemon.rs` 的 `to_code`）。取不回来的
-/// 就是还没归类的内部错误，照抄原文。
-pub(crate) fn coded(c: ErrorCode) -> anyhow::Error {
-    anyhow::Error::new(CodedError(c))
-}
-
-/// `anyhow` 要求负载实现 `std::error::Error`，包一层。
-#[derive(Debug)]
-pub(crate) struct CodedError(pub ErrorCode);
-
-impl std::fmt::Display for CodedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 这句只会进 stderr 日志，不上界面——界面拿的是码。
-        write!(f, "{:?}", self.0)
-    }
-}
-
-impl std::error::Error for CodedError {}
-
 pub struct SessionManager {
     next_id: AtomicU32,
     sessions: Mutex<HashMap<u32, Arc<Mutex<Session>>>>,
@@ -208,8 +185,10 @@ impl SessionManager {
             // 「fatal: detected dubious ownership in repository at …」
             // 原样飘到选择器/密钥失败提示上（后者尤其误导，会被用户读成
             // 「我的密钥不对」）。
-            checkpoints
-                .push(git::checkpoint(dir, id, 0).context("拍不了检查点，这个会话没法安全撤销")?);
+            checkpoints.push(
+                git::checkpoint(dir, id, 0)
+                    .map_err(|_| coded(ErrorCode::OperationFailed(Operation::FirstCheckpoint)))?,
+            );
         }
 
         let session = Session {
@@ -292,7 +271,7 @@ impl SessionManager {
                 // 慢，无锁。失败时给中文上下文，理由同 create() 里那处——
                 // 见那边的注释。
                 let sha = git::checkpoint(&dir, sid, seq)
-                    .context("拍检查点失败，这一步的改动可能没法撤销")?;
+                    .map_err(|_| coded(ErrorCode::OperationFailed(Operation::Checkpoint)))?;
                 let mut s = recover(arc.lock());
                 if s.checkpoints.last() != Some(&sha) {
                     s.checkpoints.push(sha);
@@ -349,14 +328,14 @@ impl SessionManager {
     pub fn undo(&self, id: u32) -> Result<()> {
         let (dir, sha) = self.checkpoint_base(id)?;
         // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
-        git::restore(&dir, &sha).context("撤销失败，工作区可能停在了改到一半的状态")
+        git::restore(&dir, &sha).map_err(|_| coded(ErrorCode::OperationFailed(Operation::Undo)))
     }
 
     /// 相对最后一张快照改了哪些文件。git 操作不持会话锁。
     pub fn diff(&self, id: u32) -> Result<Vec<FileStat>> {
         let (dir, base) = self.checkpoint_base(id)?;
         // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
-        git::diff_stat(&dir, &base).context("算不出改了哪些文件，再试一次")
+        git::diff_stat(&dir, &base).map_err(|_| coded(ErrorCode::OperationFailed(Operation::Diff)))
     }
 
     /// 取出做 git 操作需要的信息后立刻放锁。
@@ -498,7 +477,10 @@ mod tests {
         let err = m
             .create(plain.path(), "fake", empty_secrets(), &[])
             .unwrap_err();
-        let code = err.downcast::<CodedError>().expect("要带上错误码").0;
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
         assert!(
             matches!(code, ErrorCode::NotAGitRepo(_)),
             "实际错误: {code:?}"
@@ -523,7 +505,10 @@ mod tests {
         let err = m
             .create(&missing, "shell", empty_secrets(), &[])
             .unwrap_err();
-        let code = err.downcast::<CodedError>().expect("要带上错误码").0;
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
         assert!(
             matches!(code, ErrorCode::DirNotFound(_)),
             "实际错误: {code:?}"
@@ -943,13 +928,22 @@ mod tests {
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
         let err = mgr
             .create(&proj, "gone", secrets.get("gone"), &[])
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("启动不了"), "要说人话：{err}");
+            .unwrap_err();
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
+        // 码里只有命令名，**结构上就没有地方**能塞进 ENOENT——
+        // 这比原来靠断言字符串不含 "enoent" 强，那种断言只能拦住已知的写法。
+        let ErrorCode::CannotStart(ref cmd) = code else {
+            panic!("应当是「启动不了」这一类：{code:?}");
+        };
+        assert_eq!(cmd, "/绝对不存在/x9", "要点名是哪个命令");
+        let line = crate::i18n::msg::error(crate::i18n::Lang::Zh, &code);
+        assert!(line.contains("启动不了"), "要说人话：{line}");
         assert!(
-            !err.to_lowercase().contains("enoent"),
-            "别把系统错误码甩给用户：{err}"
+            !line.to_lowercase().contains("enoent"),
+            "别把系统错误码甩给用户：{line}"
         );
     }
 }

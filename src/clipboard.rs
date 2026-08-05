@@ -4,7 +4,7 @@
 //! 剪贴板里是图的话什么都不会发生。所以 dct 自己去读剪贴板，把图片存成临时
 //! 文件，再把文件路径当文字送给 agent —— agent 拿到路径就能读图。
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -19,11 +19,19 @@ fn paste_dir() -> PathBuf {
 #[cfg(target_os = "macos")]
 pub fn image_to_file() -> Result<Option<PathBuf>> {
     let dir = paste_dir();
-    std::fs::create_dir_all(&dir).context("建不了临时目录")?;
+    std::fs::create_dir_all(&dir).map_err(|_| {
+        crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
+            crate::proto::Operation::ReadClipboard,
+        ))
+    })?;
 
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let path = dir.join(format!("paste-{}-{}.png", std::process::id(), n));
-    let path_str = path.to_str().context("临时文件路径不是合法 UTF-8")?;
+    let path_str = path.to_str().ok_or_else(|| {
+        crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
+            crate::proto::Operation::ReadClipboard,
+        ))
+    })?;
 
     let script = format!(
         r#"set outFile to POSIX file "{path_str}"
@@ -43,7 +51,11 @@ return "OK""#
         .arg("-e")
         .arg(&script)
         .output()
-        .context("调用 osascript 失败")?;
+        .map_err(|_| {
+            crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
+                crate::proto::Operation::ReadClipboard,
+            ))
+        })?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim() == "OK" {
@@ -51,8 +63,14 @@ return "OK""#
     } else if stdout.trim() == "NO_IMAGE" {
         Ok(None)
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        bail!("读剪贴板失败: {}", err.trim())
+        // 原始 stderr 只留一份诊断痕迹，界面上给码
+        eprintln!(
+            "读剪贴板失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Err(crate::proto::coded(
+            crate::proto::ErrorCode::OperationFailed(crate::proto::Operation::ReadClipboard),
+        ))
     }
 }
 
