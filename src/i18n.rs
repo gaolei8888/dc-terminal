@@ -72,6 +72,250 @@ pub fn resolve(saved: Option<Lang>, env: &dyn Fn(&str) -> Option<String>) -> Lan
     Lang::En
 }
 
+/// 一条文案的各语言写在一起，不是每种语言各一个大 `match`——改中文时英文
+/// 就在眼前，不会出现「改了一半」。
+macro_rules! t {
+    ($lang:expr, en: $en:expr, zh: $zh:expr $(,)?) => {
+        match $lang {
+            Lang::En => $en,
+            Lang::Zh => $zh,
+        }
+    };
+}
+
+/// 无参文案。带参的走下面的 `msg` 模块——那些必须是函数，见该模块的注释。
+///
+/// 加 `Lang::Ja` 那天，`text()` 里每一条没翻的都会被编译器点名。这是选枚举
+/// 而不是配置文件的全部理由。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    // —— 动作（底栏按键表用，也是设置页等处的通用词）——
+    New,
+    SwitchAgent,
+    SwitchProject,
+    SeeAllProjects,
+    ThisProjectOnly,
+    Secrets,
+    Grid,
+    Select,
+    Open,
+    Zoom,
+    Undo,
+    Stop,
+    Diff,
+    Quit,
+    Confirm,
+    Cancel,
+    Back,
+    Edit,
+    Delete,
+    MoveArrows,
+    NextSession,
+    OtherKeysGoToAgent,
+    NewSessionFromBoard,
+    BackToListWord,
+    BackToSettingsWord,
+    OrPressDigit,
+    TypeToFilter,
+    Language,
+    // —— 逃生键 ——
+    BackToBoard,
+    BackToBoardWithF2,
+    BackToList,
+    BackToSettings,
+    // —— 视图标题 ——
+    BoardTitle,
+    BoardTitleAllProjects,
+    Disconnected,
+    PickAgentTitle,
+    PickProjectTitle,
+    TypePathTitle,
+    SettingsTitle,
+    CurrentProject,
+    ManualPath,
+    // —— 状态与提示 ——
+    NoSessionsHere,
+    NoSessionsAtAll,
+    WindowTooSmall,
+    Verifying,
+    PasteOrTypeKey,
+    NoOtherRunningSession,
+    NoSessionSelected,
+    DaemonUnreachable,
+    StaleData,
+}
+
+pub fn text(k: Key, lang: Lang) -> &'static str {
+    use Key::*;
+    match k {
+        New => t!(lang, en: "new", zh: "新建"),
+        SwitchAgent => t!(lang, en: "switch agent", zh: "换 agent"),
+        SwitchProject => t!(lang, en: "switch project", zh: "换项目"),
+        SeeAllProjects => t!(lang, en: "all projects", zh: "看全部项目"),
+        ThisProjectOnly => t!(lang, en: "this project only", zh: "只看本项目"),
+        Secrets => t!(lang, en: "keys", zh: "密钥"),
+        Grid => t!(lang, en: "grid", zh: "九宫格"),
+        Select => t!(lang, en: "select", zh: "选择"),
+        Open => t!(lang, en: "open", zh: "进入"),
+        Zoom => t!(lang, en: "zoom in", zh: "放大"),
+        Undo => t!(lang, en: "undo", zh: "回滚"),
+        Stop => t!(lang, en: "stop", zh: "停止"),
+        Diff => t!(lang, en: "changes", zh: "改动"),
+        Quit => t!(lang, en: "quit", zh: "退出"),
+        Confirm => t!(lang, en: "confirm", zh: "确认"),
+        Cancel => t!(lang, en: "cancel", zh: "取消"),
+        Back => t!(lang, en: "back", zh: "返回"),
+        Edit => t!(lang, en: "edit", zh: "改"),
+        Delete => t!(lang, en: "delete", zh: "删"),
+        MoveArrows => t!(lang, en: "arrow keys move", zh: "方向键移动"),
+        NextSession => t!(lang, en: "next session", zh: "下一个会话"),
+        NewSessionFromBoard => t!(
+            lang,
+            en: "go back and press n for a new session",
+            zh: "回看板后按 n 新建会话",
+        ),
+        BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
+        BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
+        OtherKeysGoToAgent => t!(
+            lang,
+            en: "every other key goes to the agent",
+            zh: "其余按键都发给 agent",
+        ),
+        OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
+        TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
+        Language => t!(lang, en: "language", zh: "语言"),
+
+        BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
+        BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
+        BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
+        BackToSettings => t!(lang, en: "Ctrl+Q settings", zh: "Ctrl+Q 回设置"),
+
+        BoardTitle => t!(lang, en: "dct sessions", zh: "dct 会话看板"),
+        BoardTitleAllProjects => t!(
+            lang,
+            en: "dct sessions · all projects",
+            zh: "dct 会话看板 · 全部项目",
+        ),
+        Disconnected => t!(
+            lang,
+            en: "disconnected, this may be out of date",
+            zh: "连接已断开，数据可能已过期",
+        ),
+        PickAgentTitle => t!(lang, en: "Pick an agent", zh: "选 agent"),
+        PickProjectTitle => t!(lang, en: "Pick a project", zh: "选项目"),
+        TypePathTitle => t!(lang, en: "Type a project path", zh: "输入项目路径"),
+        SettingsTitle => t!(lang, en: "Settings", zh: "设置"),
+        CurrentProject => t!(lang, en: "Project", zh: "当前项目"),
+        ManualPath => t!(lang, en: "Type a path…", zh: "手输路径…"),
+
+        NoSessionsHere => t!(
+            lang,
+            en: "No sessions in this project yet. Press n to start one, or a to see every project.",
+            zh: "这个项目还没有会话，按 n 开一个，按 a 看全部项目",
+        ),
+        NoSessionsAtAll => t!(
+            lang,
+            en: "No sessions yet. Press n to start one.",
+            zh: "还没有任何会话，按 n 开一个",
+        ),
+        WindowTooSmall => t!(
+            lang,
+            en: "Window too small — enlarge the terminal to see the grid",
+            zh: "窗口太小，放大终端窗口后再看九宫格",
+        ),
+        Verifying => t!(
+            lang,
+            en: "Checking, one moment　Esc to cancel",
+            zh: "正在验证，请稍候　Esc 可取消",
+        ),
+        PasteOrTypeKey => t!(lang, en: "Paste or type your key", zh: "粘贴或输入密钥"),
+        NoOtherRunningSession => t!(
+            lang,
+            en: "No other session is running",
+            zh: "没有其他正在跑的会话",
+        ),
+        NoSessionSelected => t!(lang, en: "No session selected", zh: "没有选中会话"),
+        DaemonUnreachable => t!(
+            lang,
+            en: "Cannot reach the dct service",
+            zh: "守护进程连不上",
+        ),
+        StaleData => t!(
+            lang,
+            en: "Cannot reach the dct service — what you see may be out of date",
+            zh: "守护进程连不上，界面数据可能已过期",
+        ),
+    }
+}
+
+/// 把「按键 + 它做什么」拼成底栏那一行。
+///
+/// 按条目拼而不是把整句写进词条表：整句进表的话，每种语言都要把 `n`/`p`/`Enter`
+/// 这些**不翻译**的键名再抄一遍，加一种语言就多抄一份，而键名改了要改 N 处。
+/// 分隔符是两个半角空格，正好是 `widgets::wrap_help` 认的断点。
+pub fn help_line(items: &[(&str, Key)], lang: Lang) -> String {
+    items
+        .iter()
+        .map(|(k, key)| format!("{k} {}", text(*key, lang)))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// 带参文案。**每条一个函数，不是带 `{}` 的模板**：模板要靠调用方按顺序填参，
+/// 漏填、错序、类型不对，编译器一概不管，而各语言的语序本来就不同。
+/// 写成函数，这些全归签名管。
+pub mod msg {
+    use super::{text, Key, Lang};
+
+    pub fn switched_to(lang: Lang, project: &str) -> String {
+        t!(lang, en: format!("Switched to {project}"), zh: format!("已切到 {project}"))
+    }
+
+    pub fn not_a_directory(lang: Lang, path: &str) -> String {
+        t!(lang, en: format!("{path} is not a folder"), zh: format!("{path} 不是一个目录"))
+    }
+
+    pub fn cannot_find_anymore(lang: Lang, path: &str) -> String {
+        t!(lang, en: format!("{path} cannot be found anymore"), zh: format!("{path} 现在找不到了"))
+    }
+
+    pub fn session_ended(lang: Lang, id: u32) -> String {
+        t!(
+            lang,
+            en: format!("Session {id} ended. Back to the board — press n to start another."),
+            zh: format!("会话 {id} 已结束，回到看板。按 n 再建一个"),
+        )
+    }
+
+    pub fn needs_dependency(lang: Lang, label: &str, target: &str) -> String {
+        t!(
+            lang,
+            en: format!("Install {label} first to use {target}"),
+            zh: format!("要先装 {label} 才能用 {target}"),
+        )
+    }
+
+    pub fn no_command_configured(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("{label} has no program configured, so it cannot run"),
+            zh: format!("{label} 没配置要运行的程序，用不了"),
+        )
+    }
+
+    pub fn command_not_found(lang: Lang, command: &str) -> String {
+        t!(
+            lang,
+            en: format!("{command} was not found on this machine"),
+            zh: format!("本机没有找到 {command}"),
+        )
+    }
+
+    pub fn title_with(lang: Lang, main: Key, extra: &str) -> String {
+        format!("{}（{extra}）", text(main, lang))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +327,110 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k: &str| m.get(k).cloned()
+    }
+
+    /// 词条表里所有的 `Key`。加变体忘了加到这里，下面两条守卫就漏测它——
+    /// 所以这份清单本身也被 `every_key_is_listed_for_the_guards` 钉着。
+    const ALL_KEYS: &[Key] = {
+        use Key::*;
+        &[
+            New,
+            SwitchAgent,
+            SwitchProject,
+            SeeAllProjects,
+            ThisProjectOnly,
+            Secrets,
+            Grid,
+            Select,
+            Open,
+            Zoom,
+            Undo,
+            Stop,
+            Diff,
+            Quit,
+            Confirm,
+            Cancel,
+            Back,
+            Edit,
+            Delete,
+            MoveArrows,
+            NextSession,
+            OtherKeysGoToAgent,
+            NewSessionFromBoard,
+            BackToListWord,
+            BackToSettingsWord,
+            OrPressDigit,
+            TypeToFilter,
+            Language,
+            BackToBoard,
+            BackToBoardWithF2,
+            BackToList,
+            BackToSettings,
+            BoardTitle,
+            BoardTitleAllProjects,
+            Disconnected,
+            PickAgentTitle,
+            PickProjectTitle,
+            TypePathTitle,
+            SettingsTitle,
+            CurrentProject,
+            ManualPath,
+            NoSessionsHere,
+            NoSessionsAtAll,
+            WindowTooSmall,
+            Verifying,
+            PasteOrTypeKey,
+            NoOtherRunningSession,
+            NoSessionSelected,
+            DaemonUnreachable,
+            StaleData,
+        ]
+    };
+
+    fn has_han(s: &str) -> bool {
+        s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    }
+
+    /// 英文词条里不许出现汉字。批量加词条时最容易犯的错就是把中文那行抄过去——
+    /// profile 那边已经踩过一次（`shell` 的 label 变成 `en = "命令行"`）。
+    #[test]
+    fn no_english_entry_contains_han_characters() {
+        for k in ALL_KEYS {
+            let en = text(*k, Lang::En);
+            assert!(!has_han(en), "{k:?} 的英文写着中文：{en}");
+        }
+    }
+
+    /// 每条词条两种语言都得有内容。空串会让屏幕上凭空少一截，而且不报错。
+    #[test]
+    fn no_entry_is_empty_in_either_language() {
+        for k in ALL_KEYS {
+            for l in Lang::all() {
+                assert!(!text(*k, *l).trim().is_empty(), "{k:?} 在 {l:?} 下是空的");
+            }
+        }
+    }
+
+    /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+    /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+    #[test]
+    fn every_key_is_listed_for_the_guards() {
+        // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+        // 而是「词条表里到底有多少条」这个事实。
+        assert_eq!(ALL_KEYS.len(), 50, "加了 Key 变体就要同步进 ALL_KEYS");
+        let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+        seen.sort();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+    }
+
+    #[test]
+    fn help_line_joins_keys_with_their_labels() {
+        let line = help_line(&[("n", Key::New), ("q", Key::Quit)], Lang::En);
+        assert_eq!(line, "n new  q quit");
+        // 分隔符必须是两个空格：`widgets::wrap_help` 就认它当断点
+        assert!(line.contains("  "));
     }
 
     #[test]

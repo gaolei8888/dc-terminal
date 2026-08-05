@@ -28,6 +28,7 @@ mod board;
 mod grid;
 mod pick;
 mod secret;
+mod settings_view;
 
 mod view;
 use view::SecretPhase;
@@ -145,7 +146,12 @@ fn spawn_signal_restore() {
     });
 }
 
-pub fn run(client: Client, default_dir: PathBuf, lang: crate::i18n::Lang) -> Result<()> {
+pub fn run(
+    client: Client,
+    default_dir: PathBuf,
+    lang: crate::i18n::Lang,
+    socket: PathBuf,
+) -> Result<()> {
     // 必须在 enable_raw_mode 之前装：装早了无害（还没进 raw mode 时
     // restore_terminal() 没有副作用，多发一次 LeaveAlternateScreen 也无害），
     // 装晚了就有一个「已经进 raw mode 但信号还没被接管」的真空窗口。
@@ -170,7 +176,7 @@ pub fn run(client: Client, default_dir: PathBuf, lang: crate::i18n::Lang) -> Res
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(client, default_dir, lang);
+    let mut app = App::new(client, default_dir, lang, socket);
 
     loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
@@ -523,6 +529,7 @@ pub fn run(client: Client, default_dir: PathBuf, lang: crate::i18n::Lang) -> Res
                 View::PickProject { .. } => pick::handle_key(&mut app, key)?,
                 View::Attached(_) => attach::handle_key(&mut app, key)?,
                 View::Grid { .. } => grid::handle_key(&mut app, key)?,
+                View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
                 View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
                 View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             }
@@ -694,7 +701,8 @@ fn selected<'a>(sessions: &'a [SessionInfo], st: &ListState) -> Option<&'a Sessi
 /// 「同一个 session 变成了不同的项目」。
 pub(crate) fn switch_project(app: &mut App, dir: std::path::PathBuf) {
     // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
-    app.message = format!("已切到 {}", short_path(&dir.display().to_string())).into();
+    app.message =
+        crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string())).into();
     app.current_dir = dir;
     app.refresh_visible();
     app.view = View::Board;
@@ -717,7 +725,9 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
         .map(|s| std::path::PathBuf::from(&s.dir))
     {
         if !view::same_project(&dir, &app.current_dir) {
-            app.message = format!("已切到 {}", short_path(&dir.display().to_string())).into();
+            app.message =
+                crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string()))
+                    .into();
             app.current_dir = dir;
             app.refresh_visible();
         }
@@ -725,6 +735,19 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 会话标题要显示项目名
     app.need_sessions = true;
     app.view = View::Attached(id);
+}
+
+/// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到
+/// 「现在是哪个」，而不是从头找。
+pub(crate) fn open_settings(app: &mut App) {
+    let mut state = ListState::default();
+    state.select(Some(
+        crate::i18n::Lang::all()
+            .iter()
+            .position(|l| *l == app.lang)
+            .unwrap_or(0),
+    ));
+    app.view = View::Settings { state };
 }
 
 /// `a` 键：在「只看当前项目」和「全部项目」之间切换。看板和九宫格共用。
@@ -1008,6 +1031,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Grid { .. } => grid::draw(f, chunks[0], app),
         View::PickProfile { .. } | View::PickProject { .. } => pick::draw(f, chunks[0], app),
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
+        View::Settings { .. } => settings_view::draw(f, chunks[0], app),
     }
 
     // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
@@ -1017,14 +1041,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 逃生键那一截已经挪进左段常驻，这里不再重复。
     let (help, style) = if !app.connected {
         (
-            "守护进程连不上，界面数据可能已过期".to_string(),
+            crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string(),
             Style::default().fg(Color::Red),
         )
     } else if app.message.text.is_empty() {
-        (
-            idle_help(&app.view, app.scope).to_string(),
-            Style::default(),
-        )
+        (idle_help(&app.view, app.scope, app.lang), Style::default())
     } else if app.message.error {
         (app.message.text.clone(), Style::default().fg(Color::Red))
     } else {
@@ -1034,7 +1055,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 「当前项目：~/work/dc/dc-terminal」加上按键表在 80 列终端里放不下同一行，
     // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "当前项目：{}",
+        "{}：{}",
+        crate::i18n::text(crate::i18n::Key::CurrentProject, app.lang),
         short_path(&app.current_dir.display().to_string())
     ));
     let inner = block.inner(chunks[1]);
@@ -1052,7 +1074,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(inner);
     f.render_widget(
-        Paragraph::new(escape_hint(&app.view)).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(escape_hint(&app.view, app.lang)).style(Style::default().fg(Color::Cyan)),
         bar[0],
     );
     // 折行而不是截断：截断会把句尾那几个键悄悄抹掉，而用户没有任何线索
@@ -1393,6 +1415,9 @@ mod tests {
                 state: ListState::default(),
                 pending_delete: None,
             },
+            View::Settings {
+                state: ListState::default(),
+            },
             // 填密钥有两条退路（回设置页 / 回选择器），两条文案都要量
             View::EnterSecret {
                 profile: String::new(),
@@ -1417,16 +1442,24 @@ mod tests {
                 return_to_settings: false,
             },
         ];
-        for v in &views {
-            let hint = escape_hint(v);
-            assert!(
-                hint.width() <= ESCAPE_HINT_COLS as usize,
-                "逃生键「{hint}」宽 {} 列，放不进 ESCAPE_HINT_COLS = {ESCAPE_HINT_COLS}",
-                hint.width()
-            );
+        // 两种语言都要量。常量是写死的，而译文长度各不相同——只量中文的话，
+        // 哪天某种语言的逃生键更长，就会在那种语言下被静默截断。
+        for l in crate::i18n::Lang::all() {
+            for v in &views {
+                let hint = escape_hint(v, *l);
+                assert!(
+                    hint.width() <= ESCAPE_HINT_COLS as usize,
+                    "{l:?} 下逃生键「{hint}」宽 {} 列，放不进 ESCAPE_HINT_COLS = {ESCAPE_HINT_COLS}",
+                    hint.width()
+                );
+            }
         }
         // 常量不能比需要的更宽：多占的每一列都是从右段的消息里抢的
-        let widest = views.iter().map(|v| escape_hint(v).width()).max().unwrap();
+        let widest = crate::i18n::Lang::all()
+            .iter()
+            .flat_map(|l| views.iter().map(move |v| escape_hint(v, *l).width()))
+            .max()
+            .unwrap();
         assert_eq!(
             widest, ESCAPE_HINT_COLS as usize,
             "ESCAPE_HINT_COLS 应当正好等于最长文案的宽度"

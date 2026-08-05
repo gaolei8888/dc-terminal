@@ -36,7 +36,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 附加的这个必定在 `visible` 里，轮转起点不会落空。
         match super::grid::next_running(&app.visible, id) {
             Some(next) => super::enter_session(app, next),
-            None => app.message = "没有其他正在跑的会话".into(),
+            None => {
+                app.message =
+                    crate::i18n::text(crate::i18n::Key::NoOtherRunningSession, app.lang).into()
+            }
         }
     } else if let Some(text) = key_to_input(&key) {
         // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。

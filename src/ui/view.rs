@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
+use crate::i18n::Lang;
 use crate::profile::ProfileStatus;
 use crate::proto::{ProfileEntry, SecretPrompt};
 use crate::session::SessionState;
@@ -37,6 +38,11 @@ pub(crate) enum View {
         state: ListState,
         /// Some 表示正处在「手输路径」的输入态
         typing_path: Option<String>,
+    },
+    /// 设置页：目前只有语言一项。跟 `Secrets` 分开是两码事——那边管的是
+    /// 「哪个 agent 用哪把密钥」，这里管的是界面本身怎么显示。
+    Settings {
+        state: ListState,
     },
     EnterSecret {
         /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
@@ -464,30 +470,31 @@ pub(crate) fn session_ended_notice(id: u32, state: SessionState) -> Option<Strin
 /// 别的窗口 kill 进程，而 kill 会把终端留在 raw mode。文案必须跟
 /// `back_one_level` 逐行对上：底栏说什么就得真能做到什么，
 /// 手输路径态退的是一层（回列表），不能写成「回看板」。
-pub(crate) fn escape_hint(view: &View) -> &'static str {
+pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
+    use crate::i18n::{text, Key};
     match view {
-        View::Board => "q 退出",
+        View::Board => format!("q {}", text(Key::Quit, lang)),
         View::PickProject {
             typing_path: Some(_),
             ..
-        } => "Ctrl+Q 回列表",
+        } => text(Key::BackToList, lang).to_string(),
         // 跟 back_one_level 保持一致：从密钥设置页进来的填密钥，退出回设置页，
         // 不是选择器，也不是看板——三条路各回各的，文案不能含糊成一句话。
         View::EnterSecret {
             return_to_settings: true,
             ..
-        } => "Ctrl+Q 回设置",
+        } => text(Key::BackToSettings, lang).to_string(),
         // 从选择器进来的填密钥，退出回的是选择器，不是看板
-        View::EnterSecret { .. } => "Ctrl+Q 回列表",
+        View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
         // 九宫格退回的也是看板，但对用户来说那一屏就是「列表」——
         // 站在格子里说「回看板」，用户会以为格子不算看板的一部分。
-        View::Grid { .. } => "Ctrl+Q 回列表",
+        View::Grid { .. } => text(Key::BackToList, lang).to_string(),
         // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
         // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
         // 落点都是看板。只写一个键等于藏起另一半——而 F2 恰恰是
         // 手指不必离开主键区的那个。其余视图没有 F2，不能照抄这句。
-        View::Attached(_) => "Ctrl+Q（F2） 回看板",
-        _ => "Ctrl+Q 回看板",
+        View::Attached(_) => text(Key::BackToBoardWithF2, lang).to_string(),
+        _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
 
@@ -495,67 +502,141 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
-pub(crate) fn idle_help(view: &View, scope: Scope) -> &'static str {
+pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
+    use crate::i18n::{help_line, text, Key};
+    // 作用域键的说明随范围反转——`a` 是个开关，只写一个方向的话，
+    // 另一个方向上屏幕就在说谎。
+    let scope_key = match scope {
+        Scope::CurrentProject => Key::SeeAllProjects,
+        Scope::AllProjects => Key::ThisProjectOnly,
+    };
     match view {
         // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
-        View::Attached(_) => "F3 下一个会话　回看板后按 n 新建会话　其余按键都发给 agent",
-        View::PickProfile { .. } => "↑↓ 选  Enter 确认  或直接按数字  Esc 取消",
+        View::Attached(_) => help_line(
+            &[
+                ("F3", Key::NextSession),
+                ("", Key::NewSessionFromBoard),
+                ("", Key::OtherKeysGoToAgent),
+            ],
+            lang,
+        )
+        .replace("  ", "　"),
+        View::PickProfile { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("", Key::OrPressDigit),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
         View::PickProject {
             typing_path: Some(_),
             ..
-        } => "输入路径后 Enter 确认，Esc 返回列表",
-        View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
-        // `g 九宫格` 插在切换类按键那一段里，不放句尾：这一整句在 80 列
-        // 终端上放不下会被右端截断，而 `g` 是九宫格唯一的入口——排在被截
-        // 掉的那一截里等于没写。
+        } => help_line(
+            &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
+            lang,
+        ),
+        View::PickProject { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("", Key::TypeToFilter),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
+        // `g 九宫格` 插在切换类按键那一段里，不放句尾：`g` 是九宫格唯一的
+        // 入口，排在最容易被挤到第二行末尾的位置等于藏起来。
         // `a` 紧跟着 `p 换项目`：两个键都在回答「我现在在看哪些会话」，
-        // 挨着放用户才会把它们当成一组。文案随范围反转——`a` 是个开关，
-        // 只写一个方向的话，另一个方向上屏幕就在说谎。
-        View::Board => match scope {
-            Scope::CurrentProject => {
-                "n 新建  N 换 agent  p 换项目  a 看全部项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
-            }
-            Scope::AllProjects => {
-                "n 新建  N 换 agent  p 换项目  a 只看本项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
-            }
-        },
+        // 挨着放用户才会把它们当成一组。
+        View::Board => help_line(
+            &[
+                ("n", Key::New),
+                ("N", Key::SwitchAgent),
+                ("p", Key::SwitchProject),
+                ("a", scope_key),
+                ("c", Key::Secrets),
+                ("g", Key::Grid),
+                ("↑↓", Key::Select),
+                ("Enter", Key::Open),
+                ("u", Key::Undo),
+                ("s", Key::Stop),
+                ("d", Key::Diff),
+            ],
+            lang,
+        ),
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
         // 跟会话视图不同（那边除了 F2 全转发，列按键表等于教人按错）。
         //
         // 跟看板那一句列的是同一批键（它们在两个视图里做的是同一件事），
         // 只把不一样的两处换掉：选择靠方向键、Enter 是放大而不是进入。
-        // 九宫格独有的两个排在最前——`Ctrl+Q 回列表` 已经常驻左段，
-        // 这里不再重复。
         //
         // `q 退出` 必须写出来：在看板上它常驻左段（escape_hint），到了九宫格
-        // 左段换成了 `Ctrl+Q 回列表`，可 q 照样直接退出整个 dct。屏幕上没写
+        // 左段换成了「Ctrl+Q 回列表」，可 q 照样直接退出整个 dct。屏幕上没写
         // 却真的管用的键，就是等着用户误按——尤其是这个键会关掉一切。
-        // 排在前三而不是句尾，理由跟看板那句里的 `g 九宫格` 一样：这一整句
-        // 在 80 列终端上放不下，句尾那几个键会被右端截掉，写了等于没写。
-        View::Grid { .. } => match scope {
-            Scope::CurrentProject => {
-                "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  a 看全部项目  c 密钥  u 回滚  s 停止  d 改动"
-            }
-            Scope::AllProjects => {
-                "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  a 只看本项目  c 密钥  u 回滚  s 停止  d 改动"
-            }
-        },
+        View::Grid { .. } => help_line(
+            &[
+                ("", Key::MoveArrows),
+                ("Enter", Key::Zoom),
+                ("q", Key::Quit),
+                ("n", Key::New),
+                ("N", Key::SwitchAgent),
+                ("p", Key::SwitchProject),
+                ("a", scope_key),
+                ("c", Key::Secrets),
+                ("u", Key::Undo),
+                ("s", Key::Stop),
+                ("d", Key::Diff),
+            ],
+            lang,
+        ),
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
         View::EnterSecret {
             phase: SecretPhase::Verifying,
             ..
-        } => "正在验证，请稍候　Esc 可取消",
+        } => text(Key::Verifying, lang).to_string(),
         // 跟 escape_hint 一样要分 return_to_settings：从设置页进来的 Esc
         // 回设置页，不是「列表」——两处文案哪怕只有半句话不一致，都是
         // 「底栏说什么就得真能做到什么」这条原则被破坏了一半。
         View::EnterSecret {
             return_to_settings: true,
             ..
-        } => "粘贴或输入密钥　Enter 确认　Esc 返回设置",
-        View::EnterSecret { .. } => "粘贴或输入密钥　Enter 确认　Esc 返回列表",
-        View::Secrets { .. } => "↑↓ 选  Enter 改  d 删  Esc 返回",
+        } => help_line(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToSettingsWord),
+            ],
+            lang,
+        ),
+        View::EnterSecret { .. } => help_line(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToListWord),
+            ],
+            lang,
+        ),
+        View::Secrets { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Edit),
+                ("d", Key::Delete),
+                ("Esc", Key::Back),
+            ],
+            lang,
+        ),
+        View::Settings { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
     }
 }
 
@@ -652,8 +733,11 @@ mod tests {
     #[test]
     fn grid_hints_match_what_the_keys_actually_do() {
         // 底栏说什么就得真能做到什么：九宫格的 Ctrl+Q 回的是列表那一屏
-        assert_eq!(escape_hint(&View::Grid { focus: 0 }), "Ctrl+Q 回列表");
-        let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject);
+        assert_eq!(
+            escape_hint(&View::Grid { focus: 0 }, Lang::Zh),
+            "Ctrl+Q 回列表"
+        );
+        let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
         for k in [
             "方向键移动",
             "Enter 放大",
@@ -682,7 +766,7 @@ mod tests {
     #[test]
     fn board_help_mentions_the_grid() {
         // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
-        assert!(idle_help(&View::Board, Scope::CurrentProject).contains("g 九宫格"));
+        assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("g 九宫格"));
     }
 
     #[test]
@@ -762,17 +846,17 @@ mod tests {
     fn the_scope_key_hint_says_where_a_will_take_you() {
         let board = View::Board;
         assert!(
-            idle_help(&board, Scope::CurrentProject).contains("a 看全部项目"),
+            idle_help(&board, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"),
             "只看本项目时，a 通向全部项目"
         );
         assert!(
-            idle_help(&board, Scope::AllProjects).contains("a 只看本项目"),
+            idle_help(&board, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"),
             "全部项目时，a 通向本项目"
         );
         // 九宫格是看板的另一种画法，同一个键必须给同一套说明
         let grid = View::Grid { focus: 0 };
-        assert!(idle_help(&grid, Scope::CurrentProject).contains("a 看全部项目"));
-        assert!(idle_help(&grid, Scope::AllProjects).contains("a 只看本项目"));
+        assert!(idle_help(&grid, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"));
+        assert!(idle_help(&grid, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"));
     }
 
     #[test]
@@ -914,25 +998,34 @@ mod tests {
     fn escape_hint_matches_what_the_key_actually_does() {
         // 底栏说什么就必须真能做到什么。手输路径态的 Ctrl+Q 是回列表
         // 不是回看板（见 back_one_level），文案不能写成「回看板」。
-        assert_eq!(escape_hint(&View::Board), "q 退出");
+        assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
         // 会话视图两个键都真的能回看板，所以两个都要写出来
-        assert_eq!(escape_hint(&View::Attached(1)), "Ctrl+Q（F2） 回看板");
         assert_eq!(
-            escape_hint(&View::PickProject {
-                all: Vec::new(),
-                filter: String::new(),
-                state: ListState::default(),
-                typing_path: None,
-            }),
+            escape_hint(&View::Attached(1), Lang::Zh),
+            "Ctrl+Q（F2） 回看板"
+        );
+        assert_eq!(
+            escape_hint(
+                &View::PickProject {
+                    all: Vec::new(),
+                    filter: String::new(),
+                    state: ListState::default(),
+                    typing_path: None,
+                },
+                Lang::Zh
+            ),
             "Ctrl+Q 回看板"
         );
         assert_eq!(
-            escape_hint(&View::PickProject {
-                all: Vec::new(),
-                filter: String::new(),
-                state: ListState::default(),
-                typing_path: Some(String::new()),
-            }),
+            escape_hint(
+                &View::PickProject {
+                    all: Vec::new(),
+                    filter: String::new(),
+                    state: ListState::default(),
+                    typing_path: Some(String::new()),
+                },
+                Lang::Zh
+            ),
             "Ctrl+Q 回列表"
         );
     }
@@ -1124,7 +1217,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_both_n_and_capital_n() {
-        let help = idle_help(&View::Board, Scope::CurrentProject);
+        let help = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
         assert!(help.contains("n 新建"));
         assert!(help.contains("N 换 agent"));
     }
@@ -1133,7 +1226,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_the_settings_key() {
-        assert!(idle_help(&View::Board, Scope::CurrentProject).contains("c 密钥"));
+        assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("c 密钥"));
     }
 
     #[test]
@@ -1154,6 +1247,7 @@ mod tests {
                 warning: None,
             },
             Scope::CurrentProject,
+            Lang::Zh,
         );
         assert!(help.contains("↑↓"));
         assert!(help.contains("数字"));
@@ -1283,17 +1377,20 @@ mod tests {
     #[test]
     fn secret_view_escape_hint_says_back_to_the_list() {
         // 底栏说什么就得真能做到什么
-        let h = escape_hint(&View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
+        let h = escape_hint(
+            &View::EnterSecret {
+                profile: "kimi".into(),
+                label: "Kimi".into(),
+                prompt: SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+                return_to_settings: false,
             },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: false,
-        });
+            Lang::Zh,
+        );
         assert!(h.contains("列表"), "底栏说什么就得真能做到什么：{h}");
     }
 
@@ -1317,17 +1414,20 @@ mod tests {
 
     #[test]
     fn secret_view_from_settings_escape_hint_says_back_to_settings() {
-        let h = escape_hint(&View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
+        let h = escape_hint(
+            &View::EnterSecret {
+                profile: "kimi".into(),
+                label: "Kimi".into(),
+                prompt: SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+                return_to_settings: true,
             },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: true,
-        });
+            Lang::Zh,
+        );
         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
     }
 
@@ -1348,6 +1448,7 @@ mod tests {
                 return_to_settings: true,
             },
             Scope::CurrentProject,
+            Lang::Zh,
         );
         assert!(
             help.contains("返回设置"),
@@ -1377,6 +1478,7 @@ mod tests {
                 pending_delete: None,
             },
             Scope::CurrentProject,
+            Lang::Zh,
         );
         assert!(help.contains("Enter 改"));
         assert!(help.contains("d 删"));

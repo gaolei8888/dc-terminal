@@ -9,6 +9,7 @@ use super::widgets::{short_path, status_label, status_style, truncate};
 use super::{
     dim, move_sel, open_new_session, open_project_picker, open_secrets, selected, session_action,
 };
+use crate::i18n::{msg, text, Key};
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -28,6 +29,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('p') if is_plain_key(&key) => open_project_picker(app),
         KeyCode::Char('c') if is_plain_key(&key) => open_secrets(app),
+        // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
+        // 而且跟 a/g 一样，两个视图共用同一个键。
+        KeyCode::Char('l') if is_plain_key(&key) => super::open_settings(app),
         KeyCode::Enter => {
             if let Some(id) = selected(&app.visible, &app.list_state).map(|s| s.id) {
                 super::enter_session(app, id);
@@ -46,7 +50,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('u') | KeyCode::Char('s') | KeyCode::Char('d') if is_plain_key(&key) => {
             app.message = match selected(&app.visible, &app.list_state).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
-                None => "没有选中会话".into(),
+                None => text(Key::NoSessionSelected, app.lang).into(),
             };
         }
         _ => {}
@@ -65,13 +69,13 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 作用域进标题：屏幕上少了一半会话时，用户必须一眼看出是过滤掉了
     // 而不是会话没了。
     let scoped = match app.scope {
-        Scope::CurrentProject => "dct 会话看板",
-        Scope::AllProjects => "dct 会话看板 · 全部项目",
+        Scope::CurrentProject => Key::BoardTitle,
+        Scope::AllProjects => Key::BoardTitleAllProjects,
     };
     let title = if app.connected {
-        scoped.to_string()
+        text(scoped, app.lang).to_string()
     } else {
-        format!("{scoped}（连接已断开，数据可能已过期）")
+        msg::title_with(app.lang, scoped, text(Key::Disconnected, app.lang))
     };
     // 只看当前项目时不画路径列：底栏已经写着当前项目，每一行再重复一遍
     // 是把 22 列花在同一句话上。腾出来的宽度给 activity——它是现在屏幕上

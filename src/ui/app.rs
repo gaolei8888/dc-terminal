@@ -84,6 +84,11 @@ pub struct App {
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
     pub lang: crate::i18n::Lang,
+    /// 守护进程 socket 的路径。设置文件就在它旁边（见
+    /// `settings::settings_path_for_socket`），所以改语言时要用到它。
+    /// 存路径而不是存设置文件路径：将来别的「跟着 socket 走」的文件
+    /// （profiles 目录、projects.json）也都从它推导，只留一个源头。
+    pub socket: PathBuf,
     pub start_dir: PathBuf,
     pub current_dir: PathBuf,
     pub quit: bool,
@@ -95,7 +100,12 @@ impl App {
     /// 分开抄，改 `new` 忘了同步改测试用的那份，测试就会在悄悄测一个跟
     /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
     /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
-    fn new_inner(client: Option<Client>, default_dir: PathBuf, lang: crate::i18n::Lang) -> App {
+    fn new_inner(
+        client: Option<Client>,
+        default_dir: PathBuf,
+        lang: crate::i18n::Lang,
+        socket: PathBuf,
+    ) -> App {
         App {
             client,
             view: View::Board,
@@ -118,20 +128,26 @@ impl App {
             need_sessions: true,
             verify_rx: None,
             lang,
+            socket,
             start_dir: default_dir.clone(),
             current_dir: default_dir,
             quit: false,
         }
     }
 
-    pub fn new(client: Client, default_dir: PathBuf, lang: crate::i18n::Lang) -> App {
-        Self::new_inner(Some(client), default_dir, lang)
+    pub fn new(
+        client: Client,
+        default_dir: PathBuf,
+        lang: crate::i18n::Lang,
+        socket: PathBuf,
+    ) -> App {
+        Self::new_inner(Some(client), default_dir, lang, socket)
     }
 
     /// 只给测试用：不需要一个活的守护进程就能构造。
     #[cfg(test)]
-    pub fn new_disconnected(_sock: PathBuf, default_dir: PathBuf) -> App {
-        Self::new_inner(None, default_dir, crate::i18n::Lang::Zh)
+    pub fn new_disconnected(sock: PathBuf, default_dir: PathBuf) -> App {
+        Self::new_inner(None, default_dir, crate::i18n::Lang::Zh, sock)
     }
 
     /// 只给测试用：`board`/`attach`/`pick`/`secret` 里 `draw()`/`handle_key()`

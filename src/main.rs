@@ -76,6 +76,6 @@ fn run_ui() -> Result<()> {
             dct::settings::load_lang(&dct::settings::settings_path_for_socket(&sock)),
             &|k| std::env::var(k).ok(),
         );
-        dct::ui::run(client, std::env::current_dir()?, lang)
+        dct::ui::run(client, std::env::current_dir()?, lang, sock.clone())
     }
 }

@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
+use crate::i18n::{msg, text, Key};
 use crate::profile::ProfileStatus;
 use crate::proto::{Request, Response, SecretPrompt};
 
@@ -213,7 +214,8 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                         super::switch_project(app, p);
                     } else {
                         // 不是 git 仓库这件事不在这里判——留给 create()
-                        app.message = Msg::err(format!("{} 不是一个目录", p.display()));
+                        app.message =
+                            Msg::err(msg::not_a_directory(app.lang, &p.display().to_string()));
                         app.view = View::PickProject {
                             all,
                             filter,
@@ -282,7 +284,8 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                         super::switch_project(app, p);
                     } else {
                         // 列表里那条不删——可能只是外置盘没挂
-                        app.message = Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
+                        app.message =
+                            Msg::err(msg::cannot_find_anymore(app.lang, &short_path(&shown[i])));
                         app.view = View::PickProject {
                             all,
                             filter,
@@ -391,8 +394,8 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
     // 中文「第 N 行」，用户本来就在手改 TOML 文件，英文的语法期望
     // 提示比吞掉更有用（详见该函数的注释）。
     let title = match warning {
-        Some(w) => format!("选 agent —— {w}"),
-        None => "选 agent".to_string(),
+        Some(w) => format!("{} —— {w}", text(Key::PickAgentTitle, app.lang)),
+        None => text(Key::PickAgentTitle, app.lang).to_string(),
     };
     let border = if warning.is_some() {
         Style::default().fg(Color::Red)
@@ -437,7 +440,7 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
-                    .title("输入项目路径（Enter 确认，Esc 返回列表）"),
+                    .title(text(Key::TypePathTitle, app.lang)),
             ),
             area,
         );
@@ -459,14 +462,16 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
             .collect();
         // 兜底入口不参与过滤，永远在最后一行
         items.push(ListItem::new(Line::from(Span::styled(
-            "手输路径…",
+            text(Key::ManualPath, app.lang),
             Style::default().fg(Color::Cyan),
         ))));
 
+        // 标题只写「选项目」，怎么操作由底栏的 idle_help 说——两处各写一遍
+        // 的话，改了键位就得记得改两处，而漏改的那处会一直教用户按错。
         let title = if filter.is_empty() {
-            "选项目（↑↓ 选，Enter 确认，直接打字过滤，Esc 取消）".to_string()
+            text(Key::PickProjectTitle, app.lang).to_string()
         } else {
-            format!("选项目（过滤：{filter}）")
+            msg::title_with(app.lang, Key::PickProjectTitle, filter)
         };
         // state 是 View 里那份的副本，draw 只读不写，所以这里克隆一份给
         // render_stateful_widget 用，不去动看板的光标。

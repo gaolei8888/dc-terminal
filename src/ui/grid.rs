@@ -12,6 +12,7 @@ use super::app::App;
 use super::view::{is_plain_key, Scope, View};
 use super::widgets::{char_width, screen_to_lines, status_label, status_style};
 use super::{dim, session_action};
+use crate::i18n::{text, Key, Lang};
 use crate::proto::ScreenEntry;
 use crate::pty::ScreenSpan;
 use crate::session::{SessionInfo, SessionState};
@@ -176,6 +177,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('p') if is_plain_key(&key) => super::open_project_picker(app),
         KeyCode::Char('c') if is_plain_key(&key) => super::open_secrets(app),
+        // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
+        // 而且跟 a/g 一样，两个视图共用同一个键。
+        KeyCode::Char('l') if is_plain_key(&key) => super::open_settings(app),
         // 跟看板同一个键、同一个 app.scope：作用域跟着用户走，不跟着视图走
         KeyCode::Char('a') if is_plain_key(&key) => super::toggle_scope(app),
         KeyCode::Enter => {
@@ -209,8 +213,11 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         &app.visible,
         &app.grid_screens,
         focus,
-        app.connected,
-        app.scope,
+        Chrome {
+            connected: app.connected,
+            scope: app.scope,
+            lang: app.lang,
+        },
     );
 }
 
@@ -219,19 +226,33 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 ///
 /// 跟 `App` 解耦（只吃它真正用得上的那几样）是为了能在测试里直接喂 fixture，
 /// 不必为了断言一句「窗口太小」去拼一个完整的 `App`。
+/// 画格子时那几样「跟会话数据无关、只影响怎么呈现」的东西。打包成一个结构体
+/// 而不是继续往参数表上加：它们总是一起传、一起来自 `App`，而八个位置参数
+/// 里传错顺序（两个 bool、两个枚举）编译器是拦不住的。
+#[derive(Clone, Copy)]
+pub(crate) struct Chrome {
+    pub connected: bool,
+    pub scope: Scope,
+    pub lang: Lang,
+}
+
 fn draw_grid(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionInfo],
     screens: &[ScreenEntry],
     focus: usize,
-    connected: bool,
-    scope: Scope,
+    chrome: Chrome,
 ) {
+    let Chrome {
+        connected,
+        scope,
+        lang,
+    } = chrome;
     if area.width < MIN_COLS || area.height < MIN_ROWS {
         // 说人话说清下一步做什么：这是用户自己能修好的事
         f.render_widget(
-            Paragraph::new("窗口太小，放大终端窗口后再看九宫格").centered(),
+            Paragraph::new(text(Key::WindowTooSmall, lang)).centered(),
             centered_line(area),
         );
         return;
@@ -244,8 +265,8 @@ fn draw_grid(
         // 只说「还没有会话」会让用户以为 dct 把它们弄丢了——这正是这一版
         // 被判为「混乱」的那类体验。
         let empty = match scope {
-            Scope::CurrentProject => "这个项目还没有会话，按 n 开一个，按 a 看全部项目",
-            Scope::AllProjects => "还没有任何会话，按 n 开一个",
+            Scope::CurrentProject => text(Key::NoSessionsHere, lang),
+            Scope::AllProjects => text(Key::NoSessionsAtAll, lang),
         };
         f.render_widget(Paragraph::new(empty).centered(), centered_line(area));
         return;
@@ -843,8 +864,11 @@ mod tests {
                 &sessions,
                 &screens,
                 0,
-                true,
-                Scope::CurrentProject,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
             )
         })
         .unwrap();
@@ -868,8 +892,21 @@ mod tests {
             session(2, SessionState::Idle),
         ];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[],
+                1,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
 
         let buf = term.backend().buffer();
         // 焦点在第二格（右半屏），青色边框只该出现在右半边
@@ -900,8 +937,21 @@ mod tests {
             session(2, SessionState::Working),
         ];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, false, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[],
+                1,
+                Chrome {
+                    connected: false,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
 
         let buf = term.backend().buffer();
         // 只看框线本身：标题里的状态词是另一套颜色（干活中就是青的），
@@ -945,8 +995,11 @@ mod tests {
                 &sessions,
                 &[entry(1, "x")],
                 0,
-                true,
-                Scope::CurrentProject,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
             )
         })
         .unwrap();
@@ -963,21 +1016,60 @@ mod tests {
 
         let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &many,
+                &[],
+                0,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
         assert!(squashed(&term).contains("1/2"), "多页要画页码");
 
         // 翻到第二页：页码跟着走
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 9, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &many,
+                &[],
+                9,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
         assert!(squashed(&term).contains("2/2"));
 
         // 单页画 1/1 是噪音
         let few: Vec<SessionInfo> = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &few, &[], 0, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &few,
+                &[],
+                0,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
         assert!(!squashed(&term).contains("1/1"), "单页不画页码");
     }
 
@@ -987,8 +1079,21 @@ mod tests {
 
         let sessions: Vec<SessionInfo> = (1..=9).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 0, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[],
+                0,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
         let c = squashed(&term);
         assert!(c.contains("窗口太小"), "画不下就直说：{c}");
         assert!(c.contains("放大终端窗口"), "还要说清下一步怎么办：{c}");
@@ -1000,8 +1105,21 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &[], &[], 0, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &[],
+                &[],
+                0,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
         let c = squashed(&term);
         assert!(
             c.contains("还没有会话"),
@@ -1022,8 +1140,21 @@ mod tests {
         // 看起来像边框破了个洞。现在先从底部切一行出来给它。
         let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true, Scope::CurrentProject))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &many,
+                &[],
+                0,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+            )
+        })
+        .unwrap();
 
         let text = buffer_text(term.backend().buffer());
         let last_row = text.lines().last().unwrap();
@@ -1049,8 +1180,11 @@ mod tests {
                 &sessions,
                 &[entry(99, "别人的画面")],
                 0,
-                true,
-                Scope::CurrentProject,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
             )
         })
         .unwrap();
