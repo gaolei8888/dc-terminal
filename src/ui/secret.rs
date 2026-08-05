@@ -297,8 +297,8 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                             .into();
                             refetch_secrets(app, Some(&name))
                         }
-                        Ok(Response::Error(e)) => {
-                            app.message = Msg::err(e);
+                        Ok(Response::Error(ref e)) => {
+                            app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
                             View::Secrets {
                                 entries,
                                 state,

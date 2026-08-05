@@ -506,6 +506,60 @@ pub mod msg {
         )
     }
 
+    /// 把守护进程报回来的错误码组成一句人话。**这是 daemon 侧文案唯一的
+    /// 落点**——daemon 只报码，句子在这里成形，所以切语言立刻生效、
+    /// 不用重启 daemon。
+    pub fn error(lang: Lang, e: &crate::proto::ErrorCode) -> String {
+        use crate::proto::ErrorCode::*;
+        match e {
+            NoSuchProfile(name) => t!(
+                lang,
+                en: format!("There is no agent called {name}"),
+                zh: format!("没有这个 agent：{name}"),
+            ),
+            DirNotFound(dir) => t!(
+                lang,
+                en: format!("{dir} does not exist"),
+                zh: format!("目录不存在：{dir}"),
+            ),
+            NotAGitRepo(dir) => t!(
+                lang,
+                en: format!("{dir} is not a git project, so an agent cannot work there"),
+                zh: format!("{dir} 不是 git 仓库，无法开 agent 会话"),
+            ),
+            NoSuchSession(id) => t!(
+                lang,
+                en: format!("Session {id} no longer exists"),
+                zh: format!("没有这个会话：{id}"),
+            ),
+            NoCheckpoint => t!(
+                lang,
+                en: "There is no checkpoint yet".to_string(),
+                zh: "还没有检查点".to_string(),
+            ),
+            // 同一个成因两种说法：界面知道用户刚按的是 `u` 还是 `d`。
+            // 这里给的是通用版本，调用方想更贴切可以自己挑词。
+            NotAnAgentSession => t!(
+                lang,
+                en: "This session has no history to undo or compare".to_string(),
+                zh: "这个会话没有可撤销或比较的记录".to_string(),
+            ),
+            BadRequest(detail) => t!(
+                lang,
+                en: format!("dct could not understand that request: {detail}"),
+                zh: format!("请求解析失败：{detail}"),
+            ),
+            // git 的 stderr 照抄，只翻外面那半句——那是 git 按它自己的
+            // `LANG` 输出的，dct 翻不动也不该翻。
+            Git(raw) => t!(
+                lang,
+                en: format!("git failed: {raw}"),
+                zh: format!("git 操作失败：{raw}"),
+            ),
+            Internal(raw) => raw.clone(),
+        }
+    }
+
     pub fn title_with(lang: Lang, main: Key, extra: &str) -> String {
         format!("{}（{extra}）", text(main, lang))
     }
@@ -649,6 +703,38 @@ mod tests {
         let before = seen.len();
         seen.dedup();
         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+    }
+
+    /// 每一个错误码在两种语言下都要组得出话，而且英文里不许有汉字。
+    /// 这是 daemon 侧文案唯一的落点——漏一条，用户就会在英文界面上
+    /// 看到一句中文，而且没有任何编译期信号。
+    #[test]
+    fn every_error_code_composes_in_both_languages() {
+        use crate::proto::ErrorCode::*;
+        let codes = [
+            NoSuchProfile("kimi".into()),
+            DirNotFound("/w/a".into()),
+            NotAGitRepo("/w/a".into()),
+            NoSuchSession(7),
+            NoCheckpoint,
+            NotAnAgentSession,
+            BadRequest("bad json".into()),
+            Git("fatal: not a repository".into()),
+        ];
+        for c in &codes {
+            for l in Lang::all() {
+                let s = msg::error(*l, c);
+                assert!(!s.trim().is_empty(), "{c:?} 在 {l:?} 下组不出话");
+            }
+            assert!(
+                !has_han(&msg::error(Lang::En, c)),
+                "{c:?} 的英文里有汉字：{}",
+                msg::error(Lang::En, c)
+            );
+        }
+        // `Internal` 是刻意的例外：它照抄原文（多半是还没归类的内部错误
+        // 或 git 的 stderr），翻不动也不该翻。
+        assert_eq!(msg::error(Lang::En, &Internal("原文".into())), "原文");
     }
 
     #[test]

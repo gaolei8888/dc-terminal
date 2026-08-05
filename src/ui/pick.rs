@@ -84,8 +84,8 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                         app.need_sessions = true; // 会话标题要显示项目名
                         View::Attached(id)
                     }
-                    Ok(Response::Error(e)) => {
-                        app.message = Msg::err(e);
+                    Ok(Response::Error(ref e)) => {
+                        app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
                         View::PickProfile {
                             entries,
                             state,

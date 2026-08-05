@@ -1,4 +1,5 @@
-use anyhow::{bail, Context, Result};
+use crate::proto::ErrorCode;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,29 @@ struct Session {
 /// 每个会话又单独包一层 `Mutex`，所以不同会话之间的操作（比如两个会话各自的
 /// `send_input`）也互不阻塞；只有同一个会话的并发操作会互相排队，这本来就是
 /// 应该的。
+/// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。
+///
+/// 不把 `SessionManager` 的错误类型整个换成 `ErrorCode`，是因为它内部到处
+/// 在 `?` io/git 错误，全换要动的地方远多于本次收益；而 daemon 边界那一处
+/// `downcast` 就能把码取回来（见 `daemon.rs` 的 `to_code`）。取不回来的
+/// 就是还没归类的内部错误，照抄原文。
+pub(crate) fn coded(c: ErrorCode) -> anyhow::Error {
+    anyhow::Error::new(CodedError(c))
+}
+
+/// `anyhow` 要求负载实现 `std::error::Error`，包一层。
+#[derive(Debug)]
+pub(crate) struct CodedError(pub ErrorCode);
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 这句只会进 stderr 日志，不上界面——界面拿的是码。
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
 pub struct SessionManager {
     next_id: AtomicU32,
     sessions: Mutex<HashMap<u32, Arc<Mutex<Session>>>>,
@@ -116,7 +140,7 @@ impl SessionManager {
         if let Some(p) = recover(self.extra_profiles.lock()).get(name) {
             return Ok(p.clone());
         }
-        Profile::builtin(name).ok_or_else(|| anyhow::anyhow!("没有这个 profile: {name}"))
+        Profile::builtin(name).ok_or_else(|| coded(ErrorCode::NoSuchProfile(name.to_string())))
     }
 
     /// `secret` 是调用方已经查好的那一条密钥（如果这个 profile 需要密钥、且用户填过的话），
@@ -134,7 +158,7 @@ impl SessionManager {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
         if !dir.is_dir() {
-            bail!("目录不存在: {}", dir.display());
+            return Err(coded(ErrorCode::DirNotFound(dir.display().to_string())));
         }
 
         // 原子分配 id：即便后面的慢操作失败，这个 id 也不会被复用给另一次并发的
@@ -147,7 +171,7 @@ impl SessionManager {
         // agent 直接在用户的真实项目里干活。检查点是隐藏快照，不动分支和历史，
         // 所以仍然要求是 git 仓库——没有 git 就没有撤销。
         if profile.is_agent && !git::is_repo(dir) {
-            bail!("{} 不是 git 仓库，无法开 agent 会话", dir.display());
+            return Err(coded(ErrorCode::NotAGitRepo(dir.display().to_string())));
         }
 
         let idle_re = profile.idle_regex()?;
@@ -217,7 +241,7 @@ impl SessionManager {
         recover(self.sessions.lock())
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("没有这个会话: {id}"))
+            .ok_or_else(|| coded(ErrorCode::NoSuchSession(id)))
     }
 
     /// 找到会话、拿到它自己的锁、跑 `f`——`sessions` 这个总表的锁只用来查一次
@@ -323,30 +347,30 @@ impl SessionManager {
 
     /// 恢复到最后一张快照。git 操作同样不持会话锁，理由见 `send_input`。
     pub fn undo(&self, id: u32) -> Result<()> {
-        let (dir, sha) = self.checkpoint_base(id, "这个会话没有检查点")?;
+        let (dir, sha) = self.checkpoint_base(id)?;
         // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
         git::restore(&dir, &sha).context("撤销失败，工作区可能停在了改到一半的状态")
     }
 
     /// 相对最后一张快照改了哪些文件。git 操作不持会话锁。
     pub fn diff(&self, id: u32) -> Result<Vec<FileStat>> {
-        let (dir, base) = self.checkpoint_base(id, "这个会话没有改动记录")?;
+        let (dir, base) = self.checkpoint_base(id)?;
         // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
         git::diff_stat(&dir, &base).context("算不出改了哪些文件，再试一次")
     }
 
     /// 取出做 git 操作需要的信息后立刻放锁。
-    fn checkpoint_base(&self, id: u32, not_agent: &str) -> Result<(PathBuf, String)> {
+    fn checkpoint_base(&self, id: u32) -> Result<(PathBuf, String)> {
         let arc = self.get_arc(id)?;
         let s = recover(arc.lock());
         if !s.is_agent {
-            anyhow::bail!("{not_agent}");
+            return Err(coded(ErrorCode::NotAnAgentSession));
         }
         let sha = s
             .checkpoints
             .last()
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
+            .ok_or_else(|| coded(ErrorCode::NoCheckpoint))?;
         Ok((s.dir.clone(), sha))
     }
 
@@ -470,11 +494,15 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
+        // 断言的是**码**，不是句子——句子是界面的事，而且会随语言变。
         let err = m
             .create(plain.path(), "fake", empty_secrets(), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("不是 git 仓库"), "实际错误: {err}");
+            .unwrap_err();
+        let code = err.downcast::<CodedError>().expect("要带上错误码").0;
+        assert!(
+            matches!(code, ErrorCode::NotAGitRepo(_)),
+            "实际错误: {code:?}"
+        );
     }
 
     #[test]
@@ -494,9 +522,12 @@ mod tests {
         let missing = std::path::PathBuf::from("/definitely/does/not/exist/dct-test-dir");
         let err = m
             .create(&missing, "shell", empty_secrets(), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("目录不存在"), "实际错误: {err}");
+            .unwrap_err();
+        let code = err.downcast::<CodedError>().expect("要带上错误码").0;
+        assert!(
+            matches!(code, ErrorCode::DirNotFound(_)),
+            "实际错误: {code:?}"
+        );
     }
 
     /// 构造性验证：故意让持有 `sessions` 锁的线程 panic，把锁弄"中毒"。

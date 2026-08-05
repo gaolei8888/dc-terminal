@@ -194,7 +194,34 @@ pub enum Response {
     LastProfile(Option<String>),
     Verify(crate::verify::VerifyOutcome),
     Ok,
-    Error(String),
+    Error(ErrorCode),
+}
+
+/// 守护进程报「哪一类错 + 参数」，**不组句**。
+///
+/// 组句一律发生在界面进程：daemon 是常驻的、可能同时服务多个界面的进程，
+/// 它不知道也不该知道谁在用什么语言。报码的另一个好处是切语言立刻生效，
+/// 不用重启 daemon——它存下来的东西里没有任何一句是某种语言的。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ErrorCode {
+    NoSuchProfile(String),
+    DirNotFound(String),
+    NotAGitRepo(String),
+    NoSuchSession(u32),
+    NoCheckpoint,
+    /// 「这个会话没有检查点」和「没有改动记录」成因其实是同一个：不是 agent
+    /// 会话。措辞交给界面——它知道用户刚按的是 `u` 还是 `d`，比守护进程更有
+    /// 资格决定这句话怎么说。
+    NotAnAgentSession,
+    /// 请求解析失败，带上原始错误供排查
+    BadRequest(String),
+    /// git 自己的 stderr。**刻意留的兜底**：那是 git 按它自己的 `LANG` 输出的，
+    /// dct 翻不动也不该翻。界面显示成「操作失败：<原文>」——外面那半句是
+    /// 翻译过的，里面照抄。
+    Git(String),
+    /// 还没归类的内部错误，同样照抄原文。有它才能一步步迁移，而不是等到
+    /// 每一条都归好类才敢合并。
+    Internal(String),
 }
 
 pub fn socket_path() -> PathBuf {

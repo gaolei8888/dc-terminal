@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
-use crate::proto::{InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
+use crate::proto::{ErrorCode, InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
 use crate::secrets::{secrets_path_for_socket, SecretStore};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
@@ -82,7 +82,7 @@ fn serve(
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir),
-            Err(e) => Response::Error(format!("请求解析失败: {e}")),
+            Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
         out.flush()?;
@@ -221,7 +221,17 @@ fn handle(
             }
         }
     };
-    r.unwrap_or_else(|e| Response::Error(e.to_string()))
+    r.unwrap_or_else(|e| Response::Error(to_code(e)))
+}
+
+/// 把内部错误还原成给界面的码。`downcast` 拿不到码的，说明这条路径还没归类——
+/// 照抄原文走 `Internal`，界面原样显示。这样迁移可以一条一条来，不必等到
+/// 每一条都归好类才敢合并。
+fn to_code(e: anyhow::Error) -> ErrorCode {
+    match e.downcast::<crate::session::CodedError>() {
+        Ok(c) => c.0,
+        Err(e) => ErrorCode::Internal(e.to_string()),
+    }
 }
 
 #[cfg(test)]

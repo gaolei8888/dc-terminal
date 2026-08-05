@@ -260,12 +260,14 @@ pub fn run(
                                             app.need_sessions = true; // 会话标题要显示项目名
                                             View::Attached(id)
                                         }
-                                        Ok(Response::Error(e)) => View::EnterSecret {
+                                        Ok(Response::Error(ref e)) => View::EnterSecret {
                                             profile,
                                             label,
                                             prompt,
                                             buf,
-                                            phase: SecretPhase::Failed(e),
+                                            phase: SecretPhase::Failed(crate::i18n::msg::error(
+                                                app.lang, e,
+                                            )),
                                             return_to_settings,
                                         },
                                         _ => View::EnterSecret {
@@ -284,12 +286,14 @@ pub fn run(
                                         },
                                     }
                                 }
-                                Ok(Response::Error(e)) => View::EnterSecret {
+                                Ok(Response::Error(ref e)) => View::EnterSecret {
                                     profile,
                                     label,
                                     prompt,
                                     buf,
-                                    phase: SecretPhase::Failed(e),
+                                    phase: SecretPhase::Failed(crate::i18n::msg::error(
+                                        app.lang, e,
+                                    )),
                                     return_to_settings,
                                 },
                                 _ => View::EnterSecret {
@@ -584,10 +588,10 @@ pub fn run(
                         warning,
                     }
                 }
-                Ok(Response::Error(e)) => View::PickProfile {
+                Ok(Response::Error(ref e)) => View::PickProfile {
                     entries: Vec::new(),
                     state: ListState::default(),
-                    warning: Some(e),
+                    warning: Some(crate::i18n::msg::error(lang, e)),
                 },
                 _ => View::PickProfile {
                     entries: Vec::new(),
@@ -623,8 +627,8 @@ pub fn run(
                         pending_delete: None,
                     }
                 }
-                Ok(Response::Error(e)) => {
-                    app.message = Msg::err(e);
+                Ok(Response::Error(ref e)) => {
+                    app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
                     View::Board
                 }
                 _ => {
@@ -873,8 +877,8 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                             app.need_sessions = true; // 会话标题要显示项目名
                             app.view = View::Attached(id);
                         }
-                        Ok(Response::Error(e)) => {
-                            app.message = Msg::err(e);
+                        Ok(Response::Error(ref e)) => {
+                            app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
                             app.view = picker(entries, warning);
                         }
                         _ => {
@@ -891,7 +895,7 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
         // 列表都拿不到，直开和选择器都没法走，只能告诉用户这次干瞪眼——
         // 视图不变，走到循环末尾 message_after_transition 会把这条消息
         // 原样留住（同其他分支，不用 continue 抢跑跳过收尾）。
-        Ok(Response::Error(e)) => app.message = Msg::err(e),
+        Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
         _ => {
             app.message =
                 Msg::err(crate::i18n::text(crate::i18n::Key::CannotListAgents, app.lang).into())
@@ -920,7 +924,7 @@ pub(crate) fn open_project_picker(app: &mut App) {
                 typing_path: None,
             };
         }
-        Ok(Response::Error(e)) => app.message = Msg::err(e),
+        Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
         _ => {
             app.message =
                 Msg::err(crate::i18n::text(crate::i18n::Key::CannotListProjects, app.lang).into())
@@ -949,7 +953,7 @@ pub(crate) fn open_secrets(app: &mut App) {
                 pending_delete: None,
             };
         }
-        Ok(Response::Error(e)) => app.message = Msg::err(e),
+        Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
         _ => {
             app.message =
                 Msg::err(crate::i18n::text(crate::i18n::Key::CannotListSecrets, app.lang).into())
@@ -983,7 +987,7 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
             .collect::<Vec<_>>()
             .join("  ")
             .into(),
-        Ok(Response::Error(e)) => Msg::err(e),
+        Ok(Response::Error(ref e)) => Msg::err(crate::i18n::msg::error(app.lang, e)),
         _ => Msg::err(crate::i18n::text(crate::i18n::Key::RequestFailed, app.lang).into()),
     }
 }
