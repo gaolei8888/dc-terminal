@@ -9,9 +9,14 @@ use crate::git::{self, FileStat};
 use crate::profile::Profile;
 use crate::pty::{PtySession, ScreenSpan};
 
-/// 一屏文字加光标位置：`screen()` 的返回值，行的集合按 (行, 列) 排布 span，
-/// 光标是 (行, 列)。type_complexity 报警要求给这个组合起个名字。
-pub type ScreenSnapshot = (Vec<Vec<ScreenSpan>>, (u16, u16));
+/// 一屏文字、光标位置、会话状态：`screen()` 的返回值，行的集合按 (行, 列)
+/// 排布 span，光标是 (行, 列)。type_complexity 报警要求给这个组合起个名字。
+///
+/// 状态挤在这里而不是让界面另发一次 `List`：贴在会话里时界面只调 `Screen`
+/// （`List` 要逐个锁所有会话、取每个的最后一行，16ms 一轮太贵），所以进程
+/// 死了它一无所知——会永远画那张空缓冲，底栏还写着「其余按键都发给 agent」。
+/// 状态是这条 16ms 通路上唯一能捎回来的存活信号，而这里本来就已经持着锁了。
+pub type ScreenSnapshot = (Vec<Vec<ScreenSpan>>, (u16, u16), SessionState);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
@@ -284,7 +289,7 @@ impl SessionManager {
     /// 返回 agent 屏幕文本和光标位置 (行, 列)。光标必须跟文本一起取，
     /// 否则界面只是一张死截图，用户看不出自己打的字落在哪。
     pub fn screen(&self, id: u32) -> Result<ScreenSnapshot> {
-        self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor())))
+        self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor(), s.state)))
     }
 
     /// 一次取多个会话的屏幕，九宫格用。锁的纪律跟 `list()` 一致：
@@ -590,11 +595,57 @@ mod tests {
 
         m.resize(id, 30, 200).unwrap();
 
-        let (lines, _) = m.screen(id).unwrap();
+        let (lines, _, _) = m.screen(id).unwrap();
         assert_eq!(lines.len(), 30, "行数应当跟着改");
 
         let width: usize = lines[0].iter().map(|sp| sp.text.chars().count()).sum();
         assert_eq!(width, 200, "列数应当跟着改，实际 {width}");
+    }
+
+    /// agent 自己退出（用户在 Claude Code 里敲 /exit、或 shell 里敲 exit）之后，
+    /// `screen()` 必须把 `Stopped` 捎回去。界面贴在会话里时只调 `Screen`，这是它
+    /// 唯一能知道进程已经没了的途径；捎不回来就会一直画那张空缓冲。
+    ///
+    /// 空缓冲本身是正常的：agent 在 alternate screen 里画，退出时恢复主屏，
+    /// 而主屏从来没被写过。所以「屏是空的」不能用来判断会话死活，只有状态能。
+    #[test]
+    fn screen_reports_stopped_after_the_process_exits() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        let mut exits = fake_agent();
+        // 立刻退出的命令：模拟 agent 自己结束，而不是被 stop() 杀掉
+        exits.command = vec!["true".into()];
+        exits.idle_pattern = None;
+        m.register_profile(exits);
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+
+        // 进程退出要一点时间，tick() 是把 is_alive() 落成 Stopped 的那一步
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let (_, _, state) = m.screen(id).unwrap();
+            if state == SessionState::Stopped {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "进程早该退出了，screen() 却一直报 {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 活着的会话不能被误报成 Stopped——否则界面会把用户从一个好端端的
+    /// 会话里踢回看板。
+    #[test]
+    fn screen_reports_a_live_session_as_not_stopped() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+        m.tick();
+        let (_, _, state) = m.screen(id).unwrap();
+        assert_ne!(state, SessionState::Stopped, "cat 还在跑，不该报 Stopped");
     }
 
     #[test]

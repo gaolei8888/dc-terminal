@@ -13,7 +13,7 @@ use super::view::{
     digit_index, expand_path, filter_projects, pick_action, PickAction, SecretPhase, View,
 };
 use super::widgets::{pad_to, short_path, truncate, Msg};
-use super::{move_sel_n, DIM};
+use super::{dim, move_sel_n};
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -378,13 +378,13 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
             let base = if matches!(e.status, ProfileStatus::Ready) {
                 Style::default()
             } else {
-                Style::default().fg(DIM)
+                dim()
             };
             ListItem::new(Line::from(vec![
                 Span::styled(num, base),
                 Span::styled(pad_to(&truncate(&e.label, 14), 14), base),
-                Span::styled(pad_to(&truncate(&e.note, 26), 26), base.fg(DIM)),
-                Span::styled(reason, base.fg(DIM)),
+                Span::styled(pad_to(&truncate(&e.note, 26), 26), base.patch(dim())),
+                Span::styled(reason, base.patch(dim())),
             ]))
         })
         .collect();
@@ -459,7 +459,7 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
                     .unwrap_or_else(|| short.clone());
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{:<20}", truncate(&name, 20))),
-                    Span::styled(truncate(&short, 50), Style::default().fg(DIM)),
+                    Span::styled(truncate(&short, 50), dim()),
                 ]))
             })
             .collect();

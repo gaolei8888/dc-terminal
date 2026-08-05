@@ -8,15 +8,17 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, ListState, Paragraph};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::client::Client;
 use crate::proto::{ProfileEntry, Request, Response};
 use crate::session::SessionInfo;
+use crate::theme::Theme;
 
 mod widgets;
 use widgets::{short_path, truncate};
-pub use widgets::{status_color, status_label, Msg};
+pub use widgets::{status_label, status_style, Msg};
 
 mod app;
 use app::App;
@@ -29,19 +31,45 @@ mod secret;
 
 mod view;
 use view::SecretPhase;
-use view::{back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition, View};
+use view::{
+    back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
+    session_ended_notice, View,
+};
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
     verify_message, verify_outcome_applies_to, PickAction,
 };
 
-/// 弱化文字（说明栏、提示、不可用项）统一用这个灰。不能用
-/// `Color::DarkGray`：它是 ANSI 亮黑（8 号色），Solarized Dark 等主题
-/// 把 8 号色设成和背景同色，整段文字直接隐形——选 agent 菜单里
-/// 所有不可用项和说明栏就这样消失过，只剩一个悬空的 ▶。
-/// `Indexed` 走 256 色表的固定灰，不经过终端主题的 16 色映射，
-/// 深浅背景下都可见。
-const DIM: Color = Color::Indexed(245);
+/// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
+///
+/// 用全局而不是给 `DrawInput` 之类的渲染入参加字段：主题是进程级配置，
+/// 启动后不变，塞进每帧的入参是把一个常量伪装成状态；而渲染函数散在
+/// `board`/`grid`/`pick`/`secret` 四个模块里，加一个必填字段就是几十处
+/// 纯噪音的改动（测试里的构造点尤其多）。
+static THEME: OnceLock<Theme> = OnceLock::new();
+
+/// 探测终端背景并记下来。`run()` 在 `enable_raw_mode()` 之后、
+/// `EnterAlternateScreen` 之前调，只调一次。
+pub fn init_theme() {
+    let _ = THEME.set(crate::theme::detect());
+}
+
+/// 弱化文字（说明栏、提示、不可用项、九宫格里没聚焦的格子）统一用这个样式。
+///
+/// 不能用 `Color::DarkGray`：它是 ANSI 亮黑（8 号色），Solarized Dark 等主题
+/// 把 8 号色设成和背景同色，整段文字直接隐形——选 agent 菜单里所有不可用项和
+/// 说明栏就这样消失过，只剩一个悬空的 ▶。
+///
+/// 也不能写死一个 256 色的灰：那治好了深色背景，却在浅色背景上同样接近隐形。
+/// 一个写死的灰不可能同时适配深浅两种底色，所以跟着探测出来的背景走
+/// （`Dark` 用偏亮的灰、`Light` 用偏暗的灰、探不出来就用终端自己的 DIM
+/// 属性，见 `theme::Theme::dim`）。
+///
+/// 没探测过就按 `Unknown` 算——那是三种取值里最保守的一个（只挂 DIM 修饰符，
+/// 不钉任何颜色），所以测试和任何绕过 `run()` 的路径都能正常渲染。
+pub fn dim() -> Style {
+    THEME.get().copied().unwrap_or(Theme::Unknown).dim()
+}
 
 /// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
 ///
@@ -127,6 +155,15 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
     // 必须在 EnterAlternateScreen / Terminal::new 之前构造：这样即便它们俩失败，
     // raw mode 也还是能被 Drop 恢复。
     let _guard = TerminalGuard;
+    // 探测终端背景，位置被两头夹死：
+    // - 必须在 enable_raw_mode() 之后：OSC 11 的回复是终端塞进 stdin 的一串
+    //   字节，非 raw 模式下会被行缓冲（它不带换行，读不出来）并且被回显到
+    //   屏幕上（用户会看见乱码）。
+    // - 必须在 EnterAlternateScreen 之前：万一有字节漏到屏幕上，此刻还在主屏、
+    //   还没开始画界面，脏字符会被随后的 alternate screen 切换盖掉；反过来就是
+    //   把乱码糊在已经画好的界面上。
+    // 在 TerminalGuard 之后是为了万一探测里有什么 panic，raw mode 仍能恢复。
+    init_theme();
     let mut stdout = std::io::stdout();
     // 开括号粘贴：不开的话粘贴的文字会一个字符一个事件地进来，
     // 粘一段话就是几百次往返，慢到没法用。
@@ -369,10 +406,30 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                 app.sent_size = Some((id, rows, cols));
             }
             match app.client().and_then(|c| c.call(Request::Screen { id })) {
-                Ok(Response::Screen { lines, cursor }) => {
+                Ok(Response::Screen {
+                    lines,
+                    cursor,
+                    state,
+                }) => {
                     app.screen = lines;
                     app.screen_cursor = cursor;
                     app.connected = true;
+                    // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
+                    // （agent 在 alternate screen 里画，退出时恢复的主屏从来
+                    // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
+                    // 每个键都掉进一个死掉的 pty 里无声消失。
+                    if let Some(notice) = session_ended_notice(id, state) {
+                        app.view = View::Board;
+                        // 回看板得重新拉一次 List：贴在会话里这一路都没拉，
+                        // 手里的 sessions 是进会话之前那份，缺的正是「这个
+                        // 会话已经没了」这条更新。
+                        app.need_sessions = true;
+                        // 会话正常结束不是错误，用普通提示，不是红字
+                        app.message = notice.into();
+                        // 下一个会话的尺寸要重新协商：sent_size 记的是刚退出
+                        // 的这个 id，留着会让新会话第一帧按错的宽度排版。
+                        app.sent_size = None;
+                    }
                 }
                 _ => app.connected = false,
             }

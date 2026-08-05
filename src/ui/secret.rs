@@ -8,9 +8,11 @@ use crate::proto::{socket_path, Request, Response, SecretPrompt};
 use crate::verify::VerifyOutcome;
 
 use super::app::App;
-use super::view::{decide_delete_key, secret_rows, DeleteKeyAction, SecretPhase, View};
+use super::view::{
+    decide_delete_key, is_plain_key, secret_rows, DeleteKeyAction, SecretPhase, View,
+};
 use super::widgets::{pad_to, truncate, Msg};
-use super::{move_sel_n, open_url, refetch_secrets, DIM};
+use super::{dim, move_sel_n, open_url, refetch_secrets};
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -256,7 +258,7 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                 },
             };
         }
-        KeyCode::Char('d') => {
+        KeyCode::Char('d') if is_plain_key(&key) => {
             let rows = secret_rows(&entries);
             let target = state.selected().and_then(|i| rows.get(i)).cloned();
             // 判断这半是纯函数（见 decide_delete_key 的文档注释，
@@ -389,7 +391,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     if !prompt.hint.is_empty() {
         lines.push(Line::from(Span::styled(
             prompt.hint.clone(),
-            Style::default().fg(DIM),
+            dim(),
         )));
         lines.push(Line::from(""));
     }
@@ -411,7 +413,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Ctrl+O 打开申领页面",
-            Style::default().fg(DIM),
+            dim(),
         )));
     }
     // IMPORTANT 3（最终整分支 code review）：Task 13 把「回哪」这句话
@@ -476,9 +478,15 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 ListItem::new(Line::from(vec![
                     Span::raw(pad_to(&truncate(&label, 14), 14)),
+                    // 三元式抬到 `Style` 这一层：`dim()` 返回的是 `Style`
+                    // （`Unknown` 那支是 DIM 修饰符而不是颜色），塞不进 `.fg()`
                     Span::styled(
                         if *configured { "已配" } else { "未配" },
-                        Style::default().fg(if *configured { Color::Green } else { DIM }),
+                        if *configured {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            dim()
+                        },
                     ),
                 ]))
             }

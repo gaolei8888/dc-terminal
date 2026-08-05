@@ -8,5 +8,6 @@ pub mod proto;
 pub mod pty;
 pub mod secrets;
 pub mod session;
+pub mod theme;
 pub mod ui;
 pub mod verify;

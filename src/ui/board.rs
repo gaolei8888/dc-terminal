@@ -4,10 +4,10 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use super::app::App;
-use super::view::View;
-use super::widgets::{short_path, status_color, status_label, truncate};
+use super::view::{is_plain_key, View};
+use super::widgets::{short_path, status_label, status_style, truncate};
 use super::{
-    move_sel, open_new_session, open_project_picker, open_secrets, selected, session_action, DIM,
+    dim, move_sel, open_new_session, open_project_picker, open_secrets, selected, session_action,
 };
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
@@ -17,19 +17,21 @@ use super::{
 /// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
-        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('q') if is_plain_key(&key) => app.quit = true,
         KeyCode::Down => move_sel(&mut app.list_state, &app.sessions, 1),
         KeyCode::Up => move_sel(&mut app.list_state, &app.sessions, -1),
-        KeyCode::Char('n') | KeyCode::Char('N') => open_new_session(app, key.code),
-        KeyCode::Char('p') => open_project_picker(app),
-        KeyCode::Char('c') => open_secrets(app),
+        KeyCode::Char('n') | KeyCode::Char('N') if is_plain_key(&key) => {
+            open_new_session(app, key.code)
+        }
+        KeyCode::Char('p') if is_plain_key(&key) => open_project_picker(app),
+        KeyCode::Char('c') if is_plain_key(&key) => open_secrets(app),
         KeyCode::Enter => {
             if let Some(id) = selected(&app.sessions, &app.list_state).map(|s| s.id) {
                 app.view = View::Attached(id);
                 app.need_sessions = true; // 会话标题要显示项目名
             }
         }
-        KeyCode::Char('g') => {
+        KeyCode::Char('g') if is_plain_key(&key) => {
             // 进九宫格时焦点落在列表当前选中的那一行：两个视图对「当前是
             // 哪个会话」的认知必须一致，不然按完 g 焦点跳到别处，用户会
             // 以为自己按错了键。
@@ -39,7 +41,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         // 三个动作跟九宫格共用 session_action，区别只在「当前会话」是
         // 选中行还是焦点格
-        KeyCode::Char('u') | KeyCode::Char('s') | KeyCode::Char('d') => {
+        KeyCode::Char('u') | KeyCode::Char('s') | KeyCode::Char('d') if is_plain_key(&key) => {
             app.message = match selected(&app.sessions, &app.list_state).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
                 None => "没有选中会话".into(),
@@ -69,14 +71,11 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|s| {
             ListItem::new(Line::from(vec![
                 Span::raw(format!("{:>3}  ", s.id)),
-                Span::styled(
-                    format!("{:<8}", status_label(s.state)),
-                    Style::default().fg(status_color(s.state)),
-                ),
+                Span::styled(format!("{:<8}", status_label(s.state)), status_style(s.state)),
                 Span::raw(format!("{:<10}", s.profile)),
                 Span::styled(
                     format!("{:<22}", truncate(&short_path(&s.dir), 22)),
-                    Style::default().fg(DIM),
+                    dim(),
                 ),
                 Span::raw(truncate(&s.activity, 60)),
             ]))

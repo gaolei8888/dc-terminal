@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::git::FileStat;
 use crate::profile::ProfileStatus;
 use crate::pty::ScreenSpan;
-use crate::session::SessionInfo;
+use crate::session::{SessionInfo, SessionState};
 
 /// 需要密钥时，UI 画输入界面要用的东西。
 ///
@@ -170,6 +170,11 @@ pub enum Response {
     Screen {
         lines: Vec<Vec<ScreenSpan>>,
         cursor: (u16, u16),
+        /// 贴在会话里时界面只调 `Screen`（`List` 太贵，见 `ui::run` 里的注释），
+        /// 所以进程死了它只能从这里知道。少了它界面会永远画那张空缓冲——
+        /// agent 退出时恢复主屏，主屏从来没被写过，所以「屏是空的」是正常的，
+        /// 判断死活只能靠状态。
+        state: SessionState,
     },
     Screens {
         screens: Vec<ScreenEntry>,

@@ -5,6 +5,7 @@ use ratatui::widgets::ListState;
 
 use crate::profile::ProfileStatus;
 use crate::proto::{ProfileEntry, SecretPrompt};
+use crate::session::SessionState;
 use crate::verify::VerifyOutcome;
 
 use super::Msg;
@@ -82,6 +83,25 @@ pub enum SecretPhase {
     Typing,
     Verifying,
     Failed(String),
+}
+
+/// 这个按键是「光板的」——没有按 Alt/Meta。
+///
+/// 用在看板和密钥页那些一个字母就干实事的分支上（退出、删除、跳走）。
+/// 理由是语义本身：`Alt+c` 不是 `c`，让它触发 `c` 的动作是 bug——这个守卫
+/// 只管这一件事，也正因为这件事本身就该管，所以要留着。
+///
+/// 这**不是**防「转义序列漏进 stdin 被当成按键」的第二道防线——曾经的
+/// 注释这么说过，是错的。crossterm 0.28.1 只把 ESC 后紧跟的那一个字节
+/// 标成 Alt（`event/sys/unix/parse.rs`），发出这个事件后立刻清空解析
+/// 缓冲区（`event/source/unix/tty.rs`），后面的字节是从头重新解析、不带
+/// 任何修饰符的。所以 `\x1b]11;rgb:cdcd/dddd/dddd\x07` 一旦漏出来，`]`
+/// 是 `Alt+']'`，但紧跟着的 `cdcd`、`dddd` 里每个 `c`/`d` 都是光板
+/// `Char('c')`/`Char('d')` 事件——这个守卫在那条路径上完全拦不住。真正
+/// 防「回复变按键」的是 `theme.rs` 里的 DA1 哨兵和 isatty 判断，不是这
+/// 里；别指望这层守卫替哨兵兜底，也别因为这层守卫在就去削弱哨兵。
+pub(crate) fn is_plain_key(key: &KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::META)
 }
 
 /// Ctrl+Q —— dct 的全局逃生键。
@@ -375,6 +395,27 @@ pub(crate) fn message_after_transition(
     }
 }
 
+/// 贴在会话里、`Screen` 捎回状态之后：这个会话是不是已经结束了，该把用户
+/// 送回看板？返回 `Some(提示语)` 就是「回看板并把这句话显示在底栏」。
+///
+/// 为什么要有这一步：agent 自己退出（`/exit`、shell 里的 `exit`）之后，
+/// 界面留在会话视图里是一片空白——agent 在 alternate screen 里画，退出时恢复
+/// 主屏，主屏从来没被写过。用户看到的是一张没有任何信息的空页，底栏还写着
+/// 「其余按键都发给 agent」，而他敲的每个键都掉进一个死掉的 pty 里无声消失。
+/// 所以「屏是空的」不能用来判断会话死活，只有状态能。
+///
+/// 只认 `Stopped`。别的状态（包括 `Unknown`——profile 没给 pattern，我们不知道
+/// 它在干什么）都得留在会话里：把一个好端端的会话判成结束，会把用户从他正在
+/// 用的 agent 里踢出去，比空白页糟得多。
+///
+/// 抽成纯函数是为了能单测（同 `escape_hint`、`idle_help`、`back_one_level`）。
+pub(crate) fn session_ended_notice(id: u32, state: SessionState) -> Option<String> {
+    match state {
+        SessionState::Stopped => Some(format!("会话 {id} 已结束，回到看板。按 n 再建一个")),
+        _ => None,
+    }
+}
+
 /// 底栏左段：逃生键提示。
 ///
 /// 这是唯一一条「不管出什么事都必须还在」的信息——用户找不到它就只能去
@@ -644,6 +685,73 @@ mod tests {
         );
         assert_eq!(filter_projects(&all, "scratch").len(), 1);
         assert!(filter_projects(&all, "没有这个").is_empty());
+    }
+
+    /// 这个守卫**不是**防「转义序列漏进 stdin 被当成按键」的：crossterm 只把
+    /// ESC 后紧跟的那一个字节标成 Alt，后面的字节都是光板 `Char` 事件，这个
+    /// 守卫拦不住；防漏进按键靠的是 `theme.rs` 里的 DA1 哨兵。这里只测它该
+    /// 管的语义：挡住 Alt/Meta，放行正常按键（含 Shift、Ctrl）——挡了正常
+    /// 按键就是把用户的键吃掉。
+    #[test]
+    fn is_plain_key_rejects_alt_but_passes_normal_keypresses() {
+        assert!(is_plain_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE
+        )));
+        // Shift 必须放过，否则大写 N 这个独立分支永远进不去
+        assert!(is_plain_key(&KeyEvent::new(
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT
+        )));
+        // Ctrl 组合照旧放过：Ctrl+Q 在这层之前就被 is_ctrl_q 接走了，
+        // 这里再挡一遍只会改掉和本次修复无关的行为。
+        assert!(is_plain_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+
+        assert!(!is_plain_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_plain_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT
+        )));
+        // 有的终端把 Option/Command 报成 META
+        assert!(!is_plain_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::META
+        )));
+    }
+
+    /// agent 自己退出之后必须把用户送回看板：留在会话视图里就是一张空白页
+    /// （agent 在 alternate screen 里画，退出时恢复的主屏从来没被写过），
+    /// 底栏还写着「其余按键都发给 agent」，而键全掉进死掉的 pty。
+    #[test]
+    fn stopped_session_sends_the_user_back_to_the_board() {
+        let notice =
+            session_ended_notice(4, SessionState::Stopped).expect("Stopped 必须回看板");
+        assert!(notice.contains('4'), "提示要说清是哪个会话结束了：{notice}");
+    }
+
+    /// 活着的会话一个都不能被判成结束——把用户从正在用的 agent 里踢出去，
+    /// 比停在空白页糟得多。`Unknown` 尤其要留下：那只是 profile 没给 pattern，
+    /// 我们不知道它在干什么，不是它死了。
+    #[test]
+    fn live_sessions_are_never_treated_as_ended() {
+        for state in [
+            SessionState::Working,
+            SessionState::Asking,
+            SessionState::Idle,
+            SessionState::Unknown,
+        ] {
+            assert_eq!(
+                session_ended_notice(1, state),
+                None,
+                "{state:?} 不该被当成已结束"
+            );
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@ use ratatui::prelude::*;
 use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
 use crate::session::SessionState;
 
-use super::DIM;
+use super::dim;
 
 pub fn status_label(s: SessionState) -> &'static str {
     match s {
@@ -15,13 +15,20 @@ pub fn status_label(s: SessionState) -> &'static str {
     }
 }
 
-pub fn status_color(s: SessionState) -> Color {
+/// 状态在界面上的样式。返回 `Style` 而不是 `Color`：Stopped/Unknown 要用
+/// `dim()`，而 `dim()` 在 `Theme::Unknown` 下表达的是 DIM 修饰符、不是某个
+/// 颜色，`Color` 装不下。给 `dim()` 再开一个返回 `Color` 的孪生函数只能退回
+/// 写死一个灰，等于在安全网上开个洞。
+///
+/// 干活中/等你回答/空闲仍用具名 ANSI 色：终端主题本来就保证这几个色在自己
+/// 背景上可读，我们再去重映射等于跟用户自己的配色打架。
+pub fn status_style(s: SessionState) -> Style {
     match s {
-        SessionState::Working => Color::Cyan,
-        SessionState::Asking => Color::Yellow,
-        SessionState::Idle => Color::Green,
-        SessionState::Stopped => DIM,
-        SessionState::Unknown => DIM,
+        SessionState::Working => Style::default().fg(Color::Cyan),
+        SessionState::Asking => Style::default().fg(Color::Yellow),
+        SessionState::Idle => Style::default().fg(Color::Green),
+        SessionState::Stopped => dim(),
+        SessionState::Unknown => dim(),
     }
 }
 
@@ -211,9 +218,25 @@ mod tests {
     #[test]
     fn asking_and_working_use_different_colors() {
         assert_ne!(
-            status_color(SessionState::Asking),
-            status_color(SessionState::Working)
+            status_style(SessionState::Asking),
+            status_style(SessionState::Working)
         );
+    }
+
+    /// Stopped/Unknown 这两个「没在干活」的状态要走弱化样式，跟说明栏、
+    /// 不可用项用的是同一套自适应灰，不能再自己钉一个写死的颜色。
+    #[test]
+    fn inactive_states_use_the_adaptive_dim_style() {
+        assert_eq!(status_style(SessionState::Stopped), dim());
+        assert_eq!(status_style(SessionState::Unknown), dim());
+    }
+
+    /// 测试进程里没人调过 `init_theme`，`dim()` 必须给出 `Unknown` 的样式，
+    /// 而不是 panic 或者某个写死的灰。这条同时守着「探测没跑过也能正常渲染」
+    /// 这个前提——所有渲染测试都靠它。
+    #[test]
+    fn dim_falls_back_to_unknown_before_detection() {
+        assert_eq!(dim(), crate::theme::Theme::Unknown.dim());
     }
 
     #[test]

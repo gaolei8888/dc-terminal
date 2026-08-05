@@ -9,9 +9,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
 use super::app::App;
-use super::view::View;
-use super::widgets::{char_width, screen_to_lines, status_color, status_label};
-use super::{session_action, DIM};
+use super::view::{is_plain_key, View};
+use super::widgets::{char_width, screen_to_lines, status_label, status_style};
+use super::{dim, session_action};
 use crate::proto::ScreenEntry;
 use crate::pty::ScreenSpan;
 use crate::session::{SessionInfo, SessionState};
@@ -162,7 +162,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         // 回列表前把列表光标对到焦点格上，理由见 sync_board_cursor_from_grid
-        KeyCode::Char('g') => {
+        KeyCode::Char('g') if is_plain_key(&key) => {
             super::sync_board_cursor_from_grid(app);
             app.view = View::Board;
         }
@@ -170,10 +170,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 管密钥、退出这几个键跟列表里一模一样（共用同一份实现，见
         // mod.rs 里这几个函数的注释）。用户不该因为切了个视图就得先退
         // 回去才能新建会话。
-        KeyCode::Char('q') => app.quit = true,
-        KeyCode::Char('n') | KeyCode::Char('N') => super::open_new_session(app, key.code),
-        KeyCode::Char('p') => super::open_project_picker(app),
-        KeyCode::Char('c') => super::open_secrets(app),
+        KeyCode::Char('q') if is_plain_key(&key) => app.quit = true,
+        KeyCode::Char('n') | KeyCode::Char('N') if is_plain_key(&key) => {
+            super::open_new_session(app, key.code)
+        }
+        KeyCode::Char('p') if is_plain_key(&key) => super::open_project_picker(app),
+        KeyCode::Char('c') if is_plain_key(&key) => super::open_secrets(app),
         KeyCode::Enter => {
             if let Some(id) = app.sessions.get(focus).map(|s| s.id) {
                 // 会话标题要显示项目名
@@ -186,7 +188,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         // 跟看板同一套动作，作用在焦点格上——共用 `session_action`，
         // 不各抄一份（抄了将来只会改一半）。
-        KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') => {
+        KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') if is_plain_key(&key) => {
             app.message = match app.sessions.get(focus).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
                 None => "还没有会话".into(),
@@ -275,13 +277,13 @@ fn draw_grid(
     for (i, info) in page_sessions.iter().enumerate() {
         let tile = tile_areas[i];
         let focused = start + i == focus;
-        // 标题就是状态指示器：状态词用 status_color 上色，跟列表同一套颜色
+        // 标题就是状态指示器：状态词用 status_style 上色，跟列表同一套颜色
         // （已停止是灰的），扫一眼九个格子就知道谁在干活、谁停了。
         let title = Line::from(vec![
             Span::raw(format!(" {} {} ", info.id, info.profile)),
             Span::styled(
                 format!("{} ", status_label(info.state)),
-                Style::default().fg(status_color(info.state)),
+                status_style(info.state),
             ),
         ]);
         // 断连时整屏格子一律红框：九个静止的画面看上去跟活的一模一样，
@@ -303,7 +305,7 @@ fn draw_grid(
         } else if focused {
             Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(DIM)
+            dim()
         };
         let block = Block::bordered().title(title).border_style(border);
         let inner = block.inner(tile);
