@@ -99,10 +99,13 @@ cargo build --release
 | `s` | stop a session |
 | `d` | what did this session change |
 | `c` | API keys |
+| `g` | tile grid: every session's live screen at once; `Enter` zooms in |
 | `q` | quit the board; sessions keep running |
 | `Ctrl+Q` | back out one level, wherever you are |
 
-Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2` and `Ctrl+Q` are the only two keys `dct` keeps.
+The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), and `n`/`N`/`p`/`c`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator.
+
+Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
 
 A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
 
