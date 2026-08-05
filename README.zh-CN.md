@@ -130,7 +130,7 @@ cargo build --release
 
 **最要紧的一条：那四家的端点地址是照公开文档抄的，从来没拿真账号试过。** 密钥有可能验证通过、会话照样起不来。在有人拿真凭据跑通之前，Kimi、GLM、DeepSeek、Qwen API 这四个就当没验证过。
 
-往回滚屏还不能用，在 iTerm2 里还会把画面搞乱，滚回底部才恢复。根子上是 `dct` 现在一行历史都不留，所以压根没东西可滚。设计已经写完了（`docs/superpowers/specs/2026-08-04-dct-scrollback-design.md`），代码还没动。
+往回滚屏还不能用，在 iTerm2 里还会把画面搞乱，滚回底部才恢复。根子上是 `dct` 现在一行历史都不留，所以压根没东西可滚。设计已经写完了（`docs/superpowers/specs/2026-08-04-dct-scrollback-design.md`），两个先决条件里的一个——把四千行的老 `ui.rs` 拆开——已经做完，滚屏本身还没动。
 
 权限是全自动接受的，所以 agent 有可能写到项目目录外面去。**那部分改动不在快照范围内，撤销撤不回来。**
 
@@ -149,7 +149,16 @@ cargo build --release
 两个进程，走 `~/.dct/daemon.sock`（只有属主能访问）收发按行分隔的 JSON。
 
 ```
-src/ui.rs        界面：视图状态机、事件循环、渲染
+src/ui/mod.rs    事件循环、终端生命周期、按键与渲染的分发
+src/ui/view.rs   View 枚举和它的纯函数
+src/ui/app.rs    循环的状态，收在一个结构里
+src/ui/board.rs  会话列表
+src/ui/grid.rs   九宫格：布局数学、裁剪、渲染
+src/ui/attach.rs 单个会话，整屏
+src/ui/pick.rs   选 agent、选项目
+src/ui/secret.rs 密钥相关的几个页面
+src/ui/widgets.rs  补空格、截断、状态配色
+src/theme.rs     终端背景是深是浅，以及据此选出的弱化文字样式
 src/client.rs    单条连接，5 秒读超时，一出错就重连
 src/daemon.rs    请求分发，一个连接一个线程
 src/session.rs   会话生命周期，200ms 一次 tick 从屏幕上读状态

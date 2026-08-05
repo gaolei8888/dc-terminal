@@ -130,7 +130,7 @@ The point was never "use your terminal from anywhere." It's that **development k
 
 **The big one: the four vendor endpoints are copied out of public documentation and have never been tested with a real account.** A key can verify fine and the session still fail to start. Until somebody runs them with real credentials, treat Kimi, GLM, DeepSeek and Qwen API as unverified.
 
-Scrolling back doesn't work yet, and in iTerm2 it actively garbles the screen — scroll to the bottom and it repaints. The underlying reason is that `dct` currently keeps zero scrollback, so there's nothing to scroll to. The design is finished (`docs/superpowers/specs/2026-08-04-dct-scrollback-design.md`); the code isn't started.
+Scrolling back doesn't work yet, and in iTerm2 it actively garbles the screen — scroll to the bottom and it repaints. The underlying reason is that `dct` currently keeps zero scrollback, so there's nothing to scroll to. The design is finished (`docs/superpowers/specs/2026-08-04-dct-scrollback-design.md`) and one of its two prerequisites — splitting the old 4000-line `ui.rs` — is done. The scrollback itself isn't started.
 
 Permissions are auto-accepted, which means an agent can write outside the project directory. **Those writes are outside the snapshot and undo won't bring them back.**
 
@@ -149,7 +149,16 @@ The interface itself is Chinese-only. Profiles are already per-language; the UI 
 Two processes, newline-delimited JSON over a Unix socket at `~/.dct/daemon.sock`, owner-only.
 
 ```
-src/ui.rs        the TUI — view state machine, event loop, rendering
+src/ui/mod.rs    the event loop, terminal lifecycle, and the key/render dispatch
+src/ui/view.rs   the View enum and its pure functions
+src/ui/app.rs    the loop's state, in one struct
+src/ui/board.rs  the session list
+src/ui/grid.rs   the tile grid — layout maths, cropping, rendering
+src/ui/attach.rs one session, full screen
+src/ui/pick.rs   the agent and project pickers
+src/ui/secret.rs the key pages
+src/ui/widgets.rs  padding, truncation, status colours
+src/theme.rs     is the terminal light or dark, and the dim style that follows
 src/client.rs    one connection, 5s read timeout, reconnects on any error
 src/daemon.rs    request dispatch, thread per connection
 src/session.rs   session lifecycle, 200ms tick that reads status off the screen
