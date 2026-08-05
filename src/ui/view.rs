@@ -730,8 +730,7 @@ mod tests {
     /// 底栏还写着「其余按键都发给 agent」，而键全掉进死掉的 pty。
     #[test]
     fn stopped_session_sends_the_user_back_to_the_board() {
-        let notice =
-            session_ended_notice(4, SessionState::Stopped).expect("Stopped 必须回看板");
+        let notice = session_ended_notice(4, SessionState::Stopped).expect("Stopped 必须回看板");
         assert!(notice.contains('4'), "提示要说清是哪个会话结束了：{notice}");
     }
 

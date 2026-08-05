@@ -389,10 +389,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let mut lines: Vec<Line> = Vec::new();
     if !prompt.hint.is_empty() {
-        lines.push(Line::from(Span::styled(
-            prompt.hint.clone(),
-            dim(),
-        )));
+        lines.push(Line::from(Span::styled(prompt.hint.clone(), dim())));
         lines.push(Line::from(""));
     }
     // 显示成圆点：密钥不该以明文停在屏幕上，用户可能在录屏或在办公室
@@ -411,10 +408,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     }
     if prompt.url.is_some() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Ctrl+O 打开申领页面",
-            dim(),
-        )));
+        lines.push(Line::from(Span::styled("Ctrl+O 打开申领页面", dim())));
     }
     // IMPORTANT 3（最终整分支 code review）：Task 13 把「回哪」这句话
     // 在 `escape_hint`/`idle_help` 上按 `return_to_settings` 分了岔，

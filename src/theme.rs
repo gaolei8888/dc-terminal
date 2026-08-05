@@ -250,9 +250,8 @@ impl ReplyReader for StdinReader {
             // `std::io::stdin`）。滞留在那儿的字节就是用户之后敲的键，界面起
             // 来后再也读不到——和当初不让开线程去阻塞读，要防的是同一类
             // 「吃键」故障，只是换了个门进来。
-            let n = unsafe {
-                libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len())
-            };
+            let n =
+                unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
             match n {
                 i if i <= 0 => return buf,
                 n => {
@@ -310,7 +309,11 @@ pub(crate) fn detect_with<R: ReplyReader>(
     // 2. 问终端本人。比 COLORFGBG 可信：那个变量是登录时设的，用户中途
     //    换了配色它不会更新。
     if let Some((r, g, b)) = parse_osc11(&reader.read_reply(QUERY_TIMEOUT)) {
-        return if is_light(r, g, b) { Theme::Light } else { Theme::Dark };
+        return if is_light(r, g, b) {
+            Theme::Light
+        } else {
+            Theme::Dark
+        };
     }
 
     // 3. 不答 OSC 11 的终端（rxvt/urxvt/konsole）留下的线索。
@@ -417,12 +420,21 @@ mod tests {
     /// `rgb:0/0/0` 的 `f` 是满值，补成 `0x000f` 就成了几乎全黑，判反。
     #[test]
     fn scales_short_hex_components_to_full_range() {
-        assert_eq!(parse_osc11(b"\x1b]11;rgb:f/f/f\x07"), Some((0xffff, 0xffff, 0xffff)));
-        assert_eq!(parse_osc11(b"\x1b]11;rgb:ff/ff/ff\x07"), Some((0xffff, 0xffff, 0xffff)));
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:f/f/f\x07"),
+            Some((0xffff, 0xffff, 0xffff))
+        );
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:ff/ff/ff\x07"),
+            Some((0xffff, 0xffff, 0xffff))
+        );
         assert_eq!(parse_osc11(b"\x1b]11;rgb:00/00/00\x07"), Some((0, 0, 0)));
         // 两位的 0x80 应该放大到约半程，而不是 0x0080
         let (r, _, _) = parse_osc11(b"\x1b]11;rgb:80/80/80\x07").unwrap();
-        assert!(r > 0x8000 && r < 0x8100, "0x80 应放大到约半程，实际 {r:#06x}");
+        assert!(
+            r > 0x8000 && r < 0x8100,
+            "0x80 应放大到约半程，实际 {r:#06x}"
+        );
     }
 
     /// 各种残缺和垃圾输入一律 None，绝不 panic——这是探测链降级的入口，
@@ -560,11 +572,17 @@ mod tests {
 
     impl CannedReader {
         fn answering(reply: &[u8]) -> Self {
-            CannedReader { reply: reply.to_vec(), calls: 0 }
+            CannedReader {
+                reply: reply.to_vec(),
+                calls: 0,
+            }
         }
         /// 不答 OSC 11 的终端，读到超时拿到空字节
         fn silent() -> Self {
-            CannedReader { reply: Vec::new(), calls: 0 }
+            CannedReader {
+                reply: Vec::new(),
+                calls: 0,
+            }
         }
     }
 
@@ -588,7 +606,10 @@ mod tests {
     #[test]
     fn override_wins_over_colorfgbg() {
         let mut r = CannedReader::silent();
-        assert_eq!(detect_with(&mut r, Some("light"), Some("15;0")), Theme::Light);
+        assert_eq!(
+            detect_with(&mut r, Some("light"), Some("15;0")),
+            Theme::Light
+        );
     }
 
     /// 第二级：OSC 11 答了就用它的结果。
@@ -617,7 +638,10 @@ mod tests {
     fn falls_back_to_colorfgbg_when_terminal_is_silent() {
         let mut r = CannedReader::silent();
         assert_eq!(detect_with(&mut r, None, Some("15;0")), Theme::Dark);
-        assert_eq!(detect_with(&mut CannedReader::silent(), None, Some("0;15")), Theme::Light);
+        assert_eq!(
+            detect_with(&mut CannedReader::silent(), None, Some("0;15")),
+            Theme::Light
+        );
     }
 
     /// 回复格式不对，也要能一路降到 COLORFGBG，而不是就地放弃。
@@ -639,6 +663,9 @@ mod tests {
     #[test]
     fn garbage_at_every_level_lands_on_unknown() {
         let mut r = CannedReader::answering(b"not an osc reply");
-        assert_eq!(detect_with(&mut r, Some("mauve"), Some("not;numbers")), Theme::Unknown);
+        assert_eq!(
+            detect_with(&mut r, Some("mauve"), Some("not;numbers")),
+            Theme::Unknown
+        );
     }
 }

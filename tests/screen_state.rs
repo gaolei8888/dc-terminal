@@ -35,7 +35,8 @@ fn screen_carries_the_session_state_over_the_socket() {
 
     match c.call(Request::Screen { id }).unwrap() {
         Response::Screen { state, .. } => assert_ne!(
-            state, SessionState::Stopped,
+            state,
+            SessionState::Stopped,
             "shell 刚起来就报 Stopped，界面会立刻把用户踢回看板"
         ),
         other => panic!("预期 Screen，实际 {other:?}"),

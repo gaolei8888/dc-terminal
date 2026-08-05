@@ -71,12 +71,12 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|s| {
             ListItem::new(Line::from(vec![
                 Span::raw(format!("{:>3}  ", s.id)),
-                Span::styled(format!("{:<8}", status_label(s.state)), status_style(s.state)),
-                Span::raw(format!("{:<10}", s.profile)),
                 Span::styled(
-                    format!("{:<22}", truncate(&short_path(&s.dir), 22)),
-                    dim(),
+                    format!("{:<8}", status_label(s.state)),
+                    status_style(s.state),
                 ),
+                Span::raw(format!("{:<10}", s.profile)),
+                Span::styled(format!("{:<22}", truncate(&short_path(&s.dir), 22)), dim()),
                 Span::raw(truncate(&s.activity, 60)),
             ]))
         })
