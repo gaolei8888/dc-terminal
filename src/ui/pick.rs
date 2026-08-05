@@ -11,7 +11,7 @@ use crate::proto::{Request, Response, SecretPrompt};
 
 use super::app::App;
 use super::view::{
-    digit_index, expand_path, filter_projects, pick_action, PickAction, SecretPhase, View,
+    digit_index, expand_path, pick_action, Pane, PickAction, ProjectPicker, SecretPhase, View,
 };
 use super::widgets::{pad_to, short_path, truncate, Msg};
 use super::{dim, move_sel_n};
@@ -24,7 +24,7 @@ use super::{dim, move_sel_n};
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.view.clone() {
         View::PickProfile { .. } => handle_pick_profile(app, key),
-        View::PickProject { .. } => handle_pick_project(app, key),
+        View::PickProject(_) => handle_pick_project(app, key),
         _ => Ok(()),
     }
 }
@@ -169,169 +169,167 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
-/// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
-/// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
-/// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
-/// 但如果哪天又被内联回循环里，这条约束就会重新生效。
+/// **这个函数里永远不要 `continue`。** 理由同上。
 fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::PickProject {
-        all,
-        mut filter,
-        mut state,
-        typing_path,
-    } = app.view.clone()
-    else {
+    let View::PickProject(mut p) = app.view.clone() else {
         return Ok(());
     };
-    match typing_path {
-        // ——手输路径态：可见字符全进输入框，不再当过滤用——
-        Some(mut buf) => match key.code {
-            KeyCode::Esc => {
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: None,
-                }
-            }
+
+    // ——手输路径态：可见字符全进输入框，不再当过滤用——
+    if let Some(mut buf) = p.typing_path.clone() {
+        match key.code {
+            KeyCode::Esc => p.typing_path = None,
             KeyCode::Enter => {
                 if buf.trim().is_empty() {
-                    // expand_path("", base) 会解析成 base 自己（非绝对路径走
-                    // base.join("")），is_dir() 照样为真——空输入不挡住的话，
-                    // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
+                    // expand_path("", base) 会解析成 base 自己，is_dir() 照样为真——
+                    // 空输入不挡住的话，用户在这一步犹豫多按一次 Enter，
+                    // 就会被无声切回启动目录。
                     app.message = Msg::err(text(Key::NoPathTyped, app.lang).into());
-                    app.view = View::PickProject {
-                        all,
-                        filter,
-                        state,
-                        typing_path: Some(buf),
-                    };
                 } else {
-                    let p = expand_path(&buf, &app.start_dir);
-                    if p.is_dir() {
-                        super::switch_project(app, p);
-                    } else {
-                        // 不是 git 仓库这件事不在这里判——留给 create()
-                        app.message =
-                            Msg::err(msg::not_a_directory(app.lang, &p.display().to_string()));
-                        app.view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: Some(buf),
-                        };
+                    let dir = expand_path(&buf, &app.start_dir);
+                    if dir.is_dir() {
+                        super::switch_project(app, dir);
+                        return Ok(());
                     }
+                    // 不是 git 仓库这件事不在这里判——留给 create()
+                    app.message =
+                        Msg::err(msg::not_a_directory(app.lang, &dir.display().to_string()));
                 }
             }
             KeyCode::Backspace => {
                 buf.pop();
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: Some(buf),
-                };
+                p.typing_path = Some(buf);
             }
             KeyCode::Char(c) => {
                 buf.push(c);
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: Some(buf),
-                };
+                p.typing_path = Some(buf);
             }
-            _ => {
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: Some(buf),
+            _ => {}
+        }
+        app.view = View::PickProject(p);
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.view = super::home_view(app);
+            return Ok(());
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            p.focus = match p.focus {
+                Pane::Recent => Pane::Browse,
+                Pane::Browse => Pane::Recent,
+            };
+            // 过滤词是对着上一栏打的，换了焦点就不成立了
+            p.filter.clear();
+        }
+        KeyCode::Down | KeyCode::Up => {
+            let d = if key.code == KeyCode::Down { 1 } else { -1 };
+            match p.focus {
+                // +1 是末行那个「手输路径…」，它不参与过滤，永远在
+                Pane::Recent => {
+                    let n = p.shown_recent().len() + 1;
+                    move_sel_n(&mut p.recent_state, n, d);
+                }
+                Pane::Browse => {
+                    let n = p.shown_entries().len();
+                    move_sel_n(&mut p.browse_state, n, d);
+                }
+            }
+        }
+        // `→` 是「往里走」：在浏览栏进子目录，在最近栏把浏览器切到那个项目
+        // 所在的位置——用户想从一个熟悉的项目附近开始找，这是最短的一步。
+        KeyCode::Right => match p.focus {
+            Pane::Browse => {
+                let shown = p.shown_entries();
+                if let Some(row) = p.browse_state.selected().and_then(|i| shown.get(i)) {
+                    let next = p.cwd.join(&row.name);
+                    p.browse_to(next);
+                }
+            }
+            Pane::Recent => {
+                let shown = p.shown_recent();
+                if let Some(dir) = p.recent_state.selected().and_then(|i| shown.get(i)) {
+                    p.browse_to(PathBuf::from(dir));
+                    p.focus = Pane::Browse;
                 }
             }
         },
-        // ——列表态——
-        None => match key.code {
-            KeyCode::Esc => app.view = super::home_view(app),
-            KeyCode::Down | KeyCode::Up => {
-                let delta = if key.code == KeyCode::Down { 1 } else { -1 };
-                // +1 是末行那个「手输路径…」，它不参与过滤，永远在
-                let n = filter_projects(&all, &filter).len() + 1;
-                move_sel_n(&mut state, n, delta);
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: None,
-                };
+        KeyCode::Left => {
+            if p.focus == Pane::Browse {
+                // 已经在根目录时 parent() 是 None——原地不动，不 panic
+                if let Some(parent) = p.cwd.parent().map(|x| x.to_path_buf()) {
+                    p.browse_to(parent);
+                }
             }
-            KeyCode::Enter => {
-                let shown = filter_projects(&all, &filter);
-                let i = state.selected().unwrap_or(0);
-                if i >= shown.len() {
-                    // 选中的是末行「手输路径…」
-                    app.view = View::PickProject {
-                        all,
-                        filter,
-                        state,
-                        typing_path: Some(String::new()),
-                    };
-                } else {
-                    let p = PathBuf::from(&shown[i]);
-                    if p.is_dir() {
-                        super::switch_project(app, p);
-                    } else {
-                        // 列表里那条不删——可能只是外置盘没挂
-                        app.message =
-                            Msg::err(msg::cannot_find_anymore(app.lang, &short_path(&shown[i])));
-                        app.view = View::PickProject {
-                            all,
-                            filter,
-                            state,
-                            typing_path: None,
-                        };
+        }
+        KeyCode::Enter => {
+            let chosen: Option<PathBuf> = match p.focus {
+                Pane::Recent => {
+                    let shown = p.shown_recent();
+                    let i = p.recent_state.selected().unwrap_or(0);
+                    match shown.get(i) {
+                        Some(dir) => Some(PathBuf::from(dir)),
+                        // 选中的是末行「手输路径…」
+                        None => {
+                            p.typing_path = Some(String::new());
+                            None
+                        }
                     }
                 }
-            }
-            KeyCode::Backspace => {
-                filter.pop();
-                state.select(Some(0));
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: None,
-                };
-            }
-            KeyCode::Char(c) => {
-                filter.push(c);
-                // 过滤变了就回到第一项，否则光标可能停在已被过滤掉的行号上
-                state.select(Some(0));
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: None,
-                };
-            }
-            _ => {
-                app.view = View::PickProject {
-                    all,
-                    filter,
-                    state,
-                    typing_path: None,
+                // 浏览栏的 Enter 是**选定**，不是进入。走到一个目录上多半是
+                // 因为它就是要找的项目；想再往下钻有 `→`，那是个方向键，
+                // 语义天然就是「往里走」。
+                Pane::Browse => {
+                    let shown = p.shown_entries();
+                    p.browse_state
+                        .selected()
+                        .and_then(|i| shown.get(i))
+                        .map(|row| p.cwd.join(&row.name))
                 }
+            };
+            if let Some(dir) = chosen {
+                if dir.is_dir() {
+                    super::switch_project(app, dir);
+                    return Ok(());
+                }
+                // 列表里那条不删——可能只是外置盘没挂
+                app.message = Msg::err(msg::cannot_find_anymore(
+                    app.lang,
+                    &short_path(&dir.display().to_string()),
+                ));
             }
-        },
+        }
+        KeyCode::Backspace => {
+            p.filter.pop();
+            reset_cursor(&mut p);
+        }
+        KeyCode::Char(c) => {
+            p.filter.push(c);
+            reset_cursor(&mut p);
+        }
+        _ => {}
     }
+    app.view = View::PickProject(p);
     Ok(())
+}
+
+/// 过滤变了就把光标收回第一行，否则它会停在一个已经被过滤掉的行号上。
+fn reset_cursor(p: &mut ProjectPicker) {
+    match p.focus {
+        Pane::Recent => p.recent_state.select(Some(0)),
+        Pane::Browse => p.browse_state.select(if p.shown_entries().is_empty() {
+            None
+        } else {
+            Some(0)
+        }),
+    }
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     match &app.view {
         View::PickProfile { .. } => draw_pick_profile(f, area, app),
-        View::PickProject { .. } => draw_pick_project(f, area, app),
+        View::PickProject(_) => draw_pick_project(f, area, app),
         _ => {}
     }
 }
@@ -419,77 +417,115 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::PickProject {
-        all,
-        filter,
-        state,
-        typing_path,
-    } = &app.view
-    else {
+    let View::PickProject(p) = &app.view else {
         return;
     };
-    // 断连时用红色边框给出明确的视觉提示：界面上的数据是上一次成功请求
-    // 留下的陈旧快照，不代表守护进程现在的真实状态。
+    let lang = app.lang;
     let border_style = if app.connected {
         Style::default()
     } else {
         Style::default().fg(Color::Red)
     };
-    if let Some(buf) = typing_path {
+
+    // 手输态占满整层，不分栏：这时候屏幕上只有一件事在发生。
+    if let Some(buf) = &p.typing_path {
         f.render_widget(
             Paragraph::new(format!("{buf}▌")).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
-                    .title(text(Key::TypePathTitle, app.lang)),
+                    .title(text(Key::TypePathTitle, lang)),
             ),
             area,
         );
+        return;
+    }
+
+    // 左边窄一点：最近项目只有名字和路径，而右边要放得下目录名加 git 标记。
+    let cols = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area)
+        .to_vec();
+
+    // ——左：最近——
+    let shown = p.shown_recent();
+    let mut items: Vec<ListItem> = shown
+        .iter()
+        .map(|path| {
+            let short = short_path(path);
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| short.clone());
+            ListItem::new(Line::from(vec![
+                Span::raw(pad_to(&truncate(&name, 18), 18)),
+                Span::styled(truncate(&short, 22), dim()),
+            ]))
+        })
+        .collect();
+    // 兜底入口不参与过滤，永远在最后一行
+    items.push(ListItem::new(Line::from(Span::styled(
+        text(Key::ManualPath, lang),
+        Style::default().fg(Color::Cyan),
+    ))));
+    f.render_stateful_widget(
+        List::new(items)
+            .block(pane_block(
+                text(Key::RecentProjects, lang).to_string(),
+                p.focus == Pane::Recent,
+                border_style,
+            ))
+            .highlight_symbol("▶ "),
+        cols[0],
+        &mut p.recent_state.clone(),
+    );
+
+    // ——右：浏览——
+    let rows = p.shown_entries();
+    let browse_block = pane_block(
+        short_path(&p.cwd.display().to_string()),
+        p.focus == Pane::Browse,
+        border_style,
+    );
+    if rows.is_empty() {
+        // 空目录和读不了的目录落在同一句话上：对用户来说这两种情况
+        // 能做的事完全一样（← 回上一级，或者去别处找）。
+        f.render_widget(
+            Paragraph::new(text(Key::NoSubfolders, lang))
+                .centered()
+                .block(browse_block),
+            cols[1],
+        );
     } else {
-        let shown = filter_projects(all, filter);
-        let mut items: Vec<ListItem> = shown
+        let items: Vec<ListItem> = rows
             .iter()
-            .map(|p| {
-                let short = short_path(p);
-                let name = std::path::Path::new(p)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| short.clone());
+            .map(|r| {
+                let mark = if r.is_git { " ●" } else { "  " };
                 ListItem::new(Line::from(vec![
-                    Span::raw(pad_to(&truncate(&name, 20), 20)),
-                    Span::styled(truncate(&short, 50), dim()),
+                    Span::raw(truncate(&r.name, 30)),
+                    // git 仓库的标记压暗：它是辅助信息，不该比目录名还抢眼
+                    Span::styled(mark, dim()),
                 ]))
             })
             .collect();
-        // 兜底入口不参与过滤，永远在最后一行
-        items.push(ListItem::new(Line::from(Span::styled(
-            text(Key::ManualPath, app.lang),
-            Style::default().fg(Color::Cyan),
-        ))));
-
-        // 标题只写「选项目」，怎么操作由底栏的 idle_help 说——两处各写一遍
-        // 的话，改了键位就得记得改两处，而漏改的那处会一直教用户按错。
-        let title = if filter.is_empty() {
-            text(Key::PickProjectTitle, app.lang).to_string()
-        } else {
-            msg::title_with(app.lang, Key::PickProjectTitle, filter)
-        };
-        // state 是 View 里那份的副本，draw 只读不写，所以这里克隆一份给
-        // render_stateful_widget 用，不去动看板的光标。
-        let mut s = state.clone();
         f.render_stateful_widget(
-            List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(border_style)
-                        .title(title),
-                )
-                .highlight_symbol("▶ "),
-            area,
-            &mut s,
+            List::new(items).block(browse_block).highlight_symbol("▶ "),
+            cols[1],
+            &mut p.browse_state.clone(),
         );
     }
+}
+
+/// 有焦点那一栏的边框加亮。两栏并排时，用户必须一眼看出打字会落在哪一边——
+/// 看不出来的话，他打的字会在他以为的另一栏里过滤，而那一栏毫无反应。
+fn pane_block(title: String, focused: bool, base: Style) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            base.patch(dim())
+        })
+        .title(title)
 }
 
 #[cfg(test)]
@@ -647,12 +683,14 @@ mod tests {
 
         let mut st = ListState::default();
         st.select(Some(0));
-        app.view = View::PickProject {
-            all: vec![b.display().to_string()],
+        app.view = View::PickProject(ProjectPicker {
             filter: String::new(),
-            state: st,
             typing_path: None,
-        };
+            ..ProjectPicker::new(
+                vec![b.display().to_string()],
+                std::path::PathBuf::from("/tmp"),
+            )
+        });
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
 
         assert_eq!(app.current_dir, b, "项目切过去了");
@@ -661,6 +699,152 @@ mod tests {
             vec![2],
             "屏幕上的会话必须同一时刻跟着换，不能等下一轮"
         );
+    }
+
+    /// 造一棵能走的目录树。
+    ///
+    /// **两个 `TempDir` 都要交出去**：一个是这棵树本身，另一个是 `test_app`
+    /// 给 socket 用的（切模式、存设置都会往它旁边写）。任何一个提前 drop，
+    /// 对应的目录就在测试跑到一半时从磁盘上消失了——`list_dirs` 会读到空、
+    /// `switch_project` 的 `is_dir()` 会变成 false，而失败信息完全不会
+    /// 指向真正的原因。
+    fn tree(
+        dirs: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        App,
+        std::path::PathBuf,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        let root = tmp.path().to_path_buf();
+        let (mut app, guard) = App::test_app();
+        app.current_dir = root.clone();
+        (tmp, guard, app, root)
+    }
+
+    fn open_picker(app: &mut App, recent: Vec<String>, cwd: std::path::PathBuf) {
+        app.view = View::PickProject(ProjectPicker::new(recent, cwd));
+    }
+
+    fn picker(app: &App) -> ProjectPicker {
+        match &app.view {
+            View::PickProject(p) => p.clone(),
+            other => panic!("不在选项目里：{}", matches!(other, View::Board)),
+        }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+    }
+
+    /// Tab 在两栏之间来回切。没有这一步，右边那栏就是个只能看不能用的装饰。
+    #[test]
+    fn tab_moves_the_focus_back_and_forth() {
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        open_picker(&mut app, vec![], root);
+        assert_eq!(picker(&app).focus, Pane::Recent, "开在最近那一栏");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(picker(&app).focus, Pane::Browse);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(picker(&app).focus, Pane::Recent);
+    }
+
+    /// `→` 进子目录，`←` 回上一级。这是「目录浏览器」这四个字的全部含义。
+    #[test]
+    fn right_descends_and_left_goes_up() {
+        let (_t, _g, mut app, root) = tree(&["outer/inner"]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Tab);
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(picker(&app).cwd, root.join("outer"), "→ 要走进去");
+        assert_eq!(
+            picker(&app)
+                .entries
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["inner"],
+            "列表要跟着换成新目录的内容"
+        );
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(picker(&app).cwd, root, "← 要回上一级");
+    }
+
+    /// 一路 `←` 走到根目录不能 panic，也不能卡住不动就静默——原地停住即可。
+    #[test]
+    fn going_up_from_the_root_stays_put() {
+        let (_t, _g, mut app, _root) = tree(&[]);
+        open_picker(&mut app, vec![], std::path::PathBuf::from("/"));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(picker(&app).cwd, std::path::PathBuf::from("/"));
+    }
+
+    /// **浏览栏的 Enter 是「选定」，不是「进入」。** 用户走到一个目录上，
+    /// 多半是因为它就是他要的项目；想再往下钻有 `→`。
+    #[test]
+    fn enter_in_the_browser_picks_the_highlighted_folder() {
+        let (_t, _g, mut app, root) = tree(&["proj/sub"]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_dir, root.join("proj"), "选定的是高亮那个目录");
+        assert!(matches!(app.view, View::Board), "选完就回家");
+        assert!(app.message.text.contains("已切到"), "换了项目要说一声");
+    }
+
+    /// 最近栏的 `→` 把浏览器切到那个项目所在的位置——用户想从一个熟悉的
+    /// 项目附近开始找，这是最短的一步。
+    #[test]
+    fn right_on_a_recent_project_opens_the_browser_there() {
+        let (_t, _g, mut app, root) = tree(&["proj/sub"]);
+        let proj = root.join("proj");
+        open_picker(&mut app, vec![proj.display().to_string()], root);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(picker(&app).cwd, proj);
+        assert_eq!(picker(&app).focus, Pane::Browse, "焦点跟着过去");
+    }
+
+    /// 打字只过滤**当前焦点那一栏**。共用一个过滤词的话，用户在左边找项目，
+    /// 右边的目录列表会跟着变空，而他并没有要求那件事。
+    #[test]
+    fn typing_filters_only_the_focused_pane() {
+        let (_t, _g, mut app, root) = tree(&["alpha", "beta"]);
+        open_picker(&mut app, vec!["/w/alpha".into(), "/w/beta".into()], root);
+
+        press(&mut app, KeyCode::Char('a'));
+        let p = picker(&app);
+        assert_eq!(p.shown_recent().len(), 2, "「a」在两条路径里都有");
+        assert_eq!(p.shown_entries().len(), 2, "浏览栏不该被左栏的过滤词影响");
+
+        press(&mut app, KeyCode::Tab); // 切到浏览栏，过滤词清空
+        press(&mut app, KeyCode::Char('b'));
+        let p = picker(&app);
+        assert_eq!(
+            p.shown_entries()
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["beta"],
+            "现在过滤的是浏览栏"
+        );
+        assert_eq!(p.shown_recent().len(), 2, "左栏不受影响");
+    }
+
+    /// Esc 回到用户选的模式，不是永远的列表（复用 B 的 home_view）。
+    #[test]
+    fn escape_returns_to_the_chosen_mode() {
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        app.view_mode = crate::ui::ViewMode::Grid;
+        open_picker(&mut app, vec![], root);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::Grid { .. }));
     }
 
     #[test]
@@ -680,12 +864,11 @@ mod tests {
         // 字符落点都不同，实测确实会踩上，所以都换新的 TestBackend，跟既有
         // 测试的写法保持一致。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        app.view = View::PickProject {
-            all: all.clone(),
+        app.view = View::PickProject(ProjectPicker {
             filter: String::new(),
-            state: st.clone(),
             typing_path: None,
-        };
+            ..ProjectPicker::new(all.clone(), std::path::PathBuf::from("/tmp"))
+        });
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
         let content: String = buffer_text(term.backend().buffer())
@@ -700,12 +883,11 @@ mod tests {
 
         // 过滤到无匹配：只剩兜底那一行，不能 panic
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        app.view = View::PickProject {
-            all: all.clone(),
+        app.view = View::PickProject(ProjectPicker {
             filter: "没有这个".to_string(),
-            state: st.clone(),
             typing_path: None,
-        };
+            ..ProjectPicker::new(all.clone(), std::path::PathBuf::from("/tmp"))
+        });
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
         let content: String = buffer_text(term.backend().buffer())
             .chars()
@@ -718,12 +900,11 @@ mod tests {
 
         // 手输态
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        app.view = View::PickProject {
-            all: all.clone(),
+        app.view = View::PickProject(ProjectPicker {
             filter: String::new(),
-            state: st.clone(),
             typing_path: Some("~/work/x".to_string()),
-        };
+            ..ProjectPicker::new(all.clone(), std::path::PathBuf::from("/tmp"))
+        });
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
         let content: String = buffer_text(term.backend().buffer())
             .chars()
@@ -736,12 +917,11 @@ mod tests {
 
         // 空列表（全新守护进程）也不能 panic
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        app.view = View::PickProject {
-            all: Vec::new(),
+        app.view = View::PickProject(ProjectPicker {
             filter: String::new(),
-            state: ListState::default(),
             typing_path: None,
-        };
+            ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+        });
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
     }
 }

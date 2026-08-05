@@ -487,10 +487,11 @@ pub fn run(
                 // 手输路径态：粘贴直接进输入框。从别处拷一条路径粘进来一步到位，
                 // 这是不做目录浏览器的底气。trim 掉换行——从终端或文件管理器
                 // 拷路径经常带一个尾随换行，不去掉会拼出一个不存在的目录。
-                View::PickProject {
-                    typing_path: Some(buf),
-                    ..
-                } => buf.push_str(text.trim()),
+                View::PickProject(p) if p.typing_path.is_some() => {
+                    if let Some(buf) = p.typing_path.as_mut() {
+                        buf.push_str(text.trim());
+                    }
+                }
                 // 密钥十有八九是粘进来的，不是敲的——用户拿到手的字符串通常带
                 // 引号、Bearer 前缀、尾随换行，clean_secret 统一洗一遍。
                 // Verifying 期间不接：那次验证已经把当时的 buf 发出去了，
@@ -544,7 +545,7 @@ pub fn run(
             match app.view.clone() {
                 View::Board => board::handle_key(&mut app, key)?,
                 View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
-                View::PickProject { .. } => pick::handle_key(&mut app, key)?,
+                View::PickProject(_) => pick::handle_key(&mut app, key)?,
                 View::Attached(_) => attach::handle_key(&mut app, key)?,
                 View::Grid { .. } => grid::handle_key(&mut app, key)?,
                 View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
@@ -784,6 +785,32 @@ fn join_warnings(
     )
 }
 
+/// 浮层占的那块地方：各方向取「终端的一大半」和一个上限里的较小者，居中。
+///
+/// 设上限是因为在一块 200 列的屏幕上，一个铺满 80% 的对话框反而更难扫——
+/// 眼睛要横跨整个屏幕才能把一行读完。
+///
+/// 终端小到放不下时**退化成全屏**，而不是显示一句「窗口太小」：选项目是
+/// 用户此刻非做不可的事，挡住他没有意义（跟九宫格不同——那一屏本来就是
+/// 「看一眼」，看不了就先别看）。
+fn popup_area(area: Rect) -> Rect {
+    // 再小就放不下两栏了：每栏各要两列边框，加上目录名和 git 标记。
+    // 比这还小的终端，浮层已经没有「浮」的意义——全屏给他。
+    const MIN_COLS: u16 = 40;
+    const MIN_ROWS: u16 = 8;
+    if area.width < MIN_COLS || area.height < MIN_ROWS {
+        return area;
+    }
+    let w = (area.width.saturating_mul(4) / 5).clamp(MIN_COLS, 100);
+    let h = (area.height.saturating_mul(3) / 4).clamp(MIN_ROWS, 24);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
 /// `g` 键：在列表和九宫格之间切换，并且**记住**。
 ///
 /// 两个模式共用这一个函数，切换和落盘绑在一起——分开写的话，某一边忘了
@@ -988,14 +1015,14 @@ pub(crate) fn open_project_picker(app: &mut App) {
             if !all.contains(&start) {
                 all.push(start);
             }
-            let mut state = ListState::default();
-            state.select(Some(0));
-            app.view = View::PickProject {
-                all,
-                filter: String::new(),
-                state,
-                typing_path: None,
-            };
+            // 浏览器从当前项目所在的位置开起：用户按 p 多半是想换到
+            // 「旁边那个」项目，从它的上一级开始找是最短的路。
+            let from = app
+                .current_dir
+                .parent()
+                .map(|x| x.to_path_buf())
+                .unwrap_or_else(|| app.current_dir.clone());
+            app.view = View::PickProject(crate::ui::view::ProjectPicker::new(all, from));
         }
         Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
         _ => {
@@ -1136,7 +1163,22 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Board => board::draw(f, chunks[0], app),
         View::Attached(_) => attach::draw(f, chunks[0], app),
         View::Grid { .. } => grid::draw(f, chunks[0], app),
-        View::PickProfile { .. } | View::PickProject { .. } => pick::draw(f, chunks[0], app),
+        View::PickProfile { .. } => pick::draw(f, chunks[0], app),
+        // 选项目是**浮层**：先照常画用户的家视图，再在中间盖一层。
+        // 背后留着看板是重点——用户要看得出自己只是叠了一层，Esc 一下
+        // 就回去了。全屏接管正是上一版被判为「混乱」的一部分。
+        View::PickProject(_) => {
+            let home = home_view(app);
+            let saved = std::mem::replace(&mut app.view, home);
+            match app.view {
+                View::Grid { .. } => grid::draw(f, chunks[0], app),
+                _ => board::draw(f, chunks[0], app),
+            }
+            app.view = saved;
+            let popup = popup_area(chunks[0]);
+            f.render_widget(ratatui::widgets::Clear, popup);
+            pick::draw(f, popup, app);
+        }
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
     }
@@ -1493,6 +1535,65 @@ mod tests {
         }
     }
 
+    /// 选项目是**浮层**不是全屏接管：画完之后，屏幕上必须**同时**看得到
+    /// 浮层的内容和背后的看板。上一版全屏接管，用户按 p 的那一刻整个
+    /// 界面消失，只剩一个几乎全空的框——这正是「完全是混乱的」的一部分。
+    #[test]
+    fn the_project_picker_is_an_overlay_not_a_takeover() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/proj");
+        app.sessions = vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/w/proj".into(),
+            state: SessionState::Idle,
+            activity: "背后的看板".into(),
+        }];
+        app.refresh_visible();
+        app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
+            vec!["/w/other".to_string()],
+            PathBuf::from("/w"),
+        ));
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+
+        assert!(c.contains("背后的看板"), "背后的看板必须还看得见：{c}");
+        assert!(c.contains("最近"), "浮层自己也要画出来：{c}");
+    }
+
+    /// 终端小到放不下浮层时退化成全屏，而不是显示一句「窗口太小」：
+    /// 选项目是用户此刻非做不可的事，挡住他没有意义。
+    #[test]
+    fn a_tiny_terminal_gets_the_picker_full_screen_rather_than_a_refusal() {
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        assert_eq!(popup_area(full), full);
+    }
+
+    /// 宽屏上浮层不该铺满：一个横跨 200 列的对话框，眼睛要扫过整个屏幕
+    /// 才能读完一行。
+    #[test]
+    fn a_wide_terminal_gets_a_bounded_centered_popup() {
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
+        let p = popup_area(full);
+        assert!(p.width <= 100, "宽度要有上限：{}", p.width);
+        assert!(p.height <= 24, "高度要有上限：{}", p.height);
+        assert!(p.x > 0 && p.y > 0, "要居中，不能贴边");
+        assert_eq!(p.x + p.width / 2, full.width / 2, "水平居中");
+    }
+
     #[test]
     fn escape_hint_cols_fits_every_view() {
         use unicode_width::UnicodeWidthStr;
@@ -1505,18 +1606,16 @@ mod tests {
                 state: ListState::default(),
                 warning: None,
             },
-            View::PickProject {
-                all: Vec::new(),
+            View::PickProject(crate::ui::view::ProjectPicker {
                 filter: String::new(),
-                state: ListState::default(),
                 typing_path: None,
-            },
-            View::PickProject {
-                all: Vec::new(),
+                ..crate::ui::view::ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+            }),
+            View::PickProject(crate::ui::view::ProjectPicker {
                 filter: String::new(),
-                state: ListState::default(),
                 typing_path: Some(String::new()),
-            },
+                ..crate::ui::view::ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+            }),
             View::Secrets {
                 entries: Vec::new(),
                 state: ListState::default(),

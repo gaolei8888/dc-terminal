@@ -134,6 +134,11 @@ pub enum Key {
     SettingsTitle,
     CurrentProject,
     ManualPath,
+    RecentProjects,
+    SwitchPane,
+    EnterFolder,
+    GoUp,
+    NoSubfolders,
     // —— 状态与提示 ——
     NoSessionsHere,
     NoSessionsAtAll,
@@ -244,6 +249,15 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         SettingsTitle => t!(lang, en: "Settings", zh: "设置"),
         CurrentProject => t!(lang, en: "Project", zh: "当前项目"),
         ManualPath => t!(lang, en: "Type a path…", zh: "手输路径…"),
+        RecentProjects => t!(lang, en: "Recent", zh: "最近"),
+        SwitchPane => t!(lang, en: "switch side", zh: "切换左右"),
+        EnterFolder => t!(lang, en: "open folder", zh: "进入文件夹"),
+        GoUp => t!(lang, en: "go up", zh: "上一级"),
+        NoSubfolders => t!(
+            lang,
+            en: "No folders here — press ← to go up",
+            zh: "这里没有文件夹，按 ← 回上一级",
+        ),
 
         NoSessionsHere => t!(
             lang,

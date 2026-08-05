@@ -30,15 +30,7 @@ pub(crate) enum View {
         /// 密钥文件读不了、自定义 profile 写错了。顶部红字。
         warning: Option<String>,
     },
-    PickProject {
-        /// 守护进程返回的完整列表，过滤不改动它
-        all: Vec<String>,
-        /// 用户打的字
-        filter: String,
-        state: ListState,
-        /// Some 表示正处在「手输路径」的输入态
-        typing_path: Option<String>,
-    },
+    PickProject(ProjectPicker),
     /// 设置页：目前只有语言一项。跟 `Secrets` 分开是两码事——那边管的是
     /// 「哪个 agent 用哪把密钥」，这里管的是界面本身怎么显示。
     Settings {
@@ -136,17 +128,11 @@ pub(crate) fn is_ctrl_q(key: &KeyEvent) -> bool {
 pub(crate) fn back_one_level(view: View) -> Option<View> {
     match view {
         View::Board => None,
-        View::PickProject {
-            all,
-            filter,
-            state,
-            typing_path: Some(_),
-        } => Some(View::PickProject {
-            all,
-            filter,
-            state,
+        // 手输态退一层是回到两栏那一屏，不是关掉整个选择器
+        View::PickProject(p) if p.typing_path.is_some() => Some(View::PickProject(ProjectPicker {
             typing_path: None,
-        }),
+            ..p
+        })),
         View::EnterSecret {
             return_to_settings: true,
             ..
@@ -381,6 +367,140 @@ pub(crate) fn filter_projects(all: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
+/// 哪一栏有焦点。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    Recent,
+    Browse,
+}
+
+/// 选项目那一层浮层的全部状态。
+///
+/// 收成一个结构体而不是继续在 `View::PickProject` 上平铺字段：字段从 4 个
+/// 涨到 8 个之后，每处 `match` 解构都要抄一长串，而且加一个字段就得改遍
+/// 所有分支。
+#[derive(Clone)]
+pub struct ProjectPicker {
+    /// 守护进程给的最近项目，过滤不改动它
+    pub recent: Vec<String>,
+    pub recent_state: ListState,
+    /// 浏览器现在停在哪个目录
+    pub cwd: PathBuf,
+    pub entries: Vec<DirRow>,
+    pub browse_state: ListState,
+    pub focus: Pane,
+    /// **只作用于当前焦点那一栏。** 两栏共用一个过滤词的话，用户在左边打字
+    /// 找项目，右边的目录列表会跟着变空，而他并没有要求那件事。
+    pub filter: String,
+    /// Some 表示正处在「手输路径」的输入态
+    pub typing_path: Option<String>,
+}
+
+impl ProjectPicker {
+    pub fn new(recent: Vec<String>, cwd: PathBuf) -> ProjectPicker {
+        let entries = list_dirs(&cwd);
+        let mut recent_state = ListState::default();
+        recent_state.select(Some(0));
+        let mut browse_state = ListState::default();
+        if !entries.is_empty() {
+            browse_state.select(Some(0));
+        }
+        ProjectPicker {
+            recent,
+            recent_state,
+            cwd,
+            entries,
+            browse_state,
+            // 开在「最近」那一栏：绝大多数时候用户要的项目就在里面，
+            // 浏览器是给「不在里面」那种情况准备的。
+            focus: Pane::Recent,
+            filter: String::new(),
+            typing_path: None,
+        }
+    }
+
+    /// 把浏览器挪到另一个目录，并把光标收回第一行——换了目录还留着旧行号，
+    /// 光标会落在一个跟刚才毫无关系的条目上。
+    pub fn browse_to(&mut self, dir: PathBuf) {
+        self.entries = list_dirs(&dir);
+        self.cwd = dir;
+        self.browse_state.select(if self.entries.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        // 过滤词是对着上一个目录打的，换了目录就不成立了
+        self.filter.clear();
+    }
+
+    /// 当前焦点那一栏里，过滤之后真正显示的行。
+    pub fn shown_recent(&self) -> Vec<String> {
+        match self.focus {
+            Pane::Recent => filter_projects(&self.recent, &self.filter),
+            Pane::Browse => self.recent.clone(),
+        }
+    }
+
+    pub fn shown_entries(&self) -> Vec<DirRow> {
+        match self.focus {
+            Pane::Browse if !self.filter.is_empty() => {
+                let f = self.filter.to_lowercase();
+                self.entries
+                    .iter()
+                    .filter(|r| r.name.to_lowercase().contains(&f))
+                    .cloned()
+                    .collect()
+            }
+            _ => self.entries.clone(),
+        }
+    }
+}
+
+/// 目录浏览器里的一行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirRow {
+    pub name: String,
+    /// 是不是 git 仓库。**只是个提示标记，不是准入判断**——真正的判断在
+    /// `session.rs` 建会话的时候。
+    pub is_git: bool,
+}
+
+/// 这些目录不进浏览器。它们不是「被隐藏的内容」，而是本来就不该出现的噪音：
+/// 目标用户是非程序员，`node_modules` 出现在选项目的列表里对他既没有意义
+/// 也没有用处（见 `dc_classroom/CLAUDE.md` 的目标用户约束）。
+const NOISE_DIRS: &[&str] = &["node_modules", "target", "build", "dist", "vendor"];
+
+/// 列出一个目录下**可以当项目选**的子目录，按名字排序。
+///
+/// 读不了（权限、目录没了）就返回空表，不报错：用户可能浏览到任何地方，
+/// 一个进不去的目录不该让整个界面倒下。调用方拿空表去显示「这里没有目录」，
+/// 跟真的空目录同一个落点——对用户来说这两种情况能做的事完全一样。
+///
+/// **判 git 用 `stat` 而不是 `git::is_repo`**：后者要 fork 一个 git 进程，
+/// 一个目录几十个子目录就是几十次 fork，翻目录会明显发卡。stat 判得没那么全
+/// （worktree、`GIT_DIR` 都会漏），但这只是个提示标记。
+pub(crate) fn list_dirs(dir: &Path) -> Vec<DirRow> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<DirRow> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || NOISE_DIRS.contains(&name.as_str()) {
+                return None;
+            }
+            let is_git = e.path().join(".git").exists();
+            Some(DirRow { name, is_git })
+        })
+        .collect();
+    // read_dir 的顺序由文件系统决定；不排的话同一个目录每次打开都可能换序，
+    // 用户没法靠位置记住东西在哪。
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
 /// 看板的两种画法。它们是**平级**的，不是「列表 + 一个附属页面」——
 /// 所以 `q` 在两边都退出 dct、`Ctrl+Q` 在两边都无事可做（已经在顶层），
 /// 而所有「回看板」的落点都得回到用户选的这一个（见 `mod.rs` 的 `home_view`）。
@@ -515,10 +635,7 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
     use crate::i18n::{text, Key};
     match view {
         View::Board => format!("q {}", text(Key::Quit, lang)),
-        View::PickProject {
-            typing_path: Some(_),
-            ..
-        } => text(Key::BackToList, lang).to_string(),
+        View::PickProject(p) if p.typing_path.is_some() => text(Key::BackToList, lang).to_string(),
         // 跟 back_one_level 保持一致：从密钥设置页进来的填密钥，退出回设置页，
         // 不是选择器，也不是看板——三条路各回各的，文案不能含糊成一句话。
         View::EnterSecret {
@@ -573,16 +690,18 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
             ],
             lang,
         ),
-        View::PickProject {
-            typing_path: Some(_),
-            ..
-        } => help_line(
+        View::PickProject(p) if p.typing_path.is_some() => help_line(
             &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
             lang,
         ),
-        View::PickProject { .. } => help_line(
+        // 目录浏览器的三个键（Tab/→/←）必须写出来：它们是这一层唯一
+        // 「学过才知道」的部分，不写就等于没做浏览器。
+        View::PickProject(_) => help_line(
             &[
+                ("Tab", Key::SwitchPane),
                 ("↑↓", Key::Select),
+                ("→", Key::EnterFolder),
+                ("←", Key::GoUp),
                 ("Enter", Key::Confirm),
                 ("", Key::TypeToFilter),
                 ("Esc", Key::Cancel),
@@ -730,12 +849,11 @@ mod tests {
             Some(View::Board)
         ));
         assert!(matches!(
-            back_one_level(View::PickProject {
-                all: Vec::new(),
+            back_one_level(View::PickProject(ProjectPicker {
                 filter: String::new(),
-                state: ListState::default(),
                 typing_path: None,
-            }),
+                ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+            })),
             Some(View::Board)
         ));
     }
@@ -743,22 +861,16 @@ mod tests {
     #[test]
     fn ctrl_q_leaves_the_typing_state_before_leaving_the_picker() {
         // 手输路径态退一层是回列表，不是一步退回看板
-        let back = back_one_level(View::PickProject {
-            all: vec!["/tmp/a".into()],
+        let back = back_one_level(View::PickProject(ProjectPicker {
             filter: "a".into(),
-            state: ListState::default(),
             typing_path: Some("/tmp/b".into()),
-        });
+            ..ProjectPicker::new(vec!["/tmp/a".into()], std::path::PathBuf::from("/tmp"))
+        }));
         match back {
-            Some(View::PickProject {
-                typing_path,
-                filter,
-                all,
-                ..
-            }) => {
-                assert_eq!(typing_path, None, "应当退出手输态");
-                assert_eq!(filter, "a", "退一层不该顺手清掉过滤词");
-                assert_eq!(all, vec!["/tmp/a".to_string()], "项目列表不该丢");
+            Some(View::PickProject(p)) => {
+                assert_eq!(p.typing_path, None, "应当退出手输态");
+                assert_eq!(p.filter, "a", "退一层不该顺手清掉过滤词");
+                assert_eq!(p.recent, vec!["/tmp/a".to_string()], "项目列表不该丢");
             }
             other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
         }
@@ -817,6 +929,23 @@ mod tests {
             "q 退出",
             "九宫格也是家，不是列表的下一层"
         );
+    }
+
+    /// 目录浏览器的三个键必须写在屏幕上。它们是这一层唯一「学过才知道」
+    /// 的部分——不写就等于做了个浏览器但没人知道怎么用。
+    #[test]
+    fn the_browser_advertises_its_three_keys() {
+        let help = idle_help(
+            &View::PickProject(ProjectPicker::new(
+                Vec::new(),
+                std::path::PathBuf::from("/tmp"),
+            )),
+            Scope::CurrentProject,
+            Lang::Zh,
+        );
+        for k in ["Tab 切换左右", "→ 进入文件夹", "← 上一级"] {
+            assert!(help.contains(k), "帮助行少了「{k}」：{help}");
+        }
     }
 
     /// `g` 在两个模式里都真的管用，所以两边的帮助行都得写出来。
@@ -976,6 +1105,63 @@ mod tests {
         );
     }
 
+    /// 浏览器只列目录，而且要把「本来就不该出现的东西」挡掉：`.` 开头的
+    /// 隐藏目录、依赖目录、构建产物。目标用户是非程序员，`node_modules`
+    /// 出现在选项目的列表里对他既没有意义也没有用处。
+    #[test]
+    fn browsing_lists_only_meaningful_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["proj", "node_modules", "target", ".hidden", ".git", "dist"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        std::fs::write(tmp.path().join("readme.md"), "x").unwrap();
+
+        let rows = list_dirs(tmp.path());
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["proj"],
+            "只该剩下真正的项目目录"
+        );
+    }
+
+    /// 目录按名字排序。`read_dir` 的顺序由文件系统决定，不排的话同一个
+    /// 目录每次打开都可能换序，用户没法靠位置记住东西在哪。
+    #[test]
+    fn browsing_sorts_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["zeta", "alpha", "Mid"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        let names: Vec<String> = list_dirs(tmp.path()).into_iter().map(|r| r.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "顺序必须稳定，不能听文件系统的");
+    }
+
+    /// git 仓库要标出来——agent 会话要求项目是 git 仓库（`session.rs`），
+    /// 在选之前就看得见，省掉一次注定失败的尝试。
+    #[test]
+    fn browsing_marks_git_repositories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+
+        let rows = list_dirs(tmp.path());
+        let git_of = |n: &str| rows.iter().find(|r| r.name == n).unwrap().is_git;
+        assert!(git_of("repo"), "有 .git 的要标出来");
+        assert!(!git_of("plain"), "没有的不能标");
+    }
+
+    /// 读不了的目录返回空表，不 panic。用户可能浏览到任何地方，
+    /// 一个没权限的目录不该让整个 dct 倒下。
+    #[test]
+    fn browsing_an_unreadable_directory_yields_nothing_instead_of_panicking() {
+        assert!(list_dirs(std::path::Path::new("/definitely/not/here/dct")).is_empty());
+    }
+
     #[test]
     fn filter_projects_is_case_insensitive_substring() {
         let all = vec![
@@ -1074,24 +1260,22 @@ mod tests {
         );
         assert_eq!(
             escape_hint(
-                &View::PickProject {
-                    all: Vec::new(),
+                &View::PickProject(ProjectPicker {
                     filter: String::new(),
-                    state: ListState::default(),
                     typing_path: None,
-                },
+                    ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+                }),
                 Lang::Zh
             ),
             "Ctrl+Q 回看板"
         );
         assert_eq!(
             escape_hint(
-                &View::PickProject {
-                    all: Vec::new(),
+                &View::PickProject(ProjectPicker {
                     filter: String::new(),
-                    state: ListState::default(),
                     typing_path: Some(String::new()),
-                },
+                    ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+                }),
                 Lang::Zh
             ),
             "Ctrl+Q 回列表"
