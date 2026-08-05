@@ -214,9 +214,11 @@ impl App {
     /// 报「守护进程连不上」——跟真实断线共用同一条错误路径，调用方不用
     /// 为“压根没连过”单独判一次。
     pub fn client(&mut self) -> Result<&mut Client> {
+        // 先抄一份：`self.client.as_mut()` 之后就不能再读 `self` 的别的字段了
+        let lang = self.lang;
         self.client
             .as_mut()
-            .ok_or_else(|| anyhow!("守护进程连不上"))
+            .ok_or_else(|| anyhow!(crate::i18n::text(crate::i18n::Key::DaemonUnreachable, lang)))
     }
 }
 

@@ -143,6 +143,41 @@ pub enum Key {
     NoSessionSelected,
     DaemonUnreachable,
     StaleData,
+    // —— 会话状态（看板与九宫格的状态列）——
+    StatusWorking,
+    StatusAsking,
+    StatusIdle,
+    StatusStopped,
+    StatusUnknown,
+    // —— 密钥页 ——
+    SecretsTitle,
+    SecretSet,
+    SecretUnset,
+    OpenSignupPage,
+    NothingToDelete,
+    PressDAgainToDelete,
+    SecretNotSaved,
+    SecretNotDeleted,
+    VerifyingShort,
+    BadSecret,
+    NetworkUnreachable,
+    // —— 各种失败 ——
+    CreateFailed,
+    CannotOpenInstallWindow,
+    NoPathTyped,
+    CannotListAgents,
+    CannotListSecrets,
+    CannotListProjects,
+    SessionOpenFailed,
+    PasteNotSent,
+    InputNotSent,
+    DaemonTooOld,
+    RequestFailed,
+    ActionDone,
+    NoChanges,
+    // —— 选择器里的「为什么用不了」——
+    ReasonNeedsSecret,
+    ReasonNotInstalled,
 }
 
 pub fn text(k: Key, lang: Lang) -> &'static str {
@@ -240,6 +275,91 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Cannot reach the dct service",
             zh: "守护进程连不上",
         ),
+        StatusWorking => t!(lang, en: "working", zh: "干活中"),
+        StatusAsking => t!(lang, en: "asking you", zh: "等你回答"),
+        StatusIdle => t!(lang, en: "idle", zh: "空闲"),
+        StatusStopped => t!(lang, en: "stopped", zh: "已停止"),
+        StatusUnknown => t!(lang, en: "—", zh: "—"),
+
+        SecretsTitle => t!(lang, en: "Keys", zh: "密钥设置"),
+        SecretSet => t!(lang, en: "set", zh: "已配"),
+        SecretUnset => t!(lang, en: "not set", zh: "未配"),
+        OpenSignupPage => t!(
+            lang,
+            en: "Ctrl+O opens the sign-up page",
+            zh: "Ctrl+O 打开申领页面",
+        ),
+        NothingToDelete => t!(
+            lang,
+            en: "No key is set here, so there is nothing to delete",
+            zh: "这个还没配密钥，没什么可删的",
+        ),
+        PressDAgainToDelete => t!(
+            lang,
+            en: "press d again to delete, any other key cancels",
+            zh: "再按 d 删除，按其他键取消",
+        ),
+        SecretNotSaved => {
+            t!(lang, en: "The key was not saved — try again", zh: "密钥没存上，再试一次")
+        }
+        SecretNotDeleted => t!(
+            lang,
+            en: "The key was not deleted — try again",
+            zh: "密钥没删掉，再试一次",
+        ),
+        VerifyingShort => t!(lang, en: "Checking…", zh: "正在验证…"),
+        BadSecret => t!(
+            lang,
+            en: "That key does not work — it may have been copied incompletely",
+            zh: "这个密钥用不了，可能是复制的时候少了一段",
+        ),
+        NetworkUnreachable => t!(
+            lang,
+            en: "Cannot reach the server — check your network",
+            zh: "连不上服务器，检查一下网络",
+        ),
+
+        CreateFailed => t!(lang, en: "Could not create the session", zh: "创建失败"),
+        CannotOpenInstallWindow => t!(
+            lang,
+            en: "Could not open the install window",
+            zh: "开不了安装窗口",
+        ),
+        NoPathTyped => t!(lang, en: "No path typed yet", zh: "还没输入路径"),
+        CannotListAgents => t!(lang, en: "Could not load the agent list", zh: "拿不到 agent 列表"),
+        CannotListSecrets => t!(lang, en: "Could not load the key list", zh: "拿不到密钥列表"),
+        CannotListProjects => t!(
+            lang,
+            en: "Could not load the project list",
+            zh: "拿不到项目列表",
+        ),
+        SessionOpenFailed => t!(
+            lang,
+            en: "Could not open the session — try again",
+            zh: "开不了会话，再试一次",
+        ),
+        PasteNotSent => t!(
+            lang,
+            en: "Cannot reach the dct service — what you pasted was not sent",
+            zh: "守护进程连不上，粘贴的内容没发出去",
+        ),
+        InputNotSent => t!(
+            lang,
+            en: "Cannot reach the dct service — that keystroke was not sent",
+            zh: "守护进程连不上，刚才那次输入没发出去",
+        ),
+        DaemonTooOld => t!(
+            lang,
+            en: "The background service is an older version and cannot show the screen. Quit dct and open it again.",
+            zh: "后台服务是旧版本，看不到画面。退出 dct 再重新打开就好",
+        ),
+        RequestFailed => t!(lang, en: "That did not work", zh: "请求失败"),
+        ActionDone => t!(lang, en: "Done", zh: "完成"),
+        NoChanges => t!(lang, en: "No changes", zh: "没有改动"),
+
+        ReasonNeedsSecret => t!(lang, en: "(no key yet)", zh: "（未填密钥）"),
+        ReasonNotInstalled => t!(lang, en: "(not installed)", zh: "（未安装）"),
+
         StaleData => t!(
             lang,
             en: "Cannot reach the dct service — what you see may be out of date",
@@ -308,6 +428,81 @@ pub mod msg {
             lang,
             en: format!("{command} was not found on this machine"),
             zh: format!("本机没有找到 {command}"),
+        )
+    }
+
+    pub fn secret_saved(lang: Lang, label: &str) -> String {
+        t!(lang, en: format!("Saved the key for {label}"), zh: format!("已保存 {label} 的密钥"))
+    }
+
+    pub fn secret_deleted(lang: Lang, label: &str) -> String {
+        t!(lang, en: format!("Deleted the key for {label}"), zh: format!("已删除 {label} 的密钥"))
+    }
+
+    pub fn confirm_delete_secret(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("Press d again to delete the key for {label}, any other key cancels"),
+            zh: format!("再按一次 d 删除 {label} 的密钥，按其他键取消"),
+        )
+    }
+
+    /// 标题里必须带上「Esc 回哪」，而且分设置页/选择器两种。
+    ///
+    /// 这半句一度被合并掉，理由是底栏的 `idle_help` 已经说了——但那两处画在
+    /// 不同的区域，密钥页这一屏自己看不到底栏。更要紧的是 `escape_hint` 和
+    /// 标题必须**互相印证**：底栏说什么就得真能做到什么，标题跟着一起说，
+    /// 才不会出现一处说设置、一处还写着旧的「列表」。
+    pub fn enter_secret_title(lang: Lang, label: &str, to_settings: bool) -> String {
+        let back = text(
+            if to_settings {
+                Key::BackToSettingsWord
+            } else {
+                Key::BackToListWord
+            },
+            lang,
+        );
+        let confirm = text(Key::Confirm, lang);
+        t!(
+            lang,
+            en: format!("Key for {label} (Enter {confirm}, Esc {back})"),
+            zh: format!("填 {label} 的密钥（Enter {confirm}，Esc {back}）"),
+        )
+    }
+
+    pub fn cannot_open_browser(lang: Lang, url: &str) -> String {
+        t!(
+            lang,
+            en: format!("Could not open a browser — visit {url} yourself"),
+            zh: format!("打不开浏览器，自己去访问 {url}"),
+        )
+    }
+
+    pub fn installing(lang: Lang, profile: &str) -> String {
+        t!(
+            lang,
+            en: format!("Installing {profile}. When it finishes, press Ctrl+Q then N."),
+            zh: format!("正在安装 {profile}，装完按 Ctrl+Q 回看板再按 N"),
+        )
+    }
+
+    pub fn reason_needs_dependency(lang: Lang, label: &str) -> String {
+        t!(lang, en: format!("(install {label} first)"), zh: format!("（需要先装 {label}）"))
+    }
+
+    pub fn session_title(lang: Lang, id: u32, project: &str) -> String {
+        t!(
+            lang,
+            en: format!("Session {id} · {project} —— F2 goes back"),
+            zh: format!("会话 {id} · {project} —— F2 返回看板"),
+        )
+    }
+
+    pub fn session_title_disconnected(lang: Lang, id: u32, project: &str) -> String {
+        t!(
+            lang,
+            en: format!("Session {id} · {project} (disconnected, may be out of date) —— F2 goes back"),
+            zh: format!("会话 {id} · {project}（连接已断开，画面可能过期）—— F2 返回看板"),
         )
     }
 
@@ -384,6 +579,37 @@ mod tests {
             NoSessionSelected,
             DaemonUnreachable,
             StaleData,
+            StatusWorking,
+            StatusAsking,
+            StatusIdle,
+            StatusStopped,
+            StatusUnknown,
+            SecretsTitle,
+            SecretSet,
+            SecretUnset,
+            OpenSignupPage,
+            NothingToDelete,
+            PressDAgainToDelete,
+            SecretNotSaved,
+            SecretNotDeleted,
+            VerifyingShort,
+            BadSecret,
+            NetworkUnreachable,
+            CreateFailed,
+            CannotOpenInstallWindow,
+            NoPathTyped,
+            CannotListAgents,
+            CannotListSecrets,
+            CannotListProjects,
+            SessionOpenFailed,
+            PasteNotSent,
+            InputNotSent,
+            DaemonTooOld,
+            RequestFailed,
+            ActionDone,
+            NoChanges,
+            ReasonNeedsSecret,
+            ReasonNotInstalled,
         ]
     };
 
@@ -417,7 +643,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 50, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 81, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

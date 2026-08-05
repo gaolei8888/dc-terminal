@@ -60,7 +60,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         };
         // 四条分支的落点：pick_action 只是个纯函数分类器，真正
         // 建会话/开安装窗口这些带副作用的活儿在这里做。
-        app.view = match chosen.map(|i| (i, pick_action(&entries[i]))) {
+        app.view = match chosen.map(|i| (i, pick_action(&entries[i], app.lang))) {
             None => View::PickProfile {
                 entries,
                 state,
@@ -93,7 +93,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                         }
                     }
                     _ => {
-                        app.message = Msg::err("创建失败".into());
+                        app.message = Msg::err(text(Key::CreateFailed, app.lang).into());
                         View::PickProfile {
                             entries,
                             state,
@@ -142,13 +142,12 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                         let _ = app
                             .client()
                             .and_then(|c| c.call(Request::Input { id, text: line }));
-                        app.message =
-                            format!("正在安装 {profile}，装完按 Ctrl+Q 回看板再按 N").into();
+                        app.message = msg::installing(app.lang, &profile).into();
                         app.need_sessions = true;
                         View::Attached(id)
                     }
                     _ => {
-                        app.message = Msg::err("开不了安装窗口".into());
+                        app.message = Msg::err(text(Key::CannotOpenInstallWindow, app.lang).into());
                         View::PickProfile {
                             entries,
                             state,
@@ -201,7 +200,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                     // expand_path("", base) 会解析成 base 自己（非绝对路径走
                     // base.join("")），is_dir() 照样为真——空输入不挡住的话，
                     // 用户在这一步犹豫多按一次 Enter，就会被无声切回启动目录。
-                    app.message = Msg::err("还没输入路径".into());
+                    app.message = Msg::err(text(Key::NoPathTyped, app.lang).into());
                     app.view = View::PickProject {
                         all,
                         filter,
@@ -364,11 +363,13 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
             };
             let reason = match &e.status {
                 ProfileStatus::Ready => String::new(),
-                ProfileStatus::NeedsSecret => "（未填密钥）".into(),
+                ProfileStatus::NeedsSecret => text(Key::ReasonNeedsSecret, app.lang).into(),
                 ProfileStatus::NeedsDependency { label } => {
-                    format!("（需要先装 {label}）")
+                    msg::reason_needs_dependency(app.lang, label)
                 }
-                ProfileStatus::NotInstalled { .. } => "（未安装）".into(),
+                ProfileStatus::NotInstalled { .. } => {
+                    text(Key::ReasonNotInstalled, app.lang).into()
+                }
             };
             // 不可用的整行压暗，不只是把原因压暗——用户是先看名字再看原因的，
             // 名字亮着会让他先以为能用
@@ -455,7 +456,7 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| short.clone());
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{:<20}", truncate(&name, 20))),
+                    Span::raw(pad_to(&truncate(&name, 20), 20)),
                     Span::styled(truncate(&short, 50), dim()),
                 ]))
             })

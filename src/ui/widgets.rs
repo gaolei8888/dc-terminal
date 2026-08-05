@@ -5,14 +5,18 @@ use crate::session::SessionState;
 
 use super::dim;
 
-pub fn status_label(s: SessionState) -> &'static str {
-    match s {
-        SessionState::Working => "干活中",
-        SessionState::Asking => "等你回答",
-        SessionState::Idle => "空闲",
-        SessionState::Stopped => "已停止",
-        SessionState::Unknown => "—",
-    }
+pub fn status_label(s: SessionState, lang: crate::i18n::Lang) -> &'static str {
+    use crate::i18n::{text, Key};
+    text(
+        match s {
+            SessionState::Working => Key::StatusWorking,
+            SessionState::Asking => Key::StatusAsking,
+            SessionState::Idle => Key::StatusIdle,
+            SessionState::Stopped => Key::StatusStopped,
+            SessionState::Unknown => Key::StatusUnknown,
+        },
+        lang,
+    )
 }
 
 /// 状态在界面上的样式。返回 `Style` 而不是 `Color`：Stopped/Unknown 要用
@@ -284,16 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn status_labels_are_chinese() {
-        assert_eq!(status_label(SessionState::Working), "干活中");
-        assert_eq!(status_label(SessionState::Asking), "等你回答");
-        assert_eq!(status_label(SessionState::Idle), "空闲");
-        assert_eq!(status_label(SessionState::Stopped), "已停止");
+    fn status_labels_are_translated() {
+        use crate::i18n::Lang;
+        assert_eq!(status_label(SessionState::Working, Lang::Zh), "干活中");
+        assert_eq!(status_label(SessionState::Working, Lang::En), "working");
+        assert_eq!(status_label(SessionState::Asking, Lang::Zh), "等你回答");
+        assert_eq!(status_label(SessionState::Idle, Lang::Zh), "空闲");
+        assert_eq!(status_label(SessionState::Stopped, Lang::Zh), "已停止");
     }
 
     #[test]
     fn unknown_state_shows_a_dash() {
-        assert_eq!(status_label(SessionState::Unknown), "—");
+        assert_eq!(
+            status_label(SessionState::Unknown, crate::i18n::Lang::Zh),
+            "—"
+        );
     }
 
     #[test]

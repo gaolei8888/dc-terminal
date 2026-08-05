@@ -185,12 +185,12 @@ pub enum PickAction {
 
 /// 按下某一项时该干什么。抽成纯函数是为了能单测——`run()` 的按键循环
 /// 要连真 socket，测不了（同 `back_one_level`）。
-pub fn pick_action(e: &ProfileEntry) -> PickAction {
+pub fn pick_action(e: &ProfileEntry, lang: Lang) -> PickAction {
     match &e.status {
         ProfileStatus::Ready => PickAction::Start(e.name.clone()),
         ProfileStatus::NeedsSecret => PickAction::AskSecret(0),
         ProfileStatus::NeedsDependency { label } => {
-            PickAction::Blocked(format!("要先装 {label} 才能用 {}", e.label))
+            PickAction::Blocked(crate::i18n::msg::needs_dependency(lang, label, &e.label))
         }
         ProfileStatus::NotInstalled { command } => match &e.install {
             Some(i) => PickAction::Install {
@@ -203,9 +203,9 @@ pub fn pick_action(e: &ProfileEntry) -> PickAction {
             // 干脆点名是这个 profile 本身没配置要跑什么，而不是暗示去装一个
             // 不存在的空名字命令。
             None if command.is_empty() => {
-                PickAction::Blocked(format!("{} 没配置要运行的程序，用不了", e.label))
+                PickAction::Blocked(crate::i18n::msg::no_command_configured(lang, &e.label))
             }
-            None => PickAction::Blocked(format!("本机没有找到 {command}")),
+            None => PickAction::Blocked(crate::i18n::msg::command_not_found(lang, command)),
         },
     }
 }
@@ -309,11 +309,13 @@ pub fn clean_secret(s: &str) -> String {
 /// `Unreachable` 必须说网络的问题，不能说密钥的问题——用户的密钥可能
 /// 完全没问题，只是这台机器连不上服务器；把锅甩给密钥会让他白跑一趟
 /// 去重新生成一个根本不需要换的 key。
-pub fn verify_message(o: VerifyOutcome) -> Option<String> {
+pub fn verify_message(o: VerifyOutcome, lang: Lang) -> Option<String> {
     match o {
         VerifyOutcome::Ok => None,
-        VerifyOutcome::BadKey => Some("这个密钥用不了，可能是复制的时候少了一段".into()),
-        VerifyOutcome::Unreachable => Some("连不上服务器，检查一下网络".into()),
+        VerifyOutcome::BadKey => Some(crate::i18n::text(crate::i18n::Key::BadSecret, lang).into()),
+        VerifyOutcome::Unreachable => {
+            Some(crate::i18n::text(crate::i18n::Key::NetworkUnreachable, lang).into())
+        }
     }
 }
 
@@ -457,9 +459,9 @@ pub(crate) fn message_after_transition(
 /// 用的 agent 里踢出去，比空白页糟得多。
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`idle_help`、`back_one_level`）。
-pub(crate) fn session_ended_notice(id: u32, state: SessionState) -> Option<String> {
+pub(crate) fn session_ended_notice(id: u32, state: SessionState, lang: Lang) -> Option<String> {
     match state {
-        SessionState::Stopped => Some(format!("会话 {id} 已结束，回到看板。按 n 再建一个")),
+        SessionState::Stopped => Some(crate::i18n::msg::session_ended(lang, id)),
         _ => None,
     }
 }
@@ -971,7 +973,8 @@ mod tests {
     /// 底栏还写着「其余按键都发给 agent」，而键全掉进死掉的 pty。
     #[test]
     fn stopped_session_sends_the_user_back_to_the_board() {
-        let notice = session_ended_notice(4, SessionState::Stopped).expect("Stopped 必须回看板");
+        let notice =
+            session_ended_notice(4, SessionState::Stopped, Lang::Zh).expect("Stopped 必须回看板");
         assert!(notice.contains('4'), "提示要说清是哪个会话结束了：{notice}");
     }
 
@@ -987,7 +990,7 @@ mod tests {
             SessionState::Unknown,
         ] {
             assert_eq!(
-                session_ended_notice(1, state),
+                session_ended_notice(1, state, Lang::Zh),
                 None,
                 "{state:?} 不该被当成已结束"
             );
@@ -1086,13 +1089,16 @@ mod tests {
     #[test]
     fn ready_entry_starts_a_session() {
         let e = entry("claude", ProfileStatus::Ready);
-        assert!(matches!(pick_action(&e), PickAction::Start(n) if n == "claude"));
+        assert!(matches!(pick_action(&e, Lang::Zh), PickAction::Start(n) if n == "claude"));
     }
 
     #[test]
     fn needs_secret_entry_opens_the_secret_view() {
         let e = entry("kimi", ProfileStatus::NeedsSecret);
-        assert!(matches!(pick_action(&e), PickAction::AskSecret(_)));
+        assert!(matches!(
+            pick_action(&e, Lang::Zh),
+            PickAction::AskSecret(_)
+        ));
     }
 
     #[test]
@@ -1112,7 +1118,7 @@ mod tests {
             ],
             note: String::new(),
         });
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Install { profile, command } => {
                 assert_eq!(profile, "codex");
                 assert_eq!(command[0], "npm");
@@ -1129,7 +1135,7 @@ mod tests {
                 command: "weird".into(),
             },
         );
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Blocked(msg) => {
                 assert!(msg.contains("weird"), "要说清是哪个命令找不到：{msg}");
                 assert!(!msg.contains("PATH"), "别对非程序员说 PATH");
@@ -1149,7 +1155,7 @@ mod tests {
                 command: String::new(),
             },
         );
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Blocked(msg) => {
                 assert!(msg.contains("weird"), "要点名是哪个 profile：{msg}");
                 assert!(
@@ -1169,7 +1175,7 @@ mod tests {
                 label: "Claude".into(),
             },
         );
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Blocked(msg) => {
                 assert!(msg.contains("Claude"), "要点名先装什么：{msg}");
             }
@@ -1304,14 +1310,14 @@ mod tests {
 
     #[test]
     fn bad_key_gets_a_human_message() {
-        let m = verify_message(VerifyOutcome::BadKey).unwrap();
+        let m = verify_message(VerifyOutcome::BadKey, Lang::Zh).unwrap();
         assert!(m.contains("密钥"));
         assert!(!m.contains("401"), "别把状态码甩给用户：{m}");
     }
 
     #[test]
     fn unreachable_blames_the_network_not_the_key() {
-        let m = verify_message(VerifyOutcome::Unreachable).unwrap();
+        let m = verify_message(VerifyOutcome::Unreachable, Lang::Zh).unwrap();
         assert!(
             m.contains("网络"),
             "连不上要说是网络，不能让用户去怀疑密钥：{m}"
@@ -1320,7 +1326,7 @@ mod tests {
 
     #[test]
     fn ok_has_no_message() {
-        assert!(verify_message(VerifyOutcome::Ok).is_none());
+        assert!(verify_message(VerifyOutcome::Ok, Lang::Zh).is_none());
     }
 
     // ———— CRITICAL 1（最终整分支 code review）：验证结果不能套错屏幕 ————

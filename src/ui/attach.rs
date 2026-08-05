@@ -49,7 +49,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             .and_then(|c| c.call(Request::Input { id, text }))
             .is_err()
         {
-            app.message = Msg::err("守护进程连不上，刚才那次输入没发出去".into());
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::InputNotSent, app.lang).into());
         }
     }
     Ok(())
@@ -76,9 +77,9 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|s| short_path(&s.dir))
         .unwrap_or_default();
     let title = if app.connected {
-        format!("会话 {id} · {project} —— F2 返回看板")
+        crate::i18n::msg::session_title(app.lang, id, &project)
     } else {
-        format!("会话 {id} · {project}（连接已断开，画面可能过期）—— F2 返回看板")
+        crate::i18n::msg::session_title_disconnected(app.lang, id, &project)
     };
     f.render_widget(
         Paragraph::new(screen_to_lines(&app.screen)).block(

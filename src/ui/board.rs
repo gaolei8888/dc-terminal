@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use super::app::App;
 use super::view::{is_plain_key, Scope, View};
-use super::widgets::{short_path, status_label, status_style, truncate};
+use super::widgets::{pad_to, short_path, status_label, status_style, truncate};
 use super::{
     dim, move_sel, open_new_session, open_project_picker, open_secrets, selected, session_action,
 };
@@ -89,14 +89,14 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             let mut spans = vec![
                 Span::raw(format!("{:>3}  ", s.id)),
                 Span::styled(
-                    format!("{:<8}", status_label(s.state)),
+                    pad_to(status_label(s.state, app.lang), 8),
                     status_style(s.state),
                 ),
-                Span::raw(format!("{:<10}", s.profile)),
+                Span::raw(pad_to(&s.profile, 10)),
             ];
             if show_dir {
                 spans.push(Span::styled(
-                    format!("{:<22}", truncate(&short_path(&s.dir), 22)),
+                    pad_to(&truncate(&short_path(&s.dir), 22), 22),
                     dim(),
                 ));
             }

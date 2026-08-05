@@ -206,7 +206,7 @@ pub fn run(
                     // 扔掉，不切视图——套在一个不相干的 profile/密钥上
                     // 比什么都不做更危险（见 CRITICAL 1 的复现步骤）。
                     if verify_outcome_applies_to(&sent_profile, &sent_buf, &profile, &buf) {
-                        app.view = match verify_message(outcome) {
+                        app.view = match verify_message(outcome, app.lang) {
                             Some(m) => View::EnterSecret {
                                 profile,
                                 label,
@@ -243,7 +243,8 @@ pub fn run(
                                     // 「已配」，但删除那条路径有「已删除 X 的密钥」
                                     // 的消息条打底，改密钥这条路径原来什么都不说，
                                     // 是同一对镜像操作里唯一没反馈的一半——补齐。
-                                    app.message = format!("已保存 {label} 的密钥").into();
+                                    app.message =
+                                        crate::i18n::msg::secret_saved(app.lang, &label).into();
                                     refetch_secrets(&mut app, Some(&profile))
                                 }
                                 Ok(Response::Ok) => {
@@ -273,7 +274,11 @@ pub fn run(
                                             prompt,
                                             buf,
                                             phase: SecretPhase::Failed(
-                                                "开不了会话，再试一次".into(),
+                                                crate::i18n::text(
+                                                    crate::i18n::Key::SessionOpenFailed,
+                                                    app.lang,
+                                                )
+                                                .into(),
                                             ),
                                             return_to_settings,
                                         },
@@ -292,7 +297,13 @@ pub fn run(
                                     label,
                                     prompt,
                                     buf,
-                                    phase: SecretPhase::Failed("密钥没存上，再试一次".into()),
+                                    phase: SecretPhase::Failed(
+                                        crate::i18n::text(
+                                            crate::i18n::Key::SecretNotSaved,
+                                            app.lang,
+                                        )
+                                        .into(),
+                                    ),
                                     return_to_settings,
                                 },
                             },
@@ -370,7 +381,7 @@ pub fn run(
                     // 成了假话**，那时必须改成把 Error 里的原文说给用户听。
                     Ok(Response::Error(_)) => {
                         app.message = Msg::err(
-                            "后台服务是旧版本，看不到画面。退出 dct 再重新打开就好".into(),
+                            crate::i18n::text(crate::i18n::Key::DaemonTooOld, app.lang).into(),
                         );
                         app.view = View::Board;
                         app.need_sessions = true;
@@ -424,7 +435,7 @@ pub fn run(
                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
                     // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
                     // 每个键都掉进一个死掉的 pty 里无声消失。
-                    if let Some(notice) = session_ended_notice(id, state) {
+                    if let Some(notice) = session_ended_notice(id, state, app.lang) {
                         app.view = View::Board;
                         // 回看板得重新拉一次 List：贴在会话里这一路都没拉，
                         // 手里的 sessions 是进会话之前那份，缺的正是「这个
@@ -463,7 +474,9 @@ pub fn run(
                         None => !text.is_empty(),
                     };
                     if failed {
-                        app.message = Msg::err("守护进程连不上，粘贴的内容没发出去".into());
+                        app.message = Msg::err(
+                            crate::i18n::text(crate::i18n::Key::PasteNotSent, app.lang).into(),
+                        );
                     }
                 }
                 // 手输路径态：粘贴直接进输入框。从别处拷一条路径粘进来一步到位，
@@ -579,7 +592,9 @@ pub fn run(
                 _ => View::PickProfile {
                     entries: Vec::new(),
                     state: ListState::default(),
-                    warning: Some("拿不到 agent 列表".into()),
+                    warning: Some(
+                        crate::i18n::text(crate::i18n::Key::CannotListAgents, app.lang).into(),
+                    ),
                 },
             };
         }
@@ -613,7 +628,9 @@ pub fn run(
                     View::Board
                 }
                 _ => {
-                    app.message = Msg::err("拿不到密钥列表".into());
+                    app.message = Msg::err(
+                        crate::i18n::text(crate::i18n::Key::CannotListSecrets, app.lang).into(),
+                    );
                     View::Board
                 }
             };
@@ -861,7 +878,9 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                             app.view = picker(entries, warning);
                         }
                         _ => {
-                            app.message = Msg::err("创建失败".into());
+                            app.message = Msg::err(
+                                crate::i18n::text(crate::i18n::Key::CreateFailed, app.lang).into(),
+                            );
                             app.view = picker(entries, warning);
                         }
                     }
@@ -873,7 +892,10 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
         // 视图不变，走到循环末尾 message_after_transition 会把这条消息
         // 原样留住（同其他分支，不用 continue 抢跑跳过收尾）。
         Ok(Response::Error(e)) => app.message = Msg::err(e),
-        _ => app.message = Msg::err("拿不到 agent 列表".into()),
+        _ => {
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::CannotListAgents, app.lang).into())
+        }
     }
 }
 
@@ -899,7 +921,10 @@ pub(crate) fn open_project_picker(app: &mut App) {
             };
         }
         Ok(Response::Error(e)) => app.message = Msg::err(e),
-        _ => app.message = Msg::err("拿不到项目列表".into()),
+        _ => {
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::CannotListProjects, app.lang).into())
+        }
     }
 }
 
@@ -925,7 +950,10 @@ pub(crate) fn open_secrets(app: &mut App) {
             };
         }
         Ok(Response::Error(e)) => app.message = Msg::err(e),
-        _ => app.message = Msg::err("拿不到密钥列表".into()),
+        _ => {
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::CannotListSecrets, app.lang).into())
+        }
     }
 }
 
@@ -945,8 +973,10 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
         _ => return "".into(),
     };
     match app.client().and_then(|c| c.call(req)) {
-        Ok(Response::Ok) => "完成".into(),
-        Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
+        Ok(Response::Ok) => crate::i18n::text(crate::i18n::Key::ActionDone, app.lang).into(),
+        Ok(Response::Diff(v)) if v.is_empty() => {
+            crate::i18n::text(crate::i18n::Key::NoChanges, app.lang).into()
+        }
         Ok(Response::Diff(v)) => v
             .iter()
             .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
@@ -954,7 +984,7 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
             .join("  ")
             .into(),
         Ok(Response::Error(e)) => Msg::err(e),
-        _ => Msg::err("请求失败".into()),
+        _ => Msg::err(crate::i18n::text(crate::i18n::Key::RequestFailed, app.lang).into()),
     }
 }
 

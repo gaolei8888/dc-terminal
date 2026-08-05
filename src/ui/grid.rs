@@ -195,7 +195,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') if is_plain_key(&key) => {
             app.message = match app.visible.get(focus).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
-                None => "还没有会话".into(),
+                None => text(Key::NoSessionsAtAll, app.lang).into(),
             };
         }
         _ => {}
@@ -310,7 +310,7 @@ fn draw_grid(
         let mut title = vec![
             Span::raw(format!(" {} {} ", info.id, info.profile)),
             Span::styled(
-                format!("{} ", status_label(info.state)),
+                format!("{} ", status_label(info.state, lang)),
                 status_style(info.state),
             ),
         ];
@@ -793,7 +793,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Grid { focus: 0 };
         handle_key(&mut app, key(KeyCode::Char('s'))).unwrap();
-        assert_eq!(app.message.text, "还没有会话");
+        assert_eq!(app.message.text, "还没有任何会话，按 n 开一个");
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Grid { .. }), "空看板放大不了");
     }

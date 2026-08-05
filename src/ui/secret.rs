@@ -152,7 +152,8 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 会以为是自己按错了键。
                 if let Some(url) = &prompt.url {
                     if !open_url(url) {
-                        app.message = Msg::err(format!("打不开浏览器，自己去访问 {url}"));
+                        app.message =
+                            Msg::err(crate::i18n::msg::cannot_open_browser(app.lang, url));
                     }
                 }
                 app.view = View::EnterSecret {
@@ -269,7 +270,8 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 只会得到一句空洞的「已删除」，用户会怀疑自己是不是
                 // 删错了别的东西。
                 DeleteKeyAction::NotConfigured => {
-                    app.message = "这个还没配密钥，没什么可删的".into();
+                    app.message =
+                        crate::i18n::text(crate::i18n::Key::NothingToDelete, app.lang).into();
                     View::Secrets {
                         entries,
                         state,
@@ -284,13 +286,13 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                         })
                     }) {
                         Ok(Response::Ok) => {
-                            app.message = format!(
-                                "已删除 {} 的密钥",
-                                entries
+                            app.message = crate::i18n::msg::secret_deleted(
+                                app.lang,
+                                &entries
                                     .iter()
                                     .find(|e| e.name == name)
                                     .map(|e| e.label.clone())
-                                    .unwrap_or(name.clone())
+                                    .unwrap_or(name.clone()),
                             )
                             .into();
                             refetch_secrets(app, Some(&name))
@@ -304,7 +306,10 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                             }
                         }
                         _ => {
-                            app.message = Msg::err("密钥没删掉，再试一次".into());
+                            app.message = Msg::err(
+                                crate::i18n::text(crate::i18n::Key::SecretNotDeleted, app.lang)
+                                    .into(),
+                            );
                             View::Secrets {
                                 entries,
                                 state,
@@ -318,13 +323,13 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 消息栏再重复一遍是双保险，行内提示万一没看到，
                 // 底栏还有一句。
                 DeleteKeyAction::Arm(name) => {
-                    app.message = format!(
-                        "再按一次 d 删除 {} 的密钥，按其他键取消",
-                        entries
+                    app.message = crate::i18n::msg::confirm_delete_secret(
+                        app.lang,
+                        &entries
                             .iter()
                             .find(|e| e.name == name)
                             .map(|e| e.label.clone())
-                            .unwrap_or_else(|| name.clone())
+                            .unwrap_or_else(|| name.clone()),
                     )
                     .into();
                     View::Secrets {
@@ -398,7 +403,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     match phase {
         SecretPhase::Typing => {}
         SecretPhase::Verifying => lines.push(Line::from(Span::styled(
-            "正在验证…",
+            crate::i18n::text(crate::i18n::Key::VerifyingShort, app.lang),
             Style::default().fg(Color::Cyan),
         ))),
         SecretPhase::Failed(m) => lines.push(Line::from(Span::styled(
@@ -408,7 +413,10 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     }
     if prompt.url.is_some() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Ctrl+O 打开申领页面", dim())));
+        lines.push(Line::from(Span::styled(
+            crate::i18n::text(crate::i18n::Key::OpenSignupPage, app.lang),
+            dim(),
+        )));
     }
     // IMPORTANT 3（最终整分支 code review）：Task 13 把「回哪」这句话
     // 在 `escape_hint`/`idle_help` 上按 `return_to_settings` 分了岔，
@@ -416,9 +424,9 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     // 「Esc 回设置」当场自相矛盾，而标题字号更大，用户会先信错的
     // 那句。这里补上同样的分支，别让第三处文案再单独漂移。
     let title = if *return_to_settings {
-        format!("填 {label} 的密钥（Enter 确认，Esc 返回设置）")
+        crate::i18n::msg::enter_secret_title(app.lang, label, true)
     } else {
-        format!("填 {label} 的密钥（Enter 确认，Esc 返回列表）")
+        crate::i18n::msg::enter_secret_title(app.lang, label, false)
     };
     f.render_widget(
         Paragraph::new(lines).block(
@@ -465,7 +473,7 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
                 ListItem::new(Line::from(vec![
                     Span::raw(pad_to(&truncate(&label, 14), 14)),
                     Span::styled(
-                        "再按 d 删除，按其他键取消",
+                        crate::i18n::text(crate::i18n::Key::PressDAgainToDelete, app.lang),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
                 ]))
@@ -475,7 +483,11 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
                     // 三元式抬到 `Style` 这一层：`dim()` 返回的是 `Style`
                     // （`Unknown` 那支是 DIM 修饰符而不是颜色），塞不进 `.fg()`
                     Span::styled(
-                        if *configured { "已配" } else { "未配" },
+                        if *configured {
+                            crate::i18n::text(crate::i18n::Key::SecretSet, app.lang)
+                        } else {
+                            crate::i18n::text(crate::i18n::Key::SecretUnset, app.lang)
+                        },
                         if *configured {
                             Style::default().fg(Color::Green)
                         } else {
@@ -493,7 +505,7 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
-                    .title("密钥设置"),
+                    .title(crate::i18n::text(crate::i18n::Key::SecretsTitle, app.lang)),
             )
             .highlight_symbol("▶ "),
         area,
@@ -650,7 +662,7 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        assert!(c.contains("密钥设置"));
+        assert!(c.contains(crate::i18n::text(crate::i18n::Key::SecretsTitle, app.lang)));
     }
 
     #[test]
@@ -673,8 +685,14 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        assert!(c.contains("已配"), "配过的那行要显示已配：{c}");
-        assert!(c.contains("未配"), "没配的那行要显示未配：{c}");
+        assert!(
+            c.contains(crate::i18n::text(crate::i18n::Key::SecretSet, app.lang)),
+            "配过的那行要显示已配：{c}"
+        );
+        assert!(
+            c.contains(crate::i18n::text(crate::i18n::Key::SecretUnset, app.lang)),
+            "没配的那行要显示未配：{c}"
+        );
     }
 
     // ———— Finding 1（Task 13 code review）：删密钥的二次确认 ————
@@ -707,7 +725,7 @@ mod tests {
             "武装状态要在行内画出明确提示：{c}"
         );
         assert!(
-            !c.contains("已配"),
+            !c.contains(crate::i18n::text(crate::i18n::Key::SecretSet, app.lang)),
             "武装的这一行不该继续显示「已配」，会跟警告混在一起：{c}"
         );
     }
