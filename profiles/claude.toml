@@ -5,12 +5,15 @@ idle_pattern = "\\? for shortcuts"
 
 [label]
 zh = "Claude"
+en = "Claude"
 
 [note]
 zh = "Anthropic 官方"
+en = "Official Anthropic CLI"
 
 [install]
 command = ["npm", "i", "-g", "@anthropic-ai/claude-code"]
 
 [install.note]
 zh = "需要先装 Node.js"
+en = "Requires Node.js"

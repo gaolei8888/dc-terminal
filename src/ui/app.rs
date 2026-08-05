@@ -80,6 +80,10 @@ pub struct App {
     pub verify_rx: Option<std::sync::mpsc::Receiver<(String, String, VerifyOutcome)>>,
     // start_dir 是 dct 启动时的目录，只用来解析用户敲进来的相对路径，永不改变。
     // current_dir 是「新会话开在哪」，选择器会改它。
+    /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
+    /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
+    /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
+    pub lang: crate::i18n::Lang,
     pub start_dir: PathBuf,
     pub current_dir: PathBuf,
     pub quit: bool,
@@ -91,7 +95,7 @@ impl App {
     /// 分开抄，改 `new` 忘了同步改测试用的那份，测试就会在悄悄测一个跟
     /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
     /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
-    fn new_inner(client: Option<Client>, default_dir: PathBuf) -> App {
+    fn new_inner(client: Option<Client>, default_dir: PathBuf, lang: crate::i18n::Lang) -> App {
         App {
             client,
             view: View::Board,
@@ -113,20 +117,21 @@ impl App {
             connected: true,
             need_sessions: true,
             verify_rx: None,
+            lang,
             start_dir: default_dir.clone(),
             current_dir: default_dir,
             quit: false,
         }
     }
 
-    pub fn new(client: Client, default_dir: PathBuf) -> App {
-        Self::new_inner(Some(client), default_dir)
+    pub fn new(client: Client, default_dir: PathBuf, lang: crate::i18n::Lang) -> App {
+        Self::new_inner(Some(client), default_dir, lang)
     }
 
     /// 只给测试用：不需要一个活的守护进程就能构造。
     #[cfg(test)]
     pub fn new_disconnected(_sock: PathBuf, default_dir: PathBuf) -> App {
-        Self::new_inner(None, default_dir)
+        Self::new_inner(None, default_dir, crate::i18n::Lang::Zh)
     }
 
     /// 只给测试用：`board`/`attach`/`pick`/`secret` 里 `draw()`/`handle_key()`

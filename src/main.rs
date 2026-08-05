@@ -69,5 +69,13 @@ fn run_ui() -> Result<()> {
 
     let client =
         Client::connect(&sock).with_context(|| format!("连不上守护进程：{}", sock.display()))?;
-    dct::ui::run(client, std::env::current_dir()?)
+    {
+        // 语言在这里定一次：main 是唯一同时知道 socket 路径（设置文件在它旁边）
+        // 和真实环境变量的地方。定完交给 ui::run，界面自己不再去猜。
+        let lang = dct::i18n::resolve(
+            dct::settings::load_lang(&dct::settings::settings_path_for_socket(&sock)),
+            &|k| std::env::var(k).ok(),
+        );
+        dct::ui::run(client, std::env::current_dir()?, lang)
+    }
 }

@@ -5,12 +5,15 @@ is_agent = true
 
 [label]
 zh = "OpenCode"
+en = "OpenCode"
 
 [note]
 zh = "开源，可接多种模型"
+en = "Open source, works with many models"
 
 [install]
 command = ["npm", "i", "-g", "opencode-ai"]
 
 [install.note]
 zh = "需要先装 Node.js"
+en = "Requires Node.js"

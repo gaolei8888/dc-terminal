@@ -10,7 +10,12 @@ fn profiles_returns_entries_with_labels_and_status() {
     let h = common::start_daemon();
     let mut c = h.client();
 
-    let Response::Profiles { entries, warning } = c.call(Request::Profiles).unwrap() else {
+    let Response::Profiles { entries, warning } = c
+        .call(Request::Profiles {
+            lang: dct::i18n::Lang::Zh,
+        })
+        .unwrap()
+    else {
         panic!("应当返回 Profiles");
     };
     assert!(warning.is_none(), "干净环境不该有告警");
@@ -37,7 +42,12 @@ fn set_secret_flips_kimi_off_needs_secret() {
     })
     .unwrap();
 
-    let Response::Profiles { entries, .. } = c.call(Request::Profiles).unwrap() else {
+    let Response::Profiles { entries, .. } = c
+        .call(Request::Profiles {
+            lang: dct::i18n::Lang::Zh,
+        })
+        .unwrap()
+    else {
         panic!()
     };
     let kimi = entries.iter().find(|e| e.name == "kimi").unwrap();
@@ -62,7 +72,12 @@ fn delete_secret_puts_it_back() {
     })
     .unwrap();
 
-    let Response::Profiles { entries, .. } = c.call(Request::Profiles).unwrap() else {
+    let Response::Profiles { entries, .. } = c
+        .call(Request::Profiles {
+            lang: dct::i18n::Lang::Zh,
+        })
+        .unwrap()
+    else {
         panic!()
     };
     let kimi = entries.iter().find(|e| e.name == "kimi").unwrap();

@@ -87,7 +87,12 @@ pub enum Request {
     Diff {
         id: u32,
     },
-    Profiles,
+    /// 带上界面当前的语言。守护进程不知道、也不该知道谁在用什么语言——
+    /// 它是常驻的、可能同时服务多个界面的进程，把「当前语言」存成它的状态
+    /// 就等于假设只有一个客户端。取哪一份文案由请求方说了算。
+    Profiles {
+        lang: crate::i18n::Lang,
+    },
     Projects,
     SetSecret {
         profile: String,
@@ -140,7 +145,7 @@ impl std::fmt::Debug for Request {
             Request::Stop { id } => f.debug_struct("Stop").field("id", id).finish(),
             Request::Undo { id } => f.debug_struct("Undo").field("id", id).finish(),
             Request::Diff { id } => f.debug_struct("Diff").field("id", id).finish(),
-            Request::Profiles => write!(f, "Profiles"),
+            Request::Profiles { lang } => f.debug_struct("Profiles").field("lang", lang).finish(),
             Request::Projects => write!(f, "Projects"),
             Request::SetSecret { profile, .. } => f
                 .debug_struct("SetSecret")

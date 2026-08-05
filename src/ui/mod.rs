@@ -145,7 +145,7 @@ fn spawn_signal_restore() {
     });
 }
 
-pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
+pub fn run(client: Client, default_dir: PathBuf, lang: crate::i18n::Lang) -> Result<()> {
     // 必须在 enable_raw_mode 之前装：装早了无害（还没进 raw mode 时
     // restore_terminal() 没有副作用，多发一次 LeaveAlternateScreen 也无害），
     // 装晚了就有一个「已经进 raw mode 但信号还没被接管」的真空窗口。
@@ -170,7 +170,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(client, default_dir);
+    let mut app = App::new(client, default_dir, lang);
 
     loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
@@ -549,7 +549,10 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         let needs_profile_refetch =
             matches!(&app.view, View::PickProfile { entries, .. } if entries.is_empty());
         if needs_profile_refetch {
-            app.view = match app.client().and_then(|c| c.call(Request::Profiles)) {
+            app.view = match app
+                .client()
+                .and_then(|c| c.call(Request::Profiles { lang }))
+            {
                 Ok(Response::Profiles { entries, warning }) => {
                     let mut state = ListState::default();
                     if !entries.is_empty() {
@@ -583,7 +586,10 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         let needs_secrets_refetch =
             matches!(&app.view, View::Secrets { entries, .. } if entries.is_empty());
         if needs_secrets_refetch {
-            app.view = match app.client().and_then(|c| c.call(Request::Profiles)) {
+            app.view = match app
+                .client()
+                .and_then(|c| c.call(Request::Profiles { lang }))
+            {
                 Ok(Response::Profiles { entries, .. }) => {
                     let mut state = ListState::default();
                     if !secret_rows(&entries).is_empty() {
@@ -776,7 +782,11 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
     // pick_action 和 View::PickProfile 的按键分支。n 和 N 都要这份
     // 列表——n 拿它判断上次那个 agent 现在还在不在 Ready，N 拿它渲染
     // 选择器——所以只拉一次，不分两条路各拉各的。
-    match app.client().and_then(|c| c.call(Request::Profiles)) {
+    let lang = app.lang;
+    match app
+        .client()
+        .and_then(|c| c.call(Request::Profiles { lang }))
+    {
         Ok(Response::Profiles { entries, warning }) => {
             // 把「拉完列表但没能直开」的三种落点（选择器为空、建会话失败
             // 两种）收在一处，省得同一段 ListState 初始化抄三遍——那种
@@ -875,7 +885,11 @@ pub(crate) fn open_secrets(app: &mut App) {
     // 拿不到列表就不进设置页：留在原地给一句错误，总比弹进一个既没数据、
     // 又没地方显示错误的空白页强（`View::Secrets` 没有 `warning` 字段，
     // 见其字段注释）。
-    match app.client().and_then(|c| c.call(Request::Profiles)) {
+    let lang = app.lang;
+    match app
+        .client()
+        .and_then(|c| c.call(Request::Profiles { lang }))
+    {
         Ok(Response::Profiles { entries, .. }) => {
             let mut state = ListState::default();
             if !secret_rows(&entries).is_empty() {
@@ -935,7 +949,11 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
     // 借着 `app` 的别的字段（比如 `entries`/`state` 已经从 `app.view` 解构
     // 出来），走一个吃 `&mut self` 的方法会跟这些借用打架。`None` 归到跟
     // 下面 `_ =>` 一样的失败落点——同真实断线共用一条路径，不新增分支。
-    let result = app.client.as_mut().map(|c| c.call(Request::Profiles));
+    let lang = app.lang;
+    let result = app
+        .client
+        .as_mut()
+        .map(|c| c.call(Request::Profiles { lang }));
     match result {
         Some(Ok(Response::Profiles { entries, .. })) => {
             let rows = secret_rows(&entries);

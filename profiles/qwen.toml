@@ -5,12 +5,15 @@ is_agent = true
 
 [label]
 zh = "Qwen Code"
+en = "Qwen Code"
 
 [note]
 zh = "阿里通义，独立命令行"
+en = "Alibaba Qwen, standalone CLI"
 
 [install]
 command = ["npm", "i", "-g", "@qwen-code/qwen-code"]
 
 [install.note]
 zh = "需要先装 Node.js"
+en = "Requires Node.js"

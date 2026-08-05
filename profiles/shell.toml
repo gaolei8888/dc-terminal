@@ -4,6 +4,8 @@ is_agent = false
 
 [label]
 zh = "命令行"
+en = "Terminal"
 
 [note]
 zh = "普通终端，不带 AI"
+en = "A plain terminal, no AI"

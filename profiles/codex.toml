@@ -7,12 +7,15 @@ busy_pattern = "esc to interrupt"
 
 [label]
 zh = "Codex"
+en = "Codex"
 
 [note]
 zh = "OpenAI 官方"
+en = "Official OpenAI CLI"
 
 [install]
 command = ["npm", "i", "-g", "@openai/codex"]
 
 [install.note]
 zh = "需要先装 Node.js"
+en = "Requires Node.js"

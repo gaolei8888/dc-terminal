@@ -8,7 +8,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use crate::profile::Profile;
-use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of, Lang};
+use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
 use crate::secrets::{secrets_path_for_socket, SecretStore};
@@ -99,7 +99,7 @@ fn handle(
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         Request::List => Ok(Response::Sessions(mgr.list())),
-        Request::Profiles => {
+        Request::Profiles { lang } => {
             let (all, mut warnings) = all_profiles(profiles_dir);
             let sec = recover(secrets.lock());
             if let Some(e) = sec.load_error() {
@@ -125,16 +125,16 @@ fn handle(
                     let has_secret = sec.get(&p.name).is_some();
                     ProfileEntry {
                         name: p.name.clone(),
-                        label: p.display_label(Lang::Zh),
-                        note: p.display_note(Lang::Zh),
-                        status: status_of(p, &all, has_secret, &command_exists, Lang::Zh),
+                        label: p.display_label(lang),
+                        note: p.display_note(lang),
+                        status: status_of(p, &all, has_secret, &command_exists, lang),
                         secret: p.secret.as_ref().map(|s| SecretPrompt {
-                            hint: s.hint.get(Lang::Zh).unwrap_or("").to_string(),
+                            hint: s.hint.get(lang).unwrap_or("").to_string(),
                             url: s.url.clone(),
                         }),
                         install: p.install.as_ref().map(|i| InstallPrompt {
                             command: i.command.clone(),
-                            note: i.note.get(Lang::Zh).unwrap_or("").to_string(),
+                            note: i.note.get(lang).unwrap_or("").to_string(),
                         }),
                         has_secret,
                     }
@@ -291,7 +291,9 @@ mod tests {
         let profiles_dir = tempfile::tempdir().unwrap();
 
         let resp = handle(
-            Request::Profiles,
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
             &mgr,
             &store,
             &secrets,
@@ -313,6 +315,46 @@ mod tests {
             }
             other => panic!("期待 Response::Profiles，得到 {other:?}"),
         }
+    }
+
+    /// 守护进程不该替用户决定语言。它是常驻的、可能同时服务多个界面的进程，
+    /// 「谁的语言是什么」不是它的状态——界面在请求里带上，它照着取就行。
+    /// 以前这里硬编码 `Lang::Zh`，于是 profile 的 `en` 文案写了也永远没人读。
+    #[test]
+    fn profiles_are_labelled_in_the_language_the_client_asked_for() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &secrets_dir.path().join("secrets.toml"),
+        )));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Store::load(
+            &store_dir.path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let labels = |lang| match handle(
+            Request::Profiles { lang },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+        ) {
+            Response::Profiles { entries, .. } => entries
+                .into_iter()
+                .map(|e| format!("{}|{}", e.label, e.note))
+                .collect::<Vec<_>>()
+                .join("  "),
+            other => panic!("期待 Response::Profiles，得到 {other:?}"),
+        };
+
+        let zh = labels(crate::i18n::Lang::Zh);
+        let en = labels(crate::i18n::Lang::En);
+        assert!(
+            zh.contains("命令行"),
+            "中文下 shell 的名字是「命令行」：{zh}"
+        );
+        assert_ne!(zh, en, "换了语言，菜单文案必须真的跟着变");
     }
 
     /// 回归测试，对应审查发现「密钥仓的锁被握过了整个 create()」：以前 `handle()`

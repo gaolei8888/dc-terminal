@@ -2,16 +2,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-/// 界面语言。i18n 那一期会把它挪进 `src/i18n.rs` 并加上其余语言；
-/// 这里先立一个单变体的版本，好让 profile 的多语言字段现在就按最终结构落地——
-/// profile 是**用户可编辑的数据文件**，进不了 i18n 的词条表，
-/// 现在写成平字符串，i18n 落地时就是一次会打破用户文件的改动。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    Zh,
-}
+pub use crate::i18n::Lang;
 
 /// 一段可翻译的文案。TOML 里写成子表：`[label]` 下面 `zh = "..."`。
+///
+/// profile 是**用户可编辑的数据文件**，进不了 i18n 的词条表——所以它的多语言
+/// 走这条独立的路，而不是 `i18n::Key`。用户自己写的 profile 只写母语是常态。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LocalizedText {
     #[serde(default)]
@@ -21,9 +17,14 @@ pub struct LocalizedText {
 }
 
 impl LocalizedText {
+    /// 取不到就是 `None`，**不跨语言回落**。回落到另一种语言的话，英文界面里
+    /// 会冒出一句中文，用户既看不懂也不知道那是哪来的；回落成什么由调用方
+    /// 决定（`display_label` 回落到 profile 名，`display_note` 回落到空串），
+    /// 那是它们各自知道、这里不知道的事。
     pub fn get(&self, lang: Lang) -> Option<&str> {
         match lang {
             Lang::Zh => self.zh.as_deref(),
+            Lang::En => self.en.as_deref(),
         }
     }
 }
@@ -548,6 +549,82 @@ mod tests {
         );
         assert_eq!(p.label.get(Lang::Zh), Some("Kimi"));
         assert_eq!(p.note.get(Lang::Zh), Some("月之暗面"));
+    }
+
+    /// 内置 profile 的每一条 `en` 里都不许出现汉字。
+    ///
+    /// 这条不是洁癖：补英文那次我用脚本批量加 `en =`，品牌名（`Claude`/`Kimi`）
+    /// 中英同形所以直接抄了中文那行，结果 `shell` 的 label 被抄成
+    /// `en = "命令行"`——英文界面上凭空冒出一句中文，而回落机制看它非空
+    /// 就认了。人工补译很容易再犯同样的错，交给测试。
+    #[test]
+    fn no_builtin_profile_smuggles_chinese_into_its_english_text() {
+        let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        for p in Profile::builtins() {
+            for (what, t) in [
+                ("label", &p.label),
+                ("note", &p.note),
+                (
+                    "secret.hint",
+                    &p.secret
+                        .as_ref()
+                        .map(|s| s.hint.clone())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "install.note",
+                    &p.install
+                        .as_ref()
+                        .map(|i| i.note.clone())
+                        .unwrap_or_default(),
+                ),
+            ] {
+                if let Some(en) = t.en.as_deref() {
+                    assert!(!cjk(en), "{} 的 {what} 里 en 写着中文：{en}", p.name);
+                }
+            }
+        }
+    }
+
+    /// profile 的 TOML 里 `[note]` 下同时写了 `zh` 和 `en`，两边都要取得到。
+    /// 这是 i18n 那一期之前唯一说不通的地方：`Lang` 只有 `Zh` 一个变体，
+    /// 用户写了 `en = "..."` 也永远没人读。
+    #[test]
+    fn localized_text_serves_both_languages() {
+        let p = Profile::from_toml(
+            r#"
+            name = "kimi"
+            command = ["kimi"]
+            is_agent = true
+            [label]
+            zh = "Kimi"
+            en = "Kimi"
+            [note]
+            zh = "月之暗面"
+            en = "Moonshot AI"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.display_note(Lang::Zh), "月之暗面");
+        assert_eq!(p.display_note(Lang::En), "Moonshot AI");
+    }
+
+    /// 只写了中文的 profile，英文界面下回落到 profile 名而不是显示中文——
+    /// 用户自己写的 profile 不会有人替他翻译，回落必须是个他认得的词。
+    #[test]
+    fn a_chinese_only_label_falls_back_to_the_profile_name_in_english() {
+        let p = Profile::from_toml(
+            r#"
+            name = "myagent"
+            command = ["x"]
+            is_agent = true
+            [label]
+            zh = "我的助手"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.display_label(Lang::Zh), "我的助手");
+        assert_eq!(p.display_label(Lang::En), "myagent");
     }
 
     #[test]

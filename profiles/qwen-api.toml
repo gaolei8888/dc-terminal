@@ -5,9 +5,11 @@ idle_pattern = "\\? for shortcuts"
 
 [label]
 zh = "Qwen API"
+en = "Qwen API"
 
 [note]
 zh = "阿里通义，套用 Claude 界面"
+en = "Alibaba Qwen, through the Claude interface"
 
 [env]
 ANTHROPIC_BASE_URL = "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy"
@@ -18,6 +20,7 @@ url = "https://bailian.console.aliyun.com/?tab=model#/api-key"
 
 [secret.hint]
 zh = "在阿里云百炼控制台创建 API Key"
+en = "Create an API key in the Alibaba Cloud Bailian console"
 
 [secret.verify]
 url = "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1/messages"

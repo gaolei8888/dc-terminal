@@ -5,9 +5,11 @@ idle_pattern = "\\? for shortcuts"
 
 [label]
 zh = "GLM"
+en = "GLM"
 
 [note]
 zh = "智谱，套用 Claude 界面"
+en = "Zhipu AI, through the Claude interface"
 
 [env]
 ANTHROPIC_BASE_URL = "https://open.bigmodel.cn/api/anthropic"
@@ -18,6 +20,7 @@ url = "https://open.bigmodel.cn/usercenter/apikeys"
 
 [secret.hint]
 zh = "在 open.bigmodel.cn 的用户中心复制 API Key"
+en = "Copy your API key from your account at open.bigmodel.cn"
 
 [secret.verify]
 url = "https://open.bigmodel.cn/api/anthropic/v1/messages"
