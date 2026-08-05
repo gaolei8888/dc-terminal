@@ -369,6 +369,48 @@ pub(crate) fn filter_projects(all: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
+/// 看板上到底显示哪些会话。跟着用户走而不是跟着视图走——列表和九宫格是
+/// 同一批会话的两种画法，作用域在两边必须一致，否则切个视图会话数就变了。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scope {
+    CurrentProject,
+    AllProjects,
+}
+
+/// 按作用域筛出真正上屏的会话。抽成纯函数是为了能单测（同 `filter_projects`）
+/// ——过滤错了的代价是用户对着别的项目的会话按 `s` 停止，这必须在有守护
+/// 进程之前就测得到。
+pub(crate) fn visible_sessions(
+    all: &[crate::session::SessionInfo],
+    scope: Scope,
+    project: &Path,
+) -> Vec<crate::session::SessionInfo> {
+    if scope == Scope::AllProjects {
+        return all.to_vec();
+    }
+    all.iter()
+        .filter(|s| same_project(Path::new(&s.dir), project))
+        .cloned()
+        .collect()
+}
+
+/// 两个路径是不是同一个项目。归一化只在这里定义一次——过滤和「进会话要不要
+/// 切项目」必须用同一套判断，各写各的迟早会分叉成「列表里看不见、但进去了
+/// 又说没换项目」这种自相矛盾的状态。
+pub(crate) fn same_project(dir: &Path, project: &Path) -> bool {
+    canon(dir) == canon(project)
+}
+
+/// 比较用的归一化。**只用于比较，不用于显示**——把 `/tmp` 显示成
+/// `/private/tmp` 会让 macOS 上的界面凭空变丑，而用户并没有做错什么。
+///
+/// 解析失败（目录已被删）时退化成原样：一个指向已删目录的会话仍然应当
+/// 待在它原本的项目下，而不是从「当前项目」和「全部项目」两个视图里
+/// 同时消失——那才是真的找不回来了。
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// 视图切换后，底部消息该不该清掉。抽成纯函数是因为 `run()` 的按键循环里有
 /// 十几处给 `message` 赋值，没法在每处都补一行清空逻辑——漏一处就会有一个
 /// 视图继续顶着上一屏的残留话术（比如看板「已开会话 3」被 `Enter` 带进会话
@@ -453,7 +495,7 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
-pub(crate) fn idle_help(view: &View) -> &'static str {
+pub(crate) fn idle_help(view: &View, scope: Scope) -> &'static str {
     match view {
         // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
@@ -467,9 +509,17 @@ pub(crate) fn idle_help(view: &View) -> &'static str {
         // `g 九宫格` 插在切换类按键那一段里，不放句尾：这一整句在 80 列
         // 终端上放不下会被右端截断，而 `g` 是九宫格唯一的入口——排在被截
         // 掉的那一截里等于没写。
-        View::Board => {
-            "n 新建  N 换 agent  p 换项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
-        }
+        // `a` 紧跟着 `p 换项目`：两个键都在回答「我现在在看哪些会话」，
+        // 挨着放用户才会把它们当成一组。文案随范围反转——`a` 是个开关，
+        // 只写一个方向的话，另一个方向上屏幕就在说谎。
+        View::Board => match scope {
+            Scope::CurrentProject => {
+                "n 新建  N 换 agent  p 换项目  a 看全部项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
+            }
+            Scope::AllProjects => {
+                "n 新建  N 换 agent  p 换项目  a 只看本项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
+            }
+        },
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
         // 跟会话视图不同（那边除了 F2 全转发，列按键表等于教人按错）。
         //
@@ -483,9 +533,14 @@ pub(crate) fn idle_help(view: &View) -> &'static str {
         // 却真的管用的键，就是等着用户误按——尤其是这个键会关掉一切。
         // 排在前三而不是句尾，理由跟看板那句里的 `g 九宫格` 一样：这一整句
         // 在 80 列终端上放不下，句尾那几个键会被右端截掉，写了等于没写。
-        View::Grid { .. } => {
-            "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  c 密钥  u 回滚  s 停止  d 改动"
-        }
+        View::Grid { .. } => match scope {
+            Scope::CurrentProject => {
+                "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  a 看全部项目  c 密钥  u 回滚  s 停止  d 改动"
+            }
+            Scope::AllProjects => {
+                "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  a 只看本项目  c 密钥  u 回滚  s 停止  d 改动"
+            }
+        },
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
         View::EnterSecret {
@@ -598,7 +653,7 @@ mod tests {
     fn grid_hints_match_what_the_keys_actually_do() {
         // 底栏说什么就得真能做到什么：九宫格的 Ctrl+Q 回的是列表那一屏
         assert_eq!(escape_hint(&View::Grid { focus: 0 }), "Ctrl+Q 回列表");
-        let help = idle_help(&View::Grid { focus: 0 });
+        let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject);
         for k in [
             "方向键移动",
             "Enter 放大",
@@ -616,19 +671,18 @@ mod tests {
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
-        // 80 列终端上右段只剩 63 列（80 − 2 边框 − 15 左段），整句放不下会被
-        // 截断。`q 退出` 必须落在截断线之前，不然写了也看不见。
-        let visible = crate::ui::truncate(help, 63);
-        assert!(
-            visible.contains("q 退出"),
-            "80 列终端上看不到「q 退出」：{visible}"
-        );
+        // 「这些键在 80 列终端上真的看得见吗」这个问题，原来是靠在这里
+        // 手算一遍截断宽度来回答的（`truncate(help, 63)`）。那个算式随着
+        // 底栏改成两行自动换行已经失效，而且它算的是文案、不是屏幕。
+        // 真正的断言搬到了 `mod.rs`——那里是把整帧画出来再数格子：
+        // `every_board_key_is_actually_on_screen_at_eighty_columns` 和
+        // `every_grid_key_is_actually_on_screen_at_eighty_columns`。
     }
 
     #[test]
     fn board_help_mentions_the_grid() {
         // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
-        assert!(idle_help(&View::Board).contains("g 九宫格"));
+        assert!(idle_help(&View::Board, Scope::CurrentProject).contains("g 九宫格"));
     }
 
     #[test]
@@ -673,6 +727,102 @@ mod tests {
         // is_dir() 帮忙识别"用户什么都没输"。
         let base = std::path::Path::new("/base");
         assert_eq!(expand_path("", base), base);
+    }
+
+    fn sess(id: u32, dir: &str) -> crate::session::SessionInfo {
+        crate::session::SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+        }
+    }
+
+    #[test]
+    fn current_project_scope_keeps_only_that_project_in_order() {
+        // 这条就是用户报的症状一：底栏写着 A，屏幕上却有 B 的会话。
+        let all = [
+            sess(1, "/w/a"),
+            sess(2, "/w/b"),
+            sess(3, "/w/a"),
+            sess(4, "/w/c"),
+        ];
+        let got = visible_sessions(&all, Scope::CurrentProject, Path::new("/w/a"));
+        assert_eq!(
+            got.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "只留当前项目的会话，且保持原顺序"
+        );
+    }
+
+    /// `a` 是个开关，两个方向做的事相反。只写一句「a 全部项目」的话，
+    /// 用户已经在全部项目视图里时，屏幕会让他以为再按一次还是看全部。
+    #[test]
+    fn the_scope_key_hint_says_where_a_will_take_you() {
+        let board = View::Board;
+        assert!(
+            idle_help(&board, Scope::CurrentProject).contains("a 看全部项目"),
+            "只看本项目时，a 通向全部项目"
+        );
+        assert!(
+            idle_help(&board, Scope::AllProjects).contains("a 只看本项目"),
+            "全部项目时，a 通向本项目"
+        );
+        // 九宫格是看板的另一种画法，同一个键必须给同一套说明
+        let grid = View::Grid { focus: 0 };
+        assert!(idle_help(&grid, Scope::CurrentProject).contains("a 看全部项目"));
+        assert!(idle_help(&grid, Scope::AllProjects).contains("a 只看本项目"));
+    }
+
+    #[test]
+    fn all_projects_scope_returns_everything_untouched() {
+        let all = [sess(1, "/w/a"), sess(2, "/w/b")];
+        let got = visible_sessions(&all, Scope::AllProjects, Path::new("/w/a"));
+        assert_eq!(
+            got.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "全部项目视图不筛任何东西，当前项目是什么都不影响它"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_sessions_yields_an_empty_list() {
+        // 空不是异常：新项目、或者刚把会话全停了，都会走到这里。
+        // 返回空 Vec 而不是 panic，是九宫格空状态文案能上屏的前提。
+        let all = [sess(1, "/w/a")];
+        assert!(visible_sessions(&all, Scope::CurrentProject, Path::new("/w/b")).is_empty());
+    }
+
+    #[test]
+    fn a_session_whose_dir_was_deleted_stays_under_its_own_project() {
+        // canonicalize 对已删目录会失败。退化成字面比较，让这个会话仍然
+        // 归在它原本的项目下——否则它会从两个视图里同时消失，用户再也
+        // 没有任何入口去停掉它。
+        let gone = "/definitely/does/not/exist/dct-scope-test";
+        let all = [sess(1, gone)];
+        let got = visible_sessions(&all, Scope::CurrentProject, Path::new(gone));
+        assert_eq!(got.len(), 1, "目录没了，会话还在，仍要看得见");
+    }
+
+    #[test]
+    fn a_symlinked_project_dir_still_matches_its_sessions() {
+        // 会话是用真实路径建的，用户却可能从一个符号链接进同一个项目
+        // （macOS 上 /tmp -> /private/tmp 就是现成的例子）。字面比较会让
+        // 整个项目的会话凭空消失，而用户看不出任何原因。
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("proj");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let all = [sess(1, &real.display().to_string())];
+        let got = visible_sessions(&all, Scope::CurrentProject, &link);
+        assert_eq!(
+            got.len(),
+            1,
+            "从符号链接进来的当前项目，必须仍然认得出它自己的会话"
+        );
     }
 
     #[test]
@@ -974,7 +1124,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_both_n_and_capital_n() {
-        let help = idle_help(&View::Board);
+        let help = idle_help(&View::Board, Scope::CurrentProject);
         assert!(help.contains("n 新建"));
         assert!(help.contains("N 换 agent"));
     }
@@ -983,7 +1133,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_the_settings_key() {
-        assert!(idle_help(&View::Board).contains("c 密钥"));
+        assert!(idle_help(&View::Board, Scope::CurrentProject).contains("c 密钥"));
     }
 
     #[test]
@@ -997,11 +1147,14 @@ mod tests {
 
     #[test]
     fn picker_help_mentions_both_ways_to_choose() {
-        let help = idle_help(&View::PickProfile {
-            entries: vec![],
-            state: ListState::default(),
-            warning: None,
-        });
+        let help = idle_help(
+            &View::PickProfile {
+                entries: vec![],
+                state: ListState::default(),
+                warning: None,
+            },
+            Scope::CurrentProject,
+        );
         assert!(help.contains("↑↓"));
         assert!(help.contains("数字"));
     }
@@ -1182,17 +1335,20 @@ mod tests {
     fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
         // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
         // 一处还说着旧的「列表」。
-        let help = idle_help(&View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
+        let help = idle_help(
+            &View::EnterSecret {
+                profile: "kimi".into(),
+                label: "Kimi".into(),
+                prompt: SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+                return_to_settings: true,
             },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: true,
-        });
+            Scope::CurrentProject,
+        );
         assert!(
             help.contains("返回设置"),
             "底栏说什么就得真能做到什么：{help}"
@@ -1214,11 +1370,14 @@ mod tests {
 
     #[test]
     fn secrets_page_help_lists_its_own_keys() {
-        let help = idle_help(&View::Secrets {
-            entries: vec![],
-            state: ListState::default(),
-            pending_delete: None,
-        });
+        let help = idle_help(
+            &View::Secrets {
+                entries: vec![],
+                state: ListState::default(),
+                pending_delete: None,
+            },
+            Scope::CurrentProject,
+        );
         assert!(help.contains("Enter 改"));
         assert!(help.contains("d 删"));
     }

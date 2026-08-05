@@ -160,9 +160,90 @@ pub(crate) fn short_path(p: &str) -> String {
     }
 }
 
+/// 把底栏那张按键表折成不超过 `width` 列的若干行。
+///
+/// 自己折而不是用 ratatui 的 `Wrap`：`Wrap` 在任何空白处断行，而按键表里
+/// 「p 换项目」这种写法键名和说明之间就有一个空格，于是行尾会留下一个
+/// 孤零零的 `p`，下一行开头是「换项目」——屏幕上看起来是两个键，其中一个
+/// 还没有名字。这里只在**分隔符**处断：两个半角空格，或一个全角空格
+/// （`　`，几条帮助文案用它当分隔）。
+///
+/// 单项本身超宽时独占一行，原样放出去（宁可让它被右端裁掉，也不能丢掉
+/// 或者卡在死循环里）。
+pub(crate) fn wrap_help(help: &str, width: usize) -> Vec<String> {
+    let items: Vec<&str> = help
+        .split("  ")
+        .flat_map(|s| s.split('\u{3000}'))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let disp = |s: &str| s.chars().map(char_width).sum::<usize>();
+    const SEP: &str = "  ";
+    let sep_w = 2;
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for it in items {
+        let w = disp(it);
+        if cur.is_empty() {
+            cur.push_str(it);
+            cur_w = w;
+        } else if cur_w + sep_w + w <= width {
+            cur.push_str(SEP);
+            cur.push_str(it);
+            cur_w += sep_w + w;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(it);
+            cur_w = w;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 底栏按键表折行时，**一个键的名字和它的说明绝不能分家**。
+    /// ratatui 自带的 `Wrap` 在任何空白处断行，于是「p 换项目」会被折成
+    /// 行尾一个孤零零的 `p` 加下一行的「换项目」——屏幕上看起来像两个键，
+    /// 而其中一个还没有名字。
+    #[test]
+    fn wrap_help_never_splits_a_key_from_its_label() {
+        let help = "q 退出  n 新建  N 换 agent  p 换项目  a 看全部项目  c 密钥";
+        let lines = wrap_help(help, 30);
+        assert!(lines.len() > 1, "30 列放不下，必须折行：{lines:?}");
+        for l in &lines {
+            assert!(
+                !l.trim_end().ends_with(" p")
+                    && !l.trim_end().ends_with(" n")
+                    && !l.trim_end().ends_with(" N"),
+                "行尾留下了一个没有说明的孤零零的键：{l:?}"
+            );
+        }
+        // 折行不能丢字：把各行拼回去，每个键都还在
+        let joined = lines.join("");
+        for k in ["q 退出", "n 新建", "N 换 agent", "p 换项目", "a 看全部项目"] {
+            assert!(joined.contains(k), "折行把「{k}」弄丢了：{joined}");
+        }
+    }
+
+    /// 单个键本身就比一行还宽时不能死循环，也不能把它整个丢掉。
+    #[test]
+    fn wrap_help_keeps_an_oversized_item_on_its_own_line() {
+        let lines = wrap_help("a 一个特别特别特别长的说明文字", 8);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("特别特别"));
+    }
 
     #[test]
     fn pad_to_aligns_cjk_and_ascii_labels_to_the_same_display_width() {

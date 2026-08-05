@@ -23,7 +23,18 @@ pub struct App {
     pub client: Option<Client>,
     pub view: View,
     pub list_state: ListState,
+    // 守护进程返回的**全量**列表。除了重算 `visible`，界面不该直接读它——
+    // 读了就会把别的项目的会话画上屏，那正是这套机制要修的 bug。
     pub sessions: Vec<SessionInfo>,
+    // 当前作用域下真正上屏的那些，由 `refresh_visible()` 从 `sessions` 派生。
+    //
+    // 派生出一份 Vec 而不是留一个过滤器函数或一张下标映射表：`board`/`grid`/
+    // `mod` 里的光标、焦点、`session_action` 全都是**按下标**索引会话的。
+    // 换成一份已经筛好的 Vec，这些调用点逻辑一个字都不用改；映射表则要求
+    // 每一处都记得转换一次，漏一处就是「选中第 3 行、停掉第 5 个会话」
+    // 这种最难查的 bug。
+    pub visible: Vec<SessionInfo>,
+    pub scope: super::view::Scope,
     pub message: Msg,
     pub screen: Vec<Vec<ScreenSpan>>,
     pub screen_cursor: (u16, u16),
@@ -86,6 +97,10 @@ impl App {
             view: View::Board,
             list_state: ListState::default(),
             sessions: Vec::new(),
+            visible: Vec::new(),
+            // 每次启动都从「只看当前项目」开始。作用域不持久化：它是个
+            // 临时的查看动作，不是配置。
+            scope: super::view::Scope::CurrentProject,
             message: "".into(),
             screen: Vec::new(),
             screen_cursor: (0, 0),
@@ -133,6 +148,47 @@ impl App {
         (app, dir)
     }
 
+    /// 装入守护进程刚返回的会话列表。**赋值和重算必须成对发生**，所以
+    /// 主循环走这条路而不是直接写 `app.sessions = v`——直接赋值的话，
+    /// 这一帧还会拿着上一轮的 `visible` 去画，刚开的会话要等下一轮才出现。
+    pub fn set_sessions(&mut self, v: Vec<SessionInfo>) {
+        self.sessions = v;
+        self.refresh_visible();
+    }
+
+    /// 从 `sessions` 重算 `visible`，然后把光标和焦点收拢进新的范围。
+    ///
+    /// 只该在三个地方调用，多一处是白算，少一处是屏幕说谎：
+    /// 拉到新的会话列表之后、`scope` 被切换时、`current_dir` 被改变时。
+    pub fn refresh_visible(&mut self) {
+        self.visible = super::view::visible_sessions(&self.sessions, self.scope, &self.current_dir);
+
+        // 收拢到**末项**而不是首项：用户的注意力在列表尾部时，弹回第一行
+        // 会让他以为自己选中的会话被删了。
+        match self.visible.len() {
+            0 => {
+                // 零个 item 上还留着 Some(0)，List 会画一条悬空的高亮
+                self.list_state.select(None);
+                if let View::Grid { focus } = &mut self.view {
+                    *focus = 0;
+                }
+            }
+            n => {
+                let last = n - 1;
+                // 只在越界时才动它。没选中过就保持没选中——这里不负责
+                // 「替用户选一个」，那是 `move_sel` 和进入视图时的事。
+                if let Some(i) = self.list_state.selected() {
+                    if i > last {
+                        self.list_state.select(Some(last));
+                    }
+                }
+                if let View::Grid { focus } = &mut self.view {
+                    *focus = (*focus).min(last);
+                }
+            }
+        }
+    }
+
     /// 拿到活的守护进程连接；构造时没能连上（目前只有测试会这样构造）就
     /// 报「守护进程连不上」——跟真实断线共用同一条错误路径，调用方不用
     /// 为“压根没连过”单独判一次。
@@ -159,6 +215,79 @@ mod tests {
         assert_eq!(app.message.text, "");
         assert!(!app.quit);
         assert!(app.need_sessions, "开机第一轮必须拉一次会话列表");
+    }
+
+    fn sess(id: u32, dir: &str) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: crate::session::SessionState::Idle,
+            activity: String::new(),
+        }
+    }
+
+    /// 过滤会让列表变短，而光标是个下标。不收拢的话，`grid.rs` 里
+    /// `move_focus` 的 `total - page_start` 在 release 下会**下溢**，
+    /// debug 下则直接撞上那条 `debug_assert!(focus < total)`。
+    #[test]
+    fn refresh_visible_clamps_the_cursor_into_the_new_range() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.sessions = vec![
+            sess(1, "/w/a"),
+            sess(2, "/w/b"),
+            sess(3, "/w/b"),
+            sess(4, "/w/b"),
+            sess(5, "/w/a"),
+        ];
+        app.list_state.select(Some(4));
+        app.view = View::Grid { focus: 4 };
+
+        app.refresh_visible();
+
+        assert_eq!(app.visible.len(), 2, "当前项目只有两个会话");
+        assert_eq!(
+            app.list_state.selected(),
+            Some(1),
+            "光标收拢到末项而不是首项——注意力在列表尾部时弹回第一行，\
+             用户会以为自己选中的会话没了"
+        );
+        assert!(matches!(app.view, View::Grid { focus: 1 }), "焦点同样收拢");
+    }
+
+    /// 作用域空了就没有格子可焦。光标必须是 `None` 而不是 `Some(0)`：
+    /// `Some(0)` 会让列表在零个 item 上画高亮条。
+    #[test]
+    fn refresh_visible_drops_the_cursor_when_nothing_is_visible() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+        app.sessions = vec![sess(1, "/w/b")];
+        app.list_state.select(Some(0));
+        app.view = View::Grid { focus: 3 };
+
+        app.refresh_visible();
+
+        assert!(app.visible.is_empty());
+        assert_eq!(app.list_state.selected(), None);
+        assert!(matches!(app.view, View::Grid { focus: 0 }));
+    }
+
+    /// 主循环每轮拿到新的会话列表时走这条路。存在的理由是「赋值 + 重算」
+    /// 必须成对发生 —— 直接写 `app.sessions = v` 的话，屏幕会拿旧的
+    /// `visible` 再画一帧，刚开的会话要等下一轮才出现。
+    #[test]
+    fn set_sessions_recomputes_the_visible_list() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/a");
+
+        app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
+
+        assert_eq!(
+            app.visible.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1],
+            "拿到新列表的同一时刻就要筛好，不能留到下一帧"
+        );
     }
 
     /// start_dir 只用来解析用户敲的相对路径，永不改变；current_dir 是

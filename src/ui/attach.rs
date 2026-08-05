@@ -31,11 +31,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     } else if key.code == KeyCode::F(3) {
         // F3 = 直接切到下一个在跑的会话，不用先退回看板。选 F3 沿用
         // F2 的理由：没有 CLI agent 用 F 功能键，偷它不踩任何人。
-        match super::grid::next_running(&app.sessions, id) {
-            Some(next) => {
-                app.view = View::Attached(next);
-                app.need_sessions = true; // 会话标题要显示新会话的项目名
-            }
+        // 在 `visible` 里找下一个，不是全量：F3 该在你眼下这批会话里轮转。
+        // 进会话时当前项目已经跟着切过去了（见 `enter_session`），所以正在
+        // 附加的这个必定在 `visible` 里，轮转起点不会落空。
+        match super::grid::next_running(&app.visible, id) {
+            Some(next) => super::enter_session(app, next),
             None => app.message = "没有其他正在跑的会话".into(),
         }
     } else if let Some(text) = key_to_input(&key) {
@@ -125,6 +125,9 @@ mod tests {
             session(2, SessionState::Stopped),
             session(3, SessionState::Idle),
         ];
+        // `session()` 的 dir 是 /tmp/a：对上当前项目，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Attached(1);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(
@@ -139,6 +142,8 @@ mod tests {
         // 唯一在跑的会话按 F3：不能跳回自己，也不能悄无声息什么都不做。
         let (mut app, _dir) = App::test_app();
         app.sessions = vec![session(1, SessionState::Working)];
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Attached(1);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(matches!(app.view, View::Attached(1)), "不能跳回自己");

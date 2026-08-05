@@ -210,11 +210,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                 } else {
                     let p = expand_path(&buf, &app.start_dir);
                     if p.is_dir() {
-                        // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
-                        app.message =
-                            format!("已切到 {}", short_path(&p.display().to_string())).into();
-                        app.current_dir = p;
-                        app.view = View::Board;
+                        super::switch_project(app, p);
                     } else {
                         // 不是 git 仓库这件事不在这里判——留给 create()
                         app.message = Msg::err(format!("{} 不是一个目录", p.display()));
@@ -283,9 +279,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                 } else {
                     let p = PathBuf::from(&shown[i]);
                     if p.is_dir() {
-                        app.message = format!("已切到 {}", short_path(&shown[i])).into();
-                        app.current_dir = p;
-                        app.view = View::Board;
+                        super::switch_project(app, p);
                     } else {
                         // 列表里那条不删——可能只是外置盘没挂
                         app.message = Msg::err(format!("{} 现在找不到了", short_path(&shown[i])));
@@ -495,6 +489,7 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::ListState;
 
@@ -618,6 +613,48 @@ mod tests {
             })
         });
         assert!(red, "有 warning 时边框要是红的");
+    }
+
+    /// 换完项目就得看到新项目的会话。等下一轮 `need_sessions` 才重算的话，
+    /// 中间那一帧画的是上一个项目的会话、底栏却已经写着新项目——正是这一版
+    /// 让用户觉得「同一个 session 变成了不同的项目」的那一幕。
+    #[test]
+    fn confirming_a_project_recomputes_the_visible_sessions_at_once() {
+        use crate::session::{SessionInfo, SessionState};
+        let (mut app, dir) = App::test_app();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+
+        let mk = |id: u32, d: &std::path::Path| SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: d.display().to_string(),
+            state: SessionState::Idle,
+            activity: String::new(),
+        };
+        app.sessions = vec![mk(1, &a), mk(2, &b)];
+        app.current_dir = a.clone();
+        app.refresh_visible();
+        assert_eq!(app.visible.len(), 1, "前提：a 项目下只有会话 1");
+
+        let mut st = ListState::default();
+        st.select(Some(0));
+        app.view = View::PickProject {
+            all: vec![b.display().to_string()],
+            filter: String::new(),
+            state: st,
+            typing_path: None,
+        };
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+
+        assert_eq!(app.current_dir, b, "项目切过去了");
+        assert_eq!(
+            app.visible.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2],
+            "屏幕上的会话必须同一时刻跟着换，不能等下一轮"
+        );
     }
 
     #[test]

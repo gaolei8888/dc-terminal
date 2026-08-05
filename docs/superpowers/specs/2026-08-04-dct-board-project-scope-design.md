@@ -1,6 +1,6 @@
 # dct 看板按项目过滤 —— 设计
 
-**状态：** 待用户 review
+**状态：** 已实现（`feat/board-project-scope`），待用户 review 设计判断
 **位置：** 换项目重做四步（D → A → B → C）的第一步
 **取代：** 无。`2026-08-03-dct-project-switch-design.md` 描述的 `p` 键换项目本身保留，这里补的是它一直缺的那一半
 
@@ -178,6 +178,20 @@ fn visible_sessions(all: &[SessionInfo], scope: Scope, project: &Path) -> Vec<Se
 | `src/ui/attach.rs` | 进入跨项目会话时切换 `current_dir` |
 
 守护进程侧（`daemon.rs`、`session.rs`、`proto.rs`）**零改动**。
+
+## 实施中发现的一处计划外改动
+
+加 `a` 键时撞上一个**既有** bug：底栏的按键表是单行截断的，原文案已经 91 列宽，
+而 80 列终端上右段只剩 57 列——`u 回滚` / `s 停止` / `d 改动` 长期被右端整个截掉，
+其中两个是不可撤销的操作。`a` 只是把 `u 回滚` 也挤了出去，让它暴露出来。
+
+修法：底栏从 3 行改成 4 行（上下边框 + **两行**文字），并且自己折行而不是用
+ratatui 的 `Wrap`——`Wrap` 在任何空白处断，会把「p 换项目」拆成行尾一个孤零零的
+`p` 加下一行的「换项目」，屏幕上看起来像两个键、其中一个还没名字。折行逻辑是
+`widgets::wrap_help`，只在分隔符（两个半角空格 / 一个全角空格）处断。
+
+代价是内容区少一行。收益是看板和九宫格的**每一个键**在 80 列下都真的画得出来，
+由 `every_board_key_is_actually_on_screen_at_eighty_columns` 和它的九宫格版本钉住。
 
 ## 之后
 

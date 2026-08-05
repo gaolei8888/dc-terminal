@@ -9,7 +9,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
 use super::app::App;
-use super::view::{is_plain_key, View};
+use super::view::{is_plain_key, Scope, View};
 use super::widgets::{char_width, screen_to_lines, status_label, status_style};
 use super::{dim, session_action};
 use crate::proto::ScreenEntry;
@@ -138,7 +138,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::Grid { focus } = app.view else {
         return Ok(());
     };
-    let total = app.sessions.len();
+    let total = app.visible.len();
     match key.code {
         KeyCode::Up => {
             app.view = View::Grid {
@@ -176,20 +176,20 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('p') if is_plain_key(&key) => super::open_project_picker(app),
         KeyCode::Char('c') if is_plain_key(&key) => super::open_secrets(app),
+        // 跟看板同一个键、同一个 app.scope：作用域跟着用户走，不跟着视图走
+        KeyCode::Char('a') if is_plain_key(&key) => super::toggle_scope(app),
         KeyCode::Enter => {
-            if let Some(id) = app.sessions.get(focus).map(|s| s.id) {
-                // 会话标题要显示项目名
-                app.need_sessions = true;
+            if let Some(id) = app.visible.get(focus).map(|s| s.id) {
                 // 放大也是一条离开九宫格的路：从会话里再退出来就到了列表，
                 // 那时候光标同样得落在这个会话上（见 sync_board_cursor_from_grid）
                 super::sync_board_cursor_from_grid(app);
-                app.view = View::Attached(id);
+                super::enter_session(app, id);
             }
         }
         // 跟看板同一套动作，作用在焦点格上——共用 `session_action`，
         // 不各抄一份（抄了将来只会改一半）。
         KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') if is_plain_key(&key) => {
-            app.message = match app.sessions.get(focus).map(|s| s.id) {
+            app.message = match app.visible.get(focus).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
                 None => "还没有会话".into(),
             };
@@ -206,10 +206,11 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     draw_grid(
         f,
         area,
-        &app.sessions,
+        &app.visible,
         &app.grid_screens,
         focus,
         app.connected,
+        app.scope,
     );
 }
 
@@ -225,6 +226,7 @@ fn draw_grid(
     screens: &[ScreenEntry],
     focus: usize,
     connected: bool,
+    scope: Scope,
 ) {
     if area.width < MIN_COLS || area.height < MIN_ROWS {
         // 说人话说清下一步做什么：这是用户自己能修好的事
@@ -236,11 +238,16 @@ fn draw_grid(
     }
     if sessions.is_empty() {
         // `n` 在九宫格里跟在列表里是同一个键，直接说怎么开，别让用户
-        // 先绕回列表
-        f.render_widget(
-            Paragraph::new("还没有会话，按 n 开一个").centered(),
-            centered_line(area),
-        );
+        // 先绕回列表。
+        //
+        // 「只看当前项目」时还要多说一句 `a`：别的项目可能正跑着会话，
+        // 只说「还没有会话」会让用户以为 dct 把它们弄丢了——这正是这一版
+        // 被判为「混乱」的那类体验。
+        let empty = match scope {
+            Scope::CurrentProject => "这个项目还没有会话，按 n 开一个，按 a 看全部项目",
+            Scope::AllProjects => "还没有任何会话，按 n 开一个",
+        };
+        f.render_widget(Paragraph::new(empty).centered(), centered_line(area));
         return;
     }
 
@@ -279,13 +286,23 @@ fn draw_grid(
         let focused = start + i == focus;
         // 标题就是状态指示器：状态词用 status_style 上色，跟列表同一套颜色
         // （已停止是灰的），扫一眼九个格子就知道谁在干活、谁停了。
-        let title = Line::from(vec![
+        let mut title = vec![
             Span::raw(format!(" {} {} ", info.id, info.profile)),
             Span::styled(
                 format!("{} ", status_label(info.state)),
                 status_style(info.state),
             ),
-        ]);
+        ];
+        // 全部项目视图里九个格子长得都一样，不点名项目就分不出谁是谁。
+        // 只看当前项目时不加：底栏已经写了，加了是把边框宽度花在废话上。
+        if scope == Scope::AllProjects {
+            let project = std::path::Path::new(&info.dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| info.dir.clone());
+            title.push(Span::styled(format!("{project} "), dim()));
+        }
+        let title = Line::from(title);
         // 断连时整屏格子一律红框：九个静止的画面看上去跟活的一模一样，
         // 不给个视觉提示，用户会以为 agent 都不动了（列表和会话视图断连时
         // 也是转红框，三处一致）。焦点格用青色；其余用 DIM 而不是 DarkGray——
@@ -486,11 +503,89 @@ mod tests {
         }
     }
 
+    fn session_in(id: u32, dir: &str) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+        }
+    }
+
+    fn grid_text(app: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, f.area(), app)).unwrap();
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        (0..a.height)
+            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 九宫格跟列表必须看到同一批会话。只修列表不修格子的话，用户按 `g`
+    /// 就会看到刚刚被过滤掉的那些会话又冒出来。
+    #[test]
+    fn the_grid_never_shows_another_projects_sessions() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
+        app.sessions = vec![
+            session_in(1, "/w/dc-terminal"),
+            session_in(2, "/w/dc_desktop"),
+        ];
+        app.refresh_visible();
+        app.view = View::Grid { focus: 0 };
+
+        let c = grid_text(&mut app);
+        assert!(c.contains("1claude"), "当前项目的格子要在：{c}");
+        assert!(!c.contains("2claude"), "别的项目的格子不能画出来：{c}");
+    }
+
+    /// 全部项目视图里，格子标题要点名项目——九个格子长得都一样，
+    /// 不标名字用户分不出哪个格子属于哪个项目。
+    #[test]
+    fn the_all_projects_grid_names_each_tiles_project() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
+        app.sessions = vec![
+            session_in(1, "/w/dc-terminal"),
+            session_in(2, "/w/dc_desktop"),
+        ];
+        app.scope = Scope::AllProjects;
+        app.refresh_visible();
+        app.view = View::Grid { focus: 0 };
+
+        let c = grid_text(&mut app);
+        assert!(c.contains("dc_desktop"), "格子标题要带项目名：{c}");
+    }
+
+    /// 当前项目一个会话都没有时，别只说「还没有会话」——别的项目可能正跑着，
+    /// 得告诉用户怎么看到它们，否则他会以为 dct 把会话弄丢了。
+    #[test]
+    fn an_empty_scope_tells_the_user_how_to_see_the_other_projects() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
+        app.sessions = vec![session_in(2, "/w/dc_desktop")];
+        app.refresh_visible();
+        app.view = View::Grid { focus: 0 };
+
+        let c = grid_text(&mut app);
+        assert!(c.contains("a"), "空状态要提到 a 键：{c}");
+        assert!(c.contains("全部项目"), "并说明它能看到什么：{c}");
+    }
+
     /// 焦点从 0 一路走到 2 再走回来，视图始终留在九宫格里。
     #[test]
     fn arrows_move_the_focus_and_stay_in_the_grid() {
         let (mut app, _dir) = App::test_app();
         app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Grid { focus: 0 };
 
         handle_key(&mut app, key(KeyCode::Right)).unwrap();
@@ -508,6 +603,9 @@ mod tests {
         // 跟会话视图里的 F3 是同一个动作，两处语义一致
         let (mut app, _dir) = App::test_app();
         app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Grid { focus: 2 };
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(matches!(app.view, View::Grid { focus: 0 }), "到头回绕");
@@ -518,6 +616,9 @@ mod tests {
         // 格子只读，交互全靠放大——这条路径断了，九宫格就没法用了
         let (mut app, _dir) = App::test_app();
         app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Grid { focus: 2 };
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Attached(3)));
@@ -528,6 +629,9 @@ mod tests {
     fn g_goes_back_to_the_list() {
         let (mut app, _dir) = App::test_app();
         app.sessions = vec![session(1, SessionState::Idle)];
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Grid { focus: 0 };
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
         assert!(matches!(app.view, View::Board));
@@ -539,6 +643,9 @@ mod tests {
     fn g_moves_the_list_cursor_to_the_focused_tile() {
         let (mut app, _dir) = App::test_app();
         app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.list_state.select(Some(0));
         app.view = View::Grid { focus: 4 };
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
@@ -559,6 +666,9 @@ mod tests {
     fn the_cursor_sync_follows_the_focus_and_leaves_other_views_alone() {
         let (mut app, _dir) = App::test_app();
         app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.list_state.select(Some(0));
         app.view = View::Grid { focus: 4 };
         super::super::sync_board_cursor_from_grid(&mut app);
@@ -577,6 +687,9 @@ mod tests {
         // 那时候光标得在刚才看的那个会话上。
         let (mut app, _dir) = App::test_app();
         app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.list_state.select(Some(0));
         app.view = View::Grid { focus: 3 };
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
@@ -592,6 +705,9 @@ mod tests {
         // 做的是看板上同名键的那件事，不是「打字」。
         let (mut app, _dir) = App::test_app();
         app.sessions = vec![session(1, SessionState::Idle)];
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Grid { focus: 0 };
         for c in ['x', '中', 'z'] {
             handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
@@ -604,6 +720,9 @@ mod tests {
     fn q_quits_from_the_grid_just_like_from_the_list() {
         let (mut app, _dir) = App::test_app();
         app.sessions = vec![session(1, SessionState::Idle)];
+        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.view = View::Grid { focus: 0 };
         handle_key(&mut app, key(KeyCode::Char('q'))).unwrap();
         assert!(app.quit);
@@ -620,12 +739,18 @@ mod tests {
         for c in ['n', 'N', 'p', 'c'] {
             let (mut on_board, _d1) = App::test_app();
             on_board.sessions = vec![session(1, SessionState::Idle)];
+            // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+            on_board.current_dir = std::path::PathBuf::from("/tmp/a");
+            on_board.refresh_visible();
             on_board.list_state.select(Some(0));
             on_board.view = View::Board;
             super::super::board::handle_key(&mut on_board, key(KeyCode::Char(c))).unwrap();
 
             let (mut on_grid, _d2) = App::test_app();
             on_grid.sessions = vec![session(1, SessionState::Idle)];
+            // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
+            on_grid.current_dir = std::path::PathBuf::from("/tmp/a");
+            on_grid.refresh_visible();
             on_grid.view = View::Grid { focus: 0 };
             handle_key(&mut on_grid, key(KeyCode::Char(c))).unwrap();
 
@@ -711,8 +836,18 @@ mod tests {
         ];
         let screens = vec![entry(1, "hello-from-one"), entry(2, "hello-from-two")];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &screens, 0, true))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &screens,
+                0,
+                true,
+                Scope::CurrentProject,
+            )
+        })
+        .unwrap();
 
         let c = squashed(&term);
         assert!(c.contains("干活中"), "干活中的会话要标出来：{c}");
@@ -733,7 +868,7 @@ mod tests {
             session(2, SessionState::Idle),
         ];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, true))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, true, Scope::CurrentProject))
             .unwrap();
 
         let buf = term.backend().buffer();
@@ -765,7 +900,7 @@ mod tests {
             session(2, SessionState::Working),
         ];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, false))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 1, false, Scope::CurrentProject))
             .unwrap();
 
         let buf = term.backend().buffer();
@@ -803,8 +938,18 @@ mod tests {
         let sessions = vec![session(1, SessionState::Working)];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.set_cursor_position((7, 7)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(1, "x")], 0, true))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[entry(1, "x")],
+                0,
+                true,
+                Scope::CurrentProject,
+            )
+        })
+        .unwrap();
         assert_eq!(
             term.get_cursor_position().unwrap(),
             ratatui::layout::Position { x: 7, y: 7 },
@@ -818,20 +963,20 @@ mod tests {
 
         let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true))
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true, Scope::CurrentProject))
             .unwrap();
         assert!(squashed(&term).contains("1/2"), "多页要画页码");
 
         // 翻到第二页：页码跟着走
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 9, true))
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 9, true, Scope::CurrentProject))
             .unwrap();
         assert!(squashed(&term).contains("2/2"));
 
         // 单页画 1/1 是噪音
         let few: Vec<SessionInfo> = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &few, &[], 0, true))
+        term.draw(|f| draw_grid(f, f.area(), &few, &[], 0, true, Scope::CurrentProject))
             .unwrap();
         assert!(!squashed(&term).contains("1/1"), "单页不画页码");
     }
@@ -842,7 +987,7 @@ mod tests {
 
         let sessions: Vec<SessionInfo> = (1..=9).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 0, true))
+        term.draw(|f| draw_grid(f, f.area(), &sessions, &[], 0, true, Scope::CurrentProject))
             .unwrap();
         let c = squashed(&term);
         assert!(c.contains("窗口太小"), "画不下就直说：{c}");
@@ -855,7 +1000,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &[], &[], 0, true))
+        term.draw(|f| draw_grid(f, f.area(), &[], &[], 0, true, Scope::CurrentProject))
             .unwrap();
         let c = squashed(&term);
         assert!(
@@ -877,7 +1022,7 @@ mod tests {
         // 看起来像边框破了个洞。现在先从底部切一行出来给它。
         let many: Vec<SessionInfo> = (1..=12).map(|i| session(i, SessionState::Idle)).collect();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true))
+        term.draw(|f| draw_grid(f, f.area(), &many, &[], 0, true, Scope::CurrentProject))
             .unwrap();
 
         let text = buffer_text(term.backend().buffer());
@@ -897,8 +1042,18 @@ mod tests {
         // 不能因为找不到画面就整格消失。
         let sessions = vec![session(7, SessionState::Working)];
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_grid(f, f.area(), &sessions, &[entry(99, "别人的画面")], 0, true))
-            .unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[entry(99, "别人的画面")],
+                0,
+                true,
+                Scope::CurrentProject,
+            )
+        })
+        .unwrap();
         let c = squashed(&term);
         assert!(c.contains("干活中"), "标题照画：{c}");
         assert!(

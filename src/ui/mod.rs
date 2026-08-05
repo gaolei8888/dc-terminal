@@ -17,7 +17,7 @@ use crate::session::SessionInfo;
 use crate::theme::Theme;
 
 mod widgets;
-use widgets::{short_path, truncate};
+use widgets::short_path;
 pub use widgets::{status_label, status_style, Msg};
 
 mod app;
@@ -33,7 +33,7 @@ mod view;
 use view::SecretPhase;
 use view::{
     back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
-    session_ended_notice, View,
+    session_ended_notice, Scope, View,
 };
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
@@ -304,14 +304,14 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         if app.need_sessions || !attached {
             match app.client().and_then(|c| c.call(Request::List)) {
                 Ok(Response::Sessions(v)) => {
-                    app.sessions = v;
+                    app.set_sessions(v);
                     app.connected = true;
                 }
                 _ => app.connected = false,
             }
             app.need_sessions = false;
         }
-        if app.list_state.selected().is_none() && !app.sessions.is_empty() {
+        if app.list_state.selected().is_none() && !app.visible.is_empty() {
             app.list_state.select(Some(0));
         }
         // 会话可能在两轮之间消失（自己退了、被 s 停掉清了），焦点必须跟着
@@ -320,7 +320,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         // 的页长，格子全乱。收在这里（拉完列表、画之前）是唯一能保证
         // 渲染和按键看到的是同一个合法焦点的地方。
         if let View::Grid { focus } = app.view {
-            let last = app.sessions.len().saturating_sub(1);
+            let last = app.visible.len().saturating_sub(1);
             if focus > last {
                 app.view = View::Grid { focus: last };
             }
@@ -329,7 +329,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
             let page = grid::page_of(focus);
             let start = page * grid::TILES_PER_PAGE;
             let ids: Vec<u32> = app
-                .sessions
+                .visible
                 .iter()
                 .skip(start)
                 .take(grid::TILES_PER_PAGE)
@@ -680,6 +680,59 @@ fn selected<'a>(sessions: &'a [SessionInfo], st: &ListState) -> Option<&'a Sessi
     st.selected().and_then(|i| sessions.get(i))
 }
 
+/// 切到另一个项目：告诉用户、改 `current_dir`、重算作用域、回看板。
+///
+/// 抽成一个函数是因为选择器有两条确认路径（列表选中、手输路径），
+/// 而这四步必须整套发生。分开写的话，漏掉重算的那条路会让屏幕停在
+/// 上一个项目的会话上、底栏却已经写着新项目——用户看到的就是
+/// 「同一个 session 变成了不同的项目」。
+pub(crate) fn switch_project(app: &mut App, dir: std::path::PathBuf) {
+    // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
+    app.message = format!("已切到 {}", short_path(&dir.display().to_string())).into();
+    app.current_dir = dir;
+    app.refresh_visible();
+    app.view = View::Board;
+}
+
+/// 进一个会话。会话属于别的项目时，当前项目跟着切过去。
+///
+/// 「你在哪个会话里，当前项目就是哪个」——不这么做的话，从「全部项目」
+/// 视图进了别的项目的会话，按 F2 回来时它已经被过滤掉了，看起来像是
+/// 消失了；而且随手按 `n` 新建会话会开在一个你并没有在看的项目里。
+///
+/// 切了就必须说一声。静默改变当前项目正是这一版被判为「混乱」的原因。
+pub(crate) fn enter_session(app: &mut App, id: u32) {
+    // 在全量列表里找，不是 visible：从「全部项目」进来的那个会话，
+    // 正是当前作用域看不见的那一个。
+    if let Some(dir) = app
+        .sessions
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| std::path::PathBuf::from(&s.dir))
+    {
+        if !view::same_project(&dir, &app.current_dir) {
+            app.message = format!("已切到 {}", short_path(&dir.display().to_string())).into();
+            app.current_dir = dir;
+            app.refresh_visible();
+        }
+    }
+    // 会话标题要显示项目名
+    app.need_sessions = true;
+    app.view = View::Attached(id);
+}
+
+/// `a` 键：在「只看当前项目」和「全部项目」之间切换。看板和九宫格共用。
+///
+/// 切完立刻重算，不等下一轮 `need_sessions`——那要等到 300ms 之后，
+/// 用户会以为这个键没反应，然后再按一次又切回去。
+fn toggle_scope(app: &mut App) {
+    app.scope = match app.scope {
+        Scope::CurrentProject => Scope::AllProjects,
+        Scope::AllProjects => Scope::CurrentProject,
+    };
+    app.refresh_visible();
+}
+
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
 /// 项目选择器和会话看板共用它。
 fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
@@ -919,7 +972,11 @@ const ESCAPE_HINT_COLS: u16 = 19;
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
+    // 底栏 4 行 = 上下边框 + **两行**文字。给到两行是因为看板那张按键表
+    // 有 105 列宽，挤在一行里时 80 列终端只剩 57 列可用，`u 回滚`/`s 停止`/
+    // `d 改动` 长期被右端整个截掉——这三个里有两个是不可撤销的操作，
+    // 屏幕上没写却真的管用的键，就是等着用户误按。
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(f.area());
 
     // 穷尽匹配而不是 if/else 链：少一个 View 变体的分支，if/else 链的兜底
     // `else` 会悄悄把新变体也归给 secret::draw，画出一片空白也照样编译通过；
@@ -946,7 +1003,10 @@ fn draw(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Red),
         )
     } else if app.message.text.is_empty() {
-        (idle_help(&app.view).to_string(), Style::default())
+        (
+            idle_help(&app.view, app.scope).to_string(),
+            Style::default(),
+        )
     } else if app.message.error {
         (app.message.text.clone(), Style::default().fg(Color::Red))
     } else {
@@ -977,10 +1037,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         Paragraph::new(escape_hint(&app.view)).style(Style::default().fg(Color::Cyan)),
         bar[0],
     );
-    f.render_widget(
-        Paragraph::new(truncate(&help, bar[1].width as usize)).style(style),
-        bar[1],
-    );
+    // 折行而不是截断：截断会把句尾那几个键悄悄抹掉，而用户没有任何线索
+    // 知道自己少看了几个键。折行用 `wrap_help` 而不是 ratatui 的 `Wrap`，
+    // 理由见那个函数——`Wrap` 会把「p 换项目」拆成行尾一个孤零零的 `p`。
+    let lines: Vec<Line> = widgets::wrap_help(&help, bar[1].width as usize)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    f.render_widget(Paragraph::new(lines).style(style), bar[1]);
 }
 
 #[cfg(test)]
@@ -1238,6 +1302,50 @@ mod tests {
     /// 两者一旦脱节，左段会把逃生键**静默截断**——而逃生键正是用户卡住时
     /// 唯一的出路，截断了不会报错、只会让人退不出来。所以这里穷举所有视图，
     /// 要求常量真的容得下最长的那一条。
+    /// 底栏的按键表原来挤在一行里，91 列宽的文案塞进 80 列终端只剩 57 列可用
+    /// ——`u 回滚`/`s 停止`/`d 改动` 三个键长期被右端截掉，写了等于没写，
+    /// 而这三个里有两个是不可撤销的操作。给它第二行，把键全都露出来。
+    #[test]
+    fn every_board_key_is_actually_on_screen_at_eighty_columns() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Board;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+
+        for key in ["n新建", "p换项目", "a看全部项目", "u回滚", "s停止", "d改动"] {
+            assert!(c.contains(key), "按键表里的「{key}」被截掉了：{c}");
+        }
+    }
+
+    /// 九宫格那一句比看板的还长，而且多一个 `q 退出`——在这个视图里左段写的
+    /// 是「Ctrl+Q 回列表」，`q` 却照样关掉整个 dct。这种「屏幕上没写却真管用」
+    /// 的键最危险，必须真的画出来数一遍，不能靠手算截断宽度。
+    #[test]
+    fn every_grid_key_is_actually_on_screen_at_eighty_columns() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Grid { focus: 0 };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+
+        for key in [
+            "q退出",
+            "n新建",
+            "p换项目",
+            "a看全部项目",
+            "u回滚",
+            "s停止",
+            "d改动",
+        ] {
+            assert!(c.contains(key), "九宫格按键表里的「{key}」被截掉了：{c}");
+        }
+    }
+
     #[test]
     fn escape_hint_cols_fits_every_view() {
         use unicode_width::UnicodeWidthStr;
