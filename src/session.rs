@@ -1,4 +1,5 @@
-use anyhow::{bail, Context, Result};
+use crate::proto::{coded, ErrorCode, Operation};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,9 @@ pub enum SessionState {
     Asking,
     Idle,
     Stopped,
+    /// agent 报错了（`error_pattern` 命中）。会话还活着、进程还在，
+    /// 但屏幕上摆着一句失败——这跟「空闲」是两回事。
+    Failed,
     /// profile 没给任何 pattern，我们不知道它在干什么。
     /// 显示「—」而不是猜一个——`shell` 以前就是被猜成「干活中」的。
     Unknown,
@@ -53,6 +57,9 @@ struct Session {
     /// 干活时屏幕上一定有的串，tick() 里判定状态用。跟 idle_re 一起在
     /// 构造时编译好，profile 的正则错误在起会话这一刻就暴露，不拖到 tick。
     busy_re: Option<regex::Regex>,
+    /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
+    /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
+    error_re: Option<regex::Regex>,
     pty: PtySession,
 }
 
@@ -116,7 +123,7 @@ impl SessionManager {
         if let Some(p) = recover(self.extra_profiles.lock()).get(name) {
             return Ok(p.clone());
         }
-        Profile::builtin(name).ok_or_else(|| anyhow::anyhow!("没有这个 profile: {name}"))
+        Profile::builtin(name).ok_or_else(|| coded(ErrorCode::NoSuchProfile(name.to_string())))
     }
 
     /// `secret` 是调用方已经查好的那一条密钥（如果这个 profile 需要密钥、且用户填过的话），
@@ -134,7 +141,7 @@ impl SessionManager {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
         if !dir.is_dir() {
-            bail!("目录不存在: {}", dir.display());
+            return Err(coded(ErrorCode::DirNotFound(dir.display().to_string())));
         }
 
         // 原子分配 id：即便后面的慢操作失败，这个 id 也不会被复用给另一次并发的
@@ -147,11 +154,12 @@ impl SessionManager {
         // agent 直接在用户的真实项目里干活。检查点是隐藏快照，不动分支和历史，
         // 所以仍然要求是 git 仓库——没有 git 就没有撤销。
         if profile.is_agent && !git::is_repo(dir) {
-            bail!("{} 不是 git 仓库，无法开 agent 会话", dir.display());
+            return Err(coded(ErrorCode::NotAGitRepo(dir.display().to_string())));
         }
 
         let idle_re = profile.idle_regex()?;
         let busy_re = profile.busy_regex()?;
+        let error_re = profile.error_regex()?;
         let is_agent = profile.is_agent;
 
         // 有 pattern 才敢说「干活中」：agent 刚起来确实在初始化。
@@ -184,8 +192,10 @@ impl SessionManager {
             // 「fatal: detected dubious ownership in repository at …」
             // 原样飘到选择器/密钥失败提示上（后者尤其误导，会被用户读成
             // 「我的密钥不对」）。
-            checkpoints
-                .push(git::checkpoint(dir, id, 0).context("拍不了检查点，这个会话没法安全撤销")?);
+            checkpoints.push(
+                git::checkpoint(dir, id, 0)
+                    .map_err(|_| coded(ErrorCode::OperationFailed(Operation::FirstCheckpoint)))?,
+            );
         }
 
         let session = Session {
@@ -197,6 +207,7 @@ impl SessionManager {
             state,
             idle_re,
             busy_re,
+            error_re,
             pty,
         };
 
@@ -217,7 +228,7 @@ impl SessionManager {
         recover(self.sessions.lock())
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("没有这个会话: {id}"))
+            .ok_or_else(|| coded(ErrorCode::NoSuchSession(id)))
     }
 
     /// 找到会话、拿到它自己的锁、跑 `f`——`sessions` 这个总表的锁只用来查一次
@@ -268,7 +279,7 @@ impl SessionManager {
                 // 慢，无锁。失败时给中文上下文，理由同 create() 里那处——
                 // 见那边的注释。
                 let sha = git::checkpoint(&dir, sid, seq)
-                    .context("拍检查点失败，这一步的改动可能没法撤销")?;
+                    .map_err(|_| coded(ErrorCode::OperationFailed(Operation::Checkpoint)))?;
                 let mut s = recover(arc.lock());
                 if s.checkpoints.last() != Some(&sha) {
                     s.checkpoints.push(sha);
@@ -323,30 +334,30 @@ impl SessionManager {
 
     /// 恢复到最后一张快照。git 操作同样不持会话锁，理由见 `send_input`。
     pub fn undo(&self, id: u32) -> Result<()> {
-        let (dir, sha) = self.checkpoint_base(id, "这个会话没有检查点")?;
+        let (dir, sha) = self.checkpoint_base(id)?;
         // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
-        git::restore(&dir, &sha).context("撤销失败，工作区可能停在了改到一半的状态")
+        git::restore(&dir, &sha).map_err(|_| coded(ErrorCode::OperationFailed(Operation::Undo)))
     }
 
     /// 相对最后一张快照改了哪些文件。git 操作不持会话锁。
     pub fn diff(&self, id: u32) -> Result<Vec<FileStat>> {
-        let (dir, base) = self.checkpoint_base(id, "这个会话没有改动记录")?;
+        let (dir, base) = self.checkpoint_base(id)?;
         // 失败时给中文上下文，理由同 create() 里那处——见那边的注释。
-        git::diff_stat(&dir, &base).context("算不出改了哪些文件，再试一次")
+        git::diff_stat(&dir, &base).map_err(|_| coded(ErrorCode::OperationFailed(Operation::Diff)))
     }
 
     /// 取出做 git 操作需要的信息后立刻放锁。
-    fn checkpoint_base(&self, id: u32, not_agent: &str) -> Result<(PathBuf, String)> {
+    fn checkpoint_base(&self, id: u32) -> Result<(PathBuf, String)> {
         let arc = self.get_arc(id)?;
         let s = recover(arc.lock());
         if !s.is_agent {
-            anyhow::bail!("{not_agent}");
+            return Err(coded(ErrorCode::NotAnAgentSession));
         }
         let sha = s
             .checkpoints
             .last()
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("还没有检查点"))?;
+            .ok_or_else(|| coded(ErrorCode::NoCheckpoint))?;
         Ok((s.dir.clone(), sha))
     }
 
@@ -369,11 +380,17 @@ impl SessionManager {
             }
             // busy 优先：agent 干活时的「按 esc 中断」提示是稳定的，
             // 而空闲时的输入框占位符用户一打字就没了。
-            // screen_text() 只取一次，两个分支共用——它要扫一遍整屏文字，
-            // 每个会话每秒被 tick 5 次，没必要算两遍。
-            if s.busy_re.is_some() || s.idle_re.is_some() {
+            // screen_text() 只取一次，三个分支共用——它要扫一遍整屏文字，
+            // 每个会话每秒被 tick 5 次，没必要算三遍。
+            if s.busy_re.is_some() || s.idle_re.is_some() || s.error_re.is_some() {
                 let text = s.pty.screen_text();
-                if let Some(re) = &s.busy_re {
+                // **错误压过一切。** 出错时屏幕上同时有错误和输入框提示，
+                // idle_pattern 一样匹得上；判定顺序反过来的话，最要紧的那个
+                // 事实会被一句「空闲」盖掉——用户以为 agent 在等他，
+                // 其实那一轮已经废了。
+                if s.error_re.as_ref().is_some_and(|re| re.is_match(&text)) {
+                    s.state = SessionState::Failed;
+                } else if let Some(re) = &s.busy_re {
                     s.state = if re.is_match(&text) {
                         SessionState::Working
                     } else {
@@ -439,6 +456,7 @@ mod tests {
             is_agent: true,
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
+            error_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -470,11 +488,18 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
+        // 断言的是**码**，不是句子——句子是界面的事，而且会随语言变。
         let err = m
             .create(plain.path(), "fake", empty_secrets(), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("不是 git 仓库"), "实际错误: {err}");
+            .unwrap_err();
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
+        assert!(
+            matches!(code, ErrorCode::NotAGitRepo(_)),
+            "实际错误: {code:?}"
+        );
     }
 
     #[test]
@@ -494,9 +519,15 @@ mod tests {
         let missing = std::path::PathBuf::from("/definitely/does/not/exist/dct-test-dir");
         let err = m
             .create(&missing, "shell", empty_secrets(), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("目录不存在"), "实际错误: {err}");
+            .unwrap_err();
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
+        assert!(
+            matches!(code, ErrorCode::DirNotFound(_)),
+            "实际错误: {code:?}"
+        );
     }
 
     /// 构造性验证：故意让持有 `sessions` 锁的线程 panic，把锁弄"中毒"。
@@ -518,6 +549,116 @@ mod tests {
             .create(plain.path(), "shell", empty_secrets(), &[])
             .expect("锁中毒之后 create() 应该还能正常工作，而不是永远失败");
         assert_eq!(m.list().iter().find(|s| s.id == id).unwrap().id, id);
+    }
+
+    /// **出错时屏幕上同时有错误和输入框提示**——`idle_pattern` 一样匹得上。
+    /// 判定顺序把 `Failed` 排在前面，否则最要紧的那个事实会被一句「空闲」
+    /// 盖掉，而那正是用户实际撞到的 bug：以为 agent 在等他，其实那一轮废了。
+    #[test]
+    fn an_error_on_screen_wins_over_the_idle_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mgr = SessionManager::new();
+        // 先只打 READY（空闲），一秒后追加错误行，两句同时留在屏幕上。
+        // 先等出一次 Idle 是为了逼 tick() 真正算过一次——否则这条测试
+        // 可能只是撞上了某个默认值（同 busy_pattern_wins_over_idle_pattern）。
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "boom"
+                command = ["/bin/sh", "-c", "echo READY; sleep 1; echo 'API Error: closed'; sleep 5"]
+                is_agent = false
+                idle_pattern = "READY"
+                error_pattern = "API Error"
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr.create(&proj, "boom", secrets.get("boom"), &[]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "只有 READY 时应当是 Idle");
+            sleep(Duration::from_millis(50));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "错误和空闲提示同屏时，error_pattern 必须压过 idle_pattern"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 没写 `error_pattern` 的 profile 行为完全不变——功能对它是关着的。
+    /// 这条保证给别的 agent 补文案之前，它们一点都不会被误伤。
+    #[test]
+    fn a_profile_without_an_error_pattern_never_reports_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "quiet"
+                command = ["/bin/sh", "-c", "echo 'API Error: closed'; echo READY; sleep 5"]
+                is_agent = false
+                idle_pattern = "READY"
+                "#,
+            )
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr
+            .create(&proj, "quiet", secrets.get("quiet"), &[])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "该判成 Idle");
+            sleep(Duration::from_millis(50));
+        }
+        assert_ne!(
+            state_of(&mgr, id),
+            SessionState::Failed,
+            "没声明错误文案的 agent 不该被判失败"
+        );
+    }
+
+    #[test]
+    fn a_stopped_session_is_not_reclassified_as_failed() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        let mut p = fake_agent();
+        p.error_pattern = Some("API Error".into());
+        m.register_profile(p);
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+        m.send_input(id, "API Error").unwrap();
+        m.send_input(id, "").unwrap();
+        m.stop(id).unwrap();
+        m.tick();
+
+        assert_eq!(
+            m.list().iter().find(|s| s.id == id).unwrap().state,
+            SessionState::Stopped
+        );
     }
 
     #[test]
@@ -912,13 +1053,22 @@ mod tests {
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
         let err = mgr
             .create(&proj, "gone", secrets.get("gone"), &[])
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("启动不了"), "要说人话：{err}");
+            .unwrap_err();
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
+        // 码里只有命令名，**结构上就没有地方**能塞进 ENOENT——
+        // 这比原来靠断言字符串不含 "enoent" 强，那种断言只能拦住已知的写法。
+        let ErrorCode::CannotStart(ref cmd) = code else {
+            panic!("应当是「启动不了」这一类：{code:?}");
+        };
+        assert_eq!(cmd, "/绝对不存在/x9", "要点名是哪个命令");
+        let line = crate::i18n::msg::error(crate::i18n::Lang::Zh, &code);
+        assert!(line.contains("启动不了"), "要说人话：{line}");
         assert!(
-            !err.to_lowercase().contains("enoent"),
-            "别把系统错误码甩给用户：{err}"
+            !line.to_lowercase().contains("enoent"),
+            "别把系统错误码甩给用户：{line}"
         );
     }
 }

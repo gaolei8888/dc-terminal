@@ -8,9 +8,9 @@ use std::time::Duration;
 
 #[cfg(test)]
 use crate::profile::Profile;
-use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of, Lang};
+use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
-use crate::proto::{InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
+use crate::proto::{ErrorCode, InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
 use crate::secrets::{secrets_path_for_socket, SecretStore};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
@@ -82,7 +82,7 @@ fn serve(
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir),
-            Err(e) => Response::Error(format!("请求解析失败: {e}")),
+            Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
         out.flush()?;
@@ -99,7 +99,7 @@ fn handle(
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         Request::List => Ok(Response::Sessions(mgr.list())),
-        Request::Profiles => {
+        Request::Profiles { lang } => {
             let (all, mut warnings) = all_profiles(profiles_dir);
             let sec = recover(secrets.lock());
             if let Some(e) = sec.load_error() {
@@ -112,7 +112,7 @@ fn handle(
                 // 不支持手改的文件。`load_error()` 现在返回的已经是一句自足、
                 // 说清楚该干什么的中文（见 `SecretStore::load` 的注释），这里
                 // 只负责把路径带上，不再叠加任何暗示"去编辑它"的措辞。
-                warnings.insert(0, format!("{e}（{}）", sec.path().display()));
+                warnings.insert(0, e.clone());
             }
             let entries = all
                 .iter()
@@ -125,29 +125,22 @@ fn handle(
                     let has_secret = sec.get(&p.name).is_some();
                     ProfileEntry {
                         name: p.name.clone(),
-                        label: p.display_label(Lang::Zh),
-                        note: p.display_note(Lang::Zh),
-                        status: status_of(p, &all, has_secret, &command_exists, Lang::Zh),
+                        label: p.display_label(lang),
+                        note: p.display_note(lang),
+                        status: status_of(p, &all, has_secret, &command_exists, lang),
                         secret: p.secret.as_ref().map(|s| SecretPrompt {
-                            hint: s.hint.get(Lang::Zh).unwrap_or("").to_string(),
+                            hint: s.hint.get(lang).unwrap_or("").to_string(),
                             url: s.url.clone(),
                         }),
                         install: p.install.as_ref().map(|i| InstallPrompt {
                             command: i.command.clone(),
-                            note: i.note.get(Lang::Zh).unwrap_or("").to_string(),
+                            note: i.note.get(lang).unwrap_or("").to_string(),
                         }),
                         has_secret,
                     }
                 })
                 .collect();
-            Ok(Response::Profiles {
-                entries,
-                warning: if warnings.is_empty() {
-                    None
-                } else {
-                    Some(warnings.join("；"))
-                },
-            })
+            Ok(Response::Profiles { entries, warnings })
         }
         Request::Projects => Ok(Response::Projects(recover(store.lock()).list())),
         Request::Create {
@@ -221,7 +214,17 @@ fn handle(
             }
         }
     };
-    r.unwrap_or_else(|e| Response::Error(e.to_string()))
+    r.unwrap_or_else(|e| Response::Error(to_code(e)))
+}
+
+/// 把内部错误还原成给界面的码。`downcast` 拿不到码的，说明这条路径还没归类——
+/// 照抄原文走 `Internal`，界面原样显示。这样迁移可以一条一条来，不必等到
+/// 每一条都归好类才敢合并。
+fn to_code(e: anyhow::Error) -> ErrorCode {
+    match e.downcast::<crate::proto::CodedError>() {
+        Ok(c) => c.0,
+        Err(e) => ErrorCode::Internal(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +267,7 @@ mod tests {
             is_agent: true,
             idle_pattern: None,
             busy_pattern: None,
+            error_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -291,7 +295,9 @@ mod tests {
         let profiles_dir = tempfile::tempdir().unwrap();
 
         let resp = handle(
-            Request::Profiles,
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
             &mgr,
             &store,
             &secrets,
@@ -299,20 +305,73 @@ mod tests {
         );
 
         match resp {
-            Response::Profiles { warning, .. } => {
-                let w = warning.expect("密钥文件读坏了必须有 warning");
-                assert!(
-                    w.contains(&secrets_path.display().to_string()),
-                    "要点名是哪个文件：{w}"
+            Response::Profiles { warnings, .. } => {
+                // 守护进程报的是**码**。它点名了是哪个文件，但一个字的
+                // 文案都不组——句子由界面用 `i18n::msg::warning` 组出来。
+                let w = warnings
+                    .iter()
+                    .find(|w| matches!(w, crate::proto::WarningCode::SecretsCorrupt { .. }))
+                    .expect("密钥文件读坏了必须有 warning");
+                let crate::proto::WarningCode::SecretsCorrupt { path } = w else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    path,
+                    &secrets_path.display().to_string(),
+                    "要点名是哪个文件"
                 );
-                assert!(!w.contains('\n'), "不能是多行栈追踪：{w}");
+
+                // 组出来的那句话仍然要满足原来的两条约束：一行、不带
+                // toml 库自带的图形化 Display。
+                let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+                assert!(!line.contains('\n'), "不能是多行栈追踪：{line}");
                 assert!(
-                    !w.contains("TOML parse error"),
-                    "toml 库自带的图形化 Display 不能漏出来：{w}"
+                    !line.contains("TOML parse error"),
+                    "toml 库自带的图形化 Display 不能漏出来：{line}"
                 );
             }
             other => panic!("期待 Response::Profiles，得到 {other:?}"),
         }
+    }
+
+    /// 守护进程不该替用户决定语言。它是常驻的、可能同时服务多个界面的进程，
+    /// 「谁的语言是什么」不是它的状态——界面在请求里带上，它照着取就行。
+    /// 以前这里硬编码 `Lang::Zh`，于是 profile 的 `en` 文案写了也永远没人读。
+    #[test]
+    fn profiles_are_labelled_in_the_language_the_client_asked_for() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &secrets_dir.path().join("secrets.toml"),
+        )));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Store::load(
+            &store_dir.path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let labels = |lang| match handle(
+            Request::Profiles { lang },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+        ) {
+            Response::Profiles { entries, .. } => entries
+                .into_iter()
+                .map(|e| format!("{}|{}", e.label, e.note))
+                .collect::<Vec<_>>()
+                .join("  "),
+            other => panic!("期待 Response::Profiles，得到 {other:?}"),
+        };
+
+        let zh = labels(crate::i18n::Lang::Zh);
+        let en = labels(crate::i18n::Lang::En);
+        assert!(
+            zh.contains("命令行"),
+            "中文下 shell 的名字是「命令行」：{zh}"
+        );
+        assert_ne!(zh, en, "换了语言，菜单文案必须真的跟着变");
     }
 
     /// 回归测试，对应审查发现「密钥仓的锁被握过了整个 create()」：以前 `handle()`

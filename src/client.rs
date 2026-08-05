@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -38,10 +38,10 @@ impl Client {
 
     fn reconnect(&mut self) -> Result<()> {
         let stream = UnixStream::connect(&self.socket)
-            .with_context(|| format!("连不上守护进程: {}", self.socket.display()))?;
+            .map_err(|_| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
-            .context("设置读超时失败")?;
+            .map_err(|_| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
         self.conn = Some(Conn {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
@@ -65,7 +65,10 @@ impl Client {
     }
 
     fn try_call(&mut self, req: &Request) -> Result<Response> {
-        let conn = self.conn.as_mut().context("连接已断开")?;
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
         writeln!(conn.writer, "{}", serde_json::to_string(req)?)?;
         conn.writer.flush()?;
 
@@ -73,9 +76,11 @@ impl Client {
         let n = conn
             .reader
             .read_line(&mut line)
-            .context("守护进程没有回应")?;
+            .map_err(|_| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
         if n == 0 {
-            bail!("守护进程关闭了连接");
+            return Err(crate::proto::coded(
+                crate::proto::ErrorCode::DaemonNotResponding,
+            ));
         }
         Ok(serde_json::from_str(&line)?)
     }

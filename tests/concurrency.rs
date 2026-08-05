@@ -16,6 +16,7 @@ fn fake_agent() -> Profile {
         is_agent: true,
         idle_pattern: None,
         busy_pattern: None,
+        error_pattern: None,
         env: Default::default(),
         secret: None,
         install: None,

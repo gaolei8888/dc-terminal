@@ -2,12 +2,15 @@ name = "deepseek"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
 idle_pattern = "\\? for shortcuts"
+error_pattern = "API Error|Connection closed mid-response"
 
 [label]
 zh = "DeepSeek"
+en = "DeepSeek"
 
 [note]
 zh = "深度求索，套用 Claude 界面"
+en = "DeepSeek, through the Claude interface"
 
 [env]
 ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
@@ -18,6 +21,7 @@ url = "https://platform.deepseek.com/api_keys"
 
 [secret.hint]
 zh = "在 platform.deepseek.com 开通后复制 API Key"
+en = "Sign up at platform.deepseek.com, then copy your API key"
 
 [secret.verify]
 url = "https://api.deepseek.com/anthropic/v1/messages"

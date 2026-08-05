@@ -1,4 +1,5 @@
-use anyhow::{bail, Context, Result};
+use crate::proto::{coded, ErrorCode, Operation, WarningCode};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -18,7 +19,7 @@ pub struct SecretStore {
     path: PathBuf,
     secrets: BTreeMap<String, String>,
     /// 读失败的原因。非 None 时**拒绝任何写入**——见 `set()` 的注释。
-    load_error: Option<String>,
+    load_error: Option<WarningCode>,
 }
 
 /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
@@ -45,10 +46,10 @@ impl SecretStore {
                 eprintln!("密钥文件读取失败（{}）：{e}", path.display());
                 (
                     BTreeMap::new(),
-                    Some(format!(
-                        "密钥文件读不了：{}",
-                        crate::profile::describe_io_error(&e)
-                    )),
+                    Some(WarningCode::SecretsUnreadable {
+                        path: path.display().to_string(),
+                        reason: crate::profile::io_reason(&e),
+                    }),
                 )
             }
             Ok(src) => match toml::from_str::<Disk>(&src) {
@@ -73,10 +74,9 @@ impl SecretStore {
                     eprintln!("密钥文件解析失败（{}）：{e}", path.display());
                     (
                         BTreeMap::new(),
-                        Some(
-                            "密钥文件坏了，读不出来。删掉这个文件，回 dct 里重新粘贴一遍密钥就行，不用手动修它。"
-                                .to_string(),
-                        ),
+                        Some(WarningCode::SecretsCorrupt {
+                            path: path.display().to_string(),
+                        }),
                     )
                 }
             },
@@ -88,8 +88,8 @@ impl SecretStore {
         }
     }
 
-    pub fn load_error(&self) -> Option<&str> {
-        self.load_error.as_deref()
+    pub fn load_error(&self) -> Option<&WarningCode> {
+        self.load_error.as_ref()
     }
 
     /// 密钥文件路径。daemon 组装警告文案时要点名是哪个文件，让用户去看。
@@ -147,17 +147,25 @@ impl SecretStore {
     fn save(&self) -> Result<()> {
         // 读坏了就不写。当空覆盖的话，用户手改坏的文件（也许只是少个引号，
         // 完全能救回来）会被我们内存里那份残缺数据彻底盖掉。
-        if let Some(e) = &self.load_error {
-            bail!("改不了 {}：{e}", self.path.display());
+        // 这条**是用户可见的**：它经守护进程冒泡到界面，用户按 c 改密钥
+        // 时会看到。所以同样报码不报句子。
+        if self.load_error.is_some() {
+            return Err(coded(ErrorCode::SecretsFileBroken {
+                path: self.path.display().to_string(),
+            }));
         }
 
-        let parent = self.path.parent().context("密钥文件没有上级目录")?;
-        std::fs::create_dir_all(parent).context("建不了密钥文件所在目录")?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
 
         let text = toml::to_string(&Disk {
             secrets: self.secrets.clone(),
         })
-        .context("密钥序列化失败")?;
+        .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
 
         // 原子写：先写同目录的临时文件再 rename。直接覆写的话写到一半断电
         // 会留下半截 TOML，下次 load 就走进「读坏了」分支。
@@ -172,10 +180,13 @@ impl SecretStore {
                 .truncate(true)
                 .mode(0o600)
                 .open(&tmp)
-                .context("写不了密钥临时文件")?;
-            f.write_all(text.as_bytes()).context("写密钥失败")?;
-            f.sync_all().context("刷盘失败")?;
-            std::fs::rename(&tmp, &self.path).context("替换密钥文件失败")?;
+                .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
+            f.write_all(text.as_bytes())
+                .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
+            f.sync_all()
+                .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
+            std::fs::rename(&tmp, &self.path)
+                .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
             Ok(())
         })();
 
@@ -276,11 +287,15 @@ mod tests {
         let mut s = SecretStore::load(&f);
         assert!(s.load_error().is_some(), "要记住读失败了");
 
+        // 报的是码；人话由界面组。组出来那句仍要说人话、并给出下一步。
         let err = s.set("kimi", "sk-abc").unwrap_err();
-        assert!(
-            err.to_string().contains("密钥文件"),
-            "拒绝写入时要说人话：{err}"
-        );
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("拒绝写入要带错误码")
+            .0;
+        assert!(matches!(code, ErrorCode::SecretsFileBroken { .. }));
+        let line = crate::i18n::msg::error(crate::i18n::Lang::Zh, &code);
+        assert!(line.contains("密钥文件"), "拒绝写入时要说人话：{line}");
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             "这不是 TOML {{{",
@@ -311,7 +326,10 @@ mod tests {
         std::fs::write(&f, "这不是 TOML {{{").unwrap();
 
         let s = SecretStore::load(&f);
-        let err = s.load_error().expect("要记住读失败了");
+        let code = s.load_error().expect("要记住读失败了");
+        // 结构上就没有地方能塞进 toml 的原文——这一类码只带路径。
+        assert!(matches!(code, WarningCode::SecretsCorrupt { .. }));
+        let err = crate::i18n::msg::warning(crate::i18n::Lang::Zh, code);
         assert!(!err.contains('\n'), "不能是多行栈追踪：{err}");
         assert!(
             !err.contains("TOML parse error"),
@@ -354,7 +372,15 @@ mod tests {
         // 触发不了——老实跳过，好过硬跑出一个和权限无关的 flaky 失败。
         if std::fs::read_to_string(&f).is_err() {
             let s = SecretStore::load(&f);
-            let err = s.load_error().expect("要记住读失败了");
+            let code = s.load_error().expect("要记住读失败了");
+            assert!(matches!(
+                code,
+                WarningCode::SecretsUnreadable {
+                    reason: crate::proto::IoReason::PermissionDenied,
+                    ..
+                }
+            ));
+            let err = crate::i18n::msg::warning(crate::i18n::Lang::Zh, code);
             assert!(!err.contains("os error"), "不能漏出 errno：{err}");
             assert!(
                 !err.contains("Permission denied"),
@@ -388,8 +414,12 @@ mod tests {
 
         // set 会因为 load_error 而失败
         let err = s.set("key", "value").unwrap_err();
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("改不了"));
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("拒绝写入要带错误码")
+            .0;
+        let err_msg = crate::i18n::msg::error(crate::i18n::Lang::Zh, &code);
+        assert!(err_msg.contains("没有改它"));
         // 错误要告诉用户删掉文件重新填，不能建议手动修复
         assert!(
             err_msg.contains("删"),
@@ -419,8 +449,12 @@ mod tests {
 
         // remove 会因为 load_error 而失败
         let err = s.remove("key").unwrap_err();
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("改不了"));
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("拒绝写入要带错误码")
+            .0;
+        let err_msg = crate::i18n::msg::error(crate::i18n::Lang::Zh, &code);
+        assert!(err_msg.contains("没有改它"));
         // 错误要告诉用户删掉文件重新填，不能建议手动修复
         assert!(
             err_msg.contains("删"),

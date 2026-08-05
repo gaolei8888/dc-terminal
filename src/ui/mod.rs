@@ -17,7 +17,7 @@ use crate::session::SessionInfo;
 use crate::theme::Theme;
 
 mod widgets;
-use widgets::{short_path, truncate};
+use widgets::short_path;
 pub use widgets::{status_label, status_style, Msg};
 
 mod app;
@@ -28,16 +28,17 @@ mod board;
 mod grid;
 mod pick;
 mod secret;
+mod settings_view;
 
 mod view;
 use view::SecretPhase;
 use view::{
     back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
-    session_ended_notice, View,
+    session_ended_notice, Scope, View,
 };
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
-    verify_message, verify_outcome_applies_to, PickAction,
+    verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
@@ -145,7 +146,13 @@ fn spawn_signal_restore() {
     });
 }
 
-pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
+pub fn run(
+    client: Client,
+    default_dir: PathBuf,
+    lang: crate::i18n::Lang,
+    socket: PathBuf,
+    view_mode: ViewMode,
+) -> Result<()> {
     // 必须在 enable_raw_mode 之前装：装早了无害（还没进 raw mode 时
     // restore_terminal() 没有副作用，多发一次 LeaveAlternateScreen 也无害），
     // 装晚了就有一个「已经进 raw mode 但信号还没被接管」的真空窗口。
@@ -170,7 +177,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(client, default_dir);
+    let mut app = App::new(client, default_dir, lang, socket, view_mode);
 
     loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
@@ -200,7 +207,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                     // 扔掉，不切视图——套在一个不相干的 profile/密钥上
                     // 比什么都不做更危险（见 CRITICAL 1 的复现步骤）。
                     if verify_outcome_applies_to(&sent_profile, &sent_buf, &profile, &buf) {
-                        app.view = match verify_message(outcome) {
+                        app.view = match verify_message(outcome, app.lang) {
                             Some(m) => View::EnterSecret {
                                 profile,
                                 label,
@@ -237,7 +244,8 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                                     // 「已配」，但删除那条路径有「已删除 X 的密钥」
                                     // 的消息条打底，改密钥这条路径原来什么都不说，
                                     // 是同一对镜像操作里唯一没反馈的一半——补齐。
-                                    app.message = format!("已保存 {label} 的密钥").into();
+                                    app.message =
+                                        crate::i18n::msg::secret_saved(app.lang, &label).into();
                                     refetch_secrets(&mut app, Some(&profile))
                                 }
                                 Ok(Response::Ok) => {
@@ -253,12 +261,14 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                                             app.need_sessions = true; // 会话标题要显示项目名
                                             View::Attached(id)
                                         }
-                                        Ok(Response::Error(e)) => View::EnterSecret {
+                                        Ok(Response::Error(ref e)) => View::EnterSecret {
                                             profile,
                                             label,
                                             prompt,
                                             buf,
-                                            phase: SecretPhase::Failed(e),
+                                            phase: SecretPhase::Failed(crate::i18n::msg::error(
+                                                app.lang, e,
+                                            )),
                                             return_to_settings,
                                         },
                                         _ => View::EnterSecret {
@@ -267,18 +277,24 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                                             prompt,
                                             buf,
                                             phase: SecretPhase::Failed(
-                                                "开不了会话，再试一次".into(),
+                                                crate::i18n::text(
+                                                    crate::i18n::Key::SessionOpenFailed,
+                                                    app.lang,
+                                                )
+                                                .into(),
                                             ),
                                             return_to_settings,
                                         },
                                     }
                                 }
-                                Ok(Response::Error(e)) => View::EnterSecret {
+                                Ok(Response::Error(ref e)) => View::EnterSecret {
                                     profile,
                                     label,
                                     prompt,
                                     buf,
-                                    phase: SecretPhase::Failed(e),
+                                    phase: SecretPhase::Failed(crate::i18n::msg::error(
+                                        app.lang, e,
+                                    )),
                                     return_to_settings,
                                 },
                                 _ => View::EnterSecret {
@@ -286,7 +302,13 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                                     label,
                                     prompt,
                                     buf,
-                                    phase: SecretPhase::Failed("密钥没存上，再试一次".into()),
+                                    phase: SecretPhase::Failed(
+                                        crate::i18n::text(
+                                            crate::i18n::Key::SecretNotSaved,
+                                            app.lang,
+                                        )
+                                        .into(),
+                                    ),
                                     return_to_settings,
                                 },
                             },
@@ -304,14 +326,14 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         if app.need_sessions || !attached {
             match app.client().and_then(|c| c.call(Request::List)) {
                 Ok(Response::Sessions(v)) => {
-                    app.sessions = v;
+                    app.set_sessions(v);
                     app.connected = true;
                 }
                 _ => app.connected = false,
             }
             app.need_sessions = false;
         }
-        if app.list_state.selected().is_none() && !app.sessions.is_empty() {
+        if app.list_state.selected().is_none() && !app.visible.is_empty() {
             app.list_state.select(Some(0));
         }
         // 会话可能在两轮之间消失（自己退了、被 s 停掉清了），焦点必须跟着
@@ -320,7 +342,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         // 的页长，格子全乱。收在这里（拉完列表、画之前）是唯一能保证
         // 渲染和按键看到的是同一个合法焦点的地方。
         if let View::Grid { focus } = app.view {
-            let last = app.sessions.len().saturating_sub(1);
+            let last = app.visible.len().saturating_sub(1);
             if focus > last {
                 app.view = View::Grid { focus: last };
             }
@@ -329,7 +351,7 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
             let page = grid::page_of(focus);
             let start = page * grid::TILES_PER_PAGE;
             let ids: Vec<u32> = app
-                .sessions
+                .visible
                 .iter()
                 .skip(start)
                 .take(grid::TILES_PER_PAGE)
@@ -364,9 +386,9 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                     // 成了假话**，那时必须改成把 Error 里的原文说给用户听。
                     Ok(Response::Error(_)) => {
                         app.message = Msg::err(
-                            "后台服务是旧版本，看不到画面。退出 dct 再重新打开就好".into(),
+                            crate::i18n::text(crate::i18n::Key::DaemonTooOld, app.lang).into(),
                         );
-                        app.view = View::Board;
+                        app.view = home_view(&app);
                         app.need_sessions = true;
                     }
                     _ => app.connected = false,
@@ -418,8 +440,8 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
                     // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
                     // 每个键都掉进一个死掉的 pty 里无声消失。
-                    if let Some(notice) = session_ended_notice(id, state) {
-                        app.view = View::Board;
+                    if let Some(notice) = session_ended_notice(id, state, app.lang) {
+                        app.view = home_view(&app);
                         // 回看板得重新拉一次 List：贴在会话里这一路都没拉，
                         // 手里的 sessions 是进会话之前那份，缺的正是「这个
                         // 会话已经没了」这条更新。
@@ -457,16 +479,19 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                         None => !text.is_empty(),
                     };
                     if failed {
-                        app.message = Msg::err("守护进程连不上，粘贴的内容没发出去".into());
+                        app.message = Msg::err(
+                            crate::i18n::text(crate::i18n::Key::PasteNotSent, app.lang).into(),
+                        );
                     }
                 }
                 // 手输路径态：粘贴直接进输入框。从别处拷一条路径粘进来一步到位，
                 // 这是不做目录浏览器的底气。trim 掉换行——从终端或文件管理器
                 // 拷路径经常带一个尾随换行，不去掉会拼出一个不存在的目录。
-                View::PickProject {
-                    typing_path: Some(buf),
-                    ..
-                } => buf.push_str(text.trim()),
+                View::PickProject(p) if p.typing_path.is_some() => {
+                    if let Some(buf) = p.typing_path.as_mut() {
+                        buf.push_str(text.trim());
+                    }
+                }
                 // 密钥十有八九是粘进来的，不是敲的——用户拿到手的字符串通常带
                 // 引号、Bearer 前缀、尾随换行，clean_secret 统一洗一遍。
                 // Verifying 期间不接：那次验证已经把当时的 buf 发出去了，
@@ -520,9 +545,10 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
             match app.view.clone() {
                 View::Board => board::handle_key(&mut app, key)?,
                 View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
-                View::PickProject { .. } => pick::handle_key(&mut app, key)?,
+                View::PickProject(_) => pick::handle_key(&mut app, key)?,
                 View::Attached(_) => attach::handle_key(&mut app, key)?,
                 View::Grid { .. } => grid::handle_key(&mut app, key)?,
+                View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
                 View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
                 View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             }
@@ -549,8 +575,12 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         let needs_profile_refetch =
             matches!(&app.view, View::PickProfile { entries, .. } if entries.is_empty());
         if needs_profile_refetch {
-            app.view = match app.client().and_then(|c| c.call(Request::Profiles)) {
-                Ok(Response::Profiles { entries, warning }) => {
+            app.view = match app
+                .client()
+                .and_then(|c| c.call(Request::Profiles { lang }))
+            {
+                Ok(Response::Profiles { entries, warnings }) => {
+                    let warning = join_warnings(&warnings, lang);
                     let mut state = ListState::default();
                     if !entries.is_empty() {
                         state.select(Some(0));
@@ -561,15 +591,17 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                         warning,
                     }
                 }
-                Ok(Response::Error(e)) => View::PickProfile {
+                Ok(Response::Error(ref e)) => View::PickProfile {
                     entries: Vec::new(),
                     state: ListState::default(),
-                    warning: Some(e),
+                    warning: Some(crate::i18n::msg::error(lang, e)),
                 },
                 _ => View::PickProfile {
                     entries: Vec::new(),
                     state: ListState::default(),
-                    warning: Some("拿不到 agent 列表".into()),
+                    warning: Some(
+                        crate::i18n::text(crate::i18n::Key::CannotListAgents, app.lang).into(),
+                    ),
                 },
             };
         }
@@ -583,7 +615,10 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
         let needs_secrets_refetch =
             matches!(&app.view, View::Secrets { entries, .. } if entries.is_empty());
         if needs_secrets_refetch {
-            app.view = match app.client().and_then(|c| c.call(Request::Profiles)) {
+            app.view = match app
+                .client()
+                .and_then(|c| c.call(Request::Profiles { lang }))
+            {
                 Ok(Response::Profiles { entries, .. }) => {
                     let mut state = ListState::default();
                     if !secret_rows(&entries).is_empty() {
@@ -595,13 +630,15 @@ pub fn run(client: Client, default_dir: PathBuf) -> Result<()> {
                         pending_delete: None,
                     }
                 }
-                Ok(Response::Error(e)) => {
-                    app.message = Msg::err(e);
-                    View::Board
+                Ok(Response::Error(ref e)) => {
+                    app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
+                    home_view(&app)
                 }
                 _ => {
-                    app.message = Msg::err("拿不到密钥列表".into());
-                    View::Board
+                    app.message = Msg::err(
+                        crate::i18n::text(crate::i18n::Key::CannotListSecrets, app.lang).into(),
+                    );
+                    home_view(&app)
                 }
             };
         }
@@ -680,6 +717,171 @@ fn selected<'a>(sessions: &'a [SessionInfo], st: &ListState) -> Option<&'a Sessi
     st.selected().and_then(|i| sessions.get(i))
 }
 
+/// 切到另一个项目：告诉用户、改 `current_dir`、重算作用域、回看板。
+///
+/// 抽成一个函数是因为选择器有两条确认路径（列表选中、手输路径），
+/// 而这四步必须整套发生。分开写的话，漏掉重算的那条路会让屏幕停在
+/// 上一个项目的会话上、底栏却已经写着新项目——用户看到的就是
+/// 「同一个 session 变成了不同的项目」。
+pub(crate) fn switch_project(app: &mut App, dir: std::path::PathBuf) {
+    // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
+    app.message =
+        crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string())).into();
+    app.current_dir = dir;
+    app.refresh_visible();
+    app.view = home_view(app);
+}
+
+/// 进一个会话。会话属于别的项目时，当前项目跟着切过去。
+///
+/// 「你在哪个会话里，当前项目就是哪个」——不这么做的话，从「全部项目」
+/// 视图进了别的项目的会话，按 F2 回来时它已经被过滤掉了，看起来像是
+/// 消失了；而且随手按 `n` 新建会话会开在一个你并没有在看的项目里。
+///
+/// 切了就必须说一声。静默改变当前项目正是这一版被判为「混乱」的原因。
+pub(crate) fn enter_session(app: &mut App, id: u32) {
+    // 在全量列表里找，不是 visible：从「全部项目」进来的那个会话，
+    // 正是当前作用域看不见的那一个。
+    if let Some(dir) = app
+        .sessions
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| std::path::PathBuf::from(&s.dir))
+    {
+        if !view::same_project(&dir, &app.current_dir) {
+            app.message =
+                crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string()))
+                    .into();
+            app.current_dir = dir;
+            app.refresh_visible();
+        }
+    }
+    // 会话标题要显示项目名
+    app.need_sessions = true;
+    app.view = View::Attached(id);
+}
+
+/// 把守护进程报回来的一串警告码组成一行人话。
+///
+/// 拼接（`；`）发生在这里而不是 daemon 侧：daemon 连用哪种语言都不知道，
+/// 更不知道该用哪个分隔符——中文用顿号式的全角分号，英文该用 `; `。
+fn join_warnings(
+    warnings: &[crate::proto::WarningCode],
+    lang: crate::i18n::Lang,
+) -> Option<String> {
+    if warnings.is_empty() {
+        return None;
+    }
+    let sep = match lang {
+        crate::i18n::Lang::Zh => "；",
+        crate::i18n::Lang::En => "; ",
+    };
+    Some(
+        warnings
+            .iter()
+            .map(|w| crate::i18n::msg::warning(lang, w))
+            .collect::<Vec<_>>()
+            .join(sep),
+    )
+}
+
+/// 浮层占的那块地方：各方向取「终端的一大半」和一个上限里的较小者，居中。
+///
+/// 设上限是因为在一块 200 列的屏幕上，一个铺满 80% 的对话框反而更难扫——
+/// 眼睛要横跨整个屏幕才能把一行读完。
+///
+/// 终端小到放不下时**退化成全屏**，而不是显示一句「窗口太小」：选项目是
+/// 用户此刻非做不可的事，挡住他没有意义（跟九宫格不同——那一屏本来就是
+/// 「看一眼」，看不了就先别看）。
+fn popup_area(area: Rect) -> Rect {
+    // 再小就放不下两栏了：每栏各要两列边框，加上目录名和 git 标记。
+    // 比这还小的终端，浮层已经没有「浮」的意义——全屏给他。
+    const MIN_COLS: u16 = 40;
+    const MIN_ROWS: u16 = 8;
+    if area.width < MIN_COLS || area.height < MIN_ROWS {
+        return area;
+    }
+    let w = (area.width.saturating_mul(4) / 5).clamp(MIN_COLS, 100);
+    let h = (area.height.saturating_mul(3) / 4).clamp(MIN_ROWS, 24);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// `g` 键：在列表和九宫格之间切换，并且**记住**。
+///
+/// 两个模式共用这一个函数，切换和落盘绑在一起——分开写的话，某一边忘了
+/// 落盘，用户就会遇到「有时记得、有时不记得」这种最难描述的 bug。
+///
+/// 落盘失败只在底栏说一句，不挡住切换本身：模式已经切了，屏幕上就是新的
+/// 那个，硬要因为写不了文件把它切回去反而更费解。
+pub(crate) fn toggle_view_mode(app: &mut App) {
+    // 离开九宫格前先把列表光标对到焦点格上；`home_view` 负责反方向。
+    // 两个视图对「当前是哪个会话」的认知必须一致，否则切一下模式，
+    // 接下来的 `s`（停止）就毁在另一个会话上——这个键不可撤销。
+    if matches!(app.view, View::Grid { .. }) {
+        sync_board_cursor_from_grid(app);
+    }
+    app.view_mode = app.view_mode.toggled();
+    app.view = home_view(app);
+    let path = crate::settings::settings_path_for_socket(&app.socket);
+    if let Err(e) = crate::settings::save_view_mode(&path, app.view_mode) {
+        app.message = Msg::err(
+            e.downcast_ref::<crate::proto::CodedError>()
+                .map(|c| crate::i18n::msg::error(app.lang, &c.0))
+                .unwrap_or_else(|| e.to_string()),
+        );
+    }
+}
+
+/// 用户选的那个模式对应的视图。**所有「回看板」的地方都必须走这里。**
+///
+/// 硬编码 `View::Board` 的每一处都是一个「明明在九宫格里，某次操作完却被
+/// 甩回列表」的 bug——而且是偶发、复现不了的那种。
+///
+/// 顺带让两个模式对「当前是哪个会话」的认知保持一致：进九宫格时焦点落在
+/// 列表光标那一行。反方向由 `sync_board_cursor_from_grid` 负责。
+pub(crate) fn home_view(app: &App) -> View {
+    match app.view_mode {
+        ViewMode::List => View::Board,
+        ViewMode::Grid => View::Grid {
+            focus: app
+                .list_state
+                .selected()
+                .unwrap_or(0)
+                .min(app.visible.len().saturating_sub(1)),
+        },
+    }
+}
+
+/// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到
+/// 「现在是哪个」，而不是从头找。
+pub(crate) fn open_settings(app: &mut App) {
+    let mut state = ListState::default();
+    state.select(Some(
+        crate::i18n::Lang::all()
+            .iter()
+            .position(|l| *l == app.lang)
+            .unwrap_or(0),
+    ));
+    app.view = View::Settings { state };
+}
+
+/// `a` 键：在「只看当前项目」和「全部项目」之间切换。看板和九宫格共用。
+///
+/// 切完立刻重算，不等下一轮 `need_sessions`——那要等到 300ms 之后，
+/// 用户会以为这个键没反应，然后再按一次又切回去。
+fn toggle_scope(app: &mut App) {
+    app.scope = match app.scope {
+        Scope::CurrentProject => Scope::AllProjects,
+        Scope::AllProjects => Scope::CurrentProject,
+    };
+    app.refresh_visible();
+}
+
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
 /// 项目选择器和会话看板共用它。
 fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
@@ -723,8 +925,13 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
     // pick_action 和 View::PickProfile 的按键分支。n 和 N 都要这份
     // 列表——n 拿它判断上次那个 agent 现在还在不在 Ready，N 拿它渲染
     // 选择器——所以只拉一次，不分两条路各拉各的。
-    match app.client().and_then(|c| c.call(Request::Profiles)) {
-        Ok(Response::Profiles { entries, warning }) => {
+    let lang = app.lang;
+    match app
+        .client()
+        .and_then(|c| c.call(Request::Profiles { lang }))
+    {
+        Ok(Response::Profiles { entries, warnings }) => {
+            let warning = join_warnings(&warnings, app.lang);
             // 把「拉完列表但没能直开」的三种落点（选择器为空、建会话失败
             // 两种）收在一处，省得同一段 ListState 初始化抄三遍——那种
             // 抄法迟早有一份漏了空表守卫。
@@ -770,12 +977,14 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                             app.need_sessions = true; // 会话标题要显示项目名
                             app.view = View::Attached(id);
                         }
-                        Ok(Response::Error(e)) => {
-                            app.message = Msg::err(e);
+                        Ok(Response::Error(ref e)) => {
+                            app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
                             app.view = picker(entries, warning);
                         }
                         _ => {
-                            app.message = Msg::err("创建失败".into());
+                            app.message = Msg::err(
+                                crate::i18n::text(crate::i18n::Key::CreateFailed, app.lang).into(),
+                            );
                             app.view = picker(entries, warning);
                         }
                     }
@@ -786,8 +995,11 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
         // 列表都拿不到，直开和选择器都没法走，只能告诉用户这次干瞪眼——
         // 视图不变，走到循环末尾 message_after_transition 会把这条消息
         // 原样留住（同其他分支，不用 continue 抢跑跳过收尾）。
-        Ok(Response::Error(e)) => app.message = Msg::err(e),
-        _ => app.message = Msg::err("拿不到 agent 列表".into()),
+        Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
+        _ => {
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::CannotListAgents, app.lang).into())
+        }
     }
 }
 
@@ -803,17 +1015,20 @@ pub(crate) fn open_project_picker(app: &mut App) {
             if !all.contains(&start) {
                 all.push(start);
             }
-            let mut state = ListState::default();
-            state.select(Some(0));
-            app.view = View::PickProject {
-                all,
-                filter: String::new(),
-                state,
-                typing_path: None,
-            };
+            // 浏览器从当前项目所在的位置开起：用户按 p 多半是想换到
+            // 「旁边那个」项目，从它的上一级开始找是最短的路。
+            let from = app
+                .current_dir
+                .parent()
+                .map(|x| x.to_path_buf())
+                .unwrap_or_else(|| app.current_dir.clone());
+            app.view = View::PickProject(crate::ui::view::ProjectPicker::new(all, from));
         }
-        Ok(Response::Error(e)) => app.message = Msg::err(e),
-        _ => app.message = Msg::err("拿不到项目列表".into()),
+        Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
+        _ => {
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::CannotListProjects, app.lang).into())
+        }
     }
 }
 
@@ -822,7 +1037,11 @@ pub(crate) fn open_secrets(app: &mut App) {
     // 拿不到列表就不进设置页：留在原地给一句错误，总比弹进一个既没数据、
     // 又没地方显示错误的空白页强（`View::Secrets` 没有 `warning` 字段，
     // 见其字段注释）。
-    match app.client().and_then(|c| c.call(Request::Profiles)) {
+    let lang = app.lang;
+    match app
+        .client()
+        .and_then(|c| c.call(Request::Profiles { lang }))
+    {
         Ok(Response::Profiles { entries, .. }) => {
             let mut state = ListState::default();
             if !secret_rows(&entries).is_empty() {
@@ -834,8 +1053,11 @@ pub(crate) fn open_secrets(app: &mut App) {
                 pending_delete: None,
             };
         }
-        Ok(Response::Error(e)) => app.message = Msg::err(e),
-        _ => app.message = Msg::err("拿不到密钥列表".into()),
+        Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
+        _ => {
+            app.message =
+                Msg::err(crate::i18n::text(crate::i18n::Key::CannotListSecrets, app.lang).into())
+        }
     }
 }
 
@@ -855,16 +1077,18 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
         _ => return "".into(),
     };
     match app.client().and_then(|c| c.call(req)) {
-        Ok(Response::Ok) => "完成".into(),
-        Ok(Response::Diff(v)) if v.is_empty() => "没有改动".into(),
+        Ok(Response::Ok) => crate::i18n::text(crate::i18n::Key::ActionDone, app.lang).into(),
+        Ok(Response::Diff(v)) if v.is_empty() => {
+            crate::i18n::text(crate::i18n::Key::NoChanges, app.lang).into()
+        }
         Ok(Response::Diff(v)) => v
             .iter()
             .map(|f| format!("{} +{} -{}", f.path, f.added, f.removed))
             .collect::<Vec<_>>()
             .join("  ")
             .into(),
-        Ok(Response::Error(e)) => Msg::err(e),
-        _ => Msg::err("请求失败".into()),
+        Ok(Response::Error(ref e)) => Msg::err(crate::i18n::msg::error(app.lang, e)),
+        _ => Msg::err(crate::i18n::text(crate::i18n::Key::RequestFailed, app.lang).into()),
     }
 }
 
@@ -882,7 +1106,11 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
     // 借着 `app` 的别的字段（比如 `entries`/`state` 已经从 `app.view` 解构
     // 出来），走一个吃 `&mut self` 的方法会跟这些借用打架。`None` 归到跟
     // 下面 `_ =>` 一样的失败落点——同真实断线共用一条路径，不新增分支。
-    let result = app.client.as_mut().map(|c| c.call(Request::Profiles));
+    let lang = app.lang;
+    let result = app
+        .client
+        .as_mut()
+        .map(|c| c.call(Request::Profiles { lang }));
     match result {
         Some(Ok(Response::Profiles { entries, .. })) => {
             let rows = secret_rows(&entries);
@@ -910,15 +1138,20 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
     }
 }
 
-/// 左段固定占的列数：「Ctrl+Q 回看板」= 6 + 1 + 中文 3 字 × 2 = 13。
-/// 三条文案里最长的就是它（「Ctrl+Q 回列表」同宽，「q 退出」更短）。
+/// 左段固定占的列数：最长的一条是会话视图的「Ctrl+Q（F2） 回看板」
+/// = 6 + 全角括号 2 + "F2" 2 + 全角括号 2 + 空格 1 + 中文 3 字 × 2 = 19。
+/// 其余各条都更短（「Ctrl+Q 回列表」13，「q 退出」7）。
 /// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
-const ESCAPE_HINT_COLS: u16 = 13;
+const ESCAPE_HINT_COLS: u16 = 19;
 
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(f.area());
+    // 底栏 4 行 = 上下边框 + **两行**文字。给到两行是因为看板那张按键表
+    // 有 105 列宽，挤在一行里时 80 列终端只剩 57 列可用，`u 回滚`/`s 停止`/
+    // `d 改动` 长期被右端整个截掉——这三个里有两个是不可撤销的操作，
+    // 屏幕上没写却真的管用的键，就是等着用户误按。
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(f.area());
 
     // 穷尽匹配而不是 if/else 链：少一个 View 变体的分支，if/else 链的兜底
     // `else` 会悄悄把新变体也归给 secret::draw，画出一片空白也照样编译通过；
@@ -930,8 +1163,24 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Board => board::draw(f, chunks[0], app),
         View::Attached(_) => attach::draw(f, chunks[0], app),
         View::Grid { .. } => grid::draw(f, chunks[0], app),
-        View::PickProfile { .. } | View::PickProject { .. } => pick::draw(f, chunks[0], app),
+        View::PickProfile { .. } => pick::draw(f, chunks[0], app),
+        // 选项目是**浮层**：先照常画用户的家视图，再在中间盖一层。
+        // 背后留着看板是重点——用户要看得出自己只是叠了一层，Esc 一下
+        // 就回去了。全屏接管正是上一版被判为「混乱」的一部分。
+        View::PickProject(_) => {
+            let home = home_view(app);
+            let saved = std::mem::replace(&mut app.view, home);
+            match app.view {
+                View::Grid { .. } => grid::draw(f, chunks[0], app),
+                _ => board::draw(f, chunks[0], app),
+            }
+            app.view = saved;
+            let popup = popup_area(chunks[0]);
+            f.render_widget(ratatui::widgets::Clear, popup);
+            pick::draw(f, popup, app);
+        }
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
+        View::Settings { .. } => settings_view::draw(f, chunks[0], app),
     }
 
     // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
@@ -941,11 +1190,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 逃生键那一截已经挪进左段常驻，这里不再重复。
     let (help, style) = if !app.connected {
         (
-            "守护进程连不上，界面数据可能已过期".to_string(),
+            crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string(),
             Style::default().fg(Color::Red),
         )
     } else if app.message.text.is_empty() {
-        (idle_help(&app.view).to_string(), Style::default())
+        (idle_help(&app.view, app.scope, app.lang), Style::default())
     } else if app.message.error {
         (app.message.text.clone(), Style::default().fg(Color::Red))
     } else {
@@ -955,7 +1204,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 「当前项目：~/work/dc/dc-terminal」加上按键表在 80 列终端里放不下同一行，
     // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "当前项目：{}",
+        "{}：{}",
+        crate::i18n::text(crate::i18n::Key::CurrentProject, app.lang),
         short_path(&app.current_dir.display().to_string())
     ));
     let inner = block.inner(chunks[1]);
@@ -973,13 +1223,17 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(inner);
     f.render_widget(
-        Paragraph::new(escape_hint(&app.view)).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(escape_hint(&app.view, app.lang)).style(Style::default().fg(Color::Cyan)),
         bar[0],
     );
-    f.render_widget(
-        Paragraph::new(truncate(&help, bar[1].width as usize)).style(style),
-        bar[1],
-    );
+    // 折行而不是截断：截断会把句尾那几个键悄悄抹掉，而用户没有任何线索
+    // 知道自己少看了几个键。折行用 `wrap_help` 而不是 ratatui 的 `Wrap`，
+    // 理由见那个函数——`Wrap` 会把「p 换项目」拆成行尾一个孤零零的 `p`。
+    let lines: Vec<Line> = widgets::wrap_help(&help, bar[1].width as usize)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    f.render_widget(Paragraph::new(lines).style(style), bar[1]);
 }
 
 #[cfg(test)]
@@ -1233,6 +1487,191 @@ mod tests {
             .collect()
     }
 
+    /// `ESCAPE_HINT_COLS` 是写死的，`escape_hint` 的文案却会跟着功能改。
+    /// 两者一旦脱节，左段会把逃生键**静默截断**——而逃生键正是用户卡住时
+    /// 唯一的出路，截断了不会报错、只会让人退不出来。所以这里穷举所有视图，
+    /// 要求常量真的容得下最长的那一条。
+    /// 底栏的按键表原来挤在一行里，91 列宽的文案塞进 80 列终端只剩 57 列可用
+    /// ——`u 回滚`/`s 停止`/`d 改动` 三个键长期被右端截掉，写了等于没写，
+    /// 而这三个里有两个是不可撤销的操作。给它第二行，把键全都露出来。
+    #[test]
+    fn every_board_key_is_actually_on_screen_at_eighty_columns() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Board;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+
+        for key in ["n新建", "p换项目", "a看全部项目", "u回滚", "s停止", "d改动"] {
+            assert!(c.contains(key), "按键表里的「{key}」被截掉了：{c}");
+        }
+    }
+
+    /// 九宫格那一句比看板的还长，而且多一个 `q 退出`——在这个视图里左段写的
+    /// 是「Ctrl+Q 回列表」，`q` 却照样关掉整个 dct。这种「屏幕上没写却真管用」
+    /// 的键最危险，必须真的画出来数一遍，不能靠手算截断宽度。
+    #[test]
+    fn every_grid_key_is_actually_on_screen_at_eighty_columns() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Grid { focus: 0 };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+
+        for key in [
+            "q退出",
+            "n新建",
+            "p换项目",
+            "a看全部项目",
+            "u回滚",
+            "s停止",
+            "d改动",
+        ] {
+            assert!(c.contains(key), "九宫格按键表里的「{key}」被截掉了：{c}");
+        }
+    }
+
+    /// 选项目是**浮层**不是全屏接管：画完之后，屏幕上必须**同时**看得到
+    /// 浮层的内容和背后的看板。上一版全屏接管，用户按 p 的那一刻整个
+    /// 界面消失，只剩一个几乎全空的框——这正是「完全是混乱的」的一部分。
+    #[test]
+    fn the_project_picker_is_an_overlay_not_a_takeover() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = PathBuf::from("/w/proj");
+        app.sessions = vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/w/proj".into(),
+            state: SessionState::Idle,
+            activity: "背后的看板".into(),
+        }];
+        app.refresh_visible();
+        app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
+            vec!["/w/other".to_string()],
+            PathBuf::from("/w"),
+        ));
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+
+        assert!(c.contains("背后的看板"), "背后的看板必须还看得见：{c}");
+        assert!(c.contains("最近"), "浮层自己也要画出来：{c}");
+    }
+
+    /// 终端小到放不下浮层时退化成全屏，而不是显示一句「窗口太小」：
+    /// 选项目是用户此刻非做不可的事，挡住他没有意义。
+    #[test]
+    fn a_tiny_terminal_gets_the_picker_full_screen_rather_than_a_refusal() {
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        assert_eq!(popup_area(full), full);
+    }
+
+    /// 宽屏上浮层不该铺满：一个横跨 200 列的对话框，眼睛要扫过整个屏幕
+    /// 才能读完一行。
+    #[test]
+    fn a_wide_terminal_gets_a_bounded_centered_popup() {
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
+        let p = popup_area(full);
+        assert!(p.width <= 100, "宽度要有上限：{}", p.width);
+        assert!(p.height <= 24, "高度要有上限：{}", p.height);
+        assert!(p.x > 0 && p.y > 0, "要居中，不能贴边");
+        assert_eq!(p.x + p.width / 2, full.width / 2, "水平居中");
+    }
+
+    #[test]
+    fn escape_hint_cols_fits_every_view() {
+        use unicode_width::UnicodeWidthStr;
+        let views = [
+            View::Board,
+            View::Attached(1),
+            View::Grid { focus: 0 },
+            View::PickProfile {
+                entries: Vec::new(),
+                state: ListState::default(),
+                warning: None,
+            },
+            View::PickProject(crate::ui::view::ProjectPicker {
+                filter: String::new(),
+                typing_path: None,
+                ..crate::ui::view::ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+            }),
+            View::PickProject(crate::ui::view::ProjectPicker {
+                filter: String::new(),
+                typing_path: Some(String::new()),
+                ..crate::ui::view::ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+            }),
+            View::Secrets {
+                entries: Vec::new(),
+                state: ListState::default(),
+                pending_delete: None,
+            },
+            View::Settings {
+                state: ListState::default(),
+            },
+            // 填密钥有两条退路（回设置页 / 回选择器），两条文案都要量
+            View::EnterSecret {
+                profile: String::new(),
+                label: String::new(),
+                prompt: crate::proto::SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: view::SecretPhase::Typing,
+                return_to_settings: true,
+            },
+            View::EnterSecret {
+                profile: String::new(),
+                label: String::new(),
+                prompt: crate::proto::SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: view::SecretPhase::Typing,
+                return_to_settings: false,
+            },
+        ];
+        // 两种语言都要量。常量是写死的，而译文长度各不相同——只量中文的话，
+        // 哪天某种语言的逃生键更长，就会在那种语言下被静默截断。
+        for l in crate::i18n::Lang::all() {
+            for v in &views {
+                let hint = escape_hint(v, *l);
+                assert!(
+                    hint.width() <= ESCAPE_HINT_COLS as usize,
+                    "{l:?} 下逃生键「{hint}」宽 {} 列，放不进 ESCAPE_HINT_COLS = {ESCAPE_HINT_COLS}",
+                    hint.width()
+                );
+            }
+        }
+        // 常量不能比需要的更宽：多占的每一列都是从右段的消息里抢的
+        let widest = crate::i18n::Lang::all()
+            .iter()
+            .flat_map(|l| views.iter().map(move |v| escape_hint(v, *l).width()))
+            .max()
+            .unwrap();
+        assert_eq!(
+            widest, ESCAPE_HINT_COLS as usize,
+            "ESCAPE_HINT_COLS 应当正好等于最长文案的宽度"
+        );
+    }
+
     #[test]
     fn escape_hint_survives_a_long_message() {
         use ratatui::backend::TestBackend;
@@ -1266,7 +1705,10 @@ mod tests {
         app.connected = false;
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
-        assert!(c.contains("Ctrl+Q回看板"), "断连时逃生提示必须还在：{c}");
+        assert!(
+            c.contains("Ctrl+Q（F2）回看板"),
+            "断连时逃生提示必须还在：{c}"
+        );
         assert!(c.contains("连不上"), "断连提示本身也要显示：{c}");
     }
 
@@ -1359,10 +1801,11 @@ mod tests {
         app.view = View::Attached(1);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
-        assert!(c.contains("Ctrl+Q回看板"), "会话视图要给出逆转键提示：{c}");
+        // F2 从右段的「F2 同效」挪进了左段的逃生键本身，两个键并列写在
+        // 一处。断言跟着挪：老用户的肌肉记忆仍要在屏幕上找得到。
         assert!(
-            c.contains("F2同效"),
-            "F2 是老用户的肌肉记忆，也要留在提示里：{c}"
+            c.contains("Ctrl+Q（F2）回看板"),
+            "会话视图要给出逆转键提示，且两个键都要点名：{c}"
         );
         assert!(
             c.contains("F3下一个会话"),

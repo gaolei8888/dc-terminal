@@ -2,16 +2,13 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-/// 界面语言。i18n 那一期会把它挪进 `src/i18n.rs` 并加上其余语言；
-/// 这里先立一个单变体的版本，好让 profile 的多语言字段现在就按最终结构落地——
-/// profile 是**用户可编辑的数据文件**，进不了 i18n 的词条表，
-/// 现在写成平字符串，i18n 落地时就是一次会打破用户文件的改动。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    Zh,
-}
+pub use crate::i18n::Lang;
+use crate::proto::{IoReason, WarningCode};
 
 /// 一段可翻译的文案。TOML 里写成子表：`[label]` 下面 `zh = "..."`。
+///
+/// profile 是**用户可编辑的数据文件**，进不了 i18n 的词条表——所以它的多语言
+/// 走这条独立的路，而不是 `i18n::Key`。用户自己写的 profile 只写母语是常态。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LocalizedText {
     #[serde(default)]
@@ -21,9 +18,14 @@ pub struct LocalizedText {
 }
 
 impl LocalizedText {
+    /// 取不到就是 `None`，**不跨语言回落**。回落到另一种语言的话，英文界面里
+    /// 会冒出一句中文，用户既看不懂也不知道那是哪来的；回落成什么由调用方
+    /// 决定（`display_label` 回落到 profile 名，`display_note` 回落到空串），
+    /// 那是它们各自知道、这里不知道的事。
     pub fn get(&self, lang: Lang) -> Option<&str> {
         match lang {
             Lang::Zh => self.zh.as_deref(),
+            Lang::En => self.en.as_deref(),
         }
     }
 }
@@ -68,6 +70,13 @@ pub struct Profile {
     /// 比 `idle_pattern` 可靠：空闲时的输入框占位符用户一打字就没了。
     #[serde(default)]
     pub busy_pattern: Option<String>,
+    /// agent 失败时屏幕上一定会出现的串（比如 Claude Code 的 `API Error`）。
+    ///
+    /// **只给见过真实错误文案的 profile 写。** 凭想象编正则会造出误报，
+    /// 而误报比不报更糟：一个好端端的会话被标成失败，用户跑去看一个根本
+    /// 没出事的东西，然后就不再相信这个标记了。没写 = 这个功能对它关着。
+    #[serde(default)]
+    pub error_pattern: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -148,6 +157,17 @@ impl Profile {
         }
     }
 
+    pub fn error_regex(&self) -> Result<Option<regex::Regex>> {
+        match &self.error_pattern {
+            None => Ok(None),
+            Some(p) => {
+                Ok(Some(regex::Regex::new(p).with_context(|| {
+                    format!("error_pattern 不是合法正则: {p}")
+                })?))
+            }
+        }
+    }
+
     /// 菜单上显示的名字。没写 label 就回落到 profile 名——那至少是个能认的词。
     pub fn display_label(&self, lang: Lang) -> String {
         self.label.get(lang).unwrap_or(&self.name).to_string()
@@ -176,17 +196,17 @@ pub fn profiles_dir_for_socket(socket: &Path) -> PathBuf {
 /// 这里按 `ErrorKind` 挑几种用户分得清、也做得了什么的说法；分不清的
 /// 归到一句笼统的「读取失败」——原始详情不丢，调用方负责写到 stderr，
 /// 不冒泡到界面上。
-pub(crate) fn describe_io_error(e: &std::io::Error) -> String {
+pub(crate) fn io_reason(e: &std::io::Error) -> IoReason {
     match e.kind() {
-        std::io::ErrorKind::PermissionDenied => "没有权限读取".to_string(),
-        std::io::ErrorKind::NotADirectory => "不是一个文件夹".to_string(),
-        _ => "读取失败".to_string(),
+        std::io::ErrorKind::PermissionDenied => IoReason::PermissionDenied,
+        std::io::ErrorKind::NotADirectory => IoReason::NotADirectory,
+        _ => IoReason::Other,
     }
 }
 
 /// 读一个目录下所有 `*.toml`。第二个返回值是每个读不了的文件的人话错误——
 /// **不能静默跳过**：用户自己写的 profile 没出现在菜单里，他需要知道为什么。
-pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
+pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<WarningCode>) {
     let mut found = Vec::new();
     let mut errs = Vec::new();
 
@@ -201,7 +221,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
             // 原始系统错误写到 stderr 留个诊断痕迹，界面上只给人话——
             // 见 describe_io_error 的注释。
             eprintln!("{name} 打不开：{e}");
-            errs.push(format!("{name} 打不开：{}", describe_io_error(&e)));
+            errs.push(WarningCode::ProfileDirUnreadable {
+                name: name.to_string(),
+                reason: io_reason(&e),
+            });
             return (found, errs);
         }
     };
@@ -219,7 +242,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
         match std::fs::read_to_string(&path) {
             Err(e) => {
                 eprintln!("{name} 读不了：{e}");
-                errs.push(format!("{name} 读不了：{}", describe_io_error(&e)));
+                errs.push(WarningCode::ProfileUnreadable {
+                    name: name.to_string(),
+                    reason: io_reason(&e),
+                });
             }
             Ok(src) => match Profile::from_toml(&src) {
                 // `Profile::from_toml` 用 `.context()` 包了一层，anyhow 的
@@ -229,12 +255,16 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
                 // toml::de::Error，span/message 都在，只是不走它自带的多行
                 // ASCII 图 Display（那是给等宽终端排版看的，不是人话）。
                 Err(e) => {
-                    let detail = e
+                    let (line, reason) = e
                         .root_cause()
                         .downcast_ref::<toml::de::Error>()
                         .map(|te| describe_toml_error(te, &src))
-                        .unwrap_or_else(|| e.to_string());
-                    errs.push(format!("{name} 写错了：{detail}"));
+                        .unwrap_or((None, e.to_string()));
+                    errs.push(WarningCode::ProfileMalformed {
+                        name: name.to_string(),
+                        line,
+                        reason,
+                    });
                 }
                 Ok(p) => found.push(p),
             },
@@ -253,7 +283,7 @@ pub fn load_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
 /// 这行菜单状态栏只能放一行字，两行糊在一起在等宽终端上会错位换行，看着又是
 /// 一份变相的栈追踪。这里把内部换行拍平成中文顿号式的分隔符——两句话都留着，
 /// 「expected ...」那半句是真正告诉用户该怎么改的部分，直接丢掉可惜。
-pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
+pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> (Option<usize>, String) {
     let reason = err
         .message()
         .lines()
@@ -261,16 +291,16 @@ pub(crate) fn describe_toml_error(err: &toml::de::Error, src: &str) -> String {
         .collect::<Vec<_>>()
         .join("；");
     match err.span() {
-        Some(span) => {
-            let line = src[..span.start.min(src.len())].matches('\n').count() + 1;
-            format!("第 {line} 行：{reason}")
-        }
-        None => reason,
+        Some(span) => (
+            Some(src[..span.start.min(src.len())].matches('\n').count() + 1),
+            reason,
+        ),
+        None => (None, reason),
     }
 }
 
 /// 内置 + 磁盘。同名以磁盘为准（用户改了就是要改），新名字追加在后面。
-pub fn all_profiles(dir: &Path) -> (Vec<Profile>, Vec<String>) {
+pub fn all_profiles(dir: &Path) -> (Vec<Profile>, Vec<WarningCode>) {
     let (disk, errs) = load_dir(dir);
     let mut out = Profile::builtins();
     for p in disk {
@@ -550,6 +580,146 @@ mod tests {
         assert_eq!(p.note.get(Lang::Zh), Some("月之暗面"));
     }
 
+    /// 声明了 `error_pattern` 的内置 profile，那条正则必须编得过——
+    /// 编不过的话，会话建起来直接失败（`create()` 会 `?` 掉它），
+    /// 而用户什么都没做错。
+    #[test]
+    fn every_builtin_error_pattern_compiles() {
+        for p in Profile::builtins() {
+            assert!(
+                p.error_regex().is_ok(),
+                "{} 的 error_pattern 不是合法正则",
+                p.name
+            );
+        }
+    }
+
+    /// claude 系那几个的 `command` 就是 `claude`，界面完全一样，所以
+    /// 错误文案也一样。漏掉任何一个，那个 agent 就会静默地坏着。
+    #[test]
+    fn every_claude_based_profile_detects_the_same_errors() {
+        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            let re = p
+                .error_regex()
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} 应当声明 error_pattern"));
+            assert!(
+                re.is_match("API Error: Connection closed mid-response."),
+                "{name} 认不出用户实际撞到的那句话"
+            );
+        }
+    }
+
+    /// **没见过错误文案的 agent 一条都不许编。** 凭想象写正则会造出误报，
+    /// 而误报比不报更糟：好端端的会话被标成失败，用户跑去看一个没出事的
+    /// 东西，然后就不再相信这个标记了。
+    #[test]
+    fn profiles_with_unknown_error_text_declare_nothing() {
+        for name in ["codex", "opencode", "qwen", "shell"] {
+            assert!(
+                Profile::builtin(name).unwrap().error_pattern.is_none(),
+                "{name} 的错误文案还没见过实物，不该凭空编一条"
+            );
+        }
+    }
+
+    /// 内置 profile 的每一条 `en` 里都不许出现汉字。
+    ///
+    /// 这条不是洁癖：补英文那次我用脚本批量加 `en =`，品牌名（`Claude`/`Kimi`）
+    /// 中英同形所以直接抄了中文那行，结果 `shell` 的 label 被抄成
+    /// `en = "命令行"`——英文界面上凭空冒出一句中文，而回落机制看它非空
+    /// 就认了。人工补译很容易再犯同样的错，交给测试。
+    #[test]
+    fn no_builtin_profile_smuggles_chinese_into_its_english_text() {
+        let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        for p in Profile::builtins() {
+            for (what, t) in [
+                ("label", &p.label),
+                ("note", &p.note),
+                (
+                    "secret.hint",
+                    &p.secret
+                        .as_ref()
+                        .map(|s| s.hint.clone())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "install.note",
+                    &p.install
+                        .as_ref()
+                        .map(|i| i.note.clone())
+                        .unwrap_or_default(),
+                ),
+            ] {
+                if let Some(en) = t.en.as_deref() {
+                    assert!(!cjk(en), "{} 的 {what} 里 en 写着中文：{en}", p.name);
+                }
+            }
+        }
+    }
+
+    /// profile 的 TOML 里 `[note]` 下同时写了 `zh` 和 `en`，两边都要取得到。
+    /// 这是 i18n 那一期之前唯一说不通的地方：`Lang` 只有 `Zh` 一个变体，
+    /// 用户写了 `en = "..."` 也永远没人读。
+    /// agent 失败时屏幕上那句话。没写 `error_pattern` 的 profile
+    /// 这个功能就是关着的，行为跟改之前完全一样。
+    #[test]
+    fn parses_and_compiles_the_error_pattern() {
+        let p =
+            Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\nerror_pattern = \"API Error\"\n")
+                .unwrap();
+        assert_eq!(p.error_pattern.as_deref(), Some("API Error"));
+        let re = p.error_regex().unwrap().unwrap();
+        assert!(re.is_match("API Error: Connection closed mid-response"));
+        assert!(!re.is_match("一切正常"));
+    }
+
+    #[test]
+    fn a_profile_without_an_error_pattern_has_no_error_regex() {
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.error_pattern.is_none());
+        assert!(p.error_regex().unwrap().is_none());
+    }
+
+    #[test]
+    fn localized_text_serves_both_languages() {
+        let p = Profile::from_toml(
+            r#"
+            name = "kimi"
+            command = ["kimi"]
+            is_agent = true
+            [label]
+            zh = "Kimi"
+            en = "Kimi"
+            [note]
+            zh = "月之暗面"
+            en = "Moonshot AI"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.display_note(Lang::Zh), "月之暗面");
+        assert_eq!(p.display_note(Lang::En), "Moonshot AI");
+    }
+
+    /// 只写了中文的 profile，英文界面下回落到 profile 名而不是显示中文——
+    /// 用户自己写的 profile 不会有人替他翻译，回落必须是个他认得的词。
+    #[test]
+    fn a_chinese_only_label_falls_back_to_the_profile_name_in_english() {
+        let p = Profile::from_toml(
+            r#"
+            name = "myagent"
+            command = ["x"]
+            is_agent = true
+            [label]
+            zh = "我的助手"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.display_label(Lang::Zh), "我的助手");
+        assert_eq!(p.display_label(Lang::En), "myagent");
+    }
+
     #[test]
     fn parses_busy_pattern_and_install() {
         let p = Profile::from_toml(
@@ -751,17 +921,16 @@ mod tests {
             "一个坏文件不能连累其它的"
         );
         assert_eq!(errs.len(), 1);
-        assert!(
-            errs[0].contains("bad.toml"),
-            "错误里要说是哪个文件：{}",
-            errs[0]
-        );
+        let WarningCode::ProfileMalformed { name, line, reason } = &errs[0] else {
+            panic!("应当是「写错了」这一类：{:?}", errs[0]);
+        };
+        assert_eq!(name, "bad.toml", "错误里要说是哪个文件");
         // anyhow 的 `.context()` 会把底层 toml::de::Error 的行号和原因吞掉，
         // 只剩一句「profile TOML 解析失败」——那等于把「坏了」重说一遍，
         // 用户本来就知道坏了。这里要证明详细原因确实透出来了。
         assert!(
-            errs[0].contains("第 1 行") && errs[0].contains("invalid key"),
-            "错误里要带解析细节（行号+原因），不能退化成一句空话：{}",
+            *line == Some(1) && reason.contains("invalid key"),
+            "错误里要带解析细节（行号+原因），不能退化成一句空话：{:?}",
             errs[0]
         );
     }
@@ -783,20 +952,20 @@ mod tests {
 
         let (_, errs) = load_dir(tmp.path());
         assert_eq!(errs.len(), 1);
+        let WarningCode::ProfileMalformed { reason, .. } = &errs[0] else {
+            panic!("应当是「写错了」这一类：{:?}", errs[0]);
+        };
         assert!(
-            !errs[0].contains('\n'),
-            "错误要是单行，不能带换行糊到状态栏上：{}",
-            errs[0]
+            !reason.contains('\n'),
+            "原因要是单行，不能带换行糊到状态栏上：{reason}"
         );
         assert!(
-            errs[0].contains("invalid escape sequence"),
-            "第一句原因不能丢：{}",
-            errs[0]
+            reason.contains("invalid escape sequence"),
+            "第一句原因不能丢：{reason}"
         );
         assert!(
-            errs[0].contains("expected"),
-            "该怎么改的那半句不能丢：{}",
-            errs[0]
+            reason.contains("expected"),
+            "该怎么改的那半句不能丢：{reason}"
         );
     }
 
@@ -835,20 +1004,20 @@ mod tests {
                 "目录存在但读不了（比如权限不对）不能和「目录不存在」一样静默——\
                  用户既拿不到自定义 profile，也拿不到任何解释"
             );
-            assert!(
-                errs[0].contains("locked"),
-                "错误里要指出是哪个目录：{}",
-                errs[0]
-            );
+            let WarningCode::ProfileDirUnreadable { name, reason } = &errs[0] else {
+                panic!("应当是「目录打不开」这一类：{:?}", errs[0]);
+            };
+            assert!(name.contains("locked"), "错误里要指出是哪个目录：{name}");
             // io::Error 的 Display 是英文系统原话（"Permission denied (os
-            // error 13)"），零编程经验的用户看不懂 errno——这行必须只剩
-            // 中文说法，原文只写 stderr。
+            // error 13)"），零编程经验的用户看不懂 errno。现在结构上就没有
+            // 地方能塞进原文——码里只有一个分类枚举。
+            assert_eq!(*reason, IoReason::PermissionDenied, "要点名是权限问题");
+            let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, &errs[0]);
             assert!(
-                !errs[0].contains("os error") && !errs[0].contains("Permission denied"),
-                "不能把系统原话漏给用户：{}",
-                errs[0]
+                !line.contains("os error") && !line.contains("Permission denied"),
+                "组出来的话里不能有系统原话：{line}"
             );
-            assert!(errs[0].contains("权限"), "要点名是权限问题：{}", errs[0]);
+            assert!(line.contains("权限"), "中文下要说「权限」：{line}");
         }
     }
 
@@ -876,11 +1045,15 @@ mod tests {
             let (found, errs) = load_dir(tmp.path());
             assert!(found.is_empty());
             assert_eq!(errs.len(), 1);
-            assert!(errs[0].contains("locked.toml"));
+            let WarningCode::ProfileUnreadable { name, reason } = &errs[0] else {
+                panic!("应当是「文件读不了」这一类：{:?}", errs[0]);
+            };
+            assert_eq!(name, "locked.toml");
+            assert_eq!(*reason, IoReason::PermissionDenied);
+            let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, &errs[0]);
             assert!(
-                !errs[0].contains("os error") && !errs[0].contains("Permission denied"),
-                "不能把系统原话漏给用户：{}",
-                errs[0]
+                !line.contains("os error") && !line.contains("Permission denied"),
+                "不能把系统原话漏给用户：{line}"
             );
         }
     }

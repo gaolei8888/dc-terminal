@@ -123,7 +123,9 @@ fn unknown_session_returns_error_not_panic() {
     let h = common::start_daemon();
     let mut c = h.client();
     match c.call(Request::Stop { id: 999 }).unwrap() {
-        Response::Error(msg) => assert!(msg.contains("没有这个会话")),
+        // 守护进程报的是**码**，不是句子——它不知道用户在用什么语言。
+        // 句子由界面用 `i18n::msg::error` 组出来。
+        Response::Error(code) => assert_eq!(code, dct::proto::ErrorCode::NoSuchSession(999)),
         other => panic!("预期 Error，实际 {other:?}"),
     }
 }

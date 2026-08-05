@@ -69,5 +69,16 @@ fn run_ui() -> Result<()> {
 
     let client =
         Client::connect(&sock).with_context(|| format!("连不上守护进程：{}", sock.display()))?;
-    dct::ui::run(client, std::env::current_dir()?)
+    {
+        // 语言在这里定一次：main 是唯一同时知道 socket 路径（设置文件在它旁边）
+        // 和真实环境变量的地方。定完交给 ui::run，界面自己不再去猜。
+        let settings = dct::settings::settings_path_for_socket(&sock);
+        let lang = dct::i18n::resolve(dct::settings::load_lang(&settings), &|k| {
+            std::env::var(k).ok()
+        });
+        // 新装默认九宫格：列表在宽屏上是一屏留白，而九宫格直接给出每个
+        // 会话在干什么——后者才是「一屏管好几个 agent」这件事的样子。
+        let mode = dct::settings::load_view_mode(&settings).unwrap_or(dct::ui::ViewMode::Grid);
+        dct::ui::run(client, std::env::current_dir()?, lang, sock.clone(), mode)
+    }
 }

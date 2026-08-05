@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
+use crate::i18n::Lang;
 use crate::profile::ProfileStatus;
 use crate::proto::{ProfileEntry, SecretPrompt};
 use crate::session::SessionState;
@@ -29,14 +30,11 @@ pub(crate) enum View {
         /// 密钥文件读不了、自定义 profile 写错了。顶部红字。
         warning: Option<String>,
     },
-    PickProject {
-        /// 守护进程返回的完整列表，过滤不改动它
-        all: Vec<String>,
-        /// 用户打的字
-        filter: String,
+    PickProject(ProjectPicker),
+    /// 设置页：目前只有语言一项。跟 `Secrets` 分开是两码事——那边管的是
+    /// 「哪个 agent 用哪把密钥」，这里管的是界面本身怎么显示。
+    Settings {
         state: ListState,
-        /// Some 表示正处在「手输路径」的输入态
-        typing_path: Option<String>,
     },
     EnterSecret {
         /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
@@ -130,17 +128,11 @@ pub(crate) fn is_ctrl_q(key: &KeyEvent) -> bool {
 pub(crate) fn back_one_level(view: View) -> Option<View> {
     match view {
         View::Board => None,
-        View::PickProject {
-            all,
-            filter,
-            state,
-            typing_path: Some(_),
-        } => Some(View::PickProject {
-            all,
-            filter,
-            state,
+        // 手输态退一层是回到两栏那一屏，不是关掉整个选择器
+        View::PickProject(p) if p.typing_path.is_some() => Some(View::PickProject(ProjectPicker {
             typing_path: None,
-        }),
+            ..p
+        })),
         View::EnterSecret {
             return_to_settings: true,
             ..
@@ -154,8 +146,12 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
             state: ListState::default(),
             warning: None,
         }),
-        // Secrets 和 Grid 落在这条兜底里：它们跟 Attached/PickProject 一样
-        // 只有一层，退一层就是看板。
+        // 九宫格跟列表是**平级**的两个模式，它自己就是顶层，退无可退——
+        // 跟 `View::Board` 一样返回 `None`。以前它落在下面那条兜底里，
+        // 于是 Ctrl+Q 成了 `g` 的隐藏同义词。
+        View::Grid { .. } => None,
+        // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
+        // 退一层就是看板。
         _ => Some(View::Board),
     }
 }
@@ -179,12 +175,12 @@ pub enum PickAction {
 
 /// 按下某一项时该干什么。抽成纯函数是为了能单测——`run()` 的按键循环
 /// 要连真 socket，测不了（同 `back_one_level`）。
-pub fn pick_action(e: &ProfileEntry) -> PickAction {
+pub fn pick_action(e: &ProfileEntry, lang: Lang) -> PickAction {
     match &e.status {
         ProfileStatus::Ready => PickAction::Start(e.name.clone()),
         ProfileStatus::NeedsSecret => PickAction::AskSecret(0),
         ProfileStatus::NeedsDependency { label } => {
-            PickAction::Blocked(format!("要先装 {label} 才能用 {}", e.label))
+            PickAction::Blocked(crate::i18n::msg::needs_dependency(lang, label, &e.label))
         }
         ProfileStatus::NotInstalled { command } => match &e.install {
             Some(i) => PickAction::Install {
@@ -197,9 +193,9 @@ pub fn pick_action(e: &ProfileEntry) -> PickAction {
             // 干脆点名是这个 profile 本身没配置要跑什么，而不是暗示去装一个
             // 不存在的空名字命令。
             None if command.is_empty() => {
-                PickAction::Blocked(format!("{} 没配置要运行的程序，用不了", e.label))
+                PickAction::Blocked(crate::i18n::msg::no_command_configured(lang, &e.label))
             }
-            None => PickAction::Blocked(format!("本机没有找到 {command}")),
+            None => PickAction::Blocked(crate::i18n::msg::command_not_found(lang, command)),
         },
     }
 }
@@ -303,11 +299,13 @@ pub fn clean_secret(s: &str) -> String {
 /// `Unreachable` 必须说网络的问题，不能说密钥的问题——用户的密钥可能
 /// 完全没问题，只是这台机器连不上服务器；把锅甩给密钥会让他白跑一趟
 /// 去重新生成一个根本不需要换的 key。
-pub fn verify_message(o: VerifyOutcome) -> Option<String> {
+pub fn verify_message(o: VerifyOutcome, lang: Lang) -> Option<String> {
     match o {
         VerifyOutcome::Ok => None,
-        VerifyOutcome::BadKey => Some("这个密钥用不了，可能是复制的时候少了一段".into()),
-        VerifyOutcome::Unreachable => Some("连不上服务器，检查一下网络".into()),
+        VerifyOutcome::BadKey => Some(crate::i18n::text(crate::i18n::Key::BadSecret, lang).into()),
+        VerifyOutcome::Unreachable => {
+            Some(crate::i18n::text(crate::i18n::Key::NetworkUnreachable, lang).into())
+        }
     }
 }
 
@@ -369,6 +367,217 @@ pub(crate) fn filter_projects(all: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
+/// 哪一栏有焦点。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    Recent,
+    Browse,
+}
+
+/// 选项目那一层浮层的全部状态。
+///
+/// 收成一个结构体而不是继续在 `View::PickProject` 上平铺字段：字段从 4 个
+/// 涨到 8 个之后，每处 `match` 解构都要抄一长串，而且加一个字段就得改遍
+/// 所有分支。
+#[derive(Clone)]
+pub struct ProjectPicker {
+    /// 守护进程给的最近项目，过滤不改动它
+    pub recent: Vec<String>,
+    pub recent_state: ListState,
+    /// 浏览器现在停在哪个目录
+    pub cwd: PathBuf,
+    pub entries: Vec<DirRow>,
+    pub browse_state: ListState,
+    pub focus: Pane,
+    /// **只作用于当前焦点那一栏。** 两栏共用一个过滤词的话，用户在左边打字
+    /// 找项目，右边的目录列表会跟着变空，而他并没有要求那件事。
+    pub filter: String,
+    /// Some 表示正处在「手输路径」的输入态
+    pub typing_path: Option<String>,
+}
+
+impl ProjectPicker {
+    pub fn new(recent: Vec<String>, cwd: PathBuf) -> ProjectPicker {
+        let entries = list_dirs(&cwd);
+        let mut recent_state = ListState::default();
+        recent_state.select(Some(0));
+        let mut browse_state = ListState::default();
+        if !entries.is_empty() {
+            browse_state.select(Some(0));
+        }
+        ProjectPicker {
+            recent,
+            recent_state,
+            cwd,
+            entries,
+            browse_state,
+            // 开在「最近」那一栏：绝大多数时候用户要的项目就在里面，
+            // 浏览器是给「不在里面」那种情况准备的。
+            focus: Pane::Recent,
+            filter: String::new(),
+            typing_path: None,
+        }
+    }
+
+    /// 把浏览器挪到另一个目录，并把光标收回第一行——换了目录还留着旧行号，
+    /// 光标会落在一个跟刚才毫无关系的条目上。
+    pub fn browse_to(&mut self, dir: PathBuf) {
+        self.entries = list_dirs(&dir);
+        self.cwd = dir;
+        self.browse_state.select(if self.entries.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        // 过滤词是对着上一个目录打的，换了目录就不成立了
+        self.filter.clear();
+    }
+
+    /// 当前焦点那一栏里，过滤之后真正显示的行。
+    pub fn shown_recent(&self) -> Vec<String> {
+        match self.focus {
+            Pane::Recent => filter_projects(&self.recent, &self.filter),
+            Pane::Browse => self.recent.clone(),
+        }
+    }
+
+    pub fn shown_entries(&self) -> Vec<DirRow> {
+        match self.focus {
+            Pane::Browse if !self.filter.is_empty() => {
+                let f = self.filter.to_lowercase();
+                self.entries
+                    .iter()
+                    .filter(|r| r.name.to_lowercase().contains(&f))
+                    .cloned()
+                    .collect()
+            }
+            _ => self.entries.clone(),
+        }
+    }
+}
+
+/// 目录浏览器里的一行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirRow {
+    pub name: String,
+    /// 是不是 git 仓库。**只是个提示标记，不是准入判断**——真正的判断在
+    /// `session.rs` 建会话的时候。
+    pub is_git: bool,
+}
+
+/// 这些目录不进浏览器。它们不是「被隐藏的内容」，而是本来就不该出现的噪音：
+/// 目标用户是非程序员，`node_modules` 出现在选项目的列表里对他既没有意义
+/// 也没有用处（见 `dc_classroom/CLAUDE.md` 的目标用户约束）。
+const NOISE_DIRS: &[&str] = &["node_modules", "target", "build", "dist", "vendor"];
+
+/// 列出一个目录下**可以当项目选**的子目录，按名字排序。
+///
+/// 读不了（权限、目录没了）就返回空表，不报错：用户可能浏览到任何地方，
+/// 一个进不去的目录不该让整个界面倒下。调用方拿空表去显示「这里没有目录」，
+/// 跟真的空目录同一个落点——对用户来说这两种情况能做的事完全一样。
+///
+/// **判 git 用 `stat` 而不是 `git::is_repo`**：后者要 fork 一个 git 进程，
+/// 一个目录几十个子目录就是几十次 fork，翻目录会明显发卡。stat 判得没那么全
+/// （worktree、`GIT_DIR` 都会漏），但这只是个提示标记。
+pub(crate) fn list_dirs(dir: &Path) -> Vec<DirRow> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<DirRow> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || NOISE_DIRS.contains(&name.as_str()) {
+                return None;
+            }
+            let is_git = e.path().join(".git").exists();
+            Some(DirRow { name, is_git })
+        })
+        .collect();
+    // read_dir 的顺序由文件系统决定；不排的话同一个目录每次打开都可能换序，
+    // 用户没法靠位置记住东西在哪。
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+/// 看板的两种画法。它们是**平级**的，不是「列表 + 一个附属页面」——
+/// 所以 `q` 在两边都退出 dct、`Ctrl+Q` 在两边都无事可做（已经在顶层），
+/// 而所有「回看板」的落点都得回到用户选的这一个（见 `mod.rs` 的 `home_view`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ViewMode {
+    List,
+    Grid,
+}
+
+impl ViewMode {
+    /// 存进 settings.json 的稳定短码，跟枚举顺序无关。
+    pub fn code(self) -> &'static str {
+        match self {
+            ViewMode::List => "list",
+            ViewMode::Grid => "grid",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Option<ViewMode> {
+        match s {
+            "list" => Some(ViewMode::List),
+            "grid" => Some(ViewMode::Grid),
+            _ => None,
+        }
+    }
+
+    /// 切到另一个。只有两个模式，所以这是个全函数，不用兜底分支。
+    pub fn toggled(self) -> ViewMode {
+        match self {
+            ViewMode::List => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::List,
+        }
+    }
+}
+
+/// 看板上到底显示哪些会话。跟着用户走而不是跟着视图走——列表和九宫格是
+/// 同一批会话的两种画法，作用域在两边必须一致，否则切个视图会话数就变了。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scope {
+    CurrentProject,
+    AllProjects,
+}
+
+/// 按作用域筛出真正上屏的会话。抽成纯函数是为了能单测（同 `filter_projects`）
+/// ——过滤错了的代价是用户对着别的项目的会话按 `s` 停止，这必须在有守护
+/// 进程之前就测得到。
+pub(crate) fn visible_sessions(
+    all: &[crate::session::SessionInfo],
+    scope: Scope,
+    project: &Path,
+) -> Vec<crate::session::SessionInfo> {
+    if scope == Scope::AllProjects {
+        return all.to_vec();
+    }
+    all.iter()
+        .filter(|s| same_project(Path::new(&s.dir), project))
+        .cloned()
+        .collect()
+}
+
+/// 两个路径是不是同一个项目。归一化只在这里定义一次——过滤和「进会话要不要
+/// 切项目」必须用同一套判断，各写各的迟早会分叉成「列表里看不见、但进去了
+/// 又说没换项目」这种自相矛盾的状态。
+pub(crate) fn same_project(dir: &Path, project: &Path) -> bool {
+    canon(dir) == canon(project)
+}
+
+/// 比较用的归一化。**只用于比较，不用于显示**——把 `/tmp` 显示成
+/// `/private/tmp` 会让 macOS 上的界面凭空变丑，而用户并没有做错什么。
+///
+/// 解析失败（目录已被删）时退化成原样：一个指向已删目录的会话仍然应当
+/// 待在它原本的项目下，而不是从「当前项目」和「全部项目」两个视图里
+/// 同时消失——那才是真的找不回来了。
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// 视图切换后，底部消息该不该清掉。抽成纯函数是因为 `run()` 的按键循环里有
 /// 十几处给 `message` 赋值，没法在每处都补一行清空逻辑——漏一处就会有一个
 /// 视图继续顶着上一屏的残留话术（比如看板「已开会话 3」被 `Enter` 带进会话
@@ -409,9 +618,9 @@ pub(crate) fn message_after_transition(
 /// 用的 agent 里踢出去，比空白页糟得多。
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`idle_help`、`back_one_level`）。
-pub(crate) fn session_ended_notice(id: u32, state: SessionState) -> Option<String> {
+pub(crate) fn session_ended_notice(id: u32, state: SessionState, lang: Lang) -> Option<String> {
     match state {
-        SessionState::Stopped => Some(format!("会话 {id} 已结束，回到看板。按 n 再建一个")),
+        SessionState::Stopped => Some(crate::i18n::msg::session_ended(lang, id)),
         _ => None,
     }
 }
@@ -422,25 +631,29 @@ pub(crate) fn session_ended_notice(id: u32, state: SessionState) -> Option<Strin
 /// 别的窗口 kill 进程，而 kill 会把终端留在 raw mode。文案必须跟
 /// `back_one_level` 逐行对上：底栏说什么就得真能做到什么，
 /// 手输路径态退的是一层（回列表），不能写成「回看板」。
-pub(crate) fn escape_hint(view: &View) -> &'static str {
+pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
+    use crate::i18n::{text, Key};
     match view {
-        View::Board => "q 退出",
-        View::PickProject {
-            typing_path: Some(_),
-            ..
-        } => "Ctrl+Q 回列表",
+        View::Board => format!("q {}", text(Key::Quit, lang)),
+        View::PickProject(p) if p.typing_path.is_some() => text(Key::BackToList, lang).to_string(),
         // 跟 back_one_level 保持一致：从密钥设置页进来的填密钥，退出回设置页，
         // 不是选择器，也不是看板——三条路各回各的，文案不能含糊成一句话。
         View::EnterSecret {
             return_to_settings: true,
             ..
-        } => "Ctrl+Q 回设置",
+        } => text(Key::BackToSettings, lang).to_string(),
         // 从选择器进来的填密钥，退出回的是选择器，不是看板
-        View::EnterSecret { .. } => "Ctrl+Q 回列表",
-        // 九宫格退回的也是看板，但对用户来说那一屏就是「列表」——
-        // 站在格子里说「回看板」，用户会以为格子不算看板的一部分。
-        View::Grid { .. } => "Ctrl+Q 回列表",
-        _ => "Ctrl+Q 回看板",
+        View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
+        // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
+        // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
+        // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
+        View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
+        // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
+        // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
+        // 落点都是看板。只写一个键等于藏起另一半——而 F2 恰恰是
+        // 手指不必离开主键区的那个。其余视图没有 F2，不能照抄这句。
+        View::Attached(_) => text(Key::BackToBoardWithF2, lang).to_string(),
+        _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
 
@@ -448,52 +661,144 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
-pub(crate) fn idle_help(view: &View) -> &'static str {
+pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
+    use crate::i18n::{help_line, text, Key};
+    // 作用域键的说明随范围反转——`a` 是个开关，只写一个方向的话，
+    // 另一个方向上屏幕就在说谎。
+    let scope_key = match scope {
+        Scope::CurrentProject => Key::SeeAllProjects,
+        Scope::AllProjects => Key::ThisProjectOnly,
+    };
     match view {
-        View::Attached(_) => "F2 同效　F3 下一个会话　回看板后按 n 新建会话　其余按键都发给 agent",
-        View::PickProfile { .. } => "↑↓ 选  Enter 确认  或直接按数字  Esc 取消",
-        View::PickProject {
-            typing_path: Some(_),
-            ..
-        } => "输入路径后 Enter 确认，Esc 返回列表",
-        View::PickProject { .. } => "↑↓ 选  Enter 确认  直接打字过滤  Esc 取消",
-        // `g 九宫格` 插在切换类按键那一段里，不放句尾：这一整句在 80 列
-        // 终端上放不下会被右端截断，而 `g` 是九宫格唯一的入口——排在被截
-        // 掉的那一截里等于没写。
-        View::Board => {
-            "n 新建  N 换 agent  p 换项目  c 密钥  g 九宫格  ↑↓ 选择  Enter 进入  u 回滚  s 停止  d 改动"
-        }
+        // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
+        // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
+        View::Attached(_) => help_line(
+            &[
+                ("F3", Key::NextSession),
+                ("", Key::NewSessionFromBoard),
+                ("", Key::OtherKeysGoToAgent),
+            ],
+            lang,
+        )
+        .replace("  ", "　"),
+        View::PickProfile { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("", Key::OrPressDigit),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
+        View::PickProject(p) if p.typing_path.is_some() => help_line(
+            &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
+            lang,
+        ),
+        // 目录浏览器的三个键（Tab/→/←）必须写出来：它们是这一层唯一
+        // 「学过才知道」的部分，不写就等于没做浏览器。
+        View::PickProject(_) => help_line(
+            &[
+                ("Tab", Key::SwitchPane),
+                ("↑↓", Key::Select),
+                ("→", Key::EnterFolder),
+                ("←", Key::GoUp),
+                ("Enter", Key::Confirm),
+                ("", Key::TypeToFilter),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
+        // `g 九宫格` 插在切换类按键那一段里，不放句尾：`g` 是九宫格唯一的
+        // 入口，排在最容易被挤到第二行末尾的位置等于藏起来。
+        // `a` 紧跟着 `p 换项目`：两个键都在回答「我现在在看哪些会话」，
+        // 挨着放用户才会把它们当成一组。
+        View::Board => help_line(
+            &[
+                ("n", Key::New),
+                ("N", Key::SwitchAgent),
+                ("p", Key::SwitchProject),
+                ("a", scope_key),
+                ("c", Key::Secrets),
+                ("g", Key::Grid),
+                ("↑↓", Key::Select),
+                ("Enter", Key::Open),
+                ("u", Key::Undo),
+                ("s", Key::Stop),
+                ("d", Key::Diff),
+            ],
+            lang,
+        ),
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
         // 跟会话视图不同（那边除了 F2 全转发，列按键表等于教人按错）。
         //
         // 跟看板那一句列的是同一批键（它们在两个视图里做的是同一件事），
         // 只把不一样的两处换掉：选择靠方向键、Enter 是放大而不是进入。
-        // 九宫格独有的两个排在最前——`Ctrl+Q 回列表` 已经常驻左段，
-        // 这里不再重复。
         //
-        // `q 退出` 必须写出来：在看板上它常驻左段（escape_hint），到了九宫格
-        // 左段换成了 `Ctrl+Q 回列表`，可 q 照样直接退出整个 dct。屏幕上没写
-        // 却真的管用的键，就是等着用户误按——尤其是这个键会关掉一切。
-        // 排在前三而不是句尾，理由跟看板那句里的 `g 九宫格` 一样：这一整句
-        // 在 80 列终端上放不下，句尾那几个键会被右端截掉，写了等于没写。
-        View::Grid { .. } => {
-            "方向键移动  Enter 放大  q 退出  n 新建  N 换 agent  p 换项目  c 密钥  u 回滚  s 停止  d 改动"
-        }
+        // `q 退出` **不**写在这里：九宫格现在跟列表一样是顶层，左段的
+        // escape_hint 已经常驻「q 退出」。原来要写是因为那时左段被
+        // 「Ctrl+Q 回列表」占着，q 没有别的地方交代。重复一遍只会挤掉
+        // 句尾的 s/d——那两个是不可撤销的操作，比重复一次 q 重要得多。
+        View::Grid { .. } => help_line(
+            &[
+                ("", Key::MoveArrows),
+                ("Enter", Key::Zoom),
+                ("g", Key::List),
+                ("n", Key::New),
+                ("N", Key::SwitchAgent),
+                ("p", Key::SwitchProject),
+                ("a", scope_key),
+                ("c", Key::Secrets),
+                ("u", Key::Undo),
+                ("s", Key::Stop),
+                ("d", Key::Diff),
+            ],
+            lang,
+        ),
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
         View::EnterSecret {
             phase: SecretPhase::Verifying,
             ..
-        } => "正在验证，请稍候　Esc 可取消",
+        } => text(Key::Verifying, lang).to_string(),
         // 跟 escape_hint 一样要分 return_to_settings：从设置页进来的 Esc
         // 回设置页，不是「列表」——两处文案哪怕只有半句话不一致，都是
         // 「底栏说什么就得真能做到什么」这条原则被破坏了一半。
         View::EnterSecret {
             return_to_settings: true,
             ..
-        } => "粘贴或输入密钥　Enter 确认　Esc 返回设置",
-        View::EnterSecret { .. } => "粘贴或输入密钥　Enter 确认　Esc 返回列表",
-        View::Secrets { .. } => "↑↓ 选  Enter 改  d 删  Esc 返回",
+        } => help_line(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToSettingsWord),
+            ],
+            lang,
+        ),
+        View::EnterSecret { .. } => help_line(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToListWord),
+            ],
+            lang,
+        ),
+        View::Secrets { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Edit),
+                ("d", Key::Delete),
+                ("Esc", Key::Back),
+            ],
+            lang,
+        ),
+        View::Settings { .. } => help_line(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
     }
 }
 
@@ -544,12 +849,11 @@ mod tests {
             Some(View::Board)
         ));
         assert!(matches!(
-            back_one_level(View::PickProject {
-                all: Vec::new(),
+            back_one_level(View::PickProject(ProjectPicker {
                 filter: String::new(),
-                state: ListState::default(),
                 typing_path: None,
-            }),
+                ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+            })),
             Some(View::Board)
         ));
     }
@@ -557,41 +861,26 @@ mod tests {
     #[test]
     fn ctrl_q_leaves_the_typing_state_before_leaving_the_picker() {
         // 手输路径态退一层是回列表，不是一步退回看板
-        let back = back_one_level(View::PickProject {
-            all: vec!["/tmp/a".into()],
+        let back = back_one_level(View::PickProject(ProjectPicker {
             filter: "a".into(),
-            state: ListState::default(),
             typing_path: Some("/tmp/b".into()),
-        });
+            ..ProjectPicker::new(vec!["/tmp/a".into()], std::path::PathBuf::from("/tmp"))
+        }));
         match back {
-            Some(View::PickProject {
-                typing_path,
-                filter,
-                all,
-                ..
-            }) => {
-                assert_eq!(typing_path, None, "应当退出手输态");
-                assert_eq!(filter, "a", "退一层不该顺手清掉过滤词");
-                assert_eq!(all, vec!["/tmp/a".to_string()], "项目列表不该丢");
+            Some(View::PickProject(p)) => {
+                assert_eq!(p.typing_path, None, "应当退出手输态");
+                assert_eq!(p.filter, "a", "退一层不该顺手清掉过滤词");
+                assert_eq!(p.recent, vec!["/tmp/a".to_string()], "项目列表不该丢");
             }
             other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
         }
     }
 
     #[test]
-    fn grid_backs_out_to_the_board() {
-        // 九宫格跟会话视图一样只有一层，Ctrl+Q 退回列表
-        assert!(matches!(
-            back_one_level(View::Grid { focus: 3 }),
-            Some(View::Board)
-        ));
-    }
-
-    #[test]
     fn grid_hints_match_what_the_keys_actually_do() {
-        // 底栏说什么就得真能做到什么：九宫格的 Ctrl+Q 回的是列表那一屏
-        assert_eq!(escape_hint(&View::Grid { focus: 0 }), "Ctrl+Q 回列表");
-        let help = idle_help(&View::Grid { focus: 0 });
+        // 底栏说什么就得真能做到什么。九宫格现在是顶层，逃生键是 q——
+        // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
+        let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
         for k in [
             "方向键移动",
             "Enter 放大",
@@ -602,26 +891,78 @@ mod tests {
             "u 回滚",
             "s 停止",
             "d 改动",
-            // q 在九宫格里照样直接退出整个 dct，而左段这时写的是
-            // 「Ctrl+Q 回列表」，没人会知道 q 还在。屏幕上没写却真管用的键
-            // 就是等着用户误按，何况这个键会关掉一切。
-            "q 退出",
+            // `g 列表` 是九宫格唯一交代「怎么切回去」的地方
+            "g 列表",
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
-        // 80 列终端上右段只剩 63 列（80 − 2 边框 − 15 左段），整句放不下会被
-        // 截断。`q 退出` 必须落在截断线之前，不然写了也看不见。
-        let visible = crate::ui::truncate(help, 63);
+        // `q 退出` 不该再出现在这一句里：它已经常驻左段（escape_hint），
+        // 重复一遍只会把句尾的 s/d 挤出屏幕，而那两个不可撤销。
         assert!(
-            visible.contains("q 退出"),
-            "80 列终端上看不到「q 退出」：{visible}"
+            !help.contains("q 退出"),
+            "左段已经写着 q 退出，这里不该重复：{help}"
         );
+        // 「这些键在 80 列终端上真的看得见吗」这个问题，原来是靠在这里
+        // 手算一遍截断宽度来回答的（`truncate(help, 63)`）。那个算式随着
+        // 底栏改成两行自动换行已经失效，而且它算的是文案、不是屏幕。
+        // 真正的断言搬到了 `mod.rs`——那里是把整帧画出来再数格子：
+        // `every_board_key_is_actually_on_screen_at_eighty_columns` 和
+        // `every_grid_key_is_actually_on_screen_at_eighty_columns`。
     }
 
     #[test]
     fn board_help_mentions_the_grid() {
         // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
-        assert!(idle_help(&View::Board).contains("g 九宫格"));
+        assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("g 九宫格"));
+    }
+
+    /// 九宫格不再是列表的下一层：两个模式都是顶层，`Ctrl+Q` 在两边都无事
+    /// 可做。留着「Ctrl+Q 回列表」的话，它就是 `g` 的一个隐藏同义词，
+    /// 而屏幕上写的是「回列表」——用户会以为自己退出了什么。
+    #[test]
+    fn both_board_modes_are_top_level() {
+        assert!(back_one_level(View::Board).is_none());
+        assert!(back_one_level(View::Grid { focus: 0 }).is_none());
+        assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
+        assert_eq!(
+            escape_hint(&View::Grid { focus: 0 }, Lang::Zh),
+            "q 退出",
+            "九宫格也是家，不是列表的下一层"
+        );
+    }
+
+    /// 目录浏览器的三个键必须写在屏幕上。它们是这一层唯一「学过才知道」
+    /// 的部分——不写就等于做了个浏览器但没人知道怎么用。
+    #[test]
+    fn the_browser_advertises_its_three_keys() {
+        let help = idle_help(
+            &View::PickProject(ProjectPicker::new(
+                Vec::new(),
+                std::path::PathBuf::from("/tmp"),
+            )),
+            Scope::CurrentProject,
+            Lang::Zh,
+        );
+        for k in ["Tab 切换左右", "→ 进入文件夹", "← 上一级"] {
+            assert!(help.contains(k), "帮助行少了「{k}」：{help}");
+        }
+    }
+
+    /// `g` 在两个模式里都真的管用，所以两边的帮助行都得写出来。
+    /// 原来九宫格那句里没有 `g`——正是这个仓库反复警惕的
+    /// 「屏幕上没写却真管用的键」，只是这次犯在自己身上。
+    #[test]
+    fn both_modes_advertise_the_key_that_switches_them() {
+        let list = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
+        let grid = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
+        assert!(
+            list.contains("g 九宫格"),
+            "列表要告诉用户怎么去九宫格：{list}"
+        );
+        assert!(
+            grid.contains("g 列表"),
+            "九宫格要告诉用户怎么回列表：{grid}"
+        );
     }
 
     #[test]
@@ -666,6 +1007,159 @@ mod tests {
         // is_dir() 帮忙识别"用户什么都没输"。
         let base = std::path::Path::new("/base");
         assert_eq!(expand_path("", base), base);
+    }
+
+    fn sess(id: u32, dir: &str) -> crate::session::SessionInfo {
+        crate::session::SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+        }
+    }
+
+    #[test]
+    fn current_project_scope_keeps_only_that_project_in_order() {
+        // 这条就是用户报的症状一：底栏写着 A，屏幕上却有 B 的会话。
+        let all = [
+            sess(1, "/w/a"),
+            sess(2, "/w/b"),
+            sess(3, "/w/a"),
+            sess(4, "/w/c"),
+        ];
+        let got = visible_sessions(&all, Scope::CurrentProject, Path::new("/w/a"));
+        assert_eq!(
+            got.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "只留当前项目的会话，且保持原顺序"
+        );
+    }
+
+    /// `a` 是个开关，两个方向做的事相反。只写一句「a 全部项目」的话，
+    /// 用户已经在全部项目视图里时，屏幕会让他以为再按一次还是看全部。
+    #[test]
+    fn the_scope_key_hint_says_where_a_will_take_you() {
+        let board = View::Board;
+        assert!(
+            idle_help(&board, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"),
+            "只看本项目时，a 通向全部项目"
+        );
+        assert!(
+            idle_help(&board, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"),
+            "全部项目时，a 通向本项目"
+        );
+        // 九宫格是看板的另一种画法，同一个键必须给同一套说明
+        let grid = View::Grid { focus: 0 };
+        assert!(idle_help(&grid, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"));
+        assert!(idle_help(&grid, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"));
+    }
+
+    #[test]
+    fn all_projects_scope_returns_everything_untouched() {
+        let all = [sess(1, "/w/a"), sess(2, "/w/b")];
+        let got = visible_sessions(&all, Scope::AllProjects, Path::new("/w/a"));
+        assert_eq!(
+            got.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "全部项目视图不筛任何东西，当前项目是什么都不影响它"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_sessions_yields_an_empty_list() {
+        // 空不是异常：新项目、或者刚把会话全停了，都会走到这里。
+        // 返回空 Vec 而不是 panic，是九宫格空状态文案能上屏的前提。
+        let all = [sess(1, "/w/a")];
+        assert!(visible_sessions(&all, Scope::CurrentProject, Path::new("/w/b")).is_empty());
+    }
+
+    #[test]
+    fn a_session_whose_dir_was_deleted_stays_under_its_own_project() {
+        // canonicalize 对已删目录会失败。退化成字面比较，让这个会话仍然
+        // 归在它原本的项目下——否则它会从两个视图里同时消失，用户再也
+        // 没有任何入口去停掉它。
+        let gone = "/definitely/does/not/exist/dct-scope-test";
+        let all = [sess(1, gone)];
+        let got = visible_sessions(&all, Scope::CurrentProject, Path::new(gone));
+        assert_eq!(got.len(), 1, "目录没了，会话还在，仍要看得见");
+    }
+
+    #[test]
+    fn a_symlinked_project_dir_still_matches_its_sessions() {
+        // 会话是用真实路径建的，用户却可能从一个符号链接进同一个项目
+        // （macOS 上 /tmp -> /private/tmp 就是现成的例子）。字面比较会让
+        // 整个项目的会话凭空消失，而用户看不出任何原因。
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("proj");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let all = [sess(1, &real.display().to_string())];
+        let got = visible_sessions(&all, Scope::CurrentProject, &link);
+        assert_eq!(
+            got.len(),
+            1,
+            "从符号链接进来的当前项目，必须仍然认得出它自己的会话"
+        );
+    }
+
+    /// 浏览器只列目录，而且要把「本来就不该出现的东西」挡掉：`.` 开头的
+    /// 隐藏目录、依赖目录、构建产物。目标用户是非程序员，`node_modules`
+    /// 出现在选项目的列表里对他既没有意义也没有用处。
+    #[test]
+    fn browsing_lists_only_meaningful_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["proj", "node_modules", "target", ".hidden", ".git", "dist"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        std::fs::write(tmp.path().join("readme.md"), "x").unwrap();
+
+        let rows = list_dirs(tmp.path());
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["proj"],
+            "只该剩下真正的项目目录"
+        );
+    }
+
+    /// 目录按名字排序。`read_dir` 的顺序由文件系统决定，不排的话同一个
+    /// 目录每次打开都可能换序，用户没法靠位置记住东西在哪。
+    #[test]
+    fn browsing_sorts_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["zeta", "alpha", "Mid"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        let names: Vec<String> = list_dirs(tmp.path()).into_iter().map(|r| r.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "顺序必须稳定，不能听文件系统的");
+    }
+
+    /// git 仓库要标出来——agent 会话要求项目是 git 仓库（`session.rs`），
+    /// 在选之前就看得见，省掉一次注定失败的尝试。
+    #[test]
+    fn browsing_marks_git_repositories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+
+        let rows = list_dirs(tmp.path());
+        let git_of = |n: &str| rows.iter().find(|r| r.name == n).unwrap().is_git;
+        assert!(git_of("repo"), "有 .git 的要标出来");
+        assert!(!git_of("plain"), "没有的不能标");
+    }
+
+    /// 读不了的目录返回空表，不 panic。用户可能浏览到任何地方，
+    /// 一个没权限的目录不该让整个 dct 倒下。
+    #[test]
+    fn browsing_an_unreadable_directory_yields_nothing_instead_of_panicking() {
+        assert!(list_dirs(std::path::Path::new("/definitely/not/here/dct")).is_empty());
     }
 
     #[test]
@@ -730,7 +1224,8 @@ mod tests {
     /// 底栏还写着「其余按键都发给 agent」，而键全掉进死掉的 pty。
     #[test]
     fn stopped_session_sends_the_user_back_to_the_board() {
-        let notice = session_ended_notice(4, SessionState::Stopped).expect("Stopped 必须回看板");
+        let notice =
+            session_ended_notice(4, SessionState::Stopped, Lang::Zh).expect("Stopped 必须回看板");
         assert!(notice.contains('4'), "提示要说清是哪个会话结束了：{notice}");
     }
 
@@ -746,7 +1241,7 @@ mod tests {
             SessionState::Unknown,
         ] {
             assert_eq!(
-                session_ended_notice(1, state),
+                session_ended_notice(1, state, Lang::Zh),
                 None,
                 "{state:?} 不该被当成已结束"
             );
@@ -757,24 +1252,32 @@ mod tests {
     fn escape_hint_matches_what_the_key_actually_does() {
         // 底栏说什么就必须真能做到什么。手输路径态的 Ctrl+Q 是回列表
         // 不是回看板（见 back_one_level），文案不能写成「回看板」。
-        assert_eq!(escape_hint(&View::Board), "q 退出");
-        assert_eq!(escape_hint(&View::Attached(1)), "Ctrl+Q 回看板");
+        assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
+        // 会话视图两个键都真的能回看板，所以两个都要写出来
         assert_eq!(
-            escape_hint(&View::PickProject {
-                all: Vec::new(),
-                filter: String::new(),
-                state: ListState::default(),
-                typing_path: None,
-            }),
+            escape_hint(&View::Attached(1), Lang::Zh),
+            "Ctrl+Q（F2） 回看板"
+        );
+        assert_eq!(
+            escape_hint(
+                &View::PickProject(ProjectPicker {
+                    filter: String::new(),
+                    typing_path: None,
+                    ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+                }),
+                Lang::Zh
+            ),
             "Ctrl+Q 回看板"
         );
         assert_eq!(
-            escape_hint(&View::PickProject {
-                all: Vec::new(),
-                filter: String::new(),
-                state: ListState::default(),
-                typing_path: Some(String::new()),
-            }),
+            escape_hint(
+                &View::PickProject(ProjectPicker {
+                    filter: String::new(),
+                    typing_path: Some(String::new()),
+                    ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+                }),
+                Lang::Zh
+            ),
             "Ctrl+Q 回列表"
         );
     }
@@ -835,13 +1338,16 @@ mod tests {
     #[test]
     fn ready_entry_starts_a_session() {
         let e = entry("claude", ProfileStatus::Ready);
-        assert!(matches!(pick_action(&e), PickAction::Start(n) if n == "claude"));
+        assert!(matches!(pick_action(&e, Lang::Zh), PickAction::Start(n) if n == "claude"));
     }
 
     #[test]
     fn needs_secret_entry_opens_the_secret_view() {
         let e = entry("kimi", ProfileStatus::NeedsSecret);
-        assert!(matches!(pick_action(&e), PickAction::AskSecret(_)));
+        assert!(matches!(
+            pick_action(&e, Lang::Zh),
+            PickAction::AskSecret(_)
+        ));
     }
 
     #[test]
@@ -861,7 +1367,7 @@ mod tests {
             ],
             note: String::new(),
         });
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Install { profile, command } => {
                 assert_eq!(profile, "codex");
                 assert_eq!(command[0], "npm");
@@ -878,7 +1384,7 @@ mod tests {
                 command: "weird".into(),
             },
         );
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Blocked(msg) => {
                 assert!(msg.contains("weird"), "要说清是哪个命令找不到：{msg}");
                 assert!(!msg.contains("PATH"), "别对非程序员说 PATH");
@@ -898,7 +1404,7 @@ mod tests {
                 command: String::new(),
             },
         );
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Blocked(msg) => {
                 assert!(msg.contains("weird"), "要点名是哪个 profile：{msg}");
                 assert!(
@@ -918,7 +1424,7 @@ mod tests {
                 label: "Claude".into(),
             },
         );
-        match pick_action(&e) {
+        match pick_action(&e, Lang::Zh) {
             PickAction::Blocked(msg) => {
                 assert!(msg.contains("Claude"), "要点名先装什么：{msg}");
             }
@@ -966,7 +1472,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_both_n_and_capital_n() {
-        let help = idle_help(&View::Board);
+        let help = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
         assert!(help.contains("n 新建"));
         assert!(help.contains("N 换 agent"));
     }
@@ -975,7 +1481,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_the_settings_key() {
-        assert!(idle_help(&View::Board).contains("c 密钥"));
+        assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("c 密钥"));
     }
 
     #[test]
@@ -989,11 +1495,15 @@ mod tests {
 
     #[test]
     fn picker_help_mentions_both_ways_to_choose() {
-        let help = idle_help(&View::PickProfile {
-            entries: vec![],
-            state: ListState::default(),
-            warning: None,
-        });
+        let help = idle_help(
+            &View::PickProfile {
+                entries: vec![],
+                state: ListState::default(),
+                warning: None,
+            },
+            Scope::CurrentProject,
+            Lang::Zh,
+        );
         assert!(help.contains("↑↓"));
         assert!(help.contains("数字"));
     }
@@ -1049,14 +1559,14 @@ mod tests {
 
     #[test]
     fn bad_key_gets_a_human_message() {
-        let m = verify_message(VerifyOutcome::BadKey).unwrap();
+        let m = verify_message(VerifyOutcome::BadKey, Lang::Zh).unwrap();
         assert!(m.contains("密钥"));
         assert!(!m.contains("401"), "别把状态码甩给用户：{m}");
     }
 
     #[test]
     fn unreachable_blames_the_network_not_the_key() {
-        let m = verify_message(VerifyOutcome::Unreachable).unwrap();
+        let m = verify_message(VerifyOutcome::Unreachable, Lang::Zh).unwrap();
         assert!(
             m.contains("网络"),
             "连不上要说是网络，不能让用户去怀疑密钥：{m}"
@@ -1065,7 +1575,7 @@ mod tests {
 
     #[test]
     fn ok_has_no_message() {
-        assert!(verify_message(VerifyOutcome::Ok).is_none());
+        assert!(verify_message(VerifyOutcome::Ok, Lang::Zh).is_none());
     }
 
     // ———— CRITICAL 1（最终整分支 code review）：验证结果不能套错屏幕 ————
@@ -1122,17 +1632,20 @@ mod tests {
     #[test]
     fn secret_view_escape_hint_says_back_to_the_list() {
         // 底栏说什么就得真能做到什么
-        let h = escape_hint(&View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
+        let h = escape_hint(
+            &View::EnterSecret {
+                profile: "kimi".into(),
+                label: "Kimi".into(),
+                prompt: SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+                return_to_settings: false,
             },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: false,
-        });
+            Lang::Zh,
+        );
         assert!(h.contains("列表"), "底栏说什么就得真能做到什么：{h}");
     }
 
@@ -1156,17 +1669,20 @@ mod tests {
 
     #[test]
     fn secret_view_from_settings_escape_hint_says_back_to_settings() {
-        let h = escape_hint(&View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
+        let h = escape_hint(
+            &View::EnterSecret {
+                profile: "kimi".into(),
+                label: "Kimi".into(),
+                prompt: SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+                return_to_settings: true,
             },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: true,
-        });
+            Lang::Zh,
+        );
         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
     }
 
@@ -1174,17 +1690,21 @@ mod tests {
     fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
         // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
         // 一处还说着旧的「列表」。
-        let help = idle_help(&View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
+        let help = idle_help(
+            &View::EnterSecret {
+                profile: "kimi".into(),
+                label: "Kimi".into(),
+                prompt: SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+                return_to_settings: true,
             },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: true,
-        });
+            Scope::CurrentProject,
+            Lang::Zh,
+        );
         assert!(
             help.contains("返回设置"),
             "底栏说什么就得真能做到什么：{help}"
@@ -1206,11 +1726,15 @@ mod tests {
 
     #[test]
     fn secrets_page_help_lists_its_own_keys() {
-        let help = idle_help(&View::Secrets {
-            entries: vec![],
-            state: ListState::default(),
-            pending_delete: None,
-        });
+        let help = idle_help(
+            &View::Secrets {
+                entries: vec![],
+                state: ListState::default(),
+                pending_delete: None,
+            },
+            Scope::CurrentProject,
+            Lang::Zh,
+        );
         assert!(help.contains("Enter 改"));
         assert!(help.contains("d 删"));
     }
