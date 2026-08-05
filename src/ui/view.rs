@@ -160,8 +160,12 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
             state: ListState::default(),
             warning: None,
         }),
-        // Secrets 和 Grid 落在这条兜底里：它们跟 Attached/PickProject 一样
-        // 只有一层，退一层就是看板。
+        // 九宫格跟列表是**平级**的两个模式，它自己就是顶层，退无可退——
+        // 跟 `View::Board` 一样返回 `None`。以前它落在下面那条兜底里，
+        // 于是 Ctrl+Q 成了 `g` 的隐藏同义词。
+        View::Grid { .. } => None,
+        // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
+        // 退一层就是看板。
         _ => Some(View::Board),
     }
 }
@@ -377,6 +381,41 @@ pub(crate) fn filter_projects(all: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
+/// 看板的两种画法。它们是**平级**的，不是「列表 + 一个附属页面」——
+/// 所以 `q` 在两边都退出 dct、`Ctrl+Q` 在两边都无事可做（已经在顶层），
+/// 而所有「回看板」的落点都得回到用户选的这一个（见 `mod.rs` 的 `home_view`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ViewMode {
+    List,
+    Grid,
+}
+
+impl ViewMode {
+    /// 存进 settings.json 的稳定短码，跟枚举顺序无关。
+    pub fn code(self) -> &'static str {
+        match self {
+            ViewMode::List => "list",
+            ViewMode::Grid => "grid",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Option<ViewMode> {
+        match s {
+            "list" => Some(ViewMode::List),
+            "grid" => Some(ViewMode::Grid),
+            _ => None,
+        }
+    }
+
+    /// 切到另一个。只有两个模式，所以这是个全函数，不用兜底分支。
+    pub fn toggled(self) -> ViewMode {
+        match self {
+            ViewMode::List => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::List,
+        }
+    }
+}
+
 /// 看板上到底显示哪些会话。跟着用户走而不是跟着视图走——列表和九宫格是
 /// 同一批会话的两种画法，作用域在两边必须一致，否则切个视图会话数就变了。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -488,9 +527,10 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         } => text(Key::BackToSettings, lang).to_string(),
         // 从选择器进来的填密钥，退出回的是选择器，不是看板
         View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
-        // 九宫格退回的也是看板，但对用户来说那一屏就是「列表」——
-        // 站在格子里说「回看板」，用户会以为格子不算看板的一部分。
-        View::Grid { .. } => text(Key::BackToList, lang).to_string(),
+        // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
+        // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
+        // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
+        View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
         // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
         // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
         // 落点都是看板。只写一个键等于藏起另一半——而 F2 恰恰是
@@ -575,14 +615,15 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
         // 跟看板那一句列的是同一批键（它们在两个视图里做的是同一件事），
         // 只把不一样的两处换掉：选择靠方向键、Enter 是放大而不是进入。
         //
-        // `q 退出` 必须写出来：在看板上它常驻左段（escape_hint），到了九宫格
-        // 左段换成了「Ctrl+Q 回列表」，可 q 照样直接退出整个 dct。屏幕上没写
-        // 却真的管用的键，就是等着用户误按——尤其是这个键会关掉一切。
+        // `q 退出` **不**写在这里：九宫格现在跟列表一样是顶层，左段的
+        // escape_hint 已经常驻「q 退出」。原来要写是因为那时左段被
+        // 「Ctrl+Q 回列表」占着，q 没有别的地方交代。重复一遍只会挤掉
+        // 句尾的 s/d——那两个是不可撤销的操作，比重复一次 q 重要得多。
         View::Grid { .. } => help_line(
             &[
                 ("", Key::MoveArrows),
                 ("Enter", Key::Zoom),
-                ("q", Key::Quit),
+                ("g", Key::List),
                 ("n", Key::New),
                 ("N", Key::SwitchAgent),
                 ("p", Key::SwitchProject),
@@ -724,21 +765,9 @@ mod tests {
     }
 
     #[test]
-    fn grid_backs_out_to_the_board() {
-        // 九宫格跟会话视图一样只有一层，Ctrl+Q 退回列表
-        assert!(matches!(
-            back_one_level(View::Grid { focus: 3 }),
-            Some(View::Board)
-        ));
-    }
-
-    #[test]
     fn grid_hints_match_what_the_keys_actually_do() {
-        // 底栏说什么就得真能做到什么：九宫格的 Ctrl+Q 回的是列表那一屏
-        assert_eq!(
-            escape_hint(&View::Grid { focus: 0 }, Lang::Zh),
-            "Ctrl+Q 回列表"
-        );
+        // 底栏说什么就得真能做到什么。九宫格现在是顶层，逃生键是 q——
+        // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
         let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
         for k in [
             "方向键移动",
@@ -750,13 +779,17 @@ mod tests {
             "u 回滚",
             "s 停止",
             "d 改动",
-            // q 在九宫格里照样直接退出整个 dct，而左段这时写的是
-            // 「Ctrl+Q 回列表」，没人会知道 q 还在。屏幕上没写却真管用的键
-            // 就是等着用户误按，何况这个键会关掉一切。
-            "q 退出",
+            // `g 列表` 是九宫格唯一交代「怎么切回去」的地方
+            "g 列表",
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
+        // `q 退出` 不该再出现在这一句里：它已经常驻左段（escape_hint），
+        // 重复一遍只会把句尾的 s/d 挤出屏幕，而那两个不可撤销。
+        assert!(
+            !help.contains("q 退出"),
+            "左段已经写着 q 退出，这里不该重复：{help}"
+        );
         // 「这些键在 80 列终端上真的看得见吗」这个问题，原来是靠在这里
         // 手算一遍截断宽度来回答的（`truncate(help, 63)`）。那个算式随着
         // 底栏改成两行自动换行已经失效，而且它算的是文案、不是屏幕。
@@ -769,6 +802,38 @@ mod tests {
     fn board_help_mentions_the_grid() {
         // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
         assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("g 九宫格"));
+    }
+
+    /// 九宫格不再是列表的下一层：两个模式都是顶层，`Ctrl+Q` 在两边都无事
+    /// 可做。留着「Ctrl+Q 回列表」的话，它就是 `g` 的一个隐藏同义词，
+    /// 而屏幕上写的是「回列表」——用户会以为自己退出了什么。
+    #[test]
+    fn both_board_modes_are_top_level() {
+        assert!(back_one_level(View::Board).is_none());
+        assert!(back_one_level(View::Grid { focus: 0 }).is_none());
+        assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
+        assert_eq!(
+            escape_hint(&View::Grid { focus: 0 }, Lang::Zh),
+            "q 退出",
+            "九宫格也是家，不是列表的下一层"
+        );
+    }
+
+    /// `g` 在两个模式里都真的管用，所以两边的帮助行都得写出来。
+    /// 原来九宫格那句里没有 `g`——正是这个仓库反复警惕的
+    /// 「屏幕上没写却真管用的键」，只是这次犯在自己身上。
+    #[test]
+    fn both_modes_advertise_the_key_that_switches_them() {
+        let list = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
+        let grid = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
+        assert!(
+            list.contains("g 九宫格"),
+            "列表要告诉用户怎么去九宫格：{list}"
+        );
+        assert!(
+            grid.contains("g 列表"),
+            "九宫格要告诉用户怎么回列表：{grid}"
+        );
     }
 
     #[test]

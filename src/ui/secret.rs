@@ -206,7 +206,7 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     };
     match key.code {
-        KeyCode::Esc => app.view = View::Board,
+        KeyCode::Esc => app.view = super::home_view(app),
         KeyCode::Down | KeyCode::Up => {
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
             move_sel_n(&mut state, secret_rows(&entries).len(), d);

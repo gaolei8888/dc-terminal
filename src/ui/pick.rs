@@ -44,7 +44,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     };
     if key.code == KeyCode::Esc {
-        app.view = View::Board;
+        app.view = super::home_view(app);
     } else {
         // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
         // 挪完直接落到 chosen = None，不会误触发下面的路由。
@@ -253,7 +253,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
         },
         // ——列表态——
         None => match key.code {
-            KeyCode::Esc => app.view = View::Board,
+            KeyCode::Esc => app.view = super::home_view(app),
             KeyCode::Down | KeyCode::Up => {
                 let delta = if key.code == KeyCode::Down { 1 } else { -1 };
                 // +1 是末行那个「手输路径…」，它不参与过滤，永远在

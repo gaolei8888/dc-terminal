@@ -162,11 +162,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 focus: move_focus(focus, total, Dir::Right),
             }
         }
-        // 回列表前把列表光标对到焦点格上，理由见 sync_board_cursor_from_grid
-        KeyCode::Char('g') if is_plain_key(&key) => {
-            super::sync_board_cursor_from_grid(app);
-            app.view = View::Board;
-        }
+        KeyCode::Char('g') if is_plain_key(&key) => super::toggle_view_mode(app),
         // 九宫格是看板的另一种画法，不是另一个世界：开会话、换项目、
         // 管密钥、退出这几个键跟列表里一模一样（共用同一份实现，见
         // mod.rs 里这几个函数的注释）。用户不该因为切了个视图就得先退
@@ -647,15 +643,25 @@ mod tests {
     }
 
     #[test]
-    fn g_goes_back_to_the_list() {
+    fn g_switches_back_to_list_mode_and_remembers_it() {
         let (mut app, _dir) = App::test_app();
         app.sessions = vec![session(1, SessionState::Idle)];
         // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
+        app.view_mode = crate::ui::ViewMode::Grid;
         app.view = View::Grid { focus: 0 };
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
         assert!(matches!(app.view, View::Board));
+        assert_eq!(app.view_mode, crate::ui::ViewMode::List);
+        // 记住选择：不落盘的话「记住」只在本次进程里成立
+        assert_eq!(
+            crate::settings::load_view_mode(&crate::settings::settings_path_for_socket(
+                &app.socket
+            )),
+            Some(crate::ui::ViewMode::List),
+            "切模式必须落盘"
+        );
     }
 
     /// `g` 回列表要把光标带到焦点格上。反方向（列表 → 九宫格）由 `board.rs`
@@ -668,6 +674,7 @@ mod tests {
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
         app.list_state.select(Some(0));
+        app.view_mode = crate::ui::ViewMode::Grid;
         app.view = View::Grid { focus: 4 };
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
         assert!(matches!(app.view, View::Board));

@@ -23,7 +23,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     };
     match key.code {
-        KeyCode::Esc => app.view = View::Board,
+        KeyCode::Esc => app.view = super::home_view(app),
         KeyCode::Down | KeyCode::Up => {
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
             move_sel_n(&mut state, Lang::all().len(), d);
@@ -44,7 +44,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     Err(e) => app.message = Msg::err(format!("{e}")),
                 }
             }
-            app.view = View::Board;
+            app.view = super::home_view(app);
         }
         _ => app.view = View::Settings { state },
     }

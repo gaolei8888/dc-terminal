@@ -26,7 +26,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // 那是 Claude Code 的「转后台」。逆转键挑 F2 是因为没有 CLI agent
     // 在用它，不必搞双击透传那种隐形状态。
     if key.code == KeyCode::F(2) {
-        app.view = View::Board;
+        app.view = super::home_view(app);
         app.need_sessions = true;
     } else if key.code == KeyCode::F(3) {
         // F3 = 直接切到下一个在跑的会话，不用先退回看板。选 F3 沿用

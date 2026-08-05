@@ -38,7 +38,7 @@ use view::{
 };
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
-    verify_message, verify_outcome_applies_to, PickAction,
+    verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
@@ -151,6 +151,7 @@ pub fn run(
     default_dir: PathBuf,
     lang: crate::i18n::Lang,
     socket: PathBuf,
+    view_mode: ViewMode,
 ) -> Result<()> {
     // 必须在 enable_raw_mode 之前装：装早了无害（还没进 raw mode 时
     // restore_terminal() 没有副作用，多发一次 LeaveAlternateScreen 也无害），
@@ -176,7 +177,7 @@ pub fn run(
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(client, default_dir, lang, socket);
+    let mut app = App::new(client, default_dir, lang, socket, view_mode);
 
     loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
@@ -387,7 +388,7 @@ pub fn run(
                         app.message = Msg::err(
                             crate::i18n::text(crate::i18n::Key::DaemonTooOld, app.lang).into(),
                         );
-                        app.view = View::Board;
+                        app.view = home_view(&app);
                         app.need_sessions = true;
                     }
                     _ => app.connected = false,
@@ -440,7 +441,7 @@ pub fn run(
                     // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
                     // 每个键都掉进一个死掉的 pty 里无声消失。
                     if let Some(notice) = session_ended_notice(id, state, app.lang) {
-                        app.view = View::Board;
+                        app.view = home_view(&app);
                         // 回看板得重新拉一次 List：贴在会话里这一路都没拉，
                         // 手里的 sessions 是进会话之前那份，缺的正是「这个
                         // 会话已经没了」这条更新。
@@ -630,13 +631,13 @@ pub fn run(
                 }
                 Ok(Response::Error(ref e)) => {
                     app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
-                    View::Board
+                    home_view(&app)
                 }
                 _ => {
                     app.message = Msg::err(
                         crate::i18n::text(crate::i18n::Key::CannotListSecrets, app.lang).into(),
                     );
-                    View::Board
+                    home_view(&app)
                 }
             };
         }
@@ -727,7 +728,7 @@ pub(crate) fn switch_project(app: &mut App, dir: std::path::PathBuf) {
         crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string())).into();
     app.current_dir = dir;
     app.refresh_visible();
-    app.view = View::Board;
+    app.view = home_view(app);
 }
 
 /// 进一个会话。会话属于别的项目时，当前项目跟着切过去。
@@ -781,6 +782,52 @@ fn join_warnings(
             .collect::<Vec<_>>()
             .join(sep),
     )
+}
+
+/// `g` 键：在列表和九宫格之间切换，并且**记住**。
+///
+/// 两个模式共用这一个函数，切换和落盘绑在一起——分开写的话，某一边忘了
+/// 落盘，用户就会遇到「有时记得、有时不记得」这种最难描述的 bug。
+///
+/// 落盘失败只在底栏说一句，不挡住切换本身：模式已经切了，屏幕上就是新的
+/// 那个，硬要因为写不了文件把它切回去反而更费解。
+pub(crate) fn toggle_view_mode(app: &mut App) {
+    // 离开九宫格前先把列表光标对到焦点格上；`home_view` 负责反方向。
+    // 两个视图对「当前是哪个会话」的认知必须一致，否则切一下模式，
+    // 接下来的 `s`（停止）就毁在另一个会话上——这个键不可撤销。
+    if matches!(app.view, View::Grid { .. }) {
+        sync_board_cursor_from_grid(app);
+    }
+    app.view_mode = app.view_mode.toggled();
+    app.view = home_view(app);
+    let path = crate::settings::settings_path_for_socket(&app.socket);
+    if let Err(e) = crate::settings::save_view_mode(&path, app.view_mode) {
+        app.message = Msg::err(
+            e.downcast_ref::<crate::proto::CodedError>()
+                .map(|c| crate::i18n::msg::error(app.lang, &c.0))
+                .unwrap_or_else(|| e.to_string()),
+        );
+    }
+}
+
+/// 用户选的那个模式对应的视图。**所有「回看板」的地方都必须走这里。**
+///
+/// 硬编码 `View::Board` 的每一处都是一个「明明在九宫格里，某次操作完却被
+/// 甩回列表」的 bug——而且是偶发、复现不了的那种。
+///
+/// 顺带让两个模式对「当前是哪个会话」的认知保持一致：进九宫格时焦点落在
+/// 列表光标那一行。反方向由 `sync_board_cursor_from_grid` 负责。
+pub(crate) fn home_view(app: &App) -> View {
+    match app.view_mode {
+        ViewMode::List => View::Board,
+        ViewMode::Grid => View::Grid {
+            focus: app
+                .list_state
+                .selected()
+                .unwrap_or(0)
+                .min(app.visible.len().saturating_sub(1)),
+        },
+    }
 }
 
 /// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到

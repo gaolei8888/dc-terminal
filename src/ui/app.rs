@@ -35,6 +35,9 @@ pub struct App {
     // 这种最难查的 bug。
     pub visible: Vec<SessionInfo>,
     pub scope: super::view::Scope,
+    /// 用户选的看板画法。列表和九宫格是**平级**的两个模式，不是一个视图
+    /// 加一个附属页面——所以每一处「回看板」都得问它（见 `mod.rs::home_view`）。
+    pub view_mode: super::view::ViewMode,
     pub message: Msg,
     pub screen: Vec<Vec<ScreenSpan>>,
     pub screen_cursor: (u16, u16),
@@ -105,16 +108,23 @@ impl App {
         default_dir: PathBuf,
         lang: crate::i18n::Lang,
         socket: PathBuf,
+        view_mode: super::view::ViewMode,
     ) -> App {
         App {
             client,
-            view: View::Board,
+            // 启动就落在用户选的模式上。硬编码 `View::Board` 的话，
+            // 「记住选择」在最要紧的那一刻（刚打开 dct）就是假的。
+            view: match view_mode {
+                super::view::ViewMode::List => View::Board,
+                super::view::ViewMode::Grid => View::Grid { focus: 0 },
+            },
             list_state: ListState::default(),
             sessions: Vec::new(),
             visible: Vec::new(),
             // 每次启动都从「只看当前项目」开始。作用域不持久化：它是个
             // 临时的查看动作，不是配置。
             scope: super::view::Scope::CurrentProject,
+            view_mode,
             message: "".into(),
             screen: Vec::new(),
             screen_cursor: (0, 0),
@@ -140,14 +150,23 @@ impl App {
         default_dir: PathBuf,
         lang: crate::i18n::Lang,
         socket: PathBuf,
+        view_mode: super::view::ViewMode,
     ) -> App {
-        Self::new_inner(Some(client), default_dir, lang, socket)
+        Self::new_inner(Some(client), default_dir, lang, socket, view_mode)
     }
 
     /// 只给测试用：不需要一个活的守护进程就能构造。
     #[cfg(test)]
     pub fn new_disconnected(sock: PathBuf, default_dir: PathBuf) -> App {
-        Self::new_inner(None, default_dir, crate::i18n::Lang::Zh, sock)
+        // 测试默认列表模式：既有的一大批测试都在断言列表的行为，
+        // 换默认值会让它们测的东西悄悄变成另一个视图。
+        Self::new_inner(
+            None,
+            default_dir,
+            crate::i18n::Lang::Zh,
+            sock,
+            super::view::ViewMode::List,
+        )
     }
 
     /// 只给测试用：`board`/`attach`/`pick`/`secret` 里 `draw()`/`handle_key()`
@@ -311,6 +330,37 @@ mod tests {
             vec![1],
             "拿到新列表的同一时刻就要筛好，不能留到下一帧"
         );
+    }
+
+    /// 从会话按 F2 回来，落点必须是**用户选的模式**，不是永远的列表。
+    /// 原来 12 处硬编码 `View::Board`，留着任何一处，用户就会在某条路径上
+    /// 被莫名其妙甩回列表——而且是那种偶尔发生、复现不了的观感 bug。
+    #[test]
+    fn leaving_a_session_lands_on_the_chosen_mode() {
+        use super::super::home_view;
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![sess(1, "/w/a"), sess(2, "/w/a")];
+        app.current_dir = PathBuf::from("/w/a");
+        app.refresh_visible();
+        app.list_state.select(Some(1));
+
+        app.view_mode = crate::ui::ViewMode::Grid;
+        assert!(
+            matches!(home_view(&app), View::Grid { focus: 1 }),
+            "九宫格模式下要回九宫格，而且焦点落在列表刚才选中的那个会话上"
+        );
+
+        app.view_mode = crate::ui::ViewMode::List;
+        assert!(matches!(home_view(&app), View::Board));
+    }
+
+    /// 一个会话都没有时切模式不能 panic，焦点收拢到 0。
+    #[test]
+    fn home_view_survives_an_empty_board() {
+        use super::super::home_view;
+        let (mut app, _dir) = App::test_app();
+        app.view_mode = crate::ui::ViewMode::Grid;
+        assert!(matches!(home_view(&app), View::Grid { focus: 0 }));
     }
 
     /// start_dir 只用来解析用户敲的相对路径，永不改变；current_dir 是

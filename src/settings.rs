@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::i18n::Lang;
 use crate::proto::{coded, ErrorCode, Operation};
+use crate::ui::ViewMode;
 
 /// 盘上格式：`{"lang":"zh"}`。包一层对象而不是直接存字符串，是为了将来加设置项
 /// 时老文件仍能读（跟 `projects.rs` 的 `Disk` 同一个理由）。
@@ -16,6 +17,8 @@ use crate::proto::{coded, ErrorCode, Operation};
 struct Disk {
     #[serde(default)]
     lang: Option<String>,
+    #[serde(default)]
+    view_mode: Option<String>,
 }
 
 /// 位置跟着 socket 走，与 `projects.rs::store_path_for_socket` 同一套推导：
@@ -37,23 +40,41 @@ pub fn load_lang(path: &Path) -> Option<Lang> {
     Lang::from_code(&disk.lang?)
 }
 
+/// 用户存过的看板模式。认不出/没存过一律 `None`——理由同 `load_lang`。
+pub fn load_view_mode(path: &Path) -> Option<ViewMode> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let disk: Disk = serde_json::from_str(&s).ok()?;
+    ViewMode::from_code(&disk.view_mode?)
+}
+
+pub fn save_view_mode(path: &Path, mode: ViewMode) -> Result<()> {
+    save_with(path, |d| d.view_mode = Some(mode.code().to_string()))
+}
+
 /// **跟 `projects.rs::save` 刻意不同：这里返回 `Result`。**
 /// 「最近项目」是缓存，丢了无所谓，所以它吞掉一切错误；语言是用户明确做出的
 /// 选择，写不进去必须说一声，否则他下次开 dct 发现语言变回去了，不知道该怪谁。
 pub fn save_lang(path: &Path, lang: Lang) -> Result<()> {
+    save_with(path, |d| d.lang = Some(lang.code().to_string()))
+}
+
+/// 读回来、改一个字段、原子写回去。
+///
+/// **先读再写**是为了不让两个设置项互相抹掉：只有一个字段的时候看不出来，
+/// 但加第二个的那天，直接覆写就会让存模式顺手把语言清掉。这个坑要在
+/// 只有一项的时候就填上，而不是等它咬人。
+fn save_with(path: &Path, edit: impl FnOnce(&mut Disk)) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
     std::fs::create_dir_all(parent)
         .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
 
-    // 先读回来再写，不是直接覆盖：将来多一个设置项时，存语言不能顺手把别的
-    // 设置抹掉。现在只有一项，但这个坑要在只有一项的时候就填上。
     let mut disk: Disk = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    disk.lang = Some(lang.code().to_string());
+    edit(&mut disk);
 
     let json = serde_json::to_string(&disk)
         .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSettings)))?;
@@ -69,6 +90,44 @@ pub fn save_lang(path: &Path, lang: Lang) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_view_mode_survives_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.json");
+        save_view_mode(&f, ViewMode::List).unwrap();
+        assert_eq!(load_view_mode(&f), Some(ViewMode::List));
+    }
+
+    /// 没存过 → `None`，由调用方决定默认值。跟 `load_lang` 一样，
+    /// 这个模块只管读写，不做判断。
+    #[test]
+    fn no_saved_view_mode_means_no_choice_was_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(load_view_mode(&tmp.path().join("x.json")), None);
+    }
+
+    /// 认不出的值（老版本存的、手改坏了）也是「没有可用的选择」，不能 panic。
+    #[test]
+    fn an_unknown_view_mode_means_no_choice_was_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.json");
+        std::fs::write(&f, r#"{"view_mode":"hologram"}"#).unwrap();
+        assert_eq!(load_view_mode(&f), None);
+    }
+
+    /// 两个设置项互不干扰：存模式不能把语言抹掉，反过来也一样。
+    /// 这正是 `Disk` 包一层对象、`save` 先读回来再写的理由。
+    #[test]
+    fn saving_one_setting_does_not_wipe_the_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.json");
+        save_lang(&f, Lang::Zh).unwrap();
+        save_view_mode(&f, ViewMode::List).unwrap();
+        assert_eq!(load_lang(&f), Some(Lang::Zh), "存模式不能把语言抹掉");
+        save_lang(&f, Lang::En).unwrap();
+        assert_eq!(load_view_mode(&f), Some(ViewMode::List), "反过来也一样");
+    }
 
     #[test]
     fn a_saved_language_survives_a_reload() {

@@ -4,7 +4,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use super::app::App;
-use super::view::{is_plain_key, Scope, View};
+use super::view::{is_plain_key, Scope};
 use super::widgets::{pad_to, short_path, status_label, status_style, truncate};
 use super::{
     dim, move_sel, open_new_session, open_project_picker, open_secrets, selected, session_action,
@@ -37,14 +37,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 super::enter_session(app, id);
             }
         }
-        KeyCode::Char('g') if is_plain_key(&key) => {
-            // 进九宫格时焦点落在列表当前选中的那一行：两个视图对「当前是
-            // 哪个会话」的认知必须一致，不然按完 g 焦点跳到别处，用户会
-            // 以为自己按错了键。
-            app.view = View::Grid {
-                focus: app.list_state.selected().unwrap_or(0),
-            };
-        }
+        // 切模式并记住。焦点/光标的对齐在 toggle_view_mode 里统一做——
+        // 两个方向各写一份的话，迟早只改对一半。
+        KeyCode::Char('g') if is_plain_key(&key) => super::toggle_view_mode(app),
         // 三个动作跟九宫格共用 session_action，区别只在「当前会话」是
         // 选中行还是焦点格
         KeyCode::Char('u') | KeyCode::Char('s') | KeyCode::Char('d') if is_plain_key(&key) => {
@@ -124,6 +119,7 @@ mod tests {
     use crate::session::{SessionInfo, SessionState};
     use crossterm::event::KeyModifiers;
 
+    use super::super::view::View;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -249,6 +245,8 @@ mod tests {
                 activity: String::new(),
             })
             .collect();
+        app.current_dir = PathBuf::from("/tmp/a");
+        app.refresh_visible();
         app.list_state.select(Some(2));
         handle_key(
             &mut app,
@@ -256,5 +254,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(app.view, View::Grid { focus: 2 }));
+        assert_eq!(
+            app.view_mode,
+            crate::ui::ViewMode::Grid,
+            "g 切的是**模式**，不是打开一个附属页面——下次回家也该落在九宫格"
+        );
     }
 }
