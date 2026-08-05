@@ -910,10 +910,11 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
     }
 }
 
-/// 左段固定占的列数：「Ctrl+Q 回看板」= 6 + 1 + 中文 3 字 × 2 = 13。
-/// 三条文案里最长的就是它（「Ctrl+Q 回列表」同宽，「q 退出」更短）。
+/// 左段固定占的列数：最长的一条是会话视图的「Ctrl+Q（F2） 回看板」
+/// = 6 + 全角括号 2 + "F2" 2 + 全角括号 2 + 空格 1 + 中文 3 字 × 2 = 19。
+/// 其余各条都更短（「Ctrl+Q 回列表」13，「q 退出」7）。
 /// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
-const ESCAPE_HINT_COLS: u16 = 13;
+const ESCAPE_HINT_COLS: u16 = 19;
 
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
@@ -1233,6 +1234,79 @@ mod tests {
             .collect()
     }
 
+    /// `ESCAPE_HINT_COLS` 是写死的，`escape_hint` 的文案却会跟着功能改。
+    /// 两者一旦脱节，左段会把逃生键**静默截断**——而逃生键正是用户卡住时
+    /// 唯一的出路，截断了不会报错、只会让人退不出来。所以这里穷举所有视图，
+    /// 要求常量真的容得下最长的那一条。
+    #[test]
+    fn escape_hint_cols_fits_every_view() {
+        use unicode_width::UnicodeWidthStr;
+        let views = [
+            View::Board,
+            View::Attached(1),
+            View::Grid { focus: 0 },
+            View::PickProfile {
+                entries: Vec::new(),
+                state: ListState::default(),
+                warning: None,
+            },
+            View::PickProject {
+                all: Vec::new(),
+                filter: String::new(),
+                state: ListState::default(),
+                typing_path: None,
+            },
+            View::PickProject {
+                all: Vec::new(),
+                filter: String::new(),
+                state: ListState::default(),
+                typing_path: Some(String::new()),
+            },
+            View::Secrets {
+                entries: Vec::new(),
+                state: ListState::default(),
+                pending_delete: None,
+            },
+            // 填密钥有两条退路（回设置页 / 回选择器），两条文案都要量
+            View::EnterSecret {
+                profile: String::new(),
+                label: String::new(),
+                prompt: crate::proto::SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: view::SecretPhase::Typing,
+                return_to_settings: true,
+            },
+            View::EnterSecret {
+                profile: String::new(),
+                label: String::new(),
+                prompt: crate::proto::SecretPrompt {
+                    hint: String::new(),
+                    url: None,
+                },
+                buf: String::new(),
+                phase: view::SecretPhase::Typing,
+                return_to_settings: false,
+            },
+        ];
+        for v in &views {
+            let hint = escape_hint(v);
+            assert!(
+                hint.width() <= ESCAPE_HINT_COLS as usize,
+                "逃生键「{hint}」宽 {} 列，放不进 ESCAPE_HINT_COLS = {ESCAPE_HINT_COLS}",
+                hint.width()
+            );
+        }
+        // 常量不能比需要的更宽：多占的每一列都是从右段的消息里抢的
+        let widest = views.iter().map(|v| escape_hint(v).width()).max().unwrap();
+        assert_eq!(
+            widest, ESCAPE_HINT_COLS as usize,
+            "ESCAPE_HINT_COLS 应当正好等于最长文案的宽度"
+        );
+    }
+
     #[test]
     fn escape_hint_survives_a_long_message() {
         use ratatui::backend::TestBackend;
@@ -1266,7 +1340,10 @@ mod tests {
         app.connected = false;
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
-        assert!(c.contains("Ctrl+Q回看板"), "断连时逃生提示必须还在：{c}");
+        assert!(
+            c.contains("Ctrl+Q（F2）回看板"),
+            "断连时逃生提示必须还在：{c}"
+        );
         assert!(c.contains("连不上"), "断连提示本身也要显示：{c}");
     }
 
@@ -1359,10 +1436,11 @@ mod tests {
         app.view = View::Attached(1);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
-        assert!(c.contains("Ctrl+Q回看板"), "会话视图要给出逆转键提示：{c}");
+        // F2 从右段的「F2 同效」挪进了左段的逃生键本身，两个键并列写在
+        // 一处。断言跟着挪：老用户的肌肉记忆仍要在屏幕上找得到。
         assert!(
-            c.contains("F2同效"),
-            "F2 是老用户的肌肉记忆，也要留在提示里：{c}"
+            c.contains("Ctrl+Q（F2）回看板"),
+            "会话视图要给出逆转键提示，且两个键都要点名：{c}"
         );
         assert!(
             c.contains("F3下一个会话"),

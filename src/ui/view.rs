@@ -440,6 +440,11 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
         // 九宫格退回的也是看板，但对用户来说那一屏就是「列表」——
         // 站在格子里说「回看板」，用户会以为格子不算看板的一部分。
         View::Grid { .. } => "Ctrl+Q 回列表",
+        // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
+        // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
+        // 落点都是看板。只写一个键等于藏起另一半——而 F2 恰恰是
+        // 手指不必离开主键区的那个。其余视图没有 F2，不能照抄这句。
+        View::Attached(_) => "Ctrl+Q（F2） 回看板",
         _ => "Ctrl+Q 回看板",
     }
 }
@@ -450,7 +455,9 @@ pub(crate) fn escape_hint(view: &View) -> &'static str {
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
 pub(crate) fn idle_help(view: &View) -> &'static str {
     match view {
-        View::Attached(_) => "F2 同效　F3 下一个会话　回看板后按 n 新建会话　其余按键都发给 agent",
+        // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
+        // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
+        View::Attached(_) => "F3 下一个会话　回看板后按 n 新建会话　其余按键都发给 agent",
         View::PickProfile { .. } => "↑↓ 选  Enter 确认  或直接按数字  Esc 取消",
         View::PickProject {
             typing_path: Some(_),
@@ -758,7 +765,8 @@ mod tests {
         // 底栏说什么就必须真能做到什么。手输路径态的 Ctrl+Q 是回列表
         // 不是回看板（见 back_one_level），文案不能写成「回看板」。
         assert_eq!(escape_hint(&View::Board), "q 退出");
-        assert_eq!(escape_hint(&View::Attached(1)), "Ctrl+Q 回看板");
+        // 会话视图两个键都真的能回看板，所以两个都要写出来
+        assert_eq!(escape_hint(&View::Attached(1)), "Ctrl+Q（F2） 回看板");
         assert_eq!(
             escape_hint(&View::PickProject {
                 all: Vec::new(),
