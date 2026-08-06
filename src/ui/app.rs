@@ -125,7 +125,7 @@ impl App {
             // 「记住选择」在最要紧的那一刻（刚打开 dct）就是假的。
             view: match view_mode {
                 super::view::ViewMode::List => View::Board,
-                super::view::ViewMode::Grid => View::Grid { focus: 0 },
+                super::view::ViewMode::Grid => View::grid(0),
             },
             list_state: ListState::default(),
             sessions: Vec::new(),
@@ -270,7 +270,7 @@ impl App {
             }
         }
         let grid_last = self.grid_visible.len().saturating_sub(1);
-        if let View::Grid { focus } = &mut self.view {
+        if let View::Grid { focus, .. } = &mut self.view {
             *focus = (*focus).min(grid_last);
         }
     }
@@ -330,7 +330,7 @@ mod tests {
             sess(5, "/w/a"),
         ];
         app.list_state.select(Some(4));
-        app.view = View::Grid { focus: 4 };
+        app.view = View::grid(4);
 
         app.refresh_visible();
 
@@ -341,7 +341,10 @@ mod tests {
             "光标收拢到末项而不是首项——注意力在列表尾部时弹回第一行，\
              用户会以为自己选中的会话没了"
         );
-        assert!(matches!(app.view, View::Grid { focus: 1 }), "焦点同样收拢");
+        assert!(
+            matches!(app.view, View::Grid { focus: 1, .. }),
+            "焦点同样收拢"
+        );
     }
 
     /// 作用域空了就没有格子可焦。光标必须是 `None` 而不是 `Some(0)`：
@@ -352,13 +355,13 @@ mod tests {
         app.current_dir = PathBuf::from("/w/a");
         app.sessions = vec![sess(1, "/w/b")];
         app.list_state.select(Some(0));
-        app.view = View::Grid { focus: 3 };
+        app.view = View::grid(3);
 
         app.refresh_visible();
 
         assert!(app.visible.is_empty());
         assert_eq!(app.list_state.selected(), None);
-        assert!(matches!(app.view, View::Grid { focus: 0 }));
+        assert!(matches!(app.view, View::Grid { focus: 0, .. }));
     }
 
     /// 主循环每轮拿到新的会话列表时走这条路。存在的理由是「赋值 + 重算」
@@ -443,12 +446,12 @@ mod tests {
         // 列表选中会话 4（下标 3）→ 九宫格该落在会话 4（格子下标 1）
         app.list_state.select(Some(3));
         assert!(
-            matches!(home_view(&app), View::Grid { focus: 1 }),
+            matches!(home_view(&app), View::Grid { focus: 1, .. }),
             "焦点要落在同一个**会话**上，不是同一个下标"
         );
 
         // 反方向：焦点在第 2 格（会话 4）→ 列表光标回到会话 4 那一行
-        app.view = View::Grid { focus: 1 };
+        app.view = View::grid(1);
         sync_board_cursor_from_grid(&mut app);
         assert_eq!(app.list_state.selected(), Some(3));
     }
@@ -458,10 +461,10 @@ mod tests {
     fn a_grid_where_everything_is_stopped_is_empty_not_broken() {
         let (mut app, _dir) = App::test_app();
         app.current_dir = PathBuf::from("/w/a");
-        app.view = View::Grid { focus: 2 };
+        app.view = View::grid(2);
         app.set_sessions(vec![stopped(1, "/w/a"), stopped(2, "/w/a")]);
         assert!(app.grid_visible.is_empty());
-        assert!(matches!(app.view, View::Grid { focus: 0 }));
+        assert!(matches!(app.view, View::Grid { focus: 0, .. }));
     }
 
     /// agent 出错时要**主动说一句**，而且点名是哪个会话——用户可能正在别的
@@ -538,7 +541,7 @@ mod tests {
 
         app.view_mode = crate::ui::ViewMode::Grid;
         assert!(
-            matches!(home_view(&app), View::Grid { focus: 1 }),
+            matches!(home_view(&app), View::Grid { focus: 1, .. }),
             "九宫格模式下要回九宫格，而且焦点落在列表刚才选中的那个会话上"
         );
 
@@ -552,7 +555,7 @@ mod tests {
         use super::super::home_view;
         let (mut app, _dir) = App::test_app();
         app.view_mode = crate::ui::ViewMode::Grid;
-        assert!(matches!(home_view(&app), View::Grid { focus: 0 }));
+        assert!(matches!(home_view(&app), View::Grid { focus: 0, .. }));
     }
 
     /// start_dir 只用来解析用户敲的相对路径，永不改变；current_dir 是

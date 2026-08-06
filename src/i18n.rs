@@ -111,6 +111,14 @@ pub enum Key {
     Edit,
     Delete,
     MoveArrows,
+    /// 九宫格里打开单行回复框的那个键
+    ReplyOnce,
+    /// 回复框里的两个键
+    SendReply,
+    /// 回复框里的 Ctrl+C：打断正在干活的 agent
+    InterruptAgent,
+    /// 回复框还空着时的占位提示：直接回车 = 替用户按一下回车（批准/继续）
+    EmptyReplyIsEnter,
     NextSession,
     OtherKeysGoToAgent,
     NewSessionFromBoard,
@@ -212,6 +220,19 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         Edit => t!(lang, en: "edit", zh: "改"),
         Delete => t!(lang, en: "delete", zh: "删"),
         MoveArrows => t!(lang, en: "arrow keys pick a tile", zh: "方向键选格子"),
+        // 「回一句」而不是「输入」：用户要做的事是回复一个正在等他的 agent，
+        // 不是「往某处输入文本」。前者说的是意图，后者说的是机制。
+        ReplyOnce => t!(lang, en: "reply", zh: "回一句"),
+        SendReply => t!(lang, en: "send", zh: "送出"),
+        // 「打断它」而不是「中断」：用户要做的是喊停一个跑偏的 agent
+        InterruptAgent => t!(lang, en: "stop the agent", zh: "打断它"),
+        // 空框直接回车最常用（批个计划、说声继续），得写在用户眼前，
+        // 否则他会以为必须先打字才能回。
+        EmptyReplyIsEnter => t!(
+            lang,
+            en: "type a reply, or just press Enter to approve",
+            zh: "打字回复，或者直接回车表示同意"
+        ),
         NextSession => t!(lang, en: "next session", zh: "下一个会话"),
         NewSessionFromBoard => t!(
             lang,
@@ -773,6 +794,10 @@ mod tests {
             Edit,
             Delete,
             MoveArrows,
+            ReplyOnce,
+            SendReply,
+            InterruptAgent,
+            EmptyReplyIsEnter,
             NextSession,
             OtherKeysGoToAgent,
             NewSessionFromBoard,
@@ -867,7 +892,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 81, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 85, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

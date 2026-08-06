@@ -6,11 +6,12 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use super::app::App;
-use super::view::{is_plain_key, Scope, View};
-use super::widgets::{char_width, screen_to_lines, status_label, status_style};
+use super::view::{is_plain_key, reply_key, Draft, Reply, Scope, View};
+use super::widgets::Msg;
+use super::widgets::{char_width, pad_to, screen_to_lines, status_label, status_style};
 use super::{dim, session_action};
 use crate::i18n::{text, Key, Lang};
 use crate::proto::ScreenEntry;
@@ -133,33 +134,44 @@ const MIN_ROWS: u16 = 20;
 /// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
 /// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 ///
-/// 这里**没有**一条把按键转发给 agent 的路径，这是设计约束：格子只读，
-/// 想打字按 Enter 放大（见 `View::Grid` 的注释）。
+/// 这里**没有**一条把按键逐个转发给 agent 的路径，这是设计约束：格子只读，
+/// 想完整交互按 Enter 放大（见 `View::Grid` 的注释）。回复框是那条约束之外
+/// 唯一的口子，它整句整句地发，不是按键转发。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::Grid { focus } = app.view else {
-        return Ok(());
+    let (focus, draft) = match &app.view {
+        View::Grid { focus, reply } => (*focus, reply.clone()),
+        _ => return Ok(()),
     };
+    // 框开着的时候键盘**整个**归框。挡在这一层而不是在下面的 match 里逐个
+    // 排除：漏掉任何一个动作键，用户打字打到那个字母就把会话停了，而
+    // `s 停止` 撤不回来。这里一道关，比十一个 `if reply.is_none()` 可靠。
+    if let Some(draft) = draft {
+        return type_into_reply(app, focus, draft, key);
+    }
     let total = app.grid_visible.len();
     match key.code {
-        KeyCode::Up => {
-            app.view = View::Grid {
-                focus: move_focus(focus, total, Dir::Up),
-            }
-        }
-        KeyCode::Down => {
-            app.view = View::Grid {
-                focus: move_focus(focus, total, Dir::Down),
-            }
-        }
-        KeyCode::Left => {
-            app.view = View::Grid {
-                focus: move_focus(focus, total, Dir::Left),
-            }
-        }
+        KeyCode::Up => app.view = View::grid(move_focus(focus, total, Dir::Up)),
+        KeyCode::Down => app.view = View::grid(move_focus(focus, total, Dir::Down)),
+        KeyCode::Left => app.view = View::grid(move_focus(focus, total, Dir::Left)),
         // F3 = 「下一个」，跟会话视图里的 F3 是同一个动作，肌肉记忆只练一次
         KeyCode::Right | KeyCode::F(3) => {
-            app.view = View::Grid {
-                focus: move_focus(focus, total, Dir::Right),
+            app.view = View::grid(move_focus(focus, total, Dir::Right))
+        }
+        // `i` 开回复框。收件人在这一刻钉死成会话 id，之后焦点再怎么动都
+        // 不改——见 `Draft::id`。
+        KeyCode::Char('i') if is_plain_key(&key) => {
+            app.view = match app.grid_visible.get(focus).map(|s| s.id) {
+                Some(id) => View::Grid {
+                    focus,
+                    reply: Some(Draft {
+                        id,
+                        text: String::new(),
+                    }),
+                },
+                None => {
+                    app.message = text(Key::NoSessionsAtAll, app.lang).into();
+                    return Ok(());
+                }
             }
         }
         KeyCode::Char('g') if is_plain_key(&key) => super::toggle_view_mode(app),
@@ -200,8 +212,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Grid { focus } = app.view else {
-        return;
+    let (focus, draft) = match &app.view {
+        View::Grid { focus, reply } => (*focus, reply.clone()),
+        _ => return,
     };
     draw_grid(
         f,
@@ -216,6 +229,17 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         },
         !app.visible.is_empty(),
     );
+    if let Some(draft) = draft {
+        let who = app
+            .grid_visible
+            .iter()
+            .find(|s| s.id == draft.id)
+            .map(|s| format!("{} {}", s.id, s.profile))
+            // 收件人在打字途中被停掉了。仍然照实写出 id——用户得看得见
+            // 自己正在对谁说话，哪怕那个会话刚没了。
+            .unwrap_or_else(|| draft.id.to_string());
+        draw_reply(f, area, &draft.text, &who, app.lang);
+    }
 }
 
 /// 画九宫格。格子的顺序 = 当页会话的顺序；画面按 id 跟 `screens` 配对，
@@ -314,22 +338,18 @@ fn draw_grid(
     for (i, info) in page_sessions.iter().enumerate() {
         let tile = tile_areas[i];
         let focused = start + i == focus;
+        // 「出问题了」比「你选中了它」优先：断连是整屏过期，失败是这一格
+        // 出事，两种都用红。焦点在红态下不换颜色，换的是边框字符和色块——
+        // 颜色这一个维度已经被占用了，再抢就两件事都说不清。
+        let alarmed = !connected || matches!(info.state, SessionState::Failed);
+        let focus_color = if alarmed { Color::Red } else { Color::Cyan };
+
         // 标题就是状态指示器：状态词用 status_style 上色，跟列表同一套颜色
         // （已停止是灰的），扫一眼九个格子就知道谁在干活、谁停了。
         let mut title = vec![
             // 跟列表的 `highlight_symbol` 同一个符号：两个模式看起来才是
-            // 同一件事。只靠边框换色不够——一条 1 格宽的线在浅色主题上跟
-            // 灰线几乎一样，而且用户得先知道「有选中这回事」才会去找它。
-            Span::styled(
-                if focused { "▶" } else { " " },
-                if focused {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
+            // 同一件事。
+            Span::raw(if focused { "▶" } else { " " }),
             Span::raw(format!("{} {} ", info.id, info.profile)),
             Span::styled(
                 format!("{} ", status_label(info.state, lang)),
@@ -345,41 +365,58 @@ fn draw_grid(
                 .unwrap_or_else(|| info.dir.clone());
             title.push(Span::styled(format!("{project} "), dim()));
         }
-        let title = Line::from(title);
-        // 断连时整屏格子一律红框：九个静止的画面看上去跟活的一模一样，
-        // 不给个视觉提示，用户会以为 agent 都不动了（列表和会话视图断连时
-        // 也是转红框，三处一致）。焦点格用青色；其余用 DIM 而不是 DarkGray——
-        // 后者是 ANSI 亮黑，有些主题把它设成背景同色，整圈边框会隐形
-        // （见 mod.rs 里 DIM 的注释）。
+        // 焦点格的标题反色成一条**铺满整格宽度**的实心色块。
         //
-        // 断连时焦点格是红色加粗，不是青色：颜色已经被「数据过期」这件事
-        // 占用了，焦点只能换一个维度来标。全都染成同一种红的话，用户就找不到
-        // 自己按方向键移到哪儿了。
-        // 出错的格子边框转红，跟断连时那一屏红框区分得开：那是整屏都红，
-        // 这是九个里的某一个红。用户扫一眼九宫格就该看见是哪一格出事了——
-        // 光靠标题里那两个字太容易漏。
-        let border = if matches!(info.state, SessionState::Failed) && connected {
-            Style::default().fg(Color::Red).add_modifier(if focused {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            })
-        } else if !connected {
-            let red = Style::default().fg(Color::Red);
-            if focused {
-                red.add_modifier(Modifier::BOLD)
-            } else {
-                red
-            }
+        // 只把标题文字反色不够：文字才占十来列，格子宽三四十列，剩下的还是
+        // 一条细边框，扫视时那一小块跟别的格子的标题混在一起。补齐到整行之后
+        // 焦点格顶上是一条完整的横条，隔着屏幕都认得出来，用户不需要先知道
+        // 「有选中这回事」才找得到它。
+        //
+        // 补空格而不是靠别的办法：Block 的 title 只画文字那几列，宽度得自己
+        // 撑开。`pad_to` 按显示宽度补，CJK 占两列这件事它已经处理了——用
+        // `len()` 的话中文标题会补出双倍长度，把右上角的框线顶掉。
+        //
+        // 反色时状态词交出自己的颜色：底色已经占满整条，青底上的红字比黑字
+        // 更难读，而状态本来就写着字（「干活中」/「出错」），不靠颜色也读得出。
+        if focused {
+            let block = Style::default().bg(focus_color).fg(Color::Black);
+            let text: String = title.iter().map(|s| s.content.as_ref()).collect();
+            // 左右两列是边框，标题能占的就是中间这些列
+            let width = tile.width.saturating_sub(2) as usize;
+            title = vec![Span::styled(pad_to(&text, width), block)];
+        }
+        let title = Line::from(title);
+        // 边框的**颜色**说状态，边框的**字符**说焦点。两件事各占一个维度，
+        // 才能同时说清「这一格出事了」和「你现在站在这一格」。
+        //
+        // 颜色：断连时整屏格子一律红框——九个静止的画面看上去跟活的一模一样，
+        // 不给个视觉提示，用户会以为 agent 都不动了（列表和会话视图断连时
+        // 也是转红框，三处一致）。单格失败也红，跟那一屏红区分得开：那是
+        // 整屏都红，这是九个里的某一个红。其余用 DIM 而不是 DarkGray——后者
+        // 是 ANSI 亮黑，有些主题把它设成背景同色，整圈边框会隐形（见 mod.rs
+        // 里 DIM 的注释）。
+        //
+        // 字符：焦点格用 Thick（`┏━┓`）。这里原来用的是 `Modifier::BOLD`，
+        // 理由写的是「笔画粗细不受主题影响」——方向没错，手段是坏的：BOLD
+        // 加在框线字符上，绝大多数终端字体没有对应的加粗字形，修饰被直接
+        // 忽略。于是焦点实际只剩「青 vs 暗」一个颜色维度，浅色主题下几乎
+        // 看不出来，红态下更是完全没有标记。Thick 换的是字符本身，终端支
+        // 不支持 BOLD、用户配的什么配色，都不影响。
+        let border = if alarmed {
+            Style::default().fg(Color::Red)
         } else if focused {
-            // 加粗：颜色在各种终端主题下的对比度差别很大，笔画粗细不受主题影响
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Cyan)
         } else {
             dim()
         };
-        let block = Block::bordered().title(title).border_style(border);
+        let block = Block::bordered()
+            .border_type(if focused {
+                BorderType::Thick
+            } else {
+                BorderType::Plain
+            })
+            .title(title)
+            .border_style(border);
         let inner = block.inner(tile);
         f.render_widget(block, tile);
 
@@ -391,7 +428,20 @@ fn draw_grid(
                 .map(|l| crop_line(l, inner.width as usize))
                 .collect();
             // 不画光标：只读的格子画光标只会误导用户在这里打字
-            f.render_widget(Paragraph::new(screen_to_lines(&cropped)), inner);
+            //
+            // 非焦点格的画面整体压暗。前两个维度（颜色、框线字符）都已经用
+            // 满了，对比度是第三个——让另外八格退到背景层，焦点格不用再加
+            // 任何装饰就自己跳出来了。
+            //
+            // 代价说清楚：那八格的 agent 输出确实变灰了，而「一眼扫全部」正是
+            // 九宫格存在的理由。但压暗不是隐藏——字还在，标题上的状态词也还是
+            // 原色（压暗只作用于画面，不碰标题），而「找不到焦点在哪一格」比
+            // 「另外八格淡一点」更痛。
+            let lines = screen_to_lines(&cropped);
+            f.render_widget(
+                Paragraph::new(if focused { lines } else { recede(lines) }),
+                inner,
+            );
         }
     }
 
@@ -402,6 +452,135 @@ fn draw_grid(
             footer,
         );
     }
+}
+
+/// 回复框收到一个键。判断全在 `reply_key`（纯函数，好测），这里只做 I/O
+/// 和视图切换。
+fn type_into_reply(app: &mut App, focus: usize, draft: Draft, key: KeyEvent) -> Result<()> {
+    match reply_key(&draft.text, &key) {
+        Reply::Typing(text) => {
+            app.view = View::Grid {
+                focus,
+                reply: Some(Draft { id: draft.id, text }),
+            }
+        }
+        Reply::Cancel => app.view = View::grid(focus),
+        Reply::Send(body) => {
+            app.message = send_reply(app, draft.id, &body);
+            app.view = View::grid(focus);
+        }
+        // `\x03` = Ctrl+C，跟 `key_to_input` 给附加视图算出来的是同一个字节
+        Reply::Interrupt => {
+            app.message = match send_input(app, draft.id, "\u{3}") {
+                Ok(()) => text(Key::ActionDone, app.lang).into(),
+                Err(m) => m,
+            };
+            app.view = View::grid(focus);
+        }
+    }
+    Ok(())
+}
+
+/// 把一句话交给 agent：先送文字，**再单独送一个空 `Input`**。
+///
+/// 空 `Input` 在守护进程侧就是「按回车」，而且回车那一步还会打检查点
+/// （见 `session.rs::send_input`）。所以这两步不能反、也不能合并成一次：
+/// 合并了就没有「发这句话之前」那个还原点，用户按 `u` 回滚不回来——而
+/// 「回滚」正是这个工具敢让非程序员放手用 agent 的底气。
+///
+/// 文字没送出去就不按回车：半句话加一个回车，等于把残缺的指令交给了 agent。
+fn send_reply(app: &mut App, id: u32, body: &str) -> Msg {
+    let sent = if body.is_empty() {
+        send_input(app, id, "")
+    } else {
+        send_input(app, id, body).and_then(|()| send_input(app, id, ""))
+    };
+    match sent {
+        Ok(()) => text(Key::ActionDone, app.lang).into(),
+        Err(m) => m,
+    }
+}
+
+/// 一次 `Request::Input`。失败原样交给调用方——发不出去必须说出来，
+/// 悄悄吞掉的话用户以为自己回过话了，其实 agent 还在那儿等着。
+fn send_input(app: &mut App, id: u32, body: &str) -> std::result::Result<(), Msg> {
+    let req = crate::proto::Request::Input {
+        id,
+        text: body.to_string(),
+    };
+    match app.client().and_then(|c| c.call(req)) {
+        Ok(crate::proto::Response::Ok) => Ok(()),
+        Ok(crate::proto::Response::Error(ref e)) => {
+            Err(Msg::err(crate::i18n::msg::error(app.lang, e)))
+        }
+        _ => Err(Msg::err(text(Key::RequestFailed, app.lang).into())),
+    }
+}
+
+/// 回复框：**盖**在九宫格最下面那一行上。
+///
+/// 是盖上去的，不是从上面切一行下来。切的话内容区就少一行，而 80×24 下
+/// 九宫格的内容区正好等于 `MIN_ROWS`——少一行整个视图就换成一句「窗口太小」，
+/// 框一开格子全没了。盖在最后一行只压掉最下面那排格子的下边框，代价最小。
+fn draw_reply(f: &mut Frame, area: Rect, draft: &str, who: &str, lang: Lang) {
+    let row = Rect {
+        x: area.x,
+        y: area.bottom().saturating_sub(1),
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(ratatui::widgets::Clear, row);
+
+    // 收件人写在最前面，而且是「会话号 + agent 名字」。发错人撤不回来，
+    // 所以这不是装饰——用户打字时眼睛就在这一行上，收件人必须在他视线里。
+    let to = Span::styled(
+        format!("→ {who}："),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    // 空框时给一句话，把「直接回车 = 同意」说出来。这是最高频的用法，
+    // 不写的话用户会以为必须先打点什么才能回。
+    let body = if draft.is_empty() {
+        vec![
+            Span::styled("▌", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("  {}", text(Key::EmptyReplyIsEnter, lang)), dim()),
+        ]
+    } else {
+        vec![
+            Span::raw(draft.to_string()),
+            Span::styled("▌", Style::default().fg(Color::Cyan)),
+        ]
+    };
+    let mut spans = vec![to];
+    spans.extend(body);
+    f.render_widget(Paragraph::new(Line::from(spans)), row);
+}
+
+/// 把一屏文字推到背景层：给每个 span 叠上 `DIM`。
+///
+/// 用 DIM 而不是把前景色统一改成灰：agent 的输出自带颜色（diff 的红绿、
+/// 语法高亮、报错的红），统一改色等于把这些信息一起抹掉；DIM 是在原色上
+/// 降亮度，颜色关系还在。
+///
+/// DIM 加在**文字**上跟 BOLD 加在框线字符上是两回事——后者绝大多数字体
+/// 没有对应字形所以被忽略（见 `draw_grid` 里边框那段），普通文字的 DIM
+/// 终端普遍支持。
+fn recede(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|s| {
+                        let style = s.style.add_modifier(Modifier::DIM);
+                        Span::styled(s.content, style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 /// 整块区域里垂直居中的那一行。一句话的提示贴在最上面像是画残了，
@@ -597,7 +776,7 @@ mod tests {
             })
             .collect();
         app.refresh_visible();
-        app.view = View::Grid { focus: 1 };
+        app.view = View::grid(1);
 
         let c = grid_text(&mut app);
         assert_eq!(c.matches('▶').count(), 1, "有且只有一个格子带标记：{c}");
@@ -614,7 +793,7 @@ mod tests {
         let mut s1 = session(1, SessionState::Stopped);
         s1.dir = "/tmp/a".into();
         app.set_sessions(vec![s1]);
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
 
         let c = grid_text(&mut app);
         assert!(c.contains("都停了"), "要说清是「停了」不是「没有」：{c}");
@@ -631,7 +810,7 @@ mod tests {
         s.dir = "/tmp/a".into();
         app.sessions = vec![s];
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
 
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
@@ -658,7 +837,7 @@ mod tests {
             session_in(2, "/w/dc_desktop"),
         ];
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
 
         let c = grid_text(&mut app);
         assert!(c.contains("1claude"), "当前项目的格子要在：{c}");
@@ -677,7 +856,7 @@ mod tests {
         ];
         app.scope = Scope::AllProjects;
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
 
         let c = grid_text(&mut app);
         assert!(c.contains("dc_desktop"), "格子标题要带项目名：{c}");
@@ -691,7 +870,7 @@ mod tests {
         app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
         app.sessions = vec![session_in(2, "/w/dc_desktop")];
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
 
         let c = grid_text(&mut app);
         assert!(c.contains("a"), "空状态要提到 a 键：{c}");
@@ -706,16 +885,16 @@ mod tests {
         // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
 
         handle_key(&mut app, key(KeyCode::Right)).unwrap();
-        assert!(matches!(app.view, View::Grid { focus: 1 }));
+        assert!(matches!(app.view, View::Grid { focus: 1, .. }));
         handle_key(&mut app, key(KeyCode::Down)).unwrap();
-        assert!(matches!(app.view, View::Grid { focus: 2 }));
+        assert!(matches!(app.view, View::Grid { focus: 2, .. }));
         handle_key(&mut app, key(KeyCode::Left)).unwrap();
-        assert!(matches!(app.view, View::Grid { focus: 1 }));
+        assert!(matches!(app.view, View::Grid { focus: 1, .. }));
         handle_key(&mut app, key(KeyCode::Up)).unwrap();
-        assert!(matches!(app.view, View::Grid { focus: 0 }));
+        assert!(matches!(app.view, View::Grid { focus: 0, .. }));
     }
 
     #[test]
@@ -726,9 +905,9 @@ mod tests {
         // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
-        app.view = View::Grid { focus: 2 };
+        app.view = View::grid(2);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
-        assert!(matches!(app.view, View::Grid { focus: 0 }), "到头回绕");
+        assert!(matches!(app.view, View::Grid { focus: 0, .. }), "到头回绕");
     }
 
     #[test]
@@ -739,7 +918,7 @@ mod tests {
         // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
-        app.view = View::Grid { focus: 2 };
+        app.view = View::grid(2);
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Attached(3)));
         assert!(app.need_sessions, "会话标题要显示项目名，得重拉一次列表");
@@ -753,7 +932,7 @@ mod tests {
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
         app.view_mode = crate::ui::ViewMode::Grid;
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
         assert!(matches!(app.view, View::Board));
         assert_eq!(app.view_mode, crate::ui::ViewMode::List);
@@ -778,7 +957,7 @@ mod tests {
         app.refresh_visible();
         app.list_state.select(Some(0));
         app.view_mode = crate::ui::ViewMode::Grid;
-        app.view = View::Grid { focus: 4 };
+        app.view = View::grid(4);
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
         assert!(matches!(app.view, View::Board));
         assert_eq!(
@@ -801,7 +980,7 @@ mod tests {
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
         app.list_state.select(Some(0));
-        app.view = View::Grid { focus: 4 };
+        app.view = View::grid(4);
         super::super::sync_board_cursor_from_grid(&mut app);
         assert_eq!(app.list_state.selected(), Some(4));
 
@@ -822,7 +1001,7 @@ mod tests {
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
         app.list_state.select(Some(0));
-        app.view = View::Grid { focus: 3 };
+        app.view = View::grid(3);
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Attached(4)));
         assert_eq!(app.list_state.selected(), Some(3));
@@ -839,10 +1018,10 @@ mod tests {
         // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
         for c in ['x', '中', 'z'] {
             handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
-            assert!(matches!(app.view, View::Grid { focus: 0 }));
+            assert!(matches!(app.view, View::Grid { focus: 0, .. }));
             assert_eq!(app.message.text, "");
         }
     }
@@ -854,7 +1033,7 @@ mod tests {
         // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
         app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.refresh_visible();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('q'))).unwrap();
         assert!(app.quit);
     }
@@ -882,7 +1061,7 @@ mod tests {
             // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
             on_grid.current_dir = std::path::PathBuf::from("/tmp/a");
             on_grid.refresh_visible();
-            on_grid.view = View::Grid { focus: 0 };
+            on_grid.view = View::grid(0);
             handle_key(&mut on_grid, key(KeyCode::Char(c))).unwrap();
 
             assert_eq!(
@@ -891,7 +1070,7 @@ mod tests {
             );
             assert!(!on_grid.message.text.is_empty(), "失败了要说话：{c}");
             assert!(
-                matches!(on_grid.view, View::Grid { focus: 0 }),
+                matches!(on_grid.view, View::Grid { focus: 0, .. }),
                 "拿不到数据就留在原地，不能把用户甩到别的屏幕上：{c}"
             );
         }
@@ -901,7 +1080,7 @@ mod tests {
     fn actions_on_an_empty_board_say_so_instead_of_panicking() {
         // 会话全没了还按 s：不能拿 sessions[focus] 直接索引
         let (mut app, _dir) = App::test_app();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('s'))).unwrap();
         assert_eq!(app.message.text, "还没有任何会话，按 n 开一个");
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
@@ -1038,6 +1217,161 @@ mod tests {
         );
     }
 
+    /// 细框和粗框的字符集。焦点靠**字符本身**区分，所以测试也只能按字符
+    /// 认——按颜色认就会把「红态下焦点没标记」这个 bug 一路放过去。
+    const THIN: &str = "─│┌┐└┘";
+    const THICK: &str = "━┃┏┓┗┛";
+
+    /// **焦点必须一眼看得出来，而且不能只靠颜色。**
+    ///
+    /// 上一版焦点是「青色 + `Modifier::BOLD`」，注释还写着「笔画粗细不受
+    /// 主题影响」——但 BOLD 加在框线字符上，绝大多数终端字体根本没有加粗的
+    /// 框线字形，这个修饰会被直接忽略。于是焦点实际只剩「青 vs 暗」一个
+    /// 维度，浅色主题下几乎看不出来。换 Thick 换的是字符本身，终端支不支持
+    /// BOLD、用户配的什么配色，都不影响。
+    #[test]
+    fn the_focused_tile_is_the_only_one_with_a_thick_border() {
+        use ratatui::backend::TestBackend;
+
+        let sessions = vec![
+            session(1, SessionState::Idle),
+            session(2, SessionState::Idle),
+        ];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[],
+                1,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+                false,
+            )
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let thick = cells_with(buf, |c| THICK.contains(c.symbol()));
+        let thin = cells_with(buf, |c| THIN.contains(c.symbol()));
+        assert!(!thick.is_empty(), "焦点格必须有粗框");
+        assert!(!thin.is_empty(), "非焦点格必须还是细框");
+        // 焦点在第二格（右半屏）
+        assert!(
+            thick.iter().all(|(x, _)| *x >= 40),
+            "只有焦点格该用粗框，实际用粗框的列：{:?}",
+            thick.iter().map(|(x, _)| *x).collect::<Vec<_>>()
+        );
+        assert!(
+            thin.iter().all(|(x, _)| *x < 40),
+            "非焦点格不该混进粗框区，实际细框的列：{:?}",
+            thin.iter().map(|(x, _)| *x).collect::<Vec<_>>()
+        );
+    }
+
+    /// 焦点格的标题整条反色（实心色块）。一条 1 格宽的边框线在浅色主题上
+    /// 跟灰线几乎一样，用户得先知道「有选中这回事」才会去找它；实心色块
+    /// 是屏幕上最扎眼的东西，不需要先学会看。
+    #[test]
+    fn the_focused_tiles_title_is_a_solid_block() {
+        use ratatui::backend::TestBackend;
+
+        let sessions = vec![
+            session(1, SessionState::Idle),
+            session(2, SessionState::Idle),
+        ];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &[],
+                1,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+                false,
+            )
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let block = cells_with(buf, |c| c.style().bg == Some(Color::Cyan));
+        assert!(!block.is_empty(), "焦点格的标题该是一条青色实心块");
+        assert!(
+            block.iter().all(|(x, _)| *x >= 40),
+            "色块只该出现在焦点格上，实际的列：{:?}",
+            block.iter().map(|(x, _)| *x).collect::<Vec<_>>()
+        );
+        // 色块得在标题那一行上，不是飘在格子中间
+        assert!(
+            block.iter().all(|(_, y)| *y == 0),
+            "色块该贴在标题行上，实际的行：{:?}",
+            block.iter().map(|(_, y)| *y).collect::<Vec<_>>()
+        );
+        // 色块要**铺满整格宽度**，不是只包住标题那几个字。只反色文字的话
+        // 色块才占十来列，格子宽三四十列，扫视时那一小块跟别的格子的标题
+        // 混在一起——「不够明显」正是这么来的。
+        //
+        // 按**跨度**断言而不是格数：宽字符（「空闲」这种 CJK）在 ratatui 里
+        // 只有首格带样式，后一格是个不带样式的空串占位。数格子的话每个中文
+        // 都会少算一格，断言就变成了在数标题里有几个汉字。
+        let left = block.iter().map(|(x, _)| *x).min().unwrap();
+        let right = block.iter().map(|(x, _)| *x).max().unwrap();
+        // 焦点格是右边那个：x 从 40 到 79，左右各一列边框
+        assert_eq!(left, 41, "色块该从格子左边框内侧起头");
+        assert_eq!(right, 78, "色块该一直铺到右边框内侧");
+    }
+
+    /// 非焦点格的画面要退到背景层。颜色和框线字符两个维度都已经用满了，
+    /// 对比度是第三个——另外八格暗下去，焦点格不用再加装饰就自己跳出来。
+    #[test]
+    fn the_tiles_you_are_not_on_recede() {
+        use ratatui::backend::TestBackend;
+
+        let sessions = vec![
+            session(1, SessionState::Idle),
+            session(2, SessionState::Idle),
+        ];
+        let screens = vec![entry(1, "左边这格"), entry(2, "右边这格")];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw_grid(
+                f,
+                f.area(),
+                &sessions,
+                &screens,
+                1,
+                Chrome {
+                    connected: true,
+                    scope: Scope::CurrentProject,
+                    lang: Lang::Zh,
+                },
+                false,
+            )
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let dimmed = cells_with(buf, |c| {
+            c.style().add_modifier.contains(Modifier::DIM) && c.symbol() != " "
+        });
+        assert!(!dimmed.is_empty(), "非焦点格的画面该压暗");
+        // 焦点在右半屏，压暗的只该出现在左半屏的画面里
+        assert!(
+            dimmed.iter().all(|(x, _)| *x < 40),
+            "焦点格的画面不该被压暗，实际压暗的列：{:?}",
+            dimmed.iter().map(|(x, _)| *x).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn disconnected_tiles_turn_red_like_the_other_views() {
         use ratatui::backend::TestBackend;
@@ -1068,8 +1402,10 @@ mod tests {
 
         let buf = term.backend().buffer();
         // 只看框线本身：标题里的状态词是另一套颜色（干活中就是青的），
-        // 它跟连没连上没关系。
-        let is_border = |c: &ratatui::buffer::Cell| "─│┌┐└┘".contains(c.symbol());
+        // 它跟连没连上没关系。粗细两套字符都要算进来——只数细框的话，
+        // 焦点格（粗框）会整个溜出这条断言，「每一格都红」就成了空话。
+        let is_border =
+            |c: &ratatui::buffer::Cell| THIN.contains(c.symbol()) || THICK.contains(c.symbol());
         let borders = cells_with(buf, is_border);
         assert!(!borders.is_empty(), "格子总该有边框");
         let red_borders = cells_with(buf, |c| is_border(c) && c.style().fg == Some(Color::Red));
@@ -1078,14 +1414,24 @@ mod tests {
             borders.len(),
             "断连时每一格的边框都得是红的，不能有格子还留着「一切正常」的颜色"
         );
-        // 焦点格（右半屏）靠加粗区分：颜色已经被「数据过期」占用了
-        let bold_xs = cells_with(buf, |c| {
-            c.style().fg == Some(Color::Red) && c.style().add_modifier.contains(Modifier::BOLD)
-        });
-        assert!(!bold_xs.is_empty(), "断连时也要看得出焦点在哪一格");
+        // 焦点格（右半屏）靠**框线字符**区分：颜色已经被「数据过期」占用了。
+        // 这里原来断言的是 BOLD，而 BOLD 在框线字符上根本画不出来——
+        // 测试过了，屏幕上却什么都没有。
+        let thick = cells_with(buf, |c| THICK.contains(c.symbol()));
+        assert!(!thick.is_empty(), "断连时也要看得出焦点在哪一格");
         assert!(
-            bold_xs.iter().all(|(x, _)| *x >= 40),
-            "只有焦点格该加粗，实际加粗的列：{bold_xs:?}"
+            thick.iter().all(|(x, _)| *x >= 40),
+            "只有焦点格该用粗框，实际用粗框的列：{thick:?}"
+        );
+        // 标题色块跟着边框一起转红。一个格子上同时挂着青色块和红框，
+        // 用户会当成两件不同的事，反而比不标还乱。
+        assert!(
+            cells_with(buf, |c| c.style().bg == Some(Color::Cyan)).is_empty(),
+            "断连时焦点色块该是红的，不该还留着青色"
+        );
+        assert!(
+            !cells_with(buf, |c| c.style().bg == Some(Color::Red)).is_empty(),
+            "断连时焦点格照样要有实心色块"
         );
     }
 
@@ -1315,5 +1661,213 @@ mod tests {
             !c.contains("别人的画面"),
             "id 对不上的画面绝不能画进来：{c}"
         );
+    }
+
+    /// 焦点格上按 `i` 开框，收件人钉成那一格的会话 id。
+    #[test]
+    fn i_opens_a_reply_box_addressed_to_the_focused_session() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(1);
+
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+        match &app.view {
+            View::Grid {
+                focus,
+                reply: Some(d),
+            } => {
+                assert_eq!(*focus, 1, "开框不该动焦点");
+                assert_eq!(d.id, 2, "收件人该是焦点那一格的会话");
+                assert!(d.text.is_empty(), "刚开的框该是空的");
+            }
+            _ => panic!("按 i 该开出回复框"),
+        }
+    }
+
+    /// **框开着的时候动作键必须失效。** 这是整个功能里最贵的一个错：
+    /// 用户打「so」的第一个字母就把会话停了，而停止不可撤销。
+    /// `reply_key` 那边测的是判断，这里测的是「判断真的挡在了 handle_key 前面」
+    /// ——两层都要，中间漏一层键就照样漏下去了。
+    #[test]
+    fn action_keys_do_not_fire_while_the_reply_box_is_open() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(1);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+
+        for c in ['s', 'u', 'd', 'q', 'g', 'n', 'p', 'a', 'c', 'l'] {
+            handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        assert!(!app.quit, "`q` 在框里只是个字母，不该退出 dct");
+        match &app.view {
+            View::Grid {
+                focus,
+                reply: Some(d),
+            } => {
+                assert_eq!(*focus, 1, "焦点不该动");
+                assert_eq!(d.text, "sudqgnpacl", "这些键该原样落进框里");
+            }
+            other => panic!(
+                "该还停在开着框的九宫格里，实际换了视图（是九宫格：{}）",
+                matches!(other, View::Grid { .. })
+            ),
+        }
+    }
+
+    /// 方向键在框里不动焦点——焦点一动，屏幕上「发给 X」那行就跟着变，
+    /// 而用户正对着它打字。
+    #[test]
+    fn arrows_do_not_move_the_focus_while_the_box_is_open() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(1);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+
+        handle_key(&mut app, key(KeyCode::Right)).unwrap();
+        handle_key(&mut app, key(KeyCode::Left)).unwrap();
+        match &app.view {
+            View::Grid {
+                focus,
+                reply: Some(d),
+            } => {
+                assert_eq!(*focus, 1);
+                assert_eq!(d.id, 2, "收件人从头到尾是同一个");
+            }
+            _ => panic!("该还开着框"),
+        }
+    }
+
+    /// Esc 关框、**不发**，而且不该顺手退出九宫格。
+    #[test]
+    fn esc_closes_the_box_and_leaves_the_grid_alone() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(1);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert!(
+            matches!(
+                app.view,
+                View::Grid {
+                    focus: 1,
+                    reply: None
+                }
+            ),
+            "Esc 该只关掉框，人还留在九宫格的同一格上"
+        );
+    }
+
+    /// 关掉的框不许留着上次的半句话。留着的话，用户下次按 `i` 一回车，
+    /// 上次没发的残句就跟着发出去了——而发出去撤不回来。
+    #[test]
+    fn reopening_the_box_starts_from_a_blank_draft() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(1);
+
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+        for c in "别发这句".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+
+        match &app.view {
+            View::Grid { reply: Some(d), .. } => {
+                assert!(
+                    d.text.is_empty(),
+                    "重开的框必须是空的，实际留着「{}」",
+                    d.text
+                )
+            }
+            _ => panic!("该开着框"),
+        }
+    }
+
+    /// 一个会话都没有时按 `i` 不该开出一个没人收的框。
+    #[test]
+    fn i_on_an_empty_grid_says_so_instead_of_opening_a_box() {
+        let (mut app, _dir) = App::test_app();
+        app.view = View::grid(0);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+        assert!(
+            matches!(app.view, View::Grid { reply: None, .. }),
+            "没有收件人就不该开框"
+        );
+        assert!(!app.message.text.is_empty(), "得说一句为什么没反应");
+    }
+
+    /// 框要画出来，而且**收件人必须在屏幕上**。发错 agent 撤不回来，
+    /// 用户打字时眼睛就在这一行上，收件人不能只存在于内存里。
+    #[test]
+    fn the_reply_box_names_who_it_is_addressed_to() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(1);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+        for c in "继续".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+
+        let c = grid_text(&mut app);
+        assert!(c.contains("2claude"), "回复行要写明发给谁：{c}");
+        assert!(c.contains("继续"), "打的字要显示出来：{c}");
+    }
+
+    /// 空框时要把「直接回车 = 同意」写出来。这是最高频的用法，不写的话
+    /// 用户会以为必须先打点什么才能回。
+    #[test]
+    fn an_empty_box_says_that_a_bare_enter_approves() {
+        let (mut app, _dir) = App::test_app();
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = vec![session(1, SessionState::Idle)];
+        app.refresh_visible();
+        app.view = View::grid(0);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+
+        let c = grid_text(&mut app);
+        assert!(
+            c.contains("直接回车表示同意"),
+            "空框该说清回车是干什么的：{c}"
+        );
+    }
+
+    /// 回复行是**盖**在最后一行上的，不是从上面切一行。切的话 80×24 下
+    /// 内容区跌破 MIN_ROWS，框一开整个九宫格就换成「窗口太小」。
+    #[test]
+    fn opening_the_box_does_not_shrink_the_grid_away() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = App::test_app();
+        app.connected = true;
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.sessions = (1..=4).map(|i| session(i, SessionState::Idle)).collect();
+        app.refresh_visible();
+        app.view = View::grid(0);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(!screen.contains("窗口太小"), "开框不该把格子挤没：{screen}");
+        assert!(screen.contains("claude"), "格子该还在：{screen}");
     }
 }

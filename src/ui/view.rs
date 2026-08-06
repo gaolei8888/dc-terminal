@@ -11,18 +11,98 @@ use crate::verify::VerifyOutcome;
 
 use super::Msg;
 
+/// 九宫格里那行回复框正在攒的一句话。
+#[derive(Clone)]
+pub(crate) struct Draft {
+    /// 收件人的**会话 id**，不是格子下标。
+    ///
+    /// 下标会漂：会话被停掉、翻页、切作用域，都会让同一个下标指向另一个
+    /// 会话。用户是对着某一个 agent 打的这句话，中途下标漂了就发给了别人，
+    /// 而发出去撤不回来。所以按下 `i` 的那一刻就把收件人钉死，之后不管
+    /// 焦点怎么动都不改。
+    pub id: u32,
+    pub text: String,
+}
+
+/// 回复框收到一个键之后该干什么。
+///
+/// 抽成纯函数 + 这个枚举，是为了让「发什么、发完框关不关」能脱离守护进程
+/// 直接测。真正容易写错的正是这一段：半句话被留在框里、下次开框一起发出去，
+/// 或者取消了却还是发了——这些都是撤不回来的错，不能只靠手点。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reply {
+    /// 继续编辑，框里现在是这些字
+    Typing(String),
+    /// 关掉，什么都不发
+    Cancel,
+    /// 关掉，把这些字发给 agent，再替他按一下回车。空串 = 只按回车。
+    Send(String),
+    /// 关掉，发一个中断（Ctrl+C）给 agent
+    Interrupt,
+}
+
+/// 一个键落进回复框里的结果。
+///
+/// 这里**不认**任何动作键：框开着的时候 `s`/`u`/`d` 就是三个字母，不是
+/// 停止/回滚/看改动。否则用户打「so」就把会话停了——而停止不可撤销。
+pub(crate) fn reply_key(text: &str, key: &KeyEvent) -> Reply {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => Reply::Cancel,
+        // 跟会话视图里一样：Ctrl+C 是「打断它」，不是「关掉这个框」。
+        // 用户在九宫格里看见某个 agent 跑偏了，这是最快的一脚刹车。
+        KeyCode::Char('c') if ctrl => Reply::Interrupt,
+        KeyCode::Enter => Reply::Send(text.to_string()),
+        KeyCode::Backspace => {
+            let mut t = text.to_string();
+            // `pop` 按**字符**删，一个汉字一下。按字节删会把 UTF-8 切碎。
+            t.pop();
+            Reply::Typing(t)
+        }
+        // Ctrl/Alt 组合键不当字符收：它们在终端里是控制序列，收进来会变成
+        // 一串看不懂的字，而用户以为自己只是按了个快捷键。
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            Reply::Typing(format!("{text}{c}"))
+        }
+        // 其余（方向键、F 键、Tab…）一律吞掉、原样保留正在打的字。
+        // 不转发给 agent：转发就等于把格子变成了半个附加视图，而格子的
+        // PTY 尺寸根本撑不起 agent 的完整界面（见 `View::Grid` 的注释）。
+        _ => Reply::Typing(text.to_string()),
+    }
+}
+
+impl View {
+    /// 九宫格视图，回复框关着。
+    ///
+    /// **所有「进/回九宫格」的地方都走这里。** 把 `reply` 显式写成 `None`
+    /// 散落在几十个构造点上，只要漏一处就是「切个视图回来，刚打的半句话
+    /// 还在框里」——而那半句话下一个回车就发给 agent 了。开框永远是用户的
+    /// 一次显式动作（按 `i`），没有任何一条路径该顺手把它带开。
+    pub(crate) fn grid(focus: usize) -> View {
+        View::Grid { focus, reply: None }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum View {
     Board,
     Attached(u32),
-    /// 九宫格：平铺所有会话的实时画面，只读。`focus` 是**全体会话**里的
-    /// 下标（不是当页内的），当前页从它推导，见 `grid::page_of`。
+    /// 九宫格：平铺所有会话的实时画面。`focus` 是**全体会话**里的下标
+    /// （不是当页内的），当前页从它推导，见 `grid::page_of`。
     ///
-    /// 只读是设计约束不是偷懒：一个会话的 PTY 只有一份尺寸，格子里能打字
-    /// 就得把会话缩到格子那么小（见 tile-grid 设计文档）。要交互按 Enter
-    /// 放大成附加视图。
+    /// **格子本身始终只读**，这是设计约束不是偷懒：一个会话的 PTY 只有一份
+    /// 尺寸，要让 agent 的完整界面在格子里能用，就得把 PTY 缩到格子那么小
+    /// ——80×24 终端下格子内区只有 25×5，Claude Code 光是底部那条状态栏就要
+    /// 折三行，输入框根本放不进去。所以键盘不往格子里转发，`s`/`u`/`d` 这些
+    /// 字母留给动作键。要完整交互按 Enter 放大成附加视图。
+    ///
+    /// `reply` 是那条约束**之外**的一个小口子：一行回复框，用来不离开九宫格
+    /// 就回 agent 一句（批个计划、答个是非题）。它不碰 PTY 尺寸、不渲染
+    /// agent 的光标、不改协议——光标是这个输入框自己的，文字靠现成的
+    /// `Request::Input` 送出去。`None` = 框没开，键盘照旧全是动作键。
     Grid {
         focus: usize,
+        reply: Option<Draft>,
     },
     PickProfile {
         entries: Vec<ProfileEntry>,
@@ -647,6 +727,8 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
         // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
         // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
+        // 框开着时左段写 Esc：这时候 `q` 只是个字母，写「q 退出」是假的。
+        View::Grid { reply: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
         View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
         // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
         // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
@@ -719,6 +801,10 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
                 ("p", Key::SwitchProject),
                 ("a", scope_key),
                 ("c", Key::Secrets),
+                // `l 设置` 紧跟 `c 密钥`：两个都是「配置」类入口。原来两份
+                // 按键表里都没有它，而 `l` 一直是能按的——屏幕上没写却真管用
+                // 的键，用户只能靠撞见。
+                ("l", Key::SettingsTitle),
                 ("g", Key::Grid),
                 ("↑↓", Key::Select),
                 ("Enter", Key::Open),
@@ -738,16 +824,37 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
         // escape_hint 已经常驻「q 退出」。原来要写是因为那时左段被
         // 「Ctrl+Q 回列表」占着，q 没有别的地方交代。重复一遍只会挤掉
         // 句尾的 s/d——那两个是不可撤销的操作，比重复一次 q 重要得多。
+        // 回复框开着时键盘整个归框，这时候再列动作键就是在教人按错——
+        // 屏幕上写着做不到的操作比不写更糟。
+        //
+        // `Esc 取消` **不**写在这里：它已经常驻左段（`escape_hint`）。同一行
+        // 里写两遍是拿最稀缺的一行去重复已知信息，而 `Ctrl+C 打断` 才是这里
+        // 唯一「不写就找不到」的键——它跟 `s 停止` 一样是打断 agent 的动作，
+        // 藏起来只会让用户眼看着它跑偏却不知道怎么喊停。
+        View::Grid { reply: Some(_), .. } => help_line(
+            &[("Enter", Key::SendReply), ("Ctrl+C", Key::InterruptAgent)],
+            lang,
+        ),
+        // `N 换 agent` 不写在这一份里：加了 `i 回一句` 之后这张表会折到
+        // 第三行，底栏多吃一行，内容区在 80×24 下跌破 `grid.rs` 的 MIN_ROWS，
+        // 整个九宫格换成一句「窗口太小」。`N` 是 `n` 的变体（按 n 就会看到
+        // agent 选择器），而 `i` 是全新能力——挤掉谁很清楚。
+        // 有 `the_bottom_bar_never_squeezes_the_grid_off_the_screen` 盯着。
         View::Grid { .. } => help_line(
             &[
                 ("", Key::MoveArrows),
                 ("Enter", Key::Zoom),
+                ("i", Key::ReplyOnce),
                 ("g", Key::List),
                 ("n", Key::New),
-                ("N", Key::SwitchAgent),
                 ("p", Key::SwitchProject),
                 ("a", scope_key),
                 ("c", Key::Secrets),
+                // 九宫格这份**不**跟着加 `l 设置`。加了就要折到第三行，底栏
+                // 多吃一行，内容区在 80×24 下只剩 19 行——正好跌破 grid.rs 的
+                // `MIN_ROWS`，整个九宫格换成一句「窗口太小」。少写一个键，比在
+                // 最常见的终端尺寸上把这个视图整个关掉划算。
+                // 有 `the_bottom_bar_never_squeezes_the_grid_off_the_screen` 盯着。
                 ("u", Key::Undo),
                 ("s", Key::Stop),
                 ("d", Key::Diff),
@@ -880,12 +987,12 @@ mod tests {
     fn grid_hints_match_what_the_keys_actually_do() {
         // 底栏说什么就得真能做到什么。九宫格现在是顶层，逃生键是 q——
         // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
-        let help = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
+        let help = idle_help(&View::grid(0), Scope::CurrentProject, Lang::Zh);
         for k in [
             "方向键选格子",
             "Enter 放大",
+            "i 回一句",
             "n 新建",
-            "N 换 agent",
             "p 换项目",
             "c 密钥",
             "u 回滚",
@@ -896,6 +1003,12 @@ mod tests {
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
+        // `N 换 agent` 有意不写：见 idle_help 里那段注释。按 `n` 就会看到
+        // agent 选择器，所以它不是「屏幕上没写就找不到」的能力。
+        assert!(
+            !help.contains("N 换"),
+            "九宫格按键表放不下 N，写了就会把 d 改动挤出屏幕：{help}"
+        );
         // `q 退出` 不该再出现在这一句里：它已经常驻左段（escape_hint），
         // 重复一遍只会把句尾的 s/d 挤出屏幕，而那两个不可撤销。
         assert!(
@@ -922,10 +1035,10 @@ mod tests {
     #[test]
     fn both_board_modes_are_top_level() {
         assert!(back_one_level(View::Board).is_none());
-        assert!(back_one_level(View::Grid { focus: 0 }).is_none());
+        assert!(back_one_level(View::grid(0)).is_none());
         assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
         assert_eq!(
-            escape_hint(&View::Grid { focus: 0 }, Lang::Zh),
+            escape_hint(&View::grid(0), Lang::Zh),
             "q 退出",
             "九宫格也是家，不是列表的下一层"
         );
@@ -954,7 +1067,7 @@ mod tests {
     #[test]
     fn both_modes_advertise_the_key_that_switches_them() {
         let list = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
-        let grid = idle_help(&View::Grid { focus: 0 }, Scope::CurrentProject, Lang::Zh);
+        let grid = idle_help(&View::grid(0), Scope::CurrentProject, Lang::Zh);
         assert!(
             list.contains("g 九宫格"),
             "列表要告诉用户怎么去九宫格：{list}"
@@ -1050,7 +1163,7 @@ mod tests {
             "全部项目时，a 通向本项目"
         );
         // 九宫格是看板的另一种画法，同一个键必须给同一套说明
-        let grid = View::Grid { focus: 0 };
+        let grid = View::grid(0);
         assert!(idle_help(&grid, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"));
         assert!(idle_help(&grid, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"));
     }
@@ -1808,5 +1921,118 @@ mod tests {
             pending_delete: Some("kimi".to_string()),
         };
         assert!(matches!(back_one_level(armed), Some(View::Board)));
+    }
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_k(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn typing_accumulates_into_the_draft() {
+        assert_eq!(
+            reply_key("", &k(KeyCode::Char('h'))),
+            Reply::Typing("h".into())
+        );
+        assert_eq!(
+            reply_key("继续", &k(KeyCode::Char('，'))),
+            Reply::Typing("继续，".into())
+        );
+    }
+
+    /// 退格按字符删。按字节删会把一个汉字切成半截 UTF-8，剩下的字节
+    /// 一渲染就是乱码，而中文是这个界面的主语言。
+    #[test]
+    fn backspace_deletes_one_character_not_one_byte() {
+        assert_eq!(
+            reply_key("方案B", &k(KeyCode::Backspace)),
+            Reply::Typing("方案".into())
+        );
+        assert_eq!(
+            reply_key("方案", &k(KeyCode::Backspace)),
+            Reply::Typing("方".into())
+        );
+        // 空框退格不该炸，也不该变成别的动作
+        assert_eq!(
+            reply_key("", &k(KeyCode::Backspace)),
+            Reply::Typing(String::new())
+        );
+    }
+
+    #[test]
+    fn esc_throws_the_draft_away_without_sending() {
+        assert_eq!(reply_key("别发这句", &k(KeyCode::Esc)), Reply::Cancel);
+    }
+
+    #[test]
+    fn enter_sends_what_is_in_the_box() {
+        assert_eq!(
+            reply_key("继续，用方案 B", &k(KeyCode::Enter)),
+            Reply::Send("继续，用方案 B".into())
+        );
+    }
+
+    /// 空框直接回车 = 替用户按一下回车（批准/继续）。这是最高频的交互，
+    /// 不该逼他先打点什么。守护进程侧空串本来就是这个意思（见
+    /// `session.rs::send_input`），所以这里原样传下去就行。
+    #[test]
+    fn enter_on_an_empty_box_is_a_bare_enter() {
+        assert_eq!(
+            reply_key("", &k(KeyCode::Enter)),
+            Reply::Send(String::new())
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_the_agent_instead_of_closing_the_box() {
+        assert_eq!(reply_key("半句话", &ctrl_k('c')), Reply::Interrupt);
+    }
+
+    /// **框开着的时候动作键必须失效。** 不这么做的话，用户打「so」的第一个
+    /// 字母就把会话停了——而停止不可撤销。这是整个功能里最贵的一个错。
+    #[test]
+    fn action_keys_are_just_letters_while_the_box_is_open() {
+        for c in ['s', 'u', 'd', 'q', 'n', 'p', 'a', 'c', 'l', 'g', 'i'] {
+            assert_eq!(
+                reply_key("", &k(KeyCode::Char(c))),
+                Reply::Typing(c.to_string()),
+                "框开着时 `{c}` 只能是个字母"
+            );
+        }
+    }
+
+    /// 组合键不当字符收：终端里它们是控制序列，收进框会变成一串看不懂的
+    /// 字，而用户以为自己只是按了个快捷键。
+    #[test]
+    fn modifier_combos_do_not_land_in_the_draft() {
+        assert_eq!(
+            reply_key("在打字", &ctrl_k('a')),
+            Reply::Typing("在打字".into())
+        );
+        assert_eq!(
+            reply_key(
+                "在打字",
+                &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)
+            ),
+            Reply::Typing("在打字".into())
+        );
+    }
+
+    /// 方向键在框里不动焦点——焦点动了，屏幕上「发给 4 claude」那行字就
+    /// 跟着变，而用户正对着它打字。收件人在按 `i` 那一刻就钉死了。
+    #[test]
+    fn arrows_do_not_move_the_focus_while_the_box_is_open() {
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+        ] {
+            assert_eq!(reply_key("草稿", &k(code)), Reply::Typing("草稿".into()));
+        }
     }
 }

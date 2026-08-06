@@ -341,13 +341,13 @@ pub fn run(
         // debug_assert 就是为这条路径设的，而 release 下越界会算出一个荒唐
         // 的页长，格子全乱。收在这里（拉完列表、画之前）是唯一能保证
         // 渲染和按键看到的是同一个合法焦点的地方。
-        if let View::Grid { focus } = app.view {
+        if let View::Grid { focus, .. } = app.view {
             let last = app.visible.len().saturating_sub(1);
             if focus > last {
-                app.view = View::Grid { focus: last };
+                app.view = View::grid(last);
             }
         }
-        if let View::Grid { focus } = app.view {
+        if let View::Grid { focus, .. } = app.view {
             let page = grid::page_of(focus);
             let start = page * grid::TILES_PER_PAGE;
             let ids: Vec<u32> = app
@@ -851,14 +851,13 @@ pub(crate) fn home_view(app: &App) -> View {
         // 光标停在一个已停止的会话上时（九宫格里没有它）落回第一格：
         // 那是个「它在九宫格里不存在」的诚实答案，比对到旁边某个无关的
         // 会话上强。
-        ViewMode::Grid => View::Grid {
-            focus: app
-                .list_state
+        ViewMode::Grid => View::grid(
+            app.list_state
                 .selected()
                 .and_then(|i| app.visible.get(i))
                 .and_then(|s| app.grid_visible.iter().position(|g| g.id == s.id))
                 .unwrap_or(0),
-        },
+        ),
     }
 }
 
@@ -914,7 +913,7 @@ fn move_sel(st: &mut ListState, sessions: &[SessionInfo], delta: i32) {
 /// 走的是 `back_one_level`——它是纯函数，手里根本没有 `list_state`。
 /// 不在九宫格里就什么都不做，调用方不必先判视图。
 pub(crate) fn sync_board_cursor_from_grid(app: &mut App) {
-    if let View::Grid { focus } = app.view {
+    if let View::Grid { focus, .. } = app.view {
         // **按会话 id 对，不按下标。** 九宫格不画已停止的会话，所以两个
         // 集合的下标根本对不上——第 2 格可能是列表的第 4 行。对错了的话，
         // 回列表后接下来的 `s`（停止）或 `u`（回滚）就毁在另一个会话上，
@@ -1160,11 +1159,47 @@ const ESCAPE_HINT_COLS: u16 = 19;
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw(f: &mut Frame, app: &mut App) {
-    // 底栏 4 行 = 上下边框 + **两行**文字。给到两行是因为看板那张按键表
-    // 有 105 列宽，挤在一行里时 80 列终端只剩 57 列可用，`u 回滚`/`s 停止`/
-    // `d 改动` 长期被右端整个截掉——这三个里有两个是不可撤销的操作，
-    // 屏幕上没写却真的管用的键，就是等着用户误按。
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(f.area());
+    // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
+    // 而那些键在会话视图里全部被转发给 agent——用户照着按 n，字母 n 会落进
+    // Claude Code 的输入框。显示做不到的操作比不显示更糟。
+    //
+    // 逃生键那一截已经挪进左段常驻，这里不再重复。
+    //
+    // 算在布局之前：底栏要多高，取决于这段文字折成几行。
+    let (help, style) = if !app.connected {
+        (
+            crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string(),
+            Style::default().fg(Color::Red),
+        )
+    } else if app.message.text.is_empty() {
+        (idle_help(&app.view, app.scope, app.lang), Style::default())
+    } else if app.message.error {
+        (app.message.text.clone(), Style::default().fg(Color::Red))
+    } else {
+        (app.message.text.clone(), Style::default())
+    };
+
+    // 右段可用宽度。跟下面切 `bar` 时算的是同一个数——不一致的话，按高度
+    // 预留的行数就对不上真正折出来的行数，末尾几个键照样会被吃掉。
+    let help_cols = f
+        .area()
+        .width
+        .saturating_sub(2 + ESCAPE_HINT_COLS + 2) // 块的左右边框 + 左段及其间隔
+        as usize;
+    let help_lines = widgets::wrap_help(&help, help_cols);
+
+    // 底栏高度 = 上下边框 + 文案真正折出来的行数。
+    //
+    // 这里原来写死 4 行（两行文字），于是「按键表能不能放下」变成了一件
+    // 靠人算、靠单测事后兜的事：往表里加一个键，末尾的 `d 改动` 就被右端
+    // 悄悄截掉，而 u/s/d 里有两个是不可撤销的操作。屏幕上没写却真的管用的
+    // 键，就是等着用户误按。按内容算高度之后，这一类 bug 在结构上不再可能
+    // 发生——宽终端上底栏自动缩回一行，格子把空间拿回去。
+    //
+    // 上限三分之一屏：再窄的终端里还是会截，但那时候继续让位只会把内容区
+    // 挤没。80 列（最常见的下限）装得下全部按键，有单测盯着。
+    let bar_h = ((help_lines.len() as u16).max(1) + 2).min((f.area().height / 3).max(3));
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(bar_h)]).split(f.area());
 
     // 穷尽匹配而不是 if/else 链：少一个 View 变体的分支，if/else 链的兜底
     // `else` 会悄悄把新变体也归给 secret::draw，画出一片空白也照样编译通过；
@@ -1196,23 +1231,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
     }
 
-    // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
-    // 而那些键在会话视图里全部被转发给 agent——用户照着按 n，字母 n 会落进
-    // Claude Code 的输入框。显示做不到的操作比不显示更糟。
-    //
-    // 逃生键那一截已经挪进左段常驻，这里不再重复。
-    let (help, style) = if !app.connected {
-        (
-            crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string(),
-            Style::default().fg(Color::Red),
-        )
-    } else if app.message.text.is_empty() {
-        (idle_help(&app.view, app.scope, app.lang), Style::default())
-    } else if app.message.error {
-        (app.message.text.clone(), Style::default().fg(Color::Red))
-    } else {
-        (app.message.text.clone(), Style::default())
-    };
     // 当前项目放在边框标题里，框内只留一行字。中文是双宽字符，
     // 「当前项目：~/work/dc/dc-terminal」加上按键表在 80 列终端里放不下同一行，
     // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
@@ -1242,10 +1260,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 折行而不是截断：截断会把句尾那几个键悄悄抹掉，而用户没有任何线索
     // 知道自己少看了几个键。折行用 `wrap_help` 而不是 ratatui 的 `Wrap`，
     // 理由见那个函数——`Wrap` 会把「p 换项目」拆成行尾一个孤零零的 `p`。
-    let lines: Vec<Line> = widgets::wrap_help(&help, bar[1].width as usize)
-        .into_iter()
-        .map(Line::from)
-        .collect();
+    //
+    // 用上面按 `help_cols` 折好的那一份，不在这里重折：底栏高度就是按它
+    // 的行数留的，两处各折一次的话，宽度算法一旦分叉，留的行和画的行就对
+    // 不上了。这条断言由 `the_bar_is_exactly_as_tall_as_the_help_it_holds` 盯着。
+    debug_assert_eq!(
+        help_cols, bar[1].width as usize,
+        "预留底栏高度用的宽度必须跟真正画的宽度一致"
+    );
+    let lines: Vec<Line> = help_lines.into_iter().map(Line::from).collect();
     f.render_widget(Paragraph::new(lines).style(style), bar[1]);
 }
 
@@ -1383,7 +1406,7 @@ mod tests {
 
         // 九宫格：格子内容的渲染细节在 grid.rs 自己的测试里，这里只过一遍
         // 顶层分派（含底栏那截）
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         // profile 选择弹窗
@@ -1517,9 +1540,114 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
 
-        for key in ["n新建", "p换项目", "a看全部项目", "u回滚", "s停止", "d改动"] {
+        for key in [
+            "n新建",
+            "p换项目",
+            "a看全部项目",
+            "c密钥",
+            "l设置",
+            "u回滚",
+            "s停止",
+            "d改动",
+        ] {
             assert!(c.contains(key), "按键表里的「{key}」被截掉了：{c}");
         }
+    }
+
+    /// 底栏顶边所在的行号。顶边那一行写着「当前项目：」，找它就行。
+    fn bar_top(term: &Terminal<ratatui::backend::TestBackend>) -> u16 {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .find(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, *y)))
+                    .any(|c| c.symbol() == "当")
+            })
+            .expect("底栏顶边总该在屏幕上")
+    }
+
+    /// 底栏高度必须是按文案算出来的，不是写死的。
+    ///
+    /// 写死 4 行的那一版把「按键表放不放得下」变成了靠人算的事：往表里加
+    /// 一个键，末尾的 `d 改动` 就被右端悄悄截掉，而 u/s/d 里有两个不可撤销。
+    /// 这条盯着预留的行数跟真正折出来的行数一致——两者一旦分叉，屏幕上就会
+    /// 重新出现「没写却管用」的键。
+    #[test]
+    fn the_bar_is_exactly_as_tall_as_the_help_it_holds() {
+        use ratatui::backend::TestBackend;
+
+        for width in [80u16, 100, 160] {
+            let (mut app, _dir) = App::test_app();
+            app.view = View::Board;
+            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+
+            let want = widgets::wrap_help(
+                &idle_help(&View::Board, app.scope, app.lang),
+                (width - 2 - ESCAPE_HINT_COLS - 2) as usize,
+            )
+            .len() as u16
+                + 2;
+            assert_eq!(
+                24 - bar_top(&term),
+                want,
+                "{width} 列下底栏该是 {want} 行高"
+            );
+        }
+    }
+
+    /// 底栏不许把九宫格挤到画不出来。
+    ///
+    /// 底栏高度改成按内容算之后，按键表每多折一行，内容区就少一行。80×24
+    /// 恰好卡在边界上：内容区 20 行 = `grid.rs` 的 `MIN_ROWS`，再少一行整个
+    /// 九宫格就换成一句「窗口太小」。往九宫格那份按键表里加一个键就会触发，
+    /// 而这在单测里不加一条断言是看不出来的——按键表的测试只数键，不看格子
+    /// 还在不在。
+    #[test]
+    fn the_bottom_bar_never_squeezes_the_grid_off_the_screen() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = App::test_app();
+        app.connected = true;
+        app.current_dir = std::path::PathBuf::from("/tmp/a");
+        app.set_sessions(vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/tmp/a".into(),
+            state: SessionState::Working,
+            activity: String::new(),
+        }]);
+        app.view = View::grid(0);
+
+        // 80×24 是最常见的终端下限，这一条必须在这个尺寸上成立
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = bar_text(&term);
+        assert!(
+            !screen.contains("窗口太小"),
+            "80×24 下九宫格必须画得出来，底栏不能把它挤没：{screen}"
+        );
+        assert!(screen.contains("claude"), "格子该在屏幕上：{screen}");
+    }
+
+    /// 终端够宽时底栏要把行让回去。只长不缩的话，「不截断按键表」就是拿
+    /// 内容区去换的——而九宫格每少一行，九个格子里的 agent 输出各少一行。
+    #[test]
+    fn a_wide_terminal_gets_its_rows_back() {
+        use ratatui::backend::TestBackend;
+
+        let mut heights = Vec::new();
+        for width in [80u16, 160] {
+            let (mut app, _dir) = App::test_app();
+            app.view = View::Board;
+            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            heights.push(24 - bar_top(&term));
+        }
+        assert!(
+            heights[1] < heights[0],
+            "160 列下底栏该比 80 列下矮，实际 {heights:?}"
+        );
     }
 
     /// 九宫格那一句比看板的还长，而且多一个 `q 退出`——在这个视图里左段写的
@@ -1530,7 +1658,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let (mut app, _dir) = App::test_app();
-        app.view = View::Grid { focus: 0 };
+        app.view = View::grid(0);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
@@ -1540,6 +1668,7 @@ mod tests {
             "n新建",
             "p换项目",
             "a看全部项目",
+            "c密钥",
             "u回滚",
             "s停止",
             "d改动",
@@ -1613,7 +1742,7 @@ mod tests {
         let views = [
             View::Board,
             View::Attached(1),
-            View::Grid { focus: 0 },
+            View::grid(0),
             View::PickProfile {
                 entries: Vec::new(),
                 state: ListState::default(),

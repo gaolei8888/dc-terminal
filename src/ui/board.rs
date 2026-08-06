@@ -253,7 +253,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert!(matches!(app.view, View::Grid { focus: 2 }));
+        assert!(matches!(app.view, View::Grid { focus: 2, .. }));
         assert_eq!(
             app.view_mode,
             crate::ui::ViewMode::Grid,
