@@ -10,6 +10,90 @@ use crate::proto::{Request, Response};
 /// 就会跟着冻结，连 `q` 都按不动。5 秒对正常操作留了充分余量。
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 换掉 socket 那头的守护进程：先请它走，走不动就硬来，然后拉一个新的
+/// 起来，确认新的真的能服务了才返回。
+///
+/// **这会杀掉所有正在跑的会话**，因为 pty 就在守护进程里。调用方必须先问过
+/// 用户——这是这个产品最不该擅自做的一件事（「关掉窗口不影响会话」是它的
+/// 立身之本）。
+pub fn restart_daemon(socket: &Path, exe: &Path) -> Result<()> {
+    let old = Client::connect(socket)
+        .ok()
+        .and_then(|c| c.peer_pid())
+        .ok_or_else(|| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
+
+    // SIGTERM 先：守护进程自己会把 pty 收拾干净。给两秒，还赖着就 SIGKILL。
+    unsafe { libc::kill(old as i32, libc::SIGTERM) };
+    let gone = wait_up_to(Duration::from_secs(2), || !process_alive(old));
+    if !gone {
+        unsafe { libc::kill(old as i32, libc::SIGKILL) };
+        wait_up_to(Duration::from_secs(2), || !process_alive(old));
+    }
+
+    spawn_daemon(exe, socket)?;
+
+    // 「连得上」不等于「能服务」：旧进程死掉时留下的 socket 文件照样摆在那。
+    // 一定要真发一条请求，而且要发 Hello——新起来的那个必须是同一号协议，
+    // 否则这次重启什么也没解决。
+    let up = wait_up_to(Duration::from_secs(5), || {
+        Client::connect(socket)
+            .ok()
+            .and_then(|mut c| c.protocol())
+            .is_some_and(|v| v == crate::proto::PROTOCOL_VERSION)
+    });
+    if !up {
+        return Err(crate::proto::coded(
+            crate::proto::ErrorCode::DaemonNotResponding,
+        ));
+    }
+    Ok(())
+}
+
+/// 拉起一个守护进程，脱离当前终端。
+///
+/// `setsid`：不这么做的话它跟 TUI 在同一个 session 里，关掉终端窗口时 SIGHUP
+/// 会把它一起带走——而「关掉窗口不影响会话」正是这个产品存在的理由。
+///
+/// socket 路径显式传给子进程，不让它自己从 `HOME` 推：重启这条路上「换掉的是
+/// 哪个 socket」必须只有一个说法。
+pub fn spawn_daemon(exe: &Path, socket: &Path) -> Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .arg(socket)
+        // 守护进程的输出必须全部丢弃：它和 TUI 共用同一个终端，
+        // 任何一行 stderr 都会直接糊在界面上。
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+fn process_alive(pid: u32) -> bool {
+    // 0 号信号不发信号，只问「这个进程还在不在」。
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cond()
+}
+
 /// 一条到守护进程的连接。
 ///
 /// **超时之后必须丢掉连接重连，不能接着用。** 超时只是"这次没等到"，
@@ -47,6 +131,46 @@ impl Client {
             writer: stream,
         });
         Ok(())
+    }
+
+    /// 「你是几号协议？」`None` 表示答不上来——老到不认识 `Hello` 的守护进程
+    /// 会解析失败，而**答不上来本身就是答案**：那一定不是跟本界面同一份源码
+    /// 编出来的。
+    pub fn protocol(&mut self) -> Option<u32> {
+        match self.call(Request::Hello) {
+            Ok(Response::Hello { protocol }) => Some(protocol),
+            _ => None,
+        }
+    }
+
+    /// socket 那头那个进程的 pid，问内核要。
+    ///
+    /// 不靠进程名匹配（旧守护进程可能是从完全不同的路径起的），也不靠守护
+    /// 进程自己配合（需要换掉的恰恰是那些老到不认识任何新请求的）。内核记着
+    /// 是谁 bind 的这个 socket，这是唯一一个不需要对面同意的问法。
+    #[cfg(target_os = "macos")]
+    pub fn peer_pid(&self) -> Option<u32> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.conn.as_ref()?.writer.as_raw_fd();
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        (rc == 0 && pid > 0).then_some(pid as u32)
+    }
+
+    /// 别的平台没实现。返回 `None` 的后果是 [`restart_daemon`] 认不出旧守护
+    /// 进程、于是拒绝动手——比拿一个猜出来的 pid 去 kill 强。
+    #[cfg(not(target_os = "macos"))]
+    pub fn peer_pid(&self) -> Option<u32> {
+        None
     }
 
     pub fn call(&mut self, req: Request) -> Result<Response> {

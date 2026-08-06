@@ -21,6 +21,24 @@ fn unique_binary(dir: &Path, tag: &str) -> PathBuf {
     dst
 }
 
+/// 这份二进制起的守护进程还在不在。按完整路径匹配，只认这个测试自己那一份，
+/// 不会看见开发机上真正在跑的 dct。
+fn daemon_alive(bin: &Path) -> bool {
+    Command::new("pgrep")
+        .args(["-f", &format!("{} daemon", bin.display())])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// 只杀这个测试自己那份二进制起的守护进程。同 `daemon_detach.rs` 的收尾。
+fn reap_daemon(bin: &Path) {
+    Command::new("pkill")
+        .args(["-f", &format!("{} daemon", bin.display())])
+        .output()
+        .ok();
+}
+
 fn wait_for(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -153,6 +171,17 @@ fn sigterm_restores_the_terminal() {
     );
 
     unsafe { libc::close(master) };
+
+    // TUI 一起来就会 `setsid` 拉起一个守护进程，而 setsid 的全部意义就是
+    // 「杀 TUI 杀不到我」。这两个测试只 kill TUI，守护进程就活到开发机重启
+    // 为止——实测一台机器上攒了 124 个，全是历次 `cargo test` 留下的，每个
+    // 都还锁着一份早就该被删掉的临时二进制。
+    reap_daemon(&bin);
+    assert!(
+        wait_for(|| !daemon_alive(&bin), 10),
+        "测试自己拉起的守护进程没被收掉：{}",
+        bin.display()
+    );
 }
 
 #[test]
@@ -180,4 +209,15 @@ fn sighup_restores_the_terminal() {
     assert!(!unsafe { is_raw(master) }, "SIGHUP 之后终端仍停在 raw mode");
 
     unsafe { libc::close(master) };
+
+    // TUI 一起来就会 `setsid` 拉起一个守护进程，而 setsid 的全部意义就是
+    // 「杀 TUI 杀不到我」。这两个测试只 kill TUI，守护进程就活到开发机重启
+    // 为止——实测一台机器上攒了 124 个，全是历次 `cargo test` 留下的，每个
+    // 都还锁着一份早就该被删掉的临时二进制。
+    reap_daemon(&bin);
+    assert!(
+        wait_for(|| !daemon_alive(&bin), 10),
+        "测试自己拉起的守护进程没被收掉：{}",
+        bin.display()
+    );
 }

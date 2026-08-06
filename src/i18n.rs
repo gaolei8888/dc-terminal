@@ -188,6 +188,11 @@ pub enum Key {
     PasteNotSent,
     InputNotSent,
     DaemonTooOld,
+    // —— 启动时撞上旧守护进程 ——
+    StaleDaemonExplain,
+    StaleDaemonAsk,
+    StaleDaemonRestarting,
+    StaleDaemonRestartFailed,
     RequestFailed,
     ActionDone,
     NoChanges,
@@ -393,6 +398,28 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Cannot reach the dct service — that keystroke was not sent",
             zh: "守护进程连不上，刚才那次输入没发出去",
         ),
+        StaleDaemonExplain => t!(
+            lang,
+            en: "The background service is still the old version, so some things will not work.\n\
+                 It is the piece that keeps your agent sessions running while dct is closed.\n\n\
+                 Restarting it fixes this. The sessions running right now will end —\n\
+                 your file changes stay, but the agents have to be started again.",
+            zh: "后台服务还是旧版本，有些功能会用不了。\n\
+                 它是 dct 关掉之后替你看着 agent 会话的那个东西。\n\n\
+                 重启它就能修好。正在跑的会话会断——文件改动都还在，\n\
+                 只是 agent 要重新开一次。",
+        ),
+        StaleDaemonAsk => t!(
+            lang,
+            en: "Restart it now? (y = restart, Enter = leave it for now)",
+            zh: "现在重启吗？(y = 重启，直接回车 = 先这样用)",
+        ),
+        StaleDaemonRestarting => t!(lang, en: "Restarting…", zh: "正在重启…"),
+        StaleDaemonRestartFailed => t!(
+            lang,
+            en: "Could not restart it. Continuing with the old one.",
+            zh: "没能重启，先接着用旧的",
+        ),
         DaemonTooOld => t!(
             lang,
             en: "The background service is an older version and cannot show the screen. Quit dct and open it again.",
@@ -431,6 +458,14 @@ pub fn help_line(items: &[(&str, Key)], lang: Lang) -> String {
 /// 写成函数，这些全归签名管。
 pub mod msg {
     use super::{text, Key, Lang};
+
+    pub fn not_a_session_id(lang: Lang, arg: &str) -> String {
+        t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
+    }
+
+    pub fn stopped_session(lang: Lang, id: u32) -> String {
+        t!(lang, en: format!("Stopped session {id}"), zh: format!("已停止 {id} 号会话"))
+    }
 
     pub fn switched_to(lang: Lang, project: &str) -> String {
         t!(lang, en: format!("Switched to {project}"), zh: format!("已切到 {project}"))
@@ -854,6 +889,10 @@ mod tests {
             PasteNotSent,
             InputNotSent,
             DaemonTooOld,
+            StaleDaemonExplain,
+            StaleDaemonAsk,
+            StaleDaemonRestarting,
+            StaleDaemonRestartFailed,
             RequestFailed,
             ActionDone,
             NoChanges,
@@ -892,7 +931,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 85, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 89, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

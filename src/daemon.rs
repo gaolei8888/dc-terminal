@@ -98,6 +98,10 @@ fn handle(
     profiles_dir: &Path,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
+        // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
+        Request::Hello => Ok(Response::Hello {
+            protocol: crate::proto::PROTOCOL_VERSION,
+        }),
         Request::List => Ok(Response::Sessions(mgr.list())),
         Request::Profiles { lang } => {
             let (all, mut warnings) = all_profiles(profiles_dir);

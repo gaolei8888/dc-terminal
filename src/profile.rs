@@ -527,11 +527,15 @@ mod tests {
         assert!(Profile::builtin("nope").is_none());
     }
 
+    /// 不挑某个内置 profile 来测：内置的用 idle 还是 busy 特征是它自己的事
+    /// （claude 系就从 `idle_pattern` 换到了 `busy_pattern`），这条只问
+    /// 「声明了 idle_pattern 的 profile，那条正则编得过、匹得上」。
     #[test]
     fn idle_regex_compiles() {
-        let p = Profile::builtin("claude").unwrap();
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\nidle_pattern = \"READY$\"\n")
+            .unwrap();
         let re = p.idle_regex().unwrap().unwrap();
-        assert!(re.is_match("  ? for shortcuts"));
+        assert!(re.is_match("  READY"));
     }
 
     #[test]

@@ -6,6 +6,22 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// 起 agent 之前必须从继承来的环境里摘掉的标记。
+///
+/// 守护进程常常是从某个 agent 自己的会话里被拉起来的（用户在 Claude Code 里
+/// 敲 `dct`），而它一活就是好几天。这些变量的意思是「你是某个 agent 会话的
+/// 子进程」，传给一个全新的会话就是**假的**，而 CLI 会照着它改行为——实测
+/// 表现是每个新会话顶上挂一句「Transcript saving is off」，聊天记录一条不存。
+///
+/// 只列这一类身份标记。凭据（`ANTHROPIC_API_KEY` 之流）和登录态一律不动：
+/// 那是「agent 能不能干活」，跟「它以为自己是谁」是两回事。
+const INHERITED_SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+];
+
 /// 终端颜色。跟 vt100 的表示一一对应，额外实现序列化好走协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ScreenColor {
@@ -80,8 +96,15 @@ impl PtySession {
         }
         builder.cwd(cwd);
 
-        // 只加不减：不清空继承来的环境。ANTHROPIC_BASE_URL 这类是覆盖上去的，
-        // 但 PATH / HOME / 各家 CLI 自己的登录态都得留着，清了 agent 就起不来。
+        // 先摘掉「我正跑在别的 agent 会话里」这类标记，再加 profile 自己的环境
+        // （顺序不能反：profile 想显式设回某一个，得说了算）。
+        for k in INHERITED_SESSION_MARKERS {
+            builder.env_remove(k);
+        }
+
+        // 除上面那几个之外只加不减：不清空继承来的环境。ANTHROPIC_BASE_URL
+        // 这类是覆盖上去的，但 PATH / HOME / 各家 CLI 自己的登录态都得留着，
+        // 清了 agent 就起不来。
         for (k, v) in env {
             builder.env(k, v);
         }

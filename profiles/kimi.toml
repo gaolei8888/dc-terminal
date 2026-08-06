@@ -1,7 +1,11 @@
 name = "kimi"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
-idle_pattern = "\\? for shortcuts"
+# 干活时底部一定有「(12s · esc to interrupt)」。
+# 不能拿 `? for shortcuts` 当 idle_pattern：上面这条命令带的
+# `--dangerously-skip-permissions` 会让底栏常驻「bypass permissions on」，
+# 正好把那行顶掉——profile 会用自己的启动参数保证自己永远判不出空闲。
+busy_pattern = "esc to interrupt"
 error_pattern = "API Error|Connection closed mid-response"
 
 [label]

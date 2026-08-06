@@ -6,6 +6,35 @@ use crate::profile::ProfileStatus;
 use crate::pty::ScreenSpan;
 use crate::session::{SessionInfo, SessionState};
 
+/// 界面和守护进程之间的线上契约版本。**改了协议就要加一。**
+///
+/// 这两个东西是分开升级的：守护进程一活就是好几天（它活得久正是这个产品
+/// 存在的理由），用户装了新版本 dct 之后，跟他说话的还是几天前那个进程。
+/// 协议一改，新界面发的请求旧守护进程就解不出来——2026-08-05 的现场是
+/// `Profiles` 加了 `lang` 字段之后，按 n 只弹一句「拿不到 agent 列表」，
+/// 没有任何线索指向真正的原因。
+///
+/// `the_request_shape_is_pinned_to_the_protocol_version` 会在形状变了而
+/// 这个数字没变时变红。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 对面那个守护进程能不能用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStatus {
+    /// 同一份协议，正常用。
+    Same,
+    /// 号对不上，或者老到连 `Hello` 都不认识。
+    Stale,
+}
+
+/// `None` = 连 `Hello` 都答不上来，那是比握手本身还老的守护进程。
+pub fn daemon_status(protocol: Option<u32>) -> DaemonStatus {
+    match protocol {
+        Some(v) if v == PROTOCOL_VERSION => DaemonStatus::Same,
+        _ => DaemonStatus::Stale,
+    }
+}
+
 /// 需要密钥时，UI 画输入界面要用的东西。
 ///
 /// 只带**已经取好语言**的字符串，不把 `LocalizedText` 送过线：组句发生在哪
@@ -52,6 +81,10 @@ pub struct ScreenEntry {
 
 #[derive(Serialize, Deserialize)]
 pub enum Request {
+    /// 「你是几号协议？」界面连上之后问的第一句。放在最前面，且
+    /// **永远不许改形状**——它是唯一一条必须让任何年纪的守护进程都能
+    /// 解出来的请求（老到答不上来也没关系，答不上来本身就是答案）。
+    Hello,
     List,
     Create {
         dir: String,
@@ -118,6 +151,7 @@ pub enum Request {
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Request::Hello => write!(f, "Hello"),
             Request::List => write!(f, "List"),
             Request::Create {
                 dir,
@@ -168,6 +202,10 @@ impl std::fmt::Debug for Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
+    /// 对 [`Request::Hello`] 的回答。同样不许改形状。
+    Hello {
+        protocol: u32,
+    },
     Sessions(Vec<SessionInfo>),
     Created {
         id: u32,
@@ -368,6 +406,95 @@ mod tests {
             Request::Screens { ids } => assert_eq!(ids, vec![1, 3, 7]),
             other => panic!("解回来不是 Screens：{other:?}"),
         }
+    }
+
+    /// 答不上「你是几号协议」的守护进程，就是老到连这个问题都不认识的那种。
+    /// 现场那个 daemon 正是如此：它比 `Hello` 还老。
+    #[test]
+    fn a_daemon_that_cannot_answer_is_stale() {
+        assert_eq!(daemon_status(None), DaemonStatus::Stale);
+    }
+
+    /// 答得上但号对不上，一样不能用——两边编译自不同的源码。
+    #[test]
+    fn a_daemon_on_another_protocol_is_stale() {
+        assert_eq!(
+            daemon_status(Some(PROTOCOL_VERSION + 1)),
+            DaemonStatus::Stale
+        );
+        assert_eq!(
+            daemon_status(Some(PROTOCOL_VERSION.wrapping_sub(1))),
+            DaemonStatus::Stale
+        );
+    }
+
+    #[test]
+    fn a_daemon_on_the_same_protocol_is_usable() {
+        assert_eq!(daemon_status(Some(PROTOCOL_VERSION)), DaemonStatus::Same);
+    }
+
+    /// 协议的线上形状，钉死在 `PROTOCOL_VERSION` 上。
+    ///
+    /// 改了任何一个变体的名字或字段，这条会红。红了就**必须**把
+    /// `PROTOCOL_VERSION` 一起加一——否则新界面又会去跟一个解不出它请求的
+    /// 旧守护进程说话，而用户看到的只有一句「拿不到 agent 列表」，
+    /// 没有任何线索指向真正的原因。这正是 2026-08-05 那次现场事故。
+    ///
+    /// 只钉请求：请求是**新界面发给旧 daemon** 的那一半，也就是会炸的那一半。
+    #[test]
+    fn the_request_shape_is_pinned_to_the_protocol_version() {
+        // 每个变体都要在这里出现一次。漏一个不会被这条测试发现，但会被
+        // `impl Debug for Request` 那个穷举 match 拦下来——加变体必须
+        // 同时改那里。
+        let all = vec![
+            Request::Hello,
+            Request::List,
+            Request::Create {
+                dir: "d".into(),
+                profile: "p".into(),
+                remember: true,
+            },
+            Request::Input {
+                id: 1,
+                text: "t".into(),
+            },
+            Request::Screen { id: 1 },
+            Request::Screens { ids: vec![1] },
+            Request::Resize {
+                id: 1,
+                rows: 2,
+                cols: 3,
+            },
+            Request::Stop { id: 1 },
+            Request::Undo { id: 1 },
+            Request::Diff { id: 1 },
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
+            Request::Projects,
+            Request::SetSecret {
+                profile: "p".into(),
+                value: "v".into(),
+            },
+            Request::DeleteSecret {
+                profile: "p".into(),
+            },
+            Request::LastProfile,
+            Request::VerifySecret {
+                profile: "p".into(),
+                value: "v".into(),
+            },
+        ];
+
+        let shape = serde_json::to_string(&all).unwrap();
+        assert_eq!(
+            (PROTOCOL_VERSION, shape.as_str()),
+            (
+                1,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}}]"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
     }
 
     #[test]

@@ -34,6 +34,42 @@ pub enum SessionState {
     Unknown,
 }
 
+/// 一屏文字 → 状态。返回 `None` 表示「这屏说明不了任何事」，调用方
+/// 保持原状态不动。
+///
+/// 抽成纯函数是为了能拿真实截屏当输入直接测。判定顺序有讲究：
+///
+/// - **错误压过一切。** 出错时屏幕上同时有错误和输入框提示，`idle_pattern`
+///   一样匹得上；顺序反过来的话，最要紧的那个事实会被一句「空闲」盖掉——
+///   用户以为 agent 在等他，其实那一轮已经废了。
+/// - **busy 优先于 idle。** agent 干活时的「按 esc 中断」提示是稳定的，
+///   而空闲时的输入框占位符用户一打字就没了。
+fn classify(
+    text: &str,
+    error_re: Option<&regex::Regex>,
+    busy_re: Option<&regex::Regex>,
+    idle_re: Option<&regex::Regex>,
+) -> Option<SessionState> {
+    if error_re.is_some_and(|re| re.is_match(text)) {
+        return Some(SessionState::Failed);
+    }
+    if let Some(re) = busy_re {
+        return Some(if re.is_match(text) {
+            SessionState::Working
+        } else {
+            SessionState::Idle
+        });
+    }
+    if let Some(re) = idle_re {
+        return Some(if re.is_match(text) {
+            SessionState::Idle
+        } else {
+            SessionState::Working
+        });
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: u32,
@@ -362,6 +398,9 @@ impl SessionManager {
     }
 
     /// 扫一遍所有会话，更新状态。由守护进程定时调用。
+    ///
+    /// 判定本身在 [`classify`]，不在这里：那是一个「一屏文字 → 状态」的
+    /// 纯函数，能拿真实截屏直接测，不用先支一个活着的 pty。
     pub fn tick(&self) {
         let snapshot: Vec<Arc<Mutex<Session>>> =
             recover(self.sessions.lock()).values().cloned().collect();
@@ -384,24 +423,14 @@ impl SessionManager {
             // 每个会话每秒被 tick 5 次，没必要算三遍。
             if s.busy_re.is_some() || s.idle_re.is_some() || s.error_re.is_some() {
                 let text = s.pty.screen_text();
-                // **错误压过一切。** 出错时屏幕上同时有错误和输入框提示，
-                // idle_pattern 一样匹得上；判定顺序反过来的话，最要紧的那个
-                // 事实会被一句「空闲」盖掉——用户以为 agent 在等他，
-                // 其实那一轮已经废了。
-                if s.error_re.as_ref().is_some_and(|re| re.is_match(&text)) {
-                    s.state = SessionState::Failed;
-                } else if let Some(re) = &s.busy_re {
-                    s.state = if re.is_match(&text) {
-                        SessionState::Working
-                    } else {
-                        SessionState::Idle
-                    };
-                } else if let Some(re) = &s.idle_re {
-                    s.state = if re.is_match(&text) {
-                        SessionState::Idle
-                    } else {
-                        SessionState::Working
-                    };
+                let next = classify(
+                    &text,
+                    s.error_re.as_ref(),
+                    s.busy_re.as_ref(),
+                    s.idle_re.as_ref(),
+                );
+                if let Some(next) = next {
+                    s.state = next;
                 }
             }
             // 两个都没有：状态不动，保持 Unknown
@@ -417,6 +446,76 @@ mod tests {
     use std::process::Command;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
+
+    /// 一台真机上 Claude Code **停在提示符等人** 时的屏幕底部，照抄。
+    ///
+    /// 关键在最后一行：用 `--dangerously-skip-permissions` 起的 Claude Code
+    /// 底栏常驻「bypass permissions on」，把 `? for shortcuts` 顶掉了。
+    const CLAUDE_WAITING_FOR_YOU: &str = "\
+● 362 个测试全绿，clippy 干净，已提交并重装到 ~/.local/bin/dct。
+
+  用起来再有别扭的地方告诉我。
+
+✳ Brewed for 9m 52s
+                                        new task? /clear to save 612.1k tokens
+❯
+⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker
+~/work/dc/dc-terminal  main | \"实现项目选择的目录浏览器\" | Opus 5 | ctx:61%
+▶▶ bypass permissions on (shift+tab to cycle)
+";
+
+    /// 同一台机器上，同一个 agent **正在干活**。
+    const CLAUDE_WORKING: &str = "\
+● 我来查一下这个。
+
+✳ Brewing… (5s · ↓ 1.2k tokens · esc to interrupt)
+❯
+▶▶ bypass permissions on (shift+tab to cycle)
+";
+
+    /// claude 系的 profile 全都带 `--dangerously-skip-permissions` 起 agent，
+    /// 于是它们用自己的启动参数保证了自己的 `idle_pattern` 永远不出现：
+    /// 会话明明停在提示符上等人，格子标题却一直写着「干活中」。
+    ///
+    /// 这条测试钉的是结论，不是某一条正则：不管 profile 用什么 pattern，
+    /// 「等人的屏幕」不许判成 Working。
+    #[test]
+    fn a_claude_family_session_waiting_at_the_prompt_is_idle() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = crate::profile::Profile::builtin(name).unwrap();
+            let state = classify(
+                CLAUDE_WAITING_FOR_YOU,
+                p.error_regex().unwrap().as_ref(),
+                p.busy_regex().unwrap().as_ref(),
+                p.idle_regex().unwrap().as_ref(),
+            );
+            assert_eq!(
+                state,
+                Some(SessionState::Idle),
+                "{name}：停在提示符等人的屏幕被判成了 {state:?}"
+            );
+        }
+    }
+
+    /// 上一条的守门人。少了它，把 pattern 全删光也能让上一条变绿——
+    /// 那是把「永远说干活中」换成「永远说空闲」，一样错。
+    #[test]
+    fn a_claude_family_session_mid_turn_is_working() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = crate::profile::Profile::builtin(name).unwrap();
+            let state = classify(
+                CLAUDE_WORKING,
+                p.error_regex().unwrap().as_ref(),
+                p.busy_regex().unwrap().as_ref(),
+                p.idle_regex().unwrap().as_ref(),
+            );
+            assert_eq!(
+                state,
+                Some(SessionState::Working),
+                "{name}：正在干活的屏幕被判成了 {state:?}"
+            );
+        }
+    }
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -798,6 +897,61 @@ mod tests {
         m.stop(id).unwrap();
         let st = m.list().iter().find(|s| s.id == id).unwrap().state;
         assert_eq!(st, SessionState::Stopped);
+    }
+
+    /// 守护进程常常是从某个 agent 自己的会话里被拉起来的——用户在 Claude Code
+    /// 里敲 `dct`，dct 发现没有 daemon 就 `setsid` 拉起一个。那个 daemon 一活
+    /// 就是好几天，于是启动它的那个会话留在环境里的「我是子会话」标记，会被
+    /// 原样传给它之后开的**每一个** agent。表现是每个新会话顶上都挂着一句
+    /// 「Transcript saving is off」，聊天记录一条都不存，而用户完全不知道
+    /// 这跟他几天前在哪敲的那一下有关系。
+    ///
+    /// 环境是「只加不减」的——PATH、HOME、各家 CLI 的登录态都得留着——
+    /// 但这类标记必须摘掉。
+    #[test]
+    fn agent_sessions_do_not_inherit_the_launching_agents_markers() {
+        // 进程级的改动，但这个变量全仓库没有别处读，不会干扰并行跑的其他测试。
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "contaminated");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+            name = "fake-agent"
+            command = ["/bin/sh", "-c", "echo MARK=[$CLAUDE_CODE_CHILD_SESSION] HOME=[$HOME]; sleep 5"]
+            is_agent = false
+            "#,
+            )
+            .unwrap(),
+        );
+
+        let id = mgr.create(&proj, "fake-agent", None, &[]).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let text = loop {
+            let text = mgr.screen_text_for_test(id);
+            if text.contains("MARK=") {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "会话没打印出东西来：{text}"
+            );
+            sleep(Duration::from_millis(50));
+        };
+
+        assert!(
+            text.contains("MARK=[]"),
+            "启动 dct 的那个 agent 的会话标记漏给了新会话：{text}"
+        );
+        // 同一屏里验一下没有把环境清空——只减这一类标记，别的照传。
+        assert!(text.contains("HOME=[/"), "把继承来的环境清过头了：{text}");
+
+        std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
     }
 
     #[test]
