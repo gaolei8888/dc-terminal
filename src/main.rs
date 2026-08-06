@@ -11,9 +11,14 @@ const HELP: &str = "\
 dct —— vibe coding 终端
 
 用法：
-  dct           打开会话看板（守护进程没在跑就自动拉起）
-  dct daemon    只跑守护进程，不开界面
-  dct --help    看这段
+  dct              打开会话看板（守护进程没在跑就自动拉起）
+  dct ps           列出后台在跑的会话
+  dct stop <会话号> 停掉某个会话，可以给多个
+  dct stop --all   停掉全部会话
+  dct daemon       只跑守护进程，不开界面
+  dct --help       看这段
+
+ps 和 stop 都不会拉起守护进程：问「有没有东西在跑」不该把「没有」变成「有」。
 ";
 
 fn main() -> Result<()> {
@@ -27,6 +32,16 @@ fn main() -> Result<()> {
             let sock = args.get(1).map(PathBuf::from).unwrap_or_else(socket_path);
             dct::daemon::run(&sock)
         }
+        // ps / stop 走的是**已经在跑**的守护进程，连不上就如实说没有，
+        // 绝不顺手拉起一个——见 `cli` 的模块注释。
+        Some("ps") => dct::cli::run_ps(&socket_path(), cli_lang()),
+        Some("stop") => {
+            let target = dct::cli::parse_stop_args(&args[1..], cli_lang());
+            let code = dct::cli::run_stop(&socket_path(), cli_lang(), target)?;
+            // 停不成要让脚本看得出来。`dct stop 3 && 干别的` 这种写法很自然，
+            // 而「3 号根本没停成」如果只体现在 stderr 上，后面那半句照样会跑。
+            std::process::exit(code)
+        }
         Some("--help") | Some("-h") => {
             println!("{HELP}");
             Ok(())
@@ -36,6 +51,16 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// `ps` / `stop` 用哪种语言。跟界面同一条路：设置里选过的优先，没选过看
+/// 环境变量。这两条命令印的是给人看的话（状态词、「要停哪个」），跟界面
+/// 说两种语言会很怪。
+fn cli_lang() -> dct::i18n::Lang {
+    let settings = dct::settings::settings_path_for_socket(&socket_path());
+    dct::i18n::resolve(dct::settings::load_lang(&settings), &|k| {
+        std::env::var(k).ok()
+    })
 }
 
 fn run_ui() -> Result<()> {

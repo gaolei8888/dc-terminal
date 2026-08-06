@@ -411,6 +411,22 @@ impl SessionManager {
                 continue;
             }
             if !s.pty.is_alive() {
+                // **这一轮是回收子进程的最后机会。** 下一轮 tick 会在上面那个
+                // `Stopped` 分支直接跳过它，`Session` 又一直留在 map 里、`Drop`
+                // 不会跑——错过这里就再也没人管了。
+                //
+                // 自己退出的 agent（`/exit`、崩溃、shell 里 `exit`）没有任何
+                // 一处 wait 过它：读线程读到 EOF 只是置了个 `alive` 标志
+                // （见 `pty.rs` 里那段），而 `is_alive()` 一看标志就短路返回，
+                // 里面的 `try_wait()` 根本走不到。于是子进程变成僵尸，一直挂到
+                // 守护进程重启——而守护进程一活就是好几天，这正是它存在的理由。
+                // 按 `s` 停止那条路没这个问题，`stop()` 走的是 `pty.kill()`。
+                //
+                // 用 `kill()` 而不是补一次 `try_wait()`：还有一种情况是子进程
+                // 关掉了 PTY 却还活着，那时 `try_wait` 回收不到任何东西，而
+                // 这个会话已经被判成停止、不会再被看第二眼了。`kill()` 先杀
+                // 再等，两种情况一起收干净。
+                let _ = s.pty.kill();
                 s.state = SessionState::Stopped;
                 continue;
             }

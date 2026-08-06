@@ -159,6 +159,11 @@ pub enum Key {
     DaemonUnreachable,
     StaleData,
     // —— 会话状态（看板与九宫格的状态列）——
+    // —— dct ps / dct stop（普通终端里用，不开界面）——
+    NoDaemonRunning,
+    NoSessionsRunning,
+    StopNeedsATarget,
+    StopAllTakesNoIds,
     StatusWorking,
     StatusAsking,
     StatusIdle,
@@ -323,6 +328,24 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Cannot reach the dct service",
             zh: "守护进程连不上",
+        ),
+        NoDaemonRunning => t!(
+            lang,
+            en: "Nothing is running in the background",
+            zh: "后台没有东西在跑",
+        ),
+        NoSessionsRunning => t!(lang, en: "No sessions", zh: "没有会话"),
+        // 说清「怎么停一个」和「怎么全停」，而不是甩一句「参数错误」——
+        // 敲出 `dct stop` 的人已经知道自己要停东西了，缺的是怎么写。
+        StopNeedsATarget => t!(
+            lang,
+            en: "Which one? `dct stop 3` stops session 3, `dct stop --all` stops every session.",
+            zh: "要停哪个？`dct stop 3` 停 3 号会话，`dct stop --all` 全停。",
+        ),
+        StopAllTakesNoIds => t!(
+            lang,
+            en: "`dct stop --all` already means every session — drop the ids.",
+            zh: "`dct stop --all` 本来就是全停，不要再跟会话号。",
         ),
         StatusWorking => t!(lang, en: "working", zh: "干活中"),
         StatusAsking => t!(lang, en: "asking you", zh: "等你回答"),
@@ -863,6 +886,10 @@ mod tests {
             NoSessionSelected,
             DaemonUnreachable,
             StaleData,
+            NoDaemonRunning,
+            NoSessionsRunning,
+            StopNeedsATarget,
+            StopAllTakesNoIds,
             StatusWorking,
             StatusAsking,
             StatusIdle,
@@ -931,7 +958,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 89, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 93, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
