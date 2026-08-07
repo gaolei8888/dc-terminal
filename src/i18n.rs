@@ -713,28 +713,43 @@ pub mod msg {
     /// 跟 `scrolled_up` 一样必须带上「按 End 回底部」：这半句在这个状态下
     /// 反而最要紧——用户翻着历史、新内容还在不断堆积，正是最想马上跳回去
     /// 看最新输出的时候，不能只说「有新东西」却不说怎么去看。
+    ///
+    /// 英文版故意比直译短：底栏右段的宽度是「终端总宽 − 23」（`mod.rs` 的
+    /// `ESCAPE_HINT_COLS`），窄终端上很快就不够 40 列。这句话走的是
+    /// `BarContent::Text`，`wrap_help` 只在空格连打两个的地方才折行，这句
+    /// 里全是单空格，放不下就不是折行而是被 `Paragraph` 直接截断——原来
+    /// "↓ {n} new line(s) below · press End to jump back down" 有 52+ 列，
+    /// 80 列左右的终端就已经在吃「怎么回去」那半句，这正是这句话存在的
+    /// 唯一理由。缩短之后即使在很窄的终端上，「按 End」也还留得住。
+    /// 中文版本来就短（~30 列），不用动。
     pub fn scroll_new_lines_below(lang: Lang, n: usize) -> String {
         t!(
             lang,
-            en: format!("↓ {n} new line(s) below · press End to jump back down"),
+            en: format!("↓ {n} new below · press End"),
             zh: format!("↓ 下面还有 {n} 行新内容 · 按 End 回到底部"),
         )
     }
 
     /// 底栏「已经往上翻了多远，怎么回去」。两件事缺一不可——只说翻了多远，
     /// 用户不知道怎么回底部；只说怎么回去，他不知道自己是不是还看得到最新的。
+    ///
+    /// 英文版缩短的理由跟 `scroll_new_lines_below` 一样——见那边的注释。
     pub fn scrolled_up(lang: Lang, offset: usize) -> String {
         t!(
             lang,
-            en: format!("↑ Scrolled up {offset} line(s) · press End to jump back down"),
+            en: format!("↑ Scrolled up {offset} · press End"),
             zh: format!("↑ 已往上翻 {offset} 行 · 按 End 回到底部"),
         )
     }
 
-    /// agent 自己攥着画面又不收鼠标（比如 Claude Code）：滚轮和翻页在这个
-    /// 会话里都没用。装死的话用户会以为滚轮坏了，反复去试——必须说清楚
-    /// 「这儿翻不了」。不能提"备用屏"/"scrollback"/"缓冲区"这类黑话，用户
-    /// 不是程序员，听不懂这些词，只会更迷惑。
+    /// 触发条件是 `!agent_owns && alt_screen`：agent 用了备用屏、但没开鼠标
+    /// 上报，滚轮和翻页在这个会话里都没用。真正会落进这一支的是 `less`、
+    /// `vim`、`htop` 这类吃全屏又不理鼠标的程序——**不是** Claude Code：
+    /// Claude Code 恰恰是会收鼠标的那一类（`agent_owns` 判据见
+    /// `attach::wheel_action` 的文档），走的是完全不同的分支。装死的话
+    /// 用户会以为滚轮坏了，反复去试——必须说清楚「这儿翻不了」。不能提
+    /// "备用屏"/"scrollback"/"缓冲区"这类黑话，用户不是程序员，听不懂
+    /// 这些词，只会更迷惑。
     pub fn agent_owns_the_screen(lang: Lang) -> String {
         t!(
             lang,

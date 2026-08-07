@@ -906,6 +906,29 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 又回来之间恢复过、再坏过一次，缓存里那份还是上上次失败的旧话，
     // 不清掉的话 `run()` 主循环会以为「问过了」，永远不会去问新的那次。
     app.explained_failure = None;
+    // CONTROLLER RULING：进入会话视图一律落在底部，不管上次离开时翻到
+    // 哪儿了、也不管这一次算不算「换了个尺寸」。
+    //
+    // 原来落地在哪儿全看 `run()` 主循环里那条按 `sent_size` 判断要不要发
+    // `Request::Resize` 的分支——`SessionManager::resize` 顺手把 scroll 归了
+    // 零，于是「回不回底部」变成了一个跟尺寸缓存打不打得上的意外结果：
+    // 切到另一个会话再回来，id 变了，`sent_size` 不匹配，触发 Resize，
+    // 顺带回到底部；按 F2 回看板、什么都没点、又直接 Enter 回同一个会话，
+    // `sent_size` 还对得上，Resize 不发，人就诡异地卡在几十行之前翻到的
+    // 地方——同一个「回来看看」的意图，走两条路给两种结果。
+    //
+    // 离开了再回来，用户要看的是最新输出，不是他上次读到一半的历史——
+    // 一种可预期的行为好过两种碰运气的。所以这里直接、明确地发一次
+    // `Scroll::Bottom`，不再借 `sent_size`/`Resize` 的副作用捎带出来。
+    // 失败就静默：跟 `handle_key` 里滚动请求失败的处理一样，这不是用户
+    // 当下敲的一个键，没反应分不清是卡顿还是断连，下一帧的 `Screen`
+    // 探测自然会把 `connected` 标成假。
+    let _ = app.client().and_then(|c| {
+        c.call(Request::Scroll {
+            id,
+            by: crate::session::ScrollBy::Bottom,
+        })
+    });
 }
 
 /// 把守护进程报回来的一串警告码组成一行人话。
@@ -1508,6 +1531,132 @@ mod tests {
             app.explained_failure, None,
             "进入会话必须当成一次全新的观察，不能继续顶着上一次的缓存"
         );
+    }
+
+    /// F7 回归测试：re-entering 落在底部必须是 `enter_session` 自己主动做的
+    /// 一件事，不能是靠 `run()` 主循环里 `sent_size` 变了才顺带触发的
+    /// `Resize` 副作用——不然「F3 直接切会话」（id 变了，`sent_size` 跟着
+    /// 变）和「F2 回看板、原地 Enter 回同一个会话」（id 没变，`sent_size`
+    /// 照样对得上，`Resize` 根本不会发）会给出两种不同的结果，同一个「回
+    /// 来看看」的意图，一半时候把用户按第一种方式接回底部，另一半晾在
+    /// 半空。
+    ///
+    /// 这条测试故意不走 `run()`、不发任何 `Resize`，只直接调
+    /// `enter_session`：起一个真守护进程，攒出足够滚屏、真的往上翻一截，
+    /// 确认 offset 确实大于零；然后单独调 `enter_session`（模拟"已经在看
+    /// 这个会话，只是重新点了一下进来"，没有任何尺寸变化可以触发
+    /// Resize），如果 offset 归零了，只能是这次改动新加的那次显式
+    /// `Request::Scroll { by: Bottom }` 干的。
+    #[test]
+    fn entering_a_session_always_lands_at_the_bottom_even_without_a_resize() {
+        use crate::client::Client;
+        use crate::proto::{Request, Response};
+        use crate::session::ScrollBy;
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(Instant::now() < deadline, "daemon 没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut c = Client::connect(&sock).unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let id = match c
+            .call(Request::Create {
+                dir: workdir.path().display().to_string(),
+                profile: "shell".into(),
+                remember: false,
+            })
+            .unwrap()
+        {
+            Response::Created { id } => id,
+            other => panic!("预期 Created，实际 {other:?}"),
+        };
+
+        // 攒够滚屏内容：跟 `session.rs` 里 `scrolling_session` 用的是同一种
+        // POSIX 循环，不挑具体 shell。
+        c.call(Request::Input {
+            id,
+            text: "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done\n".into(),
+        })
+        .unwrap();
+
+        let screen = |c: &mut Client| -> (String, crate::session::ScrollState) {
+            match c.call(Request::Screen { id }).unwrap() {
+                Response::Screen { lines, scroll, .. } => {
+                    let text = lines
+                        .iter()
+                        .flat_map(|l| l.iter())
+                        .map(|s| s.text.as_str())
+                        .collect::<String>();
+                    (text, scroll)
+                }
+                other => panic!("预期 Screen，实际 {other:?}"),
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (text, scroll) = screen(&mut c);
+            if text.contains("line-200") && scroll.max > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "没等到滚屏内容攒够");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        c.call(Request::Scroll {
+            id,
+            by: ScrollBy::Rows(20),
+        })
+        .unwrap();
+        let (_, scroll) = screen(&mut c);
+        assert!(scroll.offset > 0, "先确认真的往上翻了，不然下面测的是空话");
+
+        // 模拟「已经在看这个会话，重新进来一次」——不经过 `run()`，直接调
+        // `enter_session`：这条路径上没有任何 Resize 会发生。
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            workdir.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+        app.sessions = vec![SessionInfo {
+            id,
+            profile: "shell".into(),
+            dir: workdir.path().display().to_string(),
+            state: SessionState::Working,
+            activity: String::new(),
+            is_agent: false,
+        }];
+        app.current_dir = workdir.path().to_path_buf();
+        app.view = View::Board;
+
+        enter_session(&mut app, id);
+
+        // `enter_session` 发的 Scroll 请求是异步落地的——给它一点时间，
+        // 不是靠 sleep 赌运气，是轮询到超时才认输。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, scroll_after) = screen(&mut c);
+            if scroll_after.offset == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "重新进入会话必须落在底部，不能停在离开前翻到的地方：offset={}",
+                scroll_after.offset
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -2346,6 +2495,42 @@ mod tests {
 
         assert!(c.contains("已切到某个项目"), "消息该赢，没显示出来：{c}");
         assert!(!c.contains("按End回到底部"), "滚动提示不该盖过消息：{c}");
+    }
+
+    /// F6 回归测试：英文滚动提示走的是 `BarContent::Text`，`wrap_help`
+    /// 只在连续两个空格的地方才折行，而这句提示全是单空格，放不下就不是
+    /// 折行，是被 `Paragraph`（没挂 `.wrap()`）直接从右边截断。原来的
+    /// "↑ Scrolled up 40 line(s) · press End to jump back down" 有 54 列，
+    /// 底栏右段宽度是「终端总宽 − 23」，55 列的终端只有 32 列可用——刚好
+    /// 卡在「怎么回去」那半句中间，`End` 整个词被截没了：这个宽度算出的
+    /// 切点（`old[:32]`）落在 "press " 之后、"End" 之前，用户会看到自己
+    /// 正翻着历史，却读不到任何一个字告诉他怎么回去。缩短后的新版本
+    /// （28 列）在同样的宽度下完整放得下。
+    #[test]
+    fn the_way_back_survives_a_narrow_terminal() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(55, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.lang = crate::i18n::Lang::En;
+        app.scroll = crate::session::ScrollState {
+            agent_owns: false,
+            alt_screen: false,
+            max: 500,
+            offset: 40,
+            new_lines: 0,
+        };
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        assert!(
+            c.contains("End"),
+            "55 列的终端上，用户翻到哪儿都不该看不到怎么回去：{c}"
+        );
     }
 
     /// 副作用（`execute!` 往 stdout 写转义序列）没法单测，但「这一帧该不该

@@ -335,8 +335,12 @@ pub enum Response {
     /// 没配 LLM、或者算失败了——界面不用区分，统一显示今天就有的那句
     /// 失败提示）。
     Explanation(Option<String>),
-    /// 对 [`Request::Scroll`] 的回答：滚完之后的状态，界面拿它直接刷底栏，
-    /// 不用再补一次 `Screen` 才知道滚到哪了。
+    /// 对 [`Request::Scroll`] 的回答：滚完之后的状态。**目前没有任何调用点
+    /// 读它**——界面所有发 `Request::Scroll` 的地方都用 `let _ = ...` 扔掉
+    /// 返回值，底栏刷新靠的是下一轮 16ms 一次的 `Screen` 轮询自然带回来的
+    /// `scroll` 字段，不是这个字段直接驱动的。留着 `Scrolled` 而不是改成
+    /// `Ok`：它仍然是描述这次滚动的正确形状，往后要是哪个调用点想抄近路
+    /// 立刻拿到滚完的状态（不等下一轮 `Screen`），数据已经现成。
     Scrolled(ScrollState),
 }
 

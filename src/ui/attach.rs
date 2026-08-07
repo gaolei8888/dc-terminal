@@ -48,6 +48,18 @@ pub(crate) fn wheel_action(st: &ScrollState, up: bool) -> ScrollAction {
 /// 在守护进程侧是 `saturating_sub` 之后再钳到 `[0, max]`，结果跟
 /// `ScrollBy::Bottom` 完全一样，多一个分支只是多一处要测的东西。
 pub(crate) fn key_scroll(st: &ScrollState, key: &KeyEvent, page: u16) -> Option<ScrollAction> {
+    // `End` 先于 `agent_owns` 的挡板被判定：`agent_owns` 是每帧从活的 parser
+    // 上读出来的即时属性，不是某个 agent 固定的性格——一个命令跑完、起了个
+    // 会用鼠标的 pager/TUI，`agent_owns` 说变就变，而 `offset` 不会跟着自动
+    // 归零。用户在 dct 自己滚的历史（`offset > 0`）就是 dct 自己欠下的账，
+    // 不管此刻鼠标归谁，回到底部这件事永远该由 dct 来兑现——底栏那句提示
+    // 敢说「按 End 回到底部」，`End` 就必须真的管用，不然用户会被自己屏幕
+    // 上唯一给的指令坑在原地。`offset == 0` 时才轮到下面 `agent_owns` 的
+    // 挡板：这时候没什么可回的，`End` 才该按它平时的意思（比如编辑器的
+    // 「跳到行尾」）转发给 agent。
+    if key.code == KeyCode::End && st.offset > 0 {
+        return Some(ScrollAction::Scroll(-i32::MAX));
+    }
     if st.agent_owns {
         return None;
     }
@@ -62,7 +74,6 @@ pub(crate) fn key_scroll(st: &ScrollState, key: &KeyEvent, page: u16) -> Option<
         KeyCode::PageUp | KeyCode::PageDown if st.max == 0 => None,
         KeyCode::PageUp => Some(ScrollAction::Scroll(step)),
         KeyCode::PageDown => Some(ScrollAction::Scroll(-step)),
-        KeyCode::End if st.offset > 0 => Some(ScrollAction::Scroll(-i32::MAX)),
         _ => None,
     }
 }
@@ -255,8 +266,13 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
         return false;
     }
 
-    // 终端坐标减掉内容区左上角，换算成 agent 画面里的坐标。任何一边越界
-    // （点在了边框、底栏上）就直接丢——那些地方压根不是 agent 的画面。
+    // 终端坐标减掉内容区左上角，换算成 agent 画面里的坐标。`checked_sub`
+    // 只挡得住点在边框上方/左方（结果会是负数）的那一半越界——点在内容区
+    // 右边或下边（底栏、右边框）的点击减完还是个合法的非负数，照样会被
+    // 转发过去，只是行/列比 agent 实际画面多出那么一两个。真实 agent 收到
+    // 一个越界的行列会直接忽略，不是活的 bug；真要在这里也挡住，需要的是
+    // 内容区的宽高（一个 Rect），而不是只有左上角这一个点——`screen_origin`
+    // 目前只存了原点，补一个矩形是下一次改这块的事，这次不做。
     let Some((col, row)) = app
         .screen_origin
         .and_then(|(c0, r0)| Some((m.column.checked_sub(c0)?, m.row.checked_sub(r0)?)))
@@ -462,6 +478,21 @@ mod tests {
     fn end_jumps_all_the_way_down() {
         let a = key_scroll(&own(false, 500, 40, 0), &key(KeyCode::End), 24).unwrap();
         assert!(matches!(a, ScrollAction::Scroll(n) if n == -i32::MAX));
+    }
+
+    /// B1 回归测试：一个命令跑完、agent 自己起了个会用鼠标的 pager/TUI，
+    /// `agent_owns` 会在 offset 还没归零的时候就翻成真——这时候底栏还挂着
+    /// 「按 End 回到底部」，`End` 必须真的被 dct 吃掉，不能落进
+    /// `key_to_input` 当成一个普通键发给 agent（那边多半根本不理会，用户
+    /// 就被自己屏幕上唯一给出的指令坑在原地）。
+    #[test]
+    fn end_is_claimed_even_when_the_agent_now_owns_the_screen() {
+        let st = own(true, 500, 40, 0);
+        let a = key_scroll(&st, &key(KeyCode::End), 24).unwrap();
+        assert!(
+            matches!(a, ScrollAction::Scroll(n) if n == -i32::MAX),
+            "dct 还欠着 40 行没滚回去，agent_owns 翻了也不能让 End 变成死键"
+        );
     }
 
     #[test]
