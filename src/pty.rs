@@ -347,8 +347,11 @@ impl PtySession {
     /// 我们只负责别让 i32 加法溢出。
     pub fn scroll_by(&self, rows: i32) -> ScrollView {
         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
-        let max = probe_max(&mut parser);
+        // 顺序不能反：probe_max 会把偏移拨到顶当副作用（见它自己的文档），
+        // 先读 cur 再 probe_max，不然 cur 读到的永远是上一次探测剩下的
+        // max，而不是调用方真正的当前位置——增量滚动会变成每次都跳到顶。
         let cur = parser.screen().scrollback();
+        let max = probe_max(&mut parser);
         let target = if rows >= 0 {
             cur.saturating_add(rows as usize)
         } else {
@@ -620,6 +623,24 @@ mod tests {
         p.scroll_by(10);
         let st = p.scroll_by(-1000);
         assert_eq!(st.offset, 0, "往下翻过头就停在底部");
+    }
+
+    /// 回归测试：probe_max 会把偏移拨到顶当副作用，如果 scroll_by 先探测
+    /// 上限再读“当前”偏移，读到的就永远是上限本身，而不是上一次滚动
+    /// 停留的位置——每次增量滚动都会直接跳到最顶上。这里用一段远大于
+    /// 步长的历史，确保两次小步滚动不会撞到顶（撞顶的话，错误实现和
+    /// 正确实现会算出同一个答案，测不出问题）。
+    #[test]
+    fn scrolling_by_a_small_amount_twice_advances_instead_of_jumping_to_the_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), 200);
+        assert!(wait_for(&p, "line-200"));
+
+        let first = p.scroll_by(5);
+        assert_eq!(first.offset, 5, "第一次滚 5 行应该刚好停在 5");
+
+        let second = p.scroll_by(5);
+        assert_eq!(second.offset, 10, "第二次滚 5 行应该接着往上，不是跳回顶");
     }
 
     /// 这条测的是 vt100 的行为，不是我们的代码——但整个「新输出时画面不动」
