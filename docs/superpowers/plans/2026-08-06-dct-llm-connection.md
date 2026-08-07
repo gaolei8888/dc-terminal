@@ -1534,12 +1534,24 @@ pub fn llm_check() -> i32 {
             .cloned()
             .or_else(|| crate::profile::Profile::builtin(n))
     };
-    let oauth = |n: &str| match n {
-        "claude" | "kimi" | "glm" | "deepseek" | "qwen-api" => {
-            crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer)
-        }
-        "codex" => crate::llm::creds::read_codex_auth(),
-        _ => None,
+    // 修正（fix round 1 code review，CRITICAL）：这里原来把 kimi/glm/
+    // deepseek/qwen-api 也映射到 claude 的 OAuth。那四家的 `[api].base_url`
+    // 是它们自己的第三方服务器（api.moonshot.cn / open.bigmodel.cn /
+    // api.deepseek.com / dashscope.aliyuncs.com），`send_real` 会把凭据塞进
+    // `Authorization: Bearer` 头直接打过去——等于把用户的 Anthropic 登录态
+    // 发给了四家跟 Anthropic 毫无关系的第三方。规则钉死：一个 CLI 的
+    // OAuth 只能给它自己的端点用，不能给别家。kimi/glm/deepseek/qwen-api
+    // 跟用户没有任何 OAuth 关系，只能走用户自己填的 key。
+    //
+    // 映射拆成一个独立、可注入测试的 `oauth_lookup(name, claude, codex)`
+    // 函数（在 `cli.rs` 里），有一条测试钉死这四个名字永远拿不到别家的
+    // token，见 task-7-report.md 的 fix round 1 记录。
+    let oauth = |n: &str| {
+        oauth_lookup(
+            n,
+            &|| crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer),
+            &crate::llm::creds::read_codex_auth,
+        )
     };
 
     println!("provider: {}", cfg.llm.provider);
@@ -1590,6 +1602,23 @@ The CLI transport resolves to Inherit and consults no credential store at
 all. Adds 'dct llm check', which runs the configured connection for real —
 this is what makes the 'verified against a live endpoint' bar checkable."
 ```
+
+**Fix round 1（code review）：** 除了上面已经改掉的 vendor→Claude-OAuth 映射
+（CRITICAL）之外，同一轮还发现并修了三处，全部记在
+`.superpowers/sdd/2026-08-06-dct-llm-connection/task-7-report.md`：
+
+- 凭据顺序（key 优先于 OAuth）之前没有测试同时喂 key 和 OAuth，翻转
+  `.or_else()` 顺序也能全绿——补了 `an_explicit_key_outranks_an_oauth_token_found_elsewhere`，把这条顺序拆成独立的 `select_credential` 函数以便直接测。
+- 为了让 `.unwrap_err()` 编译通过，曾经给 `dyn Backend` 加了一个只为测试
+  存在的 `Debug` 实现——已撤掉，改用 `matches!` 断言，不需要 `T: Debug`。
+- `describe()` 的四句话原样带着 `provider`/`transport`/`cli` 这些内部
+  字段名，测试也弱到 `"x xxxxxxxxx"` 都能过——文案改成不含内部字段名/
+  类型名的大白话，测试改成查具体禁词 + 查真实存在的下一步动作。
+
+另外顺手修了两处「便宜」的问题：HTTP 路径按 `Wire` 区分
+（`/v1/messages` vs `/v1/chat/completions`，写死前者会让 OpenAI 型端点
+404），以及 `cfg.llm.model` 为空时不再瞎猜 `claude-3-5-sonnet`，改成
+`ResolveError::NoModel` 让用户自己填。
 
 ---
 

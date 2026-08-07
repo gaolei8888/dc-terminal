@@ -235,6 +235,35 @@ pub fn run_prune(sock: &Path, lang: Lang) -> Result<()> {
     Ok(())
 }
 
+/// 一个 provider 只能拿到**它自己厂商**的 OAuth，绝不能拿别家的。
+///
+/// CRITICAL（见 review）：这里曾经把 kimi / glm / deepseek / qwen-api 也映射
+/// 到 `read_claude_oauth()`，而 `send_real`（`src/llm/http.rs`）会把凭据
+/// 塞进 `Authorization: Bearer` 头直接打给这些 profile 自己的 `[api].base_url`
+/// （api.moonshot.cn / open.bigmodel.cn / api.deepseek.com /
+/// dashscope.aliyuncs.com）——等于把用户的 Anthropic 登录态发给了四家
+/// 跟 Anthropic 毫无关系的第三方服务器。claude 本身又没有 `[api]` 块
+/// （它走官方端点，靠 CLI 自己登录），所以那个分支唯一能真正走到的效果
+/// 就是把 token 发给别家。
+///
+/// 规则钉死：**一个 CLI 的 OAuth 只能给它自己的端点用。** kimi/glm/
+/// deepseek/qwen-api 跟用户没有任何 OAuth 关系，只能走用户自己填的 key
+/// （`resolve::resolve` 里 key 优先于 OAuth 那条顺序保证了这一点）。
+/// 不要再把它们加回 claude 或 codex 的分支。
+///
+/// `claude`/`codex` 两个闭包注入是为了测试不用碰真实 Keychain / `auth.json`。
+fn oauth_lookup(
+    name: &str,
+    claude: &dyn Fn() -> Option<crate::llm::creds::Credential>,
+    codex: &dyn Fn() -> Option<crate::llm::creds::Credential>,
+) -> Option<crate::llm::creds::Credential> {
+    match name {
+        "claude" => claude(),
+        "codex" => codex(),
+        _ => None,
+    }
+}
+
 /// `dct llm check`：把配置里那条 LLM 连接真的跑一次。
 ///
 /// 这条命令**就是**「配置写完还要真打端点验过」那条验收标准的载体。
@@ -252,12 +281,12 @@ pub fn llm_check() -> i32 {
             .cloned()
             .or_else(|| crate::profile::Profile::builtin(n))
     };
-    let oauth = |n: &str| match n {
-        "claude" | "kimi" | "glm" | "deepseek" | "qwen-api" => {
-            crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer)
-        }
-        "codex" => crate::llm::creds::read_codex_auth(),
-        _ => None,
+    let oauth = |n: &str| {
+        oauth_lookup(
+            n,
+            &|| crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer),
+            &crate::llm::creds::read_codex_auth,
+        )
     };
 
     println!("provider: {}", cfg.llm.provider);
@@ -294,6 +323,36 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// CRITICAL fix pin: `oauth_lookup` 曾经把 kimi/glm/deepseek/qwen-api
+    /// 也映射到 claude 的 OAuth，等于把用户的 Anthropic 登录态发给了四家
+    /// 毫不相关的第三方服务器（见 `oauth_lookup` 上的注释）。这里钉死
+    /// 只有 claude 拿得到 claude 自己的 token、codex 拿得到 codex 自己的
+    /// token，其余名字一律 `None`——不管注入的 `claude`/`codex` 闭包
+    /// 返回什么。两个闭包都是假的，测试不碰真实 Keychain / `auth.json`。
+    #[test]
+    fn oauth_lookup_never_offers_one_vendors_token_to_another() {
+        use crate::llm::creds::Credential;
+
+        let claude = || Some(Credential::Bearer("claude-token".into()));
+        let codex = || Some(Credential::Bearer("codex-token".into()));
+
+        assert_eq!(
+            oauth_lookup("claude", &claude, &codex),
+            Some(Credential::Bearer("claude-token".into()))
+        );
+        assert_eq!(
+            oauth_lookup("codex", &claude, &codex),
+            Some(Credential::Bearer("codex-token".into()))
+        );
+        for vendor in ["kimi", "glm", "deepseek", "qwen-api"] {
+            assert_eq!(
+                oauth_lookup(vendor, &claude, &codex),
+                None,
+                "{vendor} 没有自己的 OAuth 关系，不该拿到别家的凭据"
+            );
+        }
     }
 
     /// **不给参数不能等于全停。** `dct stop` 是最容易手滑敲出来的形式，
