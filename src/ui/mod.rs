@@ -1,6 +1,8 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -82,11 +84,30 @@ pub fn dim() -> Style {
 /// 「尽量多还原一点」。
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    // 无条件关鼠标捕获，不管这次运行有没有真的开过：没开过时多发一次关闭
+    // 序列是无害的，而漏关会让用户的终端从此点哪儿都冒出 SGR 乱码——
+    // 比翻不了历史严重得多，所以这里不像捕获本身那样只在会话里才动作。
     let _ = execute!(
         std::io::stdout(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     );
+}
+
+/// 这一帧要不要开关鼠标捕获。`None` = 上一帧和这一帧「在不在会话里」
+/// 没变，什么都不用做。
+///
+/// 抽成纯函数是因为副作用（`execute!` 往 stdout 写转义序列）没法单测，
+/// 判断「变没变」这件事能测——而且判断错了后果不轻：漏开会让滚轮/点击
+/// 走终端自己的选中逻辑而不是这套协议，漏关会让用户退回看板之后连
+/// 拖选文字复制都做不了。
+fn mouse_capture_transition(was_attached: bool, is_attached: bool) -> Option<bool> {
+    if was_attached == is_attached {
+        None
+    } else {
+        Some(is_attached)
+    }
 }
 
 /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
@@ -179,8 +200,18 @@ pub fn run(
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
+    // 鼠标捕获只在会话里开：看板不需要滚，而开着捕获会让终端原生的选中
+    // 复制失效——把这个代价限制在真正需要它的地方。见下面 `term.draw`
+    // 之前那段每帧检查一次的逻辑，以及它为什么不挂在某一个「进入会话」的
+    // 分支上（进 `View::Attached` 的路不止一条：`enter_session`、密钥验证
+    // 通过后直接建会话、九宫格里……挂哪个分支都会漏另一条）。
+    let mut mouse_captured = false;
 
-    loop {
+    // 有标签是因为下面排空鼠标事件那段需要从一个嵌套的 `while` 里跳回
+    // 这个循环的顶部，而不是跳回 `while` 自己——普通的无标签 `continue`
+    // 已经覆盖了这个函数里所有别的 `continue`，不用因为加了一个标签
+    // 就把它们全部改成 `continue 'main`。
+    'main: loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
         if let Some(rx) = &app.verify_rx {
@@ -433,9 +464,13 @@ pub fn run(
                     lines,
                     cursor,
                     state,
+                    scroll,
                 }) => {
                     app.screen = lines;
                     app.screen_cursor = cursor;
+                    // 按键和滚轮怎么分流、底栏那句提示写什么，都看这一份——
+                    // 每 16ms 跟着 `Screen` 一起刷新，滞后最多一帧，够用了。
+                    app.scroll = scroll;
                     app.connected = true;
                     // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
@@ -493,6 +528,22 @@ pub fn run(
             }
         }
 
+        // 检查一次「在不在会话里」有没有变，而不是在每个能进/出 `View::Attached`
+        // 的分支各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
+        // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
+        // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
+        // 会话已结束……）到这里都已经跑完，此刻的 `app.view` 就是即将画出来
+        // 的那一帧。
+        let is_attached = matches!(app.view, View::Attached(_));
+        if let Some(enable) = mouse_capture_transition(mouse_captured, is_attached) {
+            let _ = if enable {
+                execute!(std::io::stdout(), EnableMouseCapture)
+            } else {
+                execute!(std::io::stdout(), DisableMouseCapture)
+            };
+            mouse_captured = enable;
+        }
+
         term.draw(|f| draw(f, &mut app))?;
 
         // 会话里要跟手：刷新慢了，你敲的字要等下一轮才显示，每次按键都像卡了一下。
@@ -501,7 +552,39 @@ pub fn run(
         if !event::poll(Duration::from_millis(tick))? {
             continue;
         }
-        let ev = event::read()?;
+        let mut ev = event::read()?;
+        // 鼠标事件在这里先摘出来单独处理，而且可能不止吃掉这一个：见下面
+        // 的注释。这个 `while` 结束之后，`ev` 保证不再是 `Event::Mouse`，
+        // 后面的 Paste/Key 分支照旧用它。
+        //
+        // 循环体里对 `handle_mouse` 的调用不违反房规（见 `attach::handle_key`
+        // 头上「永远不要 continue」那条）——它压根不 continue，只是被这个
+        // `while` 循环调用；`continue 'main` 才是真正跳过循环末尾清理
+        // `message` 那段的地方，而 `handle_mouse` 内部**不许**碰
+        // `app.message`，那条约束写在它自己的文档注释上，不受这里怎么
+        // 调用它影响。
+        while let Event::Mouse(m) = ev {
+            let acted = attach::handle_mouse(&mut app, m);
+            if acted {
+                // 真的送出了一次请求（滚动了、转发了点击/松开）：状态可能
+                // 变了，照旧走一次完整的循环体去重新取一遍 Screen、重绘。
+                continue 'main;
+            }
+            // 没做事的绝大多数是纯移动——`EnableMouseCapture` 打开的
+            // `?1003h` 是任意移动追踪，跟 agent 有没有订阅无关，鼠标扫一下
+            // 80 列宽的窗口就是几十个这种事件，`handle_mouse` 早就把它们
+            // 原地丢掉了（见它的文档）。问题是外层 `continue` 会把「取一次
+            // Screen、画一帧」全套重放一遍——用一个被丢弃的小事件换来一次
+            // 昂贵的守护进程往返和终端重绘，跟当初「移动事件不转发是为了
+            // 省流量」的初衷正好背道而驰。这里原地看一眼有没有紧跟着到达
+            // 的下一个事件：有就继续在这个 `while` 里处理掉，没有就老实
+            // 结束这一轮——不需要刷新时最多等到下一次自然的 16ms/150ms
+            // tick，不会更旧，只是不为每一个被丢弃的移动事件单独刷一次。
+            if !event::poll(Duration::from_millis(0))? {
+                continue 'main;
+            }
+            ev = event::read()?;
+        }
         // 粘贴整段一次发完，不能拆成一个个字符
         if let Event::Paste(text) = ev {
             match &mut app.view {
@@ -823,6 +906,29 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 又回来之间恢复过、再坏过一次，缓存里那份还是上上次失败的旧话，
     // 不清掉的话 `run()` 主循环会以为「问过了」，永远不会去问新的那次。
     app.explained_failure = None;
+    // CONTROLLER RULING：进入会话视图一律落在底部，不管上次离开时翻到
+    // 哪儿了、也不管这一次算不算「换了个尺寸」。
+    //
+    // 原来落地在哪儿全看 `run()` 主循环里那条按 `sent_size` 判断要不要发
+    // `Request::Resize` 的分支——`SessionManager::resize` 顺手把 scroll 归了
+    // 零，于是「回不回底部」变成了一个跟尺寸缓存打不打得上的意外结果：
+    // 切到另一个会话再回来，id 变了，`sent_size` 不匹配，触发 Resize，
+    // 顺带回到底部；按 F2 回看板、什么都没点、又直接 Enter 回同一个会话，
+    // `sent_size` 还对得上，Resize 不发，人就诡异地卡在几十行之前翻到的
+    // 地方——同一个「回来看看」的意图，走两条路给两种结果。
+    //
+    // 离开了再回来，用户要看的是最新输出，不是他上次读到一半的历史——
+    // 一种可预期的行为好过两种碰运气的。所以这里直接、明确地发一次
+    // `Scroll::Bottom`，不再借 `sent_size`/`Resize` 的副作用捎带出来。
+    // 失败就静默：跟 `handle_key` 里滚动请求失败的处理一样，这不是用户
+    // 当下敲的一个键，没反应分不清是卡顿还是断连，下一帧的 `Screen`
+    // 探测自然会把 `connected` 标成假。
+    let _ = app.client().and_then(|c| {
+        c.call(Request::Scroll {
+            id,
+            by: crate::session::ScrollBy::Bottom,
+        })
+    });
 }
 
 /// 把守护进程报回来的一串警告码组成一行人话。
@@ -1239,10 +1345,21 @@ fn draw(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Red),
         )
     } else if app.message.text.is_empty() {
-        (
-            BarContent::Keys(idle_help(&app.view, app.scope, app.lang, help_ctx(app))),
-            Style::default(),
-        )
+        // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
+        // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
+        // 只在 `message` 为空这一支里问它：`message` 优先在外层 if/else
+        // 链上已经保证了（见函数头注释），这里不用重复判断。
+        let scroll_hint = match &app.view {
+            View::Attached(_) => attach::scroll_hint(&app.scroll, app.lang),
+            _ => None,
+        };
+        match scroll_hint {
+            Some(hint) => (BarContent::Text(hint), Style::default()),
+            None => (
+                BarContent::Keys(idle_help(&app.view, app.scope, app.lang, help_ctx(app))),
+                Style::default(),
+            ),
+        }
     } else if app.message.error {
         (
             BarContent::Text(app.message.text.clone()),
@@ -1414,6 +1531,132 @@ mod tests {
             app.explained_failure, None,
             "进入会话必须当成一次全新的观察，不能继续顶着上一次的缓存"
         );
+    }
+
+    /// F7 回归测试：re-entering 落在底部必须是 `enter_session` 自己主动做的
+    /// 一件事，不能是靠 `run()` 主循环里 `sent_size` 变了才顺带触发的
+    /// `Resize` 副作用——不然「F3 直接切会话」（id 变了，`sent_size` 跟着
+    /// 变）和「F2 回看板、原地 Enter 回同一个会话」（id 没变，`sent_size`
+    /// 照样对得上，`Resize` 根本不会发）会给出两种不同的结果，同一个「回
+    /// 来看看」的意图，一半时候把用户按第一种方式接回底部，另一半晾在
+    /// 半空。
+    ///
+    /// 这条测试故意不走 `run()`、不发任何 `Resize`，只直接调
+    /// `enter_session`：起一个真守护进程，攒出足够滚屏、真的往上翻一截，
+    /// 确认 offset 确实大于零；然后单独调 `enter_session`（模拟"已经在看
+    /// 这个会话，只是重新点了一下进来"，没有任何尺寸变化可以触发
+    /// Resize），如果 offset 归零了，只能是这次改动新加的那次显式
+    /// `Request::Scroll { by: Bottom }` 干的。
+    #[test]
+    fn entering_a_session_always_lands_at_the_bottom_even_without_a_resize() {
+        use crate::client::Client;
+        use crate::proto::{Request, Response};
+        use crate::session::ScrollBy;
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(Instant::now() < deadline, "daemon 没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut c = Client::connect(&sock).unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let id = match c
+            .call(Request::Create {
+                dir: workdir.path().display().to_string(),
+                profile: "shell".into(),
+                remember: false,
+            })
+            .unwrap()
+        {
+            Response::Created { id } => id,
+            other => panic!("预期 Created，实际 {other:?}"),
+        };
+
+        // 攒够滚屏内容：跟 `session.rs` 里 `scrolling_session` 用的是同一种
+        // POSIX 循环，不挑具体 shell。
+        c.call(Request::Input {
+            id,
+            text: "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done\n".into(),
+        })
+        .unwrap();
+
+        let screen = |c: &mut Client| -> (String, crate::session::ScrollState) {
+            match c.call(Request::Screen { id }).unwrap() {
+                Response::Screen { lines, scroll, .. } => {
+                    let text = lines
+                        .iter()
+                        .flat_map(|l| l.iter())
+                        .map(|s| s.text.as_str())
+                        .collect::<String>();
+                    (text, scroll)
+                }
+                other => panic!("预期 Screen，实际 {other:?}"),
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (text, scroll) = screen(&mut c);
+            if text.contains("line-200") && scroll.max > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "没等到滚屏内容攒够");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        c.call(Request::Scroll {
+            id,
+            by: ScrollBy::Rows(20),
+        })
+        .unwrap();
+        let (_, scroll) = screen(&mut c);
+        assert!(scroll.offset > 0, "先确认真的往上翻了，不然下面测的是空话");
+
+        // 模拟「已经在看这个会话，重新进来一次」——不经过 `run()`，直接调
+        // `enter_session`：这条路径上没有任何 Resize 会发生。
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            workdir.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+        app.sessions = vec![SessionInfo {
+            id,
+            profile: "shell".into(),
+            dir: workdir.path().display().to_string(),
+            state: SessionState::Working,
+            activity: String::new(),
+            is_agent: false,
+        }];
+        app.current_dir = workdir.path().to_path_buf();
+        app.view = View::Board;
+
+        enter_session(&mut app, id);
+
+        // `enter_session` 发的 Scroll 请求是异步落地的——给它一点时间，
+        // 不是靠 sleep 赌运气，是轮询到超时才认输。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, scroll_after) = screen(&mut c);
+            if scroll_after.offset == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "重新进入会话必须落在底部，不能停在离开前翻到的地方：offset={}",
+                scroll_after.offset
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -2191,5 +2434,114 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
         assert!(c.contains("u回滚"), "看板要显示自己的按键表：{c}");
+    }
+
+    #[test]
+    fn a_scroll_hint_takes_over_the_bottom_bar_when_there_is_history() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.scroll = crate::session::ScrollState {
+            agent_owns: false,
+            alt_screen: false,
+            max: 500,
+            offset: 40,
+            new_lines: 0,
+        };
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        // `App::test_app()` 默认 `Lang::Zh`，所以断言实际渲染出来的整句话
+        // （`i18n::msg::scrolled_up` 的中文版，空白已被上面的 filter 去掉），
+        // 不是随便抓两个数字——数字对了但拼错了别的字、或者 offset 算错但
+        // 凑巧还是两位数，光查「有没有 4 和 0」都抓不出来。
+        assert!(
+            c.contains("已往上翻40行·按End回到底部"),
+            "翻到哪儿了、怎么回去都要原样写在底栏：{c}"
+        );
+        assert!(
+            !c.contains("F3下一个会话"),
+            "有滚动提示可显示时，不该再挤按键表：{c}"
+        );
+    }
+
+    /// 消息和滚动提示抢同一行时消息赢——消息是对用户刚才那个动作的回应，
+    /// 滚动提示是持续状态，盖掉前者会让用户以为自己那步操作没反应。
+    #[test]
+    fn a_message_beats_the_scroll_hint() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.scroll = crate::session::ScrollState {
+            agent_owns: false,
+            alt_screen: false,
+            max: 500,
+            offset: 40,
+            new_lines: 0,
+        };
+        app.message = "已切到某个项目".into();
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        assert!(c.contains("已切到某个项目"), "消息该赢，没显示出来：{c}");
+        assert!(!c.contains("按End回到底部"), "滚动提示不该盖过消息：{c}");
+    }
+
+    /// F6 回归测试：英文滚动提示走的是 `BarContent::Text`，`wrap_help`
+    /// 只在连续两个空格的地方才折行，而这句提示全是单空格，放不下就不是
+    /// 折行，是被 `Paragraph`（没挂 `.wrap()`）直接从右边截断。原来的
+    /// "↑ Scrolled up 40 line(s) · press End to jump back down" 有 54 列，
+    /// 底栏右段宽度是「终端总宽 − 23」，55 列的终端只有 32 列可用——刚好
+    /// 卡在「怎么回去」那半句中间，`End` 整个词被截没了：这个宽度算出的
+    /// 切点（`old[:32]`）落在 "press " 之后、"End" 之前，用户会看到自己
+    /// 正翻着历史，却读不到任何一个字告诉他怎么回去。缩短后的新版本
+    /// （28 列）在同样的宽度下完整放得下。
+    #[test]
+    fn the_way_back_survives_a_narrow_terminal() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(55, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.lang = crate::i18n::Lang::En;
+        app.scroll = crate::session::ScrollState {
+            agent_owns: false,
+            alt_screen: false,
+            max: 500,
+            offset: 40,
+            new_lines: 0,
+        };
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        assert!(
+            c.contains("End"),
+            "55 列的终端上，用户翻到哪儿都不该看不到怎么回去：{c}"
+        );
+    }
+
+    /// 副作用（`execute!` 往 stdout 写转义序列）没法单测，但「这一帧该不该
+    /// 动一下捕获」这个判断能测——`run()` 每帧都靠它决定要不要发
+    /// `EnableMouseCapture`/`DisableMouseCapture`，判断错了要么漏开
+    /// （滚轮/点击走了终端自己的逻辑）要么漏关（退回看板还拖选不了文字）。
+    #[test]
+    fn mouse_capture_toggles_only_on_a_real_transition() {
+        assert_eq!(mouse_capture_transition(false, false), None);
+        assert_eq!(mouse_capture_transition(true, true), None);
+        assert_eq!(mouse_capture_transition(false, true), Some(true));
+        assert_eq!(mouse_capture_transition(true, false), Some(false));
     }
 }

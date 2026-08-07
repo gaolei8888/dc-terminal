@@ -259,17 +259,18 @@ fn handle(
             r
         }
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
-        Request::Screen { id } => mgr
-            .screen(id)
-            .map(|(lines, cursor, state)| Response::Screen {
-                lines,
-                cursor,
-                state,
-            }),
+        Request::Screen { id } => mgr.screen(id).map(|snap| Response::Screen {
+            lines: snap.lines,
+            cursor: snap.cursor,
+            state: snap.state,
+            scroll: snap.scroll,
+        }),
         Request::Screens { ids } => Ok(Response::Screens {
             screens: mgr.screens(&ids),
         }),
         Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
+        Request::Scroll { id, by } => mgr.scroll(id, by).map(Response::Scrolled),
+        Request::Mouse { id, event } => mgr.forward_mouse(id, event).map(|_| Response::Ok),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
         Request::Kill { id } => mgr.kill(id).map(|_| Response::Ok),
         Request::Prune => Ok(Response::Pruned(mgr.prune())),

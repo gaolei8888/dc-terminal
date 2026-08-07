@@ -59,6 +59,40 @@ pub struct ScreenSpan {
     pub style: ScreenStyle,
 }
 
+/// 每个会话保留多少行滚出屏幕的内容。
+///
+/// 写死不做配置项：用户不该被问这个数字。vt100 0.16 的 `Cell` 正好 32
+/// 字节（crate 自己拿 `const _: () = assert!(size_of::<Cell>() == 32)`
+/// 钉死的，不是估的），120 列一行约 3.75 KB，2000 行满载约 7.5 MB/会话。
+/// 底下是 `VecDeque`，按实际用量增长，2000 是天花板不是预分配——但
+/// `vt100::Row::new` 是 `vec![Cell::new(); cols]`，一整行的 cell 一次性
+/// 分配好，不是按字符数惰性长的，所以「按用量增长」说的是行数（有多少行
+/// 曾经滚出过屏幕），不是每行占的字节数。
+///
+/// 停掉但没被 `prune` 的会话，parser（连带它这 2000 行上限的缓冲）会一直
+/// 活着：`SessionManager::stop` 只杀子进程，`Session` 和它的 parser 要等
+/// 有人显式调 `prune`，而这条路径没有自动触发者。所以一个「跑过一阵、
+/// 已经停了、还没被清理」的会话，从这份滚屏加进来之前只占几十 KB（没有
+/// 滚屏缓冲的年代），现在可能占到几 MB——这个代价是故意咽下去的：停掉的
+/// 会话还能被附加进去回看它做过什么（`u` 回滚、`d` 看改动都要读这份历史），
+/// 提前把它砍掉就是砍掉这个功能。写在这儿是为了不让下一个读到内存占用
+/// 报表偏高的人凭空怀疑这是个泄漏。
+pub const SCROLLBACK_ROWS: usize = 2000;
+
+/// pty 层看到的滚动事实。
+///
+/// `agent_owns` 是整个滚屏设计的分流开关：agent 开了鼠标上报就说明它自己
+/// 管视口（Claude Code 就是这样），滚轮该转发给它；没开就由 dct 滚自己的
+/// 缓冲（codex、命令行）。这两个真实 agent 在「用不用备用屏」上正好相反，
+/// 所以判据只能是鼠标，不能是备用屏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollView {
+    pub offset: usize,
+    pub max: usize,
+    pub agent_owns: bool,
+    pub alt_screen: bool,
+}
+
 pub struct PtySession {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -116,7 +150,7 @@ impl PtySession {
             crate::proto::coded(crate::proto::ErrorCode::CannotStart(cmd[0].clone()))
         })?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_ROWS)));
         let writer = Arc::new(Mutex::new(pty.master.take_writer()?));
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -162,6 +196,7 @@ impl PtySession {
         self.parser
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .screen_mut()
             .set_size(rows, cols);
         Ok(())
     }
@@ -206,7 +241,7 @@ impl PtySession {
                     let text = if text.is_empty() {
                         " ".to_string()
                     } else {
-                        text
+                        text.to_string()
                     };
                     let style = ScreenStyle {
                         fg: cell.fgcolor().into(),
@@ -317,6 +352,175 @@ impl PtySession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .process_id()
+    }
+
+    /// 滚动并返回滚完之后的状态。正数往上翻进历史，负数往下。
+    ///
+    /// 钳位交给 vt100 自己做（`grid.rs:183-185` 会 `.min(scrollback.len())`），
+    /// 我们只负责别让 i32 加法溢出。
+    pub fn scroll_by(&self, rows: i32) -> ScrollView {
+        let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        // 顺序不能反：probe_max 会把偏移拨到顶当副作用（见它自己的文档），
+        // 先读 cur 再 probe_max，不然 cur 读到的永远是上一次探测剩下的
+        // max，而不是调用方真正的当前位置——增量滚动会变成每次都跳到顶。
+        let cur = parser.screen().scrollback();
+        let max = probe_max(&mut parser);
+        let target = if rows >= 0 {
+            cur.saturating_add(rows as usize)
+        } else {
+            cur.saturating_sub(rows.unsigned_abs() as usize)
+        };
+        parser.screen_mut().set_scrollback(target.min(max));
+        view_of(&parser, max)
+    }
+
+    pub fn scroll_to_bottom(&self) -> ScrollView {
+        let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        // probe_max 会把偏移推到顶，所以归零必须在它之后
+        let max = probe_max(&mut parser);
+        parser.screen_mut().set_scrollback(0);
+        view_of(&parser, max)
+    }
+
+    pub fn scroll_state(&self) -> ScrollView {
+        let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = parser.screen().scrollback();
+        let max = probe_max(&mut parser);
+        parser.screen_mut().set_scrollback(cur);
+        view_of(&parser, max)
+    }
+
+    /// 把鼠标事件按 agent 当前的模式写进 PTY。它不收鼠标就什么都不做——
+    /// 这是正常情况，不是错误。
+    pub fn write_mouse(&self, ev: crate::proto::MouseForward) -> Result<()> {
+        let bytes = {
+            let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+            let screen = parser.screen();
+            encode_mouse(
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+                &ev,
+            )
+        };
+        // 锁在上面那个块结束时就放掉了，`self.write()` 拿的是另一把锁。
+        // 同时握两把是死锁的开始，这个仓库在 `create()` 上已经吃过一次
+        // 「持锁做慢操作」的亏，别在这里重犯。
+        match bytes {
+            Some(b) => self.write(&b),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 把一个鼠标事件编码成 agent 当前订阅的那种格式。
+///
+/// `None` 表示「什么都别发」，有三种情况：agent 根本没开鼠标上报；
+/// 它只订阅了按下（X10）而这是个抬起；坐标大到默认编码装不下。
+/// 三种都是「发出去比不发更糟」——agent 会收到它没订阅的东西，
+/// 或者一个指向别处的坐标。
+pub fn encode_mouse(
+    mode: vt100::MouseProtocolMode,
+    enc: vt100::MouseProtocolEncoding,
+    ev: &crate::proto::MouseForward,
+) -> Option<Vec<u8>> {
+    use crate::proto::MouseForwardKind as K;
+    use vt100::MouseProtocolMode as M;
+
+    if mode == M::None {
+        return None;
+    }
+    let is_release = matches!(ev.kind, K::Release(_));
+    if is_release && mode == M::Press {
+        return None;
+    }
+
+    // 硬件按钮/滚轮方向对应的按钮号。
+    let raw_button = match ev.kind {
+        K::WheelUp => 64,
+        K::WheelDown => 65,
+        K::Press(b) | K::Release(b) => u32::from(b),
+    };
+    let mut modifiers = 0;
+    if ev.shift {
+        modifiers += 4;
+    }
+    if ev.alt {
+        modifiers += 8;
+    }
+    if ev.ctrl {
+        modifiers += 16;
+    }
+
+    // SGR 在 release 时照实发按钮号——这也是 SGR 存在的理由之一：legacy
+    // 协议做不到。legacy 协议（Default/Utf8）的 Cb/Cx/Cy 结构里没有「哪个
+    // 按钮松开了」这回事，xterm 规定 release 一律用哨兵值 3；重用按钮号
+    // 会让 agent 把「松开」读成「同一个按钮又按了一次」，拖拽/选区状态
+    // 就跟着错位——这正是本函数文档说的「发出去比不发更糟」，只是这次
+    // 错的是事件类型而不是坐标。两种编码的按钮号分开算，别混用。
+    let sgr_button = raw_button + modifiers;
+    let legacy_button = (if is_release { 3 } else { raw_button }) + modifiers;
+
+    // 终端协议的坐标是 1 起算的，我们内部是 0 起算的
+    let col = u32::from(ev.col) + 1;
+    let row = u32::from(ev.row) + 1;
+
+    match enc {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let end = if is_release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{sgr_button};{col};{row}{end}").into_bytes())
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            // ?1005 把 32+值 当 Unicode 码点、按 UTF-8 编码，不是原始字节——
+            // 值一旦到 128 就跨进两字节范围（0x80..=0x7FF）。照 Default 那样
+            // 直接吐单字节，只要列号 >= 96（32+97=129）就会吐出一个不合法
+            // 的独立字节，把 agent 之后的整段解析都带崩，不只是这一次
+            // 事件坐标读错。
+            //
+            // 两字节 UTF-8 能装下的最大码点是 0x7FF（2047），减掉固定加的
+            // 32，单个值最大能到 2015——这也是 xterm 文档里「行列最大到
+            // 2015」的来历。超过就装不下，宁可不发。
+            const UTF8_MOUSE_MAX: u32 = 2015;
+            if legacy_button > UTF8_MOUSE_MAX || col > UTF8_MOUSE_MAX || row > UTF8_MOUSE_MAX {
+                return None;
+            }
+            let mut s = String::from("\x1b[M");
+            s.push(char::from_u32(32 + legacy_button)?);
+            s.push(char::from_u32(32 + col)?);
+            s.push(char::from_u32(32 + row)?);
+            Some(s.into_bytes())
+        }
+        vt100::MouseProtocolEncoding::Default => {
+            // 单字节形式一个值最多编到 255（= 32+223），也就是值本身不能
+            // 超过 223；发一个装不下的坐标比不发更糟，agent 会以为你点在
+            // 别处。
+            let b = 32u32.checked_add(legacy_button)?;
+            let c = 32u32.checked_add(col)?;
+            let r = 32u32.checked_add(row)?;
+            if b > 255 || c > 255 || r > 255 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', b as u8, c as u8, r as u8])
+        }
+    }
+}
+
+/// vt100 不公开「现在攒了多少行历史」。但 `set_scrollback` 内部会
+/// `.min(scrollback.len())` 钳一次，所以设一个大得离谱的值再读回来，
+/// 读到的就是真实上限。三次字段写，不分配不拷贝。
+///
+/// **调用方负责把偏移放回去**——这个函数会改变它。
+fn probe_max(parser: &mut vt100::Parser) -> usize {
+    parser.screen_mut().set_scrollback(usize::MAX);
+    parser.screen().scrollback()
+}
+
+fn view_of(parser: &vt100::Parser, max: usize) -> ScrollView {
+    let screen = parser.screen();
+    ScrollView {
+        offset: screen.scrollback(),
+        max,
+        agent_owns: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+        alt_screen: screen.alternate_screen(),
     }
 }
 
@@ -482,5 +686,425 @@ mod tests {
             );
             sleep(Duration::from_millis(50));
         }
+    }
+
+    /// 造一个吐 N 行然后挂着不退的会话
+    fn spawn_lines(dir: &Path, n: usize) -> PtySession {
+        PtySession::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done; sleep 30"),
+            ],
+            &Default::default(),
+            dir,
+            24,
+            80,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn keeps_history_that_scrolled_off_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), 100);
+        assert!(wait_for(&p, "line-100"));
+
+        // 屏幕只有 24 行，line-1 早就滚出去了
+        assert!(!p.screen_text().contains("line-1\n"));
+
+        p.scroll_by(90);
+        assert!(
+            p.screen_text().contains("line-1\n"),
+            "往上翻 90 行应该能看见最早那行"
+        );
+    }
+
+    #[test]
+    fn history_is_capped_at_the_configured_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), SCROLLBACK_ROWS + 500);
+        assert!(wait_for(&p, &format!("line-{}", SCROLLBACK_ROWS + 500)));
+
+        let st = p.scroll_state();
+        assert_eq!(st.max, SCROLLBACK_ROWS, "上限就是上限，不能无限涨");
+    }
+
+    #[test]
+    fn scrolling_past_the_top_stops_at_the_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), 50);
+        assert!(wait_for(&p, "line-50"));
+
+        let st = p.scroll_by(i32::MAX);
+        assert_eq!(st.offset, st.max, "翻到头就停在头，不能溢出");
+    }
+
+    #[test]
+    fn scrolling_below_the_bottom_stops_at_the_bottom() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), 50);
+        assert!(wait_for(&p, "line-50"));
+
+        p.scroll_by(10);
+        let st = p.scroll_by(-1000);
+        assert_eq!(st.offset, 0, "往下翻过头就停在底部");
+    }
+
+    /// 回归测试：probe_max 会把偏移拨到顶当副作用，如果 scroll_by 先探测
+    /// 上限再读“当前”偏移，读到的就永远是上限本身，而不是上一次滚动
+    /// 停留的位置——每次增量滚动都会直接跳到最顶上。这里用一段远大于
+    /// 步长的历史，确保两次小步滚动不会撞到顶（撞顶的话，错误实现和
+    /// 正确实现会算出同一个答案，测不出问题）。
+    #[test]
+    fn scrolling_by_a_small_amount_twice_advances_instead_of_jumping_to_the_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), 200);
+        assert!(wait_for(&p, "line-200"));
+
+        let first = p.scroll_by(5);
+        assert_eq!(first.offset, 5, "第一次滚 5 行应该刚好停在 5");
+
+        let second = p.scroll_by(5);
+        assert_eq!(second.offset, 10, "第二次滚 5 行应该接着往上，不是跳回顶");
+    }
+
+    /// 这条测的是 vt100 的行为，不是我们的代码——但整个「新输出时画面不动」
+    /// 的设计都压在它上面（grid.rs:556-558）。它哪天变了，这里要第一个响。
+    #[test]
+    fn the_view_stays_put_when_new_output_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = PtySession::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "i=1; while [ $i -le 60 ]; do echo line-$i; i=$((i+1)); done; \
+                 sleep 1; echo MARKER-NEW; sleep 30"
+                    .to_string(),
+            ],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&p, "line-60"));
+
+        let before = p.scroll_by(30);
+        assert!(wait_for_offset_to_grow(&p, before.offset));
+
+        let after = p.scroll_state();
+        assert!(
+            after.offset > before.offset,
+            "来了新行，偏移要跟着涨，画面才不动：{} -> {}",
+            before.offset,
+            after.offset
+        );
+    }
+
+    fn wait_for_offset_to_grow(p: &PtySession, from: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if p.scroll_state().offset > from {
+                return true;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn an_alternate_screen_app_has_no_history_to_scroll() {
+        let dir = tempfile::tempdir().unwrap();
+        // ESC[?1049h 进备用屏，然后吐一堆行
+        let p = PtySession::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[?1049h'; i=1; while [ $i -le 60 ]; do echo alt-$i; \
+                 i=$((i+1)); done; sleep 30"
+                    .to_string(),
+            ],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&p, "alt-60"));
+
+        let st = p.scroll_state();
+        assert!(st.alt_screen, "应该认出它在备用屏上");
+        assert_eq!(st.max, 0, "备用屏上没有历史，这跟真实终端一致");
+    }
+
+    /// 程序设了滚动区（DECSTBM）之后，vt100 不往 scrollback 里塞任何东西
+    /// （grid.rs:551）。这不是我们能改的，但界面要能认出「这里翻不了」
+    /// 而不是让用户对着一个没反应的滚轮猜。
+    #[test]
+    fn a_scroll_region_swallows_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = PtySession::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[1;20r'; i=1; while [ $i -le 60 ]; do echo rgn-$i; \
+                 i=$((i+1)); done; sleep 30"
+                    .to_string(),
+            ],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&p, "rgn-60"));
+        assert_eq!(p.scroll_state().max, 0);
+    }
+
+    #[test]
+    fn a_plain_shell_does_not_own_the_scrolling() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = spawn_lines(dir.path(), 10);
+        assert!(wait_for(&p, "line-10"));
+        assert!(
+            !p.scroll_state().agent_owns,
+            "没开鼠标上报的程序，滚轮归 dct"
+        );
+    }
+
+    #[test]
+    fn an_app_that_asks_for_the_mouse_owns_the_scrolling() {
+        let dir = tempfile::tempdir().unwrap();
+        // ESC[?1000h 开鼠标上报，跟 Claude Code 实测抓到的一样
+        let p = PtySession::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[?1000h'; echo mouse-on; sleep 30".to_string(),
+            ],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&p, "mouse-on"));
+        assert!(p.scroll_state().agent_owns);
+    }
+
+    use crate::proto::{MouseForward, MouseForwardKind};
+
+    fn ev(kind: MouseForwardKind, col: u16, row: u16) -> MouseForward {
+        MouseForward {
+            col,
+            row,
+            kind,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        }
+    }
+
+    #[test]
+    fn sgr_encodes_a_wheel_scroll() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::AnyMotion,
+            vt100::MouseProtocolEncoding::Sgr,
+            &ev(MouseForwardKind::WheelUp, 10, 20),
+        )
+        .unwrap();
+        // 坐标是 1 起算的，所以 10,20 变成 11,21
+        assert_eq!(out, b"\x1b[<64;11;21M".to_vec());
+    }
+
+    #[test]
+    fn sgr_wheel_down_uses_a_different_button_code() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::AnyMotion,
+            vt100::MouseProtocolEncoding::Sgr,
+            &ev(MouseForwardKind::WheelDown, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(out, b"\x1b[<65;1;1M".to_vec());
+    }
+
+    #[test]
+    fn sgr_marks_release_with_a_lowercase_m() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Sgr,
+            &ev(MouseForwardKind::Release(0), 4, 5),
+        )
+        .unwrap();
+        assert_eq!(out, b"\x1b[<0;5;6m".to_vec());
+    }
+
+    #[test]
+    fn modifiers_are_added_to_the_button_code() {
+        let mut e = ev(MouseForwardKind::Press(0), 0, 0);
+        e.shift = true;
+        e.ctrl = true;
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Sgr,
+            &e,
+        )
+        .unwrap();
+        // 0 + 4(shift) + 16(ctrl) = 20
+        assert_eq!(out, b"\x1b[<20;1;1M".to_vec());
+    }
+
+    #[test]
+    fn default_encoding_uses_the_single_byte_form() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 10, 20),
+        )
+        .unwrap();
+        // 32+0, 32+11, 32+21
+        assert_eq!(out, vec![0x1b, b'[', b'M', 32, 43, 53]);
+    }
+
+    #[test]
+    fn default_encoding_refuses_coordinates_it_cannot_express() {
+        // 单字节形式最多到 223；发一个截断的坐标会让 agent 以为你点在别处
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 300, 5),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn nothing_is_sent_when_the_agent_does_not_want_the_mouse() {
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::None,
+            vt100::MouseProtocolEncoding::Sgr,
+            &ev(MouseForwardKind::WheelUp, 1, 1),
+        )
+        .is_none());
+    }
+
+    /// X10（`?1000` 不带 release）只上报按下。发一个抬起事件过去，
+    /// agent 会收到一个它没订阅的东西。
+    #[test]
+    fn x10_mode_drops_release_events() {
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::Press,
+            vt100::MouseProtocolEncoding::Sgr,
+            &ev(MouseForwardKind::Release(0), 1, 1),
+        )
+        .is_none());
+    }
+
+    /// legacy（非 SGR）协议里 release 用哨兵值 3，不是按钮号——单字节协议
+    /// 没法告诉 agent 到底松开的是哪个按钮。重用按钮号会让 agent 把
+    /// 「松开」读成「同一个按钮又按了一次」，拖拽/选区状态就会跟着错位。
+    #[test]
+    fn default_encoding_uses_the_release_sentinel_not_the_button_number() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Release(0), 0, 0),
+        )
+        .unwrap();
+        // 32+3, 32+1, 32+1
+        assert_eq!(out, vec![0x1b, b'[', b'M', 35, 33, 33]);
+    }
+
+    /// 同一个坐标上，按下和松开在 legacy 编码下必须是两个不同的字节串——
+    /// 如果按钮号被直接照抄，这两个事件会长得一模一样，agent 完全无法
+    /// 区分（这就是 CRITICAL 那个 bug 的可观测症状）。
+    #[test]
+    fn default_encoding_release_differs_from_a_press_at_the_same_spot() {
+        let press = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 0, 0),
+        )
+        .unwrap();
+        let release = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Release(0), 0, 0),
+        )
+        .unwrap();
+        assert_ne!(
+            press, release,
+            "agent 必须能分清「按下」和「松开」，否则选区/拖拽状态会错位"
+        );
+    }
+
+    /// 单字节形式能表达的最大值是 223（编码字节 = 32+223 = 255，正好是
+    /// u8 的上限）；wire 坐标 1 起算，所以内部 0 起算的列号最大能到 222。
+    /// 这条和下面那条各自钉住边界的一侧，防止「> 255」被悄悄改成
+    /// 「> 256」之类还能让旧测试蒙混过关的错误。
+    #[test]
+    fn default_encoding_accepts_the_largest_column_it_can_express() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 222, 0),
+        )
+        .unwrap();
+        // 32+0, 32+223, 32+1
+        assert_eq!(out, vec![0x1b, b'[', b'M', 32, 255, 33]);
+    }
+
+    #[test]
+    fn default_encoding_rejects_the_column_one_past_the_boundary() {
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 223, 0),
+        )
+        .is_none());
+    }
+
+    /// `legacy_button` 是 Default 和 Utf8 共用的同一个变量，这里钉住
+    /// release 哨兵没有在 Utf8 分支被漏掉（万一以后有人把两个分支的
+    /// 按钮计算拆开重写）。
+    #[test]
+    fn utf8_encoding_also_uses_the_release_sentinel() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Utf8,
+            &ev(MouseForwardKind::Release(0), 0, 0),
+        )
+        .unwrap();
+        // 32+3, 32+1, 32+1，全部落在单字节 UTF-8 范围内
+        assert_eq!(out, vec![0x1b, b'[', b'M', 35, 33, 33]);
+    }
+
+    /// ?1005 把 32+值 当 Unicode 码点编码成 UTF-8。一旦列号让这个码点
+    /// 跨过 128（列号 >= 96 时，32 + 97 = 129），就必须变成两字节——
+    /// 如果退化成 Default 那样的单字节形式，会吐出一个不合法的独立
+    /// 字节，把 agent 之后的整段解析带崩。
+    #[test]
+    fn utf8_encoding_uses_multiple_bytes_once_the_column_passes_127() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Utf8,
+            &ev(MouseForwardKind::Press(0), 96, 0),
+        )
+        .unwrap();
+        // 按钮=32(单字节)，列=32+97=129=U+0081(两字节 0xC2 0x81)，行=32+1=33(单字节)
+        assert_eq!(out, vec![0x1b, b'[', b'M', 32, 0xC2, 0x81, 33]);
+    }
+
+    /// 两字节 UTF-8 能装下的最大码点是 0x7FF（2047），减掉固定加的 32，
+    /// 单个值最大能到 2015；再大就要三字节，我们没实现也不该假装能编，
+    /// 发不出去比编错更安全。
+    #[test]
+    fn utf8_encoding_refuses_coordinates_past_the_two_byte_ceiling() {
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Utf8,
+            &ev(MouseForwardKind::Press(0), 2016, 0),
+        )
+        .is_none());
     }
 }
