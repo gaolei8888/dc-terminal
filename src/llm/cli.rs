@@ -47,7 +47,9 @@ impl Backend for CliBackend {
     }
 }
 
-/// 真实子进程。**没有单元测试覆盖**（会拉起真 CLI），在实测那一步验。
+/// 真实子进程。**跟具体 agent CLI（`claude` 之类）的集成没有单元测试覆盖**，
+/// 那部分在实测那一步验；但收发管道本身的正确性（不跟真 CLI 绑定）有一条
+/// 用 `cat` 做的回归测试，见下面 `run_real_does_not_deadlock_...`。
 ///
 /// 提示词走 stdin 不走参数：参数会进 `ps` 输出、可能超长度上限，
 /// 还要处理引号转义。
@@ -61,21 +63,44 @@ fn run_real(cmd: &[String], input: &str, env: &BTreeMap<String, String>) -> Resu
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("{head} 起不来：{e}"))?;
-    child
+
+    // 写 stdin 得放到单独的线程上，跟 wait_with_output 读 stdout/stderr
+    // 并发进行：如果提示词超过管道缓冲区（macOS 16KB / Linux 64KB），而
+    // 子进程这时候正往 stdout 写东西没人读，父进程堵在 write_all、子进程
+    // 堵在写 stdout，就是经典的双向管道死锁。两条管道得同时有人伺候。
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| "拿不到 stdin".to_string())?
-        .write_all(input.as_bytes())
-        .map_err(|e| format!("写 stdin 失败：{e}"))?;
+        .ok_or_else(|| "拿不到 stdin".to_string())?;
+    let input = input.to_string();
+    let writer = std::thread::spawn(move || -> Result<(), String> {
+        let result = stdin.write_all(input.as_bytes());
+        // `stdin` 在这里出作用域被 drop，子进程收到 EOF——这个行为必须保留：
+        // 父进程不主动关，子进程读 stdin 会永远等下去。
+        match result {
+            Ok(()) => Ok(()),
+            // 子进程提前退出（参数错、没登录）会自己关掉 stdin，父进程这时候
+            // 写入会拿到 BrokenPipe——这不是真的错误，退出码和 stderr 才是。
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(format!("写 stdin 失败：{e}")),
+        }
+    });
+
     let out = child
         .wait_with_output()
         .map_err(|e| format!("等待失败：{e}"))?;
+    // 线程 panic 不能 unwrap 带崩——转成错误字符串正常传回去。
+    let write_result = writer
+        .join()
+        .unwrap_or_else(|_| Err("写 stdin 的线程 panic 了".to_string()));
+
     if !out.status.success() {
         return Err(format!(
             "{head} 退出码非零：{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    write_result?;
     String::from_utf8(out.stdout).map_err(|e| format!("输出不是 UTF-8：{e}"))
 }
 
@@ -138,5 +163,30 @@ mod tests {
             Arc::new(|_: &[String], _: &str| Ok("   \n  ".into())),
         );
         assert_eq!(b.complete(&p()), Err(LlmError::Malformed));
+    }
+
+    // 这条测的是 run_real 本身（不经 with_runner），因为要复现的问题只在真
+    // 管道上才存在：写 stdin 和读 stdout 谁先谁后，是操作系统管道缓冲区和
+    // 真实并发调度的事，字符串层面的注入测试完全绕不过它。用 `cat` 而不是
+    // 某个 agent CLI，是因为这里要验的是我们自己收发管道的正确性，跟具体
+    // 厂商命令、登录态都无关——`cat` 到处都有，天然满足「一边吐 stdout
+    // 一边等 stdin 读完」的条件：它会原样把收到的每个字节写回去。
+    #[cfg(unix)]
+    #[test]
+    fn run_real_does_not_deadlock_when_prompt_exceeds_the_pipe_buffer() {
+        // 数百 KB，稳稳超过 macOS 16KB / Linux 64KB 的管道缓冲区上限。
+        let big = "喵".repeat(200_000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let payload = big.clone();
+        std::thread::spawn(move || {
+            let result = run_real(&["cat".to_string()], &payload, &BTreeMap::new());
+            let _ = tx.send(result);
+        });
+        // 用超时兜底：如果死锁又出现了，测试要能报「卡死」而不是把
+        // 整个测试进程挂在这里等到天荒地老。
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run_real 卡死了——这正是要防的双向管道死锁");
+        assert_eq!(result, Ok(big));
     }
 }
