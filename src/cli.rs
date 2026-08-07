@@ -235,6 +235,59 @@ pub fn run_prune(sock: &Path, lang: Lang) -> Result<()> {
     Ok(())
 }
 
+/// `dct llm check`：把配置里那条 LLM 连接真的跑一次。
+///
+/// 这条命令**就是**「配置写完还要真打端点验过」那条验收标准的载体。
+pub fn llm_check() -> i32 {
+    let socket = crate::proto::socket_path();
+    let cfg = crate::config::Config::load(&crate::config::config_path_for_socket(&socket));
+    let secrets =
+        crate::secrets::SecretStore::load(&crate::secrets::secrets_path_for_socket(&socket));
+    let profiles_dir = crate::profile::profiles_dir_for_socket(&socket);
+    let (custom, _) = crate::profile::all_profiles(&profiles_dir);
+    let lookup = |n: &str| {
+        custom
+            .iter()
+            .find(|p| p.name == n)
+            .cloned()
+            .or_else(|| crate::profile::Profile::builtin(n))
+    };
+    let oauth = |n: &str| match n {
+        "claude" | "kimi" | "glm" | "deepseek" | "qwen-api" => {
+            crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer)
+        }
+        "codex" => crate::llm::creds::read_codex_auth(),
+        _ => None,
+    };
+
+    println!("provider: {}", cfg.llm.provider);
+    println!("transport: {:?}", cfg.llm.transport);
+
+    let backend = match crate::llm::resolve::resolve(&cfg, &lookup, &secrets, &oauth) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("连不上：{}", crate::llm::resolve::describe(&e));
+            return 1;
+        }
+    };
+
+    let p = crate::llm::Prompt {
+        system: "你是一个只回答一个词的助手。".into(),
+        user: "回答「好」这一个字，不要别的。".into(),
+        max_tokens: 16,
+    };
+    match crate::llm::complete_with_timeout(backend, p, std::time::Duration::from_secs(60)) {
+        Ok(answer) => {
+            println!("通了。模型回答：{answer}");
+            0
+        }
+        Err(e) => {
+            println!("没通：{e:?}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

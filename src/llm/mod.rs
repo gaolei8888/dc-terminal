@@ -6,7 +6,9 @@
 pub mod cli;
 pub mod creds;
 pub mod http;
+pub mod resolve;
 
+use std::fmt;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +31,16 @@ pub enum LlmError {
 
 pub trait Backend: Send + Sync {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError>;
+}
+
+/// 不看 `self`——纯粹是为了让 `Arc<dyn Backend>` 满足 `Result::unwrap_err`
+/// 之类要 `Debug` 的地方（`resolve` 的测试就要用）。不影响任何实现者
+/// （`CliBackend` / `HttpBackend`）本身要不要 `Debug`，也绝不会打印任何
+/// 凭据——它压根不读字段。
+impl fmt::Debug for dyn Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<llm backend>")
+    }
 }
 
 /// 在工作线程上跑，最多等 `d`。
