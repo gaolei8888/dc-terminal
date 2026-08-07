@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::git::FileStat;
 use crate::profile::ProfileStatus;
@@ -390,6 +390,15 @@ pub enum WarningCode {
 pub fn socket_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".dct").join("daemon.sock")
+}
+
+/// 会话生死簿的位置，跟着 socket 走（同 `store_path_for_socket`），
+/// 测试把 socket 放临时目录就自动隔离。
+pub fn journal_path_for_socket(socket: &Path) -> PathBuf {
+    match socket.parent() {
+        Some(d) => d.join("sessions.log"),
+        None => PathBuf::from("sessions.log"),
+    }
 }
 
 #[cfg(test)]

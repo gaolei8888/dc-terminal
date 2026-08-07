@@ -126,6 +126,9 @@ pub struct SessionManager {
     next_id: AtomicU32,
     sessions: Mutex<HashMap<u32, Arc<Mutex<Session>>>>,
     extra_profiles: Mutex<HashMap<String, Profile>>,
+    /// 会话的生死记在这里。默认不落盘（见 `journal::Journal`），
+    /// 只有 `daemon::run()` 会给它一个真实路径。
+    pub journal: crate::journal::Journal,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -147,6 +150,7 @@ impl SessionManager {
             next_id: AtomicU32::new(1),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
+            journal: crate::journal::Journal::new(),
         }
     }
 
@@ -257,6 +261,11 @@ impl SessionManager {
             error_re,
             pty,
         };
+
+        // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
+        // 它是什么时候、在哪个项目起来的，对不上「我刚才按了什么」。
+        self.journal
+            .born(id, &session.profile.name, dir, session.pty.process_id());
 
         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
         recover(self.sessions.lock()).insert(id, Arc::new(Mutex::new(session)));
@@ -374,8 +383,13 @@ impl SessionManager {
 
     pub fn stop(&self, id: u32) -> Result<()> {
         self.with_session(id, |s| {
+            // pid 要在 kill 之前取：杀完再问就已经被回收了。
+            let pid = s.pty.process_id();
             s.pty.kill()?;
             s.state = SessionState::Stopped;
+            // `requested` 和 `tick()` 里那条 `vanished` 是这本日志唯一
+            // 分得开的两件事——见 `journal` 的模块注释。
+            self.journal.died(id, crate::journal::Death::Requested, pid);
             Ok(())
         })
     }
@@ -481,8 +495,11 @@ impl SessionManager {
                 // 关掉了 PTY 却还活着，那时 `try_wait` 回收不到任何东西，而
                 // 这个会话已经被判成停止、不会再被看第二眼了。`kill()` 先杀
                 // 再等，两种情况一起收干净。
+                let pid = s.pty.process_id();
                 let _ = s.pty.kill();
                 s.state = SessionState::Stopped;
+                self.journal
+                    .died(s.id, crate::journal::Death::Vanished, pid);
                 continue;
             }
             if s.state == SessionState::Asking {

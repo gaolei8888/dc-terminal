@@ -16,7 +16,12 @@ use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
 
 pub fn run(socket: &Path) -> Result<()> {
-    run_with_manager(socket, Arc::new(SessionManager::new()))
+    let mgr = SessionManager::new();
+    // 生死簿只在真正的守护进程里落盘。单元测试自己 `new()` 一个 manager，
+    // 拿到的是不记账的那种——绝不能去写用户真实的 `~/.dct/sessions.log`。
+    mgr.journal
+        .set_path(crate::proto::journal_path_for_socket(socket));
+    run_with_manager(socket, Arc::new(mgr))
 }
 
 /// 供测试注入自定义 `SessionManager`（比如预先 `register_profile` 一个专供测试用的慢

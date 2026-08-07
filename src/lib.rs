@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod daemon;
 pub mod git;
 pub mod i18n;
+pub mod journal;
 pub mod profile;
 pub mod projects;
 pub mod proto;
