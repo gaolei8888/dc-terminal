@@ -48,7 +48,23 @@ pub fn extract_text(wire: Wire, body: &str) -> Option<String> {
             .get("message")?
             .get("content")?
             .as_str()?,
-        Wire::Anthropic => v.get("content")?.get(0)?.get("text")?.as_str()?,
+        // **不能写死 `content[0]`。** 真实的 Anthropic 回答经常以一个
+        // `thinking` 或 `tool_use` 块开头，第一个块里根本没有 `text` 字段——
+        // 写死下标的话这个功能不是偶尔坏，是 100% 读不出来，而且是安静地
+        // 退化成 `Malformed`。要的是**第一个 `type == "text"` 的块**。
+        Wire::Anthropic => {
+            let blocks = v.get("content")?.as_array()?;
+            blocks
+                .iter()
+                .find(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                // 有些 Anthropic 兼容的第三方端点不写 `type`。它们只会返回
+                // 纯文本块，退一步认「第一个带 text 字段的块」——thinking /
+                // tool_use 块都没有这个字段，所以退这一步不会把思考过程
+                // 当成答案。
+                .or_else(|| blocks.iter().find(|b| b.get("text").is_some()))?
+                .get("text")?
+                .as_str()?
+        }
     };
     let t = s.trim();
     if t.is_empty() {
@@ -203,6 +219,46 @@ mod tests {
                 r#"{"content":[{"type":"text","text":"答案"}]}"#
             )
             .as_deref(),
+            Some("答案")
+        );
+    }
+
+    /// 真实的 Anthropic 回答可能以 `thinking` / `tool_use` 块开头。写死
+    /// `content[0]` 的话，这个功能不是偶尔坏，是每次都读不出来——而且是
+    /// 安静地退化成「读不懂」，用户只会看到出错解释永远不出现。
+    #[test]
+    fn a_leading_thinking_block_does_not_hide_the_answer() {
+        let body = r#"{"content":[
+            {"type":"thinking","thinking":"先想一下……","signature":"sig"},
+            {"type":"text","text":"磁盘满了。"}
+        ]}"#;
+        assert_eq!(
+            extract_text(Wire::Anthropic, body).as_deref(),
+            Some("磁盘满了。")
+        );
+
+        // 工具调用块开头是同一回事。
+        let with_tool = r#"{"content":[
+            {"type":"tool_use","id":"tu_1","name":"look","input":{}},
+            {"type":"text","text":"答案"}
+        ]}"#;
+        assert_eq!(
+            extract_text(Wire::Anthropic, with_tool).as_deref(),
+            Some("答案")
+        );
+
+        // 一个 text 块都没有 = 读不出来，绝不猜。thinking 里的思考过程
+        // 尤其不能当答案端上去。
+        let only_thinking = r#"{"content":[{"type":"thinking","thinking":"想了半天"}]}"#;
+        assert!(extract_text(Wire::Anthropic, only_thinking).is_none());
+    }
+
+    /// 有些 Anthropic 兼容的第三方端点不写 `type`。这一步退让必须留着，
+    /// 否则那几家会从「能用」变成「全都读不懂」。
+    #[test]
+    fn a_block_without_a_type_still_reads_as_text() {
+        assert_eq!(
+            extract_text(Wire::Anthropic, r#"{"content":[{"text":"答案"}]}"#).as_deref(),
             Some("答案")
         );
     }
