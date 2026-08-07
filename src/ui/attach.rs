@@ -43,6 +43,10 @@ pub(crate) fn wheel_action(st: &ScrollState, up: bool) -> ScrollAction {
 }
 
 /// 翻页键归谁。`None` = 不归 dct 管，让它落到普通按键路径送给 agent。
+///
+/// `End` 用 `Scroll(-i32::MAX)` 而不是单独一个 `Bottom` 分支：`ScrollBy::Rows`
+/// 在守护进程侧是 `saturating_sub` 之后再钳到 `[0, max]`，结果跟
+/// `ScrollBy::Bottom` 完全一样，多一个分支只是多一处要测的东西。
 pub(crate) fn key_scroll(st: &ScrollState, key: &KeyEvent, page: u16) -> Option<ScrollAction> {
     if st.agent_owns {
         return None;
@@ -51,6 +55,11 @@ pub(crate) fn key_scroll(st: &ScrollState, key: &KeyEvent, page: u16) -> Option<
     // 每翻一页都要重新找位置。窗口太小时至少滚 1 行，不能算出 0 或负数。
     let step = i32::from(page).saturating_sub(2).max(1);
     match key.code {
+        // 没有历史可翻时 PageUp/PageDown 也该放行给 agent，不能在这儿吃掉
+        // 变成死键——跟 `wheel_action` 的 `max == 0` 判据是同一条路由规则，
+        // 两个入口对同一个问题必须给同一个答案。一个刚建的、还没吐出一屏
+        // 内容的 inline agent 正是这种情况：PageUp 对它来说是普通的编辑键。
+        KeyCode::PageUp | KeyCode::PageDown if st.max == 0 => None,
         KeyCode::PageUp => Some(ScrollAction::Scroll(step)),
         KeyCode::PageDown => Some(ScrollAction::Scroll(-step)),
         KeyCode::End if st.offset > 0 => Some(ScrollAction::Scroll(-i32::MAX)),
@@ -59,10 +68,6 @@ pub(crate) fn key_scroll(st: &ScrollState, key: &KeyEvent, page: u16) -> Option<
 }
 
 /// 底栏那一句滚动提示。`None` = 不显示，让位给平时的按键表。
-///
-/// `End` 用 `Scroll(-i32::MAX)` 而不是单独一个 `Bottom` 分支：`ScrollBy::Rows`
-/// 在守护进程侧是 `saturating_sub` 之后再钳到 `[0, max]`，结果跟
-/// `ScrollBy::Bottom` 完全一样，多一个分支只是多一处要测的东西。
 pub(crate) fn scroll_hint(st: &ScrollState, lang: Lang) -> Option<String> {
     if st.offset > 0 && st.new_lines > 0 {
         return Some(crate::i18n::msg::scroll_new_lines_below(lang, st.new_lines));
@@ -196,15 +201,22 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// **这个函数里不许改 `app.message`。** 主循环在调用它之后直接 `continue`，
-/// 跳过了循环末尾清理陈旧消息的那一段——在这里设一条消息，它会一直挂在
-/// 屏幕上直到下一次按键。同理也不用 `?` 把 `app.client()` 的错误往上抛：
-/// 鼠标事件一秒钟能来几十个，某一次因为断线送失败不该让整个界面跟着
-/// 退出——下一帧的 `Screen` 探测自然会把 `connected` 标成假，断连提示
-/// 走那条既有的路。
-pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
+/// **这个函数里不许改 `app.message`。** 主循环在调用它之后可能直接
+/// `continue` 回循环顶部，跳过了循环末尾清理陈旧消息的那一段——在这里
+/// 设一条消息，它会一直挂在屏幕上直到下一次按键。同理也不用 `?` 把
+/// `app.client()` 的错误往上抛：鼠标事件一秒钟能来几十个，某一次因为
+/// 断线送失败不该让整个界面跟着退出——下一帧的 `Screen` 探测自然会把
+/// `connected` 标成假，断连提示走那条既有的路。
+///
+/// 返回这次事件有没有真的送出一次请求（滚动，或者转发点击/松开）。调用方
+/// （`run()`）靠这个判断值不值得为它触发一次完整的「取 Screen、重绘」——
+/// 纯移动这类被就地丢弃的事件占了鼠标事件的大多数，不该背上这个代价
+/// （见 `run()` 里排空鼠标事件那段的注释）。没有任何一条路径会失败到需要
+/// 报错的地步，所以是 `bool` 不是 `Result<()>`——把「这里不会出错」这件事
+/// 写进类型里，比只写在注释里更可信，调用点也就不再需要一个不会触发的 `?`。
+pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     let View::Attached(id) = app.view else {
-        return Ok(());
+        return false;
     };
     let (up, forwardable) = match m.kind {
         MouseEventKind::ScrollUp => (true, Some(MouseForwardKind::WheelUp)),
@@ -217,7 +229,7 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         _ => (false, None),
     };
     let Some(kind) = forwardable else {
-        return Ok(());
+        return false;
     };
 
     let is_wheel = matches!(
@@ -226,7 +238,7 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     );
     if is_wheel {
         match wheel_action(&app.scroll, up) {
-            ScrollAction::Ignore => return Ok(()),
+            ScrollAction::Ignore => return false,
             ScrollAction::Scroll(n) => {
                 let _ = app.client().and_then(|c| {
                     c.call(Request::Scroll {
@@ -234,13 +246,13 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                         by: ScrollBy::Rows(n),
                     })
                 });
-                return Ok(());
+                return true;
             }
             ScrollAction::Forward => {}
         }
     } else if !app.scroll.agent_owns {
         // 不收鼠标的 agent 收到点击/松开事件只会看到一串乱码。
-        return Ok(());
+        return false;
     }
 
     // 终端坐标减掉内容区左上角，换算成 agent 画面里的坐标。任何一边越界
@@ -249,7 +261,7 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         .screen_origin
         .and_then(|(c0, r0)| Some((m.column.checked_sub(c0)?, m.row.checked_sub(r0)?)))
     else {
-        return Ok(());
+        return false;
     };
 
     let _ = app.client().and_then(|c| {
@@ -265,7 +277,7 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             },
         })
     });
-    Ok(())
+    true
 }
 
 fn button_code(b: MouseButton) -> u8 {
@@ -330,6 +342,39 @@ mod tests {
         assert!(!app.message.text.is_empty(), "得说一句，不能默不作声");
     }
 
+    /// `handle_mouse` 靠 `screen_origin` 把终端坐标换算成 agent 画面里的
+    /// 坐标，自己绝不硬算边框宽度——这条测试钉住 `draw` 真的记对了那个
+    /// 坐标。少了它，`draw` 里 `app.screen_origin = Some((area.x, area.y))`
+    /// （漏掉 `+1` 的边框偏移）这种改动全量测试照样 542/0 全绿，因为没有
+    /// 别的测试断言过这个字段的值——鼠标点哪儿都会偏一格，而且偏得悄无
+    /// 声息，正是 `screen_origin` 这个字段本来要防的那类 bug。
+    #[test]
+    fn draw_records_the_bordered_content_corner_as_the_screen_origin() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![session(1, SessionState::Working)];
+        app.view = View::Attached(1);
+        // 不用整块屏幕：故意给一个不是 (0, 0) 的偏移，这样如果 `draw` 悄悄
+        // 写成了直接抄 `area.x`/`area.y`（漏掉 `+1` 的边框），或者写死了
+        // 一个常数，这条测试都能抓出来，而不是恰好在 (0, 0) 时侥幸对上。
+        let area = Rect {
+            x: 3,
+            y: 2,
+            width: 40,
+            height: 12,
+        };
+
+        term.draw(|f| draw(f, area, &mut app)).unwrap();
+
+        assert_eq!(
+            app.screen_origin,
+            Some((area.x + 1, area.y + 1)),
+            "内容区左上角要算上边框（+1），不能是 area 自己的坐标"
+        );
+    }
+
     fn own(agent_owns: bool, max: usize, offset: usize, new_lines: usize) -> ScrollState {
         ScrollState {
             agent_owns,
@@ -375,6 +420,17 @@ mod tests {
         assert!(key_scroll(&own(true, 0, 0, 0), &key(KeyCode::End), 24).is_none());
     }
 
+    /// 跟 `wheel_action` 的 `there_is_nothing_to_scroll_when_there_is_no_history`
+    /// 是同一条路由规则的两个入口，必须给出同一个答案：没有历史时 dct 不该
+    /// 吃掉 PageUp/PageDown。不这样的话，一个刚建的、还没吐出一屏内容的
+    /// inline agent 上按 PageUp 会被 dct 悄悄吞掉、什么反应都没有——而滚轮
+    /// 在同样的状态下（`wheel_action` 的 `max == 0` 分支）老老实实转发。
+    #[test]
+    fn page_keys_are_not_scroll_keys_when_there_is_no_history() {
+        assert!(key_scroll(&own(false, 0, 0, 0), &key(KeyCode::PageUp), 24).is_none());
+        assert!(key_scroll(&own(false, 0, 0, 0), &key(KeyCode::PageDown), 24).is_none());
+    }
+
     #[test]
     fn page_keys_scroll_a_screen_minus_two() {
         let up = key_scroll(&own(false, 500, 0, 0), &key(KeyCode::PageUp), 24).unwrap();
@@ -413,10 +469,13 @@ mod tests {
         let st = own(false, 500, 40, 12);
         let h = scroll_hint(&st, Lang::Zh).unwrap();
         assert!(h.contains("12"), "得说清有多少新东西: {h}");
+        // 用户正翻着历史、新内容还在堆积，是最想立刻跳回去看最新输出的
+        // 时候——光说「有新东西」不说怎么回去，等于只交代了一半。
+        assert!(h.contains("End"), "得说清怎么回去: {h}");
         let en = scroll_hint(&st, Lang::En).unwrap();
         assert!(
-            !en.is_empty() && en.contains("12"),
-            "英文版也要说清同一个数字: {en}"
+            !en.is_empty() && en.contains("12") && en.contains("End"),
+            "英文版也要说清同一个数字，以及怎么回去: {en}"
         );
     }
 
@@ -515,28 +574,40 @@ mod tests {
     fn handle_mouse_does_nothing_off_the_attached_view() {
         let (mut app, _dir) = App::test_app();
         app.view = View::Board;
-        handle_mouse(&mut app, mouse_ev(MouseEventKind::ScrollUp, 5, 5)).unwrap();
+        assert!(!handle_mouse(
+            &mut app,
+            mouse_ev(MouseEventKind::ScrollUp, 5, 5)
+        ));
         assert!(app.message.text.is_empty());
     }
 
-    /// client 是 `None`（`App::test_app` 就是断连的），下面每种事件都会在
-    /// 真正发请求那一步失败——这条测试盯的是那次失败不能像 `handle_key`
-    /// 里的 `Input` 分支那样反手把错误焊进 `app.message`。这是 e0ba1ec 那类
-    /// bug 的另一种化身：主循环在 `handle_mouse` 后面直接 `continue`，跳过
-    /// 了收尾清理，这里设的消息会一直挂到下一次按键。
+    /// client 是 `None`（`App::test_app` 就是断连的），下面每种可转发的
+    /// 事件都会在真正发请求那一步失败——这条测试盯的是那次失败不能像
+    /// `handle_key` 里的 `Input` 分支那样反手把错误焊进 `app.message`。
+    /// 这是 e0ba1ec 那类 bug 的另一种化身：主循环在 `handle_mouse` 后面
+    /// 可能直接跳回循环顶部，跳过了收尾清理，这里设的消息会一直挂到下
+    /// 一次按键。
+    ///
+    /// `agent_owns = true` 是故意的：只有这样滚轮和点击/松开才会真的走到
+    /// 发请求那一步（而不是被 `wheel_action`/「不收鼠标的 agent」提前
+    /// 挡下），这条测试才对得上「调用失败」这四个字，而不是「压根没调用」。
+    /// 顺带验证了 `handle_mouse` 的返回值：真发了请求的返回 `true`，
+    /// 纯移动这种从不发请求的返回 `false`。
     #[test]
     fn handle_mouse_never_touches_the_message_even_when_the_call_fails() {
         let (mut app, _dir) = App::test_app();
         app.view = View::Attached(1);
+        app.scroll.agent_owns = true;
         app.screen_origin = Some((1, 1));
-        for kind in [
-            MouseEventKind::ScrollUp,
-            MouseEventKind::ScrollDown,
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-            MouseEventKind::Moved,
+        for (kind, expect_acted) in [
+            (MouseEventKind::ScrollUp, true),
+            (MouseEventKind::ScrollDown, true),
+            (MouseEventKind::Down(MouseButton::Left), true),
+            (MouseEventKind::Up(MouseButton::Left), true),
+            (MouseEventKind::Moved, false),
         ] {
-            handle_mouse(&mut app, mouse_ev(kind, 5, 5)).unwrap();
+            let acted = handle_mouse(&mut app, mouse_ev(kind, 5, 5));
+            assert_eq!(acted, expect_acted, "事件是 {kind:?}");
             assert!(
                 app.message.text.is_empty(),
                 "handle_mouse 不许改 message，事件是 {kind:?}"
@@ -552,11 +623,10 @@ mod tests {
         app.view = View::Attached(1);
         app.scroll.agent_owns = true; // 让点击走到坐标换算那一步，不要提前 return
         app.screen_origin = None;
-        handle_mouse(
+        assert!(!handle_mouse(
             &mut app,
-            mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 5),
-        )
-        .unwrap();
+            mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 5)
+        ));
         assert!(app.message.text.is_empty());
     }
 }

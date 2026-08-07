@@ -207,7 +207,11 @@ pub fn run(
     // 通过后直接建会话、九宫格里……挂哪个分支都会漏另一条）。
     let mut mouse_captured = false;
 
-    loop {
+    // 有标签是因为下面排空鼠标事件那段需要从一个嵌套的 `while` 里跳回
+    // 这个循环的顶部，而不是跳回 `while` 自己——普通的无标签 `continue`
+    // 已经覆盖了这个函数里所有别的 `continue`，不用因为加了一个标签
+    // 就把它们全部改成 `continue 'main`。
+    'main: loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
         if let Some(rx) = &app.verify_rx {
@@ -548,14 +552,38 @@ pub fn run(
         if !event::poll(Duration::from_millis(tick))? {
             continue;
         }
-        let ev = event::read()?;
-        // 这个 `continue` 在按键处理**之前**，不在任何按键分支里，不违反
-        // 房规（见 `attach::handle_key` 头上的注释）。但循环末尾清理陈旧
-        // `message` 的那段也会被它跳过——所以 `handle_mouse` 内部**不许**
-        // 改 `app.message`，那条约束写在它自己的文档注释上。
-        if let Event::Mouse(m) = ev {
-            attach::handle_mouse(&mut app, m)?;
-            continue;
+        let mut ev = event::read()?;
+        // 鼠标事件在这里先摘出来单独处理，而且可能不止吃掉这一个：见下面
+        // 的注释。这个 `while` 结束之后，`ev` 保证不再是 `Event::Mouse`，
+        // 后面的 Paste/Key 分支照旧用它。
+        //
+        // 循环体里对 `handle_mouse` 的调用不违反房规（见 `attach::handle_key`
+        // 头上「永远不要 continue」那条）——它压根不 continue，只是被这个
+        // `while` 循环调用；`continue 'main` 才是真正跳过循环末尾清理
+        // `message` 那段的地方，而 `handle_mouse` 内部**不许**碰
+        // `app.message`，那条约束写在它自己的文档注释上，不受这里怎么
+        // 调用它影响。
+        while let Event::Mouse(m) = ev {
+            let acted = attach::handle_mouse(&mut app, m);
+            if acted {
+                // 真的送出了一次请求（滚动了、转发了点击/松开）：状态可能
+                // 变了，照旧走一次完整的循环体去重新取一遍 Screen、重绘。
+                continue 'main;
+            }
+            // 没做事的绝大多数是纯移动——`EnableMouseCapture` 打开的
+            // `?1003h` 是任意移动追踪，跟 agent 有没有订阅无关，鼠标扫一下
+            // 80 列宽的窗口就是几十个这种事件，`handle_mouse` 早就把它们
+            // 原地丢掉了（见它的文档）。问题是外层 `continue` 会把「取一次
+            // Screen、画一帧」全套重放一遍——用一个被丢弃的小事件换来一次
+            // 昂贵的守护进程往返和终端重绘，跟当初「移动事件不转发是为了
+            // 省流量」的初衷正好背道而驰。这里原地看一眼有没有紧跟着到达
+            // 的下一个事件：有就继续在这个 `while` 里处理掉，没有就老实
+            // 结束这一轮——不需要刷新时最多等到下一次自然的 16ms/150ms
+            // tick，不会更旧，只是不为每一个被丢弃的移动事件单独刷一次。
+            if !event::poll(Duration::from_millis(0))? {
+                continue 'main;
+            }
+            ev = event::read()?;
         }
         // 粘贴整段一次发完，不能拆成一个个字符
         if let Event::Paste(text) = ev {
@@ -2279,9 +2307,13 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
 
+        // `App::test_app()` 默认 `Lang::Zh`，所以断言实际渲染出来的整句话
+        // （`i18n::msg::scrolled_up` 的中文版，空白已被上面的 filter 去掉），
+        // 不是随便抓两个数字——数字对了但拼错了别的字、或者 offset 算错但
+        // 凑巧还是两位数，光查「有没有 4 和 0」都抓不出来。
         assert!(
-            c.contains('4') && c.contains('0'),
-            "翻到哪儿了要写在底栏：{c}"
+            c.contains("已往上翻40行·按End回到底部"),
+            "翻到哪儿了、怎么回去都要原样写在底栏：{c}"
         );
         assert!(
             !c.contains("F3下一个会话"),

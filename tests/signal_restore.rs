@@ -9,8 +9,23 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+/// crossterm 0.28.1 的 `DisableMouseCapture::write_ansi`（src/event.rs）真正
+/// 写出来的字节，逐条核实过，不是凭印象抄的字面量：`csi!("?1006l")` 展开成
+/// `"\x1B[?1006l"`（`csi!` 定义在 crossterm 的 `macros.rs`，把参数拼在
+/// `"\x1B["` 后面），五条 disable 序列按 `EnableMouseCapture` 的**逆序**
+/// 拼在一起，一次 `write_ansi` 调用全部写出。这是 SIGTERM/SIGHUP 之后
+/// `restore_terminal()` 必须真的送到用户终端上的那串字节——漏了它，用户
+/// 退出 dct 之后终端会在每次点击/拖选时冒出这串乱码，直到他知道敲什么
+/// 命令才能清掉，而多数用户不知道。
+const DISABLE_MOUSE_CAPTURE_SEQ: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
 
 /// 把测试用的二进制复制成一个独一无二的名字，收尾时按名字杀进程
 /// 不会误伤开发机上真正在跑的 dct 守护进程。
@@ -63,12 +78,17 @@ unsafe fn is_raw(master: libc::c_int) -> bool {
     (t.c_lflag & libc::ECHO) == 0 || (t.c_lflag & libc::ICANON) == 0
 }
 
-/// 在一个我们自己持有 fd 的 pty 里把 dct 跑起来，返回 (子进程, master fd)。
+/// 在一个我们自己持有 fd 的 pty 里把 dct 跑起来，返回 (子进程, master fd,
+/// dct 写给终端的全部字节)。
 ///
 /// 必须 `setsid` + `TIOCSCTTY`：crossterm 的 `enable_raw_mode` 优先操作
 /// `/dev/tty`，也就是**控制终端**。不给子进程把这个 pty 设成控制终端的话，
 /// 它动的是 cargo test 自己的终端，这个测试就测了个寂寞。
-fn spawn_dct_in_pty(bin: &Path, home: &Path, cwd: &Path) -> (std::process::Child, libc::c_int) {
+fn spawn_dct_in_pty(
+    bin: &Path,
+    home: &Path,
+    cwd: &Path,
+) -> (std::process::Child, libc::c_int, Arc<Mutex<Vec<u8>>>) {
     let (mut master, mut slave) = (0, 0);
     unsafe {
         assert_eq!(
@@ -128,14 +148,30 @@ fn spawn_dct_in_pty(bin: &Path, home: &Path, cwd: &Path) -> (std::process::Child
     // 出不来——实测那样连 SIGTERM 都收拾不干净，进程会停在 ps 的 `?E`
     //「正在退出」状态上十几秒不动。真终端本来就一直在读，这条只是把它补上。
     // 读 dup 出来的副本：收尾时主线程 close(master) 不会跟这个线程抢同一个 fd。
+    //
+    // 原来这里读完就扔——draining 只是为了不卡住子进程。现在把读到的字节
+    // 攒进一份共享缓冲区带出去：`restore_terminal()` 在 SIGTERM/SIGHUP 之后
+    // 写的 `DisableMouseCapture` 序列也在这条流里，不攒下来就只能「看代码
+    // 相信它会发生」，测不出「真的发生了」。
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_thread = Arc::clone(&captured);
     let drain = unsafe { libc::dup(master) };
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
-        while unsafe { libc::read(drain, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
+        loop {
+            let n = unsafe { libc::read(drain, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            captured_for_thread
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..n as usize]);
+        }
         unsafe { libc::close(drain) };
     });
 
-    (child, master)
+    (child, master, captured)
 }
 
 /// 等 TUI 真的进了 raw mode。不等就发信号的话，测试可能在它还没设置终端时
@@ -144,13 +180,23 @@ fn wait_until_raw(master: libc::c_int) -> bool {
     wait_for(|| unsafe { is_raw(master) }, 20)
 }
 
+/// 等排空线程把 `needle` 攒进 `captured` 里。子进程退出（`try_wait` 返回
+/// `Some`）不代表排空线程已经把它写的最后几个字节读完并追加到缓冲区——
+/// 两者是不同线程，中间有个真实但很短的窗口，所以要轮询，不能读一次就断言。
+fn wait_until_captured_contains(captured: &Arc<Mutex<Vec<u8>>>, needle: &[u8], secs: u64) -> bool {
+    wait_for(
+        || contains_subsequence(&captured.lock().unwrap(), needle),
+        secs,
+    )
+}
+
 #[test]
 fn sigterm_restores_the_terminal() {
     let home = tempfile::tempdir().unwrap();
     let workdir = tempfile::tempdir().unwrap();
     let bin = unique_binary(home.path(), "sigterm");
 
-    let (mut child, master) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
+    let (mut child, master, captured) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
     assert!(
         wait_until_raw(master),
         "TUI 始终没进 raw mode，测试前提不成立"
@@ -168,6 +214,13 @@ fn sigterm_restores_the_terminal() {
     assert!(
         !unsafe { is_raw(master) },
         "SIGTERM 之后终端仍停在 raw mode——用户会拿到一个不回显、不换行的死终端"
+    );
+    // raw mode 恢复只说明 `disable_raw_mode()` 跑了；`DisableMouseCapture`
+    // 是另一条独立的 `execute!`，漏发不会影响上面那条断言——这里直接盯着
+    // 它真的写进了终端那条流，而不是从"raw mode 好了"倒推"鼠标捕获也关了"。
+    assert!(
+        wait_until_captured_contains(&captured, DISABLE_MOUSE_CAPTURE_SEQ, 5),
+        "SIGTERM 之后没看到 DisableMouseCapture 序列——用户以后点哪儿终端都会冒乱码"
     );
 
     unsafe { libc::close(master) };
@@ -190,7 +243,7 @@ fn sighup_restores_the_terminal() {
     let workdir = tempfile::tempdir().unwrap();
     let bin = unique_binary(home.path(), "sighup");
 
-    let (mut child, master) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
+    let (mut child, master, captured) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
     assert!(
         wait_until_raw(master),
         "TUI 始终没进 raw mode，测试前提不成立"
@@ -207,6 +260,12 @@ fn sighup_restores_the_terminal() {
     );
 
     assert!(!unsafe { is_raw(master) }, "SIGHUP 之后终端仍停在 raw mode");
+    // 同 SIGTERM 那条：raw mode 恢复不等于鼠标捕获也关了，两条是
+    // `restore_terminal()` 里两次独立的 `execute!`，分别断言。
+    assert!(
+        wait_until_captured_contains(&captured, DISABLE_MOUSE_CAPTURE_SEQ, 5),
+        "SIGHUP 之后没看到 DisableMouseCapture 序列——用户以后点哪儿终端都会冒乱码"
+    );
 
     unsafe { libc::close(master) };
 

@@ -709,11 +709,15 @@ pub mod msg {
 
     /// 底栏「往上翻了，下面又有新东西了」。用户滚回底部之前画面不会自己跳，
     /// 免得他正读一半的历史被新输出顶飞——这句话是唯一的提醒。
+    ///
+    /// 跟 `scrolled_up` 一样必须带上「按 End 回底部」：这半句在这个状态下
+    /// 反而最要紧——用户翻着历史、新内容还在不断堆积，正是最想马上跳回去
+    /// 看最新输出的时候，不能只说「有新东西」却不说怎么去看。
     pub fn scroll_new_lines_below(lang: Lang, n: usize) -> String {
         t!(
             lang,
-            en: format!("↓ {n} new line(s) below"),
-            zh: format!("↓ 下面还有 {n} 行新内容"),
+            en: format!("↓ {n} new line(s) below · press End to jump back down"),
+            zh: format!("↓ 下面还有 {n} 行新内容 · 按 End 回到底部"),
         )
     }
 
