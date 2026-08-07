@@ -7,7 +7,7 @@ use super::cli::CliBackend;
 use super::creds::Credential;
 use super::http::HttpBackend;
 use super::Backend;
-use crate::config::{Config, Transport};
+use crate::config::{LlmConfig, Transport};
 use crate::profile::{Profile, Wire};
 use crate::secrets::SecretStore;
 use std::sync::Arc;
@@ -77,16 +77,23 @@ fn http_url(base: &str, wire: Wire) -> String {
     format!("{}{path}", base.trim_end_matches('/'))
 }
 
+/// **调用方负责先问「用户开了没有」。** 这个函数只回答「开了之后，该接
+/// 哪个后端」——它接的是 `LlmConfig`，不是 `Config`，是故意的：`Config::llm`
+/// 是 `Option`，`None` 就是「没开」，那不是这个函数该处理的一种情况，是
+/// 调用方压根不该调它的一种情况（daemon 启动时不 resolve、`dct llm check`
+/// 打一句「还没开」就退出，两边都在调用前就分了叉，见各自的调用点）。
+/// 这里如果也认一个 `Option` 就会长出第二条「没开」的路径，两条路径迟早
+/// 会说不一样的话。
 pub fn resolve(
-    cfg: &Config,
+    llm: &LlmConfig,
     lookup: &dyn Fn(&str) -> Option<Profile>,
     secrets: &SecretStore,
     oauth: &dyn Fn(&str) -> Option<Credential>,
 ) -> Result<Arc<dyn Backend>, ResolveError> {
-    let name = cfg.llm.provider.as_str();
+    let name = llm.provider.as_str();
     let p = lookup(name).ok_or_else(|| ResolveError::NoSuchProvider(name.to_string()))?;
 
-    match cfg.llm.transport {
+    match llm.transport {
         Transport::Cli => {
             let h = p
                 .headless
@@ -103,16 +110,11 @@ pub fn resolve(
             let cred = select_credential(name, secrets, oauth)?;
             // 猜一个默认模型（比如写死 claude-3-5-sonnet）会在非 Anthropic
             // 端点上稳定换来 404——这是要用户自己拍板的事，不是能替他猜的。
-            let model = cfg
-                .llm
+            let model = llm
                 .model
                 .clone()
                 .ok_or_else(|| ResolveError::NoModel(name.to_string()))?;
-            let base = cfg
-                .llm
-                .base_url
-                .clone()
-                .unwrap_or_else(|| api.base_url.clone());
+            let base = llm.base_url.clone().unwrap_or_else(|| api.base_url.clone());
             let url = http_url(&base, api.wire);
             Ok(Arc::new(HttpBackend::new(url, api.wire, model, cred)))
         }
@@ -122,16 +124,17 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, LlmConfig, Transport};
+    use crate::config::{LlmConfig, Transport};
 
-    fn cfg(provider: &str, transport: Transport) -> Config {
-        Config {
-            llm: LlmConfig {
-                provider: provider.into(),
-                model: Some("m".into()),
-                base_url: None,
-                transport,
-            },
+    // `resolve()` 只接 `LlmConfig`（「开了之后配什么」），不接 `Config`
+    // （「开没开」）——见 `resolve` 上的注释，这里的测试也就不需要
+    // `Config`/`Option` 那一层了。
+    fn cfg(provider: &str, transport: Transport) -> LlmConfig {
+        LlmConfig {
+            provider: provider.into(),
+            model: Some("m".into()),
+            base_url: None,
+            transport,
         }
     }
 
@@ -246,7 +249,7 @@ mod tests {
     #[test]
     fn http_without_a_model_is_refused_instead_of_guessing_one() {
         let mut c = cfg("kimi", Transport::Http);
-        c.llm.model = None;
+        c.model = None;
         let with_oauth = |_: &str| Some(Credential::Bearer("t".into()));
         let r = resolve(&c, &builtin, &empty_secrets(), &with_oauth);
         assert!(matches!(r, Err(ResolveError::NoModel(ref n)) if n == "kimi"));

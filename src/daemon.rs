@@ -46,31 +46,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
 
     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
-    // resolve 不了（没配、没登录）**不能拦住守护进程本身起来**：LLM 是增强，
-    // 不是地基（同 `config.rs` 头注释），只把原因往 stderr 写一行，会话该怎么
-    // 跑还怎么跑，只是问不出「为什么」这件事关掉了。
-    {
-        let cfg = crate::config::Config::load(&crate::config::config_path_for_socket(socket));
-        let llm_secrets = SecretStore::load(&secrets_path_for_socket(socket));
-        let (custom, _) = all_profiles(&profiles_dir);
-        let lookup = |n: &str| {
-            custom
-                .iter()
-                .find(|p| p.name == n)
-                .cloned()
-                .or_else(|| Profile::builtin(n))
-        };
-        match crate::llm::resolve::resolve(&cfg, &lookup, &llm_secrets, &startup_oauth) {
-            Ok(b) => mgr.set_backend(Some(b)),
-            Err(e) => {
-                eprintln!(
-                    "dct: 出错解释关了（{}），会话照常跑",
-                    crate::llm::resolve::describe(&e)
-                );
-                mgr.set_backend(None);
-            }
-        }
-    }
+    // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
+    // 装后端」这条 Critical 修复本身，见下面 `install_llm_backend` 和它的测试。
+    install_llm_backend(socket, &profiles_dir, &mgr);
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
@@ -91,6 +69,40 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// **`cfg.llm` 是 `None` 就什么都不做**：不 resolve、不装后端、也不打印
+/// 任何一行——这是绝大多数用户的正常状态（没写过 `[llm]`），不是一种
+/// 「本来该配却没配好」的错误。见 `config.rs` 头注释：出错解释会把一个
+/// 失败会话屏幕上的原始内容送给模型，这必须是用户自己写下 `[llm]` 才
+/// 触发的动作，不能因为「什么都没配」就替他打开、把他终端里的东西发
+/// 给第三方。只有用户确实写了 `[llm]` 却指向一个连不上的后端时，才值得
+/// 在 stderr 上留一行——那时候他大概率是想用这功能的，只是配错了。
+fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
+    let Some(llm) =
+        &crate::config::Config::load(&crate::config::config_path_for_socket(socket)).llm
+    else {
+        return;
+    };
+    let llm_secrets = SecretStore::load(&secrets_path_for_socket(socket));
+    let (custom, _) = all_profiles(profiles_dir);
+    let lookup = |n: &str| {
+        custom
+            .iter()
+            .find(|p| p.name == n)
+            .cloned()
+            .or_else(|| Profile::builtin(n))
+    };
+    match crate::llm::resolve::resolve(llm, &lookup, &llm_secrets, &startup_oauth) {
+        Ok(b) => mgr.set_backend(Some(b)),
+        Err(e) => {
+            eprintln!(
+                "dct: 出错解释开着，但连不上（{}），会话照常跑",
+                crate::llm::resolve::describe(&e)
+            );
+            mgr.set_backend(None);
+        }
+    }
 }
 
 /// 只有 claude/codex 有自己的 OAuth 关系，别的 provider 只能走用户自己填的
@@ -606,5 +618,48 @@ mod tests {
             profiles_dir.path(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
+    }
+
+    /// **Critical 回归测试.** 没写 `[llm]`（这里就是没有 `config.toml` 这个
+    /// 文件——「不存在」和「写了但没这一段」在 `config.rs` 里是同一件事）
+    /// 是绝大多数用户的正常状态，出错解释必须整个关着：`install_llm_backend`
+    /// 压根不能调 `resolve()`，更不能装上一个会把终端内容发出去的后端。
+    ///
+    /// 断言的是 `backend_is_set()` 这个布尔值，不是「问一次真实网络/CLI
+    /// 会不会成功」——默认 provider 是 `claude` + `Transport::Cli`，如果
+    /// Critical 那个 bug 还在，这条路径的 `resolve()` 本来就会成功（`Cli`
+    /// 传输不需要凭据），间接测法（等一个 explanation 出现）反而会被「这台
+    /// 机器上到底装没装 claude CLI」这种环境噪音污染，钉不住真正的问题。
+    #[test]
+    fn no_llm_section_means_no_backend_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock"); // 旁边故意不写 config.toml
+        let mgr = SessionManager::new();
+
+        install_llm_backend(&socket, &dir.path().join("profiles"), &mgr);
+
+        assert!(
+            !mgr.backend_is_set(),
+            "没写 [llm] 就不该装后端——这是隐私边界，不是默认值的事"
+        );
+    }
+
+    /// 反过来钉住「写了就真的开」：不能为了堵上面那条回归，把功能焊死关掉。
+    /// `[llm]` 段里什么字段都不填，靠的是 `LlmConfig` 自己的默认值
+    /// （provider claude、transport Cli），这条路径不需要任何真实凭据就该
+    /// 成功——`Transport::Cli` 只是记下命令，不在这一步真的起子进程。
+    #[test]
+    fn a_bare_llm_section_does_install_a_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(crate::config::config_path_for_socket(&socket), "[llm]\n").unwrap();
+        let mgr = SessionManager::new();
+
+        install_llm_backend(&socket, &dir.path().join("profiles"), &mgr);
+
+        assert!(
+            mgr.backend_is_set(),
+            "写了 [llm]（哪怕是空的）就该是一次显式的开——这条不能被上一条回归测试误伤"
+        );
     }
 }

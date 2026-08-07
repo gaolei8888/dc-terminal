@@ -289,10 +289,24 @@ pub fn llm_check() -> i32 {
         )
     };
 
-    println!("provider: {}", cfg.llm.provider);
-    println!("transport: {:?}", cfg.llm.transport);
+    // 没写 `[llm]` 就是没开——这是绝大多数用户的正常状态，不是「配置不对」。
+    // 见 `config.rs` 头注释：出错解释会把终端里的原始内容送给模型，必须是
+    // 用户自己主动写下 `[llm]` 才算数，这里不能替他去猜一份默认配置来验。
+    let Some(llm) = &cfg.llm else {
+        println!("出错解释这个功能现在是关着的（没写过 [llm]）。");
+        println!("要打开的话，在设置文件里加一段：");
+        println!();
+        println!("[llm]");
+        println!("provider = \"claude\"");
+        println!();
+        println!("加了之后再跑一次 `dct llm check` 就能验。");
+        return 1;
+    };
 
-    let backend = match crate::llm::resolve::resolve(&cfg, &lookup, &secrets, &oauth) {
+    println!("provider: {}", llm.provider);
+    println!("transport: {:?}", llm.transport);
+
+    let backend = match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
         Ok(b) => b,
         Err(e) => {
             println!("连不上：{}", crate::llm::resolve::describe(&e));

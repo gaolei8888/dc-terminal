@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::git::{self, FileStat};
@@ -133,6 +133,12 @@ struct Session {
     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
     /// 正持着它。裸 `Option<String>` 编不过。
     explanation_slot: Arc<Mutex<Option<String>>>,
+    /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
+    /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
+    /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
+    /// 没有这道防线的话，一个卡了很久的旧回答有可能在新一轮的新回答
+    /// 写回去**之后**才姗姗来迟，把新答案覆盖成旧的。
+    explanation_gen: Arc<AtomicU64>,
 }
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
@@ -191,6 +197,14 @@ impl SessionManager {
     pub fn explanation(&self, id: u32) -> Option<String> {
         self.with_session(id, |s| Ok(recover(s.explanation_slot.lock()).clone()))
             .unwrap_or(None)
+    }
+
+    /// 只给测试用：不暴露真正的后端（没有理由把它 clone 出去），只答
+    /// 「装没装上」这一个布尔值。`daemon.rs` 的启动测试要钉的正是「没写
+    /// `[llm]` 时压根不该装」，这个问题不该靠一次真实网络调用去间接猜。
+    #[cfg(test)]
+    pub(crate) fn backend_is_set(&self) -> bool {
+        recover(self.backend.lock()).is_some()
     }
 
     /// 注册内置之外的 profile（测试用，也是将来从磁盘加载自定义 profile 的入口）
@@ -300,6 +314,7 @@ impl SessionManager {
             error_re,
             pty,
             explanation_slot: Arc::new(Mutex::new(None)),
+            explanation_gen: Arc::new(AtomicU64::new(0)),
         };
 
         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
@@ -565,17 +580,29 @@ impl SessionManager {
     /// **绝不在 tick 里同步等模型。** tick 每 200ms 一轮，一次同步调用就能
     /// 让整个守护进程卡住，而卡住的 dct 和死掉的 agent 长得一模一样。
     fn request_explanation(&self, s: &mut Session) {
+        // 先清空、先占号，**在起线程之前**、也不管有没有后端：这一刻起
+        // 「上一次失败」的解释就不再是关于*这次*失败的了，界面不该继续
+        // 顶着一句过期的话，直到（如果有的话）新答案自己写进来。
+        *recover(s.explanation_slot.lock()) = None;
+        let my_gen = s.explanation_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
         let Some(b) = recover(self.backend.lock()).clone() else {
             return; // 没配后端：功能安静下线，会话照跑
         };
         let p = explain_prompt(&s.pty.screen_text());
         let slot = s.explanation_slot.clone(); // Arc<Mutex<Option<String>>>
+        let gen = s.explanation_gen.clone();
         std::thread::spawn(move || {
             if let Ok(text) =
                 crate::llm::complete_with_timeout(b, p, std::time::Duration::from_secs(30))
             {
-                if let Ok(mut g) = slot.lock() {
-                    *g = Some(text);
+                // 只有这次问的还是「最新一次失败」才写回——一个卡了很久的
+                // 旧线程，如果在更新的一轮已经问过之后才答完，这份迟到的
+                // 旧答案就不写了，免得把新答案盖成旧的。
+                if gen.load(Ordering::SeqCst) == my_gen {
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(text);
+                    }
                 }
             }
             // 失败就什么都不做——界面显示今天就有的那句失败提示
@@ -798,6 +825,97 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "只在进入 Failed 那一刻问一次"
+        );
+    }
+
+    /// **Important (b) 回归测试.** 第二次失败之后，界面不该继续顶着第一次
+    /// 失败时那句解释；哪怕算第一次那句的线程运气不好、比第二次还慢，晚了
+    /// 才答完，也不能让它把第二次的新答案覆盖回旧的（last-writer-wins 的
+    /// 那种覆盖，赢的必须是「最新一次失败」，不是「最后答完的那个」）。
+    #[test]
+    fn a_second_failure_does_not_show_the_first_failures_stale_explanation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Sequenced(Arc<AtomicUsize>);
+        impl crate::llm::Backend for Sequenced {
+            fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    // 第一次失败问得慢，且是「旧」答案——故意让它比第二次的
+                    // 新答案更晚才答完，用来验证它写不进去。
+                    sleep(Duration::from_millis(700));
+                    Ok("旧的解释，不该被看到。".into())
+                } else {
+                    Ok("新的解释。".into())
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mgr = SessionManager::new();
+        // 先 BOOM（第一次失败），clear 掉再打 READY（恢复成 Idle——手法同
+        // `busy_pattern_marks_working_then_idle`：`clear` 把 BOOM 从可见屏幕
+        // 上抹掉，error_re 才会真的不再匹配），再 BOOM 一次（第二次失败）。
+        mgr.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "flaky"
+                command = ["/bin/sh", "-c", "echo BOOM; sleep 0.3; clear; echo READY; sleep 0.3; echo BOOM; sleep 5"]
+                is_agent = false
+                idle_pattern = "READY"
+                error_pattern = "BOOM"
+                "#,
+            )
+            .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let id = mgr.create(&proj, "flaky", empty_secrets(), &[]).unwrap();
+        mgr.set_backend(Some(Arc::new(Sequenced(calls))));
+
+        // 第一次失败
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_of(&mgr, id) != SessionState::Failed {
+            mgr.tick();
+            assert!(Instant::now() < deadline, "第一次 BOOM 该判成 Failed");
+            sleep(Duration::from_millis(50));
+        }
+
+        // clear + READY 之后恢复成 Idle
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_of(&mgr, id) != SessionState::Idle {
+            mgr.tick();
+            assert!(
+                Instant::now() < deadline,
+                "clear 之后 BOOM 该从屏幕上消失，判成 Idle"
+            );
+            sleep(Duration::from_millis(50));
+        }
+
+        // 第二次失败
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_of(&mgr, id) != SessionState::Failed {
+            mgr.tick();
+            assert!(Instant::now() < deadline, "第二次 BOOM 该再次判成 Failed");
+            sleep(Duration::from_millis(50));
+        }
+
+        // 第二次（快）的答案落地
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mgr.explanation(id).is_none() {
+            mgr.tick();
+            assert!(Instant::now() < deadline, "第二次失败的解释迟迟没有出现");
+            sleep(Duration::from_millis(50));
+        }
+        assert_eq!(mgr.explanation(id).as_deref(), Some("新的解释。"));
+
+        // 给第一次那个慢线程留足时间答完——它的答案不许把上面这份新的盖掉。
+        sleep(Duration::from_millis(900));
+        assert_eq!(
+            mgr.explanation(id).as_deref(),
+            Some("新的解释。"),
+            "第一次失败的旧答案迟到了，不该覆盖第二次的新答案"
         );
     }
 

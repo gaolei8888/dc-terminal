@@ -453,18 +453,40 @@ pub fn run(
                         // 的这个 id，留着会让新会话第一帧按错的宽度排版。
                         app.sent_size = None;
                     } else if state == crate::session::SessionState::Failed {
-                        // 出错解释是异步算出来的（daemon 侧丢给了后台线程，
-                        // 不在 tick() 里等模型），这里问到才显示；没问到就什么
-                        // 都不做——今天原本就没有这条提示，界面必须长得
-                        // 一模一样，不能因为这个功能露出一个新的空白/报错态。
-                        if let Ok(Response::Explanation(Some(text))) = app
-                            .client()
-                            .and_then(|c| c.call(Request::Explanation { id }))
-                        {
-                            app.message = Msg::err(crate::i18n::msg::session_failure_explained(
-                                app.lang, id, &text,
-                            ));
+                        // 已经拿到这个会话**这一次**失败的解释了：不再问、
+                        // 也不再碰 app.message——见 `App::explained_failure`
+                        // 上的注释，这是不让附加视图 16ms 一帧焊死消息栏的
+                        // 关键。只有还没拿到答案时才问一次。
+                        let already_have = app
+                            .explained_failure
+                            .as_ref()
+                            .is_some_and(|(cached_id, _)| *cached_id == id);
+                        if !already_have {
+                            // 出错解释是异步算出来的（daemon 侧丢给了后台
+                            // 线程，不在 tick() 里等模型），这里问到才显示；
+                            // 没问到就什么都不做——今天原本就没有这条提示，
+                            // 界面必须长得一模一样，不能因为这个功能露出一个
+                            // 新的空白/报错态。
+                            if let Ok(Response::Explanation(Some(text))) = app
+                                .client()
+                                .and_then(|c| c.call(Request::Explanation { id }))
+                            {
+                                app.message =
+                                    Msg::err(crate::i18n::msg::session_failure_explained(
+                                        app.lang, id, &text,
+                                    ));
+                                app.explained_failure = Some((id, text));
+                            }
                         }
+                    } else if app
+                        .explained_failure
+                        .as_ref()
+                        .is_some_and(|(cached_id, _)| *cached_id == id)
+                    {
+                        // 这个会话不再是 Failed 了（恢复了）：把缓存忘掉。
+                        // 不忘的话，它下次再坏，`already_have` 会一直是
+                        // true，新的一次失败永远问不出新的解释。
+                        app.explained_failure = None;
                     }
                 }
                 _ => app.connected = false,
@@ -796,6 +818,11 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 会话标题要显示项目名
     app.need_sessions = true;
     app.view = View::Attached(id);
+    // 每次「进入」都当成一次全新的观察：`explained_failure` 缓存的是
+    // 「上一次贴在这个会话里时看到的解释」，如果这个会话在用户离开、
+    // 又回来之间恢复过、再坏过一次，缓存里那份还是上上次失败的旧话，
+    // 不清掉的话 `run()` 主循环会以为「问过了」，永远不会去问新的那次。
+    app.explained_failure = None;
 }
 
 /// 把守护进程报回来的一串警告码组成一行人话。
@@ -1362,6 +1389,31 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Important (a)/(b) 回归点，UI 这一侧：`explained_failure` 缓存必须在
+    /// **每次进入**会话时清空——不然一个「恢复了、又坏了一次」的会话，会
+    /// 一直顶着用户上一次贴在这里时看到的旧解释，`already_have` 永远为真，
+    /// 新的一次失败问不出新答案。
+    #[test]
+    fn entering_a_session_forgets_any_previously_cached_explanation() {
+        let (mut app, _dir) = App::test_app();
+        app.sessions = vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: app.current_dir.display().to_string(),
+            state: SessionState::Failed,
+            activity: String::new(),
+            is_agent: true,
+        }];
+        app.explained_failure = Some((1, "上一次贴在这里时看到的旧解释".into()));
+
+        enter_session(&mut app, 1);
+
+        assert_eq!(
+            app.explained_failure, None,
+            "进入会话必须当成一次全新的观察，不能继续顶着上一次的缓存"
+        );
     }
 
     #[test]

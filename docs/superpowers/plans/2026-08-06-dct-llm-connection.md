@@ -38,12 +38,16 @@
 - Produces:
   - `config::Transport { Cli, Http }`（`#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]`，serde rename 成小写）
   - `config::LlmConfig { pub provider: String, pub model: Option<String>, pub base_url: Option<String>, pub transport: Transport }`
-  - `config::Config { pub llm: LlmConfig }`
+  - `config::Config { pub llm: Option<LlmConfig> }`
   - `Config::from_toml(s: &str) -> anyhow::Result<Config>`
-  - `Config::load(path: &Path) -> Config`（文件不存在 = 默认值，**不报错**）
+  - `Config::load(path: &Path) -> Config`（文件不存在 = `llm: None`，**不报错**）
   - `config::config_path_for_socket(socket: &Path) -> PathBuf`
 
-**说明：** 默认 provider 是 `"claude"`、transport 是 `Cli`——那是用户最可能已经登录过的 CLI，且 `Cli` 这条路不需要任何凭据。配置整段缺失必须等价于默认值，否则老用户升级上来 dct 就起不来了。
+**说明：** `llm` 是 `Option`，不是默认开着的 `LlmConfig`——**这是隐私边界，不是随手选的类型**（2026-08-06 fix round 1，Critical）。出错解释（Task 8）会把一个失败会话屏幕上最后 2000 个字符原样送给配置里指定的模型，而那正是 `Invalid API key: sk-ant-...`、`Authorization: Bearer ...`、`.env` 内容、带 token 的 git 地址最容易出现的地方。把这功能打开必须是用户的一次主动动作，不能因为「用户什么都没配」就替他默认打开、把他终端里的东西发给第三方。
+
+文件不存在、内容为空、这一段没写、整份文件解析坏了——一律落在 `llm: None` 上，功能整个关着，`daemon.rs` 连 `resolve()` 都不会调用（见 Task 8）。**只有用户显式写下 `[llm]`**（哪怕后面什么都不填）才算「我要开」，那一刻开始，段内每个字段该有什么默认值（`provider` 默认 `"claude"`、`transport` 默认 `Cli`——那是用户最可能已经登录过的 CLI，且 `Cli` 这条路不需要任何凭据）还是照旧生效。「要不要开」和「开了之后怎么配」是两件事，前者靠 `Option`，后者靠 `LlmConfig` 内部的 `#[serde(default = ...)]`。
+
+⚠️ 下面 Step 1/Step 3 的代码块是本任务**最初**的设计（`llm: LlmConfig`，配置缺失 = 默认开着），已被 2026-08-06 fix round 1 的 Critical 修复取代。实现前请直接对照当前 `src/config.rs`（`llm: Option<LlmConfig>`），不要照抄下面这份旧代码。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -216,7 +220,9 @@ pub fn config_path_for_socket(socket: &Path) -> PathBuf {
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --lib config::`
-Expected: 6 passed
+Expected (post fix-round-1, `llm: Option<LlmConfig>`): 8 passed — no `[llm]` section /
+empty file / missing file / broken file all assert `llm.is_none()`; a bare `[llm]` and a
+full `[llm]` both assert `llm.is_some()` with the right fields.
 
 - [ ] **Step 5: 提交**
 
@@ -224,9 +230,11 @@ Expected: 6 passed
 cargo fmt && cargo test --lib config:: && git add src/config.rs src/lib.rs
 git commit -m "feat(config): add ~/.dct/config.toml with an [llm] section
 
-Defaults to the claude profile over the CLI transport, which needs no
-credential at all. A missing or broken config falls back to defaults
-instead of failing to start: the LLM is an enhancement, not a foundation."
+llm is Option<LlmConfig>, not a default-on LlmConfig: turning on the feature
+that sends failed-session screen text to a model must be a deliberate act,
+not something a user gets by having no config file at all. Writing a bare
+[llm] opts in; the fields inside it still default to the claude profile
+over the CLI transport, which needs no credential at all."
 ```
 
 ---
@@ -1627,9 +1635,12 @@ this is what makes the 'verified against a live endpoint' bar checkable."
 **Files:**
 - Modify: `src/session.rs`（`Session` 加字段；`tick()` 里检测进入 `Failed` 的那一刻）
 - Modify: `src/proto.rs`（`Request::Explanation { id }`、`Response::Explanation(Option<String>)`）
-- Modify: `src/daemon.rs`（接线；启动时 resolve 一次后端）
-- Modify: `src/ui/mod.rs`（`Failed` 会话上显示解释）
+- Modify: `src/daemon.rs`（接线；启动时 resolve 一次后端，仅当 `cfg.llm` 是 `Some`）
+- Modify: `src/ui/mod.rs`（`Failed` 会话上显示解释；`src/ui/app.rs` 加一个每会话缓存字段）
 - Modify: `src/i18n.rs`（新词条）
+- fix round 1 追加触及：`src/llm/resolve.rs`（`resolve()` 改接 `LlmConfig` 而不是
+  `Config`）、`src/cli.rs`（`llm_check` 处理 `cfg.llm` 是 `None` 的情形）——见下面的
+  fix round 1 附注。
 
 **Interfaces:**
 - Consumes: `llm::{Backend, Prompt, complete_with_timeout}`、`llm::resolve::resolve`
@@ -1646,6 +1657,34 @@ this is what makes the 'verified against a live endpoint' bar checkable."
 **退路：** 后端没配 / 调不通 / 超时，`explanation` 保持 `None`，界面显示今天就有的那句失败提示。**功能安静下线，不打扰用户。**
 
 截屏文本要**截尾**再送：整屏可能几千字，只要最后 2000 字符——错误一定在末尾。
+
+> **2026-08-06 fix round 1（code review：1 Critical + 2 Important）追加，实现前必读：**
+>
+> - **Critical——「没配后端」必须真的意味着「没配」，不能靠 `Config` 默认值假装没配。**
+>   `daemon.rs` 启动时装后端这一步，**必须先看 `cfg.llm.is_some()`**（Task 1 的 fix：`Config::llm`
+>   已经是 `Option<LlmConfig>`，缺 `[llm]` 就是 `None`）——`None` 时压根不调 `resolve()`、
+>   不装后端、不打印任何东西；只有用户确实写了 `[llm]` 却连不上时才值得往 stderr 留一行。
+>   这一步值得抽成一个独立函数（比如 `install_llm_backend(socket, profiles_dir, mgr)`），
+>   好让「没写 `[llm]` 就不该装后端」这条能在不起真实 socket/listener 的情况下直接单测——
+>   断言 `SessionManager` 有没有装上后端，不要靠等一个真实网络调用的结果去反推，那样测试会
+>   被「这台机器上到底装没装某个 CLI」这类环境噪音污染。
+> - **Important (a)——UI 不能每帧都重发 `Request::Explanation`、每帧都重写 `app.message`。**
+>   附加视图 16ms 一轮；`App` 需要一个「这个会话这一次失败已经拿到解释了」的缓存（比如
+>   `explained_failure: Option<(u32, String)>`），拿到过就不再问、也不再碰 `app.message`
+>   ——不然粘贴失败、Ctrl+C 打断这类别处设的消息，下一帧就被这句话原样盖掉，用户永远看不见。
+>   `enter_session`（或等价的「进入这个会话」入口）要清空这份缓存：不清的话，一个「恢复了、
+>   又坏了一次」的会话会一直顶着用户上一次看到的旧解释，永远问不出新的。
+> - **Important (b)——第二次失败不能显示第一次失败的解释，也不能被第一次的慢答案覆盖。**
+>   `request_explanation` 在**起线程之前**（不管有没有配后端）就要清空 `explanation_slot`
+>   并给这一轮失败发一个号（`explanation_gen: Arc<AtomicU64>` 之类，自增一次）；后台线程
+>   算完之后先比一遍「我领到的号还是不是最新那个」，不是才不写——这样一个卡了很久的旧线程，
+>   哪怕在新一轮失败已经有了新答案之后才姗姗来迟，也没法把新答案盖成旧的。
+>
+> 这三条把原本只列在 Files 里的 `src/session.rs` / `src/daemon.rs` / `src/ui/mod.rs`
+> 的实现细节改深了；`src/config.rs`（Task 1）、`src/llm/resolve.rs`、`src/cli.rs`
+> 的 `llm_check` 也要跟着 `Config::llm: Option<LlmConfig>` 一起改（`resolve()` 改成只接
+> `LlmConfig`，「开没开」的判断留给调用方；`llm_check` 在 `cfg.llm` 是 `None` 时打印一句
+> 明确的中文——功能没开、该在配置文件里加什么——然后非零退出，不能走「连不上」那条话术）。
 
 - [ ] **Step 1: 写失败的测试**
 
