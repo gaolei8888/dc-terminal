@@ -109,16 +109,24 @@ impl Backend for HttpBackend {
     }
 }
 
+/// 直连用的 `ureq::Agent`。单独拆出来是为了让 `.timeout_connect()` 这类
+/// 配置能在不发真实请求的前提下被测试用 `Debug` 输出核实到——同
+/// `verify.rs` 的 `build_probe_agent`：`send_real` 本身不能被测试调用
+/// （会打真网络），但构建 `Agent` 这一步不涉及任何 I/O。
+fn build_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(HTTP_TIMEOUT)
+        .timeout_connect(HTTP_TIMEOUT)
+        .build()
+}
+
 /// 真实传输。**没有单元测试覆盖**，在实测那一步验。
 fn send_real(
     url: &str,
     cred: &Credential,
     body: &serde_json::Value,
 ) -> Result<(u16, String), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(HTTP_TIMEOUT)
-        .timeout_connect(HTTP_TIMEOUT)
-        .build();
+    let agent = build_http_agent();
     let mut req = agent.post(url).set("content-type", "application/json");
     match cred {
         Credential::Key(k) => {
@@ -147,6 +155,7 @@ fn send_real(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn p() -> Prompt {
         Prompt {
@@ -265,5 +274,61 @@ mod tests {
             }),
         );
         assert_eq!(b.complete(&p()), Ok("好了".to_string()));
+    }
+
+    /// 建 `Agent` 不发请求，不碰网络——同 `verify.rs` 的
+    /// `probe_agent_bounds_the_connect_phase_too`，能在不打真网络的前提下
+    /// 核实 `timeout_connect` 真的被设置了，而不只是相信注释。这就是
+    /// 本次要守住的回归点：之前只设了 `.timeout()`，建连阶段会退回 ureq
+    /// 默认的 30 秒；`send_real` 本身没有单测覆盖，所以这个防护必须扎在
+    /// 单独拆出来的 `build_http_agent` 上。
+    #[test]
+    fn http_agent_bounds_the_connect_phase_too() {
+        let debug = format!("{:?}", build_http_agent());
+        assert!(
+            debug.contains("timeout_connect: Some(20s)"),
+            "connect 阶段没有被 HTTP_TIMEOUT 兜住，可能退回 ureq 默认的 30 秒: {debug}"
+        );
+        assert!(
+            debug.contains("timeout: Some(20s)"),
+            "整体超时没有被设置: {debug}"
+        );
+    }
+
+    /// `body_for` 单测只能证明这个函数本身对，证不了 `complete()` 真的把
+    /// `self.wire`（而不是写死的某个值）传给了它。这条测试盯住 `complete()`
+    /// 实际调用 sender 时传出去的 url / 凭据 / 请求体，同 `verify.rs` 的
+    /// `the_key_reaches_the_transport`。
+    ///
+    /// 用 `Wire::Anthropic` 构造是关键：断言请求体有一个**顶层** `system`
+    /// 字段，才是真正能抓住「`complete()` 里把 wire 写死成 `Openai`」这类
+    /// 回归的地方——那种改动不会碰到 `body_for` 自己的单测，只会在这个
+    /// 接缝上露出来。
+    #[test]
+    fn the_backend_sends_its_own_url_wire_and_credential() {
+        let seen: Arc<Mutex<(String, Credential, serde_json::Value)>> = Arc::new(Mutex::new((
+            String::new(),
+            Credential::Inherit,
+            serde_json::Value::Null,
+        )));
+        let sink = seen.clone();
+        let b = HttpBackend::with_sender(
+            "https://x/v1/messages".into(),
+            Wire::Anthropic,
+            "m".into(),
+            Credential::Key("sk-abc".into()),
+            Arc::new(move |url, cred, body| {
+                *sink.lock().unwrap() = (url.to_string(), cred.clone(), body.clone());
+                Ok((200, r#"{"content":[{"type":"text","text":"ok"}]}"#.into()))
+            }),
+        );
+        b.complete(&p()).unwrap();
+        let (url, cred, body) = seen.lock().unwrap().clone();
+        assert_eq!(url, "https://x/v1/messages");
+        // `Credential` 的 `Debug` 是刻意打码的——比较用 `==`（`Credential`
+        // 派生了 `PartialEq`），断言失败信息里绝不能把明文格式化出来。
+        assert_eq!(cred, Credential::Key("sk-abc".into()));
+        assert_eq!(body["system"], "s");
+        assert!(body["messages"][0].get("system").is_none());
     }
 }
