@@ -5,7 +5,7 @@ use ratatui::widgets::ListState;
 
 use crate::client::Client;
 use crate::pty::ScreenSpan;
-use crate::session::SessionInfo;
+use crate::session::{ScrollState, SessionInfo};
 use crate::verify::VerifyOutcome;
 
 use super::view::View;
@@ -50,6 +50,15 @@ pub struct App {
     pub message: Msg,
     pub screen: Vec<Vec<ScreenSpan>>,
     pub screen_cursor: (u16, u16),
+    /// 最近一次 `Screen` 响应带回来的滚动状态。滚轮和翻页键都要看它分流
+    /// （agent 自己攥着画面还是 dct 攥着），底栏的滚动提示也要看它——
+    /// 每帧都会被刷新，滞后最多一帧，够用了。
+    pub scroll: ScrollState,
+    /// 会话内容区左上角在真实终端上的坐标，由 `attach::draw` 每帧画完之后
+    /// 填上。鼠标事件的列/行是终端坐标，换算成 agent 画面里的坐标要减掉它——
+    /// `handle_mouse` 自己不硬算边框宽度，布局改了这里也不会悄悄算错。
+    /// `None` = 还没画过一帧，或者当前根本不在会话视图里。
+    pub screen_origin: Option<(u16, u16)>,
     // 九宫格当前页那几个会话的画面，按 id 跟格子配对。跟 `screen` 分开存：
     // 那一份是附加视图正在放大的**单个**会话，两者的刷新节奏和来源消息
     // 都不一样（16ms 的 `Screen` vs 300ms 的 `Screens`），共用一个字段
@@ -151,6 +160,8 @@ impl App {
             message: "".into(),
             screen: Vec::new(),
             screen_cursor: (0, 0),
+            scroll: ScrollState::default(),
+            screen_origin: None,
             grid_screens: Vec::new(),
             grid_last_fetch: None,
             grid_page: None,

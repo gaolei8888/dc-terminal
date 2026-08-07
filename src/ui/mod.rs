@@ -1,6 +1,8 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -82,11 +84,30 @@ pub fn dim() -> Style {
 /// 「尽量多还原一点」。
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    // 无条件关鼠标捕获，不管这次运行有没有真的开过：没开过时多发一次关闭
+    // 序列是无害的，而漏关会让用户的终端从此点哪儿都冒出 SGR 乱码——
+    // 比翻不了历史严重得多，所以这里不像捕获本身那样只在会话里才动作。
     let _ = execute!(
         std::io::stdout(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     );
+}
+
+/// 这一帧要不要开关鼠标捕获。`None` = 上一帧和这一帧「在不在会话里」
+/// 没变，什么都不用做。
+///
+/// 抽成纯函数是因为副作用（`execute!` 往 stdout 写转义序列）没法单测，
+/// 判断「变没变」这件事能测——而且判断错了后果不轻：漏开会让滚轮/点击
+/// 走终端自己的选中逻辑而不是这套协议，漏关会让用户退回看板之后连
+/// 拖选文字复制都做不了。
+fn mouse_capture_transition(was_attached: bool, is_attached: bool) -> Option<bool> {
+    if was_attached == is_attached {
+        None
+    } else {
+        Some(is_attached)
+    }
 }
 
 /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
@@ -179,6 +200,12 @@ pub fn run(
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
+    // 鼠标捕获只在会话里开：看板不需要滚，而开着捕获会让终端原生的选中
+    // 复制失效——把这个代价限制在真正需要它的地方。见下面 `term.draw`
+    // 之前那段每帧检查一次的逻辑，以及它为什么不挂在某一个「进入会话」的
+    // 分支上（进 `View::Attached` 的路不止一条：`enter_session`、密钥验证
+    // 通过后直接建会话、九宫格里……挂哪个分支都会漏另一条）。
+    let mut mouse_captured = false;
 
     loop {
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
@@ -433,12 +460,13 @@ pub fn run(
                     lines,
                     cursor,
                     state,
-                    // 底栏画滚动提示、鼠标事件转发是下一个任务的活；这里先
-                    // 用 `..` 接住新字段，别让协议加字段变成这边的编译错误。
-                    ..
+                    scroll,
                 }) => {
                     app.screen = lines;
                     app.screen_cursor = cursor;
+                    // 按键和滚轮怎么分流、底栏那句提示写什么，都看这一份——
+                    // 每 16ms 跟着 `Screen` 一起刷新，滞后最多一帧，够用了。
+                    app.scroll = scroll;
                     app.connected = true;
                     // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
@@ -496,6 +524,22 @@ pub fn run(
             }
         }
 
+        // 检查一次「在不在会话里」有没有变，而不是在每个能进/出 `View::Attached`
+        // 的分支各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
+        // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
+        // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
+        // 会话已结束……）到这里都已经跑完，此刻的 `app.view` 就是即将画出来
+        // 的那一帧。
+        let is_attached = matches!(app.view, View::Attached(_));
+        if let Some(enable) = mouse_capture_transition(mouse_captured, is_attached) {
+            let _ = if enable {
+                execute!(std::io::stdout(), EnableMouseCapture)
+            } else {
+                execute!(std::io::stdout(), DisableMouseCapture)
+            };
+            mouse_captured = enable;
+        }
+
         term.draw(|f| draw(f, &mut app))?;
 
         // 会话里要跟手：刷新慢了，你敲的字要等下一轮才显示，每次按键都像卡了一下。
@@ -505,6 +549,14 @@ pub fn run(
             continue;
         }
         let ev = event::read()?;
+        // 这个 `continue` 在按键处理**之前**，不在任何按键分支里，不违反
+        // 房规（见 `attach::handle_key` 头上的注释）。但循环末尾清理陈旧
+        // `message` 的那段也会被它跳过——所以 `handle_mouse` 内部**不许**
+        // 改 `app.message`，那条约束写在它自己的文档注释上。
+        if let Event::Mouse(m) = ev {
+            attach::handle_mouse(&mut app, m)?;
+            continue;
+        }
         // 粘贴整段一次发完，不能拆成一个个字符
         if let Event::Paste(text) = ev {
             match &mut app.view {
@@ -1242,10 +1294,21 @@ fn draw(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Red),
         )
     } else if app.message.text.is_empty() {
-        (
-            BarContent::Keys(idle_help(&app.view, app.scope, app.lang, help_ctx(app))),
-            Style::default(),
-        )
+        // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
+        // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
+        // 只在 `message` 为空这一支里问它：`message` 优先在外层 if/else
+        // 链上已经保证了（见函数头注释），这里不用重复判断。
+        let scroll_hint = match &app.view {
+            View::Attached(_) => attach::scroll_hint(&app.scroll, app.lang),
+            _ => None,
+        };
+        match scroll_hint {
+            Some(hint) => (BarContent::Text(hint), Style::default()),
+            None => (
+                BarContent::Keys(idle_help(&app.view, app.scope, app.lang, help_ctx(app))),
+                Style::default(),
+            ),
+        }
     } else if app.message.error {
         (
             BarContent::Text(app.message.text.clone()),
@@ -2194,5 +2257,74 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
         assert!(c.contains("u回滚"), "看板要显示自己的按键表：{c}");
+    }
+
+    #[test]
+    fn a_scroll_hint_takes_over_the_bottom_bar_when_there_is_history() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.scroll = crate::session::ScrollState {
+            agent_owns: false,
+            alt_screen: false,
+            max: 500,
+            offset: 40,
+            new_lines: 0,
+        };
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        assert!(
+            c.contains('4') && c.contains('0'),
+            "翻到哪儿了要写在底栏：{c}"
+        );
+        assert!(
+            !c.contains("F3下一个会话"),
+            "有滚动提示可显示时，不该再挤按键表：{c}"
+        );
+    }
+
+    /// 消息和滚动提示抢同一行时消息赢——消息是对用户刚才那个动作的回应，
+    /// 滚动提示是持续状态，盖掉前者会让用户以为自己那步操作没反应。
+    #[test]
+    fn a_message_beats_the_scroll_hint() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.scroll = crate::session::ScrollState {
+            agent_owns: false,
+            alt_screen: false,
+            max: 500,
+            offset: 40,
+            new_lines: 0,
+        };
+        app.message = "已切到某个项目".into();
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        assert!(c.contains("已切到某个项目"), "消息该赢，没显示出来：{c}");
+        assert!(!c.contains("按End回到底部"), "滚动提示不该盖过消息：{c}");
+    }
+
+    /// 副作用（`execute!` 往 stdout 写转义序列）没法单测，但「这一帧该不该
+    /// 动一下捕获」这个判断能测——`run()` 每帧都靠它决定要不要发
+    /// `EnableMouseCapture`/`DisableMouseCapture`，判断错了要么漏开
+    /// （滚轮/点击走了终端自己的逻辑）要么漏关（退回看板还拖选不了文字）。
+    #[test]
+    fn mouse_capture_toggles_only_on_a_real_transition() {
+        assert_eq!(mouse_capture_transition(false, false), None);
+        assert_eq!(mouse_capture_transition(true, true), None);
+        assert_eq!(mouse_capture_transition(false, true), Some(true));
+        assert_eq!(mouse_capture_transition(true, false), Some(false));
     }
 }

@@ -707,6 +707,39 @@ pub mod msg {
         )
     }
 
+    /// 底栏「往上翻了，下面又有新东西了」。用户滚回底部之前画面不会自己跳，
+    /// 免得他正读一半的历史被新输出顶飞——这句话是唯一的提醒。
+    pub fn scroll_new_lines_below(lang: Lang, n: usize) -> String {
+        t!(
+            lang,
+            en: format!("↓ {n} new line(s) below"),
+            zh: format!("↓ 下面还有 {n} 行新内容"),
+        )
+    }
+
+    /// 底栏「已经往上翻了多远，怎么回去」。两件事缺一不可——只说翻了多远，
+    /// 用户不知道怎么回底部；只说怎么回去，他不知道自己是不是还看得到最新的。
+    pub fn scrolled_up(lang: Lang, offset: usize) -> String {
+        t!(
+            lang,
+            en: format!("↑ Scrolled up {offset} line(s) · press End to jump back down"),
+            zh: format!("↑ 已往上翻 {offset} 行 · 按 End 回到底部"),
+        )
+    }
+
+    /// agent 自己攥着画面又不收鼠标（比如 Claude Code）：滚轮和翻页在这个
+    /// 会话里都没用。装死的话用户会以为滚轮坏了，反复去试——必须说清楚
+    /// 「这儿翻不了」。不能提"备用屏"/"scrollback"/"缓冲区"这类黑话，用户
+    /// 不是程序员，听不懂这些词，只会更迷惑。
+    pub fn agent_owns_the_screen(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "This assistant controls its own screen here, so there's nothing to look back at"
+                .to_string(),
+            zh: "这个 agent 自己管画面，翻不了历史".to_string(),
+        )
+    }
+
     /// 把守护进程报回来的错误码组成一句人话。**这是 daemon 侧文案唯一的
     /// 落点**——daemon 只报码，句子在这里成形，所以切语言立刻生效、
     /// 不用重启 daemon。
