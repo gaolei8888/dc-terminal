@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod git;
 pub mod i18n;
+pub mod llm;
 pub mod profile;
 pub mod projects;
 pub mod proto;
