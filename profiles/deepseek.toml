@@ -29,3 +29,10 @@ en = "Sign up at platform.deepseek.com, then copy your API key"
 
 [secret.verify]
 url = "https://api.deepseek.com/anthropic/v1/messages"
+
+[headless]
+command = ["claude", "-p"]
+
+[api]
+base_url = "https://api.deepseek.com/anthropic"
+wire = "anthropic"

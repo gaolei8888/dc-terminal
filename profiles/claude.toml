@@ -22,3 +22,7 @@ command = ["npm", "i", "-g", "@anthropic-ai/claude-code"]
 [install.note]
 zh = "需要先装 Node.js"
 en = "Requires Node.js"
+
+[headless]
+# 实测：`claude -p/--print` 是官方的非交互模式，提示词作为参数追加。
+command = ["claude", "-p"]
