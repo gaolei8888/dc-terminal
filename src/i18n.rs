@@ -127,6 +127,15 @@ pub enum Key {
     OrPressDigit,
     TypeToFilter,
     Language,
+    // —— 全部按键浮层 ——
+    /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
+    /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
+    /// 就是「后面还有」的通用说法。
+    MoreKeys,
+    AllKeys,
+    KeysGroupMove,
+    KeysGroupSession,
+    KeysGroupConfig,
     // —— 逃生键 ——
     BackToBoard,
     BackToBoardWithF2,
@@ -259,6 +268,12 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
+
+        MoreKeys => t!(lang, en: "…", zh: "…"),
+        AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
+        KeysGroupMove => t!(lang, en: "Move", zh: "走动"),
+        KeysGroupSession => t!(lang, en: "Sessions", zh: "会话"),
+        KeysGroupConfig => t!(lang, en: "Settings", zh: "设置"),
 
         BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
         BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
@@ -463,15 +478,52 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
     }
 }
 
-/// 把「按键 + 它做什么」拼成底栏那一行。
+/// 底栏和「全部按键」浮层里的一条提示：**键名和说明分开存**。
+///
+/// 分开不是为了好看：键名要加粗（加粗是 `Span` 一级的事），拼成一整个
+/// 字符串之后再想切回来，只能靠猜哪个空格是分隔符——而 `Ctrl+C 打断`、
+/// `方向键选格子`、`其余按键都发给 agent` 各有各的形状，猜不准就会加粗到
+/// 说明的头一个词上去。
+///
+/// `key` 是空串表示这条只是一句说明，没有对应的按键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelpItem {
+    pub key: &'static str,
+    pub label: &'static str,
+}
+
+impl std::fmt::Display for HelpItem {
+    /// 一条提示拼成文字的样子。渲染时加粗的那一份必须跟这里给出同一串
+    /// 字符——单测断言的是这一份，屏幕上画的是那一份，两者分叉就等于
+    /// 测了个寂寞。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.key.is_empty() {
+            write!(f, "{}", self.label)
+        } else {
+            write!(f, "{} {}", self.key, self.label)
+        }
+    }
+}
+
+/// 把「按键 + 它做什么」列成底栏那一排。
 ///
 /// 按条目拼而不是把整句写进词条表：整句进表的话，每种语言都要把 `n`/`p`/`Enter`
 /// 这些**不翻译**的键名再抄一遍，加一种语言就多抄一份，而键名改了要改 N 处。
-/// 分隔符是两个半角空格，正好是 `widgets::wrap_help` 认的断点。
-pub fn help_line(items: &[(&str, Key)], lang: Lang) -> String {
+pub fn help_items(items: &[(&'static str, Key)], lang: Lang) -> Vec<HelpItem> {
     items
         .iter()
-        .map(|(k, key)| format!("{k} {}", text(*key, lang)))
+        .map(|(k, key)| HelpItem {
+            key: k,
+            label: text(*key, lang),
+        })
+        .collect()
+}
+
+/// 一排提示拼成文字。分隔符是两个半角空格，正好是 `widgets::wrap_help` 认的断点。
+pub fn help_text(items: &[HelpItem]) -> String {
+    items
+        .iter()
+        .map(|it| it.to_string())
         .collect::<Vec<_>>()
         .join("  ")
 }
@@ -1059,10 +1111,22 @@ mod tests {
 
     #[test]
     fn help_line_joins_keys_with_their_labels() {
-        let line = help_line(&[("n", Key::New), ("q", Key::Quit)], Lang::En);
+        let items = help_items(&[("n", Key::New), ("q", Key::Quit)], Lang::En);
+        let line = help_text(&items);
         assert_eq!(line, "n new  q quit");
         // 分隔符必须是两个空格：`widgets::wrap_help` 就认它当断点
         assert!(line.contains("  "));
+        // 键名和说明分开存着，渲染时才有东西可加粗
+        assert_eq!(items[0].key, "n");
+        assert_eq!(items[0].label, "new");
+    }
+
+    /// 没有对应按键的那种提示（「其余按键都发给 agent」）不能在句首多出
+    /// 一个空格——原来的 `format!("{k} {label}")` 在 `k` 是空串时就会。
+    #[test]
+    fn a_help_item_without_a_key_is_just_its_label() {
+        let items = help_items(&[("", Key::OtherKeysGoToAgent)], Lang::En);
+        assert_eq!(help_text(&items), text(Key::OtherKeysGoToAgent, Lang::En));
     }
 
     #[test]

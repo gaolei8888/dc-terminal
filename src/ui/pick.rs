@@ -675,6 +675,7 @@ mod tests {
             dir: d.display().to_string(),
             state: SessionState::Idle,
             activity: String::new(),
+            is_agent: true,
         };
         app.sessions = vec![mk(1, &a), mk(2, &b)];
         app.current_dir = a.clone();

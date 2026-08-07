@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
 
+use crate::i18n::HelpItem;
 use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
 use crate::session::SessionState;
 
@@ -128,7 +129,7 @@ pub(crate) fn char_width(ch: char) -> usize {
     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
@@ -216,9 +217,205 @@ pub(crate) fn wrap_help(help: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// 一条提示占几列。跟 `HelpItem` 的 `Display` 必须一致——量的和画的
+/// 不是同一串字符的话，算出来的宽度就是假的。
+pub(crate) fn item_width(it: &HelpItem) -> usize {
+    display_width(&it.to_string())
+}
+
+/// 底栏那一行：从前往后取放得下的若干条，**最后一条永远保留**。
+///
+/// 底栏只有一行（多一行就少一行内容区，九宫格在 80×24 下直接跌破
+/// `grid.rs` 的 `MIN_ROWS`），所以放不下的必须丢。丢哪些由**调用方排的
+/// 顺序**决定：`idle_help` 里越靠前的键越重要，尾巴上的 `? …` 是那扇
+/// 「被丢掉的键都在里面」的门，它一旦被丢，用户就再也找不回那些键了——
+/// 所以它是唯一一条不参与截断的。
+///
+/// 宽度小到连尾巴都放不下时仍然把尾巴还回去：让 `Paragraph` 去截，
+/// 总比返回一个空行、屏幕上什么都不写强。
+pub(crate) fn fit_help(items: &[HelpItem], width: usize) -> Vec<&HelpItem> {
+    let Some((tail, head)) = items.split_last() else {
+        return Vec::new();
+    };
+    const SEP_W: usize = 2;
+    let mut out: Vec<&HelpItem> = Vec::new();
+    // 给尾巴留的位置：它自己的宽度，外加它前面那个分隔符
+    let budget = width.saturating_sub(item_width(tail) + SEP_W);
+    let mut used = 0usize;
+    for it in head {
+        let w = item_width(it);
+        let need = if out.is_empty() { w } else { SEP_W + w };
+        if used + need > budget {
+            break;
+        }
+        used += need;
+        out.push(it);
+    }
+    out.push(tail);
+    out
+}
+
+/// 把一排提示折成不超过 `width` 列的若干行（「全部按键」浮层用）。
+///
+/// 跟 `fit_help` 分开：那边只有一行、放不下就丢；这边是浮层，行数管够，
+/// 一条都不能丢。
+pub(crate) fn wrap_items(items: &[HelpItem], width: usize) -> Vec<Vec<&HelpItem>> {
+    const SEP_W: usize = 2;
+    let mut rows: Vec<Vec<&HelpItem>> = Vec::new();
+    let mut cur: Vec<&HelpItem> = Vec::new();
+    let mut used = 0usize;
+    for it in items {
+        let w = item_width(it);
+        if !cur.is_empty() && used + SEP_W + w > width {
+            rows.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        used += if cur.is_empty() { w } else { SEP_W + w };
+        cur.push(it);
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+/// 一排提示画成带样式的一行：**键名加粗，说明不加粗**。
+///
+/// 加粗是这一行里唯一的层次——底栏是一串「字母 + 中文」交替的文字，
+/// 不把字母挑出来的话，用户得逐个词去认哪个是能按的键。
+pub(crate) fn help_spans(items: &[&HelpItem]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for it in items {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        if !it.key.is_empty() {
+            spans.push(Span::styled(
+                it.key.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::raw(it.label.to_string()));
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{help_items, Key, Lang};
+
+    fn items(pairs: &[(&'static str, Key)]) -> Vec<HelpItem> {
+        help_items(pairs, Lang::Zh)
+    }
+
+    /// 底栏只有一行，放不下的只能丢——但那扇能找回它们的门（尾巴上的
+    /// `? …`）绝不能跟着一起被丢。丢了它，被截掉的键就真的没有任何入口了。
+    #[test]
+    fn fit_help_never_drops_the_tail() {
+        let all = items(&[
+            ("↑↓", Key::Select),
+            ("Enter", Key::Open),
+            ("n", Key::New),
+            ("s", Key::Stop),
+            ("d", Key::Diff),
+            ("?", Key::MoreKeys),
+        ]);
+        for width in [0usize, 1, 3, 8, 20, 57] {
+            let kept = fit_help(&all, width);
+            assert_eq!(
+                kept.last().copied(),
+                all.last(),
+                "{width} 列下尾巴被丢了：{kept:?}"
+            );
+        }
+    }
+
+    /// 截断从**尾巴前面**开始，而且是从后往前丢：越靠前的键越重要。
+    #[test]
+    fn fit_help_keeps_the_important_keys_first() {
+        let all = items(&[
+            ("↑↓", Key::Select),  // 7 列
+            ("Enter", Key::Open), // 10 列
+            ("n", Key::New),      // 6 列
+            ("?", Key::MoreKeys), // 3 列
+        ]);
+        // 7 + 2 + 10 + 2 + 3 = 24 列：正好放得下前两条加尾巴，`n 新建` 放不下
+        let kept = fit_help(&all, 24);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].key, "↑↓");
+        assert_eq!(kept[1].key, "Enter");
+        assert_eq!(kept[2].key, "?");
+        // 宽一点就该多露一个出来
+        assert_eq!(fit_help(&all, 32).len(), 4);
+    }
+
+    /// 无论多窄，底栏都只有一行——这是这次改动的全部意义。
+    #[test]
+    fn fit_help_always_fits_on_one_line() {
+        let all = items(&[
+            ("↑↓", Key::Select),
+            ("Enter", Key::Open),
+            ("n", Key::New),
+            ("N", Key::SwitchAgent),
+            ("p", Key::SwitchProject),
+            ("a", Key::SeeAllProjects),
+            ("?", Key::MoreKeys),
+        ]);
+        for width in [24usize, 40, 57, 80, 120] {
+            let line: String = fit_help(&all, width)
+                .iter()
+                .map(|it| it.to_string())
+                .collect::<Vec<_>>()
+                .join("  ");
+            assert!(
+                display_width(&line) <= width,
+                "{width} 列下折出了 {} 列：{line}",
+                display_width(&line)
+            );
+        }
+    }
+
+    /// 键名加粗，说明不加粗。这一行里字母和中文交替出现，不给键名一点
+    /// 重量的话，用户得逐个词去认哪个是能按的。
+    #[test]
+    fn help_spans_bold_only_the_key_name() {
+        let all = items(&[("n", Key::New)]);
+        let spans = help_spans(&all.iter().collect::<Vec<_>>());
+        let bold: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, vec!["n"], "只有键名该是粗的");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "n 新建", "加粗不能改变画出来的字");
+    }
+
+    /// 没有键名的那种提示（「其余按键都发给 agent」）不该在句首多一个空格。
+    #[test]
+    fn help_spans_of_a_keyless_item_start_with_the_label() {
+        let all = items(&[("", Key::OtherKeysGoToAgent)]);
+        let spans = help_spans(&all.iter().collect::<Vec<_>>());
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, crate::i18n::text(Key::OtherKeysGoToAgent, Lang::Zh));
+    }
+
+    /// 浮层里一条都不能丢：底栏丢掉的键正是靠它才找得回来。
+    #[test]
+    fn wrap_items_keeps_every_item() {
+        let all = items(&[
+            ("n", Key::New),
+            ("N", Key::SwitchAgent),
+            ("s", Key::Stop),
+            ("u", Key::Undo),
+            ("d", Key::Diff),
+        ]);
+        let rows = wrap_items(&all, 16);
+        assert!(rows.len() > 1, "16 列放不下，必须折行：{rows:?}");
+        assert_eq!(rows.iter().map(|r| r.len()).sum::<usize>(), all.len());
+    }
 
     /// 底栏按键表折行时，**一个键的名字和它的说明绝不能分家**。
     /// ratatui 自带的 `Wrap` 在任何空白处断行，于是「p 换项目」会被折成

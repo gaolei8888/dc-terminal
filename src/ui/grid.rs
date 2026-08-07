@@ -175,6 +175,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Char('g') if is_plain_key(&key) => super::toggle_view_mode(app),
+        // 底栏只有一行，装不下的键都在这扇门后面（底栏尾巴上那条 `? …`）。
+        // 回复框开着时走不到这里——上面那道关把键盘整个交给了框。
+        KeyCode::Char('?') if is_plain_key(&key) => super::keys::open(app),
         // 九宫格是看板的另一种画法，不是另一个世界：开会话、换项目、
         // 管密钥、退出这几个键跟列表里一模一样（共用同一份实现，见
         // mod.rs 里这几个函数的注释）。用户不该因为切了个视图就得先退
@@ -734,6 +737,7 @@ mod tests {
             dir: "/tmp/a".into(),
             state,
             activity: String::new(),
+            is_agent: true,
         }
     }
 
@@ -744,6 +748,7 @@ mod tests {
             dir: dir.into(),
             state: SessionState::Idle,
             activity: String::new(),
+            is_agent: true,
         }
     }
 

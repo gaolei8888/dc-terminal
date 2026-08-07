@@ -117,6 +117,7 @@ mod tests {
             dir: "/tmp/a".into(),
             state,
             activity: String::new(),
+            is_agent: true,
         }
     }
 

@@ -80,6 +80,17 @@ pub struct SessionInfo {
     /// 这个 agent 此刻在干什么（屏幕最后一行有内容的文字）。
     /// 看板靠它做"扫一眼全局"，不需要打开每个会话。
     pub activity: String,
+    /// 是 agent 会话还是普通命令行。
+    ///
+    /// 界面**必须**知道这件事：`u 回滚` / `d 改动` 只对 agent 会话有效
+    /// （`checkpoint_base` 对命令行会话直接返回 `NotAnAgentSession`），
+    /// 底栏不能对着一个 shell 会话写这两个键——屏幕上写着做不到的操作
+    /// 比不写更糟。
+    ///
+    /// 从守护进程侧的 `Session::is_agent` 原样带上来，不在界面侧靠 profile
+    /// 名字猜：那是 profile.toml 里的一个声明（`profile.rs` 的 `is_agent`），
+    /// 只有守护进程读得到，猜的迟早会跟真值分叉。
+    pub is_agent: bool,
 }
 
 struct Session {
@@ -289,6 +300,7 @@ impl SessionManager {
                     dir: s.dir.display().to_string(),
                     state: s.state,
                     activity: s.pty.last_line(),
+                    is_agent: s.is_agent,
                 }
             })
             .collect();

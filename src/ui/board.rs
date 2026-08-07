@@ -40,6 +40,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 切模式并记住。焦点/光标的对齐在 toggle_view_mode 里统一做——
         // 两个方向各写一份的话，迟早只改对一半。
         KeyCode::Char('g') if is_plain_key(&key) => super::toggle_view_mode(app),
+        // 底栏只有一行，装不下的键都在这扇门后面（底栏尾巴上那条 `? …`）
+        KeyCode::Char('?') if is_plain_key(&key) => super::keys::open(app),
         // 三个动作跟九宫格共用 session_action，区别只在「当前会话」是
         // 选中行还是焦点格
         KeyCode::Char('u') | KeyCode::Char('s') | KeyCode::Char('d') if is_plain_key(&key) => {
@@ -131,6 +133,7 @@ mod tests {
             dir: dir.into(),
             state: SessionState::Idle,
             activity: String::new(),
+            is_agent: true,
         }
     }
 
@@ -243,6 +246,7 @@ mod tests {
                 dir: "/tmp/a".into(),
                 state: SessionState::Idle,
                 activity: String::new(),
+                is_agent: true,
             })
             .collect();
         app.current_dir = PathBuf::from("/tmp/a");

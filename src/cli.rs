@@ -240,6 +240,7 @@ mod tests {
             dir: "/w/dc-terminal".into(),
             state,
             activity: activity.into(),
+            is_agent: true,
         }
     }
 

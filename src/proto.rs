@@ -14,9 +14,13 @@ use crate::session::{SessionInfo, SessionState};
 /// `Profiles` 加了 `lang` 字段之后，按 n 只弹一句「拿不到 agent 列表」，
 /// 没有任何线索指向真正的原因。
 ///
-/// `the_request_shape_is_pinned_to_the_protocol_version` 会在形状变了而
-/// 这个数字没变时变红。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// `the_request_shape_is_pinned_to_the_protocol_version` 和
+/// `the_session_info_shape_is_pinned_too` 会在形状变了而这个数字没变时变红。
+///
+/// 2 = `SessionInfo` 多了 `is_agent`：底栏要按「这是不是 agent 会话」决定
+/// 写不写 `u 回滚` / `d 改动`，旧守护进程回的 JSON 里没有这个字段，新界面
+/// 解不出来。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,10 +494,35 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                1,
+                2,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// 请求那条 pin 只钉了**发出去**的形状，回来的没人管——而 2026-08-06
+    /// 给 `SessionInfo` 加 `is_agent` 正是改在回程上：旧守护进程回的 JSON
+    /// 里没这个字段，新界面 `from_str` 直接失败，症状是看板一个会话都没有。
+    /// 回程的形状同样是契约，同样要钉。
+    #[test]
+    fn the_session_info_shape_is_pinned_too() {
+        let info = SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/d".into(),
+            state: SessionState::Idle,
+            activity: "a".into(),
+            is_agent: true,
+        };
+        let shape = serde_json::to_string(&info).unwrap();
+        assert_eq!(
+            (PROTOCOL_VERSION, shape.as_str()),
+            (
+                2,
+                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
+            ),
+            "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
 

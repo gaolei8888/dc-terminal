@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::i18n::Lang;
+use crate::i18n::{HelpItem, Lang};
 use crate::profile::ProfileStatus;
 use crate::proto::{ProfileEntry, SecretPrompt};
 use crate::session::SessionState;
@@ -131,6 +131,17 @@ pub(crate) enum View {
         /// 猜——建这个视图的地方必须显式填它，别指望靠别的字段反推。
         return_to_settings: bool,
     },
+    /// 「全部按键」浮层：底栏放不下的键都在这里。`?` 开，`Esc` 回。
+    ///
+    /// 底栏只有一行，装不下的键必须丢（见 `widgets::fit_help`）——但丢掉的
+    /// 键仍然真的能按，而这个仓库反复警惕的正是「屏幕上没写却真管用的键」。
+    /// 这个浮层就是那些键唯一的去处：底栏尾巴上那条 `? …` 是门，这里是门后。
+    ///
+    /// `from` 存的是**开门之前那一屏**，不是 `home_view()` 算出来的家：
+    /// 从九宫格按 `?`，关掉之后必须回到刚才那个焦点格上，不能悄悄换成列表。
+    Keys {
+        from: Box<View>,
+    },
     /// 密钥设置页：看板按 `c` 进，只列声明了密钥的 profile（见 `secret_rows`）。
     /// 跟 `PickProfile` 分开是两码事——那边是「选一个能干活的 agent」，
     /// 这边是「管理密钥本身」，选中的动作也完全不同（改/删，而不是开会话）。
@@ -230,6 +241,9 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
         // 跟 `View::Board` 一样返回 `None`。以前它落在下面那条兜底里，
         // 于是 Ctrl+Q 成了 `g` 的隐藏同义词。
         View::Grid { .. } => None,
+        // 浮层退的是**开门之前那一屏**，不是看板：从九宫格按 `?` 再退出来，
+        // 落回列表就等于用户按一下问号顺手换了个视图。
+        View::Keys { from } => Some(*from),
         // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
         // 退一层就是看板。
         _ => Some(View::Board),
@@ -730,6 +744,8 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 框开着时左段写 Esc：这时候 `q` 只是个字母，写「q 退出」是假的。
         View::Grid { reply: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
         View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
+        // 全部按键浮层：`q` 在这里只是一张表上的一个字母，写「q 退出」是假的。
+        View::Keys { .. } => format!("Esc {}", text(Key::Back, lang)),
         // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
         // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
         // 落点都是看板。只写一个键等于藏起另一半——而 F2 恰恰是
@@ -739,12 +755,110 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
     }
 }
 
+/// 底栏画按键表时需要知道的「现在能干什么」。
+///
+/// 不传整个 `App` 是为了能单测：这一屏的规则全是「有没有选中 / 选中的是什么」
+/// 的组合，拿两个字段就能穷举，拽进一个连着 socket 的 `App` 只会让测试
+/// 写不出来。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HelpCtx {
+    /// 屏幕上有没有会话。**跟「选中了没有」是两回事**：dct 刚起来时列表
+    /// 光标是 `None`（`refresh_visible` 不替用户选），而这恰恰是最需要
+    /// 看见 `↑↓ 选择` 的时刻——按「有没有选中」判的话，那个键会在唯一
+    /// 用得上它的场合消失。
+    pub has_sessions: bool,
+    /// 当前选中（列表）或聚焦（九宫格）的那个会话。`s`/`u`/`d` 都作用在
+    /// 它身上，没有它这三个键按下去只会得到一句「没有选中会话」。
+    pub selected: Option<SelectedSession>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectedSession {
+    /// 是 agent 会话还是普通命令行。`u 回滚` / `d 改动` 只对前者有效。
+    pub is_agent: bool,
+    pub state: SessionState,
+}
+
+impl HelpCtx {
+    /// 有没有会话可选。没有的话，`↑↓ 选择` / `Enter 进入` 这类键写了也按不动。
+    fn has_session(&self) -> bool {
+        self.has_sessions
+    }
+
+    /// 能不能停。已经停了的会话再写一个 `s 停止`，按下去只会得到一句错误。
+    fn can_stop(&self) -> bool {
+        matches!(self.selected, Some(s) if s.state != SessionState::Stopped)
+    }
+
+    /// 能不能回滚 / 看改动。命令行会话没有检查点，守护进程侧
+    /// `checkpoint_base` 会直接返回 `NotAnAgentSession`——底栏对着一个
+    /// shell 会话写 `u 回滚`，就是在说谎。
+    fn can_checkpoint(&self) -> bool {
+        matches!(self.selected, Some(s) if s.is_agent)
+    }
+}
+
+/// 看板和九宫格共用的那张按键表。两个视图里同一个键做的是同一件事，
+/// 排序和「什么时候写」也就不该有两套——各抄一份的话，将来只会改对一半。
+///
+/// 不一样的地方由参数带进来：`select` 是「怎么挪」（列表是 `↑↓ 选择`，
+/// 九宫格是 `方向键选格子`），`enter` 是「回车做什么」（进入 / 放大）。
+/// 剩下那条 `i 回一句` 只有九宫格有，由调用方插进去。
+fn board_keys(
+    scope_key: crate::i18n::Key,
+    ctx: HelpCtx,
+    select: (&'static str, crate::i18n::Key),
+    enter: (&'static str, crate::i18n::Key),
+) -> Vec<(&'static str, crate::i18n::Key)> {
+    use crate::i18n::Key;
+    let mut keys: Vec<(&'static str, Key)> = Vec::new();
+    // 一个会话都没有时，「选」和「进」都没有对象
+    if ctx.has_session() {
+        keys.push(select);
+        keys.push(enter);
+    }
+    // `n 新建` 无条件：它恰恰是「一个会话都没有」时唯一该按的键
+    keys.push(("n", Key::New));
+    if ctx.can_stop() {
+        keys.push(("s", Key::Stop));
+    }
+    // 回滚和改动是一对，条件也是同一条（都走 checkpoint_base）
+    if ctx.can_checkpoint() {
+        keys.push(("u", Key::Undo));
+        keys.push(("d", Key::Diff));
+    }
+    keys.extend([
+        ("g", Key::Grid),
+        ("p", Key::SwitchProject),
+        ("a", scope_key),
+        ("N", Key::SwitchAgent),
+        ("c", Key::Secrets),
+        ("l", Key::SettingsTitle),
+        ("?", Key::MoreKeys),
+    ]);
+    keys
+}
+
 /// 底部提示条：没有消息覆盖时，按当前视图告诉用户能按什么键。
+///
+/// **顺序就是优先级。** 底栏只有一行，放不下的从尾部开始丢（见
+/// `widgets::fit_help`），所以越靠前的键越是「不写就找不到、找不到就干不了活」
+/// 的那种。原来这张表是按「话题分组」排的（切换类挨着、配置类挨着），那在
+/// 折两行的年代成立；现在窄终端上排在后面的直接不上屏，排序就变成了一个
+/// 关于「丢哪个」的决定。
+///
+/// 尾巴上的 `? …` 是 `View::Keys` 浮层的门，永远不被截断——被丢掉的键全在
+/// 门后面，丢了门它们就真的没有入口了。
+///
+/// **能不能按也决定写不写**（`ctx`）：一个会话都没有的看板上写 `s 停止`
+/// `u 回滚` `d 改动`，一个 shell 会话上写 `u 回滚` `d 改动`，按下去只会得到
+/// 一句错误。屏幕上写着做不到的操作比不写更糟——而底栏只剩一行之后，一个
+/// 假键占掉的正是一个真键的位置。
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
-pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
-    use crate::i18n::{help_line, text, Key};
+pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> {
+    use crate::i18n::{help_items, Key};
     // 作用域键的说明随范围反转——`a` 是个开关，只写一个方向的话，
     // 另一个方向上屏幕就在说谎。
     let scope_key = match scope {
@@ -754,16 +868,18 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
     match view {
         // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
-        View::Attached(_) => help_line(
+        View::Attached(_) => help_items(
             &[
                 ("F3", Key::NextSession),
                 ("", Key::NewSessionFromBoard),
                 ("", Key::OtherKeysGoToAgent),
             ],
             lang,
-        )
-        .replace("  ", "　"),
-        View::PickProfile { .. } => help_line(
+        ),
+        // 浮层自己就是一整屏按键表，右段再列一遍是重复；左段的
+        // 「Esc 返回」已经把这里唯一能按的键交代完了。
+        View::Keys { .. } => Vec::new(),
+        View::PickProfile { .. } => help_items(
             &[
                 ("↑↓", Key::Select),
                 ("Enter", Key::Confirm),
@@ -772,13 +888,13 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
             ],
             lang,
         ),
-        View::PickProject(p) if p.typing_path.is_some() => help_line(
+        View::PickProject(p) if p.typing_path.is_some() => help_items(
             &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
             lang,
         ),
         // 目录浏览器的三个键（Tab/→/←）必须写出来：它们是这一层唯一
         // 「学过才知道」的部分，不写就等于没做浏览器。
-        View::PickProject(_) => help_line(
+        View::PickProject(_) => help_items(
             &[
                 ("Tab", Key::SwitchPane),
                 ("↑↓", Key::Select),
@@ -790,28 +906,18 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
             ],
             lang,
         ),
-        // `g 九宫格` 插在切换类按键那一段里，不放句尾：`g` 是九宫格唯一的
-        // 入口，排在最容易被挤到第二行末尾的位置等于藏起来。
-        // `a` 紧跟着 `p 换项目`：两个键都在回答「我现在在看哪些会话」，
-        // 挨着放用户才会把它们当成一组。
-        View::Board => help_line(
-            &[
-                ("n", Key::New),
-                ("N", Key::SwitchAgent),
-                ("p", Key::SwitchProject),
-                ("a", scope_key),
-                ("c", Key::Secrets),
-                // `l 设置` 紧跟 `c 密钥`：两个都是「配置」类入口。原来两份
-                // 按键表里都没有它，而 `l` 一直是能按的——屏幕上没写却真管用
-                // 的键，用户只能靠撞见。
-                ("l", Key::SettingsTitle),
-                ("g", Key::Grid),
-                ("↑↓", Key::Select),
-                ("Enter", Key::Open),
-                ("u", Key::Undo),
-                ("s", Key::Stop),
-                ("d", Key::Diff),
-            ],
+        // 排序 = 优先级，窄终端上后面的直接不上屏（见函数头注释）。
+        //
+        // 前六个是「在这一屏上干活」要用的：先看得见、进得去，再是新建和三个
+        // 作用在选中会话上的动作。`u/s/d` 排在 `p/N/a/c/l` 前面，是因为它们
+        // 作用在用户眼前这一行上，而后者是去别的地方——在一屏放不下的时候，
+        // 眼前的事优先。
+        //
+        // `g 九宫格` 排在切换类的头一个：它是九宫格唯一的入口，进了浮层还得
+        // 现找。剩下的挪到 `?` 后面不是把它们藏起来——`n` 会带出 agent 选择器
+        // （`N` 的去处），`c/l` 是一年按一次的配置入口。
+        View::Board => help_items(
+            &board_keys(scope_key, ctx, ("↑↓", Key::Select), ("Enter", Key::Open)),
             lang,
         ),
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
@@ -831,49 +937,44 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
         // 里写两遍是拿最稀缺的一行去重复已知信息，而 `Ctrl+C 打断` 才是这里
         // 唯一「不写就找不到」的键——它跟 `s 停止` 一样是打断 agent 的动作，
         // 藏起来只会让用户眼看着它跑偏却不知道怎么喊停。
-        View::Grid { reply: Some(_), .. } => help_line(
+        View::Grid { reply: Some(_), .. } => help_items(
             &[("Enter", Key::SendReply), ("Ctrl+C", Key::InterruptAgent)],
             lang,
         ),
-        // `N 换 agent` 不写在这一份里：加了 `i 回一句` 之后这张表会折到
-        // 第三行，底栏多吃一行，内容区在 80×24 下跌破 `grid.rs` 的 MIN_ROWS，
-        // 整个九宫格换成一句「窗口太小」。`N` 是 `n` 的变体（按 n 就会看到
-        // agent 选择器），而 `i` 是全新能力——挤掉谁很清楚。
-        // 有 `the_bottom_bar_never_squeezes_the_grid_off_the_screen` 盯着。
-        View::Grid { .. } => help_line(
-            &[
-                ("", Key::MoveArrows),
-                ("Enter", Key::Zoom),
-                ("i", Key::ReplyOnce),
-                ("g", Key::List),
-                ("n", Key::New),
-                ("p", Key::SwitchProject),
-                ("a", scope_key),
-                ("c", Key::Secrets),
-                // 九宫格这份**不**跟着加 `l 设置`。加了就要折到第三行，底栏
-                // 多吃一行，内容区在 80×24 下只剩 19 行——正好跌破 grid.rs 的
-                // `MIN_ROWS`，整个九宫格换成一句「窗口太小」。少写一个键，比在
-                // 最常见的终端尺寸上把这个视图整个关掉划算。
-                // 有 `the_bottom_bar_never_squeezes_the_grid_off_the_screen` 盯着。
-                ("u", Key::Undo),
-                ("s", Key::Stop),
-                ("d", Key::Diff),
-            ],
-            lang,
-        ),
+        // 跟看板那一份同序同优先级（同一个键在两个视图里做同一件事，排序也
+        // 不该两个样），只换三处：选择靠方向键、Enter 是放大不是进入、多一条
+        // `i 回一句`——那是九宫格独有的能力，不写就找不到，所以排在动作键前面。
+        // 共用 `board_keys`，不各抄一份：抄了将来只会改一半。
+        //
+        // 「加一个键就会把 `d 改动` 挤出屏幕」这件事不再需要在这里手工权衡：
+        // 底栏只有一行、按顺序截断，加在尾巴上的键只会落进 `?` 浮层，不会再
+        // 悄悄顶掉前面的任何一个。
+        View::Grid { .. } => {
+            let mut keys = board_keys(scope_key, ctx, ("", Key::MoveArrows), ("Enter", Key::Zoom));
+            // `i 回一句` 紧跟在 `Enter 放大` 后面：两个都是「对着这一格做点
+            // 什么」。没有会话可回时不写——回复框会开在一个不存在的会话上。
+            if ctx.has_session() {
+                keys.insert(2, ("i", Key::ReplyOnce));
+            }
+            // 九宫格里 `g` 通向列表，看板里通向九宫格；其余完全一致。
+            if let Some(g) = keys.iter_mut().find(|(k, _)| *k == "g") {
+                g.1 = Key::List;
+            }
+            help_items(&keys, lang)
+        }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
         View::EnterSecret {
             phase: SecretPhase::Verifying,
             ..
-        } => text(Key::Verifying, lang).to_string(),
+        } => help_items(&[("", Key::Verifying)], lang),
         // 跟 escape_hint 一样要分 return_to_settings：从设置页进来的 Esc
         // 回设置页，不是「列表」——两处文案哪怕只有半句话不一致，都是
         // 「底栏说什么就得真能做到什么」这条原则被破坏了一半。
         View::EnterSecret {
             return_to_settings: true,
             ..
-        } => help_line(
+        } => help_items(
             &[
                 ("", Key::PasteOrTypeKey),
                 ("Enter", Key::Confirm),
@@ -881,7 +982,7 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
             ],
             lang,
         ),
-        View::EnterSecret { .. } => help_line(
+        View::EnterSecret { .. } => help_items(
             &[
                 ("", Key::PasteOrTypeKey),
                 ("Enter", Key::Confirm),
@@ -889,7 +990,7 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
             ],
             lang,
         ),
-        View::Secrets { .. } => help_line(
+        View::Secrets { .. } => help_items(
             &[
                 ("↑↓", Key::Select),
                 ("Enter", Key::Edit),
@@ -898,7 +999,7 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang) -> String {
             ],
             lang,
         ),
-        View::Settings { .. } => help_line(
+        View::Settings { .. } => help_items(
             &[
                 ("↑↓", Key::Select),
                 ("Enter", Key::Confirm),
@@ -917,6 +1018,43 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// 按键表拼成文字的样子。断言的是这一份，屏幕上画的是加粗版的同一份
+    /// （`widgets::help_spans` 有单测钉住两者一致）。
+    ///
+    /// 注意：这里是**全表**，不是屏幕上真正显示的那几条——底栏会按宽度截断
+    /// （`widgets::fit_help`）。「某个键在 80 列下真的看得见吗」是另一个问题，
+    /// 由 `mod.rs` 里那几条画完整帧再数格子的测试回答。
+    /// 默认按「选中了一个正在跑的 agent 会话」算：那是键最全的一档，
+    /// 大多数断言问的是「这个键在不在表里」，不是「什么时候不该在」。
+    /// 后者由 `help_when` 单独问。
+    fn help_of(view: &View, scope: Scope, lang: Lang) -> String {
+        help_when(view, scope, lang, agent_session())
+    }
+
+    fn help_when(view: &View, scope: Scope, lang: Lang, ctx: HelpCtx) -> String {
+        crate::i18n::help_text(&idle_help(view, scope, lang, ctx))
+    }
+
+    fn agent_session() -> HelpCtx {
+        HelpCtx {
+            has_sessions: true,
+            selected: Some(SelectedSession {
+                is_agent: true,
+                state: SessionState::Idle,
+            }),
+        }
+    }
+
+    fn shell_session() -> HelpCtx {
+        HelpCtx {
+            has_sessions: true,
+            selected: Some(SelectedSession {
+                is_agent: false,
+                state: SessionState::Idle,
+            }),
+        }
     }
 
     #[test]
@@ -983,11 +1121,96 @@ mod tests {
         }
     }
 
+    /// 一个会话都没有的看板上，`↑↓ 选择` / `Enter 进入` / `s 停止` /
+    /// `u 回滚` / `d 改动` 全都无事可做。写它们不只是没用——底栏只剩一行，
+    /// 五个假键会把 `n 新建`（这时候唯一该按的键）挤到后面去。
+    #[test]
+    fn the_bottom_bar_offers_nothing_to_act_on_when_there_are_no_sessions() {
+        let empty = HelpCtx::default();
+        for view in [View::Board, View::grid(0)] {
+            let help = help_when(&view, Scope::CurrentProject, Lang::Zh, empty);
+            for k in ["↑↓ 选择", "Enter", "s 停止", "u 回滚", "d 改动", "i 回一句"] {
+                assert!(!help.contains(k), "一个会话都没有，不该写「{k}」：{help}");
+            }
+            assert!(help.contains("n 新建"), "这时候唯一该按的就是它：{help}");
+            assert!(help.ends_with("? …"), "门永远在：{help}");
+        }
+    }
+
+    /// 选中的是命令行会话时不写 `u 回滚` / `d 改动`：那两条走的是检查点，
+    /// 而命令行会话没有检查点——守护进程侧 `checkpoint_base` 会直接返回
+    /// `NotAnAgentSession`。**底栏在说谎**是这次改动要消灭的东西。
+    #[test]
+    fn the_bottom_bar_never_offers_undo_on_a_shell_session() {
+        let help = help_when(
+            &View::Board,
+            Scope::CurrentProject,
+            Lang::Zh,
+            shell_session(),
+        );
+        assert!(!help.contains("u 回滚"), "命令行会话回滚不了：{help}");
+        assert!(!help.contains("d 改动"), "命令行会话没有改动可看：{help}");
+        // 但停得掉，也照样能选能进
+        assert!(help.contains("s 停止"), "{help}");
+        assert!(help.contains("↑↓ 选择"), "{help}");
+        // agent 会话上这两条要回来，否则这条测试等于把功能测没了
+        let agent = help_when(
+            &View::Board,
+            Scope::CurrentProject,
+            Lang::Zh,
+            agent_session(),
+        );
+        assert!(
+            agent.contains("u 回滚") && agent.contains("d 改动"),
+            "{agent}"
+        );
+    }
+
+    /// 已经停掉的会话不写 `s 停止`：按下去只会得到一句错误。
+    #[test]
+    fn the_bottom_bar_does_not_offer_to_stop_an_already_stopped_session() {
+        let stopped = HelpCtx {
+            has_sessions: true,
+            selected: Some(SelectedSession {
+                is_agent: true,
+                state: SessionState::Stopped,
+            }),
+        };
+        let help = help_when(&View::Board, Scope::CurrentProject, Lang::Zh, stopped);
+        assert!(!help.contains("s 停止"), "已经停了：{help}");
+        // 停了的会话仍然能看改动、能回滚——检查点还在
+        assert!(help.contains("d 改动"), "{help}");
+    }
+
+    /// 屏幕上有会话、但光标还没落到任何一行（dct 刚起来就是这个状态）：
+    /// 这时候最该写的就是 `↑↓ 选择`，而 `s`/`u`/`d` 没有作用对象。
+    /// 按「有没有选中」一刀切的话，那个键会在唯一用得上它的场合消失。
+    #[test]
+    fn the_select_key_shows_up_before_anything_is_selected() {
+        let nothing_selected = HelpCtx {
+            has_sessions: true,
+            selected: None,
+        };
+        let help = help_when(
+            &View::Board,
+            Scope::CurrentProject,
+            Lang::Zh,
+            nothing_selected,
+        );
+        assert!(help.contains("↑↓ 选择"), "有会话就该告诉他怎么选：{help}");
+        for k in ["s 停止", "u 回滚", "d 改动"] {
+            assert!(
+                !help.contains(k),
+                "还没选中任何一行，「{k}」作用在谁身上？{help}"
+            );
+        }
+    }
+
     #[test]
     fn grid_hints_match_what_the_keys_actually_do() {
         // 底栏说什么就得真能做到什么。九宫格现在是顶层，逃生键是 q——
         // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
-        let help = idle_help(&View::grid(0), Scope::CurrentProject, Lang::Zh);
+        let help = help_of(&View::grid(0), Scope::CurrentProject, Lang::Zh);
         for k in [
             "方向键选格子",
             "Enter 放大",
@@ -1003,30 +1226,28 @@ mod tests {
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
-        // `N 换 agent` 有意不写：见 idle_help 里那段注释。按 `n` 就会看到
-        // agent 选择器，所以它不是「屏幕上没写就找不到」的能力。
-        assert!(
-            !help.contains("N 换"),
-            "九宫格按键表放不下 N，写了就会把 d 改动挤出屏幕：{help}"
-        );
-        // `q 退出` 不该再出现在这一句里：它已经常驻左段（escape_hint），
-        // 重复一遍只会把句尾的 s/d 挤出屏幕，而那两个不可撤销。
+        // `N 换 agent` 现在写在表里了。原来不写是因为它会把 `d 改动` 挤出
+        // 屏幕——那是折行年代的取舍；底栏改成按顺序截断之后，排在尾巴上的键
+        // 只会落进 `?` 浮层，顶不掉前面任何一个。
+        assert!(help.contains("N 换 agent"), "{help}");
+        // `q 退出` 不该出现在这一句里：它已经常驻左段（escape_hint），
+        // 重复一遍是拿最稀缺的一行去重复已知信息。
         assert!(
             !help.contains("q 退出"),
             "左段已经写着 q 退出，这里不该重复：{help}"
         );
-        // 「这些键在 80 列终端上真的看得见吗」这个问题，原来是靠在这里
-        // 手算一遍截断宽度来回答的（`truncate(help, 63)`）。那个算式随着
-        // 底栏改成两行自动换行已经失效，而且它算的是文案、不是屏幕。
-        // 真正的断言搬到了 `mod.rs`——那里是把整帧画出来再数格子：
-        // `every_board_key_is_actually_on_screen_at_eighty_columns` 和
-        // `every_grid_key_is_actually_on_screen_at_eighty_columns`。
+        // 尾巴上永远留着那扇门：这一串键 80 列下放不完，放不下的全在门后。
+        assert!(help.ends_with("? …"), "按键表尾巴上必须留着 `? …`：{help}");
+        // 「这些键在 80 列终端上真的看得见吗」是另一个问题——这里是全表，
+        // 屏幕上显示的是按宽度截过的一截。那个问题由 `mod.rs` 里把整帧画出来
+        // 再数格子的几条测试回答（`the_keys_that_survive_eighty_columns_are_the_ones_that_matter`
+        // 和 `the_door_to_the_rest_of_the_keys_is_always_on_screen`）。
     }
 
     #[test]
     fn board_help_mentions_the_grid() {
         // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
-        assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("g 九宫格"));
+        assert!(help_of(&View::Board, Scope::CurrentProject, Lang::Zh).contains("g 九宫格"));
     }
 
     /// 九宫格不再是列表的下一层：两个模式都是顶层，`Ctrl+Q` 在两边都无事
@@ -1048,7 +1269,7 @@ mod tests {
     /// 的部分——不写就等于做了个浏览器但没人知道怎么用。
     #[test]
     fn the_browser_advertises_its_three_keys() {
-        let help = idle_help(
+        let help = help_of(
             &View::PickProject(ProjectPicker::new(
                 Vec::new(),
                 std::path::PathBuf::from("/tmp"),
@@ -1066,8 +1287,8 @@ mod tests {
     /// 「屏幕上没写却真管用的键」，只是这次犯在自己身上。
     #[test]
     fn both_modes_advertise_the_key_that_switches_them() {
-        let list = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
-        let grid = idle_help(&View::grid(0), Scope::CurrentProject, Lang::Zh);
+        let list = help_of(&View::Board, Scope::CurrentProject, Lang::Zh);
+        let grid = help_of(&View::grid(0), Scope::CurrentProject, Lang::Zh);
         assert!(
             list.contains("g 九宫格"),
             "列表要告诉用户怎么去九宫格：{list}"
@@ -1129,6 +1350,7 @@ mod tests {
             dir: dir.into(),
             state: SessionState::Idle,
             activity: String::new(),
+            is_agent: true,
         }
     }
 
@@ -1155,17 +1377,17 @@ mod tests {
     fn the_scope_key_hint_says_where_a_will_take_you() {
         let board = View::Board;
         assert!(
-            idle_help(&board, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"),
+            help_of(&board, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"),
             "只看本项目时，a 通向全部项目"
         );
         assert!(
-            idle_help(&board, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"),
+            help_of(&board, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"),
             "全部项目时，a 通向本项目"
         );
         // 九宫格是看板的另一种画法，同一个键必须给同一套说明
         let grid = View::grid(0);
-        assert!(idle_help(&grid, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"));
-        assert!(idle_help(&grid, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"));
+        assert!(help_of(&grid, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"));
+        assert!(help_of(&grid, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"));
     }
 
     #[test]
@@ -1585,7 +1807,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_both_n_and_capital_n() {
-        let help = idle_help(&View::Board, Scope::CurrentProject, Lang::Zh);
+        let help = help_of(&View::Board, Scope::CurrentProject, Lang::Zh);
         assert!(help.contains("n 新建"));
         assert!(help.contains("N 换 agent"));
     }
@@ -1594,7 +1816,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_the_settings_key() {
-        assert!(idle_help(&View::Board, Scope::CurrentProject, Lang::Zh).contains("c 密钥"));
+        assert!(help_of(&View::Board, Scope::CurrentProject, Lang::Zh).contains("c 密钥"));
     }
 
     #[test]
@@ -1608,7 +1830,7 @@ mod tests {
 
     #[test]
     fn picker_help_mentions_both_ways_to_choose() {
-        let help = idle_help(
+        let help = help_of(
             &View::PickProfile {
                 entries: vec![],
                 state: ListState::default(),
@@ -1803,7 +2025,7 @@ mod tests {
     fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
         // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
         // 一处还说着旧的「列表」。
-        let help = idle_help(
+        let help = help_of(
             &View::EnterSecret {
                 profile: "kimi".into(),
                 label: "Kimi".into(),
@@ -1839,7 +2061,7 @@ mod tests {
 
     #[test]
     fn secrets_page_help_lists_its_own_keys() {
-        let help = idle_help(
+        let help = help_of(
             &View::Secrets {
                 entries: vec![],
                 state: ListState::default(),

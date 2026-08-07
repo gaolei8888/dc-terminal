@@ -312,6 +312,7 @@ mod tests {
             dir: dir.into(),
             state: crate::session::SessionState::Idle,
             activity: String::new(),
+            is_agent: true,
         }
     }
 
@@ -388,6 +389,7 @@ mod tests {
             dir: dir.into(),
             state: crate::session::SessionState::Failed,
             activity: String::new(),
+            is_agent: true,
         }
     }
 
@@ -398,6 +400,7 @@ mod tests {
             dir: dir.into(),
             state: crate::session::SessionState::Stopped,
             activity: String::new(),
+            is_agent: true,
         }
     }
 
