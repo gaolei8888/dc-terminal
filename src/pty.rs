@@ -421,20 +421,31 @@ pub fn encode_mouse(
         return None;
     }
 
-    let mut button = match ev.kind {
+    // 硬件按钮/滚轮方向对应的按钮号。
+    let raw_button = match ev.kind {
         K::WheelUp => 64,
         K::WheelDown => 65,
         K::Press(b) | K::Release(b) => u32::from(b),
     };
+    let mut modifiers = 0;
     if ev.shift {
-        button += 4;
+        modifiers += 4;
     }
     if ev.alt {
-        button += 8;
+        modifiers += 8;
     }
     if ev.ctrl {
-        button += 16;
+        modifiers += 16;
     }
+
+    // SGR 在 release 时照实发按钮号——这也是 SGR 存在的理由之一：legacy
+    // 协议做不到。legacy 协议（Default/Utf8）的 Cb/Cx/Cy 结构里没有「哪个
+    // 按钮松开了」这回事，xterm 规定 release 一律用哨兵值 3；重用按钮号
+    // 会让 agent 把「松开」读成「同一个按钮又按了一次」，拖拽/选区状态
+    // 就跟着错位——这正是本函数文档说的「发出去比不发更糟」，只是这次
+    // 错的是事件类型而不是坐标。两种编码的按钮号分开算，别混用。
+    let sgr_button = raw_button + modifiers;
+    let legacy_button = (if is_release { 3 } else { raw_button }) + modifiers;
 
     // 终端协议的坐标是 1 起算的，我们内部是 0 起算的
     let col = u32::from(ev.col) + 1;
@@ -443,12 +454,33 @@ pub fn encode_mouse(
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let end = if is_release { 'm' } else { 'M' };
-            Some(format!("\x1b[<{button};{col};{row}{end}").into_bytes())
+            Some(format!("\x1b[<{sgr_button};{col};{row}{end}").into_bytes())
         }
-        // Utf8 跟 Default 的差别只在坐标怎么编码。按下界处理成
-        // 「装不下就不发」对两者都成立，也就不用分开写。
-        _ => {
-            let b = 32u32.checked_add(button)?;
+        vt100::MouseProtocolEncoding::Utf8 => {
+            // ?1005 把 32+值 当 Unicode 码点、按 UTF-8 编码，不是原始字节——
+            // 值一旦到 128 就跨进两字节范围（0x80..=0x7FF）。照 Default 那样
+            // 直接吐单字节，只要列号 >= 96（32+97=129）就会吐出一个不合法
+            // 的独立字节，把 agent 之后的整段解析都带崩，不只是这一次
+            // 事件坐标读错。
+            //
+            // 两字节 UTF-8 能装下的最大码点是 0x7FF（2047），减掉固定加的
+            // 32，单个值最大能到 2015——这也是 xterm 文档里「行列最大到
+            // 2015」的来历。超过就装不下，宁可不发。
+            const UTF8_MOUSE_MAX: u32 = 2015;
+            if legacy_button > UTF8_MOUSE_MAX || col > UTF8_MOUSE_MAX || row > UTF8_MOUSE_MAX {
+                return None;
+            }
+            let mut s = String::from("\x1b[M");
+            s.push(char::from_u32(32 + legacy_button)?);
+            s.push(char::from_u32(32 + col)?);
+            s.push(char::from_u32(32 + row)?);
+            Some(s.into_bytes())
+        }
+        vt100::MouseProtocolEncoding::Default => {
+            // 单字节形式一个值最多编到 255（= 32+223），也就是值本身不能
+            // 超过 223；发一个装不下的坐标比不发更糟，agent 会以为你点在
+            // 别处。
+            let b = 32u32.checked_add(legacy_button)?;
             let c = 32u32.checked_add(col)?;
             let r = 32u32.checked_add(row)?;
             if b > 255 || c > 255 || r > 255 {
@@ -951,6 +983,114 @@ mod tests {
             vt100::MouseProtocolMode::Press,
             vt100::MouseProtocolEncoding::Sgr,
             &ev(MouseForwardKind::Release(0), 1, 1),
+        )
+        .is_none());
+    }
+
+    /// legacy（非 SGR）协议里 release 用哨兵值 3，不是按钮号——单字节协议
+    /// 没法告诉 agent 到底松开的是哪个按钮。重用按钮号会让 agent 把
+    /// 「松开」读成「同一个按钮又按了一次」，拖拽/选区状态就会跟着错位。
+    #[test]
+    fn default_encoding_uses_the_release_sentinel_not_the_button_number() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Release(0), 0, 0),
+        )
+        .unwrap();
+        // 32+3, 32+1, 32+1
+        assert_eq!(out, vec![0x1b, b'[', b'M', 35, 33, 33]);
+    }
+
+    /// 同一个坐标上，按下和松开在 legacy 编码下必须是两个不同的字节串——
+    /// 如果按钮号被直接照抄，这两个事件会长得一模一样，agent 完全无法
+    /// 区分（这就是 CRITICAL 那个 bug 的可观测症状）。
+    #[test]
+    fn default_encoding_release_differs_from_a_press_at_the_same_spot() {
+        let press = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 0, 0),
+        )
+        .unwrap();
+        let release = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Release(0), 0, 0),
+        )
+        .unwrap();
+        assert_ne!(
+            press, release,
+            "agent 必须能分清「按下」和「松开」，否则选区/拖拽状态会错位"
+        );
+    }
+
+    /// 单字节形式能表达的最大值是 223（编码字节 = 32+223 = 255，正好是
+    /// u8 的上限）；wire 坐标 1 起算，所以内部 0 起算的列号最大能到 222。
+    /// 这条和下面那条各自钉住边界的一侧，防止「> 255」被悄悄改成
+    /// 「> 256」之类还能让旧测试蒙混过关的错误。
+    #[test]
+    fn default_encoding_accepts_the_largest_column_it_can_express() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 222, 0),
+        )
+        .unwrap();
+        // 32+0, 32+223, 32+1
+        assert_eq!(out, vec![0x1b, b'[', b'M', 32, 255, 33]);
+    }
+
+    #[test]
+    fn default_encoding_rejects_the_column_one_past_the_boundary() {
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Default,
+            &ev(MouseForwardKind::Press(0), 223, 0),
+        )
+        .is_none());
+    }
+
+    /// `legacy_button` 是 Default 和 Utf8 共用的同一个变量，这里钉住
+    /// release 哨兵没有在 Utf8 分支被漏掉（万一以后有人把两个分支的
+    /// 按钮计算拆开重写）。
+    #[test]
+    fn utf8_encoding_also_uses_the_release_sentinel() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Utf8,
+            &ev(MouseForwardKind::Release(0), 0, 0),
+        )
+        .unwrap();
+        // 32+3, 32+1, 32+1，全部落在单字节 UTF-8 范围内
+        assert_eq!(out, vec![0x1b, b'[', b'M', 35, 33, 33]);
+    }
+
+    /// ?1005 把 32+值 当 Unicode 码点编码成 UTF-8。一旦列号让这个码点
+    /// 跨过 128（列号 >= 96 时，32 + 97 = 129），就必须变成两字节——
+    /// 如果退化成 Default 那样的单字节形式，会吐出一个不合法的独立
+    /// 字节，把 agent 之后的整段解析带崩。
+    #[test]
+    fn utf8_encoding_uses_multiple_bytes_once_the_column_passes_127() {
+        let out = encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Utf8,
+            &ev(MouseForwardKind::Press(0), 96, 0),
+        )
+        .unwrap();
+        // 按钮=32(单字节)，列=32+97=129=U+0081(两字节 0xC2 0x81)，行=32+1=33(单字节)
+        assert_eq!(out, vec![0x1b, b'[', b'M', 32, 0xC2, 0x81, 33]);
+    }
+
+    /// 两字节 UTF-8 能装下的最大码点是 0x7FF（2047），减掉固定加的 32，
+    /// 单个值最大能到 2015；再大就要三字节，我们没实现也不该假装能编，
+    /// 发不出去比编错更安全。
+    #[test]
+    fn utf8_encoding_refuses_coordinates_past_the_two_byte_ceiling() {
+        assert!(encode_mouse(
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Utf8,
+            &ev(MouseForwardKind::Press(0), 2016, 0),
         )
         .is_none());
     }
