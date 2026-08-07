@@ -40,7 +40,9 @@ pub struct ScrollState {
 }
 
 /// `SessionManager::scroll` 的入参：相对滚几行，或者干脆回到底部。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 派生 `Serialize`/`Deserialize`：`proto::Request::Scroll` 直接把它嵌进
+/// 线上请求，协议层不重新定义一份平行的滚动语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScrollBy {
     Rows(i32),
     Bottom,
@@ -500,6 +502,15 @@ impl SessionManager {
             s.scroll_mark = v.offset;
             Ok(state_of(v, s.scroll_mark))
         })
+    }
+
+    /// 把界面转发过来的鼠标事件按 agent 当前的编码写进 PTY。
+    ///
+    /// 占位实现：真正按 agent 是否开了鼠标报告、用的是哪种编码来决定写不写、
+    /// 写什么留给 Task 9（见 `PtySession::write_mouse` 的注释）。这里先把
+    /// 线路接通，让 `Request::Mouse` 编译得过、跑得起来。
+    pub fn forward_mouse(&self, id: u32, ev: crate::proto::MouseForward) -> Result<()> {
+        self.with_session(id, |s| s.pty.write_mouse(ev))
     }
 
     /// 一次取多个会话的屏幕，九宫格用。锁的纪律跟 `list()` 一致：

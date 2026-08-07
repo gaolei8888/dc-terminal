@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::git::FileStat;
 use crate::profile::ProfileStatus;
 use crate::pty::ScreenSpan;
-use crate::session::{SessionInfo, SessionState};
+use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 
 /// 界面和守护进程之间的线上契约版本。**改了协议就要加一。**
 ///
@@ -28,7 +28,10 @@ use crate::session::{SessionInfo, SessionState};
 /// 会话「出了什么事」。旧守护进程不认识这条请求，界面发过去只会得到一句
 /// 解析失败；老实说这条不至于让界面整个用不了（不问就是了），但协议形状
 /// 变了就要加一，理由同上面两条。
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// 5 = 多了 `Request::Scroll` / `Request::Mouse` / `Response::Scrolled`，
+/// `Response::Screen` 加了 `scroll`（带 `#[serde(default)]`，旧 JSON 照样能解）。
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +92,30 @@ pub struct ProfileEntry {
 pub struct ScreenEntry {
     pub id: u32,
     pub lines: Vec<Vec<ScreenSpan>>,
+}
+
+/// 界面转发的一次鼠标事件，agent 当前的编码方式（哪种协议、SGR 与否）由
+/// daemon 那一侧的 PTY 状态决定——界面只管「用户在哪个格子上做了什么」，
+/// 不掺和编码。列/行 0 起算，跟 `Response::Screen` 的 `cursor` 一致。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MouseForward {
+    pub col: u16,
+    pub row: u16,
+    pub kind: MouseForwardKind,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+/// 鼠标事件的种类。按下/松开带按钮号而不是分成三个变体各配一份——
+/// 编码那一侧（Task 9）反正要按数字拼 SGR 序列，分开只会多一层 match。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum MouseForwardKind {
+    WheelUp,
+    WheelDown,
+    /// 0 = 左键，1 = 中键，2 = 右键
+    Press(u8),
+    Release(u8),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,6 +200,19 @@ pub enum Request {
     Explanation {
         id: u32,
     },
+    /// 用户主动滚动：相对滚几行，或者直接回到底部。类型是
+    /// `session::ScrollBy`——协议层不重新定义一份平行的滚动语义。
+    Scroll {
+        id: u32,
+        by: ScrollBy,
+    },
+    /// 界面转发的鼠标事件（滚轮、点击、拖拽结束的松开）。是否真的转发给
+    /// agent 由 daemon 按当前是不是在看历史（`ScrollState::alt_screen` /
+    /// `offset`）决定，界面不用先猜。
+    Mouse {
+        id: u32,
+        event: MouseForward,
+    },
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -233,6 +273,17 @@ impl std::fmt::Debug for Request {
                 .field("value", &"<redacted>")
                 .finish(),
             Request::Explanation { id } => f.debug_struct("Explanation").field("id", id).finish(),
+            Request::Scroll { id, by } => f
+                .debug_struct("Scroll")
+                .field("id", id)
+                .field("by", by)
+                .finish(),
+            // 没有密钥、没有用户输入的自由文本，坐标和按键状态照常打印。
+            Request::Mouse { id, event } => f
+                .debug_struct("Mouse")
+                .field("id", id)
+                .field("event", event)
+                .finish(),
         }
     }
 }
@@ -255,6 +306,12 @@ pub enum Response {
         /// agent 退出时恢复主屏，主屏从来没被写过，所以「屏是空的」是正常的，
         /// 判断死活只能靠状态。
         state: SessionState,
+        /// 底栏画滚动提示要用的全部事实。`#[serde(default)]`：往后再加字段
+        /// 不用再动 `PROTOCOL_VERSION`——旧 JSON 没有这个字段时补一个
+        /// `ScrollState::default()`（没在滚、没有未读行），跟真没滚动过的
+        /// 会话是同一个状态，不会被误读成别的。
+        #[serde(default)]
+        scroll: ScrollState,
     },
     Screens {
         screens: Vec<ScreenEntry>,
@@ -278,6 +335,9 @@ pub enum Response {
     /// 没配 LLM、或者算失败了——界面不用区分，统一显示今天就有的那句
     /// 失败提示）。
     Explanation(Option<String>),
+    /// 对 [`Request::Scroll`] 的回答：滚完之后的状态，界面拿它直接刷底栏，
+    /// 不用再补一次 `Screen` 才知道滚到哪了。
+    Scrolled(ScrollState),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -548,14 +608,29 @@ mod tests {
                 value: "v".into(),
             },
             Request::Explanation { id: 1 },
+            Request::Scroll {
+                id: 1,
+                by: ScrollBy::Rows(3),
+            },
+            Request::Mouse {
+                id: 1,
+                event: MouseForward {
+                    col: 10,
+                    row: 20,
+                    kind: MouseForwardKind::Press(0),
+                    shift: false,
+                    alt: false,
+                    ctrl: false,
+                },
+            },
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                4,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}}]"#
+                5,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -579,7 +654,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                4,
+                5,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -608,5 +683,53 @@ mod tests {
             }
             other => panic!("解回来不是 Screens：{other:?}"),
         }
+    }
+
+    /// 新加的滚动字段必须能从「没有这个字段」的旧 JSON 里解出来。
+    /// 这是 `#[serde(default)]` 的意义所在：往后再加字段就不用再动版本号。
+    ///
+    /// `state` 带上而不是照抄 brief 原样的 `{"lines":[],"cursor":[0,0]}}`：
+    /// 那是 3 版之前的形状，`state` 早就是这个变体里不带默认值的必填字段
+    /// （见它自己的文档注释——少了它界面就没法判断进程死活）。这里只测
+    /// `scroll` 这一个新字段的向后兼容，不重新测已经钉在别处的旧字段。
+    #[test]
+    fn a_screen_response_without_scroll_still_parses() {
+        let old = r#"{"Screen":{"lines":[],"cursor":[0,0],"state":"Idle"}}"#;
+        let r: Response = serde_json::from_str(old).unwrap();
+        match r {
+            Response::Screen { scroll, .. } => {
+                assert_eq!(scroll, crate::session::ScrollState::default());
+            }
+            _ => panic!("解成了别的变体"),
+        }
+    }
+
+    #[test]
+    fn scroll_requests_survive_a_round_trip() {
+        for by in [ScrollBy::Rows(3), ScrollBy::Rows(-3), ScrollBy::Bottom] {
+            let req = Request::Scroll { id: 7, by };
+            let s = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&s).unwrap();
+            assert!(matches!(back, Request::Scroll { id: 7, .. }));
+        }
+    }
+
+    /// 手写的 Debug 漏一条 arm 会编译不过，但漏了密钥脱敏不会。
+    /// 顺手确认新变体没有把什么敏感东西带进 Debug。
+    #[test]
+    fn mouse_debug_has_no_surprises() {
+        let req = Request::Mouse {
+            id: 1,
+            event: MouseForward {
+                col: 10,
+                row: 20,
+                kind: MouseForwardKind::WheelUp,
+                shift: false,
+                alt: false,
+                ctrl: false,
+            },
+        };
+        let s = format!("{req:?}");
+        assert!(s.contains("Mouse"));
     }
 }

@@ -433,6 +433,9 @@ pub fn run(
                     lines,
                     cursor,
                     state,
+                    // 底栏画滚动提示、鼠标事件转发是下一个任务的活；这里先
+                    // 用 `..` 接住新字段，别让协议加字段变成这边的编译错误。
+                    ..
                 }) => {
                     app.screen = lines;
                     app.screen_cursor = cursor;

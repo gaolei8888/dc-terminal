@@ -376,6 +376,12 @@ impl PtySession {
         parser.screen_mut().set_scrollback(cur);
         view_of(&parser, max)
     }
+
+    /// 把一次鼠标事件编码成 agent 期望的转义序列并写进 PTY。
+    // Task 9 实现：空壳先让 `Request::Mouse` 这条线路编译得过、跑得起来。
+    pub fn write_mouse(&self, _ev: crate::proto::MouseForward) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// vt100 不公开「现在攒了多少行历史」。但 `set_scrollback` 内部会
