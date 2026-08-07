@@ -259,13 +259,11 @@ fn handle(
             r
         }
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
-        Request::Screen { id } => mgr
-            .screen(id)
-            .map(|(lines, cursor, state)| Response::Screen {
-                lines,
-                cursor,
-                state,
-            }),
+        Request::Screen { id } => mgr.screen(id).map(|snap| Response::Screen {
+            lines: snap.lines,
+            cursor: snap.cursor,
+            state: snap.state,
+        }),
         Request::Screens { ids } => Ok(Response::Screens {
             screens: mgr.screens(&ids),
         }),
