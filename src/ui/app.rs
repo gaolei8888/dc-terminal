@@ -104,6 +104,19 @@ pub struct App {
     pub start_dir: PathBuf,
     pub current_dir: PathBuf,
     pub quit: bool,
+    /// 贴在会话里时，出错解释算出来之后缓存在这（会话 id, 解释文字）。
+    ///
+    /// **不是为了省一次网络请求，是为了别把 `app.message` 焊死。** 附加
+    /// 视图每 16ms 跑一轮；没有这份缓存的话，`run()` 会在**每一帧**都重发
+    /// `Request::Explanation`、重写一次 `app.message`——哪怕答案没变。
+    /// 别的地方（粘贴失败、Ctrl+C 打断……）在两帧之间设的消息，下一帧就被
+    /// 这句话原样盖掉，用户永远看不见。有了缓存，`app.message` 只在**第一次
+    /// 拿到答案的那一帧**被赋值一次，之后这个会话不再触碰它。
+    ///
+    /// 离开 `Failed`（哪怕只是这一帧的 `Screen` 还没追上）就把它忘掉：
+    /// 见 `mod.rs::run` 里配对的清空分支——这样同一个会话「恢复了、又坏了」
+    /// 会被当成一次新的失败重新问一遍，不会一直顶着上一次的旧话。
+    pub(crate) explained_failure: Option<(u32, String)>,
 }
 
 impl App {
@@ -152,6 +165,7 @@ impl App {
             start_dir: default_dir.clone(),
             current_dir: default_dir,
             quit: false,
+            explained_failure: None,
         }
     }
 

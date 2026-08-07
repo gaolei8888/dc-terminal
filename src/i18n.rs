@@ -680,6 +680,17 @@ pub mod msg {
         )
     }
 
+    /// 出错解释算出来之后显示的那句话。**只套一层「哪个会话」的前缀**——
+    /// 解释本身已经是模型给零编程用户的完整一两句话（见
+    /// `session::explain_prompt`），这里不重新组句，只帮用户对上是哪个会话。
+    pub fn session_failure_explained(lang: Lang, id: u32, explanation: &str) -> String {
+        t!(
+            lang,
+            en: format!("Session {id}: {explanation}"),
+            zh: format!("{id} 号会话：{explanation}"),
+        )
+    }
+
     pub fn session_title(lang: Lang, id: u32, project: &str) -> String {
         t!(
             lang,
@@ -883,7 +894,152 @@ pub mod msg {
                      不用手动修它。（{path}）"
                 ),
             ),
+            // 用户确实写了 `[llm]`（这是一次主动的开），但连不上。守护进程
+            // 的 stderr 是被丢弃的（`client::spawn_daemon` 把它接到 null，
+            // 否则每一行都会糊在 TUI 上），所以这句话只能顶到界面上来，
+            // 否则用户开了功能却什么都没发生、也没人告诉他为什么。
+            LlmUnavailable(problem) => {
+                let why = llm_problem(lang, problem);
+                t!(
+                    lang,
+                    en: format!("Explaining failures is switched on but not connected: {why} Sessions run as usual."),
+                    zh: format!("「出错解释」开着，但连不上：{why}会话照常跑。"),
+                )
+            }
         }
+    }
+
+    /// 设置文件的位置。**每一句「去改设置」都必须带上它**——「设置文件」
+    /// 四个字对一个零编程经验的人不是一个可执行的下一步，一个路径才是。
+    /// 写成常量而不是把真实路径一路传进来：这些句子会跟着 `WarningCode`
+    /// 从守护进程走到界面进程，中间那条 socket 上没有「谁的 socket 旁边的
+    /// config」这个概念，而真实用户的它就是这个路径（见 `proto::socket_path`
+    /// 和 `config::config_path_for_socket`）。
+    pub const CONFIG_PATH: &str = "~/.dct/config.toml";
+
+    /// LLM 连不上时给用户的一句话。
+    ///
+    /// **不许出现内部字段名/类型名**（provider / transport / cli / agent /
+    /// Error 这类）——那是 Rust 代码里的词，不是用户的词。每句话点名是哪个
+    /// 厂商，并且给一个他真做得到的下一步（改哪个文件、按哪个键）。
+    pub fn llm_problem(lang: Lang, e: &crate::llm::resolve::ResolveError) -> String {
+        use crate::llm::resolve::ResolveError::*;
+        let cfg = CONFIG_PATH;
+        match e {
+            NoSuchProvider(n) => t!(
+                lang,
+                en: format!("The settings file {cfg} asks for “{n}”, which dct does not know. Change it to claude."),
+                zh: format!("设置文件 {cfg} 里写的「{n}」不是 dct 认识的名字，把它换成 claude 试试。"),
+            ),
+            // kimi/glm/deepseek/qwen-api 走到这里是常事（它们没有、也不该有
+            // 无界面命令，见 `profile.rs` 的
+            // `unverified_clis_declare_no_headless_command`），所以这句话必须
+            // 把**它们那条正路**也说出来——只说「换成 claude」等于让一个
+            // 已经付过钱、填好密钥的用户去换一家。「直连」是本项目对这件事的
+            // 统一说法，见下面 `NoApiEndpoint`。
+            NoHeadlessCommand(n) => t!(
+                lang,
+                en: format!("“{n}” cannot answer questions on its own in the background. Open the settings file {cfg} and either change that line to claude, or switch “{n}” to a direct connection and fill in the model name."),
+                zh: format!("「{n}」还没法自己在后台回答问题。打开设置文件 {cfg}，要么把这一项换成 claude，要么给「{n}」打开「直连」并填上型号名。"),
+            ),
+            NoApiEndpoint(n) => t!(
+                lang,
+                en: format!("“{n}” has no address dct can connect to by itself. Open the settings file {cfg} and turn the direct-connection line off, so it signs in on its own instead."),
+                zh: format!("「{n}」没有可以直接连接的网址。打开设置文件 {cfg}，把「直连」这一项关掉，改回让它自己登录。"),
+            ),
+            NoCredential(n) => t!(
+                lang,
+                en: format!("“{n}” has no key yet. Press c on the main screen to enter one."),
+                zh: format!("「{n}」还没有密钥。在主界面按 c 填一个。"),
+            ),
+            NoModel(n) => t!(
+                lang,
+                en: format!("“{n}” has no model name yet. Open the settings file {cfg} and fill in the exact name of the model you want."),
+                zh: format!("「{n}」还没有指定用哪个型号。打开设置文件 {cfg}，填一个具体的型号名。"),
+            ),
+            // 这一句要说清楚**为什么拒绝**：用户会觉得「我明明登录过了」。
+            // 说法只能用他懂的词——不同的公司、不同的账号，不是「凭据出处」。
+            BorrowedCredentialRefused { name, host } => t!(
+                lang,
+                en: format!("“{name}” has no key of its own yet. dct will not hand your sign-in from another program to {host} — they are different companies. Press c on the main screen and enter a key for “{name}”."),
+                zh: format!("「{name}」还没有自己的密钥。dct 不会把你在别的程序里的登录拿去连 {host}——那是两家不同的公司。在主界面按 c 给「{name}」填一个密钥。"),
+            ),
+            BadBaseUrl { name, url } => t!(
+                lang,
+                en: format!("The address for “{name}” ({url}) does not look like a web address, and dct will not send a key somewhere it cannot read. Fix that line in the settings file {cfg}."),
+                zh: format!("「{name}」要连的地址（{url}）不像一个网址，而 dct 不会把密钥发到看不懂的地方。改一下设置文件 {cfg} 里的那一行。"),
+            ),
+        }
+    }
+
+    /// `dct llm check`：这功能还没打开时说的话。**带上真实路径**——
+    /// 这条命令是在用户自己的终端里跑的，它知道那份设置文件到底在哪。
+    pub fn llm_not_enabled(lang: Lang, path: &std::path::Path) -> String {
+        let p = path.display();
+        t!(
+            lang,
+            en: format!(
+                "Explaining failures is switched off right now.\n\
+                 To switch it on, put these two lines in {p}\n\n\
+                 [llm]\nprovider = \"claude\"\n\n\
+                 Then run `dct llm check` again to test it."
+            ),
+            zh: format!(
+                "「出错解释」这个功能现在是关着的。\n\
+                 要打开的话，在 {p} 里加上这两行：\n\n\
+                 [llm]\nprovider = \"claude\"\n\n\
+                 加完再跑一次 `dct llm check` 就能验。"
+            ),
+        )
+    }
+
+    /// `dct llm check` 开头那行「现在这份设置是什么」。
+    pub fn llm_using(lang: Lang, provider: &str, direct: bool) -> String {
+        let how = if direct {
+            t!(lang, en: "connecting directly", zh: "直接连接")
+        } else {
+            t!(lang, en: "letting it sign in on its own", zh: "让它自己登录")
+        };
+        t!(
+            lang,
+            en: format!("Using {provider}, {how}."),
+            zh: format!("用的是 {provider}，{how}。"),
+        )
+    }
+
+    pub fn llm_cannot_connect(lang: Lang, why: &str) -> String {
+        t!(lang, en: format!("Not connected: {why}"), zh: format!("连不上：{why}"))
+    }
+
+    pub fn llm_works(lang: Lang, answer: &str) -> String {
+        t!(
+            lang,
+            en: format!("It works. The model replied: {answer}"),
+            zh: format!("通了。模型回答：{answer}"),
+        )
+    }
+
+    /// 真打了一次端点但没成。三种结果对用户是三件不同的事，别糊成一句。
+    pub fn llm_call_failed(lang: Lang, e: crate::llm::LlmError) -> String {
+        use crate::llm::LlmError::*;
+        match e {
+            Unavailable => t!(
+                lang,
+                en: "No answer came back — the address or the key may be wrong, or the network is blocked.",
+                zh: "没通：地址或者密钥可能不对，也可能是网络不通。",
+            ),
+            Timeout => t!(
+                lang,
+                en: "It took too long to answer and dct stopped waiting.",
+                zh: "等太久还没回话，dct 不等了。",
+            ),
+            Malformed => t!(
+                lang,
+                en: "Something came back, but dct could not read it.",
+                zh: "有回话，但 dct 读不懂它回的东西。",
+            ),
+        }
+        .to_string()
     }
 
     pub fn title_with(lang: Lang, main: Key, extra: &str) -> String {
@@ -1117,6 +1273,31 @@ mod tests {
             SecretsCorrupt {
                 path: "/h/.dct/secrets.toml".into(),
             },
+            // 出错解释连不上的每一种原因都要能在两种语言下组成一句警告——
+            // 这是它唯一能走到用户眼前的路（守护进程的 stderr 被丢弃了）。
+            LlmUnavailable(crate::llm::resolve::ResolveError::NoCredential(
+                "kimi".into(),
+            )),
+            LlmUnavailable(crate::llm::resolve::ResolveError::NoSuchProvider(
+                "nope".into(),
+            )),
+            LlmUnavailable(crate::llm::resolve::ResolveError::NoHeadlessCommand(
+                "kimi".into(),
+            )),
+            LlmUnavailable(crate::llm::resolve::ResolveError::NoApiEndpoint(
+                "claude".into(),
+            )),
+            LlmUnavailable(crate::llm::resolve::ResolveError::NoModel("kimi".into())),
+            LlmUnavailable(
+                crate::llm::resolve::ResolveError::BorrowedCredentialRefused {
+                    name: "kimi".into(),
+                    host: "api.moonshot.cn".into(),
+                },
+            ),
+            LlmUnavailable(crate::llm::resolve::ResolveError::BadBaseUrl {
+                name: "kimi".into(),
+                url: "not-a-url".into(),
+            }),
         ];
         for c in &codes {
             for l in Lang::all() {

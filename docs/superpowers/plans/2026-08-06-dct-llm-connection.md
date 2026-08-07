@@ -38,12 +38,16 @@
 - Produces:
   - `config::Transport { Cli, Http }`（`#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]`，serde rename 成小写）
   - `config::LlmConfig { pub provider: String, pub model: Option<String>, pub base_url: Option<String>, pub transport: Transport }`
-  - `config::Config { pub llm: LlmConfig }`
+  - `config::Config { pub llm: Option<LlmConfig> }`
   - `Config::from_toml(s: &str) -> anyhow::Result<Config>`
-  - `Config::load(path: &Path) -> Config`（文件不存在 = 默认值，**不报错**）
+  - `Config::load(path: &Path) -> Config`（文件不存在 = `llm: None`，**不报错**）
   - `config::config_path_for_socket(socket: &Path) -> PathBuf`
 
-**说明：** 默认 provider 是 `"claude"`、transport 是 `Cli`——那是用户最可能已经登录过的 CLI，且 `Cli` 这条路不需要任何凭据。配置整段缺失必须等价于默认值，否则老用户升级上来 dct 就起不来了。
+**说明：** `llm` 是 `Option`，不是默认开着的 `LlmConfig`——**这是隐私边界，不是随手选的类型**（2026-08-06 fix round 1，Critical）。出错解释（Task 8）会把一个失败会话屏幕上最后 2000 个字符原样送给配置里指定的模型，而那正是 `Invalid API key: sk-ant-...`、`Authorization: Bearer ...`、`.env` 内容、带 token 的 git 地址最容易出现的地方。把这功能打开必须是用户的一次主动动作，不能因为「用户什么都没配」就替他默认打开、把他终端里的东西发给第三方。
+
+文件不存在、内容为空、这一段没写、整份文件解析坏了——一律落在 `llm: None` 上，功能整个关着，`daemon.rs` 连 `resolve()` 都不会调用（见 Task 8）。**只有用户显式写下 `[llm]`**（哪怕后面什么都不填）才算「我要开」，那一刻开始，段内每个字段该有什么默认值（`provider` 默认 `"claude"`、`transport` 默认 `Cli`——那是用户最可能已经登录过的 CLI，且 `Cli` 这条路不需要任何凭据）还是照旧生效。「要不要开」和「开了之后怎么配」是两件事，前者靠 `Option`，后者靠 `LlmConfig` 内部的 `#[serde(default = ...)]`。
+
+⚠️ 下面 Step 1/Step 3 的代码块是本任务**最初**的设计（`llm: LlmConfig`，配置缺失 = 默认开着），已被 2026-08-06 fix round 1 的 Critical 修复取代。实现前请直接对照当前 `src/config.rs`（`llm: Option<LlmConfig>`），不要照抄下面这份旧代码。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -216,7 +220,9 @@ pub fn config_path_for_socket(socket: &Path) -> PathBuf {
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --lib config::`
-Expected: 6 passed
+Expected (post fix-round-1, `llm: Option<LlmConfig>`): 8 passed — no `[llm]` section /
+empty file / missing file / broken file all assert `llm.is_none()`; a bare `[llm]` and a
+full `[llm]` both assert `llm.is_some()` with the right fields.
 
 - [ ] **Step 5: 提交**
 
@@ -224,9 +230,11 @@ Expected: 6 passed
 cargo fmt && cargo test --lib config:: && git add src/config.rs src/lib.rs
 git commit -m "feat(config): add ~/.dct/config.toml with an [llm] section
 
-Defaults to the claude profile over the CLI transport, which needs no
-credential at all. A missing or broken config falls back to defaults
-instead of failing to start: the LLM is an enhancement, not a foundation."
+llm is Option<LlmConfig>, not a default-on LlmConfig: turning on the feature
+that sends failed-session screen text to a model must be a deliberate act,
+not something a user gets by having no config file at all. Writing a bare
+[llm] opts in; the fields inside it still default to the claude profile
+over the CLI transport, which needs no credential at all."
 ```
 
 ---
@@ -886,6 +894,14 @@ mod tests {
 }
 ```
 
+> **Fix round 1 补记：** 上面这 4 条是最初的 TDD 记录，原样保留。审查发现
+> `run_real` 有双向管道死锁（写 stdin 早于读 stdout/stderr，提示词一超过
+> 管道缓冲区就互相卡死），修完之后在 `tests` 模块末尾（`}` 之前）多加了
+> 第 5 条 `run_real_does_not_deadlock_when_prompt_exceeds_the_pipe_buffer`——
+> 用 `cat` 拉一个真子进程，喂进去几百 KB 数据验证不卡死，用
+> `mpsc::recv_timeout` 兜底，回归了就报「卡死」而不是把测试进程挂住。
+> 见下面 Step 3 修正后的 `run_real`。
+
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --lib llm::cli`
@@ -911,28 +927,26 @@ pub type Runner = dyn Fn(&[String], &str) -> Result<String, String> + Send + Syn
 
 pub struct CliBackend {
     command: Vec<String>,
-    env: BTreeMap<String, String>,
     runner: Arc<Runner>,
 }
 
 impl CliBackend {
+    /// `env` 不进结构体——它只被真实 runner 用到，闭包捕获走就够了。
+    /// 存一份在字段里没有任何读者，是纯粹的死重量。
     pub fn new(command: Vec<String>, env: BTreeMap<String, String>) -> CliBackend {
-        let env_for_run = env.clone();
         CliBackend {
             command,
-            env,
-            runner: Arc::new(move |cmd, input| run_real(cmd, input, &env_for_run)),
+            runner: Arc::new(move |cmd, input| run_real(cmd, input, &env)),
         }
     }
 
     pub fn with_runner(command: Vec<String>, runner: Arc<Runner>) -> CliBackend {
-        CliBackend { command, env: BTreeMap::new(), runner }
+        CliBackend { command, runner }
     }
 }
 
 impl Backend for CliBackend {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
-        let _ = &self.env; // 真实 runner 已经捕获了它
         let input = format!("{}\n\n{}", p.system, p.user);
         let out = (self.runner)(&self.command, &input).map_err(|e| {
             eprintln!("LLM CLI 调用失败：{e}");
@@ -947,7 +961,9 @@ impl Backend for CliBackend {
     }
 }
 
-/// 真实子进程。**没有单元测试覆盖**（会拉起真 CLI），在实测那一步验。
+/// 真实子进程。**跟具体 agent CLI（`claude` 之类）的集成没有单元测试覆盖**，
+/// 那部分在实测那一步验；但收发管道本身的正确性（不跟真 CLI 绑定）有一条
+/// 用 `cat` 做的回归测试，见下面 `run_real_does_not_deadlock_...`。
 ///
 /// 提示词走 stdin 不走参数：参数会进 `ps` 输出、可能超长度上限，
 /// 还要处理引号转义。
@@ -961,19 +977,44 @@ fn run_real(cmd: &[String], input: &str, env: &BTreeMap<String, String>) -> Resu
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("{head} 起不来：{e}"))?;
-    child
+
+    // 写 stdin 得放到单独的线程上，跟 wait_with_output 读 stdout/stderr
+    // 并发进行：如果提示词超过管道缓冲区（macOS 16KB / Linux 64KB），而
+    // 子进程这时候正往 stdout 写东西没人读，父进程堵在 write_all、子进程
+    // 堵在写 stdout，就是经典的双向管道死锁。两条管道得同时有人伺候。
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| "拿不到 stdin".to_string())?
-        .write_all(input.as_bytes())
-        .map_err(|e| format!("写 stdin 失败：{e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("等待失败：{e}"))?;
+        .ok_or_else(|| "拿不到 stdin".to_string())?;
+    let input = input.to_string();
+    let writer = std::thread::spawn(move || -> Result<(), String> {
+        let result = stdin.write_all(input.as_bytes());
+        // `stdin` 在这里出作用域被 drop，子进程收到 EOF——这个行为必须保留：
+        // 父进程不主动关，子进程读 stdin 会永远等下去。
+        match result {
+            Ok(()) => Ok(()),
+            // 子进程提前退出（参数错、没登录）会自己关掉 stdin，父进程这时候
+            // 写入会拿到 BrokenPipe——这不是真的错误，退出码和 stderr 才是。
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(format!("写 stdin 失败：{e}")),
+        }
+    });
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("等待失败：{e}"))?;
+    // 线程 panic 不能 unwrap 带崩——转成错误字符串正常传回去。
+    let write_result = writer
+        .join()
+        .unwrap_or_else(|_| Err("写 stdin 的线程 panic 了".to_string()));
+
     if !out.status.success() {
         return Err(format!(
             "{head} 退出码非零：{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    write_result?;
     String::from_utf8(out.stdout).map_err(|e| format!("输出不是 UTF-8：{e}"))
 }
 ```
@@ -983,7 +1024,7 @@ fn run_real(cmd: &[String], input: &str, env: &BTreeMap<String, String>) -> Resu
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --lib llm::cli`
-Expected: 4 passed
+Expected: 5 passed（含一条真拉子进程验证不死锁的 `run_real` 回归测试）
 
 - [ ] **Step 5: 提交**
 
@@ -1501,12 +1542,24 @@ pub fn llm_check() -> i32 {
             .cloned()
             .or_else(|| crate::profile::Profile::builtin(n))
     };
-    let oauth = |n: &str| match n {
-        "claude" | "kimi" | "glm" | "deepseek" | "qwen-api" => {
-            crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer)
-        }
-        "codex" => crate::llm::creds::read_codex_auth(),
-        _ => None,
+    // 修正（fix round 1 code review，CRITICAL）：这里原来把 kimi/glm/
+    // deepseek/qwen-api 也映射到 claude 的 OAuth。那四家的 `[api].base_url`
+    // 是它们自己的第三方服务器（api.moonshot.cn / open.bigmodel.cn /
+    // api.deepseek.com / dashscope.aliyuncs.com），`send_real` 会把凭据塞进
+    // `Authorization: Bearer` 头直接打过去——等于把用户的 Anthropic 登录态
+    // 发给了四家跟 Anthropic 毫无关系的第三方。规则钉死：一个 CLI 的
+    // OAuth 只能给它自己的端点用，不能给别家。kimi/glm/deepseek/qwen-api
+    // 跟用户没有任何 OAuth 关系，只能走用户自己填的 key。
+    //
+    // 映射拆成一个独立、可注入测试的 `oauth_lookup(name, claude, codex)`
+    // 函数（在 `cli.rs` 里），有一条测试钉死这四个名字永远拿不到别家的
+    // token，见 task-7-report.md 的 fix round 1 记录。
+    let oauth = |n: &str| {
+        oauth_lookup(
+            n,
+            &|| crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer),
+            &crate::llm::creds::read_codex_auth,
+        )
     };
 
     println!("provider: {}", cfg.llm.provider);
@@ -1558,6 +1611,23 @@ all. Adds 'dct llm check', which runs the configured connection for real —
 this is what makes the 'verified against a live endpoint' bar checkable."
 ```
 
+**Fix round 1（code review）：** 除了上面已经改掉的 vendor→Claude-OAuth 映射
+（CRITICAL）之外，同一轮还发现并修了三处，全部记在
+`.superpowers/sdd/2026-08-06-dct-llm-connection/task-7-report.md`：
+
+- 凭据顺序（key 优先于 OAuth）之前没有测试同时喂 key 和 OAuth，翻转
+  `.or_else()` 顺序也能全绿——补了 `an_explicit_key_outranks_an_oauth_token_found_elsewhere`，把这条顺序拆成独立的 `select_credential` 函数以便直接测。
+- 为了让 `.unwrap_err()` 编译通过，曾经给 `dyn Backend` 加了一个只为测试
+  存在的 `Debug` 实现——已撤掉，改用 `matches!` 断言，不需要 `T: Debug`。
+- `describe()` 的四句话原样带着 `provider`/`transport`/`cli` 这些内部
+  字段名，测试也弱到 `"x xxxxxxxxx"` 都能过——文案改成不含内部字段名/
+  类型名的大白话，测试改成查具体禁词 + 查真实存在的下一步动作。
+
+另外顺手修了两处「便宜」的问题：HTTP 路径按 `Wire` 区分
+（`/v1/messages` vs `/v1/chat/completions`，写死前者会让 OpenAI 型端点
+404），以及 `cfg.llm.model` 为空时不再瞎猜 `claude-3-5-sonnet`，改成
+`ResolveError::NoModel` 让用户自己填。
+
 ---
 
 ### Task 8: 出错解释——会话失败时说人话
@@ -1565,14 +1635,19 @@ this is what makes the 'verified against a live endpoint' bar checkable."
 **Files:**
 - Modify: `src/session.rs`（`Session` 加字段；`tick()` 里检测进入 `Failed` 的那一刻）
 - Modify: `src/proto.rs`（`Request::Explanation { id }`、`Response::Explanation(Option<String>)`）
-- Modify: `src/daemon.rs`（接线；启动时 resolve 一次后端）
-- Modify: `src/ui/mod.rs`（`Failed` 会话上显示解释）
+- Modify: `src/daemon.rs`（接线；启动时 resolve 一次后端，仅当 `cfg.llm` 是 `Some`）
+- Modify: `src/ui/mod.rs`（`Failed` 会话上显示解释；`src/ui/app.rs` 加一个每会话缓存字段）
 - Modify: `src/i18n.rs`（新词条）
+- fix round 1 追加触及：`src/llm/resolve.rs`（`resolve()` 改接 `LlmConfig` 而不是
+  `Config`）、`src/cli.rs`（`llm_check` 处理 `cfg.llm` 是 `None` 的情形）——见下面的
+  fix round 1 附注。
 
 **Interfaces:**
 - Consumes: `llm::{Backend, Prompt, complete_with_timeout}`、`llm::resolve::resolve`
 - Produces:
-  - `session::Session` 新字段 `explanation: Option<String>`
+  - `session::Session` 新字段 `explanation_slot: Arc<Mutex<Option<String>>>`
+    （**必须是 `Arc<Mutex<_>>`**：解释由后台线程写回，而那个线程拿不到
+    `Session` 的锁——`tick()` 正持着它。裸 `Option<String>` 编不过。）
   - `session::explain_prompt(screen: &str) -> Prompt`
   - `SessionManager::set_backend(&self, b: Option<Arc<dyn Backend>>)`
   - `SessionManager::explanation(&self, id: u32) -> Option<String>`
@@ -1582,6 +1657,34 @@ this is what makes the 'verified against a live endpoint' bar checkable."
 **退路：** 后端没配 / 调不通 / 超时，`explanation` 保持 `None`，界面显示今天就有的那句失败提示。**功能安静下线，不打扰用户。**
 
 截屏文本要**截尾**再送：整屏可能几千字，只要最后 2000 字符——错误一定在末尾。
+
+> **2026-08-06 fix round 1（code review：1 Critical + 2 Important）追加，实现前必读：**
+>
+> - **Critical——「没配后端」必须真的意味着「没配」，不能靠 `Config` 默认值假装没配。**
+>   `daemon.rs` 启动时装后端这一步，**必须先看 `cfg.llm.is_some()`**（Task 1 的 fix：`Config::llm`
+>   已经是 `Option<LlmConfig>`，缺 `[llm]` 就是 `None`）——`None` 时压根不调 `resolve()`、
+>   不装后端、不打印任何东西；只有用户确实写了 `[llm]` 却连不上时才值得往 stderr 留一行。
+>   这一步值得抽成一个独立函数（比如 `install_llm_backend(socket, profiles_dir, mgr)`），
+>   好让「没写 `[llm]` 就不该装后端」这条能在不起真实 socket/listener 的情况下直接单测——
+>   断言 `SessionManager` 有没有装上后端，不要靠等一个真实网络调用的结果去反推，那样测试会
+>   被「这台机器上到底装没装某个 CLI」这类环境噪音污染。
+> - **Important (a)——UI 不能每帧都重发 `Request::Explanation`、每帧都重写 `app.message`。**
+>   附加视图 16ms 一轮；`App` 需要一个「这个会话这一次失败已经拿到解释了」的缓存（比如
+>   `explained_failure: Option<(u32, String)>`），拿到过就不再问、也不再碰 `app.message`
+>   ——不然粘贴失败、Ctrl+C 打断这类别处设的消息，下一帧就被这句话原样盖掉，用户永远看不见。
+>   `enter_session`（或等价的「进入这个会话」入口）要清空这份缓存：不清的话，一个「恢复了、
+>   又坏了一次」的会话会一直顶着用户上一次看到的旧解释，永远问不出新的。
+> - **Important (b)——第二次失败不能显示第一次失败的解释，也不能被第一次的慢答案覆盖。**
+>   `request_explanation` 在**起线程之前**（不管有没有配后端）就要清空 `explanation_slot`
+>   并给这一轮失败发一个号（`explanation_gen: Arc<AtomicU64>` 之类，自增一次）；后台线程
+>   算完之后先比一遍「我领到的号还是不是最新那个」，不是才不写——这样一个卡了很久的旧线程，
+>   哪怕在新一轮失败已经有了新答案之后才姗姗来迟，也没法把新答案盖成旧的。
+>
+> 这三条把原本只列在 Files 里的 `src/session.rs` / `src/daemon.rs` / `src/ui/mod.rs`
+> 的实现细节改深了；`src/config.rs`（Task 1）、`src/llm/resolve.rs`、`src/cli.rs`
+> 的 `llm_check` 也要跟着 `Config::llm: Option<LlmConfig>` 一起改（`resolve()` 改成只接
+> `LlmConfig`，「开没开」的判断留给调用方；`llm_check` 在 `cfg.llm` 是 `None` 时打印一句
+> 明确的中文——功能没开、该在配置文件里加什么——然后非零退出，不能走「连不上」那条话术）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1660,7 +1763,8 @@ Expected: 编译失败，`cannot find function 'explain_prompt'`
 
 `src/session.rs`：
 
-1. `Session` 结构加 `explanation: Option<String>`（`new` 里初始化为 `None`）
+1. `Session` 结构加 `explanation_slot: Arc<Mutex<Option<String>>>`（`new` 里初始化为
+   `Arc::new(Mutex::new(None))`）。`SessionManager::explanation(id)` 读它并 clone 出来。
 2. `SessionManager` 加 `backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>`
 3. 加两个方法与一个纯函数：
 
@@ -1735,7 +1839,8 @@ Expected: 全绿
 - [ ] **Step 5: 提交**
 
 ```bash
-cargo fmt && cargo test --lib && cargo build && git diff --check && git add -A
+cargo fmt && cargo test --lib && cargo build && git diff --check
+git add src/session.rs src/proto.rs src/daemon.rs src/ui/mod.rs src/i18n.rs
 git commit -m "feat: explain in plain language why a session failed
 
 Fires once on the transition into Failed, not while Failed: the latter would

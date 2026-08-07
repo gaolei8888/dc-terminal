@@ -29,3 +29,7 @@ en = "Copy your API key from your account at open.bigmodel.cn"
 
 [secret.verify]
 url = "https://open.bigmodel.cn/api/anthropic/v1/messages"
+
+[api]
+base_url = "https://open.bigmodel.cn/api/anthropic"
+wire = "anthropic"

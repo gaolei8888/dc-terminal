@@ -58,6 +58,33 @@ pub struct InstallSpec {
     pub note: LocalizedText,
 }
 
+/// 怎么把这个 profile 用**无界面**方式跑一次（dct 自己要用模型时走这条）。
+///
+/// 命令后面会追加提示词，stdout 就是回答。
+/// **只给实测过的 profile 写**——编一个出来等于造一条用户按了就报错的路。
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeadlessSpec {
+    pub command: Vec<String>,
+}
+
+/// HTTP 端点说的是哪种话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Wire {
+    Openai,
+    Anthropic,
+}
+
+/// 这个 profile 背后的 HTTP 端点，给 dct 自己直连用。
+///
+/// 和 `[env] ANTHROPIC_BASE_URL` 值相同但**不合并**：那个是给子进程的，
+/// 这个是给 dct 的，将来会分叉（dc_llm 只有 `[api]`，没有 `[env]`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiSpec {
+    pub base_url: String,
+    pub wire: Wire,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -83,6 +110,10 @@ pub struct Profile {
     pub secret: Option<SecretSpec>,
     #[serde(default)]
     pub install: Option<InstallSpec>,
+    #[serde(default)]
+    pub headless: Option<HeadlessSpec>,
+    #[serde(default)]
+    pub api: Option<ApiSpec>,
     #[serde(default)]
     pub label: LocalizedText,
     #[serde(default)]
@@ -1076,5 +1107,99 @@ mod tests {
         std::fs::write(tmp.path().join("README.md"), "随手放的笔记").unwrap();
         let (_, errs) = all_profiles(tmp.path());
         assert!(errs.is_empty(), "非 .toml 文件直接跳过，不该报错");
+    }
+
+    #[test]
+    fn claude_and_codex_declare_a_headless_command() {
+        // 这两个是本机实测过的：`claude -p` 和 `codex exec`。
+        for name in ["claude", "codex"] {
+            let p = Profile::builtin(name).unwrap();
+            let h = p
+                .headless
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: 要有 [headless]"));
+            assert!(!h.command.is_empty(), "{name}: headless 命令不能为空");
+        }
+        assert_eq!(
+            Profile::builtin("claude")
+                .unwrap()
+                .headless
+                .unwrap()
+                .command,
+            vec!["claude".to_string(), "-p".to_string()]
+        );
+        assert_eq!(
+            Profile::builtin("codex").unwrap().headless.unwrap().command,
+            vec!["codex".to_string(), "exec".to_string()]
+        );
+    }
+
+    /// **只有非交互模式被真的跑过的 CLI 才许写 `[headless]`。**
+    ///
+    /// - opencode / qwen 本机没装，无界面模式没验过。
+    /// - kimi / glm / deepseek / qwen-api 一样没验过，而且它们比前两个更危险：
+    ///   它们的 `[headless]` 曾经写着 `claude -p`，配上自己的
+    ///   `[env] ANTHROPIC_BASE_URL`（moonshot / bigmodel / deepseek /
+    ///   dashscope），等于起一个 `claude` 去打第三方端点，而那条路上没有
+    ///   任何地方注入过厂商密钥——`claude` 只好拿用户 Keychain 里的
+    ///   Anthropic 登录态去认证，**把 A 家的凭据发给 B 家的服务器**。
+    ///   这四个是 API 密钥形态的厂商，它们的正路是 `[api]` + HTTP 直连。
+    ///
+    /// 编一个没验过的 `[headless]` 出来 = 造一条用户一走就坏的路，
+    /// 和「没验过就不填 pattern」是同一条纪律。不要把这些块加回去。
+    #[test]
+    fn unverified_clis_declare_no_headless_command() {
+        for name in ["opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.headless.is_none(),
+                "{name}: 没有实测过非交互模式就不许写 [headless]——\
+                 编出来的那条路一走就坏，而且这几个 API 形态的 profile 还会\
+                 让子进程去借另一家的登录态。它们的正路是 [api] + 直连。"
+            );
+        }
+    }
+
+    #[test]
+    fn api_shaped_profiles_declare_an_api_block() {
+        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            let api = p
+                .api
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: 要有 [api]"));
+            assert!(
+                api.base_url.starts_with("https://"),
+                "{name}: base_url 要是 https"
+            );
+            assert_eq!(
+                api.wire,
+                Wire::Anthropic,
+                "{name}: 这四个都是 Anthropic 兼容形态"
+            );
+        }
+    }
+
+    #[test]
+    fn the_api_base_url_matches_the_env_base_url() {
+        // 两个字段现在值相同但用途不同（env 给子进程，api 给 dct 自己）。
+        // 不合并，但要一致——不一致意味着有人只改了一边。
+        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            let env = p.env.get("ANTHROPIC_BASE_URL").unwrap();
+            assert_eq!(
+                &p.api.as_ref().unwrap().base_url,
+                env,
+                "{name}: 两处 base_url 不一致"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_without_the_new_blocks_still_parses() {
+        // 用户手写的老 profile 不能因为加了新字段就读不了。
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.headless.is_none());
+        assert!(p.api.is_none());
     }
 }

@@ -18,6 +18,7 @@ dct —— vibe coding 终端
   dct kill <会话号> 强制杀掉，不给它收尾的时间；可以给多个
   dct kill --all   强制杀掉全部会话
   dct prune        把已经停掉的会话从列表里清掉
+  dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面
   dct --help       看这段
 
@@ -53,6 +54,11 @@ fn main() -> Result<()> {
         }
         // prune 不接参数：它只对已经停了的会话下手，那批东西不可能被误伤。
         Some("prune") => dct::cli::run_prune(&socket_path(), cli_lang()),
+        // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
+        // 通路，跟会话、pty 都无关。
+        Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
+            std::process::exit(dct::cli::llm_check(cli_lang()))
+        }
         Some("--help") | Some("-h") => {
             println!("{HELP}");
             Ok(())

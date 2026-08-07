@@ -235,12 +235,176 @@ pub fn run_prune(sock: &Path, lang: Lang) -> Result<()> {
     Ok(())
 }
 
+/// 一个 provider 只能拿到**它自己厂商**的 OAuth，绝不能拿别家的。
+///
+/// CRITICAL（见 review）：这里曾经把 kimi / glm / deepseek / qwen-api 也映射
+/// 到 `read_claude_oauth()`，而 `send_real`（`src/llm/http.rs`）会把凭据
+/// 塞进 `Authorization: Bearer` 头直接打给这些 profile 自己的 `[api].base_url`
+/// （api.moonshot.cn / open.bigmodel.cn / api.deepseek.com /
+/// dashscope.aliyuncs.com）——等于把用户的 Anthropic 登录态发给了四家
+/// 跟 Anthropic 毫无关系的第三方服务器。claude 本身又没有 `[api]` 块
+/// （它走官方端点，靠 CLI 自己登录），所以那个分支唯一能真正走到的效果
+/// 就是把 token 发给别家。
+///
+/// 规则钉死：**一个 CLI 的 OAuth 只能给它自己的端点用。** kimi/glm/
+/// deepseek/qwen-api 跟用户没有任何 OAuth 关系，只能走用户自己填的 key
+/// （`resolve::resolve` 里 key 优先于 OAuth 那条顺序保证了这一点）。
+/// 不要再把它们加回 claude 或 codex 的分支。
+///
+/// **按名字挑只是第一道关。** 名字是用户可以手写的（
+/// `~/.dct/profiles/claude.toml` 里塞一个 `[api]`、设置文件里写一行
+/// `base_url`），所以每份凭据都带着**出处**（`BorrowedFrom`）一起返回，
+/// 由 `resolve::select_credential` 拿它去比对**目的地主机**——那才是凭据
+/// 真正会去的地方。两道关一起才关得住这一类问题。
+///
+/// `claude`/`codex` 两个闭包注入是为了测试不用碰真实 Keychain / `auth.json`。
+fn oauth_lookup(
+    name: &str,
+    claude: &dyn Fn() -> Option<crate::llm::creds::Borrowed>,
+    codex: &dyn Fn() -> Option<crate::llm::creds::Borrowed>,
+) -> Option<crate::llm::creds::Borrowed> {
+    match name {
+        "claude" => claude(),
+        "codex" => codex(),
+        _ => None,
+    }
+}
+
+/// `dct llm check`：把配置里那条 LLM 连接真的跑一次。
+///
+/// 这条命令**就是**「配置写完还要真打端点验过」那条验收标准的载体。
+///
+/// `lang` 跟 `ps`/`stop`/`prune` 同一条路（`main::cli_lang()`）：这条命令印的
+/// 也是给人看的话，跟界面说两种语言会很怪。
+pub fn llm_check(lang: Lang) -> i32 {
+    let socket = crate::proto::socket_path();
+    let config_path = crate::config::config_path_for_socket(&socket);
+    let cfg = crate::config::Config::load(&config_path);
+    let secrets =
+        crate::secrets::SecretStore::load(&crate::secrets::secrets_path_for_socket(&socket));
+    let profiles_dir = crate::profile::profiles_dir_for_socket(&socket);
+    let (custom, _) = crate::profile::all_profiles(&profiles_dir);
+    let lookup = |n: &str| {
+        custom
+            .iter()
+            .find(|p| p.name == n)
+            .cloned()
+            .or_else(|| crate::profile::Profile::builtin(n))
+    };
+    let oauth = |n: &str| {
+        use crate::llm::creds::{BorrowedFrom, Credential};
+        oauth_lookup(
+            n,
+            &|| {
+                crate::llm::creds::read_claude_oauth()
+                    .map(|t| (BorrowedFrom::ClaudeCli, Credential::Bearer(t)))
+            },
+            &|| crate::llm::creds::read_codex_auth().map(|c| (BorrowedFrom::CodexCli, c)),
+        )
+    };
+
+    // 没写 `[llm]` 就是没开——这是绝大多数用户的正常状态，不是「配置不对」。
+    // 见 `config.rs` 头注释：出错解释会把终端里的原始内容送给模型，必须是
+    // 用户自己主动写下 `[llm]` 才算数，这里不能替他去猜一份默认配置来验。
+    let Some(llm) = &cfg.llm else {
+        // 路径是真的从 socket 推出来的那一个，不是一句「设置文件」——
+        // 零编程经验的用户没法对「设置文件」这四个字采取任何行动。
+        println!("{}", crate::i18n::msg::llm_not_enabled(lang, &config_path));
+        return 1;
+    };
+
+    println!(
+        "{}",
+        crate::i18n::msg::llm_using(
+            lang,
+            &llm.provider,
+            llm.transport == crate::config::Transport::Http
+        )
+    );
+
+    let backend = match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "{}",
+                crate::i18n::msg::llm_cannot_connect(
+                    lang,
+                    &crate::i18n::msg::llm_problem(lang, &e)
+                )
+            );
+            return 1;
+        }
+    };
+
+    let p = crate::llm::Prompt {
+        system: "你是一个只回答一个词的助手。".into(),
+        user: "回答「好」这一个字，不要别的。".into(),
+        max_tokens: 16,
+    };
+    match crate::llm::complete_with_timeout(backend, p, std::time::Duration::from_secs(60)) {
+        Ok(answer) => {
+            println!("{}", crate::i18n::msg::llm_works(lang, &answer));
+            0
+        }
+        Err(e) => {
+            println!("{}", crate::i18n::msg::llm_call_failed(lang, e));
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// CRITICAL fix pin: `oauth_lookup` 曾经把 kimi/glm/deepseek/qwen-api
+    /// 也映射到 claude 的 OAuth，等于把用户的 Anthropic 登录态发给了四家
+    /// 毫不相关的第三方服务器（见 `oauth_lookup` 上的注释）。这里钉死
+    /// 只有 claude 拿得到 claude 自己的 token、codex 拿得到 codex 自己的
+    /// token，其余名字一律 `None`——不管注入的 `claude`/`codex` 闭包
+    /// 返回什么。两个闭包都是假的，测试不碰真实 Keychain / `auth.json`。
+    #[test]
+    fn oauth_lookup_never_offers_one_vendors_token_to_another() {
+        use crate::llm::creds::{BorrowedFrom, Credential};
+
+        let claude = || {
+            Some((
+                BorrowedFrom::ClaudeCli,
+                Credential::Bearer("claude-token".into()),
+            ))
+        };
+        let codex = || {
+            Some((
+                BorrowedFrom::CodexCli,
+                Credential::Bearer("codex-token".into()),
+            ))
+        };
+
+        assert_eq!(
+            oauth_lookup("claude", &claude, &codex),
+            Some((
+                BorrowedFrom::ClaudeCli,
+                Credential::Bearer("claude-token".into())
+            ))
+        );
+        assert_eq!(
+            oauth_lookup("codex", &claude, &codex),
+            Some((
+                BorrowedFrom::CodexCli,
+                Credential::Bearer("codex-token".into())
+            ))
+        );
+        for vendor in ["kimi", "glm", "deepseek", "qwen-api"] {
+            assert_eq!(
+                oauth_lookup(vendor, &claude, &codex),
+                None,
+                "{vendor} 没有自己的 OAuth 关系，不该拿到别家的凭据"
+            );
+        }
     }
 
     /// **不给参数不能等于全停。** `dct stop` 是最容易手滑敲出来的形式，

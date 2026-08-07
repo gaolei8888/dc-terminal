@@ -105,7 +105,16 @@ wire = "anthropic"   # 或 "openai"
 ### 配置
 
 `~/.dct/config.toml` 新增 `[llm]`：provider、model、可选的 base_url 覆盖。
-整段缺失 = 默认用 `claude` profile 的无界面模式——那是用户最可能已经登录过的 CLI。
+
+**整段缺失 = 这个功能整个关着**（实现如此，而且是刻意的）。这一稿早先写的是
+「整段缺失 = 默认用 `claude` profile 的无界面模式」，那是错的，不要照着它改回去：
+出错解释会把一个失败会话屏幕上最后 2000 个字符原样送给模型，而那正是
+`Invalid API key: sk-ant-...`、`Authorization: Bearer ...`、`.env` 内容最容易
+出现的地方。**把这功能打开必须是用户的一次主动动作**，不能因为「什么都没配」
+就替他打开、把他终端里的东西发给第三方。用户显式写下 `[llm]`（哪怕后面什么
+都不填）才算「我要开」；段内各字段该有什么默认值（`provider` 默认 `claude`、
+`transport` 默认 `cli`）只回答「开了之后怎么配」，不回答「要不要开」。
+见 `src/config.rs` 头注释和 `daemon::install_llm_backend`。
 
 ## 数据流：自答流水线
 
@@ -188,14 +197,28 @@ tick → SessionState::Asking（已有的正则机器，src/session.rs:26）
 
 ## 实测验证
 
-用户要求「配置写完还要真打端点验过」。诚实的边界：
-
-| 项 | 现在能不能验 |
-|---|---|
-| `claude -p` 走已有 SSO | **能**，本机已登录（Keychain 里有） |
-| `codex exec` 走已有 SSO | **能**，`~/.codex/auth.json` 在 |
-| Keychain 提取 | **能** |
-| HTTP 路径 | **不能**——需要用户给一份真 vendor key，或把 dc_llm/Ollama 拉起来。本机 `:8700` 和 `:11434` 现在都连不上 |
-| 四个 vendor 的 base_url | **仍未实测**，与既有的发布阻塞项是同一件事 |
-
+用户要求「配置写完还要真打端点验过」。**下面是 2026-08-06 真跑出来的结果**，
 没跑过的一律记成「未验证」，不当作跑过。
+
+### 跑通了的
+
+| 项 | 结果 |
+|---|---|
+| 关着的时候真的是关的 | ✅ 没有 `[llm]` 段时打印「功能现在是关着的」并退 1，不建任何后端 |
+| `claude -p` 走已有 SSO | ✅ **通了**，模型答「好」，9.4 秒。全程没有任何 key，认证完全靠 Keychain 里已有的登录 |
+| `codex exec` 走已有 SSO | ✅ **通了**，模型答「好」，认证靠 `~/.codex/auth.json` |
+| 四条拒绝路径的措辞 | ✅ opencode（没无界面模式）/ 不认识的名字 / claude 直连（没 `[api]`）/ kimi 没密钥，四句都是人话、都给得出下一步、都退 1 |
+| **凭据不会跑到别人家去** | ✅ kimi + 直连 + 没填密钥 → 说「还没有密钥，按 c 填」，**不会**去摸 Keychain 里的 Anthropic token。这是那个 Critical 在运行时的验证，不只是单测 |
+| HTTP 传输层（`send_real`） | ✅ 对着本地一个假 Anthropic 端点跑通，并**核对了真正发出去的报文**：路径 `/v1/messages`、`system` 在**顶层**而不是塞在 `messages` 里、model 来自配置、`x-api-key` 与 `authorization` 都在 |
+
+`send_real` 与 `run_real` 是全计划里仅有的两个没有单测的函数，也正是各自藏过一个
+bug 的地方。这一轮两个都真跑过了。
+
+### 仍未验证的
+
+| 项 | 为什么 |
+|---|---|
+| 四个 vendor 的真实 base_url | **需要各家的真 API key**，本轮拿不到。与既有的发布阻塞项是同一件事，没有前进 |
+| `Wire::Openai` 那条路 | **没有任何内置 profile 用 openai 形态**，四个 vendor 全是 anthropic 兼容。`/v1/chat/completions` 这条路径只有单测覆盖，从没真发过 |
+| dc_llm `:8700` / Ollama `:11434` | 本机两个都连不上，没起 |
+| 出错解释的端到端表现 | `explain_prompt` 的产出质量没有真实失败会话验过——只验了管道通不通 |

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(test)]
 use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
@@ -50,6 +49,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
 
+    // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
+    // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
+    // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
+    // 装后端」这条 Critical 修复本身，见下面 `install_llm_backend` 和它的测试。
+    install_llm_backend(socket, &profiles_dir, &mgr);
+
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -69,6 +74,68 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// **`cfg.llm` 是 `None` 就什么都不做**：不 resolve、不装后端、也不打印
+/// 任何一行——这是绝大多数用户的正常状态（没写过 `[llm]`），不是一种
+/// 「本来该配却没配好」的错误。见 `config.rs` 头注释：出错解释会把一个
+/// 失败会话屏幕上的原始内容送给模型，这必须是用户自己写下 `[llm]` 才
+/// 触发的动作，不能因为「什么都没配」就替他打开、把他终端里的东西发
+/// 给第三方。只有用户确实写了 `[llm]` 却指向一个连不上的后端时，才值得
+/// 在 stderr 上留一行——那时候他大概率是想用这功能的，只是配错了。
+fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
+    let Some(llm) =
+        &crate::config::Config::load(&crate::config::config_path_for_socket(socket)).llm
+    else {
+        return;
+    };
+    let llm_secrets = SecretStore::load(&secrets_path_for_socket(socket));
+    let (custom, _) = all_profiles(profiles_dir);
+    let lookup = |n: &str| {
+        custom
+            .iter()
+            .find(|p| p.name == n)
+            .cloned()
+            .or_else(|| Profile::builtin(n))
+    };
+    match crate::llm::resolve::resolve(llm, &lookup, &llm_secrets, &startup_oauth) {
+        Ok(b) => {
+            mgr.set_backend(Some(b));
+            mgr.set_llm_problem(None);
+        }
+        Err(e) => {
+            // stderr 这一行只有 `dct daemon` 前台跑的时候看得见：界面进程
+            // 拉起守护进程时把 stderr 接到了 `/dev/null`（`spawn_daemon`——
+            // 不然每一行都会糊在 TUI 上）。所以真正让用户看到的是记下来的
+            // 这个码，`Request::Profiles` 会把它当成一条警告顶上去。
+            eprintln!("dct: 出错解释开着，但连不上（{e:?}），会话照常跑");
+            mgr.set_backend(None);
+            mgr.set_llm_problem(Some(e));
+        }
+    }
+}
+
+/// 只有 claude/codex 有自己的 OAuth 关系，别的 provider 只能走用户自己填的
+/// key（`resolve::resolve` 里 key 优先于 OAuth 那条顺序保证了这一点）。跟
+/// `cli.rs::oauth_lookup` 是同一条规则，见那边的注释——**不要**把 kimi/glm/
+/// deepseek/qwen-api 也映射到这两个查询上，那等于把用户的 Anthropic/OpenAI
+/// 登录态发给几家跟它们毫无关系的第三方服务器。
+///
+/// 每份凭据都带着**出处**（`BorrowedFrom`）一起返回：按名字挑只是第一道关，
+/// 名字是用户可以手写的，真正管用的是 `resolve::select_credential` 拿这个
+/// 出处去比对目的地主机。
+///
+/// 单独写一份而不是复用 `cli.rs::oauth_lookup`：那边把两个查询做成了可注入
+/// 的闭包参数，是为了单测能绕开真实 Keychain / `auth.json`；守护进程启动
+/// 只跑一次真实查询，没有这个诉求，硬套那个签名反而要在这里现造两个闭包。
+fn startup_oauth(name: &str) -> Option<crate::llm::creds::Borrowed> {
+    use crate::llm::creds::{BorrowedFrom, Credential};
+    match name {
+        "claude" => crate::llm::creds::read_claude_oauth()
+            .map(|t| (BorrowedFrom::ClaudeCli, Credential::Bearer(t))),
+        "codex" => crate::llm::creds::read_codex_auth().map(|c| (BorrowedFrom::CodexCli, c)),
+        _ => None,
+    }
 }
 
 fn serve(
@@ -122,6 +189,12 @@ fn handle(
                 // 说清楚该干什么的中文（见 `SecretStore::load` 的注释），这里
                 // 只负责把路径带上，不再叠加任何暗示"去编辑它"的措辞。
                 warnings.insert(0, e.clone());
+            }
+            // 用户开了出错解释却接不上，这条原因只有这一条路能走到他眼前
+            // （守护进程的 stderr 被丢弃了）。排在密钥/profile 那些警告后面：
+            // 那几条是「你现在要用的东西坏了」，这条是「一个增强功能没生效」。
+            if let Some(p) = mgr.llm_problem() {
+                warnings.push(crate::proto::WarningCode::LlmUnavailable(p));
             }
             let entries = all
                 .iter()
@@ -211,6 +284,9 @@ fn handle(
         Request::LastProfile => Ok(Response::LastProfile(
             recover(store.lock()).last_profile().map(str::to_string),
         )),
+        // 永远不失败：没有解释（没配后端、还没算完、算失败了）跟「问不到」
+        // 是同一件事，界面不用区分，统一显示今天就有的那句失败提示。
+        Request::Explanation { id } => Ok(Response::Explanation(mgr.explanation(id))),
         Request::VerifySecret { profile, value } => {
             let (all, _) = all_profiles(profiles_dir);
             let spec = all
@@ -282,6 +358,8 @@ mod tests {
             env: Default::default(),
             secret: None,
             install: None,
+            headless: None,
+            api: None,
             label: Default::default(),
             note: Default::default(),
         }
@@ -454,6 +532,204 @@ mod tests {
         assert!(
             lock_wait < Duration::from_millis(100),
             "secrets 锁被慢 Create 攥着不放：等了 {lock_wait:?}（同期 Create 耗时 {create_elapsed:?}）"
+        );
+    }
+
+    // 冒充一个会报错的 agent：echo BOOM 之后常驻，好让 tick() 判成 Failed
+    // 而不是 Stopped（同 session.rs::tests::failing_agent）。
+    fn failing_agent() -> Profile {
+        Profile {
+            name: "daemon-explain-fake".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "echo BOOM; sleep 5".into()],
+            is_agent: true,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: Some("BOOM".into()),
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        }
+    }
+
+    struct FixedAnswer;
+    impl crate::llm::Backend for FixedAnswer {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            Ok("这个命令没配好，重开一次就行。".into())
+        }
+    }
+
+    /// 回归测试：`Request::Explanation` 真的接到了 `mgr.explanation()`，不是
+    /// 一条只在类型上存在、`handle()` 里没人接的死请求。
+    #[test]
+    fn explanation_request_is_wired_to_the_session_manager() {
+        let repo = tempfile::tempdir().unwrap();
+        {
+            let run = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .output()
+                    .unwrap();
+            };
+            run(&["init", "-q"]);
+            run(&["config", "user.email", "t@example.com"]);
+            run(&["config", "user.name", "t"]);
+            std::fs::write(repo.path().join("a.txt"), "hi\n").unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", "init"]);
+        }
+
+        let mgr = Arc::new(SessionManager::new());
+        mgr.register_profile(failing_agent());
+        mgr.set_backend(Some(Arc::new(FixedAnswer)));
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let id = mgr
+            .create(repo.path(), "daemon-explain-fake", None, &[])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            let resp = handle(
+                Request::Explanation { id },
+                &mgr,
+                &store,
+                &secrets,
+                profiles_dir.path(),
+            );
+            if let Response::Explanation(Some(text)) = resp {
+                assert_eq!(text, "这个命令没配好，重开一次就行。");
+                return;
+            }
+            assert!(Instant::now() < deadline, "Explanation 请求一直没接到解释");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 没有对应会话时，`Explanation` 也要老老实实回 `None`，不能 panic
+    /// 或者报错——「问不到」跟「没配后端」在界面眼里是同一件事。
+    #[test]
+    fn explanation_for_an_unknown_session_is_none_not_an_error() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let resp = handle(
+            Request::Explanation { id: 9999 },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+        );
+        assert!(matches!(resp, Response::Explanation(None)));
+    }
+
+    /// **Critical 回归测试.** 没写 `[llm]`（这里就是没有 `config.toml` 这个
+    /// 文件——「不存在」和「写了但没这一段」在 `config.rs` 里是同一件事）
+    /// 是绝大多数用户的正常状态，出错解释必须整个关着：`install_llm_backend`
+    /// 压根不能调 `resolve()`，更不能装上一个会把终端内容发出去的后端。
+    ///
+    /// 断言的是 `backend_is_set()` 这个布尔值，不是「问一次真实网络/CLI
+    /// 会不会成功」——默认 provider 是 `claude` + `Transport::Cli`，如果
+    /// Critical 那个 bug 还在，这条路径的 `resolve()` 本来就会成功（`Cli`
+    /// 传输不需要凭据），间接测法（等一个 explanation 出现）反而会被「这台
+    /// 机器上到底装没装 claude CLI」这种环境噪音污染，钉不住真正的问题。
+    #[test]
+    fn no_llm_section_means_no_backend_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock"); // 旁边故意不写 config.toml
+        let mgr = SessionManager::new();
+
+        install_llm_backend(&socket, &dir.path().join("profiles"), &mgr);
+
+        assert!(
+            !mgr.backend_is_set(),
+            "没写 [llm] 就不该装后端——这是隐私边界，不是默认值的事"
+        );
+    }
+
+    /// 反过来钉住「写了就真的开」：不能为了堵上面那条回归，把功能焊死关掉。
+    /// `[llm]` 段里什么字段都不填，靠的是 `LlmConfig` 自己的默认值
+    /// （provider claude、transport Cli），这条路径不需要任何真实凭据就该
+    /// 成功——`Transport::Cli` 只是记下命令，不在这一步真的起子进程。
+    #[test]
+    fn a_bare_llm_section_does_install_a_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(crate::config::config_path_for_socket(&socket), "[llm]\n").unwrap();
+        let mgr = SessionManager::new();
+
+        install_llm_backend(&socket, &dir.path().join("profiles"), &mgr);
+
+        assert!(
+            mgr.backend_is_set(),
+            "写了 [llm]（哪怕是空的）就该是一次显式的开——这条不能被上一条回归测试误伤"
+        );
+        assert!(mgr.llm_problem().is_none(), "接上了就不该留着一条抱怨");
+    }
+
+    /// 用户开了出错解释、却配错了，**这件事必须走得到他眼前**。
+    ///
+    /// 守护进程那句 `eprintln!` 是看不见的：界面进程拉起它的时候把 stderr
+    /// 接到了 `/dev/null`（`client::spawn_daemon`，不然每一行都会糊在 TUI
+    /// 上）。所以原因要记在守护进程上，并且跟着 `Request::Profiles` 一起
+    /// 顶到界面的警告栏——这条测试钉的就是这条通路，从「配错了」一直到
+    /// 「界面拿到一条能读的警告」。
+    #[test]
+    fn a_broken_llm_setting_reaches_the_user_instead_of_going_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            "[llm]\nprovider = \"根本没有这个\"\n",
+        )
+        .unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let profiles_dir = dir.path().join("profiles");
+
+        install_llm_backend(&socket, &profiles_dir, &mgr);
+
+        assert!(!mgr.backend_is_set(), "连不上就不该装后端");
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &dir.path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json"))));
+        let resp = handle(
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
+            &mgr,
+            &store,
+            &secrets,
+            &profiles_dir,
+        );
+        let Response::Profiles { warnings, .. } = resp else {
+            panic!("期待 Response::Profiles");
+        };
+        let w = warnings
+            .iter()
+            .find(|w| matches!(w, crate::proto::WarningCode::LlmUnavailable(_)))
+            .expect("配错了却一个警告都没有——用户会以为功能坏了却查不到任何线索");
+        let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+        assert!(
+            line.contains("根本没有这个"),
+            "要点名是设置里的哪个名字写错了：{line}"
         );
     }
 }

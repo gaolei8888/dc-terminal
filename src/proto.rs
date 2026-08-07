@@ -23,7 +23,12 @@ use crate::session::{SessionInfo, SessionState};
 ///
 /// 3 = 多了 `Kill` / `Prune` 两条请求。这两条旧守护进程根本不认，发过去
 /// 只会得到一句解析失败。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 4 = 多了 `Explanation` 请求 / `Response::Explanation`——问一个 `Failed`
+/// 会话「出了什么事」。旧守护进程不认识这条请求，界面发过去只会得到一句
+/// 解析失败；老实说这条不至于让界面整个用不了（不问就是了），但协议形状
+/// 变了就要加一，理由同上面两条。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +166,13 @@ pub enum Request {
         profile: String,
         value: String,
     },
+    /// 「这个 `Failed` 会话到底出了什么事」，人话版。答案可能还没算出来
+    /// （问模型是异步的，见 `session.rs::request_explanation`），也可能
+    /// 压根没配 LLM——两种情况都回 `Response::Explanation(None)`，界面
+    /// 该显示今天就有的那句失败提示。
+    Explanation {
+        id: u32,
+    },
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -220,6 +232,7 @@ impl std::fmt::Debug for Request {
                 .field("profile", profile)
                 .field("value", &"<redacted>")
                 .finish(),
+            Request::Explanation { id } => f.debug_struct("Explanation").field("id", id).finish(),
         }
     }
 }
@@ -261,6 +274,10 @@ pub enum Response {
     Verify(crate::verify::VerifyOutcome),
     Ok,
     Error(ErrorCode),
+    /// 对 [`Request::Explanation`] 的回答。`None` = 没有（还没算出来、
+    /// 没配 LLM、或者算失败了——界面不用区分，统一显示今天就有的那句
+    /// 失败提示）。
+    Explanation(Option<String>),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -381,6 +398,14 @@ pub enum WarningCode {
     },
     /// 密钥文件读不了
     SecretsUnreadable { path: String, reason: IoReason },
+    /// 用户写了 `[llm]`（一次主动的「我要开」），但那条连接接不上。
+    ///
+    /// 守护进程启动时 resolve 一次，失败就把原因**记下来**而不是只往 stderr
+    /// 打一行：界面进程拉起守护进程时把它的 stderr 接到了 `/dev/null`
+    /// （`client::spawn_daemon`——不然每一行都会糊在 TUI 上），所以那一行
+    /// 谁都看不见，用户开了功能却只会得到一片沉默。带的是
+    /// `ResolveError` 这个**码**，不是句子，理由同本枚举其余各条。
+    LlmUnavailable(crate::llm::resolve::ResolveError),
     /// 密钥文件坏了。**不给行号也不给 toml 的原文**：README 明说密钥不该手改，
     /// 而且这时候所有写入都被拒，照着行号去抠语法是把用户往错路上支。
     /// 唯一有效的下一步是删掉它重新粘贴一遍。
@@ -522,14 +547,15 @@ mod tests {
                 profile: "p".into(),
                 value: "v".into(),
             },
+            Request::Explanation { id: 1 },
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                3,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}}]"#
+                4,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -553,7 +579,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                3,
+                4,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"

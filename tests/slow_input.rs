@@ -47,6 +47,8 @@ fn fake_agent() -> Profile {
         env: Default::default(),
         secret: None,
         install: None,
+        headless: None,
+        api: None,
         label: Default::default(),
         note: Default::default(),
     }
