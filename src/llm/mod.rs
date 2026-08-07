@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod creds;
+pub mod http;
 
 use std::sync::mpsc;
 use std::sync::Arc;
