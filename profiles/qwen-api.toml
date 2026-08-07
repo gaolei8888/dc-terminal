@@ -30,9 +30,6 @@ en = "Create an API key in the Alibaba Cloud Bailian console"
 [secret.verify]
 url = "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy/v1/messages"
 
-[headless]
-command = ["claude", "-p"]
-
 [api]
 base_url = "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy"
 wire = "anthropic"

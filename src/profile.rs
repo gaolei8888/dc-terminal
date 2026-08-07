@@ -1134,13 +1134,29 @@ mod tests {
         );
     }
 
+    /// **只有非交互模式被真的跑过的 CLI 才许写 `[headless]`。**
+    ///
+    /// - opencode / qwen 本机没装，无界面模式没验过。
+    /// - kimi / glm / deepseek / qwen-api 一样没验过，而且它们比前两个更危险：
+    ///   它们的 `[headless]` 曾经写着 `claude -p`，配上自己的
+    ///   `[env] ANTHROPIC_BASE_URL`（moonshot / bigmodel / deepseek /
+    ///   dashscope），等于起一个 `claude` 去打第三方端点，而那条路上没有
+    ///   任何地方注入过厂商密钥——`claude` 只好拿用户 Keychain 里的
+    ///   Anthropic 登录态去认证，**把 A 家的凭据发给 B 家的服务器**。
+    ///   这四个是 API 密钥形态的厂商，它们的正路是 `[api]` + HTTP 直连。
+    ///
+    /// 编一个没验过的 `[headless]` 出来 = 造一条用户一走就坏的路，
+    /// 和「没验过就不填 pattern」是同一条纪律。不要把这些块加回去。
     #[test]
     fn unverified_clis_declare_no_headless_command() {
-        // opencode / qwen 本机没装，无界面模式没验过。编一个出来 = 造一条
-        // 用户按了就报错的路，和「没验过就不填 pattern」是同一条纪律。
-        for name in ["opencode", "qwen"] {
+        for name in ["opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
-            assert!(p.headless.is_none(), "{name}: 没实测过就别填 [headless]");
+            assert!(
+                p.headless.is_none(),
+                "{name}: 没有实测过非交互模式就不许写 [headless]——\
+                 编出来的那条路一走就坏，而且这几个 API 形态的 profile 还会\
+                 让子进程去借另一家的登录态。它们的正路是 [api] + 直连。"
+            );
         }
     }
 
