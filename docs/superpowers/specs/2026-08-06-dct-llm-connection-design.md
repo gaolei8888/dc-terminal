@@ -105,7 +105,16 @@ wire = "anthropic"   # 或 "openai"
 ### 配置
 
 `~/.dct/config.toml` 新增 `[llm]`：provider、model、可选的 base_url 覆盖。
-整段缺失 = 默认用 `claude` profile 的无界面模式——那是用户最可能已经登录过的 CLI。
+
+**整段缺失 = 这个功能整个关着**（实现如此，而且是刻意的）。这一稿早先写的是
+「整段缺失 = 默认用 `claude` profile 的无界面模式」，那是错的，不要照着它改回去：
+出错解释会把一个失败会话屏幕上最后 2000 个字符原样送给模型，而那正是
+`Invalid API key: sk-ant-...`、`Authorization: Bearer ...`、`.env` 内容最容易
+出现的地方。**把这功能打开必须是用户的一次主动动作**，不能因为「什么都没配」
+就替他打开、把他终端里的东西发给第三方。用户显式写下 `[llm]`（哪怕后面什么
+都不填）才算「我要开」；段内各字段该有什么默认值（`provider` 默认 `claude`、
+`transport` 默认 `cli`）只回答「开了之后怎么配」，不回答「要不要开」。
+见 `src/config.rs` 头注释和 `daemon::install_llm_backend`。
 
 ## 数据流：自答流水线
 
