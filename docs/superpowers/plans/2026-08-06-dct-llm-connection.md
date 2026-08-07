@@ -911,28 +911,26 @@ pub type Runner = dyn Fn(&[String], &str) -> Result<String, String> + Send + Syn
 
 pub struct CliBackend {
     command: Vec<String>,
-    env: BTreeMap<String, String>,
     runner: Arc<Runner>,
 }
 
 impl CliBackend {
+    /// `env` 不进结构体——它只被真实 runner 用到，闭包捕获走就够了。
+    /// 存一份在字段里没有任何读者，是纯粹的死重量。
     pub fn new(command: Vec<String>, env: BTreeMap<String, String>) -> CliBackend {
-        let env_for_run = env.clone();
         CliBackend {
             command,
-            env,
-            runner: Arc::new(move |cmd, input| run_real(cmd, input, &env_for_run)),
+            runner: Arc::new(move |cmd, input| run_real(cmd, input, &env)),
         }
     }
 
     pub fn with_runner(command: Vec<String>, runner: Arc<Runner>) -> CliBackend {
-        CliBackend { command, env: BTreeMap::new(), runner }
+        CliBackend { command, runner }
     }
 }
 
 impl Backend for CliBackend {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
-        let _ = &self.env; // 真实 runner 已经捕获了它
         let input = format!("{}\n\n{}", p.system, p.user);
         let out = (self.runner)(&self.command, &input).map_err(|e| {
             eprintln!("LLM CLI 调用失败：{e}");
@@ -1572,7 +1570,9 @@ this is what makes the 'verified against a live endpoint' bar checkable."
 **Interfaces:**
 - Consumes: `llm::{Backend, Prompt, complete_with_timeout}`、`llm::resolve::resolve`
 - Produces:
-  - `session::Session` 新字段 `explanation: Option<String>`
+  - `session::Session` 新字段 `explanation_slot: Arc<Mutex<Option<String>>>`
+    （**必须是 `Arc<Mutex<_>>`**：解释由后台线程写回，而那个线程拿不到
+    `Session` 的锁——`tick()` 正持着它。裸 `Option<String>` 编不过。）
   - `session::explain_prompt(screen: &str) -> Prompt`
   - `SessionManager::set_backend(&self, b: Option<Arc<dyn Backend>>)`
   - `SessionManager::explanation(&self, id: u32) -> Option<String>`
@@ -1660,7 +1660,8 @@ Expected: 编译失败，`cannot find function 'explain_prompt'`
 
 `src/session.rs`：
 
-1. `Session` 结构加 `explanation: Option<String>`（`new` 里初始化为 `None`）
+1. `Session` 结构加 `explanation_slot: Arc<Mutex<Option<String>>>`（`new` 里初始化为
+   `Arc::new(Mutex::new(None))`）。`SessionManager::explanation(id)` 读它并 clone 出来。
 2. `SessionManager` 加 `backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>`
 3. 加两个方法与一个纯函数：
 
@@ -1735,7 +1736,8 @@ Expected: 全绿
 - [ ] **Step 5: 提交**
 
 ```bash
-cargo fmt && cargo test --lib && cargo build && git diff --check && git add -A
+cargo fmt && cargo test --lib && cargo build && git diff --check
+git add src/session.rs src/proto.rs src/daemon.rs src/ui/mod.rs src/i18n.rs
 git commit -m "feat: explain in plain language why a session failed
 
 Fires once on the transition into Failed, not while Failed: the latter would
