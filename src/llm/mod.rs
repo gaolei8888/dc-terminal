@@ -3,6 +3,7 @@
 //! **每一处用法都必须有不依赖 LLM 的退路。** 这一层的错误都是「算了，
 //! 当没有这个功能」，不是「dct 坏了」。
 
+pub mod cli;
 pub mod creds;
 
 use std::sync::mpsc;
