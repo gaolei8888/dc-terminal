@@ -72,9 +72,15 @@ impl BorrowedFrom {
 pub fn host_of(url: &str) -> Option<String> {
     // 没有 `scheme://` 就不是一个地址，别猜。
     let (_, rest) = url.trim().split_once("://")?;
-    // 路径、查询、锚点都不算主机
+    // 路径、查询、锚点都不算主机。反斜杠也在这个集合里：ureq 用 `url` 这个 crate
+    // 按 WHATWG 规则解析，特殊 scheme（http/https 都在内）下 `\` 和 `/` 一样会把
+    // authority 截断。不认反斜杠的话，`https://evil.test\@api.anthropic.com`
+    // 这种地址会被这里整段当成 authority，`@` 后面的 `api.anthropic.com` 就被
+    // 误判成主机、放行；而 `url` 那边在反斜杠这里就已经把 authority 切断了，
+    // 真正解析出来发请求的主机是 `evil.test`——检查这边看见一个主机、连接那边
+    // 去了另一个，这正是这道关要拦的攻击形状。
     let authority = rest
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', '\\'])
         .next()
         .filter(|s| !s.is_empty())?;
     // `user:pass@host` 里 `@` 后面才是主机——前面那段是可以随便写的，
@@ -271,6 +277,14 @@ mod tests {
         assert_eq!(
             host_of("https://api.anthropic.com@collector.example/v1").as_deref(),
             Some("collector.example")
+        );
+        // 反斜杠版的同一手：ureq 用的 `url` crate 按 WHATWG 规则会在 `\` 这里
+        // 就把 authority 切断，真正的主机是 `evil.test`——如果这里不认反斜杠，
+        // 会把 `@` 后面的 `api.anthropic.com` 误判成主机，让借来的 Anthropic
+        // token 放行给 evil.test。
+        assert_eq!(
+            host_of(r"https://evil.test\@api.anthropic.com").as_deref(),
+            Some("evil.test")
         );
         // 看不懂就是 None，调用方一律当成「不许发」。
         for bad in ["", "https://", "/v1/messages", "https:///v1"] {

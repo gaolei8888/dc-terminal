@@ -320,3 +320,102 @@ $ HOME=<tmp> DCT_LANG=zh dct llm check      # kimi + 直连 + 型号，没填密
 - 没有用 emoji 当图标。
 - 全部 `git add` 都是显式路径。
 - 提交信息英文，无 AI/Co-Authored-By 署名。
+
+---
+
+## 二轮修复：`host_of` 的反斜杠旁路（VERIFIED bypass）
+
+**问题。** `creds::host_of` 用 `rest.split(['/', '?', '#'])` 切出 authority，
+不认 `\`。ureq 的请求走 `url` crate，按 WHATWG 规则解析：特殊 scheme
+（http/https 在内）下 `\` 和 `/` 一样会把 authority 截断。于是
+
+```
+base_url = "https://evil.test\@api.anthropic.com"
+```
+
+`host_of` 把整段 `evil.test\@api.anthropic.com` 当成一个 authority，`@` 后面
+的 `api.anthropic.com` 被当成主机 → 检查放行；而 `url` crate 在 `\` 那里就已
+经把 authority 切成 `evil.test`，请求真正打到的是 `evil.test`。检查这边看见
+一个主机、连接那边去了另一个——Keychain 里借来的 Anthropic Bearer 被放行给
+攻击者的主机，正是这道关本来要拦的 `cfg.llm.base_url` 覆盖向量。
+
+**改了什么。** `src/llm/creds.rs::host_of` 的 split 集合加了 `'\\'`，并写清
+原因（ureq 用的 `url` crate 按 WHATWG 规则会在反斜杠这里截断特殊 scheme 的
+authority，不认它就会出现「检查看到一个主机、连接去了另一个」）。
+
+**新增测试。**
+- `src/llm/creds.rs::the_host_is_taken_from_the_url_not_guessed` 加一条：
+  `host_of(r"https://evil.test\@api.anthropic.com")` 现在必须等于
+  `Some("evil.test")`（不是 `api.anthropic.com`）。
+- `src/llm/resolve.rs` 新增
+  `a_borrowed_login_is_refused_when_the_backslash_hides_the_real_host`：
+  把 `kimi` 的 `base_url` 覆盖成同一个反斜杠地址，用 `claude_oauth` 走
+  `resolve()`，断言在**关口**（不只是解析函数）上被拒——
+  `Err(ResolveError::BorrowedCredentialRefused { host: "evil.test", .. })`。
+  这条钉住的是「凭据到底放不放行」，不是「主机字符串解析对不对」。
+
+**关于其他可能缺失的 authority 终止符。** 按 WHATWG URL Standard 的
+authority state 状态机，退出 authority、进入 host 解析的条件是：
+遇到字符串结尾（`/`、`?`、`#`），或者 —— **仅当 scheme 是「特殊」的**
+（`http`/`https`/`ws`/`wss`/`ftp`/`file`）—— 遇到 `\`。dct 的 `base_url` 走的
+永远是 http/https，属于特殊 scheme，所以 `\` 适用；除了它，规范里再没有第
+四个字符会终止 authority。**结论：`/`、`?`、`#`、`\` 这四个之外，不存在遗漏
+的 authority 终止符，split 集合现在是完整的，不用再加。**
+
+顺带确认了一件**不是** bug 的事：WHATWG 解析前会把整个输入里的 ASCII
+tab/CR/LF（`\t` `\r` `\n`）先整体删掉，`host_of` 没做这一步。但这只可能让
+`host_of` 算出的主机字符串里带着这些字符、从而**更不可能**匹配上
+`anthropic.com`/`openai.com` 的后缀（`may_reach` 的 `ends_with` 比较不到，
+判定更严），方向是误拒而不是误放——跟这个模块「宁可判不许，不可放行」的
+既有设计原则一致，所以没有跟着这次一起改。
+
+**命令与实测输出**（均以 `export PATH="$HOME/.cargo/bin:$PATH"` 开头）：
+
+```
+$ cargo fmt
+（无输出）
+
+$ cargo test 2>&1 | grep "test result:"
+test result: ok. 482 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.25s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+合计 517 passed（516 lib+integration 基线 + 本轮净增 1 条 = 517，均 0 failed），
+高于要求的 517+ 门槛，且没有任何既有测试被删或放宽。
+
+```
+$ cargo test --no-run
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+（全部测试二进制编译通过，无失败）
+
+$ cargo clippy --all-targets
+Checking dct v0.1.0 (...)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.05s
+（0 warnings）
+
+$ cargo build
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+
+$ git diff --check
+（无输出，无尾随空白/冲突标记）
+```
+
+**约束核对。** 没加 crate 依赖，没有 async，没有测试碰真实凭据/`~/.dct`/
+Keychain/`security`，没有削弱或删除既有测试（只在原有测试里追加断言、新增
+一条独立测试），改动只落在 `src/llm/creds.rs` 和 `src/llm/resolve.rs` 两个
+文件。

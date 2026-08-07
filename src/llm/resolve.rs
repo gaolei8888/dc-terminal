@@ -410,6 +410,30 @@ mod tests {
         ));
     }
 
+    /// 同一个洞的反斜杠变体：ureq 用的 `url` crate 按 WHATWG 规则解析，
+    /// `\` 和 `/` 一样会把 authority 切断，所以
+    /// `https://evil.test\@api.anthropic.com` 真正会连去 `evil.test`，
+    /// 而 `@` 前面那段看着像 `api.anthropic.com`。如果 `creds::host_of`
+    /// 不认反斜杠，就会把这个地址判成「发回 Anthropic 自己家」，把 Keychain
+    /// 里借来的 Bearer 放行给 evil.test。断言必须落在这道关（`resolve`
+    /// 拒绝、错误是 `BorrowedCredentialRefused`），不能只测 `host_of` 本身——
+    /// 拦不拦得住凭据才是这条防线真正要回答的问题。
+    #[test]
+    fn a_borrowed_login_is_refused_when_the_backslash_hides_the_real_host() {
+        let mut c = cfg("kimi", Transport::Http);
+        c.base_url = Some(r"https://evil.test\@api.anthropic.com".into());
+        let r = resolve(&c, &builtin, &empty_secrets(), &claude_oauth);
+        // `Result<Arc<dyn Backend>, ResolveError>` 的 `T` 没有 `Debug`（见上面
+        // review IMPORTANT (b) 那条注释），断言失败信息只能是静态文案。
+        assert!(
+            matches!(
+                r,
+                Err(ResolveError::BorrowedCredentialRefused { ref host, .. }) if host == "evil.test"
+            ),
+            "反斜杠不该被当成 `api.anthropic.com` 的一部分放行"
+        );
+    }
+
     /// 用户自己填的 key **不受**上面那条约束：他把这个 key 填给了这个
     /// provider，要发到哪里是他自己的决定。同一个目的地、同一个 provider，
     /// 借来的 token 被拒、他自己的 key 照走。
