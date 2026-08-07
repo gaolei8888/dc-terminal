@@ -505,10 +505,8 @@ impl SessionManager {
     }
 
     /// 把界面转发过来的鼠标事件按 agent 当前的编码写进 PTY。
-    ///
-    /// 占位实现：真正按 agent 是否开了鼠标报告、用的是哪种编码来决定写不写、
-    /// 写什么留给 Task 9（见 `PtySession::write_mouse` 的注释）。这里先把
-    /// 线路接通，让 `Request::Mouse` 编译得过、跑得起来。
+    /// 编不编、编成什么样，全由 `PtySession::write_mouse` 按 agent 当前
+    /// 订阅的协议/编码决定——这里只是把线路接通。
     pub fn forward_mouse(&self, id: u32, ev: crate::proto::MouseForward) -> Result<()> {
         self.with_session(id, |s| s.pty.write_mouse(ev))
     }
