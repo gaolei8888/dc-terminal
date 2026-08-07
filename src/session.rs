@@ -70,6 +70,27 @@ fn classify(
     None
 }
 
+/// 让模型把一屏失败翻译成一句人话。
+///
+/// **只送屏幕末尾**：整屏可能几千字，而错误一定在末尾。整屏送过去既慢又贵，
+/// 还容易让模型抓错重点。
+pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
+    const TAIL: usize = 2000;
+    let tail: String = {
+        let chars: Vec<char> = screen.chars().collect();
+        let start = chars.len().saturating_sub(TAIL);
+        chars[start..].iter().collect()
+    };
+    crate::llm::Prompt {
+        system: "你在帮一个完全不懂编程的人。用中文，一到两句话说清楚刚才那个\
+                 命令行工具出了什么事、他现在该做什么。不要出现英文报错原文、\
+                 不要栈追踪、不要术语、不要代码。"
+            .into(),
+        user: format!("这是屏幕上的最后一段内容：\n\n{tail}"),
+        max_tokens: 200,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: u32,
@@ -108,6 +129,10 @@ struct Session {
     /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
     error_re: Option<regex::Regex>,
     pty: PtySession,
+    /// 出错原因的人话解释，由后台线程写回（见 `SessionManager::request_explanation`）。
+    /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
+    /// 正持着它。裸 `Option<String>` 编不过。
+    explanation_slot: Arc<Mutex<Option<String>>>,
 }
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
@@ -126,6 +151,9 @@ pub struct SessionManager {
     next_id: AtomicU32,
     sessions: Mutex<HashMap<u32, Arc<Mutex<Session>>>>,
     extra_profiles: Mutex<HashMap<String, Profile>>,
+    /// 出错解释要用的后端。`None` = 没配 LLM，功能安静下线（见
+    /// `request_explanation`）。守护进程启动时 resolve 一次填进来。
+    backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -147,7 +175,22 @@ impl SessionManager {
             next_id: AtomicU32::new(1),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
+            backend: Mutex::new(None),
         }
+    }
+
+    /// 装上（或摘掉）出错解释要用的后端。守护进程启动时 resolve 一次调用，
+    /// resolve 失败就传 `None`——功能安静下线，不影响会话本身跑不跑得起来。
+    pub fn set_backend(&self, b: Option<Arc<dyn crate::llm::Backend>>) {
+        *recover(self.backend.lock()) = b;
+    }
+
+    /// 读一个会话此刻的出错解释。没有后端、还没问完、或者问失败了，
+    /// 都是 `None`——调用方（daemon/界面）不用区分这三种情况，
+    /// 统一当作「暂时没有」处理。
+    pub fn explanation(&self, id: u32) -> Option<String> {
+        self.with_session(id, |s| Ok(recover(s.explanation_slot.lock()).clone()))
+            .unwrap_or(None)
     }
 
     /// 注册内置之外的 profile（测试用，也是将来从磁盘加载自定义 profile 的入口）
@@ -256,6 +299,7 @@ impl SessionManager {
             busy_re,
             error_re,
             pty,
+            explanation_slot: Arc::new(Mutex::new(None)),
         };
 
         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
@@ -504,11 +548,38 @@ impl SessionManager {
                     s.idle_re.as_ref(),
                 );
                 if let Some(next) = next {
+                    let was = s.state;
                     s.state = next;
+                    // 只在**进入** Failed 的那一刻问一次。条件写成「原来不是
+                    // Failed」而不是「现在是 Failed」——后者会每 200ms 打一次
+                    // 模型，一个失败会话能把额度烧光。
+                    if next == SessionState::Failed && was != SessionState::Failed {
+                        self.request_explanation(&mut s);
+                    }
                 }
             }
             // 两个都没有：状态不动，保持 Unknown
         }
+    }
+
+    /// **绝不在 tick 里同步等模型。** tick 每 200ms 一轮，一次同步调用就能
+    /// 让整个守护进程卡住，而卡住的 dct 和死掉的 agent 长得一模一样。
+    fn request_explanation(&self, s: &mut Session) {
+        let Some(b) = recover(self.backend.lock()).clone() else {
+            return; // 没配后端：功能安静下线，会话照跑
+        };
+        let p = explain_prompt(&s.pty.screen_text());
+        let slot = s.explanation_slot.clone(); // Arc<Mutex<Option<String>>>
+        std::thread::spawn(move || {
+            if let Ok(text) =
+                crate::llm::complete_with_timeout(b, p, std::time::Duration::from_secs(30))
+            {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(text);
+                }
+            }
+            // 失败就什么都不做——界面显示今天就有的那句失败提示
+        });
     }
 }
 
@@ -638,6 +709,96 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
         }
+    }
+
+    // 冒充一个会报错的 agent：跟 fake_agent 一样是常驻进程（先 echo BOOM 再
+    // sleep），不然一次性输出完就退出，state 会被 tick() 判成 Stopped，
+    // 抢在 Failed 前面。
+    fn failing_agent() -> Profile {
+        Profile {
+            name: "failing".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "echo BOOM; sleep 5".into()],
+            is_agent: true,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: Some("BOOM".into()),
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_explain_prompt_carries_the_tail_of_the_screen() {
+        let long = "x".repeat(5000) + "API Error: Connection closed mid-response.";
+        let p = explain_prompt(&long);
+        assert!(p.user.contains("API Error"), "错误在末尾，必须送到");
+        assert!(p.user.chars().count() < 2500, "整屏太长，要截尾");
+        assert!(p.system.contains("中文"), "用户默认中文");
+    }
+
+    #[test]
+    fn the_explain_prompt_asks_for_plain_language() {
+        let p = explain_prompt("API Error: Connection closed mid-response.");
+        // 目标用户零编程经验：不要栈追踪、不要术语。
+        assert!(p.system.contains("不要"), "要明确禁止术语/栈追踪");
+        assert!(p.max_tokens <= 200, "一句话就够，别让它写小作文");
+    }
+
+    #[test]
+    fn with_no_backend_the_explanation_stays_empty_and_nothing_breaks() {
+        // 这是「非 LLM 退路」的回归点：没配后端时 dct 表现得和今天一模一样。
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+        m.set_backend(None);
+        m.tick();
+        assert_eq!(m.explanation(id), None);
+    }
+
+    #[test]
+    fn entering_failed_asks_the_backend_once_not_every_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        impl crate::llm::Backend for Counting {
+            fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("网络断了，重开一次就行。".into())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(failing_agent()); // error_pattern 命中的假 agent
+        let id = m
+            .create(repo.path(), "failing", empty_secrets(), &[])
+            .unwrap();
+        m.set_backend(Some(Arc::new(Counting(calls.clone()))));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while m.explanation(id).is_none() && Instant::now() < deadline {
+            m.tick();
+            sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            m.explanation(id).as_deref(),
+            Some("网络断了，重开一次就行。")
+        );
+
+        // 再 tick 若干轮：还是 Failed，但**不许**再问模型。
+        for _ in 0..10 {
+            m.tick();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "只在进入 Failed 那一刻问一次"
+        );
     }
 
     /// `stop()` 只把状态改成 `Stopped`，从不删——守护进程活得很久，于是

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(test)]
 use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
@@ -45,6 +44,34 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
 
+    // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
+    // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
+    // resolve 不了（没配、没登录）**不能拦住守护进程本身起来**：LLM 是增强，
+    // 不是地基（同 `config.rs` 头注释），只把原因往 stderr 写一行，会话该怎么
+    // 跑还怎么跑，只是问不出「为什么」这件事关掉了。
+    {
+        let cfg = crate::config::Config::load(&crate::config::config_path_for_socket(socket));
+        let llm_secrets = SecretStore::load(&secrets_path_for_socket(socket));
+        let (custom, _) = all_profiles(&profiles_dir);
+        let lookup = |n: &str| {
+            custom
+                .iter()
+                .find(|p| p.name == n)
+                .cloned()
+                .or_else(|| Profile::builtin(n))
+        };
+        match crate::llm::resolve::resolve(&cfg, &lookup, &llm_secrets, &startup_oauth) {
+            Ok(b) => mgr.set_backend(Some(b)),
+            Err(e) => {
+                eprintln!(
+                    "dct: 出错解释关了（{}），会话照常跑",
+                    crate::llm::resolve::describe(&e)
+                );
+                mgr.set_backend(None);
+            }
+        }
+    }
+
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -64,6 +91,25 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// 只有 claude/codex 有自己的 OAuth 关系，别的 provider 只能走用户自己填的
+/// key（`resolve::resolve` 里 key 优先于 OAuth 那条顺序保证了这一点）。跟
+/// `cli.rs::oauth_lookup` 是同一条规则，见那边的注释——**不要**把 kimi/glm/
+/// deepseek/qwen-api 也映射到这两个查询上，那等于把用户的 Anthropic/OpenAI
+/// 登录态发给几家跟它们毫无关系的第三方服务器。
+///
+/// 单独写一份而不是复用 `cli.rs::oauth_lookup`：那边把两个查询做成了可注入
+/// 的闭包参数，是为了单测能绕开真实 Keychain / `auth.json`；守护进程启动
+/// 只跑一次真实查询，没有这个诉求，硬套那个签名反而要在这里现造两个闭包。
+fn startup_oauth(name: &str) -> Option<crate::llm::creds::Credential> {
+    match name {
+        "claude" => {
+            crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer)
+        }
+        "codex" => crate::llm::creds::read_codex_auth(),
+        _ => None,
+    }
 }
 
 fn serve(
@@ -206,6 +252,9 @@ fn handle(
         Request::LastProfile => Ok(Response::LastProfile(
             recover(store.lock()).last_profile().map(str::to_string),
         )),
+        // 永远不失败：没有解释（没配后端、还没算完、算失败了）跟「问不到」
+        // 是同一件事，界面不用区分，统一显示今天就有的那句失败提示。
+        Request::Explanation { id } => Ok(Response::Explanation(mgr.explanation(id))),
         Request::VerifySecret { profile, value } => {
             let (all, _) = all_profiles(profiles_dir);
             let spec = all
@@ -452,5 +501,110 @@ mod tests {
             lock_wait < Duration::from_millis(100),
             "secrets 锁被慢 Create 攥着不放：等了 {lock_wait:?}（同期 Create 耗时 {create_elapsed:?}）"
         );
+    }
+
+    // 冒充一个会报错的 agent：echo BOOM 之后常驻，好让 tick() 判成 Failed
+    // 而不是 Stopped（同 session.rs::tests::failing_agent）。
+    fn failing_agent() -> Profile {
+        Profile {
+            name: "daemon-explain-fake".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "echo BOOM; sleep 5".into()],
+            is_agent: true,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: Some("BOOM".into()),
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        }
+    }
+
+    struct FixedAnswer;
+    impl crate::llm::Backend for FixedAnswer {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            Ok("这个命令没配好，重开一次就行。".into())
+        }
+    }
+
+    /// 回归测试：`Request::Explanation` 真的接到了 `mgr.explanation()`，不是
+    /// 一条只在类型上存在、`handle()` 里没人接的死请求。
+    #[test]
+    fn explanation_request_is_wired_to_the_session_manager() {
+        let repo = tempfile::tempdir().unwrap();
+        {
+            let run = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .output()
+                    .unwrap();
+            };
+            run(&["init", "-q"]);
+            run(&["config", "user.email", "t@example.com"]);
+            run(&["config", "user.name", "t"]);
+            std::fs::write(repo.path().join("a.txt"), "hi\n").unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", "init"]);
+        }
+
+        let mgr = Arc::new(SessionManager::new());
+        mgr.register_profile(failing_agent());
+        mgr.set_backend(Some(Arc::new(FixedAnswer)));
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let id = mgr
+            .create(repo.path(), "daemon-explain-fake", None, &[])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            let resp = handle(
+                Request::Explanation { id },
+                &mgr,
+                &store,
+                &secrets,
+                profiles_dir.path(),
+            );
+            if let Response::Explanation(Some(text)) = resp {
+                assert_eq!(text, "这个命令没配好，重开一次就行。");
+                return;
+            }
+            assert!(Instant::now() < deadline, "Explanation 请求一直没接到解释");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 没有对应会话时，`Explanation` 也要老老实实回 `None`，不能 panic
+    /// 或者报错——「问不到」跟「没配后端」在界面眼里是同一件事。
+    #[test]
+    fn explanation_for_an_unknown_session_is_none_not_an_error() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+
+        let resp = handle(
+            Request::Explanation { id: 9999 },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+        );
+        assert!(matches!(resp, Response::Explanation(None)));
     }
 }

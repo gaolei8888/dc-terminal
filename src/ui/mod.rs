@@ -452,6 +452,19 @@ pub fn run(
                         // 下一个会话的尺寸要重新协商：sent_size 记的是刚退出
                         // 的这个 id，留着会让新会话第一帧按错的宽度排版。
                         app.sent_size = None;
+                    } else if state == crate::session::SessionState::Failed {
+                        // 出错解释是异步算出来的（daemon 侧丢给了后台线程，
+                        // 不在 tick() 里等模型），这里问到才显示；没问到就什么
+                        // 都不做——今天原本就没有这条提示，界面必须长得
+                        // 一模一样，不能因为这个功能露出一个新的空白/报错态。
+                        if let Ok(Response::Explanation(Some(text))) = app
+                            .client()
+                            .and_then(|c| c.call(Request::Explanation { id }))
+                        {
+                            app.message = Msg::err(crate::i18n::msg::session_failure_explained(
+                                app.lang, id, &text,
+                            ));
+                        }
                     }
                 }
                 _ => app.connected = false,

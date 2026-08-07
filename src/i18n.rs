@@ -680,6 +680,17 @@ pub mod msg {
         )
     }
 
+    /// 出错解释算出来之后显示的那句话。**只套一层「哪个会话」的前缀**——
+    /// 解释本身已经是模型给零编程用户的完整一两句话（见
+    /// `session::explain_prompt`），这里不重新组句，只帮用户对上是哪个会话。
+    pub fn session_failure_explained(lang: Lang, id: u32, explanation: &str) -> String {
+        t!(
+            lang,
+            en: format!("Session {id}: {explanation}"),
+            zh: format!("{id} 号会话：{explanation}"),
+        )
+    }
+
     pub fn session_title(lang: Lang, id: u32, project: &str) -> String {
         t!(
             lang,
