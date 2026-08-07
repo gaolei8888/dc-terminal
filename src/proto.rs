@@ -20,7 +20,10 @@ use crate::session::{SessionInfo, SessionState};
 /// 2 = `SessionInfo` 多了 `is_agent`：底栏要按「这是不是 agent 会话」决定
 /// 写不写 `u 回滚` / `d 改动`，旧守护进程回的 JSON 里没有这个字段，新界面
 /// 解不出来。
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// 3 = 多了 `Kill` / `Prune` 两条请求。这两条旧守护进程根本不认，发过去
+/// 只会得到一句解析失败。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +121,21 @@ pub enum Request {
     Stop {
         id: u32,
     },
+    /// 强杀：不给那 200ms 宽限期。
+    ///
+    /// 跟 `Stop` 的差别真实但很窄——`Stop` 走的是 portable-pty 的
+    /// SIGHUP → 约 200ms → SIGKILL，这里直接 SIGKILL。留着两条命令是因为
+    /// 「敲了 stop 它还在」这件事必须有下一步可走，而那一步不能是让用户
+    /// 自己去 `ps` 里认进程号。
+    Kill {
+        id: u32,
+    },
+    /// 把已经停掉的会话从名册上抹掉。
+    ///
+    /// `Stop` 只把状态改成 `Stopped`，不删——守护进程活得很久，于是
+    /// `dct ps` 会越积越多的墓碑。删是一个**用户显式发起**的动作，不是
+    /// 守护进程定时干的：定时清会让「刚才那个会话去哪了」变成新问题。
+    Prune,
     Undo {
         id: u32,
     },
@@ -181,6 +199,8 @@ impl std::fmt::Debug for Request {
                 .field("cols", cols)
                 .finish(),
             Request::Stop { id } => f.debug_struct("Stop").field("id", id).finish(),
+            Request::Kill { id } => f.debug_struct("Kill").field("id", id).finish(),
+            Request::Prune => write!(f, "Prune"),
             Request::Undo { id } => f.debug_struct("Undo").field("id", id).finish(),
             Request::Diff { id } => f.debug_struct("Diff").field("id", id).finish(),
             Request::Profiles { lang } => f.debug_struct("Profiles").field("lang", lang).finish(),
@@ -234,6 +254,9 @@ pub enum Response {
         warnings: Vec<WarningCode>,
     },
     Projects(Vec<String>),
+    /// 抹掉了几个。报数字而不是 `Ok`：用户敲 `dct prune` 想知道的正是
+    /// 「清掉了多少」，而「一个都没有」和「清掉了 5 个」要说两句不同的话。
+    Pruned(u32),
     LastProfile(Option<String>),
     Verify(crate::verify::VerifyOutcome),
     Ok,
@@ -470,6 +493,8 @@ mod tests {
                 cols: 3,
             },
             Request::Stop { id: 1 },
+            Request::Kill { id: 1 },
+            Request::Prune,
             Request::Undo { id: 1 },
             Request::Diff { id: 1 },
             Request::Profiles {
@@ -494,8 +519,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                2,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}}]"#
+                3,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -519,7 +544,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                2,
+                3,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"

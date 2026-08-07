@@ -15,10 +15,14 @@ dct —— vibe coding 终端
   dct ps           列出后台在跑的会话
   dct stop <会话号> 停掉某个会话，可以给多个
   dct stop --all   停掉全部会话
+  dct kill <会话号> 强制杀掉，不给它收尾的时间；可以给多个
+  dct kill --all   强制杀掉全部会话
+  dct prune        把已经停掉的会话从列表里清掉
   dct daemon       只跑守护进程，不开界面
   dct --help       看这段
 
-ps 和 stop 都不会拉起守护进程：问「有没有东西在跑」不该把「没有」变成「有」。
+ps / stop / kill / prune 都不会拉起守护进程：问「有没有东西在跑」不该把
+「没有」变成「有」。
 ";
 
 fn main() -> Result<()> {
@@ -36,12 +40,19 @@ fn main() -> Result<()> {
         // 绝不顺手拉起一个——见 `cli` 的模块注释。
         Some("ps") => dct::cli::run_ps(&socket_path(), cli_lang()),
         Some("stop") => {
-            let target = dct::cli::parse_stop_args(&args[1..], cli_lang());
+            let target = dct::cli::parse_target_args(&args[1..], cli_lang(), "stop");
             let code = dct::cli::run_stop(&socket_path(), cli_lang(), target)?;
             // 停不成要让脚本看得出来。`dct stop 3 && 干别的` 这种写法很自然，
             // 而「3 号根本没停成」如果只体现在 stderr 上，后面那半句照样会跑。
             std::process::exit(code)
         }
+        Some("kill") => {
+            let target = dct::cli::parse_target_args(&args[1..], cli_lang(), "kill");
+            let code = dct::cli::run_kill(&socket_path(), cli_lang(), target)?;
+            std::process::exit(code)
+        }
+        // prune 不接参数：它只对已经停了的会话下手，那批东西不可能被误伤。
+        Some("prune") => dct::cli::run_prune(&socket_path(), cli_lang()),
         Some("--help") | Some("-h") => {
             println!("{HELP}");
             Ok(())

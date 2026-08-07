@@ -171,8 +171,7 @@ pub enum Key {
     // —— dct ps / dct stop（普通终端里用，不开界面）——
     NoDaemonRunning,
     NoSessionsRunning,
-    StopNeedsATarget,
-    StopAllTakesNoIds,
+    NothingToPrune,
     StatusWorking,
     StatusAsking,
     StatusIdle,
@@ -350,17 +349,10 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "后台没有东西在跑",
         ),
         NoSessionsRunning => t!(lang, en: "No sessions", zh: "没有会话"),
-        // 说清「怎么停一个」和「怎么全停」，而不是甩一句「参数错误」——
-        // 敲出 `dct stop` 的人已经知道自己要停东西了，缺的是怎么写。
-        StopNeedsATarget => t!(
+        NothingToPrune => t!(
             lang,
-            en: "Which one? `dct stop 3` stops session 3, `dct stop --all` stops every session.",
-            zh: "要停哪个？`dct stop 3` 停 3 号会话，`dct stop --all` 全停。",
-        ),
-        StopAllTakesNoIds => t!(
-            lang,
-            en: "`dct stop --all` already means every session — drop the ids.",
-            zh: "`dct stop --all` 本来就是全停，不要再跟会话号。",
+            en: "No stopped sessions to clean up",
+            zh: "没有要清理的会话",
         ),
         StatusWorking => t!(lang, en: "working", zh: "干活中"),
         StatusAsking => t!(lang, en: "asking you", zh: "等你回答"),
@@ -540,6 +532,39 @@ pub mod msg {
 
     pub fn stopped_session(lang: Lang, id: u32) -> String {
         t!(lang, en: format!("Stopped session {id}"), zh: format!("已停止 {id} 号会话"))
+    }
+
+    pub fn killed_session(lang: Lang, id: u32) -> String {
+        t!(lang, en: format!("Killed session {id}"), zh: format!("已杀掉 {id} 号会话"))
+    }
+
+    pub fn pruned(lang: Lang, n: u32) -> String {
+        t!(
+            lang,
+            en: format!("Cleaned up {n} stopped session(s)"),
+            zh: format!("清掉 {n} 个已停止的会话"),
+        )
+    }
+
+    /// 「要停哪个 / 要杀哪个」。
+    ///
+    /// **`cmd` 带进来而不是写死 `stop`**：这句话的全部价值就是告诉用户
+    /// 下一步该敲什么，而用户敲的是 `dct kill` 却被告知 `dct stop 3` 怎么用，
+    /// 等于把他推去解一个他没问的问题。
+    pub fn needs_a_target(lang: Lang, cmd: &str) -> String {
+        t!(
+            lang,
+            en: format!("Which one? `dct {cmd} 3` for session 3, `dct {cmd} --all` for every session."),
+            zh: format!("要哪个？`dct {cmd} 3` 是 3 号会话，`dct {cmd} --all` 是全部。"),
+        )
+    }
+
+    pub fn all_takes_no_ids(lang: Lang, cmd: &str) -> String {
+        t!(
+            lang,
+            en: format!("`dct {cmd} --all` already means every session — drop the ids."),
+            zh: format!("`dct {cmd} --all` 本来就是全部，不要再跟会话号。"),
+        )
     }
 
     pub fn switched_to(lang: Lang, project: &str) -> String {
@@ -940,8 +965,7 @@ mod tests {
             StaleData,
             NoDaemonRunning,
             NoSessionsRunning,
-            StopNeedsATarget,
-            StopAllTakesNoIds,
+            NothingToPrune,
             StatusWorking,
             StatusAsking,
             StatusIdle,
@@ -1010,7 +1034,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 93, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 92, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
