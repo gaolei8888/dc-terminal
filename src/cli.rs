@@ -22,42 +22,46 @@ use crate::i18n::{text, Key, Lang};
 use crate::proto::{Request, Response};
 use crate::session::{SessionInfo, SessionState};
 
-/// `dct stop` 的参数解析结果。
+/// `dct stop` / `dct kill` 的参数解析结果。两条命令的参数形状一模一样，
+/// 规矩也一模一样——**要哪个必须明写**——所以共用一份解析。
 #[derive(Debug, PartialEq, Eq)]
-pub enum StopTarget {
-    /// 停这几个会话
+pub enum Target {
+    /// 这几个会话
     Ids(Vec<u32>),
-    /// 停全部
+    /// 全部
     All,
     /// 参数不对，把该说的话说清楚
     Usage(String),
 }
 
-/// 解析 `dct stop` 后面的参数。
+/// 解析 `dct stop` / `dct kill` 后面的参数。
 ///
-/// **不给参数不等于「停全部」。** 停会话不可撤销，而 `dct stop` 是最容易被
-/// 手滑敲出来的形式——把它默认成「全停」，用户想停一个却停光了所有 agent，
-/// 正在跑的活全断。要全停必须明写 `--all`。
-pub fn parse_stop_args(args: &[String], lang: Lang) -> StopTarget {
+/// **不给参数不等于「全部」。** 这两条命令都不可撤销，而它们又都是最容易被
+/// 手滑敲出来的形式——默认成全部的话，用户想停一个却停光了所有 agent，
+/// 正在跑的活全断。要全部必须明写 `--all`。
+///
+/// `cmd` 只影响用法提示里印的是 `dct stop 3` 还是 `dct kill 3`：用户敲的是
+/// 哪条命令，回话里就得是哪条。印错了等于让他去解一个他没问的问题。
+pub fn parse_target_args(args: &[String], lang: Lang, cmd: &str) -> Target {
     if args.is_empty() {
-        return StopTarget::Usage(text(Key::StopNeedsATarget, lang).into());
+        return Target::Usage(crate::i18n::msg::needs_a_target(lang, cmd));
     }
     if args.iter().any(|a| a == "--all") {
         // `--all` 跟具体 id 混着给，说明用户自己也没想清楚要停什么。
         // 与其猜一个，不如让他重敲一遍——这条命令撤不回来。
         if args.len() > 1 {
-            return StopTarget::Usage(text(Key::StopAllTakesNoIds, lang).into());
+            return Target::Usage(crate::i18n::msg::all_takes_no_ids(lang, cmd));
         }
-        return StopTarget::All;
+        return Target::All;
     }
     let mut ids = Vec::new();
     for a in args {
         match a.parse::<u32>() {
             Ok(n) => ids.push(n),
-            Err(_) => return StopTarget::Usage(crate::i18n::msg::not_a_session_id(lang, a)),
+            Err(_) => return Target::Usage(crate::i18n::msg::not_a_session_id(lang, a)),
         }
     }
-    StopTarget::Ids(ids)
+    Target::Ids(ids)
 }
 
 fn status_word(s: SessionState, lang: Lang) -> &'static str {
@@ -128,9 +132,28 @@ pub fn run_ps(sock: &Path, lang: Lang) -> Result<()> {
 ///
 /// 逐个停而不是遇错就停手：用户敲 `dct stop 3 4 5` 的意思是这三个都别跑了，
 /// 3 号已经没了不该连累 4、5 还留着。
-pub fn run_stop(sock: &Path, lang: Lang, target: StopTarget) -> Result<i32> {
+pub fn run_stop(sock: &Path, lang: Lang, target: Target) -> Result<i32> {
+    run_on_targets(sock, lang, target, Force::No)
+}
+
+/// 跟 `run_stop` 走同一条路，只把请求换成 `Kill`。
+///
+/// 共用而不是抄一份：两条命令唯一的差别是发给守护进程的那一个请求，
+/// 而**周围那一圈**（`--all` 要先问一遍谁还活着、逐个发不中途放弃、
+/// 有一个失败就退非零）全都一样。抄一份的话，将来改退出码只会改对一半。
+pub fn run_kill(sock: &Path, lang: Lang, target: Target) -> Result<i32> {
+    run_on_targets(sock, lang, target, Force::Yes)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Force {
+    No,
+    Yes,
+}
+
+fn run_on_targets(sock: &Path, lang: Lang, target: Target, force: Force) -> Result<i32> {
     let target = match target {
-        StopTarget::Usage(msg) => {
+        Target::Usage(msg) => {
             eprintln!("{msg}");
             return Ok(2);
         }
@@ -143,7 +166,9 @@ pub fn run_stop(sock: &Path, lang: Lang, target: StopTarget) -> Result<i32> {
     };
 
     let ids = match target {
-        StopTarget::All => match c.call(Request::List)? {
+        // 「全部」= 所有还没停的。已经停了的不必再停一次，也不该因为
+        // 它们而让退出码变成非零。
+        Target::All => match c.call(Request::List)? {
             Response::Sessions(v) => v
                 .iter()
                 .filter(|s| s.state != SessionState::Stopped)
@@ -151,8 +176,8 @@ pub fn run_stop(sock: &Path, lang: Lang, target: StopTarget) -> Result<i32> {
                 .collect(),
             other => anyhow::bail!("守护进程答非所问：{other:?}"),
         },
-        StopTarget::Ids(v) => v,
-        StopTarget::Usage(_) => unreachable!("上面已经处理过了"),
+        Target::Ids(v) => v,
+        Target::Usage(_) => unreachable!("上面已经处理过了"),
     };
 
     if ids.is_empty() {
@@ -162,8 +187,18 @@ pub fn run_stop(sock: &Path, lang: Lang, target: StopTarget) -> Result<i32> {
 
     let mut bad = 0;
     for id in ids {
-        match c.call(Request::Stop { id }) {
-            Ok(Response::Ok) => println!("{}", crate::i18n::msg::stopped_session(lang, id)),
+        let req = match force {
+            Force::No => Request::Stop { id },
+            Force::Yes => Request::Kill { id },
+        };
+        match c.call(req) {
+            Ok(Response::Ok) => println!(
+                "{}",
+                match force {
+                    Force::No => crate::i18n::msg::stopped_session(lang, id),
+                    Force::Yes => crate::i18n::msg::killed_session(lang, id),
+                }
+            ),
             Ok(Response::Error(ref e)) => {
                 bad += 1;
                 eprintln!("{}", crate::i18n::msg::error(lang, e));
@@ -181,6 +216,25 @@ pub fn run_stop(sock: &Path, lang: Lang, target: StopTarget) -> Result<i32> {
     Ok(if bad > 0 { 1 } else { 0 })
 }
 
+/// `dct prune`：把已经停掉的会话从名册上抹掉。
+///
+/// 不接参数、也没有 `--all`：这条命令本来就只对「已经停了的」下手，
+/// 而那批东西不可能被误伤——它们已经不跑了。
+pub fn run_prune(sock: &Path, lang: Lang) -> Result<()> {
+    let Some(mut c) = connect(sock) else {
+        println!("{}", text(Key::NoDaemonRunning, lang));
+        return Ok(());
+    };
+    match c.call(Request::Prune)? {
+        // 一个都没清跟清了几个是两句话：印「清掉 0 个」会让人以为
+        // 命令没生效，而事实是本来就没有可清的。
+        Response::Pruned(0) => println!("{}", text(Key::NothingToPrune, lang)),
+        Response::Pruned(n) => println!("{}", crate::i18n::msg::pruned(lang, n)),
+        other => anyhow::bail!("守护进程答非所问：{other:?}"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,25 +247,51 @@ mod tests {
     /// 而停会话撤不回来——默认全停的话，用户想停一个会把所有 agent 停光。
     #[test]
     fn a_bare_stop_asks_what_to_stop_instead_of_stopping_everything() {
-        match parse_stop_args(&args(&[]), Lang::Zh) {
-            StopTarget::Usage(m) => assert!(!m.trim().is_empty(), "得说清该怎么用"),
+        match parse_target_args(&args(&[]), Lang::Zh, "stop") {
+            Target::Usage(m) => assert!(!m.trim().is_empty(), "得说清该怎么用"),
             other => panic!("空参数必须是用法提示，实际 {other:?}"),
+        }
+    }
+
+    /// `kill` 更凶（不给收尾时间），同一条规矩更要成立。
+    #[test]
+    fn a_bare_kill_asks_what_to_kill_instead_of_killing_everything() {
+        match parse_target_args(&args(&[]), Lang::Zh, "kill") {
+            Target::Usage(m) => assert!(!m.trim().is_empty(), "得说清该怎么用"),
+            other => panic!("空参数必须是用法提示，实际 {other:?}"),
+        }
+    }
+
+    /// 用户敲的是哪条命令，用法提示里就得印哪条。印着 `dct stop 3` 去回答
+    /// 一个敲了 `dct kill` 的人，等于把他推去解一个他没问的问题。
+    #[test]
+    fn the_usage_hint_names_the_command_you_actually_typed() {
+        for (cmd, other) in [("kill", "stop"), ("stop", "kill")] {
+            for bad in [args(&[]), args(&["--all", "3"])] {
+                match parse_target_args(&bad, Lang::Zh, cmd) {
+                    Target::Usage(m) => {
+                        assert!(m.contains(&format!("dct {cmd}")), "提示里该印 {cmd}：{m}");
+                        assert!(!m.contains(&format!("dct {other}")), "不该印 {other}：{m}");
+                    }
+                    other => panic!("该是用法提示，实际 {other:?}"),
+                }
+            }
         }
     }
 
     #[test]
     fn ids_are_parsed_in_the_order_given() {
         assert_eq!(
-            parse_stop_args(&args(&["3", "4", "5"]), Lang::Zh),
-            StopTarget::Ids(vec![3, 4, 5])
+            parse_target_args(&args(&["3", "4", "5"]), Lang::Zh, "stop"),
+            Target::Ids(vec![3, 4, 5])
         );
     }
 
     #[test]
     fn all_means_all() {
         assert_eq!(
-            parse_stop_args(&args(&["--all"]), Lang::Zh),
-            StopTarget::All
+            parse_target_args(&args(&["--all"]), Lang::Zh, "stop"),
+            Target::All
         );
     }
 
@@ -219,16 +299,24 @@ mod tests {
     /// 停掉了他没打算停的东西。
     #[test]
     fn all_mixed_with_ids_is_refused_rather_than_guessed() {
-        match parse_stop_args(&args(&["--all", "3"]), Lang::Zh) {
-            StopTarget::Usage(_) => {}
+        match parse_target_args(&args(&["--all", "3"]), Lang::Zh, "stop") {
+            Target::Usage(_) => {}
+            other => panic!("混着给必须拒绝，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_all_takes_no_ids() {
+        match parse_target_args(&args(&["--all", "3"]), Lang::Zh, "kill") {
+            Target::Usage(m) => assert!(m.contains("kill"), "{m}"),
             other => panic!("混着给必须拒绝，实际 {other:?}"),
         }
     }
 
     #[test]
     fn a_non_number_says_so_instead_of_being_skipped() {
-        match parse_stop_args(&args(&["claude"]), Lang::Zh) {
-            StopTarget::Usage(m) => assert!(m.contains("claude"), "得点名是哪个参数不对：{m}"),
+        match parse_target_args(&args(&["claude"]), Lang::Zh, "stop") {
+            Target::Usage(m) => assert!(m.contains("claude"), "得点名是哪个参数不对：{m}"),
             other => panic!("非数字必须报错，实际 {other:?}"),
         }
     }

@@ -380,6 +380,49 @@ impl SessionManager {
         })
     }
 
+    /// 强杀：跟 `stop` 同一个落点（`state` 置 `Stopped`），只是不给那 200ms。
+    ///
+    /// 状态必须跟 `stop` 一致，不能另立一个「被强杀的」状态：对用户来说
+    /// 这两条命令的结果是同一件事——这个会话不跑了。多一个状态就要在看板、
+    /// 九宫格、`dct ps` 三处各给它一种画法，而它们要表达的话是同一句。
+    pub fn kill(&self, id: u32) -> Result<()> {
+        self.with_session(id, |s| {
+            s.pty.kill_now()?;
+            s.state = SessionState::Stopped;
+            Ok(())
+        })
+    }
+
+    /// 把已经停掉的会话从名册上抹掉，返回抹掉了几个。
+    ///
+    /// **两趟，跟 `list()` 同一套锁纪律**：先逐个短暂拿会话锁挑出该删的 id，
+    /// 再拿 map 锁删。倒过来（持 map 锁去逐个锁会话）会让整个看板卡在
+    /// 一个正在做慢活的会话上——`list()` 每 150ms 就要走一遍同一批锁。
+    ///
+    /// 被删的 `Session` 在这里落地析构，`PtySession::Drop` 会兜底再回收一次
+    /// 子进程。那是空操作（这些会话已经停了），但不能省：判成 `Stopped` 的
+    /// 路径不止 `stop()` 一条，`tick()` 里那条「进程自己没了」也算。
+    pub fn prune(&self) -> u32 {
+        // 第一趟：拿 map 锁只做一次浅拷贝就放手，之后逐个锁会话——跟
+        // `list()` 一字不差的顺序。反过来（攥着 map 锁去锁会话）会让整个
+        // 看板卡在某个正在做慢活的会话上。
+        let snapshot: Vec<Arc<Mutex<Session>>> =
+            recover(self.sessions.lock()).values().cloned().collect();
+        let dead: Vec<u32> = snapshot
+            .iter()
+            .filter_map(|arc| {
+                let s = recover(arc.lock());
+                (s.state == SessionState::Stopped).then_some(s.id)
+            })
+            .collect();
+
+        // 第二趟：只做 HashMap 删除，不碰任何会话锁。
+        // 用 `remove().is_some()` 数，不用 `dead.len()`：两趟之间没有锁，
+        // 中途可能有别人删了同一个 id，报一个虚高的数字等于骗用户。
+        let mut map = recover(self.sessions.lock());
+        dead.iter().filter(|id| map.remove(id).is_some()).count() as u32
+    }
+
     /// 恢复到最后一张快照。git 操作同样不持会话锁，理由见 `send_input`。
     pub fn undo(&self, id: u32) -> Result<()> {
         let (dir, sha) = self.checkpoint_base(id)?;
@@ -590,6 +633,55 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
         }
+    }
+
+    /// `stop()` 只把状态改成 `Stopped`，从不删——守护进程活得很久，于是
+    /// `dct ps` 会越积越多的墓碑。`prune()` 是把它们抹掉的那一步，而且
+    /// **只抹已经停了的**：还在跑的会话被顺手删掉，用户就再也够不着它了
+    /// （pty 还在守护进程里活着，但名册上没有它，停都停不掉）。
+    #[test]
+    fn prune_removes_stopped_sessions_and_leaves_the_rest() {
+        let plain = tempfile::tempdir().unwrap();
+        let m = SessionManager::new();
+        let dead = m
+            .create(plain.path(), "shell", empty_secrets(), &[])
+            .unwrap();
+        let alive = m
+            .create(plain.path(), "shell", empty_secrets(), &[])
+            .unwrap();
+        m.stop(dead).unwrap();
+
+        assert_eq!(m.prune(), 1, "只该抹掉那个已经停了的");
+        let left: Vec<u32> = m.list().iter().map(|s| s.id).collect();
+        assert_eq!(left, vec![alive], "还在跑的必须留着");
+
+        // 再来一次没东西可抹了——已经抹过的不该被数第二遍
+        assert_eq!(m.prune(), 0);
+    }
+
+    #[test]
+    fn prune_on_a_clean_manager_removes_nothing() {
+        let m = SessionManager::new();
+        assert_eq!(m.prune(), 0);
+    }
+
+    /// `kill()` 跟 `stop()` 落在同一个状态上。对用户来说这两条命令的结果
+    /// 是同一件事——这个会话不跑了；多一个「被强杀的」状态，就要在看板、
+    /// 九宫格、`dct ps` 三处各给它一种画法，而它们要说的是同一句话。
+    #[test]
+    fn kill_stops_the_session_just_like_stop_does() {
+        let plain = tempfile::tempdir().unwrap();
+        let m = SessionManager::new();
+        let id = m
+            .create(plain.path(), "shell", empty_secrets(), &[])
+            .unwrap();
+
+        m.kill(id).unwrap();
+
+        let s = m.list().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.state, SessionState::Stopped);
+        // 杀完就该能被 prune 掉，跟 stop 出来的墓碑一视同仁
+        assert_eq!(m.prune(), 1);
     }
 
     #[test]

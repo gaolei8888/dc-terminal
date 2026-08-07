@@ -284,6 +284,34 @@ impl PtySession {
         Ok(())
     }
 
+    /// 立刻 SIGKILL，不给宽限期。
+    ///
+    /// 跟 `kill()` 的差别只有那 200ms：`kill()` 走 portable-pty 的
+    /// SIGHUP → 约 200ms → SIGKILL，好让 agent 有机会自己收尾（存盘、
+    /// 恢复终端）。这条路给的是「敲了 stop 它还赖着不走」时的下一步，
+    /// 那时候再等一次同样的 200ms 只是重复一遍已经失败过的事。
+    ///
+    /// **wait 一次是必须的**，跟 `kill()` 同一个理由：SIGKILL 之后不收尸
+    /// 就留一个僵尸，而守护进程一活就是好几天。
+    ///
+    /// 拿不到 pid（子进程已经没了）不算失败：目标状态就是「它不在了」，
+    /// 而它确实不在了。照样 wait 一次把可能存在的尸体收掉。
+    pub fn kill_now(&mut self) -> Result<()> {
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pid) = child.process_id() {
+            // SAFETY: 只是给一个 pid 发信号。pid 来自我们自己 spawn 的子进程，
+            // 最坏情况是它已经退出、信号发给一个不存在的进程（返回 ESRCH，
+            // 下面的 wait 照样把尸体收掉）。
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = child.wait();
+        drop(child);
+        self.alive.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         self.child
             .lock()
@@ -363,6 +391,33 @@ mod tests {
             sleep(Duration::from_millis(50));
         }
         assert!(!p.is_alive());
+    }
+
+    /// SIGKILL 之后必须 `wait()` 一次把尸体收掉。守护进程一活就是好几天，
+    /// 每强杀一个会话留一个僵尸的话，进程表会慢慢被填满，而用户看不到
+    /// 任何症状——直到某天起不了新会话。
+    #[test]
+    fn kill_now_leaves_no_zombie() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = PtySession::spawn(
+            &["cat".to_string()],
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        let pid = p.process_id().expect("刚起来的进程该有 pid");
+
+        p.kill_now().unwrap();
+        assert!(!p.is_alive(), "杀完就不该再报活着");
+
+        // 收干净了的话，这个 pid 已经不在进程表里——`kill(pid, 0)` 只探测
+        // 存在性，不真的发信号。僵尸仍然算「存在」，所以这条真的能分辨出
+        // 「杀了但没收尸」。
+        // SAFETY: 0 号信号不改变目标进程的任何状态，只做存在性检查。
+        let alive_in_table = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        assert!(!alive_in_table, "{pid} 还留在进程表里，说明没 wait 收尸");
     }
 
     #[test]

@@ -193,6 +193,8 @@ fn handle(
         }),
         Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
+        Request::Kill { id } => mgr.kill(id).map(|_| Response::Ok),
+        Request::Prune => Ok(Response::Pruned(mgr.prune())),
         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
         Request::Diff { id } => mgr.diff(id).map(Response::Diff),
         Request::SetSecret { profile, value } => recover(secrets.lock())
