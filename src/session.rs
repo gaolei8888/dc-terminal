@@ -160,6 +160,12 @@ pub struct SessionManager {
     /// 出错解释要用的后端。`None` = 没配 LLM，功能安静下线（见
     /// `request_explanation`）。守护进程启动时 resolve 一次填进来。
     backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>,
+    /// 上面那次 resolve 为什么失败。**只有用户确实写了 `[llm]` 却接不上时
+    /// 才是 `Some`**——没写 `[llm]` 是绝大多数人的正常状态，不是问题，
+    /// 那种情况这里始终是 `None`。存下来是因为守护进程的 stderr 被丢弃了
+    /// （见 `proto::WarningCode::LlmUnavailable`），这是这条原因唯一能走到
+    /// 用户眼前的路。
+    llm_problem: Mutex<Option<crate::llm::resolve::ResolveError>>,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -182,6 +188,7 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             backend: Mutex::new(None),
+            llm_problem: Mutex::new(None),
         }
     }
 
@@ -189,6 +196,17 @@ impl SessionManager {
     /// resolve 失败就传 `None`——功能安静下线，不影响会话本身跑不跑得起来。
     pub fn set_backend(&self, b: Option<Arc<dyn crate::llm::Backend>>) {
         *recover(self.backend.lock()) = b;
+    }
+
+    /// 记下（或清掉）「用户开了出错解释，但连不上」的原因。
+    /// `Request::Profiles` 会把它当成一条警告顶到界面上——守护进程的
+    /// stderr 是被丢弃的，不记下来就等于没说过。
+    pub fn set_llm_problem(&self, p: Option<crate::llm::resolve::ResolveError>) {
+        *recover(self.llm_problem.lock()) = p;
+    }
+
+    pub fn llm_problem(&self) -> Option<crate::llm::resolve::ResolveError> {
+        recover(self.llm_problem.lock()).clone()
     }
 
     /// 读一个会话此刻的出错解释。没有后端、还没问完、或者问失败了，
@@ -433,8 +451,6 @@ impl SessionManager {
 
     pub fn stop(&self, id: u32) -> Result<()> {
         self.with_session(id, |s| {
-            // pid 要在 kill 之前取：杀完再问就已经被回收了。
-            let pid = s.pty.process_id();
             s.pty.kill()?;
             s.state = SessionState::Stopped;
             Ok(())
@@ -542,7 +558,6 @@ impl SessionManager {
                 // 关掉了 PTY 却还活着，那时 `try_wait` 回收不到任何东西，而
                 // 这个会话已经被判成停止、不会再被看第二眼了。`kill()` 先杀
                 // 再等，两种情况一起收干净。
-                let pid = s.pty.process_id();
                 let _ = s.pty.kill();
                 s.state = SessionState::Stopped;
                 continue;

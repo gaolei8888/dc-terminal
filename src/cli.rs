@@ -251,12 +251,18 @@ pub fn run_prune(sock: &Path, lang: Lang) -> Result<()> {
 /// （`resolve::resolve` 里 key 优先于 OAuth 那条顺序保证了这一点）。
 /// 不要再把它们加回 claude 或 codex 的分支。
 ///
+/// **按名字挑只是第一道关。** 名字是用户可以手写的（
+/// `~/.dct/profiles/claude.toml` 里塞一个 `[api]`、设置文件里写一行
+/// `base_url`），所以每份凭据都带着**出处**（`BorrowedFrom`）一起返回，
+/// 由 `resolve::select_credential` 拿它去比对**目的地主机**——那才是凭据
+/// 真正会去的地方。两道关一起才关得住这一类问题。
+///
 /// `claude`/`codex` 两个闭包注入是为了测试不用碰真实 Keychain / `auth.json`。
 fn oauth_lookup(
     name: &str,
-    claude: &dyn Fn() -> Option<crate::llm::creds::Credential>,
-    codex: &dyn Fn() -> Option<crate::llm::creds::Credential>,
-) -> Option<crate::llm::creds::Credential> {
+    claude: &dyn Fn() -> Option<crate::llm::creds::Borrowed>,
+    codex: &dyn Fn() -> Option<crate::llm::creds::Borrowed>,
+) -> Option<crate::llm::creds::Borrowed> {
     match name {
         "claude" => claude(),
         "codex" => codex(),
@@ -267,9 +273,13 @@ fn oauth_lookup(
 /// `dct llm check`：把配置里那条 LLM 连接真的跑一次。
 ///
 /// 这条命令**就是**「配置写完还要真打端点验过」那条验收标准的载体。
-pub fn llm_check() -> i32 {
+///
+/// `lang` 跟 `ps`/`stop`/`prune` 同一条路（`main::cli_lang()`）：这条命令印的
+/// 也是给人看的话，跟界面说两种语言会很怪。
+pub fn llm_check(lang: Lang) -> i32 {
     let socket = crate::proto::socket_path();
-    let cfg = crate::config::Config::load(&crate::config::config_path_for_socket(&socket));
+    let config_path = crate::config::config_path_for_socket(&socket);
+    let cfg = crate::config::Config::load(&config_path);
     let secrets =
         crate::secrets::SecretStore::load(&crate::secrets::secrets_path_for_socket(&socket));
     let profiles_dir = crate::profile::profiles_dir_for_socket(&socket);
@@ -282,10 +292,14 @@ pub fn llm_check() -> i32 {
             .or_else(|| crate::profile::Profile::builtin(n))
     };
     let oauth = |n: &str| {
+        use crate::llm::creds::{BorrowedFrom, Credential};
         oauth_lookup(
             n,
-            &|| crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer),
-            &crate::llm::creds::read_codex_auth,
+            &|| {
+                crate::llm::creds::read_claude_oauth()
+                    .map(|t| (BorrowedFrom::ClaudeCli, Credential::Bearer(t)))
+            },
+            &|| crate::llm::creds::read_codex_auth().map(|c| (BorrowedFrom::CodexCli, c)),
         )
     };
 
@@ -293,23 +307,31 @@ pub fn llm_check() -> i32 {
     // 见 `config.rs` 头注释：出错解释会把终端里的原始内容送给模型，必须是
     // 用户自己主动写下 `[llm]` 才算数，这里不能替他去猜一份默认配置来验。
     let Some(llm) = &cfg.llm else {
-        println!("出错解释这个功能现在是关着的（没写过 [llm]）。");
-        println!("要打开的话，在设置文件里加一段：");
-        println!();
-        println!("[llm]");
-        println!("provider = \"claude\"");
-        println!();
-        println!("加了之后再跑一次 `dct llm check` 就能验。");
+        // 路径是真的从 socket 推出来的那一个，不是一句「设置文件」——
+        // 零编程经验的用户没法对「设置文件」这四个字采取任何行动。
+        println!("{}", crate::i18n::msg::llm_not_enabled(lang, &config_path));
         return 1;
     };
 
-    println!("provider: {}", llm.provider);
-    println!("transport: {:?}", llm.transport);
+    println!(
+        "{}",
+        crate::i18n::msg::llm_using(
+            lang,
+            &llm.provider,
+            llm.transport == crate::config::Transport::Http
+        )
+    );
 
     let backend = match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
         Ok(b) => b,
         Err(e) => {
-            println!("连不上：{}", crate::llm::resolve::describe(&e));
+            println!(
+                "{}",
+                crate::i18n::msg::llm_cannot_connect(
+                    lang,
+                    &crate::i18n::msg::llm_problem(lang, &e)
+                )
+            );
             return 1;
         }
     };
@@ -321,11 +343,11 @@ pub fn llm_check() -> i32 {
     };
     match crate::llm::complete_with_timeout(backend, p, std::time::Duration::from_secs(60)) {
         Ok(answer) => {
-            println!("通了。模型回答：{answer}");
+            println!("{}", crate::i18n::msg::llm_works(lang, &answer));
             0
         }
         Err(e) => {
-            println!("没通：{e:?}");
+            println!("{}", crate::i18n::msg::llm_call_failed(lang, e));
             1
         }
     }
@@ -347,18 +369,34 @@ mod tests {
     /// 返回什么。两个闭包都是假的，测试不碰真实 Keychain / `auth.json`。
     #[test]
     fn oauth_lookup_never_offers_one_vendors_token_to_another() {
-        use crate::llm::creds::Credential;
+        use crate::llm::creds::{BorrowedFrom, Credential};
 
-        let claude = || Some(Credential::Bearer("claude-token".into()));
-        let codex = || Some(Credential::Bearer("codex-token".into()));
+        let claude = || {
+            Some((
+                BorrowedFrom::ClaudeCli,
+                Credential::Bearer("claude-token".into()),
+            ))
+        };
+        let codex = || {
+            Some((
+                BorrowedFrom::CodexCli,
+                Credential::Bearer("codex-token".into()),
+            ))
+        };
 
         assert_eq!(
             oauth_lookup("claude", &claude, &codex),
-            Some(Credential::Bearer("claude-token".into()))
+            Some((
+                BorrowedFrom::ClaudeCli,
+                Credential::Bearer("claude-token".into())
+            ))
         );
         assert_eq!(
             oauth_lookup("codex", &claude, &codex),
-            Some(Credential::Bearer("codex-token".into()))
+            Some((
+                BorrowedFrom::CodexCli,
+                Credential::Bearer("codex-token".into())
+            ))
         );
         for vendor in ["kimi", "glm", "deepseek", "qwen-api"] {
             assert_eq!(

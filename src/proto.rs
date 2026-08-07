@@ -398,6 +398,14 @@ pub enum WarningCode {
     },
     /// 密钥文件读不了
     SecretsUnreadable { path: String, reason: IoReason },
+    /// 用户写了 `[llm]`（一次主动的「我要开」），但那条连接接不上。
+    ///
+    /// 守护进程启动时 resolve 一次，失败就把原因**记下来**而不是只往 stderr
+    /// 打一行：界面进程拉起守护进程时把它的 stderr 接到了 `/dev/null`
+    /// （`client::spawn_daemon`——不然每一行都会糊在 TUI 上），所以那一行
+    /// 谁都看不见，用户开了功能却只会得到一片沉默。带的是
+    /// `ResolveError` 这个**码**，不是句子，理由同本枚举其余各条。
+    LlmUnavailable(crate::llm::resolve::ResolveError),
     /// 密钥文件坏了。**不给行号也不给 toml 的原文**：README 明说密钥不该手改，
     /// 而且这时候所有写入都被拒，照着行号去抠语法是把用户往错路上支。
     /// 唯一有效的下一步是删掉它重新粘贴一遍。

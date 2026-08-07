@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
         // 通路，跟会话、pty 都无关。
         Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
-            std::process::exit(dct::cli::llm_check())
+            std::process::exit(dct::cli::llm_check(cli_lang()))
         }
         Some("--help") | Some("-h") => {
             println!("{HELP}");

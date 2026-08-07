@@ -94,13 +94,18 @@ fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager)
             .or_else(|| Profile::builtin(n))
     };
     match crate::llm::resolve::resolve(llm, &lookup, &llm_secrets, &startup_oauth) {
-        Ok(b) => mgr.set_backend(Some(b)),
+        Ok(b) => {
+            mgr.set_backend(Some(b));
+            mgr.set_llm_problem(None);
+        }
         Err(e) => {
-            eprintln!(
-                "dct: 出错解释开着，但连不上（{}），会话照常跑",
-                crate::llm::resolve::describe(&e)
-            );
+            // stderr 这一行只有 `dct daemon` 前台跑的时候看得见：界面进程
+            // 拉起守护进程时把 stderr 接到了 `/dev/null`（`spawn_daemon`——
+            // 不然每一行都会糊在 TUI 上）。所以真正让用户看到的是记下来的
+            // 这个码，`Request::Profiles` 会把它当成一条警告顶上去。
+            eprintln!("dct: 出错解释开着，但连不上（{e:?}），会话照常跑");
             mgr.set_backend(None);
+            mgr.set_llm_problem(Some(e));
         }
     }
 }
@@ -111,15 +116,19 @@ fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager)
 /// deepseek/qwen-api 也映射到这两个查询上，那等于把用户的 Anthropic/OpenAI
 /// 登录态发给几家跟它们毫无关系的第三方服务器。
 ///
+/// 每份凭据都带着**出处**（`BorrowedFrom`）一起返回：按名字挑只是第一道关，
+/// 名字是用户可以手写的，真正管用的是 `resolve::select_credential` 拿这个
+/// 出处去比对目的地主机。
+///
 /// 单独写一份而不是复用 `cli.rs::oauth_lookup`：那边把两个查询做成了可注入
 /// 的闭包参数，是为了单测能绕开真实 Keychain / `auth.json`；守护进程启动
 /// 只跑一次真实查询，没有这个诉求，硬套那个签名反而要在这里现造两个闭包。
-fn startup_oauth(name: &str) -> Option<crate::llm::creds::Credential> {
+fn startup_oauth(name: &str) -> Option<crate::llm::creds::Borrowed> {
+    use crate::llm::creds::{BorrowedFrom, Credential};
     match name {
-        "claude" => {
-            crate::llm::creds::read_claude_oauth().map(crate::llm::creds::Credential::Bearer)
-        }
-        "codex" => crate::llm::creds::read_codex_auth(),
+        "claude" => crate::llm::creds::read_claude_oauth()
+            .map(|t| (BorrowedFrom::ClaudeCli, Credential::Bearer(t))),
+        "codex" => crate::llm::creds::read_codex_auth().map(|c| (BorrowedFrom::CodexCli, c)),
         _ => None,
     }
 }
@@ -175,6 +184,12 @@ fn handle(
                 // 说清楚该干什么的中文（见 `SecretStore::load` 的注释），这里
                 // 只负责把路径带上，不再叠加任何暗示"去编辑它"的措辞。
                 warnings.insert(0, e.clone());
+            }
+            // 用户开了出错解释却接不上，这条原因只有这一条路能走到他眼前
+            // （守护进程的 stderr 被丢弃了）。排在密钥/profile 那些警告后面：
+            // 那几条是「你现在要用的东西坏了」，这条是「一个增强功能没生效」。
+            if let Some(p) = mgr.llm_problem() {
+                warnings.push(crate::proto::WarningCode::LlmUnavailable(p));
             }
             let entries = all
                 .iter()
@@ -660,6 +675,56 @@ mod tests {
         assert!(
             mgr.backend_is_set(),
             "写了 [llm]（哪怕是空的）就该是一次显式的开——这条不能被上一条回归测试误伤"
+        );
+        assert!(mgr.llm_problem().is_none(), "接上了就不该留着一条抱怨");
+    }
+
+    /// 用户开了出错解释、却配错了，**这件事必须走得到他眼前**。
+    ///
+    /// 守护进程那句 `eprintln!` 是看不见的：界面进程拉起它的时候把 stderr
+    /// 接到了 `/dev/null`（`client::spawn_daemon`，不然每一行都会糊在 TUI
+    /// 上）。所以原因要记在守护进程上，并且跟着 `Request::Profiles` 一起
+    /// 顶到界面的警告栏——这条测试钉的就是这条通路，从「配错了」一直到
+    /// 「界面拿到一条能读的警告」。
+    #[test]
+    fn a_broken_llm_setting_reaches_the_user_instead_of_going_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            "[llm]\nprovider = \"根本没有这个\"\n",
+        )
+        .unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let profiles_dir = dir.path().join("profiles");
+
+        install_llm_backend(&socket, &profiles_dir, &mgr);
+
+        assert!(!mgr.backend_is_set(), "连不上就不该装后端");
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &dir.path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json"))));
+        let resp = handle(
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
+            &mgr,
+            &store,
+            &secrets,
+            &profiles_dir,
+        );
+        let Response::Profiles { warnings, .. } = resp else {
+            panic!("期待 Response::Profiles");
+        };
+        let w = warnings
+            .iter()
+            .find(|w| matches!(w, crate::proto::WarningCode::LlmUnavailable(_)))
+            .expect("配错了却一个警告都没有——用户会以为功能坏了却查不到任何线索");
+        let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+        assert!(
+            line.contains("根本没有这个"),
+            "要点名是设置里的哪个名字写错了：{line}"
         );
     }
 }
