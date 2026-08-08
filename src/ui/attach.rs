@@ -125,7 +125,18 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             .flat_map(|g| g.sessions.iter().cloned())
             .collect();
         match super::grid::next_running(&board, id) {
-            Some(next) => super::enter_session(app, next),
+            Some(next) => {
+                // 光标必须跟着人走。F3 会跨过项目边界（那是用户按的键，
+                // 跨得理直气壮），而分组之后**光标就是「当前项目」**——
+                // 不挪它的话，按 F2 回看板时底栏还写着上一个项目、`n` 也
+                // 会开在那儿，而人刚从另一个项目的会话里出来。这正是这一版
+                // 要消灭的那种「屏幕和状态各说各话」。
+                //
+                // 跟九宫格 Enter 放大走的是同一个函数（见
+                // `mod.rs::point_cursor_at_session`），两处不各写一份。
+                super::point_cursor_at_session(app, next);
+                super::enter_session(app, next)
+            }
             None => {
                 app.message =
                     crate::i18n::text(crate::i18n::Key::NoOtherRunningSession, app.lang).into()
@@ -346,6 +357,44 @@ mod tests {
             "跳过停掉的 2，落在 3 上"
         );
         assert!(app.need_sessions, "会话标题要显示新会话的项目名");
+    }
+
+    /// F3 会跨过项目边界，而**光标是「当前项目」唯一的答案处**——它必须
+    /// 跟着人走。不挪的话，用户从 a 的会话 F3 到 b 的会话、再按 F2 回看板，
+    /// 底栏还写着 a、`n` 也会开在 a，而他刚从 b 里出来。
+    ///
+    /// 断言落在光标所在的**项目**上，不是「视图变成了 Attached」——
+    /// 后者对着没修的代码照样通过。
+    #[test]
+    fn f3_into_another_project_takes_the_cursor_with_it() {
+        let (mut app, _dir) = App::test_app();
+        let in_dir = |id: u32, dir: &str| SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: SessionState::Working,
+            activity: String::new(),
+            is_agent: true,
+        };
+        app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
+        // 行：[组头 a, 会话 1, 组头 b, 会话 2]——先站在 a 的会话上
+        app.list_state.select(Some(1));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("a".to_string()),
+            "前提：当前项目是 a"
+        );
+        app.view = View::Attached(1);
+
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+
+        assert!(matches!(app.view, View::Attached(2)), "跳到了 b 的会话");
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "当前项目必须跟着人走到 b——否则 F2 回看板时屏幕和状态各说各话"
+        );
+        assert_eq!(app.selected_session().map(|s| s.id), Some(2));
     }
 
     #[test]

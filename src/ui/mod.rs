@@ -1099,6 +1099,26 @@ pub(crate) fn unpin_current(app: &mut App) {
     let _ = app;
 }
 
+/// 把列表光标指到某个会话所在的那一行。**「指向第 N 号会话」只有这一份
+/// 实现**，所有需要它的入口（九宫格回列表、F3 跨会话跳）都走这里。
+///
+/// 各写各的迟早会分叉，而分叉出来的样子就是「光标留在原来那个项目上、
+/// 人已经在另一个项目的会话里」——分组之后光标是「当前项目」唯一的答案处，
+/// 它跟人不同步就等于屏幕在说谎。
+///
+/// 在**行**里找，不是在会话数组里找：列表里夹着组头行，会话在
+/// `rows` 和 `grid_sessions()` 两个集合里的下标没有任何对应关系。
+/// 找不到（会话刚没了）就不动光标——乱指一个比不动更糟。
+pub(crate) fn point_cursor_at_session(app: &mut App, id: u32) {
+    let at = app.rows.iter().position(|r| match r {
+        view::Row::Session(g, s) => app.groups[*g].sessions[*s].id == id,
+        view::Row::Header(_) => false,
+    });
+    if let Some(i) = at {
+        app.list_state.select(Some(i));
+    }
+}
+
 /// 离开九宫格之前，把列表光标挪到当前焦点格上。
 ///
 /// 两个视图对「当前是哪个会话」的认知必须一致——`board.rs` 的 `g` 分支
@@ -1116,15 +1136,7 @@ pub(crate) fn sync_board_cursor_from_grid(app: &mut App) {
         // 回列表后接下来的 `s`（停止）或 `u`（回滚）就毁在另一个会话上，
         // 而这两个键都不可撤销。
         if let Some(id) = app.grid_sessions().get(focus).map(|s| s.id) {
-            // 在**行**里找，不是在会话数组里找：列表现在还夹着组头行，
-            // 会话在两个集合里的下标不再有任何对应关系。
-            let at = app.rows.iter().position(|r| match r {
-                view::Row::Session(g, s) => app.groups[*g].sessions[*s].id == id,
-                view::Row::Header(_) => false,
-            });
-            if let Some(i) = at {
-                app.list_state.select(Some(i));
-            }
+            point_cursor_at_session(app, id);
         }
     }
 }
