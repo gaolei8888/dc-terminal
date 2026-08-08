@@ -397,6 +397,40 @@ mod tests {
         assert_eq!(app.selected_session().map(|s| s.id), Some(2));
     }
 
+    /// 同上，但目标会话所在的组正**折叠**着。折叠的组在 `rows` 里一行会话都
+    /// 没有，只在行里搜的实现会一无所获、光标一动不动——人已经在 b 的会话里，
+    /// 按 F2 回看板时底栏还写着 a，`n` 也开在 a。折叠是列表的显示偏好，
+    /// 不该让 F3 变成半个动作。
+    #[test]
+    fn f3_into_a_collapsed_project_takes_the_cursor_with_it() {
+        let (mut app, _dir) = App::test_app();
+        let in_dir = |id: u32, dir: &str| SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: SessionState::Working,
+            activity: String::new(),
+            is_agent: true,
+        };
+        app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
+        // 把 b 折起来，再回到 a 的会话上
+        app.list_state.select(Some(2));
+        super::super::toggle_collapse(&mut app);
+        assert!(app.groups[1].collapsed, "前提：b 是折叠的");
+        app.list_state.select(Some(1));
+        app.view = View::Attached(1);
+
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+
+        assert!(matches!(app.view, View::Attached(2)), "跳到了 b 的会话");
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "折叠不该把当前项目冻在 a 上"
+        );
+        assert_eq!(app.selected_session().map(|s| s.id), Some(2));
+    }
+
     #[test]
     fn f3_says_so_when_this_is_the_only_running_session() {
         // 唯一在跑的会话按 F3：不能跳回自己，也不能悄无声息什么都不做。

@@ -297,23 +297,39 @@ fn point_cursor_at_focus(app: &mut App) {
     }
 }
 
+/// **「进这个项目，焦点该落在哪一格」只有这一份答案。**
+///
+/// 两个调用方问的是同一个问题：`Tab`/数字键换项目（`focus_first_of_current_group`），
+/// 以及从列表切进九宫格时光标停在组头上（`mod.rs::home_view`）。各答各的
+/// 一定会分叉，而分叉出来的样子就是「`Tab` 到 B、按 `g`，第一帧 `▶` 就落在
+/// A 的格子上」——底栏念 B、`n`/`x` 作用在 B，`Enter`/`i`/`s`/`u`/`d` 却作用
+/// 在 A，而这几个键里有两个不可撤销。
+///
+/// 这个组在九宫格里一个格子都没有（会话全停了、或者压根是空组）就返回
+/// `None`，调用方各自决定怎么办：换项目那条**不动焦点**（硬挪只会指到别人家
+/// 的格子上），`home_view` 那条落回第 0 格（它必须交出一个下标）。两种落点
+/// 都会让两个指针指着不同的项目，由 `sync_board_cursor_from_grid` 的守卫
+/// 收尾。
+///
+/// `first_live` 回答的是「这个项目在九宫格里有没有格子、第一格是谁」。
+/// **它不回答「焦点是不是陈旧的」**——会话全停的项目同样没有格子，但用户
+/// 在那儿挪焦点完全正当。那个问题归 `sync_board_cursor_from_grid` 自己的
+/// 守卫，两者问的不是同一件事（这一条曾经写反过，见 `first_live` 的文档）。
+pub(crate) fn first_tile_of_current_group(app: &App) -> Option<usize> {
+    let first = app.current_group().and_then(|g| g.first_live())?;
+    app.grid_sessions().iter().position(|s| s.id == first)
+}
+
 /// 把焦点挪到当前组的第一个活会话上。
 ///
-/// 找不到（这个组的会话全停了、或者压根是个空组）就**不动**：空组在九宫格里
-/// 一个格子都没有，硬挪只会把焦点指到别人家的格子上去。
+/// 找不到就**不动**：空组在九宫格里一个格子都没有，硬挪只会把焦点指到
+/// 别人家的格子上去。
 ///
 /// 焦点不动不等于这一下按键没反应——`jump_project`/`goto_project` 已经把
 /// 列表光标挪到了新项目的组头上，底栏那一段项目名读的就是它，用户看得见
 /// 自己换到了哪儿，接着按 `n` 开在那儿、按 `x` 把它拿掉。
 fn focus_first_of_current_group(app: &mut App) {
-    // `first_live` 回答的是「这个项目在九宫格里有没有格子、第一格是谁」。
-    // **它不回答「焦点是不是陈旧的」**——会话全停的项目同样没有格子，但用户
-    // 在那儿挪焦点完全正当。那个问题归 `sync_board_cursor_from_grid` 自己的
-    // 守卫，两者问的不是同一件事（这一条曾经写反过，见 `first_live` 的文档）。
-    let Some(first) = app.current_group().and_then(|g| g.first_live()) else {
-        return;
-    };
-    if let Some(i) = app.grid_sessions().iter().position(|s| s.id == first) {
+    if let Some(i) = first_tile_of_current_group(app) {
         app.view = View::grid(i);
     }
 }
@@ -1081,6 +1097,67 @@ mod tests {
             "焦点是故意留旧的，`g` 不能拿它把刚换过去的项目换回来"
         );
         assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
+    }
+
+    /// **折叠一个组不会把九宫格冻在别的项目上。**
+    ///
+    /// 折叠只是列表那边的显示偏好，而九宫格照画所有项目的格子。方向键把
+    /// `▶` 挪进折叠组的格子时，光标必须跟着进去——折叠的组在 `rows` 里一行
+    /// 会话都没有，光在行里搜的实现会一无所获、光标原地不动，于是底栏念着 a、
+    /// `▶` 在 b 的格子上，`n` 开进 a。
+    #[test]
+    fn arrowing_into_a_collapsed_project_still_moves_the_cursor() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        // 把 b 折起来（光标先停到它的组头上），再回到 a
+        app.list_state.select(Some(2));
+        super::super::toggle_collapse(&mut app);
+        assert!(app.groups[1].collapsed, "前提：b 是折叠的");
+        app.list_state.select(Some(1));
+        app.view = View::grid(0);
+        assert!(app.current_dir().ends_with("a"), "前提：当前项目是 a");
+
+        handle_key(&mut app, key(KeyCode::Right)).unwrap();
+
+        assert!(
+            matches!(app.view, View::Grid { focus: 1, .. }),
+            "焦点挪到了 b 的格子上"
+        );
+        assert!(
+            app.current_dir().ends_with("b"),
+            "当前项目必须跟着 ▶ 走：{}",
+            app.current_dir().display()
+        );
+        assert_eq!(app.selected_session().map(|s| s.id), Some(2));
+    }
+
+    /// `x` 拿掉光标所在的空组之后，`point_cursor_at_focus` 负责把光标接到
+    /// `▶` 指着的那一格上——那一格所在的组正折叠着时同样得接得住。接不住的话
+    /// 光标落在 `refresh_rows` 的兜底第 0 行，跟 `▶` 分属两个项目。
+    #[test]
+    fn removing_a_project_realigns_the_cursor_even_into_a_collapsed_group() {
+        let (mut app, _dir) = App::test_app();
+        app.pinned = vec!["/w/z".into()];
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        // 行：[组头 a, 1, 组头 b, 2, 组头 z]——把 b 折起来
+        app.list_state.select(Some(2));
+        super::super::toggle_collapse(&mut app);
+        assert!(app.groups[1].collapsed, "前提：b 是折叠的");
+
+        // 焦点指着 b 的那一格，光标停在空组 z 的组头上
+        app.view = View::grid(1);
+        app.list_state.select(Some(3));
+        assert!(app.current_dir().ends_with("z"), "前提：当前项目是 z");
+
+        handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
+
+        assert_eq!(app.groups.len(), 2, "z 真的被拿掉了");
+        assert_eq!(
+            app.selected_session().map(|s| s.id),
+            Some(2),
+            "光标要接到 ▶ 指着的那一格上，而不是掉回第 0 行"
+        );
+        assert!(app.current_dir().ends_with("b"));
     }
 
     /// **被拒绝的 `x` 必须一动不动。**

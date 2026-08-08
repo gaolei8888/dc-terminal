@@ -1187,14 +1187,24 @@ pub(crate) fn home_view(app: &App) -> View {
     match app.view_mode {
         ViewMode::List => View::Board,
         // 同样按会话 id 对——理由见 `sync_board_cursor_from_grid`。
-        // 光标停在一个已停止的会话上时（九宫格里没有它）落回第一格：
-        // 那是个「它在九宫格里不存在」的诚实答案，比对到旁边某个无关的
-        // 会话上强。
-        // 光标停在组头上时（那一行没有会话）同样落回第一格：那是个诚实的
-        // 「这一行在九宫格里没有对应物」，比对到旁边某个无关的会话上强。
+        //
+        // 光标那一行在九宫格里没有对应物时（停在组头上、或者停在一个已停止
+        // 的会话上），退而问**同一个项目的第一格**——问的是
+        // `grid::first_tile_of_current_group`，也就是 `Tab`/数字键换项目时
+        // 用的那一份，不另写一份。
+        //
+        // 这一步不是锦上添花：`Tab`/`1`…`9` 按设计就把光标落在**组头**上
+        // （spec 规则 3），所以「`Tab` 到 B 再按 `g`」是日常路径，不是边角。
+        // 直接落回第 0 格的话，第一帧 `▶` 就在 A 的格子上，而底栏念的是 B——
+        // `Enter`/`i`/`s`/`u`/`d` 作用在 A，`n`/`x` 作用在 B。
+        //
+        // 那个项目在九宫格里一个格子都没有时才落回第 0 格：这一支必须交出
+        // 一个下标，而第 0 格至少是确定的。两个指针于是指着不同的项目，
+        // 由 `sync_board_cursor_from_grid` 的守卫收尾。
         ViewMode::Grid => View::grid(
             app.selected_session()
                 .and_then(|s| app.grid_sessions().iter().position(|g| g.id == s.id))
+                .or_else(|| grid::first_tile_of_current_group(app))
                 .unwrap_or(0),
         ),
     }
@@ -1280,15 +1290,42 @@ pub(crate) fn toggle_collapse(app: &mut App) {
 /// 人已经在另一个项目的会话里」——分组之后光标是「当前项目」唯一的答案处，
 /// 它跟人不同步就等于屏幕在说谎。
 ///
-/// 在**行**里找，不是在会话数组里找：列表里夹着组头行，会话在
-/// `rows` 和 `grid_sessions()` 两个集合里的下标没有任何对应关系。
-/// 找不到（会话刚没了）就不动光标——乱指一个比不动更糟。
+/// 先在**组**里找，再换算成行：会话在 `rows` 和 `grid_sessions()` 两个集合
+/// 里的下标没有任何对应关系（列表里夹着组头行），而**折叠的组根本不贡献
+/// 会话行**（见 `view::flatten`）。只在 `rows` 里找的话，目标会话所在的组
+/// 一旦是折叠的，这里就一行都找不到、光标一动不动——而屏幕上看得见的指针
+/// （九宫格的 `▶`、F3 送进去的那个会话）已经走了。那正是「屏幕和状态各说
+/// 各话」：底栏念着 A，`n` 开在 A，人却在 B 里。
+///
+/// **找到了就把那个组展开**，而不是退而求其次去选它的组头。两条理由：
+///
+/// - 组头行上 `selected_session()` 是 `None`，于是 `Enter`/`s`/`u`/`d` 全都
+///   失去作用对象，底栏也不再写 `Enter`——用户明明正盯着那个会话（放大的
+///   那一屏、`▶` 指着的那一格），屏幕却说「这里没有选中的会话」。折叠是一个
+///   显示偏好，不该把这几个键吃掉。
+/// - 走到这里的每一条路都是**用户按了键**：方向键挪格、F3 换会话、`x` 删组。
+///   「后台事件不许换项目」那条不变量管的是没有按键的那一半，展开一个组是
+///   这次按键看得见的后果，不是背着用户发生的。
+///
+/// 找不到（会话刚没了）就什么都不做——乱指一个比不动更糟。
 pub(crate) fn point_cursor_at_session(app: &mut App, id: u32) {
-    let at = app.rows.iter().position(|r| match r {
-        view::Row::Session(g, s) => app.groups[*g].sessions[*s].id == id,
-        view::Row::Header(_) => false,
-    });
-    if let Some(i) = at {
+    let Some((gi, si)) = app.groups.iter().enumerate().find_map(|(gi, g)| {
+        g.sessions
+            .iter()
+            .position(|s| s.id == id)
+            .map(|si| (gi, si))
+    }) else {
+        return;
+    };
+    if app.groups[gi].collapsed {
+        app.groups[gi].collapsed = false;
+        app.rows = view::flatten(&app.groups);
+    }
+    if let Some(i) = app
+        .rows
+        .iter()
+        .position(|r| *r == view::Row::Session(gi, si))
+    {
         app.list_state.select(Some(i));
     }
 }
@@ -1311,23 +1348,26 @@ pub(crate) fn point_cursor_at_session(app: &mut App, id: u32) {
 /// 守卫：**焦点指着的那一格，不属于光标此刻所在的项目时，什么都不做。**
 ///
 /// 说清楚这条判据**实际**回答的是什么，别把它读成更大的承诺：它问的是
-/// 「两个指针指的是不是同一个项目」，不是「焦点是不是陈旧的」。这两个问题
-/// 在这里恰好可以互相替代，因为**分歧只有一种来源**——焦点动不了的那些落点
-/// （见 `grid::focus_first_of_current_group`）：`Tab`/数字键走到一个没有活
-/// 会话的项目、`p` 刚摆上一个新项目、`home_view` 因为光标停在组头或已停止
-/// 会话上而回落到第 0 格。方向键那条路不经过这里（它永远两个一起挪），
-/// 所以走到这个函数时若两个指针不一致，那就是上面那几种情况之一，`focus`
-/// 指的是**上一个**项目。
+/// 「两个指针指的是不是同一个项目」，不是「焦点是不是陈旧的」。走到这里
+/// 时两者不一致，来源有两类：
+///
+/// - **焦点动不了的那些落点**（见 `grid::first_tile_of_current_group`）：
+///   `Tab`/数字键走到一个没有活会话的项目、`p` 刚摆上一个新项目、
+///   `home_view` 因为当前项目在九宫格里一个格子都没有而回落到第 0 格。
+///   这几种情况下 `focus` 指的是**上一个**项目，判光标赢就是对的。
+/// - **下标平移**：另一个 dct 窗口 prune 掉一个会话之后，格子整体前移，
+///   `focus` 这个下标不再指着原来那一格。这条守卫**盖不住**它——它只比
+///   「两个指针是不是同一个项目」，平移到同项目的另一格照样放行，而画在
+///   屏幕上的 `▶` 可能已经落到别的项目的格子上了。那是这一版之前就有的
+///   老问题（`Enter` 放大的是漂过去的那一格），明确不在射程内，也没在
+///   这一版里修。
+///
+/// 方向键那条路不经过这里（它永远两个一起挪），所以上面两类之外没有第三类。
 ///
 /// 一旦不一致，这条判据一律**判光标赢**。这是对的，但理由不是「光标更正确」，
 /// 而是它更**耐久**：`refresh_rows` 是按身份（锚点）把光标找回原位的，而对
 /// `focus` 只做了一次下标夹取（`app.rs` 里 `min(grid_last)`）。会话增删导致
 /// 下标平移时，光标还指着原来那个东西，`focus` 已经指到别的格子上去了。
-///
-/// 这也意味着它**不管**下标平移本身：另一个 dct 窗口 prune 掉一个会话之后，
-/// 画在屏幕上的 `▶` 可能已经落在别的项目的格子上，而底栏是对的——那时候
-/// `Enter` 放大的是漂过去的那一格。那是这一版之前就有的老问题，不在这条
-/// 守卫的射程内，也没在这一版里修。
 ///
 /// 判据**不能**换成「这个组有没有活格子」（曾经就是那么写的）。两个问题只在
 /// 一种场景下答案相同，往两个方向都会岔开，而且两边都咬人：
@@ -1961,6 +2001,67 @@ mod tests {
 
         let other = vec![d.path().join("另一个").display().to_string()];
         assert!(projects_changed(&mine, &other), "真换了就得认");
+    }
+
+    /// **折叠的组里也指得到会话。**
+    ///
+    /// 折叠的组一行会话都不贡献（`view::flatten`），所以只在 `rows` 里搜的
+    /// 实现会一无所获、光标一动不动——而调用方（方向键、F3、`x`）已经把人
+    /// 送进那个会话/那一格了。结果就是底栏念着 A、`▶` 在 B，`n` 开进 A。
+    #[test]
+    fn pointing_at_a_session_inside_a_collapsed_group_opens_that_group() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_at(1, "/w/a"), sess_at(2, "/w/b")]);
+        // 光标停到 b 的组头上，把 b 折起来
+        app.list_state.select(Some(2));
+        toggle_collapse(&mut app);
+        assert!(app.groups[1].collapsed, "前提：b 是折叠的");
+        // 回到 a
+        app.list_state.select(Some(0));
+        assert!(app.current_dir().ends_with("a"), "前提：当前项目是 a");
+
+        point_cursor_at_session(&mut app, 2);
+
+        assert!(
+            app.current_dir().ends_with("b"),
+            "当前项目必须跟着走到 b：{}",
+            app.current_dir().display()
+        );
+        assert_eq!(
+            app.selected_session().map(|s| s.id),
+            Some(2),
+            "而且要真的停在那个会话上——停在组头上的话 Enter/s/u/d 全没了对象"
+        );
+        assert!(!app.groups[1].collapsed, "指进去就得展开，不然那一行不存在");
+    }
+
+    /// `Tab` 落在**组头**上是设计（spec 规则 3），所以「`Tab` 到 B 再按 `g`」
+    /// 是日常路径。`home_view` 的九宫格分支要是在组头上直接回落第 0 格，
+    /// 第一帧 `▶` 就在 A 的格子上，而底栏念的是 B——`Enter`/`i`/`s`/`u`/`d`
+    /// 作用在 A，`n`/`x` 作用在 B，其中两个键不可撤销。
+    #[test]
+    fn entering_the_grid_from_a_header_lands_on_that_project_first_tile() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![
+            sess_at(1, "/w/a"),
+            sess_at(2, "/w/b"),
+            sess_at(3, "/w/b"),
+        ]);
+        app.view_mode = ViewMode::Grid;
+        // 行：[组头 a, 1, 组头 b, 2, 3]——`Tab` 一下落在 b 的组头上
+        jump_project(&mut app, 1);
+        assert!(app.current_dir().ends_with("b"), "前提：当前项目是 b");
+        assert!(app.selected_session().is_none(), "前提：光标在组头上");
+
+        let View::Grid { focus, .. } = home_view(&app) else {
+            panic!("九宫格模式下该回九宫格");
+        };
+
+        assert_eq!(
+            app.grid_sessions()[focus].dir,
+            "/w/b",
+            "焦点必须落在当前项目的第一格，不是第 0 格"
+        );
     }
 
     /// Important (a)/(b) 回归点，UI 这一侧：`explained_failure` 缓存必须在
