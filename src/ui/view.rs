@@ -1270,6 +1270,19 @@ mod tests {
         }
     }
 
+    /// 光标停在一个**拿得掉**的组上（pinned 且一个会话都没有）。
+    ///
+    /// 上面两档都是 `can_remove: false`，于是 `idle_help` 里那两处
+    /// `("x", RemoveProject)` 从来没被任何守卫扫到过——把它们写成中文
+    /// 也是一路绿灯。这一档专门为它们而设。
+    fn on_a_removable_group() -> HelpCtx {
+        HelpCtx {
+            selected: None,
+            can_remove: true,
+            can_switch_project: true,
+        }
+    }
+
     /// 底栏按键表的**键名列里不许出现汉字**，而且两种语言下必须一模一样。
     ///
     /// 为什么要单独一条：一条提示有两半，说明那半走 `text()`，`i18n` 的
@@ -1344,7 +1357,7 @@ mod tests {
         // `View` 没有 `Debug`（里面挂着 `ListState` 之类），失败信息里用下标
         // 指回上面那张表就够了——表是按顺序写死的。
         for (i, v) in views.iter().enumerate() {
-            for ctx in [on_a_session(), on_a_header()] {
+            for ctx in [on_a_session(), on_a_header(), on_a_removable_group()] {
                 let en: Vec<&str> = idle_help(v, Lang::En, ctx)
                     .iter()
                     .map(|it| it.key)
@@ -2574,6 +2587,41 @@ mod tests {
             g[0].parent,
             crate::ui::widgets::short_path(&tmp.path().display().to_string())
         );
+    }
+
+    /// **同一个目录的两种拼法必须落进同一个组。**
+    ///
+    /// 用户从符号链接进项目、会话却是用真实路径建的（macOS 上 `/tmp` →
+    /// `/private/tmp` 是现成的例子），字面比较会把它们劈成两个组：看板上多
+    /// 一行同名项目，各自领着一半会话，而用户看不出任何原因。
+    ///
+    /// 上面那条 `display_name_and_parent_…` 盖不住它——它只有一个会话，
+    /// 一个会话怎么分都是一个组。这条要的是**两条拼法各带一个会话**。
+    /// （这份覆盖在改成分组模型时被一起删掉了，这里补回来。）
+    #[test]
+    fn two_spellings_of_one_directory_land_in_a_single_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("proj");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let all = vec![
+            si(1, &real.display().to_string(), "claude"),
+            si(2, &link.display().to_string(), "claude"),
+        ];
+        let g = group_sessions(&all, &[], &BTreeMap::new());
+
+        assert_eq!(g.len(), 1, "两种拼法指的是同一个项目，不能劈成两组");
+        assert_eq!(
+            g[0].sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "两个会话都要归在这一个组底下"
+        );
+        // pinned 那一半同样要认得出：pin 的是链接、会话是用真实路径建的
+        let g = group_sessions(&all, &[link.display().to_string()], &BTreeMap::new());
+        assert_eq!(g.len(), 1, "pin 的拼法跟会话的拼法不同，也是同一个项目");
+        assert!(g[0].pinned);
     }
 
     fn grp(dir: &str, ids: &[u32]) -> ProjectGroup {

@@ -107,6 +107,93 @@ fn create_with_remember_records_the_profile() {
     ));
 }
 
+/// **这一版的招牌功能，端到端跑一遍：每个项目各记各的 agent。**
+///
+/// 单测（`projects::Store` 那条）只盖到 store 本身，而 `profiles_flow` 里
+/// 原有的那条只用了**一个**目录——一个目录分不出「按项目记」和「记一个全局
+/// 值」，因为 `last_profile_for` 找不到项目记录时会退回那个全局兜底，两种
+/// 实现给的答案一模一样。于是把 `daemon.rs` 里那一行改成往一个固定的假目录
+/// 记账（也就是「按项目记」彻底失效），全部 17 个测试二进制照样全绿。
+///
+/// 两个目录、两个 agent，才问得出这个问题。
+#[test]
+fn two_projects_each_keep_their_own_agent_over_the_wire() {
+    use dct::profile::Profile;
+    use dct::session::SessionManager;
+    use std::sync::Arc;
+
+    // 用 `cat` 冒充第二个 agent：内置 profile 里只有 `shell` 一定装得上，
+    // 而这条测试的全部意义就是**两个不同的名字**。非 agent，所以不要求 git 仓库。
+    let fake = Profile {
+        name: "profiles-flow-fake".into(),
+        command: vec!["cat".into()],
+        is_agent: false,
+        idle_pattern: None,
+        busy_pattern: None,
+        error_pattern: None,
+        env: Default::default(),
+        secret: None,
+        install: None,
+        headless: None,
+        api: None,
+        label: Default::default(),
+        note: Default::default(),
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    let sock = home.path().join("daemon.sock");
+    let mgr = Arc::new(SessionManager::new());
+    mgr.register_profile(fake);
+    let s = sock.clone();
+    std::thread::spawn(move || {
+        let _ = dct::daemon::run_with_manager(&s, mgr);
+    });
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut c = dct::client::Client::connect(&sock).unwrap();
+
+    let a = home.path().join("proj-a");
+    let b = home.path().join("proj-b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+
+    for (dir, profile) in [(&a, "shell"), (&b, "profiles-flow-fake")] {
+        match c
+            .call(Request::Create {
+                dir: dir.display().to_string(),
+                profile: profile.into(),
+                remember: true,
+            })
+            .unwrap()
+        {
+            Response::Created { .. } => {}
+            other => panic!("{profile} 建会话失败：{other:?}"),
+        }
+    }
+
+    let last = |c: &mut dct::client::Client, d: &std::path::Path| match c
+        .call(Request::LastProfile {
+            dir: d.display().to_string(),
+        })
+        .unwrap()
+    {
+        Response::LastProfile(x) => x,
+        other => panic!("预期 LastProfile，实际 {other:?}"),
+    };
+
+    // 两条断言缺一不可：只问 b 的话，全局兜底也会答对（b 是最后写的那个）。
+    assert_eq!(
+        last(&mut c, &a).as_deref(),
+        Some("shell"),
+        "先建的那个项目必须还记得自己的 agent，而不是被后一次覆盖"
+    );
+    assert_eq!(last(&mut c, &b).as_deref(), Some("profiles-flow-fake"));
+}
+
 #[test]
 fn create_without_remember_does_not_record() {
     // 「帮你装 CLI」开的那个 shell 会话不能变成「上次用的 agent」——

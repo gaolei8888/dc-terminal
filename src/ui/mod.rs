@@ -3138,9 +3138,32 @@ mod tests {
     /// false，`Tab` 压根没进候选表，于是 `!contains("Tab换项目")` 无论
     /// `board_keys` 怎么改都是绿的——这条断言本来要盯的是那条上限，
     /// 用单项目 fixture 就变成了一句永真的话。
+    ///
+    /// **两种语言都要数键。** 中文那几条字面（`i回一句`…）只在 `Lang::Zh`
+    /// 下成立，英文标签一旦变长（`i reply once` 比 `i回一句` 宽 5 列），
+    /// 80 列上会被 `fit_help` 悄悄丢掉一条，而整套测试全绿。所以除了那几条
+    /// 字面，再直接数一遍两种语言下真正画出来的条数——中文这一行在 80 列上
+    /// 正好占满 39 列的可用宽度，一列余量都没有。
     #[test]
     fn the_grid_keeps_its_own_key_on_screen_at_eighty_columns() {
         use ratatui::backend::TestBackend;
+
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let (mut app, _dir) = app_with_two_projects(View::grid(0));
+            app.lang = lang;
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let (_, _, cols) = bar_widths(80 - 2);
+            let keys: Vec<&str> = widgets::fit_help(&bar_keys(&app, cols as usize), cols as usize)
+                .iter()
+                .map(|i| i.key)
+                .collect();
+            assert_eq!(
+                keys.len(),
+                4,
+                "{lang:?} 下 80 列放不下九宫格那四条：{keys:?}"
+            );
+        }
 
         let (mut app, _dir) = app_with_two_projects(View::grid(0));
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();

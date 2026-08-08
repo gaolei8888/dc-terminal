@@ -763,6 +763,10 @@ mod tests {
         assert!(s.contains("Mouse"));
     }
 
+    /// `Projects` 的回程形状同样是契约：`pinned` 是这一版新加的字段，旧守护
+    /// 进程回的 JSON 里没有它。跟上面两条一样钉在 `PROTOCOL_VERSION` 上——
+    /// 光钉一个裸字符串的话，谁把这个变体改了形状、只顺手更新这里的期望值，
+    /// 就能一路绿灯地把版本号留在原地，而那正是 2026-08-05 那次事故的形状。
     #[test]
     fn projects_response_carries_both_lists() {
         let r = Response::Projects {
@@ -770,11 +774,10 @@ mod tests {
             pinned: vec!["/b".into()],
         };
         let s = serde_json::to_string(&r).unwrap();
-        assert_eq!(s, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#);
-    }
-
-    #[test]
-    fn protocol_version_was_bumped_for_the_project_grouping_change() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(
+            (PROTOCOL_VERSION, s.as_str()),
+            (6, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
     }
 }
