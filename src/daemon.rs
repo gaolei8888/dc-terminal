@@ -224,7 +224,13 @@ fn handle(
                 .collect();
             Ok(Response::Profiles { entries, warnings })
         }
-        Request::Projects => Ok(Response::Projects(recover(store.lock()).list())),
+        Request::Projects => {
+            let st = recover(store.lock());
+            Ok(Response::Projects {
+                recent: st.list(),
+                pinned: st.pinned(),
+            })
+        }
         Request::Create {
             dir,
             profile,
@@ -253,7 +259,7 @@ fn handle(
                 // remember=false 是「帮你装 CLI」那条路径：它开的 shell 会话
                 // 不是用户选的 agent，记了下次按 n 会掉进命令行。
                 if remember {
-                    st.set_last_profile(&profile);
+                    st.set_last_profile_for(std::path::Path::new(&dir), &profile);
                 }
             }
             r
@@ -282,9 +288,17 @@ fn handle(
         Request::DeleteSecret { profile } => recover(secrets.lock())
             .remove(&profile)
             .map(|_| Response::Ok),
-        Request::LastProfile => Ok(Response::LastProfile(
-            recover(store.lock()).last_profile().map(str::to_string),
+        Request::LastProfile { dir } => Ok(Response::LastProfile(
+            recover(store.lock()).last_profile_for(std::path::Path::new(&dir)),
         )),
+        Request::PinProject { dir } => {
+            recover(store.lock()).pin(std::path::Path::new(&dir));
+            Ok(Response::Ok)
+        }
+        Request::UnpinProject { dir } => {
+            recover(store.lock()).unpin(std::path::Path::new(&dir));
+            Ok(Response::Ok)
+        }
         // 永远不失败：没有解释（没配后端、还没算完、算失败了）跟「问不到」
         // 是同一件事，界面不用区分，统一显示今天就有的那句失败提示。
         Request::Explanation { id } => Ok(Response::Explanation(mgr.explanation(id))),

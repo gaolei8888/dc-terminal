@@ -78,17 +78,6 @@ impl Store {
         self.recent.clone()
     }
 
-    pub fn last_profile(&self) -> Option<&str> {
-        self.last_profile.as_deref()
-    }
-
-    /// 记一笔「上次用的 agent」。跟 `touch()` 一样立即落盘——守护进程没有
-    /// 干净关闭的钩子，内存里的改动不落盘就等于没发生过。
-    pub fn set_last_profile(&mut self, name: &str) {
-        self.last_profile = Some(name.to_string());
-        self.save();
-    }
-
     /// 记一笔：去重、提到最前、截断、落盘。
     pub fn touch(&mut self, dir: &Path) {
         let key = key_of(dir);
@@ -263,16 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn last_profile_survives_reload() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = tmp.path().join("projects.json");
-        let mut s = Store::load(&f);
-        s.set_last_profile("kimi");
-        drop(s);
-        assert_eq!(Store::load(&f).last_profile(), Some("kimi"));
-    }
-
-    #[test]
     fn old_file_without_last_profile_still_loads() {
         // 已经在用 dct 的人，projects.json 里没有这个字段
         let tmp = tempfile::tempdir().unwrap();
@@ -280,7 +259,7 @@ mod tests {
         std::fs::write(&f, r#"{"recent":["/a"]}"#).unwrap();
         let s = Store::load(&f);
         assert_eq!(s.list(), vec!["/a".to_string()]);
-        assert_eq!(s.last_profile(), None);
+        assert_eq!(s.last_profile_for(tmp.path()), None);
     }
 
     #[test]

@@ -31,7 +31,13 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 ///
 /// 5 = 多了 `Request::Scroll` / `Request::Mouse` / `Response::Scrolled`，
 /// `Response::Screen` 加了 `scroll`（带 `#[serde(default)]`，旧 JSON 照样能解）。
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// 6 = `LastProfile` 从没有字段的单例变体换成了带 `dir` 的——记忆是按项目
+/// 分的，一个全局值会让你在 A 项目按 `n` 开出 B 项目上次用的那个 agent。
+/// 同时多了 `Request::PinProject` / `Request::UnpinProject`，
+/// `Response::Projects` 从 `Vec<String>` 换成了带 `recent` / `pinned`
+/// 两个具名字段的结构体。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +187,20 @@ pub enum Request {
         lang: crate::i18n::Lang,
     },
     Projects,
+    /// 这个项目上次用的 agent。**必须带目录**：记忆是按项目分的，
+    /// 一个全局值会让你在 A 项目按 `n` 开出 B 项目上次用的那个 agent。
+    LastProfile {
+        dir: String,
+    },
+    /// 把一个项目摆上看板（哪怕它一个会话都没有）。
+    PinProject {
+        dir: String,
+    },
+    /// 从看板上拿掉一个项目。只对没有会话的项目有意义，
+    /// 「有没有会话」由界面判断，daemon 不管——它不知道界面正在显示什么。
+    UnpinProject {
+        dir: String,
+    },
     SetSecret {
         profile: String,
         value: String,
@@ -188,7 +208,6 @@ pub enum Request {
     DeleteSecret {
         profile: String,
     },
-    LastProfile,
     VerifySecret {
         profile: String,
         value: String,
@@ -257,6 +276,9 @@ impl std::fmt::Debug for Request {
             Request::Diff { id } => f.debug_struct("Diff").field("id", id).finish(),
             Request::Profiles { lang } => f.debug_struct("Profiles").field("lang", lang).finish(),
             Request::Projects => write!(f, "Projects"),
+            Request::LastProfile { dir } => write!(f, "LastProfile {dir}"),
+            Request::PinProject { dir } => write!(f, "PinProject {dir}"),
+            Request::UnpinProject { dir } => write!(f, "UnpinProject {dir}"),
             Request::SetSecret { profile, .. } => f
                 .debug_struct("SetSecret")
                 .field("profile", profile)
@@ -266,7 +288,6 @@ impl std::fmt::Debug for Request {
                 .debug_struct("DeleteSecret")
                 .field("profile", profile)
                 .finish(),
-            Request::LastProfile => write!(f, "LastProfile"),
             Request::VerifySecret { profile, .. } => f
                 .debug_struct("VerifySecret")
                 .field("profile", profile)
@@ -323,7 +344,10 @@ pub enum Response {
         /// 报码不报句子——理由同 `ErrorCode`。
         warnings: Vec<WarningCode>,
     },
-    Projects(Vec<String>),
+    Projects {
+        recent: Vec<String>,
+        pinned: Vec<String>,
+    },
     /// 抹掉了几个。报数字而不是 `Ok`：用户敲 `dct prune` 想知道的正是
     /// 「清掉了多少」，而「一个都没有」和「清掉了 5 个」要说两句不同的话。
     Pruned(u32),
@@ -606,7 +630,9 @@ mod tests {
             Request::DeleteSecret {
                 profile: "p".into(),
             },
-            Request::LastProfile,
+            Request::LastProfile { dir: "d".into() },
+            Request::PinProject { dir: "d".into() },
+            Request::UnpinProject { dir: "d".into() },
             Request::VerifySecret {
                 profile: "p".into(),
                 value: "v".into(),
@@ -633,8 +659,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                5,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
+                6,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -658,7 +684,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                5,
+                6,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -735,5 +761,20 @@ mod tests {
         };
         let s = format!("{req:?}");
         assert!(s.contains("Mouse"));
+    }
+
+    #[test]
+    fn projects_response_carries_both_lists() {
+        let r = Response::Projects {
+            recent: vec!["/a".into()],
+            pinned: vec!["/b".into()],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#);
+    }
+
+    #[test]
+    fn protocol_version_was_bumped_for_the_project_grouping_change() {
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 }

@@ -1135,7 +1135,11 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
             // 大写 N 一定要看一眼选择器，不查上次用的是谁；
             // 小写 n 才去问 daemon 上次记的是哪个 agent。
             let last = if code == KeyCode::Char('n') {
-                match app.client().and_then(|c| c.call(Request::LastProfile)) {
+                let dir = app.current_dir.display().to_string();
+                match app
+                    .client()
+                    .and_then(|c| c.call(Request::LastProfile { dir }))
+                {
                     Ok(Response::LastProfile(l)) => l,
                     _ => None,
                 }
@@ -1190,7 +1194,9 @@ pub(crate) fn open_project_picker(app: &mut App) {
     // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
     // 自己从来没开过项目。
     match app.client().and_then(|c| c.call(Request::Projects)) {
-        Ok(Response::Projects(mut all)) => {
+        Ok(Response::Projects {
+            recent: mut all, ..
+        }) => {
             // 全新守护进程列表是空的，补上启动目录，
             // 保证第一次用也不会看到空列表。
             let start = app.start_dir.display().to_string();

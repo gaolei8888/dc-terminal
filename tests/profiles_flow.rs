@@ -102,7 +102,7 @@ fn create_with_remember_records_the_profile() {
     .unwrap();
 
     assert!(matches!(
-        c.call(Request::LastProfile).unwrap(),
+        c.call(Request::LastProfile { dir: dir.display().to_string() }).unwrap(),
         Response::LastProfile(Some(ref n)) if n == "shell"
     ));
 }
@@ -123,7 +123,10 @@ fn create_without_remember_does_not_record() {
     .unwrap();
 
     assert!(matches!(
-        c.call(Request::LastProfile).unwrap(),
+        c.call(Request::LastProfile {
+            dir: dir.display().to_string()
+        })
+        .unwrap(),
         Response::LastProfile(None)
     ));
 }

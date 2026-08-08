@@ -9,7 +9,7 @@ fn canon(p: &std::path::Path) -> String {
 
 fn projects(c: &mut Client) -> Vec<String> {
     match c.call(Request::Projects).unwrap() {
-        Response::Projects(v) => v,
+        Response::Projects { recent, .. } => recent,
         other => panic!("预期 Projects，实际 {other:?}"),
     }
 }
