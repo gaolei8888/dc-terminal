@@ -168,6 +168,48 @@ pub(crate) fn short_path(p: &str) -> String {
     }
 }
 
+/// 底栏中段那块「我在哪个项目」的字，塞进 `cols` 列里。
+///
+/// 光写一个项目名是不够的：用户手上十来个项目里常有 `web` / `api` 这种
+/// 重名的目录，光看名字认不出是哪一个。但中段的宽度是固定的（见
+/// `mod.rs::PROJECT_COLS`），整条路径又几乎永远放不下——所以规则是
+/// **名字优先，父目录按「从近到远」一段一段往前贴，贴不下就停**：
+///
+/// - `("dc-terminal", "~/work/dc")` 16 列 → `dc/dc-terminal`
+/// - 同上 24 列 → `~/work/dc/dc-terminal`（整条都贴上了，补回 `~`）
+/// - `("a", "/tmp")` 16 列 → `/tmp/a`
+///
+/// 「贴不下就停」而不是「跳过这一段接着试更短的」：路径中间挖掉一段之后
+/// 读起来是**另一条真实存在的路径**，而用户没有任何线索知道那是拼出来的。
+///
+/// 名字自己就超宽时只截名字，一段父目录都不贴——这时候贴上去只会把名字
+/// 挤得更短，而名字才是用来认项目的那部分。
+///
+/// 传进来的 `parent` 必须是 `short_path` 过的显示串（`ProjectGroup.parent`
+/// 就是），**绝不能是 canon 过的路径**：macOS 上那会把用户敲的 `/tmp/x`
+/// 显示成 `/private/tmp/x`。
+pub(crate) fn project_label(name: &str, parent: &str, cols: usize) -> String {
+    if display_width(name) > cols {
+        return truncate(name, cols);
+    }
+    let comps: Vec<&str> = parent.split('/').filter(|s| !s.is_empty()).collect();
+    let absolute = parent.starts_with('/');
+    let mut best = name.to_string();
+    for n in 1..=comps.len() {
+        let mut cand = format!("{}/{}", comps[comps.len() - n..].join("/"), name);
+        // 整条父目录都贴上了，绝对路径的那个开头 `/` 也得补回来——
+        // 少了它 `/tmp/a` 会显示成 `tmp/a`，看着像个相对路径。
+        if n == comps.len() && absolute {
+            cand.insert(0, '/');
+        }
+        if display_width(&cand) > cols {
+            break;
+        }
+        best = cand;
+    }
+    best
+}
+
 /// 把底栏那张按键表折成不超过 `width` 列的若干行。
 ///
 /// 自己折而不是用 ratatui 的 `Wrap`：`Wrap` 在任何空白处断行，而按键表里
@@ -296,7 +338,9 @@ pub(crate) fn help_spans(items: &[&HelpItem]) -> Vec<Span<'static>> {
             ));
             spans.push(Span::raw(" "));
         }
-        spans.push(Span::raw(it.label.to_string()));
+        // 走 `label()` 而不是 `label`：动态标签（`n 新建 claude`）顶掉词条表
+        // 那一条，量宽度的 `item_width` 走的也是它，两处必须是同一串字符。
+        spans.push(Span::raw(it.label().to_string()));
     }
     spans
 }
@@ -308,6 +352,50 @@ mod tests {
 
     fn items(pairs: &[(&'static str, Key)]) -> Vec<HelpItem> {
         help_items(pairs, Lang::Zh)
+    }
+
+    /// 中段那 16 列要用满：名字放得下就把父目录一段一段贴回去，
+    /// 而不是让一个短名字后面拖着一大片空白。用户手上重名的目录很多
+    /// （`web`/`api`/`docs`），光一个名字认不出是哪一个。
+    #[test]
+    fn project_label_spends_the_budget_on_parent_context() {
+        assert_eq!(
+            project_label("dc-terminal", "~/work/dc", 16),
+            "dc/dc-terminal",
+            "16 列只贴得下最近的一段"
+        );
+        assert_eq!(
+            project_label("dc-terminal", "~/work/dc", 24),
+            "~/work/dc/dc-terminal",
+            "放得下就把整条贴回去"
+        );
+        // 绝对路径整条贴回去时，开头那个 `/` 得补上，否则看着像相对路径
+        assert_eq!(project_label("a", "/tmp", 16), "/tmp/a");
+        // 没有父目录（根目录下的项目）就只剩名字
+        assert_eq!(project_label("a", "", 16), "a");
+    }
+
+    /// 名字自己就超宽时只截名字：贴父目录只会把用来认项目的那部分挤得更短。
+    #[test]
+    fn project_label_truncates_the_name_rather_than_the_parent() {
+        // `truncate` 补的那个 `…` 会让结果比 max 多出一列（既有行为），
+        // 中段留着 2 列间隔正好吃得下
+        assert_eq!(
+            project_label("a-very-long-project", "~/work", 10),
+            "a-very-lon…"
+        );
+        // 中文项目名一个字两列，按显示宽度截，不能按字符数
+        assert_eq!(project_label("一二三四五六", "~/w", 5), "一二…");
+    }
+
+    /// 路径中间不许挖空。`~/work/dc/x` 放不下时给出 `dc/x`，绝不能是
+    /// `~/dc/x`——后者是**另一条真实存在的路径**，而用户没有任何线索
+    /// 知道那是拼出来的。
+    #[test]
+    fn project_label_never_elides_the_middle_of_a_path() {
+        let s = project_label("x", "~/work/dc", 8);
+        assert_eq!(s, "dc/x");
+        assert!(!s.starts_with("~/"), "开头那段贴不下就整段不贴：{s}");
     }
 
     /// 底栏只有一行，放不下的只能丢——但那扇能找回它们的门（尾巴上的
@@ -337,18 +425,18 @@ mod tests {
     fn fit_help_keeps_the_important_keys_first() {
         let all = items(&[
             ("↑↓", Key::Select),  // 7 列
-            ("Enter", Key::Open), // 10 列
+            ("Enter", Key::Open), // 12 列
             ("n", Key::New),      // 6 列
             ("?", Key::MoreKeys), // 3 列
         ]);
-        // 7 + 2 + 10 + 2 + 3 = 24 列：正好放得下前两条加尾巴，`n 新建` 放不下
-        let kept = fit_help(&all, 24);
+        // 7 + 2 + 12 + 2 + 3 = 26 列：正好放得下前两条加尾巴，`n 新建` 放不下
+        let kept = fit_help(&all, 26);
         assert_eq!(kept.len(), 3);
         assert_eq!(kept[0].key, "↑↓");
         assert_eq!(kept[1].key, "Enter");
         assert_eq!(kept[2].key, "?");
         // 宽一点就该多露一个出来
-        assert_eq!(fit_help(&all, 32).len(), 4);
+        assert_eq!(fit_help(&all, 34).len(), 4);
     }
 
     /// 无论多窄，底栏都只有一行——这是这次改动的全部意义。

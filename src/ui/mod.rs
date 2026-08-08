@@ -866,23 +866,21 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
 /// 分岔，理由也一样。收在这里一次，就不会有「底栏按列表算、按键按格子算」
 /// 这种两边不一致。
 fn help_ctx(app: &App) -> view::HelpCtx {
-    // 九宫格不画已停止的会话，所以「屏幕上有没有东西」在两个视图里数的
-    // 不是同一件事——列表看有没有行（空项目组也是一行，`n` 有地方可去），
-    // 格子看有没有活着的会话。
-    let (has_sessions, cur) = match &app.view {
-        View::Grid { focus, .. } => {
-            let all = app.grid_sessions();
-            let cur = all.get(*focus).cloned();
-            (!all.is_empty(), cur)
-        }
-        _ => (!app.rows.is_empty(), app.selected_session().cloned()),
+    // 列表问光标停在哪一行——**停在组头上就是「没选中」**（`selected_session()`
+    // 自己就是这么定义的）。这一点是 `Enter 进会话` 写不写的唯一依据：组头行
+    // 上按 Enter 什么都不会发生，写出来就是屏幕上写着一个按不动的键。
+    let selected = match &app.view {
+        View::Grid { focus, .. } => app.grid_sessions().get(*focus).is_some(),
+        _ => app.selected_session().is_some(),
     };
     view::HelpCtx {
-        has_sessions,
-        selected: cur.map(|s| view::SelectedSession {
-            is_agent: s.is_agent,
-            state: s.state,
-        }),
+        selected,
+        // `x` 只拿得掉「pinned 且没有会话」的组，跟 `unpin_current` 的两条
+        // 守卫逐条对上——底栏说什么就得真能做到什么。
+        can_remove: app
+            .current_group()
+            .map(|g| g.pinned && g.sessions.is_empty())
+            .unwrap_or(false),
     }
 }
 
@@ -1530,6 +1528,39 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
 /// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
 const ESCAPE_HINT_COLS: u16 = 19;
 
+/// 底栏中段：当前项目占的列数。按显示宽度截断，CJK 项目名同样算两列。
+///
+/// 16 列是「放得下一个常见项目名 + 一两段父目录」跟「别把右段挤没」之间的
+/// 折中，怎么用满见 `widgets::project_label`。
+const PROJECT_COLS: u16 = 16;
+
+/// 右段无论如何要留的列数。
+///
+/// 28 = 英文那条滚动提示的完整宽度（`i18n::msg::scrolled_up`，
+/// "↑ Scrolled up 40 line(s) · press End to jump back down" 缩短之后的版本）。
+/// 它是右段里唯一「少一个字就没法用」的内容：按键表放不下的键在 `?` 后面
+/// 找得回来，普通消息还能折行，只有这一句既折不了（整句都是单空格，
+/// `wrap_help` 只认双空格断点）又必须读全——用户正翻在历史里，这句话是他
+/// 回到底部的唯一说明。由 `the_way_back_survives_a_narrow_terminal` 盯着。
+const ACTION_MIN_COLS: u16 = 28;
+
+/// 底栏三段各占多少列（`inner` 是去掉左右边框之后的可用宽度）。
+///
+/// 抽成纯函数是因为这个数要用两遍：一遍算「右段折出几行」（底栏高度按它留），
+/// 一遍真的切布局。两处各算一次的话，宽度算法一旦分叉，留的行和画的行就对
+/// 不上，句尾会被静默吃掉。
+///
+/// 让位顺序是**中段先让、左段永不让**：左段是用户卡住时唯一的出路，右段至少
+/// 得留下那扇 `?` 门。注意这里让的是**终端太窄**，跟「消息/断连提示能不能盖
+/// 掉中段」是两码事——后者的答案永远是不能，那件事由布局本身保证：消息只画
+/// 在右段里。
+fn bar_widths(inner: u16) -> (u16, u16, u16) {
+    let escape = (ESCAPE_HINT_COLS + 2).min(inner); // +2 是和中段之间的间隔
+    let rest = inner - escape;
+    let project = (PROJECT_COLS + 2).min(rest.saturating_sub(ACTION_MIN_COLS));
+    (escape, project, rest - project)
+}
+
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw(f: &mut Frame, app: &mut App) {
@@ -1543,6 +1574,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     //
     // 按键表和消息走两条路：按键表是一排结构化的条目（键名要加粗、放不下的
     // 按优先级丢，永远一行），消息是一句人话（一个字都不能丢，宁可折行）。
+    //
+    // 右段可用宽度先算出来：`bar_keys` 要拿它决定 `n` 那条写不写得下 agent 名。
+    // 跟下面切 `bar` 时算的是同一个数（同一个函数），不一致的话，按高度预留的
+    // 行数就对不上真正折出来的行数，末尾几个键照样会被吃掉。
+    let (_, _, action_cols) = bar_widths(f.area().width.saturating_sub(2)); // -2 是块的左右边框
+    let help_cols = action_cols as usize;
     let (bar, style) = if !app.connected {
         (
             BarContent::Text(crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string()),
@@ -1559,10 +1596,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         };
         match scroll_hint {
             Some(hint) => (BarContent::Text(hint), Style::default()),
-            None => (
-                BarContent::Keys(idle_help(&app.view, app.lang, help_ctx(app))),
-                Style::default(),
-            ),
+            None => (BarContent::Keys(bar_keys(app, help_cols)), Style::default()),
         }
     } else if app.message.error {
         (
@@ -1573,13 +1607,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         (BarContent::Text(app.message.text.clone()), Style::default())
     };
 
-    // 右段可用宽度。跟下面切 `bar` 时算的是同一个数——不一致的话，按高度
-    // 预留的行数就对不上真正折出来的行数，末尾几个键照样会被吃掉。
-    let help_cols = f
-        .area()
-        .width
-        .saturating_sub(2 + ESCAPE_HINT_COLS + 2) // 块的左右边框 + 左段及其间隔
-        as usize;
     // 按键表永远一行：多一行底栏就多吃一行内容区，而九宫格在 80×24 下只差
     // 一行就跌破 `grid.rs` 的 `MIN_ROWS`，整屏换成一句「窗口太小」。放不下的
     // 键落进 `?` 浮层，不再挤占版面（见 `widgets::fit_help`）。
@@ -1648,33 +1675,25 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
     }
 
-    // 当前项目放在边框标题里，框内只留一行字。中文是双宽字符，
-    // 「当前项目：~/work/dc/dc-terminal」加上按键表在 80 列终端里放不下同一行，
-    // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
-    //
-    // 写的是组的 `name`（来自**未归一化**的原始路径），不是 `current_dir()`
-    // ——后者是分组键，已经 canon 过，`/tmp/x` 会显示成 `/private/tmp/x`：
-    // 归一化只用于比较，永不用于显示。底栏的正式改造在 Task 7。
-    let project = app
-        .current_group()
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| short_path(&app.start_dir.display().to_string()));
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        "{}：{}",
-        crate::i18n::text(crate::i18n::Key::CurrentProject, app.lang),
-        project
-    ));
+    // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
+    // 要的是「我在哪」和「这里能干什么」挨在一起读。项目现在是框内的中段。
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(chunks[1]);
     f.render_widget(block, chunks[1]);
 
-    // 横向拆两段：左段是逃生键，永不让位；断连提示和消息只能吃掉右段。
+    // 横向拆三段，各有各的固定职责：**逃生键 / 当前项目 / 至多三个动作**。
+    // 前两段永不让位，只有第三段会被消息、断连提示、宽度不够替换掉。
     //
-    // 拆之前的写法是一整行按优先级二选一，于是「已切到 X」这类完全正常的
-    // 操作反馈会把整张按键表连同「q 退出」一起顶掉，而消息只在切视图时才清——
-    // 用户不知道怎么切视图正是他卡住的原因，于是退出提示永久消失。
-    // 拆成两段之后这件事在结构上不可能再发生。
+    // 拆之前是一整行按优先级二选一，于是「已切到 X」这类完全正常的操作反馈
+    // 会把整张按键表连同「q 退出」一起顶掉，而消息只在切视图时才清——用户
+    // 不知道怎么切视图正是他卡住的原因，于是退出提示永久消失。项目名后来
+    // 挂在边框标题上，同一句消息照样能盖掉它（标题只有一行，消息一长就顶
+    // 上去了），用户于是既不知道自己在哪，也不知道 `n` 会开在哪。
+    // 拆成三段之后这两件事在结构上都不可能再发生。
+    let (esc_w, project_w, _) = bar_widths(inner.width);
     let bar = Layout::horizontal([
-        Constraint::Length(ESCAPE_HINT_COLS + 2), // +2 是和右段之间的间隔
+        Constraint::Length(esc_w),
+        Constraint::Length(project_w),
         Constraint::Min(0),
     ])
     .split(inner);
@@ -1682,18 +1701,86 @@ fn draw(f: &mut Frame, app: &mut App) {
         Paragraph::new(escape_hint(&app.view, app.lang)).style(Style::default().fg(Color::Cyan)),
         bar[0],
     );
+    // 中段：当前项目。**永不让位。**
+    //
+    // 写的是组的 `name`/`parent`（来自**未归一化**的原始路径），不是
+    // `current_dir()`——后者是分组键，已经 canon 过，`/tmp/x` 会显示成
+    // `/private/tmp/x`：归一化只用于比较，永不用于显示。
+    let (name, parent) = match app.current_group() {
+        Some(g) => (g.name.clone(), g.parent.clone()),
+        // 一个组都没有（只可能是还没拉到会话列表的头一帧）：退回启动目录。
+        // 中段宁可写个稍后会被修正的地方，也不能空着——空着的那一帧里，
+        // 用户看不出 `n` 会把新会话开在哪。
+        None => (
+            app.start_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| app.start_dir.display().to_string()),
+            app.start_dir
+                .parent()
+                .map(|p| short_path(&p.display().to_string()))
+                .unwrap_or_default(),
+        ),
+    };
+    f.render_widget(
+        Paragraph::new(widgets::project_label(
+            &name,
+            &parent,
+            project_w.saturating_sub(2) as usize, // -2 是和右段之间的间隔
+        ))
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+        bar[1],
+    );
     // 折行而不是截断：截断会把句尾那几个键悄悄抹掉，而用户没有任何线索
     // 知道自己少看了几个键。折行用 `wrap_help` 而不是 ratatui 的 `Wrap`，
-    // 理由见那个函数——`Wrap` 会把「p 换项目」拆成行尾一个孤零零的 `p`。
+    // 理由见那个函数——`Wrap` 会把「Tab 换项目」拆成行尾一个孤零零的 `Tab`。
     //
     // 用上面按 `help_cols` 折好的那一份，不在这里重折：底栏高度就是按它
     // 的行数留的，两处各折一次的话，宽度算法一旦分叉，留的行和画的行就对
-    // 不上了。这条断言由 `the_bar_is_exactly_as_tall_as_the_help_it_holds` 盯着。
+    // 不上了。
     debug_assert_eq!(
-        help_cols, bar[1].width as usize,
+        help_cols, bar[2].width as usize,
         "预留底栏高度用的宽度必须跟真正画的宽度一致"
     );
-    f.render_widget(Paragraph::new(help_lines).style(style), bar[1]);
+    f.render_widget(Paragraph::new(help_lines).style(style), bar[2]);
+}
+
+/// 底栏右段这一帧的按键表，`n` 那一条带上这个项目上次用的 agent 名。
+///
+/// 抽出来是因为 `idle_help` 给的是**静态词条**（`&'static str` 的表），而
+/// agent 名是运行时才知道的——只能在这一层替换掉。看得见 agent 名是有用的：
+/// 按 `n` 到底会开出什么，用户不必先记住自己上次在这个项目里用的是谁。
+///
+/// `cols` 是右段的可用宽度：**agent 名放不下就不写**。让位的是一句说明的
+/// 后半截，不是一个键——三个键在任何宽度上都原样在场。这条区分是这次改造
+/// 的要点：一个**键**在 100 列上有、在 80 列上没有，用户就学不会这一行；
+/// 而 `n 新建` 后面少一个名字，他仍然知道 `n` 是新建，按下去还会弹选择器。
+fn bar_keys(app: &App, cols: usize) -> Vec<crate::i18n::HelpItem> {
+    let items = idle_help(&app.view, app.lang, help_ctx(app));
+    // 这个项目从没开过会话就只写 `n 新建`——按下去会弹 agent 选择器，
+    // 那正是该有的行为，所以不必编一个名字出来。
+    let Some(agent) = app.current_group().and_then(|g| g.last_profile.clone()) else {
+        return items;
+    };
+    let mut named = items.clone();
+    for it in named.iter_mut() {
+        if it.key == "n" {
+            // `n 新建 claude`——括号去掉，agent 名直接跟在后面。底栏每一列
+            // 都金贵，一对括号占两列却什么都没说。
+            it.label_owned = Some(format!("{} {}", it.label, agent));
+        }
+    }
+    if help_width(&named) <= cols {
+        named
+    } else {
+        items
+    }
+}
+
+/// 一排提示连着分隔符一共占几列。跟 `widgets::fit_help` 的算法必须一致——
+/// 一个说「放得下」另一个说「放不下」的话，多出来的那截会被右端静默截掉。
+fn help_width(items: &[crate::i18n::HelpItem]) -> usize {
+    items.iter().map(widgets::item_width).sum::<usize>() + 2 * items.len().saturating_sub(1)
 }
 
 /// 底栏右段这一帧要显示的东西。
@@ -2215,24 +2302,136 @@ mod tests {
         (app, dir)
     }
 
-    /// 80 列（最常见的下限）下右段只有 57 列，十来个键放不下。放不下的键
-    /// 落进 `?` 浮层，**留在屏幕上的必须是最要紧的那几个**：看得见、进得去、
-    /// 加上三个作用在选中会话上的动作。
+    /// 80 列（最常见的下限）下，右段那三条动作必须整整齐齐都在。
     ///
-    /// 这条盯的是排序：`idle_help` 里的顺序就是「谁先被丢」，把 `c 密钥`
-    /// 排到 `s 停止` 前面不会有任何编译错误，只会让 80 列终端上的用户看不到
-    /// 停止键。
+    /// 这条盯的是「三段各占多宽」这个预算：中段和左段是定死的，右段剩多少
+    /// 全看那两个常量。谁把 `PROJECT_COLS` 调大一点，80 列上第三个键就会
+    /// 被右端**静默**吃掉——不报错、不换行，只是没了。
     #[test]
-    fn the_keys_that_survive_eighty_columns_are_the_ones_that_matter() {
+    fn the_three_actions_all_fit_at_eighty_columns() {
+        use ratatui::backend::TestBackend;
+
+        // 记着 agent 名的项目是**更挤**的那一档（`n 新建 claude` 比
+        // `n 新建` 宽 7 列），窄终端上先崩的是它——所以这条按它测。
+        for agent in [None, Some("claude")] {
+            let (mut app, _dir) = app_with_one_agent_session(View::Board);
+            if let Some(a) = agent {
+                remember_agent(&mut app, a);
+            }
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let c = bar_text(&term);
+
+            for key in ["Enter进会话", "n新建", "Tab换项目", "?…"] {
+                assert!(c.contains(key), "{agent:?} 下「{key}」被截掉了：{c}");
+            }
+        }
+    }
+
+    /// 左段和中段永不让位：一条长消息、断连状态，都不能把「我在哪个项目」
+    /// 顶掉。老版本正是「已切到 X」这类消息把项目信息整个盖掉的。
+    ///
+    /// 断言的是**完整的显示串**（`/tmp/a`）而不只是项目名：`dir` 是 canon
+    /// 过的分组键，macOS 上那是 `/private/tmp/a`——中段一旦改成画 `dir`，
+    /// 这条就会红。
+    #[test]
+    fn the_project_segment_survives_a_long_message_and_a_disconnect() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _d) = app_with_one_agent_session(View::Board);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        app.message = "x".repeat(400).into();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(bar_text(&term).contains("/tmp/a"), "长消息不能盖掉项目名");
+
+        app.connected = false;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+        assert!(c.contains("/tmp/a"), "断连也不能盖掉项目名：{c}");
+        assert!(c.contains("q退出"), "断连也不能盖掉逃生键：{c}");
+    }
+
+    /// 右段硬上限 3 条动作 + 一个 `?`。终端再宽也不多塞——一行的内容随宽度
+    /// 变化本身就是不可预期的：用户在 80 列上学会的那一行，到 200 列上会
+    /// 多出几个键、位置全变。
+    #[test]
+    fn the_action_segment_never_exceeds_three_keys_plus_the_door() {
+        use ratatui::backend::TestBackend;
+
+        for w in [80u16, 120, 200] {
+            let (mut app, _d) = app_with_one_agent_session(View::Board);
+            let mut term = Terminal::new(TestBackend::new(w, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let items = idle_help(&app.view, app.lang, help_ctx(&app));
+            assert!(
+                items.len() <= 4,
+                "{w} 列下右段有 {} 条，超过 3 个动作 + ?",
+                items.len()
+            );
+        }
+    }
+
+    /// 光标停在组头上时不该写 `Enter 进会话`——按下去没有对象。
+    ///
+    /// 这条从 `help_ctx` 一路测到文案：`selected_session()` 在组头行上返回
+    /// `None`，`help_ctx` 得把它带下去，`board_keys` 才不会写那一条。中间
+    /// 任何一环用「有没有行」代替「有没有选中会话」，这条就会红。
+    #[test]
+    fn a_header_row_does_not_advertise_entering_a_session() {
+        let (mut app, _d) = app_with_one_agent_session(View::Board);
+        app.list_state.select(Some(0));
+        assert!(app.selected_session().is_none(), "第 0 行该是组头");
+        let items = idle_help(&app.view, app.lang, help_ctx(&app));
+        let joined = crate::i18n::help_text(&items);
+        assert!(!joined.contains("Enter"), "组头行上不写 Enter：{joined}");
+        assert!(joined.contains("n 新建"), "组头行上最该按的是它：{joined}");
+    }
+
+    /// `n` 那一条要带上这个项目上次用的 agent 名。按下去到底会开出什么，
+    /// 用户不该先去记自己上次在这个项目里用的是谁。
+    #[test]
+    fn the_new_key_names_the_agent_it_would_start() {
         use ratatui::backend::TestBackend;
 
         let (mut app, _dir) = app_with_one_agent_session(View::Board);
-        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        remember_agent(&mut app, "claude");
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
+        assert!(c.contains("n新建claude"), "`n` 该说清会开哪个 agent：{c}");
+    }
 
-        for key in ["↑↓选择", "Enter进入", "n新建", "s停止", "u回滚", "d改动"] {
-            assert!(c.contains(key), "按键表里的「{key}」被截掉了：{c}");
+    /// 给 `/tmp/a` 这个项目记上「上次用的是谁」，`n 新建 <agent>` 才有名字可写。
+    /// 键是**归一化后**的路径——`group_sessions` 就是拿它当分组键去查 `profiles` 的。
+    fn remember_agent(app: &mut App, name: &str) {
+        app.profiles.insert(
+            view::canon(Path::new("/tmp/a")).display().to_string(),
+            name.into(),
+        );
+        app.refresh_rows();
+    }
+
+    /// 三段的宽度预算：左段永不让位，右段至少留得下那扇门，中段是让位的
+    /// 那一个——但让的是**终端太窄**，不是让给消息。
+    #[test]
+    fn the_bar_gives_up_the_project_before_the_escape_hint_or_the_door() {
+        // 常见宽度：三段都拿到自己那份
+        assert_eq!(bar_widths(98), (21, 18, 59));
+        assert_eq!(bar_widths(78), (21, 18, 39));
+        // 55 列终端（`the_way_back_survives_a_narrow_terminal` 那一档）：
+        // 中段缩到只剩几列，好让右段完整放下那句「怎么回到底部」
+        assert_eq!(bar_widths(53), (21, 4, 28));
+        // 再窄下去中段整个让掉，左段和右段一列不动
+        let (esc, proj, act) = bar_widths(38);
+        assert_eq!(esc, 21, "逃生键永不让位");
+        assert_eq!(proj, 0, "窄到这份上，让的是中段");
+        assert_eq!(esc + proj + act, 38, "三段必须正好铺满，不能有空隙");
+        // 窄到荒谬也不能 panic、不能溢出
+        for w in [0u16, 1, 5, 20, 22, 25] {
+            let (e, p, a) = bar_widths(w);
+            assert_eq!(e + p + a, w, "{w} 列下三段加起来不等于总宽");
         }
     }
 
@@ -2249,7 +2448,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
 
-        for key in ["↑↓选择", "Enter进入", "s停止", "u回滚", "d改动"] {
+        for key in ["↑↓选择", "Enter进会话", "s停止", "u回滚", "d改动"] {
             assert!(!c.contains(key), "空看板上「{key}」按不动，不该写：{c}");
         }
         assert!(c.contains("n新建"), "空看板上唯一该按的键：{c}");
@@ -2293,22 +2492,22 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect();
         assert!(bold.contains('n'), "`n` 该是粗的：{bold:?}");
-        assert!(bold.contains('s'), "`s` 该是粗的：{bold:?}");
+        assert!(bold.contains('T'), "`Tab` 也该是粗的：{bold:?}");
         assert!(
             !bold.contains('新'),
             "只有键名该加粗，说明不该跟着粗：{bold:?}"
         );
     }
 
-    /// 底栏顶边所在的行号。顶边那一行写着「当前项目：」，找它就行。
+    /// 底栏顶边所在的行号。
+    ///
+    /// 找的是**最后一个**左上角 `┌`：屏幕上只有内容区和底栏两个带边框的块，
+    /// 底栏在下面。原来是找边框标题里的「当」字（「当前项目：…」），那个
+    /// 标题在本任务里被拆进框内的中段了。
     fn bar_top(term: &Terminal<ratatui::backend::TestBackend>) -> u16 {
         let buf = term.backend().buffer();
         (0..buf.area.height)
-            .find(|y| {
-                (0..buf.area.width)
-                    .filter_map(|x| buf.cell((x, *y)))
-                    .any(|c| c.symbol() == "当")
-            })
+            .rfind(|y| buf.cell((0, *y)).map(|c| c.symbol()) == Some("┌"))
             .expect("底栏顶边总该在屏幕上")
     }
 
@@ -2392,37 +2591,40 @@ mod tests {
         assert!(screen.contains("claude"), "格子该在屏幕上：{screen}");
     }
 
-    /// 终端够宽就该多露几个键出来。底栏恒为一行之后，宽度换来的不再是
-    /// 「少折一行」，而是「少丢几个键」——不这么用的话，160 列终端跟 80 列
-    /// 看到的是同样一小撮键，宽出来的一百列白白空着。
+    /// 底栏的内容**不随终端宽度变化**。
+    ///
+    /// 这条取代了老的 `a_wide_terminal_shows_more_keys`（那条要求 160 列比
+    /// 80 列多露几个键）。「宽了就多塞几个」听着像是把空间用满，实际后果是
+    /// 同一个键在 80 列上没有、在 160 列上有：用户在自己那台终端上学会的
+    /// 一行，换台机器就变了，而他没有任何线索知道为什么。现在多出来的宽度
+    /// 留白，键表恒定。
     #[test]
-    fn a_wide_terminal_shows_more_keys() {
+    fn the_bar_says_the_same_thing_at_every_width() {
         use ratatui::backend::TestBackend;
 
-        let mut counts = Vec::new();
-        for width in [80u16, 160] {
-            let (mut app, _dir) = App::test_app();
-            app.view = View::Board;
+        let mut seen: Option<Vec<&str>> = None;
+        for width in [80u16, 100, 160, 240] {
+            let (mut app, _dir) = app_with_one_agent_session(View::Board);
+            remember_agent(&mut app, "claude");
             let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
             term.draw(|f| draw(f, &mut app)).unwrap();
-            counts.push(
-                bar_text(&term).matches('…').count() + {
-                    let c = bar_text(&term);
-                    ["p换项目", "a看全部项目", "c密钥", "l设置", "N换agent"]
-                        .iter()
-                        .filter(|k| c.contains(**k))
-                        .count()
-                },
-            );
+            let (_, _, cols) = bar_widths(width - 2);
+            // 比的是**键**，不是整行文字：`n` 后面那个 agent 名放不下时会
+            // 让位，那是有意的（见 `bar_keys`）——让的是半句说明，不是一个键。
+            let keys: Vec<&str> = widgets::fit_help(&bar_keys(&app, cols as usize), cols as usize)
+                .iter()
+                .map(|i| i.key)
+                .collect();
+            match &seen {
+                None => seen = Some(keys),
+                Some(first) => assert_eq!(first, &keys, "{width} 列下键表变了"),
+            }
         }
-        assert!(
-            counts[1] > counts[0],
-            "160 列下该比 80 列多露几个键，实际 {counts:?}"
-        );
     }
 
-    /// 九宫格的按键表跟看板同一套规矩：留在屏幕上的是最要紧的那几个，
-    /// 其中 `i 回一句` 是这个视图独有的能力，不写就找不到。
+    /// 九宫格的按键表跟看板同一条上限，但候选键是它自己的：`i 回一句` 是这个
+    /// 视图独有的能力，不写就找不到；`Tab`/`x` 在这里根本没绑，写了就是教人
+    /// 按一个按不动的键。
     #[test]
     fn the_grid_keeps_its_own_key_on_screen_at_eighty_columns() {
         use ratatui::backend::TestBackend;
@@ -2432,8 +2634,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
 
-        for key in ["q退出", "方向键选格子", "Enter放大", "i回一句", "n新建"] {
+        for key in ["q退出", "Enter放大", "i回一句", "n新建", "?…"] {
             assert!(c.contains(key), "九宫格按键表里的「{key}」被截掉了：{c}");
+        }
+        for key in ["Tab换项目", "x移除"] {
+            assert!(!c.contains(key), "九宫格没绑「{key}」，不该写：{c}");
         }
     }
 
@@ -2719,8 +2924,7 @@ mod tests {
             c.contains("F3下一个会话"),
             "F3 是九宫格快速跳转的入口，提示里丢了就没人知道：{c}"
         );
-        assert!(c.contains("新建会话"), "还要说清新建会话怎么走：{c}");
-        assert!(!c.contains("u回滚"), "会话视图不能显示看板按键表：{c}");
+        assert!(!c.contains("n新建"), "会话视图不能显示看板按键表：{c}");
 
         // 看板视图：仍然显示看板的按键表。
         // 必须换一个全新的 TestBackend：ratatui 画宽字符（中文）时只写首个 cell，
@@ -2731,7 +2935,7 @@ mod tests {
         app.view = View::Board;
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
-        assert!(c.contains("u回滚"), "看板要显示自己的按键表：{c}");
+        assert!(c.contains("Tab换项目"), "看板要显示自己的按键表：{c}");
     }
 
     #[test]

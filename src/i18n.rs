@@ -92,7 +92,17 @@ pub enum Key {
     // —— 动作（底栏按键表用，也是设置页等处的通用词）——
     New,
     SwitchAgent,
+    /// `Tab` 的说明：在看板上已有的项目之间跳。**`p` 不是它**——见 `AddProject`。
     SwitchProject,
+    /// `p` 的说明：把一个看板上还没有的项目摆上来。
+    ///
+    /// 跟 `SwitchProject` 分开是因为它们真的是两件事：`Tab` 在已有的组之间
+    /// 走，`p` 往看板上加一个新的。共用「换项目」那句话的年代里，`p` 是唯一
+    /// 的换项目手段；`Tab` 出现之后再写「换项目」，用户会以为按 `p` 能一步
+    /// 换过去，而实际弹出来的是一个选择器。
+    AddProject,
+    /// `x` 的说明：把光标所在的空项目从看板上拿掉。
+    RemoveProject,
     SeeAllProjects,
     ThisProjectOnly,
     Secrets,
@@ -224,13 +234,18 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         New => t!(lang, en: "new", zh: "新建"),
         SwitchAgent => t!(lang, en: "switch agent", zh: "换 agent"),
         SwitchProject => t!(lang, en: "switch project", zh: "换项目"),
+        AddProject => t!(lang, en: "add project", zh: "加项目"),
+        RemoveProject => t!(lang, en: "remove", zh: "移除"),
         SeeAllProjects => t!(lang, en: "all projects", zh: "看全部项目"),
         ThisProjectOnly => t!(lang, en: "this project only", zh: "只看本项目"),
         Secrets => t!(lang, en: "keys", zh: "密钥"),
         Grid => t!(lang, en: "grid", zh: "九宫格"),
         List => t!(lang, en: "list", zh: "列表"),
         Select => t!(lang, en: "select", zh: "选择"),
-        Open => t!(lang, en: "open", zh: "进入"),
+        // 「进会话」而不是「进入」：底栏中段现在写着项目名，紧挨着一个
+        // 光秃秃的「进入」，读起来像是「进入这个项目」。用户按 Enter 得到
+        // 的是选中那一行的那个会话，说清楚是进哪儿不用多花一列。
+        Open => t!(lang, en: "open", zh: "进会话"),
         Zoom => t!(lang, en: "zoom in", zh: "放大"),
         Undo => t!(lang, en: "undo", zh: "回滚"),
         Stop => t!(lang, en: "stop", zh: "停止"),
@@ -298,6 +313,9 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         PickProjectTitle => t!(lang, en: "Pick a project", zh: "选项目"),
         TypePathTitle => t!(lang, en: "Type a project path", zh: "输入项目路径"),
         SettingsTitle => t!(lang, en: "Settings", zh: "设置"),
+        // 底栏中段现在只写项目本身，不再写「当前项目：」这个标签——一行里
+        // 最贵的是列数，而「这里写的是哪个项目」不用一个标签来说明。词条留着
+        // 是因为别处（浮层标题之类）随时可能要，它不占屏幕。
         CurrentProject => t!(lang, en: "Project", zh: "当前项目"),
         ManualPath => t!(lang, en: "Type a path…", zh: "手输路径…"),
         RecentProjects => t!(lang, en: "Recent", zh: "最近"),
@@ -487,10 +505,26 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
 /// 说明的头一个词上去。
 ///
 /// `key` 是空串表示这条只是一句说明，没有对应的按键。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelpItem {
     pub key: &'static str,
     pub label: &'static str,
+    /// 动态标签。有它就顶掉 `label`——底栏的 `n 新建 claude` 里那个 agent 名
+    /// 是运行时才知道的，塞不进 `&'static str` 的词条表。
+    ///
+    /// 加这个字段的代价是 `HelpItem` 不再 `Copy`（`String` 不是 `Copy`）。
+    /// 那没关系：这个类型只在几处按值构造、其余全走引用（`fit_help` /
+    /// `wrap_items` 返回的都是 `&HelpItem`）。
+    pub label_owned: Option<String>,
+}
+
+impl HelpItem {
+    /// 这条提示实际显示的说明。**所有读说明的地方都必须走这里**——
+    /// 量宽度的、画屏幕的、拼给单测看的，只要有一处直接读 `label`，
+    /// 屏幕上就会是一串字、断言里是另一串字，而两者都「通过」了。
+    pub fn label(&self) -> &str {
+        self.label_owned.as_deref().unwrap_or(self.label)
+    }
 }
 
 impl std::fmt::Display for HelpItem {
@@ -499,9 +533,9 @@ impl std::fmt::Display for HelpItem {
     /// 测了个寂寞。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.key.is_empty() {
-            write!(f, "{}", self.label)
+            write!(f, "{}", self.label())
         } else {
-            write!(f, "{} {}", self.key, self.label)
+            write!(f, "{} {}", self.key, self.label())
         }
     }
 }
@@ -516,6 +550,7 @@ pub fn help_items(items: &[(&'static str, Key)], lang: Lang) -> Vec<HelpItem> {
         .map(|(k, key)| HelpItem {
             key: k,
             label: text(*key, lang),
+            label_owned: None,
         })
         .collect()
 }
@@ -1139,6 +1174,8 @@ mod tests {
             New,
             SwitchAgent,
             SwitchProject,
+            AddProject,
+            RemoveProject,
             SeeAllProjects,
             ThisProjectOnly,
             Secrets,
@@ -1263,7 +1300,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 94, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
@@ -1396,7 +1433,20 @@ mod tests {
         assert!(line.contains("  "));
         // 键名和说明分开存着，渲染时才有东西可加粗
         assert_eq!(items[0].key, "n");
-        assert_eq!(items[0].label, "new");
+        assert_eq!(items[0].label(), "new");
+    }
+
+    /// 动态标签顶掉词条表里那一条，而且**每一个读说明的地方都得跟着变**。
+    /// 底栏的 `n 新建 claude` 就靠它：agent 名是运行时才知道的，进不了
+    /// `&'static str` 的表。漏改一处（比如量宽度的那一处还读着旧 `label`）
+    /// 的症状是屏幕上画出来的一行比算出来的宽，句尾被静默截掉。
+    #[test]
+    fn a_runtime_label_overrides_the_table_one() {
+        let mut items = help_items(&[("n", Key::New)], Lang::En);
+        items[0].label_owned = Some("new claude".into());
+        assert_eq!(items[0].label(), "new claude");
+        assert_eq!(help_text(&items), "n new claude");
+        assert_eq!(items[0].to_string(), "n new claude");
     }
 
     /// 没有对应按键的那种提示（「其余按键都发给 agent」）不能在句首多出

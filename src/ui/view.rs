@@ -655,13 +655,7 @@ pub(crate) struct ProjectGroup {
     /// 组头上那行灰字（父目录，已 `short_path`）。同上，来自原始路径。
     pub parent: String,
     pub sessions: Vec<crate::session::SessionInfo>,
-    /// 这个项目上次用的 agent，底栏 `n 新建 <agent>` 要用。
-    ///
-    /// `#[allow(dead_code)]` 只加在这一个字段上（不是整个结构体）：读它的
-    /// 是底栏，而底栏的改造在 Task 7。属性收得这么窄，是为了别顺手把
-    /// 结构体里别的成员的死代码一起盖掉——Task 3 那个 item 级的
-    /// `allow` 正是因为这个才在本 Task 被摘掉。
-    #[allow(dead_code)]
+    /// 这个项目上次用的 agent，底栏那条 `n 新建 <agent>` 要用。
     pub last_profile: Option<String>,
     /// 由 `p` 摆上来的。`x` 只能移除 pinned 且没有会话的组。
     pub pinned: bool,
@@ -953,78 +947,41 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
 /// 写不出来。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HelpCtx {
-    /// 屏幕上有没有东西可选。**跟「选中了没有」是两回事**：列表光标可能
-    /// 正停在一个组头上（那一行没有会话），而这恰恰是最需要看见
-    /// `↑↓ 选择` 的时刻——按「有没有选中会话」判的话，那个键会在唯一
-    /// 用得上它的场合消失。
-    pub has_sessions: bool,
-    /// 当前选中（列表）或聚焦（九宫格）的那个会话。`s`/`u`/`d` 都作用在
-    /// 它身上，没有它这三个键按下去只会得到一句「没有选中会话」。
-    pub selected: Option<SelectedSession>,
+    /// 光标（列表）或焦点（九宫格）现在真的落在一个会话上。停在组头上
+    /// 就是 `false`——那时候 `Enter` 按下去没有对象，写出来就是屏幕上
+    /// 写着一个按不动的键。
+    pub selected: bool,
+    /// 光标所在的组是不是「pinned 且没有会话」——只有这种组能按 `x` 拿掉。
+    pub can_remove: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SelectedSession {
-    /// 是 agent 会话还是普通命令行。`u 回滚` / `d 改动` 只对前者有效。
-    pub is_agent: bool,
-    pub state: SessionState,
-}
-
-impl HelpCtx {
-    /// 有没有会话可选。没有的话，`↑↓ 选择` / `Enter 进入` 这类键写了也按不动。
-    fn has_session(&self) -> bool {
-        self.has_sessions
-    }
-
-    /// 能不能停。已经停了的会话再写一个 `s 停止`，按下去只会得到一句错误。
-    fn can_stop(&self) -> bool {
-        matches!(self.selected, Some(s) if s.state != SessionState::Stopped)
-    }
-
-    /// 能不能回滚 / 看改动。命令行会话没有检查点，守护进程侧
-    /// `checkpoint_base` 会直接返回 `NotAnAgentSession`——底栏对着一个
-    /// shell 会话写 `u 回滚`，就是在说谎。
-    fn can_checkpoint(&self) -> bool {
-        matches!(self.selected, Some(s) if s.is_agent)
-    }
-}
-
-/// 看板和九宫格共用的那张按键表。两个视图里同一个键做的是同一件事，
-/// 排序和「什么时候写」也就不该有两套——各抄一份的话，将来只会改对一半。
+/// 看板和九宫格共用的那张按键表。**硬上限三条动作 + 一个 `?`。**
 ///
-/// 不一样的地方由参数带进来：`select` 是「怎么挪」（列表是 `↑↓ 选择`，
-/// 九宫格是 `方向键选格子`），`enter` 是「回车做什么」（进入 / 放大）。
-/// 剩下那条 `i 回一句` 只有九宫格有，由调用方插进去。
+/// 上限不是「放得下就多塞」：一行的内容随终端宽度变化，本身就是不可预期的
+/// ——用户在窄终端上学会的键，到宽终端上位置全变了，同一个键在 120 列上
+/// 看得见、在 80 列上无声消失。剩下的键全在 `?` 后面，那扇门永远在。
+///
+/// 三条选谁，按「此刻最可能做的」：光标停在会话行上，最可能是进去看看；
+/// 停在组头上，最可能是在这里开一个新会话。
+///
+/// `rest` 是这个视图自己的候选键，按重要性排好序。**只许列这个视图真的
+/// 绑了的键**——九宫格没有 `Tab`、也没有 `x`（见 `grid::handle_key`），
+/// 把看板那两条照搬过去就是屏幕上写着按不动的键，而这个仓库把那当 bug
+/// 而不是小瑕疵。两个视图共用这个函数是为了共用**上限和挑选顺序**，
+/// 不是为了共用一张假装两边一样的键表。
 fn board_keys(
     ctx: HelpCtx,
-    select: (&'static str, crate::i18n::Key),
     enter: (&'static str, crate::i18n::Key),
+    rest: &[(&'static str, crate::i18n::Key)],
 ) -> Vec<(&'static str, crate::i18n::Key)> {
     use crate::i18n::Key;
     let mut keys: Vec<(&'static str, Key)> = Vec::new();
-    // 一个会话都没有时，「选」和「进」都没有对象
-    if ctx.has_session() {
-        keys.push(select);
+    if ctx.selected {
         keys.push(enter);
     }
-    // `n 新建` 无条件：它恰恰是「一个会话都没有」时唯一该按的键
-    keys.push(("n", Key::New));
-    if ctx.can_stop() {
-        keys.push(("s", Key::Stop));
-    }
-    // 回滚和改动是一对，条件也是同一条（都走 checkpoint_base）
-    if ctx.can_checkpoint() {
-        keys.push(("u", Key::Undo));
-        keys.push(("d", Key::Diff));
-    }
-    keys.extend([
-        ("g", Key::Grid),
-        ("p", Key::SwitchProject),
-        ("N", Key::SwitchAgent),
-        ("c", Key::Secrets),
-        ("l", Key::SettingsTitle),
-        ("?", Key::MoreKeys),
-    ]);
+    keys.extend_from_slice(rest);
+    keys.truncate(3);
+    keys.push(("?", Key::MoreKeys));
     keys
 }
 
@@ -1035,6 +992,10 @@ fn board_keys(
 /// 的那种。原来这张表是按「话题分组」排的（切换类挨着、配置类挨着），那在
 /// 折两行的年代成立；现在窄终端上排在后面的直接不上屏，排序就变成了一个
 /// 关于「丢哪个」的决定。
+///
+/// 看板和九宫格这两支还额外压着一条**硬上限：三条动作 + 一个 `?`**，见
+/// `board_keys`。上限之外的键不是被丢了，是被搬到了 `?` 浮层里——底栏
+/// 一行挤十来个键的结果是它们中的一半会随终端宽度忽隐忽现。
 ///
 /// 尾巴上的 `? …` 是 `View::Keys` 浮层的门，永远不被截断——被丢掉的键全在
 /// 门后面，丢了门它们就真的没有入口了。
@@ -1051,14 +1012,12 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
     match view {
         // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
-        View::Attached(_) => help_items(
-            &[
-                ("F3", Key::NextSession),
-                ("", Key::NewSessionFromBoard),
-                ("", Key::OtherKeysGoToAgent),
-            ],
-            lang,
-        ),
+        //
+        // 只剩 `F3` 一条：中段让出去 18 列之后，80 列终端上右段只有 39 列，
+        // 原来那三条（含两句整话）加起来六十多列，多出来的部分不是"折一行"
+        // 而是被右端**静默截掉**——写三条只是让第一条也读不完整。F3 是这里
+        // 唯一「不写就找不到」的键；另外两条是说明，不是键，去 `?` 后面。
+        View::Attached(_) => help_items(&[("F3", Key::NextSession)], lang),
         // 浮层自己就是一整屏按键表，右段再列一遍是重复；左段的
         // 「Esc 返回」已经把这里唯一能按的键交代完了。
         View::Keys { .. } => Vec::new(),
@@ -1089,20 +1048,23 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
-        // 排序 = 优先级，窄终端上后面的直接不上屏（见函数头注释）。
+        // 看板：进会话 / 新建 / 换项目，最多三条（见 `board_keys`）。
         //
-        // 前六个是「在这一屏上干活」要用的：先看得见、进得去，再是新建和三个
-        // 作用在选中会话上的动作。`u/s/d` 排在 `p/N/a/c/l` 前面，是因为它们
-        // 作用在用户眼前这一行上，而后者是去别的地方——在一屏放不下的时候，
-        // 眼前的事优先。
+        // `x 移除` 只在「pinned 且空」的组上写——它也只有在那种组上才真的
+        // 管用（见 `mod.rs::unpin_current`）。它排在 `Tab` 前面是因为那时
+        // 光标就停在那个空组上，`x` 说的正是眼前这一行的事。
         //
-        // `g 九宫格` 排在切换类的头一个：它是九宫格唯一的入口，进了浮层还得
-        // 现找。剩下的挪到 `?` 后面不是把它们藏起来——`n` 会带出 agent 选择器
-        // （`N` 的去处），`c/l` 是一年按一次的配置入口。
-        View::Board => help_items(
-            &board_keys(ctx, ("↑↓", Key::Select), ("Enter", Key::Open)),
-            lang,
-        ),
+        // `s/u/d`、`g`、`N`、`c`、`l`、`p` 全部挪到 `?` 后面。挪走不是藏
+        // 起来：门永远在尾巴上，而一行里挤十来个键的结果是它们中的一半会
+        // 随终端宽度忽隐忽现。
+        View::Board => {
+            let mut rest: Vec<(&'static str, Key)> = vec![("n", Key::New)];
+            if ctx.can_remove {
+                rest.push(("x", Key::RemoveProject));
+            }
+            rest.push(("Tab", Key::SwitchProject));
+            help_items(&board_keys(ctx, ("Enter", Key::Open), &rest), lang)
+        }
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
         // 跟会话视图不同（那边除了 F2 全转发，列按键表等于教人按错）。
         //
@@ -1124,26 +1086,20 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             &[("Enter", Key::SendReply), ("Ctrl+C", Key::InterruptAgent)],
             lang,
         ),
-        // 跟看板那一份同序同优先级（同一个键在两个视图里做同一件事，排序也
-        // 不该两个样），只换三处：选择靠方向键、Enter 是放大不是进入、多一条
-        // `i 回一句`——那是九宫格独有的能力，不写就找不到，所以排在动作键前面。
-        // 共用 `board_keys`，不各抄一份：抄了将来只会改一半。
+        // 九宫格：跟看板同一条上限（三条动作 + 门），但**候选键是它自己的**
+        // ——这个视图没绑 `Tab`、也没绑 `x`（见 `grid::handle_key`），照搬
+        // 看板那两条就是在教人按一个按不动的键。
         //
-        // 「加一个键就会把 `d 改动` 挤出屏幕」这件事不再需要在这里手工权衡：
-        // 底栏只有一行、按顺序截断，加在尾巴上的键只会落进 `?` 浮层，不会再
-        // 悄悄顶掉前面的任何一个。
+        // `i 回一句` 排在 `n 新建` 前面：它是九宫格独有的能力，不写就找不到，
+        // 而 `n` 在看板上、浮层里、到处都写着。没有聚焦会话时不写——回复框
+        // 会开在一个不存在的会话上。
         View::Grid { .. } => {
-            let mut keys = board_keys(ctx, ("", Key::MoveArrows), ("Enter", Key::Zoom));
-            // `i 回一句` 紧跟在 `Enter 放大` 后面：两个都是「对着这一格做点
-            // 什么」。没有会话可回时不写——回复框会开在一个不存在的会话上。
-            if ctx.has_session() {
-                keys.insert(2, ("i", Key::ReplyOnce));
+            let mut rest: Vec<(&'static str, Key)> = Vec::new();
+            if ctx.selected {
+                rest.push(("i", Key::ReplyOnce));
             }
-            // 九宫格里 `g` 通向列表，看板里通向九宫格；其余完全一致。
-            if let Some(g) = keys.iter_mut().find(|(k, _)| *k == "g") {
-                g.1 = Key::List;
-            }
-            help_items(&keys, lang)
+            rest.push(("n", Key::New));
+            help_items(&board_keys(ctx, ("Enter", Key::Zoom), &rest), lang)
         }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
         // 以为再按一次有用，其实这时候按键全被吞掉，只有 Esc 生效。
@@ -1209,34 +1165,20 @@ mod tests {
     /// 注意：这里是**全表**，不是屏幕上真正显示的那几条——底栏会按宽度截断
     /// （`widgets::fit_help`）。「某个键在 80 列下真的看得见吗」是另一个问题，
     /// 由 `mod.rs` 里那几条画完整帧再数格子的测试回答。
-    /// 默认按「选中了一个正在跑的 agent 会话」算：那是键最全的一档，
-    /// 大多数断言问的是「这个键在不在表里」，不是「什么时候不该在」。
-    /// 后者由 `help_when` 单独问。
+    /// 默认按「光标停在一个会话上」算：那是键最全的一档，大多数断言问的是
+    /// 「这个键在不在表里」，不是「什么时候不该在」。后者由 `help_when` 单独问。
     fn help_of(view: &View, lang: Lang) -> String {
-        help_when(view, lang, agent_session())
+        help_when(view, lang, on_a_session())
     }
 
     fn help_when(view: &View, lang: Lang, ctx: HelpCtx) -> String {
         crate::i18n::help_text(&idle_help(view, lang, ctx))
     }
 
-    fn agent_session() -> HelpCtx {
+    fn on_a_session() -> HelpCtx {
         HelpCtx {
-            has_sessions: true,
-            selected: Some(SelectedSession {
-                is_agent: true,
-                state: SessionState::Idle,
-            }),
-        }
-    }
-
-    fn shell_session() -> HelpCtx {
-        HelpCtx {
-            has_sessions: true,
-            selected: Some(SelectedSession {
-                is_agent: false,
-                state: SessionState::Idle,
-            }),
+            selected: true,
+            can_remove: false,
         }
     }
 
@@ -1304,9 +1246,9 @@ mod tests {
         }
     }
 
-    /// 一个会话都没有的看板上，`↑↓ 选择` / `Enter 进入` / `s 停止` /
-    /// `u 回滚` / `d 改动` 全都无事可做。写它们不只是没用——底栏只剩一行，
-    /// 五个假键会把 `n 新建`（这时候唯一该按的键）挤到后面去。
+    /// 一个会话都没有的看板上（光标停在一个空项目的组头上也一样），
+    /// `Enter` 无事可做。写它不只是没用——右段只有三个位子，一个假键
+    /// 占掉的正是一个真键的位置。
     #[test]
     fn the_bottom_bar_offers_nothing_to_act_on_when_there_are_no_sessions() {
         let empty = HelpCtx::default();
@@ -1320,57 +1262,69 @@ mod tests {
         }
     }
 
-    /// 选中的是命令行会话时不写 `u 回滚` / `d 改动`：那两条走的是检查点，
-    /// 而命令行会话没有检查点——守护进程侧 `checkpoint_base` 会直接返回
-    /// `NotAnAgentSession`。**底栏在说谎**是这次改动要消灭的东西。
+    /// **右段硬上限：三条动作 + 一个 `?`**，任何一档上下文都不许超。
+    ///
+    /// 这条替掉了原来那三条按 `s`/`u`/`d` 的可用性逐条问的测试
+    /// （`..._never_offers_undo_on_a_shell_session` 等）。那三个键现在整个
+    /// 不进底栏了，它们的可用性规则在这一层已经无从谈起——真正要守的变成
+    /// 了「一行里到底能写几个键」，因为超出上限的后果不是报错，是排在后面
+    /// 的键随终端宽度忽隐忽现。
     #[test]
-    fn the_bottom_bar_never_offers_undo_on_a_shell_session() {
-        let help = help_when(&View::Board, Lang::Zh, shell_session());
-        assert!(!help.contains("u 回滚"), "命令行会话回滚不了：{help}");
-        assert!(!help.contains("d 改动"), "命令行会话没有改动可看：{help}");
-        // 但停得掉，也照样能选能进
-        assert!(help.contains("s 停止"), "{help}");
-        assert!(help.contains("↑↓ 选择"), "{help}");
-        // agent 会话上这两条要回来，否则这条测试等于把功能测没了
-        let agent = help_when(&View::Board, Lang::Zh, agent_session());
+    fn the_action_segment_is_capped_in_every_context() {
+        let cases = [
+            HelpCtx::default(),
+            HelpCtx {
+                selected: true,
+                can_remove: false,
+            },
+            HelpCtx {
+                selected: false,
+                can_remove: true,
+            },
+            HelpCtx {
+                selected: true,
+                can_remove: true,
+            },
+        ];
+        for view in [View::Board, View::grid(0)] {
+            for ctx in cases {
+                let items = idle_help(&view, Lang::Zh, ctx);
+                assert!(
+                    items.len() <= 4,
+                    "{ctx:?} 下有 {} 条，超过 3 个动作 + ?",
+                    items.len()
+                );
+                assert_eq!(items.last().map(|i| i.key), Some("?"), "门永远在尾巴上");
+            }
+        }
+    }
+
+    /// `x 移除` 只在**能按**的时候写：光标停在一个 pinned 且没有会话的组上。
+    /// 别处写它，按下去只会得到一句「这个项目还有会话」——底栏在说谎。
+    #[test]
+    fn the_remove_key_only_shows_up_on_a_group_it_can_actually_remove() {
+        let removable = HelpCtx {
+            selected: false,
+            can_remove: true,
+        };
         assert!(
-            agent.contains("u 回滚") && agent.contains("d 改动"),
-            "{agent}"
+            help_when(&View::Board, Lang::Zh, removable).contains("x 移除"),
+            "空的 pinned 组上就该写它"
+        );
+        assert!(
+            !help_when(&View::Board, Lang::Zh, on_a_session()).contains("x 移除"),
+            "还有会话的组拿不掉，不该写"
         );
     }
 
-    /// 已经停掉的会话不写 `s 停止`：按下去只会得到一句错误。
+    /// `Tab` 和 `x` 只在列表上绑着，九宫格没有——把看板那张表照搬过去，
+    /// 就是这个仓库反复警惕的「屏幕上写着却按不动的键」，只是这次犯在
+    /// 共用一个函数的便利上。
     #[test]
-    fn the_bottom_bar_does_not_offer_to_stop_an_already_stopped_session() {
-        let stopped = HelpCtx {
-            has_sessions: true,
-            selected: Some(SelectedSession {
-                is_agent: true,
-                state: SessionState::Stopped,
-            }),
-        };
-        let help = help_when(&View::Board, Lang::Zh, stopped);
-        assert!(!help.contains("s 停止"), "已经停了：{help}");
-        // 停了的会话仍然能看改动、能回滚——检查点还在
-        assert!(help.contains("d 改动"), "{help}");
-    }
-
-    /// 屏幕上有会话、但光标还没落到任何一行（dct 刚起来就是这个状态）：
-    /// 这时候最该写的就是 `↑↓ 选择`，而 `s`/`u`/`d` 没有作用对象。
-    /// 按「有没有选中」一刀切的话，那个键会在唯一用得上它的场合消失。
-    #[test]
-    fn the_select_key_shows_up_before_anything_is_selected() {
-        let nothing_selected = HelpCtx {
-            has_sessions: true,
-            selected: None,
-        };
-        let help = help_when(&View::Board, Lang::Zh, nothing_selected);
-        assert!(help.contains("↑↓ 选择"), "有会话就该告诉他怎么选：{help}");
-        for k in ["s 停止", "u 回滚", "d 改动"] {
-            assert!(
-                !help.contains(k),
-                "还没选中任何一行，「{k}」作用在谁身上？{help}"
-            );
+    fn the_grid_never_advertises_keys_it_does_not_bind() {
+        let help = help_of(&View::grid(0), Lang::Zh);
+        for k in ["Tab", "x 移除"] {
+            assert!(!help.contains(k), "九宫格没绑「{k}」：{help}");
         }
     }
 
@@ -1380,42 +1334,25 @@ mod tests {
         // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
         let help = help_of(&View::grid(0), Lang::Zh);
         for k in [
-            "方向键选格子",
             "Enter 放大",
+            // `i 回一句` 是这个视图独有的能力，不写就找不到
             "i 回一句",
             "n 新建",
-            "p 换项目",
-            "c 密钥",
-            "u 回滚",
-            "s 停止",
-            "d 改动",
-            // `g 列表` 是九宫格唯一交代「怎么切回去」的地方
-            "g 列表",
         ] {
             assert!(help.contains(k), "九宫格的按键表少了「{k}」：{help}");
         }
-        // `N 换 agent` 现在写在表里了。原来不写是因为它会把 `d 改动` 挤出
-        // 屏幕——那是折行年代的取舍；底栏改成按顺序截断之后，排在尾巴上的键
-        // 只会落进 `?` 浮层，顶不掉前面任何一个。
-        assert!(help.contains("N 换 agent"), "{help}");
         // `q 退出` 不该出现在这一句里：它已经常驻左段（escape_hint），
         // 重复一遍是拿最稀缺的一行去重复已知信息。
         assert!(
             !help.contains("q 退出"),
             "左段已经写着 q 退出，这里不该重复：{help}"
         );
-        // 尾巴上永远留着那扇门：这一串键 80 列下放不完，放不下的全在门后。
+        // 尾巴上永远留着那扇门：上限之外的键全在门后。
         assert!(help.ends_with("? …"), "按键表尾巴上必须留着 `? …`：{help}");
         // 「这些键在 80 列终端上真的看得见吗」是另一个问题——这里是全表，
         // 屏幕上显示的是按宽度截过的一截。那个问题由 `mod.rs` 里把整帧画出来
-        // 再数格子的几条测试回答（`the_keys_that_survive_eighty_columns_are_the_ones_that_matter`
+        // 再数格子的几条测试回答（`the_three_actions_all_fit_at_eighty_columns`
         // 和 `the_door_to_the_rest_of_the_keys_is_always_on_screen`）。
-    }
-
-    #[test]
-    fn board_help_mentions_the_grid() {
-        // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
-        assert!(help_of(&View::Board, Lang::Zh).contains("g 九宫格"));
     }
 
     /// 九宫格不再是列表的下一层：两个模式都是顶层，`Ctrl+Q` 在两边都无事
@@ -1449,21 +1386,14 @@ mod tests {
         }
     }
 
-    /// `g` 在两个模式里都真的管用，所以两边的帮助行都得写出来。
-    /// 原来九宫格那句里没有 `g`——正是这个仓库反复警惕的
-    /// 「屏幕上没写却真管用的键」，只是这次犯在自己身上。
+    /// `g` 现在不进底栏了（右段只有三个位子），它的去处是 `?` 浮层。
+    /// 「两个模式各自把切过去的那个键写出来」这条要求没有放弃，只是搬了家
+    /// ——由 `keys.rs` 的 `the_wording_follows_where_you_came_from` 盯着。
+    /// 这里只保证底栏不会**假装**它在。
     #[test]
-    fn both_modes_advertise_the_key_that_switches_them() {
-        let list = help_of(&View::Board, Lang::Zh);
-        let grid = help_of(&View::grid(0), Lang::Zh);
-        assert!(
-            list.contains("g 九宫格"),
-            "列表要告诉用户怎么去九宫格：{list}"
-        );
-        assert!(
-            grid.contains("g 列表"),
-            "九宫格要告诉用户怎么回列表：{grid}"
-        );
+    fn the_bar_leaves_the_view_switch_key_to_the_overlay() {
+        assert!(!help_of(&View::Board, Lang::Zh).contains("g "));
+        assert!(!help_of(&View::grid(0), Lang::Zh).contains("g "));
     }
 
     #[test]
@@ -1875,18 +1805,15 @@ mod tests {
         assert_eq!(quick_start_target(None, &entries), None);
     }
 
+    /// `n 新建` 是底栏三个位子里唯一无条件占一个的键——一个会话都没有时，
+    /// 它是屏幕上唯一有意义的动作。`N 换 agent` 和 `c 密钥` 挪进了 `?` 浮层
+    /// （由 `keys.rs` 的 `every_key_the_bar_drops_is_in_here` 盯着）。
     #[test]
-    fn board_help_mentions_both_n_and_capital_n() {
-        let help = help_of(&View::Board, Lang::Zh);
-        assert!(help.contains("n 新建"));
-        assert!(help.contains("N 换 agent"));
-    }
-
-    // ———— Task 13：密钥设置页 ————
-
-    #[test]
-    fn board_help_mentions_the_settings_key() {
-        assert!(help_of(&View::Board, Lang::Zh).contains("c 密钥"));
+    fn board_help_always_offers_a_new_session() {
+        for ctx in [HelpCtx::default(), on_a_session()] {
+            let help = help_when(&View::Board, Lang::Zh, ctx);
+            assert!(help.contains("n 新建"), "{help}");
+        }
     }
 
     #[test]

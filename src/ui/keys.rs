@@ -53,6 +53,12 @@ fn groups(from: &View, lang: Lang) -> Vec<Group> {
     );
     if in_grid {
         move_keys.extend(help_items(&[("i", Key::ReplyOnce)], lang));
+    } else {
+        // `Tab` 只在列表上绑着（`board::handle_key`），九宫格没有它——
+        // 这一屏的作用是回答「我现在能按什么」，列一个这个视图按不动的键
+        // 就是在骗人。列表这边它反倒是**日常换项目的主路径**，底栏那三个
+        // 位子有时轮不到它，浮层里绝不能也没有。
+        move_keys.extend(help_items(&[("Tab", Key::SwitchProject)], lang));
     }
     vec![
         Group {
@@ -74,15 +80,28 @@ fn groups(from: &View, lang: Lang) -> Vec<Group> {
         },
         Group {
             title: Key::KeysGroupConfig,
-            items: help_items(
-                &[
-                    ("p", Key::SwitchProject),
-                    ("c", Key::Secrets),
-                    ("l", Key::SettingsTitle),
-                    ("q", Key::Quit),
-                ],
-                lang,
-            ),
+            // `p` 写的是「加项目」不是「换项目」：换项目是 `Tab`（零弹窗、
+            // 一个键），`p` 只剩「把一个看板上还没有的项目摆上来」这一件事。
+            // 照着旧措辞按 `p` 的人会以为能一步换过去，弹出来的却是选择器。
+            //
+            // `x 移除` 只在列表上绑着，而且只对空组管用（`unpin_current`）。
+            // 它在底栏里只有光标停在那种组上时才写，浮层这边是常驻的一览表
+            // ——不列的话，这个键就成了「屏幕上从没写过却真管用」的那种。
+            items: {
+                let mut v = help_items(&[("p", Key::AddProject)], lang);
+                if !in_grid {
+                    v.extend(help_items(&[("x", Key::RemoveProject)], lang));
+                }
+                v.extend(help_items(
+                    &[
+                        ("c", Key::Secrets),
+                        ("l", Key::SettingsTitle),
+                        ("q", Key::Quit),
+                    ],
+                    lang,
+                ));
+                v
+            },
         },
     ]
 }
@@ -216,7 +235,9 @@ mod tests {
             "s 停止",
             "u 回滚",
             "d 改动",
-            "p 换项目",
+            "p 加项目",
+            "x 移除",
+            "Tab 换项目",
             "c 密钥",
             "l 设置",
             "q 退出",
@@ -244,7 +265,7 @@ mod tests {
             .map(|g| help_text(&g.items))
             .collect::<Vec<_>>()
             .join("  ");
-        assert!(board.contains("Enter 进入"), "{board}");
+        assert!(board.contains("Enter 进会话"), "{board}");
         assert!(board.contains("g 九宫格"), "{board}");
         assert!(
             !board.contains("i 回一句"),
