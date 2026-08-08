@@ -168,11 +168,12 @@ pub enum Key {
     NoSubfolders,
     // —— 状态与提示 ——
     NoSessionsHere,
-    NoSessionsAtAll,
-    /// 九宫格的整屏空态。跟 `NoSessionsAtAll` 分开是因为落点不同：那一条是
-    /// 一句**提示消息**（在一个空看板上按 `s`/`i` 得到的反馈），这一条是
-    /// 一整屏，屏幕正中就这一句话，说的是「这里现在什么都没有，下一步做这个」。
-    /// 合成一条的话，改动其中一处的措辞会静悄悄改掉另一处。
+    /// 九宫格的整屏空态：一个格子都没有，屏幕正中就这一句话。
+    ///
+    /// 空屏和底栏说的必须是**两个不同的事实**：这一条说「这里现在什么都没有，
+    /// 下一步做这个」，底栏那边按 `s`/`i` 得到的是 `NoSessionSelected`
+    /// （「这一下按键没有作用对象」）。原来两处各有一条措辞不同、意思一样的
+    /// 词条，同屏出现时用户会以为是两件事。
     NoSessionsRunningPressN,
     /// 组头上：这个项目的目录已经不在了
     ProjectDirGone,
@@ -348,11 +349,6 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Every session here has stopped. Press g for the list to see them, or n to start one.",
             zh: "这里的会话都停了。按 g 回列表能看到它们，按 n 开一个新的",
-        ),
-        NoSessionsAtAll => t!(
-            lang,
-            en: "No sessions yet. Press n to start one.",
-            zh: "还没有任何会话，按 n 开一个",
         ),
         NoSessionsRunningPressN => t!(
             lang,
@@ -1236,7 +1232,6 @@ mod tests {
             CurrentProject,
             ManualPath,
             NoSessionsHere,
-            NoSessionsAtAll,
             NoSessionsRunningPressN,
             ProjectDirGone,
             // 早就在词条表里，却一直没进这份清单——于是两条守卫（两种语言都
@@ -1322,7 +1317,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 97, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

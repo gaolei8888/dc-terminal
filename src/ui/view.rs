@@ -674,6 +674,22 @@ impl ProjectGroup {
         m.into_iter().collect()
     }
 
+    /// 这个项目在九宫格里的第一个格子（按 id 序），没有格子就是 `None`。
+    ///
+    /// **「有会话」不等于「有格子」**：九宫格不画已停止的会话（见
+    /// `App::grid_sessions`），所以一个组可以行行都是会话、却一个格子都没有。
+    /// 判断只留这一份，是因为有两个地方要问同一个问题，而它们的答案必须逐字
+    /// 一致：`grid::focus_first_of_current_group`（焦点该落到哪一格）和
+    /// `sync_board_cursor_from_grid`（这一格的项目能不能反过来改写光标）。
+    /// 两边各写各的一旦分岔，就会出现「焦点按 A 的规则不动、光标按 B 的规则
+    /// 照改」，而那正好是「换了项目又被悄悄换回去」。
+    pub fn first_live(&self) -> Option<u32> {
+        self.sessions
+            .iter()
+            .find(|s| s.state != SessionState::Stopped)
+            .map(|s| s.id)
+    }
+
     /// 这个项目里有几个会话出错了。组头上要用红字点出来——
     /// 会话静默失败是 dct 最贵的失败模式。
     pub fn failed(&self) -> usize {

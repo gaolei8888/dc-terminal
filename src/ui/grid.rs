@@ -179,7 +179,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `Tab` 走得到一个空项目，就得走得掉它：`x` 只拿得掉「pinned 且没有
         // 会话」的组（守卫在 `unpin_current` 里），那种组在九宫格里没有格子，
         // 少了这个键用户只能先 `g` 回列表才拿得掉。
-        KeyCode::Char('x') if is_plain_key(&key) => super::unpin_current(app),
+        //
+        // 拿掉之后**必须**重新对齐光标：光标此刻正停在被删掉的那个组头上，
+        // `refresh_rows` 的锚点跟着一起没了，只能退回第 0 行——也就是一个跟
+        // 用户毫无关系的项目。而九宫格里看得见的指针是 `▶`，它还在原来那一格
+        // 上。不对齐的话，`x` 之后底栏写着 A、`▶` 在 C，`n` 会开进 A。
+        KeyCode::Char('x') if is_plain_key(&key) => {
+            super::unpin_current(app);
+            super::sync_board_cursor_from_grid(app);
+        }
         // `i` 开回复框。收件人在这一刻钉死成会话 id，之后焦点再怎么动都
         // 不改——见 `Draft::id`。
         KeyCode::Char('i') if is_plain_key(&key) => {
@@ -191,8 +199,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         text: String::new(),
                     }),
                 },
+                // 焦点下面没有会话，只可能是九宫格一个格子都没有——那时候
+                // 屏幕正中已经写着「还没有会话，按 n 新建」了。底栏再说一遍
+                // 同一件事（还是另一种措辞）只会让人以为是两回事；这里说的
+                // 是**另一个**事实：这一下按键没有作用对象。跟看板上同名的
+                // 情形用同一条词条（`board::handle_key`）。
                 None => {
-                    app.message = text(Key::NoSessionsAtAll, app.lang).into();
+                    app.message = text(Key::NoSessionSelected, app.lang).into();
                     return Ok(());
                 }
             }
@@ -227,7 +240,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') if is_plain_key(&key) => {
             app.message = match visible.get(focus).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
-                None => text(Key::NoSessionsAtAll, app.lang).into(),
+                // 同上：屏幕正中已经在说「这里什么都没有」，底栏说的是
+                // 「这一下没有作用对象」——两个不同的事实，不是同一句话说两遍。
+                None => text(Key::NoSessionSelected, app.lang).into(),
             };
         }
         _ => {}
@@ -259,13 +274,12 @@ fn move_grid_focus(app: &mut App, focus: usize, total: usize, dir: Dir) {
 /// 列表光标挪到了新项目的组头上，底栏那一段项目名读的就是它，用户看得见
 /// 自己换到了哪儿，接着按 `n` 开在那儿、按 `x` 把它拿掉。
 fn focus_first_of_current_group(app: &mut App) {
-    let first = app.current_group().and_then(|g| {
-        g.sessions
-            .iter()
-            .find(|s| s.state != SessionState::Stopped)
-            .map(|s| s.id)
-    });
-    let Some(first) = first else { return };
+    // `first_live` 是「这个项目在九宫格里有没有格子」唯一的判断处——
+    // `sync_board_cursor_from_grid` 问的是同一个问题，两边必须逐字一致，
+    // 理由见 `ProjectGroup::first_live` 自己的文档。
+    let Some(first) = app.current_group().and_then(|g| g.first_live()) else {
+        return;
+    };
     if let Some(i) = app.grid_sessions().iter().position(|s| s.id == first) {
         app.view = View::grid(i);
     }
@@ -1009,20 +1023,94 @@ mod tests {
         );
     }
 
-    /// `x` 在九宫格里也能把一个空项目拿掉：`Tab` 走得到它，就得走得掉它，
-    /// 否则用户只能先按 `g` 回列表——而那正是「九宫格是看板的另一种画法，
-    /// 不是另一个世界」这条约束要消灭的东西。
+    /// **换到一个空项目之后按 `g`，落点必须还是那个空项目。**
+    ///
+    /// 这是上一条的下半程，而且是真正会咬人的那一半：空项目上焦点是**故意**
+    /// 留旧的（它指着上一个项目的格子），而 `g` 会走
+    /// `sync_board_cursor_from_grid` 拿焦点去改写光标——不设防的话，用户
+    /// `p` 摆上 z、`Tab` 过去、底栏明明写着 z，一按 `g` 就回到了 a，接着
+    /// 按 `n` 会把新会话开进 a。`Enter` 放大走的是同一条同步，同一个洞。
     #[test]
-    fn x_removes_an_empty_project_from_the_grid_too() {
+    fn tab_onto_an_empty_project_then_g_still_lands_on_that_project() {
+        let (mut app, _dir) = App::test_app();
+        app.pinned = vec!["/w/z".into()];
+        app.set_sessions(vec![session_in(1, "/w/a")]);
+        app.view_mode = crate::ui::ViewMode::Grid;
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
+
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "焦点是故意留旧的，`g` 不能拿它把刚换过去的项目换回来"
+        );
+        assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
+    }
+
+    /// 同一个洞的另一条出口：`Enter` 放大也调 `sync_board_cursor_from_grid`。
+    /// 空项目上按 `Enter` 会放大那个**陈旧焦点**指着的会话（用户看得见 `▶`
+    /// 在那儿，这一步不算意外），但它不该顺手把当前项目也改回去——
+    /// 从会话里退出来时，用户应当回到自己刚换过去的那个项目。
+    #[test]
+    fn zooming_from_an_empty_project_does_not_change_the_project_back() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
         app.set_sessions(vec![session_in(1, "/w/a")]);
         app.view = View::grid(0);
 
         handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(app.view, View::Attached(1)));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string())
+        );
+    }
+
+    /// `x` 在九宫格里也能把一个空项目拿掉：`Tab` 走得到它，就得走得掉它，
+    /// 否则用户只能先按 `g` 回列表——而那正是「九宫格是看板的另一种画法，
+    /// 不是另一个世界」这条约束要消灭的东西。
+    ///
+    /// 拿掉之后光标必须**跟着 `▶` 走**：被删的那个组头就是光标站的地方，
+    /// `refresh_rows` 的锚点跟着一起没了，只能退回第 0 行——那是个跟用户毫无
+    /// 关系的项目，而屏幕上看得见的指针 `▶` 还在别处。
+    ///
+    /// **三个组是必须的**：只有两个组时「退回第 0 行」碰巧就是正确答案，
+    /// 这条断言会因为巧合而通过，什么都没测到。这里让焦点停在**最后**一个
+    /// 项目 `z` 上，删掉中间的空组 `m`，第 0 行是 `a`——错了就看得见。
+    #[test]
+    fn x_removes_an_empty_project_and_leaves_the_cursor_where_the_focus_is() {
+        let (mut app, _dir) = App::test_app();
+        app.pinned = vec!["/w/m".into()];
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/z")]);
+        // 组序是 a / m / z，焦点落在 z 的格子上
+        app.view = View::grid(1);
+        app.list_state.select(Some(3));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "前提：一开始光标和焦点都在 z 上"
+        );
+
+        // 走到空组 m（`Tab` 从 z 绕回 a，再一下到 m），再把它拿掉
+        handle_key(&mut app, key(KeyCode::Char('2'))).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("m".to_string())
+        );
         handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
-        assert_eq!(app.groups.len(), 1, "空项目该被拿掉");
-        assert_eq!(app.groups[0].name, "a");
+
+        assert_eq!(app.groups.len(), 2, "空项目该被拿掉");
+        assert!(app.groups.iter().all(|g| g.name != "m"));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "▶ 还在 z 的格子上，光标就不能退回第 0 行的 a——那会让 n 开进 a"
+        );
     }
 
     /// **方向键跨过项目边界时，「当前项目」得跟着走。**
@@ -1247,15 +1335,49 @@ mod tests {
         }
     }
 
+    /// 会话全没了还按 `s`：不能拿 `sessions[focus]` 直接索引。
+    ///
+    /// **底栏说的必须跟屏幕正中说的是两件事。** 空九宫格的正中已经写着
+    /// 「还没有会话，按 n 新建」；底栏这一句说的是「这一下按键没有作用对象」，
+    /// 跟看板上同名的情形共用同一条词条。两处都说「这里什么都没有」，只是
+    /// 措辞不同的话，用户会以为屏幕在告诉他两件事。
     #[test]
     fn actions_on_an_empty_board_say_so_instead_of_panicking() {
-        // 会话全没了还按 s：不能拿 sessions[focus] 直接索引
         let (mut app, _dir) = App::test_app();
         app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('s'))).unwrap();
-        assert_eq!(app.message.text, "还没有任何会话，按 n 开一个");
+        // 「底栏和空屏说的不是同一句话」由
+        // `the_empty_screen_and_the_bar_do_not_say_the_same_thing_twice` 单独盯
+        assert_eq!(app.message.text, "没有选中会话");
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Grid { .. }), "空看板放大不了");
+    }
+
+    /// 空九宫格上按 `s`，屏幕上同时有两句话：正中一句「这里什么都没有」、
+    /// 底栏一句「这一下没有作用对象」。它们必须是**两个事实**，不能是同一件
+    /// 事的两种措辞——同屏出现时用户会以为那是两件事，然后去找第二件。
+    #[test]
+    fn the_empty_screen_and_the_bar_do_not_say_the_same_thing_twice() {
+        let (mut app, _dir) = App::test_app();
+        app.view = View::grid(0);
+        handle_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+
+        let centre = grid_text(&mut app);
+        assert!(
+            centre.contains("还没有会话"),
+            "正中说的是「这里空的」：{centre}"
+        );
+        assert!(centre.contains("按n新建"), "并指出下一步：{centre}");
+        assert_eq!(
+            app.message.text, "没有选中会话",
+            "底栏说的是另一件事：这一下按键没有作用对象"
+        );
+        // 反向守卫：底栏那句话不许再变回一句「这里什么都没有」
+        assert!(
+            !app.message.text.contains("按 n"),
+            "底栏不该再重复一遍「按 n 新建」：{}",
+            app.message.text
+        );
     }
 
     // ———— 视图：渲染 ————
