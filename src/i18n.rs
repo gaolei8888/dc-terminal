@@ -159,6 +159,8 @@ pub enum Key {
     // —— 状态与提示 ——
     NoSessionsHere,
     NoSessionsAtAll,
+    /// 组头上：这个项目的目录已经不在了
+    ProjectDirGone,
     AllSessionsStopped,
     WindowTooSmall,
     Verifying,
@@ -306,11 +308,10 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "这里没有文件夹，按 ← 回上一级",
         ),
 
-        NoSessionsHere => t!(
-            lang,
-            en: "No sessions in this project yet. Press n to start one, or a to see every project.",
-            zh: "这个项目还没有会话，按 n 开一个，按 a 看全部项目",
-        ),
+        // 组头上那一句，不是整屏空态——分组之后这句话贴在项目名后面，
+        // 屏幕上别的组还列着会话，「按 n 开一个」那半句在这里是噪音。
+        NoSessionsHere => t!(lang, en: "no sessions yet", zh: "还没有会话"),
+        ProjectDirGone => t!(lang, en: "folder is gone", zh: "目录不在了"),
         AllSessionsStopped => t!(
             lang,
             en: "Every session here has stopped. Press g for the list to see them, or n to start one.",
@@ -678,6 +679,15 @@ pub mod msg {
             en: format!("Session {id} ({profile}) hit an error — go and take a look"),
             zh: format!("会话 {id}（{profile}）出错了，去看一眼"),
         )
+    }
+
+    /// 组头上的「N 个出错」。会话静默失败是 dct 最贵的失败模式，
+    /// 组头上必须一眼看得见。
+    pub fn failed_count(lang: Lang, n: usize) -> String {
+        match lang {
+            Lang::En => format!("{n} failed"),
+            Lang::Zh => format!("{n} 个出错"),
+        }
     }
 
     /// 出错解释算出来之后显示的那句话。**只套一层「哪个会话」的前缀**——
@@ -1164,6 +1174,7 @@ mod tests {
             ManualPath,
             NoSessionsHere,
             NoSessionsAtAll,
+            ProjectDirGone,
             WindowTooSmall,
             Verifying,
             PasteOrTypeKey,
@@ -1242,7 +1253,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 92, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 93, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::app::App;
 use super::dim;
-use super::view::{Scope, View};
+use super::view::View;
 use super::widgets::{display_width, help_spans, item_width, wrap_items};
 use crate::i18n::{help_items, text, HelpItem, Key, Lang};
 
@@ -29,7 +29,7 @@ struct Group {
 /// 写成「跟着来路走」而不是列一张固定表，是因为这一屏的作用就是**替用户
 /// 回答「我现在能按什么」**。列一张两个视图混在一起的表，等于把他刚躲开的
 /// 那个问题又还给他。
-fn groups(from: &View, scope: Scope, lang: Lang) -> Vec<Group> {
+fn groups(from: &View, lang: Lang) -> Vec<Group> {
     let in_grid = matches!(from, View::Grid { .. });
     let mut move_keys: Vec<HelpItem> = help_items(
         &[
@@ -77,13 +77,6 @@ fn groups(from: &View, scope: Scope, lang: Lang) -> Vec<Group> {
             items: help_items(
                 &[
                     ("p", Key::SwitchProject),
-                    (
-                        "a",
-                        match scope {
-                            Scope::CurrentProject => Key::SeeAllProjects,
-                            Scope::AllProjects => Key::ThisProjectOnly,
-                        },
-                    ),
                     ("c", Key::Secrets),
                     ("l", Key::SettingsTitle),
                     ("q", Key::Quit),
@@ -128,7 +121,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
     let View::Keys { from } = &app.view else {
         return;
     };
-    let groups = groups(from, app.scope, app.lang);
+    let groups = groups(from, app.lang);
 
     // 先在「最多能有多宽」里折行，再按折出来的**实际**宽高裁浮层。
     //
@@ -212,7 +205,7 @@ mod tests {
     fn every_key_the_bar_drops_is_in_here() {
         let (mut app, _dir) = App::test_app();
         app.view = View::Board;
-        let listed = groups(&View::Board, Scope::CurrentProject, Lang::Zh)
+        let listed = groups(&View::Board, Lang::Zh)
             .iter()
             .map(|g| help_text(&g.items))
             .collect::<Vec<_>>()
@@ -224,7 +217,6 @@ mod tests {
             "u 回滚",
             "d 改动",
             "p 换项目",
-            "a 看全部项目",
             "c 密钥",
             "l 设置",
             "q 退出",
@@ -238,7 +230,7 @@ mod tests {
     /// 列一张两个视图混在一起的表，等于把「我现在能按什么」这个问题又还给用户。
     #[test]
     fn the_wording_follows_where_you_came_from() {
-        let grid = groups(&View::grid(0), Scope::CurrentProject, Lang::Zh)
+        let grid = groups(&View::grid(0), Lang::Zh)
             .iter()
             .map(|g| help_text(&g.items))
             .collect::<Vec<_>>()
@@ -247,7 +239,7 @@ mod tests {
         assert!(grid.contains("g 列表"), "{grid}");
         assert!(grid.contains("i 回一句"), "{grid}");
 
-        let board = groups(&View::Board, Scope::CurrentProject, Lang::Zh)
+        let board = groups(&View::Board, Lang::Zh)
             .iter()
             .map(|g| help_text(&g.items))
             .collect::<Vec<_>>()
@@ -260,22 +252,10 @@ mod tests {
         );
     }
 
-    /// `a` 是个开关，浮层里也得说清它通向哪边——跟底栏同一套说明。
-    #[test]
-    fn the_scope_key_says_where_it_takes_you() {
-        let all = groups(&View::Board, Scope::AllProjects, Lang::Zh)
-            .iter()
-            .map(|g| help_text(&g.items))
-            .collect::<Vec<_>>()
-            .join("  ");
-        assert!(all.contains("a 只看本项目"), "{all}");
-    }
-
     /// 浮层不是全屏接管：背后那一屏要还看得见。
     #[test]
     fn the_overlay_leaves_the_board_visible_behind_it() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/w/proj");
         app.set_sessions(vec![crate::session::SessionInfo {
             id: 1,
             profile: "claude".into(),

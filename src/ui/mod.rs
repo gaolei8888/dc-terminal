@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use crate::client::Client;
 use crate::proto::{ProfileEntry, Request, Response};
-use crate::session::SessionInfo;
 use crate::theme::Theme;
 
 mod widgets;
@@ -37,7 +36,7 @@ mod view;
 use view::SecretPhase;
 use view::{
     back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
-    session_ended_notice, Scope, View,
+    session_ended_notice, View,
 };
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
@@ -281,7 +280,7 @@ pub fn run(
                                     refetch_secrets(&mut app, Some(&profile))
                                 }
                                 Ok(Response::Ok) => {
-                                    let dir = app.current_dir.display().to_string();
+                                    let dir = app.current_dir().display().to_string();
                                     match app.client().and_then(|c| {
                                         c.call(Request::Create {
                                             dir,
@@ -365,7 +364,7 @@ pub fn run(
             }
             app.need_sessions = false;
         }
-        if app.list_state.selected().is_none() && !app.visible.is_empty() {
+        if app.list_state.selected().is_none() && !app.rows.is_empty() {
             app.list_state.select(Some(0));
         }
         // 会话可能在两轮之间消失（自己退了、被 s 停掉清了），焦点必须跟着
@@ -374,7 +373,7 @@ pub fn run(
         // 的页长，格子全乱。收在这里（拉完列表、画之前）是唯一能保证
         // 渲染和按键看到的是同一个合法焦点的地方。
         if let View::Grid { focus, .. } = app.view {
-            let last = app.visible.len().saturating_sub(1);
+            let last = app.grid_sessions().len().saturating_sub(1);
             if focus > last {
                 app.view = View::grid(last);
             }
@@ -383,7 +382,7 @@ pub fn run(
             let page = grid::page_of(focus);
             let start = page * grid::TILES_PER_PAGE;
             let ids: Vec<u32> = app
-                .grid_visible
+                .grid_sessions()
                 .iter()
                 .skip(start)
                 .take(grid::TILES_PER_PAGE)
@@ -833,25 +832,27 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
     Some(s)
 }
 
-fn selected<'a>(sessions: &'a [SessionInfo], st: &ListState) -> Option<&'a SessionInfo> {
-    st.selected().and_then(|i| sessions.get(i))
-}
-
 /// 底栏画按键表要知道的「现在能干什么」。
 ///
-/// 「当前是哪个会话」在两个视图里问法不同：列表问光标选中了哪一行
-/// （`visible` + `list_state`），九宫格问焦点在哪一格（`grid_visible` +
-/// `focus`）——跟 `session_action` 的两个调用点是同一条分岔，理由也一样。
-/// 收在这里一次，就不会有「底栏按列表算、按键按格子算」这种两边不一致。
+/// 「当前是哪个会话」在两个视图里问法不同：列表问光标停在哪一行
+/// （`selected_session()`，停在组头上就是「没选中」），九宫格问焦点在哪一格
+/// （`grid_sessions()` + `focus`）——跟 `session_action` 的两个调用点是同一条
+/// 分岔，理由也一样。收在这里一次，就不会有「底栏按列表算、按键按格子算」
+/// 这种两边不一致。
 fn help_ctx(app: &App) -> view::HelpCtx {
-    // 九宫格不画已停止的会话，所以「屏幕上有没有会话」在两个视图里
-    // 数的是两个集合——列表看 `visible`，格子看 `grid_visible`。
-    let (all, cur) = match &app.view {
-        View::Grid { focus, .. } => (&app.grid_visible, app.grid_visible.get(*focus)),
-        _ => (&app.visible, selected(&app.visible, &app.list_state)),
+    // 九宫格不画已停止的会话，所以「屏幕上有没有东西」在两个视图里数的
+    // 不是同一件事——列表看有没有行（空项目组也是一行，`n` 有地方可去），
+    // 格子看有没有活着的会话。
+    let (has_sessions, cur) = match &app.view {
+        View::Grid { focus, .. } => {
+            let all = app.grid_sessions();
+            let cur = all.get(*focus).cloned();
+            (!all.is_empty(), cur)
+        }
+        _ => (!app.rows.is_empty(), app.selected_session().cloned()),
     };
     view::HelpCtx {
-        has_sessions: !all.is_empty(),
+        has_sessions,
         selected: cur.map(|s| view::SelectedSession {
             is_agent: s.is_agent,
             state: s.state,
@@ -859,45 +860,34 @@ fn help_ctx(app: &App) -> view::HelpCtx {
     }
 }
 
-/// 切到另一个项目：告诉用户、改 `current_dir`、重算作用域、回看板。
+/// 切到另一个项目：把它 pin 上看板、说一声、把光标挪到它的组头上、回看板。
 ///
 /// 抽成一个函数是因为选择器有两条确认路径（列表选中、手输路径），
-/// 而这四步必须整套发生。分开写的话，漏掉重算的那条路会让屏幕停在
-/// 上一个项目的会话上、底栏却已经写着新项目——用户看到的就是
-/// 「同一个 session 变成了不同的项目」。
+/// 而这几步必须整套发生。**光标就是当前项目**，所以「换项目」在这一版里
+/// 就是「把光标挪到那个组头上」——挪不过去（那个项目还没有组）时先靠
+/// `pinned` 把组造出来，Task 6 接上守护进程的落盘。
 pub(crate) fn switch_project(app: &mut App, dir: std::path::PathBuf) {
     // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
     app.message =
         crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string())).into();
-    app.current_dir = dir;
-    app.refresh_visible();
+    let key = view::canon(&dir);
+    let raw = dir.display().to_string();
+    if !app.pinned.contains(&raw) {
+        app.pinned.push(raw);
+    }
+    app.refresh_rows();
+    if let Some(gi) = app.groups.iter().position(|g| g.dir == key) {
+        goto_project(app, gi);
+    }
     app.view = home_view(app);
 }
 
-/// 进一个会话。会话属于别的项目时，当前项目跟着切过去。
+/// 进一个会话。
 ///
-/// 「你在哪个会话里，当前项目就是哪个」——不这么做的话，从「全部项目」
-/// 视图进了别的项目的会话，按 F2 回来时它已经被过滤掉了，看起来像是
-/// 消失了；而且随手按 `n` 新建会话会开在一个你并没有在看的项目里。
-///
-/// 切了就必须说一声。静默改变当前项目正是这一版被判为「混乱」的原因。
+/// 这里**不再**改写任何「当前项目」——它不再是一个字段，而是光标所在的
+/// 那个组。从别的组进一个会话时，光标本来就已经在那个组里了（不然那一行
+/// 根本不会被选中），所以既没有什么可改，也没有什么可报告。
 pub(crate) fn enter_session(app: &mut App, id: u32) {
-    // 在全量列表里找，不是 visible：从「全部项目」进来的那个会话，
-    // 正是当前作用域看不见的那一个。
-    if let Some(dir) = app
-        .sessions
-        .iter()
-        .find(|s| s.id == id)
-        .map(|s| std::path::PathBuf::from(&s.dir))
-    {
-        if !view::same_project(&dir, &app.current_dir) {
-            app.message =
-                crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string()))
-                    .into();
-            app.current_dir = dir;
-            app.refresh_visible();
-        }
-    }
     // 会话标题要显示项目名
     app.need_sessions = true;
     app.view = View::Attached(id);
@@ -1021,11 +1011,11 @@ pub(crate) fn home_view(app: &App) -> View {
         // 光标停在一个已停止的会话上时（九宫格里没有它）落回第一格：
         // 那是个「它在九宫格里不存在」的诚实答案，比对到旁边某个无关的
         // 会话上强。
+        // 光标停在组头上时（那一行没有会话）同样落回第一格：那是个诚实的
+        // 「这一行在九宫格里没有对应物」，比对到旁边某个无关的会话上强。
         ViewMode::Grid => View::grid(
-            app.list_state
-                .selected()
-                .and_then(|i| app.visible.get(i))
-                .and_then(|s| app.grid_visible.iter().position(|g| g.id == s.id))
+            app.selected_session()
+                .and_then(|s| app.grid_sessions().iter().position(|g| g.id == s.id))
                 .unwrap_or(0),
         ),
     }
@@ -1044,18 +1034,6 @@ pub(crate) fn open_settings(app: &mut App) {
     app.view = View::Settings { state };
 }
 
-/// `a` 键：在「只看当前项目」和「全部项目」之间切换。看板和九宫格共用。
-///
-/// 切完立刻重算，不等下一轮 `need_sessions`——那要等到 300ms 之后，
-/// 用户会以为这个键没反应，然后再按一次又切回去。
-fn toggle_scope(app: &mut App) {
-    app.scope = match app.scope {
-        Scope::CurrentProject => Scope::AllProjects,
-        Scope::AllProjects => Scope::CurrentProject,
-    };
-    app.refresh_visible();
-}
-
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
 /// 项目选择器和会话看板共用它。
 fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
@@ -1068,8 +1046,57 @@ fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
     st.select(Some(next as usize));
 }
 
-fn move_sel(st: &mut ListState, sessions: &[SessionInfo], delta: i32) {
-    move_sel_n(st, sessions.len(), delta);
+/// 上下走一行。行里既有组头也有会话行，两种都能停——空组只有组头，
+/// 停不上去的话那个项目就永远选不中，`n` 也就去不了。
+pub(crate) fn move_row(app: &mut App, delta: i32) {
+    move_sel_n(&mut app.list_state, app.rows.len(), delta);
+}
+
+/// 跳到下 / 上一个项目的组头。到头回绕：四个项目里 `Tab` 转一圈回到起点，
+/// 比「按到底就不动了」好解释。
+pub(crate) fn jump_project(app: &mut App, delta: i32) {
+    if app.groups.is_empty() {
+        return;
+    }
+    let cur = app
+        .list_state
+        .selected()
+        .and_then(|i| view::group_of(&app.rows, i))
+        .unwrap_or(0) as i32;
+    let n = app.groups.len() as i32;
+    let next = (cur + delta).rem_euclid(n) as usize;
+    goto_project(app, next);
+}
+
+/// 直达第 N 个项目（0 基）。越界什么都不做——按了 `7` 而只有三个项目时，
+/// 不动比跳到最后一个更好懂。
+pub(crate) fn goto_project(app: &mut App, gi: usize) {
+    if gi >= app.groups.len() {
+        return;
+    }
+    if let Some(i) = app.rows.iter().position(|r| *r == view::Row::Header(gi)) {
+        app.list_state.select(Some(i));
+    }
+}
+
+/// 折叠 / 展开光标所在的组。折完把光标收到组头上——不然它会停在一行
+/// 已经不存在的会话上。
+pub(crate) fn toggle_collapse(app: &mut App) {
+    let Some(gi) = app
+        .list_state
+        .selected()
+        .and_then(|i| view::group_of(&app.rows, i))
+    else {
+        return;
+    };
+    app.groups[gi].collapsed = !app.groups[gi].collapsed;
+    app.rows = view::flatten(&app.groups);
+    goto_project(app, gi);
+}
+
+/// `x`：把空组从看板上拿掉。真正的落盘在 Task 6 接上守护进程。
+pub(crate) fn unpin_current(app: &mut App) {
+    let _ = app;
 }
 
 /// 离开九宫格之前，把列表光标挪到当前焦点格上。
@@ -1088,8 +1115,14 @@ pub(crate) fn sync_board_cursor_from_grid(app: &mut App) {
         // 集合的下标根本对不上——第 2 格可能是列表的第 4 行。对错了的话，
         // 回列表后接下来的 `s`（停止）或 `u`（回滚）就毁在另一个会话上，
         // 而这两个键都不可撤销。
-        if let Some(id) = app.grid_visible.get(focus).map(|s| s.id) {
-            if let Some(i) = app.visible.iter().position(|s| s.id == id) {
+        if let Some(id) = app.grid_sessions().get(focus).map(|s| s.id) {
+            // 在**行**里找，不是在会话数组里找：列表现在还夹着组头行，
+            // 会话在两个集合里的下标不再有任何对应关系。
+            let at = app.rows.iter().position(|r| match r {
+                view::Row::Session(g, s) => app.groups[*g].sessions[*s].id == id,
+                view::Row::Header(_) => false,
+            });
+            if let Some(i) = at {
                 app.list_state.select(Some(i));
             }
         }
@@ -1135,7 +1168,7 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
             // 大写 N 一定要看一眼选择器，不查上次用的是谁；
             // 小写 n 才去问 daemon 上次记的是哪个 agent。
             let last = if code == KeyCode::Char('n') {
-                let dir = app.current_dir.display().to_string();
+                let dir = app.current_dir().display().to_string();
                 match app
                     .client()
                     .and_then(|c| c.call(Request::LastProfile { dir }))
@@ -1151,7 +1184,7 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                     // 同 View::PickProfile 里 PickAction::Start 那支：
                     // 「n」等价于「已经替用户选好了上次那个」，建完直接
                     // 进会话，不用再让他确认一遍。
-                    let dir = app.current_dir.display().to_string();
+                    let dir = app.current_dir().display().to_string();
                     match app.client().and_then(|c| {
                         c.call(Request::Create {
                             dir,
@@ -1205,11 +1238,8 @@ pub(crate) fn open_project_picker(app: &mut App) {
             }
             // 浏览器从当前项目所在的位置开起：用户按 p 多半是想换到
             // 「旁边那个」项目，从它的上一级开始找是最短的路。
-            let from = app
-                .current_dir
-                .parent()
-                .map(|x| x.to_path_buf())
-                .unwrap_or_else(|| app.current_dir.clone());
+            let cur = app.current_dir();
+            let from = cur.parent().map(|x| x.to_path_buf()).unwrap_or(cur);
             app.view = View::PickProject(crate::ui::view::ProjectPicker::new(all, from));
         }
         Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
@@ -1362,7 +1392,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         match scroll_hint {
             Some(hint) => (BarContent::Text(hint), Style::default()),
             None => (
-                BarContent::Keys(idle_help(&app.view, app.scope, app.lang, help_ctx(app))),
+                BarContent::Keys(idle_help(&app.view, app.lang, help_ctx(app))),
                 Style::default(),
             ),
         }
@@ -1453,10 +1483,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 当前项目放在边框标题里，框内只留一行字。中文是双宽字符，
     // 「当前项目：~/work/dc/dc-terminal」加上按键表在 80 列终端里放不下同一行，
     // 挤在一起会被 Paragraph 直接截断——标题行本来就空着，正好用它。
+    //
+    // 写的是组的 `name`（来自**未归一化**的原始路径），不是 `current_dir()`
+    // ——后者是分组键，已经 canon 过，`/tmp/x` 会显示成 `/private/tmp/x`：
+    // 归一化只用于比较，永不用于显示。底栏的正式改造在 Task 7。
+    let project = app
+        .current_group()
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| short_path(&app.start_dir.display().to_string()));
     let block = Block::default().borders(Borders::ALL).title(format!(
         "{}：{}",
         crate::i18n::text(crate::i18n::Key::CurrentProject, app.lang),
-        short_path(&app.current_dir.display().to_string())
+        project
     ));
     let inner = block.inner(chunks[1]);
     f.render_widget(block, chunks[1]);
@@ -1503,7 +1541,7 @@ enum BarContent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionState;
+    use crate::session::{SessionInfo, SessionState};
     use app::App;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1521,14 +1559,15 @@ mod tests {
     #[test]
     fn entering_a_session_forgets_any_previously_cached_explanation() {
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![SessionInfo {
+        let dir = app.start_dir.display().to_string();
+        app.set_sessions(vec![SessionInfo {
             id: 1,
             profile: "claude".into(),
-            dir: app.current_dir.display().to_string(),
+            dir,
             state: SessionState::Failed,
             activity: String::new(),
             is_agent: true,
-        }];
+        }]);
         app.explained_failure = Some((1, "上一次贴在这里时看到的旧解释".into()));
 
         enter_session(&mut app, 1);
@@ -1635,15 +1674,14 @@ mod tests {
             sock.clone(),
             ViewMode::List,
         );
-        app.sessions = vec![SessionInfo {
+        app.set_sessions(vec![SessionInfo {
             id,
             profile: "shell".into(),
             dir: workdir.path().display().to_string(),
             state: SessionState::Working,
             activity: String::new(),
             is_agent: false,
-        }];
-        app.current_dir = workdir.path().to_path_buf();
+        }]);
         app.view = View::Board;
 
         enter_session(&mut app, id);
@@ -1763,12 +1801,10 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let (mut app, _dir) = App::test_app();
-        app.list_state.select(Some(0));
-        app.current_dir = PathBuf::from("/tmp/proj");
 
         // 看板视图，含空消息
         app.view = View::Board;
-        app.sessions = sessions.clone();
+        app.set_sessions(sessions.clone());
         app.message = Msg::from("");
         app.connected = true;
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1776,11 +1812,11 @@ mod tests {
         app.message = Msg::from("完成");
         term.draw(|f| draw(f, &mut app)).unwrap();
         // 看板为空列表也不能 panic
-        app.sessions = Vec::new();
+        app.set_sessions(Vec::new());
         app.message = Msg::from("");
         term.draw(|f| draw(f, &mut app)).unwrap();
         // 断连状态：底部提示和边框都要切到断连样式，也不能 panic
-        app.sessions = sessions.clone();
+        app.set_sessions(sessions.clone());
         app.connected = false;
         term.draw(|f| draw(f, &mut app)).unwrap();
         app.connected = true;
@@ -1838,7 +1874,6 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/tmp/proj");
         app.view = View::Board;
         app.message = Msg::from("完成");
         app.connected = false;
@@ -1916,7 +1951,6 @@ mod tests {
     fn app_with_one_agent_session(view: View) -> (App, tempfile::TempDir) {
         let (mut app, dir) = App::test_app();
         app.connected = true;
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.set_sessions(vec![SessionInfo {
             id: 1,
             profile: "claude".into(),
@@ -1925,7 +1959,9 @@ mod tests {
             activity: String::new(),
             is_agent: true,
         }]);
-        app.list_state.select(Some(0));
+        // 第 0 行是组头，第 1 行才是那个会话。停在组头上等于「没选中会话」，
+        // s/u/d 也就都不该写在底栏上——那是对的行为，但不是这些测试要问的。
+        app.list_state.select(Some(1));
         app.view = view;
         (app, dir)
     }
@@ -2086,7 +2122,6 @@ mod tests {
 
         let (mut app, _dir) = App::test_app();
         app.connected = true;
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
         app.set_sessions(vec![SessionInfo {
             id: 1,
             profile: "claude".into(),
@@ -2160,16 +2195,14 @@ mod tests {
     fn the_project_picker_is_an_overlay_not_a_takeover() {
         use ratatui::backend::TestBackend;
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/proj");
-        app.sessions = vec![SessionInfo {
+        app.set_sessions(vec![SessionInfo {
             id: 1,
             profile: "claude".into(),
             dir: "/w/proj".into(),
             state: SessionState::Idle,
             activity: "背后的看板".into(),
             is_agent: true,
-        }];
-        app.refresh_visible();
+        }]);
         app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
             vec!["/w/other".to_string()],
             PathBuf::from("/w"),
@@ -2302,7 +2335,6 @@ mod tests {
         // 顶掉，其中就包括「q 退出」。用户从此没有任何地方能看到怎么退出。
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/tmp");
         app.view = View::Board;
         app.message = Msg::from(
             "已切到 ~/work/dc/dc-terminal，这条消息故意写得很长很长很长很长很长".to_string(),
@@ -2322,7 +2354,6 @@ mod tests {
         // 出事的那一刻恰恰是最需要逃生提示的时候，断连提示不能把它顶掉。
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/tmp");
         app.view = View::Attached(1);
         app.connected = false;
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -2334,14 +2365,27 @@ mod tests {
         assert!(c.contains("连不上"), "断连提示本身也要显示：{c}");
     }
 
+    /// 底栏要写着「我在哪个项目」——而那个项目就是光标所在的那个组，
+    /// 不再是一个可以跟屏幕上的列表对不上的字段。
     #[test]
     fn bottom_bar_shows_current_project() {
         use ratatui::backend::TestBackend;
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/Users/lei/work/dc/dc-terminal");
+        app.set_sessions(vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/Users/lei/work/dc/dc-terminal".into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+        }]);
         app.view = View::Board;
+        assert!(
+            app.current_dir().ends_with("dc-terminal"),
+            "前提：光标落在这个项目的组里"
+        );
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content: String = buffer_text(term.backend().buffer())
@@ -2360,7 +2404,6 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/tmp");
         app.view = View::Board;
         app.message = Msg::err("不是一个目录".into());
         term.draw(|f| draw(f, &mut app)).unwrap();

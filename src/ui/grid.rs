@@ -9,7 +9,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use super::app::App;
-use super::view::{is_plain_key, reply_key, Draft, Reply, Scope, View};
+use super::view::{is_plain_key, reply_key, Draft, Reply, View};
 use super::widgets::Msg;
 use super::widgets::{char_width, pad_to, screen_to_lines, status_label, status_style};
 use super::{dim, session_action};
@@ -148,7 +148,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if let Some(draft) = draft {
         return type_into_reply(app, focus, draft, key);
     }
-    let total = app.grid_visible.len();
+    // 一次算好、整个函数用同一份：`grid_sessions()` 每次调用都重新遍历
+    // 分组，中途再算一次就有了两份可能不同的真相。
+    let visible = app.grid_sessions();
+    let total = visible.len();
     match key.code {
         KeyCode::Up => app.view = View::grid(move_focus(focus, total, Dir::Up)),
         KeyCode::Down => app.view = View::grid(move_focus(focus, total, Dir::Down)),
@@ -160,7 +163,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `i` 开回复框。收件人在这一刻钉死成会话 id，之后焦点再怎么动都
         // 不改——见 `Draft::id`。
         KeyCode::Char('i') if is_plain_key(&key) => {
-            app.view = match app.grid_visible.get(focus).map(|s| s.id) {
+            app.view = match visible.get(focus).map(|s| s.id) {
                 Some(id) => View::Grid {
                     focus,
                     reply: Some(Draft {
@@ -191,10 +194,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
         // 而且跟 a/g 一样，两个视图共用同一个键。
         KeyCode::Char('l') if is_plain_key(&key) => super::open_settings(app),
-        // 跟看板同一个键、同一个 app.scope：作用域跟着用户走，不跟着视图走
-        KeyCode::Char('a') if is_plain_key(&key) => super::toggle_scope(app),
         KeyCode::Enter => {
-            if let Some(id) = app.grid_visible.get(focus).map(|s| s.id) {
+            if let Some(id) = visible.get(focus).map(|s| s.id) {
                 // 放大也是一条离开九宫格的路：从会话里再退出来就到了列表，
                 // 那时候光标同样得落在这个会话上（见 sync_board_cursor_from_grid）
                 super::sync_board_cursor_from_grid(app);
@@ -204,7 +205,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 跟看板同一套动作，作用在焦点格上——共用 `session_action`，
         // 不各抄一份（抄了将来只会改一半）。
         KeyCode::Char('s') | KeyCode::Char('u') | KeyCode::Char('d') if is_plain_key(&key) => {
-            app.message = match app.grid_visible.get(focus).map(|s| s.id) {
+            app.message = match visible.get(focus).map(|s| s.id) {
                 Some(id) => session_action(app, key.code, id),
                 None => text(Key::NoSessionsAtAll, app.lang).into(),
             };
@@ -219,22 +220,21 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         View::Grid { focus, reply } => (*focus, reply.clone()),
         _ => return,
     };
+    let visible = app.grid_sessions();
     draw_grid(
         f,
         area,
-        &app.grid_visible,
+        &visible,
         &app.grid_screens,
         focus,
         Chrome {
             connected: app.connected,
-            scope: app.scope,
             lang: app.lang,
         },
-        !app.visible.is_empty(),
+        !app.sessions.is_empty(),
     );
     if let Some(draft) = draft {
-        let who = app
-            .grid_visible
+        let who = visible
             .iter()
             .find(|s| s.id == draft.id)
             .map(|s| format!("{} {}", s.id, s.profile))
@@ -256,7 +256,6 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 #[derive(Clone, Copy)]
 pub(crate) struct Chrome {
     pub connected: bool,
-    pub scope: Scope,
     pub lang: Lang,
 }
 
@@ -270,11 +269,7 @@ fn draw_grid(
     // 作用域里有会话，只是全停了——空状态那句话要说得不一样
     has_stopped: bool,
 ) {
-    let Chrome {
-        connected,
-        scope,
-        lang,
-    } = chrome;
+    let Chrome { connected, lang } = chrome;
     if area.width < MIN_COLS || area.height < MIN_ROWS {
         // 说人话说清下一步做什么：这是用户自己能修好的事
         f.render_widget(
@@ -295,16 +290,12 @@ fn draw_grid(
             return;
         }
         // `n` 在九宫格里跟在列表里是同一个键，直接说怎么开，别让用户
-        // 先绕回列表。
-        //
-        // 「只看当前项目」时还要多说一句 `a`：别的项目可能正跑着会话，
-        // 只说「还没有会话」会让用户以为 dct 把它们弄丢了——这正是这一版
-        // 被判为「混乱」的那类体验。
-        let empty = match scope {
-            Scope::CurrentProject => text(Key::NoSessionsHere, lang),
-            Scope::AllProjects => text(Key::NoSessionsAtAll, lang),
-        };
-        f.render_widget(Paragraph::new(empty).centered(), centered_line(area));
+        // 先绕回列表。分组之后九宫格画的是**所有**项目的会话，所以
+        // 「一个都没有」就是字面意思，不再需要「别的项目里可能还有」那半句。
+        f.render_widget(
+            Paragraph::new(text(Key::NoSessionsAtAll, lang)).centered(),
+            centered_line(area),
+        );
         return;
     }
 
@@ -359,15 +350,14 @@ fn draw_grid(
                 status_style(info.state),
             ),
         ];
-        // 全部项目视图里九个格子长得都一样，不点名项目就分不出谁是谁。
-        // 只看当前项目时不加：底栏已经写了，加了是把边框宽度花在废话上。
-        if scope == Scope::AllProjects {
-            let project = std::path::Path::new(&info.dir)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| info.dir.clone());
-            title.push(Span::styled(format!("{project} "), dim()));
-        }
+        // 九个格子长得都一样，不点名项目就分不出谁是谁。九宫格现在画的是
+        // 所有项目的会话，所以这一条**无条件**加——不加就没有任何地方能
+        // 告诉用户这一格属于谁。
+        let project = std::path::Path::new(&info.dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| info.dir.clone());
+        title.push(Span::styled(format!("{project} "), dim()));
         // 焦点格的标题反色成一条**铺满整格宽度**的实心色块。
         //
         // 只把标题文字反色不够：文字才占十来列，格子宽三四十列，剩下的还是
@@ -772,15 +762,7 @@ mod tests {
     #[test]
     fn the_focused_tile_is_marked_with_the_same_arrow_the_list_uses() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3)
-            .map(|i| {
-                let mut s = session(i, SessionState::Idle);
-                s.dir = "/tmp/a".into();
-                s
-            })
-            .collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
 
         let c = grid_text(&mut app);
@@ -794,7 +776,6 @@ mod tests {
     #[test]
     fn a_grid_of_only_stopped_sessions_says_where_they_went() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
         let mut s1 = session(1, SessionState::Stopped);
         s1.dir = "/tmp/a".into();
         app.set_sessions(vec![s1]);
@@ -810,11 +791,9 @@ mod tests {
     #[test]
     fn a_failed_tile_gets_a_red_border() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
         let mut s = session(1, SessionState::Failed);
         s.dir = "/tmp/a".into();
-        app.sessions = vec![s];
-        app.refresh_visible();
+        app.set_sessions(vec![s]);
         app.view = View::grid(0);
 
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -831,65 +810,43 @@ mod tests {
         assert!(red, "出错的格子必须有红色，扫一眼就看得见");
     }
 
-    /// 九宫格跟列表必须看到同一批会话。只修列表不修格子的话，用户按 `g`
-    /// 就会看到刚刚被过滤掉的那些会话又冒出来。
+    /// 九宫格跟列表看的是同一批会话——列表现在按项目分组列出全部，
+    /// 格子也就该把全部都画出来。每一格标题**无条件**带项目名：九个格子
+    /// 长得都一样，不点名就分不出谁是谁。
     #[test]
-    fn the_grid_never_shows_another_projects_sessions() {
+    fn every_tile_names_its_own_project() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
-        app.sessions = vec![
+        app.set_sessions(vec![
             session_in(1, "/w/dc-terminal"),
             session_in(2, "/w/dc_desktop"),
-        ];
-        app.refresh_visible();
+        ]);
         app.view = View::grid(0);
 
         let c = grid_text(&mut app);
-        assert!(c.contains("1claude"), "当前项目的格子要在：{c}");
-        assert!(!c.contains("2claude"), "别的项目的格子不能画出来：{c}");
-    }
-
-    /// 全部项目视图里，格子标题要点名项目——九个格子长得都一样，
-    /// 不标名字用户分不出哪个格子属于哪个项目。
-    #[test]
-    fn the_all_projects_grid_names_each_tiles_project() {
-        let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
-        app.sessions = vec![
-            session_in(1, "/w/dc-terminal"),
-            session_in(2, "/w/dc_desktop"),
-        ];
-        app.scope = Scope::AllProjects;
-        app.refresh_visible();
-        app.view = View::grid(0);
-
-        let c = grid_text(&mut app);
+        assert!(c.contains("1claude"), "两个项目的格子都要在：{c}");
+        assert!(c.contains("2claude"), "别的项目不再被藏起来：{c}");
+        assert!(c.contains("dc-terminal"), "格子标题要带项目名：{c}");
         assert!(c.contains("dc_desktop"), "格子标题要带项目名：{c}");
     }
 
-    /// 当前项目一个会话都没有时，别只说「还没有会话」——别的项目可能正跑着，
-    /// 得告诉用户怎么看到它们，否则他会以为 dct 把会话弄丢了。
+    /// 一个会话都没有时，直接说怎么开一个。分组之后九宫格画的是所有项目的
+    /// 会话，「这里没有但别处可能有」这种半句话不再存在。
     #[test]
-    fn an_empty_scope_tells_the_user_how_to_see_the_other_projects() {
+    fn an_empty_grid_says_how_to_start_a_session() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/w/dc-terminal");
-        app.sessions = vec![session_in(2, "/w/dc_desktop")];
-        app.refresh_visible();
+        app.set_sessions(Vec::new());
         app.view = View::grid(0);
 
         let c = grid_text(&mut app);
-        assert!(c.contains("a"), "空状态要提到 a 键：{c}");
-        assert!(c.contains("全部项目"), "并说明它能看到什么：{c}");
+        assert!(c.contains("还没有任何会话"), "空状态要说人话：{c}");
+        assert!(c.contains("按n开一个"), "并指出下一步怎么做：{c}");
     }
 
     /// 焦点从 0 一路走到 2 再走回来，视图始终留在九宫格里。
     #[test]
     fn arrows_move_the_focus_and_stay_in_the_grid() {
         let (mut app, _dir) = App::test_app();
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(0);
 
         handle_key(&mut app, key(KeyCode::Right)).unwrap();
@@ -906,10 +863,7 @@ mod tests {
     fn f3_moves_to_the_next_tile_like_the_right_arrow() {
         // 跟会话视图里的 F3 是同一个动作，两处语义一致
         let (mut app, _dir) = App::test_app();
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(2);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(matches!(app.view, View::Grid { focus: 0, .. }), "到头回绕");
@@ -919,10 +873,7 @@ mod tests {
     fn enter_zooms_into_the_focused_session() {
         // 格子只读，交互全靠放大——这条路径断了，九宫格就没法用了
         let (mut app, _dir) = App::test_app();
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(2);
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Attached(3)));
@@ -932,10 +883,7 @@ mod tests {
     #[test]
     fn g_switches_back_to_list_mode_and_remembers_it() {
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![session(1, SessionState::Idle)];
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
         app.view_mode = crate::ui::ViewMode::Grid;
         app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
@@ -956,10 +904,7 @@ mod tests {
     #[test]
     fn g_moves_the_list_cursor_to_the_focused_tile() {
         let (mut app, _dir) = App::test_app();
-        app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions((1..=6).map(|i| session(i, SessionState::Idle)).collect());
         app.list_state.select(Some(0));
         app.view_mode = crate::ui::ViewMode::Grid;
         app.view = View::grid(4);
@@ -967,8 +912,8 @@ mod tests {
         assert!(matches!(app.view, View::Board));
         assert_eq!(
             app.list_state.selected(),
-            Some(4),
-            "从第 5 格回列表，光标必须停在第 5 行——\
+            Some(5),
+            "从第 5 格回列表，光标必须停在会话 5 那一行（组头占了第 0 行）——\
              不然接下来的 s/u 会停掉、回滚另一个会话"
         );
     }
@@ -980,14 +925,12 @@ mod tests {
     #[test]
     fn the_cursor_sync_follows_the_focus_and_leaves_other_views_alone() {
         let (mut app, _dir) = App::test_app();
-        app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions((1..=6).map(|i| session(i, SessionState::Idle)).collect());
         app.list_state.select(Some(0));
         app.view = View::grid(4);
         super::super::sync_board_cursor_from_grid(&mut app);
-        assert_eq!(app.list_state.selected(), Some(4));
+        // 行是 [组头, 1, 2, 3, 4, 5, 6]：第 5 格是会话 5，落在第 5 行
+        assert_eq!(app.list_state.selected(), Some(5));
 
         // 从别的视图按 Ctrl+Q 时它也会被调到，那时候不该动光标
         app.view = View::Attached(1);
@@ -1001,15 +944,12 @@ mod tests {
         // Enter 放大也是离开九宫格的一条路：从会话里 Ctrl+Q 出来就到列表，
         // 那时候光标得在刚才看的那个会话上。
         let (mut app, _dir) = App::test_app();
-        app.sessions = (1..=6).map(|i| session(i, SessionState::Idle)).collect();
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions((1..=6).map(|i| session(i, SessionState::Idle)).collect());
         app.list_state.select(Some(0));
         app.view = View::grid(3);
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.view, View::Attached(4)));
-        assert_eq!(app.list_state.selected(), Some(3));
+        assert_eq!(app.list_state.selected(), Some(4), "组头占了第 0 行");
     }
 
     #[test]
@@ -1019,10 +959,7 @@ mod tests {
         // 挑的都是九宫格没有绑定的键——绑了的那几个（n/N/p/c/q/s/u/d）
         // 做的是看板上同名键的那件事，不是「打字」。
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![session(1, SessionState::Idle)];
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
         app.view = View::grid(0);
         for c in ['x', '中', 'z'] {
             handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
@@ -1034,10 +971,7 @@ mod tests {
     #[test]
     fn q_quits_from_the_grid_just_like_from_the_list() {
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![session(1, SessionState::Idle)];
-        // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
         app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('q'))).unwrap();
         assert!(app.quit);
@@ -1053,19 +987,13 @@ mod tests {
     fn the_board_keys_behave_identically_in_the_grid() {
         for c in ['n', 'N', 'p', 'c'] {
             let (mut on_board, _d1) = App::test_app();
-            on_board.sessions = vec![session(1, SessionState::Idle)];
-            // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-            on_board.current_dir = std::path::PathBuf::from("/tmp/a");
-            on_board.refresh_visible();
+            on_board.set_sessions(vec![session(1, SessionState::Idle)]);
             on_board.list_state.select(Some(0));
             on_board.view = View::Board;
             super::super::board::handle_key(&mut on_board, key(KeyCode::Char(c))).unwrap();
 
             let (mut on_grid, _d2) = App::test_app();
-            on_grid.sessions = vec![session(1, SessionState::Idle)];
-            // `session()` 的 dir 是 /tmp/a：让当前项目对上它，走真实的过滤路径
-            on_grid.current_dir = std::path::PathBuf::from("/tmp/a");
-            on_grid.refresh_visible();
+            on_grid.set_sessions(vec![session(1, SessionState::Idle)]);
             on_grid.view = View::grid(0);
             handle_key(&mut on_grid, key(KeyCode::Char(c))).unwrap();
 
@@ -1160,7 +1088,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1196,7 +1123,6 @@ mod tests {
                 1,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1252,7 +1178,6 @@ mod tests {
                 1,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1299,7 +1224,6 @@ mod tests {
                 1,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1356,7 +1280,6 @@ mod tests {
                 1,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1397,7 +1320,6 @@ mod tests {
                 1,
                 Chrome {
                     connected: false,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1461,7 +1383,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1490,7 +1411,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1510,7 +1430,6 @@ mod tests {
                 9,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1531,7 +1450,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1556,7 +1474,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1583,7 +1500,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1592,7 +1508,7 @@ mod tests {
         .unwrap();
         let c = squashed(&term);
         assert!(
-            c.contains("还没有会话"),
+            c.contains("还没有任何会话"),
             "空看板要说话，不能只画一个空框：{c}"
         );
         assert!(c.contains("按n开一个"), "n 在这一屏就能按，直接说：{c}");
@@ -1619,7 +1535,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1653,7 +1568,6 @@ mod tests {
                 0,
                 Chrome {
                     connected: true,
-                    scope: Scope::CurrentProject,
                     lang: Lang::Zh,
                 },
                 false,
@@ -1672,9 +1586,7 @@ mod tests {
     #[test]
     fn i_opens_a_reply_box_addressed_to_the_focused_session() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
 
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
@@ -1698,9 +1610,7 @@ mod tests {
     #[test]
     fn action_keys_do_not_fire_while_the_reply_box_is_open() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
 
@@ -1728,9 +1638,7 @@ mod tests {
     #[test]
     fn arrows_do_not_move_the_focus_while_the_box_is_open() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
 
@@ -1752,9 +1660,7 @@ mod tests {
     #[test]
     fn esc_closes_the_box_and_leaves_the_grid_alone() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
         handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
@@ -1777,9 +1683,7 @@ mod tests {
     #[test]
     fn reopening_the_box_starts_from_a_blank_draft() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
 
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
@@ -1819,9 +1723,7 @@ mod tests {
     #[test]
     fn the_reply_box_names_who_it_is_addressed_to() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=3).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(1);
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
         for c in "继续".chars() {
@@ -1838,9 +1740,7 @@ mod tests {
     #[test]
     fn an_empty_box_says_that_a_bare_enter_approves() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = vec![session(1, SessionState::Idle)];
-        app.refresh_visible();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
         app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
 
@@ -1859,9 +1759,7 @@ mod tests {
 
         let (mut app, _dir) = App::test_app();
         app.connected = true;
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.sessions = (1..=4).map(|i| session(i, SessionState::Idle)).collect();
-        app.refresh_visible();
+        app.set_sessions((1..=4).map(|i| session(i, SessionState::Idle)).collect());
         app.view = View::grid(0);
         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
 

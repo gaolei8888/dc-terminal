@@ -23,27 +23,17 @@ pub struct App {
     pub client: Option<Client>,
     pub view: View,
     pub list_state: ListState,
-    // 守护进程返回的**全量**列表。除了重算 `visible`，界面不该直接读它——
-    // 读了就会把别的项目的会话画上屏，那正是这套机制要修的 bug。
+    /// 守护进程返回的**全量**列表。界面不直接读它，读的是 `groups`。
     pub sessions: Vec<SessionInfo>,
-    // 当前作用域下真正上屏的那些，由 `refresh_visible()` 从 `sessions` 派生。
-    //
-    // 派生出一份 Vec 而不是留一个过滤器函数或一张下标映射表：`board`/`grid`/
-    // `mod` 里的光标、焦点、`session_action` 全都是**按下标**索引会话的。
-    // 换成一份已经筛好的 Vec，这些调用点逻辑一个字都不用改；映射表则要求
-    // 每一处都记得转换一次，漏一处就是「选中第 3 行、停掉第 5 个会话」
-    // 这种最难查的 bug。
-    pub visible: Vec<SessionInfo>,
-    /// 九宫格真正画出来的那些：`visible` 去掉已停止的。
-    ///
-    /// 九宫格是「看几个 agent 此刻在干什么」的地方——kill 掉的会话没有
-    /// 「此刻」，一格给它就是一格静止截图或者一片空白。列表那边不筛：
-    /// 停掉的会话还剩唯一一点价值，`u` 回滚它做过的改动、`d` 看它改了什么。
-    ///
-    /// 两个模式看到的集合因此不同，所以**光标和焦点只能按会话 id 对应，
-    /// 不能按下标**（见 `mod.rs` 的 `home_view` / `sync_board_cursor_from_grid`）。
-    pub grid_visible: Vec<SessionInfo>,
-    pub scope: super::view::Scope,
+    /// 按项目分好的组。看板画的是它。
+    pub groups: Vec<super::view::ProjectGroup>,
+    /// `groups` 展平成的行（组头 + 会话），`list_state` 选的是它的下标。
+    pub rows: Vec<super::view::Row>,
+    /// 用户 pin 上看板的项目（守护进程给的）。跟 `sessions` 一起决定
+    /// 看板上出现哪些组——规则 1：有会话的 ∪ pinned 的。
+    pub pinned: Vec<String>,
+    /// 项目目录 → 上次用的 agent（守护进程给的），组头和底栏 `n` 要用。
+    pub profiles: std::collections::BTreeMap<String, String>,
     /// 用户选的看板画法。列表和九宫格是**平级**的两个模式，不是一个视图
     /// 加一个附属页面——所以每一处「回看板」都得问它（见 `mod.rs::home_view`）。
     pub view_mode: super::view::ViewMode,
@@ -99,8 +89,6 @@ pub struct App {
     // 不必把这条防线押在"每个退出分支都记得清 receiver"这种容易漏改的
     // 纪律上。
     pub verify_rx: Option<std::sync::mpsc::Receiver<(String, String, VerifyOutcome)>>,
-    // start_dir 是 dct 启动时的目录，只用来解析用户敲进来的相对路径，永不改变。
-    // current_dir 是「新会话开在哪」，选择器会改它。
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
@@ -110,8 +98,10 @@ pub struct App {
     /// 存路径而不是存设置文件路径：将来别的「跟着 socket 走」的文件
     /// （profiles 目录、projects.json）也都从它推导，只留一个源头。
     pub socket: PathBuf,
+    /// dct 启动时的目录，只用来解析用户敲进来的相对路径、以及看板上一个组
+    /// 都还没有时的兜底落点。**永不改变**——「当前项目」不再是一个字段，
+    /// 而是光标所在的那个组（见 `current_dir()`）。
     pub start_dir: PathBuf,
-    pub current_dir: PathBuf,
     pub quit: bool,
     /// 贴在会话里时，出错解释算出来之后缓存在这（会话 id, 解释文字）。
     ///
@@ -151,11 +141,10 @@ impl App {
             },
             list_state: ListState::default(),
             sessions: Vec::new(),
-            visible: Vec::new(),
-            grid_visible: Vec::new(),
-            // 每次启动都从「只看当前项目」开始。作用域不持久化：它是个
-            // 临时的查看动作，不是配置。
-            scope: super::view::Scope::CurrentProject,
+            groups: Vec::new(),
+            rows: Vec::new(),
+            pinned: Vec::new(),
+            profiles: std::collections::BTreeMap::new(),
             view_mode,
             message: "".into(),
             screen: Vec::new(),
@@ -173,8 +162,7 @@ impl App {
             verify_rx: None,
             lang,
             socket,
-            start_dir: default_dir.clone(),
-            current_dir: default_dir,
+            start_dir: default_dir,
             quit: false,
             explained_failure: None,
         }
@@ -205,12 +193,12 @@ impl App {
     }
 
     /// 只给测试用：`board`/`attach`/`pick`/`secret` 里 `draw()`/`handle_key()`
-    /// 的单测要喂一个 `App`，但用不上真实守护进程，也不关心 `current_dir`
+    /// 的单测要喂一个 `App`，但用不上真实守护进程，也不关心 `start_dir`
     /// 具体是哪——用临时目录垫一个就行。
     ///
     /// 必须把 `TempDir` guard 跟 `App` 一起交出去：`tempfile::tempdir()` 返回的
     /// 目录在 guard 被 drop 的那一刻就从磁盘上删掉。如果这里只取
-    /// `dir.path()` 垫两个字段就让 `dir` 在函数结束时被丢弃，`current_dir`
+    /// `dir.path()` 垫两个字段就让 `dir` 在函数结束时被丢弃，`start_dir`
     /// 存的会是一个刚被删除的路径——大多数单测只是把这个路径当字符串用，
     /// 不会踩到，但只要有一天哪个测试真的碰了文件系统（`is_dir()`、
     /// `expand_path` 之类），就会在一个已经不存在的目录上悄无声息地失败。
@@ -225,11 +213,11 @@ impl App {
 
     /// 装入守护进程刚返回的会话列表。**赋值和重算必须成对发生**，所以
     /// 主循环走这条路而不是直接写 `app.sessions = v`——直接赋值的话，
-    /// 这一帧还会拿着上一轮的 `visible` 去画，刚开的会话要等下一轮才出现。
+    /// 这一帧还会拿着上一轮的 `rows` 去画，刚开的会话要等下一轮才出现。
     pub fn set_sessions(&mut self, v: Vec<SessionInfo>) {
         self.announce_new_failures(&v);
         self.sessions = v;
-        self.refresh_visible();
+        self.refresh_rows();
     }
 
     /// 刚进入失败态的会话，说一句。
@@ -241,9 +229,9 @@ impl App {
     /// 只在**转变**的那一刻说：还留在失败态里的会话不会每轮再喊一遍，
     /// 否则底栏会变成噪音，还会盖住用户正需要看的别的提示。
     ///
-    /// 用 `sessions`（全量）而不是 `visible`：别的项目的会话出错了照样要说。
-    /// 过滤只决定看板列什么，不该让一个真出了事的会话彻底无声——用户不知道
-    /// 它坏了，就不会去看它，而那正是这个功能要解决的事。
+    /// 用 `sessions`（全量）而不是分好组的那份：别的项目的会话出错了照样要说，
+    /// 哪怕它所在的组正被折叠着。用户不知道它坏了，就不会去看它，而那正是
+    /// 这个功能要解决的事。
     fn announce_new_failures(&mut self, next: &[SessionInfo]) {
         use crate::session::SessionState::Failed;
         let was_failed = |id: u32| {
@@ -264,39 +252,76 @@ impl App {
         }
     }
 
-    /// 从 `sessions` 重算 `visible`，然后把光标和焦点收拢进新的范围。
+    /// 从 `sessions` + `pinned` 重算分组和行，并把光标钉回原来那个东西上。
     ///
-    /// 只该在三个地方调用，多一处是白算，少一处是屏幕说谎：
-    /// 拉到新的会话列表之后、`scope` 被切换时、`current_dir` 被改变时。
-    pub fn refresh_visible(&mut self) {
-        self.visible = super::view::visible_sessions(&self.sessions, self.scope, &self.current_dir);
-        self.grid_visible = self
-            .visible
+    /// **先取锚点再重算**：顺序反了的话锚点取的是新列表里的东西，
+    /// 等于没锚。
+    pub fn refresh_rows(&mut self) {
+        let anchor = self
+            .list_state
+            .selected()
+            .and_then(|i| super::view::anchor_of(&self.groups, &self.rows, i));
+        // 折叠状态是用户的选择，重算不能把它抹掉
+        let collapsed: Vec<PathBuf> = self
+            .groups
             .iter()
-            .filter(|s| s.state != crate::session::SessionState::Stopped)
-            .cloned()
+            .filter(|g| g.collapsed)
+            .map(|g| g.dir.clone())
             .collect();
 
-        // 收拢到**末项**而不是首项：用户的注意力在列表尾部时，弹回第一行
-        // 会让他以为自己选中的会话被删了。
-        // 列表光标按 `visible` 收，九宫格焦点按 `grid_visible` 收——
-        // 两个集合长度不同，共用一个上界会让其中一个越界。
-        match self.visible.len() {
-            // 零个 item 上还留着 Some(0)，List 会画一条悬空的高亮
-            0 => self.list_state.select(None),
-            n => {
-                // 只在越界时才动它。没选中过就保持没选中——这里不负责
-                // 「替用户选一个」，那是 `move_sel` 和进入视图时的事。
-                if let Some(i) = self.list_state.selected() {
-                    if i > n - 1 {
-                        self.list_state.select(Some(n - 1));
-                    }
-                }
-            }
+        self.groups = super::view::group_sessions(&self.sessions, &self.pinned, &self.profiles);
+        for g in &mut self.groups {
+            g.collapsed = collapsed.contains(&g.dir);
         }
-        let grid_last = self.grid_visible.len().saturating_sub(1);
+        self.rows = super::view::flatten(&self.groups);
+
+        let next = anchor
+            .and_then(|a| super::view::find_anchor(&self.groups, &self.rows, &a))
+            // 找不回来（第一次、或者组真的没了）就落在第 0 行。
+            // 行数为零时不选——`List` 在空列表上留着 `Some(0)` 会画一条悬空高亮。
+            .or(if self.rows.is_empty() { None } else { Some(0) });
+        self.list_state.select(next);
+
+        let grid_last = self.grid_sessions().len().saturating_sub(1);
         if let View::Grid { focus, .. } = &mut self.view {
             *focus = (*focus).min(grid_last);
+        }
+    }
+
+    /// 九宫格真正画出来的那些：所有组的会话按 (项目, id) 连排，去掉已停止的。
+    ///
+    /// 九宫格是「看几个 agent 此刻在干什么」的地方——停掉的会话没有「此刻」。
+    /// 列表那边不筛：停掉的会话还剩唯一一点价值，`u` 回滚、`d` 看改动。
+    pub fn grid_sessions(&self) -> Vec<SessionInfo> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.sessions.iter())
+            .filter(|s| s.state != crate::session::SessionState::Stopped)
+            .cloned()
+            .collect()
+    }
+
+    /// 光标所在的组。**这是「当前项目」唯一的答案处。**
+    pub fn current_group(&self) -> Option<&super::view::ProjectGroup> {
+        let i = self.list_state.selected()?;
+        let gi = super::view::group_of(&self.rows, i)?;
+        self.groups.get(gi)
+    }
+
+    /// 新会话开在哪。没有任何组时（只可能发生在还没拉到列表的第一帧）
+    /// 退回启动目录。
+    pub fn current_dir(&self) -> PathBuf {
+        self.current_group()
+            .map(|g| g.dir.clone())
+            .unwrap_or_else(|| self.start_dir.clone())
+    }
+
+    /// 光标停在会话行上时是哪个会话；停在组头上就是 `None`。
+    pub fn selected_session(&self) -> Option<&SessionInfo> {
+        let i = self.list_state.selected()?;
+        match self.rows.get(i)? {
+            super::view::Row::Header(_) => None,
+            super::view::Row::Session(g, s) => self.groups.get(*g)?.sessions.get(*s),
         }
     }
 
@@ -341,70 +366,114 @@ mod tests {
         }
     }
 
-    /// 过滤会让列表变短，而光标是个下标。不收拢的话，`grid.rs` 里
+    /// 会话没了列表就变短，而九宫格焦点是个下标。不收拢的话，`grid.rs` 里
     /// `move_focus` 的 `total - page_start` 在 release 下会**下溢**，
     /// debug 下则直接撞上那条 `debug_assert!(focus < total)`。
     #[test]
-    fn refresh_visible_clamps_the_cursor_into_the_new_range() {
+    fn refresh_rows_clamps_the_grid_focus_into_the_new_range() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
-        app.sessions = vec![
+        app.set_sessions(vec![
             sess(1, "/w/a"),
             sess(2, "/w/b"),
             sess(3, "/w/b"),
             sess(4, "/w/b"),
             sess(5, "/w/a"),
-        ];
-        app.list_state.select(Some(4));
+        ]);
         app.view = View::grid(4);
 
-        app.refresh_visible();
+        app.set_sessions(vec![sess(1, "/w/a"), sess(5, "/w/a")]);
 
-        assert_eq!(app.visible.len(), 2, "当前项目只有两个会话");
-        assert_eq!(
-            app.list_state.selected(),
-            Some(1),
-            "光标收拢到末项而不是首项——注意力在列表尾部时弹回第一行，\
-             用户会以为自己选中的会话没了"
-        );
+        assert_eq!(app.grid_sessions().len(), 2);
         assert!(
             matches!(app.view, View::Grid { focus: 1, .. }),
-            "焦点同样收拢"
+            "焦点收拢到最后一格，而不是越界"
+        );
+        assert!(
+            app.list_state
+                .selected()
+                .is_some_and(|i| i < app.rows.len()),
+            "光标也必须还落在一行真实存在的行上"
         );
     }
 
-    /// 作用域空了就没有格子可焦。光标必须是 `None` 而不是 `Some(0)`：
+    /// 一行都没有就没有东西可选。光标必须是 `None` 而不是 `Some(0)`：
     /// `Some(0)` 会让列表在零个 item 上画高亮条。
     #[test]
-    fn refresh_visible_drops_the_cursor_when_nothing_is_visible() {
+    fn refresh_rows_drops_the_cursor_when_there_are_no_rows() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
-        app.sessions = vec![sess(1, "/w/b")];
-        app.list_state.select(Some(0));
+        app.set_sessions(vec![sess(1, "/w/b")]);
         app.view = View::grid(3);
 
-        app.refresh_visible();
+        app.set_sessions(Vec::new());
 
-        assert!(app.visible.is_empty());
+        assert!(app.rows.is_empty());
         assert_eq!(app.list_state.selected(), None);
         assert!(matches!(app.view, View::Grid { focus: 0, .. }));
     }
 
     /// 主循环每轮拿到新的会话列表时走这条路。存在的理由是「赋值 + 重算」
     /// 必须成对发生 —— 直接写 `app.sessions = v` 的话，屏幕会拿旧的
-    /// `visible` 再画一帧，刚开的会话要等下一轮才出现。
+    /// `rows` 再画一帧，刚开的会话要等下一轮才出现。
     #[test]
-    fn set_sessions_recomputes_the_visible_list() {
-        let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
-
+    fn set_sessions_builds_groups_and_rows() {
+        let (mut app, _d) = App::test_app();
         app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
 
+        assert_eq!(app.groups.len(), 2);
+        assert_eq!(app.rows.len(), 4, "两个组头 + 两个会话行");
+    }
+
+    /// 规则 5：项目只在用户移动光标时变。后台多出来的会话不能把光标推走。
+    #[test]
+    fn a_new_session_in_another_project_does_not_move_the_cursor() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess(1, "/w/a"), sess(7, "/w/b")]);
+        // 光标放到 /w/b 的会话 7 上
+        app.list_state.select(Some(3));
+        let before = app.current_dir();
+
+        app.set_sessions(vec![sess(1, "/w/a"), sess(4, "/w/a"), sess(7, "/w/b")]);
+
+        assert_eq!(app.current_dir(), before, "当前项目没变");
+        assert_eq!(app.selected_session().map(|s| s.id), Some(7));
+    }
+
+    /// 组不塌陷：最后一个会话没了，组变空留在原地，光标落到它自己的组头上。
+    #[test]
+    fn a_group_that_loses_its_last_session_keeps_the_cursor() {
+        let (mut app, _d) = App::test_app();
+        app.pinned = vec!["/w/b".to_string()];
+        app.set_sessions(vec![sess(1, "/w/a"), sess(7, "/w/b")]);
+        app.list_state.select(Some(3));
+
+        app.set_sessions(vec![sess(1, "/w/a")]);
+
+        assert_eq!(app.groups.len(), 2, "pinned 的空组留在看板上");
         assert_eq!(
-            app.visible.iter().map(|s| s.id).collect::<Vec<_>>(),
-            vec![1],
-            "拿到新列表的同一时刻就要筛好，不能留到下一帧"
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "光标还在 b 上，没有滑回 a"
         );
+    }
+
+    #[test]
+    fn the_current_project_is_whatever_group_the_cursor_is_in() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
+
+        app.list_state.select(Some(0));
+        assert!(app.current_dir().ends_with("a"));
+        app.list_state.select(Some(2));
+        assert!(app.current_dir().ends_with("b"));
+    }
+
+    #[test]
+    fn the_grid_leaves_out_stopped_sessions_but_keeps_the_group() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![stopped(1, "/w/a"), sess(2, "/w/a")]);
+
+        assert_eq!(app.groups[0].sessions.len(), 2, "列表里两个都在");
+        assert_eq!(app.grid_sessions().len(), 1, "九宫格里只剩没停的那个");
     }
 
     fn failing(id: u32, dir: &str) -> SessionInfo {
@@ -435,7 +504,6 @@ mod tests {
     #[test]
     fn the_grid_leaves_out_stopped_sessions() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.set_sessions(vec![
             stopped(1, "/w/a"),
             sess(2, "/w/a"),
@@ -444,12 +512,16 @@ mod tests {
         ]);
 
         assert_eq!(
-            app.visible.iter().map(|s| s.id).collect::<Vec<_>>(),
+            app.groups[0]
+                .sessions
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3, 4],
             "列表要留着它们：停掉的会话还能 u 回滚、d 看改动"
         );
         assert_eq!(
-            app.grid_visible.iter().map(|s| s.id).collect::<Vec<_>>(),
+            app.grid_sessions().iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![2, 4],
             "九宫格只画还活着的"
         );
@@ -462,7 +534,6 @@ mod tests {
     fn switching_modes_keeps_the_same_session_under_the_cursor() {
         use super::super::{home_view, sync_board_cursor_from_grid};
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.set_sessions(vec![
             stopped(1, "/w/a"),
             sess(2, "/w/a"),
@@ -471,8 +542,9 @@ mod tests {
         ]);
         app.view_mode = crate::ui::ViewMode::Grid;
 
-        // 列表选中会话 4（下标 3）→ 九宫格该落在会话 4（格子下标 1）
-        app.list_state.select(Some(3));
+        // 行是 [组头, 1, 2, 3, 4]：列表选中会话 4（第 4 行）→ 九宫格该落在
+        // 会话 4（格子下标 1，停掉的两个不占格子）
+        app.list_state.select(Some(4));
         assert!(
             matches!(home_view(&app), View::Grid { focus: 1, .. }),
             "焦点要落在同一个**会话**上，不是同一个下标"
@@ -481,17 +553,16 @@ mod tests {
         // 反方向：焦点在第 2 格（会话 4）→ 列表光标回到会话 4 那一行
         app.view = View::grid(1);
         sync_board_cursor_from_grid(&mut app);
-        assert_eq!(app.list_state.selected(), Some(3));
+        assert_eq!(app.list_state.selected(), Some(4));
     }
 
     /// 全都停掉时九宫格是空的——不能 panic，焦点收拢到 0。
     #[test]
     fn a_grid_where_everything_is_stopped_is_empty_not_broken() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.view = View::grid(2);
         app.set_sessions(vec![stopped(1, "/w/a"), stopped(2, "/w/a")]);
-        assert!(app.grid_visible.is_empty());
+        assert!(app.grid_sessions().is_empty());
         assert!(matches!(app.view, View::Grid { focus: 0, .. }));
     }
 
@@ -501,7 +572,6 @@ mod tests {
     #[test]
     fn a_session_that_just_failed_announces_itself() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.set_sessions(vec![sess(1, "/w/a")]);
         assert!(app.message.text.is_empty(), "前提：还没出错");
 
@@ -519,7 +589,6 @@ mod tests {
     #[test]
     fn a_session_that_stays_failed_only_announces_once() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.set_sessions(vec![sess(1, "/w/a")]);
         app.set_sessions(vec![failing(1, "/w/a")]);
         app.message = "".into();
@@ -533,7 +602,6 @@ mod tests {
     #[test]
     fn a_failure_in_another_project_is_still_announced() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.set_sessions(vec![sess(2, "/w/b")]);
         app.set_sessions(vec![failing(2, "/w/b")]);
         assert!(
@@ -547,7 +615,6 @@ mod tests {
     #[test]
     fn recovering_from_a_failure_says_nothing() {
         let (mut app, _dir) = App::test_app();
-        app.current_dir = PathBuf::from("/w/a");
         app.set_sessions(vec![failing(1, "/w/a")]);
         app.message = "".into();
 
@@ -562,10 +629,9 @@ mod tests {
     fn leaving_a_session_lands_on_the_chosen_mode() {
         use super::super::home_view;
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![sess(1, "/w/a"), sess(2, "/w/a")];
-        app.current_dir = PathBuf::from("/w/a");
-        app.refresh_visible();
-        app.list_state.select(Some(1));
+        app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/a")]);
+        // 行：[组头, 1, 2]——选中会话 2
+        app.list_state.select(Some(2));
 
         app.view_mode = crate::ui::ViewMode::Grid;
         assert!(
@@ -586,14 +652,23 @@ mod tests {
         assert!(matches!(home_view(&app), View::Grid { focus: 0, .. }));
     }
 
-    /// start_dir 只用来解析用户敲的相对路径，永不改变；current_dir 是
-    /// 「下一个会话开在哪」，选择器会改它。两者一开始相同但不是同一个东西，
-    /// 合并成一个字段会让「换了项目之后再敲相对路径」解析到错的基准目录。
+    /// `start_dir` 只用来解析用户敲的相对路径，**永不改变**；
+    /// 「当前项目」是光标所在的那个组，随光标走。两者一开始看起来一样，
+    /// 但不是同一个东西——合并成一个字段会让「换了项目之后再敲相对路径」
+    /// 解析到错的基准目录。
     #[test]
-    fn start_dir_and_current_dir_are_separate_fields() {
+    fn the_start_dir_never_moves_while_the_current_project_follows_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new_disconnected(dir.path().join("s.sock"), dir.path().to_path_buf());
-        app.current_dir = PathBuf::from("/somewhere/else");
-        assert_eq!(app.start_dir, dir.path());
+        assert_eq!(
+            app.current_dir(),
+            dir.path(),
+            "一个组都还没有时退回启动目录"
+        );
+
+        app.set_sessions(vec![sess(1, "/w/somewhere-else")]);
+
+        assert_eq!(app.start_dir, dir.path(), "启动目录不许被会话列表改写");
+        assert!(app.current_dir().ends_with("somewhere-else"));
     }
 }

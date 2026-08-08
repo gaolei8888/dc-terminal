@@ -70,7 +70,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 选完直接进会话。用户选中的意图就是「我要用这个
                 // agent 干活」，先弹回看板再让他找一遍自己刚建的
                 // 会话是白让人做第二次选择。建失败才回选择器。
-                let dir = app.current_dir.display().to_string();
+                let dir = app.current_dir().display().to_string();
                 match app.client().and_then(|c| {
                     c.call(Request::Create {
                         dir,
@@ -129,7 +129,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 用命令行会话跑安装命令，让用户看着它装，而不是
                 // 干等一句「装不了」。remember: false —— 这不是
                 // 用户选的 agent，记了下次按 n 会掉进命令行。
-                let dir = app.current_dir.display().to_string();
+                let dir = app.current_dir().display().to_string();
                 match app.client().and_then(|c| {
                     c.call(Request::Create {
                         dir,
@@ -657,11 +657,11 @@ mod tests {
         assert!(red, "有 warning 时边框要是红的");
     }
 
-    /// 换完项目就得看到新项目的会话。等下一轮 `need_sessions` 才重算的话，
-    /// 中间那一帧画的是上一个项目的会话、底栏却已经写着新项目——正是这一版
-    /// 让用户觉得「同一个 session 变成了不同的项目」的那一幕。
+    /// 换完项目，光标就得落在那个项目的组上——「当前项目 = 光标在哪个组」，
+    /// 所以不挪光标等于什么都没发生：底栏还写着旧项目，`n` 也还是开在旧项目里。
+    /// 等下一轮 `need_sessions` 才重算的话，中间那一帧屏幕上就是上一个项目。
     #[test]
-    fn confirming_a_project_recomputes_the_visible_sessions_at_once() {
+    fn confirming_a_project_moves_the_cursor_into_its_group_at_once() {
         use crate::session::{SessionInfo, SessionState};
         let (mut app, dir) = App::test_app();
         let a = dir.path().join("a");
@@ -677,10 +677,9 @@ mod tests {
             activity: String::new(),
             is_agent: true,
         };
-        app.sessions = vec![mk(1, &a), mk(2, &b)];
-        app.current_dir = a.clone();
-        app.refresh_visible();
-        assert_eq!(app.visible.len(), 1, "前提：a 项目下只有会话 1");
+        app.set_sessions(vec![mk(1, &a), mk(2, &b)]);
+        app.list_state.select(Some(0));
+        assert!(app.current_dir().ends_with("a"), "前提：光标在 a 上");
 
         let mut st = ListState::default();
         st.select(Some(0));
@@ -694,11 +693,11 @@ mod tests {
         });
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
 
-        assert_eq!(app.current_dir, b, "项目切过去了");
+        assert!(app.current_dir().ends_with("b"), "项目切过去了");
         assert_eq!(
-            app.visible.iter().map(|s| s.id).collect::<Vec<_>>(),
-            vec![2],
-            "屏幕上的会话必须同一时刻跟着换，不能等下一轮"
+            app.selected_session().map(|s| s.id),
+            None,
+            "光标停在 b 的组头上，不是随便某个会话上"
         );
     }
 
@@ -722,8 +721,7 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(d)).unwrap();
         }
         let root = tmp.path().to_path_buf();
-        let (mut app, guard) = App::test_app();
-        app.current_dir = root.clone();
+        let (app, guard) = App::test_app();
         (tmp, guard, app, root)
     }
 
@@ -795,7 +793,14 @@ mod tests {
         open_picker(&mut app, vec![], root.clone());
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.current_dir, root.join("proj"), "选定的是高亮那个目录");
+        // 比末段而不是整条路径：`current_dir()` 给的是分组键（已归一化），
+        // macOS 上 `/var/...` 会变成 `/private/var/...`。要问的是「选中的是
+        // 不是 proj 这个目录」，归一化不改变这个答案。
+        assert!(
+            app.current_dir().ends_with("proj"),
+            "选定的是高亮那个目录，实际 {}",
+            app.current_dir().display()
+        );
         assert!(matches!(app.view, View::Board), "选完就回家");
         assert!(app.message.text.contains("已切到"), "换了项目要说一声");
     }

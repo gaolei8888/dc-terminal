@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::i18n::Lang;
 use crate::proto::{MouseForward, MouseForwardKind, Request};
-use crate::session::{ScrollBy, ScrollState};
+use crate::session::{ScrollBy, ScrollState, SessionInfo};
 
 use super::app::App;
 use super::key_to_input;
@@ -115,10 +115,16 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     } else if key.code == KeyCode::F(3) {
         // F3 = 直接切到下一个在跑的会话，不用先退回看板。选 F3 沿用
         // F2 的理由：没有 CLI agent 用 F 功能键，偷它不踩任何人。
-        // 在 `visible` 里找下一个，不是全量：F3 该在你眼下这批会话里轮转。
-        // 进会话时当前项目已经跟着切过去了（见 `enter_session`），所以正在
-        // 附加的这个必定在 `visible` 里，轮转起点不会落空。
-        match super::grid::next_running(&app.visible, id) {
+        // 按**看板上的顺序**（项目、id）轮转，不是守护进程返回的顺序——
+        // 用户眼睛里的顺序就是看板那一份。已停止的会话留在这份列表里：
+        // `next_running` 自己会跳过它们，而正贴着的这一个必须在列表里，
+        // 否则轮转的起点就落空了（从一个已停止的会话按 F3 会一动不动）。
+        let board: Vec<SessionInfo> = app
+            .groups
+            .iter()
+            .flat_map(|g| g.sessions.iter().cloned())
+            .collect();
+        match super::grid::next_running(&board, id) {
             Some(next) => super::enter_session(app, next),
             None => {
                 app.message =
@@ -328,14 +334,11 @@ mod tests {
     fn f3_jumps_straight_to_the_next_running_session() {
         // 不用先退回看板：从会话 1 按 F3 直接落在下一个在跑的会话上。
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![
+        app.set_sessions(vec![
             session(1, SessionState::Working),
             session(2, SessionState::Stopped),
             session(3, SessionState::Idle),
-        ];
-        // `session()` 的 dir 是 /tmp/a：对上当前项目，走真实的过滤路径
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        ]);
         app.view = View::Attached(1);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(
@@ -349,9 +352,7 @@ mod tests {
     fn f3_says_so_when_this_is_the_only_running_session() {
         // 唯一在跑的会话按 F3：不能跳回自己，也不能悄无声息什么都不做。
         let (mut app, _dir) = App::test_app();
-        app.sessions = vec![session(1, SessionState::Working)];
-        app.current_dir = std::path::PathBuf::from("/tmp/a");
-        app.refresh_visible();
+        app.set_sessions(vec![session(1, SessionState::Working)]);
         app.view = View::Attached(1);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(matches!(app.view, View::Attached(1)), "不能跳回自己");

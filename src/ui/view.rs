@@ -631,44 +631,11 @@ impl ViewMode {
     }
 }
 
-/// 看板上到底显示哪些会话。跟着用户走而不是跟着视图走——列表和九宫格是
-/// 同一批会话的两种画法，作用域在两边必须一致，否则切个视图会话数就变了。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Scope {
-    CurrentProject,
-    AllProjects,
-}
-
-/// 按作用域筛出真正上屏的会话。抽成纯函数是为了能单测（同 `filter_projects`）
-/// ——过滤错了的代价是用户对着别的项目的会话按 `s` 停止，这必须在有守护
-/// 进程之前就测得到。
-pub(crate) fn visible_sessions(
-    all: &[crate::session::SessionInfo],
-    scope: Scope,
-    project: &Path,
-) -> Vec<crate::session::SessionInfo> {
-    if scope == Scope::AllProjects {
-        return all.to_vec();
-    }
-    all.iter()
-        .filter(|s| same_project(Path::new(&s.dir), project))
-        .cloned()
-        .collect()
-}
-
-/// 两个路径是不是同一个项目。归一化只在这里定义一次——过滤和「进会话要不要
-/// 切项目」必须用同一套判断，各写各的迟早会分叉成「列表里看不见、但进去了
-/// 又说没换项目」这种自相矛盾的状态。
-pub(crate) fn same_project(dir: &Path, project: &Path) -> bool {
-    canon(dir) == canon(project)
-}
-
 /// 比较用的归一化。**只用于比较，不用于显示**——把 `/tmp` 显示成
 /// `/private/tmp` 会让 macOS 上的界面凭空变丑，而用户并没有做错什么。
 ///
 /// 解析失败（目录已被删）时退化成原样：一个指向已删目录的会话仍然应当
-/// 待在它原本的项目下，而不是从「当前项目」和「全部项目」两个视图里
-/// 同时消失——那才是真的找不回来了。
+/// 待在它原本的项目组下，而不是从看板上凭空消失——那才是真的找不回来了。
 pub(crate) fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
@@ -677,12 +644,7 @@ pub(crate) fn canon(p: &Path) -> PathBuf {
 ///
 /// `sessions` 是这一组要显示的会话——已停止的会话在列表里显示、在九宫格里
 /// 不显示，这个差异由**调用方在传入前过滤**，分组函数本身不认识状态语义。
-///
-/// `#[allow(dead_code)]`：Task 3 只新增这个类型和 `group_sessions`，board.rs
-/// 要到 Task 5 才开始消费它们——在那之前 clippy 会把整块（包括没被任何测试
-/// 读到的 `collapsed` 字段）当死代码报错。
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct ProjectGroup {
     /// 归一化后的绝对路径，也是分组键。**只用于比较，不用于显示**——
     /// 跟 `canon()` 的规矩一致。
@@ -694,13 +656,21 @@ pub(crate) struct ProjectGroup {
     pub parent: String,
     pub sessions: Vec<crate::session::SessionInfo>,
     /// 这个项目上次用的 agent，底栏 `n 新建 <agent>` 要用。
+    ///
+    /// `#[allow(dead_code)]` 只加在这一个字段上（不是整个结构体）：读它的
+    /// 是底栏，而底栏的改造在 Task 7。属性收得这么窄，是为了别顺手把
+    /// 结构体里别的成员的死代码一起盖掉——Task 3 那个 item 级的
+    /// `allow` 正是因为这个才在本 Task 被摘掉。
+    #[allow(dead_code)]
     pub last_profile: Option<String>,
     /// 由 `p` 摆上来的。`x` 只能移除 pinned 且没有会话的组。
+    ///
+    /// 同上，读它的 `unpin_current` 要到 Task 6 才真正实现。
+    #[allow(dead_code)]
     pub pinned: bool,
     pub collapsed: bool,
 }
 
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
 impl ProjectGroup {
     /// 组头上的 `claude×2 codex×1`。**现算不存**：存下来就有两份真相，
     /// 而它们只有一份是新的。按 agent 名排序，跟组的排序同一个理由——
@@ -734,7 +704,6 @@ impl ProjectGroup {
 /// 使用时间的排序，都会让行在用户没按键的时候移动，而「项目在我没
 /// 按键的时候变了」正是这一版要消灭的东西。组内会话按 `id` 升序，
 /// 同一个理由。
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs，测试之外暂时没人调用。
 pub(crate) fn group_sessions(
     sessions: &[crate::session::SessionInfo],
     pinned: &[String],
@@ -811,12 +780,7 @@ pub(crate) fn group_sessions(
 
 /// 看板上的一行。分组之后光标不能再是「第几个会话」——它得能停在组头上，
 /// 空组只有组头这一行。
-///
-/// `#[allow(dead_code)]`：跟 `ProjectGroup` 一样，Task 4 只新增行展平和
-/// 光标锚点这套纯函数，board.rs 要到 Task 5 才开始消费——这个属性到那时候
-/// 就该摘掉。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub(crate) enum Row {
     Header(usize),
     /// (组下标, 组内会话下标)
@@ -824,7 +788,6 @@ pub(crate) enum Row {
 }
 
 /// 把分组展平成屏幕上的行。折叠的组只贡献组头那一行。
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
 pub(crate) fn flatten(groups: &[ProjectGroup]) -> Vec<Row> {
     let mut rows = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
@@ -840,7 +803,6 @@ pub(crate) fn flatten(groups: &[ProjectGroup]) -> Vec<Row> {
 
 /// 某一行属于哪个组。**「当前项目」就是这个函数的答案**——不再有一个
 /// 可以跟屏幕不一致的 `current_dir` 字段。
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
 pub(crate) fn group_of(rows: &[Row], i: usize) -> Option<usize> {
     match rows.get(i)? {
         Row::Header(g) => Some(*g),
@@ -859,13 +821,11 @@ pub(crate) fn group_of(rows: &[Row], i: usize) -> Option<usize> {
 /// 兜底规则根本没法实现，只能瞎猜或者放弃。（这是本任务实现阶段发现的一处
 /// 与参考实现的偏差，详见任务报告。）
 #[derive(Clone, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
 pub(crate) enum Anchor {
     Session(u32, PathBuf),
     Header(PathBuf),
 }
 
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
 pub(crate) fn anchor_of(groups: &[ProjectGroup], rows: &[Row], i: usize) -> Option<Anchor> {
     match rows.get(i)? {
         Row::Header(g) => Some(Anchor::Header(groups.get(*g)?.dir.clone())),
@@ -878,7 +838,6 @@ pub(crate) fn anchor_of(groups: &[ProjectGroup], rows: &[Row], i: usize) -> Opti
 
 /// 找回锚点。顺序：同 id 的会话行 → 该会话原属组的组头 → 同 dir 的组头。
 /// 全找不到返回 `None`，调用方落到第 0 行。
-#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
 pub(crate) fn find_anchor(groups: &[ProjectGroup], rows: &[Row], a: &Anchor) -> Option<usize> {
     match a {
         Anchor::Session(id, dir) => {
@@ -997,9 +956,9 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
 /// 写不出来。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HelpCtx {
-    /// 屏幕上有没有会话。**跟「选中了没有」是两回事**：dct 刚起来时列表
-    /// 光标是 `None`（`refresh_visible` 不替用户选），而这恰恰是最需要
-    /// 看见 `↑↓ 选择` 的时刻——按「有没有选中」判的话，那个键会在唯一
+    /// 屏幕上有没有东西可选。**跟「选中了没有」是两回事**：列表光标可能
+    /// 正停在一个组头上（那一行没有会话），而这恰恰是最需要看见
+    /// `↑↓ 选择` 的时刻——按「有没有选中会话」判的话，那个键会在唯一
     /// 用得上它的场合消失。
     pub has_sessions: bool,
     /// 当前选中（列表）或聚焦（九宫格）的那个会话。`s`/`u`/`d` 都作用在
@@ -1040,7 +999,6 @@ impl HelpCtx {
 /// 九宫格是 `方向键选格子`），`enter` 是「回车做什么」（进入 / 放大）。
 /// 剩下那条 `i 回一句` 只有九宫格有，由调用方插进去。
 fn board_keys(
-    scope_key: crate::i18n::Key,
     ctx: HelpCtx,
     select: (&'static str, crate::i18n::Key),
     enter: (&'static str, crate::i18n::Key),
@@ -1065,7 +1023,6 @@ fn board_keys(
     keys.extend([
         ("g", Key::Grid),
         ("p", Key::SwitchProject),
-        ("a", scope_key),
         ("N", Key::SwitchAgent),
         ("c", Key::Secrets),
         ("l", Key::SettingsTitle),
@@ -1092,14 +1049,8 @@ fn board_keys(
 ///
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
-pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> {
+pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> {
     use crate::i18n::{help_items, Key};
-    // 作用域键的说明随范围反转——`a` 是个开关，只写一个方向的话，
-    // 另一个方向上屏幕就在说谎。
-    let scope_key = match scope {
-        Scope::CurrentProject => Key::SeeAllProjects,
-        Scope::AllProjects => Key::ThisProjectOnly,
-    };
     match view {
         // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
@@ -1152,7 +1103,7 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang, ctx: HelpCtx) -> 
         // 现找。剩下的挪到 `?` 后面不是把它们藏起来——`n` 会带出 agent 选择器
         // （`N` 的去处），`c/l` 是一年按一次的配置入口。
         View::Board => help_items(
-            &board_keys(scope_key, ctx, ("↑↓", Key::Select), ("Enter", Key::Open)),
+            &board_keys(ctx, ("↑↓", Key::Select), ("Enter", Key::Open)),
             lang,
         ),
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
@@ -1185,7 +1136,7 @@ pub(crate) fn idle_help(view: &View, scope: Scope, lang: Lang, ctx: HelpCtx) -> 
         // 底栏只有一行、按顺序截断，加在尾巴上的键只会落进 `?` 浮层，不会再
         // 悄悄顶掉前面的任何一个。
         View::Grid { .. } => {
-            let mut keys = board_keys(scope_key, ctx, ("", Key::MoveArrows), ("Enter", Key::Zoom));
+            let mut keys = board_keys(ctx, ("", Key::MoveArrows), ("Enter", Key::Zoom));
             // `i 回一句` 紧跟在 `Enter 放大` 后面：两个都是「对着这一格做点
             // 什么」。没有会话可回时不写——回复框会开在一个不存在的会话上。
             if ctx.has_session() {
@@ -1264,12 +1215,12 @@ mod tests {
     /// 默认按「选中了一个正在跑的 agent 会话」算：那是键最全的一档，
     /// 大多数断言问的是「这个键在不在表里」，不是「什么时候不该在」。
     /// 后者由 `help_when` 单独问。
-    fn help_of(view: &View, scope: Scope, lang: Lang) -> String {
-        help_when(view, scope, lang, agent_session())
+    fn help_of(view: &View, lang: Lang) -> String {
+        help_when(view, lang, agent_session())
     }
 
-    fn help_when(view: &View, scope: Scope, lang: Lang, ctx: HelpCtx) -> String {
-        crate::i18n::help_text(&idle_help(view, scope, lang, ctx))
+    fn help_when(view: &View, lang: Lang, ctx: HelpCtx) -> String {
+        crate::i18n::help_text(&idle_help(view, lang, ctx))
     }
 
     fn agent_session() -> HelpCtx {
@@ -1363,7 +1314,7 @@ mod tests {
     fn the_bottom_bar_offers_nothing_to_act_on_when_there_are_no_sessions() {
         let empty = HelpCtx::default();
         for view in [View::Board, View::grid(0)] {
-            let help = help_when(&view, Scope::CurrentProject, Lang::Zh, empty);
+            let help = help_when(&view, Lang::Zh, empty);
             for k in ["↑↓ 选择", "Enter", "s 停止", "u 回滚", "d 改动", "i 回一句"] {
                 assert!(!help.contains(k), "一个会话都没有，不该写「{k}」：{help}");
             }
@@ -1377,24 +1328,14 @@ mod tests {
     /// `NotAnAgentSession`。**底栏在说谎**是这次改动要消灭的东西。
     #[test]
     fn the_bottom_bar_never_offers_undo_on_a_shell_session() {
-        let help = help_when(
-            &View::Board,
-            Scope::CurrentProject,
-            Lang::Zh,
-            shell_session(),
-        );
+        let help = help_when(&View::Board, Lang::Zh, shell_session());
         assert!(!help.contains("u 回滚"), "命令行会话回滚不了：{help}");
         assert!(!help.contains("d 改动"), "命令行会话没有改动可看：{help}");
         // 但停得掉，也照样能选能进
         assert!(help.contains("s 停止"), "{help}");
         assert!(help.contains("↑↓ 选择"), "{help}");
         // agent 会话上这两条要回来，否则这条测试等于把功能测没了
-        let agent = help_when(
-            &View::Board,
-            Scope::CurrentProject,
-            Lang::Zh,
-            agent_session(),
-        );
+        let agent = help_when(&View::Board, Lang::Zh, agent_session());
         assert!(
             agent.contains("u 回滚") && agent.contains("d 改动"),
             "{agent}"
@@ -1411,7 +1352,7 @@ mod tests {
                 state: SessionState::Stopped,
             }),
         };
-        let help = help_when(&View::Board, Scope::CurrentProject, Lang::Zh, stopped);
+        let help = help_when(&View::Board, Lang::Zh, stopped);
         assert!(!help.contains("s 停止"), "已经停了：{help}");
         // 停了的会话仍然能看改动、能回滚——检查点还在
         assert!(help.contains("d 改动"), "{help}");
@@ -1426,12 +1367,7 @@ mod tests {
             has_sessions: true,
             selected: None,
         };
-        let help = help_when(
-            &View::Board,
-            Scope::CurrentProject,
-            Lang::Zh,
-            nothing_selected,
-        );
+        let help = help_when(&View::Board, Lang::Zh, nothing_selected);
         assert!(help.contains("↑↓ 选择"), "有会话就该告诉他怎么选：{help}");
         for k in ["s 停止", "u 回滚", "d 改动"] {
             assert!(
@@ -1445,7 +1381,7 @@ mod tests {
     fn grid_hints_match_what_the_keys_actually_do() {
         // 底栏说什么就得真能做到什么。九宫格现在是顶层，逃生键是 q——
         // 「两个模式都是家」这条由 both_board_modes_are_top_level 单独钉住。
-        let help = help_of(&View::grid(0), Scope::CurrentProject, Lang::Zh);
+        let help = help_of(&View::grid(0), Lang::Zh);
         for k in [
             "方向键选格子",
             "Enter 放大",
@@ -1482,7 +1418,7 @@ mod tests {
     #[test]
     fn board_help_mentions_the_grid() {
         // 不写出来就没人会去按 g——九宫格是第二视图，没有别的入口
-        assert!(help_of(&View::Board, Scope::CurrentProject, Lang::Zh).contains("g 九宫格"));
+        assert!(help_of(&View::Board, Lang::Zh).contains("g 九宫格"));
     }
 
     /// 九宫格不再是列表的下一层：两个模式都是顶层，`Ctrl+Q` 在两边都无事
@@ -1509,7 +1445,6 @@ mod tests {
                 Vec::new(),
                 std::path::PathBuf::from("/tmp"),
             )),
-            Scope::CurrentProject,
             Lang::Zh,
         );
         for k in ["Tab 切换左右", "→ 进入文件夹", "← 上一级"] {
@@ -1522,8 +1457,8 @@ mod tests {
     /// 「屏幕上没写却真管用的键」，只是这次犯在自己身上。
     #[test]
     fn both_modes_advertise_the_key_that_switches_them() {
-        let list = help_of(&View::Board, Scope::CurrentProject, Lang::Zh);
-        let grid = help_of(&View::grid(0), Scope::CurrentProject, Lang::Zh);
+        let list = help_of(&View::Board, Lang::Zh);
+        let grid = help_of(&View::grid(0), Lang::Zh);
         assert!(
             list.contains("g 九宫格"),
             "列表要告诉用户怎么去九宫格：{list}"
@@ -1576,103 +1511,6 @@ mod tests {
         // is_dir() 帮忙识别"用户什么都没输"。
         let base = std::path::Path::new("/base");
         assert_eq!(expand_path("", base), base);
-    }
-
-    fn sess(id: u32, dir: &str) -> crate::session::SessionInfo {
-        crate::session::SessionInfo {
-            id,
-            profile: "claude".into(),
-            dir: dir.into(),
-            state: SessionState::Idle,
-            activity: String::new(),
-            is_agent: true,
-        }
-    }
-
-    #[test]
-    fn current_project_scope_keeps_only_that_project_in_order() {
-        // 这条就是用户报的症状一：底栏写着 A，屏幕上却有 B 的会话。
-        let all = [
-            sess(1, "/w/a"),
-            sess(2, "/w/b"),
-            sess(3, "/w/a"),
-            sess(4, "/w/c"),
-        ];
-        let got = visible_sessions(&all, Scope::CurrentProject, Path::new("/w/a"));
-        assert_eq!(
-            got.iter().map(|s| s.id).collect::<Vec<_>>(),
-            vec![1, 3],
-            "只留当前项目的会话，且保持原顺序"
-        );
-    }
-
-    /// `a` 是个开关，两个方向做的事相反。只写一句「a 全部项目」的话，
-    /// 用户已经在全部项目视图里时，屏幕会让他以为再按一次还是看全部。
-    #[test]
-    fn the_scope_key_hint_says_where_a_will_take_you() {
-        let board = View::Board;
-        assert!(
-            help_of(&board, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"),
-            "只看本项目时，a 通向全部项目"
-        );
-        assert!(
-            help_of(&board, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"),
-            "全部项目时，a 通向本项目"
-        );
-        // 九宫格是看板的另一种画法，同一个键必须给同一套说明
-        let grid = View::grid(0);
-        assert!(help_of(&grid, Scope::CurrentProject, Lang::Zh).contains("a 看全部项目"));
-        assert!(help_of(&grid, Scope::AllProjects, Lang::Zh).contains("a 只看本项目"));
-    }
-
-    #[test]
-    fn all_projects_scope_returns_everything_untouched() {
-        let all = [sess(1, "/w/a"), sess(2, "/w/b")];
-        let got = visible_sessions(&all, Scope::AllProjects, Path::new("/w/a"));
-        assert_eq!(
-            got.iter().map(|s| s.id).collect::<Vec<_>>(),
-            vec![1, 2],
-            "全部项目视图不筛任何东西，当前项目是什么都不影响它"
-        );
-    }
-
-    #[test]
-    fn a_project_with_no_sessions_yields_an_empty_list() {
-        // 空不是异常：新项目、或者刚把会话全停了，都会走到这里。
-        // 返回空 Vec 而不是 panic，是九宫格空状态文案能上屏的前提。
-        let all = [sess(1, "/w/a")];
-        assert!(visible_sessions(&all, Scope::CurrentProject, Path::new("/w/b")).is_empty());
-    }
-
-    #[test]
-    fn a_session_whose_dir_was_deleted_stays_under_its_own_project() {
-        // canonicalize 对已删目录会失败。退化成字面比较，让这个会话仍然
-        // 归在它原本的项目下——否则它会从两个视图里同时消失，用户再也
-        // 没有任何入口去停掉它。
-        let gone = "/definitely/does/not/exist/dct-scope-test";
-        let all = [sess(1, gone)];
-        let got = visible_sessions(&all, Scope::CurrentProject, Path::new(gone));
-        assert_eq!(got.len(), 1, "目录没了，会话还在，仍要看得见");
-    }
-
-    #[test]
-    fn a_symlinked_project_dir_still_matches_its_sessions() {
-        // 会话是用真实路径建的，用户却可能从一个符号链接进同一个项目
-        // （macOS 上 /tmp -> /private/tmp 就是现成的例子）。字面比较会让
-        // 整个项目的会话凭空消失，而用户看不出任何原因。
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("proj");
-        std::fs::create_dir(&real).unwrap();
-        let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let all = [sess(1, &real.display().to_string())];
-        let got = visible_sessions(&all, Scope::CurrentProject, &link);
-        assert_eq!(
-            got.len(),
-            1,
-            "从符号链接进来的当前项目，必须仍然认得出它自己的会话"
-        );
     }
 
     /// 浏览器只列目录，而且要把「本来就不该出现的东西」挡掉：`.` 开头的
@@ -2042,7 +1880,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_both_n_and_capital_n() {
-        let help = help_of(&View::Board, Scope::CurrentProject, Lang::Zh);
+        let help = help_of(&View::Board, Lang::Zh);
         assert!(help.contains("n 新建"));
         assert!(help.contains("N 换 agent"));
     }
@@ -2051,7 +1889,7 @@ mod tests {
 
     #[test]
     fn board_help_mentions_the_settings_key() {
-        assert!(help_of(&View::Board, Scope::CurrentProject, Lang::Zh).contains("c 密钥"));
+        assert!(help_of(&View::Board, Lang::Zh).contains("c 密钥"));
     }
 
     #[test]
@@ -2071,7 +1909,6 @@ mod tests {
                 state: ListState::default(),
                 warning: None,
             },
-            Scope::CurrentProject,
             Lang::Zh,
         );
         assert!(help.contains("↑↓"));
@@ -2272,7 +2109,6 @@ mod tests {
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
             },
-            Scope::CurrentProject,
             Lang::Zh,
         );
         assert!(
@@ -2302,7 +2138,6 @@ mod tests {
                 state: ListState::default(),
                 pending_delete: None,
             },
-            Scope::CurrentProject,
             Lang::Zh,
         );
         assert!(help.contains("Enter 改"));
