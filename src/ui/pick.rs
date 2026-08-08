@@ -188,7 +188,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                 } else {
                     let dir = expand_path(&buf, &app.start_dir);
                     if dir.is_dir() {
-                        super::switch_project(app, dir);
+                        super::pin_project(app, dir);
                         return Ok(());
                     }
                     // 不是 git 仓库这件事不在这里判——留给 create()
@@ -290,7 +290,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
             };
             if let Some(dir) = chosen {
                 if dir.is_dir() {
-                    super::switch_project(app, dir);
+                    super::pin_project(app, dir);
                     return Ok(());
                 }
                 // 列表里那条不删——可能只是外置盘没挂
@@ -802,7 +802,18 @@ mod tests {
             app.current_dir().display()
         );
         assert!(matches!(app.view, View::Board), "选完就回家");
-        assert!(app.message.text.contains("已切到"), "换了项目要说一声");
+        // 原来这里断言底栏出现一句「已切到 X」。`p` 降格成「把项目摆上看板」
+        // 之后那句话没了：换项目是 `Tab`，而摆上看板这件事屏幕自己看得见——
+        // 多出来一个组、光标落进去。断言改成断言那两件看得见的事。
+        assert!(
+            app.groups.iter().any(|g| g.name == "proj"),
+            "选中的项目要作为一个组出现在看板上"
+        );
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("proj".to_string()),
+            "光标要落进那个组"
+        );
     }
 
     /// 最近栏的 `→` 把浏览器切到那个项目所在的位置——用户想从一个熟悉的
@@ -929,5 +940,128 @@ mod tests {
             ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
         });
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+    }
+
+    fn sess_in(id: u32, dir: &str) -> crate::session::SessionInfo {
+        crate::session::SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: crate::session::SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+        }
+    }
+
+    /// `p` 选定一个项目之后，它必须以一个组的形式出现在看板上，并且光标落进去——
+    /// 否则用户按完 `p` 什么都没发生，`n` 也去不了那儿。
+    #[test]
+    fn confirming_a_project_puts_it_on_the_board_and_moves_the_cursor_there() {
+        let (mut app, d) = App::test_app();
+        let target = d.path().join("newproj");
+        std::fs::create_dir(&target).unwrap();
+        app.set_sessions(vec![]);
+
+        super::super::pin_project(&mut app, target.clone());
+
+        assert!(
+            app.pinned.iter().any(|p| p.ends_with("newproj")),
+            "要进 pinned"
+        );
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("newproj".to_string()),
+            "光标要落在新组上"
+        );
+    }
+
+    /// `x` 只能拿掉空组。有会话的组必须拒绝——「顺便停掉所有会话」是个
+    /// 用户没要求过的复合动作，而 `s` 已经能一个一个停。
+    #[test]
+    fn removing_a_group_that_still_has_sessions_is_refused() {
+        let (mut app, _d) = App::test_app();
+        app.pinned = vec!["/w/a".to_string()];
+        app.set_sessions(vec![sess_in(1, "/w/a")]);
+        app.list_state.select(Some(0));
+
+        super::super::unpin_current(&mut app);
+
+        assert_eq!(app.groups.len(), 1, "组还在");
+        assert!(app.message.error, "要给一句红字提示");
+    }
+
+    /// `x` 落在一个空组上就真的把它拿掉——本地 `pinned` 和看板上的组
+    /// 必须一起消失，不能只改一半让下一次重算把它又变回来。
+    #[test]
+    fn removing_an_empty_group_takes_it_off_the_board() {
+        let (mut app, d) = App::test_app();
+        let gone = d.path().join("空项目");
+        std::fs::create_dir(&gone).unwrap();
+        app.pinned = vec![gone.display().to_string()];
+        app.set_sessions(vec![sess_in(1, "/w/a")]);
+        let gi = app
+            .groups
+            .iter()
+            .position(|g| g.name == "空项目")
+            .expect("前提：空组在看板上");
+        super::super::goto_project(&mut app, gi);
+
+        super::super::unpin_current(&mut app);
+
+        assert!(
+            !app.groups.iter().any(|g| g.name == "空项目"),
+            "组要从看板上消失"
+        );
+        assert!(app.pinned.is_empty(), "本地 pinned 也要一起清掉");
+        assert!(!app.message.error, "拿掉空组不是错误");
+    }
+
+    /// **`pinned` 里存的拼写和分组键（canon 之后的）可能不是同一个字符串。**
+    /// macOS 上 `/tmp/x` 归一化成 `/private/tmp/x`；按字面比对去删的话，
+    /// `x` 会看起来「按了没反应」——组消失一帧，下一次重算又原样回来。
+    #[test]
+    fn removing_a_group_matches_pinned_by_canonical_path_not_by_spelling() {
+        let (mut app, d) = App::test_app();
+        let real = d.path().join("链接目标");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("软链");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // 用户当初 pin 的是软链那条拼写，分组键却是 canon 之后的真实路径
+        app.pinned = vec![link.display().to_string()];
+        app.set_sessions(vec![]);
+        app.list_state.select(Some(0));
+
+        super::super::unpin_current(&mut app);
+
+        assert!(app.pinned.is_empty(), "按归一化后的路径比对才删得掉");
+        assert!(app.groups.is_empty(), "组也要跟着消失");
+    }
+
+    /// 开机兜底：一个组都没有时把启动目录摆上去。没有它，全新安装的第一屏
+    /// 是一个连光标都落不下去的空盒子，`n` 也没有目标。
+    #[test]
+    fn a_board_with_nothing_on_it_gets_the_start_dir() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![]);
+        assert!(app.groups.is_empty(), "前提：全新守护进程，什么都没有");
+
+        super::super::seed_start_project(&mut app);
+
+        assert_eq!(app.groups.len(), 1, "看板上永远至少有一个组");
+        assert!(app.current_group().is_some(), "光标有地方落");
+        assert_eq!(app.current_dir(), super::super::view::canon(&app.start_dir));
+    }
+
+    /// 已经有组了就不补——启动目录跟用户手头这些项目未必有关系，
+    /// 硬塞一行进去只是噪音。
+    #[test]
+    fn seeding_leaves_a_board_that_already_has_a_group_alone() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/w/a")]);
+
+        super::super::seed_start_project(&mut app);
+
+        assert_eq!(app.groups.len(), 1, "不该多出启动目录那一行");
+        assert!(app.pinned.is_empty());
     }
 }

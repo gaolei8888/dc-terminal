@@ -664,9 +664,6 @@ pub(crate) struct ProjectGroup {
     #[allow(dead_code)]
     pub last_profile: Option<String>,
     /// 由 `p` 摆上来的。`x` 只能移除 pinned 且没有会话的组。
-    ///
-    /// 同上，读它的 `unpin_current` 要到 Task 6 才真正实现。
-    #[allow(dead_code)]
     pub pinned: bool,
     pub collapsed: bool,
 }

@@ -34,6 +34,13 @@ pub struct App {
     pub pinned: Vec<String>,
     /// 项目目录 → 上次用的 agent（守护进程给的），组头和底栏 `n` 要用。
     pub profiles: std::collections::BTreeMap<String, String>,
+    /// 已经问过守护进程「上次用的是哪个 agent」的项目目录（canon 后的）。
+    ///
+    /// **专门用来缓存「没有记录」这个答案。** 只看 `profiles` 的话，一个
+    /// 确实没开过会话的项目永远进不了那张表，于是每一轮拉取都要为它重发
+    /// 一次 `LastProfile`——看板 150ms 一轮，守护进程一忙界面就会一顿一顿。
+    /// 见 `mod.rs::profiles_to_fetch`。
+    pub profiles_asked: std::collections::BTreeSet<String>,
     /// 用户选的看板画法。列表和九宫格是**平级**的两个模式，不是一个视图
     /// 加一个附属页面——所以每一处「回看板」都得问它（见 `mod.rs::home_view`）。
     pub view_mode: super::view::ViewMode,
@@ -145,6 +152,7 @@ impl App {
             rows: Vec::new(),
             pinned: Vec::new(),
             profiles: std::collections::BTreeMap::new(),
+            profiles_asked: std::collections::BTreeSet::new(),
             view_mode,
             message: "".into(),
             screen: Vec::new(),

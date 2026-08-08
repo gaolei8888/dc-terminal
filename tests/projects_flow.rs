@@ -72,3 +72,71 @@ fn projects_is_empty_on_a_fresh_daemon() {
     let mut c = h.client();
     assert!(projects(&mut c).is_empty(), "全新守护进程的列表应为空");
 }
+
+fn pinned(c: &mut Client) -> Vec<String> {
+    match c.call(Request::Projects).unwrap() {
+        Response::Projects { pinned, .. } => pinned,
+        other => panic!("预期 Projects，实际 {other:?}"),
+    }
+}
+
+/// `p` / `x` 的整条来回，跨 socket 走一遍。
+///
+/// 单测只盖到 `projects::Store`；`PinProject` / `UnpinProject` 两个请求到
+/// 守护进程 handler 这一段，在这个 Task 之前从来没有调用方，也就从来没被
+/// 端到端跑过。这里跑一遍：摆上去要**落盘**（重新连一次还在——不然重启
+/// dct 那个项目就自己没了，而规矩说的是「只有 `x` 能移除」），拿下来也要
+/// 落盘。
+#[test]
+fn pinning_a_project_survives_a_reconnect_and_unpinning_removes_it() {
+    let h = common::start_daemon();
+    let d = tempfile::tempdir().unwrap();
+
+    let mut c = h.client();
+    assert!(
+        pinned(&mut c).is_empty(),
+        "全新守护进程（projects.json 还不存在）一条 pinned 都没有"
+    );
+
+    assert!(matches!(
+        c.call(Request::PinProject {
+            dir: d.path().display().to_string()
+        })
+        .unwrap(),
+        Response::Ok
+    ));
+
+    // 换一条连接再问，确认答案来自落盘的那份而不是这条连接的内存
+    let mut c2 = h.client();
+    assert_eq!(pinned(&mut c2), vec![canon(d.path())]);
+
+    assert!(matches!(
+        c2.call(Request::UnpinProject {
+            dir: d.path().display().to_string()
+        })
+        .unwrap(),
+        Response::Ok
+    ));
+    assert!(pinned(&mut h.client()).is_empty(), "`x` 之后要真的没了");
+}
+
+/// 一个从没开过会话的项目问 `LastProfile`，守护进程要能干脆地答「没有」。
+/// 界面靠这个答案缓存负结果（见 `ui::profiles_to_fetch`）；如果它在这里
+/// 报错而不是 `LastProfile(None)`，界面就会认为「还没问到」，每 150ms
+/// 重问一次。
+#[test]
+fn a_project_with_no_history_answers_last_profile_with_none() {
+    let h = common::start_daemon();
+    let d = tempfile::tempdir().unwrap();
+
+    match h
+        .client()
+        .call(Request::LastProfile {
+            dir: d.path().display().to_string(),
+        })
+        .unwrap()
+    {
+        Response::LastProfile(None) => {}
+        other => panic!("预期 LastProfile(None)，实际 {other:?}"),
+    }
+}

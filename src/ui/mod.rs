@@ -9,7 +9,7 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, ListState, Paragraph};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -205,6 +205,9 @@ pub fn run(
     // 分支上（进 `View::Attached` 的路不止一条：`enter_session`、密钥验证
     // 通过后直接建会话、九宫格里……挂哪个分支都会漏另一条）。
     let mut mouse_captured = false;
+    // 「开机那次兜底补启动目录」有没有做过。一次性的：做完之后用户 `x` 掉
+    // 所有组是他自己的选择，不该被这段逻辑一次次撤销回来。
+    let mut seeded = false;
 
     // 有标签是因为下面排空鼠标事件那段需要从一个嵌套的 `while` 里跳回
     // 这个循环的顶部，而不是跳回 `while` 自己——普通的无标签 `continue`
@@ -359,6 +362,29 @@ pub fn run(
                 Ok(Response::Sessions(v)) => {
                     app.set_sessions(v);
                     app.connected = true;
+                    // `pinned` 跟会话列表同一个节奏拉，不是每帧拉：看板上出现
+                    // 哪些组 = 有会话的 ∪ pinned 的，只刷新其中一半会让另一半
+                    // 停在旧答案上（别的 dct 窗口 `p` 上来的项目永远不出现，
+                    // `x` 掉的项目永远不消失）。
+                    if let Ok(Response::Projects { pinned, .. }) =
+                        app.client().and_then(|c| c.call(Request::Projects))
+                    {
+                        if projects_changed(&app.pinned, &pinned) {
+                            app.pinned = pinned;
+                            app.refresh_rows();
+                        }
+                    }
+                    // 只在 `List` 成功这一支里问 `LastProfile`：守护进程连不上
+                    // 的时候连问都不问，断线期间不会每轮空转一遍。
+                    refresh_project_profiles(&mut app);
+                    // 开机第一次拉完（而且是**成功**拉完）才补启动目录。放在
+                    // 失败路径上的话，第一轮连不上就会本地摆一个组上去，等到
+                    // 真连上、守护进程报回一份空的 `pinned`，它又被同步掉——
+                    // 看板重新变空，而这个一次性的补位已经用掉了。
+                    if !seeded {
+                        seeded = true;
+                        seed_start_project(&mut app);
+                    }
                 }
                 _ => app.connected = false,
             }
@@ -860,26 +886,156 @@ fn help_ctx(app: &App) -> view::HelpCtx {
     }
 }
 
-/// 切到另一个项目：把它 pin 上看板、说一声、把光标挪到它的组头上、回看板。
+/// `p` 选定之后：告诉守护进程记下来、更新本地 `pinned`、重算行、把光标
+/// 送到那个组上、回家视图。
 ///
-/// 抽成一个函数是因为选择器有两条确认路径（列表选中、手输路径），
-/// 而这几步必须整套发生。**光标就是当前项目**，所以「换项目」在这一版里
-/// 就是「把光标挪到那个组头上」——挪不过去（那个项目还没有组）时先靠
-/// `pinned` 把组造出来，Task 6 接上守护进程的落盘。
-pub(crate) fn switch_project(app: &mut App, dir: std::path::PathBuf) {
-    // 「当前项目」已经在底部边框标题里，这里说的是刚发生的动作
-    app.message =
-        crate::i18n::msg::switched_to(app.lang, &short_path(&dir.display().to_string())).into();
+/// **`p` 不再是「换项目」。** 换项目是 `Tab`（零弹窗、一个键），`p` 只剩
+/// 一件事：把一个看板上还没有的项目摆上来。摆上来之后光标落进去，于是
+/// 「当前项目」顺带也就是它了——但那是光标动了的后果，不是 `p` 自己另有
+/// 一套「当前项目」的写法。
+///
+/// 抽成一个函数是因为选择器有两条确认路径（列表选中、手输路径），而这五步
+/// 必须整套发生。分开写的话，漏掉重算的那条路会让屏幕停在旧的一屏，而用户
+/// 刚刚明确选了一个项目——那正是上一版被判为「混乱」的手感。
+pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
+    let d = dir.display().to_string();
+    // 落盘失败不拦路：pinned 是便利性状态，本地先摆上，用户这一次照样能用。
+    // 下一轮拉取会把守护进程那边的真相同步回来（见 `run` 里的 `Projects`）。
+    let _ = app
+        .client()
+        .and_then(|c| c.call(Request::PinProject { dir: d.clone() }));
+    // 按归一化后的路径判重，不按字面：同一个项目用两种拼法（走符号链接、
+    // 不走）敲进来是同一个组，`pinned` 里却会多出一条永远没人用的死行。
     let key = view::canon(&dir);
-    let raw = dir.display().to_string();
-    if !app.pinned.contains(&raw) {
-        app.pinned.push(raw);
+    if !app.pinned.iter().any(|p| view::canon(Path::new(p)) == key) {
+        // 存**原始拼写**：`pinned` 同时是组头 name/parent 的显示来源
+        // （见 `view::group_sessions`），归一化只用于比较。
+        app.pinned.push(d);
     }
     app.refresh_rows();
     if let Some(gi) = app.groups.iter().position(|g| g.dir == key) {
         goto_project(app, gi);
     }
     app.view = home_view(app);
+}
+
+/// `x`：把光标所在的**空**组从看板上拿掉。
+///
+/// 还有会话就拒绝，红字说一句。「顺便把这些会话都停掉」是个用户没要求过的
+/// 复合破坏动作，而 `s` 已经能一个一个停——一次拒绝比一次多做好解释得多。
+pub(crate) fn unpin_current(app: &mut App) {
+    let Some(g) = app.current_group() else {
+        return;
+    };
+    if !g.sessions.is_empty() {
+        app.message = Msg::err(crate::i18n::text(crate::i18n::Key::GroupNotEmpty, app.lang).into());
+        return;
+    }
+    // 组能出现在看板上只有两个理由：有会话、或者被 pin 了。上面已经排掉
+    // 前者，所以走到这儿的必然是 pinned——真不是（结构上到不了）就什么
+    // 都不做，而不是发一个守护进程认不出的 unpin。
+    if !g.pinned {
+        return;
+    }
+    let key = g.dir.clone();
+    let d = key.display().to_string();
+    let _ = app
+        .client()
+        .and_then(|c| c.call(Request::UnpinProject { dir: d }));
+    // **按归一化后的路径删，不按字面。** `pinned` 里存的是用户当初敲的
+    // 拼写，而 `g.dir` 是 canon 之后的分组键——macOS 上 `/tmp/x` 就是
+    // `/private/tmp/x`。字面比对删不掉的话，`x` 看起来像「按了没反应」：
+    // 组消失一帧，下一次重算又原样回来。
+    app.pinned.retain(|p| view::canon(Path::new(p)) != key);
+    app.refresh_rows();
+}
+
+/// 开机兜底：看板上一个组都没有时，把启动目录摆上去。
+///
+/// 全新安装、或者第一次跑这一版时 `pinned` 是空的、也还没有任何会话。
+/// 没有这一步，用户第一眼看到的是一个连光标都落不下去的空盒子。摆上启动
+/// 目录之后，「看板上一个组都没有」这个状态在开机路径上就不存在了——光标
+/// 永远有地方落，`n` 永远有目标。
+///
+/// 已经有组了就不碰：启动目录跟用户手头这些项目未必有关系，硬塞一行进去
+/// 只是噪音。
+pub(crate) fn seed_start_project(app: &mut App) {
+    if !app.groups.is_empty() {
+        return;
+    }
+    pin_project(app, app.start_dir.clone());
+}
+
+/// 守护进程报回来的 `pinned` 跟手里这份**指的是不是同一组项目**。
+///
+/// 不能直接 `!=` 就认字面：守护进程存的是归一化后的路径（见
+/// `projects::key_of`），而刚被 `pin_project` 摆上去的那一条存的是用户敲的
+/// 原始拼写。字面比对会判成「变了」，于是每次拉取都把用户的拼写换成
+/// `/private/tmp/...` 这种归一化结果——组头下面那行灰字会在用户没做任何事
+/// 的时候自己变一次样，还白搭一次 `refresh_rows`（它对每个会话目录都要
+/// `canonicalize` 一次）。
+///
+/// 先比字面（绝大多数情况下两边一模一样，这条路一次 `canonicalize` 都不做），
+/// 只有字面不同才去做归一化比较——那是真的可能变了，值得那几次系统调用。
+fn projects_changed(have: &[String], fresh: &[String]) -> bool {
+    if have == fresh {
+        return false;
+    }
+    let keys = |v: &[String]| {
+        let mut k: Vec<PathBuf> = v.iter().map(|p| view::canon(Path::new(p))).collect();
+        k.sort();
+        k.dedup();
+        k
+    };
+    keys(have) != keys(fresh)
+}
+
+/// 还没问过「上次用的是哪个 agent」的那些组。
+///
+/// 单独抽出来是因为这里是**唯一**能挡住每帧一次阻塞往返的地方，而它挡不挡
+/// 得住只看两个集合够不够全：拿到答案的（`profiles`）、以及问过但守护进程
+/// 说「没有记录」的（`profiles_asked`）。只看前者的话，一个确实没有记录的
+/// 项目永远不会被写进 `profiles`，于是每一轮都要为它重发一次请求——看板
+/// 150ms 一轮，守护进程一忙界面就会一顿一顿。**负答案必须也缓存。**
+fn profiles_to_fetch(app: &App) -> Vec<String> {
+    app.groups
+        .iter()
+        .map(|g| g.dir.display().to_string())
+        .filter(|d| !app.profiles.contains_key(d) && !app.profiles_asked.contains(d))
+        .collect()
+}
+
+/// 把每个组「上次用的 agent」补齐，底栏的 `n 新建 <agent>` 要用。
+///
+/// 只为**还没问过**的组各发一次请求（见 `profiles_to_fetch`），所以稳定态
+/// 下这个函数一次往返都不发。调用点在 `run` 里 `List` 成功那一支里面：
+/// 守护进程连不上的时候连问都不问，也就不会在断线期间每轮空转一遍。
+pub(crate) fn refresh_project_profiles(app: &mut App) {
+    let mut got = false;
+    for d in profiles_to_fetch(app) {
+        match app
+            .client()
+            .and_then(|c| c.call(Request::LastProfile { dir: d.clone() }))
+        {
+            Ok(Response::LastProfile(answer)) => {
+                // 问到了就记下「问过了」，不管答案是有还是没有——这一条
+                // 就是负答案的缓存。
+                app.profiles_asked.insert(d.clone());
+                if let Some(p) = answer {
+                    app.profiles.insert(d, p);
+                    got = true;
+                }
+            }
+            // 请求本身没成，不算问过：这不是「没有记录」，而且这一轮多半
+            // 整条连接都断了，剩下的组再问也是白问，直接收手。
+            _ => break,
+        }
+    }
+    // 只在真拿到新东西时才重算。`refresh_rows` 会对每个会话目录做一次
+    // `canonicalize`（真实的文件系统调用），无条件每轮再来一遍纯属白烧。
+    if got {
+        app.refresh_rows();
+    }
 }
 
 /// 进一个会话。
@@ -1094,11 +1250,6 @@ pub(crate) fn toggle_collapse(app: &mut App) {
     goto_project(app, gi);
 }
 
-/// `x`：把空组从看板上拿掉。真正的落盘在 Task 6 接上守护进程。
-pub(crate) fn unpin_current(app: &mut App) {
-    let _ = app;
-}
-
 /// 把列表光标指到某个会话所在的那一行。**「指向第 N 号会话」只有这一份
 /// 实现**，所有需要它的入口（九宫格回列表、F3 跨会话跳）都走这里。
 ///
@@ -1199,12 +1350,17 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                     let dir = app.current_dir().display().to_string();
                     match app.client().and_then(|c| {
                         c.call(Request::Create {
-                            dir,
-                            profile: name,
+                            dir: dir.clone(),
+                            profile: name.clone(),
                             remember: true,
                         })
                     }) {
                         Ok(Response::Created { id }) => {
+                            // 守护进程刚刚记下了这个项目的 agent（remember: true），
+                            // 手里这份缓存直接跟上，省一次 `LastProfile` 往返，
+                            // 也省得底栏在下一轮拉取之前还写着旧的那个名字。
+                            app.profiles.insert(dir.clone(), name);
+                            app.profiles_asked.insert(dir);
                             app.need_sessions = true; // 会话标题要显示项目名
                             app.view = View::Attached(id);
                         }
@@ -1562,6 +1718,87 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn sess_at(id: u32, dir: &str) -> SessionInfo {
+        SessionInfo {
+            id,
+            profile: "claude".into(),
+            dir: dir.into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+        }
+    }
+
+    /// **一个「确实没有记录」的项目只能被问一次。** 只用 `profiles` 当缓存
+    /// 的话，它的键永远不会被写进去，于是每一轮拉取都要为它重发一次
+    /// `LastProfile`——看板 150ms 一轮，守护进程一忙界面就一顿一顿。
+    /// 负答案必须也被记住，这条测试盯的就是这件事。
+    #[test]
+    fn a_project_with_no_recorded_agent_is_only_asked_once() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_at(1, "/w/a"), sess_at(2, "/w/b")]);
+        assert_eq!(profiles_to_fetch(&app).len(), 2, "一开始两个都要问");
+
+        // 守护进程对两个都答「没有记录」——`profiles` 不会多出任何一条
+        for d in profiles_to_fetch(&app) {
+            app.profiles_asked.insert(d);
+        }
+
+        assert!(
+            profiles_to_fetch(&app).is_empty(),
+            "问过就不再问，哪怕答案是「没有」"
+        );
+    }
+
+    /// 已经知道答案的组也不再问。
+    #[test]
+    fn a_project_whose_agent_is_already_known_is_not_asked_again() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_at(1, "/w/a")]);
+        let d = app.groups[0].dir.display().to_string();
+        app.profiles.insert(d, "codex".into());
+
+        assert!(profiles_to_fetch(&app).is_empty());
+    }
+
+    /// 新出现的组要问一次——不然刚 `p` 上来的项目，底栏永远写不出
+    /// 「上次用的那个 agent」。
+    #[test]
+    fn a_group_that_just_appeared_is_asked_once() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_at(1, "/w/a")]);
+        for d in profiles_to_fetch(&app) {
+            app.profiles_asked.insert(d);
+        }
+        assert!(profiles_to_fetch(&app).is_empty(), "前提：都问过了");
+
+        app.set_sessions(vec![sess_at(1, "/w/a"), sess_at(2, "/w/新来的")]);
+
+        assert_eq!(profiles_to_fetch(&app).len(), 1, "只问新来的那一个");
+    }
+
+    /// 守护进程报回来的是归一化后的路径，手里这份是用户敲的原始拼写——
+    /// 指的其实是同一组项目。判成「变了」的话，每一轮拉取都会把用户的拼写
+    /// 换成 `/private/...`，组头下面那行灰字会在用户什么都没做的时候自己
+    /// 变一次样，还白搭一次 `refresh_rows`（它对每个会话目录都要
+    /// `canonicalize` 一次）。
+    #[test]
+    fn the_same_projects_spelled_differently_do_not_count_as_a_change() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("目标");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("软链");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mine = vec![link.display().to_string()];
+        let theirs = vec![view::canon(&link).display().to_string()];
+        assert_ne!(mine, theirs, "前提：两条路径字面不同");
+        assert!(!projects_changed(&mine, &theirs), "指的是同一个项目");
+
+        let other = vec![d.path().join("另一个").display().to_string()];
+        assert!(projects_changed(&mine, &other), "真换了就得认");
     }
 
     /// Important (a)/(b) 回归点，UI 这一侧：`explained_failure` 缓存必须在

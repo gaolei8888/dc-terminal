@@ -214,6 +214,8 @@ pub enum Key {
     // —— 选择器里的「为什么用不了」——
     ReasonNeedsSecret,
     ReasonNotInstalled,
+    /// `x` 按在一个还有会话的组上
+    GroupNotEmpty,
 }
 
 pub fn text(k: Key, lang: Lang) -> &'static str {
@@ -463,6 +465,12 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         ReasonNeedsSecret => t!(lang, en: "(no key yet)", zh: "（未填密钥）"),
         ReasonNotInstalled => t!(lang, en: "(not installed)", zh: "（未安装）"),
 
+        GroupNotEmpty => t!(
+            lang,
+            en: "This project still has sessions. Stop them first.",
+            zh: "这个项目还有会话，先停掉才能移除。"
+        ),
+
         StaleData => t!(
             lang,
             en: "Cannot reach the dct service — what you see may be out of date",
@@ -568,9 +576,10 @@ pub mod msg {
         )
     }
 
-    pub fn switched_to(lang: Lang, project: &str) -> String {
-        t!(lang, en: format!("Switched to {project}"), zh: format!("已切到 {project}"))
-    }
+    // `switched_to`（「已切到 X」）在 `p` 从「换项目」降格成「把项目摆上
+    // 看板」时删掉了：换项目现在是 `Tab`，一个键、零弹窗、不说话，光标
+    // 落在哪个组上就是当前项目，屏幕自己看得见——再补一句话反而会盖掉
+    // 底栏上别的更要紧的提示（见 board.rs 头上 `e0ba1ec` 那段）。
 
     pub fn not_a_directory(lang: Lang, path: &str) -> String {
         t!(lang, en: format!("{path} is not a folder"), zh: format!("{path} 不是一个目录"))
@@ -1220,6 +1229,7 @@ mod tests {
             NoChanges,
             ReasonNeedsSecret,
             ReasonNotInstalled,
+            GroupNotEmpty,
         ]
     };
 
@@ -1253,7 +1263,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 93, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 94, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
