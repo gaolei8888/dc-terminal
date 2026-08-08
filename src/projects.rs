@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 列表上限。20 条足够覆盖手头在做的项目，再多列表本身就难挑了。
@@ -9,9 +10,20 @@ const MAX: usize = 20;
 struct Disk {
     #[serde(default)]
     recent: Vec<String>,
-    /// 上次开会话用的 agent。`n` 键直连它。
+    /// **旧字段，留着当兜底。** 升级之前只有这一个全局值；升级之后新会话
+    /// 一律写进 `project_profiles`，但还没开过会话的老项目要靠它，否则
+    /// 一升级所有项目的 `n` 都退化成弹选择器。
     #[serde(default)]
     last_profile: Option<String>,
+    /// 用户按 `p` 摆上看板、还没有会话的项目。落盘而不是只放内存里：
+    /// 规则是「`x` 才能移除」，不落盘的话重启 dct 就自己没了，两句话对不上。
+    #[serde(default)]
+    pinned: Vec<String>,
+    /// 项目目录 → 上次在这个项目里开会话用的 agent。
+    /// 用 `BTreeMap` 不是 `HashMap`：落盘顺序稳定，`projects.json` 的 diff
+    /// 才不会每次都乱跳。
+    #[serde(default)]
+    project_profiles: BTreeMap<String, String>,
 }
 
 /// 最近开过会话的项目目录，最近使用的在最前；外加上次用的 agent。
@@ -19,6 +31,8 @@ pub struct Store {
     path: PathBuf,
     recent: Vec<String>,
     last_profile: Option<String>,
+    pinned: Vec<String>,
+    project_profiles: BTreeMap<String, String>,
 }
 
 /// 存放位置跟着 socket 走，而不是直接拼 `$HOME`。生产环境 socket 在
@@ -30,6 +44,17 @@ pub fn store_path_for_socket(socket: &Path) -> PathBuf {
         Some(d) => d.join("projects.json"),
         None => PathBuf::from("projects.json"),
     }
+}
+
+/// 以路径为键时统一走这里。`.` 和 `/abs/path` 必须落在同一个键上，
+/// 否则同一个项目会在 `recent`、`pinned`、`project_profiles` 里各占一行。
+///
+/// 归一失败（目录刚被删）就用原样：丢掉这一条比存个粗糙的路径更糟。
+fn key_of(dir: &Path) -> String {
+    std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string()
 }
 
 impl Store {
@@ -44,6 +69,8 @@ impl Store {
             path: path.to_path_buf(),
             recent: disk.recent,
             last_profile: disk.last_profile,
+            pinned: disk.pinned,
+            project_profiles: disk.project_profiles,
         }
     }
 
@@ -64,15 +91,46 @@ impl Store {
 
     /// 记一笔：去重、提到最前、截断、落盘。
     pub fn touch(&mut self, dir: &Path) {
-        // 归一成绝对路径，免得 `.` 和 `/abs/path` 在列表里各占一行。
-        // 归一失败（目录刚被删）就存原样——丢掉这一条比存个粗糙的路径更糟。
-        let key = std::fs::canonicalize(dir)
-            .unwrap_or_else(|_| dir.to_path_buf())
-            .display()
-            .to_string();
+        let key = key_of(dir);
         self.recent.retain(|p| p != &key);
         self.recent.insert(0, key);
         self.recent.truncate(MAX);
+        self.save();
+    }
+
+    /// 这个项目上次用的 agent。没有单独记录就吃全局的旧值（见 `Disk::last_profile`）。
+    pub fn last_profile_for(&self, dir: &Path) -> Option<String> {
+        self.project_profiles
+            .get(&key_of(dir))
+            .cloned()
+            .or_else(|| self.last_profile.clone())
+    }
+
+    /// 记一笔「这个项目上次用的 agent」。同时刷新全局兜底值——一个刚被
+    /// `p` 摆上看板、从没开过会话的新项目，`n` 该给的是「你最近在用的那个」，
+    /// 而不是空。
+    pub fn set_last_profile_for(&mut self, dir: &Path, name: &str) {
+        self.project_profiles.insert(key_of(dir), name.to_string());
+        self.last_profile = Some(name.to_string());
+        self.save();
+    }
+
+    pub fn pinned(&self) -> Vec<String> {
+        self.pinned.clone()
+    }
+
+    /// 摆一个项目上看板。已经在里面就什么都不做——重复 pin 不该出现两行。
+    pub fn pin(&mut self, dir: &Path) {
+        let key = key_of(dir);
+        if !self.pinned.contains(&key) {
+            self.pinned.push(key);
+            self.save();
+        }
+    }
+
+    pub fn unpin(&mut self, dir: &Path) {
+        let key = key_of(dir);
+        self.pinned.retain(|p| p != &key);
         self.save();
     }
 
@@ -87,6 +145,8 @@ impl Store {
         let Ok(json) = serde_json::to_string(&Disk {
             recent: self.recent.clone(),
             last_profile: self.last_profile.clone(),
+            pinned: self.pinned.clone(),
+            project_profiles: self.project_profiles.clone(),
         }) else {
             return;
         };
@@ -221,5 +281,74 @@ mod tests {
         let s = Store::load(&f);
         assert_eq!(s.list(), vec!["/a".to_string()]);
         assert_eq!(s.last_profile(), None);
+    }
+
+    #[test]
+    fn each_project_remembers_its_own_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+
+        let f = tmp.path().join("projects.json");
+        let mut s = Store::load(&f);
+        s.set_last_profile_for(&a, "claude");
+        s.set_last_profile_for(&b, "codex");
+
+        let s = Store::load(&f);
+        assert_eq!(s.last_profile_for(&a).as_deref(), Some("claude"));
+        assert_eq!(s.last_profile_for(&b).as_deref(), Some("codex"));
+    }
+
+    /// 老文件里只有一个全局 `last_profile`。升级之后每个项目都还没有自己的记录，
+    /// 这时候必须回退到那个全局值——否则老用户一升级，所有项目的 `n` 都变成
+    /// 「弹选择器」，看起来像是设置丢了。
+    #[test]
+    fn an_unknown_project_falls_back_to_the_old_global_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("projects.json");
+        std::fs::write(&f, r#"{"recent":[],"last_profile":"kimi"}"#).unwrap();
+
+        let s = Store::load(&f);
+        assert_eq!(
+            s.last_profile_for(tmp.path()).as_deref(),
+            Some("kimi"),
+            "没有单独记录的项目要吃全局兜底"
+        );
+    }
+
+    #[test]
+    fn pinned_projects_dedupe_and_survive_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        let f = tmp.path().join("projects.json");
+
+        let mut s = Store::load(&f);
+        s.pin(&a);
+        s.pin(&a);
+        assert_eq!(
+            Store::load(&f).pinned(),
+            vec![canon(&a)],
+            "重复 pin 不该出现两行"
+        );
+
+        let mut s = Store::load(&f);
+        s.unpin(&a);
+        assert!(Store::load(&f).pinned().is_empty());
+    }
+
+    /// 老文件没有 `pinned` / `project_profiles` 两个字段，必须照常读出来，
+    /// 不能整份 JSON 解析失败把 `recent` 也一起丢掉。
+    #[test]
+    fn an_old_file_without_the_new_fields_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("projects.json");
+        std::fs::write(&f, r#"{"recent":["/x"],"last_profile":"claude"}"#).unwrap();
+
+        let s = Store::load(&f);
+        assert_eq!(s.list(), vec!["/x".to_string()]);
+        assert!(s.pinned().is_empty());
     }
 }
