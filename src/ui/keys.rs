@@ -37,6 +37,14 @@ struct Group {
 /// 拿到的是 `NotAnAgentSession`。
 fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
     let in_grid = matches!(from, View::Grid { .. });
+    // 方向键这一条不设前提，跟下面那些键不同。理由不是「看板上总有一个组」——
+    // 那句话是假的：`App::new` 的 `pinned` 是空的，开机补启动目录那一下
+    // （`seed_start_project`）要等守护进程第一次 `List` 回来才发生，中间那几十
+    // 毫秒看板真的一行都没有。写在这里的理由是**代价**：其余的键按不动时会
+    // 弹一句错（`u` 拿到 `NotAnAgentSession`）或者悄悄什么都不发生，用户会
+    // 以为自己按错了；空列表上按方向键则是所有人对列表的既有预期，没有任何
+    // 需要解释的后果。而且这一条是这一组的**锚**——把它也去掉，那半秒里
+    // 「走动」组会是个空标题。
     let mut move_keys: Vec<HelpItem> = help_items(
         &[if in_grid {
             ("", Key::MoveArrows)
@@ -45,6 +53,11 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
         }],
         lang,
     );
+    // 折叠只有看板绑着（`board::handle_key` 的 Left/Right/Space）；九宫格
+    // 那边左右键是移动焦点，写上去就是教人按错。
+    if !in_grid {
+        move_keys.extend(help_items(&[("←→/空格", Key::ToggleCollapse)], lang));
+    }
     // `Enter` 没有作用对象时不写：列表停在组头上、九宫格一个活着的会话
     // 都没有，按下去都是无声无息。
     if ctx.selected.is_some() {
@@ -74,8 +87,14 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
     // 只有一个项目时它原地打转（见 `HelpCtx::can_switch_project`），那种时候
     // 两屏同样都不写——这一屏的作用是回答「我现在能按什么」，列一个按不动的
     // 键就是在骗人。
+    // 数字键跟 `Tab` 是同一个动作的两种走法（都落到 `goto_project`/
+    // `jump_project`），所以前提也是同一个：只有一个项目时 `1` 就是原地不动、
+    // `2`…`9` 越界什么都不发生。两个视图都绑着，两屏都写。
     if ctx.can_switch_project {
-        move_keys.extend(help_items(&[("Tab", Key::SwitchProject)], lang));
+        move_keys.extend(help_items(
+            &[("Tab", Key::SwitchProject), ("1…9", Key::GotoProject)],
+            lang,
+        ));
     }
 
     // 作用在选中会话上的三个键，跟底栏当年那份判断逐条对上：停不掉的不写
@@ -274,6 +293,8 @@ mod tests {
             "p 加项目",
             "x 移除",
             "Tab 换项目",
+            "1…9 直达项目",
+            "←→/空格 折叠",
             "c 密钥",
             "l 设置",
             "q 退出",
@@ -294,11 +315,18 @@ mod tests {
         // 换项目那两个键两个视图都绑着，所以两屏都得写——底栏里它们经常
         // 被三条动作的上限挤掉，这一屏是它们唯一的落点。
         assert!(grid.contains("Tab 换项目"), "{grid}");
+        assert!(grid.contains("1…9 直达项目"), "{grid}");
         assert!(grid.contains("x 移除"), "{grid}");
+        // 但折叠只有看板绑着：九宫格的左右键是移动焦点
+        assert!(
+            !grid.contains("折叠"),
+            "九宫格没绑折叠，写了就是教人按错：{grid}"
+        );
 
         let board = listed(&View::Board, everything_available());
         assert!(board.contains("Enter 进会话"), "{board}");
         assert!(board.contains("g 九宫格"), "{board}");
+        assert!(board.contains("←→/空格 折叠"), "{board}");
         assert!(
             !board.contains("i 回一句"),
             "列表里没有回复框，写了就是教人按错：{board}"
@@ -366,6 +394,10 @@ mod tests {
         for from in [View::Board, View::grid(0)] {
             let s = listed(&from, alone);
             assert!(!s.contains("Tab"), "只有一个项目，Tab 什么都不做：{s}");
+            assert!(
+                !s.contains("1…9"),
+                "数字键跟 Tab 同一个动作，前提也一样：{s}"
+            );
             assert!(!s.contains("x 移除"), "非空组拿不掉：{s}");
         }
     }

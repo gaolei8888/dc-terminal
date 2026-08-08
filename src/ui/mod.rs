@@ -2820,13 +2820,18 @@ mod tests {
     }
 
     /// 九宫格的按键表跟看板同一条上限，但候选键是它自己的：`i 回一句` 是这个
-    /// 视图独有的能力，不写就找不到；`Tab`/`x` 在这里根本没绑，写了就是教人
-    /// 按一个按不动的键。
+    /// 视图独有的能力，不写就找不到，所以它排在 `Tab` 前面并把 `Tab` 挤出
+    /// 那三个位子（`board_keys` 的 `truncate(3)`）。
+    ///
+    /// **用两个项目的 fixture。** 单项目那一档里 `can_switch_project` 是
+    /// false，`Tab` 压根没进候选表，于是 `!contains("Tab换项目")` 无论
+    /// `board_keys` 怎么改都是绿的——这条断言本来要盯的是那条上限，
+    /// 用单项目 fixture 就变成了一句永真的话。
     #[test]
     fn the_grid_keeps_its_own_key_on_screen_at_eighty_columns() {
         use ratatui::backend::TestBackend;
 
-        let (mut app, _dir) = app_with_one_agent_session(View::grid(0));
+        let (mut app, _dir) = app_with_two_projects(View::grid(0));
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
@@ -2834,9 +2839,14 @@ mod tests {
         for key in ["q退出", "Enter放大", "i回一句", "n新建", "?…"] {
             assert!(c.contains(key), "九宫格按键表里的「{key}」被截掉了：{c}");
         }
-        for key in ["Tab换项目", "x移除"] {
-            assert!(!c.contains(key), "九宫格没绑「{key}」，不该写：{c}");
-        }
+        // `Tab` 九宫格是绑着的（`grid::handle_key`），这里没有它是因为三条
+        // 动作已经满了——它在 `?` 浮层里，那扇门就在这一行的尾巴上。
+        assert!(
+            !c.contains("Tab换项目"),
+            "三条动作的上限破了：底栏又开始随宽度忽隐忽现：{c}"
+        );
+        // `x` 也绑着，但光标那个组还有正在跑的会话，`unpin_current` 会拒绝
+        assert!(!c.contains("x移除"), "非空组拿不掉，不该写：{c}");
     }
 
     /// 选项目是**浮层**不是全屏接管：画完之后，屏幕上必须**同时**看得到

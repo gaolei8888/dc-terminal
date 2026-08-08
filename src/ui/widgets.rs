@@ -448,7 +448,11 @@ mod tests {
             ("n", Key::New),
             ("N", Key::SwitchAgent),
             ("p", Key::SwitchProject),
-            ("a", Key::SeeAllProjects),
+            // 这一条纯粹是**宽度素材**：这条测试算的是列数，不是哪个键真绑在
+            // 看板上。原来放的是 `a 看全部项目`（中文 12 列 / 英文 14 列），
+            // 那条词条随着分组一起删了，换成宽度最接近的 `进入文件夹`
+            // （12 列 / 13 列），列数预算不变。
+            ("e", Key::EnterFolder),
             ("?", Key::MoreKeys),
         ]);
         for width in [24usize, 40, 57, 80, 120] {

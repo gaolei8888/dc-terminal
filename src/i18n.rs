@@ -101,10 +101,15 @@ pub enum Key {
     /// 的换项目手段；`Tab` 出现之后再写「换项目」，用户会以为按 `p` 能一步
     /// 换过去，而实际弹出来的是一个选择器。
     AddProject,
+    /// `1`…`9` 的说明：组头前面印着号码，按下去一步落到那个项目上。
+    /// 跟 `Tab` 是同一件事的两种走法，所以两条都得写：`Tab` 是挨个翻，
+    /// 数字是看见号码直接跳。
+    GotoProject,
     /// `x` 的说明：把光标所在的空项目从看板上拿掉。
     RemoveProject,
-    SeeAllProjects,
-    ThisProjectOnly,
+    /// `←` `→` `空格` 的说明：把光标所在的那个组收起来 / 摊开。
+    /// 只有看板绑着——九宫格的左右键是移动焦点（`grid::handle_key`）。
+    ToggleCollapse,
     Secrets,
     Grid,
     List,
@@ -153,7 +158,6 @@ pub enum Key {
     BackToSettings,
     // —— 视图标题 ——
     BoardTitle,
-    BoardTitleAllProjects,
     Disconnected,
     PickAgentTitle,
     PickProjectTitle,
@@ -248,9 +252,9 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 「换项目」放得下，不必跟着缩。
         SwitchProject => t!(lang, en: "project", zh: "换项目"),
         AddProject => t!(lang, en: "add project", zh: "加项目"),
+        GotoProject => t!(lang, en: "go to project", zh: "直达项目"),
         RemoveProject => t!(lang, en: "remove", zh: "移除"),
-        SeeAllProjects => t!(lang, en: "all projects", zh: "看全部项目"),
-        ThisProjectOnly => t!(lang, en: "this project only", zh: "只看本项目"),
+        ToggleCollapse => t!(lang, en: "fold", zh: "折叠"),
         Secrets => t!(lang, en: "keys", zh: "密钥"),
         Grid => t!(lang, en: "grid", zh: "九宫格"),
         List => t!(lang, en: "list", zh: "列表"),
@@ -311,12 +315,9 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
         BackToSettings => t!(lang, en: "Ctrl+Q settings", zh: "Ctrl+Q 回设置"),
 
+        // 看板只有这一个标题了：它现在**永远**是全部项目——分组之后
+        // 「只看本项目 / 看全部项目」这对模式整个消失，标题不再随模式变。
         BoardTitle => t!(lang, en: "dct sessions", zh: "dct 会话看板"),
-        BoardTitleAllProjects => t!(
-            lang,
-            en: "dct sessions · all projects",
-            zh: "dct 会话看板 · 全部项目",
-        ),
         Disconnected => t!(
             lang,
             en: "disconnected, this may be out of date",
@@ -1188,9 +1189,9 @@ mod tests {
             SwitchAgent,
             SwitchProject,
             AddProject,
+            GotoProject,
             RemoveProject,
-            SeeAllProjects,
-            ThisProjectOnly,
+            ToggleCollapse,
             Secrets,
             Grid,
             Select,
@@ -1223,7 +1224,6 @@ mod tests {
             BackToList,
             BackToSettings,
             BoardTitle,
-            BoardTitleAllProjects,
             Disconnected,
             PickAgentTitle,
             PickProjectTitle,
@@ -1317,7 +1317,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 97, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

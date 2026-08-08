@@ -90,22 +90,34 @@ If you rebuild `dct` while the daemon from before the rebuild is still running, 
 
 ## The board
 
+The board is **grouped by project**. Sessions from the same project sit together under a header line that names the agents that project is running (`claude×2 codex×1`) and whether any of them failed. A vertical bar down the left marks the project your cursor is in — that's where `n` opens.
+
 | Key | |
 |---|---|
-| `n` | new session with whatever agent you used last, straight in, no menu |
+| `Tab` `Shift+Tab` | switch project, one keypress |
+| `1`…`9` | go straight to the Nth project (the number is printed on the header) |
+| `n` | new session in the current project, with that project's last agent |
 | `N` | new session, pick the agent |
-| `p` | switch project — sets where the *next* session opens |
+| `p` | put another project on the board |
+| `x` | take a project with no sessions off the board |
+| `←` `→` `space` | fold / unfold the current project |
 | `↑` `↓` | move around |
 | `Enter` | open a session |
 | `u` | undo, back to the last snapshot |
 | `s` | stop a session |
 | `d` | what did this session change |
 | `c` | API keys |
+| `l` | settings (interface language) |
 | `g` | tile grid: every session's live screen at once; `Enter` zooms in |
+| `?` | all keys |
 | `q` | quit the board; sessions keep running |
 | `Ctrl+Q` | back out one level, wherever you are |
 
-The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), and `n`/`N`/`p`/`c`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
+**Every project remembers its own last agent.** Press `n` in project A and you get claude, press `n` in project B and you get codex — and the bottom bar names which one you're about to get before you press anything (`n new claude`). A project that has never had a session just says `n new`, and pressing it opens the agent picker; so does a window too narrow to fit the name without pushing another key off the line.
+
+The bottom bar is one line, and the keys that don't fit don't flicker in and out with the window width: whatever the bar can't hold lives one keypress away behind `?`, and that door (`? …`) is always the last thing on the line. That screen lists only the keys that actually do something right now — no `Tab` when there's only one project, no `x` when the group still has sessions in it.
+
+The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly what they do on the board (folding is list-only; in the grid the left and right arrows move the focus). Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
 
 Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
 
@@ -142,9 +154,9 @@ Two agents in one project will fight over the same files. Different projects, no
 
 `opencode` and `qwen` are in the list but neither has ever actually been run, so they have no screen patterns and their sessions just show `—`.
 
-Switching projects is currently a "recently used" list plus pasting a path by hand. There's no directory browser. This part needs redoing.
+Only the first nine groups get a number. From the tenth project on, `Tab` is the only way there, one step at a time.
 
-The interface itself is Chinese-only. Profiles are already per-language; the UI strings aren't.
+The interface comes in Chinese and English. `l` switches it, `DCT_LANG=en` overrides it for one run, and with neither it follows your system locale.
 
 ---
 
