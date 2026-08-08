@@ -112,8 +112,19 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     // 目录被删了：名字标灰并点出来。会话本身还活着（进程的 cwd
                     // 已经打开），组照常留在看板上——让它消失才是真的找不回来了。
                     let gone = !g.dir.exists();
+                    // **先截再补**，跟下面那行父目录一样。`pad_to` 只补不截，
+                    // 光靠它的话一个长目录名（`我的自媒体电商代运营项目` 是
+                    // 24 列，而中文项目名长成这样再普通不过）会把整行右推，
+                    // 80 列上先被吃掉的正是行尾那个红色的「N 个出错」——
+                    // 一个坏掉的项目于是看起来一切正常，而这是 dct 最贵的
+                    // 失败模式。名字裁短了还看得出是哪个项目，出错的红字被
+                    // 裁掉了就什么都没有了。
+                    //
+                    // 上限取 17 不是 18：`truncate` 裁完会补一个 `…`，17 列
+                    // 的内容加那一个字符正好 18，列宽分毫不动。名字比父目录
+                    // 那一列（16）宽一格是有意的——认项目靠的是名字。
                     spans.push(Span::styled(
-                        pad_to(&g.name, 18),
+                        pad_to(&truncate(&g.name, 17), 18),
                         if gone {
                             dim()
                         } else {
@@ -238,16 +249,20 @@ mod tests {
 
     /// 目录被删了要在组头上说出来，而不是让整个组从看板上消失——
     /// 会话本身还活着（进程的 cwd 早就打开了），消失才是真的找不回来。
+    ///
+    /// 名字挑一个放得进那 18 列的：名字列现在会截断（见
+    /// `a_long_cjk_project_name_never_pushes_the_failure_count_off_screen`），
+    /// 而这条问的是「这一行还在不在、有没有说清为什么灰」，不是截断规则。
     #[test]
     fn a_group_whose_folder_is_gone_says_so_instead_of_vanishing() {
         let (mut app, _dir) = App::test_app();
-        app.set_sessions(vec![sess(1, "/w/definitely-not-here")]);
+        app.set_sessions(vec![sess(1, "/w/gone-for-good")]);
 
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
         let c = screen_text(&term);
-        assert!(c.contains("definitely-not-here"), "组还在看板上：{c}");
+        assert!(c.contains("gone-for-good"), "组还在看板上：{c}");
         assert!(c.contains("目录不在了"), "并且说清为什么它是灰的：{c}");
     }
 
@@ -268,6 +283,38 @@ mod tests {
             screen_text(&term).contains("1个出错"),
             "组头必须点出出错的数量：{}",
             screen_text(&term)
+        );
+    }
+
+    /// **长项目名不许把「N 个出错」挤下 80 列的屏幕。**
+    ///
+    /// 目标用户是中文用户，`我的自媒体电商代运营项目` 这样 24 列宽的目录名
+    /// 是日常，不是边角。名字那一列原来只补不截（`pad_to`），于是整行被右推，
+    /// 80 列上先被吃掉的正是行尾那句红字——而它是组折起来的时候，屏幕上
+    /// 唯一还说得出「这个项目里出事了」的地方。名字裁短了还认得出是哪个项目，
+    /// 红字被裁掉了就什么线索都不剩。
+    #[test]
+    fn a_long_cjk_project_name_never_pushes_the_failure_count_off_screen() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "我的自媒体电商代运营项目");
+        let mut bad1 = sess(2, &proj);
+        bad1.state = SessionState::Failed;
+        let mut bad2 = sess(3, &proj);
+        bad2.state = SessionState::Failed;
+        app.set_sessions(vec![sess(1, &proj), bad1, bad2]);
+
+        // 80 列是最常见的终端下限，也正是这一行最先崩的地方
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(
+            c.contains("2个出错"),
+            "80 列下这句红字被长项目名挤掉了：{c}"
+        );
+        assert!(
+            c.contains("我的自媒体电商"),
+            "名字可以裁短，但要还认得出是哪个项目：{c}"
         );
     }
 
