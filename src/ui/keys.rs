@@ -55,8 +55,14 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
     );
     // 折叠只有看板绑着（`board::handle_key` 的 Left/Right/Space）；九宫格
     // 那边左右键是移动焦点，写上去就是教人按错。
+    //
+    // 键名列写 `Space` 不写 `空格`：这一列是**键盘上那个键叫什么**，跟界面
+    // 语言无关，整个仓库都是 `Tab`/`Enter`/`Esc`/`Ctrl+Q`/`F3` 这样原样写的。
+    // 写成中文的话英文用户会看到 `←→/空格 fold`——而 i18n 那条「英文里不许
+    // 有汉字」的守卫只扫 `text()`，看不见键名列。现在下面
+    // `no_key_column_is_ever_written_in_chinese` 把这一列也扫上了。
     if !in_grid {
-        move_keys.extend(help_items(&[("←→/空格", Key::ToggleCollapse)], lang));
+        move_keys.extend(help_items(&[("←→/Space", Key::ToggleCollapse)], lang));
     }
     // `Enter` 没有作用对象时不写：列表停在组头上、九宫格一个活着的会话
     // 都没有，按下去都是无声无息。
@@ -294,7 +300,7 @@ mod tests {
             "x 移除",
             "Tab 换项目",
             "1…9 直达项目",
-            "←→/空格 折叠",
+            "←→/Space 折叠",
             "c 密钥",
             "l 设置",
             "q 退出",
@@ -326,7 +332,7 @@ mod tests {
         let board = listed(&View::Board, everything_available());
         assert!(board.contains("Enter 进会话"), "{board}");
         assert!(board.contains("g 九宫格"), "{board}");
-        assert!(board.contains("←→/空格 折叠"), "{board}");
+        assert!(board.contains("←→/Space 折叠"), "{board}");
         assert!(
             !board.contains("i 回一句"),
             "列表里没有回复框，写了就是教人按错：{board}"
@@ -399,6 +405,45 @@ mod tests {
                 "数字键跟 Tab 同一个动作，前提也一样：{s}"
             );
             assert!(!s.contains("x 移除"), "非空组拿不掉：{s}");
+        }
+    }
+
+    /// **键名列里不许出现汉字。**
+    ///
+    /// 按键表的每一条有两半：说明那一列走 `text()`，`i18n` 的
+    /// `no_english_entry_contains_han_characters` 管得着；键名那一列是写死的
+    /// 字面量，那条守卫**完全看不见**。于是 `("←→/空格", ToggleCollapse)`
+    /// 这种错能一路走到英文界面上，显示成 `←→/空格 fold`，而所有测试都是绿的。
+    ///
+    /// 键名列写的是**键盘上那个键叫什么**，跟界面语言无关——所以顺带把「两种
+    /// 语言下键名列必须一模一样」也钉住：哪天有人给某个键名加了译文，这条会红。
+    /// 单独修掉一处不够，下一处照样是隐形的，所以补的是守卫不是补丁。
+    #[test]
+    fn no_key_column_is_ever_written_in_chinese() {
+        use crate::i18n::has_han;
+        // `View` 没有 `Debug`，失败信息里用「列表 / 九宫格」指回来。
+        for (name, from) in [("列表", View::Board), ("九宫格", View::grid(0))] {
+            for ctx in [
+                everything_available(),
+                HelpCtx {
+                    selected: None,
+                    can_remove: false,
+                    can_switch_project: false,
+                },
+            ] {
+                let en: Vec<String> = groups(&from, ctx, Lang::En)
+                    .iter()
+                    .flat_map(|g| g.items.iter().map(|it| it.key.to_string()))
+                    .collect();
+                let zh: Vec<String> = groups(&from, ctx, Lang::Zh)
+                    .iter()
+                    .flat_map(|g| g.items.iter().map(|it| it.key.to_string()))
+                    .collect();
+                for k in &en {
+                    assert!(!has_han(k), "键名列里写了汉字：{k:?}（{name}）");
+                }
+                assert_eq!(en, zh, "键名列跟着语言变了（{name}）");
+            }
         }
     }
 

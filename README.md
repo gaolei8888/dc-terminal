@@ -95,12 +95,12 @@ The board is **grouped by project**. Sessions from the same project sit together
 | Key | |
 |---|---|
 | `Tab` `Shift+Tab` | switch project, one keypress |
-| `1`…`9` | go straight to the Nth project (the number is printed on the header) |
+| `1`…`9` | go straight to the Nth project (the number is printed on the header; only the first nine get one) |
 | `n` | new session in the current project, with that project's last agent |
 | `N` | new session, pick the agent |
 | `p` | put another project on the board |
 | `x` | take a project with no sessions off the board |
-| `←` `→` `space` | fold / unfold the current project |
+| `←` `→` `Space` | fold / unfold the current project |
 | `↑` `↓` | move around |
 | `Enter` | open a session |
 | `u` | undo, back to the last snapshot |
@@ -117,7 +117,11 @@ The board is **grouped by project**. Sessions from the same project sit together
 
 The bottom bar is one line, and the keys that don't fit don't flicker in and out with the window width: whatever the bar can't hold lives one keypress away behind `?`, and that door (`? …`) is always the last thing on the line. That screen lists only the keys that actually do something right now — no `Tab` when there's only one project, no `x` when the group still has sessions in it.
 
-The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly what they do on the board (folding is list-only; in the grid the left and right arrows move the focus). Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
+The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), `g` goes back to the list, `?` opens the same all-keys screen, and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Two differences: folding is list-only, because in the grid the left and right arrows move the focus; and the digits work with no number on screen, because tiles carry no numbering the way group headers do — `1` is still the first project.
+
+`i` is the grid's own key, and the one thing the board has no equivalent for: it opens a one-line reply box on the focused tile, so you can answer an agent without leaving the overview. Type and press `Enter` to send. Press `Enter` on an empty box and it sends a bare Enter — that's how you approve a plan or say "carry on". `Ctrl+C` interrupts the agent instead. While the box is open the whole keyboard belongs to it.
+
+Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
 
 Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
 

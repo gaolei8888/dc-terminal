@@ -1262,6 +1262,97 @@ mod tests {
         }
     }
 
+    /// 底栏按键表的**键名列里不许出现汉字**，而且两种语言下必须一模一样。
+    ///
+    /// 为什么要单独一条：一条提示有两半，说明那半走 `text()`，`i18n` 的
+    /// `no_english_entry_contains_han_characters` 管得着；键名那半是散落在
+    /// `idle_help` 里的写死字面量，那条守卫**完全看不见**。于是把中文写进
+    /// 键名列（`("←→/空格", ToggleCollapse)`）能一路走到英文界面上显示成
+    /// `←→/空格 fold`，而全套测试都是绿的。这一条把另外那半也扫上。
+    ///
+    /// 键名列写的是**键盘上那个键叫什么**——`n`/`Tab`/`Esc`/`F3`/`↑↓`——
+    /// 跟界面语言无关，所以「两种语言下完全相同」比「没有汉字」更强，
+    /// 两条都断言。
+    ///
+    /// 视图是**逐个变体列全**的，不是挑几个有代表性的：漏掉的那一支正是
+    /// 下一次会出事的地方。`idle_help` 的 match 加了新分支而这里没跟上时，
+    /// 这条守卫不会自己报错——但下面 `assert!(!views.is_empty())` 旁边那句
+    /// 注释会提醒改这里的人。
+    #[test]
+    fn no_key_column_is_ever_written_in_chinese() {
+        use crate::i18n::has_han;
+        use std::path::PathBuf;
+
+        let secret = |return_to_settings, phase| View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase,
+            return_to_settings,
+        };
+        let mut typing = ProjectPicker::new(vec![], PathBuf::from("/"));
+        typing.typing_path = Some(String::new());
+
+        let views = vec![
+            View::Board,
+            View::Attached(1),
+            View::grid(0),
+            View::Grid {
+                focus: 0,
+                reply: Some(Draft {
+                    id: 1,
+                    text: String::new(),
+                }),
+            },
+            View::PickProfile {
+                entries: vec![entry("claude", ProfileStatus::Ready)],
+                state: ListState::default(),
+                warning: None,
+            },
+            View::PickProject(ProjectPicker::new(vec![], PathBuf::from("/"))),
+            View::PickProject(typing),
+            View::Settings {
+                state: ListState::default(),
+            },
+            secret(false, SecretPhase::Typing),
+            secret(true, SecretPhase::Typing),
+            secret(false, SecretPhase::Verifying),
+            View::Keys {
+                from: Box::new(View::Board),
+            },
+            View::Secrets {
+                entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
+                state: ListState::default(),
+                pending_delete: None,
+            },
+        ];
+        // 加了 View 变体就往上面那张表里补一行——这条守卫只查得到被列出来的。
+        assert!(!views.is_empty());
+
+        // `View` 没有 `Debug`（里面挂着 `ListState` 之类），失败信息里用下标
+        // 指回上面那张表就够了——表是按顺序写死的。
+        for (i, v) in views.iter().enumerate() {
+            for ctx in [on_a_session(), on_a_header()] {
+                let en: Vec<&str> = idle_help(v, Lang::En, ctx)
+                    .iter()
+                    .map(|it| it.key)
+                    .collect();
+                let zh: Vec<&str> = idle_help(v, Lang::Zh, ctx)
+                    .iter()
+                    .map(|it| it.key)
+                    .collect();
+                for k in &en {
+                    assert!(!has_han(k), "键名列里写了汉字：{k:?}（views[{i}]）");
+                }
+                assert_eq!(en, zh, "键名列跟着语言变了（views[{i}]）");
+            }
+        }
+    }
+
     #[test]
     fn ctrl_q_is_never_forwarded_to_the_agent() {
         // 调用点已经拦了 Ctrl+Q，这层是兜底：万一哪天调用点漏改，

@@ -238,6 +238,20 @@ pub enum Key {
     GroupNotEmpty,
 }
 
+/// 一段文字里有没有汉字。
+///
+/// 提到模块顶层（原来埋在 `mod tests` 里）是因为「英文界面上不许冒出汉字」
+/// 这条规矩管的**不止是 `text()`**。按键表的每一条有两半：键名那一列是
+/// 写死的字面量（`n`、`Tab`、`↑↓`），说明那一列才走 `text()`。
+/// `no_english_entry_contains_han_characters` 只看得见后一半，于是
+/// `("←→/空格", ToggleCollapse)` 这种「把中文写进键名列」的错整个在它视野
+/// 之外——英文用户看到的是 `←→/空格 fold`。现在 `view.rs` 和 `keys.rs`
+/// 各有一条守卫把前一半也扫一遍，三条共用这一个判定。
+#[cfg(test)]
+pub(crate) fn has_han(s: &str) -> bool {
+    s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
 pub fn text(k: Key, lang: Lang) -> &'static str {
     use Key::*;
     match k {
@@ -1286,10 +1300,6 @@ mod tests {
             GroupNotEmpty,
         ]
     };
-
-    fn has_han(s: &str) -> bool {
-        s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-    }
 
     /// 英文词条里不许出现汉字。批量加词条时最容易犯的错就是把中文那行抄过去——
     /// profile 那边已经踩过一次（`shell` 的 label 变成 `en = "命令行"`）。
