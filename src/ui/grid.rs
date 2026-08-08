@@ -184,9 +184,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `refresh_rows` 的锚点跟着一起没了，只能退回第 0 行——也就是一个跟
         // 用户毫无关系的项目。而九宫格里看得见的指针是 `▶`，它还在原来那一格
         // 上。不对齐的话，`x` 之后底栏写着 A、`▶` 在 C，`n` 会开进 A。
+        //
+        // 这里也走无条件的那一支：光标原来站的组刚被删掉，它现在的位置是个
+        // 兜底值，没有资格再跟焦点争「当前项目」是谁。
         KeyCode::Char('x') if is_plain_key(&key) => {
             super::unpin_current(app);
-            super::sync_board_cursor_from_grid(app);
+            point_cursor_at_focus(app);
         }
         // `i` 开回复框。收件人在这一刻钉死成会话 id，之后焦点再怎么动都
         // 不改——见 `Draft::id`。
@@ -258,11 +261,33 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 /// 哪个目录、`x` 拿掉哪个组，全都还指着上一个项目，而屏幕上焦点分明已经在
 /// 别人家的格子里了。这正是这一版要消灭的「屏幕和状态各说各的」。
 ///
-/// 会话刚没了、焦点一时对不上任何 id 时 `sync_board_cursor_from_grid` 自己
-/// 不动光标——乱指一个比不动更糟，理由见那个函数。
+/// **走 `point_cursor_at_focus` 而不是 `sync_board_cursor_from_grid`。**
+/// 后者带着一条「焦点可能是陈旧的、别拿它改写光标」的守卫，那条守卫是为
+/// 「用户没有碰过焦点」的出口准备的。方向键恰恰相反：按下它就是用户在说
+/// 「我现在指的是这一格」，没有任何情况该让这个动作只挪一半。让它也过一遍
+/// 那条守卫的话，同一个方向键会因为一个屏幕上看不见的状态而有两种含义，
+/// 而屏幕上没有任何东西能告诉用户现在是哪一种。
 fn move_grid_focus(app: &mut App, focus: usize, total: usize, dir: Dir) {
     app.view = View::grid(move_focus(focus, total, dir));
-    super::sync_board_cursor_from_grid(app);
+    point_cursor_at_focus(app);
+}
+
+/// 把列表光标指到**此刻焦点那一格**的会话上，无条件。
+///
+/// 跟 `sync_board_cursor_from_grid` 的差别只有那条「焦点是不是陈旧的」守卫。
+/// 这里的两个调用点都属于「焦点就是此刻唯一有意义的指针」，守卫在这儿只会
+/// 添乱：方向键是用户显式的指点动作；`x` 则是把光标原来站的那个组整个删掉了，
+/// 光标剩下的落点是 `refresh_rows` 的兜底第 0 行，跟用户毫无关系。
+///
+/// 焦点一时对不上任何会话（刚被停掉/清掉，还没收拢）就什么都不做——
+/// 乱指一个比不动更糟，同 `point_cursor_at_session`。
+fn point_cursor_at_focus(app: &mut App) {
+    let View::Grid { focus, .. } = app.view else {
+        return;
+    };
+    if let Some(id) = app.grid_sessions().get(focus).map(|s| s.id) {
+        super::point_cursor_at_session(app, id);
+    }
 }
 
 /// 把焦点挪到当前组的第一个活会话上。
@@ -1048,6 +1073,81 @@ mod tests {
             "焦点是故意留旧的，`g` 不能拿它把刚换过去的项目换回来"
         );
         assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
+    }
+
+    /// **会话全停了的项目不是「焦点陈旧」，别把它们混成一件事。**
+    ///
+    /// 一个所有会话都已停止的项目，在九宫格里同样一个格子都没有。但用户在它
+    /// 上面按方向键时，焦点是**他自己挪的**——那是一次显式的指点动作，光标
+    /// 必须跟着走。要是拿「这个组没有活格子」当作「焦点是陈旧的」的判据，
+    /// 这里就会被一起挡掉：用户从全停项目进九宫格、方向键挪到别的项目的活
+    /// 格子上、再回列表，光标却还停在那个**已停止**的会话上——而 `s`/`u`
+    /// 都不可撤销，正是 `sync_board_cursor_from_grid` 开篇警告的那种事故。
+    #[test]
+    fn an_all_stopped_project_does_not_freeze_the_cursor_where_it_stands() {
+        let (mut app, _dir) = App::test_app();
+        let mut stopped = session_in(9, "/w/zz");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(2, "/w/b"), session_in(3, "/w/b"), stopped]);
+        // 行是 [组头 b, 2, 3, 组头 zz, 9]：光标停在 zz 的那个已停止会话上
+        app.list_state.select(Some(4));
+        assert_eq!(
+            app.selected_session().map(|s| s.id),
+            Some(9),
+            "前提：光标在 zz 的已停止会话上"
+        );
+        app.view_mode = crate::ui::ViewMode::Grid;
+        // 进九宫格：zz 在这儿没有格子，焦点只能回落到第 0 格（b 的会话 2）
+        app.view = super::super::home_view(&app);
+        assert!(matches!(app.view, View::Grid { focus: 0, .. }));
+
+        // 用户自己把焦点挪到 b 的第二个活格子上——这是显式的指点动作
+        handle_key(&mut app, key(KeyCode::Right)).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
+
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(
+            app.selected_session().map(|s| s.id),
+            Some(3),
+            "光标必须落在用户指着的那个活会话上，而不是留在已停止的 9 上——\
+             接下来的 s/u 都不可撤销"
+        );
+    }
+
+    /// **空项目一旦拿到会话，陈旧的焦点也不会自己回正。**
+    ///
+    /// `Tab` 到空项目 z 之后焦点是故意留旧的（指着 a 的格子）。这时候后台
+    /// 那一轮 `List` 轮询把 z 的新会话捎了回来（另一个 dct 窗口开的，或者
+    /// 刚从 `n` 回来），z 于是有了活会话——但**没有任何东西会把焦点挪进 z**。
+    /// 拿「这个组有没有活格子」当判据的话，守卫会在这一刻打开，而焦点仍然是
+    /// 旧的，`g` 照样把用户送回 a。
+    #[test]
+    fn a_stale_focus_stays_stale_after_the_empty_project_gains_a_session() {
+        let (mut app, _dir) = App::test_app();
+        app.pinned = vec!["/w/z".into()];
+        app.set_sessions(vec![session_in(1, "/w/a")]);
+        app.view_mode = crate::ui::ViewMode::Grid;
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string())
+        );
+
+        // 后台轮询：z 有会话了。光标（锚在 z 的组头上）不动，焦点也没人挪。
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(5, "/w/z")]);
+        assert!(
+            matches!(app.view, View::Grid { focus: 0, .. }),
+            "没有任何东西会把焦点挪进 z"
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "焦点还是旧的（指着 a 的格子），z 有没有会话都不该让它改写光标"
+        );
     }
 
     /// 同一个洞的另一条出口：`Enter` 放大也调 `sync_board_cursor_from_grid`。
