@@ -947,12 +947,44 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
 /// 写不出来。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HelpCtx {
-    /// 光标（列表）或焦点（九宫格）现在真的落在一个会话上。停在组头上
-    /// 就是 `false`——那时候 `Enter` 按下去没有对象，写出来就是屏幕上
-    /// 写着一个按不动的键。
-    pub selected: bool,
+    /// 光标（列表）或焦点（九宫格）现在落在哪个会话上。停在组头上就是
+    /// `None`——那时候 `Enter` 按下去没有对象，写出来就是屏幕上写着一个
+    /// 按不动的键。
+    ///
+    /// 带着会话本身而不只是一个 bool：`s`/`u`/`d` 能不能按要看它的状态和
+    /// 是不是 agent 会话。底栏现在不写这三个键了（上限三条），但 `?` 浮层
+    /// 写——而浮层同样不许宣传一个按不动的键。
+    pub selected: Option<SelectedSession>,
     /// 光标所在的组是不是「pinned 且没有会话」——只有这种组能按 `x` 拿掉。
     pub can_remove: bool,
+    /// 看板上有没有**第二个**项目可跳。
+    ///
+    /// 只有一个组时 `Tab` 什么都不做：`jump_project` 算的是
+    /// `(cur + 1).rem_euclid(1)`，也就是 0，光标原地停在同一个组头上。
+    /// 而「只有一个项目」正是第一次用 dct 时的默认状态——那一屏上写着
+    /// `Tab 换项目`，按下去毫无反应，用户学到的第一件事就是底栏会骗人。
+    pub can_switch_project: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectedSession {
+    /// 是 agent 会话还是普通命令行。`u 回滚` / `d 改动` 只对前者有效。
+    pub is_agent: bool,
+    pub state: SessionState,
+}
+
+impl HelpCtx {
+    /// 能不能停。已经停了的会话再写一个 `s 停止`，按下去只会得到一句错误。
+    pub(crate) fn can_stop(&self) -> bool {
+        matches!(self.selected, Some(s) if s.state != SessionState::Stopped)
+    }
+
+    /// 能不能回滚 / 看改动。命令行会话没有检查点，守护进程侧
+    /// `checkpoint_base` 会直接返回 `NotAnAgentSession`——对着一个 shell
+    /// 会话写 `u 回滚`，就是在说谎。
+    pub(crate) fn can_checkpoint(&self) -> bool {
+        matches!(self.selected, Some(s) if s.is_agent)
+    }
 }
 
 /// 看板和九宫格共用的那张按键表。**硬上限三条动作 + 一个 `?`。**
@@ -976,7 +1008,7 @@ fn board_keys(
 ) -> Vec<(&'static str, crate::i18n::Key)> {
     use crate::i18n::Key;
     let mut keys: Vec<(&'static str, Key)> = Vec::new();
-    if ctx.selected {
+    if ctx.selected.is_some() {
         keys.push(enter);
     }
     keys.extend_from_slice(rest);
@@ -1062,7 +1094,11 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             if ctx.can_remove {
                 rest.push(("x", Key::RemoveProject));
             }
-            rest.push(("Tab", Key::SwitchProject));
+            // 只有一个项目时 `Tab` 原地打转（见 `HelpCtx::can_switch_project`），
+            // 不写。第一次用 dct 的那一屏正好就是这种状态。
+            if ctx.can_switch_project {
+                rest.push(("Tab", Key::SwitchProject));
+            }
             help_items(&board_keys(ctx, ("Enter", Key::Open), &rest), lang)
         }
         // 格子只读，键盘不会送进 agent，所以这里可以放心列一张按键表——
@@ -1095,7 +1131,7 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 会开在一个不存在的会话上。
         View::Grid { .. } => {
             let mut rest: Vec<(&'static str, Key)> = Vec::new();
-            if ctx.selected {
+            if ctx.selected.is_some() {
                 rest.push(("i", Key::ReplyOnce));
             }
             rest.push(("n", Key::New));
@@ -1175,10 +1211,27 @@ mod tests {
         crate::i18n::help_text(&idle_help(view, lang, ctx))
     }
 
+    /// 默认那一档：光标停在一个正在跑的 agent 会话上，看板上不止一个项目。
+    /// 这是键最全的一档——`Tab`/`s`/`u`/`d` 的前提都在，所以「某个键不该
+    /// 出现」这类断言拿它当反例才有意义（前提不在的话，断言会因为前提不在
+    /// 而通过，那是个假绿）。
     fn on_a_session() -> HelpCtx {
         HelpCtx {
-            selected: true,
+            selected: Some(SelectedSession {
+                is_agent: true,
+                state: SessionState::Idle,
+            }),
             can_remove: false,
+            can_switch_project: true,
+        }
+    }
+
+    /// 光标停在组头上（或者九宫格里一个会话都没有），但看板上有多个项目。
+    fn on_a_header() -> HelpCtx {
+        HelpCtx {
+            selected: None,
+            can_remove: false,
+            can_switch_project: true,
         }
     }
 
@@ -1273,17 +1326,17 @@ mod tests {
     fn the_action_segment_is_capped_in_every_context() {
         let cases = [
             HelpCtx::default(),
+            on_a_header(),
+            on_a_session(),
             HelpCtx {
-                selected: true,
-                can_remove: false,
-            },
-            HelpCtx {
-                selected: false,
                 can_remove: true,
+                ..on_a_header()
             },
+            // 结构上到不了的一档（选中会话的组不可能是空组），但上限本身
+            // 不该依赖那个巧合——`truncate(3)` 就是靠这一档才被真正测到。
             HelpCtx {
-                selected: true,
                 can_remove: true,
+                ..on_a_session()
             },
         ];
         for view in [View::Board, View::grid(0)] {
@@ -1304,8 +1357,8 @@ mod tests {
     #[test]
     fn the_remove_key_only_shows_up_on_a_group_it_can_actually_remove() {
         let removable = HelpCtx {
-            selected: false,
             can_remove: true,
+            ..on_a_header()
         };
         assert!(
             help_when(&View::Board, Lang::Zh, removable).contains("x 移除"),

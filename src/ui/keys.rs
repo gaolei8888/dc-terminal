@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::app::App;
 use super::dim;
-use super::view::View;
+use super::view::{HelpCtx, View};
 use super::widgets::{display_width, help_spans, item_width, wrap_items};
 use crate::i18n::{help_items, text, HelpItem, Key, Lang};
 
@@ -29,37 +29,65 @@ struct Group {
 /// 写成「跟着来路走」而不是列一张固定表，是因为这一屏的作用就是**替用户
 /// 回答「我现在能按什么」**。列一张两个视图混在一起的表，等于把他刚躲开的
 /// 那个问题又还给他。
-fn groups(from: &View, lang: Lang) -> Vec<Group> {
+///
+/// **同一个理由，`ctx` 也必须进来。** 「不许宣传一个按不动的键」这条规矩
+/// 不分屏：以前 `s`/`u`/`d` 靠底栏按 `HelpCtx` 过滤，浮层跟着沾光；底栏
+/// 收成三个位子之后，这三个键唯一的落点就是这一屏，它再无条件列出来，
+/// 那条规矩就整个没人执行了——对着一个命令行会话写 `u 回滚`，按下去
+/// 拿到的是 `NotAnAgentSession`。
+fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
     let in_grid = matches!(from, View::Grid { .. });
     let mut move_keys: Vec<HelpItem> = help_items(
-        &[
-            if in_grid {
-                ("", Key::MoveArrows)
-            } else {
-                ("↑↓", Key::Select)
-            },
-            if in_grid {
+        &[if in_grid {
+            ("", Key::MoveArrows)
+        } else {
+            ("↑↓", Key::Select)
+        }],
+        lang,
+    );
+    // `Enter` 没有作用对象时不写：列表停在组头上、九宫格一个活着的会话
+    // 都没有，按下去都是无声无息。
+    if ctx.selected.is_some() {
+        move_keys.extend(help_items(
+            &[if in_grid {
                 ("Enter", Key::Zoom)
             } else {
                 ("Enter", Key::Open)
-            },
-            if in_grid {
-                ("g", Key::List)
-            } else {
-                ("g", Key::Grid)
-            },
-        ],
+            }],
+            lang,
+        ));
+    }
+    move_keys.extend(help_items(
+        &[if in_grid {
+            ("g", Key::List)
+        } else {
+            ("g", Key::Grid)
+        }],
         lang,
-    );
+    ));
     if in_grid {
-        move_keys.extend(help_items(&[("i", Key::ReplyOnce)], lang));
-    } else {
+        if ctx.selected.is_some() {
+            move_keys.extend(help_items(&[("i", Key::ReplyOnce)], lang));
+        }
+    } else if ctx.can_switch_project {
         // `Tab` 只在列表上绑着（`board::handle_key`），九宫格没有它——
         // 这一屏的作用是回答「我现在能按什么」，列一个这个视图按不动的键
         // 就是在骗人。列表这边它反倒是**日常换项目的主路径**，底栏那三个
-        // 位子有时轮不到它，浮层里绝不能也没有。
+        // 位子有时轮不到它，浮层里绝不能也没有。只有一个项目时它原地打转
+        // （见 `HelpCtx::can_switch_project`），那种时候同样不写。
         move_keys.extend(help_items(&[("Tab", Key::SwitchProject)], lang));
     }
+
+    // 作用在选中会话上的三个键，跟底栏当年那份判断逐条对上：停不掉的不写
+    // `s`，没有检查点的不写 `u`/`d`。
+    let mut session_keys = help_items(&[("n", Key::New), ("N", Key::SwitchAgent)], lang);
+    if ctx.can_stop() {
+        session_keys.extend(help_items(&[("s", Key::Stop)], lang));
+    }
+    if ctx.can_checkpoint() {
+        session_keys.extend(help_items(&[("u", Key::Undo), ("d", Key::Diff)], lang));
+    }
+
     vec![
         Group {
             title: Key::KeysGroupMove,
@@ -67,16 +95,7 @@ fn groups(from: &View, lang: Lang) -> Vec<Group> {
         },
         Group {
             title: Key::KeysGroupSession,
-            items: help_items(
-                &[
-                    ("n", Key::New),
-                    ("N", Key::SwitchAgent),
-                    ("s", Key::Stop),
-                    ("u", Key::Undo),
-                    ("d", Key::Diff),
-                ],
-                lang,
-            ),
+            items: session_keys,
         },
         Group {
             title: Key::KeysGroupConfig,
@@ -84,12 +103,11 @@ fn groups(from: &View, lang: Lang) -> Vec<Group> {
             // 一个键），`p` 只剩「把一个看板上还没有的项目摆上来」这一件事。
             // 照着旧措辞按 `p` 的人会以为能一步换过去，弹出来的却是选择器。
             //
-            // `x 移除` 只在列表上绑着，而且只对空组管用（`unpin_current`）。
-            // 它在底栏里只有光标停在那种组上时才写，浮层这边是常驻的一览表
-            // ——不列的话，这个键就成了「屏幕上从没写过却真管用」的那种。
+            // `x 移除` 只在列表上绑着，而且只对空组管用（`unpin_current`）
+            // ——两个条件都不满足就不写，同上。
             items: {
                 let mut v = help_items(&[("p", Key::AddProject)], lang);
-                if !in_grid {
+                if !in_grid && ctx.can_remove {
                     v.extend(help_items(&[("x", Key::RemoveProject)], lang));
                 }
                 v.extend(help_items(
@@ -140,7 +158,9 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
     let View::Keys { from } = &app.view else {
         return;
     };
-    let groups = groups(from, app.lang);
+    // 按**开门之前那一屏**算上下文，不是按 `app.view`（那是 `View::Keys`
+    // 自己）。从九宫格按 `?`，问的得是那一格的状态。
+    let groups = groups(from, super::help_ctx_for(app, from), app.lang);
 
     // 先在「最多能有多宽」里折行，再按折出来的**实际**宽高裁浮层。
     //
@@ -218,17 +238,33 @@ mod tests {
             .collect()
     }
 
+    /// 「什么都能按」那一档：选中一个正在跑的 agent 会话、看板上有第二个
+    /// 项目、光标所在的组可以移除。浮层现在按上下文过滤，所以「某个键在不在
+    /// 这一屏上」的断言必须先把它能按的前提摆出来。
+    fn everything_available() -> HelpCtx {
+        HelpCtx {
+            selected: Some(crate::ui::view::SelectedSession {
+                is_agent: true,
+                state: crate::session::SessionState::Idle,
+            }),
+            can_remove: true,
+            can_switch_project: true,
+        }
+    }
+
+    fn listed(from: &View, ctx: HelpCtx) -> String {
+        groups(from, ctx, Lang::Zh)
+            .iter()
+            .map(|g| help_text(&g.items))
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
     /// 底栏丢掉的键必须**全部**在这一屏上。这条是整个设计的支点：少一个，
     /// 那个键就成了「屏幕上没写却真管用」的键，而这正是要消灭的东西。
     #[test]
     fn every_key_the_bar_drops_is_in_here() {
-        let (mut app, _dir) = App::test_app();
-        app.view = View::Board;
-        let listed = groups(&View::Board, Lang::Zh)
-            .iter()
-            .map(|g| help_text(&g.items))
-            .collect::<Vec<_>>()
-            .join("  ");
+        let listed = listed(&View::Board, everything_available());
         for k in [
             "n 新建",
             "N 换 agent",
@@ -251,26 +287,80 @@ mod tests {
     /// 列一张两个视图混在一起的表，等于把「我现在能按什么」这个问题又还给用户。
     #[test]
     fn the_wording_follows_where_you_came_from() {
-        let grid = groups(&View::grid(0), Lang::Zh)
-            .iter()
-            .map(|g| help_text(&g.items))
-            .collect::<Vec<_>>()
-            .join("  ");
+        let grid = listed(&View::grid(0), everything_available());
         assert!(grid.contains("Enter 放大"), "{grid}");
         assert!(grid.contains("g 列表"), "{grid}");
         assert!(grid.contains("i 回一句"), "{grid}");
 
-        let board = groups(&View::Board, Lang::Zh)
-            .iter()
-            .map(|g| help_text(&g.items))
-            .collect::<Vec<_>>()
-            .join("  ");
+        let board = listed(&View::Board, everything_available());
         assert!(board.contains("Enter 进会话"), "{board}");
         assert!(board.contains("g 九宫格"), "{board}");
         assert!(
             !board.contains("i 回一句"),
             "列表里没有回复框，写了就是教人按错：{board}"
         );
+    }
+
+    /// **浮层同样不许宣传一个按不动的键。**
+    ///
+    /// 底栏收成三个位子之后，`s`/`u`/`d` 唯一的落点就是这一屏——它再无条件
+    /// 列出来的话，「屏幕上写着做不到的操作」这条规矩就整个没人执行了。
+    /// 三条各自的前提跟守护进程侧逐条对上：命令行会话没有检查点
+    /// （`checkpoint_base` 直接返回 `NotAnAgentSession`），已经停掉的会话
+    /// 再停一次只会得到一句错误。
+    #[test]
+    fn the_overlay_filters_the_keys_that_act_on_a_session() {
+        use crate::session::SessionState;
+        use crate::ui::view::SelectedSession;
+
+        let shell = HelpCtx {
+            selected: Some(SelectedSession {
+                is_agent: false,
+                state: SessionState::Idle,
+            }),
+            ..everything_available()
+        };
+        let s = listed(&View::Board, shell);
+        assert!(!s.contains("u 回滚"), "命令行会话回滚不了：{s}");
+        assert!(!s.contains("d 改动"), "命令行会话没有改动可看：{s}");
+        assert!(s.contains("s 停止"), "但停得掉：{s}");
+
+        let stopped = HelpCtx {
+            selected: Some(SelectedSession {
+                is_agent: true,
+                state: SessionState::Stopped,
+            }),
+            ..everything_available()
+        };
+        let s = listed(&View::Board, stopped);
+        assert!(!s.contains("s 停止"), "已经停了：{s}");
+        assert!(s.contains("d 改动"), "停了的会话检查点还在：{s}");
+
+        // 光标停在组头上：三个键一个都没有作用对象，`Enter` 也一样
+        let header = HelpCtx {
+            selected: None,
+            ..everything_available()
+        };
+        let s = listed(&View::Board, header);
+        for k in ["s 停止", "u 回滚", "d 改动", "Enter"] {
+            assert!(!s.contains(k), "组头行上「{k}」按不动：{s}");
+        }
+        // 但这一屏不该因此变成空的——去别处的键照旧都在
+        assert!(s.contains("n 新建") && s.contains("p 加项目"), "{s}");
+    }
+
+    /// `Tab` 和 `x` 在浮层里也按同一条规矩：只有一个项目时 `Tab` 原地打转，
+    /// 组里还有会话时 `x` 会被拒绝。
+    #[test]
+    fn the_overlay_gates_tab_and_x_on_the_board_state() {
+        let alone = HelpCtx {
+            can_switch_project: false,
+            can_remove: false,
+            ..everything_available()
+        };
+        let s = listed(&View::Board, alone);
+        assert!(!s.contains("Tab"), "只有一个项目，Tab 什么都不做：{s}");
+        assert!(!s.contains("x 移除"), "非空组拿不掉：{s}");
     }
 
     /// 浮层不是全屏接管：背后那一屏要还看得见。
@@ -299,6 +389,17 @@ mod tests {
     #[test]
     fn the_overlay_fits_in_eighty_by_twenty_four() {
         let (mut app, _dir) = App::test_app();
+        // `s`/`u`/`d` 现在按上下文过滤（见 `the_overlay_filters_...`），
+        // 所以要断言它们画得出来，得先真的有一个能停、能回滚的会话。
+        app.set_sessions(vec![crate::session::SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/w/proj".into(),
+            state: crate::session::SessionState::Working,
+            activity: String::new(),
+            is_agent: true,
+        }]);
+        app.list_state.select(Some(1));
         open(&mut app);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| super::super::draw(f, &mut app)).unwrap();

@@ -866,21 +866,37 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
 /// 分岔，理由也一样。收在这里一次，就不会有「底栏按列表算、按键按格子算」
 /// 这种两边不一致。
 fn help_ctx(app: &App) -> view::HelpCtx {
+    help_ctx_for(app, &app.view)
+}
+
+/// 同上，但按**指定的视图**算。
+///
+/// `?` 浮层要用这一支：它自己是 `View::Keys { from }`，而它列的是 `from`
+/// 那一屏能按什么。拿 `app.view` 去算，从九宫格按 `?` 之后问到的会是列表
+/// 光标的状态——那正是这一屏存在的意义（回答「我**现在**能按什么」）被
+/// 悄悄答错的方式。
+fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
     // 列表问光标停在哪一行——**停在组头上就是「没选中」**（`selected_session()`
     // 自己就是这么定义的）。这一点是 `Enter 进会话` 写不写的唯一依据：组头行
     // 上按 Enter 什么都不会发生，写出来就是屏幕上写着一个按不动的键。
-    let selected = match &app.view {
-        View::Grid { focus, .. } => app.grid_sessions().get(*focus).is_some(),
-        _ => app.selected_session().is_some(),
+    let cur = match view {
+        View::Grid { focus, .. } => app.grid_sessions().get(*focus).cloned(),
+        _ => app.selected_session().cloned(),
     };
     view::HelpCtx {
-        selected,
+        selected: cur.map(|s| view::SelectedSession {
+            is_agent: s.is_agent,
+            state: s.state,
+        }),
         // `x` 只拿得掉「pinned 且没有会话」的组，跟 `unpin_current` 的两条
         // 守卫逐条对上——底栏说什么就得真能做到什么。
         can_remove: app
             .current_group()
             .map(|g| g.pinned && g.sessions.is_empty())
             .unwrap_or(false),
+        // 跟 `jump_project` 逐条对上：0 个组直接 return，1 个组
+        // `rem_euclid(1)` 恒为 0（原地不动）。两种都不该写这个键。
+        can_switch_project: app.groups.len() > 1,
     }
 }
 
@@ -2302,6 +2318,38 @@ mod tests {
         (app, dir)
     }
 
+    /// 同上，但看板上有**两个**项目，光标停在第一个项目的那个会话上。
+    ///
+    /// `Tab 换项目` 只在有第二个项目可跳时才写（`jump_project` 在一个组上
+    /// 原地打转），所以任何关于 `Tab` 的断言都必须用这一档——用单项目的
+    /// 那个 fixture 去断言 `Tab` 在场，等于把一个按不动的键钉死在测试里。
+    fn app_with_two_projects(view: View) -> (App, tempfile::TempDir) {
+        let (mut app, dir) = App::test_app();
+        app.connected = true;
+        app.set_sessions(vec![
+            SessionInfo {
+                id: 1,
+                profile: "claude".into(),
+                dir: "/tmp/a".into(),
+                state: SessionState::Working,
+                activity: String::new(),
+                is_agent: true,
+            },
+            SessionInfo {
+                id: 2,
+                profile: "claude".into(),
+                dir: "/tmp/b".into(),
+                state: SessionState::Working,
+                activity: String::new(),
+                is_agent: true,
+            },
+        ]);
+        // 行序：组头 a / 会话 1 / 组头 b / 会话 2
+        app.list_state.select(Some(1));
+        app.view = view;
+        (app, dir)
+    }
+
     /// 80 列（最常见的下限）下，右段那三条动作必须整整齐齐都在。
     ///
     /// 这条盯的是「三段各占多宽」这个预算：中段和左段是定死的，右段剩多少
@@ -2311,21 +2359,59 @@ mod tests {
     fn the_three_actions_all_fit_at_eighty_columns() {
         use ratatui::backend::TestBackend;
 
+        // 两种语言都要测。中文是双宽字符但字少，英文是单宽但词长——
+        // 谁更挤不是想当然的：`Tab 换项目` 是 10 列，`Tab switch project`
+        // 是 18 列。只测中文的话，英文用户的底栏在 80 列上会悄悄少一个键，
+        // 而这正是这次改造要消灭的那件事。
+        //
         // 记着 agent 名的项目是**更挤**的那一档（`n 新建 claude` 比
-        // `n 新建` 宽 7 列），窄终端上先崩的是它——所以这条按它测。
-        for agent in [None, Some("claude")] {
-            let (mut app, _dir) = app_with_one_agent_session(View::Board);
-            if let Some(a) = agent {
-                remember_agent(&mut app, a);
-            }
-            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            term.draw(|f| draw(f, &mut app)).unwrap();
-            let c = bar_text(&term);
+        // `n 新建` 宽 7 列），所以两档都过一遍。
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            for agent in [None, Some("claude")] {
+                let (mut app, _dir) = app_with_two_projects(View::Board);
+                app.lang = lang;
+                if let Some(a) = agent {
+                    remember_agent(&mut app, a);
+                }
+                let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                let c = bar_text(&term);
 
-            for key in ["Enter进会话", "n新建", "Tab换项目", "?…"] {
-                assert!(c.contains(key), "{agent:?} 下「{key}」被截掉了：{c}");
+                let want: [&str; 4] = match lang {
+                    crate::i18n::Lang::Zh => ["Enter进会话", "n新建", "Tab换项目", "?…"],
+                    _ => ["Enteropen", "nnew", "Tabproject", "?…"],
+                };
+                for key in want {
+                    assert!(
+                        c.contains(key),
+                        "{lang:?}/{agent:?} 下「{key}」被截掉了：{c}"
+                    );
+                }
             }
         }
+    }
+
+    /// 只有一个项目时不写 `Tab 换项目`：`jump_project` 算的是
+    /// `(cur + 1).rem_euclid(1)` = 0，光标原地停在同一个组头上。而「只有
+    /// 一个项目」正是第一次用 dct 的默认状态——那一屏上写着一个按下去
+    /// 毫无反应的键，用户学到的第一件事就是底栏会骗人。
+    #[test]
+    fn a_lone_project_does_not_advertise_switching_to_another() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        assert_eq!(app.groups.len(), 1, "这个 fixture 只有一个项目");
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+        assert!(!c.contains("Tab"), "只有一个项目，Tab 什么都不做：{c}");
+
+        // 有第二个项目就该写出来，否则这条测试等于把功能测没了
+        let (mut app, _dir) = app_with_two_projects(View::Board);
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+        assert!(c.contains("Tab换项目"), "有第二个项目就该写：{c}");
     }
 
     /// 左段和中段永不让位：一条长消息、断连状态，都不能把「我在哪个项目」
@@ -2351,6 +2437,50 @@ mod tests {
         let c = bar_text(&term);
         assert!(c.contains("/tmp/a"), "断连也不能盖掉项目名：{c}");
         assert!(c.contains("q退出"), "断连也不能盖掉逃生键：{c}");
+        assert!(
+            !c.contains("/private/"),
+            "中段画的必须是用户敲的那条路径，不是 canon 之后的：{c}"
+        );
+    }
+
+    /// 中段画的是**用户敲的那条路径**，不是归一化之后的。
+    ///
+    /// macOS 上 `/tmp` 是指向 `/private/tmp` 的符号链接，所以这里特意用一个
+    /// **真实存在**的临时目录（建在 `/tmp` 下）：`canonicalize` 只有对真的
+    /// 存在的路径才会给出不同的答案。上一条测试用的 `/tmp/a` 并不存在，
+    /// canon 会原样退回，那条断言因此抓不住「中段改成画 `g.dir`」这个改动
+    /// ——这一条才抓得住。Linux 上 `/tmp` 不是符号链接，断言照样成立，
+    /// 只是不吃劲。
+    #[test]
+    fn the_project_segment_never_shows_the_canonical_path() {
+        use ratatui::backend::TestBackend;
+
+        let real = tempfile::Builder::new()
+            .prefix("dct-bar-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let typed = real.path().display().to_string();
+
+        let (mut app, _d) = App::test_app();
+        app.connected = true;
+        app.set_sessions(vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: typed.clone(),
+            state: SessionState::Working,
+            activity: String::new(),
+            is_agent: true,
+        }]);
+        app.list_state.select(Some(1));
+        app.view = View::Board;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let c = bar_text(&term);
+        assert!(
+            !c.contains("/private/"),
+            "canon 只用于比较，永不用于显示：{c}"
+        );
     }
 
     /// 右段硬上限 3 条动作 + 一个 `?`。终端再宽也不多塞——一行的内容随宽度
@@ -2479,7 +2609,7 @@ mod tests {
     fn the_key_letters_are_bold() {
         use ratatui::backend::TestBackend;
 
-        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        let (mut app, _dir) = app_with_two_projects(View::Board);
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
 
@@ -2602,22 +2732,30 @@ mod tests {
     fn the_bar_says_the_same_thing_at_every_width() {
         use ratatui::backend::TestBackend;
 
-        let mut seen: Option<Vec<&str>> = None;
-        for width in [80u16, 100, 160, 240] {
-            let (mut app, _dir) = app_with_one_agent_session(View::Board);
-            remember_agent(&mut app, "claude");
-            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
-            term.draw(|f| draw(f, &mut app)).unwrap();
-            let (_, _, cols) = bar_widths(width - 2);
-            // 比的是**键**，不是整行文字：`n` 后面那个 agent 名放不下时会
-            // 让位，那是有意的（见 `bar_keys`）——让的是半句说明，不是一个键。
-            let keys: Vec<&str> = widgets::fit_help(&bar_keys(&app, cols as usize), cols as usize)
-                .iter()
-                .map(|i| i.key)
-                .collect();
-            match &seen {
-                None => seen = Some(keys),
-                Some(first) => assert_eq!(first, &keys, "{width} 列下键表变了"),
+        // **两种语言各跑一遍。** 只测一种语言的宽度测试抓不住这一类 bug，
+        // 而这一类 bug 正是这个任务存在的理由：中文的一行 37 列、英文的
+        // 35 列，两者跟 80 列下那 39 列的余量完全不同，谁先崩不是想当然的。
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let mut seen: Option<Vec<&str>> = None;
+            for width in [80u16, 100, 160, 240] {
+                let (mut app, _dir) = app_with_two_projects(View::Board);
+                app.lang = lang;
+                remember_agent(&mut app, "claude");
+                let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                let (_, _, cols) = bar_widths(width - 2);
+                // 比的是**键**，不是整行文字：`n` 后面那个 agent 名放不下时会
+                // 让位，那是有意的（见 `bar_keys`）——让的是半句说明，不是一个键。
+                let keys: Vec<&str> =
+                    widgets::fit_help(&bar_keys(&app, cols as usize), cols as usize)
+                        .iter()
+                        .map(|i| i.key)
+                        .collect();
+                assert_eq!(keys.len(), 4, "{lang:?}/{width} 列下少了一个键：{keys:?}");
+                match &seen {
+                    None => seen = Some(keys),
+                    Some(first) => assert_eq!(first, &keys, "{lang:?}/{width} 列下键表变了"),
+                }
             }
         }
     }
@@ -2935,7 +3073,7 @@ mod tests {
         app.view = View::Board;
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
-        assert!(c.contains("Tab换项目"), "看板要显示自己的按键表：{c}");
+        assert!(c.contains("n新建"), "看板要显示自己的按键表：{c}");
     }
 
     #[test]

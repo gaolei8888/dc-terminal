@@ -233,7 +233,14 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
     match k {
         New => t!(lang, en: "new", zh: "新建"),
         SwitchAgent => t!(lang, en: "switch agent", zh: "换 agent"),
-        SwitchProject => t!(lang, en: "switch project", zh: "换项目"),
+        // 英文只有一个词。底栏三段切完，80 列终端的右段只剩 39 列，而
+        // `Enter open  n new  Tab switch project  ? …` 要 42 列——多出来的
+        // 三列不是折一行，是 `Tab` 整条被 `fit_help` 丢掉，于是英文用户的
+        // 底栏又回到了「键随窗口宽度忽隐忽现」，正是这次改造要消灭的东西。
+        // 名词而不是动词，也是因为这三列：紧挨着它左边的中段写的就是当前
+        // 项目名，`Tab project` 读起来是「Tab → 项目」。中文双宽字符更省，
+        // 「换项目」放得下，不必跟着缩。
+        SwitchProject => t!(lang, en: "project", zh: "换项目"),
         AddProject => t!(lang, en: "add project", zh: "加项目"),
         RemoveProject => t!(lang, en: "remove", zh: "移除"),
         SeeAllProjects => t!(lang, en: "all projects", zh: "看全部项目"),
