@@ -71,15 +71,11 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // agent 干活」，先弹回看板再让他找一遍自己刚建的
                 // 会话是白让人做第二次选择。建失败才回选择器。
                 let dir = app.current_dir().display().to_string();
-                match app.client().and_then(|c| {
-                    c.call(Request::Create {
-                        dir,
-                        profile: name,
-                        // 选择器里选的就是用户真的要用的 agent——
-                        // 与「帮你装 CLI」那条 remember=false 的路径区分开。
-                        remember: true,
-                    })
-                }) {
+                // 选择器里选的就是用户真的要用的 agent——与「帮你装 CLI」
+                // 那条 remember=false 的路径区分开。走 `create_session`
+                // 而不是自己发请求：底栏那句 `n 新建 <agent>` 的缓存由它
+                // 统一跟上（见它的文档）。
+                match super::create_session(app, &dir, &name, true) {
                     Ok(Response::Created { id }) => {
                         app.need_sessions = true; // 会话标题要显示项目名
                         View::Attached(id)
@@ -130,13 +126,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 干等一句「装不了」。remember: false —— 这不是
                 // 用户选的 agent，记了下次按 n 会掉进命令行。
                 let dir = app.current_dir().display().to_string();
-                match app.client().and_then(|c| {
-                    c.call(Request::Create {
-                        dir,
-                        profile: "shell".into(),
-                        remember: false,
-                    })
-                }) {
+                match super::create_session(app, &dir, "shell", false) {
                     Ok(Response::Created { id }) => {
                         let line = format!("{}\n", command.join(" "));
                         let _ = app

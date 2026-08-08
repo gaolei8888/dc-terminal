@@ -284,13 +284,7 @@ pub fn run(
                                 }
                                 Ok(Response::Ok) => {
                                     let dir = app.current_dir().display().to_string();
-                                    match app.client().and_then(|c| {
-                                        c.call(Request::Create {
-                                            dir,
-                                            profile: profile.clone(),
-                                            remember: true,
-                                        })
-                                    }) {
+                                    match create_session(&mut app, &dir, &profile, true) {
                                         Ok(Response::Created { id }) => {
                                             app.need_sessions = true; // 会话标题要显示项目名
                                             View::Attached(id)
@@ -1061,6 +1055,45 @@ pub(crate) fn refresh_project_profiles(app: &mut App) {
     }
 }
 
+/// **开会话的唯一入口。** 界面里没有第二处发得出建会话请求
+/// （`every_create_goes_through_the_one_helper_that_updates_the_cache` 钉着
+/// 这一条，靠扫源码——它数的就是下面那一行）。
+///
+/// 唯一的理由就是这个函数末尾那三行：`remember: true` 的 `Create` 会让守护
+/// 进程记下「这个项目上次用的 agent」，而手里那份缓存（`profiles` /
+/// `profiles_asked`）**不会**自己知道。`profiles_to_fetch` 只问没问过的项目，
+/// 所以缓存里那个旧值不是「晚一轮才更新」，是**这一整次 dct 运行都不会再更新**：
+/// 项目 A 记着 claude、底栏写着 `n 新建 claude`，用户按 `N` 选了 codex，
+/// 守护进程记的是 codex，底栏却一直写 claude 直到重启——而底栏那一句正是
+/// 「按 n 会开出什么」的承诺。
+///
+/// 三个调用点各记一次的写法（原来就是那样，而且三处里只有一处记了）撑不住
+/// 下一个调用点：新加一条建会话的路的人没有任何提示要去补这三行。收到一处，
+/// 忘不掉。
+pub(crate) fn create_session(
+    app: &mut App,
+    dir: &str,
+    profile: &str,
+    remember: bool,
+) -> Result<Response> {
+    let r = app.client().and_then(|c| {
+        c.call(Request::Create {
+            dir: dir.to_string(),
+            profile: profile.to_string(),
+            remember,
+        })
+    });
+    // 只有真建成了才跟着记：守护进程侧也是这条规矩（`daemon.rs` 里
+    // `if r.is_ok()`），建失败的目录不该留下「上次用的是它」。
+    // `remember: false` 是「帮你装 CLI」那条路径开的 shell 会话，守护进程
+    // 不记，这里同样不能记——记了下次按 `n` 会掉进一个命令行。
+    if remember && matches!(r, Ok(Response::Created { .. })) {
+        app.profiles.insert(dir.to_string(), profile.to_string());
+        app.profiles_asked.insert(dir.to_string());
+    }
+    r
+}
+
 /// 进一个会话。
 ///
 /// 这里**不再**改写任何「当前项目」——它不再是一个字段，而是光标所在的
@@ -1461,19 +1494,9 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                     // 「n」等价于「已经替用户选好了上次那个」，建完直接
                     // 进会话，不用再让他确认一遍。
                     let dir = app.current_dir().display().to_string();
-                    match app.client().and_then(|c| {
-                        c.call(Request::Create {
-                            dir: dir.clone(),
-                            profile: name.clone(),
-                            remember: true,
-                        })
-                    }) {
+                    // 缓存由 `create_session` 自己跟上，这里不再各记一份。
+                    match create_session(app, &dir, &name, true) {
                         Ok(Response::Created { id }) => {
-                            // 守护进程刚刚记下了这个项目的 agent（remember: true），
-                            // 手里这份缓存直接跟上，省一次 `LastProfile` 往返，
-                            // 也省得底栏在下一轮拉取之前还写着旧的那个名字。
-                            app.profiles.insert(dir.clone(), name);
-                            app.profiles_asked.insert(dir);
                             app.need_sessions = true; // 会话标题要显示项目名
                             app.view = View::Attached(id);
                         }
@@ -1922,6 +1945,26 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// 起一个真守护进程，socket 和它的 `~/.dct` 替身都落在临时目录里
+    /// （`projects.json` 跟着 socket 走，见 `projects::store_path_for_socket`），
+    /// 绝不会碰用户真实的那份。返回的 `TempDir` 要接住：它一被丢弃，
+    /// socket 就跟着没了。
+    fn start_daemon_for_test() -> (PathBuf, tempfile::TempDir) {
+        use std::time::{Duration, Instant};
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(Instant::now() < deadline, "daemon 没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (sock, home)
+    }
+
     fn sess_at(id: u32, dir: &str) -> SessionInfo {
         SessionInfo {
             id,
@@ -2061,6 +2104,107 @@ mod tests {
             app.grid_sessions()[focus].dir,
             "/w/b",
             "焦点必须落在当前项目的第一格，不是第 0 格"
+        );
+    }
+
+    /// **建完会话，底栏那句 `n 新建 <agent>` 必须立刻说真话。**
+    ///
+    /// `profiles_to_fetch` 只问**没问过**的项目，所以缓存里的旧值不是「晚一轮
+    /// 才更新」，是这一整次运行都不会再更新：项目记着 claude、底栏写着
+    /// `n 新建 claude`，用户按 `N` 选了别的，守护进程记的是新的那个，底栏
+    /// 却一直写 claude 直到重启 dct。
+    ///
+    /// 起一个真守护进程：这条路只有真的走完一次 `Create` 才有东西可对，
+    /// 断开的 `App` 上 `create_session` 直接失败，什么都证明不了。
+    #[test]
+    fn creating_a_session_updates_the_local_agent_cache() {
+        use crate::client::Client;
+
+        let (sock, _home) = start_daemon_for_test();
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().display().to_string();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+        // 这个项目此刻记着 claude，底栏据此写 `n 新建 claude`
+        app.profiles.insert(dir.clone(), "claude".into());
+        app.profiles_asked.insert(dir.clone());
+
+        // 用户按 N 挑了另一个 agent（`shell` 是唯一一定装得上的那个）
+        let r = create_session(&mut app, &dir, "shell", true);
+        assert!(
+            matches!(r, Ok(Response::Created { .. })),
+            "前提：会话真的建起来了：{r:?}"
+        );
+
+        assert_eq!(
+            app.profiles.get(&dir).map(String::as_str),
+            Some("shell"),
+            "缓存还写着旧 agent，底栏会一直承诺一个 `n` 不会开出来的东西"
+        );
+    }
+
+    /// `remember: false` 那条路（「帮你装 CLI」开的 shell 会话）不能进缓存——
+    /// 守护进程侧也不记，两边记的东西一旦不一样，底栏说的就不是守护进程会做的。
+    #[test]
+    fn an_install_window_never_becomes_the_projects_agent() {
+        use crate::client::Client;
+
+        let (sock, _home) = start_daemon_for_test();
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().display().to_string();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+
+        let r = create_session(&mut app, &dir, "shell", false);
+        assert!(matches!(r, Ok(Response::Created { .. })), "{r:?}");
+
+        assert!(
+            app.profiles.is_empty() && app.profiles_asked.is_empty(),
+            "装 CLI 的那个 shell 会话不是用户选的 agent，不该被记住"
+        );
+    }
+
+    /// **建会话只有一个入口。** 三个调用点各记一次缓存的写法撑不住下一个
+    /// 调用点——新加一条建会话的路的人没有任何提示要去补那几行，而漏了之后
+    /// 底栏会安静地承诺一个 `n` 不会开出来的 agent。这条守卫把「别忘了」
+    /// 换成一个编译不过之外的、看得见的红。
+    #[test]
+    fn every_create_goes_through_the_one_helper_that_updates_the_cache() {
+        // 拼出来，免得这条测试自己的源码被下面的扫描数进去
+        let needle = concat!("Request::", "Create");
+        for (name, src) in [
+            ("pick.rs", include_str!("pick.rs")),
+            ("board.rs", include_str!("board.rs")),
+            ("grid.rs", include_str!("grid.rs")),
+            ("attach.rs", include_str!("attach.rs")),
+            ("secret.rs", include_str!("secret.rs")),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "{name} 自己发了 Create，绕过了 create_session 的缓存更新"
+            );
+        }
+        // mod.rs 的生产代码部分（`#[cfg(test)]` 之前）只该有 `create_session`
+        // 里的那一处。测试代码里另有一处直接对守护进程发 Create，那是在测
+        // 别的东西，不走界面这条路。
+        let prod = include_str!("mod.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "mod.rs 里只该有 create_session 那一处 Create"
         );
     }
 
