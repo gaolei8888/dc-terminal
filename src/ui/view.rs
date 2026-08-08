@@ -684,11 +684,13 @@ pub(crate) fn canon(p: &Path) -> PathBuf {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct ProjectGroup {
-    /// 归一化后的绝对路径，也是分组键。
+    /// 归一化后的绝对路径，也是分组键。**只用于比较，不用于显示**——
+    /// 跟 `canon()` 的规矩一致。
     pub dir: PathBuf,
-    /// 组头上的项目名（路径最后一段）。
+    /// 组头上的项目名（路径最后一段）。取自**未归一化**的原始路径字符串，
+    /// 理由见 `group_sessions` 里挑选 display 来源那段注释。
     pub name: String,
-    /// 组头上那行灰字（父目录，已 `short_path`）。
+    /// 组头上那行灰字（父目录，已 `short_path`）。同上，来自原始路径。
     pub parent: String,
     pub sessions: Vec<crate::session::SessionInfo>,
     /// 这个项目上次用的 agent，底栏 `n 新建 <agent>` 要用。
@@ -723,9 +725,15 @@ impl ProjectGroup {
 
 /// 看板上出现哪些项目：**有会话的 ∪ pinned 的**。没有第三种。
 ///
-/// 排序按 `dir` 字符串升序，**固定**。任何按活跃度或最后使用时间的排序，
-/// 都会让行在用户没按键的时候移动——而「项目在我没按键的时候变了」正是
-/// 这一版要消灭的东西。组内会话按 `id` 升序，同一个理由。
+/// 排序是 `BTreeMap<PathBuf, _>` 自带的、`PathBuf` 的 component-wise
+/// `Ord`——不是裸字符串排序，两者在真实目录名上会分道扬镳：
+/// `PathBuf::from("/w/a-b").cmp(&PathBuf::from("/w/a/c"))` 是
+/// `Greater`（按分量比，`"a-b"` 整段 > `"a"`），同一对路径当 `&str`
+/// 比较却是 `Less`（`'-'` 0x2D < `'/'` 0x2F）。这里用的是前者。
+/// 不管是哪一种，它都是稳定的、与会话生灭无关——任何按活跃度或最后
+/// 使用时间的排序，都会让行在用户没按键的时候移动，而「项目在我没
+/// 按键的时候变了」正是这一版要消灭的东西。组内会话按 `id` 升序，
+/// 同一个理由。
 #[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs，测试之外暂时没人调用。
 pub(crate) fn group_sessions(
     sessions: &[crate::session::SessionInfo],
@@ -733,6 +741,9 @@ pub(crate) fn group_sessions(
     profiles: &BTreeMap<String, String>,
 ) -> Vec<ProjectGroup> {
     // 分组键统一走 canon：`/tmp` 和 `/private/tmp` 下的两个会话是同一个项目。
+    // 这个 canon 后的 PathBuf 只当分组/比较的 key 用，绝不进 name/parent——
+    // 见 canon() 自己的文档：归一化会把 `/tmp` 显示成 `/private/tmp`，
+    // 界面凭空变丑，而用户什么都没做错。
     let mut buckets: BTreeMap<PathBuf, Vec<crate::session::SessionInfo>> = BTreeMap::new();
     for s in sessions {
         buckets
@@ -740,7 +751,21 @@ pub(crate) fn group_sessions(
             .or_default()
             .push(s.clone());
     }
-    let pinned_keys: Vec<PathBuf> = pinned.iter().map(|p| canon(Path::new(p))).collect();
+    // pinned 项目的原始拼写（用户当初 `p` 摆上来时敲的那个字符串），
+    // 按 canon 后的 key 存一份，专门留给 name/parent 用。
+    let mut pinned_display: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let pinned_keys: Vec<PathBuf> = pinned
+        .iter()
+        .map(|p| {
+            let key = canon(Path::new(p));
+            // 同一个项目被 pin 了两种拼法（比如一次走符号链接一次没走）
+            // 时，谁先出现在 `pinned` 里就用谁——固定优先级好过看起来随机。
+            pinned_display
+                .entry(key.clone())
+                .or_insert_with(|| p.clone());
+            key
+        })
+        .collect();
     for p in &pinned_keys {
         buckets.entry(p.clone()).or_default();
     }
@@ -749,12 +774,23 @@ pub(crate) fn group_sessions(
         .into_iter()
         .map(|(dir, mut sessions)| {
             sessions.sort_by_key(|s| s.id);
-            let name = dir
+            // name/parent 的显示来源必须是未归一化的原始路径字符串，且
+            // 挑选规则要固定，不能随会话生灭改变已显示的拼写：
+            // pinned 就用 pinned 自己的拼写；没 pinned 就用组内 id 最小
+            // 那个会话的 `dir`（上面已按 id 排过序，`sessions[0]` 就是它）。
+            // 组存在就必属于「有会话」∪「pinned」之一，二者必居其一，
+            // 所以这里总能找到一个原始字符串；空串分支只是防御性兜底，
+            // 结构上不会被真正走到。
+            let display_path: &str = pinned_display
+                .get(&dir)
+                .map(String::as_str)
+                .unwrap_or_else(|| sessions.first().map(|s| s.dir.as_str()).unwrap_or(""));
+            let name = Path::new(display_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 // 根目录没有 file_name。显示整条路径总比显示空白强。
-                .unwrap_or_else(|| dir.display().to_string());
-            let parent = dir
+                .unwrap_or_else(|| display_path.to_string());
+            let parent = Path::new(display_path)
                 .parent()
                 .map(|p| super::widgets::short_path(&p.display().to_string()))
                 .unwrap_or_default();
@@ -2448,5 +2484,37 @@ mod tests {
     #[test]
     fn grouping_nothing_at_all_yields_nothing() {
         assert!(group_sessions(&[], &[], &BTreeMap::new()).is_empty());
+    }
+
+    /// `canon()` 自己的文档写得很清楚：归一化只能用来比较，不能用来显示——
+    /// 把 `/tmp` 显示成 `/private/tmp` 会让 macOS 上的界面凭空变丑。分组键
+    /// (`dir`) 必须走 canon（否则同一个项目从两条拼法进来会被判成两个
+    /// 项目），但 `name`/`parent` 必须来自用户敲的那条原始路径。这里用真
+    /// 符号链接来验证，而不是拿两个字符串字面量摆样子——字面量根本不会
+    /// 调用 `canonicalize`，测不出这个 bug。
+    #[test]
+    fn display_name_and_parent_come_from_the_original_path_not_the_canonical_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let real = nested.join("actual-project");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("renamed-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // 会话的 dir 是用户敲的那条链接路径，不是解析后的真实路径。
+        let all = vec![si(1, &link.display().to_string(), "claude")];
+        let g = group_sessions(&all, &[], &BTreeMap::new());
+
+        assert_eq!(g.len(), 1);
+        // 分组/比较键必须是归一化后的真实路径。
+        assert_eq!(g[0].dir, std::fs::canonicalize(&real).unwrap());
+        // 但显示必须保留用户敲的那条链接路径的拼写——如果错误地从归一化
+        // 后的 `dir` 派生，这里会变成 "actual-project" / ".../nested"。
+        assert_eq!(g[0].name, "renamed-link");
+        assert_eq!(
+            g[0].parent,
+            crate::ui::widgets::short_path(&tmp.path().display().to_string())
+        );
     }
 }
