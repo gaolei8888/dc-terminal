@@ -136,7 +136,6 @@ pub enum Key {
     EmptyReplyIsEnter,
     NextSession,
     OtherKeysGoToAgent,
-    NewSessionFromBoard,
     BackToListWord,
     BackToSettingsWord,
     OrPressDigit,
@@ -302,11 +301,6 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "打字回复，或者直接回车表示同意"
         ),
         NextSession => t!(lang, en: "next session", zh: "下一个会话"),
-        NewSessionFromBoard => t!(
-            lang,
-            en: "go back and press n for a new session",
-            zh: "回看板后按 n 新建会话",
-        ),
         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
         OtherKeysGoToAgent => t!(
@@ -1227,7 +1221,6 @@ mod tests {
             EmptyReplyIsEnter,
             NextSession,
             OtherKeysGoToAgent,
-            NewSessionFromBoard,
             BackToListWord,
             BackToSettingsWord,
             OrPressDigit,
@@ -1327,7 +1320,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 95, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -1057,4 +1057,44 @@ mod tests {
         assert_eq!(app.groups.len(), 1, "不该多出启动目录那一行");
         assert!(app.pinned.is_empty());
     }
+
+    /// **开机补位是后台路径，不许换用户正看着的那一屏。**
+    ///
+    /// 它挂在第一次 `List` **成功**之后。守护进程慢上几轮的话，用户完全
+    /// 可能已经按 `N` 开了选择器、按 `l` 进了设置页——这时候把他甩回看板，
+    /// 是一次他没有按过任何键的视图切换。今天走不到只是因为第一轮几乎
+    /// 总是一次就成，那是运气不是设计。
+    #[test]
+    fn seeding_never_yanks_the_user_out_of_a_screen_they_opened() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![]);
+        app.view = View::Settings {
+            state: ListState::default(),
+        };
+
+        super::super::seed_start_project(&mut app);
+
+        assert!(
+            matches!(app.view, View::Settings { .. }),
+            "用户开的设置页必须还在"
+        );
+        assert_eq!(app.groups.len(), 1, "补位本身照做");
+    }
+
+    /// 反过来：本来就在看板上时照常重算落点——那时候「回家」是恒等式，
+    /// 唯一的作用是让刚摆上去的组在九宫格里也有个合理的焦点。
+    #[test]
+    fn seeding_still_lands_home_when_the_user_is_already_on_the_board() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![]);
+        app.view_mode = crate::ui::ViewMode::Grid;
+        app.view = View::grid(7);
+
+        super::super::seed_start_project(&mut app);
+
+        assert!(
+            matches!(app.view, View::Grid { focus: 0, .. }),
+            "还在九宫格里，焦点收拢到一个真实存在的格子"
+        );
+    }
 }

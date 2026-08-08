@@ -262,7 +262,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
 /// 焦点挪一格，**并且把列表光标一起挪过去**。
 ///
-/// 九宫格现在铺的是所有项目的会话（分组之前它只画一个作用域），所以左右
+/// 九宫格现在铺的是所有项目的会话（分组之前它只画当前那一个项目），所以左右
 /// 一走就可能跨进另一个项目。而「当前项目」唯一的答案处是列表光标
 /// （`App::current_group`）——不一起挪的话，底栏的项目名、`n` 把新会话开在
 /// 哪个目录、`x` 拿掉哪个组，全都还指着上一个项目，而屏幕上焦点分明已经在
@@ -385,7 +385,7 @@ fn draw_grid(
     screens: &[ScreenEntry],
     focus: usize,
     chrome: Chrome,
-    // 作用域里有会话，只是全停了——空状态那句话要说得不一样
+    // 看板上有会话，只是全停了——空状态那句话要说得不一样
     has_stopped: bool,
 ) {
     let Chrome { connected, lang } = chrome;

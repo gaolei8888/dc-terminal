@@ -906,6 +906,16 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
 /// 必须整套发生。分开写的话，漏掉重算的那条路会让屏幕停在旧的一屏，而用户
 /// 刚刚明确选了一个项目——那正是上一版被判为「混乱」的手感。
 pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
+    add_project(app, dir);
+    app.view = home_view(app);
+}
+
+/// 上面那五步里**不动视图**的前四步。
+///
+/// 拆出来只为一个调用方：`seed_start_project`。它跑在后台路径上（主循环
+/// 第一次 `List` 成功之后），而 `pin_project` 最后那一行是「用户刚在选择器
+/// 里选定了一个项目，把他送回家」——这两件事只是碰巧共用前四步。
+pub(crate) fn add_project(app: &mut App, dir: std::path::PathBuf) {
     let d = dir.display().to_string();
     // 落盘失败不拦路：pinned 是便利性状态，本地先摆上，用户这一次照样能用。
     // 下一轮拉取会把守护进程那边的真相同步回来（见 `run` 里的 `Projects`）。
@@ -924,7 +934,6 @@ pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
     if let Some(gi) = app.groups.iter().position(|g| g.dir == key) {
         goto_project(app, gi);
     }
-    app.view = home_view(app);
 }
 
 /// `x`：把光标所在的**空**组从看板上拿掉。
@@ -976,11 +985,24 @@ pub(crate) fn unpin_current(app: &mut App) -> bool {
 ///
 /// 已经有组了就不碰：启动目录跟用户手头这些项目未必有关系，硬塞一行进去
 /// 只是噪音。
+///
+/// **这是一条后台路径，不许换用户正看着的那一屏。** 它挂在主循环第一次
+/// `List` **成功**之后——守护进程要是慢上几轮（或者头几轮压根连不上），
+/// 这中间用户完全可能已经按 `N` 开了选择器、按 `l` 进了设置页。那时候
+/// 走 `pin_project`（它最后一行无条件 `app.view = home_view(app)`）会把人
+/// 从他自己打开的那一屏拽回看板，而他没有按过任何键。今天走不到只是因为
+/// 第一轮 `List` 几乎总是一次就成——那是运气，不是设计。
+///
+/// 本来就在看板/九宫格上才重算落点：那时候「回家」是恒等式，唯一的作用
+/// 是让刚摆上去的组在九宫格里也有个合理的焦点。
 pub(crate) fn seed_start_project(app: &mut App) {
     if !app.groups.is_empty() {
         return;
     }
-    pin_project(app, app.start_dir.clone());
+    add_project(app, app.start_dir.clone());
+    if matches!(app.view, View::Board | View::Grid { .. }) {
+        app.view = home_view(app);
+    }
 }
 
 /// 守护进程报回来的 `pinned` 跟手里这份**指的是不是同一组项目**。
