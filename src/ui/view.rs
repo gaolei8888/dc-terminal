@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -668,8 +669,108 @@ pub(crate) fn same_project(dir: &Path, project: &Path) -> bool {
 /// 解析失败（目录已被删）时退化成原样：一个指向已删目录的会话仍然应当
 /// 待在它原本的项目下，而不是从「当前项目」和「全部项目」两个视图里
 /// 同时消失——那才是真的找不回来了。
-fn canon(p: &Path) -> PathBuf {
+pub(crate) fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// 看板上的一个项目组。
+///
+/// `sessions` 是这一组要显示的会话——已停止的会话在列表里显示、在九宫格里
+/// 不显示，这个差异由**调用方在传入前过滤**，分组函数本身不认识状态语义。
+///
+/// `#[allow(dead_code)]`：Task 3 只新增这个类型和 `group_sessions`，board.rs
+/// 要到 Task 5 才开始消费它们——在那之前 clippy 会把整块（包括没被任何测试
+/// 读到的 `collapsed` 字段）当死代码报错。
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct ProjectGroup {
+    /// 归一化后的绝对路径，也是分组键。
+    pub dir: PathBuf,
+    /// 组头上的项目名（路径最后一段）。
+    pub name: String,
+    /// 组头上那行灰字（父目录，已 `short_path`）。
+    pub parent: String,
+    pub sessions: Vec<crate::session::SessionInfo>,
+    /// 这个项目上次用的 agent，底栏 `n 新建 <agent>` 要用。
+    pub last_profile: Option<String>,
+    /// 由 `p` 摆上来的。`x` 只能移除 pinned 且没有会话的组。
+    pub pinned: bool,
+    pub collapsed: bool,
+}
+
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
+impl ProjectGroup {
+    /// 组头上的 `claude×2 codex×1`。**现算不存**：存下来就有两份真相，
+    /// 而它们只有一份是新的。按 agent 名排序，跟组的排序同一个理由——
+    /// 顺序不能随会话生灭而跳动。
+    pub fn agent_counts(&self) -> Vec<(String, usize)> {
+        let mut m: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for s in &self.sessions {
+            *m.entry(s.profile.clone()).or_insert(0) += 1;
+        }
+        m.into_iter().collect()
+    }
+
+    /// 这个项目里有几个会话出错了。组头上要用红字点出来——
+    /// 会话静默失败是 dct 最贵的失败模式。
+    pub fn failed(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.state == SessionState::Failed)
+            .count()
+    }
+}
+
+/// 看板上出现哪些项目：**有会话的 ∪ pinned 的**。没有第三种。
+///
+/// 排序按 `dir` 字符串升序，**固定**。任何按活跃度或最后使用时间的排序，
+/// 都会让行在用户没按键的时候移动——而「项目在我没按键的时候变了」正是
+/// 这一版要消灭的东西。组内会话按 `id` 升序，同一个理由。
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs，测试之外暂时没人调用。
+pub(crate) fn group_sessions(
+    sessions: &[crate::session::SessionInfo],
+    pinned: &[String],
+    profiles: &BTreeMap<String, String>,
+) -> Vec<ProjectGroup> {
+    // 分组键统一走 canon：`/tmp` 和 `/private/tmp` 下的两个会话是同一个项目。
+    let mut buckets: BTreeMap<PathBuf, Vec<crate::session::SessionInfo>> = BTreeMap::new();
+    for s in sessions {
+        buckets
+            .entry(canon(Path::new(&s.dir)))
+            .or_default()
+            .push(s.clone());
+    }
+    let pinned_keys: Vec<PathBuf> = pinned.iter().map(|p| canon(Path::new(p))).collect();
+    for p in &pinned_keys {
+        buckets.entry(p.clone()).or_default();
+    }
+
+    buckets
+        .into_iter()
+        .map(|(dir, mut sessions)| {
+            sessions.sort_by_key(|s| s.id);
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                // 根目录没有 file_name。显示整条路径总比显示空白强。
+                .unwrap_or_else(|| dir.display().to_string());
+            let parent = dir
+                .parent()
+                .map(|p| super::widgets::short_path(&p.display().to_string()))
+                .unwrap_or_default();
+            let last_profile = profiles.get(&dir.display().to_string()).cloned();
+            let pinned = pinned_keys.contains(&dir);
+            ProjectGroup {
+                dir,
+                name,
+                parent,
+                sessions,
+                last_profile,
+                pinned,
+                collapsed: false,
+            }
+        })
+        .collect()
 }
 
 /// 视图切换后，底部消息该不该清掉。抽成纯函数是因为 `run()` 的按键循环里有
@@ -2256,5 +2357,96 @@ mod tests {
         ] {
             assert_eq!(reply_key("草稿", &k(code)), Reply::Typing("草稿".into()));
         }
+    }
+
+    fn si(id: u32, dir: &str, profile: &str) -> crate::session::SessionInfo {
+        crate::session::SessionInfo {
+            id,
+            dir: dir.into(),
+            profile: profile.into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+        }
+    }
+
+    #[test]
+    fn groups_are_sorted_by_path_and_sessions_by_id() {
+        let all = vec![
+            si(9, "/w/b", "claude"),
+            si(2, "/w/a", "codex"),
+            si(5, "/w/a", "claude"),
+        ];
+        let g = group_sessions(&all, &[], &BTreeMap::new());
+
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].dir, PathBuf::from("/w/a"));
+        assert_eq!(g[1].dir, PathBuf::from("/w/b"));
+        assert_eq!(
+            g[0].sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 5],
+            "组内按 id 升序，固定"
+        );
+    }
+
+    /// 规则 1：看板上的项目 = 有会话的 ∪ pinned 的。pinned 但没有会话的
+    /// 项目必须以空组出现，否则光标没地方落、`n` 无处可去。
+    #[test]
+    fn a_pinned_project_with_no_sessions_still_gets_a_group() {
+        let g = group_sessions(&[], &["/w/empty".to_string()], &BTreeMap::new());
+
+        assert_eq!(g.len(), 1);
+        assert!(g[0].sessions.is_empty());
+        assert!(g[0].pinned);
+    }
+
+    #[test]
+    fn a_project_that_is_both_pinned_and_busy_appears_once() {
+        let all = vec![si(1, "/w/a", "claude")];
+        let g = group_sessions(&all, &["/w/a".to_string()], &BTreeMap::new());
+
+        assert_eq!(g.len(), 1, "pinned 和有会话是并集，不是两行");
+        assert!(g[0].pinned);
+        assert_eq!(g[0].sessions.len(), 1);
+    }
+
+    #[test]
+    fn the_group_header_summarises_agents_and_failures() {
+        let mut all = vec![
+            si(1, "/w/a", "claude"),
+            si(2, "/w/a", "claude"),
+            si(3, "/w/a", "codex"),
+        ];
+        all[2].state = SessionState::Failed;
+        let g = group_sessions(&all, &[], &BTreeMap::new());
+
+        assert_eq!(
+            g[0].agent_counts(),
+            vec![("claude".to_string(), 2), ("codex".to_string(), 1)],
+            "按 agent 名字排序，数量是这个项目里的会话数"
+        );
+        assert_eq!(g[0].failed(), 1);
+    }
+
+    #[test]
+    fn a_group_carries_the_agent_that_project_used_last() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("/w/a".to_string(), "kimi".to_string());
+        let g = group_sessions(&[], &["/w/a".to_string()], &profiles);
+
+        assert_eq!(g[0].last_profile.as_deref(), Some("kimi"));
+    }
+
+    #[test]
+    fn the_name_is_the_last_path_component_and_the_parent_is_shortened() {
+        let g = group_sessions(&[], &["/w/dc/dc-terminal".to_string()], &BTreeMap::new());
+
+        assert_eq!(g[0].name, "dc-terminal");
+        assert_eq!(g[0].parent, "/w/dc");
+    }
+
+    #[test]
+    fn grouping_nothing_at_all_yields_nothing() {
+        assert!(group_sessions(&[], &[], &BTreeMap::new()).is_empty());
     }
 }
