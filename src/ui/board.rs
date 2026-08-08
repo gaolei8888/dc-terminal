@@ -33,7 +33,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             open_new_session(app, key.code)
         }
         KeyCode::Char('p') if is_plain_key(&key) => open_project_picker(app),
-        KeyCode::Char('x') if is_plain_key(&key) => super::unpin_current(app),
+        // 列表这边成不成功都不用再动光标：这里只有**一个**指针（光标本身），
+        // 没有第二个要跟它对齐。成功时组没了，`refresh_rows` 的锚点回落是
+        // 列表自己的事；被拒绝时什么都没变，光标本来就该原地不动。
+        // 九宫格那边不一样，它还有个看得见的 `▶`——见 `grid::handle_key`。
+        KeyCode::Char('x') if is_plain_key(&key) => {
+            let _ = super::unpin_current(app);
+        }
         KeyCode::Char('c') if is_plain_key(&key) => open_secrets(app),
         // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
         // 而且跟 g 一样，两个视图共用同一个键。

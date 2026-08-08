@@ -180,16 +180,23 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // 会话」的组（守卫在 `unpin_current` 里），那种组在九宫格里没有格子，
         // 少了这个键用户只能先 `g` 回列表才拿得掉。
         //
-        // 拿掉之后**必须**重新对齐光标：光标此刻正停在被删掉的那个组头上，
+        // **真的拿掉了**才重新对齐光标：那时候光标正停在被删掉的那个组头上，
         // `refresh_rows` 的锚点跟着一起没了，只能退回第 0 行——也就是一个跟
         // 用户毫无关系的项目。而九宫格里看得见的指针是 `▶`，它还在原来那一格
         // 上。不对齐的话，`x` 之后底栏写着 A、`▶` 在 C，`n` 会开进 A。
+        // 这一支走无条件的 `point_cursor_at_focus`：光标原来站的组刚被删掉，
+        // 它现在的位置是个兜底值，没有资格再跟焦点争「当前项目」是谁。
         //
-        // 这里也走无条件的那一支：光标原来站的组刚被删掉，它现在的位置是个
-        // 兜底值，没有资格再跟焦点争「当前项目」是谁。
+        // **被拒绝时一动不动。** `unpin_current` 拒绝非空组之后底栏写着
+        // 「这个项目还有会话，先停掉才能移除」——那句话说的是「什么都没发生」，
+        // 而这时候焦点很可能是陈旧的（`Tab` 到一个只剩已停止会话的项目上，
+        // 焦点还留在别人家的格子里）。照样对齐光标的话，当前项目会被那个陈旧
+        // 焦点悄悄换走，用户接着按 `n`，会话开进了另一个项目，而屏幕刚刚
+        // 告诉过他这一下没生效。
         KeyCode::Char('x') if is_plain_key(&key) => {
-            super::unpin_current(app);
-            point_cursor_at_focus(app);
+            if super::unpin_current(app) {
+                point_cursor_at_focus(app);
+            }
         }
         // `i` 开回复框。收件人在这一刻钉死成会话 id，之后焦点再怎么动都
         // 不改——见 `Draft::id`。
@@ -299,9 +306,10 @@ fn point_cursor_at_focus(app: &mut App) {
 /// 列表光标挪到了新项目的组头上，底栏那一段项目名读的就是它，用户看得见
 /// 自己换到了哪儿，接着按 `n` 开在那儿、按 `x` 把它拿掉。
 fn focus_first_of_current_group(app: &mut App) {
-    // `first_live` 是「这个项目在九宫格里有没有格子」唯一的判断处——
-    // `sync_board_cursor_from_grid` 问的是同一个问题，两边必须逐字一致，
-    // 理由见 `ProjectGroup::first_live` 自己的文档。
+    // `first_live` 回答的是「这个项目在九宫格里有没有格子、第一格是谁」。
+    // **它不回答「焦点是不是陈旧的」**——会话全停的项目同样没有格子，但用户
+    // 在那儿挪焦点完全正当。那个问题归 `sync_board_cursor_from_grid` 自己的
+    // 守卫，两者问的不是同一件事（这一条曾经写反过，见 `first_live` 的文档）。
     let Some(first) = app.current_group().and_then(|g| g.first_live()) else {
         return;
     };
@@ -1071,6 +1079,47 @@ mod tests {
             app.current_group().map(|g| g.name.clone()),
             Some("z".to_string()),
             "焦点是故意留旧的，`g` 不能拿它把刚换过去的项目换回来"
+        );
+        assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
+    }
+
+    /// **被拒绝的 `x` 必须一动不动。**
+    ///
+    /// `unpin_current` 只拿得掉空组，非空的会被拒绝、底栏红字说一句。那句话
+    /// 说的是「什么都没发生」——所以这时候**尤其**不能顺手对齐光标：`Tab` 到
+    /// 一个只剩已停止会话的项目上时焦点是陈旧的（还留在别人家的格子里），
+    /// 对齐一次就把当前项目悄悄换走了。用户接着按 `n`，会话开进了另一个项目，
+    /// 而屏幕刚刚告诉过他这一下没生效——「说没发生、其实发生了」是最坏的组合。
+    ///
+    /// 两条断言缺一不可：只断言那句话的话，坏代码照样通过。
+    #[test]
+    fn a_refused_x_changes_nothing_at_all() {
+        let (mut app, _dir) = App::test_app();
+        let mut stopped = session_in(9, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.pinned = vec!["/w/z".into()];
+        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
+        app.view = View::grid(0);
+
+        // z 有会话（虽然停了），所以拿不掉；焦点此刻是陈旧的，指着 a 的格子
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "前提：已经换到 z 了"
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
+
+        assert_eq!(
+            app.message.text, "这个项目还有会话，先停掉才能移除。",
+            "拒绝要说一句"
+        );
+        assert_eq!(app.groups.len(), 2, "一个组都不该少");
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "说了「什么都没发生」，那就连当前项目都不许动"
         );
         assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
     }

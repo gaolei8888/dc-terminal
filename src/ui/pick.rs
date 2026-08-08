@@ -984,8 +984,9 @@ mod tests {
         app.set_sessions(vec![sess_in(1, "/w/a")]);
         app.list_state.select(Some(0));
 
-        super::super::unpin_current(&mut app);
+        let removed = super::super::unpin_current(&mut app);
 
+        assert!(!removed, "拒绝了就得如实报告——调用方要靠它决定动不动光标");
         assert_eq!(app.groups.len(), 1, "组还在");
         assert!(app.message.error, "要给一句红字提示");
     }
@@ -1006,8 +1007,9 @@ mod tests {
             .expect("前提：空组在看板上");
         super::super::goto_project(&mut app, gi);
 
-        super::super::unpin_current(&mut app);
+        let removed = super::super::unpin_current(&mut app);
 
+        assert!(removed, "真拿掉了就得如实报告");
         assert!(
             !app.groups.iter().any(|g| g.name == "空项目"),
             "组要从看板上消失"
@@ -1031,8 +1033,9 @@ mod tests {
         app.set_sessions(vec![]);
         app.list_state.select(Some(0));
 
-        super::super::unpin_current(&mut app);
+        let removed = super::super::unpin_current(&mut app);
 
+        assert!(removed, "真拿掉了就得如实报告");
         assert!(app.pinned.is_empty(), "按归一化后的路径比对才删得掉");
         assert!(app.groups.is_empty(), "组也要跟着消失");
     }
