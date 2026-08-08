@@ -809,6 +809,104 @@ pub(crate) fn group_sessions(
         .collect()
 }
 
+/// 看板上的一行。分组之后光标不能再是「第几个会话」——它得能停在组头上，
+/// 空组只有组头这一行。
+///
+/// `#[allow(dead_code)]`：跟 `ProjectGroup` 一样，Task 4 只新增行展平和
+/// 光标锚点这套纯函数，board.rs 要到 Task 5 才开始消费——这个属性到那时候
+/// 就该摘掉。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+pub(crate) enum Row {
+    Header(usize),
+    /// (组下标, 组内会话下标)
+    Session(usize, usize),
+}
+
+/// 把分组展平成屏幕上的行。折叠的组只贡献组头那一行。
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
+pub(crate) fn flatten(groups: &[ProjectGroup]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        rows.push(Row::Header(gi));
+        if !g.collapsed {
+            for si in 0..g.sessions.len() {
+                rows.push(Row::Session(gi, si));
+            }
+        }
+    }
+    rows
+}
+
+/// 某一行属于哪个组。**「当前项目」就是这个函数的答案**——不再有一个
+/// 可以跟屏幕不一致的 `current_dir` 字段。
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
+pub(crate) fn group_of(rows: &[Row], i: usize) -> Option<usize> {
+    match rows.get(i)? {
+        Row::Header(g) => Some(*g),
+        Row::Session(g, _) => Some(*g),
+    }
+}
+
+/// 光标指着的那个东西的**语义身份**。重新分组之后靠它找回原位。
+///
+/// 存身份而不是存下标：下标在会话生灭时会指向别的东西，而那正好就是
+/// 「项目在我没按键的时候变了」这个缺陷本身。
+///
+/// `Session` 除了 id 还带着建锚点那一刻它所在组的 `dir`：会话一旦真的没了
+/// （结束并被 prune），新的 `groups` 里再也不会出现这个 id，光凭 id
+/// 找不回「原属组」是谁——不存这份记忆，「退回它原来那个组的组头」这条
+/// 兜底规则根本没法实现，只能瞎猜或者放弃。（这是本任务实现阶段发现的一处
+/// 与参考实现的偏差，详见任务报告。）
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
+pub(crate) enum Anchor {
+    Session(u32, PathBuf),
+    Header(PathBuf),
+}
+
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
+pub(crate) fn anchor_of(groups: &[ProjectGroup], rows: &[Row], i: usize) -> Option<Anchor> {
+    match rows.get(i)? {
+        Row::Header(g) => Some(Anchor::Header(groups.get(*g)?.dir.clone())),
+        Row::Session(g, s) => {
+            let grp = groups.get(*g)?;
+            Some(Anchor::Session(grp.sessions.get(*s)?.id, grp.dir.clone()))
+        }
+    }
+}
+
+/// 找回锚点。顺序：同 id 的会话行 → 该会话原属组的组头 → 同 dir 的组头。
+/// 全找不到返回 `None`，调用方落到第 0 行。
+#[allow(dead_code)] // 同上：consumer 是 Task 5 的 board.rs。
+pub(crate) fn find_anchor(groups: &[ProjectGroup], rows: &[Row], a: &Anchor) -> Option<usize> {
+    match a {
+        Anchor::Session(id, dir) => {
+            // 会话还在：站回它身上
+            if let Some(i) = rows.iter().position(|r| match r {
+                Row::Session(g, s) => groups[*g].sessions[*s].id == *id,
+                Row::Header(_) => false,
+            }) {
+                return Some(i);
+            }
+            // 会话没了：退回它原来那个组的组头。**不能就近落在下一行**——
+            // 下一行可能已经是别的项目，那就等于项目在用户没按键时变了。
+            // 这里靠的是锚点自带的 `dir`，不是在新 `groups` 里重新搜这个
+            // id——会话真没了之后，新的 `groups` 里不会再有任何一个会话
+            // 带着这个 id，搜也搜不到。
+            let gi = groups.iter().position(|g| &g.dir == dir);
+            match gi {
+                Some(gi) => rows.iter().position(|r| *r == Row::Header(gi)),
+                None => None,
+            }
+        }
+        Anchor::Header(dir) => {
+            let gi = groups.iter().position(|g| &g.dir == dir)?;
+            rows.iter().position(|r| *r == Row::Header(gi))
+        }
+    }
+}
+
 /// 视图切换后，底部消息该不该清掉。抽成纯函数是因为 `run()` 的按键循环里有
 /// 十几处给 `message` 赋值，没法在每处都补一行清空逻辑——漏一处就会有一个
 /// 视图继续顶着上一屏的残留话术（比如看板「已开会话 3」被 `Enter` 带进会话
@@ -2516,5 +2614,102 @@ mod tests {
             g[0].parent,
             crate::ui::widgets::short_path(&tmp.path().display().to_string())
         );
+    }
+
+    fn grp(dir: &str, ids: &[u32]) -> ProjectGroup {
+        let sessions: Vec<_> = ids.iter().map(|i| si(*i, dir, "claude")).collect();
+        let mut g = group_sessions(&sessions, &[dir.to_string()], &BTreeMap::new());
+        g.remove(0)
+    }
+
+    #[test]
+    fn flatten_puts_a_header_before_each_group() {
+        let groups = vec![grp("/w/a", &[1, 2]), grp("/w/b", &[3])];
+        assert_eq!(
+            flatten(&groups),
+            vec![
+                Row::Header(0),
+                Row::Session(0, 0),
+                Row::Session(0, 1),
+                Row::Header(1),
+                Row::Session(1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_collapsed_group_contributes_only_its_header() {
+        let mut groups = vec![grp("/w/a", &[1, 2]), grp("/w/b", &[3])];
+        groups[0].collapsed = true;
+        assert_eq!(
+            flatten(&groups),
+            vec![Row::Header(0), Row::Header(1), Row::Session(1, 0)]
+        );
+    }
+
+    #[test]
+    fn an_empty_group_still_contributes_its_header() {
+        let groups = vec![grp("/w/empty", &[])];
+        assert_eq!(flatten(&groups), vec![Row::Header(0)]);
+    }
+
+    #[test]
+    fn group_of_answers_for_both_row_kinds() {
+        let groups = vec![grp("/w/a", &[1]), grp("/w/b", &[2])];
+        let rows = flatten(&groups);
+        assert_eq!(group_of(&rows, 0), Some(0));
+        assert_eq!(group_of(&rows, 1), Some(0));
+        assert_eq!(group_of(&rows, 3), Some(1));
+        assert_eq!(group_of(&rows, 99), None);
+    }
+
+    /// 本设计最关键的不变式：后台事件让行数变了，光标必须还站在同一个东西上。
+    #[test]
+    fn the_cursor_stays_on_the_same_session_when_another_group_grows() {
+        let before = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        let rows_before = flatten(&before);
+        // 光标在 /w/b 的会话 7 上（第 3 行）
+        let a = anchor_of(&before, &rows_before, 3).unwrap();
+        assert_eq!(a, Anchor::Session(7, canon(Path::new("/w/b"))));
+
+        // /w/a 里多开了两个会话，行数变了
+        let after = vec![grp("/w/a", &[1, 4, 5]), grp("/w/b", &[7])];
+        let rows_after = flatten(&after);
+        let i = find_anchor(&after, &rows_after, &a).unwrap();
+
+        assert_eq!(rows_after[i], Row::Session(1, 0), "还站在会话 7 上");
+    }
+
+    /// 会话没了（结束并被 prune）——退回它原来那个组的组头，不要滑到别的项目上。
+    #[test]
+    fn a_vanished_session_falls_back_to_its_own_group_header() {
+        let before = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        let rows_before = flatten(&before);
+        let a = anchor_of(&before, &rows_before, 3).unwrap();
+
+        let after = vec![grp("/w/a", &[1]), grp("/w/b", &[])];
+        let rows_after = flatten(&after);
+        let i = find_anchor(&after, &rows_after, &a).unwrap();
+
+        assert_eq!(
+            rows_after[i],
+            Row::Header(1),
+            "落在 /w/b 的组头上，不是 /w/a"
+        );
+    }
+
+    #[test]
+    fn a_header_anchor_finds_its_group_again_after_reordering() {
+        let before = vec![grp("/w/b", &[7])];
+        let rows_before = flatten(&before);
+        let a = anchor_of(&before, &rows_before, 0).unwrap();
+        assert_eq!(a, Anchor::Header(canon(Path::new("/w/b"))));
+
+        // /w/a 是新出现的，排在前面，把 /w/b 挤到了第 2 行
+        let after = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        let rows_after = flatten(&after);
+        let i = find_anchor(&after, &rows_after, &a).unwrap();
+
+        assert_eq!(rows_after[i], Row::Header(1));
     }
 }
