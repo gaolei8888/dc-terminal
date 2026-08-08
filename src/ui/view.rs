@@ -649,7 +649,14 @@ pub(crate) struct ProjectGroup {
     /// 归一化后的绝对路径，也是分组键。**只用于比较，不用于显示**——
     /// 跟 `canon()` 的规矩一致。
     pub dir: PathBuf,
-    /// 组头上的项目名（路径最后一段）。取自**未归一化**的原始路径字符串，
+    /// 这个项目**未归一化**的那条路径——用户当初敲的拼写。`name`/`parent`
+    /// 从它推出来，`p` 的目录浏览器也从它的上一级开起。
+    ///
+    /// 跟 `dir` 分开存而不是「要显示时再反推」：`parent` 已经 `short_path`
+    /// 过（`~` 开头），拼不回一条真实路径；而 `dir` 是 canon 过的，
+    /// macOS 上拿它去开浏览器，用户敲的 `/tmp/x` 会变成 `/private/tmp/x`。
+    pub display_dir: PathBuf,
+    /// 组头上的项目名（路径最后一段）。取自 `display_dir`，
     /// 理由见 `group_sessions` 里挑选 display 来源那段注释。
     pub name: String,
     /// 组头上那行灰字（父目录，已 `short_path`）。同上，来自原始路径。
@@ -775,6 +782,7 @@ pub(crate) fn group_sessions(
             let pinned = pinned_keys.contains(&dir);
             ProjectGroup {
                 dir,
+                display_dir: PathBuf::from(display_path),
                 name,
                 parent,
                 sessions,

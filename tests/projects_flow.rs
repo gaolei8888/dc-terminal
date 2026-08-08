@@ -106,9 +106,12 @@ fn pinning_a_project_survives_a_reconnect_and_unpinning_removes_it() {
         Response::Ok
     ));
 
-    // 换一条连接再问，确认答案来自落盘的那份而不是这条连接的内存
+    // 换一条连接再问，确认答案来自落盘的那份而不是这条连接的内存。
+    // 回来的必须是**用户敲的那条路径**：界面拿这一份当组头名字的显示来源，
+    // 存/回归一化结果的话，重启一次 dct 项目就自己改了名（macOS 上还会
+    // 冒出 `/private/var/…`）。见 `projects::Store::pin`。
     let mut c2 = h.client();
-    assert_eq!(pinned(&mut c2), vec![canon(d.path())]);
+    assert_eq!(pinned(&mut c2), vec![d.path().display().to_string()]);
 
     assert!(matches!(
         c2.call(Request::UnpinProject {

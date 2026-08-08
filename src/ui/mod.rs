@@ -1526,6 +1526,21 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
     }
 }
 
+/// `p` 的目录浏览器从哪儿开起：**当前项目的上一级**。用户按 `p` 多半是想
+/// 去「旁边那个」项目，从上一级开始找是最短的路。
+///
+/// 用组的 `display_dir`（用户敲的那条），**不是** `current_dir()`——后者是
+/// 分组键，已经 canon 过：macOS 上用户 pin 的 `/tmp/x` 会让浏览器顶着
+/// `/private/tmp` 打开，而他从没见过这个路径。canon 只用于比较。
+fn browse_start_dir(app: &App) -> PathBuf {
+    let cur = app
+        .current_group()
+        .map(|g| g.display_dir.clone())
+        // 一个组都没有（还没拉到列表的头一帧）：退回启动目录，同 `current_dir`。
+        .unwrap_or_else(|| app.start_dir.clone());
+    cur.parent().map(|x| x.to_path_buf()).unwrap_or(cur)
+}
+
 /// `p`：换项目。看板和九宫格共用，同 `open_new_session`。
 pub(crate) fn open_project_picker(app: &mut App) {
     // 拿不到列表就不进选择器：进去看见一片空白，用户会以为
@@ -1540,11 +1555,10 @@ pub(crate) fn open_project_picker(app: &mut App) {
             if !all.contains(&start) {
                 all.push(start);
             }
-            // 浏览器从当前项目所在的位置开起：用户按 p 多半是想换到
-            // 「旁边那个」项目，从它的上一级开始找是最短的路。
-            let cur = app.current_dir();
-            let from = cur.parent().map(|x| x.to_path_buf()).unwrap_or(cur);
-            app.view = View::PickProject(crate::ui::view::ProjectPicker::new(all, from));
+            app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
+                all,
+                browse_start_dir(app),
+            ));
         }
         Ok(Response::Error(ref e)) => app.message = Msg::err(crate::i18n::msg::error(app.lang, e)),
         _ => {
@@ -2104,6 +2118,36 @@ mod tests {
             app.grid_sessions()[focus].dir,
             "/w/b",
             "焦点必须落在当前项目的第一格，不是第 0 格"
+        );
+    }
+
+    /// **`p` 的浏览器从用户敲的那条路径开起，不是归一化之后的那条。**
+    ///
+    /// 分组键是 canon 过的（`/tmp/x` 在 macOS 上就是 `/private/tmp/x`），
+    /// 拿它去开浏览器的话，用户按下 `p` 看到的顶栏是一条他从没见过的路径。
+    /// canon 只用于比较。
+    #[test]
+    fn the_project_browser_opens_where_the_user_typed_not_where_canon_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let real = nested.join("真实名字");
+        std::fs::create_dir(&real).unwrap();
+        let typed = tmp.path().join("我敲的名字");
+        std::os::unix::fs::symlink(&real, &typed).unwrap();
+
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_at(1, &typed.display().to_string())]);
+        assert_eq!(
+            app.current_dir(),
+            view::canon(&real),
+            "前提：分组键是归一化之后那条"
+        );
+
+        assert_eq!(
+            browse_start_dir(&app),
+            tmp.path(),
+            "浏览器该开在用户敲的那条路径的上一级"
         );
     }
 

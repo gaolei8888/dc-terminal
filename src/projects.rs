@@ -17,6 +17,14 @@ struct Disk {
     last_profile: Option<String>,
     /// 用户按 `p` 摆上看板、还没有会话的项目。落盘而不是只放内存里：
     /// 规则是「`x` 才能移除」，不落盘的话重启 dct 就自己没了，两句话对不上。
+    ///
+    /// 存的是**用户当初敲的那条路径**，不是 `key_of` 归一化之后的那条。
+    /// 这一份同时是界面上组头 name/parent 的显示来源（见
+    /// `ui::view::group_sessions`），而重启之后界面手里的 `pinned` 完全来自
+    /// 这个文件——存归一化结果的话，用户 pin 的 `…/我敲的名字` 会在下次
+    /// 启动时自己变成 `/private/var/…/真实名字`，「canon 只用于比较、
+    /// 永不用于显示」这条规矩就在进程边界上破了。判重、`unpin` 一律走
+    /// `key_of` 现算，不靠存的形式。
     #[serde(default)]
     pinned: Vec<String>,
     /// 项目目录 → 上次在这个项目里开会话用的 agent。
@@ -109,17 +117,23 @@ impl Store {
     }
 
     /// 摆一个项目上看板。已经在里面就什么都不做——重复 pin 不该出现两行。
+    ///
+    /// **存原样、按归一化判重。** 存的那条要拿去显示（组头上的项目名），
+    /// 判重的那条得认得出「同一个目录的两种拼法」（走符号链接、`/tmp` 与
+    /// `/private/tmp`）——两件事要的不是同一个字符串，所以分开。
     pub fn pin(&mut self, dir: &Path) {
         let key = key_of(dir);
-        if !self.pinned.contains(&key) {
-            self.pinned.push(key);
+        if !self.pinned.iter().any(|p| key_of(Path::new(p)) == key) {
+            self.pinned.push(dir.display().to_string());
             self.save();
         }
     }
 
+    /// 同上，按归一化后的路径删：存的是用户的拼写，用户这次可能换了另一种
+    /// 拼法来敲。字面比对删不掉的话，`x` 看起来就是「按了没反应」。
     pub fn unpin(&mut self, dir: &Path) {
         let key = key_of(dir);
-        self.pinned.retain(|p| p != &key);
+        self.pinned.retain(|p| key_of(Path::new(p)) != key);
         self.save();
     }
 
@@ -309,13 +323,50 @@ mod tests {
         s.pin(&a);
         assert_eq!(
             Store::load(&f).pinned(),
-            vec![canon(&a)],
+            vec![a.display().to_string()],
             "重复 pin 不该出现两行"
         );
 
         let mut s = Store::load(&f);
         s.unpin(&a);
         assert!(Store::load(&f).pinned().is_empty());
+    }
+
+    /// **pin 上去的项目，重启之后名字不许自己变。**
+    ///
+    /// `pinned` 同时是界面上组头 name/parent 的显示来源，而重启之后界面手里
+    /// 那一份完全来自这个文件。存归一化结果的话，用户 pin 的
+    /// `…/我敲的名字`（一条符号链接）下次启动会显示成 `…/真实名字`，在
+    /// macOS 上还会连父目录一起变成 `/private/var/…`——「canon 只用于比较、
+    /// 永不用于显示」这条规矩在一次进程重启上就破了，而用户什么都没做。
+    #[test]
+    fn a_pinned_project_keeps_the_users_spelling_across_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("真实名字");
+        std::fs::create_dir(&real).unwrap();
+        let typed = tmp.path().join("我敲的名字");
+        std::os::unix::fs::symlink(&real, &typed).unwrap();
+        let f = tmp.path().join("projects.json");
+
+        let mut s = Store::load(&f);
+        s.pin(&typed);
+        drop(s);
+
+        assert_eq!(
+            Store::load(&f).pinned(),
+            vec![typed.display().to_string()],
+            "重新 load 出来的必须还是用户敲的那条路径"
+        );
+        // 另一种拼法指的是同一个项目：既不该多出一行，也要 unpin 得掉
+        let mut s = Store::load(&f);
+        s.pin(&real);
+        assert_eq!(Store::load(&f).pinned().len(), 1, "两种拼法是同一个项目");
+        let mut s = Store::load(&f);
+        s.unpin(&real);
+        assert!(
+            Store::load(&f).pinned().is_empty(),
+            "换一种拼法也要拿得掉，不然 `x` 看起来像按了没反应"
+        );
     }
 
     /// 老文件没有 `pinned` / `project_profiles` 两个字段，必须照常读出来，
