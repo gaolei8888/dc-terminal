@@ -153,13 +153,33 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let visible = app.grid_sessions();
     let total = visible.len();
     match key.code {
-        KeyCode::Up => app.view = View::grid(move_focus(focus, total, Dir::Up)),
-        KeyCode::Down => app.view = View::grid(move_focus(focus, total, Dir::Down)),
-        KeyCode::Left => app.view = View::grid(move_focus(focus, total, Dir::Left)),
+        KeyCode::Up => move_grid_focus(app, focus, total, Dir::Up),
+        KeyCode::Down => move_grid_focus(app, focus, total, Dir::Down),
+        KeyCode::Left => move_grid_focus(app, focus, total, Dir::Left),
         // F3 = 「下一个」，跟会话视图里的 F3 是同一个动作，肌肉记忆只练一次
-        KeyCode::Right | KeyCode::F(3) => {
-            app.view = View::grid(move_focus(focus, total, Dir::Right))
+        KeyCode::Right | KeyCode::F(3) => move_grid_focus(app, focus, total, Dir::Right),
+        // 换项目跟看板同一批键、同一个语义（共用 `jump_project`/`goto_project`，
+        // 不各抄一份）。九宫格没有组头可停，所以「换项目」= 焦点跳到那个项目的
+        // 第一个格子，同时看板那边的光标也跟着走——两个模式共用一个光标。
+        //
+        // 数字键在列表上有可见的号码（组头前面印着 `1`…`9`），九宫格里没有
+        // 地方放它；键仍然绑着，是为了跟列表一致，见任务报告里记的这处取舍。
+        KeyCode::Tab => {
+            super::jump_project(app, 1);
+            focus_first_of_current_group(app);
         }
+        KeyCode::BackTab => {
+            super::jump_project(app, -1);
+            focus_first_of_current_group(app);
+        }
+        KeyCode::Char(c @ '1'..='9') if is_plain_key(&key) => {
+            super::goto_project(app, c as usize - '1' as usize);
+            focus_first_of_current_group(app);
+        }
+        // `Tab` 走得到一个空项目，就得走得掉它：`x` 只拿得掉「pinned 且没有
+        // 会话」的组（守卫在 `unpin_current` 里），那种组在九宫格里没有格子，
+        // 少了这个键用户只能先 `g` 回列表才拿得掉。
+        KeyCode::Char('x') if is_plain_key(&key) => super::unpin_current(app),
         // `i` 开回复框。收件人在这一刻钉死成会话 id，之后焦点再怎么动都
         // 不改——见 `Draft::id`。
         KeyCode::Char('i') if is_plain_key(&key) => {
@@ -213,6 +233,42 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// 焦点挪一格，**并且把列表光标一起挪过去**。
+///
+/// 九宫格现在铺的是所有项目的会话（分组之前它只画一个作用域），所以左右
+/// 一走就可能跨进另一个项目。而「当前项目」唯一的答案处是列表光标
+/// （`App::current_group`）——不一起挪的话，底栏的项目名、`n` 把新会话开在
+/// 哪个目录、`x` 拿掉哪个组，全都还指着上一个项目，而屏幕上焦点分明已经在
+/// 别人家的格子里了。这正是这一版要消灭的「屏幕和状态各说各的」。
+///
+/// 会话刚没了、焦点一时对不上任何 id 时 `sync_board_cursor_from_grid` 自己
+/// 不动光标——乱指一个比不动更糟，理由见那个函数。
+fn move_grid_focus(app: &mut App, focus: usize, total: usize, dir: Dir) {
+    app.view = View::grid(move_focus(focus, total, dir));
+    super::sync_board_cursor_from_grid(app);
+}
+
+/// 把焦点挪到当前组的第一个活会话上。
+///
+/// 找不到（这个组的会话全停了、或者压根是个空组）就**不动**：空组在九宫格里
+/// 一个格子都没有，硬挪只会把焦点指到别人家的格子上去。
+///
+/// 焦点不动不等于这一下按键没反应——`jump_project`/`goto_project` 已经把
+/// 列表光标挪到了新项目的组头上，底栏那一段项目名读的就是它，用户看得见
+/// 自己换到了哪儿，接着按 `n` 开在那儿、按 `x` 把它拿掉。
+fn focus_first_of_current_group(app: &mut App) {
+    let first = app.current_group().and_then(|g| {
+        g.sessions
+            .iter()
+            .find(|s| s.state != SessionState::Stopped)
+            .map(|s| s.id)
+    });
+    let Some(first) = first else { return };
+    if let Some(i) = app.grid_sessions().iter().position(|s| s.id == first) {
+        app.view = View::grid(i);
+    }
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
@@ -292,8 +348,10 @@ fn draw_grid(
         // `n` 在九宫格里跟在列表里是同一个键，直接说怎么开，别让用户
         // 先绕回列表。分组之后九宫格画的是**所有**项目的会话，所以
         // 「一个都没有」就是字面意思，不再需要「别的项目里可能还有」那半句。
+        // 「一个项目组都没有」也不可能走到这儿——开机时 `seed_start_project`
+        // 会把启动目录摆上去。
         f.render_widget(
-            Paragraph::new(text(Key::NoSessionsAtAll, lang)).centered(),
+            Paragraph::new(text(Key::NoSessionsRunningPressN, lang)).centered(),
             centered_line(area),
         );
         return;
@@ -829,6 +887,185 @@ mod tests {
         assert!(c.contains("dc_desktop"), "格子标题要带项目名：{c}");
     }
 
+    /// **同一个项目的格子必须连排。** 格子上没有组头（二维布局里没地方放），
+    /// 「谁跟谁是一伙的」全靠挨着——一旦按 id 全局排序，两个项目的格子就会
+    /// 交错着铺满九宫格，用户只能一格一格读项目名。顺序由 `grid_sessions()`
+    /// 给（组序 + 组内 id 序），这条盯着它别被改回去。
+    ///
+    /// 连排还顺带管住了翻页：一个项目只有在它自己跨过第 9 格时才会被页边
+    /// 切开，而不是因为别的项目插了队。
+    #[test]
+    fn tiles_are_ordered_by_project_then_id() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![
+            session_in(9, "/w/b"),
+            session_in(2, "/w/a"),
+            session_in(5, "/w/a"),
+        ]);
+        assert_eq!(
+            app.grid_sessions().iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 5, 9],
+            "同一项目的格子必须连排，不能按 id 全局排序把它们打散"
+        );
+    }
+
+    /// `Tab` 在九宫格里跟在列表里是同一件事：换到下一个项目。焦点落到那个
+    /// 项目的第一个格子上，列表光标（「当前项目」唯一的答案处）也一起走。
+    #[test]
+    fn tab_moves_the_focus_to_the_next_project() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string())
+        );
+        assert!(
+            matches!(app.view, View::Grid { focus: 1, .. }),
+            "焦点要落到 b 的第一个格子上"
+        );
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("a".to_string()),
+            "到头回绕，跟列表一样"
+        );
+        assert!(matches!(app.view, View::Grid { focus: 0, .. }));
+    }
+
+    #[test]
+    fn shift_tab_goes_back_to_the_previous_project() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::BackTab)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "往回一格从头绕到尾"
+        );
+        assert!(matches!(app.view, View::Grid { focus: 1, .. }));
+    }
+
+    /// 数字键直达第 N 个项目，跟列表上一模一样（列表的组头上印着这个号码）。
+    /// 越界什么都不做——按了 `9` 而只有两个项目时，不动比跳到最后一个好懂。
+    #[test]
+    fn a_digit_jumps_straight_to_that_project() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![
+            session_in(1, "/w/a"),
+            session_in(2, "/w/b"),
+            session_in(3, "/w/c"),
+        ]);
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Char('3'))).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("c".to_string())
+        );
+        assert!(matches!(app.view, View::Grid { focus: 2, .. }));
+
+        handle_key(&mut app, key(KeyCode::Char('9'))).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("c".to_string()),
+            "越界不动"
+        );
+        assert!(matches!(app.view, View::Grid { focus: 2, .. }));
+    }
+
+    /// `Tab` 走到一个**空**项目（`p` 摆上来但还没开会话）：九宫格里它一个
+    /// 格子都没有，焦点无处可去，只能留在原地——硬挪就会指到别人家的格子上。
+    ///
+    /// 但这一下**不是没反应**：底栏的项目名读的是列表光标，`jump_project`
+    /// 已经把它挪过去了，用户看得见自己换到了哪个项目，接着按 `n` 就开在那儿、
+    /// 按 `x` 就把它拿掉。
+    #[test]
+    fn tab_onto_an_empty_project_switches_project_without_moving_the_focus() {
+        let (mut app, _dir) = App::test_app();
+        app.pinned = vec!["/w/z".into()];
+        app.set_sessions(vec![session_in(1, "/w/a")]);
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("z".to_string()),
+            "项目确实换过去了，按键不能是无声的"
+        );
+        assert!(
+            matches!(app.view, View::Grid { focus: 0, .. }),
+            "空项目没有格子，焦点只能留在原地"
+        );
+        assert_eq!(
+            app.current_dir(),
+            std::path::PathBuf::from("/w/z"),
+            "接着按 n 要开在刚换过去的那个项目里"
+        );
+    }
+
+    /// `x` 在九宫格里也能把一个空项目拿掉：`Tab` 走得到它，就得走得掉它，
+    /// 否则用户只能先按 `g` 回列表——而那正是「九宫格是看板的另一种画法，
+    /// 不是另一个世界」这条约束要消灭的东西。
+    #[test]
+    fn x_removes_an_empty_project_from_the_grid_too() {
+        let (mut app, _dir) = App::test_app();
+        app.pinned = vec!["/w/z".into()];
+        app.set_sessions(vec![session_in(1, "/w/a")]);
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
+        assert_eq!(app.groups.len(), 1, "空项目该被拿掉");
+        assert_eq!(app.groups[0].name, "a");
+    }
+
+    /// **方向键跨过项目边界时，「当前项目」得跟着走。**
+    ///
+    /// 九宫格现在铺的是所有项目的会话，左右一走就可能跨进另一个项目。不同步
+    /// 的话，底栏还写着上一个项目名、`n` 会把新会话开进上一个项目里，而用户
+    /// 眼睛盯着的分明是另一格——「屏幕和状态各说各的」正是这一版要消灭的东西。
+    #[test]
+    fn moving_the_focus_across_a_project_boundary_switches_the_current_project() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        app.view = View::grid(0);
+        // 光标停在 a 的会话行上（进九宫格时两边本来就是对齐的）
+        app.list_state.select(Some(1));
+
+        handle_key(&mut app, key(KeyCode::Right)).unwrap();
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "焦点已经在 b 的格子上了，当前项目就必须是 b"
+        );
+        assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/b"));
+    }
+
+    /// 换完项目再按 `g` 回列表，落点必须还是那个项目。两个视图共用一个光标，
+    /// `Tab` 只挪动其中一个就等于把它们劈开了。
+    #[test]
+    fn tab_then_g_lands_on_the_same_project() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        app.view_mode = crate::ui::ViewMode::Grid;
+        app.view = View::grid(0);
+
+        handle_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('g'))).unwrap();
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "九宫格里换了项目，回列表不能又回到原来那个"
+        );
+    }
+
     /// 一个会话都没有时，直接说怎么开一个。分组之后九宫格画的是所有项目的
     /// 会话，「这里没有但别处可能有」这种半句话不再存在。
     #[test]
@@ -838,8 +1075,8 @@ mod tests {
         app.view = View::grid(0);
 
         let c = grid_text(&mut app);
-        assert!(c.contains("还没有任何会话"), "空状态要说人话：{c}");
-        assert!(c.contains("按n开一个"), "并指出下一步怎么做：{c}");
+        assert!(c.contains("还没有会话"), "空状态要说人话：{c}");
+        assert!(c.contains("按n新建"), "并指出下一步怎么做：{c}");
     }
 
     /// 焦点从 0 一路走到 2 再走回来，视图始终留在九宫格里。
@@ -956,12 +1193,13 @@ mod tests {
     fn typing_in_a_tile_does_nothing_at_all() {
         // 格子里任何按键都不会送进 agent（设计约束，见 View::Grid 的注释）。
         // 这里能验证的是「什么都没发生」：视图没变，也没冒出一句消息。
-        // 挑的都是九宫格没有绑定的键——绑了的那几个（n/N/p/c/q/s/u/d）
-        // 做的是看板上同名键的那件事，不是「打字」。
+        // 挑的都是九宫格没有绑定的键——绑了的那几个（n/N/p/c/q/s/u/d/x/1-9）
+        // 做的是看板上同名键的那件事，不是「打字」。`x` 从这张表里挪走了：
+        // 它现在跟看板一样是「移除空项目」（见 `x_removes_an_empty_project_...`）。
         let (mut app, _dir) = App::test_app();
         app.set_sessions(vec![session(1, SessionState::Idle)]);
         app.view = View::grid(0);
-        for c in ['x', '中', 'z'] {
+        for c in ['w', '中', 'z'] {
             handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
             assert!(matches!(app.view, View::Grid { focus: 0, .. }));
             assert_eq!(app.message.text, "");
@@ -1508,10 +1746,10 @@ mod tests {
         .unwrap();
         let c = squashed(&term);
         assert!(
-            c.contains("还没有任何会话"),
+            c.contains("还没有会话"),
             "空看板要说话，不能只画一个空框：{c}"
         );
-        assert!(c.contains("按n开一个"), "n 在这一屏就能按，直接说：{c}");
+        assert!(c.contains("按n新建"), "n 在这一屏就能按，直接说：{c}");
         assert!(
             !c.contains("回列表"),
             "别让用户先绕回列表——n 在这儿就管用：{c}"

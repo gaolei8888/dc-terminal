@@ -65,16 +65,16 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
         }],
         lang,
     ));
-    if in_grid {
-        if ctx.selected.is_some() {
-            move_keys.extend(help_items(&[("i", Key::ReplyOnce)], lang));
-        }
-    } else if ctx.can_switch_project {
-        // `Tab` 只在列表上绑着（`board::handle_key`），九宫格没有它——
-        // 这一屏的作用是回答「我现在能按什么」，列一个这个视图按不动的键
-        // 就是在骗人。列表这边它反倒是**日常换项目的主路径**，底栏那三个
-        // 位子有时轮不到它，浮层里绝不能也没有。只有一个项目时它原地打转
-        // （见 `HelpCtx::can_switch_project`），那种时候同样不写。
+    if in_grid && ctx.selected.is_some() {
+        move_keys.extend(help_items(&[("i", Key::ReplyOnce)], lang));
+    }
+    // `Tab` 两个视图都绑着（`board::handle_key` / `grid::handle_key`），
+    // 所以两屏都写。它是**日常换项目的主路径**，底栏那三个位子经常轮不到它
+    // （九宫格里尤其：`Enter`/`i`/`n` 先占满），浮层里绝不能也没有。
+    // 只有一个项目时它原地打转（见 `HelpCtx::can_switch_project`），那种时候
+    // 两屏同样都不写——这一屏的作用是回答「我现在能按什么」，列一个按不动的
+    // 键就是在骗人。
+    if ctx.can_switch_project {
         move_keys.extend(help_items(&[("Tab", Key::SwitchProject)], lang));
     }
 
@@ -103,11 +103,11 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
             // 一个键），`p` 只剩「把一个看板上还没有的项目摆上来」这一件事。
             // 照着旧措辞按 `p` 的人会以为能一步换过去，弹出来的却是选择器。
             //
-            // `x 移除` 只在列表上绑着，而且只对空组管用（`unpin_current`）
-            // ——两个条件都不满足就不写，同上。
+            // `x 移除` 现在两个视图都绑着，但只对「pinned 且空」的组管用
+            // （`unpin_current` 的两条守卫）——不满足就不写，同上。
             items: {
                 let mut v = help_items(&[("p", Key::AddProject)], lang);
-                if !in_grid && ctx.can_remove {
+                if ctx.can_remove {
                     v.extend(help_items(&[("x", Key::RemoveProject)], lang));
                 }
                 v.extend(help_items(
@@ -291,6 +291,10 @@ mod tests {
         assert!(grid.contains("Enter 放大"), "{grid}");
         assert!(grid.contains("g 列表"), "{grid}");
         assert!(grid.contains("i 回一句"), "{grid}");
+        // 换项目那两个键两个视图都绑着，所以两屏都得写——底栏里它们经常
+        // 被三条动作的上限挤掉，这一屏是它们唯一的落点。
+        assert!(grid.contains("Tab 换项目"), "{grid}");
+        assert!(grid.contains("x 移除"), "{grid}");
 
         let board = listed(&View::Board, everything_available());
         assert!(board.contains("Enter 进会话"), "{board}");
@@ -350,7 +354,8 @@ mod tests {
     }
 
     /// `Tab` 和 `x` 在浮层里也按同一条规矩：只有一个项目时 `Tab` 原地打转，
-    /// 组里还有会话时 `x` 会被拒绝。
+    /// 组里还有会话时 `x` 会被拒绝。**两个视图同一条规矩**——它们现在两边
+    /// 都绑着，一边写一边不写就是又分了岔。
     #[test]
     fn the_overlay_gates_tab_and_x_on_the_board_state() {
         let alone = HelpCtx {
@@ -358,9 +363,11 @@ mod tests {
             can_remove: false,
             ..everything_available()
         };
-        let s = listed(&View::Board, alone);
-        assert!(!s.contains("Tab"), "只有一个项目，Tab 什么都不做：{s}");
-        assert!(!s.contains("x 移除"), "非空组拿不掉：{s}");
+        for from in [View::Board, View::grid(0)] {
+            let s = listed(&from, alone);
+            assert!(!s.contains("Tab"), "只有一个项目，Tab 什么都不做：{s}");
+            assert!(!s.contains("x 移除"), "非空组拿不掉：{s}");
+        }
     }
 
     /// 浮层不是全屏接管：背后那一屏要还看得见。

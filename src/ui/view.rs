@@ -997,10 +997,11 @@ impl HelpCtx {
 /// 停在组头上，最可能是在这里开一个新会话。
 ///
 /// `rest` 是这个视图自己的候选键，按重要性排好序。**只许列这个视图真的
-/// 绑了的键**——九宫格没有 `Tab`、也没有 `x`（见 `grid::handle_key`），
-/// 把看板那两条照搬过去就是屏幕上写着按不动的键，而这个仓库把那当 bug
-/// 而不是小瑕疵。两个视图共用这个函数是为了共用**上限和挑选顺序**，
-/// 不是为了共用一张假装两边一样的键表。
+/// 绑了的键**——两个视图共用这个函数是为了共用**上限和挑选顺序**，不是为了
+/// 共用一张假装两边一样的键表。九宫格曾经没绑 `Tab`/`x`，那时候把看板那两条
+/// 照搬过去就是屏幕上写着按不动的键，而这个仓库把那当 bug 而不是小瑕疵；
+/// 现在它绑了（见 `grid::handle_key`），所以这两条也就跟着回到了它的候选表里
+/// ——键和这张表必须在同一次改动里一起走，先后脚都会留下一段说谎的底栏。
 fn board_keys(
     ctx: HelpCtx,
     enter: (&'static str, crate::i18n::Key),
@@ -1122,19 +1123,28 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             &[("Enter", Key::SendReply), ("Ctrl+C", Key::InterruptAgent)],
             lang,
         ),
-        // 九宫格：跟看板同一条上限（三条动作 + 门），但**候选键是它自己的**
-        // ——这个视图没绑 `Tab`、也没绑 `x`（见 `grid::handle_key`），照搬
-        // 看板那两条就是在教人按一个按不动的键。
+        // 九宫格：跟看板同一条上限（三条动作 + 门），候选键也几乎是同一批
+        // ——`Tab`/`x` 现在两个视图都绑着（见 `grid::handle_key`），两处的
+        // 前提也逐条相同（`can_switch_project` / `can_remove`）。
         //
         // `i 回一句` 排在 `n 新建` 前面：它是九宫格独有的能力，不写就找不到，
         // 而 `n` 在看板上、浮层里、到处都写着。没有聚焦会话时不写——回复框
         // 会开在一个不存在的会话上。
+        //
+        // 其余顺序跟看板那一支对齐（n → x → Tab），这样同一个键在两个视图里
+        // 出现在同一个位置上，切模式不用重新找。
         View::Grid { .. } => {
             let mut rest: Vec<(&'static str, Key)> = Vec::new();
             if ctx.selected.is_some() {
                 rest.push(("i", Key::ReplyOnce));
             }
             rest.push(("n", Key::New));
+            if ctx.can_remove {
+                rest.push(("x", Key::RemoveProject));
+            }
+            if ctx.can_switch_project {
+                rest.push(("Tab", Key::SwitchProject));
+            }
             help_items(&board_keys(ctx, ("Enter", Key::Zoom), &rest), lang)
         }
         // 验证中不接受任何操作，底部提示不该继续说「Enter 确认」——那会让人
@@ -1370,14 +1380,36 @@ mod tests {
         );
     }
 
-    /// `Tab` 和 `x` 只在列表上绑着，九宫格没有——把看板那张表照搬过去，
-    /// 就是这个仓库反复警惕的「屏幕上写着却按不动的键」，只是这次犯在
-    /// 共用一个函数的便利上。
+    /// `Tab` 和 `x` 现在两个视图都绑着，所以两边的按键表也得都写——键和表
+    /// 必须在同一次改动里一起走。反过来，前提不成立时两边同样都不许写：
+    /// 「屏幕上写着却按不动的键」这条规矩不分视图。
+    ///
+    /// 用「组头那一档」问（`selected: None`）：键最全的那一档里 `Enter`/`i`
+    /// 会先占满三个位子，`Tab` 被 `truncate(3)` 截掉，断言就会因为截断而
+    /// 通过——那是个假绿，问的根本不是「它在不在候选表里」。
     #[test]
-    fn the_grid_never_advertises_keys_it_does_not_bind() {
-        let help = help_of(&View::grid(0), Lang::Zh);
+    fn the_grid_advertises_the_project_keys_it_binds() {
+        let removable = HelpCtx {
+            can_remove: true,
+            ..on_a_header()
+        };
+        let help = help_when(&View::grid(0), Lang::Zh, removable);
+        for k in ["Tab 换项目", "x 移除"] {
+            assert!(
+                help.contains(k),
+                "九宫格现在绑着「{k}」，就得写出来：{help}"
+            );
+        }
+
+        // 前提不在就别写：只有一个项目时 `Tab` 原地打转，非空组 `x` 会被拒绝
+        let alone = HelpCtx {
+            can_remove: false,
+            can_switch_project: false,
+            ..on_a_header()
+        };
+        let help = help_when(&View::grid(0), Lang::Zh, alone);
         for k in ["Tab", "x 移除"] {
-            assert!(!help.contains(k), "九宫格没绑「{k}」：{help}");
+            assert!(!help.contains(k), "这一档按不动「{k}」：{help}");
         }
     }
 

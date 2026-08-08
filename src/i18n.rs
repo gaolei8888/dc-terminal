@@ -169,6 +169,11 @@ pub enum Key {
     // —— 状态与提示 ——
     NoSessionsHere,
     NoSessionsAtAll,
+    /// 九宫格的整屏空态。跟 `NoSessionsAtAll` 分开是因为落点不同：那一条是
+    /// 一句**提示消息**（在一个空看板上按 `s`/`i` 得到的反馈），这一条是
+    /// 一整屏，屏幕正中就这一句话，说的是「这里现在什么都没有，下一步做这个」。
+    /// 合成一条的话，改动其中一处的措辞会静悄悄改掉另一处。
+    NoSessionsRunningPressN,
     /// 组头上：这个项目的目录已经不在了
     ProjectDirGone,
     AllSessionsStopped,
@@ -348,6 +353,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "No sessions yet. Press n to start one.",
             zh: "还没有任何会话，按 n 开一个",
+        ),
+        NoSessionsRunningPressN => t!(
+            lang,
+            en: "No sessions yet — press n to start one",
+            zh: "还没有会话，按 n 新建",
         ),
         WindowTooSmall => t!(
             lang,
@@ -1227,7 +1237,12 @@ mod tests {
             ManualPath,
             NoSessionsHere,
             NoSessionsAtAll,
+            NoSessionsRunningPressN,
             ProjectDirGone,
+            // 早就在词条表里，却一直没进这份清单——于是两条守卫（两种语言都
+            // 组得出话、英文里不许有汉字）从来没查过它。顺手补上：它正是九宫格
+            // 另一种空态用的那一条，跟刚加的 NoSessionsRunningPressN 挨着。
+            AllSessionsStopped,
             WindowTooSmall,
             Verifying,
             PasteOrTypeKey,
@@ -1307,7 +1322,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
