@@ -1552,6 +1552,138 @@ mod tests {
         }
     }
 
+    /// **钉死** `was == SessionState::Working` 单独扛住的那一半：
+    /// `recovering_from_a_failure_does_not_count_as_finishing_a_round`
+    /// 测的是 `first_input` 全程为空的场景——那条测试其实是被两道判断
+    /// 同时拦住的（`!s.first_input.is_empty()` 那道判断也在拦，见它的
+    /// 文档注释），单独去掉 `was == Working` 拦不住它。这条要隔离的是
+    /// `!s.first_input.is_empty()` 已经放行之后剩下的那一半：用户已经
+    /// 说过话（`first_input` 非空），agent 却报错又恢复——五个内置
+    /// profile 有 `error_pattern`（只有 codex.toml 没有），用户说完话
+    /// 之后 agent 报错、错误文案又从屏幕上滚走，`classify()` 会把这读成
+    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会烧掉一辈子
+    /// 只有一次的 `name_slot`，真正干完活也翻不了身。
+    ///
+    /// 区分「误触发」和「真起名」不能靠 `first_input`——两次触发时它都
+    /// 非空、内容还一样，天生分不出谁是谁。只能靠 prompt 里屏幕尾巴那
+    /// 一段：`cat` 要等脚本走完 BOOM → 清屏 → READY 才会真正开始读、
+    /// 回显用户排在队列里的那句话，所以恢复那一刻的屏幕尾巴里还没有它，
+    /// 真正干完一轮活之后的屏幕尾巴里才有。
+    #[test]
+    fn recovering_from_a_failure_after_real_input_still_does_not_count() {
+        struct ByScreenTail;
+        impl crate::llm::Backend for ByScreenTail {
+            fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                // `p.user` 里 first_input 是原样嵌进去的，不管屏幕上有没有
+                // 这句话都会出现——不能拿整个 `p.user` 去 `contains`，那样
+                // 两次触发永远都命中。真正能分出「误触发」和「真起名」的，
+                // 是「屏幕上的最后一段内容：」这个分隔符**之后**那一段。
+                let tail = p
+                    .user
+                    .split("屏幕上的最后一段内容：\n\n")
+                    .nth(1)
+                    .unwrap_or("");
+                if tail.contains("修一下登录白屏") {
+                    Ok("真实名字".into())
+                } else {
+                    Ok("恢复期间误触发".into())
+                }
+            }
+        }
+
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(Profile {
+            name: "flaky-name-2".into(),
+            // 清屏和打 READY 仍然要在同一次 write 里（理由同上一条测试）。
+            //
+            // 两处 sleep 都是故意留宽的安全边际，不是随手抄的数字：
+            // - BOOM 停留 1 秒才清屏：这条测试的第一段轮询要能至少抓到
+            //   一次 `Failed` 才有意义——`was` 记的是「上一次 tick() 看到
+            //   的状态」，如果轮询碰巧一次都没抓到 `Failed`（比如系统繁忙、
+            //   调度抖动让这次 tick() 迟迟排不上号），`was` 就会停在创建
+            //   时的初始值 `Working` 上，跳过 `Failed` 直接读到 `Idle`——
+            //   这时候即使生产代码完全正确，`was == Working` 也会误判为真，
+            //   测试就会因为轮询granularity 不够而假红/假绿，测的不是
+            //   生产代码。1 秒相对 20ms 的轮询间隔留了大约 50 倍余量。
+            // - READY 上屏和 `cat` 起来之间垫 0.5 秒：`cat` fork/exec 完去
+            //   读那句排队的输入，中间的间隔本来全凭系统调度，窄到跟
+            //   tick() 轮询的间隔可能落进同一个窗口——那样恢复那一刻的
+            //   屏幕说不定已经带着回显了，这条测试用来分辨「误触发」和
+            //   「真起名」的判据就被冲没了。
+            // 两处都是同一个思路：给状态转换留出一个测得准的窗口，
+            // 不靠运气——跟上一条测试解决 split-write 那个 flake 一样。
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo BOOM; sleep 1; printf '\\033[2J\\033[HREADY\\n'; sleep 0.5; cat".into(),
+            ],
+            is_agent: true,
+            idle_pattern: Some("READY".into()),
+            busy_pattern: None,
+            error_pattern: Some("BOOM".into()),
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        });
+        m.set_backend(Some(Arc::new(ByScreenTail)));
+        let id = m
+            .create(repo.path(), "flaky-name-2", empty_secrets(), &[])
+            .unwrap();
+
+        // 用户先说话：`first_input` 在恢复发生之前就已经封存、非空，
+        // `!s.first_input.is_empty()` 那道判断在恢复那一刻已经放行，
+        // 剩下单独扛住误判的只有 `was == SessionState::Working`。
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap();
+
+        // BOOM → 清屏 + READY 的恢复走完。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_of(&m, id) != SessionState::Idle {
+            m.tick();
+            assert!(Instant::now() < deadline, "该从 BOOM 恢复成 Idle");
+            sleep(Duration::from_millis(20));
+        }
+        // 多 tick 几轮，把「本不该发生的误触发」的窗口喂饱，给它足够
+        // 机会真的发生并把答案写回槽里。
+        for _ in 0..10 {
+            m.tick();
+            sleep(Duration::from_millis(20));
+        }
+
+        // 等 `cat` 真把排队的那句话读出来、回显到屏幕上——只有这之后，
+        // 屏幕尾巴里才会出现它，标志着「真正干完一轮活」的证据到位了。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !m.screen_text_for_test(id).contains("修一下登录白屏") {
+            m.tick();
+            assert!(Instant::now() < deadline, "cat 该把排队的输入回显出来");
+            sleep(Duration::from_millis(20));
+        }
+
+        // 现在才是真正的下一轮：会话已经在 Idle，重新逼一次 Working，
+        // 让它在屏幕尾巴已经带着用户那句话的情况下再走一次
+        // Working → Idle。
+        m.send_input(id, "").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+            if tag == "真实名字" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "真正干完一轮活之后应该起出真实名字，最后是 {tag:?}"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn with_no_backend_the_explanation_stays_empty_and_nothing_breaks() {
         // 这是「非 LLM 退路」的回归点：没配后端时 dct 表现得和今天一模一样。
