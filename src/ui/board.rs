@@ -9,6 +9,13 @@ use super::widgets::{pad_to, status_label, status_style, truncate};
 use super::{dim, open_new_session, open_project_picker, open_secrets, session_action};
 use crate::i18n::{msg, text, Key};
 
+/// 组头上，最后一格（「还没有会话 …」/ agent 统计）之前的所有东西占几列。
+///
+/// `2` 是 `List` 为 `highlight_symbol("▶ ")` 在**每一行**预留的宽度——不是
+/// 只给选中那一行，这是最容易在算宽度时漏掉的一段。其余依次是：项目色条 1、
+/// 序号 3、折叠箭头 2、项目名 18、父目录 18。
+const HEADER_PREFIX_COLS: usize = 2 + 1 + 3 + 2 + 18 + 18;
+
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
 /// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
@@ -146,6 +153,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                         // 接在这一格后面而不是另开一列：这一格本来就只有
                         // 「还没有会话」这半句，右边全是空白。从没记过 agent
                         // 的项目照旧只写原来那句，不编一个名字出来。
+                        //
+                        // 宽度：这一格拿到的是**整行减去前缀**，而前缀里有一段
+                        // 容易漏掉的——`List` 给 `highlight_symbol("▶ ")` 在
+                        // **每一行**都预留两列，不只是选中那行。算漏它的话
+                        // 80 列上这句会正好被右边框切掉尾巴（最长的内置 agent
+                        // 名是 8 列：`opencode`/`deepseek`/`qwen-api`）。
+                        // 自建 profile 的名字要多长有多长，所以除了把文案收短，
+                        // 还得真按剩下的宽度裁一次——裁出个 `…` 也比无声地被
+                        // 边框吃掉强，后者用户根本看不出还有字。
                         let hint = text(Key::NoSessionsHere, app.lang);
                         let line = match &g.last_profile {
                             Some(p) => {
@@ -153,7 +169,10 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                             }
                             None => hint.to_string(),
                         };
-                        spans.push(Span::styled(line, dim()));
+                        let room = (area.width as usize)
+                            .saturating_sub(2) // 左右边框
+                            .saturating_sub(HEADER_PREFIX_COLS);
+                        spans.push(Span::styled(truncate(&line, room), dim()));
                     } else {
                         let agents: Vec<String> = g
                             .agent_counts()
@@ -344,31 +363,79 @@ mod tests {
     ///
     /// **两种语言都在 80 列上验一遍**：中文双宽字少、英文单宽词长，谁先撞到
     /// 右边界不是想当然的。
+    ///
+    /// **用最长的那个 agent 名，不是最短的。** 内置 profile 里最长的是 8 列
+    /// （`opencode`/`deepseek`/`qwen-api`，`profiles/` 里数出来的），而
+    /// `claude` 只有 6 列——拿 `claude` 测出来的「放得下」在真实的 8 列名字
+    /// 上会被右边框静默切掉两列。这个 fixture 把最长的那个也过一遍。
     #[test]
     fn an_empty_project_names_the_agent_it_last_used() {
-        for (lang, want) in [
-            (crate::i18n::Lang::Zh, "上次用claude"),
-            (crate::i18n::Lang::En, "lastusedclaude"),
-        ] {
-            let (mut app, dir) = App::test_app();
-            app.lang = lang;
-            let proj = real_dir(&dir, "我的项目");
-            app.pinned = vec![proj.clone()];
-            app.profiles.insert(
-                super::super::view::canon(std::path::Path::new(&proj))
-                    .display()
-                    .to_string(),
-                "claude".into(),
-            );
-            app.set_sessions(vec![]);
-            assert!(app.groups[0].sessions.is_empty(), "前提：一个会话都没有");
+        // 键名列宽度无关，测的是最短和最长两档都完整
+        for agent in ["claude", "opencode"] {
+            for (lang, want) in [
+                (crate::i18n::Lang::Zh, format!("上次用{agent}")),
+                (crate::i18n::Lang::En, format!("lastused{agent}")),
+            ] {
+                let (mut app, dir) = App::test_app();
+                app.lang = lang;
+                let proj = real_dir(&dir, "我的项目");
+                app.pinned = vec![proj.clone()];
+                app.profiles.insert(
+                    super::super::view::canon(std::path::Path::new(&proj))
+                        .display()
+                        .to_string(),
+                    agent.into(),
+                );
+                app.set_sessions(vec![]);
+                assert!(app.groups[0].sessions.is_empty(), "前提：一个会话都没有");
 
-            let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+                let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+                term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
-            let c = screen_text(&term);
-            assert!(c.contains(want), "{lang:?}/80 列下少了「{want}」：{c}");
+                let c = screen_text(&term);
+                assert!(c.contains(&want), "{lang:?}/80 列下少了「{want}」：{c}");
+            }
         }
+    }
+
+    /// 自建 profile 的名字要多长有多长。放不下时要看得见一个 `…`——被右边框
+    /// 无声吃掉的话，用户根本不知道后面还有字。这也从另一头钉住
+    /// `HEADER_PREFIX_COLS`：常量小了就不会裁，这条会红。
+    #[test]
+    fn an_over_long_agent_name_is_cut_visibly_not_by_the_border() {
+        let (mut app, dir) = App::test_app();
+        app.lang = crate::i18n::Lang::En;
+        let proj = real_dir(&dir, "我的项目");
+        app.pinned = vec![proj.clone()];
+        app.profiles.insert(
+            super::super::view::canon(std::path::Path::new(&proj))
+                .display()
+                .to_string(),
+            "an-absurdly-long-locally-defined-agent".into(),
+        );
+        app.set_sessions(vec![]);
+
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(c.contains('…'), "放不下就要看得见省略号：{c}");
+    }
+
+    /// 内置 profile 名字最长 8 列——`an_empty_project_names_the_agent_it_last_used`
+    /// 里那个 `opencode` 是照着 `profiles/` 挑的，不是随手写的。哪天加进来一个
+    /// 更长的，这条会红，提醒去看那个宽度还够不够。
+    #[test]
+    fn no_builtin_agent_name_is_wider_than_the_header_budget_allows() {
+        let longest = crate::profile::Profile::builtin_names()
+            .into_iter()
+            .max_by_key(|n| super::super::widgets::display_width(n))
+            .unwrap();
+        assert_eq!(
+            super::super::widgets::display_width(longest),
+            8,
+            "内置 agent 名最长 8 列（{longest}）；变了就去复核组头那一格的宽度"
+        );
     }
 
     /// 从没记过 agent 的项目照旧只写原来那句——不编一个名字出来，

@@ -354,7 +354,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
 
         // 组头上那一句，不是整屏空态——分组之后这句话贴在项目名后面，
         // 屏幕上别的组还列着会话，「按 n 开一个」那半句在这里是噪音。
-        NoSessionsHere => t!(lang, en: "no sessions yet", zh: "还没有会话"),
+        // 英文写 `no sessions` 不写 `no sessions yet`：这一格后面还要接
+        // 「上次用 <agent>」，而 80 列的看板上这一格只有 34 列（组头前缀
+        // 44 列，含 `List` 每行都预留的 `▶ `）。`yet` 那四列会把最长的
+        // 内置 agent 名（`opencode`/`deepseek`/`qwen-api`，8 列）顶出边框。
+        NoSessionsHere => t!(lang, en: "no sessions", zh: "还没有会话"),
         // 空项目的组头上，这半句接在上面那条后面：`还没有会话 · 上次用 claude`。
         // 「哪个项目用哪个 agent」在别处只有底栏那一条，而底栏 80 列上会把
         // agent 名让掉——空项目于是全屏没有一处答得出这个问题。
