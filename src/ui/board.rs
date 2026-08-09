@@ -135,7 +135,25 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     if gone {
                         spans.push(Span::styled(text(Key::ProjectDirGone, app.lang), dim()));
                     } else if g.sessions.is_empty() {
-                        spans.push(Span::styled(text(Key::NoSessionsHere, app.lang), dim()));
+                        // 空项目的组头上补一句「上次用的是谁」。
+                        //
+                        // 「哪个项目用哪个 agent」本来只有底栏那一条 `n 新建
+                        // <agent>` 答得出，而底栏在 80 列上会把 agent 名让掉
+                        // （`bar_keys` 里那条「让的是半句说明、不是一个键」），
+                        // 于是一个还没有会话的项目在整个屏幕上无处可查——而
+                        // 这正是这次改造被提出来时的那句话。
+                        //
+                        // 接在这一格后面而不是另开一列：这一格本来就只有
+                        // 「还没有会话」这半句，右边全是空白。从没记过 agent
+                        // 的项目照旧只写原来那句，不编一个名字出来。
+                        let hint = text(Key::NoSessionsHere, app.lang);
+                        let line = match &g.last_profile {
+                            Some(p) => {
+                                format!("{hint} · {} {p}", text(Key::LastUsedAgent, app.lang))
+                            }
+                            None => hint.to_string(),
+                        };
+                        spans.push(Span::styled(line, dim()));
                     } else {
                         let agents: Vec<String> = g
                             .agent_counts()
@@ -316,6 +334,58 @@ mod tests {
             c.contains("我的自媒体电商"),
             "名字可以裁短，但要还认得出是哪个项目：{c}"
         );
+    }
+
+    /// **还没有会话的项目，组头上要写出它上次用的是哪个 agent。**
+    ///
+    /// 「哪个项目用哪个 agent」在别处只有底栏那一条 `n 新建 <agent>` 答得出，
+    /// 而底栏在 80 列上放不下时会把 agent 名让掉——于是一个空项目在整个屏幕
+    /// 上没有一处答得出这个问题，而那正是这次改造被提出来时的那句话。
+    ///
+    /// **两种语言都在 80 列上验一遍**：中文双宽字少、英文单宽词长，谁先撞到
+    /// 右边界不是想当然的。
+    #[test]
+    fn an_empty_project_names_the_agent_it_last_used() {
+        for (lang, want) in [
+            (crate::i18n::Lang::Zh, "上次用claude"),
+            (crate::i18n::Lang::En, "lastusedclaude"),
+        ] {
+            let (mut app, dir) = App::test_app();
+            app.lang = lang;
+            let proj = real_dir(&dir, "我的项目");
+            app.pinned = vec![proj.clone()];
+            app.profiles.insert(
+                super::super::view::canon(std::path::Path::new(&proj))
+                    .display()
+                    .to_string(),
+                "claude".into(),
+            );
+            app.set_sessions(vec![]);
+            assert!(app.groups[0].sessions.is_empty(), "前提：一个会话都没有");
+
+            let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+            let c = screen_text(&term);
+            assert!(c.contains(want), "{lang:?}/80 列下少了「{want}」：{c}");
+        }
+    }
+
+    /// 从没记过 agent 的项目照旧只写原来那句——不编一个名字出来，
+    /// 也不留一个「上次用 」的空尾巴。
+    #[test]
+    fn an_empty_project_with_no_recorded_agent_says_only_what_it_knows() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "崭新项目");
+        app.pinned = vec![proj];
+        app.set_sessions(vec![]);
+
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(c.contains("还没有会话"), "原来那句还在：{c}");
+        assert!(!c.contains("上次用"), "没有记录就别起头说一半：{c}");
     }
 
     /// 「当前项目 = 光标所在的组」，所以进一个别的组的会话既不需要改写

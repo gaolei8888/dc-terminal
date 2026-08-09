@@ -171,6 +171,8 @@ pub enum Key {
     NoSubfolders,
     // —— 状态与提示 ——
     NoSessionsHere,
+    /// 空项目组头上接在「还没有会话」后面的那半句：`上次用 claude`
+    LastUsedAgent,
     /// 九宫格的整屏空态：一个格子都没有，屏幕正中就这一句话。
     ///
     /// 空屏和底栏说的必须是**两个不同的事实**：这一条说「这里现在什么都没有，
@@ -353,6 +355,10 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 组头上那一句，不是整屏空态——分组之后这句话贴在项目名后面，
         // 屏幕上别的组还列着会话，「按 n 开一个」那半句在这里是噪音。
         NoSessionsHere => t!(lang, en: "no sessions yet", zh: "还没有会话"),
+        // 空项目的组头上，这半句接在上面那条后面：`还没有会话 · 上次用 claude`。
+        // 「哪个项目用哪个 agent」在别处只有底栏那一条，而底栏 80 列上会把
+        // agent 名让掉——空项目于是全屏没有一处答得出这个问题。
+        LastUsedAgent => t!(lang, en: "last used", zh: "上次用"),
         ProjectDirGone => t!(lang, en: "folder is gone", zh: "目录不在了"),
         AllSessionsStopped => t!(
             lang,
@@ -1239,6 +1245,7 @@ mod tests {
             CurrentProject,
             ManualPath,
             NoSessionsHere,
+            LastUsedAgent,
             NoSessionsRunningPressN,
             ProjectDirGone,
             // 早就在词条表里，却一直没进这份清单——于是两条守卫（两种语言都
@@ -1320,7 +1327,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 95, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
