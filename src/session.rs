@@ -122,7 +122,10 @@ pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
 
 /// 名字最多留这么多字符。**按字符数、不按显示宽度**：守护进程存的是
 /// 一段文字，画多宽是界面那一侧按各自的位置算的（见 `widgets::truncate`）。
-/// 24 是 12 个汉字，跟 prompt 里要的「不超过 12 个字」对得上。
+/// 24 是**字符数**上限，是给不听话的模型留的兜底余量——prompt 里要的是
+/// 不超过 12 个字，24 给英文答案（字母比汉字窄得多，字符数天然要多留
+/// 一截）留出呼吸空间。这不是排版决定，真正按显示宽度做裁剪的是界面
+/// 各处自己的事，跟这个常数无关。
 ///
 /// 这一版还没有调用方——起名逻辑要接进 daemon 的 tick 才会用到它，那是
 /// 下一个任务的事。`expect` 只挂在非测试构建上：测试里已经在调它，那边
@@ -162,15 +165,19 @@ pub(crate) fn clean_name(raw: &str) -> String {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    // 引号和收尾标点必须在**同一次** trim 里一起剥，不能分两轮各管一种字符集：
-    // 模型常把整句话包在引号里、句末再补一个句号，比如「修登录白屏」。分两轮
-    // 剥的话，剥引号那一轮从后往前第一个字符是句号、不是引号，直接收手，
-    // 剥不到里层的引号；剥标点那一轮再上场时引号已经挡在最后，标点那一轮
-    // 剥完句号就轮到引号、可它认的字符集里没有引号，同样收手——两轮各退
-    // 半步，谁都剥不干净。合成一个字符集一次性从两端向里扫，才能把「引号
-    // 叠标点」这种情况一次剥到底。
-    let line =
-        line.trim_matches(|c: char| QUOTES.contains(&c) || TAIL.contains(&c) || c.is_whitespace());
+    // 前后两端剥的字符集**不对称**，这是故意的：
+    // - 开头只剥引号和空白，不剥 TAIL 标点——名字本来就可能拿标点开头
+    //   （`.NET 迁移`、`.env 权限` 都是这个工具的域里说得通的会话名），
+    //   把开头的 `.` 当噪音铲掉会把真实名字铲坏。
+    // - 结尾把引号、TAIL 标点、空白放进同一个字符集里一次性剥：模型常把
+    //   整句话包在引号里、句末再补一个句号，比如「修登录白屏」。如果结尾
+    //   也分两轮、各管一种字符集，剥标点那一轮会在够到句号后停在引号上、
+    //   剥引号那一轮又认不得标点，两轮各退半步，谁都剥不干净，会留下
+    //   「修登录白屏」这种带着里层引号的残留。合成一个字符集一次性从
+    //   结尾向里扫，才能把「引号叠标点」这种情况一次剥到底。
+    let line = line.trim_start_matches(|c: char| QUOTES.contains(&c) || c.is_whitespace());
+    let line = line
+        .trim_end_matches(|c: char| QUOTES.contains(&c) || TAIL.contains(&c) || c.is_whitespace());
     line.chars().take(NAME_MAX_CHARS).collect()
 }
 
@@ -1152,6 +1159,15 @@ mod tests {
     #[test]
     fn clean_name_keeps_a_quote_that_sits_in_the_middle() {
         assert_eq!(clean_name("修复 \"login\" 白屏"), "修复 \"login\" 白屏");
+    }
+
+    /// 开头的标点不是包装、是名字的一部分：这个工具的域里 `.NET`、`.env`
+    /// 这种以句点开头的名字说得通，掐头去尾的剥法不能把它们当噪音铲掉。
+    /// 这是把结尾用的字符集错误地套到开头去会踩中的回归。
+    #[test]
+    fn clean_name_keeps_a_leading_tail_punctuation_character() {
+        assert_eq!(clean_name(".NET 迁移"), ".NET 迁移");
+        assert_eq!(clean_name(".env 权限"), ".env 权限");
     }
 
     /// 恰好等于上限字符数的名字必须原样保留，不多不少——`chars().take(n)`
