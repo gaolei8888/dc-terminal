@@ -69,27 +69,23 @@ fn wants_mouse_capture(attached: bool, agent_subscribed: bool, copy_mode: bool) 
 `mouse_capture_transition(was, wants)` 的签名不变，只是第二个参数从
 「在不在会话里」换成这个函数的结果。
 
-### 二、agent 订没订阅：协议要多带一个字段
+### 二、agent 订没订阅：**这件事已经在线上了，不用改协议**
 
-`Response::Screen` 现在带回 `lines / cursor / state / scroll`，加一个 `mouse: bool`：
+初稿说要给 `Response::Screen` 加一个 `mouse: bool`、把 `PROTOCOL_VERSION` 推到 7。
+**那是错的。** 这个事实早就在传了：
 
-```rust
-Screen {
-    lines: Vec<Vec<ScreenSpan>>,
-    cursor: (u16, u16),
-    state: SessionState,
-    scroll: ScrollState,
-    /// agent 此刻有没有订阅鼠标上报。界面拿它决定要不要抓鼠标——
-    /// 抓了它不要的，用户就白白丢了拖选复制。
-    mouse: bool,
-}
-```
+- `src/pty.rs::view_of` 里 `agent_owns: screen.mouse_protocol_mode() != MouseProtocolMode::None`
+- 经 `session.rs::state_of` 进 `ScrollState`
+- 随 `Response::Screen.scroll` 回到界面
+- 界面每帧存进 `App.scroll`，`src/ui/attach.rs` 已经在五处读它
 
-守护进程侧从 `screen.mouse_protocol_mode() != MouseProtocolMode::None` 得到它，
-跟 `write_mouse` 读的是同一个来源，不另起一套判断。
+`ScrollState.agent_owns` 的语义就是「agent 自己攥着鼠标」，跟「要不要抓鼠标」问的是
+**同一个事实**。所以这一版：
 
-**`PROTOCOL_VERSION` → 7。** 升级后旧守护进程要重启，正在跑的会话会断，走现有的
-询问流程（README 已有那段说明）。
+> **协议不变，`PROTOCOL_VERSION` 保持 6，守护进程一行不改。**
+
+而且共用同一个字段是对的，不只是省事：滚轮该归谁、鼠标要不要抓，本来就必须给出
+一致的答案。各读各的判据，迟早会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
 
 **它会中途变，不是开会话时判一次。** Claude Code 弹出可滚动菜单时开鼠标、收起来就关。
 会话视图本来就每帧拉 `Screen`，所以这个值天然跟着刷新；`mouse_capture_transition`
@@ -112,13 +108,12 @@ F4 退出」），优先级高于滚动提示，低于错误消息。
 
 ### 四、要动的文件
 
+**守护进程侧一个文件都不动**（`proto.rs` / `pty.rs` / `session.rs` / `daemon.rs` 全部不变）。
+这一版整个活在界面进程里：
+
 | 文件 | 改什么 |
 |---|---|
-| `src/proto.rs` | `Response::Screen` 加 `mouse`；`PROTOCOL_VERSION` → 7；Debug impl 与 JSON 快照测试 |
-| `src/pty.rs` | 快照里带上 `mouse_protocol_mode() != None` |
-| `src/session.rs` | `screen()` 把它透传出来 |
-| `src/daemon.rs` | `Request::Screen` 的响应补这个字段 |
-| `src/ui/app.rs` | `agent_wants_mouse: bool`、`copy_mode: bool` |
+| `src/ui/app.rs` | `copy_mode: bool`（`agent_owns` 走既有的 `App.scroll`，不加字段） |
 | `src/ui/mod.rs` | `wants_mouse_capture`；捕获判据换掉；`F4` 分支 |
 | `src/ui/attach.rs` | `F4` 不转发；离开会话时复位 |
 | `src/ui/view.rs` | 复制模式的底栏文案 |
@@ -146,11 +141,14 @@ F4 退出」），优先级高于滚动提示，低于错误消息。
 
 ## 破坏性变更
 
-**`PROTOCOL_VERSION` 6 → 7。** 升级后旧守护进程需要重启，正在跑的会话会断
-（文件改动都在，agent 要重开）。
+**没有。** 协议不变（见 §二），守护进程不用重启，正在跑的会话不受影响。
 
-grouping 那一轮刚把版本从 5 推到 6，两次都还没发布——**如果两版一起发，用户只需要
-重启一次守护进程**；分开发就是两次。这不影响本设计，只影响发布节奏。
+> **发布节奏的前提变了。** 用户在 2026-08-08 拍板「两版一起发」，理由是当时以为
+> 这一版会把协议从 6 推到 7、分开发就要用户重启两次守护进程。**那个前提不成立**——
+> 这一版一次协议变更都没有。
+>
+> 所以现在只剩 grouping 那一次 5 → 6，什么时候发、跟这一版一起还是先发，
+> 是纯粹的排期选择，不再有「省一次重启」这个技术理由。这个决定退回给用户。
 
 ## 已知上限
 
