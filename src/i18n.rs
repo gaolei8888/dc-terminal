@@ -192,6 +192,9 @@ pub enum Key {
     StaleData,
     /// 复制模式下顶掉整条底栏右段的提示
     CopyMode,
+    /// 同上，但给放不下长文案的窄终端用——必须放进 `ui::ACTION_MIN_COLS`，
+    /// 因为这是全屏唯一写着 F4（怎么退出复制模式）的地方，容不下被静默截断。
+    CopyModeShort,
     // —— 会话状态（看板与九宫格的状态列）——
     // —— dct ps / dct stop（普通终端里用，不开界面）——
     NoDaemonRunning,
@@ -533,6 +536,12 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Copy mode · mouse released · F4 exits",
             zh: "复制模式 · 鼠标已交还终端 · F4 退出"
+        ),
+
+        CopyModeShort => t!(
+            lang,
+            en: "Copy mode · F4 exits",
+            zh: "复制模式 · F4 退出"
         ),
     }
 }
@@ -1272,6 +1281,7 @@ mod tests {
             DaemonUnreachable,
             StaleData,
             CopyMode,
+            CopyModeShort,
             NoDaemonRunning,
             NoSessionsRunning,
             NothingToPrune,
@@ -1340,12 +1350,33 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 97, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
         seen.dedup();
         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+    }
+
+    /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
+    /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
+    /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
+    /// 用户就会卡在一个看不见也出不去的模式里，跟 `ESCAPE_HINT_COLS` 那条
+    /// 守卫（`src/ui/mod.rs` 的 `escape_hint_cols_fits_every_view`）防的是
+    /// 同一类事故。
+    #[test]
+    fn copy_mode_short_fits_the_action_floor_in_every_language() {
+        use unicode_width::UnicodeWidthStr;
+
+        for l in Lang::all() {
+            let short = text(Key::CopyModeShort, *l);
+            assert!(
+                short.width() <= crate::ui::ACTION_MIN_COLS as usize,
+                "{l:?} 下复制模式的短文案「{short}」宽 {} 列，放不进 ACTION_MIN_COLS = {}",
+                short.width(),
+                crate::ui::ACTION_MIN_COLS
+            );
+        }
     }
 
     /// 每一个错误码在两种语言下都要组得出话，而且英文里不许有汉字。

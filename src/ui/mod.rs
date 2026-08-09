@@ -1885,7 +1885,11 @@ const PROJECT_COLS: u16 = 16;
 /// 找得回来，普通消息还能折行，只有这一句既折不了（整句都是单空格，
 /// `wrap_help` 只认双空格断点）又必须读全——用户正翻在历史里，这句话是他
 /// 回到底部的唯一说明。由 `the_way_back_survives_a_narrow_terminal` 盯着。
-const ACTION_MIN_COLS: u16 = 28;
+///
+/// `pub(crate)`：`i18n.rs` 里 `CopyModeShort` 的守卫测试也要拿它当基准——
+/// 复制模式提示是右段另一条「少一个字就没法用」的内容（全屏唯一写着 F4
+/// 的地方），短文案必须放得进这同一条底线。
+pub(crate) const ACTION_MIN_COLS: u16 = 28;
 
 /// 底栏三段各占多少列（`inner` 是去掉左右边框之后的可用宽度）。
 ///
@@ -1937,7 +1941,18 @@ fn draw(f: &mut Frame, app: &mut App) {
         // 压不过错误消息——外层 if/else 链已经保证了这一点。
         let hint = match &app.view {
             View::Attached(_) if app.copy_mode => {
-                Some(crate::i18n::text(crate::i18n::Key::CopyMode, app.lang).to_string())
+                // 底栏右段只保证 ACTION_MIN_COLS 列，而这条提示是全屏唯一
+                // 写着 F4 的地方——截掉尾巴等于把用户关在一个看不见也出不去
+                // 的模式里。长文案说清楚「为什么」（鼠标交还给了终端），量
+                // 得下就用；量不下换成放得进 ACTION_MIN_COLS 的短文案，两种
+                // 语言都保证放得下（`copy_mode_short_fits_the_action_floor_in_every_language`）。
+                let long = crate::i18n::text(crate::i18n::Key::CopyMode, app.lang);
+                let chosen = if widgets::display_width(long) <= help_cols {
+                    long
+                } else {
+                    crate::i18n::text(crate::i18n::Key::CopyModeShort, app.lang)
+                };
+                Some(chosen.to_string())
             }
             View::Attached(_) => attach::scroll_hint(&app.scroll, app.lang),
             _ => None,
@@ -3813,6 +3828,29 @@ mod tests {
             assert!(
                 bar.contains(&hint.replace(' ', "")),
                 "{lang:?} 在 80 列下要完整显示复制模式提示，不能被切掉尾巴：{bar}"
+            );
+        }
+    }
+
+    /// 60 是 `grid::MIN_COLS`，一个受支持的宽度、也是常见的 tmux 分屏宽度。
+    /// 这里右段只剩 `ACTION_MIN_COLS`（28）列，长文案放不下，必须换成短文案
+    /// ——而短文案本身也必须完整出现，不能被 `Paragraph` 悄悄切掉尾巴。
+    #[test]
+    fn copy_mode_short_hint_survives_sixty_columns_in_both_languages() {
+        use ratatui::backend::TestBackend;
+
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
+            app.lang = lang;
+            app.copy_mode = true;
+            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+
+            let bar = bar_text(&term);
+            let short = crate::i18n::text(crate::i18n::Key::CopyModeShort, lang);
+            assert!(
+                bar.contains(&short.replace(' ', "")),
+                "{lang:?} 在 60 列下要完整显示复制模式的短文案：{bar}"
             );
         }
     }
