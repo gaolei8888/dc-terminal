@@ -1058,6 +1058,88 @@ mod tests {
         assert!(app.pinned.is_empty());
     }
 
+    /// **后台事件不许换掉当前项目——哪怕那个组是「有会话」才在看板上的。**
+    ///
+    /// 成员规则是「有**在跑**的会话 ∪ pinned」，所以一个没 pin 的组，最后一个
+    /// 会话自己跑完停掉的那一刻就整个没了。要是光标正站在它里面，
+    /// `find_anchor` 既找不到会话行、也找不到同 dir 的组头，只能退回第 0 行——
+    /// **当前项目在用户没碰键盘的时候变了**，接着的 `n`/`x` 作用在别的项目上。
+    /// 那正是整条分支要消灭的缺陷，也正好违反 spec §三的「组不塌陷」。
+    ///
+    /// 支点是「光标落在哪个组上就 pin 哪个组」。这条测试走的就是那条路：
+    /// 挪光标 → `pin_cursor_group`（主循环每轮都调）→ 后台 `set_sessions`。
+    #[test]
+    fn a_background_stop_never_moves_the_cursor_out_of_its_project() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/b")]);
+        assert!(app.pinned.is_empty(), "前提：两个组都不是 pin 上来的");
+        // 行：[组头 a, 1, 组头 b, 2]——用户挪到 b 的会话上
+        app.list_state.select(Some(3));
+        super::super::pin_cursor_group(&mut app);
+
+        // 后台那一轮 List：b 的唯一一个会话自己跑完停了。没有任何按键。
+        let mut done = sess_in(2, "/w/b");
+        done.state = crate::session::SessionState::Stopped;
+        app.set_sessions(vec![sess_in(1, "/w/a"), done]);
+
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "当前项目不许在用户没按键的时候变；n/x 会跟着跑到别的项目上去"
+        );
+        assert_eq!(app.groups.len(), 2, "组不塌陷：b 还在看板上");
+    }
+
+    /// 反过来的一半：**用户从没去过**的组，最后一个会话停掉时照旧下看板——
+    /// 这正是 `x` 能真的拿掉东西所依赖的那条成员规则。少了这一条，上面那条
+    /// 测试用「所有组都不会消失」也能通过，而 `x` 会退回成一个死键。
+    #[test]
+    fn a_project_the_cursor_never_visited_still_leaves_when_it_goes_quiet() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/b")]);
+        // 光标留在 a 上，从没去过 b
+        app.list_state.select(Some(1));
+        super::super::pin_cursor_group(&mut app);
+
+        let mut done = sess_in(2, "/w/b");
+        done.state = crate::session::SessionState::Stopped;
+        app.set_sessions(vec![sess_in(1, "/w/a"), done]);
+
+        assert_eq!(
+            app.groups
+                .iter()
+                .map(|g| g.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string()],
+            "没去过的项目安静下来就该下看板"
+        );
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("a".into())
+        );
+    }
+
+    /// 同一个组里上下走一百下，只该 pin 一次——判据是这个组自己的 `pinned`
+    /// 标志，不是「光标动了没有」。每个方向键一次守护进程往返的话，看板在
+    /// 长列表里会一顿一顿。
+    #[test]
+    fn pinning_the_cursor_group_is_once_per_project_not_once_per_keypress() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/a")]);
+
+        for row in [0usize, 1, 2, 1, 0, 2] {
+            app.list_state.select(Some(row));
+            super::super::pin_cursor_group(&mut app);
+        }
+
+        assert_eq!(
+            app.pinned.len(),
+            1,
+            "同一个项目只 pin 一次：{:?}",
+            app.pinned
+        );
+    }
+
     /// **只剩已停止会话的项目，`x` 拿得掉。**
     ///
     /// 已停止的会话没有进程，拿掉这个组毁不掉任何还活着的东西。按「有没有

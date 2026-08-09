@@ -357,7 +357,7 @@ pub fn run(
                     app.set_sessions(v);
                     app.connected = true;
                     // `pinned` 跟会话列表同一个节奏拉，不是每帧拉：看板上出现
-                    // 哪些组 = 有会话的 ∪ pinned 的，只刷新其中一半会让另一半
+                    // 哪些组 = 有在跑的会话的 ∪ pinned 的，只刷新其中一半会让另一半
                     // 停在旧答案上（别的 dct 窗口 `p` 上来的项目永远不出现，
                     // `x` 掉的项目永远不消失）。
                     if let Ok(Response::Projects { pinned, .. }) =
@@ -387,6 +387,14 @@ pub fn run(
         if app.list_state.selected().is_none() && !app.rows.is_empty() {
             app.list_state.select(Some(0));
         }
+        // 光标也可能是**没按键**落到一个新组上的：开机第一次拉完列表落在第 0
+        // 行、上一行那句兜底、`refresh_rows` 的锚点回落。这几条同样得把脚下
+        // 那个组 pin 住，否则它下一轮就可能自己没了。
+        //
+        // 按键那一路在循环末尾另有一次调用：只留这一处的话，「用户挪到 b」和
+        // 「下一轮 List 报回 b 的会话停了」之间隔着一次 `set_sessions`，b 会
+        // 在被 pin 之前先消失一次。
+        pin_cursor_group(&mut app);
         // 会话可能在两轮之间消失（自己退了、被 s 停掉清了），焦点必须跟着
         // 收回来。不收的话 grid::move_focus 会拿到一个越界的下标——它的
         // debug_assert 就是为这条路径设的，而 release 下越界会算出一个荒唐
@@ -692,6 +700,12 @@ pub fn run(
                 View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             }
         }
+        // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
+        // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
+        // 放在整个 match 之后而不是逐个按键分支里：那些分支散在四个模块里，
+        // 漏一个就是一个「这个项目会在你手没动的时候消失」的洞，而且不会有
+        // 任何编译期信号。已经 pin 上的组直接返回，所以这里不花任何往返。
+        pin_cursor_group(&mut app);
 
         // 退出必须在这里落地，不能拖到循环末尾的收尾代码之后。现在有三条路
         // 会置 quit：Ctrl+Q 在顶层（`back_one_level` 返回 None）、看板上按 q、
@@ -909,6 +923,47 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
 pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
     add_project(app, dir);
     app.view = home_view(app);
+}
+
+/// **光标落在哪个项目上，就把哪个项目 pin 住。**
+///
+/// 这一条是「组不塌陷」在新的成员规则下唯一的支点。组留在看板上的理由是
+/// 「有在跑的会话 ∪ pinned」（见 `view::group_sessions`），于是一个没被 pin
+/// 的组，最后一个会话自己跑完停掉的那一刻就没了——而那可能正是光标**此刻
+/// 站着**的组：`find_anchor` 找不到会话行，也找不到同 dir 的组头，只能退回
+/// 第 0 行。**当前项目在用户没碰键盘的时候变了**，接着的 `n`/`x` 作用在
+/// 另一个项目上。那正是整条分支要消灭的缺陷，也正好违反 spec §三的
+/// 「组不塌陷」。
+///
+/// 让光标所在的组恒为 pinned，这件事在结构上就不可能发生——不必给
+/// `find_anchor` 或 `group_sessions` 加一条「除非光标在里面」的特例（那种
+/// 特例意味着「看板上有哪些组」要看光标在哪，两个本该独立的东西缠在一起）。
+///
+/// 顺带把升级路径关上：`pinned` 是这条分支才有的东西，升级后第一次运行时
+/// 每个既有项目都是没 pin 的，而 `seed_start_project` 因为看板不空而不动手。
+/// 光标第一次落下就把自己那个项目 pin 上了。
+///
+/// **按「组变了没有」发请求，不是按「光标动了没有」**：判据就是这个组自己
+/// 的 `pinned` 标志——已经 pin 上的组直接返回，所以方向键在同一个组里上下
+/// 走一百下，一次往返都不会有。
+pub(crate) fn pin_cursor_group(app: &mut App) {
+    let Some(g) = app.current_group() else {
+        return;
+    };
+    if g.pinned {
+        return;
+    }
+    // 存**原始拼写**，同 `add_project`：`pinned` 同时是组头 name/parent 的
+    // 显示来源，canon 只用于比较。
+    let d = g.display_dir.display().to_string();
+    // 落盘失败不拦路：本地先记上，用户这一次照样不会被抽走脚下的组。
+    let _ = app
+        .client()
+        .and_then(|c| c.call(Request::PinProject { dir: d.clone() }));
+    // `g.pinned` 为假就意味着 `app.pinned` 里没有任何一条跟它 canon 相等
+    // （`group_sessions` 就是这么算出这个标志的），所以直接 push 不会重复。
+    app.pinned.push(d);
+    app.refresh_rows();
 }
 
 /// 上面那五步里**不动视图**的前四步。

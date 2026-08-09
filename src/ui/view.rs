@@ -664,7 +664,11 @@ pub(crate) struct ProjectGroup {
     pub sessions: Vec<crate::session::SessionInfo>,
     /// 这个项目上次用的 agent，底栏那条 `n 新建 <agent>` 要用。
     pub last_profile: Option<String>,
-    /// 由 `p` 摆上来的。`x` 只能移除 pinned 且没有会话的组。
+    /// 这个组被 pin 住了。三个来源：用户按 `p` 摆上来、开机时的启动目录补位、
+    /// 以及**光标落到它上面**（`mod.rs::pin_cursor_group`——脚下那个组必须
+    /// pin 住，否则它的最后一个会话自己停掉时整个组会在用户没按键的时候没了）。
+    ///
+    /// `x` 只能移除 pinned 且**没有在跑的会话**的组（`mod.rs::unpin_current`）。
     pub pinned: bool,
     pub collapsed: bool,
 }
@@ -724,7 +728,12 @@ impl ProjectGroup {
     }
 }
 
-/// 看板上出现哪些项目：**有会话的 ∪ pinned 的**。没有第三种。
+/// 看板上出现哪些项目：**有在跑的会话的 ∪ pinned 的**。没有第三种。
+///
+/// 「在跑的」这个限定是 `x` 能真的拿掉东西的前提（见下面 `retain` 那一段），
+/// 而它的代价——一个组可能在没人按键的时候没了——由「光标所在的组恒为
+/// pinned」兜住（`mod.rs::pin_cursor_group`）：会消失的只有用户从来没去过
+/// 的组。
 ///
 /// 排序是 `BTreeMap<PathBuf, _>` 自带的、`PathBuf` 的 component-wise
 /// `Ord`——不是裸字符串排序，两者在真实目录名上会分道扬镳：
