@@ -141,6 +141,16 @@ pub struct SessionInfo {
     /// 名字猜：那是 profile.toml 里的一个声明（`profile.rs` 的 `is_agent`），
     /// 只有守护进程读得到，猜的迟早会跟真值分叉。
     pub is_agent: bool,
+    /// 这个会话的稳定名字，守护进程在它第一次干完活时起一次，之后不变。
+    ///
+    /// 空串 = 还没起出来（刚建、没配 LLM、不是 agent 会话，或者对面是
+    /// 认不得这个字段的旧守护进程）。**界面遇到空串一律退回 `profile`。**
+    ///
+    /// `#[serde(default)]` 是本版不升 `PROTOCOL_VERSION` 的依据：加纯读
+    /// 字段时旧 JSON 补默认值，而 serde 反序列化本来就忽略不认识的字段，
+    /// 所以新旧界面/守护进程怎么搭配都不会炸，只是没有名字。
+    #[serde(default)]
+    pub tag: String,
 }
 
 struct Session {
@@ -162,6 +172,9 @@ struct Session {
     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
     /// 正持着它。裸 `Option<String>` 编不过。
     explanation_slot: Arc<Mutex<Option<String>>>,
+    /// 会话起名用的槽。跟 `explanation_slot` 平级、同一套用法。
+    /// `None` = 还没触发过起名；`Some(_)` = 已经触发过（**只触发一次**）。
+    name_slot: Arc<Mutex<Option<String>>>,
     /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
     /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
     /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
@@ -373,6 +386,7 @@ impl SessionManager {
             error_re,
             pty,
             explanation_slot: Arc::new(Mutex::new(None)),
+            name_slot: Arc::new(Mutex::new(None)),
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
         };
@@ -418,6 +432,7 @@ impl SessionManager {
             .iter()
             .map(|s| {
                 let s = recover(s.lock());
+                let tag = recover(s.name_slot.lock()).clone().unwrap_or_default();
                 SessionInfo {
                     id: s.id,
                     profile: s.profile.name.clone(),
@@ -425,6 +440,7 @@ impl SessionManager {
                     state: s.state,
                     activity: s.pty.last_line(),
                     is_agent: s.is_agent,
+                    tag,
                 }
             })
             .collect();
@@ -1874,5 +1890,29 @@ mod tests {
     fn scrolling_a_session_that_does_not_exist_says_so() {
         let mgr = SessionManager::new();
         assert!(mgr.scroll(999, ScrollBy::Rows(1)).is_err());
+    }
+
+    /// 旧守护进程发来的 JSON 没有 `tag` 这个字段。必须补成空串而不是
+    /// 反序列化失败 —— 这正是本版**不升协议号**的全部依据（同 `scroll`
+    /// 字段当初的做法，见 `proto.rs` 里那条注释）。
+    #[test]
+    fn session_info_without_a_tag_field_still_parses() {
+        let old = r#"{"id":3,"profile":"claude","dir":"/w/a",
+                      "state":"Idle","activity":"","is_agent":true}"#;
+        let s: SessionInfo = serde_json::from_str(old).expect("旧 JSON 必须还能读");
+        assert_eq!(s.tag, "", "缺字段补空串");
+        assert_eq!(s.id, 3);
+    }
+
+    /// 新建的会话还没起过名。
+    #[test]
+    fn a_fresh_session_has_no_tag() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+
+        let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+        assert_eq!(tag, "");
     }
 }

@@ -666,6 +666,7 @@ mod tests {
             state: SessionState::Idle,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         };
         app.set_sessions(vec![mk(1, &a), mk(2, &b)]);
         app.list_state.select(Some(0));
@@ -940,6 +941,7 @@ mod tests {
             state: crate::session::SessionState::Idle,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }
     }
 

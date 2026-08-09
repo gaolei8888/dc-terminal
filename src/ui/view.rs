@@ -2526,6 +2526,7 @@ mod tests {
             state: SessionState::Idle,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }
     }
 

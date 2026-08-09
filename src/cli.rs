@@ -493,6 +493,7 @@ mod tests {
             state,
             activity: activity.into(),
             is_agent: true,
+            tag: String::new(),
         }
     }
 

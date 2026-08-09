@@ -362,6 +362,7 @@ mod tests {
             state,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }
     }
 
@@ -440,6 +441,7 @@ mod tests {
             state: SessionState::Working,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
         // 行：[组头 a, 会话 1, 组头 b, 会话 2]——先站在 a 的会话上
@@ -476,6 +478,7 @@ mod tests {
             state: SessionState::Working,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
         // 把 b 折起来，再回到 a 的会话上

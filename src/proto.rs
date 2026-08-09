@@ -679,13 +679,14 @@ mod tests {
             state: SessionState::Idle,
             activity: "a".into(),
             is_agent: true,
+            tag: String::new(),
         };
         let shape = serde_json::to_string(&info).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
                 6,
-                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
+                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );

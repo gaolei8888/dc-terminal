@@ -458,6 +458,7 @@ mod tests {
             state: crate::session::SessionState::Idle,
             activity: "背后的看板".into(),
             is_agent: true,
+            tag: String::new(),
         }]);
         open(&mut app);
 
@@ -482,6 +483,7 @@ mod tests {
             state: crate::session::SessionState::Working,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }]);
         app.list_state.select(Some(1));
         open(&mut app);

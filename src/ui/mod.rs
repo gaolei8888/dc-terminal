@@ -2198,6 +2198,7 @@ mod tests {
             state: SessionState::Idle,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }
     }
 
@@ -2507,6 +2508,7 @@ mod tests {
             state: SessionState::Failed,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }]);
         app.explained_failure = Some((1, "上一次贴在这里时看到的旧解释".into()));
 
@@ -2621,6 +2623,7 @@ mod tests {
             state: SessionState::Working,
             activity: String::new(),
             is_agent: false,
+            tag: String::new(),
         }]);
         app.view = View::Board;
 
@@ -2728,6 +2731,7 @@ mod tests {
                 state: SessionState::Working,
                 activity: "正在读取 src/main.rs".into(),
                 is_agent: true,
+                tag: String::new(),
             },
             SessionInfo {
                 id: 2,
@@ -2736,6 +2740,7 @@ mod tests {
                 state: SessionState::Asking,
                 activity: "要用哪个方案？".into(),
                 is_agent: true,
+                tag: String::new(),
             },
         ];
 
@@ -2898,6 +2903,7 @@ mod tests {
             state: SessionState::Working,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }]);
         // 第 0 行是组头，第 1 行才是那个会话。停在组头上等于「没选中会话」，
         // s/u/d 也就都不该写在底栏上——那是对的行为，但不是这些测试要问的。
@@ -2922,6 +2928,7 @@ mod tests {
                 state: SessionState::Working,
                 activity: String::new(),
                 is_agent: true,
+                tag: String::new(),
             },
             SessionInfo {
                 id: 2,
@@ -2930,6 +2937,7 @@ mod tests {
                 state: SessionState::Working,
                 activity: String::new(),
                 is_agent: true,
+                tag: String::new(),
             },
         ]);
         // 行序：组头 a / 会话 1 / 组头 b / 会话 2
@@ -3058,6 +3066,7 @@ mod tests {
             state: SessionState::Working,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }]);
         app.list_state.select(Some(1));
         app.view = View::Board;
@@ -3295,6 +3304,7 @@ mod tests {
             state: SessionState::Working,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }]);
         app.view = View::grid(0);
 
@@ -3415,6 +3425,7 @@ mod tests {
             state: SessionState::Idle,
             activity: "背后的看板".into(),
             is_agent: true,
+            tag: String::new(),
         }]);
         app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
             vec!["/w/other".to_string()],
@@ -3593,6 +3604,7 @@ mod tests {
             state: SessionState::Idle,
             activity: String::new(),
             is_agent: true,
+            tag: String::new(),
         }]);
         app.view = View::Board;
         assert!(
