@@ -86,6 +86,21 @@ cargo build --release
 ./target/release/dct
 ```
 
+To put it on your `PATH` instead of running it out of `target/`:
+
+```
+./scripts/install.sh
+```
+
+That builds, installs to `~/.local/bin` (`--dir` or `DCT_INSTALL_DIR` to put it
+elsewhere), and runs the result once to prove it starts. Use it rather than
+copying the binary over an installed one yourself. On macOS, overwriting the file
+in place while the daemon is still executing it leaves the kernel holding a stale
+code signature for that inode, and the next `dct` you type dies at `exec` with
+nothing but `zsh: killed` to show for it — `codesign -v` will insist the signature
+is fine, because the copy on disk is. `install.sh` writes a new file and renames
+it over the old one, so the new binary always gets a fresh inode.
+
 If you rebuild `dct` while the daemon from before the rebuild is still running, the next start notices, explains that restarting it will end whatever sessions are currently running (file changes stay, the agents don't), and asks before touching anything. Say yes and it swaps the daemon in and reconnects; say no and it carries on with the old one.
 
 ## The board
