@@ -229,7 +229,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .find(|s| s.id == id)
         .map(|s| {
             let project = short_path(&s.dir);
-            if s.tag.is_empty() {
+            // 断连时这一行的预算全部让给警告和退路：`session_title_disconnected`
+            // 已经比连上时多出一整句「连接已断开，画面可能过期」，名字这时候
+            // 是这一行里最不要紧的东西——用户正盯着这个会话看，早就知道自己
+            // 在哪个会话里。断连状态下名字不裁到能放心的宽度、直接不画，
+            // 才保得住尾巴那句「F2 返回看板」——那是这一屏唯一说得出怎么
+            // 离开的地方，而断连恰恰是用户最想找到这条退路的时候。这个分支
+            // 不去凑断连标题本来就超宽的那笔账（连字段都没有 tag 时它已经
+            // 接近 106 列），那是另一件事；这里只保证这个功能不再往里加。
+            if s.tag.is_empty() || !app.connected {
                 project
             } else {
                 // 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS`
@@ -407,6 +415,44 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect()
+    }
+
+    /// 断连时这一行的预算全部让给警告和退路，名字整个不画——不是裁短。
+    ///
+    /// **只测中文（`Lang::Zh`）。** 断连标题本来就比连上时多出一整句「连接
+    /// 已断开，画面可能过期」，这笔账在这次改动之前就已经存在：哪怕名字
+    /// 是空字符串，英文版在 60 列上尾巴的「goes back」也已经被裁没了（探针
+    /// 量过：`"(disconnected, may be out of date) —— F2"`，`goes back`
+    /// 四个字整个不见）。那是另一件事，有自己的宽度测试要补，不该在这条
+    /// 测试里一起断言——这条测试要钉住的是**这个功能没有让它更糟**，而不是
+    /// 顺手把预先就存在的窟窿也堵上。中文版在两个宽度下都放得下尾巴（同样
+    /// 探针量过），所以能干净地证明「名字不裁、直接不画」这个决定本身是够的。
+    #[test]
+    fn a_disconnected_title_drops_the_name_to_save_room_for_the_way_out() {
+        use ratatui::backend::TestBackend;
+
+        for width in [80u16, 60] {
+            let (mut app, _dir) = App::test_app();
+            app.connected = false;
+            let mut s = session(1, SessionState::Idle);
+            s.dir = "/w/a".into();
+            s.tag = "修".repeat(24);
+            app.set_sessions(vec![s]);
+            app.view = View::Attached(1);
+
+            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+            let c = screen_text(&term);
+            assert!(
+                c.contains("F2返回看板"),
+                "{width} 列下断连标题丢了退出提示：{c}"
+            );
+            assert!(
+                !c.contains('修'),
+                "{width} 列下断连标题不该再画名字，它把预算让给了警告和退路：{c}"
+            );
+        }
     }
 
     /// 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS` 给的是
