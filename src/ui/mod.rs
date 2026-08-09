@@ -1260,6 +1260,14 @@ pub(crate) fn create_session(
         app.profiles.insert(dir.to_string(), profile.to_string());
         app.profiles_asked.insert(dir.to_string());
     }
+    // 复制模式不能从上一个会话粘到这个新建的来——跟 `enter_session` 对应
+    // 位置的注释是同一件事：这里和 `enter_session` 一起，是「进」这一侧
+    // 仅有的两个入口，合起来才盖得住所有会落到 `View::Attached` 的路径
+    // （选择器建会话、密钥验证通过后建会话、`n`/`N` 快速建会话都经这里）。
+    // 不看 `r` 是否真的建成才复位：建失败时调用方本来就不会真的切进
+    // `View::Attached`，复位一次不占谁的便宜，也不用为了「只在成功时」
+    // 再包一层判断。
+    app.copy_mode = false;
     r
 }
 
@@ -1277,11 +1285,16 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 又回来之间恢复过、再坏过一次，缓存里那份还是上上次失败的旧话，
     // 不清掉的话 `run()` 主循环会以为「问过了」，永远不会去问新的那次。
     app.explained_failure = None;
-    // 上一个会话的复制模式不能粘到这一个来。**在「进入」这一侧复位**，
-    // 不在三条离开的路上各写一次：`enter_session` 是所有进会话路径的唯一
-    // 漏斗（看板 Enter、九宫格 Enter、F3 都走它），而离开有三条路，其中
-    // Ctrl+Q 那条走的是 `back_one_level`——一个所有视图共用的纯函数，
-    // 为这一个字段改它的签名不值。漏斗上写一次，结构上就漏不掉。
+    // 上一个会话的复制模式不能粘到这一个来。**在「进入」这一侧复位**——
+    // 进 `View::Attached` 的路不止一条（看板 Enter、九宫格 Enter、F3 都走
+    // 这个函数，但选择器建会话、密钥验证通过后建会话、`n`/`N` 快速建会话
+    // 走的是 `create_session`，见 `run()` 里鼠标捕获那段注释）。真正撑住
+    // 「复位一次就漏不掉」的不是某一个函数是唯一入口，而是**进的这一侧
+    // 一共只有 `enter_session` 和 `create_session` 两个构造器，合起来盖住
+    // 所有会落到 `View::Attached` 的路径**——这里复位一次，`create_session`
+    // 里再复位一次，两处就覆盖完了。反过来，离开有三条路，其中 Ctrl+Q
+    // 那条走的是 `back_one_level`——一个所有视图共用的纯函数，为这一个
+    // 字段改它的签名不值，所以选在「进」而不是「出」的这几处写。
     //
     // 留在看板上的那个 `copy_mode` 是无害的：`wants_mouse_capture` 的第一个
     // 条件就是「贴在会话里」，不在会话里时它压根不参与判断。
@@ -2394,6 +2407,35 @@ mod tests {
             app.profiles.is_empty() && app.profiles_asked.is_empty(),
             "装 CLI 的那个 shell 会话不是用户选的 agent，不该被记住"
         );
+    }
+
+    /// `create_session` 是「进」这一侧另一个构造器（另一个是 `enter_session`，
+    /// 见 `attach::tests::entering_a_session_always_starts_outside_copy_mode`）。
+    /// 选择器建会话、密钥验证通过后建会话、`n`/`N` 快速建会话都经这里落进
+    /// `View::Attached`，`enter_session` 一个都不会经过——如果这里不复位，
+    /// 从一个开着复制模式的会话按 F2 回看板、再按 `n` 新建一个会话，新会话
+    /// 会带着上一个会话的复制模式出生，鼠标捕获照样是关的，而用户不知道
+    /// 为什么鼠标点了没反应。
+    #[test]
+    fn create_session_resets_copy_mode_for_a_freshly_created_session() {
+        use crate::client::Client;
+
+        let (sock, _home) = start_daemon_for_test();
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().display().to_string();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+        app.copy_mode = true;
+
+        let r = create_session(&mut app, &dir, "shell", false);
+        assert!(matches!(r, Ok(Response::Created { .. })), "前提：{r:?}");
+
+        assert!(!app.copy_mode, "上一个会话的复制模式不能粘到新建的这一个上");
     }
 
     /// **建会话只有一个入口。** 三个调用点各记一次缓存的写法撑不住下一个

@@ -376,9 +376,11 @@ mod tests {
     /// 一定从「鼠标归 agent」开始。
     ///
     /// 在**进入**这一侧复位，而不是在三条离开的路上各写一次：`enter_session`
-    /// 是所有进会话路径的唯一漏斗（看板 Enter、九宫格 Enter、F3 都走它），
-    /// 而离开有三条路，其中 Ctrl+Q 那条走的是 `back_one_level`——一个所有视图
-    /// 共用的纯函数，为这一个字段改它的签名不值。漏斗上写一次，结构上就漏不掉。
+    /// 只是「进」这一侧两个构造器之一（另一个是 `create_session`，见
+    /// `create_session_resets_copy_mode_for_a_freshly_created_session`），
+    /// 两处合起来才盖住所有会落到 `View::Attached` 的路径。而离开有三条路，
+    /// 其中 Ctrl+Q 那条走的是 `back_one_level`——一个所有视图共用的纯函数，
+    /// 为这一个字段改它的签名不值。
     #[test]
     fn entering_a_session_always_starts_outside_copy_mode() {
         let (mut app, _d) = App::test_app();
