@@ -190,6 +190,8 @@ pub enum Key {
     NoSessionSelected,
     DaemonUnreachable,
     StaleData,
+    /// 复制模式下顶掉整条底栏右段的提示
+    CopyMode,
     // —— 会话状态（看板与九宫格的状态列）——
     // —— dct ps / dct stop（普通终端里用，不开界面）——
     NoDaemonRunning,
@@ -525,6 +527,12 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Cannot reach the dct service — what you see may be out of date",
             zh: "守护进程连不上，界面数据可能已过期",
+        ),
+
+        CopyMode => t!(
+            lang,
+            en: "Copy mode · mouse released · F4 exits",
+            zh: "复制模式 · 鼠标已交还终端 · F4 退出"
         ),
     }
 }
@@ -1263,6 +1271,7 @@ mod tests {
             NoSessionSelected,
             DaemonUnreachable,
             StaleData,
+            CopyMode,
             NoDaemonRunning,
             NoSessionsRunning,
             NothingToPrune,
@@ -1331,7 +1340,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 97, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

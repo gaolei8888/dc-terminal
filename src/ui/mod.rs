@@ -1933,12 +1933,17 @@ fn draw(f: &mut Frame, app: &mut App) {
         // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
         // 只在 `message` 为空这一支里问它：`message` 优先在外层 if/else
         // 链上已经保证了（见函数头注释），这里不用重复判断。
-        let scroll_hint = match &app.view {
+        // 复制模式压过滚动提示：这时候滚轮根本不归 dct 管，那条提示是错的。
+        // 压不过错误消息——外层 if/else 链已经保证了这一点。
+        let hint = match &app.view {
+            View::Attached(_) if app.copy_mode => {
+                Some(crate::i18n::text(crate::i18n::Key::CopyMode, app.lang).to_string())
+            }
             View::Attached(_) => attach::scroll_hint(&app.scroll, app.lang),
             _ => None,
         };
-        match scroll_hint {
-            Some(hint) => (BarContent::Text(hint), Style::default()),
+        match hint {
+            Some(h) => (BarContent::Text(h), Style::default()),
             None => (BarContent::Keys(bar_keys(app, help_cols)), Style::default()),
         }
     } else if app.message.error {
@@ -3736,6 +3741,80 @@ mod tests {
 
         assert!(c.contains("已切到某个项目"), "消息该赢，没显示出来：{c}");
         assert!(!c.contains("按End回到底部"), "滚动提示不该盖过消息：{c}");
+    }
+
+    /// 模式看不见就是下一个隐形状态，而这个仓库刚花一整轮改造消灭掉那种东西。
+    #[test]
+    fn copy_mode_says_so_in_the_bar() {
+        use ratatui::backend::TestBackend;
+
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
+            app.lang = lang;
+            app.copy_mode = true;
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+
+            let bar = bar_text(&term);
+            let hint = crate::i18n::text(crate::i18n::Key::CopyMode, lang);
+            assert!(
+                bar.contains(&hint.replace(' ', "")),
+                "{lang:?} 下底栏要写着复制模式：{bar}"
+            );
+        }
+    }
+
+    /// 优先级：错误消息 > 复制模式 > 滚动提示。
+    ///
+    /// 复制模式压过滚动提示，是因为在复制模式下滚轮根本不归 dct 管，
+    /// 那条提示这时候是错的；而错误消息压过复制模式，是因为出错是一次性的、
+    /// 不说就再也没机会说，复制模式则是个持续状态，下一帧还会写。
+    #[test]
+    fn an_error_beats_copy_mode_which_beats_the_scroll_hint() {
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
+        app.copy_mode = true;
+        app.scroll = crate::session::ScrollState {
+            offset: 5,
+            max: 100,
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let hint = crate::i18n::text(crate::i18n::Key::CopyMode, app.lang);
+        assert!(
+            bar_text(&term).contains(&hint.replace(' ', "")),
+            "复制模式压过滚动提示"
+        );
+
+        app.message = Msg::err("出事了".into());
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(bar_text(&term).contains("出事了"), "错误消息压过复制模式");
+    }
+
+    /// 80 是我们支持的最窄终端，右段只有 39 列，而 `wrap_help` 不拆单空格的
+    /// 句子——写长了不会折行，会被 `Paragraph` 悄悄切掉尾巴。两种语言都要
+    /// 在这个宽度下把复制模式的提示完整放出来，一个字都不能少。
+    #[test]
+    fn copy_mode_hint_survives_eighty_columns_in_both_languages() {
+        use ratatui::backend::TestBackend;
+
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
+            app.lang = lang;
+            app.copy_mode = true;
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+
+            let bar = bar_text(&term);
+            let hint = crate::i18n::text(crate::i18n::Key::CopyMode, lang);
+            assert!(
+                bar.contains(&hint.replace(' ', "")),
+                "{lang:?} 在 80 列下要完整显示复制模式提示，不能被切掉尾巴：{bar}"
+            );
+        }
     }
 
     /// F6 回归测试：英文滚动提示走的是 `BarContent::Text`，`wrap_help`
