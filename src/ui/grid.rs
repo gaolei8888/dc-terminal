@@ -1162,28 +1162,36 @@ mod tests {
 
     /// **被拒绝的 `x` 必须一动不动。**
     ///
-    /// `unpin_current` 只拿得掉空组，非空的会被拒绝、底栏红字说一句。那句话
-    /// 说的是「什么都没发生」——所以这时候**尤其**不能顺手对齐光标：`Tab` 到
-    /// 一个只剩已停止会话的项目上时焦点是陈旧的（还留在别人家的格子里），
+    /// `unpin_current` 只拿得掉没有**在跑**的会话的组，还有活会话的会被拒绝、
+    /// 底栏红字说一句。那句话说的是「什么都没发生」——所以这时候**尤其**不能
+    /// 顺手对齐光标：这一刻焦点很可能是陈旧的（还留在别人家的格子里），
     /// 对齐一次就把当前项目悄悄换走了。用户接着按 `n`，会话开进了另一个项目，
     /// 而屏幕刚刚告诉过他这一下没生效——「说没发生、其实发生了」是最坏的组合。
+    ///
+    /// 「拒绝 + 焦点陈旧」现在只有这一种造得出来的组合（已停止的会话不再
+    /// 挡住 `x`）：`Tab` 到一个空项目上（焦点故意留旧），后台那一轮 `List`
+    /// 把一个活会话捎进了这个项目——没有任何东西会顺手把焦点挪进去。
     ///
     /// 两条断言缺一不可：只断言那句话的话，坏代码照样通过。
     #[test]
     fn a_refused_x_changes_nothing_at_all() {
         let (mut app, _dir) = App::test_app();
-        let mut stopped = session_in(9, "/w/z");
-        stopped.state = SessionState::Stopped;
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
+        app.set_sessions(vec![session_in(1, "/w/a")]);
         app.view = View::grid(0);
 
-        // z 有会话（虽然停了），所以拿不掉；焦点此刻是陈旧的，指着 a 的格子
+        // 换到空项目 z：它在九宫格里没有格子，焦点故意留旧，指着 a 的格子
         handle_key(&mut app, key(KeyCode::Tab)).unwrap();
         assert_eq!(
             app.current_group().map(|g| g.name.clone()),
             Some("z".to_string()),
             "前提：已经换到 z 了"
+        );
+        // 后台轮询：z 拿到一个活会话，于是 `x` 会被拒绝，而焦点还是旧的
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(5, "/w/z")]);
+        assert!(
+            matches!(app.view, View::Grid { focus: 0, .. }),
+            "前提：焦点还指着 a"
         );
 
         handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
@@ -1214,6 +1222,10 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         let mut stopped = session_in(9, "/w/zz");
         stopped.state = SessionState::Stopped;
+        // zz 只有一个已停止的会话，所以它必须是 pinned 的才留得在看板上
+        // （见 `group_sessions` 的成员规则）——这条测试问的是「全停的项目
+        // 不等于焦点陈旧」，不是「它凭什么在看板上」。
+        app.pinned = vec!["/w/zz".into()];
         app.set_sessions(vec![session_in(2, "/w/b"), session_in(3, "/w/b"), stopped]);
         // 行是 [组头 b, 2, 3, 组头 zz, 9]：光标停在 zz 的那个已停止会话上
         app.list_state.select(Some(4));

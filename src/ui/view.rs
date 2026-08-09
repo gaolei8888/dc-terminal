@@ -698,6 +698,22 @@ impl ProjectGroup {
             .map(|s| s.id)
     }
 
+    /// 这个项目里还有没有**在跑**的东西。
+    ///
+    /// 「还有会话吗」这个问题在看板上有两种答案，而要紧的是这一种：已停止的
+    /// 会话没有进程，它留在列表里只为了 `u` 回滚和 `d` 看改动。所以：
+    ///
+    /// - `x` 拿不拿得掉这个组（`mod.rs::unpin_current` 的拒绝判据）
+    /// - 底栏和 `?` 浮层写不写 `x 移除`（`help_ctx_for` 的 `can_remove`）
+    /// - 这个组凭什么留在看板上（`group_sessions` 的成员规则）
+    ///
+    /// 三处问的是同一件事，所以只有这一个判据。三处各写一个
+    /// `sessions.is_empty()` 的话，它们会分岔——这条分支已经因为完全一样的
+    /// 形状产出过四条评审意见了。
+    pub fn has_live_session(&self) -> bool {
+        self.first_live().is_some()
+    }
+
     /// 这个项目里有几个会话出错了。组头上要用红字点出来——
     /// 会话静默失败是 dct 最贵的失败模式。
     pub fn failed(&self) -> usize {
@@ -753,6 +769,24 @@ pub(crate) fn group_sessions(
     for p in &pinned_keys {
         buckets.entry(p.clone()).or_default();
     }
+    // **已停止的会话不足以让一个组留在看板上。** 它没有进程，留着只为了
+    // `u`/`d`；一个只剩已停止会话、又没被 `p` 摆上来的项目，是用户从没
+    // 要求过的一行——看板会这样一直攒下去，攒到再也找不到自己手头那几个。
+    //
+    // 这也是 `x` 能真的拿掉东西的前提：`x` 只做 unpin，而组的另一半来源是
+    // 「有会话」。少了这一条，`x` 一个只剩已停止会话的项目会取消 pin、
+    // 然后那一行原样留在屏幕上——按下去什么都没发生，正是这一版要消灭的
+    // 「屏幕和状态各说各话」。
+    //
+    // 代价（用户已经权衡过并接受）：那些已停止会话的 `u`/`d` 从看板上没了
+    // 入口，除非用 `p` 把这个项目重新摆回来——会话本身还在守护进程里，
+    // 摆回来就一起回来，什么都没被删。
+    buckets.retain(|dir, sessions| {
+        pinned_keys.contains(dir)
+            || sessions
+                .iter()
+                .any(|s| s.state != crate::session::SessionState::Stopped)
+    });
 
     buckets
         .into_iter()

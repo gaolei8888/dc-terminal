@@ -882,11 +882,12 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
             is_agent: s.is_agent,
             state: s.state,
         }),
-        // `x` 只拿得掉「pinned 且没有会话」的组，跟 `unpin_current` 的两条
-        // 守卫逐条对上——底栏说什么就得真能做到什么。
+        // `x` 只拿得掉「pinned 且没有在跑的会话」的组，跟 `unpin_current`
+        // 的两条守卫逐条对上——底栏说什么就得真能做到什么。判据是同一个
+        // `has_live_session`，不是另写一个 `sessions.is_empty()`。
         can_remove: app
             .current_group()
-            .map(|g| g.pinned && g.sessions.is_empty())
+            .map(|g| g.pinned && !g.has_live_session())
             .unwrap_or(false),
         // 跟 `jump_project` 逐条对上：0 个组直接 return，1 个组
         // `rem_euclid(1)` 恒为 0（原地不动）。两种都不该写这个键。
@@ -936,10 +937,17 @@ pub(crate) fn add_project(app: &mut App, dir: std::path::PathBuf) {
     }
 }
 
-/// `x`：把光标所在的**空**组从看板上拿掉。
+/// `x`：把光标所在的组从看板上拿掉。
 ///
-/// 还有会话就拒绝，红字说一句。「顺便把这些会话都停掉」是个用户没要求过的
-/// 复合破坏动作，而 `s` 已经能一个一个停——一次拒绝比一次多做好解释得多。
+/// 还有**在跑**的会话就拒绝，红字说一句。「顺便把这些会话都停掉」是个用户
+/// 没要求过的复合破坏动作，而 `s` 已经能一个一个停——一次拒绝比一次多做
+/// 好解释得多。
+///
+/// **已停止的会话不算数**（判据是 `ProjectGroup::has_live_session`，跟
+/// `can_remove` 共用一个）。它没有进程，拿掉这个组毁不掉任何还活着的东西。
+/// 按「有没有会话」拒绝的话会拒出一个死局：一个只剩已停止会话的项目永远
+/// 下不了看板，而 `x` 连写都不写，那句「先停掉才能移除」指的又正是用户
+/// 刚做过的事——唯一的出路是去另一个终端敲 `dct prune`。
 ///
 /// **返回「真的拿掉了吗」。** 三条 return 里有两条是拒绝，一条是无事可做，
 /// 它们跟成功那条对屏幕的影响完全不同，调用方必须分得开：九宫格那边成功之后
@@ -952,13 +960,14 @@ pub(crate) fn unpin_current(app: &mut App) -> bool {
     let Some(g) = app.current_group() else {
         return false;
     };
-    if !g.sessions.is_empty() {
+    if g.has_live_session() {
         app.message = Msg::err(crate::i18n::text(crate::i18n::Key::GroupNotEmpty, app.lang).into());
         return false;
     }
-    // 组能出现在看板上只有两个理由：有会话、或者被 pin 了。上面已经排掉
-    // 前者，所以走到这儿的必然是 pinned——真不是（结构上到不了）就什么
-    // 都不做，而不是发一个守护进程认不出的 unpin。
+    // 组能出现在看板上只有两个理由：有**在跑**的会话、或者被 pin 了
+    // （见 `group_sessions` 的成员规则）。上面已经排掉前者，所以走到这儿的
+    // 必然是 pinned——真不是（结构上到不了）就什么都不做，而不是发一个
+    // 守护进程认不出的 unpin。
     if !g.pinned {
         return false;
     }

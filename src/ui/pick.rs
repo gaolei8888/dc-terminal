@@ -1058,6 +1058,80 @@ mod tests {
         assert!(app.pinned.is_empty());
     }
 
+    /// **只剩已停止会话的项目，`x` 拿得掉。**
+    ///
+    /// 已停止的会话没有进程，拿掉这个组毁不掉任何还活着的东西。按「有没有
+    /// 会话」拒绝会拒出一个死局：这个项目永远下不了看板，底栏连 `x` 都不写，
+    /// 而那句「先停掉才能移除」说的正是用户刚做过的事——唯一的出路是去
+    /// 另一个终端敲 `dct prune`，而 TUI 里根本没有这个键。
+    ///
+    /// 断言到「这一行真的没了」，不只是「函数返回了 true」：`x` 只做 unpin，
+    /// 而组还有第二个来源（有会话）——只改拒绝判据的话，这一行会原样留在
+    /// 屏幕上，按下去什么都不发生。
+    #[test]
+    fn x_removes_a_project_that_only_holds_stopped_sessions() {
+        let (mut app, _d) = App::test_app();
+        let mut done = sess_in(9, "/w/z");
+        done.state = crate::session::SessionState::Stopped;
+        app.pinned = vec!["/w/z".to_string()];
+        app.set_sessions(vec![sess_in(1, "/w/a"), done]);
+        // 行：[组头 a, 1, 组头 z, 9]——光标停到 z 上
+        app.list_state.select(Some(2));
+        assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
+
+        assert!(super::super::unpin_current(&mut app), "拿得掉");
+
+        assert!(
+            !app.groups.iter().any(|g| g.name == "z"),
+            "那一行必须真的从看板上没了，而不是取消 pin 之后原样留着"
+        );
+        assert!(app.message.text.is_empty(), "成功不该报错");
+    }
+
+    /// 反过来：还有**在跑**的会话就照旧拒绝，并且说那句话——这时候
+    /// 「先停掉才能移除」是真能照做的建议。
+    #[test]
+    fn x_still_refuses_a_project_with_a_running_session() {
+        let (mut app, _d) = App::test_app();
+        app.pinned = vec!["/w/z".to_string()];
+        app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(9, "/w/z")]);
+        app.list_state.select(Some(2));
+        assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
+
+        assert!(!super::super::unpin_current(&mut app), "拿不掉");
+
+        assert!(app.groups.iter().any(|g| g.name == "z"), "组还在");
+        assert!(
+            app.message.error && !app.message.text.is_empty(),
+            "要红字说一句"
+        );
+    }
+
+    /// 底栏和 `?` 浮层写不写 `x 移除`，跟它拿不拿得掉必须逐条对上——
+    /// 屏幕上写着做不到的操作比不写更糟，而一个做得到却不写的键，
+    /// 用户永远找不到。
+    #[test]
+    fn the_bar_offers_x_on_a_project_that_only_holds_stopped_sessions() {
+        let (mut app, _d) = App::test_app();
+        let mut done = sess_in(9, "/w/z");
+        done.state = crate::session::SessionState::Stopped;
+        app.pinned = vec!["/w/z".to_string()];
+        app.set_sessions(vec![sess_in(1, "/w/a"), done]);
+        app.list_state.select(Some(2));
+
+        assert!(
+            super::super::help_ctx_for(&app, &View::Board).can_remove,
+            "拿得掉就得写出来"
+        );
+
+        // 换成一个在跑的会话：同一个位置，答案必须翻过来
+        app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(9, "/w/z")]);
+        assert!(
+            !super::super::help_ctx_for(&app, &View::Board).can_remove,
+            "拿不掉就不许写"
+        );
+    }
+
     /// **开机补位是后台路径，不许换用户正看着的那一屏。**
     ///
     /// 它挂在第一次 `List` **成功**之后。守护进程慢上几轮的话，用户完全
