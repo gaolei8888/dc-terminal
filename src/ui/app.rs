@@ -277,6 +277,12 @@ impl App {
             .list_state
             .selected()
             .and_then(|i| super::view::anchor_of(&self.groups, &self.rows, i));
+        // 九宫格焦点也要按身份锚定。**必须在重算之前取**，理由同上面那行：
+        // 重算之后取到的是新列表里的东西，等于没锚。
+        let grid_anchor = match &self.view {
+            View::Grid { focus, .. } => self.grid_sessions().get(*focus).map(|s| s.id),
+            _ => None,
+        };
         // 折叠状态是用户的选择，重算不能把它抹掉
         let collapsed: Vec<PathBuf> = self
             .groups
@@ -298,9 +304,17 @@ impl App {
             .or(if self.rows.is_empty() { None } else { Some(0) });
         self.list_state.select(next);
 
-        let grid_last = self.grid_sessions().len().saturating_sub(1);
+        // 焦点是身份，不是位置。会话增删会让格子整体平移，只夹取的话
+        // 焦点会静默指到别的会话上 —— 而 `i` 的收件人、`Enter` 放大的
+        // 那一格、`s`/`u` 作用的对象全都取自它，后两个不可撤销。
+        // 锚点找不回来（那个会话真没了）才退回夹取。
+        let visible_ids: Vec<u32> = self.grid_sessions().iter().map(|s| s.id).collect();
+        let grid_last = visible_ids.len().saturating_sub(1);
         if let View::Grid { focus, .. } = &mut self.view {
-            *focus = (*focus).min(grid_last);
+            let clamped = (*focus).min(grid_last);
+            *focus = grid_anchor
+                .and_then(|id| visible_ids.iter().position(|x| *x == id))
+                .unwrap_or(clamped);
         }
     }
 
@@ -409,6 +423,48 @@ mod tests {
                 .selected()
                 .is_some_and(|i| i < app.rows.len()),
             "光标也必须还落在一行真实存在的行上"
+        );
+    }
+
+    /// 焦点是**身份**，不是位置。前面的会话没了，格子整体前移，焦点必须
+    /// 还站在原来那个会话上。
+    ///
+    /// **焦点必须停在中间**：停在最后一格时，`min(focus, grid_last)` 的
+    /// 结果碰巧跟身份锚定一致（两者移动同样的距离），这个 bug 就藏起来了。
+    ///
+    /// 不修的话：`i 回一句` 的收件人取自 `visible.get(focus)`
+    /// （`grid.rs`），焦点漂到哪儿消息就发给谁 —— 而 `s`（停止）和
+    /// `u`（回滚）走同一条路，两个都不可撤销。
+    #[test]
+    fn refresh_rows_keeps_the_grid_focus_on_the_same_session() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![
+            sess(1, "/w/a"),
+            sess(2, "/w/a"),
+            sess(3, "/w/a"),
+            sess(4, "/w/a"),
+        ]);
+        app.view = View::grid(2); // 焦点在 3 号身上，中间那一格
+
+        // 1 号跑完停了。九宫格不画已停止的会话，后面三格整体前移一位。
+        let mut gone = sess(1, "/w/a");
+        gone.state = crate::session::SessionState::Stopped;
+        app.set_sessions(vec![
+            gone,
+            sess(2, "/w/a"),
+            sess(3, "/w/a"),
+            sess(4, "/w/a"),
+        ]);
+
+        let visible = app.grid_sessions();
+        assert_eq!(visible.len(), 3, "已停止的那个不进九宫格");
+        let View::Grid { focus, .. } = app.view else {
+            panic!("还该在九宫格里");
+        };
+        assert_eq!(
+            visible[focus].id, 3,
+            "焦点必须还站在 3 号身上，实际站在 {} 号上",
+            visible[focus].id
         );
     }
 
