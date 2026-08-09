@@ -219,16 +219,27 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     };
     // 标题显示用户当初指定的项目目录，不是内部的 worktree 路径——
     // 给用户看 .git/dct-worktrees/s2 只会让他不知道自己在哪。
-    let project = app
+    //
+    // 有名字就把它接在项目后面。**不动 `session_title` 的签名**：那两条
+    // i18n 词条已经被宽度测试盯着，往里加参数等于要同时改两种语言的
+    // 句式；接在 `project` 后面是纯拼接，句式不动。
+    let here = app
         .sessions
         .iter()
         .find(|s| s.id == id)
-        .map(|s| short_path(&s.dir))
+        .map(|s| {
+            let project = short_path(&s.dir);
+            if s.tag.is_empty() {
+                project
+            } else {
+                format!("{project} · {}", s.tag)
+            }
+        })
         .unwrap_or_default();
     let title = if app.connected {
-        crate::i18n::msg::session_title(app.lang, id, &project)
+        crate::i18n::msg::session_title(app.lang, id, &here)
     } else {
-        crate::i18n::msg::session_title_disconnected(app.lang, id, &project)
+        crate::i18n::msg::session_title_disconnected(app.lang, id, &here)
     };
     f.render_widget(
         Paragraph::new(screen_to_lines(&app.screen)).block(

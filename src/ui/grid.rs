@@ -11,7 +11,9 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use super::app::App;
 use super::view::{is_plain_key, reply_key, Draft, Reply, View};
 use super::widgets::Msg;
-use super::widgets::{char_width, pad_to, screen_to_lines, status_label, status_style};
+use super::widgets::{
+    char_width, pad_to, screen_to_lines, session_label, status_label, status_style, truncate,
+};
 use super::{dim, session_action};
 use crate::i18n::{text, Key, Lang};
 use crate::proto::ScreenEntry;
@@ -357,7 +359,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         let who = visible
             .iter()
             .find(|s| s.id == draft.id)
-            .map(|s| format!("{} {}", s.id, s.profile))
+            .map(|s| format!("{} {}", s.id, session_label(s)))
             // 收件人在打字途中被停掉了。仍然照实写出 id——用户得看得见
             // 自己正在对谁说话，哪怕那个会话刚没了。
             .unwrap_or_else(|| draft.id.to_string());
@@ -466,7 +468,11 @@ fn draw_grid(
             // 跟列表的 `highlight_symbol` 同一个符号：两个模式看起来才是
             // 同一件事。
             Span::raw(if focused { "▶" } else { " " }),
-            Span::raw(format!("{} {} ", info.id, info.profile)),
+            Span::raw(format!(
+                "{} {} ",
+                info.id,
+                truncate(session_label(info), 20)
+            )),
             Span::styled(
                 format!("{} ", status_label(info.state, lang)),
                 status_style(info.state),
@@ -2334,6 +2340,35 @@ mod tests {
         let c = grid_text(&mut app);
         assert!(c.contains("2claude"), "回复行要写明发给谁：{c}");
         assert!(c.contains("继续"), "打的字要显示出来：{c}");
+    }
+
+    /// 回复框写的是名字，不是 `3 claude` —— 一个项目挂三个 claude 时，
+    /// 后者三处写的东西一模一样，用户没法在按 Enter 之前核对发给了谁。
+    #[test]
+    fn the_reply_box_is_addressed_by_name() {
+        let (mut app, _dir) = App::test_app();
+        // 另外两个会话的 profile 换成 codex：只有这样才能断言屏幕上没有
+        // "claude" 这几个字——目标会话的 profile 恰好也是 claude，如果
+        // 别的格子还留着 claude，负向断言就会被它们污染。
+        let mut sessions: Vec<SessionInfo> = (1..=3)
+            .map(|i| {
+                let mut s = session(i, SessionState::Idle);
+                s.profile = "codex".into();
+                s
+            })
+            .collect();
+        sessions[1].profile = "claude".into();
+        sessions[1].tag = "修登录白屏".into();
+        app.set_sessions(sessions);
+        app.view = View::grid(1);
+        handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+
+        let c = grid_text(&mut app);
+        assert!(
+            c.contains("2修登录白屏"),
+            "回复行要写名字，不是 profile：{c}"
+        );
+        assert!(!c.contains("claude"), "有名字就不该再露出 profile：{c}");
     }
 
     /// 空框时要把「直接回车 = 同意」写出来。这是最高频的用法，不写的话

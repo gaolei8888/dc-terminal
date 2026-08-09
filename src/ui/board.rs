@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use super::app::App;
 use super::view::is_plain_key;
-use super::widgets::{pad_to, status_label, status_style, truncate};
+use super::widgets::{pad_to, session_label, status_label, status_style, truncate};
 use super::{dim, open_new_session, open_project_picker, open_secrets, session_action};
 use crate::i18n::{msg, text, Key};
 
@@ -203,10 +203,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                         pad_to(status_label(s.state, app.lang), 8),
                         status_style(s.state),
                     ));
-                    spans.push(Span::raw(pad_to(&s.profile, 10)));
+                    // 名字比原来的 profile 那一格宽（10 → 16）：profile 名最长
+                    // 8 列，名字是 12 个汉字。多出来的 6 列从 activity 那边收，
+                    // 整行总宽不变。传 15 给 truncate 而不是 16 —— 它真裁了的
+                    // 时候返回的是 max + 1 列（那个 `…` 是长度判断之后才追加的），
+                    // 照 16 传的话省略号会把列宽顶宽一格。
+                    spans.push(Span::raw(pad_to(&truncate(session_label(s), 15), 16)));
                     // 会话行不重复项目名——组头已经说了，宽度还给 activity，
                     // 它是屏幕上最先被截断的信息。
-                    spans.push(Span::raw(truncate(&s.activity, 76)));
+                    spans.push(Span::raw(truncate(&s.activity, 70)));
                 }
             }
             ListItem::new(Line::from(spans))

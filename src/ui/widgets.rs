@@ -160,6 +160,19 @@ pub(crate) fn pad_to(s: &str, width: usize) -> String {
     out
 }
 
+/// 界面上代表一个会话的那一段文字：有名字就是名字，没有就退回 profile。
+///
+/// **四个视图共用这一个答案处。** 各判各的迟早分叉成「列表写着名字、
+/// 格子写着 claude」，而这个功能存在的全部理由就是让同一个会话在哪儿
+/// 看都是同一个东西。
+pub(crate) fn session_label(s: &crate::session::SessionInfo) -> &str {
+    if s.tag.is_empty() {
+        &s.profile
+    } else {
+        &s.tag
+    }
+}
+
 /// 把 $HOME 缩成 ~，界面上路径太长会被裁掉。
 pub(crate) fn short_path(p: &str) -> String {
     match std::env::var("HOME") {
@@ -641,5 +654,23 @@ mod tests {
         assert!(!m.error);
         assert_eq!(m.text, "完成");
         assert!(Msg::err("炸了".into()).error);
+    }
+
+    /// 「画哪一段」只有这一个答案处。散在四个视图里各判一次，迟早分叉成
+    /// 「列表写着名字、格子写着 profile」。
+    #[test]
+    fn session_label_falls_back_to_the_profile_when_there_is_no_tag() {
+        let mut s = crate::session::SessionInfo {
+            id: 3,
+            profile: "claude".into(),
+            dir: "/w/a".into(),
+            state: crate::session::SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+            tag: String::new(),
+        };
+        assert_eq!(session_label(&s), "claude");
+        s.tag = "修登录白屏".into();
+        assert_eq!(session_label(&s), "修登录白屏");
     }
 }
