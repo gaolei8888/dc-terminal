@@ -37,6 +37,13 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 同时多了 `Request::PinProject` / `Request::UnpinProject`，
 /// `Response::Projects` 从 `Vec<String>` 换成了带 `recent` / `pinned`
 /// 两个具名字段的结构体。
+///
+/// 6（事后追加，没有加一）= `SessionInfo` 又多了 `tag`（会话的稳定名字，
+/// 空串表示还没起出来）。没有跟着把版本号加一，是因为这个字段带
+/// `#[serde(default)]` 且纯只读，没有新增或改动任何 `Request` 变体——
+/// 旧守护进程不需要「懂」它，只是答复里多了一段旧进程从不读的文本。
+/// 具体的允许条件和「这不能当先例」的警告见
+/// `the_session_info_shape_is_pinned_too` 测试上的注释。
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 对面那个守护进程能不能用。
@@ -670,6 +677,24 @@ mod tests {
     /// 给 `SessionInfo` 加 `is_agent` 正是改在回程上：旧守护进程回的 JSON
     /// 里没这个字段，新界面 `from_str` 直接失败，症状是看板一个会话都没有。
     /// 回程的形状同样是契约，同样要钉。
+    ///
+    /// **2026-08-09 的例外，写清楚不然会被误读成先例**：这条测试的期望字符串
+    /// 尾部多了 `,"tag":""`，`PROTOCOL_VERSION` 却没跟着加一。这不是「顺手
+    /// 把期望值改掉就让测试重新变绿」——2026-08-05 那次事故（见本文件顶部
+    /// 的版本变更记录）正是这个动作本身，这条测试存在的全部目的就是让那个
+    /// 动作红。允许这次例外只因为同时满足两个条件：
+    ///
+    /// 1. `SessionInfo.tag` 带 `#[serde(default)]`——旧界面解新守护进程的
+    ///    JSON，多出来的字段被 serde 直接忽略；新界面解旧守护进程的 JSON，
+    ///    缺的字段补成空串。两边都不会解析失败。
+    /// 2. 这次没有新增或改动任何 `Request` 变体——旧守护进程完全不需要
+    ///    「懂」这个新字段，它甚至不知道对面在问它，`tag` 只是它答复里顺带
+    ///    多出来的一段旧进程从不读的文本。
+    ///
+    /// 这条规则**不能推广**：只要对面必须**理解**一个新字段或新变体才能
+    /// 正常应答（而不是可以安全无视），版本号就要加一，不管那个字段本身
+    /// 带不带 `#[serde(default)]`。下次想跳过版本号，先证明满足上面两条，
+    /// 不是从一个空字符串开始编故事。
     #[test]
     fn the_session_info_shape_is_pinned_too() {
         let info = SessionInfo {
