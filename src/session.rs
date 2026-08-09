@@ -825,15 +825,30 @@ impl SessionManager {
                     if next == SessionState::Failed && was != SessionState::Failed {
                         self.request_explanation(&mut s);
                     }
-                    // 第一次干完活 = 起名的时机。不在第一句输入送出去时起：
-                    // 那一刻信息最少，正是「继续」「帮我看看」出现的地方；
-                    // 干完一轮之后屏幕上才有它到底在做什么的实证。
+                    // 起名的时机是「干完一轮 **且用户已经说过话**」，两个条件
+                    // 缺一不可。不在第一句输入送出去时起：那一刻信息最少，
+                    // 正是「继续」「帮我看看」出现的地方；干完一轮之后屏幕上
+                    // 才有它到底在做什么的实证。
+                    //
+                    // `!s.first_input.is_empty()` 这一半不是锦上添花，是必需的：
+                    // 真实 profile（claude/codex/glm/kimi/deepseek/qwen-api）
+                    // 全都只声明 `busy_pattern`，不声明 `idle_pattern`——`classify()`
+                    // 在 busy_pattern 存在时，busy 串**不在**屏幕上就判 Idle，
+                    // 而刚创建、还停在启动画面上的会话正是这样。没有这道判断，
+                    // `create()` 之后的第一个 tick 就会把 `was == Working`（创建时
+                    // 因为有 pattern 而置的初始状态）→ `next == Idle`（启动画面）
+                    // 读成「干完一轮活」，用空的 `first_input` 把名字永久钉成空串。
+                    // 注意这里特意用 `first_input`、不用 `first_input_sealed`：
+                    // 用户粘一大段需求、还没敲回车封存，agent 却已经抢先干完一轮
+                    // 活，这种情况下也该拿这段还没封存的话去起名，不该因为没封存
+                    // 就被这道判断拦下。
                     //
                     // `name_slot` 非 None 就是已经起过了（`request_name` 一进门
                     // 就同步写兜底），所以这个条件同时管住了「只起一次」。
                     if was == SessionState::Working
                         && matches!(next, SessionState::Idle | SessionState::Asking)
                         && s.is_agent
+                        && !s.first_input.is_empty()
                         && recover(s.name_slot.lock()).is_none()
                     {
                         self.request_name(&mut s);
@@ -1099,6 +1114,29 @@ mod tests {
         }
     }
 
+    // 真实 profile 的形状：claude/codex/glm/kimi/deepseek/qwen-api 全都只
+    // 声明 `busy_pattern`（比如「esc to interrupt」），不声明 `idle_pattern`——
+    // `profiles/*.toml` 里 `idle_pattern` 这个词只出现在解释「为什么故意不写」
+    // 的注释里。`classify()` 在 busy_pattern 存在时，busy 串**不在**屏幕上
+    // 就判 Idle：刚创建、还停在启动画面上的会话，第一个 tick 就是这个读法。
+    fn busy_only_agent() -> Profile {
+        Profile {
+            name: "busy-only".into(),
+            command: vec!["cat".into()],
+            is_agent: true,
+            idle_pattern: None,
+            busy_pattern: Some("esc to interrupt".into()),
+            error_pattern: None,
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        }
+    }
+
     #[test]
     fn the_explain_prompt_carries_the_tail_of_the_screen() {
         let long = "x".repeat(5000) + "API Error: Connection closed mid-response.";
@@ -1353,12 +1391,81 @@ mod tests {
         }
     }
 
+    /// **钉死这个仓库真正会踩的坑**：所有真实 profile（claude/codex/glm/
+    /// kimi/deepseek/qwen-api）都只声明 `busy_pattern`，没有一个声明
+    /// `idle_pattern`。`classify()` 在只有 busy_pattern 时，busy 串**不在**
+    /// 屏幕上就判 Idle——刚创建、还停在启动画面上的会话，第一个 tick
+    /// 就是这个读法：`was == Working`（创建时因为有 pattern 而置的初始
+    /// 状态）→ `next == Idle`（启动画面，还没人跟它说过话）。没有
+    /// `!s.first_input.is_empty()` 这道判断，这一跳会被当成「干完一轮活」，
+    /// 用空的 first_input 把名字永久钉成空串。
+    #[test]
+    fn a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen() {
+        // 跟 `recovering_from_a_failure_does_not_count_as_finishing_a_round`
+        // 同一个理由：名字跟着 prompt 里有没有真实的第一句话走，这样才能
+        // 把「是哪一次触发定下了这个名字」测出来，不受线程调度影响。
+        struct ByPrompt;
+        impl crate::llm::Backend for ByPrompt {
+            fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                if p.user.contains("修一下登录白屏") {
+                    Ok("真实名字".into())
+                } else {
+                    Ok("启动画面误触发".into())
+                }
+            }
+        }
+
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(busy_only_agent());
+        m.set_backend(Some(Arc::new(ByPrompt)));
+        let id = m
+            .create(repo.path(), "busy-only", empty_secrets(), &[])
+            .unwrap();
+
+        // 没送过任何输入：`cat` 的屏幕是空的，busy 串自然不在上面，
+        // `classify()` 一上来就会把这读成 Idle。多 tick 几轮，确认名字
+        // 一直是空的，也没有被偷偷钉死（后面真正干活那一段会把「偷偷
+        // 钉死」这件事测出来——钉死了的话，真名字永远出不来）。
+        for _ in 0..5 {
+            m.tick();
+            assert_eq!(
+                m.list().iter().find(|s| s.id == id).unwrap().tag,
+                "",
+                "没人跟它说过话，不该有名字"
+            );
+            sleep(Duration::from_millis(20));
+        }
+
+        // 现在才是真正干活：送真实输入，走一轮 Working → Idle。
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+            if tag == "真实名字" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "真正干完一轮活之后应该起出真实名字，最后是 {tag:?}"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
     /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
-    /// 起名。这是触发条件里 `was == SessionState::Working` 唯一测得到的
-    /// 地方——`name_slot` 那道「只起一次」的门槛在这种场景下反而是帮凶：
-    /// 如果 Failed → Idle 也被当成起名时机，它会拿这时候还空着的
-    /// `first_input` 把 `name_slot` 提前钉死，等真正干完一轮活、有真实
-    /// 内容可用的时候，`name_slot` 已经非 `None` 了，再也翻不了身。
+    /// 起名。这个场景里 `was == SessionState::Working` 和
+    /// `!s.first_input.is_empty()` 两道判断**都**能单独拦住误触发（这里
+    /// 从没送过输入，first_input 全程是空的，跟
+    /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
+    /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
+    /// `name_slot` 那道「只起一次」的门槛在误触发场景下反而是帮凶——如果
+    /// Failed → Idle 被当成起名时机，它会拿这时候还空着的 `first_input`
+    /// 把 `name_slot` 提前钉死，等真正干完一轮活、有真实内容可用的时候，
+    /// `name_slot` 已经非 `None` 了，再也翻不了身。
     #[test]
     fn recovering_from_a_failure_does_not_count_as_finishing_a_round() {
         // 名字跟着 prompt 里有没有真实的第一句话走，而不是跟着「第几次被
@@ -1379,18 +1486,34 @@ mod tests {
 
         let repo = init_repo();
         let m = SessionManager::new();
-        m.register_profile(
-            Profile::from_toml(
-                r#"
-                name = "flaky-name"
-                command = ["/bin/sh", "-c", "echo BOOM; sleep 0.2; clear; echo READY; sleep 30"]
-                is_agent = true
-                idle_pattern = "READY"
-                error_pattern = "BOOM"
-                "#,
-            )
-            .unwrap(),
-        );
+        m.register_profile(Profile {
+            name: "flaky-name".into(),
+            // 清屏和打 READY 必须在**同一次** write 里发生，不能是 `clear;
+            // echo READY` 那种两条命令、两次 write：pty 读端偶尔会正好落在
+            // 两次 write 之间那个窗口，那一刻屏幕上既没有 BOOM 也没有
+            // READY，`classify()` 会把它错判成 `Working`，下一次 tick 才
+            // 看见 READY，就成了一次货真价实但不该发生的 `Working → Idle`
+            // ——first_input 还是空的，这道判断本该拦住它却没机会拦，测试
+            // 就会因为错误的原因失败（观察到的是 flake，不是这个测试真正
+            // 要测的东西）。一次 `printf` 把 ED2（清屏）、光标归位、READY
+            // 三样一起打出去，从根上消掉这个窗口。
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo BOOM; sleep 0.2; printf '\\033[2J\\033[HREADY\\n'; sleep 30".into(),
+            ],
+            is_agent: true,
+            idle_pattern: Some("READY".into()),
+            busy_pattern: None,
+            error_pattern: Some("BOOM".into()),
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        });
         m.set_backend(Some(Arc::new(ByPrompt)));
         let id = m
             .create(repo.path(), "flaky-name", empty_secrets(), &[])
