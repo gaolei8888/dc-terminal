@@ -3809,9 +3809,11 @@ mod tests {
         assert!(bar_text(&term).contains("出事了"), "错误消息压过复制模式");
     }
 
-    /// 80 是我们支持的最窄终端，右段只有 39 列，而 `wrap_help` 不拆单空格的
-    /// 句子——写长了不会折行，会被 `Paragraph` 悄悄切掉尾巴。两种语言都要
-    /// 在这个宽度下把复制模式的提示完整放出来，一个字都不能少。
+    /// 80 不是最窄的受支持宽度（那是下面 `MIN_COLS` 那条测试的 60），而是
+    /// 长文案必须仍然放得下的那道线：右段在这个宽度下只有 39 列，而
+    /// `wrap_help` 不拆单空格的句子——写长了不会折行，会被 `Paragraph`
+    /// 悄悄切掉尾巴。两种语言都要在这个宽度下把复制模式的提示完整放出来，
+    /// 一个字都不能少；再窄下去（见下面 60 列那条）才轮到短文案接手。
     #[test]
     fn copy_mode_hint_survives_eighty_columns_in_both_languages() {
         use ratatui::backend::TestBackend;
@@ -3852,6 +3854,39 @@ mod tests {
                 bar.contains(&short.replace(' ', "")),
                 "{lang:?} 在 60 列下要完整显示复制模式的短文案：{bar}"
             );
+        }
+    }
+
+    /// 会话视图里唯一能进复制模式的入口就是 `F4`——`?` 浮层打不开（附加
+    /// 视图里所有键都转发给 agent），提示本身要等 `copy_mode` 已经是真的
+    /// 才会画出来。`idle_help` 的 `View::Attached` 分支必须把 `F4` 写在
+    /// 底栏上，用户才有地方看到这个键存在。
+    ///
+    /// 两个宽度都要测，不能只测 80：`fit_help` 是按预算从前面**丢**的，
+    /// 60 列这一档右段落到 `ACTION_MIN_COLS`（28）——`F3`+`F4` 在这个地板上
+    /// 挤不挤得下，只有真的在这个宽度画一遍才知道；只测 80 列的话，`F4`
+    /// 在窄终端上被 `fit_help` 悄悄丢掉的回归会一路绿灯漏过去。
+    #[test]
+    fn attached_view_bar_keeps_both_f3_and_f4_at_eighty_and_sixty_columns() {
+        use ratatui::backend::TestBackend;
+
+        for width in [80u16, 60u16] {
+            for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+                let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
+                app.lang = lang;
+                let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+
+                let bar = bar_text(&term);
+                assert!(
+                    bar.contains("F3"),
+                    "{width} 列 {lang:?} 下 F3（下一个会话）不见了：{bar}"
+                );
+                assert!(
+                    bar.contains("F4"),
+                    "{width} 列 {lang:?} 下 F4 不见了——这是这一层唯一能进复制模式的入口：{bar}"
+                );
+            }
         }
     }
 

@@ -135,6 +135,13 @@ pub enum Key {
     /// 回复框还空着时的占位提示：直接回车 = 替用户按一下回车（批准/继续）
     EmptyReplyIsEnter,
     NextSession,
+    /// `F4` 在会话视图里的动作名：进复制模式。**只是这一个动词**——
+    /// 「鼠标交还终端」「按 F4 退出」这些解释已经在 `CopyMode`/`CopyModeShort`
+    /// 里说了，这里跟 `("F4", ...)` 拼起来只用来填底栏按键表那一格
+    /// （`F4 复制` / `F4 copy`），不是那条状态提示本身，命名和用途都不能跟
+    /// 它们混：`CopyMode`/`CopyModeShort` 是「已经在复制模式里」时顶掉整条
+    /// 右段的话，这一条是「还没进去、告诉你按哪个键能进去」。
+    EnterCopyMode,
     OtherKeysGoToAgent,
     BackToListWord,
     BackToSettingsWord,
@@ -308,6 +315,9 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "打字回复，或者直接回车表示同意"
         ),
         NextSession => t!(lang, en: "next session", zh: "下一个会话"),
+        // 只是动词，跟 `Undo`/`Diff` 那一档词条一个形状——句子留给
+        // `CopyMode`/`CopyModeShort`。
+        EnterCopyMode => t!(lang, en: "copy", zh: "复制"),
         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
         OtherKeysGoToAgent => t!(
@@ -1247,6 +1257,7 @@ mod tests {
             InterruptAgent,
             EmptyReplyIsEnter,
             NextSession,
+            EnterCopyMode,
             OtherKeysGoToAgent,
             BackToListWord,
             BackToSettingsWord,
@@ -1350,7 +1361,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 99, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

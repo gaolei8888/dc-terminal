@@ -32,6 +32,21 @@ pub(crate) enum ScrollAction {
 /// Claude Code 备用屏 + 全套鼠标，codex 内联 + 完全不要鼠标，两个真实
 /// agent 在这两个维度上正好相反。按鼠标分流恰好把两边都送到握着内容的
 /// 那一方：Claude Code 自己管视口，codex 的历史在 dct 缓冲里。
+///
+/// **鼠标捕获现在跟这个判据是同一个开关**（`mod.rs::wants_mouse_capture`）：
+/// dct 只在 `app.scroll.agent_owns` 为真（且不在 `copy_mode`）时才抓住终端
+/// 鼠标。`agent_owns` 一旦是假，捕获跟着关掉，滚轮事件从此根本进不了这个
+/// 进程——终端自己接管了它（走的是它自己的原生选中/滚屏逻辑，不是 dct 这套
+/// 协议）。也就是说 codex 这类不订阅鼠标的 agent 会话，稳态下压根不会调用
+/// 到这个函数，`agent_owns` 为假这条判据在这里已经等不到真实输入了。
+///
+/// 下面这条 `ScrollAction::Scroll` 分支（连带 `handle_mouse` 里
+/// `!app.scroll.agent_owns` 那个点击挡板）如今只剩一扇一帧宽的窗口能被
+/// 走到：agent 刚放下鼠标、这一帧刚把 `agent_owns` 翻成假，但捕获的
+/// `Enable`/`DisableMouseCapture` 还没来得及把终端也切过去，恰好在这个缝隙
+/// 里冒出来的一次滚轮才会落到这条分支上。它不是「dct 平时替不要鼠标的
+/// agent 滚」的日常路径，只是这条缝隙的兜底——分支和下面的测试都不是
+/// 死代码，只是别再拿它们当常态来读。
 pub(crate) fn wheel_action(st: &ScrollState, up: bool) -> ScrollAction {
     if st.agent_owns {
         return ScrollAction::Forward;

@@ -129,7 +129,7 @@ pub struct App {
     /// 它是「此刻正在复制」的临时状态，不是配置——离开会话一律复位
     /// （见 `attach::handle_key`）。跨会话粘着的话，用户会在另一个会话里
     /// 发现鼠标莫名其妙不归 agent 管，而屏幕上没有任何东西解释为什么。
-    pub copy_mode: bool,
+    pub(crate) copy_mode: bool,
 }
 
 impl App {
