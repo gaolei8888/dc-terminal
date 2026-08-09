@@ -123,9 +123,9 @@ The grid is read-only — arrows move focus, `F3` does the same as `→` (next t
 
 Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
 
-Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
+Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3`, `F4` and `Ctrl+Q` are the only four keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view, `F4` toggles copy mode (more on that below).
 
-You can scroll back through what a session already printed — the wheel, or `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. The wheel moves 3 lines a notch, a page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. Claude Code wants the mouse for its own scrolling, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex doesn't want the mouse, so `dct` scrolls what it kept instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
+You can scroll back through what a session already printed, with `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. A page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. The wheel only does something when the agent itself wants the mouse: Claude Code does, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex and plain command-line tools don't want the mouse, so `dct` doesn't capture it there either — the wheel does nothing in those sessions, use `PageUp`/`PageDown`/`End` instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
 
 A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
 
@@ -150,7 +150,11 @@ The point was never "use your terminal from anywhere." It's that **development k
 
 **The big one: the four vendor endpoints are copied out of public documentation and have never been tested with a real account.** A key can verify fine and the session still fail to start. Until somebody runs them with real credentials, treat Kimi, GLM, DeepSeek and Qwen API as unverified.
 
-Scrolling back works now, but it cost you something: while you're inside a session, `dct` grabs the mouse, so your terminal's own click-and-drag text selection stops working there. In iTerm2 you hold Option to get it back; most terminals have some equivalent modifier. `dct` has no copy of its own yet. Back on the board the mouse is yours again.
+`dct` only takes the mouse when **the agent itself wants it**. Claude Code does (it uses the mouse to scroll its own screen); codex and plain command-line tools don't — in those sessions the mouse stays with the terminal the whole time, so click-and-drag text selection and copying work exactly as they always do. The cost is that the wheel no longer scrolls `dct`'s own history in those sessions; use `PageUp`/`PageDown`/`End` instead.
+
+To copy inside a session where the agent wants the mouse, press `F4` to enter copy mode: the mouse goes back to the terminal, the bottom bar says so, and pressing `F4` again leaves it once you're done copying. You can also use your terminal's own modifier (Option in iTerm2) without leaving the session at all.
+
+`dct` has no copy of its own — copying uses whatever your terminal already gives you.
 
 Permissions are auto-accepted, which means an agent can write outside the project directory. **Those writes are outside the snapshot and undo won't bring them back.**
 
