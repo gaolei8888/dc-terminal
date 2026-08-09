@@ -120,6 +120,47 @@ pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
     }
 }
 
+/// 第一句输入最多留这么多字符。粘一大段需求时前 200 字足够喂模型，
+/// 把几千字留在内存里没有意义。
+const FIRST_INPUT_MAX: usize = 200;
+
+/// 攒「用户对这个会话说的第一句话」。
+///
+/// 抽成自由函数是因为两个客户端送输入的形状完全不同（会话视图逐键、
+/// 九宫格整段 + 一次空 `Input`），而这条规则必须对两条路给出同一个答案 ——
+/// 那是能测的，`send_input` 里那一圈锁和 PTY 写入不是。
+///
+/// `text` 为空 = 按回车（见 `send_input` 的文档）。
+pub(crate) fn collect_first_input(buf: &mut String, sealed: &mut bool, text: &str) {
+    if *sealed {
+        return;
+    }
+    if text.is_empty() {
+        *sealed = true;
+        return;
+    }
+    // `find` 给的是字节下标，而 `\r`/`\n` 都是 ASCII，切在这里一定是
+    // 合法的字符边界。
+    match text.find(['\r', '\n']) {
+        Some(i) => {
+            append_capped(buf, &text[..i]);
+            *sealed = true;
+        }
+        None => append_capped(buf, text),
+    }
+}
+
+/// 按**字符数**封顶追加。这里不按显示宽度算：这段字是喂给模型的原料，
+/// 不是画在屏幕上的东西，宽度是界面那一侧的事。
+fn append_capped(buf: &mut String, text: &str) {
+    for ch in text.chars() {
+        if buf.chars().count() >= FIRST_INPUT_MAX {
+            return;
+        }
+        buf.push(ch);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: u32,
@@ -175,6 +216,10 @@ struct Session {
     /// 会话起名用的槽。跟 `explanation_slot` 平级、同一套用法。
     /// `None` = 还没触发过起名；`Some(_)` = 已经触发过（**只触发一次**）。
     name_slot: Arc<Mutex<Option<String>>>,
+    /// 用户对这个会话说的第一句话，起名用。只在 agent 会话上攒。
+    first_input: String,
+    /// 第一句攒完了没有。见 `collect_first_input`。
+    first_input_sealed: bool,
     /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
     /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
     /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
@@ -387,6 +432,8 @@ impl SessionManager {
             pty,
             explanation_slot: Arc::new(Mutex::new(None)),
             name_slot: Arc::new(Mutex::new(None)),
+            first_input: String::new(),
+            first_input_sealed: false,
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
         };
@@ -456,6 +503,16 @@ impl SessionManager {
     /// 这个会话卡住整个看板——`list()` 要逐个锁会话取状态。
     pub fn send_input(&self, id: u32, text: &str) -> Result<()> {
         let arc = self.get_arc(id)?;
+
+        {
+            // 攒第一句。**在所有分支之前**——下面空串那一支会提早 return，
+            // 挂在它后面就永远收不到回车。
+            let mut guard = recover(arc.lock());
+            let s = &mut *guard;
+            if s.is_agent {
+                collect_first_input(&mut s.first_input, &mut s.first_input_sealed, text);
+            }
+        }
 
         if text.is_empty() {
             let (dir, sid, seq, is_agent) = {
@@ -913,6 +970,67 @@ mod tests {
         // 目标用户零编程经验：不要栈追踪、不要术语。
         assert!(p.system.contains("不要"), "要明确禁止术语/栈追踪");
         assert!(p.max_tokens <= 200, "一句话就够，别让它写小作文");
+    }
+
+    /// 逐键送和整段送必须封存出同一句话 —— 会话视图是一个键一次
+    /// `Input`，九宫格 `i` 是整段 + 一次空 `Input`。
+    #[test]
+    fn both_input_paths_seal_the_same_first_line() {
+        let mut a = (String::new(), false);
+        for k in ["h", "i", "\r"] {
+            collect_first_input(&mut a.0, &mut a.1, k);
+        }
+
+        let mut b = (String::new(), false);
+        collect_first_input(&mut b.0, &mut b.1, "hi");
+        collect_first_input(&mut b.0, &mut b.1, "");
+
+        assert_eq!(a.0, "hi");
+        assert_eq!(b.0, "hi");
+        assert!(a.1 && b.1, "两条路都要封存");
+    }
+
+    /// 封存之后再送字，第一句不再变 —— 它是「第一句」，不是「最近一句」。
+    #[test]
+    fn sealed_first_input_never_changes_again() {
+        let mut buf = String::new();
+        let mut sealed = false;
+        collect_first_input(&mut buf, &mut sealed, "hi");
+        collect_first_input(&mut buf, &mut sealed, "");
+        collect_first_input(&mut buf, &mut sealed, "and more");
+        assert_eq!(buf, "hi");
+    }
+
+    /// 粘一大段需求进来：只留前 200 个字符，剩下的不进内存。
+    #[test]
+    fn a_pasted_wall_of_text_is_capped() {
+        let mut buf = String::new();
+        let mut sealed = false;
+        collect_first_input(&mut buf, &mut sealed, &"x".repeat(300));
+        assert_eq!(buf.chars().count(), FIRST_INPUT_MAX);
+        assert!(!sealed, "没按回车就不算封存");
+    }
+
+    /// 一次送进来的字里就带着回车（粘贴多行）：回车之前的算第一句，
+    /// 回车本身封存。
+    #[test]
+    fn a_newline_inside_one_chunk_seals_at_the_newline() {
+        let mut buf = String::new();
+        let mut sealed = false;
+        collect_first_input(&mut buf, &mut sealed, "fix login\nand also");
+        assert_eq!(buf, "fix login");
+        assert!(sealed);
+    }
+
+    /// 粘贴的中文句子后面跟一个换行：`find` 拿到的是字节下标，多字节字符的
+    /// 字节永远不会跟 ASCII 的 `\n` 撞在一起，切在这里不会崩在字符中间。
+    #[test]
+    fn a_multibyte_utf8_sentence_before_the_newline_does_not_panic() {
+        let mut buf = String::new();
+        let mut sealed = false;
+        collect_first_input(&mut buf, &mut sealed, "修复登录问题\n还有别的");
+        assert_eq!(buf, "修复登录问题");
+        assert!(sealed);
     }
 
     #[test]
