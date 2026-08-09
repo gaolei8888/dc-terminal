@@ -120,6 +120,86 @@ pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
     }
 }
 
+/// 名字最多留这么多字符。**按字符数、不按显示宽度**：守护进程存的是
+/// 一段文字，画多宽是界面那一侧按各自的位置算的（见 `widgets::truncate`）。
+/// 24 是 12 个汉字，跟 prompt 里要的「不超过 12 个字」对得上。
+///
+/// 这一版还没有调用方——起名逻辑要接进 daemon 的 tick 才会用到它，那是
+/// 下一个任务的事。`expect` 只挂在非测试构建上：测试里已经在调它，那边
+/// 谈不上「死代码」；调用方接上之后 `cfg(not(test))` 那边的 `expect` 会
+/// 自己变成「多余的 expect」编译错误，到时候删掉它，不用指望有人记得回来查。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "下一个任务把起名逻辑接进 daemon 的 tick 时才会用到"
+    )
+)]
+const NAME_MAX_CHARS: usize = 24;
+
+/// 把模型回的东西洗成一个能直接画在标题上的名字。
+///
+/// 模型很少老老实实只给名字：会加引号、会加句号、会多写一句解释。
+/// 洗不干净的话屏幕上就会出现「「修登录白屏」。」。洗完是空串表示
+/// 这次没拿到可用的答案，调用方走兜底。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "下一个任务把起名逻辑接进 daemon 的 tick 时才会用到"
+    )
+)]
+pub(crate) fn clean_name(raw: &str) -> String {
+    const QUOTES: [char; 12] = [
+        '"', '\'', '「', '」', '『', '』', '“', '”', '‘', '’', '《', '》',
+    ];
+    const TAIL: [char; 12] = [
+        '。', '．', '.', '，', ',', '！', '!', '？', '?', '；', ';', '、',
+    ];
+
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // 引号和收尾标点必须在**同一次** trim 里一起剥，不能分两轮各管一种字符集：
+    // 模型常把整句话包在引号里、句末再补一个句号，比如「修登录白屏」。分两轮
+    // 剥的话，剥引号那一轮从后往前第一个字符是句号、不是引号，直接收手，
+    // 剥不到里层的引号；剥标点那一轮再上场时引号已经挡在最后，标点那一轮
+    // 剥完句号就轮到引号、可它认的字符集里没有引号，同样收手——两轮各退
+    // 半步，谁都剥不干净。合成一个字符集一次性从两端向里扫，才能把「引号
+    // 叠标点」这种情况一次剥到底。
+    let line =
+        line.trim_matches(|c: char| QUOTES.contains(&c) || TAIL.contains(&c) || c.is_whitespace());
+    line.chars().take(NAME_MAX_CHARS).collect()
+}
+
+/// 让模型给这个会话起个名字。
+///
+/// **只送屏幕末尾**，理由同 `explain_prompt`：整屏几千字，又慢又贵，
+/// 还容易让模型抓错重点。
+///
+/// **语言写进 prompt，不做参数**：名字由守护进程生成并钉死，而界面语言
+/// 用户随时能切（`l` 键，不重启 daemon）。跟着用户输入的语言走，切界面
+/// 语言之后也不会留下一堆对不上的名字。
+pub fn name_prompt(first_input: &str, screen: &str) -> crate::llm::Prompt {
+    const TAIL: usize = 2000;
+    let tail: String = {
+        let chars: Vec<char> = screen.chars().collect();
+        let start = chars.len().saturating_sub(TAIL);
+        chars[start..].iter().collect()
+    };
+    crate::llm::Prompt {
+        system: "给下面这个编程会话起一个名字，好让人在一屏几个会话里认出它。\
+                 只回名字本身，不超过 12 个字。说的是这个会话在做的**任务**，\
+                 不是它此刻的动作。不要引号、不要标点、不要「任务」「会话」\
+                 这类没有信息的词。**用与用户那句话相同的语言。**"
+            .into(),
+        user: format!("用户说的第一句话：\n{first_input}\n\n屏幕上的最后一段内容：\n\n{tail}"),
+        max_tokens: 64,
+    }
+}
+
 /// 第一句输入最多留这么多字符。粘一大段需求时前 200 字足够喂模型，
 /// 把几千字留在内存里没有意义。
 const FIRST_INPUT_MAX: usize = 200;
@@ -1031,6 +1111,67 @@ mod tests {
         collect_first_input(&mut buf, &mut sealed, "修复登录问题\n还有别的");
         assert_eq!(buf, "修复登录问题");
         assert!(sealed);
+    }
+
+    /// 模型多半会回一句带标点、带引号的话，不会老老实实只给名字。
+    /// 洗不干净的话，格子标题上会出现「「修登录白屏」。」这种东西。
+    #[test]
+    fn clean_name_strips_quotes_punctuation_and_extra_lines() {
+        assert_eq!(clean_name("「修登录白屏」。"), "修登录白屏");
+        assert_eq!(clean_name("\"fix login blank\""), "fix login blank");
+        assert_eq!(clean_name("修登录白屏\n（这个会话在修登录）"), "修登录白屏");
+        assert_eq!(clean_name("  修登录白屏  "), "修登录白屏");
+    }
+
+    /// 洗完是空的就当模型没答上来，调用方走兜底。
+    #[test]
+    fn clean_name_returns_empty_when_there_is_nothing_left() {
+        assert_eq!(clean_name(""), "");
+        assert_eq!(clean_name("   \n  "), "");
+        assert_eq!(clean_name("。。。"), "");
+    }
+
+    /// 模型不听话给了一长串：按字符数封顶，别让它撑爆标题。
+    #[test]
+    fn clean_name_caps_a_runaway_answer() {
+        let long = "修".repeat(100);
+        assert_eq!(clean_name(&long).chars().count(), NAME_MAX_CHARS);
+    }
+
+    /// 引号叠标点（引号包住整句、句末再补句号）必须在同一次 trim 里一起
+    /// 剥掉，分两轮剥（先剥引号、再剥标点）会在两者交替出现时半途而废，
+    /// 剥出「修登录白屏」这种带着里层引号的残留。这是 Step 3 最初实现的
+    /// 真实 bug，被这条断言直接抓住，所以单独钉一下这个场景。
+    #[test]
+    fn clean_name_strips_a_quote_stacked_with_trailing_punctuation() {
+        assert_eq!(clean_name("「修登录白屏」。"), "修登录白屏");
+    }
+
+    /// 名字中间原本就带引号（不在首尾）：trim 只从两端往里剥，中间的
+    /// 引号不是「多余包装」，不该被当成噪音铲掉。
+    #[test]
+    fn clean_name_keeps_a_quote_that_sits_in_the_middle() {
+        assert_eq!(clean_name("修复 \"login\" 白屏"), "修复 \"login\" 白屏");
+    }
+
+    /// 恰好等于上限字符数的名字必须原样保留，不多不少——`chars().take(n)`
+    /// 按字符切，不按字节，不会在多字节字符中间切出半个字来，也不会因为
+    /// “大于等于”之类的边界写错而多切/少切一个字符。
+    #[test]
+    fn clean_name_keeps_a_name_exactly_at_the_cap_intact() {
+        let exact = "修".repeat(NAME_MAX_CHARS);
+        let cleaned = clean_name(&exact);
+        assert_eq!(cleaned, exact);
+        assert_eq!(cleaned.chars().count(), NAME_MAX_CHARS);
+    }
+
+    /// prompt 必须带上第一句输入和屏幕末尾两样，缺一样模型就只能猜。
+    #[test]
+    fn name_prompt_carries_both_the_first_line_and_the_screen() {
+        let p = name_prompt("修一下登录白屏", "…… 正在改 auth.ts ……");
+        assert!(p.user.contains("修一下登录白屏"));
+        assert!(p.user.contains("auth.ts"));
+        assert!(p.max_tokens <= 64, "起个名字不需要长回答");
     }
 
     #[test]
