@@ -160,8 +160,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                         // 80 列上这句会正好被右边框切掉尾巴（最长的内置 agent
                         // 名是 8 列：`opencode`/`deepseek`/`qwen-api`）。
                         // 自建 profile 的名字要多长有多长，所以除了把文案收短，
-                        // 还得真按剩下的宽度裁一次——裁出个 `…` 也比无声地被
-                        // 边框吃掉强，后者用户根本看不出还有字。
+                        // 还得真按剩下的宽度裁一次。
+                        //
+                        // 传给 `truncate` 的是 `room - 1`，不是 `room`：它**真的
+                        // 裁了**的时候返回的是 `max + 1` 列——那个 `…` 是在长度
+                        // 判断之后才追加的（`widgets::truncate`，同 `:134` 那行
+                        // 父目录为什么写 16 填 18）。照 `room` 传的话，省略号
+                        // 自己正好落在边框那一列上被 ratatui 剪掉，屏幕上留下一个
+                        // 齐齐整整、看不出被截过的名字——正是这段代码要防的那件事，
+                        // 只是换了个更隐蔽的样子。
                         let hint = text(Key::NoSessionsHere, app.lang);
                         let line = match &g.last_profile {
                             Some(p) => {
@@ -172,7 +179,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                         let room = (area.width as usize)
                             .saturating_sub(2) // 左右边框
                             .saturating_sub(HEADER_PREFIX_COLS);
-                        spans.push(Span::styled(truncate(&line, room), dim()));
+                        spans.push(Span::styled(truncate(&line, room.saturating_sub(1)), dim()));
                     } else {
                         let agents: Vec<String> = g
                             .agent_counts()
@@ -399,8 +406,22 @@ mod tests {
     }
 
     /// 自建 profile 的名字要多长有多长。放不下时要看得见一个 `…`——被右边框
-    /// 无声吃掉的话，用户根本不知道后面还有字。这也从另一头钉住
-    /// `HEADER_PREFIX_COLS`：常量小了就不会裁，这条会红。
+    /// 无声吃掉的话，用户根本不知道后面还有字。
+    ///
+    /// **断言必须钉到那个省略号出现在哪一个字之后**，不能只问「这一屏上有没有
+    /// `…`」：父目录那一列自己就会裁出一个（临时目录的路径很长），于是
+    /// `contains('…')` 无论截断代码在不在都是真的。这条测试第一版就是那么写的，
+    /// 删掉整段截断照样绿——评审抓到了，这里记下来。
+    ///
+    /// 这一条同时从**两个**方向钉住 `HEADER_PREFIX_COLS` 和那次
+    /// `saturating_sub(1)`：
+    ///
+    /// - 截断整个删掉 → 这一格铺到 34 列被边框剪断，屏幕上没有省略号；
+    /// - 常量小了（`room` 变大）→ 裁得更靠后，`truncate` 返回 `max+1` 列，
+    ///   省略号越过边框被剪掉，屏幕上同样没有它；
+    /// - 常量大了 → 裁得更靠前，省略号在别的字后面。
+    ///
+    /// 三种都对不上下面那个字面量。
     #[test]
     fn an_over_long_agent_name_is_cut_visibly_not_by_the_border() {
         let (mut app, dir) = App::test_app();
@@ -418,8 +439,14 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
+        // 80 列：内框 78，前缀 44，这一格 34 列。`no sessions · last used `
+        // 占 24，`truncate` 拿到 33，于是名字露出 9 个字符再补一个 `…`——
+        // 一共 34 列，一列不多一列不少。
         let c = screen_text(&term);
-        assert!(c.contains('…'), "放不下就要看得见省略号：{c}");
+        assert!(
+            c.contains("lastusedan-absurd…"),
+            "省略号必须自己也画得出来，而不是连它一起被右边框吃掉：{c}"
+        );
     }
 
     /// 内置 profile 名字最长 8 列——`an_empty_project_names_the_agent_it_last_used`
