@@ -122,6 +122,29 @@ fn wants_mouse_capture(attached: bool, agent_subscribed: bool, copy_mode: bool) 
     attached && agent_subscribed && !copy_mode
 }
 
+/// 这一轮 `Screen` 请求的结果决定下一帧的 `app.scroll`：拿到新画面就用
+/// 新的一份，请求失败（断连、或者这次干脆没拿到 `Response::Screen`）就
+/// 原样保留上一帧的值，不清空。
+///
+/// 断连不代表 agent 放弃了它订阅的鼠标协议，只代表这一轮没问到它现在的
+/// 状态——`agent_owns` 一旦被错误地复位成 `false`，`wants_mouse_capture`
+/// 就会在断连的每一帧里都把捕获关掉再开回来，那是往 stdout 反复写转义
+/// 序列，断连时这是最吵的一种失败。
+///
+/// 抽成纯函数是因为它现在能被真正测到：喂一个 `Err`，断言拿回来的还是
+/// 传进去的那个 `previous`——而不是像内联在 `run()` 里那样，测试只能
+/// 设置一个字段（`app.connected`）再重新算一遍同一个纯函数，两次调用
+/// 参数完全相同，永远不可能失败，也就什么都没测到。
+fn scroll_after_screen_call(
+    previous: crate::session::ScrollState,
+    result: &Result<Response>,
+) -> crate::session::ScrollState {
+    match result {
+        Ok(Response::Screen { scroll, .. }) => *scroll,
+        _ => previous,
+    }
+}
+
 /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
 /// mode / alternate screen；`run()` 的主循环里到处都是 `?`，一旦某次
 /// `client.call`/`term.draw` 出错就会直接从函数返回，跳过写在循环末尾的清理代码，
@@ -496,18 +519,22 @@ pub fn run(
             {
                 app.sent_size = Some((id, rows, cols));
             }
-            match app.client().and_then(|c| c.call(Request::Screen { id })) {
+            let screen_result = app.client().and_then(|c| c.call(Request::Screen { id }));
+            // 按键和滚轮怎么分流、底栏那句提示写什么、这一帧该不该抓鼠标，
+            // 都看 `app.scroll` 这一份——每 16ms 跟着 `Screen` 一起刷新，
+            // 滞后最多一帧，够用了。独立于下面这个 match 先算好：请求失败
+            // 时这个 match 走的是 `_` 分支，不会碰 `scroll`，见
+            // `scroll_after_screen_call` 头上的注释。
+            app.scroll = scroll_after_screen_call(app.scroll, &screen_result);
+            match screen_result {
                 Ok(Response::Screen {
                     lines,
                     cursor,
                     state,
-                    scroll,
+                    ..
                 }) => {
                     app.screen = lines;
                     app.screen_cursor = cursor;
-                    // 按键和滚轮怎么分流、底栏那句提示写什么，都看这一份——
-                    // 每 16ms 跟着 `Screen` 一起刷新，滞后最多一帧，够用了。
-                    app.scroll = scroll;
                     app.connected = true;
                     // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
@@ -3729,25 +3756,53 @@ mod tests {
         assert!(!wants_mouse_capture(false, false, true));
     }
 
-    /// 断连时 `Screen` 拉不到，`app.scroll` 保持上一帧的值，所以捕获状态不该翻转。
-    /// 翻转要往 stdout 写转义序列，断连时反复翻转是最吵的一种失败。
+    /// 断连（或者这一轮压根没拿到 `Response::Screen`）时，`app.scroll`
+    /// 必须原样保留上一帧的值，不能被复位——复位会让 `wants_mouse_capture`
+    /// 在断连的每一帧里反复翻转捕获状态，那是往 stdout 反复写转义序列，
+    /// 断连时这是最吵的一种失败。
+    ///
+    /// 这里直接喂 `scroll_after_screen_call` 一个 `Err`，断言拿回来的就是
+    /// 传进去的 `previous`。早先这个位置放的是一个只会通过的假测试：它把
+    /// `app.connected` 设成 `false`——一个 `wants_mouse_capture` 根本不读
+    /// 的字段——然后拿完全相同的参数把同一个纯函数又调用了一遍；任何确定性
+    /// 函数在这种写法下都必然通过，哪怕 `run()` 的断连分支真被改成把
+    /// `app.scroll` 复位成 `Default`（这正是它宣称要防住的回归），那个
+    /// 测试也照样是绿的。抽出 `scroll_after_screen_call` 就是为了让这条
+    /// 属性能被真正测到：破坏它的实现（比如把 `_ => previous` 改成
+    /// `_ => crate::session::ScrollState::default()`），这个测试会红。
     #[test]
     fn a_failed_screen_call_does_not_flip_the_capture_state() {
-        let (mut app, _d) = App::test_app();
-        app.view = View::Attached(1);
-        app.scroll = crate::session::ScrollState {
+        let previous = crate::session::ScrollState {
             agent_owns: true,
+            max: 10,
+            offset: 3,
             ..Default::default()
         };
-        let before = wants_mouse_capture(true, app.scroll.agent_owns, app.copy_mode);
+        let failed: Result<Response> = Err(anyhow::anyhow!("daemon unreachable"));
 
-        // 一次失败的 Screen 调用不会碰 app.scroll
-        app.connected = false;
+        assert_eq!(scroll_after_screen_call(previous, &failed), previous);
+    }
 
-        assert_eq!(
-            wants_mouse_capture(true, app.scroll.agent_owns, app.copy_mode),
-            before
-        );
+    /// 反过来：请求真的成功时，`scroll` 必须换成新的一份，不能沿用旧的。
+    /// 跟上一条测试各守一半——少了这一条，把 `scroll_after_screen_call`
+    /// 整个写成 `|previous, _| previous` 也能让「断连不翻转」那条测试通过。
+    #[test]
+    fn a_successful_screen_call_replaces_the_scroll_state() {
+        let previous = crate::session::ScrollState::default();
+        let fresh = crate::session::ScrollState {
+            agent_owns: true,
+            max: 10,
+            offset: 3,
+            ..Default::default()
+        };
+        let ok: Result<Response> = Ok(Response::Screen {
+            lines: Vec::new(),
+            cursor: (0, 0),
+            state: SessionState::Idle,
+            scroll: fresh,
+        });
+
+        assert_eq!(scroll_after_screen_call(previous, &ok), fresh);
     }
 
     #[test]
