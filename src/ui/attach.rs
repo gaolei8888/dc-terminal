@@ -10,7 +10,7 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo};
 use super::app::App;
 use super::key_to_input;
 use super::view::View;
-use super::widgets::{screen_to_lines, short_path, Msg};
+use super::widgets::{screen_to_lines, short_path, truncate, Msg};
 
 /// 滚轮一格滚几行。3 是终端惯例，改了会跟用户在别处（浏览器、编辑器）的
 /// 肌肉记忆打架。
@@ -232,7 +232,21 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             if s.tag.is_empty() {
                 project
             } else {
-                format!("{project} · {}", s.tag)
+                // 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS`
+                // 给的是 24 个字符的余量，不是「不超过 12 个汉字」那句提示的
+                // 保证——真给满 24 个汉字就是 48 列。这句标题的尾巴「—— F2
+                // 返回看板」/「—— F2 goes back」是屏幕上唯一说得出怎么退出
+                // 这个会话的地方，名字不裁的话会把它顶出边框，用户连「有这个
+                // 键」这件事都看不见（这个项目已经出过一次这个形状的 bug：
+                // 键存在，但屏幕上哪儿都没写）。
+                //
+                // 16 列是量出来的：60 列（本仓库测的最窄宽度）减 2 列边框，
+                // 减前缀「Session 1 · 」（英文最长档，12 列）、减分隔符
+                // 「 · 」（3 列）、减尾巴「 —— F2 goes back」（英文最长档，
+                // 16 列），剩下给 `project` 和名字总共 27 列；`truncate`
+                // 真裁了会多出一列，所以传 15 留 1 列余量——`project` 在这个
+                // 视图里通常只是最后一段目录名，不会把这份预算吃光。
+                format!("{project} · {}", truncate(&s.tag, 15))
             }
         })
         .unwrap_or_default();
@@ -381,6 +395,49 @@ mod tests {
         let (mut app, d) = App::test_app();
         app.view = View::Attached(1);
         (app, d)
+    }
+
+    fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        (0..a.height)
+            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS` 给的是
+    /// 24 个字符的余量，不是「不超过 12 个汉字」那句提示的承诺——真给满
+    /// 24 个汉字就是 48 列。标题尾巴「F2 返回看板」是屏幕上唯一说得出怎么
+    /// 退出这个会话的地方，名字不裁的话会把它顶出边框：这个项目已经出过
+    /// 一次同样形状的 bug（键存在，但屏幕上哪儿都没写），不是假设的风险。
+    ///
+    /// 两个宽度都测：60 列是仓库里既有宽度测试用的最窄档，80 列是最常见
+    /// 的终端下限。
+    #[test]
+    fn a_long_name_never_pushes_the_way_back_off_the_title() {
+        use ratatui::backend::TestBackend;
+
+        for width in [80u16, 60] {
+            let (mut app, _dir) = App::test_app();
+            let mut s = session(1, SessionState::Idle);
+            s.dir = "/w/a".into();
+            s.tag = "修".repeat(24);
+            app.set_sessions(vec![s]);
+            app.view = View::Attached(1);
+
+            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+            let c = screen_text(&term);
+            assert!(
+                c.contains("F2返回看板"),
+                "{width} 列下一个 48 列宽的名字把退出提示顶出了标题：{c}"
+            );
+        }
     }
 
     #[test]

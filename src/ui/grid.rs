@@ -359,7 +359,14 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         let who = visible
             .iter()
             .find(|s| s.id == draft.id)
-            .map(|s| format!("{} {}", s.id, session_label(s)))
+            // 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS`
+            // 给的是 24 个字符的余量，不是「不超过 12 个汉字」这句提示的
+            // 保证——真给满 24 个汉字就是 48 列。收件人写在 `to` 前面、
+            // `body`（用户正在打的字）和光标 `▌` 跟在后面同一行，名字不裁的话
+            // 会把用户自己正在打的字连同光标一起顶出屏幕，而这正是他此刻
+            // 眼睛盯着的地方。跟格子标题用同一个上限（20），两处对「名字最多
+            // 露多宽」给同一个答案。
+            .map(|s| format!("{} {}", s.id, truncate(session_label(s), 20)))
             // 收件人在打字途中被停掉了。仍然照实写出 id——用户得看得见
             // 自己正在对谁说话，哪怕那个会话刚没了。
             .unwrap_or_else(|| draft.id.to_string());
@@ -873,7 +880,12 @@ mod tests {
     }
 
     fn grid_text(app: &mut App) -> String {
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        grid_text_at(app, 120, 30)
+    }
+
+    fn grid_text_at(app: &mut App, width: u16, height: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         term.draw(|f| draw(f, f.area(), app)).unwrap();
         let buf = term.backend().buffer();
         let a = buf.area;
@@ -2369,6 +2381,45 @@ mod tests {
             "回复行要写名字，不是 profile：{c}"
         );
         assert!(!c.contains("claude"), "有名字就不该再露出 profile：{c}");
+    }
+
+    /// 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS` 给的是
+    /// 24 个字符的余量，不是「不超过 12 个汉字」那句提示的承诺——真给满
+    /// 24 个汉字就是 48 列。收件人 `to` 画在这一行最前面，用户正在打的字
+    /// 和光标 `▌` 跟在它后面——名字不裁的话会把这两样一起顶出屏幕，而那
+    /// 正是用户按 Enter 之前唯一在看的地方，他会看不见自己正要发出去什么。
+    ///
+    /// 两个宽度都测：60 是九宫格自己的最小支持宽度（`MIN_COLS`），80 是
+    /// 最常见的终端下限。
+    #[test]
+    fn a_long_name_never_pushes_the_draft_off_the_reply_row() {
+        // 光一个短短的「继续」量不出这个 bug：收件人前缀（`→ id ：`）本来就
+        // 短，48 列的名字加上一句两个字的草稿，在 60 列上还差 1 列勉强够放
+        // 得下——真按下暂停键，这条测试会绿得毫无意义。挑一句用户真会打的
+        // 长一点的话（14 个字，28 列），未裁时连 80 列都放不下，两个宽度
+        // 才都真的在测这件事，而不是巧合地够用。
+        let draft = "继续，麻烦顺手也把这个改掉";
+        for width in [80u16, 60] {
+            let (mut app, _dir) = App::test_app();
+            let mut sessions = vec![session(1, SessionState::Idle)];
+            sessions[0].tag = "修".repeat(24);
+            app.set_sessions(sessions);
+            app.view = View::grid(0);
+            handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+            for c in draft.chars() {
+                handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
+            }
+
+            let c = grid_text_at(&mut app, width, 24);
+            assert!(
+                c.contains(draft),
+                "{width} 列下一个 48 列宽的名字把正在打的字顶出了屏幕：{c}"
+            );
+            assert!(
+                c.contains('▌'),
+                "{width} 列下一个 48 列宽的名字把光标顶出了屏幕：{c}"
+            );
+        }
     }
 
     /// 空框时要把「直接回车 = 同意」写出来。这是最高频的用法，不写的话
