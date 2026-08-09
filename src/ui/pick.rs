@@ -1119,6 +1119,65 @@ mod tests {
         );
     }
 
+    /// **守护进程报回来的 `pinned` 不许把光标脚下那个组冲掉。**
+    ///
+    /// `pin_cursor_group` 在 `PinProject` 失败时也只记在本地（这是对的），
+    /// 但下一轮把守护进程那份整个盖上来、紧跟着 `refresh_rows`，那条本地的 pin
+    /// 就没了——光标脚下那个组要是只靠 pin 留着，这一下它从看板上消失，光标
+    /// 掉回第 0 行。当前项目在用户没按键的时候变了，而起因只是一次 IPC 往返
+    /// （超时会丢连接、下一次调用透明重连，于是后面的请求全成功，没有任何
+    /// 错误浮上来）；另一个 dct 窗口按 `x` 也是同一条路。
+    #[test]
+    fn a_projects_sync_never_unpins_the_group_under_the_cursor() {
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/b")]);
+        app.list_state.select(Some(3));
+        super::super::pin_cursor_group(&mut app);
+        // b 的会话停了：现在它留在看板上**只**靠那条 pin
+        let mut done = sess_in(2, "/w/b");
+        done.state = crate::session::SessionState::Stopped;
+        app.set_sessions(vec![sess_in(1, "/w/a"), done]);
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "前提：光标还在 b 上"
+        );
+
+        // 守护进程报回来的那份里没有 b（请求掉了，或者另一个窗口 x 掉了）
+        super::super::adopt_pinned(&mut app, vec!["/w/a".to_string()]);
+
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("b".to_string()),
+            "组不塌陷不能押在一次 IPC 往返成功上"
+        );
+        assert_eq!(app.groups.len(), 2);
+    }
+
+    /// 但别的项目照旧同步：另一个 dct 窗口 `p` 上来的要出现、`x` 掉的要消失。
+    /// 只保光标脚下那一个。
+    #[test]
+    fn a_projects_sync_still_adopts_every_other_change() {
+        let (mut app, _d) = App::test_app();
+        app.pinned = vec!["/w/gone".to_string()];
+        app.set_sessions(vec![sess_in(1, "/w/a")]);
+        app.list_state.select(Some(1));
+        super::super::pin_cursor_group(&mut app);
+
+        // 另一个窗口：x 掉了 /w/gone，p 上来了 /w/new
+        super::super::adopt_pinned(&mut app, vec!["/w/a".to_string(), "/w/new".to_string()]);
+
+        let names: Vec<String> = app.groups.iter().map(|g| g.name.clone()).collect();
+        assert!(
+            !names.contains(&"gone".to_string()),
+            "x 掉的要消失：{names:?}"
+        );
+        assert!(
+            names.contains(&"new".to_string()),
+            "p 上来的要出现：{names:?}"
+        );
+    }
+
     /// 同一个组里上下走一百下，只该 pin 一次——判据是这个组自己的 `pinned`
     /// 标志，不是「光标动了没有」。每个方向键一次守护进程往返的话，看板在
     /// 长列表里会一顿一顿。

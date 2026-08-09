@@ -363,10 +363,7 @@ pub fn run(
                     if let Ok(Response::Projects { pinned, .. }) =
                         app.client().and_then(|c| c.call(Request::Projects))
                     {
-                        if projects_changed(&app.pinned, &pinned) {
-                            app.pinned = pinned;
-                            app.refresh_rows();
-                        }
+                        adopt_pinned(&mut app, pinned);
                     }
                     // 只在 `List` 成功这一支里问 `LastProfile`：守护进程连不上
                     // 的时候连问都不问，断线期间不会每轮空转一遍。
@@ -923,6 +920,46 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
 pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
     add_project(app, dir);
     app.view = home_view(app);
+}
+
+/// 装入守护进程报回来的那份 `pinned`，**但绝不把光标脚下那个组一起冲掉**。
+///
+/// 整份赋值是必须的：另一个 dct 窗口 `p` 上来的项目要出现，`x` 掉的要消失。
+/// 但赋完之后紧跟着的 `refresh_rows` 会按新的 `pinned` 重算成员，而成员规则
+/// 是「有在跑的会话 ∪ pinned」——光标脚下那个组要是只靠 pin 留着（会话都停了、
+/// 或者压根没有会话），这一下就把它抹掉了，光标掉回第 0 行。**当前项目在用户
+/// 没按键的时候变了**，而起因只是一次 IPC 往返。
+///
+/// 两条路都真实存在，不是想象出来的：
+///
+/// - `PinProject` 掉在半路上。`client.rs` 的超时会把连接整个丢掉、下一次调用
+///   透明重连，于是紧接着的 `List`/`Projects` 全都成功——那条 pin 就这么没了，
+///   没有任何错误浮到界面上。
+/// - 另一个 dct 窗口对同一个项目按了 `x`。
+///
+/// 所以「组不塌陷」不能押在一次往返成功上。补回来的同时把那条请求也重发一次：
+/// 只补本地的话，守护进程每一轮都会再报一份没有它的列表，这里就每一轮都要
+/// 重算一遍行（`refresh_rows` 对每个会话目录都要 `canonicalize`）。
+pub(crate) fn adopt_pinned(app: &mut App, fresh: Vec<String>) {
+    if !projects_changed(&app.pinned, &fresh) {
+        return;
+    }
+    // 先记下来：`current_group()` 读的是**这一刻**的 `groups`，赋值之后
+    // 那个组可能就查不到了。
+    let keep = app
+        .current_group()
+        .map(|g| g.display_dir.display().to_string());
+    app.pinned = fresh;
+    if let Some(d) = keep {
+        let key = view::canon(Path::new(&d));
+        if !app.pinned.iter().any(|p| view::canon(Path::new(p)) == key) {
+            let _ = app
+                .client()
+                .and_then(|c| c.call(Request::PinProject { dir: d.clone() }));
+            app.pinned.push(d);
+        }
+    }
+    app.refresh_rows();
 }
 
 /// **光标落在哪个项目上，就把哪个项目 pin 住。**
