@@ -126,18 +126,6 @@ pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
 /// 不超过 12 个字，24 给英文答案（字母比汉字窄得多，字符数天然要多留
 /// 一截）留出呼吸空间。这不是排版决定，真正按显示宽度做裁剪的是界面
 /// 各处自己的事，跟这个常数无关。
-///
-/// 这一版还没有调用方——起名逻辑要接进 daemon 的 tick 才会用到它，那是
-/// 下一个任务的事。`expect` 只挂在非测试构建上：测试里已经在调它，那边
-/// 谈不上「死代码」；调用方接上之后 `cfg(not(test))` 那边的 `expect` 会
-/// 自己变成「多余的 expect」编译错误，到时候删掉它，不用指望有人记得回来查。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "下一个任务把起名逻辑接进 daemon 的 tick 时才会用到"
-    )
-)]
 const NAME_MAX_CHARS: usize = 24;
 
 /// 把模型回的东西洗成一个能直接画在标题上的名字。
@@ -145,13 +133,6 @@ const NAME_MAX_CHARS: usize = 24;
 /// 模型很少老老实实只给名字：会加引号、会加句号、会多写一句解释。
 /// 洗不干净的话屏幕上就会出现「「修登录白屏」。」。洗完是空串表示
 /// 这次没拿到可用的答案，调用方走兜底。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "下一个任务把起名逻辑接进 daemon 的 tick 时才会用到"
-    )
-)]
 pub(crate) fn clean_name(raw: &str) -> String {
     const QUOTES: [char; 12] = [
         '"', '\'', '「', '」', '『', '』', '“', '”', '‘', '’', '《', '》',
@@ -844,6 +825,19 @@ impl SessionManager {
                     if next == SessionState::Failed && was != SessionState::Failed {
                         self.request_explanation(&mut s);
                     }
+                    // 第一次干完活 = 起名的时机。不在第一句输入送出去时起：
+                    // 那一刻信息最少，正是「继续」「帮我看看」出现的地方；
+                    // 干完一轮之后屏幕上才有它到底在做什么的实证。
+                    //
+                    // `name_slot` 非 None 就是已经起过了（`request_name` 一进门
+                    // 就同步写兜底），所以这个条件同时管住了「只起一次」。
+                    if was == SessionState::Working
+                        && matches!(next, SessionState::Idle | SessionState::Asking)
+                        && s.is_agent
+                        && recover(s.name_slot.lock()).is_none()
+                    {
+                        self.request_name(&mut s);
+                    }
                 }
             }
             // 两个都没有：状态不动，保持 Unknown
@@ -879,6 +873,40 @@ impl SessionManager {
                 }
             }
             // 失败就什么都不做——界面显示今天就有的那句失败提示
+        });
+    }
+
+    /// 给这个会话起个名字。**只在它第一次干完活时调用一次**（见 `tick`）。
+    ///
+    /// 跟 `request_explanation` 是同一条路，但**不需要 generation 计数器**：
+    /// 失败会反复发生、迟到的旧解释会盖掉新解释，而名字一辈子只问一次，
+    /// 全程只有一个线程可能写这个槽。
+    fn request_name(&self, s: &mut Session) {
+        // 先把兜底同步写进去：从这一刻起 `name_slot` 就是 `Some(_)`，
+        // 它同时兼任「已经起过名了」的标志位。模型答得出就覆盖，
+        // 答不出就把第一句留在这儿。
+        let fallback: String = s.first_input.chars().take(NAME_MAX_CHARS).collect();
+        *recover(s.name_slot.lock()) = Some(fallback);
+
+        let Some(b) = recover(self.backend.lock()).clone() else {
+            return; // 没配后端：功能安静下线，兜底那句留着
+        };
+        let p = name_prompt(&s.first_input, &s.pty.screen_text());
+        let slot = s.name_slot.clone();
+        std::thread::spawn(move || {
+            // 15 秒，比 `explanation` 的 30 秒短：那个是用户正等着看解释，
+            // 这个是后台起名，没人等，等太久只是白占一个线程。
+            if let Ok(text) =
+                crate::llm::complete_with_timeout(b, p, std::time::Duration::from_secs(15))
+            {
+                let name = clean_name(&text);
+                if !name.is_empty() {
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(name);
+                    }
+                }
+            }
+            // 失败就什么都不做——兜底那句已经在槽里了
         });
     }
 }
@@ -1042,6 +1070,35 @@ mod tests {
         }
     }
 
+    // `fake_agent`（cat）的 idle_pattern 靠**回显用户敲的字**去命中——那对
+    // `tick_marks_idle_when_pattern_matches` 这种直接打 "READY" 的测试没问题，
+    // 但起名测试要送的是真实的第一句话（"修一下登录白屏"），screen 上永远不会
+    // 出现 "READY"，Working → Idle 这一跳就永远不会发生，`request_name` 也就
+    // 永远不会被触发到。所以起名测试需要一个不看输入内容、自己按时间线走到
+    // Idle 的假 agent：开局先是 Working（`send_input` 直接置位），过一小会儿
+    // 自己吐 "READY"，跟用户敲了什么无关。
+    fn finishing_agent() -> Profile {
+        Profile {
+            name: "finishing".into(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 0.2; echo READY; sleep 30".into(),
+            ],
+            is_agent: true,
+            idle_pattern: Some("READY".into()),
+            busy_pattern: None,
+            error_pattern: None,
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        }
+    }
+
     #[test]
     fn the_explain_prompt_carries_the_tail_of_the_screen() {
         let long = "x".repeat(5000) + "API Error: Connection closed mid-response.";
@@ -1188,6 +1245,188 @@ mod tests {
         assert!(p.user.contains("修一下登录白屏"));
         assert!(p.user.contains("auth.ts"));
         assert!(p.max_tokens <= 64, "起个名字不需要长回答");
+    }
+
+    struct FixedBackend(String);
+    impl crate::llm::Backend for FixedBackend {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct DeadBackend;
+    impl crate::llm::Backend for DeadBackend {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            Err(crate::llm::LlmError::Unavailable)
+        }
+    }
+
+    /// 起名的正路：干完一轮活，名字就出来了。
+    #[test]
+    fn a_session_gets_named_after_its_first_round_of_work() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(finishing_agent());
+        m.set_backend(Some(Arc::new(FixedBackend("「修登录白屏」。".into()))));
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap(); // 空字符串 = 回车，状态进 Working
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+            if tag == "修登录白屏" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "一直没起出名字，最后是 {tag:?}");
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// **钉死**：再干一轮，名字不变。这是「只起一次」唯一测得到的地方。
+    #[test]
+    fn a_name_is_pinned_and_never_asked_for_twice() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(finishing_agent());
+        m.set_backend(Some(Arc::new(FixedBackend("第一个名字".into()))));
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+
+        m.send_input(id, "干活").unwrap();
+        m.send_input(id, "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            if m.list().iter().find(|s| s.id == id).unwrap().tag == "第一个名字" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "第一次就没起出来");
+            sleep(Duration::from_millis(50));
+        }
+
+        // 换一个会给别的答案的后端，再走一轮 Working → Idle
+        m.set_backend(Some(Arc::new(FixedBackend("第二个名字".into()))));
+        m.send_input(id, "再干一轮").unwrap();
+        m.send_input(id, "").unwrap();
+        for _ in 0..20 {
+            m.tick();
+            sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            m.list().iter().find(|s| s.id == id).unwrap().tag,
+            "第一个名字",
+            "名字是钉死的，第二轮不该重起"
+        );
+    }
+
+    /// 模型答不上来（或者压根没配后端）时，名字停在第一句输入上，
+    /// 不是空着。
+    #[test]
+    fn a_dead_model_leaves_the_first_line_as_the_name() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(finishing_agent());
+        m.set_backend(Some(Arc::new(DeadBackend)));
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+            if tag == "修一下登录白屏" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "兜底没生效，最后是 {tag:?}");
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
+    /// 起名。这是触发条件里 `was == SessionState::Working` 唯一测得到的
+    /// 地方——`name_slot` 那道「只起一次」的门槛在这种场景下反而是帮凶：
+    /// 如果 Failed → Idle 也被当成起名时机，它会拿这时候还空着的
+    /// `first_input` 把 `name_slot` 提前钉死，等真正干完一轮活、有真实
+    /// 内容可用的时候，`name_slot` 已经非 `None` 了，再也翻不了身。
+    #[test]
+    fn recovering_from_a_failure_does_not_count_as_finishing_a_round() {
+        // 名字跟着 prompt 里有没有真实的第一句话走，而不是跟着「第几次被
+        // 问到」走：不管 request_name 是被误触发一次还是正常触发一次，
+        // 只要 prompt 里没有真实输入，答案就该是「提前」那句，不该是
+        // 「真实」那句——这样才量得出「到底是哪一次触发把名字定下来的」，
+        // 不受线程调度先后顺序影响。
+        struct ByPrompt;
+        impl crate::llm::Backend for ByPrompt {
+            fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                if p.user.contains("修一下登录白屏") {
+                    Ok("真实名字".into())
+                } else {
+                    Ok("提前起的名字".into())
+                }
+            }
+        }
+
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(
+            Profile::from_toml(
+                r#"
+                name = "flaky-name"
+                command = ["/bin/sh", "-c", "echo BOOM; sleep 0.2; clear; echo READY; sleep 30"]
+                is_agent = true
+                idle_pattern = "READY"
+                error_pattern = "BOOM"
+                "#,
+            )
+            .unwrap(),
+        );
+        m.set_backend(Some(Arc::new(ByPrompt)));
+        let id = m
+            .create(repo.path(), "flaky-name", empty_secrets(), &[])
+            .unwrap();
+
+        // 没送过任何输入，纯靠脚本自己 BOOM 再恢复——first_input 全程是空的。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_of(&m, id) != SessionState::Idle {
+            m.tick();
+            assert!(Instant::now() < deadline, "该从 BOOM 恢复成 Idle");
+            sleep(Duration::from_millis(50));
+        }
+        // 多跑几轮，给「本不该发生的提前触发」留够时间真的发生并把答案
+        // 写回槽里。
+        for _ in 0..10 {
+            m.tick();
+            sleep(Duration::from_millis(20));
+        }
+
+        // 现在才是真正干活：送真实输入，走一轮 Working → Idle。
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+            if tag == "真实名字" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "真正干完一轮活之后应该起出真实名字，最后是 {tag:?}"
+            );
+            sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
