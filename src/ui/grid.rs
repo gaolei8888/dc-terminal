@@ -126,13 +126,6 @@ pub fn crop_line(spans: &[ScreenSpan], max_cols: usize) -> Vec<ScreenSpan> {
     out
 }
 
-/// 极端组合下（很长的状态词 + 多位数 id + 60 列终端）光靠预算推导会把
-/// 名字挤到 0 列，用户连「这是哪个会话」都认不出——留这个下限保证名字
-/// 好歹露几个字符。代价：那种极端组合下状态词可能被再挤掉 1 列，但那不是
-/// `Working` 这个最常见、也是 `fix-2-brief.md` 点名要测的状态（见
-/// `tile_title_name_cap` 的文档）。
-const MIN_TITLE_NAME_COLS: usize = 4;
-
 /// 格子标题里名字能占的列数：从格子宽度**现推**，不是写死的常量。
 ///
 /// 九宫格的列数随当页会话数变（1/2/3 列，见 `grid_shape`）：同样宽的
@@ -149,6 +142,22 @@ const MIN_TITLE_NAME_COLS: usize = 4;
 /// 状态词后面那个空格。项目名不算进这笔账——它本来就没有走 `truncate`
 /// （既有缺口，final review 已经记录，见 `draw_grid` 里 `project` 那段的
 /// 注释，这次不修），再替它扣预算只会让名字更窄，换不来任何保证。
+///
+/// **故意不设下限。** 这里曾经有一个 `.max(4)`，理由是「名字总得露点什么」——
+/// 那个理由本身没错，但下限选错了保护对象：预算已经耗尽时，把名字的上限
+/// 硬拉高，抢的不是空白，是状态词的地盘。三位数 id（`AtomicU32` 单调递增、
+/// 守护进程常驻不重启，见 `src/session.rs` 的 id 分配，两三位数是家常便饭）
+/// 加上最长的英文状态词 `asking you`（10 列）在 60 列终端上会把预算吃穿，
+/// 下限一生效，`asking you` 就被现从裁到 `asking yo`/`asking y`/`asking `，
+/// 位数越多切得越狠——这正是这个函数存在的理由本该防住的事。
+///
+/// 不设下限不会让名字整个消失：`truncate` 自己就是那道防线——`max` 传 0
+/// 或任何一个连第一个字符都装不下的值，它只返回一个 `…`（见
+/// `widgets.rs::truncate` 的文档），从不返回空字符串。而只要发生了截断，
+/// `truncate` 的返回值最多比 `max` 宽 1 列（省略号是在宽度检查**之后**
+/// 追加的），这一列恰好被名字后面那个已经算进 `overhead` 的空格吸收——
+/// 所以「状态词完整可见」这条不变式在任何 id、任何状态词、任何宽度下都
+/// 成立，不是巧合，是这笔账本身的性质（细节见 `fix-2-report.md` 的推导）。
 fn tile_title_name_cap(tile_width: u16, id: u32, status_word: &str) -> usize {
     let budget = tile_width.saturating_sub(2) as usize;
     let overhead = 1                          // 焦点标记「▶」或一个空格
@@ -157,7 +166,7 @@ fn tile_title_name_cap(tile_width: u16, id: u32, status_word: &str) -> usize {
         + 1                                    // 名字后面那个空格
         + display_width(status_word)
         + 1; // 状态词后面那个空格
-    budget.saturating_sub(overhead).max(MIN_TITLE_NAME_COLS)
+    budget.saturating_sub(overhead)
 }
 
 /// 小于这个尺寸就不画格子。九格里每格还要各扣掉两行边框，再小下去
@@ -821,17 +830,38 @@ mod tests {
         );
     }
 
-    /// 下限只在极端组合下才会被触碰到——`Working` 状态、60 列宽的组合
-    /// 触不到（见上一条测试的 60 列结果 7/6，都大于下限 4）。挑一个真的会
-    /// 把预算推穿的组合：`asking you`（10 列，英文里最长的状态词）+ 60 列。
-    /// 不裁的话这里会算出负数（`saturating_sub` 会给 0），下限把它兜回 4，
-    /// 名字好歹还能露出几个字符。
+    /// 没有下限，预算真的会被吃穿到 0——这是有意的，不是漏了兜底。
+    /// `truncate` 自己就是最后一道防线：`max` 传 0，它只返回一个 `…`，
+    /// 从不返回空字符串（见 `widgets.rs::truncate` 的文档），所以名字
+    /// 不会真的消失，只是缩成一个省略号。
+    ///
+    /// 用真实会话 id 的位数递增来触碰这个边界：`AtomicU32` 单调递增、
+    /// 守护进程常驻不重启，两三位数的 id 是家常便饭，四位数也不是假想的
+    /// 极端值。`asking you`（10 列）是所有状态词里最宽的一个，也是用户
+    /// 最需要看见的那个——它意味着 agent 卡住等你回话。
     #[test]
-    fn tile_title_name_cap_has_a_floor_so_the_name_never_disappears() {
+    fn tile_title_name_cap_can_reach_zero_when_the_id_is_wide() {
+        // 60 列、3 列布局：预算 18 列。overhead = 1(标记) + id 位数 + 1(空格)
+        // + 1(空格) + 10(asking you) + 1(空格) = 14 + id 位数。
         assert_eq!(
             tile_title_name_cap(20, 1, "asking you"),
-            MIN_TITLE_NAME_COLS,
-            "60 列宽 + 最长的英文状态词，预算被吃穿，下限得兜住"
+            3,
+            "1 位数 id：18 − 15 = 3"
+        );
+        assert_eq!(
+            tile_title_name_cap(20, 10, "asking you"),
+            2,
+            "2 位数 id：18 − 16 = 2"
+        );
+        assert_eq!(
+            tile_title_name_cap(20, 100, "asking you"),
+            1,
+            "3 位数 id：18 − 17 = 1"
+        );
+        assert_eq!(
+            tile_title_name_cap(20, 1000, "asking you"),
+            0,
+            "4 位数 id：预算被吃穿，saturating_sub 给 0，不是负数或 panic"
         );
     }
 
@@ -1076,36 +1106,118 @@ mod tests {
     /// 状态词，从而看不出坏的那一格已经坏了——五格全长，状态词要么全部
     /// 消失（旧代码），要么全部还在（新代码），这条断言才踩得中问题。
     ///
-    /// 中英文各测一次：状态词是 `干活中`（6 列）或 `working`（7 列），
-    /// 预算差一列，而这一列正好是 80 列那一档的全部余量。
+    /// **四个能出现在正常格子里的状态各测一次，不只 `Working`。** 第一版只测了 `Working`，
+    /// 而 `Working` 恰好是所有状态词里最短的一个（中文 6 列、英文 7 列）——
+    /// 那一版的下限（`.max(4)`）在 `Working` 上从来不会被判定为「预算不够」，
+    /// 于是删掉下限那个变异在这条测试上悄悄溜了过去，得靠专门测下限的单测
+    /// 才抓到（回归的完整经过见 `fix-2-report.md`）。`Asking`
+    /// （`等你回答`/`asking you`，英文版 10 列，全部状态词里最宽）才是真正
+    /// 吃紧的一档，也是用户最需要看清楚的一档——它意味着 agent 卡住等你
+    /// 回话。中英文各测一次：状态词宽度不同，60/80 列那一档的余量也跟着变。
     #[test]
     fn a_long_name_never_pushes_the_status_word_off_the_tile_title() {
         use ratatui::backend::TestBackend;
 
-        for lang in [Lang::Zh, Lang::En] {
-            for width in [60u16, 80] {
-                let (mut app, _dir) = App::test_app();
-                app.lang = lang;
-                let sessions: Vec<SessionInfo> = (1..=5)
-                    .map(|i| {
-                        let mut s = session(i, SessionState::Working);
-                        s.tag = "修".repeat(24);
-                        s
-                    })
-                    .collect();
-                app.set_sessions(sessions);
-                app.view = View::grid(0);
+        // `Stopped` 不在这个列表里：五格全停会撞上另一条完全无关的分支——
+        // 「一个会话都没有」和「有会话但都停了」要分开说，全停时格子网格
+        // 整个换成一句「都停了，按 g/n」的解释文字（见
+        // `a_grid_of_only_stopped_sessions_says_where_they_went`），标题
+        // 这条不变式根本没有格子可测。这不是漏测：那条分支已经有自己的
+        // 测试盯着。
+        for state in [
+            SessionState::Working,
+            SessionState::Asking,
+            SessionState::Idle,
+            SessionState::Failed,
+        ] {
+            for lang in [Lang::Zh, Lang::En] {
+                for width in [60u16, 80] {
+                    let (mut app, _dir) = App::test_app();
+                    app.lang = lang;
+                    let sessions: Vec<SessionInfo> = (1..=5)
+                        .map(|i| {
+                            let mut s = session(i, state);
+                            s.tag = "修".repeat(24);
+                            s
+                        })
+                        .collect();
+                    app.set_sessions(sessions);
+                    app.view = View::grid(0);
 
-                let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
-                term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
-                let c = squashed(&term);
+                    let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+                    let c = squashed(&term);
 
-                let status = status_label(SessionState::Working, lang);
-                assert!(
-                    c.contains(status),
-                    "{lang:?} 语言、{width} 列下，24 字符的名字把状态词挤出了格子：{c}"
-                );
+                    // `squashed` 把画面里所有空白都过滤掉了（宽字符后面 ratatui
+                    // 塞的补位空格，见 `squashed` 自己的文档），`asking you`
+                    // 是唯一一个状态词自带内部空格的——不 squash 掉这个空格，
+                    // 拿它去 `contains` 永远找不到，会把「测试自己写错了」
+                    // 误判成「状态词被挤没了」。
+                    let status: String = status_label(state, lang)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    assert!(
+                        c.contains(&status),
+                        "{state:?}/{lang:?} 语言、{width} 列下，24 字符的名字把状态词挤出了格子：{c}"
+                    );
+                }
             }
+        }
+    }
+
+    /// 上一条测试的会话 id 固定是 1..=5，一位数——不会踩中真正让下限显得
+    /// 「有必要」的那个场景：id 越长，`tile_title_name_cap` 该给名字的预算
+    /// 越小，旧代码里的下限把预算硬拉回 4，抢的正是状态词的地盘。会话 id
+    /// 来自单调递增、永不回收的 `AtomicU32`（`src/session.rs:476,509,594`），
+    /// 守护进程又是长期常驻的，两三位数的 id 是运行几天后的正常状态，
+    /// 不是构造出来的边界。
+    ///
+    /// 用 `Asking` + 60 列（预算最紧的组合）配上从 1 位数到 4 位数的 id，
+    /// 状态词在任何一个 id 上都不能被挤没。
+    ///
+    /// **上限停在 4 位数，不是随便挑的。** 4 位数是这笔账本身能担保的边界：
+    /// `overhead = 4 + id 位数 + status 宽度`，`asking you` 是 10 列，
+    /// 60 列格子预算是 18 —— `id 位数 <= 4` 时 `overhead <= budget`，
+    /// 溢出最多 1 列，而这 1 列被名字后面那个空格吸收（见
+    /// `tile_title_name_cap` 文档里的证明）。5 位数（≥10000）会让 `overhead`
+    /// 本身超过预算——这时哪怕名字缩成一个 `…`，那 1 列的赤字也会啃掉状态词
+    /// 的最后一个字符（跑过一次：`asking you` 变成 `asking yo`，丢的不是
+    /// 空格，是内容）。这是审这一轮改动时顺手发现的、比这次评审要求的
+    /// `id=1/10/100` 更远一档的边界，超出这一轮的范围，已经在报告里单独
+    /// 记下来，不在这条测试里断言（断言了也是红的，不该由这条任务顺手改）。
+    #[test]
+    fn multi_digit_session_ids_do_not_erode_the_status_words_budget() {
+        use ratatui::backend::TestBackend;
+
+        for lang in [Lang::Zh, Lang::En] {
+            let (mut app, _dir) = App::test_app();
+            app.lang = lang;
+            let sessions: Vec<SessionInfo> = [1u32, 10, 100, 1000, 9999]
+                .into_iter()
+                .map(|id| {
+                    let mut s = session(id, SessionState::Asking);
+                    s.tag = "修".repeat(24);
+                    s
+                })
+                .collect();
+            app.set_sessions(sessions);
+            app.view = View::grid(0);
+
+            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+            let c = squashed(&term);
+
+            // 同上一条测试：`asking you` 带内部空格，squash 掉画面里的空白后
+            // 也要把期望值一起 squash，否则 `contains` 永远假红。
+            let status: String = status_label(SessionState::Asking, lang)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                c.contains(&status),
+                "{lang:?} 语言下，多位数 id 把状态词挤出了格子：{c}"
+            );
         }
     }
 
