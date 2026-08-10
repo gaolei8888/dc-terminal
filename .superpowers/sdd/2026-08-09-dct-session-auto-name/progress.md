@@ -112,3 +112,24 @@ Task 7: complete (commits df32dbd..10bea5f, review clean — spec ✅, every doc
 verified against source, both READMEs agree)
 Task 7: minor (deferred): the no-rename limitation landed in the new feature section rather than
 the "things that will annoy you" section; the fallback paragraph did land there correctly.
+
+FINAL WHOLE-BRANCH REVIEW (opus, 34-mutation audit): **NOT MERGEABLE AS-IS.**
+Full report being written to `final-review-report.md` in this directory — read that first.
+Blocking:
+  1. CODE — unsanitized keystroke bytes become the pinned name (`collect_first_input` accumulates
+     raw bytes from the per-keystroke attached-view path: backspace, control chars, escapes).
+  2. CODE — the grid tile header lets the name evict the status word, and dropping
+     `truncate(session_label(info), 20)` (src/ui/grid.rs:475) turns NO test red.
+  3. COVERAGE — the board list has zero coverage for this feature: swapping `session_label(s)`
+     back to `s.profile` (the list never shows the name) survives, as do dropping truncate/pad_to
+     and reverting the 70/76 activity re-budget.
+  4. TEST — `recovering_from_a_failure_does_not_count_as_finishing_a_round` survives deleting
+     either guard AND both at once; zero unique coverage. Delete it or assert on the slot at the
+     moment of recovery instead of on the final value.
+Follow-up (non-blocking): `is_agent` gate unpinned in BOTH places; grid re-anchoring tested only
+for session removal (not addition ahead of focus, not across a page boundary); attach title never
+asserts the positive; duplicate tests; `name_prompt`'s 2000-char cap unasserted.
+Flake shape worth remembering: the six new naming tests degrade toward FALSE GREENS under load,
+not false reds — they need a tick to land inside a 0.2s window polled at 50ms.
+Note: HEAD moved 10bea5f -> f007276 (the docs commit keeping this workspace) during the review,
+so its line numbers describe the tree as read. The `.gitignore` item it flagged is resolved.
