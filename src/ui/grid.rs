@@ -971,6 +971,51 @@ mod tests {
         assert!(c.contains("dc_desktop"), "格子标题要带项目名：{c}");
     }
 
+    /// 名字挤没状态词：`fix-2-brief.md` 算过账——3 列布局（5 个以上会话）
+    /// 下，60/80 列的终端每格只有 18/24 列标题预算，放不下「20 列名字 +
+    /// 状态词 + 项目名」，状态词被推出格子右边界，被 ratatui 按区域截断
+    /// 吃掉。九宫格存在的理由就是一眼看出「谁在干活、谁停了或挂了」，这个
+    /// 答案不能在名字一长就消失。
+    ///
+    /// 让**全部五格**都挂长名字，不是只挂一格：格子标题是逐格独立算的，
+    /// 只让一格挂长名字的话，另外四格（名字是默认的 `claude`，本来就短）
+    /// 无论有没有这次修复都会正常显示状态词，断言会在整块画面里找到
+    /// 状态词，从而看不出坏的那一格已经坏了——五格全长，状态词要么全部
+    /// 消失（旧代码），要么全部还在（新代码），这条断言才踩得中问题。
+    ///
+    /// 中英文各测一次：状态词是 `干活中`（6 列）或 `working`（7 列），
+    /// 预算差一列，而这一列正好是 80 列那一档的全部余量。
+    #[test]
+    fn a_long_name_never_pushes_the_status_word_off_the_tile_title() {
+        use ratatui::backend::TestBackend;
+
+        for lang in [Lang::Zh, Lang::En] {
+            for width in [60u16, 80] {
+                let (mut app, _dir) = App::test_app();
+                app.lang = lang;
+                let sessions: Vec<SessionInfo> = (1..=5)
+                    .map(|i| {
+                        let mut s = session(i, SessionState::Working);
+                        s.tag = "修".repeat(24);
+                        s
+                    })
+                    .collect();
+                app.set_sessions(sessions);
+                app.view = View::grid(0);
+
+                let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+                let c = squashed(&term);
+
+                let status = status_label(SessionState::Working, lang);
+                assert!(
+                    c.contains(status),
+                    "{lang:?} 语言、{width} 列下，24 字符的名字把状态词挤出了格子：{c}"
+                );
+            }
+        }
+    }
+
     /// **同一个项目的格子必须连排。** 格子上没有组头（二维布局里没地方放），
     /// 「谁跟谁是一伙的」全靠挨着——一旦按 id 全局排序，两个项目的格子就会
     /// 交错着铺满九宫格，用户只能一格一格读项目名。顺序由 `grid_sessions()`
