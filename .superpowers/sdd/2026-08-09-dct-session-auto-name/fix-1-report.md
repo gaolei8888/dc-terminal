@@ -224,3 +224,160 @@ None blocking. Two notes for whoever reviews this:
   which conflicts with the brief's own "no test failure = test not written
   well enough" instruction. Flagging this as a deliberate scope decision in
   case the reviewer disagrees with the trade-off.
+
+## Round 2 — fixes from the task review (spec ❌, two Important findings)
+
+The task review confirmed the sanitizing filter itself (`apply_keystrokes`/
+`sanitize`) was correct and left it untouched. Two Important findings were
+about consequences and coverage, not the filter, plus two minor cleanups.
+
+### Important 1 — the reopened naming gate was unbounded
+
+The review's diagnosis was correct and its root-cause analysis of its own
+brief's error was correct too: leaving `name_slot` as `None` on an empty
+fallback does *not* give a later real user input a second chance, because
+`collect_first_input` returns early once `first_input_sealed` is set — no
+later input ever reaches `first_input`. Only the model can ever name such a
+session, and gating on `name_slot.is_none()` reopened `request_name` on
+*every* subsequent Working→Idle transition, which meant: an unbounded
+stream of 15-second LLM calls for a session that will never usefully
+produce a name, and a real lost-update race — a second `request_name`
+firing before the first one's background thread completes would
+synchronously overwrite `name_slot` back to `None` (since a still-empty
+fallback recomputes to `None` every time), discarding a real name the first
+thread had already written.
+
+Fix: added a separate `Session::name_attempted: bool` field, set to `true`
+as the very first statement in `request_name` (before the fallback write,
+before the backend check — so there is no window where two calls could both
+see "not yet attempted"). `tick()`'s gate now checks `!s.name_attempted`
+instead of `name_slot.is_none()`. This restores true "ask once, ever"
+semantics — matching what the original (pre-existing, pre-fix-1) code
+comments claimed but, after my first pass, no longer delivered.
+
+Comments corrected to stop claiming `name_slot`'s `None`-ness is the "have
+we tried" signal:
+- `SessionInfo::tag`'s doc (was line 376-377, the "一次干完活时起一次，
+  之后不变" claim) — now points at `Session::name_attempted` as the
+  mechanism that actually guarantees this.
+- `request_name`'s doc and the `Session::name_slot` field doc (was line
+  1019-1021 in the reviewed diff) — rewritten to state the gate is
+  `name_attempted`, not `name_slot`.
+- Two test doc comments (`recovering_from_a_failure_does_not_count_as_finishing_a_round`,
+  and the test formerly named
+  `whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt`)
+  also asserted the old, wrong mechanism and were rewritten.
+
+**The whitespace-only test had to be inverted, not just relabeled.** The
+old test proved the gate *reopens* after an empty fallback — that was
+exactly the bug. It's renamed
+`whitespace_only_input_is_asked_about_exactly_once_not_forever` and now
+proves the opposite: after the first (empty-fallback) attempt, a second
+forced Working→Idle transition, even with a backend that *would* produce a
+real name, must **not** change the tag. Verified this test actually
+discriminates: reverted to the old assertion direction against the fixed
+code and confirmed it fails (see mutation table below, M9/M10 use the same
+mechanism).
+
+Mutation testing on the new gate:
+
+| # | Mutation | Result | Test(s) that caught it |
+|---|---|---|---|
+| M9 | Negate the tick() gate: `!s.name_attempted` → `s.name_attempted` | Caught | 8 tests failed, incl. `a_session_gets_named_after_its_first_round_of_work`, `a_name_is_pinned_and_never_asked_for_twice` |
+| M10 | Remove `s.name_attempted = true;` from `request_name` | Caught | `a_name_is_pinned_and_never_asked_for_twice`, `whitespace_only_input_is_asked_about_exactly_once_not_forever` |
+
+### Important 2 — the core regression test was at the wrong layer
+
+Correct finding, and the review's prediction was right: I added
+`ui::board::tests::a_tag_with_control_bytes_never_reaches_the_rendered_buffer`
+in `src/ui/board.rs`, using the existing `TestBackend` + `screen_text()`
+harness (`board.rs:266`), setting `SessionInfo.tag = "\x1b[Afix\x7f"`
+directly (bypassing the daemon entirely, simulating what a UI talking to an
+unpatched daemon would receive) and rendering a real frame.
+
+**The test fails.** `screen_text()`'s output contains the literal bytes
+`\u{1b}[Afix\u{7f}` — the board's list-item rendering path
+(`Span::raw` → `List`/`ListItem` → `Line` → `Span::render_ref`, `board.rs:211`)
+has no control-character filter of its own, exactly as the review predicted
+from reading the `ratatui` source. The daemon-side `sanitize` added in
+Round 1 is necessary and correct for the primary path (new daemon → new
+UI), but does not close the socket-boundary path (old/unpatched daemon →
+new UI) the review pointed at — `SessionInfo.tag` crosses that boundary as
+`#[serde(default)]` JSON with no guarantee about what produced it.
+
+Per the review's explicit instruction, I did **not** silently add a filter
+to `truncate`/`session_label`/the render path — that code is `grid.rs:475`
+/ `board.rs` territory that the review's own message describes as the
+subject of a *different* Important finding (about `grid.rs:475` dropping
+`truncate(session_label(info), 20)`), i.e. arguably someone else's fix task.
+Instead: the test is marked `#[ignore = "..."]` with a reason string that
+states the gap and cites this report, so `cargo test` stays green while the
+test remains in the tree, discoverable, and immediately runnable
+(`cargo test -- --ignored`) by whoever picks up UI-side filtering — they
+won't need to reconstruct the threat model, just delete the `#[ignore]` and
+watch it turn green once fixed.
+
+**Recommendation for whoever owns the UI side**: the fix likely belongs in
+`session_label` (`widgets.rs:168`) — a single choke point for both
+`board.rs` and `grid.rs`'s title rendering — running the tag through the
+same kind of control-character strip before it's ever handed to `Span`.
+Whether to reuse `session::sanitize`-shaped logic or something UI-local is
+a decision for that task, not this one.
+
+### Minor findings
+
+- `sanitize` changed from `pub(crate)` to private (`fn sanitize`, was
+  `pub(crate) fn sanitize`) — no caller outside `session.rs` (verified with
+  `grep -rn "session::sanitize\|::sanitize(" src/` excluding `session.rs`
+  itself: no matches). Tests still see it fine since `mod tests` is a
+  submodule.
+- Added a paragraph to `model_name`'s doc comment explaining that its call
+  to `sanitize` borrows keystroke semantics (backspace-pops) for text that
+  isn't a keystroke stream, and why that's harmless here (a model answer
+  containing `\x7f`/`\x08` is already an edge case — screen content the
+  model is echoing back after being manipulated — and either "pop" or
+  "drop" reads leave the same safety property: the byte never survives
+  into the name; "pop" was kept only so `sanitize` stays a single
+  implementation instead of one per caller).
+
+### Re-verification
+
+```
+$ cargo test --lib session:: -- --test-threads=1
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out
+
+$ cargo test --lib ui::board:: -- --test-threads=1
+test result: ok. 14 passed; 0 failed; 1 ignored; 0 measured; 672 filtered out
+(the 1 ignored is the new, deliberately-red-if-run render-layer test — see
+Important 2 above)
+
+$ cargo test -- --test-threads=1        # full workspace: unit + all integration binaries
+test result: ok. 686 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+... (16 more "ok" lines, one per integration test binary, all 0 failed)
+
+$ cargo fmt --check
+(clean)
+
+$ cargo clippy --all-targets
+(clean, no warnings)
+
+$ git diff --check
+(clean)
+```
+
+Files touched this round: `src/session.rs` (the `name_attempted` fix and
+comment corrections), `src/ui/board.rs` (the new render-layer test).
+
+### Concerns
+
+- The `#[ignore]`d test in `board.rs` is, as far as I could find, the first
+  use of `#[ignore]` in this codebase (`grep -rn "#\[ignore" src/` had no
+  prior hits). I judged it the right tool for "known failing, deliberately
+  not fixed here, must stay discoverable" rather than inventing a
+  codebase-local convention, but flagging the precedent in case the
+  reviewer prefers a different way to record an intentionally-still-broken
+  regression test (e.g. tracking it purely in this report with no test
+  artifact at all).
+- The UI-side gap Important 2 surfaced is real and is not fixed by this
+  task. `tag` reaching the UI unsanitized from an old daemon is a genuine,
+  if narrower, instance of the same injection class Finding 1 was about.
