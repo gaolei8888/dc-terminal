@@ -144,6 +144,14 @@ You can scroll back through what a session already printed, with `PageUp`/`PageD
 
 A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
 
+## Sessions get a name
+
+Three `claude` sessions in one project used to all read `3 claude`, `5 claude`, `7 claude` — the same string with a different number, in every place you'd check before deciding which one to open. Now the daemon names each agent session for you: the first time it finishes a round of work — the first `Working → Idle`/`Asking` transition after you've actually said something to it — it hands the model configured under `[llm]` what you said and what's on screen, and asks for a short name. `3 claude` becomes `3 fix the login blank screen`, and that's it for the life of the session; it's generated once and never regenerated. The name is written in whatever language you typed in, not whatever the interface happens to be showing — the two can drift apart because `l` switches the interface language at runtime, but a name, once made, doesn't move with it.
+
+It shows up everywhere a session does: the session list, the tile titles in the grid, and the reply box's recipient line. The attached session's own title carries it too, with one exception — while the connection to the daemon is down, that title's space goes to the warning and the way out instead, not the name. One shared helper decides what to draw for a session, so these places can't quietly drift the way separately-formatted strings always do.
+
+There's no way to rename a session by hand in this version.
+
 ---
 
 # Where this is going
@@ -170,6 +178,8 @@ The point was never "use your terminal from anywhere." It's that **development k
 To copy inside a session where the agent wants the mouse, press `F4` to enter copy mode: the mouse goes back to the terminal, the bottom bar says so, and pressing `F4` again leaves it once you're done copying. You can also use your terminal's own modifier (Option in iTerm2) without leaving the session at all.
 
 `dct` has no copy of its own — copying uses whatever your terminal already gives you.
+
+Naming a session needs an `[llm]` backend configured in `~/.dct/config.toml`, and most people don't have one — that's the normal case, not a problem. Without it, or if the model call times out, or the answer that comes back isn't usable, naming quietly steps back: the name falls back to the first thing you typed, trimmed short. Never typed anything either? Then there's no name at all, and the display shows exactly what it always showed before this feature existed — the agent's profile name. None of that interrupts the session or shows an error; it just runs.
 
 Permissions are auto-accepted, which means an agent can write outside the project directory. **Those writes are outside the snapshot and undo won't bring them back.**
 
