@@ -297,6 +297,16 @@ mod tests {
     /// `board.rs:211` 那句 `truncate(session_label(s), 15)` 会先经过
     /// `truncate`，控制字符在那一层就被丢弃了（细节和为什么选那一层，
     /// 见 `truncate` 自己的文档、`fix-1-report.md` 的 Important 2）。
+    ///
+    /// **两条断言缺一不可**：只断言「控制字符不在」测不出「这一行到底
+    /// 有没有画」——如果哪天改动让这个会话整行都不渲染了、或者
+    /// `session_label`/`tag` 干脆不再画出来，控制字符自然也不在
+    /// `screen_text` 里，这条测试会**假装通过**，其实什么都没验证到。
+    /// 第二条断言钉住「标签洗完之后剩下的那部分文字确实上了屏幕」——
+    /// `truncate("\x1b[Afix\x7f", 15)` 丢掉 `ESC` 和 `DEL` 之后剩下
+    /// `"[Afix"`（`[` 和 `A` 是转义序列里的普通可打印字符，`truncate`
+    /// 不做整条转义序列的识别，只逐字符丢控制字节，见它自己的文档）。
+    /// 两条assert 合起来才是「标签画出来了，而且是干净的」。
     #[test]
     fn a_tag_with_control_bytes_never_reaches_the_rendered_buffer() {
         let (mut app, dir) = App::test_app();
@@ -314,6 +324,10 @@ mod tests {
         assert!(
             !c.chars().any(|ch| ch.is_control()),
             "控制字符穿透渲染，落进了 buffer：{c:?}"
+        );
+        assert!(
+            c.contains("[Afix"),
+            "标签清洗剩下的可见部分应该照样画在屏幕上，不能连内容一起被吞掉：{c:?}"
         );
     }
 

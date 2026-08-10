@@ -1618,6 +1618,23 @@ mod tests {
         }
     }
 
+    /// 跟 `FixedBackend` 一样答得出名字，多做一件事：`complete()` 被调用
+    /// 的那一刻往 channel 里发一个信号。`complete_with_timeout`
+    /// （`llm/mod.rs`）会在**它自己另开的一个线程**里同步调用
+    /// `Backend::complete`，所以收到这个信号就是「`request_name` 真的
+    /// 走到了模型这一步」唯一站得住脚的证据——不是靠猜多久之后 `tag`
+    /// 应该变了没变。
+    struct SignalingBackend {
+        name: String,
+        called: std::sync::mpsc::Sender<()>,
+    }
+    impl crate::llm::Backend for SignalingBackend {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            let _ = self.called.send(());
+            Ok(self.name.clone())
+        }
+    }
+
     /// 起名的正路：干完一轮活，名字就出来了。
     #[test]
     fn a_session_gets_named_after_its_first_round_of_work() {
@@ -1904,23 +1921,52 @@ mod tests {
             "空白兜底不该产出一个看不见但非空的 tag"
         );
 
-        // 换一个答得出名字的后端，再逼一次 Working → Idle：`send_input`
-        // 的空串分支会无条件把状态同步置回 Working（不管屏幕内容），
-        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。如果
-        // `name_attempted` 没有真正挡住重复触发，这个后端会在几轮之内
-        // 把 tag 改写成「真实名字」。
-        m.set_backend(Some(Arc::new(FixedBackend("真实名字".into()))));
+        // 换一个答得出名字、但会在被真正调用时发信号的后端，再逼一次
+        // Working → Idle：`send_input` 的空串分支会无条件把状态同步置回
+        // Working（不管屏幕内容），"READY" 还留在屏幕上，下一次 tick 就
+        // 会再判一次 Idle。
+        let (called_tx, called_rx) = std::sync::mpsc::channel();
+        m.set_backend(Some(Arc::new(SignalingBackend {
+            name: "真实名字".into(),
+            called: called_tx,
+        })));
         m.send_input(id, "").unwrap();
 
-        for _ in 0..10 {
+        // 触发（如果 `name_attempted` 没挡住的话）第二次 Working → Idle。
+        // 这几次 `tick()` 全是同步调用——`request_name` 会不会被**触发**
+        // 在 `tick()` 内部就已经决定好了，不需要真实时间流逝，用不着
+        // sleep。
+        for _ in 0..5 {
             m.tick();
-            assert_eq!(
-                m.list().iter().find(|s| s.id == id).unwrap().tag,
-                "",
-                "name_attempted 该挡住第二次 request_name，这个会话不该再起出名字"
-            );
-            sleep(Duration::from_millis(30));
         }
+
+        // 用 channel 而不是「等一会儿再看 tag 变没变」判定：旧版本的这条
+        // 测试是十次 `tick()` + 30ms sleep 各自断言 `tag == ""`，负载重的
+        // 时候后台线程可能没能在这固定 ~300ms 的预算里落地，测试因为
+        // 错误的原因侥幸通过——那正是这一整个分支被打回的病根（真正
+        // 「判别力强」的测试要能稳定地红，不能只是偶尔红）。
+        //
+        // `recv_timeout` 反过来用：`complete()` 一旦真被调用，
+        // `SignalingBackend` 会几乎瞬间发信号（纯内存操作，没有网络
+        // 延迟），5 秒给的是巨大的余量——如果 bug 真的在，信号早就该到了；
+        // 如果 `name_attempted` 生效，信号**永远不会来**，超时本身就是
+        // 这条测试要的证据，不是「等的时间不够长」。跟其余测试等一个
+        // *会*发生的事件时用的 5 秒 deadline 是同一个量级，这里等的是
+        // 「确认它不发生」。
+        match called_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(()) => panic!(
+                "name_attempted 没有挡住第二次 request_name：\
+                 后端的 complete() 被再次调用了"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(e) => panic!("channel 出了意外：{e:?}"),
+        }
+
+        assert_eq!(
+            m.list().iter().find(|s| s.id == id).unwrap().tag,
+            "",
+            "既然没有第二次 request_name，tag 也不该变"
+        );
     }
 
     /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
