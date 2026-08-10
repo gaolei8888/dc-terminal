@@ -1,7 +1,8 @@
 # Fix 2 report — grid tile title loses the status word to a long name
 
 Base: `12e5b0f` (Fix 1 complete, on `feat/session-auto-name`).
-Commits: `a1f2070` (failing test), `7048a24` (implementation).
+Commits: `a1f2070` (failing test), `7048a24` (implementation), `07862d8`
+(round-1 fix: drop the name floor).
 
 ## Option chosen: A (derive the cap from tile width)
 
@@ -187,3 +188,155 @@ $ git diff --check
   the reply-row `who` construction in `draw()` — both out of scope per the
   brief and the task instructions, confirmed by direct reading rather than
   taking the brief's scope note on faith.
+
+## Round 1 addendum — the floor was actively wrong
+
+The reviewer rendered the floored code by hand at 60 columns, `Asking`,
+English, and found the floor clipping `asking you` down to `asking yo` /
+`asking y` / `asking ` for ids 1/10/100 — worse the wider the id got, and not
+English-only (`等你回答` loses its last character at id >= 100 too). My own
+concern note had understated this as "roughly 1 column, Working-only-safe";
+it was actually up to 3 columns, and it hit the most important state
+(`Asking` — the agent is blocked on the user) precisely because that state's
+word is the widest.
+
+### Verifying the claim before acting on it
+
+Per `receiving-code-review`, worked the arithmetic by hand against the real
+`truncate` (`src/ui/widgets.rs:164-183`) before touching code:
+
+- `truncate(s, max)` never returns an empty string. When the first character
+  doesn't fit, it returns exactly `"…"` (width 1) with no characters
+  consumed — this is the reviewer's "truncate is its own floor" claim, and
+  it holds regardless of how small `max` is, including 0.
+- When truncation happens after `n` characters fit, the returned width is
+  `w + 1` where `w <= max` (width already consumed before the character that
+  overflowed) — so overshoot past `max` is **at most** 1 column, not always
+  exactly 1 (it's 0 when the string's character widths land exactly on
+  `max`, checked both with all-ASCII and all-CJK strings by hand).
+- Reconstructed the reviewer's three id/asking-you renderings from the
+  arithmetic (floored cap = 4 for all three ids because 18−15, 18−16, 18−17
+  all round-trip through `.max(4)`; unfloored cap = 3/2/1) and the predicted
+  clipped/fixed status text matched their claimed buffers exactly for
+  id=1/10/100, confirming the claim rather than trusting it.
+- Pushed the same arithmetic further than the review's examples and found a
+  **new, smaller edge the review's proof doesn't cover**: the "status word
+  fully visible" invariant only holds while `overhead <= budget`. At 60
+  columns with `Asking`/English, `overhead = 14 + id_digits`, so the
+  invariant holds through 4-digit ids (`9999`, overhead=18=budget, 1-column
+  overshoot absorbed by the trailing space) but breaks at 5 digits
+  (`10000`, overhead=19>budget=18): even the bare `"…"` name still pushes 2
+  columns over budget, and the second of those 2 columns comes out of the
+  status word itself (`asking you` → `asking yo`, verified by writing the
+  test with id=10000 first, watching it fail, and reading the printed
+  buffer). This is a real, narrower gap than what the floor was covering,
+  discovered while verifying the fix rather than trusting the proof at face
+  value. **Left it out of scope deliberately** — a 5-digit session id
+  requires roughly 10,000 sessions created over a daemon's lifetime, well
+  past what this round's brief or the coordinator's examples (id up to 100)
+  called for, and unilaterally expanding a requested floor-removal into a
+  budget-formula rewrite is scope creep this task shouldn't take on its own
+  authority. Flagging it here as a candidate triage item alongside the three
+  the coordinator already listed (project-name comment, per-frame
+  allocation, tile/reply-row disagreement at 120 columns).
+
+### What changed
+
+- `src/ui/grid.rs`: deleted `MIN_TITLE_NAME_COLS` and the `.max(...)` call
+  in `tile_title_name_cap`; `tile_title_name_cap` is now a straight
+  `budget.saturating_sub(overhead)`.
+- Replaced `tile_title_name_cap_has_a_floor_so_the_name_never_disappears`
+  (self-referential — asserted `== MIN_TITLE_NAME_COLS`, so it would have
+  stayed green if the constant itself were raised) with
+  `tile_title_name_cap_can_reach_zero_when_the_id_is_wide`, asserting
+  literal values (3, 2, 1, 0) for `Asking`/60-columns across 1-4 digit ids.
+- Widened `a_long_name_never_pushes_the_status_word_off_the_tile_title` from
+  `Working`-only to a loop over `Working`/`Asking`/`Idle`/`Failed`.
+  `Stopped` is deliberately excluded: rendering 5 sessions that are all
+  `Stopped` hits an unrelated pre-existing branch (`draw_grid` replaces the
+  whole tile grid with a "they're all stopped, press g/n" screen — already
+  covered by `a_grid_of_only_stopped_sessions_says_where_they_went`), not
+  the tile-title code path this fix touches. Discovered this by running the
+  loop with `Stopped` included first and reading the failure — the buffer
+  contained the "all stopped" sentence, not a stale/clipped tile.
+- Added `multi_digit_session_ids_do_not_erode_the_status_words_budget`,
+  reproducing the reviewer's exact id=1/10/100/`Asking`/60-column scenario
+  plus the 1000/9999 boundary the arithmetic still guarantees (stopped at
+  9999, not 10000+, for the reason above).
+- Both new render tests initially had a real bug of their own, caught by
+  running them before trusting them green: `status_label(Asking, En)` is
+  `"asking you"`, the only status word with an internal space, but the
+  assertion compared it against `squashed(&term)`, which strips **all**
+  whitespace from the rendered buffer (documented on `squashed` itself,
+  pre-existing). `c.contains("asking you")` can never match a string with no
+  spaces in it — first run failed with a message claiming the status word
+  was clipped when the buffer plainly contained `askingyou` intact. Fixed by
+  stripping whitespace from the expected status string the same way before
+  comparing, and left a comment explaining why (so the next person doesn't
+  reintroduce the same false failure).
+
+### Mutation testing (repeated on the amended code)
+
+Same by-hand protocol as before: edit, run, observe, revert, confirm green.
+
+1. **Acceptance criterion — delete `truncate()` from the tile title.**
+   `truncate(session_label(info), name_cap)` → `session_label(info)`.
+   Result: 2 tests failed (`a_long_name_never_pushes_the_status_word_off_the_tile_title`,
+   `multi_digit_session_ids_do_not_erode_the_status_words_budget`). Reverted.
+2. **Derivation → fixed value.** `tile_title_name_cap` body → `20`
+   (unconditionally). Result: 4 tests failed (both render tests plus both
+   pure-arithmetic tests). Reverted.
+3. **Reintroduce the deleted floor** (`.max(4)` added back) — this is the
+   exact regression the review found, run against the amended test suite to
+   confirm it's now caught. Result: 3 tests failed
+   (`a_long_name_never_pushes_the_status_word_off_the_tile_title` at the
+   `Asking` iteration, `multi_digit_session_ids_do_not_erode_the_status_words_budget`,
+   `tile_title_name_cap_can_reach_zero_when_the_id_is_wide`). Reverted.
+
+### Test commands and output tails
+
+```
+$ cargo test --lib ui::grid:: -- --test-threads=1
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 628 filtered out; finished in 0.09s
+
+$ cargo fmt --check
+(clean, no output)
+
+$ cargo clippy --all-targets
+    Checking dct v0.1.0 (/Users/lei/work/dc/dc-terminal)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4s
+
+$ cargo test -- --test-threads=1
+test result: ok. 694 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in ~32-40s
+(plus 15 integration-test binaries; one run showed `tests/grid_reply.rs`
+FAILED on 2 tests — a real socket+PTY test that spawns a daemon and a login
+shell and waits on wall-clock deadlines, unrelated to this file. Re-ran
+`cargo test --test grid_reply -- --test-threads=1` in isolation immediately
+after: 2 passed, 0 failed, confirming it was load-induced flake in the full
+parallel run, not a regression from this change. Full suite re-run after
+came back clean.)
+```
+
+### Files whose tests were re-run for this round
+
+- `src/ui/grid.rs` (`ui::grid::tests::*`, 66 tests) — the only file this
+  round's commit touches.
+- Full workspace `cargo test` (694 lib tests + all `tests/*.rs` integration
+  binaries) to catch any unexpected interaction.
+
+### Concerns (superseding the previous round's concern)
+
+- The previous round's stated concern ("the floor could still cost the
+  status word ~1 column in extreme combinations") is retracted — that floor
+  is now gone, and the invariant it was hedging against no longer needs
+  hedging for any case the removal itself can guarantee.
+- New concern, deliberately not fixed this round: **5+ digit session ids
+  (>= 10000) can still clip the last 1-2 characters off the status word** at
+  60 columns with the `Asking` state, because at that point `overhead` alone
+  (before the name contributes anything) exceeds the tile's budget. This is
+  a materially smaller and further-out edge than the floor bug — the review
+  proof's own examples never reached it — but it is real, reproduced by
+  hand, and worth a line in the final review's triage list alongside the
+  three items already flagged (project-name comment overpromising,
+  per-frame `id.to_string()` allocation, tile/reply-row disagreement at 120
+  columns).
