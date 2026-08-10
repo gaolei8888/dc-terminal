@@ -1737,7 +1737,7 @@ mod tests {
     /// 用空的 first_input 把名字永久钉成空串。
     #[test]
     fn a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen() {
-        // 跟 `recovering_from_a_failure_does_not_count_as_finishing_a_round`
+        // 跟 `recovering_from_a_failure_after_real_input_still_does_not_count`
         // 同一个理由：名字跟着 prompt 里有没有真实的第一句话走，这样才能
         // 把「是哪一次触发定下了这个名字」测出来，不受线程调度影响。
         struct ByPrompt;
@@ -1969,114 +1969,24 @@ mod tests {
         );
     }
 
-    /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
-    /// 起名。这个场景里 `was == SessionState::Working` 和
-    /// `!s.first_input.is_empty()` 两道判断**都**能单独拦住误触发（这里
-    /// 从没送过输入，first_input 全程是空的，跟
+    /// **钉死** `was == SessionState::Working` 这道判断：用户已经说过话
+    /// （`first_input` 非空，`!s.first_input.is_empty()` 那道判断已经放行）
+    /// 之后，agent 却报错又恢复——五个内置 profile 有 `error_pattern`
+    /// （只有 codex.toml 没有），用户说完话之后 agent 报错、错误文案又从
+    /// 屏幕上滚走，`classify()` 会把这读成 Idle。这不是「干完一轮活」，
+    /// 不该拿它起名，起了就会把一辈子只有一次的 `name_attempted` 提前
+    /// 烧掉，真正干完活也翻不了身。
+    ///
+    /// `!s.first_input.is_empty()` 那一半单独由
     /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
-    /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
-    /// `name_attempted` 那道「只起一次」的门槛在误触发场景下反而是帮凶——
-    /// 如果 Failed → Idle 被当成起名时机，它会拿这时候还空着的
-    /// `first_input` 把 `name_attempted` 提前置成 `true`，等真正干完
-    /// 一轮活、有真实内容可用的时候，`request_name` 已经再也不会被
-    /// 调用第二次了。
-    #[test]
-    fn recovering_from_a_failure_does_not_count_as_finishing_a_round() {
-        // 名字跟着 prompt 里有没有真实的第一句话走，而不是跟着「第几次被
-        // 问到」走：不管 request_name 是被误触发一次还是正常触发一次，
-        // 只要 prompt 里没有真实输入，答案就该是「提前」那句，不该是
-        // 「真实」那句——这样才量得出「到底是哪一次触发把名字定下来的」，
-        // 不受线程调度先后顺序影响。
-        struct ByPrompt;
-        impl crate::llm::Backend for ByPrompt {
-            fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
-                if p.user.contains("修一下登录白屏") {
-                    Ok("真实名字".into())
-                } else {
-                    Ok("提前起的名字".into())
-                }
-            }
-        }
-
-        let repo = init_repo();
-        let m = SessionManager::new();
-        m.register_profile(Profile {
-            name: "flaky-name".into(),
-            // 清屏和打 READY 必须在**同一次** write 里发生，不能是 `clear;
-            // echo READY` 那种两条命令、两次 write：pty 读端偶尔会正好落在
-            // 两次 write 之间那个窗口，那一刻屏幕上既没有 BOOM 也没有
-            // READY，`classify()` 会把它错判成 `Working`，下一次 tick 才
-            // 看见 READY，就成了一次货真价实但不该发生的 `Working → Idle`
-            // ——first_input 还是空的，这道判断本该拦住它却没机会拦，测试
-            // 就会因为错误的原因失败（观察到的是 flake，不是这个测试真正
-            // 要测的东西）。一次 `printf` 把 ED2（清屏）、光标归位、READY
-            // 三样一起打出去，从根上消掉这个窗口。
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "echo BOOM; sleep 0.2; printf '\\033[2J\\033[HREADY\\n'; sleep 30".into(),
-            ],
-            is_agent: true,
-            idle_pattern: Some("READY".into()),
-            busy_pattern: None,
-            error_pattern: Some("BOOM".into()),
-            env: Default::default(),
-            secret: None,
-            install: None,
-            headless: None,
-            api: None,
-            label: Default::default(),
-            note: Default::default(),
-        });
-        m.set_backend(Some(Arc::new(ByPrompt)));
-        let id = m
-            .create(repo.path(), "flaky-name", empty_secrets(), &[])
-            .unwrap();
-
-        // 没送过任何输入，纯靠脚本自己 BOOM 再恢复——first_input 全程是空的。
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while state_of(&m, id) != SessionState::Idle {
-            m.tick();
-            assert!(Instant::now() < deadline, "该从 BOOM 恢复成 Idle");
-            sleep(Duration::from_millis(50));
-        }
-        // 多跑几轮，给「本不该发生的提前触发」留够时间真的发生并把答案
-        // 写回槽里。
-        for _ in 0..10 {
-            m.tick();
-            sleep(Duration::from_millis(20));
-        }
-
-        // 现在才是真正干活：送真实输入，走一轮 Working → Idle。
-        m.send_input(id, "修一下登录白屏").unwrap();
-        m.send_input(id, "").unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            m.tick();
-            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
-            if tag == "真实名字" {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "真正干完一轮活之后应该起出真实名字，最后是 {tag:?}"
-            );
-            sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// **钉死** `was == SessionState::Working` 单独扛住的那一半：
-    /// `recovering_from_a_failure_does_not_count_as_finishing_a_round`
-    /// 测的是 `first_input` 全程为空的场景——那条测试其实是被两道判断
-    /// 同时拦住的（`!s.first_input.is_empty()` 那道判断也在拦，见它的
-    /// 文档注释），单独去掉 `was == Working` 拦不住它。这条要隔离的是
-    /// `!s.first_input.is_empty()` 已经放行之后剩下的那一半：用户已经
-    /// 说过话（`first_input` 非空），agent 却报错又恢复——五个内置
-    /// profile 有 `error_pattern`（只有 codex.toml 没有），用户说完话
-    /// 之后 agent 报错、错误文案又从屏幕上滚走，`classify()` 会把这读成
-    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会把一辈子只有
-    /// 一次的 `name_attempted` 提前烧掉，真正干完活也翻不了身。
+    /// 钉住（刚创建、first_input 全程为空的场景）；这条测的是它放行之后
+    /// 剩下那一半。曾经还有第三条测试，想在「first_input 全程为空」的
+    /// 恢复场景里同时钉两道判断——删掉了：那个场景里两道判断本来就都能
+    /// 单独拦住误触发，而测试断言的是最终状态、不是误触发那一刻的槽值，
+    /// 结果两道判断分别单独删掉都测不出来，只有两个一起删才勉强测出来
+    /// （用 mutation 验证过）。这两个「一起删」需要的分量，现在被这条和
+    /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
+    /// 分别独立覆盖了，留着那第三条纯属重复，删掉不损失任何判别力。
     ///
     /// 区分「误触发」和「真起名」不能靠 `first_input`——两次触发时它都
     /// 非空、内容还一样，天生分不出谁是谁。只能靠 prompt 里屏幕尾巴那
@@ -3185,17 +3095,5 @@ mod tests {
         let s: SessionInfo = serde_json::from_str(old).expect("旧 JSON 必须还能读");
         assert_eq!(s.tag, "", "缺字段补空串");
         assert_eq!(s.id, 3);
-    }
-
-    /// 新建的会话还没起过名。
-    #[test]
-    fn a_fresh_session_has_no_tag() {
-        let repo = init_repo();
-        let m = SessionManager::new();
-        m.register_profile(fake_agent());
-        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
-
-        let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
-        assert_eq!(tag, "");
     }
 }
