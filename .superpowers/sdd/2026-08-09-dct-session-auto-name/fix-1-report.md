@@ -1,0 +1,226 @@
+# Fix 1 report — control bytes in session names
+
+Owner: fix-1 (of 4 blocking items from the final review). Scope: only Finding 1
+(`src/session.rs`, the unsanitized-keystroke-bytes-become-the-name defect). The
+other three findings are separate tasks and were not touched.
+
+## What changed and why
+
+The bug chain (see `fix-1-brief.md` for the full argument, verified against
+`ratatui-0.28.1` source): the attach view forwards every keystroke verbatim
+(`ui/mod.rs::key_to_input`) — arrows are `\x1b[A`..`\x1b[D`, Backspace is
+`\x7f`, Esc is `\x1b`, Ctrl+letter is `\x01`..`\x1a`. `collect_first_input`
+recorded these raw bytes into `first_input`, `request_name` copied them
+straight into `name_slot` with no filtering, and `name_slot`'s content
+(`SessionInfo.tag`) is rendered via `Line` → `Span::render_ref`, a path that —
+unlike `Buffer::set_stringn`/`Paragraph` — does not drop control characters.
+A backspace-laden or escape-prefixed name would therefore corrupt every
+subsequent frame of the board/grid/attach title.
+
+Fixes, all in `src/session.rs`:
+
+1. **`is_backspace` / `apply_keystrokes`** (new, near `clean_name`): a shared
+   character-processing core. `\x7f`/`\x08` pop the last character already
+   accumulated (per the "recorded text should match what the user meant to
+   type" decision — `"fix teh\x7f\x7f\x7fthe"` now records as `"fix the"`,
+   not a literal byte replay). A full CSI escape sequence (`ESC '[' `
+   parameter-bytes* terminator-byte, terminator = ASCII `0x40..=0x7E`) is
+   consumed and dropped as one unit — dropping only the leading `ESC` and
+   leaving `[A` behind was an early bug I caught with a mutation test (see
+   below): `[` and the letter that follows it are *not* control characters
+   individually, so a naive `char::is_control()` filter lets them through.
+   Bare `Esc` (not followed by `[`) is dropped with no lookahead. Any other
+   control character (Ctrl+letter) is dropped outright.
+2. **`append_capped`** now delegates to `apply_keystrokes` with a cap, so
+   `first_input` — the buffer collected incrementally, one `send_input` call
+   per keystroke in the attach view — is clean at the point of collection.
+   This also fixes the secondary problem the brief flagged: `first_input` is
+   fed verbatim into `name_prompt`, so the model itself used to be handed a
+   string full of `\x7f`.
+3. **`sanitize`** (new, `pub(crate)`, one-shot version of the same filter):
+   applied to the model's answer before it can reach `name_slot`, since
+   `clean_name` only strips quotes/punctuation and was never meant to strip
+   control bytes.
+4. **`fallback_name` / `model_name`** (new, pure functions): the two
+   decision points from the brief — "cap → sanitize → trim → treat empty as
+   `None`" — extracted out of `request_name` into free functions, for the
+   same reason `collect_first_input` was already a free function (see its
+   doc comment): it's logic worth testing directly, decoupled from the
+   locks/threads/PTY machinery in `request_name`. This extraction was not
+   optional cosmetics — see mutation M3 below, it's the only way the
+   fallback-side `sanitize` call turned out to be provably necessary.
+   `request_name` now just calls `*recover(s.name_slot.lock()) =
+   fallback_name(&s.first_input);` and, in the model thread, `if let
+   Some(name) = model_name(&text) { ... }`.
+5. Empty-after-sanitize handling: if `fallback_name`/`model_name` return
+   `None`, `name_slot` is left/set to `None`, not `Some(String::new())`.
+   `name_slot.is_none()` doubles as the "have we tried yet" gate in `tick()`,
+   so a whitespace-only first message no longer permanently pins an
+   invisible empty tag — the next Working→Idle transition gets another shot
+   at naming the session.
+
+## Mutation testing
+
+Per the brief's instruction, "all green" was not the bar — every mutation
+below was hand-introduced, the suite re-run, and the result recorded. Two of
+them **survived** on the first pass; both led to either a stronger test or
+(in one case) a refactor that made the surviving code path testable at all.
+The exact code was restored from a saved copy (`diff` verified identical)
+after every mutation.
+
+| # | Mutation | Result | Test(s) that caught it |
+|---|---|---|---|
+| M1 | `apply_keystrokes`: negate `!ch.is_control()` → `ch.is_control()` | **Caught** | 21 tests failed (nearly everything touching `first_input`/`sanitize`) |
+| M2 | `request_name`'s fallback write: drop the `is_empty()` → `None` branch, always `Some(fallback)` | **Survived first**, then caught | See below — required strengthening the whitespace test |
+| M3 | `fallback_name`: remove the `sanitize(&capped)` call | **Survived first**, then caught | See below — required extracting `fallback_name` as a directly-testable function |
+| M4 | `model_name`: remove the `sanitize(&clean_name(raw))` call (use `clean_name` alone) | Caught | `model_name_is_none_when_nothing_survives_the_wash`, `model_name_strips_control_bytes_after_clean_name`, `the_model_named_path_is_sanitized_too` |
+| M5 | `fallback_name`: invert the emptiness check (`!cleaned.is_empty() → None`) | Caught | 6 tests failed, incl. `fallback_name_is_none_for_whitespace_only_input`, `whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt` |
+| M6 | CSI terminator range narrowed to `0x40..=0x3f` (always empty ⇒ the loop never finds a terminator and silently eats the rest of the string) | Caught | `fallback_name_strips_control_bytes_even_if_first_input_somehow_carries_them` (its input has real text *after* the escape sequence, which is what exposes over-consumption) |
+| M7 | Negate the CSI-introducer check (`chars.peek() == Some(&'[')` → `!=`) | Caught | 6 tests failed, incl. `sanitize_strips_escape_sequences_and_ctrl_codes`, `collect_first_input_drops_escape_sequences_and_control_codes` |
+| M8 | Negate `is_backspace` (`==` → `!=` / `&&` instead of `||`) | Caught | 24 tests failed |
+
+### M2 in detail — why it survived, and the fix
+
+The first version of the "whitespace-only input" test only asserted that
+`SessionInfo.tag` stayed `""`. That assertion is blind to the bug: `list()`
+does `name_slot.clone().unwrap_or_default()`, so `None` and `Some("")` both
+render as `""` — they're indistinguishable from the outside. The mutation
+(always writing `Some(fallback)`, even when empty) pins `name_slot` to
+`Some("")` forever, which the old test could not see.
+
+The fix was to test the thing that actually depends on `None` vs `Some("")`:
+whether the naming gate reopens. I rewrote
+`whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt` to
+force a *second* Working→Idle transition (using `fake_agent()` / `cat`, whose
+screen content I control by writing `"READY"` to it directly, since
+`finishing_agent()` only prints `READY` once and then sleeps 30s — it can't
+be used to force a second transition). After the whitespace round, I swap in
+a `FixedBackend` that returns a real name and drive a second round; the test
+only passes if that second round can actually produce a name, which requires
+`name_slot` to have been left `None`.
+
+### M3 in detail — why it survived, and the fix
+
+`s.first_input` is written *only* through `collect_first_input` →
+`append_capped`, which (after this fix) already strips control bytes and
+escape sequences at collection time. So by the time `request_name` reads
+`s.first_input`, it is provably already clean — no test driven through the
+public `SessionManager` API can make the `sanitize(&fallback)` call in
+`request_name` matter, because nothing can get an unsanitized byte into
+`first_input` in the first place under the current code.
+
+Rather than accept an untestable "defense in depth" line (which the brief's
+own process explicitly disallows — "no test failure = the test wasn't written
+well enough, go add more"), I extracted the fallback-computation logic into
+`fallback_name(first_input: &str) -> Option<String>`, a pure function with no
+`Session`/PTY dependency. That makes it possible to test the sanitize step in
+isolation, by handing it a string that *deliberately* bypasses
+`append_capped` — `fallback_name("fix\x1b[A the bug")` must equal
+`Some("fix the bug".to_string())`. This also matches the file's existing
+convention (`collect_first_input`'s own doc comment gives the identical
+rationale for being a free function). The same extraction was applied
+symmetrically to the model-name path as `model_name`.
+
+## Test commands and output
+
+TDD: the new tests were written first and confirmed to fail to compile
+(`sanitize` didn't exist yet), then the implementation was added.
+
+Full session module suite, single-threaded (the timing-sensitive naming
+tests share real subprocesses and must not run concurrently):
+
+```
+$ cargo test --lib session:: -- --test-threads=1
+...
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 16.49s
+```
+
+Full workspace suite (unit + all integration test binaries):
+
+```
+$ cargo test -- --test-threads=1
+...
+test result: ok. 686 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.95s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s   (doctests)
+test result: ok. 9 passed; ...
+test result: ok. 1 passed; ...   (x several integration binaries)
+test result: ok. 3 passed; ...
+test result: ok. 6 passed; ...
+test result: ok. 5 passed; ...
+test result: ok. 2 passed; ...
+test result: ok. 1 passed; ...
+... (17 test binaries total, all "0 failed")
+```
+
+Formatting and lints:
+
+```
+$ cargo fmt --check
+(no output — clean)
+
+$ cargo clippy --all-targets
+    Checking dct v0.1.0 (/Users/lei/work/dc/dc-terminal)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.7s
+(no warnings)
+
+$ git diff --check
+(no output — clean)
+```
+
+One clippy warning was fixed along the way: `while let Some(next) =
+chars.next()` inside the CSI-consuming loop → `for next in chars.by_ref()`
+(clippy::while_let_on_iterator).
+
+## New tests added (all in `src/session.rs`, `mod tests`)
+
+Pure-function level:
+- `sanitize_strips_escape_sequences_and_ctrl_codes`
+- `sanitize_pops_the_previous_character_on_backspace`
+- `sanitize_backspace_on_an_empty_buffer_does_nothing`
+- `sanitize_keeps_ordinary_text_untouched`
+- `fallback_name_strips_control_bytes_even_if_first_input_somehow_carries_them`
+- `fallback_name_is_none_for_whitespace_only_input`
+- `fallback_name_caps_and_trims`
+- `model_name_strips_control_bytes_after_clean_name`
+- `model_name_is_none_when_nothing_survives_the_wash`
+- `collect_first_input_applies_backspace_as_the_user_intended`
+- `collect_first_input_backspace_reaches_across_calls`
+- `collect_first_input_drops_escape_sequences_and_control_codes`
+- `collect_first_input_backspace_on_an_empty_buffer_does_nothing_bad`
+
+Full `SessionManager` integration level (real subprocess, real `tick()`,
+50ms-poll deadline loops — the same pattern the file already uses everywhere
+else; per the brief's known-flake warning, none of these depend on landing a
+tick inside a narrow timing window, they poll to a 5s deadline):
+- `a_tag_born_from_control_bytes_never_carries_them_into_the_render_path` —
+  the brief's required core regression test: feeds `\x1b[A` (arrow-up,
+  simulating "pressed up-arrow to recall history before typing") plus a
+  typo-and-backspace sequence through `send_input` one keystroke at a time,
+  asserts the resulting `tag` never contains a control character at any
+  point during polling, and lands on the exact backspace-corrected string
+  `"fix the"`.
+- `the_model_named_path_is_sanitized_too` — model returns a name containing
+  `ESC` and `DEL`, asserts the stored tag is clean.
+- `whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt`
+  — see M2 above.
+
+## Concerns / follow-ups
+
+None blocking. Two notes for whoever reviews this:
+
+- `append_capped`'s CSI-consumption loop has no explicit upper bound on how
+  many bytes it will consume looking for a terminator; if it ever finds
+  none, it silently consumes the rest of the current `text` chunk. This is
+  safe in practice given `FIRST_INPUT_MAX` (200 chars) and the 24-char
+  `name_prompt` model-name cap bound the blast radius, and it's the same
+  trade-off any ANSI-stripper makes on malformed input — but it's worth
+  knowing about if this function is ever reused somewhere with an unbounded
+  input size.
+- I extracted `fallback_name`/`model_name` beyond what the brief's "要改什么"
+  section literally asked for (it only asked for a shared `sanitize` called
+  at the two write points). I judged this necessary rather than optional
+  because mutation M3 could not otherwise be honestly closed — the
+  alternative was leaving a genuinely dead/untestable line in `request_name`,
+  which conflicts with the brief's own "no test failure = test not written
+  well enough" instruction. Flagging this as a deliberate scope decision in
+  case the reviewer disagrees with the trade-off.
