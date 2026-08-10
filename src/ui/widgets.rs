@@ -134,10 +134,40 @@ pub(crate) fn display_width(s: &str) -> usize {
 }
 
 /// 按显示宽度截断，超出的用 … 收尾。看板一行放不下就裁，不能让它换行把表格冲乱。
+///
+/// **顺带把控制字符滤掉，这是渲染层唯一的一道防线。**`char_width` 对
+/// 控制字符返回 0（见它自己的文档），如果不在这里主动丢弃，它们会带着
+/// 零宽度混进 `out`：既不占用截断预算，又原样穿过这个函数，交给
+/// `ratatui` 的 `Span::render_ref` 原样画出来——那条路不像
+/// `Buffer::set_stringn`/`Paragraph` 那样过滤控制字符（细节见
+/// `fix-1-brief.md`）。`\x1b[A` 这种转义序列一旦这样漏到终端上，就是
+/// 每一帧都往看板里发一次真实的光标控制命令。
+///
+/// 选在这里补、不是在 `session_label` 补：这个函数是**看板列表项、
+/// 九宫格标题、附着视图块标题**共用的唯一收窄口（`board.rs`/`grid.rs`/
+/// `attach.rs` 的相关调用点都会经过这里），补在这一处就同时覆盖了四条
+/// 渲染路径；`session_label` 只覆盖 tag 这一个字段，且它现在返回的是
+/// 零拷贝的 `&str`，要在那边过滤就得先把签名改成拿所有权的 `String`，
+/// 牵连所有调用点。
+///
+/// **只丢 `is_control()`，不做转义序列的整体识别**（不像守护进程侧
+/// `session::sanitize` 那样把 `ESC '[' ... 终止字节` 整段吃掉）：这里
+/// 要保的安全性质只有「控制字节不能原样落进终端」，`\x1b[A` 里的 `[`
+/// 和 `A` 单独看是普通可打印字符，把 `ESC` 丢了之后，剩下的 `[A` 对
+/// 终端来说就是两个字，不再是一条活的控制序列——守护进程侧要多做一步
+/// 是因为它还要保证「记录下来的文本等于用户真正想打的话」，这里没有
+/// 这层语义负担，不用照抄那一整套状态机。
+///
+/// **不会影响宽度/CJK 计算**：`char_width` 已经把控制字符算成 0 列，
+/// 这里只是不再把它们 `push` 进 `out`，`w` 的累加值一分不差——跳过的
+/// 字符本来就没有为 `w` 贡献过什么。
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let mut w = 0;
     let mut out = String::new();
     for ch in s.chars() {
+        if ch.is_control() {
+            continue;
+        }
         let cw = char_width(ch);
         if w + cw > max {
             out.push('…');
@@ -399,6 +429,47 @@ mod tests {
         );
         // 中文项目名一个字两列，按显示宽度截，不能按字符数
         assert_eq!(project_label("一二三四五六", "~/w", 5), "一二…");
+    }
+
+    /// **核心回归测试**：控制字符/转义序列不能穿过 `truncate` 落进渲染
+    /// 出的字符串——这是渲染层唯一的一道防线（细节见 `truncate` 自己的
+    /// 文档、`fix-1-brief.md`、`fix-1-report.md` 的 Important 2）。
+    /// 上箭头（`\x1b[A`）和退格（`\x7f`）是 fix-1-brief 按键表里
+    /// 真实存在的转发字节，直接照抄。
+    #[test]
+    fn truncate_strips_control_bytes_before_they_can_reach_the_render_path() {
+        assert_eq!(truncate("\x1b[Afix\x7f", 20), "[Afix");
+        assert_eq!(truncate("\x1b\x01hi", 20), "hi");
+    }
+
+    /// 控制字符不占宽度预算（`char_width` 早就把它们算成 0 列），丢弃
+    /// 它们不该让后面正常的字被多裁或者少裁一个——`w` 的累加值必须跟
+    /// 「控制字符从没出现过」时完全一样。
+    #[test]
+    fn truncate_dropping_control_bytes_does_not_shift_the_width_budget() {
+        assert_eq!(truncate("ab", 2), "ab");
+        assert_eq!(
+            truncate("a\x1bb", 2),
+            "ab",
+            "控制字符不该占用这 2 列里的任何一列"
+        );
+        assert_eq!(truncate("abc", 2), "ab…");
+        assert_eq!(
+            truncate("a\x1bbc", 2),
+            "ab…",
+            "丢弃控制字符之后，正常字符该不该被裁的判断不能变"
+        );
+    }
+
+    /// 中文/CJK 宽度计算不受影响：控制字符和两列宽的字符混在一起时，
+    /// 截断点仍然按显示宽度算，不是按字符数。
+    #[test]
+    fn truncate_control_byte_stripping_does_not_disturb_cjk_width_accounting() {
+        // 4 列刚好放得下两个中文字，后面没有更多字符，不该被裁。
+        assert_eq!(truncate("一\x1b二", 4), "一二");
+        // 加上第三个字就超出 4 列，即使 4 列本身正好被前两个字占满，
+        // 这一条钉的是「控制字符没有偷偷占掉本该属于第三个字的空间」。
+        assert_eq!(truncate("一\x1b二三", 4), "一二…");
     }
 
     /// 路径中间不许挖空。`~/work/dc/x` 放不下时给出 `dc/x`，绝不能是

@@ -293,20 +293,11 @@ mod tests {
     /// （细节见 `fix-1-brief.md`）。`screen_text` 只过滤空白字符，
     /// 控制字符如果真的穿透渲染，会原样出现在它的输出里。
     ///
-    /// **这条测试现在是红的，而且故意留红**（`#[ignore]`，不是删掉或者
-    /// 悄悄改断言凑合过）：`session.rs` 的 `sanitize` 只挡得住「新守护
-    /// 进程 + 新界面」这一种组合，挡不住「新界面接旧守护进程」——旧
-    /// 守护进程从没洗过 `tag`，界面这边这条渲染路径本身完全不设防。
-    /// 这是 fix-1 范围之外的一个真实缺口，细节见
-    /// `fix-1-report.md`：这条测试留着不删，是为了让接手界面侧过滤
-    /// （`truncate`/`session_label`，`grid.rs:475` 那条相关发现提到的
-    /// 正是这两个函数）的人有一条能直接摘掉 `#[ignore]` 验证的测试，
-    /// 不用重新猜一遍威胁模型。
+    /// **界面侧的防线在 `widgets::truncate` 里**，不在这个测试文件——
+    /// `board.rs:211` 那句 `truncate(session_label(s), 15)` 会先经过
+    /// `truncate`，控制字符在那一层就被丢弃了（细节和为什么选那一层，
+    /// 见 `truncate` 自己的文档、`fix-1-report.md` 的 Important 2）。
     #[test]
-    #[ignore = "known gap outside fix-1's scope: the render path in board.rs \
-                has no control-character filter of its own; only the daemon-side \
-                sanitize protects it, so a UI talking to a pre-fix daemon still \
-                renders raw control bytes. See fix-1-report.md, Important 2."]
     fn a_tag_with_control_bytes_never_reaches_the_rendered_buffer() {
         let (mut app, dir) = App::test_app();
         let proj = real_dir(&dir, "proj");
