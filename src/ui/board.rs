@@ -275,6 +275,57 @@ mod tests {
             .collect()
     }
 
+    /// **核心回归测试，钉在渲染出的 buffer 这一层**（`fix-1-brief.md`
+    /// 明确要的层级——见 `fix-1-report.md` 里对第一轮 review 的回应）。
+    ///
+    /// `session::tests` 里同名意图的测试断言的是 `SessionInfo.tag`，那是
+    /// 渲染的**输入**，不是渲染的**结果**：`tag` 是 `#[serde(default)]`
+    /// 的 JSON 字段，跨守护进程↔界面的 socket 走（见 `SessionInfo::tag`
+    /// 自己的文档），一个连着**旧守护进程**的新界面——这是本仓库里
+    /// 记录在案、会反复发生的组合——会原样拿到旧守护进程从来没洗过的
+    /// `tag`。`session.rs` 那道 `sanitize` 过滤完全长在守护进程一侧，
+    /// 界面这边没有第二道防线；这条测试才是真正验证「就算界面拿到一个
+    /// 脏 tag，控制字符最终也画不到屏幕上」的地方。
+    ///
+    /// 看板列表项走的是 `Span::raw` → `List`/`ListItem` → `Line` →
+    /// `Span::render_ref`（`board.rs:211`），跟 `Buffer::set_stringn`/
+    /// `Paragraph` 不是同一条路，后两者会过滤控制字符，前者不会
+    /// （细节见 `fix-1-brief.md`）。`screen_text` 只过滤空白字符，
+    /// 控制字符如果真的穿透渲染，会原样出现在它的输出里。
+    ///
+    /// **这条测试现在是红的，而且故意留红**（`#[ignore]`，不是删掉或者
+    /// 悄悄改断言凑合过）：`session.rs` 的 `sanitize` 只挡得住「新守护
+    /// 进程 + 新界面」这一种组合，挡不住「新界面接旧守护进程」——旧
+    /// 守护进程从没洗过 `tag`，界面这边这条渲染路径本身完全不设防。
+    /// 这是 fix-1 范围之外的一个真实缺口，细节见
+    /// `fix-1-report.md`：这条测试留着不删，是为了让接手界面侧过滤
+    /// （`truncate`/`session_label`，`grid.rs:475` 那条相关发现提到的
+    /// 正是这两个函数）的人有一条能直接摘掉 `#[ignore]` 验证的测试，
+    /// 不用重新猜一遍威胁模型。
+    #[test]
+    #[ignore = "known gap outside fix-1's scope: the render path in board.rs \
+                has no control-character filter of its own; only the daemon-side \
+                sanitize protects it, so a UI talking to a pre-fix daemon still \
+                renders raw control bytes. See fix-1-report.md, Important 2."]
+    fn a_tag_with_control_bytes_never_reaches_the_rendered_buffer() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut s = sess(1, &proj);
+        // 上箭头的转义序列 + 一个字面的退格字节，模拟 fix-1-brief 里
+        // 描述的、一个没洗过 tag 的旧守护进程会发过来的东西。
+        s.tag = "\x1b[Afix\x7f".into();
+        app.set_sessions(vec![s]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(
+            !c.chars().any(|ch| ch.is_control()),
+            "控制字符穿透渲染，落进了 buffer：{c:?}"
+        );
+    }
+
     /// 用户报的症状一：底栏写着「当前项目：dc-terminal」，看板却列着
     /// dc_desktop 的会话。答案不再是「把别的项目藏起来」，而是**分组**：
     /// 两个项目都在屏幕上，各自的会话待在自己的组头底下，谁属于谁一眼可见。

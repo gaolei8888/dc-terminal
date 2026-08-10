@@ -234,7 +234,7 @@ fn apply_keystrokes(out: &mut String, text: &str, cap: Option<usize>) {
 /// 和标点、不管控制字符——一段被操纵过的屏幕内容可以诱导模型把控制字符
 /// 原样吐回来。两条路落地前必须过同一道过滤，漏一条就是漏一条到用户
 /// 终端的注入路径。
-pub(crate) fn sanitize(text: &str) -> String {
+fn sanitize(text: &str) -> String {
     let mut out = String::new();
     apply_keystrokes(&mut out, text, None);
     out
@@ -253,10 +253,14 @@ pub(crate) fn sanitize(text: &str) -> String {
 ///
 /// 洗完再 `trim()` 一次，重新判断是否为空：如果什么都不剩（比如用户
 /// 只敲了个空格就回车），返回 `None`——调用方据此把 `name_slot` 留成
-/// `None`，不写一个看不见的空字符串。`name_slot` 非 `None` 就是「已经
-/// 起过名」的标志位（见 `request_name`），写成 `Some("")` 会把这个
-/// 会话永久钉死成一个看不见的名字，往后再也没有机会用一次真正的输入
-/// 重新起名。
+/// `None`，不写一个看不见的空字符串（`Some("")` 在 `session_label` 里
+/// 跟真的没起出名字长得一模一样，`list()` 对两者做的都是
+/// `unwrap_or_default()`）。
+///
+/// **`None` 不等于「还没试过」**：「问过没有」单独用
+/// `Session::name_attempted` 记，不能再靠这个函数的返回值是不是 `None`
+/// 来判断——细节和为什么不能靠 `name_slot`，见 `name_attempted` 自己的
+/// 文档。
 fn fallback_name(first_input: &str) -> Option<String> {
     let capped: String = first_input.chars().take(NAME_MAX_CHARS).collect();
     let cleaned = sanitize(&capped);
@@ -274,6 +278,16 @@ fn fallback_name(first_input: &str) -> Option<String> {
 /// 被操纵过的屏幕内容能诱导模型把控制字符原样吐回来，这里补上 `sanitize`
 /// 那一道，跟 `fallback_name` 走的是同一份判空逻辑：洗完/去空白之后
 /// 什么都不剩，返回 `None`，调用方不写、不覆盖已经在槽里的兜底。
+///
+/// 借用的是同一个 `sanitize`，所以模型答案里如果恰好带上 `\x7f`/`\x08`，
+/// 也会被读成「退格，弹掉上一个字符」——`sanitize` 那套弹出语义原本是
+/// 为**按键流**设计的（用户改错字），模型答案不是按键流，这里是把一个
+/// 键盘领域的语义借到了文本领域。无害：退格类字节混进模型答案本来就
+/// 极其罕见（那是屏幕内容被操纵之后模型复述出来的控制字节，不是正常
+/// 语言输出的一部分），就算真的出现，按「弹出」还是按「丢弃」处理，
+/// 结果都是「这个字节不会以原样留在名字里」——两种读法在这里要保的
+/// 安全性质上没有区别，选「弹出」只是为了让 `sanitize` 保持单一实现、
+/// 不用为两个调用方各写一套控制字符处理。
 fn model_name(raw: &str) -> Option<String> {
     let cleaned = sanitize(&clean_name(raw));
     let cleaned = cleaned.trim();
@@ -373,7 +387,10 @@ pub struct SessionInfo {
     /// 名字猜：那是 profile.toml 里的一个声明（`profile.rs` 的 `is_agent`），
     /// 只有守护进程读得到，猜的迟早会跟真值分叉。
     pub is_agent: bool,
-    /// 这个会话的稳定名字，守护进程在它第一次干完活时起一次，之后不变。
+    /// 这个会话的稳定名字，守护进程在它第一次干完活时起一次，之后不变——
+    /// 「只起一次」由守护进程侧的 `Session::name_attempted` 保证，不是靠
+    /// 这个字段本身是不是空串（一个第一句话只有空白的会话也会被判定为
+    /// 「已经问过」，即使问出来的结果是空）。
     ///
     /// 空串 = 还没起出来（刚建、没配 LLM、不是 agent 会话，或者对面是
     /// 认不得这个字段的旧守护进程）。**界面遇到空串一律退回 `profile`。**
@@ -405,12 +422,28 @@ struct Session {
     /// 正持着它。裸 `Option<String>` 编不过。
     explanation_slot: Arc<Mutex<Option<String>>>,
     /// 会话起名用的槽。跟 `explanation_slot` 平级、同一套用法。
-    /// `None` = 还没触发过起名；`Some(_)` = 已经触发过（**只触发一次**）。
+    ///
+    /// **`None` 不等于「还没触发过起名」**：`fallback_name` 允许兜底
+    /// 本身就是 `None`（第一句话洗完/去空白之后什么都不剩，见它的
+    /// 文档），这种会话被问过之后 `name_slot` 也是 `None`。「问没问过」
+    /// 单独用 `name_attempted` 记，不能再靠这个字段是不是 `None` 判断。
     name_slot: Arc<Mutex<Option<String>>>,
     /// 用户对这个会话说的第一句话，起名用。只在 agent 会话上攒。
     first_input: String,
     /// 第一句攒完了没有。见 `collect_first_input`。
     first_input_sealed: bool,
+    /// 起名有没有被**真正尝试过一次**——这是「只问一次」唯一的门槛。
+    ///
+    /// 不能拿 `name_slot.is_none()` 当门槛：`fallback_name` 允许兜底
+    /// 本身就是 `None`，如果继续靠 `name_slot` 判断「问过没有」，一个
+    /// 第一句话只有空白的会话会在**每一次** Working → Idle 都重新触发
+    /// `request_name`——白白多打一次模型（`request_explanation` 的文档
+    /// 里要躲的是同一种坑：一个失败会话能把额度烧光），而且会有两个
+    /// 后台起名线程同时在飞：后触发的那次 `request_name` 会同步把
+    /// `name_slot` 写回 `None`，把前一个线程已经写进去的真名字覆盖
+    /// 掉——一次丢失更新。`request_name` 一进门就把这里设成 `true`，
+    /// 之后这个会话再也不会被 `tick()` 认为该起名。
+    name_attempted: bool,
     /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
     /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
     /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
@@ -625,6 +658,7 @@ impl SessionManager {
             name_slot: Arc::new(Mutex::new(None)),
             first_input: String::new(),
             first_input_sealed: false,
+            name_attempted: false,
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
         };
@@ -966,13 +1000,20 @@ impl SessionManager {
                     // 活，这种情况下也该拿这段还没封存的话去起名，不该因为没封存
                     // 就被这道判断拦下。
                     //
-                    // `name_slot` 非 None 就是已经起过了（`request_name` 一进门
-                    // 就同步写兜底），所以这个条件同时管住了「只起一次」。
+                    // 「只起一次」的门槛是 `name_attempted`，**不是**
+                    // `name_slot.is_none()`：`fallback_name` 允许兜底本身
+                    // 就是 `None`（第一句话洗完/去空白之后什么都不剩），
+                    // 如果拿 `name_slot` 当门槛，这种会话会在每一轮
+                    // Working → Idle 都被重新读成「还没起过」，白白多打
+                    // 一次模型，还可能让两个后台起名线程同时在飞——后
+                    // 触发的那次会把先完成的线程刚写进去的真名字同步
+                    // 覆盖回 `None`，一次丢失更新（细节见 `name_attempted`
+                    // 自己的文档）。
                     if was == SessionState::Working
                         && matches!(next, SessionState::Idle | SessionState::Asking)
                         && s.is_agent
                         && !s.first_input.is_empty()
-                        && recover(s.name_slot.lock()).is_none()
+                        && !s.name_attempted
                     {
                         self.request_name(&mut s);
                     }
@@ -1014,17 +1055,28 @@ impl SessionManager {
         });
     }
 
-    /// 给这个会话起个名字。**只在它第一次干完活时调用一次**（见 `tick`）。
+    /// 给这个会话起个名字。**只在它第一次干完活时调用一次**——门槛是
+    /// `Session::name_attempted`，`tick()` 在调用这里之前已经检查过
+    /// （不是 `name_slot` 是否为 `None`：`fallback_name` 允许兜底本身
+    /// 就是 `None`，拿 `name_slot` 当门槛会让这类会话每一轮都被重新
+    /// 触发，细节见 `name_attempted` 的文档）。
     ///
     /// 跟 `request_explanation` 是同一条路，但**不需要 generation 计数器**：
-    /// 失败会反复发生、迟到的旧解释会盖掉新解释，而名字一辈子只问一次，
-    /// 全程只有一个线程可能写这个槽。
+    /// 失败会反复发生、迟到的旧解释会盖掉新解释，而这里的门槛在函数
+    /// 一进门就同步立起来（见下面第一行），全程只有一个线程可能写
+    /// `name_slot`，没有「迟到的旧答案盖掉新答案」这种事要防。
     fn request_name(&self, s: &mut Session) {
-        // 先把兜底同步写进去：从这一刻起 `name_slot` 就是 `Some(_)`，
-        // 它同时兼任「已经起过名了」的标志位。模型答得出就覆盖，
-        // 答不出就把第一句留在这儿。`fallback_name` 可能给 `None`
-        // （洗完/去空白之后什么都不剩），这种情况下 `name_slot` 就该
-        // 留成 `None`，不能钉死一个看不见的空 tag——见它自己的文档。
+        // 先立门槛，**在做任何别的事之前**：不管兜底洗不洗得出东西、
+        // 不管有没有配后端，「这个会话已经问过一次名字」从这一刻起就是
+        // 定局，`tick()` 不会再为它调用这个函数第二次。放在最前面是为
+        // 了不留窗口——换成先写兜底、后立门槛，两步之间那一刻门槛还
+        // 没立起来。
+        s.name_attempted = true;
+
+        // 再把兜底同步写进去：模型答得出就覆盖，答不出就把第一句留在
+        // 这儿。`fallback_name` 可能给 `None`（洗完/去空白之后什么都
+        // 不剩），这种情况下 `name_slot` 就该留成 `None`，不能钉死一个
+        // 看不见的空 tag——见它自己的文档。
         *recover(s.name_slot.lock()) = fallback_name(&s.first_input);
 
         let Some(b) = recover(self.backend.lock()).clone() else {
@@ -1801,25 +1853,26 @@ mod tests {
     }
 
     /// 只送空白（一个空格加回车）：洗完/去空白之后兜底是空的，`name_slot`
-    /// 必须留 `None`，不能把一个看不见的空 tag 钉死。
+    /// 必须留 `None`，不能钉死一个看不见的空 tag——**但「问过没有」这件
+    /// 事本身必须只成立一次**，不能因为 `name_slot` 还是 `None` 就被
+    /// `tick()` 读成「还没问过」而反复重新触发。反复触发的代价是真实的：
+    /// 每一轮 Working → Idle 都会再打一次模型（跟 `request_explanation`
+    /// 的文档里要躲的是同一种坑——一个答不上来的会话能把额度烧光），
+    /// 而且会有两个后台起名线程同时在飞——后触发的那次 `request_name`
+    /// 会同步把 `name_slot` 写回 `None`，把前一个线程刚写进去的真名字
+    /// 覆盖掉，一次丢失更新（`Session::name_attempted` 的文档记的是
+    /// 同一件事）。
     ///
-    /// 光看 `tag` 停在 `""` 测不出这件事——`list()` 对 `None` 和
-    /// `Some("")` 做的都是 `unwrap_or_default()`，两种状态在界面上长得
-    /// 一模一样，钉死成 `Some("")` 的 bug 会被这种断言完全放过。真正
-    /// 能测出区别的是**下一轮**：`name_slot` 是不是 `None` 决定了
-    /// `tick()` 的起名门槛（`recover(s.name_slot.lock()).is_none()`）
-    /// 会不会再打开一次。所以这条测试逼出第二轮 Working → Idle，这次
-    /// 换一个答得出名字的后端，只有 `name_slot` 真的还是 `None`，
-    /// 这一轮才可能起出名字来。
+    /// 所以这条测试反过来验证：第一轮空白兜底问过之后，就算换一个真的
+    /// 答得出名字的后端、再逼出一次 Working → Idle，也不该再起出
+    /// 名字——`name_attempted` 得挡住第二次 `request_name`。
     #[test]
-    fn whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt() {
+    fn whitespace_only_input_is_asked_about_exactly_once_not_forever() {
         let repo = init_repo();
         let m = SessionManager::new();
-        // `fake_agent`（cat，只声明 idle_pattern）比 `finishing_agent` 更
-        // 适合这条测试：`finishing_agent` 的脚本打完一次 READY 就
-        // `sleep 30` 不再吭声，逼不出第二次 Working → Idle。`cat` 回显
-        // 什么、屏幕上就有什么，能按需要反复把 "READY" 打上屏幕，
-        // 从而反复触发状态判定。
+        // `fake_agent`（cat，只声明 idle_pattern）能按需要反复把 "READY"
+        // 打上屏幕，从而反复触发状态判定——`finishing_agent` 的脚本打完
+        // 一次 READY 就 `sleep 30` 不再吭声，逼不出第二次 Working → Idle。
         m.register_profile(fake_agent());
         m.set_backend(Some(Arc::new(DeadBackend)));
         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
@@ -1853,23 +1906,20 @@ mod tests {
 
         // 换一个答得出名字的后端，再逼一次 Working → Idle：`send_input`
         // 的空串分支会无条件把状态同步置回 Working（不管屏幕内容），
-        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。
+        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。如果
+        // `name_attempted` 没有真正挡住重复触发，这个后端会在几轮之内
+        // 把 tag 改写成「真实名字」。
         m.set_backend(Some(Arc::new(FixedBackend("真实名字".into()))));
         m.send_input(id, "").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        for _ in 0..10 {
             m.tick();
-            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
-            if tag == "真实名字" {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "空白那一轮不该把 name_slot 钉死，第二轮该能起出真名字，\
-                 最后是 {tag:?}"
+            assert_eq!(
+                m.list().iter().find(|s| s.id == id).unwrap().tag,
+                "",
+                "name_attempted 该挡住第二次 request_name，这个会话不该再起出名字"
             );
-            sleep(Duration::from_millis(50));
+            sleep(Duration::from_millis(30));
         }
     }
 
@@ -1879,10 +1929,11 @@ mod tests {
     /// 从没送过输入，first_input 全程是空的，跟
     /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
     /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
-    /// `name_slot` 那道「只起一次」的门槛在误触发场景下反而是帮凶——如果
-    /// Failed → Idle 被当成起名时机，它会拿这时候还空着的 `first_input`
-    /// 把 `name_slot` 提前钉死，等真正干完一轮活、有真实内容可用的时候，
-    /// `name_slot` 已经非 `None` 了，再也翻不了身。
+    /// `name_attempted` 那道「只起一次」的门槛在误触发场景下反而是帮凶——
+    /// 如果 Failed → Idle 被当成起名时机，它会拿这时候还空着的
+    /// `first_input` 把 `name_attempted` 提前置成 `true`，等真正干完
+    /// 一轮活、有真实内容可用的时候，`request_name` 已经再也不会被
+    /// 调用第二次了。
     #[test]
     fn recovering_from_a_failure_does_not_count_as_finishing_a_round() {
         // 名字跟着 prompt 里有没有真实的第一句话走，而不是跟着「第几次被
@@ -1978,8 +2029,8 @@ mod tests {
     /// 说过话（`first_input` 非空），agent 却报错又恢复——五个内置
     /// profile 有 `error_pattern`（只有 codex.toml 没有），用户说完话
     /// 之后 agent 报错、错误文案又从屏幕上滚走，`classify()` 会把这读成
-    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会烧掉一辈子
-    /// 只有一次的 `name_slot`，真正干完活也翻不了身。
+    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会把一辈子只有
+    /// 一次的 `name_attempted` 提前烧掉，真正干完活也翻不了身。
     ///
     /// 区分「误触发」和「真起名」不能靠 `first_input`——两次触发时它都
     /// 非空、内容还一样，天生分不出谁是谁。只能靠 prompt 里屏幕尾巴那
