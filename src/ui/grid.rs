@@ -12,7 +12,8 @@ use super::app::App;
 use super::view::{is_plain_key, reply_key, Draft, Reply, View};
 use super::widgets::Msg;
 use super::widgets::{
-    char_width, pad_to, screen_to_lines, session_label, status_label, status_style, truncate,
+    char_width, display_width, pad_to, screen_to_lines, session_label, status_label, status_style,
+    truncate,
 };
 use super::{dim, session_action};
 use crate::i18n::{text, Key, Lang};
@@ -123,6 +124,40 @@ pub fn crop_line(spans: &[ScreenSpan], max_cols: usize) -> Vec<ScreenSpan> {
         }
     }
     out
+}
+
+/// 极端组合下（很长的状态词 + 多位数 id + 60 列终端）光靠预算推导会把
+/// 名字挤到 0 列，用户连「这是哪个会话」都认不出——留这个下限保证名字
+/// 好歹露几个字符。代价：那种极端组合下状态词可能被再挤掉 1 列，但那不是
+/// `Working` 这个最常见、也是 `fix-2-brief.md` 点名要测的状态（见
+/// `tile_title_name_cap` 的文档）。
+const MIN_TITLE_NAME_COLS: usize = 4;
+
+/// 格子标题里名字能占的列数：从格子宽度**现推**，不是写死的常量。
+///
+/// 九宫格的列数随当页会话数变（1/2/3 列，见 `grid_shape`）：同样宽的
+/// 终端，会话一多格子就窄下去。固定的名字上限在窄格子上会把状态词和
+/// 项目名挤出格子边界，被 ratatui 按区域截断吃掉——`fix-2-brief.md`
+/// 算过账：60 列终端、5 个以上会话时格子标题只有 18 列预算，装不下
+/// 「20 列名字 + 状态词」。而状态词才是九宫格存在的理由：一眼看出谁在
+/// 干活、谁停了或挂了，这个答案不能被名字挤没。
+///
+/// `tile_width` 是格子矩形的原始宽度（含左右边框各一列，跟传给
+/// `Block::inner` 之前的 `Rect::width` 是同一个数）；这里先减掉那两列
+/// 边框得到标题真正可用的预算，再减去除名字外的固定开销：焦点标记 1 列、
+/// `id` 的位数、id 和名字间那个空格、名字后面那个空格、状态词的显示宽度、
+/// 状态词后面那个空格。项目名不算进这笔账——它本来就没有走 `truncate`
+/// （既有缺口，final review 已经记录，见 `draw_grid` 里 `project` 那段的
+/// 注释，这次不修），再替它扣预算只会让名字更窄，换不来任何保证。
+fn tile_title_name_cap(tile_width: u16, id: u32, status_word: &str) -> usize {
+    let budget = tile_width.saturating_sub(2) as usize;
+    let overhead = 1                          // 焦点标记「▶」或一个空格
+        + display_width(&id.to_string())      // id 本身
+        + 1                                    // id 后面那个空格
+        + 1                                    // 名字后面那个空格
+        + display_width(status_word)
+        + 1; // 状态词后面那个空格
+    budget.saturating_sub(overhead).max(MIN_TITLE_NAME_COLS)
 }
 
 /// 小于这个尺寸就不画格子。九格里每格还要各扣掉两行边框，再小下去
@@ -364,8 +399,11 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             // 保证——真给满 24 个汉字就是 48 列。收件人写在 `to` 前面、
             // `body`（用户正在打的字）和光标 `▌` 跟在后面同一行，名字不裁的话
             // 会把用户自己正在打的字连同光标一起顶出屏幕，而这正是他此刻
-            // 眼睛盯着的地方。跟格子标题用同一个上限（20），两处对「名字最多
-            // 露多宽」给同一个答案。
+            // 眼睛盯着的地方。上限固定在 20——这一行的宽度不随格子数变（回复框
+            // 是盖在整个九宫格顶上的一整行，见 `opening_the_box_does_not_shrink_
+            // the_grid_away`），不需要像格子标题那样按格宽现推（见
+            // `tile_title_name_cap` 的文档，那边的 20 已经改成动态的了，这里
+            // 这个 20 是独立的一笔账，不是跟那边「同一个上限」）。
             .map(|s| format!("{} {}", s.id, truncate(session_label(s), 20)))
             // 收件人在打字途中被停掉了。仍然照实写出 id——用户得看得见
             // 自己正在对谁说话，哪怕那个会话刚没了。
@@ -471,6 +509,12 @@ fn draw_grid(
 
         // 标题就是状态指示器：状态词用 status_style 上色，跟列表同一套颜色
         // （已停止是灰的），扫一眼九个格子就知道谁在干活、谁停了。
+        //
+        // 名字的上限不是写死的 20——`tile_title_name_cap` 从这一格的实际
+        // 宽度现推，窄格子（3 列布局、60~80 列终端）上会把名字压得比 20
+        // 更小，为的是让状态词始终留在格子里（细节见该函数的文档）。
+        let status_word = status_label(info.state, lang);
+        let name_cap = tile_title_name_cap(tile.width, info.id, status_word);
         let mut title = vec![
             // 跟列表的 `highlight_symbol` 同一个符号：两个模式看起来才是
             // 同一件事。
@@ -478,16 +522,18 @@ fn draw_grid(
             Span::raw(format!(
                 "{} {} ",
                 info.id,
-                truncate(session_label(info), 20)
+                truncate(session_label(info), name_cap)
             )),
-            Span::styled(
-                format!("{} ", status_label(info.state, lang)),
-                status_style(info.state),
-            ),
+            Span::styled(format!("{status_word} "), status_style(info.state)),
         ];
         // 九个格子长得都一样，不点名项目就分不出谁是谁。九宫格现在画的是
         // 所有项目的会话，所以这一条**无条件**加——不加就没有任何地方能
         // 告诉用户这一格属于谁。
+        //
+        // **既有缺口，这次不修**：这里拼进 `title` 的 `project` 没有走
+        // `truncate`，直接交给 `Span::render_ref`——final review 已经记录
+        // 这一条（`src/ui/grid.rs:495`），归属另一条任务。`tile_title_name_cap`
+        // 的预算故意不替它扣分：扣了也换不来任何保证，只会让名字更窄。
         let project = std::path::Path::new(&info.dir)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -740,6 +786,53 @@ mod tests {
         assert_eq!(grid_shape(9), (3, 3));
         // 超过 9 的调用方先按页切好再问形状，这里按满页算
         assert_eq!(grid_shape(0), (1, 1), "空看板画一个空格子占位");
+    }
+
+    /// 按 `fix-2-brief.md` 的表逐档核对：60/80/120 列、3 列布局（对应
+    /// `tile_width` 20/26/40），中英文状态词各一档。这条不渲染任何东西，
+    /// 直接测算术——比整块画面渲染更容易钉住「差一列」这种边界。
+    #[test]
+    fn tile_title_name_cap_is_derived_from_tile_width_not_fixed() {
+        // id=1（1 位数），格子内宽 = tile_width - 2
+        assert_eq!(
+            tile_title_name_cap(20, 1, "干活中"),
+            7,
+            "60 列、3 列布局、中文：18 列预算减 11 列固定开销"
+        );
+        assert_eq!(
+            tile_title_name_cap(20, 1, "working"),
+            6,
+            "60 列、3 列布局、英文：预算比中文少 1 列，因为 working 比干活中宽 1 列"
+        );
+        assert_eq!(
+            tile_title_name_cap(26, 1, "干活中"),
+            13,
+            "80 列、3 列布局、中文"
+        );
+        assert_eq!(
+            tile_title_name_cap(26, 1, "working"),
+            12,
+            "80 列、3 列布局、英文"
+        );
+        assert_eq!(
+            tile_title_name_cap(40, 1, "干活中"),
+            27,
+            "120 列、3 列布局、中文：预算宽裕，远超 24 字符名字的上限"
+        );
+    }
+
+    /// 下限只在极端组合下才会被触碰到——`Working` 状态、60 列宽的组合
+    /// 触不到（见上一条测试的 60 列结果 7/6，都大于下限 4）。挑一个真的会
+    /// 把预算推穿的组合：`asking you`（10 列，英文里最长的状态词）+ 60 列。
+    /// 不裁的话这里会算出负数（`saturating_sub` 会给 0），下限把它兜回 4，
+    /// 名字好歹还能露出几个字符。
+    #[test]
+    fn tile_title_name_cap_has_a_floor_so_the_name_never_disappears() {
+        assert_eq!(
+            tile_title_name_cap(20, 1, "asking you"),
+            MIN_TITLE_NAME_COLS,
+            "60 列宽 + 最长的英文状态词，预算被吃穿，下限得兜住"
+        );
     }
 
     #[test]
