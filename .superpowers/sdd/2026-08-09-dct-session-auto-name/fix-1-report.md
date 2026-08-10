@@ -507,3 +507,145 @@ None. The render-path gap Important 2 identified is now closed with
 coverage that discriminates (verified by mutation), and both dependent
 titles (grid, attach) were confirmed covered by inspection rather than
 assumed.
+
+## Round 4 — two Minor findings, same defect class as the branch's rejection
+
+Round 3's re-review verdicted both Important findings and both minors
+ADDRESSED and explicitly said not to revisit that work — did not. This round
+covers two new Minor findings the coordinator chose to fix now rather than
+defer, both instances of "a test that degrades to green under load," which
+is the exact defect class the branch was originally rejected for.
+
+### Minor 1 — `whitespace_only_input_is_asked_about_exactly_once_not_forever` was the false-green shape
+
+The version from round 2 (`src/session.rs`) ran ten iterations of
+`m.tick()` + `sleep(30ms)`, asserting `tag == ""` each time — a negative
+assertion on a fixed ~300ms total budget, checking for the *absence* of an
+effect from a background thread. Under load, a slow-to-schedule
+`SignalingBackend`/`FixedBackend` thread could miss that window entirely,
+and the test would pass for the wrong reason (never having actually run
+long enough to observe the bug if it were present) rather than because the
+guard held.
+
+Fixed by making the backend itself the source of truth instead of the
+clock. Added `SignalingBackend` (next to `FixedBackend`/`DeadBackend`,
+~line 1614): identical to `FixedBackend` except `complete()` also sends on
+an `mpsc::Sender<()>` before returning. Since `complete_with_timeout`
+(`src/llm/mod.rs:40-53`) always calls `Backend::complete` synchronously
+inside its own freshly-spawned thread, a signal on that channel is direct,
+unambiguous proof that `request_name` reached the model call a second
+time — not an inference from elapsed wall-clock time.
+
+The rewritten test:
+1. Ticks the (already-triggered-once) session forward synchronously — no
+   sleeping needed here, since whether `request_name` gets *invoked* again
+   is decided entirely inside `tick()`'s synchronous critical section,
+   before any thread is spawned.
+2. Calls `called_rx.recv_timeout(Duration::from_secs(5))` and asserts it
+   returns `Err(Timeout)`.
+
+This is not "a bigger sleep window" — it's structurally different from the
+pattern being rejected. The 5-second bound is not a race the test is trying
+to win; it exists only to keep a broken run from hanging forever, and it's
+symmetric with every other `Duration::from_secs(5)` deadline already used
+throughout this file for waiting on a real async completion. Verified both
+failure directions:
+
+- **Bug present** (re-ran mutation M10 — `s.name_attempted = true;` removed
+  from `request_name`): test fails in **0.29s**, because the signal arrives
+  almost immediately once `complete()` is actually called — it does not
+  wait out the 5s bound to report failure.
+- **Bug absent** (current code): test passes in ~5.3s, always waiting the
+  full bound, because there is no scenario in which the signal can arrive —
+  the guard prevents the call from ever happening, not just from happening
+  "in time."
+
+That asymmetry (fails fast, passes slow) is what makes this deterministic
+rather than a wider version of the same race: a slow/loaded test machine
+can only ever make the *passing* case marginally more certain, never
+produce a false pass in the buggy case.
+
+### Minor 2 — `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` was one-sided
+
+The round-3 version (`src/ui/board.rs`) asserted only
+`!c.chars().any(|ch| ch.is_control())` on the rendered buffer. That
+assertion is vacuously true if the session row — or the tag/label within
+it — stops being rendered at all, which round 2's `#[ignore]`d red run
+happened to rule out only by accident (the row *did* render at the time),
+not because anything pinned it.
+
+Added a second, positive assertion: `c.contains("[Afix")`. Computed by
+hand and confirmed by running the test: `truncate("\x1b[Afix\x7f", 15)`
+drops `ESC` (`\x1b`) and `DEL` (`\x7f`) — both `is_control()` — and keeps
+everything else, including the literal `[` and `A` that follow `ESC` in
+the arrow-key escape sequence (`truncate` does per-character control-byte
+filtering, not the daemon-side `sanitize`'s whole-CSI-sequence consumption
+— see `truncate`'s doc for why that asymmetry is intentional). So the
+visible, on-screen result of cleaning `"\x1b[Afix\x7f"` is `"[Afix"`, and
+that string must appear in `screen_text`'s output.
+
+Verified the discrimination two ways:
+- Introduced a mutation commenting out `board.rs:211`'s
+  `spans.push(Span::raw(pad_to(&truncate(session_label(s), 15), 16)));`
+  (simulating "the row/label stops rendering"). **With both assertions**,
+  the test fails (no `"[Afix"` on screen). **With only the old,
+  negative-only assertion** (checked by temporarily reverting to it under
+  the same mutation), the test still passes — concretely reproducing the
+  vacuous-pass the coordinator described, not just arguing it exists in
+  theory.
+
+### Mutation testing
+
+| # | Mutation | Result | Test(s) that caught it |
+|---|---|---|---|
+| M10 (re-run) | Remove `s.name_attempted = true;` from `request_name` | Caught, fails in 0.29s | `whitespace_only_input_is_asked_about_exactly_once_not_forever` |
+| M13 | Comment out `board.rs:211`'s tag/label span (row stops rendering the label) | Caught by the two-assertion version; **confirmed vacuously passes with only the old negative assertion** | `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` |
+
+### Re-verification
+
+```
+$ cargo test --lib session:: -- --test-threads=1
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 615 filtered out; finished in 21.06s
+
+$ cargo test --lib ui::board:: -- --test-threads=1
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 675 filtered out; finished in 0.01s
+
+$ cargo test -- --test-threads=1        # full workspace
+test result: ok. 690 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.74s
+... (16 more "ok" lines, one per integration test binary, all 0 failed)
+
+$ cargo fmt --check
+(clean)
+
+$ cargo clippy --all-targets
+(clean, no warnings)
+
+$ git diff --check
+(clean)
+```
+
+Files touched this round: `src/session.rs` (`SignalingBackend` +
+channel-based rewrite of the whitespace test),
+`src/ui/board.rs` (added the positive assertion + doc comment explaining
+why both are required).
+
+### Triage item for the final review (not acted on, per instruction)
+
+The coordinator's own re-review found that `truncate` is **not** the
+choke point every UI string passes through: `src/ui/grid.rs:495`,
+`src/ui/attach.rs:231`/`:241` (`short_path(&s.dir)` — the entire title in
+the disconnected branch), and `src/ui/board.rs:189` reach
+`Span::render_ref` without going through `truncate` at all, and a POSIX
+directory name may legally contain `0x1b` (only `/` and NUL are
+forbidden on POSIX filesystems). This is the same injection class as
+Finding 1/Important 2, reached through a different, pre-existing route
+that predates this branch — not something introduced by any commit in
+this task. Recording it here per instruction; not investigated further
+and no code touched for it, since scope for this item belongs to the
+final review, not this task.
+
+### Concerns
+
+None. Both minors are closed with tests confirmed to discriminate in both
+directions (fails fast on the bug, passes deterministically without it),
+not just argued to.
