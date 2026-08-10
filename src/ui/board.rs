@@ -275,6 +275,33 @@ mod tests {
             .collect()
     }
 
+    /// 找到屏幕上包含 `marker` 的那一行，**原样返回，不过滤空白**——跟
+    /// `screen_text` 反着来：那边为了好比对内容才把空白洗掉，这里恰恰是要
+    /// 保留 `pad_to` 补的空格和它们的列位置，不然量不出两个记号之间隔了
+    /// 几列。给下面几条守 `board.rs:211` 列算术的测试用。
+    fn row_with(term: &Terminal<TestBackend>, marker: &str) -> String {
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        (0..a.height)
+            .map(|y| {
+                (0..a.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .find(|row| row.contains(marker))
+            .unwrap_or_else(|| panic!("没有任何一行画出了记号 {marker:?}"))
+    }
+
+    /// 两个记号之间（含 `from_marker` 自己）隔了几**列**。必须用显示宽度量，
+    /// 不能用字节数或字符数：`row.find` 给的是字节偏移，`…`/CJK 在 UTF-8
+    /// 里是多字节，字节差和真实列差对不上——这个坑不是抄来的，是写这几条
+    /// 测试时自己踩出来的。
+    fn cols_between(row: &str, from_marker: &str, to_marker: &str) -> usize {
+        let from = row.find(from_marker).unwrap();
+        let to = row.find(to_marker).unwrap();
+        unicode_width::UnicodeWidthStr::width(&row[from..to])
+    }
+
     /// **核心回归测试，钉在渲染出的 buffer 这一层**（`fix-1-brief.md`
     /// 明确要的层级——见 `fix-1-report.md` 里对第一轮 review 的回应）。
     ///
@@ -328,6 +355,142 @@ mod tests {
         assert!(
             c.contains("[Afix"),
             "标签清洗剩下的可见部分应该照样画在屏幕上，不能连内容一起被吞掉：{c:?}"
+        );
+    }
+
+    // 下面四条测的是 `board.rs:211` 那句 `pad_to(&truncate(session_label(s),
+    // 15), 16)` 自己——把 profile 那 10 列压到 6 列腾给名字之后，看板列表
+    // 对这套算术一条测试都没有（fix-3-brief.md，`final-review-report.md`
+    // Finding 6）。四个变异各配一条：
+    //   ① session_label(s) → s.profile         → the_session_row_shows_the_name_not_the_profile
+    //   ② 删掉 truncate(…, 15)                  → an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget
+    //   ③ 删掉 pad_to(…, 16)                    → a_short_name_is_padded_out_to_the_full_sixteen_columns
+    //   ④ activity 的 70 改回 76                → the_activity_column_still_truncates_at_seventy_not_seventy_six
+    // 算术本身（fix-3-brief.md 的核对）：`truncate(s, 15)` 在真的截断时输出
+    // 的宽度**不总是**正好 16——brief 里那句话只在「触发截断前累计宽度恰好
+    // 撞满 15」时成立（比如 15 个纯 ASCII 字符打头的输入）；如果触发点提前
+    // （例如宽字符让预算在 14 就跳空），输出可能只有 15 列。这不是产品代码的
+    // bug：`pad_to(…, 16)` 兜的就是这个差——不管 `truncate` 吐出 15 还是 16，
+    // `pad_to` 都会把它填满到 16，所以「这一列最终总是 16 列宽」这个不变量
+    // 依然成立，brief 的结论（算术是对的、只需要盖住它）没有问题，只是它对
+    // `truncate` 单独产出宽度的描述略有简化。下面四条测的正是这个组合后的
+    // 不变量，不依赖 `truncate` 单独的输出宽度是 15 还是 16。
+
+    /// **杀变异①**：`session_label(s)` 被换成 `s.profile`。
+    ///
+    /// 组头本来就会用 `s.profile` 报一句「这个项目里有几个 claude」
+    /// （`agent_counts()`，跟 tag 完全无关），所以单看「屏幕上有没有出现
+    /// `claude`」测不出这个变异——不管名字列画的是 tag 还是 profile，
+    /// `claude` 反正都会因为组头而出现一次。真正能分开两者的是**出现了
+    /// 几次**：名字列如果也被换成 profile，`claude` 就会在组头之外再多冒
+    /// 一次。
+    #[test]
+    fn the_session_row_shows_the_name_not_the_profile() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut s = sess(1, &proj);
+        s.tag = "改登录页文案".into(); // 6 个汉字 = 12 列，落在 15 列预算内，不会被截
+        app.set_sessions(vec![s]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(c.contains("改登录页文案"), "会话行必须画出名字：{c}");
+        assert_eq!(
+            c.matches("claude").count(),
+            1,
+            "claude 只该在组头的 agent 统计里出现一次；如果名字列被换回 s.profile，\
+             这里会变成 2：{c}"
+        );
+    }
+
+    /// **杀变异③**：`pad_to(…, 16)` 被删掉。
+    ///
+    /// 名字比 15 列窄时 `truncate` 根本不会触发省略号，输出原样就是 tag
+    /// 本身——这时候把这一列撑到 16 列全靠 `pad_to`。`screen_text` 会把
+    /// 空白过滤掉，补没补空格从它的输出里看不出来；这里改用 `row_with` 保留
+    /// 原始列位置，直接量「名字」到「activity」之间隔了几列。
+    #[test]
+    fn a_short_name_is_padded_out_to_the_full_sixteen_columns() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut s = sess(1, &proj);
+        s.tag = "NAME".into(); // 4 列，纯 ASCII——不会触发截断，量起来没有歧义
+        s.activity = "ACTV_TAIL".into();
+        app.set_sessions(vec![s]);
+
+        // 200 列：给 activity 留足空间，不让右边框在这条测试里掺和进来——
+        // 这条测的是 `pad_to` 补没补，不是右边框裁没裁。
+        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let row = row_with(&term, "ACTV_TAIL");
+        assert_eq!(
+            cols_between(&row, "NAME", "ACTV_TAIL"),
+            16,
+            "`NAME` 到 `ACTV_TAIL` 应该正好隔 16 列（`pad_to` 补齐的宽度）；\
+             删掉 `pad_to` 的话这里会变成 4（tag 自己的宽度，一点没补）：{row:?}"
+        );
+    }
+
+    /// **杀变异②**：`truncate(…, 15)` 被删掉。
+    ///
+    /// tag 给到 20 列（全 ASCII，量起来没有 CJK 的歧义）。真按 15 列截的话，
+    /// 触发点正好撞在预算撑满的那一刻（15 个单列字符），输出是「15 个字符 +
+    /// 一个省略号」= 16 列，`pad_to` 这时候是空操作。删掉 `truncate` 之后
+    /// 整条 tag（20 列）原样画出来，`pad_to` 的目标 16 又补不了负数，名字列
+    /// 直接涨到 20 列——`LONGNAME` 记号到 `ACTV_TAIL` 记号之间的列数就是能不能
+    /// 抓住这个变异的地方。
+    #[test]
+    fn an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut s = sess(1, &proj);
+        s.tag = format!("LONGNAME{}", "X".repeat(12)); // 20 列
+        s.activity = "ACTV_TAIL".into();
+        app.set_sessions(vec![s]);
+
+        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let row = row_with(&term, "ACTV_TAIL");
+        assert_eq!(
+            cols_between(&row, "LONGNAME", "ACTV_TAIL"),
+            16,
+            "`LONGNAME…` 到 `ACTV_TAIL` 应该正好隔 16 列；删掉 `truncate` 的话\
+             整条 20 列的 tag 会原样画出来，这里会变成 20：{row:?}"
+        );
+    }
+
+    /// **杀变异④**：activity 的截断预算从 70 被改回 76。
+    ///
+    /// 造一条 74 列长的 activity（70 个 `A` 紧跟着记号 `MARK`）：预算是 70
+    /// 的话，第 71 列就会撞上截断，`MARK` 连一个字都露不出来；预算一旦变成
+    /// 76，前 74 列全放得下，`MARK` 会整个冒出来。「`MARK` 在不在屏幕上」
+    /// 直接就是「预算是不是 70」的答案，不用量列。
+    #[test]
+    fn the_activity_column_still_truncates_at_seventy_not_seventy_six() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut s = sess(1, &proj);
+        s.activity = format!("{}MARK", "A".repeat(70));
+        app.set_sessions(vec![s]);
+
+        // 200 列：activity 自己的 70 列预算不该被右边框提前掐断，
+        // 这条测的是 `truncate` 里的数字，不是终端宽度。
+        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(
+            c.contains(&"A".repeat(70)),
+            "70 个 A 应该都画出来了，不然下面「MARK 不在」的断言就是空的：{c}"
+        );
+        assert!(
+            !c.contains("MARK"),
+            "70 列预算下 MARK 连一个字都不该露出来；如果预算被改回 76，\
+             MARK 会整个冒出来：{c}"
         );
     }
 
