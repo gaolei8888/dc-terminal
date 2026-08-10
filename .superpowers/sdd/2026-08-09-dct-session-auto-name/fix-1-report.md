@@ -381,3 +381,129 @@ comment corrections), `src/ui/board.rs` (the new render-layer test).
 - The UI-side gap Important 2 surfaced is real and is not fixed by this
   task. `tag` reaching the UI unsanitized from an old daemon is a genuine,
   if narrower, instance of the same injection class Finding 1 was about.
+
+## Round 3 — closing the render-path gap (Important 2, acted on)
+
+The coordinator clarified that "say so in your report rather than adding it
+silently" meant *report before acting*, not *leave it broken* — and set the
+scope explicitly to include the UI-side filter. Implemented it.
+
+### Where the filter went, and why
+
+Added the filter inside `truncate` (`src/ui/widgets.rs`), not
+`session_label`. Reasoning:
+
+1. **Coverage.** `truncate` is the single choke point every rendered title
+   in this codebase passes through, not just the tag: `board.rs:211`
+   (`truncate(session_label(s), 15)`), `grid.rs:369` and `grid.rs:481`
+   (`truncate(session_label(info), 20)`), and `attach.rs:257`
+   (`truncate(&s.tag, 15)`). Filtering in `session_label` would only cover
+   `tag` — `truncate`'s other callers (`board.rs`'s group name/parent dir,
+   `s.activity` which is a rendering of live agent screen content, `pick.rs`'s
+   labels/notes, `secret.rs`'s labels) get hardened for free, and none of
+   those are more trustworthy than `tag` — a directory name or an agent's
+   last screen line can contain arbitrary bytes too.
+2. **No signature change.** `session_label` currently returns a zero-copy
+   `&str` (either `&s.tag` or `&s.profile`); filtering there means
+   allocating and changing the return type to `String`, rippling through
+   every call site. `truncate` already takes and returns an owned `String` —
+   the fix is entirely internal to the function.
+3. **Confirmed no CJK/width regression** (this was the specific thing I was
+   asked to check for before proceeding, and did before writing the fix):
+   `char_width` already returns 0 for every control character (see its own
+   doc comment — this was already true before this round). The old loop
+   pushed 0-width control characters into `out` without them ever
+   contributing to `w`; the new code just skips the `push` for those same
+   characters via `continue` before reaching the width/cap logic. `w`'s
+   accumulated value is byte-for-byte identical with or without the
+   control characters in the input, so the truncation point for the
+   surrounding real characters cannot move. Added
+   `truncate_control_byte_stripping_does_not_disturb_cjk_width_accounting`
+   and `truncate_dropping_control_bytes_does_not_shift_the_width_budget` to
+   pin exactly this — both check that a control byte's presence/absence
+   changes nothing about where the *next* real character gets cut.
+
+The filter drops any `char::is_control()` character outright — it does
+*not* do the daemon-side `sanitize`'s full CSI-sequence consumption (ESC +
+`[` + params + terminator, all treated as one unit). That asymmetry is
+deliberate, not an oversight: the daemon-side function additionally has to
+reconstruct "what the user meant to type" (so a stray `[A` left over from a
+half-processed escape sequence would be a real, if minor, correctness bug
+there). At the render layer the only property that needs to hold is "no
+raw control byte reaches the terminal" — and dropping just the `ESC` byte
+already breaks the sequence: a terminal emulator needs the leading `ESC` to
+recognize `[A` as a live cursor-movement command; without it, `[A` is inert
+printable text. Per-character `is_control()` filtering is sufficient for
+that property and is what `Buffer::set_stringn`/`Paragraph` already do
+elsewhere in `ratatui`, so this keeps the same simple model rather than
+importing a second, heavier CSI-aware state machine into a generic
+string-truncation utility.
+
+### Grid tile title / attach block title coverage (asked, not tested here)
+
+Both route through `truncate` and are therefore covered by this fix:
+
+- **Grid tile title**: `grid.rs:369` (compose-reply header) and
+  `grid.rs:481` (the tile's own title bar) both call
+  `truncate(session_label(info), 20)` unconditionally — `truncate` always
+  runs the same per-character loop regardless of whether the string
+  actually needs cutting, so the filter applies even to tags that fit
+  comfortably under the width cap.
+- **Attach block title**: `attach.rs:257` calls `truncate(&s.tag, 15)`
+  directly, same unconditional path.
+
+Grepped every `.tag`/`session_label(` occurrence in `src/ui/*.rs` to check
+for a path that reads the tag without going through `truncate`
+(`attach.rs:240` is the only other production use, and it's an
+`is_empty()` check, not a render) — found none. No new tests added for the
+grid title or attach title per the instruction; Fix 2 owns `grid.rs` and
+was asked to be told rather than have tests added preemptively.
+
+### Test the coordinator asked to see turn green
+
+`#[ignore]` removed from
+`ui::board::tests::a_tag_with_control_bytes_never_reaches_the_rendered_buffer`.
+It now passes in the default suite with no flag needed.
+
+### Mutation testing
+
+| # | Mutation | Result | Test(s) that caught it |
+|---|---|---|---|
+| M11 | Negate the filter condition: `if ch.is_control()` → `if !ch.is_control()` (keeps control chars, drops everything else) | Caught | 20 tests failed across `board`, `grid`, `keys`, `pick`, `widgets` — including `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` |
+| M12 | Remove the filter entirely (revert to the old loop body) | Caught | `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` plus the three new `truncate_*` tests |
+
+### Re-verification
+
+```
+$ cargo test --lib ui::widgets:: -- --test-threads=1
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 665 filtered out
+
+$ cargo test --lib ui::board:: -- --test-threads=1
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 675 filtered out
+(a_tag_with_control_bytes_never_reaches_the_rendered_buffer is in this 15,
+ no longer ignored)
+
+$ cargo test -- --test-threads=1        # full workspace
+test result: ok. 690 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+... (16 more "ok" lines, one per integration test binary, all 0 failed)
+
+$ cargo fmt --check
+(clean)
+
+$ cargo clippy --all-targets
+(clean, no warnings)
+
+$ git diff --check
+(clean)
+```
+
+Files touched this round: `src/ui/widgets.rs` (the `truncate` filter + 3
+new tests), `src/ui/board.rs` (removed `#[ignore]`, updated its doc
+comment to point at where the defense actually lives now).
+
+### Concerns
+
+None. The render-path gap Important 2 identified is now closed with
+coverage that discriminates (verified by mutation), and both dependent
+titles (grid, attach) were confirmed covered by inspection rather than
+assumed.
