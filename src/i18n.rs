@@ -149,9 +149,37 @@ pub enum Key {
     TypeToFilter,
     Language,
     /// 设置页第二项的名字：手机通知开关那一页的入口。跟 `Language` 挨着
-    /// 放是因为它们现在是同一层列表里的兄弟项——`Language` 是真管用的
-    /// 那个，这个要等 Task 4 才接线，但列表里的位置已经在这个任务定下来。
+    /// 放是因为它们现在是同一层列表里的兄弟项，也用作 `View::Phone` 自己
+    /// 的页面标题。
     Phone,
+    // —— 手机通知页（Task 4）：状态行 + 下一步，见 `ui/phone.rs` ——
+    /// `PhoneState::Off` 的状态行：还没填令牌。
+    PhoneOff,
+    /// `PhoneState::Off` 的下一步：按 Enter 去填令牌。
+    PhoneOffNextStep,
+    /// `PhoneState::WaitingForPairing` 的下一步：去 Telegram 上给 bot
+    /// 发条消息。状态行本身要插值 bot 用户名，走 `msg::phone_waiting`，
+    /// 不在这里——这一条没有参数。
+    PhoneWaitingNextStep,
+    /// `PhoneState::Paired` 但 `owner` 意外是 `None` 时的状态行兜底
+    /// （正常情况下走 `msg::phone_paired`，带着配对账号的名字）。
+    PhonePairedNoOwner,
+    /// `PhoneState::Broken` 的状态行。**故意不读 `Broken` 里的字符串**，
+    /// 见 `proto::PhoneState::Broken` 和 `ui/phone.rs::status_line` 的
+    /// 文档注释——这是防止令牌漏进界面文案的一条纵深防御。
+    PhoneBrokenHeadline,
+    /// `PhoneState::Broken` 的下一步：两种真实成因合成一句话——
+    /// 令牌本身失效了（重新填一遍），或者对方在 Telegram 里拉黑了这个
+    /// bot（解除拉黑后按 r 重新配对）。同样不读 `Broken` 的payload，
+    /// 两种可能性都摆出来，比猜一个可能是错的原因更诚实。
+    PhoneBrokenNextStep,
+    /// 状态页上 `Enter` 键的说明：填令牌。只在 `Off`/`Broken` 两种状态下
+    /// 显示——`WaitingForPairing`/`Paired` 已经有令牌了，Enter 不做事。
+    PhoneEnterToken,
+    /// 状态页上 `r` 键的说明：重新配对。
+    PhoneRepair,
+    /// 状态页上 `x` 键的说明：整个关掉手机通知。
+    PhoneTurnOff,
     // —— 全部按键浮层 ——
     /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
     /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
@@ -340,6 +368,37 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
         Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
+        PhoneOff => t!(
+            lang,
+            en: "phone notifications are off",
+            zh: "还没连上手机",
+        ),
+        PhoneOffNextStep => t!(
+            lang,
+            en: "press Enter to type a Telegram bot token and turn this on",
+            zh: "按 Enter 填一个 Telegram 机器人的令牌，把手机通知打开",
+        ),
+        PhoneWaitingNextStep => t!(
+            lang,
+            en: "open Telegram, find that bot, and send it any message to finish pairing",
+            zh: "打开 Telegram，找到刚才那个机器人，随便发一条消息，完成配对",
+        ),
+        PhonePairedNoOwner => t!(lang, en: "phone notifications are on", zh: "已经连上手机"),
+        PhoneBrokenHeadline => t!(
+            lang,
+            en: "phone notifications stopped working",
+            zh: "手机通知断线了",
+        ),
+        PhoneBrokenNextStep => t!(
+            lang,
+            en: "if the token itself stopped working, press Enter to type a new one; \
+                 if you blocked this bot in Telegram, unblock it and press r to pair again",
+            zh: "如果是令牌本身失效了，按 Enter 重新填一遍；如果是你在 Telegram 里把这个\
+                 机器人拉黑了，解除拉黑后按 r 重新配对",
+        ),
+        PhoneEnterToken => t!(lang, en: "enter token", zh: "填令牌"),
+        PhoneRepair => t!(lang, en: "pair again", zh: "重新配对"),
+        PhoneTurnOff => t!(lang, en: "turn off", zh: "关闭"),
 
         MoreKeys => t!(lang, en: "…", zh: "…"),
         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
@@ -746,6 +805,53 @@ pub mod msg {
             en: format!("Press d again to delete the key for {label}, any other key cancels"),
             zh: format!("再按一次 d 删除 {label} 的密钥，按其他键取消"),
         )
+    }
+
+    /// 等配对时的状态行。**必须点名是哪个 bot**——「去给它发条消息」是句
+    /// 没法执行的话，除非用户知道「它」是谁。
+    pub fn phone_waiting(lang: Lang, bot: &str) -> String {
+        t!(
+            lang,
+            en: format!("waiting for you to message @{bot} on Telegram"),
+            zh: format!("等你在 Telegram 里给 @{bot} 发条消息"),
+        )
+    }
+
+    /// 已配对的状态行，带着配对账号的名字。
+    pub fn phone_paired(lang: Lang, owner: &str) -> String {
+        t!(
+            lang,
+            en: format!("connected — notifications go to {owner}"),
+            zh: format!("已经连上手机，通知发给 {owner}"),
+        )
+    }
+
+    /// `PhoneState::Broken` 里装的那句「已经成文的人话」——**守护进程**
+    /// 在验证令牌失败时调这两个函数，不是界面。这是本文件里少数几处
+    /// 组句发生在 daemon 一侧的地方，理由见 `proto::Request::PhoneSetToken`
+    /// 和 `proto::PhoneState::Broken` 的文档注释：这一条请求带着 `lang`，
+    /// daemon 借着这次请求的上下文知道该用哪种语言写这句话。
+    ///
+    /// **绝不能把令牌本身拼进这句话**——`daemon.rs::phone_verify_token`
+    /// 的单测钉着这一条，`ui/phone.rs` 那边的 `status_line`/`next_step`
+    /// 也额外加了一层「不读 payload」的纵深防御。
+    pub fn phone_token_invalid(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "this token doesn't work — it may be mistyped or already revoked",
+            zh: "这个令牌用不了，可能是复制的时候错了几位，或者已经被吊销了",
+        )
+        .to_string()
+    }
+
+    /// 验证令牌时连不上 Telegram（网络问题，或者回包读不懂）。
+    pub fn phone_unreachable(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "could not reach Telegram right now — check the network and try again",
+            zh: "现在连不上 Telegram，检查一下网络，再试一次",
+        )
+        .to_string()
     }
 
     /// 标题里必须带上「Esc 回哪」，而且分设置页/选择器两种。
@@ -1282,6 +1388,15 @@ mod tests {
             TypeToFilter,
             Language,
             Phone,
+            PhoneOff,
+            PhoneOffNextStep,
+            PhoneWaitingNextStep,
+            PhonePairedNoOwner,
+            PhoneBrokenHeadline,
+            PhoneBrokenNextStep,
+            PhoneEnterToken,
+            PhoneRepair,
+            PhoneTurnOff,
             BackToBoard,
             BackToBoardWithF2,
             BackToList,
@@ -1380,7 +1495,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 101, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 110, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

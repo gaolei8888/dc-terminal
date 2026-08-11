@@ -44,7 +44,12 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 旧守护进程不需要「懂」它，只是答复里多了一段旧进程从不读的文本。
 /// 具体的允许条件和「这不能当先例」的警告见
 /// `the_session_info_shape_is_pinned_too` 测试上的注释。
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 7 = 多了 `Request::PhoneStatus` / `PhoneSetToken` / `PhoneUnpair` /
+/// `PhoneDisable`、`Response::Phone(PhoneStatus)`。旧守护进程完全不认识
+/// 这四条新请求，界面发过去只会得到一句解析失败——手机通知这一整页
+/// 除了显示旧的静态文案，什么都做不了。
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +134,41 @@ pub enum MouseForwardKind {
     /// 0 = 左键，1 = 中键，2 = 右键
     Press(u8),
     Release(u8),
+}
+
+/// 手机通知这一页在守护进程眼里处在哪个阶段。**这一行状态是那一整页存在的
+/// 全部理由**——配对是异步的（填完令牌之后守护进程转去后台长轮询等用户在
+/// Telegram 上发第一条消息），不给这件事一个去处，用户填完令牌就会对着一片
+/// 空白发呆。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneState {
+    /// 还没填令牌
+    Off,
+    /// 填了、验过了，在等用户给 bot 发第一条消息
+    WaitingForPairing,
+    Paired,
+    /// 连不上。**装的是已经成文的人话，不是原始错误文本**——守护进程是
+    /// 唯一决定用户看到什么文字的地方（本文件顶上 `SecretPrompt` 那条已有
+    /// 的约定：组句发生在哪一侧必须一致，不能一半在 daemon 一半在界面）。
+    ///
+    /// `ui/phone.rs` 的 `status_line`/`next_step` **故意不读这个字符串的
+    /// 内容**：它们只按这个变体本身给固定文案，理由见那两个函数的文档
+    /// 注释和 `the_token_never_appears_in_any_status_text` 这条测试——这是
+    /// 一条纵深防御，哪怕将来有一天这里被塞进了不该出现的原始内容，界面上
+    /// 最显眼的那一行状态和下一步提示也不会把它带出来。这个字符串真正显示
+    /// 的地方是 `draw()` 里单独的一行详情。
+    Broken(String),
+}
+
+/// 手机通知这一页要显示的全部事实。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneStatus {
+    pub state: PhoneState,
+    /// bot 用户名，`getMe` 拿的。等配对那句话要用它——「去 Telegram 里找
+    /// @xxx 发条消息」，没有这个名字这句话就没法说。
+    pub bot: Option<String>,
+    /// 配上的主人，显示用。
+    pub owner: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,6 +279,27 @@ pub enum Request {
         id: u32,
         event: MouseForward,
     },
+    /// 手机通知这一页打开时问一次：现在是什么状态。纯读，不碰任何状态，
+    /// 也不打任何网络——守护进程手里已经有答案（见 `daemon.rs` 里那个
+    /// 内存中的 `PhoneStatus`），这条请求只是把它搬到界面上。
+    PhoneStatus,
+    /// 用户在手机通知页填完令牌按下 Enter。守护进程用它去 `getMe` 验证
+    /// （见 `channel::telegram::Telegram::get_me`），验过了才落盘、才把
+    /// 内存里的状态往前推。**带上 `lang`**：验证失败时 `PhoneState::Broken`
+    /// 里要装一句成文的人话，而组句必须发生在知道用户语言的这一侧
+    /// （同 `Profiles { lang }` 的道理，见 `SecretPrompt` 上那条约定）——
+    /// 这一条请求偏离了 brief 原始接口清单（那里没有 `lang`），是本任务
+    /// 实现时补上的，理由写在任务报告里。
+    PhoneSetToken {
+        token: String,
+        lang: crate::i18n::Lang,
+    },
+    /// 重新配对：忘掉当前的主人（`owner`/出站目的地），回到
+    /// `WaitingForPairing`，重新等下一条消息。令牌不变——如果令牌本身
+    /// 也坏了，用户要走的是 `PhoneSetToken`，不是这条。
+    PhoneUnpair,
+    /// 整个关掉：删掉存好的令牌，状态退回 `Off`。
+    PhoneDisable,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -312,6 +373,16 @@ impl std::fmt::Debug for Request {
                 .field("id", id)
                 .field("event", event)
                 .finish(),
+            Request::PhoneStatus => write!(f, "PhoneStatus"),
+            // `token` 是用户的明文密钥，同 `SetSecret`/`VerifySecret` 的
+            // `value` 一样必须脱敏——见本 impl 头上那条统一的理由。
+            Request::PhoneSetToken { token: _, lang } => f
+                .debug_struct("PhoneSetToken")
+                .field("token", &"<redacted>")
+                .field("lang", lang)
+                .finish(),
+            Request::PhoneUnpair => write!(f, "PhoneUnpair"),
+            Request::PhoneDisable => write!(f, "PhoneDisable"),
         }
     }
 }
@@ -373,6 +444,12 @@ pub enum Response {
     /// `Ok`：它仍然是描述这次滚动的正确形状，往后要是哪个调用点想抄近路
     /// 立刻拿到滚完的状态（不等下一轮 `Screen`），数据已经现成。
     Scrolled(ScrollState),
+    /// 对 [`Request::PhoneStatus`] / [`Request::PhoneSetToken`] /
+    /// [`Request::PhoneUnpair`] / [`Request::PhoneDisable`] 的共同回答：
+    /// 手机通知这一页现在的完整状态。四条请求共用一个回答形状是因为它们
+    /// 全都是「做点什么，然后告诉我现在是什么状态」——跟 `Ok` 分开是因为
+    /// 界面需要状态本身去刷新那一行，不是只知道「成功了」。
+    Phone(PhoneStatus),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -660,14 +737,21 @@ mod tests {
                     ctrl: false,
                 },
             },
+            Request::PhoneStatus,
+            Request::PhoneSetToken {
+                token: "t".into(),
+                lang: crate::i18n::Lang::Zh,
+            },
+            Request::PhoneUnpair,
+            Request::PhoneDisable,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                6,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
+                7,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t","lang":"Zh"}},"PhoneUnpair","PhoneDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -710,7 +794,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                6,
+                7,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -802,8 +886,43 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (6, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (7, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
+    }
+
+    /// 令牌是用户的明文密钥，同 `SetSecret`/`VerifySecret` 一样必须脱敏。
+    #[test]
+    fn debug_redacts_the_token_on_phone_set_token() {
+        let req = Request::PhoneSetToken {
+            token: "123456:AAH-super-secret-telegram-token".into(),
+            lang: crate::i18n::Lang::Zh,
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("123456:AAH-super-secret-telegram-token"),
+            "令牌不能出现在 Debug 输出里：{s}"
+        );
+        assert!(s.contains("PhoneSetToken"), "变体名字留着帮排查：{s}");
+    }
+
+    #[test]
+    fn phone_status_response_round_trips() {
+        let r = Response::Phone(PhoneStatus {
+            state: PhoneState::Broken("令牌用不了，重新输入一遍".into()),
+            bot: Some("my_dct_bot".into()),
+            owner: None,
+        });
+        let s = serde_json::to_string(&r).unwrap();
+        let back: Response = serde_json::from_str(&s).unwrap();
+        match back {
+            Response::Phone(status) => {
+                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+                assert!(
+                    matches!(status.state, PhoneState::Broken(m) if m == "令牌用不了，重新输入一遍")
+                );
+            }
+            other => panic!("解回来不是 Phone：{other:?}"),
+        }
     }
 }

@@ -14,6 +14,14 @@ struct Disk {
     secrets: BTreeMap<String, String>,
 }
 
+/// 手机通知的令牌存在密钥仓里，用一个 profile 不可能占用的名字。
+///
+/// **它不会出现在密钥页（`c`）里**，因为那一页遍历的是 profiles 再查
+/// `has_secret`（见 `ui/pick.rs`），不是遍历这个文件的键。
+/// 将来谁把密钥页改成遍历 `secrets.toml`，这个名字就会作为一个不存在的
+/// agent 冒出来——改那里的人请回来看这一句。
+pub const PHONE_TOKEN_KEY: &str = "__phone__";
+
 /// 按 profile 名索引的用户密钥。落盘在 `~/.dct/secrets.toml`，0600。
 pub struct SecretStore {
     path: PathBuf,

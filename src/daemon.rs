@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::channel::{telegram::Telegram, ChannelError};
 use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
-use crate::proto::{ErrorCode, InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
-use crate::secrets::{secrets_path_for_socket, SecretStore};
+use crate::proto::{
+    ErrorCode, InstallPrompt, PhoneState, PhoneStatus, ProfileEntry, Request, Response,
+    SecretPrompt,
+};
+use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
 
@@ -49,6 +53,13 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
 
+    // 手机通知这一页存在的全部理由是这一份状态——**不落盘**，只有令牌本身
+    // 落盘（跟别的密钥同一个文件）。有没有存过令牌决定开机时是 Off 还是
+    // WaitingForPairing；bot 名字这时候还不知道，`spawn_phone_startup_refresh`
+    // 会在后台把它补上，不占用监听端口打开之前的时间。
+    let phone = Arc::new(Mutex::new(initial_phone_status(&secrets)));
+    spawn_phone_startup_refresh(&phone, &secrets);
+
     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
     // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
@@ -67,13 +78,95 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let s = store.clone();
         let sec = secrets.clone();
         let pd = profiles_dir.clone();
+        let ph = phone.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph) {
                 eprintln!("连接处理失败: {e}");
             }
         });
     }
     Ok(())
+}
+
+/// 手机通知刚启动时的状态：有没有存过令牌决定 `Off` 还是
+/// `WaitingForPairing`。bot 名字这时候还不知道——现查要打网络，不能拖慢
+/// 监听端口打开的时间，交给 `spawn_phone_startup_refresh` 在后台补。
+fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
+    let has_token = recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some();
+    PhoneStatus {
+        state: if has_token {
+            PhoneState::WaitingForPairing
+        } else {
+            PhoneState::Off
+        },
+        bot: None,
+        owner: None,
+    }
+}
+
+/// 开机时如果已经存过令牌，起一个后台线程把 bot 名字补上（顺便验一遍这份
+/// 令牌是不是还能用）。放在后台是为了不让一次网络请求拖慢守护进程接受
+/// 连接的时间——同 `install_llm_backend` 不这么做的理由正相反：那边选择
+/// 同步跑是因为「装没装后端」这件事**必须**在第一条连接进来之前就有答案
+/// （出错解释的可用性是会话创建路径要读的状态）；手机通知不是，界面本来
+/// 就要靠轮询 `Request::PhoneStatus` 才能看到配对进展，晚几秒钟补上 bot
+/// 名字不会造成任何错误的界面反馈，只是「等配对」那句话短暂地说不出
+/// bot 是谁。
+fn spawn_phone_startup_refresh(phone: &Arc<Mutex<PhoneStatus>>, secrets: &Arc<Mutex<SecretStore>>) {
+    let token = recover(secrets.lock())
+        .get(PHONE_TOKEN_KEY)
+        .map(str::to_string);
+    let Some(token) = token else {
+        return;
+    };
+    let phone = phone.clone();
+    let secrets = secrets.clone();
+    std::thread::spawn(move || {
+        // 这次刷新不挂在任何一次 `Request` 上，没有人告诉我们此刻界面是
+        // 什么语言——按项目默认语言中文兜底，跟 `proto.rs` 顶上 `SecretPrompt`
+        // 那条约定里记的话一致（「daemon 端已经知道用户语言（目前只有
+        // Lang::Zh）」）。用户真的看到这句话，通常是因为存了很久没用过的
+        // 令牌在这次重启时才发现已经失效——那本来就是个冷门路径。
+        let (state, bot) = phone_verify_token(&token, crate::i18n::Lang::Zh, &|t| {
+            Telegram::new(t).get_me()
+        });
+        let mut ph = recover(phone.lock());
+        // 这段网络往返的时间里令牌可能已经被用户显式关掉了（`PhoneDisable`）
+        // ——这时候这次迟到的刷新结果不该覆盖回去，那会让一个刚被用户关掉
+        // 的功能又显示成「等待配对」，界面上凭空多出一件用户没做过的事。
+        if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
+            *ph = PhoneStatus {
+                state,
+                bot,
+                owner: ph.owner.clone(),
+            };
+        }
+    });
+}
+
+/// 令牌验证的结果该记成什么 `PhoneState` + bot 名。纯判定逻辑，传输层由
+/// 调用方注入（同 `verify.rs::verify_with` 的路子）——测试才能覆盖
+/// 「令牌好使」「令牌失效」「连不上」三种结果，不用真打 Telegram 的网络。
+///
+/// **`Broken` 分支绝不能把 `token` 拼进返回的字符串**：这是
+/// `PhoneState::Broken` 唯一的安全承诺，`phone_broken_text_never_contains_the_token`
+/// 这条测试钉着它。
+fn phone_verify_token(
+    token: &str,
+    lang: crate::i18n::Lang,
+    get_me: &dyn Fn(&str) -> Result<String, ChannelError>,
+) -> (PhoneState, Option<String>) {
+    match get_me(token) {
+        Ok(bot) => (PhoneState::WaitingForPairing, Some(bot)),
+        Err(ChannelError::BadToken) => (
+            PhoneState::Broken(crate::i18n::msg::phone_token_invalid(lang)),
+            None,
+        ),
+        Err(ChannelError::Unreachable) | Err(ChannelError::Malformed) => (
+            PhoneState::Broken(crate::i18n::msg::phone_unreachable(lang)),
+            None,
+        ),
+    }
 }
 
 /// **`cfg.llm` 是 `None` 就什么都不做**：不 resolve、不装后端、也不打印
@@ -144,6 +237,7 @@ fn serve(
     store: Arc<Mutex<Store>>,
     secrets: Arc<Mutex<SecretStore>>,
     profiles_dir: PathBuf,
+    phone: Arc<Mutex<PhoneStatus>>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -153,7 +247,7 @@ fn serve(
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir),
+            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir, &phone),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
@@ -168,6 +262,7 @@ fn handle(
     store: &Arc<Mutex<Store>>,
     secrets: &Arc<Mutex<SecretStore>>,
     profiles_dir: &Path,
+    phone: &Arc<Mutex<PhoneStatus>>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -315,6 +410,60 @@ fn handle(
                 Some(v) => Ok(Response::Verify(verify_with(&v.url, &value, &send_probe))),
             }
         }
+        // 纯读，不碰任何状态、不打网络——手机通知页每一轮轮询都要问它，
+        // 必须快。真正的网络往返只发生在 `PhoneSetToken` 和开机那次后台
+        // 刷新（`spawn_phone_startup_refresh`）里。
+        Request::PhoneStatus => Ok(Response::Phone(recover(phone.lock()).clone())),
+        Request::PhoneSetToken { token, lang } => {
+            let (state, bot) = phone_verify_token(&token, lang, &|t| Telegram::new(t).get_me());
+            // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌
+            // 本身不好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉——
+            // 界面上 `Enter` 键只在 `Off`/`Broken` 两种状态下才会被提供，
+            // 也就是说走到这条分支时磁盘上原本要么没有令牌、要么已经是
+            // 坏的，这里不存在「一个还能用的令牌被覆盖」的风险。
+            let save_result = if matches!(state, PhoneState::Broken(_)) {
+                Ok(())
+            } else {
+                recover(secrets.lock()).set(PHONE_TOKEN_KEY, &token)
+            };
+            save_result.map(|_| {
+                let mut ph = recover(phone.lock());
+                // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人（如果
+                // 有）不该继续留着，那会让通知发去一个跟这份新令牌毫不相干
+                // 的旧 chat。
+                *ph = PhoneStatus {
+                    state,
+                    bot,
+                    owner: None,
+                };
+                Response::Phone(ph.clone())
+            })
+        }
+        Request::PhoneUnpair => {
+            let mut ph = recover(phone.lock());
+            // `Off` 时按 r 没有意义可言——没有令牌就没有「重新配对」这回事，
+            // 留在原地，不伪造出一个 WaitingForPairing。
+            //
+            // `Broken` 也一并放行到 WaitingForPairing：`ChannelError::BadToken`
+            // 这一层没有保留「令牌本身失效」和「对方拉黑了这个 bot」的区分
+            // （见 telegram.rs 的 `error_from` 和它上面的注释），daemon 无法
+            // 单靠这个状态本身分辨究竟是哪一种——真正会验证令牌是不是仍然
+            // 有效的路径是 Task 5 的 Bridge 实际发消息/轮询时，不是这里。
+            if !matches!(ph.state, PhoneState::Off) {
+                ph.state = PhoneState::WaitingForPairing;
+                ph.owner = None;
+            }
+            Ok(Response::Phone(ph.clone()))
+        }
+        Request::PhoneDisable => recover(secrets.lock()).remove(PHONE_TOKEN_KEY).map(|_| {
+            let mut ph = recover(phone.lock());
+            *ph = PhoneStatus {
+                state: PhoneState::Off,
+                bot: None,
+                owner: None,
+            };
+            Response::Phone(ph.clone())
+        }),
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
 }
@@ -333,6 +482,16 @@ fn to_code(e: anyhow::Error) -> ErrorCode {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// 大多数测试根本不关心手机通知——给它们一个干净的 `Off` 状态垫底，
+    /// 不用在每个既有 `handle()` 调用点里重复拼这三行。
+    fn test_phone() -> Arc<Mutex<PhoneStatus>> {
+        Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::Off,
+            bot: None,
+            owner: None,
+        }))
+    }
 
     /// 造一个文件足够多的仓库，让 agent 会话建立时的首次 git checkpoint 慢到能
     /// 测出来。手法照抄 `tests/concurrency.rs` 的 `init_big_repo`——那边已经验证过
@@ -406,6 +565,7 @@ mod tests {
             &store,
             &secrets,
             profiles_dir.path(),
+            &test_phone(),
         );
 
         match resp {
@@ -454,12 +614,14 @@ mod tests {
         )));
         let profiles_dir = tempfile::tempdir().unwrap();
 
+        let phone = test_phone();
         let labels = |lang| match handle(
             Request::Profiles { lang },
             &mgr,
             &store,
             &secrets,
             profiles_dir.path(),
+            &phone,
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -509,6 +671,7 @@ mod tests {
         let mgr2 = mgr.clone();
         let store2 = store.clone();
         let secrets2 = secrets.clone();
+        let phone2 = test_phone();
         let repo_path = repo.path().display().to_string();
         let profiles_dir_path = profiles_dir.path().to_path_buf();
         let create_handle = std::thread::spawn(move || {
@@ -523,6 +686,7 @@ mod tests {
                 &store2,
                 &secrets2,
                 &profiles_dir_path,
+                &phone2,
             );
             (t.elapsed(), resp)
         });
@@ -622,6 +786,7 @@ mod tests {
                 &store,
                 &secrets,
                 profiles_dir.path(),
+                &test_phone(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -651,6 +816,7 @@ mod tests {
             &store,
             &secrets,
             profiles_dir.path(),
+            &test_phone(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -733,6 +899,7 @@ mod tests {
             &store,
             &secrets,
             &profiles_dir,
+            &test_phone(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -745,6 +912,238 @@ mod tests {
         assert!(
             line.contains("根本没有这个"),
             "要点名是设置里的哪个名字写错了：{line}"
+        );
+    }
+
+    // ———— 手机通知（Task 4）————
+    //
+    // `phone_verify_token` 是判定逻辑本身，传输层被注入（同
+    // `verify_with`/`verify.rs` 的路子）：这里覆盖「令牌好使」「令牌被拒」
+    // 「连不上」三种结果，不用真打 Telegram 的网络。`handle()` 里真正调
+    // `Telegram::new(t).get_me()` 走真实传输的那一支，跟 `send_real`/
+    // `Request::VerifySecret` 一样不在单元测试范围内——那是实测那一步验的
+    // 东西。
+
+    #[test]
+    fn phone_verify_token_marks_a_good_token_waiting_for_pairing() {
+        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+            Ok("my_dct_bot".to_string())
+        });
+        assert_eq!(state, PhoneState::WaitingForPairing);
+        assert_eq!(bot.as_deref(), Some("my_dct_bot"));
+    }
+
+    #[test]
+    fn phone_verify_token_marks_a_bad_token_broken() {
+        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+            Err(ChannelError::BadToken)
+        });
+        assert!(matches!(state, PhoneState::Broken(_)));
+        assert!(bot.is_none());
+        let PhoneState::Broken(msg) = state else {
+            unreachable!()
+        };
+        assert!(!msg.is_empty(), "Broken 必须带一句人话，不能是空字符串");
+    }
+
+    #[test]
+    fn phone_verify_token_marks_network_trouble_broken_too() {
+        for e in [ChannelError::Unreachable, ChannelError::Malformed] {
+            let (state, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &move |_| Err(e));
+            assert!(
+                matches!(state, PhoneState::Broken(_)),
+                "{e:?} 也该是 Broken"
+            );
+        }
+    }
+
+    /// **安全属性，不是巧合。** `phone_verify_token` 的两个 `Broken` 分支
+    /// 都是固定文案，压根不读 `token` 参数——这条测试用一个看起来像真实
+    /// Telegram 令牌的字符串去调用它，确认返回的 `Broken` 消息里一个字符
+    /// 都没有它。守护进程是唯一决定用户看到什么文字的地方（`PhoneState::
+    /// Broken` 的文档注释），这条纪律必须钉在这一层，不能只指望界面那边
+    /// 的纵深防御（`ui/phone.rs` 的 `status_line`/`next_step` 故意不读
+    /// payload）。
+    #[test]
+    fn phone_broken_text_never_contains_the_token() {
+        let real_looking_token = "123456789:AAH-super-secret-telegram-token";
+        for err in [
+            ChannelError::BadToken,
+            ChannelError::Unreachable,
+            ChannelError::Malformed,
+        ] {
+            let (state, _) =
+                phone_verify_token(real_looking_token, crate::i18n::Lang::Zh, &move |_| {
+                    Err(err)
+                });
+            let PhoneState::Broken(msg) = state else {
+                panic!("{err:?} 应该是 Broken")
+            };
+            assert!(
+                !msg.contains(real_looking_token),
+                "令牌漏进了 Broken 文案：{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_phone_status_is_off_without_a_saved_token() {
+        let secrets = Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        ));
+        assert_eq!(initial_phone_status(&secrets).state, PhoneState::Off);
+    }
+
+    #[test]
+    fn initial_phone_status_is_waiting_for_pairing_with_a_saved_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SecretStore::load(&dir.path().join("secrets.toml"));
+        store.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        let secrets = Mutex::new(store);
+        let status = initial_phone_status(&secrets);
+        assert_eq!(status.state, PhoneState::WaitingForPairing);
+        assert!(
+            status.bot.is_none(),
+            "bot 名字要等后台刷新，开机这一刻还不知道"
+        );
+    }
+
+    #[test]
+    fn phone_status_reflects_whatever_is_in_the_shared_cell() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::Paired,
+            bot: Some("my_dct_bot".into()),
+            owner: Some("lei".into()),
+        }));
+
+        let resp = handle(
+            Request::PhoneStatus,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &phone,
+        );
+        match resp {
+            Response::Phone(status) => {
+                assert_eq!(status.state, PhoneState::Paired);
+                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+                assert_eq!(status.owner.as_deref(), Some("lei"));
+            }
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+    }
+
+    /// `r`（重新配对）把主人忘掉、退回等配对，令牌和 bot 名字不动。
+    #[test]
+    fn phone_unpair_forgets_the_owner_but_keeps_the_token_alive() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::Paired,
+            bot: Some("my_dct_bot".into()),
+            owner: Some("lei".into()),
+        }));
+
+        let resp = handle(
+            Request::PhoneUnpair,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &phone,
+        );
+        match resp {
+            Response::Phone(status) => {
+                assert_eq!(status.state, PhoneState::WaitingForPairing);
+                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"), "bot 不该被忘掉");
+                assert!(status.owner.is_none(), "主人要被忘掉，这才是重新配对");
+            }
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+    }
+
+    /// 没填过令牌时按 r 没有意义——不能凭空造出一个 `WaitingForPairing`，
+    /// 那会让界面显示一件用户从没做过的事（填过令牌）。
+    #[test]
+    fn phone_unpair_on_off_stays_off() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = test_phone(); // Off
+
+        let resp = handle(
+            Request::PhoneUnpair,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &phone,
+        );
+        match resp {
+            Response::Phone(status) => assert_eq!(status.state, PhoneState::Off),
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+    }
+
+    /// `x`（整个关掉）要把令牌从磁盘上删掉，不只是内存里的状态复位——
+    /// 不删的话，下次守护进程重启，`initial_phone_status` 又会看见这份
+    /// 令牌，把一个用户已经明确关掉的功能悄悄打开。
+    #[test]
+    fn phone_disable_deletes_the_token_and_resets_to_off() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets_path = tempfile::tempdir().unwrap().path().join("secrets.toml");
+        let mut disk = SecretStore::load(&secrets_path);
+        disk.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        let secrets = Arc::new(Mutex::new(disk));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::WaitingForPairing,
+            bot: Some("my_dct_bot".into()),
+            owner: None,
+        }));
+
+        let resp = handle(
+            Request::PhoneDisable,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &phone,
+        );
+        match resp {
+            Response::Phone(status) => {
+                assert_eq!(status.state, PhoneState::Off);
+                assert!(status.bot.is_none());
+                assert!(status.owner.is_none());
+            }
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+        assert!(
+            recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
+            "令牌必须真的从磁盘上删掉，不能只改内存状态"
         );
     }
 }
