@@ -35,10 +35,22 @@ pub struct Incoming {
 /// 攻击者自己发的第一条真文字消息。`raw_len == 0` 才是"这一批之后真的
 /// 没有更多"的唯一可靠信号，`discard_backlog` 现在靠它，不靠
 /// `messages.is_empty()`。
+///
+/// **`cursor_advanced`：这一批之后，下一次 `poll()` 问的偏移量有没有真的
+/// 往前挪。** 正常情况下（真实 Telegram，`raw_len > 0`）这个值永远是
+/// `true`——每一条 update，不管有没有文字，都带着 `update_id`，实现负责
+/// 越过它。但一份读不懂的畸形响应能让 `raw_len > 0` 而游标纹丝不动：
+/// 这时候下一次 `poll()` 问的还是同一个偏移量，大概率拿回同一批东西，
+/// `raw_len` 永远不会掉到 0——`discard_backlog` 只看 `raw_len == 0`
+/// 判断"追上了"的话，会在这种情况下卡成一个不退避、不停打对方接口的
+/// 忙等，只有 `retire()`（用户按 `x`）才能打断它。`cursor_advanced ==
+/// false` 且 `raw_len > 0` 就是"这一批不是空的，但读不出能让我们前进
+/// 一步的东西"，`discard_backlog` 把它当终态错误处理，不再自己转下去。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Batch {
     pub messages: Vec<Incoming>,
     pub raw_len: usize,
+    pub cursor_advanced: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -255,11 +255,23 @@ impl Channel for Telegram {
 
         // 游标只在这批确实有 update_id 时才前进；`?` 已经在上面处理过
         // ok:false 的情况，这里的 body 一定是「一批（可能是空的）更新」。
-        if let Some(max_id) = max_update_id(&body) {
+        // `cursor_advanced` 原样反映这次有没有真的前进——`Batch` 自己的
+        // 文档注释解释了 `discard_backlog` 为什么需要知道这件事：不知道
+        // 的话，一批 `raw_len > 0` 却读不出 `update_id` 的畸形响应会让
+        // 偏移量原地不动，`discard_backlog` 只看 `raw_len` 会把它当成
+        // "还有积压"一直重新问同一个偏移量，转成忙等。
+        let cursor_advanced = if let Some(max_id) = max_update_id(&body) {
             *recover(self.offset.lock()) = max_id + 1;
-        }
+            true
+        } else {
+            false
+        };
 
-        Ok(Batch { messages, raw_len })
+        Ok(Batch {
+            messages,
+            raw_len,
+            cursor_advanced,
+        })
     }
 
     fn set_destination(&self, chat: Option<i64>) {

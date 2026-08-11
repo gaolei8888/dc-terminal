@@ -401,6 +401,16 @@ fn discard_backlog(bridge: &Bridge, phone: &Mutex<PhoneStatus>, sleep: &dyn Fn(D
         }
         match bridge.ch.poll(Duration::ZERO) {
             Ok(b) if b.raw_len == 0 => return true,
+            // `raw_len > 0` 但游标没往前挪——一份读不懂的畸形响应，不是
+            // "还有积压"。不挡住的话，下一次 `poll(ZERO)` 问的还是同一个
+            // 偏移量，大概率又拿回同一批东西：一个不退避、永远打着
+            // Telegram 的忙等，只有用户按 `x` 才能打断，见 `Batch::
+            // cursor_advanced` 自己的文档注释。当成终态错误处理——写一句
+            // `Broken`，退出，不再自己转下去。
+            Ok(b) if !b.cursor_advanced => {
+                record_terminal_error(bridge, phone, ChannelError::Malformed);
+                return false;
+            }
             Ok(_) => attempt = 0, // 还有积压,继续吃,不退避
             Err(e) if e.worth_retrying() => {
                 attempt = attempt.saturating_add(1);
@@ -502,10 +512,16 @@ mod tests {
 
     /// 正常情形下的一批：`raw_len` 跟 `messages.len()` 一致——每一条原始
     /// update 都带着文字。测 Critical 修复（积压里混着没有文字的更新）
-    /// 时不要用这个，用 `batch_with_raw_len`。
+    /// 时不要用这个，用 `batch_with_raw_len`。`cursor_advanced: true`——
+    /// 真实 Telegram 里，只要 `raw_len > 0`，每一条 update 都带着
+    /// `update_id`，游标必然往前挪。
     fn batch(messages: Vec<Incoming>) -> crate::channel::Batch {
         let raw_len = messages.len();
-        crate::channel::Batch { messages, raw_len }
+        crate::channel::Batch {
+            messages,
+            raw_len,
+            cursor_advanced: true,
+        }
     }
 
     fn empty_batch() -> crate::channel::Batch {
@@ -517,18 +533,37 @@ mod tests {
     /// 会把它们全部过滤掉，`messages` 因此是空的，但 `raw_len` 反映的是
     /// Telegram 真正吐出来的条数。`discard_backlog` 如果还在看
     /// `messages.is_empty()` 判断"是不是追上了现在"，这种批次会被误判成
-    /// "没有积压了"，即使后面可能还压着上百条真正的消息。
+    /// "没有积压了"，即使后面可能还压着上百条真正的消息。`cursor_advanced:
+    /// true`——贴纸/图片一样带着 `update_id`，游标照样往前挪，跟
+    /// `batch_stuck` 那个"读不出 update_id"的畸形场景不是一回事。
     fn batch_with_raw_len(raw_len: usize) -> crate::channel::Batch {
         crate::channel::Batch {
             messages: Vec::new(),
             raw_len,
+            cursor_advanced: true,
+        }
+    }
+
+    /// **Minor 修复准备的构造（dct-phone-channel Task 5 fix round 3）：
+    /// `raw_len > 0` 但 `cursor_advanced: false`。** 模拟一份读不懂的
+    /// 畸形响应——条目数不为零，但里面找不出任何 `update_id`，`Telegram::
+    /// poll` 因此不会挪动偏移量。`discard_backlog` 如果只看 `raw_len ==
+    /// 0` 判断"追上了"，会在这种批次上反复问同一个偏移量、反复拿回同一
+    /// 个答案，转成一个不退避的忙等，只有 `retire()` 能打断。
+    fn batch_stuck(raw_len: usize) -> crate::channel::Batch {
+        crate::channel::Batch {
+            messages: Vec::new(),
+            raw_len,
+            cursor_advanced: false,
         }
     }
 
     /// 记录每一次调用的假渠道：`accept()`/轮询循环两组测试共用。
-    /// `poll_script` 空了之后一律回 `Ok(空批次)`——这不是每条测试都要用到
-    /// 的默认值，只是让"脚本比实际调用次数短"这种笔误不会连带炸穿别的
-    /// 断言。
+    /// `poll_script` 空了之后一律回一个终态错误（`Err(ChannelError::
+    /// BadToken)`），不是 `Ok(空批次)`——见下面 `poll()` 自己的注释：空
+    /// 批次会让循环有机会转成真正的死循环，终态错误保证任何一次 mutation
+    /// 都在有限步内收敛。这份文档注释曾经写反过（来自 `864b9c8`），
+    /// 跟实现描述的不是同一件事，改成跟实现一致。
     #[derive(Default)]
     struct FakeChannel {
         destinations: Mutex<Vec<Option<i64>>>,
@@ -1000,6 +1035,45 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// **Minor 修复本身的直接验证（dct-phone-channel Task 5 fix round
+    /// 3）：`raw_len > 0` 但游标推不动，不能变成一个不退避的忙等。**
+    /// 脚本让同一个 `batch_stuck` 出现两次——如果修复漏掉了，`discard_
+    /// backlog` 会把第一次之后的 `attempt` 归零、立刻再 `poll()` 一次，
+    /// 消费第二个脚本条目；脚本耗尽之后 `FakeChannel` 回退到终态错误
+    /// （见它自己的文档注释），这条测试会看到 `poll_calls == 3` 而不是
+    /// `1`，从"卡死"降级成"很快就能观察到的多打了几次"——用没打
+    /// 退避 sleep 就区分不出两者，靠 `poll_calls == 1` 直接钉死"第一次
+    /// 就该停，不该有第二次"。
+    #[test]
+    fn discard_backlog_stops_instead_of_spinning_when_the_cursor_cannot_advance() {
+        let ch = Arc::new(FakeChannel::default());
+        {
+            let mut script = recover(ch.poll_script.lock());
+            script.push_back(Ok(batch_stuck(3))); // 畸形响应:有条目,没有 update_id
+            script.push_back(Ok(batch_stuck(3))); // 不该被消费到——第一条就该叫停
+        }
+        let bridge = Bridge::new(ch.clone());
+        let phone = test_phone();
+
+        assert!(!discard_backlog(&bridge, &phone, &no_sleep()));
+
+        assert_eq!(
+            *recover(ch.poll_calls.lock()),
+            1,
+            "游标推不动的批次必须立刻叫停，不能被当成'还有积压'继续吃"
+        );
+        assert!(
+            matches!(
+                recover(phone.lock()).state,
+                PhoneState::Broken {
+                    reason: PhoneBrokenReason::Unreachable,
+                    ..
+                }
+            ),
+            "停下来必须留一句诚实的 Broken，不能悄悄退出让页面停在原地等一个不会再来的更新"
+        );
     }
 
     /// 网络问题在吃积压阶段一样要退避重试，不是直接放弃——用两次
