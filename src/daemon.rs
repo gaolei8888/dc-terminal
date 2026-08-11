@@ -169,6 +169,43 @@ fn phone_verify_token(
     }
 }
 
+/// `Request::PhoneSetToken` 的完整处理：验证、（验过了才）落盘、更新内存
+/// 状态。**从 `handle()` 的 match 臂里拆出来单独一个函数，传输层照旧注入**
+/// ——这条请求真正碰网络的只有 `get_me` 这一步，`secrets`/`phone` 都是普通
+/// 的内存对象，拆开之后不用起真实 Telegram 网络也能测「验证失败真的没有
+/// 碰磁盘上的令牌」这条关键行为，不然这条行为只能在 `handle()` 里跟一次
+/// 真实网络请求焊在一起，测不到。
+fn apply_phone_set_token(
+    token: &str,
+    lang: crate::i18n::Lang,
+    secrets: &Mutex<SecretStore>,
+    phone: &Mutex<PhoneStatus>,
+    get_me: &dyn Fn(&str) -> Result<String, ChannelError>,
+) -> anyhow::Result<Response> {
+    let (state, bot) = phone_verify_token(token, lang, get_me);
+    // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌本身不
+    // 好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉——界面上
+    // `Enter` 键只在 `Off`/`Broken` 两种状态下才会被提供，也就是说走到
+    // 这条分支时磁盘上原本要么没有令牌、要么已经是坏的，这里不存在
+    // 「一个还能用的令牌被覆盖」的风险。
+    let save_result = if matches!(state, PhoneState::Broken(_)) {
+        Ok(())
+    } else {
+        recover(secrets.lock()).set(PHONE_TOKEN_KEY, token)
+    };
+    save_result.map(|_| {
+        let mut ph = recover(phone.lock());
+        // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人（如果有）
+        // 不该继续留着，那会让通知发去一个跟这份新令牌毫不相干的旧 chat。
+        *ph = PhoneStatus {
+            state,
+            bot,
+            owner: None,
+        };
+        Response::Phone(ph.clone())
+    })
+}
+
 /// **`cfg.llm` 是 `None` 就什么都不做**：不 resolve、不装后端、也不打印
 /// 任何一行——这是绝大多数用户的正常状态（没写过 `[llm]`），不是一种
 /// 「本来该配却没配好」的错误。见 `config.rs` 头注释：出错解释会把一个
@@ -415,29 +452,7 @@ fn handle(
         // 刷新（`spawn_phone_startup_refresh`）里。
         Request::PhoneStatus => Ok(Response::Phone(recover(phone.lock()).clone())),
         Request::PhoneSetToken { token, lang } => {
-            let (state, bot) = phone_verify_token(&token, lang, &|t| Telegram::new(t).get_me());
-            // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌
-            // 本身不好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉——
-            // 界面上 `Enter` 键只在 `Off`/`Broken` 两种状态下才会被提供，
-            // 也就是说走到这条分支时磁盘上原本要么没有令牌、要么已经是
-            // 坏的，这里不存在「一个还能用的令牌被覆盖」的风险。
-            let save_result = if matches!(state, PhoneState::Broken(_)) {
-                Ok(())
-            } else {
-                recover(secrets.lock()).set(PHONE_TOKEN_KEY, &token)
-            };
-            save_result.map(|_| {
-                let mut ph = recover(phone.lock());
-                // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人（如果
-                // 有）不该继续留着，那会让通知发去一个跟这份新令牌毫不相干
-                // 的旧 chat。
-                *ph = PhoneStatus {
-                    state,
-                    bot,
-                    owner: None,
-                };
-                Response::Phone(ph.clone())
-            })
+            apply_phone_set_token(&token, lang, secrets, phone, &|t| Telegram::new(t).get_me())
         }
         Request::PhoneUnpair => {
             let mut ph = recover(phone.lock());
@@ -957,6 +972,40 @@ mod tests {
         }
     }
 
+    /// **不是巧合，是两句不同的话。** `BadToken`（令牌本身不好使）和
+    /// `Unreachable`/`Malformed`（连不上/读不懂）该说的下一步完全不一样
+    /// ——前者是「重新填一遍」，后者是「等会儿再试」。只断言两边都是
+    /// `Broken(_)` 分不出这两句话有没有被悄悄换成同一句（比如都写成
+    /// `phone_unreachable`），这条测试直接比对消息内容本身，钉死
+    /// `phone_verify_token` 按错误类型分派到了不同的 `msg::` 函数。
+    #[test]
+    fn bad_token_and_network_trouble_produce_different_messages() {
+        let (bad, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+            Err(ChannelError::BadToken)
+        });
+        let (unreachable, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+            Err(ChannelError::Unreachable)
+        });
+        let PhoneState::Broken(bad_msg) = bad else {
+            unreachable!()
+        };
+        let PhoneState::Broken(unreachable_msg) = unreachable else {
+            unreachable!()
+        };
+        assert_ne!(
+            bad_msg, unreachable_msg,
+            "令牌失效和连不上网络不该说同一句话——下一步完全不同"
+        );
+        assert_eq!(
+            bad_msg,
+            crate::i18n::msg::phone_token_invalid(crate::i18n::Lang::Zh)
+        );
+        assert_eq!(
+            unreachable_msg,
+            crate::i18n::msg::phone_unreachable(crate::i18n::Lang::Zh)
+        );
+    }
+
     /// **安全属性，不是巧合。** `phone_verify_token` 的两个 `Broken` 分支
     /// 都是固定文案，压根不读 `token` 参数——这条测试用一个看起来像真实
     /// Telegram 令牌的字符串去调用它，确认返回的 `Broken` 消息里一个字符
@@ -1005,6 +1054,82 @@ mod tests {
         assert!(
             status.bot.is_none(),
             "bot 名字要等后台刷新，开机这一刻还不知道"
+        );
+    }
+
+    /// 令牌好使：落盘、内存状态推进到 `WaitingForPairing`、主人清空
+    /// （新令牌等于新的一轮配对）。
+    #[test]
+    fn apply_phone_set_token_saves_a_good_token() {
+        let secrets = Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        ));
+        let phone = Mutex::new(PhoneStatus {
+            state: PhoneState::Off,
+            bot: None,
+            owner: None,
+        });
+
+        let resp = apply_phone_set_token(
+            "good-token",
+            crate::i18n::Lang::Zh,
+            &secrets,
+            &phone,
+            &|_| Ok("my_dct_bot".to_string()),
+        )
+        .unwrap();
+
+        match resp {
+            Response::Phone(status) => {
+                assert_eq!(status.state, PhoneState::WaitingForPairing);
+                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+                assert!(status.owner.is_none());
+            }
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+        assert_eq!(
+            recover(secrets.lock()).get(PHONE_TOKEN_KEY),
+            Some("good-token"),
+            "验证通过的令牌必须落盘，不然重启就没了"
+        );
+    }
+
+    /// **关键行为，专门有一条测试盯着。** 令牌被拒时**不能**把它写进
+    /// `secrets.toml`——磁盘上原来的令牌（如果有）必须原封不动。这条只能
+    /// 靠拆出 `apply_phone_set_token` 才测得到：留在 `handle()` 里的话，
+    /// 这一支会先打一次真实的 `Telegram::new(t).get_me()` 网络请求，测试
+    /// 要么连不上网直接假失败，要么就得连真网络——两者都不是单元测试该做
+    /// 的事。
+    #[test]
+    fn apply_phone_set_token_does_not_save_a_bad_token() {
+        let secrets = Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        ));
+        let phone = Mutex::new(PhoneStatus {
+            state: PhoneState::Off,
+            bot: None,
+            owner: None,
+        });
+
+        let resp = apply_phone_set_token(
+            "bad-token",
+            crate::i18n::Lang::Zh,
+            &secrets,
+            &phone,
+            &|_| Err(ChannelError::BadToken),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resp,
+            Response::Phone(PhoneStatus {
+                state: PhoneState::Broken(_),
+                ..
+            })
+        ));
+        assert!(
+            recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
+            "验证失败的令牌绝不能落盘"
         );
     }
 

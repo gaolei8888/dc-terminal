@@ -362,6 +362,60 @@ mod tests {
         }
     }
 
+    /// **不能靠巧合过关。** 上一条测试连不上真守护进程，`fetch_phone_status`
+    /// 断线时的兜底恰好也是 `Off`——如果这一支被悄悄改成直接写死
+    /// `PhoneStatus { state: Off, .. }`、压根不去问守护进程，上一条测试
+    /// 照样通过。起一个真守护进程，提前塞一个令牌进它的 `secrets.toml`
+    /// （`daemon.rs` 见到它会报 `WaitingForPairing`），确认这里拿到的是
+    /// 这个真答案，才能证明这一支真的调用了 `fetch_phone_status`，不是
+    /// 现编了一个巧合相等的默认值。
+    #[test]
+    fn entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default() {
+        use crate::client::Client;
+        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
+        disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
+
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(Instant::now() < deadline, "daemon 没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let work = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            super::super::view::ViewMode::List,
+        );
+        let phone = SettingsItem::all()
+            .iter()
+            .position(|i| *i == SettingsItem::Phone)
+            .unwrap();
+        on_settings(&mut app, phone);
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        match &app.view {
+            View::Phone { status, .. } => assert_eq!(
+                status.state,
+                crate::proto::PhoneState::WaitingForPairing,
+                "该拿到守护进程的真答案"
+            ),
+            _ => panic!("选中「手机通知」按 Enter 应该打开 View::Phone"),
+        }
+    }
+
     /// 方向键要能从「语言」走到「手机通知」。`move_sel_n` 的长度参数如果
     /// 悄悄改回 `Lang::all().len()`，今天两份长度数值上都是 2，看不出
     /// 差别——这条测试不问长度参数从哪儿来，只问「按下去到没到」，是这份

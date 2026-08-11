@@ -350,6 +350,32 @@ pub(crate) fn settings_state_on_phone() -> ListState {
     s
 }
 
+/// 手机通知状态页上，`Enter`（填令牌）/`r`（重新配对）/`x`（关掉）这三个键
+/// 在当前 `PhoneState` 下有没有对象可作用。
+///
+/// **两处调用点必须共用这一份判断，不能各写一次**：`idle_help` 用它决定
+/// 底栏写不写这个键，`ui/phone.rs::handle_status` 用它决定按下去有没有
+/// 效果——这正是「屏幕上写着做不到的操作比不写更糟」那条房规反过来也成立
+/// 的地方：如果两处逻辑分别抄一遍，日后改一处忘了改另一处，要么是屏幕上
+/// 写着一个按下去毫无反应的键，要么是一个真管用却没人告诉用户的隐藏键
+/// ——本文件反复警惕的就是后一种。
+///
+/// 抽成纯函数还有一个更直接的理由：`App::test_app()` 造出来的是断线的
+/// `App`，`r`/`x` 真的发出请求也会因为连不上而回退到原状态——只看
+/// `handle_status` 跑完之后 `app.view` 变没变，分辨不出「守卫拦住了」和
+/// 「发了请求，只是刚好失败了」。把守卫本身抽出来单测，才钉得住这条判断，
+/// 而不是钉住一个连不上网络时凑巧长得一样的表象。
+pub(crate) fn phone_key_has_effect(state: &PhoneState, code: KeyCode) -> bool {
+    match code {
+        // 只在 Off/Broken 下有意义：`WaitingForPairing`/`Paired` 已经有一份
+        // 能用的令牌了。
+        KeyCode::Enter => matches!(state, PhoneState::Off | PhoneState::Broken(_)),
+        // 重新配对 / 整个关掉都只在已经填过令牌（非 Off）时才有对象可作用。
+        KeyCode::Char('r') | KeyCode::Char('x') => !matches!(state, PhoneState::Off),
+        _ => false,
+    }
+}
+
 /// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥；
 /// 没装但有安装命令的去装；没装又没法自动装的、或者缺别的 profile 依赖的，
 /// 只能告诉用户一句话，不切视图。
@@ -524,6 +550,15 @@ pub fn verify_outcome_applies_to(
     current_buf: &str,
 ) -> bool {
     issued_profile == current_profile && issued_buf == current_buf
+}
+
+/// 同上，手机通知页填令牌那次后台验证的版本——只有一份输入（令牌本身，
+/// 没有 profile 这一层），比对更简单，但道理完全一样：验证是异步的，
+/// 结果送回来时用户可能已经 Esc 退出、甚至绕回来重新打过一遍令牌，
+/// 只有「发起验证时的令牌」还等于「此刻输入框里的令牌」时，这条结果
+/// 才有落点。
+pub(crate) fn phone_verify_outcome_applies_to(issued_token: &str, current_buf: &str) -> bool {
+    issued_token == current_buf
 }
 
 /// 把用户敲进来的路径变成绝对路径：`~` 展开成家目录，相对路径按 `base` 解析。
@@ -1421,10 +1456,10 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             entry: None,
         } => {
             let mut items: Vec<(&'static str, Key)> = Vec::new();
-            if matches!(status.state, PhoneState::Off | PhoneState::Broken(_)) {
+            if phone_key_has_effect(&status.state, KeyCode::Enter) {
                 items.push(("Enter", Key::PhoneEnterToken));
             }
-            if !matches!(status.state, PhoneState::Off) {
+            if phone_key_has_effect(&status.state, KeyCode::Char('r')) {
                 items.push(("r", Key::PhoneRepair));
                 items.push(("x", Key::PhoneTurnOff));
             }
@@ -1681,6 +1716,142 @@ mod tests {
             }
             other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
         }
+    }
+
+    /// Ctrl+Q 在手机通知页跟手输路径态是同一种「先退一层」：正在填令牌时
+    /// 先回状态页，不是一步跳回设置列表。
+    #[test]
+    fn ctrl_q_leaves_the_phone_entry_before_leaving_the_page() {
+        let status = PhoneStatus {
+            state: PhoneState::WaitingForPairing,
+            bot: Some("my_dct_bot".into()),
+            owner: None,
+        };
+        let back = back_one_level(View::Phone {
+            status: status.clone(),
+            entry: Some(PhoneEntry {
+                buf: "partial".into(),
+                phase: SecretPhase::Typing,
+            }),
+        });
+        match back {
+            Some(View::Phone {
+                status: s,
+                entry: None,
+            }) => assert_eq!(s.state, status.state, "状态本身不该被这一步动"),
+            other => panic!("应当退回状态页，entry 清空，实际 {:?}", other.is_some()),
+        }
+    }
+
+    /// 只是在看状态时 Ctrl+Q 退回设置页顶层列表，光标停在「手机通知」——
+    /// 跟 `Esc` 走的是同一个目的地（见 `ui/phone.rs::handle_status`），
+    /// 两个逃生键不能说不一样的话。
+    #[test]
+    fn ctrl_q_from_the_phone_status_page_goes_back_to_settings_on_the_phone_row() {
+        let back = back_one_level(View::Phone {
+            status: PhoneStatus {
+                state: PhoneState::Off,
+                bot: None,
+                owner: None,
+            },
+            entry: None,
+        });
+        match back {
+            Some(View::Settings { state, lang: None }) => {
+                assert_eq!(
+                    state.selected().and_then(SettingsItem::at),
+                    Some(SettingsItem::Phone)
+                );
+            }
+            other => panic!("应当退回设置页顶层列表，实际 {:?}", other.is_some()),
+        }
+    }
+
+    /// `phone_key_has_effect` 是 `idle_help`（写不写这个键）和
+    /// `ui/phone.rs::handle_status`（按下去有没有效果）唯一共用的判断——
+    /// 这条测试穷举所有 (状态, 键) 组合，钉死这份真值表本身。
+    #[test]
+    fn phone_key_has_effect_matches_the_documented_truth_table() {
+        let off = PhoneState::Off;
+        let waiting = PhoneState::WaitingForPairing;
+        let paired = PhoneState::Paired;
+        let broken = PhoneState::Broken("x".into());
+
+        // Enter：只在 Off/Broken 下有效
+        assert!(phone_key_has_effect(&off, KeyCode::Enter));
+        assert!(phone_key_has_effect(&broken, KeyCode::Enter));
+        assert!(!phone_key_has_effect(&waiting, KeyCode::Enter));
+        assert!(!phone_key_has_effect(&paired, KeyCode::Enter));
+
+        // r/x：只在非 Off 下有效
+        for code in [KeyCode::Char('r'), KeyCode::Char('x')] {
+            assert!(!phone_key_has_effect(&off, code));
+            assert!(phone_key_has_effect(&waiting, code));
+            assert!(phone_key_has_effect(&paired, code));
+            assert!(phone_key_has_effect(&broken, code));
+        }
+
+        // 别的键在任何状态下都没有效果
+        assert!(!phone_key_has_effect(&waiting, KeyCode::Char('q')));
+    }
+
+    /// 底栏能不能写这个键，得跟 `phone_key_has_effect` 一致——`Off` 时不写
+    /// `r`/`x`，`Paired` 时不写 `Enter`。
+    ///
+    /// **按 `HelpItem.key` 精确比对，不是拿整句文案做子串匹配**——
+    /// `"Enter"` 本身就含着字母 `r`，拿 `contains('r')` 去问「写没写 r 这个
+    /// 键」在 `Off` 状态下会被 `"Enter"` 自己假阳性带偏。
+    #[test]
+    fn phone_idle_help_only_advertises_keys_that_actually_work() {
+        let status_of = |state| PhoneStatus {
+            state,
+            bot: Some("my_dct_bot".into()),
+            owner: Some("lei".into()),
+        };
+        let has_key = |state: PhoneState, wanted: &str| -> bool {
+            idle_help(
+                &View::Phone {
+                    status: status_of(state),
+                    entry: None,
+                },
+                Lang::Zh,
+                on_a_session(),
+            )
+            .iter()
+            .any(|it| it.key == wanted)
+        };
+
+        assert!(has_key(PhoneState::Off, "Enter"), "Off 下 Enter 该写出来");
+        assert!(
+            !has_key(PhoneState::Off, "r"),
+            "Off 下没有令牌，r 不该写出来"
+        );
+        assert!(
+            !has_key(PhoneState::Off, "x"),
+            "Off 下没有令牌，x 不该写出来"
+        );
+
+        assert!(
+            !has_key(PhoneState::WaitingForPairing, "Enter"),
+            "已经有令牌了，Enter 不该写出来"
+        );
+        assert!(has_key(PhoneState::WaitingForPairing, "r"), "该写 r");
+        assert!(has_key(PhoneState::WaitingForPairing, "x"), "该写 x");
+
+        assert!(
+            has_key(PhoneState::Broken("x".into()), "Enter"),
+            "Broken 下 Enter 该写出来"
+        );
+        assert!(
+            has_key(PhoneState::Broken("x".into()), "r"),
+            "Broken 下 r 该写出来"
+        );
+
+        assert!(
+            !has_key(PhoneState::Paired, "Enter"),
+            "Paired 下 Enter 不该写出来"
+        );
+        assert!(has_key(PhoneState::Paired, "r"), "Paired 下 r 该写出来");
     }
 
     /// 一个会话都没有的看板上（光标停在一个空项目的组头上也一样），
@@ -2433,6 +2604,22 @@ mod tests {
         ));
     }
 
+    /// `phone_verify_outcome_applies_to` 是同一条修复在手机通知令牌验证上
+    /// 的版本——只有一份输入，没有 profile 这一层，但道理一样：迟到的验证
+    /// 结果只能套在「当初发起验证时那份令牌」还等于「此刻输入框里的令牌」
+    /// 的时候。
+    #[test]
+    fn phone_verify_outcome_applies_when_the_token_still_matches() {
+        assert!(phone_verify_outcome_applies_to("tok-abc", "tok-abc"));
+    }
+
+    #[test]
+    fn phone_verify_outcome_does_not_apply_when_the_token_changed() {
+        // 令牌还在验着的时候用户 Esc 退出、重新打了一份不同的令牌——
+        // 迟到的结果不该套在这份新输入上。
+        assert!(!phone_verify_outcome_applies_to("tok-old", "tok-new"));
+    }
+
     #[test]
     fn secret_view_escapes_back_to_the_picker() {
         // 回选择器而不是回看板：用户可能只是选错了 agent
@@ -2505,6 +2692,48 @@ mod tests {
             Lang::Zh,
         );
         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+    }
+
+    /// 手机通知页的逃生键跟 `EnterSecret` 一样要分两种：正在填令牌时 Esc
+    /// 取消这次输入（回状态页），只是在看状态时 Esc 回设置——两句话不能
+    /// 说反，也不能是同一句（那样用户分不清自己退到了哪）。
+    #[test]
+    fn phone_escape_hint_distinguishes_entering_a_token_from_just_looking() {
+        let status = PhoneStatus {
+            state: PhoneState::Off,
+            bot: None,
+            owner: None,
+        };
+        let entering = escape_hint(
+            &View::Phone {
+                status: status.clone(),
+                entry: Some(PhoneEntry {
+                    buf: String::new(),
+                    phase: SecretPhase::Typing,
+                }),
+            },
+            Lang::Zh,
+        );
+        let looking = escape_hint(
+            &View::Phone {
+                status,
+                entry: None,
+            },
+            Lang::Zh,
+        );
+        assert!(
+            entering.contains("取消"),
+            "正在填令牌时 Esc 该说取消：{entering}"
+        );
+        assert!(
+            !entering.contains("设置"),
+            "正在填令牌时 Esc 不该说回设置：{entering}"
+        );
+        assert!(
+            looking.contains("设置"),
+            "只是在看状态时 Esc 该说回设置：{looking}"
+        );
+        assert_ne!(entering, looking, "两种场景不能说同一句话");
     }
 
     /// 深入语言子列表时逃生键要说「回设置」，不是顶层那句默认的

@@ -404,7 +404,7 @@ pub fn run(
                 {
                     // 只有还是当初发起这次验证的那份输入，结果才有落点——
                     // 用户可能已经 Esc 退出、甚至绕回来重新打过一遍。
-                    if buf == sent_token {
+                    if view::phone_verify_outcome_applies_to(&sent_token, &buf) {
                         app.view = match outcome {
                             Ok(new_status) => View::Phone {
                                 status: new_status,
@@ -2566,6 +2566,79 @@ mod tests {
         assert!(matches!(r, Ok(Response::Created { .. })), "前提：{r:?}");
 
         assert!(!app.copy_mode, "上一个会话的复制模式不能粘到新建的这一个上");
+    }
+
+    /// 断线时 `fetch_phone_status` 要老老实实留在调用方给的 `fallback`——
+    /// 不能凭空捏造一个新状态。特意把 fallback 设成 `Paired`（不是默认的
+    /// `Off`），这样「函数其实忽略了参数、直接写死返回 Off」这类 mutation
+    /// 会被这条测试看见——如果 fallback 恰好也是 `Off`，这类改动会被巧合
+    /// 掩护过去。
+    #[test]
+    fn fetch_phone_status_falls_back_when_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_disconnected(dir.path().join("s.sock"), dir.path().to_path_buf());
+        let fallback = crate::proto::PhoneStatus {
+            state: crate::proto::PhoneState::Paired,
+            bot: Some("my_dct_bot".into()),
+            owner: Some("lei".into()),
+        };
+
+        let got = fetch_phone_status(&mut app, fallback.clone());
+
+        assert_eq!(got, fallback, "断线时必须留在调用方给的 fallback 上");
+    }
+
+    /// 连得上的时候 `fetch_phone_status` 必须真的把守护进程的答案带回来，
+    /// 不是永远返回 fallback——起一个真守护进程，提前在它的 `secrets.toml`
+    /// 里塞一个令牌（`initial_phone_status` 见到它就该报 `WaitingForPairing`，
+    /// 见 `daemon.rs` 里对应的测试），确认 `fetch_phone_status` 传回来的
+    /// 正是这个真答案，跟传进去的 `fallback`（特意设成 `Off`）不一样。
+    #[test]
+    fn fetch_phone_status_reaches_the_real_daemon_when_connected() {
+        use crate::client::Client;
+        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
+
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        // 必须在起 daemon 之前把令牌写好：daemon 启动时会读一次
+        // secrets.toml 去算 `initial_phone_status`（见 daemon.rs::run_with_manager）。
+        let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
+        disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
+
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        {
+            use std::time::{Duration, Instant};
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !sock.exists() {
+                assert!(Instant::now() < deadline, "daemon 没起来");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let work = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+        let fallback = crate::proto::PhoneStatus {
+            state: crate::proto::PhoneState::Off,
+            bot: None,
+            owner: None,
+        };
+
+        let got = fetch_phone_status(&mut app, fallback);
+
+        assert_eq!(
+            got.state,
+            crate::proto::PhoneState::WaitingForPairing,
+            "连得上时该拿到守护进程的真答案，不是传进去的 fallback"
+        );
     }
 
     /// **建会话只有一个入口。** 三个调用点各记一次缓存的写法撑不住下一个

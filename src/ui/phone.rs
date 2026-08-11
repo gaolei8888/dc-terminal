@@ -24,7 +24,7 @@ use crate::proto::{socket_path, PhoneState, PhoneStatus, Request, Response};
 
 use super::app::App;
 use super::dim;
-use super::view::{settings_state_on_phone, PhoneEntry, SecretPhase, View};
+use super::view::{phone_key_has_effect, settings_state_on_phone, PhoneEntry, SecretPhase, View};
 
 /// 那一行状态。**四种取值都要给非空文案**——见模块头注释。
 pub(crate) fn status_line(status: &PhoneStatus, lang: Lang) -> String {
@@ -81,9 +81,9 @@ fn handle_status(app: &mut App, key: KeyEvent, status: PhoneStatus) {
                 lang: None,
             };
         }
-        // 只在 Off/Broken 下有意义：`WaitingForPairing`/`Paired` 已经有一份
-        // 能用的令牌了，这里不提供、也不显示这个键（见 `view.rs::idle_help`）。
-        KeyCode::Enter if matches!(status.state, PhoneState::Off | PhoneState::Broken(_)) => {
+        // 能不能按由 `phone_key_has_effect` 说了算——`view.rs::idle_help`
+        // 决定写不写这个键用的是同一份判断，两处必须共用（见它的文档注释）。
+        KeyCode::Enter if phone_key_has_effect(&status.state, key.code) => {
             app.view = View::Phone {
                 status,
                 entry: Some(PhoneEntry {
@@ -92,16 +92,14 @@ fn handle_status(app: &mut App, key: KeyEvent, status: PhoneStatus) {
                 }),
             };
         }
-        // 重新配对：只有已经填过令牌（非 Off）才有意义。
-        KeyCode::Char('r') if !matches!(status.state, PhoneState::Off) => {
+        KeyCode::Char('r') if phone_key_has_effect(&status.state, key.code) => {
             let resp = app.client().and_then(|c| c.call(Request::PhoneUnpair));
             app.view = View::Phone {
                 status: apply_phone_response(status, resp),
                 entry: None,
             };
         }
-        // 整个关掉：同样只有已经填过令牌才有对象可关。
-        KeyCode::Char('x') if !matches!(status.state, PhoneState::Off) => {
+        KeyCode::Char('x') if phone_key_has_effect(&status.state, key.code) => {
             let resp = app.client().and_then(|c| c.call(Request::PhoneDisable));
             app.view = View::Phone {
                 status: apply_phone_response(status, resp),
@@ -405,6 +403,28 @@ mod tests {
             }
             _ => panic!("Enter 应该打开令牌输入框"),
         }
+    }
+
+    /// `Broken`（令牌坏了）按 Enter **也要**能打开输入框——这是修复它的
+    /// 唯一路径。只测 `Off` 会漏掉这一半：`phone_key_has_effect` 是
+    /// `Off | Broken(_)` 两个条件的析取，只覆盖 `Off` 分不出「漏了 Broken」
+    /// 和「条件写对了」。
+    #[test]
+    fn enter_on_broken_also_opens_the_token_entry() {
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Phone {
+            status: PhoneStatus {
+                state: PhoneState::Broken("token revoked".into()),
+                bot: None,
+                owner: None,
+            },
+            entry: None,
+        };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(
+            matches!(app.view, View::Phone { entry: Some(_), .. }),
+            "Broken 状态下 Enter 也该打开输入框——重新填令牌是修复它的路"
+        );
     }
 
     /// `WaitingForPairing`（已经有令牌）按 Enter 不该做任何事——已经填过了。
