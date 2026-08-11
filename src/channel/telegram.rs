@@ -198,6 +198,14 @@ impl Channel for Telegram {
         // 没被告知过目的地就没有地方可发——见 `destination` 字段上的注释。
         // 一旦 `set_destination` 被调用过，这里立刻就能成功，`Unreachable`
         // 的 `worth_retrying() == true` 正好表达「现在不行，等一等会行」。
+        //
+        // 这里读一次锁就放开，不是攥着锁跨过下面最长 10 秒的网络调用——
+        // 攥着锁会让 `set_destination` 在这次 `send` 完成前一直被卡住，
+        // 代价比读到一个转瞬即逝的旧值更大。**这个取舍给出的保证只是
+        // 「重置之后不会有新的 send 发去旧账号」，不是「重置之后旧账号绝对
+        // 收不到任何东西」**——如果 `set_destination(None)` 恰好在这次快照
+        // 之后、请求送达之前落地，这一条已经在路上的消息不会被追回。写
+        // 「取消配对」那条路径（Task 5）时不要假设比这更强的保证。
         let chat_id = *recover(self.destination.lock());
         let chat_id = chat_id.ok_or(ChannelError::Unreachable)?;
         let url = self.url("sendMessage");
@@ -440,7 +448,7 @@ mod tests {
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert!(
-            calls[0].0.contains("offset=0"),
+            calls[0].0.contains("offset=0&"),
             "第一次轮询没理由带非零 offset: {}",
             calls[0].0
         );
@@ -571,6 +579,13 @@ mod tests {
     /// `set_destination(None)` 是重新配对 / 换令牌那条路径要用的——目的地
     /// 必须能被清掉，不然「取消配对」在界面上看着生效了，出站消息其实还在
     /// 送去旧账号。
+    ///
+    /// **只看 `send()` 的返回值不够。** 如果 `set_destination` 被悄悄改成
+    /// 「先到先得，`None` 也不覆盖」，`Some(777)` 会一直留着：`send` 照样会
+    /// 拼出请求打给传输层，传输层没有预备的回包，返回 `Err`，而 `send` 把
+    /// 任意传输层 `Err` 都映成 `Unreachable`——和「压根没有目的地」时的
+    /// `Unreachable` 长得一模一样，`assert_eq!` 分辨不出来。真正能证明
+    /// 「清空生效了」的是**根本没有打网络**，所以必须断言 `calls` 是空的。
     #[test]
     fn set_destination_can_be_cleared() {
         let fake = FakeTransport::new(vec![]);
@@ -578,6 +593,7 @@ mod tests {
         tg.set_destination(Some(777));
         tg.set_destination(None);
         assert_eq!(tg.send("hi").unwrap_err(), ChannelError::Unreachable);
+        assert!(fake.calls.lock().unwrap().is_empty(), "不该打网络");
     }
 
     /// 令牌被撤销时 `send` 也要能把 `BadToken` 传上去，走 `poll` 那条链路
