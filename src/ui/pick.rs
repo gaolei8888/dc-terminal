@@ -490,11 +490,25 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .map(|r| {
                 let mark = if r.is_git { " ●" } else { "  " };
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(truncate(&r.name, 30)),
                     // git 仓库的标记压暗：它是辅助信息，不该比目录名还抢眼
                     Span::styled(mark, dim()),
-                ]))
+                ];
+                // POSIX 目录名里只有 `/` 和 NUL 不合法——转义序列这类看不见
+                // 的字节完全合法，而 `truncate` 已经把它们从上面那个 span
+                // 的显示里滤掉了。不在这里补一句，这种名字选中前跟一个正常
+                // 目录长得一模一样，用户没有任何办法在选之前发现不对劲。
+                // **打开目录仍然用 `row.name` 原始值**（见 `handle_pick_project`
+                // 里的 `p.cwd.join(&row.name)`）——这一句只负责让异常在选择
+                // 的那一刻被看见，绝不能反过来去动打开逻辑。
+                if r.name.chars().any(|c| c.is_control()) {
+                    spans.push(Span::styled(
+                        format!(" {}", text(Key::HiddenCharsInName, lang)),
+                        dim(),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
         f.render_stateful_widget(
@@ -804,6 +818,67 @@ mod tests {
             app.current_group().map(|g| g.name.clone()),
             Some("proj".to_string()),
             "光标要落进那个组"
+        );
+    }
+
+    /// 选中一个名字里带看不见字符的目录之后，真正打开的必须是**磁盘上那个
+    /// 真实目录**，逐字节对得上——`truncate` 只清洗显示，`p.cwd.join` 用的
+    /// 还是 `row.name` 原始值。这是这一节的安全底线：任何把清洗后的名字
+    /// 拿去拼路径的改法都会在这里露出来（`canon` 需要目录真的存在才能
+    /// 归一化，拼错了会直接找不到这个组）。
+    #[test]
+    fn enter_opens_the_real_directory_even_when_its_name_hides_something_invisible() {
+        let weird = "weird\x1bname";
+        let (_t, _g, mut app, root) = tree(&[weird]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.current_group().map(|g| g.dir.clone()),
+            Some(crate::ui::view::canon(&root.join(weird))),
+            "打开的必须是原始名字对应的真实目录，不是清洗过的名字"
+        );
+    }
+
+    /// 浏览栏画目录名时，含看不见字符的目录要挂一个压暗提示；正常目录
+    /// **不能**挂——后一半同样重要，否则每一行都挂着它，提示就失去了意义。
+    #[test]
+    fn draw_marks_directories_whose_name_hides_something_invisible() {
+        let (_t, _g, mut app, root) = tree(&["normal", "weird\x1bname"]);
+        open_picker(&mut app, vec![], root);
+        press(&mut app, KeyCode::Tab);
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        // 只挤掉半角空格，留着换行：宽字符（这里是中文提示）在 ratatui 的
+        // 单元格网格里，续格填的是一个字面空格而不是空串，逐格拼起来就会在
+        // 每个汉字中间插一格——`draw_renders_all_profile_statuses_and_the_warning_border`
+        // 那条测试也踩过同一件事，处理方式是连换行一起挤掉；这里要按行分开断言
+        // 「正常目录不挂/异常目录要挂」，换行不能丢。
+        let rendered: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| *c != ' ')
+            .collect();
+        let marker = text(Key::HiddenCharsInName, app.lang);
+
+        let normal_line = rendered
+            .lines()
+            .find(|l| l.contains("normal"))
+            .expect("normal 目录要画出来");
+        assert!(
+            !normal_line.contains(marker),
+            "正常目录不该挂这个提示：{normal_line}"
+        );
+
+        // 显示名已经被 truncate 洗掉了看不见的字节，找那一行只能靠洗过的名字。
+        let weird_line = rendered
+            .lines()
+            .find(|l| l.contains("weirdname"))
+            .expect("藏着看不见字符的目录也要画出来（显示是清洗过的名字）");
+        assert!(
+            weird_line.contains(marker),
+            "藏着看不见字符的目录要挂这个提示：{weird_line}"
         );
     }
 

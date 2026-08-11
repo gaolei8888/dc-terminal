@@ -176,6 +176,13 @@ pub enum Key {
     EnterFolder,
     GoUp,
     NoSubfolders,
+    /// 浏览栏里，目录名单靠肉眼分辨不出异常时贴的压暗提示（见 `pick.rs`
+    /// 里挑目录那一段的说明）。POSIX 目录名里只有 `/` 和 NUL 不合法，
+    /// 转义序列这类看不见的字节完全合法，`truncate` 又把它们从**显示**里
+    /// 滤掉了——不贴这个提示，用户没有任何办法在选中之前发现这一行不对劲。
+    /// 文案不许提「控制字符」「转义序列」这类编码构成，用户不需要知道
+    /// 那是什么，只需要知道这里有点不对劲。
+    HiddenCharsInName,
     // —— 状态与提示 ——
     NoSessionsHere,
     /// 空项目组头上接在「还没有会话」后面的那半句：`上次用 claude`
@@ -365,6 +372,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "No folders here — press ← to go up",
             zh: "这里没有文件夹，按 ← 回上一级",
+        ),
+        HiddenCharsInName => t!(
+            lang,
+            en: "(something invisible in this name)",
+            zh: "（这个名字里有看不见的东西）",
         ),
 
         // 组头上那一句，不是整屏空态——分组之后这句话贴在项目名后面，
@@ -1276,6 +1288,7 @@ mod tests {
             SettingsTitle,
             CurrentProject,
             ManualPath,
+            HiddenCharsInName,
             NoSessionsHere,
             LastUsedAgent,
             NoSessionsRunningPressN,
@@ -1361,7 +1374,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 99, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 100, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
