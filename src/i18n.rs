@@ -339,7 +339,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
-        Phone => t!(lang, en: "phone", zh: "手机通知"),
+        Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
 
         MoreKeys => t!(lang, en: "…", zh: "…"),
         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),

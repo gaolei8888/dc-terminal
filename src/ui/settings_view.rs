@@ -369,6 +369,19 @@ mod tests {
         }
     }
 
+    /// 这两个长度一相等，`handle_key` 里 move_sel_n 的长度参数写错也测不出来
+    /// （见 task-3 报告的变异 #2）。哪天不相等了，这条会红——那时候补一条
+    /// 「↓ 能走到最后一个设置项」的测试，把长度来源真正钉住。
+    #[test]
+    fn the_length_coincidence_that_hides_a_wrong_move_sel_n_source() {
+        assert_eq!(
+            SettingsItem::all().len(),
+            Lang::all().len(),
+            "长度不再巧合相等了：去补一条方向键能走到最后一项设置的测试，\
+             把 move_sel_n 的长度来源钉死，不能再靠这份巧合掩护"
+        );
+    }
+
     /// 语言列表用各自的语言写，光标能走遍每一行。
     #[test]
     fn every_language_is_listed_in_its_own_language() {

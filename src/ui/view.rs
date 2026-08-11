@@ -1309,6 +1309,18 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
+        // 跟 escape_hint 一样要分层：深入语言子列表时 Esc 回的是顶层设置项
+        // 列表，不是「取消」整个设置页——两处文案哪怕只有半句话不一致，都是
+        // 「底栏说什么就得真能做到什么」这条原则被破坏了一半（同上面
+        // `EnterSecret { return_to_settings: true }` 那一条的道理）。
+        View::Settings { lang: Some(_), .. } => help_items(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToSettingsWord),
+            ],
+            lang,
+        ),
         View::Settings { .. } => help_items(
             &[
                 ("↑↓", Key::Select),
@@ -2380,6 +2392,28 @@ mod tests {
         );
         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
         assert!(!h.contains("看板"), "这一层退的不是看板：{h}");
+    }
+
+    /// `escape_hint` 和 `idle_help` 都提了「Esc 回哪」，两处不能一处说
+    /// 「回设置」、另一处还留着旧的「取消」——跟
+    /// `secret_view_from_settings_idle_help_also_says_back_to_settings` 是
+    /// 同一条原则在语言子列表上的另一半。
+    #[test]
+    fn language_list_idle_help_also_says_back_to_settings() {
+        let mut ls = ListState::default();
+        ls.select(Some(0));
+        let help = help_of(
+            &View::Settings {
+                state: ListState::default(),
+                lang: Some(ls),
+            },
+            Lang::Zh,
+        );
+        assert!(
+            help.contains("返回设置"),
+            "底栏说什么就得真能做到什么：{help}"
+        );
+        assert!(!help.contains("取消"), "这一层退的不是「取消」：{help}");
     }
 
     #[test]

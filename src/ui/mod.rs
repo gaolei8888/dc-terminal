@@ -3581,6 +3581,13 @@ mod tests {
                 state: ListState::default(),
                 lang: None,
             },
+            // 深入语言子列表也有自己的一句提示（回顶层设置项列表，不是回
+            // 看板）——跟上面 `PickProject` 两条并列的道理一样，两种输出
+            // 都要量。
+            View::Settings {
+                state: ListState::default(),
+                lang: Some(ListState::default()),
+            },
             View::Keys {
                 from: Box::new(View::Board),
             },
