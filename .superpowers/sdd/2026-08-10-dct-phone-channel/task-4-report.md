@@ -297,3 +297,192 @@ $ git diff --check
   socket the same way three pre-existing `mod.rs` tests already do
   (`start_daemon_for_test` / the manual inline version in
   `settings_view.rs`) — never touches the user's real `~/.dct`.
+
+---
+
+## Round 2 (fix round 1 recovery): verification pass, no code changes
+
+**Status: nothing in this pass required a code change.** The implementer who
+died three times (context ~500k tokens, two API connection errors then a
+600s stall) got further than the coordinator's recovery note assumed —
+before it stalled it had already fixed Criticals 2 and 3 and removed
+`spawn_phone_startup_refresh` outright, but it never wrote a report saying
+so, which is why the ledger still listed all four items as unverified. My
+job this round was to read the code (not the stale ledger entry) and check
+each of the four items against what commit `e1694c7` actually contains, then
+prove the load-bearing tests are real by mutating the guarded code and
+confirming red, then reverting. `git diff` is clean; nothing below is a new
+commit.
+
+### 1. Critical 2 first half — proof from a reachable state
+
+`proto.rs::PhoneState::has_confirmed_token()` now exists and is the single
+guard shared by `daemon.rs`'s `Request::PhoneUnpair` handler and
+`ui/view.rs::phone_key_has_effect` (both call sites are commented as
+required to agree, and do). `Broken`'s reason is now typed
+(`PhoneBrokenReason::{BadToken, BotBlocked, Unreachable}`), not a bare
+`String`, and only `BotBlocked` counts as "confirmed" — `BadToken` and
+`Unreachable` do not, because `apply_phone_set_token` never saves on a
+failed verification.
+
+Of the three `Broken` reasons, only `BadToken` and `Unreachable` are
+reachable by an actual user today — `BotBlocked` requires Telegram to answer
+`getMe` with a 403, which the code's own comment (`daemon.rs` above
+`phone_verify_token`) documents cannot happen: `getMe` carries no chat
+context, so 403 (`bot was blocked by the user`) is a `sendMessage`-only
+error that only becomes reachable once Task 5's Bridge exists. So the test
+that actually proves Critical 2's first half is
+`daemon::tests::phone_unpair_on_a_bad_token_is_a_no_op`
+(`src/daemon.rs:1332`), which constructs `Broken { BadToken | Unreachable,
+bot: None }` — exactly the state a user reaches by typing an invalid token,
+or having no network when they type a valid one — and asserts `PhoneUnpair`
+leaves it untouched.
+
+I verified this by mutation (not just by reading): reverting
+`if ph.state.has_confirmed_token()` in the `PhoneUnpair` arm to
+`if true` turns that state into `WaitingForPairing` with `bot` still `None`
+— which is precisely the `status_line` render that produces "等你在
+Telegram 里给 @? 发条消息" (`status_line`'s `WaitingForPairing` arm does
+`status.bot.as_deref().unwrap_or("?")`). That mutation turned two daemon
+tests red (`phone_unpair_on_a_bad_token_is_a_no_op`,
+`phone_unpair_on_off_stays_off`). I also mutated
+`view.rs::phone_key_has_effect`'s `r`/`x` arm to `true` and its `Enter` arm
+to `state.has_confirmed_token()` (inverted) separately; each turned
+`phone_key_has_effect_matches_the_documented_truth_table` red, and the
+`Enter` mutation additionally turned three `ui/phone.rs` tests red
+(`enter_on_broken_also_opens_the_token_entry` among them — a test that
+starts from `Broken { BadToken }`, not `Paired`).
+
+One thing worth flagging precisely: `phone_key_has_effect`'s own doc comment
+already explains why there is no equivalent "press r on Broken, assert
+no-op" test *inside* `ui/phone.rs` itself (mirroring
+`r_and_x_on_off_are_no_ops`) — `App::test_app()` is disconnected, so a
+mutated (guard removed) `r`/`x` still ends up calling a client that errors,
+and `apply_phone_response`'s fallback produces the same unchanged status as
+the guard blocking it outright. I confirmed this experimentally: mutating
+the `r`/`x` guard to `true` left `r_and_x_on_off_are_no_ops` green. Adding
+such a test to `phone.rs` would be exactly the kind of test this house
+flags as suspect — looks like coverage, discriminates nothing. The
+`phone_key_has_effect` truth-table test in `view.rs` is the one place this
+guard can actually be pinned, and it already is. I did not add a
+non-discriminating test to satisfy the brief's file-location preference.
+
+**Conclusion: already fixed and already covered as of `e1694c7`.** No code
+or test changes made this round for item 1.
+
+### 2. Critical 3 — network reachability of the two integration tests
+
+Both tests (`ui/mod.rs::fetch_phone_status_reaches_the_real_daemon_when_connected`,
+`ui/settings_view.rs::entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default`)
+now pre-seed `PHONE_TOKEN_KEY` on disk *before* starting the daemon (via the
+shared `start_daemon_at` helper, not a duplicated one — see Minor 2 below),
+and both carry a comment stating the fix: "删掉 `spawn_phone_startup_refresh`
+之后这条测试不再跟一次真实的 `getMe` 请求赛跑". I confirmed this two ways:
+
+- **Static**: `grep`'d every call site of `Telegram::new(_).get_me()` in the
+  crate. There is exactly one, inside `daemon.rs`'s `Request::PhoneSetToken`
+  arm (`&|t| Telegram::new(t).get_me()`), reached only when a client sends
+  `PhoneSetToken`. Neither test sends that request — they only read status
+  (`Request::PhoneStatus`, or `Enter` on the settings row, which calls
+  `fetch_phone_status`). `run_with_manager` itself no longer spawns any
+  background thread that touches the network (I read it in full; the only
+  spawned thread is the 200ms session-tick loop).
+- **Dynamic**: ran both tests with `https_proxy`/`http_proxy` pointed at
+  `127.0.0.1:1` (nothing listening — any real HTTP attempt would either
+  connection-refuse immediately or hang) and, separately, with no proxy
+  vars set at all. Both runs: `2 passed; finished in 0.08s`. A real call to
+  `api.telegram.org`, successful or not, does not complete in 0.08s
+  end-to-end including daemon startup — this is consistent with zero
+  network attempts, not just a fast one.
+
+The race the task warned about (asserting `WaitingForPairing` while a
+background thread overwrites it with `Broken`) no longer applies, for the
+same reason: the background thread that would have raced
+(`spawn_phone_startup_refresh`) does not exist in this tree. It was
+removed, not gated. There is nothing left to race.
+
+**Conclusion: already fixed as of `e1694c7`.** No code changes made this
+round.
+
+### 3. `spawn_phone_startup_refresh`
+
+It is gone. `grep -n spawn_phone_startup_refresh src/daemon.rs` matches only
+a doc comment (`run_with_manager`'s header and `initial_phone_status`'s)
+explaining that it used to exist and was deleted for being unrequested,
+untested, and network-touching. `run_with_manager` now calls
+`initial_phone_status(&secrets)` directly — disk-only, no thread, no
+`getMe`. This resolves the concern by removal, one of the two options the
+task offered.
+
+**Conclusion: already resolved as of `e1694c7` (by deletion). No action
+taken this round.**
+
+### 4. Mutation sweep, applied by hand, all reverted
+
+Beyond the two mutations already covered under item 1, I swept the rest of
+the logic this fix round touched or that the earlier mutation table (in the
+first half of this report) covered, re-verifying against the *current*
+shape of the code (`Broken` now carries `{ reason, message }`, not a bare
+`String`; `has_confirmed_token` is new). Each mutation was applied with
+`Edit`, confirmed red with a targeted `cargo test --lib -- --test-threads=1
+<name>`, then reverted with `git checkout -- <file>`.
+
+| # | Mutation | File | Test(s) that catch it | Result |
+|---|---|---|---|---|
+| 1 | `has_confirmed_token`: drop the `BotBlocked` arm | `proto.rs` | `phone_unpair_on_a_blocked_bot_repairs_and_keeps_the_bot_name`, `phone_idle_help_only_advertises_keys_that_actually_work`, `phone_key_has_effect_matches_the_documented_truth_table` | RED (3) |
+| 2 | `phone_verify_token`: `BadToken` composes `reason: Unreachable` instead of `BadToken` | `daemon.rs` | `phone_verify_token_marks_a_bad_token_broken` | RED |
+| 3 | `apply_phone_set_token`: drop the "don't save on Broken" guard | `daemon.rs` | `apply_phone_set_token_does_not_save_a_bad_token` | RED |
+| 4 | `initial_phone_status`: invert the has-token ternary | `daemon.rs` | 3 tests (`initial_phone_status_is_off_without_a_saved_token`, `..._is_waiting_for_pairing_with_a_saved_token`, `..._reads_the_bot_name_from_disk_without_any_network_call`) | RED (3) |
+| 5 | `PhoneDisable`: skip removing `PHONE_BOT_KEY` | `daemon.rs` | `phone_disable_deletes_the_token_and_resets_to_off` | RED |
+| 6 | `PhoneUnpair`: drop the `has_confirmed_token()` guard | `daemon.rs` | `phone_unpair_on_a_bad_token_is_a_no_op`, `phone_unpair_on_off_stays_off` | RED (2) |
+| 7 | `phone_key_has_effect`: invert the `Enter` condition | `view.rs` | 5 tests (truth table, idle_help, 3 `phone.rs` Enter tests) | RED (5) |
+| 8 | `phone_key_has_effect`: `r`/`x` condition replaced with `true` | `view.rs` | `phone_key_has_effect_matches_the_documented_truth_table`, `phone_idle_help_only_advertises_keys_that_actually_work` | RED (2) — `phone.rs`'s `r_and_x_on_off_are_no_ops` stayed green (see item 1's discussion of why) |
+| 9 | `back_one_level`: delete the `View::Phone { entry: Some(_) }` arm | `view.rs` | `ctrl_q_leaves_the_phone_entry_before_leaving_the_page` | RED |
+| 10 | `back_one_level`: `View::Phone { entry: None }` target uses `ListState::default()` instead of `settings_state_on_phone()` | `view.rs` | `ctrl_q_from_the_phone_status_page_goes_back_to_settings_on_the_phone_row` | RED |
+| 11 | `idle_help`'s `View::Phone` arm: always push Enter/r/x | `view.rs` | `phone_idle_help_only_advertises_keys_that_actually_work` | RED |
+| 12 | `escape_hint`'s `entry: Some(_)` arm made identical to the `entry: None` arm | `view.rs` | `phone_escape_hint_distinguishes_entering_a_token_from_just_looking` | RED |
+| 13 | `phone_verify_outcome_applies_to` body replaced with `true` | `view.rs` | `phone_verify_outcome_does_not_apply_when_the_token_changed` | RED |
+| 14 | `fetch_phone_status`: ignore `fallback`, always return `Off` | `mod.rs` | `fetch_phone_status_falls_back_when_disconnected` | RED |
+| 15 | `status_line`'s `WaitingForPairing` arm: drop the bot-name interpolation | `phone.rs` | `waiting_names_the_bot` | RED |
+| 16 | `next_step`'s `Paired` arm: return `Some(...)` instead of `None` | `phone.rs` | `every_state_tells_the_user_what_to_do_next` | RED |
+| 17 | `status_line`'s `Broken` arm: render `message` instead of the opaque headline | `phone.rs` | `the_token_never_appears_in_any_status_text` | RED |
+| 18 | `settings_view.rs`'s `Some(SettingsItem::Phone)` arm: hardcode `Off` instead of calling `fetch_phone_status` | `settings_view.rs` | `entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default` | RED |
+
+All 18 caught. After every mutation, `git checkout -- <file>` restored the
+original; `git status --porcelain` and `git diff --stat` were both empty
+before starting the next one and at the end of the sweep. `cargo test --lib
+-- --test-threads=1` afterward: **790 passed, 0 failed** (unchanged from the
+tree at handoff). `cargo fmt --check` and `cargo clippy --all-targets`: both
+clean, no changes needed.
+
+### Minors
+
+- **"27 tests" in `ui/phone.rs`**: still wrong, still 14
+  (`grep -c '#\[test\]' src/ui/phone.rs` → 14). The claim in the "Test
+  commands and output tails" section above (line 189 area) was accurate at
+  the time it was written (14 passed, correctly listed) — the "27" is only
+  in the "Files touched" bullet's prose and was never true; I'm not
+  overwriting that line per the append-only instruction, but flagging it
+  here as wrong. Total test count across the four phone-related files as of
+  this commit: `proto.rs` 16, `daemon.rs` 26, `ui/view.rs` 102 (not all
+  phone-specific — this file covers the whole UI), `ui/phone.rs` 14.
+- **Duplicated `start_daemon_for_test`**: also already fixed as of
+  `e1694c7`. `src/ui/mod.rs:2296` defines `pub(crate) fn start_daemon_at`
+  (the shared primitive `start_daemon_for_test` now calls), and
+  `settings_view.rs`'s test calls `super::super::start_daemon_at` directly
+  — no inlined copy remains. The doc comment on `start_daemon_for_test`
+  even names this as the reason the split exists ("那边曾经内联抄了一份
+  一模一样的实现——…C3 的修复要改两处而不是一处正是这份重复的直接代价").
+
+### What this round actually did
+
+Read every line the four work items pointed at, ran the daemon and reached
+it over its real Unix socket to rule out the network claim empirically
+rather than trust a comment, and ran an 18-mutation sweep (2 of which
+directly reproduce Critical 2's original failure mode) confirming every
+guard this task named is load-bearing. No source file changed. Verified
+final state: `git status --porcelain` shows only the pre-existing untracked
+`docs/dc-terminal_产品改进与自动化开发方案.md` (unrelated, not part of this
+branch's work); `git diff` is empty; `cargo test --lib -- --test-threads=1`
+is 790 passed / 0 failed; `cargo fmt --check` and `cargo clippy
+--all-targets` are clean.
