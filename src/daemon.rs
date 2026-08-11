@@ -2255,4 +2255,88 @@ mod tests {
             "槽位也要清空——不然下一次 PhoneSetToken/PhoneUnpair 会摸到一个已经退休的 Bridge"
         );
     }
+
+    /// **Critical 2 的 ordering 部分，钉住。** `PhoneDisable` 必须先
+    /// `retire()`，再碰 `phone` 锁——这是 `Request::PhoneDisable` 那条
+    /// 长注释里说的「不共享任何一把锁、纯粹靠先后顺序」——不然一个卡在
+    /// `phone.lock()` 上等的轮询线程，锁一到手重新检查 `is_retired()`
+    /// 时可能读到还没翻过来的 `false`，把用户刚点掉的 `Off` 又写回
+    /// `Paired`/`Broken`。
+    ///
+    /// 这条测试是确定性的，不是靠运气：测试线程自己先拿住 `phone` 锁不
+    /// 放，再在另一条线程上跑 `handle(PhoneDisable, ...)`，然后**在还
+    /// 攥着 `phone` 锁的时候**有界等待 `is_retired_for_test()` 变
+    /// `true`。retire 只需要 `bridge_slot` 和 `secrets` 两把锁，跟
+    /// `phone` 完全无关——如果 `PhoneDisable` 真的先 retire 再碰
+    /// `phone`，这个等待总会在退休真正发生之后成功，不依赖任何调度
+    /// 时序。反过来，如果谁把顺序改回「先锁 `phone` 再 retire」（Critical
+    /// 2 之前的写法），`handle()` 的那条线程会卡死在 `phone.lock()` 上
+    /// 出不来——`retire()` 压根没机会执行，`is_retired_for_test()` 在 2
+    /// 秒的预算里永远读不到 `true`，测试确定性地报红，不是偶尔报红。
+    /// 唯一的失败模式是「在负载下的假红」（2 秒预算原本就给得很宽），
+    /// 不会假绿——即 fail-closed。
+    #[test]
+    fn phone_disable_retires_before_it_ever_touches_the_phone_lock() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets_path = tempfile::tempdir().unwrap().path().join("secrets.toml");
+        let mut disk = SecretStore::load(&secrets_path);
+        disk.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        disk.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
+        let secrets = Arc::new(Mutex::new(disk));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::Paired,
+            bot: Some("my_dct_bot".into()),
+            owner: Some("lei".into()),
+        }));
+
+        let ch = Arc::new(RecordingChannel::default());
+        let bridge = Arc::new(Bridge::new(ch));
+        let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge.clone())));
+
+        // 拿住 `phone` 锁不放，制造出「一条轮询线程正卡在这把锁上」的
+        // 场景——`PhoneDisable` 如果先锁 `phone` 再 retire，它自己就会
+        // 在下面这行卡住。
+        let phone_guard = recover(phone.lock());
+
+        let mgr2 = mgr.clone();
+        let store2 = store.clone();
+        let secrets2 = secrets.clone();
+        let profiles_dir2 = profiles_dir.path().to_path_buf();
+        let phone2 = phone.clone();
+        let bridge_slot2 = bridge_slot.clone();
+        let handle_thread = std::thread::spawn(move || {
+            handle(
+                Request::PhoneDisable,
+                &mgr2,
+                &store2,
+                &secrets2,
+                &profiles_dir2,
+                &phone2,
+                &bridge_slot2,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !bridge.is_retired_for_test() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            bridge.is_retired_for_test(),
+            "retire() 必须在 PhoneDisable 碰 phone 锁之前发生——这里还攥着 \
+             phone 锁没放，如果 retire 排在锁 phone 之后，handle() 那条线程 \
+             这会儿应该卡在 phone.lock() 上，is_retired_for_test() 永远等不到 true"
+        );
+
+        // 放开锁，让 handle() 走完剩下的部分（写 Off、清槽位），再收线程。
+        drop(phone_guard);
+        let resp = handle_thread.join().expect("handle() 所在的线程不该 panic");
+        match resp {
+            Response::Phone(status) => assert_eq!(status.state, PhoneState::Off),
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+    }
 }
