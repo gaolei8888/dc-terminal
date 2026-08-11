@@ -300,9 +300,16 @@ mod tests {
 
         fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
             *recover(self.poll_calls.lock()) += 1;
+            // 脚本耗尽之后回一个**终态**错误，不是 `Ok(空批次)`——空批次
+            // 会让 `poll_forever` 立刻回到循环顶端再 `poll()` 一次，如果
+            // 测试正在验证的那个终止条件本身被 mutate 掉了（比如
+            // `send_pairing_confirmation` 该在 `Blocked` 时叫停却没叫停），
+            // 循环会在一个只回复空批次的假渠道上转成真正的死循环，把
+            // mutation 跑成一次挂起而不是一次快速失败。回终态错误保证
+            // 任何一条测试、任何一次 mutation 都在有限步内收敛。
             recover(self.poll_script.lock())
                 .pop_front()
-                .unwrap_or(Ok(Vec::new()))
+                .unwrap_or(Err(ChannelError::BadToken))
         }
 
         fn set_destination(&self, chat: Option<i64>) {
