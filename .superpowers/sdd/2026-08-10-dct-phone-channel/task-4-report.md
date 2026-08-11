@@ -486,3 +486,135 @@ final state: `git status --porcelain` shows only the pre-existing untracked
 branch's work); `git diff` is empty; `cargo test --lib -- --test-threads=1`
 is 790 passed / 0 failed; `cargo fmt --check` and `cargo clippy
 --all-targets` are clean.
+
+---
+
+## Round 3 (fix round 2): scoped re-review findings, addressed
+
+The scoped re-review of Round 2's recovery confirmed all three Criticals,
+the spec failure, and both Importants, and independently re-derived the
+`Broken{BotBlocked}`-unreachable claim. It then found two new Importants and
+three Minors **in the fix diff itself** — not in the four original work
+items. Commit `45cc5e0`. All source changes; `cargo test --lib --
+--test-threads=1`: 793 passed, 0 failed. `cargo fmt --check` and `cargo
+clippy --all-targets`: clean.
+
+### Important 1 — the fix's central behaviour had no test
+
+`next_step`'s three `Broken` arms (`PhoneNextStepBadToken`/`Blocked`/
+`Unreachable`) were only ever exercised through `is_some()`, so collapsing
+all three to the same key left the suite green — the exact defect the round
+existed to fix (an offline user with a good token told to re-type it) could
+come back silently. Added
+`ui/phone.rs::the_three_broken_reasons_give_three_different_next_steps`,
+which computes `next_step` for all three reasons and asserts pairwise
+inequality. Verified by mutation: collapsed all three match arms in
+`next_step` to `PhoneNextStepBadToken`, confirmed the new test goes red
+while `every_state_tells_the_user_what_to_do_next` (the only prior coverage)
+stays green — reproducing exactly the blind spot the review described —
+then reverted.
+
+### Important 2 — `has_confirmed_token()` and the save guard disagreed about `BotBlocked`
+
+Picked the second of the two offered fixes: **map `ChannelError::Blocked` →
+`PhoneBrokenReason::BadToken` on the set-token path**
+(`daemon.rs::phone_verify_token`), rather than teaching
+`apply_phone_set_token` to save on `BotBlocked`.
+
+Reasoning for that choice over the alternative: saving on `BotBlocked` would
+still need a real bot name to write, and `phone_verify_token` never has one
+in the `Err` branches (`get_me` failed — no username was ever returned).
+Inventing one, or trying to carry forward a previously-known name into a
+stateless verification function, is a bigger and shakier change than the
+mapping. More importantly, `getMe` has no chat context — a 403 there
+answers a question ("is anyone blocking a chat with this bot") that the
+call never asked, so treating it as `BotBlocked` was importing a
+Telegram-API-would-never-do-this assumption directly into `PhoneState`,
+which is precisely what the review flagged as unsound. Mapping it to
+`BadToken` means the only sensible response to "we asked if this token
+works and got back nonsense" is the same one `BadToken` already gives:
+retype it. `BotBlocked` is now producible only by Task 5's Bridge, at a
+point (sending to an already-paired chat) where the invariant
+`has_confirmed_token()` promises — a real token, really on disk — holds by
+construction, not by luck.
+
+This selection also let the Minor 5 fix (below) fall out cleanly:
+`phone_verify_token`'s signature changed from `(PhoneState, Option<String>)`
+to `Result<String, PhoneState>`. `Ok` now always carries a real bot name
+(the only producer is `get_me`'s success case), so `apply_phone_set_token`
+no longer has an `Option` to unwrap-or-empty-string in the save path at
+all — the type system enforces it, not control flow. Corrected the two
+comments the review named as describing a world that doesn't exist:
+`daemon.rs`'s `PhoneUnpair` handler (used to claim `Broken{BotBlocked}` is a
+state this branch's code reaches; now says it structurally can't, and that
+Task 5 owns the invariant when it starts constructing it) and
+`PhoneState::has_confirmed_token()`'s doc comment in `proto.rs` (added a
+paragraph making the same point: this arm is a promise for future code, not
+a fact about today's).
+
+`msg::phone_blocked` (the message text for `BotBlocked`) lost its only
+caller as a result. Rather than leave it silently uncalled, added
+`i18n::tests::phone_blocked_composes_in_both_languages`, calling it
+directly — same treatment `PhoneBrokenReason::BotBlocked` and
+`Key::PhoneNextStepBlocked` already get from tests that manually construct
+the state, for the same reason (Task 5 needs it working on the day it
+starts using it, not the day someone first reads the source to check).
+
+Verified by mutation: reverted the `Blocked` arm back to mapping
+`BotBlocked`, confirmed the new
+`daemon::tests::phone_verify_token_maps_blocked_to_bad_token_not_bot_blocked`
+test goes red, then reverted (checked against the already-committed fix, so
+the revert couldn't lose real work — see the process note below).
+
+### Minor 3 — `phone_unpair_from_waiting_for_pairing_stays_waiting_and_keeps_the_bot` didn't discriminate
+
+Changed its starting `owner` from `None` to `Some("lei")` and asserted it's
+cleared by `r`. With the old `None` starting point, deleting the entire `if
+ph.state.has_confirmed_token() { ... }` body in `daemon.rs`'s `PhoneUnpair`
+handler left the test green (nothing it checked had actually changed).
+
+### Minor 4 — `Response::Phone`'s wire shape had no pin
+
+Added `proto::tests::the_phone_status_shape_is_pinned_too`, mirroring
+`the_session_info_shape_is_pinned_too`: a hardcoded-JSON assertion over all
+four `PhoneState` variants and over `Response::Phone(PhoneStatus)`, not a
+round-trip. Confirmed it's a real pin, not a guess — the expected JSON
+string matched on the first run, so I didn't need the usual "write the
+wrong string, read the actual output" trick, but the test does fail loudly
+on any shape change since it hardcodes the exact serialized bytes rather
+than comparing serialize-then-deserialize against itself.
+
+### Minor 5 — made `unwrap_or("")` impossible, not just unreached
+
+Covered above under Important 2 — same fix, same commit. `bot:
+Option<String>` and its `bot.as_deref().unwrap_or("")` write are gone from
+`apply_phone_set_token`; `phone_verify_token` returning `Result<String,
+PhoneState>` means the success path has an owned `String` with nothing to
+fall back from.
+
+### Carry into Task 5, not for fixing on this branch
+
+With `spawn_phone_startup_refresh` removed (Round 2), nothing re-verifies a
+saved token after a daemon restart. A revoked token shows
+`WaitingForPairing` indefinitely on restart (disk has a token, so
+`initial_phone_status` reports `WaitingForPairing`, and nothing re-checks
+it against Telegram), and since `Enter` is suppressed whenever
+`has_confirmed_token()` is true, the only way to a new token is `x`
+(disable) then `Enter` (re-enable and retype) — there's no direct "this
+token stopped working, retype it" path from that state. This is honest for
+Task 4 alone (no Bridge exists yet, so pairing never completes regardless),
+but Task 5 needs to know it inherits this: once messages are actually being
+sent, a revoked token should probably surface as `Broken{BadToken}` again
+rather than sitting silently in `WaitingForPairing` forever.
+
+### Process note: the `git checkout --` revert trap
+
+Mid-mutation-testing for Important 1, I ran `git checkout -- src/ui/phone.rs`
+intending to revert only the mutation I'd just applied — but the new test I'd
+also just added to that same file was still uncommitted, and `git checkout
+--` restores the whole file to HEAD, not just the last edit. Both the
+mutation and my real test addition were lost in one command. Caught it by
+noticing the test was missing from a `grep`, re-added it, and re-verified.
+From that point on I committed real changes (`45cc5e0`) before running any
+further mutate-and-revert cycles, so later reverts (Important 2's) could
+only discard the mutation, never real work.
