@@ -22,6 +22,18 @@ struct Disk {
 /// agent 冒出来——改那里的人请回来看这一句。
 pub const PHONE_TOKEN_KEY: &str = "__phone__";
 
+/// bot 用户名（`getMe` 拿的，不是密钥）跟令牌存在同一份仓里，同样是为了
+/// 不再起一个存储。**这不违反"不该出现在密钥页"那条约束**，理由跟
+/// `PHONE_TOKEN_KEY` 完全一样：密钥页遍历的是 profiles，不是这个文件。
+///
+/// 存它是为了让「等你在 Telegram 里给 @xxx 发条消息」这句话在守护进程
+/// 重启之后还说得出 `xxx` 是谁——不存的话，唯一的办法是重启时再打一次
+/// `getMe` 网络请求，那意味着每次启动都要连外网，而且给单元测试制造了
+/// 一个真实的网络依赖（dct-phone-channel Task 4 fix round 1 的 Critical
+/// 3：预先塞好令牌再起 daemon 的测试，会撞上这次网络请求本身，在没有
+/// 网络的机器上必定失败，在有网络的机器上还会跟这次请求的结果赛跑）。
+pub const PHONE_BOT_KEY: &str = "__phone_bot__";
+
 /// 按 profile 名索引的用户密钥。落盘在 `~/.dct/secrets.toml`，0600。
 pub struct SecretStore {
     path: PathBuf,

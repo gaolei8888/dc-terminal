@@ -164,15 +164,24 @@ pub enum Key {
     /// `PhoneState::Paired` 但 `owner` 意外是 `None` 时的状态行兜底
     /// （正常情况下走 `msg::phone_paired`，带着配对账号的名字）。
     PhonePairedNoOwner,
-    /// `PhoneState::Broken` 的状态行。**故意不读 `Broken` 里的字符串**，
-    /// 见 `proto::PhoneState::Broken` 和 `ui/phone.rs::status_line` 的
-    /// 文档注释——这是防止令牌漏进界面文案的一条纵深防御。
+    /// `PhoneState::Broken` 的状态行，三种原因共用同一句headline——
+    /// **故意不读 `message` 字符串**，见 `proto::PhoneState::Broken` 和
+    /// `ui/phone.rs::status_line` 的文档注释，这是防止令牌漏进界面文案
+    /// 的一条纵深防御。下一步按 `reason` 分岔，见下面三条。
     PhoneBrokenHeadline,
-    /// `PhoneState::Broken` 的下一步：两种真实成因合成一句话——
-    /// 令牌本身失效了（重新填一遍），或者对方在 Telegram 里拉黑了这个
-    /// bot（解除拉黑后按 r 重新配对）。同样不读 `Broken` 的payload，
-    /// 两种可能性都摆出来，比猜一个可能是错的原因更诚实。
-    PhoneBrokenNextStep,
+    /// `PhoneBrokenReason::BadToken` 的下一步：令牌本身不好使，重新填
+    /// 一遍（`Enter`）。
+    PhoneNextStepBadToken,
+    /// `PhoneBrokenReason::BotBlocked` 的下一步：令牌完好，是对方在
+    /// Telegram 里把这个 bot 拉黑了/删了对话——解除拉黑后按 `r` 重新
+    /// 配对。**不能说「重新输入令牌」**：令牌没坏，那句建议对这个原因
+    /// 没有用（dct-phone-channel Task 4 fix round 1 的 Critical 2/根因）。
+    PhoneNextStepBlocked,
+    /// `PhoneBrokenReason::Unreachable` 的下一步：网络问题，检查网络再
+    /// 试一次。**同样不能说「重新输入令牌」**——这条本来就是一份好端端
+    /// 的令牌，只是这一次连不上或者读不懂回包（fix round 1 的
+    /// Important 1）。
+    PhoneNextStepUnreachable,
     /// 状态页上 `Enter` 键的说明：填令牌。只在 `Off`/`Broken` 两种状态下
     /// 显示——`WaitingForPairing`/`Paired` 已经有令牌了，Enter 不做事。
     PhoneEnterToken,
@@ -389,12 +398,20 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "phone notifications stopped working",
             zh: "手机通知断线了",
         ),
-        PhoneBrokenNextStep => t!(
+        PhoneNextStepBadToken => t!(
             lang,
-            en: "if the token itself stopped working, press Enter to type a new one; \
-                 if you blocked this bot in Telegram, unblock it and press r to pair again",
-            zh: "如果是令牌本身失效了，按 Enter 重新填一遍；如果是你在 Telegram 里把这个\
-                 机器人拉黑了，解除拉黑后按 r 重新配对",
+            en: "this token doesn't work — press Enter to type it again",
+            zh: "这个令牌用不了，按 Enter 重新填一遍",
+        ),
+        PhoneNextStepBlocked => t!(
+            lang,
+            en: "you blocked this bot in Telegram — unblock it, then press r to pair again",
+            zh: "你在 Telegram 里把这个机器人拉黑了，解除拉黑后按 r 重新配对",
+        ),
+        PhoneNextStepUnreachable => t!(
+            lang,
+            en: "could not reach Telegram — check your connection and try again",
+            zh: "连不上 Telegram，检查一下网络，再试一次",
         ),
         PhoneEnterToken => t!(lang, en: "enter token", zh: "填令牌"),
         PhoneRepair => t!(lang, en: "pair again", zh: "重新配对"),
@@ -850,6 +867,22 @@ pub mod msg {
             lang,
             en: "could not reach Telegram right now — check the network and try again",
             zh: "现在连不上 Telegram，检查一下网络，再试一次",
+        )
+        .to_string()
+    }
+
+    /// 令牌完好，但对方在 Telegram 里把这个 bot 拉黑了/删了对话（403）。
+    /// **`daemon.rs::phone_verify_token` 今天没有任何路径会真的调用这个
+    /// 函数**——`getMe` 没有 chat 上下文，Telegram 不会拿它回 403，这个
+    /// 原因只会在 Task 5 的 Bridge 真的往一个已配对的 chat 发消息时出现。
+    /// 留着这个分支是因为 `ChannelError` 现在有 `Blocked` 这个变体，
+    /// `phone_verify_token` 的 match 必须穷尽；写清楚这一点是为了不让
+    /// 未来的人以为这条路径今天被测过、被验证过。
+    pub fn phone_blocked(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "this bot has been blocked in Telegram — unblock it and try again",
+            zh: "这个机器人在 Telegram 里被拉黑了，解除拉黑后再试一次",
         )
         .to_string()
     }
@@ -1393,7 +1426,9 @@ mod tests {
             PhoneWaitingNextStep,
             PhonePairedNoOwner,
             PhoneBrokenHeadline,
-            PhoneBrokenNextStep,
+            PhoneNextStepBadToken,
+            PhoneNextStepBlocked,
+            PhoneNextStepUnreachable,
             PhoneEnterToken,
             PhoneRepair,
             PhoneTurnOff,
@@ -1495,7 +1530,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 110, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 112, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

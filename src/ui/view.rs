@@ -365,13 +365,24 @@ pub(crate) fn settings_state_on_phone() -> ListState {
 /// `handle_status` 跑完之后 `app.view` 变没变，分辨不出「守卫拦住了」和
 /// 「发了请求，只是刚好失败了」。把守卫本身抽出来单测，才钉得住这条判断，
 /// 而不是钉住一个连不上网络时凑巧长得一样的表象。
+///
+/// **两个键的判断互为镜像**，都读 `PhoneState::has_confirmed_token`
+/// ——`daemon.rs` 的 `Request::PhoneUnpair` 也读它，三处必须给出同一个
+/// 答案（见 `has_confirmed_token` 自己的文档注释，那里记着不这样做的
+/// 后果：dct-phone-channel Task 4 fix round 1 的 Critical 2）。
 pub(crate) fn phone_key_has_effect(state: &PhoneState, code: KeyCode) -> bool {
     match code {
-        // 只在 Off/Broken 下有意义：`WaitingForPairing`/`Paired` 已经有一份
-        // 能用的令牌了。
-        KeyCode::Enter => matches!(state, PhoneState::Off | PhoneState::Broken(_)),
-        // 重新配对 / 整个关掉都只在已经填过令牌（非 Off）时才有对象可作用。
-        KeyCode::Char('r') | KeyCode::Char('x') => !matches!(state, PhoneState::Off),
+        // 没有一份「确认有效」的令牌时才有意义：`Off`，或者验证失败但
+        // 从没成功过的 `Broken`（`BadToken`/`Unreachable`）。已经有令牌
+        // 了（`WaitingForPairing`/`Paired`/`Broken { BotBlocked }`）就不
+        // 该再提供——那份令牌本身没坏，不需要重填。
+        KeyCode::Enter => !state.has_confirmed_token(),
+        // 重新配对 / 整个关掉都只在**存在一份确认有效的令牌**时才有对象
+        // 可作用——`Off` 没有令牌，`Broken { BadToken }`/`Broken { Unreachable }`
+        // 时 `apply_phone_set_token` 验证失败根本没有落盘，这两种情形下
+        // 允许这两个键会让 `daemon.rs` 的 `PhoneUnpair` 伪造出一个磁盘上
+        // 不存在的 `WaitingForPairing`。
+        KeyCode::Char('r') | KeyCode::Char('x') => state.has_confirmed_token(),
         _ => false,
     }
 }
@@ -1472,7 +1483,7 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::InstallPrompt;
+    use crate::proto::{InstallPrompt, PhoneBrokenReason};
     use crate::ui::key_to_input;
 
     fn ctrl(c: char) -> KeyEvent {
@@ -1610,12 +1621,24 @@ mod tests {
                 pending_delete: None,
             },
             // 手机通知：`entry: None` 下按键表随 `PhoneState` 变化（能不能
-            // 按也决定写不写，见 `idle_help` 里那条总纲），四种状态都要列到，
-            // 不然某一种状态自己漏写汉字键名这条守卫看不见。
+            // 按也决定写不写，见 `idle_help` 里那条总纲），四种状态、三种
+            // `Broken` 原因都要列到，不然某一种状态自己漏写汉字键名这条
+            // 守卫看不见。
             phone_status(PhoneState::Off),
             phone_status(PhoneState::WaitingForPairing),
             phone_status(PhoneState::Paired),
-            phone_status(PhoneState::Broken("x".into())),
+            phone_status(PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "x".into(),
+            }),
+            phone_status(PhoneState::Broken {
+                reason: PhoneBrokenReason::BotBlocked,
+                message: "x".into(),
+            }),
+            phone_status(PhoneState::Broken {
+                reason: PhoneBrokenReason::Unreachable,
+                message: "x".into(),
+            }),
             View::Phone {
                 status: phone_status_of(PhoneState::Off),
                 entry: Some(PhoneEntry {
@@ -1770,25 +1793,55 @@ mod tests {
     /// `phone_key_has_effect` 是 `idle_help`（写不写这个键）和
     /// `ui/phone.rs::handle_status`（按下去有没有效果）唯一共用的判断——
     /// 这条测试穷举所有 (状态, 键) 组合，钉死这份真值表本身。
+    ///
+    /// **`Broken` 的三种原因不是同一档**——这是 dct-phone-channel Task 4
+    /// fix round 1 Critical 2 的直接教训：`BadToken`/`Unreachable` 时磁盘
+    /// 上没有一份确认有效的令牌（`apply_phone_set_token` 验证失败不落盘），
+    /// `r`/`x` 在这两种原因下必须是空操作；只有 `BotBlocked`（令牌本身
+    /// 没坏，只是这个 bot 被拉黑了）才跟 `WaitingForPairing`/`Paired` 一样
+    /// 允许 `r`/`x`，也正因为令牌没坏，`Enter` 在这一档反过来不必要。
     #[test]
     fn phone_key_has_effect_matches_the_documented_truth_table() {
         let off = PhoneState::Off;
         let waiting = PhoneState::WaitingForPairing;
         let paired = PhoneState::Paired;
-        let broken = PhoneState::Broken("x".into());
+        let bad_token = PhoneState::Broken {
+            reason: PhoneBrokenReason::BadToken,
+            message: "x".into(),
+        };
+        let unreachable = PhoneState::Broken {
+            reason: PhoneBrokenReason::Unreachable,
+            message: "x".into(),
+        };
+        let blocked = PhoneState::Broken {
+            reason: PhoneBrokenReason::BotBlocked,
+            message: "x".into(),
+        };
 
-        // Enter：只在 Off/Broken 下有效
+        // Enter：没有确认有效的令牌时才有效——Off、BadToken、Unreachable。
         assert!(phone_key_has_effect(&off, KeyCode::Enter));
-        assert!(phone_key_has_effect(&broken, KeyCode::Enter));
+        assert!(phone_key_has_effect(&bad_token, KeyCode::Enter));
+        assert!(phone_key_has_effect(&unreachable, KeyCode::Enter));
         assert!(!phone_key_has_effect(&waiting, KeyCode::Enter));
         assert!(!phone_key_has_effect(&paired, KeyCode::Enter));
+        assert!(!phone_key_has_effect(&blocked, KeyCode::Enter));
 
-        // r/x：只在非 Off 下有效
+        // r/x：只在存在一份确认有效的令牌时才有效——WaitingForPairing、
+        // Paired、BotBlocked；Off、BadToken、Unreachable 时磁盘上没有
+        // 令牌，这两个键必须是空操作。
         for code in [KeyCode::Char('r'), KeyCode::Char('x')] {
-            assert!(!phone_key_has_effect(&off, code));
-            assert!(phone_key_has_effect(&waiting, code));
-            assert!(phone_key_has_effect(&paired, code));
-            assert!(phone_key_has_effect(&broken, code));
+            assert!(!phone_key_has_effect(&off, code), "{code:?} on Off");
+            assert!(phone_key_has_effect(&waiting, code), "{code:?} on Waiting");
+            assert!(phone_key_has_effect(&paired, code), "{code:?} on Paired");
+            assert!(phone_key_has_effect(&blocked, code), "{code:?} on Blocked");
+            assert!(
+                !phone_key_has_effect(&bad_token, code),
+                "{code:?} on BadToken 必须是空操作——没有令牌可以重新配对"
+            );
+            assert!(
+                !phone_key_has_effect(&unreachable, code),
+                "{code:?} on Unreachable 必须是空操作——没有令牌可以重新配对"
+            );
         }
 
         // 别的键在任何状态下都没有效果
@@ -1838,14 +1891,31 @@ mod tests {
         assert!(has_key(PhoneState::WaitingForPairing, "r"), "该写 r");
         assert!(has_key(PhoneState::WaitingForPairing, "x"), "该写 x");
 
+        // BadToken/Unreachable：没有确认有效的令牌，Enter 该写、r/x 不该。
+        for reason in [PhoneBrokenReason::BadToken, PhoneBrokenReason::Unreachable] {
+            let st = PhoneState::Broken {
+                reason,
+                message: "x".into(),
+            };
+            assert!(has_key(st.clone(), "Enter"), "{reason:?} 下 Enter 该写出来");
+            assert!(
+                !has_key(st.clone(), "r"),
+                "{reason:?} 下没有令牌，r 不该写出来"
+            );
+            assert!(!has_key(st, "x"), "{reason:?} 下没有令牌，x 不该写出来");
+        }
+
+        // BotBlocked：令牌没坏，r/x 该写、Enter 不必要。
+        let blocked = PhoneState::Broken {
+            reason: PhoneBrokenReason::BotBlocked,
+            message: "x".into(),
+        };
         assert!(
-            has_key(PhoneState::Broken("x".into()), "Enter"),
-            "Broken 下 Enter 该写出来"
+            !has_key(blocked.clone(), "Enter"),
+            "BotBlocked 下令牌没坏，Enter 不必要"
         );
-        assert!(
-            has_key(PhoneState::Broken("x".into()), "r"),
-            "Broken 下 r 该写出来"
-        );
+        assert!(has_key(blocked.clone(), "r"), "BotBlocked 下 r 该写出来");
+        assert!(has_key(blocked, "x"), "BotBlocked 下 x 该写出来");
 
         assert!(
             !has_key(PhoneState::Paired, "Enter"),

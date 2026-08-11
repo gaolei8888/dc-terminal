@@ -11,10 +11,10 @@ use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
-    ErrorCode, InstallPrompt, PhoneState, PhoneStatus, ProfileEntry, Request, Response,
-    SecretPrompt,
+    ErrorCode, InstallPrompt, PhoneBrokenReason, PhoneState, PhoneStatus, ProfileEntry, Request,
+    Response, SecretPrompt,
 };
-use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
+use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_BOT_KEY, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
 
@@ -53,12 +53,16 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
 
-    // 手机通知这一页存在的全部理由是这一份状态——**不落盘**，只有令牌本身
-    // 落盘（跟别的密钥同一个文件）。有没有存过令牌决定开机时是 Off 还是
-    // WaitingForPairing；bot 名字这时候还不知道，`spawn_phone_startup_refresh`
-    // 会在后台把它补上，不占用监听端口打开之前的时间。
+    // 手机通知这一页存在的全部理由是这一份状态——**不落盘**，落盘的只有
+    // 令牌本身和 bot 名字（跟别的密钥同一个文件，见 `PHONE_TOKEN_KEY`/
+    // `PHONE_BOT_KEY`）。有没有存过令牌决定开机时是 `Off` 还是
+    // `WaitingForPairing`；bot 名字直接从磁盘读，**不打网络**——早先这里
+    // 起过一个后台线程去 `getMe` 现查 bot 名字，被 dct-phone-channel
+    // Task 4 fix round 1 的 Critical 3 判定为一次没人要求、没有测试、还
+    // 会把预置了令牌的集成测试拖去打真实网络的多余动作，删掉了。
+    // `apply_phone_set_token` 验证通过的那一刻就把 bot 名字跟着令牌一起
+    // 存下来，开机直接读就是最新答案。
     let phone = Arc::new(Mutex::new(initial_phone_status(&secrets)));
-    spawn_phone_startup_refresh(&phone, &secrets);
 
     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
@@ -89,68 +93,43 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
 }
 
 /// 手机通知刚启动时的状态：有没有存过令牌决定 `Off` 还是
-/// `WaitingForPairing`。bot 名字这时候还不知道——现查要打网络，不能拖慢
-/// 监听端口打开的时间，交给 `spawn_phone_startup_refresh` 在后台补。
+/// `WaitingForPairing`，bot 名字直接从磁盘读（`apply_phone_set_token`
+/// 验证通过的那一刻已经把它跟令牌一起存下来了）。**不打网络**——见本文件
+/// `run_with_manager` 里那段注释，起一个后台线程去 `getMe` 现查 bot 名字
+/// 是这里删掉的一版旧设计，被判定为没人要求、没有测试、还会把预置了
+/// 令牌的集成测试拖去打真实网络。
 fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
-    let has_token = recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some();
+    let sec = recover(secrets.lock());
+    let has_token = sec.get(PHONE_TOKEN_KEY).is_some();
     PhoneStatus {
         state: if has_token {
             PhoneState::WaitingForPairing
         } else {
             PhoneState::Off
         },
-        bot: None,
+        bot: sec.get(PHONE_BOT_KEY).map(str::to_string),
         owner: None,
     }
-}
-
-/// 开机时如果已经存过令牌，起一个后台线程把 bot 名字补上（顺便验一遍这份
-/// 令牌是不是还能用）。放在后台是为了不让一次网络请求拖慢守护进程接受
-/// 连接的时间——同 `install_llm_backend` 不这么做的理由正相反：那边选择
-/// 同步跑是因为「装没装后端」这件事**必须**在第一条连接进来之前就有答案
-/// （出错解释的可用性是会话创建路径要读的状态）；手机通知不是，界面本来
-/// 就要靠轮询 `Request::PhoneStatus` 才能看到配对进展，晚几秒钟补上 bot
-/// 名字不会造成任何错误的界面反馈，只是「等配对」那句话短暂地说不出
-/// bot 是谁。
-fn spawn_phone_startup_refresh(phone: &Arc<Mutex<PhoneStatus>>, secrets: &Arc<Mutex<SecretStore>>) {
-    let token = recover(secrets.lock())
-        .get(PHONE_TOKEN_KEY)
-        .map(str::to_string);
-    let Some(token) = token else {
-        return;
-    };
-    let phone = phone.clone();
-    let secrets = secrets.clone();
-    std::thread::spawn(move || {
-        // 这次刷新不挂在任何一次 `Request` 上，没有人告诉我们此刻界面是
-        // 什么语言——按项目默认语言中文兜底，跟 `proto.rs` 顶上 `SecretPrompt`
-        // 那条约定里记的话一致（「daemon 端已经知道用户语言（目前只有
-        // Lang::Zh）」）。用户真的看到这句话，通常是因为存了很久没用过的
-        // 令牌在这次重启时才发现已经失效——那本来就是个冷门路径。
-        let (state, bot) = phone_verify_token(&token, crate::i18n::Lang::Zh, &|t| {
-            Telegram::new(t).get_me()
-        });
-        let mut ph = recover(phone.lock());
-        // 这段网络往返的时间里令牌可能已经被用户显式关掉了（`PhoneDisable`）
-        // ——这时候这次迟到的刷新结果不该覆盖回去，那会让一个刚被用户关掉
-        // 的功能又显示成「等待配对」，界面上凭空多出一件用户没做过的事。
-        if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
-            *ph = PhoneStatus {
-                state,
-                bot,
-                owner: ph.owner.clone(),
-            };
-        }
-    });
 }
 
 /// 令牌验证的结果该记成什么 `PhoneState` + bot 名。纯判定逻辑，传输层由
 /// 调用方注入（同 `verify.rs::verify_with` 的路子）——测试才能覆盖
 /// 「令牌好使」「令牌失效」「连不上」三种结果，不用真打 Telegram 的网络。
 ///
-/// **`Broken` 分支绝不能把 `token` 拼进返回的字符串**：这是
+/// **`Broken` 的 `message` 字段绝不能把 `token` 拼进去**：这是
 /// `PhoneState::Broken` 唯一的安全承诺，`phone_broken_text_never_contains_the_token`
-/// 这条测试钉着它。
+/// 这条测试钉着它。`reason` 字段是三种真实成因的判定，直接决定
+/// `ui/phone.rs::next_step` 该给哪一句话——这是 dct-phone-channel Task 4
+/// fix round 1 的根因修复：以前 `Broken` 只有一句写死的字符串，`BadToken`
+/// 和 `Unreachable`（后来发现的 Important 1）、`Blocked`（Critical 2 指向
+/// 的那句「own message and own next step」）说的是同一句话，用户没法照着
+/// 做对的事。
+///
+/// `ChannelError::Blocked`（403）这个分支**今天没有任何调用点会真的走到**
+/// ——`getMe` 没有 chat 上下文，Telegram 不会拿它回 403，这个原因只会在
+/// Task 5 的 Bridge 往一个已配对的 chat 发消息时出现。留着是因为
+/// `ChannelError` 是穷尽 match 的一部分，而且 `PhoneState`/`i18n::msg`
+/// 已经把这条路准备好了，Task 5 不用再改一次协议形状。
 fn phone_verify_token(
     token: &str,
     lang: crate::i18n::Lang,
@@ -159,11 +138,24 @@ fn phone_verify_token(
     match get_me(token) {
         Ok(bot) => (PhoneState::WaitingForPairing, Some(bot)),
         Err(ChannelError::BadToken) => (
-            PhoneState::Broken(crate::i18n::msg::phone_token_invalid(lang)),
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: crate::i18n::msg::phone_token_invalid(lang),
+            },
+            None,
+        ),
+        Err(ChannelError::Blocked) => (
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BotBlocked,
+                message: crate::i18n::msg::phone_blocked(lang),
+            },
             None,
         ),
         Err(ChannelError::Unreachable) | Err(ChannelError::Malformed) => (
-            PhoneState::Broken(crate::i18n::msg::phone_unreachable(lang)),
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::Unreachable,
+                message: crate::i18n::msg::phone_unreachable(lang),
+            },
             None,
         ),
     }
@@ -185,13 +177,27 @@ fn apply_phone_set_token(
     let (state, bot) = phone_verify_token(token, lang, get_me);
     // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌本身不
     // 好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉——界面上
-    // `Enter` 键只在 `Off`/`Broken` 两种状态下才会被提供，也就是说走到
-    // 这条分支时磁盘上原本要么没有令牌、要么已经是坏的，这里不存在
-    // 「一个还能用的令牌被覆盖」的风险。
-    let save_result = if matches!(state, PhoneState::Broken(_)) {
+    // `Enter` 键只在没有一份「确认有效」的令牌时才会被提供（见
+    // `PhoneState::has_confirmed_token`），也就是说走到这条分支时磁盘上
+    // 原本要么没有令牌、要么已经是坏的，这里不存在「一个还能用的令牌被
+    // 覆盖」的风险。
+    let save_result = if matches!(state, PhoneState::Broken { .. }) {
         Ok(())
     } else {
-        recover(secrets.lock()).set(PHONE_TOKEN_KEY, token)
+        // 令牌和 bot 名字一起落盘：`initial_phone_status` 开机时直接读
+        // 这两个键，不再打网络去现查 bot 名字（见 `run_with_manager` 头上
+        // 那段注释）——两个写操作里如果只有第一个成功，重启后会读到一个
+        // 有令牌没 bot 名字的状态，「等你在 Telegram 里给 @? 发条消息」
+        // 的老问题会从另一个角度冒出来，所以两次 `set` 的结果都要检查。
+        //
+        // **两次 `secrets.lock()` 必须是两条分开的语句**——`Mutex` 不可
+        // 重入，第一次 `recover(secrets.lock())` 产生的 `MutexGuard` 是这
+        // 条语句里的一个临时值，Rust 的临时值销毁规则是"整条语句结束时才
+        // 释放"，如果写成一条链式表达式（`.and_then` 闭包里再 `lock()`
+        // 同一把锁），第一把锁在闭包执行时还没释放，第二次 `lock()` 会
+        // 自己把自己锁死——这曾经是本函数一个真实的自死锁 bug。
+        let first = recover(secrets.lock()).set(PHONE_TOKEN_KEY, token);
+        first.and_then(|_| recover(secrets.lock()).set(PHONE_BOT_KEY, bot.as_deref().unwrap_or("")))
     };
     save_result.map(|_| {
         let mut ph = recover(phone.lock());
@@ -448,37 +454,55 @@ fn handle(
             }
         }
         // 纯读，不碰任何状态、不打网络——手机通知页每一轮轮询都要问它，
-        // 必须快。真正的网络往返只发生在 `PhoneSetToken` 和开机那次后台
-        // 刷新（`spawn_phone_startup_refresh`）里。
+        // 必须快。真正的网络往返只发生在 `PhoneSetToken` 里。
         Request::PhoneStatus => Ok(Response::Phone(recover(phone.lock()).clone())),
         Request::PhoneSetToken { token, lang } => {
             apply_phone_set_token(&token, lang, secrets, phone, &|t| Telegram::new(t).get_me())
         }
         Request::PhoneUnpair => {
             let mut ph = recover(phone.lock());
-            // `Off` 时按 r 没有意义可言——没有令牌就没有「重新配对」这回事，
-            // 留在原地，不伪造出一个 WaitingForPairing。
+            // **只有 `has_confirmed_token()` 为真才真的推进状态**——这条
+            // 守卫必须跟 `view::phone_key_has_effect` 给出同一个答案（两者
+            // 都读 `PhoneState::has_confirmed_token`，唯一共用的判断）。
             //
-            // `Broken` 也一并放行到 WaitingForPairing：`ChannelError::BadToken`
-            // 这一层没有保留「令牌本身失效」和「对方拉黑了这个 bot」的区分
-            // （见 telegram.rs 的 `error_from` 和它上面的注释），daemon 无法
-            // 单靠这个状态本身分辨究竟是哪一种——真正会验证令牌是不是仍然
-            // 有效的路径是 Task 5 的 Bridge 实际发消息/轮询时，不是这里。
-            if !matches!(ph.state, PhoneState::Off) {
+            // 这不是可选的加固：这里曾经不管这个条件，任何非 `Off` 状态
+            // 一律被推成 `WaitingForPairing`——包括 `Broken { BadToken }`/
+            // `Broken { Unreachable }`，而这两种情形下 `apply_phone_set_token`
+            // 验证失败根本没有落盘。后果是页面自称在等配对，等的却是一个
+            // 磁盘上不存在的令牌；界面上 `Enter` 又不再提供（同一份判断，
+            // 都读 `has_confirmed_token`），用户没有任何出路，只能靠猜
+            // `x`。这是 dct-phone-channel Task 4 fix round 1 的 Critical 2，
+            // `phone_unpair_on_a_bad_token_is_a_no_op` 钉着它。
+            if ph.state.has_confirmed_token() {
                 ph.state = PhoneState::WaitingForPairing;
                 ph.owner = None;
+                // bot **不清空**：这条分支只有在原状态已经带着一个「曾经
+                // 确认有效」的 bot 名字时才会走到（`Paired`、
+                // `WaitingForPairing`，或者 `Broken { BotBlocked }`——后者
+                // 的令牌本身没坏，bot 也还是原来那个），重新配对是「回到
+                // 等下一条消息」，不是「忘掉这个 bot」。
             }
             Ok(Response::Phone(ph.clone()))
         }
-        Request::PhoneDisable => recover(secrets.lock()).remove(PHONE_TOKEN_KEY).map(|_| {
-            let mut ph = recover(phone.lock());
-            *ph = PhoneStatus {
-                state: PhoneState::Off,
-                bot: None,
-                owner: None,
-            };
-            Response::Phone(ph.clone())
-        }),
+        Request::PhoneDisable => {
+            // 两条分开的语句，同一个理由见 `apply_phone_set_token` 里那条
+            // 长注释：`Mutex` 不可重入，写成一条链式表达式会让第一次
+            // `secrets.lock()` 的 `MutexGuard`（这条表达式里的临时值，
+            // 活到整条语句结束）在 `.and_then` 闭包再次 `lock()` 同一把锁
+            // 时还没释放，自己把自己锁死。
+            let first = recover(secrets.lock()).remove(PHONE_TOKEN_KEY);
+            first
+                .and_then(|_| recover(secrets.lock()).remove(PHONE_BOT_KEY))
+                .map(|_| {
+                    let mut ph = recover(phone.lock());
+                    *ph = PhoneStatus {
+                        state: PhoneState::Off,
+                        bot: None,
+                        owner: None,
+                    };
+                    Response::Phone(ph.clone())
+                })
+        }
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
 }
@@ -953,12 +977,18 @@ mod tests {
         let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Err(ChannelError::BadToken)
         });
-        assert!(matches!(state, PhoneState::Broken(_)));
+        assert!(matches!(
+            state,
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                ..
+            }
+        ));
         assert!(bot.is_none());
-        let PhoneState::Broken(msg) = state else {
+        let PhoneState::Broken { message, .. } = state else {
             unreachable!()
         };
-        assert!(!msg.is_empty(), "Broken 必须带一句人话，不能是空字符串");
+        assert!(!message.is_empty(), "Broken 必须带一句人话，不能是空字符串");
     }
 
     #[test]
@@ -966,10 +996,35 @@ mod tests {
         for e in [ChannelError::Unreachable, ChannelError::Malformed] {
             let (state, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &move |_| Err(e));
             assert!(
-                matches!(state, PhoneState::Broken(_)),
-                "{e:?} 也该是 Broken"
+                matches!(
+                    state,
+                    PhoneState::Broken {
+                        reason: PhoneBrokenReason::Unreachable,
+                        ..
+                    }
+                ),
+                "{e:?} 也该是 Broken{{Unreachable}}"
             );
         }
+    }
+
+    /// `ChannelError::Blocked`（403）今天没有任何调用点会真的产生——见
+    /// `phone_verify_token` 上那条注释——但既然 `PhoneState`/`i18n::msg`
+    /// 已经把这条路准备好了，这条测试确认它真的接对了，不是穷尽 match
+    /// 里一个凑数的 `todo!`。
+    #[test]
+    fn phone_verify_token_marks_blocked_with_its_own_reason() {
+        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+            Err(ChannelError::Blocked)
+        });
+        assert!(matches!(
+            state,
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BotBlocked,
+                ..
+            }
+        ));
+        assert!(bot.is_none());
     }
 
     /// **不是巧合，是两句不同的话。** `BadToken`（令牌本身不好使）和
@@ -986,10 +1041,17 @@ mod tests {
         let (unreachable, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Err(ChannelError::Unreachable)
         });
-        let PhoneState::Broken(bad_msg) = bad else {
+        let PhoneState::Broken {
+            message: bad_msg, ..
+        } = bad
+        else {
             unreachable!()
         };
-        let PhoneState::Broken(unreachable_msg) = unreachable else {
+        let PhoneState::Broken {
+            message: unreachable_msg,
+            ..
+        } = unreachable
+        else {
             unreachable!()
         };
         assert_ne!(
@@ -1018,6 +1080,7 @@ mod tests {
         let real_looking_token = "123456789:AAH-super-secret-telegram-token";
         for err in [
             ChannelError::BadToken,
+            ChannelError::Blocked,
             ChannelError::Unreachable,
             ChannelError::Malformed,
         ] {
@@ -1025,12 +1088,12 @@ mod tests {
                 phone_verify_token(real_looking_token, crate::i18n::Lang::Zh, &move |_| {
                     Err(err)
                 });
-            let PhoneState::Broken(msg) = state else {
+            let PhoneState::Broken { message, .. } = state else {
                 panic!("{err:?} 应该是 Broken")
             };
             assert!(
-                !msg.contains(real_looking_token),
-                "令牌漏进了 Broken 文案：{msg}"
+                !message.contains(real_looking_token),
+                "令牌漏进了 Broken 文案：{message}"
             );
         }
     }
@@ -1051,10 +1114,27 @@ mod tests {
         let secrets = Mutex::new(store);
         let status = initial_phone_status(&secrets);
         assert_eq!(status.state, PhoneState::WaitingForPairing);
-        assert!(
-            status.bot.is_none(),
-            "bot 名字要等后台刷新，开机这一刻还不知道"
-        );
+        // 没顺带存 bot 名字（这条测试只塞了令牌）时兜底成 None——这是一个
+        // 正常但不该常见的情形（`apply_phone_set_token` 成功时永远把两个
+        // 键一起存），不是需要打网络才能知道的「还不知道」。
+        assert!(status.bot.is_none());
+    }
+
+    /// **正常路径。** `apply_phone_set_token` 成功时把令牌和 bot 名字一起
+    /// 存下来，`initial_phone_status` 开机直接读，**不打网络**——这是
+    /// dct-phone-channel Task 4 fix round 1 删掉 `spawn_phone_startup_refresh`
+    /// 之后唯一的 bot 名字来源。少了这条覆盖，「重启后 bot 名字还在」这个
+    /// 事实全靠人读代码相信，测不出回归。
+    #[test]
+    fn initial_phone_status_reads_the_bot_name_from_disk_without_any_network_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SecretStore::load(&dir.path().join("secrets.toml"));
+        store.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        store.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
+        let secrets = Mutex::new(store);
+        let status = initial_phone_status(&secrets);
+        assert_eq!(status.state, PhoneState::WaitingForPairing);
+        assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
     }
 
     /// 令牌好使：落盘、内存状态推进到 `WaitingForPairing`、主人清空
@@ -1092,6 +1172,12 @@ mod tests {
             Some("good-token"),
             "验证通过的令牌必须落盘，不然重启就没了"
         );
+        assert_eq!(
+            recover(secrets.lock()).get(PHONE_BOT_KEY),
+            Some("my_dct_bot"),
+            "bot 名字也必须落盘——不存的话，重启后 initial_phone_status \
+             要么打一次网络去现查（Critical 3 的根因），要么永远显示 @?"
+        );
     }
 
     /// **关键行为，专门有一条测试盯着。** 令牌被拒时**不能**把它写进
@@ -1123,13 +1209,17 @@ mod tests {
         assert!(matches!(
             resp,
             Response::Phone(PhoneStatus {
-                state: PhoneState::Broken(_),
+                state: PhoneState::Broken { .. },
                 ..
             })
         ));
         assert!(
             recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
             "验证失败的令牌绝不能落盘"
+        );
+        assert!(
+            recover(secrets.lock()).get(PHONE_BOT_KEY).is_none(),
+            "验证失败也不该落一个 bot 名字下来"
         );
     }
 
@@ -1230,6 +1320,128 @@ mod tests {
         }
     }
 
+    /// **回归测试，dct-phone-channel Task 4 fix round 1 的 Critical 2。**
+    /// `r` 在 `Broken { BadToken }`（或 `Unreachable`）下必须是空操作——
+    /// `apply_phone_set_token` 验证失败根本没有落盘，这两种情形下磁盘上
+    /// 压根没有一份「确认有效」的令牌。旧代码不管这个条件，任何非 `Off`
+    /// 状态一律被推成 `WaitingForPairing`：页面自称在等配对，等的却是一个
+    /// 不存在的 bot（`bot: None`，状态行只能显示「@?」），而这句话正是
+    /// `PhoneNextStepBadToken`/`PhoneNextStepUnreachable` 告诉用户去按的
+    /// 那个键——一个跟着提示走却把自己带进死胡同的陷阱。
+    #[test]
+    fn phone_unpair_on_a_bad_token_is_a_no_op() {
+        for reason in [PhoneBrokenReason::BadToken, PhoneBrokenReason::Unreachable] {
+            let mgr = Arc::new(SessionManager::new());
+            let secrets = Arc::new(Mutex::new(SecretStore::load(
+                &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+            )));
+            let store = Arc::new(Mutex::new(Store::load(
+                &tempfile::tempdir().unwrap().path().join("projects.json"),
+            )));
+            let profiles_dir = tempfile::tempdir().unwrap();
+            let phone = Arc::new(Mutex::new(PhoneStatus {
+                state: PhoneState::Broken {
+                    reason,
+                    message: "x".into(),
+                },
+                bot: None,
+                owner: None,
+            }));
+
+            let resp = handle(
+                Request::PhoneUnpair,
+                &mgr,
+                &store,
+                &secrets,
+                profiles_dir.path(),
+                &phone,
+            );
+            match resp {
+                Response::Phone(status) => assert!(
+                    matches!(status.state, PhoneState::Broken { reason: r, .. } if r == reason),
+                    "{reason:?}：r 必须原地不动，不能伪造出 WaitingForPairing"
+                ),
+                other => panic!("期待 Response::Phone，得到 {other:?}"),
+            }
+        }
+    }
+
+    /// `r` 在 `Broken { BotBlocked }` 下**要**推进——令牌本身没坏，只是这个
+    /// bot 被拉黑了，重新配对是有意义的动作，而且要留着原来那个 bot 名字
+    /// （不是伪造一个新的、也不是清空）。
+    #[test]
+    fn phone_unpair_on_a_blocked_bot_repairs_and_keeps_the_bot_name() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::Broken {
+                reason: PhoneBrokenReason::BotBlocked,
+                message: "x".into(),
+            },
+            bot: Some("my_dct_bot".into()),
+            owner: None,
+        }));
+
+        let resp = handle(
+            Request::PhoneUnpair,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &phone,
+        );
+        match resp {
+            Response::Phone(status) => {
+                assert_eq!(status.state, PhoneState::WaitingForPairing);
+                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"), "bot 不该被忘掉");
+            }
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+    }
+
+    /// `phone_unpair_forgets_the_owner_but_keeps_the_token_alive`（上面那条）
+    /// 只测了 `Paired` 起点——协议里合法，但这个分支上没有任何代码构造
+    /// `Paired`（配对要真收到一条消息，那是 Task 5）。`WaitingForPairing`
+    /// 才是这条分支上唯一真会被 `r` 作用到的起点，补上。
+    #[test]
+    fn phone_unpair_from_waiting_for_pairing_stays_waiting_and_keeps_the_bot() {
+        let mgr = Arc::new(SessionManager::new());
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(
+            &tempfile::tempdir().unwrap().path().join("projects.json"),
+        )));
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let phone = Arc::new(Mutex::new(PhoneStatus {
+            state: PhoneState::WaitingForPairing,
+            bot: Some("my_dct_bot".into()),
+            owner: None,
+        }));
+
+        let resp = handle(
+            Request::PhoneUnpair,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &phone,
+        );
+        match resp {
+            Response::Phone(status) => {
+                assert_eq!(status.state, PhoneState::WaitingForPairing);
+                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+            }
+            other => panic!("期待 Response::Phone，得到 {other:?}"),
+        }
+    }
+
     /// `x`（整个关掉）要把令牌从磁盘上删掉，不只是内存里的状态复位——
     /// 不删的话，下次守护进程重启，`initial_phone_status` 又会看见这份
     /// 令牌，把一个用户已经明确关掉的功能悄悄打开。
@@ -1239,6 +1451,7 @@ mod tests {
         let secrets_path = tempfile::tempdir().unwrap().path().join("secrets.toml");
         let mut disk = SecretStore::load(&secrets_path);
         disk.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        disk.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
         let secrets = Arc::new(Mutex::new(disk));
         let store = Arc::new(Mutex::new(Store::load(
             &tempfile::tempdir().unwrap().path().join("projects.json"),
@@ -1269,6 +1482,10 @@ mod tests {
         assert!(
             recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
             "令牌必须真的从磁盘上删掉，不能只改内存状态"
+        );
+        assert!(
+            recover(secrets.lock()).get(PHONE_BOT_KEY).is_none(),
+            "bot 名字也要一起删掉，不然重新填令牌之前它还留在磁盘上"
         );
     }
 }

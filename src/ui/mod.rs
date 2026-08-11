@@ -729,24 +729,10 @@ pub fn run(
                         );
                     }
                 }
-                // 手输路径态：粘贴直接进输入框。从别处拷一条路径粘进来一步到位，
-                // 这是不做目录浏览器的底气。trim 掉换行——从终端或文件管理器
-                // 拷路径经常带一个尾随换行，不去掉会拼出一个不存在的目录。
-                View::PickProject(p) if p.typing_path.is_some() => {
-                    if let Some(buf) = p.typing_path.as_mut() {
-                        buf.push_str(text.trim());
-                    }
-                }
-                // 密钥十有八九是粘进来的，不是敲的——用户拿到手的字符串通常带
-                // 引号、Bearer 前缀、尾随换行，clean_secret 统一洗一遍。
-                // Verifying 期间不接：那次验证已经把当时的 buf 发出去了，
-                // 这时候再改只会让用户误以为下一次回车用的是新值。
-                View::EnterSecret { buf, phase, .. }
-                    if !matches!(phase, SecretPhase::Verifying) =>
-                {
-                    buf.push_str(&clean_secret(&text));
-                }
-                _ => {}
+                // 其余视图都是纯本地缓冲区的编辑，不碰网络——见
+                // `paste_into_view`，抽成纯函数专门是为了能在不起真实终端
+                // 的前提下测「粘贴到某个视图有没有接上」这件事本身。
+                _ => paste_into_view(&mut app.view, &text),
             }
             continue;
         }
@@ -1513,6 +1499,51 @@ pub(crate) fn open_settings(app: &mut App) {
     app.view = View::Settings { state, lang: None };
 }
 
+/// 一次粘贴该落进哪个视图的哪个缓冲区。**`View::Attached` 不在这里**——
+/// 那条路要把文本真的发给 agent，需要 `app.client()`（网络），留在
+/// `run()` 的按键循环里；这里管的是纯本地的文本框编辑，不碰任何 I/O，
+/// 所以能抽成一个可以直接单测的纯函数。
+///
+/// 抽出来是 dct-phone-channel Task 4 fix round 1 的 Critical 1 教训：手机
+/// 通知的令牌输入框最早漏接了这个分支——开括号粘贴开着（`EnableBracketedPaste`），
+/// Cmd+V 只产生 `Event::Paste`、不产生 `Char` 事件，漏了对应分支就是
+/// Cmd+V 在那一屏上悄无声息地什么都不做，不报错也不提示，而一个 46 字符
+/// 的 Telegram bot 令牌没有人会去敲。这类漏接过去只能靠通读 `run()` 里
+/// 这一大段 `match` 发现；抽成纯函数之后，`paste_into_the_phone_token_box`
+/// 这条测试能在不起真实终端的前提下把它钉死。
+fn paste_into_view(view: &mut View, text: &str) {
+    match view {
+        // 手输路径态：粘贴直接进输入框。从别处拷一条路径粘进来一步到位，
+        // 这是不做目录浏览器的底气。trim 掉换行——从终端或文件管理器
+        // 拷路径经常带一个尾随换行，不去掉会拼出一个不存在的目录。
+        View::PickProject(p) if p.typing_path.is_some() => {
+            if let Some(buf) = p.typing_path.as_mut() {
+                buf.push_str(text.trim());
+            }
+        }
+        // 密钥十有八九是粘进来的，不是敲的——用户拿到手的字符串通常带
+        // 引号、Bearer 前缀、尾随换行，clean_secret 统一洗一遍。
+        // Verifying 期间不接：那次验证已经把当时的 buf 发出去了，
+        // 这时候再改只会让用户误以为下一次回车用的是新值。
+        View::EnterSecret { buf, phase, .. } if !matches!(phase, SecretPhase::Verifying) => {
+            buf.push_str(&clean_secret(text));
+        }
+        // 手机通知的令牌同样十有八九是粘进来的，同一份 `clean_secret` 洗
+        // 一遍——见本函数文档注释。
+        View::Phone {
+            entry:
+                Some(view::PhoneEntry {
+                    buf,
+                    phase: SecretPhase::Typing | SecretPhase::Failed(_),
+                }),
+            ..
+        } => {
+            buf.push_str(&clean_secret(text));
+        }
+        _ => {}
+    }
+}
+
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
 /// 项目选择器和会话看板共用它。
 fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
@@ -2239,6 +2270,42 @@ enum BarContent {
     Text(String),
 }
 
+/// 起一个真守护进程，socket 和它的 `~/.dct` 替身都落在临时目录里
+/// （`projects.json` 跟着 socket 走，见 `projects::store_path_for_socket`），
+/// 绝不会碰用户真实的那份。返回的 `TempDir` 要接住：它一被丢弃，
+/// socket 就跟着没了。
+///
+/// **在 `mod tests` 外面、`pub(crate)`**：`ui::settings_view` 的测试也要用
+/// 它（那边曾经内联抄了一份一模一样的实现——dct-phone-channel Task 4
+/// fix round 1 的 Minor 指出这份重复，C3 的修复要改两处而不是一处正是
+/// 这份重复的直接代价）。
+#[cfg(test)]
+pub(crate) fn start_daemon_for_test() -> (PathBuf, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let sock = home.path().join("daemon.sock");
+    start_daemon_at(&sock);
+    (sock, home)
+}
+
+/// 同上，但 socket 路径由调用方给——需要在起daemon**之前**往它的
+/// `secrets.toml`（`secrets_path_for_socket(&sock)`）里预先写点什么的
+/// 测试要用这个：`start_daemon_for_test()` 自己决定 socket 路径，调用方
+/// 拿到路径的时候 daemon 往往已经起来了，预置令牌会跟 `initial_phone_status`
+/// 读取的那一刻赛跑（dct-phone-channel Task 4 fix round 1 的 Critical 3）。
+#[cfg(test)]
+pub(crate) fn start_daemon_at(sock: &Path) {
+    use std::time::{Duration, Instant};
+    let s = sock.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = crate::daemon::run(&s);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "daemon 没起来");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2253,24 +2320,105 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// 起一个真守护进程，socket 和它的 `~/.dct` 替身都落在临时目录里
-    /// （`projects.json` 跟着 socket 走，见 `projects::store_path_for_socket`），
-    /// 绝不会碰用户真实的那份。返回的 `TempDir` 要接住：它一被丢弃，
-    /// socket 就跟着没了。
-    fn start_daemon_for_test() -> (PathBuf, tempfile::TempDir) {
-        use std::time::{Duration, Instant};
-        let home = tempfile::tempdir().unwrap();
-        let sock = home.path().join("daemon.sock");
-        let s = sock.clone();
-        std::thread::spawn(move || {
-            let _ = crate::daemon::run(&s);
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !sock.exists() {
-            assert!(Instant::now() < deadline, "daemon 没起来");
-            std::thread::sleep(Duration::from_millis(20));
+    // ———— dct-phone-channel Task 4 fix round 1, Critical 1 ————
+    //
+    // 手机通知的令牌输入框最早漏接了粘贴分支：`Event::Paste` 到了
+    // `run()` 的按键循环，`match &mut app.view` 里没有 `View::Phone` 这一
+    // 支，落进 `_ => {}`，Cmd+V 悄无声息地什么都不做。一个 46 字符的
+    // Telegram bot 令牌没有人会去敲——这是用户在这一页真正会做的第一件
+    // 事，必须有测试盯着，不能只靠读代码相信它接上了。
+
+    /// 正在打字（`Typing`）时粘贴要追加到 `buf` 上，用 `clean_secret` 洗过
+    /// （去引号、去 Bearer 前缀、去尾随空白），跟 `EnterSecret` 那条路完全
+    /// 同一份处理。
+    #[test]
+    fn paste_into_the_phone_token_box_while_typing() {
+        let mut view = View::Phone {
+            status: crate::proto::PhoneStatus {
+                state: crate::proto::PhoneState::Off,
+                bot: None,
+                owner: None,
+            },
+            entry: Some(view::PhoneEntry {
+                buf: String::new(),
+                phase: SecretPhase::Typing,
+            }),
+        };
+        paste_into_view(&mut view, "\"123456:AAH-fake-telegram-token\"\n");
+        match &view {
+            View::Phone {
+                entry: Some(view::PhoneEntry { buf, .. }),
+                ..
+            } => assert_eq!(buf, "123456:AAH-fake-telegram-token"),
+            _ => panic!("粘贴应该落进令牌输入框"),
         }
-        (sock, home)
+    }
+
+    /// 上一次验证失败（`Failed`）之后，输入框还在，粘贴一份新的也要接住
+    /// ——这是重新填一遍的正常路径，跟 `Typing` 是同一档。
+    #[test]
+    fn paste_into_the_phone_token_box_after_a_failed_attempt() {
+        let mut view = View::Phone {
+            status: crate::proto::PhoneStatus {
+                state: crate::proto::PhoneState::Off,
+                bot: None,
+                owner: None,
+            },
+            entry: Some(view::PhoneEntry {
+                buf: String::new(),
+                phase: SecretPhase::Failed("这个令牌用不了，重新输入一遍".into()),
+            }),
+        };
+        paste_into_view(&mut view, "a-new-token");
+        match &view {
+            View::Phone {
+                entry: Some(view::PhoneEntry { buf, .. }),
+                ..
+            } => assert_eq!(buf, "a-new-token"),
+            _ => panic!("失败之后重新粘贴也该接住"),
+        }
+    }
+
+    /// `Verifying` 期间冻结——那次验证已经把当时的 buf 发出去了，这时候
+    /// 粘贴改了 buf 只会让用户误以为下一次回车用的是新值，跟
+    /// `EnterSecret` 的 `Verifying` 冻结是同一条规则。
+    #[test]
+    fn paste_into_the_phone_token_box_is_frozen_while_verifying() {
+        let mut view = View::Phone {
+            status: crate::proto::PhoneStatus {
+                state: crate::proto::PhoneState::Off,
+                bot: None,
+                owner: None,
+            },
+            entry: Some(view::PhoneEntry {
+                buf: "already-sent".into(),
+                phase: SecretPhase::Verifying,
+            }),
+        };
+        paste_into_view(&mut view, "should-not-land");
+        match &view {
+            View::Phone {
+                entry: Some(view::PhoneEntry { buf, .. }),
+                ..
+            } => assert_eq!(buf, "already-sent", "Verifying 期间粘贴不该改动 buf"),
+            _ => panic!(),
+        }
+    }
+
+    /// 只是在看状态（没有输入框）时粘贴没有地方可落，必须是空操作、
+    /// 不能 panic。
+    #[test]
+    fn paste_while_just_looking_at_phone_status_is_a_no_op() {
+        let mut view = View::Phone {
+            status: crate::proto::PhoneStatus {
+                state: crate::proto::PhoneState::Off,
+                bot: None,
+                owner: None,
+            },
+            entry: None,
+        };
+        paste_into_view(&mut view, "stray paste");
+        assert!(matches!(view, View::Phone { entry: None, .. }));
     }
 
     fn sess_at(id: u32, dir: &str) -> SessionInfo {
@@ -2602,21 +2750,14 @@ mod tests {
         let sock = home.path().join("daemon.sock");
         // 必须在起 daemon 之前把令牌写好：daemon 启动时会读一次
         // secrets.toml 去算 `initial_phone_status`（见 daemon.rs::run_with_manager）。
+        // **不打网络**——`initial_phone_status` 只读磁盘，删掉
+        // `spawn_phone_startup_refresh` 之后这条测试不再跟一次真实的
+        // `getMe` 请求赛跑（dct-phone-channel Task 4 fix round 1 的
+        // Critical 3）。
         let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
         disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
 
-        let s = sock.clone();
-        std::thread::spawn(move || {
-            let _ = crate::daemon::run(&s);
-        });
-        {
-            use std::time::{Duration, Instant};
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !sock.exists() {
-                assert!(Instant::now() < deadline, "daemon 没起来");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
+        start_daemon_at(&sock);
 
         let work = tempfile::tempdir().unwrap();
         let mut app = App::new(

@@ -373,22 +373,15 @@ mod tests {
     fn entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default() {
         use crate::client::Client;
         use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
-        use std::time::{Duration, Instant};
 
         let home = tempfile::tempdir().unwrap();
         let sock = home.path().join("daemon.sock");
+        // 必须在起 daemon 之前把令牌写好，理由同 `ui::mod::tests::
+        // fetch_phone_status_reaches_the_real_daemon_when_connected`。
         let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
         disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
 
-        let s = sock.clone();
-        std::thread::spawn(move || {
-            let _ = crate::daemon::run(&s);
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !sock.exists() {
-            assert!(Instant::now() < deadline, "daemon 没起来");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        super::super::start_daemon_at(&sock);
 
         let work = tempfile::tempdir().unwrap();
         let mut app = App::new(

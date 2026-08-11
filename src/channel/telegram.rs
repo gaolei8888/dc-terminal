@@ -52,10 +52,18 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// 网络抖一下就会被误判成 `Unreachable`，进而触发不必要的退避重试。
 const POLL_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
-/// 从 `ok:false` 的回包里判错误类型。401/403 是令牌的问题，其余当网络问题。
+/// 从 `ok:false` 的回包里判错误类型。**401 和 403 分开判**：两个都是「重试
+/// 没意义」，但人话不一样——401 是令牌本身坏了（重新填一遍），403
+/// `Forbidden: bot was blocked by the user` 是令牌完全没问题、对方把这个
+/// bot 拉黑了（重新输入令牌治不好这个问题，去 Telegram 里解除拉黑才行）。
+/// 这个区分曾经被合并掉过（dct-phone-channel Task 4 fix round 1）：手机
+/// 通知那一页把两种原因写成同一句「令牌用不了，重新输入」，用户拉黑了
+/// bot 之后照着这句话重填一遍完全无效——`ChannelError` 是唯一还留着
+/// 401/403 这两个数字的地方，往上传的路径上不能再弄丢它。
 fn error_from(v: &serde_json::Value) -> ChannelError {
     match v.get("error_code").and_then(|c| c.as_i64()) {
-        Some(401) | Some(403) => ChannelError::BadToken,
+        Some(401) => ChannelError::BadToken,
+        Some(403) => ChannelError::Blocked,
         _ => ChannelError::Unreachable,
     }
 }
@@ -372,14 +380,30 @@ mod tests {
         assert_eq!(parse_get_me(body), Err(ChannelError::BadToken));
     }
 
-    /// Step 6 的变异测试要求：把 `error_from` 里的 `Some(401) | Some(403)`
-    /// 砍成只剩 `Some(401)`，`get_me_with_a_bad_token_says_bad_token` 照样过
-    /// （它用的是 401）——403 那半句判断根本没被任何测试盯着。这一条补上。
+    /// **403 是 `Blocked`，不是 `BadToken`。** 这两个曾经被合并成同一个
+    /// 结果（Step 6 原来的变异测试要求就是照着那份合并写的），后果是
+    /// dct-phone-channel Task 4 fix round 1 发现的一个真实 Critical：手机
+    /// 通知页把「令牌本身坏了」和「对方拉黑了这个 bot」说成同一句话，用户
+    /// 拉黑了 bot 之后照着提示重填一遍令牌完全没用。`error_from` 现在把
+    /// 401/403 分开判，这条测试钉住这个区分本身：403 绝不能落回
+    /// `BadToken`（那样 401/403 又会被静默合并成一种结果）。
     #[test]
-    fn a_403_is_also_bad_token_not_unreachable() {
+    fn a_403_is_blocked_not_bad_token() {
         let body = r#"{"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}"#;
-        assert_eq!(parse_updates(body), Err(ChannelError::BadToken));
-        assert_eq!(parse_get_me(body), Err(ChannelError::BadToken));
+        assert_eq!(parse_updates(body), Err(ChannelError::Blocked));
+        assert_eq!(parse_get_me(body), Err(ChannelError::Blocked));
+    }
+
+    /// `send()` 真的把 `Blocked` 原样透传，不是被 `?`/`.map_err` 悄悄
+    /// 改写成别的东西——同 `send_surfaces_bad_token` 核实 401 那条路的
+    /// 道理，这里核实 403 那条路。
+    #[test]
+    fn send_surfaces_blocked() {
+        let rejected = r#"{"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}"#;
+        let fake = FakeTransport::new(vec![rejected]);
+        let tg = Telegram::with_transport("tok", fake.sender());
+        tg.set_destination(Some(777));
+        assert_eq!(tg.send("hi").unwrap_err(), ChannelError::Blocked);
     }
 
     /// 假传输：记下每次被调用的 (url, body, timeout)，回放预先准备好的响应

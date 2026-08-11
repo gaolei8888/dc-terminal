@@ -9,9 +9,13 @@
 //! 其余三种都必须给出路（`every_state_tells_the_user_what_to_do_next`）。
 //!
 //! 令牌是密钥。`status_line`/`next_step` 两个函数**故意不读**
-//! `PhoneState::Broken` 里的那个字符串——这是一条纵深防御，见
+//! `PhoneState::Broken` 的 `message` 字段——这是一条纵深防御，见
 //! `proto::PhoneState::Broken` 的文档注释和
-//! `the_token_never_appears_in_any_status_text` 这条测试。
+//! `the_token_never_appears_in_any_status_text` 这条测试。`reason` 字段
+//! 不受这条限制：它是个封闭的三值枚举，不可能夹带令牌，`next_step` 靠它
+//! 分岔出三句不同的下一步（fix round 1 的根因修复——以前只有一句写死的
+//! 话，令牌失效、被拉黑、网络不通说的是同一句，其中两种听那句话去做完全
+//! 没用）。
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -20,7 +24,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::client::Client;
 use crate::i18n::{msg, text, Key, Lang};
-use crate::proto::{socket_path, PhoneState, PhoneStatus, Request, Response};
+use crate::proto::{socket_path, PhoneBrokenReason, PhoneState, PhoneStatus, Request, Response};
 
 use super::app::App;
 use super::dim;
@@ -38,10 +42,11 @@ pub(crate) fn status_line(status: &PhoneStatus, lang: Lang) -> String {
             Some(owner) => msg::phone_paired(lang, owner),
             None => text(Key::PhonePairedNoOwner, lang).to_string(),
         },
-        // **故意不读这个字符串本身**——见模块头注释和
+        // **故意不读 `message` 字段**——见模块头注释和
         // `the_token_never_appears_in_any_status_text`。真正的诊断详情
-        // 画在 `draw()` 里单独的一行，不经过这个函数。
-        PhoneState::Broken(_) => text(Key::PhoneBrokenHeadline, lang).to_string(),
+        // 画在 `draw()` 里单独的一行，不经过这个函数。三种原因共用同一句
+        // headline，区分交给 `next_step`。
+        PhoneState::Broken { .. } => text(Key::PhoneBrokenHeadline, lang).to_string(),
     }
 }
 
@@ -52,11 +57,16 @@ pub(crate) fn next_step(status: &PhoneStatus, lang: Lang) -> Option<String> {
         PhoneState::Off => Some(text(Key::PhoneOffNextStep, lang).to_string()),
         PhoneState::WaitingForPairing => Some(text(Key::PhoneWaitingNextStep, lang).to_string()),
         PhoneState::Paired => None,
-        // 同 `status_line`：不读 payload。两种真实成因（令牌失效 / 被拉黑）
-        // 合成一句话，比猜一个可能是错的原因更诚实——`ChannelError::BadToken`
-        // 这一层本来就没有保留这个区分（见 `channel/telegram.rs` 的
-        // `error_from`），没有立场假装知道具体是哪一种。
-        PhoneState::Broken(_) => Some(text(Key::PhoneBrokenNextStep, lang).to_string()),
+        // 读 `reason`（安全：封闭枚举，不可能夹带令牌），**不读 `message`**
+        // ——三个原因、三句不同的下一步，见模块头注释。
+        PhoneState::Broken { reason, .. } => Some(
+            match reason {
+                PhoneBrokenReason::BadToken => text(Key::PhoneNextStepBadToken, lang),
+                PhoneBrokenReason::BotBlocked => text(Key::PhoneNextStepBlocked, lang),
+                PhoneBrokenReason::Unreachable => text(Key::PhoneNextStepUnreachable, lang),
+            }
+            .to_string(),
+        ),
     }
 }
 
@@ -237,10 +247,10 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 详情：`Broken` 里那句守护进程写好的人话，画在单独一行——`status_line`/
     // `next_step` 故意不读它（见模块头注释），但完全不展示的话这个字符串
     // 就白存了，用户也没法知道更具体的原因。
-    if let PhoneState::Broken(reason) = &status.state {
+    if let PhoneState::Broken { message, .. } = &status.state {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            reason.clone(),
+            message.clone(),
             Style::default().fg(Color::Red),
         )));
     }
@@ -292,7 +302,10 @@ mod tests {
             PhoneState::Off,
             PhoneState::WaitingForPairing,
             PhoneState::Paired,
-            PhoneState::Broken("token revoked".into()),
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "token revoked".into(),
+            },
         ] {
             let s = status_line(
                 &PhoneStatus {
@@ -308,7 +321,10 @@ mod tests {
         for st in [
             PhoneState::Off,
             PhoneState::WaitingForPairing,
-            PhoneState::Broken("token revoked".into()),
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "token revoked".into(),
+            },
         ] {
             let s = next_step(
                 &PhoneStatus {
@@ -349,7 +365,10 @@ mod tests {
     #[test]
     fn the_token_never_appears_in_any_status_text() {
         let st = PhoneStatus {
-            state: PhoneState::Broken("123456:AAH-SECRET".into()),
+            state: PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "123456:AAH-SECRET".into(),
+            },
             bot: None,
             owner: None,
         };
@@ -414,7 +433,10 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Phone {
             status: PhoneStatus {
-                state: PhoneState::Broken("token revoked".into()),
+                state: PhoneState::Broken {
+                    reason: PhoneBrokenReason::BadToken,
+                    message: "token revoked".into(),
+                },
                 bot: None,
                 owner: None,
             },
@@ -614,7 +636,10 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Phone {
             status: PhoneStatus {
-                state: PhoneState::Broken("这个令牌用不了，重新输入一遍".into()),
+                state: PhoneState::Broken {
+                    reason: PhoneBrokenReason::BadToken,
+                    message: "这个令牌用不了，重新输入一遍".into(),
+                },
                 bot: None,
                 owner: None,
             },

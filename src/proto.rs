@@ -136,6 +136,29 @@ pub enum MouseForwardKind {
     Release(u8),
 }
 
+/// `PhoneState::Broken` 断线的真实原因。**跟 `ChannelError` 不是同一个
+/// 枚举，是故意的**——`ChannelError` 是渠道层的判断（值不值得重试），这个
+/// 是用户要看到哪句话、能做哪个动作的判断，两层各管各的，但这个类型的
+/// 存在本身就是为了不再弄丢 `ChannelError::BadToken`/`Blocked` 已经分开
+/// 记下的那个区分。
+///
+/// **三种原因，三句不同的下一步**（`ui/phone.rs::next_step`）：
+/// - `BadToken`：令牌本身不好使，下一步是重新填一遍（`Enter`）。
+/// - `BotBlocked`：令牌完好，但对方在 Telegram 里把这个 bot 拉黑了/删了
+///   对话，下一步是去解除拉黑再按 `r` 重新配对——「重新输入令牌」对这个
+///   原因毫无用处。
+/// - `Unreachable`：网络问题（连不上、或者 Telegram 回了读不懂的东西），
+///   下一步是检查网络再试一次——**不是**重新输入一份完全没问题的令牌。
+///   这条是 fix round 1 的 Important 1：把 `Unreachable` 也归进
+///   `BadToken` 一样的「重新输入」建议，会让离线、代理不通、网络抖动的
+///   用户被要求重填一份好端端的令牌。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneBrokenReason {
+    BadToken,
+    BotBlocked,
+    Unreachable,
+}
+
 /// 手机通知这一页在守护进程眼里处在哪个阶段。**这一行状态是那一整页存在的
 /// 全部理由**——配对是异步的（填完令牌之后守护进程转去后台长轮询等用户在
 /// Telegram 上发第一条消息），不给这件事一个去处，用户填完令牌就会对着一片
@@ -146,18 +169,55 @@ pub enum PhoneState {
     Off,
     /// 填了、验过了，在等用户给 bot 发第一条消息
     WaitingForPairing,
+    /// 配上了。**这一分支在这个分支（dct-phone-channel）上没有任何代码
+    /// 构造它**——写这个状态需要真的收到过一条配对消息，那是 Task 5
+    /// （Bridge）的活。它已经在这里是因为协议、i18n 文案、`idle_help`、
+    /// 单测全都得先认识这第四种取值，Task 5 落地时不用再改一次协议形状。
+    /// 见它自己在 `ui/phone.rs`/`view.rs` 里的用法：那些地方处理它时都是
+    /// 「万一将来有」而不是「今天真的会出现」。
     Paired,
-    /// 连不上。**装的是已经成文的人话，不是原始错误文本**——守护进程是
-    /// 唯一决定用户看到什么文字的地方（本文件顶上 `SecretPrompt` 那条已有
-    /// 的约定：组句发生在哪一侧必须一致，不能一半在 daemon 一半在界面）。
+    /// 连不上。**`message` 装的是已经成文的人话，不是原始错误文本**——
+    /// 守护进程是唯一决定用户看到什么文字的地方（本文件顶上
+    /// `SecretPrompt` 那条已有的约定：组句发生在哪一侧必须一致，不能一半
+    /// 在 daemon 一半在界面）。
     ///
-    /// `ui/phone.rs` 的 `status_line`/`next_step` **故意不读这个字符串的
-    /// 内容**：它们只按这个变体本身给固定文案，理由见那两个函数的文档
-    /// 注释和 `the_token_never_appears_in_any_status_text` 这条测试——这是
-    /// 一条纵深防御，哪怕将来有一天这里被塞进了不该出现的原始内容，界面上
-    /// 最显眼的那一行状态和下一步提示也不会把它带出来。这个字符串真正显示
-    /// 的地方是 `draw()` 里单独的一行详情。
-    Broken(String),
+    /// `reason` 是**类型化**的，`message` 是**不透明**的——两者的角色不
+    /// 一样。`ui/phone.rs::next_step` 读 `reason`（安全：它是个封闭枚举，
+    /// 不可能夹带令牌）来决定给哪一句下一步；`status_line`/`next_step`
+    /// **都不读 `message`**，那个字符串只在 `draw()` 里单独一行显示，见
+    /// `the_token_never_appears_in_any_status_text` 这条测试——这是一条
+    /// 纵深防御，哪怕将来有一天 `message` 被塞进了不该出现的原始内容，
+    /// 界面上最显眼的那一行状态和下一步提示也不会把它带出来。
+    Broken {
+        reason: PhoneBrokenReason,
+        message: String,
+    },
+}
+
+impl PhoneState {
+    /// 磁盘上是不是存在一份「曾经被确认有效」的令牌。`WaitingForPairing`/
+    /// `Paired` 算，`Broken { reason: BotBlocked, .. }` 也算（令牌本身没
+    /// 坏，只是这个 bot 被拉黑了）；`Off` 不算，`Broken { BadToken | Unreachable, .. }`
+    /// 也不算——后两者时 `apply_phone_set_token` 验证失败根本没有落盘。
+    ///
+    /// **`r`（重新配对）/`x`（关掉）只在这里返回 `true` 时才有对象可
+    /// 作用**，`ui/phone.rs::handle_status`（按下去有没有效果）和
+    /// `daemon.rs`（`PhoneUnpair` 该不该真的把状态推到 `WaitingForPairing`）
+    /// 必须共用这同一份判断，见它们各自的调用点：任何一处独立复制一份
+    /// 都会重演 fix round 1 的 Critical 2——`PhoneUnpair` 曾经不管这条件、
+    /// 一律把状态推成 `WaitingForPairing`，磁盘上却根本没有令牌，页面停在
+    /// 一个不存在的 bot 上，`Enter` 又不再提供，用户没有任何出路。
+    pub fn has_confirmed_token(&self) -> bool {
+        matches!(
+            self,
+            PhoneState::WaitingForPairing
+                | PhoneState::Paired
+                | PhoneState::Broken {
+                    reason: PhoneBrokenReason::BotBlocked,
+                    ..
+                }
+        )
+    }
 }
 
 /// 手机通知这一页要显示的全部事实。
@@ -909,7 +969,10 @@ mod tests {
     #[test]
     fn phone_status_response_round_trips() {
         let r = Response::Phone(PhoneStatus {
-            state: PhoneState::Broken("令牌用不了，重新输入一遍".into()),
+            state: PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "令牌用不了，重新输入一遍".into(),
+            },
             bot: Some("my_dct_bot".into()),
             owner: None,
         });
@@ -918,11 +981,41 @@ mod tests {
         match back {
             Response::Phone(status) => {
                 assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
-                assert!(
-                    matches!(status.state, PhoneState::Broken(m) if m == "令牌用不了，重新输入一遍")
-                );
+                match status.state {
+                    PhoneState::Broken { reason, message } => {
+                        assert_eq!(reason, PhoneBrokenReason::BadToken);
+                        assert_eq!(message, "令牌用不了，重新输入一遍");
+                    }
+                    other => panic!("解回来不是 Broken：{other:?}"),
+                }
             }
             other => panic!("解回来不是 Phone：{other:?}"),
         }
+    }
+
+    /// `has_confirmed_token` 是 `PhoneUnpair`（daemon.rs）和
+    /// `phone_key_has_effect`（view.rs）唯一共用的判断，钉住这份真值表
+    /// 本身——两处调用点各自的测试覆盖的是「它们用对了这个函数」，这条
+    /// 覆盖的是「这个函数本身给出的答案是对的」。
+    #[test]
+    fn has_confirmed_token_matches_the_documented_truth_table() {
+        assert!(!PhoneState::Off.has_confirmed_token());
+        assert!(PhoneState::WaitingForPairing.has_confirmed_token());
+        assert!(PhoneState::Paired.has_confirmed_token());
+        assert!(!PhoneState::Broken {
+            reason: PhoneBrokenReason::BadToken,
+            message: String::new(),
+        }
+        .has_confirmed_token());
+        assert!(!PhoneState::Broken {
+            reason: PhoneBrokenReason::Unreachable,
+            message: String::new(),
+        }
+        .has_confirmed_token());
+        assert!(PhoneState::Broken {
+            reason: PhoneBrokenReason::BotBlocked,
+            message: String::new(),
+        }
+        .has_confirmed_token());
     }
 }

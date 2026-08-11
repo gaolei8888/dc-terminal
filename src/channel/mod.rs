@@ -24,9 +24,16 @@ pub struct Incoming {
 pub enum ChannelError {
     /// 网络问题。**重试有意义。**
     Unreachable,
-    /// 令牌无效或被撤销。**重试一万次还是这个结果**，退避重试是在浪费时间，
-    /// 而且会把「该让用户去重填令牌」这件事永远拖着不说。
+    /// 令牌无效或被撤销（Telegram 的 401）。**重试一万次还是这个结果**，
+    /// 退避重试是在浪费时间，而且会把「该让用户去重填令牌」这件事永远
+    /// 拖着不说。
     BadToken,
+    /// 对方把这个 bot 拉黑了、或者删了对话（Telegram 的 403）。**跟
+    /// `BadToken` 分开是故意的**：令牌本身没坏，「重新输入令牌」这句
+    /// 建议对这个原因是错的——用户该做的是去 Telegram 里解除拉黑，见
+    /// `daemon.rs::phone_verify_token`/`PhoneUnpair` 怎么用这个区分。
+    /// 同样不值得重试。
+    Blocked,
     /// 回来了但读不懂。当作坏消息处理，不猜。
     Malformed,
 }
@@ -130,6 +137,7 @@ mod tests {
     fn bad_token_is_not_retryable_but_unreachable_is() {
         assert!(ChannelError::Unreachable.worth_retrying());
         assert!(!ChannelError::BadToken.worth_retrying());
+        assert!(!ChannelError::Blocked.worth_retrying());
         assert!(!ChannelError::Malformed.worth_retrying());
     }
 }
