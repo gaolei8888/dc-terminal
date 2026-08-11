@@ -32,11 +32,16 @@ use std::time::{Duration, Instant};
 /// - `env.PS1` 钉死成一个测试专用的固定串，`wait_for_prompt` 就不用再猜
 ///   「屏幕上随便出现点什么」，可以直接等这一句话。
 ///
-/// 这不是走 `Profile::register_profile`（那是进程内注册，这两条测试隔着
-/// socket 够不到），而是先把 profile 塞进 `SessionManager`、再拿它起
-/// `daemon::run_with_manager`——`concurrency.rs`、`profiles_flow.rs` 的
-/// `two_projects_each_keep_their_own_agent_over_the_wire` 已经是这个用法，
-/// 这里照抄，不是发明新机制。
+/// 走的正是 `SessionManager::register_profile`（`session.rs:552`）——先把
+/// profile 塞进一个 `SessionManager`，再拿它起 `daemon::run_with_manager`。
+/// 这条路**隔着 socket 够得到**：`create()` 内部的 `resolve_profile`
+/// （`session.rs:564-572`）查 `extra_profiles`（也就是 `register_profile`
+/// 注册的那张表）这一步，跟请求是不是从 socket 来的无关。写这份测试之前
+/// 有一版简报断言够不到、只能靠磁盘上的 profile 文件——读了
+/// `resolve_profile` 才发现那是错的：`concurrency.rs`、`profiles_flow.rs`
+/// 的 `two_projects_each_keep_their_own_agent_over_the_wire` 早就是「起
+/// 真 socket + `register_profile`」这个用法，这里照抄的是那个已经验证过
+/// 的现成手法，不是发明新机制，也不用再多一层磁盘 TOML 的间接。
 const PROMPT: &str = "dct-test$ ";
 const TEST_SHELL_PROFILE: &str = "grid-reply-test-shell";
 
