@@ -262,8 +262,14 @@ impl App {
         // 同一轮里坏了好几个时只报第一个：底栏只有两行，堆几句话反而
         // 一个都读不清。剩下的在列表/格子里都标着红色，跑不掉。
         if let Some(s) = newly.first() {
+            // 用户此刻正靠这句话去找是哪个会话，屏幕上别的地方（看板列表、
+            // 九宫格标题、附着标题）都已经用会话名而不是 profile 认它——
+            // 出错提示不能是仅剩的那个还叫 profile 的地方。`session_label`
+            // 是「一个会话显示成什么」的唯一决定处，不能自己另拼一遍。
             self.message = Msg::err(crate::i18n::msg::session_failed(
-                self.lang, s.id, &s.profile,
+                self.lang,
+                s.id,
+                super::widgets::session_label(s),
             ));
         }
     }
@@ -682,6 +688,46 @@ mod tests {
         assert!(
             app.message.text.contains("出错"),
             "别的项目的失败也要提示：{}",
+            app.message.text
+        );
+    }
+
+    /// 出错提示点名用的必须是**会话名**，不是 profile——看板列表、九宫格
+    /// 标题、回复框收件人、附着标题全都已经改叫会话名了，出错提示是用户
+    /// 这一刻唯一用来找会话的线索，不能是屏幕上仅剩的另一个称呼。
+    #[test]
+    fn failure_toast_calls_the_session_by_its_name_not_its_profile() {
+        let (mut app, _dir) = App::test_app();
+        let mut named = sess(7, "/w/a");
+        named.tag = "修登录白屏".into();
+        app.set_sessions(vec![named.clone()]);
+
+        named.state = crate::session::SessionState::Failed;
+        app.set_sessions(vec![named]);
+
+        assert!(
+            app.message.text.contains("修登录白屏"),
+            "要点名会话名：{}",
+            app.message.text
+        );
+        assert!(
+            !app.message.text.contains("claude"),
+            "已经有名字了，不该再退回 profile：{}",
+            app.message.text
+        );
+    }
+
+    /// 没有名字的会话失败时，`session_label` 本来就退回 profile——
+    /// 出错提示要跟这个规则走同一条路，不是自己另判一次。
+    #[test]
+    fn failure_toast_falls_back_to_the_profile_when_the_session_has_no_name() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![sess(1, "/w/a")]);
+        app.set_sessions(vec![failing(1, "/w/a")]);
+
+        assert!(
+            app.message.text.contains("claude"),
+            "没名字就该看到 profile：{}",
             app.message.text
         );
     }
