@@ -122,3 +122,107 @@ $ git diff --check
 - **No network-integration test exists for the three real `Bridge::new(Arc::new(Telegram::new(&token)))` construction sites in `daemon.rs`** (startup, `PhoneSetToken` success, and the BotBlocked-restart path's reuse of an existing `Bridge`). This is deliberate, matching the project's existing line for real-transport code (`send_real`, `verify.rs::send_probe`, `phone_verify_token`'s injected `get_me` closure) — but it does mean the *decision logic* around starting/stopping a Bridge is tested via a `RecordingChannel` fake (see below), while the literal "does `Telegram::new` get called with the right token and does the thread actually run against the real Telegram API" is unverified at the unit level, same as every other real-transport call site in this codebase.
 - I added a small `RecordingChannel` fake inside `daemon.rs`'s own test module (deliberately not sharing `bridge.rs`'s private `FakeChannel`, to keep the two modules' test concerns separate) plus a `#[cfg(test)] pub(crate) fn is_retired_for_test()` accessor on `Bridge`, mirroring the existing `i18n::has_han` pattern for test-only crate-visible hooks.
 - Bridge's forwarding of owner-authored messages into a session (`Accepted::FromOwner` today does nothing but return) is explicitly Task 7's job per the module's own comments — I did not touch it.
+
+---
+
+# Fix round 1
+
+**Status:** complete. Commits on `feat/phone-channel`:
+- `e6d378d` — `fix: pairing survives a restart instead of reopening backward in time` (both Criticals, all three Importants, the Minors)
+- `2734b9b` — `test: prove poll_forever actually calls discard_backlog, not just that discard_backlog works` (a regression test the mutation sweep below showed was missing)
+
+Test summary: `cargo test --lib -- --test-threads=1` → 838 passed, 0 failed, 29.92s. `cargo fmt -- --check`, `cargo clippy --all-targets`, `git diff --check` all clean.
+
+## Critical 1 — pairing must survive a restart, not reopen a window backward in time
+
+Two complementary fixes, as required:
+
+1. **Persist + restore the owner.** `secrets::PHONE_OWNER_KEY` is a new key alongside the token and bot name. `Bridge` gained an `on_owner_changed: Box<dyn Fn(Option<i64>) + Send + Sync>` field, called from `accept()`'s pairing branch (`Some(new_owner)`) and from `unpair()` (`None`) — the same discipline as `set_destination`: one place decides, everything else is told. `daemon.rs::persist_owner_hook(secrets)` builds the production closure; `run_with_manager` reads `PHONE_OWNER_KEY` at startup and passes it to the new `Bridge::new_with_owner(ch, owner, on_owner_changed)`, which calls `set_destination` immediately if `owner` is `Some` — a restart resumes the same pairing, it doesn't reopen one. `initial_phone_status` and `apply_phone_set_token` both got matching updates: a saved owner now means the startup status is `Paired` (not `WaitingForPairing`), and a successful new-token verification clears any stale owner left over from a previous token (three-key gated write, same "two `lock()` calls must be separate statements" discipline as the existing token/bot-name write).
+
+2. **Discard the backlog.** `channel::telegram::Telegram::with_transport` starts `offset` at 0, and Telegram's `getUpdates` with `offset=0` returns the whole unconfirmed backlog — up to ~24h, oldest first. A restart with a restored owner is safe from *pairing* being stolen (strangers are still rejected), but a never-paired restart (owner still `None`) is not: the oldest unclaimed backlog message would win pairing, and it doesn't have to be from someone currently online. `bridge.rs::discard_backlog()` runs before the first real long poll: it calls `ch.poll(Duration::ZERO)` repeatedly — Telegram returns immediately if there's anything queued, regardless of the requested timeout — discarding every batch until an empty one signals "caught up," never calling `accept()` on any of it. Reuses `terminal_reason`/`backoff_for` for its own error handling, so there's one error-mapping table, not two.
+
+I verified reason 2 is load-bearing with its own end-to-end test (`poll_forever_discards_the_backlog_before_the_real_owner_can_pair`) rather than trusting the `discard_backlog`-level unit tests, which call the function directly and can't see whether `poll_forever` still calls it — see the mutation table.
+
+**On the framing point requested:** my Task 5 report characterized "no startup re-verification needed" (carried-forward item 4) as pure gain — the first real `poll()` after a restart surfaces a revoked token within one cycle instead of leaving the page lying. That conclusion still holds, but it's the same `poll()` that Critical 1 is about: an unconditional first poll is exactly the mechanism that would have handed pairing to a stranger from the backlog if nothing else changed. Item 4's benefit and Critical 1's danger come from the identical code path — discovering a bad token fast and discovering a stranger's stale message fast are two faces of "the first poll after restart is unconditionally trusted." `discard_backlog` is what makes trusting it safe.
+
+## Critical 2 — every write to `phone` from the background thread rechecks `is_retired()`, in the same critical section as the write
+
+The bug: `poll_forever`'s `Paired` write and `send_pairing_confirmation`'s `Broken{BotBlocked}` write both acquired the `phone` lock and wrote unconditionally, with no recheck of retirement after the lock was acquired. A user pressing `x` (`PhoneDisable`) mid-race — either while a poll thread is blocked waiting for the `phone` lock `PhoneDisable` currently holds, or during `send_pairing_confirmation`'s up-to-10-second network call — could see their `Off` overwritten right back to `Paired` or `Broken{BotBlocked}`.
+
+Fix, applied uniformly: every write to `phone` from the background thread now goes through one of four small functions — `record_pairing`, `record_bot_blocked`, `record_terminal_error` (also used by `discard_backlog`'s error path), `record_bridge_panicked` (new, see Important 3) — each of which acquires the `phone` lock, rechecks `bridge.is_retired()`, and only writes if still false. This is a general fix, not two point patches: "every write to `phone`" is enforced by giving every write site the same shape, not by asking a mutator to remember to add a check.
+
+On the `PhoneDisable` side: `retire()` is now called **before** `PhoneDisable` ever touches the `phone` lock (previously: lock `phone`, write `Off`, then lock `bridge_slot` and retire, all while still holding the `phone` guard). I considered the reviewer's literal wording — "drop the guard before retiring" — against a race analysis: dropping the guard *before* calling `retire()` (rather than never holding it during `retire()` at all) still leaves a real window between the unlock and the `retire()` call, where a poll thread could acquire the lock, recheck `is_retired()`, see `false` (retire hasn't run yet), and write anyway. Calling `retire()` strictly before `PhoneDisable` acquires the `phone` lock at all closes that window: any writer that later acquires the lock is guaranteed `retire()` already ran, because `PhoneDisable`'s own `phone`-write happens-after its `retire()` call on the same thread, and any contending writer either got the lock before `PhoneDisable` (in which case its write is legitimately superseded by `Off`) or after (in which case `retire()` already happened). This also incidentally satisfies the Minor about `bridge_slot`/`phone` never being held nested — the two locks are now acquired fully sequentially in `PhoneDisable`, same as `PhoneUnpair` already did.
+
+**Known gap, stated plainly:** I did not write an automated test that catches a regression of this *ordering* (retire-before-phone vs. the original phone-then-retire). The existing `phone_disable_retires_a_present_bridge_and_clears_the_slot` test runs single-threaded and confirms retirement happens, but not *when* relative to the `phone` write — and I judged that forcing a real concurrent race into a test would trade a clear bug for a flaky one (this codebase's own house style, e.g. `session.rs`'s comment on `recv_timeout`, explicitly rejects tests that pass by chance under load). The ordering is enforced by code structure and documented at the call site; a reviewer reading `daemon.rs::Request::PhoneDisable` can verify it, but a mutation that reintroduces the old order would not be caught automatically. I mutated the four `record_*` recheck sites (see table) — those *are* caught, deterministically, because "retire before calling" is a clean substitute for the race with no timing dependency.
+
+## Important 1 — `start_phone_bridge` retires whatever was in the slot before installing a new one
+
+Unless it's the *same* `Bridge` (`Arc::ptr_eq`) being reinstalled — the `PhoneUnpair`-from-`BotBlocked` restart path passes the same `Arc<Bridge>` back in, and an unconditional retire would have the new thread see itself as already retired and exit immediately, undoing its own restart. This is now a single fix at the one place a `Bridge` gets installed into the slot, so it covers all three call sites (startup, `PhoneSetToken`, `PhoneUnpair`'s restart) without needing three separate patches.
+
+## Important 2 — `PhoneStatus.owner` gets the chat id (minimum truthful surface)
+
+`record_pairing` now sets `ph.owner = Some(id.to_string())`. `ui/phone.rs::status_line`/`msg::phone_paired` already existed and were already tested for both `Some`/`None` owner — this was a dead producer waiting for a caller, not new UI work. I did not implement a real display name (`parse_updates` reading `from.first_name`/`username`, `Incoming` growing a field) — review explicitly offered the chat-id-only version as acceptable ("at minimum"), and the fuller version is a larger, separable change touching the `Channel` trait's data shape across all four implementors.
+
+## Important 3 — a panicking poll thread now leaves an honest `Broken`, not a silently dead listener
+
+`run()` calls `record_bridge_panicked` after `catch_unwind` reports an error — a new i18n string (`msg::phone_bridge_panicked`, tested in both languages) composes into `Broken{Unreachable, ...}`, subject to the same `is_retired()` recheck as every other write. `Unreachable` was chosen because it's the one `PhoneBrokenReason` that doesn't assert something false about the panic's actual cause (a panic isn't a `ChannelError`, so "the token is bad" or "this chat blocked the bot" would both be inventions).
+
+## Minors
+
+- The third `if let Some(bridge) = recover(bridge_slot.lock())...` in `PhoneDisable` is now also part of a strictly-sequential (never nested) lock pattern, addressed as part of the Critical 2 fix above, not as a separate patch.
+- `PhoneBridgeSlot`'s doc comment now states the "`phone`/`bridge_slot` never held nested" discipline explicitly.
+- `msg::phone_pairing_confirmation` has its own composition test (`phone_pairing_confirmation_composes_in_both_languages`), matching `phone_blocked`'s existing one.
+- `BRIDGE_LANG` hardcoded to `Lang::Zh` (an English user gets a Chinese phone message and a Chinese panic-recovery message) is unchanged — it was already documented as a deliberate, known gap in the module's header, and I extended that same paragraph to say so explicitly rather than fix it; changing it means deciding where the background thread learns the user's chosen language from, which is a design question beyond this round.
+- `secrets.rs`'s `PHONE_BOT_KEY` doc comment, which argued persisting the bot name means "startup never touches the network," is corrected: startup now always touches the network (the Bridge's poll thread) whenever a token is on disk; what persisting the bot name and owner still avoids is a *specific synchronous* `getMe` call blocking startup.
+- The four daemon tests that call `handle()` with a populated `bridge_slot` now go through a new `handle_with_deadline` helper (spawns `handle()` on its own thread, `mpsc::Receiver::recv_timeout(Duration::from_secs(5))`) instead of calling `handle()` directly. I verified this actually converts a hang into a fast failure by deliberately reintroducing the Task 5 deadlock (reverting the `let bridge = recover(bridge_slot.lock()).clone(); if let Some(bridge) = bridge` rebinding back to the `if let Some(bridge) = recover(bridge_slot.lock()).clone()` form) and running just `phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge`: it failed in 5.01s with `handle() 没有在 5 秒内返回` instead of hanging.
+
+## An additional finding, out of scope for this round
+
+Two pre-existing UI-layer integration tests — `ui::mod::tests::fetch_phone_status_reaches_the_real_daemon_when_connected` and `ui::settings_view::tests::entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default` — pre-seed `PHONE_TOKEN_KEY` with a fake token and then call `start_daemon_at`, which runs the real `daemon::run` in-process. Since Task 5's original commit, that now means a real `Bridge` starts and polls `https://api.telegram.org` with a garbage token on every `cargo test` run. I confirmed this is live, not theoretical: `curl -s -o /dev/null -w "%{http_code} in %{time_total}s\n" --max-time 5 https://api.telegram.org/` returns `302 in 0.93s` from this environment. The calls fail fast (401, terminal, not retried) so they don't cause flakiness or slow the suite today, but they violate the project's established "no unit test touches real network" discipline (the whole reason `initial_phone_status`/`apply_phone_set_token` take injected closures). My `discard_backlog` change makes this slightly worse — one more real HTTP round trip per affected test run — not better. I did not fix it: the clean fix is a `Channel`-construction seam in `run_with_manager` (mirroring `apply_phone_set_token`'s injected `get_me`), which touches `run_with_manager`'s signature and therefore every one of its call sites (`run()`, and the `tests/*.rs` integration tests) — a larger, separable change from this round's brief.
+
+## Mutation table (fix round 1)
+
+All mutations applied by hand, confirmed RED, then reverted; `cargo build --lib` confirmed clean (no leftover unused-variable warnings) after each revert.
+
+| # | Mutation | Where | Test(s) that should catch it | Result |
+|---|---|---|---|---|
+| 1 | Remove `poll_forever`'s `if !discard_backlog(...) { return; }` call site entirely | `bridge.rs::poll_forever` | `poll_forever_discards_the_backlog_before_the_real_owner_can_pair` (the `discard_backlog_*` unit tests, which call the function directly, stayed green — this is *why* the test above exists) | **RED** |
+| 2 | `record_pairing`: drop the `is_retired()` guard | `bridge.rs` | `record_pairing_does_nothing_once_retired` | **RED** |
+| 3 | `record_bot_blocked`/`record_terminal_error`/`record_bridge_panicked`: replace `if !bridge.is_retired() {` with `if true {` (all three at once) | `bridge.rs` | `record_bot_blocked_does_nothing_once_retired`, `record_terminal_error_does_nothing_once_retired`, `record_bridge_panicked_does_nothing_once_retired` | **RED** (all three) |
+| 4 | `start_phone_bridge`: drop the `Arc::ptr_eq` guard, always retire whatever was in the slot | `daemon.rs` | `start_phone_bridge_does_not_retire_the_same_bridge_being_reinstalled` | **RED** |
+| 5 | `start_phone_bridge`: drop the retire-the-old-bridge block entirely | `daemon.rs` | `start_phone_bridge_retires_a_different_previous_bridge` | **RED** |
+| 6 | `persist_owner_hook`: swap the `Some`/`None` arms (set on unpair, no-op on pair) | `daemon.rs` | `persist_owner_hook_sets_and_removes_the_owner_key` | **RED** |
+| 7 | `initial_phone_status`: drop the `owner.is_some()` branch, always `WaitingForPairing` when there's a token | `daemon.rs` | `initial_phone_status_is_paired_when_an_owner_is_saved` | **RED** |
+| 8 | `apply_phone_set_token`: drop the `.and_then(|_| ...remove(PHONE_OWNER_KEY))` step | `daemon.rs` | `apply_phone_set_token_clears_a_stale_owner_from_the_previous_token` | **RED** |
+| 9 | Deadlock regression: revert the `bridge_slot` rebinding fix from Task 5 back to `if let Some(bridge) = recover(bridge_slot.lock()).clone() { ... start_phone_bridge(...) }` | `daemon.rs::Request::PhoneUnpair` | `phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge` (via the new `handle_with_deadline` wrapper) | **RED in 5.01s** (previously: hang) |
+
+Not mutated (see "Known gap" under Critical 2 above): the ordering of `PhoneDisable`'s `retire()` call relative to its `phone`-lock acquisition. No automated test distinguishes the fixed order from the original buggy one without introducing real thread timing.
+
+## Exact test commands and output tails
+
+```
+$ cargo test --lib bridge:: -- --test-threads=1
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 804 filtered out; finished in 0.00s
+
+$ cargo test --lib daemon:: -- --test-threads=1
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 802 filtered out; finished in 5.6[4-7]s
+
+$ cargo test --lib -- --test-threads=1
+test result: ok. 838 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.92s
+
+$ cargo fmt -- --check
+(no output, exit 0)
+
+$ cargo clippy --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.5xs
+(no warnings)
+
+$ git diff --check
+(no output, exit 0)
+
+# Deadlock-regression proof (mutation #9 above, reverted after):
+$ cargo test --lib phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge -- --test-threads=1
+thread '...' panicked at src/daemon.rs:842:23:
+handle() 没有在 5 秒内返回——大概率是 bridge_slot 相关的一个死锁回归了，见 Request::PhoneUnpair 那条锁死注释
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 836 filtered out; finished in 5.01s
+```
