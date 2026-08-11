@@ -2537,15 +2537,49 @@ mod tests {
     #[test]
     fn entering_a_session_always_lands_at_the_bottom_even_without_a_resize() {
         use crate::client::Client;
+        use crate::profile::Profile;
         use crate::proto::{Request, Response};
-        use crate::session::ScrollBy;
+        use crate::session::{ScrollBy, SessionManager};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
         use std::time::{Duration, Instant};
+
+        // 这条测试原来靠内置的 `shell` profile（`/bin/zsh`）攒 200 行滚屏——
+        // 那是开发者自己的登录 shell，会 source 真实的 `~/.zshrc`，起多快
+        // 全看那份 rc 文件有多重，满载并行跑 `cargo test` 时常常在「等 200
+        // 行攒够」的 5 秒期限里输掉，是一次假红，不是这条测试真的抓到了
+        // bug。改成测试自己注册的 profile：`/bin/sh --noediting`——`--noediting`
+        // 关掉 GNU Readline，shell 不会在不确定的时刻把终端切成 raw 模式；
+        // `ENV=/dev/null` 摁死 posix 模式下 sh 的启动脚本，不读任何 rc；
+        // `PS1` 钉死成固定串，等它出现就知道 shell 已经能收输入了。
+        // 详见 `.superpowers/sdd/2026-08-09-dct-session-auto-name/followup-2-brief.md`。
+        const PROMPT: &str = "dct-test$ ";
+        let mut env = BTreeMap::new();
+        env.insert("ENV".to_string(), "/dev/null".to_string());
+        env.insert("PS1".to_string(), PROMPT.to_string());
+        let test_shell = Profile {
+            name: "scroll-test-shell".into(),
+            command: vec!["/bin/sh".into(), "--noediting".into()],
+            is_agent: false,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: None,
+            env,
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        };
 
         let home = tempfile::tempdir().unwrap();
         let sock = home.path().join("daemon.sock");
+        let mgr = Arc::new(SessionManager::new());
+        mgr.register_profile(test_shell.clone());
         let s = sock.clone();
         std::thread::spawn(move || {
-            let _ = crate::daemon::run(&s);
+            let _ = crate::daemon::run_with_manager(&s, mgr);
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !sock.exists() {
@@ -2558,7 +2592,7 @@ mod tests {
         let id = match c
             .call(Request::Create {
                 dir: workdir.path().display().to_string(),
-                profile: "shell".into(),
+                profile: test_shell.name.clone(),
                 remember: false,
             })
             .unwrap()
@@ -2566,14 +2600,6 @@ mod tests {
             Response::Created { id } => id,
             other => panic!("预期 Created，实际 {other:?}"),
         };
-
-        // 攒够滚屏内容：跟 `session.rs` 里 `scrolling_session` 用的是同一种
-        // POSIX 循环，不挑具体 shell。
-        c.call(Request::Input {
-            id,
-            text: "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done\n".into(),
-        })
-        .unwrap();
 
         let screen = |c: &mut Client| -> (String, crate::session::ScrollState) {
             match c.call(Request::Screen { id }).unwrap() {
@@ -2588,6 +2614,25 @@ mod tests {
                 other => panic!("预期 Screen，实际 {other:?}"),
             }
         };
+
+        // 提示符出来之前发的字会被吞掉——等它出现，再攒滚屏内容。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (text, _) = screen(&mut c);
+            if text.contains(PROMPT) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "测试 shell 的提示符一直没出来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 攒够滚屏内容：跟 `session.rs` 里 `scrolling_session` 用的是同一种
+        // POSIX 循环，不挑具体 shell。
+        c.call(Request::Input {
+            id,
+            text: "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done\n".into(),
+        })
+        .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2618,7 +2663,7 @@ mod tests {
         );
         app.set_sessions(vec![SessionInfo {
             id,
-            profile: "shell".into(),
+            profile: test_shell.name.clone(),
             dir: workdir.path().display().to_string(),
             state: SessionState::Working,
             activity: String::new(),

@@ -9,16 +9,86 @@
 //! 它一旦变了（比如哪天 `Input` 自己带上换行），界面会安静地退化成「字发过去
 //! 了但 agent 一直在等回车」——用户以为自己回过话了，其实对面还停着。
 
+use dct::client::Client;
+use dct::profile::Profile;
 use dct::proto::{Request, Response};
+use dct::session::SessionManager;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-mod common;
+/// 这条契约测过一遍守护进程真实的 socket 往返，所以起daemon 得走真 socket。
+/// 但它**不能**用内置的 `shell` profile（`/bin/zsh`）——那是开发者自己的
+/// 登录 shell，会 source 真实的 `~/.zshrc`，提示符画出来的时间取决于那份
+/// rc 文件有多重，满载并行跑 `cargo test` 时经常输给固定的等待期限
+/// （详见 `.superpowers/sdd/2026-08-09-dct-session-auto-name/followup-2-brief.md`）。
+///
+/// 换成一个测试自己注册的 profile：`/bin/sh --noediting`。选它是因为：
+/// - `--noediting` 关掉 GNU Readline，shell 就不会在某个不确定的时刻把
+///   终端切成 raw 模式——不然那次切换本身又是一个新的竞态窗口。
+/// - `env.ENV = "/dev/null"`：sh 以 `sh` 这个名字启动、且是交互式时，会去读
+///   `$ENV` 指向的文件当启动脚本（posix 模式下 sh 版本的「rc 文件」）。显式
+///   摁死它，不管运行测试的机器上这个变量有没有被意外设置过。
+/// - `env.PS1` 钉死成一个测试专用的固定串，`wait_for_prompt` 就不用再猜
+///   「屏幕上随便出现点什么」，可以直接等这一句话。
+///
+/// 这不是走 `Profile::register_profile`（那是进程内注册，这两条测试隔着
+/// socket 够不到），而是先把 profile 塞进 `SessionManager`、再拿它起
+/// `daemon::run_with_manager`——`concurrency.rs`、`profiles_flow.rs` 的
+/// `two_projects_each_keep_their_own_agent_over_the_wire` 已经是这个用法，
+/// 这里照抄，不是发明新机制。
+const PROMPT: &str = "dct-test$ ";
+const TEST_SHELL_PROFILE: &str = "grid-reply-test-shell";
 
-fn create_shell(c: &mut dct::client::Client, dir: &std::path::Path) -> u32 {
+fn test_shell_profile() -> Profile {
+    let mut env = BTreeMap::new();
+    env.insert("ENV".to_string(), "/dev/null".to_string());
+    env.insert("PS1".to_string(), PROMPT.to_string());
+    Profile {
+        name: TEST_SHELL_PROFILE.into(),
+        command: vec!["/bin/sh".into(), "--noediting".into()],
+        is_agent: false,
+        idle_pattern: None,
+        busy_pattern: None,
+        error_pattern: None,
+        env,
+        secret: None,
+        install: None,
+        headless: None,
+        api: None,
+        label: Default::default(),
+        note: Default::default(),
+    }
+}
+
+/// 起一个只在这个测试文件里活的守护进程，`SessionManager` 里预先注册好
+/// `test_shell_profile()`。跟 `tests/common::start_daemon()` 长得像，但没有
+/// 抽到那边去——`common::mod.rs` 头上的注释说得很清楚，那个共用脚手架是
+/// 「零参数、内部自己 new 一个 manager」的形状，塞不下「起daemon 之前先
+/// register_profile」这个需求，硬塞会让共用代码长出只有一个调用方用得到的
+/// 分支。`concurrency.rs` 已经因为同样的理由自己长了一份，这里是第二份。
+fn start_daemon() -> (tempfile::TempDir, std::path::PathBuf) {
+    let home = tempfile::tempdir().unwrap();
+    let sock = home.path().join("daemon.sock");
+    let mgr = Arc::new(SessionManager::new());
+    mgr.register_profile(test_shell_profile());
+    let s = sock.clone();
+    std::thread::spawn(move || {
+        let _ = dct::daemon::run_with_manager(&s, mgr);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "守护进程没起来：{}", sock.display());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (home, sock)
+}
+
+fn create_shell(c: &mut Client, dir: &std::path::Path) -> u32 {
     match c
         .call(Request::Create {
             dir: dir.display().to_string(),
-            profile: "shell".into(),
+            profile: TEST_SHELL_PROFILE.into(),
             remember: false,
         })
         .unwrap()
@@ -28,7 +98,7 @@ fn create_shell(c: &mut dct::client::Client, dir: &std::path::Path) -> u32 {
     }
 }
 
-fn screen_text(c: &mut dct::client::Client, id: u32) -> String {
+fn screen_text(c: &mut Client, id: u32) -> String {
     match c.call(Request::Screen { id }).unwrap() {
         Response::Screen { lines, .. } => lines
             .iter()
@@ -38,22 +108,16 @@ fn screen_text(c: &mut dct::client::Client, id: u32) -> String {
     }
 }
 
-/// 等 shell 的提示符画出来。**不认具体的提示符字符**——zsh 是 `%`、bash 是
-/// `$`，而这里跑的是用户自己的登录 shell。等「屏幕上有了非空白内容」就够了，
-/// 目的只是别在提示符出来之前就往里灌字（那些字会被吞掉）。
-fn wait_for_prompt(c: &mut dct::client::Client, id: u32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if !screen_text(c, id).trim().is_empty() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "shell 的提示符一直没出来");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// 等测试 shell 的提示符画出来。跟原来那版不一样的地方是：这里不用再猜
+/// 「随便什么非空白内容」——`test_shell_profile()` 把 `PS1` 钉死成了
+/// `PROMPT`，直接等这一句话，比“非空白”更准，也不会被半行没画完的回显
+/// 骗过去。等的理由不变：提示符出来之前发的字会被吞掉。
+fn wait_for_prompt(c: &mut Client, id: u32) {
+    wait_for(c, id, PROMPT);
 }
 
 /// 等屏幕上出现某段文字。PTY 是异步的，写进去到画出来隔着几轮调度。
-fn wait_for(c: &mut dct::client::Client, id: u32, needle: &str) -> String {
+fn wait_for(c: &mut Client, id: u32, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let s = screen_text(c, id);
@@ -72,7 +136,7 @@ fn wait_for(c: &mut dct::client::Client, id: u32, needle: &str) -> String {
 /// 「命令被执行了」的判据是它出现**两次**（一次是回显，一次是输出），所以
 /// 不能用 `wait_for`——回显那一次早就在屏幕上了，`wait_for` 会当场返回一张
 /// 回车之前的旧屏，于是这条测试无论回车送没送到都「通过」。
-fn wait_for_count(c: &mut dct::client::Client, id: u32, needle: &str, n: usize) -> String {
+fn wait_for_count(c: &mut Client, id: u32, needle: &str, n: usize) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let s = screen_text(c, id);
@@ -93,9 +157,9 @@ fn wait_for_count(c: &mut dct::client::Client, id: u32, needle: &str, n: usize) 
 /// 命令、把结果打印出来，才说明这一行被提交了。
 #[test]
 fn text_then_an_empty_input_submits_the_line() {
-    let h = common::start_daemon();
+    let (_home, sock) = start_daemon();
     let workdir = tempfile::tempdir().unwrap();
-    let mut c = h.client();
+    let mut c = Client::connect(&sock).unwrap();
     let id = create_shell(&mut c, workdir.path());
 
     // shell 起来、提示符画出来之前发的字会被吞掉
@@ -130,9 +194,9 @@ fn text_then_an_empty_input_submits_the_line() {
 /// 分支——`send_reply` 在 `body` 为空时只发一次 `Input`，一次都不能少。
 #[test]
 fn an_empty_input_on_its_own_is_a_bare_enter() {
-    let h = common::start_daemon();
+    let (_home, sock) = start_daemon();
     let workdir = tempfile::tempdir().unwrap();
-    let mut c = h.client();
+    let mut c = Client::connect(&sock).unwrap();
     let id = create_shell(&mut c, workdir.path());
     wait_for_prompt(&mut c, id);
 
