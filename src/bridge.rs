@@ -160,20 +160,29 @@ impl Bridge {
                 // `apply_phone_set_token` 那条「两次 lock() 必须是两条
                 // 分开的语句」的同类纪律。
                 drop(owner);
-                self.ch.set_destination(Some(msg.chat_id));
-                // **Critical 2 的同一条纪律，应用到这个回调上**——
-                // dct-phone-channel Task 5 fix round 2 的 Important：
-                // `record_pairing` 会在 `phone` 状态槽上重新检查
-                // `is_retired()`，但这个回调之前没有。真实的坏场景：
-                // `PhoneDisable` 在这条线程卡在这次 `poll()`（最长 25 秒）
-                // 的时候把它 retire 了；线程回来之后 `accept()` 依然认下
-                // 这个陌生人（内存里的 `owner`——反正这个 `Bridge` 马上
-                // 就要被丢弃，不影响任何人），但绝不能把它落盘：
-                // `persist_owner_hook` 会把这个 chat id 写进
-                // `PHONE_OWNER_KEY`，下次重启 `Bridge::new_with_owner`
-                // 会把它当成**新令牌**的主人接回来——合法用户的第一条
-                // 消息永远被 `Rejected`，页面却显示 `Paired`。
-                if !self.is_retired() {
+                // **Critical 2 的同一条纪律，这次应用到全部三个副作用上，
+                // 不是只应用到落盘那一个（dct-phone-channel Task 5 fix
+                // round 3 的 Minor）。** 真实的坏场景：`PhoneDisable` 在
+                // 这条线程卡在这次 `poll()`（最长 25 秒）的时候把它
+                // retire 了；线程回来之后 `accept()` 依然认下这个陌生人
+                // （内存里的 `owner`——反正这个 `Bridge` 马上就要被丢弃，
+                // 不影响任何人）。落盘那半之前已经查了 `is_retired()`，
+                // 但 `set_destination` 没查：结果是陌生人的 chat id 照样
+                // 被交给 `ch`，`poll_forever` 随后调的 `send_pairing_
+                // confirmation`（它自己没有 `is_retired()` 检查，见它的
+                // 文档注释——「配对已经是事实，一句问候没发出去不该撤销
+                // 配对」这条理由在这里不成立，因为配对本来就不该发生）
+                // 就照着这个刚设的目的地把「已配对」发给了那个陌生人。
+                // 落盘这半持久危害已经被之前那轮修复关严了，但这半
+                // "陌生人在配对窗口关闭的那一刻收到确认消息"的即时危害
+                // 没关——这正是 `unpair()` 自己那条注释想避免的"这个回调
+                // 什么时候该被信任要靠读两遍代码才能确认"的不对称，只是
+                // 换了一种形状。查一次，两个副作用共用同一个结果：不设
+                // 目的地，`Channel::send` 会因为「没有目的地」直接返回
+                // `Unreachable`，`send_pairing_confirmation` 什么都不发。
+                let already_retired = self.is_retired();
+                if !already_retired {
+                    self.ch.set_destination(Some(msg.chat_id));
                     (self.on_owner_changed)(Some(msg.chat_id));
                 }
                 Accepted::Paired(msg.chat_id)
@@ -1318,6 +1327,31 @@ mod tests {
         assert!(
             recover(log.lock()).is_empty(),
             "已经 retire 的 Bridge 绝不能把这次配对落盘——下次重启会把陌生人错误地接回来"
+        );
+    }
+
+    /// **fix round 3 的 Minor：同一条纪律，这次是 `set_destination`。**
+    /// 落盘那半已经被上面那条测试钉住了，但 `accept()` 曾经无条件调
+    /// `self.ch.set_destination(Some(msg.chat_id))`——已经 retire 的
+    /// `Bridge` 上，这一步依然会把陌生人的 chat id 交给 `ch`，
+    /// `poll_forever` 随后调的 `send_pairing_confirmation`（它自己没有
+    /// `is_retired()` 检查）就会照着这个刚设的目的地真的把「已配对」
+    /// 发给这个陌生人——落盘的持久危害关严了，但陌生人在配对窗口关闭的
+    /// 那一刻收到确认消息这个即时危害没关。这里直接测 `accept()` 这一层，
+    /// 不用真的走一遍 `poll_forever`/`send_pairing_confirmation`。
+    #[test]
+    fn accept_does_not_set_destination_once_retired() {
+        let ch = Arc::new(FakeChannel::default());
+        let bridge = Bridge::new(ch.clone());
+        bridge.retire();
+
+        let accepted = bridge.accept(&msg(111, "在吗"));
+
+        assert_eq!(accepted, Accepted::Paired(111), "内存里的判定不受影响");
+        assert!(
+            recover(ch.destinations.lock()).is_empty(),
+            "已经 retire 的 Bridge 绝不能把陌生人的 chat id 交给 ch——不然\
+             send_pairing_confirmation 会真的把「已配对」发给这个陌生人"
         );
     }
 
