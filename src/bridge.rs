@@ -481,6 +481,11 @@ mod tests {
             script.push_back(Err(ChannelError::Unreachable));
             script.push_back(Err(ChannelError::Unreachable));
             script.push_back(Ok(Vec::new()));
+            // 第三次失败紧跟在一次成功后面：如果 `attempt` 没有在那次成功
+            // 时清零，这次该睡的秒数会接着前面的 2 秒继续涨到 4 秒，而不是
+            // 重新从 1 秒数起——这是 `attempt = 0` 那一行唯一会被这条测试
+            // 揪出来的地方,少了它前两条断言（消费次数、终态原因）照样绿。
+            script.push_back(Err(ChannelError::Unreachable));
             script.push_back(Err(ChannelError::BadToken));
         }
         let bridge = Bridge::new(ch.clone());
@@ -489,11 +494,15 @@ mod tests {
 
         poll_forever(&bridge, &phone, &|d| recover(slept.lock()).push(d));
 
-        assert_eq!(*recover(ch.poll_calls.lock()), 4, "四次脚本都该被消费掉");
+        assert_eq!(*recover(ch.poll_calls.lock()), 5, "五次脚本都该被消费掉");
         assert_eq!(
             *recover(slept.lock()),
-            vec![Duration::from_secs(1), Duration::from_secs(2)],
-            "连续两次失败该是 1 秒、2 秒——退避没有在一次成功之后接着涨"
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            ],
+            "一次成功之后重新失败，退避必须从 1 秒重新数起，不能接着涨"
         );
         assert!(matches!(
             recover(phone.lock()).state,
