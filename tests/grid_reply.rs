@@ -78,7 +78,11 @@ fn start_daemon() -> (tempfile::TempDir, std::path::PathBuf) {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !sock.exists() {
-        assert!(Instant::now() < deadline, "守护进程没起来：{}", sock.display());
+        assert!(
+            Instant::now() < deadline,
+            "守护进程没起来：{}",
+            sock.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     (home, sock)
