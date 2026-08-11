@@ -667,6 +667,36 @@ mod tests {
         ));
     }
 
+    /// **Critical 1 的端到端验证，在 `poll_forever` 这一层，不只是
+    /// `discard_backlog` 自己的单元测试。** `discard_backlog_*` 那几条
+    /// 测试直接调用这个函数，看不出 `poll_forever` 里那句
+    /// `if !discard_backlog(...) { return; }` 有没有被删掉——如果被删了，
+    /// 那几条测试照样全绿。这条测试让"谁赢得了配对"本身成为证据：脚本
+    /// 让"积压里的陌生人"和"现在真正发消息的主人"是两个不同的 chat id，
+    /// 如果积压没被吃掉就直接进了主循环，`accept()` 会把陌生人 222 认成
+    /// 主人，而不是真正发消息的 111。
+    #[test]
+    fn poll_forever_discards_the_backlog_before_the_real_owner_can_pair() {
+        let ch = Arc::new(FakeChannel::default());
+        {
+            let mut script = recover(ch.poll_script.lock());
+            script.push_back(Ok(vec![msg(222, "几小时前的陌生人")])); // 积压
+            script.push_back(Ok(Vec::new())); // discard_backlog 追上"现在"
+            script.push_back(Ok(vec![msg(111, "在吗")])); // 真正的第一条消息
+            script.push_back(Err(ChannelError::BadToken));
+        }
+        let bridge = Bridge::new(ch.clone());
+        let phone = test_phone();
+
+        poll_forever(&bridge, &phone, &no_sleep());
+
+        assert_eq!(
+            *recover(ch.destinations.lock()),
+            vec![Some(111)],
+            "配对必须落在真正发消息的 111 上，不是积压里的陌生人 222"
+        );
+    }
+
     /// 网络问题（`worth_retrying() == true`）退避重试，不写 `Broken`，
     /// 不停线程——脚本用两次 `Unreachable` 之后一次成功再一次终态错误来
     /// 证明"重试之后真的还会再 poll()"，而不是第一次失败就放弃。脚本第
