@@ -161,7 +161,21 @@ impl Bridge {
                 // 分开的语句」的同类纪律。
                 drop(owner);
                 self.ch.set_destination(Some(msg.chat_id));
-                (self.on_owner_changed)(Some(msg.chat_id));
+                // **Critical 2 的同一条纪律，应用到这个回调上**——
+                // dct-phone-channel Task 5 fix round 2 的 Important：
+                // `record_pairing` 会在 `phone` 状态槽上重新检查
+                // `is_retired()`，但这个回调之前没有。真实的坏场景：
+                // `PhoneDisable` 在这条线程卡在这次 `poll()`（最长 25 秒）
+                // 的时候把它 retire 了；线程回来之后 `accept()` 依然认下
+                // 这个陌生人（内存里的 `owner`——反正这个 `Bridge` 马上
+                // 就要被丢弃，不影响任何人），但绝不能把它落盘：
+                // `persist_owner_hook` 会把这个 chat id 写进
+                // `PHONE_OWNER_KEY`，下次重启 `Bridge::new_with_owner`
+                // 会把它当成**新令牌**的主人接回来——合法用户的第一条
+                // 消息永远被 `Rejected`，页面却显示 `Paired`。
+                if !self.is_retired() {
+                    (self.on_owner_changed)(Some(msg.chat_id));
+                }
                 Accepted::Paired(msg.chat_id)
             }
             Some(o) if o == msg.chat_id => Accepted::FromOwner,
@@ -179,7 +193,16 @@ impl Bridge {
     pub fn unpair(&self) {
         *recover(self.owner.lock()) = None;
         self.ch.set_destination(None);
-        (self.on_owner_changed)(None);
+        // 同 `accept()` 那条 `is_retired()` 重新检查——`unpair()` 也可能
+        // 在跟 `PhoneDisable` 并发的路径上被调用（另一个连接手写的
+        // `PhoneUnpair`，在 `PhoneDisable` 已经 retire 了同一个 `Bridge`
+        // 之后才拿到锁）。清成 `None` 这个动作本身即使晚到也无害
+        // （`PhoneDisable` 已经删过一次 `PHONE_OWNER_KEY` 了，这里最多是
+        // 再删一次已经不存在的键），但跟 `accept()` 用同一条纪律,不留一个
+        // "这个回调什么时候该被信任"要靠读两遍代码才能确认的不对称。
+        if !self.is_retired() {
+            (self.on_owner_changed)(None);
+        }
     }
 
     /// 手机通知被整个关掉（`x`）。见 `retired` 字段上的文档注释。
@@ -346,11 +369,23 @@ fn send_pairing_confirmation(bridge: &Bridge, phone: &Mutex<PhoneStatus>) -> boo
 ///
 /// **做法**：反复用 `Duration::ZERO` 调 `poll()`——Telegram 只要 offset
 /// 之后还压着没确认的更新，不管请求里的 `timeout` 是多少都会立刻吐出来，
-/// 不会真的等——直到拿到一个空批次（追上了"现在"）才停。收到的内容一律
-/// 丢弃，**不经过 `accept()`**：这是丢弃，不是延迟处理，就算这批里混着
-/// 主人自己发的旧消息也一样丢——积压这个概念本身就意味着"过时"，Task 7
-/// 落地之后把它们当成"现在发生的事"处理，意味着几小时前的一句话被敲进
-/// 一个当下活着的会话。
+/// 不会真的等——直到拿到一批 `raw_len == 0` 的（追上了"现在"）才停。收到
+/// 的内容一律丢弃，**不经过 `accept()`**：这是丢弃，不是延迟处理，就算
+/// 这批里混着主人自己发的旧消息也一样丢——积压这个概念本身就意味着
+/// "过时"，Task 7 落地之后把它们当成"现在发生的事"处理，意味着几小时前
+/// 的一句话被敲进一个当下活着的会话。
+///
+/// **判"追上了现在"用 `raw_len`，不用 `messages.is_empty()`**——这是
+/// dct-phone-channel Task 5 fix round 2 的 Critical 修复：`raw_len` 是
+/// Telegram 这一批原始 update 的条数（贴纸、图片这些没有文字的更新也
+/// 算），`messages` 是过滤掉那些之后剩下的。一批全是贴纸的更新解析出来
+/// `messages` 是空的，但 Telegram 的游标已经越过了整批（单批最多 100
+/// 条）——如果这里看 `messages.is_empty()`，攻击者只需要知道公开的 bot
+/// 用户名：连发 100 张贴纸再发一条文字，第一次 `poll(ZERO)` 拿到的 100
+/// 条贴纸解析成 `[]`，会被误判成"没有积压了"，主循环随即打开给下一条
+/// ——也就是攻击者自己发的第一条真文字消息，配对窗口重新被打开，
+/// Critical 1 想关掉的那扇门又开了一条缝。见 `channel::Batch` 自己的
+/// 文档注释。
 ///
 /// 错误处理跟主循环共用同一套判断（`terminal_reason`/`backoff_for`/
 /// `record_terminal_error`）：网络问题退避重试，终态错误写 `Broken` 后
@@ -365,7 +400,7 @@ fn discard_backlog(bridge: &Bridge, phone: &Mutex<PhoneStatus>, sleep: &dyn Fn(D
             return false;
         }
         match bridge.ch.poll(Duration::ZERO) {
-            Ok(incoming) if incoming.is_empty() => return true,
+            Ok(b) if b.raw_len == 0 => return true,
             Ok(_) => attempt = 0, // 还有积压,继续吃,不退避
             Err(e) if e.worth_retrying() => {
                 attempt = attempt.saturating_add(1);
@@ -397,9 +432,9 @@ fn poll_forever(bridge: &Bridge, phone: &Mutex<PhoneStatus>, sleep: &dyn Fn(Dura
             return;
         }
         match bridge.ch.poll(POLL_TIMEOUT) {
-            Ok(incoming) => {
+            Ok(batch) => {
                 attempt = 0;
-                for m in incoming {
+                for m in batch.messages {
                     if bridge.is_retired() {
                         return;
                     }
@@ -465,6 +500,31 @@ mod tests {
         }
     }
 
+    /// 正常情形下的一批：`raw_len` 跟 `messages.len()` 一致——每一条原始
+    /// update 都带着文字。测 Critical 修复（积压里混着没有文字的更新）
+    /// 时不要用这个，用 `batch_with_raw_len`。
+    fn batch(messages: Vec<Incoming>) -> crate::channel::Batch {
+        let raw_len = messages.len();
+        crate::channel::Batch { messages, raw_len }
+    }
+
+    fn empty_batch() -> crate::channel::Batch {
+        crate::channel::Batch::default()
+    }
+
+    /// **专门为 Critical 修复准备的构造：`raw_len` 跟 `messages.len()`
+    /// 故意不一致。** 模拟一批全是贴纸/图片的原始 update——`parse_updates`
+    /// 会把它们全部过滤掉，`messages` 因此是空的，但 `raw_len` 反映的是
+    /// Telegram 真正吐出来的条数。`discard_backlog` 如果还在看
+    /// `messages.is_empty()` 判断"是不是追上了现在"，这种批次会被误判成
+    /// "没有积压了"，即使后面可能还压着上百条真正的消息。
+    fn batch_with_raw_len(raw_len: usize) -> crate::channel::Batch {
+        crate::channel::Batch {
+            messages: Vec::new(),
+            raw_len,
+        }
+    }
+
     /// 记录每一次调用的假渠道：`accept()`/轮询循环两组测试共用。
     /// `poll_script` 空了之后一律回 `Ok(空批次)`——这不是每条测试都要用到
     /// 的默认值，只是让"脚本比实际调用次数短"这种笔误不会连带炸穿别的
@@ -474,7 +534,7 @@ mod tests {
         destinations: Mutex<Vec<Option<i64>>>,
         sent: Mutex<Vec<String>>,
         send_result: Mutex<Option<Result<crate::channel::MsgId, ChannelError>>>,
-        poll_script: Mutex<VecDeque<Result<Vec<Incoming>, ChannelError>>>,
+        poll_script: Mutex<VecDeque<Result<crate::channel::Batch, ChannelError>>>,
         poll_calls: Mutex<u32>,
     }
 
@@ -484,7 +544,7 @@ mod tests {
             (*recover(self.send_result.lock())).unwrap_or(Ok(0))
         }
 
-        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+        fn poll(&self, _timeout: Duration) -> Result<crate::channel::Batch, ChannelError> {
             *recover(self.poll_calls.lock()) += 1;
             // 脚本耗尽之后回一个**终态**错误，不是 `Ok(空批次)`——空批次
             // 会让 `poll_forever` 立刻回到循环顶端再 `poll()` 一次，如果
@@ -642,8 +702,8 @@ mod tests {
     #[test]
     fn a_pairing_message_flips_phone_status_to_paired_and_sends_a_confirmation() {
         let ch = Arc::new(FakeChannel::default());
-        recover(ch.poll_script.lock()).push_back(Ok(Vec::new())); // discard_backlog: 没有积压
-        recover(ch.poll_script.lock()).push_back(Ok(vec![msg(111, "在吗")]));
+        recover(ch.poll_script.lock()).push_back(Ok(empty_batch())); // discard_backlog: 没有积压
+        recover(ch.poll_script.lock()).push_back(Ok(batch(vec![msg(111, "在吗")])));
         recover(ch.poll_script.lock()).push_back(Err(ChannelError::BadToken));
         let bridge = Bridge::new(ch.clone());
         let phone = test_phone();
@@ -680,9 +740,9 @@ mod tests {
         let ch = Arc::new(FakeChannel::default());
         {
             let mut script = recover(ch.poll_script.lock());
-            script.push_back(Ok(vec![msg(222, "几小时前的陌生人")])); // 积压
-            script.push_back(Ok(Vec::new())); // discard_backlog 追上"现在"
-            script.push_back(Ok(vec![msg(111, "在吗")])); // 真正的第一条消息
+            script.push_back(Ok(batch(vec![msg(222, "几小时前的陌生人")]))); // 积压
+            script.push_back(Ok(empty_batch())); // discard_backlog 追上"现在"
+            script.push_back(Ok(batch(vec![msg(111, "在吗")]))); // 真正的第一条消息
             script.push_back(Err(ChannelError::BadToken));
         }
         let bridge = Bridge::new(ch.clone());
@@ -706,10 +766,10 @@ mod tests {
         let ch = Arc::new(FakeChannel::default());
         {
             let mut script = recover(ch.poll_script.lock());
-            script.push_back(Ok(Vec::new())); // discard_backlog: 没有积压
+            script.push_back(Ok(empty_batch())); // discard_backlog: 没有积压
             script.push_back(Err(ChannelError::Unreachable));
             script.push_back(Err(ChannelError::Unreachable));
-            script.push_back(Ok(Vec::new()));
+            script.push_back(Ok(empty_batch()));
             // 第三次失败紧跟在一次成功后面：如果 `attempt` 没有在那次成功
             // 时清零，这次该睡的秒数会接着前面的 2 秒继续涨到 4 秒，而不是
             // 重新从 1 秒数起——这是 `attempt = 0` 那一行唯一会被这条测试
@@ -767,8 +827,8 @@ mod tests {
     #[test]
     fn being_blocked_right_after_pairing_produces_bot_blocked_and_stops() {
         let ch = Arc::new(FakeChannel::default());
-        recover(ch.poll_script.lock()).push_back(Ok(Vec::new())); // discard_backlog
-        recover(ch.poll_script.lock()).push_back(Ok(vec![msg(111, "在吗")]));
+        recover(ch.poll_script.lock()).push_back(Ok(empty_batch())); // discard_backlog
+        recover(ch.poll_script.lock()).push_back(Ok(batch(vec![msg(111, "在吗")])));
         *recover(ch.send_result.lock()) = Some(Err(ChannelError::Blocked));
         let bridge = Bridge::new(ch.clone());
         let phone = test_phone();
@@ -800,9 +860,9 @@ mod tests {
         let ch = Arc::new(FakeChannel::default());
         {
             let mut script = recover(ch.poll_script.lock());
-            script.push_back(Ok(Vec::new())); // discard_backlog
-            script.push_back(Ok(vec![msg(111, "在吗")]));
-            script.push_back(Ok(vec![msg(222, "我也要")]));
+            script.push_back(Ok(empty_batch())); // discard_backlog
+            script.push_back(Ok(batch(vec![msg(111, "在吗")])));
+            script.push_back(Ok(batch(vec![msg(222, "我也要")])));
             script.push_back(Err(ChannelError::BadToken));
         }
         let bridge = Bridge::new(ch.clone());
@@ -823,7 +883,7 @@ mod tests {
     #[test]
     fn discard_backlog_with_nothing_waiting_consumes_one_empty_batch() {
         let ch = Arc::new(FakeChannel::default());
-        recover(ch.poll_script.lock()).push_back(Ok(Vec::new()));
+        recover(ch.poll_script.lock()).push_back(Ok(empty_batch()));
         let bridge = Bridge::new(ch.clone());
         let phone = test_phone();
 
@@ -837,6 +897,60 @@ mod tests {
         assert!(recover(ch.sent.lock()).is_empty(), "不该发任何消息");
     }
 
+    /// **Critical 修复本身的直接验证（dct-phone-channel Task 5 fix round
+    /// 2）。** 一批"看起来空但其实不是"的批次——`raw_len` 是 100（比如
+    /// 100 张贴纸），`messages` 因为都没有文字被过滤成空。旧代码看
+    /// `messages.is_empty()`，会把这一批误判成"追上了现在"，只消费一次
+    /// 脚本就返回；修复之后必须靠 `raw_len` 判断，继续吃下一批。
+    #[test]
+    fn discard_backlog_does_not_treat_a_content_filtered_batch_as_caught_up() {
+        let ch = Arc::new(FakeChannel::default());
+        {
+            let mut script = recover(ch.poll_script.lock());
+            script.push_back(Ok(batch_with_raw_len(100))); // 100 张贴纸,messages 是空的
+            script.push_back(Ok(empty_batch())); // 这才是真的追上了
+        }
+        let bridge = Bridge::new(ch.clone());
+        let phone = test_phone();
+
+        assert!(discard_backlog(&bridge, &phone, &no_sleep()));
+
+        assert_eq!(
+            *recover(ch.poll_calls.lock()),
+            2,
+            "raw_len == 100 的那一批不该被当成'追上了'，哪怕 messages 是空的"
+        );
+    }
+
+    /// **这是 Critical 修复要挡住的那个完整攻击场景，端到端**：攻击者
+    /// 不需要抢在真正主人之前发消息——只需要知道公开的 bot 用户名，先发
+    /// 100 张贴纸（`raw_len` 不为零但 `messages` 是空的），再发一条真正
+    /// 的文字消息。旧代码会在吃第一批积压时就把"messages 是空的"误判成
+    /// "追上了现在"，直接把主循环打开给紧跟着来的那条攻击者消息——这条
+    /// 测试用旧逻辑会怎么错来反证新逻辑做对了什么：脚本让攻击者的文字
+    /// 消息也还在"积压"阶段（第二次 `poll(ZERO)` 才轮到它，`raw_len`
+    /// 依然不为零），必须被一起丢弃，不能进 `accept()`。
+    #[test]
+    fn poll_forever_does_not_let_a_sticker_flood_smuggle_a_stranger_into_pairing() {
+        let ch = Arc::new(FakeChannel::default());
+        {
+            let mut script = recover(ch.poll_script.lock());
+            script.push_back(Ok(batch_with_raw_len(100))); // 攻击者:100 张贴纸
+            script.push_back(Ok(batch(vec![msg(666, "在吗")]))); // 攻击者紧跟着的文字消息,仍在积压阶段
+            script.push_back(Ok(empty_batch())); // 真的追上了
+            script.push_back(Err(ChannelError::BadToken)); // 主循环第一次真正长轮询:没有新消息,终止测试
+        }
+        let bridge = Bridge::new(ch.clone());
+        let phone = test_phone();
+
+        poll_forever(&bridge, &phone, &no_sleep());
+
+        assert!(
+            recover(ch.destinations.lock()).is_empty(),
+            "666 藏在贴纸洪水后面的那条消息不该赢得配对——它在吃积压阶段就该被丢弃，不该进 accept()"
+        );
+    }
+
     /// **这是 Critical 1 的直接验证。** 积压里混着一条"陌生人"消息（如果
     /// 直接进主循环，`accept()` 会把它认成主人）——`discard_backlog` 必须
     /// 把它连同后面那条真正的、"现在"发生的配对消息一起吃掉的前半段丢弃
@@ -847,9 +961,9 @@ mod tests {
         let ch = Arc::new(FakeChannel::default());
         {
             let mut script = recover(ch.poll_script.lock());
-            script.push_back(Ok(vec![msg(222, "几小时前的陌生人")]));
-            script.push_back(Ok(vec![msg(333, "另一条旧消息")]));
-            script.push_back(Ok(Vec::new())); // 追上"现在"
+            script.push_back(Ok(batch(vec![msg(222, "几小时前的陌生人")])));
+            script.push_back(Ok(batch(vec![msg(333, "另一条旧消息")])));
+            script.push_back(Ok(empty_batch())); // 追上"现在"
         }
         let bridge = Bridge::new(ch.clone());
         let phone = test_phone();
@@ -897,7 +1011,7 @@ mod tests {
             let mut script = recover(ch.poll_script.lock());
             script.push_back(Err(ChannelError::Unreachable));
             script.push_back(Err(ChannelError::Unreachable));
-            script.push_back(Ok(Vec::new()));
+            script.push_back(Ok(empty_batch()));
         }
         let bridge = Bridge::new(ch.clone());
         let phone = test_phone();
@@ -1108,6 +1222,49 @@ mod tests {
         assert_eq!(*recover(log.lock()), vec![Some(111), None]);
     }
 
+    /// **fix round 2 的 Important。** 已经 retire 的 `Bridge` 上
+    /// `accept()` 依然可以在内存里认下一个陌生人（这个 `Bridge` 反正马上
+    /// 要被丢弃，不影响任何人），但绝不能把它落盘——`record_pairing` 已经
+    /// 学会了不碰 `phone`，`on_owner_changed` 之前没有同样的守卫：
+    /// `PhoneDisable` 在这条轮询线程卡在 `poll()` 里（最长 25 秒）时把它
+    /// retire 了，线程一回来 `accept()` 照样认下陌生人，`persist_owner_
+    /// hook` 会把它的 chat id 写进 `PHONE_OWNER_KEY`；下一次重启，
+    /// `Bridge::new_with_owner` 会把这个陌生人当成**新令牌**的主人接
+    /// 回来——合法用户的第一条消息永远被拒绝，页面却显示 `Paired`。
+    #[test]
+    fn accept_does_not_persist_the_owner_once_retired() {
+        let ch = Arc::new(FakeChannel::default());
+        let (log, cb) = owner_change_recorder();
+        let bridge = Bridge::new_with_owner(ch, None, cb);
+        bridge.retire();
+
+        let accepted = bridge.accept(&msg(111, "在吗"));
+
+        assert_eq!(accepted, Accepted::Paired(111), "内存里的判定不受影响");
+        assert!(
+            recover(log.lock()).is_empty(),
+            "已经 retire 的 Bridge 绝不能把这次配对落盘——下次重启会把陌生人错误地接回来"
+        );
+    }
+
+    /// 同一条纪律应用到 `unpair()`：已经 retire 的 `Bridge` 上取消配对，
+    /// 不该再触发持久化回调——即使这个具体场景是良性的（`PhoneDisable`
+    /// 早就删过一次 `PHONE_OWNER_KEY` 了），也不留一个"这个回调什么时候
+    /// 该被信任"要靠读两遍代码才能确认的不对称。
+    #[test]
+    fn unpair_does_not_notify_the_callback_once_retired() {
+        let ch = Arc::new(FakeChannel::default());
+        let (log, cb) = owner_change_recorder();
+        let bridge = Bridge::new_with_owner(ch, None, cb);
+        bridge.accept(&msg(111, "在吗"));
+        recover(log.lock()).clear();
+        bridge.retire();
+
+        bridge.unpair();
+
+        assert!(recover(log.lock()).is_empty());
+    }
+
     /// **恢复不是变化。** 从磁盘上已经持久化的主人 id 构造一个
     /// `Bridge`——`on_owner_changed` 不该被触发（重新把已经落盘的值写回
     /// 同一个键没有意义），但 `set_destination` 必须立刻被调一次：不然
@@ -1148,7 +1305,7 @@ mod tests {
         fn send(&self, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
             Ok(0)
         }
-        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+        fn poll(&self, _timeout: Duration) -> Result<crate::channel::Batch, ChannelError> {
             panic!("模拟渠道内部炸了")
         }
         fn set_destination(&self, _chat: Option<i64>) {}

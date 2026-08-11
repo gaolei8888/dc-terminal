@@ -858,7 +858,7 @@ mod tests {
     struct RecordingChannel {
         destinations: Mutex<Vec<Option<i64>>>,
         poll_calls: Mutex<u32>,
-        poll_script: Mutex<std::collections::VecDeque<Result<Vec<Incoming>, ChannelError>>>,
+        poll_script: Mutex<std::collections::VecDeque<Result<crate::channel::Batch, ChannelError>>>,
     }
 
     impl Channel for RecordingChannel {
@@ -866,7 +866,7 @@ mod tests {
             Ok(0)
         }
 
-        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+        fn poll(&self, _timeout: Duration) -> Result<crate::channel::Batch, ChannelError> {
             *recover(self.poll_calls.lock()) += 1;
             // 跟 `bridge.rs::FakeChannel` 同一个理由：脚本耗尽必须回一个
             // 终态错误，不能回空批次——不然一个没预备脚本的测试会让轮询

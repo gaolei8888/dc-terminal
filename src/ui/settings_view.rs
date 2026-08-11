@@ -365,21 +365,28 @@ mod tests {
     /// **不能靠巧合过关。** 上一条测试连不上真守护进程，`fetch_phone_status`
     /// 断线时的兜底恰好也是 `Off`——如果这一支被悄悄改成直接写死
     /// `PhoneStatus { state: Off, .. }`、压根不去问守护进程，上一条测试
-    /// 照样通过。起一个真守护进程，提前塞一个令牌进它的 `secrets.toml`
-    /// （`daemon.rs` 见到它会报 `WaitingForPairing`），确认这里拿到的是
-    /// 这个真答案，才能证明这一支真的调用了 `fetch_phone_status`，不是
-    /// 现编了一个巧合相等的默认值。
+    /// 照样通过。起一个真守护进程，确认这里拿到的是这个真答案，才能证明
+    /// 这一支真的调用了 `fetch_phone_status`，不是现编了一个巧合相等的
+    /// 默认值。
+    ///
+    /// **只塞 `PHONE_BOT_KEY`，不塞令牌**——dct-phone-channel Task 5 fix
+    /// round 2 修的：塞令牌会让 `daemon.rs::run_with_manager` 真的起一条
+    /// 轮询线程去打 `api.telegram.org`（Task 5 之前这里不存在，塞令牌是
+    /// 安全的；Task 5 之后 `initial_phone_status` 见到令牌就会启动一个
+    /// Bridge），每次跑这条测试都在拿一个假令牌打真实网络，而这条测试
+    /// 根本不需要 `state` 是 `WaitingForPairing` 才能证明"真的连到了
+    /// 守护进程"——`bot` 字段单独就够：一个断线兜底或者硬编码默认值不可能
+    /// 知道 `pre-seeded-bot` 这个名字，`state` 停在 `Off`（没有令牌）不影响
+    /// 这条判别力。
     #[test]
     fn entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default() {
         use crate::client::Client;
-        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
+        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_BOT_KEY};
 
         let home = tempfile::tempdir().unwrap();
         let sock = home.path().join("daemon.sock");
-        // 必须在起 daemon 之前把令牌写好，理由同 `ui::mod::tests::
-        // fetch_phone_status_reaches_the_real_daemon_when_connected`。
         let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
-        disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
+        disk.set(PHONE_BOT_KEY, "pre-seeded-bot").unwrap();
 
         super::super::start_daemon_at(&sock);
 
@@ -401,9 +408,9 @@ mod tests {
 
         match &app.view {
             View::Phone { status, .. } => assert_eq!(
-                status.state,
-                crate::proto::PhoneState::WaitingForPairing,
-                "该拿到守护进程的真答案"
+                status.bot.as_deref(),
+                Some("pre-seeded-bot"),
+                "该拿到守护进程的真答案（bot 名字），不是断线兜底或者硬编码默认值"
             ),
             _ => panic!("选中「手机通知」按 Enter 应该打开 View::Phone"),
         }

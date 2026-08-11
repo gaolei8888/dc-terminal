@@ -20,6 +20,27 @@ pub struct Incoming {
     pub chat_id: i64,
 }
 
+/// 一次 `poll()` 拿回来的一整批。**`raw_len` 和 `messages.len()` 不相等
+/// 是正常的，不是 bug**——`raw_len` 是这一批里原始 update 的条数（贴纸、
+/// 图片、进群通知……不带文字的那些也算），`messages` 是从里面挑出来的、
+/// 真正带文字的那些。
+///
+/// **这是 dct-phone-channel Task 5 fix round 2 的 Critical 修复**：
+/// `bridge.rs::discard_backlog` 曾经只看 `messages.is_empty()` 判断"是不
+/// 是追上了现在"——一批全是贴纸的更新会解析成一个空 `Vec<Incoming>`，
+/// 但 Telegram 的游标已经往前挪过了这一整批（单批最多 100 条），后面
+/// 完全可能还压着没吃完的积压。攻击者只需要知道公开的 bot 用户名：连发
+/// 100 张贴纸再发一条文字，第一次 `poll(ZERO)` 拿到的 100 条贴纸解析成
+/// `[]`，`discard_backlog` 就会误判"追上了"，把主循环打开给下一条—— 也就是
+/// 攻击者自己发的第一条真文字消息。`raw_len == 0` 才是"这一批之后真的
+/// 没有更多"的唯一可靠信号，`discard_backlog` 现在靠它，不靠
+/// `messages.is_empty()`。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Batch {
+    pub messages: Vec<Incoming>,
+    pub raw_len: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelError {
     /// 网络问题。**重试有意义。**
@@ -47,8 +68,11 @@ impl ChannelError {
 pub trait Channel: Send + Sync {
     /// 发一条，返回渠道那边的消息 id。
     fn send(&self, text: &str) -> Result<MsgId, ChannelError>;
-    /// 取新消息，最多阻塞 `timeout`。没有新消息就返回空 `Vec`，不是错误。
-    fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError>;
+    /// 取新一批，最多阻塞 `timeout`。没有新消息就是 `raw_len == 0` 的
+    /// `Batch`，不是错误——见 `Batch` 自己的文档注释：`raw_len` 和
+    /// `messages.len()` 不相等是正常的，`raw_len` 才是"这一批之后还有没有
+    /// 更多"的可靠信号。
+    fn poll(&self, timeout: Duration) -> Result<Batch, ChannelError>;
     /// 出站该发去哪——把 `Incoming.chat_id` 那个词汇表用在出站方向上，
     /// 这样才对称。`None` = 还不知道发给谁，`send` 该报 `Unreachable`
     /// （worth_retrying：一旦这里被设置过就会成功）。

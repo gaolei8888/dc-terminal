@@ -3,7 +3,7 @@
 //! 它被排在第一个渠道，全部理由是 `getUpdates` 长轮询让 NAT 后面的笔记本
 //! 不需要服务器、不需要公网域名、不需要隧道。**别把这条优势改掉。**
 
-use super::{Channel, ChannelError, Incoming, MsgId};
+use super::{Batch, Channel, ChannelError, Incoming, MsgId};
 use crate::session::recover;
 use std::time::Duration;
 
@@ -201,6 +201,23 @@ fn max_update_id(body: &str) -> Option<i64> {
         .max()
 }
 
+/// 这一批原始 update 的条数——**在 `parse_updates` 过滤掉没有文字的更新
+/// 之前**。`discard_backlog`（dct-phone-channel Task 5 fix round 2 的
+/// Critical 修复）靠这个数字判断"这一批之后还有没有更多"，不能靠
+/// `parse_updates` 的结果长度：一批全是贴纸/图片的更新解析出来是空
+/// `Vec<Incoming>`，但 Telegram 的游标已经越过了这一整批（单批最多 100
+/// 条），空 `Vec` 不代表"没有积压了"，只代表"这一批没有文字"。同
+/// `max_update_id` 一样故意直接扫原始 body，不经过 `parse_updates` 的
+/// 结果。`body` 走到这里之前已经被 `parse_updates`/`max_update_id` 证明
+/// 过是"一批（可能是空的）更新"的形状，拿不到就当 0——那种情况下
+/// `parse_updates` 早已经在上一步 `?` 出去了，这里只是防御性的兜底。
+fn raw_update_count(body: &str) -> usize {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("result").and_then(|r| r.as_array()).map(Vec::len))
+        .unwrap_or(0)
+}
+
 impl Channel for Telegram {
     fn send(&self, text: &str) -> Result<MsgId, ChannelError> {
         // 没被告知过目的地就没有地方可发——见 `destination` 字段上的注释。
@@ -223,7 +240,7 @@ impl Channel for Telegram {
         parse_send_result(&resp).map_err(|e| reinterpret(e, status))
     }
 
-    fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+    fn poll(&self, timeout: Duration) -> Result<Batch, ChannelError> {
         let secs = timeout.as_secs();
         let offset = *recover(self.offset.lock());
         let url = format!("{}?offset={offset}&timeout={secs}", self.url("getUpdates"));
@@ -233,7 +250,8 @@ impl Channel for Telegram {
         let (status, body) =
             (self.send)(&url, "", net_timeout).map_err(|_| ChannelError::Unreachable)?;
 
-        let incoming = parse_updates(&body).map_err(|e| reinterpret(e, status))?;
+        let messages = parse_updates(&body).map_err(|e| reinterpret(e, status))?;
+        let raw_len = raw_update_count(&body);
 
         // 游标只在这批确实有 update_id 时才前进；`?` 已经在上面处理过
         // ok:false 的情况，这里的 body 一定是「一批（可能是空的）更新」。
@@ -241,7 +259,7 @@ impl Channel for Telegram {
             *recover(self.offset.lock()) = max_id + 1;
         }
 
-        Ok(incoming)
+        Ok(Batch { messages, raw_len })
     }
 
     fn set_destination(&self, chat: Option<i64>) {
@@ -496,7 +514,15 @@ mod tests {
         let tg = Telegram::with_transport("tok", fake.sender());
 
         let got = tg.poll(Duration::from_secs(25)).unwrap();
-        assert!(got.is_empty(), "贴纸没有 text，不该出现在 Incoming 里");
+        assert!(
+            got.messages.is_empty(),
+            "贴纸没有 text，不该出现在 Incoming 里"
+        );
+        assert_eq!(
+            got.raw_len, 1,
+            "raw_len 该数原始 update 的条数，不该跟着 messages 一起被过滤成 0——\
+             discard_backlog 就是靠这个数字区分「这一批全是贴纸」和「真的没有更多了」"
+        );
 
         tg.poll(Duration::from_secs(25)).unwrap();
         let calls = fake.calls.lock().unwrap();
@@ -574,7 +600,11 @@ mod tests {
         let tg = Telegram::with_transport("tok", fake.sender());
 
         let got = tg.poll(Duration::from_secs(25)).unwrap();
-        assert_eq!(got.len(), 1, "消息本身照样要交给调用方——拒绝是 bridge 的事");
+        assert_eq!(
+            got.messages.len(),
+            1,
+            "消息本身照样要交给调用方——拒绝是 bridge 的事"
+        );
 
         // send 依然没有目的地：poll 没有替我们做这个决定。
         assert_eq!(tg.send("hi").unwrap_err(), ChannelError::Unreachable);
