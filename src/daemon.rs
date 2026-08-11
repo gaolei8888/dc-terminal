@@ -776,7 +776,18 @@ fn handle(
                     // `bridge.rs` 那几个 `record_*` 函数的 `is_retired()`
                     // 重新检查是这半套修复的另一半，见它们各自的文档
                     // 注释。
-                    if let Some(bridge) = recover(bridge_slot.lock()).take() {
+                    //
+                    // **`bridge_slot.lock()` 的结果先落进一个命名变量**——
+                    // 同 `run_with_manager` 开机那处、`Request::PhoneUnpair`
+                    // 那处一样的防御写法，理由见那两处的详细注释：`if let`
+                    // 判别式里创建的临时 `MutexGuard` 会存活到整个块结束，
+                    // 不是判别式求值完就释放。这一处今天恰好安全——块体
+                    // 只调用 `bridge.retire()`，不会再去锁 `bridge_slot`——
+                    // 但那是「读代码才能确认没事」，不是「结构上不可能出
+                    // 事」，跟另外两处曾经真锁死过的写法是同一个隐患形状，
+                    // 没有理由单独留着不改。
+                    let bridge = recover(bridge_slot.lock()).take();
+                    if let Some(bridge) = bridge {
                         bridge.retire();
                     }
                     let mut ph = recover(phone.lock());
