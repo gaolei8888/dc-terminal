@@ -2741,21 +2741,30 @@ mod tests {
     /// 里塞一个令牌（`initial_phone_status` 见到它就该报 `WaitingForPairing`，
     /// 见 `daemon.rs` 里对应的测试），确认 `fetch_phone_status` 传回来的
     /// 正是这个真答案，跟传进去的 `fallback`（特意设成 `Off`）不一样。
+    /// **只塞 `PHONE_BOT_KEY`，不塞令牌**——dct-phone-channel Task 5 fix
+    /// round 2 修的：塞令牌会让 `daemon.rs::run_with_manager` 见到磁盘上
+    /// 有令牌就真的起一条轮询线程去打 `api.telegram.org`（Task 5 之前这里
+    /// 不存在，塞令牌是安全的；Task 5 之后 `initial_phone_status` 见到
+    /// 令牌就会启动一个 `Bridge`）。用的是个假令牌，Telegram 会答 404，
+    /// `error_from` 把非 401/403 的一切都归成 `Unreachable`，而
+    /// `Unreachable` 是 `worth_retrying()`——那条线程会在测试进程剩下的
+    /// 生命周期里带着指数退避一直重试，不管这台机器连不连得上网都一样。
+    /// `bot` 字段单独就够证明"真的连到了守护进程"：一个断线兜底或者硬
+    /// 编码默认值不可能知道 `pre-seeded-bot` 这个名字，`state` 停在 `Off`
+    /// （没有令牌，也就没有 Bridge）不影响这条判别力，跟
+    /// `settings_view.rs::entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default`
+    /// 是同一处修复。
     #[test]
     fn fetch_phone_status_reaches_the_real_daemon_when_connected() {
         use crate::client::Client;
-        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
+        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_BOT_KEY};
 
         let home = tempfile::tempdir().unwrap();
         let sock = home.path().join("daemon.sock");
-        // 必须在起 daemon 之前把令牌写好：daemon 启动时会读一次
+        // 必须在起 daemon 之前把 bot 名字写好：daemon 启动时会读一次
         // secrets.toml 去算 `initial_phone_status`（见 daemon.rs::run_with_manager）。
-        // **不打网络**——`initial_phone_status` 只读磁盘，删掉
-        // `spawn_phone_startup_refresh` 之后这条测试不再跟一次真实的
-        // `getMe` 请求赛跑（dct-phone-channel Task 4 fix round 1 的
-        // Critical 3）。
         let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
-        disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
+        disk.set(PHONE_BOT_KEY, "pre-seeded-bot").unwrap();
 
         start_daemon_at(&sock);
 
@@ -2776,9 +2785,9 @@ mod tests {
         let got = fetch_phone_status(&mut app, fallback);
 
         assert_eq!(
-            got.state,
-            crate::proto::PhoneState::WaitingForPairing,
-            "连得上时该拿到守护进程的真答案，不是传进去的 fallback"
+            got.bot.as_deref(),
+            Some("pre-seeded-bot"),
+            "连得上时该拿到守护进程的真答案（bot 名字），不是传进去的 fallback 或者硬编码默认值"
         );
     }
 
