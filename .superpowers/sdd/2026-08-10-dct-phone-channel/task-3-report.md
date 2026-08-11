@@ -1,6 +1,7 @@
 # Task 3 report: settings page becomes a list of settings
 
-**Status:** complete. Commit `badc974` on `feat/phone-channel` (base `1a5344c`).
+**Status:** complete, fix round 1 addressed. Commits `badc974` (original) and
+`adacd36` (fix round 1) on `feat/phone-channel` (base `1a5344c`).
 
 ## Brief inaccuracies found, and what I did about them
 
@@ -224,3 +225,95 @@ caught immediately by the guard test itself.
   remembering if any later task's fixtures or verification scripts spin up
   a real daemon under a long temp path (the repo's own scratchpad path is
   long enough to trigger it).
+
+## Fix round 1 (commit `adacd36`)
+
+Coordinator review: spec ✅, quality Approved, four items to fix. Also
+corrected my own claim in this report's mutation table: the length
+coincidence (`SettingsItem::all().len() == Lang::all().len() == 2`) does
+**not** end when Task 4 lands — Task 4 adds `View::Phone`, a separate page,
+not a third settings row. The blind spot outlives Task 4 and only closes
+when a third language or a third settings entry shows up, whichever comes
+first.
+
+### 1. Important — `idle_help` was not level-aware (`escape_hint` was)
+
+`src/ui/view.rs`: `View::Settings { .. } => help_items(...)` returned
+`("Esc", Key::Cancel)` for both the top-level list and the language
+sublist, so inside the sublist the bottom bar read left `Ctrl+Q 回设置` /
+right `Esc 取消` — the two halves disagreed about where Esc goes, exactly
+the failure mode this file's own `EnterSecret { return_to_settings: true }`
+comment names: 「两处文案哪怕只有半句话不一致，都是「底栏说什么就得真能做到什么」
+这条原则被破坏了一半」.
+
+Added a `View::Settings { lang: Some(_), .. }` arm before the existing one,
+using the already-existing `Key::BackToSettingsWord` string ("返回设置" /
+"back to settings" — the same string `EnterSecret`'s equivalent arm uses),
+placed and commented to mirror that precedent exactly. Test:
+`ui::view::tests::language_list_idle_help_also_says_back_to_settings`,
+mirroring `secret_view_from_settings_idle_help_also_says_back_to_settings`.
+Mutation-verified: deleting the new arm turns the test red (`assertion
+failed: 底栏说什么就得真能做到什么：↑↓ 选择  Enter 确认  Esc 取消`).
+
+### 2. Minor — length-source tripwire
+
+Added to `src/ui/settings_view.rs`'s test module, verbatim per the
+coordinator's spec:
+
+```rust
+#[test]
+fn the_length_coincidence_that_hides_a_wrong_move_sel_n_source() {
+    assert_eq!(SettingsItem::all().len(), Lang::all().len(), "...");
+}
+```
+
+This doesn't make mutation #2 catchable today — nothing can, given the
+coincidence — but it turns "silently uncatchable forever" into "loudly
+uncatchable until the day it isn't," which is the whole point: the day
+someone adds a third `SettingsItem` or a third `Lang`, this test goes red
+and *that* is the forcing function to finally write the "arrow keys reach
+the last item" test the length parity currently makes pointless.
+
+### 3. Minor — `Key::Phone` English text
+
+`src/i18n.rs`: `en: "phone"` → `en: "phone notifications"`, matching what
+`zh: "手机通知"` actually says (a non-programmer reading "phone" alone
+has no idea what pressing Enter on that row does). No test changes needed
+— existing i18n guards (`no_english_entry_contains_han_characters`,
+`no_entry_is_empty_in_either_language`) already cover the new string.
+
+### 4. Minor — `escape_hint_cols_fits_every_view` missing the sublist case
+
+`src/ui/mod.rs`: added `View::Settings { state: ListState::default(), lang:
+Some(ListState::default()) }` to the view list, mirroring how
+`View::PickProject`'s two `typing_path` states are both already listed
+there. No live risk today (the sublist's string happens to already be
+measured via the `EnterSecret` case using the same `Key::BackToSettings`),
+but it closes the gap for the moment the sublist gets its own distinct hint
+string.
+
+### Not addressed (by design — recorded by the coordinator as a merge gate, not mine to fix)
+
+The phone row is a visible, selectable dead end while the bottom bar
+advertises `Enter 确认`, technically violating this file's own 「屏幕上写着
+做不到的操作比不写更糟」 rule. Correct for Task 3 in isolation; the
+coordinator is tracking it so the branch cannot reach `main` before Task 4
+gives the row something real to do.
+
+### Re-verification after fix round 1
+
+```
+$ cargo test --lib ui::view -- --test-threads=1      # 95 passed
+$ cargo test --lib ui::settings_view -- --test-threads=1  # 12 passed
+$ cargo test --lib ui::tests:: -- --test-threads=1    # 64 passed
+$ cargo test --lib i18n:: -- --test-threads=1         # 18 passed
+$ cargo test --lib -- --test-threads=1
+test result: ok. 740 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ cargo fmt --check   # exit 0
+$ cargo clippy --all-targets   # no warnings
+$ git diff --check    # clean
+```
+
+740 lib tests, up from 738 (the two new tests:
+`language_list_idle_help_also_says_back_to_settings` and
+`the_length_coincidence_that_hides_a_wrong_move_sel_n_source`).
