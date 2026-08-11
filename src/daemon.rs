@@ -102,9 +102,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let saved_token = recover(secrets.lock())
         .get(PHONE_TOKEN_KEY)
         .map(str::to_string);
-    let saved_owner = recover(secrets.lock())
-        .get(PHONE_OWNER_KEY)
-        .and_then(|s| s.parse::<i64>().ok());
+    let sec = recover(secrets.lock());
+    let saved_owner = parse_saved_owner(&sec);
+    drop(sec);
     if let Some(token) = saved_token {
         start_phone_bridge(
             Arc::new(Bridge::new_with_owner(
@@ -206,6 +206,20 @@ fn persist_owner_hook(secrets: Arc<Mutex<SecretStore>>) -> Box<dyn Fn(Option<i64
     })
 }
 
+/// `PHONE_OWNER_KEY` 唯一的解析点。**`initial_phone_status` 和
+/// `run_with_manager` 曾经各自解析这个键、用两条不同的规则**：
+/// `initial_phone_status` 只看原始字符串在不在（`Option<&str>::is_some()`），
+/// `run_with_manager` 额外要求它能 `.parse::<i64>()` 成功。两条规则在正常
+/// 情况下（唯一的写入点 `persist_owner_hook` 永远写 `id.to_string()`）永远
+/// 一致，但一份手改过或者损坏的 `secrets.toml` 能让它们分道扬镳：解析失败
+/// 时 `run_with_manager` 会建一个 `owner: None` 的 `Bridge`——配对窗口重新
+/// 打开，任何人都能抢——而 `initial_phone_status` 只看见字符串存在，照样
+/// 报 `Paired`，用户拿不到窗口重开的任何信号。现在两边共用这一个函数，
+/// 不可能再分歧。
+fn parse_saved_owner(sec: &SecretStore) -> Option<i64> {
+    sec.get(PHONE_OWNER_KEY).and_then(|s| s.parse::<i64>().ok())
+}
+
 /// 手机通知刚启动时的状态：有没有存过令牌决定 `Off` 还是
 /// `WaitingForPairing`/`Paired`；bot 名字、主人 id 直接从磁盘读
 /// （`apply_phone_set_token`/`bridge.rs` 的 `on_owner_changed` 分别在
@@ -224,7 +238,13 @@ fn persist_owner_hook(secrets: Arc<Mutex<SecretStore>>) -> Box<dyn Fn(Option<i64
 fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
     let sec = recover(secrets.lock());
     let has_token = sec.get(PHONE_TOKEN_KEY).is_some();
-    let owner = sec.get(PHONE_OWNER_KEY).map(str::to_string);
+    // `parse_saved_owner`, not a raw `sec.get(PHONE_OWNER_KEY)` — see that
+    // function's doc comment for why the two must never disagree: this is
+    // the same parse `run_with_manager` uses to decide what `Bridge::
+    // new_with_owner` actually gets, so a garbled owner value produces
+    // `WaitingForPairing` here too, not a `Paired` the real `Bridge`
+    // disagrees with.
+    let owner = parse_saved_owner(&sec);
     PhoneStatus {
         state: if !has_token {
             PhoneState::Off
@@ -234,7 +254,7 @@ fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
             PhoneState::WaitingForPairing
         },
         bot: sec.get(PHONE_BOT_KEY).map(str::to_string),
-        owner,
+        owner: owner.map(|id| id.to_string()),
     }
 }
 
@@ -1581,6 +1601,35 @@ mod tests {
         assert_eq!(status.state, PhoneState::Paired);
         assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
         assert_eq!(status.owner.as_deref(), Some("111"));
+    }
+
+    /// A `PHONE_OWNER_KEY` that fails to parse as `i64` must read as "no
+    /// owner", the same as `run_with_manager` would treat it when building
+    /// the real `Bridge` (`parse_saved_owner` returns `None`, so
+    /// `Bridge::new_with_owner` gets `owner: None` and the pairing window is
+    /// open to anyone). Before both call sites shared `parse_saved_owner`,
+    /// `initial_phone_status` only checked whether the raw string existed —
+    /// so a corrupted value would report `Paired` here while the real
+    /// `Bridge` had no owner at all, and the user would get no signal that
+    /// the pairing window had reopened. Only reachable via a hand-edited or
+    /// corrupted `secrets.toml`: the only writer, `persist_owner_hook`,
+    /// always writes `id.to_string()`.
+    #[test]
+    fn initial_phone_status_treats_an_unparseable_owner_as_no_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SecretStore::load(&dir.path().join("secrets.toml"));
+        store.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        store.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
+        store.set(PHONE_OWNER_KEY, "not-a-chat-id").unwrap();
+        let secrets = Mutex::new(store);
+        let status = initial_phone_status(&secrets);
+        assert_eq!(
+            status.state,
+            PhoneState::WaitingForPairing,
+            "解析不出来的主人 id 必须当成没有主人——跟真实 Bridge 会拿到\
+             的 owner: None 保持一致，不能报 Paired 骗用户窗口没重开"
+        );
+        assert!(status.owner.is_none());
     }
 
     /// 令牌好使：落盘、内存状态推进到 `WaitingForPairing`、主人清空
