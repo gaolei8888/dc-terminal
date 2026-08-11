@@ -28,6 +28,7 @@ mod attach;
 mod board;
 mod grid;
 mod keys;
+mod phone;
 mod pick;
 mod secret;
 mod settings_view;
@@ -386,6 +387,44 @@ pub fn run(
             }
         }
 
+        // 手机通知页填令牌的后台验证结果，同上一段 `verify_rx` 一个道理：
+        // `Request::PhoneSetToken` 会打真网络（`getMe`），丢给后台线程跑，
+        // 这里每轮 `try_recv`。
+        if let Some(rx) = &app.phone_verify_rx {
+            if let Ok((sent_token, outcome)) = rx.try_recv() {
+                app.phone_verify_rx = None;
+                if let View::Phone {
+                    status,
+                    entry:
+                        Some(view::PhoneEntry {
+                            buf,
+                            phase: SecretPhase::Verifying,
+                        }),
+                } = app.view.clone()
+                {
+                    // 只有还是当初发起这次验证的那份输入，结果才有落点——
+                    // 用户可能已经 Esc 退出、甚至绕回来重新打过一遍。
+                    if buf == sent_token {
+                        app.view = match outcome {
+                            Ok(new_status) => View::Phone {
+                                status: new_status,
+                                entry: None,
+                            },
+                            Err(msg) => View::Phone {
+                                status,
+                                entry: Some(view::PhoneEntry {
+                                    buf,
+                                    phase: SecretPhase::Failed(msg),
+                                }),
+                            },
+                        };
+                    }
+                    // else：令牌对不上，这条结果对应一个用户已经离开的输入，扔了。
+                }
+                // else：视图已经不是「正在验证令牌」了，同样没有落点，扔了。
+            }
+        }
+
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
             match app.client().and_then(|c| c.call(Request::List)) {
@@ -592,6 +631,23 @@ pub fn run(
             }
         }
 
+        // 手机通知页轮询：配对是异步的（守护进程在后台等用户在 Telegram 上
+        // 发第一条消息），这一页的价值全在那一行状态会不会自己变——不轮询
+        // 的话，用户填完令牌就得手动来回切屏才能看到「等待配对」变成
+        // 「已连上」。只在 `entry.is_none()` 时轮询：正在填令牌/等验证结果
+        // 的这段时间，屏幕上该显示的是那次输入，不该被状态刷新打断。
+        if let View::Phone {
+            status,
+            entry: None,
+        } = app.view.clone()
+        {
+            let refreshed = fetch_phone_status(&mut app, status);
+            app.view = View::Phone {
+                status: refreshed,
+                entry: None,
+            };
+        }
+
         // 抓不抓鼠标不再只看「在不在会话里」：agent 没订阅鼠标的会话
         // （codex、shell）里抓着它，唯一的效果是把终端的拖选复制废掉，
         // 换来一个 PageUp/PageDown/End 已经能做的滚轮。
@@ -741,6 +797,7 @@ pub fn run(
                 View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
                 View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
                 View::Secrets { .. } => secret::handle_key(&mut app, key)?,
+                View::Phone { .. } => phone::handle_key(&mut app, key)?,
             }
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
@@ -1874,6 +1931,22 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
     }
 }
 
+/// 手机通知页要显示的状态。**失败时留在 `fallback`，不凭空捏造一个新状态**
+/// ——`Request::PhoneStatus` 在守护进程那侧是纯内存读，不打网络，唯一真会
+/// 失败的情形是断线本身；这时候陈旧数据（配合别处的红色边框，见
+/// `app.connected`）好过悄悄把一个正在等配对甚至已经配对的用户显示成
+/// 「还没连」。调用方决定 `fallback` 该是什么：第一次打开这一页用一个
+/// 干净的 `Off` 起步（还没有「原来」可言），周期轮询用上一帧的那份状态。
+pub(crate) fn fetch_phone_status(
+    app: &mut App,
+    fallback: crate::proto::PhoneStatus,
+) -> crate::proto::PhoneStatus {
+    match app.client().and_then(|c| c.call(Request::PhoneStatus)) {
+        Ok(Response::Phone(status)) => status,
+        _ => fallback,
+    }
+}
+
 /// 左段固定占的列数：最长的一条是会话视图的「Ctrl+Q（F2） 回看板」
 /// = 6 + 全角括号 2 + "F2" 2 + 全角括号 2 + 空格 1 + 中文 3 字 × 2 = 19。
 /// 其余各条都更短（「Ctrl+Q 回列表」13，「q 退出」7）。
@@ -2045,6 +2118,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
+        View::Phone { .. } => phone::draw(f, chunks[0], app),
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
@@ -3613,6 +3687,27 @@ mod tests {
                 buf: String::new(),
                 phase: view::SecretPhase::Typing,
                 return_to_settings: false,
+            },
+            // 手机通知也有两条退路（状态页回设置 / 输入框取消回状态页），
+            // 两种输出都要量，跟上面 `EnterSecret`/`PickProject` 是同一个道理。
+            View::Phone {
+                status: crate::proto::PhoneStatus {
+                    state: crate::proto::PhoneState::Off,
+                    bot: None,
+                    owner: None,
+                },
+                entry: None,
+            },
+            View::Phone {
+                status: crate::proto::PhoneStatus {
+                    state: crate::proto::PhoneState::Off,
+                    bot: None,
+                    owner: None,
+                },
+                entry: Some(view::PhoneEntry {
+                    buf: String::new(),
+                    phase: view::SecretPhase::Typing,
+                }),
             },
         ];
         // 两种语言都要量。常量是写死的，而译文长度各不相同——只量中文的话，

@@ -96,6 +96,21 @@ pub struct App {
     // 不必把这条防线押在"每个退出分支都记得清 receiver"这种容易漏改的
     // 纪律上。
     pub verify_rx: Option<std::sync::mpsc::Receiver<(String, String, VerifyOutcome)>>,
+    /// 手机通知页填令牌那次后台验证的结果。跟 `verify_rx` 同一个理由：
+    /// `Request::PhoneSetToken` 会打真网络（`getMe`），不能在按键循环里
+    /// 直接跑，丢给后台线程，主循环每轮 `try_recv`。
+    ///
+    /// 元组里带着发起这次验证时的**令牌本身**，不是只传结果——同
+    /// `verify_rx` 的道理：验证是异步的，结果送回来的这一刻，屏幕上未必
+    /// 还是发起验证时的那份输入（用户可能已经 Esc 退出、甚至重新打过一遍）。
+    /// 收的时候要现比对一遍令牌是否还是当初发起验证的那一份
+    /// （见 `ui/mod.rs` 收尾那段），对不上就扔掉，不套在一个不相干的输入上。
+    pub phone_verify_rx: Option<
+        std::sync::mpsc::Receiver<(
+            String,
+            std::result::Result<crate::proto::PhoneStatus, String>,
+        )>,
+    >,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
@@ -175,6 +190,7 @@ impl App {
             connected: true,
             need_sessions: true,
             verify_rx: None,
+            phone_verify_rx: None,
             lang,
             socket,
             start_dir: default_dir,

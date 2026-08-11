@@ -1,6 +1,5 @@
-//! 设置页：设置项列表，看板按 `l` 进。今天两项——语言（真管用）、
-//! 手机通知（Task 4 才接线，这里先占个位置，见 `handle_key` 里 `Phone`
-//! 分支的注释）。
+//! 设置页：设置项列表，看板按 `l` 进。今天两项——语言、手机通知，选中
+//! 「手机通知」进的是 `View::Phone`（见 `ui/phone.rs`）。
 //!
 //! 跟 `secret.rs` 的密钥页分开是两码事——那边管「哪个 agent 用哪把密钥」，
 //! 这里管界面本身怎么显示。
@@ -59,12 +58,22 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 };
             }
             Some(SettingsItem::Phone) => {
-                // TODO(task-4, dct-phone-channel): 手机通知页还没接线
-                // （`View::Phone` 是 Task 4 的产物）。Task 3 是纯 UI
-                // 重构、不掺任何手机通知逻辑，这一支特意留成空操作——
-                // 光标停在原地，什么都不发生。Task 4 把这一支换成
-                // `app.view = View::Phone { .. }` 就是它要接的线。
-                app.view = View::Settings { state, lang: None };
+                // 现查一次现在是什么状态——`Request::PhoneStatus` 在守护
+                // 进程那侧是纯内存读，不打网络，这次同步调用不会卡界面。
+                // 拿不到就从 `Off` 起步：这是第一次打开这一页，没有「原来」
+                // 可留（同 `fetch_phone_status` 文档注释里的约定）。
+                let status = super::fetch_phone_status(
+                    app,
+                    crate::proto::PhoneStatus {
+                        state: crate::proto::PhoneState::Off,
+                        bot: None,
+                        owner: None,
+                    },
+                );
+                app.view = View::Phone {
+                    status,
+                    entry: None,
+                };
             }
             // 下标越界（比如列表变短后光标停在旧位置）：什么都不做，
             // 比默默选中第一项更诚实——见 `SettingsItem::at` 的文档。
@@ -324,11 +333,13 @@ mod tests {
         }
     }
 
-    /// 顶层选中「手机通知」按 Enter：Task 4 才会给它接一个真视图，这里
-    /// 只保证不 panic、也不会误把用户带进语言子列表——占位归占位，行为
-    /// 不能是「什么都可能发生」。
+    /// 顶层选中「手机通知」按 Enter：这一屏不再是空操作（那是 Task 3 留的
+    /// 占位，见它自己的报告里「Placeholder left for Task 4」一节）——现在
+    /// 要真的钻进 `View::Phone`。`App::test_app()` 连不上真实守护进程，
+    /// `fetch_phone_status` 拿不到答案时退化成 `Off`，这条测试断言的正是
+    /// 这个诚实的兜底，不是「什么都可能发生」。
     #[test]
-    fn entering_the_phone_item_does_not_crash_or_open_the_language_list() {
+    fn entering_the_phone_item_opens_the_phone_view() {
         let (mut app, _dir) = App::test_app();
         let phone = SettingsItem::all()
             .iter()
@@ -338,10 +349,17 @@ mod tests {
 
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
 
-        assert!(
-            matches!(app.view, View::Settings { lang: None, .. }),
-            "手机通知还没接线，Enter 不该把光标带进语言子列表或崩掉"
-        );
+        match &app.view {
+            View::Phone { status, entry } => {
+                assert_eq!(
+                    status.state,
+                    crate::proto::PhoneState::Off,
+                    "连不上时退化成 Off"
+                );
+                assert!(entry.is_none(), "刚打开这一页不该带着一个正在填的输入框");
+            }
+            _ => panic!("选中「手机通知」按 Enter 应该打开 View::Phone"),
+        }
     }
 
     /// 方向键要能从「语言」走到「手机通知」。`move_sel_n` 的长度参数如果

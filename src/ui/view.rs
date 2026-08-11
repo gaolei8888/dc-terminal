@@ -6,7 +6,7 @@ use ratatui::widgets::ListState;
 
 use crate::i18n::{HelpItem, Lang};
 use crate::profile::ProfileStatus;
-use crate::proto::{ProfileEntry, SecretPrompt};
+use crate::proto::{PhoneState, PhoneStatus, ProfileEntry, SecretPrompt};
 use crate::session::SessionState;
 use crate::verify::VerifyOutcome;
 
@@ -178,6 +178,33 @@ pub(crate) enum View {
         /// 那一行。
         pending_delete: Option<String>,
     },
+    /// 手机通知设置页：看板 `l` → 设置 → 手机通知 进。**这一页存在的全部
+    /// 理由是 `status` 那一行状态**——配对是异步的，守护进程填完令牌就转去
+    /// 后台长轮询等用户在 Telegram 上发第一条消息，不给这件事一个去处，
+    /// 用户填完令牌就会对着一片空白发呆（见 `ui/phone.rs` 头上的注释）。
+    Phone {
+        status: PhoneStatus,
+        /// `Some` = 正在填令牌（`Enter` 开的）；`None` = 只是在看状态。
+        /// 复用 `SecretPhase`——Typing/Verifying/Failed 三态跟密钥输入
+        /// 完全对应，没必要另起一套，这也是任务本身点名要求的复用。
+        ///
+        /// **这个字段是这个任务自己加的**，不在原始接口清单里（那里只写了
+        /// `View::Phone { status: PhoneStatus }`）——跟 `View::Settings`
+        /// 加 `lang` 字段是同一类缺口：一个视图要分「看状态」和「正在填」
+        /// 两层,光有 `status` 装不下这件事，`Enter 填令牌` 这个按键描述
+        /// 本身就要求有地方存正在打的字。
+        entry: Option<PhoneEntry>,
+    },
+}
+
+/// 手机通知页正在填的令牌。跟 `EnterSecret` 分开是**类型**，不是**协议**：
+/// 提交时走的是 `Request::PhoneSetToken`，不是 `SetSecret`/`VerifySecret`
+/// ——`EnterSecret` 对没声明 `verify` 的 profile 会直接放行（见
+/// `pick_action`/`secret.rs`），套在这里会让任何输入都被当成有效令牌收下。
+#[derive(Clone)]
+pub(crate) struct PhoneEntry {
+    pub buf: String,
+    pub phase: SecretPhase,
 }
 
 /// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
@@ -287,11 +314,40 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
             state,
             lang: Some(_),
         } => Some(View::Settings { state, lang: None }),
+        // 正在填令牌时先退一层回到状态页，不是一步跳回设置列表——同
+        // `PickProject` 手输态那条特例一个道理，Ctrl+Q 每次只退一层。
+        View::Phone {
+            status,
+            entry: Some(_),
+        } => Some(View::Phone {
+            status,
+            entry: None,
+        }),
+        // 只是在看状态：退回设置页顶层列表，光标停在「手机通知」这一行——
+        // 用户是从那一行进来的，退出去理应还站在原地。
+        View::Phone { entry: None, .. } => Some(View::Settings {
+            state: settings_state_on_phone(),
+            lang: None,
+        }),
         // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
         // 退一层就是看板。顶层的 `Settings { lang: None }` 也在这条兜底里
         // ——它也只有一层，没被上面那条特例拦下的话就是回看板。
         _ => Some(View::Board),
     }
+}
+
+/// 顶层设置项列表，光标预选在「手机通知」这一行。手机通知页自己退出去
+/// （`Esc` 或 `Ctrl+Q`）、以及从设置页选中这一行进来，两处都要用同一份
+/// 构造，不能各拼一次——那样两处的「哪一行是手机通知」一旦不同步，
+/// 用户退出手机通知页会发现光标跳到了别的行上。
+pub(crate) fn settings_state_on_phone() -> ListState {
+    let mut s = ListState::default();
+    s.select(
+        SettingsItem::all()
+            .iter()
+            .position(|i| *i == SettingsItem::Phone),
+    );
+    s
 }
 
 /// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥；
@@ -1039,6 +1095,13 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // `BackToSettings`（"Ctrl+Q 回设置"）：这个词条已经泛指「回到某个
         // 设置页」，不专属密钥设置页，语言子列表要说的正是这句话。
         View::Settings { lang: Some(_), .. } => text(Key::BackToSettings, lang).to_string(),
+        // 正在填令牌：Esc 取消这次输入，退一层回状态页，不是直接回设置——
+        // 跟 `back_one_level` 里那条特例是同一件事的两半。写法同
+        // `View::Grid { reply: Some(_), .. }`：框开着时 `q` 只是个字母，
+        // 这里 Esc 才是真正生效的键，必须自己把键名拼上去。
+        View::Phone { entry: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
+        // 只是在看状态：Esc 回设置页顶层列表。
+        View::Phone { entry: None, .. } => text(Key::BackToSettings, lang).to_string(),
         // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
         // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
         // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
@@ -1329,6 +1392,45 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
+        // 验证中不接受任何操作，同 `EnterSecret` 的 `Verifying` 分支——
+        // 按键全被吞掉，只有 Esc 生效，底部不该继续说「Enter 确认」。
+        View::Phone {
+            entry:
+                Some(PhoneEntry {
+                    phase: SecretPhase::Verifying,
+                    ..
+                }),
+            ..
+        } => help_items(&[("", Key::Verifying)], lang),
+        View::Phone { entry: Some(_), .. } => help_items(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
+        // 只是在看状态：能按哪些键取决于当前是哪个 `PhoneState`——**能不能
+        // 按也决定写不写**（同本文件顶上 `idle_help` 文档注释里那条总纲）。
+        // `Enter`（填令牌）只在 `Off`/`Broken` 下有意义：`WaitingForPairing`/
+        // `Paired` 已经有一份能用的令牌了，Enter 在那两种状态下什么都不做。
+        // `r`（重新配对）/`x`（关掉）只在已经填过令牌（非 `Off`）时才有对象
+        // 可作用。
+        View::Phone {
+            status,
+            entry: None,
+        } => {
+            let mut items: Vec<(&'static str, Key)> = Vec::new();
+            if matches!(status.state, PhoneState::Off | PhoneState::Broken(_)) {
+                items.push(("Enter", Key::PhoneEnterToken));
+            }
+            if !matches!(status.state, PhoneState::Off) {
+                items.push(("r", Key::PhoneRepair));
+                items.push(("x", Key::PhoneTurnOff));
+            }
+            items.push(("Esc", Key::BackToSettingsWord));
+            help_items(&items, lang)
+        }
     }
 }
 
@@ -1427,6 +1529,15 @@ mod tests {
             phase,
             return_to_settings,
         };
+        let phone_status_of = |state| PhoneStatus {
+            state,
+            bot: Some("my_dct_bot".into()),
+            owner: Some("lei".into()),
+        };
+        let phone_status = |state| View::Phone {
+            status: phone_status_of(state),
+            entry: None,
+        };
         let mut typing = ProjectPicker::new(vec![], PathBuf::from("/"));
         typing.typing_path = Some(String::new());
 
@@ -1462,6 +1573,27 @@ mod tests {
                 entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
                 state: ListState::default(),
                 pending_delete: None,
+            },
+            // 手机通知：`entry: None` 下按键表随 `PhoneState` 变化（能不能
+            // 按也决定写不写，见 `idle_help` 里那条总纲），四种状态都要列到，
+            // 不然某一种状态自己漏写汉字键名这条守卫看不见。
+            phone_status(PhoneState::Off),
+            phone_status(PhoneState::WaitingForPairing),
+            phone_status(PhoneState::Paired),
+            phone_status(PhoneState::Broken("x".into())),
+            View::Phone {
+                status: phone_status_of(PhoneState::Off),
+                entry: Some(PhoneEntry {
+                    buf: String::new(),
+                    phase: SecretPhase::Typing,
+                }),
+            },
+            View::Phone {
+                status: phone_status_of(PhoneState::Off),
+                entry: Some(PhoneEntry {
+                    buf: String::new(),
+                    phase: SecretPhase::Verifying,
+                }),
             },
         ];
         // 加了 View 变体就往上面那张表里补一行——这条守卫只查得到被列出来的。
