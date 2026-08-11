@@ -270,3 +270,45 @@ No new test for this item: it's a refactor of a pattern already covered end-to-e
 ## Concerns
 
 - None new. The four items were independently scoped and don't interact with each other's code paths beyond both touching `Request::PhoneDisable`'s body (items 1, 3, 4 all touch it; verified the full `daemon::` and `bridge::` suites stay green after each commit, not just at the end).
+
+---
+
+# Fix round 3 (two Minors, final for this task)
+
+**Status:** complete. Two commits on `feat/phone-channel`, one per item (plus a stale-comment fix bundled into item 1's commit, same file, adjacent code):
+- `635f002` — `fix: stop discard_backlog from busy-spinning when the cursor stalls`
+- `b114eb6` — `fix: gate accept()'s set_destination the same as the disk write`
+
+Test summary: `cargo test --lib -- --test-threads=1` → 846 passed, 0 failed, 30.32s (up from 844: two new tests, one per item). `cargo fmt -- --check`, `cargo clippy --all-targets`, `git diff --check` all clean after both commits.
+
+## On the ordering pin (item 3, previous round) — a property I built in but didn't report
+
+The reviewer traced the lock sequence and confirmed something my report didn't call out: when `phone_disable_retires_before_it_ever_touches_the_phone_lock`'s assertion fires (old ordering), `phone_guard` is dropped during unwind and `recover()` tolerates the resulting poisoning — so a failing run releases the spawned `handle()` thread instead of leaving it blocked forever on `phone.lock()`. That's why the failing run in my mutation check completed in ~2.02s rather than hanging the process. I hadn't verified this consciously; it falls out of `recover()`'s existing poison-tolerant design (used everywhere else in this file) combined with Rust's unwind-drops-locals semantics. Worth stating explicitly for the next reader: the test is fail-closed at two levels, not one — a false red from load (documented already) and a panicking assertion that doesn't itself leave the suite stuck.
+
+## Item 1 — `discard_backlog` could busy-spin when the cursor stalls
+
+`src/bridge.rs::discard_backlog` (Critical fix from an earlier round) terminates on `raw_len == 0`, not on `messages.is_empty()`, to defeat the sticker-flood attack. But it never checked that a non-empty batch actually advanced the polling cursor — if a batch comes back with `raw_len > 0` but no `update_id` anywhere in it (a malformed or proxy-mangled `ok:true` body; `src/channel/telegram.rs::max_update_id` returns `None`), `Telegram::poll`'s `offset` stays put. The next `poll(ZERO)` asks the identical offset, likely gets the identical batch back, and `raw_len` never drops to 0 — a tight, un-backed-off `getUpdates?timeout=0` loop against Telegram for as long as the daemon lives, breakable only by `retire()` (the user pressing `x`).
+
+Fix: `channel::Batch` gained a `cursor_advanced: bool` field (`src/channel/mod.rs`), set by `Telegram::poll` to whether `max_update_id` found anything to advance past (`src/channel/telegram.rs`). `discard_backlog` now treats `raw_len > 0 && !cursor_advanced` as a terminal error — reusing `record_terminal_error`/`ChannelError::Malformed` (the same mapping already used for "came back but we can't parse it") rather than inventing a new error path — instead of resetting `attempt` and looping.
+
+This is a real, if small, contract change: `Batch`'s two other construction sites (`FakeChannel`'s `batch`/`batch_with_raw_len` test helpers in `bridge.rs`) needed the new field filled in (`true` for both — real Telegram always carries `update_id` on every item, sticker or not, so any legitimate `raw_len > 0` batch does advance the cursor). Added a third helper, `batch_stuck(raw_len)`, with `cursor_advanced: false`, for the new test.
+
+New test `discard_backlog_stops_instead_of_spinning_when_the_cursor_cannot_advance` scripts two stuck batches in a row and asserts exactly one `poll()` call happens (not two) and that a `Broken{Unreachable}` state is left behind — not just "it returns", since silently stopping would leave the page waiting on an update that will never come, the same Important 3 concern the panic-recovery path already addresses. Confirmed by mutation: removing the guard let `poll_calls` reach 3 instead of 1 (bounded only by `FakeChannel`'s own fail-closed fallback — the real production loop against real Telegram has no such bound); reverted with `Edit`.
+
+Bundled into the same commit: corrected `FakeChannel`'s stale struct doc comment (`src/bridge.rs`), which still said the exhausted `poll_script` returns `Ok(空批次)` while the impl — and its own inline comment, two lines below — return a terminal `Err`. Pre-existing drift from `864b9c8`, unrelated to this fix but directly adjacent to it in the file.
+
+## Item 2 — `accept()`'s retire gate was asymmetric
+
+An earlier round gated `accept()`'s disk write (`on_owner_changed`) on `is_retired()` but left `self.ch.set_destination(Some(msg.chat_id))` unconditional. In the exact window the gate exists for — `PhoneDisable` retiring a `Bridge` while its poll thread is blocked inside a `poll()` call (up to 25s) — a stranger's message could still reach `accept()`, `set_destination` would still hand the channel their chat id, and `poll_forever`'s subsequent call to `send_pairing_confirmation` (which has no `is_retired()` check of its own — its doc comment's reasoning, "pairing is already a fact, don't undo it over a failed goodbye", doesn't apply here because pairing shouldn't have happened at all) would then actually send the "已配对" confirmation to that stranger. The persisted-owner harm was closed by the earlier fix; this adjacent, narrower harm (an attacker gets positive proof they won a pairing race, even though nothing survives a restart) was not.
+
+Fix: `accept()` now computes `is_retired()` once into `already_retired` and gates both `set_destination` and `on_owner_changed` behind the same check — they can no longer disagree. This also means `send_pairing_confirmation` never gets a destination to send to in the retired case: `Channel::send` (both `Telegram`'s and `FakeChannel`'s) returns `Unreachable` when no destination has ever been set, which `send_pairing_confirmation` already treats as a no-op.
+
+New test `accept_does_not_set_destination_once_retired`, sibling to the existing `accept_does_not_persist_the_owner_once_retired`. Confirmed by mutation: made `set_destination` unconditional again (restoring the exact pre-fix shape) while leaving `on_owner_changed` gated; the test failed red. Reverted with `Edit`.
+
+## Not mine to fix (per the coordinator)
+
+The missing mutation-testing record for the Critical (backlog raw-count) and both Importants (retire gate, test-network) from earlier rounds — the coordinator is addressing that in the ledger, not this report.
+
+## Concerns
+
+- None new. Both items are independently scoped; the full `bridge::`, `channel::`, and full `--lib` suites stayed green after each commit, not just at the end.
