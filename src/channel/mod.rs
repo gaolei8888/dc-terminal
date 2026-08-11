@@ -42,6 +42,15 @@ pub trait Channel: Send + Sync {
     fn send(&self, text: &str) -> Result<MsgId, ChannelError>;
     /// 取新消息，最多阻塞 `timeout`。没有新消息就返回空 `Vec`，不是错误。
     fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError>;
+    /// 出站该发去哪——把 `Incoming.chat_id` 那个词汇表用在出站方向上，
+    /// 这样才对称。`None` = 还不知道发给谁，`send` 该报 `Unreachable`
+    /// （worth_retrying：一旦这里被设置过就会成功）。
+    ///
+    /// **这不是渠道自己该猜的事。** 猜的话，猜错一次就是把会话内容发给了
+    /// 错的人——`bridge.rs` 是唯一决定「谁是主人」的地方（配对、重新配对、
+    /// 换令牌），它决定了之后才调这个方法。渠道只负责记住被告知的值，
+    /// 不自己从收到的消息里现学。
+    fn set_destination(&self, chat: Option<i64>);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
