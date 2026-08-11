@@ -280,3 +280,28 @@ Triage results — NONE block:
   T8: Finding 3's documentation half is CLOSED by the README. Finding 8 has teeth — deleting the
     whole name branch at attach.rs:240-258 still breaks no test. Finding 4's failure toast
     (app.rs:266) names the profile while every other surface uses the name.
+
+FOLLOW-UPS (user chose to do 3 non-blocking triage items before merging, not after):
+Follow-up 1: complete (commits 0d0e04d, 5195dfe, review clean — spec ✅, Approved).
+  Failure toast now uses session_label; picker marks directory names hiding invisible characters.
+  THE TRAP AVOIDED: the picker still joins the RAW name at pick.rs:236/:278 — a sanitized name
+  would not join to the directory the user picked. Pinned by a test that bites structurally:
+  handle_pick_project gates on dir.is_dir() before pin_project, so ANY transformation of the name
+  yields a nonexistent path and current_group() is None.
+  Found (pre-existing, out of scope): i18n's every_key_is_listed_for_the_guards checks only
+  ALL_KEYS.len(), not membership — Key has 112 plain variants, ALL_KEYS has 100, so ~12 keys have
+  never been checked by either guard. ANOTHER "test that looks like coverage and is not".
+Follow-up 2: complete (commits 2f658d8, a76173d, review clean — spec ✅, Approved).
+  Both flaky tests stopped racing /bin/zsh. Substituted /bin/sh --noediting, ENV=/dev/null, fixed
+  PS1, registered via daemon::run_with_manager + SessionManager::register_profile.
+  FIFTH brief error caught by an implementer: I claimed socket-based tests "can't reach"
+  register_profile and must write a disk TOML. Wrong — run_with_manager + register_profile is the
+  established idiom (tests/concurrency.rs, tests/profiles_flow.rs) and resolve_profile consults
+  extra_profiles regardless of transport.
+  The echo-vs-execute distinction survives: wait_for_count(needle, 2) is unreachable without the
+  shell executing (reviewer walked wrapping, prompt redraw, status lines, echo differences), and
+  an_empty_input_on_its_own_is_a_bare_enter additionally asserts the pre-Enter count is exactly 1.
+  5 parallel full-suite runs green.
+Follow-up 2: one comment fix dispatched — grid_reply.rs:35-36 carries MY brief's error (says these
+  tests can't reach register_profile) three lines above code that calls it.
+FINAL REVIEW OF FOLLOW-UPS (opus): MERGE.
