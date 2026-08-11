@@ -112,10 +112,25 @@ pub(crate) enum View {
         warning: Option<String>,
     },
     PickProject(ProjectPicker),
-    /// 设置页：目前只有语言一项。跟 `Secrets` 分开是两码事——那边管的是
-    /// 「哪个 agent 用哪把密钥」，这里管的是界面本身怎么显示。
+    /// 设置页：一份设置项列表（见 [`SettingsItem`]）。跟 `Secrets` 分开是
+    /// 两码事——那边管的是「哪个 agent 用哪把密钥」，这里管的是界面本身
+    /// 怎么显示（以及以后手机通知怎么接，见 `SettingsItem::Phone`）。
+    ///
+    /// **加进第二项之前这一页是纯语言列表**，`state` 的下标直接映射
+    /// `Lang::all()`；现在它映射 `SettingsItem::all()`，语言挪到了
+    /// `lang` 这一层。
     Settings {
+        /// 顶层列表的光标，下标映射 `SettingsItem::all()`。
         state: ListState,
+        /// 深入语言子列表时的光标，下标映射 `Lang::all()`；`None` 表示
+        /// 还停在顶层列表上。
+        ///
+        /// **这是唯一的层级标记**——`Enter`/`Esc`/`Ctrl+Q` 该认哪一层、
+        /// 该退到哪一层，全靠这个字段是 `Some` 还是 `None` 分辨（见
+        /// `settings_view::handle_key` 和 `back_one_level` 里对应的
+        /// 那一条）。不能另开一个「当前在哪层」的旗标——两者一旦不同步，
+        /// 就是一边退不出去一边退过了头。
+        lang: Option<ListState>,
     },
     EnterSecret {
         /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
@@ -163,6 +178,26 @@ pub(crate) enum View {
         /// 那一行。
         pending_delete: Option<String>,
     },
+}
+
+/// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
+/// 直接映射 `Lang::all()`；现在映射这个枚举，选中语言那一项才进语言列表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsItem {
+    Language,
+    Phone,
+}
+
+impl SettingsItem {
+    pub(crate) fn all() -> &'static [SettingsItem] {
+        &[SettingsItem::Language, SettingsItem::Phone]
+    }
+
+    /// 越界返回 `None` 而不是兜底成第一项：`ListState` 的选中项可能停在
+    /// 一个已经不存在的位置，那时候什么都不做，比默默把用户带进语言页好。
+    pub(crate) fn at(i: usize) -> Option<SettingsItem> {
+        SettingsItem::all().get(i).copied()
+    }
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
@@ -245,8 +280,16 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
         // 浮层退的是**开门之前那一屏**，不是看板：从九宫格按 `?` 再退出来，
         // 落回列表就等于用户按一下问号顺手换了个视图。
         View::Keys { from } => Some(*from),
+        // 深入语言子列表时 Ctrl+Q 先退回顶层设置项列表，不能一步跳回看板
+        // ——不然同一屏里 Ctrl+Q 比 Esc 少退一步（Esc 见
+        // `settings_view::handle_key`），两个逃生键说的不是同一件事。
+        View::Settings {
+            state,
+            lang: Some(_),
+        } => Some(View::Settings { state, lang: None }),
         // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
-        // 退一层就是看板。
+        // 退一层就是看板。顶层的 `Settings { lang: None }` 也在这条兜底里
+        // ——它也只有一层，没被上面那条特例拦下的话就是回看板。
         _ => Some(View::Board),
     }
 }
@@ -991,6 +1034,11 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         } => text(Key::BackToSettings, lang).to_string(),
         // 从选择器进来的填密钥，退出回的是选择器，不是看板
         View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
+        // 深入语言子列表时退一层是回顶层设置项列表，不是回看板——跟
+        // `back_one_level` 里那条特例是同一件事的两半。复用
+        // `BackToSettings`（"Ctrl+Q 回设置"）：这个词条已经泛指「回到某个
+        // 设置页」，不专属密钥设置页，语言子列表要说的正是这句话。
+        View::Settings { lang: Some(_), .. } => text(Key::BackToSettings, lang).to_string(),
         // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
         // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
         // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
@@ -1390,6 +1438,7 @@ mod tests {
             View::PickProject(typing),
             View::Settings {
                 state: ListState::default(),
+                lang: None,
             },
             secret(false, SecretPhase::Typing),
             secret(true, SecretPhase::Typing),
@@ -2117,6 +2166,37 @@ mod tests {
         ));
     }
 
+    /// Ctrl+Q 深入语言子列表时退一层回顶层设置项列表，不是一步跳回看板
+    /// ——这条特例是这次重构新加的，`escaping_the_language_list_...`（在
+    /// `settings_view` 里）测的是 Esc 那条路，这里补 Ctrl+Q 那条路，两个
+    /// 逃生键必须落在同一个地方。
+    #[test]
+    fn ctrl_q_from_the_language_list_goes_back_to_the_settings_list() {
+        let mut ls = ListState::default();
+        ls.select(Some(1));
+        let back = back_one_level(View::Settings {
+            state: ListState::default(),
+            lang: Some(ls),
+        });
+        assert!(
+            matches!(back, Some(View::Settings { lang: None, .. })),
+            "该退回顶层设置项列表，不是看板"
+        );
+    }
+
+    /// Ctrl+Q 停在顶层设置项列表上（没有深入语言子列表）时，跟改结构之前
+    /// 一样一步退回看板——这一层只有一层深,不该被上面那条新特例误伤。
+    #[test]
+    fn ctrl_q_from_the_top_level_settings_list_goes_to_the_board() {
+        assert!(matches!(
+            back_one_level(View::Settings {
+                state: ListState::default(),
+                lang: None,
+            }),
+            Some(View::Board)
+        ));
+    }
+
     #[test]
     fn secrets_view_escapes_to_the_board() {
         assert!(matches!(
@@ -2281,6 +2361,25 @@ mod tests {
             Lang::Zh,
         );
         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+    }
+
+    /// 深入语言子列表时逃生键要说「回设置」，不是顶层那句默认的
+    /// 「回看板」——底栏说什么就得真能做到什么，跟
+    /// `ctrl_q_from_the_language_list_goes_back_to_the_settings_list` 是
+    /// 同一件事的两半（那条测行为，这条测文案）。
+    #[test]
+    fn escape_hint_from_the_language_list_says_back_to_settings_not_the_board() {
+        let mut ls = ListState::default();
+        ls.select(Some(0));
+        let h = escape_hint(
+            &View::Settings {
+                state: ListState::default(),
+                lang: Some(ls),
+            },
+            Lang::Zh,
+        );
+        assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+        assert!(!h.contains("看板"), "这一层退的不是看板：{h}");
     }
 
     #[test]

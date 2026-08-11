@@ -1,75 +1,185 @@
-//! 设置页：目前只有语言一项。看板按 `l` 进。
+//! 设置页：设置项列表，看板按 `l` 进。今天两项——语言（真管用）、
+//! 手机通知（Task 4 才接线，这里先占个位置，见 `handle_key` 里 `Phone`
+//! 分支的注释）。
 //!
 //! 跟 `secret.rs` 的密钥页分开是两码事——那边管「哪个 agent 用哪把密钥」，
 //! 这里管界面本身怎么显示。
+//!
+//! **这一页原来就是语言列表**，`ListState` 的下标直接映射 `Lang::all()`。
+//! 加了第二项之后光标含义分成了两层：`View::Settings.state` 走顶层
+//! `SettingsItem::all()`，选中「语言」才会开出 `lang` 那个子列表、下标
+//! 才改映射 `Lang::all()`。层级语义全记在 `View::Settings.lang` 是
+//! `Some` 还是 `None` 上，见它自己的字段注释。
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use crate::i18n::{text, Key, Lang};
 use crate::settings::{save_lang, settings_path_for_socket};
 
 use super::app::App;
-use super::view::View;
+use super::view::{SettingsItem, View};
 use super::widgets::Msg;
 use super::{dim, move_sel_n};
 
 /// **这个函数里永远不要 `continue`。** 理由同 `board.rs`：循环末尾还有一段
 /// 清理陈旧 `message` 的逻辑，跳过它会让一句普通反馈盖掉屏幕上唯一的出路。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::Settings { mut state } = app.view.clone() else {
+    let View::Settings { state, lang } = app.view.clone() else {
         return Ok(());
     };
+
+    if let Some(ls) = lang {
+        handle_language_list(app, key, state, ls);
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Esc => app.view = super::home_view(app),
         KeyCode::Down | KeyCode::Up => {
+            let mut state = state;
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
-            move_sel_n(&mut state, Lang::all().len(), d);
-            app.view = View::Settings { state };
+            move_sel_n(&mut state, SettingsItem::all().len(), d);
+            app.view = View::Settings { state, lang: None };
+        }
+        KeyCode::Enter => match state.selected().and_then(SettingsItem::at) {
+            Some(SettingsItem::Language) => {
+                // 进语言子列表：光标预选到当前语言。这条意图以前长在
+                // `open_settings`（一开设置页就见得到「现在是哪个」）——
+                // 顶层列表现在装的是设置项，语言下标对它没有意义了，
+                // 意图本身没丢，只是挪到了这一步，真正该问「现在是哪个
+                // 语言」的地方。
+                let mut ls = ListState::default();
+                ls.select(Lang::all().iter().position(|l| *l == app.lang));
+                app.view = View::Settings {
+                    state,
+                    lang: Some(ls),
+                };
+            }
+            Some(SettingsItem::Phone) => {
+                // TODO(task-4, dct-phone-channel): 手机通知页还没接线
+                // （`View::Phone` 是 Task 4 的产物）。Task 3 是纯 UI
+                // 重构、不掺任何手机通知逻辑，这一支特意留成空操作——
+                // 光标停在原地，什么都不发生。Task 4 把这一支换成
+                // `app.view = View::Phone { .. }` 就是它要接的线。
+                app.view = View::Settings { state, lang: None };
+            }
+            // 下标越界（比如列表变短后光标停在旧位置）：什么都不做，
+            // 比默默选中第一项更诚实——见 `SettingsItem::at` 的文档。
+            None => app.view = View::Settings { state, lang: None },
+        },
+        _ => app.view = View::Settings { state, lang: None },
+    }
+    Ok(())
+}
+
+/// 语言子列表的按键——**这就是改结构之前的整页逻辑**，原样搬过来，只是
+/// 从「唯一一层」变成了「深入之后的这一层」。
+fn handle_language_list(app: &mut App, key: KeyEvent, top: ListState, mut ls: ListState) {
+    match key.code {
+        // 退一层回顶层设置项列表，不是回看板——Ctrl+Q 见
+        // `view::back_one_level` 里对应的那一条，两边必须一致，不然
+        // 同一屏里两个逃生键说的不是同一件事。
+        KeyCode::Esc => {
+            app.view = View::Settings {
+                state: top,
+                lang: None,
+            }
+        }
+        KeyCode::Down | KeyCode::Up => {
+            let d = if key.code == KeyCode::Down { 1 } else { -1 };
+            move_sel_n(&mut ls, Lang::all().len(), d);
+            app.view = View::Settings {
+                state: top,
+                lang: Some(ls),
+            };
         }
         KeyCode::Enter => {
-            let chosen = state.selected().and_then(|i| Lang::all().get(i)).copied();
-            if let Some(lang) = chosen {
-                app.lang = lang;
+            let chosen = ls.selected().and_then(|i| Lang::all().get(i)).copied();
+            if let Some(l) = chosen {
+                app.lang = l;
                 // 立刻写盘。不写的话用户下次开 dct 发现语言变回去了，
                 // 而他明明记得自己选过——这正是 `save_lang` 返回 `Result`
                 // 而不是像「最近项目」那样吞掉错误的理由。
                 let path = settings_path_for_socket(&app.socket);
-                match save_lang(&path, lang) {
+                match save_lang(&path, l) {
                     // 语言已经切了，这句反馈用的就是新语言——用户按下 Enter
                     // 之后第一眼看到的就是切换生效的证据。
-                    Ok(()) => app.message = text(Key::SettingsTitle, lang).into(),
+                    Ok(()) => app.message = text(Key::SettingsTitle, l).into(),
                     Err(e) => app.message = Msg::err(format!("{e}")),
                 }
             }
             app.view = super::home_view(app);
         }
-        _ => app.view = View::Settings { state },
+        _ => {
+            app.view = View::Settings {
+                state: top,
+                lang: Some(ls),
+            }
+        }
     }
-    Ok(())
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Settings { state } = &app.view else {
+    let View::Settings { state, lang } = &app.view else {
         return;
     };
-    let items: Vec<ListItem> = Lang::all()
+
+    let border_style = if app.connected {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
+    if let Some(ls) = lang {
+        // 语言子列表：画法跟改结构之前的整页一模一样——各语言用自己的
+        // 语言写，当前项打勾。误切到看不懂的语言之后，这个符号是跨语言
+        // 都认得的线索，这条道理没有因为多了一层而改变。
+        let items: Vec<ListItem> = Lang::all()
+            .iter()
+            .map(|l| {
+                let mark = if *l == app.lang { "✓ " } else { "  " };
+                let style = if *l == app.lang {
+                    Style::default()
+                } else {
+                    dim()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(mark, style),
+                    Span::styled(l.native_name(), style),
+                ]))
+            })
+            .collect();
+        let mut s = ls.clone();
+        f.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(
+                            "{} · {}",
+                            text(Key::SettingsTitle, app.lang),
+                            text(Key::Language, app.lang)
+                        ))
+                        .border_style(border_style),
+                )
+                .highlight_symbol("▶ "),
+            area,
+            &mut s,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = SettingsItem::all()
         .iter()
-        .map(|l| {
-            // 每种语言用它自己的语言写。当前这一项用 `✓` 标出来——
-            // 误切到看不懂的语言之后，这个符号是跨语言都认得的线索。
-            let mark = if *l == app.lang { "✓ " } else { "  " };
-            let style = if *l == app.lang {
-                Style::default()
-            } else {
-                dim()
+        .map(|item| {
+            let label = match item {
+                SettingsItem::Language => text(Key::Language, app.lang),
+                SettingsItem::Phone => text(Key::Phone, app.lang),
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(mark, style),
-                Span::styled(l.native_name(), style),
-            ]))
+            ListItem::new(Line::from(Span::raw(label)))
         })
         .collect();
 
@@ -79,16 +189,8 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(
-                        "{} · {}",
-                        text(Key::SettingsTitle, app.lang),
-                        text(Key::Language, app.lang)
-                    ))
-                    .border_style(if app.connected {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::Red)
-                    }),
+                    .title(text(Key::SettingsTitle, app.lang))
+                    .border_style(border_style),
             )
             .highlight_symbol("▶ "),
         area,
@@ -100,25 +202,61 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
-    use ratatui::widgets::ListState;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// 光标停在顶层设置项列表的第 `selected` 项上。
     fn on_settings(app: &mut App, selected: usize) {
         let mut st = ListState::default();
         st.select(Some(selected));
-        app.view = View::Settings { state: st };
+        app.view = View::Settings {
+            state: st,
+            lang: None,
+        };
+    }
+
+    /// 光标已经深入语言子列表，停在第 `selected` 种语言上——测「选中语言
+    /// 按 Enter 怎么样」不需要先测「顶层怎么钻进去」，两件事分开测，一个
+    /// 出错时另一个不会跟着一起红。
+    fn on_language_list(app: &mut App, selected: usize) {
+        let mut ls = ListState::default();
+        ls.select(Some(selected));
+        app.view = View::Settings {
+            state: ListState::default(),
+            lang: Some(ls),
+        };
+    }
+
+    /// 改结构之前，下标直接映射 Lang::all()。改完之后映射设置项。
+    /// **这条是回归测试**：语言仍然切得动比手机通知能用更重要。
+    #[test]
+    fn the_first_item_is_language() {
+        assert_eq!(SettingsItem::all()[0], SettingsItem::Language);
+    }
+
+    #[test]
+    fn phone_is_a_settings_item_too() {
+        assert!(SettingsItem::all().contains(&SettingsItem::Phone));
+    }
+
+    /// 下标越界不能 panic——`ListState` 的选中项在列表变短时会留在旧位置。
+    #[test]
+    fn an_out_of_range_index_selects_nothing() {
+        assert_eq!(SettingsItem::at(99), None);
+        assert_eq!(SettingsItem::at(0), Some(SettingsItem::Language));
     }
 
     /// 选中一种语言按 Enter：界面语言当场就变，并且落盘——下次开 dct 还是它。
+    /// 这是从改结构之前原样搬过来的回归测试，只是入口从「顶层」换成了
+    /// 「已经在语言子列表里」。
     #[test]
     fn choosing_a_language_applies_it_and_writes_it_to_disk() {
         let (mut app, dir) = App::test_app();
         app.lang = Lang::Zh;
         let en_index = Lang::all().iter().position(|l| *l == Lang::En).unwrap();
-        on_settings(&mut app, en_index);
+        on_language_list(&mut app, en_index);
 
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
 
@@ -145,11 +283,97 @@ mod tests {
         );
     }
 
+    /// 深入语言子列表之后 Esc 退一层回顶层设置项列表，不是直接回看板——
+    /// 这是这次重构本身引入的新台阶，得有测试钉住它，不然下一次改动会把
+    /// 它和顶层的 Esc 语义弄混，两个逃生键说的就不再是同一件事。
+    #[test]
+    fn escaping_the_language_list_goes_back_to_the_settings_list_not_the_board() {
+        let (mut app, _dir) = App::test_app();
+        on_language_list(&mut app, 0);
+
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert!(
+            matches!(app.view, View::Settings { lang: None, .. }),
+            "Esc 从语言子列表出来应该退回顶层设置项列表"
+        );
+    }
+
+    /// 顶层选中「语言」按 Enter 要能钻进语言子列表，并且光标预选在当前
+    /// 语言上——这份「进来第一眼看到现在是哪个」的意图以前长在
+    /// `open_settings` 里，这次重构把它挪到了这一步，得有测试接住，不然
+    /// 下一次改动会以为「预选当前项」只是巧合。
+    #[test]
+    fn entering_the_language_item_opens_the_list_preselected_on_the_current_language() {
+        let (mut app, _dir) = App::test_app();
+        app.lang = Lang::Zh;
+        let top = SettingsItem::all()
+            .iter()
+            .position(|i| *i == SettingsItem::Language)
+            .unwrap();
+        on_settings(&mut app, top);
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        match &app.view {
+            View::Settings { lang: Some(ls), .. } => {
+                let zh_index = Lang::all().iter().position(|l| *l == Lang::Zh).unwrap();
+                assert_eq!(ls.selected(), Some(zh_index), "要预选在当前语言上");
+            }
+            _ => panic!("选中「语言」按 Enter 应该钻进语言子列表"),
+        }
+    }
+
+    /// 顶层选中「手机通知」按 Enter：Task 4 才会给它接一个真视图，这里
+    /// 只保证不 panic、也不会误把用户带进语言子列表——占位归占位，行为
+    /// 不能是「什么都可能发生」。
+    #[test]
+    fn entering_the_phone_item_does_not_crash_or_open_the_language_list() {
+        let (mut app, _dir) = App::test_app();
+        let phone = SettingsItem::all()
+            .iter()
+            .position(|i| *i == SettingsItem::Phone)
+            .unwrap();
+        on_settings(&mut app, phone);
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(app.view, View::Settings { lang: None, .. }),
+            "手机通知还没接线，Enter 不该把光标带进语言子列表或崩掉"
+        );
+    }
+
+    /// 方向键要能从「语言」走到「手机通知」。`move_sel_n` 的长度参数如果
+    /// 悄悄改回 `Lang::all().len()`，今天两份长度数值上都是 2，看不出
+    /// 差别——这条测试不问长度参数从哪儿来，只问「按下去到没到」，是这份
+    /// 数值巧合之外唯一还能钉住这条移动的测试（见任务报告的变异测试表）。
+    #[test]
+    fn pressing_down_from_language_selects_phone() {
+        let (mut app, _dir) = App::test_app();
+        on_settings(&mut app, 0);
+
+        handle_key(&mut app, key(KeyCode::Down)).unwrap();
+
+        match &app.view {
+            View::Settings {
+                state, lang: None, ..
+            } => {
+                assert_eq!(
+                    state.selected().and_then(SettingsItem::at),
+                    Some(SettingsItem::Phone),
+                    "↓ 应该能从语言走到手机通知"
+                );
+            }
+            _ => panic!("方向键应该还在顶层设置项列表里"),
+        }
+    }
+
     /// 语言列表用各自的语言写，光标能走遍每一行。
     #[test]
     fn every_language_is_listed_in_its_own_language() {
         let (mut app, _dir) = App::test_app();
-        on_settings(&mut app, 0);
+        on_language_list(&mut app, 0);
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
         let buf = term.backend().buffer();
@@ -170,5 +394,42 @@ mod tests {
                 l
             );
         }
+    }
+
+    /// 顶层列表把两个设置项都列出来，各自用界面语言写——手机通知今天还是
+    /// 占位，但它已经是一个用户看得见、选得中的行，标签不能漏。
+    #[test]
+    fn the_top_level_list_shows_both_settings_items() {
+        let (mut app, _dir) = App::test_app();
+        on_settings(&mut app, 0);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        let c: String = (0..a.height)
+            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            c.contains(
+                &text(Key::Language, app.lang)
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            ),
+            "顶层列表要列出「语言」：{c}"
+        );
+        assert!(
+            c.contains(
+                &text(Key::Phone, app.lang)
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            ),
+            "顶层列表要列出「手机通知」：{c}"
+        );
     }
 }

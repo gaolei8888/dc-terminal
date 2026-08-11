@@ -36,7 +36,7 @@ mod view;
 use view::SecretPhase;
 use view::{
     back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
-    session_ended_notice, View,
+    session_ended_notice, SettingsItem, View,
 };
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
@@ -1434,17 +1434,26 @@ pub(crate) fn home_view(app: &App) -> View {
     }
 }
 
-/// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到
-/// 「现在是哪个」，而不是从头找。
+/// `l` 键：打开设置页，光标落在「语言」这一项上——它是设置页里今天唯一
+/// 真管用的一项（手机通知要等 Task 4 才接线），日常路径压成零步找。
+///
+/// **以前这里把光标预选到「当前语言在 `Lang::all()` 里的下标」**，那时候
+/// 整页就是语言列表，这样做直接就对了。现在顶层列表映射的是
+/// `SettingsItem`，一个跟语言数量没有任何关系的枚举——继续用语言下标去
+/// 选它是错的：选了不是 `Lang::all()` 第一个的语言的用户，进设置页时
+/// 光标会落在别的设置项上，而不是「语言」。今天两个枚举碰巧都是两项，
+/// 这个错误甚至不会越界 panic，只会把光标悄悄放错行——最隐蔽的那种 bug。
+/// 「进来第一眼看到现在是哪个」这份意图没有丢，它挪到了
+/// `settings_view::handle_key` 里选中「语言」按 Enter 的那一刻，只有
+/// 那时候「现在是哪个语言」才是一个有意义的问题。
 pub(crate) fn open_settings(app: &mut App) {
     let mut state = ListState::default();
-    state.select(Some(
-        crate::i18n::Lang::all()
+    state.select(
+        SettingsItem::all()
             .iter()
-            .position(|l| *l == app.lang)
-            .unwrap_or(0),
-    ));
-    app.view = View::Settings { state };
+            .position(|i| *i == SettingsItem::Language),
+    );
+    app.view = View::Settings { state, lang: None };
 }
 
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
@@ -2221,6 +2230,32 @@ mod tests {
             profiles_to_fetch(&app).is_empty(),
             "问过就不再问，哪怕答案是「没有」"
         );
+    }
+
+    /// `l` 键要把光标落在「语言」这一项上，**不管用户现在用的是哪种
+    /// 语言**。以前光标预选靠的是「当前语言在 `Lang::all()` 里的下标」，
+    /// 那个下标现在指的是别的东西（`SettingsItem::all()` 的下标）——
+    /// 选中文（`Lang::all()` 下标 1）的用户如果还吃这条老逻辑，光标会
+    /// 落在「手机通知」上而不是「语言」，这条测试专门盯这件事。
+    #[test]
+    fn opening_settings_always_selects_language_regardless_of_current_lang() {
+        for lang in crate::i18n::Lang::all() {
+            let (mut app, _d) = App::test_app();
+            app.lang = *lang;
+
+            open_settings(&mut app);
+
+            match &app.view {
+                View::Settings { state, lang: None } => {
+                    assert_eq!(
+                        state.selected().and_then(SettingsItem::at),
+                        Some(SettingsItem::Language),
+                        "语言是 {lang:?} 时,`l` 也该落在「语言」这一项上"
+                    );
+                }
+                _ => panic!("open_settings 应该产出顶层的 View::Settings"),
+            }
+        }
     }
 
     /// 已经知道答案的组也不再问。
@@ -3544,6 +3579,7 @@ mod tests {
             },
             View::Settings {
                 state: ListState::default(),
+                lang: None,
             },
             View::Keys {
                 from: Box::new(View::Board),
