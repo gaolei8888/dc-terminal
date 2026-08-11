@@ -200,6 +200,17 @@ impl PhoneState {
     /// 坏，只是这个 bot 被拉黑了）；`Off` 不算，`Broken { BadToken | Unreachable, .. }`
     /// 也不算——后两者时 `apply_phone_set_token` 验证失败根本没有落盘。
     ///
+    /// **`BotBlocked` 这一支是一份承诺，不是今天就有代码兑现的事实。**
+    /// `daemon.rs::phone_verify_token`——这个分支上唯一会产出 `PhoneState`
+    /// 的地方——今天**从不**构造 `Broken { BotBlocked }`（fix round 2 的
+    /// Important 2：它曾经会，`apply_phone_set_token` 却对所有 `Broken`
+    /// 一律不落盘，两边对不上，会重演下面这段 Critical 2）。所以这一支
+    /// 今天是空过滤条件，只有测试手写状态才会用到。**任何将来构造
+    /// `Broken { BotBlocked }` 的代码（Task 5 的 Bridge：一次真正配对
+    /// 之后往已知 chat 发消息失败）必须先确保磁盘上真的有令牌、`bot`
+    /// 字段真的是 `Some`，再让这一支返回 `true`**——否则就是在维护一个
+    /// 谎言。
+    ///
     /// **`r`（重新配对）/`x`（关掉）只在这里返回 `true` 时才有对象可
     /// 作用**，`ui/phone.rs::handle_status`（按下去有没有效果）和
     /// `daemon.rs`（`PhoneUnpair` 该不该真的把状态推到 `WaitingForPairing`）
@@ -858,6 +869,60 @@ mod tests {
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// **Minor 4（dct-phone-channel Task 4 fix round 2）。** `Response::Phone`
+    /// 在这个分支上从诞生起就只有一条自我一致的往返测试
+    /// （`phone_status_response_round_trips`）——序列化再反序列化，跟
+    /// 自己比对。那种测试**钉不住线上形状**：字段改名、`Broken` 从
+    /// newtype 变成带 `reason`/`message` 的结构体变体，只要序列化和
+    /// 反序列化用的是同一份 derive，来回一趟照样相等，不会变红。跟
+    /// `Request`/`SessionInfo` 一样，这里需要一条硬编码期望字符串的测试
+    /// ——`PhoneState` 四个取值都要出现一次，漏一个不会被这条测试本身
+    /// 发现，但会被 `impl Debug for PhoneState`（如果将来加一个）或者
+    /// 穷尽 match 拦下来。
+    ///
+    /// `PROTOCOL_VERSION` 仍然是 7：这四个变体、`PhoneStatus`、
+    /// `PhoneBrokenReason` 全都是本次改动之前就已经在协议版本 7 里的
+    /// 东西（`Broken` 从 `Broken(String)` 换成 `Broken { reason, message }`
+    /// 发生在这条分支自己合并进 main 之前，从没有任何已发布的旧守护进程
+    /// 认识过 `Broken(String)` 那个旧形状）——这条测试钉的是**从现在起**
+    /// 的形状，往后再改才需要加一。
+    #[test]
+    fn the_phone_status_shape_is_pinned_too() {
+        let all_states = vec![
+            PhoneState::Off,
+            PhoneState::WaitingForPairing,
+            PhoneState::Paired,
+            PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "m".into(),
+            },
+        ];
+        let shape = serde_json::to_string(&all_states).unwrap();
+        assert_eq!(
+            (PROTOCOL_VERSION, shape.as_str()),
+            (
+                7,
+                r#"["Off","WaitingForPairing","Paired",{"Broken":{"reason":"BadToken","message":"m"}}]"#
+            ),
+            "PhoneState 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+
+        let resp = Response::Phone(PhoneStatus {
+            state: PhoneState::WaitingForPairing,
+            bot: Some("b".into()),
+            owner: None,
+        });
+        let resp_shape = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            (PROTOCOL_VERSION, resp_shape.as_str()),
+            (
+                7,
+                r#"{"Phone":{"state":"WaitingForPairing","bot":"b","owner":null}}"#
+            ),
+            "Response::Phone 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
 

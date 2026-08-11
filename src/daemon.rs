@@ -112,9 +112,18 @@ fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
     }
 }
 
-/// 令牌验证的结果该记成什么 `PhoneState` + bot 名。纯判定逻辑，传输层由
-/// 调用方注入（同 `verify.rs::verify_with` 的路子）——测试才能覆盖
-/// 「令牌好使」「令牌失效」「连不上」三种结果，不用真打 Telegram 的网络。
+/// 令牌验证的结果：好使就是 `Ok` 附带 bot 名（`get_me` 成功时**总是**
+/// 拿得到一个真实用户名，这不是 `Option`——这个签名本身就是
+/// dct-phone-channel Task 4 fix round 2 的 Minor 5 修复：旧签名是
+/// `(PhoneState, Option<String>)`，`apply_phone_set_token` 落盘那一支要写
+/// `bot.as_deref().unwrap_or("")`，这个 `""` 兜底今天确实到不了（`Ok` 分支
+/// 唯一的产出者），但「到不了」是控制流碰巧配合，不是类型逼出来的。现在
+/// 落盘那一支拿到的是 `String`，压根没有空字符串可写。
+///
+/// 失败就是 `Err` 附带一个**已经成文**的 `PhoneState::Broken`——纯判定
+/// 逻辑，传输层由调用方注入（同 `verify.rs::verify_with` 的路子）——测试
+/// 才能覆盖「令牌好使」「令牌失效」「连不上」三种结果，不用真打 Telegram
+/// 的网络。
 ///
 /// **`Broken` 的 `message` 字段绝不能把 `token` 拼进去**：这是
 /// `PhoneState::Broken` 唯一的安全承诺，`phone_broken_text_never_contains_the_token`
@@ -125,39 +134,37 @@ fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
 /// 的那句「own message and own next step」）说的是同一句话，用户没法照着
 /// 做对的事。
 ///
-/// `ChannelError::Blocked`（403）这个分支**今天没有任何调用点会真的走到**
-/// ——`getMe` 没有 chat 上下文，Telegram 不会拿它回 403，这个原因只会在
-/// Task 5 的 Bridge 往一个已配对的 chat 发消息时出现。留着是因为
-/// `ChannelError` 是穷尽 match 的一部分，而且 `PhoneState`/`i18n::msg`
-/// 已经把这条路准备好了，Task 5 不用再改一次协议形状。
+/// **`ChannelError::Blocked`（403）在这条路径上映成 `BadToken`，不是
+/// `BotBlocked`**——这是 fix round 2 的 Important 2 修复。`PhoneState::
+/// has_confirmed_token()` 把 `BotBlocked` 当成「磁盘上有一份确认有效的
+/// 令牌」，但这条函数（唯一的 `apply_phone_set_token` 调用方）验证失败
+/// 从不落盘：如果这里真的产出 `BotBlocked`，`has_confirmed_token()` 就会
+/// 对着一个磁盘上根本不存在的令牌撒谎，`r` 会把用户带回 Critical 2 那个
+/// 死胡同——PhoneUnpair 会把状态推成 `WaitingForPairing`，`bot` 却只能是
+/// `None`（这条路径压根没拿到真实用户名），status_line 又画出「@?」。
+/// 与其指望 Telegram 永远不会在一次没有 chat 上下文的 `getMe` 调用上答
+/// 403（`getMe` 问的是"这个令牌是谁"，不是"这个 chat 屏蔽了没"，403
+/// 在这里没有语义），不如让这条路径**压根不产出** `BotBlocked`——那个
+/// 原因只该由 Task 5 的 Bridge 在一次真正配对之后、往已知 chat 发消息
+/// 失败时构造，那时候磁盘上确实有一份令牌，`has_confirmed_token()` 的
+/// 承诺才成立。`msg::phone_blocked`/`Key::PhoneNextStepBlocked` 仍然留着
+/// ——Task 5 要用，`i18n.rs` 自己的测试直接调用 `msg::phone_blocked` 钉住
+/// 它没坏。
 fn phone_verify_token(
     token: &str,
     lang: crate::i18n::Lang,
     get_me: &dyn Fn(&str) -> Result<String, ChannelError>,
-) -> (PhoneState, Option<String>) {
+) -> Result<String, PhoneState> {
     match get_me(token) {
-        Ok(bot) => (PhoneState::WaitingForPairing, Some(bot)),
-        Err(ChannelError::BadToken) => (
-            PhoneState::Broken {
-                reason: PhoneBrokenReason::BadToken,
-                message: crate::i18n::msg::phone_token_invalid(lang),
-            },
-            None,
-        ),
-        Err(ChannelError::Blocked) => (
-            PhoneState::Broken {
-                reason: PhoneBrokenReason::BotBlocked,
-                message: crate::i18n::msg::phone_blocked(lang),
-            },
-            None,
-        ),
-        Err(ChannelError::Unreachable) | Err(ChannelError::Malformed) => (
-            PhoneState::Broken {
-                reason: PhoneBrokenReason::Unreachable,
-                message: crate::i18n::msg::phone_unreachable(lang),
-            },
-            None,
-        ),
+        Ok(bot) => Ok(bot),
+        Err(ChannelError::BadToken) | Err(ChannelError::Blocked) => Err(PhoneState::Broken {
+            reason: PhoneBrokenReason::BadToken,
+            message: crate::i18n::msg::phone_token_invalid(lang),
+        }),
+        Err(ChannelError::Unreachable) | Err(ChannelError::Malformed) => Err(PhoneState::Broken {
+            reason: PhoneBrokenReason::Unreachable,
+            message: crate::i18n::msg::phone_unreachable(lang),
+        }),
     }
 }
 
@@ -174,42 +181,53 @@ fn apply_phone_set_token(
     phone: &Mutex<PhoneStatus>,
     get_me: &dyn Fn(&str) -> Result<String, ChannelError>,
 ) -> anyhow::Result<Response> {
-    let (state, bot) = phone_verify_token(token, lang, get_me);
-    // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌本身不
-    // 好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉——界面上
-    // `Enter` 键只在没有一份「确认有效」的令牌时才会被提供（见
-    // `PhoneState::has_confirmed_token`），也就是说走到这条分支时磁盘上
-    // 原本要么没有令牌、要么已经是坏的，这里不存在「一个还能用的令牌被
-    // 覆盖」的风险。
-    let save_result = if matches!(state, PhoneState::Broken { .. }) {
-        Ok(())
-    } else {
-        // 令牌和 bot 名字一起落盘：`initial_phone_status` 开机时直接读
-        // 这两个键，不再打网络去现查 bot 名字（见 `run_with_manager` 头上
-        // 那段注释）——两个写操作里如果只有第一个成功，重启后会读到一个
-        // 有令牌没 bot 名字的状态，「等你在 Telegram 里给 @? 发条消息」
-        // 的老问题会从另一个角度冒出来，所以两次 `set` 的结果都要检查。
-        //
-        // **两次 `secrets.lock()` 必须是两条分开的语句**——`Mutex` 不可
-        // 重入，第一次 `recover(secrets.lock())` 产生的 `MutexGuard` 是这
-        // 条语句里的一个临时值，Rust 的临时值销毁规则是"整条语句结束时才
-        // 释放"，如果写成一条链式表达式（`.and_then` 闭包里再 `lock()`
-        // 同一把锁），第一把锁在闭包执行时还没释放，第二次 `lock()` 会
-        // 自己把自己锁死——这曾经是本函数一个真实的自死锁 bug。
-        let first = recover(secrets.lock()).set(PHONE_TOKEN_KEY, token);
-        first.and_then(|_| recover(secrets.lock()).set(PHONE_BOT_KEY, bot.as_deref().unwrap_or("")))
-    };
-    save_result.map(|_| {
-        let mut ph = recover(phone.lock());
-        // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人（如果有）
-        // 不该继续留着，那会让通知发去一个跟这份新令牌毫不相干的旧 chat。
-        *ph = PhoneStatus {
-            state,
-            bot,
-            owner: None,
-        };
-        Response::Phone(ph.clone())
-    })
+    match phone_verify_token(token, lang, get_me) {
+        Ok(bot) => {
+            // 令牌和 bot 名字一起落盘：`initial_phone_status` 开机时直接读
+            // 这两个键，不再打网络去现查 bot 名字（见 `run_with_manager` 头上
+            // 那段注释）——两个写操作里如果只有第一个成功，重启后会读到一个
+            // 有令牌没 bot 名字的状态，「等你在 Telegram 里给 @? 发条消息」
+            // 的老问题会从另一个角度冒出来，所以两次 `set` 的结果都要检查。
+            //
+            // **两次 `secrets.lock()` 必须是两条分开的语句**——`Mutex` 不可
+            // 重入，第一次 `recover(secrets.lock())` 产生的 `MutexGuard` 是这
+            // 条语句里的一个临时值，Rust 的临时值销毁规则是"整条语句结束时才
+            // 释放"，如果写成一条链式表达式（`.and_then` 闭包里再 `lock()`
+            // 同一把锁），第一把锁在闭包执行时还没释放，第二次 `lock()` 会
+            // 自己把自己锁死——这曾经是本函数一个真实的自死锁 bug。
+            let first = recover(secrets.lock()).set(PHONE_TOKEN_KEY, token);
+            first
+                .and_then(|_| recover(secrets.lock()).set(PHONE_BOT_KEY, &bot))
+                .map(|_| {
+                    let mut ph = recover(phone.lock());
+                    // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人
+                    // （如果有）不该继续留着，那会让通知发去一个跟这份新
+                    // 令牌毫不相干的旧 chat。
+                    *ph = PhoneStatus {
+                        state: PhoneState::WaitingForPairing,
+                        bot: Some(bot),
+                        owner: None,
+                    };
+                    Response::Phone(ph.clone())
+                })
+        }
+        Err(state) => {
+            // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌
+            // 本身不好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉
+            // ——界面上 `Enter` 键只在没有一份「确认有效」的令牌时才会被
+            // 提供（见 `PhoneState::has_confirmed_token`），也就是说走到
+            // 这条分支时磁盘上原本要么没有令牌、要么已经是坏的，这里不存在
+            // 「一个还能用的令牌被覆盖」的风险。`bot` 写成 `None` 同理：
+            // `phone_verify_token` 的 `Err` 分支从不产出一个真实用户名。
+            let mut ph = recover(phone.lock());
+            *ph = PhoneStatus {
+                state,
+                bot: None,
+                owner: None,
+            };
+            Ok(Response::Phone(ph.clone()))
+        }
+    }
 }
 
 /// **`cfg.llm` 是 `None` 就什么都不做**：不 resolve、不装后端、也不打印
@@ -477,10 +495,17 @@ fn handle(
                 ph.state = PhoneState::WaitingForPairing;
                 ph.owner = None;
                 // bot **不清空**：这条分支只有在原状态已经带着一个「曾经
-                // 确认有效」的 bot 名字时才会走到（`Paired`、
-                // `WaitingForPairing`，或者 `Broken { BotBlocked }`——后者
-                // 的令牌本身没坏，bot 也还是原来那个），重新配对是「回到
-                // 等下一条消息」，不是「忘掉这个 bot」。
+                // 确认有效」的 bot 名字时才会走到。今天在这条分支上唯一
+                // 能真的走到这里的是 `Paired`/`WaitingForPairing`——两者
+                // 都只能由 `apply_phone_set_token` 验证成功产出，一定带着
+                // 真实 bot 名字。`Broken { BotBlocked }` 结构上也满足这个
+                // 守卫（`has_confirmed_token()` 把它算作「确认有效」），
+                // 但 `phone_verify_token` 今天**不产出**这个原因（fix
+                // round 2 Important 2：那样会让 `has_confirmed_token()`
+                // 对着一个磁盘上不存在的令牌撒谎），所以这条分支处理
+                // `BotBlocked` 的行为——推进、保留 bot——只在 Task 5 的
+                // Bridge 开始构造它之后才会被真的走到。Bridge 必须保证
+                // 那时候 bot 已经是 `Some`：这条重新配对的行为依赖它。
             }
             Ok(Response::Phone(ph.clone()))
         }
@@ -965,18 +990,18 @@ mod tests {
 
     #[test]
     fn phone_verify_token_marks_a_good_token_waiting_for_pairing() {
-        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+        let bot = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Ok("my_dct_bot".to_string())
         });
-        assert_eq!(state, PhoneState::WaitingForPairing);
-        assert_eq!(bot.as_deref(), Some("my_dct_bot"));
+        assert_eq!(bot.as_deref(), Ok("my_dct_bot"));
     }
 
     #[test]
     fn phone_verify_token_marks_a_bad_token_broken() {
-        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+        let state = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Err(ChannelError::BadToken)
-        });
+        })
+        .expect_err("坏令牌应该是 Err");
         assert!(matches!(
             state,
             PhoneState::Broken {
@@ -984,7 +1009,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(bot.is_none());
         let PhoneState::Broken { message, .. } = state else {
             unreachable!()
         };
@@ -994,7 +1018,8 @@ mod tests {
     #[test]
     fn phone_verify_token_marks_network_trouble_broken_too() {
         for e in [ChannelError::Unreachable, ChannelError::Malformed] {
-            let (state, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &move |_| Err(e));
+            let state = phone_verify_token("tok", crate::i18n::Lang::Zh, &move |_| Err(e))
+                .expect_err("连不上应该是 Err");
             assert!(
                 matches!(
                     state,
@@ -1008,23 +1033,31 @@ mod tests {
         }
     }
 
-    /// `ChannelError::Blocked`（403）今天没有任何调用点会真的产生——见
-    /// `phone_verify_token` 上那条注释——但既然 `PhoneState`/`i18n::msg`
-    /// 已经把这条路准备好了，这条测试确认它真的接对了，不是穷尽 match
-    /// 里一个凑数的 `todo!`。
+    /// **fix round 2 的 Important 2。** 403 在这条「刚填令牌」的路径上
+    /// 映成 `BadToken`，**不是** `BotBlocked`——`getMe` 没有 chat 上下文，
+    /// 一个真实的 403 只会在 Task 5 的 Bridge 往已配对的 chat 发消息时
+    /// 出现，那时候磁盘上确实有令牌。如果这里让它映成 `BotBlocked`，
+    /// `PhoneState::has_confirmed_token()` 就会对着一个从没落盘过的令牌
+    /// 撒谎——`apply_phone_set_token` 对所有 `Broken` 一律不落盘，两边
+    /// 对不上就是 Critical 2 的死胡同重演一遍：`r` 把状态推成
+    /// `WaitingForPairing`，`bot` 却是 `None`（这条路径压根拿不到真实
+    /// 用户名），画面又是「@?」。
     #[test]
-    fn phone_verify_token_marks_blocked_with_its_own_reason() {
-        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+    fn phone_verify_token_maps_blocked_to_bad_token_not_bot_blocked() {
+        let state = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Err(ChannelError::Blocked)
-        });
-        assert!(matches!(
-            state,
-            PhoneState::Broken {
-                reason: PhoneBrokenReason::BotBlocked,
-                ..
-            }
-        ));
-        assert!(bot.is_none());
+        })
+        .expect_err("403 应该是 Err");
+        assert!(
+            matches!(
+                state,
+                PhoneState::Broken {
+                    reason: PhoneBrokenReason::BadToken,
+                    ..
+                }
+            ),
+            "403 在这条路径上不该产出 BotBlocked，得到 {state:?}"
+        );
     }
 
     /// **不是巧合，是两句不同的话。** `BadToken`（令牌本身不好使）和
@@ -1035,12 +1068,14 @@ mod tests {
     /// `phone_verify_token` 按错误类型分派到了不同的 `msg::` 函数。
     #[test]
     fn bad_token_and_network_trouble_produce_different_messages() {
-        let (bad, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+        let bad = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Err(ChannelError::BadToken)
-        });
-        let (unreachable, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
+        })
+        .expect_err("坏令牌应该是 Err");
+        let unreachable = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
             Err(ChannelError::Unreachable)
-        });
+        })
+        .expect_err("连不上应该是 Err");
         let PhoneState::Broken {
             message: bad_msg, ..
         } = bad
@@ -1084,10 +1119,10 @@ mod tests {
             ChannelError::Unreachable,
             ChannelError::Malformed,
         ] {
-            let (state, _) =
-                phone_verify_token(real_looking_token, crate::i18n::Lang::Zh, &move |_| {
-                    Err(err)
-                });
+            let state = phone_verify_token(real_looking_token, crate::i18n::Lang::Zh, &move |_| {
+                Err(err)
+            })
+            .expect_err(&format!("{err:?} 应该是 Err"));
             let PhoneState::Broken { message, .. } = state else {
                 panic!("{err:?} 应该是 Broken")
             };
@@ -1368,7 +1403,10 @@ mod tests {
 
     /// `r` 在 `Broken { BotBlocked }` 下**要**推进——令牌本身没坏，只是这个
     /// bot 被拉黑了，重新配对是有意义的动作，而且要留着原来那个 bot 名字
-    /// （不是伪造一个新的、也不是清空）。
+    /// （不是伪造一个新的、也不是清空）。**这条状态今天没有任何代码会真的
+    /// 构造**（`phone_verify_token` 把 403 映成 `BadToken`，见 fix round 2
+    /// Important 2）——这条测试手写状态，钉住 `PhoneUnpair` 对这一支的
+    /// 处理逻辑本身是对的，为 Task 5 的 Bridge 真的开始构造它那天准备好。
     #[test]
     fn phone_unpair_on_a_blocked_bot_repairs_and_keeps_the_bot_name() {
         let mgr = Arc::new(SessionManager::new());
@@ -1409,6 +1447,14 @@ mod tests {
     /// 只测了 `Paired` 起点——协议里合法，但这个分支上没有任何代码构造
     /// `Paired`（配对要真收到一条消息，那是 Task 5）。`WaitingForPairing`
     /// 才是这条分支上唯一真会被 `r` 作用到的起点，补上。
+    ///
+    /// **`owner` 起点特意设成 `Some(..)`，不是原来的 `None`（fix round 2
+    /// 的 Minor 3）。** 原来那个起点本身就是 `None`，断言「还是
+    /// `WaitingForPairing`、bot 没丢」不会因为 `owner` 而红——删掉
+    /// `daemon.rs` 那个 `if` 分支的整个函数体（守卫连同它保护的赋值一起
+    /// 消失），`ph` 原地不动，这条测试照样绿：`state`/`bot` 没变过，
+    /// `owner` 本来就是 `None`。现在起点带着一个真实的 `owner`，「`r`
+    /// 必须清掉它」这条断言只有守卫真的执行了赋值才会成立。
     #[test]
     fn phone_unpair_from_waiting_for_pairing_stays_waiting_and_keeps_the_bot() {
         let mgr = Arc::new(SessionManager::new());
@@ -1422,7 +1468,7 @@ mod tests {
         let phone = Arc::new(Mutex::new(PhoneStatus {
             state: PhoneState::WaitingForPairing,
             bot: Some("my_dct_bot".into()),
-            owner: None,
+            owner: Some("lei".into()),
         }));
 
         let resp = handle(
@@ -1437,6 +1483,7 @@ mod tests {
             Response::Phone(status) => {
                 assert_eq!(status.state, PhoneState::WaitingForPairing);
                 assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+                assert!(status.owner.is_none(), "r 是重新配对，上一个主人必须被忘掉");
             }
             other => panic!("期待 Response::Phone，得到 {other:?}"),
         }

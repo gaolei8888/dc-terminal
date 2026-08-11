@@ -361,6 +361,41 @@ mod tests {
         assert!(s.contains("my_dct_bot"), "等配对却没说是哪个 bot：{s}");
     }
 
+    /// **fix round 2 的 Important 1。** 三个 `Broken` 原因说的是三句不同的
+    /// 下一步——这是这一整轮修复的意义所在（`PhoneBrokenReason` 存在的
+    /// 唯一理由）：`BadToken` 该重填，`BotBlocked` 该去解除拉黑，
+    /// `Unreachable` 该等一等再试，把它们说成同一句话会让「离线但令牌
+    /// 完好的用户被要求重填一份好端端的令牌」这个原始缺陷在测试全绿的
+    /// 情况下悄悄回来——`every_state_tells_the_user_what_to_do_next` 只
+    /// 断言 `next_step` 非空，三个原因全部折叠回同一句 `PhoneNextStepBadToken`
+    /// 照样通过。这条测试直接比对三句话本身，两两不同（验证过：把
+    /// `next_step` 的三个 `Broken` 分支都改成 `PhoneNextStepBadToken`，
+    /// 这条测试红，`every_state_tells_the_user_what_to_do_next` 仍然绿）。
+    #[test]
+    fn the_three_broken_reasons_give_three_different_next_steps() {
+        let step_for = |reason| {
+            next_step(
+                &PhoneStatus {
+                    state: PhoneState::Broken {
+                        reason,
+                        message: "x".into(),
+                    },
+                    bot: None,
+                    owner: None,
+                },
+                Lang::Zh,
+            )
+            .expect("Broken 必须给下一步")
+        };
+        let bad_token = step_for(PhoneBrokenReason::BadToken);
+        let bot_blocked = step_for(PhoneBrokenReason::BotBlocked);
+        let unreachable = step_for(PhoneBrokenReason::Unreachable);
+
+        assert_ne!(bad_token, bot_blocked, "令牌失效和被拉黑不该说同一句下一步");
+        assert_ne!(bad_token, unreachable, "令牌失效和连不上不该说同一句下一步");
+        assert_ne!(bot_blocked, unreachable, "被拉黑和连不上不该说同一句下一步");
+    }
+
     /// 令牌是密钥。**任何一处状态文案都不许把它带出来。**
     #[test]
     fn the_token_never_appears_in_any_status_text() {

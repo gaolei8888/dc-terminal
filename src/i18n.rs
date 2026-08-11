@@ -1780,4 +1780,25 @@ mod tests {
         assert_eq!(Lang::En.native_name(), "English");
         assert_eq!(Lang::Zh.native_name(), "中文");
     }
+
+    /// `msg::phone_blocked` 今天没有任何生产代码调用点——
+    /// `daemon.rs::phone_verify_token` 把 403 映成 `BadToken`，不是
+    /// `BotBlocked`（dct-phone-channel Task 4 fix round 2 的 Important 2：
+    /// 让这条路径产出 `BotBlocked` 会跟 `apply_phone_set_token` 从不为
+    /// `Broken` 落盘这件事对不上）。这个函数留着是给 Task 5 的 Bridge 用
+    /// 的——一次真正配对之后往已知 chat 发消息被拒才是它的真实调用点。
+    /// 这条测试是它今天唯一的调用者，两种语言都要组得出话，不然它会在
+    /// 真被用到的那天才第一次被验证。
+    #[test]
+    fn phone_blocked_composes_in_both_languages() {
+        for l in Lang::all() {
+            let s = msg::phone_blocked(*l);
+            assert!(!s.trim().is_empty(), "{l:?} 下组不出话");
+        }
+        assert!(
+            !has_han(&msg::phone_blocked(Lang::En)),
+            "英文里有汉字：{}",
+            msg::phone_blocked(Lang::En)
+        );
+    }
 }
