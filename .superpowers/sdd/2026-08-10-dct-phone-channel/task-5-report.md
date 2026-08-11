@@ -226,3 +226,47 @@ thread '...' panicked at src/daemon.rs:842:23:
 handle() 没有在 5 秒内返回——大概率是 bridge_slot 相关的一个死锁回归了，见 Request::PhoneUnpair 那条锁死注释
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 836 filtered out; finished in 5.01s
 ```
+
+---
+
+# Fix round 2 (final four items)
+
+**Status:** complete. Four commits on `feat/phone-channel`, one per item:
+- `ec1210c` — `test: cover PhoneDisable's owner-key removal from secrets.toml`
+- `87a86d1` — `fix: parse the saved owner id once, shared by status and Bridge`
+- `3691d42` — `test: pin PhoneDisable's retire-before-phone-lock ordering`
+- `b1f4ea5` — `fix: rebind the third bridge_slot if-let in PhoneDisable`
+
+Test summary: `cargo test --lib -- --test-threads=1` → 844 passed, 0 failed, 29.69s (up from the base 842: two genuinely new tests, `initial_phone_status_treats_an_unparseable_owner_as_no_owner` and `phone_disable_retires_before_it_ever_touches_the_phone_lock`; `phone_disable_deletes_the_token_and_resets_to_off` and `phone_disable_retires_a_present_bridge_and_clears_the_slot` gained assertions but are the same tests). `cargo fmt -- --check`, `cargo clippy --all-targets`, `git diff --check` all clean after every item.
+
+## Item 1 — `PhoneDisable`'s owner removal now has coverage
+
+Extended `phone_disable_deletes_the_token_and_resets_to_off` (`src/daemon.rs`) to seed `PHONE_OWNER_KEY` on disk and assert it's gone afterward, with a message naming the actual harm ("a privacy leftover after an explicit off"). Confirmed by mutation: removing the `.and_then(|_| recover(secrets.lock()).remove(PHONE_OWNER_KEY))` step made the test fail red; reverted with `Edit` (not `git checkout --`, per the standing instruction — item 1's real change was committed first).
+
+## Item 2 — owner key parsed once, shared by status and `Bridge`
+
+`initial_phone_status` and `run_with_manager` read `PHONE_OWNER_KEY` with two different rules: the former only checked whether the raw string existed, the latter required `.parse::<i64>()` to succeed. Added `parse_saved_owner(sec: &SecretStore) -> Option<i64>` and made both call sites use it — `initial_phone_status` now derives its `Paired`/`WaitingForPairing` decision and its `owner: Option<String>` field from the same parsed value `run_with_manager` feeds `Bridge::new_with_owner`. A garbled value (only reachable via a hand-edited or corrupted `secrets.toml`) now reports `WaitingForPairing` consistently instead of a `Paired` that lies about the real `Bridge`'s open pairing window.
+
+New test `initial_phone_status_treats_an_unparseable_owner_as_no_owner` seeds `PHONE_OWNER_KEY = "not-a-chat-id"` and asserts `WaitingForPairing`/`owner: None`. Confirmed by mutation: reverting `initial_phone_status`'s owner line back to the old raw-string check (`sec.get(PHONE_OWNER_KEY).map(str::to_string)`, `owner.is_some()`) made it fail red (`Paired` vs expected `WaitingForPairing`); reverted with `Edit`.
+
+One implementation snag worth recording: writing `parse_saved_owner(&recover(secrets.lock()))` inline in `run_with_manager` doesn't compile — Rust infers `recover`'s generic `T` from the *expected* argument type of `parse_saved_owner` (`&SecretStore`), so it tries to unify `T = SecretStore` against `secrets.lock() : LockResult<MutexGuard<SecretStore>>` and fails with a confusing "expected `Result<SecretStore, ...>`, found `Result<MutexGuard<...>, ...>`" pointing at `recover`, not at the real mismatch. Fixed by binding the guard to a named `sec` variable first, matching the codebase's existing "one `lock()` per statement" discipline.
+
+## Item 3 — deterministic pin for the retire-before-lock ordering
+
+A previous implementer judged no non-flaky test was possible and left the ordering enforced only by code structure and comment. Added `phone_disable_retires_before_it_ever_touches_the_phone_lock`: the test thread locks `phone` and holds the guard, spawns `handle(Request::PhoneDisable, ...)` on another thread, then bounded-waits (2s) for `bridge.is_retired_for_test()` **while still holding the guard**, then drops it and joins.
+
+Verified both directions by hand:
+- With the real (fixed) ordering: passes immediately, every run.
+- Temporarily swapped `PhoneDisable`'s two steps back to the pre-Critical-2 shape (lock `phone`, write `Off`, *then* lock `bridge_slot` and retire, all under the same `phone` guard): the test failed deterministically in ~2.02s (`retire() 必须在 PhoneDisable 碰 phone 锁之前发生...`), because `handle()`'s thread blocks on `phone.lock()` (held by the test thread) before it ever reaches `retire()`. Not a timing coincidence — the old order makes the wait's success structurally impossible within the budget, and the new order makes it structurally certain. Reverted the mutation with `Edit`, re-ran `phone_disable::` tests green.
+
+Fail-closed as specified: the only failure mode under load is a false red (the 2s budget is generous relative to the pure in-memory work involved), never a false green.
+
+## Item 4 — third `bridge_slot` if-let rebound
+
+`PhoneDisable`'s `if let Some(bridge) = recover(bridge_slot.lock()).take() { bridge.retire(); }` was the one site of three left in the fragile shape (`if let` scrutinee's `MutexGuard` lives across the whole block). Rebound it the same way as the other two (`run_with_manager`'s startup `if let Some(token) = ...`, `PhoneUnpair`'s `if let Some(bridge) = ...`): lock-and-take into a named `bridge` variable first, then `if let Some(bridge) = bridge`. Added a comment explaining this site was safe only because its body happens not to re-lock — reasoned around, not structurally prevented — matching the reasoning already given at the other two sites.
+
+No new test for this item: it's a refactor of a pattern already covered end-to-end by `phone_disable_retires_a_present_bridge_and_clears_the_slot` and the new ordering test in item 3, both of which exercise this exact `if let` with a populated `bridge_slot` and would hang (caught by `handle_with_deadline`'s 5s deadline or item 3's own bounded wait) if the rebind were wrong.
+
+## Concerns
+
+- None new. The four items were independently scoped and don't interact with each other's code paths beyond both touching `Request::PhoneDisable`'s body (items 1, 3, 4 all touch it; verified the full `daemon::` and `bridge::` suites stay green after each commit, not just at the end).
