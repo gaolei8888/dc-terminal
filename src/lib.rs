@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod channel;
 pub mod cli;
 pub mod client;

@@ -872,17 +872,30 @@ pub mod msg {
     }
 
     /// 令牌完好，但对方在 Telegram 里把这个 bot 拉黑了/删了对话（403）。
-    /// **`daemon.rs::phone_verify_token` 今天没有任何路径会真的调用这个
-    /// 函数**——`getMe` 没有 chat 上下文，Telegram 不会拿它回 403，这个
-    /// 原因只会在 Task 5 的 Bridge 真的往一个已配对的 chat 发消息时出现。
-    /// 留着这个分支是因为 `ChannelError` 现在有 `Blocked` 这个变体，
-    /// `phone_verify_token` 的 match 必须穷尽；写清楚这一点是为了不让
-    /// 未来的人以为这条路径今天被测过、被验证过。
+    /// **`daemon.rs::phone_verify_token` 仍然从不调用这个函数**——`getMe`
+    /// 没有 chat 上下文，Telegram 不会拿它回一个有意义的 403，那条路径把
+    /// `Blocked` 映成 `BadToken`（见它自己的文档注释）。真正的调用点是
+    /// `bridge.rs::send_pairing_confirmation`：配对刚成立那一刻往新认下的
+    /// chat 发确认消息，那时候手上是一个确凿无疑的 chat id，403 在那里
+    /// 才是「这个 chat 拉黑了 bot」的真话，不是猜测。
     pub fn phone_blocked(lang: Lang) -> String {
         t!(
             lang,
             en: "this bot has been blocked in Telegram — unblock it and try again",
             zh: "这个机器人在 Telegram 里被拉黑了，解除拉黑后再试一次",
+        )
+        .to_string()
+    }
+
+    /// 配对刚成立那一刻，`bridge.rs` 往新认下的主人发的第一句话。**故意
+    /// 不承诺任何还没落地的功能**——这个分支落地时事件通知（agent 停下/
+    /// 出错才推一条消息）还没有任何代码，回复被敲进会话（Task 7）也还
+    /// 没有；这句话只确认"配对成功了"这一件已经真实发生的事，不多说。
+    pub fn phone_pairing_confirmation(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "dct is now paired with this chat. This is its first message.",
+            zh: "dct 配对成功，这是它发来的第一条消息。",
         )
         .to_string()
     }
@@ -1781,14 +1794,13 @@ mod tests {
         assert_eq!(Lang::Zh.native_name(), "中文");
     }
 
-    /// `msg::phone_blocked` 今天没有任何生产代码调用点——
-    /// `daemon.rs::phone_verify_token` 把 403 映成 `BadToken`，不是
-    /// `BotBlocked`（dct-phone-channel Task 4 fix round 2 的 Important 2：
-    /// 让这条路径产出 `BotBlocked` 会跟 `apply_phone_set_token` 从不为
-    /// `Broken` 落盘这件事对不上）。这个函数留着是给 Task 5 的 Bridge 用
-    /// 的——一次真正配对之后往已知 chat 发消息被拒才是它的真实调用点。
-    /// 这条测试是它今天唯一的调用者，两种语言都要组得出话，不然它会在
-    /// 真被用到的那天才第一次被验证。
+    /// `daemon.rs::phone_verify_token` 仍然从不调用 `msg::phone_blocked`
+    /// ——它把 403 映成 `BadToken`，不是 `BotBlocked`（dct-phone-channel
+    /// Task 4 fix round 2 的 Important 2：让那条路径产出 `BotBlocked` 会跟
+    /// `apply_phone_set_token` 从不为 `Broken` 落盘这件事对不上）。真正的
+    /// 调用点从 Task 5 起是 `bridge.rs::send_pairing_confirmation`——一次
+    /// 真正配对之后往已知 chat 发确认消息被拒。这条测试单独钉住两种语言
+    /// 都组得出话，不依赖那条集成路径真的打一次网络才能验证文案本身。
     #[test]
     fn phone_blocked_composes_in_both_languages() {
         for l in Lang::all() {
