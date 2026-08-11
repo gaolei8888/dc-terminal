@@ -120,6 +120,15 @@ impl Bridge {
     fn is_retired(&self) -> bool {
         self.retired.load(Ordering::SeqCst)
     }
+
+    /// `retire()` 的效果全在一个私有 `AtomicBool` 里，daemon.rs 那条
+    /// 「`PhoneDisable` 真的让旧 Bridge 停下来」的测试没有别的办法确认
+    /// 调用生效——同 `i18n::has_han` 那种 `#[cfg(test)] pub(crate)` 开孔，
+    /// 只在测试构建里存在，不改变生产可见性。
+    #[cfg(test)]
+    pub(crate) fn is_retired_for_test(&self) -> bool {
+        self.is_retired()
+    }
 }
 
 /// 下一次重试前该等多久。指数退避，从 1 秒开始每次翻倍，`MAX_BACKOFF`
@@ -295,7 +304,7 @@ mod tests {
     impl Channel for FakeChannel {
         fn send(&self, text: &str) -> Result<crate::channel::MsgId, ChannelError> {
             recover(self.sent.lock()).push(text.to_string());
-            recover(self.send_result.lock()).clone().unwrap_or(Ok(0))
+            (*recover(self.send_result.lock())).unwrap_or(Ok(0))
         }
 
         fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {

@@ -169,12 +169,9 @@ pub enum PhoneState {
     Off,
     /// 填了、验过了，在等用户给 bot 发第一条消息
     WaitingForPairing,
-    /// 配上了。**这一分支在这个分支（dct-phone-channel）上没有任何代码
-    /// 构造它**——写这个状态需要真的收到过一条配对消息，那是 Task 5
-    /// （Bridge）的活。它已经在这里是因为协议、i18n 文案、`idle_help`、
-    /// 单测全都得先认识这第四种取值，Task 5 落地时不用再改一次协议形状。
-    /// 见它自己在 `ui/phone.rs`/`view.rs` 里的用法：那些地方处理它时都是
-    /// 「万一将来有」而不是「今天真的会出现」。
+    /// 配上了。从 Task 5 起真的会被构造——`bridge.rs::poll_forever` 收到
+    /// 第一条消息、`Bridge::accept` 认下发信人之后，把这个值写进 `phone`
+    /// 状态槽（长轮询线程自己写，不经过任何 `Request`）。
     Paired,
     /// 连不上。**`message` 装的是已经成文的人话，不是原始错误文本**——
     /// 守护进程是唯一决定用户看到什么文字的地方（本文件顶上
@@ -200,16 +197,16 @@ impl PhoneState {
     /// 坏，只是这个 bot 被拉黑了）；`Off` 不算，`Broken { BadToken | Unreachable, .. }`
     /// 也不算——后两者时 `apply_phone_set_token` 验证失败根本没有落盘。
     ///
-    /// **`BotBlocked` 这一支是一份承诺，不是今天就有代码兑现的事实。**
-    /// `daemon.rs::phone_verify_token`——这个分支上唯一会产出 `PhoneState`
-    /// 的地方——今天**从不**构造 `Broken { BotBlocked }`（fix round 2 的
-    /// Important 2：它曾经会，`apply_phone_set_token` 却对所有 `Broken`
-    /// 一律不落盘，两边对不上，会重演下面这段 Critical 2）。所以这一支
-    /// 今天是空过滤条件，只有测试手写状态才会用到。**任何将来构造
-    /// `Broken { BotBlocked }` 的代码（Task 5 的 Bridge：一次真正配对
-    /// 之后往已知 chat 发消息失败）必须先确保磁盘上真的有令牌、`bot`
-    /// 字段真的是 `Some`，再让这一支返回 `true`**——否则就是在维护一个
-    /// 谎言。
+    /// **`BotBlocked` 这一支从 Task 5 起是一份兑现了的承诺，不再是空过滤
+    /// 条件。** 唯一的产出点是 `bridge.rs::send_pairing_confirmation`：
+    /// 配对刚成立那一刻往新认下的 chat 发确认消息，403 就在这里落地成
+    /// `Broken { BotBlocked }`。能走到这一步，前面必然已经先有一次成功的
+    /// `apply_phone_set_token`（令牌和 `bot` 名字早就落盘了），再有一次
+    /// 成功的 `Bridge::accept`（配对本身也已经发生）——这个分支返回 `true`
+    /// 不是靠人手工守住的约定，是这两件已经发生的事的自然推论，所以是
+    /// **真** 而不是**巧**。`daemon.rs::phone_verify_token`（`getMe` 那条
+    /// 验证路径）依然从不构造它——`getMe` 没有 chat 上下文，403 在那里
+    /// 只能猜，不能像 `send()` 那样手上攥着一个确凿无疑的 chat id。
     ///
     /// **`r`（重新配对）/`x`（关掉）只在这里返回 `true` 时才有对象可
     /// 作用**，`ui/phone.rs::handle_status`（按下去有没有效果）和
