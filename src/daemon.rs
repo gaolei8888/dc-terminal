@@ -2112,15 +2112,16 @@ mod tests {
         let mut disk = SecretStore::load(&secrets_path);
         disk.set(PHONE_TOKEN_KEY, "some-token").unwrap();
         disk.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
+        disk.set(PHONE_OWNER_KEY, "111").unwrap();
         let secrets = Arc::new(Mutex::new(disk));
         let store = Arc::new(Mutex::new(Store::load(
             &tempfile::tempdir().unwrap().path().join("projects.json"),
         )));
         let profiles_dir = tempfile::tempdir().unwrap();
         let phone = Arc::new(Mutex::new(PhoneStatus {
-            state: PhoneState::WaitingForPairing,
+            state: PhoneState::Paired,
             bot: Some("my_dct_bot".into()),
-            owner: None,
+            owner: Some("111".into()),
         }));
 
         let resp = handle(
@@ -2147,6 +2148,12 @@ mod tests {
         assert!(
             recover(secrets.lock()).get(PHONE_BOT_KEY).is_none(),
             "bot 名字也要一起删掉，不然重新填令牌之前它还留在磁盘上"
+        );
+        assert!(
+            recover(secrets.lock()).get(PHONE_OWNER_KEY).is_none(),
+            "主人 id 也要一起删掉——不删的话，用户明确关掉手机通知之后，\
+             磁盘上还留着一个跟已经删掉的令牌配对过的 chat id，是一次关掉之后\
+             的隐私残留"
         );
     }
 
