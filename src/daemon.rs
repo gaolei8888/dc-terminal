@@ -15,7 +15,9 @@ use crate::proto::{
     ErrorCode, InstallPrompt, PhoneBrokenReason, PhoneState, PhoneStatus, ProfileEntry, Request,
     Response, SecretPrompt,
 };
-use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_BOT_KEY, PHONE_TOKEN_KEY};
+use crate::secrets::{
+    secrets_path_for_socket, SecretStore, PHONE_BOT_KEY, PHONE_OWNER_KEY, PHONE_TOKEN_KEY,
+};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
 
@@ -54,27 +56,42 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
 
-    // 手机通知这一页存在的全部理由是这一份状态——**不落盘**，落盘的只有
-    // 令牌本身和 bot 名字（跟别的密钥同一个文件，见 `PHONE_TOKEN_KEY`/
-    // `PHONE_BOT_KEY`）。有没有存过令牌决定开机时是 `Off` 还是
-    // `WaitingForPairing`；bot 名字直接从磁盘读，**不打网络**——早先这里
-    // 起过一个后台线程去 `getMe` 现查 bot 名字，被 dct-phone-channel
-    // Task 4 fix round 1 的 Critical 3 判定为一次没人要求、没有测试、还
-    // 会把预置了令牌的集成测试拖去打真实网络的多余动作，删掉了。
-    // `apply_phone_set_token` 验证通过的那一刻就把 bot 名字跟着令牌一起
-    // 存下来，开机直接读就是最新答案。
+    // 手机通知这一页存在的全部理由是这一份状态——**内存里的字段不落盘**，
+    // 落盘的是令牌本身、bot 名字、主人 chat id 三个键（跟别的密钥同一个
+    // 文件，见 `PHONE_TOKEN_KEY`/`PHONE_BOT_KEY`/`PHONE_OWNER_KEY`）。有没
+    // 有存过令牌、存过主人，决定开机时是 `Off`、`WaitingForPairing` 还是
+    // `Paired`；bot 名字和主人直接从磁盘读，**不用同步打一次网络请求就
+    // 拿到**——早先这里起过一个后台线程去 `getMe` 现查 bot 名字，被
+    // dct-phone-channel Task 4 fix round 1 的 Critical 3 判定为一次没人
+    // 要求、没有测试、还会把预置了令牌的集成测试拖去打真实网络的多余
+    // 动作，删掉了。`apply_phone_set_token` 验证通过的那一刻就把 bot 名字
+    // 跟着令牌一起存下来，开机直接读就是最新答案；主人 chat id 由
+    // `bridge.rs` 的 `on_owner_changed` 回调在配对/取消配对那一刻写，见
+    // `PHONE_OWNER_KEY` 自己的文档注释。
     let phone = Arc::new(Mutex::new(initial_phone_status(&secrets)));
 
     // dct-phone-channel Task 5：如果磁盘上已经有一份令牌（`WaitingForPairing`
     // 或者更早——`initial_phone_status` 刚刚已经读过一次同一个键），起一条
     // 真正在长轮询的 Bridge 线程。**这跟上面注释里删掉的那个「起线程去
     // getMe 现查 bot 名字」不是同一件事**：那是一次性的、会阻塞在「验证
-    // 通不通过」上的同步调用，这里是异步的长轮询，不读不写 bot 名字，只
-    // 是终于让「配对」这件事在开机时就有人在听——不然一个已经填过令牌、
-    // 还没配对成功的用户，重启一次守护进程就再也等不到自己发的那条
-    // Telegram 消息。
+    // 通不通过」上的同步调用，这里是异步的长轮询，只是终于让「配对」这
+    // 件事在开机时就有人在听——不然一个已经填过令牌、还没配对成功的
+    // 用户，重启一次守护进程就再也等不到自己发的那条 Telegram 消息。
+    //
+    // **如果磁盘上还存着一份配对好的主人 chat id，把它接回新起的
+    // `Bridge`（`Bridge::new_with_owner`），不是每次重启都重新打开一轮
+    // 配对**——这是 dct-phone-channel Task 5 fix round 1 的 Critical 1：
+    // 一个全新的 `Bridge`（`owner: None`）每次重启都会把配对窗口悄悄
+    // 重新打开，而且 `channel::telegram::Telegram` 的 `offset` 从 0 开始，
+    // 意味着这轮重新打开看到的第一批消息是 Telegram 服务器上攒着的、
+    // 最长将近 24 小时的历史积压——配对窗口不但重新打开，还倒退回了
+    // 过去某一刻，见 `bridge.rs` 模块头注释「主人 id 要落盘」和
+    // `PHONE_OWNER_KEY` 自己的文档注释。（`Bridge` 自己另外还会在第一次
+    // 真正长轮询之前吃一遍积压——`discard_backlog`——这两条修复缺一不可，
+    // 恢复持久化的主人救不了「从没配对过、刚填完令牌」这种起点本来就是
+    // `owner: None` 的场景。）
     let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(None));
-    // 先落进一个命名变量，`secrets` 的 `MutexGuard` 才会在这条 `let` 语句
+    // 先落进命名变量，`secrets` 的 `MutexGuard` 才会在这条 `let` 语句
     // 结束时就释放——写成 `if let Some(token) = recover(secrets.lock())…
     // { start_phone_bridge(...) }` 的话，判别式里的临时 `MutexGuard` 会
     // 存活到整个块结束，`start_phone_bridge` 内部虽然锁的是另一把锁
@@ -85,9 +102,16 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let saved_token = recover(secrets.lock())
         .get(PHONE_TOKEN_KEY)
         .map(str::to_string);
+    let saved_owner = recover(secrets.lock())
+        .get(PHONE_OWNER_KEY)
+        .and_then(|s| s.parse::<i64>().ok());
     if let Some(token) = saved_token {
         start_phone_bridge(
-            Arc::new(Bridge::new(Arc::new(Telegram::new(&token)))),
+            Arc::new(Bridge::new_with_owner(
+                Arc::new(Telegram::new(&token)),
+                saved_owner,
+                persist_owner_hook(secrets.clone()),
+            )),
             phone.clone(),
             &bridge_slot,
         );
@@ -127,6 +151,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
 /// 一条消息，「现在该用哪一个 Bridge、该不该起一条新线程」是这个槽位和
 /// 它旁边那几个调用点（`start_phone_bridge`、`PhoneUnpair`、
 /// `PhoneDisable`）的事。`None` 意味着手机通知没开，或者刚被整个关掉。
+///
+/// **这把锁和 `phone` 那把锁从不嵌套持有**——`handle()` 里摸到两者的
+/// 分支（`PhoneUnpair`/`PhoneDisable`）永远是「锁一个、用完释放、再锁
+/// 另一个」，不是「锁着一个的时候去锁另一个」，所以两者谁先谁后没有
+/// real 死锁风险；但为了不留一个「读代码才知道」的隐性规则，这里明说：
+/// 别在持有 `bridge_slot` 的时候去锁 `phone`，也别反过来。
 type PhoneBridgeSlot = Arc<Mutex<Option<Arc<Bridge>>>>;
 
 /// 把一个刚验证过的令牌接成一条真正在跑的手机通道：把 `Bridge` 塞进共享
@@ -134,28 +164,77 @@ type PhoneBridgeSlot = Arc<Mutex<Option<Arc<Bridge>>>>;
 /// 有令牌（`run_with_manager`）、`PhoneSetToken` 验证成功、`PhoneUnpair`
 /// 从 `Broken { BotBlocked }` 恢复（复用同一个 `Bridge`，令牌没变不用
 /// 重新建 Telegram 客户端）。
+///
+/// **换新 Bridge 之前，先把槽里可能还留着的旧 Bridge 退休掉——除非它
+/// 就是同一个。** 这是 dct-phone-channel Task 5 fix round 1 的
+/// Important 1：`PhoneSetToken` 换新令牌时如果不这么做，旧 Bridge 的
+/// 轮询线程会跟新的并存下去，两条线程都在拿各自的令牌轮询、都可能把
+/// `phone` 状态槽写乱。用 `Arc::ptr_eq` 判断"是不是同一个"而不是无条件
+/// retire——`PhoneUnpair` 的 `BotBlocked` 恢复分支传进来的就是**同一个**
+/// `Bridge`（令牌没变，复用它换一条新线程），无条件 retire 会让这条新
+/// 线程一启动就看见自己被标记成"已退休"，立刻退出，白起。
 fn start_phone_bridge(bridge: Arc<Bridge>, phone: Arc<Mutex<PhoneStatus>>, slot: &PhoneBridgeSlot) {
-    *recover(slot.lock()) = Some(bridge.clone());
+    let mut guard = recover(slot.lock());
+    if let Some(old) = guard.take() {
+        if !Arc::ptr_eq(&old, &bridge) {
+            old.retire();
+        }
+    }
+    *guard = Some(bridge.clone());
+    drop(guard);
     std::thread::spawn(move || crate::bridge::run(bridge, phone));
 }
 
+/// `Bridge::new_with_owner` 的 `on_owner_changed` 回调，接到
+/// `secrets::PHONE_OWNER_KEY`——配对成功时把 chat id 落盘，取消配对时
+/// 删掉。**这是这个键唯一的写入点**（`PhoneDisable` 例外：它走
+/// `Bridge::retire()` 不触发这个回调，自己另外删一次，见
+/// `Request::PhoneDisable` 的注释）。落盘失败只记一条 stderr，不是这个
+/// 回调该往哪儿报错的地方——`Bridge` 内部调用它的两个点（`accept()`/
+/// `unpair()`）都不是可以失败的函数，凭空多一个错误返回值只会逼着
+/// `Bridge` 自己决定"落盘失败了该干什么"，那不是它的关注点。
+fn persist_owner_hook(secrets: Arc<Mutex<SecretStore>>) -> Box<dyn Fn(Option<i64>) + Send + Sync> {
+    Box::new(move |owner| {
+        let mut sec = recover(secrets.lock());
+        let result = match owner {
+            Some(id) => sec.set(PHONE_OWNER_KEY, &id.to_string()),
+            None => sec.remove(PHONE_OWNER_KEY),
+        };
+        if let Err(e) = result {
+            eprintln!("dct: 记不下配对的主人 id（{e}），下次重启会重新配对");
+        }
+    })
+}
+
 /// 手机通知刚启动时的状态：有没有存过令牌决定 `Off` 还是
-/// `WaitingForPairing`，bot 名字直接从磁盘读（`apply_phone_set_token`
-/// 验证通过的那一刻已经把它跟令牌一起存下来了）。**不打网络**——见本文件
-/// `run_with_manager` 里那段注释，起一个后台线程去 `getMe` 现查 bot 名字
-/// 是这里删掉的一版旧设计，被判定为没人要求、没有测试、还会把预置了
-/// 令牌的集成测试拖去打真实网络。
+/// `WaitingForPairing`/`Paired`；bot 名字、主人 id 直接从磁盘读
+/// （`apply_phone_set_token`/`bridge.rs` 的 `on_owner_changed` 分别在
+/// 验证通过、配对成功那一刻把它们存下来了）。**不需要同步打一次网络
+/// 请求就能算出这三个字段**——早先这里起过一个后台线程去 `getMe` 现查
+/// bot 名字，被 dct-phone-channel Task 4 fix round 1 的 Critical 3 判定
+/// 为一次没人要求、没有测试、还会把预置了令牌的集成测试拖去打真实网络
+/// 的多余动作，删掉了。
+///
+/// **存在的主人 id 意味着状态直接是 `Paired`，不是 `WaitingForPairing`**
+/// ——dct-phone-channel Task 5 fix round 1 的 Critical 1/Important 2：
+/// 磁盘上有主人 id 就代表配对真的发生过，重启不该让页面倒退回"等配对"
+/// （用户会以为自己需要重新在 Telegram 里发消息，其实不需要）；
+/// `run_with_manager` 随后会把同一个主人接回新起的 `Bridge`，这里只是
+/// 让界面立刻反映那个即将发生的恢复，不用等第一次心跳。
 fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
     let sec = recover(secrets.lock());
     let has_token = sec.get(PHONE_TOKEN_KEY).is_some();
+    let owner = sec.get(PHONE_OWNER_KEY).map(str::to_string);
     PhoneStatus {
-        state: if has_token {
-            PhoneState::WaitingForPairing
-        } else {
+        state: if !has_token {
             PhoneState::Off
+        } else if owner.is_some() {
+            PhoneState::Paired
+        } else {
+            PhoneState::WaitingForPairing
         },
         bot: sec.get(PHONE_BOT_KEY).map(str::to_string),
-        owner: None,
+        owner,
     }
 }
 
@@ -230,13 +309,21 @@ fn apply_phone_set_token(
 ) -> anyhow::Result<Response> {
     match phone_verify_token(token, lang, get_me) {
         Ok(bot) => {
-            // 令牌和 bot 名字一起落盘：`initial_phone_status` 开机时直接读
-            // 这两个键，不再打网络去现查 bot 名字（见 `run_with_manager` 头上
-            // 那段注释）——两个写操作里如果只有第一个成功，重启后会读到一个
-            // 有令牌没 bot 名字的状态，「等你在 Telegram 里给 @? 发条消息」
-            // 的老问题会从另一个角度冒出来，所以两次 `set` 的结果都要检查。
+            // 令牌、bot 名字、（如果有的话）上一轮的主人 id 一起处理：
+            // `initial_phone_status` 开机时直接读这几个键，不再打网络去
+            // 现查 bot 名字（见 `run_with_manager` 头上那段注释）——三个
+            // 写操作里如果前两个只有一个成功，重启后会读到一个有令牌没
+            // bot 名字的状态，「等你在 Telegram 里给 @? 发条消息」的老
+            // 问题会从另一个角度冒出来，所以每一步的结果都要检查。
             //
-            // **两次 `secrets.lock()` 必须是两条分开的语句**——`Mutex` 不可
+            // **第三步删 `PHONE_OWNER_KEY`**：新令牌等于新的 bot、新的
+            // 一轮配对，上一次配上的主人不该继续留在磁盘上——不删的话，
+            // 如果这次填新令牌之后守护进程在配对真的完成之前就重启了，
+            // `initial_phone_status`/`run_with_manager` 会捡到一个属于
+            // **旧**令牌的主人 id，把它错误地接到这个**新**令牌的
+            // `Bridge` 上，通知发去一个跟新令牌毫不相干的 chat。
+            //
+            // **三次 `secrets.lock()` 必须是三条分开的语句**——`Mutex` 不可
             // 重入，第一次 `recover(secrets.lock())` 产生的 `MutexGuard` 是这
             // 条语句里的一个临时值，Rust 的临时值销毁规则是"整条语句结束时才
             // 释放"，如果写成一条链式表达式（`.and_then` 闭包里再 `lock()`
@@ -245,6 +332,7 @@ fn apply_phone_set_token(
             let first = recover(secrets.lock()).set(PHONE_TOKEN_KEY, token);
             first
                 .and_then(|_| recover(secrets.lock()).set(PHONE_BOT_KEY, &bot))
+                .and_then(|_| recover(secrets.lock()).remove(PHONE_OWNER_KEY))
                 .map(|_| {
                     let mut ph = recover(phone.lock());
                     // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人
@@ -546,8 +634,18 @@ fn handle(
                     ..
                 }))
             ) {
+                // `owner: None`——新令牌就是新的一轮配对，`apply_phone_
+                // set_token` 已经把上一轮的主人 id 从磁盘和内存里都清掉了
+                // （见它自己的注释），这里不该凭空恢复一个。`start_phone_
+                // bridge` 会先把槽里可能还留着的旧 Bridge 退休掉
+                // （Important 1），新 Bridge 用同一个 `persist_owner_hook`
+                // ——配对真的发生时，回调把新主人写进同一个 `PHONE_OWNER_KEY`。
                 start_phone_bridge(
-                    Arc::new(Bridge::new(Arc::new(Telegram::new(&token)))),
+                    Arc::new(Bridge::new_with_owner(
+                        Arc::new(Telegram::new(&token)),
+                        None,
+                        persist_owner_hook(secrets.clone()),
+                    )),
                     phone.clone(),
                     bridge_slot,
                 );
@@ -625,31 +723,48 @@ fn handle(
             Ok(Response::Phone(out))
         }
         Request::PhoneDisable => {
-            // 两条分开的语句，同一个理由见 `apply_phone_set_token` 里那条
+            // 三条分开的语句，同一个理由见 `apply_phone_set_token` 里那条
             // 长注释：`Mutex` 不可重入，写成一条链式表达式会让第一次
             // `secrets.lock()` 的 `MutexGuard`（这条表达式里的临时值，
             // 活到整条语句结束）在 `.and_then` 闭包再次 `lock()` 同一把锁
-            // 时还没释放，自己把自己锁死。
+            // 时还没释放，自己把自己锁死。第三个键：`PHONE_OWNER_KEY` 不是
+            // 经 `Bridge::unpair()` 清的——`PhoneDisable` 走的是
+            // `Bridge::retire()`，`retire()` 不触发 `on_owner_changed`（见
+            // 那个字段的文档注释），这里必须自己删一次，不然彻底关掉之后
+            // 磁盘上还留着一个跟已经删掉的令牌配对过的主人 id。
             let first = recover(secrets.lock()).remove(PHONE_TOKEN_KEY);
             first
                 .and_then(|_| recover(secrets.lock()).remove(PHONE_BOT_KEY))
+                .and_then(|_| recover(secrets.lock()).remove(PHONE_OWNER_KEY))
                 .map(|_| {
+                    // **Critical 2 的修复：先退休旧 Bridge，再碰 `phone`，
+                    // 两步之间不嵌套持有任何一把锁。** 旧写法是先锁
+                    // `phone`、写 `Off`，再锁 `bridge_slot`、`retire()`，
+                    // 全程都攥着 `phone` 的锁——`poll_forever` 的
+                    // `record_pairing`/`record_bot_blocked` 会在这把锁
+                    // 释放之后才拿到它，而那时候 `retire()` 已经跑过了，
+                    // 靠"锁释放在 retire() 之后"这个顺序侥幸做对了检查。
+                    // **反过来写（不锁着 phone 去 retire）看似更"轻"，
+                    // 却会漏出一个真实的窗口**：如果 retire() 推迟到
+                    // "phone 解锁"之后才执行，一个恰好在那个窗口里抢到
+                    // `phone` 锁的轮询线程，重新检查 `is_retired()` 时
+                    // 读到的还是 `false`，照样把 `Paired`/`Broken`
+                    // 写回去。让 `retire()` 严格发生在这个函数第一次碰
+                    // `phone` 之前——不共享任何一把锁、纯粹靠先后顺序—
+                    // —就不会有这个窗口：任何随后才拿到 `phone` 锁的
+                    // 轮询线程，`is_retired()` 一定已经是 `true`。
+                    // `bridge.rs` 那几个 `record_*` 函数的 `is_retired()`
+                    // 重新检查是这半套修复的另一半，见它们各自的文档
+                    // 注释。
+                    if let Some(bridge) = recover(bridge_slot.lock()).take() {
+                        bridge.retire();
+                    }
                     let mut ph = recover(phone.lock());
                     *ph = PhoneStatus {
                         state: PhoneState::Off,
                         bot: None,
                         owner: None,
                     };
-                    // 彻底关掉：清空共享槽，把旧 Bridge（如果还在跑）标记
-                    // 成 retired——下一次它检查这个标记（循环顶端，或者
-                    // 处理完一条消息之后）就会安静退出，不会在令牌已经被
-                    // 用户删掉之后还把状态悄悄改回 `Paired`。见
-                    // `bridge.rs::Bridge::retire` 头注释里那条有边界的
-                    // 承诺：这不保证立刻停，线程可能正卡在一次 `poll()`
-                    // 网络调用里。
-                    if let Some(bridge) = recover(bridge_slot.lock()).take() {
-                        bridge.retire();
-                    }
                     Response::Phone(ph.clone())
                 })
         }
@@ -691,6 +806,47 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
+    /// 在独立线程上跑 `handle()`，用 `recv_timeout` 给一个宽裕的死线——
+    /// `bridge_slot` 相关的几个分支曾经真的死锁过一次（见
+    /// `Request::PhoneUnpair` 里那条锁死注释），死锁的失败模式是「进程
+    /// 再也不返回」，不是「断言失败」：一条真的卡住的测试会拖着整个
+    /// `cargo test` 陪葬（`ps` 才看得出来），不会像正常的失败那样几秒
+    /// 内报红。这几条摸 `bridge_slot` 的测试改用这个而不是直接调
+    /// `handle()`，让「死锁回归了」翻译成「这条测试失败，5 秒内」，
+    /// 不是「这条测试再也不结束」——同 `session.rs` 那条 `recv_timeout`
+    /// 反过来用的道理，这里等的也是"确认它没卡住"，5 秒是巨大的余量
+    /// （正常调用是纯内存操作，微秒级）。
+    fn handle_with_deadline(
+        req: Request,
+        mgr: Arc<SessionManager>,
+        store: Arc<Mutex<Store>>,
+        secrets: Arc<Mutex<SecretStore>>,
+        profiles_dir: PathBuf,
+        phone: Arc<Mutex<PhoneStatus>>,
+        bridge_slot: PhoneBridgeSlot,
+    ) -> Response {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let resp = handle(
+                req,
+                &mgr,
+                &store,
+                &secrets,
+                &profiles_dir,
+                &phone,
+                &bridge_slot,
+            );
+            let _ = tx.send(resp);
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(resp) => resp,
+            Err(_) => panic!(
+                "handle() 没有在 5 秒内返回——大概率是 bridge_slot 相关的一个死锁回归了，\
+                 见 Request::PhoneUnpair 那条锁死注释"
+            ),
+        }
+    }
+
     /// 假渠道，只用来观察 `handle()` 里那几条摸 `bridge_slot` 的分支有没有
     /// 真的调用 `bridge.rs` 暴露出来的公开方法（`accept`/`unpair`/`poll`）
     /// ——故意不跟 `bridge.rs` 自己测试模块里的 `FakeChannel` 共用：那边测
@@ -723,6 +879,67 @@ mod tests {
         fn set_destination(&self, chat: Option<i64>) {
             recover(self.destinations.lock()).push(chat);
         }
+    }
+
+    // ———— start_phone_bridge: 换新 Bridge 之前退休旧的（Important 1） ————
+
+    /// **Important 1 的直接验证。** 槽里已经有一个 Bridge，换一个**不同**
+    /// 的 Bridge 进来——旧的必须被 retire，新的不该被误伤，槽里最终装的
+    /// 是新的那个。
+    #[test]
+    fn start_phone_bridge_retires_a_different_previous_bridge() {
+        let old_bridge = Arc::new(Bridge::new(Arc::new(RecordingChannel::default())));
+        let slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(old_bridge.clone())));
+
+        let new_ch = Arc::new(RecordingChannel::default());
+        recover(new_ch.poll_script.lock()).push_back(Err(ChannelError::BadToken));
+        let new_bridge = Arc::new(Bridge::new(new_ch));
+        let phone = test_phone();
+
+        start_phone_bridge(new_bridge.clone(), phone, &slot);
+
+        assert!(
+            old_bridge.is_retired_for_test(),
+            "换新令牌时旧 Bridge 的轮询线程不该跟新的并存下去"
+        );
+        assert!(!new_bridge.is_retired_for_test(), "新 Bridge 不该被误伤");
+        let in_slot = recover(slot.lock()).clone().expect("槽里该装着新 Bridge");
+        assert!(Arc::ptr_eq(&in_slot, &new_bridge));
+    }
+
+    /// **同一个 Bridge 复用**（`PhoneUnpair` 从 `Broken{BotBlocked}` 恢复
+    /// 走的正是这条路）：不该被自己退休——那样新起的轮询线程一启动就会
+    /// 看见自己"已经退休"，立刻退出，白起一条线程。
+    #[test]
+    fn start_phone_bridge_does_not_retire_the_same_bridge_being_reinstalled() {
+        let ch = Arc::new(RecordingChannel::default());
+        recover(ch.poll_script.lock()).push_back(Err(ChannelError::BadToken));
+        let bridge = Arc::new(Bridge::new(ch));
+        let slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge.clone())));
+        let phone = test_phone();
+
+        start_phone_bridge(bridge.clone(), phone, &slot);
+
+        assert!(
+            !bridge.is_retired_for_test(),
+            "复用同一个 Bridge 换一条新线程时不该自己把自己 retire 掉"
+        );
+    }
+
+    // ———— persist_owner_hook: PHONE_OWNER_KEY 唯一的写入点（Critical 1） ————
+
+    #[test]
+    fn persist_owner_hook_sets_and_removes_the_owner_key() {
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        let hook = persist_owner_hook(secrets.clone());
+
+        hook(Some(111));
+        assert_eq!(recover(secrets.lock()).get(PHONE_OWNER_KEY), Some("111"));
+
+        hook(None);
+        assert!(recover(secrets.lock()).get(PHONE_OWNER_KEY).is_none());
     }
 
     /// 造一个文件足够多的仓库，让 agent 会话建立时的首次 git checkpoint 慢到能
@@ -1346,6 +1563,26 @@ mod tests {
         assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
     }
 
+    /// **dct-phone-channel Task 5 fix round 1，Critical 1 / Important 2。**
+    /// 磁盘上存着一个主人 id 意味着配对真的发生过——开机状态必须直接是
+    /// `Paired`，不是 `WaitingForPairing`：不这样的话，重启会让页面倒退
+    /// 回"等配对"，用户会以为自己需要在 Telegram 里重新发一条消息，其实
+    /// `run_with_manager` 马上就会把同一个主人接回新起的 `Bridge`，根本
+    /// 不需要。
+    #[test]
+    fn initial_phone_status_is_paired_when_an_owner_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SecretStore::load(&dir.path().join("secrets.toml"));
+        store.set(PHONE_TOKEN_KEY, "some-token").unwrap();
+        store.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
+        store.set(PHONE_OWNER_KEY, "111").unwrap();
+        let secrets = Mutex::new(store);
+        let status = initial_phone_status(&secrets);
+        assert_eq!(status.state, PhoneState::Paired);
+        assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+        assert_eq!(status.owner.as_deref(), Some("111"));
+    }
+
     /// 令牌好使：落盘、内存状态推进到 `WaitingForPairing`、主人清空
     /// （新令牌等于新的一轮配对）。
     #[test]
@@ -1386,6 +1623,41 @@ mod tests {
             Some("my_dct_bot"),
             "bot 名字也必须落盘——不存的话，重启后 initial_phone_status \
              要么打一次网络去现查（Critical 3 的根因），要么永远显示 @?"
+        );
+    }
+
+    /// **Critical 1 的收尾。** 换新令牌时，如果磁盘上还留着**上一个**
+    /// 令牌配对时存的主人 id，必须删掉——不删的话，一旦这次填新令牌之后
+    /// 守护进程在新一轮配对真的完成之前重启了，`initial_phone_status`/
+    /// `run_with_manager` 会把那个属于旧令牌的主人错误地接到新令牌的
+    /// `Bridge` 上。
+    #[test]
+    fn apply_phone_set_token_clears_a_stale_owner_from_the_previous_token() {
+        let secrets = Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        ));
+        recover(secrets.lock()).set(PHONE_OWNER_KEY, "111").unwrap();
+        let phone = Mutex::new(PhoneStatus {
+            state: PhoneState::Broken {
+                reason: PhoneBrokenReason::BadToken,
+                message: "x".into(),
+            },
+            bot: None,
+            owner: None,
+        });
+
+        apply_phone_set_token(
+            "good-token",
+            crate::i18n::Lang::Zh,
+            &secrets,
+            &phone,
+            &|_| Ok("my_dct_bot".to_string()),
+        )
+        .unwrap();
+
+        assert!(
+            recover(secrets.lock()).get(PHONE_OWNER_KEY).is_none(),
+            "旧令牌的主人 id 必须被新令牌的验证成功清掉"
         );
     }
 
@@ -1658,14 +1930,14 @@ mod tests {
         });
         let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge)));
 
-        handle(
+        handle_with_deadline(
             Request::PhoneUnpair,
-            &mgr,
-            &store,
-            &secrets,
-            profiles_dir.path(),
-            &phone,
-            &bridge_slot,
+            mgr,
+            store,
+            secrets,
+            profiles_dir.path().to_path_buf(),
+            phone,
+            bridge_slot,
         );
 
         assert_eq!(
@@ -1710,14 +1982,14 @@ mod tests {
         });
         let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge)));
 
-        handle(
+        handle_with_deadline(
             Request::PhoneUnpair,
-            &mgr,
-            &store,
-            &secrets,
-            profiles_dir.path(),
-            &phone,
-            &bridge_slot,
+            mgr,
+            store,
+            secrets,
+            profiles_dir.path().to_path_buf(),
+            phone,
+            bridge_slot,
         );
 
         assert_eq!(
@@ -1758,14 +2030,14 @@ mod tests {
         let bridge = Arc::new(Bridge::new(ch.clone()));
         let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge)));
 
-        handle(
+        handle_with_deadline(
             Request::PhoneUnpair,
-            &mgr,
-            &store,
-            &secrets,
-            profiles_dir.path(),
-            &phone,
-            &bridge_slot,
+            mgr,
+            store,
+            secrets,
+            profiles_dir.path().to_path_buf(),
+            phone,
+            bridge_slot,
         );
 
         // 新线程是异步起的，`handle()` 返回时不保证它已经跑完——有界等待
@@ -1908,14 +2180,14 @@ mod tests {
         assert!(!bridge.is_retired_for_test(), "起点必须不是已经退休的");
         let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge.clone())));
 
-        handle(
+        handle_with_deadline(
             Request::PhoneDisable,
-            &mgr,
-            &store,
-            &secrets,
-            profiles_dir.path(),
-            &phone,
-            &bridge_slot,
+            mgr,
+            store,
+            secrets,
+            profiles_dir.path().to_path_buf(),
+            phone,
+            bridge_slot.clone(),
         );
 
         assert!(

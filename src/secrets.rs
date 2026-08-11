@@ -27,12 +27,39 @@ pub const PHONE_TOKEN_KEY: &str = "__phone__";
 /// `PHONE_TOKEN_KEY` 完全一样：密钥页遍历的是 profiles，不是这个文件。
 ///
 /// 存它是为了让「等你在 Telegram 里给 @xxx 发条消息」这句话在守护进程
-/// 重启之后还说得出 `xxx` 是谁——不存的话，唯一的办法是重启时再打一次
-/// `getMe` 网络请求，那意味着每次启动都要连外网，而且给单元测试制造了
-/// 一个真实的网络依赖（dct-phone-channel Task 4 fix round 1 的 Critical
-/// 3：预先塞好令牌再起 daemon 的测试，会撞上这次网络请求本身，在没有
-/// 网络的机器上必定失败，在有网络的机器上还会跟这次请求的结果赛跑）。
+/// 重启之后不必等一次同步的 `getMe` 网络往返才显示得出来——不存的话，
+/// 唯一的办法是重启时再打一次 `getMe`，那会让界面在这次请求打完之前都
+/// 不知道该说什么，而且给单元测试制造了一个真实的网络依赖（dct-phone-
+/// channel Task 4 fix round 1 的 Critical 3：预先塞好令牌再起 daemon 的
+/// 测试，会撞上这次网络请求本身，在没有网络的机器上必定失败，在有网络
+/// 的机器上还会跟这次请求的结果赛跑）。
+///
+/// **这不再意味着"开机完全不碰网络"**——dct-phone-channel Task 5 之后，
+/// 磁盘上只要有令牌，`run_with_manager` 就会起一条真正在长轮询的
+/// `Bridge` 线程，那条线程自己会打 Telegram 的网络（还会在第一次真正
+/// 长轮询之前先吃一遍积压，见 `bridge.rs::discard_backlog`）。这里避免
+/// 的只是"为了显示 bot 名字而单独同步打一次 `getMe`"这一件具体的事，
+/// 不是"开机绝不碰网络"这个更大的断言——后者从 Task 5 起就不成立了。
 pub const PHONE_BOT_KEY: &str = "__phone_bot__";
+
+/// 配对成功之后的主人 chat id，跟令牌、bot 名字存在同一份仓里。
+///
+/// **这是 dct-phone-channel Task 5 fix round 1 的 Critical 1 修复**：
+/// 没有它，`Bridge` 每次随守护进程重启都会带着 `owner: None` 重新起，
+/// 也就是重新打开一轮配对——不是等一个新用户操作触发的窗口，是每次
+/// 重启都自动重开，而且 `Telegram::with_transport` 把 `offset` 初始化
+/// 成 0，意味着重新打开的这轮配对第一眼看到的不是"现在"发生的消息，
+/// 是 Telegram 服务器上攒着的、最长将近 24 小时的历史积压——**倒退回
+/// 过去某一刻的一扇重新打开的门**，一个几小时前发过消息的陌生人，
+/// 完全不需要在场、不需要够快，就能赢下配对。
+///
+/// 存了它，`run_with_manager` 重启时能把同一个主人接回新起的 `Bridge`
+/// （`Bridge::new_with_owner`），配对本身不用重新发生一次；`bridge.rs`
+/// 的 `on_owner_changed` 回调是这个键唯一的写入点——配对时（`accept()`）
+/// 写真实 chat id，取消配对时（`unpair()`）删掉。`PhoneDisable`
+/// （`Bridge::retire()`，不经过 `unpair()`）额外自己删一次，因为
+/// `retire()` 不触发这个回调。
+pub const PHONE_OWNER_KEY: &str = "__phone_owner__";
 
 /// 按 profile 名索引的用户密钥。落盘在 `~/.dct/secrets.toml`，0600。
 pub struct SecretStore {

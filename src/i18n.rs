@@ -900,6 +900,22 @@ pub mod msg {
         .to_string()
     }
 
+    /// `bridge.rs::run()` 兜住一次内部 panic 之后写进 `PhoneState::Broken`
+    /// 的文案——dct-phone-channel Task 5 fix round 1 的 Important 3：不给
+    /// 这种情况一句话，页面会永远停在 `WaitingForPairing`/`Paired` 上，
+    /// 背后其实什么都没有在监听，而用户没有任何信号知道。**故意不说
+    /// 「令牌」出了什么问题**——panic 不是一个 `ChannelError`，编不出更
+    /// 精确的原因，这句话只给一个总是管用的下一步：关掉再重新来一次。
+    pub fn phone_bridge_panicked(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "phone notifications hit an internal error and stopped — \
+                 press x to turn it off, then fill in the token again",
+            zh: "手机通知出了问题，已经停掉——按 x 关掉，再重新填一次令牌",
+        )
+        .to_string()
+    }
+
     /// 标题里必须带上「Esc 回哪」，而且分设置页/选择器两种。
     ///
     /// 这半句一度被合并掉，理由是底栏的 `idle_help` 已经说了——但那两处画在
@@ -1811,6 +1827,40 @@ mod tests {
             !has_han(&msg::phone_blocked(Lang::En)),
             "英文里有汉字：{}",
             msg::phone_blocked(Lang::En)
+        );
+    }
+
+    /// `msg::phone_pairing_confirmation` 是唯一会真的落到用户手机屏幕上
+    /// 的新字符串——`phone_blocked` 有上面那条测试单独钉着两种语言都
+    /// 组得出话，这条是它的邻居，同样的理由（dct-phone-channel Task 5
+    /// fix round 1 的 Minor：这条字符串曾经只被集成路径间接覆盖，从没有
+    /// 一条测试直接调用过它）。
+    #[test]
+    fn phone_pairing_confirmation_composes_in_both_languages() {
+        for l in Lang::all() {
+            let s = msg::phone_pairing_confirmation(*l);
+            assert!(!s.trim().is_empty(), "{l:?} 下组不出话");
+        }
+        assert!(
+            !has_han(&msg::phone_pairing_confirmation(Lang::En)),
+            "英文里有汉字：{}",
+            msg::phone_pairing_confirmation(Lang::En)
+        );
+    }
+
+    /// `msg::phone_bridge_panicked`——`bridge.rs::run()` 兜住一次内部
+    /// panic 之后写进 `Broken` 的文案，dct-phone-channel Task 5 fix
+    /// round 1 的 Important 3。
+    #[test]
+    fn phone_bridge_panicked_composes_in_both_languages() {
+        for l in Lang::all() {
+            let s = msg::phone_bridge_panicked(*l);
+            assert!(!s.trim().is_empty(), "{l:?} 下组不出话");
+        }
+        assert!(
+            !has_han(&msg::phone_bridge_panicked(Lang::En)),
+            "英文里有汉字：{}",
+            msg::phone_bridge_panicked(Lang::En)
         );
     }
 }
