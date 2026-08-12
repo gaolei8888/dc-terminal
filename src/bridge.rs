@@ -60,10 +60,11 @@
 //! `Broken` 文案，今天都是中文——已知的、故意留下的缺口，不是漏改。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::channel::{Channel, ChannelError, Incoming};
+use crate::channel::{Channel, ChannelError, Event, EventKind, Incoming};
 use crate::i18n::{msg, Lang};
 use crate::proto::{PhoneBrokenReason, PhoneState, PhoneStatus};
 use crate::session::recover;
@@ -503,6 +504,54 @@ pub fn run(bridge: Arc<Bridge>, phone: Arc<Mutex<PhoneStatus>>) {
         // 其余会话不受影响，才是这整条纪律唯一要保证的事。
         eprintln!("手机通知线程出了内部错误，已经停掉——不影响正在跑的会话");
         record_bridge_panicked(&bridge, &phone);
+    }
+}
+
+/// 把一个出站事件写成一句能直接发出去的话。**只用 `Event` 自己已经
+/// 成文的字段**——不碰屏幕、不问模型，那两样是 Task 9（合并、编号选项）
+/// 的事。这是「没配 `[llm]`」那一档本来就该有的最小实现：一条事件一句
+/// 话，不合并、不去重，用户能立刻收到，晚一点再变得更聪明。
+fn describe_event(e: &Event) -> String {
+    let what = match e.kind {
+        EventKind::Stopped => "干完一轮，在等你",
+        EventKind::Failed => "报错了",
+        EventKind::Vanished => "自己没了",
+    };
+    format!("{}（{}）：{}", e.name, e.project, what)
+}
+
+/// 出站事件的消费端——`tick()`（`session.rs`）只管把 `Event` 投进队列，
+/// 谁去发、发几次、发给谁全在这里，同模块头注释「`set_destination` 只
+/// 从这里调用」那条纪律：一件事只有一个地方做主。
+///
+/// 阻塞 `rx.recv()`：发送端只有 `SessionManager::set_event_sink` 装配的
+/// 那一个 `SyncSender`，`recv()` 回 `Err` 就是它被丢了（守护进程整个
+/// 关掉，或者测试场景主动 `drop(tx)`），循环该结束，不是该报错。
+///
+/// **单条发送失败不重试、不动 `phone` 状态槽。** 退避、把坏令牌写成
+/// `Broken` 是 `poll_forever` 那条轮询已经在做的事；这里另开一条决策
+/// 路径只会让「什么时候该退避」这件事出现两份定义。有意义的重试/队列
+/// 策略是后续任务的事（计划里 `Bridge::enqueue`/`QUEUE_CAP` 那一条）。
+fn consume_events(bridge: &Bridge, rx: &Receiver<Event>) {
+    while let Ok(ev) = rx.recv() {
+        let _ = bridge.ch.send(&describe_event(&ev));
+    }
+}
+
+/// 事件消费线程的真正入口。**同 `run()`，整个线程体包在 `catch_unwind`
+/// 里**——手机通道死掉是遗憾，会话跟着死是灾难，模块头注释那条原则在
+/// 这条线程上同样成立。
+///
+/// 跟 `run()` 不一样的是：这条线程死了不写 `phone` 状态槽——没有一个
+/// `PhoneState` 变体表示「配对/监听都好好的，只是出站通知的消费线程挂了」，
+/// 编一个出来是这个任务范围之外的事；今天的行为是安静停止出站通知，
+/// 会话和入站消息都不受影响。
+pub fn run_events(bridge: Arc<Bridge>, rx: Receiver<Event>) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        consume_events(&bridge, &rx);
+    }));
+    if outcome.is_err() {
+        eprintln!("手机事件推送线程出了内部错误，已经停掉——不影响正在跑的会话，也不影响入站消息");
     }
 }
 
@@ -1440,5 +1489,92 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ———— describe_event / consume_events: 出站事件的消费端 ————
+
+    fn ev(kind: EventKind) -> Event {
+        Event {
+            session: 1,
+            kind,
+            name: "修登录白屏".into(),
+            project: "web".into(),
+        }
+    }
+
+    /// 三种 `EventKind` 必须落成三句读得出区别的话——手机上收到的东西
+    /// 要是「停下来了」和「报错了」长得一样，用户没法从消息本身判断
+    /// 该不该紧张。
+    #[test]
+    fn describe_event_tells_the_three_kinds_apart() {
+        let stopped = describe_event(&ev(EventKind::Stopped));
+        let failed = describe_event(&ev(EventKind::Failed));
+        let vanished = describe_event(&ev(EventKind::Vanished));
+
+        assert!(stopped.contains("修登录白屏"));
+        assert_ne!(stopped, failed);
+        assert_ne!(stopped, vanished);
+        assert_ne!(failed, vanished);
+    }
+
+    /// 主线：队列里的每一条都该被发出去，顺序不变——`tick()` 投递的顺序
+    /// 就是事情发生的顺序，消费端没有理由打乱它。`drop(tx)` 是让
+    /// `rx.recv()` 回 `Err`、循环自己结束的唯一办法，不然这条测试会
+    /// 挂住，同 `poll_forever` 测试里"脚本耗尽必须是终态错误，不能是
+    /// 空批次"的道理——这里换成了"发送端必须真的没了，不能是恰好没有
+    /// 新事件"。
+    #[test]
+    fn consume_events_sends_every_queued_event_in_order() {
+        let ch = Arc::new(FakeChannel::default());
+        let bridge = Bridge::new(ch.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ev(EventKind::Stopped)).unwrap();
+        tx.send(ev(EventKind::Failed)).unwrap();
+        drop(tx);
+
+        consume_events(&bridge, &rx);
+
+        let sent = recover(ch.sent.lock());
+        assert_eq!(sent.len(), 2, "两条排队的事件都该被发出去");
+        assert_eq!(sent[0], describe_event(&ev(EventKind::Stopped)));
+        assert_eq!(sent[1], describe_event(&ev(EventKind::Failed)));
+    }
+
+    /// 发送端一开始就没有任何事件、直接被丢掉——消费端不该因为"一条都
+    /// 没收到"就报错或者卡住，`recv()` 的 `Err` 本身就是"该结束了"。
+    #[test]
+    fn consume_events_returns_quietly_when_the_sender_is_dropped_with_nothing_sent() {
+        let ch = Arc::new(FakeChannel::default());
+        let bridge = Bridge::new(ch.clone());
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        drop(tx);
+
+        consume_events(&bridge, &rx);
+
+        assert!(recover(ch.sent.lock()).is_empty());
+    }
+
+    struct PanickingSendChannel;
+    impl Channel for PanickingSendChannel {
+        fn send(&self, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
+            panic!("模拟渠道内部炸了")
+        }
+        fn poll(&self, _timeout: Duration) -> Result<crate::channel::Batch, ChannelError> {
+            Ok(crate::channel::Batch::default())
+        }
+        fn set_destination(&self, _chat: Option<i64>) {}
+    }
+
+    /// **同 `a_panic_inside_the_loop_never_escapes_run`，这次是出站消费
+    /// 线程。** 如果 `run_events` 少了 `catch_unwind`，这条测试自己就会
+    /// 因为一次未捕获的 panic 而失败。
+    #[test]
+    fn a_panic_inside_the_consumer_never_escapes_run_events() {
+        let bridge = Arc::new(Bridge::new(Arc::new(PanickingSendChannel)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ev(EventKind::Stopped)).unwrap();
+        drop(tx);
+
+        run_events(bridge, rx); // 不 panic 就是这条测试的主要断言
     }
 }
