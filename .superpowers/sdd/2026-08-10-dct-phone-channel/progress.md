@@ -169,3 +169,140 @@ Task 4: fix round 1 — the implementer died THREE times (two API connection err
    - spawn_phone_startup_refresh: not in the brief, still unjustified.
    - The full mutation sweep was never completed.
    - No round-1 report exists.
+Task 4: my "STILL UNVERIFIED" list above was STALE, not wrong — a fresh implementer verified that
+  the agent which died three times had in fact finished all four items before stalling; it just
+  never wrote them up. Verification pass: no source changes, 18 mutations run and reverted, git
+  diff clean, and network-freedom shown DYNAMICALLY (proxies pointed at an unroutable address,
+  both integration tests finish in 0.08s). spawn_phone_startup_refresh was REMOVED, not gated.
+Task 4: scoped re-review of the recovered fix (commit 12076c3..e1694c7) — all 3 Criticals, the
+  spec failure and both Importants ADDRESSED. Reviewer independently re-derived that
+  Broken{BotBlocked} is unreachable today, and confirmed no path from daemon startup or either
+  test reaches a real network call (the only live call site is PhoneSetToken -> get_me, and no
+  test presses Enter in an open entry).
+Task 4: fix round 2 dispatched — 2 Important + 3 Minor found in the fix diff itself:
+  I1: THE FIX'S CENTRAL BEHAVIOUR HAS NO TEST. Three reasons producing three different next steps
+      is the whole point of the round, and collapsing all three arms to PhoneNextStepBadToken
+      leaves the ENTIRE SUITE GREEN — so "offline user told to re-type a perfectly good token"
+      can regress silently.
+  I2: apply_phone_set_token skips saving for EVERY Broken including BotBlocked, while
+      has_confirmed_token() asserts BotBlocked means a token IS on disk. The only thing keeping
+      this from being Critical 2 all over again is that Telegram happens never to answer getMe
+      with 403 — an EXTERNAL SERVER'S BEHAVIOUR, not an invariant in our code. The comment at
+      daemon.rs:481 also describes a world that does not exist (claims BotBlocked carries a
+      previously-confirmed bot name; its only producer returns bot: None).
+CARRY-FORWARD TO TASK 5: nothing re-verifies a saved token after a restart now that the startup
+  refresh is gone. A revoked token shows WaitingForPairing forever, and since Enter is suppressed
+  whenever has_confirmed_token(), the only way to a new token is `x` then `Enter`. Honest while no
+  bridge exists (pairing never completes anyway); Task 5 must revisit.
+Task 4: fix round 2/5 (all ADDRESSED, 0 open; commit 4cd7ef6..45cc5e0). The implementer's solution
+  to I2 was better than either option I offered: map Blocked -> BadToken on the SET-TOKEN path,
+  because that path never has a real bot name to save and getMe carries no chat context, so
+  BotBlocked would not be a truthful answer there. Reviewer's summary of why it is right: it keeps
+  has_confirmed_token()'s promise TRUE BY CONSTRUCTION rather than TRUE BY LUCK.
+  Reviewer also verified the disclosed `git checkout --` incident lost nothing (test counts per
+  file are consistent with N-1 existing + 1 new), and that the new shape pin is a real hardcoded-
+  JSON pin rather than a self-consistent round-trip.
+Task 4: complete (commits adacd36..cd4a6cb, review clean) — 793 lib tests.
+  Cost note: this task burned ~900k subagent tokens across three agents, one of which died three
+  times. The recovery pattern that worked: commit the tree first, then hand a FRESH agent the
+  brief + report + an explicit list of what is unverified.
+  Process lesson from the implementer, worth repeating in later tasks: it lost a real test to
+  `git checkout --` while reverting a mutation, and switched to committing real changes BEFORE
+  each mutate-and-revert cycle. Do that from the start.
+BASE for Task 5 = cd4a6cb
+Task 5: initial (commits cd4a6cb..360f8e8; the first three landed before the first dispatch was
+  interrupted, the rest after re-dispatch). Implementer found a REAL SELF-DEADLOCK in the
+  inherited wiring: `if let Some(b) = recover(slot.lock()).clone() { start_phone_bridge(..) }`
+  extends the scrutinee's MutexGuard across the block and the callee re-locks the same mutex.
+  No existing test reached that branch (all used an empty slot), so it shipped silently until new
+  coverage hung cargo test for 7+ minutes.
+Task 5: review 1 — spec ✅, quality NOT APPROVED. 2 Critical + 3 Important + 4 Minor.
+  The deliverable itself (accept, rejection tests, set_destination monopoly) was verified by
+  TRACING every path, not by reading the tests, and it holds. What fails is the lifecycle wiring.
+  C1 *** PAIRING DOES NOT SURVIVE A DAEMON RESTART, AND THE REOPENED WINDOW IS RETROACTIVE ***
+     owner lives only in memory and is never persisted, so every daemon start builds a fresh
+     Bridge with owner: None -> pairing reopens with no user action and no announcement.
+     Worse: Telegram::with_transport starts offset at 0, so getUpdates?offset=0 returns the whole
+     ~24h unconfirmed backlog OLDEST FIRST. On the first poll after a restart, THE OLDEST
+     UNCONSUMED MESSAGE WINS THE PAIRING — including one a stranger sent hours earlier while the
+     machine was asleep. The stranger does not have to be present, or fast, or lucky.
+     This contradicts the rationale written into pairing_happens_exactly_once itself
+     (「配对必须是用户填完令牌后的一次显式动作，而不是长期开着的门」). Reviewer's phrasing:
+     "a door that reopens on every boot and swings backwards in time."
+     Fix: persist the owner chat id next to the token AND discard the backlog on a fresh Bridge.
+  C2 Paired/BotBlocked can be written AFTER the token is deleted. "By construction" holds for
+     creation ordering, not against concurrent deletion: send_pairing_confirmation does a 10s
+     network send then writes Broken{BotBlocked} without re-checking is_retired(); and
+     poll_forever checks is_retired() BEFORE blocking on phone.lock(), which PhoneDisable holds
+     while it retires — so the guard releases and the thread writes Paired over Off.
+     daemon.rs:643-649's comment promises exactly this cannot happen. Holding the phone guard
+     across retire() LINES THEM UP rather than separating them.
+  I1: PhoneSetToken replaces the slot without retiring the old Bridge. Survives only on an
+      unwritten three-file argument enforced by the UI, not the daemon.
+  I2: PhoneStatus.owner is never populated, so a wrong pairing is INVISIBLE — which is what makes
+      C1 undetectable in practice. msg::phone_paired now has no producer at all.
+  I3: a panic in the poll thread leaves the page asserting a promise nothing keeps (stderr goes
+      to /dev/null when the TUI spawns the daemon).
+Task 5: fix round 1/5 dispatched.
+Task 5: fix round 1/5 (both Criticals + all 3 Importants ADDRESSED; commits 360f8e8..badd725).
+  Two implementer judgement calls UPHELD by the reviewer: seating owner + calling set_destination
+  inside the constructor genuinely closes the pre-thread window; and its STRONGER ordering for
+  PhoneDisable (retire strictly before any phone lock) is the version that actually closes the
+  race — the literal "drop the guard first" I suggested would have left a window.
+Task 5: fix round 2/5 dispatched. The fix INTRODUCED a new Critical, and it is the subtlest bug
+  found in either plan so far:
+  *** discard_backlog stops at the first batch containing no TEXT, not the first empty batch. ***
+    parse_updates silently skips non-text updates while max_update_id still advances the cursor,
+    so an empty Vec<Incoming> means "this batch had no text", NOT "Telegram has nothing left".
+    getUpdates has no limit and Telegram caps a batch at 100. So: SEND 100 STICKERS, THEN ONE TEXT.
+    The drain sees [] and declares itself caught up; the main loop's first long poll returns
+    update 101 and pairs the attacker. Needs nothing but the public bot username.
+    THE UNIT TESTS CANNOT SEE IT: FakeChannel scripts Vec<Incoming> directly, so it can never
+    produce "non-empty batch that parses to empty" — the fake collapses exactly the seam the bug
+    lives in (transport's batch vs parser's message).
+  I: the new on_owner_changed persistence is NOT retire-gated, so a retired bridge can write a
+     stale chat id back to disk after it was cleared -> next start seats it as owner of the NEW
+     token -> the legitimate user is Rejected forever while the UI says Paired.
+  I: the test-network regression is worse than reported. The implementer said the bogus token
+     fails fast with a terminal 401; Telegram actually answers 404, and error_from maps non-401/403
+     to Unreachable, which IS worth_retrying — so each test leaves a thread retrying api.telegram.org
+     with backoff for the life of the binary. Reviewer found a TWO-LINE test-side fix the
+     implementer missed: neither test needs a token at all, seed only PHONE_BOT_KEY.
+CARRY-FORWARD (track as real work, not a report line): phone_paired renders a raw chat id to a
+  non-programmer (「通知发给 6285551234」). Needs from.first_name out of parse_updates.
+Task 5: fix round 2/5 — the new Critical, both Importants and all four small items ADDRESSED
+  (commits badd725..c321d00). Carried by THREE implementers: two were cut off by API errors and I
+  committed their recovered trees (468b96c, 006d847) in between.
+  MY FAILURE, recorded because it cost the record rather than the code: 468b96c bundles three
+  separately-findable fixes (the Batch/raw_len change, the accept/unpair retire gate, and half the
+  settings-view test fix) and 006d847 carries the other half — because I committed recovered work
+  without having anyone write up what was in it. THE REPORT THEREFORE HAS NO MUTATION-TESTING
+  RECORD FOR THE CRITICAL OR THE RETIRE GATE. The reviewer verified discrimination for each by
+  reasoning through what the pre-fix code would do, and the evidence is in that review, not in the
+  report. Next time a recovered tree is committed, dispatch the write-up with it.
+  Reviewer's verification worth keeping: the fake CAN now express the seam the bug lived in
+  (batch_with_raw_len builds messages: vec![] with raw_len: n), and the seam is pinned one layer
+  down too — the_cursor_advances_past_a_text_less_update_too now asserts raw_len == 1 with empty
+  messages against hardcoded Telegram JSON, so raw_update_count cannot silently collapse back onto
+  the parser. The ordering pin is fail-closed by structure, and its assert releases the spawned
+  thread on unwind (recover tolerates the poisoning), so a failure is ~2s red rather than a hang.
+Task 5: fix round 3/5 dispatched — 2 Minors, one of them introduced by our own fix:
+  the drain's termination now depends on the cursor advancing and the loop never checks it, so a
+  batch with raw_len > 0 but no parsable update_id spins a tight, un-backed-off timeout=0 loop
+  against Telegram until the user presses x. We traded a security hole for a hot loop.
+  Second: the retire gate is asymmetric inside accept() — the disk write is gated but
+  set_destination and send_pairing_confirmation are not, so a stranger can still receive the
+  「已配对」 message in the same window. No durable harm; the file just now needs reading twice.
+Task 5: fix round 3/5 (both Minors ADDRESSED, 0 open; commit c321d00..c951e0c).
+  The busy-spin fix was better than the one-comparison guard I asked for: raw_len > 0 with a
+  stuck cursor is now classified as a MALFORMED reply and goes through record_terminal_error, so
+  the user sees an actionable line on the phone page instead of a silent hot loop. Reviewer
+  confirmed cursor_advanced is written in the same branch that assigns offset, from the same
+  max_update_id value, so it cannot disagree with whether the cursor really moved.
+Task 5: complete (commits cd4a6cb..c951e0c, review clean) — 846 lib tests.
+  DEFERRED (coverage blind spot, not a defect): the report claims FakeChannel::send mirrors
+  Telegram's "no destination => Unreachable". It does not — it records unconditionally and returns
+  Ok(0). So the full poll_forever -> accept -> send_pairing_confirmation path under retirement has
+  no test; the new test asserts from the destinations side instead. Fine today, worth closing when
+  someone next touches the fake.
+BASE for Task 6 = c951e0c
