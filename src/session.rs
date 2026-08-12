@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use crate::channel::{debounce, Event, EventKind, DEBOUNCE_WINDOW};
 use crate::git::{self, FileStat};
 use crate::profile::Profile;
 use crate::pty::{PtySession, ScreenSpan};
@@ -97,6 +99,20 @@ fn classify(
         });
     }
     None
+}
+
+/// 三道门，与关系——缺一不发。`tick()` 在三处调用点都要先过这道判断，
+/// 才会往 `event_sink` 里投一个 `Event`。
+///
+/// **第二道门是关键。** 真实 profile（claude/codex/glm/kimi/deepseek/
+/// qwen-api）全都只声明 `busy_pattern`，`classify()` 在 busy 串不在屏幕上
+/// 时就判 `Idle`——刚创建、还停在启动画面上的会话正是这样。`create()`
+/// 之后的第一个 tick 会把「创建时置的初始 Working」→「启动画面读成
+/// Idle」这一跳读成「干完一轮活」，跟 auto-name 那边要挡的是同一个坑
+/// （见 `Session::name_attempted` 和 tick() 里那段注释）。没有这道门，
+/// **每开一个会话手机就响一次。**
+fn should_notify(is_agent: bool, first_input_empty: bool, has_channel: bool) -> bool {
+    is_agent && !first_input_empty && has_channel
 }
 
 /// 让模型把一屏失败翻译成一句人话。
@@ -458,6 +474,10 @@ struct Session {
     /// 少算，画面也会开始往上飘（最老的行被挤掉了）。这是环形缓冲的
     /// 固有代价。
     scroll_mark: usize,
+    /// 这个会话上次真被判定为「该推事件」的时刻，相对
+    /// `SessionManager::clock_origin`——`debounce()` 用它压快速抖动，见
+    /// `SessionManager::maybe_notify`。`None` = 从没发过。
+    last_notified: Option<Duration>,
 }
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
@@ -488,6 +508,23 @@ pub struct SessionManager {
     /// （见 `proto::WarningCode::LlmUnavailable`），这是这条原因唯一能走到
     /// 用户眼前的路。
     llm_problem: Mutex<Option<crate::llm::resolve::ResolveError>>,
+    /// `tick()` 往这里投出站事件（agent 停下/报错/没了），`bridge.rs`
+    /// 那边的消费者从队列另一头收——这是 `session.rs` 唯一知道「手机通知
+    /// 存在」这件事的地方，它不认识 `Bridge`，只认识一个能塞事件的洞。
+    /// `None`（默认，`daemon.rs` 没配手机通知时就是这样）= `should_notify`
+    /// 的第三道门关着，`tick()` 甚至不会拿 `first_input`/`is_agent` 去凑
+    /// 判断，直接短路。
+    event_sink: Mutex<Option<mpsc::SyncSender<Event>>>,
+    /// 出站防抖要用的时间起点，构造时取一次、往后不变。
+    ///
+    /// **不能用 `SystemTime::now()` 现查**：那是挂钟时间，会被系统时钟
+    /// 回拨——一次回拨会让 `debounce()` 里的 `now.saturating_sub(last)`
+    /// 算出一个比真实间隔更小（甚至饱和成 0）的值，把一个真事件当成
+    /// 抖动压掉；反过来时钟前跳又会让一次真正的抖动被误判成「窗口外」，
+    /// 提前放行。`Instant` 保证单调递增，`.elapsed()`（等价于
+    /// `Instant::now() - self`）是这里唯一不受挂钟影响的取法——见
+    /// `maybe_notify` 怎么用它。
+    clock_origin: Instant,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -512,7 +549,23 @@ impl SessionManager {
             journal: crate::journal::Journal::new(),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
+            event_sink: Mutex::new(None),
+            clock_origin: Instant::now(),
         }
+    }
+
+    /// 装（或摘）出站事件的消费端。`None`（默认）意味着手机通知没配置——
+    /// `should_notify` 的第三道门因此关着，`tick()` 不会往任何地方投事件。
+    ///
+    /// **`mpsc::SyncSender` 不是 `mpsc::Sender`。** 计划文档写的是后者，
+    /// 但 `std::sync::mpsc::Sender` 没有 `try_send`——它背后是无界队列，
+    /// `send()` 只会在接收端整个丢了的时候才失败，不会因为「队列满了」
+    /// 失败，因为它永远不会满。这个任务的硬约束是「队列有界、满了就丢、
+    /// 绝不阻塞 tick」（见 `maybe_notify`），只有 `SyncSender::try_send`
+    /// 才有这个语义——用 `Sender` 会悄悄把「满了就丢」实现成「无限攒着」，
+    /// 跟 tick 每 200ms 跑一次、绝不能被一次慢操作拖住的约束正面冲突。
+    pub fn set_event_sink(&self, sink: Option<mpsc::SyncSender<Event>>) {
+        *recover(self.event_sink.lock()) = sink;
     }
 
     /// 装上（或摘掉）出错解释要用的后端。守护进程启动时 resolve 一次调用，
@@ -661,6 +714,7 @@ impl SessionManager {
             name_attempted: false,
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
+            last_notified: None,
         };
 
         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
@@ -930,6 +984,12 @@ impl SessionManager {
         let snapshot: Vec<Arc<Mutex<Session>>> =
             recover(self.sessions.lock()).values().cloned().collect();
 
+        // 一轮 tick 里所有会话共用同一个「现在」——不在每个会话内部现查
+        // `clock_origin.elapsed()`：`debounce()` 要的是「两次判定之间隔了
+        // 多久」，不是「扫到这个会话时又多花了几微秒」，会话越靠后现查
+        // 只会让它看到的「现在」越晚，没有意义地引入误差。
+        let now = self.clock_origin.elapsed();
+
         for s in snapshot {
             let mut s = recover(s.lock());
             if s.state == SessionState::Stopped {
@@ -956,6 +1016,7 @@ impl SessionManager {
                 s.state = SessionState::Stopped;
                 self.journal
                     .died(s.id, crate::journal::Death::Vanished, pid);
+                self.maybe_notify(&mut s, EventKind::Vanished, now);
                 continue;
             }
             if s.state == SessionState::Asking {
@@ -981,6 +1042,7 @@ impl SessionManager {
                     // 模型，一个失败会话能把额度烧光。
                     if next == SessionState::Failed && was != SessionState::Failed {
                         self.request_explanation(&mut s);
+                        self.maybe_notify(&mut s, EventKind::Failed, now);
                     }
                     // 起名的时机是「干完一轮 **且用户已经说过话**」，两个条件
                     // 缺一不可。不在第一句输入送出去时起：那一刻信息最少，
@@ -1009,17 +1071,79 @@ impl SessionManager {
                     // 触发的那次会把先完成的线程刚写进去的真名字同步
                     // 覆盖回 `None`，一次丢失更新（细节见 `name_attempted`
                     // 自己的文档）。
-                    if was == SessionState::Working
-                        && matches!(next, SessionState::Idle | SessionState::Asking)
-                        && s.is_agent
-                        && !s.first_input.is_empty()
-                        && !s.name_attempted
+                    // 「干完一轮停下来了」这件事本身跟上面起名字的四个
+                    // 条件不是同一件事——起名只在**第一次**发生时做
+                    // （`!s.name_attempted`），但用户每次「回到 Working
+                    // 又停下来」都值得推一条事件（防抖负责压掉窗口内的
+                    // 抖动，见 `maybe_notify`），拆成两个独立的 `if`，
+                    // 不共用同一组门槛。
+                    let just_stopped = was == SessionState::Working
+                        && matches!(next, SessionState::Idle | SessionState::Asking);
+                    if just_stopped && s.is_agent && !s.first_input.is_empty() && !s.name_attempted
                     {
                         self.request_name(&mut s);
+                    }
+                    if just_stopped {
+                        self.maybe_notify(&mut s, EventKind::Stopped, now);
                     }
                 }
             }
             // 两个都没有：状态不动，保持 Unknown
+        }
+    }
+
+    /// 三道门 + 防抖之后，真的往 `event_sink` 里投一个事件——tick() 唯一
+    /// 会碰这个字段的地方，三处调用点各自决定 `kind`。
+    ///
+    /// **`try_send`，绝不阻塞。** 队列满了直接丢这一条：tick 每 200ms
+    /// 跑一次、扫全部会话，谁都不该在这里等一个消费者把队列腾出空位——
+    /// 那正是模块头注释「tick 线程绝不碰网络」想避免的同一类卡死，只是
+    /// 换成了「卡在往队列里塞」而不是「卡在网络调用」。
+    ///
+    /// `now` 由调用方（`tick()`）传一次进来，不在这里现查——见 `tick()`
+    /// 顶端那行 `let now = ...` 的注释。
+    fn maybe_notify(&self, s: &mut Session, kind: EventKind, now: Duration) {
+        let sink = recover(self.event_sink.lock()).clone();
+        if !should_notify(s.is_agent, s.first_input.is_empty(), sink.is_some()) {
+            return;
+        }
+        if !debounce(s.last_notified, now, DEBOUNCE_WINDOW) {
+            return;
+        }
+        // 「发过」记在这里，不等 `try_send` 是否真的成功——防抖压的是
+        // 「这个会话最近有没有被判定为该推」，不是「最近有没有真的送到
+        // 对方手机上」。队列满了本身已经是降级模式（见上面 `try_send`
+        // 的注释），不该反过来靠「没送成功就不算，下一轮再试」去弥补，
+        // 那正好是防抖想避免的重复轰炸。
+        s.last_notified = Some(now);
+        if let Some(sink) = sink {
+            let name = {
+                let t = recover(s.name_slot.lock()).clone().unwrap_or_default();
+                // `tag`（`list()`）空串时界面退回 profile 名字，这里跟着
+                // 同一条约定：手机上不该出现一个看不见的空会话名，尤其是
+                // 「干完一轮就推」这第一次事件，往往正好跟起名字撞在
+                // 同一个 tick——`name_slot` 这时大概率还没写回来。
+                if t.is_empty() {
+                    s.profile.name.clone()
+                } else {
+                    t
+                }
+            };
+            // 「项目」没有单独的域概念（`projects.rs` 只按路径记
+            // 最近/置顶，不存一个独立的显示名），取目录名当一个够用的
+            // 近似——用户自己认得自己项目文件夹叫什么。
+            let project = s
+                .dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let _ = sink.try_send(Event {
+                session: s.id,
+                kind,
+                name,
+                project,
+            });
         }
     }
 
@@ -1188,6 +1312,33 @@ mod tests {
                 "{name}：正在干活的屏幕被判成了 {state:?}"
             );
         }
+    }
+
+    // ———— should_notify: 三道门 ————
+
+    /// 第二道是关键：真实 profile（claude/codex/glm/kimi/deepseek/
+    /// qwen-api）**全都只声明 busy_pattern**，`classify()` 在 busy 串不在
+    /// 屏幕上时就判 Idle，而刚创建、还停在启动画面上的会话正是这样。
+    /// 没有这道门，**每开一个会话手机就响一次**。
+    #[test]
+    fn a_brand_new_session_does_not_page_you() {
+        // 是 agent、有渠道，但用户还没说过话
+        assert!(!should_notify(true, true, true));
+    }
+
+    #[test]
+    fn a_plain_shell_never_pages_you() {
+        assert!(!should_notify(false, false, true));
+    }
+
+    #[test]
+    fn no_channel_means_no_page() {
+        assert!(!should_notify(true, false, false));
+    }
+
+    #[test]
+    fn an_agent_you_have_talked_to_pages_you() {
+        assert!(should_notify(true, false, true));
     }
 
     fn init_repo() -> tempfile::TempDir {
@@ -1790,6 +1941,107 @@ mod tests {
             );
             sleep(Duration::from_millis(50));
         }
+    }
+
+    /// **走完整 `tick()` 的集成测试，不只是 `should_notify` 自己。**
+    /// `busy_only_agent` 复刻真实 profile 的形状（只有 `busy_pattern`）——
+    /// `create()` 之后第一个 `tick()` 就会把「创建时置的初始 Working」→
+    /// 「启动画面读成 Idle」这一跳读出来，如果第二道门（`first_input`）
+    /// 没接进 `tick()` 本身（比如接错了变量、或者压根没接），这条测试就
+    /// 是唯一能抓出来的地方——`should_notify` 单测只能证明这个纯函数本身
+    /// 对，证不了 `tick()` 真的在调它。
+    #[test]
+    fn a_newly_created_session_pushes_no_event_on_its_first_tick() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(busy_only_agent());
+        let (tx, rx) = mpsc::sync_channel(8);
+        m.set_event_sink(Some(tx));
+        m.create(repo.path(), "busy-only", empty_secrets(), &[])
+            .unwrap();
+
+        m.tick();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "刚创建、没人说过话的会话，第一个 tick 就不该往队列里投任何事件"
+        );
+    }
+
+    /// 正面用例——只有「不该发」的测试不够，三道门/防抖任何一处方向接反
+    /// （比如某个门的 `!` 漏掉）都可能让「该发」这条路径反而更容易造出
+    /// 假绿。跟 `a_session_gets_named_after_its_first_round_of_work`
+    /// 同一套 `finishing_agent`：真发过第一句话、真的 Working → Idle
+    /// 一轮，`should_notify` 三道门都该放行。
+    #[test]
+    fn a_real_round_of_work_pushes_a_stopped_event() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(finishing_agent());
+        let (tx, rx) = mpsc::sync_channel(8);
+        m.set_event_sink(Some(tx));
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap(); // 空字符串 = 回车，状态进 Working
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            if let Ok(ev) = rx.try_recv() {
+                assert_eq!(ev.session, id);
+                assert_eq!(ev.kind, EventKind::Stopped);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "干完一轮活之后应该推一条 Stopped 事件，但一直没收到"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 防抖：窗口内第二次 Working → Idle 不该再推一条。窗口默认 30 秒，
+    /// 测试全程远小于这个数，不需要真的等——只要真的逼出两次转换，断言
+    /// 队列里只落了一条。跟 `whitespace_only_input_is_asked_about_
+    /// exactly_once_not_forever` 一样的手法逼第二轮：READY 还留在屏幕上，
+    /// `send_input("")` 无条件把状态同步置回 Working，下一次 tick 就会
+    /// 再判一次 Idle。
+    #[test]
+    fn a_second_stop_within_the_debounce_window_is_suppressed() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(finishing_agent());
+        let (tx, rx) = mpsc::sync_channel(8);
+        m.set_event_sink(Some(tx));
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap();
+
+        // 等第一次 Working → Idle 落地。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "第一次事件一直没来");
+            sleep(Duration::from_millis(50));
+        }
+
+        // 逼出第二次 Working → Idle，紧跟在第一次后面，远在 30 秒窗口内。
+        m.send_input(id, "").unwrap();
+        m.tick();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "窗口内的第二次 Working → Idle 不该再推一条——这正是防抖存在的理由"
+        );
     }
 
     /// **核心回归测试**（fix-1-brief）：附着视图逐键转发时，用户先按了
