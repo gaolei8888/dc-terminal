@@ -194,62 +194,11 @@ pub(crate) fn is_plain_key(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::META)
 }
 
-/// Ctrl+Q —— dct 的全局逃生键。
-///
-/// crossterm 把它报成 `Char('q')` 带 `CONTROL` 修饰，有的终端送大写。
-/// 判断必须放在任何 `Char(c)` 分支**之前**：项目选择器的打字过滤是靠
-/// `Char(c)` 累加的，判晚了会往过滤框里塞一个 `q`。
-pub(crate) fn is_ctrl_q(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
-}
-
-/// Ctrl+Q 从当前视图退到哪一层。`None` 表示「退到头了，该退出 dct」。
-///
-/// 抽成纯函数是为了能单测——`run()` 的按键循环要连真 socket，测不了。
-///
-/// `EnterSecret` 退回哪一层要看 `return_to_settings`：从密钥设置页进来的
-/// 回设置页（用户在管理配置），从选择器进来的回选择器（用户很可能只是
-/// 选错了 agent，回选择器比回看板更顺手）。但这里是个纯函数，拿不到 daemon
-/// 连接，现查不出一份新的条目列表，只能给一个 `entries: vec![]` 的空壳。
-/// **调用方必须知道这个约定**：`run()` 的按键循环里，只要处理完一次按键后
-/// 发现 `view` 变成了空的 `PickProfile`/`Secrets`（不管是走这个函数的
-/// Ctrl+Q，还是 `EnterSecret` 自己的 Esc 分支），就要补一次
-/// `Request::Profiles` 把条目填上——不然用户看到的是一屏空白，会以为自己
-/// 一个 agent/密钥都没有。
-pub(crate) fn back_one_level(view: View) -> Option<View> {
-    match view {
-        View::Board => None,
-        // 手输态退一层是回到两栏那一屏，不是关掉整个选择器
-        View::PickProject(p) if p.typing_path.is_some() => Some(View::PickProject(ProjectPicker {
-            typing_path: None,
-            ..p
-        })),
-        View::EnterSecret {
-            return_to_settings: true,
-            ..
-        } => Some(View::Secrets {
-            entries: Vec::new(),
-            state: ListState::default(),
-            pending_delete: None,
-        }),
-        View::EnterSecret { .. } => Some(View::PickProfile {
-            entries: Vec::new(),
-            state: ListState::default(),
-            warning: None,
-        }),
-        // 九宫格跟列表是**平级**的两个模式，它自己就是顶层，退无可退——
-        // 跟 `View::Board` 一样返回 `None`。以前它落在下面那条兜底里，
-        // 于是 Ctrl+Q 成了 `g` 的隐藏同义词。
-        View::Grid { .. } => None,
-        // 浮层退的是**开门之前那一屏**，不是看板：从九宫格按 `?` 再退出来，
-        // 落回列表就等于用户按一下问号顺手换了个视图。
-        View::Keys { from } => Some(*from),
-        // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
-        // 退一层就是看板。
-        _ => Some(View::Board),
-    }
-}
+// 这里以前有 `is_ctrl_q` 和 `back_one_level`：Ctrl+Q 曾是所有视图共用的
+// 「退一层」全局键。它没了——每个视图退出的键都写在底栏上，而且每个视图
+// 都已经有一个：会话视图是 F2（`attach.rs`），其余视图是 Esc（`pick.rs`、
+// `settings_view.rs`、`secret.rs`、`keys.rs`），看板和九宫格是 `q`。
+// 一个不写在屏幕上的第二条退路只会让 0x11 白白拿不回给 agent。
 
 /// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥；
 /// 没装但有安装命令的去装；没装又没法自动装的、或者缺别的 profile 依赖的，
@@ -408,7 +357,7 @@ pub fn verify_message(o: VerifyOutcome, lang: Lang) -> Option<String> {
 ///
 /// CRITICAL 1（最终整分支 code review）：验证是异步的——发起时把
 /// `(profile, buf)` 交给后台线程，结果送回来可能是好几秒之后。这几秒里
-/// 用户完全可能已经 Ctrl+Q/Esc 退出这一屏，甚至绕回来在**另一个** agent
+/// 用户完全可能已经按 Esc 退出这一屏，甚至绕回来在**另一个** agent
 /// 身上重新填了密钥。旧代码收结果时只看"现在还是不是 `EnterSecret`
 /// 视图"，对不上具体是哪个 profile、填的是哪份密钥——于是一次迟到的
 /// 「Kimi 的密钥验证通过了」被套在了此刻屏幕上「GLM，密钥框还是空的」
@@ -597,7 +546,7 @@ pub(crate) fn list_dirs(dir: &Path) -> Vec<DirRow> {
 }
 
 /// 看板的两种画法。它们是**平级**的，不是「列表 + 一个附属页面」——
-/// 所以 `q` 在两边都退出 dct、`Ctrl+Q` 在两边都无事可做（已经在顶层），
+/// 所以 `q` 在两边都退出 dct（两边都是顶层，没有「上一层」可退），
 /// 而所有「回看板」的落点都得回到用户选的这一个（见 `mod.rs` 的 `home_view`）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ViewMode {
@@ -975,16 +924,20 @@ pub(crate) fn session_ended_notice(id: u32, state: SessionState, lang: Lang) -> 
 /// 底栏左段：逃生键提示。
 ///
 /// 这是唯一一条「不管出什么事都必须还在」的信息——用户找不到它就只能去
-/// 别的窗口 kill 进程，而 kill 会把终端留在 raw mode。文案必须跟
-/// `back_one_level` 逐行对上：底栏说什么就得真能做到什么，
+/// 别的窗口 kill 进程，而 kill 会把终端留在 raw mode。文案必须跟各视图
+/// 自己的按键处理逐行对上：底栏说什么就得真能做到什么，
 /// 手输路径态退的是一层（回列表），不能写成「回看板」。
+///
+/// Ctrl+Q 没了之后这条提示是**唯一**的退路说明，不再有一个「猜得到的」
+/// 全局键兜底。改这里的文案等于改用户唯一知道的逃生方式，慎重。
 pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
     use crate::i18n::{text, Key};
     match view {
         View::Board => format!("q {}", text(Key::Quit, lang)),
         View::PickProject(p) if p.typing_path.is_some() => text(Key::BackToList, lang).to_string(),
-        // 跟 back_one_level 保持一致：从密钥设置页进来的填密钥，退出回设置页，
-        // 不是选择器，也不是看板——三条路各回各的，文案不能含糊成一句话。
+        // 跟 `secret.rs` 的 Esc 分支保持一致：从密钥设置页进来的填密钥，退出
+        // 回设置页，不是选择器，也不是看板——三条路各回各的，文案不能含糊成
+        // 一句话。
         View::EnterSecret {
             return_to_settings: true,
             ..
@@ -992,18 +945,17 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 从选择器进来的填密钥，退出回的是选择器，不是看板
         View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
         // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
-        // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
-        // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
+        // 跟列表上一样是「q 退出」，而不是「回列表」：写成回列表就是在暗示
+        // 有一条退回列表的路，而回列表的键是 `g`（换模式），不是逃生。
         // 框开着时左段写 Esc：这时候 `q` 只是个字母，写「q 退出」是假的。
         View::Grid { reply: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
         View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
         // 全部按键浮层：`q` 在这里只是一张表上的一个字母，写「q 退出」是假的。
         View::Keys { .. } => format!("Esc {}", text(Key::Back, lang)),
-        // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
-        // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
-        // 落点都是看板。只写一个键等于藏起另一半——而 F2 恰恰是
-        // 手指不必离开主键区的那个。其余视图没有 F2，不能照抄这句。
-        View::Attached(_) => text(Key::BackToBoardWithF2, lang).to_string(),
+        // 会话视图是唯一一个不写 Esc 的地方：Esc 必须原样发给 agent
+        // （Claude Code 靠它取消/清空/关弹窗），所以逃生键是 F2，由
+        // `attach.rs` 自己吃掉。其余视图没有 F2，不能照抄这句。
+        View::Attached(_) => text(Key::BackToBoardF2, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
@@ -1111,7 +1063,7 @@ fn board_keys(
 pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> {
     use crate::i18n::{help_items, Key};
     match view {
-        // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
+        // 不再写「F2 同效」：左段的逃生键本身就是「F2 回看板」，
         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
         //
         // `F3` 和 `F4`：中段让出去 18 列之后，80 列终端上右段只有 39 列，
@@ -1123,7 +1075,8 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 靠前的项放不下才被丢。这一层里唯一「不按就没法拖选复制」的键是
         // `F4`（除了 F2/F3，附加视图里的键一律转发给 agent，见
         // `attach::handle_key` 头上那条注释），所以它必须是最后丢的那个；
-        // `F3` 有 `Ctrl+Q`/`F2` 之类的平替，排在前面、窄到极限时先让路。
+        // `F3` 只是快捷方式（退回看板再进另一个会话是等价的两步），排在
+        // 前面、窄到极限时先让路。
         View::Attached(_) => help_items(
             &[("F3", Key::NextSession), ("F4", Key::EnterCopyMode)],
             lang,
@@ -1187,7 +1140,7 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         //
         // `q 退出` **不**写在这里：九宫格现在跟列表一样是顶层，左段的
         // escape_hint 已经常驻「q 退出」。原来要写是因为那时左段被
-        // 「Ctrl+Q 回列表」占着，q 没有别的地方交代。重复一遍只会挤掉
+        // 「Esc 回列表」占着，q 没有别的地方交代。重复一遍只会挤掉
         // 句尾的 s/d——那两个是不可撤销的操作，比重复一次 q 重要得多。
         // 回复框开着时键盘整个归框，这时候再列动作键就是在教人按错——
         // 屏幕上写着做不到的操作比不写更糟。
@@ -1427,72 +1380,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_q_is_never_forwarded_to_the_agent() {
-        // 调用点已经拦了 Ctrl+Q，这层是兜底：万一哪天调用点漏改，
-        // 也不能把 0x11 悄悄发进 agent——那会变成一个「按了逃生键，
-        // 结果字符落进了 Claude Code 输入框」的怪现象。
-        assert_eq!(key_to_input(&ctrl('q')), None);
-        assert_eq!(key_to_input(&ctrl('Q')), None);
+    fn ctrl_q_now_reaches_the_agent_like_any_other_ctrl_combo() {
+        // Ctrl+Q 曾是 dct 的全局逃生键，被 `key_to_input` 单独扣下不发。
+        // 逃生键收敛成 F2 一个之后这条例外没了：0x11 跟别的 Ctrl 组合一样
+        // 进 agent，屏幕上写着的 F2 才是唯一的退路。
+        assert_eq!(key_to_input(&ctrl('q')).as_deref(), Some("\u{11}"));
+        assert_eq!(key_to_input(&ctrl('Q')).as_deref(), Some("\u{11}"));
     }
-
-    #[test]
-    fn ctrl_q_is_recognised_in_both_cases() {
-        // 有的终端在 Ctrl 组合里送大写字母
-        assert!(is_ctrl_q(&ctrl('q')));
-        assert!(is_ctrl_q(&ctrl('Q')));
-        // 不带 Ctrl 的裸 q 不算——否则在项目选择器里打字过滤会退出界面
-        assert!(!is_ctrl_q(&KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE
-        )));
-    }
-
-    #[test]
-    fn ctrl_q_backs_out_one_level_at_a_time() {
-        // 会话 / 两个选择器 -> 看板
-        assert!(matches!(
-            back_one_level(View::Attached(1)),
-            Some(View::Board)
-        ));
-        assert!(matches!(
-            back_one_level(View::PickProfile {
-                entries: Vec::new(),
-                state: ListState::default(),
-                warning: None,
-            }),
-            Some(View::Board)
-        ));
-        assert!(matches!(
-            back_one_level(View::PickProject(ProjectPicker {
-                filter: String::new(),
-                typing_path: None,
-                ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
-            })),
-            Some(View::Board)
-        ));
-    }
-
-    #[test]
-    fn ctrl_q_leaves_the_typing_state_before_leaving_the_picker() {
-        // 手输路径态退一层是回列表，不是一步退回看板
-        let back = back_one_level(View::PickProject(ProjectPicker {
-            filter: "a".into(),
-            typing_path: Some("/tmp/b".into()),
-            ..ProjectPicker::new(vec!["/tmp/a".into()], std::path::PathBuf::from("/tmp"))
-        }));
-        match back {
-            Some(View::PickProject(p)) => {
-                assert_eq!(p.typing_path, None, "应当退出手输态");
-                assert_eq!(p.filter, "a", "退一层不该顺手清掉过滤词");
-                assert_eq!(p.recent, vec!["/tmp/a".to_string()], "项目列表不该丢");
-            }
-            other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
-        }
-    }
-
-    /// 一个会话都没有的看板上（光标停在一个空项目的组头上也一样），
-    /// `Enter` 无事可做。写它不只是没用——右段只有三个位子，一个假键
-    /// 占掉的正是一个真键的位置。
     #[test]
     fn the_bottom_bar_offers_nothing_to_act_on_when_there_are_no_sessions() {
         let empty = HelpCtx::default();
@@ -1621,13 +1515,11 @@ mod tests {
         // 和 `the_door_to_the_rest_of_the_keys_is_always_on_screen`）。
     }
 
-    /// 九宫格不再是列表的下一层：两个模式都是顶层，`Ctrl+Q` 在两边都无事
-    /// 可做。留着「Ctrl+Q 回列表」的话，它就是 `g` 的一个隐藏同义词，
+    /// 九宫格不再是列表的下一层：两个模式都是顶层，逃生键在两边都是
+    /// 「q 退出」。写成「回列表」的话它就是 `g` 的一个隐藏同义词，
     /// 而屏幕上写的是「回列表」——用户会以为自己退出了什么。
     #[test]
     fn both_board_modes_are_top_level() {
-        assert!(back_one_level(View::Board).is_none());
-        assert!(back_one_level(View::grid(0)).is_none());
         assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
         assert_eq!(
             escape_hint(&View::grid(0), Lang::Zh),
@@ -1660,12 +1552,6 @@ mod tests {
     fn the_bar_leaves_the_view_switch_key_to_the_overlay() {
         assert!(!help_of(&View::Board, Lang::Zh).contains("g "));
         assert!(!help_of(&View::grid(0), Lang::Zh).contains("g "));
-    }
-
-    #[test]
-    fn ctrl_q_on_the_board_quits() {
-        // 退到头了。看板上退出不杀会话，守护进程继续跑。
-        assert!(back_one_level(View::Board).is_none());
     }
 
     #[test]
@@ -1798,7 +1684,8 @@ mod tests {
             KeyCode::Char('N'),
             KeyModifiers::SHIFT
         )));
-        // Ctrl 组合照旧放过：Ctrl+Q 在这层之前就被 is_ctrl_q 接走了，
+        // Ctrl 组合照旧放过（Ctrl+Q 也不再例外——见
+        // `ctrl_q_now_reaches_the_agent_like_any_other_ctrl_combo`），
         // 这里再挡一遍只会改掉和本次修复无关的行为。
         assert!(is_plain_key(&KeyEvent::new(
             KeyCode::Char('c'),
@@ -1851,14 +1738,11 @@ mod tests {
 
     #[test]
     fn escape_hint_matches_what_the_key_actually_does() {
-        // 底栏说什么就必须真能做到什么。手输路径态的 Ctrl+Q 是回列表
-        // 不是回看板（见 back_one_level），文案不能写成「回看板」。
+        // 底栏说什么就必须真能做到什么。手输路径态的 Esc 是回列表
+        // 不是回看板（见 `pick.rs` 的手输态分支），文案不能写成「回看板」。
         assert_eq!(escape_hint(&View::Board, Lang::Zh), "q 退出");
-        // 会话视图两个键都真的能回看板，所以两个都要写出来
-        assert_eq!(
-            escape_hint(&View::Attached(1), Lang::Zh),
-            "Ctrl+Q（F2） 回看板"
-        );
+        // 会话视图的逃生键是 F2 独一份：Esc 归 agent，Ctrl+Q 已经没了
+        assert_eq!(escape_hint(&View::Attached(1), Lang::Zh), "F2 回看板");
         assert_eq!(
             escape_hint(
                 &View::PickProject(ProjectPicker {
@@ -1868,7 +1752,7 @@ mod tests {
                 }),
                 Lang::Zh
             ),
-            "Ctrl+Q 回看板"
+            "Esc 回看板"
         );
         assert_eq!(
             escape_hint(
@@ -1879,7 +1763,7 @@ mod tests {
                 }),
                 Lang::Zh
             ),
-            "Ctrl+Q 回列表"
+            "Esc 回列表"
         );
     }
 
@@ -2105,30 +1989,6 @@ mod tests {
         assert!(help.contains("数字"));
     }
 
-    #[test]
-    fn back_one_level_from_picker_goes_to_board() {
-        assert!(matches!(
-            back_one_level(View::PickProfile {
-                entries: vec![],
-                state: ListState::default(),
-                warning: None,
-            }),
-            Some(View::Board)
-        ));
-    }
-
-    #[test]
-    fn secrets_view_escapes_to_the_board() {
-        assert!(matches!(
-            back_one_level(View::Secrets {
-                entries: vec![],
-                state: ListState::default(),
-                pending_delete: None,
-            }),
-            Some(View::Board)
-        ));
-    }
-
     // ———— Task 11：填密钥界面 ————
 
     #[test]
@@ -2210,23 +2070,6 @@ mod tests {
     }
 
     #[test]
-    fn secret_view_escapes_back_to_the_picker() {
-        // 回选择器而不是回看板：用户可能只是选错了 agent
-        let back = back_one_level(View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
-            },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: false,
-        });
-        assert!(matches!(back, Some(View::PickProfile { .. })));
-    }
-
-    #[test]
     fn secret_view_escape_hint_says_back_to_the_list() {
         // 底栏说什么就得真能做到什么
         let h = escape_hint(
@@ -2244,24 +2087,6 @@ mod tests {
             Lang::Zh,
         );
         assert!(h.contains("列表"), "底栏说什么就得真能做到什么：{h}");
-    }
-
-    #[test]
-    fn secret_view_from_settings_escapes_back_to_settings_not_the_picker() {
-        // return_to_settings 是「从哪儿进来的」——从密钥设置页进来的填密钥，
-        // 退出必须回设置页，不能像从选择器进来的那样落回 PickProfile。
-        let back = back_one_level(View::EnterSecret {
-            profile: "kimi".into(),
-            label: "Kimi".into(),
-            prompt: SecretPrompt {
-                hint: String::new(),
-                url: None,
-            },
-            buf: String::new(),
-            phase: SecretPhase::Typing,
-            return_to_settings: true,
-        });
-        assert!(matches!(back, Some(View::Secrets { .. })));
     }
 
     #[test]
@@ -2385,24 +2210,6 @@ mod tests {
     fn decide_delete_key_with_nothing_selected_is_a_no_op() {
         let action = decide_delete_key(None, &Some("kimi".to_string()));
         assert_eq!(action, DeleteKeyAction::NoSelection);
-    }
-
-    #[test]
-    fn back_one_level_from_secrets_clears_any_armed_delete() {
-        // Esc/Ctrl+Q 从密钥页退到看板，整个 View::Secrets 都被扔掉，
-        // 武装状态自然作废——这里确认 back_one_level 走的是「退到看板」
-        // 这条通用兜底，而不是哪天有人给 Secrets 加了专属分支却忘了清
-        // pending_delete。
-        let armed = View::Secrets {
-            entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
-            state: {
-                let mut s = ListState::default();
-                s.select(Some(0));
-                s
-            },
-            pending_delete: Some("kimi".to_string()),
-        };
-        assert!(matches!(back_one_level(armed), Some(View::Board)));
     }
 
     fn k(code: KeyCode) -> KeyEvent {

@@ -159,7 +159,7 @@ pub enum Key {
     KeysGroupConfig,
     // —— 逃生键 ——
     BackToBoard,
-    BackToBoardWithF2,
+    BackToBoardF2,
     BackToList,
     BackToSettings,
     // —— 视图标题 ——
@@ -342,10 +342,12 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         KeysGroupSession => t!(lang, en: "Sessions", zh: "会话"),
         KeysGroupConfig => t!(lang, en: "Settings", zh: "设置"),
 
-        BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
-        BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
-        BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
-        BackToSettings => t!(lang, en: "Ctrl+Q settings", zh: "Ctrl+Q 回设置"),
+        BackToBoard => t!(lang, en: "Esc back", zh: "Esc 回看板"),
+        // 会话视图专用：那里 Esc 归 agent（取消/清空/关弹窗），逃生键只能是
+        // F2。别把这条跟上面那条合并——合并就意味着某一屏的底栏在说谎。
+        BackToBoardF2 => t!(lang, en: "F2 back", zh: "F2 回看板"),
+        BackToList => t!(lang, en: "Esc back", zh: "Esc 回列表"),
+        BackToSettings => t!(lang, en: "Esc settings", zh: "Esc 回设置"),
 
         // 看板只有这一个标题了：它现在**永远**是全部项目——分组之后
         // 「只看本项目 / 看全部项目」这对模式整个消失，标题不再随模式变。
@@ -777,8 +779,8 @@ pub mod msg {
     pub fn installing(lang: Lang, profile: &str) -> String {
         t!(
             lang,
-            en: format!("Installing {profile}. When it finishes, press Ctrl+Q then N."),
-            zh: format!("正在安装 {profile}，装完按 Ctrl+Q 回看板再按 N"),
+            en: format!("Installing {profile}. When it finishes, press Esc then N."),
+            zh: format!("正在安装 {profile}，装完按 Esc 回看板再按 N"),
         )
     }
 
@@ -1277,7 +1279,7 @@ mod tests {
             TypeToFilter,
             Language,
             BackToBoard,
-            BackToBoardWithF2,
+            BackToBoardF2,
             BackToList,
             BackToSettings,
             BoardTitle,

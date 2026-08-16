@@ -545,6 +545,68 @@ mod tests {
         e
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn typing(return_to_settings: bool) -> View {
+        View::EnterSecret {
+            profile: "kimi".into(),
+            label: "Kimi".into(),
+            prompt: SecretPrompt {
+                hint: String::new(),
+                url: None,
+            },
+            buf: String::new(),
+            phase: SecretPhase::Typing,
+            return_to_settings,
+        }
+    }
+
+    /// 回选择器而不是回看板：用户可能只是选错了 agent。
+    ///
+    /// 这条以前测的是 `view::back_one_level`（Ctrl+Q 那条全局退路）。Ctrl+Q
+    /// 没了之后退路只剩这一个 Esc 分支，测试跟着搬到真正的按键处理上。
+    #[test]
+    fn escape_from_typing_a_key_goes_back_to_the_picker() {
+        let (mut app, _dir) = App::test_app();
+        app.view = typing(false);
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.view, View::PickProfile { .. }));
+    }
+
+    /// `return_to_settings` 是「从哪儿进来的」——从密钥设置页进来的填密钥，
+    /// 退出必须回设置页，不能像从选择器进来的那样落回 PickProfile。
+    #[test]
+    fn escape_from_settings_goes_back_to_settings_not_the_picker() {
+        let (mut app, _dir) = App::test_app();
+        app.view = typing(true);
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.view, View::Secrets { .. }));
+    }
+
+    /// Esc 从密钥页退出去，整个 `View::Secrets` 都被扔掉，武装的「再按一次
+    /// 就删」自然作废——这里防的是哪天有人给 Esc 加了「只清屏不换视图」
+    /// 之类的分支，却把 `pending_delete` 留在原地。
+    #[test]
+    fn escape_from_the_secrets_page_drops_any_armed_delete() {
+        let (mut app, _dir) = App::test_app();
+        app.view = View::Secrets {
+            entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
+            state: {
+                let mut st = ListState::default();
+                st.select(Some(0));
+                st
+            },
+            pending_delete: Some("kimi".to_string()),
+        };
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+        assert!(
+            !matches!(app.view, View::Secrets { .. }),
+            "Esc 要真的离开密钥页，武装状态才谈得上作废"
+        );
+    }
+
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         let area = buf.area;
         let mut s = String::new();

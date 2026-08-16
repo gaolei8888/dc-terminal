@@ -502,15 +502,15 @@ mod tests {
     }
 
     /// 复制模式是「此刻正在复制」的临时状态，不是配置。**进会话时复位**——
-    /// 不管上一个会话是怎么离开的（F2、Ctrl+Q、agent 自己退出），下一个会话
+    /// 不管上一个会话是怎么离开的（F2、agent 自己退出），下一个会话
     /// 一定从「鼠标归 agent」开始。
     ///
     /// 在**进入**这一侧复位，而不是在三条离开的路上各写一次：`enter_session`
     /// 只是「进」这一侧两个构造器之一（另一个是 `create_session`，见
     /// `create_session_resets_copy_mode_for_a_freshly_created_session`），
-    /// 两处合起来才盖住所有会落到 `View::Attached` 的路径。而离开有三条路，
-    /// 其中 Ctrl+Q 那条走的是 `back_one_level`——一个所有视图共用的纯函数，
-    /// 为这一个字段改它的签名不值。
+    /// 两处合起来才盖住所有会落到 `View::Attached` 的路径。而离开有好几条
+    /// 路（F2、agent 自己退出、守护进程报会话没了），散在不同模块里，为这
+    /// 一个字段在每条路上各写一次复位，漏一条就是一个不会报错的洞。
     #[test]
     fn entering_a_session_always_starts_outside_copy_mode() {
         let (mut app, _d) = App::test_app();

@@ -920,6 +920,28 @@ mod tests {
         assert_eq!(p.shown_recent().len(), 2, "左栏不受影响");
     }
 
+    /// 手输路径态按 Esc 退的是**一层**——回两栏那一屏，不是一步关掉整个
+    /// 选择器，也不能顺手清掉已经打好的过滤词。
+    ///
+    /// 这条以前测的是 `view::back_one_level`（Ctrl+Q 那条全局退路）。Ctrl+Q
+    /// 没了之后退路只剩这一个 Esc 分支，测试跟着搬到真正的按键处理上。
+    #[test]
+    fn escape_leaves_the_typing_state_before_leaving_the_picker() {
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        open_picker(&mut app, vec!["/w/a".into()], root);
+        let mut p = picker(&app);
+        p.filter = "a".into();
+        p.typing_path = Some("/tmp/b".into());
+        app.view = View::PickProject(p);
+
+        press(&mut app, KeyCode::Esc);
+
+        let p = picker(&app);
+        assert_eq!(p.typing_path, None, "应当退出手输态");
+        assert_eq!(p.filter, "a", "退一层不该顺手清掉过滤词");
+        assert_eq!(p.recent, vec!["/w/a".to_string()], "项目列表不该丢");
+    }
+
     /// Esc 回到用户选的模式，不是永远的列表（复用 B 的 home_view）。
     #[test]
     fn escape_returns_to_the_chosen_mode() {

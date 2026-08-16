@@ -34,14 +34,11 @@ mod settings_view;
 
 mod view;
 use view::SecretPhase;
-use view::{
-    back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
-    session_ended_notice, View,
-};
 pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
     verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
+use view::{escape_hint, idle_help, message_after_transition, session_ended_notice, View};
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
 ///
@@ -270,7 +267,7 @@ pub fn run(
                     // 屏幕上这一份 (profile, buf)」完全一致时才有落点——见
                     // 上面声明 `verify_rx` 时的注释和
                     // `verify_outcome_applies_to` 的文档注释。用户可能在这次
-                    // 网络探测跑着的时候已经 Ctrl+Q/Esc 退出去，甚至绕回来
+                    // 网络探测跑着的时候已经 Esc 退出去，甚至绕回来
                     // 在另一个 agent 身上重新填了密钥；这时候视图仍然是
                     // `EnterSecret`，光看"是不是这个变体"分不出是不是同一个
                     // 请求，必须把 profile 和 buf 都比对上。不满足就直接
@@ -307,7 +304,7 @@ pub fn run(
                                     // `continue` 到下一轮循环顶部，跳过收尾，空壳会
                                     // 一直空着，直到用户偶然按下一个键才被补上（手测
                                     // 时真的复现了：改完密钥，界面卡在一屏空列表，
-                                    // 直到按了 Ctrl+Q 再按 c 才刷出来）。直接现查一遍，
+                                    // 直到按了 Esc 再按 c 才刷出来）。直接现查一遍，
                                     // 光标顺手定在刚改的这一行上。
                                     //
                                     // 改完给一句确认：这一行本身会从「未配」翻成
@@ -381,7 +378,7 @@ pub fn run(
                     // else：profile 或 buf 对不上——这条结果对应的是一个用户
                     // 已经离开的请求，扔了，不切视图。
                 }
-                // else：视图现在压根就不是 EnterSecret 了（比如用户 Esc/Ctrl+Q
+                // else：视图现在压根就不是 EnterSecret 了（比如用户按 Esc
                 // 提前离开，切到了看板/选择器/设置页）。同样没有落点，扔了。
             }
         }
@@ -498,7 +495,7 @@ pub fn run(
             // 画面也扔掉。留着的话，下次再按 g 进来的第一帧画的是上一次的
             // 旧画面（可能是几分钟前的，甚至是已经没了的会话）。收在这里
             // 而不是在每个「离开九宫格」的按键分支里各清一次：出口有 g、
-            // Ctrl+Q、Enter 放大、n/p/c 弹出的那几个视图……漏一个就是一帧
+            // Esc、Enter 放大、n/p/c 弹出的那几个视图……漏一个就是一帧
             // 残影，而这一条判断覆盖了全部。
             app.grid_screens.clear();
         }
@@ -707,41 +704,24 @@ pub fn run(
         let message_text_before = app.message.text.clone();
         let message_error_before = app.message.error;
 
-        // Ctrl+Q 在所有视图里都是「退一层，一直按就退到头」。
+        // 这里以前先拦一道全局 Ctrl+Q（「退一层，一直按就退到头」）。它没了：
+        // 每个视图的退路都写在底栏左段上，而且每个视图都已经有一个——会话
+        // 视图 F2、其余视图 Esc、看板和九宫格 `q`。少一个全局键的代价是
+        // 「猜不到就得看底栏」，收益是 0x11 重新归 agent，而且底栏上写的键
+        // 就是全部的键，没有第二套暗规则。
         //
-        // 加这个键是因为真实事故：用户不知道有 F2，在会话里怎么按都出不去，
-        // 只能去别的窗口 kill 进程。`Q = quit` 是非程序员唯一猜得到的组合，
-        // 而 Claude Code 不占用它——代价只是从 agent 手里拿走 0x11。
-        //
-        // 拦截**必须**留在 `match view.clone()` 之前，别挪进去：`PickProject`
-        // 的打字过滤和手输路径都靠 `Char(c)` 累加，而 Ctrl+Q 在 crossterm 里
-        // 就是 `Char('q')` 带 CONTROL——挪进去就会往过滤框里塞一个 q。
-        if is_ctrl_q(&key) {
-            // 从九宫格退回列表时，列表光标要落在刚才那个焦点格上（见
-            // `sync_board_cursor_from_grid`）。必须在 `back_one_level` 之前调，
-            // 那之后 `app.view` 已经不是 Grid 了。
-            sync_board_cursor_from_grid(&mut app);
-            match back_one_level(app.view.clone()) {
-                None => app.quit = true,
-                Some(next) => {
-                    // 回看板要重新拉一次会话列表，否则看板显示的是进会话之前的旧快照
-                    app.need_sessions = matches!(next, View::Board);
-                    app.view = next;
-                }
-            }
-        } else {
-            // 必须 clone：分支里要给 view 赋值，match &view 会被借用检查器拒掉
-            match app.view.clone() {
-                View::Board => board::handle_key(&mut app, key)?,
-                View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
-                View::PickProject(_) => pick::handle_key(&mut app, key)?,
-                View::Attached(_) => attach::handle_key(&mut app, key)?,
-                View::Grid { .. } => grid::handle_key(&mut app, key)?,
-                View::Keys { .. } => keys::handle_key(&mut app, key)?,
-                View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
-                View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
-                View::Secrets { .. } => secret::handle_key(&mut app, key)?,
-            }
+        // 现在每个键都直接进视图自己的处理函数。必须 clone：分支里要给 view
+        // 赋值，match &view 会被借用检查器拒掉。
+        match app.view.clone() {
+            View::Board => board::handle_key(&mut app, key)?,
+            View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
+            View::PickProject(_) => pick::handle_key(&mut app, key)?,
+            View::Attached(_) => attach::handle_key(&mut app, key)?,
+            View::Grid { .. } => grid::handle_key(&mut app, key)?,
+            View::Keys { .. } => keys::handle_key(&mut app, key)?,
+            View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
+            View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
+            View::Secrets { .. } => secret::handle_key(&mut app, key)?,
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
@@ -751,7 +731,7 @@ pub fn run(
         pin_cursor_group(&mut app);
 
         // 退出必须在这里落地，不能拖到循环末尾的收尾代码之后。现在有三条路
-        // 会置 quit：Ctrl+Q 在顶层（`back_one_level` 返回 None）、看板上按 q、
+        // 会置 quit：看板上按 q、
         // 九宫格里按 q。走到下面的 needs_*_refetch / message_after_transition
         // 也不会有副作用，但那是这三条路各自的巧合，不是那段代码保证的——
         // 而且退出点还会再增加（九宫格那条就是后加的）。在这里 break 直接
@@ -762,8 +742,8 @@ pub fn run(
             break;
         }
 
-        // 好几条路都能把 view 换成一个空的 PickProfile——Ctrl+Q 走
-        // back_one_level（它是纯函数，拿不到 daemon 连接，只能给个
+        // 好几条路都能把 view 换成一个空的 PickProfile——`EnterSecret` 的 Esc
+        // 分支拿不到 daemon 连接，只能给个
         // entries: vec![] 的空壳，约定见它的文档注释），EnterSecret 自己的
         // Esc 分支也直接手搭了同一个空壳。两条路都得补，所以放在这里统一
         // 收口，而不是在每个「退回选择器」的地方各查一次——漏一个分支就是
@@ -802,7 +782,7 @@ pub fn run(
             };
         }
 
-        // 同样的空壳套路用在 Secrets 上：EnterSecret 的 Esc/Ctrl+Q 从设置页
+        // 同样的空壳套路用在 Secrets 上：EnterSecret 的 Esc 从设置页
         // 那条分支进来时、以及验证成功后回设置页时，都是先甩一个空壳占位，
         // 这里补一次 Profiles 把数据填上。`Secrets` 没有 `warning` 字段
         // （跟 `PickProfile` 不一样，见它的字段注释——密钥页的错误反馈走的
@@ -876,10 +856,8 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
     let s = match key.code {
         KeyCode::Enter => String::new(),
         KeyCode::Char(c) if ctrl => {
-            // Ctrl+Q 是 dct 自己的逃生键，绝不透传——见 is_ctrl_q 的注释
-            if c.eq_ignore_ascii_case(&'q') {
-                return None;
-            }
+            // Ctrl+Q 这里没有例外：它曾是 dct 自己的逃生键，被这一层扣着不发。
+            // 逃生键改成 F2 独一份之后，0x11 就该跟别的 Ctrl 组合一样进 agent。
             // Ctrl+A..Ctrl+Z -> 0x01..0x1a，其余 Ctrl 组合不转发
             let lower = c.to_ascii_lowercase();
             if lower.is_ascii_lowercase() {
@@ -1292,8 +1270,8 @@ pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 「复位一次就漏不掉」的不是某一个函数是唯一入口，而是**进的这一侧
     // 一共只有 `enter_session` 和 `create_session` 两个构造器，合起来盖住
     // 所有会落到 `View::Attached` 的路径**——这里复位一次，`create_session`
-    // 里再复位一次，两处就覆盖完了。反过来，离开有三条路，其中 Ctrl+Q
-    // 那条走的是 `back_one_level`——一个所有视图共用的纯函数，为这一个
+    // 里再复位一次，两处就覆盖完了。反过来，离开有三条路，其中一条走的是
+    // 各视图自己的 Esc/F2 分支——它们散在四个模块里，为这一个
     // 字段改它的签名不值，所以选在「进」而不是「出」的这几处写。
     //
     // 留在看板上的那个 `copy_mode` 是无害的：`wants_mouse_capture` 的第一个
@@ -1558,14 +1536,13 @@ pub(crate) fn point_cursor_at_session(app: &mut App, id: u32) {
 ///
 /// 两个视图对「当前是哪个会话」的认知必须一致——`board.rs` 的 `g` 分支
 /// 已经做了列表→九宫格那一半，这是反过来的另一半。少了它，用户盯着第 5 格
-/// 按 Ctrl+Q 回到列表，光标还停在第一行，下一个 `s`（停止）或 `u`（回滚）
+/// 回到列表时光标还停在第一行，下一个 `s`（停止）或 `u`（回滚）
 /// 就毁在另一个会话上——这两个键都不可撤销，不能指望用户自己看出来。
 ///
-/// 抽成函数是因为出口不止一个（`g`、Ctrl+Q、Enter 放大），而 Ctrl+Q 那条
-/// 走的是 `back_one_level`——它是纯函数，手里根本没有 `list_state`。
+/// 抽成函数是因为出口不止一个（`g`、Enter 放大）。
 /// 不在九宫格里就什么都不做，调用方不必先判视图。
 ///
-/// **只用在「用户没有碰过焦点」的那几个出口上**（`g`、`Enter`、Ctrl+Q）。
+/// **只用在「用户没有碰过焦点」的那几个出口上**（`g`、`Enter`）。
 /// 方向键那条路不走这里，它直接 `point_cursor_at_session`——理由见下面那条
 /// 守卫，以及 `grid::point_cursor_at_focus`。
 ///
@@ -1825,7 +1802,7 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
 /// （删完/改完还盯着同一个 profile，比每次都弹回第一行顺手），不给就落在
 /// 第一行（刚打开页面，没有"原来"）。
 ///
-/// 拉取失败时退化成一个空 `entries` 的壳——同 `back_one_level` 对
+/// 拉取失败时退化成一个空 `entries` 的壳——同各视图 Esc 分支对
 /// `PickProfile`/`Secrets` 的约定：循环收尾那段通用重拉逻辑看到空壳会自己
 /// 再补一次，这里不需要重复一份「失败了怎么办」的判断。
 fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
@@ -1865,11 +1842,12 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
     }
 }
 
-/// 左段固定占的列数：最长的一条是会话视图的「Ctrl+Q（F2） 回看板」
-/// = 6 + 全角括号 2 + "F2" 2 + 全角括号 2 + 空格 1 + 中文 3 字 × 2 = 19。
-/// 其余各条都更短（「Ctrl+Q 回列表」13，「q 退出」7）。
-/// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
-const ESCAPE_HINT_COLS: u16 = 19;
+/// 左段固定占的列数：最长的一条是英文密钥页的 "Esc settings" = 12。
+/// 中文那边最长的是「Esc 回看板」= 3 + 1 + 中文 3 字 × 2 = 10，会话视图的
+/// 「F2 回看板」只有 9。写死而不是每帧算：左段宽度跟着文案跳动会让右段的
+/// 消息忽宽忽窄。`escape_hint_cols_fits_every_view` 会把这个数钉死在
+/// 「正好等于最长文案」上，改文案就得跟着改这里。
+const ESCAPE_HINT_COLS: u16 = 12;
 
 /// 底栏中段：当前项目占的列数。按显示宽度截断，CJK 项目名同样算两列。
 ///
@@ -3189,15 +3167,17 @@ mod tests {
     /// 那一个——但让的是**终端太窄**，不是让给消息。
     #[test]
     fn the_bar_gives_up_the_project_before_the_escape_hint_or_the_door() {
+        // 左段是 ESCAPE_HINT_COLS + 2 = 14：逃生键从「Ctrl+Q（F2） 回看板」
+        // 收敛成「F2 回看板」之后窄了 7 列，那 7 列全归右段。
         // 常见宽度：三段都拿到自己那份
-        assert_eq!(bar_widths(98), (21, 18, 59));
-        assert_eq!(bar_widths(78), (21, 18, 39));
+        assert_eq!(bar_widths(98), (14, 18, 66));
+        assert_eq!(bar_widths(78), (14, 18, 46));
         // 55 列终端（`the_way_back_survives_a_narrow_terminal` 那一档）：
         // 中段缩到只剩几列，好让右段完整放下那句「怎么回到底部」
-        assert_eq!(bar_widths(53), (21, 4, 28));
+        assert_eq!(bar_widths(53), (14, 11, 28));
         // 再窄下去中段整个让掉，左段和右段一列不动
         let (esc, proj, act) = bar_widths(38);
-        assert_eq!(esc, 21, "逃生键永不让位");
+        assert_eq!(esc, 14, "逃生键永不让位");
         assert_eq!(proj, 0, "窄到这份上，让的是中段");
         assert_eq!(esc + proj + act, 38, "三段必须正好铺满，不能有空隙");
         // 窄到荒谬也不能 panic、不能溢出
@@ -3627,10 +3607,7 @@ mod tests {
         app.connected = false;
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = bar_text(&term);
-        assert!(
-            c.contains("Ctrl+Q（F2）回看板"),
-            "断连时逃生提示必须还在：{c}"
-        );
+        assert!(c.contains("F2回看板"), "断连时逃生提示必须还在：{c}");
         assert!(c.contains("连不上"), "断连提示本身也要显示：{c}");
     }
 
@@ -3730,12 +3707,9 @@ mod tests {
         app.view = View::Attached(1);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
-        // F2 从右段的「F2 同效」挪进了左段的逃生键本身，两个键并列写在
-        // 一处。断言跟着挪：老用户的肌肉记忆仍要在屏幕上找得到。
-        assert!(
-            c.contains("Ctrl+Q（F2）回看板"),
-            "会话视图要给出逆转键提示，且两个键都要点名：{c}"
-        );
+        // 会话视图的逃生键只有 F2 一个（Esc 归 agent，Ctrl+Q 已经不存在）。
+        // 它写在左段的逃生键上——这是用户能看到的唯一一条退路。
+        assert!(c.contains("F2回看板"), "会话视图要给出逆转键提示：{c}");
         assert!(
             c.contains("F3下一个会话"),
             "F3 是九宫格快速跳转的入口，提示里丢了就没人知道：{c}"

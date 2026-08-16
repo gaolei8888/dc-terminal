@@ -57,7 +57,7 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
     // 那边左右键是移动焦点，写上去就是教人按错。
     //
     // 键名列写 `Space` 不写 `空格`：这一列是**键盘上那个键叫什么**，跟界面
-    // 语言无关，整个仓库都是 `Tab`/`Enter`/`Esc`/`Ctrl+Q`/`F3` 这样原样写的。
+    // 语言无关，整个仓库都是 `Tab`/`Enter`/`Esc`/`F2`/`F3` 这样原样写的。
     // 写成中文的话英文用户会看到 `←→/空格 fold`——而 i18n 那条「英文里不许
     // 有汉字」的守卫只扫 `text()`，看不见键名列。现在下面
     // `no_key_column_is_ever_written_in_chinese` 把这一列也扫上了。

@@ -126,7 +126,7 @@ The board is **grouped by project**. Sessions from the same project sit together
 | `g` | tile grid: every session's live screen at once; `Enter` zooms in |
 | `?` | all keys |
 | `q` | quit the board; sessions keep running |
-| `Ctrl+Q` | back out one level, wherever you are |
+| `Esc` | back out one level in the pickers, keys page and settings |
 
 **Every project remembers its own last agent.** Press `n` in project A and you get claude, press `n` in project B and you get codex — and the bottom bar names which one you're about to get before you press anything (`n new claude`). A project that has never had a session just says `n new`, and pressing it opens the agent picker; so does a window too narrow to fit the name without pushing another key off the line.
 
@@ -138,7 +138,7 @@ The grid is read-only — arrows move focus, `F3` does the same as `→` (next t
 
 Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
 
-Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3`, `F4` and `Ctrl+Q` are the only four keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view, `F4` toggles copy mode (more on that below).
+Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `F4` are the only three keys `dct` keeps: `F2` backs out to the board, `F3` jumps straight to the next running session without leaving the attach view, `F4` toggles copy mode (more on that below). The bottom-left hint (`F2 back`) is always there — a disconnect, an error, or a long message can't push it off the line, because it's the only way out of a session.
 
 You can scroll back through what a session already printed, with `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. A page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. The wheel only does something when the agent itself wants the mouse: Claude Code does, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex and plain command-line tools don't want the mouse, so `dct` doesn't capture it there either — the wheel no longer scrolls `dct`'s history, and depending on your terminal it may do nothing or send arrow keys straight to the agent; use `PageUp`/`PageDown`/`End` instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
 

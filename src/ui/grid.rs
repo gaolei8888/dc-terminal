@@ -1752,10 +1752,9 @@ mod tests {
         );
     }
 
-    /// Ctrl+Q 那条出口的同步只能做在 `run()` 的按键循环里（`back_one_level`
-    /// 是纯函数，拿不到 `list_state`），而循环要真终端才跑得起来、测不了。
-    /// 能测的是它调的那个函数：在九宫格里对齐焦点、不在九宫格里一动不动
-    /// （Ctrl+Q 是全局键，每次按都会经过它）。
+    /// 光标同步这件事本身在 `run()` 的按键循环里发生，而循环要真终端才跑得
+    /// 起来、测不了。能测的是它调的那个函数：在九宫格里对齐焦点、不在九宫格
+    /// 里一动不动（别的视图也会调到它）。
     #[test]
     fn the_cursor_sync_follows_the_focus_and_leaves_other_views_alone() {
         let (mut app, _dir) = App::test_app();
@@ -1766,7 +1765,7 @@ mod tests {
         // 行是 [组头, 1, 2, 3, 4, 5, 6]：第 5 格是会话 5，落在第 5 行
         assert_eq!(app.list_state.selected(), Some(5));
 
-        // 从别的视图按 Ctrl+Q 时它也会被调到，那时候不该动光标
+        // 从别的视图调到它时不该动光标
         app.view = View::Attached(1);
         app.list_state.select(Some(2));
         super::super::sync_board_cursor_from_grid(&mut app);
@@ -1775,7 +1774,7 @@ mod tests {
 
     #[test]
     fn zooming_in_also_leaves_the_list_cursor_on_that_session() {
-        // Enter 放大也是离开九宫格的一条路：从会话里 Ctrl+Q 出来就到列表，
+        // Enter 放大也是离开九宫格的一条路：从那个会话里按 F2 出来就到列表，
         // 那时候光标得在刚才看的那个会话上。
         let (mut app, _dir) = App::test_app();
         app.set_sessions((1..=6).map(|i| session(i, SessionState::Idle)).collect());
