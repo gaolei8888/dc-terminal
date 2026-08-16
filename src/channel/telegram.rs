@@ -136,9 +136,6 @@ pub struct Telegram {
     /// 长轮询的游标。Telegram 只在你确认过之后才丢弃旧更新，
     /// 不带它会把同一条消息反复取回来——那意味着同一句话被敲进 agent 好几遍。
     offset: Mutex<i64>,
-    /// 配对到的 chat id。**第一个给 bot 发消息的人**被记为主人；配对
-    /// 之前没有地方可发，`send` 会报 `Unreachable`。
-    chat_id: Mutex<Option<i64>>,
     send: Box<Send>,
 }
 
@@ -151,7 +148,6 @@ impl Telegram {
         Telegram {
             token: token.to_string(),
             offset: Mutex::new(0),
-            chat_id: Mutex::new(None),
             send,
         }
     }
@@ -162,13 +158,8 @@ impl Telegram {
 }
 
 impl Channel for Telegram {
-    fn send(&self, text: &str) -> Result<MsgId, ChannelError> {
-        let chat_id = self
-            .chat_id
-            .lock()
-            .unwrap()
-            .ok_or(ChannelError::Unreachable)?;
-        let body = serde_json::json!({"chat_id": chat_id, "text": text}).to_string();
+    fn send(&self, to: i64, text: &str) -> Result<MsgId, ChannelError> {
+        let body = serde_json::json!({"chat_id": to, "text": text}).to_string();
         let resp =
             (self.send)(&self.url("sendMessage"), &body).map_err(|_| ChannelError::Unreachable)?;
         parse_send_result(&resp)
@@ -192,14 +183,6 @@ impl Channel for Telegram {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
             if let Some(max_id) = max_update_id(&v) {
                 *self.offset.lock().unwrap() = max_id + 1;
-            }
-        }
-
-        // 配对：第一条收到的消息，它的发送者就是主人。
-        if let Some(first) = incoming.first() {
-            let mut chat = self.chat_id.lock().unwrap();
-            if chat.is_none() {
-                *chat = Some(first.chat_id);
             }
         }
 
@@ -327,6 +310,42 @@ mod tests {
             urls[1].contains("offset=8"),
             "第二次轮询该带上上一批最大 update_id(7) + 1: {}",
             urls[1]
+        );
+    }
+
+    /// `send` 的 `to` 参数必须原样送进请求体的 `chat_id` 字段——渠道自己
+    /// 不记着任何 chat id，收件人完全由调用方每次决定。这一条要是被
+    /// 破坏（比如又悄悄记住了某个 chat id、或者忽略 `to` 用了别的常量），
+    /// 发往「用户私人会话」的通知就可能被送到错的聊天里，这正是
+    /// `chat_id: Mutex<Option<i64>>` 这个字段被删掉要防的问题。
+    #[test]
+    fn send_posts_to_the_chat_id_the_caller_passed() {
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let tg = Telegram::with_transport(
+            "tok",
+            Box::new(move |url, body| {
+                sink.lock()
+                    .unwrap()
+                    .push((url.to_string(), body.to_string()));
+                Ok(r#"{"ok":true,"result":{"message_id":1,"chat":{"id":0}}}"#.to_string())
+            }),
+        );
+
+        tg.send(4242, "hello").unwrap();
+        tg.send(9999, "hello again").unwrap();
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[0].1.contains("\"chat_id\":4242"),
+            "第一次 send 的请求体该带上调用方传入的 4242: {}",
+            calls[0].1
+        );
+        assert!(
+            calls[1].1.contains("\"chat_id\":9999"),
+            "第二次 send 换了目标，请求体该跟着换成 9999，不是复用上一次: {}",
+            calls[1].1
         );
     }
 }

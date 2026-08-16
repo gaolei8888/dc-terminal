@@ -38,8 +38,10 @@ impl ChannelError {
 }
 
 pub trait Channel: Send + Sync {
-    /// 发一条，返回渠道那边的消息 id。
-    fn send(&self, text: &str) -> Result<MsgId, ChannelError>;
+    /// 发一条给 `to`，返回渠道那边的消息 id。
+    /// **谁是收件人由调用方决定**——渠道这一层不认识、也不记着谁是主人，
+    /// 那是 `bridge.rs` 的职责。
+    fn send(&self, to: i64, text: &str) -> Result<MsgId, ChannelError>;
     /// 取新消息，最多阻塞 `timeout`。没有新消息就返回空 `Vec`，不是错误。
     fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError>;
 }
