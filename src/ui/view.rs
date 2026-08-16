@@ -112,10 +112,19 @@ pub(crate) enum View {
         warning: Option<String>,
     },
     PickProject(ProjectPicker),
-    /// 设置页：目前只有语言一项。跟 `Secrets` 分开是两码事——那边管的是
-    /// 「哪个 agent 用哪把密钥」，这里管的是界面本身怎么显示。
+    /// 设置页：一张「设置项」列表（`SettingsItem`，见 `settings_view.rs`），
+    /// 不再是纯语言列表——语言现在是列表里的一项，选中它才进语言子列表。
+    /// 跟 `Secrets` 分开是两码事——那边管的是「哪个 agent 用哪把密钥」，
+    /// 这里管的是界面本身怎么显示。
     Settings {
+        /// 顶层「设置项」列表的光标。
         state: ListState,
+        /// `None` = 停在顶层设置项列表；`Some` = 已经选中「语言」进了语言
+        /// 子列表，这里存的是子列表自己的光标。**不新开一个 `View` 变体**
+        /// 是因为语言子列表退出（`Esc`）之后要回到的是设置项列表，不是
+        /// 看板——用同一个 `View::Settings` 装两层，`Esc` 才能一层一层退，
+        /// 而不是一步退到底。
+        lang: Option<ListState>,
     },
     EnterSecret {
         /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
@@ -1343,6 +1352,7 @@ mod tests {
             View::PickProject(typing),
             View::Settings {
                 state: ListState::default(),
+                lang: None,
             },
             secret(false, SecretPhase::Typing),
             secret(true, SecretPhase::Typing),

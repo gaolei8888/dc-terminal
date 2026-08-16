@@ -1412,17 +1412,12 @@ pub(crate) fn home_view(app: &App) -> View {
     }
 }
 
-/// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到
-/// 「现在是哪个」，而不是从头找。
+/// `l` 键：打开设置页，光标落在「语言」这一项上——它现在是设置项列表里的
+/// 第一项，不再是语言本身的列表（见 `settings_view::SettingsItem`）。
 pub(crate) fn open_settings(app: &mut App) {
     let mut state = ListState::default();
-    state.select(Some(
-        crate::i18n::Lang::all()
-            .iter()
-            .position(|l| *l == app.lang)
-            .unwrap_or(0),
-    ));
-    app.view = View::Settings { state };
+    state.select(Some(0));
+    app.view = View::Settings { state, lang: None };
 }
 
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
@@ -3524,6 +3519,7 @@ mod tests {
             },
             View::Settings {
                 state: ListState::default(),
+                lang: None,
             },
             View::Keys {
                 from: Box::new(View::Board),

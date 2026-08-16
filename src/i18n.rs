@@ -148,6 +148,9 @@ pub enum Key {
     OrPressDigit,
     TypeToFilter,
     Language,
+    /// 设置页顶层列表里的第二项。手机通知页本身（Task 4 的 `View::Phone`）
+    /// 有自己一整套状态文案，这里只是设置项列表上的那一行标签。
+    Phone,
     // —— 全部按键浮层 ——
     /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
     /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
@@ -335,6 +338,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
+        Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
 
         MoreKeys => t!(lang, en: "…", zh: "…"),
         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
@@ -1278,6 +1282,7 @@ mod tests {
             OrPressDigit,
             TypeToFilter,
             Language,
+            Phone,
             BackToBoard,
             BackToBoardF2,
             BackToList,
@@ -1376,7 +1381,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 100, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 101, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
