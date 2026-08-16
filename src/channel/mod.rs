@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+pub mod telegram;
+
 /// 渠道那边的消息 id。长按回复靠它把回复关联回某个会话。
 /// Telegram 的 `message_id` 是有符号整数，这里跟着它走。
 pub type MsgId = i64;
