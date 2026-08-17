@@ -396,7 +396,7 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
         List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .border_style(border)
                     .title(title),
             )
@@ -422,7 +422,7 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(
             Paragraph::new(format!("{buf}▌")).block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .border_style(border_style)
                     .title(text(Key::TypePathTitle, lang)),
             ),
@@ -523,7 +523,7 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
 /// 看不出来的话，他打的字会在他以为的另一栏里过滤，而那一栏毫无反应。
 fn pane_block(title: String, focused: bool, base: Style) -> Block<'static> {
     Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(if focused {
             Style::default().fg(Color::Cyan)
         } else {

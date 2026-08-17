@@ -164,7 +164,7 @@ fn draw_settings_items(f: &mut Frame, area: Rect, app: &mut App, state: &ListSta
         List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .title(text(Key::SettingsTitle, app.lang))
                     .border_style(if app.connected {
                         Style::default()
@@ -202,7 +202,7 @@ fn draw_language_list(f: &mut Frame, area: Rect, app: &mut App, state: &ListStat
         List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .title(format!(
                         "{} · {}",
                         text(Key::SettingsTitle, app.lang),

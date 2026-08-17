@@ -431,7 +431,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .border_style(border_style)
                 .title(title),
         ),
@@ -503,7 +503,7 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
         List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .border_style(border_style)
                     .title(crate::i18n::text(crate::i18n::Key::SecretsTitle, app.lang)),
             )

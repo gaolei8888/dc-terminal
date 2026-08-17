@@ -193,7 +193,10 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
     // 就是一个左边一行字、右边一大片空白的框——用户会去找那片空白里是不是
     // 还有东西。框贴着内容走，眼睛才知道到哪儿为止。
     let max_w = (area.width.saturating_mul(4) / 5).max(20);
-    let inner_w = max_w.saturating_sub(4).max(16) as usize;
+    // 这个浮层只画上下边框（`Borders::TOP | Borders::BOTTOM`），左右不再
+    // 吃列——复制文字不该带上边框字符。原来的 `4` 是「左右边框各 1 列」
+    // 加「左右各留 1 列呼吸感」；边框那一半现在是 0，只剩呼吸感的 2 列。
+    let inner_w = max_w.saturating_sub(2).max(16) as usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut widest = 0usize;
     for (i, g) in groups.iter().enumerate() {
@@ -217,13 +220,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
 
     // 标题也算宽度：「全部按键」比内容窄得多，但英文下不一定。
     widest = widest.max(display_width(text(Key::AllKeys, app.lang)));
-    let want_w = (widest as u16 + 4).min(max_w);
+    // `+2` 跟上面 `inner_w` 的 `-2` 是同一笔账（只剩呼吸感，边框那一半已经
+    // 是 0），来回换算才不会分叉。
+    let want_w = (widest as u16 + 2).min(max_w);
     let popup = popup_area(area, want_w, lines.len() as u16 + 2);
     f.render_widget(ratatui::widgets::Clear, popup);
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(text(Key::AllKeys, app.lang)),
         ),
         popup,

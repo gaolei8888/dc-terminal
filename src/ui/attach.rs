@@ -248,13 +248,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 // 键」这件事都看不见（这个项目已经出过一次这个形状的 bug：
                 // 键存在，但屏幕上哪儿都没写）。
                 //
-                // 16 列是量出来的：60 列（本仓库测的最窄宽度）减 2 列边框，
-                // 减前缀「Session 1 · 」（英文最长档，12 列）、减分隔符
-                // 「 · 」（3 列）、减尾巴「 —— F2 goes back」（英文最长档，
-                // 16 列），剩下给 `project` 和名字总共 27 列；`truncate`
-                // 真裁了会多出一列，所以传 15 留 1 列余量——`project` 在这个
-                // 视图里通常只是最后一段目录名，不会把这份预算吃光。
-                format!("{project} · {}", truncate(&s.tag, 15))
+                // 18 列是量出来的：60 列（本仓库测的最窄宽度）——会话内容区
+                // 左右不再画边框（复制文字不该带上边框字符），这笔账不用再
+                // 减那 2 列——减前缀「Session 1 · 」（英文最长档，12 列）、
+                // 减分隔符「 · 」（3 列）、减尾巴「 —— F2 goes back」（英文
+                // 最长档，16 列），剩下给 `project` 和名字总共 29 列；
+                // `truncate` 真裁了会多出一列，所以传 17 留 1 列余量——
+                // `project` 在这个视图里通常只是最后一段目录名，不会把这份
+                // 预算吃光。
+                format!("{project} · {}", truncate(&s.tag, 17))
             }
         })
         .unwrap_or_default();
@@ -263,25 +265,29 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         crate::i18n::msg::session_title_disconnected(app.lang, id, &here)
     };
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(border_style)
+        .title(title);
+    // 内容区左上角/宽高**从 `Block::inner()` 拿**，不手算边框宽度——这正是
+    // `App::screen_origin` 的文档警告的那类 bug：布局一改，手算的数就
+    // 悄悄错了。现在左右不画边框，`inner.x == area.x`；上下各还有一行
+    // 边框，`inner.y == area.y + 1`。
+    let inner = block.inner(area);
     f.render_widget(
-        Paragraph::new(screen_to_lines(&app.screen)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title),
-        ),
+        Paragraph::new(screen_to_lines(&app.screen)).block(block),
         area,
     );
     // 会话内容区左上角在真实终端上的坐标，鼠标事件换算列/行要用它。
     // 必须在这里记，不能让 `handle_mouse` 自己硬算边框宽度——布局改了
     // 硬算的数就错了，而且错得很安静（见 `App::screen_origin` 的文档）。
-    app.screen_origin = Some((area.x + 1, area.y + 1));
+    app.screen_origin = Some((inner.x, inner.y));
     // 把 agent 屏幕里的光标位置映射到真实终端上。没有这一步用户
-    // 看到的只是一张死截图，不知道自己打的字会落在哪。+1 是边框。
+    // 看到的只是一张死截图，不知道自己打的字会落在哪。
     let (row, col) = app.screen_cursor;
-    let x = area.x + 1 + col;
-    let y = area.y + 1 + row;
-    if x < area.x + area.width.saturating_sub(1) && y < area.y + area.height.saturating_sub(1) {
+    let x = inner.x + col;
+    let y = inner.y + row;
+    if x < inner.x + inner.width && y < inner.y + inner.height {
         f.set_cursor_position((x, y));
     }
 }
@@ -341,12 +347,13 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     }
 
     // 终端坐标减掉内容区左上角，换算成 agent 画面里的坐标。`checked_sub`
-    // 只挡得住点在边框上方/左方（结果会是负数）的那一半越界——点在内容区
-    // 右边或下边（底栏、右边框）的点击减完还是个合法的非负数，照样会被
-    // 转发过去，只是行/列比 agent 实际画面多出那么一两个。真实 agent 收到
-    // 一个越界的行列会直接忽略，不是活的 bug；真要在这里也挡住，需要的是
-    // 内容区的宽高（一个 Rect），而不是只有左上角这一个点——`screen_origin`
-    // 目前只存了原点，补一个矩形是下一次改这块的事，这次不做。
+    // 只挡得住点在上边框上方（结果会是负数）的那一半越界——左右不再画
+    // 边框，没有「点在边框上」这回事了；点在内容区右边或下边（底栏）的
+    // 点击减完还是个合法的非负数，照样会被转发过去，只是行/列比 agent
+    // 实际画面多出那么一两个。真实 agent 收到一个越界的行列会直接忽略，
+    // 不是活的 bug；真要在这里也挡住，需要的是内容区的宽高（一个 Rect），
+    // 而不是只有左上角这一个点——`screen_origin` 目前只存了原点，补一个
+    // 矩形是下一次改这块的事，这次不做。
     let Some((col, row)) = app
         .screen_origin
         .and_then(|(c0, r0)| Some((m.column.checked_sub(c0)?, m.row.checked_sub(r0)?)))
@@ -627,9 +634,12 @@ mod tests {
     /// `handle_mouse` 靠 `screen_origin` 把终端坐标换算成 agent 画面里的
     /// 坐标，自己绝不硬算边框宽度——这条测试钉住 `draw` 真的记对了那个
     /// 坐标。少了它，`draw` 里 `app.screen_origin = Some((area.x, area.y))`
-    /// （漏掉 `+1` 的边框偏移）这种改动全量测试照样 542/0 全绿，因为没有
+    /// （漏掉上边框的 `+1` 偏移）这种改动全量测试照样全绿，因为没有
     /// 别的测试断言过这个字段的值——鼠标点哪儿都会偏一格，而且偏得悄无
     /// 声息，正是 `screen_origin` 这个字段本来要防的那类 bug。
+    ///
+    /// 会话内容区左右不再画边框（复制文字不该带上边框字符），上下还各有
+    /// 一行——`x` 因此该等于 `area.x` 本身，`y` 还是 `area.y + 1`。
     #[test]
     fn draw_records_the_bordered_content_corner_as_the_screen_origin() {
         use ratatui::backend::TestBackend;
@@ -639,8 +649,8 @@ mod tests {
         app.sessions = vec![session(1, SessionState::Working)];
         app.view = View::Attached(1);
         // 不用整块屏幕：故意给一个不是 (0, 0) 的偏移，这样如果 `draw` 悄悄
-        // 写成了直接抄 `area.x`/`area.y`（漏掉 `+1` 的边框），或者写死了
-        // 一个常数，这条测试都能抓出来，而不是恰好在 (0, 0) 时侥幸对上。
+        // 写成了直接抄一个写死的常数，这条测试都能抓出来，而不是恰好在
+        // (0, 0) 时侥幸对上。
         let area = Rect {
             x: 3,
             y: 2,
@@ -652,8 +662,8 @@ mod tests {
 
         assert_eq!(
             app.screen_origin,
-            Some((area.x + 1, area.y + 1)),
-            "内容区左上角要算上边框（+1），不能是 area 自己的坐标"
+            Some((area.x, area.y + 1)),
+            "内容区左上角左右不再有边框，上边框还要算 +1"
         );
     }
 

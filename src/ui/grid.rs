@@ -6,7 +6,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::app::App;
 use super::view::{is_plain_key, reply_key, Draft, Reply, View};
@@ -131,13 +131,15 @@ pub fn crop_line(spans: &[ScreenSpan], max_cols: usize) -> Vec<ScreenSpan> {
 /// 九宫格的列数随当页会话数变（1/2/3 列，见 `grid_shape`）：同样宽的
 /// 终端，会话一多格子就窄下去。固定的名字上限在窄格子上会把状态词和
 /// 项目名挤出格子边界，被 ratatui 按区域截断吃掉——`fix-2-brief.md`
-/// 算过账：60 列终端、5 个以上会话时格子标题只有 18 列预算，装不下
-/// 「20 列名字 + 状态词」。而状态词才是九宫格存在的理由：一眼看出谁在
-/// 干活、谁停了或挂了，这个答案不能被名字挤没。
+/// 算过账：60 列终端、5 个以上会话时格子标题只有 20 列预算（格子左右不再
+/// 画边框之后多出的那 2 列已经算进去了），装不下「20 列名字 + 状态词」。
+/// 而状态词才是九宫格存在的理由：一眼看出谁在干活、谁停了或挂了，这个
+/// 答案不能被名字挤没。
 ///
-/// `tile_width` 是格子矩形的原始宽度（含左右边框各一列，跟传给
-/// `Block::inner` 之前的 `Rect::width` 是同一个数）；这里先减掉那两列
-/// 边框得到标题真正可用的预算，再减去除名字外的固定开销：焦点标记 1 列、
+/// `tile_width` 是格子矩形的原始宽度（跟传给 `Block::inner` 之前的
+/// `Rect::width` 是同一个数）；格子左右不再画边框（复制文字不该带上边框
+/// 字符），这个宽度本身就是标题真正可用的预算，不用再减边框——这里直接
+/// 拿它减去除名字外的固定开销：焦点标记 1 列、
 /// `id` 的位数、id 和名字间那个空格、名字后面那个空格、状态词的显示宽度、
 /// 状态词后面那个空格。项目名不算进这笔账——它本来就没有走 `truncate`
 /// （既有缺口，final review 已经记录，见 `draw_grid` 里 `project` 那段的
@@ -159,7 +161,7 @@ pub fn crop_line(spans: &[ScreenSpan], max_cols: usize) -> Vec<ScreenSpan> {
 /// 所以「状态词完整可见」这条不变式在任何 id、任何状态词、任何宽度下都
 /// 成立，不是巧合，是这笔账本身的性质（细节见 `fix-2-report.md` 的推导）。
 fn tile_title_name_cap(tile_width: u16, id: u32, status_word: &str) -> usize {
-    let budget = tile_width.saturating_sub(2) as usize;
+    let budget = tile_width as usize;
     let overhead = 1                          // 焦点标记「▶」或一个空格
         + display_width(&id.to_string())      // id 本身
         + 1                                    // id 后面那个空格
@@ -564,8 +566,9 @@ fn draw_grid(
         if focused {
             let block = Style::default().bg(focus_color).fg(Color::Black);
             let text: String = title.iter().map(|s| s.content.as_ref()).collect();
-            // 左右两列是边框，标题能占的就是中间这些列
-            let width = tile.width.saturating_sub(2) as usize;
+            // 格子左右不再画边框（复制文字不该带上边框字符），标题能占的
+            // 就是整个格子宽度。
+            let width = tile.width as usize;
             title = vec![Span::styled(pad_to(&text, width), block)];
         }
         let title = Line::from(title);
@@ -592,7 +595,10 @@ fn draw_grid(
         } else {
             dim()
         };
-        let block = Block::bordered()
+        // 只画上下边框（`Borders::TOP | Borders::BOTTOM`），跟其余每一处
+        // 有边框的视图一致——左右的竖线会被用户当成内容一起选中、复制。
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(if focused {
                 BorderType::Thick
             } else {
@@ -802,30 +808,30 @@ mod tests {
     /// 直接测算术——比整块画面渲染更容易钉住「差一列」这种边界。
     #[test]
     fn tile_title_name_cap_is_derived_from_tile_width_not_fixed() {
-        // id=1（1 位数），格子内宽 = tile_width - 2
+        // id=1（1 位数）。格子左右不再画边框，格子内宽 = tile_width 本身。
         assert_eq!(
             tile_title_name_cap(20, 1, "干活中"),
-            7,
-            "60 列、3 列布局、中文：18 列预算减 11 列固定开销"
+            9,
+            "60 列、3 列布局、中文：20 列预算减 11 列固定开销"
         );
         assert_eq!(
             tile_title_name_cap(20, 1, "working"),
-            6,
+            8,
             "60 列、3 列布局、英文：预算比中文少 1 列，因为 working 比干活中宽 1 列"
         );
         assert_eq!(
             tile_title_name_cap(26, 1, "干活中"),
-            13,
+            15,
             "80 列、3 列布局、中文"
         );
         assert_eq!(
             tile_title_name_cap(26, 1, "working"),
-            12,
+            14,
             "80 列、3 列布局、英文"
         );
         assert_eq!(
             tile_title_name_cap(40, 1, "干活中"),
-            27,
+            29,
             "120 列、3 列布局、中文：预算宽裕，远超 24 字符名字的上限"
         );
     }
@@ -841,27 +847,33 @@ mod tests {
     /// 最需要看见的那个——它意味着 agent 卡住等你回话。
     #[test]
     fn tile_title_name_cap_can_reach_zero_when_the_id_is_wide() {
-        // 60 列、3 列布局：预算 18 列。overhead = 1(标记) + id 位数 + 1(空格)
-        // + 1(空格) + 10(asking you) + 1(空格) = 14 + id 位数。
+        // 60 列、3 列布局：格子左右不再画边框，预算就是 tile_width 本身，
+        // 20 列。overhead = 1(标记) + id 位数 + 1(空格) + 1(空格) +
+        // 10(asking you) + 1(空格) = 14 + id 位数。
         assert_eq!(
             tile_title_name_cap(20, 1, "asking you"),
-            3,
-            "1 位数 id：18 − 15 = 3"
+            5,
+            "1 位数 id：20 − 15 = 5"
         );
         assert_eq!(
             tile_title_name_cap(20, 10, "asking you"),
-            2,
-            "2 位数 id：18 − 16 = 2"
+            4,
+            "2 位数 id：20 − 16 = 4"
         );
         assert_eq!(
             tile_title_name_cap(20, 100, "asking you"),
-            1,
-            "3 位数 id：18 − 17 = 1"
+            3,
+            "3 位数 id：20 − 17 = 3"
         );
         assert_eq!(
             tile_title_name_cap(20, 1000, "asking you"),
+            2,
+            "4 位数 id：20 − 18 = 2"
+        );
+        assert_eq!(
+            tile_title_name_cap(20, 100000, "asking you"),
             0,
-            "4 位数 id：预算被吃穿，saturating_sub 给 0，不是负数或 panic"
+            "6 位数 id：预算被吃穿（20 − 20 = 0），saturating_sub 给 0，不是负数或 panic"
         );
     }
 
@@ -1178,14 +1190,12 @@ mod tests {
     ///
     /// **上限停在 4 位数，不是随便挑的。** 4 位数是这笔账本身能担保的边界：
     /// `overhead = 4 + id 位数 + status 宽度`，`asking you` 是 10 列，
-    /// 60 列格子预算是 18 —— `id 位数 <= 4` 时 `overhead <= budget`，
-    /// 溢出最多 1 列，而这 1 列被名字后面那个空格吸收（见
-    /// `tile_title_name_cap` 文档里的证明）。5 位数（≥10000）会让 `overhead`
-    /// 本身超过预算——这时哪怕名字缩成一个 `…`，那 1 列的赤字也会啃掉状态词
-    /// 的最后一个字符（跑过一次：`asking you` 变成 `asking yo`，丢的不是
-    /// 空格，是内容）。这是审这一轮改动时顺手发现的、比这次评审要求的
-    /// `id=1/10/100` 更远一档的边界，超出这一轮的范围，已经在报告里单独
-    /// 记下来，不在这条测试里断言（断言了也是红的，不该由这条任务顺手改）。
+    /// 60 列格子预算是 20（格子左右不再画边框之后多出的 2 列已经算进去）——
+    /// `id 位数 <= 4` 时 `overhead <= budget`，绰绰有余；这道边界原来卡在
+    /// 更小的预算上（左右各一列边框还没去掉的时候），本身就不宽裕，去掉
+    /// 边框之后反而更安全了。真正会让 `overhead` 追上预算的位数也跟着往后
+    /// 挪了一档，超出这一轮的范围，已经在报告里单独记下来，不在这条测试里
+    /// 断言（断言了也是红的，不该由这条任务顺手改）。
     #[test]
     fn multi_digit_session_ids_do_not_erode_the_status_words_budget() {
         use ratatui::backend::TestBackend;
@@ -2122,9 +2132,10 @@ mod tests {
         // 都会少算一格，断言就变成了在数标题里有几个汉字。
         let left = block.iter().map(|(x, _)| *x).min().unwrap();
         let right = block.iter().map(|(x, _)| *x).max().unwrap();
-        // 焦点格是右边那个：x 从 40 到 79，左右各一列边框
-        assert_eq!(left, 41, "色块该从格子左边框内侧起头");
-        assert_eq!(right, 78, "色块该一直铺到右边框内侧");
+        // 焦点格是右边那个：x 从 40 到 79。格子左右不再画边框，色块因此该
+        // 铺满整个格子宽度，不再像以前那样从边框内侧算起。
+        assert_eq!(left, 40, "色块该从格子最左一列起头");
+        assert_eq!(right, 79, "色块该一直铺到格子最右一列");
     }
 
     /// 非焦点格的画面要退到背景层。颜色和框线字符两个维度都已经用满了，

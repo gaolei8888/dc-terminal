@@ -176,9 +176,10 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                             }
                             None => hint.to_string(),
                         };
-                        let room = (area.width as usize)
-                            .saturating_sub(2) // 左右边框
-                            .saturating_sub(HEADER_PREFIX_COLS);
+                        // 列表这个块只画上下边框（`Borders::TOP | Borders::BOTTOM`），
+                        // 左右不再吃掉列——复制文字不该带上边框字符——所以
+                        // 这里不用再像改动前那样先减 2 补偿左右边框。
+                        let room = (area.width as usize).saturating_sub(HEADER_PREFIX_COLS);
                         spans.push(Span::styled(truncate(&line, room.saturating_sub(1)), dim()));
                     } else {
                         let agents: Vec<String> = g
@@ -222,7 +223,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .border_style(border_style)
                     .title(title),
             )
@@ -420,8 +421,8 @@ mod tests {
         s.activity = "ACTV_TAIL".into();
         app.set_sessions(vec![s]);
 
-        // 200 列：给 activity 留足空间，不让右边框在这条测试里掺和进来——
-        // 这条测的是 `pad_to` 补没补，不是右边框裁没裁。
+        // 200 列：给 activity 留足空间，不让这一行的宽度上限在这条测试里
+        // 掺和进来——这条测的是 `pad_to` 补没补，不是截断裁没裁。
         let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
@@ -477,7 +478,7 @@ mod tests {
         s.activity = format!("{}MARK", "A".repeat(70));
         app.set_sessions(vec![s]);
 
-        // 200 列：activity 自己的 70 列预算不该被右边框提前掐断，
+        // 200 列：activity 自己的 70 列预算不该被行宽提前掐断，
         // 这条测的是 `truncate` 里的数字，不是终端宽度。
         let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
@@ -630,8 +631,8 @@ mod tests {
         }
     }
 
-    /// 自建 profile 的名字要多长有多长。放不下时要看得见一个 `…`——被右边框
-    /// 无声吃掉的话，用户根本不知道后面还有字。
+    /// 自建 profile 的名字要多长有多长。放不下时要看得见一个 `…`——被这一行
+    /// 的右边缘无声吃掉的话，用户根本不知道后面还有字。
     ///
     /// **断言必须钉到那个省略号出现在哪一个字之后**，不能只问「这一屏上有没有
     /// `…`」：父目录那一列自己就会裁出一个（临时目录的路径很长），于是
@@ -641,9 +642,10 @@ mod tests {
     /// 这一条同时从**两个**方向钉住 `HEADER_PREFIX_COLS` 和那次
     /// `saturating_sub(1)`：
     ///
-    /// - 截断整个删掉 → 这一格铺到 34 列被边框剪断，屏幕上没有省略号；
+    /// - 截断整个删掉 → 这一格铺到 36 列被 `List` 按区域宽度剪断，屏幕上
+    ///   没有省略号；
     /// - 常量小了（`room` 变大）→ 裁得更靠后，`truncate` 返回 `max+1` 列，
-    ///   省略号越过边框被剪掉，屏幕上同样没有它；
+    ///   省略号越过这一行的宽度被剪掉，屏幕上同样没有它；
     /// - 常量大了 → 裁得更靠前，省略号在别的字后面。
     ///
     /// 三种都对不上下面那个字面量。
@@ -664,13 +666,13 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
-        // 80 列：内框 78，前缀 44，这一格 34 列。`no sessions · last used `
-        // 占 24，`truncate` 拿到 33，于是名字露出 9 个字符再补一个 `…`——
-        // 一共 34 列，一列不多一列不少。
+        // 80 列：这个块只画上下边框，不再吃列，前缀 44，这一格 36 列。
+        // `no sessions · last used ` 占 24，`truncate` 拿到 35，于是名字
+        // 露出 11 个字符再补一个 `…`——一共 36 列，一列不多一列不少。
         let c = screen_text(&term);
         assert!(
-            c.contains("lastusedan-absurd…"),
-            "省略号必须自己也画得出来，而不是连它一起被右边框吃掉：{c}"
+            c.contains("lastusedan-absurdly…"),
+            "省略号必须自己也画得出来，而不是被截断悄悄吃掉：{c}"
         );
     }
 

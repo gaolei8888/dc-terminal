@@ -502,10 +502,13 @@ pub fn run(
         if let View::Attached(id) = &app.view {
             let id = *id;
             // 把 agent 画面区的真实大小告诉它。不做的话它永远按初始宽度排版，
-            // 窗口再宽也只用左边一块。减 2 是边框。
+            // 窗口再宽也只用左边一块。高度减 2 是上下边框、减 3 是底栏；
+            // 会话内容区左右不再画边框（复制文字不该带上边框字符），宽度
+            // 因此不用再扣任何列——`attach::draw` 里的块用的是
+            // `Borders::TOP | Borders::BOTTOM`，跟这里必须保持一致。
             let area = term.size()?;
             let rows = area.height.saturating_sub(2 + 3);
-            let cols = area.width.saturating_sub(2);
+            let cols = area.width;
             if app.sent_size != Some((id, rows, cols))
                 && rows > 0
                 && cols > 0
@@ -1898,7 +1901,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 右段可用宽度先算出来：`bar_keys` 要拿它决定 `n` 那条写不写得下 agent 名。
     // 跟下面切 `bar` 时算的是同一个数（同一个函数），不一致的话，按高度预留的
     // 行数就对不上真正折出来的行数，末尾几个键照样会被吃掉。
-    let (_, _, action_cols) = bar_widths(f.area().width.saturating_sub(2)); // -2 是块的左右边框
+    // 底栏这个块只画上下边框（`Borders::TOP | Borders::BOTTOM`），左右
+    // 不再吃掉列——复制文字不该带上边框字符。这里因此直接用整个宽度，
+    // 不用像改动前那样再减 2 补偿左右边框。
+    let (_, _, action_cols) = bar_widths(f.area().width);
     let help_cols = action_cols as usize;
     let (bar, style) = if !app.connected {
         (
@@ -2013,7 +2019,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
     // 要的是「我在哪」和「这里能干什么」挨在一起读。项目现在是框内的中段。
-    let block = Block::default().borders(Borders::ALL);
+    let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(chunks[1]);
     f.render_widget(block, chunks[1]);
 
@@ -3248,13 +3254,25 @@ mod tests {
 
     /// 底栏顶边所在的行号。
     ///
-    /// 找的是**最后一个**左上角 `┌`：屏幕上只有内容区和底栏两个带边框的块，
-    /// 底栏在下面。原来是找边框标题里的「当」字（「当前项目：…」），那个
-    /// 标题在本任务里被拆进框内的中段了。
+    /// 原来靠左上角 `┌` 认——那时候左右还画边框，`┌` 是唯一的角。现在这些
+    /// 块只画上下边框（`Borders::TOP | Borders::BOTTOM`），没有左右边框
+    /// 就没有角字符可认，只剩横线字符 `─`。但 `─` 不是底栏独有的：内容区
+    /// 自己的块也有上下边框，第 0 列上可能不止两条横线，最后一行终端本身
+    /// 也未必是横线——**只有底栏的下边框保证总在屏幕最后一行**（底栏是
+    /// 垂直切分出来的最后一块，`Layout::vertical` 保证它贴到 `f.area()`
+    /// 的底边）。从那一行往上找**最近**的一条横线就是底栏顶边——按键表/
+    /// 消息那几行内容不会以 `─` 开头，中间不会有别的横线插进来。
     fn bar_top(term: &Terminal<ratatui::backend::TestBackend>) -> u16 {
         let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .rfind(|y| buf.cell((0, *y)).map(|c| c.symbol()) == Some("┌"))
+        let bottom_edge = buf.area.height - 1;
+        assert_eq!(
+            buf.cell((0, bottom_edge)).map(|c| c.symbol()),
+            Some("─"),
+            "底栏下边框总该贴着屏幕最后一行"
+        );
+        (0..bottom_edge)
+            .rev()
+            .find(|y| buf.cell((0, *y)).map(|c| c.symbol()) == Some("─"))
             .expect("底栏顶边总该在屏幕上")
     }
 
@@ -3361,7 +3379,8 @@ mod tests {
                 remember_agent(&mut app, "claude");
                 let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
                 term.draw(|f| draw(f, &mut app)).unwrap();
-                let (_, _, cols) = bar_widths(width - 2);
+                // 底栏只画上下边框，宽度不再扣左右边框那 2 列。
+                let (_, _, cols) = bar_widths(width);
                 // 比的是**键**，不是整行文字：`n` 后面那个 agent 名放不下时会
                 // 让位，那是有意的（见 `bar_keys`）——让的是半句说明，不是一个键。
                 let keys: Vec<&str> =
@@ -3401,7 +3420,8 @@ mod tests {
             app.lang = lang;
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             term.draw(|f| draw(f, &mut app)).unwrap();
-            let (_, _, cols) = bar_widths(80 - 2);
+            // 底栏只画上下边框，宽度不再扣左右边框那 2 列。
+            let (_, _, cols) = bar_widths(80);
             let keys: Vec<&str> = widgets::fit_help(&bar_keys(&app, cols as usize), cols as usize)
                 .iter()
                 .map(|i| i.key)
