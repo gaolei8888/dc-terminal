@@ -1510,6 +1510,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // **C1 的回归测试。** 文字出现在屏幕上不足以证明这句话被真的
+        // 提交了——`send_input` 把「写字符」和「按回车」拆成了两次调用
+        // （`session.rs` 的注释），只做第一步的话文字会原样停在输入框里，
+        // 屏幕上一样看得见，但 agent 根本没有开始跑这一轮。`plain_shell`
+        // 这个 profile 没有任何 pattern，`create()` 之后状态是
+        // `Unknown`；只有真的按了回车（`send_input(id, "")`）才会把状态
+        // 推成 `Working`（`session.rs::send_input` 空字符串分支，非
+        // agent 会话也一样）。这里等的是这个状态迁移本身，不是屏幕文字。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = mgr.list().into_iter().find(|s| s.id == id).map(|s| s.state);
+            if state == Some(crate::session::SessionState::Working) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "手机来的这句话必须被真的提交（按回车），不能只是敲进输入框——\
+                 会话此刻的状态是 {state:?}，一直没有推进到 Working"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         // journal 路径也接对了——`Bridge` 自己那本账本跟 `mgr.journal`
         // 用的是同一个文件。
         let deadline = Instant::now() + Duration::from_secs(2);

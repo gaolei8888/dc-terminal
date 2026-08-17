@@ -175,9 +175,21 @@ pub fn route(i: &RouteInput) -> Route {
 /// crate::session::SessionManager`）；测试用假实现记录写了什么、写给了谁
 /// （`for_test_with_writer`），不碰真 PTY。
 pub trait SessionWriter: Send + Sync {
-    /// 把 `text` 敲进 `id` 对应的会话。会话已经不在了、或者敲的过程本身
-    /// 出了错，返回 `Err`——**错误信息必须已经是能给用户看的人话**，
-    /// `deliver` 不会再加工它，只会原样往回执里放（`Delivered::Failed`）。
+    /// 把 `text` 敲进 `id` 对应的会话，**并且真的把这句话交出去**——不是
+    /// 敲进输入框就算数。**这是安全评审的 C1 修复**：`session.rs::
+    /// send_input` 把「写字符」和「按回车」拆成了两次调用（写字符本身
+    /// 不会让 agent 开始干活，空字符串那一次才是回车、才会打检查点、
+    /// 才会把状态推进 `Working`），`ui/grid.rs::send_reply` 的文档注释
+    /// 明确写着这两步**不能合并、也不能反**——合并了就没有检查点，用户
+    /// 按不了 `u` 回滚。以前这里只调用了第一步，手机那句回复会被敲进
+    /// 输入框然后停在那里，agent 什么都不会跑，而用户收到的回执却说
+    /// 「已经敲进」——这是能想到最贵的一种谎言：唯一看不见终端的那个人，
+    /// 被明确告知一件没有发生的事已经发生了。
+    ///
+    /// **两步只要有一步失败就必须整体报 `Err`**——半句话被写进了 PTY
+    /// 但没有真的提交，跟完全没敲没有本质区别（agent 都不会往下走），
+    /// 绝不能因为「文字这一半成功了」就报 `Ok`：那样回执和 journal 记的
+    /// `Typed` 依然是一句谎言。
     fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String>;
     /// 这个会话给用户看该叫什么名字。跟 `SessionInfo::tag` 同一条规则：
     /// 起过名字用名字，没起过退回 profile。会话已经不在了（比如决定敲给
@@ -198,7 +210,18 @@ pub trait SessionWriter: Send + Sync {
 /// 一个 id，代价跟 `dct ps` 刷新一次看板一样，不是热路径。
 impl SessionWriter for crate::session::SessionManager {
     fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String> {
-        self.send_input(id, text).map_err(|e| e.to_string())
+        // 跟 `ui/grid.rs::send_reply` 同一个两步约定，**顺序、拆分都不能
+        // 变**：先把文字写进输入框，再单独送一次空字符串按回车——空字符
+        // 串那一步才会打检查点、才会真的让 agent 开始干这一轮。手机来的
+        // 文字不会是空串（Telegram 消息本身就带着 `text`），但同样照
+        // `send_reply` 的分支写全，不假设调用方永远不会传空文本。
+        if !text.is_empty() {
+            self.send_input(id, text).map_err(|e| e.to_string())?;
+        }
+        // 这一步失败——文字可能已经躺在输入框里，但没有被提交——**必须
+        // 让整体报错**，绝不能因为上一步成功了就在这里放行：那样回执和
+        // journal 记的 `Typed` 会撒谎。
+        self.send_input(id, "").map_err(|e| e.to_string())
     }
 
     fn name_of(&self, id: u32) -> Option<String> {
@@ -269,14 +292,28 @@ pub struct Bridge {
     /// 只负责「进来一条、满了丢最旧的」这条规则本身，不管调用方是谁。
     outbound: Mutex<VecDeque<Event>>,
     /// 推送消息 id -> 那条推送来自哪个会话（`RouteInput::map`）。**只有
-    /// 只关涉一个会话的推送才会进这张表**——一次合并了好几件事的推送
-    /// 长按回复该敲给哪个没有唯一答案，`route()` 的规则 1 只认识
-    /// `u32`（单个会话），宁可让这种回复落到 `Route::Gone`（"这条消息
-    /// 已经不认识了，去 /ls"），也不该在这里编一个多选一的猜测。
+    /// 只关涉一个会话的推送才会进这张表**——`route()` 的规则 1 只认识
+    /// `u32`（单个会话）。一次合并了好几件事的推送走的是下面
+    /// `ambiguous_pushes` 那张单独的表，见它的文档。
     ///
     /// 有界、drop-oldest，跟 `outbound` 同一条道理（`MSG_MAP_CAP`）：
     /// 守护进程一直跑下去，这张表不清理会无限长下去。
     outbound_map: Mutex<VecDeque<(MsgId, u32)>>,
+    /// 推送消息 id -> 那条推送**合并**了哪几个会话。**这不是
+    /// `outbound_map` 的备用方案，是它的必要补充**：早先的版本只给单
+    /// 会话推送记映射，合并推送干脆不记，导致长按回复一条"有两件事"的
+    /// 推送会落到 `Route::Gone`（"这条消息已经不认识了"）——可两个会话
+    /// 明明都还活着、都还在等，这句话是在撒谎，而且偏偏撒在"好几个 agent
+    /// 同时停下来"这种最需要分清楚该回给谁的场合。**正确答案是
+    /// `Route::Ask`**："不确定该说给哪个，回复其中一条或者发 /use"——
+    /// 跟"好几个会话同时在等"用的是同一条"不猜、问用户"的规则。
+    ///
+    /// `route_and_deliver` 在调用 `route()`（它只认识单会话的
+    /// `outbound_map`）之前，先查这张表；两张表按 `MsgId` 互斥，同一个
+    /// id 只会出现在其中一张里，见 `run_sender` 里写入时的分支。
+    ///
+    /// 同样有界、drop-oldest（`MSG_MAP_CAP`）。
+    ambiguous_pushes: Mutex<VecDeque<(MsgId, Vec<u32>)>>,
     /// `/use <n>` 选中的会话，`None` = 没有显式选过，或者选过但已经
     /// 因为 `replied_since_use` 作废。
     used: Mutex<Option<u32>>,
@@ -310,6 +347,7 @@ impl Bridge {
             persist_owner,
             outbound: Mutex::new(VecDeque::new()),
             outbound_map: Mutex::new(VecDeque::new()),
+            ambiguous_pushes: Mutex::new(VecDeque::new()),
             used: Mutex::new(None),
             replied_since_use: Mutex::new(false),
             writer: Mutex::new(None),
@@ -413,13 +451,28 @@ impl Bridge {
     /// 任何身份判断，把它挪到 `accept()` 之前调用就是重新打开安全漏洞。
     fn route_and_deliver(&self, msg: &Incoming) {
         let text = msg.text.trim();
-        if let Some(rest) = text.strip_prefix("/use") {
+        if let Some(rest) = strip_command(text, "/use") {
             self.handle_use(rest.trim());
             return;
         }
-        if text == "/ls" {
+        if strip_command(text, "/ls").is_some() {
             self.handle_ls();
             return;
+        }
+
+        // **I1 的修复。** 长按回复的是一条"合并了好几件事"的推送：`route()`
+        // 只认识单会话的 `outbound_map`，会把这种回复判成 `Gone`（"这条
+        // 消息已经不认识了"）——但两个会话可能都还活着、都还在等，那句
+        // 话是在撒谎。正确答案是 `Route::Ask`：不确定该说给哪个，问一句，
+        // 见 `ambiguous_pushes` 字段文档。这段检查必须在构造 `RouteInput`
+        // 之前做——`route()` 本身不认识这张表，也不该认识（它是纯函数，
+        // 五条规则不该再长出第六条特例）。
+        if let Some(reply_id) = msg.reply_to {
+            if let Some(sessions) = self.ambiguous_reply_sessions(reply_id) {
+                self.deliver(Route::Ask(sessions), &msg.text);
+                *recover(self.replied_since_use.lock()) = true;
+                return;
+            }
         }
 
         let map: HashMap<MsgId, u32> = recover(self.outbound_map.lock()).iter().copied().collect();
@@ -505,6 +558,27 @@ impl Bridge {
             m.pop_front();
         }
         m.push_back((id, session));
+    }
+
+    /// 一条合并了好几件事的推送发出去之后，把它关涉的会话集合记到
+    /// `ambiguous_pushes`——见该字段的文档。跟 `record_push` 同一条
+    /// 丢最旧的上限规则。
+    fn record_ambiguous_push(&self, id: MsgId, sessions: Vec<u32>) {
+        let mut m = recover(self.ambiguous_pushes.lock());
+        if m.len() >= MSG_MAP_CAP {
+            m.pop_front();
+        }
+        m.push_back((id, sessions));
+    }
+
+    /// 一条长按回复对应的 `MsgId`，如果它当初是一条合并推送，答它关涉的
+    /// 会话集合；不是（或者已经不记得了）就是 `None`——调用方据此决定
+    /// 是走 `Route::Ask` 还是照常问 `route()`。
+    fn ambiguous_reply_sessions(&self, id: MsgId) -> Option<Vec<u32>> {
+        recover(self.ambiguous_pushes.lock())
+            .iter()
+            .find(|(mid, _)| *mid == id)
+            .map(|(_, sessions)| sessions.clone())
     }
 
     /// 消费队列这一半：把一条 `session.rs::tick()` 产的事件收进来。
@@ -740,7 +814,15 @@ impl Bridge {
     /// 更糟，`Channel::send` 的错误也一并吞掉，同 `journal.rs` 那条
     /// 「记不下来/发不出去不该连累别的事」的规矩。
     fn reply(&self, text: &str) {
-        if let Some(to) = *recover(self.owner.lock()) {
+        // **不能写成 `if let Some(to) = *recover(self.owner.lock()) { ... }`**
+        // ——`if let` 的临时对象（这里是 `MutexGuard`）活到整个分支体结束，
+        // 那样 `owner` 这把锁会一直被攥着，直到 `ch.send()`（网络调用，
+        // 慢的时候能到好几秒）返回才放。这段时间里 `PhoneUnpair` 的
+        // `clear_owner()` 和发送线程读 `owner` 都会被卡住——手机通道
+        // 自己在等网络，不该连累"忘掉主人"这种应该瞬间完成的操作。
+        // 显式把值拷出来、让锁在这一行结束就释放，再去发网络请求。
+        let to = *recover(self.owner.lock());
+        if let Some(to) = to {
             let _ = self.ch.send(to, text);
         }
     }
@@ -831,6 +913,18 @@ impl Bridge {
             if events.is_empty() {
                 continue;
             }
+            // **F2 同款修复，出站这一半。** `drain_outbound()` 到
+            // `ch.send()` 之间没有任何耗时操作，但 `stop()` 完全可能在
+            // 这道窄缝里被别的线程调用（`PhoneDisable`/`PhoneUnpair`/
+            // 重新填令牌）——不补这一道检查的话，一条已经被"判了死刑"
+            // 的发送线程仍然可能把这批事件发到 Telegram 上，跟入站那边
+            // `run()` 里 `poll()` 返回之后要重新看一眼 `stop` 是同一个
+            // 理由（见那边 F2 的文档）。这批已经取出来的事件**照旧不放
+            // 回队列**——跟"没有主人时故意丢弃"同一条道理，停下来之后
+            // 这批消息也不值得攒着找机会补发。
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
             // 还没配对：这批事件没有地方可送。**故意丢弃，不攒着等以后
             // 补发**——同 `spawn_event_consumer` 那条道理，攒着的话用户
             // 一旦配对成功会被一堆早就过期的通知糊一脸。
@@ -839,10 +933,21 @@ impl Bridge {
             };
             let text = merge(&events, crate::i18n::Lang::Zh);
             if let Ok(id) = self.ch.send(to, &text) {
-                // 只有只关涉一个会话的这一批才配拥有映射——见
-                // `outbound_map` 字段文档。
-                if let [only] = events.as_slice() {
-                    self.record_push(id, only.session);
+                match events.as_slice() {
+                    // 只关涉一个会话：进单会话映射，`route()` 的规则 1
+                    // 能直接用。
+                    [only] => self.record_push(id, only.session),
+                    // 合并了好几件事：进 `ambiguous_pushes`，长按回复
+                    // 这条推送该问"回给哪个"，不该判成"不认识这条消息"
+                    // ——见该字段的文档。去重是因为同一个会话理论上不该
+                    // 在同一批里出现两次，但"防御性去重"比"假设上游永远
+                    // 不会重复"更值得信。
+                    many => {
+                        let mut sessions: Vec<u32> = many.iter().map(|e| e.session).collect();
+                        sessions.sort_unstable();
+                        sessions.dedup();
+                        self.record_ambiguous_push(id, sessions);
+                    }
                 }
             }
             // 发送失败：吞掉，不重试。同 `journal.rs` 的规矩——手机通道
@@ -995,6 +1100,25 @@ fn strip_numbered_prefix(line: &str) -> Option<&str> {
         .or_else(|| rest.strip_prefix('、'))
         .or_else(|| rest.strip_prefix(')'))
         .or_else(|| rest.strip_prefix('）'))
+}
+
+/// 认一条命令，允许 Telegram 那种 `/cmd@botname` 的写法。`cmd` 只带前导
+/// `/`，比如 `"/use"`。**不能靠 `str::starts_with` 判断**——`/use` 是
+/// `/user`、`/useless` 的前缀，`starts_with("/use")` 会把这些完全不相干
+/// 的命令误判成 `/use` 然后把它们剩下的字母当成参数吞掉（`/user` 会被
+/// 解析成 `/use` 带参数 `"r"`）。这里要求命令后面紧跟着的要么是字符串
+/// 结尾、要么是空白、要么是 `@botname` 这种群聊里@机器人时客户端自动
+/// 加的后缀，三种之外一律判定"这不是这个命令"，返回 `None`。
+///
+/// 返回值是命令（以及 `@botname`，如果有）之后剩下的部分，原样不 trim。
+fn strip_command<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(cmd)?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        return Some(rest);
+    }
+    let after_at = rest.strip_prefix('@')?;
+    let end = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
+    Some(&after_at[end..])
 }
 
 /// 一个正在跑的 bridge 的外部句柄。**除了它，外面不该有别的办法碰到
@@ -2739,6 +2863,147 @@ mod tests {
             "该告诉用户正确格式：{}",
             spy.last_reply()
         );
+    }
+
+    /// **回归测试。** `/use` 是 `/user`、`/useless` 的前缀——`strip_prefix`
+    /// 判断会把这些完全不相干的命令误当成 `/use` 带了个奇怪的参数，
+    /// 更糟的是解析失败之后老实回一句「格式不对」，把原本该敲进会话的
+    /// 一句话变成了一句提示。这两条消息都该被当成**普通文字**敲进当前
+    /// 唯一在等的会话，而不是被 `/use` 的前缀匹配吞掉。
+    #[test]
+    fn use_prefix_does_not_swallow_unrelated_commands() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9]);
+        b.dispatch(&msg(999, "/user"));
+        b.dispatch(&msg(999, "/useless"));
+        assert_eq!(
+            spy.written(),
+            vec![(9, "/user".to_string()), (9, "/useless".to_string())],
+            "/user、/useless 不是 /use，该原样敲给唯一在等的会话"
+        );
+    }
+
+    /// Telegram 群聊里 `/use@botname` 是合法写法（客户端@机器人时自动
+    /// 加的后缀）——旧的 `text.strip_prefix("/use")` 认不出这种形式，
+    /// 会把整句话（包括 `@botname`）当成普通文字敲进会话。
+    #[test]
+    fn use_and_ls_recognize_the_at_botname_suffix() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        // 摆两个候选，不是一个——只有一个在等的话，"唯一在等"这条规则
+        // 会掩盖 /use 解析失败：即使 /use@botname 没被认出来（老代码把
+        // `@my_dct_bot 3` 整段当成解析失败的参数），下一条消息照样会
+        // 靠规则 4 落到那唯一的候选上，测试会在应该失败的时候误判成功。
+        spy.set_waiting(&[3, 9]);
+        b.dispatch(&msg(999, "/use@my_dct_bot 3"));
+        b.dispatch(&msg(999, "继续"));
+        assert_eq!(
+            spy.written(),
+            vec![(3, "继续".to_string())],
+            "/use@botname 该被认成 /use，选中 3 号——两个候选里唯一能\
+             解释这个结果的路径就是 /use 解析成功了"
+        );
+
+        b.dispatch(&msg(999, "/ls@my_dct_bot"));
+        assert_eq!(
+            spy.written().len(),
+            1,
+            "/ls@botname 该被认成 /ls，不该被敲进任何会话"
+        );
+    }
+
+    /// **I1 的回归测试。** 一次合并了好几件事的推送，长按回复它必须问
+    /// "回给哪个"（`Route::Ask`），不能落到 `Route::Gone`（"这条消息
+    /// 已经不认识了"）——两个会话明明都还活着、都还在等，`Gone` 那句
+    /// 话是在撒谎，而且偏偏撒在最需要分清楚的场合。走真实的
+    /// `run_sender()`，不直接摸私有字段。
+    #[test]
+    fn replying_to_a_merged_push_asks_which_one_instead_of_lying_gone() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(1, "对账");
+        spy.name(2, "修登录白屏");
+        let bridge = Arc::new(b);
+        bridge.enqueue(named_event(
+            1,
+            crate::channel::EventKind::Stopped,
+            "对账",
+            "fin",
+        ));
+        bridge.enqueue(named_event(
+            2,
+            crate::channel::EventKind::Stopped,
+            "修登录白屏",
+            "web",
+        ));
+
+        let worker = bridge.clone();
+        let handle = std::thread::spawn(move || worker.run_sender());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while spy.replies.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "该把合并的两件事发出去");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        bridge.stop();
+        assert!(wait_for_join(handle, Duration::from_secs(2)));
+
+        bridge.dispatch(&Incoming {
+            text: "先跑完".into(),
+            reply_to: Some(0), // Spy::send 固定回 0
+            chat_id: 999,
+        });
+
+        assert!(spy.written().is_empty(), "两个候选，不该猜着敲进任何一个");
+        let reply = spy.last_reply();
+        assert!(
+            !reply.contains("已经不在了"),
+            "两个会话都还活着，不该说成 Gone：{reply}"
+        );
+        assert!(
+            reply.contains("对账") && reply.contains("修登录白屏"),
+            "该报出两个候选的名字：{reply}"
+        );
+    }
+
+    /// **C1 的回归测试（真实 `SessionManager`）。** `SessionWriter::
+    /// type_into` 现在必须真的按回车（`send_input(id, "")`），不能只把
+    /// 文字写进输入框——用 `cat` 起一个真会话，敲一句话之后确认
+    /// `SessionState` 真的推进到了 `Working`（`session.rs::send_input`
+    /// 空字符串分支才会改这个状态），而不是仅仅看屏幕上有没有字。
+    #[test]
+    fn session_manager_type_into_submits_not_just_types() {
+        let mgr = crate::session::SessionManager::new();
+        mgr.register_profile(crate::profile::Profile {
+            name: "bridge-c1-fake".into(),
+            command: vec!["cat".into()],
+            is_agent: false,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: None,
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let id = mgr.create(dir.path(), "bridge-c1-fake", None, &[]).unwrap();
+
+        let writer: &dyn SessionWriter = &mgr;
+        writer.type_into(id, "你好").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = mgr.list().into_iter().find(|s| s.id == id).map(|s| s.state);
+            if state == Some(crate::session::SessionState::Working) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "type_into 必须真的按回车，状态该推进到 Working，实际 {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// `/ls`：报一遍此刻在等的会话，没名字的退回编号。

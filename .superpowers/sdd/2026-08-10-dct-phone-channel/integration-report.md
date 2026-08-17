@@ -310,3 +310,172 @@ pairs_then_stops_on_bad_token`'s `msg(111, "hi")`) now also triggers a
    and the msg-id map; this is consistent with the rest of the design
    (`Route::Gone` exists for exactly this case) but is worth being aware of
    if a future task considers persisting more of `Bridge`'s state.
+
+## Round 2: adversarial review fixes (commit after 35e5efc)
+
+Review of `35e5efc` found the feature was structurally sound (`route_and_
+deliver` reachability, lock ordering, map bounding, `merge` staying
+model-free, post-restart `Gone` semantics, and the strengthened no-orphan
+test were all confirmed correct) but not functional end to end: **C1
+(Critical) — a phone reply was typed into the input buffer but never
+submitted.**
+
+### C1 — `type_into` must press Enter, not just write
+
+`session.rs::send_input` splits "write characters" and "press Enter" into
+two separate calls — writing the body never advances the agent; only a
+follow-up call with an **empty string** does (`\r`, checkpoint, `Working`
+transition — see `session.rs` around line 785). `ui/grid.rs::send_reply`
+already follows this convention explicitly and its doc comment says the
+two steps must never be merged or reordered. `SessionWriter::type_into`
+(the implementation for `SessionManager`, `bridge.rs`) only did the first
+half — a phone reply would sit in the input buffer forever while the
+receipt claimed "已经敲进「name」" and the journal recorded `Typed(id)`,
+both lying to the one user who cannot look at the terminal to notice.
+
+Fixed by making `impl SessionWriter for SessionManager::type_into` call
+`send_input(id, text)` (skipped if `text` is empty, matching `send_reply`'s
+own branch) and then unconditionally `send_input(id, "")`, propagating
+`Err` from *either* step. A failure on the second step (Enter) after the
+first step (body) succeeded still returns `Err` — the PTY may already have
+the half-typed body sitting in it, but the receipt/journal will honestly
+report `Failed`, never `Typed`, for that case. Trait doc comment
+(`SessionWriter::type_into`) rewritten to state this contract explicitly so
+a future alternate implementation doesn't regress it silently.
+
+**Test:** `bridge::tests::session_manager_type_into_submits_not_just_types`
+— spins up a real `SessionManager` session (`cat`, non-agent so no git
+repo needed), calls `type_into` directly, and waits for `SessionState` to
+reach `Working` (only the empty-string/Enter branch of `send_input` flips
+that state for a non-agent session) rather than merely checking screen
+text.
+
+**Strengthened the existing daemon.rs e2e test**
+(`start_phone_bridge_wires_the_real_session_manager_and_journal`), which
+previously only asserted the reply text appeared on screen — exactly the
+blind spot the reviewer identified, since a typed-but-unsubmitted buffer
+also shows up on screen. It now additionally waits for the real session to
+reach `SessionState::Working`.
+
+**Mutation performed and confirmed to fail both tests:** removed the
+"press Enter" step from `type_into`, leaving only the body write.
+- `session_manager_type_into_submits_not_just_types` failed: state stayed
+  `Unknown`, deadline hit.
+- `start_phone_bridge_wires_the_real_session_manager_and_journal` failed:
+  `会话此刻的状态是 Some(Unknown)，一直没有推进到 Working`.
+
+Reverted; both pass again.
+
+### I1 (Important) — a merged push's reply must not claim `Gone`
+
+Only single-event batches were ever recorded in `outbound_map`
+(`RouteInput::map` is typed `HashMap<MsgId, u32>` — one session per id), so
+long-press-replying to a push that merged several stopped agents fell
+through `route()`'s rule 1 to `Route::Gone` ("这条消息对应的会话已经不在
+了") — a lie, since both sessions were alive and idle. Per the reviewer's
+suggested fix, added a second table, `Bridge::ambiguous_pushes:
+Mutex<VecDeque<(MsgId, Vec<u32>)>>` (same `MSG_MAP_CAP`/drop-oldest
+policy as `outbound_map`, and disjoint from it by construction — an id
+goes into exactly one of the two, decided in `run_sender` by
+`events.as_slice()` matching `[only]` vs. everything else).
+
+`route_and_deliver` now checks `ambiguous_reply_sessions(reply_id)`
+*before* constructing `RouteInput` and calling `route()` — `route()`
+itself stays a pure five-rule function untouched, unaware this second
+table exists; the ambiguity check is resolved one layer up, in the glue
+code whose whole job is assembling `route()`'s inputs from live state. A
+hit answers `Route::Ask(sessions)` (the same "several candidates, don't
+guess" path already used for "several sessions waiting") and flips
+`replied_since_use`, exactly like a normal routed reply would.
+
+**Test:** `bridge::tests::replying_to_a_merged_push_asks_which_one_
+instead_of_lying_gone` — enqueues two named events, lets the real
+`run_sender()` merge and send them, then replies to the returned `MsgId`
+and asserts the reply neither writes to any session nor contains "已经不
+在了", and names both candidates.
+
+**Mutation performed and confirmed to fail this test:** removed the
+`ambiguous_reply_sessions` check from `route_and_deliver`. Result: the
+reply fell through to `Route::Gone` and the test failed on the "不该说成
+Gone" assertion with the exact `Gone` message text. Reverted; passes.
+
+### Three small-but-not-cosmetic fixes
+
+- **`/use`/`/ls` command matching swallowed unrelated commands and missed
+  `@botname`.** `text.strip_prefix("/use")` matched `/user`, `/useless`,
+  etc. as `/use` with garbled arguments (and, on parse failure, silently
+  dropped the original message instead of typing it), and neither `/use`
+  nor the exact-match `/ls` recognized Telegram's `/cmd@botname` form
+  (added automatically when a bot is @-mentioned in a group). Added a
+  `strip_command(text, cmd)` helper: a match requires the command to be
+  followed by end-of-string, whitespace, or an `@botname` suffix — anything
+  else means "this is a different command," returned as `None`. Both
+  `/use` and `/ls` now go through it.
+
+  **Tests:** `use_prefix_does_not_swallow_unrelated_commands` (`/user`,
+  `/useless` sent to a session with one waiting candidate must type
+  through verbatim, not get eaten as malformed `/use`) and
+  `use_and_ls_recognize_the_at_botname_suffix` (`/use@my_dct_bot 3` then
+  `/ls@my_dct_bot`, against **two** waiting candidates specifically so a
+  false pass via the "only one waiting" rule can't mask a broken `@botname`
+  parse). **Mutation performed:** reverted `strip_command(text, "/use")`
+  back to `text.strip_prefix("/use")`. Both tests failed (the first because
+  `/user`/`/useless` got swallowed and typed nothing; the second because
+  `/use@my_dct_bot 3` failed to parse and the follow-up message fell
+  through to `Route::Ask` instead of `Route::To(3)`). Reverted; both pass.
+
+- **`reply()` held the `owner` mutex across `Channel::send()`.** `if let
+  Some(to) = *recover(self.owner.lock()) { self.ch.send(to, text); }` —
+  Rust's `if let` temporary-lifetime extension keeps the `MutexGuard` alive
+  for the whole arm body, so the lock was held for the full duration of the
+  network call (up to several seconds), blocking `PhoneUnpair`'s
+  `clear_owner()` and the send loop's owner read for no reason. Fixed by
+  copying the `Option<i64>` out of the guard on its own line before the
+  `if let`, so the guard drops immediately.
+
+- **No `stop` check between `drain_outbound()` and `ch.send()` in
+  `run_sender`.** Mirrors the same class of bug `run()`'s F2 fix already
+  addressed on the inbound side (`stop()` can land in the narrow window
+  between a blocking call returning and the next side effect). Added a
+  `self.stop.load()` check right after `drain_outbound()` and before the
+  network send; on a hit the already-drained batch is dropped (not
+  requeued), consistent with the existing "no accumulation across a
+  disabled channel" policy used everywhere else in this file.
+
+- **`session.rs::maybe_notify`'s project-name fallback leaked a full path.**
+  `dir.file_name()` returns `None` for root (`/`) or paths ending in `..`;
+  the old fallback was `s.dir.display().to_string()` — a full local
+  filesystem path sent to the phone, crossing the no-paths privacy
+  boundary from CLAUDE.md. Changed the fallback to a fixed placeholder
+  string ("未命名项目") — honest, not a fabricated name, and never a path.
+  No dedicated test added (this is a genuinely degenerate path shape,
+  `SessionState`/`Event` plumbing here is otherwise already covered); flag
+  for the final review if a path-shaped fixture is wanted.
+
+### Commands run (round 2)
+
+```
+cargo fmt --check                    -> clean
+cargo clippy --all-targets           -> clean, zero warnings
+cargo test --lib -- bridge:: daemon:: session:: journal:: channel:: --test-threads=2
+                                      -> 192 passed, 0 failed
+cargo test -- --test-threads=1 (background, full suite) -> see below
+```
+
+Round 2 adds 5 new tests (4 in `bridge.rs`, 0 new in `daemon.rs` — the
+existing e2e test was strengthened in place rather than duplicated).
+Round-1 baseline to hold was 852 passing; round 2 should land at 857
+(pending the background run).
+
+### Concerns (round 2)
+
+- The project-name-fallback fix (`session.rs`) has no dedicated regression
+  test — it's a one-line change covering a genuinely degenerate path shape
+  (root directory or a dir ending in `..`), and constructing a `Session`
+  with such a `dir` in a unit test seemed like more machinery than the fix
+  warranted, but flagging in case the final review disagrees.
+- `ambiguous_pushes` and `outbound_map` are two separate bounded structures
+  now instead of one; they're kept disjoint by construction (a `MsgId` is
+  written to exactly one, decided once in `run_sender`), but a future
+  change to either has to remember to preserve that invariant — there's no
+  type-level enforcement of "never in both."

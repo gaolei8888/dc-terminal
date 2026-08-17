@@ -448,3 +448,61 @@ Cost if wrong: a larger, harder-to-review diff than one task's worth, touching t
 The alternative is worse and nearly happened: Task 11's step 6 is the only check that would
 catch a disconnected feature, and it CANNOT RUN (no bot token per the user's instruction), so
 this would have shipped as ~845 green tests over a feature that does nothing.
+
+Task 9: complete (commits 771ced2..1ef77df, 845 passing) — pending review alongside integration.
+Integration: implementer DONE, commit 35e5efc, 852/853 passing (only the pre-existing
+  `sighup_restores_the_terminal` real-PTY timing flake failed). All three required mutations
+  performed and confirmed to fail their tests before revert. Notably it reported having to
+  STRENGTHEN its own first-draft no-orphan test because the mutation initially survived it.
+  Controller verified the security structure directly at src/bridge.rs:401-407:
+    Accepted::Paired    => route_and_deliver(msg)   (the pairing message's own content is
+                                                     still processed, deliberately)
+    Accepted::FromOwner => route_and_deliver(msg)
+    Accepted::Rejected  => {}   <- empty arm, with a comment stating nothing calling
+                                   route/deliver may ever be added here
+  That satisfies the Task 8 reviewer's condition by construction rather than by absence.
+Integration: concern — a merged multi-session push cannot be replied to directly by design; it
+  falls back to Route::Gone / "check /ls". Reasonable, but it means the merge feature and the
+  long-press-reply feature are mutually exclusive for that message. Flag to review.
+Integration: concern — the `/use` selection and the MsgId→session map are process-lifetime only
+  and lost on daemon restart. Consistent with the existing Route::Gone semantics (a reply to a
+  pre-restart message types nothing), so it degrades safely rather than wrongly.
+
+Integration + Task 9: review (opus) — spec ❌, NOT APPROVED. One Critical.
+  C1: `SessionWriter::type_into` (bridge.rs:200-202) calls send_input(id, text) and stops, but
+      send_input only WRITES THE BYTES — pressing Enter is a separate call with an empty string
+      (ui/grid.rs:683-685 does exactly that, with a comment that the steps must not be merged).
+      So a phone reply lands in the agent's input buffer and sits there: no \r, no Working
+      transition, no checkpoint, nothing runs. Meanwhile the phone gets "已经敲进「name」" and the
+      journal records Typed(id) — both asserting a delivery that did not happen, to the one user
+      who cannot glance at the terminal to notice. The new e2e test asserts only that characters
+      appear on screen, which a typed-but-unsubmitted buffer passes. This is the feature's entire
+      purpose failing silently behind 852 green tests.
+  I1: only single-event batches enter outbound_map, so replying to a MERGED push yields
+      Route::Gone — "这条消息对应的会话已经不在了" — while both sessions are alive and idle.
+      Route::Ask exists for "several candidates, don't guess"; Gone is the wrong answer, not just
+      a limitation. Worst in exactly the case where routing matters most.
+  Everything the review was asked to attack came back CLEAN: no second entry point to
+  route_and_deliver/route/deliver/send_input (grep over production lines); /use and /ls handled
+  inside route_and_deliver, i.e. behind accept(); no pairing window (accept latches the owner
+  under the lock before returning Paired); persist-before-slot is the correct order; lock order
+  outbound→owner→outbound_map has no cycle; both threads catch_unwind-wrapped sharing one stop
+  flag so replace/stop_current orphan nothing; map is Mutex<VecDeque> bounded MSG_MAP_CAP=256
+  drop-oldest; unknown id → Gone with a mutation guard pinning it; post-restart reply → Gone,
+  never a current-session fallback; merge has no llm reference at all.
+  Reviewer also verified the strengthened no-orphan test genuinely fails under mutation by
+  reading it, and judged the other two mutation-verified tests equally solid (they pin behaviour
+  through public paths, not internal state).
+Integration: fix round 1/5 dispatched — C1 (write + Enter, fail if either half fails, e2e
+  asserts the session actually leaves Idle, mutation-test by dropping Enter), I1 (record every
+  session a merged push covers and answer Ask), plus four small-but-not-cosmetic items:
+  /ls@botname currently gets TYPED INTO THE TERMINAL; /use prefix swallows /user…; reply() holds
+  the owner mutex across a 5s send; no stop check between drain_outbound and ch.send; and
+  session.rs:1100-1103 falls back to dir.display(), putting a full path on the wire.
+Integration: minor (deferred to final review): `deliver`/`enqueue` are pub with no callers
+  outside the module — a pub unauthenticated delivery entry point is the shape the guarded arm
+  defends against; BridgeHandle::accept is pub and latches ownership as a side effect.
+Integration: minor (deferred): the new daemon e2e test spawns a real PTY with 3s/2s deadlines,
+  same class as the known sighup flake — expect occasional load-dependent failures.
+Task 9: OPEN — options_prompt/parse_options have no production caller yet; the async
+  ask-the-model-with-fallback half is deferred to Task 10. Must not be lost before Task 11.

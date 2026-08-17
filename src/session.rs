@@ -1097,11 +1097,18 @@ impl SessionManager {
         s.last_notified = Some(now);
 
         let name = recover(s.name_slot.lock()).clone().unwrap_or_default();
+        // **隐私边界的回归修复。** `file_name()` 在根目录（`/`）或者以
+        // `..` 结尾的路径上返回 `None`——这两种都是边缘情况，但退化成
+        // `s.dir.display()` 会把整条本地文件系统路径原样送到手机上，
+        // 正是 CLAUDE.md 那条「手机上的字绝不能带路径」要挡住的东西。
+        // 这里不编一个假名字，也不泄露路径，退回一个诚实的占位词——
+        // 跟 `fallback_name`/`event_label` 同一条「宁可平淡也不能露底」
+        // 的规矩。
         let project = s
             .dir
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| s.dir.display().to_string());
+            .unwrap_or_else(|| "未命名项目".to_string());
         // 发不出去（接收端掉了）就丢：跟没配手机通知没有区别，tick() 不该
         // 因为这件事而报错或者重试。
         let _ = tx.send(Event {
