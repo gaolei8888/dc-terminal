@@ -49,6 +49,19 @@ pub trait Channel: Send + Sync {
     /// 谁负责，这里只是问一句「你是谁」，不记也不认谁是主人——那还是
     /// `bridge.rs` 的职责（Ruling 8）。
     fn get_me(&self) -> Result<String, ChannelError>;
+    /// 只在清空积压时用（`bridge.rs::drain_backlog`）：取一批更新、把游标
+    /// 往前推，只告诉调用方这一批**原始**有多少条——不管有没有 text，
+    /// 图片/贴纸/加群通知都要算进去。
+    ///
+    /// **不能用 `poll()` 过滤之后的数量代替这个数字。** `poll()` 只把带
+    /// `text` 字段的更新包成 `Incoming`，没有 text 的（图片、贴纸、加群
+    /// 通知）会被悄悄跳过——这条规则对 `poll()` 场景完全正确（一张图片
+    /// 不该让整轮轮询失败）。但如果拿"过滤之后还剩几条"当"积压是不是
+    /// 清空了"的判断依据，攻击者只要在 dct 关着的时候先发 100 张贴纸再发
+    /// 一条文字：贴纸那一批会被 `poll()` 过滤成空，`drain_backlog` 就会
+    /// 误判"积压空了"，排在贴纸后面的那条文字反而会被当成"配对开着之后
+    /// 的第一条"接受下来——这正是这个方法存在的理由。
+    fn drain(&self, timeout: Duration) -> Result<usize, ChannelError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

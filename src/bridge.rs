@@ -188,9 +188,19 @@ impl Bridge {
     /// 规则的字面漏洞。
     ///
     /// 用 0 秒超时反复问一遍：Telegram 的 `getUpdates` 只要有积压就立刻
-    /// 整批返回，不等到 timeout 才回；拿到一个空批次，说明积压真的空了，
-    /// 从这一刻起才把"配对开着"这件事交给 `run()` 的主循环——**只有在这
-    /// 之后到达的消息**才有资格配对。
+    /// 整批返回，不等到 timeout 才回；拿到一个**原始数量是 0** 的批次，
+    /// 说明积压真的空了，从这一刻起才把"配对开着"这件事交给 `run()` 的
+    /// 主循环——**只有在这之后到达的消息**才有资格配对。
+    ///
+    /// **必须用 `Channel::drain`，绝不能用 `Channel::poll`。** `poll()`
+    /// 返回的是过滤之后的 `Vec<Incoming>`（没有 text 的更新——图片、贴纸、
+    /// 加群通知——早被悄悄跳过，这条规则对 `poll()` 完全正确）；如果拿
+    /// "过滤之后还剩几条"当"积压清空了没有"的判断依据，攻击者只要在 dct
+    /// 关着的时候先发 100 张贴纸再发一条文字：贴纸那一批会被过滤成空，
+    /// 这个函数就会把它误判成"积压空了"，排在贴纸后面的那条文字反而会
+    /// 被当成"配对开着之后的第一条"接受下来——这是 C1 的原始漏洞借着
+    /// 这个函数的终止条件原样复活（F1）。`drain()` 报的是原始条数，
+    /// 不管有没有 text，这里没有"过滤"这一步可以被利用。
     ///
     /// 已经有持久化主人的重启路径（`owner` 是 `Some`）**不会走到这里**，
     /// 见 `run()`：那种情况下配对早就完成过了，不存在「谁会被误判成
@@ -202,11 +212,12 @@ impl Bridge {
             if self.stop.load(Ordering::Relaxed) {
                 return false;
             }
-            match self.ch.poll(Duration::ZERO) {
-                Ok(batch) if batch.is_empty() => return true,
+            match self.ch.drain(Duration::ZERO) {
+                Ok(0) => return true,
                 Ok(_) => {
-                    // 还有积压，一条都不处理、也不让它们进 accept()，
-                    // 继续问下一批直到问出一个空批次。
+                    // 还有积压（不管这一批里有没有能解析出文字的消息），
+                    // 一条都不处理、也不让它们进 accept()，继续问下一批
+                    // 直到问出一个原始数量为 0 的批次。
                 }
                 Err(e) if e.worth_retrying() => {
                     self.sleep_or_stop(delay);
@@ -276,6 +287,20 @@ impl Bridge {
             }
             match self.ch.poll(POLL_TIMEOUT) {
                 Ok(incoming) => {
+                    // **F2 的修复。** `poll()` 可能挂了将近 `POLL_TIMEOUT`
+                    // （25 秒）——`stop()` 完全可能在它阻塞期间被别的线程
+                    // 调用（`PhoneUnpair`/`PhoneDisable`/重新填令牌）。不在
+                    // 这里重新看一眼 `stop`，一条消息就可能在"线程已经被
+                    // 判了死刑"之后还是被 `dispatch()`：往共享的 `phone`
+                    // 状态槽里写一次配对成功（UI 显示"已配对"），还会调
+                    // `persist_owner` 把 chat id 写回密钥仓——如果这发生在
+                    // `PhoneDisable`/`PhoneSetToken` 已经删掉/换掉
+                    // `PHONE_OWNER_KEY` 之后，等于用一条"来自快死的旧线程"
+                    // 的消息把它写了回去，下次重启 `startup_bridge_owner`
+                    // 就会把这个本该作废的 chat id 交给新的 bridge。
+                    if self.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
                     delay = INITIAL_BACKOFF;
                     for msg in &incoming {
                         self.dispatch(msg);
@@ -424,6 +449,9 @@ mod tests {
         }
         fn get_me(&self) -> Result<String, ChannelError> {
             panic!("accept() 测试不该碰渠道的 get_me()")
+        }
+        fn drain(&self, _timeout: Duration) -> Result<usize, ChannelError> {
+            panic!("accept() 测试不该碰渠道的 drain()")
         }
     }
 
@@ -733,29 +761,41 @@ mod tests {
 
     // ---- get_me / 轮询主循环：mock channel，不碰网络 ----
 
-    /// 可编程的 mock：`get_me` 给定的一个结果，`poll` 是一串排好队的结果，
-    /// 用完就返回空批次（不是错误）。三个字段各记一件事：调用次数、
-    /// 每次调用传进来的 timeout（用来分清"清空积压那一下"用的是 0 秒
-    /// 还是"正常轮询"用的是 `POLL_TIMEOUT`），跟真实回包一样不关心
-    /// 谁在问。
+    /// 可编程的 mock：`get_me` 给定的一个结果，`poll`/`drain` 各自是一串
+    /// 排好队的结果，用完就返回空批次/0（不是错误）——这是两条**独立**
+    /// 的队列，不是同一条：真实的 `Telegram` 也是这样，`drain_backlog`
+    /// 只会调用 `drain()`，`run()` 的正常轮询只会调用 `poll()`，谁调了
+    /// 哪个、调了几次，靠各自的调用计数分辨，不用再像以前那样去比较
+    /// 传进来的 timeout。`on_poll_return` 是给 F2 的回归测试用的钩子：
+    /// 在 `poll()` 即将返回之前跑一下，让测试能在"poll() 已经返回，但
+    /// `run()` 还没来得及 `dispatch()`"这个窗口里做点什么（比如喊停）。
     struct MockChannel {
         get_me_result: Result<String, ChannelError>,
         poll_results: Mutex<VecDeque<Result<Vec<Incoming>, ChannelError>>>,
+        drain_results: Mutex<VecDeque<Result<usize, ChannelError>>>,
         poll_calls: Mutex<u32>,
-        poll_timeouts: Mutex<Vec<Duration>>,
+        drain_calls: Mutex<u32>,
+        on_poll_return: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl MockChannel {
-        fn new(
-            get_me_result: Result<String, ChannelError>,
-            poll_results: Vec<Result<Vec<Incoming>, ChannelError>>,
-        ) -> MockChannel {
+        fn new(get_me_result: Result<String, ChannelError>) -> MockChannel {
             MockChannel {
                 get_me_result,
-                poll_results: Mutex::new(poll_results.into()),
+                poll_results: Mutex::new(VecDeque::new()),
+                drain_results: Mutex::new(VecDeque::new()),
                 poll_calls: Mutex::new(0),
-                poll_timeouts: Mutex::new(Vec::new()),
+                drain_calls: Mutex::new(0),
+                on_poll_return: Mutex::new(None),
             }
+        }
+
+        fn queue_poll(&self, r: Result<Vec<Incoming>, ChannelError>) {
+            self.poll_results.lock().unwrap().push_back(r);
+        }
+
+        fn queue_drain(&self, r: Result<usize, ChannelError>) {
+            self.drain_results.lock().unwrap().push_back(r);
         }
     }
 
@@ -763,17 +803,29 @@ mod tests {
         fn send(&self, _to: i64, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
             unimplemented!("这一路测试不需要 send")
         }
-        fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
             *self.poll_calls.lock().unwrap() += 1;
-            self.poll_timeouts.lock().unwrap().push(timeout);
-            self.poll_results
+            let result = self
+                .poll_results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Ok(Vec::new()))
+                .unwrap_or(Ok(Vec::new()));
+            if let Some(f) = self.on_poll_return.lock().unwrap().as_ref() {
+                f();
+            }
+            result
         }
         fn get_me(&self) -> Result<String, ChannelError> {
             self.get_me_result.clone()
+        }
+        fn drain(&self, _timeout: Duration) -> Result<usize, ChannelError> {
+            *self.drain_calls.lock().unwrap() += 1;
+            self.drain_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(0))
         }
     }
 
@@ -784,14 +836,11 @@ mod tests {
     #[test]
     fn run_populates_bot_then_pairs_then_stops_on_bad_token() {
         let phone = blank_status();
-        let ch = Arc::new(MockChannel::new(
-            Ok("my_dct_bot".to_string()),
-            vec![
-                Ok(Vec::new()),           // drain_backlog：没有积压
-                Ok(vec![msg(111, "hi")]), // 正常轮询：第一条真消息完成配对
-                Err(ChannelError::BadToken),
-            ],
-        ));
+        let ch = Arc::new(MockChannel::new(Ok("my_dct_bot".to_string())));
+        ch.queue_drain(Ok(0)); // drain_backlog：没有积压
+        ch.queue_poll(Ok(vec![msg(111, "hi")])); // 正常轮询：第一条真消息完成配对
+        ch.queue_poll(Err(ChannelError::BadToken));
+
         let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
         bridge.run();
 
@@ -801,31 +850,25 @@ mod tests {
             PhoneState::Broken(_) => {}
             other => panic!("该停在 Broken，得到 {other:?}"),
         }
-        assert_eq!(*ch.poll_calls.lock().unwrap(), 3);
-        let timeouts = ch.poll_timeouts.lock().unwrap().clone();
-        assert_eq!(
-            timeouts,
-            vec![Duration::ZERO, POLL_TIMEOUT, POLL_TIMEOUT],
-            "第一次问积压该用 0 秒，配对完成之后才切回正常的长轮询超时"
-        );
+        assert_eq!(*ch.drain_calls.lock().unwrap(), 1, "积压只问了一次就问出空");
+        assert_eq!(*ch.poll_calls.lock().unwrap(), 2, "正常轮询该走两次");
     }
 
     /// **C1 的回归测试。** 重启前（`owner` 还是 `None`，没能从密钥仓恢复）
     /// Telegram 已经攒了一条陌生人的积压消息——这正是"攻击者趁 dct 关着
     /// 抢先发消息"那个场景。`drain_backlog` 必须把它原样倒掉，配对只能
-    /// 落在积压清空之后到达的第一条真消息上。
+    /// 落在积压清空之后到达的第一条真消息上。**这里的积压完全不经过
+    /// `poll()`**——`drain()` 只报数量，攻击者的消息内容从头到尾都没有
+    /// 被解析成 `Incoming`，比"解析了但丢弃"更进一步地堵死了这条路。
     #[test]
     fn a_backlog_message_present_before_pairing_opens_is_discarded_not_paired() {
         let phone = blank_status();
-        let ch = Arc::new(MockChannel::new(
-            Ok("my_dct_bot".to_string()),
-            vec![
-                Ok(vec![msg(999, "我趁你不在先发一条")]), // 积压：攻击者的消息
-                Ok(Vec::new()),                           // 积压问干净了
-                Ok(vec![msg(111, "真主人上线")]),         // 配对开着之后的第一条
-                Err(ChannelError::BadToken),
-            ],
-        ));
+        let ch = Arc::new(MockChannel::new(Ok("my_dct_bot".to_string())));
+        ch.queue_drain(Ok(1)); // 积压：还有一条原始更新（攻击者的消息，drain 不关心内容）
+        ch.queue_drain(Ok(0)); // 积压问干净了
+        ch.queue_poll(Ok(vec![msg(111, "真主人上线")])); // 配对开着之后的第一条
+        ch.queue_poll(Err(ChannelError::BadToken));
+
         let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
         bridge.run();
 
@@ -836,8 +879,40 @@ mod tests {
             "配对必须落在真主人身上，不能是积压里那条陌生人的消息"
         );
         drop(st);
+        assert_eq!(*ch.drain_calls.lock().unwrap(), 2, "积压该被问两次才问出空");
         // 陌生人 999 从始至终没有拿到过 `Paired`——直接问 bridge 本身也确认一遍。
         assert_eq!(bridge.accept(&msg(999, "还想再试一次")), Accepted::Rejected);
+    }
+
+    /// **F1 的回归测试。** 积压里那一批全是没有 text 的更新（贴纸/图片/
+    /// 加群通知）——如果 `drain_backlog` 拿"parse_updates 过滤之后还剩
+    /// 几条"当判断依据（而不是原始条数），这一批会被误判成"积压已经
+    /// 清空"：`drain()` 报"原始 100 条"，`drain_backlog` 必须老实再问
+    /// 一轮，不能因为"这批东西看起来都不是消息"就提前放行。
+    #[test]
+    fn drain_backlog_does_not_stop_on_a_batch_that_is_all_non_text_updates() {
+        let phone = blank_status();
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
+        ch.queue_drain(Ok(100)); // 100 条原始更新——这批全是贴纸，但 drain() 老实报了原始数量
+        ch.queue_drain(Ok(0)); // 下一批才真的空
+        ch.queue_poll(Ok(vec![msg(111, "真主人上线")]));
+        ch.queue_poll(Err(ChannelError::BadToken));
+
+        let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
+        bridge.run();
+
+        assert_eq!(
+            *ch.drain_calls.lock().unwrap(),
+            2,
+            "第一批报了 100 条，必须再问一轮，不能一次就判定积压空了"
+        );
+        assert_eq!(
+            *ch.poll_calls.lock().unwrap(),
+            2,
+            "只有积压真的空了才进正常轮询"
+        );
+        let st = phone.lock().unwrap();
+        assert_eq!(st.owner.as_deref(), Some("111"));
     }
 
     /// 令牌一开始就是坏的：`get_me` 直接 `BadToken`，`run()` 必须
@@ -846,11 +921,12 @@ mod tests {
     #[test]
     fn a_bad_token_at_startup_never_reaches_poll() {
         let phone = blank_status();
-        let ch = Arc::new(MockChannel::new(Err(ChannelError::BadToken), Vec::new()));
+        let ch = Arc::new(MockChannel::new(Err(ChannelError::BadToken)));
         let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
         bridge.run();
 
         assert_eq!(*ch.poll_calls.lock().unwrap(), 0);
+        assert_eq!(*ch.drain_calls.lock().unwrap(), 0);
         let st = phone.lock().unwrap();
         assert_eq!(st.bot, None);
         match &st.state {
@@ -861,25 +937,54 @@ mod tests {
 
     /// 重启且 `owner` 已知：`run()` 必须直接进正常轮询，**跳过**
     /// `drain_backlog`——不然重启一次，主人自己此刻真的发来的消息都可能
-    /// 被当成"积压"平白丢掉。用第一次 `poll` 调用的 timeout 是不是
-    /// `POLL_TIMEOUT`（而不是 `drain_backlog` 用的 0 秒）来分辨走了
-    /// 哪条路径。
+    /// 被当成"积压"平白丢掉。`drain_calls` 必须是 0，`poll_calls` 是 1。
     #[test]
     fn run_with_a_known_owner_skips_backlog_draining_and_polls_directly() {
         let phone = blank_status();
-        let ch = Arc::new(MockChannel::new(
-            Ok("bot".to_string()),
-            vec![Err(ChannelError::BadToken)],
-        ));
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
+        ch.queue_poll(Err(ChannelError::BadToken));
+
         let bridge = Bridge::new(ch.clone(), phone, Some(111), Box::new(|_| {}));
         bridge.run();
 
-        assert_eq!(*ch.poll_calls.lock().unwrap(), 1);
         assert_eq!(
-            ch.poll_timeouts.lock().unwrap().clone(),
-            vec![POLL_TIMEOUT],
-            "已经有主人时不该先走清空积压那一步（0 秒超时），要直接用正常轮询的超时"
+            *ch.drain_calls.lock().unwrap(),
+            0,
+            "已经有主人时不该先走清空积压那一步"
         );
+        assert_eq!(*ch.poll_calls.lock().unwrap(), 1);
+    }
+
+    /// **F2 的回归测试。** `poll()` 返回了一条陌生人消息之后、`run()`
+    /// 还没来得及 `dispatch()` 之前，`stop()` 恰好被调用（模拟
+    /// `PhoneDisable`/`PhoneUnpair`/重新填令牌发生在这个窗口里）。这条
+    /// 消息不该被派发——不然一个已经被判了死刑的线程还能在临死前把
+    /// 陌生人写成主人、把 chat id 落盘。用 `on_poll_return` 钩子精确
+    /// 制造"poll() 刚返回、dispatch() 还没跑"这个时刻。
+    #[test]
+    fn a_stop_right_after_poll_returns_prevents_the_message_from_being_dispatched() {
+        let phone = blank_status();
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
+        ch.queue_drain(Ok(0));
+        ch.queue_poll(Ok(vec![msg(999, "陌生人趁 stop() 生效前那一刻发消息")]));
+
+        let bridge = Arc::new(Bridge::new(
+            ch.clone(),
+            phone.clone(),
+            None,
+            Box::new(|_| {}),
+        ));
+        let b2 = bridge.clone();
+        *ch.on_poll_return.lock().unwrap() = Some(Box::new(move || b2.stop()));
+
+        bridge.run();
+
+        let st = phone.lock().unwrap();
+        assert_eq!(
+            st.owner, None,
+            "poll() 返回之后、dispatch() 之前 stop() 已经生效——这条消息不该被派发/配对"
+        );
+        assert_eq!(*ch.poll_calls.lock().unwrap(), 1, "只该问这一次就该退出了");
     }
 
     /// `run()` 里的 panic 必须被 `catch_unwind` 接住，不能往外冒——这是
@@ -897,6 +1002,9 @@ mod tests {
             }
             fn get_me(&self) -> Result<String, ChannelError> {
                 Ok("bot".to_string())
+            }
+            fn drain(&self, _timeout: Duration) -> Result<usize, ChannelError> {
+                Ok(0)
             }
         }
         let phone = blank_status();
@@ -917,7 +1025,7 @@ mod tests {
         // owner 已知：跳过 drain_backlog，直接进那个"每次都成功但什么都
         // 没有"的正常轮询，循环转得飞快，最能暴露"stop 没生效就会一直
         // 转下去"这件事。
-        let ch = Arc::new(MockChannel::new(Ok("bot".to_string()), Vec::new()));
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
         let bridge = Arc::new(Bridge::new(ch.clone(), phone, Some(1), Box::new(|_| {})));
         let worker = bridge.clone();
         let handle = std::thread::spawn(move || worker.run());
@@ -966,7 +1074,7 @@ mod tests {
         let slot: Mutex<Option<BridgeHandle>> = Mutex::new(None);
         let phone = blank_status();
 
-        let old_ch = Arc::new(MockChannel::new(Ok("old_bot".to_string()), Vec::new()));
+        let old_ch = Arc::new(MockChannel::new(Ok("old_bot".to_string())));
         replace(
             &slot,
             old_ch.clone(),
@@ -981,7 +1089,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        let new_ch = Arc::new(MockChannel::new(Ok("new_bot".to_string()), Vec::new()));
+        let new_ch = Arc::new(MockChannel::new(Ok("new_bot".to_string())));
         replace(
             &slot,
             new_ch.clone(),
@@ -1013,7 +1121,7 @@ mod tests {
     fn stop_current_stops_the_bridge_and_leaves_the_slot_empty() {
         let slot: Mutex<Option<BridgeHandle>> = Mutex::new(None);
         let phone = blank_status();
-        let ch = Arc::new(MockChannel::new(Ok("bot".to_string()), Vec::new()));
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
         replace(&slot, ch.clone(), phone, Some(1), Box::new(|_| {}));
 
         let deadline = Instant::now() + Duration::from_secs(2);

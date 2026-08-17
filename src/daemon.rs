@@ -123,12 +123,38 @@ fn initial_phone_status(secrets: &SecretStore) -> PhoneStatus {
     }
 }
 
+/// 密钥仓里那份持久化的 owner 到底是什么状态——**三种情况必须分得清**，
+/// 不能只有"有"和"没有"两种：
+///
+/// - `None`：从没配对过（或者是一次全新的令牌），**可以**打开配对。
+/// - `Known`：配对完成过，值读得出来，直接拿去恢复，不重新打开配对。
+/// - `Corrupt`：这个键**存在**，但读不出一个合法的 chat id（F3）。这
+///   **不等于** `None`——`.and_then(...).ok()` 那种"解析失败就退化成
+///   `None`"的写法会把它悄悄合并进"可以打开配对"，而"配对信息读不出来"
+///   和"从没配过对"完全是两件事：前者曾经有一个真主人，只是这一条记录
+///   坏了；把它当成后者处理，等于在 Ruling 9 明确禁止的地方又把门打开
+///   给了任何人。正确的处理是拒绝启动配对，把这件事说给用户听。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupOwner {
+    None,
+    Known(i64),
+    Corrupt,
+}
+
 /// 重启时该拿哪个 chat id 当 `Bridge` 的 `owner`——**必须**读密钥仓里
 /// 持久化的那份，不能镶死成 `None`。镶死成 `None` 就是 C1：bot 用户名
 /// 公开可搜，攻击者只要趁 dct 关着抢先发消息，重启后一旦 `owner` 又从
 /// `None` 起步，`Bridge` 就会重新把"谁先发消息"当成配对的依据。
-fn startup_bridge_owner(secrets: &SecretStore) -> Option<i64> {
-    secrets.get(PHONE_OWNER_KEY).and_then(|v| v.parse().ok())
+fn startup_bridge_owner(secrets: &SecretStore) -> StartupOwner {
+    match secrets.get(PHONE_OWNER_KEY) {
+        None => StartupOwner::None,
+        Some(v) => match v.parse::<i64>() {
+            Ok(id) => StartupOwner::Known(id),
+            // F3：读不出来**绝不能**退化成 `None`——那等于把"这条记录坏了"
+            // 当成"从没配过对"，重新把配对的门打开给第一个发消息的人。
+            Err(_) => StartupOwner::Corrupt,
+        },
+    }
 }
 
 /// 配对完成那一刻，`Bridge` 要把 chat id 落盘用的回调。**跟令牌用同一个
@@ -157,16 +183,31 @@ fn start_phone_bridge(
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     make_channel: &dyn Fn(&str) -> Arc<dyn crate::channel::Channel>,
 ) {
-    let (token, owner) = {
+    let (token, owner_state) = {
         let s = recover(secrets.lock());
         match s.get(PHONE_TOKEN_KEY) {
             Some(token) => (Some(token.to_string()), startup_bridge_owner(&s)),
-            None => (None, None),
+            None => (None, StartupOwner::None),
         }
     };
     let Some(token) = token else {
         return;
     };
+
+    // **F3 的修复。** 配对信息读不出来，不是"从没配过对"——绝不能当成
+    // `None` 打开配对，那样任何人都能抢在真主人前面重新配对成功。老实
+    // 拒绝起 bridge，把这件事说给用户听，让他知道该怎么办（重新粘贴一遍
+    // 令牌：`Request::PhoneSetToken` 会清掉这条坏记录，见那边的注释）。
+    let owner = match owner_state {
+        StartupOwner::None => None,
+        StartupOwner::Known(id) => Some(id),
+        StartupOwner::Corrupt => {
+            recover(phone.lock()).state =
+                PhoneState::Broken("手机配对信息读不出来了，去设置页重新粘贴一遍令牌".to_string());
+            return;
+        }
+    };
+
     let ch = make_channel(&token);
     crate::bridge::replace(
         bridge,
@@ -576,6 +617,9 @@ mod tests {
         }
         fn get_me(&self) -> std::result::Result<String, ChannelError> {
             panic!("这条测试链路不该真的打网络验证令牌")
+        }
+        fn drain(&self, _timeout: Duration) -> std::result::Result<usize, ChannelError> {
+            panic!("这条测试链路不该真的打网络清空积压")
         }
     }
 
@@ -1198,23 +1242,67 @@ mod tests {
     /// **绝不能因为解析失败就崩，也绝不能编一个假的主人出来**，两种情况
     /// 都只是"这次重启要重新走配对"，不是错误。
     #[test]
-    fn startup_bridge_owner_reads_the_persisted_value_or_says_so_honestly() {
+    fn startup_bridge_owner_distinguishes_absent_known_and_corrupt() {
         let empty = SecretStore::load(&tempfile::tempdir().unwrap().path().join("secrets.toml"));
-        assert_eq!(startup_bridge_owner(&empty), None);
+        assert_eq!(startup_bridge_owner(&empty), StartupOwner::None);
 
         let tmp = tempfile::tempdir().unwrap();
         let mut with_owner = SecretStore::load(&tmp.path().join("secrets.toml"));
         with_owner.set(PHONE_OWNER_KEY, "555").unwrap();
-        assert_eq!(startup_bridge_owner(&with_owner), Some(555));
+        assert_eq!(startup_bridge_owner(&with_owner), StartupOwner::Known(555));
 
+        // **F3 的钉子。** 键存在，但读不出一个合法的 chat id——这**不是**
+        // "从没配过对"，不能退化成 `StartupOwner::None`。之前的实现用
+        // `.and_then(...).ok()` 把这条路径悄悄合并进了 `None`，等于把
+        // "配对信息坏了"错当成"可以随便谁来配对"，Ruling 9 明确禁止。
         let tmp2 = tempfile::tempdir().unwrap();
         let mut garbage = SecretStore::load(&tmp2.path().join("secrets.toml"));
         garbage.set(PHONE_OWNER_KEY, "这不是数字").unwrap();
         assert_eq!(
             startup_bridge_owner(&garbage),
-            None,
-            "解析不出来就该是 None，不能 panic 也不能编一个假主人"
+            StartupOwner::Corrupt,
+            "读不出来必须是一个明确的、配对不能开的状态，不能悄悄退化成 None"
         );
+    }
+
+    /// **F3 的端到端回归测试。** 密钥仓里有令牌，但持久化的 owner 是一条
+    /// 读不出来的坏记录——`start_phone_bridge` 绝不能把这种情况当成
+    /// "从没配过对"去打开配对：不该起任何 bridge（没有 bridge 就没有
+    /// 任何人能被 `accept()` 判成主人，这是最强的保护），要把这件事说给
+    /// 用户听，让他知道下一步该干什么。
+    #[test]
+    fn startup_refuses_to_open_pairing_when_the_persisted_owner_is_corrupt() {
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        recover(secrets.lock())
+            .set(PHONE_TOKEN_KEY, "123456:AAH-tok")
+            .unwrap();
+        recover(secrets.lock())
+            .set(PHONE_OWNER_KEY, "这不是数字")
+            .unwrap();
+        let phone = test_phone();
+        let bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>> = Arc::new(Mutex::new(None));
+
+        start_phone_bridge(&secrets, &phone, &bridge, &|_token| {
+            Arc::new(StubChannel) as Arc<dyn crate::channel::Channel>
+        });
+
+        assert!(
+            recover(bridge.lock()).is_none(),
+            "配对信息读不出来时不该起任何 bridge——那等于把\"读不出来\"当成\"随便谁来都行\""
+        );
+        let st = recover(phone.lock());
+        match &st.state {
+            PhoneState::Broken(text) => {
+                assert!(!text.is_empty());
+                assert!(
+                    text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                    "该是写给人看的一句话: {text}"
+                );
+            }
+            other => panic!("该停在 Broken，得到 {other:?}"),
+        }
     }
 
     /// **C1 的端到端回归测试，钉在守护进程启动这条真实路径上。**

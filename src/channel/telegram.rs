@@ -60,6 +60,22 @@ pub fn parse_updates(body: &str) -> Result<Vec<Incoming>, ChannelError> {
     Ok(out)
 }
 
+/// 跟 `parse_updates` 拿的是同一段 JSON，但数的是**原始条数**——不管
+/// 这条更新有没有 `message.text`，图片、贴纸、加群通知都要算进去。
+/// `Channel::drain` 就是靠这个数字（不是 `parse_updates` 过滤之后剩下
+/// 几条）判断"积压是不是真的空了"，见该 trait 方法文档注释里的攻击
+/// 场景（F1）。
+pub fn count_raw_updates(body: &str) -> Result<usize, ChannelError> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| ChannelError::Malformed)?;
+    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
+        return Err(error_from(&v));
+    }
+    v.get("result")
+        .and_then(|r| r.as_array())
+        .map(|a| a.len())
+        .ok_or(ChannelError::Malformed)
+}
+
 /// 从原始回包里读出这一批更新里最大的 `update_id`。**只有这个值加一之后
 /// 才是下一次 `getUpdates` 该用的 `offset`**——用它才能让 Telegram 不再
 /// 把这批更新重新递过来。
@@ -204,6 +220,31 @@ impl Channel for Telegram {
 
         Ok(incoming)
     }
+
+    /// **F1 的修复。** 跟 `poll` 打同一个 `getUpdates`、同样推进 offset，
+    /// 但不解析成 `Incoming`——只数这一批原始有多少条，见 trait 方法的
+    /// 文档注释。刻意不复用 `parse_updates`：那个函数的返回值天然就是
+    /// "过滤之后还剩几条"，把它硬套在这里，等于把 F1 想堵住的那个漏洞
+    /// 原样搬回来。
+    fn drain(&self, timeout: Duration) -> Result<usize, ChannelError> {
+        let offset = *self.offset.lock().unwrap();
+        let url = format!(
+            "{}?offset={}&timeout={}",
+            self.url("getUpdates"),
+            offset,
+            timeout.as_secs()
+        );
+        let resp = (self.send)(&url, "").map_err(|_| ChannelError::Unreachable)?;
+        let count = count_raw_updates(&resp)?;
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+            if let Some(max_id) = max_update_id(&v) {
+                *self.offset.lock().unwrap() = max_id + 1;
+            }
+        }
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +280,29 @@ mod tests {
         let body = r#"{"ok":true,"result":[{"update_id":3,"message":{
             "message_id":44,"chat":{"id":777}}}]}"#;
         assert_eq!(parse_updates(body).unwrap().len(), 0);
+    }
+
+    /// **F1 的钉子。** 一批全是没有 text 的更新（贴纸/图片/加群通知）：
+    /// `parse_updates` 把它们全部过滤掉，剩下 0 条——这对 `poll()` 完全
+    /// 正确。但 `count_raw_updates` 数的是原始条数，必须报 1，不是 0。
+    /// 如果哪天有人图省事让 `Channel::drain` 复用 `parse_updates` 的
+    /// 长度，这条测试会先炸：`drain_backlog` 会把"一批贴纸"误判成
+    /// "积压空了"，攻击者排在贴纸后面的文字消息就会被当成配对开着之后
+    /// 的第一条。
+    #[test]
+    fn count_raw_updates_counts_updates_with_no_text_too() {
+        let body = r#"{"ok":true,"result":[{"update_id":3,"message":{
+            "message_id":44,"chat":{"id":777}}}]}"#;
+        assert_eq!(
+            parse_updates(body).unwrap().len(),
+            0,
+            "poll() 这条路径过滤掉没有 text 的更新是对的"
+        );
+        assert_eq!(
+            count_raw_updates(body).unwrap(),
+            1,
+            "drain() 这条路径必须数原始条数，不能借用 parse_updates 过滤之后的长度"
+        );
     }
 
     /// 令牌被撤销时 Telegram 回 ok:false + 401。**必须区分出 BadToken**，
@@ -346,6 +410,41 @@ mod tests {
         assert!(
             urls[1].contains("offset=8"),
             "第二次轮询该带上上一批最大 update_id(7) + 1: {}",
+            urls[1]
+        );
+    }
+
+    /// **F1 的端到端钉子，钉在真实的 `Telegram::drain` 上。** 一批全是
+    /// 贴纸（没有 text），`Telegram::poll` 在同一段回包上会拿到一个空
+    /// `Vec`；`drain` 必须报"这一批有 1 条"，还要照常把 offset 往前推——
+    /// 攻击者排在这批贴纸后面的文字消息不该因为"看起来积压是空的"而被
+    /// 提前放进配对窗口。
+    #[test]
+    fn drain_reports_the_raw_count_of_a_sticker_only_batch_and_still_advances_the_offset() {
+        let seen_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen_urls.clone();
+        let tg = Telegram::with_transport(
+            "tok",
+            Box::new(move |url, _body| {
+                sink.lock().unwrap().push(url.to_string());
+                // 一条贴纸：有 update_id，有 message，但没有 text。
+                Ok(r#"{"ok":true,"result":[
+                    {"update_id":9,"message":{"message_id":1,"chat":{"id":666}}}
+                ]}"#
+                .to_string())
+            }),
+        );
+
+        let count = tg.drain(Duration::ZERO).unwrap();
+        assert_eq!(count, 1, "这一批原始有一条贴纸，drain 不该报 0");
+
+        // offset 照常往前推——第二次调用（不管是 drain 还是 poll）该带
+        // 上 update_id(9) + 1。
+        let _ = tg.poll(Duration::from_secs(1));
+        let urls = seen_urls.lock().unwrap();
+        assert!(
+            urls[1].contains("offset=10"),
+            "drain 也该像 poll 一样推进 offset: {}",
             urls[1]
         );
     }
