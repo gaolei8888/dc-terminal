@@ -4,6 +4,7 @@
 //! 不需要服务器、不需要公网域名、不需要隧道。**别把这条优势改掉。**
 
 use super::{Channel, ChannelError, Incoming, MsgId};
+use crate::session::recover;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -198,7 +199,7 @@ impl Channel for Telegram {
     }
 
     fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
-        let offset = *self.offset.lock().unwrap();
+        let offset = *recover(self.offset.lock());
         let url = format!(
             "{}?offset={}&timeout={}",
             self.url("getUpdates"),
@@ -214,7 +215,7 @@ impl Channel for Telegram {
         // `?` 已经保证这里的 JSON 一定是合法且 ok:true 的。
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
             if let Some(max_id) = max_update_id(&v) {
-                *self.offset.lock().unwrap() = max_id + 1;
+                *recover(self.offset.lock()) = max_id + 1;
             }
         }
 
@@ -227,7 +228,7 @@ impl Channel for Telegram {
     /// "过滤之后还剩几条"，把它硬套在这里，等于把 F1 想堵住的那个漏洞
     /// 原样搬回来。
     fn drain(&self, timeout: Duration) -> Result<usize, ChannelError> {
-        let offset = *self.offset.lock().unwrap();
+        let offset = *recover(self.offset.lock());
         let url = format!(
             "{}?offset={}&timeout={}",
             self.url("getUpdates"),
@@ -239,7 +240,7 @@ impl Channel for Telegram {
 
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
             if let Some(max_id) = max_update_id(&v) {
-                *self.offset.lock().unwrap() = max_id + 1;
+                *recover(self.offset.lock()) = max_id + 1;
             }
         }
 

@@ -96,7 +96,26 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 见 `bridge::spawn_event_consumer` 的文档。`bridge` 此刻可能还是
     // `None`（没写过令牌）——没关系，消费者每次收到事件才现查槽里是谁。
     let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
-    mgr.set_event_sink(event_tx);
+    // **修复 1（最终整分支 review）。** 以前这里无条件调用
+    // `mgr.set_event_sink`，`should_notify` 的第三道门（`has_channel`）
+    // 因此永远判真——包括从没写过手机令牌的人。装上 sink 之后，
+    // 每个会话的 Stopped/Failed/Vanished 转换都会截一次屏、包成
+    // `Event` 送进这条队列，`spawn_event_consumer` 发现 `bridge` 槽是
+    // `None` 才把它悄悄丢掉。这条路径从没让数据出过进程（不是泄露），
+    // 但 `should_notify`/`event_tx` 两处文档注释说的「没配手机通知，
+    // 试都不用试」因此是一句不成立的保证。
+    //
+    // 真正的修法是让这个 sink 只在功能确实被配置过时才装：启动时看
+    // 密钥仓里有没有令牌——有，说明这次重启是在恢复一个已经开着的
+    // 手机通知，`should_notify` 从进程一起来就该判真；没有，就跟
+    // `initial_phone_status`/`start_phone_bridge` 一样，什么都不做。
+    // `Request::PhoneSetToken` 成功时会重新调用一次 `set_event_sink`
+    // 把它补上（用户从 `Off` 第一次填令牌走的正是这条路径），
+    // `Request::PhoneDisable` 会调用 `clear_event_sink` 收回——两处
+    // 都在 `handle()` 里，见那两个分支的注释。
+    if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
+        mgr.set_event_sink(event_tx.clone());
+    }
     crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
 
     let tick_mgr = mgr.clone();
@@ -113,8 +132,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let pd = profiles_dir.clone();
         let ph = phone.clone();
         let br = bridge.clone();
+        let et = event_tx.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -310,6 +330,7 @@ fn startup_oauth(name: &str) -> Option<crate::llm::creds::Borrowed> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     stream: UnixStream,
     mgr: Arc<SessionManager>,
@@ -318,6 +339,7 @@ fn serve(
     profiles_dir: PathBuf,
     phone: Arc<Mutex<PhoneStatus>>,
     bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
+    event_tx: std::sync::mpsc::Sender<Event>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -327,7 +349,16 @@ fn serve(
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir, &phone, &bridge),
+            Ok(req) => handle(
+                req,
+                &mgr,
+                &store,
+                &secrets,
+                &profiles_dir,
+                &phone,
+                &bridge,
+                &event_tx,
+            ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
@@ -345,6 +376,7 @@ fn handle(
     profiles_dir: &Path,
     phone: &Arc<Mutex<PhoneStatus>>,
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
+    event_tx: &std::sync::mpsc::Sender<Event>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -509,6 +541,21 @@ fn handle(
                     // 之后 `startup_bridge_owner` 会把上一个 bot 的 chat id
                     // 错当成这个新 bot 的主人。
                     let _ = recover(secrets.lock()).remove(PHONE_OWNER_KEY);
+                    let status = PhoneStatus {
+                        state: crate::proto::PhoneState::WaitingForPairing,
+                        bot: Some(bot),
+                        owner: None,
+                    };
+                    // **修复 7（最终整分支 review）。** 必须先写状态槽，
+                    // 再起新的 bridge——`replace()` 起的轮询线程立刻开始
+                    // 跑，一次跑得很快的失败（网络瞬时不通、令牌被撤销）
+                    // 可能在极短时间内就把状态改判成 `Broken`。这行如果
+                    // 排在 `replace()` 之后，这次「验证通过」的乐观结果
+                    // 会原样覆盖那个更新、更真实的 `Broken`，界面短暂地
+                    // 撒谎说「等配对」。反过来，先写后起不会丢真相：
+                    // bridge 线程判 `Broken` 时自己会再写一次这个槽，
+                    // 谁写得晚谁说了算，不存在覆盖窗口。
+                    *recover(phone.lock()) = status.clone();
                     // 令牌验证过、也落盘了——现在真的开始听：不起这个线程，
                     // 用户填完令牌之后就是对着「等配对」发呆，永远等不到
                     // bridge 去认那第一条消息。`owner` 传 `None`：这次填的
@@ -530,19 +577,26 @@ fn handle(
                         mgr.journal.path(),
                         mgr.backend(),
                     );
-                    PhoneStatus {
-                        state: crate::proto::PhoneState::WaitingForPairing,
-                        bot: Some(bot),
-                        owner: None,
-                    }
+                    // **修复 1（最终整分支 review）。** 用户可能是第一次
+                    // 从 `Off` 填令牌——守护进程启动时只在密钥仓里已经有
+                    // 令牌的那条路径上装过 `set_event_sink`（见
+                    // `run_with_manager`），这次是从零开始配的人必须在
+                    // 这里补上，否则 `should_notify` 的第三道门永远判假，
+                    // 手机通知装了跟没装一样。重新填一遍令牌（`Bridge`
+                    // 已经在跑）的情况下这行是幂等的空操作。
+                    mgr.set_event_sink(event_tx.clone());
+                    status
                 }
-                Err(e) => PhoneStatus {
-                    state: crate::proto::PhoneState::Broken(phone_set_token_failure_message(e)),
-                    bot: None,
-                    owner: None,
-                },
+                Err(e) => {
+                    let status = PhoneStatus {
+                        state: crate::proto::PhoneState::Broken(phone_set_token_failure_message(e)),
+                        bot: None,
+                        owner: None,
+                    };
+                    *recover(phone.lock()) = status.clone();
+                    status
+                }
             };
-            *recover(phone.lock()) = status.clone();
             Ok(Response::Phone(status))
         }
         // 换一台手机：令牌还在，只是把「谁是主人」忘掉，退回等配对。
@@ -575,6 +629,13 @@ fn handle(
             }
             let _ = recover(secrets.lock()).remove(PHONE_OWNER_KEY);
             crate::bridge::stop_current(bridge);
+            // **修复 1（最终整分支 review）。** 跟 `set_event_sink` 配对的
+            // 反操作：手机通知真的关掉了，`should_notify` 的第三道门也该
+            // 跟着退回判假，不然这个功能只是表面上关了——`tick()` 还在
+            // 为每个会话截屏、往一条现在没有任何消费者会理睬的队列里投
+            // 事件，纯属浪费，也让这句「没配手机通知，试都不用试」的
+            // 文档承诺继续对不上。
+            mgr.clear_event_sink();
             let status = PhoneStatus {
                 state: crate::proto::PhoneState::Off,
                 bot: None,
@@ -630,6 +691,13 @@ mod tests {
     /// 同上——大多数测试不关心手机通知，`bridge` 槽给个空的就行。
     fn test_bridge() -> Arc<Mutex<Option<crate::bridge::BridgeHandle>>> {
         Arc::new(Mutex::new(None))
+    }
+
+    /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
+    /// 要能重新调用 `set_event_sink`）——大多数测试不关心手机通知，给一个
+    /// 没人接收的 channel 就够了，`send()` 本身不会因为没有接收端而失败。
+    fn test_event_tx() -> std::sync::mpsc::Sender<Event> {
+        std::sync::mpsc::channel().0
     }
 
     /// 一个不碰网络、光靠自己字段回答问题的假渠道——测试"重启到底认不
@@ -730,6 +798,7 @@ mod tests {
             profiles_dir.path(),
             &test_phone(),
             &test_bridge(),
+            &test_event_tx(),
         );
 
         match resp {
@@ -786,6 +855,7 @@ mod tests {
             profiles_dir.path(),
             &test_phone(),
             &test_bridge(),
+            &test_event_tx(),
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -851,6 +921,7 @@ mod tests {
                 &profiles_dir_path,
                 &test_phone(),
                 &test_bridge(),
+                &test_event_tx(),
             );
             (t.elapsed(), resp)
         });
@@ -952,6 +1023,7 @@ mod tests {
                 profiles_dir.path(),
                 &test_phone(),
                 &test_bridge(),
+                &test_event_tx(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -983,6 +1055,7 @@ mod tests {
             profiles_dir.path(),
             &test_phone(),
             &test_bridge(),
+            &test_event_tx(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -1067,6 +1140,7 @@ mod tests {
             &profiles_dir,
             &test_phone(),
             &test_bridge(),
+            &test_event_tx(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1124,6 +1198,7 @@ mod tests {
             profiles_dir.path(),
             &phone,
             &test_bridge(),
+            &test_event_tx(),
         );
 
         match resp {
@@ -1175,6 +1250,7 @@ mod tests {
             profiles_dir.path(),
             &phone,
             &bridge,
+            &test_event_tx(),
         );
 
         match resp {
@@ -1243,6 +1319,7 @@ mod tests {
             profiles_dir.path(),
             &phone,
             &bridge,
+            &test_event_tx(),
         );
 
         match resp {

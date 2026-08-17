@@ -112,7 +112,12 @@ fn classify(
 ///   **每开一个会话手机就响一次**。跟 `tick()` 里起名字用的是同一个
 ///   判据、同一个理由，见那边的长注释。
 /// - `has_channel`：没配手机通知（`SessionManager::set_event_sink` 没被
-///   调过）就没有地方可推，试都不用试。
+///   调过，或者被 `clear_event_sink` 收回过）就没有地方可推，试都不用试。
+///   **修复 1（最终整分支 review）之前这道门是摆设**：`daemon.rs` 不管
+///   有没有配过手机通知都会调用 `set_event_sink`，这里传进来的
+///   `has_channel` 因此对谁都恒真。现在 `set_event_sink` 只在启动时密钥
+///   仓已有令牌、或者 `PhoneSetToken` 成功时才被调用，`PhoneDisable` 会
+///   调 `clear_event_sink` 收回——这道门从这次修复起才是真的在把关。
 pub fn should_notify(is_agent: bool, first_input_empty: bool, has_channel: bool) -> bool {
     is_agent && !first_input_empty && has_channel
 }
@@ -515,8 +520,15 @@ pub struct SessionManager {
     /// `tick()` 绝不能因为投递这件事阻塞，一个 `mpsc::Sender` 的
     /// `send()` 本来就不会阻塞（它只会让底层队列变长），有界的那一半
     /// 由 `bridge.rs` 在消费端做，见那边的 `QUEUE_CAP`。`None` = 没配
-    /// 手机通知（`set_event_sink` 没被调过），这时候 `should_notify` 的
+    /// 手机通知——`set_event_sink` 从没被调过，或者被 `clear_event_sink`
+    /// 收回过（`Request::PhoneDisable`）——这时候 `should_notify` 的
     /// 第三道门（`has_channel`）直接判假，tick() 连 `send()` 都不会试。
+    /// **修复 1（最终整分支 review）之前，`daemon.rs` 无条件调用
+    /// `set_event_sink`，这个字段实际上永远是 `Some`**，`has_channel`
+    /// 因此对所有人都恒真——不是数据泄露（消费端在 `bridge` 槽是 `None`
+    /// 时会把事件悄悄丢掉），但这段文档曾经描述的是一个从没被满足过的
+    /// 承诺。现在装/收都跟着「手机通知这个功能是不是真的配置过」走，
+    /// 见 `set_event_sink`/`clear_event_sink` 各自的调用点。
     event_tx: Mutex<Option<mpsc::Sender<Event>>>,
     /// `Session::last_notified` 记的时刻的起点。用相对时长而不是挂钟
     /// 时间是为了配合 `channel::debounce`（`Instant` 造不出「10 秒前」，
@@ -552,12 +564,23 @@ impl SessionManager {
         }
     }
 
-    /// 接上手机通知队列的入口。`daemon.rs` 在配好 `Bridge` 之后调用一次；
+    /// 接上手机通知队列的入口。**只在手机通知这个功能真的被配置过时才该
+    /// 调用**（最终整分支 review 的修复 1）——`daemon.rs::run_with_manager`
+    /// 只在启动时密钥仓里已经有令牌的那条路径上调它一次，`PhoneSetToken`
+    /// 成功时重新调一次（用户第一次从 `Off` 填令牌走的正是这条路径）。
     /// 测试直接建一对 `mpsc::channel()` 传进来，不用起真的 bridge。
     /// 不调用这个方法的话，`should_notify` 的第三道门永远判假——没配
     /// 手机通知的人，`tick()` 不会试着往哪里发任何东西。
     pub fn set_event_sink(&self, tx: mpsc::Sender<Event>) {
         *recover(self.event_tx.lock()) = Some(tx);
+    }
+
+    /// `set_event_sink` 的反操作，`Request::PhoneDisable` 落地的地方。
+    /// 手机通知关掉之后，`should_notify` 的第三道门也该跟着退回判假——
+    /// 不这样做的话，`tick()` 会继续为每个会话截屏、往一条已经没有任何
+    /// 消费者会理睬的队列里投事件，功能表面上关了，代价却一分没少。
+    pub fn clear_event_sink(&self) {
+        *recover(self.event_tx.lock()) = None;
     }
 
     /// 装上（或摘掉）出错解释要用的后端。守护进程启动时 resolve 一次调用，

@@ -279,6 +279,7 @@ mod tests {
             }),
             can_remove: true,
             can_switch_project: true,
+            phone_editing: false,
         }
     }
 
@@ -434,6 +435,7 @@ mod tests {
                     selected: None,
                     can_remove: false,
                     can_switch_project: false,
+                    phone_editing: false,
                 },
             ] {
                 let en: Vec<String> = groups(&from, ctx, Lang::En)

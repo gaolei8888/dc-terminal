@@ -972,6 +972,10 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
         // 跟 `jump_project` 逐条对上：0 个组直接 return，1 个组
         // `rem_euclid(1)` 恒为 0（原地不动）。两种都不该写这个键。
         can_switch_project: app.groups.len() > 1,
+        // 修复 6：只有手机页会用到这个字段（`idle_help` 的 `View::Phone`
+        // 分支），但算它不需要知道自己是不是在手机页上——`phone_buf` 只在
+        // 那一页会被置成 `Some`，其它任何视图下这里恒为 `false`。
+        phone_editing: app.phone_buf.is_some(),
     }
 }
 

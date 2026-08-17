@@ -1004,6 +1004,13 @@ pub(crate) struct HelpCtx {
     /// 而「只有一个项目」正是第一次用 dct 时的默认状态——那一屏上写着
     /// `Tab 换项目`，按下去毫无反应，用户学到的第一件事就是底栏会骗人。
     pub can_switch_project: bool,
+    /// 手机页的令牌输入框是不是开着（`App::phone_buf.is_some()`）——
+    /// **最终整分支 review 的修复 6。** 这时候整页的物理键含义都变了：
+    /// `Enter` 提交这一行输入，`x` 只是往输入框里敲一个字母 `x`，`Esc`
+    /// 才是取消。`View::Phone` 本身不带这个临时态（见它的文档注释：
+    /// `phone_buf` 因为要跟 `Receiver` 共存而只能待在 `App` 上），所以
+    /// 这里单独收一个 `bool` 进来，而不是把整个 `App` 拽进签名。
+    pub phone_editing: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1248,6 +1255,21 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 只会报错的键，比不写更糟。
         View::Phone { status } => {
             use crate::proto::PhoneState;
+            // **修复 6。** 令牌输入框开着的时候别再画 `status` 派生的那几个
+            // 键——`Enter 填令牌`/`x 关掉` 在这个状态下是假的：`Enter` 会把
+            // 这行提交成新令牌，`x` 只是敲进输入框的一个字母，真正能取消的
+            // 是 `Esc`。继续画旧的那三个键，就是「底栏说什么就得真能做到
+            // 什么」在这一页被破坏的样子。
+            if ctx.phone_editing {
+                return help_items(
+                    &[
+                        ("", Key::PasteOrTypeKey),
+                        ("Enter", Key::Confirm),
+                        ("Esc", Key::Cancel),
+                    ],
+                    lang,
+                );
+            }
             let mut items: Vec<(&'static str, Key)> = Vec::new();
             match status.state {
                 PhoneState::Off | PhoneState::Broken(_) => {
@@ -1303,6 +1325,7 @@ mod tests {
             }),
             can_remove: false,
             can_switch_project: true,
+            phone_editing: false,
         }
     }
 
@@ -1312,6 +1335,7 @@ mod tests {
             selected: None,
             can_remove: false,
             can_switch_project: true,
+            phone_editing: false,
         }
     }
 
@@ -1325,6 +1349,7 @@ mod tests {
             selected: None,
             can_remove: true,
             can_switch_project: true,
+            phone_editing: false,
         }
     }
 
@@ -1494,6 +1519,48 @@ mod tests {
             !help_when(&View::Board, Lang::Zh, on_a_session()).contains("x 移除"),
             "还有会话的组拿不掉，不该写"
         );
+    }
+
+    /// **修复 6 的回归测试。** 手机页令牌输入框开着的时候，`status` 派生
+    /// 的那几个键（`Enter 填令牌`/`x 关掉`/`r 重新配对`）在这个状态下全是
+    /// 假的：`Enter` 提交输入、`x` 只是敲进输入框的一个字母。底栏这时候
+    /// 该说的是编辑态自己的那三个键，一个旧键都不该混进来。
+    #[test]
+    fn the_phone_bar_shows_editing_keys_while_the_token_field_is_open() {
+        use crate::proto::{PhoneState, PhoneStatus};
+        let editing = HelpCtx {
+            phone_editing: true,
+            ..on_a_header()
+        };
+        for state in [
+            PhoneState::Off,
+            PhoneState::WaitingForPairing,
+            PhoneState::Paired,
+            PhoneState::Broken("坏了".into()),
+        ] {
+            let view = View::Phone {
+                status: PhoneStatus {
+                    state,
+                    bot: None,
+                    owner: None,
+                },
+            };
+            let help = help_when(&view, Lang::Zh, editing);
+            assert!(
+                help.contains("Enter") && help.contains("确认"),
+                "编辑态该有 Enter 确认：{help}"
+            );
+            assert!(
+                help.contains("Esc") && help.contains("取消"),
+                "编辑态该有 Esc 取消：{help}"
+            );
+            for stale in ["填令牌", "关掉", "重新配对"] {
+                assert!(
+                    !help.contains(stale),
+                    "输入框开着的时候不该再画「{stale}」这个旧键：{help}"
+                );
+            }
+        }
     }
 
     /// `Tab` 和 `x` 现在两个视图都绑着，所以两边的按键表也得都写——键和表

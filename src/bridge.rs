@@ -657,7 +657,13 @@ impl Bridge {
     /// 消费队列这一半：把一条 `session.rs::tick()` 产的事件收进来。
     /// **满了丢最旧的一条**（`QUEUE_CAP`，Ruling 4）——不是拒收新的，
     /// 新的事件永远进得来，代价是队首那条最老的被挤掉。
-    pub fn enqueue(&self, e: Event) {
+    ///
+    /// **不对外公开**（最终整分支 review 的修复 2）：模块外没有任何合法调用者
+    /// ——唯一的生产入口是本模块内的 `spawn_event_consumer`。留着 `pub` 只是给
+    /// 「绕开 `accept()` 直接建 `Bridge` 再往里塞」这条路径开了一扇不该开的门,
+    /// 而 `dispatch` 里那个刻意留空的 `Rejected => {}` 存在的全部意义就是不让
+    /// 这条路径存在——把可见性收紧到跟事实相符,让编译器帮忙守住这条边界。
+    fn enqueue(&self, e: Event) {
         let mut q = recover(self.outbound.lock());
         if q.len() >= QUEUE_CAP {
             q.pop_front();
@@ -793,12 +799,30 @@ impl Bridge {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// 忘掉主人，重新打开配对。**`PhoneUnpair` 唯一要做的事**——不重启
-    /// 线程、不碰 Telegram 的 offset，下一条到达的消息（不管是谁发的）
-    /// 立刻重新触发 `accept()` 的 `None` 分支。密钥仓里持久化的那份由
-    /// 调用方（`daemon.rs`）另外清掉，这里只管内存里这一份。
+    /// 忘掉主人，重新打开配对，**并且清空旧手机留下的全部路由状态**
+    /// （最终整分支 review 的修复 4）。`PhoneUnpair` 唯一要做的事——不
+    /// 重启线程、不碰 Telegram 的 offset，下一条到达的消息（不管是谁
+    /// 发的）立刻重新触发 `accept()` 的 `None` 分支。密钥仓里持久化的
+    /// 那份由调用方（`daemon.rs`）另外清掉，这里只管内存里这一份。
+    ///
+    /// **不能只清 `owner`。** 以前这里就是这么做的：`used`（`/use`
+    /// 选中的会话）、`replied_since_use`、`outbound_map`、
+    /// `ambiguous_pushes`、`pending_options` 全都原样留着。新配对的
+    /// 手机因此会直接继承上一台手机的 `/use` 目标——它发的第一条大白话
+    /// 消息按 `route()` 规则 2 直接敲进旧目标，而不是老实地问一句"回给
+    /// 哪个"。这正是"手机丢了，配一台新的"这条路径，也是猜错代价最大
+    /// 的场景：新主人这次发的可能是完全不相干的一句话，却被当成回复
+    /// 敲进了别的会话。`pending_options` 也不能留：那是"上一次推送猜出
+    /// 的选项"，跟旧手机的会话身份绑在一起，留给新手机同样是拿旧问题
+    /// 解读新回复。`outbound`（还没发出去的推送队列）不在这份清单里——
+    /// 那些通知不属于任何一台手机，应该原样送给新配对的那台。
     pub fn clear_owner(&self) {
         *recover(self.owner.lock()) = None;
+        *recover(self.used.lock()) = None;
+        *recover(self.replied_since_use.lock()) = false;
+        recover(self.outbound_map.lock()).clear();
+        recover(self.ambiguous_pushes.lock()).clear();
+        recover(self.pending_options.lock()).clear();
     }
 
     /// `route()` 已经决定了该往哪儿去，这里是把决定真的落地。**`To` 敲，
@@ -807,7 +831,13 @@ impl Bridge {
     /// 的全部意义就是"这次不该猜"，回一句人话、绝不动 PTY 才是它们唯一
     /// 正确的做法。**全部记 journal**——手机来的这条消息最终去了哪儿，
     /// 跟会话自己怎么没的一样，得留得下痕迹。
-    pub fn deliver(&self, route: Route, text: &str) -> Delivered {
+    ///
+    /// **不对外公开**（最终整分支 review 的修复 2）：`route()`/`dispatch()`
+    /// 已经把「先过 `accept()` 的安检」这件事焊死在唯一的调用路径上；把
+    /// `deliver` 留成 `pub` 等于允许模块外的代码拿着一个真 writer 直接调
+    /// `deliver(Route::To(id), text)`，跳过安检去敲用户的会话——`Rejected
+    /// => {}` 那个刻意留空的分支是这道安检唯一的实现,可见性也要护着它。
+    fn deliver(&self, route: Route, text: &str) -> Delivered {
         match route {
             Route::To(id) => self.deliver_to(id, text),
             Route::Ask(ids) => {
@@ -1145,7 +1175,15 @@ impl Bridge {
         drop(slot);
 
         match fresh_options {
-            Some((_, opts)) => format!("{base}\n{}", render_numbered(&opts)),
+            // **最终整分支 review 的修复 3。** 光甩一串 `1. …\n2. …` 没有
+            // 任何提示——收信人从没写过程序，也看不见终端，光看这份列表
+            // 猜不出「回个数字」是个选项；而 `map_answer_index` 那整条
+            // 路径存在的意义就是也认自己的大白话，可从没有一处广播过这
+            // 件事。补一句人话交代两种都行，别让免打字这条路白修。
+            Some((_, opts)) => format!(
+                "{base}\n{}\n\n回数字就行，或者直接说说你自己的想法也可以",
+                render_numbered(&opts)
+            ),
             None => base,
         }
     }
@@ -1506,9 +1544,13 @@ impl BridgeHandle {
         self.bridge.clear_owner();
     }
 
-    /// 转发给内部的 `accept()`——Task 7 往会话里敲字之前要先问这一句，
-    /// 现在先给测试用来验证 `unpair()` 真的改到了内部状态。
-    pub fn accept(&self, msg: &Incoming) -> Accepted {
+    /// 转发给内部的 `accept()`——只给测试用，验证 `unpair()`/`replace()`
+    /// 之后内部状态真的变了。生产路径唯一的调用者是本模块内的
+    /// `dispatch()`，直接摸 `Bridge::accept`，不经过这层转发；对外暴露
+    /// 这条捷径只会多一条绕开 `dispatch` 那道安检去问 `accept()` 的路
+    /// （最终整分支 review 的修复 2），`#[cfg(test)]` 收紧到测试构建。
+    #[cfg(test)]
+    pub(crate) fn accept(&self, msg: &Incoming) -> Accepted {
         self.bridge.accept(msg)
     }
 }
@@ -2480,6 +2522,34 @@ mod tests {
             handle.accept(&msg(222, "新手机先发")),
             Accepted::Paired(222),
             "unpair 之后配对要重新打开，不能永远焊死在老主人身上"
+        );
+    }
+
+    /// **最终整分支 review 修复 4 的回归测试。** `PhoneUnpair`（落地为
+    /// `clear_owner()`）以前只忘掉 `owner`，`used`（`/use` 选中的目标）
+    /// 原样留着——新配对的手机会直接继承旧手机的 `/use` 目标，它发的第一
+    /// 条不带回复的大白话会被悄悄敲进旧目标，而不是老实地按"唯一在等"
+    /// 这条规则走。这正是"手机丢了，配一台新的"这条路径，猜错代价最大。
+    #[test]
+    fn unpairing_does_not_leave_the_old_use_target_for_the_next_phone() {
+        // `for_test_with_writer` 自带一个已经配好对的老主人（999），正好
+        // 省去再走一次 `accept()` 配对流程。
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9]);
+        // 老主人选中了一个跟"唯一在等"完全不同的会话。
+        b.dispatch(&msg(999, "/use 3"));
+
+        b.clear_owner(); // PhoneUnpair 的落地
+        assert_eq!(b.accept(&msg(222, "新手机")), Accepted::Paired(222));
+
+        // 新手机发一条不带回复的大白话——旧手机的 /use 3 不该还在生效，
+        // 该退回"唯一在等"这条规则，敲进 9 号，而不是悄悄敲进 3 号。
+        b.dispatch(&msg(222, "继续"));
+        assert_eq!(
+            spy.written(),
+            vec![(9, "继续".to_string())],
+            "新手机不该继承旧手机的 /use 目标：{:?}",
+            spy.written()
         );
     }
 
@@ -3828,6 +3898,12 @@ mod tests {
         assert!(
             spy.last_reply().contains("1. 先跑完") && spy.last_reply().contains("2. 现在改"),
             "推送该带上模型猜出的编号选项：{}",
+            spy.last_reply()
+        );
+        // 修复 3：光有编号列表不够——收信人得知道自己也能不照抄编号回复。
+        assert!(
+            spy.last_reply().contains("回数字") && spy.last_reply().contains("自己的想法"),
+            "选项列表旁边该有一句提示：数字或大白话都能回：{}",
             spy.last_reply()
         );
 
