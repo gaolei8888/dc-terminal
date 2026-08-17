@@ -30,6 +30,14 @@ pub struct SecretStore {
 /// agent 冒出来——改那里的人请回来看这一句。
 pub const PHONE_TOKEN_KEY: &str = "__phone__";
 
+/// 配对完成之后的主人 chat id，跟令牌一样存在密钥仓里。**这是 C1 的修复
+/// 的一半**：以前"谁是主人"只活在内存里的 `Bridge::owner`，daemon 一
+/// 重启就忘光，又从头允许任何人配对——而 bot 用户名是公开可搜的，攻击者
+/// 只要趁 dct 关着抢先发一条消息，重启后 Telegram 积压里他的消息排第一
+/// 个，就会被判成主人。持久化这个值、重启时读回来交给 `Bridge::new`，
+/// 配对就只在真正第一次填令牌之后发生一次，不会随重启反复重开。
+pub const PHONE_OWNER_KEY: &str = "__phone_owner__";
+
 /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
 pub fn secrets_path_for_socket(socket: &Path) -> PathBuf {
     match socket.parent() {

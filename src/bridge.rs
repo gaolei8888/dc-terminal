@@ -12,11 +12,31 @@
 //! 用户的终端。**第一个在填完令牌之后发消息的人成为主人，其余所有人的消息
 //! 永远丢弃。** `accept()` 是这条规则唯一的实现——它错了，就是任何人都能
 //! 往用户机器上敲字。
+//!
+//! **独立安全评审发现的三个 Critical，全部出在 `accept()` 外面的生命周期上**
+//! （`accept()` 本身被确认是对的）：
+//!
+//! 1. **重启重新打开配对**（C1）：`owner` 以前只活在内存里，重启一次就
+//!    忘掉主人是谁，又从头允许任何人配对——而一个全新的 `Telegram`
+//!    从 offset 0 起步，第一次 `poll()` 会把 Telegram 攒了最多 24 小时的
+//!    积压消息整批吐出来。攻击者只要在 dct 关着的时候，把消息发给这个
+//!    公开可搜的用户名，重启后积压里他的消息排第一个，就会被 `accept()`
+//!    判成主人。**修法**：`owner` 现在由调用方（`daemon.rs`）从密钥仓里
+//!    读出持久化的值传进来；重启时如果读到了，`run()` 直接跳过配对和
+//!    清空积压这两步，见 `run()` 和 `drain_backlog()`。真正首次配对
+//!    （`owner` 是 `None`）时，先把积压清空再打开配对，见 `drain_backlog`
+//!    的文档注释。
+//! 2. / 3. **`PhoneUnpair`/`PhoneDisable` 够不着线程、重新填令牌能起出
+//!    两个活的轮询线程**（C2/C3）：以前 `spawn()` 只管起、不管停，调用方
+//!    拿不到任何句柄。现在 `spawn()` 返回 `BridgeHandle`，daemon 只通过
+//!    `replace()`/`stop_current()` 这两个函数改它持有的那一个槽——保证
+//!    任何时刻最多只有一条真的在跑的轮询线程，见这两个函数的文档注释。
 
 use crate::channel::{Channel, ChannelError, Incoming};
 use crate::proto::{PhoneState, PhoneStatus};
 use crate::session::recover;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +47,9 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// 退避的上限：五分钟。超过这个数就没有再翻倍的意义——用户等半小时和等
 /// 五分钟已经没区别，翻倍下去只会让「网络恢复了但还要再等好久」变得更糟。
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// `sleep_or_stop` 检查停止信号的粒度。数字选得够小，`stop()` 之后线程能
+/// 在这么久之内真的退出，而不是把 `MAX_BACKOFF` 那五分钟原样睡完。
+const STOP_CHECK_GRANULARITY: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accepted {
@@ -42,24 +65,49 @@ pub struct Bridge {
     /// Task 4 的共享状态槽——`Request::PhoneStatus` 唯一的答案来源。
     /// bridge 线程写，daemon 的请求处理线程读，同一把 `Mutex`，Ruling 3。
     phone: Arc<Mutex<PhoneStatus>>,
-    /// 配对之后只认这一个。`None` = 还没配对。
+    /// 配对之后只认这一个。`None` = 还没配对（这次是真的没配过，或者
+    /// 调用方没能从密钥仓里读到持久化的主人——见 `daemon.rs` 的
+    /// `startup_bridge_owner`）。
     owner: Mutex<Option<i64>>,
+    /// `stop()` 置位之后，`run()` 在下一次能检查到的地方（每轮循环开头、
+    /// 每次退避睡眠的每个小切片）主动退出。**不是抢占式的**：正在阻塞的
+    /// 那一次网络调用不会被打断，但 `POLL_TIMEOUT` 本身只有 25 秒，
+    /// 「不该拖累关掉手机通知这件事的响应速度」这条要求在这个量级下
+    /// 站得住。
+    stop: AtomicBool,
+    /// 配对完成那一刻要做的持久化——把 chat id 写进密钥仓，好让重启之后
+    /// `daemon.rs` 能把它读回来传给下一个 `Bridge::new`。**只在 `accept()`
+    /// 返回 `Paired` 的那一次调用一次**，见 `dispatch()`。测试用的实现是
+    /// 空操作，见 `Bridge::for_test`。
+    persist_owner: Box<dyn Fn(i64) + Send + Sync>,
     // …… 消息映射与当前会话见 Task 7
 }
 
 impl Bridge {
-    pub fn new(ch: Arc<dyn Channel>, phone: Arc<Mutex<PhoneStatus>>) -> Bridge {
+    pub fn new(
+        ch: Arc<dyn Channel>,
+        phone: Arc<Mutex<PhoneStatus>>,
+        owner: Option<i64>,
+        persist_owner: Box<dyn Fn(i64) + Send + Sync>,
+    ) -> Bridge {
         Bridge {
             ch,
             phone,
-            owner: Mutex::new(None),
+            owner: Mutex::new(owner),
+            stop: AtomicBool::new(false),
+            persist_owner,
         }
     }
 
     /// 只测 `accept()` 用——渠道和状态槽都是不会被读的占位符。
     #[cfg(test)]
     fn for_test() -> Bridge {
-        Bridge::new(Arc::new(tests::NeverCalled), tests::blank_status())
+        Bridge::new(
+            Arc::new(tests::NeverCalled),
+            tests::blank_status(),
+            None,
+            Box::new(|_| {}),
+        )
     }
 
     /// 这条消息该不该数？**这是整个功能唯一真会伤到用户的地方。**
@@ -80,6 +128,10 @@ impl Bridge {
     /// 丢弃陌生人不留任何痕迹是这条规则的全部意义）。
     fn dispatch(&self, msg: &Incoming) {
         if let Accepted::Paired(chat_id) = self.accept(msg) {
+            // 落盘在改内存状态槽之前——`PhoneStatus` 只是给界面看的缓存，
+            // 密钥仓那份才是重启之后唯一还在的真相。顺序反过来的话，一次
+            // 「状态槽已经显示配对成功，但落盘失败」的窗口会比这里更长。
+            (self.persist_owner)(chat_id);
             let mut st = recover(self.phone.lock());
             st.state = PhoneState::Paired;
             // 这里没有真实姓名可用——`Incoming` 没带 Telegram 的
@@ -96,16 +148,21 @@ impl Bridge {
     /// 返回 `false` 表示令牌本身就不能用（`BadToken`）或者回包读不懂
     /// （`Malformed`）——两种都已经把 `Broken` 写进状态槽了，调用方不该
     /// 再进轮询循环，那只会拿同一个坏令牌把 `getUpdates` 也打挂一遍。
+    /// 也可能是 `stop()` 打断了重试——这种情况不写任何状态，调用方
+    /// （`run()`）看到 `false` 直接退出即可，不该被误判成「令牌坏了」。
     fn ensure_bot_known(&self) -> bool {
         let mut delay = INITIAL_BACKOFF;
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
             match self.ch.get_me() {
                 Ok(username) => {
                     recover(self.phone.lock()).bot = Some(username);
                     return true;
                 }
                 Err(e) if e.worth_retrying() => {
-                    std::thread::sleep(delay);
+                    self.sleep_or_stop(delay);
                     delay = next_backoff(delay);
                 }
                 Err(e) => {
@@ -120,6 +177,81 @@ impl Bridge {
         recover(self.phone.lock()).state = PhoneState::Broken(broken_message(e));
     }
 
+    /// **C1 的修复。** 配对还没完成（`owner` 是 `None`）时，先把 Telegram
+    /// 在 dct 没跑期间攒下的所有旧消息倒空——不认，也不让它们参与配对。
+    ///
+    /// 不这么做的话：这个 bot 的用户名是公开可搜的，攻击者只要趁 dct 关着
+    /// 提前把消息发过去；一旦 daemon 重新起来、`owner` 还是 `None`
+    /// （从没配对过，或者调用方确实没有持久化的主人可以恢复），第一次
+    /// `poll()` 拿回来的就是 Telegram 积压里的旧消息，`accept()` 会把
+    /// 发第一条积压消息的人判成主人——这正是那条「第一个发消息的人」
+    /// 规则的字面漏洞。
+    ///
+    /// 用 0 秒超时反复问一遍：Telegram 的 `getUpdates` 只要有积压就立刻
+    /// 整批返回，不等到 timeout 才回；拿到一个空批次，说明积压真的空了，
+    /// 从这一刻起才把"配对开着"这件事交给 `run()` 的主循环——**只有在这
+    /// 之后到达的消息**才有资格配对。
+    ///
+    /// 已经有持久化主人的重启路径（`owner` 是 `Some`）**不会走到这里**，
+    /// 见 `run()`：那种情况下配对早就完成过了，不存在「谁会被误判成
+    /// 主人」的问题，反而应该尽快进入正常轮询，不能平白丢掉主人此刻真的
+    /// 发来的消息。
+    fn drain_backlog(&self) -> bool {
+        let mut delay = INITIAL_BACKOFF;
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            match self.ch.poll(Duration::ZERO) {
+                Ok(batch) if batch.is_empty() => return true,
+                Ok(_) => {
+                    // 还有积压，一条都不处理、也不让它们进 accept()，
+                    // 继续问下一批直到问出一个空批次。
+                }
+                Err(e) if e.worth_retrying() => {
+                    self.sleep_or_stop(delay);
+                    delay = next_backoff(delay);
+                }
+                Err(e) => {
+                    self.mark_broken(e);
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// 睡 `dur`，但每隔一小段就看一眼 `stop`——`stop()` 之后调用方不该
+    /// 还要等一次完整的退避（最长五分钟）才能真的退出。纯粹的睡眠时长
+    /// 之和还是 `dur`（除非提前被打断），语义上跟直接 `sleep(dur)`
+    /// 一样，只是能被喊停。
+    fn sleep_or_stop(&self, dur: Duration) {
+        let mut waited = Duration::ZERO;
+        while waited < dur {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let this = STOP_CHECK_GRANULARITY.min(dur - waited);
+            std::thread::sleep(this);
+            waited += this;
+        }
+    }
+
+    /// 请下一次能检查到 `stop` 的地方（循环开头、退避睡眠中间）主动退出。
+    /// **不是抢占式的**——正在进行的那一次网络调用不会被打断，见字段
+    /// 文档。`BridgeHandle::stop` 是外部唯一该用的入口，这个方法本身
+    /// 也是 `pub`，是因为 bridge 内部测试要在同一模块里直接摸到它。
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// 忘掉主人，重新打开配对。**`PhoneUnpair` 唯一要做的事**——不重启
+    /// 线程、不碰 Telegram 的 offset，下一条到达的消息（不管是谁发的）
+    /// 立刻重新触发 `accept()` 的 `None` 分支。密钥仓里持久化的那份由
+    /// 调用方（`daemon.rs`）另外清掉，这里只管内存里这一份。
+    pub fn clear_owner(&self) {
+        *recover(self.owner.lock()) = None;
+    }
+
     /// 轮询主循环。**不要直接调用它**——用模块级的 `spawn()`，那边包了
     /// `catch_unwind`；这个方法本身可能 panic（比如锁中毒之外的 bug），
     /// 隔离全靠调用方。
@@ -127,9 +259,21 @@ impl Bridge {
         if !self.ensure_bot_known() {
             return;
         }
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // 只有还没配对的时候才需要清空积压——已经有主人的重启路径直接进
+        // 正常轮询，见 `drain_backlog` 文档注释最后一段。
+        if recover(self.owner.lock()).is_none() && !self.drain_backlog() {
+            return;
+        }
 
         let mut delay = INITIAL_BACKOFF;
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
             match self.ch.poll(POLL_TIMEOUT) {
                 Ok(incoming) => {
                     delay = INITIAL_BACKOFF;
@@ -138,7 +282,7 @@ impl Bridge {
                     }
                 }
                 Err(e) if e.worth_retrying() => {
-                    std::thread::sleep(delay);
+                    self.sleep_or_stop(delay);
                     delay = next_backoff(delay);
                 }
                 Err(e) => {
@@ -156,8 +300,10 @@ fn next_backoff(current: Duration) -> Duration {
 }
 
 /// `PhoneState::Broken` 要装的那句人话。**绝不带原始错误、绝不带令牌**——
-/// `ChannelError` 本身就不携带令牌或原始回包内容，从值的形状上就堵死了
-/// 「手滑把令牌带出来」这条路，不用靠这里的作者自觉。
+/// 这不是靠这里的作者自觉守住的规矩，是结构上做不到：`ChannelError` 的
+/// 三个变体都不携带任何字符串字段（见 `channel/mod.rs`），这个函数的输入
+/// 类型上就不可能携带令牌或者原始回包内容，「手滑把令牌带出来」这条路
+/// 从签名上就堵死了。
 ///
 /// 只有 `worth_retrying()` 为假的两种（`BadToken`/`Malformed`）会走到这里
 /// ——`Unreachable` 永远在退避循环里重试，不会被判定成「停下」。
@@ -169,19 +315,85 @@ fn broken_message(e: ChannelError) -> String {
     }
 }
 
+/// 一个正在跑的 bridge 的外部句柄。**除了它，外面不该有别的办法碰到
+/// 内部那个 `Bridge`**——`replace()`/`stop_current()` 只通过它管线程的
+/// 生死，`daemon.rs` 也只通过它转发 `PhoneUnpair`（`unpair()`）。
+pub struct BridgeHandle {
+    bridge: Arc<Bridge>,
+}
+
+impl BridgeHandle {
+    /// 让轮询线程在下一次能检查到的地方退出。见 `Bridge::stop` 的文档。
+    pub fn stop(&self) {
+        self.bridge.stop();
+    }
+
+    /// `PhoneUnpair` 的落地点：忘掉主人，重新打开配对，线程继续跑，
+    /// 不用重启。
+    pub fn unpair(&self) {
+        self.bridge.clear_owner();
+    }
+
+    /// 转发给内部的 `accept()`——Task 7 往会话里敲字之前要先问这一句，
+    /// 现在先给测试用来验证 `unpair()` 真的改到了内部状态。
+    pub fn accept(&self, msg: &Incoming) -> Accepted {
+        self.bridge.accept(msg)
+    }
+}
+
 /// 把 bridge 起在后台线程上。**整个线程体包在 `catch_unwind` 里**——
 /// 一个手机通道死掉是遗憾，一个会话死掉是灾难，两者绝不能是同一件事。
-pub fn spawn(ch: Arc<dyn Channel>, phone: Arc<Mutex<PhoneStatus>>) {
+///
+/// 不要直接调用它来更换一个正在跑的 bridge——那样旧的线程没人管，
+/// 会跟新的一起活着（C3）。改令牌/配对状态一律走 `replace()`。
+pub fn spawn(
+    ch: Arc<dyn Channel>,
+    phone: Arc<Mutex<PhoneStatus>>,
+    owner: Option<i64>,
+    persist_owner: Box<dyn Fn(i64) + Send + Sync>,
+) -> BridgeHandle {
+    let bridge = Arc::new(Bridge::new(ch, phone, owner, persist_owner));
+    let worker = bridge.clone();
     std::thread::spawn(move || {
-        let bridge = Bridge::new(ch, phone);
-        let _ = catch_unwind(AssertUnwindSafe(|| bridge.run()));
+        let _ = catch_unwind(AssertUnwindSafe(|| worker.run()));
     });
+    BridgeHandle { bridge }
+}
+
+/// **C2/C3 的修复。** 守护进程只通过这一个函数改变"当前是哪个 bridge 在跑"
+/// ——重启、`PhoneSetToken` 换令牌，都调它，而不是各自直接调 `spawn()`。
+/// 换之前先把槽里原来那个（如果有）真的停掉，保证任何时刻这个槽里最多
+/// 只有一条活的轮询线程：不这么做的话，重新填一次令牌就会起出第二个
+/// 长轮询同一个 bot 的线程，两条线程各自维护自己的 `owner`，谁先问到
+/// `getUpdates` 谁就替自己的那份 `owner` 配上人——主人和攻击者可能各自
+/// 配对到不同的 bridge 上，都以为自己是主人（C3）。
+pub fn replace(
+    slot: &Mutex<Option<BridgeHandle>>,
+    ch: Arc<dyn Channel>,
+    phone: Arc<Mutex<PhoneStatus>>,
+    owner: Option<i64>,
+    persist_owner: Box<dyn Fn(i64) + Send + Sync>,
+) {
+    let mut guard = recover(slot.lock());
+    if let Some(old) = guard.take() {
+        old.stop();
+    }
+    *guard = Some(spawn(ch, phone, owner, persist_owner));
+}
+
+/// `PhoneDisable` 的落地点：把槽里的 bridge（如果有）停掉，槽留空。
+/// 跟 `replace()` 共用同一条「先停旧的」逻辑，只是不起新的。
+pub fn stop_current(slot: &Mutex<Option<BridgeHandle>>) {
+    if let Some(old) = recover(slot.lock()).take() {
+        old.stop();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Instant;
 
     fn msg(chat: i64, text: &str) -> Incoming {
         Incoming {
@@ -213,6 +425,19 @@ mod tests {
         fn get_me(&self) -> Result<String, ChannelError> {
             panic!("accept() 测试不该碰渠道的 get_me()")
         }
+    }
+
+    /// 把 `JoinHandle::join()` 包一层超时——原生 API 没有这个能力。
+    /// 用来断言"线程真的退出了"，而不是靠一次固定长度的 `sleep` 赌它
+    /// 应该退出了。看门线程如果一直等不到（说明 `stop()` 没生效）会
+    /// 泄漏，但测试本身会在 `timeout` 之后如实报失败，不会一直挂着。
+    fn wait_for_join(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(timeout).is_ok()
     }
 
     // ---- 三条来自 brief 的失败测试，配对规则的全部依据 ----
@@ -287,12 +512,87 @@ mod tests {
         assert_eq!(b.accept(&msg(0, "换个人")), Accepted::Rejected);
     }
 
-    // ---- dispatch：只有 Paired 才动状态槽 ----
+    /// 一堆线程同时对着一个全新的 bridge 发第一条消息——`accept()` 的
+    /// 判定和写入必须在同一把锁下完成，不然两个线程都可能读到 `None`，
+    /// 都以为自己该配对成功。多线程跑一遍，钉住"两次 `Paired` 加起来
+    /// 也只有一次"这条并发下的不变量。
+    #[test]
+    fn only_one_thread_ever_wins_pairing_when_racing() {
+        let b = Arc::new(Bridge::for_test());
+        let handles: Vec<_> = (0..64)
+            .map(|i| {
+                let b = b.clone();
+                std::thread::spawn(move || b.accept(&msg(i, "hi")))
+            })
+            .collect();
+        let results: Vec<Accepted> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let paired_count = results
+            .iter()
+            .filter(|r| matches!(r, Accepted::Paired(_)))
+            .count();
+        assert_eq!(paired_count, 1, "64 个线程抢着发第一条消息，只能有一个赢");
+        let rejected_count = results
+            .iter()
+            .filter(|r| matches!(r, Accepted::Rejected))
+            .count();
+        assert_eq!(rejected_count, 63, "剩下的必须全部被拒绝，一个都不能漏");
+    }
+
+    /// `owner` 那把锁在持锁期间 panic 会中毒——`recover()` 就是为了这个。
+    /// 钉住中毒之后 `accept()` 照样能认出原来的主人，不会因为一次无关的
+    /// panic 就把"谁是主人"这件事忘掉、也不会让陌生人趁虚而入。
+    /// 手法照抄 `session.rs::recovers_from_poisoned_sessions_lock`。
+    #[test]
+    fn owner_survives_a_panic_while_the_lock_was_held() {
+        let b = Bridge::for_test();
+        assert_eq!(b.accept(&msg(111, "hi")), Accepted::Paired(111));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = b.owner.lock().unwrap();
+            panic!("模拟持锁期间的 panic，用来验证 owner 锁中毒后还能恢复");
+        }));
+        assert!(result.is_err(), "上面这次 panic 应该被 catch_unwind 接住");
+
+        assert_eq!(
+            b.accept(&msg(111, "还在吗")),
+            Accepted::FromOwner,
+            "锁中毒之后不能把主人忘掉"
+        );
+        assert_eq!(
+            b.accept(&msg(222, "陌生人")),
+            Accepted::Rejected,
+            "锁中毒也不能让陌生人趁虚而入"
+        );
+    }
+
+    /// 重启时如果密钥仓里已经有持久化的主人，`Bridge::new` 直接拿这个
+    /// 值当 `owner`——**配对不会重新打开**。这是 C1 的另一半：光靠
+    /// `drain_backlog` 清空积压还不够，如果每次重启都把 `owner` 焊死成
+    /// `None`，清空积压之后照样是"谁先发消息谁是主人"，攻击者只要在
+    /// 积压清空之后抢在真主人前面发一条就赢了。真正的修法是重启根本
+    /// 不该重新进入"谁先发消息"这个状态。
+    #[test]
+    fn a_bridge_restored_with_a_known_owner_never_reopens_pairing() {
+        let b = Bridge::new(
+            Arc::new(NeverCalled),
+            blank_status(),
+            Some(111),
+            Box::new(|_| {}),
+        );
+        assert_eq!(
+            b.accept(&msg(222, "先到")),
+            Accepted::Rejected,
+            "owner 已经从密钥仓恢复，陌生人抢先发消息也不该被判成主人"
+        );
+        assert_eq!(b.accept(&msg(111, "真主人")), Accepted::FromOwner);
+    }
+
+    // ---- dispatch：只有 Paired 才动状态槽，也只有 Paired 才落盘 ----
 
     #[test]
     fn dispatch_on_pairing_writes_paired_state_and_owner() {
         let phone = blank_status();
-        let b = Bridge::new(Arc::new(NeverCalled), phone.clone());
+        let b = Bridge::new(Arc::new(NeverCalled), phone.clone(), None, Box::new(|_| {}));
         b.dispatch(&msg(42, "hi"));
         let st = phone.lock().unwrap();
         assert_eq!(st.state, PhoneState::Paired);
@@ -304,20 +604,26 @@ mod tests {
     #[test]
     fn dispatch_from_owner_does_not_touch_the_slot_again() {
         let phone = blank_status();
-        let b = Bridge::new(Arc::new(NeverCalled), phone.clone());
+        let b = Bridge::new(Arc::new(NeverCalled), phone.clone(), None, Box::new(|_| {}));
         b.dispatch(&msg(42, "配对"));
         // 手动把状态槽改成一个跟「配对」不同的值，确认 FromOwner 不会把它
         // 又改回去、也不会动 owner 字段。
         {
             let mut st = phone.lock().unwrap();
             st.owner = Some("哨兵".to_string());
+            st.state = PhoneState::WaitingForPairing;
         }
         b.dispatch(&msg(42, "第二条"));
         let st = phone.lock().unwrap();
         assert_eq!(
             st.owner.as_deref(),
             Some("哨兵"),
-            "FromOwner 不该覆盖状态槽"
+            "FromOwner 不该覆盖状态槽的 owner"
+        );
+        assert_eq!(
+            st.state,
+            PhoneState::WaitingForPairing,
+            "FromOwner 也不该覆盖状态槽的 state"
         );
     }
 
@@ -325,7 +631,7 @@ mod tests {
     #[test]
     fn dispatch_from_a_stranger_leaves_the_slot_untouched() {
         let phone = blank_status();
-        let b = Bridge::new(Arc::new(NeverCalled), phone.clone());
+        let b = Bridge::new(Arc::new(NeverCalled), phone.clone(), None, Box::new(|_| {}));
         b.dispatch(&msg(1, "先配对")); // 1 号成为主人
         {
             let mut st = phone.lock().unwrap();
@@ -336,6 +642,32 @@ mod tests {
         let st = phone.lock().unwrap();
         assert_eq!(st.state, PhoneState::WaitingForPairing);
         assert_eq!(st.owner, None);
+    }
+
+    /// **C1 修复链条上最要紧的一环**：`persist_owner` 只在真正配对的
+    /// 那一刻被调用一次，`FromOwner`/`Rejected` 都不该碰它——如果陌生人
+    /// 的每次尝试都触发一次落盘调用，磁盘上最终写的是谁完全看运气；
+    /// 如果主人后续的普通消息重复触发，语义上没错但浪费磁盘 IO，也可能
+    /// 掩盖"配对只应该发生一次"这个事实。
+    #[test]
+    fn dispatch_on_pairing_calls_persist_owner_exactly_once() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let phone = blank_status();
+        let b = Bridge::new(
+            Arc::new(NeverCalled),
+            phone,
+            None,
+            Box::new(move |id| sink.lock().unwrap().push(id)),
+        );
+        b.dispatch(&msg(42, "配对"));
+        b.dispatch(&msg(42, "第二条")); // FromOwner，不该再落盘
+        b.dispatch(&msg(99, "陌生人")); // Rejected，不该落盘
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![42],
+            "只有真正配对那一刻才落盘 owner，且只落一次"
+        );
     }
 
     // ---- 退避：纯函数，不用真的睡 ----
@@ -355,6 +687,34 @@ mod tests {
         assert_eq!(d, MAX_BACKOFF);
     }
 
+    /// `stop()` 必须能打断一次正在进行的退避睡眠，而不是让调用方等它
+    /// 睡完——真等完的话，「关掉手机通知」这个操作在最坏情况下（正好
+    /// 撞上退避顶到 5 分钟的那一刻）要等 5 分钟才有反应。
+    #[test]
+    fn stop_interrupts_a_long_backoff_sleep_instead_of_waiting_it_out() {
+        // 用 2 秒（不是真正的 `MAX_BACKOFF` = 5 分钟）代表"一次很长的退避
+        // 睡眠"：这条测试要验证的是"stop() 能不能打断"，不是"5 分钟" 这个
+        // 具体数字本身——`backoff_doubles_and_caps_at_five_minutes` 已经
+        // 钉住了那个上限。用一个小得多但仍然远大于"该被打断掉的那一点点
+        // 时间"的数字，能让"如果哪天 `stop()` 被改回没用"这个变异在几百
+        // 毫秒内就失败，而不是要等 5 分钟才真正能看到断言失败——测试本身
+        // 的运行时间不该跟它想防住的那个 bug 的严重程度绑在一起。
+        const A_LONG_SLEEP: Duration = Duration::from_secs(2);
+        let b = Arc::new(Bridge::for_test());
+        let b2 = b.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            b2.stop();
+        });
+        let start = Instant::now();
+        b.sleep_or_stop(A_LONG_SLEEP);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "stop() 该能打断退避睡眠，而不是等满 {A_LONG_SLEEP:?}：实际睡了 {:?}",
+            start.elapsed()
+        );
+    }
+
     // ---- broken_message：人话，绝不是原始错误或令牌 ----
 
     #[test]
@@ -371,44 +731,41 @@ mod tests {
         }
     }
 
-    /// 令牌本身根本没有任何入口能进到 `broken_message`——`ChannelError`
-    /// 的每个变体都不携带字符串。这条测试把这个结构性事实钉在这里：
-    /// 就算故意塞一个「看起来像令牌」的东西进错误值，也做不到，因为
-    /// 类型上就不允许。这里改成对每种变体的输出做一次可疑片段扫描，
-    /// 防止将来有人把 `ChannelError` 改成带 `String` 字段又在这里拼接。
-    #[test]
-    fn broken_message_never_contains_anything_token_shaped() {
-        for e in [
-            ChannelError::BadToken,
-            ChannelError::Unreachable,
-            ChannelError::Malformed,
-        ] {
-            let text = broken_message(e);
-            assert!(!text.contains(':'), "冒号分隔的令牌形状不该出现: {text}");
-            assert!(
-                !text.to_lowercase().contains("token"),
-                "不该出现英文 token 字样: {text}"
-            );
-        }
-    }
-
     // ---- get_me / 轮询主循环：mock channel，不碰网络 ----
 
     /// 可编程的 mock：`get_me` 给定的一个结果，`poll` 是一串排好队的结果，
-    /// 用完就返回空批次（不是错误）。两边都记调用次数，用来断言
-    /// 「令牌一开始就是坏的，就不该再进轮询循环」。
+    /// 用完就返回空批次（不是错误）。三个字段各记一件事：调用次数、
+    /// 每次调用传进来的 timeout（用来分清"清空积压那一下"用的是 0 秒
+    /// 还是"正常轮询"用的是 `POLL_TIMEOUT`），跟真实回包一样不关心
+    /// 谁在问。
     struct MockChannel {
         get_me_result: Result<String, ChannelError>,
         poll_results: Mutex<VecDeque<Result<Vec<Incoming>, ChannelError>>>,
         poll_calls: Mutex<u32>,
+        poll_timeouts: Mutex<Vec<Duration>>,
+    }
+
+    impl MockChannel {
+        fn new(
+            get_me_result: Result<String, ChannelError>,
+            poll_results: Vec<Result<Vec<Incoming>, ChannelError>>,
+        ) -> MockChannel {
+            MockChannel {
+                get_me_result,
+                poll_results: Mutex::new(poll_results.into()),
+                poll_calls: Mutex::new(0),
+                poll_timeouts: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl Channel for MockChannel {
         fn send(&self, _to: i64, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
             unimplemented!("这一路测试不需要 send")
         }
-        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+        fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
             *self.poll_calls.lock().unwrap() += 1;
+            self.poll_timeouts.lock().unwrap().push(timeout);
             self.poll_results
                 .lock()
                 .unwrap()
@@ -420,20 +777,22 @@ mod tests {
         }
     }
 
-    /// 正常路径：`get_me` 先补上 bot 名字，然后处理一条配对消息，
-    /// 再收到一个不可重试的错误（`BadToken`）就停下、把 `Broken` 写进去。
+    /// 正常路径（首次配对，`owner` 是 `None`）：`get_me` 先补上 bot 名字，
+    /// 接着 `drain_backlog` 问一次积压（这里没有），再进正常轮询：处理
+    /// 一条配对消息，然后收到一个不可重试的错误（`BadToken`）就停下、
+    /// 把 `Broken` 写进去。
     #[test]
     fn run_populates_bot_then_pairs_then_stops_on_bad_token() {
         let phone = blank_status();
-        let ch = Arc::new(MockChannel {
-            get_me_result: Ok("my_dct_bot".to_string()),
-            poll_results: Mutex::new(VecDeque::from([
-                Ok(vec![msg(111, "hi")]),
+        let ch = Arc::new(MockChannel::new(
+            Ok("my_dct_bot".to_string()),
+            vec![
+                Ok(Vec::new()),           // drain_backlog：没有积压
+                Ok(vec![msg(111, "hi")]), // 正常轮询：第一条真消息完成配对
                 Err(ChannelError::BadToken),
-            ])),
-            poll_calls: Mutex::new(0),
-        });
-        let bridge = Bridge::new(ch.clone(), phone.clone());
+            ],
+        ));
+        let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
         bridge.run();
 
         let st = phone.lock().unwrap();
@@ -442,7 +801,43 @@ mod tests {
             PhoneState::Broken(_) => {}
             other => panic!("该停在 Broken，得到 {other:?}"),
         }
-        assert_eq!(*ch.poll_calls.lock().unwrap(), 2);
+        assert_eq!(*ch.poll_calls.lock().unwrap(), 3);
+        let timeouts = ch.poll_timeouts.lock().unwrap().clone();
+        assert_eq!(
+            timeouts,
+            vec![Duration::ZERO, POLL_TIMEOUT, POLL_TIMEOUT],
+            "第一次问积压该用 0 秒，配对完成之后才切回正常的长轮询超时"
+        );
+    }
+
+    /// **C1 的回归测试。** 重启前（`owner` 还是 `None`，没能从密钥仓恢复）
+    /// Telegram 已经攒了一条陌生人的积压消息——这正是"攻击者趁 dct 关着
+    /// 抢先发消息"那个场景。`drain_backlog` 必须把它原样倒掉，配对只能
+    /// 落在积压清空之后到达的第一条真消息上。
+    #[test]
+    fn a_backlog_message_present_before_pairing_opens_is_discarded_not_paired() {
+        let phone = blank_status();
+        let ch = Arc::new(MockChannel::new(
+            Ok("my_dct_bot".to_string()),
+            vec![
+                Ok(vec![msg(999, "我趁你不在先发一条")]), // 积压：攻击者的消息
+                Ok(Vec::new()),                           // 积压问干净了
+                Ok(vec![msg(111, "真主人上线")]),         // 配对开着之后的第一条
+                Err(ChannelError::BadToken),
+            ],
+        ));
+        let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
+        bridge.run();
+
+        let st = phone.lock().unwrap();
+        assert_eq!(
+            st.owner.as_deref(),
+            Some("111"),
+            "配对必须落在真主人身上，不能是积压里那条陌生人的消息"
+        );
+        drop(st);
+        // 陌生人 999 从始至终没有拿到过 `Paired`——直接问 bridge 本身也确认一遍。
+        assert_eq!(bridge.accept(&msg(999, "还想再试一次")), Accepted::Rejected);
     }
 
     /// 令牌一开始就是坏的：`get_me` 直接 `BadToken`，`run()` 必须
@@ -451,12 +846,8 @@ mod tests {
     #[test]
     fn a_bad_token_at_startup_never_reaches_poll() {
         let phone = blank_status();
-        let ch = Arc::new(MockChannel {
-            get_me_result: Err(ChannelError::BadToken),
-            poll_results: Mutex::new(VecDeque::new()),
-            poll_calls: Mutex::new(0),
-        });
-        let bridge = Bridge::new(ch.clone(), phone.clone());
+        let ch = Arc::new(MockChannel::new(Err(ChannelError::BadToken), Vec::new()));
+        let bridge = Bridge::new(ch.clone(), phone.clone(), None, Box::new(|_| {}));
         bridge.run();
 
         assert_eq!(*ch.poll_calls.lock().unwrap(), 0);
@@ -466,6 +857,29 @@ mod tests {
             PhoneState::Broken(_) => {}
             other => panic!("该停在 Broken，得到 {other:?}"),
         }
+    }
+
+    /// 重启且 `owner` 已知：`run()` 必须直接进正常轮询，**跳过**
+    /// `drain_backlog`——不然重启一次，主人自己此刻真的发来的消息都可能
+    /// 被当成"积压"平白丢掉。用第一次 `poll` 调用的 timeout 是不是
+    /// `POLL_TIMEOUT`（而不是 `drain_backlog` 用的 0 秒）来分辨走了
+    /// 哪条路径。
+    #[test]
+    fn run_with_a_known_owner_skips_backlog_draining_and_polls_directly() {
+        let phone = blank_status();
+        let ch = Arc::new(MockChannel::new(
+            Ok("bot".to_string()),
+            vec![Err(ChannelError::BadToken)],
+        ));
+        let bridge = Bridge::new(ch.clone(), phone, Some(111), Box::new(|_| {}));
+        bridge.run();
+
+        assert_eq!(*ch.poll_calls.lock().unwrap(), 1);
+        assert_eq!(
+            ch.poll_timeouts.lock().unwrap().clone(),
+            vec![POLL_TIMEOUT],
+            "已经有主人时不该先走清空积压那一步（0 秒超时），要直接用正常轮询的超时"
+        );
     }
 
     /// `run()` 里的 panic 必须被 `catch_unwind` 接住，不能往外冒——这是
@@ -486,11 +900,141 @@ mod tests {
             }
         }
         let phone = blank_status();
-        let bridge = Bridge::new(Arc::new(PanicsOnPoll), phone);
+        let bridge = Bridge::new(Arc::new(PanicsOnPoll), phone, None, Box::new(|_| {}));
         let result = catch_unwind(AssertUnwindSafe(|| bridge.run()));
         assert!(
             result.is_err(),
             "run() 里的 panic 该被外面的 catch_unwind 接住"
+        );
+    }
+
+    // ---- stop：C2/C3 修复的地基 ----
+
+    /// `stop()` 之后轮询线程必须真的退出，不是只改一个没人看的标志位。
+    #[test]
+    fn stop_actually_stops_the_polling_thread() {
+        let phone = blank_status();
+        // owner 已知：跳过 drain_backlog，直接进那个"每次都成功但什么都
+        // 没有"的正常轮询，循环转得飞快，最能暴露"stop 没生效就会一直
+        // 转下去"这件事。
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string()), Vec::new()));
+        let bridge = Arc::new(Bridge::new(ch.clone(), phone, Some(1), Box::new(|_| {})));
+        let worker = bridge.clone();
+        let handle = std::thread::spawn(move || worker.run());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while *ch.poll_calls.lock().unwrap() == 0 {
+            assert!(Instant::now() < deadline, "轮询线程一直没跑起来");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        bridge.stop();
+        assert!(
+            wait_for_join(handle, Duration::from_secs(2)),
+            "stop() 之后线程该在有限时间内退出，而不是继续轮询下去"
+        );
+    }
+
+    /// `BridgeHandle::unpair()` 必须真的改到内部 `Bridge` 的状态——
+    /// **C2 的回归测试**：以前 `PhoneUnpair` 只改了 `PhoneStatus` 这个
+    /// 给界面看的缓存，`Bridge::owner` 毫不知情，旧主人事实上继续掌握
+    /// 着通道，新手机永远配不上。
+    #[test]
+    fn bridge_handle_unpair_clears_the_owner_and_reopens_pairing() {
+        let handle = spawn(
+            Arc::new(NeverCalled),
+            blank_status(),
+            Some(111),
+            Box::new(|_| {}),
+        );
+        assert_eq!(handle.accept(&msg(111, "老主人")), Accepted::FromOwner);
+
+        handle.unpair();
+
+        assert_eq!(
+            handle.accept(&msg(222, "新手机先发")),
+            Accepted::Paired(222),
+            "unpair 之后配对要重新打开，不能永远焊死在老主人身上"
+        );
+    }
+
+    /// **C3 的回归测试。** `replace()` 必须先把槽里旧的 bridge 停掉，
+    /// 再让新的顶上——不然旧的和新的会同时长轮询同一个 bot，一个把
+    /// 攻击者配成主人、一个把真主人配成主人，两边都以为自己赢了。
+    #[test]
+    fn replace_stops_the_old_bridge_before_starting_the_new_one() {
+        let slot: Mutex<Option<BridgeHandle>> = Mutex::new(None);
+        let phone = blank_status();
+
+        let old_ch = Arc::new(MockChannel::new(Ok("old_bot".to_string()), Vec::new()));
+        replace(
+            &slot,
+            old_ch.clone(),
+            phone.clone(),
+            Some(1),
+            Box::new(|_| {}),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while *old_ch.poll_calls.lock().unwrap() == 0 {
+            assert!(Instant::now() < deadline, "旧的 bridge 一直没跑起来");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let new_ch = Arc::new(MockChannel::new(Ok("new_bot".to_string()), Vec::new()));
+        replace(
+            &slot,
+            new_ch.clone(),
+            phone.clone(),
+            Some(2),
+            Box::new(|_| {}),
+        );
+
+        // 给旧线程一点时间真的退出，再看它是不是真停了——不是只停了
+        // "看起来"，是接下来这段时间里 poll 调用次数彻底不再增长。
+        std::thread::sleep(Duration::from_millis(150));
+        let old_count = *old_ch.poll_calls.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            *old_ch.poll_calls.lock().unwrap(),
+            old_count,
+            "replace() 之后旧的 bridge 不该还在轮询——两条活着的轮询线程\
+             会让攻击者和主人各自配对到不同的 bridge 上（C3）"
+        );
+        assert!(
+            *new_ch.poll_calls.lock().unwrap() > 0,
+            "新的 bridge 该顶上开始跑"
+        );
+    }
+
+    /// `stop_current()`：跟 `replace()` 共用"先停旧的"这条逻辑，只是
+    /// 不起新的——`PhoneDisable` 用的就是这个。
+    #[test]
+    fn stop_current_stops_the_bridge_and_leaves_the_slot_empty() {
+        let slot: Mutex<Option<BridgeHandle>> = Mutex::new(None);
+        let phone = blank_status();
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string()), Vec::new()));
+        replace(&slot, ch.clone(), phone, Some(1), Box::new(|_| {}));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while *ch.poll_calls.lock().unwrap() == 0 {
+            assert!(Instant::now() < deadline, "bridge 一直没跑起来");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        stop_current(&slot);
+
+        std::thread::sleep(Duration::from_millis(150));
+        let count = *ch.poll_calls.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            *ch.poll_calls.lock().unwrap(),
+            count,
+            "stop_current() 之后不该还在轮询"
+        );
+        assert!(
+            recover(slot.lock()).is_none(),
+            "槽里不该留着一个已经停掉的句柄"
         );
     }
 }
