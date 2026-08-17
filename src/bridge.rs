@@ -32,13 +32,29 @@
 //!    `replace()`/`stop_current()` 这两个函数改它持有的那一个槽——保证
 //!    任何时刻最多只有一条真的在跑的轮询线程，见这两个函数的文档注释。
 
-use crate::channel::{Channel, ChannelError, Incoming};
+use crate::channel::{Channel, ChannelError, Event, Incoming};
 use crate::proto::{PhoneState, PhoneStatus};
 use crate::session::recover;
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// 出站事件队列的上限（Ruling 4）。`session.rs::tick()` 那一头是
+/// unbounded 的 `mpsc::Sender`——`tick()` 绝不能因为投递阻塞，见那边
+/// `SessionManager::event_tx` 的文档。有界这一半必须在消费端做，做在
+/// 这里：`Bridge::enqueue` 满了就丢**最旧**的一条。
+///
+/// 丢最旧不是随便选的：对 stop/fail 通知来说，用户会先看到手机上最新
+/// 收到的那条，旧的哪怕留着也多半已经不是当下最要紧的那件事了；反过来
+/// 丢最新的话，用户会一直盯着一条早就过时的通知，看不到刚发生的事。
+///
+/// **这个数字是拍出来的**，跟 `channel::DEBOUNCE_WINDOW` 一样——如果
+/// 有 32 条事件排在队列里还没发出去，说明手机通知这条链路本身卡住了
+/// 很久，不是调大这一个数字能救的场面，先给个不至于让内存无限涨的
+/// 上限。
+pub const QUEUE_CAP: usize = 32;
 
 /// 长轮询一次最多挂多久。Telegram `getUpdates` 用同一个数字当查询参数。
 const POLL_TIMEOUT: Duration = Duration::from_secs(25);
@@ -80,6 +96,11 @@ pub struct Bridge {
     /// 返回 `Paired` 的那一次调用一次**，见 `dispatch()`。测试用的实现是
     /// 空操作，见 `Bridge::for_test`。
     persist_owner: Box<dyn Fn(i64) + Send + Sync>,
+    /// Task 6 产的出站事件，有界、drop-oldest，见 `QUEUE_CAP`。**谁把
+    /// `session.rs::tick()` 那头 `mpsc::Receiver<Event>` 里的事件搬进
+    /// 这里，是接线的事**——这个字段和 `enqueue`/`queued` 这两个方法
+    /// 只负责「进来一条、满了丢最旧的」这条规则本身，不管调用方是谁。
+    outbound: Mutex<VecDeque<Event>>,
     // …… 消息映射与当前会话见 Task 7
 }
 
@@ -96,6 +117,7 @@ impl Bridge {
             owner: Mutex::new(owner),
             stop: AtomicBool::new(false),
             persist_owner,
+            outbound: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -139,6 +161,24 @@ impl Bridge {
             // chat id 本身。诚实地显示一个数字，好过编一个不存在的名字。
             st.owner = Some(chat_id.to_string());
         }
+    }
+
+    /// 消费队列这一半：把一条 `session.rs::tick()` 产的事件收进来。
+    /// **满了丢最旧的一条**（`QUEUE_CAP`，Ruling 4）——不是拒收新的，
+    /// 新的事件永远进得来，代价是队首那条最老的被挤掉。
+    pub fn enqueue(&self, e: Event) {
+        let mut q = recover(self.outbound.lock());
+        if q.len() >= QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(e);
+    }
+
+    /// 队列此刻的快照，按进队顺序（最老的在前）。只读、不消费——
+    /// 测试和（后续任务的）实际发送都要看这份内容，谁都不该在看一眼的
+    /// 同时把别人还没读到的事件顺手清空。
+    pub fn queued(&self) -> Vec<Event> {
+        recover(self.outbound.lock()).iter().cloned().collect()
     }
 
     /// 补 bot 用户名，带跟轮询同一套退避。**必须在进入轮询循环之前做**——
@@ -419,6 +459,47 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::time::Instant;
+
+    fn ev(session: u32) -> Event {
+        Event {
+            session,
+            kind: crate::channel::EventKind::Stopped,
+            name: String::new(),
+            project: "p".into(),
+        }
+    }
+
+    /// 基本形状：进去几条，`queued()` 原样按顺序吐回来。Task 11 会补
+    /// 「满了丢最旧」那条更细的测试；这里先钉住没满的时候完全不该丢。
+    #[test]
+    fn enqueue_keeps_everything_under_the_cap() {
+        let b = Bridge::for_test();
+        b.enqueue(ev(1));
+        b.enqueue(ev(2));
+        b.enqueue(ev(3));
+        let sessions: Vec<u32> = b.queued().iter().map(|e| e.session).collect();
+        assert_eq!(sessions, vec![1, 2, 3]);
+    }
+
+    /// 满了之后再来一条，被挤掉的必须是**最旧**的那条，不是最新的——
+    /// Ruling 4 的全部依据：对 stop/fail 通知来说，最新的事件才是有用的。
+    #[test]
+    fn enqueue_drops_the_oldest_when_the_queue_is_full() {
+        let b = Bridge::for_test();
+        for i in 0..QUEUE_CAP as u32 {
+            b.enqueue(ev(i));
+        }
+        b.enqueue(ev(QUEUE_CAP as u32)); // 这一条让队列溢出一条
+
+        let sessions: Vec<u32> = b.queued().iter().map(|e| e.session).collect();
+        assert_eq!(sessions.len(), QUEUE_CAP, "队列不该超过上限");
+        assert_eq!(sessions[0], 1, "最旧的那条（0号）该被挤掉");
+        assert_eq!(
+            *sessions.last().unwrap(),
+            QUEUE_CAP as u32,
+            "最新那条必须留着"
+        );
+    }
 
     fn msg(chat: i64, text: &str) -> Incoming {
         Incoming {

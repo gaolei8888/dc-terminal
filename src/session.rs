@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use crate::channel::{debounce, Event, EventKind, DEBOUNCE_WINDOW};
 use crate::git::{self, FileStat};
 use crate::profile::Profile;
 use crate::pty::{PtySession, ScreenSpan};
@@ -97,6 +99,22 @@ fn classify(
         });
     }
     None
+}
+
+/// 该不该为这个会话叫醒用户的手机？三道门，全 AND。
+///
+/// - `is_agent`：命令行会话（shell）从来不该推送——用户自己在敲的东西，
+///   没有「停下来了」这个概念。
+/// - `!first_input_empty`（这里传入的是 `first_input_empty` 本身）：**这道
+///   是关键。** 真实 profile（claude/codex/glm/kimi/deepseek/qwen-api）
+///   全都只声明 `busy_pattern`，`classify()` 在 busy 串不在屏幕上时就判
+///   Idle——而刚创建、还停在启动画面上的会话正是这样。没有这道门，
+///   **每开一个会话手机就响一次**。跟 `tick()` 里起名字用的是同一个
+///   判据、同一个理由，见那边的长注释。
+/// - `has_channel`：没配手机通知（`SessionManager::set_event_sink` 没被
+///   调过）就没有地方可推，试都不用试。
+pub fn should_notify(is_agent: bool, first_input_empty: bool, has_channel: bool) -> bool {
+    is_agent && !first_input_empty && has_channel
 }
 
 /// 让模型把一屏失败翻译成一句人话。
@@ -458,6 +476,11 @@ struct Session {
     /// 少算，画面也会开始往上飘（最老的行被挤掉了）。这是环形缓冲的
     /// 固有代价。
     scroll_mark: usize,
+    /// 这个会话上次真的把事件送进手机通知队列的时刻，`debounce()` 的
+    /// `last` 参数。相对 `SessionManager::started`，不是挂钟时间——
+    /// 见那个字段的文档，理由跟 `channel::debounce` 用 `Duration` 而不是
+    /// `Instant` 一样：这里是唯一需要拿它做减法的地方。
+    last_notified: Option<Duration>,
 }
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
@@ -488,6 +511,18 @@ pub struct SessionManager {
     /// （见 `proto::WarningCode::LlmUnavailable`），这是这条原因唯一能走到
     /// 用户眼前的路。
     llm_problem: Mutex<Option<crate::llm::resolve::ResolveError>>,
+    /// `tick()` 往手机通知队列投事件用的出口。**unbounded**——Ruling 4：
+    /// `tick()` 绝不能因为投递这件事阻塞，一个 `mpsc::Sender` 的
+    /// `send()` 本来就不会阻塞（它只会让底层队列变长），有界的那一半
+    /// 由 `bridge.rs` 在消费端做，见那边的 `QUEUE_CAP`。`None` = 没配
+    /// 手机通知（`set_event_sink` 没被调过），这时候 `should_notify` 的
+    /// 第三道门（`has_channel`）直接判假，tick() 连 `send()` 都不会试。
+    event_tx: Mutex<Option<mpsc::Sender<Event>>>,
+    /// `Session::last_notified` 记的时刻的起点。用相对时长而不是挂钟
+    /// 时间是为了配合 `channel::debounce`（`Instant` 造不出「10 秒前」，
+    /// 测试需要确定的时间点）；这里只需要一个单调、进程存活期内不变的
+    /// 参照系，`Instant` 正合适。
+    started: Instant,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -512,7 +547,17 @@ impl SessionManager {
             journal: crate::journal::Journal::new(),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
+            event_tx: Mutex::new(None),
+            started: Instant::now(),
         }
+    }
+
+    /// 接上手机通知队列的入口。`daemon.rs` 在配好 `Bridge` 之后调用一次；
+    /// 测试直接建一对 `mpsc::channel()` 传进来，不用起真的 bridge。
+    /// 不调用这个方法的话，`should_notify` 的第三道门永远判假——没配
+    /// 手机通知的人，`tick()` 不会试着往哪里发任何东西。
+    pub fn set_event_sink(&self, tx: mpsc::Sender<Event>) {
+        *recover(self.event_tx.lock()) = Some(tx);
     }
 
     /// 装上（或摘掉）出错解释要用的后端。守护进程启动时 resolve 一次调用，
@@ -661,6 +706,7 @@ impl SessionManager {
             name_attempted: false,
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
+            last_notified: None,
         };
 
         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
@@ -956,6 +1002,7 @@ impl SessionManager {
                 s.state = SessionState::Stopped;
                 self.journal
                     .died(s.id, crate::journal::Death::Vanished, pid);
+                self.maybe_notify(&mut s, EventKind::Vanished);
                 continue;
             }
             if s.state == SessionState::Asking {
@@ -981,6 +1028,7 @@ impl SessionManager {
                     // 模型，一个失败会话能把额度烧光。
                     if next == SessionState::Failed && was != SessionState::Failed {
                         self.request_explanation(&mut s);
+                        self.maybe_notify(&mut s, EventKind::Failed);
                     }
                     // 起名的时机是「干完一轮 **且用户已经说过话**」，两个条件
                     // 缺一不可。不在第一句输入送出去时起：那一刻信息最少，
@@ -1011,16 +1059,57 @@ impl SessionManager {
                     // 自己的文档）。
                     if was == SessionState::Working
                         && matches!(next, SessionState::Idle | SessionState::Asking)
-                        && s.is_agent
-                        && !s.first_input.is_empty()
-                        && !s.name_attempted
                     {
-                        self.request_name(&mut s);
+                        // 起名只问一次（`name_attempted` 那道门），但「停下来了」
+                        // 这件事该发生几次就通知几次——一个 agent 干完第二轮活
+                        // 一样值得让手机响一次，不能因为名字早就起过了就把这次
+                        // 也拦下。所以通知跟起名分成两个独立的 if，共用同一个
+                        // `was`/`next` 判断，但各自的门槛互不影响。
+                        if s.is_agent && !s.first_input.is_empty() && !s.name_attempted {
+                            self.request_name(&mut s);
+                        }
+                        self.maybe_notify(&mut s, EventKind::Stopped);
                     }
                 }
             }
             // 两个都没有：状态不动，保持 Unknown
         }
+    }
+
+    /// 三道门 + 防抖，`Stopped`/`Failed`/`Vanished` 共用的唯一出口。
+    ///
+    /// **绝不阻塞。** `event_tx` 是 unbounded 的 `mpsc::Sender`——`send()`
+    /// 只会让底层队列变长，不会等任何人来收；唯一可能的失败是接收端已经
+    /// 掉了（没配手机通知，或者 bridge 那边的消费线程还没起来），这时候
+    /// 安静丢掉，不是 tick() 该操心的事。有界、drop-oldest 那一半在
+    /// `bridge.rs` 的消费端，见那边 `QUEUE_CAP` 的文档。
+    fn maybe_notify(&self, s: &mut Session, kind: EventKind) {
+        let tx = recover(self.event_tx.lock()).clone();
+        if !should_notify(s.is_agent, s.first_input.is_empty(), tx.is_some()) {
+            return;
+        }
+        let tx = tx.expect("should_notify 的第三道门刚判过 has_channel 为真");
+
+        let now = self.started.elapsed();
+        if !debounce(s.last_notified, now, DEBOUNCE_WINDOW) {
+            return;
+        }
+        s.last_notified = Some(now);
+
+        let name = recover(s.name_slot.lock()).clone().unwrap_or_default();
+        let project = s
+            .dir
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.dir.display().to_string());
+        // 发不出去（接收端掉了）就丢：跟没配手机通知没有区别，tick() 不该
+        // 因为这件事而报错或者重试。
+        let _ = tx.send(Event {
+            session: s.id,
+            kind,
+            name,
+            project,
+        });
     }
 
     /// **绝不在 tick 里同步等模型。** tick 每 200ms 一轮，一次同步调用就能
@@ -3095,5 +3184,91 @@ mod tests {
         let s: SessionInfo = serde_json::from_str(old).expect("旧 JSON 必须还能读");
         assert_eq!(s.tag, "", "缺字段补空串");
         assert_eq!(s.id, 3);
+    }
+
+    // ---- should_notify：三道门，全 AND ----
+
+    /// 是 agent、有渠道，但用户还没说过话——刚创建、还停在启动画面上的
+    /// 会话正是这样。这是三道门里唯一真会被踩到的坑，见 `should_notify`
+    /// 自己的文档。
+    #[test]
+    fn a_brand_new_session_does_not_page_you() {
+        assert!(!should_notify(true, true, true));
+    }
+
+    #[test]
+    fn a_plain_shell_never_pages_you() {
+        assert!(!should_notify(false, false, true));
+    }
+
+    #[test]
+    fn no_channel_means_no_page() {
+        assert!(!should_notify(true, false, false));
+    }
+
+    #[test]
+    fn an_agent_you_have_talked_to_pages_you() {
+        assert!(should_notify(true, false, true));
+    }
+
+    // ---- tick()：完整走一遍，钉住「刚开会话不该震手机」这件事 ----
+
+    /// `create()` 之后立刻 `tick()`：假 profile 只声明 `busy_pattern`
+    /// （真实 profile 的形状），没人跟它说过话，屏幕自然读成 Idle。
+    /// 没有 `should_notify` 那道 `first_input` 门，这一跳会被误判成
+    /// 「干完一轮活」，事件队列里会多出一条 `Stopped`——这正是
+    /// 「每开一个会话手机就响一次」那个 bug 的样子。多 tick 几轮，
+    /// 确认这件事不是运气好躲过了一次，而是稳定地不会发生。
+    #[test]
+    fn a_brand_new_session_does_not_wake_your_phone() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(busy_only_agent());
+        let (tx, rx) = mpsc::channel();
+        m.set_event_sink(tx);
+
+        let id = m
+            .create(repo.path(), "busy-only", empty_secrets(), &[])
+            .unwrap();
+
+        for _ in 0..5 {
+            m.tick();
+            assert!(
+                rx.try_recv().is_err(),
+                "会话 {id} 还没人说过话，队列里不该有任何事件"
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 用户真的说过话、agent 干完一轮活之后，`Stopped` 事件必须真的
+    /// 送到队列里——上一条测试钉住「不该响」的那一半，这条钉住
+    /// 「该响的时候真的响」的那一半，免得把三道门全改成恒假也能让
+    /// 上一条测试通过。
+    #[test]
+    fn an_agent_that_finishes_a_real_turn_wakes_your_phone() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(finishing_agent());
+        let (tx, rx) = mpsc::channel();
+        m.set_event_sink(tx);
+
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+        m.send_input(id, "修一下登录白屏").unwrap();
+        m.send_input(id, "").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            if let Ok(ev) = rx.try_recv() {
+                assert_eq!(ev.session, id);
+                assert_eq!(ev.kind, EventKind::Stopped);
+                break;
+            }
+            assert!(Instant::now() < deadline, "真正干完一轮活该震一次手机");
+            sleep(Duration::from_millis(20));
+        }
     }
 }
