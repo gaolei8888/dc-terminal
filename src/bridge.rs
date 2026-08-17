@@ -38,7 +38,7 @@ use crate::session::recover;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 /// 出站事件队列的上限（Ruling 4）。`session.rs::tick()` 那一头是
@@ -454,6 +454,54 @@ pub fn stop_current(slot: &Mutex<Option<BridgeHandle>>) {
     }
 }
 
+/// **Ruling 10 的落地点.** 队列的另一半：把 `session.rs::tick()` 那头的
+/// `mpsc::Receiver<Event>` 接进来，一有事件到达就转手交给**此刻**槽里
+/// 那个活着的 bridge。
+///
+/// **这是唯一常驻到整个守护进程生命周期的消费者，它不属于任何一个具体
+/// 的 `Bridge` 实例。** `replace()`（换令牌）、`stop_current()`（关掉）
+/// 都只改变槽里那个 `Option<BridgeHandle>`，这个消费者线程本身从不
+/// 重启，`daemon.rs::run_with_manager` 只在启动时 `spawn` 一次——这正是
+/// 为什么不会重演 C2/C3 那种「换一次令牌就多出一条线程，两条各管各的」：
+/// 这里从头到尾只有一条消费者线程，它每次都重新看一眼槽里此刻是谁。
+///
+/// **没有活着的 bridge 时，事件被故意丢弃**，不是缺陷：没有令牌、
+/// 刚被 `PhoneDisable`、或者正处在 `replace()` 换令牌那极短的窗口里，
+/// 这时候「发给谁」这个问题本身没有答案。**故意不攒起来以后补发**——
+/// 攒着的话，用户重新打开手机通知的那一刻会被一堆早就过期的「某会话
+/// 停下来了」糊一脸，比什么都不说更糟；`should_notify`/`debounce` 保证
+/// 的是「响的时候值得响」，不是「保证响过」。
+///
+/// **绝不阻塞 `tick()`，绝不向外 panic**：`rx.recv()` 会阻塞这**一个**
+/// 消费者线程本身，但那正是它该做的事——`tick()` 只管往 unbounded 的
+/// `mpsc::Sender` 里 `send()`，从不等在这里，两条线程之间没有反向的
+/// 依赖。每一次真正的处理（查槽、`enqueue`）都包在 `catch_unwind` 里，
+/// 单次失败不会把整条消费者线程带走，同 `spawn()` 那条「手机通道死掉是
+/// 遗憾，会话死掉才是灾难」的规矩，也同这里「一个停掉的 bridge 不该
+/// 继续被喂事件」——槽里读到 `None` 就是全部要做的事，不会去戳一个已经
+/// `stop()` 过的旧 `Bridge`。
+pub fn spawn_event_consumer(
+    rx: mpsc::Receiver<Event>,
+    slot: Arc<Mutex<Option<BridgeHandle>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        let event = match rx.recv() {
+            Ok(e) => e,
+            // 发送端掉了：持着 `mpsc::Sender` 的 `SessionManager` 没了，
+            // 说明整个 daemon 在关——这个消费者线程也该跟着退出，
+            // 不是错误，不用报。
+            Err(_) => return,
+        };
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(handle) = recover(slot.lock()).as_ref() {
+                handle.bridge.enqueue(event);
+            }
+            // `None`：没有活着的 bridge，见函数文档——故意丢弃，
+            // 不攒、不重试。
+        }));
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +547,114 @@ mod tests {
             QUEUE_CAP as u32,
             "最新那条必须留着"
         );
+    }
+
+    // ---- spawn_event_consumer：Ruling 10 的接线本身 ----
+
+    fn handle_around(b: Bridge) -> BridgeHandle {
+        BridgeHandle {
+            bridge: Arc::new(b),
+        }
+    }
+
+    /// **走真实接线，不直接调 `enqueue`。** 槽里有一个活着的 bridge，
+    /// `tx.send()` 之后事件必须真的出现在那个 bridge 的 `queued()` 里——
+    /// 这条测试钉的是「消费者线程真的把 `mpsc::Receiver` 那头收到的东西
+    /// 转手交给了槽里的 bridge」这件事本身，不是 `enqueue`/`should_notify`
+    /// 各自的正确性（那两个已经有别的测试钉住了）。
+    #[test]
+    fn an_event_sent_through_the_channel_reaches_the_live_bridge() {
+        let slot: Arc<Mutex<Option<BridgeHandle>>> =
+            Arc::new(Mutex::new(Some(handle_around(Bridge::for_test()))));
+        let (tx, rx) = mpsc::channel();
+        spawn_event_consumer(rx, slot.clone());
+
+        tx.send(ev(1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sessions: Vec<u32> = {
+                let g = recover(slot.lock());
+                g.as_ref()
+                    .unwrap()
+                    .bridge
+                    .queued()
+                    .iter()
+                    .map(|e| e.session)
+                    .collect()
+            };
+            if sessions == vec![1] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "事件该经真实的消费者线程落到 bridge 的队列里，实际看到 {sessions:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 槽里没有活着的 bridge（没配令牌、刚被 `PhoneDisable`）：事件必须
+    /// 被**故意丢弃**，不阻塞、不 panic、也不偷偷攒在别的地方等以后补发
+    /// ——之后哪怕真的接上一个 bridge，早先那些事件也不该突然冒出来。
+    #[test]
+    fn events_are_dropped_without_blocking_when_no_bridge_is_live() {
+        let slot: Arc<Mutex<Option<BridgeHandle>>> = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::channel();
+        spawn_event_consumer(rx, slot.clone());
+
+        // 连发好几条：没有 bridge 接收，`send()` 本身是 unbounded 的，
+        // 这几行不该卡住——超时用来给"万一真的卡住了"一个可观测的失败，
+        // 而不是让测试本身悬在那里。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for i in 1..=5u32 {
+            assert!(
+                Instant::now() < deadline,
+                "没有 bridge 时 send() 也不该卡住"
+            );
+            tx.send(ev(i)).unwrap();
+        }
+
+        // 给消费者线程一点时间，让它真的把这 5 条在槽还是 `None` 的时候
+        // 处理掉（也就是丢掉）——不留这段余量的话，槽可能在消费者线程
+        // 还没来得及看第一条之前就被下面这行改成 `Some`，测的就不再是
+        // "没有 bridge 时会丢"，而是纯粹的线程调度赛跑。跟本文件别处
+        // "sleep 一小段再断言" 的写法（比如 `replace_stops_the_old_bridge_
+        // before_starting_the_new_one`）同一个理由。
+        std::thread::sleep(Duration::from_millis(200));
+
+        // 现在才接上一个 bridge：如果消费者线程在没有 bridge 那段时间
+        // 把事件攒在了别的地方，这里就会看到 1..=5 一起冒出来；正确行为
+        // 是那 5 条已经被丢了，只有**之后**发的这一条会出现。
+        *recover(slot.lock()) = Some(handle_around(Bridge::for_test()));
+        tx.send(ev(99)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sessions: Vec<u32> = {
+                let g = recover(slot.lock());
+                g.as_ref()
+                    .unwrap()
+                    .bridge
+                    .queued()
+                    .iter()
+                    .map(|e| e.session)
+                    .collect()
+            };
+            if !sessions.is_empty() {
+                assert_eq!(
+                    sessions,
+                    vec![99],
+                    "没有 bridge 时发的那 5 条不该被攒起来、事后补发"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "接上 bridge 之后新发的事件也该正常送达，而不是消费者线程被卡住了"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn msg(chat: i64, text: &str) -> Incoming {

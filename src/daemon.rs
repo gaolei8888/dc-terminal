@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::channel::telegram::Telegram;
-use crate::channel::ChannelError;
+use crate::channel::{ChannelError, Event};
 use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
@@ -76,6 +76,15 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     start_phone_bridge(&secrets, &phone, &bridge, &|token| {
         Arc::new(Telegram::new(token)) as Arc<dyn crate::channel::Channel>
     });
+
+    // Ruling 10：把 `tick()` 那头 unbounded 的 `mpsc::Sender<Event>` 接到
+    // 这唯一常驻的消费者线程上——它读的是 `bridge` 这个槽，不是某一个具体
+    // 的 `Bridge` 实例，换令牌/关掉都不会让它跟着重启或者留下第二条线程，
+    // 见 `bridge::spawn_event_consumer` 的文档。`bridge` 此刻可能还是
+    // `None`（没写过令牌）——没关系，消费者每次收到事件才现查槽里是谁。
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+    mgr.set_event_sink(event_tx);
+    crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
 
     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
