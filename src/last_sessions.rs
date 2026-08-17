@@ -43,7 +43,11 @@ pub struct RecordedSession {
     pub profile: String,
     #[serde(default)]
     pub tag: String,
-    /// UNIX 纪元秒。只在同一份清单内部比较「谁更新」，跨进程重启之后
+    /// UNIX 纪元毫秒（不是秒）——精度按秒算的话，两个会话在同一秒内先后
+    /// 被用过（比如一次交互测试里连着敲两下），落盘时会看着一样新，
+    /// `group_for_resume` 的 `max_by_key` 就退化成「打平取最后一个」，
+    /// 而那不是真的「谁更晚被用过」。只在同一份清单内部比较「谁更新」，
+    /// 跨进程重启之后
     /// 的绝对值没有意义——见 `group_for_resume` 的文档。
     pub last_active: u64,
 }

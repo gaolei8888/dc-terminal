@@ -486,15 +486,18 @@ struct Session {
     /// 见那个字段的文档，理由跟 `channel::debounce` 用 `Duration` 而不是
     /// `Instant` 一样：这里是唯一需要拿它做减法的地方。
     last_notified: Option<Duration>,
-    /// 建这个会话的挂钟时刻，写进 `last-sessions.toml` 的 `last_active`。
+    /// 这个会话真的被用过的最后一刻，写进 `last-sessions.toml` 的
+    /// `last_active`。创建时打一次底，之后两处会刷新它：
     ///
-    /// **只在创建时打一次戳，不随后续操作更新**：这个仓库里没有别的地方
-    /// 追踪「用户真的在跟这个会话互动」这件事的精确时刻（`send_input`
-    /// 关心的是要不要打检查点，不是这个），临时为了这一个字段去加一条
-    /// 更细的追踪，换来的精度在 `last_sessions::group_for_resume` 唯一
-    /// 关心的场景——「同一个目录+profile 下，哪个是后开的那个」——里
-    /// 派不上用场：两个会话谁更该继续，靠的是谁开得晚，不是谁刚被戳了
-    /// 一下键盘。
+    /// - `send_input`：用户敲了字符或者按了回车，只更新内存。
+    /// - `tick()` 里 Working → Idle 那一跳：agent 干完了一轮活。
+    ///
+    /// **这两处都不是「建得晚」的同义词。** 早上 9 点建的会话被聊了一
+    /// 上午，11 点建的会话开完就晾在那——`group_for_resume` 要认的是
+    /// 前者，`--continue` 恢复的也是 claude 自己最后写过的那份对话，
+    /// 不是「哪个窗口更年轻」。只按创建时间盖章会把 `--continue` 接到
+    /// 用错的那个会话上，正是「一组里只让一个继续」这条规矩想避免的
+    /// 事故本身，只是换了个更隐蔽的位置犯。
     last_active: std::time::SystemTime,
 }
 
@@ -680,11 +683,13 @@ impl SessionManager {
                     dir: s.dir.clone(),
                     profile: s.profile.name.clone(),
                     tag,
+                    // 毫秒不是秒——理由见 `RecordedSession::last_active` 的文档：
+                    // 按秒算的话，同一秒内先后被用过的两个会话会看着一样新。
                     last_active: s
                         .last_active
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs(),
+                        .as_millis() as u64,
                 })
             })
             .collect();
@@ -929,6 +934,13 @@ impl SessionManager {
             if s.is_agent {
                 collect_first_input(&mut s.first_input, &mut s.first_input_sealed, text);
             }
+            // 用户真的在跟这个会话互动——不管是敲一个字符还是按回车提交。
+            // **只更新内存，不落盘**：这个方法在正常使用下每一次按键都会
+            // 被调用一次，`last_sessions::save` 的磁盘 IO 绝不能挂在这条
+            // 路径上（跟 `tick()` 不能写盘是同一条纪律，只是触发频率更高）。
+            // 落盘只在会话集合变化（create/stop/kill/prune）或者下面
+            // `tick()` 里 Working → Idle 那一刻发生——见那两处的注释。
+            s.last_active = std::time::SystemTime::now();
         }
 
         if text.is_empty() {
@@ -1180,6 +1192,13 @@ impl SessionManager {
             // 而空闲时的输入框占位符用户一打字就没了。
             // screen_text() 只取一次，三个分支共用——它要扫一遍整屏文字，
             // 每个会话每秒被 tick 5 次，没必要算三遍。
+            //
+            // `just_finished_a_round`：Working → Idle/Asking 那一跳发生了没有。
+            // 用来决定这轮 tick 处理完这一个会话之后，要不要把 `last_active`
+            // 的新值落盘——**不能在还攥着 `s` 这把锁的时候调
+            // `persist_last_sessions`**，那会再去锁同一个会话而死锁，所以
+            // 只在这里记一个标记，真正的落盘挪到下面松开锁之后。
+            let mut just_finished_a_round = false;
             if s.busy_re.is_some() || s.idle_re.is_some() || s.error_re.is_some() {
                 let text = s.pty.screen_text();
                 let next = classify(
@@ -1237,10 +1256,34 @@ impl SessionManager {
                             self.request_name(&mut s);
                         }
                         self.maybe_notify(&mut s, EventKind::Stopped);
+
+                        // 干完一轮活，也是「这个会话真的被用过」的证据——
+                        // 跟 `send_input` 那一半共同撑起 `last_sessions::
+                        // group_for_resume` 需要的「最近活跃」，不是「最近
+                        // 建的」。只更新内存；落盘挪到下面，等这把锁松开。
+                        s.last_active = std::time::SystemTime::now();
+                        just_finished_a_round = true;
                     }
                 }
             }
             // 两个都没有：状态不动，保持 Unknown
+
+            // **必须在这里、锁已经松开之后**：`persist_last_sessions` 会
+            // 重新遍历 `sessions` 逐个上锁，如果 `s`（这个会话自己的锁）
+            // 还没释放就调用，会跟它自己死锁。这也是为什么不能挪到上面
+            // `just_finished_a_round = true` 那一行紧接着调用。
+            //
+            // 这是 `last_sessions.toml` 唯一一处**不是**因为会话集合变化
+            // （create/stop/kill/prune）而落盘的写入点，且只在 Working →
+            // Idle/Asking 这种「一轮活干完了」的稀疏事件上触发，不是
+            // `tick()` 每 200ms 都会碰到的路径——跟 `maybe_notify` 判断
+            // 手机要不要响是同一个触发点、同一个频率量级，不违反「`tick()`
+            // 不做磁盘 IO」这条纪律：那条纪律要挡的是每一轮 tick 都要担的
+            // 磁盘开销，不是「干完一轮活才发生一次」的开销。
+            if just_finished_a_round {
+                drop(s);
+                self.persist_last_sessions();
+            }
         }
     }
 
@@ -3148,6 +3191,150 @@ mod tests {
         mgr.stop(id).unwrap();
         let recs = crate::last_sessions::load(&record_path);
         assert!(recs.is_empty(), "停掉之后不该再出现在活着的清单里");
+    }
+
+    /// **钉住这次修复本身**：`last_active` 必须跟着真的使用走，不是跟着
+    /// 「谁建得晚」走。
+    ///
+    /// 场景：同一个目录 + profile 下，A 先建，B 后建；但 A 之后被真的用过
+    /// （`send_input`），B 建完就晾在那没人碰。`--continue` 接的是 claude
+    /// 自己最后写过的那份对话——也就是 A 的——所以恢复时该继续的是 A，
+    /// 不是「看起来更年轻」的 B。
+    ///
+    /// 只按创建时间盖章的旧实现会让这条测试失败：那种写法下 B 的
+    /// `last_active` 永远比 A 晚（它确实建得更晚），`group_for_resume`
+    /// 会错误地选中 B。
+    #[test]
+    fn a_session_used_more_recently_outranks_a_newer_but_idle_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(fake_agent());
+
+        let proj = init_repo();
+        // A：先建。
+        let id_a = mgr
+            .create(proj.path(), "fake", empty_secrets(), &[])
+            .unwrap();
+        sleep(Duration::from_millis(20));
+        // B：后建。这一刻起，如果什么都不发生，B 就是「更晚被用过」的那个
+        // ——这条测试要证明的正是：只要 A 之后被真的用过，这个默认就会
+        // 被推翻。
+        let id_b = mgr
+            .create(proj.path(), "fake", empty_secrets(), &[])
+            .unwrap();
+        let after_b_created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        sleep(Duration::from_millis(20));
+
+        // A 之后被真的用过：这一下应该把它的 `last_active` 刷新到
+        // `after_b_created` 之后。**但只更新内存**——`send_input` 不落盘
+        // （这正是这次修复要守住的纪律），所以磁盘上的清单这一刻还是
+        // `create(id_b)` 那次留下的旧快照。
+        mgr.send_input(id_a, "继续").unwrap();
+
+        // 逼一次真正的落盘：随便在别的目录建一个第三方会话——`create()`
+        // 会把此刻所有活着的会话（含 A 已经刷新过的 `last_active`）整份
+        // 重写进清单。选一个跟 A/B 完全不搭界的目录，不去干扰要测的那个
+        // `(dir, profile)` 分组。
+        let other_proj = init_repo();
+        mgr.create(other_proj.path(), "fake", empty_secrets(), &[])
+            .unwrap();
+
+        let recs: Vec<_> = crate::last_sessions::load(&record_path)
+            .into_iter()
+            .filter(|r| r.dir == proj.path())
+            .collect();
+        assert_eq!(recs.len(), 2);
+        assert!(
+            recs.iter()
+                .all(|r| r.profile == "fake" && r.dir == proj.path()),
+            "两条记录该是同一个 (dir, profile) 分组：{recs:?}"
+        );
+
+        // 不靠 id（清单里根本不记 id）分辨谁是谁，靠「谁的 last_active
+        // 晚于 B 刚建完那一刻」——只有真的被 `send_input` 碰过的那条
+        // （也就是 A）该晚于这个时间戳。
+        let touched: Vec<_> = recs
+            .iter()
+            .filter(|r| r.last_active > after_b_created)
+            .collect();
+        assert_eq!(
+            touched.len(),
+            1,
+            "该只有一条（A）比 B 建完那一刻更新：{recs:?}"
+        );
+
+        let resume_flags = crate::last_sessions::group_for_resume(&recs);
+        let winner = recs
+            .iter()
+            .zip(resume_flags.iter())
+            .filter(|(_, &r)| r)
+            .count();
+        assert_eq!(winner, 1, "一组里只能有一条继续");
+        let winning_record = recs
+            .iter()
+            .zip(resume_flags.iter())
+            .find(|(_, &r)| r)
+            .map(|(r, _)| r)
+            .unwrap();
+        assert!(
+            winning_record.last_active > after_b_created,
+            "被真的用过的那一条（A）才该继续，不是建得更晚但没人碰的那一条（B）：\
+             记录={recs:?}，恢复判定={resume_flags:?}"
+        );
+
+        // 避免「id 分配了但没用上」的 clippy 警告，同时留一个交叉检查：
+        // 两个 id 确实不同，测的是两个不同的会话。
+        assert_ne!(id_a, id_b);
+    }
+
+    /// `tick()` 里 Working → Idle 那一跳要把刷新过的 `last_active` 真的
+    /// 落盘——不然「干完一轮活」这个信号只活在内存里，daemon 万一在这之后、
+    /// 下一次 create/stop/kill/prune 之前被重启，磁盘上的清单还是这个
+    /// 会话建号那一刻的旧时间戳，`group_for_resume` 就看不到它真的被用
+    /// 过。这条测试全程不调用 `create`/`stop`/`kill`/`prune`——只有
+    /// `create()` 建号那一次写过盘，之后能让清单里的时间戳往前走的，
+    /// 只能是 `tick()` 自己。
+    #[test]
+    fn tick_persists_the_refreshed_last_active_on_working_to_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.set_last_sessions_path(record_path.clone());
+        m.register_profile(finishing_agent());
+        let id = m
+            .create(repo.path(), "finishing", empty_secrets(), &[])
+            .unwrap();
+
+        let after_create = crate::last_sessions::load(&record_path)[0].last_active;
+
+        // `finishing_agent` 自己按时间线走到 Idle（见它的文档），不需要
+        // 真的送一句话——这条测试只关心 Working → Idle 这一跳本身，
+        // 不关心起名。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            if state_of(&m, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "一直没进 Idle");
+            sleep(Duration::from_millis(20));
+        }
+
+        let after_idle = crate::last_sessions::load(&record_path)[0].last_active;
+        assert!(
+            after_idle > after_create,
+            "Working → Idle 之后，落盘的 last_active 该比建号时新：{after_create} → {after_idle}"
+        );
     }
 
     /// 没装过路径（`SessionManager::new()` 默认状态）的话，`create`/

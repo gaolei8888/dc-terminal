@@ -69,6 +69,10 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let last_sessions_records = crate::last_sessions::load(&last_sessions_path);
     mgr.set_last_sessions_path(last_sessions_path);
     if !last_sessions_records.is_empty() {
+        eprintln!(
+            "dct：正在接回上次的 {} 个会话……",
+            last_sessions_records.len()
+        );
         let (all, _) = all_profiles(&profiles_dir);
         let secrets_guard = recover(secrets.lock());
         for line in restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr) {
@@ -78,6 +82,7 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
             eprintln!("{line}");
         }
         drop(secrets_guard);
+        eprintln!("dct：会话接回完成。");
     }
 
     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
@@ -324,8 +329,27 @@ fn restore_last_sessions(
 ) -> Vec<String> {
     let resume_flags = crate::last_sessions::group_for_resume(records);
     let mut diagnostics = Vec::new();
+    let total = records.len();
 
-    for (record, &resume) in records.iter().zip(resume_flags.iter()) {
+    for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
+        // 一条会话的恢复可能要跑真正的子进程 spawn + 首次 git checkpoint
+        // （agent profile 都要），仓库大的话这一步单独就要小半秒。这整段
+        // 恢复是同步跑在守护进程真正开始接请求之前的（见调用点的注释），
+        // 慢仓库、几个会话叠起来能拖出好几秒的静默——静默的等待在这个
+        // 项目里是不被允许的（见 CLAUDE.md「一个不给下一步的等待就是没
+        // 做完」那条同一精神：这里没有错误，但用户看到的现象是一样的，
+        // 「怎么卡住了」）。只印到 stderr——只有前台 `dct daemon` 或者
+        // 单测能看见，跟 `install_llm_backend` 那条注释是同一条限制：
+        // 真正被 TUI 拉起来的那个守护进程，stdio 全被接到 `/dev/null`。
+        // 不进 `diagnostics` 返回值：那个返回值是「跳过了哪条、为什么」
+        // 这一份被测试直接断言内容的清单，进度行混进去只会让每条测试都要
+        // 重新数一遍行数，而进度本身不是需要断言的行为。
+        eprintln!(
+            "正在恢复第 {}/{total} 个会话：{}（{}）",
+            i + 1,
+            record.dir.display(),
+            record.profile
+        );
         if !record.dir.is_dir() {
             diagnostics.push(format!(
                 "跳过恢复：{} 这个目录已经不在了（profile：{}）",
