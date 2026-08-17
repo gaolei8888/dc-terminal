@@ -506,3 +506,177 @@ Integration: minor (deferred): the new daemon e2e test spawns a real PTY with 3s
   same class as the known sighup flake — expect occasional load-dependent failures.
 Task 9: OPEN — options_prompt/parse_options have no production caller yet; the async
   ask-the-model-with-fallback half is deferred to Task 10. Must not be lost before Task 11.
+Integration: fix round 1/5 (6 addressed, 0 open; commit ed0b078, 856 passing).
+  C1 ADDRESSED and the tests provably prove submission: reviewer grepped `SessionState::Working`
+    and found it assigned in EXACTLY two places tree-wide, both inside send_input's
+    `if text.is_empty()` branch — so both strengthened assertions are satisfiable only if the
+    Enter call ran, making the drop-the-Enter mutation caught by construction. Screen text can no
+    longer carry the test. No path produces a false `Typed`: deliver_to journals Typed and replies
+    only in the Ok arm, and type_into `?`s the body write and returns the Enter result.
+  I1 ADDRESSED honestly: new `ambiguous_pushes` map (same MSG_MAP_CAP drop-oldest), consulted
+    BEFORE RouteInput is built so route() stays a pure five-rule function, answering Ask(sessions).
+    No PTY write on any Ask path, confirmed.
+  All four smaller items addressed. `strip_command` traced across every form: /use, /use 3,
+    /use@bot 3, /ls@bot parse; /user, /useless, /usewhat@bot correctly fall through to normal
+    routing and get typed verbatim (pinned by a test). No lock is held across a network call at
+    ANY send site (reviewer checked all of them, not just the reported one). stop rechecked
+    between drain_outbound and the send. Path leak replaced with a fixed placeholder.
+  Security ordering confirmed intact at bridge.rs:439-444; no new lock cycle (`ambiguous_pushes`
+    is only ever taken alone); no token in any new status text, log, or journal entry.
+Integration: deferred note: the `text.is_empty()` guard would send a bare Enter and report a
+  `Typed` receipt — unreachable in practice (telegram.rs:41 skips updates with no text, and
+  Telegram cannot send empty text) and identical to pre-fix behaviour.
+Integration: deferred note: disjoint-MsgId-by-convention cannot mis-route — the check order is
+  fail-safe, `ambiguous_pushes` is consulted before `outbound_map`, so an id in both yields Ask
+  (writes nothing) rather than typing into a guessed session.
+Integration: deferred note: `Ask` can name a session that has since vanished (ids recorded at
+  send time, not intersected with `waiting()`). Strictly better than the old Gone; the follow-up
+  /use N gets an honest "没能敲进". Intersecting would be a small improvement, not a defect.
+Integration: complete (commits 771ced2..ed0b078, review clean after 1 fix round, 4 minors +
+  4 deferred notes). THE FEATURE NOW WORKS END TO END under test.
+
+Task 10: implementer DONE, commit e1c720e. 875 passing (baseline 856 + 19), fmt + clippy clean,
+  no stray logs. All three brief mutations caught; the admit-0 ordinal mutation was caught by a
+  proactively added `a_model_answer_of_zero_is_out_of_range_and_sent_as_typed` test. Task 9's
+  async half FULLY LANDED — options_prompt/parse_options now have a real caller via
+  `compose_outbound`, fallback built first, model asked second with a 15s timeout, `Event.screen`
+  added and threaded through session.rs/daemon.rs.
+Task 10: review (opus) — spec ✅, quality Approved, NO Criticals. The red line was traced rather
+  than assumed: every path into the model and out of `map_answer` checked; `complete_with_timeout`
+  sends a late result to a dropped receiver so a slow model can never write back; `narrow` has no
+  representation for confidence so it structurally cannot skip the question. `compose_outbound`'s
+  fallback-first ordering is structural (base is line 1; the model call can only APPEND).
+  `screen` captured after the gates and debounce, so no cost when notifications are off; read at
+  exactly one site and never reaching a receipt, the journal, an error string, or a log.
+  Three Importants, all dispatched as fix round 1:
+  P1 (privacy, the serious one): `parse_options` rejects only `/` and a backtick, so a screen line
+     like `Set API_KEY=sk-live-abc123 in .env, then continue` — or a diff line `- return None` —
+     becomes a candidate, is appended to the push, and is stored in Telegram's cloud. This is the
+     FIRST screen-derived text to reach the wire. Fix: length bound (~24 chars), reject `=`, `\`,
+     `--`, and cap the candidate count.
+  P2 (red line): `pending_options` is cleared only when that session appears in a LATER batch, so
+     if the agent moves past its question without a new event (answered in the terminal, or
+     debounced) the entry survives and the next free-text reply is handed to map_answer — making
+     the guarantee the model's obedience rather than the structure. Fix with a TTL/Instant stamp
+     and/or clearing on TUI input.
+  P3: when a mapping fires the receipt still says only 已经敲进「name」, never what actually went
+     in — precisely the harm the red line names. Fix: state the choice when map_answer mapped.
+  Plus one minor being fixed because the code documents the rule it breaks: the backend mutex is
+  held across the model call (up to 15s at :1037, 8s at :107-118), contradicting reply()'s own
+  comment at :868-874 about never holding a lock across a network call.
+Task 10: minor (deferred): moving `install_llm_backend` ahead of `start_phone_bridge`
+  (daemon.rs:1059) lengthens the "正在重新接上" window the comment above it calls short. Correct as
+  a fix for the None-backend bug; the alternative is set_backend after spawn.
+Task 10: minor (deferred): the appended options list has no cue telling a non-programmer they may
+  answer by number or in their own words.
+Task 10: fix round 1/5 (4 addressed, 0 open; commit c0a2ca0, 883 passing).
+  P1 ADDRESSED: filter now rejects `/`, backtick, `=`, `\`, `--`, >24 CHARACTERS (not bytes —
+    correct, a 24-byte cap would reject an 8-char Chinese option), and caps candidates at 6.
+    The `=` test uses a short `A=1` so the length bound cannot mask it; the length test uses a
+    symbol-free 30-char string. Both genuinely mutation-sensitive.
+  P2 ADDRESSED via TTL: `(Instant, Vec<String>)`, entries dropped after 300s BEFORE the backend
+    is touched; the test asserts verbatim text, plain receipt, AND `SpyBackend::calls() == 0`, so
+    the mutation fails on the call count rather than a string.
+  P3 ADDRESSED: `map_answer_index` returns `Option<usize>`, making "mapped" type-level rather than
+    inferred from "the output looks numeric" — which avoids a numeric free-text reply printing a
+    bogus option. Receipt names the choice only when `chosen.is_some()`; `opt` can only come from
+    `parse_options` output so it inherits the filter.
+  Mutex-across-model-call ADDRESSED at both sites; no other `backend.lock()` site remains.
+Task 10: fix round 2/5 dispatched for two named residuals — reject `:` and `：` (colon-separated
+  secrets like `token: abc123` were the nearest miss to the leak just fixed, same KEY-value shape
+  as `=`), and make the candidate cap REJECT rather than truncate (its own doc argues >6 lines
+  means the model misread the screen, in which case keeping 6 still pushes 6 screen lines).
+  Committed as 52e154f; verification running.
+
+**Ruling 12 — deferring clear-on-TUI-input for `pending_options`.**
+A 300s window remains where options are consulted for a question the agent has stopped asking:
+agent asks A/B → push carries options → user answers IN THE TERMINAL → agent moves on without a
+new event → a later free-text reply from the phone is handed to map_answer, and a disobedient
+model returning "1" substitutes. Ruling: defer. The TTL bounds it, and P3's receipt now discloses
+any substitution, so the harm is visible rather than silent — which was the red line's actual
+concern. Closing it fully needs a hook in the session input path.
+Cost if wrong: within 5 minutes of answering a question in the terminal, a phone reply to that
+same session could be replaced by an ordinal — and the user would see the receipt say so.
+Task 10: deferred: remaining filter residuals a short-string filter cannot catch — bare
+  `sk-live-abc123`, `return None`, `.env`, `-rf`. This is defence in depth, not a proof.
+Task 10: fix round 2/5 (2 addressed; commit 52e154f, 885 passing). `:` and `：` now rejected;
+  candidate cap rejects instead of truncating. Controller accepted these on round 1's verdict
+  rather than spending a third review pass on two rejection predicates.
+Task 10: complete (commits ed0b078..52e154f, review clean after 2 fix rounds, 4 minors deferred)
+
+Task 11: implementer DONE, commit 5e6ff78 — DOCS ONLY. All three brief requirements (backoff
+  cap, bounded drop-oldest queue, BadToken/Malformed → Broken without retry) were already fully
+  implemented and tested by Tasks 5 and 6, which needed them at the time. It correctly declined
+  to add a duplicate `backoff(attempt)` alongside the existing `next_backoff(current)`, ran both
+  required mutations by hand against the existing tests (both failed correctly, then reverted —
+  `git diff` on bridge.rs/phone.rs empty), and changed no source.
+Task 11 Step 6: NOT RUN, as instructed — no bot token. Written into the spec's 未验证/风险 table
+  as eight NOT RUN entries, each with what to do, what to expect, and why it matters. Check 7
+  (a stranger messages the bot → nothing happens) is marked most important: it is the only
+  end-to-end confirmation of the security boundary, which unit tests cover only as branch logic.
+  Check 8 (restart, then reply to an old message → "that session is gone", nothing typed) second.
+  Also recorded every never-validated guessed constant: DEBOUNCE_WINDOW 30s, QUEUE_CAP 32,
+  PENDING_OPTIONS_TTL 300s, MSG_MAP_CAP 256, OPTION_MAX_CHARS 24, OPTIONS_MAX_CANDIDATES 6,
+  and the 15s/8s model timeouts — each labelled a guess rather than a measurement.
+Task 11: complete (commit 52e154f..5e6ff78, docs only, Step 6 recorded NOT RUN)
+
+ALL 11 PLAN TASKS COMPLETE + the out-of-plan border removal + the out-of-plan integration task.
+Final whole-branch review (opus, resumed after the machine slept mid-run): **READY WITH FIXES**,
+no Criticals. 885 passing, fmt clean, clippy 0, all 21 commit messages English with no AI trailer.
+  Three Importants: (1) daemon.rs:99 installs the event sink unconditionally, so should_notify's
+    has_channel gate is dead in production and screen text is captured for users who never enabled
+    phone (dropped in-process, not a leak, but two doc comments are now false guarantees);
+    (2) enqueue/deliver/BridgeHandle::accept are pub with no external caller, so in-crate code could
+    build a Bridge, install the real writer, and call deliver() bypassing accept() entirely — the
+    guard's value is being structural; (3) the options list is bare `1. …` with no cue that a free-text
+    answer is honoured, though the whole map_answer_index path exists for it.
+  Minors taken into the fix wave: PhoneUnpair leaves used/outbound_map/ambiguous_pushes/
+    pending_options behind so a NEW phone inherits the old one's /use target (the lost-phone path);
+    telegram.rs uses .lock().unwrap() rather than recover() at four sites (silent poll-thread death
+    while the UI still says 已连上); the bottom bar shows state keys while the token field is open,
+    where `x` types a literal x; PhoneSetToken writes the status slot after replace() has already
+    started the bridge, so an immediate Broken can be overwritten back to WaitingForPairing.
+  Deferred-list triage: ONLY the pub-surface item was fix-before-merge. All ~15 others ship as-is,
+    with reasoning recorded per item. Two dropped as already resolved: T4's unread
+    phone_set_token_failure_message (now called at daemon.rs:540) and `pub fn map_answer` (now
+    #[cfg(test)] pub(crate) as of 52e154f).
+  Verified clean across the whole branch: no second inert path; the security boundary holds with
+    nothing reaching route/deliver/route_and_deliver/send_input except Request::Input (0600 socket)
+    and ui/grid.rs; Event.screen written at exactly one site and read at exactly one, with nothing
+    screen-derived reaching a receipt, the journal (Delivery is a Copy enum with no text), a log, or
+    the UI except through parse_options; no lock held across a network call at any of the four send
+    sites; lock order acyclic; secrets atomic at 0600 with send_real's token-bearing error string
+    discarded at every call site; spec fidelity confirmed including all five "not implemented"
+    exclusions genuinely absent; border-removal commit b6046ac verified in full.
+  One benign spec deviation noted: outbound intelligence runs synchronously on the sender thread
+    with a 15s hard timeout rather than a spawned thread — fallback still computed first, tick()
+    untouched.
+  Task 11's eight-row manual checklist judged adequate to execute by hand, with rows 7 and 8
+    correctly flagged as the two that actually prove the security boundary and the Gone path.
+Final fix wave dispatched (one agent, all seven items, per the skill's one-wave rule).
+Final fix wave: commit a9564a2, 887 passing (885 + 2), fmt clean, clippy 0, clean tree.
+  Fix 1 took the REAL route rather than the comment-only fallback: sink armed at startup only
+  when a token exists, re-armed in PhoneSetToken so mid-session enable works without a restart,
+  new clear_event_sink() called from PhoneDisable, and both stale doc comments rewritten.
+Final scoped re-review (opus): **MERGE VERDICT READY.** All seven ADDRESSED, no new Critical or
+  Important. Specifically confirmed: mid-session enable works (token verified → slot → bridge →
+  sink armed → next stop pages); disable genuinely stops capture (maybe_notify returns at the
+  gate BEFORE screen_text() is called); PhoneUnpair correctly leaves the sink armed since the
+  token is still configured; the narrowed visibility is compiler-enforced with no equivalent
+  bypass left (the pub free route() returns a value with nothing public to execute it);
+  clear_owner clears all six routing fields while deliberately keeping `outbound` (undelivered
+  pushes are not phone-specific); the fix-4 mutation was verified structurally capable of failing
+  (the test drives /use 3 through dispatch rather than stubbing `used`); all four telegram.rs
+  sites use recover() with every remaining .lock().unwrap() confined to #[cfg(test)]; no
+  `continue` introduced; slot-then-start ordering corrected.
+  Collateral verified hunk by hunk: the 9 test call-site edits are each a single added
+  `&test_event_tx(),` line — no assertion, expectation, or assert! text changed anywhere.
+  tick() cannot block or panic on the sink (clones the Option first, so arming/clearing
+  concurrently is race-free; worst case is one skipped notification).
+KNOWN ISSUES surfaced at merge (not blockers):
+  - PhoneSetToken still RETURNS the optimistic WaitingForPairing status, so a bridge that fails
+    within milliseconds shows 等配对 for one refresh before the next poll reveals Broken. The
+    persisted slot is no longer clobbered, so it self-heals.
+  - Fix 1's arming is keyed on the secrets store being readable at startup; a corrupt secrets
+    file leaves the sink unarmed, so the feature reads as off rather than half-on — coherent with
+    start_phone_bridge and initial_phone_status, which also skip.
