@@ -281,6 +281,14 @@ pub enum Key {
     StaleDaemonAsk,
     StaleDaemonRestarting,
     StaleDaemonRestartFailed,
+    // —— 守护进程重启后，问要不要接回上次的会话 ——
+    ResumeSessionsExplain,
+    ResumeSessionsAsk,
+    /// 清单里某一条后面跟的标记：这一条会真的接回上次的对话。
+    ResumeSessionsWillContinue,
+    /// 清单里某一条后面跟的标记：同一个目录 + agent 下已经有别的会话
+    /// 接回去了，这一条老老实实开一个新的。
+    ResumeSessionsWillStartFresh,
     RequestFailed,
     ActionDone,
     NoChanges,
@@ -606,6 +614,18 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Could not restart it. Continuing with the old one.",
             zh: "没能重启，先接着用旧的",
         ),
+        ResumeSessionsExplain => t!(
+            lang,
+            en: "The background service was not running. Before, it had these sessions open:",
+            zh: "后台服务这次没在跑。它上次开着这些会话：",
+        ),
+        ResumeSessionsAsk => t!(
+            lang,
+            en: "Bring them back? (y = bring them back, Enter = start with an empty board)",
+            zh: "要接回来吗？(y = 接回来，直接回车 = 从空白看板开始)",
+        ),
+        ResumeSessionsWillContinue => t!(lang, en: "continues", zh: "继续"),
+        ResumeSessionsWillStartFresh => t!(lang, en: "starts fresh", zh: "新开"),
         DaemonTooOld => t!(
             lang,
             en: "The background service is an older version and cannot show the screen. Quit dct and open it again.",
@@ -1435,6 +1455,10 @@ mod tests {
             StaleDaemonAsk,
             StaleDaemonRestarting,
             StaleDaemonRestartFailed,
+            ResumeSessionsExplain,
+            ResumeSessionsAsk,
+            ResumeSessionsWillContinue,
+            ResumeSessionsWillStartFresh,
             RequestFailed,
             ActionDone,
             NoChanges,
@@ -1470,7 +1494,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 101, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 105, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

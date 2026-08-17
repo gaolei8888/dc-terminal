@@ -51,6 +51,7 @@ fn fake_agent() -> Profile {
         api: None,
         label: Default::default(),
         note: Default::default(),
+        resume_args: Default::default(),
     }
 }
 

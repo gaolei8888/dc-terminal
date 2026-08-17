@@ -53,6 +53,33 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         socket,
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
+
+    // 上次守护进程还活着时留下的会话清单——**先读出来，再装路径**。
+    // 装路径本身不写盘（`set_last_sessions_path` 只记一个 `PathBuf`），
+    // 但装完之后紧接着的 `restore_last_sessions` 里每一次
+    // `create_resuming` 都会触发一次 `persist_last_sessions`，把清单
+    // 重写成「这一刻已经恢复出来的那几个」——顺序反过来的话，恢复的
+    // 第一条会话建好的瞬间就把还没读到的其余条目冲掉。
+    //
+    // 路径跟 secrets/store 一样直接从 socket 推：这是一份可以随时重建
+    // 的状态缓存，不是需要「只有真正的守护进程才落盘」那种审计意义上的
+    // 生死簿（对比 `journal`，只有 `run()` 才给它装真实路径），装在
+    // `run_with_manager` 里让直接调用它的测试也能验到恢复逻辑。
+    let last_sessions_path = crate::last_sessions::last_sessions_path_for_socket(socket);
+    let last_sessions_records = crate::last_sessions::load(&last_sessions_path);
+    mgr.set_last_sessions_path(last_sessions_path);
+    if !last_sessions_records.is_empty() {
+        let (all, _) = all_profiles(&profiles_dir);
+        let secrets_guard = recover(secrets.lock());
+        for line in restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr) {
+            // 最佳努力：跳过的每一条都留一句人话在 stderr，绝不能因为
+            // 一条坏记录（目录没了、profile 被删了……）就让整个恢复
+            // 流程中止——一半恢复出来的看板好过一个都没有。
+            eprintln!("{line}");
+        }
+        drop(secrets_guard);
+    }
+
     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
     // Task 5 的 bridge 线程要写的那个地方——两边共用同一把 `Mutex`，谁先谁后
     // 都不会看到半份数据。启动时只看密钥仓里有没有令牌：**不**在这里打一次
@@ -275,6 +302,60 @@ fn start_phone_bridge(
 /// 触发的动作，不能因为「什么都没配」就替他打开、把他终端里的东西发
 /// 给第三方。只有用户确实写了 `[llm]` 却指向一个连不上的后端时，才值得
 /// 在 stderr 上留一行——那时候他大概率是想用这功能的，只是配错了。
+/// 把上次守护进程还活着时记下的会话逐条接回来。**全程最佳努力**：一条
+/// 记录目录没了、profile 被删了、或者建的时候本身就出错，只跳过那一条、
+/// 留一句解释，绝不能因为一条坏记录就让其它本来接得回来的会话也一起
+/// 泡汤。
+///
+/// 谁真的该带 `--continue`（谁不该）由 `last_sessions::group_for_resume`
+/// 这个纯函数决定——这里只管照着它的判定去调
+/// `SessionManager::create_resuming`，不重新做一遍分组判断。
+///
+/// 返回值是给用户看的诊断行（跳过了哪条、为什么），调用方决定往哪儿送
+/// （目前是 stderr，只有前台 `dct daemon` 能看见——这条限制跟
+/// `install_llm_backend` 里那句注释是同一件事：真正的守护进程没有终端）。
+/// 抽成返回值而不是内部直接 `eprintln!`，是为了这条最容易出错的路径能
+/// 被单元测试直接断言到，不用真的起一个 socket 去截 stderr。
+fn restore_last_sessions(
+    records: &[crate::last_sessions::RecordedSession],
+    all: &[Profile],
+    secrets: &SecretStore,
+    mgr: &SessionManager,
+) -> Vec<String> {
+    let resume_flags = crate::last_sessions::group_for_resume(records);
+    let mut diagnostics = Vec::new();
+
+    for (record, &resume) in records.iter().zip(resume_flags.iter()) {
+        if !record.dir.is_dir() {
+            diagnostics.push(format!(
+                "跳过恢复：{} 这个目录已经不在了（profile：{}）",
+                record.dir.display(),
+                record.profile
+            ));
+            continue;
+        }
+        if !all.iter().any(|p| p.name == record.profile) {
+            diagnostics.push(format!(
+                "跳过恢复：{} 用的 {} 这个 agent 已经不在了",
+                record.dir.display(),
+                record.profile
+            ));
+            continue;
+        }
+
+        let secret = secrets.get(&record.profile);
+        if let Err(e) = mgr.create_resuming(&record.dir, &record.profile, secret, all, resume) {
+            diagnostics.push(format!(
+                "跳过恢复：{}（{}）没能重新起来：{e}",
+                record.dir.display(),
+                record.profile
+            ));
+        }
+    }
+
+    diagnostics
+}
+
 fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
     let Some(llm) =
         &crate::config::Config::load(&crate::config::config_path_for_socket(socket)).llm
@@ -750,6 +831,137 @@ mod tests {
         run(&["commit", "-q", "-m", "init"]);
     }
 
+    fn init_repo(path: &Path) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), "hi\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn rec(dir: &Path, profile: &str) -> crate::last_sessions::RecordedSession {
+        crate::last_sessions::RecordedSession {
+            dir: dir.to_path_buf(),
+            profile: profile.to_string(),
+            tag: String::new(),
+            last_active: 1,
+        }
+    }
+
+    /// **一条坏记录不能连累其它接得回来的会话。** 目录已经不在了的那条
+    /// 该被跳过（带一句能读懂的理由），同一批里目录还在的那条要照常
+    /// 恢复出来。
+    #[test]
+    fn a_missing_directory_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alive = tmp.path().join("alive");
+        std::fs::create_dir(&alive).unwrap();
+        init_repo(&alive);
+        let gone = tmp.path().join("gone-project"); // 从没建过，目录不存在
+
+        let mgr = SessionManager::new();
+        let all = vec![fake_agent()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let records = vec![
+            rec(&gone, "daemon-lock-fake"),
+            rec(&alive, "daemon-lock-fake"),
+        ];
+        let lines = restore_last_sessions(&records, &all, &secrets, &mgr);
+
+        assert_eq!(lines.len(), 1, "只有一条该被跳过：{lines:?}");
+        assert!(
+            lines[0].contains(&gone.display().to_string()),
+            "跳过的理由要点名是哪个目录：{lines:?}"
+        );
+        assert_eq!(mgr.list().len(), 1, "目录还在的那条要恢复出来");
+        assert_eq!(mgr.list()[0].dir, alive.display().to_string());
+    }
+
+    /// 同样的道理，profile 被用户删掉了（比如以前装过又卸载、或者磁盘上
+    /// 的自定义 profile 文件被删了）也只是跳过这一条。
+    #[test]
+    fn a_removed_profile_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        init_repo(&proj);
+
+        let mgr = SessionManager::new();
+        let all: Vec<Profile> = vec![]; // 空：这个 profile 已经不认识了
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let records = vec![rec(&proj, "no-longer-exists")];
+        let lines = restore_last_sessions(&records, &all, &secrets, &mgr);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no-longer-exists"));
+        assert!(mgr.list().is_empty(), "没恢复出任何会话");
+    }
+
+    /// claude×2 撞车：只有活得最晚的那个真的带 `--continue`。这条测试
+    /// 走的是 `restore_last_sessions` 的完整路径——分组判定
+    /// （`last_sessions::group_for_resume`）+ 真的用 `create_resuming`
+    /// 把参数接上去，用探针 profile 直接从屏幕上读出接没接。
+    #[test]
+    fn restoring_two_claude_sessions_in_one_dir_only_continues_the_newer_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let probe = Profile::from_toml(
+            r#"
+            name = "resume-probe"
+            command = ["/bin/sh", "-c", "printf 'ARGS=[%s]\n' \"$*\"; sleep 5", "--"]
+            is_agent = false
+            resume_args = ["marker-arg"]
+            "#,
+        )
+        .unwrap();
+        let all = vec![probe];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut older = rec(&proj, "resume-probe");
+        older.last_active = 100;
+        let mut newer = rec(&proj, "resume-probe");
+        newer.last_active = 200;
+
+        let mgr = SessionManager::new();
+        let lines = restore_last_sessions(&[older, newer], &all, &secrets, &mgr);
+        assert!(lines.is_empty(), "两条都该恢复成功：{lines:?}");
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut with_marker, mut without_marker);
+        loop {
+            with_marker = ids
+                .iter()
+                .filter(|&&id| mgr.screen_text_for_test(id).contains("ARGS=[marker-arg]"))
+                .count();
+            without_marker = ids
+                .iter()
+                .filter(|&&id| mgr.screen_text_for_test(id).contains("ARGS=[]"))
+                .count();
+            if with_marker + without_marker == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "两个探针都该有输出了");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(with_marker, 1, "只能有一个真的接上了 --continue 式的参数");
+        assert_eq!(without_marker, 1, "另一个必须老老实实开一个新的");
+    }
+
     // 用 cat 冒充 agent：能收输入、不会自己退出，is_agent = true 才会触发
     // create() 里的 git checkpoint。
     fn fake_agent() -> Profile {
@@ -767,6 +979,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 
@@ -966,6 +1179,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 
@@ -1546,6 +1760,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 

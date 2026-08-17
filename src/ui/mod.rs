@@ -2597,6 +2597,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         };
 
         let home = tempfile::tempdir().unwrap();

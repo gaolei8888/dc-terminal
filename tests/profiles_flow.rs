@@ -138,6 +138,7 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
         api: None,
         label: Default::default(),
         note: Default::default(),
+        resume_args: Default::default(),
     };
 
     let home = tempfile::tempdir().unwrap();

@@ -7,6 +7,9 @@ is_agent = true
 # 正好把那行顶掉——profile 会用自己的启动参数保证自己永远判不出空闲。
 busy_pattern = "esc to interrupt"
 error_pattern = "API Error|Connection closed mid-response"
+# 恢复守护进程重启前的会话时用：跑的是 claude 二进制，`--continue`
+# 接回这个目录下最近一次对话。
+resume_args = ["--continue"]
 
 [label]
 zh = "DeepSeek"

@@ -63,6 +63,7 @@ fn test_shell_profile() -> Profile {
         api: None,
         label: Default::default(),
         note: Default::default(),
+        resume_args: Default::default(),
     }
 }
 

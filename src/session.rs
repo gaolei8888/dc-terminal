@@ -486,6 +486,16 @@ struct Session {
     /// 见那个字段的文档，理由跟 `channel::debounce` 用 `Duration` 而不是
     /// `Instant` 一样：这里是唯一需要拿它做减法的地方。
     last_notified: Option<Duration>,
+    /// 建这个会话的挂钟时刻，写进 `last-sessions.toml` 的 `last_active`。
+    ///
+    /// **只在创建时打一次戳，不随后续操作更新**：这个仓库里没有别的地方
+    /// 追踪「用户真的在跟这个会话互动」这件事的精确时刻（`send_input`
+    /// 关心的是要不要打检查点，不是这个），临时为了这一个字段去加一条
+    /// 更细的追踪，换来的精度在 `last_sessions::group_for_resume` 唯一
+    /// 关心的场景——「同一个目录+profile 下，哪个是后开的那个」——里
+    /// 派不上用场：两个会话谁更该继续，靠的是谁开得晚，不是谁刚被戳了
+    /// 一下键盘。
+    last_active: std::time::SystemTime,
 }
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
@@ -510,6 +520,11 @@ pub struct SessionManager {
     /// 出错解释要用的后端。`None` = 没配 LLM，功能安静下线（见
     /// `request_explanation`）。守护进程启动时 resolve 一次填进来。
     backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>,
+    /// `last-sessions.toml` 该落在哪。`None` = 不落盘（默认；单元测试
+    /// 拿到的就是这种），只有 `daemon.rs::run_with_manager` 会给它一个
+    /// 真实路径——同 `journal` 的模式，绝不能让测试写到用户真实的
+    /// `~/.dct/last-sessions.toml`。
+    last_sessions_path: Mutex<Option<PathBuf>>,
     /// 上面那次 resolve 为什么失败。**只有用户确实写了 `[llm]` 却接不上时
     /// 才是 `Some`**——没写 `[llm]` 是绝大多数人的正常状态，不是问题，
     /// 那种情况这里始终是 `None`。存下来是因为守护进程的 stderr 被丢弃了
@@ -557,6 +572,7 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),
+            last_sessions_path: Mutex::new(None),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
             event_tx: Mutex::new(None),
@@ -632,6 +648,51 @@ impl SessionManager {
         recover(self.extra_profiles.lock()).insert(p.name.clone(), p);
     }
 
+    /// 装上 `last-sessions.toml` 该落在哪。只有 `daemon.rs::run_with_manager`
+    /// 会调用——同 `journal.set_path` 的模式。装上之后，`create`/`stop`/
+    /// `kill`/`prune` 才会真的往磁盘写；不调用就是默认状态（不落盘），
+    /// 单元测试因此不会碰到真实的 `~/.dct/last-sessions.toml`。
+    pub fn set_last_sessions_path(&self, path: PathBuf) {
+        *recover(self.last_sessions_path.lock()) = Some(path);
+    }
+
+    /// 把此刻还活着（非 `Stopped`）的会话整份重写进 `last-sessions.toml`。
+    ///
+    /// **只从 `create`/`stop`/`kill`/`prune` 调用，绝不能从 `tick()` 调**——
+    /// 见 `last_sessions` 模块文档开头那段。落盘失败只吞掉、写 stderr：
+    /// 跟 `journal` 一样，这是一份可以随时重建的状态缓存，不是用户数据，
+    /// 没必要因为一次写盘失败就让 `create`/`stop` 这些请求本身也报错。
+    fn persist_last_sessions(&self) {
+        let Some(path) = recover(self.last_sessions_path.lock()).clone() else {
+            return;
+        };
+        let snapshot: Vec<Arc<Mutex<Session>>> =
+            recover(self.sessions.lock()).values().cloned().collect();
+        let records: Vec<crate::last_sessions::RecordedSession> = snapshot
+            .iter()
+            .filter_map(|arc| {
+                let s = recover(arc.lock());
+                if s.state == SessionState::Stopped {
+                    return None;
+                }
+                let tag = recover(s.name_slot.lock()).clone().unwrap_or_default();
+                Some(crate::last_sessions::RecordedSession {
+                    dir: s.dir.clone(),
+                    profile: s.profile.name.clone(),
+                    tag,
+                    last_active: s
+                        .last_active
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                })
+            })
+            .collect();
+        if let Err(e) = crate::last_sessions::save(&path, &records) {
+            eprintln!("上次会话清单写入失败（{}）：{e}", path.display());
+        }
+    }
+
     /// `profiles` 是调用方（daemon）已经算好的「内置 + 磁盘」全集（见
     /// `profile::all_profiles`），排在最前面查——用户在磁盘上新建或覆盖的
     /// profile 必须能被 `create()` 找到，不然「UI 说这个 agent 能用」和
@@ -661,6 +722,45 @@ impl SessionManager {
         profile_name: &str,
         secret: Option<&str>,
         profiles: &[Profile],
+    ) -> Result<u32> {
+        self.create_inner(dir, profile_name, secret, profiles, false)
+    }
+
+    /// `create()` 的姐妹方法：多一个 `resume` 开关，守护进程重启后恢复
+    /// 上次的会话时用。
+    ///
+    /// **不是给 `create()` 加一个新参数**：这个仓库里 `create()` 的调用点
+    /// 遍布正常的「用户按 n 开一个新会话」路径（`daemon.rs::handle`、
+    /// 一大批测试），那条路上根本不存在「要不要接上恢复参数」这个问题——
+    /// 硬塞一个恒为 `false` 的参数进每一个调用点，是在让所有跟恢复无关的
+    /// 调用方替一个只有守护进程启动那一刻才用得上的功能背默认值。加一个
+    /// 姐妹方法，正常路径原封不动，恢复路径（目前只有 `daemon.rs` 启动时
+    /// 读 `last-sessions.toml` 那一段）单独走这条。
+    ///
+    /// `resume = true` 时把 `profile.resume_args` 接到 `profile.command`
+    /// 后面（`opencode`/`qwen`/`codex`/`shell` 这类没声明 `resume_args`
+    /// 的 profile，接的是一个空切片，等于什么都没变——调用方不用先检查
+    /// 「这个 profile 支不支持恢复」再决定要不要传 `true`）。判定「这一条
+    /// 该不该真的传 `true`」是 `last_sessions::group_for_resume` 的事，
+    /// 不是这里。
+    pub fn create_resuming(
+        &self,
+        dir: &Path,
+        profile_name: &str,
+        secret: Option<&str>,
+        profiles: &[Profile],
+        resume: bool,
+    ) -> Result<u32> {
+        self.create_inner(dir, profile_name, secret, profiles, resume)
+    }
+
+    fn create_inner(
+        &self,
+        dir: &Path,
+        profile_name: &str,
+        secret: Option<&str>,
+        profiles: &[Profile],
+        resume: bool,
     ) -> Result<u32> {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
@@ -706,7 +806,15 @@ impl SessionManager {
             }
         }
 
-        let pty = PtySession::spawn(&profile.command, &env, dir, 40, 120)?;
+        // 只在恢复路径上、且这个 profile 真的声明过恢复参数时才追加——
+        // 没声明的 profile（`opencode`/`qwen`/`codex`/`shell`）这里接的是
+        // 空切片，`command` 原样不变。
+        let mut command = profile.command.clone();
+        if resume {
+            command.extend(profile.resume_args.iter().cloned());
+        }
+
+        let pty = PtySession::spawn(&command, &env, dir, 40, 120)?;
 
         let mut checkpoints = Vec::new();
         if is_agent {
@@ -741,6 +849,7 @@ impl SessionManager {
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
             last_notified: None,
+            last_active: std::time::SystemTime::now(),
         };
 
         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
@@ -750,6 +859,9 @@ impl SessionManager {
 
         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
         recover(self.sessions.lock()).insert(id, Arc::new(Mutex::new(session)));
+        // 会话集合变了，把清单重写一份——`create`/`stop`/`kill`/`prune`
+        // 四处之一，绝不能从 `tick()` 调，见 `persist_last_sessions` 文档。
+        self.persist_last_sessions();
         Ok(id)
     }
 
@@ -918,7 +1030,7 @@ impl SessionManager {
     }
 
     pub fn stop(&self, id: u32) -> Result<()> {
-        self.with_session(id, |s| {
+        let r = self.with_session(id, |s| {
             // pid 要在 kill 之前取：杀完再问就已经被回收了。
             let pid = s.pty.process_id();
             s.pty.kill()?;
@@ -927,7 +1039,14 @@ impl SessionManager {
             // 分得开的两件事——见 `journal` 的模块注释。
             self.journal.died(id, crate::journal::Death::Requested, pid);
             Ok(())
-        })
+        });
+        // **必须在 `with_session` 返回之后调用**：`persist_last_sessions`
+        // 会重新去锁这同一个会话的 `Mutex`（拿它此刻的状态），锁是非重入的，
+        // 挂在上面那个闭包里面调会死锁——`with_session` 这一刻还攥着它。
+        if r.is_ok() {
+            self.persist_last_sessions();
+        }
+        r
     }
 
     /// 强杀：跟 `stop` 同一个落点（`state` 置 `Stopped`），只是不给那 200ms。
@@ -936,11 +1055,17 @@ impl SessionManager {
     /// 这两条命令的结果是同一件事——这个会话不跑了。多一个状态就要在看板、
     /// 九宫格、`dct ps` 三处各给它一种画法，而它们要表达的话是同一句。
     pub fn kill(&self, id: u32) -> Result<()> {
-        self.with_session(id, |s| {
+        let r = self.with_session(id, |s| {
             s.pty.kill_now()?;
             s.state = SessionState::Stopped;
             Ok(())
-        })
+        });
+        // 理由同 `stop()`：不能在 `with_session` 的闭包里调，会跟它手上
+        // 那把还没放开的会话锁死锁。
+        if r.is_ok() {
+            self.persist_last_sessions();
+        }
+        r
     }
 
     /// 把已经停掉的会话从名册上抹掉，返回抹掉了几个。
@@ -969,8 +1094,17 @@ impl SessionManager {
         // 第二趟：只做 HashMap 删除，不碰任何会话锁。
         // 用 `remove().is_some()` 数，不用 `dead.len()`：两趟之间没有锁，
         // 中途可能有别人删了同一个 id，报一个虚高的数字等于骗用户。
-        let mut map = recover(self.sessions.lock());
-        dead.iter().filter(|id| map.remove(id).is_some()).count() as u32
+        let removed = {
+            let mut map = recover(self.sessions.lock());
+            dead.iter().filter(|id| map.remove(id).is_some()).count() as u32
+        };
+        // 真删掉了才重写清单——这也是「进程自己崩了」（tick() 的
+        // vanished 分支不写清单）唯一被清单追上的地方：那条分支只把
+        // 状态标成 Stopped，`prune()` 才真正把它从活着的集合里摘掉。
+        if removed > 0 {
+            self.persist_last_sessions();
+        }
+        removed
     }
 
     /// 恢复到最后一张快照。git 操作同样不持会话锁，理由见 `send_input`。
@@ -1373,6 +1507,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 
@@ -1394,6 +1529,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 
@@ -1423,6 +1559,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 
@@ -1446,6 +1583,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         }
     }
 
@@ -2190,6 +2328,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         });
         m.set_backend(Some(Arc::new(ByScreenTail)));
         let id = m
@@ -2899,6 +3038,132 @@ mod tests {
         assert!(mgr
             .create(&proj, "fake-api", secrets.get("fake-api"), &[])
             .is_ok());
+    }
+
+    /// `create_resuming(resume = true)` 真的把 `resume_args` 接到了
+    /// `command` 后面——不是接到了别的地方，也不是原样漏掉。
+    ///
+    /// 用 `sh -c '... "$@"' --` 当探针：命令行最后追加的参数会变成 `$@`，
+    /// 原样打到屏幕上。`resume = false` 时不该多出这一截。
+    fn resume_probe_profile() -> Profile {
+        Profile::from_toml(
+            r#"
+            name = "resume-probe"
+            command = ["/bin/sh", "-c", "printf 'ARGS=[%s]\n' \"$*\"; sleep 5", "--"]
+            is_agent = false
+            resume_args = ["marker-arg"]
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_resuming_with_resume_true_appends_resume_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(resume_probe_profile());
+
+        let id = mgr
+            .create_resuming(tmp.path(), "resume-probe", None, &[], true)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = mgr.screen_text_for_test(id);
+            if text.contains("ARGS=[marker-arg]") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "没看到追加的恢复参数：{text}");
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn create_resuming_with_resume_false_appends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(resume_probe_profile());
+
+        let id = mgr
+            .create_resuming(tmp.path(), "resume-probe", None, &[], false)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = mgr.screen_text_for_test(id);
+            if text.contains("ARGS=[]") {
+                break;
+            }
+            assert!(
+                !text.contains("marker-arg"),
+                "resume = false 不该带上恢复参数：{text}"
+            );
+            assert!(Instant::now() < deadline, "没看到探针输出：{text}");
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 一个没声明 `resume_args` 的 profile，`resume = true` 也不该凭空
+    /// 长出参数来——`create()`（走的是 `resume = false`）和这条路唯一的
+    /// 差别只在于「这个 profile 自己声明过什么」。
+    #[test]
+    fn a_profile_without_resume_args_is_unaffected_by_the_resume_flag() {
+        let proj = init_repo();
+        let mgr = SessionManager::new();
+        mgr.register_profile(fake_agent());
+
+        let id = mgr
+            .create_resuming(proj.path(), "fake", None, &[], true)
+            .unwrap();
+        // `fake_agent()` 的 command 就是 `["cat"]`：如果 resume_args 被
+        // 凭空加上了什么，`cat` 会因为收到一个不存在的文件名参数而报错
+        // 退出，会话活不过这次探测。
+        sleep(Duration::from_millis(200));
+        assert_eq!(state_of(&mgr, id), SessionState::Working);
+    }
+
+    /// `create`/`stop`/`prune` 改变会话集合时，`last-sessions.toml` 要
+    /// 跟着更新；`tick()` 不写这份文件（见 `persist_last_sessions` 的
+    /// 文档），所以这里全程不调用 `tick()`。
+    #[test]
+    fn creating_and_stopping_rewrites_the_last_sessions_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(fake_agent());
+
+        let proj = init_repo();
+        let id = mgr
+            .create(proj.path(), "fake", empty_secrets(), &[])
+            .unwrap();
+
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs.len(), 1, "建完一个会话，清单里该有一条");
+        assert_eq!(recs[0].profile, "fake");
+        assert_eq!(recs[0].dir, proj.path());
+
+        mgr.stop(id).unwrap();
+        let recs = crate::last_sessions::load(&record_path);
+        assert!(recs.is_empty(), "停掉之后不该再出现在活着的清单里");
+    }
+
+    /// 没装过路径（`SessionManager::new()` 默认状态）的话，`create`/
+    /// `stop` 都不该去碰任何文件——单元测试绝大多数都不设这个路径，
+    /// 一旦哪天不小心变成默认写盘，会到处冒出意外的 `last-sessions.toml`。
+    #[test]
+    fn without_a_configured_path_nothing_is_written_to_disk() {
+        let mgr = SessionManager::new();
+        mgr.register_profile(fake_agent());
+        let proj = init_repo();
+        let id = mgr
+            .create(proj.path(), "fake", empty_secrets(), &[])
+            .unwrap();
+        mgr.stop(id).unwrap();
+        // 没有路径就没有文件可读——这条测试的价值在于上面两步都没有 panic
+        // 也没有把任何东西写到进程当前目录下。
     }
 
     // 下面两个测试踩的是同一块地雷：只要 profile 配了任意 pattern，create() 就把初始状态

@@ -3741,6 +3741,7 @@ mod tests {
             api: None,
             label: Default::default(),
             note: Default::default(),
+            resume_args: Default::default(),
         });
         let dir = tempfile::tempdir().unwrap();
         let id = mgr.create(dir.path(), "bridge-c1-fake", None, &[]).unwrap();

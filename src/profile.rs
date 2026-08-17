@@ -118,6 +118,17 @@ pub struct Profile {
     pub label: LocalizedText,
     #[serde(default)]
     pub note: LocalizedText,
+    /// 恢复会话时追加到 `command` 后面的参数（比如 `claude` 的
+    /// `--continue`）。**只给实测过「这个参数确实是恢复上一次对话」的
+    /// profile 写**——凭空编一个会造出「看着在恢复、其实开了个新对话」
+    /// 的假象，比老老实实开一个新会话更糟：用户会带着错的上下文继续干活。
+    ///
+    /// 恢复时该不该真的把这些参数接上去，不是这个字段自己决定的——见
+    /// `last_sessions::group_for_resume` 的文档：同一个目录下的多个
+    /// 会话如果都在跑同一个 profile，`claude --continue` 只会捡回**最新**
+    /// 那一份对话，所以一组里只有最近活跃的那一个才会真的带上这些参数。
+    #[serde(default)]
+    pub resume_args: Vec<String>,
 }
 
 const CLAUDE: &str = include_str!("../profiles/claude.toml");
@@ -1201,5 +1212,33 @@ mod tests {
         let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
         assert!(p.headless.is_none());
         assert!(p.api.is_none());
+    }
+
+    /// 跑 claude 二进制的五个 profile 都该带 `--continue`——它们重启后要
+    /// 靠这个接回原来的对话。
+    #[test]
+    fn claude_based_profiles_declare_continue_as_resume_args() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(
+                p.resume_args,
+                vec!["--continue".to_string()],
+                "{name}: 应当声明 resume_args = [\"--continue\"]"
+            );
+        }
+    }
+
+    /// **没实测过恢复方式的四个 profile 一条参数都不许编。** 编一个出来，
+    /// 用户会以为自己接回了原来的对话，实际却是一个安安静静的新会话——
+    /// 这比老实告诉他「这个重开了」更糟。
+    #[test]
+    fn unverified_profiles_declare_no_resume_args() {
+        for name in ["codex", "opencode", "qwen", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.resume_args.is_empty(),
+                "{name}: 恢复方式没实测过，不该编 resume_args"
+            );
+        }
     }
 }

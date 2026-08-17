@@ -92,6 +92,14 @@ fn run_ui() -> Result<()> {
     });
 
     if Client::connect(&sock).is_err() {
+        // 真的要拉起一个全新的守护进程之前问一次：上次它带着这些会话被
+        // 关掉过，要不要把它们接回来。放在这里而不是让守护进程自己问——
+        // 守护进程一旦真的被 `spawn_daemon` 拉起来，stdin/stdout/stderr
+        // 全被接到 `/dev/null`（见 `spawn_daemon` 的注释：它要跟 TUI 共用
+        // 同一个终端，任何一行输出都会糊到界面上），那时候已经没有终端
+        // 可以问了。
+        offer_to_resume_last_sessions(&sock, lang);
+
         dct::client::spawn_daemon(&exe, &sock).context("拉起守护进程失败")?;
 
         for _ in 0..50 {
@@ -117,6 +125,70 @@ fn run_ui() -> Result<()> {
     // 会话在干什么——后者才是「一屏管好几个 agent」这件事的样子。
     let mode = dct::settings::load_view_mode(&settings).unwrap_or(dct::ui::ViewMode::Grid);
     dct::ui::run(client, std::env::current_dir()?, lang, sock.clone(), mode)
+}
+
+/// 这次要拉起的是一个全新的守护进程（`Client::connect` 刚判定连不上），
+/// 而上次关掉的那个守护进程可能还留着一份 `last-sessions.toml`。进界面
+/// 之前问一次：接回来，还是从空白看板开始。
+///
+/// **只在这里问，不在守护进程里问**——见调用点的注释。
+///
+/// 用户按 Enter（或者答案不是 `y`）：清单要清空，`daemon::run_with_manager`
+/// 稍后读到的就是一份空清单，什么都不会恢复——这正是「拒绝恢复要清掉
+/// 记录」这条规矩落地的地方。按 `y`：清单原样留着不动，交给守护进程
+/// 启动时自己去读、自己去按 `(dir, profile)` 分组决定谁真的带上恢复参数
+/// （`daemon::restore_last_sessions` / `last_sessions::group_for_resume`）——
+/// 这里不重复算一遍分组，只是为了把状态词（继续/新开）显示给用户看。
+///
+/// 读不到 stdin（没有终端、被脚本调用……）**什么都不做**：不清空、也不
+/// 假装用户回答了什么。这份清单本来就没有过期这回事（见 `last_sessions`
+/// 模块的文档），保持原样比乱猜一个答案更安全。
+fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
+    let path = dct::last_sessions::last_sessions_path_for_socket(sock);
+    let records = dct::last_sessions::load(&path);
+    if records.is_empty() {
+        return;
+    }
+
+    let profiles_dir = dct::profile::profiles_dir_for_socket(sock);
+    let (all, _) = dct::profile::all_profiles(&profiles_dir);
+    let resume_flags = dct::last_sessions::group_for_resume(&records);
+
+    println!("{}", text(Key::ResumeSessionsExplain, lang));
+    for (rec, &resume) in records.iter().zip(resume_flags.iter()) {
+        let label = all
+            .iter()
+            .find(|p| p.name == rec.profile)
+            .map(|p| p.display_label(lang))
+            .unwrap_or_else(|| rec.profile.clone());
+        let marker = text(
+            if resume {
+                Key::ResumeSessionsWillContinue
+            } else {
+                Key::ResumeSessionsWillStartFresh
+            },
+            lang,
+        );
+        let name = if rec.tag.is_empty() {
+            rec.dir.display().to_string()
+        } else {
+            format!("{}  ({})", rec.tag, rec.dir.display())
+        };
+        println!("  {label}  {name}  [{marker}]");
+    }
+    print!("{} ", text(Key::ResumeSessionsAsk, lang));
+    let _ = std::io::stdout().flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        // 拒绝恢复：清单要清空，不是留着等下次再问。落盘失败就算了——
+        // 最坏的结果是下次又问一遍同样的问题，不影响这次已经决定
+        // 「从空白看板开始」这件事。
+        let _ = dct::last_sessions::clear(&path);
+    }
 }
 
 /// 撞上旧守护进程时，进界面之前先跟用户说清楚。
