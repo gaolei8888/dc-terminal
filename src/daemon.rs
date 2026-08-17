@@ -63,6 +63,17 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let s = recover(secrets.lock());
         Arc::new(Mutex::new(initial_phone_status(&s)))
     };
+    // 重启时密钥仓里已经有令牌：得立刻把 bridge 起起来，不然 `bot` 会一直
+    // 停在 `None`——`ui/phone.rs::status_line` 那条「正在重新接上」的诚实
+    // 文案只在这段窗口够短的前提下才站得住（Task 4 遗留发现，Task 5 来关）。
+    // 没有令牌就什么都不做：`Bridge::new` 需要一个真的渠道，编不出一个。
+    {
+        let s = recover(secrets.lock());
+        if let Some(token) = s.get(PHONE_TOKEN_KEY) {
+            let ch: Arc<dyn crate::channel::Channel> = Arc::new(Telegram::new(token));
+            crate::bridge::spawn(ch, phone.clone());
+        }
+    }
 
     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
@@ -362,6 +373,12 @@ fn handle(
                     if let Err(e) = recover(secrets.lock()).set(PHONE_TOKEN_KEY, &token) {
                         return Response::Error(to_code(e));
                     }
+                    // 令牌验证过、也落盘了——现在真的开始听：不起这个线程，
+                    // 用户填完令牌之后就是对着「等配对」发呆，永远等不到
+                    // bridge 去认那第一条消息。`Bridge` 自己的 `owner` 从
+                    // `None` 开始，只认这次填的令牌之后第一个发消息的人。
+                    let ch: Arc<dyn crate::channel::Channel> = Arc::new(Telegram::new(&token));
+                    crate::bridge::spawn(ch, phone.clone());
                     PhoneStatus {
                         state: crate::proto::PhoneState::WaitingForPairing,
                         bot: Some(bot),

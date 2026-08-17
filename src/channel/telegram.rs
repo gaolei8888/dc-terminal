@@ -166,6 +166,14 @@ impl Telegram {
 }
 
 impl Channel for Telegram {
+    /// 委托给同名的固有方法（`impl Telegram` 那个）——固有方法优先于 trait
+    /// 方法解析，这里不会无限递归。分开留着两个入口是因为调用方不同：
+    /// `Request::PhoneSetToken` 直接认得 `Telegram`，不需要经过 `dyn Channel`；
+    /// `bridge.rs` 只攥着 `Arc<dyn Channel>`，得从这条 trait 方法过。
+    fn get_me(&self) -> Result<String, ChannelError> {
+        Telegram::get_me(self)
+    }
+
     fn send(&self, to: i64, text: &str) -> Result<MsgId, ChannelError> {
         let body = serde_json::json!({"chat_id": to, "text": text}).to_string();
         let resp =

@@ -44,6 +44,11 @@ pub trait Channel: Send + Sync {
     fn send(&self, to: i64, text: &str) -> Result<MsgId, ChannelError>;
     /// 取新消息，最多阻塞 `timeout`。没有新消息就返回空 `Vec`，不是错误。
     fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError>;
+    /// 这个渠道背后是谁——配对页要点名「去找 @xxx 发条消息」，没有名字
+    /// 那句话就没法写。**不带任何状态**：跟 `send`/`poll` 一样，谁的令牌
+    /// 谁负责，这里只是问一句「你是谁」，不记也不认谁是主人——那还是
+    /// `bridge.rs` 的职责（Ruling 8）。
+    fn get_me(&self) -> Result<String, ChannelError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
