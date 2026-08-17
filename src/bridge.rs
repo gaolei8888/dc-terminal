@@ -42,7 +42,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 出站事件队列的上限（Ruling 4）。`session.rs::tick()` 那一头是
 /// unbounded 的 `mpsc::Sender`——`tick()` 绝不能因为投递阻塞，见那边
@@ -337,13 +337,30 @@ pub struct Bridge {
     /// 好几个候选照旧反问，这是 `Config::llm` 那道隐私边界在这里唯一
     /// 正确的落地（CLAUDE.md「每一处用法都必须有不依赖 LLM 的退路」）。
     backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>,
-    /// 会话 id -> 上一次推送时模型猜出的选项列表。**只在这一支被用一次**：
-    /// `deliver_to` 用它把这条回复交给 `map_answer` 转成 agent 要的序号，
-    /// 用完（或者被下一条更新的推送覆盖/清掉）就不该继续留着——一份过期
-    /// 的选项拿去解读一条毫不相干的新回复，比没有选项更危险（见
-    /// `compose_outbound` 里"没拿到新选项就清掉旧的"那一段）。
-    pending_options: Mutex<HashMap<u32, Vec<String>>>,
+    /// 会话 id -> （这份选项是什么时候推送的，选项列表）。**只在这一支被
+    /// 用一次**：`deliver_to` 用它把这条回复交给 `map_answer` 转成 agent
+    /// 要的序号，用完（或者被下一条更新的推送覆盖/清掉）就不该继续留着
+    /// ——一份过期的选项拿去解读一条毫不相干的新回复，比没有选项更危险
+    /// （见 `compose_outbound` 里"没拿到新选项就清掉旧的"那一段）。
+    ///
+    /// **`Instant` 是安全评审要求补的那道结构性保证**：只在"下一条推送
+    /// 又提到这个会话"时才清掉不够——agent 完全可能在没有再产生一条事件
+    /// 的情况下就翻过了这个问题（用户直接在终端里回答了它，或者这一轮
+    /// 的通知被 debounce 掉了），那样条目会一直留着，直到这个会话的
+    /// **下一次**含糊回复被错误地喂给 `map_answer`。一个不听话的模型
+    /// 这时候答"1"，dct 就会把用户明明打的一整句话换成"1"——这正是红线
+    /// 不允许发生的事：把"该不该相信模型"变成模型自己说了算，而不是
+    /// 结构上就不给它这个机会。`deliver_to` 读取时额外检查
+    /// `PENDING_OPTIONS_TTL`，超时的条目一律当没有，见那边的文档。
+    pending_options: Mutex<HashMap<u32, (Instant, Vec<String>)>>,
 }
+
+/// `pending_options` 里一条选项记录还能被信任多久。**故意选得短**：
+/// 真实使用场景里，用户看到带选项的推送到回复，通常是几十秒到几分钟
+/// 的事——他在看手机、决定要不要跑完还是现在改。超过这个窗口更可能是
+/// agent 已经翻篇了（用户从终端直接答的，或者这条推送根本没被打开），
+/// 继续拿这份选项解读一条新回复的风险大于"多问一次/原样敲进去"的代价。
+const PENDING_OPTIONS_TTL: Duration = Duration::from_secs(300);
 
 impl Bridge {
     pub fn new(
@@ -368,6 +385,16 @@ impl Bridge {
             backend: Mutex::new(None),
             pending_options: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 只给测试用：直接摆一条 `pending_options` 记录，绕开真正的
+    /// `compose_outbound`/模型往返——`deliver_to` 对"过期条目一律当没有"
+    /// 这条规则的测试需要摆出一个"很久以前推的"记录，走真实的发送线程
+    /// 等 `PENDING_OPTIONS_TTL` 秒不现实，直接注入一个已经过期的时间戳
+    /// 才测得到这条边界。
+    #[cfg(test)]
+    fn set_pending_options_for_test(&self, id: u32, at: Instant, opts: Vec<String>) {
+        recover(self.pending_options.lock()).insert(id, (at, opts));
     }
 
     /// 接进敲字的能力（Ruling 7）。生产环境传一个包着 `SessionManager` 的
@@ -519,9 +546,17 @@ impl Bridge {
         // 好几个候选就是反问，不会因为这个功能而变得更敢猜。
         let route = match route {
             Route::Ask(ids) => {
-                let guess = recover(self.backend.lock())
-                    .clone()
-                    .and_then(|b| narrow(&ids, &msg.text, &b));
+                // **不能写成 `recover(self.backend.lock()).clone().and_then(...)`
+                // 一整条链子。** 那样 `.lock()` 产生的 `MutexGuard` 会活到
+                // 整条语句结束——包括后面 `narrow()` 那次最长 8 秒的模型
+                // 调用——跟 `reply()` 自己文档里"绝不该在等网络调用的时候
+                // 攥着一把锁"是同一条规矩（这里锁着的是 `backend`，不是
+                // `owner`，但代价一样：`PhoneSetToken`/`PhoneDisable` 这类
+                // 需要瞬间生效的操作会被平白拖住）。先在自己的语句里把
+                // `Arc` 克隆出来、让锁在这一行结束时就释放，再拿这个局部
+                // 变量去问模型。
+                let backend = recover(self.backend.lock()).clone();
+                let guess = backend.and_then(|b| narrow(&ids, &msg.text, &b));
                 match guess {
                     Some(id) => Route::To(id),
                     None => Route::Ask(ids),
@@ -808,22 +843,54 @@ impl Bridge {
             return Delivered::Failed(msg);
         };
         // **红线在这里落地。** `pending_options` 里有这个会话上一次推送
-        // 猜出的选项，就把这条回复交给 `map_answer` 转成 agent 要的序号；
-        // 没有（绝大多数消息——没在等选择、没配后端、或者已经用过一次）
-        // 就是 `None`，`map_answer` 自己的 early return 保证模型压根不会
-        // 被调用，`text` 原样往下走。**取一次就丢**：`remove` 而不是
-        // `get`，同一份选项不该被拿去解读这个会话之后的第二条回复，见
-        // `pending_options` 字段的文档。
-        let opts = recover(self.pending_options.lock()).remove(&id);
+        // 猜出的选项，就把这条回复交给 `map_answer_index` 转成 agent 要的
+        // 序号；没有（绝大多数消息——没在等选择、没配后端、已经用过一次、
+        // 或者已经过期）就是 `None`，模型压根不会被调用，`text` 原样往下
+        // 走。**取一次就丢**：`remove` 而不是 `get`，同一份选项不该被拿去
+        // 解读这个会话之后的第二条回复，见 `pending_options` 字段的文档。
+        //
+        // **过期的条目视同没有**——这是安全评审要求补的结构性保证：
+        // agent 完全可能在没有再产生一条推送事件的情况下就翻过了这个
+        // 问题（用户直接在终端里回答了它，或者这一轮通知被 debounce 掉
+        // 了），`compose_outbound` 那边"下一条推送提到这个会话才清掉"这
+        // 条规则单独存在时补不到这个缝——`PENDING_OPTIONS_TTL` 在这里补上：
+        // 超过窗口，不管选项列表本身是不是还"新鲜"，一律当没有，`text`
+        // 原样敲进去。
+        let opts = {
+            let mut slot = recover(self.pending_options.lock());
+            slot.remove(&id).and_then(|(at, opts)| {
+                if at.elapsed() <= PENDING_OPTIONS_TTL {
+                    Some(opts)
+                } else {
+                    None
+                }
+            })
+        };
         let backend = recover(self.backend.lock()).clone();
-        let to_type = match (&opts, &backend) {
-            (Some(opts), Some(b)) => map_answer(text, Some(opts), b),
-            _ => text.to_string(),
+        // `chosen` 只在模型真的选中了某一项时才是 `Some`——见
+        // `map_answer_index` 的文档：跟 `to_type` 分开算，不靠"结果是不是
+        // 一串数字"去猜，那样会把恰好也是数字的自由文本误判成"选中了"。
+        let (to_type, chosen) = match (&opts, &backend) {
+            (Some(opts), Some(b)) => match map_answer_index(text, opts, b) {
+                Some(n) => (n.to_string(), Some(opts[n - 1].clone())),
+                None => (text.to_string(), None),
+            },
+            _ => (text.to_string(), None),
         };
         match writer.type_into(id, &to_type) {
             Ok(()) => {
                 let name = writer.name_of(id).unwrap_or_else(|| fallback_name(id));
-                self.reply(&format!("已经敲进「{name}」"));
+                // **红线的第三半，回执这一侧。** 模型把这句话换成了序号，
+                // 用户在手机上唯一能看到的就是这条回执——不说清楚换成了
+                // 什么，"他说了一句话、agent 收到了另一句"这件事就从头到
+                // 尾没有一处让他知道。映射发生了就把选中的原文说回去；
+                // 没发生（绝大多数情况）还是原来那句平淡的回执。
+                match &chosen {
+                    Some(opt) => {
+                        self.reply(&format!("已经按你说的选了「{opt}」，敲进了「{name}」"))
+                    }
+                    None => self.reply(&format!("已经敲进「{name}」")),
+                }
                 self.journal.delivered(Delivery::Typed(id));
                 Delivered::Typed(id)
             }
@@ -1034,7 +1101,17 @@ impl Bridge {
         let mut fresh_options: Option<(u32, Vec<String>)> = None;
         if let [only] = events {
             if only.kind == crate::channel::EventKind::Stopped {
-                if let Some(backend) = recover(self.backend.lock()).clone() {
+                // **不能写成 `if let Some(backend) = recover(self.backend.lock())
+                // .clone() { ... }`.** Edition 2021 一直把 `if let` 的
+                // scrutinee 临时对象活到整个分支体结束，那样 `backend`
+                // 这把锁就会一路攥到下面最长 15 秒的模型调用返回——跟
+                // `reply()` 自己文档里"绝不该在等网络调用的时候攥着一把
+                // 锁"（那边管的是 `owner`）是同一条规矩，这里换成了
+                // `backend`：`PhoneSetToken`/`PhoneDisable` 这类需要瞬间
+                // 生效的操作会被这 15 秒平白拖住。先用一条独立的 `let`
+                // 语句把 `Arc` 克隆出来、让锁在这一行结束时就释放。
+                let backend = recover(self.backend.lock()).clone();
+                if let Some(backend) = backend {
                     let p = options_prompt(&only.screen);
                     // 15 秒硬超时：`compose_outbound` 已经在发送线程上，
                     // 不是 `tick()`，慢一点没关系（见 `run_sender` 的
@@ -1058,7 +1135,7 @@ impl Bridge {
         for e in events {
             match &fresh_options {
                 Some((session, opts)) if *session == e.session => {
-                    slot.insert(e.session, opts.clone());
+                    slot.insert(e.session, (Instant::now(), opts.clone()));
                 }
                 _ => {
                     slot.remove(&e.session);
@@ -1173,15 +1250,39 @@ pub fn options_prompt(screen: &str) -> crate::llm::Prompt {
     }
 }
 
+/// 单条选项允许的最长字符数（按字符数、不按字节，理由跟 `session.rs::
+/// NAME_MAX_CHARS` 一样）。**这是最后一道、也是覆盖面最广的一道过滤**：
+/// `options_prompt` 要的是"几个字的大白话"，一条真选项不该长过这个数字。
+/// 一行只要超过它，不管有没有命中下面任何一个具体的字符类信号，本身就
+/// 说明这不是一条被概括过的选项，而是屏幕上一整行原始内容（一条命令、
+/// 一段配置、一句长长的错误原文）被原样搬了过来——这道过滤专门兜住
+/// "内容本身够短、但仍然是屏幕原文"这类漏网的情况，比如一个不含 `/`、
+/// 反引号、`=`、`\`、`--` 的敏感短语。
+const OPTION_MAX_CHARS: usize = 24;
+
+/// 一条推送最多带几个选项。**这不是审美限制，是隐私限制**：多于这个数
+/// 字，要么是模型没有按"从几个选项里选一个"理解这段屏幕（把一堆本来
+/// 不相干的行都编了号），要么屏幕内容本身就撑爆了这个功能的适用范围
+/// ——两种情况都不该把一长串东西糊给用户，也不该给"屏幕原文被大段搬运
+/// 出去"留更大的窗口。
+const OPTIONS_MAX_CANDIDATES: usize = 6;
+
 /// 从模型的答案里洗出选项列表。**解析不出来就是没有选项，绝不猜**——
 /// 这条规则比任何具体的格式细节都重要：模型答得含糊、跑题、或者干脆
 /// 说「没有选项」，调用方都该拿到 `None`，退回只有元数据的兜底消息，
 /// 而不是把模型那句话本身当成唯一的「选项」塞给用户。
 ///
-/// **隐私过滤的另一半**（跟 `options_prompt` 的 prompt 要求配对）：任何
-/// 一行选项只要带 `/` 或反引号，整行丢弃，不管前面编号解析得多干净——
-/// prompt 只是请求模型别这么写，这里才是真正兜底的保证。丢弃的是那一
-/// 行，不是整个答案：其余能用的选项还是照常返回。
+/// **隐私过滤的核心保证**（跟 `options_prompt` 的 prompt 要求配对）：
+/// prompt 只是"请求"模型别写路径/代码块/diff/原文，模型不听话是常态，
+/// 这里才是真正兜底的关卡，丢弃的是不合规的那一行，不是整个答案。
+/// 字符类信号只挡得住"明显长得像代码/命令"的行——`/`、反引号是路径/
+/// 代码块最直白的信号；`=` 挡的是 `KEY=value` 这种赋值（环境变量、配置，
+/// 常常直接带着真实的密钥/密码，这是本次评审揪出的具体泄露：一行形如
+/// "把 .env 里的 API_KEY=sk-live-... 改掉" 的屏幕内容，既不含 `/` 也不含
+/// 反引号，能原样混进选项列表、被存进 Telegram 的云端）；`\` 挡转义/
+/// Windows 路径/shell 续行；`--` 挡命令行参数。`OPTION_MAX_CHARS` 是最后
+/// 一道，兜住"够短、但仍是屏幕原文"这类漏网的情况——见它自己的文档。
+/// `OPTIONS_MAX_CANDIDATES` 则限制这份列表本身能有多长。
 pub fn parse_options(raw: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for line in raw.lines() {
@@ -1192,10 +1293,19 @@ pub fn parse_options(raw: &str) -> Option<Vec<String>> {
         if candidate.is_empty() {
             continue;
         }
-        if candidate.contains('/') || candidate.contains('`') {
+        if candidate.contains('/')
+            || candidate.contains('`')
+            || candidate.contains('=')
+            || candidate.contains('\\')
+            || candidate.contains("--")
+            || candidate.chars().count() > OPTION_MAX_CHARS
+        {
             continue;
         }
         out.push(candidate.to_string());
+        if out.len() >= OPTIONS_MAX_CANDIDATES {
+            break;
+        }
     }
     if out.is_empty() {
         None
@@ -1254,14 +1364,32 @@ pub fn map_answer(
     if opts.is_empty() {
         return user.to_string();
     }
-    let p = map_answer_prompt(user, opts);
-    match crate::llm::complete_with_timeout(b.clone(), p, Duration::from_secs(8)) {
-        Ok(a) => match a.trim().parse::<usize>() {
-            Ok(n) if n >= 1 && n <= opts.len() => n.to_string(),
-            _ => user.to_string(),
-        },
-        Err(_) => user.to_string(),
+    match map_answer_index(user, opts, b) {
+        Some(n) => n.to_string(),
+        None => user.to_string(),
     }
+}
+
+/// `map_answer` 的核心，拆出来单独给 `deliver_to` 用。**返回的是候选里
+/// 那个合法的、从 1 开始的序号本身，不是 `opts` 的下标**——跟
+/// `render_numbered`/`map_answer_prompt` 给用户看的编号是同一套。
+///
+/// 单独拆出来是因为 `deliver_to` 需要分清"模型真的选中了某一项"和
+/// "模型没选中、`user` 原样退回去、这句话恰好也是一串数字"这两种情况
+/// ——两者用 `map_answer` 的返回值（一个 `String`）本身分不开：如果
+/// `deliver_to` 拿 `map_answer` 的结果去 `parse::<usize>()`，一句碰巧是
+/// 数字的自由文本会被误当成"选中了第 n 项"，把不该出现的选项原文塞进
+/// 回执里。这里返回结构化的 `Option<usize>`，"选中了" 和 "没选中" 在
+/// 类型上就分开了，调用方不用去猜一个字符串的来历。
+fn map_answer_index(
+    user: &str,
+    opts: &[String],
+    b: &Arc<dyn crate::llm::Backend>,
+) -> Option<usize> {
+    let p = map_answer_prompt(user, opts);
+    let raw = crate::llm::complete_with_timeout(b.clone(), p, Duration::from_secs(8)).ok()?;
+    let n: usize = raw.trim().parse().ok()?;
+    (n >= 1 && n <= opts.len()).then_some(n)
 }
 
 /// 问模型「用户这句话说的是哪个候选会话」的 prompt。**只带编号，不带
@@ -2651,6 +2779,78 @@ mod tests {
         );
     }
 
+    /// **红线的第三半：用户必须能看见自己的话被换掉了。** 模型把这条
+    /// 回复映射成了一个选项，回执必须把选中的选项原文说回去——不说的话
+    /// 就是"他说了一句话、agent 收到了另一句"这件事全程没有一处让他知道，
+    /// 而这正是红线要挡住的伤害本身。
+    #[test]
+    fn when_the_model_maps_an_answer_the_receipt_says_what_was_chosen() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(7, "改登录页");
+        b.set_pending_options_for_test(
+            7,
+            Instant::now(),
+            vec!["先跑完".to_string(), "现在改".to_string()],
+        );
+        let backend: Arc<dyn crate::llm::Backend> = FakeBackend::answering("2");
+        b.set_backend(Some(backend));
+
+        let d = b.deliver(Route::To(7), "就第二个吧");
+
+        assert_eq!(d, Delivered::Typed(7));
+        assert_eq!(spy.written(), vec![(7, "2".to_string())]);
+        assert!(
+            spy.last_reply().contains("现在改"),
+            "回执该说清楚选中的是哪个选项：{}",
+            spy.last_reply()
+        );
+    }
+
+    /// 没有映射发生（没有候选、答不出来、答案越界……）：回执照旧是那句
+    /// 平淡的"已经敲进「name」"，不该无中生有地提一个选项。
+    #[test]
+    fn without_a_mapping_the_receipt_stays_plain() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(7, "改登录页");
+        b.set_pending_options_for_test(7, Instant::now(), vec!["先跑完".to_string()]);
+        let backend: Arc<dyn crate::llm::Backend> = FakeBackend::answering("我不确定");
+        b.set_backend(Some(backend));
+
+        let d = b.deliver(Route::To(7), "等等我再想想");
+
+        assert_eq!(d, Delivered::Typed(7));
+        assert_eq!(spy.written(), vec![(7, "等等我再想想".to_string())]);
+        assert_eq!(spy.last_reply(), "已经敲进「改登录页」");
+    }
+
+    /// **安全评审要求补的结构性保证。** 一条很久以前推送时留下的选项
+    /// 记录，不该被拿去解读现在这句完全不相干的回复——即使模型这时候
+    /// 老老实实答了一个候选里的合法序号，过期这件事本身就足以让整条
+    /// 记录作废，`text` 必须原样敲进去，回执也必须是平淡的那句。
+    #[test]
+    fn a_stale_pending_options_entry_is_refused_and_the_text_goes_in_verbatim() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(7, "改登录页");
+        let long_ago = Instant::now() - (PENDING_OPTIONS_TTL + Duration::from_secs(1));
+        b.set_pending_options_for_test(
+            7,
+            long_ago,
+            vec!["先跑完".to_string(), "现在改".to_string()],
+        );
+        // 就算模型老老实实答了一个合法序号，过期这件事本身就该让这条
+        // 记录作废——`SpyBackend` 顺便验证了这种情况下模型压根不会被调用。
+        let spy_backend = SpyBackend::new();
+        let backend: Arc<dyn crate::llm::Backend> = spy_backend.clone();
+        b.set_backend(Some(backend));
+
+        let d = b.deliver(Route::To(7), "随便说句话");
+
+        assert_eq!(d, Delivered::Typed(7));
+        assert_eq!(spy.written(), vec![(7, "随便说句话".to_string())]);
+        assert_eq!(spy.last_reply(), "已经敲进「改登录页」");
+        assert_eq!(spy_backend.calls(), 0, "过期的选项不该被拿去问模型");
+    }
+
     /// `Gone` 什么都不敲。这是重启之后那条安全路径的落地，光有 `route()`
     /// 返回 `Gone` 不够，得确认真的没写出去。
     #[test]
@@ -2914,6 +3114,65 @@ mod tests {
     #[test]
     fn options_that_are_all_filtered_out_mean_no_options() {
         assert_eq!(parse_options("1. 修改 /etc/hosts\n2. 用 `ls`"), None);
+    }
+
+    /// **真实泄露场景。** 屏幕上一行"把 .env 里的 API_KEY=sk-live-...
+    /// 改掉"——既不含 `/`，也不含反引号，靠这两个字符类信号完全挡不住。
+    /// 一个真实密钥/密码经常长这个形状（`KEY=value`），这条测试钉的就是
+    /// 这次评审揪出的具体泄露：`=` 必须单独被拦。
+    #[test]
+    fn options_containing_an_env_style_assignment_are_discarded() {
+        // **故意选一个很短的例子**（远在 `OPTION_MAX_CHARS` 之内、也不含
+        // `/`、反引号、`\`、`--`）——真实泄露往往更长，但如果这里也用一条
+        // 长候选，这条测试就分不清是 `=` 本身被拦了，还是长度上限碰巧
+        // 也拦住了它，变异测试测不出"删掉 `=` 检查"这一刀。
+        let got = parse_options("1. 把 A=1 改了\n2. 先跑完").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+        // 更贴近真实泄露的例子，独立确认：即便是一整条像密钥赋值的内容，
+        // 同样要被拦住（这里长度和 `=` 两道过滤同时命中，不影响上面那条
+        // 测试对 `=` 单独负责）。
+        let got = parse_options("1. 把 API_KEY=sk-live-abc123 改掉\n2. 先跑完").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
+    /// 反斜杠——转义、Windows 路径、shell 续行——同样是"这其实是原始
+    /// 内容"的信号，即便它既不含 `/` 也不含 `=`。
+    #[test]
+    fn options_containing_a_backslash_are_discarded() {
+        let got = parse_options("1. 编辑 C:\\Users\\config\n2. 先跑完").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
+    /// 双横线——命令行参数——同样该被拦下。
+    #[test]
+    fn options_containing_double_dash_flags_are_discarded() {
+        let got = parse_options("1. 加上 --force 重跑\n2. 先跑完").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
+    /// **变异测试专用：长度上限。** 一条选项如果长过 `OPTION_MAX_CHARS`，
+    /// 不管有没有命中任何具体的字符类信号，本身就该被当成"屏幕原文"
+    /// 拦下——这是兜住"内容本身够短测试想不到、但仍然是原文"这类情况的
+    /// 最后一道，也是覆盖面最广的一道。
+    #[test]
+    fn an_option_longer_than_the_char_limit_is_discarded() {
+        let long_but_clean = "先跑完".repeat(10); // 30 个字符，不含任何被
+                                                  // 单独拦截的符号，纯靠
+                                                  // 长度本身触发过滤。
+        assert!(long_but_clean.chars().count() > OPTION_MAX_CHARS);
+        let got = parse_options(&format!("1. {long_but_clean}\n2. 先跑完")).unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
+    /// 候选数量上限：模型答得再离谱，`parse_options` 也不该无限往外掏。
+    #[test]
+    fn parse_options_caps_the_number_of_candidates() {
+        let raw = (1..=20)
+            .map(|i| format!("{i}. 选项{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let got = parse_options(&raw).unwrap();
+        assert_eq!(got.len(), OPTIONS_MAX_CANDIDATES);
     }
 
     // ---- options_prompt：范式跟 explain_prompt/name_prompt 一致 ----
