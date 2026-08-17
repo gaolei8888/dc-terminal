@@ -22,6 +22,14 @@ pub struct SecretStore {
     load_error: Option<WarningCode>,
 }
 
+/// 手机通知的令牌存在密钥仓里，用一个 profile 不可能占用的名字。
+///
+/// **它不会出现在密钥页（`c`）里**，因为那一页遍历的是 profiles 再查
+/// `has_secret`（见 `ui/view.rs` 的 `secret_rows`），不是遍历这个文件的键。
+/// 将来谁把密钥页改成遍历 `secrets.toml`，这个名字就会作为一个不存在的
+/// agent 冒出来——改那里的人请回来看这一句。
+pub const PHONE_TOKEN_KEY: &str = "__phone__";
+
 /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
 pub fn secrets_path_for_socket(socket: &Path) -> PathBuf {
     match socket.parent() {
@@ -205,6 +213,21 @@ impl SecretStore {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// `PHONE_TOKEN_KEY` 只是这个仓库里的另一个键——手机令牌用同一套
+    /// `set`/`get`/`remove`，没有单独的存储路径。这条钉住它确实是一个
+    /// 合法的、不会跟真实 profile 撞名的键。
+    #[test]
+    fn phone_token_key_round_trips_like_any_other_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secrets.toml");
+        let mut s = SecretStore::load(&f);
+        s.set(PHONE_TOKEN_KEY, "123456:AAH-token").unwrap();
+        assert_eq!(s.get(PHONE_TOKEN_KEY), Some("123456:AAH-token"));
+        // 没有哪个真实 profile 会叫这个名字——双下划线包裹的写法本来就
+        // 不是任何 CLI 工具会用的 profile 名。
+        assert!(PHONE_TOKEN_KEY.starts_with("__") && PHONE_TOKEN_KEY.ends_with("__"));
+    }
 
     #[test]
     fn secrets_path_sits_next_to_socket() {

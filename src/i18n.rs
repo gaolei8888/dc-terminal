@@ -151,6 +151,29 @@ pub enum Key {
     /// 设置页顶层列表里的第二项。手机通知页本身（Task 4 的 `View::Phone`）
     /// 有自己一整套状态文案，这里只是设置项列表上的那一行标签。
     Phone,
+    // —— 手机通知页 ——
+    /// 还没填过令牌
+    PhoneOffLine,
+    /// 已经连上，但不知道是谁（没有 `owner`，理论上不该出现，兜底用）
+    PhonePairedLine,
+    /// 连不上——**不带任何原因**，原因由 `daemon.rs` 决定但故意不传到这里，
+    /// 见 `PhoneState::Broken` 的文档注释和 `ui::phone::status_line`。
+    PhoneBrokenLine,
+    /// Off 状态的下一步：去填一个令牌
+    PhoneNextStepOff,
+    /// WaitingForPairing 状态的下一步：叫用户去 Telegram 给 bot 发消息
+    /// （具体是哪个 bot 由 `status_line` 那句负责点名，这一句只说「发过去」）
+    PhoneNextStepWaiting,
+    /// Broken 状态的下一步：重新填一遍令牌
+    PhoneNextStepBroken,
+    /// 按键表：填令牌
+    PhoneEnterToken,
+    /// 按键表：重新配对（换一台手机）
+    PhoneRepair,
+    /// 按键表：关掉手机通知
+    PhoneTurnOff,
+    /// 手机页填令牌时的输入提示
+    PhonePasteToken,
     // —— 全部按键浮层 ——
     /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
     /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
@@ -339,6 +362,36 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
         Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
+        PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
+        PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
+        PhoneBrokenLine => t!(
+            lang,
+            en: "Cannot reach the phone notification service right now",
+            zh: "手机通知这会儿连不上",
+        ),
+        PhoneNextStepOff => t!(
+            lang,
+            en: "Press Enter and paste a Telegram bot token to turn this on",
+            zh: "按 Enter 粘贴一个 Telegram bot 的令牌，打开这个功能",
+        ),
+        PhoneNextStepWaiting => t!(
+            lang,
+            en: "Open Telegram and send that bot any message to finish pairing",
+            zh: "打开 Telegram，给那个 bot 发一条消息，就能完成配对",
+        ),
+        PhoneNextStepBroken => t!(
+            lang,
+            en: "Press Enter to paste the token again",
+            zh: "按 Enter 重新粘贴一遍令牌",
+        ),
+        PhoneEnterToken => t!(lang, en: "enter token", zh: "填令牌"),
+        PhoneRepair => t!(lang, en: "re-pair", zh: "重新配对"),
+        PhoneTurnOff => t!(lang, en: "turn off", zh: "关掉"),
+        PhonePasteToken => t!(
+            lang,
+            en: "Paste or type the bot token from BotFather",
+            zh: "粘贴或输入 BotFather 给的令牌",
+        ),
 
         MoreKeys => t!(lang, en: "…", zh: "…"),
         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
@@ -769,6 +822,25 @@ pub mod msg {
             lang,
             en: format!("Key for {label} (Enter {confirm}, Esc {back})"),
             zh: format!("填 {label} 的密钥（Enter {confirm}，Esc {back}）"),
+        )
+    }
+
+    /// 等配对时的状态行——**必须点名 bot**，不然「去发条消息」没法执行
+    /// （见 `ui::phone::status_line` 头上的注释和 `waiting_names_the_bot`）。
+    pub fn phone_waiting_for_pairing(lang: Lang, bot: &str) -> String {
+        t!(
+            lang,
+            en: format!("Token saved. Waiting for you to message @{bot} on Telegram"),
+            zh: format!("令牌已保存，正在等你去 Telegram 给 @{bot} 发条消息"),
+        )
+    }
+
+    /// 已连上时的状态行，带着主人的名字。
+    pub fn phone_paired(lang: Lang, owner: &str) -> String {
+        t!(
+            lang,
+            en: format!("Connected · {owner}"),
+            zh: format!("已连上 · {owner}"),
         )
     }
 

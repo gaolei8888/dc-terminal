@@ -44,7 +44,12 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 旧守护进程不需要「懂」它，只是答复里多了一段旧进程从不读的文本。
 /// 具体的允许条件和「这不能当先例」的警告见
 /// `the_session_info_shape_is_pinned_too` 测试上的注释。
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 7 = 手机通知。多了 `Request::PhoneStatus` / `PhoneSetToken` / `PhoneUnpair`
+/// / `PhoneDisable` 四条，`Response::Phone(PhoneStatus)`。旧守护进程完全不
+/// 认识这几条请求，界面发过去只会得到一句解析失败——跟 `Kill`/`Prune` 那次
+/// 加一是同一个理由。
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +84,40 @@ pub struct SecretPrompt {
 pub struct InstallPrompt {
     pub command: Vec<String>,
     pub note: String,
+}
+
+/// 手机通知的状态。**只有四种，每一种都要给用户一条能做的下一步**——
+/// `Paired` 除外，那是终点，不需要下一步（见 `ui::phone::next_step`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneState {
+    /// 还没填令牌
+    Off,
+    /// 填了、验过了，在等用户给 bot 发第一条消息
+    WaitingForPairing,
+    Paired,
+    /// 连不上。**装的是人话**，不是原始错误文本——守护进程是唯一决定
+    /// 用户看到什么文字的地方（本文件顶上那条已有的约定）。
+    ///
+    /// 这个字段的内容**从不**直接显示给用户（见 `ui::phone::status_line`
+    /// 和 `ui::phone::next_step`）：万一某处写这个值的代码手滑塞进了原始
+    /// 错误甚至令牌本身，界面上显示的仍然是一句固定的人话，不是这里装的
+    /// 原文——`the_token_never_appears_in_any_status_text` 钉的就是这一条。
+    Broken(String),
+}
+
+/// 手机通知这一整套的状态：连没连、是谁的手机、bot 叫什么名字。
+///
+/// **不带 chat id / token**——那两个是密钥级别的东西，`chat_id` 归
+/// `bridge.rs`（Ruling 8：渠道层和 bridge 都不该把它泄到这一层），
+/// `token` 只活在 `SecretStore` 里（见 `secrets::PHONE_TOKEN_KEY`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneStatus {
+    pub state: PhoneState,
+    /// bot 用户名，`getMe` 拿的。等配对那句话要用它——不带名字的
+    /// 「去给它发条消息」是一句没法执行的话。
+    pub bot: Option<String>,
+    /// 配上的主人，显示用（比如「已连上 · lei」）。
+    pub owner: Option<String>,
 }
 
 /// 菜单上一行的完整信息：UI 拿到它就能画出「名字 + 说明 + 能不能用 +
@@ -239,6 +278,22 @@ pub enum Request {
         id: u32,
         event: MouseForward,
     },
+    /// 手机通知眼下是什么状态。答案来自守护进程一份共享的状态槽——
+    /// 配对本身是异步的（守护进程一直轮询，直到用户在 Telegram 里给 bot
+    /// 发第一条消息），这条请求就是界面用来看那份状态槽此刻写着什么的。
+    PhoneStatus,
+    /// 填一个新令牌。守护进程拿它去打一次 Telegram 的 `getMe`（顺便验证令牌、
+    /// 拿到 bot 用户名），通过就存进密钥仓、状态槽写成 `WaitingForPairing`；
+    /// 不通过就把状态槽写成 `Broken`，令牌不落盘。这条请求会打真网络，
+    /// 界面必须像 `VerifySecret` 一样丢给后台线程，不能堵在按键循环里。
+    PhoneSetToken {
+        token: String,
+    },
+    /// 解除当前配对（清空 `owner`），状态槽退回 `WaitingForPairing`——
+    /// 令牌还在，等下一个人发消息重新配对。用在「换一台手机」的场景。
+    PhoneUnpair,
+    /// 整个关掉：删掉令牌，状态槽退回 `Off`。
+    PhoneDisable,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -312,6 +367,14 @@ impl std::fmt::Debug for Request {
                 .field("id", id)
                 .field("event", event)
                 .finish(),
+            Request::PhoneStatus => write!(f, "PhoneStatus"),
+            // `token` 是密钥，同 `SetSecret`/`VerifySecret` 的道理，脱敏。
+            Request::PhoneSetToken { .. } => f
+                .debug_struct("PhoneSetToken")
+                .field("token", &"<redacted>")
+                .finish(),
+            Request::PhoneUnpair => write!(f, "PhoneUnpair"),
+            Request::PhoneDisable => write!(f, "PhoneDisable"),
         }
     }
 }
@@ -373,6 +436,9 @@ pub enum Response {
     /// `Ok`：它仍然是描述这次滚动的正确形状，往后要是哪个调用点想抄近路
     /// 立刻拿到滚完的状态（不等下一轮 `Screen`），数据已经现成。
     Scrolled(ScrollState),
+    /// 对 `Request::PhoneStatus` / `PhoneSetToken` / `PhoneUnpair` /
+    /// `PhoneDisable` 四条的共同回答：手机通知眼下是什么状态。
+    Phone(PhoneStatus),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -553,6 +619,20 @@ mod tests {
         assert!(s.contains("glm"), "profile 名字留着帮排查：{s}");
     }
 
+    /// 同 `debug_redacts_the_secret_on_set_secret`：手机令牌也是密钥，
+    /// 不能出现在 Debug 输出里。
+    #[test]
+    fn debug_redacts_the_token_on_phone_set_token() {
+        let req = Request::PhoneSetToken {
+            token: "123456:AAH-super-secret-token".into(),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("123456:AAH-super-secret-token"),
+            "手机令牌不能出现在 Debug 输出里：{s}"
+        );
+    }
+
     #[test]
     fn screens_request_round_trips() {
         let req = Request::Screens { ids: vec![1, 3, 7] };
@@ -660,14 +740,18 @@ mod tests {
                     ctrl: false,
                 },
             },
+            Request::PhoneStatus,
+            Request::PhoneSetToken { token: "t".into() },
+            Request::PhoneUnpair,
+            Request::PhoneDisable,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                6,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
+                7,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -710,7 +794,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                6,
+                7,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -802,7 +886,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (6, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (7, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

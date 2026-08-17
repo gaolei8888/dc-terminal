@@ -13,6 +13,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use crate::i18n::{text, Key, Lang};
+use crate::proto::{Request, Response};
 use crate::settings::{save_lang, settings_path_for_socket};
 
 use super::app::App;
@@ -60,8 +61,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     handle_top_key(app, key, state)
 }
 
-/// 顶层设置项列表：`Language` 进语言子列表，`Phone` 眼下什么都不做——
-/// 手机通知那一页是 Task 4 才建的 `View::Phone`，这里先按兵不动。
+/// 顶层设置项列表：`Language` 进语言子列表，`Phone` 进手机通知页
+/// （`View::Phone`，见 `ui::phone`）。
 fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.view = super::home_view(app),
@@ -81,15 +82,31 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
                     lang: Some(lang_state),
                 };
             }
-            // 手机通知页要等 Task 4 建好 `View::Phone` 才有地方去，这里先什么
-            // 都不做——不是漏写，是这一项眼下还没有下一层。
-            Some(SettingsItem::Phone) | None => {
+            Some(SettingsItem::Phone) => open_phone(app, state),
+            None => {
                 app.view = View::Settings { state, lang: None };
             }
         },
         _ => app.view = View::Settings { state, lang: None },
     }
     Ok(())
+}
+
+/// 拿一次当前的手机通知状态，进 `View::Phone`。拿不到就留在设置页给一句
+/// 错误——同 `mod.rs::open_secrets` 的道理：总比弹进一个既没数据、又没地方
+/// 显示错误的空白页强。
+fn open_phone(app: &mut App, state: ListState) {
+    match app.client().and_then(|c| c.call(Request::PhoneStatus)) {
+        Ok(Response::Phone(status)) => app.view = View::Phone { status },
+        Ok(Response::Error(ref e)) => {
+            app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
+            app.view = View::Settings { state, lang: None };
+        }
+        _ => {
+            app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
+            app.view = View::Settings { state, lang: None };
+        }
+    }
 }
 
 /// 语言子列表：跟改结构之前的顶层逻辑完全一样，只是现在挂在「语言」这一项
@@ -310,10 +327,10 @@ mod tests {
         assert_eq!(app.lang, Lang::Zh, "只是打开子列表，还没真的选");
     }
 
-    /// **手机通知眼下是空按钮。** `View::Phone` 是 Task 4 才建的，这里选中
-    /// 「Phone」按 Enter 只能原地不动，不能 panic，也不能悄悄改语言。
+    /// 断开的 `App`（测试默认那种）拿不到手机状态：留在设置页给一句错误，
+    /// 不能 panic，也不能悄悄改语言，也不能弹进一个没有数据的手机页。
     #[test]
-    fn choosing_phone_does_nothing_yet() {
+    fn choosing_phone_without_a_daemon_stays_on_settings_with_an_error() {
         let (mut app, _dir) = App::test_app();
         app.lang = Lang::Zh;
         on_settings_items(&mut app, 1);
@@ -323,7 +340,56 @@ mod tests {
         assert_eq!(app.lang, Lang::Zh, "选 Phone 不该改语言");
         assert!(
             matches!(app.view, View::Settings { .. }),
-            "还应该停在设置页上"
+            "拿不到数据就该留在设置页上"
+        );
+        assert!(app.message.error, "要有一句红字告诉用户出了什么事");
+    }
+
+    /// **Ruling 2**：选中「Phone」按 Enter 要真的进 `View::Phone`，带着守护
+    /// 进程刚给的那份状态；`Esc` 要能从手机页退回设置页（跟语言子列表退出
+    /// 一样，一层一层退，不是一步退到底看板）。起一个真守护进程——断开的
+    /// `App` 上 `Request::PhoneStatus` 直接失败，证明不了真正的转场。
+    #[test]
+    fn choosing_phone_enters_the_phone_page_and_escape_returns_to_settings() {
+        use crate::client::Client;
+
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(std::time::Instant::now() < deadline, "daemon 没起来");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            home.path().to_path_buf(),
+            Lang::Zh,
+            sock,
+            crate::ui::ViewMode::List,
+        );
+        on_settings_items(&mut app, 1);
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        let View::Phone { status } = &app.view else {
+            panic!("选中 Phone 按 Enter 该进手机页，实际停在了别的视图上");
+        };
+        assert_eq!(
+            status.state,
+            crate::proto::PhoneState::Off,
+            "刚起的守护进程还没配过令牌"
+        );
+
+        // Esc 在手机页由 `phone::handle_key` 接（同 `mod.rs` 的按键分发），
+        // 不是这个模块自己的 `handle_key`——那个函数只认 `View::Settings`。
+        crate::ui::phone::handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+        assert!(
+            matches!(app.view, View::Settings { .. }),
+            "Esc 要从手机页退回设置页，不是一步退到看板"
         );
     }
 

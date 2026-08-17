@@ -172,6 +172,14 @@ pub(crate) enum View {
         /// 那一行。
         pending_delete: Option<String>,
     },
+    /// 手机通知设置页：设置页选中「Phone」进。**只带 `status`**——「正在打字」
+    /// 和「验证中」这两个临时态存在 `App`（`phone_buf`/`phone_verify_rx`）
+    /// 而不是这里，理由跟 `verify_rx` 待在 `App` 上一模一样：`View` 要整体
+    /// `Clone`，装着后台线程结果的 `Receiver` 进不去一个要 `Clone` 的枚举
+    /// （见 `App::verify_rx` 的文档注释）。
+    Phone {
+        status: crate::proto::PhoneStatus,
+    },
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
@@ -965,6 +973,9 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // （Claude Code 靠它取消/清空/关弹窗），所以逃生键是 F2，由
         // `attach.rs` 自己吃掉。其余视图没有 F2，不能照抄这句。
         View::Attached(_) => text(Key::BackToBoardF2, lang).to_string(),
+        // 从设置页进来，退出回设置页——同 `EnterSecret` 的 `return_to_settings`
+        // 分支一个道理，这一页没有别的来路。
+        View::Phone { .. } => text(Key::BackToSettings, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
@@ -1231,6 +1242,26 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
+        // 手机页的按键随状态变化：没填过令牌只有 Enter 能按，配上人之后
+        // 才谈得上 `r` 重新配对，`x` 只要还有令牌就能关掉。跟 `board_keys`
+        // 那一档「能不能按也决定写不写」同一个道理——写一个此刻按下去
+        // 只会报错的键，比不写更糟。
+        View::Phone { status } => {
+            use crate::proto::PhoneState;
+            let mut items: Vec<(&'static str, Key)> = Vec::new();
+            match status.state {
+                PhoneState::Off | PhoneState::Broken(_) => {
+                    items.push(("Enter", Key::PhoneEnterToken))
+                }
+                PhoneState::Paired => items.push(("r", Key::PhoneRepair)),
+                PhoneState::WaitingForPairing => {}
+            }
+            if !matches!(status.state, PhoneState::Off) {
+                items.push(("x", Key::PhoneTurnOff));
+            }
+            items.push(("Esc", Key::BackToSettingsWord));
+            help_items(&items, lang)
+        }
     }
 }
 

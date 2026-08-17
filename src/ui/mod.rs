@@ -28,6 +28,7 @@ mod attach;
 mod board;
 mod grid;
 mod keys;
+mod phone;
 mod pick;
 mod secret;
 mod settings_view;
@@ -383,6 +384,46 @@ pub fn run(
             }
         }
 
+        // 手机令牌验证的结果，同上面 `verify_rx` 一个理由：必须在 `term.draw`
+        // 之前收，不然用户看见的这一帧还是「正在验证…」，多闪一下。
+        if let Some(rx) = &app.phone_verify_rx {
+            if let Ok(status) = rx.try_recv() {
+                app.phone_verify_rx = None;
+                app.phone_buf = None;
+                // 用户可能已经 Esc 退出手机页去了别处——这条结果没有落点，
+                // 扔了，不切视图（同 `verify_rx` 收尾那段「视图对不上就
+                // 不应用」的道理，只是这里判的是「还在不在这一页」而不是
+                // 「profile/buf 对不对得上」，因为手机页同一时间只可能有
+                // 一次在飞的验证）。
+                if matches!(app.view, View::Phone { .. }) {
+                    app.view = View::Phone { status };
+                }
+            }
+        }
+        // 手机页要能眼看着状态从「等配对」变成「已连上」——配对本身是
+        // 异步的（守护进程一直轮询直到用户在 Telegram 里发消息），没有这
+        // 一段轮询，用户守着这一页也看不到任何变化。跟九宫格的 300ms 节流
+        // 同一个理由：这是「偶尔扫一眼」的东西，不是打字的地方，不用跟
+        // 会话视图一样 16ms 一刷。正在打字/验证中不用刷——那两种临时态
+        // 不该被一次后台轮询悄悄打断。
+        if matches!(app.view, View::Phone { .. })
+            && app.phone_buf.is_none()
+            && app.phone_verify_rx.is_none()
+        {
+            let due = app
+                .phone_last_fetch
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
+            if due {
+                if let Ok(Response::Phone(status)) =
+                    app.client().and_then(|c| c.call(Request::PhoneStatus))
+                {
+                    app.view = View::Phone { status };
+                    app.connected = true;
+                }
+                app.phone_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
             match app.client().and_then(|c| c.call(Request::List)) {
@@ -725,6 +766,7 @@ pub fn run(
             View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
             View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
             View::Secrets { .. } => secret::handle_key(&mut app, key)?,
+            View::Phone { .. } => phone::handle_key(&mut app, key)?,
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
@@ -2015,6 +2057,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
+        View::Phone { .. } => phone::draw(f, chunks[0], app),
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
@@ -3566,6 +3609,13 @@ mod tests {
                 buf: String::new(),
                 phase: view::SecretPhase::Typing,
                 return_to_settings: false,
+            },
+            View::Phone {
+                status: crate::proto::PhoneStatus {
+                    state: crate::proto::PhoneState::Off,
+                    bot: None,
+                    owner: None,
+                },
             },
         ];
         // 两种语言都要量。常量是写死的，而译文长度各不相同——只量中文的话，

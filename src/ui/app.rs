@@ -96,6 +96,19 @@ pub struct App {
     // 不必把这条防线押在"每个退出分支都记得清 receiver"这种容易漏改的
     // 纪律上。
     pub verify_rx: Option<std::sync::mpsc::Receiver<(String, String, VerifyOutcome)>>,
+    /// 手机页正在打的令牌，`None` = 只是在看状态，没有在打字。放在 `App`
+    /// 而不是 `View::Phone` 里，跟 `verify_rx` 同一个理由——`View::Phone`
+    /// 只有一个字段（`status`），装不下这个临时态，也不该装：见
+    /// `View::Phone` 的文档注释。
+    pub phone_buf: Option<String>,
+    /// 手机令牌验证的结果通道。跟 `verify_rx` 一样：`Request::PhoneSetToken`
+    /// 会打真的 Telegram 网络，不能堵在按键循环里，丢给后台线程，主循环
+    /// 每轮 `try_recv`。`Some` 本身就是「正在验证」这件事的全部真相，
+    /// 不需要另开一个布尔字段。
+    pub phone_verify_rx: Option<std::sync::mpsc::Receiver<crate::proto::PhoneStatus>>,
+    /// 上次自动刷新手机状态的时刻，把轮询压到 300ms 一轮——同
+    /// `grid_last_fetch` 一个理由：这是「偶尔扫一眼」的东西，不用每帧都问。
+    pub phone_last_fetch: Option<std::time::Instant>,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
@@ -175,6 +188,9 @@ impl App {
             connected: true,
             need_sessions: true,
             verify_rx: None,
+            phone_buf: None,
+            phone_verify_rx: None,
+            phone_last_fetch: None,
             lang,
             socket,
             start_dir: default_dir,

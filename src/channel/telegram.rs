@@ -155,6 +155,14 @@ impl Telegram {
     fn url(&self, method: &str) -> String {
         format!("{API}/bot{}/{method}", self.token)
     }
+
+    /// 验证令牌，顺便拿 bot 用户名。守护进程处理 `Request::PhoneSetToken`
+    /// 时调这个——跟 `Channel::send`/`poll` 分开是因为「验证一个新令牌」
+    /// 不是渠道日常收发的一部分，也不需要哪个会话认识它。
+    pub fn get_me(&self) -> Result<String, ChannelError> {
+        let resp = (self.send)(&self.url("getMe"), "").map_err(|_| ChannelError::Unreachable)?;
+        parse_get_me(&resp)
+    }
 }
 
 impl Channel for Telegram {
@@ -268,6 +276,27 @@ mod tests {
     fn get_me_with_a_bad_token_says_bad_token() {
         let body = r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#;
         assert_eq!(parse_get_me(body), Err(ChannelError::BadToken));
+    }
+
+    /// `Telegram::get_me` 是 daemon 侧真正调用的入口——`parse_get_me` 只是
+    /// 它内部用的解析函数。这条钉住整条路径：注入的传输拿到的 URL 里带着
+    /// 令牌，回包解出用户名。
+    #[test]
+    fn telegram_get_me_uses_the_injected_transport() {
+        let seen_url: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let sink = seen_url.clone();
+        let tg = Telegram::with_transport(
+            "tok",
+            Box::new(move |url, _body| {
+                *sink.lock().unwrap() = url.to_string();
+                Ok(
+                    r#"{"ok":true,"result":{"id":1,"is_bot":true,"username":"my_dct_bot"}}"#
+                        .to_string(),
+                )
+            }),
+        );
+        assert_eq!(tg.get_me().unwrap(), "my_dct_bot");
+        assert!(seen_url.lock().unwrap().contains("bottok/getMe"));
     }
 
     /// 连续两次 `poll`：第二次的 URL 必须带上「上一次最大 update_id + 1」
