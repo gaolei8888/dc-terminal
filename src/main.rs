@@ -117,6 +117,16 @@ fn run_ui() -> Result<()> {
     // 产品存在的理由），所以「新界面碰上旧守护进程」不是意外，是常态——而
     // 现场表现是按 n 弹一句「拿不到 agent 列表」，一个既不说明原因、也不
     // 告诉用户怎么办的死胡同。趁还没进界面，在这里问清楚。
+    //
+    // **`offer_to_resume_last_sessions` 故意不摆在这条分支上。** 它只在
+    // 上面「压根没有守护进程在跑」那条分支问过一次——旧守护进程重启这条
+    // 路，用户在 `offer_to_restart_stale_daemon` 里已经被明确告知「重启
+    // 会断掉正在跑的会话」并且亲口按了 `y` 同意，那本身就是一次对「这些
+    // 会话要断了」的知情同意，重启完了之后没道理再让他确认第二遍要不要
+    // 接回来——`restart_daemon` 杀旧进程之前，daemon 一直在跑，`create`/
+    // `stop`/`kill`/`prune` 早把 `last-sessions.toml` 维护得很新，新起来
+    // 的那个守护进程原样按「有清单就恢复」的默认流程接回去就是了，不需要
+    // 再问一遍。
     if daemon_status(client.protocol()) == DaemonStatus::Stale {
         client = offer_to_restart_stale_daemon(client, &sock, &exe, lang)?;
     }

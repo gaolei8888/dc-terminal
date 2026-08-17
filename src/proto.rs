@@ -571,6 +571,30 @@ pub enum WarningCode {
     /// 而且这时候所有写入都被拒，照着行号去抠语法是把用户往错路上支。
     /// 唯一有效的下一步是删掉它重新粘贴一遍。
     SecretsCorrupt { path: String },
+    /// 守护进程重启时，`last-sessions.toml` 里记的某一条没能接回来。
+    ///
+    /// **这条曾经只往 stderr 打一行**——而真正被 TUI 拉起来的那个守护进程，
+    /// stdio 全被接到 `/dev/null`（`client::spawn_daemon`），用户按了 y
+    /// 同意恢复，一个格子却悄无声息地没出现，没有任何地方告诉他是目录没了
+    /// 还是 profile 被卸载了。跟 `LlmUnavailable` 同一个理由：守护进程的
+    /// stderr 到不了用户眼前，唯一能到的路是这里，经 `Request::Profiles`
+    /// 顶成一条警告。
+    SessionResumeSkipped {
+        dir: String,
+        profile: String,
+        reason: SessionResumeSkipReason,
+    },
+}
+
+/// 恢复上次会话时，某一条为什么被跳过。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionResumeSkipReason {
+    /// 记录的目录已经不存在了
+    DirGone,
+    /// 记录的 profile 已经不认识了（被删掉、改了名……）
+    ProfileGone,
+    /// 目录和 profile 都还在，但重新起这个会话本身失败了
+    StartFailed,
 }
 
 pub fn socket_path() -> PathBuf {

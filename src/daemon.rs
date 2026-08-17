@@ -75,14 +75,15 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         );
         let (all, _) = all_profiles(&profiles_dir);
         let secrets_guard = recover(secrets.lock());
-        for line in restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr) {
-            // 最佳努力：跳过的每一条都留一句人话在 stderr，绝不能因为
-            // 一条坏记录（目录没了、profile 被删了……）就让整个恢复
-            // 流程中止——一半恢复出来的看板好过一个都没有。
-            eprintln!("{line}");
-        }
+        let skips = restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
         drop(secrets_guard);
         eprintln!("dct：会话接回完成。");
+        // review 之后补上：真正被 TUI 拉起来的守护进程 stdio 全接到
+        // `/dev/null`，上面几行 `eprintln!` 谁都看不见——用户按了 y
+        // 同意恢复，一个格子却悄无声息地没出现，没有任何地方告诉他为什么。
+        // 记下来，交给 `Request::Profiles` 顶给界面，跟 `LlmUnavailable`
+        // 走的是同一条路。
+        mgr.set_resume_skips(skips);
     }
 
     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
@@ -316,19 +317,25 @@ fn start_phone_bridge(
 /// 这个纯函数决定——这里只管照着它的判定去调
 /// `SessionManager::create_resuming`，不重新做一遍分组判断。
 ///
-/// 返回值是给用户看的诊断行（跳过了哪条、为什么），调用方决定往哪儿送
-/// （目前是 stderr，只有前台 `dct daemon` 能看见——这条限制跟
-/// `install_llm_backend` 里那句注释是同一件事：真正的守护进程没有终端）。
-/// 抽成返回值而不是内部直接 `eprintln!`，是为了这条最容易出错的路径能
-/// 被单元测试直接断言到，不用真的起一个 socket 去截 stderr。
+/// 返回值是**结构化的**跳过原因（`WarningCode`），不是拼好的句子——跟
+/// `LlmUnavailable` 同一个理由：这份清单最终要经 `mgr.set_resume_skips`
+/// 存起来、`Request::Profiles` 顶给界面（review 之后补上的路，
+/// 见 `SessionManager::resume_skips` 的文档），界面按用户选的语言组句，
+/// 守护进程自己不猜。**这不是它唯一的出口**：函数内部仍然直接
+/// `eprintln!` 进度和跳过的原始信息（Chinese，纯诊断用，只有前台
+/// `dct daemon` 或者截获 stderr 的测试看得见，跟 `install_llm_backend`
+/// 那条注释是同一条限制），那条narration 不需要多语言、也不需要被测试
+/// 断言内容，所以没有走返回值。
 fn restore_last_sessions(
     records: &[crate::last_sessions::RecordedSession],
     all: &[Profile],
     secrets: &SecretStore,
     mgr: &SessionManager,
-) -> Vec<String> {
+) -> Vec<crate::proto::WarningCode> {
+    use crate::proto::{SessionResumeSkipReason, WarningCode};
+
     let resume_flags = crate::last_sessions::group_for_resume(records);
-    let mut diagnostics = Vec::new();
+    let mut skips = Vec::new();
     let total = records.len();
 
     for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
@@ -341,9 +348,6 @@ fn restore_last_sessions(
         // 「怎么卡住了」）。只印到 stderr——只有前台 `dct daemon` 或者
         // 单测能看见，跟 `install_llm_backend` 那条注释是同一条限制：
         // 真正被 TUI 拉起来的那个守护进程，stdio 全被接到 `/dev/null`。
-        // 不进 `diagnostics` 返回值：那个返回值是「跳过了哪条、为什么」
-        // 这一份被测试直接断言内容的清单，进度行混进去只会让每条测试都要
-        // 重新数一遍行数，而进度本身不是需要断言的行为。
         eprintln!(
             "正在恢复第 {}/{total} 个会话：{}（{}）",
             i + 1,
@@ -351,33 +355,54 @@ fn restore_last_sessions(
             record.profile
         );
         if !record.dir.is_dir() {
-            diagnostics.push(format!(
+            eprintln!(
                 "跳过恢复：{} 这个目录已经不在了（profile：{}）",
                 record.dir.display(),
                 record.profile
-            ));
+            );
+            skips.push(WarningCode::SessionResumeSkipped {
+                dir: record.dir.display().to_string(),
+                profile: record.profile.clone(),
+                reason: SessionResumeSkipReason::DirGone,
+            });
             continue;
         }
         if !all.iter().any(|p| p.name == record.profile) {
-            diagnostics.push(format!(
+            eprintln!(
                 "跳过恢复：{} 用的 {} 这个 agent 已经不在了",
                 record.dir.display(),
                 record.profile
-            ));
+            );
+            skips.push(WarningCode::SessionResumeSkipped {
+                dir: record.dir.display().to_string(),
+                profile: record.profile.clone(),
+                reason: SessionResumeSkipReason::ProfileGone,
+            });
             continue;
         }
 
         let secret = secrets.get(&record.profile);
-        if let Err(e) = mgr.create_resuming(&record.dir, &record.profile, secret, all, resume) {
-            diagnostics.push(format!(
+        let tag = if record.tag.is_empty() {
+            None
+        } else {
+            Some(record.tag.as_str())
+        };
+        if let Err(e) = mgr.create_resuming(&record.dir, &record.profile, secret, all, resume, tag)
+        {
+            eprintln!(
                 "跳过恢复：{}（{}）没能重新起来：{e}",
                 record.dir.display(),
                 record.profile
-            ));
+            );
+            skips.push(WarningCode::SessionResumeSkipped {
+                dir: record.dir.display().to_string(),
+                profile: record.profile.clone(),
+                reason: SessionResumeSkipReason::StartFailed,
+            });
         }
     }
 
-    diagnostics
+    skips
 }
 
 fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
@@ -510,6 +535,11 @@ fn handle(
             if let Some(p) = mgr.llm_problem() {
                 warnings.push(crate::proto::WarningCode::LlmUnavailable(p));
             }
+            // 上次重启恢复会话时跳过的那几条——同样的道理：守护进程的
+            // stderr 到不了用户眼前，这是唯一能让他知道「少了哪个、
+            // 为什么」的路。排在最后：前面几条都是「你现在要用的东西
+            // 坏了」，这条是「有一件过去的事没能完全成功」，优先级最低。
+            warnings.extend(mgr.resume_skips());
             let entries = all
                 .iter()
                 .map(|p| {
@@ -899,13 +929,20 @@ mod tests {
             rec(&gone, "daemon-lock-fake"),
             rec(&alive, "daemon-lock-fake"),
         ];
-        let lines = restore_last_sessions(&records, &all, &secrets, &mgr);
+        let skips = restore_last_sessions(&records, &all, &secrets, &mgr);
 
-        assert_eq!(lines.len(), 1, "只有一条该被跳过：{lines:?}");
-        assert!(
-            lines[0].contains(&gone.display().to_string()),
-            "跳过的理由要点名是哪个目录：{lines:?}"
-        );
+        assert_eq!(skips.len(), 1, "只有一条该被跳过：{skips:?}");
+        match &skips[0] {
+            crate::proto::WarningCode::SessionResumeSkipped { dir, reason, .. } => {
+                assert_eq!(
+                    dir,
+                    &gone.display().to_string(),
+                    "跳过的理由要点名是哪个目录"
+                );
+                assert_eq!(*reason, crate::proto::SessionResumeSkipReason::DirGone);
+            }
+            other => panic!("应当是 SessionResumeSkipped：{other:?}"),
+        }
         assert_eq!(mgr.list().len(), 1, "目录还在的那条要恢复出来");
         assert_eq!(mgr.list()[0].dir, alive.display().to_string());
     }
@@ -924,11 +961,46 @@ mod tests {
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
 
         let records = vec![rec(&proj, "no-longer-exists")];
-        let lines = restore_last_sessions(&records, &all, &secrets, &mgr);
+        let skips = restore_last_sessions(&records, &all, &secrets, &mgr);
 
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("no-longer-exists"));
+        assert_eq!(skips.len(), 1);
+        match &skips[0] {
+            crate::proto::WarningCode::SessionResumeSkipped {
+                profile, reason, ..
+            } => {
+                assert_eq!(profile, "no-longer-exists");
+                assert_eq!(*reason, crate::proto::SessionResumeSkipReason::ProfileGone);
+            }
+            other => panic!("应当是 SessionResumeSkipped：{other:?}"),
+        }
         assert!(mgr.list().is_empty(), "没恢复出任何会话");
+    }
+
+    /// **钉住 review 之后补上的修复**：开局提示里明明白白显示了这个会话
+    /// 的名字，`create_resuming` 却不把它接回去的话，用户刚看完一份带
+    /// 名字的清单，回头看到的却是一个没名字的空槽——提示立刻穿帮。
+    #[test]
+    fn restoring_a_session_reapplies_its_recorded_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        init_repo(&proj);
+
+        let mgr = SessionManager::new();
+        let all = vec![fake_agent()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "daemon-lock-fake");
+        r.tag = "修登录白屏".to_string();
+        let skips = restore_last_sessions(&[r], &all, &secrets, &mgr);
+
+        assert!(skips.is_empty(), "这条该恢复成功：{skips:?}");
+        let list = mgr.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].tag, "修登录白屏",
+            "恢复出来的会话要带着记录里的名字，不能是空槽"
+        );
     }
 
     /// claude×2 撞车：只有活得最晚的那个真的带 `--continue`。这条测试
@@ -1391,6 +1463,52 @@ mod tests {
         assert!(
             line.contains("根本没有这个"),
             "要点名是设置里的哪个名字写错了：{line}"
+        );
+    }
+
+    /// **钉住 review 之后补上的路由**：`restore_last_sessions` 跳过的
+    /// 那几条不能只活在 stderr 里（真正被 TUI 拉起来的守护进程 stdio
+    /// 全接到 `/dev/null`，谁都看不见）——`mgr.set_resume_skips` 记下来，
+    /// 必须真的经 `Request::Profiles` 走到界面能读到的地方，跟
+    /// `LlmUnavailable` 走的是同一条路。
+    #[test]
+    fn skipped_session_resume_reaches_the_user_through_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles_dir = dir.path().join("profiles");
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_resume_skips(vec![crate::proto::WarningCode::SessionResumeSkipped {
+            dir: "/w/dc-terminal".to_string(),
+            profile: "claude".to_string(),
+            reason: crate::proto::SessionResumeSkipReason::DirGone,
+        }]);
+
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &dir.path().join("secrets.toml"),
+        )));
+        let store = Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json"))));
+        let resp = handle(
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
+            &mgr,
+            &store,
+            &secrets,
+            &profiles_dir,
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+        );
+        let Response::Profiles { warnings, .. } = resp else {
+            panic!("期待 Response::Profiles");
+        };
+        let w = warnings
+            .iter()
+            .find(|w| matches!(w, crate::proto::WarningCode::SessionResumeSkipped { .. }))
+            .expect("跳过的会话恢复没有走到警告里——用户按了 y，一个格子却悄悄消失");
+        let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+        assert!(
+            line.contains("/w/dc-terminal") && line.contains("claude"),
+            "要点名是哪个目录、哪个 agent：{line}"
         );
     }
 

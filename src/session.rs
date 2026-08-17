@@ -151,6 +151,13 @@ pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
 /// 各处自己的事，跟这个常数无关。
 const NAME_MAX_CHARS: usize = 24;
 
+/// `tick()` 里 Working → Idle/Asking 触发的清单落盘专用的防抖窗口——
+/// 见 `Session::last_persisted` 的文档：不跟手机通知共用 30 秒那个数字，
+/// 这里只是为了压住一次全屏重绘造成的状态抖动，窗口要短得多。2 秒足够
+/// 盖掉一次绘制抖动，又远小于真实的「一轮工作」通常花的时间，不会把
+/// 磁盘上的时间戳拖到影响恢复判定准确性的地步。
+const ROUND_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
+
 /// 把模型回的东西洗成一个能直接画在标题上的名字。
 ///
 /// 模型很少老老实实只给名字：会加引号、会加句号、会多写一句解释。
@@ -499,6 +506,26 @@ struct Session {
     /// 用错的那个会话上，正是「一组里只让一个继续」这条规矩想避免的
     /// 事故本身，只是换了个更隐蔽的位置犯。
     last_active: std::time::SystemTime,
+    /// 上次因为「干完一轮活」（Working → Idle/Asking）而真的把清单落盘的
+    /// 时刻，`debounce()` 的 `last` 参数，跟 `last_notified` 同一套用法
+    /// （相对 `SessionManager::started`）。
+    ///
+    /// **这是唯一给这条落盘路径设的节流阀。** 一次全屏重绘能在没有任何
+    /// 真实工作发生的情况下把「esc to interrupt」那一行盖住一轮 tick，
+    /// 让状态在 Working/Idle 之间来回抖一下——`classify()` 本身分不清
+    /// 「真的空闲了」和「画面被重绘吞了一帧」，`tick()` 每秒跑 5 次，
+    /// 抖起来最坏能到每秒 5 次落盘。没有这道节流，这条本该「每轮活一次」
+    /// 的稀疏写入会退化成事实上的逐 tick 写入，正是这个模块从设计第一天
+    /// 起就要挡住的东西（见 `last_sessions` 模块文档「绝不能从 tick()
+    /// 写」那段）。
+    ///
+    /// **窗口用的是专门给这条路径开的短常数（`ROUND_PERSIST_DEBOUNCE`），
+    /// 不跟 `last_notified` 共用 `channel::DEBOUNCE_WINDOW`（30 秒）**：
+    /// 那个数字是为了不拿手机通知骚扰用户拍出来的，套在这里的话，30 秒内
+    /// 真的又干完一轮活的正常使用也会被一起挡住，磁盘上的时间戳能滞后到
+    /// 影响「谁更该继续」判断准确性的地步——这条防抖只是为了压住毫无
+    /// 实际工作的抖动帧，窗口要短得多。
+    last_persisted: Option<Duration>,
 }
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
@@ -534,6 +561,15 @@ pub struct SessionManager {
     /// （见 `proto::WarningCode::LlmUnavailable`），这是这条原因唯一能走到
     /// 用户眼前的路。
     llm_problem: Mutex<Option<crate::llm::resolve::ResolveError>>,
+    /// 上次守护进程重启时，`last-sessions.toml` 里有哪几条没能接回来。
+    /// 跟 `llm_problem` 一模一样的道理：守护进程的 stderr 到不了用户
+    /// 眼前，这是唯一能让「跳过了哪条、为什么」走到界面上的路，见
+    /// `proto::WarningCode::SessionResumeSkipped`。启动时最多写一次
+    /// （`daemon::run_with_manager` 里恢复流程跑完之后），此后不再变，
+    /// 一直留到下次真正重启——不像 `llm_problem` 会随 `PhoneSetToken`
+    /// 之类的请求被重新 resolve，这份清单描述的是「上一次重启发生过
+    /// 什么」，本来就该是这次进程生命周期里的一份定论。
+    resume_skips: Mutex<Vec<crate::proto::WarningCode>>,
     /// `tick()` 往手机通知队列投事件用的出口。**unbounded**——Ruling 4：
     /// `tick()` 绝不能因为投递这件事阻塞，一个 `mpsc::Sender` 的
     /// `send()` 本来就不会阻塞（它只会让底层队列变长），有界的那一半
@@ -578,6 +614,7 @@ impl SessionManager {
             last_sessions_path: Mutex::new(None),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
+            resume_skips: Mutex::new(Vec::new()),
             event_tx: Mutex::new(None),
             started: Instant::now(),
         }
@@ -617,6 +654,23 @@ impl SessionManager {
 
     pub fn llm_problem(&self) -> Option<crate::llm::resolve::ResolveError> {
         recover(self.llm_problem.lock()).clone()
+    }
+
+    /// 记下这次启动恢复上次会话时，哪几条被跳过了。`daemon::run_with_manager`
+    /// 在 `restore_last_sessions` 跑完之后调用一次；没恢复过（清单本来就
+    /// 是空的）就不调用，`resume_skips()` 保持默认的空 `Vec`——跟
+    /// `llm_problem` 用 `None` 表示「没这回事」是同一个道理，只是这里
+    /// 用空列表。
+    pub fn set_resume_skips(&self, skips: Vec<crate::proto::WarningCode>) {
+        *recover(self.resume_skips.lock()) = skips;
+    }
+
+    /// `Request::Profiles` 会把这些当成警告顶到界面上——守护进程的
+    /// stderr 是被丢弃的，不这样做的话，用户按 y 同意恢复之后，少掉的
+    /// 那个格子就是一片沉默，没有任何地方告诉他是目录没了还是 profile
+    /// 被卸载了。
+    pub fn resume_skips(&self) -> Vec<crate::proto::WarningCode> {
+        recover(self.resume_skips.lock()).clone()
     }
 
     /// 读一个会话此刻的出错解释。没有后端、还没问完、或者问失败了，
@@ -728,7 +782,7 @@ impl SessionManager {
         secret: Option<&str>,
         profiles: &[Profile],
     ) -> Result<u32> {
-        self.create_inner(dir, profile_name, secret, profiles, false)
+        self.create_inner(dir, profile_name, secret, profiles, false, None)
     }
 
     /// `create()` 的姐妹方法：多一个 `resume` 开关，守护进程重启后恢复
@@ -748,6 +802,16 @@ impl SessionManager {
     /// 「这个 profile 支不支持恢复」再决定要不要传 `true`）。判定「这一条
     /// 该不该真的传 `true`」是 `last_sessions::group_for_resume` 的事，
     /// 不是这里。
+    ///
+    /// `restore_tag`：从 `last-sessions.toml` 里记下来的名字（`None` 或者
+    /// 空串 = 那条记录当时还没起出名字，恢复出来的会话就照旧走一遍正常的
+    /// 起名流程，不用特殊处理）。**review 之后补上**：用户在开局提示里
+    /// 已经被明确告知「这个会话会叫这个名字」，`create_resuming` 之前没有
+    /// 把这个名字真的接回去，会话建出来是一个没名字的空槽——提示里的话
+    /// 立刻穿帮。带了名字的话，这里同时把 `name_attempted` 标成
+    /// `true`：这个名字是恢复出来的、不是这一轮新对话起的，`tick()`
+    /// 不该在它干完第一轮活的时候又去问模型要一个新名字、把刚恢复回来的
+    /// 名字覆盖掉。
     pub fn create_resuming(
         &self,
         dir: &Path,
@@ -755,8 +819,9 @@ impl SessionManager {
         secret: Option<&str>,
         profiles: &[Profile],
         resume: bool,
+        restore_tag: Option<&str>,
     ) -> Result<u32> {
-        self.create_inner(dir, profile_name, secret, profiles, resume)
+        self.create_inner(dir, profile_name, secret, profiles, resume, restore_tag)
     }
 
     fn create_inner(
@@ -766,6 +831,7 @@ impl SessionManager {
         secret: Option<&str>,
         profiles: &[Profile],
         resume: bool,
+        restore_tag: Option<&str>,
     ) -> Result<u32> {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
@@ -835,6 +901,17 @@ impl SessionManager {
             );
         }
 
+        // 恢复出来的名字（有的话）。空串等同于「没有」——那条记录当时
+        // 就没起出名字，跟从没恢复过没有区别，让它照旧走一遍正常流程。
+        let restored_name = restore_tag
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        // 带了名字就算「已经问过」，见 `create_resuming` 上 `restore_tag`
+        // 那段文档：这个名字是恢复出来的，不该被 `tick()` 干完第一轮活
+        // 之后又问模型要一个新的盖掉。
+        let name_attempted = restored_name.is_some();
+
         let session = Session {
             id,
             profile,
@@ -847,14 +924,15 @@ impl SessionManager {
             error_re,
             pty,
             explanation_slot: Arc::new(Mutex::new(None)),
-            name_slot: Arc::new(Mutex::new(None)),
+            name_slot: Arc::new(Mutex::new(restored_name)),
             first_input: String::new(),
             first_input_sealed: false,
-            name_attempted: false,
+            name_attempted,
             explanation_gen: Arc::new(AtomicU64::new(0)),
             scroll_mark: 0,
             last_notified: None,
             last_active: std::time::SystemTime::now(),
+            last_persisted: None,
         };
 
         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
@@ -1183,6 +1261,22 @@ impl SessionManager {
                 self.journal
                     .died(s.id, crate::journal::Death::Vanished, pid);
                 self.maybe_notify(&mut s, EventKind::Vanished);
+                // **修复（review 之后补上）**：这也是会话集合变化的一种——
+                // 一个崩溃/自己退出的会话从「活着」变成「停了」，跟 `stop()`/
+                // `kill()` 落的是同一个 `Stopped`。不在这里重写清单的话，
+                // 它会带着崩溃前最后一刻的 `last_active` 继续留在磁盘上，
+                // 直到下一次 create/stop/kill/prune 才被冲掉——这段窗口里
+                // 如果同一个目录+profile 下还有另一个真正活着、最近被用过
+                // 的会话，`group_for_resume` 会去比一个死会话的旧时间戳，
+                // 死的那个反而可能赢，daemon 重启时把 `--continue` 接给一个
+                // 已经不存在的会话，活着的那个倒要重新开始——这正是分组
+                // 规则本来要防的事故，只是换了个入口。
+                //
+                // 在这里调用是安全的：`s` 是这个会话自己的锁，`drop(s)` 先
+                // 松开、`persist_last_sessions` 再重新逐个上锁，跟
+                // Working → Idle 那条路径是同一套顺序。
+                drop(s);
+                self.persist_last_sessions();
                 continue;
             }
             if s.state == SessionState::Asking {
@@ -1262,7 +1356,19 @@ impl SessionManager {
                         // group_for_resume` 需要的「最近活跃」，不是「最近
                         // 建的」。只更新内存；落盘挪到下面，等这把锁松开。
                         s.last_active = std::time::SystemTime::now();
-                        just_finished_a_round = true;
+
+                        // review 之后补上的节流：一次全屏重绘能在没有任何
+                        // 真实工作发生的情况下把状态判定抖一下，
+                        // Working → Idle → Working 在几个 tick 之内来回跳，
+                        // 每一跳都会走到这里——不挡住的话，这条本该「一轮
+                        // 活一次」的落盘会退化成事实上贴着 tick() 节奏的
+                        // 磁盘 IO，正是这个模块从第一天起就要避免的东西。
+                        // 见 `Session::last_persisted` 的文档。
+                        let now = self.started.elapsed();
+                        if debounce(s.last_persisted, now, ROUND_PERSIST_DEBOUNCE) {
+                            s.last_persisted = Some(now);
+                            just_finished_a_round = true;
+                        }
                     }
                 }
             }
@@ -3107,7 +3213,7 @@ mod tests {
         mgr.register_profile(resume_probe_profile());
 
         let id = mgr
-            .create_resuming(tmp.path(), "resume-probe", None, &[], true)
+            .create_resuming(tmp.path(), "resume-probe", None, &[], true, None)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3128,7 +3234,7 @@ mod tests {
         mgr.register_profile(resume_probe_profile());
 
         let id = mgr
-            .create_resuming(tmp.path(), "resume-probe", None, &[], false)
+            .create_resuming(tmp.path(), "resume-probe", None, &[], false, None)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3156,7 +3262,7 @@ mod tests {
         mgr.register_profile(fake_agent());
 
         let id = mgr
-            .create_resuming(proj.path(), "fake", None, &[], true)
+            .create_resuming(proj.path(), "fake", None, &[], true, None)
             .unwrap();
         // `fake_agent()` 的 command 就是 `["cat"]`：如果 resume_args 被
         // 凭空加上了什么，`cat` 会因为收到一个不存在的文件名参数而报错
@@ -3335,6 +3441,160 @@ mod tests {
             after_idle > after_create,
             "Working → Idle 之后，落盘的 last_active 该比建号时新：{after_create} → {after_idle}"
         );
+    }
+
+    /// **钉住 review 之后补上的节流**：一次全屏重绘能让状态在
+    /// Working/Idle 之间来回抖，`classify()` 分不清「真的空闲了」和
+    /// 「画面被重绘吞了一帧」。没有防抖的话，这种抖动会让 `tick()`
+    /// 每检测到一次 Working → Idle 就落一次盘，最坏能到每秒 5 次——
+    /// 正是这个模块从第一天起就要避免的「贴着 tick() 节奏做磁盘 IO」。
+    ///
+    /// 用一个不停在 `WORK`/`READY` 之间自己来回切换的 profile（不需要
+    /// 任何用户输入，纯靠屏幕内容驱动 `classify()`）制造这种抖动，在
+    /// 防抖窗口内反复 `tick()`，落盘的时间戳必须原地不动；窗口过了之后
+    /// 再抖一次，才允许它往前走一格。
+    #[test]
+    fn a_flickering_screen_does_not_flood_the_disk_with_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let flickering = Profile::from_toml(
+            r#"
+            name = "flickering"
+            command = ["/bin/sh", "-c", 'while true; do printf "\033[2J\033[HWORK\n"; sleep 0.05; printf "\033[2J\033[HREADY\n"; sleep 0.05; done']
+            is_agent = true
+            idle_pattern = "READY"
+            "#,
+        )
+        .unwrap();
+
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.set_last_sessions_path(record_path.clone());
+        let id = m
+            .create(repo.path(), "flickering", empty_secrets(), &[flickering])
+            .unwrap();
+
+        // 等它第一次真的翻到 Idle 过一次——这一下必然落盘（第一次没有
+        // 「上次」可比），之后的抖动才是这条测试真正要验的部分。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            if state_of(&m, id) == SessionState::Idle {
+                break;
+            }
+            assert!(Instant::now() < deadline, "一直没进 Idle");
+            sleep(Duration::from_millis(10));
+        }
+        let first = crate::last_sessions::load(&record_path)[0].last_active;
+
+        // 接下来 1 秒之内疯狂 tick()——屏幕在这期间会在 WORK/READY 之间
+        // 来回抖好几十次，每一次「翻到 Idle」按旧实现都会触发一次落盘。
+        // 防抖窗口是 2 秒，这 1 秒之内落盘的时间戳必须纹丝不动。
+        let keep_ticking_until = Instant::now() + Duration::from_millis(1000);
+        while Instant::now() < keep_ticking_until {
+            m.tick();
+            sleep(Duration::from_millis(10));
+        }
+        let after_flicker = crate::last_sessions::load(&record_path)[0].last_active;
+        assert_eq!(
+            after_flicker, first,
+            "防抖窗口内的抖动不该产生新的落盘：{first} → {after_flicker}"
+        );
+
+        // 窗口过了（防抖是 2 秒，上面已经过了 1 秒，再等够）之后再抖一次，
+        // 时间戳才允许往前走——证明这不是「永远冻结」，只是节流。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            m.tick();
+            let now = crate::last_sessions::load(&record_path)[0].last_active;
+            if now > first {
+                break;
+            }
+            assert!(Instant::now() < deadline, "窗口过了之后应该能再落一次盘");
+            sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// **钉住 review 之后补上的修复**：一个自己崩掉的会话（tick() 的
+    /// `vanished` 分支，不是 `stop()`/`kill()`）不落盘的话，会带着崩溃前
+    /// 最后一刻的 `last_active` 继续赖在清单里，直到下一次
+    /// create/stop/kill/prune 才被冲掉。同一个 `(dir, profile)` 下如果
+    /// 还有一个真正活着、但没那么晚才动过的会话，`group_for_resume` 会去
+    /// 比一个死会话的旧时间戳——死的那个反而可能赢，daemon 重启时把
+    /// `--continue` 接给一个已经不存在的会话，活着的那个倒要重新开始。
+    ///
+    /// 场景：A 先建（一直活着），B 后建（记录下来的时间天然比 A 晚），
+    /// 然后 B 自己崩了（进程退出，不是被 `stop`/`kill`）。`tick()` 必须
+    /// 在检测到这次崩溃的同一刻把清单重写掉，让 B 从「活着的会话」里
+    /// 彻底消失——而不是留着一个比 A 更新、却已经不存在的条目。
+    #[test]
+    fn a_session_that_crashes_later_does_not_outrank_a_live_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        let proj = init_repo();
+
+        // A：一直活着的会话（cat，不会自己退出）。
+        let id_a = mgr
+            .create(proj.path(), "fake", None, &[fake_agent()])
+            .unwrap();
+        sleep(Duration::from_millis(30));
+
+        // B：跟 A 同一个 (dir, profile)，但命令会自己很快退出——模拟
+        // 「用到 11 点，然后崩了」。**故意用同一个 profile 名字「fake」**：
+        // `resolve_profile` 先查调用方传进来的 `profiles` 切片，同一个
+        // manager 上两次 `create` 各自带一份不同的 `Profile` 定义，记录
+        // 下来的 `profile` 字符串照样相同——这正是 `group_for_resume`
+        // 要按 `(dir, profile)` 分组、认成"同一组"的场景。
+        let crashing = Profile::from_toml(
+            r#"
+            name = "fake"
+            command = ["/bin/sh", "-c", "exit 1"]
+            is_agent = true
+            "#,
+        )
+        .unwrap();
+        let id_b = mgr.create(proj.path(), "fake", None, &[crashing]).unwrap();
+
+        // 崩之前，B 确实是刚被建出来、比 A 新——这一步的落盘（`create()`
+        // 触发的那次）如实反映了「B 此刻是更新的那个」，这本身没有错。
+        let before_crash = crate::last_sessions::load(&record_path);
+        assert_eq!(before_crash.len(), 2, "B 崩溃之前，两条都该在清单里");
+
+        // 等 B 自己退出（`/bin/sh -c "exit 1"` 几乎立刻结束），然后跑
+        // tick() 去发现它——这是 `vanished` 分支，不是 `stop`/`kill`。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id_b) == SessionState::Stopped {
+                break;
+            }
+            assert!(Instant::now() < deadline, "B 应该已经自己退出了");
+            sleep(Duration::from_millis(20));
+        }
+
+        // 崩溃这一刻必须已经把清单重写过：B 不该再出现，A 还活着、还在。
+        let after_crash = crate::last_sessions::load(&record_path);
+        assert_eq!(
+            after_crash.len(),
+            1,
+            "B 崩溃之后，清单里不该再留着它的旧时间戳：{after_crash:?}"
+        );
+        assert_eq!(after_crash[0].dir, proj.path());
+        assert_eq!(after_crash[0].profile, "fake");
+
+        // 分组判定：清单里只剩 A 了，它自然拿到「继续」——不存在跟一个
+        // 已经死掉、却还留着更新时间戳的 B 抢的问题。
+        let flags = crate::last_sessions::group_for_resume(&after_crash);
+        assert_eq!(flags, vec![true]);
+
+        assert_ne!(id_a, id_b);
+        assert_eq!(state_of(&mgr, id_a), SessionState::Working, "A 应该还活着");
     }
 
     /// 没装过路径（`SessionManager::new()` 默认状态）的话，`create`/

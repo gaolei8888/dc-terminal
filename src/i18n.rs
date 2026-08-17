@@ -1198,6 +1198,38 @@ pub mod msg {
                     zh: format!("「出错解释」开着，但连不上：{why}会话照常跑。"),
                 )
             }
+            // 用户在开局提示里已经答应了「接回来」，一条没恢复成功就该有
+            // 一句解释——不然一个格子悄悄消失，用户既不知道少了哪个，
+            // 也不知道该拿它怎么办。三种原因对应三种不同的下一步，
+            // 不能糊成一句「没恢复成功」。
+            SessionResumeSkipped {
+                dir,
+                profile,
+                reason,
+            } => {
+                let why = match reason {
+                    crate::proto::SessionResumeSkipReason::DirGone => t!(
+                        lang,
+                        en: "that folder no longer exists",
+                        zh: "那个目录已经不在了",
+                    ),
+                    crate::proto::SessionResumeSkipReason::ProfileGone => t!(
+                        lang,
+                        en: "that agent is no longer available",
+                        zh: "那个 agent 已经不在了",
+                    ),
+                    crate::proto::SessionResumeSkipReason::StartFailed => t!(
+                        lang,
+                        en: "it could not be started again",
+                        zh: "没能重新启动",
+                    ),
+                };
+                t!(
+                    lang,
+                    en: format!("Could not bring back the “{profile}” session in {dir}: {why}."),
+                    zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
+                )
+            }
         }
     }
 
@@ -1623,6 +1655,21 @@ mod tests {
                 name: "kimi".into(),
                 url: "not-a-url".into(),
             }),
+            SessionResumeSkipped {
+                dir: "/w/dc-terminal".into(),
+                profile: "claude".into(),
+                reason: crate::proto::SessionResumeSkipReason::DirGone,
+            },
+            SessionResumeSkipped {
+                dir: "/w/dc-terminal".into(),
+                profile: "claude".into(),
+                reason: crate::proto::SessionResumeSkipReason::ProfileGone,
+            },
+            SessionResumeSkipped {
+                dir: "/w/dc-terminal".into(),
+                profile: "claude".into(),
+                reason: crate::proto::SessionResumeSkipReason::StartFailed,
+            },
         ];
         for c in &codes {
             for l in Lang::all() {
