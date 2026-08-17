@@ -30,11 +30,17 @@ pub(crate) fn status_line(status: &PhoneStatus, lang: Lang) -> String {
     match &status.state {
         PhoneState::Off => text(Key::PhoneOffLine, lang).to_string(),
         // **必须点名 bot**，否则「去发条消息」是一句没法执行的话
-        // （见 `waiting_names_the_bot`）。没有名字（理论上不该发生：daemon
-        // 只有拿到 `getMe` 的用户名才会进这个状态）就晾着，不瞎编一个。
+        // （见 `waiting_names_the_bot`）。没有名字**会**在生产里真的发生：
+        // 守护进程重启时，只要密钥仓里已经有令牌就直接进这个状态
+        // （`daemon::initial_phone_status`），但 bot 用户名要等 Task 5 的
+        // bridge 线程真的跑起来、重新打一次 `getMe` 才补得上。这不是
+        // `Off`——令牌还在，配对多半也还在——所以绝不能借用 `PhoneOffLine`
+        // （那曾经是这里的写法，被判为一个可复现的生产缺陷：重启完打开
+        // 这一页会显示「手机通知还没打开」，而它根本没关）。这里给一句
+        // 诚实的「正在重新接上」，不点名、也不假装点名。
         PhoneState::WaitingForPairing => match &status.bot {
             Some(bot) => msg::phone_waiting_for_pairing(lang, bot),
-            None => text(Key::PhoneOffLine, lang).to_string(),
+            None => text(Key::PhoneReconnectingLine, lang).to_string(),
         },
         PhoneState::Paired => match &status.owner {
             Some(owner) => msg::phone_paired(lang, owner),
@@ -49,7 +55,16 @@ pub(crate) fn status_line(status: &PhoneStatus, lang: Lang) -> String {
 pub(crate) fn next_step(status: &PhoneStatus, lang: Lang) -> Option<String> {
     match &status.state {
         PhoneState::Off => Some(text(Key::PhoneNextStepOff, lang).to_string()),
-        PhoneState::WaitingForPairing => Some(text(Key::PhoneNextStepWaiting, lang).to_string()),
+        // 没有 bot 名字时不能叫用户「去给它发条消息」——那正是
+        // `waiting_names_the_bot` 要防的事，这里给的是一个不点名也站得住
+        // 的下一步：等一下。
+        PhoneState::WaitingForPairing => Some(
+            match &status.bot {
+                Some(_) => text(Key::PhoneNextStepWaiting, lang),
+                None => text(Key::PhoneNextStepReconnecting, lang),
+            }
+            .to_string(),
+        ),
         PhoneState::Paired => None,
         PhoneState::Broken(_) => Some(text(Key::PhoneNextStepBroken, lang).to_string()),
     }
@@ -274,6 +289,31 @@ mod tests {
             Lang::Zh,
         );
         assert!(s.contains("my_dct_bot"), "等配对却没说是哪个 bot：{s}");
+    }
+
+    /// 生产里真的会撞到的一格：守护进程重启，令牌还在（`WaitingForPairing`），
+    /// 但 bot 用户名还没等到 bridge 重新查回来（`bot: None`）——这时候
+    /// **既不能**说「手机通知还没打开」（令牌没丢，这不是 `Off`），
+    /// **也不能**叫用户去给一个没有名字的 bot 发消息（`waiting_names_the_bot`
+    /// 防的就是这个）。
+    #[test]
+    fn waiting_without_a_bot_name_is_neither_off_nor_a_dangling_instruction() {
+        let st = PhoneStatus {
+            state: PhoneState::WaitingForPairing,
+            bot: None,
+            owner: None,
+        };
+        let line = status_line(&st, Lang::Zh);
+        assert_ne!(
+            line,
+            text(Key::PhoneOffLine, Lang::Zh),
+            "令牌还在，不该说成关着的：{line}"
+        );
+        let step = next_step(&st, Lang::Zh).expect("这个状态仍然要给下一步");
+        assert!(
+            !step.contains('@') && !step.to_lowercase().contains("bot"),
+            "没有名字就不能叫用户去找某个 bot：{step}"
+        );
     }
 
     /// 令牌是密钥。**任何一处状态文案都不许把它带出来。**

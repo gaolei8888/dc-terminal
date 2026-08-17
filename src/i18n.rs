@@ -156,6 +156,10 @@ pub enum Key {
     PhoneOffLine,
     /// 已经连上，但不知道是谁（没有 `owner`，理论上不该出现，兜底用）
     PhonePairedLine,
+    /// `WaitingForPairing` 但还没拿到 bot 用户名——守护进程刚重启，令牌
+    /// 还在但 bot 名字要等 bridge 重新查一次。**不能借用 `PhoneOffLine`**：
+    /// 令牌没丢，这不是关着，见 `ui::phone::status_line` 的注释。
+    PhoneReconnectingLine,
     /// 连不上——**不带任何原因**，原因由 `daemon.rs` 决定但故意不传到这里，
     /// 见 `PhoneState::Broken` 的文档注释和 `ui::phone::status_line`。
     PhoneBrokenLine,
@@ -166,6 +170,9 @@ pub enum Key {
     PhoneNextStepWaiting,
     /// Broken 状态的下一步：重新填一遍令牌
     PhoneNextStepBroken,
+    /// `WaitingForPairing` 但还没拿到 bot 名字时的下一步：等一下，
+    /// **不能**叫用户去给一个没有名字的 bot 发消息。
+    PhoneNextStepReconnecting,
     /// 按键表：填令牌
     PhoneEnterToken,
     /// 按键表：重新配对（换一台手机）
@@ -364,6 +371,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
+        PhoneReconnectingLine => t!(
+            lang,
+            en: "Reconnecting, one moment",
+            zh: "正在重新接上，请稍候",
+        ),
         PhoneBrokenLine => t!(
             lang,
             en: "Cannot reach the phone notification service right now",
@@ -383,6 +395,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Press Enter to paste the token again",
             zh: "按 Enter 重新粘贴一遍令牌",
+        ),
+        PhoneNextStepReconnecting => t!(
+            lang,
+            en: "Give it a moment, then check back here",
+            zh: "稍等一下，过会儿再回来看看",
         ),
         PhoneEnterToken => t!(lang, en: "enter token", zh: "填令牌"),
         PhoneRepair => t!(lang, en: "re-pair", zh: "重新配对"),
