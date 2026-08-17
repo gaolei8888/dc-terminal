@@ -1298,13 +1298,20 @@ pub fn parse_options(raw: &str) -> Option<Vec<String>> {
             || candidate.contains('=')
             || candidate.contains('\\')
             || candidate.contains("--")
+            || candidate.contains(':')
+            || candidate.contains('：')
             || candidate.chars().count() > OPTION_MAX_CHARS
         {
             continue;
         }
         out.push(candidate.to_string());
-        if out.len() >= OPTIONS_MAX_CANDIDATES {
-            break;
+        // 超过这个数字**整份答案不采信**，不是只留前几个——见
+        // `OPTIONS_MAX_CANDIDATES` 自己的文档：模型给出这么多编号，本身
+        // 就说明它没有把这段屏幕读成"从几个选项里选一个"，那么这份答案
+        // 作为整体就是不可信的，截断只留前六条既治不好这个问题，还会把
+        // 那六条本该被判定为"读错了"的屏幕原文继续送到手机上。
+        if out.len() > OPTIONS_MAX_CANDIDATES {
+            return None;
         }
     }
     if out.is_empty() {
@@ -1353,7 +1360,19 @@ fn map_answer_prompt(user: &str, opts: &[String]) -> crate::llm::Prompt {
 /// 只有 `options` 非空时才会问模型，而且答案必须是候选里的合法序号
 /// （`1..=opts.len()`）——序号本身就是数字，模型答错、答不出、超时、
 /// 答案越界，全部原样退回 `user`，不猜、不编。
-pub fn map_answer(
+///
+/// **`#[cfg(test)]`：生产路径不再调用这个函数本身。** `deliver_to` 需要
+/// 分清"模型真的选中了某一项"和"没选中、原样退回的话恰好也是数字"这两
+/// 种情况（见 `map_answer_index` 的文档），所以它直接调用返回结构化
+/// `Option<usize>` 的 `map_answer_index`，不经过这层返回 `String` 的
+/// 包装。留着这个函数是因为它是 brief 原文点名的接口形状（`map_answer(
+/// user, options, backend) -> String`），也是红线测试最直接、最贴合
+/// brief 断言写法的落点——`free_text_is_typed_verbatim_and_never_reaches_
+/// the_model` 等测试钉的就是这个签名。不给它生产调用方就不该给它生产
+/// 可见性，免得它在往后的改动里跟真实路径（`map_answer_index`）悄悄
+/// 长出两套不同的行为。
+#[cfg(test)]
+pub(crate) fn map_answer(
     user: &str,
     options: Option<&[String]>,
     b: &Arc<dyn crate::llm::Backend>,
@@ -3150,6 +3169,24 @@ mod tests {
         assert_eq!(got, vec!["先跑完".to_string()]);
     }
 
+    /// **变异测试专用：冒号分隔的 `KEY: value`。** 跟 `=` 是同一类信号，
+    /// 但字符不同——`token: abc123`、`密码: hunter2` 这类短语既不带 `/`
+    /// `` ` `` `=` `\` `--`，也不会撞上长度上限，是这次评审揪出的
+    /// "跟已修的漏洞形状相同但字符不同"的最近一个漏网之鱼。
+    #[test]
+    fn options_containing_an_ascii_colon_are_discarded() {
+        let got = parse_options("1. token: abc123\n2. 先跑完").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
+    /// 全角冒号——屏幕内容可能是中文，`密码：hunter2` 这种写法一样常见，
+    /// ASCII 版本的检查挡不住它。
+    #[test]
+    fn options_containing_a_fullwidth_colon_are_discarded() {
+        let got = parse_options("1. 密码：hunter2\n2. 先跑完").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
     /// **变异测试专用：长度上限。** 一条选项如果长过 `OPTION_MAX_CHARS`，
     /// 不管有没有命中任何具体的字符类信号，本身就该被当成"屏幕原文"
     /// 拦下——这是兜住"内容本身够短测试想不到、但仍然是原文"这类情况的
@@ -3167,12 +3204,15 @@ mod tests {
     /// 候选数量上限：模型答得再离谱，`parse_options` 也不该无限往外掏。
     #[test]
     fn parse_options_caps_the_number_of_candidates() {
+        // 超过 `OPTIONS_MAX_CANDIDATES` 不是"截断只留前六条"，而是整份
+        // 答案作废——这么多编号本身就说明模型没把这段屏幕读成"从几个
+        // 选项里选一个"，那六条留下来的候选照样是没被正确理解的屏幕
+        // 原文，截断治不好这个问题。
         let raw = (1..=20)
             .map(|i| format!("{i}. 选项{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let got = parse_options(&raw).unwrap();
-        assert_eq!(got.len(), OPTIONS_MAX_CANDIDATES);
+        assert_eq!(parse_options(&raw), None);
     }
 
     // ---- options_prompt：范式跟 explain_prompt/name_prompt 一致 ----
