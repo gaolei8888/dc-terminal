@@ -84,6 +84,13 @@ pub struct Event {
     /// 会话名。自动命名功能早就生成好了，这里直接用。
     pub name: String,
     pub project: String,
+    /// 事件发生那一刻的屏幕文字（仅用于 `bridge.rs::options_prompt` 猜
+    /// 「agent 是不是在等一个选择」，从不直接展示给用户）。**这是唯一
+    /// 携带原始屏幕内容的字段**——`name`/`project` 都已经是成文的人话，
+    /// 这个字段不是：它只喂给模型，任何真正送到手机上的文字都必须先过
+    /// `bridge.rs::parse_options` 那道过滤，绝不能把这段原始内容直接
+    /// 转发出去。
+    pub screen: String,
 }
 
 /// 这个事件该发吗？

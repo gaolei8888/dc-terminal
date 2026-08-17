@@ -593,6 +593,17 @@ impl SessionManager {
         recover(self.backend.lock()).is_some()
     }
 
+    /// 这次进程 resolve 出来的后端，**跟出错解释共用同一份**——`bridge.rs`
+    /// 猜「agent 是不是在等一个选择」（`options_prompt`）、猜「这条回复该
+    /// 敲给哪个候选会话」（`narrow`）用的都是这一个，不用户单独为手机通道
+    /// 再配一遍。`None` 就是没配 `[llm]`（或者配了但连不上），调用方
+    /// （`daemon.rs`）据此决定要不要给 `Bridge` 也装上；`Bridge` 拿到
+    /// `None` 时这两个功能安静下线，回复照旧原样敲进去，见它们各自的
+    /// 文档。
+    pub fn backend(&self) -> Option<Arc<dyn crate::llm::Backend>> {
+        recover(self.backend.lock()).clone()
+    }
+
     /// 注册内置之外的 profile（测试用，也是将来从磁盘加载自定义 profile 的入口）
     pub fn register_profile(&self, p: Profile) {
         recover(self.extra_profiles.lock()).insert(p.name.clone(), p);
@@ -1111,11 +1122,18 @@ impl SessionManager {
             .unwrap_or_else(|| "未命名项目".to_string());
         // 发不出去（接收端掉了）就丢：跟没配手机通知没有区别，tick() 不该
         // 因为这件事而报错或者重试。
+        //
+        // `screen` 只在这一刻现取一次——跟 `explain_prompt`/`name_prompt`
+        // 同一条理由，事件是"这一刻发生的事"，屏幕再往后翻就不是这条事件
+        // 该配的那一份了。`bridge.rs` 拿它去问模型"是不是在等一个选择"
+        // （`options_prompt`），从不会把它原样转发到手机上。
+        let screen = s.pty.screen_text();
         let _ = tx.send(Event {
             session: s.id,
             kind,
             name,
             project,
+            screen,
         });
     }
 

@@ -330,6 +330,19 @@ pub struct Bridge {
     /// `~/.dct`。`set_journal_path` 接进跟会话生死同一份文件的路径，
     /// 好让两类记录能对上时间线，接线同样是另一个任务的事。
     journal: Journal,
+    /// `options_prompt`/`map_answer`/`narrow` 要用的后端，**跟
+    /// `session.rs::SessionManager` 出错解释共用同一份**（见
+    /// `SessionManager::backend`）。`None` = 没配 `[llm]`（或者配了但连不
+    /// 上）——三个功能全都安静下线：推送只带元数据、回复原样敲进去、
+    /// 好几个候选照旧反问，这是 `Config::llm` 那道隐私边界在这里唯一
+    /// 正确的落地（CLAUDE.md「每一处用法都必须有不依赖 LLM 的退路」）。
+    backend: Mutex<Option<Arc<dyn crate::llm::Backend>>>,
+    /// 会话 id -> 上一次推送时模型猜出的选项列表。**只在这一支被用一次**：
+    /// `deliver_to` 用它把这条回复交给 `map_answer` 转成 agent 要的序号，
+    /// 用完（或者被下一条更新的推送覆盖/清掉）就不该继续留着——一份过期
+    /// 的选项拿去解读一条毫不相干的新回复，比没有选项更危险（见
+    /// `compose_outbound` 里"没拿到新选项就清掉旧的"那一段）。
+    pending_options: Mutex<HashMap<u32, Vec<String>>>,
 }
 
 impl Bridge {
@@ -352,6 +365,8 @@ impl Bridge {
             replied_since_use: Mutex::new(false),
             writer: Mutex::new(None),
             journal: Journal::new(),
+            backend: Mutex::new(None),
+            pending_options: Mutex::new(HashMap::new()),
         }
     }
 
@@ -360,6 +375,12 @@ impl Bridge {
     /// 测试传假的记录器。
     pub fn set_writer(&self, w: Arc<dyn SessionWriter>) {
         *recover(self.writer.lock()) = Some(w);
+    }
+
+    /// 接进 `options_prompt`/`map_answer`/`narrow` 要用的后端。`None` =
+    /// 没配 `[llm]`——三个功能安静下线，见 `backend` 字段的文档。
+    pub fn set_backend(&self, b: Option<Arc<dyn crate::llm::Backend>>) {
+        *recover(self.backend.lock()) = b;
     }
 
     /// 接进 journal 该写去哪个文件。**故意跟 `SessionManager::journal` 用
@@ -491,6 +512,23 @@ impl Bridge {
             waiting: &waiting,
         };
         let route = route(&input);
+        // 规则 4（好几个在等）猜一把该敲给哪个候选——**猜不准还是反问**，
+        // 见 `narrow` 自己的文档：模型说不好、答案不在候选里，两种都原样
+        // 走 `Route::Ask`，绝不因为"模型听起来有把握"就跳过这一问。没配
+        // 后端（`backend` 是 `None`）时 `and_then` 短路，行为退回到今天：
+        // 好几个候选就是反问，不会因为这个功能而变得更敢猜。
+        let route = match route {
+            Route::Ask(ids) => {
+                let guess = recover(self.backend.lock())
+                    .clone()
+                    .and_then(|b| narrow(&ids, &msg.text, &b));
+                match guess {
+                    Some(id) => Route::To(id),
+                    None => Route::Ask(ids),
+                }
+            }
+            other => other,
+        };
         self.deliver(route, &msg.text);
 
         // 规则 3 的另一半：**这条**消息如果是一次长按回复，从这一刻起
@@ -769,7 +807,20 @@ impl Bridge {
             self.journal.delivered(Delivery::Failed(id));
             return Delivered::Failed(msg);
         };
-        match writer.type_into(id, text) {
+        // **红线在这里落地。** `pending_options` 里有这个会话上一次推送
+        // 猜出的选项，就把这条回复交给 `map_answer` 转成 agent 要的序号；
+        // 没有（绝大多数消息——没在等选择、没配后端、或者已经用过一次）
+        // 就是 `None`，`map_answer` 自己的 early return 保证模型压根不会
+        // 被调用，`text` 原样往下走。**取一次就丢**：`remove` 而不是
+        // `get`，同一份选项不该被拿去解读这个会话之后的第二条回复，见
+        // `pending_options` 字段的文档。
+        let opts = recover(self.pending_options.lock()).remove(&id);
+        let backend = recover(self.backend.lock()).clone();
+        let to_type = match (&opts, &backend) {
+            (Some(opts), Some(b)) => map_answer(text, Some(opts), b),
+            _ => text.to_string(),
+        };
+        match writer.type_into(id, &to_type) {
             Ok(()) => {
                 let name = writer.name_of(id).unwrap_or_else(|| fallback_name(id));
                 self.reply(&format!("已经敲进「{name}」"));
@@ -900,6 +951,13 @@ impl Bridge {
     /// 另开一面旗子，这正是"停/换令牌不会留下孤儿线程"这条要求在这里
     /// 的落地：把它系在轮询线程已经验证过能生效的同一根绳子上，而不是
     /// 自己发明一套新的生死开关。
+    ///
+    /// `compose_outbound()` 可能因为问模型而多花最多 15 秒——这没关系，
+    /// 也是"绝不阻塞 tick()"这条不变量本来就允许的：卡住的是这条独立
+    /// 的发送线程本身，`tick()`/daemon 的其它请求处理都在别的线程上，
+    /// 感知不到这 15 秒。代价只是"这一批消息会晚最多 15 秒送到手机上"，
+    /// 换来的是选项列表——`session.rs::request_explanation` 允许自己的
+    /// 后台线程等模型 30 秒是同一条道理。
     fn run_sender(&self) {
         loop {
             if self.stop.load(Ordering::Relaxed) {
@@ -931,7 +989,7 @@ impl Bridge {
             let Some(to) = *recover(self.owner.lock()) else {
                 continue;
             };
-            let text = merge(&events, crate::i18n::Lang::Zh);
+            let text = self.compose_outbound(&events);
             if let Ok(id) = self.ch.send(to, &text) {
                 match events.as_slice() {
                     // 只关涉一个会话：进单会话映射，`route()` 的规则 1
@@ -953,6 +1011,65 @@ impl Bridge {
             // 发送失败：吞掉，不重试。同 `journal.rs` 的规矩——手机通道
             // 这条线程自己没发出去，不该连累任何会话；下一轮醒来时，
             // 真正要紧的新事件早就把这条盖过去了。
+        }
+    }
+
+    /// Task 9 遗留的那一半：把 `merge()` 产的纯元数据消息，跟"这个 agent
+    /// 是不是在等一个选择"这件事拼到一起。
+    ///
+    /// **顺序是唯一的保证。** 先把 `merge()` 的兜底文案算完（`base`）——
+    /// 这一步不需要模型，之后不管发生什么，`base` 都已经是一条能发出去
+    /// 的、诚实的消息。只有算完 `base` 之后才去问模型；模型慢、模型没答
+    /// 好、根本没配 `[llm]`，最坏的结果都只是"少了选项列表"，从来不是
+    /// "没有消息"或者"消息里有一半是空的"——这正是"每一处 LLM 用法都要有
+    /// 退路"（CLAUDE.md）在这里的落地。
+    ///
+    /// **只在"这一批只有一件事、且是 Stopped"的时候才问**：合并推送
+    /// （好几件事拼成一条）没有单独的屏幕可看，`Failed`/`Vanished` 也没有
+    /// "在等一个选择"这回事——`event_verb` 已经把这两种说清楚了，追加
+    /// 选项只会让文案自相矛盾。
+    fn compose_outbound(&self, events: &[Event]) -> String {
+        let base = merge(events, crate::i18n::Lang::Zh);
+
+        let mut fresh_options: Option<(u32, Vec<String>)> = None;
+        if let [only] = events {
+            if only.kind == crate::channel::EventKind::Stopped {
+                if let Some(backend) = recover(self.backend.lock()).clone() {
+                    let p = options_prompt(&only.screen);
+                    // 15 秒硬超时：`compose_outbound` 已经在发送线程上，
+                    // 不是 `tick()`，慢一点没关系（见 `run_sender` 的
+                    // 文档），但也不能真的无限等下去。
+                    if let Ok(raw) =
+                        crate::llm::complete_with_timeout(backend, p, Duration::from_secs(15))
+                    {
+                        if let Some(opts) = parse_options(&raw) {
+                            fresh_options = Some((only.session, opts));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 这一批里没有会话拿到新鲜的选项列表，就把它们各自留着的旧选项
+        // 一并清掉——一份问过的旧问题的选项，不该被拿去解读一条跟它毫不
+        // 相干的新回复（比如 agent 已经从"选 A 还是 B"翻过去到下一轮，
+        // 手机上这条新推送干脆没有问题，用户这次的话就该原样敲进去）。
+        let mut slot = recover(self.pending_options.lock());
+        for e in events {
+            match &fresh_options {
+                Some((session, opts)) if *session == e.session => {
+                    slot.insert(e.session, opts.clone());
+                }
+                _ => {
+                    slot.remove(&e.session);
+                }
+            }
+        }
+        drop(slot);
+
+        match fresh_options {
+            Some((_, opts)) => format!("{base}\n{}", render_numbered(&opts)),
+            None => base,
         }
     }
 }
@@ -1087,6 +1204,108 @@ pub fn parse_options(raw: &str) -> Option<Vec<String>> {
     }
 }
 
+/// 把一组选项渲染成能直接拼进推送文案的编号列表，`1. xxx` 一行一个。
+/// `map_answer_prompt` 把同样的选项喂给模型判断答案时，用的是同一种
+/// 编号格式——用户看到的编号和他回复时该用的编号必须是同一套。
+fn render_numbered(items: &[String]) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {s}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 问模型「用户这句话对应哪个选项」的 prompt。跟 `options_prompt` 是同
+/// 一条流水线的另一端：那边把屏幕变成编号选项，这里把用户的大白话变回
+/// 编号——中间的选项文字（`opts`）已经是 `options_prompt`/`parse_options`
+/// 洗过一遍的干净大白话，不含路径/代码块，这里不需要重复设防。
+fn map_answer_prompt(user: &str, opts: &[String]) -> crate::llm::Prompt {
+    crate::llm::Prompt {
+        system: "命令行工具给用户列了几个选项，用户没有照抄编号，而是用自己\
+                 的话回复了其中一个意思。判断他说的对应哪个编号，只回复那个\
+                 编号本身的数字，不要别的字。如果看不出他说的是哪一个、或者\
+                 他说的是完全不相干的另一件事，就只回复「不确定」。"
+            .into(),
+        user: format!("选项：\n{}\n\n用户的回复：\n{user}", render_numbered(opts)),
+        max_tokens: 16,
+    }
+}
+
+/// 把用户的话变成 agent 要的形式。**只转格式，不造内容。**
+///
+/// **这个 early return 就是整条红线。** agent 要的是自由文本
+/// （`options` 是 `None`）：模型完全不介入，函数在看到 `options` 之前，
+/// 唯一能做的事就是原样把 `user` 还回去——没有润色，没有摘要，没有第二
+/// 种可能。一个用户在手机上打出来的句子和最终敲进 agent 的句子必须逐字
+/// 相同，因为这是唯一一处他自己看不见结果的地方（CLAUDE.md）。
+///
+/// 只有 `options` 非空时才会问模型，而且答案必须是候选里的合法序号
+/// （`1..=opts.len()`）——序号本身就是数字，模型答错、答不出、超时、
+/// 答案越界，全部原样退回 `user`，不猜、不编。
+pub fn map_answer(
+    user: &str,
+    options: Option<&[String]>,
+    b: &Arc<dyn crate::llm::Backend>,
+) -> String {
+    let Some(opts) = options else {
+        return user.to_string();
+    };
+    if opts.is_empty() {
+        return user.to_string();
+    }
+    let p = map_answer_prompt(user, opts);
+    match crate::llm::complete_with_timeout(b.clone(), p, Duration::from_secs(8)) {
+        Ok(a) => match a.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= opts.len() => n.to_string(),
+            _ => user.to_string(),
+        },
+        Err(_) => user.to_string(),
+    }
+}
+
+/// 问模型「用户这句话说的是哪个候选会话」的 prompt。**只带编号，不带
+/// 名字/项目/屏幕内容**——`narrow` 的调用方（`route_and_deliver`）此刻
+/// 手里只有 `Route::Ask` 携带的一串会话号，这本来就是它唯一能问的问题；
+/// 猜不准（模型答不出、答案不在候选里）不是这个 prompt 的失职，是
+/// `narrow` 本该有的边界，见它自己的文档。
+fn narrow_prompt(candidates: &[u32], text: &str) -> crate::llm::Prompt {
+    let list = candidates
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("、");
+    crate::llm::Prompt {
+        system: "用户手机上有好几个编程会话同时在等他说话，编号是给出的候选\
+                 列表。他刚发来一句话，可能用「第一个」「第二个」「最后那个」\
+                 这类说法指代其中一个候选编号。判断他说的是候选列表里的哪个\
+                 编号，只回复那个编号本身的数字，不要别的字。如果看不出\
+                 线索、拿不准，就只回复「不确定」。绝不能回复候选列表之外\
+                 的编号。"
+            .into(),
+        user: format!("候选编号：{list}\n\n用户刚发来的话：\n{text}"),
+        max_tokens: 16,
+    }
+}
+
+/// 猜「这条含糊的回复该敲给哪个候选会话」。**永远不因为模型看起来有
+/// 把握就跳过反问**——调用方（`route_and_deliver`）只在 `Route::Ask`
+/// 那一支调用这里（Task 7 规则 4：好几个会话同时在等），猜不出来
+/// （`None`）就照旧走 `Route::Ask`，问用户，不猜。
+///
+/// **答案必须在 `candidates` 里，一律不采信越界的号码**——这条检查独立
+/// 于 prompt 里"绝不能回复候选列表之外的编号"那句话：prompt 只是请求，
+/// 模型不听话是常态，真正的保证在这里。
+pub fn narrow(candidates: &[u32], text: &str, b: &Arc<dyn crate::llm::Backend>) -> Option<u32> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let p = narrow_prompt(candidates, text);
+    let raw = crate::llm::complete_with_timeout(b.clone(), p, Duration::from_secs(8)).ok()?;
+    let n: u32 = raw.trim().parse().ok()?;
+    candidates.contains(&n).then_some(n)
+}
+
 /// 剥掉一行开头的编号前缀（`1.`/`1、`/`1)`），剥不掉就说明这行根本不是
 /// 编号列表的一部分。
 fn strip_numbered_prefix(line: &str) -> Option<&str> {
@@ -1165,6 +1384,7 @@ pub fn spawn(
     persist_owner: Box<dyn Fn(i64) + Send + Sync>,
     writer: Option<Arc<dyn SessionWriter>>,
     journal_path: Option<PathBuf>,
+    backend: Option<Arc<dyn crate::llm::Backend>>,
 ) -> BridgeHandle {
     let bridge = Arc::new(Bridge::new(ch, phone, owner, persist_owner));
     if let Some(w) = writer {
@@ -1173,6 +1393,9 @@ pub fn spawn(
     if let Some(p) = journal_path {
         bridge.set_journal_path(p);
     }
+    // 跟 writer/journal_path 同一条道理：起线程之前就该接好，不留
+    // "轮询/发送线程已经在跑、但还接不到后端"的窗口。
+    bridge.set_backend(backend);
     let worker = bridge.clone();
     std::thread::spawn(move || {
         let _ = catch_unwind(AssertUnwindSafe(|| worker.run()));
@@ -1191,6 +1414,7 @@ pub fn spawn(
 /// 长轮询同一个 bot 的线程，两条线程各自维护自己的 `owner`，谁先问到
 /// `getUpdates` 谁就替自己的那份 `owner` 配上人——主人和攻击者可能各自
 /// 配对到不同的 bridge 上，都以为自己是主人（C3）。
+#[allow(clippy::too_many_arguments)]
 pub fn replace(
     slot: &Mutex<Option<BridgeHandle>>,
     ch: Arc<dyn Channel>,
@@ -1199,12 +1423,21 @@ pub fn replace(
     persist_owner: Box<dyn Fn(i64) + Send + Sync>,
     writer: Option<Arc<dyn SessionWriter>>,
     journal_path: Option<PathBuf>,
+    backend: Option<Arc<dyn crate::llm::Backend>>,
 ) {
     let mut guard = recover(slot.lock());
     if let Some(old) = guard.take() {
         old.stop();
     }
-    *guard = Some(spawn(ch, phone, owner, persist_owner, writer, journal_path));
+    *guard = Some(spawn(
+        ch,
+        phone,
+        owner,
+        persist_owner,
+        writer,
+        journal_path,
+        backend,
+    ));
 }
 
 /// `PhoneDisable` 的落地点：把槽里的 bridge（如果有）停掉，槽留空。
@@ -1275,6 +1508,7 @@ mod tests {
             kind: crate::channel::EventKind::Stopped,
             name: String::new(),
             project: "p".into(),
+            screen: String::new(),
         }
     }
 
@@ -2089,6 +2323,7 @@ mod tests {
             Box::new(|_| {}),
             None,
             None,
+            None,
         );
         assert_eq!(handle.accept(&msg(111, "老主人")), Accepted::FromOwner);
 
@@ -2118,6 +2353,7 @@ mod tests {
             Box::new(|_| {}),
             None,
             None,
+            None,
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2133,6 +2369,7 @@ mod tests {
             phone.clone(),
             Some(2),
             Box::new(|_| {}),
+            None,
             None,
             None,
         );
@@ -2167,6 +2404,7 @@ mod tests {
             phone,
             Some(1),
             Box::new(|_| {}),
+            None,
             None,
             None,
         );
@@ -2581,6 +2819,7 @@ mod tests {
             kind,
             name: name.to_string(),
             project: project.to_string(),
+            screen: String::new(),
         }
     }
 
@@ -2696,6 +2935,154 @@ mod tests {
         let p = options_prompt(&long);
         // 用户部分不该把全部 500+2000 个字符都塞进去，只留末尾那一段。
         assert!(p.user.chars().count() <= OPTIONS_TAIL + 50);
+    }
+
+    // ---- map_answer/narrow：红线本身 ----
+    //
+    // `map_answer`/`narrow` 都接 `&Arc<dyn Backend>`，不是 brief 草稿里
+    // 写的裸 `&dyn Backend`：`llm::complete_with_timeout` 需要一个
+    // `'static` 的 `Arc<dyn Backend>` 才能安全地 `move` 进后台线程去跑
+    // 硬超时（跟 `session.rs::request_explanation` 是同一条约束，见
+    // `llm/mod.rs::complete_with_timeout` 的签名和文档）——一个借用如果
+    // 允许被这样搬进一个可能在超时后继续跑下去的线程，就不再是安全的
+    // 借用了。测试双打包成 `Arc<dyn Backend>` 而不是裸值，行为跟 brief
+    // 里的断言完全一致，只是构造方式适配了这条真实存在的生命周期约束。
+
+    /// 被调用就记一笔——`free_text_is_typed_verbatim_and_never_reaches_the_model`
+    /// 唯一要问的问题就是「模型有没有被碰过」。
+    #[derive(Default)]
+    struct SpyBackend(std::sync::atomic::AtomicUsize);
+
+    impl SpyBackend {
+        fn new() -> Arc<SpyBackend> {
+            Arc::new(SpyBackend::default())
+        }
+        fn calls(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    impl crate::llm::Backend for SpyBackend {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok("2".to_string())
+        }
+    }
+
+    /// 答一个固定答案，或者（`timing_out`）睡到比任何超时都长，专门测
+    /// 「模型太慢就当没答」这条路。
+    struct FakeBackend {
+        answer: String,
+        delay: Option<Duration>,
+    }
+
+    impl FakeBackend {
+        fn answering(a: &str) -> Arc<dyn crate::llm::Backend> {
+            Arc::new(FakeBackend {
+                answer: a.to_string(),
+                delay: None,
+            })
+        }
+        fn timing_out() -> Arc<dyn crate::llm::Backend> {
+            Arc::new(FakeBackend {
+                answer: "太晚了".to_string(),
+                delay: Some(Duration::from_secs(30)),
+            })
+        }
+    }
+
+    impl crate::llm::Backend for FakeBackend {
+        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            if let Some(d) = self.delay {
+                std::thread::sleep(d);
+            }
+            Ok(self.answer.clone())
+        }
+    }
+
+    /// **红线：agent 要的是自由文本时模型完全不介入。** 模型一旦开始
+    /// 润色，敲进 agent 的就不再是用户说的话，而他在手机上看不见这件事。
+    #[test]
+    fn free_text_is_typed_verbatim_and_never_reaches_the_model() {
+        let spy = SpyBackend::new();
+        let backend: Arc<dyn crate::llm::Backend> = spy.clone();
+        let out = map_answer("那个啥 你先把测试跑一下然后再说", None, &backend);
+        assert_eq!(out, "那个啥 你先把测试跑一下然后再说");
+        assert_eq!(spy.calls(), 0, "自由文本却调了模型");
+    }
+
+    #[test]
+    fn a_spoken_ordinal_becomes_the_option_the_agent_wants() {
+        let b = FakeBackend::answering("2");
+        let opts = vec!["先跑完".to_string(), "现在改".to_string()];
+        assert_eq!(map_answer("就第二个吧", Some(&opts), &b), "2");
+    }
+
+    /// 映射不确定就原样发。这是红线的另一半。
+    #[test]
+    fn an_unmappable_answer_is_sent_as_typed() {
+        let b = FakeBackend::answering("我不确定");
+        let opts = vec!["先跑完".to_string(), "现在改".to_string()];
+        assert_eq!(map_answer("等等我再想想", Some(&opts), &b), "等等我再想想");
+    }
+
+    #[test]
+    fn a_model_timeout_sends_what_the_user_typed() {
+        let b = FakeBackend::timing_out();
+        let opts = vec!["先跑完".to_string()];
+        assert_eq!(map_answer("就第一个", Some(&opts), &b), "就第一个");
+    }
+
+    /// **变异测试专用**：下界如果被误改成放行 0（`n <= opts.len()`，
+    /// 丢了 `n >= 1`），这条必须失败——0 从来不是候选序号，`opts` 从 1
+    /// 开始编号，跟 `render_numbered`/`map_answer_prompt` 给用户看的
+    /// 编号是同一套。
+    #[test]
+    fn a_model_answer_of_zero_is_out_of_range_and_sent_as_typed() {
+        let b = FakeBackend::answering("0");
+        let opts = vec!["先跑完".to_string()];
+        assert_eq!(map_answer("就这个", Some(&opts), &b), "就这个");
+    }
+
+    /// 空选项列表（`parse_options` 从不产出，但调用方不该被信任到这个
+    /// 地步）：没有什么可选，模型也不该被问，原样发。
+    #[test]
+    fn empty_options_are_treated_like_free_text() {
+        let spy = SpyBackend::new();
+        let backend: Arc<dyn crate::llm::Backend> = spy.clone();
+        let opts: Vec<String> = vec![];
+        assert_eq!(map_answer("随便", Some(&opts), &backend), "随便");
+        assert_eq!(spy.calls(), 0);
+    }
+
+    /// 猜路由不确定就还是反问。**永远不因为「模型有把握」跳过那一
+    /// 问**——敲错 agent 的代价比多问一句大得多。
+    #[test]
+    fn an_uncertain_narrow_still_asks() {
+        let b = FakeBackend::answering("说不好");
+        assert_eq!(narrow(&[9, 10], "先跑完", &b), None);
+    }
+
+    /// 模型答了一个不在候选里的会话号，一律不采信。
+    #[test]
+    fn a_narrow_outside_the_candidates_is_refused() {
+        let b = FakeBackend::answering("77");
+        assert_eq!(narrow(&[9, 10], "先跑完", &b), None);
+    }
+
+    /// 正常情况：答案确实在候选里，采信。
+    #[test]
+    fn a_narrow_inside_the_candidates_is_accepted() {
+        let b = FakeBackend::answering("10");
+        assert_eq!(narrow(&[9, 10], "最后一个", &b), Some(10));
+    }
+
+    /// 猜路由一样受同一个超时保护——`narrow` 也不该有把 `tick()`/发送
+    /// 线程之外的什么东西卡住的能力。
+    #[test]
+    fn a_narrow_timeout_refuses_to_guess() {
+        let b = FakeBackend::timing_out();
+        assert_eq!(narrow(&[9, 10], "先跑完", &b), None);
     }
 
     // ==== 整合任务：把 enqueue/route/deliver/`/use`/`/ls` 真的接起来 ====
@@ -3038,7 +3425,15 @@ mod tests {
         let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
         // owner 已知：跳过 drain_backlog，轮询线程立刻进入"每次都成功但
         // 什么都没有"的正常轮询，最能暴露"stop 没生效就会一直转下去"。
-        let handle = spawn(ch.clone(), phone, Some(1), Box::new(|_| {}), None, None);
+        let handle = spawn(
+            ch.clone(),
+            phone,
+            Some(1),
+            Box::new(|_| {}),
+            None,
+            None,
+            None,
+        );
         handle.bridge.enqueue(ev(1));
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3077,5 +3472,171 @@ mod tests {
             "stop() 之后发送线程不该还在跑——两条线程共用同一个 stop 标志位，\
              stop() 之后新塞进队列的事件也不该被发出去"
         );
+    }
+
+    // ==== Task 10 的接线：`options_prompt`/`parse_options`/`map_answer`/
+    // `narrow` 真的被 `compose_outbound`/`deliver_to`/`route_and_deliver`
+    // 用起来，不再是"写好了但没人调用"的死代码。====
+
+    /// 按 prompt 的内容分流答案——同一个假后端要同时扮演"猜屏幕上是不是
+    /// 在等选择"（`options_prompt`）和"这句话对应哪个序号"
+    /// （`map_answer_prompt`/`narrow_prompt`）两个角色，靠 system 提示词
+    /// 里的特征字符串区分是哪一次调用。
+    struct ScriptedBackend(fn(&crate::llm::Prompt) -> String);
+    impl crate::llm::Backend for ScriptedBackend {
+        fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+            Ok((self.0)(p))
+        }
+    }
+
+    /// **Task 9 遗留的那一半，真的接上了。** 一条 Stopped 事件带着"是
+    /// 继续跑完还是现在就改"这样的屏幕内容，配了后端之后推送该带上模型
+    /// 猜出的编号选项；用户接下来一句大白话回复（唯一在等，不用长按
+    /// 回复），`map_answer` 该把它变成 agent 要的序号，而不是把这句话
+    /// 原样敲进去。
+    #[test]
+    fn options_from_the_push_are_used_to_map_the_next_reply() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9]);
+        let backend: Arc<dyn crate::llm::Backend> = Arc::new(ScriptedBackend(|p| {
+            if p.system.contains("从几个选项里选一个") {
+                "1. 先跑完\n2. 现在改".to_string()
+            } else {
+                "2".to_string()
+            }
+        }));
+        b.set_backend(Some(backend));
+        let bridge = Arc::new(b);
+        bridge.enqueue(Event {
+            session: 9,
+            kind: crate::channel::EventKind::Stopped,
+            name: "改登录页".to_string(),
+            project: "web".to_string(),
+            screen: "…… 是继续跑完，还是现在就改？ ……".to_string(),
+        });
+
+        let worker = bridge.clone();
+        let handle = std::thread::spawn(move || worker.run_sender());
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !spy.replies.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "发送线程该把带选项的推送发出去");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            spy.last_reply().contains("1. 先跑完") && spy.last_reply().contains("2. 现在改"),
+            "推送该带上模型猜出的编号选项：{}",
+            spy.last_reply()
+        );
+
+        bridge.dispatch(&msg(999, "就第二个吧"));
+        assert_eq!(
+            spy.written(),
+            vec![(9, "2".to_string())],
+            "该敲进 agent 的是序号 2，不是用户原话"
+        );
+
+        bridge.stop();
+        assert!(wait_for_join(handle, Duration::from_secs(2)));
+    }
+
+    /// 没配后端（`for_test_with_writer` 默认就是这样）：推送只有元数据，
+    /// 没有选项列表——这是"每一处 LLM 用法都要有退路"在推送这一侧的
+    /// 落地，不该因为这个功能而让没写 `[llm]` 的人看到任何变化。
+    #[test]
+    fn without_a_backend_the_push_stays_metadata_only() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        let bridge = Arc::new(b);
+        bridge.enqueue(Event {
+            session: 9,
+            kind: crate::channel::EventKind::Stopped,
+            name: "改登录页".to_string(),
+            project: "web".to_string(),
+            screen: "…… 是继续跑完，还是现在就改？ ……".to_string(),
+        });
+
+        let worker = bridge.clone();
+        let handle = std::thread::spawn(move || worker.run_sender());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if !spy.replies.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "发送线程该照常把推送发出去");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !spy.last_reply().contains("1. "),
+            "没配后端就不该出现编号选项：{}",
+            spy.last_reply()
+        );
+
+        bridge.stop();
+        assert!(wait_for_join(handle, Duration::from_secs(2)));
+    }
+
+    /// `narrow` 真的接进了 `route_and_deliver`：好几个会话在等、又没有
+    /// 用回复/`＄use` 指明是哪个，模型给出一个在候选里的确定答案时，
+    /// 不该再反问，直接敲给猜出来的那个。
+    #[test]
+    fn a_confident_narrow_guess_is_used_instead_of_asking() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9, 10]);
+        spy.name(10, "对账");
+        let backend: Arc<dyn crate::llm::Backend> = Arc::new(ScriptedBackend(|_| "10".into()));
+        b.set_backend(Some(backend));
+
+        b.dispatch(&msg(999, "跟最后一个说继续"));
+
+        assert_eq!(
+            spy.written(),
+            vec![(10, "跟最后一个说继续".to_string())],
+            "确定的猜测该直接敲给猜出来的会话"
+        );
+        assert!(
+            spy.replies
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.contains("不确定该说给哪个")),
+            "猜准了就不该再反问"
+        );
+    }
+
+    /// **红线的另一半：猜路由不确定就还是反问。** 模型说不上来的时候，
+    /// `route_and_deliver` 不该把 `Route::Ask` 悄悄换成一次乱猜。
+    #[test]
+    fn an_uncertain_narrow_guess_still_asks_via_dispatch() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9, 10]);
+        let backend: Arc<dyn crate::llm::Backend> = Arc::new(ScriptedBackend(|_| "说不好".into()));
+        b.set_backend(Some(backend));
+
+        b.dispatch(&msg(999, "先跑完"));
+
+        assert!(spy.written().is_empty(), "拿不准就不该敲进任何会话");
+        assert!(
+            spy.last_reply().contains("不确定该说给哪个"),
+            "拿不准就该照旧反问：{}",
+            spy.last_reply()
+        );
+    }
+
+    /// 没配后端：好几个会话在等，行为必须跟今天完全一样——反问，不猜。
+    /// 这是这整个功能"退路"的最后一道验证：`Config::llm` 是 `None` 时
+    /// `dct` 该表现得像这个功能从未存在过。
+    #[test]
+    fn without_a_backend_several_waiting_still_just_asks() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9, 10]);
+
+        b.dispatch(&msg(999, "先跑完"));
+
+        assert!(spy.written().is_empty());
+        assert!(spy.last_reply().contains("不确定该说给哪个"));
     }
 }

@@ -73,6 +73,19 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 任何时刻这里最多只有一个 `Some`，见 `bridge::replace`/`stop_current`
     // 的文档注释（C2/C3 的修复）。
     let bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>> = Arc::new(Mutex::new(None));
+
+    // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
+    // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
+    // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
+    // 装后端」这条 Critical 修复本身，见下面 `install_llm_backend` 和它的测试。
+    //
+    // **必须排在 `start_phone_bridge` 之前**：`bridge::spawn` 起线程之前
+    // 就把后端接好（同 writer/journal_path 那条「不留窗口」的道理），
+    // 而 `start_phone_bridge` 读的是 `mgr.backend()`——先装后端再起 bridge，
+    // 才不会让重启这条路径上的 `Bridge` 永远拿到一个「本该有、却还没来
+    // 得及装」的 `None`。
+    install_llm_backend(socket, &profiles_dir, &mgr);
+
     start_phone_bridge(&secrets, &phone, &bridge, &mgr, &|token| {
         Arc::new(Telegram::new(token)) as Arc<dyn crate::channel::Channel>
     });
@@ -85,12 +98,6 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
     mgr.set_event_sink(event_tx);
     crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
-
-    // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
-    // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
-    // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
-    // 装后端」这条 Critical 修复本身，见下面 `install_llm_backend` 和它的测试。
-    install_llm_backend(socket, &profiles_dir, &mgr);
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
@@ -232,6 +239,12 @@ fn start_phone_bridge(
         // 跟会话生死用同一份文件——两本账本讲的是同一条时间线。
         Some(mgr.clone() as Arc<dyn crate::bridge::SessionWriter>),
         mgr.journal.path(),
+        // 跟出错解释共用同一份后端（见 `SessionManager::backend`）——
+        // `install_llm_backend` 必须已经跑过一次，调用方（`run_with_manager`）
+        // 保证了这个顺序。`None`（没写 `[llm]`，或者写了但连不上）时
+        // `Bridge` 里那两个功能安静下线，见 `bridge.rs::Bridge::backend`
+        // 字段的文档。
+        mgr.backend(),
     );
 }
 
@@ -515,6 +528,7 @@ fn handle(
                         persist_owner_closure(secrets.clone()),
                         Some(mgr.clone() as Arc<dyn crate::bridge::SessionWriter>),
                         mgr.journal.path(),
+                        mgr.backend(),
                     );
                     PhoneStatus {
                         state: crate::proto::PhoneState::WaitingForPairing,
@@ -1149,6 +1163,7 @@ mod tests {
             Box::new(|_| {}),
             None,
             None,
+            None,
         );
         let bridge = Arc::new(Mutex::new(Some(bridge_handle)));
 
@@ -1214,6 +1229,7 @@ mod tests {
             phone.clone(),
             Some(111),
             Box::new(|_| {}),
+            None,
             None,
             None,
         );
