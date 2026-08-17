@@ -45,6 +45,39 @@ impl fmt::Display for Death {
     }
 }
 
+/// 手机上一条回复最终去了哪儿——跟 `Death` 同一个理由：日志里只写一句
+/// 「处理了一条消息」查不出任何东西，「敲进了哪个会话」「说了什么」
+/// 才是将来能对上「我不在的时候手机上那句话去哪了」这种报告的依据。
+///
+/// **绝不带消息原文**：用户可能在回复里贴了密钥、私事，日志文件是本地
+/// 明文，不该比"敲错了地方"的风险还大。这里只记结果本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// 敲进了这个会话。
+    Typed(u32),
+    /// 敲的时候失败了（会话在决定敲给它之后、真的敲进去之前没了，
+    /// 或者别的写入错误）。
+    Failed(u32),
+    /// 好几个候选，问了用户，报的是候选个数。
+    Asked(usize),
+    /// 这条消息对应的推送守护进程已经不认识了，什么都没敲。
+    Gone,
+    /// 没有 `/use`，也没有会话在等，请用户自己去看会话列表。
+    NeedUse,
+}
+
+impl fmt::Display for Delivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Delivery::Typed(id) => write!(f, "typed session={id}"),
+            Delivery::Failed(id) => write!(f, "failed session={id}"),
+            Delivery::Asked(n) => write!(f, "asked candidates={n}"),
+            Delivery::Gone => f.write_str("gone"),
+            Delivery::NeedUse => f.write_str("need_use"),
+        }
+    }
+}
+
 /// 一本日志。`None` 路径 = 不记账，`SessionManager::new()` 的默认值——
 /// 单元测试因此不会去写用户真实的 `~/.dct/sessions.log`。
 #[derive(Debug, Default)]
@@ -74,6 +107,12 @@ impl Journal {
             "session {id} stopped  why={why} pid={}",
             pid_word(pid)
         ));
+    }
+
+    /// 手机来的一条消息落地之后记一笔。见 `Delivery` 的文档——**只记结果，
+    /// 不记消息原文**，`bridge.rs::deliver` 是唯一的调用方。
+    pub fn delivered(&self, d: Delivery) {
+        self.write(&format!("inbound  {d}"));
     }
 
     fn write(&self, line: &str) {
@@ -171,6 +210,35 @@ mod tests {
             lines[1].contains("pid=gone"),
             "拿不到 pid 本身就是线索，得写出来：{}",
             lines[1]
+        );
+    }
+
+    /// 手机来的消息不管去了哪儿都要留痕，而且**绝不带原文**——日志文件是
+    /// 本地明文，用户可能在回复里贴了密钥或私事。
+    #[test]
+    fn delivered_records_the_outcome_but_never_the_message_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.log");
+        let j = Journal::new();
+        j.set_path(path.clone());
+
+        j.delivered(Delivery::Typed(7));
+        j.delivered(Delivery::Failed(7));
+        j.delivered(Delivery::Asked(2));
+        j.delivered(Delivery::Gone);
+        j.delivered(Delivery::NeedUse);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5, "五笔各占一行：\n{text}");
+        assert!(lines[0].contains("typed session=7"), "{}", lines[0]);
+        assert!(lines[1].contains("failed session=7"), "{}", lines[1]);
+        assert!(lines[2].contains("asked candidates=2"), "{}", lines[2]);
+        assert!(lines[3].contains("gone"), "{}", lines[3]);
+        assert!(lines[4].contains("need_use"), "{}", lines[4]);
+        assert!(
+            !text.contains("先跑完") && !text.contains("密码"),
+            "journal 不该出现消息原文：{text}"
         );
     }
 

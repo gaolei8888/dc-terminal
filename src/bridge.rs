@@ -33,11 +33,13 @@
 //!    任何时刻最多只有一条真的在跑的轮询线程，见这两个函数的文档注释。
 
 use crate::channel::{Channel, ChannelError, Event, Incoming, MsgId};
+use crate::journal::{Delivery, Journal};
 use crate::proto::{PhoneState, PhoneStatus};
 use crate::session::recover;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -154,6 +156,68 @@ pub fn route(i: &RouteInput) -> Route {
     Route::NeedUse
 }
 
+/// 敲字这一半的能力：把文字真的敲进某个会话的 PTY，并且知道该拿什么名字
+/// 称呼这个会话给用户听——回执要报「敲给了谁」，光有一个 id 用户在手机上
+/// 看不懂，必须换成人话（Ruling 7）。
+///
+/// 生产环境这层包的是 `SessionManager`（见下面 `impl SessionWriter for
+/// crate::session::SessionManager`）；测试用假实现记录写了什么、写给了谁
+/// （`for_test_with_writer`），不碰真 PTY。
+pub trait SessionWriter: Send + Sync {
+    /// 把 `text` 敲进 `id` 对应的会话。会话已经不在了、或者敲的过程本身
+    /// 出了错，返回 `Err`——**错误信息必须已经是能给用户看的人话**，
+    /// `deliver` 不会再加工它，只会原样往回执里放（`Delivered::Failed`）。
+    fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String>;
+    /// 这个会话给用户看该叫什么名字。跟 `SessionInfo::tag` 同一条规则：
+    /// 起过名字用名字，没起过退回 profile。会话已经不在了（比如决定敲给
+    /// 它之后、真的敲之前那一小段时间窗口里没掉了）返回 `None`——调用方
+    /// 退化成用编号称呼它，绝不编一个不存在的名字。
+    fn name_of(&self, id: u32) -> Option<String>;
+}
+
+/// Ruling 7 的落地：`SessionManager` 已经有 `send_input`（敲字）和 `list`
+/// （取 `id -> tag/profile`），直接包一层就是完整的 `SessionWriter`——不用
+/// 在 `SessionManager` 里另开一条路。`list()` 每次都拷一份快照，这里只找
+/// 一个 id，代价跟 `dct ps` 刷新一次看板一样，不是热路径。
+impl SessionWriter for crate::session::SessionManager {
+    fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String> {
+        self.send_input(id, text).map_err(|e| e.to_string())
+    }
+
+    fn name_of(&self, id: u32) -> Option<String> {
+        self.list().into_iter().find(|s| s.id == id).map(|s| {
+            if s.tag.is_empty() {
+                s.profile
+            } else {
+                s.tag
+            }
+        })
+    }
+}
+
+/// `deliver()` 的答案——四条 `Route` 各对应一个变体，`Failed` 是
+/// `To(id)` 敲的时候真的出错那一支（会话在 `route()` 判定之后、真敲之前
+/// 那道窄缝里没掉了，或者别的写入错误）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivered {
+    /// 敲进了这一个会话。
+    Typed(u32),
+    /// 问了用户，这是问出去的候选。
+    AskedWhich(Vec<u32>),
+    /// 说了「这条消息对应的会话已经不在了」。
+    SaidGone,
+    /// 说了「先去看看会话列表」。
+    SaidNeedUse,
+    /// 敲的时候出错了，这是已经组好、发给用户看的那句人话。
+    Failed(String),
+}
+
+/// 会话已经不在了的兜底称呼——**绝不编一个不存在的名字**，诚实地报一个
+/// 编号，好过看着更亲切但是假的一句话。
+fn fallback_name(id: u32) -> String {
+    format!("{id} 号会话")
+}
+
 pub struct Bridge {
     ch: Arc<dyn Channel>,
     /// Task 4 的共享状态槽——`Request::PhoneStatus` 唯一的答案来源。
@@ -179,7 +243,17 @@ pub struct Bridge {
     /// 这里，是接线的事**——这个字段和 `enqueue`/`queued` 这两个方法
     /// 只负责「进来一条、满了丢最旧的」这条规则本身，不管调用方是谁。
     outbound: Mutex<VecDeque<Event>>,
-    // …… 消息映射与当前会话见 Task 7
+    // …… 消息映射与当前会话见 Task 9/10
+    /// 敲字这一半的能力（Ruling 7）。`None` = 还没接线——`Bridge::new` 之后
+    /// 默认没有，调用方（daemon.rs，接线是另一个任务）通过 `set_writer`
+    /// 装进真的 `SessionManager`；测试用 `for_test_with_writer` 装假的。
+    /// `deliver()` 在这是 `None` 的时候不会假装敲成功了，见那边的分支。
+    writer: Mutex<Option<Arc<dyn SessionWriter>>>,
+    /// 手机来的消息最终去了哪儿，记进这本 journal——默认没设路径（跟
+    /// `SessionManager::journal` 的默认值一样），单测因此不会碰真实的
+    /// `~/.dct`。`set_journal_path` 接进跟会话生死同一份文件的路径，
+    /// 好让两类记录能对上时间线，接线同样是另一个任务的事。
+    journal: Journal,
 }
 
 impl Bridge {
@@ -196,7 +270,34 @@ impl Bridge {
             stop: AtomicBool::new(false),
             persist_owner,
             outbound: Mutex::new(VecDeque::new()),
+            writer: Mutex::new(None),
+            journal: Journal::new(),
         }
+    }
+
+    /// 接进敲字的能力（Ruling 7）。生产环境传一个包着 `SessionManager` 的
+    /// `Arc`（`SessionManager` 已经 `impl SessionWriter`，见上面那段），
+    /// 测试传假的记录器。
+    pub fn set_writer(&self, w: Arc<dyn SessionWriter>) {
+        *recover(self.writer.lock()) = Some(w);
+    }
+
+    /// 接进 journal 该写去哪个文件。**故意跟 `SessionManager::journal` 用
+    /// 同一个路径**——两本账本讲的是同一条时间线（"会话是不是这时候没的"
+    /// 跟"手机上这句话是不是这时候敲进去的"），分开的文件没法互相印证。
+    pub fn set_journal_path(&self, p: PathBuf) {
+        self.journal.set_path(p);
+    }
+
+    /// 只测 `deliver()` 用——渠道和写入器都是会记录下发生了什么的假实现，
+    /// 不碰真 PTY、也不碰网络。见 `tests::Spy`。
+    #[cfg(test)]
+    fn for_test_with_writer() -> (Bridge, Arc<tests::Spy>) {
+        let spy = Arc::new(tests::Spy::default());
+        let ch: Arc<dyn Channel> = spy.clone();
+        let b = Bridge::new(ch, tests::blank_status(), Some(999), Box::new(|_| {}));
+        b.set_writer(spy.clone() as Arc<dyn SessionWriter>);
+        (b, spy)
     }
 
     /// 只测 `accept()` 用——渠道和状态槽都是不会被读的占位符。
@@ -379,6 +480,97 @@ impl Bridge {
     /// 调用方（`daemon.rs`）另外清掉，这里只管内存里这一份。
     pub fn clear_owner(&self) {
         *recover(self.owner.lock()) = None;
+    }
+
+    /// `route()` 已经决定了该往哪儿去，这里是把决定真的落地。**`To` 敲，
+    /// 另外三支什么都不敲**——回执不是锦上添花：用户在外面看不见终端，
+    /// 没有回执他不知道这句话到底进去没有；而 `Ask`/`Gone`/`NeedUse` 存在
+    /// 的全部意义就是"这次不该猜"，回一句人话、绝不动 PTY 才是它们唯一
+    /// 正确的做法。**全部记 journal**——手机来的这条消息最终去了哪儿，
+    /// 跟会话自己怎么没的一样，得留得下痕迹。
+    pub fn deliver(&self, route: Route, text: &str) -> Delivered {
+        match route {
+            Route::To(id) => self.deliver_to(id, text),
+            Route::Ask(ids) => {
+                self.reply(&self.ask_message(&ids));
+                self.journal.delivered(Delivery::Asked(ids.len()));
+                Delivered::AskedWhich(ids)
+            }
+            Route::Gone => {
+                self.reply(
+                    "这条消息对应的会话已经不在了，没有敲给任何人。先发 /ls 看看现在有哪些会话",
+                );
+                self.journal.delivered(Delivery::Gone);
+                Delivered::SaidGone
+            }
+            Route::NeedUse => {
+                self.reply("先发 /ls 看看有哪些会话，再回复其中一条，或者发 /use 加编号指定一个");
+                self.journal.delivered(Delivery::NeedUse);
+                Delivered::SaidNeedUse
+            }
+        }
+    }
+
+    /// `Route::To` 那一支：真的敲、再报一句回执。**唯一会碰 `writer` 的
+    /// 地方**，`Ask`/`Gone`/`NeedUse` 三支绝不会走到这个方法里。
+    fn deliver_to(&self, id: u32, text: &str) -> Delivered {
+        let Some(writer) = recover(self.writer.lock()).clone() else {
+            // 还没接线（`set_writer` 没被调用过）——不是用户的错，但也
+            // 绝不能假装敲进去了，那正是"用户以为进去了、其实没有"这条
+            // 最贵的错误路径。
+            let msg = "这句话现在发不出去，稍后再试一次".to_string();
+            self.reply(&msg);
+            self.journal.delivered(Delivery::Failed(id));
+            return Delivered::Failed(msg);
+        };
+        match writer.type_into(id, text) {
+            Ok(()) => {
+                let name = writer.name_of(id).unwrap_or_else(|| fallback_name(id));
+                self.reply(&format!("已经敲进「{name}」"));
+                self.journal.delivered(Delivery::Typed(id));
+                Delivered::Typed(id)
+            }
+            Err(_) => {
+                // `writer.type_into` 的错误信息不往回执里带——那是内部
+                // 诊断用的字符串，不保证已经是人话（`SessionManager` 那边
+                // 只是把 `anyhow::Error` 转成了 `to_string()`）。用户只需要
+                // 知道"没进去"和"该敲给谁"，不需要知道底层是哪种失败。
+                let name = writer.name_of(id).unwrap_or_else(|| fallback_name(id));
+                let msg = format!("这句话没能敲进「{name}」，稍后再试一次");
+                self.reply(&msg);
+                self.journal.delivered(Delivery::Failed(id));
+                Delivered::Failed(msg)
+            }
+        }
+    }
+
+    /// 好几个候选时回的那句话。**尽量点名字**——`9 号`比`9 号「装依赖」`
+    /// 难认得多，写入器给不出名字（还没接线，或者那个会话恰好也没了）
+    /// 就诚实地退回编号，不编。
+    fn ask_message(&self, ids: &[u32]) -> String {
+        let writer = recover(self.writer.lock()).clone();
+        let list = ids
+            .iter()
+            .map(|&id| {
+                let name = writer.as_ref().and_then(|w| w.name_of(id));
+                match name {
+                    Some(name) => format!("{id} 号「{name}」"),
+                    None => format!("{id} 号"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        format!("不确定该说给哪个：{list}？回复其中一条推送，或者发 /use 加编号指定一个")
+    }
+
+    /// 回一句给主人。**没有主人（理论上不该发生，`deliver` 只该在
+    /// `accept()` 判过是主人之后被调用）就什么都不发**——发错人比不发
+    /// 更糟，`Channel::send` 的错误也一并吞掉，同 `journal.rs` 那条
+    /// 「记不下来/发不出去不该连累别的事」的规矩。
+    fn reply(&self, text: &str) {
+        if let Some(to) = *recover(self.owner.lock()) {
+            let _ = self.ch.send(to, text);
+        }
     }
 
     /// 轮询主循环。**不要直接调用它**——用模块级的 `spawn()`，那边包了
@@ -1576,6 +1768,252 @@ mod tests {
         assert_eq!(
             route(&input(None, &map, None, true, &[9, 10])),
             Route::Ask(vec![9, 10])
+        );
+    }
+
+    // ---- deliver()：敲字、回执、journal，来自 brief 的失败测试 ----
+
+    /// 一身兼二职的假实现：既是敲字的 `SessionWriter`，也是发回执的
+    /// `Channel`——两边共用一份记录，测试只需要问一个对象"发生了什么"。
+    /// **不碰真 PTY、不碰网络**，`poll`/`get_me`/`drain` 这条测试用不到，
+    /// 真被调用就是测试写错了，照 `NeverCalled` 的先例让它 panic。
+    #[derive(Default)]
+    pub(super) struct Spy {
+        written: Mutex<Vec<(u32, String)>>,
+        replies: Mutex<Vec<String>>,
+        names: Mutex<HashMap<u32, String>>,
+        /// 敲字时该失败的会话号——空集合表示从不失败。
+        fail: Mutex<std::collections::HashSet<u32>>,
+    }
+
+    impl Spy {
+        /// 敲进了哪些会话、敲了什么，按发生顺序。
+        pub(super) fn written(&self) -> Vec<(u32, String)> {
+            self.written.lock().unwrap().clone()
+        }
+
+        /// 最后一条回给主人的话——回执/候选列表/Gone/NeedUse 都走这里。
+        pub(super) fn last_reply(&self) -> String {
+            self.replies
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// 目前一共回了几句——用来钉"这一支到底有没有回过话"。
+        fn reply_count(&self) -> usize {
+            self.replies.lock().unwrap().len()
+        }
+
+        /// 给某个 id 配一个名字，`name_of` 就答这个。
+        pub(super) fn name(&self, id: u32, name: &str) {
+            self.names.lock().unwrap().insert(id, name.to_string());
+        }
+
+        /// 让敲某个会话这件事失败——测 `Delivered::Failed` 那一支用。
+        pub(super) fn fail_on(&self, id: u32) {
+            self.fail.lock().unwrap().insert(id);
+        }
+    }
+
+    impl Channel for Spy {
+        fn send(&self, _to: i64, text: &str) -> Result<MsgId, ChannelError> {
+            self.replies.lock().unwrap().push(text.to_string());
+            Ok(0)
+        }
+        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+            panic!("deliver() 测试不该碰渠道的 poll()")
+        }
+        fn get_me(&self) -> Result<String, ChannelError> {
+            panic!("deliver() 测试不该碰渠道的 get_me()")
+        }
+        fn drain(&self, _timeout: Duration) -> Result<usize, ChannelError> {
+            panic!("deliver() 测试不该碰渠道的 drain()")
+        }
+    }
+
+    impl SessionWriter for Spy {
+        fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String> {
+            if self.fail.lock().unwrap().contains(&id) {
+                return Err(format!("模拟写入失败：会话 {id}"));
+            }
+            self.written.lock().unwrap().push((id, text.to_string()));
+            Ok(())
+        }
+        fn name_of(&self, id: u32) -> Option<String> {
+            self.names.lock().unwrap().get(&id).cloned()
+        }
+    }
+
+    /// 回执不是锦上添花：用户在外面看不见终端，没有回执他不知道这句话
+    /// 到底进去没有。
+    #[test]
+    fn typing_it_in_sends_a_receipt_naming_the_session() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(7, "修登录白屏");
+        let d = b.deliver(Route::To(7), "先跑完");
+        assert_eq!(d, Delivered::Typed(7));
+        assert_eq!(spy.written(), vec![(7, "先跑完".to_string())]);
+        assert!(
+            spy.last_reply().contains("修登录白屏"),
+            "回执里没说敲给了谁"
+        );
+    }
+
+    /// `Gone` 什么都不敲。这是重启之后那条安全路径的落地，光有 `route()`
+    /// 返回 `Gone` 不够，得确认真的没写出去。
+    #[test]
+    fn a_gone_route_writes_nothing_at_all() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        assert_eq!(b.deliver(Route::Gone, "先跑完"), Delivered::SaidGone);
+        assert!(spy.written().is_empty(), "旧消息被敲进了会话");
+    }
+
+    #[test]
+    fn asking_which_writes_nothing_either() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        assert_eq!(
+            b.deliver(Route::Ask(vec![9, 10]), "先跑完"),
+            Delivered::AskedWhich(vec![9, 10])
+        );
+        assert!(spy.written().is_empty());
+    }
+
+    /// **额外测试，brief 的三条只挑了 `Gone`/`Ask`。** `NeedUse` 是第三条
+    /// "这次不该猜"的分支，同样必须一个字都不敲——只测这三条里的两条，
+    /// 剩下这条会被漏掉。
+    #[test]
+    fn a_need_use_route_writes_nothing_at_all() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        assert_eq!(b.deliver(Route::NeedUse, "先跑完"), Delivered::SaidNeedUse);
+        assert!(spy.written().is_empty(), "NeedUse 也不该敲任何东西");
+    }
+
+    /// 三条"什么都不敲"的分支必须**照样回一句话**——不回话的话，用户在
+    /// 手机上看到的是消息发出去之后死一般的沉默，跟真没收到没有区别。
+    #[test]
+    fn gone_ask_and_need_use_all_still_reply_something() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        b.deliver(Route::Gone, "x");
+        assert_eq!(spy.reply_count(), 1, "Gone 也要回一句话");
+        b.deliver(Route::Ask(vec![1, 2]), "x");
+        assert_eq!(spy.reply_count(), 2, "Ask 也要回一句话");
+        b.deliver(Route::NeedUse, "x");
+        assert_eq!(spy.reply_count(), 3, "NeedUse 也要回一句话");
+    }
+
+    /// 会话在 `route()` 判定"敲给它"之后、真的敲进去之前的那道窄缝里
+    /// 没掉了（或者别的写入错误）：`deliver` 不能悄悄吞掉这件事，得诚实
+    /// 报 `Failed`，回执也要说清楚没进去，而不是假装 `Typed`。
+    #[test]
+    fn a_write_failure_is_reported_honestly_not_swallowed() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.fail_on(7);
+        let d = b.deliver(Route::To(7), "先跑完");
+        match d {
+            Delivered::Failed(msg) => assert!(!msg.is_empty()),
+            other => panic!("期待 Failed，得到 {other:?}"),
+        }
+        assert!(spy.written().is_empty(), "写失败就不该出现在写入记录里");
+        assert_eq!(
+            spy.reply_count(),
+            1,
+            "失败也要回一句话，不能假装什么都没发生"
+        );
+    }
+
+    /// 没接线（`set_writer` 没被调用过）：`To` 分支绝不能假装敲成功了。
+    #[test]
+    fn deliver_to_without_a_writer_fails_honestly() {
+        let b = Bridge::for_test();
+        let d = b.deliver(Route::To(7), "先跑完");
+        match d {
+            Delivered::Failed(msg) => assert!(!msg.is_empty()),
+            other => panic!("期待 Failed，得到 {other:?}"),
+        }
+    }
+
+    /// 手机端的字绝不能带路径、diff 或代码块——这是隐私边界，回执和候选
+    /// 列表也不例外（见 CLAUDE.md 里那条约束）。这里钉住四条分支产出的
+    /// 文案里没有明显的代码块/路径痕迹。
+    #[test]
+    fn phone_facing_text_never_looks_like_a_path_or_a_code_block() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(7, "修登录白屏");
+        b.deliver(Route::To(7), "先跑完");
+        b.deliver(Route::Ask(vec![9, 10]), "先跑完");
+        b.deliver(Route::Gone, "先跑完");
+        b.deliver(Route::NeedUse, "先跑完");
+        // 只检查真正发给手机的回执/提示，不检查敲进 PTY 的原文——那是
+        // 用户自己打的字，敲字这条路本来就不该也不能过滤它。
+        for reply in spy.replies.lock().unwrap().iter() {
+            assert!(!reply.contains("```"), "不该带代码块：{reply}");
+            assert!(!reply.contains('\n'), "不该是多行/带缩进的东西：{reply}");
+        }
+    }
+
+    /// 四条路径全部记 journal——手机来的这条消息最终去了哪儿，跟会话
+    /// 自己怎么没的一样，得留得下痕迹。
+    #[test]
+    fn all_four_routes_are_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.log");
+        let (b, spy) = Bridge::for_test_with_writer();
+        b.set_journal_path(path.clone());
+
+        b.deliver(Route::To(7), "先跑完");
+        b.deliver(Route::Ask(vec![9, 10]), "先跑完");
+        b.deliver(Route::Gone, "先跑完");
+        b.deliver(Route::NeedUse, "先跑完");
+        spy.fail_on(8);
+        b.deliver(Route::To(8), "再来一句");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("typed session=7"), "{text}");
+        assert!(text.contains("asked candidates=2"), "{text}");
+        assert!(text.contains("gone"), "{text}");
+        assert!(text.contains("need_use"), "{text}");
+        assert!(text.contains("failed session=8"), "{text}");
+        assert!(!text.contains("先跑完"), "journal 不该带消息原文：{text}");
+    }
+
+    // ---- 变异测试：按 brief 的两条手改一遍，确认测试真的会失败 ----
+    //
+    // 两处手改都直接在这份文件上做、跑指定测试确认失败、再撤销，跟
+    // Task 7 报告里记录的手法一样。下面这两条测试本身就是"钉子"——
+    // 留在代码里，不需要真的改一遍源码才能验证；变异过程记在 task-8
+    // 报告里。
+
+    /// **钉住"Gone 绝不能敲字"这件事本身。** 如果有人把 `Gone` 分支改成
+    /// 也调用 `type_into`，这条测试必须失败——它就是 brief 要求的那个
+    /// 变异要打中的靶子。
+    #[test]
+    fn mutation_guard_gone_must_never_call_type_into() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        b.deliver(Route::Gone, "不该被敲进任何地方的一句话");
+        assert!(
+            spy.written().is_empty(),
+            "Gone 分支一旦调用了 type_into，这里就会看到写入记录"
+        );
+    }
+
+    /// **钉住"回执必须报名字，不能只报编号"这件事本身。** 如果有人把
+    /// `deliver_to` 里的 `name` 换成 `id.to_string()`，这条测试必须失败。
+    #[test]
+    fn mutation_guard_receipt_must_name_the_session_not_just_the_number() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.name(7, "修登录白屏");
+        b.deliver(Route::To(7), "先跑完");
+        let reply = spy.last_reply();
+        assert!(
+            reply.contains("修登录白屏"),
+            "回执必须点名会话叫什么：{reply}"
+        );
+        assert!(
+            !reply.contains("7 号会话"),
+            "回执不该退化成只报编号（这里明明有名字可用）：{reply}"
         );
     }
 }
