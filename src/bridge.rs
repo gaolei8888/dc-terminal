@@ -650,6 +650,130 @@ fn broken_message(e: ChannelError) -> String {
     }
 }
 
+/// 会话没起名字（还没跑完过一轮）时，`merge` 用来称呼它的那句话——
+/// 跟 `fallback_name` 是同一条规矩：诚实报一个编号，好过编一个不存在的
+/// 名字。
+fn event_label(e: &Event) -> String {
+    let name = if e.name.trim().is_empty() {
+        fallback_name(e.session)
+    } else {
+        format!("「{}」", e.name)
+    };
+    format!("{name}（{}）", e.project)
+}
+
+/// 这一类事件该用哪句人话收尾。
+fn event_verb(kind: crate::channel::EventKind) -> &'static str {
+    match kind {
+        crate::channel::EventKind::Stopped => "干完停下来了",
+        crate::channel::EventKind::Failed => "报错了",
+        crate::channel::EventKind::Vanished => "自己不见了",
+    }
+}
+
+/// 把攒了一段时间的几个事件合并成**一条**发给手机的消息。**不需要任何
+/// 模型**——这是它存在的全部意义：断网八小时之后，用户重新连上手机
+/// 通知，不该在那一瞬间收到几百条推送。`lang` 目前不参与分支：手机上
+/// 的文案跟 `broken_message` 一样只写了中文这一种（已有评审认定这条
+/// precedent 成立），参数留着只是为了让这个纯函数跟别处「输出人话、
+/// 带 `Lang`」的签名保持一致，界面语言的切换（`l` 键）不该影响发到
+/// 手机上的字。
+///
+/// **只有一件事的时候绝不排编号列表**——`a_single_event_is_not_dressed_
+/// up_as_a_list` 钉的就是这条：一件事本来就不是一个「列表」，编上
+/// 「1.」纯属多余的形式感，还会让用户以为还有别的事没显示全。
+pub fn merge(events: &[Event], lang: crate::i18n::Lang) -> String {
+    let _ = lang;
+    if events.len() == 1 {
+        let e = &events[0];
+        return format!("{}{}", event_label(e), event_verb(e.kind));
+    }
+    let lines: Vec<String> = events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{}. {}{}", i + 1, event_label(e), event_verb(e.kind)))
+        .collect();
+    format!("有 {} 件事：\n{}", events.len(), lines.join("\n"))
+}
+
+/// 屏幕文字最多喂给模型这么多字符。跟 `session.rs::explain_prompt`/
+/// `name_prompt` 用的是同一个数字、同一条理由：整屏几千字又慢又贵，
+/// 还容易让模型抓错重点，只送末尾就够了。
+const OPTIONS_TAIL: usize = 2000;
+
+/// 问模型「这个屏幕是不是在等用户从几个选项里选一个」。跟
+/// `session.rs::explain_prompt`/`name_prompt` 走的是同一条范式：纯函数、
+/// 只喂屏幕末尾、prompt 里把隐私边界写死。
+///
+/// **这里的要求是双保险的一半**：prompt 明确禁止路径、代码块、diff——
+/// 但 prompt 只是「请求」，模型不听话是常态，真正的保证在 `parse_options`
+/// 那道过滤（见它的文档）。
+pub fn options_prompt(screen: &str) -> crate::llm::Prompt {
+    let tail: String = {
+        let chars: Vec<char> = screen.chars().collect();
+        let start = chars.len().saturating_sub(OPTIONS_TAIL);
+        chars[start..].iter().collect()
+    };
+    crate::llm::Prompt {
+        system: "你在帮一个完全不懂编程的人。看看这段命令行工具的屏幕内容，\
+                 判断它是不是正停下来等用户从几个选项里选一个。如果是，把\
+                 每个选项概括成几个字的大白话，编号列出，一行一个，格式是\
+                 「1. 选项内容」。如果看不出是在等选择，就只回复「没有选项」。\
+                 **绝不能出现文件路径、目录、代码块、反引号、diff、命令行\
+                 原文**——用户在手机上看，这些东西对他没有意义，还可能\
+                 泄露不该出现在这里的内容。"
+            .into(),
+        user: format!("这是屏幕上的最后一段内容：\n\n{tail}"),
+        max_tokens: 200,
+    }
+}
+
+/// 从模型的答案里洗出选项列表。**解析不出来就是没有选项，绝不猜**——
+/// 这条规则比任何具体的格式细节都重要：模型答得含糊、跑题、或者干脆
+/// 说「没有选项」，调用方都该拿到 `None`，退回只有元数据的兜底消息，
+/// 而不是把模型那句话本身当成唯一的「选项」塞给用户。
+///
+/// **隐私过滤的另一半**（跟 `options_prompt` 的 prompt 要求配对）：任何
+/// 一行选项只要带 `/` 或反引号，整行丢弃，不管前面编号解析得多干净——
+/// prompt 只是请求模型别这么写，这里才是真正兜底的保证。丢弃的是那一
+/// 行，不是整个答案：其余能用的选项还是照常返回。
+pub fn parse_options(raw: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let Some(rest) = strip_numbered_prefix(line.trim()) else {
+            continue;
+        };
+        let candidate = rest.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate.contains('/') || candidate.contains('`') {
+            continue;
+        }
+        out.push(candidate.to_string());
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 剥掉一行开头的编号前缀（`1.`/`1、`/`1)`），剥不掉就说明这行根本不是
+/// 编号列表的一部分。
+fn strip_numbered_prefix(line: &str) -> Option<&str> {
+    let digits_end = line
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, c)| i + c.len_utf8())?;
+    let rest = &line[digits_end..];
+    rest.strip_prefix('.')
+        .or_else(|| rest.strip_prefix('、'))
+        .or_else(|| rest.strip_prefix(')'))
+        .or_else(|| rest.strip_prefix('）'))
+}
+
 /// 一个正在跑的 bridge 的外部句柄。**除了它，外面不该有别的办法碰到
 /// 内部那个 `Bridge`**——`replace()`/`stop_current()` 只通过它管线程的
 /// 生死，`daemon.rs` 也只通过它转发 `PhoneUnpair`（`unpair()`）。
@@ -2015,5 +2139,135 @@ mod tests {
             !reply.contains("7 号会话"),
             "回执不该退化成只报编号（这里明明有名字可用）：{reply}"
         );
+    }
+
+    // ---- merge：合并不需要模型 ----
+
+    fn named_event(
+        session: u32,
+        kind: crate::channel::EventKind,
+        name: &str,
+        project: &str,
+    ) -> Event {
+        Event {
+            session,
+            kind,
+            name: name.to_string(),
+            project: project.to_string(),
+        }
+    }
+
+    /// 合并不需要模型。断网八小时不该在恢复瞬间收到五百条。
+    #[test]
+    fn several_events_become_one_message() {
+        let evs = vec![
+            named_event(1, crate::channel::EventKind::Stopped, "修登录白屏", "web"),
+            named_event(2, crate::channel::EventKind::Failed, "对账", "fin"),
+        ];
+        let m = merge(&evs, crate::i18n::Lang::Zh);
+        assert!(m.contains("修登录白屏") && m.contains("对账"));
+        // 一条消息，不是两条拼起来——两个会话名之间不该出现消息分隔
+        assert_eq!(m.matches("\n\n\n").count(), 0);
+    }
+
+    #[test]
+    fn a_single_event_is_not_dressed_up_as_a_list() {
+        let evs = vec![named_event(
+            1,
+            crate::channel::EventKind::Stopped,
+            "修登录白屏",
+            "web",
+        )];
+        let m = merge(&evs, crate::i18n::Lang::Zh);
+        assert!(!m.contains("1."), "只有一件事却排了个编号列表：{m}");
+    }
+
+    /// 没起过名字的会话不能编一个假名字——诚实退回编号，跟 `deliver_to`
+    /// 用的是同一条 `fallback_name`。
+    #[test]
+    fn merge_falls_back_to_a_number_when_a_session_has_no_name() {
+        let evs = vec![named_event(9, crate::channel::EventKind::Vanished, "", "x")];
+        let m = merge(&evs, crate::i18n::Lang::Zh);
+        assert!(m.contains("9 号会话"), "没有名字该退回编号：{m}");
+    }
+
+    /// 三件事排出的编号必须是 1、2、3——不是"钉住有编号"这么松，是钉住
+    /// 编号真的按进队顺序对上号，不是随手拼出来的。
+    #[test]
+    fn merge_numbers_several_events_in_order() {
+        let evs = vec![
+            named_event(1, crate::channel::EventKind::Stopped, "甲", "p1"),
+            named_event(2, crate::channel::EventKind::Failed, "乙", "p2"),
+            named_event(3, crate::channel::EventKind::Vanished, "丙", "p3"),
+        ];
+        let m = merge(&evs, crate::i18n::Lang::Zh);
+        assert!(
+            m.contains("1. ") && m.contains("2. ") && m.contains("3. "),
+            "{m}"
+        );
+        // 顺序必须对上：甲排在乙前面，乙排在丙前面。
+        let i_a = m.find('甲').unwrap();
+        let i_b = m.find('乙').unwrap();
+        let i_c = m.find('丙').unwrap();
+        assert!(i_a < i_b && i_b < i_c, "编号顺序跟进队顺序对不上：{m}");
+    }
+
+    // ---- parse_options：解析不出来就是没有选项，绝不猜 ----
+
+    /// 模型答得不成形就当没有选项——**绝不猜**，退回只有元数据的消息。
+    #[test]
+    fn unparseable_options_mean_no_options() {
+        assert_eq!(parse_options("我觉得他大概想问你要不要继续吧"), None);
+        assert_eq!(parse_options(""), None);
+    }
+
+    #[test]
+    fn options_come_back_in_order() {
+        let got = parse_options("1. 先跑完\n2. 现在改").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string(), "现在改".to_string()]);
+    }
+
+    /// 隐私边界的第二道保险：prompt 只是请求，`parse_options` 才是真正
+    /// 的保证——含 `/` 或反引号的候选项整行丢弃，不管编号解析得多干净。
+    #[test]
+    fn options_containing_a_path_or_a_backtick_are_discarded() {
+        let got = parse_options("1. 直接改 src/main.rs\n2. 先跑完\n3. 用 `cargo test`").unwrap();
+        assert_eq!(got, vec!["先跑完".to_string()]);
+    }
+
+    /// 模型说「没有选项」这类不带编号的大白话：0 条能用的候选，`None`，
+    /// 不是 `Some(vec![])`——两者对调用方来说必须是同一件事（退回兜底），
+    /// 但 `None` 才是这个函数唯一诚实的表达。
+    #[test]
+    fn a_plain_no_reply_yields_no_options() {
+        assert_eq!(parse_options("没有选项"), None);
+    }
+
+    /// 只剩隐私过滤会挡掉的候选项：全部丢弃之后一条不剩，同样是 `None`，
+    /// 不能因为"编号解析成功过"就返回一个空列表糊弄过去。
+    #[test]
+    fn options_that_are_all_filtered_out_mean_no_options() {
+        assert_eq!(parse_options("1. 修改 /etc/hosts\n2. 用 `ls`"), None);
+    }
+
+    // ---- options_prompt：范式跟 explain_prompt/name_prompt 一致 ----
+
+    #[test]
+    fn options_prompt_forbids_paths_and_code_and_carries_the_screen() {
+        let p = options_prompt("…… 是继续跑完，还是现在就改？ ……");
+        assert!(p.system.contains("路径"), "{}", p.system);
+        assert!(p.system.contains("代码块"), "{}", p.system);
+        assert!(p.system.contains("反引号"), "{}", p.system);
+        assert!(p.system.contains("diff"), "{}", p.system);
+        assert!(p.user.contains("是继续跑完，还是现在就改？"));
+        assert!(p.max_tokens <= 200);
+    }
+
+    #[test]
+    fn options_prompt_only_carries_the_screen_tail() {
+        let long = "x".repeat(OPTIONS_TAIL + 500);
+        let p = options_prompt(&long);
+        // 用户部分不该把全部 500+2000 个字符都塞进去，只留末尾那一段。
+        assert!(p.user.chars().count() <= OPTIONS_TAIL + 50);
     }
 }
