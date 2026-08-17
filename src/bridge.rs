@@ -32,9 +32,10 @@
 //!    `replace()`/`stop_current()` 这两个函数改它持有的那一个槽——保证
 //!    任何时刻最多只有一条真的在跑的轮询线程，见这两个函数的文档注释。
 
-use crate::channel::{Channel, ChannelError, Event, Incoming};
+use crate::channel::{Channel, ChannelError, Event, Incoming, MsgId};
 use crate::proto::{PhoneState, PhoneStatus};
 use crate::session::recover;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +75,83 @@ pub enum Accepted {
     FromOwner,
     /// 不是主人发的，**丢弃**。
     Rejected,
+}
+
+/// 决定一条不带主人身份问题（那个问题 `accept()` 已经答过了）的入站消息
+/// 该敲进哪个会话——或者拒绝回答。**纯函数，不做 IO、不碰任何共享状态**：
+/// 调用方（Task 8）负责把这里此刻的真相（消息映射、`/use` 状态、谁在等）
+/// 攒成这个结构体,再问 `route()`。
+pub struct RouteInput<'a> {
+    /// 这条消息是不是长按/回复了手机上此前收到的某条推送。
+    pub reply_to: Option<MsgId>,
+    /// 推送消息 id -> 那条推送来自哪个会话。守护进程重启后这份映射
+    /// 是空的——这正是规则 1 里 `Gone` 分支存在的原因。
+    pub map: &'a HashMap<MsgId, u32>,
+    /// 用户上一次 `/use` 显式选中的会话，如果有的话。
+    pub used: Option<u32>,
+    /// 自从那次 `/use` 之后，用户是不是已经回复过至少一条推送——一旦
+    /// 是，说明注意力已经转走，`/use` 的指定就作废了（规则 3）。
+    pub replied_since_use: bool,
+    /// 此刻正在等待输入、且没有被上面两条规则截住的候选会话集合。
+    pub waiting: &'a [u32],
+}
+
+/// `route()` 的答案。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// 敲进这一个会话，没有歧义。
+    To(u32),
+    /// 好几个候选，说不清该敲哪个——**问用户，不猜**。
+    Ask(Vec<u32>),
+    /// 这条回复对应的推送消息守护进程已经不认识了（多半是重启把映射
+    /// 冲掉了）。**唯一正确的动作是什么都不敲**——退化成"发给当前会话"
+    /// 正是把话敲进错误终端的那条路径，用户在手机上看不到终端，
+    /// 不会发现敲错了。
+    Gone,
+    /// 没有 `/use`，也没有任何会话在等：告诉用户先去看看会话列表，
+    /// 而不是替他瞎猜一个。
+    NeedUse,
+}
+
+/// 决定一条入站消息该敲进哪个会话，或者拒绝回答。**五条规则，顺序固定，
+/// 不能重排**——顺序本身就是设计的一部分：
+///
+/// 1. 带回复的消息永远直接定位到那条推送对应的会话，**永远不反问**；
+///    如果映射里已经找不到（守护进程重启过），答案是 `Gone`，什么都不敲。
+/// 2. 显式 `/use` 过、且那之后还没回复过任何推送：`/use` 压过"唯一在等
+///    的那个会话"——用户切过去就是想跟那个会话说话，这一条必须排在
+///    "唯一在等"前面，否则一个碰巧在等的会话会把他的话抢走。
+/// 3. 但 `/use` 只在用户还没有用回复动作转移注意力之前有效——一旦他
+///    回复过至少一条推送，说明注意力已经转走，`/use` 的指定作废，
+///    不然一次 `/use` 会永久劫持所有后续不带回复的消息。
+/// 4. 只有一个会话在等：直接给它。
+/// 5. 好几个会话在等：`Ask`，不猜——敲错 agent 的代价远大于多问一句。
+/// 6. 什么都没有（没有 `/use`，没有会话在等）：`NeedUse`，请用户自己去
+///    看一眼会话列表。
+pub fn route(i: &RouteInput) -> Route {
+    // 1. 带回复的：直接定位，永远不反问。
+    if let Some(m) = i.reply_to {
+        return match i.map.get(&m) {
+            Some(&s) => Route::To(s),
+            // 守护进程重启过，映射没了。**绝不退化成"发给当前会话"**——
+            // 那正是会把话敲进错误终端的路径。
+            None => Route::Gone,
+        };
+    }
+    // 2. 显式 /use 过、且那之后还没回复过任何推送。
+    if let (Some(u), false) = (i.used, i.replied_since_use) {
+        return Route::To(u);
+    }
+    // 3. 只有一个在等。
+    if i.waiting.len() == 1 {
+        return Route::To(i.waiting[0]);
+    }
+    // 4. 好几个在等：不猜。
+    if i.waiting.len() > 1 {
+        return Route::Ask(i.waiting.to_vec());
+    }
+    // 5. 没候选也没 /use 过。
+    Route::NeedUse
 }
 
 pub struct Bridge {
@@ -1380,6 +1458,124 @@ mod tests {
         assert!(
             recover(slot.lock()).is_none(),
             "槽里不该留着一个已经停掉的句柄"
+        );
+    }
+
+    // ---- route()：五条规则，来自 brief 的失败测试 ----
+
+    fn input<'a>(
+        reply_to: Option<MsgId>,
+        map: &'a HashMap<MsgId, u32>,
+        used: Option<u32>,
+        replied_since_use: bool,
+        waiting: &'a [u32],
+    ) -> RouteInput<'a> {
+        RouteInput {
+            reply_to,
+            map,
+            used,
+            replied_since_use,
+            waiting,
+        }
+    }
+
+    #[test]
+    fn a_reply_goes_where_it_replied() {
+        let map = HashMap::from([(42, 7)]);
+        assert_eq!(
+            route(&input(Some(42), &map, Some(3), false, &[9])),
+            Route::To(7)
+        );
+    }
+
+    /// **重启之后旧消息不能敲进任何地方。** 退化成「发给当前会话」正好是
+    /// 敲错地方的那条路径。
+    #[test]
+    fn a_reply_to_a_message_we_no_longer_know_types_nothing() {
+        let map = HashMap::new();
+        assert_eq!(
+            route(&input(Some(42), &map, Some(3), false, &[9])),
+            Route::Gone
+        );
+    }
+
+    /// `/use` 压过「唯一在等」：用户切过去就是想跟那个会话说话，
+    /// 此刻另一个会话恰好在等，不能把他的话抢走。
+    #[test]
+    fn an_explicit_use_beats_a_waiting_session() {
+        let map = HashMap::new();
+        assert_eq!(
+            route(&input(None, &map, Some(3), false, &[9])),
+            Route::To(3)
+        );
+    }
+
+    /// 但用户一旦长按回复过某条推送，注意力已经转走，`/use` 的指定作废——
+    /// 否则一次 `/use` 会永久劫持所有不带回复的消息。
+    #[test]
+    fn use_expires_once_you_have_replied_to_a_push() {
+        let map = HashMap::new();
+        assert_eq!(route(&input(None, &map, Some(3), true, &[9])), Route::To(9));
+    }
+
+    #[test]
+    fn the_only_one_waiting_gets_it() {
+        let map = HashMap::new();
+        assert_eq!(route(&input(None, &map, None, false, &[9])), Route::To(9));
+    }
+
+    /// 好几个在等就不猜。敲错 agent 的代价比多问一句大得多。
+    #[test]
+    fn several_waiting_means_ask_not_guess() {
+        let map = HashMap::new();
+        assert_eq!(
+            route(&input(None, &map, None, false, &[9, 10])),
+            Route::Ask(vec![9, 10])
+        );
+    }
+
+    #[test]
+    fn nothing_waiting_and_no_use_asks_for_ls() {
+        let map = HashMap::new();
+        assert_eq!(route(&input(None, &map, None, false, &[])), Route::NeedUse);
+    }
+
+    // ---- 额外的对抗性测试：钉住变异测试列表之外容易被忽略的角落 ----
+
+    /// 带回复的消息即便此刻同时有 `/use` 和好几个会话在等，规则 1 也必须
+    /// 第一个生效——回复动作本身就是最明确的指向,不该被后面任何一条
+    /// 规则盖过。这条测试防的是"整体规则顺序被打乱"，而不仅仅是
+    /// brief 里点名的"2、3 互换"。
+    #[test]
+    fn a_reply_wins_over_everything_else_even_with_use_and_many_waiting() {
+        let map = HashMap::from([(1, 5)]);
+        assert_eq!(
+            route(&input(Some(1), &map, Some(3), false, &[9, 10])),
+            Route::To(5)
+        );
+    }
+
+    /// `Gone` 同样必须盖过 `/use` 和"在等"——找不到映射就是找不到,
+    /// 不该因为凑巧有别的候选就悄悄改答案。
+    #[test]
+    fn gone_wins_over_use_and_waiting_too() {
+        let map = HashMap::new();
+        assert_eq!(
+            route(&input(Some(999), &map, Some(3), false, &[9, 10])),
+            Route::Gone
+        );
+    }
+
+    /// 没有 `/use`、也没有回复，但已经"回复过推送"这件事本身对"唯一在等"
+    /// 这条规则没有任何影响——`replied_since_use` 只管 `/use` 的生死,
+    /// 不该意外地也去干扰规则 3/4。
+    #[test]
+    fn replied_since_use_does_not_affect_the_waiting_rules_when_there_is_no_use() {
+        let map = HashMap::new();
+        assert_eq!(route(&input(None, &map, None, true, &[9])), Route::To(9));
+        assert_eq!(
+            route(&input(None, &map, None, true, &[9, 10])),
+            Route::Ask(vec![9, 10])
         );
     }
 }
