@@ -59,6 +59,10 @@ use std::time::Duration;
 /// 上限。
 pub const QUEUE_CAP: usize = 32;
 
+/// 推送消息 id -> 会话映射表的上限，跟 `QUEUE_CAP` 同一条丢最旧规则：
+/// 长按回复的时效性本来就有限，一直没被回复的旧推送不值得无限占内存。
+pub const MSG_MAP_CAP: usize = 256;
+
 /// 长轮询一次最多挂多久。Telegram `getUpdates` 用同一个数字当查询参数。
 const POLL_TIMEOUT: Duration = Duration::from_secs(25);
 /// 退避的起点。
@@ -69,6 +73,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// `sleep_or_stop` 检查停止信号的粒度。数字选得够小，`stop()` 之后线程能
 /// 在这么久之内真的退出，而不是把 `MAX_BACKOFF` 那五分钟原样睡完。
 const STOP_CHECK_GRANULARITY: Duration = Duration::from_millis(20);
+
+/// 发送线程每一轮醒来看一眼队列的间隔。**不需要跟 `DEBOUNCE_WINDOW`
+/// 对齐**——去抖已经在 `session.rs::tick()` 往队列里放事件之前做完了
+/// （`Session::last_notified`），发送线程这边只管"队列里现在有什么就
+/// 发出去"，这个数字只是"多久看一眼"，选得比去抖窗口小得多，好让
+/// 事件不会平白多等将近一整个间隔才被发出去。
+const SEND_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accepted {
@@ -173,6 +184,12 @@ pub trait SessionWriter: Send + Sync {
     /// 它之后、真的敲之前那一小段时间窗口里没掉了）返回 `None`——调用方
     /// 退化成用编号称呼它，绝不编一个不存在的名字。
     fn name_of(&self, id: u32) -> Option<String>;
+    /// 此刻正在等待用户输入的会话 id——`route()` 的 `RouteInput::waiting`
+    /// 和 `/ls` 都要用它。**「等待」= `SessionState::Idle`**：干完一轮、
+    /// 停在提示符前面，正是手机上那句「唯一在等的那个」该指的对象；
+    /// `Working`/`Stopped`/`Failed`/`Unknown` 都不算——干着活的会话没有
+    /// 「该敲给它」这回事，`Failed`/`Stopped` 也不是在等下一句话。
+    fn waiting(&self) -> Vec<u32>;
 }
 
 /// Ruling 7 的落地：`SessionManager` 已经有 `send_input`（敲字）和 `list`
@@ -192,6 +209,14 @@ impl SessionWriter for crate::session::SessionManager {
                 s.tag
             }
         })
+    }
+
+    fn waiting(&self) -> Vec<u32> {
+        self.list()
+            .into_iter()
+            .filter(|s| s.state == crate::session::SessionState::Idle)
+            .map(|s| s.id)
+            .collect()
     }
 }
 
@@ -243,7 +268,21 @@ pub struct Bridge {
     /// 这里，是接线的事**——这个字段和 `enqueue`/`queued` 这两个方法
     /// 只负责「进来一条、满了丢最旧的」这条规则本身，不管调用方是谁。
     outbound: Mutex<VecDeque<Event>>,
-    // …… 消息映射与当前会话见 Task 9/10
+    /// 推送消息 id -> 那条推送来自哪个会话（`RouteInput::map`）。**只有
+    /// 只关涉一个会话的推送才会进这张表**——一次合并了好几件事的推送
+    /// 长按回复该敲给哪个没有唯一答案，`route()` 的规则 1 只认识
+    /// `u32`（单个会话），宁可让这种回复落到 `Route::Gone`（"这条消息
+    /// 已经不认识了，去 /ls"），也不该在这里编一个多选一的猜测。
+    ///
+    /// 有界、drop-oldest，跟 `outbound` 同一条道理（`MSG_MAP_CAP`）：
+    /// 守护进程一直跑下去，这张表不清理会无限长下去。
+    outbound_map: Mutex<VecDeque<(MsgId, u32)>>,
+    /// `/use <n>` 选中的会话，`None` = 没有显式选过，或者选过但已经
+    /// 因为 `replied_since_use` 作废。
+    used: Mutex<Option<u32>>,
+    /// 自从上一次 `/use` 之后，用户是不是已经长按回复过至少一条推送——
+    /// `route()` 规则 3 的依据。`/use` 每次被重新设置都清成 `false`。
+    replied_since_use: Mutex<bool>,
     /// 敲字这一半的能力（Ruling 7）。`None` = 还没接线——`Bridge::new` 之后
     /// 默认没有，调用方（daemon.rs，接线是另一个任务）通过 `set_writer`
     /// 装进真的 `SessionManager`；测试用 `for_test_with_writer` 装假的。
@@ -270,6 +309,9 @@ impl Bridge {
             stop: AtomicBool::new(false),
             persist_owner,
             outbound: Mutex::new(VecDeque::new()),
+            outbound_map: Mutex::new(VecDeque::new()),
+            used: Mutex::new(None),
+            replied_since_use: Mutex::new(false),
             writer: Mutex::new(None),
             journal: Journal::new(),
         }
@@ -324,22 +366,145 @@ impl Bridge {
         }
     }
 
-    /// 一条消息落地之后，状态槽该跟着改什么。**只处理 `Paired`**——
-    /// `FromOwner`/`Rejected` 不该动状态槽（往会话里敲字是 Task 7 的事，
-    /// 丢弃陌生人不留任何痕迹是这条规则的全部意义）。
+    /// 一条消息落地之后该做什么。**这是唯一会把一条入站消息交给
+    /// `route()`/`deliver()` 的地方，而且结构上只有两条腿能走到那里**：
+    /// `Accepted::Paired` 和 `Accepted::FromOwner`。`Accepted::Rejected`
+    /// 对应的是一个空分支——不是"这个分支里判断了什么都不做"，是
+    /// **这个分支根本没有语句能碰到 `route_and_deliver`**。安全评审的
+    /// 要求是"结构上明显"，不是"跑起来碰巧对"：把 `route_and_deliver`
+    /// 挪到这个 `match` 外面统一调用一次、只在外面另加一个
+    /// `if !matches!(.., Rejected)` 之类的守卫，都不满足这条要求——那样
+    /// 的写法只要有人删掉那一行守卫就会把陌生人的话敲进用户的终端，
+    /// 而编译器不会提醒。现在这样，想犯这个错误必须先把
+    /// `route_and_deliver(msg)` 这行代码亲手打进 `Rejected` 分支里，
+    /// 变动本身在 diff 里无所遁形（`security_review_the_rejected_arm_
+    /// never_calls_route_or_deliver` 是这条不变量的测试）。
     fn dispatch(&self, msg: &Incoming) {
-        if let Accepted::Paired(chat_id) = self.accept(msg) {
-            // 落盘在改内存状态槽之前——`PhoneStatus` 只是给界面看的缓存，
-            // 密钥仓那份才是重启之后唯一还在的真相。顺序反过来的话，一次
-            // 「状态槽已经显示配对成功，但落盘失败」的窗口会比这里更长。
-            (self.persist_owner)(chat_id);
-            let mut st = recover(self.phone.lock());
-            st.state = PhoneState::Paired;
-            // 这里没有真实姓名可用——`Incoming` 没带 Telegram 的
-            // `message.from.username`（Task 2 没有解析它），能给的只有
-            // chat id 本身。诚实地显示一个数字，好过编一个不存在的名字。
-            st.owner = Some(chat_id.to_string());
+        match self.accept(msg) {
+            Accepted::Paired(chat_id) => {
+                // 落盘在改内存状态槽之前——`PhoneStatus` 只是给界面看的
+                // 缓存，密钥仓那份才是重启之后唯一还在的真相。顺序反过来
+                // 的话，一次「状态槽已经显示配对成功，但落盘失败」的窗口
+                // 会比这里更长。
+                (self.persist_owner)(chat_id);
+                let mut st = recover(self.phone.lock());
+                st.state = PhoneState::Paired;
+                // 这里没有真实姓名可用——`Incoming` 没带 Telegram 的
+                // `message.from.username`（Task 2 没有解析它），能给的
+                // 只有 chat id 本身。诚实地显示一个数字，好过编一个不
+                // 存在的名字。
+                st.owner = Some(chat_id.to_string());
+                drop(st);
+                // 配对完成的这条消息本身也可能带着内容（比如直接就是
+                // 一句 `/ls` 或者要说给某个会话的话）——不能因为这条
+                // 消息"顺便"完成了配对就把它的内容扔掉不处理。
+                self.route_and_deliver(msg);
+            }
+            Accepted::FromOwner => self.route_and_deliver(msg),
+            // **空分支。绝不能在这里加任何调用 `route`/`deliver` 的代码**
+            // ——见上面的文档注释，这正是安全评审要求"结构上明显"的落地。
+            Accepted::Rejected => {}
         }
+    }
+
+    /// `Paired`/`FromOwner` 共用的处理：先认 `/use`、`/ls` 这两条命令，
+    /// 都不是的话才交给 `route()`/`deliver()`。**只在 `dispatch()` 的
+    /// 两条已认证分支里被调用**——见那边的文档注释，这个方法本身不做
+    /// 任何身份判断，把它挪到 `accept()` 之前调用就是重新打开安全漏洞。
+    fn route_and_deliver(&self, msg: &Incoming) {
+        let text = msg.text.trim();
+        if let Some(rest) = text.strip_prefix("/use") {
+            self.handle_use(rest.trim());
+            return;
+        }
+        if text == "/ls" {
+            self.handle_ls();
+            return;
+        }
+
+        let map: HashMap<MsgId, u32> = recover(self.outbound_map.lock()).iter().copied().collect();
+        let waiting: Vec<u32> = recover(self.writer.lock())
+            .clone()
+            .map(|w| w.waiting())
+            .unwrap_or_default();
+        let used = *recover(self.used.lock());
+        let replied_since_use = *recover(self.replied_since_use.lock());
+
+        let input = RouteInput {
+            reply_to: msg.reply_to,
+            map: &map,
+            used,
+            replied_since_use,
+            waiting: &waiting,
+        };
+        let route = route(&input);
+        self.deliver(route, &msg.text);
+
+        // 规则 3 的另一半：**这条**消息如果是一次长按回复，从这一刻起
+        // `/use` 的指定作废——放在 `route()`/`deliver()` 之后才翻这个
+        // 标记，这样这条消息本身仍然吃到了翻转之前的 `replied_since_use`
+        // 快照（回复动作本身走的是规则 1，压根不看这个标记，但下一条
+        // 不带回复的消息必须已经看到 `/use` 失效）。
+        if msg.reply_to.is_some() {
+            *recover(self.replied_since_use.lock()) = true;
+        }
+    }
+
+    /// `/use <n>` 的落地：`n` 解析不出来就老实说清楚格式，解析出来就
+    /// 记下来、把 `replied_since_use` 清零——这是一次新的显式选择，
+    /// 不该继承上一次选择留下的"已经回复过"状态。**不校验 `n` 是不是
+    /// 真的存在**：`route()`/`deliver_to` 已经会在真敲的时候诚实报
+    /// "这个会话已经不在了"，这里重复校验一遍只是多一处可能跟那边
+    /// 对不上的逻辑。
+    fn handle_use(&self, rest: &str) {
+        match rest.parse::<u32>() {
+            Ok(id) => {
+                *recover(self.used.lock()) = Some(id);
+                *recover(self.replied_since_use.lock()) = false;
+                self.reply(&format!("好，接下来的话默认说给 {id} 号"));
+            }
+            Err(_) => {
+                self.reply("没看懂，格式是 /use 加编号，比如 /use 3");
+            }
+        }
+    }
+
+    /// `/ls`：报一遍此刻在等用户说话的会话。**没有真实姓名就退回编号**
+    /// ——跟 `ask_message`/`fallback_name` 同一条规矩，绝不编一个不存在
+    /// 的名字。
+    fn handle_ls(&self) {
+        let writer = recover(self.writer.lock()).clone();
+        let Some(writer) = writer else {
+            self.reply("这句话现在发不出去，稍后再试一次");
+            return;
+        };
+        let ids = writer.waiting();
+        if ids.is_empty() {
+            self.reply("现在没有会话在等你说话");
+            return;
+        }
+        let list = ids
+            .iter()
+            .map(|&id| match writer.name_of(id) {
+                Some(name) => format!("{id} 号「{name}」", id = id, name = name),
+                None => fallback_name(id),
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        self.reply(&format!(
+            "在等你说话的有：{list}。回复其中一条，或者发 /use 加编号指定一个"
+        ));
+    }
+
+    /// 一条推送发出去之后，把渠道回的 `MsgId` 记到它关涉的会话上——
+    /// 长按回复靠这张表找到家（`RouteInput::map`）。**只有只关涉一个
+    /// 会话的推送才配拥有这条记录**，见 `outbound_map` 字段文档。
+    fn record_push(&self, id: MsgId, session: u32) {
+        let mut m = recover(self.outbound_map.lock());
+        if m.len() >= MSG_MAP_CAP {
+            m.pop_front();
+        }
+        m.push_back((id, session));
     }
 
     /// 消费队列这一半：把一条 `session.rs::tick()` 产的事件收进来。
@@ -358,6 +523,13 @@ impl Bridge {
     /// 同时把别人还没读到的事件顺手清空。
     pub fn queued(&self) -> Vec<Event> {
         recover(self.outbound.lock()).iter().cloned().collect()
+    }
+
+    /// 发送线程那一半：把队列里此刻攒着的全部事件**取走**，按进队顺序。
+    /// 空队列拿到空 `Vec`，不是错误——发送线程每一轮都会问一遍，大多数
+    /// 时候什么都没有。
+    fn drain_outbound(&self) -> Vec<Event> {
+        recover(self.outbound.lock()).drain(..).collect()
     }
 
     /// 补 bot 用户名，带跟轮询同一套退避。**必须在进入轮询循环之前做**——
@@ -627,6 +799,57 @@ impl Bridge {
             }
         }
     }
+
+    /// 出站这一半的主循环：定期把 `enqueue()` 攒下的事件整批取走、合并成
+    /// 一条、发给主人，把渠道回的 `MsgId` 记进 `outbound_map`。**不要
+    /// 直接调用它**——用模块级的 `spawn_sender()`，那边包了
+    /// `catch_unwind`，理由同 `run()`。
+    ///
+    /// **绝不阻塞 `tick()`。** 这是这条线程存在的全部理由：
+    /// `session.rs::tick()` 只管往 unbounded 的 `mpsc::Sender<Event>`
+    /// 里 `send()`，那条 channel 由常驻的 `spawn_event_consumer` 转手
+    /// `enqueue()` 进这里的 `outbound` 队列（有界、drop-oldest）；这个
+    /// 方法只从 `outbound` 这一头读，从不回头去等 `tick()`，两条线程
+    /// 之间没有反向依赖，`tick()` 那 200ms 一轮的循环感知不到这里发生
+    /// 了什么，哪怕这里因为网络卡住半天。
+    ///
+    /// **跟轮询线程共用同一个 `self.stop`**——`stop()`/`replace()`/
+    /// `stop_current()` 一次调用同时喊停两条线程，不必再给发送线程
+    /// 另开一面旗子，这正是"停/换令牌不会留下孤儿线程"这条要求在这里
+    /// 的落地：把它系在轮询线程已经验证过能生效的同一根绳子上，而不是
+    /// 自己发明一套新的生死开关。
+    fn run_sender(&self) {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            self.sleep_or_stop(SEND_INTERVAL);
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let events = self.drain_outbound();
+            if events.is_empty() {
+                continue;
+            }
+            // 还没配对：这批事件没有地方可送。**故意丢弃，不攒着等以后
+            // 补发**——同 `spawn_event_consumer` 那条道理，攒着的话用户
+            // 一旦配对成功会被一堆早就过期的通知糊一脸。
+            let Some(to) = *recover(self.owner.lock()) else {
+                continue;
+            };
+            let text = merge(&events, crate::i18n::Lang::Zh);
+            if let Ok(id) = self.ch.send(to, &text) {
+                // 只有只关涉一个会话的这一批才配拥有映射——见
+                // `outbound_map` 字段文档。
+                if let [only] = events.as_slice() {
+                    self.record_push(id, only.session);
+                }
+            }
+            // 发送失败：吞掉，不重试。同 `journal.rs` 的规矩——手机通道
+            // 这条线程自己没发出去，不该连累任何会话；下一轮醒来时，
+            // 真正要紧的新事件早就把这条盖过去了。
+        }
+    }
 }
 
 /// 指数退避，上限五分钟。纯函数——不用真的睡一觉就能测。
@@ -800,8 +1023,14 @@ impl BridgeHandle {
     }
 }
 
-/// 把 bridge 起在后台线程上。**整个线程体包在 `catch_unwind` 里**——
-/// 一个手机通道死掉是遗憾，一个会话死掉是灾难，两者绝不能是同一件事。
+/// 把 bridge 起在后台线程上——**两条**线程：轮询线程（入站）和发送线程
+/// （出站，`run_sender`），共用同一个 `stop` 标志位，一次 `stop()` 两条
+/// 都会退出。**每条线程体都包在 `catch_unwind` 里**——一个手机通道死掉
+/// 是遗憾，一个会话死掉是灾难，两者绝不能是同一件事。
+///
+/// `writer`/`journal_path` 都是 `None` 就是测试里那种"还没接线"的
+/// `Bridge`——生产环境（`daemon.rs`）总是传 `Some`，两者都在起线程*之前*
+/// 装好，不留一个"线程已经在跑但还没接上敲字能力"的窗口。
 ///
 /// 不要直接调用它来更换一个正在跑的 bridge——那样旧的线程没人管，
 /// 会跟新的一起活着（C3）。改令牌/配对状态一律走 `replace()`。
@@ -810,11 +1039,23 @@ pub fn spawn(
     phone: Arc<Mutex<PhoneStatus>>,
     owner: Option<i64>,
     persist_owner: Box<dyn Fn(i64) + Send + Sync>,
+    writer: Option<Arc<dyn SessionWriter>>,
+    journal_path: Option<PathBuf>,
 ) -> BridgeHandle {
     let bridge = Arc::new(Bridge::new(ch, phone, owner, persist_owner));
+    if let Some(w) = writer {
+        bridge.set_writer(w);
+    }
+    if let Some(p) = journal_path {
+        bridge.set_journal_path(p);
+    }
     let worker = bridge.clone();
     std::thread::spawn(move || {
         let _ = catch_unwind(AssertUnwindSafe(|| worker.run()));
+    });
+    let sender = bridge.clone();
+    std::thread::spawn(move || {
+        let _ = catch_unwind(AssertUnwindSafe(|| sender.run_sender()));
     });
     BridgeHandle { bridge }
 }
@@ -832,12 +1073,14 @@ pub fn replace(
     phone: Arc<Mutex<PhoneStatus>>,
     owner: Option<i64>,
     persist_owner: Box<dyn Fn(i64) + Send + Sync>,
+    writer: Option<Arc<dyn SessionWriter>>,
+    journal_path: Option<PathBuf>,
 ) {
     let mut guard = recover(slot.lock());
     if let Some(old) = guard.take() {
         old.stop();
     }
-    *guard = Some(spawn(ch, phone, owner, persist_owner));
+    *guard = Some(spawn(ch, phone, owner, persist_owner, writer, journal_path));
 }
 
 /// `PhoneDisable` 的落地点：把槽里的 bridge（如果有）停掉，槽留空。
@@ -1251,7 +1494,16 @@ mod tests {
     #[test]
     fn dispatch_on_pairing_writes_paired_state_and_owner() {
         let phone = blank_status();
-        let b = Bridge::new(Arc::new(NeverCalled), phone.clone(), None, Box::new(|_| {}));
+        // `Spy` 不是 `NeverCalled`——`dispatch()` 现在**也**会把消息交给
+        // `route_and_deliver`（Task 8/9 的接线），没有 `/use`/在等的会话时
+        // 会回一句「先发 /ls」，这一句要走真的 `Channel::send`，用
+        // `NeverCalled` 会直接 panic。
+        let b = Bridge::new(
+            Arc::new(Spy::default()),
+            phone.clone(),
+            None,
+            Box::new(|_| {}),
+        );
         b.dispatch(&msg(42, "hi"));
         let st = phone.lock().unwrap();
         assert_eq!(st.state, PhoneState::Paired);
@@ -1263,7 +1515,12 @@ mod tests {
     #[test]
     fn dispatch_from_owner_does_not_touch_the_slot_again() {
         let phone = blank_status();
-        let b = Bridge::new(Arc::new(NeverCalled), phone.clone(), None, Box::new(|_| {}));
+        let b = Bridge::new(
+            Arc::new(Spy::default()),
+            phone.clone(),
+            None,
+            Box::new(|_| {}),
+        );
         b.dispatch(&msg(42, "配对"));
         // 手动把状态槽改成一个跟「配对」不同的值，确认 FromOwner 不会把它
         // 又改回去、也不会动 owner 字段。
@@ -1290,7 +1547,12 @@ mod tests {
     #[test]
     fn dispatch_from_a_stranger_leaves_the_slot_untouched() {
         let phone = blank_status();
-        let b = Bridge::new(Arc::new(NeverCalled), phone.clone(), None, Box::new(|_| {}));
+        let b = Bridge::new(
+            Arc::new(Spy::default()),
+            phone.clone(),
+            None,
+            Box::new(|_| {}),
+        );
         b.dispatch(&msg(1, "先配对")); // 1 号成为主人
         {
             let mut st = phone.lock().unwrap();
@@ -1314,7 +1576,7 @@ mod tests {
         let sink = calls.clone();
         let phone = blank_status();
         let b = Bridge::new(
-            Arc::new(NeverCalled),
+            Arc::new(Spy::default()),
             phone,
             None,
             Box::new(move |id| sink.lock().unwrap().push(id)),
@@ -1407,6 +1669,12 @@ mod tests {
         poll_calls: Mutex<u32>,
         drain_calls: Mutex<u32>,
         on_poll_return: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// `send()` 被调用过几次、传的都是什么——`route_and_deliver` 现在
+        /// 接在 `dispatch()` 里，`run()` 测试里配对/路由产生的回执都会走
+        /// 到这里，不能再让 `send()` panic（以前"这一路测试不需要 send"
+        /// 的年代已经过去，Task 8/9 把它接上了）。
+        sends: Mutex<Vec<(i64, String)>>,
+        next_msg_id: Mutex<MsgId>,
     }
 
     impl MockChannel {
@@ -1418,6 +1686,8 @@ mod tests {
                 poll_calls: Mutex::new(0),
                 drain_calls: Mutex::new(0),
                 on_poll_return: Mutex::new(None),
+                sends: Mutex::new(Vec::new()),
+                next_msg_id: Mutex::new(0),
             }
         }
 
@@ -1428,11 +1698,19 @@ mod tests {
         fn queue_drain(&self, r: Result<usize, ChannelError>) {
             self.drain_results.lock().unwrap().push_back(r);
         }
+
+        fn sends(&self) -> Vec<(i64, String)> {
+            self.sends.lock().unwrap().clone()
+        }
     }
 
     impl Channel for MockChannel {
-        fn send(&self, _to: i64, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
-            unimplemented!("这一路测试不需要 send")
+        fn send(&self, to: i64, text: &str) -> Result<crate::channel::MsgId, ChannelError> {
+            self.sends.lock().unwrap().push((to, text.to_string()));
+            let mut n = self.next_msg_id.lock().unwrap();
+            let id = *n;
+            *n += 1;
+            Ok(id)
         }
         fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
             *self.poll_calls.lock().unwrap() += 1;
@@ -1685,6 +1963,8 @@ mod tests {
             blank_status(),
             Some(111),
             Box::new(|_| {}),
+            None,
+            None,
         );
         assert_eq!(handle.accept(&msg(111, "老主人")), Accepted::FromOwner);
 
@@ -1712,6 +1992,8 @@ mod tests {
             phone.clone(),
             Some(1),
             Box::new(|_| {}),
+            None,
+            None,
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1727,6 +2009,8 @@ mod tests {
             phone.clone(),
             Some(2),
             Box::new(|_| {}),
+            None,
+            None,
         );
 
         // 给旧线程一点时间真的退出，再看它是不是真停了——不是只停了
@@ -1753,7 +2037,15 @@ mod tests {
         let slot: Mutex<Option<BridgeHandle>> = Mutex::new(None);
         let phone = blank_status();
         let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
-        replace(&slot, ch.clone(), phone, Some(1), Box::new(|_| {}));
+        replace(
+            &slot,
+            ch.clone(),
+            phone,
+            Some(1),
+            Box::new(|_| {}),
+            None,
+            None,
+        );
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while *ch.poll_calls.lock().unwrap() == 0 {
@@ -1908,6 +2200,9 @@ mod tests {
         names: Mutex<HashMap<u32, String>>,
         /// 敲字时该失败的会话号——空集合表示从不失败。
         fail: Mutex<std::collections::HashSet<u32>>,
+        /// `waiting()` 该答什么——`route_and_deliver`/`/ls` 的测试用
+        /// `set_waiting` 摆好这份候选集合，不碰真的 `SessionManager`。
+        waiting: Mutex<Vec<u32>>,
     }
 
     impl Spy {
@@ -1940,6 +2235,11 @@ mod tests {
         pub(super) fn fail_on(&self, id: u32) {
             self.fail.lock().unwrap().insert(id);
         }
+
+        /// 摆好 `waiting()` 该答的候选集合。
+        pub(super) fn set_waiting(&self, ids: &[u32]) {
+            *self.waiting.lock().unwrap() = ids.to_vec();
+        }
     }
 
     impl Channel for Spy {
@@ -1968,6 +2268,9 @@ mod tests {
         }
         fn name_of(&self, id: u32) -> Option<String> {
             self.names.lock().unwrap().get(&id).cloned()
+        }
+        fn waiting(&self) -> Vec<u32> {
+            self.waiting.lock().unwrap().clone()
         }
     }
 
@@ -2269,5 +2572,245 @@ mod tests {
         let p = options_prompt(&long);
         // 用户部分不该把全部 500+2000 个字符都塞进去，只留末尾那一段。
         assert!(p.user.chars().count() <= OPTIONS_TAIL + 50);
+    }
+
+    // ==== 整合任务：把 enqueue/route/deliver/`/use`/`/ls` 真的接起来 ====
+
+    /// **安全测试，整个整合任务里最重要的一条。** 陌生人的消息必须一次
+    /// 都碰不到 `route()`/`deliver()`——不是"结果看起来正确"这么松，是
+    /// 拿一个只要 `type_into`/`send` 被调用就会留痕的 `Spy` 直接问：
+    /// 陌生人发的这条消息，会话里一个字都没多，回执也一条没多。
+    ///
+    /// **这条测试钉的就是 `dispatch()` 的结构**：`route_and_deliver` 只在
+    /// `Accepted::Paired`/`Accepted::FromOwner` 两条分支里被调用，
+    /// `Accepted::Rejected` 是一个空分支——见 `dispatch()` 的文档注释。
+    #[test]
+    fn security_a_rejected_stranger_never_reaches_route_or_deliver() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[1, 2]); // 故意摆出"好几个在等"，排除"反正没得选所以看起来没敲"这种巧合
+        spy.name(1, "对账");
+
+        // 主人是 999（`for_test_with_writer` 的默认值）。陌生人 111 无论
+        // 发什么——`/use`、`/ls`、看起来像回复——都不该被接受。
+        b.dispatch(&msg(111, "/use 1"));
+        b.dispatch(&msg(111, "/ls"));
+        b.dispatch(&Incoming {
+            text: "冒充回复".into(),
+            reply_to: Some(0),
+            chat_id: 111,
+        });
+
+        assert!(
+            spy.written().is_empty(),
+            "陌生人的消息一个字都不该被敲进任何会话"
+        );
+        assert!(
+            spy.replies.lock().unwrap().is_empty(),
+            "陌生人不该收到任何回执——回执是发给主人的，`reply()` 只会在\
+             `route_and_deliver`/`handle_use`/`handle_ls` 里被调用，\
+             这几个方法从未在 Rejected 分支上被调用过"
+        );
+    }
+
+    /// 出站发送线程：`enqueue()` 进去的事件真的会被合并、发给主人，渠道
+    /// 回的 `MsgId` 落进 `outbound_map`。**走真实的 `run_sender()`**，
+    /// 不是直接调用私有的合并/映射函数——这条测试钉的是"这条线程真的在
+    /// 跑、真的在读队列"这件事本身。
+    #[test]
+    fn a_queued_event_is_sent_and_its_msg_id_is_recorded() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        let bridge = Arc::new(b);
+        bridge.enqueue(named_event(
+            7,
+            crate::channel::EventKind::Stopped,
+            "修登录白屏",
+            "p",
+        ));
+
+        let worker = bridge.clone();
+        let handle = std::thread::spawn(move || worker.run_sender());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if !spy.replies.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "发送线程该把队列里的事件真的发出去"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            spy.last_reply().contains("修登录白屏"),
+            "发出去的是 merge() 组好的那条人话：{}",
+            spy.last_reply()
+        );
+
+        bridge.stop();
+        assert!(wait_for_join(handle, Duration::from_secs(2)));
+
+        // 长按回复：`Spy::send` 固定回 `0`，`record_push` 该已经把
+        // `0 -> 7` 记进 `outbound_map`——用一条回复 `0` 的入站消息验证，
+        // 而不是直接窥探私有字段。
+        bridge.dispatch(&Incoming {
+            text: "先跑完".into(),
+            reply_to: Some(0),
+            chat_id: 999,
+        });
+        assert_eq!(
+            spy.written().last(),
+            Some(&(7, "先跑完".to_string())),
+            "长按回复该落到 MsgId 关涉的那个会话上"
+        );
+    }
+
+    /// **变异测试的钉子之一（`record_push` 不写）。** 如果有人把
+    /// `run_sender` 里那句 `self.record_push(id, only.session)` 删掉，
+    /// 这条测试会失败：长按回复找不到映射，`route()` 只能答 `Gone`，
+    /// 什么都不敲。手改一遍、跑这条测试确认失败，是整合报告里记录的
+    /// 变异之一。
+    #[test]
+    fn mutation_guard_a_reply_without_a_recorded_mapping_types_nothing() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        // 没有任何 enqueue/send 发生过，`outbound_map` 是空的。
+        b.dispatch(&Incoming {
+            text: "先跑完".into(),
+            reply_to: Some(0),
+            chat_id: 999,
+        });
+        assert!(
+            spy.written().is_empty(),
+            "映射里没有这条 MsgId，就不该敲进任何地方"
+        );
+    }
+
+    /// `/use <n>` 之后一条不带回复的消息该敲给 `n`；一旦用户长按回复过
+    /// 一条推送，`/use` 的指定作废，后续消息回到"唯一在等的那个"这条
+    /// 规则。**这是 `route()` 五条规则第一次真的被 `dispatch()` 调用到**
+    /// ——`route()` 自己的单元测试只测纯函数，这条测试测的是
+    /// `route_and_deliver` 有没有把真实状态（`/use`、`replied_since_use`、
+    /// `waiting()`）拼对。
+    #[test]
+    fn use_then_reply_then_use_expires() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[9]);
+        b.record_push(55, 9); // 假装此前有一条推送来自 9 号会话
+
+        b.dispatch(&msg(999, "/use 3"));
+        b.dispatch(&Incoming {
+            text: "继续".into(),
+            reply_to: None,
+            chat_id: 999,
+        });
+        assert_eq!(
+            spy.written(),
+            vec![(3, "继续".to_string())],
+            "/use 选中之后，不带回复的消息该敲给 3 号"
+        );
+
+        // 长按回复一条推送——注意力已经转走，`/use` 从这一刻起作废。
+        b.dispatch(&Incoming {
+            text: "先跑完".into(),
+            reply_to: Some(55),
+            chat_id: 999,
+        });
+
+        b.dispatch(&Incoming {
+            text: "接着".into(),
+            reply_to: None,
+            chat_id: 999,
+        });
+        assert_eq!(
+            spy.written().last(),
+            Some(&(9, "接着".to_string())),
+            "/use 已经作废，只有 9 号在等，该退回「唯一在等」这条规则"
+        );
+    }
+
+    /// `/use` 解析不出编号：老实说清楚格式，不猜、不崩。
+    #[test]
+    fn use_with_a_bad_number_explains_the_format_instead_of_guessing() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        b.dispatch(&msg(999, "/use 三号"));
+        assert!(spy.written().is_empty(), "解析不出来就不该敲任何地方");
+        assert!(
+            spy.last_reply().contains("/use"),
+            "该告诉用户正确格式：{}",
+            spy.last_reply()
+        );
+    }
+
+    /// `/ls`：报一遍此刻在等的会话，没名字的退回编号。
+    #[test]
+    fn ls_lists_the_waiting_sessions_by_name() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.set_waiting(&[3, 9]);
+        spy.name(3, "对账");
+        b.dispatch(&msg(999, "/ls"));
+        let reply = spy.last_reply();
+        assert!(reply.contains("对账"), "{reply}");
+        assert!(reply.contains("9 号"), "没名字的该退回编号：{reply}");
+        assert!(spy.written().is_empty(), "/ls 不该敲任何地方");
+    }
+
+    /// 没有会话在等时 `/ls` 也要老实说清楚，不能什么都不回。
+    #[test]
+    fn ls_with_nothing_waiting_says_so() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        b.dispatch(&msg(999, "/ls"));
+        assert!(!spy.last_reply().is_empty());
+        assert!(spy.written().is_empty());
+    }
+
+    /// **no-orphan 测试。** `stop()` 之后轮询线程和发送线程都必须真的
+    /// 退出——用 `MockChannel` 起一个真的 `spawn()`（两条线程都在跑），
+    /// 往队列里塞一个事件让发送线程有活干，确认它真的发过一次；`stop()`
+    /// 之后再确认两边的调用计数都不再增长。
+    #[test]
+    fn stop_leaves_neither_the_poller_nor_the_sender_still_running() {
+        let phone = blank_status();
+        let ch = Arc::new(MockChannel::new(Ok("bot".to_string())));
+        // owner 已知：跳过 drain_backlog，轮询线程立刻进入"每次都成功但
+        // 什么都没有"的正常轮询，最能暴露"stop 没生效就会一直转下去"。
+        let handle = spawn(ch.clone(), phone, Some(1), Box::new(|_| {}), None, None);
+        handle.bridge.enqueue(ev(1));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while *ch.poll_calls.lock().unwrap() == 0 || ch.sends().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "两条线程都该真的跑起来：poll_calls={} sends={}",
+                *ch.poll_calls.lock().unwrap(),
+                ch.sends().len()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        handle.stop();
+        // 给两条线程一点时间真的看到 stop 标志位并退出。
+        std::thread::sleep(Duration::from_millis(100));
+        let poll_count = *ch.poll_calls.lock().unwrap();
+        let send_count = ch.sends().len();
+
+        // **只看"计数不再增长"还不够**——发送线程本来就要睡满
+        // `SEND_INTERVAL` 才会去看一眼队列，队列里如果什么都没有，
+        // 一个"stop 没生效、还在傻循环"的线程和一个"已经真的退出"的
+        // 线程在没有新事件时看起来一模一样。**往队列里塞一条新事件**，
+        // 只有真的退出的线程才不会去碰它。
+        handle.bridge.enqueue(ev(2));
+        std::thread::sleep(SEND_INTERVAL * 3);
+
+        assert_eq!(
+            *ch.poll_calls.lock().unwrap(),
+            poll_count,
+            "stop() 之后轮询线程不该还在跑"
+        );
+        assert_eq!(
+            ch.sends().len(),
+            send_count,
+            "stop() 之后发送线程不该还在跑——两条线程共用同一个 stop 标志位，\
+             stop() 之后新塞进队列的事件也不该被发出去"
+        );
     }
 }

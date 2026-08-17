@@ -94,6 +94,14 @@ impl Journal {
         *self.path.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
     }
 
+    /// 这本账本此刻落在哪个文件上，没设过路径就是 `None`。**`bridge.rs`
+    /// 靠它拿到跟会话生死同一份文件的路径**——两本账本讲的是同一条
+    /// 时间线，不该分开维护两份配置，见 `Bridge::set_journal_path` 的
+    /// 调用点。
+    pub fn path(&self) -> Option<PathBuf> {
+        self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub fn born(&self, id: u32, profile: &str, dir: &Path, pid: Option<u32>) {
         self.write(&format!(
             "session {id} born  profile={profile} pid={} dir={}",

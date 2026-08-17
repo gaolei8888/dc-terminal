@@ -73,7 +73,7 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 任何时刻这里最多只有一个 `Some`，见 `bridge::replace`/`stop_current`
     // 的文档注释（C2/C3 的修复）。
     let bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>> = Arc::new(Mutex::new(None));
-    start_phone_bridge(&secrets, &phone, &bridge, &|token| {
+    start_phone_bridge(&secrets, &phone, &bridge, &mgr, &|token| {
         Arc::new(Telegram::new(token)) as Arc<dyn crate::channel::Channel>
     });
 
@@ -190,6 +190,7 @@ fn start_phone_bridge(
     secrets: &Arc<Mutex<SecretStore>>,
     phone: &Arc<Mutex<PhoneStatus>>,
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
+    mgr: &Arc<SessionManager>,
     make_channel: &dyn Fn(&str) -> Arc<dyn crate::channel::Channel>,
 ) {
     let (token, owner_state) = {
@@ -224,6 +225,13 @@ fn start_phone_bridge(
         phone.clone(),
         owner,
         persist_owner_closure(secrets.clone()),
+        // 敲字的能力和记账的文件——`Bridge` 起线程之前就该接好，不留
+        // "轮询线程已经在跑、但还接不到 PTY"的窗口，见 `bridge::spawn`
+        // 的文档注释。`mgr.clone()` 是 `Arc<SessionManager>`，它已经
+        // `impl SessionWriter`（见 `bridge.rs`）。`mgr.journal.path()`
+        // 跟会话生死用同一份文件——两本账本讲的是同一条时间线。
+        Some(mgr.clone() as Arc<dyn crate::bridge::SessionWriter>),
+        mgr.journal.path(),
     );
 }
 
@@ -505,6 +513,8 @@ fn handle(
                         phone.clone(),
                         None,
                         persist_owner_closure(secrets.clone()),
+                        Some(mgr.clone() as Arc<dyn crate::bridge::SessionWriter>),
+                        mgr.journal.path(),
                     );
                     PhoneStatus {
                         state: crate::proto::PhoneState::WaitingForPairing,
@@ -1137,6 +1147,8 @@ mod tests {
             phone.clone(),
             Some(111),
             Box::new(|_| {}),
+            None,
+            None,
         );
         let bridge = Arc::new(Mutex::new(Some(bridge_handle)));
 
@@ -1202,6 +1214,8 @@ mod tests {
             phone.clone(),
             Some(111),
             Box::new(|_| {}),
+            None,
+            None,
         );
         let bridge = Arc::new(Mutex::new(Some(bridge_handle)));
 
@@ -1292,8 +1306,9 @@ mod tests {
             .unwrap();
         let phone = test_phone();
         let bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>> = Arc::new(Mutex::new(None));
+        let mgr = Arc::new(SessionManager::new());
 
-        start_phone_bridge(&secrets, &phone, &bridge, &|_token| {
+        start_phone_bridge(&secrets, &phone, &bridge, &mgr, &|_token| {
             Arc::new(StubChannel) as Arc<dyn crate::channel::Channel>
         });
 
@@ -1337,8 +1352,9 @@ mod tests {
         recover(secrets.lock()).set(PHONE_OWNER_KEY, "555").unwrap();
         let phone = test_phone();
         let bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>> = Arc::new(Mutex::new(None));
+        let mgr = Arc::new(SessionManager::new());
 
-        start_phone_bridge(&secrets, &phone, &bridge, &|_token| {
+        start_phone_bridge(&secrets, &phone, &bridge, &mgr, &|_token| {
             Arc::new(StubChannel) as Arc<dyn crate::channel::Channel>
         });
 
@@ -1363,5 +1379,152 @@ mod tests {
             }),
             crate::bridge::Accepted::FromOwner
         );
+    }
+
+    /// **端到端接线测试。** `bridge.rs` 的单元测试全部用 `Spy` 假装
+    /// "敲字能力"和"文件记账"，从没验证过 `daemon.rs` 真的把
+    /// `SessionManager` 和 journal 路径接给了 `Bridge`——这条测试走
+    /// `start_phone_bridge`（真实启动路径），拿一个不碰网络的假渠道
+    /// 喂它两条真实消息（`/use` 选中一个真的会话，再一条要说的话），
+    /// 确认文字真的敲进了那个用真实 `PtySession` 起来的会话，而且
+    /// journal 文件里真的多了一笔——这两件事合起来才说明 `Some(mgr.clone()
+    /// as Arc<dyn SessionWriter>)` 和 `mgr.journal.path()` 这两行接线
+    /// 是对的，不是编译器点头就完事。
+    struct FakeChannel {
+        get_me_result: Result<String, ChannelError>,
+        poll_queue: Mutex<
+            std::collections::VecDeque<
+                std::result::Result<Vec<crate::channel::Incoming>, ChannelError>,
+            >,
+        >,
+    }
+    impl FakeChannel {
+        fn new(get_me_result: Result<String, ChannelError>) -> FakeChannel {
+            FakeChannel {
+                get_me_result,
+                poll_queue: Mutex::new(std::collections::VecDeque::new()),
+            }
+        }
+        fn queue_poll(&self, r: std::result::Result<Vec<crate::channel::Incoming>, ChannelError>) {
+            self.poll_queue.lock().unwrap().push_back(r);
+        }
+    }
+    impl crate::channel::Channel for FakeChannel {
+        fn send(
+            &self,
+            _to: i64,
+            _text: &str,
+        ) -> std::result::Result<crate::channel::MsgId, ChannelError> {
+            Ok(0)
+        }
+        fn poll(
+            &self,
+            _timeout: Duration,
+        ) -> std::result::Result<Vec<crate::channel::Incoming>, ChannelError> {
+            self.poll_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()))
+        }
+        fn get_me(&self) -> std::result::Result<String, ChannelError> {
+            self.get_me_result.clone()
+        }
+        fn drain(&self, _timeout: Duration) -> std::result::Result<usize, ChannelError> {
+            Ok(0)
+        }
+    }
+
+    // 一个没有任何 pattern 的普通命令行会话——不是 agent，`create()` 不会
+    // 要求它是 git 仓库，也不需要它真的表现出"在等输入"，`/use` 选中它
+    // 靠的是编号本身，不靠 `waiting()`。
+    fn plain_shell() -> Profile {
+        Profile {
+            name: "daemon-wire-fake".into(),
+            command: vec!["cat".into()],
+            is_agent: false,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: None,
+            env: Default::default(),
+            secret: None,
+            install: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+        }
+    }
+
+    #[test]
+    fn start_phone_bridge_wires_the_real_session_manager_and_journal() {
+        let mgr = Arc::new(SessionManager::new());
+        mgr.register_profile(plain_shell());
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal_path = journal_dir.path().join("sessions.log");
+        mgr.journal.set_path(journal_path.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = mgr
+            .create(dir.path(), "daemon-wire-fake", None, &[])
+            .unwrap();
+
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+        )));
+        recover(secrets.lock())
+            .set(PHONE_TOKEN_KEY, "123456:AAH-tok")
+            .unwrap();
+        // owner 已知：跳过配对，`FakeChannel` 发来的第一条消息直接算
+        // `FromOwner`，走的是 dispatch() 里真正常见的那条腿。
+        recover(secrets.lock()).set(PHONE_OWNER_KEY, "42").unwrap();
+        let phone = test_phone();
+        let bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>> = Arc::new(Mutex::new(None));
+
+        let ch = Arc::new(FakeChannel::new(Ok("bot".to_string())));
+        ch.queue_poll(Ok(vec![crate::channel::Incoming {
+            text: format!("/use {id}"),
+            reply_to: None,
+            chat_id: 42,
+        }]));
+        ch.queue_poll(Ok(vec![crate::channel::Incoming {
+            text: "你好".into(),
+            reply_to: None,
+            chat_id: 42,
+        }]));
+
+        let ch_for_closure = ch.clone();
+        start_phone_bridge(&secrets, &phone, &bridge, &mgr, &move |_token| {
+            ch_for_closure.clone() as Arc<dyn crate::channel::Channel>
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if mgr.screen_text_for_test(id).contains("你好") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "该把手机上收到的文字真的敲进真实的 SessionManager，屏幕上一直没出现"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // journal 路径也接对了——`Bridge` 自己那本账本跟 `mgr.journal`
+        // 用的是同一个文件。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let text = std::fs::read_to_string(&journal_path).unwrap_or_default();
+            if text.contains("typed session=") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "手机来的消息落地之后该在 journal 里留痕，跟会话生死记在同一个文件"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        crate::bridge::stop_current(&bridge);
     }
 }
