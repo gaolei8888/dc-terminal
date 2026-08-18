@@ -1,0 +1,11 @@
+# 行尾按文件类型钉死，不看各人 core.autocrlf 的脸色。
+#
+# .cmd 是唯一一个由 cmd.exe 解释的产物，而 cmd 解析块结构时对行尾是敏感的：
+# 一个 LF 结尾的批处理文件大多数时候没事，出事的时候症状是"某一行被跳过了"，
+# 而不是一句报错。没必要赌，直接要求它在工作区里永远是 CRLF。
+#
+# .ps1 和 .sh 反过来钉成 LF：PowerShell 两种都读，bash 见了 CR 会把它当成
+# 命令的一部分（经典的 $'\r': command not found）。
+*.cmd text eol=crlf
+*.ps1 text eol=lf
+*.sh  text eol=lf

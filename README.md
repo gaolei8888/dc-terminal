@@ -101,6 +101,39 @@ nothing but `zsh: killed` to show for it — `codesign -v` will insist the signa
 is fine, because the copy on disk is. `install.sh` writes a new file and renames
 it over the old one, so the new binary always gets a fresh inode.
 
+### Windows
+
+There is no Windows build, and that isn't an oversight waiting to be fixed by a
+better installer. `dct` is Unix at the joints: the TUI and the daemon talk over a
+Unix domain socket, the daemon's lifecycle runs on `libc::kill` and `setsid`, and
+the key file's protection is the `0600` bit. `cargo build` does not get through
+on Windows, so there is no binary for a `.msi` to carry.
+
+What works today is WSL. From PowerShell or from `cmd`:
+
+```
+scripts\install.cmd
+```
+
+That picks a WSL distribution (skipping `docker-desktop`, which is Docker's own
+backend and has no package manager), installs a C toolchain, `git` and Rust
+inside it if they're missing, hands the build to the same `scripts/install.sh` as
+everywhere else, and then leaves a `dct.cmd` in `%LOCALAPPDATA%\Programs\dct` and
+puts that directory on your `PATH`. After it finishes, `dct` in PowerShell, `dct`
+in `cmd` and `dct` in a WSL shell are the same command. The shim carries your
+current directory across, so `dct` in a project folder opens the board on that
+project the way it does on Unix.
+
+`-Distro`, `-InstallDir`, `-ShimDir`, `-NoBuild`, `-NoPath` and `-NoShim` all pass
+through; `scripts\install.ps1` takes them directly if you'd rather skip the `.cmd`
+wrapper (it exists so that PowerShell's default execution policy can't stop the
+install with an error that has nothing to do with `dct`).
+
+Two things worth knowing. Building a repo that lives on a Windows drive goes
+through the 9p file system and is slow — clone into WSL's own file system if you
+mind. And the board is a full-screen TUI, so it looks better in Windows Terminal
+than in the old console host.
+
 If you rebuild `dct` while the daemon from before the rebuild is still running, the next start notices, explains that restarting it will end whatever sessions are currently running (file changes stay, the agents don't), and asks before touching anything. Say yes and it swaps the daemon in and reconnects; say no and it carries on with the old one.
 
 ## The board

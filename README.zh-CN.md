@@ -99,6 +99,36 @@ macOS 上，守护进程还在执行这个文件的时候原地覆盖它，内�
 `zsh: killed`——而 `codesign -v` 还会说签名没问题，因为磁盘上那份确实没问题。
 `install.sh` 是先写新文件再 rename 覆盖，新二进制永远落在一个新 inode 上。
 
+### Windows
+
+没有 Windows 版本，而且这不是"还没顾上、写个好点的安装器就能解决"的事。
+`dct` 的关节全长在 Unix 上：界面和守护进程之间走 Unix domain socket，守护
+进程的生死靠 `libc::kill` 和 `setsid`，密钥文件的保护就是那个 `0600` 位。
+在 Windows 上 `cargo build` 根本过不去，也就没有二进制给 `.msi` 装。
+
+现在能跑的地方是 WSL。在 PowerShell 里或者 `cmd` 里：
+
+```
+scripts\install.cmd
+```
+
+它会挑一个 WSL 发行版（跳过 `docker-desktop`——那是 Docker 自己的后端，
+里头连包管理器都没有），在里面把 C 工具链、`git` 和 Rust 缺的补上，编译
+安装这一步交给跟别处一样的 `scripts/install.sh`，最后在
+`%LOCALAPPDATA%\Programs\dct` 里留一个 `dct.cmd` 并把这个目录加进 `PATH`。
+装完之后，PowerShell 里的 `dct`、`cmd` 里的 `dct`、WSL 里的 `dct`，是同一条
+命令。这个 shim 会把当前目录带过去，所以在项目目录里敲 `dct`，板子就开在
+那个项目上，跟 Unix 上一样。
+
+`-Distro`、`-InstallDir`、`-ShimDir`、`-NoBuild`、`-NoPath`、`-NoShim` 都是
+透传的；不想走 `.cmd` 那层就直接用 `scripts\install.ps1`。那个 `.cmd` 存在的
+唯一理由，是别让 PowerShell 默认的执行策略用一句跟 `dct` 毫无关系的报错
+把安装挡在门外。
+
+两件事值得先知道。仓库放在 Windows 盘上的话，编译要过 9p，慢得很明显——
+在意就把仓库 clone 到 WSL 自己的文件系统里。另外板子是全屏 TUI，用 Windows
+Terminal 开比老的控制台窗口好看。
+
 重新编译过 `dct` 之后，如果旧编译版本的守护进程还在跑，下次启动会发现这一点，跟你说清楚重启会让正在跑的会话全部结束（文件改动都还在，只是 agent 得重新开），问过你才动手。答 y 就换掉旧的重连上去；直接回车就还用旧的接着跑。
 
 ## 看板
