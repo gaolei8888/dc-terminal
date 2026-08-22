@@ -142,6 +142,11 @@ pub enum Key {
     /// 它们混：`CopyMode`/`CopyModeShort` 是「已经在复制模式里」时顶掉整条
     /// 右段的话，这一条是「还没进去、告诉你按哪个键能进去」。
     EnterCopyMode,
+    /// `F5` 在会话视图里的动作名：把剪贴板里的图片交给 agent。跟
+    /// `EnterCopyMode` 一样只是**一个动词**，拼在 `("F5", ...)` 后面填底栏
+    /// 那一格；「为什么不是 Ctrl+V」那句解释在 `attach::paste_image` 的
+    /// 文档注释里，不占底栏。
+    PasteImage,
     OtherKeysGoToAgent,
     BackToListWord,
     BackToSettingsWord,
@@ -234,6 +239,10 @@ pub enum Key {
     Verifying,
     PasteOrTypeKey,
     NoOtherRunningSession,
+    /// 按了 F5，但剪贴板里没有图。**不是错误**——用户刚拷的是一段文字，
+    /// 或者截图还没截成，这是最常见的一种「什么都没发生」，红字会把它说得
+    /// 比实情严重。
+    NoImageInClipboard,
     NoSessionSelected,
     DaemonUnreachable,
     StaleData,
@@ -366,6 +375,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 只是动词，跟 `Undo`/`Diff` 那一档词条一个形状——句子留给
         // `CopyMode`/`CopyModeShort`。
         EnterCopyMode => t!(lang, en: "copy", zh: "复制"),
+        PasteImage => t!(lang, en: "paste image", zh: "粘贴图片"),
         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
         OtherKeysGoToAgent => t!(
@@ -500,6 +510,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "No other session is running",
             zh: "没有其他正在跑的会话",
+        ),
+        NoImageInClipboard => t!(
+            lang,
+            en: "The clipboard has no image",
+            zh: "剪贴板里没有图片",
         ),
         NoSessionSelected => t!(lang, en: "No session selected", zh: "没有选中会话"),
         DaemonUnreachable => t!(
@@ -1417,6 +1432,7 @@ mod tests {
             EmptyReplyIsEnter,
             NextSession,
             EnterCopyMode,
+            PasteImage,
             OtherKeysGoToAgent,
             BackToListWord,
             BackToSettingsWord,
@@ -1449,6 +1465,7 @@ mod tests {
             Verifying,
             PasteOrTypeKey,
             NoOtherRunningSession,
+            NoImageInClipboard,
             NoSessionSelected,
             DaemonUnreachable,
             StaleData,
@@ -1526,7 +1543,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 105, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 107, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

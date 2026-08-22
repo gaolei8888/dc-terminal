@@ -2,6 +2,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::path::Path;
 
 use crate::i18n::Lang;
 use crate::proto::{MouseForward, MouseForwardKind, Request};
@@ -166,6 +167,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `mod.rs::wants_mouse_capture`）——在这儿直接 execute! 的话，
         // 就有两处在写同一个终端状态，而它们对「现在开着没有」的记忆会分叉。
         app.copy_mode = !app.copy_mode;
+    } else if key.code == KeyCode::F(5) {
+        paste_image(app, id);
     } else if let Some(action) = key_scroll(
         &app.scroll,
         &key,
@@ -203,6 +206,66 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// F5 = 把剪贴板里的图片存成文件，再把**路径**当文字发给 agent。
+///
+/// **为什么不是 Ctrl+V。** 那个键根本到不了 dct：终端自己把粘贴键绑走了
+/// （Windows Terminal 默认 `ctrl+v`，macOS 上是 `Cmd+V`），按下去它读一遍
+/// 剪贴板，然后把里面的**文字**送进来——那条路是 `Event::Paste`，主循环
+/// 已经接着了。剪贴板里是图的时候它一个字节都不送，dct 连「用户按过粘贴」
+/// 都不知道，没有任何可以挂钩的事件。所以取图只能挂在一个终端不认识的键
+/// 上；挑 F5 沿用 F2/F3/F4 那条理由：没有 CLI agent 在用 F 功能键，偷它不
+/// 踩任何人，而且它现在本来就是个死键（`key_to_input` 不翻译功能键）。
+///
+/// 送路径而不是别的：终端这根管子只过字节，图片过不去；而 agent 拿到一条
+/// 路径就能自己去读那张图——Claude Code、codex 都是这么用的。
+fn paste_image(app: &mut App, id: u32) {
+    match crate::clipboard::image_to_file() {
+        Ok(Some(path)) => {
+            let text = path_as_input(&path);
+            // 失败的处理跟下面手打字符那条完全一样，理由也一样：静默吞掉
+            // 的话，用户分不清是「dct 没读到图」还是「发出去了但 agent 卡着」。
+            if app
+                .client()
+                .and_then(|c| c.call(Request::Input { id, text }))
+                .is_err()
+            {
+                app.message =
+                    Msg::err(crate::i18n::text(crate::i18n::Key::InputNotSent, app.lang).into());
+            }
+        }
+        // 剪贴板里是文字、是空的，都走这一条，而且**不是红字**：用户按了
+        // 一个键、什么都没发生，他需要的只是一句「这里没有图」。
+        Ok(None) => {
+            app.message = crate::i18n::text(crate::i18n::Key::NoImageInClipboard, app.lang).into()
+        }
+        Err(e) => {
+            app.message = Msg::err(
+                e.downcast_ref::<crate::proto::CodedError>()
+                    .map(|c| crate::i18n::msg::error(app.lang, &c.0))
+                    .unwrap_or_else(|| e.to_string()),
+            )
+        }
+    }
+}
+
+/// 一条路径怎么写进 agent 的输入框。
+///
+/// 带空格就加双引号：用户名里有空格的机器上，临时目录就是
+/// `C:\Users\Li Ming\AppData\Local\Temp\dct-pastes\...`，不加引号的话 agent
+/// 只会看到半条路径，然后报一个「文件不存在」——而那半条路径看上去还挺
+/// 像样，用户很难反应过来问题出在空格上。
+///
+/// 尾巴上留一个空格：粘完图接着打字是常态（「这张图里的按钮为什么……」），
+/// 没有它两段会黏成一个词。
+pub(crate) fn path_as_input(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if s.contains(' ') {
+        format!("\"{s}\" ")
+    } else {
+        format!("{s} ")
+    }
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
@@ -404,6 +467,25 @@ mod tests {
             is_agent: true,
             tag: String::new(),
         }
+    }
+
+    /// 临时目录里的路径不带空格，这是常态。
+    #[test]
+    fn a_plain_path_goes_in_bare_with_one_trailing_space() {
+        assert_eq!(
+            path_as_input(Path::new("/tmp/dct-pastes/paste-1-0.png")),
+            "/tmp/dct-pastes/paste-1-0.png "
+        );
+    }
+
+    /// 用户名里有空格的 Windows 机器上，临时目录就是这个样子。不加引号的话
+    /// agent 只会看到 `C:\Users\Li` ——一条看着还挺像样的假路径。
+    #[test]
+    fn a_path_with_a_space_is_quoted() {
+        assert_eq!(
+            path_as_input(Path::new(r"C:\Users\Li Ming\Temp\paste-1-0.png")),
+            r#""C:\Users\Li Ming\Temp\paste-1-0.png" "#
+        );
     }
 
     fn attached_app() -> (App, tempfile::TempDir) {

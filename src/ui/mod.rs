@@ -3947,17 +3947,22 @@ mod tests {
         }
     }
 
-    /// 会话视图里唯一能进复制模式的入口就是 `F4`——`?` 浮层打不开（附加
-    /// 视图里所有键都转发给 agent），提示本身要等 `copy_mode` 已经是真的
-    /// 才会画出来。`idle_help` 的 `View::Attached` 分支必须把 `F4` 写在
-    /// 底栏上，用户才有地方看到这个键存在。
+    /// 会话视图里有两个键**不写在底栏上就等于不存在**：`F4`（唯一能进复制
+    /// 模式的入口）和 `F5`（唯一能把剪贴板里的图交给 agent 的入口）。这一层
+    /// 按 `?` 打不开浮层（附加视图里所有键都转发给 agent），复制模式那句提示
+    /// 还要等 `copy_mode` 已经是真的才画得出来——底栏是它们唯一的露面机会。
+    ///
+    /// `F3` 不在这条守卫里，是**故意**的：三条里只有它是快捷方式（退回看板
+    /// 再进另一个会话是等价的两步），所以 `idle_help` 把它排在最先被丢的位置，
+    /// 60 列那一档它确实会让出去。理由写在 `idle_help` 的 `View::Attached`
+    /// 分支上。
     ///
     /// 两个宽度都要测，不能只测 80：`fit_help` 是按预算从前面**丢**的，
-    /// 60 列这一档右段落到 `ACTION_MIN_COLS`（28）——`F3`+`F4` 在这个地板上
-    /// 挤不挤得下，只有真的在这个宽度画一遍才知道；只测 80 列的话，`F4`
+    /// 60 列这一档右段落到 `ACTION_MIN_COLS`（28）——两条在这个地板上挤不挤
+    /// 得下，只有真的在这个宽度画一遍才知道；只测 80 列的话，`F4`/`F5`
     /// 在窄终端上被 `fit_help` 悄悄丢掉的回归会一路绿灯漏过去。
     #[test]
-    fn attached_view_bar_keeps_both_f3_and_f4_at_eighty_and_sixty_columns() {
+    fn attached_view_bar_keeps_both_f4_and_f5_at_eighty_and_sixty_columns() {
         use ratatui::backend::TestBackend;
 
         for width in [80u16, 60u16] {
@@ -3969,8 +3974,8 @@ mod tests {
 
                 let bar = bar_text(&term);
                 assert!(
-                    bar.contains("F3"),
-                    "{width} 列 {lang:?} 下 F3（下一个会话）不见了：{bar}"
+                    bar.contains("F5"),
+                    "{width} 列 {lang:?} 下 F5 不见了——这是这一层唯一能粘贴图片的入口：{bar}"
                 );
                 assert!(
                     bar.contains("F4"),
