@@ -91,6 +91,12 @@ fn run_ui() -> Result<()> {
         std::env::var(k).ok()
     });
 
+    // 下面两句问答都用 `read_line`，而它要求终端处于行输入模式。上一个 dct
+    // 如果是被硬杀掉的（任务管理器、`kill -9`、崩溃），终端会停在 raw mode
+    // 里——那时候按 `y` 不回显、回车发的是 `\r`，`read_line` 等一个永远不来
+    // 的换行，用户看到的是「问了我却不理我」。先把模式摆正，见 `sys::term`。
+    dct::sys::term::ensure_line_mode();
+
     if Client::connect(&sock).is_err() {
         // 真的要拉起一个全新的守护进程之前问一次：上次它带着这些会话被
         // 关掉过，要不要把它们接回来。放在这里而不是让守护进程自己问——
