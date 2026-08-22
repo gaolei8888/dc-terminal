@@ -30,6 +30,22 @@ pub fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
     cmd.spawn()
 }
 
+/// 别让这个子进程弹出控制台窗口。
+///
+/// 守护进程自己是 `DETACHED_PROCESS` 起来的（见上），也就是**它没有控制台**。
+/// 而 Windows 上一个没有控制台的进程去起一个控制台程序时，内核会替那个孩子
+/// 新开一个控制台——连着窗口。于是每发一条消息，检查点那几次 `git.exe` 就在
+/// 屏幕上闪几个黑框。`CREATE_NO_WINDOW` 是「给它控制台，但别给窗口」那一句。
+///
+/// 凡是守护进程会起的短命子进程都得加上这个：git、走 CLI 的那个模型后端。
+/// pty 里的 agent 不在此列——那条路走 ConPTY，伪控制台本来就没有窗口。
+///
+/// Unix 上没有这个概念，是空操作。
+pub fn no_console(cmd: &mut Command) -> &mut Command {
+    imp::no_console(cmd);
+    cmd
+}
+
 /// 这个进程还在不在。
 pub fn alive(pid: u32) -> bool {
     imp::alive(pid)
@@ -64,6 +80,8 @@ mod imp {
         }
     }
 
+    pub fn no_console(_cmd: &mut Command) {}
+
     pub fn alive(pid: u32) -> bool {
         // 0 号信号不发信号，只问「这个进程还在不在」。
         unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -84,7 +102,7 @@ mod imp {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
-        DETACHED_PROCESS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
 
     /// `GetExitCodeProcess` 用来表示「还在跑」的那个值。它同时是一个**合法的
@@ -98,6 +116,11 @@ mod imp {
         // CREATE_NEW_PROCESS_GROUP 一起加：不然它会跟着调用者收到 Ctrl+C，
         // 而「按 Ctrl+C 退出界面」不该顺手打断后台的会话。
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    pub fn no_console(cmd: &mut Command) {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
     /// 句柄拿不到就当它不在了。拿不到的常见原因正是「这个 pid 已经没了」；

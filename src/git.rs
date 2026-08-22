@@ -10,10 +10,19 @@ pub struct FileStat {
     pub removed: usize,
 }
 
+/// 所有 git 调用的唯一出口。**`no_console` 必须走这里**：检查点是守护进程
+/// 干的，而守护进程没有控制台，少了那一句每敲一次回车 Windows 就闪一排黑
+/// 窗口（理由写在 `sys::proc::no_console`）。
+fn cmd(dir: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.current_dir(dir);
+    crate::sys::proc::no_console(&mut c);
+    c
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let out = cmd(dir)
         .args(args)
-        .current_dir(dir)
         .output()
         .with_context(|| format!("执行 git {args:?} 失败"))?;
     if !out.status.success() {
@@ -25,12 +34,12 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(dir);
+    let mut c = cmd(dir);
+    c.args(args);
     for (k, v) in env {
-        cmd.env(k, v);
+        c.env(k, v);
     }
-    let out = cmd
+    let out = c
         .output()
         .with_context(|| format!("执行 git {args:?} 失败"))?;
     if !out.status.success() {
@@ -40,9 +49,8 @@ fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
 }
 
 pub fn is_repo(dir: &Path) -> bool {
-    Command::new("git")
+    cmd(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(dir)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

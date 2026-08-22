@@ -863,10 +863,10 @@ fn open_url(url: &str) -> bool {
         // 中间那个空字符串是 `start` 的「窗口标题」参数：不给的话，一个
         // 带引号的网址会被 start 当成标题，于是什么都不打开。
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
-        std::process::Command::new(comspec)
-            .args(["/c", "start", "", url])
-            .spawn()
-            .is_ok()
+        let mut c = std::process::Command::new(comspec);
+        // 界面是全屏 alt-screen，cmd.exe 继承同一个控制台会把窗口糊花。
+        crate::sys::proc::no_console(&mut c);
+        c.args(["/c", "start", "", url]).spawn().is_ok()
     }
     #[cfg(not(windows))]
     {

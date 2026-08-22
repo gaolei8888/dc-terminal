@@ -59,7 +59,11 @@ fn run_real(cmd: &[String], input: &str, env: &BTreeMap<String, String>) -> Resu
     // 少了这一句，会话自动起名这类走 CLI 的功能在 Windows 上永远静默失败。
     let cmd = crate::sys::shell::launch_argv(cmd);
     let (head, rest) = cmd.split_first().ok_or_else(|| "空命令".to_string())?;
-    let mut child = std::process::Command::new(head)
+    let mut c = std::process::Command::new(head);
+    // 这条路也是守护进程走的（自动起名之类），同样不能弹窗口——
+    // 理由见 `sys::proc::no_console`。
+    crate::sys::proc::no_console(&mut c);
+    let mut child = c
         .args(rest)
         .envs(env)
         .stdin(std::process::Stdio::piped())
