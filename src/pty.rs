@@ -15,12 +15,42 @@ use std::sync::{Arc, Mutex};
 ///
 /// 只列这一类身份标记。凭据（`ANTHROPIC_API_KEY` 之流）和登录态一律不动：
 /// 那是「agent 能不能干活」，跟「它以为自己是谁」是两回事。
+///
+/// 名单不是照着文档抄的，是**从一个真在跑的守护进程的环境块里读出来的**
+/// ——它当时已经活了半天，手上攥着的正是下面这些。其中
+/// `CLAUDE_CODE_MESSAGING_*` 那一对值得单说：它们是一条**还通着的**
+/// 本地 IPC 管道加上进它的令牌，指回当初拉起守护进程的那个 Claude Code
+/// 会话。传给一个新 agent 有两重错——身份是假的，而且白送出去一把它
+/// 完全用不上的钥匙。摘掉它不属于「凭据不动」那一条：那条说的是**这个**
+/// agent 自己干活要用的东西，这一对不是。
 const INHERITED_SESSION_MARKERS: &[&str] = &[
+    "AI_AGENT",
     "CLAUDECODE",
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_PID",
 ];
+
+/// 同样要摘掉的还有继承来的**显示假设**。来源和上面那组是同一个，东西不是
+/// 同一件：那组说的是「你是谁」，这组说的是「你待的地方什么都显示不出来」。
+///
+/// Claude Code 给自己的每个子进程设 `NO_COLOR=1`，而守护进程常常正是从那里
+/// 被拉起来的（用户在 Claude Code 里敲 `dct`），它一活好几天，这一个值就跟着
+/// 传给之后每一个新会话。
+///
+/// 传过去是假的：agent 跑在 dct 自己开的 pty 里，那是一块真屏幕，颜色一路
+/// 完整地到得了界面（`screen_spans` 三种色都保留：16 色、256 色、24 位真彩，
+/// Windows 上穿过 ConPTY 也一样）。留着它，claude / codex 这些 CLI 会主动
+/// 放弃上色，整个会话退成一片单色——**看上去像 dct 把颜色弄丢了，其实是
+/// agent 压根没上色**。
+///
+/// 真想要不上色的 agent，在 profile 的 `env` 里把 `NO_COLOR` 显式写回去：
+/// 摘除在前、profile 在后，写回来的那一份说了算（见 `spawn`）。
+const INHERITED_DISPLAY_ASSUMPTIONS: &[&str] = &["NO_COLOR"];
 
 /// 终端颜色。跟 vt100 的表示一一对应，额外实现序列化好走协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -136,9 +166,13 @@ impl PtySession {
         }
         builder.cwd(cwd);
 
-        // 先摘掉「我正跑在别的 agent 会话里」这类标记，再加 profile 自己的环境
-        // （顺序不能反：profile 想显式设回某一个，得说了算）。
-        for k in INHERITED_SESSION_MARKERS {
+        // 先摘掉「我正跑在别的 agent 会话里」这类标记和它顺带带来的显示假设，
+        // 再加 profile 自己的环境（顺序不能反：profile 想显式设回某一个，
+        // 得说了算）。
+        for k in INHERITED_SESSION_MARKERS
+            .iter()
+            .chain(INHERITED_DISPLAY_ASSUMPTIONS)
+        {
             builder.env_remove(k);
         }
 
@@ -703,6 +737,85 @@ mod tests {
             80,
         )
         .unwrap()
+    }
+
+    /// 名单上的每一个都得真的被摘掉。脚本是从常量本身生成的——以后往
+    /// 名单里加一个，这条测试自动跟着覆盖，不会出现「加了但没接上」。
+    ///
+    /// 进程级环境的注意事项同下面那条。
+    #[test]
+    fn a_new_agent_does_not_inherit_session_markers() {
+        for k in INHERITED_SESSION_MARKERS {
+            std::env::set_var(k, "leaked");
+        }
+        let refs: String = INHERITED_SESSION_MARKERS
+            .iter()
+            .map(|k| format!("${k}"))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let p = PtySession::spawn(
+            &crate::sys::testing::sh_c(&format!("echo \"markers=[{refs}]\"; sleep 5")),
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(
+            wait_for(&p, "markers=[]"),
+            "会话标记必须在起 agent 之前全部摘掉，屏幕上是：{}",
+            p.screen_text()
+        );
+    }
+
+    /// agent 起来的时候手上不能还攥着 `NO_COLOR`：守护进程多半是从另一个
+    /// agent 会话里被拉起来的，那边设了这个值，传下来就会让每个新会话的
+    /// CLI 主动放弃上色。见 `INHERITED_DISPLAY_ASSUMPTIONS`。
+    ///
+    /// **这条测试改的是进程级的环境**（`env` 参数只能加不能减，摘除发生在
+    /// 继承那一步，绕不过去）。并行跑的别的测试因此可能也看到 `NO_COLOR`，
+    /// 没有一条测试会因为它变红——它只影响子进程上不上色，而其余夹具都是
+    /// `sh` 脚本，本来就不上色。
+    #[test]
+    fn a_new_agent_does_not_inherit_no_color() {
+        std::env::set_var("NO_COLOR", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let p = PtySession::spawn(
+            &crate::sys::testing::sh_c("echo \"no-color=[$NO_COLOR]\"; sleep 5"),
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(
+            wait_for(&p, "no-color=[]"),
+            "NO_COLOR 必须在起 agent 之前被摘掉，屏幕上是：{}",
+            p.screen_text()
+        );
+    }
+
+    /// 反过来的另一半：profile 显式写回来的那一份必须赢。摘除在前、profile
+    /// 在后，这个顺序就是「用户说了算」的全部实现。
+    #[test]
+    fn a_profile_can_put_no_color_back() {
+        std::env::set_var("NO_COLOR", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("NO_COLOR".to_string(), "1".to_string());
+        let p = PtySession::spawn(
+            &crate::sys::testing::sh_c("echo \"no-color=[$NO_COLOR]\"; sleep 5"),
+            &env,
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(
+            wait_for(&p, "no-color=[1]"),
+            "profile 里写死的 NO_COLOR 该照旧生效，屏幕上是：{}",
+            p.screen_text()
+        );
     }
 
     #[test]
