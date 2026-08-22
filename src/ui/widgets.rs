@@ -205,9 +205,16 @@ pub(crate) fn session_label(s: &crate::session::SessionInfo) -> &str {
 
 /// 把 $HOME 缩成 ~，界面上路径太长会被裁掉。
 pub(crate) fn short_path(p: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
-        _ => p.to_string(),
+    match crate::sys::home() {
+        Some(h) => {
+            let h = h.to_string_lossy();
+            if !h.is_empty() && p.starts_with(h.as_ref()) {
+                format!("~{}", &p[h.len()..])
+            } else {
+                p.to_string()
+            }
+        }
+        None => p.to_string(),
     }
 }
 

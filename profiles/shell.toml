@@ -1,5 +1,8 @@
 name = "shell"
-command = ["/bin/zsh"]
+# 这一行只是兜底：`Profile::builtin` 会把它换成 `login_shell()` 查出来的那个
+# shell（先 `$SHELL`，再 bash/zsh/sh）。写死哪一个都会在某类机器上落空——
+# macOS 有 /bin/zsh，Ubuntu 默认没有——所以这里留任何 Unix 上都在的那一个。
+command = ["/bin/sh"]
 is_agent = false
 
 [label]

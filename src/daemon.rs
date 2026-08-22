@@ -1,7 +1,5 @@
 use anyhow::Result;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,16 +33,10 @@ pub fn run(socket: &Path) -> Result<()> {
 /// （见 `session.rs` 的注释），各方法自己负责该锁多细的粒度。如果外面再套一把大锁，
 /// 就白做了那些细粒度设计——一个连接处理慢请求时又会把其它连接一起卡住。
 pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
-    // 权限必须收紧到只有属主可访问。这个 socket 能开会话、能往会话里发任意
-    // 输入——谁连得上，谁就能在这台机器上以你的身份执行任意命令。默认的 0755
-    // 意味着同机器的其它账号都能连。
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let _ = std::fs::remove_file(socket);
-    let listener = UnixListener::bind(socket)?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    // 建 socket、收紧权限、（Windows 上）留下 pid 文件，都在这一步里——
+    // 「谁连得上谁就能以你的身份执行任意命令」，那道门的全部细节和它在
+    // 两个平台上各能挡住什么，写在 `sys::ipc::bind_private`。
+    let listener = crate::sys::ipc::bind_private(socket)?;
 
     // 存放位置跟着 socket 走，测试把 socket 放临时目录就自动隔离，
     // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml / ~/.dct/profiles/。
@@ -462,7 +454,7 @@ fn startup_oauth(name: &str) -> Option<crate::llm::creds::Borrowed> {
 
 #[allow(clippy::too_many_arguments)]
 fn serve(
-    stream: UnixStream,
+    stream: crate::sys::ipc::Stream,
     mgr: Arc<SessionManager>,
     store: Arc<Mutex<Store>>,
     secrets: Arc<Mutex<SecretStore>>,
@@ -1013,14 +1005,14 @@ mod tests {
         let proj = tmp.path().join("proj");
         std::fs::create_dir(&proj).unwrap();
 
-        let probe = Profile::from_toml(
+        let probe = Profile::from_toml(&crate::sys::testing::toml_with_sh(
             r#"
             name = "resume-probe"
             command = ["/bin/sh", "-c", "printf 'ARGS=[%s]\n' \"$*\"; sleep 5", "--"]
             is_agent = false
             resume_args = ["marker-arg"]
             "#,
-        )
+        ))
         .unwrap();
         let all = vec![probe];
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
@@ -1063,7 +1055,7 @@ mod tests {
     fn fake_agent() -> Profile {
         Profile {
             name: "daemon-lock-fake".into(),
-            command: vec!["cat".into()],
+            command: vec![crate::sys::testing::tool("cat")],
             is_agent: true,
             idle_pattern: None,
             busy_pattern: None,
@@ -1263,7 +1255,7 @@ mod tests {
     fn failing_agent() -> Profile {
         Profile {
             name: "daemon-explain-fake".into(),
-            command: vec!["/bin/sh".into(), "-c".into(), "echo BOOM; sleep 5".into()],
+            command: crate::sys::testing::sh_c("echo BOOM; sleep 5"),
             is_agent: true,
             idle_pattern: None,
             busy_pattern: None,
@@ -1890,7 +1882,7 @@ mod tests {
     fn plain_shell() -> Profile {
         Profile {
             name: "daemon-wire-fake".into(),
-            command: vec!["cat".into()],
+            command: vec![crate::sys::testing::tool("cat")],
             is_agent: false,
             idle_pattern: None,
             busy_pattern: None,

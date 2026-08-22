@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::proto::{Request, Response};
+use crate::sys::ipc::Stream;
 
 /// 读超时：TUI 主循环在 `term.draw` 之前会先发 `List`，守护进程一卡住整个界面
 /// 就会跟着冻结，连 `q` 都按不动。5 秒对正常操作留了充分余量。
@@ -22,11 +22,17 @@ pub fn restart_daemon(socket: &Path, exe: &Path) -> Result<()> {
         .and_then(|c| c.peer_pid())
         .ok_or_else(|| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
 
-    // SIGTERM 先：守护进程自己会把 pty 收拾干净。给两秒，还赖着就 SIGKILL。
-    unsafe { libc::kill(old as i32, libc::SIGTERM) };
+    // 先礼后兵：守护进程收到 SIGTERM 会自己把 pty 收拾干净。给两秒，
+    // 还赖着就硬来。
+    //
+    // **Windows 上没有「先礼」这一档**——`ask_to_stop` 在那边就是硬杀
+    // （见 `sys::proc` 开头）。这里的两段式于是退化成一段，代价写在
+    // 那个文件里：pty 子进程要靠 job object 兜底，而不是靠守护进程
+    // 自己收尾。
+    crate::sys::proc::ask_to_stop(old);
     let gone = wait_up_to(Duration::from_secs(2), || !process_alive(old));
     if !gone {
-        unsafe { libc::kill(old as i32, libc::SIGKILL) };
+        crate::sys::proc::hard_kill(old);
         wait_up_to(Duration::from_secs(2), || !process_alive(old));
     }
 
@@ -51,8 +57,9 @@ pub fn restart_daemon(socket: &Path, exe: &Path) -> Result<()> {
 
 /// 拉起一个守护进程，脱离当前终端。
 ///
-/// `setsid`：不这么做的话它跟 TUI 在同一个 session 里，关掉终端窗口时 SIGHUP
-/// 会把它一起带走——而「关掉窗口不影响会话」正是这个产品存在的理由。
+/// 「脱离」具体怎么做按平台分（`sys::proc::spawn_detached`）：Unix 上是
+/// `setsid`，Windows 上是 `DETACHED_PROCESS`。两边要的是同一件事——关掉
+/// 终端窗口不能把它一起带走，而那正是这个产品存在的理由。
 ///
 /// socket 路径显式传给子进程，不让它自己从 `HOME` 推：重启这条路上「换掉的是
 /// 哪个 socket」必须只有一个说法。
@@ -65,22 +72,12 @@ pub fn spawn_daemon(exe: &Path, socket: &Path) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    cmd.spawn()?;
+    crate::sys::proc::spawn_detached(&mut cmd)?;
     Ok(())
 }
 
 fn process_alive(pid: u32) -> bool {
-    // 0 号信号不发信号，只问「这个进程还在不在」。
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    crate::sys::proc::alive(pid)
 }
 
 fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -106,8 +103,8 @@ pub struct Client {
 }
 
 struct Conn {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
 }
 
 impl Client {
@@ -121,7 +118,7 @@ impl Client {
     }
 
     fn reconnect(&mut self) -> Result<()> {
-        let stream = UnixStream::connect(&self.socket)
+        let stream = Stream::connect(&self.socket)
             .map_err(|_| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
@@ -143,34 +140,14 @@ impl Client {
         }
     }
 
-    /// socket 那头那个进程的 pid，问内核要。
+    /// socket 那头那个进程的 pid。
     ///
     /// 不靠进程名匹配（旧守护进程可能是从完全不同的路径起的），也不靠守护
-    /// 进程自己配合（需要换掉的恰恰是那些老到不认识任何新请求的）。内核记着
-    /// 是谁 bind 的这个 socket，这是唯一一个不需要对面同意的问法。
-    #[cfg(target_os = "macos")]
+    /// 进程自己配合——需要换掉的恰恰是那些老到不认识任何新请求的。怎么问
+    /// 按平台分，各自能问到什么强度见 `sys::ipc::peer_pid_of`。
     pub fn peer_pid(&self) -> Option<u32> {
-        use std::os::unix::io::AsRawFd;
-        let fd = self.conn.as_ref()?.writer.as_raw_fd();
-        let mut pid: libc::pid_t = 0;
-        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERPID,
-                &mut pid as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        };
-        (rc == 0 && pid > 0).then_some(pid as u32)
-    }
-
-    /// 别的平台没实现。返回 `None` 的后果是 [`restart_daemon`] 认不出旧守护
-    /// 进程、于是拒绝动手——比拿一个猜出来的 pid 去 kill 强。
-    #[cfg(not(target_os = "macos"))]
-    pub fn peer_pid(&self) -> Option<u32> {
-        None
+        let stream = &self.conn.as_ref()?.writer;
+        crate::sys::ipc::peer_pid_of(stream, &self.socket)
     }
 
     pub fn call(&mut self, req: Request) -> Result<Response> {

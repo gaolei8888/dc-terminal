@@ -19,7 +19,38 @@ ratatui = "0.28"
 crossterm = "0.28"
 unicode-width = "0.1.14"
 libc = "0.2.189"
-ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# TLS 后端按平台分叉，这是唯一的分叉点——ureq 在只开 native-tls
+# 时会自己挑它做默认（ureq-2.12.1 lib.rs:415→ntls.rs:9），所以三处
+# AgentBuilder 一行都不用改。
+#
+# Unix 留 rustls。Windows 换 schannel 不是因为它更好，是因为 rustls 拖
+# 着 ring，而 ring 要 lib.exe——那东西只在 Visual Studio Build Tools 里，
+# 几个 GB 加一次管理员提权。摆在「装个 dct」前面就是劝退。去掉
+# ring 之后整棵依赖树一行 C 都没有，rustup 自带的链接器就足够。
+# 顺带的好处是走系统证书库，公司里那类中间人代理不用另外配。
+[target.'cfg(not(windows))'.dependencies]
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[target.'cfg(windows)'.dependencies]
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+]
+
+# 标准库不给 Windows 开 AF_UNIX 的口子，这个 crate 补上，形状跟
+# `std::os::unix::net` 一样。理由见 `sys::ipc`。
+[target.'cfg(windows)'.dependencies.uds_windows]
+version = "1.1"

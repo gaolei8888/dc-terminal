@@ -15,6 +15,12 @@
 //! 直接看 `ps` 报的进程状态里有没有 `Z`。断言我们自己的 `SessionState` 是没用的
 //! ——它在出 bug 的那一版里同样是 `Stopped`，一切看起来都对。
 
+//! **这一整个文件只在 Unix 上有意义**：僵尸进程是 Unix 特有的东西。父进程
+//! 不 `wait()` 就留一个尸体占着进程表项——而 Windows 上进程退出后留下的是
+//! 一个内核对象，最后一个句柄关掉它就没了，没有「必须收尸」这一步，也就
+//! 没有这条测试要防的那个泄漏（见 `sys::proc` 开头）。
+#![cfg(unix)]
+
 use std::time::{Duration, Instant};
 
 use dct::proto::{Request, Response};

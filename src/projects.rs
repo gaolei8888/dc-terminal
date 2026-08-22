@@ -339,7 +339,9 @@ mod tests {
     /// `…/我敲的名字`（一条符号链接）下次启动会显示成 `…/真实名字`，在
     /// macOS 上还会连父目录一起变成 `/private/var/…`——「canon 只用于比较、
     /// 永不用于显示」这条规矩在一次进程重启上就破了，而用户什么都没做。
+    /// 符号链接：Windows 上建它要开发者模式或管理员权限，摆不出这个现场。
     #[test]
+    #[cfg(unix)]
     fn a_pinned_project_keeps_the_users_spelling_across_a_reload() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("真实名字");

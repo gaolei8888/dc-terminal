@@ -7,12 +7,14 @@ use dct::profile::Profile;
 use dct::proto::{Request, Response};
 use dct::session::SessionManager;
 
+mod common;
+
 // 用 cat 冒充 agent：不依赖任何外部 CLI（不能用内置的 "claude" profile，那会真的把本机的
 // claude 可执行文件拉起来），能收输入、不会自己退出。
 fn fake_agent() -> Profile {
     Profile {
         name: "concurrency-fake".into(),
-        command: vec!["cat".into()],
+        command: vec![common::posix_tool("cat")],
         is_agent: true,
         idle_pattern: None,
         busy_pattern: None,

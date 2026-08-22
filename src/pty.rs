@@ -111,6 +111,12 @@ impl PtySession {
     ) -> Result<PtySession> {
         anyhow::ensure!(!cmd.is_empty(), "启动命令为空");
 
+        // profile 里写的是「用户认得的名字」（`claude`），这里换成「这台机器上
+        // 真正启动得起来的那条命令」。Unix 上这一步什么都不做；Windows 上它
+        // 是 `claude` → `cmd.exe /c C:/.../claude.cmd` 那次翻译，少了它菜单上
+        // 认得出的 agent 一个都起不来（见 `sys::shell::launch_argv`）。
+        let cmd = crate::sys::shell::launch_argv(cmd);
+
         let pty = NativePtySystem::default()
             .openpty(PtySize {
                 rows,
@@ -334,12 +340,10 @@ impl PtySession {
     pub fn kill_now(&mut self) -> Result<()> {
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pid) = child.process_id() {
-            // SAFETY: 只是给一个 pid 发信号。pid 来自我们自己 spawn 的子进程，
-            // 最坏情况是它已经退出、信号发给一个不存在的进程（返回 ESRCH，
-            // 下面的 wait 照样把尸体收掉）。
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+            // pid 来自我们自己 spawn 的子进程，最坏情况是它已经退出、这一下
+            // 打在一个不存在的进程上（Unix 返回 ESRCH，Windows 拿不到句柄），
+            // 两边都是无害的空操作，下面的 wait 照样把尸体收掉。
+            crate::sys::proc::hard_kill(pid);
         }
         let _ = child.wait();
         drop(child);
@@ -554,7 +558,7 @@ mod tests {
     fn captures_command_output() {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
-            &["echo".to_string(), "hello-dct".to_string()],
+            &[crate::sys::testing::tool("echo"), "hello-dct".to_string()],
             &Default::default(),
             dir.path(),
             24,
@@ -568,7 +572,7 @@ mod tests {
     fn writes_input_to_process() {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
-            &["cat".to_string()],
+            &[crate::sys::testing::tool("cat")],
             &Default::default(),
             dir.path(),
             24,
@@ -583,7 +587,7 @@ mod tests {
     fn reports_death() {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
-            &["true".to_string()],
+            &[crate::sys::testing::tool("true")],
             &Default::default(),
             dir.path(),
             24,
@@ -604,7 +608,7 @@ mod tests {
     fn kill_now_leaves_no_zombie() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = PtySession::spawn(
-            &["cat".to_string()],
+            &[crate::sys::testing::tool("cat")],
             &Default::default(),
             dir.path(),
             24,
@@ -616,11 +620,10 @@ mod tests {
         p.kill_now().unwrap();
         assert!(!p.is_alive(), "杀完就不该再报活着");
 
-        // 收干净了的话，这个 pid 已经不在进程表里——`kill(pid, 0)` 只探测
-        // 存在性，不真的发信号。僵尸仍然算「存在」，所以这条真的能分辨出
-        // 「杀了但没收尸」。
-        // SAFETY: 0 号信号不改变目标进程的任何状态，只做存在性检查。
-        let alive_in_table = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        // 收干净了的话，这个 pid 已经不在进程表里。Unix 上这是 `kill(pid, 0)`
+        // 的存在性探测，而僵尸仍然算「存在」——所以这条真的能分辨出「杀了但
+        // 没收尸」，那正是它要守的东西。
+        let alive_in_table = crate::sys::proc::alive(pid);
         assert!(!alive_in_table, "{pid} 还留在进程表里，说明没 wait 收尸");
     }
 
@@ -632,11 +635,7 @@ mod tests {
         env.insert("DCT_TEST_MARKER".to_string(), "看得见我".to_string());
 
         let p = PtySession::spawn(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo $DCT_TEST_MARKER; sleep 5".to_string(),
-            ],
+            &crate::sys::testing::sh_c("echo $DCT_TEST_MARKER; sleep 5"),
             &env,
             dir.path(),
             24,
@@ -650,12 +649,16 @@ mod tests {
         );
     }
 
+    /// `ps -o stat=` 是 Unix 的问法，Windows 上没有对应物（那边也没有
+    /// 僵尸进程这个概念——句柄关掉进程就没了）。这条测试守的是 Unix 的
+    /// 收尸路径，按平台跳过而不是改写。
     #[test]
+    #[cfg(unix)]
     fn drop_reaps_child_process() {
         let dir = tempfile::tempdir().unwrap();
         let pid = {
             let p = PtySession::spawn(
-                &["cat".to_string()],
+                &[crate::sys::testing::tool("cat")],
                 &Default::default(),
                 dir.path(),
                 24,
@@ -691,11 +694,9 @@ mod tests {
     /// 造一个吐 N 行然后挂着不退的会话
     fn spawn_lines(dir: &Path, n: usize) -> PtySession {
         PtySession::spawn(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                format!("i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done; sleep 30"),
-            ],
+            &crate::sys::testing::sh_c(&format!(
+                "i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done; sleep 30"
+            )),
             &Default::default(),
             dir,
             24,
@@ -775,13 +776,10 @@ mod tests {
     fn the_view_stays_put_when_new_output_arrives() {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
+            &crate::sys::testing::sh_c(
                 "i=1; while [ $i -le 60 ]; do echo line-$i; i=$((i+1)); done; \
-                 sleep 1; echo MARKER-NEW; sleep 30"
-                    .to_string(),
-            ],
+                 sleep 1; echo MARKER-NEW; sleep 30",
+            ),
             &Default::default(),
             dir.path(),
             24,
@@ -818,13 +816,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // ESC[?1049h 进备用屏，然后吐一堆行
         let p = PtySession::spawn(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
+            &crate::sys::testing::sh_c(
                 "printf '\\033[?1049h'; i=1; while [ $i -le 60 ]; do echo alt-$i; \
-                 i=$((i+1)); done; sleep 30"
-                    .to_string(),
-            ],
+                 i=$((i+1)); done; sleep 30",
+            ),
             &Default::default(),
             dir.path(),
             24,
@@ -845,13 +840,10 @@ mod tests {
     fn a_scroll_region_swallows_the_history() {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
+            &crate::sys::testing::sh_c(
                 "printf '\\033[1;20r'; i=1; while [ $i -le 60 ]; do echo rgn-$i; \
-                 i=$((i+1)); done; sleep 30"
-                    .to_string(),
-            ],
+                 i=$((i+1)); done; sleep 30",
+            ),
             &Default::default(),
             dir.path(),
             24,
@@ -859,7 +851,29 @@ mod tests {
         )
         .unwrap();
         assert!(wait_for(&p, "rgn-60"));
-        assert_eq!(p.scroll_state().max, 0);
+
+        // 这一条两个平台的答案不一样，而且**不一样是对的**。
+        //
+        // Unix 上我们读到的是程序写出来的原始字节流，DECSTBM 原样到达
+        // vt100，于是它照规矩不往 scrollback 里放东西——历史就是没有。
+        //
+        // Windows 上中间隔着 ConPTY：滚动区是 conhost 自己解释掉的，它按
+        // 那个区域算好版面，再把结果重新渲染成一串普通的输出发给我们。
+        // 我们这头的 vt100 从头到尾没见过 DECSTBM，看到的只是一行行普通
+        // 文字，于是历史照常攒下来。
+        //
+        // 对用户来说 Windows 这边反而更好（真的翻得动）。会因此在 Windows
+        // 上失灵的是「这个程序自己管画面，翻不了」那句提示的**这一个**触发
+        // 条件；另一个条件——备用屏——是照常穿透 ConPTY 的，见
+        // `an_alternate_screen_app_has_no_history_to_scroll`，那条在两个平台
+        // 上都绿。
+        #[cfg(unix)]
+        assert_eq!(p.scroll_state().max, 0, "设了滚动区就不该有历史");
+        #[cfg(windows)]
+        assert!(
+            p.scroll_state().max > 0,
+            "ConPTY 把滚动区解释掉了，我们这头该看到普通的历史"
+        );
     }
 
     #[test]
@@ -878,11 +892,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // ESC[?1000h 开鼠标上报，跟 Claude Code 实测抓到的一样
         let p = PtySession::spawn(
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf '\\033[?1000h'; echo mouse-on; sleep 30".to_string(),
-            ],
+            &crate::sys::testing::sh_c("printf '\\033[?1000h'; echo mouse-on; sleep 30"),
             &Default::default(),
             dir.path(),
             24,

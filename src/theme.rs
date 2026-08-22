@@ -10,8 +10,13 @@
 //! 一个写死的灰不可能同时适配深浅两种底色，所以这里让它跟着背景走。
 
 use ratatui::style::{Color, Modifier, Style};
+use std::time::Duration;
+// 只有 Unix 那份「问终端要背景色」的实现在用：Windows 上不问（见下面
+// `StdinReader` 的两份实现），一个字节都不写、也不等。
+#[cfg(unix)]
 use std::io::Write;
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::Instant;
 
 /// 终端背景的深浅。`Unknown` 不是错误状态，是一个一等公民：
 /// 探测不出来的终端照样要能正常显示，见 `dim()`。
@@ -147,6 +152,10 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(150);
 /// 判据里「末尾的 `c` 必须已经到齐」这一点是刻意的：回复可能被分成几次
 /// `read` 送来，参数段读了一半时这里返回 false，调用方继续读，不会把半条
 /// 回复当成读完。
+/// Windows 上没有调用方——那边不问终端（见 `StdinReader` 的 Windows 实现）。
+/// 留着而不是一起 `#[cfg(unix)]` 掉：它是一段纯解析，自己的单元测试在两个
+/// 平台上都跑得动，而哪天真去实现 Windows 那半边时，第一件要用的就是它。
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn contains_da1(bytes: &[u8]) -> bool {
     let mut i = 0usize;
     while i + 2 < bytes.len() {
@@ -206,6 +215,7 @@ pub(crate) trait ReplyReader {
 /// 就不成立了。下次动这段读循环之前，先想清楚这两条怎么办。
 pub(crate) struct StdinReader;
 
+#[cfg(unix)]
 impl ReplyReader for StdinReader {
     fn read_reply(&mut self, deadline: Duration) -> Vec<u8> {
         // stdin 不是 tty 时什么都别做。两个理由：一是不能拿 `libc::read` 去
@@ -274,9 +284,35 @@ impl ReplyReader for StdinReader {
     }
 }
 
+/// Windows 上**不问**，直接空手而归——于是 `detect_with` 落到下一级去。
+///
+/// 不是「还没做」，是这一步在 Windows 上的失败代价和 Unix 不一样。查询要
+/// 先把 `\x1b]11;?` 写进 stdout：Windows Terminal 认得，会照规矩答；而
+/// 老的 conhost（`cmd.exe` 直接开出来的那个窗口）不认，它会把这串控制符
+/// **当普通文本原样打在屏幕上**，用户看到的是启动时闪过一行乱码。
+///
+/// 光判断终端是哪一个还不够，读回复那一半更麻烦：Windows 的控制台输入
+/// 默认给的是按键事件而不是字节流，要拿到 VT 序列得先开
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT`，再做一次带超时的读。而这段读循环上面
+/// 那一大段注释讲的正是它读错时的后果——**把用户敲的键吃掉**。为一个
+/// 「猜背景色深浅」的尽力而为的功能，在另一个平台上重新打开一次那个洞，
+/// 不值得。
+///
+/// 代价是明确的、也是有出口的：Windows 上背景色判定停在 `Theme::Unknown`，
+/// 而 `Unknown` 按设计就是能用的那一档（只用 DIM，不写死任何前景色，见
+/// `unknown_never_pins_a_foreground_color`）。用户想要准确的深浅，设
+/// `DCT_THEME` 一句话说了算，那是第 1 级、优先级还更高。
+#[cfg(windows)]
+impl ReplyReader for StdinReader {
+    fn read_reply(&mut self, _deadline: Duration) -> Vec<u8> {
+        Vec::new()
+    }
+}
+
 /// stdin 在 `timeout` 内是否可读。`poll(2)` 而不是起线程去阻塞读：
 /// 那个线程超时后仍卡在 `read` 上，之后会跟事件循环抢 stdin，把用户的
 /// 按键吃掉——一个只在「终端不答 OSC 11」时才发作的偷键 bug。
+#[cfg(unix)]
 fn stdin_is_readable(timeout: Duration) -> bool {
     let mut fd = libc::pollfd {
         fd: libc::STDIN_FILENO,

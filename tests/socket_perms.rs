@@ -1,6 +1,12 @@
 //! socket 能开会话、能往会话里发任意输入——谁连得上，谁就能以你的身份
 //! 在这台机器上执行任意命令。所以目录和 socket 都必须只有属主可访问。
 
+//! **这一整个文件只在 Unix 上有意义**：它验的是权限位这个机制本身。
+//! Windows 上同一道门是目录的 ACL，而且拦人的位置也不同（AF_UNIX 在那边
+//! connect 时不校验文件权限）——不同的机制要另写一组断言，硬套 0600 只会
+//! 得到一条永远红的测试。理由的全文在 `sys::ipc` 的 `after_bind`。
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::thread::sleep;

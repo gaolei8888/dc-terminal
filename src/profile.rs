@@ -159,7 +159,16 @@ impl Profile {
             "shell" => SHELL,
             _ => return None,
         };
-        Some(Profile::from_toml(src).expect("内置 profile 必须能解析"))
+        let mut p = Profile::from_toml(src).expect("内置 profile 必须能解析");
+        // `shell` 要跑哪个 shell 编译期定不下来：TOML 里写死任何一个都会在
+        // 某类机器上落空（macOS 有 /bin/zsh，Ubuntu 默认没有），而落空的后果
+        // 不是「换一个 shell 跑」，是「命令行」整行被标成没安装、按下去只剩
+        // 一句找不到。它偏偏是唯一 `is_agent = false` 的内置 profile——在不是
+        // git 仓库的目录里，别的八项全被 `NotAGitRepo` 挡住，它是仅剩的那一项。
+        if p.name == "shell" {
+            p.command = vec![login_shell()];
+        }
+        Some(p)
     }
 
     /// 返回顺序就是菜单顺序：先独立 CLI，再 API 形态，命令行垫底。
@@ -370,27 +379,22 @@ pub enum ProfileStatus {
     },
 }
 
+/// 内置 `shell` profile 真正要跑的那个 shell。按平台分（`sys::shell`）：
+/// Unix 上是 `$SHELL` 或 bash/zsh/sh，Windows 上是 PowerShell 或 cmd.exe。
+fn login_shell() -> String {
+    crate::sys::shell::login_shell()
+}
+
 /// `cmd` 能不能执行。带斜杠当路径查，否则遍历 PATH。
 ///
 /// **这个判断必须和实际 spawn 用同一个环境**，所以只能在守护进程里调用——
 /// 界面进程的 PATH 可能不一样，那会导致「菜单说能用，一开就失败」。
+/// 真正的实现按平台分在 `sys::fs`——「能执行」这件事两个系统的说法差得远：
+/// Unix 看权限位，Windows 看扩展名，而且用户敲的 `claude` 和磁盘上的
+/// `claude.cmd` 根本不是同一个字符串。这个名字留在这里不动，是因为
+/// `status_of` 和一串测试都按它的形状写的。
 pub fn command_exists(cmd: &str) -> bool {
-    fn is_exec(p: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-
-    if cmd.contains('/') {
-        return is_exec(Path::new(cmd));
-    }
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    path.split(':')
-        .filter(|d| !d.is_empty())
-        .any(|d| is_exec(&Path::new(d).join(cmd)))
+    crate::sys::fs::command_exists(cmd)
 }
 
 /// `command[0]` 这个命令「归谁所有」——名字和命令名相同的那个 profile。
@@ -514,15 +518,23 @@ mod tests {
     }
 
     #[test]
-    fn command_exists_finds_sh_and_not_a_made_up_name() {
-        assert!(command_exists("sh"), "PATH 上一定有 sh");
+    fn command_exists_finds_a_real_command_and_not_a_made_up_name() {
+        // 不写死 `sh`：Windows 上没有它。当前测试二进制一定在 PATH 之外，
+        // 所以这里问的是「本机的登录 shell」——那是两个平台上都一定存在、
+        // 而且一定叫得出名字的东西。
+        let shell = crate::sys::shell::login_shell();
+        assert!(command_exists(&shell), "本机的登录 shell 该找得到：{shell}");
         assert!(!command_exists("dct-绝对没有这个命令-x9"));
     }
 
     #[test]
     fn command_exists_handles_absolute_paths() {
-        assert!(command_exists("/bin/sh"));
-        assert!(!command_exists("/bin/根本没有这个"));
+        // 当前测试二进制：绝对路径、一定存在、一定可执行，两个平台通用。
+        let me = std::env::current_exe().unwrap();
+        assert!(command_exists(&me.to_string_lossy()));
+        assert!(!command_exists(
+            &me.with_file_name("根本没有这个").to_string_lossy()
+        ));
     }
 
     #[test]
@@ -555,6 +567,17 @@ mod tests {
         let p = Profile::builtin("shell").unwrap();
         assert!(!p.is_agent);
         assert!(p.idle_pattern.is_none());
+    }
+
+    /// 「命令行」这一项必须指着本机真的能起来的那个 shell。写死 `/bin/zsh`
+    /// 的那一版在 Ubuntu 上整行是灰的（Windows 走 WSL 之后这就是默认发行版），
+    /// 而它是唯一 `is_agent = false` 的内置项——它一灰，在不是 git 仓库的
+    /// 目录里九项就一项都开不了，dct 整个看上去是坏的。
+    #[test]
+    fn the_shell_profile_points_at_a_shell_that_exists_here() {
+        let p = Profile::builtin("shell").unwrap();
+        let cmd = &p.command[0];
+        assert!(command_exists(cmd), "命令行指向 {cmd}，本机起不来");
     }
 
     #[test]

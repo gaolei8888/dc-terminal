@@ -1644,7 +1644,7 @@ mod tests {
     fn fake_agent() -> Profile {
         Profile {
             name: "fake".into(),
-            command: vec!["cat".into()],
+            command: vec![crate::sys::testing::tool("cat")],
             is_agent: true,
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
@@ -1666,7 +1666,7 @@ mod tests {
     fn failing_agent() -> Profile {
         Profile {
             name: "failing".into(),
-            command: vec!["/bin/sh".into(), "-c".into(), "echo BOOM; sleep 5".into()],
+            command: crate::sys::testing::sh_c("echo BOOM; sleep 5"),
             is_agent: true,
             idle_pattern: None,
             busy_pattern: None,
@@ -1692,11 +1692,7 @@ mod tests {
     fn finishing_agent() -> Profile {
         Profile {
             name: "finishing".into(),
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep 0.2; echo READY; sleep 30".into(),
-            ],
+            command: crate::sys::testing::sh_c("sleep 0.2; echo READY; sleep 30"),
             is_agent: true,
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
@@ -1720,7 +1716,7 @@ mod tests {
     fn busy_only_agent() -> Profile {
         Profile {
             name: "busy-only".into(),
-            command: vec!["cat".into()],
+            command: vec![crate::sys::testing::tool("cat")],
             is_agent: true,
             idle_pattern: None,
             busy_pattern: Some("esc to interrupt".into()),
@@ -2417,7 +2413,24 @@ mod tests {
     /// 一段：`cat` 要等脚本走完 BOOM → 清屏 → READY 才会真正开始读、
     /// 回显用户排在队列里的那句话，所以恢复那一刻的屏幕尾巴里还没有它，
     /// 真正干完一轮活之后的屏幕尾巴里才有。
+    ///
+    /// **Windows 上摆不出这个现场，而原因值得记下来。** 实测（ConPTY，
+    /// 状态序列打点）拿到的是 `Working → Failed → Working → Idle`：中间
+    /// 多出来的那个 `Working` 是清屏造成的。上面那句「清屏和打 READY 要在
+    /// 同一次 write 里」在 Unix 上够用——字节流原样到达，一次 tick 看到的
+    /// 是清完屏且 READY 已经在屏上的样子；ConPTY 不转发字节，它自己解释、
+    /// 自己重绘，清屏和随后的 READY 落在两次渲染里，中间那一瞬两个 pattern
+    /// 都不匹配，于是状态回到 `Working`，`was == Working` 这道闸就被顶开了。
+    ///
+    /// 也就是说这道闸在 Windows 上确实更松：崩过一次又恢复的会话，可能被
+    /// 按恢复画面起名（拿到「READY」这种没信息的名字），而不是按真正干完的
+    /// 那一轮。后果只到名字为止，不丢任何东西。
+    ///
+    /// 要真治，得把判据从「上一个状态」换成「自上次输入以来有没有失败过」，
+    /// 那是改起名的行为，不属于这次移植——而且同一个洞在 Unix 上也不是不能
+    /// 发作：真实 agent 的清屏和后续输出本来就没有「同一次 write」的保证。
     #[test]
+    #[cfg(unix)]
     fn recovering_from_a_failure_after_real_input_still_does_not_count() {
         struct ByScreenTail;
         impl crate::llm::Backend for ByScreenTail {
@@ -2461,11 +2474,9 @@ mod tests {
             //   「真起名」的判据就被冲没了。
             // 两处都是同一个思路：给状态转换留出一个测得准的窗口，
             // 不靠运气——跟上一条测试解决 split-write 那个 flake 一样。
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "echo BOOM; sleep 1; printf '\\033[2J\\033[HREADY\\n'; sleep 0.5; cat".into(),
-            ],
+            command: crate::sys::testing::sh_c(
+                "echo BOOM; sleep 1; printf '\\033[2J\\033[HREADY\\n'; sleep 0.5; cat",
+            ),
             is_agent: true,
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
@@ -2616,14 +2627,13 @@ mod tests {
         // `busy_pattern_marks_working_then_idle`：`clear` 把 BOOM 从可见屏幕
         // 上抹掉，error_re 才会真的不再匹配），再 BOOM 一次（第二次失败）。
         mgr.register_profile(
-            Profile::from_toml(
-                r#"
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
                 name = "flaky"
                 command = ["/bin/sh", "-c", "echo BOOM; sleep 0.3; clear; echo READY; sleep 0.3; echo BOOM; sleep 5"]
                 is_agent = false
                 idle_pattern = "READY"
                 error_pattern = "BOOM"
-                "#,
+                "#),
             )
             .unwrap(),
         );
@@ -2824,14 +2834,13 @@ mod tests {
         // 先等出一次 Idle 是为了逼 tick() 真正算过一次——否则这条测试
         // 可能只是撞上了某个默认值（同 busy_pattern_wins_over_idle_pattern）。
         mgr.register_profile(
-            Profile::from_toml(
-                r#"
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
                 name = "boom"
                 command = ["/bin/sh", "-c", "echo READY; sleep 1; echo 'API Error: closed'; sleep 5"]
                 is_agent = false
                 idle_pattern = "READY"
                 error_pattern = "API Error"
-                "#,
+                "#),
             )
             .unwrap(),
         );
@@ -2871,14 +2880,14 @@ mod tests {
         std::fs::create_dir(&proj).unwrap();
         let mgr = SessionManager::new();
         mgr.register_profile(
-            Profile::from_toml(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
                 r#"
                 name = "quiet"
                 command = ["/bin/sh", "-c", "echo 'API Error: closed'; echo READY; sleep 5"]
                 is_agent = false
                 idle_pattern = "READY"
                 "#,
-            )
+            ))
             .unwrap(),
         );
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
@@ -3015,7 +3024,7 @@ mod tests {
         let m = SessionManager::new();
         let mut exits = fake_agent();
         // 立刻退出的命令：模拟 agent 自己结束，而不是被 stop() 杀掉
-        exits.command = vec!["true".into()];
+        exits.command = vec![crate::sys::testing::tool("true")];
         exits.idle_pattern = None;
         m.register_profile(exits);
         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
@@ -3080,12 +3089,11 @@ mod tests {
 
         let mgr = SessionManager::new();
         mgr.register_profile(
-            Profile::from_toml(
-                r#"
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
             name = "fake-agent"
             command = ["/bin/sh", "-c", "echo MARK=[$CLAUDE_CODE_CHILD_SESSION] HOME=[$HOME]; sleep 5"]
             is_agent = false
-            "#,
+            "#),
             )
             .unwrap(),
         );
@@ -3123,7 +3131,7 @@ mod tests {
 
         let mgr = SessionManager::new();
         mgr.register_profile(
-            Profile::from_toml(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
                 r#"
             name = "fake-api"
             command = ["/bin/sh", "-c", "echo TOKEN=$MY_TOKEN BASE=$MY_BASE; sleep 5"]
@@ -3135,7 +3143,7 @@ mod tests {
             [secret]
             env = "MY_TOKEN"
             "#,
-            )
+            ))
             .unwrap(),
         );
 
@@ -3170,7 +3178,7 @@ mod tests {
 
         let mgr = SessionManager::new();
         mgr.register_profile(
-            Profile::from_toml(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
                 r#"
             name = "fake-api"
             command = ["/bin/sh", "-c", "sleep 5"]
@@ -3179,7 +3187,7 @@ mod tests {
             [secret]
             env = "MY_TOKEN"
             "#,
-            )
+            ))
             .unwrap(),
         );
 
@@ -3195,14 +3203,14 @@ mod tests {
     /// 用 `sh -c '... "$@"' --` 当探针：命令行最后追加的参数会变成 `$@`，
     /// 原样打到屏幕上。`resume = false` 时不该多出这一截。
     fn resume_probe_profile() -> Profile {
-        Profile::from_toml(
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
             r#"
             name = "resume-probe"
             command = ["/bin/sh", "-c", "printf 'ARGS=[%s]\n' \"$*\"; sleep 5", "--"]
             is_agent = false
             resume_args = ["marker-arg"]
             "#,
-        )
+        ))
         .unwrap()
     }
 
@@ -3459,13 +3467,12 @@ mod tests {
         let sock = tmp.path().join("daemon.sock");
         let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
 
-        let flickering = Profile::from_toml(
-            r#"
+        let flickering = Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
             name = "flickering"
             command = ["/bin/sh", "-c", 'while true; do printf "\033[2J\033[HWORK\n"; sleep 0.05; printf "\033[2J\033[HREADY\n"; sleep 0.05; done']
             is_agent = true
             idle_pattern = "READY"
-            "#,
+            "#),
         )
         .unwrap();
 
@@ -3551,13 +3558,13 @@ mod tests {
         // manager 上两次 `create` 各自带一份不同的 `Profile` 定义，记录
         // 下来的 `profile` 字符串照样相同——这正是 `group_for_resume`
         // 要按 `(dir, profile)` 分组、认成"同一组"的场景。
-        let crashing = Profile::from_toml(
+        let crashing = Profile::from_toml(&crate::sys::testing::toml_with_sh(
             r#"
             name = "fake"
             command = ["/bin/sh", "-c", "exit 1"]
             is_agent = true
             "#,
-        )
+        ))
         .unwrap();
         let id_b = mgr.create(proj.path(), "fake", None, &[crashing]).unwrap();
 
@@ -3626,13 +3633,12 @@ mod tests {
 
         let mgr = SessionManager::new();
         mgr.register_profile(
-            Profile::from_toml(
-                r#"
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
                 name = "busy-demo"
                 command = ["/bin/sh", "-c", "echo esc to interrupt; sleep 1; clear; echo done; sleep 5"]
                 is_agent = false
                 busy_pattern = "esc to interrupt"
-                "#,
+                "#),
             )
             .unwrap(),
         );
@@ -3679,7 +3685,7 @@ mod tests {
         // 然后 BUSY 追加上去必须翻回 Working，只有「busy_re 先判定」才会翻回去，
         // 如果实现改成先看 idle_re，屏上 IDLE 还在，状态会一直卡在 Idle 直到超时。
         mgr.register_profile(
-            Profile::from_toml(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
                 r#"
                 name = "both"
                 command = ["/bin/sh", "-c", "echo IDLE; sleep 1; echo BUSY; sleep 5"]
@@ -3687,7 +3693,7 @@ mod tests {
                 busy_pattern = "BUSY"
                 idle_pattern = "IDLE"
                 "#,
-            )
+            ))
             .unwrap(),
         );
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
@@ -3728,13 +3734,13 @@ mod tests {
 
         let mgr = SessionManager::new();
         mgr.register_profile(
-            Profile::from_toml(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
                 r#"
                 name = "quiet"
                 command = ["/bin/sh", "-c", "sleep 5"]
                 is_agent = false
                 "#,
-            )
+            ))
             .unwrap(),
         );
         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
@@ -3815,11 +3821,9 @@ mod tests {
     fn scrolling_session(mgr: &SessionManager, dir: &Path, n: usize) -> u32 {
         let mut p = fake_agent();
         p.is_agent = false;
-        p.command = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            format!("i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done; sleep 30"),
-        ];
+        p.command = crate::sys::testing::sh_c(&format!(
+            "i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done; sleep 30"
+        ));
         mgr.register_profile(p.clone());
         mgr.create(dir, &p.name, empty_secrets(), &[]).unwrap()
     }
@@ -3887,13 +3891,10 @@ mod tests {
         let mgr = SessionManager::new();
         let mut p = fake_agent();
         p.is_agent = false;
-        p.command = vec![
-            "/bin/sh".into(),
-            "-c".into(),
+        p.command = crate::sys::testing::sh_c(
             "i=1; while [ $i -le 60 ]; do echo line-$i; i=$((i+1)); done; \
-             sleep 1; i=1; while [ $i -le 5 ]; do echo new-$i; i=$((i+1)); done; sleep 30"
-                .into(),
-        ];
+             sleep 1; i=1; while [ $i -le 5 ]; do echo new-$i; i=$((i+1)); done; sleep 30",
+        );
         mgr.register_profile(p.clone());
         let id = mgr
             .create(dir.path(), &p.name, empty_secrets(), &[])

@@ -4,7 +4,6 @@
 //! 这个假守护进程对第一个请求故意拖过读超时，之后正常应答。
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
@@ -12,13 +11,14 @@ use std::time::{Duration, Instant};
 
 use dct::client::Client;
 use dct::proto::{Request, Response};
+use dct::sys::ipc::Listener;
 
 fn start_slow_first_server(sock: std::path::PathBuf) {
     // 只有整个服务端收到的第一个请求会被拖慢，不是每条连接的第一个——
     // 否则客户端重连之后又会撞上一次慢应答，测的就不是"重连能否恢复"了。
     let slow_used = Arc::new(AtomicBool::new(false));
     std::thread::spawn(move || {
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = Listener::bind(&sock).unwrap();
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
             let slow_used = slow_used.clone();

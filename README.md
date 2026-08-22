@@ -103,36 +103,68 @@ it over the old one, so the new binary always gets a fresh inode.
 
 ### Windows
 
-There is no Windows build, and that isn't an oversight waiting to be fixed by a
-better installer. `dct` is Unix at the joints: the TUI and the daemon talk over a
-Unix domain socket, the daemon's lifecycle runs on `libc::kill` and `setsid`, and
-the key file's protection is the `0600` bit. `cargo build` does not get through
-on Windows, so there is no binary for a `.msi` to carry.
-
-What works today is WSL. From PowerShell or from `cmd`:
+`dct` runs natively on Windows — no WSL. From PowerShell or from `cmd`:
 
 ```
 scripts\install.cmd
 ```
 
-That picks a WSL distribution (skipping `docker-desktop`, which is Docker's own
-backend and has no package manager), installs a C toolchain, `git` and Rust
-inside it if they're missing, hands the build to the same `scripts/install.sh` as
-everywhere else, and then leaves a `dct.cmd` in `%LOCALAPPDATA%\Programs\dct` and
-puts that directory on your `PATH`. After it finishes, `dct` in PowerShell, `dct`
-in `cmd` and `dct` in a WSL shell are the same command. The shim carries your
-current directory across, so `dct` in a project folder opens the board on that
-project the way it does on Unix.
+That builds with `cargo`, installs `dct.exe` into `%LOCALAPPDATA%\Programs\dct`,
+and puts that directory on your `PATH`. `-InstallDir`, `-NoBuild` and `-NoPath`
+pass through; `scripts\install.ps1` takes them directly if you'd rather skip the
+`.cmd` wrapper (it exists so that PowerShell's default execution policy can't
+stop the install with an error that has nothing to do with `dct`).
 
-`-Distro`, `-InstallDir`, `-ShimDir`, `-NoBuild`, `-NoPath` and `-NoShim` all pass
-through; `scripts\install.ps1` takes them directly if you'd rather skip the `.cmd`
-wrapper (it exists so that PowerShell's default execution policy can't stop the
-install with an error that has nothing to do with `dct`).
+Two things to install first:
 
-Two things worth knowing. Building a repo that lives on a Windows drive goes
-through the 9p file system and is slow — clone into WSL's own file system if you
-mind. And the board is a full-screen TUI, so it looks better in Windows Terminal
-than in the old console host.
+```
+winget install --id Rustlang.Rustup -e
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e
+rustup default stable-x86_64-pc-windows-gnu
+```
+
+**No Visual Studio Build Tools required.** WinLibs is a mingw you unpack into
+your own user directory — no gigabytes, no elevation. The one thing rustup's own
+bundled mingw is missing is `as.exe`, and `dlltool` needs it to build the import
+libraries for `windows-sys` and friends; without it the build dies on
+`dlltool.exe: CreateProcess`, a line that names nothing you could act on. The
+installer checks for this before it starts compiling and says what to install.
+
+If you already have the MSVC Build Tools, `rustup default
+stable-x86_64-pc-windows-msvc` works too and needs no `as`. Either way nothing in
+the dependency tree compiles C: on Windows the TLS goes through the system's own
+schannel rather than `rustls`, which drags in `ring`, which wants `lib.exe` — so
+the toolchain above is only ever assembling and linking Rust.
+
+Install `git` too if you don't have it (`winget install --id Git.Git -e`). It
+isn't a build dependency, it's a runtime one: the snapshot before every turn
+shells out to `git`, and without it undo is dead — and undo is the whole reason
+`dct` dares run agents with permission prompts off.
+
+Under the hood, each Unix joint has a Windows counterpart (`src/sys/`): the
+daemon socket is AF_UNIX, which Windows has had since 10 1803; the daemon
+detaches with `DETACHED_PROCESS` instead of `setsid`; the key file's `0600`
+becomes an ACL with one entry for you, set at creation time rather than
+afterwards. Two places are honestly weaker than Unix and say so in the code:
+Windows has no `SIGTERM`, so replacing a running daemon can't ask it to clean up
+first, and it has no `SO_PEERCRED`, so identifying the process behind the socket
+goes through a pid file the daemon writes (checked against the process being
+alive *and* being a `dct.exe`, because pids get recycled).
+
+The `Terminal` row on the agent menu opens PowerShell here (`pwsh` if you have
+it, otherwise the built-in one), the same way it opens your login shell on Unix.
+The agents themselves are the Windows builds: npm installs `claude` as
+`claude.cmd`, and `dct` resolves and launches it through `cmd.exe` for you.
+
+The board is a full-screen TUI, so it looks better in Windows Terminal than in
+the old console host. One known gap: `dct` does not read the terminal's
+background colour on Windows, so it stays on the theme-neutral styling — set
+`DCT_THEME=dark` or `light` if you want it pinned.
+
+WSL still works if you prefer it — `scripts/install.sh` inside the distribution
+is the same install as on Linux. On a fresh Ubuntu, run
+`scripts/install-wsl-deps.sh` first for the `cc`, `git` and Rust that
+`install.sh` deliberately does not install itself.
 
 If you rebuild `dct` while the daemon from before the rebuild is still running, the next start notices, explains that restarting it will end whatever sessions are currently running (file changes stay, the agents don't), and asks before touching anything. Say yes and it swaps the daemon in and reconnects; say no and it carries on with the old one.
 

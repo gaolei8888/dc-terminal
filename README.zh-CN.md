@@ -101,33 +101,61 @@ macOS 上，守护进程还在执行这个文件的时候原地覆盖它，内�
 
 ### Windows
 
-没有 Windows 版本，而且这不是"还没顾上、写个好点的安装器就能解决"的事。
-`dct` 的关节全长在 Unix 上：界面和守护进程之间走 Unix domain socket，守护
-进程的生死靠 `libc::kill` 和 `setsid`，密钥文件的保护就是那个 `0600` 位。
-在 Windows 上 `cargo build` 根本过不去，也就没有二进制给 `.msi` 装。
-
-现在能跑的地方是 WSL。在 PowerShell 里或者 `cmd` 里：
+`dct` 在 Windows 上原生跑，不需要 WSL。在 PowerShell 里或者 `cmd` 里：
 
 ```
 scripts\install.cmd
 ```
 
-它会挑一个 WSL 发行版（跳过 `docker-desktop`——那是 Docker 自己的后端，
-里头连包管理器都没有），在里面把 C 工具链、`git` 和 Rust 缺的补上，编译
-安装这一步交给跟别处一样的 `scripts/install.sh`，最后在
-`%LOCALAPPDATA%\Programs\dct` 里留一个 `dct.cmd` 并把这个目录加进 `PATH`。
-装完之后，PowerShell 里的 `dct`、`cmd` 里的 `dct`、WSL 里的 `dct`，是同一条
-命令。这个 shim 会把当前目录带过去，所以在项目目录里敲 `dct`，板子就开在
-那个项目上，跟 Unix 上一样。
+它用 `cargo` 编译，把 `dct.exe` 装进 `%LOCALAPPDATA%\Programs\dct`，并把这个
+目录加进 `PATH`。`-InstallDir`、`-NoBuild`、`-NoPath` 都是透传的；不想走
+`.cmd` 那层就直接用 `scripts\install.ps1`。那个 `.cmd` 存在的唯一理由，是别让
+PowerShell 默认的执行策略用一句跟 `dct` 毫无关系的报错把安装挡在门外。
 
-`-Distro`、`-InstallDir`、`-ShimDir`、`-NoBuild`、`-NoPath`、`-NoShim` 都是
-透传的；不想走 `.cmd` 那层就直接用 `scripts\install.ps1`。那个 `.cmd` 存在的
-唯一理由，是别让 PowerShell 默认的执行策略用一句跟 `dct` 毫无关系的报错
-把安装挡在门外。
+先装两样：
 
-两件事值得先知道。仓库放在 Windows 盘上的话，编译要过 9p，慢得很明显——
-在意就把仓库 clone 到 WSL 自己的文件系统里。另外板子是全屏 TUI，用 Windows
-Terminal 开比老的控制台窗口好看。
+```
+winget install --id Rustlang.Rustup -e
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e
+rustup default stable-x86_64-pc-windows-gnu
+```
+
+**不需要 Visual Studio Build Tools。** WinLibs 是一份解压即用的 mingw，装在
+用户目录里，没有几个 GB 也不用管理员。rustup 自带的那份 mingw 唯独少一个
+`as.exe`，而 `dlltool` 给 `windows-sys` 这类 crate 生成 import 库时要调它；
+缺了它编译会停在 `dlltool.exe: CreateProcess` 上——那句话跟真实原因对不上号。
+安装脚本在动手编译之前就会检查这一条，缺什么直接说。
+
+已经有 MSVC Build Tools 的话，`rustup default stable-x86_64-pc-windows-msvc`
+也行，那条路不需要 `as`。两条路都一样：依赖树里没有任何 C 要编——Windows 上
+TLS 走系统自带的 schannel，而不是 `rustls`，后者拖着 `ring`，`ring` 要
+`lib.exe`。上面那套工具链自始至终只在汇编和链接 Rust 自己。
+
+`git` 也装上（`winget install --id Git.Git -e`）。它不是编译依赖，是运行时
+依赖：每一轮对话之前的那次隐藏快照是 shell 出去调 `git` 做的，没有它撤销就是
+死的——而撤销正是 `dct` 敢让 agent 关掉所有权限确认的全部理由。
+
+底下那些 Unix 关节，每一个在 Windows 上都有对应物（`src/sys/`）：守护进程的
+socket 是 AF_UNIX，Windows 10 1803 起就自带；脱离终端靠 `DETACHED_PROCESS`
+而不是 `setsid`；密钥文件的 `0600` 变成一条只有你自己的 ACL，而且和 Unix 一样
+是在创建那一刻就带上的，不是先建再收紧。有两处 Windows 确实比 Unix 弱，代码里
+点了名：Windows 没有 `SIGTERM`，所以换掉一个正在跑的守护进程时没法先请它自己
+收拾干净；也没有 `SO_PEERCRED`，所以「socket 那头是谁」只能读守护进程自己写下
+的 pid 文件——而且要同时验它还活着、并且确实是个 `dct.exe`，因为 pid 会被系统
+回收再分配。
+
+菜单里「命令行」那一行在这儿开的是 PowerShell（装了 `pwsh` 就用它，没有就用
+系统自带的那个），跟 Unix 上开你的登录 shell 是同一件事。agent 也都是
+Windows 版：npm 把 `claude` 装成 `claude.cmd`，而 `.cmd` 不是可执行映像——
+dct 会自己认出来并绕 `cmd.exe` 起它，不用你操心。
+
+板子是全屏 TUI，用 Windows Terminal 开比老的控制台窗口好看。一处已知的缺口：
+Windows 上 `dct` 不去问终端的背景色，一律用不挑背景的那套弱化样式——想钉死就
+设 `DCT_THEME=dark` 或 `light`。
+
+还是想用 WSL 也行，在发行版里跑 `scripts/install.sh`，跟 Linux 上是同一套；
+全新的 Ubuntu 先跑一次 `scripts/install-wsl-deps.sh`，把 `cc`、`git`、Rust 缺的
+补上——那些 `install.sh` 自己不装。
 
 重新编译过 `dct` 之后，如果旧编译版本的守护进程还在跑，下次启动会发现这一点，跟你说清楚重启会让正在跑的会话全部结束（文件改动都还在，只是 agent 得重新开），问过你才动手。答 y 就换掉旧的重连上去；直接回车就还用旧的接着跑。
 

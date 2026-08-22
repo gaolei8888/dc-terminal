@@ -54,6 +54,10 @@ impl Backend for CliBackend {
 /// 提示词走 stdin 不走参数：参数会进 `ps` 输出、可能超长度上限，
 /// 还要处理引号转义。
 fn run_real(cmd: &[String], input: &str, env: &BTreeMap<String, String>) -> Result<String, String> {
+    // 跟 pty 那条路同一次翻译：Windows 上 `claude` 是 `claude.cmd`，而
+    // `.cmd` 不是可执行映像，得由 cmd.exe 解释（见 `sys::shell::launch_argv`）。
+    // 少了这一句，会话自动起名这类走 CLI 的功能在 Windows 上永远静默失败。
+    let cmd = crate::sys::shell::launch_argv(cmd);
     let (head, rest) = cmd.split_first().ok_or_else(|| "空命令".to_string())?;
     let mut child = std::process::Command::new(head)
         .args(rest)
@@ -179,7 +183,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let payload = big.clone();
         std::thread::spawn(move || {
-            let result = run_real(&["cat".to_string()], &payload, &BTreeMap::new());
+            let result = run_real(
+                &[crate::sys::testing::tool("cat")],
+                &payload,
+                &BTreeMap::new(),
+            );
             let _ = tx.send(result);
         });
         // 用超时兜底：如果死锁又出现了，测试要能报「卡死」而不是把

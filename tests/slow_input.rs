@@ -12,6 +12,8 @@ use dct::profile::Profile;
 use dct::secrets::SecretStore;
 use dct::session::SessionManager;
 
+mod common;
+
 /// 造一个文件足够多的仓库，让快照慢到能测出来
 fn big_repo(files: usize) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -39,7 +41,7 @@ fn big_repo(files: usize) -> tempfile::TempDir {
 fn fake_agent() -> Profile {
     Profile {
         name: "fake".into(),
-        command: vec!["cat".into()],
+        command: vec![common::posix_tool("cat")],
         is_agent: true,
         idle_pattern: None,
         busy_pattern: None,

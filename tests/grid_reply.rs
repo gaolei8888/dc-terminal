@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod common;
+
 /// 这条契约测过一遍守护进程真实的 socket 往返，所以起daemon 得走真 socket。
 /// 但它**不能**用内置的 `shell` profile（`/bin/zsh`）——那是开发者自己的
 /// 登录 shell，会 source 真实的 `~/.zshrc`，提示符画出来的时间取决于那份
@@ -51,7 +53,7 @@ fn test_shell_profile() -> Profile {
     env.insert("PS1".to_string(), PROMPT.to_string());
     Profile {
         name: TEST_SHELL_PROFILE.into(),
-        command: vec!["/bin/sh".into(), "--noediting".into()],
+        command: vec![common::posix_tool("sh"), "--noediting".into()],
         is_agent: false,
         idle_pattern: None,
         busy_pattern: None,

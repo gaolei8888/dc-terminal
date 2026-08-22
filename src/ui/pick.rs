@@ -826,7 +826,12 @@ mod tests {
     /// 还是 `row.name` 原始值。这是这一节的安全底线：任何把清洗后的名字
     /// 拿去拼路径的改法都会在这里露出来（`canon` 需要目录真的存在才能
     /// 归一化，拼错了会直接找不到这个组）。
+    /// 名字里带控制字符的目录**在 Windows 上造不出来**：NTFS 不允许
+    /// 0x00-0x1F 出现在文件名里，`create_dir` 直接报「文件名语法不正确」。
+    /// 而被测的判据正是 `char::is_control()`——也就是说这个局面在那个平台上
+    /// 根本不会出现，不是「没覆盖到」。
     #[test]
+    #[cfg(unix)]
     fn enter_opens_the_real_directory_even_when_its_name_hides_something_invisible() {
         let weird = "weird\x1bname";
         let (_t, _g, mut app, root) = tree(&[weird]);
@@ -843,7 +848,12 @@ mod tests {
 
     /// 浏览栏画目录名时，含看不见字符的目录要挂一个压暗提示；正常目录
     /// **不能**挂——后一半同样重要，否则每一行都挂着它，提示就失去了意义。
+    /// 名字里带控制字符的目录**在 Windows 上造不出来**：NTFS 不允许
+    /// 0x00-0x1F 出现在文件名里，`create_dir` 直接报「文件名语法不正确」。
+    /// 而被测的判据正是 `char::is_control()`——也就是说这个局面在那个平台上
+    /// 根本不会出现，不是「没覆盖到」。
     #[test]
+    #[cfg(unix)]
     fn draw_marks_directories_whose_name_hides_something_invisible() {
         let (_t, _g, mut app, root) = tree(&["normal", "weird\x1bname"]);
         open_picker(&mut app, vec![], root);
@@ -1110,7 +1120,9 @@ mod tests {
     /// **`pinned` 里存的拼写和分组键（canon 之后的）可能不是同一个字符串。**
     /// macOS 上 `/tmp/x` 归一化成 `/private/tmp/x`；按字面比对去删的话，
     /// `x` 会看起来「按了没反应」——组消失一帧，下一次重算又原样回来。
+    /// 符号链接：Windows 上建它要开发者模式或管理员权限，摆不出这个现场。
     #[test]
+    #[cfg(unix)]
     fn removing_a_group_matches_pinned_by_canonical_path_not_by_spelling() {
         let (mut app, d) = App::test_app();
         let real = d.path().join("链接目标");

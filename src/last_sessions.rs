@@ -28,7 +28,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// 一条记下来的、当时还活着的会话。
@@ -103,14 +102,11 @@ pub fn save(path: &Path, sessions: &[RecordedSession]) -> Result<()> {
 
     let tmp = path.with_extension("toml.tmp");
     let result = (|| -> Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = crate::sys::fs::create_private(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
+        // 同 `secrets.rs`：先关句柄再改名，不依赖 Windows 的共享位。
+        drop(f);
         std::fs::rename(&tmp, path)?;
         Ok(())
     })();
@@ -234,7 +230,10 @@ mod tests {
         );
     }
 
+    /// 只在 Unix 上验位。Windows 的对应保证是一条只有当前用户的 ACL，
+    /// 形状完全不同，验它要另一套调用（见 `sys::acl`），不在这条测试里凑。
     #[test]
+    #[cfg(unix)]
     fn file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();

@@ -134,10 +134,11 @@ fn restarting_replaces_the_daemon_with_one_that_serves() {
     let new_pid = c.peer_pid().expect("拿不到新守护进程的 pid");
     assert_ne!(new_pid, old_pid, "根本没换人");
 
-    unsafe { libc::kill(new_pid as i32, libc::SIGKILL) };
+    dct::sys::proc::hard_kill(new_pid);
 }
 
 fn process_alive(pid: u32) -> bool {
-    // 0 号信号不发信号，只做「这个进程在不在、能不能发」的检查。
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    // Unix 上这是 0 号信号的存在性探测，Windows 上是问进程句柄的退出码。
+    // 两边同一个意思：这个 pid 现在还在不在。
+    dct::sys::proc::alive(pid)
 }

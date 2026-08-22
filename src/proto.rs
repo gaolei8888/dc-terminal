@@ -598,8 +598,11 @@ pub enum SessionResumeSkipReason {
 }
 
 pub fn socket_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".dct").join("daemon.sock")
+    // 问不出家目录就退到临时目录。这不是一个能用的长期位置（临时目录会被
+    // 清理），但它保证 dct 还能起来——而问不出家目录本身已经是这台机器
+    // 出了别的问题。
+    let home = crate::sys::home().unwrap_or_else(std::env::temp_dir);
+    home.join(".dct").join("daemon.sock")
 }
 
 /// 会话生死簿的位置，跟着 socket 走（同 `store_path_for_socket`），

@@ -3,6 +3,14 @@
 //! 之前 `dct` 用普通 `spawn` 拉起守护进程，两者在同一个终端 session 里，
 //! 关掉窗口时 SIGHUP 会把守护进程一起带走。
 
+//! **这一整个文件只在 Unix 上有意义**，但它守的东西两个平台都要。装置是
+//! Unix 的：`pgrep` 按命令行找进程、`ps -o pgid=` 看它有没有自成一组——
+//! 「自成一组」正是 `setsid` 的痕迹。Windows 上这两样都没有对应物（那边
+//! 靠的是 `DETACHED_PROCESS`：不继承调用者的控制台，见 `sys::proc`），
+//! 要验它得换一套完全不同的装置：起一个中间进程、让它拉起守护进程、
+//! 杀掉中间进程、再看守护进程还在不在。
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::{Duration, Instant};

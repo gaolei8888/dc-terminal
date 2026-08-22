@@ -158,47 +158,16 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// 让 SIGTERM / SIGINT / SIGHUP 也能还原终端。
+/// 让「被外面杀掉」也能还原终端。
 ///
-/// 为什么不是信号 handler：handler 里能调的函数必须 async-signal-safe，而
-/// crossterm 的 `disable_raw_mode()` 内部要锁一把全局 Mutex 去取原始 termios——
-/// 信号打断的正好是持锁的主线程时就死锁。`sigwait` 在普通线程上下文里返回，
-/// 之后跑的是普通代码，这个约束整个消失，也才谈得上跟 `TerminalGuard` 共用
-/// 同一个 `restore_terminal()`。
+/// 具体怎么办按平台分（`sys::signal`）：Unix 上是一个 `sigwait` 线程收
+/// SIGTERM/SIGINT/SIGHUP，Windows 上是一个控制台处理函数收 Ctrl+C 和
+/// 「点了窗口的叉」。两边为什么都不在处理函数里直接干活、为什么不用标志位
+/// 让主循环自己退，理由写在那个文件开头——两个系统的约束不同，但结论一样。
 ///
-/// 为什么不是「置个标志位让主循环自己退」：主循环卡在 `client.call` 上
-/// （守护进程死了、socket 不回）时永远轮不到下一个 tick，而那正是用户会去
-/// 别的窗口 kill 的场景——恰好是最需要它工作的时候不工作。
-///
-/// 屏蔽掩码会被子进程继承（`execve` 之后仍保留），但这里不用担心：TUI 进程
-/// 在 `run()` 里不 fork 任何东西，PTY 全在守护进程里（`src/pty.rs`），而守护
-/// 进程在 `src/main.rs:60` 就已经拉起，早于 `src/main.rs:72` 的 `ui::run`。
-///
-/// raw mode 下 Ctrl+C 不产生 SIGINT（termios 关了 ISIG），所以屏蔽 SIGINT
-/// 不影响 Ctrl+C 透传给 agent；这条只对外部 `kill -INT` 生效。
+/// 这是 `TerminalGuard` 盖不住的那一半：`Drop` 在被杀时不跑。
 fn spawn_signal_restore() {
-    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGHUP);
-        // 主线程先屏蔽，之后 spawn 出来的线程继承这份掩码，
-        // 于是这三个信号只会被下面的 sigwait 取走，不会走默认处置直接杀进程。
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-    }
-
-    std::thread::spawn(move || {
-        let mut signo: libc::c_int = 0;
-        if unsafe { libc::sigwait(&set, &mut signo) } != 0 {
-            return;
-        }
-        restore_terminal();
-        // 不能用 `exit`：它会跑 atexit 和静态析构，而主线程此刻还在跑自己的事，
-        // 两边可能同时清理终端或撞上同一把锁。终端已经在上一行还原好了，立刻走人。
-        // 退出码 128 + signo 是 shell 惯例，SIGTERM 就是 143，脚本还能判断死因。
-        unsafe { libc::_exit(128 + signo) };
-    });
+    crate::sys::signal::restore_terminal_when_killed(restore_terminal);
 }
 
 pub fn run(
@@ -882,14 +851,29 @@ pub fn run(
 
 /// 用系统默认方式打开一个网址，成功了返回 `true`。
 ///
-/// `open` 只在 macOS 上存在；Linux 桌面环境的等价物一般是 `xdg-open`。
-/// 两个都试一遍失败了才认输——用户按下 Ctrl+O 是在等申领页面弹出来，
-/// 悄无声息什么都不做，他分不清是自己按错了键还是这台机器就是打不开
-/// 浏览器（调用方在拿到 `false` 时要把这句话说出来，见按键处理里的注释）。
+/// 三个系统三个说法：macOS 是 `open`，Linux 桌面环境一般是 `xdg-open`，
+/// Windows 是让 cmd.exe 去 `start`。挨个试，全都失败了才认输——用户按下
+/// Ctrl+O 是在等申领页面弹出来，悄无声息什么都不做，他分不清是自己按错了
+/// 键还是这台机器就是打不开浏览器（调用方在拿到 `false` 时要把这句话说
+/// 出来，见按键处理里的注释）。
 fn open_url(url: &str) -> bool {
-    ["open", "xdg-open"]
-        .iter()
-        .any(|cmd| std::process::Command::new(cmd).arg(url).spawn().is_ok())
+    #[cfg(windows)]
+    {
+        // `start` 不是一个程序，是 cmd.exe 的内建命令，所以必须经它。
+        // 中间那个空字符串是 `start` 的「窗口标题」参数：不给的话，一个
+        // 带引号的网址会被 start 当成标题，于是什么都不打开。
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        std::process::Command::new(comspec)
+            .args(["/c", "start", "", url])
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        ["open", "xdg-open"]
+            .iter()
+            .any(|cmd| std::process::Command::new(cmd).arg(url).spawn().is_ok())
+    }
 }
 
 /// 把一次按键翻译成要送进 agent 的字节。返回 `None` 表示这个键不转发。
@@ -2281,7 +2265,9 @@ mod tests {
     /// 换成 `/private/...`，组头下面那行灰字会在用户什么都没做的时候自己
     /// 变一次样，还白搭一次 `refresh_rows`（它对每个会话目录都要
     /// `canonicalize` 一次）。
+    /// 符号链接：Windows 上建它要开发者模式或管理员权限，摆不出这个现场。
     #[test]
+    #[cfg(unix)]
     fn the_same_projects_spelled_differently_do_not_count_as_a_change() {
         let d = tempfile::tempdir().unwrap();
         let real = d.path().join("目标");
@@ -2364,7 +2350,9 @@ mod tests {
     /// 分组键是 canon 过的（`/tmp/x` 在 macOS 上就是 `/private/tmp/x`），
     /// 拿它去开浏览器的话，用户按下 `p` 看到的顶栏是一条他从没见过的路径。
     /// canon 只用于比较。
+    /// 符号链接：Windows 上建它要开发者模式或管理员权限，摆不出这个现场。
     #[test]
+    #[cfg(unix)]
     fn the_project_browser_opens_where_the_user_typed_not_where_canon_points() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("nested");
@@ -2585,7 +2573,7 @@ mod tests {
         env.insert("PS1".to_string(), PROMPT.to_string());
         let test_shell = Profile {
             name: "scroll-test-shell".into(),
-            command: vec!["/bin/sh".into(), "--noediting".into()],
+            command: crate::sys::testing::sh_argv(&["--noediting"]),
             is_agent: false,
             idle_pattern: None,
             busy_pattern: None,

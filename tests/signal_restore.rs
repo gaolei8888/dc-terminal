@@ -5,6 +5,12 @@
 //! raw mode 的终端——回显和行缓冲全关，看上去像第二次卡死，得知道敲 `reset`
 //! 才救得回来。而「知道敲 reset」正是不该要求用户具备的知识。
 
+//! **这一整个文件只在 Unix 上有意义**：它要 `openpty` 造一个真终端、读
+//! `termios` 看 raw mode 有没有还回去、发 SIGHUP 模拟「关掉窗口」。三样
+//! Windows 都没有——那边同一件事由控制台处理函数负责（`sys::signal`），
+//! 摆现场要另一套完全不同的装置。
+#![cfg(unix)]
+
 use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};

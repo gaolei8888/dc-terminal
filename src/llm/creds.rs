@@ -156,8 +156,7 @@ pub fn read_claude_oauth() -> Option<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let home = std::env::var("HOME").ok()?;
-        let p = std::path::Path::new(&home)
+        let p = crate::sys::home()?
             .join(".claude")
             .join(".credentials.json");
         parse_claude_oauth(&std::fs::read_to_string(p).ok()?)
@@ -165,8 +164,7 @@ pub fn read_claude_oauth() -> Option<String> {
 }
 
 pub fn read_codex_auth() -> Option<Credential> {
-    let home = std::env::var("HOME").ok()?;
-    let p = std::path::Path::new(&home).join(".codex").join("auth.json");
+    let p = crate::sys::home()?.join(".codex").join("auth.json");
     parse_codex_auth(&std::fs::read_to_string(p).ok()?)
 }
 

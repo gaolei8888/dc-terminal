@@ -398,7 +398,11 @@ pub fn verify_outcome_applies_to(
 pub(crate) fn expand_path(input: &str, base: &Path) -> PathBuf {
     // 粘贴进来的路径经常带尾随空格
     let t = input.trim();
-    let home = || PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+    // 问不出家目录时退到根：`~` 于是展开成一个一定存在、但一定不是项目的
+    // 目录，调用方那句「这儿不是 git 仓库」照常说得出口。比展开成空路径强——
+    // 那会变成相对路径，悄悄落在当前目录上。
+    let home =
+        || crate::sys::home().unwrap_or_else(|| PathBuf::from(std::path::MAIN_SEPARATOR_STR));
 
     if t == "~" {
         return home();
@@ -1665,28 +1669,50 @@ mod tests {
     #[test]
     fn expand_path_handles_tilde_and_relative() {
         let base = std::path::Path::new("/base");
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        // 不直接读 `HOME`：Windows 上根本没有这个变量，家目录在
+        // `USERPROFILE` 里。问 `sys::home()` 就是问被测代码问的同一个人。
+        let home = crate::sys::home().unwrap();
 
-        assert_eq!(
-            expand_path("/abs/x", base),
-            std::path::PathBuf::from("/abs/x")
-        );
         assert_eq!(expand_path("~/x", base), home.join("x"));
         assert_eq!(expand_path("~", base), home);
         assert_eq!(
             expand_path("rel/x", base),
             std::path::PathBuf::from("/base/rel/x")
         );
-        // 用户粘贴路径常带尾随空格
-        assert_eq!(
-            expand_path("  /abs/x  ", base),
-            std::path::PathBuf::from("/abs/x")
-        );
         // `~foo` 不是家目录展开，是个叫 ~foo 的相对路径
         assert_eq!(
             expand_path("~foo", base),
             std::path::PathBuf::from("/base/~foo")
         );
+
+        // 「什么算绝对路径」是平台自己的规矩，两边写法不一样：`/abs/x` 在
+        // Windows 上**不是**绝对路径（少了盘符），`Path::is_absolute` 对它
+        // 返回 false，于是它会被当相对路径接到 base 后面。所以这一段分开写，
+        // 而不是找一个两边都成立的写法——那种写法不存在。
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                expand_path("/abs/x", base),
+                std::path::PathBuf::from("/abs/x")
+            );
+            // 用户粘贴路径常带尾随空格
+            assert_eq!(
+                expand_path("  /abs/x  ", base),
+                std::path::PathBuf::from("/abs/x")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                expand_path(r"C:\abs\x", base),
+                std::path::PathBuf::from(r"C:\abs\x")
+            );
+            // 用户粘贴路径常带尾随空格
+            assert_eq!(
+                expand_path("  C:\\abs\\x  ", base),
+                std::path::PathBuf::from(r"C:\abs\x")
+            );
+        }
     }
 
     #[test]
@@ -2531,7 +2557,9 @@ mod tests {
     /// 项目），但 `name`/`parent` 必须来自用户敲的那条原始路径。这里用真
     /// 符号链接来验证，而不是拿两个字符串字面量摆样子——字面量根本不会
     /// 调用 `canonicalize`，测不出这个 bug。
+    /// 符号链接：Windows 上建它要开发者模式或管理员权限，摆不出这个现场。
     #[test]
+    #[cfg(unix)]
     fn display_name_and_parent_come_from_the_original_path_not_the_canonical_one() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("nested");
@@ -2566,7 +2594,9 @@ mod tests {
     /// 上面那条 `display_name_and_parent_…` 盖不住它——它只有一个会话，
     /// 一个会话怎么分都是一个组。这条要的是**两条拼法各带一个会话**。
     /// （这份覆盖在改成分组模型时被一起删掉了，这里补回来。）
+    /// 符号链接：Windows 上建它要开发者模式或管理员权限，摆不出这个现场。
     #[test]
+    #[cfg(unix)]
     fn two_spellings_of_one_directory_land_in_a_single_group() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("proj");

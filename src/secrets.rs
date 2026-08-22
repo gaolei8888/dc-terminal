@@ -3,7 +3,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// 磁盘格式。包一层 `[secrets]` 表而不是把键平铺在顶层，
@@ -190,17 +189,16 @@ impl SecretStore {
         // 那中间有一个别的账号能读到密钥的窗口。
         let tmp = self.path.with_extension("toml.tmp");
         let result = (|| -> Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
+            let mut f = crate::sys::fs::create_private(&tmp)
                 .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
             f.write_all(text.as_bytes())
                 .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
             f.sync_all()
                 .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
+            // 关掉再改名。Unix 上开着句柄改名是家常便饭，Windows 上要靠
+            // 打开时给了 FILE_SHARE_DELETE 才允许（见 `sys::fs::create_private`）。
+            // 与其依赖那个共享位，不如先关——反正内容已经 sync 下去了。
+            drop(f);
             std::fs::rename(&tmp, &self.path)
                 .map_err(|_| coded(ErrorCode::OperationFailed(Operation::SaveSecret)))?;
             Ok(())
@@ -220,6 +218,7 @@ impl SecretStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// `PHONE_TOKEN_KEY` 只是这个仓库里的另一个键——手机令牌用同一套
@@ -256,7 +255,10 @@ mod tests {
         assert_eq!(s2.get("kimi"), Some("sk-abc"));
     }
 
+    /// 只在 Unix 上验位。Windows 的对应保证是一条只有当前用户的 ACL，
+    /// 验它要另一套调用（见 `sys::acl`），不在这条测试里凑。
     #[test]
+    #[cfg(unix)]
     fn file_is_owner_only() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("secrets.toml");

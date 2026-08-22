@@ -23,7 +23,11 @@ fn profiles_returns_entries_with_labels_and_status() {
     assert_eq!(entries[0].name, "claude");
     assert_eq!(entries[0].label, "Claude", "要带中文 label");
     let shell = entries.iter().find(|e| e.name == "shell").unwrap();
-    assert_eq!(shell.status, ProfileStatus::Ready, "/bin/zsh 一定在");
+    assert_eq!(
+        shell.status,
+        ProfileStatus::Ready,
+        "命令行走 login_shell()，最差也兜底到 /bin/sh"
+    );
     let kimi = entries.iter().find(|e| e.name == "kimi").unwrap();
     assert!(
         kimi.secret.is_some(),
@@ -126,7 +130,7 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
     // 而这条测试的全部意义就是**两个不同的名字**。非 agent，所以不要求 git 仓库。
     let fake = Profile {
         name: "profiles-flow-fake".into(),
-        command: vec!["cat".into()],
+        command: vec![common::posix_tool("cat")],
         is_agent: false,
         idle_pattern: None,
         busy_pattern: None,

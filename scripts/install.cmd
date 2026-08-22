@@ -25,8 +25,20 @@ if not exist "%DCT_PS1%" (
 	exit /b 1
 )
 
+rem Prefer PowerShell 7 (pwsh) when it is installed, fall back to the Windows
+rem PowerShell that every machine has. The difference that matters here is
+rem encoding: install.ps1 is UTF-8, and Windows PowerShell 5.1 only reads it as
+rem UTF-8 because of the byte order mark at its start. pwsh needs no such help,
+rem and renders the installer's output correctly whatever the console code page.
+rem
 rem -NoProfile: the user's PowerShell profile has no business running here, and
 rem a slow or broken one would look like the installer hanging or failing.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%DCT_PS1%" %*
+where /q pwsh.exe
+if %ERRORLEVEL%==0 goto :pwsh
 
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%DCT_PS1%" %*
+exit /b %ERRORLEVEL%
+
+:pwsh
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%DCT_PS1%" %*
 exit /b %ERRORLEVEL%

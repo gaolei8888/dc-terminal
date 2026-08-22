@@ -77,3 +77,43 @@ impl DaemonHandle {
         dir
     }
 }
+
+/// 夹具要用的 POSIX 小工具，在 Windows 上从哪儿来。
+///
+/// **这是 `src/sys/testing.rs` 的一份影子。** 那一份是 `#[cfg(test)]` 的，
+/// 只在库自己的单元测试里存在；集成测试链接的是不带 `cfg(test)` 编译出来的
+/// 库，看不见它。为这件事给库开一个 feature、再让 dev-dependency 自引用来
+/// 打开它，是一条为二十行代码付出的、很容易日后没人看懂的路——所以这里照抄
+/// 一份，改那边的时候记得也看一眼这边。
+///
+/// 为什么不把脚本改写成 cmd.exe 的说法：见那个文件的开头。
+pub fn posix_tool(name: &str) -> String {
+    #[cfg(unix)]
+    {
+        if name == "sh" {
+            return "/bin/sh".to_string();
+        }
+        name.to_string()
+    }
+    #[cfg(windows)]
+    {
+        // Git for Windows 自带一整套（`<Git>\usr\bin`）。dct 本来就要 git
+        // 才能工作，所以凡是它跑得起来的机器上，这些工具一定在。
+        let out = std::process::Command::new("where")
+            .arg("git.exe")
+            .output()
+            .expect("找不到 git.exe——夹具要借用它自带的 POSIX 工具");
+        let git = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .find(|l| !l.is_empty())
+            .expect("where git.exe 没给出路径");
+        let root = std::path::Path::new(&git)
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("git.exe 的路径太浅");
+        let p = root.join("usr").join("bin").join(format!("{name}.exe"));
+        assert!(p.is_file(), "{} 不在那儿", p.display());
+        p.display().to_string()
+    }
+}

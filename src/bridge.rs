@@ -3729,7 +3729,7 @@ mod tests {
         let mgr = crate::session::SessionManager::new();
         mgr.register_profile(crate::profile::Profile {
             name: "bridge-c1-fake".into(),
-            command: vec!["cat".into()],
+            command: vec![crate::sys::testing::tool("cat")],
             is_agent: false,
             idle_pattern: None,
             busy_pattern: None,
