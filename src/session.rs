@@ -835,6 +835,18 @@ impl SessionManager {
     ) -> Result<u32> {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
+        // 这里是路径交给外部程序的最后一道关口——往下就是 git 的工作目录和
+        // pty 的 cwd，而 Windows 上带 `\\?\` 前缀的路径两者都不认（git 报
+        // 「Invalid argument」，cmd.exe 说「UNC paths are not supported」，
+        // 全文见 `sys::fs::spawnable`）。
+        //
+        // 上游已经不会再产生那个形状了（`ui::view::canon`、`projects::key_of`
+        // 都走了同一个函数），但**已经存下来的状态还带着它**：老的
+        // `projects.json` 和 `last-sessions.toml` 里就是那么写的，而恢复会话
+        // 正是从那里读路径。在这儿再拦一次，老状态才不会一直发作下去。
+        // Unix 上这一行是恒等变换。
+        let dir = &crate::sys::fs::spawnable(dir.to_path_buf());
+
         if !dir.is_dir() {
             return Err(coded(ErrorCode::DirNotFound(dir.display().to_string())));
         }
@@ -1658,6 +1670,49 @@ mod tests {
             note: Default::default(),
             resume_args: Default::default(),
         }
+    }
+
+    /// 现场：Windows 上按 1 开 Claude，底栏红字「这个会话没法安全撤销」；
+    /// 按 9 开命令行，会话生死簿里两秒之后就是 `why=vanished`。两个症状，
+    /// 一个原因——传进来的目录是 `std::fs::canonicalize` 的产物，带着
+    /// `\\?\` 前缀，而 git 建不了那个前缀下的索引锁，cmd.exe 干脆说
+    /// 「UNC paths are not supported」然后落到 Windows 目录里去。
+    ///
+    /// 上游已经不产生这个形状了（`ui::view::canon`、`projects::key_of`），
+    /// 但**存下来的老状态还带着它**，恢复会话时会原样读回来。所以
+    /// `create_inner` 在把路径交给 git 和 pty 之前还要再拦一次，这条测试
+    /// 钉的就是那一拦。
+    ///
+    /// 用 `is_agent = true` 的 profile：只有它才会走检查点，也就是当时
+    /// 第一个失败的地方。
+    #[test]
+    #[cfg(windows)]
+    fn a_session_starts_even_when_the_dir_comes_back_with_a_verbatim_prefix() {
+        let repo = init_repo();
+        let verbatim = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "前提：标准库在 Windows 上就是这么给的"
+        );
+
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let id = m
+            .create(&verbatim, "fake", empty_secrets(), &[])
+            .expect("带前缀的路径也要能开起来——这正是当初失败的那一步");
+
+        // 真的活着，而不是「建出来了但两秒后自己没了」
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        m.tick();
+        assert_ne!(
+            state_of(&m, id),
+            SessionState::Stopped,
+            "会话不能起来就没——那说明 pty 的 cwd 还是没落对"
+        );
+
+        // 会话记下来的目录也不该再带前缀，否则下一轮又会把它写回状态文件
+        let dir = m.list().into_iter().find(|s| s.id == id).unwrap().dir;
+        assert!(!dir.starts_with(r"\\?\"), "会话记下的目录还带着前缀：{dir}");
     }
 
     // 冒充一个会报错的 agent：跟 fake_agent 一样是常驻进程（先 echo BOOM 再

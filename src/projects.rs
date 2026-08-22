@@ -59,7 +59,10 @@ pub fn store_path_for_socket(socket: &Path) -> PathBuf {
 ///
 /// 归一失败（目录刚被删）就用原样：丢掉这一条比存个粗糙的路径更糟。
 fn key_of(dir: &Path) -> String {
-    std::fs::canonicalize(dir)
+    // 同 `ui::view::canon`：Windows 上不能留 `\\?\` 前缀。这份键会被
+    // `last_sessions` 抄去当恢复时的工作目录，带着前缀存下来的话，重启
+    // 之后每一条恢复出来的会话都落在一个 git 和 cmd.exe 都不认的目录上。
+    crate::sys::fs::canonicalize(dir)
         .unwrap_or_else(|_| dir.to_path_buf())
         .display()
         .to_string()
@@ -167,10 +170,15 @@ impl Store {
 mod tests {
     use super::*;
 
-    /// canonicalize 会把 macOS 上 `/var/...` 的临时目录解成 `/private/var/...`，
-    /// 所以断言里的期望值必须做同样的归一，否则测试在 macOS 上必失败。
+    /// 期望值必须跟 `key_of` 做**同一种**归一，否则测试会在某个平台上必失败，
+    /// 而失败的原因跟被测的行为毫无关系：canonicalize 在 macOS 上把 `/var/...`
+    /// 的临时目录解成 `/private/var/...`，在 Windows 上则会加一个 `\\?\` 前缀
+    /// ——而 `key_of` 把那个前缀去掉了（理由见 `sys::fs::spawnable`）。
     fn canon(p: &std::path::Path) -> String {
-        std::fs::canonicalize(p).unwrap().display().to_string()
+        crate::sys::fs::canonicalize(p)
+            .unwrap()
+            .display()
+            .to_string()
     }
 
     #[test]

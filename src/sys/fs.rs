@@ -49,6 +49,37 @@ pub fn find_command(cmd: &str) -> Option<std::path::PathBuf> {
     imp::find_command(cmd)
 }
 
+/// 归一化一条路径，用来判断「两个写法是不是同一个目录」。
+///
+/// 就是 `std::fs::canonicalize`，外加 [`spawnable`]——**标准库在 Windows 上
+/// 交出来的是 `\\?\C:\...`，那个形状不能给子进程用**，理由见下面那个函数。
+pub fn canonicalize(p: &Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(p).map(spawnable)
+}
+
+/// 一条能交给子进程当工作目录的路径。Unix 上原样奉还。
+///
+/// Windows 上是去掉 `\\?\` 这个「扩展长度路径」前缀。`std::fs::canonicalize`
+/// 一律带着它返回，而带着它的路径**很多程序都不认**——这不是理论上的担心，
+/// 是这台机器上抓到的两句原话：
+///
+/// ```text
+/// git:     fatal: Unable to create '\\?\C:\…\.git\dct-index-1.lock': Invalid argument
+/// cmd.exe: UNC paths are not supported.  Defaulting to Windows directory.
+/// ```
+///
+/// 前一句是每轮对话之前那次隐藏快照失败——也就是「这个会话没法安全撤销」，
+/// agent 于是根本开不起来；后一句是「命令行」那一行开出来的 shell 落在了
+/// Windows 目录里，随即自己退掉。同一个前缀，两个看上去毫不相干的症状。
+///
+/// **只在去掉之后仍然指向同一个文件时才去掉。** 有些路径离了这个前缀就换了
+/// 意思：超过 260 字符的（那正是这个前缀存在的理由）、某一段叫 `CON`/`NUL`
+/// 这类设备名的、某一段以点或空格结尾的（普通 API 会把它们悄悄吃掉）。
+/// 这些一律原样留着——留着的后果是 git 报错，改错的后果是动到别的文件。
+pub fn spawnable(p: std::path::PathBuf) -> std::path::PathBuf {
+    imp::spawnable(p)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -76,6 +107,10 @@ mod imp {
             .unwrap_or(false)
     }
 
+    pub fn spawnable(p: std::path::PathBuf) -> std::path::PathBuf {
+        p
+    }
+
     pub fn find_command(cmd: &str) -> Option<std::path::PathBuf> {
         if cmd.contains('/') {
             let p = Path::new(cmd);
@@ -98,6 +133,12 @@ mod imp {
     /// PATHEXT 没设时的兜底。这四个是 cmd.exe 自己的默认里跟我们有关的部分：
     /// npm 装出来的 CLI 是 `.cmd`（`claude.cmd`），Rust 编出来的是 `.exe`。
     const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+    /// 路径分隔符和那两个前缀。写成常量是因为源码里直接敲反斜杠字面量
+    /// 太容易看错，而这一段全是在数反斜杠。
+    const SEP: char = '\\';
+    const VERBATIM: &str = "\\\\?\\";
+    const VERBATIM_UNC: &str = "\\\\?\\UNC\\";
 
     pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
         // 先删掉可能存在的那一份，而不是 CREATE_ALWAYS 覆盖它。
@@ -158,6 +199,59 @@ mod imp {
 
     fn is_exec(p: &Path) -> bool {
         p.is_file()
+    }
+
+    /// 去掉前缀之后还能不能指向同一个文件。
+    ///
+    /// 三条否决：太长（`\\?\` 存在的第一理由就是绕开 260 的上限）、某一段是
+    /// 设备名（`CON` 这种，普通 API 会把它解释成设备而不是文件）、某一段以
+    /// 点或空格结尾（普通 API 会悄悄把它们吃掉，于是指向另一个名字）。
+    fn safe_without_prefix(rest: &str) -> bool {
+        const MAX_PATH: usize = 259; // 260 里有一个是结尾的 NUL
+        const DEVICES: [&str; 22] = [
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if rest.len() > MAX_PATH {
+            return false;
+        }
+        rest.split(SEP).all(|seg| {
+            if seg.ends_with('.') || seg.ends_with(' ') {
+                return false;
+            }
+            // 设备名带扩展名也仍然是设备名：`CON.txt` 一样打不开成文件。
+            let stem = seg.split('.').next().unwrap_or(seg);
+            !DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d))
+        })
+    }
+
+    pub fn spawnable(p: std::path::PathBuf) -> std::path::PathBuf {
+        let Some(s) = p.to_str() else {
+            // 不是合法 UTF-8 的路径这里不动它：拆前缀要按字符看，看不了就
+            // 别猜。带着前缀交出去最多是子进程报错，猜错了是动到别的文件。
+            return p;
+        };
+        // `\\?\UNC\server\share\…` 的原形是 `\\server\share\…`
+        if let Some(rest) = s.strip_prefix(VERBATIM_UNC) {
+            let plain = format!("{SEP}{SEP}{rest}");
+            return if safe_without_prefix(&plain) {
+                std::path::PathBuf::from(plain)
+            } else {
+                p
+            };
+        }
+        // `\\?\C:\…` 的原形是 `C:\…`。只认「盘符 + 冒号 + 反斜杠」这一种
+        // 形状：`\\?\Volume{…}` 这类没有盘符的写法离了前缀就不成立。
+        if let Some(rest) = s.strip_prefix(VERBATIM) {
+            let looks_like_drive = {
+                let b = rest.as_bytes();
+                b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+            };
+            if looks_like_drive && safe_without_prefix(rest) {
+                return std::path::PathBuf::from(rest);
+            }
+        }
+        p
     }
 
     /// Windows 上「能不能执行」不看权限位，看扩展名——而且用户敲的
@@ -223,6 +317,67 @@ mod imp {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    /// 归一化的结果会被当成工作目录交给 git 和 pty，所以它**不能**带
+    /// `\\?\`。真机上带着它的后果是两句谁也联系不到一起的报错：agent 说
+    /// 「没法安全撤销」（git 建不了索引锁），命令行会话开出来两秒就没
+    /// （cmd.exe 说 UNC 路径不支持，落到 Windows 目录里去了）。
+    #[test]
+    fn canonicalize_does_not_hand_back_a_verbatim_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let got = canonicalize(tmp.path()).unwrap();
+        assert!(
+            !got.to_string_lossy().starts_with(r"\\?\"),
+            "归一化结果还带着 `\\\\?\\`：{}",
+            got.display()
+        );
+        // 去掉前缀之后必须还是同一个目录，不能只是「看着顺眼」。
+        assert_eq!(
+            std::fs::canonicalize(&got).unwrap(),
+            std::fs::canonicalize(tmp.path()).unwrap()
+        );
+    }
+
+    /// 反过来：有些路径离了这个前缀就换了意思，那种一律留着。这几条是纯
+    /// 字面判断，不碰文件系统——`spawnable` 本身就不碰。
+    #[test]
+    fn a_path_that_needs_the_prefix_keeps_it() {
+        // 设备名：`CON` 在普通 API 眼里是控制台，不是文件
+        let device = std::path::PathBuf::from(r"\\?\C:\work\CON\a.txt");
+        assert_eq!(spawnable(device.clone()), device);
+
+        // 以点结尾的一段：普通 API 会把那个点吃掉，于是指向另一个名字
+        let dotted = std::path::PathBuf::from(r"\\?\C:\work\name.\a.txt");
+        assert_eq!(spawnable(dotted.clone()), dotted);
+
+        // 太长：绕开 260 上限正是这个前缀存在的头号理由
+        let long = std::path::PathBuf::from(format!(r"\\?\C:\{}", "a".repeat(300)));
+        assert_eq!(spawnable(long.clone()), long);
+
+        // 没有盘符的写法（卷 GUID）离了前缀根本不成立
+        let volume =
+            std::path::PathBuf::from(r"\\?\Volume{12345678-0000-0000-0000-000000000000}\a");
+        assert_eq!(spawnable(volume.clone()), volume);
+    }
+
+    /// 普通盘符路径和 UNC 都要脱掉前缀。UNC 那条是 `\\?\UNC\server\share`
+    /// 还原成 `\\server\share`——不是简单地把前四个字符切掉。
+    #[test]
+    fn a_plain_path_loses_the_prefix() {
+        assert_eq!(
+            spawnable(std::path::PathBuf::from(r"\\?\C:\work\dc-terminal")),
+            std::path::PathBuf::from(r"C:\work\dc-terminal")
+        );
+        assert_eq!(
+            spawnable(std::path::PathBuf::from(r"\\?\UNC\server\share\proj")),
+            std::path::PathBuf::from(r"\\server\share\proj")
+        );
+        // 本来就没有前缀的，原样不动
+        assert_eq!(
+            spawnable(std::path::PathBuf::from(r"C:\work")),
+            std::path::PathBuf::from(r"C:\work")
+        );
+    }
 
     /// npm 给每个 CLI 装三个文件，其中一个是**没有扩展名**的 sh 脚本
     /// （给 Git Bash 用的）。`CreateProcess` 起不了它——真机上的表现是

@@ -607,7 +607,11 @@ impl ViewMode {
 /// 解析失败（目录已被删）时退化成原样：一个指向已删目录的会话仍然应当
 /// 待在它原本的项目组下，而不是从看板上凭空消失——那才是真的找不回来了。
 pub(crate) fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    // 走 `sys::fs` 那一份而不是标准库：Windows 上标准库交出来的是
+    // `\\?\C:\…`，而这个值不只是拿来比较——它会经 `app.current_dir()`
+    // 传给 `create`，最后成为 git 和 pty 的工作目录，而那两个都不认这个
+    // 前缀（见 `sys::fs::spawnable`）。
+    crate::sys::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// 看板上的一个项目组。

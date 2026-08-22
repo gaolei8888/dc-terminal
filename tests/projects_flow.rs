@@ -3,8 +3,11 @@ use dct::proto::{Request, Response};
 
 mod common;
 
+/// 跟守护进程用的是同一种归一（`projects::key_of` → `sys::fs::canonicalize`）。
+/// 直接用标准库那一个的话，macOS 上会少解一层 `/private`，Windows 上会多一个
+/// `\\?\` 前缀——两边都会让断言因为跟被测行为无关的原因失败。
 fn canon(p: &std::path::Path) -> String {
-    std::fs::canonicalize(p).unwrap().display().to_string()
+    dct::sys::fs::canonicalize(p).unwrap().display().to_string()
 }
 
 fn projects(c: &mut Client) -> Vec<String> {
