@@ -63,6 +63,11 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                         entries: Vec::new(),
                         state: ListState::default(),
                         warning: None,
+                        // 空壳，下一轮 `run` 会把 entries 拉回来（见那边的
+                        // `needs_profile_refetch`），`no_git` 也在那儿一并重问。
+                        // 这里先问一次而不是填 false：万一那条补壳子的路以后
+                        // 改了，这一屏也不会在非 git 目录里少写那句提示。
+                        no_git: super::current_is_not_a_repo(app),
                     }
                 };
             } else {
@@ -89,6 +94,11 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                         entries: Vec::new(),
                         state: ListState::default(),
                         warning: None,
+                        // 空壳，下一轮 `run` 会把 entries 拉回来（见那边的
+                        // `needs_profile_refetch`），`no_git` 也在那儿一并重问。
+                        // 这里先问一次而不是填 false：万一那条补壳子的路以后
+                        // 改了，这一屏也不会在非 git 目录里少写那句提示。
+                        no_git: super::current_is_not_a_repo(app),
                     }
                 };
             }

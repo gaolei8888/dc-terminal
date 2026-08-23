@@ -39,12 +39,43 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         entries,
         mut state,
         warning,
+        no_git,
     } = app.view.clone()
     else {
         return Ok(());
     };
+    // 五个重建点（下面每一条不动手的分支都要把这一屏原样搭回来）都得带上
+    // `no_git`，所以先收成一个闭包，省得抄五遍还漏一份。
+    let same = |entries, state, no_git| View::PickProfile {
+        entries,
+        state,
+        warning: warning.clone(),
+        no_git,
+    };
     if key.code == KeyCode::Esc {
         app.view = super::home_view(app);
+    } else if key.code == KeyCode::Char('g') && no_git {
+        // `g`：就地建一个 git 仓库。
+        //
+        // **只在 `no_git` 为真时才认这个键**——它是屏幕上写着的那句
+        // 「按 g 初始化」的另一半，那句话不写的时候这个键也不该有反应
+        // （这个项目的规矩是屏幕和键盘必须对得上，两个方向都算）。
+        //
+        // `is_repo` 走 `rev-parse --is-inside-work-tree`，父目录是仓库时
+        // 它也为真——所以走到这里意味着**往上一级也没有仓库**，`git init`
+        // 不可能建出一个嵌套在别人工作区里的仓库来。
+        let dir = app.current_dir();
+        match crate::git::init(&dir) {
+            Ok(()) => {
+                app.message = text(Key::GitRepoCreated, app.lang).into();
+                // 提示和红边框跟着消失：这一屏九项 agent 现在真的能用了。
+                app.view = same(entries, state, false);
+            }
+            Err(e) => {
+                app.message = Msg::err(msg::git_init_failed(app.lang, &e.to_string()));
+                app.view = same(entries, state, no_git);
+            }
+        }
     } else {
         // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
         // 挪完直接落到 chosen = None，不会误触发下面的路由。
@@ -61,11 +92,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         // 四条分支的落点：pick_action 只是个纯函数分类器，真正
         // 建会话/开安装窗口这些带副作用的活儿在这里做。
         app.view = match chosen.map(|i| (i, pick_action(&entries[i], app.lang))) {
-            None => View::PickProfile {
-                entries,
-                state,
-                warning,
-            },
+            None => same(entries, state, no_git),
             Some((_, PickAction::Start(name))) => {
                 // 选完直接进会话。用户选中的意图就是「我要用这个
                 // agent 干活」，先弹回看板再让他找一遍自己刚建的
@@ -82,19 +109,11 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                     }
                     Ok(Response::Error(ref e)) => {
                         app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
-                        View::PickProfile {
-                            entries,
-                            state,
-                            warning,
-                        }
+                        same(entries, state, no_git)
                     }
                     _ => {
                         app.message = Msg::err(text(Key::CreateFailed, app.lang).into());
-                        View::PickProfile {
-                            entries,
-                            state,
-                            warning,
-                        }
+                        same(entries, state, no_git)
                     }
                 }
             }
@@ -138,21 +157,13 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                     }
                     _ => {
                         app.message = Msg::err(text(Key::CannotOpenInstallWindow, app.lang).into());
-                        View::PickProfile {
-                            entries,
-                            state,
-                            warning,
-                        }
+                        same(entries, state, no_git)
                     }
                 }
             }
             Some((_, PickAction::Blocked(msg))) => {
                 app.message = Msg::err(msg);
-                View::PickProfile {
-                    entries,
-                    state,
-                    warning,
-                }
+                same(entries, state, no_git)
             }
         };
     }
@@ -329,6 +340,7 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
         entries,
         state,
         warning,
+        no_git,
     } = &app.view
     else {
         return;
@@ -397,11 +409,21 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
         Some(p) => format!("{} · {p}", text(Key::PickAgentTitle, app.lang)),
         None => text(Key::PickAgentTitle, app.lang).to_string(),
     };
-    let title = match warning {
-        Some(w) => format!("{base} —— {w}"),
-        None => base,
-    };
-    let border = if warning.is_some() {
+    // 两句提示可以同时有，接在同一行上：`no_git` 说的是「列表没问题，但在
+    // 这个目录里都用不了」，`warning` 说的是「列表本身有问题」。哪句在前
+    // 不是随手排的——`no_git` 后面跟着一个**能按的键**（`g`），而 warning
+    // 是一句读完就完的说明；标题放不下的时候被切掉的是后半句，切掉说明
+    // 比切掉出路好。
+    let title = [
+        Some(base),
+        no_git.then(|| text(Key::NotAGitRepoHint, app.lang).to_string()),
+        warning.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" —— ");
+    let border = if warning.is_some() || *no_git {
         Style::default().fg(Color::Red)
     } else {
         border_style
@@ -640,6 +662,7 @@ mod tests {
             entries: profile_entries,
             state: pick_state,
             warning: Some("secrets.toml 读不了".into()),
+            no_git: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
@@ -1077,6 +1100,7 @@ mod tests {
             }],
             state: ratatui::widgets::ListState::default(),
             warning: None,
+            no_git: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
@@ -1087,6 +1111,101 @@ mod tests {
         assert!(
             content.contains("ai-mania"),
             "标题要写明会开在哪个项目里：{content}"
+        );
+    }
+
+    fn one_ready_entry() -> Vec<crate::proto::ProfileEntry> {
+        vec![crate::proto::ProfileEntry {
+            name: "claude".into(),
+            label: "Claude".into(),
+            note: String::new(),
+            status: ProfileStatus::Ready,
+            secret: None,
+            install: None,
+            has_secret: false,
+        }]
+    }
+
+    /// 不是 git 仓库的项目里，这一屏九项 agent 一个都开不起来（拒绝在
+    /// `session.rs` 建会话那一步）。原来用户只能按下 Enter 才知道，然后
+    /// 收一句红字、全屏没有一个键能让他往前走。标题上得先说，并且说出
+    /// 那条出路。
+    #[test]
+    fn a_non_git_project_says_so_before_the_user_presses_enter() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _d) = App::test_app();
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state: ratatui::widgets::ListState::default(),
+            warning: None,
+            no_git: true,
+        };
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let hint: String = text(Key::NotAGitRepoHint, app.lang)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains(&hint),
+            "标题要先说这儿不是 git 仓库：{content}"
+        );
+    }
+
+    /// `g` 就地把它变成 git 仓库，然后那句提示自己消失——用户不用退出去
+    /// 再进来一次才发现现在能用了。
+    #[test]
+    fn g_creates_the_git_project_right_there() {
+        let (mut app, d) = App::test_app();
+        assert!(
+            !crate::git::is_repo(&app.current_dir()),
+            "前提：当前项目还不是 git 仓库（{}）",
+            d.path().display()
+        );
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state: ratatui::widgets::ListState::default(),
+            warning: None,
+            no_git: true,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g'))).unwrap();
+
+        assert!(
+            crate::git::is_repo(&app.current_dir()),
+            "g 要真的建出仓库来"
+        );
+        assert!(
+            matches!(app.view, View::PickProfile { no_git: false, .. }),
+            "建完提示要跟着消失，不然用户以为还没成"
+        );
+        assert!(!app.message.error, "成功了不该报红");
+    }
+
+    /// **是** git 仓库的时候 `g` 不认——屏幕上那句「按 g 初始化」不写了，
+    /// 键也就不该有反应。反过来的写法（键永远认、屏幕有时候写）会让用户在
+    /// 一个正常项目里手滑按到 `g`，然后 dct 对着他的仓库跑一遍 `git init`。
+    #[test]
+    fn g_does_nothing_when_the_project_already_is_a_repo() {
+        let (mut app, d) = App::test_app();
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state: ratatui::widgets::ListState::default(),
+            warning: None,
+            no_git: false,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g'))).unwrap();
+
+        assert!(
+            !d.path().join(".git").exists(),
+            "no_git 为假时 g 不该动手——它读的是这个标志，不是文件系统"
         );
     }
 

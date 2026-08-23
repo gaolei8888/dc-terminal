@@ -957,6 +957,9 @@ pub fn run(
         let needs_profile_refetch =
             matches!(&app.view, View::PickProfile { entries, .. } if entries.is_empty());
         if needs_profile_refetch {
+            // 补壳子的这一路也要问一次：空壳是 `EnterSecret` 的 Esc 搭出来的，
+            // 它压根不知道当前项目是什么样。
+            let no_git = current_is_not_a_repo(&app);
             app.view = match app
                 .client()
                 .and_then(|c| c.call(Request::Profiles { lang }))
@@ -971,12 +974,14 @@ pub fn run(
                         entries,
                         state,
                         warning,
+                        no_git,
                     }
                 }
                 Ok(Response::Error(ref e)) => View::PickProfile {
                     entries: Vec::new(),
                     state: ListState::default(),
                     warning: Some(crate::i18n::msg::error(lang, e)),
+                    no_git,
                 },
                 _ => View::PickProfile {
                     entries: Vec::new(),
@@ -984,6 +989,7 @@ pub fn run(
                     warning: Some(
                         crate::i18n::text(crate::i18n::Key::CannotListAgents, app.lang).into(),
                     ),
+                    no_git,
                 },
             };
         }
@@ -1186,6 +1192,21 @@ pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
     // 看不出来。
     app.view = home_view(app);
     open_new_session(app, KeyCode::Char('N'));
+}
+
+/// 当前项目**不是** git 仓库吗——选 agent 那一屏拿它决定要不要写那句
+/// 「不是 git 仓库 —— 按 g 初始化」，以及 `g` 按下去算不算数。
+///
+/// 判据跟守护进程建会话时用的是**同一个函数**（`session.rs` 里
+/// `profile.is_agent && !git::is_repo(dir)`），不另写一份：分成两份的话，
+/// 界面说得通、Enter 下去却被拒（或者反过来）只是时间问题。
+///
+/// 客户端自己问 git、不走协议：守护进程永远在同一台机器上（unix socket /
+/// 命名管道），而目录浏览器早就在客户端这边判 `.git`（`view::list_dirs`）。
+/// 走协议要给 `Request` 加变体，那是要升 `PROTOCOL_VERSION` 的——为一个
+/// 本地文件系统问题让所有旧界面停摆，不值。
+pub(crate) fn current_is_not_a_repo(app: &App) -> bool {
+    !crate::git::is_repo(&app.current_dir())
 }
 
 /// 装入守护进程报回来的那份 `pinned`，**但绝不把光标脚下那个组一起冲掉**。
@@ -1855,6 +1876,9 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
     // 列表——n 拿它判断上次那个 agent 现在还在不在 Ready，N 拿它渲染
     // 选择器——所以只拉一次，不分两条路各拉各的。
     let lang = app.lang;
+    // 开这一屏之前问一次「当前项目是不是 git 仓库」，问一次就够——
+    // 理由（每帧现算等于每秒开十几个 git 子进程）见 `View::PickProfile::no_git`。
+    let no_git = current_is_not_a_repo(app);
     match app
         .client()
         .and_then(|c| c.call(Request::Profiles { lang }))
@@ -1877,6 +1901,7 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
                     entries,
                     state,
                     warning,
+                    no_git,
                 }
             };
             // 大写 N 一定要看一眼选择器，不查上次用的是谁；
@@ -3205,6 +3230,7 @@ mod tests {
             entries: Vec::new(),
             state: pick_state,
             warning: Some("secrets.toml 读不了".into()),
+            no_git: false,
         };
         term.draw(|f| draw(f, &mut app)).unwrap();
 
@@ -3954,6 +3980,7 @@ mod tests {
                 entries: Vec::new(),
                 state: ListState::default(),
                 warning: None,
+                no_git: false,
             },
             View::PickProject(crate::ui::view::ProjectPicker {
                 filter: String::new(),

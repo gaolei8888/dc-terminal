@@ -110,6 +110,19 @@ pub(crate) enum View {
         state: ListState,
         /// 密钥文件读不了、自定义 profile 写错了。顶部红字。
         warning: Option<String>,
+        /// 当前项目不是 git 仓库——九项 agent 一个都开不起来，只有命令行能用
+        /// （判断在 `session.rs` 建会话那一步，`profile.is_agent && !is_repo`）。
+        ///
+        /// **存成一个 bool，不在画的时候现算。** `git::is_repo` 要 fork 一个
+        /// git 子进程，而这一屏每一帧都在重画——现算等于每秒开十几个进程，
+        /// Windows 上还每次闪一下（`sys::proc::no_console` 挡的是那件事）。
+        /// 开这一屏的时候问一次就够了：目录会不会变成仓库，只取决于用户按不按
+        /// `g`，而那条路自己会把这里改掉。
+        ///
+        /// 守护进程那边的 `warning` 是另一回事，两者可以同时有，所以不合并
+        /// 成一个 `Option<String>`：那个是"agent 列表本身有问题"，这个是
+        /// "列表没问题，但在这个目录里都用不了"。
+        no_git: bool,
     },
     PickProject(ProjectPicker),
     /// 设置页：一张「设置项」列表（`SettingsItem`，见 `settings_view.rs`），
@@ -1156,6 +1169,25 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 浮层自己就是一整屏按键表，右段再列一遍是重复；左段的
         // 「Esc 返回」已经把这里唯一能按的键交代完了。
         View::Keys { .. } => Vec::new(),
+        // 非 git 仓库时多出一个 `g`：这一屏九项 agent 一个都开不起来，`g` 是
+        // 唯一一条往前走的路，底栏必须写得出它（标题上那句「按 g 初始化」是
+        // 另一半）。是 git 仓库时这个键不认，也就不写——屏幕上不写按不动的键。
+        //
+        // 位置是算过的，不是随手排的。`fit_help` 从**前往后**取放得下的，
+        // 只保尾巴——所以越靠后越先被丢，紧挨着尾巴的那一条最先没。`g` 要
+        // 排在「或者按数字」前面：在一个非 git 仓库里，↑↓ 和数字选中的九项
+        // 里有八项按下去只会被拒，`g` 才是这一屏唯一走得通的路，它不能是
+        // 第一个被丢掉的那条。尾巴仍然是 `Esc`——那是退出这一屏的唯一说明。
+        View::PickProfile { no_git: true, .. } => help_items(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("g", Key::InitGitRepo),
+                ("", Key::OrPressDigit),
+                ("Esc", Key::Cancel),
+            ],
+            lang,
+        ),
         View::PickProfile { .. } => help_items(
             &[
                 ("↑↓", Key::Select),
@@ -1448,6 +1480,15 @@ mod tests {
                 entries: vec![entry("claude", ProfileStatus::Ready)],
                 state: ListState::default(),
                 warning: None,
+                no_git: false,
+            },
+            // 非 git 仓库那一档是**另一张按键表**（多一个 `g`），这条守卫
+            // 只查得到被列出来的，所以两档都得摆上。
+            View::PickProfile {
+                entries: vec![entry("claude", ProfileStatus::Ready)],
+                state: ListState::default(),
+                warning: None,
+                no_git: true,
             },
             View::PickProject(ProjectPicker::new(vec![], PathBuf::from("/"))),
             View::PickProject(typing),
@@ -2157,6 +2198,7 @@ mod tests {
                 entries: vec![],
                 state: ListState::default(),
                 warning: None,
+                no_git: false,
             },
             Lang::Zh,
         );

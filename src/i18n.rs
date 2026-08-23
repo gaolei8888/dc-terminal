@@ -225,6 +225,20 @@ pub enum Key {
     BoardTitle,
     Disconnected,
     PickAgentTitle,
+    /// 选 agent 那一屏的标题后半句：当前项目不是 git 仓库。
+    ///
+    /// 短到能跟标题挤在一行是硬要求——标题只有一行，后面还要接守护进程
+    /// 报上来的 warning（密钥文件读不了之类），那是「为什么这一项用不了」
+    /// 的唯一出处。完整的理由（agent 直接改你的真文件、撤销靠 git）不写
+    /// 在这里：用户按下 Enter 会拿到 `ErrorCode::NotAGitRepo` 那一整句。
+    NotAGitRepoHint,
+    /// `g` 的说明：在当前项目上建一个 git 仓库。
+    ///
+    /// **只在选 agent 那一屏、且当前项目确实不是 git 仓库时才写得出来**
+    /// ——这个项目的规矩是「屏幕上不写按不动的键」。
+    InitGitRepo,
+    /// `g` 成功之后那句话。
+    GitRepoCreated,
     PickProjectTitle,
     TypePathTitle,
     SettingsTitle,
@@ -486,6 +500,17 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "连接已断开，数据可能已过期",
         ),
         PickAgentTitle => t!(lang, en: "Pick an agent", zh: "选 agent"),
+        NotAGitRepoHint => t!(
+            lang,
+            en: "not a git project — g to init",
+            zh: "不是 git 仓库 —— 按 g 初始化",
+        ),
+        InitGitRepo => t!(lang, en: "init git", zh: "建仓库"),
+        GitRepoCreated => t!(
+            lang,
+            en: "git project created, agents can work here now",
+            zh: "git 仓库建好了，现在可以开 agent 了",
+        ),
         PickProjectTitle => t!(lang, en: "Pick a project", zh: "选项目"),
         TypePathTitle => t!(lang, en: "Type a project path", zh: "输入项目路径"),
         SettingsTitle => t!(lang, en: "Settings", zh: "设置"),
@@ -836,6 +861,19 @@ pub mod msg {
 
     pub fn not_a_directory(lang: Lang, path: &str) -> String {
         t!(lang, en: format!("{path} is not a folder"), zh: format!("{path} 不是一个目录"))
+    }
+
+    /// `g` 建仓库失败。**把 git 的原话带上**：这一步是 dct 替用户敲的一条
+    /// 命令，失败原因（磁盘满、目录只读、机器上压根没装 git）只有 git 自己
+    /// 说得出来，吞掉它用户就只剩「没成功」三个字，连该去修什么都不知道。
+    /// 这跟 `git.rs` 里那句「不要把英文原文甩到界面上」不冲突：那说的是
+    /// 日常路径上的失败要有中文上下文，而这里中文上下文正是前半句。
+    pub fn git_init_failed(lang: Lang, err: &str) -> String {
+        t!(
+            lang,
+            en: format!("could not create the git project: {err}"),
+            zh: format!("建 git 仓库失败：{err}"),
+        )
     }
 
     pub fn cannot_find_anymore(lang: Lang, path: &str) -> String {
@@ -1498,6 +1536,9 @@ mod tests {
             BoardTitle,
             Disconnected,
             PickAgentTitle,
+            NotAGitRepoHint,
+            InitGitRepo,
+            GitRepoCreated,
             PickProjectTitle,
             TypePathTitle,
             SettingsTitle,
@@ -1594,7 +1635,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 122, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 125, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
