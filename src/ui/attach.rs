@@ -1,17 +1,19 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListState, Paragraph};
 use std::path::Path;
 
-use crate::i18n::Lang;
+use crate::i18n::{text, Key, Lang};
 use crate::proto::{MouseForward, MouseForwardKind, Request};
 use crate::session::{ScrollBy, ScrollState, SessionInfo};
+use crate::settings::{save_bar_theme, settings_path_for_socket};
 
 use super::app::App;
 use super::key_to_input;
-use super::view::View;
-use super::widgets::{screen_to_lines, short_path, truncate, Msg};
+use super::view::{ThemePick, View};
+use super::widgets::{display_width, screen_to_lines, short_path, truncate, Msg};
+use super::{move_sel_n, BarTheme};
 
 /// 滚轮一格滚几行。3 是终端惯例，改了会跟用户在别处（浏览器、编辑器）的
 /// 肌肉记忆打架。
@@ -119,6 +121,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::Attached(id) = app.view.clone() else {
         return Ok(());
     };
+    // 配色浮层开着的时候键盘整个归它，**在翻译成终端字节之前就拦下来**——
+    // 底下那一屏还是 `View::Attached`，不在这儿拦的话方向键会照常送进
+    // agent（Claude Code 的历史记录会跟着上下翻），试穿一次配色顺带把
+    // 它的输入框搅一遍。
+    if let Some(pick) = app.theme_pick.take() {
+        handle_theme_pick_key(app, key, pick);
+        return Ok(());
+    }
     // F2 是唯一被 dct 吃掉的键，其余一律 key_to_input 翻译成终端字节
     // 送进去——方向键、退格、Tab、Ctrl 组合都要能用，否则在 Claude Code
     // 里连打错字都退不了格。Esc 必须还给 agent——Claude Code 靠它
@@ -169,6 +179,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         app.copy_mode = !app.copy_mode;
     } else if key.code == KeyCode::F(5) {
         paste_image(app, id);
+    } else if key.code == KeyCode::F(6) {
+        // F6 = 就地挑配色。挑 F6 沿用 F2…F5 的理由：没有 CLI agent 在用
+        // F 功能键，偷它不踩任何人。
+        //
+        // **为什么这一层要有这个键**：配色是「压在你终端上好不好看」的事，
+        // 而唯一说了算的那一屏正是 agent 的画面——设置页那张列表底下是空的，
+        // 选中的那一档铺在真实内容上什么样，只有退回来才知道。
+        open_theme_pick(app);
     } else if let Some(action) = key_scroll(
         &app.scroll,
         &key,
@@ -268,6 +286,120 @@ pub(crate) fn path_as_input(p: &Path) -> String {
     }
 }
 
+/// 打开配色浮层，光标落在当前这一档上（跟设置页里那条子列表同一个约定）。
+fn open_theme_pick(app: &mut App) {
+    let mut state = ListState::default();
+    state.select(Some(
+        BarTheme::all()
+            .iter()
+            .position(|t| *t == app.bar)
+            .unwrap_or(0),
+    ));
+    app.theme_pick = Some(ThemePick {
+        state,
+        prev: app.bar,
+    });
+}
+
+/// 浮层开着时的键。**其余的键一律吃掉**，不往 agent 转发也不落回下面那一层：
+/// 浮层是模态的，而这一层能按的三个键（↑↓ / Enter / Esc）底栏都写着。
+///
+/// 调用方已经 `take()` 走了浮层状态，所以每一条不关窗的路都要把它放回去。
+///
+/// **`Esc` 要把配色还原**：方向键是当场生效的（试穿的全部意义就在这儿），
+/// 不还原的话「取消」跟「确定」在屏幕上一模一样，只有下次开 dct 才看得出
+/// 区别——那是最坏的一种：错得安静，还隔了一次启动。
+fn handle_theme_pick_key(app: &mut App, key: KeyEvent, mut pick: ThemePick) {
+    match key.code {
+        KeyCode::Down | KeyCode::Up => {
+            let d = if key.code == KeyCode::Down { 1 } else { -1 };
+            move_sel_n(&mut pick.state, BarTheme::all().len(), d);
+            if let Some(t) = pick.state.selected().and_then(|i| BarTheme::all().get(i)) {
+                app.bar = *t;
+            }
+            app.theme_pick = Some(pick);
+        }
+        KeyCode::Enter => {
+            // 落盘的是 `app.bar`——方向键早就把它换成选中的那一档了，
+            // 再从 `state` 里取一遍下标只会多一处能对不上的地方。
+            //
+            // 写盘失败要说话：这是这条路上唯一一件「屏幕上看不出来」的事
+            // （配色当场就变了，变的却只是这一次运行）。
+            if let Err(e) = save_bar_theme(&settings_path_for_socket(&app.socket), app.bar) {
+                app.message = Msg::err(format!("{e}"));
+            }
+            app.theme_pick = None;
+        }
+        // F6 再按一下 = 关窗，跟 `Esc` 同义（也还原）：用同一个键开和关是
+        // 用户对浮层的既有预期（`?` 浮层也是这样），而「关窗」在这一层就是
+        // 「不买」——真要买有 Enter，底栏写着。
+        KeyCode::Esc | KeyCode::F(6) => {
+            app.bar = pick.prev;
+            app.theme_pick = None;
+        }
+        _ => app.theme_pick = Some(pick),
+    }
+}
+
+/// 配色浮层：贴在会话画面右上角的一小块列表。
+///
+/// **贴右上角，不是屏幕正中**：正中盖住的是 agent 正在写的那一段，而这一层
+/// 的用途恰恰是「看看这个配色压在真实内容上什么样」——把要看的东西盖掉，
+/// 这个浮层就白开了。右上角是 CLI agent 画面上最常空着的一块。
+///
+/// 窄到放不下就**压着尺寸画**，不是不画：不画的话按 F6 会变成「键盘没了
+/// 反应、屏幕上什么都没有」——一个出不去也看不见的模式，正是 `copy_mode`
+/// 那条注释警惕的东西。挤一点的列表照样能看、Esc 照样出得去。
+fn draw_theme_pick(f: &mut Frame, area: Rect, app: &App, pick: &ThemePick) {
+    let items = super::settings_view::theme_items(app.lang, app.bar);
+    let title = text(Key::BarTheme, app.lang);
+    // 宽度按最长那一行算，不写死：配色档的名字是翻译过的，中英文宽度不一样，
+    // 写死的那个数总有一种语言会被截掉半个字。`highlight_symbol` 的两列
+    // （画在每一行最前面）和左右两列边框也要算进去。
+    let want = (super::settings_view::theme_items_width(app.lang) + 2 + 2)
+        .max(display_width(title) + 2) as u16;
+    let w = want.min(area.width);
+    let h = (BarTheme::all().len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w),
+        y: area.y,
+        width: w,
+        height: h,
+    };
+    // 先擦干净：底下是 agent 的画面，不擦的话半透出来的字会跟列表叠在一起。
+    f.render_widget(Clear, rect);
+    let mut state = pick.state.clone();
+    f.render_stateful_widget(
+        List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_symbol("▶ "),
+        rect,
+        &mut state,
+    );
+}
+
+/// 这一帧真实终端的光标该按在哪，`None` = 这一帧不画。
+///
+/// 三件事汇到这一个函数里，而不是散在两个画法分支各写一遍：
+///
+/// 1. **agent 自己关了光标**（`?25l`）就不画。干活中的 agent 基本都关着它
+///    （Claude Code 画那个转圈的时候就是），而 `screen_cursor` 那个坐标仍然
+///    跟着它每一次重绘满屏乱跑——照着画就是一个在屏幕上到处蹦的方块，而且
+///    那个方块不是 agent 画的，是 dct 自己按上去的。
+/// 2. **配色浮层开着**时不画：键盘这时候归浮层（`handle_theme_pick_key`），
+///    agent 画面里那个坐标已经不回答「我打的字会落在哪」了，而那正是这个
+///    光标存在的全部理由。
+/// 3. 算出来的位置越出内容区就不画。
+fn cursor_at(app: &App, inner: Rect) -> Option<(u16, u16)> {
+    if app.theme_pick.is_some() {
+        return None;
+    }
+    let (row, col) = app.screen_cursor;
+    let x = inner.x + col;
+    let y = inner.y + row;
+    (x < inner.x + inner.width && y < inner.y + inner.height).then_some((x, y))
+}
+
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let View::Attached(id) = &app.view else {
         return;
@@ -328,6 +460,29 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         crate::i18n::msg::session_title_disconnected(app.lang, id, &here)
     };
+    // 实色档：标题条占一行、自己铺底色，会话内容区不再画任何边框。
+    // 断连时整条标题换成红底黑字——原来那条红色边框只有一像素宽的观感，
+    // 而这一屏最要紧的一句话恰恰是「你看到的画面可能是过期的」。
+    if let Some(bar) = super::bar_style(app.bar) {
+        let bar = if app.connected {
+            bar
+        } else {
+            Style::default().bg(Color::Red).fg(Color::Black)
+        };
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        f.render_widget(Paragraph::new(title).style(bar), rows[0]);
+        f.render_widget(Paragraph::new(screen_to_lines(&app.screen)), rows[1]);
+        let inner = rows[1];
+        app.screen_origin = Some((inner.x, inner.y));
+        app.screen_area = Some((inner.width, inner.height));
+        if let Some(pos) = cursor_at(app, inner) {
+            f.set_cursor_position(pos);
+        }
+        if let Some(pick) = &app.theme_pick {
+            draw_theme_pick(f, inner, app, pick);
+        }
+        return;
+    }
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(border_style)
@@ -345,13 +500,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 必须在这里记，不能让 `handle_mouse` 自己硬算边框宽度——布局改了
     // 硬算的数就错了，而且错得很安静（见 `App::screen_origin` 的文档）。
     app.screen_origin = Some((inner.x, inner.y));
+    app.screen_area = Some((inner.width, inner.height));
     // 把 agent 屏幕里的光标位置映射到真实终端上。没有这一步用户
-    // 看到的只是一张死截图，不知道自己打的字会落在哪。
-    let (row, col) = app.screen_cursor;
-    let x = inner.x + col;
-    let y = inner.y + row;
-    if x < inner.x + inner.width && y < inner.y + inner.height {
-        f.set_cursor_position((x, y));
+    // 看到的只是一张死截图，不知道自己打的字会落在哪。**什么时候不该画**
+    // 全在 `cursor_at` 里，两个画法分支共用那一份。
+    if let Some(pos) = cursor_at(app, inner) {
+        f.set_cursor_position(pos);
+    }
+    if let Some(pick) = &app.theme_pick {
+        draw_theme_pick(f, inner, app, pick);
     }
 }
 
@@ -372,6 +529,11 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     let View::Attached(id) = app.view else {
         return false;
     };
+    // 浮层开着时鼠标不穿过去：浮层盖住的那块地方，点下去会落在 agent
+    // 画面上它**看不见**的位置上。键盘归浮层，鼠标也一样。
+    if app.theme_pick.is_some() {
+        return false;
+    }
     let (up, forwardable) = match m.kind {
         MouseEventKind::ScrollUp => (true, Some(MouseForwardKind::WheelUp)),
         MouseEventKind::ScrollDown => (false, Some(MouseForwardKind::WheelDown)),
@@ -573,6 +735,208 @@ mod tests {
                 "{width} 列下一个 48 列宽的名字把退出提示顶出了标题：{c}"
             );
         }
+    }
+
+    /// F6 打开配色浮层，光标落在**当前那一档**上——不是列表第一项。
+    /// 落在第一项的话，用户按一下方向键就已经把自己现在用的这一档丢了，
+    /// 而他还没看清列表里有什么。
+    #[test]
+    fn f6_opens_the_color_picker_on_the_current_theme() {
+        let (mut app, _d) = attached_app();
+        app.bar = BarTheme::Green;
+
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+
+        let pick = app.theme_pick.as_ref().expect("该开了浮层");
+        assert_eq!(
+            pick.state
+                .selected()
+                .and_then(|i| BarTheme::all().get(i))
+                .copied(),
+            Some(BarTheme::Green),
+        );
+        assert_eq!(app.bar, BarTheme::Green, "只是开窗，还没改任何东西");
+        assert!(matches!(app.view, View::Attached(1)), "底下那一屏没变");
+    }
+
+    /// 方向键**当场换配色**：这一层的全部意义就是「在真实画面上看它什么样」，
+    /// 要按 Enter 才看得见的话，这个浮层跟设置页那张列表没有区别。
+    ///
+    /// 当场换但**不落盘**：试穿不是买。落盘的话，试到一半按 Esc 走人，
+    /// 下次开 dct 冒出来的是他试过、没要的那一档。
+    #[test]
+    fn arrowing_in_the_picker_recolors_right_away_but_writes_nothing() {
+        let (mut app, _d) = attached_app();
+        app.bar = BarTheme::Gray;
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+
+        handle_key(&mut app, key(KeyCode::Down)).unwrap();
+
+        assert_eq!(app.bar, BarTheme::all()[1], "下一档要当场生效");
+        assert_eq!(
+            crate::settings::load_bar_theme(&settings_path_for_socket(&app.socket)),
+            None,
+            "试穿不落盘",
+        );
+        assert!(app.theme_pick.is_some(), "浮层还开着");
+    }
+
+    /// Enter = 买下来：关窗、留住这一档，而且落盘——不落盘的话下次开 dct
+    /// 又变回去，跟设置页那条路一个道理。
+    #[test]
+    fn enter_keeps_the_color_and_writes_it_to_disk() {
+        let (mut app, _d) = attached_app();
+        app.bar = BarTheme::Gray;
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+        handle_key(&mut app, key(KeyCode::Down)).unwrap();
+        let chosen = app.bar;
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(app.theme_pick.is_none(), "该关窗了");
+        assert_eq!(app.bar, chosen);
+        assert_eq!(
+            crate::settings::load_bar_theme(&settings_path_for_socket(&app.socket)),
+            Some(chosen),
+            "必须落盘，否则下次开又变回去",
+        );
+        assert!(
+            matches!(app.view, View::Attached(1)),
+            "关窗回到会话，不是看板"
+        );
+    }
+
+    /// Esc = 不买：**配色要还原**。方向键是当场生效的，不还原的话「取消」
+    /// 和「确定」在屏幕上一模一样，区别要等下次开 dct 才看得出来。
+    ///
+    /// 还原成**开窗那一刻**那一档，不是上一次按键之前那一档——连按三下
+    /// 方向键之后按 Esc，回去的是最初那件。
+    #[test]
+    fn esc_puts_the_color_back_the_way_it_was() {
+        let (mut app, _d) = attached_app();
+        app.bar = BarTheme::Purple;
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+        for _ in 0..3 {
+            handle_key(&mut app, key(KeyCode::Down)).unwrap();
+        }
+        assert_ne!(app.bar, BarTheme::Purple, "前提：试穿真的换了颜色");
+
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert!(app.theme_pick.is_none(), "该关窗了");
+        assert_eq!(app.bar, BarTheme::Purple, "试过没要，得穿回原来那件");
+        assert_eq!(
+            crate::settings::load_bar_theme(&settings_path_for_socket(&app.socket)),
+            None,
+            "取消当然不落盘",
+        );
+    }
+
+    /// 浮层是**模态**的：开着的时候一个键都不落到下面那一层，也不转发给
+    /// agent。拿 F2 当探针——它是这一屏最有力的一个键（回看板），它都被吃掉了，
+    /// 普通字符更不会漏过去。
+    ///
+    /// 不拦的话，方向键会照常送进 agent：试一次配色，Claude Code 的历史
+    /// 记录跟着上下翻了一遍。
+    #[test]
+    fn the_picker_is_modal_and_swallows_everything_else() {
+        let (mut app, _d) = attached_app();
+        app.bar = BarTheme::Gray;
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+
+        handle_key(&mut app, key(KeyCode::F(2))).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('a'))).unwrap();
+
+        assert!(matches!(app.view, View::Attached(1)), "F2 不该穿过浮层");
+        assert!(app.theme_pick.is_some(), "浮层还开着");
+        assert_eq!(app.bar, BarTheme::Gray, "普通键不该改配色");
+    }
+
+    /// 浮层开着时也不画：光标存在的全部理由是「我打的字会落在哪」，而这时候
+    /// 键盘归浮层，那个坐标已经不回答这个问题了。
+    #[test]
+    fn the_cursor_steps_aside_while_the_picker_is_open() {
+        let (mut app, _d) = attached_app();
+        let inner = Rect::new(0, 1, 80, 20);
+        app.screen_cursor = (5, 9);
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+
+        assert_eq!(cursor_at(&app, inner), None);
+    }
+
+    /// 越出内容区的坐标一直是不画的，这条老行为不能被上面两条顺手改掉。
+    #[test]
+    fn a_cursor_past_the_edge_is_still_not_drawn() {
+        let (mut app, _d) = attached_app();
+        let inner = Rect::new(0, 1, 80, 20);
+
+        app.screen_cursor = (20, 0);
+        assert_eq!(cursor_at(&app, inner), None, "行越界");
+        app.screen_cursor = (0, 80);
+        assert_eq!(cursor_at(&app, inner), None, "列越界");
+    }
+
+    /// 浮层真的画在屏幕上，而且**画在会话画面里**——它是个能看见的东西，
+    /// 不是一个只存在于 `App` 里的模式。
+    ///
+    /// 顺带把光标那条也压在真实的一帧上：`cursor_at` 的单测只钉了那个函数
+    /// 自己的判断，**它有没有被 `draw` 用上**是另一回事——两个画法分支各有
+    /// 一处调用点，漏掉一处的症状正是这次要修的那个到处蹦的方块。
+    #[test]
+    fn the_open_picker_is_actually_on_screen_and_takes_the_cursor_off() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
+        app.view = View::Attached(1);
+        app.screen_cursor = (5, 9);
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let with_cursor = term.get_cursor_position().unwrap();
+        assert_ne!(
+            (with_cursor.x, with_cursor.y),
+            (0, 0),
+            "前提：平时这一帧真的把终端光标按进了画面里"
+        );
+
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        for t in BarTheme::all() {
+            assert!(
+                c.contains(t.label(app.lang)),
+                "浮层里少了「{}」这一档：{c}",
+                t.label(app.lang)
+            );
+        }
+        let p = term.get_cursor_position().unwrap();
+        assert_eq!(
+            (p.x, p.y),
+            (0, 0),
+            "浮层开着这一帧不该再按光标——它还停在终端的初始位置上"
+        );
+    }
+
+    /// 窄窗口上也得画出来。放不下就整个不画的话，按 F6 会变成「键盘没反应、
+    /// 屏幕上什么都没有」——一个看不见也不知道怎么出去的模式。
+    #[test]
+    fn even_a_cramped_window_still_shows_the_picker() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
+        app.view = View::Attached(1);
+        handle_key(&mut app, key(KeyCode::F(6))).unwrap();
+
+        let mut term = Terminal::new(TestBackend::new(24, 10)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(
+            c.contains(BarTheme::all()[0].label(app.lang)),
+            "窄窗口上浮层整个没了：{c}"
+        );
     }
 
     #[test]

@@ -53,6 +53,8 @@ static THEME: OnceLock<Theme> = OnceLock::new();
 /// `EnterAlternateScreen` 之前调，只调一次。
 pub fn init_theme() {
     let _ = THEME.set(crate::theme::detect());
+    // 见 `SOLID` 的文档：环境变量只在这里读一次，渲染路径上一次都不读。
+    let _ = SOLID.set(std::env::var_os("NO_COLOR").is_none());
 }
 
 /// 弱化文字（说明栏、提示、不可用项、九宫格里没聚焦的格子）统一用这个样式。
@@ -70,6 +72,180 @@ pub fn init_theme() {
 /// 不钉任何颜色），所以测试和任何绕过 `run()` 的路径都能正常渲染。
 pub fn dim() -> Style {
     THEME.get().copied().unwrap_or(Theme::Unknown).dim()
+}
+
+/// 标题条/底栏的实色样式。返回 `None` 表示这一档不可用，调用方退回画横线。
+///
+/// **这里刻意不看 `THEME`**，跟 `dim()` 正相反，理由是两者画在不同的地方：
+/// `dim()` 的字落在**终端自己的背景**上，所以必须知道那个背景是深是浅，
+/// 否则挑出来的灰可能和它同色（Solarized 那次事故）。实色条自己**铺背景**，
+/// fg 和 bg 一起给，终端底色已经被盖住了——对比度是构造出来的，不是猜出来的。
+/// 一对固定的灰在深浅两种终端上同样可读，不需要探测。
+///
+/// 这一点在 Windows 上是决定性的：那边不问终端（`theme::StdinReader` 的
+/// Windows 实现直接空手而归），`COLORFGBG` 也没人设，于是探测基本恒为
+/// `Theme::Unknown`。要是让实色条跟着 `THEME` 走，它在 Windows 上就永远
+/// 不会生效——写了一整条代码路径，而目标平台上的用户一次都看不到。
+///
+/// 色号只取 232–255 那段灰阶，理由和 `Theme::dim` 挑 245/241 一样：终端
+/// 主题重定义的是 0–15 号具名色，灰阶那 24 级没有主题去动。
+///
+/// `NO_COLOR` 下返回 `None`：那时候整条实色条会塌成一片没有边界的空白，
+/// 而横线是纯字符，不依赖任何颜色。这是**唯一**需要保留横线画法的场景。
+///
+/// **`NO_COLOR` 只在 `init_theme()` 里读一次**，和 `THEME` 存进同一类全局，
+/// 理由和它一样：这是进程级配置，启动后不变。更要紧的是不能在每帧渲染时
+/// 现读环境变量——`std::env` 是进程全局的，而 `pty.rs` 的测试会
+/// `set_var("NO_COLOR", "1")`（那是它要验的东西）。渲染时现读的话，UI 测试
+/// 画出来的是横线还是实色条，取决于同一进程里哪个测试先跑到，整批 UI 测试
+/// 就成了随调度翻脸的薛定谔测试。这个坑第一次写就踩了：全量跑能过，
+/// 单独跑 `the_key_letters_are_bold` 直接挂。
+static SOLID: OnceLock<bool> = OnceLock::new();
+
+/// 标题条/底栏的配色。用户在设置页里选，落盘存着（`settings::save_bar_theme`）。
+///
+/// **色号只取两段：232–255 的灰阶，和 16–231 的 6×6×6 色立方。**避开 0–15 那
+/// 十六个具名色，理由是 `theme.rs` 开头那次事故——终端主题重定义的正是这
+/// 十六个，Solarized 把 8 号色设成和背景同色，用到它的地方整片隐形。色立方
+/// 和灰阶没有主题去动，选出来是什么就是什么。
+///
+/// `Lines` 是一等公民，不是「关掉功能」：终端不支持 256 色、用户就是喜欢
+/// 线条、或者要把画面截图贴到不认底色的地方，都该有这条退路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarTheme {
+    /// 不画实色条，退回上下横线。`NO_COLOR` 下强制走这一档。
+    Lines,
+    Gray,
+    Blue,
+    Indigo,
+    Teal,
+    Green,
+    Olive,
+    Amber,
+    Crimson,
+    Magenta,
+    Purple,
+    Slate,
+    /// 给浅色终端用的：深字压浅底，跟其余几档正好反过来。
+    Light,
+    /// 第二档浅色：暖一点的纸色底。`Light` 那档是中性灰白，压在暖色调
+    /// 终端（Solarized Light、各种「纸」主题）上会显出一块冷色补丁。
+    Paper,
+}
+
+impl BarTheme {
+    pub fn all() -> &'static [BarTheme] {
+        // 顺序是**冷 → 暖 → 浅 → 横线**，不是加进来的先后。用户在 F6 里是
+        // 一路按着 ↓ 挑的，相邻两档差得越小，他越容易看出自己想要哪一档；
+        // 把新加的几档堆在末尾，等于让他在一串没有关系的颜色里逐个试。
+        &[
+            BarTheme::Gray,
+            BarTheme::Blue,
+            BarTheme::Indigo,
+            BarTheme::Teal,
+            BarTheme::Green,
+            BarTheme::Olive,
+            BarTheme::Amber,
+            BarTheme::Crimson,
+            BarTheme::Magenta,
+            BarTheme::Purple,
+            BarTheme::Slate,
+            BarTheme::Light,
+            BarTheme::Paper,
+            BarTheme::Lines,
+        ]
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            BarTheme::Lines => "lines",
+            BarTheme::Gray => "gray",
+            BarTheme::Blue => "blue",
+            BarTheme::Indigo => "indigo",
+            BarTheme::Teal => "teal",
+            BarTheme::Green => "green",
+            BarTheme::Olive => "olive",
+            BarTheme::Amber => "amber",
+            BarTheme::Crimson => "crimson",
+            BarTheme::Magenta => "magenta",
+            BarTheme::Purple => "purple",
+            BarTheme::Slate => "slate",
+            BarTheme::Light => "light",
+            BarTheme::Paper => "paper",
+        }
+    }
+
+    /// 认不出来返回 `None`——老版本存的、手改坏了都算「没有可用的选择」，
+    /// 跟 `Lang::from_code`/`ViewMode::from_code` 同一个约定。
+    pub fn from_code(s: &str) -> Option<BarTheme> {
+        BarTheme::all().iter().copied().find(|t| t.code() == s)
+    }
+
+    /// 这一档的实色样式；`Lines` 没有，返回 `None`。
+    pub fn style(self) -> Option<Style> {
+        // 每一对都是「深底 + 同色系的浅字」（`Light`/`Paper` 反过来）。挑的
+        // 时候只有一条硬标准：对比度——由 `every_bar_theme_is_readable` 按
+        // WCAG 的公式算，低于 4.5:1 的一律不许进来。**眼睛在这件事上不可靠**，
+        // 尤其是深红、琥珀这种一眼看着很沉、算出来却够亮的颜色。
+        let (bg, fg) = match self {
+            BarTheme::Lines => return None,
+            BarTheme::Gray => (236, 252),
+            BarTheme::Blue => (24, 253),
+            BarTheme::Indigo => (17, 189),
+            BarTheme::Teal => (23, 195),
+            BarTheme::Green => (22, 253),
+            BarTheme::Olive => (58, 230),
+            BarTheme::Amber => (94, 230),
+            BarTheme::Crimson => (52, 224),
+            BarTheme::Magenta => (89, 225),
+            BarTheme::Purple => (53, 253),
+            BarTheme::Slate => (60, 255),
+            BarTheme::Light => (253, 236),
+            BarTheme::Paper => (230, 238),
+        };
+        Some(
+            Style::default()
+                .bg(Color::Indexed(bg))
+                .fg(Color::Indexed(fg)),
+        )
+    }
+
+    /// 这一档在设置页里显示成什么。跟 `Lang::native_name` 不同——配色没有
+    /// 「用它自己的语言写」这回事，走正常的 i18n 词条。
+    pub(crate) fn label(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::{text, Key};
+        match self {
+            BarTheme::Lines => text(Key::ThemeLines, lang),
+            BarTheme::Gray => text(Key::ThemeGray, lang),
+            BarTheme::Blue => text(Key::ThemeBlue, lang),
+            BarTheme::Indigo => text(Key::ThemeIndigo, lang),
+            BarTheme::Teal => text(Key::ThemeTeal, lang),
+            BarTheme::Green => text(Key::ThemeGreen, lang),
+            BarTheme::Olive => text(Key::ThemeOlive, lang),
+            BarTheme::Amber => text(Key::ThemeAmber, lang),
+            BarTheme::Crimson => text(Key::ThemeCrimson, lang),
+            BarTheme::Magenta => text(Key::ThemeMagenta, lang),
+            BarTheme::Purple => text(Key::ThemePurple, lang),
+            BarTheme::Slate => text(Key::ThemeSlate, lang),
+            BarTheme::Light => text(Key::ThemeLight, lang),
+            BarTheme::Paper => text(Key::ThemePaper, lang),
+        }
+    }
+}
+
+/// 某一档配色最终画出来是什么样。**不带任何全局可变状态**：当前选的是
+/// 哪一档存在 `App::bar` 里，理由见那个字段的文档（全局的话，一个改配色的
+/// 测试会在别的测试 `draw()` 和断言之间把值换掉）。
+///
+/// `NO_COLOR` 一票否决：那时候实色条会塌成一片没有边界的空白，而用户存的
+/// 那一档配色照旧留在盘上，把环境变量去掉就回来了。没初始化过就按「有颜色」
+/// 算——测试和任何绕过 `run()` 的路径都走默认档，而且这个默认是**定值**，
+/// 不看环境（不确定性正是 `SOLID` 要根除的东西）。
+pub fn bar_style(t: BarTheme) -> Option<Style> {
+    if !SOLID.get().copied().unwrap_or(true) {
+        return None;
+    }
+    t.style()
 }
 
 /// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
@@ -202,6 +378,13 @@ pub fn run(
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
+    // 用户存过的配色。没存过就留在 `App::new` 给的默认档，跟 `load_view_mode`
+    // 那边一样：「盘上没有可用的选择」由调用方定默认，settings 只管读写。
+    if let Some(t) =
+        crate::settings::load_bar_theme(&crate::settings::settings_path_for_socket(&app.socket))
+    {
+        app.bar = t;
+    }
     // 鼠标捕获只在会话里开：看板不需要滚，而开着捕获会让终端原生的选中
     // 复制失效——把这个代价限制在真正需要它的地方。见下面 `term.draw`
     // 之前那段每帧检查一次的逻辑，以及它为什么不挂在某一个「进入会话」的
@@ -512,13 +695,20 @@ pub fn run(
         if let View::Attached(id) = &app.view {
             let id = *id;
             // 把 agent 画面区的真实大小告诉它。不做的话它永远按初始宽度排版，
-            // 窗口再宽也只用左边一块。高度减 2 是上下边框、减 3 是底栏；
-            // 会话内容区左右不再画边框（复制文字不该带上边框字符），宽度
-            // 因此不用再扣任何列——`attach::draw` 里的块用的是
-            // `Borders::TOP | Borders::BOTTOM`，跟这里必须保持一致。
-            let area = term.size()?;
-            let rows = area.height.saturating_sub(2 + 3);
-            let cols = area.width;
+            // 窗口再宽也只用左边一块。
+            //
+            // 尺寸**从 `attach::draw` 记下来的那一份拿**（`app.screen_area`），
+            // 不在这里按边框和底栏的行数手算。这里原来写的是
+            // `height - (2 + 3)`，而那是布局算式的一份手抄件——两处分叉时
+            // 没有任何东西会报错，症状是内容区底部凭空多出一块黑边。
+            // 详见 `App::screen_area` 的文档。
+            //
+            // 还没画过一帧就跳过这一次 resize（**只跳这件事，不跳整轮循环**：
+            // `term.draw` 在下面，跳掉整轮就永远画不出第一帧，`screen_area`
+            // 也就永远填不上，直接转成死循环）。下一轮就有真实尺寸了，
+            // 晚一帧远好过发一个猜出来的数——发错了 agent 会按错的宽度
+            // 重排一次版，用户看得见那一次跳动。
+            let (cols, rows) = app.screen_area.unwrap_or((0, 0));
             if app.sent_size != Some((id, rows, cols))
                 && rows > 0
                 && cols > 0
@@ -1450,7 +1640,7 @@ pub(crate) fn home_view(app: &App) -> View {
 pub(crate) fn open_settings(app: &mut App) {
     let mut state = ListState::default();
     state.select(Some(0));
-    app.view = View::Settings { state, lang: None };
+    app.view = View::Settings { state, sub: None };
 }
 
 /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
@@ -1949,6 +2139,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         // 复制模式压过滚动提示：这时候滚轮根本不归 dct 管，那条提示是错的。
         // 压不过错误消息——外层 if/else 链已经保证了这一点。
         let hint = match &app.view {
+            // 浮层开着时这一行归浮层的三个键（`bar_keys`）——滚动提示写的是
+            // 「翻到哪儿了」，而这时候翻页键根本不归 agent 也不归 dct 的滚动，
+            // 归浮层。
+            View::Attached(_) if app.theme_pick.is_some() => None,
             View::Attached(_) if app.copy_mode => {
                 // 底栏右段只保证 ACTION_MIN_COLS 列，而这条提示是全屏唯一
                 // 写着 F4 的地方——截掉尾巴等于把用户关在一个看不见也出不去
@@ -2002,7 +2196,17 @@ fn draw(f: &mut Frame, app: &mut App) {
     //
     // 上限三分之一屏：再窄的终端里还是会截，但那时候继续让位只会把内容区
     // 挤没。
-    let bar_h = ((help_lines.len() as u16).max(1) + 2).min((f.area().height / 3).max(3));
+    // 实色档留**一行空白**在色条上方，横线档要上下两行边框。
+    //
+    // 那一行空白不是装饰：色条直接贴着 agent 画面最后一行时，两块东西挤成
+    // 一坨，眼睛分不出哪儿是 agent 的输出、哪儿是 dct 的按键表——而 agent
+    // 的内容在哪一行结束是它自己定的，dct 这边没法指望它留白。横线档不需要
+    // 这一行，因为那条横线自己就是视觉间隔。
+    //
+    // 也别把这行空白改成「色条高两行、文字居中」：那样色条会占掉两行的
+    // 底色面积，比现在更抢眼，而多出来的面积一个字都不承载。
+    let bar_chrome = if bar_style(app.bar).is_some() { 1 } else { 2 };
+    let bar_h = ((help_lines.len() as u16).max(1) + bar_chrome).min((f.area().height / 3).max(3));
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(bar_h)]).split(f.area());
 
     // 穷尽匹配而不是 if/else 链：少一个 View 变体的分支，if/else 链的兜底
@@ -2050,9 +2254,24 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
     // 要的是「我在哪」和「这里能干什么」挨在一起读。项目现在是框内的中段。
-    let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
-    let inner = block.inner(chunks[1]);
-    f.render_widget(block, chunks[1]);
+    // 实色档：整条底栏铺一层背景，不画边框。铺的是 `chunks[1]` 整块而不是
+    // 逐段刷——三段之间的间隔列也得有底色，否则色条会被切成三截。
+    let inner = match bar_style(app.bar) {
+        Some(bar) => {
+            // 上面那一行留白，色条铺在剩下的部分。留白**不铺底色**——它要的
+            // 就是和终端背景一样，才起得到间隔的作用。
+            let rows =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(chunks[1]);
+            f.render_widget(Block::default().style(bar), rows[1]);
+            rows[1]
+        }
+        None => {
+            let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
+            let inner = block.inner(chunks[1]);
+            f.render_widget(block, chunks[1]);
+            inner
+        }
+    };
 
     // 横向拆三段，各有各的固定职责：**逃生键 / 当前项目 / 至多三个动作**。
     // 前两段永不让位，只有第三段会被消息、断连提示、宽度不够替换掉。
@@ -2129,6 +2348,19 @@ fn draw(f: &mut Frame, app: &mut App) {
 /// 的要点：一个**键**在 100 列上有、在 80 列上没有，用户就学不会这一行；
 /// 而 `n 新建` 后面少一个名字，他仍然知道 `n` 是新建，按下去还会弹选择器。
 fn bar_keys(app: &App, cols: usize) -> Vec<crate::i18n::HelpItem> {
+    // 配色浮层开着时，底栏写的是浮层自己那三个键。会话那四条 F 键这时候
+    // 一个都按不动（`attach::handle_key` 先把键交给浮层），继续写着它们
+    // 就是在宣传按不动的键——这个仓库反复警惕的正是这件事。
+    if app.theme_pick.is_some() {
+        return crate::i18n::help_items(
+            &[
+                ("↑↓", crate::i18n::Key::Select),
+                ("Enter", crate::i18n::Key::Confirm),
+                ("Esc", crate::i18n::Key::Cancel),
+            ],
+            app.lang,
+        );
+    }
     let items = idle_help(&app.view, app.lang, help_ctx(app));
     // 这个项目从没开过会话就只写 `n 新建`——按下去会弹 agent 选择器，
     // 那正是该有的行为，所以不必编一个名字出来。
@@ -2505,6 +2737,107 @@ mod tests {
             1,
             "mod.rs 里只该有 create_session 那一处 Create"
         );
+    }
+
+    /// **任何一档配色都不许碰 0–15 号具名色。**
+    ///
+    /// 这是 `theme.rs` 那次事故的成文版：终端主题重定义的正是这十六个，
+    /// Solarized 把 8 号色设成和背景同色，用到它的地方整片隐形。实色条把
+    /// 前景和背景一起钉死，踩中的话是一条满宽的、糊成一片的带子——屏幕上
+    /// 最显眼的元素变成最不可读的那个。往 `BarTheme` 里加档时，这条守卫
+    /// 替人记着。
+    #[test]
+    fn no_bar_theme_uses_a_remappable_named_color() {
+        for t in BarTheme::all() {
+            let Some(style) = t.style() else { continue };
+            for (what, c) in [("bg", style.bg), ("fg", style.fg)] {
+                let Some(Color::Indexed(i)) = c else {
+                    panic!("{:?} 的 {what} 必须是 256 色索引，实际 {c:?}", t);
+                };
+                assert!(
+                    i >= 16,
+                    "{:?} 的 {what} 用了 {i} 号色——0–15 会被终端主题改写",
+                    t
+                );
+            }
+        }
+    }
+
+    /// **每一档配色都得能读。** 实色条自己铺底色，对比度是构造出来的
+    /// （见 `bar_style` 的文档），所以它到底够不够，眼睛说了不算——深红、
+    /// 琥珀这类颜色看着很沉，算出来却够亮；反过来「看着挺亮」的组合也
+    /// 常常不够。这条守卫按 WCAG 的相对亮度公式算，门槛 4.5:1（正文字号
+    /// 那一档，不是大字那一档——底栏的字就是正文字号）。
+    ///
+    /// 加一档配色的成本因此是固定的：颜色对不对由这里判，不用再靠一次
+    /// 「我在自己的终端上看着还行」。
+    #[test]
+    fn every_bar_theme_is_readable() {
+        /// 256 色索引 → sRGB。16–231 是 6×6×6 的色立方，232–255 是灰阶。
+        /// 0–15 到不了这里（`no_bar_theme_uses_a_remappable_named_color`
+        /// 已经把它们挡在外面），真来了就是那条守卫先炸。
+        fn rgb(i: u8) -> (f64, f64, f64) {
+            let c = |v: u8| f64::from(v) / 255.0;
+            if i >= 232 {
+                let v = 8 + 10 * (i - 232);
+                (c(v), c(v), c(v))
+            } else {
+                const STEP: [u8; 6] = [0, 95, 135, 175, 215, 255];
+                let i = i - 16;
+                (
+                    c(STEP[(i / 36) as usize]),
+                    c(STEP[((i % 36) / 6) as usize]),
+                    c(STEP[(i % 6) as usize]),
+                )
+            }
+        }
+        fn luminance(i: u8) -> f64 {
+            let lin = |c: f64| {
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let (r, g, b) = rgb(i);
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        }
+
+        for t in BarTheme::all() {
+            let Some(style) = t.style() else { continue };
+            let idx = |c: Option<Color>| match c {
+                Some(Color::Indexed(i)) => i,
+                other => panic!("{t:?} 的颜色不是 256 色索引：{other:?}"),
+            };
+            let (a, b) = (luminance(idx(style.bg)), luminance(idx(style.fg)));
+            let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "{t:?} 的对比度只有 {ratio:.2}:1，正文字号要 4.5:1 才读得清"
+            );
+        }
+    }
+
+    /// 配色码存盘要能原样读回来，认不出的要被拒。跟 `Lang` / `ViewMode`
+    /// 的同名守卫一个道理：码一旦写进用户的 settings.json 就是对外契约。
+    #[test]
+    fn bar_theme_codes_round_trip_and_unknown_ones_are_rejected() {
+        for t in BarTheme::all() {
+            assert_eq!(BarTheme::from_code(t.code()), Some(*t), "{:?} 没转回来", t);
+        }
+        assert_eq!(BarTheme::from_code("chartreuse"), None);
+        assert_eq!(BarTheme::from_code(""), None);
+    }
+
+    /// `Lines` 那一档必须真的没有实色样式——它是「退回横线」的开关，
+    /// 给它一个样式就等于把那条退路悄悄堵死。
+    #[test]
+    fn the_lines_theme_has_no_solid_style() {
+        assert!(BarTheme::Lines.style().is_none());
+        for t in BarTheme::all().iter().filter(|t| **t != BarTheme::Lines) {
+            assert!(t.style().is_some(), "{:?} 该有实色样式", t);
+        }
     }
 
     /// Important (a)/(b) 回归点，UI 这一侧：`explained_failure` 缓存必须在
@@ -3273,8 +3606,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let buf = term.backend().buffer();
-        let top = bar_top(&term);
-        let row = top + 1; // 顶边下面那一行就是按键表
+        let row = bar_first_line(&term, app.bar); // 底栏第一行正文就是按键表
         let bold: String = (0..buf.area.width)
             .filter_map(|x| buf.cell((x, row)))
             .filter(|c| c.style().add_modifier.contains(Modifier::BOLD))
@@ -3298,18 +3630,49 @@ mod tests {
     /// 垂直切分出来的最后一块，`Layout::vertical` 保证它贴到 `f.area()`
     /// 的底边）。从那一行往上找**最近**的一条横线就是底栏顶边——按键表/
     /// 消息那几行内容不会以 `─` 开头，中间不会有别的横线插进来。
-    fn bar_top(term: &Terminal<ratatui::backend::TestBackend>) -> u16 {
+    /// 底栏**第一行正文**（按键表/消息那一行）的行号。
+    ///
+    /// 实色档下原来那个锚点没有了：底栏不画边框，屏幕最后一行是正文而不是
+    /// `─`。改成按底色认——底栏整块铺了 `bar_style()` 的背景，内容区没有，
+    /// 所以从最后一行往上数、底色还是它的那些行就是底栏。这个判据在两档下
+    /// 都成立，横线档只是多一步跳过边框行。
+    fn bar_first_line(term: &Terminal<ratatui::backend::TestBackend>, theme: BarTheme) -> u16 {
         let buf = term.backend().buffer();
         let bottom_edge = buf.area.height - 1;
+
+        let Some(bar) = bar_style(theme) else {
+            // 横线档：下边框贴着屏幕最后一行，往上最近的那条横线是顶边，
+            // 顶边下面一行才是正文。
+            assert_eq!(
+                buf.cell((0, bottom_edge)).map(|c| c.symbol()),
+                Some("─"),
+                "横线档下，底栏下边框总该贴着屏幕最后一行"
+            );
+            let top = (0..bottom_edge)
+                .rev()
+                .find(|y| buf.cell((0, *y)).map(|c| c.symbol()) == Some("─"))
+                .expect("底栏顶边总该在屏幕上");
+            return top + 1;
+        };
+
         assert_eq!(
-            buf.cell((0, bottom_edge)).map(|c| c.symbol()),
-            Some("─"),
-            "底栏下边框总该贴着屏幕最后一行"
+            buf.cell((0, bottom_edge)).map(|c| c.bg),
+            Some(bar.bg.expect("实色条必须给出背景色")),
+            "实色档下，底栏底色总该铺到屏幕最后一行"
         );
-        (0..bottom_edge)
+        // 从最后一行往上走，底色一变就到内容区了。
+        (0..=bottom_edge)
             .rev()
-            .find(|y| buf.cell((0, *y)).map(|c| c.symbol()) == Some("─"))
-            .expect("底栏顶边总该在屏幕上")
+            .take_while(|y| buf.cell((0, *y)).map(|c| c.bg) == bar.bg)
+            .last()
+            .expect("底栏至少有一行正文")
+    }
+
+    /// 底栏正文占几行。按键表恒为一行，只有长消息会把它撑高。
+    fn bar_lines(term: &Terminal<ratatui::backend::TestBackend>, theme: BarTheme) -> u16 {
+        let h = term.backend().buffer().area.height;
+        let chrome = if bar_style(theme).is_some() { 0 } else { 1 }; // 横线档还有一行下边框
+        h - bar_first_line(term, theme) - chrome
     }
 
     /// 按键表**永远只占一行**（加上下边框共 3 行），多窄都一样。
@@ -3329,8 +3692,8 @@ mod tests {
                 let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
                 term.draw(|f| draw(f, &mut app)).unwrap();
                 assert_eq!(
-                    24 - bar_top(&term),
-                    3,
+                    bar_lines(&term, app.bar),
+                    1,
                     "{width} 列下按键表折行了，底栏不再是一行"
                 );
             }
@@ -3353,7 +3716,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert!(
-            24 - bar_top(&term) > 3,
+            bar_lines(&term, app.bar) > 1,
             "长消息该把底栏撑高，而不是被压成一行截掉一半"
         );
     }
@@ -3575,7 +3938,7 @@ mod tests {
             },
             View::Settings {
                 state: ListState::default(),
-                lang: None,
+                sub: None,
             },
             View::Keys {
                 from: Box::new(View::Board),
@@ -4101,6 +4464,29 @@ mod tests {
         });
 
         assert_eq!(scroll_after_screen_call(previous, &ok), fresh);
+    }
+
+    /// 配色浮层开着时，底栏写的是**浮层自己那三个键**。
+    ///
+    /// 会话那几条 F 键这时候一个都按不动（浮层是模态的，见
+    /// `attach::the_picker_is_modal_and_swallows_everything_else`），
+    /// 继续写着它们就是在宣传按不动的键。
+    #[test]
+    fn the_bottom_bar_hands_the_line_to_the_open_color_picker() {
+        let (mut app, _d) = App::test_app();
+        app.view = View::Attached(1);
+
+        let before = bar_keys(&app, 80);
+        assert!(
+            before.iter().any(|i| i.key == "F4"),
+            "前提：平时这一行写的是会话的 F 键"
+        );
+
+        attach::handle_key(&mut app, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)).unwrap();
+        let during = bar_keys(&app, 80);
+
+        let keys: Vec<&str> = during.iter().map(|i| i.key).collect();
+        assert_eq!(keys, vec!["↑↓", "Enter", "Esc"]);
     }
 
     #[test]

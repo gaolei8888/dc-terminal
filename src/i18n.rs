@@ -153,6 +153,22 @@ pub enum Key {
     OrPressDigit,
     TypeToFilter,
     Language,
+    /// 设置页里那一项的名字，同时也是配色子列表的标题。
+    BarTheme,
+    ThemeGray,
+    ThemeBlue,
+    ThemeIndigo,
+    ThemeTeal,
+    ThemeGreen,
+    ThemeOlive,
+    ThemeAmber,
+    ThemeCrimson,
+    ThemeMagenta,
+    ThemePurple,
+    ThemeSlate,
+    ThemeLight,
+    ThemePaper,
+    ThemeLines,
     /// 设置页顶层列表里的第二项。手机通知页本身（Task 4 的 `View::Phone`）
     /// 有自己一整套状态文案，这里只是设置项列表上的那一行标签。
     Phone,
@@ -386,6 +402,21 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
+        BarTheme => t!(lang, en: "colors", zh: "配色"),
+        ThemeGray => t!(lang, en: "gray", zh: "灰"),
+        ThemeIndigo => t!(lang, en: "indigo", zh: "靛"),
+        ThemeTeal => t!(lang, en: "teal", zh: "青"),
+        ThemeOlive => t!(lang, en: "olive", zh: "橄榄"),
+        ThemeMagenta => t!(lang, en: "magenta", zh: "玫"),
+        ThemeSlate => t!(lang, en: "slate", zh: "石板"),
+        ThemeAmber => t!(lang, en: "amber", zh: "琥珀"),
+        ThemeCrimson => t!(lang, en: "crimson", zh: "绯"),
+        ThemePaper => t!(lang, en: "paper", zh: "纸"),
+        ThemeBlue => t!(lang, en: "blue", zh: "蓝"),
+        ThemeGreen => t!(lang, en: "green", zh: "绿"),
+        ThemePurple => t!(lang, en: "purple", zh: "紫"),
+        ThemeLight => t!(lang, en: "light", zh: "浅色"),
+        ThemeLines => t!(lang, en: "lines", zh: "横线"),
         Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
@@ -1439,6 +1470,21 @@ mod tests {
             OrPressDigit,
             TypeToFilter,
             Language,
+            BarTheme,
+            ThemeGray,
+            ThemeBlue,
+            ThemeIndigo,
+            ThemeTeal,
+            ThemeGreen,
+            ThemeOlive,
+            ThemeAmber,
+            ThemeCrimson,
+            ThemeMagenta,
+            ThemePurple,
+            ThemeSlate,
+            ThemeLight,
+            ThemePaper,
+            ThemeLines,
             Phone,
             BackToBoard,
             BackToBoardF2,
@@ -1543,7 +1589,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 107, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 122, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

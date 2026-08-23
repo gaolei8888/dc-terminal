@@ -97,7 +97,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Esc => {
             app.view = View::Settings {
                 state: ratatui::widgets::ListState::default(),
-                lang: None,
+                sub: None,
             }
         }
         KeyCode::Enter

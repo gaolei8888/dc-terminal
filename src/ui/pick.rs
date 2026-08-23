@@ -1396,7 +1396,7 @@ mod tests {
         app.set_sessions(vec![]);
         app.view = View::Settings {
             state: ListState::default(),
-            lang: None,
+            sub: None,
         };
 
         super::super::seed_start_project(&mut app);

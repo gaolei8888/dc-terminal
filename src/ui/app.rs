@@ -56,6 +56,40 @@ pub struct App {
     /// `handle_mouse` 自己不硬算边框宽度，布局改了这里也不会悄悄算错。
     /// `None` = 还没画过一帧，或者当前根本不在会话视图里。
     pub screen_origin: Option<(u16, u16)>,
+    /// 会话内容区的 (宽, 高)，同样由 `attach::draw` 每帧画完之后填上。
+    ///
+    /// 存在的理由和 `screen_origin` 一模一样，只是这一份的代价更贵：告诉
+    /// agent 的画面尺寸（`Request::Resize`）原来是在事件循环里手算的
+    /// （`height - (2 + 3)`：两行边框加三行底栏），而那正是布局算式的一份
+    /// 手抄件。手抄件和 `attach::draw` 分叉的时候没有任何东西会报错——
+    /// agent 按一个偏小的高度排版，多出来的那几行就是内容区底部一块永远
+    /// 不会被写到的黑边，看上去像是留白设计。实色条那次改动就是这么栽的：
+    /// chrome 从 5 行变成 2 行，手抄件还停在 5，屏幕下方空了 3 行。
+    ///
+    /// `None` = 还没画过一帧，或者当前不在会话视图里；调用方这时候不发
+    /// resize，等下一帧拿到真实尺寸再说——晚一帧远好过发一个猜出来的数。
+    pub screen_area: Option<(u16, u16)>,
+    /// 标题条/底栏的配色，用户在设置页里选（`settings_view::handle_theme_key`）。
+    ///
+    /// **放在 `App` 里而不是做成进程级全局**，跟 `THEME`/`SOLID` 那两个正好
+    /// 相反，理由是这一项**运行时会变**：全局的话，一个改配色的测试会在别的
+    /// 测试 `draw()` 和断言之间把值换掉，那批测试就成了随调度翻脸的薛定谔
+    /// 测试。这个坑这次改动里已经踩过一次（`NO_COLOR` 当时是每帧现读的
+    /// 环境变量，全量跑能过、单独跑就挂），不该在同一次改动里再踩第二次。
+    ///
+    /// 默认 `Gray`；启动时被盘上存的那一档覆盖（`ui::run`）。
+    pub bar: super::BarTheme,
+    /// 贴在会话画面上的配色浮层（F6），`None` = 没开。
+    ///
+    /// **做成 `App` 上的一个字段，不是一个 `View` 变体**，理由跟 `copy_mode`
+    /// 一样：底下那一屏还是 `View::Attached`，主循环里七八处
+    /// `matches!(app.view, View::Attached(_))`（每帧取画面、协商尺寸、算滚动
+    /// 提示……）必须继续认出它来。换成新变体就得逐处补一支，漏一处的症状是
+    /// 浮层一开、agent 的画面就冻住。
+    ///
+    /// 开着的时候键盘整个归它（见 `attach::handle_key`），一个字节都不转发
+    /// 给 agent。
+    pub theme_pick: Option<super::view::ThemePick>,
     // 九宫格当前页那几个会话的画面，按 id 跟格子配对。跟 `screen` 分开存：
     // 那一份是附加视图正在放大的**单个**会话，两者的刷新节奏和来源消息
     // 都不一样（16ms 的 `Screen` vs 300ms 的 `Screens`），共用一个字段
@@ -179,6 +213,9 @@ impl App {
             screen_cursor: (0, 0),
             scroll: ScrollState::default(),
             screen_origin: None,
+            screen_area: None,
+            bar: super::BarTheme::Gray,
+            theme_pick: None,
             grid_screens: Vec::new(),
             grid_last_fetch: None,
             grid_page: None,

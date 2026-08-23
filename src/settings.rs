@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::i18n::Lang;
 use crate::proto::{coded, ErrorCode, Operation};
-use crate::ui::ViewMode;
+use crate::ui::{BarTheme, ViewMode};
 
 /// 盘上格式：`{"lang":"zh"}`。包一层对象而不是直接存字符串，是为了将来加设置项
 /// 时老文件仍能读（跟 `projects.rs` 的 `Disk` 同一个理由）。
@@ -19,6 +19,8 @@ struct Disk {
     lang: Option<String>,
     #[serde(default)]
     view_mode: Option<String>,
+    #[serde(default)]
+    bar_theme: Option<String>,
 }
 
 /// 位置跟着 socket 走，与 `projects.rs::store_path_for_socket` 同一套推导：
@@ -49,6 +51,19 @@ pub fn load_view_mode(path: &Path) -> Option<ViewMode> {
 
 pub fn save_view_mode(path: &Path, mode: ViewMode) -> Result<()> {
     save_with(path, |d| d.view_mode = Some(mode.code().to_string()))
+}
+
+/// 用户存过的底栏配色。认不出/没存过一律 `None`——理由同 `load_lang`。
+pub fn load_bar_theme(path: &Path) -> Option<BarTheme> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let disk: Disk = serde_json::from_str(&s).ok()?;
+    BarTheme::from_code(&disk.bar_theme?)
+}
+
+/// 返回 `Result` 而不是吞错，理由同 `save_lang`：配色是用户明确做出的选择，
+/// 写不进去必须说一声，否则下次开 dct 发现变回去了，他不知道该怪谁。
+pub fn save_bar_theme(path: &Path, t: BarTheme) -> Result<()> {
+    save_with(path, |d| d.bar_theme = Some(t.code().to_string()))
 }
 
 /// **跟 `projects.rs::save` 刻意不同：这里返回 `Result`。**
@@ -127,6 +142,37 @@ mod tests {
         assert_eq!(load_lang(&f), Some(Lang::Zh), "存模式不能把语言抹掉");
         save_lang(&f, Lang::En).unwrap();
         assert_eq!(load_view_mode(&f), Some(ViewMode::List), "反过来也一样");
+    }
+
+    #[test]
+    fn a_saved_bar_theme_survives_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.json");
+        save_bar_theme(&f, BarTheme::Blue).unwrap();
+        assert_eq!(load_bar_theme(&f), Some(BarTheme::Blue));
+    }
+
+    /// 认不出的配色码（老版本存的、手改坏了）也是「没有可用的选择」。
+    #[test]
+    fn an_unknown_bar_theme_means_no_choice_was_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.json");
+        std::fs::write(&f, r#"{"bar_theme":"chartreuse"}"#).unwrap();
+        assert_eq!(load_bar_theme(&f), None);
+    }
+
+    /// 三项设置互不干扰。加第三项的时候这条最容易忘——`save_with` 先读回来
+    /// 再写正是为了它。
+    #[test]
+    fn saving_the_bar_theme_wipes_neither_of_the_other_two() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.json");
+        save_lang(&f, Lang::Zh).unwrap();
+        save_view_mode(&f, ViewMode::List).unwrap();
+        save_bar_theme(&f, BarTheme::Green).unwrap();
+        assert_eq!(load_lang(&f), Some(Lang::Zh));
+        assert_eq!(load_view_mode(&f), Some(ViewMode::List));
+        assert_eq!(load_bar_theme(&f), Some(BarTheme::Green));
     }
 
     #[test]

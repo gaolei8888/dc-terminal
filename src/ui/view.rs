@@ -119,12 +119,15 @@ pub(crate) enum View {
     Settings {
         /// 顶层「设置项」列表的光标。
         state: ListState,
-        /// `None` = 停在顶层设置项列表；`Some` = 已经选中「语言」进了语言
-        /// 子列表，这里存的是子列表自己的光标。**不新开一个 `View` 变体**
-        /// 是因为语言子列表退出（`Esc`）之后要回到的是设置项列表，不是
+        /// `None` = 停在顶层设置项列表；`Some` = 已经进了某个子列表，
+        /// 里面存的是那个子列表自己的光标。**不新开一个 `View` 变体**
+        /// 是因为子列表退出（`Esc`）之后要回到的是设置项列表，不是
         /// 看板——用同一个 `View::Settings` 装两层，`Esc` 才能一层一层退，
         /// 而不是一步退到底。
-        lang: Option<ListState>,
+        ///
+        /// 用枚举而不是「每个子列表一个 `Option<ListState>` 字段」：两个
+        /// 字段能同时是 `Some`，那是个画不出来的状态，而编译器不会拦。
+        sub: Option<SubList>,
     },
     EnterSecret {
         /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
@@ -564,6 +567,25 @@ pub(crate) fn list_dirs(dir: &Path) -> Vec<DirRow> {
     // 用户没法靠位置记住东西在哪。
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
+}
+
+/// 贴在会话画面上的配色浮层的状态。见 `App::theme_pick`。
+///
+/// `prev` 是**打开浮层那一刻**的那一档，不是「上一次按方向键之前」的那一档：
+/// 这一层的方向键当场就把 `App::bar` 换掉了（试穿的全部意义就是看真实画面），
+/// 所以 `Esc` 要还回去的是最初那一件，不是上一件。
+#[derive(Debug, Clone)]
+pub struct ThemePick {
+    pub state: ListState,
+    pub prev: super::BarTheme,
+}
+
+/// 设置页里当前打开的子列表。见 `View::Settings::sub`。
+#[derive(Debug, Clone)]
+pub enum SubList {
+    Language(ListState),
+    /// 底栏/标题条的配色，见 `ui::BarTheme`。
+    Theme(ListState),
 }
 
 /// 看板的两种画法。它们是**平级**的，不是「列表 + 一个附属页面」——
@@ -1117,12 +1139,16 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         //   而且这一层按 `?` 是打不开浮层的（附加视图里的键一律转发给 agent，
         //   见 `attach::handle_key` 头上那条注释）——底栏不写，它就是一个
         //   屏幕上完全不存在的键。
-        // - `F3` 夹在中间（最先丢）：三条里唯一的**快捷方式**，退回看板再进
-        //   另一个会话是等价的两步，丢了它只是慢，不是做不到。
+        // - `F3` 夹在中间：三条里唯一的**快捷方式**，退回看板再进另一个
+        //   会话是等价的两步，丢了它只是慢，不是做不到。
+        // - `F6` 排在 `F4` 前面，也就是**最先丢**的那一条：其余三条丢了就
+        //   真的做不到（这一层按 `?` 打不开浮层），配色丢了还有设置页那条路
+        //   （F2 回看板、`l`、配色），而且它是四条里唯一一条「不干活也行」的。
         View::Attached(_) => help_items(
             &[
                 ("F5", Key::PasteImage),
                 ("F3", Key::NextSession),
+                ("F6", Key::BarTheme),
                 ("F4", Key::EnterCopyMode),
             ],
             lang,
@@ -1427,7 +1453,7 @@ mod tests {
             View::PickProject(typing),
             View::Settings {
                 state: ListState::default(),
-                lang: None,
+                sub: None,
             },
             secret(false, SecretPhase::Typing),
             secret(true, SecretPhase::Typing),

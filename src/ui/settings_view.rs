@@ -14,24 +14,29 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use crate::i18n::{text, Key, Lang};
 use crate::proto::{Request, Response};
-use crate::settings::{save_lang, settings_path_for_socket};
+use crate::settings::{save_bar_theme, save_lang, settings_path_for_socket};
 
 use super::app::App;
-use super::view::View;
+use super::view::{SubList, View};
 use super::widgets::Msg;
-use super::{dim, move_sel_n};
+use super::{dim, move_sel_n, BarTheme};
 
 /// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
 /// 直接映射 `Lang::all()`；现在映射这个枚举，选中语言那一项才进语言列表。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsItem {
     Language,
+    Theme,
     Phone,
 }
 
 impl SettingsItem {
     pub(crate) fn all() -> &'static [SettingsItem] {
-        &[SettingsItem::Language, SettingsItem::Phone]
+        &[
+            SettingsItem::Language,
+            SettingsItem::Theme,
+            SettingsItem::Phone,
+        ]
     }
 
     /// 越界返回 `None` 而不是兜底成第一项：`ListState` 的选中项可能停在
@@ -43,6 +48,7 @@ impl SettingsItem {
     fn label(self, lang: Lang) -> &'static str {
         match self {
             SettingsItem::Language => text(Key::Language, lang),
+            SettingsItem::Theme => text(Key::BarTheme, lang),
             SettingsItem::Phone => text(Key::Phone, lang),
         }
     }
@@ -51,14 +57,15 @@ impl SettingsItem {
 /// **这个函数里永远不要 `continue`。** 理由同 `board.rs`：循环末尾还有一段
 /// 清理陈旧 `message` 的逻辑，跳过它会让一句普通反馈盖掉屏幕上唯一的出路。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::Settings { state, lang } = app.view.clone() else {
+    let View::Settings { state, sub } = app.view.clone() else {
         return Ok(());
     };
 
-    if let Some(lang_state) = lang {
-        return handle_language_key(app, key, state, lang_state);
+    match sub {
+        Some(SubList::Language(ls)) => handle_language_key(app, key, state, ls),
+        Some(SubList::Theme(ts)) => handle_theme_key(app, key, state, ts),
+        None => handle_top_key(app, key, state),
     }
-    handle_top_key(app, key, state)
 }
 
 /// 顶层设置项列表：`Language` 进语言子列表，`Phone` 进手机通知页
@@ -69,7 +76,7 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
         KeyCode::Down | KeyCode::Up => {
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
             move_sel_n(&mut state, SettingsItem::all().len(), d);
-            app.view = View::Settings { state, lang: None };
+            app.view = View::Settings { state, sub: None };
         }
         KeyCode::Enter => match state.selected().and_then(SettingsItem::at) {
             Some(SettingsItem::Language) => {
@@ -79,15 +86,28 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
                 ));
                 app.view = View::Settings {
                     state,
-                    lang: Some(lang_state),
+                    sub: Some(SubList::Language(lang_state)),
+                };
+            }
+            Some(SettingsItem::Theme) => {
+                let mut ts = ListState::default();
+                ts.select(Some(
+                    BarTheme::all()
+                        .iter()
+                        .position(|t| *t == app.bar)
+                        .unwrap_or(0),
+                ));
+                app.view = View::Settings {
+                    state,
+                    sub: Some(SubList::Theme(ts)),
                 };
             }
             Some(SettingsItem::Phone) => open_phone(app, state),
             None => {
-                app.view = View::Settings { state, lang: None };
+                app.view = View::Settings { state, sub: None };
             }
         },
-        _ => app.view = View::Settings { state, lang: None },
+        _ => app.view = View::Settings { state, sub: None },
     }
     Ok(())
 }
@@ -100,11 +120,11 @@ fn open_phone(app: &mut App, state: ListState) {
         Ok(Response::Phone(status)) => app.view = View::Phone { status },
         Ok(Response::Error(ref e)) => {
             app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
-            app.view = View::Settings { state, lang: None };
+            app.view = View::Settings { state, sub: None };
         }
         _ => {
             app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
-            app.view = View::Settings { state, lang: None };
+            app.view = View::Settings { state, sub: None };
         }
     }
 }
@@ -120,14 +140,14 @@ fn handle_language_key(
     match key.code {
         // 回设置项列表，不是回看板——用户此刻只退了一层。
         KeyCode::Esc => {
-            app.view = View::Settings { state, lang: None };
+            app.view = View::Settings { state, sub: None };
         }
         KeyCode::Down | KeyCode::Up => {
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
             move_sel_n(&mut lang_state, Lang::all().len(), d);
             app.view = View::Settings {
                 state,
-                lang: Some(lang_state),
+                sub: Some(SubList::Language(lang_state)),
             };
         }
         KeyCode::Enter => {
@@ -153,7 +173,48 @@ fn handle_language_key(
         _ => {
             app.view = View::Settings {
                 state,
-                lang: Some(lang_state),
+                sub: Some(SubList::Language(lang_state)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 配色子列表。跟语言那一层同构，只有两处不同：选中当场生效（`set_bar_theme`
+/// 之后下一帧就是新配色），以及**存盘失败不回滚内存里的选择**——用户已经
+/// 看到新配色了，再悄悄变回去比一句错误提示更让人摸不着头脑。
+fn handle_theme_key(
+    app: &mut App,
+    key: KeyEvent,
+    state: ListState,
+    mut ts: ListState,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.view = View::Settings { state, sub: None },
+        KeyCode::Down | KeyCode::Up => {
+            let d = if key.code == KeyCode::Down { 1 } else { -1 };
+            move_sel_n(&mut ts, BarTheme::all().len(), d);
+            app.view = View::Settings {
+                state,
+                sub: Some(SubList::Theme(ts)),
+            };
+        }
+        KeyCode::Enter => {
+            let chosen = ts.selected().and_then(|i| BarTheme::all().get(i)).copied();
+            if let Some(t) = chosen {
+                app.bar = t;
+                let path = settings_path_for_socket(&app.socket);
+                match save_bar_theme(&path, t) {
+                    Ok(()) => app.message = text(Key::BarTheme, app.lang).into(),
+                    Err(e) => app.message = Msg::err(format!("{e}")),
+                }
+            }
+            app.view = super::home_view(app);
+        }
+        _ => {
+            app.view = View::Settings {
+                state,
+                sub: Some(SubList::Theme(ts)),
             }
         }
     }
@@ -161,11 +222,12 @@ fn handle_language_key(
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Settings { state, lang } = app.view.clone() else {
+    let View::Settings { state, sub } = app.view.clone() else {
         return;
     };
-    match lang {
-        Some(lang_state) => draw_language_list(f, area, app, &lang_state),
+    match sub {
+        Some(SubList::Language(ls)) => draw_language_list(f, area, app, &ls),
+        Some(SubList::Theme(ts)) => draw_theme_list(f, area, app, &ts),
         None => draw_settings_items(f, area, app, &state),
     }
 }
@@ -237,6 +299,82 @@ fn draw_language_list(f: &mut Frame, area: Rect, app: &mut App, state: &ListStat
     );
 }
 
+/// 配色列表的那几行。**每一行用它自己那档配色画出来**——设置页和会话里的
+/// F6 浮层共用这一份：两份各写一遍的话，往 `BarTheme` 里加一档就得改两处，
+/// 而漏掉的那一处不会报错，只是少一行。
+///
+/// `current` 单独传进来而不是从 `App` 里取：浮层试穿的时候 `App::bar` 每按
+/// 一下方向键就变一次，而 `✓` 要标的始终是**这一帧的当前档**，两边传的
+/// 恰好都是它。
+pub(crate) fn theme_items(lang: Lang, current: BarTheme) -> Vec<ListItem<'static>> {
+    BarTheme::all()
+        .iter()
+        .map(|t| {
+            // 当前这一档用 `✓` 标出来，跟语言列表同一个约定。
+            let mark = if *t == current { "✓ " } else { "  " };
+            let (sample, style) = theme_sample(*t, lang);
+            ListItem::new(Line::from(vec![
+                Span::raw(mark),
+                Span::styled(sample, style.unwrap_or_else(dim)),
+            ]))
+        })
+        .collect()
+}
+
+/// 一档配色的样品那一格：文字，以及画它该用的样式（`None` = `Lines` 那档，
+/// 它没有底色，由调用方按「暗一点的普通文字」画）。
+///
+/// 单独拎出来只为一件事：**排版和量宽度必须读同一份格式串**。F6 浮层要按
+/// 最宽的一行决定自己多宽，而它量的必须正是这里拼出来的那几个空格，不是
+/// 另一处照着抄的一个数——抄件和正本分叉的时候没有任何东西会报错，屏幕上
+/// 只是有一种语言被截掉半个字。
+fn theme_sample(t: BarTheme, lang: Lang) -> (String, Option<Style>) {
+    let name = t.label(lang);
+    match t.style() {
+        Some(style) => (format!("  {name}  "), Some(style)),
+        None => (format!("  {name} ────  "), None),
+    }
+}
+
+/// 这张列表最宽的一行占几列，含行首那两列（`✓ ` 或者两个空格）。
+pub(crate) fn theme_items_width(lang: Lang) -> usize {
+    BarTheme::all()
+        .iter()
+        .map(|t| 2 + crate::ui::widgets::display_width(&theme_sample(*t, lang).0))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 配色列表。**每一行用它自己那档配色画出来**——配色这种东西描述不出来，
+/// 「灰」「蓝」两个字说不清压在你终端上到底什么样，而这一行本身就是样品。
+///
+/// `Lines` 那一档没有底色可画，用一段横线当样品，跟它选中之后的样子对得上。
+fn draw_theme_list(f: &mut Frame, area: Rect, app: &mut App, state: &ListState) {
+    let items = theme_items(app.lang, app.bar);
+
+    let mut s = state.clone();
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title(format!(
+                        "{} · {}",
+                        text(Key::SettingsTitle, app.lang),
+                        text(Key::BarTheme, app.lang)
+                    ))
+                    .border_style(if app.connected {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::Red)
+                    }),
+            )
+            .highlight_symbol("▶ "),
+        area,
+        &mut s,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,8 +390,91 @@ mod tests {
         st.select(Some(selected));
         app.view = View::Settings {
             state: st,
-            lang: None,
+            sub: None,
         };
+    }
+
+    /// 光标停在**指定的那一项**上。按下标写死的话，往列表中间插一项（「配色」
+    /// 就是这么插进来的）会让一批测试悄悄改测别的东西——它们照样能过，
+    /// 只是不再验原来那件事了。
+    fn on_settings_item(app: &mut App, item: SettingsItem) {
+        let i = SettingsItem::all()
+            .iter()
+            .position(|x| *x == item)
+            .expect("这一项得在列表里");
+        on_settings_items(app, i);
+    }
+
+    /// 顶层选中「配色」按 Enter：进配色子列表，光标落在当前那一档上，
+    /// 而不是直接改配色——那是子列表自己的 Enter 才做的事。
+    #[test]
+    fn entering_colors_opens_the_sub_list_on_the_current_theme() {
+        let (mut app, _dir) = App::test_app();
+        app.bar = BarTheme::Green;
+        on_settings_item(&mut app, SettingsItem::Theme);
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        let View::Settings { sub, .. } = &app.view else {
+            panic!("还应该在设置页");
+        };
+        let Some(SubList::Theme(ts)) = sub else {
+            panic!("该进配色子列表了，实际 {sub:?}");
+        };
+        assert_eq!(
+            ts.selected().and_then(|i| BarTheme::all().get(i)).copied(),
+            Some(BarTheme::Green),
+            "光标该落在当前这一档上"
+        );
+        assert_eq!(app.bar, BarTheme::Green, "只是打开子列表，还没真的选");
+    }
+
+    /// 选中一档按 Enter：当场生效，而且必须落盘——不落盘的话用户下次开
+    /// dct 发现配色变回去了，跟语言那条一个道理。
+    #[test]
+    fn choosing_a_color_applies_it_and_writes_it_to_disk() {
+        let (mut app, _dir) = App::test_app();
+        app.bar = BarTheme::Gray;
+        let i = BarTheme::all()
+            .iter()
+            .position(|t| *t == BarTheme::Purple)
+            .unwrap();
+        let mut ts = ListState::default();
+        ts.select(Some(i));
+        app.view = View::Settings {
+            state: ListState::default(),
+            sub: Some(SubList::Theme(ts)),
+        };
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.bar, BarTheme::Purple, "配色要当场生效");
+        assert_eq!(
+            crate::settings::load_bar_theme(&settings_path_for_socket(&app.socket)),
+            Some(BarTheme::Purple),
+            "必须落盘，否则下次开又变回去"
+        );
+    }
+
+    /// Esc 退出配色子列表不改任何东西，只退一层。
+    #[test]
+    fn escaping_out_of_colors_changes_nothing_and_goes_up_one_level() {
+        let (mut app, _dir) = App::test_app();
+        app.bar = BarTheme::Gray;
+        let mut ts = ListState::default();
+        ts.select(Some(1));
+        app.view = View::Settings {
+            state: ListState::default(),
+            sub: Some(SubList::Theme(ts)),
+        };
+
+        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert_eq!(app.bar, BarTheme::Gray, "Esc 不该改配色");
+        let View::Settings { sub, .. } = &app.view else {
+            panic!("应该退回设置页，不是看板");
+        };
+        assert!(sub.is_none(), "该退回设置项列表，不是留在子列表里");
     }
 
     /// 直接把光标摆进语言子列表——用来测子列表本身的行为，不用每次都先
@@ -263,7 +484,7 @@ mod tests {
         lang_state.select(Some(selected));
         app.view = View::Settings {
             state: ListState::default(),
-            lang: Some(lang_state),
+            sub: Some(SubList::Language(lang_state)),
         };
     }
 
@@ -295,13 +516,14 @@ mod tests {
 
         handle_key(&mut app, key(KeyCode::Down)).unwrap();
 
-        let View::Settings { state, lang } = &app.view else {
+        let View::Settings { state, sub } = &app.view else {
             panic!("还应该在设置页");
         };
-        assert!(lang.is_none(), "顶层列表移动不该顺手进子列表");
+        assert!(sub.is_none(), "顶层列表移动不该顺手进子列表");
+        // 「配色」是后来插在语言和手机通知中间的，所以往下一格到的是它。
         assert_eq!(
             state.selected().and_then(SettingsItem::at),
-            Some(SettingsItem::Phone)
+            Some(SettingsItem::Theme)
         );
     }
 
@@ -315,10 +537,12 @@ mod tests {
 
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
 
-        let View::Settings { lang, .. } = &app.view else {
+        let View::Settings { sub, .. } = &app.view else {
             panic!("还应该在设置页");
         };
-        let lang_state = lang.as_ref().expect("该进语言子列表了");
+        let Some(SubList::Language(lang_state)) = sub else {
+            panic!("该进语言子列表了，实际 {sub:?}");
+        };
         assert_eq!(
             lang_state.selected(),
             Some(1),
@@ -333,7 +557,7 @@ mod tests {
     fn choosing_phone_without_a_daemon_stays_on_settings_with_an_error() {
         let (mut app, _dir) = App::test_app();
         app.lang = Lang::Zh;
-        on_settings_items(&mut app, 1);
+        on_settings_item(&mut app, SettingsItem::Phone);
 
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
 
@@ -372,7 +596,7 @@ mod tests {
             sock,
             crate::ui::ViewMode::List,
         );
-        on_settings_items(&mut app, 1);
+        on_settings_item(&mut app, SettingsItem::Phone);
 
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
         let View::Phone { status } = &app.view else {
@@ -420,10 +644,10 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
 
         assert_eq!(app.lang, Lang::Zh, "Esc 不该改语言");
-        let View::Settings { lang, .. } = &app.view else {
+        let View::Settings { sub, .. } = &app.view else {
             panic!("应该退回设置页，不是看板");
         };
-        assert!(lang.is_none(), "该退回设置项列表，不是留在子列表里");
+        assert!(sub.is_none(), "该退回设置项列表，不是留在子列表里");
     }
 
     /// Esc 不改任何东西。设置页最怕的就是「路过一下就把配置改了」。
