@@ -382,9 +382,24 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
     // 是英文：那是用户自己写的 profile TOML 解析报错，行号已经是
     // 中文「第 N 行」，用户本来就在手改 TOML 文件，英文的语法期望
     // 提示比吞掉更有用（详见该函数的注释）。
-    let title = match warning {
-        Some(w) => format!("{} —— {w}", text(Key::PickAgentTitle, app.lang)),
+    // 标题里带上当前项目。这一屏（`n`/`N` 是浮层，`p` 之后是整屏换掉）铺满了
+    // 九个 agent 的名字和说明，而按下 Enter 的后果是「在某个目录里开一个会话」
+    // ——「哪个目录」原本全屏只有底栏中段那一小块字写着。`p` 选完项目直接弹到
+    // 这儿（见 `ui::pin_project`）之后更要紧：用户刚做完「去哪个项目」这个决定，
+    // 屏幕整个换了一屏，标题上认一眼比回头去底栏找便宜得多。
+    //
+    // 只写组名（最后一段目录名），不写路径：标题是一行，路径动辄几十列，
+    // 挤掉的正是后面那半句 warning——而 warning 是「为什么这一项用不了」的
+    // 唯一出处。同名项目分不清这件事由底栏中段兜着（`project_label` 会往前
+    // 贴父目录）。
+    let here = app.current_group().map(|g| truncate(&g.name, 20));
+    let base = match &here {
+        Some(p) => format!("{} · {p}", text(Key::PickAgentTitle, app.lang)),
         None => text(Key::PickAgentTitle, app.lang).to_string(),
+    };
+    let title = match warning {
+        Some(w) => format!("{base} —— {w}"),
+        None => base,
     };
     let border = if warning.is_some() {
         Style::default().fg(Color::Red)
@@ -1038,6 +1053,41 @@ mod tests {
             ..ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
         });
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+    }
+
+    /// 选 agent 这一屏要写着「在哪个项目里开」。按下 Enter 的后果是在某个
+    /// 目录里起一个会话，而 `p` 之后是直接弹到这儿的——用户刚换完项目，
+    /// 屏幕整个变了样，标题得替他确认一次。
+    #[test]
+    fn the_agent_picker_says_which_project_it_will_open_in() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (mut app, _d) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/Users/lei/work/dc/ai-mania")]);
+        app.view = View::PickProfile {
+            entries: vec![crate::proto::ProfileEntry {
+                name: "claude".into(),
+                label: "Claude".into(),
+                note: String::new(),
+                status: ProfileStatus::Ready,
+                secret: None,
+                install: None,
+                has_secret: false,
+            }],
+            state: ratatui::widgets::ListState::default(),
+            warning: None,
+        };
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let content: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            content.contains("ai-mania"),
+            "标题要写明会开在哪个项目里：{content}"
+        );
     }
 
     fn sess_in(id: u32, dir: &str) -> crate::session::SessionInfo {

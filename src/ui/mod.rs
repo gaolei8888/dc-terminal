@@ -2333,13 +2333,28 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .unwrap_or_default(),
         ),
     };
+    // **反白成一块牌子**，不是加粗了事。加粗的项目名跟旁边同样加粗的按键名
+    // 在同一条底栏上长得几乎一样，用户要先知道「中段是项目」才认得出它——
+    // 而这正是他不知道的那件事。反白是这一整屏里唯一一块底色反过来的地方，
+    // 不需要任何先验知识就跳出来。
+    //
+    // 用 `REVERSED` 而不是挑一个具名色：底栏六档配色（`BarTheme`）的底色从
+    // 236 到 253 都有，`Light` 那档还是深字压浅底。任何写死的前景色都会在
+    // 某一档上糊掉，而反白是相对当前底色定义的，六档全都对。`Lines` 档没有
+    // 实色底，反白拿到的是终端自己的默认前景/背景，同样是一块牌子。
+    //
+    // 前后各垫一个空格：反白的字紧贴着别的字会看不出边界。这两列从**文字
+    // 预算**里出，不从段宽里出——段宽是布局的事，改它会连带动到右段。
+    let chip = widgets::project_label(
+        &name,
+        &parent,
+        project_w.saturating_sub(4) as usize, // -2 和右段的间隔，-2 牌子自己的留白
+    );
     f.render_widget(
-        Paragraph::new(widgets::project_label(
-            &name,
-            &parent,
-            project_w.saturating_sub(2) as usize, // -2 是和右段之间的间隔
-        ))
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {chip} "),
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ))),
         bar[1],
     );
     // 折行而不是截断：截断会把句尾那几个键悄悄抹掉，而用户没有任何线索
@@ -4084,6 +4099,44 @@ mod tests {
             content.contains("dc-terminal"),
             "底部必须显示当前项目，实际（已去空白）: {content}"
         );
+    }
+
+    /// 光写着还不够——它得**一眼看得见**。底栏上项目名旁边全是同样加粗的
+    /// 按键名，不反白的话用户要先知道「中段是项目」才认得出它，而那正是他
+    /// 不知道的那件事。
+    #[test]
+    fn the_current_project_is_reversed_so_it_stands_out() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/Users/lei/work/dc/dc-terminal".into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+            tag: String::new(),
+        }]);
+        app.view = View::Board;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        // 项目名头一个字母所在的那一格必须是反白的。找「有字的反白格」而不是
+        // 整行扫：牌子前后垫的空格也是反白的，只认空格的话，任何一片反白底
+        // 都能让这条测试通过。
+        let reversed = (0..area.height).any(|y| {
+            (0..area.width).any(|x| {
+                buf.cell((x, y))
+                    .map(|c| {
+                        c.symbol() == "d" && c.style().add_modifier.contains(Modifier::REVERSED)
+                    })
+                    .unwrap_or(false)
+            })
+        });
+        assert!(reversed, "底栏中段的项目名要反白成一块牌子");
     }
 
     #[test]
