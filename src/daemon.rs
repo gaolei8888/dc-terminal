@@ -604,6 +604,7 @@ fn handle(
         Request::Screen { id } => mgr.screen(id).map(|snap| Response::Screen {
             lines: snap.lines,
             cursor: snap.cursor,
+            cursor_hidden: snap.cursor_hidden,
             state: snap.state,
             scroll: snap.scroll,
         }),

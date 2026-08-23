@@ -258,6 +258,24 @@ impl PtySession {
             .cursor_position()
     }
 
+    /// agent 有没有把光标藏起来（`?25l`）。
+    ///
+    /// 干活中的 agent 基本都藏光标：Claude Code 画那个转圈的时候光标是关着
+    /// 的，而 vt100 里那个坐标仍然跟着每一次重绘在满屏乱跑。dct 以前不问
+    /// 这件事、每帧都把真实终端的光标按到那个坐标上，屏幕上就多出一个
+    /// 到处蹦的方块——它不是 agent 画面的一部分，是 dct 自己画上去的。
+    ///
+    /// 跟 `cursor()` 分成两个方法而不是让它返回 `Option`：调用方是分开的
+    /// 两件事（一个填坐标、一个决定画不画），而且 `cursor()` 的形状钉在
+    /// `ScreenSnapshot` 和协议里，动它要连着改一串。
+    pub fn cursor_hidden(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .hide_cursor()
+    }
+
     /// 带颜色和粗体等属性的整屏内容，一行一个 `Vec<ScreenSpan>`。
     /// 只传纯文本的话 agent 界面会变成单色，Claude Code 那种靠颜色区分的
     /// 输出基本没法看。

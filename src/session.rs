@@ -22,6 +22,9 @@ use crate::pty::{PtySession, ScreenSpan};
 pub struct ScreenSnapshot {
     pub lines: Vec<Vec<ScreenSpan>>,
     pub cursor: (u16, u16),
+    /// agent 自己把光标关掉了（`?25l`）。界面要跟着关，理由见
+    /// `PtySession::cursor_hidden`。
+    pub cursor_hidden: bool,
     pub scroll: ScrollState,
     pub state: SessionState,
 }
@@ -1077,6 +1080,7 @@ impl SessionManager {
             Ok(ScreenSnapshot {
                 lines: s.pty.screen_spans(),
                 cursor: s.pty.cursor(),
+                cursor_hidden: s.pty.cursor_hidden(),
                 scroll: state_of(v, s.scroll_mark),
                 state: s.state,
             })

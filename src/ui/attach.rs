@@ -391,7 +391,7 @@ fn draw_theme_pick(f: &mut Frame, area: Rect, app: &App, pick: &ThemePick) {
 ///    光标存在的全部理由。
 /// 3. 算出来的位置越出内容区就不画。
 fn cursor_at(app: &App, inner: Rect) -> Option<(u16, u16)> {
-    if app.theme_pick.is_some() {
+    if app.screen_cursor_hidden || app.theme_pick.is_some() {
         return None;
     }
     let (row, col) = app.screen_cursor;
@@ -852,6 +852,21 @@ mod tests {
         assert_eq!(app.bar, BarTheme::Gray, "普通键不该改配色");
     }
 
+    /// **agent 关了光标，dct 就不许画。** 干活中的 agent 差不多都关着它，
+    /// 而 `screen_cursor` 那个坐标仍然跟着每一次重绘满屏乱跑——照着画就是
+    /// 一个在屏幕上到处蹦的方块，而且那个方块不是 agent 画的，是 dct 按上去的。
+    #[test]
+    fn a_hidden_cursor_is_not_drawn() {
+        let (mut app, _d) = attached_app();
+        let inner = Rect::new(0, 1, 80, 20);
+        app.screen_cursor = (5, 9);
+
+        assert_eq!(cursor_at(&app, inner), Some((9, 6)), "前提：平时是画的");
+
+        app.screen_cursor_hidden = true;
+        assert_eq!(cursor_at(&app, inner), None, "agent 藏了光标就别画");
+    }
+
     /// 浮层开着时也不画：光标存在的全部理由是「我打的字会落在哪」，而这时候
     /// 键盘归浮层，那个坐标已经不回答这个问题了。
     #[test]
@@ -916,6 +931,27 @@ mod tests {
             (p.x, p.y),
             (0, 0),
             "浮层开着这一帧不该再按光标——它还停在终端的初始位置上"
+        );
+    }
+
+    /// 同上，换 agent 自己关光标那条：**画的时候真的问了这件事**。
+    #[test]
+    fn a_hidden_cursor_never_reaches_the_terminal() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
+        app.view = View::Attached(1);
+        app.screen_cursor = (5, 9);
+        app.screen_cursor_hidden = true;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let p = term.get_cursor_position().unwrap();
+        assert_eq!(
+            (p.x, p.y),
+            (0, 0),
+            "agent 关了光标，这一帧就不该把终端光标按到画面里"
         );
     }
 

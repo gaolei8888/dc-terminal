@@ -730,11 +730,13 @@ pub fn run(
                 Ok(Response::Screen {
                     lines,
                     cursor,
+                    cursor_hidden,
                     state,
                     ..
                 }) => {
                     app.screen = lines;
                     app.screen_cursor = cursor;
+                    app.screen_cursor_hidden = cursor_hidden;
                     app.connected = true;
                     // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
@@ -4459,6 +4461,7 @@ mod tests {
         let ok: Result<Response> = Ok(Response::Screen {
             lines: Vec::new(),
             cursor: (0, 0),
+            cursor_hidden: false,
             state: SessionState::Idle,
             scroll: fresh,
         });

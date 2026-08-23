@@ -47,6 +47,16 @@ pub struct App {
     pub message: Msg,
     pub screen: Vec<Vec<ScreenSpan>>,
     pub screen_cursor: (u16, u16),
+    /// agent 把光标关掉了（`?25l`），最近一次 `Screen` 响应带回来的。
+    ///
+    /// **这不是「要不要画光标」的全部答案，只是其中一条**：另一条是
+    /// dct 自己开的浮层（配色选择器）——那时候键盘归浮层，agent 画面里
+    /// 那个坐标已经不是「你打的字会落在哪」了。两条都在 `attach::draw`
+    /// 里汇到一处（`cursor_at`）。
+    ///
+    /// 默认 `false` = 画光标：旧守护进程压根不发这个字段，补出来的就是
+    /// 这个值，而那正是它一直以来的行为。
+    pub screen_cursor_hidden: bool,
     /// 最近一次 `Screen` 响应带回来的滚动状态。滚轮和翻页键都要看它分流
     /// （agent 自己攥着画面还是 dct 攥着），底栏的滚动提示也要看它——
     /// 每帧都会被刷新，滞后最多一帧，够用了。
@@ -211,6 +221,7 @@ impl App {
             message: "".into(),
             screen: Vec::new(),
             screen_cursor: (0, 0),
+            screen_cursor_hidden: false,
             scroll: ScrollState::default(),
             screen_origin: None,
             screen_area: None,

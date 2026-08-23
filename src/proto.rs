@@ -49,6 +49,13 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// / `PhoneDisable` 四条，`Response::Phone(PhoneStatus)`。旧守护进程完全不
 /// 认识这几条请求，界面发过去只会得到一句解析失败——跟 `Kill`/`Prune` 那次
 /// 加一是同一个理由。
+///
+/// 7（事后追加，没有加一）= `Response::Screen` 多了 `cursor_hidden`（agent
+/// 自己把光标关掉了没有）。走的是 `SessionInfo.tag` 那次例外的同一条口子，
+/// 两个条件同样都满足：字段带 `#[serde(default)]`（旧守护进程不发它，新界面
+/// 补成 `false`，正是「照今天这样一直画着光标」的老行为），且没有新增或
+/// 改动任何 `Request` 变体——旧守护进程完全不需要「懂」这个字段。允许条件
+/// 和「这不能当先例」的警告见 `the_session_info_shape_is_pinned_too` 上的注释。
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 对面那个守护进程能不能用。
@@ -392,6 +399,15 @@ pub enum Response {
     Screen {
         lines: Vec<Vec<ScreenSpan>>,
         cursor: (u16, u16),
+        /// agent 自己把光标藏起来了（`?25l`）。**界面必须跟着藏**——
+        /// 干活中的 agent 差不多都藏着光标（Claude Code 画转圈的时候就是），
+        /// 而 `cursor` 那个坐标仍然跟着它每一次重绘满屏乱跑；不问这件事就
+        /// 每帧把真实终端的光标按上去，屏幕上多出来的是一个到处蹦的方块。
+        ///
+        /// `#[serde(default)]`：旧守护进程不发这个字段，补 `false` 正好是
+        /// 「一直画着光标」的老行为，不会被误读成别的。
+        #[serde(default)]
+        cursor_hidden: bool,
         /// 贴在会话里时界面只调 `Screen`（`List` 太贵，见 `ui::run` 里的注释），
         /// 所以进程死了它只能从这里知道。少了它界面会永远画那张空缓冲——
         /// agent 退出时恢复主屏，主屏从来没被写过，所以「屏是空的」是正常的，
@@ -866,6 +882,21 @@ mod tests {
         match r {
             Response::Screen { scroll, .. } => {
                 assert_eq!(scroll, crate::session::ScrollState::default());
+            }
+            _ => panic!("解成了别的变体"),
+        }
+    }
+
+    /// 同上，换 `cursor_hidden` 这个后加的字段：旧守护进程回的 JSON 里
+    /// 没有它，新界面必须解得出来，而且补出来的 `false` 就是「照旧一直
+    /// 画着光标」——跟旧守护进程的真实行为对得上。
+    #[test]
+    fn a_screen_response_without_cursor_hidden_still_parses() {
+        let old = r#"{"Screen":{"lines":[],"cursor":[0,0],"state":"Idle"}}"#;
+        let r: Response = serde_json::from_str(old).unwrap();
+        match r {
+            Response::Screen { cursor_hidden, .. } => {
+                assert!(!cursor_hidden, "缺字段要补成「没藏」，也就是照旧画光标");
             }
             _ => panic!("解成了别的变体"),
         }
