@@ -1,0 +1,815 @@
+<title>dct Agent Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+
+<style>
+  /* ── tokens ─────────────────────────────────────────────────────────
+     Light is the base set. Dark redefines the same names twice: once for
+     the OS preference (guarded so an explicit light choice still wins),
+     once for the explicit stamp. No component reaches for a raw colour. */
+  :root {
+    --ground:      #ECEEF2;
+    --surface:     #F7F8FA;
+    --plate:       #171A20;   /* the terminal is dark in both themes */
+    --plate-ink:   #D6DAE1;
+    --plate-dim:   #79828F;
+    --ink:         #14161B;
+    --ink-soft:    #39414D;
+    --muted:       #56606E;
+    --rule:        #C9CFD8;
+    --accent:      #005F87;
+    --accent-soft: #D8E7EE;
+    --good:        #2F6F3E;
+    --alarm:       #A8322A;
+    --chip-bg:     #14161B;
+    --chip-ink:    #ECEEF2;
+
+    --col:   66ch;   /* running text */
+    --wide:  90ch;   /* plates break out to here */
+
+    --step--1: clamp(0.82rem, 0.79rem + 0.15vw, 0.9rem);
+    --step-0:  clamp(1.02rem, 0.98rem + 0.2vw, 1.14rem);
+    --step-1:  clamp(1.2rem, 1.12rem + 0.4vw, 1.4rem);
+    --step-2:  clamp(1.5rem, 1.34rem + 0.8vw, 2rem);
+    --step-3:  clamp(2.1rem, 1.7rem + 2vw, 3.4rem);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0F1116;
+      --surface:     #171A20;
+      --plate:       #0A0C10;
+      --plate-ink:   #D6DAE1;
+      --plate-dim:   #6C7684;
+      --ink:         #E7EAEF;
+      --ink-soft:    #C2C8D2;
+      --muted:       #8B95A5;
+      --rule:        #262B34;
+      --accent:      #63B3D9;
+      --accent-soft: #14303D;
+      --good:        #7FC08C;
+      --alarm:       #E88C7D;
+      --chip-bg:     #E7EAEF;
+      --chip-ink:    #0F1116;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0F1116;
+    --surface:     #171A20;
+    --plate:       #0A0C10;
+    --plate-ink:   #D6DAE1;
+    --plate-dim:   #6C7684;
+    --ink:         #E7EAEF;
+    --ink-soft:    #C2C8D2;
+    --muted:       #8B95A5;
+    --rule:        #262B34;
+    --accent:      #63B3D9;
+    --accent-soft: #14303D;
+    --good:        #7FC08C;
+    --alarm:       #E88C7D;
+    --chip-bg:     #E7EAEF;
+    --chip-ink:    #0F1116;
+  }
+
+  /* ── language ───────────────────────────────────────────────────────
+     No stamp yet (script blocked, or it hasn't run) → English shows and
+     Chinese stays hidden, so the page never renders both at once. */
+  :root:not([data-lang]) [lang="zh"],
+  :root[data-lang="en"] [lang="zh"] { display: none; }
+  :root[data-lang="zh"] [lang="en"] { display: none; }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Source Serif 4", Georgia, "Songti SC", serif;
+    font-size: var(--step-0);
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* one column, plates break out of it */
+  .wrap {
+    max-width: var(--wide);
+    margin: 0 auto;
+    padding: 0 clamp(1.1rem, 4vw, 2.5rem) 5rem;
+  }
+  .col { max-width: var(--col); }
+
+  h1, h2, h3 {
+    font-family: "IBM Plex Sans", system-ui, "PingFang SC", sans-serif;
+    color: var(--ink);
+    text-wrap: balance;
+    letter-spacing: -0.018em;
+    margin: 0;
+  }
+  h1 { font-size: var(--step-3); font-weight: 700; line-height: 1.04; }
+  h2 { font-size: var(--step-2); font-weight: 600; line-height: 1.15; }
+  h3 { font-size: var(--step-1); font-weight: 600; line-height: 1.25; }
+  p  { margin: 0; }
+  a  { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+  }
+
+  code, kbd, pre, .mono {
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-ligatures: none;
+  }
+  p code, li code, td code {
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 0.08em 0.34em;
+    border-radius: 2px;
+  }
+
+  /* the chip: dct marks "where you are" by reversing the bar. The page
+     borrows the same device for its section markers. */
+  .chip {
+    display: inline-block;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    background: var(--chip-bg);
+    color: var(--chip-ink);
+    padding: 0.2em 0.6em;
+  }
+
+  /* ── top bar ────────────────────────────────────────────────────── */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.7rem clamp(1.1rem, 4vw, 2.5rem);
+    background: color-mix(in srgb, var(--ground) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--rule);
+  }
+  .wordmark {
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 600;
+    font-size: 1.05rem;
+    letter-spacing: 0.02em;
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .wordmark::after {
+    content: "▌";
+    color: var(--accent);
+    animation: blink 1.2s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .topbar .spacer { flex: 1; }
+  .topbar a.plain { color: var(--muted); text-decoration: none; font-family: "IBM Plex Mono", monospace; font-size: var(--step--1); }
+  .topbar a.plain:hover { color: var(--ink); }
+  .langtoggle {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--muted);
+    padding: 0.25rem 0.55rem;
+    cursor: pointer;
+  }
+  .langtoggle:hover { color: var(--ink); border-color: var(--ink); }
+
+  /* ── hero ───────────────────────────────────────────────────────── */
+  .hero { padding: clamp(3rem, 9vw, 6rem) 0 clamp(1.6rem, 4vw, 2.4rem); }
+  .hero .lede {
+    font-size: var(--step-1);
+    color: var(--ink-soft);
+    margin-top: 1.4rem;
+    max-width: var(--col);
+  }
+  .hero .kicker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 1.6rem;
+  }
+  .tag {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    color: var(--muted);
+    border: 1px solid var(--rule);
+    padding: 0.16em 0.5em;
+  }
+
+  /* ── terminal plate ─────────────────────────────────────────────── */
+  .plate {
+    margin: 2rem 0;
+    background: var(--plate);
+    border: 1px solid var(--rule);
+    box-shadow: 0 1px 0 var(--rule);
+  }
+  .plate .bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.7rem;
+    border-bottom: 1px solid #262B34;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    color: var(--plate-dim);
+  }
+  .plate .dot {
+    width: 0.55em; height: 0.55em;
+    border-radius: 50%;
+    background: var(--plate-dim);
+    opacity: 0.5;
+  }
+  .plate pre {
+    margin: 0;
+    padding: 0.9rem 0.9rem 1.1rem;
+    overflow-x: auto;
+    color: var(--plate-ink);
+    font-size: clamp(0.62rem, 0.5rem + 1.05vw, 0.83rem);
+    line-height: 1.45;
+    tab-size: 8;
+  }
+  .plate .cap {
+    padding: 0.6rem 0.9rem;
+    border-top: 1px solid #262B34;
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: var(--step--1);
+    color: var(--plate-dim);
+    line-height: 1.5;
+  }
+  /* the reversed chip, as it really renders in the bottom bar */
+  .rev { background: var(--plate-ink); color: var(--plate); }
+  .b   { color: #E7EAEF; font-weight: 500; }
+  .dim { color: var(--plate-dim); }
+  .ok  { color: #7FC08C; }
+  .warn{ color: #E8C07D; }
+  .bad { color: #E88C7D; }
+  .cy  { color: #63B3D9; }
+
+  /* ── sections ───────────────────────────────────────────────────── */
+  section { padding: clamp(2.6rem, 7vw, 4.5rem) 0 0; }
+  .head { display: flex; flex-direction: column; gap: 0.9rem; margin-bottom: 1.5rem; }
+  .body > * + * { margin-top: 1.1rem; }
+  .body { max-width: var(--col); color: var(--ink-soft); }
+  .body strong { color: var(--ink); font-weight: 600; }
+
+  /* key list — two columns of monospace keys, collapses on narrow screens */
+  .keys {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.45rem 1rem;
+    max-width: var(--col);
+    margin-top: 1.4rem;
+    font-size: var(--step--1);
+  }
+  .keys dt {
+    font-family: "IBM Plex Mono", monospace;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .keys dd { margin: 0; color: var(--ink-soft); font-size: var(--step-0); }
+
+  /* agent cards */
+  .agents {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin-top: 1.6rem;
+  }
+  .agent { background: var(--surface); padding: 0.9rem 1rem; }
+  .agent h3 { font-size: var(--step-0); }
+  .agent p { font-size: var(--step--1); color: var(--muted); margin-top: 0.25rem; }
+  .agent .needs {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    color: var(--accent);
+    margin-top: 0.5rem;
+    display: block;
+  }
+
+  /* install blocks */
+  .snippet {
+    margin-top: 1.2rem;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+  }
+  .snippet .label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid var(--rule);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    color: var(--muted);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .snippet pre {
+    margin: 0;
+    padding: 0.8rem 0.75rem;
+    overflow-x: auto;
+    font-size: var(--step--1);
+    color: var(--ink);
+    line-height: 1.6;
+  }
+  .copy {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--muted);
+    padding: 0.1rem 0.45rem;
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .copy:hover { color: var(--ink); border-color: var(--ink); }
+
+  /* honest list */
+  .limits { max-width: var(--col); margin-top: 1.4rem; display: grid; gap: 1rem; }
+  .limit {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.75rem;
+    align-items: start;
+    font-size: var(--step--1);
+    color: var(--ink-soft);
+    line-height: 1.6;
+  }
+  .limit .mark {
+    font-family: "IBM Plex Mono", monospace;
+    color: var(--alarm);
+    font-size: var(--step-0);
+    line-height: 1.3;
+  }
+  .limit strong { color: var(--ink); }
+
+  footer {
+    margin-top: clamp(3rem, 8vw, 5rem);
+    border-top: 1px solid var(--rule);
+    padding-top: 1.4rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.4rem;
+    align-items: baseline;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: var(--step--1);
+    color: var(--muted);
+  }
+
+  /* Content is visible by default. The reveal only arms itself once the
+     script has run and stamped the root — a blocked or broken script must
+     never leave the page blank, which is exactly what an opacity:0 default
+     does. */
+  :root[data-anim="on"] .reveal { opacity: 0; transform: translateY(6px); }
+  :root[data-anim="on"] .reveal.in {
+    opacity: 1;
+    transform: none;
+    transition: opacity .5s ease, transform .5s ease;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :root[data-anim="on"] .reveal,
+    :root[data-anim="on"] .reveal.in { opacity: 1; transform: none; transition: none; }
+    .wordmark::after { animation: none; }
+  }
+</style>
+
+<header class="topbar">
+  <a class="wordmark" href="#top">dct</a>
+  <span class="spacer"></span>
+  <a class="plain" href="https://github.com/gaolei8888/dc-terminal">github</a>
+  <button class="langtoggle" id="lang" type="button" aria-label="Switch language">
+    <span lang="en">中文</span><span lang="zh">EN</span>
+  </button>
+</header>
+
+<div class="wrap" id="top">
+
+  <div class="hero reveal">
+    <div class="kicker">
+      <span class="chip">dc-terminal</span>
+      <span class="tag">Rust</span>
+      <span class="tag">macOS · Linux · Windows</span>
+      <span class="tag">v0.2.2</span>
+    </div>
+    <h1>
+      <span lang="en">Agents that keep working<br>after you close the laptop.</span>
+      <span lang="zh">关掉笔记本，<br>它们继续干活。</span>
+    </h1>
+    <p class="lede">
+      <span lang="en">A board for coding agents. Start a few, let them work in separate
+      projects, close the terminal. Come back, find one made a mess, press one key
+      and it's gone.</span>
+      <span lang="zh">一块给 coding agent 用的板子。开几个，让它们在各自的项目里干活，然后把终端关掉。
+      回来发现哪个搞砸了，按一个键，就当没发生过。</span>
+    </p>
+  </div>
+
+  <div class="plate reveal">
+    <div class="bar"><span class="dot"></span><span>dct — the board</span></div>
+<pre><span class="b">dct sessions</span><span class="dim">────────────────────────────────────────────────────</span>
+  <span class="cy">┃</span> 1 ▾ <span class="b">ai-mania</span>          ~/work            <span class="dim">claude×1</span>
+<span class="cy">▶ ┃</span>    3  <span class="ok">idle</span>    rewrite the cra…
+    2 ▾ <span class="b">dc-terminal</span>       ~/work/dc         <span class="dim">claude×1 codex×1</span>
+       1  <span class="warn">working</span> fix the login b…
+       2  <span class="ok">idle</span>    port the picker…
+
+<span class="dim">────────────────────────────────────────────────────────────────────</span>
+<span class="cy">q quit</span>         <span class="rev"> ai-mania </span>       <span class="dim">Enter open  n new  Tab project  ? …</span></pre>
+    <div class="cap">
+      <span lang="en">Grouped by project. The bar down the left marks where you are —
+      that's the project <code>n</code> opens in.</span>
+      <span lang="zh">按项目分组。左边那条竖线标着你在哪个项目里——<code>n</code> 就开在那儿。</span>
+    </div>
+  </div>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">the deal</span><span lang="zh">前提</span></span>
+      <h2>
+        <span lang="en">It never asks “is this okay?”</span>
+        <span lang="zh">它从来不问「这样可以吗？」</span>
+      </h2>
+    </div>
+    <div class="body">
+      <p>
+        <span lang="en"><strong>Precisely because you can always take it back.</strong>
+        Before every turn, dct takes a hidden snapshot of the project. That is what
+        makes it safe to turn permission prompts off entirely: agents don't stall
+        waiting for you to say yes, and whatever they break is one keypress away
+        from undone.</span>
+        <span lang="zh"><strong>正因为你随时能收回来。</strong>每一轮开始之前，dct 会给项目拍一张隐藏快照。
+        正是这一点让「把所有确认提示关掉」变得安全：agent 不会停在那儿等你点同意，
+        而它弄坏的任何东西，一个键就能撤回来。</span>
+      </p>
+      <p>
+        <span lang="en">Snapshots go through git, but on the side of git you never look
+        at. Your branches, your staging area and your <code>git log</code> stay
+        clean.</span>
+        <span lang="zh">快照走的是 git，但走的是你从来不看的那一侧。你的分支、暂存区、<code>git log</code>
+        全都干干净净。</span>
+      </p>
+      <dl class="keys">
+        <dt>u</dt><dd><span lang="en">back to the last snapshot</span><span lang="zh">回到上一张快照</span></dd>
+        <dt>d</dt><dd><span lang="en">what did this session actually change</span><span lang="zh">这个会话到底改了什么</span></dd>
+        <dt>s</dt><dd><span lang="en">stop it</span><span lang="zh">停掉它</span></dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">the daemon</span><span lang="zh">守护进程</span></span>
+      <h2>
+        <span lang="en">Sessions outlive the terminal</span>
+        <span lang="zh">会话比终端活得久</span>
+      </h2>
+    </div>
+    <div class="body">
+      <p>
+        <span lang="en">The first run starts a background daemon, and <strong>the daemon is
+        the product</strong>. Close the window, shut the lid, come back tomorrow — the
+        sessions are still running exactly where they were. <code>dct</code> itself
+        is just the window you reattach with.</span>
+        <span lang="zh">第一次运行会起一个后台守护进程，而<strong>守护进程才是这个产品本身</strong>。
+        关窗口、合上盖子、明天再来——会话还在原地跑着。<code>dct</code> 只是你重新贴上去的那扇窗。</span>
+      </p>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">the board</span><span lang="zh">看板</span></span>
+      <h2>
+        <span lang="en">One keypress per thing you'd want</span>
+        <span lang="zh">想做的每件事都是一个键</span>
+      </h2>
+    </div>
+    <div class="body">
+      <p>
+        <span lang="en">Every project remembers its own last agent: press <code>n</code> in
+        one and you get claude, press it in another and you get codex — and the bottom
+        bar names which one before you press anything.</span>
+        <span lang="zh">每个项目各自记着上次用的 agent：在这个项目里按 <code>n</code> 开出 claude，
+        在那个项目里按 <code>n</code> 开出 codex——按下去之前，底栏就写着这一下会开出谁。</span>
+      </p>
+    </div>
+    <dl class="keys">
+      <dt>Tab</dt><dd><span lang="en">switch project</span><span lang="zh">换项目</span></dd>
+      <dt>1…9</dt><dd><span lang="en">jump straight to the Nth project</span><span lang="zh">直接跳到第 N 个项目</span></dd>
+      <dt>n / N</dt><dd><span lang="en">new session — last agent, or pick one</span><span lang="zh">新会话——上次那个 agent，或者挑一个</span></dd>
+      <dt>p</dt><dd><span lang="en">put another project on the board, and start work in it</span><span lang="zh">把另一个项目摆上看板，并且直接开工</span></dd>
+      <dt>Enter</dt><dd><span lang="en">open a session, full screen</span><span lang="zh">进入会话，整屏</span></dd>
+      <dt>g</dt><dd><span lang="en">tile grid — every live screen at once</span><span lang="zh">九宫格——所有会话的实时画面</span></dd>
+      <dt>i</dt><dd><span lang="en">reply to an agent without leaving the grid</span><span lang="zh">不离开九宫格，直接回一句话</span></dd>
+      <dt>F2</dt><dd><span lang="en">back out of a session (the only key dct keeps)</span><span lang="zh">从会话里退出来（dct 只留这一个键）</span></dd>
+      <dt>?</dt><dd><span lang="en">every key that does something right now</span><span lang="zh">此刻真的有用的每一个键</span></dd>
+    </dl>
+  </section>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">nine agents</span><span lang="zh">九个 agent</span></span>
+      <h2>
+        <span lang="en">One door, including the ones that don't work yet</span>
+        <span lang="zh">一扇门，连现在用不了的那几个也在里面</span>
+      </h2>
+    </div>
+    <div class="body">
+      <p>
+        <span lang="en">Press <code>N</code> and you get all nine. The ones this machine
+        can't run are greyed out <em>with the reason</em>, and picking one takes you
+        toward fixing it instead of just saying no: not installed opens a session
+        running the installer, so you watch it work; no key opens a box to paste
+        into, with a link to wherever you get one.</span>
+        <span lang="zh">按 <code>N</code>，九个全在。这台机器上跑不了的那几个是灰的，<em>并且写着原因</em>；
+        选中它不是碰一鼻子灰，而是往「把它修好」那边走一步：没装就开一个会话跑安装命令，
+        你看着它装；没密钥就弹一个粘贴框，附带一个去哪儿拿密钥的链接。</span>
+      </p>
+      <p>
+        <span lang="en">Keys are checked against the real endpoint before they're saved,
+        so paste half a key and you find out immediately — not ten seconds later,
+        inside a session full of English error text.</span>
+        <span lang="zh">密钥存下来之前会拿真的接口验一遍：粘贴了半截，你当场就知道，
+        而不是十秒钟后在一屏英文报错里发现。</span>
+      </p>
+    </div>
+
+    <div class="plate">
+      <div class="bar"><span class="dot"></span><span>dct — pick an agent</span></div>
+<pre><span class="b">Pick an agent · ai-mania</span> <span class="bad">—— not a git project — g to init</span><span class="dim">──────────</span>
+<span class="cy">▶</span> 1. <span class="b">Claude</span>        <span class="dim">Official Anthropic CLI</span>
+  2. <span class="b">Codex</span>         <span class="dim">Official OpenAI CLI</span>
+  <span class="dim">3. OpenCode      Open source, works with ma…(not installed)</span>
+  <span class="dim">4. Kimi          Moonshot AI, through the C…(no key yet)</span>
+  5. <span class="b">Terminal</span>      <span class="dim">A plain terminal, no AI</span>
+
+<span class="dim">────────────────────────────────────────────────────────────────────</span>
+<span class="cy">Esc back</span>       <span class="rev"> ai-mania </span>       <span class="dim">↑↓ select  Enter confirm  g init git</span></pre>
+      <div class="cap">
+        <span lang="en">Agents need a git project — that's where undo comes from. If this
+        one isn't a repository yet, the picker says so before you choose, and
+        <code>g</code> makes one right there.</span>
+        <span lang="zh">agent 要的是一个 git 仓库——撤销就是从那儿来的。这个项目还不是仓库的话，
+        选择器在你动手之前就说明白了，<code>g</code> 当场建一个。</span>
+      </div>
+    </div>
+
+    <div class="agents">
+      <div class="agent">
+        <h3>Claude</h3>
+        <p><span lang="en">Anthropic's CLI</span><span lang="zh">Anthropic 官方 CLI</span></p>
+        <span class="needs">claude</span>
+      </div>
+      <div class="agent">
+        <h3>Codex</h3>
+        <p><span lang="en">OpenAI's CLI</span><span lang="zh">OpenAI 官方 CLI</span></p>
+        <span class="needs">codex</span>
+      </div>
+      <div class="agent">
+        <h3>OpenCode</h3>
+        <p><span lang="en">open source, many models</span><span lang="zh">开源，接很多模型</span></p>
+        <span class="needs">opencode</span>
+      </div>
+      <div class="agent">
+        <h3>Qwen Code</h3>
+        <p><span lang="en">Alibaba, its own CLI</span><span lang="zh">阿里，自己的 CLI</span></p>
+        <span class="needs">qwen</span>
+      </div>
+      <div class="agent">
+        <h3>Kimi · GLM · DeepSeek · Qwen API</h3>
+        <p><span lang="en">not separate programs — <code>claude</code> pointed at somebody
+        else's Anthropic-compatible endpoint</span>
+        <span lang="zh">不是四个独立程序——是 <code>claude</code> 指到别人家的 Anthropic 兼容接口上</span></p>
+        <span class="needs">claude + key</span>
+      </div>
+      <div class="agent">
+        <h3><span lang="en">Terminal</span><span lang="zh">命令行</span></h3>
+        <p><span lang="en">a plain shell, no AI, works anywhere</span><span lang="zh">一个普通终端，没有 AI，哪儿都能开</span></p>
+        <span class="needs">—</span>
+      </div>
+    </div>
+
+    <div class="body" style="margin-top:1.4rem">
+      <p>
+        <span lang="en">Keys live in <code>~/.dct/secrets.toml</code>, mode 0600, nowhere
+        near the profile files — those you can copy between machines or hand to a
+        colleague. Want your own agent? Drop a TOML file in
+        <code>~/.dct/profiles/</code>. Nothing to rebuild, nothing to restart.</span>
+        <span lang="zh">密钥放在 <code>~/.dct/secrets.toml</code>，权限 0600，跟 profile 文件离得远远的——
+        后者你可以随便拷到别的机器上、或者发给同事。想加自己的 agent？往
+        <code>~/.dct/profiles/</code> 里丢一个 TOML 文件，不用重编，也不用重启。</span>
+      </p>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">away from the desk</span><span lang="zh">人不在电脑前</span></span>
+      <h2>
+        <span lang="en">It can find you on your phone</span>
+        <span lang="zh">它能在手机上找到你</span>
+      </h2>
+    </div>
+    <div class="body">
+      <p>
+        <span lang="en">Pair a Telegram bot and dct pushes one message when a session
+        finishes, fails or disappears — several things that happened while you were
+        away arrive merged into one, not as forty notifications. Reply to a push and
+        your answer is typed into that session for you.</span>
+        <span lang="zh">配一个 Telegram bot，会话干完了、报错了、自己没了，dct 就推一条消息过来——
+        你不在的这段时间里发生的好几件事会合并成一条，而不是四十条推送。
+        长按回复一条推送，你说的话就被敲进那个会话里。</span>
+      </p>
+      <p>
+        <span lang="en">The bot's username is public, so the first person to write after
+        you fill in the token becomes the owner, and everyone else is discarded
+        forever.</span>
+        <span lang="zh">bot 的用户名是公开可搜的，所以规则是：令牌填完之后第一个发消息的人成为主人，
+        其余所有人的消息永远丢弃。</span>
+      </p>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">install</span><span lang="zh">装上它</span></span>
+      <h2>
+        <span lang="en">Two commands, either platform</span>
+        <span lang="zh">两条命令，两个平台</span>
+      </h2>
+    </div>
+    <div class="body">
+      <p>
+        <span lang="en">You need Rust 1.80 or newer and <code>git</code>. On macOS and
+        Linux you also need a C toolchain, because the TLS stack compiles some C.</span>
+        <span lang="zh">需要 Rust 1.80 或更新，以及 <code>git</code>。macOS 和 Linux 上还需要一套 C 工具链，
+        因为 TLS 那一层要编一点 C。</span>
+      </p>
+    </div>
+
+    <div class="snippet">
+      <div class="label"><span>macOS · Linux</span><button class="copy" type="button" data-copy="git clone https://github.com/gaolei8888/dc-terminal
+cd dc-terminal
+./scripts/install.sh">copy</button></div>
+<pre>git clone https://github.com/gaolei8888/dc-terminal
+cd dc-terminal
+./scripts/install.sh</pre>
+    </div>
+
+    <div class="snippet">
+      <div class="label"><span>Windows · PowerShell</span><button class="copy" type="button" data-copy="git clone https://github.com/gaolei8888/dc-terminal
+cd dc-terminal
+scripts\install.cmd">copy</button></div>
+<pre>git clone https://github.com/gaolei8888/dc-terminal
+cd dc-terminal
+scripts\install.cmd</pre>
+    </div>
+
+    <div class="body" style="margin-top:1.2rem">
+      <p>
+        <span lang="en"><strong>Windows is native — no WSL.</strong> No Visual Studio Build
+        Tools either: <code>winget install Rustlang.Rustup</code> plus the WinLibs mingw
+        is enough, and the installer checks for the one piece rustup's own bundled
+        mingw is missing before it starts compiling.</span>
+        <span lang="zh"><strong>Windows 是原生的，不用 WSL。</strong>也不需要 Visual Studio Build Tools：
+        <code>winget install Rustlang.Rustup</code> 加一套 WinLibs mingw 就够，
+        而 rustup 自带那套 mingw 缺的那一个东西，安装脚本会在开始编译之前先替你查出来。</span>
+      </p>
+      <p>
+        <span lang="en">Then run <code>dct</code> inside any git project.</span>
+        <span lang="zh">然后在任何一个 git 项目里敲 <code>dct</code>。</span>
+      </p>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="head">
+      <span class="chip"><span lang="en">before you install</span><span lang="zh">装之前先看这个</span></span>
+      <h2>
+        <span lang="en">Things that will annoy you</span>
+        <span lang="zh">会让你不爽的地方</span>
+      </h2>
+    </div>
+    <div class="limits">
+      <div class="limit">
+        <span class="mark">!</span>
+        <p>
+          <span lang="en"><strong>The four vendor endpoints have never been tested with a
+          real account.</strong> Kimi, GLM, DeepSeek and Qwen API are copied out of public
+          documentation. A key can verify fine and the session still fail to start.
+          Treat them as unverified.</span>
+          <span lang="zh"><strong>那四个厂商接口从来没用真账号跑通过。</strong>Kimi、GLM、DeepSeek、Qwen API
+          都是照着公开文档抄下来的。密钥验得过，会话照样可能起不来。当它们是没验证过的。</span>
+        </p>
+      </div>
+      <div class="limit">
+        <span class="mark">!</span>
+        <p>
+          <span lang="en"><strong>Permissions are auto-accepted, so an agent can write
+          outside the project directory.</strong> Those writes are outside the snapshot,
+          and undo won't bring them back.</span>
+          <span lang="zh"><strong>所有确认都是自动同意的，agent 可以往项目目录外面写东西。</strong>
+          那些改动不在快照里，撤销拿不回来。</span>
+        </p>
+      </div>
+      <div class="limit">
+        <span class="mark">!</span>
+        <p>
+          <span lang="en">Two agents in one project will fight over the same files.
+          Different projects, no problem.</span>
+          <span lang="zh">同一个项目里开两个 agent，它们会抢同一批文件。不同项目就没这问题。</span>
+        </p>
+      </div>
+      <div class="limit">
+        <span class="mark">!</span>
+        <p>
+          <span lang="en">A session is stuck with the agent it was born with. There's no
+          swapping Claude for Codex halfway through — the whole conversation lives
+          inside that process.</span>
+          <span lang="zh">会话生下来是哪个 agent 就是哪个，中途换不了——整段对话就活在那个进程里。</span>
+        </p>
+      </div>
+      <div class="limit">
+        <span class="mark">!</span>
+        <p>
+          <span lang="en">Automatic session names need an <code>[llm]</code> backend
+          configured, and most people don't have one. Without it the name falls back
+          to the first thing you typed; nothing errors, nothing interrupts.</span>
+          <span lang="zh">自动给会话起名字需要配一个 <code>[llm]</code> 后端，多数人没有。
+          没有的话名字就退回你打的第一句话；不报错，也不打断你。</span>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <a href="https://github.com/gaolei8888/dc-terminal">github.com/gaolei8888/dc-terminal</a>
+    <span><span lang="en">Rust · macOS, Linux, Windows</span><span lang="zh">Rust · macOS、Linux、Windows</span></span>
+    <span class="spacer"></span>
+    <span><span lang="en">design notes live in <code>docs/superpowers/specs/</code></span><span lang="zh">设计文档在 <code>docs/superpowers/specs/</code></span></span>
+  </footer>
+</div>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+
+    // language: remembered choice, else the browser's, else English.
+    var saved = null;
+    try { saved = localStorage.getItem("dct-lang"); } catch (e) {}
+    var lang = saved || ((navigator.language || "en").toLowerCase().indexOf("zh") === 0 ? "zh" : "en");
+    root.setAttribute("data-lang", lang);
+
+    var btn = document.getElementById("lang");
+    if (btn) {
+      btn.addEventListener("click", function () {
+        var next = root.getAttribute("data-lang") === "zh" ? "en" : "zh";
+        root.setAttribute("data-lang", next);
+        try { localStorage.setItem("dct-lang", next); } catch (e) {}
+      });
+    }
+
+    // copy buttons — silent no-op where the clipboard isn't available.
+    document.querySelectorAll(".copy").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var text = b.getAttribute("data-copy") || "";
+        var done = function () {
+          var was = b.textContent;
+          b.textContent = "copied";
+          setTimeout(function () { b.textContent = was; }, 1400);
+        };
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, function () {});
+          }
+        } catch (e) {}
+      });
+    });
+
+    // one staged reveal on load, nothing on scroll beyond first sight.
+    var items = document.querySelectorAll(".reveal");
+    if (!window.IntersectionObserver) { return; }
+    // Arm the animation only now: everything above this line has run, so
+    // hiding the content can still be undone by the observer below.
+    root.setAttribute("data-anim", "on");
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+      });
+    }, { rootMargin: "0px 0px -8% 0px" });
+    items.forEach(function (el) { io.observe(el); });
+  })();
+</script>
