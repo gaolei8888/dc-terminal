@@ -1074,6 +1074,35 @@ mod tests {
         );
     }
 
+    /// 选完项目紧接着要问「用哪个 agent」——用户按 `p` 是为了去那儿干活，
+    /// 不是为了看一眼看板。
+    ///
+    /// 单测里没有守护进程，`Profiles` 一定失败，所以这里断言的是那次失败
+    /// 留下的痕迹（同 `grid` 里那条「四个键在两个视图里一模一样」的测法）：
+    /// 底栏那句「列不出 agent」证明这一步真的去问过。**顺带钉住失败时的
+    /// 落点**：不能把用户留在他刚刚确认过的项目选择器上——那一屏看起来像
+    /// 「这一下没生效」，而项目其实已经切好了。
+    #[test]
+    fn confirming_a_project_goes_on_to_ask_which_agent() {
+        let (mut app, d) = App::test_app();
+        let target = d.path().join("newproj");
+        std::fs::create_dir(&target).unwrap();
+        app.set_sessions(vec![]);
+        app.view = View::PickProject(ProjectPicker::new(Vec::new(), d.path().to_path_buf()));
+
+        super::super::pin_project(&mut app, target.clone());
+
+        assert_eq!(
+            app.message.text,
+            text(Key::CannotListAgents, app.lang),
+            "要去拉一次 agent 列表"
+        );
+        assert!(
+            !matches!(app.view, View::PickProject(_)),
+            "拉不到列表也不能把用户留在项目选择器上"
+        );
+    }
+
     /// `x` 只能拿掉空组。有会话的组必须拒绝——「顺便停掉所有会话」是个
     /// 用户没要求过的复合动作，而 `s` 已经能一个一个停。
     #[test]
