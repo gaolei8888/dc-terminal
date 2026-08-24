@@ -1,0 +1,153 @@
+# dct 手机端 第 0 期：局域网 —— 实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 同一个 WiFi 下，手机扫一下终端里的二维码，打开一个网页，看见会话列表和**实时画面**，
+并且能打字、能按 `Esc`/方向键/`Ctrl+C`。**没有服务器、没有账号、没有加密。**
+
+**为什么先做这一期：** 手机端未知数最多的活（输入法、虚拟键行、40 列屏幕看 120 列画面、
+拉帧频率）全都在客户端，跟传输无关。放在「改一行、刷新一下就看见」的环境里做，比放在
+「改一行、部署一次、再掏手机」的环境里快一个数量级。而且它能回答那个真正的问题：
+**你到底会不会在手机上用它。**
+
+**跟第 1 期的关系：** 手机网页、spans 渲染、虚拟键行、输入法、`Request`/`Response` 全都
+**原样复用**，第 1 期只换一根管子（直连 → 信封 + 中转）。这一期没有一行是白写的。
+
+**Spec:** `docs/superpowers/specs/2026-08-23-dc-terminal-srv-design.md`
+（决定四「手机没有 resize 权」、流控、断线三节在本期就适用；决定一/二/三是第 1 期的事）
+
+---
+
+## 这一期的安全边界（先读）
+
+局域网模式下**数据不出你的网络**，所以 spec 决定二那套端到端加密在这里不需要。
+但暴露面不是零——同一个 WiFi 上的任何人只要拿到 token 就能往你的终端里敲字。所以：
+
+- **默认关闭。** 只有在设置页里打开「手机」时才监听，关掉立刻停掉监听线程。
+- **token 是 32 字节随机数**，存 `~/.dct/secrets.toml`（0600 / Windows 单条 ACL，现成的）。
+  每个请求都验，验不过一律 401，不给任何区分「token 错」和「没这个会话」的信息。
+- **token 不进 URL 查询串。** 查询串会进浏览器历史、进任何中间日志。二维码里带的 token
+  放在 fragment（`#t=…`，不上行），网页拿到后立刻用它换一个同源 cookie，地址栏里不留。
+- **只在会话视图之外也能用**：这不是远程 shell，能做的事就是现有 `Request` 的子集。
+
+---
+
+## Tech Stack
+
+**不加 web 框架，不加 async。** 需要的是 5 个路由加一个静态页面，`std::net::TcpListener`
+加一个线程池够了——这跟仓库自己写 `sys/ipc`、自己写协议是同一个取舍。手写 HTTP 只支持
+最小子集，并且**把子集写进代码注释里**：HTTP/1.1、只认 `Content-Length`（不支持 chunked
+请求体）、响应固定 `Connection: close`。浏览器全都接受这个子集。
+
+**唯一的新依赖是二维码。** 手机上手输 32 字节 token 不现实，二维码是必需品，不是装饰。
+用纯 Rust 的 `qrcode` crate 生成矩阵，自己用半块字符（`▀`/`▄`）渲染到终端——渲染不外包，
+因为终端画法要跟 `BarTheme` 那套配色和深浅背景对齐。
+
+---
+
+## Global Constraints
+
+- **这份计划里的参考代码不是权威。** 照抄之前先想它对不对；测试通过之后做变异测试。
+- **变异测试是每个任务的收尾动作**：判断取反、边界 ±1、`&&` 改 `||`，跑测试。
+  没有测试失败 = 测试没写够。
+- **200ms 的 tick 线程绝不碰网络**。HTTP 在自己的线程里。
+- **HTTP 线程 panic 不许拖垮守护进程**（`catch_unwind`，同 `bridge.rs::spawn`）。
+- **不发 `Resize`**（spec 决定四）：桌面 dct 是唯一有权改 PTY 尺寸的客户端。
+- 网页上每一句话写给没编过程序的人；错误不给下一步就是没写完。中英双语。
+- 不用 emoji 当图标。
+- 测试可以绑 `127.0.0.1:0` 起真服务（仓库已有先例），但不碰公网。
+- 每个任务结束前：`cargo test -- --test-threads=1`、`cargo fmt --check`、`cargo clippy --all-targets`。
+
+---
+
+## File Structure
+
+| 文件 | 职责 |
+|---|---|
+| `src/web/mod.rs`（新建） | 监听线程、最小 HTTP/1.1、token 校验、路由 |
+| `src/web/routes.rs`（新建） | 把 HTTP 请求翻成现有 `Request`，走**现有** dispatch |
+| `src/web/keys.rs`（新建） | 网页键名 → 字节。**跟 `ui::key_to_input` 共用一张表** |
+| `src/web/page.html`（新建） | 单页，自包含，`include_str!` 进二进制 |
+| `src/qr.rs`（新建） | 二维码矩阵 → 终端半块字符 |
+| `src/daemon.rs`（改） | 开关监听线程 |
+| `src/proto.rs`（改） | `Request::WebStatus` / `WebEnable` / `WebDisable` |
+| `src/ui/phone.rs`（改） | 设置页：开关、二维码、地址、已连过的设备 |
+| `src/i18n.rs`（改） | 新增文案 |
+
+---
+
+## Tasks
+
+### 任务 1：监听线程 + token
+
+- [ ] `src/web/mod.rs`：`TcpListener` 绑 `0.0.0.0:0`（端口随机，告诉用户），线程池处理连接
+- [ ] 最小 HTTP/1.1 解析：请求行、头、`Content-Length` 请求体。**子集写进注释**
+- [ ] token：32 字节随机，存 `secrets.toml`；每请求校验；失败一律 401 且不区分原因
+- [ ] `catch_unwind` 包住线程体
+- [ ] 测试：绑 `127.0.0.1:0`，`ureq` 发一个带 token 和一个不带的，分别 200/401
+- [ ] 变异测试：把 token 校验去掉，上面那条必须挂
+
+### 任务 2：只读路由
+
+- [ ] `GET /api/sessions` → 现有 `List`
+- [ ] `GET /api/screen?id=N` → 现有 `Screen`（整屏 spans，差量是后面的事）
+- [ ] **路由层不新建业务逻辑**：只做「HTTP → `Request` → 现有 dispatch → JSON」
+- [ ] 测试：起真服务 + 真 daemon，跑通一次列表和一次画面
+
+### 任务 3：网页 —— 会话列表
+
+- [ ] `src/web/page.html`：单页自包含，深浅色跟随系统，中英双语（做法同 `site/index.html`）
+- [ ] 卡片：项目名、会话名、状态、最后一行 activity
+- [ ] 空态、断线态都要有话说；心跳断了写「你的电脑睡着了」（spec）
+- [ ] 测试：给一份 `List` 的 JSON，渲染函数产出的 DOM 里有那几个会话名
+
+### 任务 4：网页 —— 实时画面
+
+- [ ] 300ms 拉一次 `Screen`，**只在前台**（`visibilitychange`），锁屏一帧不发
+- [ ] `ScreenSpan` → HTML，等宽字体，保留颜色；窄屏靠缩放平移，**不改 PTY 尺寸**
+- [ ] 测试：带颜色的一屏渲染之后颜色和文字都在；`visibilitychange` 之后不再发请求
+- [ ] 变异测试：把前台判断取反，上面那条必须挂
+
+### 任务 5：二维码 + 设置页
+
+- [ ] `src/qr.rs`：矩阵 → 半块字符，深浅背景都能扫（两种配色各出一版，测试量对比度）
+- [ ] 设置页「手机」：开关、当前地址（`http://<局域网 IP>:<port>`）、二维码、关掉的说明
+- [ ] token 放 fragment，网页拿到后换同源 cookie，地址栏不留
+- [ ] 测试：`qr` 的输出能被一个纯 Rust 解码器读回原串（round-trip）
+
+### 任务 6：输入
+
+- [ ] `POST /api/input`：`{"text": "..."}` → 现有 `Request::Input`
+- [ ] `POST /api/key`：`{"key": "Esc"|"Tab"|"Up"|…|"Ctrl+C"}` → `src/web/keys.rs` 映射成字节
+- [ ] **键映射跟 `ui::key_to_input` 共用一张表**，不许各写一份——两份迟早漂，
+      而症状是「手机上按方向键，agent 收到别的东西」
+- [ ] 虚拟键行：`Esc` `Tab` `↑` `↓` `←` `→` `Ctrl` 常驻软键盘上方
+- [ ] 空 Enter 要能发出去（批准计划／「接着干」，同九宫格 `i` 的约定）
+- [ ] 测试：每个键名映射出的字节跟 `key_to_input` 对同一个键给的完全一致
+
+### 任务 7：输入法与收尾
+
+- [ ] 中文输入靠 composition 事件，**组合期一个字节都不上送**
+- [ ] 滚回历史：走现有 `Request::Scroll`
+- [ ] 断线：连不上时整条标题变红，写明「画面可能已过期」（同桌面）
+- [ ] README 两种语言各加一节
+- [ ] 测试：模拟一次 composition，中途不产生任何请求，`compositionend` 之后只发一次
+
+---
+
+## 第 0 期不做
+
+- 服务器、账号、加密、配额（第 1 期）
+- 出了这个 WiFi 还能用（第 1 期，本期的全部意义就是先不解决它）
+- 差量传屏（先整屏；局域网带宽不是瓶颈，真上公网再说）
+- 手机上改 PTY 尺寸（spec 决定四，永远不做）
+- 推送（第 1 期之后）
+
+---
+
+## 做完之后要回答的问题
+
+这一期真正的产出不是代码，是一个答案：**你这两周在手机上打开过几次？**
+
+- 常开 → 第 1 期（中转 + 账号 + 加密）有了被验证过的理由，而且手机端已经现成。
+- 基本不开 → **别做 srv**。省下的是一台服务器、一次备案、以及从此为学员代码负的责任。
