@@ -1022,9 +1022,16 @@ mod tests {
     /// 而屏幕上那句话要说清楚为什么。
     #[test]
     fn a_name_that_escapes_keeps_you_in_the_prompt_with_a_reason() {
-        let (_t, _g, mut app, root) = tree(&[]);
-        open_picker(&mut app, vec![], root.clone());
-        // 同上：没有最近项目时，「新建项目…」是第二行
+        // **浏览位置要挑在 tempdir 里面一层。** 直接停在 tempdir 根上的话，
+        // 「跑到外面去了没有」这句断言问的是**系统临时目录**里有没有那个
+        // 名字——那是所有测试、所有历史运行共用的一块地方，别的东西在那儿
+        // 留下同名目录，这条测试就会毫无道理地红（这不是假想：写这条测试的
+        // RED 阶段自己就在那儿留过一个）。停在里面一层，父目录也归 tempdir
+        // 管，跑完自动清掉，断言问的才是这次运行真正发生的事。
+        let (_t, _g, mut app, root) = tree(&["outer"]);
+        let outer = root.join("outer");
+        open_picker(&mut app, vec![], outer.clone());
+        // 没有最近项目时，「新建项目…」是第二行
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         for c in "../escaped".chars() {
@@ -1034,10 +1041,7 @@ mod tests {
 
         assert!(picker(&app).naming.is_some(), "被踢出了输入态，名字白打了");
         assert!(app.message.error, "没给出错的话");
-        assert!(
-            !root.parent().unwrap().join("escaped").exists(),
-            "目录建到浏览位置外面去了"
-        );
+        assert!(!root.join("escaped").exists(), "目录建到浏览位置外面去了");
     }
 
     /// 空名字不建目录——`parent.join("")` 就是 `parent` 自己，不挡住的话
