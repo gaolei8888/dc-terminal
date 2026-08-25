@@ -32,6 +32,8 @@
 //!   都不告诉他。否则局域网里的人可以拿 404/401 的差别把接口摸个遍。
 //! - 比对用常数时间循环，不用 `==`
 
+pub mod routes;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
