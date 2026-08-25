@@ -179,6 +179,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "crossterm",
+ "getrandom 0.2.17",
  "libc",
  "portable-pty",
  "ratatui",

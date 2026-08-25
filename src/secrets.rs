@@ -29,6 +29,14 @@ pub struct SecretStore {
 /// agent 冒出来——改那里的人请回来看这一句。
 pub const PHONE_TOKEN_KEY: &str = "__phone__";
 
+/// 局域网手机端那个 HTTP 服务的令牌，同样用一个 profile 不可能占用的名字。
+///
+/// 跟 `PHONE_TOKEN_KEY` 是两回事，别复用：那个是 Telegram 给的 bot 令牌（**别人
+/// 发给你的**，泄漏了要去 BotFather 重置），这个是 dct 自己生成的、用来证明
+/// 「拿着它的人扫过你终端上那个二维码」。两者的生命周期、撤销方式、泄漏后果
+/// 全不一样，共用一个键会让「换掉手机端令牌」顺手把手机通知也踢下线。
+pub const WEB_TOKEN_KEY: &str = "__web__";
+
 /// 配对完成之后的主人 chat id，跟令牌一样存在密钥仓里。**这是 C1 的修复
 /// 的一半**：以前"谁是主人"只活在内存里的 `Bridge::owner`，daemon 一
 /// 重启就忘光，又从头允许任何人配对——而 bot 用户名是公开可搜的，攻击者

@@ -19,6 +19,11 @@ ratatui = "0.28"
 crossterm = "0.28"
 unicode-width = "0.1.14"
 libc = "0.2.189"
+# token 必须来自操作系统的 CSPRNG。这是唯一一处"自己想办法"会直接变成
+# 安全缺陷的地方：拿时间戳当种子的话，同一个局域网里的人知道你大概什么
+# 时候开的手机端，就能把 token 的搜索空间压到能暴力试的程度。
+# getrandom 只包一层各平台的系统调用，没有 C，也没有别的依赖。
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

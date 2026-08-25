@@ -21,3 +21,4 @@ pub mod sys;
 pub mod theme;
 pub mod ui;
 pub mod verify;
+pub mod web;
