@@ -194,3 +194,46 @@ fn dirs_home() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .expect("拿不到 home 目录")
 }
+
+/// 本机 socket 上问得到手机端的状态，而且**默认是关着的**。
+///
+/// 开关那一整圈（开、连得上、关、连不上、令牌不变）在 `daemon::web_tests` 里，
+/// 不在这儿：那边能绑回环，而这条路径只会绑 `0.0.0.0`——在 Windows 和 macOS 上
+/// 那会弹一个防火墙授权框，系统在有人点它之前把调用按住，于是测试白等五秒。
+/// **这不是绕过测试**，是把「绑哪个地址」这个决定放回调用方手里（见 `WEB_BIND`）。
+#[test]
+fn the_lan_client_is_off_until_someone_turns_it_on() {
+    let h = common::start_daemon();
+    let mut c = h.client();
+
+    match c.call(Request::WebStatus).unwrap() {
+        Response::Web(info) => {
+            assert!(!info.on, "默认就不该开着");
+            assert!(info.url.is_none(), "关着的时候不该有地址");
+            assert!(!info.address_unknown);
+        }
+        other => panic!("预期 Web，实际 {other:?}"),
+    }
+}
+
+/// **HTTP 上没有开关那个监听口的入口。**
+///
+/// 手机不该能开关自己的入口，更不该能问出那条带令牌的地址——令牌就是全部的
+/// 门禁。真正的拦截在 `daemon::handle` 的 `web` 参数上（HTTP 那一路传 `None`），
+/// 这条只是从外面再确认一次：这些路径压根不存在。
+#[test]
+fn the_http_side_exposes_no_way_to_reach_the_listener() {
+    let (_h, server, base, token) = up();
+
+    for path in [
+        "/api/webstatus",
+        "/api/webenable",
+        "/api/webdisable",
+        "/api/web",
+    ] {
+        let (status, body) = get(&base, path, &token);
+        assert_eq!(status, 404, "HTTP 上不该有 {path}：{body}");
+    }
+
+    server.stop();
+}

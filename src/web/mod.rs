@@ -153,6 +153,31 @@ pub fn ensure_token(store: &mut crate::secrets::SecretStore) -> anyhow::Result<S
     Ok(t)
 }
 
+/// 这台机器在局域网上的地址。
+///
+/// 做法是**问路由表**：开一个 UDP socket「连」到一个外网地址上，然后读它的
+/// 本地地址。UDP 的 `connect` 不发任何包（连对面在不在都不知道），它只是让
+/// 内核挑一条路由，而挑出来那条路的源地址正是「这台机器在局域网上叫什么」。
+///
+/// 为什么不枚举网卡：标准库没有这个能力，要么加一个 crate，要么两套平台
+/// 代码。而枚举出来还要挑——一台机器上常年挂着 WSL、Docker、VPN 的虚拟网卡，
+/// 挑错一个，手机上就是连不上，且用户完全不知道为什么。路由表挑的那一个，
+/// 正是这台机器"往外走"用的那一个，也就是手机最可能够得着的那一个。
+///
+/// **一个包都不会发出去**，所以断网时它也能立刻返回（拿到的多半是 `None`，
+/// 那时候 `WebInfo::address_unknown` 为真，界面负责说人话）。
+pub fn lan_ip() -> Option<std::net::IpAddr> {
+    // 8.8.8.8 只是一个"肯定不在本机"的地址，不会被访问到。
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.connect("8.8.8.8:80").ok()?;
+    let addr = probe.local_addr().ok()?.ip();
+    // 回环地址对手机没用——那是"只有这台机器自己能连"的意思。
+    if addr.is_loopback() || addr.is_unspecified() {
+        return None;
+    }
+    Some(addr)
+}
+
 /// 跑着的服务。**丢掉它不会停掉服务**——要停得显式 `stop()`，理由见那个方法。
 pub struct Server {
     addr: std::net::SocketAddr,

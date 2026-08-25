@@ -11,7 +11,7 @@ use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, stat
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
     ErrorCode, InstallPrompt, PhoneState, PhoneStatus, ProfileEntry, Request, Response,
-    SecretPrompt,
+    SecretPrompt, WebInfo,
 };
 use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_OWNER_KEY, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
@@ -149,6 +149,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         tick_mgr.tick();
     });
 
+    // 局域网手机端那个 HTTP 服务。**默认不开**——它是这台机器上唯一一个
+    // 对局域网敞口的东西，开不开是用户在设置页里的一次明确动作，
+    // 不是装了 dct 就有的默认行为。
+    let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -158,8 +163,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let ph = phone.clone();
         let br = bridge.clone();
         let et = event_tx.clone();
+        let wb = web.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -462,6 +468,7 @@ fn serve(
     phone: Arc<Mutex<PhoneStatus>>,
     bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: std::sync::mpsc::Sender<Event>,
+    web: Arc<Mutex<Option<crate::web::Server>>>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -471,6 +478,9 @@ fn serve(
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
+            // 本机 socket 这一路**带着** `web`：设置页要能开关那个监听口。
+            // 从 HTTP 上来的请求走的是另一个调用点，那边传 `None`——手机
+            // 自己开关不了它，也问不出那条带令牌的地址。
             Ok(req) => handle(
                 req,
                 &mgr,
@@ -480,6 +490,7 @@ fn serve(
                 &phone,
                 &bridge,
                 &event_tx,
+                Some(&web),
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -499,6 +510,14 @@ fn handle(
     phone: &Arc<Mutex<PhoneStatus>>,
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: &std::sync::mpsc::Sender<Event>,
+    // 局域网手机端那个监听口。**`None` 表示「这条请求是从 HTTP 上来的」**，
+    // 于是 `Web*` 三条一律拒绝。
+    //
+    // 用一个 `Option` 而不是在路由那边把这三条挡掉，是因为「谁能开关这个
+    // 口子」是一条安全边界，而安全边界要长在**它保护的那个东西旁边**——
+    // 挡在路由里的话，将来谁加一条新路由就可能顺手把它绕过去，而这里
+    // 拿不到 `web` 是物理上做不到。
+    web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -751,6 +770,23 @@ fn handle(
         // 但内存里那个 `Bridge` 攥着自己的 `Telegram` 克隆继续长轮询，
         // 用户以为关掉了，找到这个用户名的人其实还能继续敲字。现在必须
         // 真的把线程停掉。
+        // ——局域网手机端———————————————————————————————————————————
+        //
+        // 三条都先看 `web` 在不在：`None` = 这条请求是从 HTTP 上来的，
+        // 而手机不该能开关自己的入口、更不该问得出那条带令牌的地址。
+        Request::WebStatus => Ok(web_status(web, secrets)),
+        Request::WebEnable => Ok(web_enable(
+            WEB_BIND,
+            web,
+            mgr,
+            store,
+            secrets,
+            profiles_dir,
+            phone,
+            bridge,
+            event_tx,
+        )),
+        Request::WebDisable => Ok(web_disable(web)),
         Request::PhoneDisable => {
             if let Err(e) = recover(secrets.lock()).remove(PHONE_TOKEN_KEY) {
                 return Response::Error(to_code(e));
@@ -782,6 +818,140 @@ fn handle(
 /// 原始内容带进去。`ui::phone::status_line`/`next_step` 出于防御性根本
 /// 不读这个字符串（见那两个函数的注释），所以这里的措辞今天还传不到
 /// 屏幕上，但契约先立在这——哪天那两个函数改成读它，这条契约不能补。
+/// 手机端只从本机 socket 上开关。从 HTTP 上来的（`web` 是 `None`）一律
+/// 当成"没这回事"——不解释、不区分，跟 `web::serve` 那边 401 不给理由是
+/// 同一条规矩。
+fn web_refused() -> Response {
+    Response::Error(ErrorCode::BadRequest(
+        "WebStatus/WebEnable/WebDisable".into(),
+    ))
+}
+
+fn web_info(port: Option<u16>, token: &str) -> WebInfo {
+    let Some(port) = port else {
+        return WebInfo {
+            on: false,
+            url: None,
+            address_unknown: false,
+        };
+    };
+    match crate::web::lan_ip() {
+        // 令牌放 fragment，不放查询串：查询串会进浏览器历史和任何中间日志，
+        // fragment 根本不上行（见 `web::is_public` 和网页里那段 claimToken）。
+        Some(ip) => WebInfo {
+            on: true,
+            url: Some(format!("http://{ip}:{port}/#t={token}")),
+            address_unknown: false,
+        },
+        None => WebInfo {
+            on: true,
+            url: None,
+            address_unknown: true,
+        },
+    }
+}
+
+fn web_status(
+    web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
+    secrets: &Arc<Mutex<SecretStore>>,
+) -> Response {
+    let Some(web) = web else { return web_refused() };
+    let port = recover(web.lock()).as_ref().map(|s| s.addr().port());
+    if port.is_none() {
+        return Response::Web(WebInfo {
+            on: false,
+            url: None,
+            address_unknown: false,
+        });
+    }
+    // 已经开着，说明令牌早就有了；拿不到就退回"地址算不出来"，
+    // 不为了显示状态去生成一个新令牌（那会把已经配过的手机踢下线）。
+    let token = recover(secrets.lock())
+        .get(crate::secrets::WEB_TOKEN_KEY)
+        .unwrap_or_default()
+        .to_string();
+    Response::Web(web_info(port, &token))
+}
+
+/// 生产环境监听哪儿：**所有网卡**，端口交给系统挑。
+///
+/// 绑回环手机就够不着——那正是这个功能的全部意义。写死端口只会在它被占用的
+/// 那天变成一句没人看得懂的失败。
+///
+/// **在 Windows 和 macOS 上，第一次绑这个地址会弹一个防火墙授权框**，而
+/// 系统在用户点之前会把这次调用按住。所以：测试一律绑 `127.0.0.1`
+/// （见 `web_enable` 的 `bind` 参数），否则每次跑测试都要有人去点一下弹窗，
+/// 在 CI 上则是一次五秒起步的超时。**这不是测试在绕过什么**——绑哪个地址
+/// 本来就是调用方的决定，`web::serve` 收的就是一个已经绑好的监听器。
+const WEB_BIND: &str = "0.0.0.0:0";
+
+#[allow(clippy::too_many_arguments)]
+fn web_enable(
+    bind: &str,
+    web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
+    mgr: &Arc<SessionManager>,
+    store: &Arc<Mutex<Store>>,
+    secrets: &Arc<Mutex<SecretStore>>,
+    profiles_dir: &Path,
+    phone: &Arc<Mutex<PhoneStatus>>,
+    bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
+    event_tx: &std::sync::mpsc::Sender<Event>,
+) -> Response {
+    let Some(web) = web else { return web_refused() };
+    let mut slot = recover(web.lock());
+    if let Some(running) = slot.as_ref() {
+        // 已经开着就照实回答，不重开——重开会换端口，而用户手机上那个
+        // 已经打开的页面会突然连不上，且没有任何提示。
+        let token = recover(secrets.lock())
+            .get(crate::secrets::WEB_TOKEN_KEY)
+            .unwrap_or_default()
+            .to_string();
+        return Response::Web(web_info(Some(running.addr().port()), &token));
+    }
+
+    let mut guard = recover(secrets.lock());
+    let token = match crate::web::ensure_token(&mut guard) {
+        Ok(t) => t,
+        Err(e) => return Response::Error(to_code(e)),
+    };
+    drop(guard);
+
+    let listener = match std::net::TcpListener::bind(bind) {
+        Ok(l) => l,
+        Err(e) => return Response::Error(to_code(anyhow::anyhow!("{e}"))),
+    };
+
+    // **HTTP 那一路走的是同一个 `handle`**，只是 `web` 传 `None`。
+    // 另写一份分派等于养出第二套真相，而手机看到的东西必须跟桌面一致。
+    let (m, s, sec, pd, ph, br, et) = (
+        mgr.clone(),
+        store.clone(),
+        secrets.clone(),
+        profiles_dir.to_path_buf(),
+        phone.clone(),
+        bridge.clone(),
+        event_tx.clone(),
+    );
+    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None);
+    let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
+    let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
+    let port = server.addr().port();
+    *slot = Some(server);
+    Response::Web(web_info(Some(port), &token))
+}
+
+fn web_disable(web: Option<&Arc<Mutex<Option<crate::web::Server>>>>) -> Response {
+    let Some(web) = web else { return web_refused() };
+    if let Some(server) = recover(web.lock()).take() {
+        server.stop();
+    }
+    Response::Web(WebInfo {
+        on: false,
+        url: None,
+        address_unknown: false,
+    })
+}
+
 fn phone_set_token_failure_message(e: ChannelError) -> String {
     match e {
         ChannelError::BadToken => {
@@ -1101,6 +1271,7 @@ mod tests {
             &test_phone(),
             &test_bridge(),
             &test_event_tx(),
+            None,
         );
 
         match resp {
@@ -1158,6 +1329,7 @@ mod tests {
             &test_phone(),
             &test_bridge(),
             &test_event_tx(),
+            None,
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -1224,6 +1396,7 @@ mod tests {
                 &test_phone(),
                 &test_bridge(),
                 &test_event_tx(),
+                None,
             );
             (t.elapsed(), resp)
         });
@@ -1327,6 +1500,7 @@ mod tests {
                 &test_phone(),
                 &test_bridge(),
                 &test_event_tx(),
+                None,
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -1359,6 +1533,7 @@ mod tests {
             &test_phone(),
             &test_bridge(),
             &test_event_tx(),
+            None,
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -1444,6 +1619,7 @@ mod tests {
             &test_phone(),
             &test_bridge(),
             &test_event_tx(),
+            None,
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1490,6 +1666,7 @@ mod tests {
             &test_phone(),
             &test_bridge(),
             &test_event_tx(),
+            None,
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1548,6 +1725,7 @@ mod tests {
             &phone,
             &test_bridge(),
             &test_event_tx(),
+            None,
         );
 
         match resp {
@@ -1600,6 +1778,7 @@ mod tests {
             &phone,
             &bridge,
             &test_event_tx(),
+            None,
         );
 
         match resp {
@@ -1669,6 +1848,7 @@ mod tests {
             &phone,
             &bridge,
             &test_event_tx(),
+            None,
         );
 
         match resp {
@@ -1991,5 +2171,148 @@ mod tests {
         }
 
         crate::bridge::stop_current(&bridge);
+    }
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+    use crate::proto::WebInfo;
+
+    /// `handle()` 那一串参数在测试里要用四遍，打包成一个结构体传——
+    /// 返回一个八元组的话 clippy 也有话说，而且调用点全是 `.0`/`.3` 这种
+    /// 读不出意思的下标。
+    struct Fx {
+        mgr: Arc<SessionManager>,
+        store: Arc<Mutex<Store>>,
+        secrets: Arc<Mutex<SecretStore>>,
+        profiles_dir: PathBuf,
+        phone: Arc<Mutex<PhoneStatus>>,
+        bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
+        tx: std::sync::mpsc::Sender<Event>,
+        /// 临时目录得跟着 fixture 活着，不然 secrets/projects 的路径当场失效。
+        _dir: tempfile::TempDir,
+    }
+
+    impl Fx {
+        fn enable(&self, web: Option<&Arc<Mutex<Option<crate::web::Server>>>>) -> Response {
+            // 绑回环：绑 `0.0.0.0` 会弹防火墙授权框，系统在有人点它之前把
+            // 这次调用按住，测试白等五秒（见 `WEB_BIND`）。
+            web_enable(
+                "127.0.0.1:0",
+                web,
+                &self.mgr,
+                &self.store,
+                &self.secrets,
+                &self.profiles_dir,
+                &self.phone,
+                &self.bridge,
+                &self.tx,
+            )
+        }
+    }
+
+    fn fixtures() -> Fx {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = SecretStore::load(&dir.path().join("secrets.toml"));
+        Fx {
+            mgr: Arc::new(SessionManager::new()),
+            store: Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json")))),
+            secrets: Arc::new(Mutex::new(secrets)),
+            profiles_dir: dir.path().join("profiles"),
+            phone: Arc::new(Mutex::new(PhoneStatus {
+                state: PhoneState::Off,
+                bot: None,
+                owner: None,
+            })),
+            bridge: Arc::new(Mutex::new(None)),
+            tx: std::sync::mpsc::channel().0,
+            _dir: dir,
+        }
+    }
+
+    /// **手机开不了、也关不了那个监听口，更问不出那条带令牌的地址。**
+    ///
+    /// `web` 是 `None` 就代表「这条请求是从 HTTP 上来的」。这条边界要是漏了，
+    /// 任何一个连得上那个端口的人都能把地址连同令牌问出来——而令牌就是
+    /// 全部的门禁。
+    #[test]
+    fn requests_arriving_over_http_can_never_touch_the_listener() {
+        let fx = fixtures();
+        for resp in [
+            web_status(None, &fx.secrets),
+            fx.enable(None),
+            web_disable(None),
+        ] {
+            assert!(
+                matches!(resp, Response::Error(_)),
+                "从 HTTP 上来的请求必须被拒，实际 {resp:?}"
+            );
+        }
+    }
+
+    /// 开、问、关一整圈。**绑回环**：绑 `0.0.0.0` 会弹防火墙授权框，
+    /// 系统在用户点之前把调用按住，测试会白等五秒（见 `WEB_BIND`）。
+    #[test]
+    fn enabling_starts_a_listener_and_disabling_stops_it() {
+        let fx = fixtures();
+        let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
+
+        assert!(matches!(
+            web_status(Some(&web), &fx.secrets),
+            Response::Web(WebInfo { on: false, .. })
+        ));
+
+        let on = fx.enable(Some(&web));
+        assert!(matches!(on, Response::Web(WebInfo { on: true, .. })));
+        let addr = recover(web.lock()).as_ref().unwrap().addr();
+        assert!(
+            std::net::TcpStream::connect(addr).is_ok(),
+            "开了之后该连得上 {addr}"
+        );
+
+        assert!(matches!(
+            web_disable(Some(&web)),
+            Response::Web(WebInfo { on: false, .. })
+        ));
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "关了之后不该还连得上 {addr}"
+        );
+    }
+
+    /// **再开一次不换端口。** 换了的话，用户手机上那个已经打开的页面会
+    /// 突然连不上，而屏幕上不会有任何东西解释为什么。
+    #[test]
+    fn enabling_twice_keeps_the_same_address() {
+        let fx = fixtures();
+        let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
+        fx.enable(Some(&web));
+        let first = recover(web.lock()).as_ref().unwrap().addr();
+        fx.enable(Some(&web));
+        let second = recover(web.lock()).as_ref().unwrap().addr();
+        assert_eq!(first, second, "重复开启换了端口，手机上那一页会掉线");
+        web_disable(Some(&web));
+    }
+
+    /// 令牌活过一次开关。**换令牌 = 已经扫过码的手机全部失效**，
+    /// 而用户完全不知道为什么手机上突然要重新扫。
+    #[test]
+    fn the_token_survives_being_switched_off_and_on() {
+        let fx = fixtures();
+        let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
+        fx.enable(Some(&web));
+        let first = recover(fx.secrets.lock())
+            .get(crate::secrets::WEB_TOKEN_KEY)
+            .unwrap()
+            .to_string();
+        web_disable(Some(&web));
+        fx.enable(Some(&web));
+        let second = recover(fx.secrets.lock())
+            .get(crate::secrets::WEB_TOKEN_KEY)
+            .unwrap()
+            .to_string();
+        assert_eq!(first, second, "关了再开换了令牌，扫过码的手机全掉线");
+        web_disable(Some(&web));
     }
 }

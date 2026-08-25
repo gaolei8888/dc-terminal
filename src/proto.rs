@@ -56,7 +56,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 补成 `false`，正是「照今天这样一直画着光标」的老行为），且没有新增或
 /// 改动任何 `Request` 变体——旧守护进程完全不需要「懂」这个字段。允许条件
 /// 和「这不能当先例」的警告见 `the_session_info_shape_is_pinned_too` 上的注释。
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8 = 局域网手机端。多了 `Request::WebStatus` / `WebEnable` / `WebDisable`
+/// 三条，`Response::Web(WebInfo)`。**加一，没有例外可讲**：新增 `Request`
+/// 变体那条规矩没得商量——旧守护进程收到 `WebEnable` 只会回一句解析失败，
+/// 而用户看到的是「按了开关什么都没发生」。同 `Kill`/`Prune`、同手机通知那次。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +114,23 @@ pub enum PhoneState {
     /// 错误甚至令牌本身，界面上显示的仍然是一句固定的人话，不是这里装的
     /// 原文——`the_token_never_appears_in_any_status_text` 钉的就是这一条。
     Broken(String),
+}
+
+/// 局域网手机端的状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebInfo {
+    /// 正在监听吗。
+    pub on: bool,
+    /// 手机上要打开的完整地址，**含令牌**（放在 fragment 里）。
+    ///
+    /// **只走本机 socket**（见 `Request::WebStatus`）。关着的时候是 `None`——
+    /// 不是空串：空串会被界面当成「有地址但没算出来」，而那是另一回事，
+    /// 见 `address_unknown`。
+    pub url: Option<String>,
+    /// 口子开着，但算不出局域网地址（没连网、只有回环）。界面那时候要说
+    /// 人话——手机跟这台电脑连同一个 WiFi、然后访问这个端口——而不是
+    /// 摆一个连不上的地址装作一切正常。
+    pub address_unknown: bool,
 }
 
 /// 手机通知这一整套的状态：连没连、是谁的手机、bot 叫什么名字。
@@ -301,6 +322,14 @@ pub enum Request {
     PhoneUnpair,
     /// 整个关掉：删掉令牌，状态槽退回 `Off`。
     PhoneDisable,
+    /// 局域网手机端现在开着没有、地址是什么。
+    ///
+    /// **这三条只从本机的 unix socket 上答，永远不从 HTTP 上答**（见
+    /// `daemon::handle` 的 `web` 参数）：手机自己不该能开关这个监听口，
+    /// 更不该能问出那条带令牌的地址——那等于把钥匙挂在门上。
+    WebStatus,
+    WebEnable,
+    WebDisable,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -382,6 +411,9 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::PhoneUnpair => write!(f, "PhoneUnpair"),
             Request::PhoneDisable => write!(f, "PhoneDisable"),
+            Request::WebStatus => write!(f, "WebStatus"),
+            Request::WebEnable => write!(f, "WebEnable"),
+            Request::WebDisable => write!(f, "WebDisable"),
         }
     }
 }
@@ -455,6 +487,8 @@ pub enum Response {
     /// 对 `Request::PhoneStatus` / `PhoneSetToken` / `PhoneUnpair` /
     /// `PhoneDisable` 四条的共同回答：手机通知眼下是什么状态。
     Phone(PhoneStatus),
+    /// `WebStatus` / `WebEnable` / `WebDisable` 三条的共同回答。
+    Web(WebInfo),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -787,14 +821,17 @@ mod tests {
             Request::PhoneSetToken { token: "t".into() },
             Request::PhoneUnpair,
             Request::PhoneDisable,
+            Request::WebStatus,
+            Request::WebEnable,
+            Request::WebDisable,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                7,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable"]"#
+                8,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable","WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -837,7 +874,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                7,
+                8,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -944,7 +981,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (7, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (8, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
