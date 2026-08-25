@@ -144,6 +144,14 @@ pub struct App {
     /// 而不是 `View::Phone` 里，跟 `verify_rx` 同一个理由——`View::Phone`
     /// 只有一个字段（`status`），装不下这个临时态，也不该装：见
     /// `View::Phone` 的文档注释。
+    /// 局域网手机端眼下的状态：开没开、地址是什么。
+    ///
+    /// **放在 `App`，不放 `View::Phone`。** 手机通知那份 `status` 是异步
+    /// 刷新的——主循环收到新状态就整个重建一次 `View::Phone`
+    /// （`ui::mod` 里那两处 `app.view = View::Phone { status }`），塞在
+    /// 那个变体里的局域网状态会被这条刷新路径无声地冲掉。放在 `App` 上
+    /// 就不受它影响，跟 `phone_buf` 是同一条理由的另一面。
+    pub web: crate::proto::WebInfo,
     pub phone_buf: Option<String>,
     /// 手机令牌验证的结果通道。跟 `verify_rx` 一样：`Request::PhoneSetToken`
     /// 会打真的 Telegram 网络，不能堵在按键循环里，丢给后台线程，主循环
@@ -236,6 +244,11 @@ impl App {
             connected: true,
             need_sessions: true,
             verify_rx: None,
+            web: crate::proto::WebInfo {
+                on: false,
+                url: None,
+                address_unknown: false,
+            },
             phone_buf: None,
             phone_verify_rx: None,
             phone_last_fetch: None,

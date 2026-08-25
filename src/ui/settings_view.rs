@@ -117,7 +117,24 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
 /// 显示错误的空白页强。
 fn open_phone(app: &mut App, state: ListState) {
     match app.client().and_then(|c| c.call(Request::PhoneStatus)) {
-        Ok(Response::Phone(status)) => app.view = View::Phone { status },
+        Ok(Response::Phone(status)) => {
+            // 局域网那一节画的是 `app.web`，所以进页面要顺手把它也拿一次
+            // ——不拿的话屏幕上留着的是上一次的答案（或者 `App::new` 那个
+            // 「关着」的初值），而用户会照着它按 `w`，按出反效果。
+            //
+            // **拿不到就退回「关着」**，不是留着旧值：这一节的每一句话
+            // （地址、二维码）都建立在「口子真的开着」之上，宁可少说，
+            // 不能指着一个已经不成立的地址让人扫。
+            app.web = match app.client().and_then(|c| c.call(Request::WebStatus)) {
+                Ok(Response::Web(info)) => info,
+                _ => crate::proto::WebInfo {
+                    on: false,
+                    url: None,
+                    address_unknown: false,
+                },
+            };
+            app.view = View::Phone { status };
+        }
         Ok(Response::Error(ref e)) => {
             app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
             app.view = View::Settings { state, sub: None };
@@ -567,6 +584,50 @@ mod tests {
             "拿不到数据就该留在设置页上"
         );
         assert!(app.message.error, "要有一句红字告诉用户出了什么事");
+    }
+
+    /// **进这一页要把局域网状态一起拿回来。** 页面上那一节画的是
+    /// `app.web`，不拿就永远是 `App::new` 里那个「关着」的初值——守护进程
+    /// 那边明明开着，用户看到的却是「还没打开」，按 `w` 于是变成关掉。
+    /// 这里先往 `app.web` 塞一个**假的「开着」**再进页面：不拿状态的实现
+    /// 会把这个假值原样留下，测试就抓得住。
+    #[test]
+    fn entering_the_phone_page_refreshes_the_lan_state() {
+        use crate::client::Client;
+
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("daemon.sock");
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run(&s);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(std::time::Instant::now() < deadline, "daemon 没起来");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            home.path().to_path_buf(),
+            Lang::Zh,
+            sock,
+            crate::ui::ViewMode::List,
+        );
+        app.web = crate::proto::WebInfo {
+            on: true,
+            url: Some("http://10.0.0.1:1/#t=stale".into()),
+            address_unknown: false,
+        };
+        on_settings_item(&mut app, SettingsItem::Phone);
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            !app.web.on,
+            "进页面没有重新拿局域网状态，屏幕上留着一个过期的「开着」"
+        );
+        assert_eq!(app.web.url, None, "过期的地址也该跟着没了");
     }
 
     /// **Ruling 2**：选中「Phone」按 Enter 要真的进 `View::Phone`，带着守护

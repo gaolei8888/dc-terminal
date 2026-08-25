@@ -177,6 +177,31 @@ pub enum Key {
     /// 设置页顶层列表里的第二项。手机通知页本身（Task 4 的 `View::Phone`）
     /// 有自己一整套状态文案，这里只是设置项列表上的那一行标签。
     Phone,
+    // —— 局域网手机端（同一个 WiFi 下扫码打开的网页） ——
+    /// 设置页上那一小节的标题。**跟上面的「手机通知」是两件事**：那个是
+    /// Telegram 推消息，这个是同一个 WiFi 下手机上打开的网页。同一页上
+    /// 挨着放，所以标题必须让人一眼分得出来。
+    WebSection,
+    /// 没在监听
+    WebOffLine,
+    /// 在监听，而且算得出地址——具体地址由 `msg::web_address` 那句负责报，
+    /// 这一句只说「开着」。
+    WebOnLine,
+    /// 在监听，但算不出局域网地址（没连 WiFi、只有回环）。**不能借用
+    /// `WebOnLine`**：那句后面跟着一个地址，而这里根本没有地址可跟。
+    WebAddressUnknownLine,
+    /// 关着时的下一步：按 w 打开
+    WebNextStepOff,
+    /// 开着时的下一步：拿手机扫码；再按一次 w 关掉
+    WebNextStepOn,
+    /// 开着但算不出地址时的下一步：先把这台电脑连上 WiFi
+    WebNextStepAddressUnknown,
+    /// 底栏上 `w` 那一格的动作名。**只是一个动词**，跟 `EnterCopyMode`
+    /// 一样拼在 `("w", …)` 后面。
+    WebToggle,
+    /// 窗口太窄，二维码放不下。**这不是错误**——码画不下是个尺寸问题，
+    /// 出路有两条（拉宽窗口，或者照着地址手输），这一句两条都得说。
+    WebQrTooNarrow,
     // —— 手机通知页 ——
     /// 还没填过令牌
     PhoneOffLine,
@@ -443,6 +468,39 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         ThemeLight => t!(lang, en: "light", zh: "浅色"),
         ThemeLines => t!(lang, en: "lines", zh: "横线"),
         Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
+        WebSection => t!(lang, en: "Phone client on this WiFi", zh: "局域网手机端"),
+        WebOffLine => t!(lang, en: "Not listening", zh: "还没打开"),
+        WebOnLine => t!(
+            lang,
+            en: "On — scan this with the phone on the same WiFi",
+            zh: "开着——用同一个 WiFi 下的手机扫这个码",
+        ),
+        WebAddressUnknownLine => t!(
+            lang,
+            en: "On, but this computer has no address on any network",
+            zh: "开着，但这台电脑算不出自己在局域网里的地址",
+        ),
+        WebNextStepOff => t!(
+            lang,
+            en: "Press w to turn it on",
+            zh: "按 w 打开",
+        ),
+        WebNextStepOn => t!(
+            lang,
+            en: "Press w to turn it off again",
+            zh: "再按一次 w 就关掉",
+        ),
+        WebNextStepAddressUnknown => t!(
+            lang,
+            en: "Put this computer on the same WiFi as the phone, then press w twice to restart it",
+            zh: "先把这台电脑连上手机那个 WiFi，再按两下 w 重开",
+        ),
+        WebToggle => t!(lang, en: "phone client", zh: "手机端开关"),
+        WebQrTooNarrow => t!(
+            lang,
+            en: "The window is too narrow for the code — widen it, or type the address into the phone",
+            zh: "窗口太窄，二维码放不下——把窗口拉宽，或者照着地址在手机上手输",
+        ),
         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
         PhoneReconnectingLine => t!(
@@ -1518,6 +1576,15 @@ mod tests {
             NextSession,
             EnterCopyMode,
             PasteImage,
+            WebSection,
+            WebOffLine,
+            WebOnLine,
+            WebAddressUnknownLine,
+            WebNextStepOff,
+            WebNextStepOn,
+            WebNextStepAddressUnknown,
+            WebQrTooNarrow,
+            WebToggle,
             OtherKeysGoToAgent,
             BackToListWord,
             BackToSettingsWord,
@@ -1647,7 +1714,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 126, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 135, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

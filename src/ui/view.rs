@@ -1358,6 +1358,10 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             if !matches!(status.state, PhoneState::Off) {
                 items.push(("x", Key::PhoneTurnOff));
             }
+            // 局域网那一节的开关。**无条件写**（只要不是在打令牌，那一档
+            // 上面已经早退了）：`w` 在开着和关着两种状态下都真能按，这跟
+            // 上面几个键「前提不在就不写」的道理不冲突——它没有前提。
+            items.push(("w", Key::WebToggle));
             items.push(("Esc", Key::BackToSettingsWord));
             help_items(&items, lang)
         }
@@ -1369,6 +1373,38 @@ mod tests {
     use super::*;
     use crate::proto::InstallPrompt;
     use crate::ui::key_to_input;
+
+    /// 手机页的底栏要写着 `w`——这一页上局域网那一节的开关只有这一个入口，
+    /// 底栏不写就没有任何地方告诉用户它存在。
+    #[test]
+    fn the_phone_page_offers_the_lan_toggle() {
+        let bar = help_for_phone_page(false);
+        assert!(bar.contains('w'), "底栏没写 w：{bar}");
+    }
+
+    /// 但**正在打令牌的时候不写**：那会儿 `w` 是敲进输入框的一个字母，
+    /// 不是开关（见 `phone::w_while_typing_a_token_is_just_a_letter`）。
+    /// 底栏说什么就得真能做到什么——这一页早就有这条规矩（「修复 6」）。
+    #[test]
+    fn the_lan_toggle_is_not_offered_while_typing_a_token() {
+        let bar = help_for_phone_page(true);
+        assert!(!bar.contains('w'), "打字的时候底栏还写着 w：{bar}");
+    }
+
+    fn help_for_phone_page(editing: bool) -> String {
+        let view = View::Phone {
+            status: crate::proto::PhoneStatus {
+                state: crate::proto::PhoneState::Off,
+                bot: None,
+                owner: None,
+            },
+        };
+        let ctx = HelpCtx {
+            phone_editing: editing,
+            ..on_a_session()
+        };
+        help_when(&view, Lang::Zh, ctx)
+    }
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
