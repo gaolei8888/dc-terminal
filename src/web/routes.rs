@@ -315,8 +315,14 @@ mod tests {
         }
         let code = strip(PAGE, "<!--", "-->");
         let code = strip(&code, "/*", "*/");
+        // 行尾注释也要剥，不只是整行注释——`var x = 1;  // 说明` 里的中文
+        // 同样不会显示给用户。`://` 不算（`http://…` 这种），那是 URL 的一部分。
         code.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| match l.find("//") {
+                Some(0) => "",
+                Some(i) if l.as_bytes()[i - 1] != b':' => &l[..i],
+                _ => l,
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -384,6 +390,119 @@ mod tests {
                 "网页要 {key:?}，但 strings::NEEDED 里没有"
             );
         }
+    }
+
+    /// 网页认识协议里的一串名字：`Sessions`、`Screen`、`lines`、`cursor_hidden`、
+    /// 颜色的三种形状……**这些名字在 Rust 这边改了，网页不会报错，只会静静地
+    /// 显示错东西**——一屏没有颜色的字，或者一个永远空着的列表。
+    ///
+    /// 所以在这里把两边对一遍：拿真类型序列化出来，名字必须在网页里出现过。
+    /// 这条守卫拦不住"网页用了一个协议里没有的名字"（那种要靠打开浏览器看），
+    /// 但它拦得住反过来的那半边：**协议改名，而网页留在原地**。
+    #[test]
+    fn the_page_knows_the_protocol_by_its_real_names() {
+        use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
+        let code = page_without_comments();
+
+        // 颜色的三种形状。`Idx` 那一支尤其要紧：网页里判它用的是
+        // `typeof c.Idx === "number"`，因为 0 号色是黑色，真值判断会把
+        // 一整屏黑字当成"没上色"。
+        for sample in [
+            serde_json::to_string(&ScreenColor::Default).unwrap(),
+            serde_json::to_string(&ScreenColor::Idx(3)).unwrap(),
+            serde_json::to_string(&ScreenColor::Rgb(1, 2, 3)).unwrap(),
+        ] {
+            // 形如 "Default" 或 {"Idx":3}，取出里面那个名字。
+            let name = sample.trim_matches(|c: char| !c.is_alphanumeric());
+            let name = name.split('"').next().unwrap_or(name);
+            assert!(
+                code.contains(name),
+                "协议里的颜色形状 {name:?} 在网页里找不到——改了名字就要改网页"
+            );
+        }
+
+        // 一段文字的字段，以及样式里网页真的读过的那几个。
+        let span = serde_json::to_string(&ScreenSpan {
+            text: String::new(),
+            style: ScreenStyle::default(),
+        })
+        .unwrap();
+        for field in [
+            "text",
+            "style",
+            "fg",
+            "bg",
+            "bold",
+            "italic",
+            "underline",
+            "inverse",
+        ] {
+            assert!(
+                span.contains(&format!("\"{field}\"")),
+                "协议里没有 {field} 了，而网页还在读它"
+            );
+            assert!(code.contains(field), "网页没读 {field}");
+        }
+
+        // 会话列表那边网页读的字段。
+        for field in ["id", "tag", "profile", "dir", "state", "activity"] {
+            assert!(
+                code.contains(field),
+                "网页没读会话的 {field}——列表上会缺一块"
+            );
+        }
+
+        // 两个答复的外层标签。
+        for tag in ["Sessions", "Screen"] {
+            assert!(code.contains(tag), "网页不认识 {tag} 这个答复");
+        }
+        for field in ["lines", "cursor_hidden"] {
+            assert!(code.contains(field), "网页没读 Screen 的 {field}");
+        }
+    }
+
+    /// **屏幕上的内容永远不许当 HTML 用。** 那是 agent 打出来的字节，
+    /// 里面什么都可能有；`innerHTML` 一用，一段 `<img onerror=…>` 就在这一页
+    /// 里跑起来了，而这一页的同源里躺着能往终端敲字的接口。
+    ///
+    /// 规矩定成"整个文件里不许出现 innerHTML"，而不是"用的地方要小心"：
+    /// 前者一眼看得出真假，后者要人每次都想一遍。
+    #[test]
+    fn the_page_never_turns_data_into_html() {
+        let code = page_without_comments();
+        for forbidden in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "网页里出现了 {forbidden}——屏幕内容只能走 textContent"
+            );
+        }
+    }
+
+    /// 「该不该发请求」只有一处说得算。
+    ///
+    /// 抄成好几处的话，漏改一处的症状是**手机锁着屏，家里的 dct 每秒被问
+    /// 三次**——在手机上完全看不出来，只体现在电池和流量上。所以这里钉两件事：
+    /// 判断只写了一遍，而且真的有人在用它。
+    #[test]
+    fn only_one_place_decides_whether_to_poll() {
+        let code = page_without_comments();
+        assert_eq!(
+            code.matches("visibilityState").count(),
+            1,
+            "「在不在前台」这个判断被抄了不止一遍"
+        );
+        // 一处定义 + 至少两处调用（进画面时的 `tick`、定时器里那一次）。
+        // 只写 `>= 2` 的话，**定义本身就占掉一处**，定时器把判断整个删掉照样能过
+        // ——这个洞是拿变异测试当场试出来的。
+        assert!(
+            code.matches("shouldPoll()").count() >= 3,
+            "那个唯一的判断没被调够两处——定时器多半绕过它了"
+        );
     }
 
     #[test]

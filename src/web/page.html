@@ -46,6 +46,11 @@
     }
   }
   * { box-sizing: border-box; }
+  /* `hidden` 属性的 display:none 来自浏览器默认样式，而作者样式里**任何**
+     一个 display 都比它优先——`main { display: grid }` 就把它顶掉了，于是
+     `listEl.hidden = true` 之后列表照样铺在画面下面。这一条把它按回去。
+     （这个 bug 是把页面真的打开看了一眼才发现的，DOM 里 hidden 明明是 true。） */
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     background: var(--bg);
@@ -91,11 +96,41 @@
   }
   .notice { padding: 2rem 1rem; text-align: center; color: var(--dim); }
   .notice.bad { color: var(--bad); }
+
+  /* 会话画面。整块是一张固定宽度的画布——手机不改 PTY 尺寸（spec 决定四），
+     所以这里靠字号把它缩到屏幕宽度，缩到看不清就让人自己捏放大。 */
+  #screen { position: relative; padding: .5rem; overflow: auto; }
+  #screen pre {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace;
+    line-height: 1.2;
+    white-space: pre;
+    /* 画面里的字不参与系统的自动放大：iOS 会把它当正文放大，一行就散了 */
+    -webkit-text-size-adjust: none;
+    text-size-adjust: none;
+  }
+  #cursor {
+    position: absolute;
+    background: var(--ink);
+    opacity: .65;
+    pointer-events: none;
+  }
+  #back {
+    background: none; border: 0; padding: .1rem .4rem;
+    font: inherit; font-size: 1.3rem; line-height: 1;
+    color: var(--accent); cursor: pointer;
+  }
+  #ruler { position: absolute; visibility: hidden; white-space: pre; }
 </style>
 </head>
 <body>
-<header><span id="dot"></span><h1 id="title"></h1></header>
+<header>
+  <button id="back" type="button" hidden>&lsaquo;</button>
+  <span id="dot"></span>
+  <h1 id="title"></h1>
+</header>
 <main id="list"></main>
+<div id="screen" hidden><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre><div id="cursor" hidden></div></div>
 
 <script>
 (function () {
@@ -124,6 +159,14 @@
   var listEl = document.getElementById("list");
   var dotEl = document.getElementById("dot");
   var titleEl = document.getElementById("title");
+  var screenEl = document.getElementById("screen");
+  var canvasEl = document.getElementById("canvas");
+  var rulerEl = document.getElementById("ruler");
+  var cursorEl = document.getElementById("cursor");
+  var backEl = document.getElementById("back");
+
+  // 当前在看什么：会话列表，还是某个会话的画面。
+  var open = null;   // null = 列表；否则是会话 id
 
   function api(path) {
     return fetch(path, { credentials: "same-origin" }).then(function (r) {
@@ -163,6 +206,7 @@
     var el = document.createElement("div");
     el.className = "card";
     el.dataset.id = s.id;
+    el.addEventListener("click", function () { openSession(s.id, s); });
 
     var top = document.createElement("div");
     top.className = "top";
@@ -206,13 +250,155 @@
     sessions.forEach(function (s) { listEl.appendChild(card(s)); });
   }
 
+  // ——会话画面————————————————————————————————————————————————
+
+  // 256 色索引 → CSS。0–15 是终端自己的十六色（各家主题不一样，这里用一套
+  // 常见的取值），16–231 是 6×6×6 色立方，232–255 是灰阶。跟
+  // `ui::mod.rs` 里那条对比度守卫算的是同一套公式。
+  var BASE16 = [
+    "#000000", "#cd0000", "#00cd00", "#cdcd00",
+    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff"
+  ];
+  function idxColor(i) {
+    if (i < 16) { return BASE16[i]; }
+    if (i >= 232) {
+      var v = 8 + 10 * (i - 232);
+      return "rgb(" + v + "," + v + "," + v + ")";
+    }
+    var STEP = [0, 95, 135, 175, 215, 255];
+    var n = i - 16;
+    return "rgb(" + STEP[Math.floor(n / 36)] + "," +
+      STEP[Math.floor((n % 36) / 6)] + "," + STEP[n % 6] + ")";
+  }
+
+  // 协议里的颜色是三选一：字符串 "Default"、{Idx:n}、{Rgb:[r,g,b]}。
+  //
+  // **判 Idx 必须用 typeof，不能用真值判断**：0 号色是黑色，而 `if (c.Idx)`
+  // 对 0 是假的——一整屏的黑字会被当成"没上色"。
+  function cssColor(c) {
+    if (!c || c === "Default") { return null; }
+    if (typeof c.Idx === "number") { return idxColor(c.Idx); }
+    if (c.Rgb) { return "rgb(" + c.Rgb.join(",") + ")"; }
+    return null;
+  }
+
+  function styleOf(st) {
+    if (!st) { return ""; }
+    var fg = cssColor(st.fg);
+    var bg = cssColor(st.bg);
+    // 反显 = 前景背景对调。哪一边本来没有具体颜色，就拿页面自己的那一档补上——
+    // 不补的话，一屏默认色上的"反显"什么都看不出来（而反显正是 dct 自己用来
+    // 标"当前项目"的手法）。
+    if (st.inverse) {
+      var swapped = [bg || "var(--bg)", fg || "var(--ink)"];
+      fg = swapped[0];
+      bg = swapped[1];
+    }
+    var out = "";
+    if (fg) { out += "color:" + fg + ";"; }
+    if (bg) { out += "background:" + bg + ";"; }
+    if (st.bold) { out += "font-weight:600;"; }
+    if (st.italic) { out += "font-style:italic;"; }
+    if (st.underline) { out += "text-decoration:underline;"; }
+    return out;
+  }
+
+  // 一整屏画成 <pre> 里的一串 <span>。**用 textContent 塞字**，
+  // 不拼 HTML 字符串——屏幕上的内容来自 agent，里面什么字节都可能有。
+  function paint(lines) {
+    canvasEl.textContent = "";
+    var cols = 0;
+    lines.forEach(function (spans, row) {
+      var width = 0;
+      spans.forEach(function (sp) {
+        var el = document.createElement("span");
+        var css = styleOf(sp.style);
+        if (css) { el.setAttribute("style", css); }
+        el.textContent = sp.text;
+        width += sp.text.length;
+        canvasEl.appendChild(el);
+      });
+      if (width > cols) { cols = width; }
+      if (row < lines.length - 1) {
+        canvasEl.appendChild(document.createTextNode("\n"));
+      }
+    });
+    return cols;
+  }
+
+  // 画布多宽就把字号调到多小，让一行**整行**放得进屏幕。
+  //
+  // 手机不改 PTY 尺寸（spec 决定四：桌面是唯一有 resize 权的客户端），所以
+  // 一行就是一行，横着滚动去读一行终端输出等于没法读。缩到 6px 以下就不再缩了，
+  // 那时候已经不是"小"而是"看不见"——剩下的交给捏放大。
+  function fitFont(cols) {
+    if (!cols) { return; }
+    var probe = 16;
+    canvasEl.style.fontSize = probe + "px";
+    rulerEl.style.fontSize = probe + "px";
+    var per = rulerEl.getBoundingClientRect().width / 10;
+    if (!per) { return; }
+    var avail = screenEl.clientWidth - 16;
+    var size = Math.floor((avail / (cols * per)) * probe);
+    canvasEl.style.fontSize = Math.max(6, Math.min(16, size)) + "px";
+  }
+
+  function placeCursor(pos, hidden) {
+    if (hidden || !pos) { cursorEl.hidden = true; return; }
+    var size = parseFloat(canvasEl.style.fontSize) || 16;
+    rulerEl.style.fontSize = size + "px";
+    var per = rulerEl.getBoundingClientRect().width / 10;
+    var lineH = size * 1.2;
+    cursorEl.hidden = false;
+    cursorEl.style.width = per + "px";
+    cursorEl.style.height = lineH + "px";
+    cursorEl.style.left = (8 + pos[1] * per) + "px";
+    cursorEl.style.top = (8 + pos[0] * lineH) + "px";
+  }
+
+  function drawScreen(resp) {
+    if (!resp || !resp.Screen) { throw new Error("unexpected response"); }
+    var s = resp.Screen;
+    var cols = paint(s.lines || []);
+    fitFont(cols);
+    // `cursor_hidden` 为真时一定不画。agent 干活时把光标关掉，而那个坐标
+    // 还在满屏乱跑——照着画就是一个到处蹦的方块（桌面端踩过这个坑）。
+    placeCursor(s.cursor, s.cursor_hidden);
+    dotEl.className = "";
+  }
+
+  function openSession(id, info) {
+    open = id;
+    listEl.hidden = true;
+    screenEl.hidden = false;
+    backEl.hidden = false;
+    if (info) {
+      titleEl.textContent = id + " " + (info.tag && info.tag.trim() ? info.tag : info.profile);
+    }
+    tick();
+  }
+
+  function closeSession() {
+    open = null;
+    screenEl.hidden = true;
+    cursorEl.hidden = true;
+    listEl.hidden = false;
+    backEl.hidden = true;
+    titleEl.textContent = t("title");
+    tick();
+  }
+
+  backEl.addEventListener("click", closeSession);
+
   function offline() {
     dotEl.className = "off";
     listEl.textContent = "";
     listEl.appendChild(notice(t("offline"), true));
   }
 
-  function refresh() {
+  function refreshList() {
     return api("/api/sessions").then(function (resp) {
       // 协议的答复是一个 externally tagged 的枚举：{"Sessions": [...]}。
       // 别的形状（比如 {"Error": …}）当成「这一轮没拿到」，不硬解。
@@ -222,19 +408,52 @@
     }).catch(offline);
   }
 
-  // 只在页面处于前台时刷新。锁屏之后一帧都不该发——手机在兜里而 dct 在
-  // 家里每 3 秒被问一次，纯属白耗电池和带宽（spec 的「流控」）。
+  function refreshScreen(id) {
+    return api("/api/screen?id=" + encodeURIComponent(id))
+      .then(drawScreen)
+      .catch(offline);
+  }
+
+  // 一个定时器管两种画面，节奏不一样：
+  //
+  // - 画面 300ms 一帧。桌面端是 16ms，那是本地 socket 的节奏；这一条链路上
+  //   16ms 是白烧电池和带宽，而 300ms 已经跟得上人读屏幕的速度（spec 的「流控」）。
+  // - 列表 3 秒一次。它只是几行状态，更快没有意义。
+  //
+  // **只在前台跑。** 手机锁屏之后一帧都不该发——人在兜里揣着，dct 在家里
+  // 每秒被问三次。`document.visibilityState` 是这件事唯一可靠的信号。
+  var SCREEN_MS = 300;
+  var LIST_EVERY = 10;   // 10 × 300ms = 3s
   var timer = null;
+  var ticks = 0;
+
+  // 「现在该不该发请求」**只有这一处说了算**。
+  //
+  // 抄成三处（定时器里一处、进画面时一处、切回前台时一处）的话，将来漏改
+  // 其中一处的症状是"手机锁着屏，dct 在家里每秒被问三次"——而这件事在手机上
+  // 完全看不出来，只会体现在电池和流量上。有一条守卫钉着这个唯一性。
+  function shouldPoll() {
+    return document.visibilityState === "visible";
+  }
+
+  function tick() {
+    if (!shouldPoll()) { return; }
+    if (open !== null) { refreshScreen(open); return; }
+    refreshList();
+  }
+
   function start() {
     if (timer) { return; }
-    refresh();
+    tick();
     timer = setInterval(function () {
-      if (document.visibilityState === "visible") { refresh(); }
-    }, 3000);
+      if (!shouldPoll()) { return; }
+      ticks++;
+      if (open !== null) { refreshScreen(open); }
+      else if (ticks % LIST_EVERY === 0) { refreshList(); }
+    }, SCREEN_MS);
   }
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible") { refresh(); }
-  });
+
+  document.addEventListener("visibilitychange", tick);
 
   // 先取文案再取列表：文案空着的时候「还没有会话」会显示成一片空白，
   // 用户会以为页面坏了。取不到就用空表继续——结构照样在。
