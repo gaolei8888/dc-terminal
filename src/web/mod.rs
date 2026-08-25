@@ -33,6 +33,7 @@
 //! - 比对用常数时间循环，不用 `==`
 
 pub mod routes;
+pub mod strings;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -240,7 +241,7 @@ fn handle_conn(mut stream: TcpStream, token: &str, handler: &dyn Handler) {
         Ok(raw) => {
             // **认证在路由之前。** 顺序反过来的话，401 和 404 的差别就成了
             // 一张接口地图，局域网里的任何人都能免费拿走。
-            if authorized(&raw, token) {
+            if is_public(&raw) || authorized(&raw, token) {
                 handler.handle(&Req {
                     method: &raw.method,
                     path: &raw.path,
@@ -348,6 +349,24 @@ fn read_request(stream: &mut TcpStream) -> Result<RawReq, u16> {
         cookie,
         authorization,
     })
+}
+
+/// 不需要令牌就能拿到的东西。**只有网页外壳这一样。**
+///
+/// 为什么必须有这个口子：令牌在二维码里放的是 fragment（`#t=…`），而
+/// **fragment 根本不会发给服务器**——浏览器只把它留在本地。所以第一次打开
+/// 页面的那个请求身上不可能带着令牌。把外壳也锁上的话，页面永远加载不出来，
+/// 也就永远执行不到「把 fragment 换成 cookie」那一步：一个自己锁死自己的
+/// 循环。**这个洞是把页面真的用浏览器打开一次才发现的**，所有单测都是绿的。
+///
+/// 放出去的代价：一段静态 HTML，里面**没有任何用户数据**——没有会话、没有
+/// 项目名、没有路径。局域网里的人拿到它，只能知道「这台机器上跑着 dct」，
+/// 而那件事在他扫到这个开着的端口时就已经知道了。
+///
+/// 换成 `/open?t=…` 那样的重定向也能解开循环，但那等于把令牌写进查询串——
+/// 进浏览器历史、进任何中间日志。fragment 存在的全部意义就是不进那些地方。
+fn is_public(req: &RawReq) -> bool {
+    req.method == "GET" && req.path == "/"
 }
 
 /// 带对 token 了吗。两种带法：
@@ -473,6 +492,37 @@ mod tests {
         let (s, addr, _t) = up();
         let r = raw(&addr, "GET /api/sessions HTTP/1.1\r\nHost: x\r\n\r\n");
         assert_eq!(status_of(&r), 401, "没带令牌就该 401：{r}");
+        s.stop();
+    }
+
+    /// **网页外壳是唯一不要令牌的东西，而且只有 `GET`。** 它必须放出去，
+    /// 否则页面加载不出来 → 执行不到「把 fragment 里的令牌换成 cookie」那一步
+    /// → 永远也带不上令牌（自己锁死自己）。
+    #[test]
+    fn only_the_page_shell_is_public_and_only_for_get() {
+        let (s, addr, _t) = up_with(|_: &Req| Resp::html("<!doctype html>"));
+
+        let shell = raw(&addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(status_of(&shell), 200, "外壳该放出去：{shell}");
+
+        // 但只有 GET：POST / 不在白名单里。
+        let post = raw(
+            &addr,
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_of(&post), 401, "POST / 不该免票：{post}");
+
+        // 带数据的路径一个都不许免票，长得像 `/` 的也不行。
+        for path in [
+            "/api/sessions",
+            "/api/screen?id=1",
+            "/api/strings",
+            "/index.html",
+            "//",
+        ] {
+            let r = raw(&addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+            assert_eq!(status_of(&r), 401, "{path} 不该免票：{r}");
+        }
         s.stop();
     }
 

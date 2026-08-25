@@ -1,0 +1,252 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>dct</title>
+<!--
+  手机端第 0 期的整个前端。
+
+  规矩三条，改这个文件之前先读：
+
+  1. **一个字的用户可见文案都不许写死在这里。** 全部走 t("key")，键在
+     src/web/strings.rs 的 NEEDED 里；那份表由守护进程按当前界面语言填。
+     写死的话，`l` 键切语言手机上不跟着变，而且 i18n.rs 那两条守卫查不到它。
+     有一条测试会扫这个文件：出现汉字，或者出现任何一句英文文案的字面量，
+     就挂。
+  2. **没有外部资源。** 没有 CDN、没有字体、没有图。局域网里那台手机可能
+     根本没有外网，而一个转着圈加载不出来的页面比朴素的页面糟得多。
+  3. **不改 PTY 尺寸。** 手机永远不发 resize（spec 决定四）：画布尺寸归桌面
+     那一侧，手机只是在看同一块画布。
+-->
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #14161b;
+    --dim: #5b6472;
+    --line: #d9dde3;
+    --accent: #005f87;
+    --ok: #2f6f3e;
+    --busy: #8a5a00;
+    --bad: #a8322a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1116;
+      --card: #171a20;
+      --ink: #e7eaef;
+      --dim: #8b95a5;
+      --line: #262b34;
+      --accent: #63b3d9;
+      --ok: #7fc08c;
+      --busy: #e8c07d;
+      --bad: #e88c7d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    position: sticky; top: 0;
+    display: flex; align-items: center; gap: .5rem;
+    padding: .8rem 1rem;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 1rem; font-weight: 600; letter-spacing: .01em; }
+  #dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--ok); }
+  #dot.off { background: var(--bad); }
+  main { padding: .75rem; display: grid; gap: .6rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .75rem .85rem;
+    display: grid;
+    gap: .3rem;
+    /* 整张卡是可点的，指头够得着：44px 是能稳定点中的下限 */
+    min-height: 44px;
+    cursor: pointer;
+  }
+  .top { display: flex; align-items: baseline; gap: .5rem; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .state { margin-left: auto; font-size: .8rem; white-space: nowrap; }
+  .state.idle { color: var(--ok); }
+  .state.working, .state.asking { color: var(--busy); }
+  .state.failed { color: var(--bad); }
+  .state.stopped, .state.unknown { color: var(--dim); }
+  .project { font-size: .8rem; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .activity {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .78rem; color: var(--dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .notice { padding: 2rem 1rem; text-align: center; color: var(--dim); }
+  .notice.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<header><span id="dot"></span><h1 id="title"></h1></header>
+<main id="list"></main>
+
+<script>
+(function () {
+  "use strict";
+
+  // 二维码里的令牌放在 fragment（#t=…），不放查询串：查询串会进浏览器历史、
+  // 进任何中间日志，而 fragment 根本不上行。拿到之后立刻换成同源 cookie，
+  // 并把地址栏里那一截抹掉——之后每次请求靠 cookie 带，地址可以随便分享。
+  //
+  // 有效期给 30 天而不是"关掉浏览器就失效"：后者意味着每次重开浏览器都要
+  // 重新扫一次码，而扫码要人走到电脑跟前——这个功能本来就是给不在电脑跟前
+  // 的人用的。撤销靠换令牌（设置页），不靠 cookie 短命。
+  (function claimToken() {
+    var m = /(?:^|[#&])t=([^&]+)/.exec(location.hash || "");
+    if (!m) { return; }
+    document.cookie =
+      "dct_web=" + m[1] + "; path=/; max-age=2592000; SameSite=Strict";
+    history.replaceState(null, "", location.pathname);
+  })();
+
+  // 文案表。**空表也要能跑**——网络没起来时页面照样显示结构，
+  // 只是文字空着，比整页白屏强。
+  var S = {};
+  function t(key) { return S[key] || ""; }
+
+  var listEl = document.getElementById("list");
+  var dotEl = document.getElementById("dot");
+  var titleEl = document.getElementById("title");
+
+  function api(path) {
+    return fetch(path, { credentials: "same-origin" }).then(function (r) {
+      if (!r.ok) { throw new Error("http " + r.status); }
+      return r.json();
+    });
+  }
+
+  // 协议里的会话状态是一个字符串枚举（SessionState），这里只把它映射到
+  // 文案表的键上。**认不出来的一律当 unknown**：编一个状态出来比承认
+  // 不知道更糟（同看板上那条「没有 pattern 就显示 —」）。
+  function stateKey(state) {
+    switch (state) {
+      case "Working": return "working";
+      case "Asking": return "asking";
+      case "Idle": return "idle";
+      case "Stopped": return "stopped";
+      case "Failed": return "failed";
+      default: return "unknown";
+    }
+  }
+
+  // 项目目录里最后一段。整条路径在手机上一行放不下，而认项目靠的是最后一段。
+  function projectOf(dir) {
+    var parts = String(dir || "").split(/[\\/]+/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "";
+  }
+
+  function notice(text, bad) {
+    var d = document.createElement("div");
+    d.className = bad ? "notice bad" : "notice";
+    d.textContent = text;
+    return d;
+  }
+
+  function card(s) {
+    var el = document.createElement("div");
+    el.className = "card";
+    el.dataset.id = s.id;
+
+    var top = document.createElement("div");
+    top.className = "top";
+
+    var name = document.createElement("span");
+    name.className = "name";
+    // 会话没起过名字就退回 profile 名——跟桌面同一条规矩：诚实报一个编号
+    // 或者 profile，绝不编一个不存在的名字。
+    name.textContent = s.id + " " + (s.tag && s.tag.trim() ? s.tag : s.profile);
+
+    var key = stateKey(s.state);
+    var state = document.createElement("span");
+    state.className = "state " + key;
+    state.textContent = t(key);
+
+    top.appendChild(name);
+    top.appendChild(state);
+
+    var project = document.createElement("div");
+    project.className = "project";
+    project.textContent = projectOf(s.dir);
+
+    el.appendChild(top);
+    el.appendChild(project);
+
+    if (s.activity && s.activity.trim()) {
+      var act = document.createElement("div");
+      act.className = "activity";
+      act.textContent = s.activity;
+      el.appendChild(act);
+    }
+    return el;
+  }
+
+  function render(sessions) {
+    listEl.textContent = "";
+    if (!sessions.length) {
+      listEl.appendChild(notice(t("empty")));
+      return;
+    }
+    sessions.forEach(function (s) { listEl.appendChild(card(s)); });
+  }
+
+  function offline() {
+    dotEl.className = "off";
+    listEl.textContent = "";
+    listEl.appendChild(notice(t("offline"), true));
+  }
+
+  function refresh() {
+    return api("/api/sessions").then(function (resp) {
+      // 协议的答复是一个 externally tagged 的枚举：{"Sessions": [...]}。
+      // 别的形状（比如 {"Error": …}）当成「这一轮没拿到」，不硬解。
+      if (!resp || !resp.Sessions) { throw new Error("unexpected response"); }
+      dotEl.className = "";
+      render(resp.Sessions);
+    }).catch(offline);
+  }
+
+  // 只在页面处于前台时刷新。锁屏之后一帧都不该发——手机在兜里而 dct 在
+  // 家里每 3 秒被问一次，纯属白耗电池和带宽（spec 的「流控」）。
+  var timer = null;
+  function start() {
+    if (timer) { return; }
+    refresh();
+    timer = setInterval(function () {
+      if (document.visibilityState === "visible") { refresh(); }
+    }, 3000);
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") { refresh(); }
+  });
+
+  // 先取文案再取列表：文案空着的时候「还没有会话」会显示成一片空白，
+  // 用户会以为页面坏了。取不到就用空表继续——结构照样在。
+  api("/api/strings?lang=" + encodeURIComponent(navigator.language || ""))
+    .then(function (map) { S = map || {}; })
+    .catch(function () { S = {}; })
+    .then(function () {
+      titleEl.textContent = t("title");
+      document.title = t("title") || "dct";
+      start();
+    });
+})();
+</script>
+</body>
+</html>

@@ -258,6 +258,12 @@ pub enum Key {
     HiddenCharsInName,
     // —— 状态与提示 ——
     NoSessionsHere,
+    /// 手机端连不上这台电脑时的那句话。
+    ///
+    /// **不说「你的电脑睡着了」那么肯定**：手机这一侧分不出「笔记本休眠了」
+    /// 「dct 被关掉了」「换了个 WiFi」这三种，而说死一种就有三分之二的概率
+    /// 在骗人。把三种可能都摆出来，用户自己一眼就知道是哪种。
+    PhoneOffline,
     /// 空项目组头上接在「还没有会话」后面的那半句：`上次用 claude`
     LastUsedAgent,
     /// 九宫格的整屏空态：一个格子都没有，屏幕正中就这一句话。
@@ -541,6 +547,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 44 列，含 `List` 每行都预留的 `▶ `）。`yet` 那四列会把最长的
         // 内置 agent 名（`opencode`/`deepseek`/`qwen-api`，8 列）顶出边框。
         NoSessionsHere => t!(lang, en: "no sessions", zh: "还没有会话"),
+        PhoneOffline => t!(
+            lang,
+            en: "can't reach your computer — it may be asleep, or dct was closed",
+            zh: "连不上你的电脑——可能是它睡着了，或者 dct 已经关掉",
+        ),
         // 空项目的组头上，这半句接在上面那条后面：`还没有会话 · 上次用 claude`。
         // 「哪个项目用哪个 agent」在别处只有底栏那一条，而底栏 80 列上会把
         // agent 名让掉——空项目于是全屏没有一处答得出这个问题。
@@ -1546,6 +1557,7 @@ mod tests {
             ManualPath,
             HiddenCharsInName,
             NoSessionsHere,
+            PhoneOffline,
             LastUsedAgent,
             NoSessionsRunningPressN,
             ProjectDirGone,
@@ -1635,7 +1647,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 125, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 126, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

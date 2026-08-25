@@ -159,3 +159,38 @@ fn a_wrong_token_gets_nothing_even_with_a_healthy_daemon() {
 
     server.stop();
 }
+
+/// **手工看一眼**用的脚手架，默认不跑（`#[ignore]`）。
+///
+/// 网页那一层的渲染逻辑是 JS，而这个仓库的测试只有 cargo——引一个 JS 运行时
+/// 进来，等于给所有人的 `cargo test` 加一个 node 依赖，为一件本来就该用眼睛
+/// 验收的事。所以这里给一条明路：接上**这台机器上真在跑的**守护进程，
+/// 起一个本地端口，把地址印出来，然后挂着，让人（或者带浏览器的 agent）
+/// 去看真实数据长什么样。
+///
+/// ```text
+/// cargo test --test web_routes -- --ignored --nocapture serve_for_a_manual_look
+/// ```
+#[test]
+#[ignore]
+fn serve_for_a_manual_look() {
+    let sock = dirs_home().join(".dct").join("daemon.sock");
+    let client = Client::connect(&sock).expect("这台机器上得有个跑着的 dct 守护进程");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = web::new_token().unwrap();
+    let server = web::serve(
+        listener,
+        token.clone(),
+        Arc::new(Routes::new(Arc::new(OverSocket(Mutex::new(client))))),
+    );
+    println!("MANUAL_URL http://{}/#t={}", server.addr(), token);
+    std::thread::sleep(std::time::Duration::from_secs(180));
+    server.stop();
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .expect("拿不到 home 目录")
+}

@@ -21,6 +21,10 @@ use crate::proto::{Request, Response};
 
 use super::{Handler, Req, Resp};
 
+/// 手机网页本体。`include_str!` 进二进制：装 dct 的人不该还要另外拷一个
+/// 文件到某个目录里，而"找不到网页文件"是一个根本不需要存在的失败模式。
+const PAGE: &str = include_str!("page.html");
+
 /// 「把这个 `Request` 交给守护进程，给我 `Response`」。
 ///
 /// 抽成 trait 是为了让 `web` 只依赖**一个函数**，而不是 `daemon::handle` 那
@@ -69,6 +73,31 @@ impl Handler for Routes {
         // **先按路径分，再按方法分。** 反过来的话，一个 POST 到不存在的路径会
         // 得到 405（「这个路径不接受 POST」），等于告诉对方这个路径存在。
         match req.path {
+            // 网页本体。`/` 之外不给别的入口——一个静态文件服务器会长出
+            // 路径穿越那一类问题，而这里总共只有一个文件。
+            "/" => match req.method {
+                "GET" => Resp::html(PAGE),
+                _ => Resp::status(405),
+            },
+            // 网页上的每一句话都从这儿来，网页里一个字都不写死。
+            // 语言认不出来就按 `Lang::resolve` 那套的最后一档（英文）——
+            // 手机送来的是浏览器的 `navigator.language`，什么值都可能。
+            "/api/strings" => match req.method {
+                "GET" => {
+                    let lang = query_get(req.query, "lang")
+                        .map(|v| {
+                            if v.to_ascii_lowercase().starts_with("zh") {
+                                "zh"
+                            } else {
+                                "en"
+                            }
+                        })
+                        .and_then(crate::i18n::Lang::from_code)
+                        .unwrap_or(crate::i18n::Lang::En);
+                    Resp::json(super::strings::bundle(lang))
+                }
+                _ => Resp::status(405),
+            },
             "/api/sessions" => match req.method {
                 "GET" => self.answer(Request::List),
                 _ => Resp::status(405),
@@ -215,6 +244,146 @@ mod tests {
             body,
             Response::Error(crate::proto::ErrorCode::NoSuchSession(9))
         ));
+    }
+
+    #[test]
+    fn the_page_is_served_at_the_root() {
+        let (r, fake) = routes(Response::Ok);
+        let resp = r.handle(&get("/", ""));
+
+        assert_eq!(resp.status, 200);
+        assert!(resp.content_type.starts_with("text/html"));
+        assert!(!resp.body.is_empty());
+        assert!(
+            fake.seen.lock().unwrap().is_empty(),
+            "发一个静态页面不该惊动守护进程"
+        );
+    }
+
+    #[test]
+    fn the_strings_bundle_follows_the_requested_language() {
+        use crate::i18n::{text, Key, Lang};
+        let (r, _) = routes(Response::Ok);
+        let zh = r.handle(&get("/api/strings", "lang=zh-CN"));
+        let en = r.handle(&get("/api/strings", "lang=en-US"));
+
+        assert_eq!(zh.status, 200);
+        assert_ne!(zh.body, en.body, "两种语言的表不该一模一样");
+        let zh: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&zh.body).unwrap();
+        assert_eq!(zh["idle"], text(Key::StatusIdle, Lang::Zh));
+    }
+
+    /// 浏览器送来的 `navigator.language` 什么值都可能（空串、`ja`、`zh_Hant`…）。
+    /// **认不出来就退回英文，绝不失败**——一个因为语言标记看不懂而白屏的页面，
+    /// 用户完全无从下手。
+    #[test]
+    fn an_unknown_language_falls_back_instead_of_failing() {
+        use crate::i18n::{text, Key, Lang};
+        let (r, _) = routes(Response::Ok);
+        for q in ["", "lang=", "lang=ja", "lang=xx-YY", "lang=%00"] {
+            let resp = r.handle(&get("/api/strings", q));
+            assert_eq!(resp.status, 200, "lang {q:?} 不该失败");
+            let map: std::collections::BTreeMap<String, String> =
+                serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(
+                map["idle"],
+                text(Key::StatusIdle, Lang::En),
+                "lang {q:?} 该退回英文"
+            );
+        }
+    }
+
+    /// 把注释剥掉，只留会被执行/显示的部分。
+    ///
+    /// 三种注释都要剥：HTML 的 `<!-- -->`、CSS 的 `/* */`、JS 的 `//`。
+    /// **注释里写中文是允许的**（它不会显示给用户），所以漏剥哪一种，
+    /// 下面那条"网页里不许有汉字"的守卫就会误报——这个坑第一次写就踩了。
+    fn page_without_comments() -> String {
+        fn strip(src: &str, open: &str, close: &str) -> String {
+            let mut out = String::new();
+            let mut rest = src;
+            while let Some(start) = rest.find(open) {
+                out.push_str(&rest[..start]);
+                rest = match rest[start..].find(close) {
+                    Some(end) => &rest[start + end + close.len()..],
+                    None => "",
+                };
+            }
+            out.push_str(rest);
+            out
+        }
+        let code = strip(PAGE, "<!--", "-->");
+        let code = strip(&code, "/*", "*/");
+        code.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 网页里 `t("…")` 取过的键。
+    ///
+    /// **前面那个字符必须不是标识符的一部分**：不加这一条的话
+    /// `createElement("div")` 也会被算成一次 `t("div")`——`…Element(` 正好以
+    /// `t(` 结尾。第一次写就是这么误报的。
+    fn strings_the_page_asks_for() -> Vec<String> {
+        let code = page_without_comments();
+        let bytes = code.as_bytes();
+        let mut asked = Vec::new();
+        let mut i = 0;
+        while let Some(hit) = code[i..].find("t(\"") {
+            let at = i + hit;
+            let ok = at == 0
+                || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.');
+            i = at + 3;
+            if !ok {
+                continue;
+            }
+            if let Some(end) = code[i..].find('"') {
+                asked.push(code[i..i + end].to_string());
+            }
+        }
+        asked
+    }
+
+    /// **网页里不许写死任何用户可见的文案。** 这一条光靠自觉守不住，所以在这里
+    /// 扫一遍：出现汉字，或者出现文案表里任何一句英文的字面量，就挂。
+    ///
+    /// 写死了会怎样：`l` 键切了界面语言，手机上不跟着变；`i18n.rs` 那两条守卫
+    /// （两种语言都组得出话、英文里不许有汉字）查不到它；同一个状态词在电脑上
+    /// 和手机上写得不一样，而没有任何东西会报错。
+    #[test]
+    fn the_page_carries_no_user_facing_copy_of_its_own() {
+        let code = page_without_comments();
+
+        let han: Vec<char> = code
+            .chars()
+            .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+            .collect();
+        assert!(han.is_empty(), "网页里出现了汉字，应该走文案表：{han:?}");
+
+        for (name, key) in super::super::strings::NEEDED {
+            let en = crate::i18n::text(*key, crate::i18n::Lang::En);
+            // 一两个词的短语（"idle"）会跟代码里的标识符撞，只查长句子。
+            if en.len() > 12 {
+                assert!(!code.contains(en), "网页里写死了 {name} 那句话");
+            }
+        }
+    }
+
+    /// 网页取的每个键都得在表里。少一个的症状是手机上某处空着一块，
+    /// 而没有任何报错——**这正是没人会主动发现的那类缺陷**。
+    #[test]
+    fn the_page_asks_only_for_strings_that_exist() {
+        let asked = strings_the_page_asks_for();
+        assert!(!asked.is_empty(), "一个文案键都没扫到，扫描逻辑坏了");
+
+        for key in &asked {
+            assert!(
+                super::super::strings::NEEDED.iter().any(|(n, _)| n == key),
+                "网页要 {key:?}，但 strings::NEEDED 里没有"
+            );
+        }
     }
 
     #[test]
