@@ -269,6 +269,17 @@ pub enum Key {
     SettingsTitle,
     CurrentProject,
     ManualPath,
+    /// 左栏最后那一行：在浏览栏当前停着的目录里新建一个项目。**跟
+    /// `ManualPath` 一样不参与过滤**，永远在列表末尾——它是个动作，
+    /// 不是一条数据。
+    NewProject,
+    /// 新建项目时那一行提示：名字建到哪个目录里去。目录名由
+    /// `msg::new_project_in` 那句带上，这条只是它的兜底标题。
+    NewProjectPrompt,
+    /// 名字空着
+    NewProjectNoName,
+    /// 名字里有 `/` 或 `..`
+    NewProjectBadName,
     RecentProjects,
     SwitchPane,
     EnterFolder,
@@ -551,7 +562,10 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         BackToBoard => t!(lang, en: "Esc back", zh: "Esc 回看板"),
         // 会话视图专用：那里 Esc 归 agent（取消/清空/关弹窗），逃生键只能是
         // F2。别把这条跟上面那条合并——合并就意味着某一屏的底栏在说谎。
-        BackToBoardF2 => t!(lang, en: "F2 back", zh: "F2 回看板"),
+        // 英文这一格写的是**去哪儿**，不是「往回」：从会话视图上看，
+        // 「back」没说清回到哪一屏，而 F2 的落点就是那块会话看板——
+        // 中文那半早就点名了（回看板），英文补上。
+        BackToBoardF2 => t!(lang, en: "F2 main", zh: "F2 回看板"),
         BackToList => t!(lang, en: "Esc back", zh: "Esc 回列表"),
         BackToSettings => t!(lang, en: "Esc settings", zh: "Esc 回设置"),
 
@@ -583,6 +597,23 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 是因为别处（浮层标题之类）随时可能要，它不占屏幕。
         CurrentProject => t!(lang, en: "Project", zh: "当前项目"),
         ManualPath => t!(lang, en: "Type a path…", zh: "手输路径…"),
+        NewProject => t!(lang, en: "New project…", zh: "新建项目…"),
+        NewProjectPrompt => t!(
+            lang,
+            en: "Name for the new folder",
+            zh: "新目录叫什么名字",
+        ),
+        NewProjectNoName => t!(
+            lang,
+            en: "Type a name first",
+            zh: "先打一个名字",
+        ),
+        NewProjectBadName => t!(
+            lang,
+            en: "A name only — no / and no .. (use Type a path… to build elsewhere)",
+            zh: "只写名字——不要 / 也不要 ..（要建到别处用「手输路径…」）",
+        ),
+
         RecentProjects => t!(lang, en: "Recent", zh: "最近"),
         SwitchPane => t!(lang, en: "switch side", zh: "切换左右"),
         EnterFolder => t!(lang, en: "open folder", zh: "进入文件夹"),
@@ -927,6 +958,35 @@ pub mod msg {
     // 看板」时删掉了：换项目现在是 `Tab`，一个键、零弹窗、不说话，光标
     // 落在哪个组上就是当前项目，屏幕自己看得见——再补一句话反而会盖掉
     // 底栏上别的更要紧的提示（见 board.rs 头上 `e0ba1ec` 那段）。
+
+    /// 新建项目那一行的提示：**把目录说出来**。「新目录叫什么名字」少了
+    /// 「建在哪儿」这半句，用户没法确认自己是不是先把浏览栏挪对了地方。
+    pub fn new_project_in(lang: Lang, dir: &str) -> String {
+        t!(
+            lang,
+            en: format!("Name for the new folder in {dir}"),
+            zh: format!("在 {dir} 里新建一个目录，叫什么名字"),
+        )
+    }
+
+    /// 名字撞车。**把名字带上**，否则用户不知道是哪个撞了——他刚打的那个
+    /// 名字自己看得见，但列表里那个同名目录可能在过滤词外面，看不见。
+    pub fn new_project_exists(lang: Lang, name: &str) -> String {
+        t!(
+            lang,
+            en: format!("{name} is already there — pick it from the list instead"),
+            zh: format!("{name} 已经有了——直接在列表里选它"),
+        )
+    }
+
+    /// 建目录失败。**带上系统的原话**，理由同 `git_init_failed`。
+    pub fn new_project_failed(lang: Lang, err: &str) -> String {
+        t!(
+            lang,
+            en: format!("Could not create the folder: {err}"),
+            zh: format!("目录没建成：{err}"),
+        )
+    }
 
     pub fn not_a_directory(lang: Lang, path: &str) -> String {
         t!(lang, en: format!("{path} is not a folder"), zh: format!("{path} 不是一个目录"))
@@ -1622,6 +1682,10 @@ mod tests {
             SettingsTitle,
             CurrentProject,
             ManualPath,
+            NewProject,
+            NewProjectPrompt,
+            NewProjectNoName,
+            NewProjectBadName,
             HiddenCharsInName,
             NoSessionsHere,
             PhoneOffline,
@@ -1714,7 +1778,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 135, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 139, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

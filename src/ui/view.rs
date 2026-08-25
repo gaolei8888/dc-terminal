@@ -475,6 +475,13 @@ pub struct ProjectPicker {
     pub filter: String,
     /// Some 表示正处在「手输路径」的输入态
     pub typing_path: Option<String>,
+    /// Some 表示正处在「新建项目」的输入态，装着已经打进去的**名字**。
+    ///
+    /// **跟 `typing_path` 分开两个字段**，不合成一个枚举：两者收的东西
+    /// 不是一回事——那个收的是一条完整路径（可以粘贴、可以带 `~`），
+    /// 这个只收一个目录名（带分隔符要报错，见 `new_project_path`）。
+    /// 合成一个的话，两条校验规则迟早会在同一个分支里互相让步。
+    pub naming: Option<String>,
 }
 
 impl ProjectPicker {
@@ -497,6 +504,7 @@ impl ProjectPicker {
             focus: Pane::Recent,
             filter: String::new(),
             typing_path: None,
+            naming: None,
         }
     }
 
@@ -994,7 +1002,10 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
     use crate::i18n::{text, Key};
     match view {
         View::Board => format!("q {}", text(Key::Quit, lang)),
-        View::PickProject(p) if p.typing_path.is_some() => text(Key::BackToList, lang).to_string(),
+        // 新建态跟手输态同一条退路：Esc 回列表，名字不算数。
+        View::PickProject(p) if p.typing_path.is_some() || p.naming.is_some() => {
+            text(Key::BackToList, lang).to_string()
+        }
         // 跟 `secret.rs` 的 Esc 分支保持一致：从密钥设置页进来的填密钥，退出
         // 回设置页，不是选择器，也不是看板——三条路各回各的，文案不能含糊成
         // 一句话。
@@ -1197,7 +1208,7 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
-        View::PickProject(p) if p.typing_path.is_some() => help_items(
+        View::PickProject(p) if p.typing_path.is_some() || p.naming.is_some() => help_items(
             &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
             lang,
         ),

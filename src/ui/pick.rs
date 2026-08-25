@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -176,6 +176,64 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     };
 
+    // ——新建项目态：收的是一个**目录名**，不是路径——
+    //
+    // 排在手输路径态前面纯粹是因为两者互斥（同时只可能有一个是 Some），
+    // 顺序不影响结果；分开写是因为两者收的东西和校验规则都不一样，
+    // 见 `ProjectPicker::naming` 的文档注释。
+    if let Some(mut buf) = p.naming.clone() {
+        match key.code {
+            KeyCode::Esc => p.naming = None,
+            KeyCode::Enter => match new_project_path(&p.cwd, &buf) {
+                Ok(dir) => {
+                    // 先建目录再 `git init`：建不出来就没有仓库可初始化，
+                    // 反过来做会在失败时留下一个半成品。
+                    match std::fs::create_dir(&dir) {
+                        Ok(()) => {
+                            // **`git init` 失败不挡路。** 目录已经建好了，
+                            // 项目本身成立；没有仓库这件事在下一屏有整块
+                            // 红边框和 `g` 那条出路在说（见 `handle_pick_profile`），
+                            // 在这里把用户按回输入框只会让他重打一遍名字，
+                            // 而重打解决不了「机器上没装 git」。
+                            if let Err(e) = crate::git::init(&dir) {
+                                app.message =
+                                    Msg::err(msg::git_init_failed(app.lang, &e.to_string()));
+                            }
+                            super::pin_project(app, dir);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            app.message =
+                                Msg::err(msg::new_project_failed(app.lang, &e.to_string()));
+                        }
+                    }
+                }
+                // 三种毛病三句话，而且**都留在输入态里**：改个名字就能继续，
+                // 把人踢回列表等于让他刚打的名字白打。
+                Err(NameProblem::Empty) => {
+                    app.message = Msg::err(text(Key::NewProjectNoName, app.lang).into());
+                }
+                Err(NameProblem::Separator) => {
+                    app.message = Msg::err(text(Key::NewProjectBadName, app.lang).into());
+                }
+                Err(NameProblem::Exists) => {
+                    app.message = Msg::err(msg::new_project_exists(app.lang, buf.trim()));
+                }
+            },
+            KeyCode::Backspace => {
+                buf.pop();
+                p.naming = Some(buf);
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                p.naming = Some(buf);
+            }
+            _ => {}
+        }
+        app.view = View::PickProject(p);
+        return Ok(());
+    }
+
     // ——手输路径态：可见字符全进输入框，不再当过滤用——
     if let Some(mut buf) = p.typing_path.clone() {
         match key.code {
@@ -228,8 +286,10 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
             match p.focus {
                 // +1 是末行那个「手输路径…」，它不参与过滤，永远在
+                // +2 是末尾那两行「手输路径…」「新建项目…」，它们不参与
+                // 过滤，永远在。
                 Pane::Recent => {
-                    let n = p.shown_recent().len() + 1;
+                    let n = p.shown_recent().len() + 2;
                     move_sel_n(&mut p.recent_state, n, d);
                 }
                 Pane::Browse => {
@@ -271,9 +331,15 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                     let i = p.recent_state.selected().unwrap_or(0);
                     match shown.get(i) {
                         Some(dir) => Some(PathBuf::from(dir)),
-                        // 选中的是末行「手输路径…」
+                        // 过了最后一条数据之后是两个动作行：先「手输路径…」，
+                        // 再「新建项目…」。顺序跟画出来的一致，靠的是同一个
+                        // `shown_recent().len()` 做基准。
                         None => {
-                            p.typing_path = Some(String::new());
+                            if i == shown.len() {
+                                p.typing_path = Some(String::new());
+                            } else {
+                                p.naming = Some(String::new());
+                            }
                             None
                         }
                     }
@@ -316,6 +382,40 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 /// 过滤变了就把光标收回第一行，否则它会停在一个已经被过滤掉的行号上。
+/// 新建项目时，名字有什么毛病。**分开三种**：三句话不一样，而一句
+/// 「名字不合法」等于让用户自己猜是哪儿不对。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NameProblem {
+    /// 什么都没打
+    Empty,
+    /// 名字里带路径分隔符或者 `..`
+    Separator,
+    /// 这个名字已经有了
+    Exists,
+}
+
+/// 把「在 `parent` 里新建一个叫 `name` 的项目」算成一个路径。
+pub(crate) fn new_project_path(parent: &Path, name: &str) -> Result<PathBuf, NameProblem> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(NameProblem::Empty);
+    }
+    // **分隔符和 `..` 一律挡住。** 用户看着的是「在这个目录里新建」，
+    // 而 `../x` 会把目录建到别处去——屏幕和实际发生的事对不上，是这个
+    // 项目里最不能接受的一类 bug。要建到别处，那是「手输路径」那条路。
+    // Windows 的 `\` 也算：那台机器上它就是分隔符。
+    if name.contains('/') || name.contains('\\') || name.split('.').all(|p| p.is_empty()) {
+        return Err(NameProblem::Separator);
+    }
+    let dir = parent.join(name);
+    // `exists` 而不是 `is_dir`：同名的**文件**也占着这个名字，
+    // `create_dir` 到那儿一样会失败，而那时候的报错没法给用户下一步。
+    if dir.exists() {
+        return Err(NameProblem::Exists);
+    }
+    Ok(dir)
+}
+
 fn reset_cursor(p: &mut ProjectPicker) {
     match p.focus {
         Pane::Recent => p.recent_state.select(Some(0)),
@@ -454,6 +554,24 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
         Style::default().fg(Color::Red)
     };
 
+    // 新建态跟手输态一样占满整层：这时候屏幕上只有一件事在发生。
+    // 标题里带上目录——见 `msg::new_project_in` 的注释。
+    if let Some(buf) = &p.naming {
+        f.render_widget(
+            Paragraph::new(format!("{buf}▌")).block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .border_style(border_style)
+                    .title(msg::new_project_in(
+                        lang,
+                        &short_path(&p.cwd.display().to_string()),
+                    )),
+            ),
+            area,
+        );
+        return;
+    }
+
     // 手输态占满整层，不分栏：这时候屏幕上只有一件事在发生。
     if let Some(buf) = &p.typing_path {
         f.render_widget(
@@ -489,9 +607,15 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-    // 兜底入口不参与过滤，永远在最后一行
+    // 两个动作行不参与过滤，永远在最后：先「手输路径…」，再「新建项目…」。
+    // 顺序跟 `handle_pick_project` 里那个 `i == shown.len()` 的判断绑在一起，
+    // 改这里就要改那里。
     items.push(ListItem::new(Line::from(Span::styled(
         text(Key::ManualPath, lang),
+        Style::default().fg(Color::Cyan),
+    ))));
+    items.push(ListItem::new(Line::from(Span::styled(
+        text(Key::NewProject, lang),
         Style::default().fg(Color::Cyan),
     ))));
     f.render_stateful_widget(
@@ -501,7 +625,17 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
                 p.focus == Pane::Recent,
                 border_style,
             ))
-            .highlight_symbol("▶ "),
+            // **只有有焦点的那一栏画光标。** 两栏都画的话，屏幕上同时
+            // 有两个长得一模一样的 `▶`，而按 Tab 之后唯一变的东西是边框
+            // 颜色——那一档差别在不少主题下几乎看不出来。用户于是既看不出
+            // 焦点在哪，也看不出 Tab 有没有生效，方向键动的那一栏跟他盯着
+            // 的那个光标对不上。空字符串留两格，是为了让列表本身的缩进
+            // 在两种状态下一样宽，不然切焦点时整栏文字会横跳一下。
+            .highlight_symbol(if p.focus == Pane::Recent {
+                "▶ "
+            } else {
+                "  "
+            }),
         cols[0],
         &mut p.recent_state.clone(),
     );
@@ -549,7 +683,14 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect();
         f.render_stateful_widget(
-            List::new(items).block(browse_block).highlight_symbol("▶ "),
+            List::new(items)
+                .block(browse_block)
+                // 同左栏：焦点不在这儿就不画光标，见那边的注释。
+                .highlight_symbol(if p.focus == Pane::Browse {
+                    "▶ "
+                } else {
+                    "  "
+                }),
             cols[1],
             &mut p.browse_state.clone(),
         );
@@ -781,6 +922,222 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+    }
+
+    /// 新建输入态整层只画一件事，而且标题必须**把目录说出来**——「叫什么
+    /// 名字」少了「建在哪儿」，用户没法确认自己是不是先把浏览栏挪对了。
+    #[test]
+    fn the_naming_prompt_names_the_directory_it_will_build_in() {
+        let (_t, _g, mut app, root) = tree(&["outer"]);
+        open_picker(&mut app, vec![], root.join("outer"));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        for c in "abc".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let screen = buffer_text(term.backend().buffer());
+
+        assert!(
+            screen.contains("outer"),
+            "标题没说建在哪个目录里：\n{screen}"
+        );
+        assert!(screen.contains("abc"), "打进去的名字没上屏：\n{screen}");
+    }
+
+    /// 「新建项目…」那一行永远在左栏末尾，**过滤也删不掉它**——它是个
+    /// 动作，不是一条数据。过滤词把它滤没了的话，用户越是找不到项目
+    /// （正是最该新建的时候），这个入口越是不见。
+    #[test]
+    fn the_new_project_row_is_always_there() {
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        open_picker(&mut app, vec![root.join("a").display().to_string()], root);
+        // 打一个跟谁都不匹配的过滤词
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let screen = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        let label: String = text(Key::NewProject, app.lang)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            screen.contains(&label),
+            "过滤之后新建入口不见了：\n{screen}"
+        );
+    }
+
+    /// 选中那一行按 Enter，进的是**打名字**的输入态，不是直接建目录：
+    /// 建之前得让用户看清楚建在哪儿、叫什么。
+    #[test]
+    fn enter_on_the_new_project_row_asks_for_a_name() {
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        open_picker(&mut app, vec![root.join("a").display().to_string()], root);
+        // 最近栏：0 = a，1 = 手输路径…，2 = 新建项目…
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(picker(&app).naming, Some(String::new()), "没进新建输入态");
+    }
+
+    /// 打完名字回车：目录建在**浏览栏当前那个目录**里，顺手 `git init`，
+    /// 然后直接进选 agent 那一屏——新建一个项目的全部意义就是马上开工。
+    #[test]
+    fn naming_creates_the_folder_and_goes_on_to_pick_an_agent() {
+        let (_t, _g, mut app, root) = tree(&[]);
+        open_picker(&mut app, vec![], root.clone());
+        // 没有最近项目，所以左栏只有两行：0 = 手输路径…，1 = 新建项目…
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        for c in "my-thing".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        let made = root.join("my-thing");
+        assert!(made.is_dir(), "目录没建出来");
+        assert!(made.join(".git").exists(), "没有 git init");
+        // 建完就当它是被选中的项目往下走。测试里没有守护进程，所以
+        // `open_new_session` 拉不到 agent 列表、停在看板上——跟「在浏览栏
+        // 选中一个已有目录」那条路的落点完全一样（见
+        // `choosing_a_folder_pins_it`），这里钉的是**项目切过去了**。
+        assert!(
+            app.current_dir().ends_with("my-thing"),
+            "新建完没把它当成当前项目：{}",
+            app.current_dir().display()
+        );
+        assert!(matches!(app.view, View::Board), "建完没往下走");
+    }
+
+    /// 名字带 `..` 的时候：**不建，也不退出输入态**——用户改个名字就能继续，
+    /// 而屏幕上那句话要说清楚为什么。
+    #[test]
+    fn a_name_that_escapes_keeps_you_in_the_prompt_with_a_reason() {
+        let (_t, _g, mut app, root) = tree(&[]);
+        open_picker(&mut app, vec![], root.clone());
+        // 同上：没有最近项目时，「新建项目…」是第二行
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        for c in "../escaped".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(picker(&app).naming.is_some(), "被踢出了输入态，名字白打了");
+        assert!(app.message.error, "没给出错的话");
+        assert!(
+            !root.parent().unwrap().join("escaped").exists(),
+            "目录建到浏览位置外面去了"
+        );
+    }
+
+    /// 空名字不建目录——`parent.join("")` 就是 `parent` 自己，不挡住的话
+    /// 用户多按一次 Enter 就把**当前浏览的那个目录**当成新项目选走了。
+    #[test]
+    fn an_empty_name_is_refused() {
+        let (_t, _g, _app, root) = tree(&[]);
+        assert_eq!(new_project_path(&root, ""), Err(NameProblem::Empty));
+        assert_eq!(new_project_path(&root, "   "), Err(NameProblem::Empty));
+    }
+
+    /// **名字里不许有分隔符或 `..`。** 这不是洁癖：`../../x` 会在用户以为
+    /// 「在这个目录里新建」的时候，把目录建到浏览位置之外去——他看着的那
+    /// 一屏和实际发生的事对不上。要建到别处有「手输路径」那条路。
+    #[test]
+    fn a_name_that_escapes_the_browsed_directory_is_refused() {
+        let (_t, _g, _app, root) = tree(&[]);
+        for bad in ["../x", "a/b", "..", "/etc"] {
+            assert_eq!(
+                new_project_path(&root, bad),
+                Err(NameProblem::Separator),
+                "{bad} 该被挡住"
+            );
+        }
+    }
+
+    /// 名字撞车不覆盖、不静默接受：已经有的目录该用「选」的，不是「新建」的。
+    #[test]
+    fn a_name_that_already_exists_is_refused() {
+        let (_t, _g, _app, root) = tree(&["taken"]);
+        assert_eq!(new_project_path(&root, "taken"), Err(NameProblem::Exists));
+    }
+
+    /// 好名字算出来的就是浏览目录底下那一个。
+    #[test]
+    fn a_good_name_lands_inside_the_browsed_directory() {
+        let (_t, _g, _app, root) = tree(&[]);
+        assert_eq!(
+            new_project_path(&root, "my-thing"),
+            Ok(root.join("my-thing"))
+        );
+        // 两头的空格是手滑，不是名字的一部分
+        assert_eq!(
+            new_project_path(&root, " my-thing "),
+            Ok(root.join("my-thing"))
+        );
+    }
+
+    /// **屏幕上只能有一个光标。**
+    ///
+    /// 两栏各画各的 `▶`、只靠边框颜色区分焦点，是这一屏最要命的一个洞：
+    /// 用户按 Tab 之后屏幕上什么明显的东西都没变（边框那一档颜色差在很多
+    /// 主题下几乎看不出来），而另一栏那个 `▶` 看上去跟真光标一模一样——
+    /// 于是「Tab 没反应」「方向键动的是另一栏」这两句抱怨其实是同一个 bug。
+    /// 焦点在哪，`▶` 就只能在哪。
+    #[test]
+    fn only_the_focused_pane_shows_a_cursor() {
+        let (_t, _g, mut app, root) = tree(&["a", "b"]);
+        open_picker(&mut app, vec![root.join("a").display().to_string()], root);
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let screen = buffer_text(term.backend().buffer());
+
+        assert_eq!(
+            screen.matches('\u{25b6}').count(),
+            1,
+            "焦点在最近栏，屏幕上却有不止一个光标：\n{screen}"
+        );
+    }
+
+    /// 光标跟着焦点走。按一下 Tab，`▶` 必须**从左栏挪到右栏**——数目对
+    /// 不代表位置对，上面那条只钉住「只有一个」，这条钉住「在正确的一边」。
+    #[test]
+    fn the_cursor_moves_to_the_other_pane_on_tab() {
+        let (_t, _g, mut app, root) = tree(&["a", "b"]);
+        open_picker(&mut app, vec![root.join("a").display().to_string()], root);
+        press(&mut app, KeyCode::Tab);
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // 两栏是 42% / 58% 分的（见 `draw_pick_project` 的 `Layout`），
+        // 不是对半——按 42% 那条线分，才是「在哪一栏」的正确判据。
+        let half = buf.area.width * 42 / 100;
+        let mut left = 0;
+        let mut right = 0;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).map(|c| c.symbol()) == Some("\u{25b6}") {
+                    if x < half {
+                        left += 1;
+                    } else {
+                        right += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!((left, right), (0, 1), "Tab 之后光标没挪到右栏");
     }
 
     /// Tab 在两栏之间来回切。没有这一步，右边那栏就是个只能看不能用的装饰。
