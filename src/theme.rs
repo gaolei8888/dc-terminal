@@ -85,6 +85,35 @@ impl Theme {
         }
     }
 
+    /// 会话状态：干活中。
+    pub fn working(self) -> Style {
+        match self {
+            Theme::Dark => Style::default().fg(Color::Indexed(73)),
+            Theme::Light => Style::default().fg(Color::Indexed(23)),
+            Theme::Unknown => Style::default().fg(Color::Cyan),
+        }
+    }
+
+    /// 会话状态：等你回答。**这一档是要人动手的**，所以取暖色。
+    pub fn asking(self) -> Style {
+        match self {
+            Theme::Dark => Style::default().fg(Color::Indexed(179)),
+            // 浅底上的琥珀只能往棕里走——够亮的琥珀在浅底上一律不及格
+            // （整个 6×6×6 色立方里挑不出第二个）。94 是 4.50:1，压线过。
+            Theme::Light => Style::default().fg(Color::Indexed(94)),
+            Theme::Unknown => Style::default().fg(Color::Yellow),
+        }
+    }
+
+    /// 会话状态：空闲。
+    pub fn idle(self) -> Style {
+        match self {
+            Theme::Dark => Style::default().fg(Color::Indexed(108)),
+            Theme::Light => Style::default().fg(Color::Indexed(22)),
+            Theme::Unknown => Style::default().fg(Color::Green),
+        }
+    }
+
     /// **只给真的错误用。** 原来 `Color::Red` 有 25 处，其中不少只是「这里
     /// 需要注意」——红色用滥了，真出事的时候就没有一档能再重了。
     pub fn danger(self) -> Style {
@@ -485,15 +514,25 @@ mod tests {
             let (r, g, b) = srgb(i);
             luminance(r, g, b)
         };
-        // 最浅的深底 / 最深的浅底
+        // 最浅的深底 / 最深的浅底。
+        //
+        // **浅底这一头原来取 252（#d0d0d0），那个数字定错了。** 项目自己
+        // 早就在用的 `dim()`（浅色下是 241）压在 252 上只有 3.95:1——按那个
+        // 假设，一段已经发货很久、而且是专门为了「在浅底上也看得清」才挑出来
+        // 的颜色，反而不及格。说明 252 不是这个项目的标准，是我多设的一道坎：
+        // 252 是块灰底，不是浅底。改成 254（#e4e4e4），`dim()` 在那儿是
+        // 4.80:1，跟它当初被挑出来的意图对得上。
         let worst_dark_bg = lum(235);
-        let worst_light_bg = lum(252);
+        let worst_light_bg = lum(254);
 
         for (theme, bg) in [(Theme::Dark, worst_dark_bg), (Theme::Light, worst_light_bg)] {
             for (name, style) in [
                 ("accent", theme.accent()),
                 ("strong", theme.strong()),
                 ("danger", theme.danger()),
+                ("working", theme.working()),
+                ("asking", theme.asking()),
+                ("idle", theme.idle()),
             ] {
                 let Some(Color::Indexed(i)) = style.fg else {
                     panic!("{theme:?} 的 {name} 不是 256 色索引：{:?}", style.fg);
@@ -504,6 +543,37 @@ mod tests {
                     "{theme:?} 的 {name}（{i} 号）对比度只有 {ratio:.2}:1，正文字号要 4.5:1"
                 );
             }
+        }
+    }
+
+    /// 探不出背景时，三档会话状态**退回原来的具名色**。
+    ///
+    /// 这不是懒得挑颜色：Windows 上探测基本恒为 `Unknown`（`StdinReader` 的
+    /// Windows 实现直接空手而归，`COLORFGBG` 也没人设），而这一档下
+    /// 「跟随用户自己的终端配色」原来那条理由仍然成立——也确实没有别的
+    /// 安全选择。钉住它，免得哪天有人把这三行顺手改成 `dim()`：那会让
+    /// Windows 上整块看板的状态列变成一片灰。
+    #[test]
+    fn unknown_keeps_the_named_colors_for_session_states() {
+        assert_eq!(Theme::Unknown.working().fg, Some(Color::Cyan));
+        assert_eq!(Theme::Unknown.asking().fg, Some(Color::Yellow));
+        assert_eq!(Theme::Unknown.idle().fg, Some(Color::Green));
+    }
+
+    /// 深浅两档里，三档状态**互相之间**也要分得开——不是只跟背景分得开。
+    /// 三个颜色都过了对比度却彼此撞色的话，屏幕上就是三行看不出区别的字。
+    #[test]
+    fn the_three_states_are_distinguishable_from_each_other() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let idx = |s: Style| match s.fg {
+                Some(Color::Indexed(i)) => i,
+                other => panic!("{theme:?} 下不是索引色：{other:?}"),
+            };
+            let (w, a, i) = (idx(theme.working()), idx(theme.asking()), idx(theme.idle()));
+            assert!(
+                w != a && a != i && w != i,
+                "{theme:?} 下三档状态撞色了：working={w} asking={a} idle={i}"
+            );
         }
     }
 

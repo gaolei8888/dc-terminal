@@ -54,15 +54,27 @@ pub fn header(f: &mut Frame, area: Rect, title: &str, rule: Style) -> Rect {
 /// 颜色，`Color` 装不下。给 `dim()` 再开一个返回 `Color` 的孪生函数只能退回
 /// 写死一个灰，等于在安全网上开个洞。
 ///
-/// 干活中/等你回答/空闲仍用具名 ANSI 色：终端主题本来就保证这几个色在自己
-/// 背景上可读，我们再去重映射等于跟用户自己的配色打架。
+/// **这里原来的决定是「三档状态用具名 ANSI 色，跟随用户自己的终端配色」，
+/// 现在改了。** 原来那条理由（终端主题保证具名色在自己背景上可读，重映射
+/// 等于跟用户的配色打架）本身没错，但它换来的是四个纯饱和的青/黄/绿/红
+/// 挂在每一行会话上——整块屏幕最抢眼的东西，而且是这套界面看着「旧」的
+/// 主要来源。可读性从来不是问题，扎眼才是。
+///
+/// 现在跟 `accent`/`danger` 走同一套：按探测到的背景取 256 色索引，
+/// 每一档都过 WCAG 4.5:1（`every_semantic_color_is_readable_on_its_own_background`
+/// 算的）。**探不出背景时退回原来的具名色**——那一档（Windows 基本恒是
+/// 它）原来的理由仍然成立，而且此时没有别的安全选择。
+///
+/// 状态本来就写着字（`status_label`），颜色是第二道信息，不是唯一那道。
 pub fn status_style(s: SessionState) -> Style {
+    let t = super::theme_now();
     match s {
-        SessionState::Working => Style::default().fg(Color::Cyan),
-        SessionState::Asking => Style::default().fg(Color::Yellow),
-        SessionState::Idle => Style::default().fg(Color::Green),
-        // 出错了用红色：这是屏幕上唯一需要用户立刻做点什么的状态。
-        SessionState::Failed => Style::default().fg(Color::Red),
+        SessionState::Working => t.working(),
+        SessionState::Asking => t.asking(),
+        SessionState::Idle => t.idle(),
+        // 出错了用 `danger`：这是屏幕上唯一需要用户立刻做点什么的状态，
+        // 也是整套配色里唯一还留着「重」的那一档。
+        SessionState::Failed => super::danger(),
         SessionState::Stopped => dim(),
         SessionState::Unknown => dim(),
     }

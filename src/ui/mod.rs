@@ -74,6 +74,11 @@ pub fn dim() -> Style {
     THEME.get().copied().unwrap_or(Theme::Unknown).dim()
 }
 
+/// 这一刻算出来的主题。探测没跑过就按 `Unknown` 算（最保守的一档）。
+pub fn theme_now() -> Theme {
+    THEME.get().copied().unwrap_or(Theme::Unknown)
+}
+
 /// 焦点、可按的动作。取代原来满屏的 `Color::Cyan`，理由见 `Theme::accent`。
 pub fn accent() -> Style {
     THEME.get().copied().unwrap_or(Theme::Unknown).accent()
