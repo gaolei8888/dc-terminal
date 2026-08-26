@@ -13,7 +13,7 @@ use super::app::App;
 use super::key_to_input;
 use super::view::{ThemePick, View};
 use super::widgets::{display_width, screen_to_lines, short_path, truncate, Msg};
-use super::{move_sel_n, BarTheme};
+use super::{danger, move_sel_n, BarTheme};
 
 /// 滚轮一格滚几行。3 是终端惯例，改了会跟用户在别处（浏览器、编辑器）的
 /// 肌肉记忆打架。
@@ -410,7 +410,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
     // 标题显示用户当初指定的项目目录，不是内部的 worktree 路径——
     // 给用户看 .git/dct-worktrees/s2 只会让他不知道自己在哪。
@@ -483,19 +483,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         }
         return;
     }
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(border_style)
-        .title(title);
-    // 内容区左上角/宽高**从 `Block::inner()` 拿**，不手算边框宽度——这正是
-    // `App::screen_origin` 的文档警告的那类 bug：布局一改，手算的数就
-    // 悄悄错了。现在左右不画边框，`inner.x == area.x`；上下各还有一行
-    // 边框，`inner.y == area.y + 1`。
-    let inner = block.inner(area);
-    f.render_widget(
-        Paragraph::new(screen_to_lines(&app.screen)).block(block),
-        area,
-    );
+    // 内容区左上角/宽高**从 `header()` 的返回值拿**，不手算表头高度——这正是
+    // `App::screen_origin` 的文档警告的那类 bug：布局一改，手算的数就悄悄
+    // 错了，而且错得很安静（鼠标点在哪、光标画在哪全靠它）。
+    //
+    // 换成表头之后底下那条横线没了，**agent 的屏幕反而多出一行**：原来
+    // 上下各一条边框吃掉两行，现在标题一行 + 细线一行也是两行，但那两行
+    // 全在上面，下面整块都是内容。
+    let inner = super::widgets::header(f, area, &title, border_style);
+    f.render_widget(Paragraph::new(screen_to_lines(&app.screen)), inner);
     // 会话内容区左上角在真实终端上的坐标，鼠标事件换算列/行要用它。
     // 必须在这里记，不能让 `handle_mouse` 自己硬算边框宽度——布局改了
     // 硬算的数就错了，而且错得很安静（见 `App::screen_origin` 的文档）。

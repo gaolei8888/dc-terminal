@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{List, ListItem, Paragraph};
 
 use crate::i18n::{msg, text, Key};
 use crate::profile::ProfileStatus;
@@ -14,7 +14,7 @@ use super::view::{
     digit_index, expand_path, pick_action, Pane, PickAction, ProjectPicker, SecretPhase, View,
 };
 use super::widgets::{pad_to, short_path, truncate, Msg};
-use super::{dim, move_sel_n};
+use super::{accent, danger, dim, move_sel_n};
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -450,7 +450,7 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
     let items: Vec<ListItem> = entries
         .iter()
@@ -524,23 +524,13 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
     .collect::<Vec<_>>()
     .join(" —— ");
     let border = if warning.is_some() || *no_git {
-        Style::default().fg(Color::Red)
+        danger()
     } else {
         border_style
     };
     let mut s = state.clone();
-    f.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .border_style(border)
-                    .title(title),
-            )
-            .highlight_symbol("▶ "),
-        area,
-        &mut s,
-    );
+    let body = super::widgets::header(f, area, &title, border);
+    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut s);
 }
 
 fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
@@ -551,43 +541,30 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
 
     // 新建态跟手输态一样占满整层：这时候屏幕上只有一件事在发生。
     // 标题里带上目录——见 `msg::new_project_in` 的注释。
     if let Some(buf) = &p.naming {
-        f.render_widget(
-            Paragraph::new(format!("{buf}▌")).block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .border_style(border_style)
-                    .title(msg::new_project_in(
-                        lang,
-                        &short_path(&p.cwd.display().to_string()),
-                    )),
-            ),
-            area,
-        );
+        let title = msg::new_project_in(lang, &short_path(&p.cwd.display().to_string()));
+        let body = super::widgets::header(f, area, &title, border_style);
+        f.render_widget(Paragraph::new(format!("{buf}▌")), body);
         return;
     }
 
     // 手输态占满整层，不分栏：这时候屏幕上只有一件事在发生。
     if let Some(buf) = &p.typing_path {
-        f.render_widget(
-            Paragraph::new(format!("{buf}▌")).block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .border_style(border_style)
-                    .title(text(Key::TypePathTitle, lang)),
-            ),
-            area,
-        );
+        let body = super::widgets::header(f, area, text(Key::TypePathTitle, lang), border_style);
+        f.render_widget(Paragraph::new(format!("{buf}▌")), body);
         return;
     }
 
     // 左边窄一点：最近项目只有名字和路径，而右边要放得下目录名加 git 标记。
+    // 两栏之间留一个空档。**不留的话两条细线会接成一整条**，看上去是一条
+    // 横贯全屏的线，而不是两块各自的表头——分栏这件事就在视觉上消失了。
     let cols = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .spacing(2)
         .split(area)
         .to_vec();
 
@@ -612,19 +589,20 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
     // 改这里就要改那里。
     items.push(ListItem::new(Line::from(Span::styled(
         text(Key::ManualPath, lang),
-        Style::default().fg(Color::Cyan),
+        accent(),
     ))));
     items.push(ListItem::new(Line::from(Span::styled(
         text(Key::NewProject, lang),
-        Style::default().fg(Color::Cyan),
+        accent(),
     ))));
+    let left = super::widgets::header(
+        f,
+        cols[0],
+        text(Key::RecentProjects, lang),
+        rule_style(p.focus == Pane::Recent, border_style),
+    );
     f.render_stateful_widget(
         List::new(items)
-            .block(pane_block(
-                text(Key::RecentProjects, lang).to_string(),
-                p.focus == Pane::Recent,
-                border_style,
-            ))
             // **只有有焦点的那一栏画光标。** 两栏都画的话，屏幕上同时
             // 有两个长得一模一样的 `▶`，而按 Tab 之后唯一变的东西是边框
             // 颜色——那一档差别在不少主题下几乎看不出来。用户于是既看不出
@@ -636,25 +614,24 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 "  "
             }),
-        cols[0],
+        left,
         &mut p.recent_state.clone(),
     );
 
     // ——右：浏览——
     let rows = p.shown_entries();
-    let browse_block = pane_block(
-        short_path(&p.cwd.display().to_string()),
-        p.focus == Pane::Browse,
-        border_style,
+    let right = super::widgets::header(
+        f,
+        cols[1],
+        &short_path(&p.cwd.display().to_string()),
+        rule_style(p.focus == Pane::Browse, border_style),
     );
     if rows.is_empty() {
         // 空目录和读不了的目录落在同一句话上：对用户来说这两种情况
         // 能做的事完全一样（← 回上一级，或者去别处找）。
         f.render_widget(
-            Paragraph::new(text(Key::NoSubfolders, lang))
-                .centered()
-                .block(browse_block),
-            cols[1],
+            Paragraph::new(text(Key::NoSubfolders, lang)).centered(),
+            right,
         );
     } else {
         let items: Vec<ListItem> = rows
@@ -684,14 +661,13 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
             .collect();
         f.render_stateful_widget(
             List::new(items)
-                .block(browse_block)
                 // 同左栏：焦点不在这儿就不画光标，见那边的注释。
                 .highlight_symbol(if p.focus == Pane::Browse {
                     "▶ "
                 } else {
                     "  "
                 }),
-            cols[1],
+            right,
             &mut p.browse_state.clone(),
         );
     }
@@ -699,15 +675,16 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// 有焦点那一栏的边框加亮。两栏并排时，用户必须一眼看出打字会落在哪一边——
 /// 看不出来的话，他打的字会在他以为的另一栏里过滤，而那一栏毫无反应。
-fn pane_block(title: String, focused: bool, base: Style) -> Block<'static> {
-    Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            base.patch(dim())
-        })
-        .title(title)
+/// 有焦点那一栏的细线用强调色，另一栏压暗。
+///
+/// 只剩这一条线要上色了——上下两条横线夹着标题的画法换成了「标题一行、
+/// 底下一条细线」（`widgets::header`），屏幕上的线少了一半。
+fn rule_style(focused: bool, base: Style) -> Style {
+    if focused {
+        accent()
+    } else {
+        base.patch(dim())
+    }
 }
 
 #[cfg(test)]

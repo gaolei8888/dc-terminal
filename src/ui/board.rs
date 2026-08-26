@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 use super::app::App;
 use super::view::is_plain_key;
 use super::widgets::{pad_to, session_label, status_label, status_style, truncate};
-use super::{dim, open_new_session, open_project_picker, open_secrets, session_action};
+use super::{
+    accent, danger, dim, open_new_session, open_project_picker, open_secrets, session_action,
+};
 use crate::i18n::{msg, text, Key};
 
 /// 组头上，最后一格（「还没有会话 …」/ agent 统计）之前的所有东西占几列。
@@ -80,7 +82,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
     let title = if app.connected {
         text(Key::BoardTitle, app.lang).to_string()
@@ -104,7 +106,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             };
             let g = &app.groups[gi];
-            let mut spans = vec![Span::styled(bar, Style::default().fg(Color::Cyan))];
+            let mut spans = vec![Span::styled(bar, accent())];
             match row {
                 super::view::Row::Header(_) => {
                     // 序号只给前九个组：`1`…`9` 直达。第十个起靠 Tab，
@@ -190,10 +192,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                         spans.push(Span::raw(pad_to(&agents.join(" "), 22)));
                         let failed = g.failed();
                         if failed > 0 {
-                            spans.push(Span::styled(
-                                msg::failed_count(app.lang, failed),
-                                Style::default().fg(Color::Red),
-                            ));
+                            spans.push(Span::styled(msg::failed_count(app.lang, failed), danger()));
                         }
                     }
                 }
@@ -219,11 +218,20 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
+    // **看板是唯一不用 `widgets::header` 的一屏**，标题仍然嵌在那条横线里。
+    //
+    // 理由是它是所有浮层的**背景**：选项目的浮层居中盖在它身上，看板往下
+    // 挪一行，浮层上方能露出来的看板内容就少一行——`the_project_picker_is_
+    // an_overlay_not_a_takeover` 抓到的正是这个（第一条会话行整个滑到浮层
+    // 标题底下）。表头那两行在别处不花钱（原来上下边框也是两行），只有这里
+    // 花在了「背景还剩多少看得见」上。
+    //
+    // 底下那条边框还是去掉了：少一条线，还给列表一行。
     f.render_stateful_widget(
         List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .borders(Borders::TOP)
                     .border_style(border_style)
                     .title(title),
             )

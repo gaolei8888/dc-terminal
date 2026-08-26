@@ -15,7 +15,7 @@ use super::widgets::{
     char_width, display_width, pad_to, screen_to_lines, session_label, status_label, status_style,
     truncate,
 };
-use super::{dim, session_action};
+use super::{accent, danger, dim, session_action};
 use crate::i18n::{text, Key, Lang};
 use crate::proto::ScreenEntry;
 use crate::pty::ScreenSpan;
@@ -589,9 +589,9 @@ fn draw_grid(
         // 看不出来，红态下更是完全没有标记。Thick 换的是字符本身，终端支
         // 不支持 BOLD、用户配的什么配色，都不影响。
         let border = if alarmed {
-            Style::default().fg(Color::Red)
+            danger()
         } else if focused {
-            Style::default().fg(Color::Cyan)
+            accent()
         } else {
             dim()
         };
@@ -722,24 +722,16 @@ fn draw_reply(f: &mut Frame, area: Rect, draft: &str, who: &str, lang: Lang) {
 
     // 收件人写在最前面，而且是「会话号 + agent 名字」。发错人撤不回来，
     // 所以这不是装饰——用户打字时眼睛就在这一行上，收件人必须在他视线里。
-    let to = Span::styled(
-        format!("→ {who}："),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let to = Span::styled(format!("→ {who}："), accent().add_modifier(Modifier::BOLD));
     // 空框时给一句话，把「直接回车 = 同意」说出来。这是最高频的用法，
     // 不写的话用户会以为必须先打点什么才能回。
     let body = if draft.is_empty() {
         vec![
-            Span::styled("▌", Style::default().fg(Color::Cyan)),
+            Span::styled("▌", accent()),
             Span::styled(format!("  {}", text(Key::EmptyReplyIsEnter, lang)), dim()),
         ]
     } else {
-        vec![
-            Span::raw(draft.to_string()),
-            Span::styled("▌", Style::default().fg(Color::Cyan)),
-        ]
+        vec![Span::raw(draft.to_string()), Span::styled("▌", accent())]
     };
     let mut spans = vec![to];
     spans.extend(body);

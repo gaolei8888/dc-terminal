@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use crate::client::Client;
 use crate::proto::{socket_path, Request, Response, SecretPrompt};
@@ -12,7 +12,7 @@ use super::view::{
     decide_delete_key, is_plain_key, secret_rows, DeleteKeyAction, SecretPhase, View,
 };
 use super::widgets::{pad_to, truncate, Msg};
-use super::{dim, move_sel_n, open_url, refetch_secrets};
+use super::{accent, danger, dim, move_sel_n, open_url, refetch_secrets};
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -400,7 +400,7 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
     let mut lines: Vec<Line> = Vec::new();
     if !prompt.hint.is_empty() {
@@ -414,12 +414,9 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
         SecretPhase::Typing => {}
         SecretPhase::Verifying => lines.push(Line::from(Span::styled(
             crate::i18n::text(crate::i18n::Key::VerifyingShort, app.lang),
-            Style::default().fg(Color::Cyan),
+            accent(),
         ))),
-        SecretPhase::Failed(m) => lines.push(Line::from(Span::styled(
-            m.clone(),
-            Style::default().fg(Color::Red),
-        ))),
+        SecretPhase::Failed(m) => lines.push(Line::from(Span::styled(m.clone(), danger()))),
     }
     if prompt.url.is_some() {
         lines.push(Line::from(""));
@@ -438,15 +435,8 @@ fn draw_enter_secret(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         crate::i18n::msg::enter_secret_title(app.lang, label, false)
     };
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::TOP | Borders::BOTTOM)
-                .border_style(border_style)
-                .title(title),
-        ),
-        area,
-    );
+    let body = super::widgets::header(f, area, &title, border_style);
+    f.render_widget(Paragraph::new(lines), body);
 }
 
 fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
@@ -463,7 +453,7 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
     let rows = secret_rows(entries);
     let items: Vec<ListItem> = rows
@@ -484,7 +474,7 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(pad_to(&truncate(&label, 14), 14)),
                     Span::styled(
                         crate::i18n::text(crate::i18n::Key::PressDAgainToDelete, app.lang),
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        danger().add_modifier(Modifier::BOLD),
                     ),
                 ]))
             } else {
@@ -498,29 +488,20 @@ fn draw_secrets(f: &mut Frame, area: Rect, app: &mut App) {
                         } else {
                             crate::i18n::text(crate::i18n::Key::SecretUnset, app.lang)
                         },
-                        if *configured {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            dim()
-                        },
+                        if *configured { accent() } else { dim() },
                     ),
                 ]))
             }
         })
         .collect();
     let mut s = state.clone();
-    f.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .border_style(border_style)
-                    .title(crate::i18n::text(crate::i18n::Key::SecretsTitle, app.lang)),
-            )
-            .highlight_symbol("▶ "),
+    let body = super::widgets::header(
+        f,
         area,
-        &mut s,
+        crate::i18n::text(crate::i18n::Key::SecretsTitle, app.lang),
+        border_style,
     );
+    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut s);
 }
 
 #[cfg(test)]

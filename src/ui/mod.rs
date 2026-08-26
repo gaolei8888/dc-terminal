@@ -74,6 +74,21 @@ pub fn dim() -> Style {
     THEME.get().copied().unwrap_or(Theme::Unknown).dim()
 }
 
+/// 焦点、可按的动作。取代原来满屏的 `Color::Cyan`，理由见 `Theme::accent`。
+pub fn accent() -> Style {
+    THEME.get().copied().unwrap_or(Theme::Unknown).accent()
+}
+
+/// 选中那一行。
+pub fn strong() -> Style {
+    THEME.get().copied().unwrap_or(Theme::Unknown).strong()
+}
+
+/// **只给真的错误用**，理由见 `Theme::danger`。
+pub fn danger() -> Style {
+    THEME.get().copied().unwrap_or(Theme::Unknown).danger()
+}
+
 /// 标题条/底栏的实色样式。返回 `None` 表示这一档不可用，调用方退回画横线。
 ///
 /// **这里刻意不看 `THEME`**，跟 `dim()` 正相反，理由是两者画在不同的地方：
@@ -2173,7 +2188,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (bar, style) = if !app.connected {
         (
             BarContent::Text(crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string()),
-            Style::default().fg(Color::Red),
+            danger(),
         )
     } else if app.message.text.is_empty() {
         // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
@@ -2209,10 +2224,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             None => (BarContent::Keys(bar_keys(app, help_cols)), Style::default()),
         }
     } else if app.message.error {
-        (
-            BarContent::Text(app.message.text.clone()),
-            Style::default().fg(Color::Red),
-        )
+        (BarContent::Text(app.message.text.clone()), danger())
     } else {
         (BarContent::Text(app.message.text.clone()), Style::default())
     };
@@ -2334,7 +2346,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(inner);
     f.render_widget(
-        Paragraph::new(escape_hint(&app.view, app.lang)).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(escape_hint(&app.view, app.lang)).style(accent()),
         bar[0],
     );
     // 中段：当前项目。**永不让位。**
@@ -2832,35 +2844,14 @@ mod tests {
     /// 「我在自己的终端上看着还行」。
     #[test]
     fn every_bar_theme_is_readable() {
-        /// 256 色索引 → sRGB。16–231 是 6×6×6 的色立方，232–255 是灰阶。
-        /// 0–15 到不了这里（`no_bar_theme_uses_a_remappable_named_color`
-        /// 已经把它们挡在外面），真来了就是那条守卫先炸。
-        fn rgb(i: u8) -> (f64, f64, f64) {
-            let c = |v: u8| f64::from(v) / 255.0;
-            if i >= 232 {
-                let v = 8 + 10 * (i - 232);
-                (c(v), c(v), c(v))
-            } else {
-                const STEP: [u8; 6] = [0, 95, 135, 175, 215, 255];
-                let i = i - 16;
-                (
-                    c(STEP[(i / 36) as usize]),
-                    c(STEP[((i % 36) / 6) as usize]),
-                    c(STEP[(i % 6) as usize]),
-                )
-            }
-        }
-        fn luminance(i: u8) -> f64 {
-            let lin = |c: f64| {
-                if c <= 0.04045 {
-                    c / 12.92
-                } else {
-                    ((c + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            let (r, g, b) = rgb(i);
-            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-        }
+        // 公式不再在这儿抄一份：`theme::srgb`/`luminance`/`contrast` 是共用的，
+        // 语义色那条守卫（`every_semantic_color_is_readable_on_its_own_background`）
+        // 算的是同一套。两份 WCAG 实现迟早会漂，而漂的那天没人会发现——
+        // 两条守卫都还是绿的，只是它们量的不再是同一件事。
+        let luminance = |i: u8| {
+            let (r, g, b) = crate::theme::srgb(i);
+            crate::theme::luminance(r, g, b)
+        };
 
         for t in BarTheme::all() {
             let Some(style) = t.style() else { continue };
@@ -2868,9 +2859,7 @@ mod tests {
                 Some(Color::Indexed(i)) => i,
                 other => panic!("{t:?} 的颜色不是 256 色索引：{other:?}"),
             };
-            let (a, b) = (luminance(idx(style.bg)), luminance(idx(style.fg)));
-            let (hi, lo) = if a > b { (a, b) } else { (b, a) };
-            let ratio = (hi + 0.05) / (lo + 0.05);
+            let ratio = crate::theme::contrast(luminance(idx(style.bg)), luminance(idx(style.fg)));
             assert!(
                 ratio >= 4.5,
                 "{t:?} 的对比度只有 {ratio:.2}:1，正文字号要 4.5:1 才读得清"

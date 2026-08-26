@@ -1,4 +1,5 @@
 use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders};
 
 use crate::i18n::HelpItem;
 use crate::pty::{ScreenColor, ScreenSpan, ScreenStyle};
@@ -19,6 +20,33 @@ pub fn status_label(s: SessionState, lang: crate::i18n::Lang) -> &'static str {
         },
         lang,
     )
+}
+
+/// 一块面板的表头：**标题占一行，底下一条细线**，然后把剩下的地方还给内容。
+///
+/// 取代原来满屏的 `Borders::TOP | Borders::BOTTOM`——那个把标题嵌在上面那条
+/// 横线里，再在面板底下补第二条，一块面板两条线。这里花的行数是一样的
+/// （标题一行 + 细线一行 = 原来的上下两条），但屏幕上少一半的线，标题也不再
+/// 被横线夹着。
+///
+/// 返回内容可用的区域。区域高度不足 3 行时**不画表头**，整块原样还回去：
+/// 那种高度下表头会把内容挤没，而没有内容的表头没有意义。
+pub fn header(f: &mut Frame, area: Rect, title: &str, rule: Style) -> Rect {
+    // 少于 3 行：表头两行 + 内容至少一行都凑不齐，那就整块让给内容。
+    if area.height < 3 {
+        return area;
+    }
+    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
+    // 一个只有下边框的 Block：标题落在这两行的第一行，细线落在第二行。
+    // 比自己画两条 Paragraph 少一次「标题该怎么截断」的重复实现。
+    f.render_widget(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(rule)
+            .title(title.to_string()),
+        rows[0],
+    );
+    rows[1]
 }
 
 /// 状态在界面上的样式。返回 `Style` 而不是 `Color`：Stopped/Unknown 要用
@@ -397,6 +425,48 @@ pub(crate) fn help_spans(items: &[&HelpItem]) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 表头长什么样：第一行是标题，第二行是一条细线，内容从第三行开始。
+    #[test]
+    fn a_header_is_a_title_then_a_hairline() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let mut content = Rect::default();
+        term.draw(|f| {
+            content = header(f, f.area(), "Recent", Style::default());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(row(0).starts_with("Recent"), "第一行该是标题：{:?}", row(0));
+        assert!(
+            row(1).chars().all(|c| c == '\u{2500}'),
+            "第二行该是一整条细线：{:?}",
+            row(1)
+        );
+        assert_eq!(content.y, 2, "内容该从第三行开始");
+        assert_eq!(content.height, 3, "剩下的高度都该还给内容");
+    }
+
+    /// 矮到放不下的时候**不画表头**：表头会把内容挤没，而空表头没有意义。
+    #[test]
+    fn a_short_area_keeps_all_of_itself_for_content() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        let mut content = Rect::default();
+        term.draw(|f| {
+            content = header(f, f.area(), "Recent", Style::default());
+        })
+        .unwrap();
+        assert_eq!(content.height, 2, "矮的时候整块都该还给内容");
+        assert_eq!(content.y, 0);
+    }
     use super::*;
     use crate::i18n::{help_items, Key, Lang};
 

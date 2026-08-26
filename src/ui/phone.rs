@@ -13,13 +13,14 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::style::Modifier;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::i18n::{msg, text, Key, Lang};
 use crate::proto::{PhoneState, PhoneStatus, Request, Response, WebInfo};
 
 use super::app::App;
 use super::view::{clean_secret, is_plain_key, View};
+use super::{accent, danger};
 
 /// 状态行：**四种取值，每一种都要给用户看得懂的一句话**。
 ///
@@ -291,7 +292,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let border_style = if app.connected {
         Style::default()
     } else {
-        Style::default().fg(Color::Red)
+        danger()
     };
     let title = format!(
         "{} · {}",
@@ -303,7 +304,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     if app.phone_verify_rx.is_some() {
         lines.push(Line::from(Span::styled(
             text(Key::VerifyingShort, app.lang),
-            Style::default().fg(Color::Cyan),
+            accent(),
         )));
     } else if let Some(buf) = &app.phone_buf {
         lines.push(Line::from(Span::styled(
@@ -355,6 +356,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
+    let body = super::widgets::header(f, area, &title, border_style);
     f.render_widget(
         Paragraph::new(lines)
             // **必须折行。** 这一页上有两句话是「少一个字就没法用」的：
@@ -364,14 +366,8 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             //
             // 二维码那几行不受影响：`qr_lines` 已经保证画出来的码不宽于
             // 这块区域，宽度没超就没有什么可折的。
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .border_style(border_style)
-                    .title(title),
-            ),
-        area,
+            .wrap(Wrap { trim: false }),
+        body,
     );
 }
 

@@ -8,7 +8,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::app::App;
 use super::dim;
@@ -225,14 +225,8 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &App) {
     let want_w = (widest as u16 + 2).min(max_w);
     let popup = popup_area(area, want_w, lines.len() as u16 + 2);
     f.render_widget(ratatui::widgets::Clear, popup);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::TOP | Borders::BOTTOM)
-                .title(text(Key::AllKeys, app.lang)),
-        ),
-        popup,
-    );
+    let body = super::widgets::header(f, popup, text(Key::AllKeys, app.lang), dim());
+    f.render_widget(Paragraph::new(lines), body);
 }
 
 /// 居中，但**不铺满**：背后的看板/九宫格要还看得见，用户才知道自己只是叠了

@@ -45,6 +45,62 @@ impl Theme {
     }
 }
 
+/// 界面上那几档**语义色**。跟 `dim()` 一样跟着探测出来的背景走，理由也一样：
+/// 这些字落在**终端自己的背景**上，一个写死的色号不可能同时在深浅两种底色上
+/// 都读得清（`Indexed(252)` 那种近白色压在白底上就是隐形）。
+impl Theme {
+    /// 焦点、可按的动作。**取代原来满屏的 `Color::Cyan`**——那是 ANSI 6 号色，
+    /// 归终端主题管，饱和度也停在 1990 年代。
+    pub fn accent(self) -> Style {
+        match self {
+            // 110 压在深底上 6.59:1，24 压在浅底上 4.56:1（`every_semantic_color…`
+            // 那条守卫算的）。挑的是同一个色相的两档明度，所以深浅两种终端上
+            // 「这是可按的东西」看起来是同一个意思。
+            Theme::Dark => Style::default().fg(Color::Indexed(110)),
+            Theme::Light => Style::default().fg(Color::Indexed(24)),
+            // **探不出背景时退回 ANSI 青，不是退回「没有颜色」。**
+            //
+            // 这里跟 `dim()` 分道扬镳，理由是 `bar_style` 头上那条：Windows
+            // 上不问终端、`COLORFGBG` 也没人设，探测基本恒为 `Unknown`——
+            // 让 accent 在这一档变成无色，等于整个 Windows 上的界面没有强调色，
+            // 「写了一整条代码路径，而目标平台上的用户一次都看不到」。
+            //
+            // 退回具名色在这一档是安全的，理由同 `widgets::status_style`：
+            // 终端主题本来就保证这几个具名色在自己背景上可读。`dim()` 踩的坑
+            // 是 8 号亮黑被设成背景色，那是灰阶特有的问题，青色没有。
+            Theme::Unknown => Style::default().fg(Color::Cyan),
+        }
+    }
+
+    /// 选中那一行。比正文更亮/更暗一档，加粗。
+    pub fn strong(self) -> Style {
+        match self {
+            Theme::Dark => Style::default()
+                .fg(Color::Indexed(253))
+                .add_modifier(Modifier::BOLD),
+            Theme::Light => Style::default()
+                .fg(Color::Indexed(235))
+                .add_modifier(Modifier::BOLD),
+            Theme::Unknown => Style::default().add_modifier(Modifier::BOLD),
+        }
+    }
+
+    /// **只给真的错误用。** 原来 `Color::Red` 有 25 处，其中不少只是「这里
+    /// 需要注意」——红色用滥了，真出事的时候就没有一档能再重了。
+    pub fn danger(self) -> Style {
+        match self {
+            Theme::Dark => Style::default().fg(Color::Indexed(174)),
+            Theme::Light => Style::default().fg(Color::Indexed(124)),
+            // **这一档 `Unknown` 反而要钉色，跟 accent/strong 相反。**
+            // 「出事了」必须看得出是出事了，加粗传达不了这件事。ANSI 红
+            // （1 号）不是 `dim()` 踩过的那个坑：踩坑的是 8 号亮黑被主题设成
+            // 背景色，而没有哪个主题会把红设成背景——真那么干的话，终端里
+            // 每一条报错都早就隐形了，那不是这个项目能兜的。
+            Theme::Unknown => Style::default().fg(Color::Red),
+        }
+    }
+}
+
 /// 判深浅用的加权亮度，阈值 0.5。
 ///
 /// 故意**不做** sRGB 反伽马：判深浅只需要一个能把两类背景分得开的标量，
@@ -371,8 +427,112 @@ pub fn detect() -> Theme {
     detect_with(&mut StdinReader, dct.as_deref(), fgbg.as_deref())
 }
 
+/// 256 色索引 → sRGB 三通道（0.0–1.0）。
+///
+/// 16–231 是 6×6×6 的色立方，232–255 是灰阶。0–15 **算不出来**：那 16 个槽
+/// 的实际颜色由终端主题定义，没有固定的 RGB 可言——这也正是这个项目不许拿
+/// 它们上屏的原因（见 `Theme::dim` 头上那段事故记录）。
+#[cfg(test)]
+pub(crate) fn srgb(i: u8) -> (f64, f64, f64) {
+    let c = |v: u8| f64::from(v) / 255.0;
+    if i >= 232 {
+        let v = 8 + 10 * (i - 232);
+        (c(v), c(v), c(v))
+    } else {
+        const STEP: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let i = i - 16;
+        (
+            c(STEP[(i / 36) as usize]),
+            c(STEP[((i % 36) / 6) as usize]),
+            c(STEP[(i % 6) as usize]),
+        )
+    }
+}
+
+/// WCAG 相对亮度。
+#[cfg(test)]
+pub(crate) fn luminance(r: f64, g: f64, b: f64) -> f64 {
+    let lin = |c: f64| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// 两个亮度之间的 WCAG 对比度。正文字号要 4.5:1。
+#[cfg(test)]
+pub(crate) fn contrast(a: f64, b: f64) -> f64 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// **每一档语义色都要在它那种背景上读得清。** 门槛跟底栏那条守卫同一个
+    /// 4.5:1（正文字号），算的是同一套 WCAG 公式——`srgb`/`luminance`/`contrast`
+    /// 现在是共用的，不再各写一份。
+    ///
+    /// 最坏情况取「最浅的深底」和「最深的浅底」：深色主题里 235 号
+    /// （#262626）已经比绝大多数深色终端背景浅，浅色主题里 252 号（#d0d0d0）
+    /// 也比绝大多数浅色背景深。在这两头都过得去，中间就不会出事。
+    #[test]
+    fn every_semantic_color_is_readable_on_its_own_background() {
+        let lum = |i: u8| {
+            let (r, g, b) = srgb(i);
+            luminance(r, g, b)
+        };
+        // 最浅的深底 / 最深的浅底
+        let worst_dark_bg = lum(235);
+        let worst_light_bg = lum(252);
+
+        for (theme, bg) in [(Theme::Dark, worst_dark_bg), (Theme::Light, worst_light_bg)] {
+            for (name, style) in [
+                ("accent", theme.accent()),
+                ("strong", theme.strong()),
+                ("danger", theme.danger()),
+            ] {
+                let Some(Color::Indexed(i)) = style.fg else {
+                    panic!("{theme:?} 的 {name} 不是 256 色索引：{:?}", style.fg);
+                };
+                let ratio = contrast(lum(i), bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme:?} 的 {name}（{i} 号）对比度只有 {ratio:.2}:1，正文字号要 4.5:1"
+                );
+            }
+        }
+    }
+
+    /// `Unknown` 一个颜色都不钉——同 `dim()` 那条守卫。探不出背景的时候，
+    /// 任何一个写死的色号都可能正好撞上终端的背景色，而这一档的用户
+    /// （Windows 基本恒为 `Unknown`）没有第二次机会。
+    #[test]
+    fn unknown_pins_no_color_for_the_semantic_styles() {
+        // `strong` 在这一档只加粗：加粗到处都看得见，而选中那一行本来就还有
+        // 一个 `▶` 在指着，不靠颜色也认得出。
+        assert_eq!(
+            Theme::Unknown.strong().fg,
+            None,
+            "Unknown 的 strong 不该钉颜色"
+        );
+        // `accent` 和 `danger` 都**必须**有颜色，哪怕探不出背景——Windows 上
+        // 探测恒为 `Unknown`，无色等于那边整个界面没有强调色。
+        assert_eq!(
+            Theme::Unknown.accent().fg,
+            Some(Color::Cyan),
+            "探不出背景的时候，强调色还是得有颜色（Windows 恒走这一档）"
+        );
+        // `danger` 是**故意**的例外：出事了必须看得出来，加粗说不了这件事。
+        assert_eq!(
+            Theme::Unknown.danger().fg,
+            Some(Color::Red),
+            "探不出背景的时候，报错还是得是红的"
+        );
+    }
     use super::*;
 
     /// 三种背景必须给出三种不同的样式，否则「自适应」就是假的。

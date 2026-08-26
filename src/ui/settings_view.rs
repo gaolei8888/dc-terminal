@@ -10,7 +10,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::i18n::{text, Key, Lang};
 use crate::proto::{Request, Response};
@@ -19,7 +19,7 @@ use crate::settings::{save_bar_theme, save_lang, settings_path_for_socket};
 use super::app::App;
 use super::view::{SubList, View};
 use super::widgets::Msg;
-use super::{dim, move_sel_n, BarTheme};
+use super::{danger, dim, move_sel_n, BarTheme};
 
 /// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
 /// 直接映射 `Lang::all()`；现在映射这个枚举，选中语言那一项才进语言列表。
@@ -256,22 +256,17 @@ fn draw_settings_items(f: &mut Frame, area: Rect, app: &mut App, state: &ListSta
         .collect();
 
     let mut s = state.clone();
-    f.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .title(text(Key::SettingsTitle, app.lang))
-                    .border_style(if app.connected {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::Red)
-                    }),
-            )
-            .highlight_symbol("▶ "),
-        area,
-        &mut s,
-    );
+    let body = super::widgets::header(f, area, text(Key::SettingsTitle, app.lang), rule(app));
+    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut s);
+}
+
+/// 表头那条细线的颜色：断连时整条变红，跟原来边框的行为一致。
+fn rule(app: &App) -> Style {
+    if app.connected {
+        dim()
+    } else {
+        danger()
+    }
 }
 
 fn draw_language_list(f: &mut Frame, area: Rect, app: &mut App, state: &ListState) {
@@ -294,26 +289,13 @@ fn draw_language_list(f: &mut Frame, area: Rect, app: &mut App, state: &ListStat
         .collect();
 
     let mut s = state.clone();
-    f.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .title(format!(
-                        "{} · {}",
-                        text(Key::SettingsTitle, app.lang),
-                        text(Key::Language, app.lang)
-                    ))
-                    .border_style(if app.connected {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::Red)
-                    }),
-            )
-            .highlight_symbol("▶ "),
-        area,
-        &mut s,
+    let title = format!(
+        "{} · {}",
+        text(Key::SettingsTitle, app.lang),
+        text(Key::Language, app.lang)
     );
+    let body = super::widgets::header(f, area, &title, rule(app));
+    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut s);
 }
 
 /// 配色列表的那几行。**每一行用它自己那档配色画出来**——设置页和会话里的
@@ -370,26 +352,13 @@ fn draw_theme_list(f: &mut Frame, area: Rect, app: &mut App, state: &ListState) 
     let items = theme_items(app.lang, app.bar);
 
     let mut s = state.clone();
-    f.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .title(format!(
-                        "{} · {}",
-                        text(Key::SettingsTitle, app.lang),
-                        text(Key::BarTheme, app.lang)
-                    ))
-                    .border_style(if app.connected {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::Red)
-                    }),
-            )
-            .highlight_symbol("▶ "),
-        area,
-        &mut s,
+    let title = format!(
+        "{} · {}",
+        text(Key::SettingsTitle, app.lang),
+        text(Key::BarTheme, app.lang)
     );
+    let body = super::widgets::header(f, area, &title, rule(app));
+    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut s);
 }
 
 #[cfg(test)]
