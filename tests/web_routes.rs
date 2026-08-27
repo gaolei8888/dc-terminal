@@ -205,7 +205,10 @@ fn serve_for_a_manual_look() {
     }
 
     println!("MANUAL_URL http://{}/#t={}", server.addr(), token);
-    std::thread::sleep(std::time::Duration::from_secs(180));
+    // 挂 15 分钟。**三分钟太短**：这是给人用眼睛验收的脚手架，而"打开浏览器、
+    // 点进一个会话、翻翻历史、试一下打字"本来就不止三分钟——上一次就是看到
+    // 一半服务自己没了。
+    std::thread::sleep(std::time::Duration::from_secs(900));
 
     // 收拾干净：这个会话是脚手架自己开的，不该留在用户的看板上。
     if let Some(id) = scratch_id {
