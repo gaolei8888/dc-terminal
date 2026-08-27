@@ -9,7 +9,7 @@ close the terminal. Come back, find one made a mess, press one key and it's gone
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.2](https://img.shields.io/badge/version-0.2.2-444?style=flat-square)
+![version 0.2.3](https://img.shields.io/badge/version-0.2.3-444?style=flat-square)
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
