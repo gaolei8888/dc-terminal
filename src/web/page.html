@@ -67,6 +67,12 @@
     border-bottom: 1px solid var(--line);
   }
   header h1 { margin: 0; font-size: 1rem; font-weight: 600; letter-spacing: .01em; }
+  /* 断线：**整条标题变红**，跟桌面端断连时那条红色标题条是同一个做法。
+     只把小圆点变红是不够的——正在看画面的人眼睛在画面上，而画面本身
+     断线前后长得一模一样（它就是最后一帧），不喊一声他不会知道。 */
+  header.stale { background: var(--bad); color: var(--bg); border-color: var(--bad); }
+  header.stale #dot { background: var(--bg); }
+  header.stale .why { font-size: .8rem; font-weight: 400; margin-left: auto; }
   #dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--ok); }
   #dot.off { background: var(--bad); }
   main { padding: .75rem; display: grid; gap: .6rem; }
@@ -158,10 +164,11 @@
 </style>
 </head>
 <body>
-<header>
+<header id="head">
   <button id="back" type="button" hidden>&lsaquo;</button>
   <span id="dot"></span>
   <h1 id="title"></h1>
+  <span id="why" class="why"></span>
 </header>
 <main id="list"></main>
 <div id="screen" hidden><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre><div id="cursor" hidden></div></div>
@@ -205,6 +212,8 @@
   var rulerEl = document.getElementById("ruler");
   var cursorEl = document.getElementById("cursor");
   var backEl = document.getElementById("back");
+  var headEl = document.getElementById("head");
+  var whyEl = document.getElementById("why");
   var typingEl = document.getElementById("typing");
   var keyrowEl = document.getElementById("keyrow");
   var lineEl = document.getElementById("line");
@@ -411,7 +420,10 @@
     // `cursor_hidden` 为真时一定不画。agent 干活时把光标关掉，而那个坐标
     // 还在满屏乱跑——照着画就是一个到处蹦的方块（桌面端踩过这个坑）。
     placeCursor(s.cursor, s.cursor_hidden);
-    dotEl.className = "";
+    // 翻历史那两个键要不要露面，看这一帧的滚动状态（`max`/`offset`）——
+    // 没有历史可翻的时候不写，屏幕上不许出现按了没反应的东西。
+    updateHistoryKeys(s.scroll || {});
+    online();
   }
 
   // ——打字————————————————————————————————————————————————————————
@@ -430,9 +442,33 @@
     }).catch(offline);
   }
 
+  // 「现在能不能往会话里送东西」**只有这一处说了算**。
+  //
+  // 两件事都得成立：得有一个打开着的会话，而且**输入法不在组合中**。
+  // 组合期送出去的话，敲进 agent 的是拼音本身而不是汉字——而这件事在
+  // 英文键盘上永远试不出来。抄成好几处的话，漏改的那一处就是"某个按钮
+  // 在打拼音的时候把半截字送了出去"。有一条守卫钉着这个唯一性。
+  function canSend() {
+    return open !== null && !composing;
+  }
+
   function sendKey(name) {
-    if (open === null) { return; }
+    if (!canSend()) { return; }
     return post("/api/key", { id: open, key: name });
+  }
+
+  // 翻历史。**不是往会话里敲 PageUp**：桌面端那两个键在 dct 自己攥着历史时
+  // 是被 dct 吃掉的（`attach::key_scroll`），根本不到 agent 那儿。
+  function scroll(by) {
+    if (!canSend()) { return; }
+    return post("/api/scroll", { id: open, by: by });
+  }
+
+  // 一屏减两行——跟桌面端翻页的步长同一个算法（留两行接上上一屏，
+  // 不然翻完不知道自己翻到哪儿了）。
+  function pageStep() {
+    var rows = canvasEl.textContent.split("\n").length;
+    return Math.max(1, rows - 2);
   }
 
   // 虚拟键行。手机键盘上没有这些键，而 agent 全都要用：Esc 关弹窗、
@@ -447,6 +483,31 @@
   // 的话，Ctrl+D（结束输入）、Ctrl+U（清行）在手机上就永远按不出来。
   var ctrlHeld = false;
 
+  // 翻历史那三个键。**跟上面那一排分开**：它们不是按键，是
+  // `Request::Scroll`（见 `scroll()`），而且**只在真的有历史可翻时才露面**
+  // ——屏幕上不许出现按了没反应的东西。
+  var HISTORY = [
+    { name: "up", label: "⇞", act: function () { scroll({ Rows: pageStep() }); } },
+    { name: "down", label: "⇟", act: function () { scroll({ Rows: -pageStep() }); } },
+    { name: "bottom", label: "⤓", act: function () { scroll("Bottom"); } }
+  ];
+
+  // 哪几个该露面，由这一帧的滚动状态说了算：
+  // 没有历史（`max` 为 0）三个都不写；在底部时只有「往上」有意义。
+  function updateHistoryKeys(st) {
+    var max = st.max || 0;
+    var offset = st.offset || 0;
+    var show = {
+      up: max > 0 && offset < max,
+      down: offset > 0,
+      bottom: offset > 0
+    };
+    Array.prototype.forEach.call(
+      keyrowEl.querySelectorAll("button[data-history]"),
+      function (b) { b.hidden = !show[b.dataset.history]; }
+    );
+  }
+
   function buildKeyRow() {
     keyrowEl.textContent = "";
     ROW.forEach(function (name) {
@@ -455,6 +516,16 @@
       b.textContent = name === "Up" ? "↑" : name === "Down" ? "↓"
         : name === "Left" ? "←" : name === "Right" ? "→" : name;
       b.addEventListener("click", function () { sendKey(name); });
+      keyrowEl.appendChild(b);
+    });
+
+    HISTORY.forEach(function (h) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = h.label;
+      b.dataset.history = h.name;
+      b.hidden = true;
+      b.addEventListener("click", h.act);
       keyrowEl.appendChild(b);
     });
 
@@ -478,7 +549,8 @@
 
   // 粘滞 Ctrl 亮着的时候，输入框里打的第一个字母变成 Ctrl+它。
   lineEl.addEventListener("keydown", function (e) {
-    if (!ctrlHeld) { return; }
+    // 组合期一个字节都不上送——`canSend` 是那条唯一的判断。
+    if (!ctrlHeld || !canSend()) { return; }
     if (e.key && e.key.length === 1 && /[a-zA-Z]/.test(e.key)) {
       e.preventDefault();
       sendKey("Ctrl+" + e.key.toUpperCase());
@@ -493,7 +565,7 @@
 
   sayEl.addEventListener("submit", function (e) {
     e.preventDefault();
-    if (composing || open === null) { return; }
+    if (!canSend()) { return; }
     var text = lineEl.value;
     lineEl.value = "";
     // 两步，顺序不能反也不能合：先把文字写进去，再单独送一次空回车——
@@ -530,10 +602,24 @@
 
   backEl.addEventListener("click", closeSession);
 
+  // 断线。**看着画面的人也得知道**：画面本身断线前后长得一模一样（它就是
+  // 最后一帧），只在列表上写一句话的话，正在看某个会话的人什么都不会发现，
+  // 然后对着一屏早就过期的内容做判断。所以标题整条变红并写明原因——
+  // 跟桌面端断连时那条红标题是同一个做法。
   function offline() {
     dotEl.className = "off";
-    listEl.textContent = "";
-    listEl.appendChild(notice(t("offline"), true));
+    headEl.className = "stale";
+    whyEl.textContent = t("offline");
+    if (open === null) {
+      listEl.textContent = "";
+      listEl.appendChild(notice(t("offline"), true));
+    }
+  }
+
+  function online() {
+    dotEl.className = "";
+    headEl.className = "";
+    whyEl.textContent = "";
   }
 
   function refreshList() {
@@ -541,7 +627,7 @@
       // 协议的答复是一个 externally tagged 的枚举：{"Sessions": [...]}。
       // 别的形状（比如 {"Error": …}）当成「这一轮没拿到」，不硬解。
       if (!resp || !resp.Sessions) { throw new Error("unexpected response"); }
-      dotEl.className = "";
+      online();
       render(resp.Sessions);
     }).catch(offline);
   }

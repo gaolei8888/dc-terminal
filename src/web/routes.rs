@@ -142,9 +142,30 @@ impl Handler for Routes {
                 },
                 _ => Resp::status(405),
             },
+            // 翻历史。**这条不是"往会话里敲 PageUp"**：桌面端的
+            // PageUp/PageDown/End 在 dct 自己攥着历史时是被 dct 吃掉的
+            // （`attach::key_scroll`），根本不会到 agent 那儿。手机上要
+            // 一样，所以走 `Request::Scroll`，不走 `/api/key`。
+            "/api/scroll" => match req.method {
+                "POST" => match serde_json::from_slice::<ScrollBody>(req.body) {
+                    Ok(b) => self.answer(Request::Scroll { id: b.id, by: b.by }),
+                    Err(_) => Resp::status(400),
+                },
+                _ => Resp::status(405),
+            },
             _ => Resp::status(404),
         }
     }
+}
+
+/// `POST /api/scroll` 的请求体。
+///
+/// `by` 直接用 `session::ScrollBy`——**协议层不重新定义一份平行的滚动语义**
+/// （`Request::Scroll` 自己就是这么做的），网页那边送上来的也就是同一个形状。
+#[derive(serde::Deserialize)]
+struct ScrollBody {
+    id: u32,
+    by: crate::session::ScrollBy,
 }
 
 /// `POST /api/input` 的请求体。
@@ -692,6 +713,80 @@ mod tests {
                 super::super::keys::bytes_for(&name).is_some(),
                 "{name} 服务端不认"
             );
+        }
+    }
+
+    /// 翻历史走 `Request::Scroll`，**不是往会话里敲 PageUp**。
+    ///
+    /// 桌面端的 PageUp/PageDown 在 dct 自己攥着历史时是被 dct 吃掉的，
+    /// 根本不会到 agent 那儿。手机上要是翻成按键发下去，同一个手势在两个
+    /// 客户端上就是两件事——而这条链路的全部前提是"手机看到的跟桌面一样"。
+    #[test]
+    fn scrolling_history_is_a_scroll_request_not_a_keypress() {
+        use crate::session::ScrollBy;
+        let (r, fake) = routes(Response::Ok);
+        r.handle(&post("/api/scroll", r#"{"id":5,"by":{"Rows":-20}}"#));
+        r.handle(&post("/api/scroll", r#"{"id":5,"by":"Bottom"}"#));
+
+        let seen = fake.seen.lock().unwrap();
+        match seen.as_slice() {
+            [Request::Scroll {
+                id: 5,
+                by: ScrollBy::Rows(-20),
+            }, Request::Scroll {
+                id: 5,
+                by: ScrollBy::Bottom,
+            }] => {}
+            other => panic!("预期两条 Scroll，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_scroll_never_reaches_the_daemon() {
+        for body in [
+            r#"{"id":1}"#,
+            r#"{"id":1,"by":"Sideways"}"#,
+            r#"{"id":1,"by":{"Rows":"lots"}}"#,
+            "[]",
+        ] {
+            let (r, fake) = routes(Response::Ok);
+            assert_eq!(r.handle(&post("/api/scroll", body)).status, 400, "{body}");
+            assert!(fake.seen.lock().unwrap().is_empty(), "{body} 不该往下走");
+        }
+    }
+
+    /// 「现在能不能往会话里送东西」只有一处说得算，而且真的被用着。
+    ///
+    /// 两件事都在这一处判：有没有打开的会话、**输入法在不在组合中**。
+    /// 抄成好几处的话，漏改的那一处就是"某个按钮在打拼音的时候把半截字
+    /// 送了出去"——而这件事在英文键盘上永远试不出来。
+    ///
+    /// 数字跟 `only_one_place_decides_whether_to_poll` 同一个道理：一处定义
+    /// 加至少三处调用（打字、按键、翻历史）。
+    #[test]
+    fn only_one_place_decides_whether_input_may_be_sent() {
+        let code = page_without_comments();
+        assert_eq!(
+            code.matches("composing").count(),
+            4,
+            "「输入法在不在组合中」被读了不止一处（一处声明、两处 composition 事件、一处 canSend）"
+        );
+        // 一处定义 + 四处调用：送按键、粘滞 Ctrl 那一下、提交打的字、翻历史。
+        // **定义本身占一处**——写 `>= 4` 的话，把其中一处的判断删掉照样能过
+        // （变异测试当场抓到的，跟 `shouldPoll` 那条犯的是同一个错）。
+        assert!(
+            code.matches("canSend()").count() >= 5,
+            "那条唯一的判断没被调够四处——送键、Ctrl、打字、翻历史都得过它"
+        );
+    }
+
+    /// 输入法的两个事件都得接。少一个的症状：`compositionstart` 少了就没人
+    /// 拦得住组合期发送，`compositionend` 少了就再也发不出去了。
+    #[test]
+    fn both_composition_events_are_handled() {
+        let code = page_without_comments();
+        for ev in ["compositionstart", "compositionend"] {
+            assert!(code.contains(ev), "网页没接 {ev}");
         }
     }
 

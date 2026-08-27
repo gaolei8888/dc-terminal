@@ -352,6 +352,32 @@ hand in this version.
 
 ---
 
+## On your phone
+
+Settings has a "use your phone" switch. Turn it on and dct prints a QR code in
+the terminal; scan it with a phone **on the same Wi-Fi** and you get your
+sessions, each one's live screen, and a line to type into.
+
+It is a page served by the daemon on your own network. Nothing goes to a server
+— there isn't one — so this works with no internet at all, and stops working the
+moment you leave the house. Reaching your machine from anywhere is a separate
+piece of work, designed but not built: see
+[`docs/superpowers/specs/2026-08-23-dc-terminal-srv-design.md`](docs/superpowers/specs/2026-08-23-dc-terminal-srv-design.md).
+
+- **The first time, your system asks whether to allow it.** Say yes for private
+  networks, or the phone cannot connect. dct says so on the screen before you
+  press the switch.
+- The token lives in the URL fragment, so it goes into the code and never into
+  the address written on screen — screens get photographed, projected and
+  recorded, and whoever reads that line can type into your terminal.
+- The phone never resizes the terminal. A PTY has one size, and two clients
+  fighting over it would reflow the agent under the desktop too; the phone scales
+  the canvas to fit instead.
+- It stops asking for anything the moment the tab goes to the background, so a
+  phone in a pocket isn't polling your laptop three times a second.
+- Anyone on that network who has the token can type into your sessions. It is off
+  by default and one keypress from off again.
+
 ## Colours
 
 `F6` inside a session, or the settings page, opens the same list of fourteen
