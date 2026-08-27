@@ -735,6 +735,7 @@ mod tests {
                 secret: None,
                 install: None,
                 has_secret: false,
+                backend_only: false,
             },
             ProfileEntry {
                 name: "kimi".into(),
@@ -744,6 +745,7 @@ mod tests {
                 secret: None,
                 install: None,
                 has_secret: false,
+                backend_only: false,
             },
             ProfileEntry {
                 name: "glm".into(),
@@ -755,6 +757,7 @@ mod tests {
                 secret: None,
                 install: None,
                 has_secret: false,
+                backend_only: false,
             },
             ProfileEntry {
                 name: "codex".into(),
@@ -774,6 +777,7 @@ mod tests {
                     note: String::new(),
                 }),
                 has_secret: false,
+                backend_only: false,
             },
         ];
         app.view = View::PickProfile {
@@ -1435,6 +1439,7 @@ mod tests {
                 secret: None,
                 install: None,
                 has_secret: false,
+                backend_only: false,
             }],
             state: ratatui::widgets::ListState::default(),
             warning: None,
@@ -1461,6 +1466,7 @@ mod tests {
             secret: None,
             install: None,
             has_secret: false,
+            backend_only: false,
         }]
     }
 

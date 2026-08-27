@@ -164,6 +164,11 @@ pub struct ProfileEntry {
     /// `status` 反推不出真实的密钥状态。密钥设置页要的是这个事实本身，
     /// 不是「现在能不能开会话」，两者在这种情况下会给出不同答案。
     pub has_secret: bool,
+    /// 这个 profile 只做 dct 自己的 LLM 后端，不是能开会话的 agent。
+    /// 界面靠它把这类条目从 agent 选择器里摘掉，同时留在密钥页上——
+    /// 理由写在 `profile::Profile::backend_only` 上。
+    #[serde(default)]
+    pub backend_only: bool,
 }
 
 /// 九宫格一格的内容。跟 `Response::Screen` 不同，不带光标——

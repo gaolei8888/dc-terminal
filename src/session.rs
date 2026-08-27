@@ -1673,6 +1673,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 
@@ -1738,6 +1739,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 
@@ -1764,6 +1766,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 
@@ -1788,6 +1791,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 

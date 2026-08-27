@@ -286,6 +286,23 @@ pub fn pick_action(e: &ProfileEntry, lang: Lang) -> PickAction {
 /// `NeedsDependency`/`NotInstalled`，从它反推不出真实的密钥状态。
 /// `has_secret` 是 daemon 直接从密钥仓查出来的事实，不掺这层判断，
 /// 这也是为什么它作为独立字段搭在 `ProfileEntry` 上而不是从 `status` 算出来。
+/// agent 选择器该列哪些行。
+///
+/// 跟 `secret_rows` 是对称的一对：那个从「所有 profile」里挑出**要密钥的**，
+/// 这个挑出**能开会话的**。同一份 `Response::Profiles` 喂给两个页面，各自
+/// 只看自己那一半——所以 dc_llm 这类纯后端既能出现在密钥页（用户得在那儿
+/// 填端点令牌），又不会在选择器上多出一条永远灰着、也永远装不上的条目。
+///
+/// 返回借用而不是克隆整份：调用方紧接着要把它塞进 `View::PickProfile`，
+/// 克隆一次是浪费；真要拥有的地方自己 `cloned()`。
+pub fn agent_rows(entries: &[ProfileEntry]) -> Vec<ProfileEntry> {
+    entries
+        .iter()
+        .filter(|e| !e.backend_only)
+        .cloned()
+        .collect()
+}
+
 pub fn secret_rows(entries: &[ProfileEntry]) -> Vec<(String, bool)> {
     entries
         .iter()
@@ -2108,6 +2125,7 @@ mod tests {
             status,
             secret: None,
             install: None,
+            backend_only: false,
         }
     }
 
@@ -2434,6 +2452,38 @@ mod tests {
         assert!(
             help.contains("返回设置"),
             "底栏说什么就得真能做到什么：{help}"
+        );
+    }
+
+    /// dc_llm 这类东西是一个 HTTP 端点，没有命令行可装。它必须能出现在
+    /// **密钥页**（用户得在那儿填端点令牌），又绝不能出现在 **agent 选择器**
+    /// 上——那儿的每一行都意味着「按下去能开一个会话」，而它开不出来，
+    /// 而且永远装不上，因为根本没有那个东西可装。
+    ///
+    /// 两个页面吃的是同一份 `Response::Profiles`，所以这条同时验两边：
+    /// 只验一边的话，把筛子加错地方（比如加在 daemon 里）会让密钥页也跟着
+    /// 少一行，而那一行正是用户唯一能填令牌的地方。
+    #[test]
+    fn a_backend_only_profile_stays_off_the_agent_picker_but_keeps_its_key_row() {
+        let mut backend = with_secret(entry("dc-llm", ProfileStatus::NeedsSecret));
+        backend.backend_only = true;
+        let entries = vec![
+            entry("claude", ProfileStatus::Ready),
+            with_secret(entry("kimi", ProfileStatus::Ready)),
+            backend,
+        ];
+
+        let agents: Vec<String> = agent_rows(&entries).into_iter().map(|e| e.name).collect();
+        assert_eq!(
+            agents,
+            vec!["claude".to_string(), "kimi".to_string()],
+            "纯后端不该出现在选择器上：{agents:?}"
+        );
+
+        let keys: Vec<String> = secret_rows(&entries).into_iter().map(|(n, _)| n).collect();
+        assert!(
+            keys.contains(&"dc-llm".to_string()),
+            "但它必须留在密钥页上，否则令牌没地方填：{keys:?}"
         );
     }
 

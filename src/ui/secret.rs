@@ -520,6 +520,7 @@ mod tests {
             status,
             secret: None,
             install: None,
+            backend_only: false,
         }
     }
 

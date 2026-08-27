@@ -986,6 +986,8 @@ pub fn run(
             {
                 Ok(Response::Profiles { entries, warnings }) => {
                     let warning = join_warnings(&warnings, lang);
+                    // 只做 LLM 后端的那些不进这一屏——见 `view::agent_rows`。
+                    let entries = view::agent_rows(&entries);
                     let mut state = ListState::default();
                     if !entries.is_empty() {
                         state.select(Some(0));
@@ -1927,6 +1929,8 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
     {
         Ok(Response::Profiles { entries, warnings }) => {
             let warning = join_warnings(&warnings, app.lang);
+            // 同上：这一屏是「挑一个 agent 开会话」，纯后端没有会话可开。
+            let entries = view::agent_rows(&entries);
             // 把「拉完列表但没能直开」的三种落点（选择器为空、建会话失败
             // 两种）收在一处，省得同一段 ListState 初始化抄三遍——那种
             // 抄法迟早有一份漏了空表守卫。
@@ -2994,6 +2998,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         };
 
         let home = tempfile::tempdir().unwrap();

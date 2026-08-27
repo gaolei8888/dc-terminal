@@ -108,6 +108,19 @@ pub struct Profile {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub secret: Option<SecretSpec>,
+    /// 这个 profile 只做 dct 自己的 LLM 后端，**不是一个能开会话的 agent**。
+    ///
+    /// 起因是 dc_llm 这类东西：它是一个 HTTP 端点，压根没有命令行。可
+    /// `Profile` 又要求写 `command`，于是硬塞一个不存在的命令，选择器上
+    /// 就多出一条永远灰着的「未安装」——而它永远装不上，因为根本没有那个
+    /// 东西可装。这正是仓库那条「屏幕上不写按不动的键」要挡的情况。
+    ///
+    /// 打了这个标记的 profile：
+    /// - **不进** agent 选择器（见 `view::agent_rows`）
+    /// - **仍然进**密钥页——那儿正是用户要填这个端点令牌的地方
+    /// - 仍然能被 `[llm].provider` 指名（`resolve` 走的是另一条查找路径）
+    #[serde(default)]
+    pub backend_only: bool,
     #[serde(default)]
     pub install: Option<InstallSpec>,
     #[serde(default)]

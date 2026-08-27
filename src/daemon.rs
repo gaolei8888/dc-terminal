@@ -593,6 +593,7 @@ fn handle(
                             note: i.note.get(lang).unwrap_or("").to_string(),
                         }),
                         has_secret,
+                        backend_only: p.backend_only,
                     }
                 })
                 .collect();
@@ -1258,6 +1259,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 
@@ -1461,6 +1463,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 
@@ -2095,6 +2098,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            backend_only: false,
         }
     }
 
