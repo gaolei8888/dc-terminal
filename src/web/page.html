@@ -121,6 +121,40 @@
     color: var(--accent); cursor: pointer;
   }
   #ruler { position: absolute; visibility: hidden; white-space: pre; }
+
+  /* 输入区：贴在底边，软键盘弹起来时不会被盖住（`position: sticky` 跟着
+     视觉视口走，而 `fixed` 在 iOS 上会被键盘顶到看不见的地方）。 */
+  #typing { position: sticky; bottom: 0; background: var(--bg); border-top: 1px solid var(--line); }
+  #keyrow {
+    display: flex; gap: .3rem; overflow-x: auto;
+    padding: .4rem .5rem; -webkit-overflow-scrolling: touch;
+  }
+  #keyrow button {
+    flex: 0 0 auto;
+    min-width: 2.6rem; min-height: 2.2rem;
+    background: var(--card); color: var(--ink);
+    border: 1px solid var(--line); border-radius: .4rem;
+    font: inherit; font-size: .85rem;
+    cursor: pointer;
+  }
+  #keyrow button:active { background: var(--line); }
+  #keyrow button.held { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  #say { display: flex; gap: .4rem; padding: 0 .5rem .5rem; }
+  #say input {
+    flex: 1; min-width: 0;
+    background: var(--card); color: var(--ink);
+    border: 1px solid var(--line); border-radius: .4rem;
+    padding: .5rem .6rem;
+    /* 16px 是 iOS 不自动放大页面的下限——放大之后整块画面的排版就散了 */
+    font: inherit; font-size: 16px;
+  }
+  #say button {
+    flex: 0 0 auto; min-width: 3.4rem;
+    background: var(--accent); color: var(--bg);
+    border: 0; border-radius: .4rem;
+    font: inherit; font-size: .9rem; font-weight: 600;
+    cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -131,6 +165,13 @@
 </header>
 <main id="list"></main>
 <div id="screen" hidden><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre><div id="cursor" hidden></div></div>
+<div id="typing" hidden>
+  <div id="keyrow"></div>
+  <form id="say" autocomplete="off">
+    <input id="line" type="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <button type="submit" id="send">&#9166;</button>
+  </form>
+</div>
 
 <script>
 (function () {
@@ -164,6 +205,10 @@
   var rulerEl = document.getElementById("ruler");
   var cursorEl = document.getElementById("cursor");
   var backEl = document.getElementById("back");
+  var typingEl = document.getElementById("typing");
+  var keyrowEl = document.getElementById("keyrow");
+  var lineEl = document.getElementById("line");
+  var sayEl = document.getElementById("say");
 
   // 当前在看什么：会话列表，还是某个会话的画面。
   var open = null;   // null = 列表；否则是会话 id
@@ -369,11 +414,102 @@
     dotEl.className = "";
   }
 
+  // ——打字————————————————————————————————————————————————————————
+
+  function post(path, body) {
+    return fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) { throw new Error("http " + r.status); }
+      // 敲完立刻拉一帧：不等下一个 300ms 的话，手机上按下去到看见反应
+      // 之间会有小半秒的空档，那半秒里人会以为没按上，然后再按一次。
+      return tick();
+    }).catch(offline);
+  }
+
+  function sendKey(name) {
+    if (open === null) { return; }
+    return post("/api/key", { id: open, key: name });
+  }
+
+  // 虚拟键行。手机键盘上没有这些键，而 agent 全都要用：Esc 关弹窗、
+  // Tab 切模式、方向键选菜单、Ctrl+C 打断。
+  //
+  // 名字必须跟 `web::keys::NAMES` 对得上（外加 `Ctrl+` 那一档）——有一条
+  // 测试拿那张白名单来对这一排，多一个手机上按不动的键就挂。
+  var ROW = ["Esc", "Tab", "Up", "Down", "Left", "Right", "Ctrl+C"];
+
+  // `Ctrl` 单独一个粘滞键：手机上没法"按住 Ctrl 再按 C"，所以按一下 Ctrl
+  // 亮起来，下一个字母跟它合成 `Ctrl+X`，然后自动灭掉。只放一个 Ctrl+C
+  // 的话，Ctrl+D（结束输入）、Ctrl+U（清行）在手机上就永远按不出来。
+  var ctrlHeld = false;
+
+  function buildKeyRow() {
+    keyrowEl.textContent = "";
+    ROW.forEach(function (name) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = name === "Up" ? "↑" : name === "Down" ? "↓"
+        : name === "Left" ? "←" : name === "Right" ? "→" : name;
+      b.addEventListener("click", function () { sendKey(name); });
+      keyrowEl.appendChild(b);
+    });
+
+    var ctrl = document.createElement("button");
+    ctrl.type = "button";
+    ctrl.textContent = "Ctrl";
+    ctrl.addEventListener("click", function () {
+      ctrlHeld = !ctrlHeld;
+      ctrl.className = ctrlHeld ? "held" : "";
+      lineEl.focus();
+    });
+    keyrowEl.appendChild(ctrl);
+    return ctrl;
+  }
+  var ctrlBtn = buildKeyRow();
+
+  function releaseCtrl() {
+    ctrlHeld = false;
+    ctrlBtn.className = "";
+  }
+
+  // 粘滞 Ctrl 亮着的时候，输入框里打的第一个字母变成 Ctrl+它。
+  lineEl.addEventListener("keydown", function (e) {
+    if (!ctrlHeld) { return; }
+    if (e.key && e.key.length === 1 && /[a-zA-Z]/.test(e.key)) {
+      e.preventDefault();
+      sendKey("Ctrl+" + e.key.toUpperCase());
+      releaseCtrl();
+    }
+  });
+
+  // 中文输入法：组合期间一个字节都不上送。逐字符转发会把拼音本身敲进 agent。
+  var composing = false;
+  lineEl.addEventListener("compositionstart", function () { composing = true; });
+  lineEl.addEventListener("compositionend", function () { composing = false; });
+
+  sayEl.addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (composing || open === null) { return; }
+    var text = lineEl.value;
+    lineEl.value = "";
+    // 两步，顺序不能反也不能合：先把文字写进去，再单独送一次空回车——
+    // **空的那一次才打检查点**，才让 agent 真的开始干这一轮
+    // （同 SessionWriter::type_into 的约定）。合成一步的话，手机上发出去的
+    // 每一句话都没有检查点，`u` 撤不回来。
+    var typed = text ? post("/api/input", { id: open, text: text }) : Promise.resolve();
+    typed.then(function () { return sendKey("Enter"); });
+  });
+
   function openSession(id, info) {
     open = id;
     listEl.hidden = true;
     screenEl.hidden = false;
     backEl.hidden = false;
+    typingEl.hidden = false;
     if (info) {
       titleEl.textContent = id + " " + (info.tag && info.tag.trim() ? info.tag : info.profile);
     }
@@ -383,6 +519,8 @@
   function closeSession() {
     open = null;
     screenEl.hidden = true;
+    typingEl.hidden = true;
+    releaseCtrl();
     cursorEl.hidden = true;
     listEl.hidden = false;
     backEl.hidden = true;

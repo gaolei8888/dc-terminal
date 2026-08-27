@@ -112,9 +112,56 @@ impl Handler for Routes {
                 },
                 _ => Resp::status(405),
             },
+            // ——往会话里敲东西——————————————————————————————————————
+            //
+            // 这是手机端第一条**写**的路：前面几条都只是看。守门的还是同
+            // 一个令牌（`web::serve` 那一层），这里只负责把请求翻成
+            // `Request::Input`——**敲什么、敲给谁，一个字都不加工**。
+            "/api/input" => match req.method {
+                "POST" => match serde_json::from_slice::<TypeBody>(req.body) {
+                    Ok(b) => self.answer(Request::Input {
+                        id: b.id,
+                        text: b.text,
+                    }),
+                    Err(_) => Resp::status(400),
+                },
+                _ => Resp::status(405),
+            },
+            // 虚拟键行按下去的那一下。名字翻字节走 `web::keys`，
+            // 而那个模块自己不写表，转手交给桌面端同一个 `key_to_input`。
+            "/api/key" => match req.method {
+                "POST" => match serde_json::from_slice::<KeyBody>(req.body) {
+                    Ok(b) => match super::keys::bytes_for(&b.key) {
+                        Some(text) => self.answer(Request::Input { id: b.id, text }),
+                        // 白名单之外的名字是 400，不是"当成没这回事"：
+                        // 手机上按了一个键却什么都没发生，用户只会以为
+                        // 是网络卡了，然后再按一次。
+                        None => Resp::status(400),
+                    },
+                    Err(_) => Resp::status(400),
+                },
+                _ => Resp::status(405),
+            },
             _ => Resp::status(404),
         }
     }
+}
+
+/// `POST /api/input` 的请求体。
+///
+/// **`text` 允许是空串**，而且那不是边界情况——空的那一次正是「回车」，
+/// 也正是打检查点的那一次（见 `SessionWriter::type_into` 的两步约定）。
+#[derive(serde::Deserialize)]
+struct TypeBody {
+    id: u32,
+    text: String,
+}
+
+/// `POST /api/key` 的请求体。
+#[derive(serde::Deserialize)]
+struct KeyBody {
+    id: u32,
+    key: String,
 }
 
 /// 从 `a=1&id=3` 里取一个值。没有就是 `None`。
@@ -503,6 +550,149 @@ mod tests {
             code.matches("shouldPoll()").count() >= 3,
             "那个唯一的判断没被调够两处——定时器多半绕过它了"
         );
+    }
+
+    fn post(path: &str, body: &str) -> Req<'static> {
+        Req {
+            method: "POST",
+            path: Box::leak(path.to_string().into_boxed_str()),
+            query: "",
+            body: Box::leak(body.to_string().into_bytes().into_boxed_slice()),
+        }
+    }
+
+    #[test]
+    fn typing_goes_through_as_an_input_request() {
+        let (r, fake) = routes(Response::Ok);
+        let resp = r.handle(&post("/api/input", r#"{"id":3,"text":"你好"}"#));
+
+        assert_eq!(resp.status, 200);
+        let seen = fake.seen.lock().unwrap();
+        match seen.as_slice() {
+            [Request::Input { id: 3, text }] => assert_eq!(text, "你好"),
+            other => panic!("预期一条 Input，实际 {other:?}"),
+        }
+    }
+
+    /// **空 `text` 要照发**。那不是"没内容所以跳过"，那是回车——
+    /// 而回车那一次才打检查点（见 `web::keys` 里 `Enter` 那条测试）。
+    #[test]
+    fn an_empty_text_is_still_sent_because_it_is_the_enter() {
+        let (r, fake) = routes(Response::Ok);
+        r.handle(&post("/api/input", r#"{"id":3,"text":""}"#));
+
+        let seen = fake.seen.lock().unwrap();
+        match seen.as_slice() {
+            [Request::Input { id: 3, text }] => assert_eq!(text, ""),
+            other => panic!("空回车没发出去：{other:?}"),
+        }
+    }
+
+    /// 虚拟键行按下去的那一下，翻成的字节必须跟桌面端按同一个键一样。
+    #[test]
+    fn a_virtual_key_sends_the_same_bytes_the_desktop_would() {
+        let (r, fake) = routes(Response::Ok);
+        r.handle(&post("/api/key", r#"{"id":7,"key":"Up"}"#));
+
+        let seen = fake.seen.lock().unwrap();
+        match seen.as_slice() {
+            [Request::Input { id: 7, text }] => assert_eq!(text, "\x1b[A"),
+            other => panic!("预期一条 Input，实际 {other:?}"),
+        }
+    }
+
+    /// 白名单之外的键名是 400，**而且不许惊动守护进程**。手机上按了一个键
+    /// 却什么都没发生的话，用户只会以为是网络卡了，然后再按一次。
+    #[test]
+    fn an_unknown_key_name_is_refused_and_never_reaches_the_daemon() {
+        for body in [
+            r#"{"id":1,"key":"F2"}"#,
+            r#"{"id":1,"key":"ctrl+c"}"#,
+            r#"{"id":1,"key":""}"#,
+            r#"{"id":1,"key":"\u001b[A"}"#,
+        ] {
+            let (r, fake) = routes(Response::Ok);
+            let resp = r.handle(&post("/api/key", body));
+            assert_eq!(resp.status, 400, "{body} 该被拒");
+            assert!(fake.seen.lock().unwrap().is_empty(), "{body} 不该往下走");
+        }
+    }
+
+    /// 请求体读不懂就 400，**同样不许惊动守护进程**。
+    #[test]
+    fn a_malformed_body_never_reaches_the_daemon() {
+        for (path, body) in [
+            ("/api/input", "not json"),
+            ("/api/input", r#"{"id":"three","text":"x"}"#),
+            ("/api/input", r#"{"text":"没有 id"}"#),
+            ("/api/key", "{}"),
+        ] {
+            let (r, fake) = routes(Response::Ok);
+            let resp = r.handle(&post(path, body));
+            assert_eq!(resp.status, 400, "{path} {body} 该被拒");
+            assert!(fake.seen.lock().unwrap().is_empty(), "{body} 不该往下走");
+        }
+    }
+
+    /// 敲字只认 `POST`。`GET` 能敲字的话，一条链接就能往别人的终端里
+    /// 送东西——而链接是会被点的。
+    #[test]
+    fn typing_is_not_something_a_link_can_do() {
+        let (r, fake) = routes(Response::Ok);
+        for path in ["/api/input", "/api/key"] {
+            let resp = r.handle(&get(path, "id=1&text=x"));
+            assert_eq!(resp.status, 405, "{path} 不该认 GET");
+        }
+        assert!(fake.seen.lock().unwrap().is_empty());
+    }
+
+    /// **虚拟键行上的每一个键，服务端都得认。**
+    ///
+    /// 不对账的话，屏幕上会出现一个按下去只会 400 的键——而手机上按了没反应
+    /// 的表现跟"网络卡了"一模一样，用户只会再按一次。这条跟文案那两条守卫
+    /// 是同一个形状：**JS 那边对 Rust 的每一处依赖，都要能从 Rust 这边查。**
+    #[test]
+    fn every_key_on_the_virtual_row_is_one_the_daemon_accepts() {
+        let code = page_without_comments();
+        let row = code
+            .split_once("var ROW = [")
+            .expect("网页里没有那一排虚拟键了？")
+            .1
+            .split_once(']')
+            .expect("ROW 那一行没闭合")
+            .0;
+
+        let names: Vec<String> = row
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(names.len() >= 5, "虚拟键行怎么只剩 {names:?}");
+
+        for name in &names {
+            assert!(
+                super::super::keys::bytes_for(name).is_some(),
+                "虚拟键行上的 {name:?} 服务端不认——按下去只会 400"
+            );
+        }
+    }
+
+    /// 粘滞 `Ctrl` 拼出来的名字也得认。网页那边拼的是 `"Ctrl+" + 大写字母`，
+    /// 这条把那个拼法本身钉住。
+    #[test]
+    fn the_sticky_ctrl_builds_a_name_the_daemon_accepts() {
+        let code = page_without_comments();
+        assert!(
+            code.contains(r#""Ctrl+" + e.key.toUpperCase()"#),
+            "粘滞 Ctrl 的拼法变了，这条守卫要跟着改"
+        );
+        for c in ['A', 'C', 'D', 'U', 'Z'] {
+            let name = format!("Ctrl+{c}");
+            assert!(
+                super::super::keys::bytes_for(&name).is_some(),
+                "{name} 服务端不认"
+            );
+        }
     }
 
     #[test]

@@ -183,8 +183,35 @@ fn serve_for_a_manual_look() {
         token.clone(),
         Arc::new(Routes::new(Arc::new(OverSocket(Mutex::new(client))))),
     );
+    // **给这个脚手架自己开一个会话**，别拿用户正在跑的 agent 当试验田：
+    // 往一个活着的 agent 会话里敲字节是有后果的（Esc 关掉他的弹窗、
+    // 方向键动他的选择、Ctrl+C 打断他干了一半的活），而验收输入这件事
+    // 只需要一个能回显的普通终端。
+    let scratch = tempfile::tempdir().unwrap();
+    let mut c2 = Client::connect(&sock).unwrap();
+    let scratch_id = match c2.call(Request::Create {
+        dir: scratch.path().display().to_string(),
+        profile: "shell".into(),
+        remember: false,
+    }) {
+        Ok(Response::Created { id }) => Some(id),
+        other => {
+            println!("MANUAL_NOTE 起不了草稿会话：{other:?}");
+            None
+        }
+    };
+    if let Some(id) = scratch_id {
+        println!("MANUAL_SCRATCH {id}");
+    }
+
     println!("MANUAL_URL http://{}/#t={}", server.addr(), token);
     std::thread::sleep(std::time::Duration::from_secs(180));
+
+    // 收拾干净：这个会话是脚手架自己开的，不该留在用户的看板上。
+    if let Some(id) = scratch_id {
+        let _ = c2.call(Request::Kill { id });
+        let _ = c2.call(Request::Prune);
+    }
     server.stop();
 }
 

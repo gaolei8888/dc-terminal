@@ -32,6 +32,7 @@
 //!   都不告诉他。否则局域网里的人可以拿 404/401 的差别把接口摸个遍。
 //! - 比对用常数时间循环，不用 `==`
 
+pub mod keys;
 pub mod routes;
 pub mod strings;
 
