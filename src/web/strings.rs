@@ -29,6 +29,7 @@ pub const NEEDED: &[(&str, Key)] = &[
     ("back", Key::BackToListWord),
     ("smaller", Key::TextSmaller),
     ("bigger", Key::TextBigger),
+    ("keyboard", Key::KeyboardCapture),
     ("working", Key::StatusWorking),
     ("asking", Key::StatusAsking),
     ("idle", Key::StatusIdle),

@@ -214,6 +214,9 @@ pub enum Key {
     /// 念不出「A−」，而手机上读屏用户很多（同网页里 `back` 那一条）。
     TextSmaller,
     TextBigger,
+    /// 手机端那个「用键盘打字」开关的名字。接了实体键盘（iPad + 妙控键盘、
+    /// 或者随便一个蓝牙键盘）之后，人会本能地直接打字，而不是先点那个单行框。
+    KeyboardCapture,
     // —— 手机通知页 ——
     /// 还没填过令牌
     PhoneOffLine,
@@ -526,6 +529,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         WebToggle => t!(lang, en: "phone client", zh: "手机端开关"),
         TextSmaller => t!(lang, en: "smaller text", zh: "字小一点"),
         TextBigger => t!(lang, en: "bigger text", zh: "字大一点"),
+        KeyboardCapture => t!(lang, en: "type with your keyboard", zh: "用键盘打字"),
         WebQrTooNarrow => t!(
             lang,
             en: "The window is too narrow for the code — widen it, or type the address into the phone",
@@ -1810,6 +1814,7 @@ mod tests {
             WebQrTooNarrow,
             TextSmaller,
             TextBigger,
+            KeyboardCapture,
             WebToggle,
             OtherKeysGoToAgent,
             BackToListWord,
@@ -1944,7 +1949,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 142, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 143, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -145,6 +145,14 @@
   }
   .zoom:active { background: var(--line); }
   #zooms { display: flex; gap: .3rem; margin-left: auto; }
+  .zoom.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  /* 捕获键盘用的那个输入框：必须**在页面上、能获得焦点**，否则收不到输入法的
+     组合事件。所以不是 `display:none`（那样根本聚不了焦），而是缩到看不见。 */
+  #capture {
+    position: absolute; width: 1px; height: 1px;
+    padding: 0; border: 0; outline: 0;
+    opacity: 0; pointer-events: none;
+  }
   header.stale .zoom { border-color: var(--bg); color: var(--bg); }
   #ruler { position: absolute; visibility: hidden; white-space: pre; }
 
@@ -193,11 +201,13 @@
   <span id="zooms" hidden>
     <button type="button" class="zoom" id="zoomout">A&minus;</button>
     <button type="button" class="zoom" id="zoomin">A+</button>
+    <button type="button" class="zoom" id="kbd">&#9000;</button>
   </span>
 </header>
 <main id="list"></main>
 <div id="screen" hidden><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre><div id="cursor" hidden></div></div>
 <div id="typing" hidden>
+  <input id="capture" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" tabindex="-1">
   <div id="keyrow"></div>
   <form id="say" autocomplete="off">
     <input id="line" type="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false">
@@ -238,6 +248,8 @@
   var cursorEl = document.getElementById("cursor");
   var backEl = document.getElementById("back");
   var zoomsEl = document.getElementById("zooms");
+  var kbdEl = document.getElementById("kbd");
+  var captureEl = document.getElementById("capture");
   var headEl = document.getElementById("head");
   var whyEl = document.getElementById("why");
   var typingEl = document.getElementById("typing");
@@ -539,6 +551,7 @@
   // 亮起来，下一个字母跟它合成 `Ctrl+X`，然后自动灭掉。只放一个 Ctrl+C
   // 的话，Ctrl+D（结束输入）、Ctrl+U（清行）在手机上就永远按不出来。
   var ctrlHeld = false;
+  var composing = false;
 
   // 翻历史那三个键。**跟上面那一排分开**：它们不是按键，是
   // `Request::Scroll`（见 `scroll()`），而且**只在真的有历史可翻时才露面**
@@ -616,7 +629,8 @@
   });
 
   // 中文输入法：组合期间一个字节都不上送。逐字符转发会把拼音本身敲进 agent。
-  var composing = false;
+  // **两个输入口共用这一个标志**（单行框和捕获键盘用的那个隐藏框），
+  // 因为「在不在组合中」是一件事，不是两件。
   lineEl.addEventListener("compositionstart", function () { composing = true; });
   lineEl.addEventListener("compositionend", function () { composing = false; });
 
@@ -655,6 +669,7 @@
     listEl.hidden = false;
     backEl.hidden = true;
     zoomsEl.hidden = true;
+    setCapture(false);
     titleEl.textContent = t("title");
     tick();
   }
@@ -745,6 +760,100 @@
     placeCursor(lastCursor, lastCursorHidden);
   });
 
+  // ——用键盘打字（实体键盘）————————————————————————————————————
+
+  // 物理按键 → 这一页已经在用的那套名字（`web::keys::NAMES`）。
+  //
+  // **`PageUp`/`PageDown`/`End` 不在这儿**，是故意的：桌面端 dct 自己会把
+  // 它们吃掉去翻滚屏（`attach::key_scroll`），送给 agent 就成了「同一个键
+  // 两个客户端两种行为」。它们走下面 `SCROLLS_INSTEAD` 那一档，跟 ⇞⇟⤓
+  // 三个按钮是同一条路（`/api/scroll`）——**桌面吃掉之后走的也正是这条**。
+  var KEYNAMES = {
+    Escape: "Esc",
+    Tab: "Tab",
+    Enter: "Enter",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    ArrowUp: "Up",
+    ArrowDown: "Down",
+    ArrowLeft: "Left",
+    ArrowRight: "Right",
+    Home: "Home"
+  };
+
+  // 这几个键在桌面上是「翻 dct 的历史」，不是敲给 agent 的。
+  var SCROLLS_INSTEAD = {
+    PageUp: function () { return { Rows: pageStep() }; },
+    PageDown: function () { return { Rows: -pageStep() }; },
+    End: function () { return "Bottom"; }
+  };
+
+  var capturing = false;
+
+  function setCapture(on) {
+    capturing = on;
+    kbdEl.className = on ? "zoom on" : "zoom";
+    // 捕获开着时那个单行框没有意义了——键盘直通会话，不再需要"先攒一句再发"。
+    sayEl.hidden = on;
+    if (on) {
+      captureEl.focus();
+    } else {
+      captureEl.blur();
+    }
+  }
+
+  // 组合期一个字节都不上送——判断还是那一处 `canSend()`，这里只是把
+  // 组合状态喂给它。
+  captureEl.addEventListener("compositionstart", function () { composing = true; });
+  captureEl.addEventListener("compositionend", function () {
+    composing = false;
+    flushCapture();
+  });
+
+  // 普通字符走 `input` 事件，不走 `keydown`：`keydown` 上的 `e.key` 对
+  // 输入法、对带修饰的布局都不可靠，而 `input` 给的是**真正落下去的那些字**。
+  captureEl.addEventListener("input", flushCapture);
+
+  // **先问能不能送，再取值。** 反过来的话，组合期那一下会把输入框清空——
+  // 用户正在打的拼音当场消失，而他什么都没做错。
+  function flushCapture() {
+    if (!canSend()) { return; }
+    var text = captureEl.value;
+    if (!text) { return; }
+    captureEl.value = "";
+    post("/api/input", { id: open, text: text });
+  }
+
+  document.addEventListener("keydown", function (e) {
+    if (!capturing || !canSend()) { return; }
+
+    // 翻历史那三个键：走滚动，不当按键发下去（见 SCROLLS_INSTEAD 上面那段）。
+    var by = SCROLLS_INSTEAD[e.key];
+    if (by && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      scroll(by());
+      return;
+    }
+
+    // Ctrl+字母。**放在具名键前面判**：`Ctrl+C` 的 `e.key` 就是 `"c"`，
+    // 不先看修饰键的话它会被当成一个普通字符落进输入框。
+    if (e.ctrlKey && !e.altKey && !e.metaKey && /^[a-zA-Z]$/.test(e.key)) {
+      e.preventDefault();
+      sendKey("Ctrl+" + e.key.toUpperCase());
+      return;
+    }
+
+    var name = KEYNAMES[e.key];
+    if (name) {
+      e.preventDefault();
+      sendKey(name);
+    }
+    // 其余的一概不拦：普通字符由 `input` 事件收，浏览器自己的快捷键
+    // （切标签页、刷新）留给浏览器——否则用户会被关在这一页里出不去。
+  });
+
+  kbdEl.addEventListener("click", function () { setCapture(!capturing); });
+
   document.getElementById("zoomout").addEventListener("click", function () {
     setZoom(zoom / 1.15);
   });
@@ -764,6 +873,7 @@
       document.getElementById("zoomout").setAttribute("aria-label", t("smaller"));
       document.getElementById("zoomin").setAttribute("aria-label", t("bigger"));
       backEl.setAttribute("aria-label", t("back"));
+      kbdEl.setAttribute("aria-label", t("keyboard"));
       start();
     });
 })();

@@ -735,6 +735,52 @@ mod tests {
         }
     }
 
+    /// **实体键盘上的那几个键也不许当按键发下去。**
+    ///
+    /// 捕获模式收的是真键盘，`PageUp`/`PageDown`/`End` 一按一个准。桌面端
+    /// 对它们的处理是"dct 自己吃掉去翻历史"，所以这一页也得走
+    /// `/api/scroll`——跟 ⇞⇟⤓ 三个按钮同一条路。翻成按键发下去的话，
+    /// 同一块键盘在两个客户端上就是两种行为。
+    #[test]
+    fn a_physical_keyboard_scrolls_history_instead_of_sending_those_keys() {
+        let code = page_without_comments();
+
+        // 键名映射表里不许出现它们……
+        let table = code
+            .split_once("var KEYNAMES = {")
+            .expect("键名映射表没了？")
+            .1
+            .split_once('}')
+            .expect("KEYNAMES 没闭合")
+            .0;
+        for name in ["PageUp", "PageDown", "End"] {
+            assert!(
+                !table.contains(name),
+                "{name} 跑进键名映射表了——它该走滚动，不该当按键发给 agent"
+            );
+        }
+
+        // ……而且它们确实各自有一条滚动的去处。
+        // 收尾找的是行首那个 `};`，不是第一个——每一条分支自己就是一个
+        // `function () { … };`，按第一个切的话只能拿到第一行。
+        let scrolls = code
+            .split_once("var SCROLLS_INSTEAD = {")
+            .expect("那三个键的滚动分支没了？")
+            .1
+            .split_once(
+                "
+  };",
+            )
+            .expect("SCROLLS_INSTEAD 没闭合")
+            .0;
+        for name in ["PageUp", "PageDown", "End"] {
+            assert!(
+                scrolls.contains(name),
+                "{name} 没有滚动的去处，按下去会没反应"
+            );
+        }
+    }
+
     /// 粘滞 `Ctrl` 拼出来的名字也得认。网页那边拼的是 `"Ctrl+" + 大写字母`，
     /// 这条把那个拼法本身钉住。
     #[test]
@@ -803,11 +849,32 @@ mod tests {
     #[test]
     fn only_one_place_decides_whether_input_may_be_sent() {
         let code = page_without_comments();
+        // **盯的是「读」，不是出现次数。** 写它的地方会随着输入口增加
+        // （单行框一对、捕获键盘一对 composition 监听），那是正常的；
+        // 不正常的是**有第二处地方去判断它**——那才是将来会漂的东西。
+        //
+        // 读 = 总出现次数减去「赋值」的次数（声明也算一次赋值）。只查
+        // `!composing` 的话，写成 `if (composing)` 的第二处判断就溜过去了
+        // ——变异测试当场试出来的。
+        let total = code.matches("composing").count();
+        let writes = code.matches("composing = ").count();
         assert_eq!(
-            code.matches("composing").count(),
-            4,
-            "「输入法在不在组合中」被读了不止一处（一处声明、两处 composition 事件、一处 canSend）"
+            total - writes,
+            1,
+            "「输入法在不在组合中」被判断了 {} 处，而它只该在 canSend 里判一次",
+            total - writes
         );
+
+        // 两个输入口各自都要报告组合状态。少一处的症状：那个口子上打中文，
+        // 拼音会被逐字送进 agent。
+        for surface in ["lineEl", "captureEl"] {
+            for ev in ["compositionstart", "compositionend"] {
+                assert!(
+                    code.contains(&format!("{surface}.addEventListener(\"{ev}\"")),
+                    "{surface} 没接 {ev}"
+                );
+            }
+        }
         // 一处定义 + 四处调用：送按键、粘滞 Ctrl 那一下、提交打的字、翻历史。
         // **定义本身占一处**——写 `>= 4` 的话，把其中一处的判断删掉照样能过
         // （变异测试当场抓到的，跟 `shouldPoll` 那条犯的是同一个错）。
@@ -817,14 +884,28 @@ mod tests {
         );
     }
 
-    /// 输入法的两个事件都得接。少一个的症状：`compositionstart` 少了就没人
-    /// 拦得住组合期发送，`compositionend` 少了就再也发不出去了。
+    /// **能不能送，要在动那个输入框之前问。**
+    ///
+    /// 顺序反过来的话，组合期那一下会先把框清空再发现"现在不能送"——
+    /// 用户正在打的拼音当场消失，而他什么都没做错。这种事没有任何测试
+    /// 跑得到（那是浏览器里的输入法），所以在源码顺序上钉住。
     #[test]
-    fn both_composition_events_are_handled() {
+    fn the_capture_field_is_never_cleared_before_we_know_we_can_send() {
         let code = page_without_comments();
-        for ev in ["compositionstart", "compositionend"] {
-            assert!(code.contains(ev), "网页没接 {ev}");
-        }
+        let body = code
+            .split_once("function flushCapture() {")
+            .expect("flushCapture 没了？")
+            .1;
+        let gate = body
+            .find("canSend()")
+            .expect("flushCapture 里没问过能不能送");
+        let clear = body
+            .find("captureEl.value = \"\"")
+            .expect("flushCapture 里没清空输入框？");
+        assert!(
+            gate < clear,
+            "先清空了输入框才判断能不能送——组合期这一下会把用户的拼音吞掉"
+        );
     }
 
     /// **底栏不许跟着内容滚。**
