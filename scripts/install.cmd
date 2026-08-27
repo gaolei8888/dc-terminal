@@ -25,20 +25,40 @@ if not exist "%DCT_PS1%" (
 	exit /b 1
 )
 
-rem Prefer PowerShell 7 (pwsh) when it is installed, fall back to the Windows
-rem PowerShell that every machine has. The difference that matters here is
-rem encoding: install.ps1 is UTF-8, and Windows PowerShell 5.1 only reads it as
-rem UTF-8 because of the byte order mark at its start. pwsh needs no such help,
-rem and renders the installer's output correctly whatever the console code page.
+rem Read the script as UTF-8 and run it as a script block, rather than handing
+rem the path to -File.
+rem
+rem install.ps1 carries no byte order mark, because it must survive being piped
+rem through `irm ... | iex`, where a BOM becomes part of the first command name
+rem and the failure names nothing you could act on. Without a BOM, though,
+rem Windows PowerShell 5.1 falls back to the machine's ANSI code page when it
+rem reads a .ps1 from disk, and every Chinese line the installer prints comes
+rem out as garbage. Reading the bytes ourselves and naming the encoding settles
+rem it for both 5.1 and 7, BOM or no BOM.
+rem
+rem -Command must come last: everything after it on the command line is joined
+rem into one command string, which is how %* reaches the script block as its
+rem own arguments (-InstallDir D:\bin and friends still work).
 rem
 rem -NoProfile: the user's PowerShell profile has no business running here, and
 rem a slow or broken one would look like the installer hanging or failing.
+rem
+rem Prefer PowerShell 7 (pwsh) when it is installed, fall back to the Windows
+rem PowerShell that every machine has.
+rem A script block has no idea which file it came from, so $PSScriptRoot is
+rem empty even here, in a real checkout. Hand the repo root over explicitly, or
+rem -Build would claim it cannot find a repo while standing inside one.
+rem setlocal above keeps this out of the caller's environment.
+set "DCT_REPO_ROOT=%~dp0.."
+
+set "DCT_RUN=& ([scriptblock]::Create([IO.File]::ReadAllText('%DCT_PS1%',[Text.Encoding]::UTF8)))"
+
 where /q pwsh.exe
 if %ERRORLEVEL%==0 goto :pwsh
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%DCT_PS1%" %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "%DCT_RUN%" %*
 exit /b %ERRORLEVEL%
 
 :pwsh
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%DCT_PS1%" %*
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "%DCT_RUN%" %*
 exit /b %ERRORLEVEL%

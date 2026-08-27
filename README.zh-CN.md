@@ -32,38 +32,85 @@ q quit         ai-mania         Enter open  n new  Tab project  ? …
 
 ## 装上它
 
-需要 **Rust 1.80 以上**和 **git**。macOS、Linux 上还要一套 C 工具链（Xcode 命令行工具，
-或者 `build-essential`），TLS 那部分要编 C。
-
 **macOS · Linux**
 
 ```sh
-git clone https://github.com/gaolei8888/dc-terminal
-cd dc-terminal
-./scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts/install.sh | sh
 ```
 
-**Windows** —— 原生，不用 WSL。在 PowerShell 或者 `cmd` 里：
+**Windows** —— 原生，不用 WSL。在 PowerShell 里：
 
 ```
-git clone https://github.com/gaolei8888/dc-terminal
-cd dc-terminal
-scripts\install.cmd
+irm https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts/install.ps1 | iex
 ```
 
-然后在任何一个 git 项目里敲 `dct`。
+装下来的是一个几 MB 的可执行文件。**不需要 Rust，不需要编译器，不需要等编译。**
+装完新开一个终端窗口，进到任何一个文件夹里敲 `dct`。
+
+`dct` 每轮对话前会给你的项目拍一张隐藏快照，那是靠 `git` 做的——没有它，撤销就是死的，
+而撤销正是 `dct` 敢让 agent 关掉所有权限确认的全部理由。所以 Windows 上如果这台电脑
+还没有 git，安装脚本会顺手装一份便携版（45 MB，解压即用，整个躺在 `dct` 自己的目录
+下面，不写注册表也不碰系统里已有的东西）。macOS 和 Linux 上 git 通常已经有了，
+真没有的话脚本会告诉你该敲哪一条命令。
 
 <details>
-<summary>Windows 工具链，以及为什么别拿 <code>cp</code> 覆盖安装</summary>
+<summary>教室的网连不上 GitHub 怎么办</summary>
 
 <br>
 
-先装两样：
+把 release 里那几个包和 `SHA256SUMS` 原样放到任何一个学生下得到的地方，然后告诉他们
+先设一个环境变量。**学生那条安装命令一个字都不用改**，校验和照样会验。
+
+```sh
+export DCT_RELEASE_BASE=https://你的地址/dct
+curl -fsSL https://你的地址/install.sh | sh
+```
+
+```
+$env:DCT_RELEASE_BASE = 'https://你的地址/dct'
+irm https://你的地址/install.ps1 | iex
+```
+
+Windows 上那份便携 git 也一样，用 `DCT_MINGIT_URL` 换地址。
+
+</details>
+
+<details>
+<summary>装到别处、装旧的、以及别拿 <code>cp</code> 覆盖安装</summary>
+
+<br>
+
+Unix 上默认装进 `~/.local/bin`，`--dir` 或者 `DCT_INSTALL_DIR` 换地方；
+Windows 上默认是 `%LOCALAPPDATA%\Programs\dct`，换用 `-InstallDir`。
+`--build` / `-Build` 是不下现成的、从源码编译（要在 clone 好的仓库里）；
+`-NoPath`、`-NoGit` 分别是不动 PATH、不自动装那份便携 git。
+
+**别自己拿 `cp` 往装好的那个文件上覆盖。** macOS 上，守护进程还在执行这个文件的时候
+原地覆盖它，内核手里那份代码签名就此对不上，下次敲 `dct` 会在 exec 阶段被杀掉，终端里
+只留一行 `zsh: killed`——而 `codesign -v` 还会说签名没问题，因为磁盘上那份确实没问题。
+安装脚本是先写新文件再 rename 覆盖，新二进制永远落在一个新 inode 上。Windows 上是同一件事
+的另一个形状：那儿不让你写一个正在执行的映像，所以脚本先把老的改名挪开，再把新的搬进来。
+
+装完敲 `dct --version` 能看到装的是哪一版。
+
+</details>
+
+<details>
+<summary>Windows 工具链（只有从源码编译才需要）</summary>
+
+<br>
+
+走上面那条命令的话这一段可以整段跳过——预编译包不需要任何工具链。
+
+真要自己编：
 
 ```
 winget install --id Rustlang.Rustup -e
 winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e
 rustup default stable-x86_64-pc-windows-gnu
+git clone https://github.com/gaolei8888/dc-terminal
+cd dc-terminal
+scripts\install.cmd -Build
 ```
 
 **不需要 Visual Studio Build Tools。** WinLibs 是一份解压即用的 mingw，装在用户目录里，
@@ -74,23 +121,12 @@ rustup default stable-x86_64-pc-windows-gnu
 已经有 MSVC Build Tools 的话，`rustup default stable-x86_64-pc-windows-msvc` 也行，
 那条路不需要 `as`。两条路都一样：依赖树里没有任何 C 要编——Windows 上 TLS 走系统自带的
 schannel，而不是 `rustls`，后者拖着 `ring`，`ring` 要 `lib.exe`。上面那套工具链自始至终
-只在汇编和链接 Rust 自己。
+只在汇编和链接 Rust 自己。发布用的包走的是 msvc 那条路。
 
-`git` 也装上（`winget install --id Git.Git -e`）。它不是编译依赖，是运行时依赖：
-每一轮对话之前的那次隐藏快照是 shell 出去调 `git` 做的，没有它撤销就是死的——而撤销正是
-`dct` 敢让 agent 关掉所有权限确认的全部理由。
-
-`scripts\install.cmd` 用 cargo 编译，把 `dct.exe` 装进 `%LOCALAPPDATA%\Programs\dct`，
-并把这个目录加进 `PATH`。`-InstallDir`、`-NoBuild`、`-NoPath` 都是透传的；不想走 `.cmd`
-那层就直接用 `scripts\install.ps1`。那个 `.cmd` 存在的唯一理由，是别让 PowerShell 默认的
-执行策略用一句跟 `dct` 毫无关系的报错把安装挡在门外。
-
-Unix 上 `install.sh` 会编译、装到 `~/.local/bin`（想换地方用 `--dir` 或者
-`DCT_INSTALL_DIR`），装完真的跑一次确认起得来。**别自己拿 `cp` 往装好的那个文件上覆盖。**
-macOS 上，守护进程还在执行这个文件的时候原地覆盖它，内核手里那份代码签名就此对不上，
-下次敲 `dct` 会在 exec 阶段被杀掉，终端里只留一行 `zsh: killed`——而 `codesign -v`
-还会说签名没问题，因为磁盘上那份确实没问题。`install.sh` 是先写新文件再 rename 覆盖，
-新二进制永远落在一个新 inode 上。
+`scripts\install.cmd` 那个 `.cmd` 存在的唯一理由，是别让 PowerShell 默认的执行策略用
+一句跟 `dct` 毫无关系的报错把安装挡在门外；顺带它还负责按 UTF-8 把 `install.ps1` 读进来，
+因为那个文件为了能被 `irm | iex` 吃下去不能带 BOM。不想走 `.cmd` 那层就直接用
+`scripts\install.ps1`。
 
 想用 WSL 也行：在发行版里跑 `scripts/install.sh`，跟 Linux 上是同一套；全新的 Ubuntu
 先跑一次 `scripts/install-wsl-deps.sh`，把 `cc`、`git`、Rust 补上——那些 `install.sh`

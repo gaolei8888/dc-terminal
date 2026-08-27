@@ -51,8 +51,18 @@
      `listEl.hidden = true` 之后列表照样铺在画面下面。这一条把它按回去。
      （这个 bug 是把页面真的打开看了一眼才发现的，DOM 里 hidden 明明是 true。） */
   [hidden] { display: none !important; }
+  /* **整页是一个应用外壳，不是一篇会滚的文档。**
+     头和底栏定死，中间那块自己滚——原来是 body 在滚、底栏靠 `sticky` 吊着，
+     画面一长就把底栏顶出视口，而输入框和那排虚拟键正是这一页最要紧的东西。
+     `100dvh` 而不是 `100vh`：手机浏览器的地址栏会伸缩，`vh` 认的是最大那一档，
+     于是底栏被挤到屏幕外面去。 */
+  html, body { height: 100%; }
   body {
     margin: 0;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     background: var(--bg);
     color: var(--ink);
     font: 16px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
@@ -60,7 +70,7 @@
     -webkit-font-smoothing: antialiased;
   }
   header {
-    position: sticky; top: 0;
+    flex: 0 0 auto;
     display: flex; align-items: center; gap: .5rem;
     padding: .8rem 1rem;
     background: var(--bg);
@@ -75,7 +85,8 @@
   header.stale .why { font-size: .8rem; font-weight: 400; margin-left: auto; }
   #dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--ok); }
   #dot.off { background: var(--bad); }
-  main { padding: .75rem; display: grid; gap: .6rem; }
+  /* 列表和画面都是"中间那块"：占满剩下的高度，自己滚。 */
+  main { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: .75rem; display: grid; gap: .6rem; align-content: start; }
   .card {
     background: var(--card);
     border: 1px solid var(--line);
@@ -105,7 +116,7 @@
 
   /* 会话画面。整块是一张固定宽度的画布——手机不改 PTY 尺寸（spec 决定四），
      所以这里靠字号把它缩到屏幕宽度，缩到看不清就让人自己捏放大。 */
-  #screen { position: relative; padding: .5rem; overflow: auto; }
+  #screen { flex: 1 1 auto; min-height: 0; position: relative; padding: .5rem; overflow: auto; }
   #screen pre {
     margin: 0;
     font-family: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace;
@@ -126,11 +137,21 @@
     font: inherit; font-size: 1.3rem; line-height: 1;
     color: var(--accent); cursor: pointer;
   }
+  .zoom {
+    background: none; border: 1px solid var(--line); border-radius: .35rem;
+    min-width: 2rem; min-height: 1.8rem;
+    font: inherit; font-size: .8rem; line-height: 1;
+    color: var(--ink); cursor: pointer;
+  }
+  .zoom:active { background: var(--line); }
+  #zooms { display: flex; gap: .3rem; margin-left: auto; }
+  header.stale .zoom { border-color: var(--bg); color: var(--bg); }
   #ruler { position: absolute; visibility: hidden; white-space: pre; }
 
   /* 输入区：贴在底边，软键盘弹起来时不会被盖住（`position: sticky` 跟着
      视觉视口走，而 `fixed` 在 iOS 上会被键盘顶到看不见的地方）。 */
-  #typing { position: sticky; bottom: 0; background: var(--bg); border-top: 1px solid var(--line); }
+  /* 底栏**不滚**：它是 flex 的最后一项，定高，永远贴在屏幕底边。 */
+  #typing { flex: 0 0 auto; background: var(--bg); border-top: 1px solid var(--line); }
   #keyrow {
     display: flex; gap: .3rem; overflow-x: auto;
     padding: .4rem .5rem; -webkit-overflow-scrolling: touch;
@@ -169,6 +190,10 @@
   <span id="dot"></span>
   <h1 id="title"></h1>
   <span id="why" class="why"></span>
+  <span id="zooms" hidden>
+    <button type="button" class="zoom" id="zoomout">A&minus;</button>
+    <button type="button" class="zoom" id="zoomin">A+</button>
+  </span>
 </header>
 <main id="list"></main>
 <div id="screen" hidden><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre><div id="cursor" hidden></div></div>
@@ -212,6 +237,7 @@
   var rulerEl = document.getElementById("ruler");
   var cursorEl = document.getElementById("cursor");
   var backEl = document.getElementById("back");
+  var zoomsEl = document.getElementById("zooms");
   var headEl = document.getElementById("head");
   var whyEl = document.getElementById("why");
   var typingEl = document.getElementById("typing");
@@ -382,21 +408,47 @@
     return cols;
   }
 
-  // 画布多宽就把字号调到多小，让一行**整行**放得进屏幕。
+  // 用户自己调过的倍数。1 = 完全按屏幕自动适配。
   //
-  // 手机不改 PTY 尺寸（spec 决定四：桌面是唯一有 resize 权的客户端），所以
-  // 一行就是一行，横着滚动去读一行终端输出等于没法读。缩到 6px 以下就不再缩了，
-  // 那时候已经不是"小"而是"看不见"——剩下的交给捏放大。
-  function fitFont(cols) {
-    if (!cols) { return; }
+  // 记在 localStorage 里：把字号调舒服是一次性的动作，每次打开都要重调一遍
+  // 的话，这个功能就等于没有。读写都包 try——隐私模式下 localStorage 会直接
+  // 抛异常，而"存不下偏好"绝不该让整页白屏。
+  var zoom = 1;
+  try {
+    var saved = parseFloat(localStorage.getItem("dct-zoom"));
+    if (saved > 0.3 && saved < 4) { zoom = saved; }
+  } catch (e) {}
+
+  function setZoom(z) {
+    zoom = Math.max(0.5, Math.min(3, z));
+    try { localStorage.setItem("dct-zoom", String(zoom)); } catch (e) {}
+    fitFont(lastCols, lastRows);
+    placeCursor(lastCursor, lastCursorHidden);
+  }
+
+  // 把整块画布**按宽和高一起**缩进屏幕里。
+  //
+  // 原来只按宽度算，于是竖屏上一行放得下、24 行却装不下——而画面是一整块
+  // 固定尺寸的画布（手机不改 PTY 尺寸，spec 决定四），少看的那几行就是
+  // agent 此刻正在写的那几行。两个方向各算一个上限，取小的那个。
+  //
+  // 6px 封底：再小不是"小"，是"看不见"。上限 28px 是给调大的人留的余地——
+  // 超出屏幕的部分由 `#screen` 自己滚（底栏不动，它在 flex 外面）。
+  var lastCols = 0, lastRows = 0, lastCursor = null, lastCursorHidden = true;
+
+  function fitFont(cols, rows) {
+    if (!cols || !rows) { return; }
     var probe = 16;
-    canvasEl.style.fontSize = probe + "px";
     rulerEl.style.fontSize = probe + "px";
     var per = rulerEl.getBoundingClientRect().width / 10;
     if (!per) { return; }
-    var avail = screenEl.clientWidth - 16;
-    var size = Math.floor((avail / (cols * per)) * probe);
-    canvasEl.style.fontSize = Math.max(6, Math.min(16, size)) + "px";
+
+    var padding = 16;
+    var byWidth = ((screenEl.clientWidth - padding) / (cols * per)) * probe;
+    // 行高是 1.2（见 `#screen pre` 的 CSS），高度这一侧要按它折算。
+    var byHeight = (screenEl.clientHeight - padding) / (rows * 1.2);
+    var size = Math.floor(Math.min(byWidth, byHeight) * zoom);
+    canvasEl.style.fontSize = Math.max(6, Math.min(28, size)) + "px";
   }
 
   function placeCursor(pos, hidden) {
@@ -415,8 +467,13 @@
   function drawScreen(resp) {
     if (!resp || !resp.Screen) { throw new Error("unexpected response"); }
     var s = resp.Screen;
-    var cols = paint(s.lines || []);
-    fitFont(cols);
+    var lines = s.lines || [];
+    var cols = paint(lines);
+    lastCols = cols;
+    lastRows = lines.length;
+    lastCursor = s.cursor;
+    lastCursorHidden = s.cursor_hidden;
+    fitFont(cols, lines.length);
     // `cursor_hidden` 为真时一定不画。agent 干活时把光标关掉，而那个坐标
     // 还在满屏乱跑——照着画就是一个到处蹦的方块（桌面端踩过这个坑）。
     placeCursor(s.cursor, s.cursor_hidden);
@@ -582,6 +639,7 @@
     screenEl.hidden = false;
     backEl.hidden = false;
     typingEl.hidden = false;
+    zoomsEl.hidden = false;
     if (info) {
       titleEl.textContent = id + " " + (info.tag && info.tag.trim() ? info.tag : info.profile);
     }
@@ -596,6 +654,7 @@
     cursorEl.hidden = true;
     listEl.hidden = false;
     backEl.hidden = true;
+    zoomsEl.hidden = true;
     titleEl.textContent = t("title");
     tick();
   }
@@ -679,6 +738,20 @@
 
   document.addEventListener("visibilitychange", tick);
 
+  // 转屏、软键盘弹起收起，可用高度都会变——不重算的话，横过来那一下
+  // 画面还按竖屏的字号画着，屏幕右边空一大块。
+  window.addEventListener("resize", function () {
+    fitFont(lastCols, lastRows);
+    placeCursor(lastCursor, lastCursorHidden);
+  });
+
+  document.getElementById("zoomout").addEventListener("click", function () {
+    setZoom(zoom / 1.15);
+  });
+  document.getElementById("zoomin").addEventListener("click", function () {
+    setZoom(zoom * 1.15);
+  });
+
   // 先取文案再取列表：文案空着的时候「还没有会话」会显示成一片空白，
   // 用户会以为页面坏了。取不到就用空表继续——结构照样在。
   api("/api/strings?lang=" + encodeURIComponent(navigator.language || ""))
@@ -687,6 +760,10 @@
     .then(function () {
       titleEl.textContent = t("title");
       document.title = t("title") || "dct";
+      // 图标按钮也要有名字：读屏软件念不出「A−」。
+      document.getElementById("zoomout").setAttribute("aria-label", t("smaller"));
+      document.getElementById("zoomin").setAttribute("aria-label", t("bigger"));
+      backEl.setAttribute("aria-label", t("back"));
       start();
     });
 })();

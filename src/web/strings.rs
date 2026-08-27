@@ -27,6 +27,8 @@ pub const NEEDED: &[(&str, Key)] = &[
     // 返回列表那个「‹」按钮的无障碍标签。**图标也要有名字**——读屏软件
     // 念不出一个箭头字符，而这一页是给手机用的，手机上读屏用户很多。
     ("back", Key::BackToListWord),
+    ("smaller", Key::TextSmaller),
+    ("bigger", Key::TextBigger),
     ("working", Key::StatusWorking),
     ("asking", Key::StatusAsking),
     ("idle", Key::StatusIdle),

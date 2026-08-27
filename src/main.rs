@@ -20,6 +20,7 @@ dct —— vibe coding 终端
   dct prune        把已经停掉的会话从列表里清掉
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面
+  dct --version    看装的是哪一版
   dct --help       看这段
 
 ps / stop / kill / prune 都不会拉起守护进程：问「有没有东西在跑」不该把
@@ -61,6 +62,13 @@ fn main() -> Result<()> {
         }
         Some("--help") | Some("-h") => {
             println!("{HELP}");
+            Ok(())
+        }
+        // 装好之后能问出「我装的是哪一版」，这是排查的第一句话。在这之前
+        // 唯一的答案是去翻安装日志——而一条 `curl | sh` 装完就没有日志了。
+        // 只印版本号一行，不印别的：这行会被人抄进聊天窗口发过来。
+        Some("--version") | Some("-V") => {
+            println!("dct {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some(other) => {

@@ -1,0 +1,103 @@
+# 打一个 v* 的 tag，出三个平台的预编译包。
+#
+# 这个 workflow 存在的理由只有一条：**学生不该为了装 dct 先装一套编译工具链。**
+# 在它之前，README 里的第一步是 `git clone` 加 `cargo build`，也就是 Rust、
+# git、外加 mac/Linux 上一套 C 工具链——几个 GB，而学生要的只是一个几 MB 的
+# 可执行文件。
+#
+# 产物的名字里**故意不带版本号**（`dct-x86_64-apple-darwin.tar.gz`，不是
+# `dct-0.2.2-...`）。GitHub 的 `releases/latest/download/<名字>` 只认死名字，
+# 名字里带了版本号，安装脚本就得先想办法问出「最新是哪一版」——那要么查
+# API（有速率限制，而且在墙内经常连不上），要么把版本写死在脚本里（每次发版
+# 要改两个地方，漏一个就装到旧版）。装完 `dct --version` 就能答，不必写在文件名上。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # 手动也能跑一次，用来在真发版之前确认三个平台都编得出来。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂掉不该把另外两个已经编好的也一起丢掉——发版时最想知道的
+      # 恰恰是「哪几个成了、哪个没成」。
+      fail-fast: false
+      matrix:
+        include:
+          # 挑 22.04 不是图新，是图 glibc 旧：runner 上编出来的二进制要求的
+          # glibc 不会低于编译它的那台机器。24.04（glibc 2.39）编出来的东西
+          # 在 Ubuntu 22.04 上直接起不来，报的还是一句跟 dct 无关的动态链接错误。
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          # Windows 上发的是 msvc 而不是本地开发用的 gnu。依赖树里一行 C 都
+          # 没有（TLS 走系统自带的 schannel，见 Cargo.toml），所以 runner 自带
+          # 的 MSVC 直接就能编；而 msvc 产物不牵扯任何 mingw 运行时 DLL，
+          # 一个 exe 拷到哪儿都跑得起来——这正是要发给学生的形状。
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - name: 编译
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 打包分两条是因为 Windows 上没有 tar 能靠得住的历史包袱，而 zip 在
+      # Unix 上会丢掉可执行位——那会让 `curl | sh` 装完的文件跑不起来。
+      # 各用各的：Unix 出 tar.gz（留住 755），Windows 出 zip（资源管理器认它）。
+      - name: 打包（Unix）
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf "dct-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" dct
+
+      - name: 打包（Windows）
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/dct.exe" -DestinationPath "dct-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dct-${{ matrix.target }}
+          path: dct-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    # 手动触发时只编不发：那时候根本没有 tag 可以挂 release。
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+
+      # 校验和跟包一起发。安装脚本会下这个文件并比对——没有它，
+      # 「下到一半断了」和「下到一个被人换过的文件」在脚本眼里长得一模一样。
+      - name: 算 SHA256SUMS
+        working-directory: staging
+        run: sha256sum dct-* > SHA256SUMS
+
+      - name: 发 release
+        working-directory: staging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes dct-* SHA256SUMS

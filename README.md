@@ -34,39 +34,95 @@ project `n` opens in.
 
 ## Install
 
-You need **Rust 1.80+** and **git**. On macOS and Linux you also need a C
-toolchain (Xcode command line tools, or `build-essential`), because the TLS
-stack compiles some C.
-
 **macOS · Linux**
 
 ```sh
-git clone https://github.com/gaolei8888/dc-terminal
-cd dc-terminal
-./scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts/install.sh | sh
 ```
 
-**Windows** — native, no WSL. From PowerShell or `cmd`:
+**Windows** — native, no WSL. From PowerShell:
 
 ```
-git clone https://github.com/gaolei8888/dc-terminal
-cd dc-terminal
-scripts\install.cmd
+irm https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts/install.ps1 | iex
 ```
 
-Then run `dct` inside any git project.
+What comes down is a single executable of a few megabytes. **No Rust, no
+compiler, no waiting for a build.** Open a fresh terminal window afterwards,
+step into any folder, and run `dct`.
+
+Before every turn `dct` takes a hidden snapshot of your project, and it takes it
+with `git` — without git, undo is dead, and undo is the whole reason `dct` dares
+run agents with permission prompts off. So on Windows, if the machine has no git
+yet, the installer fetches a portable one for you (45 MB, unpacked in place,
+living entirely inside `dct`'s own directory: it writes no registry keys and
+touches nothing already on the system). macOS and Linux usually have git
+already; when they don't, the installer names the one command to run.
 
 <details>
-<summary>Windows toolchain, and why <code>install.sh</code> rather than <code>cp</code></summary>
+<summary>When the classroom network can't reach GitHub</summary>
 
 <br>
 
-Two things to install first:
+Put the release archives and `SHA256SUMS` anywhere your students can reach,
+then have them set one environment variable first. **Their install command
+stays exactly the same**, and checksums are still verified.
+
+```sh
+export DCT_RELEASE_BASE=https://your.host/dct
+curl -fsSL https://your.host/install.sh | sh
+```
+
+```
+$env:DCT_RELEASE_BASE = 'https://your.host/dct'
+irm https://your.host/install.ps1 | iex
+```
+
+The portable git on Windows works the same way, through `DCT_MINGIT_URL`.
+
+</details>
+
+<details>
+<summary>Installing elsewhere, and why not <code>cp</code></summary>
+
+<br>
+
+On Unix it lands in `~/.local/bin` by default; `--dir` or `DCT_INSTALL_DIR`
+moves it. On Windows the default is `%LOCALAPPDATA%\Programs\dct`, changed with
+`-InstallDir`. `--build` / `-Build` skips the download and compiles from source
+(you need a checkout for that); `-NoPath` and `-NoGit` skip touching PATH and
+skip the portable git.
+
+**Don't `cp` over an installed binary.** On macOS, overwriting the file in place
+while the daemon is still executing it leaves the kernel's cached code signature
+pointing at content that no longer matches, and the next `dct` is killed during
+exec — the terminal shows one line, `zsh: killed`. `codesign -v` will still call
+the signature valid, because the copy on disk is. The installers write a new
+file and rename it over the old one, so a new binary always lands on a fresh
+inode. Windows is the same problem wearing different clothes: there you may not
+write an image that is currently executing, so the installer renames the old one
+out of the way and moves the new one in.
+
+`dct --version` says which one you ended up with.
+
+</details>
+
+<details>
+<summary>Windows toolchain (only if you build from source)</summary>
+
+<br>
+
+Skip this whole section if you used the command above — a prebuilt binary needs
+no toolchain at all.
+
+If you really want to build it yourself:
 
 ```
 winget install --id Rustlang.Rustup -e
 winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e
 rustup default stable-x86_64-pc-windows-gnu
+git clone https://github.com/gaolei8888/dc-terminal
+cd dc-terminal
+scripts\install.cmd -Build
 ```
 
 **No Visual Studio Build Tools required.** WinLibs is a mingw you unpack into
@@ -79,34 +135,18 @@ installer checks for this before it starts compiling and says what to install.
 If you already have the MSVC Build Tools, `rustup default
 stable-x86_64-pc-windows-msvc` works too and needs no `as`. Either way nothing in
 the dependency tree compiles C: on Windows the TLS goes through the system's own
-schannel rather than `rustls`, which drags in `ring`, which wants `lib.exe` — so
-the toolchain above is only ever assembling and linking Rust.
+schannel rather than `rustls`, which drags in `ring`, which wants `lib.exe`. The
+released binaries take the msvc road.
 
-Install `git` too (`winget install --id Git.Git -e`). It isn't a build
-dependency, it's a runtime one: the snapshot before every turn shells out to
-`git`, and without it undo is dead — and undo is the whole reason `dct` dares run
-agents with permission prompts off.
+`scripts\install.cmd` exists so that PowerShell's default execution policy can't
+stop the install with an error that has nothing to do with `dct`; it also reads
+`install.ps1` as UTF-8 on your behalf, because that file carries no byte order
+mark — it has to survive being piped through `irm ... | iex`. Use
+`scripts\install.ps1` directly if you'd rather skip the `.cmd` layer.
 
-`scripts\install.cmd` builds with cargo, installs `dct.exe` into
-`%LOCALAPPDATA%\Programs\dct`, and puts that directory on your `PATH`.
-`-InstallDir`, `-NoBuild` and `-NoPath` pass through; `scripts\install.ps1` takes
-them directly if you'd rather skip the `.cmd` wrapper (it exists so that
-PowerShell's default execution policy can't stop the install with an error that
-has nothing to do with `dct`).
-
-On Unix, `install.sh` builds, installs to `~/.local/bin` (`--dir` or
-`DCT_INSTALL_DIR` to put it elsewhere), and runs the result once to prove it
-starts. **Use it rather than copying the binary over an installed one yourself.**
-On macOS, overwriting the file in place while the daemon is still executing it
-leaves the kernel holding a stale code signature for that inode, and the next
-`dct` you type dies at `exec` with nothing but `zsh: killed` to show for it —
-`codesign -v` will insist the signature is fine, because the copy on disk is.
-`install.sh` writes a new file and renames it over the old one, so the new binary
-always gets a fresh inode.
-
-Prefer WSL? `scripts/install.sh` inside the distribution is the same install as
-on Linux. On a fresh Ubuntu, run `scripts/install-wsl-deps.sh` first for the
-`cc`, `git` and Rust that `install.sh` deliberately does not install itself.
+WSL works too: run `scripts/install.sh` inside the distribution, exactly as on
+Linux. On a fresh Ubuntu, run `scripts/install-wsl-deps.sh` first — it adds
+`cc`, `git` and Rust, which `install.sh` does not install for you.
 
 </details>
 

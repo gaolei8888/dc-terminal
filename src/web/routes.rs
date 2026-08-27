@@ -790,6 +790,80 @@ mod tests {
         }
     }
 
+    /// **底栏不许跟着内容滚。**
+    ///
+    /// 输入框和那排虚拟键是这一页最要紧的东西，画面一长就被顶出视口的话，
+    /// 用户要先滚回去才能打字——而他多半以为是页面坏了。做法是整页一个
+    /// flex 外壳：头和底栏定高，中间那块自己滚。原来那版用的是
+    /// `position: sticky`，在 body 自己滚的布局里它救不了底栏。
+    ///
+    /// 这条守卫查的是"外壳还在不在"。改布局的人会撞到它——那正是目的：
+    /// 撞到之后回来读这段话，而不是发现手机上底栏又跑了。
+    #[test]
+    fn the_footer_never_scrolls_away_with_the_content() {
+        let code = page_without_comments();
+        assert!(
+            code.contains("100dvh"),
+            "外壳没有按视口高度撑开——手机地址栏一伸缩，底栏就掉到屏幕外面"
+        );
+        assert!(
+            code.contains("#typing { flex: 0 0 auto"),
+            "底栏不再是 flex 里定高的那一项了"
+        );
+        assert!(
+            !code.contains("#typing { position: sticky"),
+            "底栏又回到 sticky 了——在 body 自己滚的布局里它吊不住"
+        );
+    }
+
+    /// **画面按宽和高一起适配。**
+    ///
+    /// 只按宽度算的话，竖屏上一行放得下、24 行却装不下——而少看的那几行
+    /// 正是 agent 此刻在写的那几行。画面是一整块固定尺寸的画布（手机不改
+    /// PTY 尺寸），所以两个方向各算一个上限、取小的那个。
+    #[test]
+    fn the_screen_is_fitted_by_height_as_well_as_width() {
+        let code = page_without_comments();
+        assert!(
+            code.contains("Math.min(byWidth, byHeight)"),
+            "又变回只按宽度适配了"
+        );
+    }
+
+    /// 用户调过的字号要活过一次关页面。每次打开都要重调一遍的话，
+    /// 这个功能等于没有。
+    #[test]
+    fn the_chosen_text_size_is_remembered() {
+        let code = page_without_comments();
+        assert!(
+            code.contains("localStorage.setItem(\"dct-zoom\""),
+            "字号不落盘了"
+        );
+        assert!(
+            code.contains("catch"),
+            "localStorage 没包 try——隐私模式下它会抛异常，而那不该让整页白屏"
+        );
+    }
+
+    /// **图标按钮也要有名字。** 读屏软件念不出「A−」和「‹」，而这一页是
+    /// 给手机用的，手机上读屏用户很多。名字跟别的文案一样从文案表来。
+    #[test]
+    fn the_icon_buttons_have_names_for_a_screen_reader() {
+        let code = page_without_comments();
+        for (id, key) in [("zoomout", "smaller"), ("zoomin", "bigger")] {
+            assert!(
+                code.contains(&format!(
+                    "document.getElementById(\"{id}\").setAttribute(\"aria-label\", t(\"{key}\"))"
+                )),
+                "{id} 没有无障碍名字"
+            );
+        }
+        assert!(
+            code.contains("backEl.setAttribute(\"aria-label\", t(\"back\"))"),
+            "返回键没有无障碍名字"
+        );
+    }
+
     #[test]
     fn an_unknown_path_is_a_404_whatever_the_method() {
         let (r, fake) = routes(Response::Ok);
