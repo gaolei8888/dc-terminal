@@ -15,6 +15,7 @@ pub mod projects;
 pub mod proto;
 pub mod pty;
 pub mod qr;
+pub mod runtime;
 pub mod secrets;
 pub mod session;
 pub mod settings;

@@ -79,6 +79,18 @@ irm https://your.host/install.ps1 | iex
 
 The portable git on Windows works the same way, through `DCT_MINGIT_URL`.
 
+One more download happens later, when `dct` fetches the Node runtime the agents need. Both of
+those have mirrors laid out exactly like the originals, so two environment variables move them:
+
+```sh
+export DCT_NODE_BASE=https://npmmirror.com/mirrors/node
+export DCT_NPM_REGISTRY=https://registry.npmmirror.com
+```
+
+Two variables rather than one "mirror mode" switch, because they fail separately — a mirror may
+carry only one of them, and then you want to move only that half. When a download does fail,
+`dct` prints these two lines for you.
+
 </details>
 
 <details>
@@ -221,7 +233,10 @@ Press `N` and you get all nine, **including the ones that don't work on this
 machine**. Those are greyed out with the reason, and picking one takes you toward
 fixing it instead of just saying no:
 
-- not installed → `dct` opens a session running the installer, so you watch it work
+- not installed → `dct` opens a session and installs it, so you watch it work. **A machine
+  with no Node.js is fine** — those agents come from npm, so `dct` first fetches a Node of
+  its own into `~/.dct/runtime`, for its own use only: it never joins your system `PATH`
+  and never touches a Node you already have
 - no key → a box to paste into, with a link to wherever you get one (`Ctrl+O` opens it)
 - keys get checked against the real endpoint before they're saved, so paste half
   a key and you find out immediately, not ten seconds later inside a session full

@@ -38,6 +38,16 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 两个平台上各能挡住什么，写在 `sys::ipc::bind_private`。
     let listener = crate::sys::ipc::bind_private(socket)?;
 
+    // 把 dct 自带的那份 Node 挂到**这个进程**的 PATH 上，第一件事就做。
+    //
+    // 必须是这里，不能是别处：仓库里已经定过「可用性判定放在守护进程里
+    // 算，因为守护进程的 PATH 才是子进程真正会拿到的那个」（见
+    // `profile.rs::command_exists`）。同一条路的另一半就是这一句——
+    // 自带运行时里装的 agent，只有在守护进程自己看得见它的时候，才会
+    // 既在菜单上显示成「可用」，又真的启动得起来。放在 `bind_private`
+    // 之后是因为那一句才是「我确实是那个守护进程」的分界线。
+    crate::runtime::activate(&crate::runtime::runtime_dir_for_socket(socket));
+
     // 存放位置跟着 socket 走，测试把 socket 放临时目录就自动隔离，
     // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml / ~/.dct/profiles/。
     let store = Arc::new(Mutex::new(Store::load(&store_path_for_socket(socket))));
@@ -569,8 +579,17 @@ fn handle(
                             hint: s.hint.get(lang).unwrap_or("").to_string(),
                             url: s.url.clone(),
                         }),
+                        // 发给界面的是 `dct install <名字>`，不是 profile 里
+                        // 那条 `npm i -g …`。界面会把这一行敲进一个 shell
+                        // 会话，而一台只装了 dct 的电脑上没有 npm——原样发
+                        // 过去，学生看到的第一句话就是「npm 不是内部或外部
+                        // 命令」。`dct install` 那条路会先把运行时补上，
+                        // 而且全程说人话（见 `cli::run_install`）。
+                        //
+                        // profile 里的 `[install].command` 仍然是唯一的事实
+                        // 来源，只是由 `dct install` 去读它，不再由界面转发。
                         install: p.install.as_ref().map(|i| InstallPrompt {
-                            command: i.command.clone(),
+                            command: vec!["dct".to_string(), "install".to_string(), p.name.clone()],
                             note: i.note.get(lang).unwrap_or("").to_string(),
                         }),
                         has_secret,

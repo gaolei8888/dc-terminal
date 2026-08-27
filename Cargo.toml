@@ -25,6 +25,10 @@ libc = "0.2.189"
 # getrandom 只包一层各平台的系统调用，没有 C，也没有别的依赖。
 getrandom = "0.2"
 qrcode = { version = "0.14.1", default-features = false }
+# 校验下载回来的 Node 运行时。纯 Rust，默认特性不带 asm 也不带 C——
+# 「整棵依赖树里一行 C 都没有」这条性质是 Windows 上不用装 Visual Studio
+# Build Tools 的全部理由，不能为了一个哈希把它丢掉。
+sha2 = "0.10"
 
 [dev-dependencies]
 rqrr = "0.10.1"

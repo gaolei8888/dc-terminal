@@ -1606,6 +1606,150 @@ pub mod msg {
     pub fn title_with(lang: Lang, main: Key, extra: &str) -> String {
         format!("{}（{extra}）", text(main, lang))
     }
+
+    // ── `dct install`：自带运行时和装 agent 那条路上说的话 ──────────────
+    //
+    // 这一整组的读者是一个刚装完 dct、还没写过一行代码的学生。所以：
+    // 不出现「运行时」「依赖」「注册表」这类词，不印任何原始报错，
+    // 每一句话要么在报告进度，要么给出他此刻做得到的下一步。
+
+    /// 开始下 Node 之前说一句。**说出体积**——几十 MB 在教室的网里可能要
+    /// 几分钟，不说的话学生会以为卡死了，然后按 Ctrl+C。
+    pub fn node_fetching(lang: Lang, version: &str) -> String {
+        t!(
+            lang,
+            en: format!("Fetching the runtime the agents need (Node {version}, about 50 MB). This can take a few minutes."),
+            zh: format!("正在下载 agent 要用的运行时（Node {version}，大约 50 MB），网慢的话要几分钟。"),
+        )
+    }
+
+    pub fn node_ready(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Runtime ready.",
+            zh: "运行时准备好了。",
+        )
+        .to_string()
+    }
+
+    /// 下不到。**印出地址**：学生答不上「你连的是哪儿」，而老师一眼就能
+    /// 看出他是不是漏设了镜像。
+    pub fn download_unreachable(lang: Lang, url: &str) -> String {
+        t!(
+            lang,
+            en: format!("Could not download from {url} — the network could not reach it."),
+            zh: format!("下不到东西：{url} 连不上。"),
+        )
+    }
+
+    pub fn download_corrupt(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "What came down does not match the official checksum, so dct did not install it. This is usually a download cut short — run the same command again.",
+            zh: "下回来的文件跟官方校验和对不上，没有装它。多半是下到一半断了，把刚才那条命令再跑一次。",
+        )
+        .to_string()
+    }
+
+    pub fn no_node_for_platform(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "There is no ready-made runtime for this kind of computer. Install Node.js yourself from nodejs.org, then try again.",
+            zh: "这种电脑没有现成的运行时可下。自己去 nodejs.org 装一个 Node.js，再回来试一次。",
+        )
+        .to_string()
+    }
+
+    pub fn cannot_unpack(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "The runtime came down but could not be unpacked. Run the same command again; if it keeps happening, tell whoever set this up.",
+            zh: "运行时下回来了，但解不开。把刚才那条命令再跑一次；一直这样就告诉给你装这套东西的人。",
+        )
+        .to_string()
+    }
+
+    pub fn cannot_write_runtime(lang: Lang, dir: &str) -> String {
+        t!(
+            lang,
+            en: format!("dct could not write to {dir}. Check the disk is not full and that you can write there."),
+            zh: format!("写不进 {dir}。看一眼硬盘是不是满了，以及你有没有权限往那儿写。"),
+        )
+    }
+
+    /// 网络这一类的失败之后补的一句。**把两个地址原样印出来**，让老师
+    /// 抄一行给学生，而不是让学生拿着「换个镜像」四个字去搜。
+    pub fn mirror_hint(lang: Lang, node_base: &str, registry: &str) -> String {
+        t!(
+            lang,
+            en: format!(
+                "If you are on a network that cannot reach the usual sources, set these two first and run it again:\n    DCT_NODE_BASE={node_base}\n    DCT_NPM_REGISTRY={registry}"
+            ),
+            zh: format!(
+                "如果你这儿连不上默认的下载源，先设这两个再跑一遍：\n    DCT_NODE_BASE={node_base}\n    DCT_NPM_REGISTRY={registry}"
+            ),
+        )
+    }
+
+    pub fn installing_agent(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("Installing {label}."),
+            zh: format!("正在安装 {label}。"),
+        )
+    }
+
+    /// 装完了，而且**真的去查了一遍**那个命令现在找得到——「npm 说成功了」
+    /// 和「敲得出这个命令了」不是同一件事。
+    pub fn install_succeeded(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("{label} is installed. Press Esc to go back to the board, then N to start it."),
+            zh: format!("{label} 装好了。按 Esc 回看板，再按 N 就能开它。"),
+        )
+    }
+
+    /// npm 说它成功了，但那个命令还是找不到。这不是理论情况：npm 装到
+    /// 别的 prefix 去、或者包本身没带 bin，都会长成这样。
+    pub fn install_finished_but_missing(lang: Lang, command: &str) -> String {
+        t!(
+            lang,
+            en: format!("The install finished without complaining, but `{command}` still is not there. Tell whoever set this up — this one is not something you can fix from here."),
+            zh: format!("安装过程没报错，但 `{command}` 还是不在。这一条你自己修不了，告诉给你装这套东西的人。"),
+        )
+    }
+
+    pub fn install_failed(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("Could not install {label}. The lines above are what the installer itself said."),
+            zh: format!("{label} 没装成。上面那几行是安装程序自己说的话。"),
+        )
+    }
+
+    pub fn unknown_agent(lang: Lang, name: &str) -> String {
+        t!(
+            lang,
+            en: format!("dct does not know an agent called `{name}`."),
+            zh: format!("dct 不认识一个叫 `{name}` 的 agent。"),
+        )
+    }
+
+    pub fn agent_has_no_installer(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("{label} has no install command of its own, so dct cannot install it for you."),
+            zh: format!("{label} 没有配安装命令，dct 没法替你装它。"),
+        )
+    }
+
+    pub fn agent_already_installed(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("{label} is already installed."),
+            zh: format!("{label} 已经装好了。"),
+        )
+    }
 }
 
 #[cfg(test)]

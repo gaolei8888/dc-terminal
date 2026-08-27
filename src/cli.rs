@@ -353,6 +353,195 @@ pub fn llm_check(lang: Lang) -> i32 {
     }
 }
 
+/// 把下载进度印在终端上。**百分比压在同一行**：这条命令是在一个 PTY
+/// 会话里跑给学生看的，一行一个百分比会把几十屏刷过去，而他真正要看的
+/// 是这一行之前和之后的那两句话。
+#[derive(Default)]
+struct TermProgress {
+    /// 上一次印出去的百分比。
+    ///
+    /// 不记这个的话，每收一块（64 KB）就印一次——50 MB 就是八百多次。
+    /// 在终端里靠 `\r` 盖掉还看得过去，但这条命令的输出会被重定向
+    /// （日志、抓屏工具、`dct install claude > out.txt`），那时候 `\r`
+    /// 不再是「回到行首」，八百个百分比会原样堆成几十 KB。只在整数
+    /// 百分比真的变了的时候印，上限一百次。
+    last: std::cell::Cell<u64>,
+}
+
+impl crate::runtime::Progress for TermProgress {
+    fn line(&self, text: &str) {
+        println!("{text}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    fn percent(&self, done: u64, total: Option<u64>) {
+        // 对面没给 Content-Length 时不要编一个百分比出来，改报已下多少。
+        // 编一个假的进度条比承认不知道更糟——那条永远走不到头的进度条
+        // 会让人一直等下去。
+        let (step, unit) = match total {
+            Some(t) if t > 0 => (done * 100 / t, "%"),
+            // 对面没给 Content-Length 时按 MB 报，每涨一 MB 说一次。
+            _ => (done / (1024 * 1024), " MB"),
+        };
+        if step == self.last.get() {
+            return;
+        }
+        self.last.set(step);
+        print!("\r  {step}{unit}   ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    fn done(&self) {
+        println!();
+    }
+}
+
+/// 把 `FetchError` 翻成一句给人看的话。
+///
+/// 网络类的失败后面补一句镜像提示：那是这类失败里唯一一条学生自己走得通
+/// 的路，而它需要两个他不可能猜到的地址。校验和对不上和磁盘写不进不补，
+/// 换镜像对那两种情况没有帮助，多印一段只会让人往错的方向使劲。
+fn fetch_problem(lang: Lang, e: &crate::runtime::FetchError) -> String {
+    use crate::runtime::FetchError as F;
+    let hint = || {
+        crate::i18n::msg::mirror_hint(
+            lang,
+            crate::runtime::CN_NODE_BASE,
+            crate::runtime::CN_NPM_REGISTRY,
+        )
+    };
+    match e {
+        F::Unreachable { url } => format!(
+            "{}
+
+{}",
+            crate::i18n::msg::download_unreachable(lang, url),
+            hint()
+        ),
+        F::Corrupt => crate::i18n::msg::download_corrupt(lang),
+        F::NoAssetForPlatform => crate::i18n::msg::no_node_for_platform(lang),
+        F::CannotUnpack => crate::i18n::msg::cannot_unpack(lang),
+        F::CannotWrite => crate::i18n::msg::cannot_write_runtime(lang, "~/.dct"),
+    }
+}
+
+/// npm 该去哪个仓库拿包。国内课堂设 `DCT_NPM_REGISTRY`，别处不设就是官方。
+///
+/// 跟 `DCT_NODE_BASE` 分成两个变量而不是一个「中国模式」开关：这两件事
+/// 会分别失效（镜像站可能只镜像了其中一样），而一个开关同时管两样的话，
+/// 出问题时没法只换一半。
+fn npm_registry() -> Option<String> {
+    std::env::var("DCT_NPM_REGISTRY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `dct install <agent>`：把一个 agent 装到能用为止。
+///
+/// **这条命令存在的理由，是把「学生看到的第一句英文报错」换掉。** 在它
+/// 之前，选中一个没装的 agent 会在一个 shell 会话里跑 `npm i -g …`，
+/// 而一台只装了 dct 的电脑上没有 npm，于是学生得到的是
+/// 「npm 不是内部或外部命令」——一句操作系统的原话，既不说缺什么，
+/// 也不说下一步该干嘛。
+///
+/// 现在这一行由 dct 自己走完：缺运行时就先下一份自带的，再装 agent，
+/// **最后真的再查一遍那个命令是不是找得到了**。最后这一步不能省：
+/// 「npm 说成功了」和「敲得出这个命令了」不是同一件事——npm 装到别的
+/// prefix 去、或者包本身没带 bin，都会长成「成功但没有」。
+pub fn run_install(name: &str, lang: Lang) -> i32 {
+    let socket = crate::proto::socket_path();
+    let runtime = crate::runtime::runtime_dir_for_socket(&socket);
+    let profiles_dir = crate::profile::profiles_dir_for_socket(&socket);
+    let (custom, _) = crate::profile::all_profiles(&profiles_dir);
+
+    let Some(p) = custom
+        .iter()
+        .find(|p| p.name == name)
+        .cloned()
+        .or_else(|| crate::profile::Profile::builtin(name))
+    else {
+        eprintln!("{}", crate::i18n::msg::unknown_agent(lang, name));
+        return 2;
+    };
+
+    // 先把自带的运行时挂上，再问任何「装没装」的问题。顺序反了的话，
+    // 上一次装好的 agent 会被报成没装——它就在自带运行时那个目录里。
+    crate::runtime::activate(&runtime);
+
+    let label = p.display_label(lang);
+    let Some(cmd0) = p.command.first().cloned() else {
+        eprintln!("{}", crate::i18n::msg::agent_has_no_installer(lang, &label));
+        return 1;
+    };
+
+    if crate::profile::command_exists(&cmd0) {
+        println!(
+            "{}",
+            crate::i18n::msg::agent_already_installed(lang, &label)
+        );
+        return 0;
+    }
+
+    let Some(spec) = p.install.clone() else {
+        eprintln!("{}", crate::i18n::msg::agent_has_no_installer(lang, &label));
+        return 1;
+    };
+
+    let mut argv = spec.command.clone();
+    if argv.is_empty() {
+        eprintln!("{}", crate::i18n::msg::agent_has_no_installer(lang, &label));
+        return 1;
+    }
+
+    // 只有 npm 那条路要运行时。将来有人写一个 `[install]` 跑别的东西
+    // （brew、pip、winget），不该被拖去下一份 Node。
+    let uses_npm = argv[0] == "npm" || argv[0] == "npx";
+    if uses_npm && !crate::profile::command_exists("npm") {
+        if let Err(e) = crate::runtime::ensure_node(&runtime, lang, &TermProgress::default()) {
+            eprintln!("{}", fetch_problem(lang, &e));
+            return 1;
+        }
+        println!("{}", crate::i18n::msg::node_ready(lang));
+    }
+
+    if uses_npm {
+        if let Some(reg) = npm_registry() {
+            argv.push("--registry".into());
+            argv.push(reg);
+        }
+    }
+
+    println!("{}", crate::i18n::msg::installing_agent(lang, &label));
+
+    // Windows 上 npm 装出来的是 `.cmd`，而 CreateProcess 只启动真正的
+    // 可执行映像——`launch_argv` 就是为这件事存在的（见 `sys::shell`）。
+    let argv = crate::sys::shell::launch_argv(&argv);
+    let ran = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status();
+
+    match ran {
+        Ok(st) if st.success() => {}
+        _ => {
+            eprintln!("{}", crate::i18n::msg::install_failed(lang, &label));
+            return 1;
+        }
+    }
+
+    // 装完再查一遍。见函数头注释：这一步是这条命令跟直接敲 npm 的全部差别。
+    if crate::profile::command_exists(&cmd0) {
+        println!("{}", crate::i18n::msg::install_succeeded(lang, &label));
+        0
+    } else {
+        eprintln!(
+            "{}",
+            crate::i18n::msg::install_finished_but_missing(lang, &cmd0)
+        );
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

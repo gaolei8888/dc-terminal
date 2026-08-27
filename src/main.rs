@@ -18,6 +18,8 @@ dct —— vibe coding 终端
   dct kill <会话号> 强制杀掉，不给它收尾的时间；可以给多个
   dct kill --all   强制杀掉全部会话
   dct prune        把已经停掉的会话从列表里清掉
+  dct install <名字> 装一个 agent（claude / codex / qwen / opencode）。
+                   缺 Node 运行时会自己补上一份，只给 dct 自己用
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面
   dct --version    看装的是哪一版
@@ -55,6 +57,16 @@ fn main() -> Result<()> {
         }
         // prune 不接参数：它只对已经停了的会话下手，那批东西不可能被误伤。
         Some("prune") => dct::cli::run_prune(&socket_path(), cli_lang()),
+        // `install` 也不连守护进程：它装的是磁盘上的东西，跟有没有会话
+        // 在跑无关。界面开一个 shell 会话把这一行敲进去，学生因此看得见
+        // 整个过程——那正是这条命令要给他的东西。
+        Some("install") => match args.get(1) {
+            Some(name) => std::process::exit(dct::cli::run_install(name, cli_lang())),
+            None => {
+                eprintln!("要装哪个？比如：dct install claude");
+                std::process::exit(2)
+            }
+        },
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
         // 通路，跟会话、pty 都无关。
         Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
