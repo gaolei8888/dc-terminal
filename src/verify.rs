@@ -23,7 +23,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// `send_probe` 本身不能被测试调用（会打真网络），但构建 `Agent` 这一步
 /// 不涉及任何 I/O。
 fn build_probe_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    crate::sys::tls::agent_builder()
         .timeout(PROBE_TIMEOUT)
         .timeout_connect(PROBE_TIMEOUT)
         .build()

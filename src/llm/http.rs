@@ -130,7 +130,7 @@ impl Backend for HttpBackend {
 /// `verify.rs` 的 `build_probe_agent`：`send_real` 本身不能被测试调用
 /// （会打真网络），但构建 `Agent` 这一步不涉及任何 I/O。
 fn build_http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    crate::sys::tls::agent_builder()
         .timeout(HTTP_TIMEOUT)
         .timeout_connect(HTTP_TIMEOUT)
         .build()

@@ -129,7 +129,7 @@ fn timeout_from_url(url: &str) -> Duration {
 /// 真实传输。**没有单元测试覆盖**，走注入的 `Send` 那条缝才能测。
 fn send_real(url: &str, body: &str) -> Result<String, String> {
     let t = timeout_from_url(url);
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::sys::tls::agent_builder()
         .timeout(t)
         .timeout_connect(t)
         .build();

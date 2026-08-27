@@ -19,6 +19,7 @@ pub mod proc;
 pub mod shell;
 pub mod signal;
 pub mod term;
+pub mod tls;
 
 /// 测试夹具专用，见那个文件的头。产品代码不编译它。
 #[cfg(test)]

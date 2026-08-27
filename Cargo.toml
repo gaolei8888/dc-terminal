@@ -30,9 +30,16 @@ qrcode = { version = "0.14.1", default-features = false }
 rqrr = "0.10.1"
 tempfile = "3"
 
-# TLS 后端按平台分叉，这是唯一的分叉点——ureq 在只开 native-tls
-# 时会自己挑它做默认（ureq-2.12.1 lib.rs:415→ntls.rs:9），所以三处
-# AgentBuilder 一行都不用改。
+# TLS 后端按平台分叉。
+#
+# **这里曾经写着「ureq 在只开 native-tls 时会自己挑它做默认，所以三处
+# AgentBuilder 一行都不用改」——那句话是反的**，而且反得很贵：Windows 上
+# 每一次 HTTPS 请求都失败，报 `no TLS backend is configured`，而密钥验证、
+# 会话起名、手机通知这三条路全都零测试覆盖（测试不碰网络），于是这个 bug
+# 一直没人撞见。ureq 自己的注释写在 lib.rs:401：native-tls「must be
+# configured via the AgentBuilder，it is never picked up as a default」。
+# 现在所有 agent 都从 `sys::tls::agent_builder()` 出来，那里显式装后端，
+# 别再在别处 `ureq::AgentBuilder::new()`。
 #
 # Unix 留 rustls。Windows 换 schannel 不是因为它更好，是因为 rustls 拖
 # 着 ring，而 ring 要 lib.exe——那东西只在 Visual Studio Build Tools 里，
