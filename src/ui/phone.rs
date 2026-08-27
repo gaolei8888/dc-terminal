@@ -340,6 +340,14 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         if let Some(step) = web_next_step(&app.web, app.lang) {
             lines.push(Line::from(Span::styled(step, super::dim())));
         }
+        // 还没打开的时候，把「系统会弹一个授权框」写在按下去**之前**。
+        // 开着之后就不再说了：那时候他已经点过了，再提一遍是噪音。
+        if !app.web.on {
+            lines.push(Line::from(Span::styled(
+                text(Key::WebFirewall, app.lang),
+                super::dim(),
+            )));
+        }
         if let Some(url) = &app.web.url {
             lines.push(Line::from(""));
             // 屏幕上写到端口为止，令牌只进码里（`address_for_display`）。
@@ -635,6 +643,52 @@ mod tests {
     /// 断言用的：跟 `screen_of` 一样把空白滤掉再比。
     fn squeeze(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// **打开之前就得说清楚系统会拦一下。**
+    ///
+    /// 第一次绑到所有网卡上时，Windows 和 macOS 都会弹一个授权框，而系统在
+    /// 有人点它之前把那次调用按住。不知情的用户点了「取消」，之后只会看到
+    /// 手机连不上，而屏幕上没有任何东西解释为什么——这正是「错误信息不给出
+    /// 下一步就是没写完」那条房规要防的形状，只不过这一次要在**出错之前**说。
+    #[test]
+    fn the_firewall_prompt_is_explained_before_it_appears() {
+        let (mut app, _dir) = App::test_app();
+        app.view = phone_view(PhoneState::Off);
+        app.web = WebInfo {
+            on: false,
+            url: None,
+            address_unknown: false,
+        };
+
+        let screen = screen_of(&mut app, 80, 40);
+
+        assert!(
+            screen.contains(&squeeze(text(Key::WebFirewall, app.lang))),
+            "还没打开的时候没讲防火墙那一下：
+{screen}"
+        );
+    }
+
+    /// 开着之后就不再提防火墙了：那时候他已经点过那个框，再说一遍是噪音，
+    /// 而这一页最值钱的是二维码上面那几行。
+    #[test]
+    fn the_firewall_line_goes_away_once_it_is_on() {
+        let (mut app, _dir) = App::test_app();
+        app.view = phone_view(PhoneState::Off);
+        app.web = WebInfo {
+            on: true,
+            url: Some("http://192.168.1.5:53412/#t=deadbeefcafe".into()),
+            address_unknown: false,
+        };
+
+        let screen = screen_of(&mut app, 80, 40);
+
+        assert!(
+            !screen.contains(&squeeze(text(Key::WebFirewall, app.lang))),
+            "开着之后还在讲防火墙：
+{screen}"
+        );
     }
 
     /// 开着的时候，这一页得让人能用上它：**局域网那一节要露面**，地址要在

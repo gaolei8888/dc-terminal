@@ -192,6 +192,14 @@ pub enum Key {
     WebAddressUnknownLine,
     /// 关着时的下一步：按 w 打开
     WebNextStepOff,
+    /// 打开之前先说：系统会弹一个防火墙授权框。
+    ///
+    /// **必须在按下去之前说**。第一次绑到所有网卡上时，Windows 和 macOS 都会
+    /// 问一句允不允许，而**系统在有人点它之前把那次调用按住**——不知情的用户
+    /// 点了「取消」，之后只会看到手机连不上，屏幕上没有任何东西解释为什么。
+    /// （这件事是被一条集成测试逼出来的：客户端正好 5 秒超时，而守护进程
+    /// 日志显示它早就把回复写完了。）
+    WebFirewall,
     /// 开着时的下一步：拿手机扫码；再按一次 w 关掉
     WebNextStepOn,
     /// 开着但算不出地址时的下一步：先把这台电脑连上 WiFi
@@ -495,6 +503,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Press w to turn it on",
             zh: "按 w 打开",
+        ),
+        WebFirewall => t!(
+            lang,
+            en: "The first time, your system asks whether to allow it — say yes for private networks, or the phone cannot connect.",
+            zh: "第一次打开时系统会问允不允许，选「允许·专用网络」，否则手机连不上。",
         ),
         WebNextStepOn => t!(
             lang,
@@ -1641,6 +1654,7 @@ mod tests {
             WebOnLine,
             WebAddressUnknownLine,
             WebNextStepOff,
+            WebFirewall,
             WebNextStepOn,
             WebNextStepAddressUnknown,
             WebQrTooNarrow,
@@ -1778,7 +1792,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 139, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 140, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
