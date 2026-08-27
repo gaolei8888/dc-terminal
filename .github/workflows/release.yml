@@ -37,8 +37,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
+          # 两个 macOS 目标都在 Apple Silicon 的 runner 上编，Intel 那份靠
+          # 交叉编译，**不是**去 macos-13 上原生编。
+          #
+          # 这不是偏好，是实测：v0.2.3 那次发版里，另外三个目标都在两分钟
+          # 内跑完，`macos-13` 排了半个多小时都没分到机器——GitHub 一直在
+          # 退役 Intel 的 macOS runner，那个池子已经不能当成发版的必经之路。
+          # 一个拿不到机器的目标会把整个 release 卡死，因为发布那一步要等
+          # 全部四个包齐了才动。
+          #
+          # 交叉编译在这儿是安全的：runner 上的 Xcode SDK 两个架构都带，
+          # `cc` 给 apple-darwin 目标会自己加 `-arch x86_64`。
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-14
