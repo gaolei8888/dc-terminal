@@ -1586,6 +1586,47 @@ mod tests {
         assert_eq!(key_to_input(&ctrl('q')).as_deref(), Some("\u{11}"));
         assert_eq!(key_to_input(&ctrl('Q')).as_deref(), Some("\u{11}"));
     }
+
+    /// **Alt 要发 ESC 前缀。** 终端几十年的约定是「meta 发 ESC」，而 dct
+    /// 原来把 Alt 整个丢掉了——`Alt+V` 到 agent 手里是一个光秃秃的 `v`。
+    ///
+    /// 用户是在贴图上撞见的（"没有 dct 的时候 Windows 上 Alt+V 能贴图"），
+    /// 但坏的范围大得多：readline 的 `Alt+B`/`Alt+F`/`Alt+D`、以及任何用 Alt
+    /// 的 TUI，在 dct 底下全都退化成普通字母。**而且不报错**——键是通的、
+    /// 字符也进去了，只是意思变了。
+    #[test]
+    fn alt_sends_the_escape_prefix_a_terminal_expects() {
+        let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        assert_eq!(key_to_input(&alt('v')).as_deref(), Some("\u{1b}v"));
+        assert_eq!(key_to_input(&alt('b')).as_deref(), Some("\u{1b}b"));
+
+        // Ctrl+Alt 两个都在：先按 Ctrl 折成控制字节，再补 meta 的前缀。
+        let ctrl_alt = KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(key_to_input(&ctrl_alt).as_deref(), Some("\u{1b}\u{4}"));
+    }
+
+    /// **`Alt+Enter` 不许被补前缀。**
+    ///
+    /// 回车那一支返回的是空串——那是跟 `session::send_input` 约定的「提交」
+    /// 信号，**只有它打检查点**。补上前缀之后它就成了一个纯 `ESC`：用户想
+    /// 换行，agent 收到的是「取消」，而且这一轮没有检查点，`u` 撤不回来。
+    #[test]
+    fn alt_enter_is_still_the_enter_that_takes_the_checkpoint() {
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(key_to_input(&alt_enter).as_deref(), Some(""));
+    }
+
+    /// 方向键那一档**不假装支持**：xterm 把修饰键编进 CSI 的参数里
+    /// （`Alt+Up` 是 `CSI 1;3A`），不是在前面贴一个 ESC。贴了是另一种编码，
+    /// agent 认不出来——那还不如原样送出去。
+    #[test]
+    fn alt_does_not_fake_a_modifier_encoding_for_the_arrow_keys() {
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(key_to_input(&alt_up).as_deref(), Some("\u{1b}[A"));
+    }
     #[test]
     fn the_bottom_bar_offers_nothing_to_act_on_when_there_are_no_sessions() {
         let empty = HelpCtx::default();

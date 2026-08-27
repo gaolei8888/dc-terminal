@@ -1100,6 +1100,7 @@ fn open_url(url: &str) -> bool {
 /// 逐字符输入不会产生提交。所以回车必须返回 `Some(String::new())` 而不是 "\r"。
 pub fn key_to_input(key: &KeyEvent) -> Option<String> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let s = match key.code {
         KeyCode::Enter => String::new(),
         KeyCode::Char(c) if ctrl => {
@@ -1131,6 +1132,27 @@ pub fn key_to_input(key: &KeyEvent) -> Option<String> {
         KeyCode::Esc => "\x1b".into(),
         _ => return None,
     };
+
+    // **Alt（meta）要补上 ESC 前缀。** 终端几十年的约定是「meta 发 ESC」：
+    // `Alt+X` 送出去的是 `ESC` 后面跟着 `X` 两个字节。不补的话，`Alt+V` 到
+    // agent 手里就是一个光秃秃的 `v`——用户按的是贴图，agent 收到的是
+    // 「他打了个字母」。
+    //
+    // 受害的远不止贴图：readline 的 `Alt+B`/`Alt+F`（按词移动）、`Alt+D`
+    // （删词），以及任何用 Alt 的 TUI，在 dct 底下全都退化成普通字母。
+    // **而且这种坏法不报错**——键是通的、字符也进去了，只是意思变了。
+    //
+    // **只给 `Char` 补前缀，别的键一个都不补**，两条理由：
+    //
+    // - 回车那一支返回的是**空串**，那是跟 `session::send_input` 约定的
+    //   「提交」信号（只有它打检查点）。给它补前缀，`Alt+Enter` 就成了一个
+    //   纯 `ESC`——用户想换行，agent 收到「取消」。
+    // - 方向键那些本来就是 CSI 序列，而 xterm 对它们的修饰键编码是写进参数
+    //   （`Alt+Up` 是 `CSI 1;3A`），不是在前面贴一个 ESC。贴了是另一种编码，
+    //   agent 认不出来。要支持那一档得单独写，这里不假装支持。
+    if alt && matches!(key.code, KeyCode::Char(_)) {
+        return Some(format!("\x1b{s}"));
+    }
     Some(s)
 }
 
