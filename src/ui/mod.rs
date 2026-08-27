@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -284,6 +285,11 @@ fn restore_terminal() {
         std::io::stdout(),
         DisableMouseCapture,
         DisableBracketedPaste,
+        // 把光标形状还给用户自己的设置。跟上面关鼠标捕获同一个道理：
+        // 无条件发，没改过时多发一次无害，而漏还会让用户**退出 dct 之后**
+        // 的终端一直顶着我们挑的那个形状——那种「是不是它把我终端弄坏了」
+        // 的怀疑，比少一个功能难洗得多。
+        SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen
     );
 }
@@ -394,7 +400,26 @@ pub fn run(
     let mut stdout = std::io::stdout();
     // 开括号粘贴：不开的话粘贴的文字会一个字符一个事件地进来，
     // 粘一段话就是几百次往返，慢到没法用。
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    //
+    // 顺带把光标钉成不闪的那一档。会话里那个光标是 dct 自己画上去的，
+    // 用来告诉你「你打的字会落在这儿」（`ui::attach` 里的 `cursor_at`），
+    // 而它闪不闪一直是终端自己的默认——多数终端默认就是闪。
+    //
+    // **agent 的意图在这里拿不到，所以只能由 dct 定。** 终端里表达
+    // 「光标别闪」的那个序列是 DECSCUSR（`CSI Ps SP q`），而 `vt100`
+    // 0.16 压根不跟踪它：agent 就算发过，也在解析时被丢掉了，屏幕快照里
+    // 没有这个信息。（对比 `hide_cursor`，那个它是跟踪的，所以「agent 藏
+    // 起来的光标不要画」做得到——见 `pty::cursor_hidden`。）
+    //
+    // 挑竖线而不是方块：这个光标画在 agent 自己的画面上，方块会把底下那个
+    // 字盖掉，竖线不会。退出时用 `DefaultUserShape` 还回用户自己的设置，
+    // 不是硬塞一个我们以为的默认值回去。
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        SetCursorStyle::SteadyBar
+    )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
