@@ -698,6 +698,43 @@ mod tests {
         }
     }
 
+    /// **虚拟键行上不许出现桌面端自己会吃掉的键。**
+    ///
+    /// `PageUp`/`PageDown` 在桌面上有历史可翻时是 dct 用来翻滚屏的，根本不到
+    /// agent 那儿；`End` 在滚上去之后是「回到底部」。把它们放进这一排，
+    /// 同一个键就成了「桌面翻历史、手机敲给 agent」两回事——而这条链路的
+    /// 全部前提是手机做到的跟桌面一样。手机翻历史有自己的路（`/api/scroll`），
+    /// 那条路走的正是桌面被吃掉之后走的同一个 `Request::Scroll`。
+    #[test]
+    fn the_virtual_row_never_offers_a_key_the_desktop_would_swallow() {
+        let code = page_without_comments();
+        let row = code
+            .split_once("var ROW = [")
+            .expect("网页里没有那一排虚拟键了？")
+            .1
+            .split_once(']')
+            .expect("ROW 那一行没闭合")
+            .0;
+
+        // **名单本身也要钉住。** 只遍历那个常量的话，把它清空就让这条守卫
+        // 变成空转、测试照样绿——跟 `qr` 那条静区守卫犯过的是同一个错，
+        // 也是变异测试当场抓到的。桌面端真改了拦截规则，这里就该一起改。
+        let list = super::super::keys::INTERCEPTED_ON_DESKTOP;
+        for name in ["PageUp", "PageDown", "End"] {
+            assert!(
+                list.contains(&name),
+                "{name} 从「桌面会吃掉的键」名单里没了——桌面端真改规则了？"
+            );
+        }
+
+        for name in list {
+            assert!(
+                !row.contains(name),
+                "虚拟键行上有 {name:?}——桌面端会把它吃掉去翻历史，两边就不一样了"
+            );
+        }
+    }
+
     /// 粘滞 `Ctrl` 拼出来的名字也得认。网页那边拼的是 `"Ctrl+" + 大写字母`，
     /// 这条把那个拼法本身钉住。
     #[test]

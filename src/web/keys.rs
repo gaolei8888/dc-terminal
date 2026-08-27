@@ -37,6 +37,18 @@ pub const NAMES: &[&str] = &[
     "Delete",
 ];
 
+/// 桌面端的 dct **自己会吃掉**的那几个键（见 `ui::attach::key_scroll`）。
+///
+/// 它们仍然在 [`NAMES`] 里，因为在某些状态下桌面确实会把它们转发给 agent：
+/// `PageUp`/`PageDown` 在**没有历史可翻**（`max == 0`）时是普通编辑键，
+/// `End` 在没滚上去（`offset == 0`）时是「跳到行尾」。
+///
+/// **但虚拟键行上一个都不许放。** 放上去就成了「同一个键，桌面翻历史、
+/// 手机敲给 agent」——而这条链路的全部前提是手机看到的、做到的跟桌面一样。
+/// 手机翻历史走的是 `/api/scroll`（`Request::Scroll`），跟桌面被吃掉之后
+/// 走的是同一条路。有一条守卫盯着那一排（见 `routes.rs`）。
+pub const INTERCEPTED_ON_DESKTOP: &[&str] = &["PageUp", "PageDown", "End"];
+
 /// 一个键名对应的字节。认不出来返回 `None`（调用方拒掉这次请求）。
 ///
 /// `Ctrl+X` 单独认一档：写死 `Ctrl+C` 一个的话，`Ctrl+D`（结束输入）、
