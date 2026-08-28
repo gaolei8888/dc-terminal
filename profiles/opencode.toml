@@ -1,4 +1,7 @@
 name = "opencode"
+# opencode 的权限**不在命令行参数上**，所以这一行是光的。它靠一个环境变量，
+# 见下面的 `[env]`——`--help` 和 `run --help` 里都没有任何 approval / yolo
+# 之类的开关，找错地方会以为它没有这个能力。
 command = ["opencode"]
 is_agent = true
 # TUI 没实测过，不填 pattern —— 状态显示「—」比编一个假状态好
@@ -17,3 +20,25 @@ command = ["npm", "i", "-g", "opencode-ai"]
 [install.note]
 zh = "需要先装 Node.js"
 en = "Requires Node.js"
+
+# 把权限确认全关掉。不关的话 agent 每要动一个文件、跑一条命令都停下来等人
+# 点头，而 dct 的整个前提是「它从来不问这样可以吗」——底气来自每轮之前的
+# 隐藏快照，不是逐条确认。
+#
+# 形状是实测出来的（opencode 1.18.23）：这个变量的值是一段 JSON，会被合并
+# 进配置里的 `permission`，档位是 ask / allow / deny。二进制里那段代码是
+#     if (env.OPENCODE_PERMISSION) try { config.permission = merge(..., JSON.parse(...)) }
+#     catch { logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping") }
+#
+# **JSON 写错会被静默跳过**，而且那句警告只有加 `--print-logs` 才看得见。
+# 也就是说少一个引号的后果不是报错，是 agent 安安静静地又开始问你——
+# 而看板上它显示成「在干活」。`profile.rs` 里有一条测试把这段 JSON 真的
+# parse 一遍，就是为了这个。
+#
+# 十一个键名不是猜的，是二进制里那份清单：
+#     ["bash","read","edit","glob","grep","webfetch","task","todowrite",
+#      "websearch","lsp","skill"]
+# 全列出来而不是只写 bash/edit：漏掉的那个不会报错，只会在某一次真的用到
+# 它的时候停下来，而那时候没人在看着屏幕。
+[env]
+OPENCODE_PERMISSION = '{"bash":"allow","read":"allow","edit":"allow","glob":"allow","grep":"allow","webfetch":"allow","task":"allow","todowrite":"allow","websearch":"allow","lsp":"allow","skill":"allow"}'

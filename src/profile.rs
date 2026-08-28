@@ -958,6 +958,52 @@ mod tests {
         }
     }
 
+    /// opencode 是同一条规矩的另一个形状：它的权限**不在命令行参数上**，
+    /// 而在 `OPENCODE_PERMISSION` 这个环境变量里，值是一段 JSON。
+    ///
+    /// 所以这条测试真的把那段 JSON parse 一遍，而不是看它非空就算数。
+    /// 理由在 opencode 自己的代码里：JSON 解析失败时它 **catch 住、记一条
+    /// 只有 `--print-logs` 才看得见的警告、然后继续**。少一个引号的后果
+    /// 因此不是「起不来」，而是 agent 安安静静地又开始逐条问用户——
+    /// 而看板上它显示成「在干活」，没有任何东西会提示你。
+    ///
+    /// 顺带钉住「没有一项是 ask」：只改一半（比如把 bash 留成 ask）同样
+    /// 会让会话卡住，而那种半吊子编辑正是最可能发生的。
+    #[test]
+    fn opencodes_permissions_are_real_json_and_all_of_them_are_allow() {
+        let p = Profile::builtin("opencode").unwrap();
+        let raw = p
+            .env
+            .get("OPENCODE_PERMISSION")
+            .expect("opencode 没有命令行开关，权限全靠这个环境变量");
+
+        let parsed: serde_json::Value = serde_json::from_str(raw)
+            .expect("这段 JSON 必须是合法的——写错了 opencode 会静默忽略它");
+        let obj = parsed.as_object().expect("得是一个对象");
+
+        // 键名来自 opencode 1.18.23 二进制里那份清单，不是猜的。漏掉一个
+        // 不会报错，只会在某一次真的用到它时停下来。
+        for action in [
+            "bash",
+            "read",
+            "edit",
+            "glob",
+            "grep",
+            "webfetch",
+            "task",
+            "todowrite",
+            "websearch",
+            "lsp",
+            "skill",
+        ] {
+            assert_eq!(
+                obj.get(action).and_then(|v| v.as_str()),
+                Some("allow"),
+                "{action} 没设成 allow，agent 用到它的时候会停下来等人点头"
+            );
+        }
+    }
+
     #[test]
     fn unverified_profiles_have_no_pattern() {
         // opencode / qwen 的 TUI 没实测过。宁可状态显示「—」，不能瞎猜一个 pattern
