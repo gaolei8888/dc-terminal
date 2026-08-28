@@ -1,0 +1,21 @@
+[package]
+name = "dct-srv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dct-link = { path = "../dct-link" }
+# **async 只在这里。** 「不引入 async 运行时」那条规矩是给守护进程和 TUI 写的
+# （见 `docs/superpowers/plans/2026-08-10-dct-phone-channel.md`），把它照搬到
+# 中转上是刻舟求剑：中转的全部工作就是同时挂着几千条空闲长连接，这正是 async
+# 唯一真正不可替代的场景。一个教室 1000 台设备用线程模型就是 1000 条常驻线程。
+#
+# 这是独立 crate，`cargo tree -p dct` 里看不到 tokio——那条验收在任务 1 里。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde_json = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+# 只有测试要自己拼 HTTP 请求（见 tests/serves.rs），服务本身用不到读写扩展。
+tokio = { version = "1", features = ["io-util"] }

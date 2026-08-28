@@ -21,7 +21,19 @@ use serde::{Deserialize, Serialize};
 /// 这个管守护进程和中转之间。中转升级的时候，全世界的笔记本上跑着的是上周
 /// 装的 dct；两边的版本对不上，`AuthFrame` 那一下就要说清楚，而不是等到某个
 /// 字段解不出来才炸。
-pub const LINK_VERSION: u32 = 1;
+///
+/// 2 = 两个接口的请求/响应体（`PollResponse`、`SendRequest`）进了这个 crate，
+/// `LinkError` 多了 `Busy`。信封本身一个字节没变——**但版本号还是加了一**：
+/// 「只有信封变了才加一」这条会立刻退化成「我觉得这次不算」，而这个数字唯一
+/// 的用处就是在两边版本不一致时说话。现在还没有任何一台机器在跑它，加一是
+/// 免费的；等真有人在用了，免费的就只剩后悔。
+pub const LINK_VERSION: u32 = 2;
+
+/// 长轮询：**我有什么要收的吗**。请求体就是 `AuthFrame`。
+pub const PATH_POLL: &str = "/link/poll";
+
+/// 投递一个信封。请求体是 `SendRequest`。
+pub const PATH_SEND: &str = "/link/send";
 
 /// 一个 payload 最多多少字节。
 ///
@@ -162,6 +174,33 @@ pub struct AuthFrame {
     pub token: String,
 }
 
+/// `POST /link/poll` 的答复。
+///
+/// **超时不是错误。** 长轮询挂满 30 秒什么都没等到，是这条链路上最正常的
+/// 一件事（一个人一天里绝大多数时候不在看手机）；把它编码成错误，守护进程
+/// 那边就得靠「这个错误其实不算错」来区分真断线，那是迟早要搞混的。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollResponse {
+    /// `None` = 这一轮没有东西给你，立刻再来一次。
+    pub envelope: Option<Envelope>,
+}
+
+/// `POST /link/send` 的请求体。
+///
+/// `auth` 和 `envelope.from` 会被中转比对：**信封上的寄件人必须就是出示
+/// 凭据的那个人**。不比对的话，任何一个能连上中转的人都能冒充别人发东西。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRequest {
+    pub auth: AuthFrame,
+    pub envelope: Envelope,
+}
+
+/// 中转回坏消息时的响应体。成功不回 body（`204`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub error: LinkError,
+}
+
 /// 中转能回的坏消息，**全集**。
 ///
 /// 是码不是话：翻译在 `dct` 和网页那边。这个枚举没有「其他错误」那一项，
@@ -175,6 +214,12 @@ pub enum LinkError {
     VersionMismatch,
     /// 收件人不在线。**不排队、不落盘**（spec「不做什么」第一条）。
     Offline,
+    /// 收件人在线，但它积压的东西还没取走，收不下了。
+    ///
+    /// 跟 `Offline` 分开是有用的：`Offline` 该说「你的电脑离线了」，`Busy`
+    /// 该说「你的电脑忙不过来」，两句话指向完全不同的排查方向。合成一个的话
+    /// 用户会被指去检查网络，而问题在他自己那台机器上。
+    Busy,
     /// payload 超过 `MAX_PAYLOAD`。
     TooBig,
     /// 这个账号今天的额度用完了（任务 7）。
@@ -190,6 +235,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Unauthorized => "unauthorized",
             LinkError::VersionMismatch => "link version mismatch",
             LinkError::Offline => "peer offline",
+            LinkError::Busy => "peer is not keeping up",
             LinkError::TooBig => "payload too big",
             LinkError::QuotaExceeded => "quota exceeded",
             LinkError::NotYours => "device belongs to another account",
@@ -246,7 +292,7 @@ mod tests {
         assert_eq!(
             (LINK_VERSION, shape.as_str()),
             (
-                1,
+                2,
                 r#"{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}"#
             ),
             "信封的线上形状变了。把 LINK_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -266,7 +312,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&auth).unwrap(),
-            r#"{"version":1,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
+            r#"{"version":2,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
         );
         assert_eq!(
             serde_json::to_string(&EndpointKind::Phone).unwrap(),
@@ -278,13 +324,45 @@ mod tests {
             LinkError::Unauthorized,
             LinkError::VersionMismatch,
             LinkError::Offline,
+            LinkError::Busy,
             LinkError::TooBig,
             LinkError::QuotaExceeded,
             LinkError::NotYours,
         ];
         assert_eq!(
             serde_json::to_string(&all).unwrap(),
-            r#"["Unauthorized","VersionMismatch","Offline","TooBig","QuotaExceeded","NotYours"]"#
+            r#"["Unauthorized","VersionMismatch","Offline","Busy","TooBig","QuotaExceeded","NotYours"]"#
+        );
+    }
+
+    /// 两个接口的请求/响应体也是契约——网页那边是手写 JS 在拼这些字段名，
+    /// 拼错一个不会有编译器管它。
+    #[test]
+    fn the_two_endpoints_have_a_pinned_body_shape() {
+        let auth = AuthFrame {
+            version: LINK_VERSION,
+            kind: EndpointKind::Phone,
+            endpoint: EndpointId::new("phone:7").unwrap(),
+            token: "t".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&SendRequest {
+                auth,
+                envelope: sample()
+            })
+            .unwrap(),
+            r#"{"auth":{"version":2,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PollResponse { envelope: None }).unwrap(),
+            r#"{"envelope":null}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorBody {
+                error: LinkError::Offline
+            })
+            .unwrap(),
+            r#"{"error":"Offline"}"#
         );
     }
 

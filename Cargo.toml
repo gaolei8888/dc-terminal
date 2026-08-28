@@ -2,9 +2,8 @@
 # `src/` 搬进 `crates/dct/`**，那会产生一个几百个文件的 rename diff，把真正
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
-# `crates/dct-srv`（中转服务）还没建，等第一期任务 2。它一建就要加进来。
 [workspace]
-members = ["crates/dct-link"]
+members = ["crates/dct-link", "crates/dct-srv"]
 
 [package]
 name = "dct"
