@@ -263,6 +263,13 @@ pub enum Key {
     BackToSettings,
     // —— 视图标题 ——
     BoardTitle,
+    /// 底栏中段那块牌子前面的那个名词：`project` / `项目`。
+    ///
+    /// 反白的 `dc/dc-terminal` 无疑是**某个东西**，但没人告得诉你是哪个
+    /// 东西——底栏分三段这件事本身就得先知道，而不知道它的人正是找不着
+    /// 自己在哪的那个人。名词只在放得下时才写（`bar_chip`），让位的顺序是
+    /// 父目录、名词、名字里的字符，牌子自己永远在场。
+    ProjectChipLabel,
     Disconnected,
     PickAgentTitle,
     /// 选 agent 那一屏的标题后半句：当前项目不是 git 仓库。
@@ -382,6 +389,11 @@ pub enum Key {
     StaleDaemonAsk,
     StaleDaemonRestarting,
     StaleDaemonRestartFailed,
+    RestartExplain,
+    RestartAsk,
+    RestartCancelled,
+    RestartDone,
+    RestartFailed,
     // —— 守护进程重启后，问要不要接回上次的会话 ——
     ResumeSessionsExplain,
     ResumeSessionsAsk,
@@ -595,6 +607,8 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 看板只有这一个标题了：它现在**永远**是全部项目——分组之后
         // 「只看本项目 / 看全部项目」这对模式整个消失，标题不再随模式变。
         BoardTitle => t!(lang, en: "dct sessions", zh: "dct 会话看板"),
+        // 英文 7 列、中文 4 列：中文因此比英文多留一档父目录的余地
+        ProjectChipLabel => t!(lang, en: "project", zh: "项目"),
         Disconnected => t!(
             lang,
             en: "disconnected, this may be out of date",
@@ -813,6 +827,29 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Could not restart it. Continuing with the old one.",
             zh: "没能重启，先接着用旧的",
         ),
+        // `dct restart` 用的那一套。跟上面 `StaleDaemon*` 分开写而不是复用：
+        // 那一套的语境是「你手里这个守护进程是旧版本」（用户没打算重启，是
+        // dct 发现问题拦下来问的），这一套的语境是「你自己敲了 restart」——
+        // 前者要先解释为什么突然被问，后者只需要把代价说清楚。
+        RestartExplain => t!(
+            lang,
+            en: "Restarting the background service ends the sessions running right now —\n\
+                 your file changes stay, but the agents have to be started again.",
+            zh: "重启后台服务会断掉正在跑的会话——文件改动都还在，\n\
+                 只是 agent 要重新开一次。",
+        ),
+        RestartAsk => t!(
+            lang,
+            en: "Restart it now? (y = restart, Enter = leave it alone)",
+            zh: "现在重启吗？(y = 重启，直接回车 = 不动它)",
+        ),
+        RestartCancelled => t!(lang, en: "Left it alone.", zh: "没动它"),
+        RestartDone => t!(lang, en: "Restarted.", zh: "已重启"),
+        RestartFailed => t!(
+            lang,
+            en: "Could not restart it. The old one is still running.",
+            zh: "没能重启，旧的还在跑",
+        ),
         ResumeSessionsExplain => t!(
             lang,
             en: "The background service was not running. Before, it had these sessions open:",
@@ -966,6 +1003,19 @@ pub mod msg {
             lang,
             en: format!("Which one? `dct {cmd} 3` for session 3, `dct {cmd} --all` for every session."),
             zh: format!("要哪个？`dct {cmd} 3` 是 3 号会话，`dct {cmd} --all` 是全部。"),
+        )
+    }
+
+    /// `dct restart` 后面跟了它不认识的东西。
+    ///
+    /// **不把不认识的参数当成「没参数」忽略掉**：`dct restart --all` 这种手滑
+    /// 如果被当成裸 `dct restart` 执行，用户以为自己限定了范围，实际把整个
+    /// 守护进程连所有会话一起换掉了。
+    pub fn restart_takes_no_args(lang: Lang, arg: &str) -> String {
+        t!(
+            lang,
+            en: format!("`dct restart` takes no arguments (`{arg}`) — only `-y` to skip the question."),
+            zh: format!("`dct restart` 不接参数（`{arg}`），只认 `-y`（不问直接重启）。"),
         )
     }
 
@@ -1843,6 +1893,7 @@ mod tests {
             BackToList,
             BackToSettings,
             BoardTitle,
+            ProjectChipLabel,
             Disconnected,
             PickAgentTitle,
             NotAGitRepoHint,
@@ -1910,6 +1961,11 @@ mod tests {
             StaleDaemonAsk,
             StaleDaemonRestarting,
             StaleDaemonRestartFailed,
+            RestartExplain,
+            RestartAsk,
+            RestartCancelled,
+            RestartDone,
+            RestartFailed,
             ResumeSessionsExplain,
             ResumeSessionsAsk,
             ResumeSessionsWillContinue,
@@ -1949,7 +2005,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 143, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 149, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

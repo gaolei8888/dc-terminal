@@ -5,7 +5,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use super::app::App;
 use super::view::is_plain_key;
-use super::widgets::{pad_to, session_label, status_label, status_style, truncate};
+use super::widgets::{
+    display_width, pad_to, project_label, session_label, status_label, status_style, truncate,
+};
 use super::{
     accent, danger, dim, open_new_session, open_project_picker, open_secrets, session_action,
 };
@@ -84,17 +86,54 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         danger()
     };
-    let title = if app.connected {
-        text(Key::BoardTitle, app.lang).to_string()
-    } else {
-        msg::title_with(app.lang, Key::BoardTitle, text(Key::Disconnected, app.lang))
-    };
     // 当前项目：整组左侧一条竖色条。不靠光标行——光标只标「哪一行」，
     // 项目要的是「哪一片」，隔着屏幕就得认得出来。
+    //
+    // 算在标题之前：标题上那块牌子写的就是这个组。
     let current = app
         .list_state
         .selected()
         .and_then(|i| super::view::group_of(&app.rows, i));
+
+    // 标题：`dct 会话看板` + 当前项目的**完整路径**反白成一块牌子，断连那
+    // 半句接在牌子后面。
+    //
+    // 三处说同一件事，各答一个问题，都不多余：标题答「我在哪个项目」（这里
+    // 宽度有余，路径写得全，而组头那 18 列写不全），组头那块牌子答「屏幕上
+    // 哪几行是我的」（一条 1 列宽的竖条答不了，这才是这次改动的起因），底栏
+    // 答「按 `n` 会开在哪」。
+    //
+    // 牌子在前、断连在后：断连是全屏唯一一处红字，它挤长了只该把标题右边
+    // 那条横线吃掉，不该把「我在哪」顶出屏幕——恰恰是断连这一屏最想知道
+    // 自己在哪。所以不再用 `msg::title_with` 把两句拼成一个 `String`。
+    let base = text(Key::BoardTitle, app.lang);
+    let mut title = vec![Span::raw(format!("{base} "))];
+    if let Some(gi) = current {
+        let g = &app.groups[gi];
+        // 预算：整行减掉标题、断连那半句、和右边至少留的几列横线。量不下
+        // 就少贴几段父目录（`project_label` 自己会退到只写名字），而不是
+        // 让它去挤断连那句话。
+        let taken = display_width(base)
+            + 1
+            + if app.connected {
+                0
+            } else {
+                display_width(text(Key::Disconnected, app.lang)) + 4
+            };
+        let room = (area.width as usize).saturating_sub(taken + 6);
+        let chip = project_label(&g.name, &g.parent, room.saturating_sub(2));
+        title.push(Span::styled(
+            format!(" {chip} "),
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ));
+    }
+    if !app.connected {
+        title.push(Span::styled(
+            format!("（{}）", text(Key::Disconnected, app.lang)),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let title = Line::from(title);
 
     let items: Vec<ListItem> = app
         .rows
@@ -132,14 +171,45 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     // 上限取 17 不是 18：`truncate` 裁完会补一个 `…`，17 列
                     // 的内容加那一个字符正好 18，列宽分毫不动。名字比父目录
                     // 那一列（16）宽一格是有意的——认项目靠的是名字。
-                    spans.push(Span::styled(
-                        pad_to(&truncate(&g.name, 17), 18),
-                        if gone {
-                            dim()
-                        } else {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        },
-                    ));
+                    //
+                    // 当前项目的名字**反白成一块牌子**，不是加粗了事：屏幕上
+                    // 每个项目名都是加粗的，加粗认不出哪个是自己那个。反白是
+                    // 这一屏里唯一一块底色反过来的地方，不需要先知道「左边那
+                    // 条竖线是什么意思」就跳得出来——而不知道这件事的人正是
+                    // 找不到自己在哪的那个人。用 `REVERSED` 而不是挑一个具名
+                    // 色的理由跟底栏那块牌子一样（见 `ui/mod.rs` 里那段）：
+                    // 六档底栏配色里任何写死的前景色都会在某一档上糊掉。
+                    //
+                    // 列宽分毫不动：牌子前后各垫一个空格，所以名字的预算从
+                    // 17 收到 15（15 列内容 + `truncate` 可能补的那一个 `…`
+                    // + 两个空格 = 18）。这一格右边是 agent 统计和行尾那个
+                    // 红色的「N 个出错」——它被挤掉是 dct 最贵的失败模式，
+                    // 牌子绝不能从别人的列里借宽度。
+                    //
+                    // 目录没了的组不贴牌子：那一行整行标灰是在说「这东西现在
+                    // 是坏的」，反白会把它重新变成屏幕上最显眼的东西。
+                    if Some(gi) == current && !gone {
+                        // 牌子**只包住名字**，右边补的空白照旧是普通底色：
+                        // 反白连着补到 18 列的话，短名字后面会拖出一条长
+                        // 尾巴，看着像进度条而不像一块牌子。补白单独一段，
+                        // 两段加起来仍然是 18 列。
+                        let chip = format!(" {} ", truncate(&g.name, 15));
+                        let w = display_width(&chip);
+                        spans.push(Span::styled(
+                            chip,
+                            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                        ));
+                        spans.push(Span::raw(" ".repeat(18usize.saturating_sub(w))));
+                    } else {
+                        spans.push(Span::styled(
+                            pad_to(&truncate(&g.name, 17), 18),
+                            if gone {
+                                dim()
+                            } else {
+                                Style::default().add_modifier(Modifier::BOLD)
+                            },
+                        ));
+                    }
                     spans.push(Span::styled(pad_to(&truncate(&g.parent, 16), 18), dim()));
                     if gone {
                         spans.push(Span::styled(text(Key::ProjectDirGone, app.lang), dim()));
@@ -500,6 +570,213 @@ mod tests {
             !c.contains("MARK"),
             "70 列预算下 MARK 连一个字都不该露出来；如果预算被改回 76，\
              MARK 会整个冒出来：{c}"
+        );
+    }
+
+    /// 第 0 行（标题那一行）的文字，空白洗掉——`TestBackend` 把一个双宽
+    /// 汉字画成「字 + 空格」两格，不洗的话 `contains("会话看板")` 永远不成立。
+    fn title_text(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 屏幕上所有**反白**格子的符号，按行优先拼起来（空白同样洗掉）。三处
+    /// 项目标识（标题的牌子、组头的牌子、底栏的牌子——底栏不在这个 widget
+    /// 里）都是靠 `REVERSED` 认的，用具名色断言会跟六档底栏配色打架。
+    fn reversed_symbols(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        (0..a.height)
+            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)))
+            .filter(|c| c.style().add_modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol().to_string())
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// **当前项目在组头上反白成一块牌子，别的项目没有。**
+    ///
+    /// 改动前它只有左边一条 1 列宽的竖线，而名字本身跟别的项目名一样是
+    /// 加粗的——「屏幕上哪几行是我的」于是全压在那一列上。
+    #[test]
+    fn the_current_project_wears_a_chip_on_its_group_row() {
+        let (mut app, dir) = App::test_app();
+        let mine = real_dir(&dir, "aaa-mine");
+        let other = real_dir(&dir, "zzz-other");
+        app.set_sessions(vec![sess(1, &mine), sess(2, &other)]);
+        // 组是按名字排的，`set_sessions` 之后光标停在第一行——也就是 aaa-mine
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("aaa-mine".to_string()),
+            "前提：光标停在 aaa-mine 那一组"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let rev = reversed_symbols(&term);
+        assert!(rev.contains("aaa-mine"), "当前项目要反白：{rev}");
+        assert!(
+            !rev.contains("zzz-other"),
+            "别的项目不许反白，否则牌子什么都没区分出来：{rev}"
+        );
+    }
+
+    /// **牌子只包住名字，不许把补白一起反白。** 反白连着补到 18 列的话，
+    /// 短名字后面会拖出一条长尾巴，看着像进度条。牌子两端各一个空格，
+    /// 所以反白的宽度恰好是「名字 + 2」。
+    #[test]
+    fn the_chip_hugs_the_name_instead_of_filling_the_column() {
+        let (mut app, dir) = App::test_app();
+        let mine = real_dir(&dir, "dct");
+        app.set_sessions(vec![sess(1, &mine)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        // 组头那一行里反白的格子：只有 ` dct `（标题那块牌子在另一行）
+        let buf = term.backend().buffer();
+        let row = (0..buf.area.height)
+            .find(|&y| {
+                (0..buf.area.width).any(|x| buf.cell((x, y)).map(|c| c.symbol()) == Some("▾"))
+            })
+            .expect("没有组头行");
+        let on_row: String = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, row)))
+            .filter(|c| c.style().add_modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert_eq!(on_row, " dct ", "牌子该是名字加左右各一个空格：{on_row:?}");
+    }
+
+    /// **组头上的牌子不许把名字那一列撑宽。** 牌子的两个空格是从名字自己的
+    /// 18 列预算里出的（截断上限 17 → 15），不是从右边邻居那里借的——右边
+    /// 是 agent 统计和行尾那句红字，后者被挤掉是 dct 最贵的失败模式。
+    #[test]
+    fn the_chip_does_not_widen_the_name_column() {
+        let (mut app, dir) = App::test_app();
+        // 两个组：一个戴牌子（光标所在），一个没戴。两行的父目录列必须
+        // 落在同一列上，否则就是牌子把列撑宽了。
+        let mine = real_dir(&dir, "mine-project-here");
+        let other = real_dir(&dir, "other-project-x");
+        app.set_sessions(vec![sess(1, &mine), sess(2, &other)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        // 用组序号当记号，不用项目名：完整路径也写在**标题**那一行（标题上
+        // 那块牌子），拿名字找行会先撞上标题。
+        let chipped = row_with(&term, "1 ▾");
+        let plain = row_with(&term, "2 ▾");
+        // `▾` 到 agent 统计之间的列数：名字列 + 父目录列，两行必须完全一样
+        assert_eq!(
+            cols_between(&chipped, "▾", "claude×1"),
+            cols_between(&plain, "▾", "claude×1"),
+            "戴牌子的那一行把名字列撑宽了：\n{chipped}\n{plain}"
+        );
+    }
+
+    /// **标题上也写当前项目，写的是完整路径。** 组头那 18 列写不全路径，
+    /// 而「我在哪个项目」值得写全一次；标题这一行宽度有余。
+    #[test]
+    fn the_title_carries_the_current_project() {
+        let (mut app, dir) = App::test_app();
+        let mine = real_dir(&dir, "dc-terminal");
+        app.set_sessions(vec![sess(1, &mine)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let title = title_text(&term);
+        assert!(title.contains("dct会话看板"), "标题本身还在：{title}");
+        assert!(title.contains("dc-terminal"), "标题上要写当前项目：{title}");
+        let buf = term.backend().buffer();
+        let on_title: String = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)))
+            .filter(|c| c.style().add_modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            on_title.contains("dc-terminal"),
+            "标题上那一段要反白成牌子，跟组头是同一个记号：{on_title}"
+        );
+    }
+
+    /// **断连那半句永远接在牌子后面，而且两者都在场。** 断连是最想知道
+    /// 自己在哪的那一屏：它挤长了只该吃掉标题右边那条横线。
+    #[test]
+    fn a_disconnected_title_keeps_both_the_project_and_the_warning() {
+        let (mut app, dir) = App::test_app();
+        let mine = real_dir(&dir, "dc-terminal");
+        app.set_sessions(vec![sess(1, &mine)]);
+        app.connected = false;
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let title = title_text(&term);
+        let name_at = title
+            .find("dc-terminal")
+            .unwrap_or_else(|| panic!("少了项目名：{title}"));
+        let warn_at = title
+            .find("连接已断开")
+            .unwrap_or_else(|| panic!("少了断连提示：{title}"));
+        assert!(name_at < warn_at, "牌子要在断连那半句前面：{title}");
+    }
+
+    /// **戴上牌子之后，80 列的中文项目名仍然挤不掉行尾那句红字。**
+    ///
+    /// `a_long_cjk_project_name_never_pushes_the_failure_count_off_screen`
+    /// 守的是同一条列算术，这一条补的是「当前项目」这一支：牌子的两个空格
+    /// 走的是名字自己的预算，走错了的话最先没的就是这句红字。
+    #[test]
+    fn a_chipped_cjk_name_still_leaves_room_for_the_failure_count() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "我的自媒体电商代运营项目");
+        let mut bad = sess(2, &proj);
+        bad.state = SessionState::Failed;
+        app.set_sessions(vec![sess(1, &proj), bad]);
+
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        assert!(c.contains("1个出错"), "牌子把红字挤下屏幕了：{c}");
+        let rev = reversed_symbols(&term);
+        assert!(
+            rev.contains("我的自媒体"),
+            "前提：这一行真的戴着牌子：{rev}"
+        );
+    }
+
+    /// 目录没了的组不戴牌子：整行标灰是在说「这东西现在是坏的」，反白会
+    /// 把它重新变成屏幕上最显眼的东西。
+    #[test]
+    fn a_group_whose_folder_is_gone_wears_no_chip() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![sess(1, "/w/gone-for-good")]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        let on_rows: String = (1..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)))
+            .filter(|c| c.style().add_modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            !on_rows.contains("gone-for-good"),
+            "坏掉的组不该被反白强调：{on_rows}"
         );
     }
 

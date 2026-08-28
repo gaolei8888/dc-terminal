@@ -2184,9 +2184,16 @@ const ESCAPE_HINT_COLS: u16 = 12;
 
 /// 底栏中段：当前项目占的列数。按显示宽度截断，CJK 项目名同样算两列。
 ///
-/// 16 列是「放得下一个常见项目名 + 一两段父目录」跟「别把右段挤没」之间的
-/// 折中，怎么用满见 `widgets::project_label`。
-const PROJECT_COLS: u16 = 16;
+/// 24 列是「放得下那个名词 + 一个常见项目名 + 一段父目录」跟「别把右段挤没」
+/// 之间的折中，怎么用满见 `bar_chip` 和 `widgets::project_label`。
+///
+/// 从 16 提到 24 是牌子加上名词（`project` 8 列 / `项目` 5 列，含分隔的空格）
+/// 那次：16 列的预算减掉牌子自己两列留白之后只剩 14，而一个再普通不过的
+/// 11 列项目名加上英文那个名词就是 19——名词于是**永远**让不到位，改动等于
+/// 没做。这个数是照最窄的那一档（80 列）反推的，见
+/// `the_three_actions_all_fit_at_eighty_columns`：80 列上左段 14、中段 26、
+/// 右段还剩 40，离 `ACTION_MIN_COLS` 的 28 还有余量。
+const PROJECT_COLS: u16 = 24;
 
 /// 右段无论如何要留的列数。
 ///
@@ -2438,10 +2445,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     //
     // 前后各垫一个空格：反白的字紧贴着别的字会看不出边界。这两列从**文字
     // 预算**里出，不从段宽里出——段宽是布局的事，改它会连带动到右段。
-    let chip = widgets::project_label(
+    let chip = bar_chip(
         &name,
         &parent,
         project_w.saturating_sub(4) as usize, // -2 和右段的间隔，-2 牌子自己的留白
+        app.lang,
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2462,6 +2470,31 @@ fn draw(f: &mut Frame, app: &mut App) {
         "预留底栏高度用的宽度必须跟真正画的宽度一致"
     );
     f.render_widget(Paragraph::new(help_lines).style(style), bar[2]);
+}
+
+/// 底栏中段牌子上的字：`项目 dc/dc-terminal`，写不下名词就只写路径。
+///
+/// 名词（`project` / `项目`）是从**文字预算**里出的，不是从段宽里出的——
+/// 段宽是布局的事，动它会连带把右段那三个键挤掉一个（`bar_widths` 里
+/// `PROJECT_COLS` 和 `ACTION_MIN_COLS` 的那笔账）。所以窄下来时让位的
+/// 顺序是：父目录（`project_label` 自己退），然后这个名词，最后才是名字
+/// 里的字符。**牌子本身在任何宽度上都在场**：空着的那一帧里，用户看不出
+/// `n` 会把新会话开在哪。
+///
+/// 名词让位的门槛是「名字自己还写得全吗」，不是「加上名词还剩几列」：
+/// 名词占了 8 列却把项目名截成 `dc-ter…`，等于用一个所有项目都一样的词
+/// 换掉了唯一能区分项目的信息。
+fn bar_chip(name: &str, parent: &str, cols: usize, lang: crate::i18n::Lang) -> String {
+    let label = crate::i18n::text(crate::i18n::Key::ProjectChipLabel, lang);
+    let need = widgets::display_width(label) + 1;
+    if need + widgets::display_width(name) <= cols {
+        format!(
+            "{label} {}",
+            widgets::project_label(name, parent, cols - need)
+        )
+    } else {
+        widgets::project_label(name, parent, cols)
+    }
 }
 
 /// 底栏右段这一帧的按键表，`n` 那一条带上这个项目上次用的 agent 名。
@@ -3645,9 +3678,9 @@ mod tests {
     fn the_bar_gives_up_the_project_before_the_escape_hint_or_the_door() {
         // 左段是 ESCAPE_HINT_COLS + 2 = 14：逃生键从「Ctrl+Q（F2） 回看板」
         // 收敛成「F2 回看板」之后窄了 7 列，那 7 列全归右段。
-        // 常见宽度：三段都拿到自己那份
-        assert_eq!(bar_widths(98), (14, 18, 66));
-        assert_eq!(bar_widths(78), (14, 18, 46));
+        // 常见宽度：三段都拿到自己那份（中段 = PROJECT_COLS + 2 = 26）
+        assert_eq!(bar_widths(98), (14, 26, 58));
+        assert_eq!(bar_widths(78), (14, 26, 38));
         // 55 列终端（`the_way_back_survives_a_narrow_terminal` 那一档）：
         // 中段缩到只剩几列，好让右段完整放下那句「怎么回到底部」
         assert_eq!(bar_widths(53), (14, 11, 28));
@@ -4171,6 +4204,81 @@ mod tests {
         assert!(
             content.contains("dc-terminal"),
             "底部必须显示当前项目，实际（已去空白）: {content}"
+        );
+    }
+
+    /// **牌子上要有那个名词。** 反白的 `dc/dc-terminal` 无疑是某个东西，
+    /// 但底栏分三段这件事本身得先知道——而不知道它的人正是找不着自己在哪
+    /// 的那个人。
+    #[test]
+    fn the_project_chip_says_that_it_is_a_project() {
+        use ratatui::backend::TestBackend;
+
+        for (lang, want) in [
+            (crate::i18n::Lang::Zh, "项目"),
+            (crate::i18n::Lang::En, "project"),
+        ] {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = App::test_app();
+            app.lang = lang;
+            app.set_sessions(vec![SessionInfo {
+                id: 1,
+                profile: "claude".into(),
+                dir: "/Users/lei/work/dc/dc-terminal".into(),
+                state: SessionState::Idle,
+                activity: String::new(),
+                is_agent: true,
+                tag: String::new(),
+            }]);
+            app.view = View::Board;
+            term.draw(|f| draw(f, &mut app)).unwrap();
+
+            let c = bar_text(&term);
+            assert!(c.contains(want), "{lang:?}：牌子上少了那个名词：{c}");
+            assert!(c.contains("dc-terminal"), "{lang:?}：项目名还得在：{c}");
+        }
+    }
+
+    /// **窄下来时让位的是那个名词，不是名字。** 名词在所有项目上都长一样，
+    /// 名字是唯一区分得出项目的东西——反过来让位等于用一个没信息量的词换掉
+    /// 了唯一有信息量的那部分。牌子自己在任何宽度上都在场。
+    #[test]
+    fn the_chip_drops_the_label_before_it_drops_the_name() {
+        let lang = crate::i18n::Lang::En;
+        // 宽到写得下名词 + 一段父目录
+        let roomy = bar_chip("dc-terminal", "~/work/dc", 24, lang);
+        assert!(roomy.starts_with("project "), "宽的时候要写名词：{roomy}");
+        assert!(roomy.contains("dc-terminal"), "名字永远在：{roomy}");
+
+        // 刚好装不下「名词 + 名字」：名词整个让掉，名字一个字都不许少
+        let tight = bar_chip("dc-terminal", "~/work/dc", 16, lang);
+        assert!(!tight.contains("project"), "窄的时候名词该让位：{tight}");
+        assert!(
+            tight.ends_with("dc-terminal"),
+            "让位换来的是完整的名字：{tight}"
+        );
+
+        // 连名字都装不下了才截名字，牌子还是不空
+        let cramped = bar_chip("dc-terminal", "~/work/dc", 6, lang);
+        assert!(!cramped.is_empty(), "牌子永远不空：{cramped}");
+        assert!(cramped.starts_with("dc-ter"), "截的是名字的尾巴：{cramped}");
+    }
+
+    /// 中文那个名词只有 4 列（`项目`），英文是 7 列（`project`）——同一个
+    /// 宽度下中文因此比英文多留得住一段父目录。这条钉住的是「名词的宽度算
+    /// 的是显示列数，不是字符数」。
+    #[test]
+    fn the_label_is_measured_in_columns_not_characters() {
+        let zh = bar_chip("dc-terminal", "~/work/dc", 20, crate::i18n::Lang::Zh);
+        let en = bar_chip("dc-terminal", "~/work/dc", 20, crate::i18n::Lang::En);
+        assert!(zh.starts_with("项目 "), "中文牌子：{zh}");
+        assert!(
+            widgets::display_width(&zh) <= 20 && widgets::display_width(&en) <= 20,
+            "两种语言都不许超预算：{zh} / {en}"
+        );
+        assert!(
+            zh.contains("dc/dc-terminal"),
+            "中文名词短，同一预算下父目录留得住：{zh}"
         );
     }
 

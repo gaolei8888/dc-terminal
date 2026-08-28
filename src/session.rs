@@ -2518,6 +2518,7 @@ mod tests {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(Profile {
+            backend_only: false,
             name: "flaky-name-2".into(),
             // 清屏和打 READY 仍然要在同一次 write 里（理由同上一条测试）。
             //

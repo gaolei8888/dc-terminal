@@ -190,6 +190,12 @@ are currently running (file changes stay, the agents don't), and asks before
 touching anything. Say yes and it swaps the daemon in and reconnects; say no and
 it carries on with the old one.
 
+`dct restart` does that swap on demand, without opening the board — for when the
+rebuild produced the same version number and nothing notices anything is stale.
+It asks the same question first, listing what will die; `dct restart -y` skips
+the question. With nothing running it says so and starts nothing: restarting is
+not starting.
+
 </details>
 
 ---

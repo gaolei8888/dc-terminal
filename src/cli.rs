@@ -216,6 +216,110 @@ fn run_on_targets(sock: &Path, lang: Lang, target: Target, force: Force) -> Resu
     Ok(if bad > 0 { 1 } else { 0 })
 }
 
+/// `dct restart` 的参数解析结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// 先问一句再动手
+    Ask,
+    /// `-y`：不问，直接换
+    Yes,
+    /// 参数不对
+    Usage(String),
+}
+
+/// 解析 `dct restart` 后面的参数。认的只有 `-y` / `--yes`。
+///
+/// 不认识的参数一律是用法错误，**不是「当没看见」**——理由写在
+/// `i18n::msg::restart_takes_no_args` 上。
+pub fn parse_restart_args(args: &[String], lang: Lang) -> Restart {
+    let mut yes = false;
+    for a in args {
+        match a.as_str() {
+            "-y" | "--yes" => yes = true,
+            other => return Restart::Usage(crate::i18n::msg::restart_takes_no_args(lang, other)),
+        }
+    }
+    if yes {
+        Restart::Yes
+    } else {
+        Restart::Ask
+    }
+}
+
+/// `dct restart`：把守护进程换成当前这个二进制，不开界面。
+///
+/// 为什么要有它：换掉守护进程这条路本来只有一个入口——界面启动时撞上旧版本
+/// 弹的那句问话（`main::offer_to_restart_stale_daemon`）。而「我刚 `cargo
+/// build` 完，想让后台跑上新的」跟「版本号对不上」是两件事：前者版本可能一样
+/// （同一个 commit 改了个字符串又编了一遍），根本触发不了那句问话，用户只剩
+/// `pkill -f "dct daemon"` 可用——而那条路认的是进程不是会话，跟本模块开头
+/// 说的是同一个问题。
+///
+/// **它跟 `ps`/`stop` 一样不会拉起守护进程。** 本来没东西在跑的时候，
+/// `restart` 想要的那个东西（换掉在跑的那个）压根不存在；顺手起一个等于
+/// 把「重启」偷偷变成「启动」，而启动是 `dct` 自己的事。
+///
+/// 返回值是退出码：换成了 0，参数不对 2，没换成 1。**「本来就没东西在跑」
+/// 是 0**，跟 `ps` 同一条规矩：那是个正常答案，不是错误。
+pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result<i32> {
+    let ask = match args {
+        Restart::Usage(msg) => {
+            eprintln!("{msg}");
+            return Ok(2);
+        }
+        Restart::Ask => true,
+        Restart::Yes => false,
+    };
+
+    let Some(mut c) = connect(sock) else {
+        println!("{}", text(Key::NoDaemonRunning, lang));
+        return Ok(0);
+    };
+
+    if ask {
+        // 先把要被断掉的东西摆出来再问。「会断掉正在跑的会话」是一句抽象的
+        // 话，而「3 号 claude 正在 ~/proj 里干活」是用户真正要衡量的代价。
+        if let Ok(Response::Sessions(v)) = c.call(Request::List) {
+            let live: Vec<SessionInfo> = v
+                .into_iter()
+                .filter(|s| s.state != SessionState::Stopped)
+                .collect();
+            if !live.is_empty() {
+                println!("{}", render_ps(&live, lang));
+            }
+        }
+        println!("{}", text(Key::RestartExplain, lang));
+        print!("{} ", text(Key::RestartAsk, lang));
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // stdin 读不到（脚本、cron、`< /dev/null`）就当没答应。这条命令会
+        // 杀掉所有正在跑的 agent，没人在场的时候**默认不动**才是对的——
+        // 无人值守要重启，请明写 `-y`。
+        let mut answer = String::new();
+        let said_yes = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)
+            .is_ok()
+            && answer.trim().eq_ignore_ascii_case("y");
+        if !said_yes {
+            println!("{}", text(Key::RestartCancelled, lang));
+            return Ok(0);
+        }
+    }
+
+    // 手里这条连接连着的正是马上要被杀掉的那个进程，先丢掉。
+    drop(c);
+    println!("{}", text(Key::StaleDaemonRestarting, lang));
+    match crate::client::restart_daemon(sock, exe) {
+        Ok(()) => {
+            println!("{}", text(Key::RestartDone, lang));
+            Ok(0)
+        }
+        Err(_) => {
+            eprintln!("{}", text(Key::RestartFailed, lang));
+            Ok(1)
+        }
+    }
+}
+
 /// `dct prune`：把已经停掉的会话从名册上抹掉。
 ///
 /// 不接参数、也没有 `--all`：这条命令本来就只对「已经停了的」下手，
@@ -548,6 +652,32 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `dct restart` 的参数：只认 `-y` / `--yes`，别的一律用法错误。
+    ///
+    /// 钉死「不认识的参数不等于没参数」：`dct restart --all` 要是被当成裸
+    /// `dct restart` 跑，用户以为自己限定了范围，实际连所有会话一起换掉。
+    #[test]
+    fn restart_only_accepts_the_yes_flag() {
+        let lang = Lang::Zh;
+        assert_eq!(parse_restart_args(&args(&[]), lang), Restart::Ask);
+        assert_eq!(parse_restart_args(&args(&["-y"]), lang), Restart::Yes);
+        assert_eq!(parse_restart_args(&args(&["--yes"]), lang), Restart::Yes);
+        assert!(matches!(
+            parse_restart_args(&args(&["--all"]), lang),
+            Restart::Usage(_)
+        ));
+        assert!(matches!(
+            parse_restart_args(&args(&["3"]), lang),
+            Restart::Usage(_)
+        ));
+        // `-y` 混着不认识的参数也是用法错误：不许因为看见了 `-y` 就把
+        // 后面那个看不懂的东西忽略掉。
+        assert!(matches!(
+            parse_restart_args(&args(&["-y", "--all"]), lang),
+            Restart::Usage(_)
+        ));
     }
 
     /// CRITICAL fix pin: `oauth_lookup` 曾经把 kimi/glm/deepseek/qwen-api

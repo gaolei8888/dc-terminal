@@ -20,12 +20,13 @@ dct —— vibe coding 终端
   dct prune        把已经停掉的会话从列表里清掉
   dct install <名字> 装一个 agent（claude / codex / qwen / opencode）。
                    缺 Node 运行时会自己补上一份，只给 dct 自己用
+  dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面
   dct --version    看装的是哪一版
   dct --help       看这段
 
-ps / stop / kill / prune 都不会拉起守护进程：问「有没有东西在跑」不该把
+ps / stop / kill / prune / restart 都不会拉起守护进程：问「有没有东西在跑」不该把
 「没有」变成「有」。
 ";
 
@@ -67,6 +68,15 @@ fn main() -> Result<()> {
                 std::process::exit(2)
             }
         },
+        // restart 换掉的是**整个**守护进程，所有会话跟着断，所以默认要问一句
+        // （`-y` 免问）。它跟 ps/stop 一样不会顺手拉起一个——理由在
+        // `cli::run_restart` 上。
+        Some("restart") => {
+            let target = dct::cli::parse_restart_args(&args[1..], cli_lang());
+            let exe = std::env::current_exe()?;
+            let code = dct::cli::run_restart(&socket_path(), &exe, cli_lang(), target)?;
+            std::process::exit(code)
+        }
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
         // 通路，跟会话、pty 都无关。
         Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
