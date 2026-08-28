@@ -39,11 +39,9 @@ use dct_link::{
 };
 use tokio::sync::mpsc;
 
-/// 一次长轮询最多挂多久。
-///
-/// 30 秒是照着运营商 NAT 的回收时间挑的（spec「断线」那一节）：挂得比它久，
-/// 连接会被中间的某个盒子悄悄掐掉，而两端都不知道。
-pub const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 一次长轮询最多挂多久。**这个数字两边共用**，理由见 `dct_link::POLL_TIMEOUT`
+/// ——守护进程要拿它算自己的读超时，算错一边整条链路就永远连不上。
+pub const DEFAULT_POLL_TIMEOUT: Duration = dct_link::POLL_TIMEOUT;
 
 /// 每台设备的信箱能存几个信封。
 ///
