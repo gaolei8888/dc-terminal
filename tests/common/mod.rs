@@ -103,17 +103,33 @@ pub fn posix_tool(name: &str) -> String {
             .arg("git.exe")
             .output()
             .expect("找不到 git.exe——夹具要借用它自带的 POSIX 工具");
-        let git = String::from_utf8_lossy(&out.stdout)
+        // **别只看第一条，也别数层数。** `where` 会给出好几个 git.exe，
+        // 顺序由 PATH 决定：这台机器上第一条是 `<Git>\mingw64\bin\git.exe`，
+        // 往上两级是 `<Git>\mingw64`，那底下没有 `usr\bin`。第二条
+        // `<Git>\cmd\git.exe` 往上两级才是对的。哪一条排在前面取决于跑
+        // 测试的是哪个终端，所以「取第一条 + 上两级」这个写法在同一台机器
+        // 上时灵时不灵。
+        //
+        // 改成：每一条候选都往上一级一级找，谁底下有 `usr\bin\<name>.exe`
+        // 就用谁。层数不用猜，PATH 的顺序也不再重要。
+        let found = String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(|l| l.trim().to_string())
-            .find(|l| !l.is_empty())
-            .expect("where git.exe 没给出路径");
-        let root = std::path::Path::new(&git)
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("git.exe 的路径太浅");
-        let p = root.join("usr").join("bin").join(format!("{name}.exe"));
-        assert!(p.is_file(), "{} 不在那儿", p.display());
-        p.display().to_string()
+            .filter(|l| !l.is_empty())
+            .find_map(|git| {
+                std::path::Path::new(&git)
+                    .ancestors()
+                    .map(|root| root.join("usr").join("bin").join(format!("{name}.exe")))
+                    .find(|p| p.is_file())
+            });
+        match found {
+            Some(p) => p.display().to_string(),
+            None => panic!(
+                "在 git.exe 附近找不到 {name}.exe。夹具借的是 Git for Windows \
+                 自带的那套 POSIX 工具（`<Git>\\usr\\bin`）；`where git.exe` \
+                 给出的是：{}",
+                String::from_utf8_lossy(&out.stdout).replace('\n', " ")
+            ),
+        }
     }
 }
