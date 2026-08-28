@@ -32,8 +32,14 @@
     --busy: #8a5a00;
     --bad: #a8322a;
   }
+  /* 深色那一档写两遍，**不是重复**：
+     - `prefers-color-scheme` 管「跟随系统」那一档（没选过就走它）；
+     - `[data-theme="dark"]` 管用户在这一页上明确选的那一档，而且要能
+       在系统是浅色时**压过**上面那条。
+     反过来 `[data-theme="light"]` 也要能在系统是深色时压回浅色，所以
+     浅色那一组不能只写在 `:root` 上——它得能再声明一次。 */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #0f1116;
       --card: #171a20;
       --ink: #e7eaef;
@@ -44,6 +50,28 @@
       --busy: #e8c07d;
       --bad: #e88c7d;
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1116;
+    --card: #171a20;
+    --ink: #e7eaef;
+    --dim: #8b95a5;
+    --line: #262b34;
+    --accent: #63b3d9;
+    --ok: #7fc08c;
+    --busy: #e8c07d;
+    --bad: #e88c7d;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #14161b;
+    --dim: #5b6472;
+    --line: #d9dde3;
+    --accent: #005f87;
+    --ok: #2f6f3e;
+    --busy: #8a5a00;
+    --bad: #a8322a;
   }
   * { box-sizing: border-box; }
   /* `hidden` 属性的 display:none 来自浏览器默认样式，而作者样式里**任何**
@@ -202,6 +230,7 @@
     <button type="button" class="zoom" id="zoomout">A&minus;</button>
     <button type="button" class="zoom" id="zoomin">A+</button>
     <button type="button" class="zoom" id="kbd">&#9000;</button>
+    <button type="button" class="zoom" id="theme" aria-label="theme">&#9681;</button>
   </span>
 </header>
 <main id="list"></main>
@@ -249,6 +278,7 @@
   var backEl = document.getElementById("back");
   var zoomsEl = document.getElementById("zooms");
   var kbdEl = document.getElementById("kbd");
+  var themeEl = document.getElementById("theme");
   var captureEl = document.getElementById("capture");
   var headEl = document.getElementById("head");
   var whyEl = document.getElementById("why");
@@ -347,14 +377,83 @@
   // 256 色索引 → CSS。0–15 是终端自己的十六色（各家主题不一样，这里用一套
   // 常见的取值），16–231 是 6×6×6 色立方，232–255 是灰阶。跟
   // `ui::mod.rs` 里那条对比度守卫算的是同一套公式。
-  var BASE16 = [
-    "#000000", "#cd0000", "#00cd00", "#cdcd00",
-    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
-    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
-    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff"
-  ];
+  // ——配色——
+  //
+  // 三档：跟随系统（默认）、浅、深。选过的存 localStorage，**只存在这台
+  // 手机上**：同一个 dct 可能同时被好几个人打开，一个人挑的颜色不该跳到
+  // 另一个人的屏幕上，更不该跑回桌面去（桌面那一侧的配色归桌面自己，
+  // 同 spec 决定四「手机没有 resize 权」那条道理）。
+  var THEMES = ["system", "light", "dark"];
+  var themeIdx = 0;
+  try {
+    var saved = localStorage.getItem("dct-theme");
+    if (THEMES.indexOf(saved) > 0) { themeIdx = THEMES.indexOf(saved); }
+  } catch (e) {
+    // 隐私模式下 localStorage 会抛。选不过是记不住，页面照常能用。
+  }
+
+  // 眼下到底是深还是浅。**跟随系统那一档要去问系统**，不能只看属性：
+  // 画屏幕那套色号靠它选调色板，看错了整屏字会压在同色背景上。
+  function isDark() {
+    var t = THEMES[themeIdx];
+    if (t === "dark") { return true; }
+    if (t === "light") { return false; }
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  var lastLines = null;
+
+  // 重画上一屏。**必须存在**：屏幕那一片 <span> 上钉的是行内 style，
+  // 里面是上一套调色板算出来的颜色，光换 CSS 变量动不了它们。
+  function repaint() {
+    if (lastLines) { paint(lastLines); }
+  }
+
+  function applyTheme() {
+    var t = THEMES[themeIdx];
+    if (t === "system") {
+      document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.setAttribute("data-theme", t);
+    }
+    // 屏幕已经画出来的那一片 <span> 上钉着上一套调色板算出来的颜色，
+    // 不重画的话切了主题只有外壳变、正文不变。
+    repaint();
+  }
+
+  // 系统在「跟随系统」那一档下变了色，也要跟着走。
+  if (window.matchMedia) {
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    var onSys = function () { if (THEMES[themeIdx] === "system") { applyTheme(); } };
+    if (mq.addEventListener) { mq.addEventListener("change", onSys); }
+    else if (mq.addListener) { mq.addListener(onSys); }
+  }
+
+  // ANSI 的 0–15 号没有固定的 RGB——终端主题自己定。这里要两套，因为
+  // **同一套色号在深底和浅底上不可能都读得清**：经典 xterm 那套是为黑底
+  // 配的，把它压在白底上，11 号亮黄（#ffff00）和 15 号白（#ffffff）直接
+  // 隐形；反过来浅底那套压在黑底上，0 号黑也一样看不见。
+  //
+  // 浅底那套里 7/15 号**故意不是白色**：在黑底终端上它们是默认前景（也就是
+  // 正文），照字面画成白色的话，一屏正文在白底上全部消失。所有「亮」色也
+  // 相应压暗——亮色在浅底上的作用是「更重」，不是「更亮」。
+  var PALETTE = {
+    dark: [
+      "#000000", "#cd0000", "#00cd00", "#cdcd00",
+      "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+      "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+      "#5c5cff", "#ff00ff", "#00ffff", "#ffffff"
+    ],
+    light: [
+      "#2b2f36", "#a8322a", "#2f6f3e", "#8a5a00",
+      "#005f87", "#8b3a8b", "#16697a", "#3a3f4a",
+      "#5b6472", "#c0392b", "#3d8b50", "#a06a00",
+      "#0a6f9c", "#a34aa3", "#1c7f92", "#14161b"
+    ]
+  };
   function idxColor(i) {
-    if (i < 16) { return BASE16[i]; }
+    var base = PALETTE[isDark() ? "dark" : "light"];
+    if (i < 16) { return base[i]; }
     if (i >= 232) {
       var v = 8 + 10 * (i - 232);
       return "rgb(" + v + "," + v + "," + v + ")";
@@ -480,6 +579,10 @@
     if (!resp || !resp.Screen) { throw new Error("unexpected response"); }
     var s = resp.Screen;
     var lines = s.lines || [];
+    // 留一份：切配色要拿它原样重画一遍（`repaint`）。存的是协议里的
+    // 颜色（"Default"/{Idx}/{Rgb}），不是算好的 CSS，所以换调色板之后
+    // 重算出来的就是新那套。
+    lastLines = lines;
     var cols = paint(lines);
     lastCols = cols;
     lastRows = lines.length;
@@ -853,6 +956,21 @@
   });
 
   kbdEl.addEventListener("click", function () { setCapture(!capturing); });
+
+  // 按一下换下一档：跟随系统 → 浅 → 深 → 跟随系统。三档轮转而不是
+  // 两档开关，是因为「跟随系统」得是能回得去的一档——手机在傍晚自己
+  // 变深色，用户多半希望这一页也跟着变。
+  themeEl.addEventListener("click", function () {
+    themeIdx = (themeIdx + 1) % THEMES.length;
+    try {
+      localStorage.setItem("dct-theme", THEMES[themeIdx]);
+    } catch (e) {
+      // 记不住就算了，这一次的选择照样生效。
+    }
+    applyTheme();
+  });
+
+  applyTheme();
 
   document.getElementById("zoomout").addEventListener("click", function () {
     setZoom(zoom / 1.15);

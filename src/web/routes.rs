@@ -199,6 +199,51 @@ fn query_get<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 网页里那套配色**必须两档都在**。
+    ///
+    /// 这一条挡的是一个很容易发生、而且发生了没人会立刻发现的编辑：
+    /// 顺手删掉浅色那套调色板，或者把切换按钮拿掉。测试跑不了浏览器里的
+    /// JS，所以这里只钉住「东西还在」——那正是丢了之后最贵的那一部分：
+    /// 深色手机上一屏白底、或者浅色手机上一屏看不见的亮黄。
+    #[test]
+    fn the_page_ships_both_palettes_and_a_way_to_switch() {
+        for needle in [
+            "PALETTE",
+            "dark:",
+            "light:",
+            "data-theme",
+            "prefers-color-scheme",
+            "id=\"theme\"",
+            "dct-theme",
+        ] {
+            assert!(
+                PAGE.contains(needle),
+                "网页里少了 {needle}——配色这套东西缺一块就只剩一半能用"
+            );
+        }
+    }
+
+    /// 浅色那套里 7/15 号**不许是白的**。
+    ///
+    /// 它们在黑底终端上是默认前景，也就是正文。照字面画成白色的话，
+    /// 白底上一整屏正文直接消失——这不是配色难看，是页面没内容。
+    #[test]
+    fn the_light_palette_never_paints_body_text_white() {
+        let light = PAGE
+            .split("light: [")
+            .nth(1)
+            .expect("浅色调色板不见了")
+            .split(']')
+            .next()
+            .unwrap();
+        for white in ["#ffffff", "#fff\"", "#e5e5e5"] {
+            assert!(
+                !light.contains(white),
+                "浅色调色板里出现了 {white}：白底上的正文会整屏消失\n{light}"
+            );
+        }
+    }
     use super::*;
     use std::sync::Mutex;
 
