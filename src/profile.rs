@@ -930,6 +930,34 @@ mod tests {
             .is_match("(12s • esc to interrupt)"));
     }
 
+    /// **每个我们知道绕过参数的 agent，profile 里必须真的带着它。**
+    ///
+    /// 这不是风格问题。dct 敢让 agent 关掉所有权限确认，靠的是每轮之前那张
+    /// 隐藏快照——「它从来不问这样可以吗」是产品承诺的一半，另一半是「反悔
+    /// 只要一个键」。漏掉这个参数，agent 会在动第一个文件时停下来等人点头，
+    /// 而看板上只会显示成「在干活」，用户要进到会话里才发现它其实在等他。
+    ///
+    /// `qwen` 就这么漏了很久（`command = ["qwen"]`），因为它一次都没真跑过。
+    /// 这条测试是为了让下一次「顺手编辑一下 profile」不会又把它删掉。
+    ///
+    /// **只列我们实测过的。** `opencode` 不在这儿——它的绕过参数叫什么还没人
+    /// 验过，凭想象填一个进去只会让这条测试变成谎话。
+    #[test]
+    fn every_agent_we_know_the_flag_for_actually_carries_it() {
+        for (name, flag) in [
+            ("claude", "--dangerously-skip-permissions"),
+            ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+            ("qwen", "--approval-mode=yolo"),
+        ] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.command.iter().any(|a| a == flag),
+                "{name} 的 command 里必须有 {flag}，否则它会停下来问用户：{:?}",
+                p.command
+            );
+        }
+    }
+
     #[test]
     fn unverified_profiles_have_no_pattern() {
         // opencode / qwen 的 TUI 没实测过。宁可状态显示「—」，不能瞎猜一个 pattern

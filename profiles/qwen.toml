@@ -1,7 +1,17 @@
 name = "qwen"
-command = ["qwen"]
+# `--approval-mode=yolo`：不带它，agent 每要动一个文件、跑一条命令都会停下来
+# 等人点头，而 dct 的整个前提是「它从来不问这样可以吗」——那份底气来自每轮
+# 之前的隐藏快照，不是来自逐条确认。README 那句「command 里记得带上这个
+# agent 自己的权限绕过参数」说的就是这里，而这个 profile 一直漏着它。
+#
+# 写 `--approval-mode=yolo` 而不是 `--yolo`：两个都还能用，但 Qwen Code
+# 自己的文档说前者是取代后者的新写法（"Use `--approval-mode=yolo` instead
+# of `--yolo` for the new unified approach"），而且两个同时给会直接报错。
+# 实测于 qwen-code 0.22.2。
+command = ["qwen", "--approval-mode=yolo"]
 is_agent = true
-# 同 opencode，未实测
+# 两个 pattern 仍然不填：TUI 没实测过，编一个假的会让正在干活的会话在看板上
+# 显示成空闲。状态显示「—」是承认不知道。
 
 [label]
 zh = "Qwen Code"
