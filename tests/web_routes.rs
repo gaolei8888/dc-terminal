@@ -176,7 +176,15 @@ fn a_wrong_token_gets_nothing_even_with_a_healthy_daemon() {
 fn serve_for_a_manual_look() {
     let sock = dirs_home().join(".dct").join("daemon.sock");
     let client = Client::connect(&sock).expect("这台机器上得有个跑着的 dct 守护进程");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // **绑所有网卡**，不是回环：手机和平板要够得着。
+    //
+    // 那为什么不干脆用产品里那个 `w` 开关？因为网页是**守护进程**发的，
+    // 而守护进程一活就是好几天——它手里那份页面是它启动那天的。要验证刚写完
+    // 的前端，要么重启守护进程（结束正在跑的会话），要么就走这条：这个测试
+    // 进程是刚编出来的，它手里那份页面就是工作区里这一份。
+    //
+    // 代价：第一次跑会弹一次防火墙授权框（同 `daemon::WEB_BIND` 那段注释）。
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     let token = web::new_token().unwrap();
     let server = web::serve(
         listener,
@@ -204,7 +212,27 @@ fn serve_for_a_manual_look() {
         println!("MANUAL_SCRATCH {id}");
     }
 
-    println!("MANUAL_URL http://{}/#t={}", server.addr(), token);
+    // 地址用局域网 IP，不是监听器报的 `0.0.0.0`——后者手机上打不开。
+    let host = match dct::web::lan_ip() {
+        Some(ip) => ip.to_string(),
+        None => {
+            println!("MANUAL_NOTE 算不出局域网地址，只能本机访问");
+            "127.0.0.1".to_string()
+        }
+    };
+    let url = format!("http://{}:{}/#t={}", host, server.addr().port(), token);
+    println!("MANUAL_URL {url}");
+
+    // 顺手把二维码给出来：那串令牌有 64 个十六进制字符，在平板上手输是
+    // 不可能的事（这正是产品里那个码存在的理由，见 `src/qr.rs`）。
+    //
+    // 画到终端**和**写成文件，两份都要：这个脚手架经常是被后台跑起来的，
+    // 而那时候终端里那份的颜色转义会被日志吞掉，只剩一片 `▀`——扫不了。
+    print_qr(&url);
+    match write_qr_svg(&url) {
+        Ok(path) => println!("MANUAL_QR {}", path.display()),
+        Err(e) => println!("MANUAL_NOTE 二维码写不出来：{e}"),
+    }
     // 挂 15 分钟。**三分钟太短**：这是给人用眼睛验收的脚手架，而"打开浏览器、
     // 点进一个会话、翻翻历史、试一下打字"本来就不止三分钟——上一次就是看到
     // 一半服务自己没了。
@@ -216,6 +244,70 @@ fn serve_for_a_manual_look() {
         let _ = c2.call(Request::Prune);
     }
     server.stop();
+}
+
+/// 把二维码画到 stdout 上。
+///
+/// 跟设置页里那块码是同一个 `qr` 模块、同一套颜色（16 号纯黑 / 231 号纯白，
+/// 每一格自己钉死前景和背景）——**颜色不能交给终端主题**，深色主题下整块码
+/// 会变成反相的，有些手机就认不出来了。
+fn print_qr(data: &str) {
+    let Some(art) = dct::qr::render(data) else {
+        println!("MANUAL_NOTE 这段地址编不成二维码");
+        return;
+    };
+    for row in &art.rows {
+        let mut line = String::new();
+        for cell in row {
+            let idx = |c: ratatui::style::Color| match c {
+                ratatui::style::Color::Indexed(i) => i,
+                _ => 0,
+            };
+            // `▀`：前景画上半格、背景画下半格，一个字符格装两个模块。
+            line.push_str(&format!(
+                "[38;5;{}m[48;5;{}m▀",
+                idx(cell.top),
+                idx(cell.bottom)
+            ));
+        }
+        line.push_str("[0m");
+        println!("{line}");
+    }
+}
+
+/// 把二维码写成一个 SVG 文件，返回路径。双击就能看，然后拿平板扫。
+///
+/// 用 SVG 不用 PNG：不引任何图片库，一个模块就是一个 `<rect>`，而且放大
+/// 不糊——摄像头扫的是对比度，糊了就认不出来。
+fn write_qr_svg(data: &str) -> std::io::Result<std::path::PathBuf> {
+    let art = dct::qr::render(data).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "这段地址编不成二维码")
+    })?;
+    // 一格两个模块（上下半块），所以纵向的模块数是行数的两倍。
+    let side = art.cols;
+    const PX: usize = 10;
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{0}\" height=\"{0}\"          viewBox=\"0 0 {1} {1}\"><rect width=\"{1}\" height=\"{1}\" fill=\"#fff\"/>",
+        side * PX,
+        side
+    );
+    for (r, row) in art.rows.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            for (half, color) in [(0usize, cell.top), (1usize, cell.bottom)] {
+                if color == dct::qr::DARK {
+                    let y = r * 2 + half;
+                    svg.push_str(&format!(
+                        "<rect x=\"{c}\" y=\"{y}\" width=\"1\" height=\"1\" fill=\"#000\"/>"
+                    ));
+                }
+            }
+        }
+    }
+    svg.push_str("</svg>");
+
+    let path = std::env::temp_dir().join("dct-manual-qr.svg");
+    std::fs::write(&path, svg)?;
+    Ok(path)
 }
 
 fn dirs_home() -> std::path::PathBuf {
