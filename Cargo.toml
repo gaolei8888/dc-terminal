@@ -1,3 +1,11 @@
+# 这个仓库从 2026-08-28 起是个 workspace。根包仍然是 `dct` 本身——**没有把
+# `src/` 搬进 `crates/dct/`**，那会产生一个几百个文件的 rename diff，把真正
+# 的改动淹掉，而唯一的收获是目录看起来整齐。
+#
+# `crates/dct-srv`（中转服务）还没建，等第一期任务 2。它一建就要加进来。
+[workspace]
+members = ["crates/dct-link"]
+
 [package]
 name = "dct"
 version = "0.2.3"
@@ -5,6 +13,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+# 跟中转服务共用的信封。`dct` 和 `dct-srv` 谁也不依赖谁，共同依赖这个。
+dct-link = { path = "crates/dct-link" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -104,13 +104,33 @@ pub struct Envelope {
 
 ## Tasks
 
-### 任务 1：拆 workspace，建 `dct-link`
+### 任务 1：拆 workspace，建 `dct-link` ✅（2026-08-28）
 
-- [ ] 根 `Cargo.toml` 加 `[workspace] members = [".", "crates/dct-link", "crates/dct-srv"]`
-- [ ] 新建 `crates/dct-link`，只放 `Envelope`、`EndpointId`、`AuthFrame`、错误码、`LINK_VERSION`
-- [ ] `dct` 依赖 `dct-link`；**`src/proto.rs` 一行不动**
-- [ ] 测试：信封 JSON 形状被钉住（同 `proto.rs` 里 `the_request_shape_is_pinned_to_the_protocol_version` 的写法）
-- [ ] 验收：`cargo tree -p dct` 里没有 `tokio`；`cargo test --workspace` 全绿
+- [x] 根 `Cargo.toml` 加 `[workspace]`。**`members` 里只有 `crates/dct-link`**：
+      计划原文写的是 `[".", "crates/dct-link", "crates/dct-srv"]`，但列一个还不存在的
+      成员 cargo 直接报错，`dct-srv` 等任务 2 建出来再加；根包是隐式成员，`"."` 不用写
+- [x] 新建 `crates/dct-link`，只放 `Envelope`、`EndpointId`、`AuthFrame`、`LinkError`、
+      `EndpointKind`、`PubKey`、`LINK_VERSION`、`MAX_PAYLOAD`
+- [x] `dct` 依赖 `dct-link`；**`src/proto.rs` 一行不动**
+- [x] 测试：信封、鉴权帧、错误码三样的 JSON 形状都钉在 `LINK_VERSION` 上
+- [x] 验收：`cargo tree -p dct` 里没有 `tokio`；`cargo test --workspace` 全绿（1023 + 8）
+
+**计划里没写、做的时候才发现要定的三件事：**
+
+1. **payload 走 base64，不走 serde 默认的数字数组。** 默认写法一个字节要四五个字符，
+   整屏画面上公网时这个放大倍数是要命的；base64 只放大 1.33 倍。为此给 `dct-link`
+   加了 `base64` 依赖（纯 Rust，不破坏「整棵依赖树一行 C 都没有」）。
+2. **`EndpointId` 是个校验过的新类型，不是 `String`。** 它是中转的路由键，从网络上来：
+   不限长等于让人把设备表撑爆，不限字符集等于放控制字符和换行进来——今天当 HashMap
+   的 key 没事，明天有人把它写进日志或 HTTP 头就出事。校验挂在 `TryFrom<String>` 上，
+   所以**走 serde 解出来的 id 也必须过同一道检查**（有测试盯着这条）。
+3. **`AuthFrame` 多了 `kind`（`Computer` / `Phone`）。** 笔记本带的是配对 token，手机带的
+   是 dc_classroom 的登录 token，验法完全不同；不写这个字段，中转只能拿凭据挨个验证器
+   去猜。
+
+变异测试：长度边界 `>` 改 `>=`、删空串检查、字符集判断取反、删超大 payload 预检、
+去掉 `try_from` 让 JSON 绕过校验、去掉 `recipients` 的 `serde(default)`——六个变异全部
+有测试挂。
 
 ### 任务 2：srv 骨架 —— 路由与设备表
 

@@ -219,6 +219,7 @@ version = "0.2.3"
 dependencies = [
  "anyhow",
  "crossterm",
+ "dct-link",
  "getrandom 0.2.17",
  "libc",
  "portable-pty",
@@ -236,6 +237,15 @@ dependencies = [
  "ureq",
  "vt100",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "dct-link"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,0 +1,13 @@
+[package]
+name = "dct-link"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 信封的 payload 是任意字节（第一期是 JSON 文本，第二期是密文），而信封本身
+# 走 JSON。serde 默认会把 `Vec<u8>` 写成一个数字数组——一个字节四五个字符，
+# 整屏画面那种东西上公网时这个放大倍数是要命的。base64 只放大 1.33 倍。
+# 纯 Rust，没有 C，符合仓库那条「整棵依赖树一行 C 都没有」的规矩。
+base64 = "0.22"
