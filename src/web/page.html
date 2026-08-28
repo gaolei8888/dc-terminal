@@ -135,7 +135,7 @@
   .state.stopped, .state.unknown { color: var(--dim); }
   .project { font-size: .8rem; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .activity {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--mono);
     font-size: .78rem; color: var(--dim);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
@@ -145,9 +145,15 @@
   /* 会话画面。整块是一张固定宽度的画布——手机不改 PTY 尺寸（spec 决定四），
      所以这里靠字号把它缩到屏幕宽度，缩到看不清就让人自己捏放大。 */
   #screen { flex: 1 1 auto; min-height: 0; position: relative; padding: .5rem; overflow: auto; }
+  /* 等宽字体只定义这一次。**尺子必须跟画面用同一套**——尺子是
+     `#screen` 的直接子元素、`<pre>` 的兄弟，`#screen pre` 那条选择器
+     根本不匹配它，于是它继承 body 的比例字体。拿比例字体量出来的
+     「每个字符多宽」偏大（量的还是 M，比例字体里最宽的字母之一），
+     光标就越往右偏得越多，`fitFont` 也会把字号挑小、右边空一条。 */
+  :root { --mono: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace; }
   #screen pre {
     margin: 0;
-    font-family: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace;
+    font-family: var(--mono);
     line-height: 1.2;
     white-space: pre;
     /* 画面里的字不参与系统的自动放大：iOS 会把它当正文放大，一行就散了 */
@@ -182,7 +188,8 @@
     opacity: 0; pointer-events: none;
   }
   header.stale .zoom { border-color: var(--bg); color: var(--bg); }
-  #ruler { position: absolute; visibility: hidden; white-space: pre; }
+  /* 尺子：量「一个字符多宽」。字体必须跟 `#screen pre` 一致，见那边的注释。 */
+  #ruler { position: absolute; visibility: hidden; white-space: pre; font-family: var(--mono); }
 
   /* 输入区：贴在底边，软键盘弹起来时不会被盖住（`position: sticky` 跟着
      视觉视口走，而 `fixed` 在 iOS 上会被键盘顶到看不见的地方）。 */

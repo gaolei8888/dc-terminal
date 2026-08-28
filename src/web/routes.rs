@@ -848,6 +848,46 @@ mod tests {
         }
     }
 
+    /// **尺子和画面必须用同一套字体。**
+    ///
+    /// 这条守卫是为一个真实的缺陷立的：`#ruler` 是 `#screen` 的直接子元素、
+    /// `<pre>` 的兄弟，而等宽字体原来只写在 `#screen pre` 上——那条选择器
+    /// 不匹配尺子，于是它继承 body 的比例字体。用比例字体量出来的「每个
+    /// 字符多宽」偏大，`placeCursor` 的光标块越往右偏得越多，`fitFont`
+    /// 也会把字号挑小、画面右边空一条。
+    ///
+    /// 钉的是「只有一处定义、两处都引它」——各写一份的话，改了一处忘了
+    /// 另一处，这个缺陷就原样回来了，而且症状很难联想到字体。
+    #[test]
+    fn the_ruler_measures_in_the_same_font_the_screen_paints_in() {
+        let code = PAGE;
+        assert!(
+            code.contains("--mono:"),
+            "等宽字体没有单独一处定义——尺子和画面迟早各用各的"
+        );
+        // 画面和尺子这两条规则**各自**都要引它——数个数不够，那样两处
+        // 都引在别的地方也能凑出来。
+        for rule in ["#screen pre {", "#ruler {"] {
+            let body = code
+                .split_once(rule)
+                .unwrap_or_else(|| panic!("{rule} 没了"))
+                .1
+                .split_once('}')
+                .expect("规则没闭合")
+                .0;
+            assert!(
+                body.contains("font-family: var(--mono)"),
+                "{rule} 没用 --mono——尺子和画面又各用各的字体了"
+            );
+        }
+        // 字体名只许出现在那一处定义里，别处不许再拼一遍。
+        assert_eq!(
+            code.matches("ui-monospace").count(),
+            1,
+            "等宽字体名出现了不止一次——迟早两处会漂"
+        );
+    }
+
     /// **实体键盘上的那几个键也不许当按键发下去。**
     ///
     /// 捕获模式收的是真键盘，`PageUp`/`PageDown`/`End` 一按一个准。它们
