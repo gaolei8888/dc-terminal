@@ -204,6 +204,12 @@ pub enum Key {
     WebNextStepOn,
     /// 开着但算不出地址时的下一步：先把这台电脑连上 WiFi
     WebNextStepAddressUnknown,
+    /// 手机网页上输入框的提示语：点屏幕上的一行，把那行文字放进输入框。
+    ///
+    /// 手机上没有桌面那个 `F4` 复制模式（临时把鼠标还给终端去拖选），
+    /// 而长按选中在真机上不好使——于是「把屏幕上的字弄进输入框」这件事
+    /// 在手机上原本无路可走。这句话是那条路的唯一说明书。
+    TapLineToInsert,
     /// 底栏上「打开」那一格的动作名。
     WebTurnOn,
     /// 底栏上「关掉」那一格的动作名。
@@ -541,6 +547,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Put this computer on the same WiFi as the phone, then press w twice to restart it",
             zh: "先把这台电脑连上手机那个 WiFi，再按两下 w 重开",
+        ),
+        TapLineToInsert => t!(
+            lang,
+            en: "Type here, or tap a line above to copy it in",
+            zh: "在这儿打字，或者点上面某一行把它放进来",
         ),
         WebTurnOn => t!(lang, en: "turn on", zh: "打开"),
         WebTurnOff => t!(lang, en: "turn off", zh: "关掉"),
@@ -1873,6 +1884,7 @@ mod tests {
             KeyboardCapture,
             WebToggle,
             WebTurnOn,
+            TapLineToInsert,
             WebTurnOff,
             OtherKeysGoToAgent,
             BackToListWord,
@@ -2013,7 +2025,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 151, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 152, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

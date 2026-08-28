@@ -36,6 +36,7 @@ pub const NEEDED: &[(&str, Key)] = &[
     ("stopped", Key::StatusStopped),
     ("failed", Key::StatusFailed),
     ("unknown", Key::StatusUnknown),
+    ("tapline", Key::TapLineToInsert),
 ];
 
 /// 一门语言的整张表，JSON。

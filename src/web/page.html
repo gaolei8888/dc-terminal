@@ -503,14 +503,21 @@
     var cols = 0;
     lines.forEach(function (spans, row) {
       var width = 0;
+      // **每一行套一个 `<span class="row">`。** 点一行要把这一行的字取出来，
+      // 而原来所有 span 是平铺的，点中之后无从知道自己落在第几行。
+      // 换行符仍然留在行外面：`pageStep()` 靠 `canvasEl.textContent` 数行数，
+      // 把 `\n` 收进行里会让那个数字变，而它管的是翻页步长。
+      var line = document.createElement("span");
+      line.className = "row";
       spans.forEach(function (sp) {
         var el = document.createElement("span");
         var css = styleOf(sp.style);
         if (css) { el.setAttribute("style", css); }
         el.textContent = sp.text;
         width += sp.text.length;
-        canvasEl.appendChild(el);
+        line.appendChild(el);
       });
+      canvasEl.appendChild(line);
       if (width > cols) { cols = width; }
       if (row < lines.length - 1) {
         canvasEl.appendChild(document.createTextNode("\n"));
@@ -1047,6 +1054,50 @@
     // （切标签页、刷新）留给浏览器——否则用户会被关在这一页里出不去。
   });
 
+  // ——点一行，把它放进输入框——
+  //
+  // 手机上没有桌面那个 `F4` 复制模式，长按选中在真机上也不好使，于是
+  // 「把屏幕上的字弄进输入框」原本无路可走——而这正是最常要做的一件事：
+  // agent 打了一条命令或一个建议出来，人想拿过来改一改再发回去。
+  //
+  // **只认真正的「点」，不认滑动。** 画面区自己要滚，手指一划就取消——
+  // 不判这一下的话，每次滚动都会往输入框里塞一行。
+  var tapFrom = null;
+  var tapCancelled = false;
+  canvasEl.addEventListener("touchstart", function (e) {
+    var t = e.touches[0];
+    tapFrom = t ? { x: t.clientX, y: t.clientY } : null;
+    tapCancelled = false;
+  }, { passive: true });
+  canvasEl.addEventListener("touchmove", function (e) {
+    if (!tapFrom || tapCancelled) { return; }
+    var t = e.touches[0];
+    if (!t) { return; }
+    // 10px 是「手指按住不动也会抖一点」和「这是一次滑动」之间的界线。
+    if (Math.abs(t.clientX - tapFrom.x) > 10 || Math.abs(t.clientY - tapFrom.y) > 10) {
+      tapCancelled = true;
+    }
+  }, { passive: true });
+
+  canvasEl.addEventListener("click", function (e) {
+    // 滑动过就不算点。鼠标点（桌面浏览器调试用）根本不产生 touch 事件，
+    // `tapCancelled` 一直是 false，照常放行。
+    if (tapCancelled) { tapCancelled = false; return; }
+    var row = e.target && e.target.closest ? e.target.closest(".row") : null;
+    if (!row || !lineEl) { return; }
+    // 终端每一行都补足了宽度，右边一大片空格；不裁掉的话输入框里全是空白。
+    var text = row.textContent.replace(/\s+$/, "");
+    if (!text) { return; }
+    // **往后接，不覆盖。** 输入框里已经打了字的时候覆盖掉就是把人的活儿
+    // 弄丢了，而接在后面最坏也只是多一段可以删掉的字。空框时接=放进去，
+    // 一条规则管两种情况。
+    var cur = lineEl.value;
+    lineEl.value = cur && !/\s$/.test(cur) ? cur + " " + text : cur + text;
+    lineEl.focus();
+    // 光标放到末尾：接进来就是为了在后面接着改。
+    try { lineEl.setSelectionRange(lineEl.value.length, lineEl.value.length); } catch (err) { /* 某些输入类型不支持 */ }
+  });
+
   kbdEl.addEventListener("click", function () { setCapture(!capturing); });
 
   // 按一下换下一档：跟随系统 → 浅 → 深 → 跟随系统。三档轮转而不是
@@ -1084,6 +1135,9 @@
       document.getElementById("zoomin").setAttribute("aria-label", t("bigger"));
       backEl.setAttribute("aria-label", t("back"));
       kbdEl.setAttribute("aria-label", t("keyboard"));
+      // 输入框的提示语兼这条功能的说明书：点一行能把它放进来这件事
+      // 没有任何别的地方写着，不写就等于没做（屏幕上不许有猜出来的功能）。
+      lineEl.setAttribute("placeholder", t("tapline"));
       start();
     });
 })();

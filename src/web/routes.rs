@@ -825,6 +825,29 @@ mod tests {
         }
     }
 
+    /// 点一行放进输入框：**三块都要在**——行有自己的元素、滑动会取消、
+    /// 接在后面而不是覆盖。
+    ///
+    /// 这条功能在手机上没有替代路径：桌面的 `F4` 复制模式这边没有，长按
+    /// 选中在真机上也不好使。少任何一块的症状都很具体：行不套元素就不知道
+    /// 点中了第几行；不判滑动就每次滚屏都往输入框塞一行；覆盖式写入会把
+    /// 用户已经打了一半的字弄丢。
+    #[test]
+    fn tapping_a_line_puts_it_in_the_box() {
+        let code = page_without_comments();
+        for needle in [
+            "line.className = \"row\"",
+            "closest(\".row\")",
+            "if (tapCancelled)",
+            "cur + \" \" + text",
+        ] {
+            assert!(
+                code.contains(needle),
+                "少了 {needle:?}——点一行放进输入框这条路断了一截"
+            );
+        }
+    }
+
     /// **实体键盘上的那几个键也不许当按键发下去。**
     ///
     /// 捕获模式收的是真键盘，`PageUp`/`PageDown`/`End` 一按一个准。它们
