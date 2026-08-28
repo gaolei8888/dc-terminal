@@ -3902,6 +3902,27 @@ mod tests {
         panic!("等不到 {needle}");
     }
 
+    /// 等到画面不再变。
+    ///
+    /// `wait_for_screen` 看的是**文字**，而一行要等换行符到了才算一行。
+    /// "line-60" 这几个字进屏幕和它后面那个换行符进屏幕，很可能是两次
+    /// 不同的 pty 读——中间那一瞬间去取基准，基准就少数了一行，后面
+    /// 所有"从基准到现在新增了几行"的判断全部偏一。整套测试一起跑、
+    /// 机器忙的时候这个缝隙会被拉开，症状是 `new_lines` 多出恰好 1。
+    fn wait_for_quiet(mgr: &SessionManager, id: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = mgr.screen_text_for_test(id);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100));
+            let now = mgr.screen_text_for_test(id);
+            if now == last {
+                return;
+            }
+            last = now;
+        }
+        panic!("画面一直在变，等不到它安静下来");
+    }
+
     #[test]
     fn typing_jumps_back_to_the_bottom() {
         let dir = init_repo();
@@ -3963,6 +3984,9 @@ mod tests {
             .create(dir.path(), &p.name, empty_secrets(), &[])
             .unwrap();
         wait_for_screen(&mgr, id, "line-60");
+        // 取基准之前必须让画面先停下来，理由见 `wait_for_quiet`。脚本在这
+        // 60 行之后特意 `sleep 1`，那一秒就是留给这件事的。
+        wait_for_quiet(&mgr, id);
 
         // 刚滚完，底下没有新东西
         let st = mgr.scroll(id, ScrollBy::Rows(20)).unwrap();
