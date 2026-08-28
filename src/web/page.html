@@ -594,7 +594,8 @@
     placeCursor(s.cursor, s.cursor_hidden);
     // 翻历史那两个键要不要露面，看这一帧的滚动状态（`max`/`offset`）——
     // 没有历史可翻的时候不写，屏幕上不许出现按了没反应的东西。
-    updateHistoryKeys(s.scroll || {});
+    scrollState = s.scroll || {};
+    updateHistoryKeys(scrollState);
     online();
   }
 
@@ -610,7 +611,12 @@
       if (!r.ok) { throw new Error("http " + r.status); }
       // 敲完立刻拉一帧：不等下一个 300ms 的话，手机上按下去到看见反应
       // 之间会有小半秒的空档，那半秒里人会以为没按上，然后再按一次。
-      return tick();
+      //
+      // **但连着敲的时候只补最后那一帧。** 捕获模式下每一个字符都是一次
+      // `input` 事件、一次 `post`（见 `flushCapture`），一路直连 `tick()`
+      // 的话，打一行字就是几十次整屏拉取加几十次整片 DOM 重建。人眼要的
+      // 是"停下来那一刻屏幕是对的"，不是每个字符都对一次。
+      return nudge();
     }).catch(offline);
   }
 
@@ -631,8 +637,43 @@
 
   // 翻历史。**不是往会话里敲 PageUp**：桌面端那两个键在 dct 自己攥着历史时
   // 是被 dct 吃掉的（`attach::key_scroll`），根本不到 agent 那儿。
-  function scroll(by) {
+  // 眼下这一屏的滚动事实（`ScrollState`）：`agent_owns` / `max` / `offset`。
+  // `drawScreen` 每帧更新它，路由要靠它。
+  var scrollState = {};
+
+  // **翻历史该走哪条路，桌面已经定过了，这里照抄那份判断。**
+  //
+  // 桌面：`attach::wheel_action` 和 `attach::key_scroll`——
+  //   - `offset > 0` 时 End 永远由 dct 兑现（底栏敢写就必须能按）；
+  //   - `agent_owns` 为真（Claude Code 这类自己管视口的 agent）→ 不拦，
+  //     翻页键原样送给 agent，滚的是它自己的历史；
+  //   - `max == 0`（备用屏上没有历史）→ 同样送给 agent，当普通编辑键。
+  //   - 其余才是 dct 滚自己的缓冲。
+  //
+  // 手机原来只实现了最后那一档，于是在 Claude Code 会话上 ⇞⇟ 整个消失、
+  // 什么也翻不动——而同一个会话在桌面上是翻得动的。两边不一样，正是这条
+  // 链路最不该出现的东西。
+  //
+  // 这份判断跟 `attach.rs` 那两个函数是**同一条规则的两处实现**，改一处就
+  // 要改另一处；之所以不能只留一处，是因为路由必须在客户端做——服务端
+  // 不知道用户按的是"翻历史"还是"给 agent 发 PageUp"。
+  function scrollGoesToAgent(kind) {
+    if (kind === "bottom") {
+      // offset > 0 就是 dct 自己欠的账，不管此刻鼠标归谁都由 dct 兑现。
+      return !(scrollState.offset > 0);
+    }
+    return scrollState.agent_owns || !(scrollState.max > 0);
+  }
+
+  // `kind` 是「用户想干什么」（up/down/bottom），`by` 是走 dct 那条路时的参数。
+  // 送给 agent 那条路用的是键名——同一个意图的两种表达。
+  var AGENT_KEY = { up: "PageUp", down: "PageDown", bottom: "End" };
+
+  function scroll(kind, by) {
     if (!canSend()) { return; }
+    if (scrollGoesToAgent(kind)) {
+      return post("/api/key", { id: open, key: AGENT_KEY[kind] });
+    }
     return post("/api/scroll", { id: open, by: by });
   }
 
@@ -660,9 +701,9 @@
   // `Request::Scroll`（见 `scroll()`），而且**只在真的有历史可翻时才露面**
   // ——屏幕上不许出现按了没反应的东西。
   var HISTORY = [
-    { name: "up", label: "⇞", act: function () { scroll({ Rows: pageStep() }); } },
-    { name: "down", label: "⇟", act: function () { scroll({ Rows: -pageStep() }); } },
-    { name: "bottom", label: "⤓", act: function () { scroll("Bottom"); } }
+    { name: "up", label: "⇞", act: function () { scroll("up", { Rows: pageStep() }); } },
+    { name: "down", label: "⇟", act: function () { scroll("down", { Rows: -pageStep() }); } },
+    { name: "bottom", label: "⤓", act: function () { scroll("bottom", "Bottom"); } }
   ];
 
   // 哪几个该露面，由这一帧的滚动状态说了算：
@@ -670,9 +711,16 @@
   function updateHistoryKeys(st) {
     var max = st.max || 0;
     var offset = st.offset || 0;
+    // agent 自己管视口的时候，dct 这边的 `max`/`offset` 恒为 0——但翻页
+    // **是有用的**，只不过翻的是 agent 自己的历史（`scroll()` 会把键送
+    // 过去）。照 max 判就等于在 Claude Code 会话上把这三个键全藏起来，
+    // 而桌面上它们是能按的。
+    var toAgent = st.agent_owns;
     var show = {
-      up: max > 0 && offset < max,
-      down: offset > 0,
+      up: toAgent || (max > 0 && offset < max),
+      down: toAgent || offset > 0,
+      // 回到底部只在真的滚上去过的时候才有意义；agent 自己管视口时
+      // 「底部」归它自己定义，dct 没有可兑现的账。
       bottom: offset > 0
     };
     Array.prototype.forEach.call(
@@ -809,10 +857,38 @@
     }).catch(offline);
   }
 
+  // **一次只飞一个 `/api/screen`。**
+  //
+  // 没有这道闸的时候：300ms 的定时器照发，而每敲一个字 `post()` 又追加
+  // 一帧（见它上面那段注释）。手机上打字 5 个字符每秒，就是每秒八九个
+  // 整屏请求，每个回来都要把整片 <pre> 拆了重建（`paint`）再量一次字号
+  // （`fitFont`）。链路一慢（WiFi 差、daemon 忙），单个请求超过 300ms，
+  // 后面的就开始叠——越慢越叠，越叠越慢。用户看到的就是"打了字之后整个
+  // 会话卡住"。
+  //
+  // 闸门期间来的请求不排队，只记一个「还欠一帧」：屏幕是**当前状态**，
+  // 补三帧陈旧的没有意义，补最后一帧才有。
+  var screenInflight = false;
+  var screenDue = false;
+
   function refreshScreen(id) {
+    if (screenInflight) {
+      screenDue = true;
+      return Promise.resolve();
+    }
+    screenInflight = true;
     return api("/api/screen?id=" + encodeURIComponent(id))
       .then(drawScreen)
-      .catch(offline);
+      .catch(offline)
+      .then(function () {
+        screenInflight = false;
+        if (screenDue) {
+          screenDue = false;
+          // 欠的那一帧补在下一轮事件循环里，不在这里直接递归——
+          // 链路一直慢的话，直接递归就是一条永不落地的调用链。
+          if (open !== null && shouldPoll()) { setTimeout(function () { refreshScreen(open); }, 0); }
+        }
+      });
   }
 
   // 一个定时器管两种画面，节奏不一样：
@@ -835,6 +911,18 @@
   // 完全看不出来，只会体现在电池和流量上。有一条守卫钉着这个唯一性。
   function shouldPoll() {
     return document.visibilityState === "visible";
+  }
+
+  // 打字之后那一帧：**合并**。40ms 内连着敲的字共用同一帧。
+  // 这个数字挑得比人的连击间隔小、比一次往返大——比它小就退回一字一帧，
+  // 比它大人就会觉得"敲下去没反应"。
+  var nudgeTimer = null;
+  function nudge() {
+    if (nudgeTimer) { return; }
+    nudgeTimer = setTimeout(function () {
+      nudgeTimer = null;
+      tick();
+    }, 40);
   }
 
   function tick() {
@@ -885,10 +973,13 @@
   };
 
   // 这几个键在桌面上是「翻 dct 的历史」，不是敲给 agent 的。
+  // 实体键盘上那三个键。**它们不进 `KEYNAMES`**：意图是「翻历史」，
+  // 而翻历史该走哪条路由 `scroll()` 决定——`agent_owns` 为真时它自己会把
+  // 键送给 agent，跟桌面一样。名字在这里只是「哪一种翻法」。
   var SCROLLS_INSTEAD = {
-    PageUp: function () { return { Rows: pageStep() }; },
-    PageDown: function () { return { Rows: -pageStep() }; },
-    End: function () { return "Bottom"; }
+    PageUp: function () { return ["up", { Rows: pageStep() }]; },
+    PageDown: function () { return ["down", { Rows: -pageStep() }]; },
+    End: function () { return ["bottom", "Bottom"]; }
   };
 
   var capturing = false;
@@ -934,7 +1025,8 @@
     var by = SCROLLS_INSTEAD[e.key];
     if (by && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
-      scroll(by());
+      var args = by();
+      scroll(args[0], args[1]);
       return;
     }
 

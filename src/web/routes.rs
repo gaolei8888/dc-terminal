@@ -780,12 +780,62 @@ mod tests {
         }
     }
 
+    /// **路由的两档都要在。**
+    ///
+    /// 这条守卫是为一个真实的缺陷立的：网页原来把翻历史一律发去
+    /// `/api/scroll`，而 `agent_owns` 为真时（Claude Code 这类自己管视口的
+    /// agent）dct 侧的 `max` 恒为 0，于是 ⇞⇟ 整个藏起来、什么也翻不动——
+    /// 同一个会话在桌面上却是翻得动的（桌面把键送给了 agent）。
+    ///
+    /// 跑不了浏览器里的 JS，所以只能钉住「那一档还在」。它一旦被删掉，
+    /// 症状就是 Claude Code 会话在手机上又没法翻历史了。
+    #[test]
+    fn the_page_routes_history_the_way_the_desktop_does() {
+        // **匹配的是「接上了」的形状，不是「名字还在」。** 只查标识符
+        // 存不存在的话，把分支改成 `if (false)` 一样绿——第一版就是这么
+        // 写的，三条变异一条都没抓住。
+        let code = page_without_comments();
+        for needle in [
+            "if (scrollGoesToAgent(kind))",
+            "scrollState.agent_owns",
+            "post(\"/api/key\", { id: open, key: AGENT_KEY[kind] })",
+            "up: toAgent ||",
+        ] {
+            assert!(
+                code.contains(needle),
+                "少了 {needle:?}——翻历史那条路由断了送给 agent 的那一档"
+            );
+        }
+    }
+
+    /// 整屏拉取要有闸门。
+    ///
+    /// 也是为一个真实的缺陷立的：定时器每 300ms 一帧，而捕获模式下**每敲
+    /// 一个字**又追加一帧，两边都没有在途判断。链路一慢就开始叠，越叠越慢，
+    /// 用户看到的是"打完字整个会话卡住"。
+    #[test]
+    fn screen_refreshes_do_not_stack_up() {
+        // 同上：查的是闸门真的挡在路上，不是变量还声明着。
+        let code = page_without_comments();
+        for needle in ["if (screenInflight)", "screenDue = true", "return nudge();"] {
+            assert!(
+                code.contains(needle),
+                "少了 {needle:?}——整屏拉取又会在慢链路上叠起来"
+            );
+        }
+    }
+
     /// **实体键盘上的那几个键也不许当按键发下去。**
     ///
-    /// 捕获模式收的是真键盘，`PageUp`/`PageDown`/`End` 一按一个准。桌面端
-    /// 对它们的处理是"dct 自己吃掉去翻历史"，所以这一页也得走
-    /// `/api/scroll`——跟 ⇞⇟⤓ 三个按钮同一条路。翻成按键发下去的话，
-    /// 同一块键盘在两个客户端上就是两种行为。
+    /// 捕获模式收的是真键盘，`PageUp`/`PageDown`/`End` 一按一个准。它们
+    /// 不许进键名映射表直接当按键发下去——**要先经过 `scroll()` 那道路由**，
+    /// 跟 ⇞⇟⤓ 三个按钮同一条路。
+    ///
+    /// 注意这条守卫说的**不是**「一定走 `/api/scroll`」。桌面对这三个键的
+    /// 处理本来就分两档（`attach::key_scroll`）：dct 有历史时自己吃掉，
+    /// `agent_owns` 或者没历史时原样送给 agent。`scroll()` 照抄的就是那份
+    /// 判断。这里要钉的是「不许绕过那道路由」——绕过去，同一块键盘在两个
+    /// 客户端上就成了两种行为。
     #[test]
     fn a_physical_keyboard_scrolls_history_instead_of_sending_those_keys() {
         let code = page_without_comments();
