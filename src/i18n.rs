@@ -204,6 +204,10 @@ pub enum Key {
     WebNextStepOn,
     /// 开着但算不出地址时的下一步：先把这台电脑连上 WiFi
     WebNextStepAddressUnknown,
+    /// 底栏上「打开」那一格的动作名。
+    WebTurnOn,
+    /// 底栏上「关掉」那一格的动作名。
+    WebTurnOff,
     /// 底栏上 `w` 那一格的动作名。**只是一个动词**，跟 `EnterCopyMode`
     /// 一样拼在 `("w", …)` 后面。
     WebToggle,
@@ -538,6 +542,8 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Put this computer on the same WiFi as the phone, then press w twice to restart it",
             zh: "先把这台电脑连上手机那个 WiFi，再按两下 w 重开",
         ),
+        WebTurnOn => t!(lang, en: "turn on", zh: "打开"),
+        WebTurnOff => t!(lang, en: "turn off", zh: "关掉"),
         WebToggle => t!(lang, en: "phone client", zh: "手机端开关"),
         TextSmaller => t!(lang, en: "smaller text", zh: "字小一点"),
         TextBigger => t!(lang, en: "bigger text", zh: "字大一点"),
@@ -1866,6 +1872,8 @@ mod tests {
             TextBigger,
             KeyboardCapture,
             WebToggle,
+            WebTurnOn,
+            WebTurnOff,
             OtherKeysGoToAgent,
             BackToListWord,
             BackToSettingsWord,
@@ -2005,7 +2013,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 149, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 151, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

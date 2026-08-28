@@ -28,6 +28,7 @@ pub(crate) enum SettingsItem {
     Language,
     Theme,
     Phone,
+    Web,
 }
 
 impl SettingsItem {
@@ -36,6 +37,7 @@ impl SettingsItem {
             SettingsItem::Language,
             SettingsItem::Theme,
             SettingsItem::Phone,
+            SettingsItem::Web,
         ]
     }
 
@@ -50,6 +52,27 @@ impl SettingsItem {
             SettingsItem::Language => text(Key::Language, lang),
             SettingsItem::Theme => text(Key::BarTheme, lang),
             SettingsItem::Phone => text(Key::Phone, lang),
+            SettingsItem::Web => text(Key::WebSection, lang),
+        }
+    }
+}
+
+/// 拿一次局域网手机端的状态，进 `View::Web`。**拿不到就退回「关着」**，
+/// 不是留着上一次的答案：这一页每一句话（地址、二维码）都建立在「口子真的
+/// 开着」之上，宁可少说，也不能指着一个已经不成立的地址让人扫。
+fn open_web(app: &mut App, state: ListState) {
+    match app.client().and_then(|c| c.call(Request::WebStatus)) {
+        Ok(Response::Web(info)) => {
+            app.web = info;
+            app.view = View::Web;
+        }
+        Ok(Response::Error(ref e)) => {
+            app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
+            app.view = View::Settings { state, sub: None };
+        }
+        _ => {
+            app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
+            app.view = View::Settings { state, sub: None };
         }
     }
 }
@@ -103,6 +126,7 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
                 };
             }
             Some(SettingsItem::Phone) => open_phone(app, state),
+            Some(SettingsItem::Web) => open_web(app, state),
             None => {
                 app.view = View::Settings { state, sub: None };
             }
@@ -117,24 +141,7 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
 /// 显示错误的空白页强。
 fn open_phone(app: &mut App, state: ListState) {
     match app.client().and_then(|c| c.call(Request::PhoneStatus)) {
-        Ok(Response::Phone(status)) => {
-            // 局域网那一节画的是 `app.web`，所以进页面要顺手把它也拿一次
-            // ——不拿的话屏幕上留着的是上一次的答案（或者 `App::new` 那个
-            // 「关着」的初值），而用户会照着它按 `w`，按出反效果。
-            //
-            // **拿不到就退回「关着」**，不是留着旧值：这一节的每一句话
-            // （地址、二维码）都建立在「口子真的开着」之上，宁可少说，
-            // 不能指着一个已经不成立的地址让人扫。
-            app.web = match app.client().and_then(|c| c.call(Request::WebStatus)) {
-                Ok(Response::Web(info)) => info,
-                _ => crate::proto::WebInfo {
-                    on: false,
-                    url: None,
-                    address_unknown: false,
-                },
-            };
-            app.view = View::Phone { status };
-        }
+        Ok(Response::Phone(status)) => app.view = View::Phone { status },
         Ok(Response::Error(ref e)) => {
             app.message = Msg::err(crate::i18n::msg::error(app.lang, e));
             app.view = View::Settings { state, sub: None };
@@ -555,13 +562,16 @@ mod tests {
         assert!(app.message.error, "要有一句红字告诉用户出了什么事");
     }
 
-    /// **进这一页要把局域网状态一起拿回来。** 页面上那一节画的是
-    /// `app.web`，不拿就永远是 `App::new` 里那个「关着」的初值——守护进程
-    /// 那边明明开着，用户看到的却是「还没打开」，按 `w` 于是变成关掉。
+    /// **进局域网那一页要把状态拿回来。** 页面画的是 `app.web`，不拿就
+    /// 永远是 `App::new` 里那个「关着」的初值——守护进程那边明明开着，
+    /// 用户看到的却是「还没打开」，于是按 Enter 想开，实际什么也没发生。
     /// 这里先往 `app.web` 塞一个**假的「开着」**再进页面：不拿状态的实现
     /// 会把这个假值原样留下，测试就抓得住。
+    ///
+    /// （这条守卫原来挂在手机通知页上——那时候两件事挤在同一页。拆开之后
+    /// 它跟着局域网那一页走。）
     #[test]
-    fn entering_the_phone_page_refreshes_the_lan_state() {
+    fn entering_the_web_page_refreshes_the_lan_state() {
         use crate::client::Client;
 
         let home = tempfile::tempdir().unwrap();
@@ -588,10 +598,11 @@ mod tests {
             url: Some("http://10.0.0.1:1/#t=stale".into()),
             address_unknown: false,
         };
-        on_settings_item(&mut app, SettingsItem::Phone);
+        on_settings_item(&mut app, SettingsItem::Web);
 
         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
 
+        assert!(matches!(app.view, View::Web), "没进局域网那一页");
         assert!(
             !app.web.on,
             "进页面没有重新拿局域网状态，屏幕上留着一个过期的「开着」"

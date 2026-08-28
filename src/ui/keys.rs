@@ -274,6 +274,7 @@ mod tests {
             can_remove: true,
             can_switch_project: true,
             phone_editing: false,
+            web_on: false,
         }
     }
 
@@ -430,6 +431,7 @@ mod tests {
                     can_remove: false,
                     can_switch_project: false,
                     phone_editing: false,
+                    web_on: false,
                 },
             ] {
                 let en: Vec<String> = groups(&from, ctx, Lang::En)

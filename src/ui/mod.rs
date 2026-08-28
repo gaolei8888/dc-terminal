@@ -33,6 +33,7 @@ mod phone;
 mod pick;
 mod secret;
 mod settings_view;
+mod web;
 
 mod view;
 use view::SecretPhase;
@@ -973,6 +974,7 @@ pub fn run(
             View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
             View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             View::Phone { .. } => phone::handle_key(&mut app, key)?,
+            View::Web => web::handle_key(&mut app, key)?,
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
@@ -1227,6 +1229,7 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
         // 分支），但算它不需要知道自己是不是在手机页上——`phone_buf` 只在
         // 那一页会被置成 `Some`，其它任何视图下这里恒为 `false`。
         phone_editing: app.phone_buf.is_some(),
+        web_on: app.web.on,
     }
 }
 
@@ -2369,6 +2372,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
         View::Phone { .. } => phone::draw(f, chunks[0], app),
+        View::Web => web::draw(f, chunks[0], app),
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户

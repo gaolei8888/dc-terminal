@@ -196,6 +196,13 @@ pub(crate) enum View {
     Phone {
         status: crate::proto::PhoneStatus,
     },
+    /// 局域网手机端设置页。设置页选中「局域网手机端」进。
+    ///
+    /// **一个字段都不带**：这一页要显示的状态全在 `App::web` 上，理由见
+    /// 那个字段的文档注释（手机通知那条异步刷新会重建 `View::Phone`，
+    /// 塞在视图里的状态会被无声冲掉；这一页没有那条路，但把状态放在
+    /// 同一个地方，两页读的就是同一份真相）。
+    Web,
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
@@ -1082,6 +1089,13 @@ pub(crate) struct HelpCtx {
     /// `phone_buf` 因为要跟 `Receiver` 共存而只能待在 `App` 上），所以
     /// 这里单独收一个 `bool` 进来，而不是把整个 `App` 拽进签名。
     pub phone_editing: bool,
+    /// 局域网手机端此刻开着没有（`App::web.on`）。
+    ///
+    /// 跟 `phone_editing` 同一个道理收成一个 `bool`：这一页的状态住在
+    /// `App::web` 上（`View::Web` 一个字段都不带），而底栏要拿它决定写
+    /// 「Enter 打开」还是「x 关掉」——写错那一个，屏幕上就是一个按下去
+    /// 没反应的键。
+    pub web_on: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1358,6 +1372,19 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 才谈得上 `r` 重新配对，`x` 只要还有令牌就能关掉。跟 `board_keys`
         // 那一档「能不能按也决定写不写」同一个道理——写一个此刻按下去
         // 只会报错的键，比不写更糟。
+        // 一页只有一个开关，所以底栏也只写那一个：关着写「Enter 打开」，
+        // 开着写「x 关掉」。**两个都写是错的**——写一个此刻按下去没反应的键，
+        // 比不写更糟（同这一页上面几条的道理）。
+        View::Web => {
+            let mut items: Vec<(&'static str, Key)> = Vec::new();
+            if ctx.web_on {
+                items.push(("x", Key::WebTurnOff));
+            } else {
+                items.push(("Enter", Key::WebTurnOn));
+            }
+            items.push(("Esc", Key::BackToSettingsWord));
+            help_items(&items, lang)
+        }
         View::Phone { status } => {
             use crate::proto::PhoneState;
             // **修复 6。** 令牌输入框开着的时候别再画 `status` 派生的那几个
@@ -1467,6 +1494,7 @@ mod tests {
             can_remove: false,
             can_switch_project: true,
             phone_editing: false,
+            web_on: false,
         }
     }
 
@@ -1477,6 +1505,7 @@ mod tests {
             can_remove: false,
             can_switch_project: true,
             phone_editing: false,
+            web_on: false,
         }
     }
 
@@ -1491,6 +1520,7 @@ mod tests {
             can_remove: true,
             can_switch_project: true,
             phone_editing: false,
+            web_on: false,
         }
     }
 
