@@ -280,6 +280,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dct-link",
+ "dct-page",
  "getrandom 0.2.17",
  "libc",
  "portable-pty",
@@ -309,11 +310,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dct-page"
+version = "0.1.0"
+
+[[package]]
 name = "dct-srv"
 version = "0.1.0"
 dependencies = [
  "axum",
  "dct-link",
+ "dct-page",
  "serde_json",
  "tokio",
  "tower",

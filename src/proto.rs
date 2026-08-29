@@ -60,7 +60,14 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 三条，`Response::Web(WebInfo)`。**加一，没有例外可讲**：新增 `Request`
 /// 变体那条规矩没得商量——旧守护进程收到 `WebEnable` 只会回一句解析失败，
 /// 而用户看到的是「按了开关什么都没发生」。同 `Kill`/`Prune`、同手机通知那次。
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// 9 = 手机网页的文案改走协议。多了 `Request::WebStrings { lang }` 和
+/// `Response::Strings`。以前那张表是 `web::routes` 直接从 i18n 里取了就发的，
+/// **绕过了 dispatch**——局域网模式下没问题，但经中转看家里电脑的时候，
+/// 中转手上只有一个不透明的信封，它既不认识 i18n 也不该认识（spec 决定一）。
+/// 文案要么走协议，要么在中转上再抄一份 i18n 表；后者会让「决定用户看到
+/// 什么字的地方只有一个」这条当场作废，所以只能走协议。
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +339,11 @@ pub enum Request {
     /// **这三条只从本机的 unix socket 上答，永远不从 HTTP 上答**（见
     /// `daemon::handle` 的 `web` 参数）：手机自己不该能开关这个监听口，
     /// 更不该能问出那条带令牌的地址——那等于把钥匙挂在门上。
+    /// 手机网页要那张文案表。`lang` 是浏览器报的语言，认不出来由守护进程
+    /// 兜到英文——**网页自己一个字都不写死**，见 `web::strings`。
+    WebStrings {
+        lang: crate::i18n::Lang,
+    },
     WebStatus,
     WebEnable,
     WebDisable,
@@ -416,6 +428,7 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::PhoneUnpair => write!(f, "PhoneUnpair"),
             Request::PhoneDisable => write!(f, "PhoneDisable"),
+            Request::WebStrings { lang } => write!(f, "WebStrings({lang:?})"),
             Request::WebStatus => write!(f, "WebStatus"),
             Request::WebEnable => write!(f, "WebEnable"),
             Request::WebDisable => write!(f, "WebDisable"),
@@ -494,6 +507,11 @@ pub enum Response {
     Phone(PhoneStatus),
     /// `WebStatus` / `WebEnable` / `WebDisable` 三条的共同回答。
     Web(WebInfo),
+    /// 对 [`Request::WebStrings`] 的回答：网页要显示的每一句话。
+    ///
+    /// `BTreeMap` 不是 `HashMap`：序列化出来的顺序要稳定，否则那条钉住线上
+    /// 形状的测试每次跑都可能换个顺序。
+    Strings(std::collections::BTreeMap<String, String>),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -826,6 +844,9 @@ mod tests {
             Request::PhoneSetToken { token: "t".into() },
             Request::PhoneUnpair,
             Request::PhoneDisable,
+            Request::WebStrings {
+                lang: crate::i18n::Lang::Zh,
+            },
             Request::WebStatus,
             Request::WebEnable,
             Request::WebDisable,
@@ -835,8 +856,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                8,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable","WebStatus","WebEnable","WebDisable"]"#
+                9,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"WebStrings":{"lang":"Zh"}},"WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -879,7 +900,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                8,
+                9,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -986,7 +1007,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (8, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (9, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 /// 「只有信封变了才加一」这条会立刻退化成「我觉得这次不算」，而这个数字唯一
 /// 的用处就是在两边版本不一致时说话。现在还没有任何一台机器在跑它，加一是
 /// 免费的；等真有人在用了，免费的就只剩后悔。
-pub const LINK_VERSION: u32 = 2;
+///
+/// 3 = 多了 `/link/ask`（发一个信封、挂着等配对的答复）和 `LinkError::NoAnswer`。
+pub const LINK_VERSION: u32 = 3;
 
 /// 长轮询：**我有什么要收的吗**。请求体就是 `AuthFrame`。
 pub const PATH_POLL: &str = "/link/poll";
@@ -47,6 +49,17 @@ pub const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 
 /// 投递一个信封。请求体是 `SendRequest`。
 pub const PATH_SEND: &str = "/link/send";
+
+/// 投一个信封，**挂着等配对的答复**，一次往返拿到答案。请求体同样是
+/// `SendRequest`，答复体是一个 `Envelope`。
+///
+/// 手机为什么不用 `/link/poll` 自己收答复：那样页面里要自己记「哪个 `seq`
+/// 对应哪个还没兑现的 Promise」。这个仓库里的 JS 一行都跑不了测试（页面全
+/// 靠 Rust 扫源码的守卫钉着），把新增的复杂度放在唯一测不了的地方是最差的
+/// 选择。放在这里，它有测试，也做得了变异测试。
+///
+/// 中转依然不看 payload：配对只用信封上的 `to` 和 `seq`。
+pub const PATH_ASK: &str = "/link/ask";
 
 /// 一个 payload 最多多少字节。
 ///
@@ -232,6 +245,13 @@ pub enum LinkError {
     VersionMismatch,
     /// 收件人不在线。**不排队、不落盘**（spec「不做什么」第一条）。
     Offline,
+    /// 收件人在线、信封也投到了，但它在时限内没回话。
+    ///
+    /// **跟 `Offline` 是两句不同的话**，而这正是计划里要的那两种断线说法：
+    /// `Offline` 是「你的电脑离线了」（它根本没在问中转要东西），这条是
+    /// 「你的电脑没回话」——网线好好的，是那台机器自己卡住了、睡过去了、
+    /// 或者 dct 死了。两者要让用户去看的地方完全不同。
+    NoAnswer,
     /// 收件人在线，但它积压的东西还没取走，收不下了。
     ///
     /// 跟 `Offline` 分开是有用的：`Offline` 该说「你的电脑离线了」，`Busy`
@@ -253,6 +273,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Unauthorized => "unauthorized",
             LinkError::VersionMismatch => "link version mismatch",
             LinkError::Offline => "peer offline",
+            LinkError::NoAnswer => "peer did not answer in time",
             LinkError::Busy => "peer is not keeping up",
             LinkError::TooBig => "payload too big",
             LinkError::QuotaExceeded => "quota exceeded",
@@ -310,7 +331,7 @@ mod tests {
         assert_eq!(
             (LINK_VERSION, shape.as_str()),
             (
-                2,
+                3,
                 r#"{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}"#
             ),
             "信封的线上形状变了。把 LINK_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -330,7 +351,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&auth).unwrap(),
-            r#"{"version":2,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
+            r#"{"version":3,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
         );
         assert_eq!(
             serde_json::to_string(&EndpointKind::Phone).unwrap(),
@@ -342,6 +363,7 @@ mod tests {
             LinkError::Unauthorized,
             LinkError::VersionMismatch,
             LinkError::Offline,
+            LinkError::NoAnswer,
             LinkError::Busy,
             LinkError::TooBig,
             LinkError::QuotaExceeded,
@@ -349,7 +371,7 @@ mod tests {
         ];
         assert_eq!(
             serde_json::to_string(&all).unwrap(),
-            r#"["Unauthorized","VersionMismatch","Offline","Busy","TooBig","QuotaExceeded","NotYours"]"#
+            r#"["Unauthorized","VersionMismatch","Offline","NoAnswer","Busy","TooBig","QuotaExceeded","NotYours"]"#
         );
     }
 
@@ -369,7 +391,7 @@ mod tests {
                 envelope: sample()
             })
             .unwrap(),
-            r#"{"auth":{"version":2,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
+            r#"{"auth":{"version":3,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
         );
         assert_eq!(
             serde_json::to_string(&PollResponse { envelope: None }).unwrap(),

@@ -297,12 +297,53 @@
   // 当前在看什么：会话列表，还是某个会话的画面。
   var open = null;   // null = 列表；否则是会话 id
 
-  function api(path) {
+  // ——数据从哪儿来——————————————————————————————————————————————
+  //
+  // **整页只有 `wire` 这一处知道会话在哪儿、怎么问它。** 局域网这一版直接
+  // 问守护进程在你自己网络上开的那个口。以后要在任何网络下看家里的电脑，
+  // 换的就是这一个对象——画面、按键、翻历史、输入法那些代码一行都不用动，
+  // 而那些正是这一页里最难写对、最不该为了换根管子再动一遍的部分。
+  //
+  // 有一条守卫钉着这件事：`/api/` 那几个路径只许出现在这个对象里。
+
+  function getJson(path) {
     return fetch(path, { credentials: "same-origin" }).then(function (r) {
       if (!r.ok) { throw new Error("http " + r.status); }
       return r.json();
     });
   }
+
+  function postJson(path, body) {
+    return fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) { throw new Error("http " + r.status); }
+    });
+  }
+
+  var wire = {
+    strings: function (lang) {
+      return getJson("/api/strings?lang=" + encodeURIComponent(lang));
+    },
+    sessions: function () {
+      return getJson("/api/sessions");
+    },
+    screen: function (id) {
+      return getJson("/api/screen?id=" + encodeURIComponent(id));
+    },
+    input: function (id, text) {
+      return postJson("/api/input", { id: id, text: text });
+    },
+    key: function (id, name) {
+      return postJson("/api/key", { id: id, key: name });
+    },
+    scroll: function (id, by) {
+      return postJson("/api/scroll", { id: id, by: by });
+    }
+  };
 
   // 协议里的会话状态是一个字符串枚举（SessionState），这里只把它映射到
   // 文案表的键上。**认不出来的一律当 unknown**：编一个状态出来比承认
@@ -615,23 +656,18 @@
 
   // ——打字————————————————————————————————————————————————————————
 
-  function post(path, body) {
-    return fetch(path, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }).then(function (r) {
-      if (!r.ok) { throw new Error("http " + r.status); }
-      // 敲完立刻拉一帧：不等下一个 300ms 的话，手机上按下去到看见反应
-      // 之间会有小半秒的空档，那半秒里人会以为没按上，然后再按一次。
-      //
-      // **但连着敲的时候只补最后那一帧。** 捕获模式下每一个字符都是一次
-      // `input` 事件、一次 `post`（见 `flushCapture`），一路直连 `tick()`
-      // 的话，打一行字就是几十次整屏拉取加几十次整片 DOM 重建。人眼要的
-      // 是"停下来那一刻屏幕是对的"，不是每个字符都对一次。
-      return nudge();
-    }).catch(offline);
+  // 往会话里送完东西之后，总要做的那两件事。**怎么送在 `wire` 里，这里
+  // 只管送完。** 分开是因为换根管子只该换前者。
+  //
+  // 敲完立刻拉一帧：不等下一个 300ms 的话，手机上按下去到看见反应之间会有
+  // 小半秒的空档，那半秒里人会以为没按上，然后再按一次。
+  //
+  // **但连着敲的时候只补最后那一帧。** 捕获模式下每一个字符都是一次
+  // `input` 事件、一次发送（见 `flushCapture`），一路直连 `tick()` 的话，
+  // 打一行字就是几十次整屏拉取加几十次整片 DOM 重建。人眼要的是"停下来
+  // 那一刻屏幕是对的"，不是每个字符都对一次。
+  function sent(p) {
+    return p.then(nudge).catch(offline);
   }
 
   // 「现在能不能往会话里送东西」**只有这一处说了算**。
@@ -646,7 +682,7 @@
 
   function sendKey(name) {
     if (!canSend()) { return; }
-    return post("/api/key", { id: open, key: name });
+    return sent(wire.key(open, name));
   }
 
   // 翻历史。**不是往会话里敲 PageUp**：桌面端那两个键在 dct 自己攥着历史时
@@ -686,9 +722,9 @@
   function scroll(kind, by) {
     if (!canSend()) { return; }
     if (scrollGoesToAgent(kind)) {
-      return post("/api/key", { id: open, key: AGENT_KEY[kind] });
+      return sent(wire.key(open, AGENT_KEY[kind]));
     }
-    return post("/api/scroll", { id: open, by: by });
+    return sent(wire.scroll(open, by));
   }
 
   // 一屏减两行——跟桌面端翻页的步长同一个算法（留两行接上上一屏，
@@ -808,7 +844,7 @@
     // **空的那一次才打检查点**，才让 agent 真的开始干这一轮
     // （同 SessionWriter::type_into 的约定）。合成一步的话，手机上发出去的
     // 每一句话都没有检查点，`u` 撤不回来。
-    var typed = text ? post("/api/input", { id: open, text: text }) : Promise.resolve();
+    var typed = text ? sent(wire.input(open, text)) : Promise.resolve();
     typed.then(function () { return sendKey("Enter"); });
   });
 
@@ -862,7 +898,7 @@
   }
 
   function refreshList() {
-    return api("/api/sessions").then(function (resp) {
+    return wire.sessions().then(function (resp) {
       // 协议的答复是一个 externally tagged 的枚举：{"Sessions": [...]}。
       // 别的形状（比如 {"Error": …}）当成「这一轮没拿到」，不硬解。
       if (!resp || !resp.Sessions) { throw new Error("unexpected response"); }
@@ -891,7 +927,7 @@
       return Promise.resolve();
     }
     screenInflight = true;
-    return api("/api/screen?id=" + encodeURIComponent(id))
+    return wire.screen(id)
       .then(drawScreen)
       .catch(offline)
       .then(function () {
@@ -1029,7 +1065,7 @@
     var text = captureEl.value;
     if (!text) { return; }
     captureEl.value = "";
-    post("/api/input", { id: open, text: text });
+    sent(wire.input(open, text));
   }
 
   document.addEventListener("keydown", function (e) {
@@ -1131,8 +1167,10 @@
 
   // 先取文案再取列表：文案空着的时候「还没有会话」会显示成一片空白，
   // 用户会以为页面坏了。取不到就用空表继续——结构照样在。
-  api("/api/strings?lang=" + encodeURIComponent(navigator.language || ""))
-    .then(function (map) { S = map || {}; })
+  wire.strings(navigator.language || "")
+    // 文案现在跟别的东西一样是协议的答复：{"Strings": {...}}。别的形状
+    // （比如 {"Error": …}）当成拿不到，用空表继续——结构照样在。
+    .then(function (resp) { S = (resp && resp.Strings) || {}; })
     .catch(function () { S = {}; })
     .then(function () {
       titleEl.textContent = t("title");

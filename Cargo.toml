@@ -3,7 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
-members = ["crates/dct-link", "crates/dct-srv"]
+members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv"]
 
 [package]
 name = "dct"
@@ -14,6 +14,8 @@ edition = "2021"
 anyhow = "1"
 # 跟中转服务共用的信封。`dct` 和 `dct-srv` 谁也不依赖谁，共同依赖这个。
 dct-link = { path = "crates/dct-link" }
+# 手机端那一页网页。放在共享 crate 里是因为中转也要发同一份——见那边的注释。
+dct-page = { path = "crates/dct-page" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

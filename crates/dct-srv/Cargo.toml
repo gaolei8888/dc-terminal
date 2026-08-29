@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 dct-link = { path = "../dct-link" }
+# 手机端那一页网页。**跟 `dct` 发的是同一份字节**——它不住在这两个 crate 的
+# 任何一个里面，正是为了让"发两份不一样的网页"这件事需要有人特意去做。
+dct-page = { path = "../dct-page" }
 # **async 只在这里。** 「不引入 async 运行时」那条规矩是给守护进程和 TUI 写的
 # （见 `docs/superpowers/plans/2026-08-10-dct-phone-channel.md`），把它照搬到
 # 中转上是刻舟求剑：中转的全部工作就是同时挂着几千条空闲长连接，这正是 async

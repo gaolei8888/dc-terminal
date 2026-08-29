@@ -794,6 +794,10 @@ fn handle(
         //
         // 三条都先看 `web` 在不在：`None` = 这条请求是从 HTTP 上来的，
         // 而手机不该能开关自己的入口、更不该问得出那条带令牌的地址。
+        // 网页要的那张文案表。**跟别的请求走同一条路**——它以前是
+        // `web::routes` 直接取了就发的，那条捷径在中转那一侧走不通
+        // （中转手上只有信封，见 `proto.rs` 版本 9 那段注释）。
+        Request::WebStrings { lang } => Ok(Response::Strings(crate::web::strings::bundle(lang))),
         Request::WebStatus => Ok(web_status(web, secrets)),
         Request::WebEnable => Ok(web_enable(
             WEB_BIND,

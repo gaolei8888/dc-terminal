@@ -31,11 +31,11 @@ use std::time::{Duration, Instant};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use dct_link::{
     AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PollResponse, SendRequest, LINK_VERSION,
-    MAX_PAYLOAD, PATH_POLL, PATH_SEND,
+    MAX_PAYLOAD, PATH_ASK, PATH_POLL, PATH_SEND,
 };
 use tokio::sync::mpsc;
 
@@ -83,8 +83,13 @@ struct Device {
     last_poll: Instant,
 }
 
+/// 正挂在 `/link/ask` 上等答复的人。键是「等的是谁的、哪一个 `seq`」，
+/// 也就是答复信封上的 `to` 和 `seq`。
+type Waiting = Mutex<HashMap<(EndpointId, u64), tokio::sync::oneshot::Sender<Envelope>>>;
+
 pub struct Relay {
     devices: Mutex<HashMap<EndpointId, Device>>,
+    waiting: Waiting,
     cfg: Config,
 }
 
@@ -92,6 +97,7 @@ impl Relay {
     pub fn new(cfg: Config) -> Self {
         Relay {
             devices: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
             cfg,
         }
     }
@@ -156,6 +162,21 @@ impl Relay {
             return Err(LinkError::TooBig);
         }
 
+        // **先看有没有人正挂着等这一封。** 走 `/link/ask` 的手机根本不轮询，
+        // 它不在设备表里；这一步要是排在在线检查后面，笔记本发回去的答复
+        // 会被判成"收件人不在线"直接丢掉，而提问的人还在那头挂着。
+        if let Some(tx) = self
+            .waiting
+            .lock()
+            .expect("waiting table poisoned")
+            .remove(&(req.envelope.to.clone(), req.envelope.seq))
+        {
+            // 送不进去只有一种可能：提问的人已经不等了（超时或者断开）。
+            // 那封答复就没有意义了，丢掉是对的。
+            let _ = tx.send(req.envelope.clone());
+            return Ok(());
+        }
+
         let tx = {
             let map = self.devices.lock().expect("device table poisoned");
             match map.get(&req.envelope.to) {
@@ -169,6 +190,53 @@ impl Relay {
             // 取件的一端被清扫掉了：设备已经不在了，跟从没来过一样。
             mpsc::error::TrySendError::Closed(_) => LinkError::Offline,
         })
+    }
+}
+
+impl Relay {
+    /// 投一个信封，挂着等配对的答复。
+    ///
+    /// 手机用这条：一次 fetch 一个答案，页面里因此不需要任何「哪个 seq 对应
+    /// 哪个还没兑现的 Promise」的簿记——那份簿记要是放在页面里，就落在这个
+    /// 仓库里唯一跑不了测试的地方。
+    pub async fn ask(&self, req: &SendRequest) -> Result<Envelope, LinkError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let key = (req.envelope.from.clone(), req.envelope.seq);
+
+        // **先挂号再投递。** 反过来的话，笔记本答得够快就会在挂号之前把答复
+        // 送到，那一封找不到人等它，于是走进设备信箱再也没人取——而提问的人
+        // 在这头一直挂到超时。这种 bug 只在快的机器上出现。
+        self.waiting
+            .lock()
+            .expect("waiting table poisoned")
+            .insert(key.clone(), tx);
+
+        if let Err(e) = self.send(req) {
+            self.forget(&key);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(self.cfg.poll_timeout, rx).await {
+            Ok(Ok(env)) => Ok(env),
+            // 发端没了：只可能是别处把这个挂号顶掉了（同一个 seq 被用了两次）。
+            Ok(Err(_)) => {
+                self.forget(&key);
+                Err(LinkError::NoAnswer)
+            }
+            Err(_) => {
+                self.forget(&key);
+                Err(LinkError::NoAnswer)
+            }
+        }
+    }
+
+    /// 不等了。**必须清掉**，否则一个超时的提问会在表里留下一个永远没人
+    /// 取走的挂号，而那正是这类表长成内存泄漏的方式。
+    fn forget(&self, key: &(EndpointId, u64)) {
+        self.waiting
+            .lock()
+            .expect("waiting table poisoned")
+            .remove(key);
     }
 }
 
@@ -187,6 +255,9 @@ impl IntoResponse for Rejected {
             // 409 而不是 404：这台设备存在，只是现在不在。404 会让人以为
             // 地址写错了。
             LinkError::Offline => StatusCode::CONFLICT,
+            // 504：信封投到了，是对面没在时限内回话。跟 409 分开，网页才
+            // 能说两句不同的话。
+            LinkError::NoAnswer => StatusCode::GATEWAY_TIMEOUT,
             LinkError::Busy => StatusCode::TOO_MANY_REQUESTS,
             LinkError::TooBig => StatusCode::PAYLOAD_TOO_LARGE,
             LinkError::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
@@ -200,6 +271,19 @@ impl From<LinkError> for Rejected {
     fn from(e: LinkError) -> Self {
         Rejected(e)
     }
+}
+
+/// 手机网页本体。
+///
+/// **跟守护进程在局域网上发的是同一份字节**（`dct_page::PAGE`），不是抄过来
+/// 的一份。两份各自演化的网页，最贵的地方在于其中一份的 bug 只在另一种模式
+/// 下才复现，而那时候没人会想到去对比两个文件。
+///
+/// 眼下这一页在中转上还打不开：它取数走的是守护进程那套 `/api/*`，换成信封
+/// 是下一步的事。现在就把路由接上，是因为"两边发同一份"这条性质要从它有
+/// 第二个服务端的第一天起就成立——补挂上去的那天，多半已经有人拷过一份了。
+async fn page_route() -> axum::response::Html<&'static str> {
+    axum::response::Html(dct_page::PAGE)
 }
 
 async fn poll_route(
@@ -219,10 +303,19 @@ async fn send_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn ask_route(
+    State(relay): State<Arc<Relay>>,
+    Json(req): Json<SendRequest>,
+) -> Result<Json<Envelope>, Rejected> {
+    Ok(Json(relay.ask(&req).await?))
+}
+
 pub fn router(relay: Arc<Relay>) -> Router {
     Router::new()
+        .route("/", get(page_route))
         .route(PATH_POLL, post(poll_route))
         .route(PATH_SEND, post(send_route))
+        .route(PATH_ASK, post(ask_route))
         // base64 放大 1.33 倍，再给信封的其余字段留点空。比这还大的东西在
         // 读进内存之前就该被挡掉——`send` 里那条 `TooBig` 管的是这条线以下、
         // `MAX_PAYLOAD` 以上的部分，那部分才值得回一个说得清的错误码。
@@ -275,6 +368,19 @@ mod tests {
         EndpointId::new(s).unwrap()
     }
 
+    /// 等一个条件成立，**必须带死线**。
+    ///
+    /// 不带的话，任何一个让条件永远不成立的改动都会让测试**卡死**而不是
+    /// 挂掉——而卡死的测试等于没有测试：变异测试跑不完，CI 只会超时，
+    /// 没有人能从那个现象看出是哪一行出了问题。这条是自己踩出来的。
+    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < deadline, "等不到{what}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     fn auth(who: &str) -> AuthFrame {
         AuthFrame {
             version: LINK_VERSION,
@@ -304,9 +410,10 @@ mod tests {
         let r = relay.clone();
         let waiting = tokio::spawn(async move { r.poll(&auth("b")).await });
         // 让 b 先真的挂上去，否则下面这一投会撞上"从没来过"。
-        while relay.devices.lock().unwrap().get(&id("b")).is_none() {
-            tokio::task::yield_now().await;
-        }
+        until("b 挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id("b"))
+        })
+        .await;
 
         relay.send(&letter("a", "b", b"hello")).unwrap();
 
@@ -408,6 +515,154 @@ mod tests {
         assert_eq!(relay.send(&letter("a", "b", b"x")), Err(LinkError::Busy));
     }
 
+    // ——— 挂着等答复 ———
+
+    fn question(from: &str, to: &str, seq: u64) -> SendRequest {
+        SendRequest {
+            auth: auth(from),
+            envelope: Envelope {
+                from: id(from),
+                to: id(to),
+                seq,
+                payload: b"a question".to_vec(),
+                recipients: vec![],
+            },
+        }
+    }
+
+    /// 让一台"笔记本"挂上轮询，收到什么就回一封同 `seq` 的信。
+    async fn a_laptop_that_answers(relay: Arc<Relay>, who: &'static str, body: &'static [u8]) {
+        let r = relay.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(got)) = r.poll(&auth(who)).await {
+                let _ = r.send(&SendRequest {
+                    auth: auth(who),
+                    envelope: Envelope {
+                        from: id(who),
+                        to: got.from.clone(),
+                        seq: got.seq,
+                        payload: body.to_vec(),
+                        recipients: vec![],
+                    },
+                });
+            }
+        });
+        // 等它真的挂上去，否则下面那一问会撞上"从没来过"。
+        until("笔记本挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id(who))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_question_gets_its_answer_back_in_one_round_trip() {
+        let relay = Arc::new(Relay::new(cfg(2000)));
+        a_laptop_that_answers(relay.clone(), "laptop", b"the answer").await;
+
+        let answer = relay.ask(&question("phone:1", "laptop", 7)).await.unwrap();
+        assert_eq!(answer.from, id("laptop"));
+        assert_eq!(answer.to, id("phone:1"));
+        assert_eq!(answer.seq, 7, "答复要带着提问那个 seq 回来");
+        assert_eq!(answer.payload, b"the answer");
+    }
+
+    /// **提问的人从不轮询。** 它不在设备表里，所以答复那一封必须先看挂号表
+    /// 再看在线表——顺序反了的话，笔记本的答复会被判成"收件人不在线"丢掉，
+    /// 而提问的人在那头一直挂到超时。
+    #[tokio::test]
+    async fn the_asker_never_has_to_register_as_a_device() {
+        let relay = Arc::new(Relay::new(cfg(2000)));
+        a_laptop_that_answers(relay.clone(), "laptop", b"ok").await;
+
+        relay.ask(&question("phone:1", "laptop", 1)).await.unwrap();
+        assert!(
+            relay.devices.lock().unwrap().get(&id("phone:1")).is_none(),
+            "提问的人不该因为问了一句就变成一台设备"
+        );
+    }
+
+    /// 「你的电脑离线了」和「你的电脑没回话」是两句不同的话，指向两个不同的
+    /// 地方。合成一句的话，一台睡过去的电脑会让用户去查网络。
+    #[tokio::test]
+    async fn a_computer_that_is_gone_and_one_that_is_silent_say_different_things() {
+        let relay = Arc::new(Relay::new(cfg(200)));
+
+        // 压根没来过：立刻就知道，不用挂满超时。
+        let started = std::time::Instant::now();
+        assert_eq!(
+            relay.ask(&question("phone:1", "nobody", 1)).await,
+            Err(LinkError::Offline)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "对面不在线是当场就知道的事，不该挂满超时"
+        );
+
+        // 在线，但不回话。
+        assert_eq!(relay.poll(&auth("mute")).await.unwrap(), None);
+        assert_eq!(
+            relay.ask(&question("phone:1", "mute", 2)).await,
+            Err(LinkError::NoAnswer)
+        );
+    }
+
+    /// 超时的提问必须把自己的挂号清掉。留着的话，这张表就是一条内存泄漏——
+    /// 每一个没等到答复的请求都往里加一条，永远没人取走。
+    #[tokio::test]
+    async fn a_question_that_times_out_leaves_nothing_behind() {
+        let relay = Arc::new(Relay::new(cfg(100)));
+        assert_eq!(relay.poll(&auth("mute")).await.unwrap(), None);
+        assert!(relay.ask(&question("phone:1", "mute", 1)).await.is_err());
+        assert!(
+            relay.waiting.lock().unwrap().is_empty(),
+            "等超时了还留着挂号"
+        );
+
+        // 投不出去的那一路也一样：`send` 失败之后不能把挂号丢在表里。
+        assert!(relay.ask(&question("phone:1", "nobody", 2)).await.is_err());
+        assert!(
+            relay.waiting.lock().unwrap().is_empty(),
+            "投不出去也留了挂号"
+        );
+    }
+
+    /// 答复是按 `seq` 配对的，不是按到达顺序。两个问题同时挂着、答复倒着
+    /// 回来，各自也得回到各自那一头。
+    #[tokio::test]
+    async fn answers_find_their_own_question_even_when_they_arrive_backwards() {
+        let relay = Arc::new(Relay::new(cfg(2000)));
+        assert_eq!(relay.poll(&auth("laptop")).await.unwrap(), None);
+
+        let (a, b) = (relay.clone(), relay.clone());
+        let q1 = tokio::spawn(async move { a.ask(&question("phone:1", "laptop", 1)).await });
+        let q2 = tokio::spawn(async move { b.ask(&question("phone:1", "laptop", 2)).await });
+
+        // 等两个都挂上号。
+        until("两个问题都挂上号", || {
+            relay.waiting.lock().unwrap().len() >= 2
+        })
+        .await;
+
+        // 后问的先答。
+        for (seq, body) in [(2u64, &b"second"[..]), (1, &b"first"[..])] {
+            relay
+                .send(&SendRequest {
+                    auth: auth("laptop"),
+                    envelope: Envelope {
+                        from: id("laptop"),
+                        to: id("phone:1"),
+                        seq,
+                        payload: body.to_vec(),
+                        recipients: vec![],
+                    },
+                })
+                .unwrap();
+        }
+
+        assert_eq!(q1.await.unwrap().unwrap().payload, b"first");
+        assert_eq!(q2.await.unwrap().unwrap().payload, b"second");
+    }
+
     // ——— 接口这一层 ———
 
     async fn post(app: Router, path: &str, body: &str) -> (StatusCode, String) {
@@ -427,6 +682,34 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// 中转发的网页必须**逐字节**等于守护进程发的那一份。
+    ///
+    /// 这条测试是"只有一份网页"那件事唯一的看门人。哪天有人图省事在
+    /// `dct-srv` 里放一份自己的 `page.html`，它当场就红。
+    #[tokio::test]
+    async fn the_relay_serves_the_very_same_page_the_daemon_does() {
+        let relay = Arc::new(Relay::new(cfg(50)));
+        let res = router(relay)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            dct_page::PAGE.as_bytes(),
+            "中转发的网页跟守护进程发的不是同一份了"
+        );
     }
 
     #[tokio::test]
@@ -462,5 +745,21 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, r#"{"error":"Offline"}"#);
+    }
+
+    /// 「没回话」要以自己的码穿过 HTTP 那一层回到网页，别混进 409。
+    #[tokio::test]
+    async fn a_silent_computer_comes_back_as_its_own_code() {
+        let relay = Arc::new(Relay::new(cfg(100)));
+        assert_eq!(relay.poll(&auth("mute")).await.unwrap(), None);
+
+        let (status, body) = post(
+            router(relay),
+            PATH_ASK,
+            &serde_json::to_string(&question("phone:1", "mute", 1)).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body, r#"{"error":"NoAnswer"}"#);
     }
 }

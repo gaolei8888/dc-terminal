@@ -21,9 +21,12 @@ use crate::proto::{Request, Response};
 
 use super::{Handler, Req, Resp};
 
-/// 手机网页本体。`include_str!` 进二进制：装 dct 的人不该还要另外拷一个
-/// 文件到某个目录里，而"找不到网页文件"是一个根本不需要存在的失败模式。
-const PAGE: &str = include_str!("page.html");
+/// 手机网页本体，打进二进制：装 dct 的人不该还要另外拷一个文件到某个目录里，
+/// 而"找不到网页文件"是一个根本不需要存在的失败模式。
+///
+/// **文件本身在 `crates/dct-page`**，因为中转也要发同一份。理由见那个 crate
+/// 的模块注释。
+const PAGE: &str = dct_page::PAGE;
 
 /// 「把这个 `Request` 交给守护进程，给我 `Response`」。
 ///
@@ -94,7 +97,12 @@ impl Handler for Routes {
                         })
                         .and_then(crate::i18n::Lang::from_code)
                         .unwrap_or(crate::i18n::Lang::En);
-                    Resp::json(super::strings::bundle(lang))
+                    // **走 dispatch，不自己取。** 以前这里直接调
+                    // `strings::bundle`，于是这张表是全页唯一一样不经过协议
+                    // 的东西——而经中转的时候中转手上只有信封，取不到它。
+                    // 现在它跟别的一样是一条 `Request`，网页两种模式下
+                    // 拿到的形状因此也一样（`{"Strings":{…}}`）。
+                    self.answer(Request::WebStrings { lang })
                 }
                 _ => Resp::status(405),
             },
@@ -264,8 +272,18 @@ mod tests {
         });
         let f = Arc::clone(&fake);
         let routes = Routes::new(Arc::new(move |req: Request| {
+            // 文案那一条走真实现。它现在也是一条协议请求（协议 9），拿罐头
+            // 答复顶替的话，「表跟着语言变」这件事就没法测了——而那正是
+            // 这条路唯一值得测的东西。
+            let strings = match &req {
+                Request::WebStrings { lang } => Some(crate::web::strings::bundle(*lang)),
+                _ => None,
+            };
             f.seen.lock().unwrap().push(req);
-            serde_json::from_str(&f.reply).unwrap()
+            match strings {
+                Some(map) => Response::Strings(map),
+                None => serde_json::from_str(&f.reply).unwrap(),
+            }
         }));
         (routes, fake)
     }
@@ -373,6 +391,15 @@ mod tests {
         );
     }
 
+    /// 文案现在是协议答复的一部分，形状是 `{"Strings": {…}}`——**网页两种
+    /// 模式下拿到的是同一个形状**，这正是把它挪进协议换来的东西。
+    fn strings_in(body: &[u8]) -> std::collections::BTreeMap<String, String> {
+        match serde_json::from_slice::<Response>(body).expect("答复解不出来") {
+            Response::Strings(map) => map,
+            other => panic!("这不是一张文案表：{other:?}"),
+        }
+    }
+
     #[test]
     fn the_strings_bundle_follows_the_requested_language() {
         use crate::i18n::{text, Key, Lang};
@@ -382,9 +409,10 @@ mod tests {
 
         assert_eq!(zh.status, 200);
         assert_ne!(zh.body, en.body, "两种语言的表不该一模一样");
-        let zh: std::collections::BTreeMap<String, String> =
-            serde_json::from_slice(&zh.body).unwrap();
-        assert_eq!(zh["idle"], text(Key::StatusIdle, Lang::Zh));
+        assert_eq!(
+            strings_in(&zh.body)["idle"],
+            text(Key::StatusIdle, Lang::Zh)
+        );
     }
 
     /// 浏览器送来的 `navigator.language` 什么值都可能（空串、`ja`、`zh_Hant`…）。
@@ -397,10 +425,8 @@ mod tests {
         for q in ["", "lang=", "lang=ja", "lang=xx-YY", "lang=%00"] {
             let resp = r.handle(&get("/api/strings", q));
             assert_eq!(resp.status, 200, "lang {q:?} 不该失败");
-            let map: std::collections::BTreeMap<String, String> =
-                serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(
-                map["idle"],
+                strings_in(&resp.body)["idle"],
                 text(Key::StatusIdle, Lang::En),
                 "lang {q:?} 该退回英文"
             );
@@ -798,7 +824,7 @@ mod tests {
         for needle in [
             "if (scrollGoesToAgent(kind))",
             "scrollState.agent_owns",
-            "post(\"/api/key\", { id: open, key: AGENT_KEY[kind] })",
+            "sent(wire.key(open, AGENT_KEY[kind]))",
             "up: toAgent ||",
         ] {
             assert!(
@@ -817,7 +843,13 @@ mod tests {
     fn screen_refreshes_do_not_stack_up() {
         // 同上：查的是闸门真的挡在路上，不是变量还声明着。
         let code = page_without_comments();
-        for needle in ["if (screenInflight)", "screenDue = true", "return nudge();"] {
+        for needle in [
+            "if (screenInflight)",
+            "screenDue = true",
+            // 补一帧现在挂在 `sent` 上（取数搬进 `wire` 之后，`post` 没了）。
+            // 钉的还是同一件事：送完东西之后确实会去补那一帧。
+            "p.then(nudge)",
+        ] {
             assert!(
                 code.contains(needle),
                 "少了 {needle:?}——整屏拉取又会在慢链路上叠起来"
@@ -993,6 +1025,82 @@ mod tests {
             let (r, fake) = routes(Response::Ok);
             assert_eq!(r.handle(&post("/api/scroll", body)).status, 400, "{body}");
             assert!(fake.seen.lock().unwrap().is_empty(), "{body} 不该往下走");
+        }
+    }
+
+    /// **换一根管子只该换一个地方。**
+    ///
+    /// 这一页里最难写对的东西——输入法组合、翻历史该给谁、一次只飞一帧、
+    /// 字号自适配——没有一样跟"数据从哪儿来"有关。经中转看家里的电脑那一期
+    /// 要换的只是取数那一层；这条守卫保证到那天为止，取数没有再长出第二处
+    /// 来。散出去一处，那一处就是将来被漏改的那处。
+    #[test]
+    fn only_one_place_knows_where_the_data_comes_from() {
+        let code = page_without_comments();
+        let start = code
+            .find("var wire = {")
+            .expect("页面里应该有 wire 这个对象");
+        let len = code[start..]
+            .find("\n  };")
+            .expect("wire 该以单独一行 `  };` 收尾");
+        let (inside, outside) = (
+            &code[start..start + len],
+            format!("{}{}", &code[..start], &code[start + len..]),
+        );
+
+        assert_eq!(
+            outside.matches("/api/").count(),
+            0,
+            "`/api/` 只许出现在 wire 里。散在别处的那一处，就是换中转那天被漏改的那处。"
+        );
+        // 上面那条在 wire 空掉、调用方全都改回写死路径时**照样绿**——那时候
+        // 页面里一个 `/api/` 都没有了。所以还要确认它们真在里面。
+        assert_eq!(
+            inside.matches("/api/").count(),
+            6,
+            "wire 该正好盖住六件事：文案、列表、画面、打字、按键、翻历史。"
+        );
+    }
+
+    /// 页面问的每一条路径，路由都得真的接。
+    ///
+    /// **以前两边的路径从来没被对过一遍。** 把 `wire` 里的 `/api/scroll` 打成
+    /// `/api/scrol`，整套测试一条都不会红——真机上那是翻历史整个失灵，而且
+    /// 只有滚到底的人才会发现。变异测试当场试出来的这个洞。
+    ///
+    /// 只问"这条路径存不存在"，不问方法对不对：方法那一层由上面各自的测试
+    /// 盯着，这里要拦的是拼写和改名。
+    #[test]
+    fn every_path_the_page_asks_for_is_one_the_router_serves() {
+        let code = page_without_comments();
+        let start = code
+            .find("var wire = {")
+            .expect("页面里应该有 wire 这个对象");
+        let len = code[start..]
+            .find("\n  };")
+            .expect("wire 该以单独一行 `  };` 收尾");
+        let inside = &code[start..start + len];
+
+        let paths: Vec<&str> = inside
+            .match_indices("/api/")
+            .map(|(i, _)| {
+                let rest = &inside[i..];
+                // 路径到引号或者 `?` 为止——`"/api/screen?id=" + …` 那种拼接
+                // 里，问号后面的不是路径。
+                let end = rest.find(['"', '?']).unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(paths.len(), 6, "wire 里该正好六条路径：{paths:?}");
+
+        let (r, _fake) = routes(Response::Sessions(Vec::new()));
+        for p in paths {
+            let seen_by_get = r.handle(&get(p, "")).status != 404;
+            let seen_by_post = r.handle(&post(p, "{}")).status != 404;
+            assert!(
+                seen_by_get || seen_by_post,
+                "网页要问 {p:?}，而路由上没有这条路径"
+            );
         }
     }
 

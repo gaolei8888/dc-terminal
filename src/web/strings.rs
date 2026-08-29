@@ -40,15 +40,11 @@ pub const NEEDED: &[(&str, Key)] = &[
 ];
 
 /// 一门语言的整张表，JSON。
-pub fn bundle(lang: Lang) -> String {
-    let map: std::collections::BTreeMap<&str, &str> = NEEDED
+pub fn bundle(lang: Lang) -> std::collections::BTreeMap<String, String> {
+    NEEDED
         .iter()
-        .map(|(name, key)| (*name, text(*key, lang)))
-        .collect();
-    // 这张表是我们自己拼的，只有 `&str`，序列化不可能失败——真失败了也
-    // 只能给一张空表，而空表在网页上的样子是「所有文字都不见了」，
-    // 比 panic 掉整个守护进程强。
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+        .map(|(name, key)| (name.to_string(), text(*key, lang).to_string()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -66,12 +62,11 @@ mod tests {
     }
 
     #[test]
-    fn the_bundle_is_json_with_every_name_in_it() {
+    fn the_bundle_has_every_name_in_it() {
         for lang in Lang::all() {
-            let json: std::collections::BTreeMap<String, String> =
-                serde_json::from_str(&bundle(*lang)).unwrap();
+            let map = bundle(*lang);
             for (name, _) in NEEDED {
-                assert!(json.contains_key(*name), "{lang:?} 的表里少了 {name}");
+                assert!(map.contains_key(*name), "{lang:?} 的表里少了 {name}");
             }
         }
     }
@@ -82,10 +77,8 @@ mod tests {
     /// （比如写死 `Lang::En`）会让手机端永远是英文，而上面两条测试照样全绿。
     #[test]
     fn the_two_languages_are_actually_different() {
-        let zh: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(&bundle(Lang::Zh)).unwrap();
-        let en: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(&bundle(Lang::En)).unwrap();
+        let zh = bundle(Lang::Zh);
+        let en = bundle(Lang::En);
 
         // `unknown` 两边都是「—」，那是故意的（见 `StatusUnknown`），不算数。
         let differing = NEEDED
