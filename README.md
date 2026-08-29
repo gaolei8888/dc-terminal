@@ -2,10 +2,16 @@
 
 # dct
 
-### Agents that keep working after you close the laptop.
+### Stop babysitting your agents.
 
-A board for coding agents. Start a few, let them work in separate projects,
-close the terminal. Come back, find one made a mess, press one key and it's gone.
+A coding agent needs you sitting there because every few minutes it stops to ask
+"is this okay?". dct answers all of those yes — **and can afford to, because it
+takes a hidden snapshot of your project before every single turn.** If one makes
+a mess, `u` puts it back.
+
+With nobody to babysit, one person can run several at once: a board, a nine-up
+grid, one glance to see who's working and who's stuck. Close the terminal and
+they keep going. Leave the house and check them from your phone.
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
@@ -29,6 +35,36 @@ q quit         ai-mania         Enter open  n new  Tab project  ? …
 
 Grouped by project. The bar down the left marks where you are — that's the
 project `n` opens in.
+
+---
+
+## What this adds over an agent in tmux
+
+Keeping a process alive is something `tmux` already does, and dct is no better
+at it. The difference is the other four things:
+
+**It never asks permission, because it can undo.** A hidden git snapshot before
+every turn, `u` to go back one, `d` to see which files a session actually
+touched. **Without that the other three don't matter** — you'd still be sitting
+there clicking "allow", and running several agents would only make you busier.
+
+**State is read, not guessed.** Every 200ms dct reads each session's screen and
+works out what it's doing: working, idle, stopped, failed. Nine agents on one
+board, and you can tell which is stuck without opening any of them. When it
+can't tell, it prints "—" instead of guessing — `shell` sessions used to get
+guessed as "working".
+
+**Sessions belong to the daemon, not the terminal.** Close the terminal, drop
+the SSH connection, shut the lid: they keep running, and typing `dct` puts you
+back exactly where you left.
+
+**Nine agents, one installer.** `dct install claude` brings the Node it needs
+with it, and keys all live in `~/.dct/secrets.toml` — no remembering what each
+vendor calls its environment variable.
+
+What it costs is in [Things that will annoy
+you](#things-that-will-annoy-you) — **read that before you decide**, especially
+what "accepts every permission" means outside the project directory.
 
 ---
 
@@ -436,6 +472,17 @@ piece of work, designed but not built: see
   the canvas to fit instead.
 - It stops asking for anything the moment the tab goes to the background, so a
   phone in a pocket isn't polling your laptop three times a second.
+- **The type sizes itself**: the page picks a size that makes the whole screen
+  fit, `+` and `−` adjust it, and what you chose is remembered. The bottom bar is
+  pinned there and doesn't scroll away with the content.
+- **Plug in a keyboard and just type**: light up the keyboard button top right
+  and a physical keyboard on an iPad or phone goes straight into the session —
+  arrows, `Ctrl+C`, and IME composition included. `PageUp`, `PageDown` and `End`
+  still scroll history, the same rule as the desktop.
+- **Tap any line on screen** and it lands in the input box, ready to edit and
+  send.
+- The phone can pick its own colours, screen included, without touching the
+  desktop's.
 - Anyone on that network who has the token can type into your sessions. It is off
   by default and one keypress from off again.
 
@@ -583,6 +630,11 @@ src/verify.rs      the API-key probe
 src/git.rs         hidden snapshots
 src/projects.rs    recent projects, last agent used
 src/proto.rs       the wire contract
+src/web/           the LAN phone client: a tiny HTTP server and one page
+src/link.rs        dials out to a relay and long-polls it (no switch yet)
+crates/dct-link/   the envelope the daemon and the relay share; no Request
+crates/dct-srv/    the relay. Phase one has no auth and no encryption, and
+                   refuses to bind anything but loopback
 ```
 
 Three decisions worth knowing before you change things.
