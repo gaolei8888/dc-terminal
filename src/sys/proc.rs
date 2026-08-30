@@ -27,7 +27,7 @@ use std::process::{Child, Command};
 /// 于是关掉那个窗口不会波及它。
 pub fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
     imp::detach(cmd);
-    cmd.spawn()
+    imp::spawn(cmd)
 }
 
 /// 别让这个子进程弹出控制台窗口。
@@ -64,7 +64,13 @@ pub fn hard_kill(pid: u32) {
 
 #[cfg(unix)]
 mod imp {
-    use std::process::Command;
+    use std::process::{Child, Command};
+
+    /// Unix 上没有 Windows 那个句柄继承的坑（`exec` 之后除了 fd 0/1/2 之外
+    /// 的描述符都带着 `CLOEXEC`），起就是起。
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
+        cmd.spawn()
+    }
 
     pub fn detach(cmd: &mut Command) {
         use std::os::unix::process::CommandExt;
@@ -98,8 +104,14 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use std::process::Command;
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use std::process::{Child, Command};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
         CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -116,6 +128,58 @@ mod imp {
         // CREATE_NEW_PROCESS_GROUP 一起加：不然它会跟着调用者收到 Ctrl+C，
         // 而「按 Ctrl+C 退出界面」不该顺手打断后台的会话。
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    /// 起这个子进程，**但别把我们自己那几根管子递给它**。
+    ///
+    /// Windows 上 `CreateProcess` 必须以 `bInheritHandles=TRUE` 调用，标准库
+    /// 才能把子进程的三个标准句柄递过去。可 TRUE 的含义不是"递这三个"，而是
+    /// **"我手上每一个标记了可继承的句柄，孩子都拿一份"**。于是即使我们已经
+    /// 把守护进程的 stdin/stdout/stderr 全指到 NUL（见 `client::spawn_daemon`），
+    /// 它照样会拿到**我们自己的** stdout——而我们的 stdout 很可能是别人的管子。
+    ///
+    /// 症状是这样的：`dct restart -y | tee log`，或者任何一个用管道收 dct
+    /// 输出的脚本，会在 dct 早就退出之后继续挂着，因为管子的写端还在那个
+    /// 刚被拉起来、准备活好几天的守护进程手里。它永远不会关。
+    ///
+    /// （这是被 `restart_with_yes_swaps_the_daemon_process` 逮住的：那条测试
+    /// 用 `Command::output()` 收输出，于是整轮测试卡死，还每次留下一个野
+    /// 守护进程。它就是这件事的回归测试。）
+    ///
+    /// 所以起之前把那三个句柄的可继承标志摘掉，起完立刻装回去。**必须装
+    /// 回去**：标准库的 `Stdio::inherit()` 靠的就是这个标志，一直摘着的话，
+    /// 这个进程之后再想让某个子进程共用自己的终端就会失败。
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
+        let saved = take_inheritance();
+        let out = cmd.spawn();
+        for (h, flags) in saved {
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, flags) };
+        }
+        out
+    }
+
+    /// 把三个标准句柄的可继承标志摘掉，返回原来的值好装回去。
+    ///
+    /// 拿不到句柄、或者它本来就不可继承的，一律跳过——不记就不会去改它，
+    /// 也就不会把一个本来没有的标志"还"上去。
+    fn take_inheritance() -> Vec<(HANDLE, u32)> {
+        let mut saved = Vec::new();
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                let h = GetStdHandle(which);
+                if h.is_null() || h == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut flags = 0u32;
+                if GetHandleInformation(h, &mut flags) == 0 || flags & HANDLE_FLAG_INHERIT == 0 {
+                    continue;
+                }
+                if SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) != 0 {
+                    saved.push((h, flags & HANDLE_FLAG_INHERIT));
+                }
+            }
+        }
+        saved
     }
 
     pub fn no_console(cmd: &mut Command) {

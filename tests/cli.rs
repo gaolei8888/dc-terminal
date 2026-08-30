@@ -1,5 +1,85 @@
 use std::process::Command;
 
+/// 跑一条 `dct` 命令，**带死线**。两个测试模块共用这一份。
+///
+/// 这里不能用 `Command::output()`：它要等到管子两端全部关闭为止，而
+/// 「dct 自己早就退出了、管子却还开着」恰恰是这些测试要抓的那类 bug——
+/// `restart` 会拉起一个准备活好几天的守护进程，那个进程只要继承了我们
+/// 这根管子的写端，`output()` 就永远不返回。
+///
+/// 它真的发生过（修在 `sys::proc::imp::spawn`，那里有始末）。当时的症状不是
+/// 某条测试红了，而是**整轮测试卡死**，还每次留下一个野守护进程，把下一次
+/// 编译的链接也一并搞失败。卡死的测试等于没有测试：没有人能从「CI 超时」
+/// 这一个现象看出是哪一行出了问题。
+///
+/// 所以进程退出有死线，读输出也有死线，超了就带着诊断 panic。
+fn run_with_home(home: &std::path::Path, args: &[&str]) -> (String, String, i32) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dct"))
+        .args(args)
+        .env("HOME", home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (which, pipe) in [
+        ("stdout", child.stdout.take().map(Pipe::Out)),
+        ("stderr", child.stderr.take().map(Pipe::Err)),
+    ] {
+        let tx = tx.clone();
+        let mut pipe = pipe.expect("管子该在");
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            let _ = tx.send((which, text));
+        });
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let code = loop {
+        match child.try_wait().unwrap() {
+            Some(st) => break st.code().unwrap_or(-1),
+            None => assert!(Instant::now() < deadline, "dct {args:?} 三十秒还没退出"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let (mut out, mut err) = (String::new(), String::new());
+    for _ in 0..2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(("stdout", t)) => out = t,
+            Ok((_, t)) => err = t,
+            Err(_) => panic!(
+                "dct {args:?} 已经退出了（{code}），管子却还没关。
+                多半是它拉起的某个后台进程继承了这根管子的写端，见                 `sys::proc::imp::spawn` 上的注释。"
+            ),
+        }
+    }
+    (out, err, code)
+}
+
+/// 两根管子读起来是一回事，类型不是。
+enum Pipe {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+impl std::io::Read for Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Pipe::Out(p) => p.read(buf),
+            Pipe::Err(p) => p.read(buf),
+        }
+    }
+}
+
 #[test]
 fn daemon_subcommand_is_recognized() {
     // --help 必须提到 daemon 子命令
@@ -87,18 +167,7 @@ mod ps_and_stop {
         }
     }
 
-    fn run_with_home(home: &Path, args: &[&str]) -> (String, String, i32) {
-        let out = Command::new(env!("CARGO_BIN_EXE_dct"))
-            .args(args)
-            .env("HOME", home)
-            .output()
-            .unwrap();
-        (
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-            out.status.code().unwrap_or(-1),
-        )
-    }
+    use super::run_with_home;
 
     /// **没有守护进程时 `dct ps` 不许拉起一个。**
     ///
@@ -326,18 +395,7 @@ mod restart {
         dct::client::Client::connect(sock).ok()?.peer_pid()
     }
 
-    fn run_with_home(home: &Path, args: &[&str]) -> (String, String, i32) {
-        let out = Command::new(env!("CARGO_BIN_EXE_dct"))
-            .args(args)
-            .env("HOME", home)
-            .output()
-            .unwrap();
-        (
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-            out.status.code().unwrap_or(-1),
-        )
-    }
+    use super::run_with_home;
 
     /// `-y` 真的换掉了守护进程：pid 变了，而新的那个连得上。
     #[test]
