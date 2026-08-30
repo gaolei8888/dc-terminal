@@ -83,25 +83,14 @@ impl Handler for Routes {
                 _ => Resp::status(405),
             },
             // 网页上的每一句话都从这儿来，网页里一个字都不写死。
-            // 语言认不出来就按 `Lang::resolve` 那套的最后一档（英文）——
-            // 手机送来的是浏览器的 `navigator.language`，什么值都可能。
+            //
+            // **这一层只把值搬过去，不认它。** 以前这里直接调 `strings::bundle`，
+            // 而且顺手把 `zh-CN` 认成 `Lang::Zh`——两件事都是中转做不了的
+            // （它手上只有信封）。现在语言标记原样进 `Request::WebStrings`，
+            // 认不认得出由守护进程说了算（`strings::bundle_for`）。
             "/api/strings" => match req.method {
                 "GET" => {
-                    let lang = query_get(req.query, "lang")
-                        .map(|v| {
-                            if v.to_ascii_lowercase().starts_with("zh") {
-                                "zh"
-                            } else {
-                                "en"
-                            }
-                        })
-                        .and_then(crate::i18n::Lang::from_code)
-                        .unwrap_or(crate::i18n::Lang::En);
-                    // **走 dispatch，不自己取。** 以前这里直接调
-                    // `strings::bundle`，于是这张表是全页唯一一样不经过协议
-                    // 的东西——而经中转的时候中转手上只有信封，取不到它。
-                    // 现在它跟别的一样是一条 `Request`，网页两种模式下
-                    // 拿到的形状因此也一样（`{"Strings":{…}}`）。
+                    let lang = query_get(req.query, "lang").unwrap_or("").to_string();
                     self.answer(Request::WebStrings { lang })
                 }
                 _ => Resp::status(405),
@@ -135,17 +124,21 @@ impl Handler for Routes {
                 },
                 _ => Resp::status(405),
             },
-            // 虚拟键行按下去的那一下。名字翻字节走 `web::keys`，
-            // 而那个模块自己不写表，转手交给桌面端同一个 `key_to_input`。
+            // 虚拟键行按下去的那一下。**翻译不在这一层做。**
+            //
+            // 以前这里调 `keys::bytes_for` 把名字翻成
+            // 字节，再发一条 `Request::Input`——那是这一层最后一处"顺手算
+            // 一下"，而中转手上只有信封，算不了（同文案那条，见协议 10）。
+            //
+            // 名字不认识现在回的是 `200 {"Error":…}` 而不是 400。这跟本文件
+            // 开头那条规矩是一致的：**协议层的回答一律 200**。用户那一侧
+            // 什么都没变——按了一个键仍然会得到一句说得清的话，而不是静默。
             "/api/key" => match req.method {
                 "POST" => match serde_json::from_slice::<KeyBody>(req.body) {
-                    Ok(b) => match super::keys::bytes_for(&b.key) {
-                        Some(text) => self.answer(Request::Input { id: b.id, text }),
-                        // 白名单之外的名字是 400，不是"当成没这回事"：
-                        // 手机上按了一个键却什么都没发生，用户只会以为
-                        // 是网络卡了，然后再按一次。
-                        None => Resp::status(400),
-                    },
+                    Ok(b) => self.answer(Request::Key {
+                        id: b.id,
+                        name: b.key,
+                    }),
                     Err(_) => Resp::status(400),
                 },
                 _ => Resp::status(405),
@@ -272,16 +265,21 @@ mod tests {
         });
         let f = Arc::clone(&fake);
         let routes = Routes::new(Arc::new(move |req: Request| {
-            // 文案那一条走真实现。它现在也是一条协议请求（协议 9），拿罐头
-            // 答复顶替的话，「表跟着语言变」这件事就没法测了——而那正是
-            // 这条路唯一值得测的东西。
-            let strings = match &req {
-                Request::WebStrings { lang } => Some(crate::web::strings::bundle(*lang)),
+            // 文案和键名这两条走真实现。它们现在也是协议请求（协议 9、10），
+            // 拿罐头答复顶替的话，这两条路上唯一值得测的东西就都没了。
+            let real = match &req {
+                Request::WebStrings { lang } => {
+                    Some(Response::Strings(crate::web::strings::bundle_for(lang)))
+                }
+                Request::Key { name, .. } => Some(match crate::web::keys::bytes_for(name) {
+                    Some(_) => Response::Ok,
+                    None => Response::Error(crate::proto::ErrorCode::BadRequest(name.clone())),
+                }),
                 _ => None,
             };
             f.seen.lock().unwrap().push(req);
-            match strings {
-                Some(map) => Response::Strings(map),
+            match real {
+                Some(r) => r,
                 None => serde_json::from_str(&f.reply).unwrap(),
             }
         }));
@@ -680,33 +678,49 @@ mod tests {
         }
     }
 
-    /// 虚拟键行按下去的那一下，翻成的字节必须跟桌面端按同一个键一样。
+    /// 键名**原样往下送，这一层不翻译**。
+    ///
+    /// 翻译搬去了守护进程（协议 10），因为中转手上只有信封、翻不了。字节
+    /// 层面的保证还在原地：`web::keys` 里那三条测试盯着「发出去的字节跟真
+    /// 终端一致」「Enter 是空串」「白名单外一律拒」。这一条只管这一层别再
+    /// 自己动手——一旦哪天有人又在这儿翻一次，仓库里就有两张表了，而两张
+    /// 表漂了的症状是"手机上按方向键，agent 收到别的东西"。
     #[test]
-    fn a_virtual_key_sends_the_same_bytes_the_desktop_would() {
+    fn a_key_press_is_forwarded_by_name_not_translated_here() {
         let (r, fake) = routes(Response::Ok);
         r.handle(&post("/api/key", r#"{"id":7,"key":"Up"}"#));
 
         let seen = fake.seen.lock().unwrap();
         match seen.as_slice() {
-            [Request::Input { id: 7, text }] => assert_eq!(text, "\x1b[A"),
-            other => panic!("预期一条 Input，实际 {other:?}"),
+            [Request::Key { id: 7, name }] => assert_eq!(name, "Up"),
+            other => panic!("预期一条 Key，实际 {other:?}"),
         }
     }
 
-    /// 白名单之外的键名是 400，**而且不许惊动守护进程**。手机上按了一个键
-    /// 却什么都没发生的话，用户只会以为是网络卡了，然后再按一次。
+    /// 白名单之外的键名会得到**一句说得清的话，不是沉默**。
+    ///
+    /// 以前这里是 400，现在是 `200 {"Error":…}`——拒不拒绝这件事跟着翻译
+    /// 一起搬去了守护进程，而本文件开头那条规矩说：协议层的回答一律 200。
+    /// 要守的性质一个字没变，还是当初立这条测试的那一条：手机上按了一个键
+    /// 却什么都没发生的话，用户只会以为是网卡了，然后再按一次。
     #[test]
-    fn an_unknown_key_name_is_refused_and_never_reaches_the_daemon() {
+    fn an_unknown_key_name_comes_back_as_a_sentence_not_as_silence() {
         for body in [
             r#"{"id":1,"key":"F2"}"#,
             r#"{"id":1,"key":"ctrl+c"}"#,
             r#"{"id":1,"key":""}"#,
             r#"{"id":1,"key":"\u001b[A"}"#,
         ] {
-            let (r, fake) = routes(Response::Ok);
+            let (r, _) = routes(Response::Ok);
             let resp = r.handle(&post("/api/key", body));
-            assert_eq!(resp.status, 400, "{body} 该被拒");
-            assert!(fake.seen.lock().unwrap().is_empty(), "{body} 不该往下走");
+            assert_eq!(resp.status, 200, "{body}");
+            assert!(
+                matches!(
+                    serde_json::from_slice::<Response>(&resp.body).unwrap(),
+                    Response::Error(_)
+                ),
+                "{body} 该被拒，而且要说出来"
+            );
         }
     }
 

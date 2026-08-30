@@ -40,6 +40,24 @@ pub const NEEDED: &[(&str, Key)] = &[
 ];
 
 /// 一门语言的整张表，JSON。
+/// 按浏览器报的语言标记给一张表。
+///
+/// **解析在这儿做，不在路由层。** 以前是 `web::routes` 把 `?lang=zh-CN` 认成
+/// `Lang::Zh` 再取表——那是路由层的又一处"顺手算一下"，而经中转的时候中转
+/// 手上只有信封，算不了（同键名那条，见协议 10）。
+///
+/// 认不出来一律退回英文，**绝不失败**：浏览器送来的 `navigator.language`
+/// 什么值都可能（空串、`ja`、`zh_Hant`……），而一个因为语言标记看不懂就白屏
+/// 的页面，用户完全无从下手。
+pub fn bundle_for(tag: &str) -> std::collections::BTreeMap<String, String> {
+    let code = if tag.to_ascii_lowercase().starts_with("zh") {
+        "zh"
+    } else {
+        "en"
+    };
+    bundle(Lang::from_code(code).unwrap_or(Lang::En))
+}
+
 pub fn bundle(lang: Lang) -> std::collections::BTreeMap<String, String> {
     NEEDED
         .iter()

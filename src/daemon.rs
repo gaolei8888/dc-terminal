@@ -640,6 +640,14 @@ fn handle(
             r
         }
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
+        // 键名 → 字节的翻译在这儿做，不在网页里也不在中转里：那张表只有
+        // 一份（`ui::key_to_input`），而这是唯一同时够得着它和会话的地方。
+        Request::Key { id, name } => match crate::web::keys::bytes_for(&name) {
+            Some(text) => mgr.send_input(id, &text).map(|_| Response::Ok),
+            None => Ok(Response::Error(ErrorCode::BadRequest(format!(
+                "不认识的键名：{name}"
+            )))),
+        },
         Request::Screen { id } => mgr.screen(id).map(|snap| Response::Screen {
             lines: snap.lines,
             cursor: snap.cursor,
@@ -797,7 +805,9 @@ fn handle(
         // 网页要的那张文案表。**跟别的请求走同一条路**——它以前是
         // `web::routes` 直接取了就发的，那条捷径在中转那一侧走不通
         // （中转手上只有信封，见 `proto.rs` 版本 9 那段注释）。
-        Request::WebStrings { lang } => Ok(Response::Strings(crate::web::strings::bundle(lang))),
+        Request::WebStrings { lang } => {
+            Ok(Response::Strings(crate::web::strings::bundle_for(&lang)))
+        }
         Request::WebStatus => Ok(web_status(web, secrets)),
         Request::WebEnable => Ok(web_enable(
             WEB_BIND,
