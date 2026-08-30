@@ -505,6 +505,57 @@ impl crate::runtime::Progress for TermProgress {
 /// 网络类的失败后面补一句镜像提示：那是这类失败里唯一一条学生自己走得通
 /// 的路，而它需要两个他不可能猜到的地址。校验和对不上和磁盘写不进不补，
 /// 换镜像对那两种情况没有帮助，多印一段只会让人往错的方向使劲。
+/// `dct install git`：把那份便携 git 装到能用为止。
+///
+/// 跟 `run_install` 装 agent 那条路一样，**最后真的再查一遍**：
+/// 「解压说成功了」和「敲得出 git 了」不是同一件事。
+fn run_install_git(runtime: &std::path::Path, lang: Lang) -> i32 {
+    // 先把自带的运行时挂上再问「装没装」——顺序反了的话，上一次装好的
+    // 那份 git 会被报成没装，它就在 `~/.dct/runtime/git` 里。
+    crate::runtime::activate(runtime);
+
+    if crate::git::available() {
+        println!("{}", crate::i18n::msg::git_already_installed(lang));
+        return 0;
+    }
+
+    if let Err(e) = crate::runtime::ensure_git(runtime, lang, &TermProgress::default()) {
+        eprintln!("{}", git_fetch_problem(lang, &e));
+        return 1;
+    }
+
+    if crate::git::available() {
+        println!("{}", crate::i18n::msg::git_ready(lang));
+        0
+    } else {
+        // 装完了却还是跑不起来。极少见，但不能报成成功——那会让下一步
+        // 失败在一句跟原因对不上的话上。
+        eprintln!(
+            "{}",
+            crate::i18n::msg::install_finished_but_missing(lang, "git")
+        );
+        1
+    }
+}
+
+/// 同 `fetch_problem`，但「这个平台没有现成的包」那一支说的是 git 的事。
+///
+/// 不复用那一支：它印的是「自己装一份 Node」，而走到这里的用户缺的是
+/// git，照着那句话做解决不了他的问题。
+fn git_fetch_problem(lang: Lang, e: &crate::runtime::FetchError) -> String {
+    use crate::runtime::FetchError as F;
+    match e {
+        F::NoAssetForPlatform => crate::i18n::msg::git_missing_install_it_yourself(lang),
+        // 下不到时给的镜像变量也得是 git 那个，不是 Node 那两个。
+        F::Unreachable { url } => format!(
+            "{}\n\n{}",
+            crate::i18n::msg::download_unreachable(lang, url),
+            crate::i18n::msg::git_mirror_hint(lang)
+        ),
+        other => fetch_problem(lang, other),
+    }
+}
+
 fn fetch_problem(lang: Lang, e: &crate::runtime::FetchError) -> String {
     use crate::runtime::FetchError as F;
     let hint = || {
@@ -556,6 +607,15 @@ fn npm_registry() -> Option<String> {
 pub fn run_install(name: &str, lang: Lang) -> i32 {
     let socket = crate::proto::socket_path();
     let runtime = crate::runtime::runtime_dir_for_socket(&socket);
+
+    // `dct install git` 走的是另一条路：git 不是 agent，没有 profile，
+    // 也不经过 npm。放在这里而不是另开一个子命令，是因为用户要问的问题
+    // 是同一个——「帮我把缺的那样东西装上」——而多一个子命令就多一个
+    // 得先知道它存在才用得上的东西。
+    if name == "git" {
+        return run_install_git(&runtime, lang);
+    }
+
     let profiles_dir = crate::profile::profiles_dir_for_socket(&socket);
     let (custom, _) = crate::profile::all_profiles(&profiles_dir);
 

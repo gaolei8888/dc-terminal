@@ -56,6 +56,29 @@ pub fn is_repo(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 这台机器上有没有一个**跑得起来的** git。
+///
+/// **必须真的跑一次 `git --version`，不能只问 PATH 上有没有这个名字。**
+/// macOS 上 `/usr/bin/git` 是个占位的壳：Xcode 命令行工具没装时它照样在
+/// PATH 上、`command_exists` 照样说有，真跑起来才会弹一个安装窗口出来。
+/// 只查名字的话，这条检查在最需要它的那台机器上恰好是失灵的。
+/// （`scripts/install.sh` 的 `check_git` 早就是这么写的，理由同一条。）
+///
+/// 为什么单独有这个函数：`is_repo` 分不出「这儿不是仓库」和「这台机器上
+/// 没有 git」——两种情况它都返回 `false`，因为后者 `output()` 直接是
+/// `Err`。而这两句话对用户来说是完全不同的两件事，给出的下一步也不一样
+/// （前者按 `g` 建仓库，后者按 `g` 只会再失败一次）。
+///
+/// 目录用当前目录即可：问的是「git 这个程序在不在」，跟在哪儿问无关。
+pub fn available() -> bool {
+    let mut c = Command::new("git");
+    crate::sys::proc::no_console(&mut c);
+    c.arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// 在这个目录上建一个 git 仓库。
 ///
 /// **只该在 `is_repo()` 说"不是"的时候调。** 那个判断走的是

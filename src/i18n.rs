@@ -1720,6 +1720,79 @@ pub mod msg {
         .to_string()
     }
 
+    /// 下 git 之前那一句。**说清楚它是干嘛用的**：用户点的是「开一个
+    /// agent」，屏幕上突然开始下一个 45 MB 的东西，不说一句的话那看起来
+    /// 像是卡住了或者装错了什么。
+    pub fn git_fetching(lang: Lang, version: &str) -> String {
+        t!(
+            lang,
+            en: format!("This machine has no git. Fetching a portable copy for dct (git {version}, about 45 MB) — dct needs it to snapshot your project before each turn, which is what makes undo work."),
+            zh: format!("这台电脑上没有 git，正在下一份便携版给 dct 用（git {version}，大约 45 MB）。dct 每轮对话前给你的项目拍快照靠的就是它，没有它撤销是死的。"),
+        )
+    }
+
+    pub fn git_ready(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "git is ready.",
+            zh: "git 准备好了。",
+        )
+        .to_string()
+    }
+
+    /// 按 `g` 之后发现缺的是 git 本身，开了个窗口装它。
+    ///
+    /// **说清楚「装完还要再按一次 g」**：用户按 `g` 的意图是「把仓库建起来」，
+    /// 而这一步只完成了前一半，装完回到那一屏时他需要知道自己该干嘛。
+    pub fn installing_git(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "This machine has no git — installing it first. When it finishes, press Esc and then g again to create the project.",
+            zh: "这台电脑上没有 git，先装它。装完按 Esc 回去，再按一次 g 就能建仓库了。",
+        )
+        .to_string()
+    }
+
+    pub fn git_already_installed(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "git is already installed on this machine.",
+            zh: "这台电脑上已经有 git 了。",
+        )
+        .to_string()
+    }
+
+    /// 那份便携 git 下不到时的镜像提示。
+    ///
+    /// 跟 `mirror_hint` 分开：那条说的是 `DCT_NODE_BASE` / `DCT_NPM_REGISTRY`，
+    /// 对着它设一天也不会让 git 下下来。这里给的是**整个地址**而不是前缀，
+    /// 理由见 `runtime::mingit_url`。
+    pub fn git_mirror_hint(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "If your network cannot reach that address, put the same zip somewhere you can download from, set this, and run it again:\n    DCT_MINGIT_URL=<your address>",
+            zh: "如果你这儿连不上那个地址，把同一个 zip 放到一个能下的地方，设上这个再跑一遍：\n    DCT_MINGIT_URL=<你的地址>",
+        )
+        .to_string()
+    }
+
+    /// 这台机器上没有 git，而 dct 也没法替他装（非 Windows）。
+    ///
+    /// **一定要带上那条能照抄的命令**：这个工具的用户是训练营的学生，
+    /// 「请先安装 git」对他们等于什么都没说。命令按平台分，因为两个平台
+    /// 的答案完全不一样，给错了比不给更糟。
+    pub fn git_missing_install_it_yourself(lang: Lang) -> String {
+        let how = match std::env::consts::OS {
+            "macos" => "xcode-select --install",
+            _ => "sudo apt install git",
+        };
+        t!(
+            lang,
+            en: format!("This machine has no git, and dct can only install it for you on Windows. Run this, then start dct again:\n    {how}"),
+            zh: format!("这台电脑上没有 git，而 dct 只能在 Windows 上替你装。先敲这一条，再重新打开 dct：\n    {how}"),
+        )
+    }
+
     /// 下不到。**印出地址**：学生答不上「你连的是哪儿」，而老师一眼就能
     /// 看出他是不是漏设了镜像。
     pub fn download_unreachable(lang: Lang, url: &str) -> String {

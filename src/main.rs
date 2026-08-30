@@ -20,6 +20,8 @@ dct —— vibe coding 终端
   dct prune        把已经停掉的会话从列表里清掉
   dct install <名字> 装一个 agent（claude / codex / qwen / opencode）。
                    缺 Node 运行时会自己补上一份，只给 dct 自己用
+  dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
+                   靠它，没有它撤销是死的；同样只给 dct 自己用
   dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面

@@ -166,12 +166,24 @@ pub fn prepend_path(existing: &str, dir: &Path) -> String {
 /// 所以「装没装」这个判断也必须在同一个环境里问。在别处改，会得到
 /// 「菜单说能用，一开就失败」，或者反过来的「明明装好了却说没装」。
 pub fn activate(runtime: &Path) {
-    if !node_installed(runtime) {
+    // 两份运行时各挂各的：Node 没装不该拦着 git 上 PATH，反过来也一样。
+    // 早先这里是 `if !node_installed { return; }` 打头，把 git 一起挡在
+    // 了外面——那时候只有 Node，现在不是了。
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if node_installed(runtime) {
+        dirs.push(node_bin_dir(runtime));
+    }
+    if git_installed(runtime) {
+        dirs.push(git_bin_dir(runtime));
+    }
+    if dirs.is_empty() {
         return;
     }
-    let bin = node_bin_dir(runtime);
     let current = std::env::var("PATH").unwrap_or_default();
-    let next = prepend_path(&current, &bin);
+    let mut next = current.clone();
+    for d in &dirs {
+        next = prepend_path(&next, d);
+    }
     if next != current {
         std::env::set_var("PATH", next);
     }
@@ -379,6 +391,135 @@ pub fn ensure_node(
     Ok(())
 }
 
+// ---------------------------------------------------------------- 自带的 git
+//
+// **为什么 dct 要自己管 git：** git 不是编译依赖，是运行时依赖。每一轮对话
+// 之前那次隐藏快照是 shell 出去调 git 做的（`git.rs`），没有它撤销就是死的
+// ——而撤销正是 dct 敢让 agent 关掉所有权限确认的全部理由。
+//
+// 安装脚本里已经有一份同样的逻辑（`scripts/install.ps1` 的
+// `Install-PortableGit`），这里再做一遍**不是重复**：那条路只覆盖「用官方
+// 脚本装的 dct」。`cargo install`、解压 release 包、从别人那儿拷一个
+// `dct.exe`、以及**脚本自己那一步下载失败了**（`Install-PortableGit` 返回
+// `false`，脚本照样往下走印「装好了」）——这四种情况下机器上都没有 git，
+// 而 dct 直到用户按下 Enter 那一刻才会发现。
+//
+// 跟 Node 那半边共用全部机制：同一个 `Progress`、同一个 `FetchError`、
+// 同一个边下边算哈希的 `download_verified`、同一个 shell 出去调 tar 的
+// `unpack`、同一个 `~/.dct/runtime` 目录。不进系统 PATH，不写注册表，
+// 不碰用户可能已经装好的那份 git，删 `~/.dct` 就干净了。
+
+/// 钉死版本，理由同 `NODE_VERSION`：每个学生手里必须是同一份，否则
+/// 「他那台为什么不行」第一个要排除的就是这一条。
+pub const GIT_VERSION: &str = "2.47.1";
+
+/// MinGit：git-for-windows 官方出的便携版，解压即用。
+/// 跟 `scripts/install.ps1` 里那个 `$DefaultGitZipUrl` 是同一个地址——
+/// 两处指向同一份文件是有意的，改一个就要改另一个。
+const DEFAULT_MINGIT_URL: &str = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip";
+
+/// 这个包的 SHA256。**实测算出来的，不是抄来的**：
+/// `MinGit-2.47.1-64-bit.zip`，47241394 字节。
+///
+/// Node 那半边的哈希是当场从官方 `SHASUMS256.txt` 拉的，git-for-windows
+/// 的 release 没有那样一个能按文件名查的清单，所以这里钉一个常量。代价是
+/// 换版本要连着换这一行；换来的是**这个文件会被放进 PATH 天天执行**，而
+/// 「下到一半断了」和「下到一个被人换过的文件」在解压之前长得一模一样。
+///
+/// 安装脚本里那一步至今没有这个检查（`Install-PortableGit` 直接
+/// `Expand-Archive`），而同一个脚本对 `dct.exe` 却坚持验——那是个该补的
+/// 口子，不是可以照抄的先例。
+pub const MINGIT_SHA256: &str = "50b04b55425b5c465d076cdb184f63a0cd0f86f6ec8bb4d5860114a713d2c29a";
+
+/// 老师在教室里换镜像用。跟 `DCT_NODE_BASE` 一个道理，也跟
+/// `install.ps1` 的 `DCT_MINGIT_URL` 同名——学生那条命令一个字不用改。
+///
+/// 这里给的是**整个地址**而不是前缀：MinGit 没有 `<base>/<版本>/<文件名>`
+/// 那样的目录结构可言，老师多半是把这一个 zip 原样放到某个能下的地方。
+pub fn mingit_url() -> String {
+    std::env::var("DCT_MINGIT_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MINGIT_URL.to_string())
+}
+
+pub fn git_dir(runtime: &Path) -> PathBuf {
+    runtime.join("git")
+}
+
+/// 要加进 PATH 的那个目录。
+///
+/// **MinGit 的包里没有顶层目录**——解开就是 `cmd/`、`etc/`、`mingw64/`、
+/// `usr/` 平铺在解压目标下面（实测过；Node 那边解出来的是
+/// `node-v22.11.0-win-x64/`，两者不一样，`ensure_git` 里那段 rename
+/// 因此不能照抄 `ensure_node`）。`git.exe` 在 `cmd/` 下面，跟
+/// `install.ps1` 加进 PATH 的是同一个目录。
+pub fn git_bin_dir(runtime: &Path) -> PathBuf {
+    git_dir(runtime).join("cmd")
+}
+
+/// 这份自带的 git 装好了没有。同 `node_installed`：认可执行文件在不在，
+/// 不是目录在不在——上次解压到一半断电的话，目录是在的，而里面没有
+/// 能跑的东西。
+pub fn git_installed(runtime: &Path) -> bool {
+    git_bin_dir(runtime).join("git.exe").is_file()
+}
+
+/// 确保 `~/.dct/runtime/git` 里有一份能跑的 git，然后挂到当前进程的 PATH 上。
+///
+/// **只有 Windows 走得通。** MinGit 是 git-for-windows 出的，别的平台没有
+/// 对应的东西：macOS 上 git 跟 Xcode 命令行工具绑在一起（`xcode-select
+/// --install`，会弹一个窗，脚本驱动不了），Linux 上是包管理器加 sudo。
+/// 那两条路要么要用户点，要么要提权，都不该由一个正在画 TUI 的进程
+/// 替用户按下去。所以这里如实返回 `NoAssetForPlatform`，由调用方把
+/// 「这台机器得自己装 git」连着那一条命令一起说清楚。
+pub fn ensure_git(
+    runtime: &Path,
+    lang: crate::i18n::Lang,
+    p: &dyn Progress,
+) -> Result<(), FetchError> {
+    if git_installed(runtime) {
+        activate(runtime);
+        return Ok(());
+    }
+    if !cfg!(windows) {
+        return Err(FetchError::NoAssetForPlatform);
+    }
+
+    p.line(&crate::i18n::msg::git_fetching(lang, GIT_VERSION));
+
+    std::fs::create_dir_all(runtime).map_err(|_| FetchError::CannotWrite)?;
+    let staging = runtime.join(".git-staging");
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let archive = runtime.join("MinGit.zip");
+    let url = mingit_url();
+    // 这个地址会 302 到 GitHub 的 CDN 上去。ureq 默认跟跳转（最多 5 次），
+    // `sys::tls::agent_builder` 没关掉它。
+    download_verified(&url, &archive, MINGIT_SHA256, p)?;
+
+    let r = unpack(&archive, &staging);
+    // 包留着没有意义，45 MB。解得开解不开都删。
+    let _ = std::fs::remove_file(&archive);
+    r?;
+
+    // **直接把 staging 挪成 git 目录**，不像 `ensure_node` 那样先进去找一层
+    // ——见 `git_bin_dir` 的注释：这个包解出来是平铺的，没有顶层目录。
+    if !staging.join("cmd").join("git.exe").is_file() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(FetchError::CannotUnpack);
+    }
+    let target = git_dir(runtime);
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::rename(&staging, &target).map_err(|_| FetchError::CannotWrite)?;
+
+    if !git_installed(runtime) {
+        return Err(FetchError::CannotUnpack);
+    }
+    activate(runtime);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +656,110 @@ ccc  node-v22.11.0-win-x64.zip
         });
         let out = prepend_path("", dir);
         assert_eq!(out, dir.to_string_lossy());
+    }
+
+    /// `git.exe` 在 `cmd/` 下面，跟 `install.ps1` 加进 PATH 的是同一个目录。
+    /// 两处指的必须是同一个地方，否则「脚本装的」和「dct 自己装的」会各挂
+    /// 各的，而其中一个是错的。
+    #[test]
+    fn the_portable_git_lives_in_the_cmd_subdirectory() {
+        let rt = Path::new("/r");
+        assert_eq!(git_bin_dir(rt), git_dir(rt).join("cmd"));
+    }
+
+    /// 同 `node_installed`：认可执行文件，不认目录。上次解压到一半断电时
+    /// 目录是在的，而里面没有能跑的东西——那种状态最难查，因为它看起来
+    /// 是装好的。
+    #[test]
+    fn a_half_unpacked_git_directory_does_not_count_as_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        assert!(!git_installed(rt), "空的运行时目录里不该有 git");
+
+        std::fs::create_dir_all(git_bin_dir(rt)).unwrap();
+        assert!(!git_installed(rt), "只有目录、没有 git.exe，不算装好");
+
+        std::fs::write(git_bin_dir(rt).join("git.exe"), b"not really git").unwrap();
+        assert!(git_installed(rt));
+    }
+
+    /// **这条钉的是一个真出过的错**：`activate` 原来是
+    /// `if !node_installed { return; }` 打头的，加进 git 之后那一句会把
+    /// git 一起挡在 PATH 外面——于是「dct 自己装了 git」和「dct 找得到
+    /// 那份 git」变成两件事，而学生只装了 git、没装 Node 正是最常见的情形。
+    #[test]
+    fn git_gets_onto_the_path_even_when_node_is_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let bin = git_bin_dir(rt);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("git.exe"), b"not really git").unwrap();
+        assert!(!node_installed(rt), "这条测的就是没有 Node 的那种机器");
+
+        let before = std::env::var("PATH").unwrap_or_default();
+        activate(rt);
+        let after = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", &before); // 别把进程级 PATH 留给后面的测试
+
+        assert!(
+            after.contains(&*bin.to_string_lossy()),
+            "没装 Node 的机器上，自带的 git 也必须挂得上：{after}"
+        );
+    }
+
+    /// 哈希是手抄进来的一个常量（git-for-windows 没有可按文件名查的
+    /// `SHASUMS256.txt`）。抄错一个字符的后果是**每一次装 git 都失败在
+    /// 「文件损坏」上**，而那句话会把人指向网络问题。形状对不对这里就能查。
+    #[test]
+    fn the_pinned_mingit_checksum_is_well_formed() {
+        assert_eq!(MINGIT_SHA256.len(), 64, "SHA256 是 64 个十六进制字符");
+        assert!(
+            MINGIT_SHA256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "只能是小写十六进制：{MINGIT_SHA256}"
+        );
+    }
+
+    /// 钉死版本这件事本身：地址里的版本号和 `GIT_VERSION` 必须是同一个。
+    /// 对不上的话，日志里说在装 2.47.1，实际下的是别的——排查时第一个
+    /// 被排除的就是这条线索。
+    #[test]
+    fn the_pinned_git_version_matches_the_url_it_downloads() {
+        assert!(
+            DEFAULT_MINGIT_URL.contains(GIT_VERSION),
+            "地址跟 GIT_VERSION 对不上：{DEFAULT_MINGIT_URL}"
+        );
+    }
+
+    /// 老师换镜像用的口子。给的是整个地址而不是前缀——MinGit 没有
+    /// `<base>/<版本>/<文件名>` 那样的结构可言（见 `mingit_url`）。
+    #[test]
+    fn the_mingit_address_can_be_pointed_at_a_classroom_mirror() {
+        let saved = std::env::var("DCT_MINGIT_URL").ok();
+        std::env::set_var("DCT_MINGIT_URL", "https://m.example/MinGit.zip");
+        assert_eq!(mingit_url(), "https://m.example/MinGit.zip");
+        // 空的当没设：老师把变量清成空串是常见操作，那时候该退回默认，
+        // 而不是拿一个空地址去下载。
+        std::env::set_var("DCT_MINGIT_URL", "   ");
+        assert_eq!(mingit_url(), DEFAULT_MINGIT_URL);
+        match saved {
+            Some(v) => std::env::set_var("DCT_MINGIT_URL", v),
+            None => std::env::remove_var("DCT_MINGIT_URL"),
+        }
+    }
+
+    /// 非 Windows 上如实说「这台机器没有现成的包」，不是假装成功，也不是
+    /// 报一个看起来像网络问题的错。调用方靠这一支把 `xcode-select --install`
+    /// 那条命令说出来。
+    #[cfg(not(windows))]
+    #[test]
+    fn there_is_no_portable_git_to_fetch_outside_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ensure_git(tmp.path(), crate::i18n::Lang::Zh, &Silent),
+            Err(FetchError::NoAssetForPlatform)
+        );
     }
 
     /// 路径都从 socket 推出来，跟 config.toml / secrets.toml / profiles 一样。

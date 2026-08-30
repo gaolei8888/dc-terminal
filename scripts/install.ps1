@@ -51,7 +51,11 @@ param(
 	[string]$ReleaseBase,
 
 	# 同上，给那份便携 git 用。
-	[string]$GitZipUrl
+	[string]$GitZipUrl,
+
+	# 那份便携 git 的 SHA256。换了 $GitZipUrl 指向另一个版本时才需要给——
+	# 镜像上放的要是同一个文件，默认值就还对得上。
+	[string]$GitSha256
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,12 +77,25 @@ $DefaultReleaseBase = 'https://github.com/gaolei8888/dc-terminal/releases/latest
 # 「拍快照、回退」，这份 2.47.1 够用到天荒地老。下不到会退回去只提醒一句，
 # 所以这个 URL 哪天失效了，最坏的结果也只是回到今天的行为。
 $DefaultGitZipUrl = 'https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip'
+# 上面那个包的 SHA256（47241394 字节，实测算出来的）。
+#
+# 这一步以前是没有的：同一个脚本对 dct.exe 坚持验校验和，理由写在
+# `Get-Prebuilt` 上面——「下到一半断了，和下到一个被人换过的文件，在解压
+# 之前长得一模一样，而这个文件接下来会被放进 PATH 天天执行」。那句话对
+# 这份 git 一字不差地成立，而且它比 dct.exe 更值得验：dct 只在用户敲
+# dct 时跑，git 是每一轮对话之前都会被 shell 出去调的。
+#
+# 跟 `src/runtime.rs` 里的 `MINGIT_SHA256` 是同一个值，改一个就要改另一个。
+$DefaultGitSha256 = '50b04b55425b5c465d076cdb184f63a0cd0f86f6ec8bb4d5860114a713d2c29a'
 
 if (-not $ReleaseBase) {
 	$ReleaseBase = if ($env:DCT_RELEASE_BASE) { $env:DCT_RELEASE_BASE } else { $DefaultReleaseBase }
 }
 if (-not $GitZipUrl) {
 	$GitZipUrl = if ($env:DCT_MINGIT_URL) { $env:DCT_MINGIT_URL } else { $DefaultGitZipUrl }
+}
+if (-not $GitSha256) {
+	$GitSha256 = if ($env:DCT_MINGIT_SHA256) { $env:DCT_MINGIT_SHA256 } else { $DefaultGitSha256 }
 }
 
 function Write-Step { param([string]$Text) Write-Host "==> $Text" -ForegroundColor Cyan }
@@ -291,6 +308,20 @@ function Install-PortableGit {
 		$tmpZip = Join-Path ([IO.Path]::GetTempPath()) "MinGit-$PID.zip"
 		try {
 			Invoke-WebRequest -Uri $GitZipUrl -OutFile $tmpZip -UseBasicParsing
+
+			# 验校验和。理由见 $DefaultGitSha256 上面那段——这个文件会被
+			# 放进 PATH，而且比 dct.exe 被调用得还频繁。
+			#
+			# 对不上就**不装**，而不是「提醒一句照装」：一个下坏了的 git
+			# 会让后面每一次快照都失败在看不懂的地方，比没有 git 更难查。
+			$gotHash = (Get-FileHash -LiteralPath $tmpZip -Algorithm SHA256).Hash
+			if ($gotHash -ine $GitSha256) {
+				Write-Warn '那份便携 git 跟校验和对不上，不装它。'
+				Write-Warn '多半是下到一半断了，重跑一次就好；一直对不上就换个网络。'
+				Write-Verbose "期望 $GitSha256，实际 $gotHash"
+				return $false
+			}
+
 			# 解到一个新目录再挪过去，中途断了不会留下一个半拉的 git
 			# 骗过上面那个 Test-Path。
 			$staging = Join-Path ([IO.Path]::GetTempPath()) "MinGit-$PID"

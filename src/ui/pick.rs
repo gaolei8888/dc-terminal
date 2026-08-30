@@ -65,6 +65,41 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         // 它也为真——所以走到这里意味着**往上一级也没有仓库**，`git init`
         // 不可能建出一个嵌套在别人工作区里的仓库来。
         let dir = app.current_dir();
+        // **先分清缺的是哪一样。** `is_repo` 对「这儿不是仓库」和「这台
+        // 电脑上压根没有 git」返回的都是 `false`（后者 `output()` 直接是
+        // `Err`），于是 `no_git` 为真有两种成因，而它们的下一步完全不同：
+        // 前者 `git init` 就好，后者 `git init` 只会再失败一次，把一句
+        // 「系统找不到指定的文件」甩到屏幕上——那句话跟真实原因对不上号，
+        // 而我们的用户多半答不出「我没装 git」这件事。
+        //
+        // 这个判断放在按键路径上，不是画面路径上：它要 fork 一个 git
+        // 进程，每帧问一次是不行的（同 `view.rs` 里那条「判 git 用 stat
+        // 而不是 `git::is_repo`」的理由）。
+        if !crate::git::available() {
+            // 用命令行会话跑 `dct install git`，让用户看着它装——45 MB
+            // 下几分钟，在按键处理里同步下完会把整个界面冻住。这条路
+            // 跟装 agent 用的是同一套机制（见上面 `PickAction::Install`），
+            // 连「`dct` 在 PATH 上」这个前提也和那边的 `npm` 同一档。
+            let d = dir.display().to_string();
+            app.view = match super::create_session(app, &d, "shell", false) {
+                Ok(Response::Created { id }) => {
+                    let _ = app.client().and_then(|c| {
+                        c.call(Request::Input {
+                            id,
+                            text: "dct install git\n".into(),
+                        })
+                    });
+                    app.message = msg::installing_git(app.lang).into();
+                    app.need_sessions = true;
+                    View::Attached(id)
+                }
+                _ => {
+                    app.message = Msg::err(text(Key::CannotOpenInstallWindow, app.lang).into());
+                    same(entries, state, no_git)
+                }
+            };
+            return Ok(());
+        }
         match crate::git::init(&dir) {
             Ok(()) => {
                 app.message = text(Key::GitRepoCreated, app.lang).into();
