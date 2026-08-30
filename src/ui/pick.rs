@@ -34,6 +34,82 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 /// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
 /// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
 /// 但如果哪天又被内联回循环里，这条约束就会重新生效。
+/// `app.view = v; Ok(())` 的简写。上面那个 `Start` 分支里要从 `match` 中途
+/// 退出（缺 git 时后面那一大段建会话的活儿一件都不该干），而那个 `match`
+/// 整体是要赋给 `app.view` 的表达式——中途 `return` 就得自己把视图放回去。
+fn set_view(app: &mut App, v: View) -> Result<()> {
+    app.view = v;
+    Ok(())
+}
+
+/// 开会话之前，把「这儿得是个 git 仓库」这件事办好之后的结果。
+enum RepoPrep {
+    /// 可以开会话了——本来就是仓库，或者刚刚替他建好。
+    Ready,
+    /// 这台电脑上没有 git，已经开了个窗口在装。这就是要切过去的那一屏。
+    Ready2Install(View),
+    /// 办不成。里面是给用户看的那句话。
+    Failed(String),
+}
+
+/// 让当前目录成为一个能给 agent 用的 git 仓库。
+///
+/// **这件事 dct 自己做，不让用户按键。** 以前这儿写的是「不是 git 仓库 ——
+/// 按 g 初始化」，然后等用户按 `g`。对着我们的用户想一遍那一步要求他知道
+/// 什么：git 是什么、仓库是什么、为什么开个 AI 助手要先有仓库、以及 `g`
+/// 这个键。四样里他一样都不需要知道——他要的是「用 Claude 干活」，而
+/// 「先有个仓库」是**我们**的实现要求，不是他的意图的一部分。把实现要求
+/// 摆成一道用户必须自己跨过去的门槛，是把我们的问题转嫁给他。
+///
+/// 建仓库这件事本身也担得起自动做：`git init` 只往目录里加一个 `.git`，
+/// 不动任何已有文件，不产生提交，删掉就干净了。而它换来的是撤销能用——
+/// 那正是 dct 敢让 agent 关掉权限确认的前提。所以这里的取舍不是
+/// 「替他做决定」对「让他自己决定」，是「悄悄多一个 `.git`」对
+/// 「他卡在一句看不懂的话上」。**做完要说一声**，那是调用方的事。
+///
+/// 判「是不是仓库」用 `is_repo` 当场问，不用界面上那个 `no_git` 标志：
+/// 那个标志是这一屏建出来的时候算的，而用户可能在别的窗口里已经把仓库
+/// 建好了。要动手的那一刻，问的必须是文件系统。
+fn prepare_repo(app: &mut App, dir: &std::path::Path) -> RepoPrep {
+    if crate::git::is_repo(dir) {
+        return RepoPrep::Ready;
+    }
+    // **先分清缺的是哪一样。** `is_repo` 对「这儿不是仓库」和「这台电脑上
+    // 压根没有 git」返回的都是 `false`（后者 `output()` 直接是 `Err`），
+    // 而它们的下一步完全不同：前者 `git init` 就好，后者 `git init` 只会
+    // 失败，把一句「系统找不到指定的文件」甩到屏幕上——那句话跟真实原因
+    // 对不上号，而我们的用户答不出「我没装 git」这件事。
+    //
+    // 这个判断在按键路径上，不在画面路径上：它要 fork 一个 git 进程，
+    // 每帧问一次是不行的（同 `view.rs` 里「判 git 用 stat 而不是
+    // `git::is_repo`」那条）。
+    if !crate::git::available() {
+        // 用命令行会话跑 `dct install git`，让用户看着它装——45 MB 下几
+        // 分钟，在按键处理里同步下完会把整个界面冻住。跟装 agent 用的是
+        // 同一套机制（见 `PickAction::Install`），连「`dct` 在 PATH 上」
+        // 这个前提也和那边的 `npm` 同一档。
+        let d = dir.display().to_string();
+        return match super::create_session(app, &d, "shell", false) {
+            Ok(Response::Created { id }) => {
+                let _ = app.client().and_then(|c| {
+                    c.call(Request::Input {
+                        id,
+                        text: "dct install git\n".into(),
+                    })
+                });
+                app.message = msg::installing_git(app.lang).into();
+                app.need_sessions = true;
+                RepoPrep::Ready2Install(View::Attached(id))
+            }
+            _ => RepoPrep::Failed(text(Key::CannotOpenInstallWindow, app.lang).into()),
+        };
+    }
+    match crate::git::init(dir) {
+        Ok(()) => RepoPrep::Ready,
+        Err(e) => RepoPrep::Failed(msg::git_init_failed(app.lang, &e.to_string())),
+    }
+}
+
 fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
     let View::PickProfile {
         entries,
@@ -55,62 +131,22 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::Esc {
         app.view = super::home_view(app);
     } else if key.code == KeyCode::Char('g') && no_git {
-        // `g`：就地建一个 git 仓库。
-        //
-        // **只在 `no_git` 为真时才认这个键**——它是屏幕上写着的那句
-        // 「按 g 初始化」的另一半，那句话不写的时候这个键也不该有反应
-        // （这个项目的规矩是屏幕和键盘必须对得上，两个方向都算）。
-        //
-        // `is_repo` 走 `rev-parse --is-inside-work-tree`，父目录是仓库时
-        // 它也为真——所以走到这里意味着**往上一级也没有仓库**，`git init`
-        // 不可能建出一个嵌套在别人工作区里的仓库来。
+        // `g` 现在是一条**捷径**，不再是唯一的路：按 Enter 选 agent 时
+        // 仓库会自动建好（见 `prepare_repo`）。留着它是因为屏幕上还写着
+        // 那句话，而这个项目的规矩是屏幕和键盘必须对得上——两个方向都算。
         let dir = app.current_dir();
-        // **先分清缺的是哪一样。** `is_repo` 对「这儿不是仓库」和「这台
-        // 电脑上压根没有 git」返回的都是 `false`（后者 `output()` 直接是
-        // `Err`），于是 `no_git` 为真有两种成因，而它们的下一步完全不同：
-        // 前者 `git init` 就好，后者 `git init` 只会再失败一次，把一句
-        // 「系统找不到指定的文件」甩到屏幕上——那句话跟真实原因对不上号，
-        // 而我们的用户多半答不出「我没装 git」这件事。
-        //
-        // 这个判断放在按键路径上，不是画面路径上：它要 fork 一个 git
-        // 进程，每帧问一次是不行的（同 `view.rs` 里那条「判 git 用 stat
-        // 而不是 `git::is_repo`」的理由）。
-        if !crate::git::available() {
-            // 用命令行会话跑 `dct install git`，让用户看着它装——45 MB
-            // 下几分钟，在按键处理里同步下完会把整个界面冻住。这条路
-            // 跟装 agent 用的是同一套机制（见上面 `PickAction::Install`），
-            // 连「`dct` 在 PATH 上」这个前提也和那边的 `npm` 同一档。
-            let d = dir.display().to_string();
-            app.view = match super::create_session(app, &d, "shell", false) {
-                Ok(Response::Created { id }) => {
-                    let _ = app.client().and_then(|c| {
-                        c.call(Request::Input {
-                            id,
-                            text: "dct install git\n".into(),
-                        })
-                    });
-                    app.message = msg::installing_git(app.lang).into();
-                    app.need_sessions = true;
-                    View::Attached(id)
-                }
-                _ => {
-                    app.message = Msg::err(text(Key::CannotOpenInstallWindow, app.lang).into());
-                    same(entries, state, no_git)
-                }
-            };
-            return Ok(());
-        }
-        match crate::git::init(&dir) {
-            Ok(()) => {
+        app.view = match prepare_repo(app, &dir) {
+            RepoPrep::Ready => {
                 app.message = text(Key::GitRepoCreated, app.lang).into();
                 // 提示和红边框跟着消失：这一屏九项 agent 现在真的能用了。
-                app.view = same(entries, state, false);
+                same(entries, state, false)
             }
-            Err(e) => {
-                app.message = Msg::err(msg::git_init_failed(app.lang, &e.to_string()));
-                app.view = same(entries, state, no_git);
+            RepoPrep::Ready2Install(v) => v,
+            RepoPrep::Failed(m) => {
+                app.message = Msg::err(m);
+                same(entries, state, no_git)
             }
-        }
+        };
     } else {
         // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
         // 挪完直接落到 chosen = None，不会误触发下面的路由。
@@ -129,10 +165,27 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         app.view = match chosen.map(|i| (i, pick_action(&entries[i], app.lang))) {
             None => same(entries, state, no_git),
             Some((_, PickAction::Start(name))) => {
+                // **不是 git 仓库的话，就在这儿替他建好，不再拦下来让他
+                // 按 g。** 用户按 Enter 的意图是「我要用这个 agent 干活」，
+                // 而「先得是个 git 仓库」是 dct 的实现要求，不是他意图的
+                // 一部分——把它摆成一道门槛，等于让他先答对一道他没必要
+                // 懂的题。完整的理由写在 `prepare_repo` 上面。
+                let dirp = app.current_dir();
+                let made_repo = !crate::git::is_repo(&dirp);
+                match prepare_repo(app, &dirp) {
+                    RepoPrep::Ready => {}
+                    // 缺 git，正在装。装完他回到这一屏再选一次——这一步
+                    // 没法接着往下走，agent 起来了也没有撤销可用。
+                    RepoPrep::Ready2Install(v) => return set_view(app, v),
+                    RepoPrep::Failed(m) => {
+                        app.message = Msg::err(m);
+                        return set_view(app, same(entries, state, no_git));
+                    }
+                }
                 // 选完直接进会话。用户选中的意图就是「我要用这个
                 // agent 干活」，先弹回看板再让他找一遍自己刚建的
                 // 会话是白让人做第二次选择。建失败才回选择器。
-                let dir = app.current_dir().display().to_string();
+                let dir = dirp.display().to_string();
                 // 选择器里选的就是用户真的要用的 agent——与「帮你装 CLI」
                 // 那条 remember=false 的路径区分开。走 `create_session`
                 // 而不是自己发请求：底栏那句 `n 新建 <agent>` 的缓存由它
@@ -140,6 +193,12 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 match super::create_session(app, &dir, &name, true) {
                     Ok(Response::Created { id }) => {
                         app.need_sessions = true; // 会话标题要显示项目名
+                                                  // **替他建了仓库就说一声。** 悄悄在别人的文件夹里
+                                                  // 多放一个 `.git` 而一个字不说，是另一种毛病——
+                                                  // 他哪天自己发现，会不知道那是谁干的、能不能删。
+                        if made_repo {
+                            app.message = msg::git_repo_created_for_you(app.lang).into();
+                        }
                         View::Attached(id)
                     }
                     Ok(Response::Error(ref e)) => {
@@ -544,11 +603,10 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
         Some(p) => format!("{} · {p}", text(Key::PickAgentTitle, app.lang)),
         None => text(Key::PickAgentTitle, app.lang).to_string(),
     };
-    // 两句提示可以同时有，接在同一行上：`no_git` 说的是「列表没问题，但在
-    // 这个目录里都用不了」，`warning` 说的是「列表本身有问题」。哪句在前
-    // 不是随手排的——`no_git` 后面跟着一个**能按的键**（`g`），而 warning
-    // 是一句读完就完的说明；标题放不下的时候被切掉的是后半句，切掉说明
-    // 比切掉出路好。
+    // 两句提示可以同时有，接在同一行上：`no_git` 说的是「这个目录还不是
+    // 仓库，开 agent 时会替你建一个」，`warning` 说的是「列表本身有问题」。
+    // `no_git` 在前是因为它讲的是**接下来会对用户的文件夹做什么**，而
+    // warning 是一句读完就完的说明；标题放不下的时候切掉的是后半句。
     let title = [
         Some(base),
         no_git.then(|| text(Key::NotAGitRepoHint, app.lang).to_string()),
@@ -558,7 +616,12 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
     .flatten()
     .collect::<Vec<_>>()
     .join(" —— ");
-    let border = if warning.is_some() || *no_git {
+    // **`no_git` 不再画红框。** 红框的意思是「这一屏现在是坏的」——以前
+    // 确实如此：九项 agent 一个都开不起来，除非用户自己按 `g`。现在按
+    // Enter 就会把仓库建好（`prepare_repo`），没有任何东西是坏的，只是
+    // 会多做一件事而已。继续标红等于把一句普通的告知说成故障，而我们的
+    // 用户看见红色只会以为自己弄坏了什么。
+    let border = if warning.is_some() {
         danger()
     } else {
         border_style
@@ -1534,6 +1597,107 @@ mod tests {
         assert!(
             content.contains(&hint),
             "标题要先说这儿不是 git 仓库：{content}"
+        );
+    }
+
+    /// **这条是「小白不该被要求按 g」那件事的钉子。**
+    ///
+    /// 用户按 Enter 选 agent，意图是「我要用它干活」。「先得是个 git 仓库」
+    /// 是 dct 的实现要求，不是他意图的一部分——所以仓库必须在这一步自己
+    /// 建出来，而不是把他拦在一句「按 g 初始化」上（那句话要求他先懂
+    /// git 是什么、仓库是什么、以及为什么开个 AI 助手要先有仓库）。
+    ///
+    /// 这里不要求会话真的起得来（测试环境里没有守护进程，`create_session`
+    /// 会失败）。钉的是**顺序**：仓库在尝试建会话之前就已经建好了。
+    #[test]
+    fn choosing_an_agent_makes_the_repo_itself_without_asking_the_user_to_press_g() {
+        let (mut app, d) = App::test_app();
+        assert!(
+            !crate::git::is_repo(&app.current_dir()),
+            "前提：当前项目还不是 git 仓库（{}）",
+            d.path().display()
+        );
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(0)); // 光标停在第一个 agent 上
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state,
+            warning: None,
+            no_git: true,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(
+            crate::git::is_repo(&app.current_dir()),
+            "选 agent 这一步就该把仓库建出来，不该等用户去按 g"
+        );
+    }
+
+    /// **已经是仓库的就别再动它。** 自动建仓库这件事只在「还没有仓库」
+    /// 时成立；对着一个已有的仓库再跑一遍 `git init`，哪怕结果无害，也是
+    /// 在用户的项目上做一件他没要求的事——而这个项目里绝大多数目录都是
+    /// 已经有仓库的，也就是说这条路径才是最常走的那一条。
+    ///
+    /// 钉的是「原来的历史还在」：`prepare_repo` 第一句就是 `is_repo` 判断，
+    /// 真为假的话下面那句 `git init` 会跑，这条测试会看见 HEAD 没了。
+    #[test]
+    fn choosing_an_agent_leaves_an_existing_repo_completely_alone() {
+        let (mut app, d) = App::test_app();
+        let dir = app.current_dir();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "原来就有的提交"]);
+
+        let head_before = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert!(!head_before.is_empty(), "前提：这儿已经是个有提交的仓库");
+
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(0));
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state,
+            // 已经是仓库，所以这一屏本来就不会写「按 g 初始化」
+            no_git: false,
+            warning: None,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        let head_after = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            head_before,
+            head_after,
+            "已经有仓库的目录，选 agent 不该动它的历史（{}）",
+            d.path().display()
         );
     }
 

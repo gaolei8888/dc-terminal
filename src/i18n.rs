@@ -636,10 +636,16 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "连接已断开，数据可能已过期",
         ),
         PickAgentTitle => t!(lang, en: "Pick an agent", zh: "选 agent"),
+        // **说的是「接下来会发生什么」，不是「你得先干什么」。**
+        // 这句话以前写的是「按 g 初始化」——一句命令，而且要求用户先懂
+        // git 是什么、仓库是什么、以及为什么开个 AI 助手要先有仓库。他一样
+        // 都不需要懂：仓库现在由 `pick::prepare_repo` 在按下 Enter 那一刻
+        // 自己建。留着这句话是为了**别让那个 `.git` 凭空冒出来**，不是为了
+        // 派活给用户。
         NotAGitRepoHint => t!(
             lang,
-            en: "not a git project — g to init",
-            zh: "不是 git 仓库 —— 按 g 初始化",
+            en: "not a git project yet — dct will set one up",
+            zh: "还不是 git 仓库 —— 开 agent 时自动建",
         ),
         InitGitRepo => t!(lang, en: "init git", zh: "建仓库"),
         GitRepoCreated => t!(
@@ -1749,6 +1755,20 @@ pub mod msg {
             lang,
             en: "This machine has no git — installing it first. When it finishes, press Esc and then g again to create the project.",
             zh: "这台电脑上没有 git，先装它。装完按 Esc 回去，再按一次 g 就能建仓库了。",
+        )
+        .to_string()
+    }
+
+    /// 替用户把 git 仓库建好了，会话正在起来。
+    ///
+    /// **说的是「做了什么」和「为什么」，不是「你得先做什么」**：这一句
+    /// 出现的时候事情已经办完了，用户不需要采取任何行动。写清楚是因为
+    /// 我们动了他的文件夹（多了一个 `.git`），他有权知道那是谁干的。
+    pub fn git_repo_created_for_you(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "This folder was not a git project, so dct made it one — that is what lets you undo what the agent does.",
+            zh: "这个文件夹还不是 git 仓库，dct 顺手建好了——撤销 agent 的改动要靠它。",
         )
         .to_string()
     }
