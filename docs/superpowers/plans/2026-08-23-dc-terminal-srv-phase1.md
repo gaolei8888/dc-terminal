@@ -21,6 +21,32 @@ srv 侧独立 crate，`tokio` + `axum`。
 
 ---
 
+## 现在到哪儿了（2026-08-29）
+
+**任务 1、2、3、4 做完了，下一个是任务 5。** 工作树干净，全部已推，
+最后一个提交是 `62d19e3 feat(web): the phone can reach a computer through the relay`。
+最近一次完整闸门：**1128 passed / 0 failed**，clippy 零警告，fmt 干净
+（`cargo test --workspace -- --test-threads=1`，`--test-threads=1` 是必须的，
+pty 和会话测试会起真进程）。
+
+**链路已经通到什么程度：** 手机网页可以经中转拿到一台电脑上的会话
+（`relayWire` → `/link/ask` → 中转 → daemon 的 `link.rs` → 现有 dispatch → 原路回来），
+六件事（文案、列表、画面、打字、按键、翻历史）两种模式走的是同一批 `Request`。
+
+**还差三样才叫「能给人用」：**
+
+1. **没人验令牌**（任务 5）——中转现在信任任何自称某某的连接。
+2. **配不出来**（任务 6）——`link.rs` 是完整的，但 `daemon.rs` 还没起它，
+   因为起它要中转地址和令牌，那是配对的产物。手机那边选哪台电脑靠 URL 里的 `#d=`。
+3. **不加密**（第二期）——所以这一期的硬性验收条件仍然是：**中转只监听内网地址**。
+   `must_be_loopback` 已经在任务 2 提前落地了。
+
+**新会话开工前：** `git pull --rebase`（另一台机器上有并行的活），
+然后读本文件里任务 1–4 的「跟计划不一样的地方」——那几段记的是决定和理由，
+不是流水账，任务 5 会用到其中至少两条。
+
+---
+
 ## 两处跟 spec 措辞不同的地方（先读这一段）
 
 **一、共享 crate 只装信封，不装 `Request`/`Response`。** spec 的「仓库布局」写的是
@@ -70,10 +96,10 @@ srv 是独立 crate，`tokio` 不会进 `dct` 的依赖树——`cargo tree -p d
 | `Cargo.toml`（改） | 加 `[workspace]`，成员为根包 + 两个新 crate |
 | `crates/dct-link/`（新建） | **共享**：信封、鉴权帧、错误码、常量。不含 `Request`/`Response` |
 | `crates/dct-srv/`（新建） | 中转服务：路由、鉴权、配额、静态网页 |
-| `crates/dct-srv/web/`（新建） | 手机网页（单页，自包含，同 `site/index.html` 的做法） |
+| ~~`crates/dct-srv/web/`~~ → `crates/dct-page/`（已建） | 手机网页。**两边共用一份**，不是搬进 srv——理由见任务 4 第一条 |
 | `src/link.rs`（新建） | daemon 侧的出网客户端：长轮询、重连、把信封交给现有 dispatch |
-| `src/daemon.rs`（改） | 起 link 线程；信封里的 `Request` 走**现有**分发，不另开一条路 |
-| `src/proto.rs`（改） | 只加 `Request::Link*`（配对/状态），`Request`/`Response` 本体不动 |
+| `src/daemon.rs`（改） | 起 link 线程；信封里的 `Request` 走**现有**分发，不另开一条路。**还没做，留给任务 6** |
+| `src/proto.rs`（改） | 计划写「只加 `Request::Link*`」，实际还加了 `Request::WebStrings`、`Request::Key`、`Response::Strings`（协议 9→10）——理由见任务 4 第二条 |
 | `src/ui/phone.rs`（改） | 设置页里显示配对状态、配对码、已连设备 |
 | `src/i18n.rs`（改） | 新增文案 Key |
 
@@ -248,6 +274,12 @@ pub struct Envelope {
 
 ### 任务 5：接 dc_classroom 鉴权
 
+**开工前有一个事实要问清楚：dc_classroom 现在怎么存 session？**
+这决定中转是**调它的 REST**还是**共用它 Redis 里的 session**。前者边界干净——中转只认
+一个 HTTP 接口，dc_classroom 换存储不关它的事；后者少一次网络往返，但两个服务从此
+共享一份存储格式，以后谁改都得看着对方。**不知道也能开工**：`Accounts` trait 和内存
+实现不依赖这个答案（任务 5 的大半在这两样上），真实现留一个明确的口子，答案来了再填。
+
 - [ ] `Accounts` trait：`fn who(&self, token: &str) -> Result<UserId>`
 - [ ] 真实现调 dc_classroom REST；测试实现是内存表
 - [ ] 设备属于账号：`/link/*` 每个请求都验，跨账号投递直接拒
@@ -273,6 +305,8 @@ pub struct Envelope {
 
 ## 第一期不做
 
+- **第 0 期主动搁置的两件小事**（2026-08-28 说的「暂时先不做」）：Linux 上 F5 读剪贴板、
+  iPad 外接键盘的 `Cmd+.` → Esc。都不挡本期，什么时候想起来什么时候做
 - 加密、二维码、X25519（第二期）
 - 手机上打字、虚拟键行、输入法、滚回历史（**第 0 期就做完了**，本期不碰）
 - 差量传屏（第三期；第一期整屏传，先把链路证明出来）
