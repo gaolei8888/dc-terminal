@@ -12,7 +12,7 @@ coding agent 要你守着，是因为它每隔几分钟就问一句「这样可�
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.3](https://img.shields.io/badge/version-0.2.3-444?style=flat-square)
+![version 0.2.4](https://img.shields.io/badge/version-0.2.4-444?style=flat-square)
 
 [English](README.md) · 设计记录在 [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
