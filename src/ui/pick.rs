@@ -71,6 +71,19 @@ enum RepoPrep {
 /// 那个标志是这一屏建出来的时候算的，而用户可能在别的窗口里已经把仓库
 /// 建好了。要动手的那一刻，问的必须是文件系统。
 fn prepare_repo(app: &mut App, dir: &std::path::Path) -> RepoPrep {
+    // **每次都先把自带的运行时挂一遍 PATH，不能只在启动时挂。**
+    //
+    // 这一步少了会变成一个死循环，而且正好卡住这个功能唯一服务的那种用户：
+    // 他没有 git，选 agent → dct 开一个窗口跑 `dct install git` → 装完了。
+    // 但那是**另一个进程**的 PATH，界面这个进程一无所知，于是 `available()`
+    // 还是假，他再选一次 agent，又开一个装 git 的窗口——那边说「已经有了」，
+    // 回来还是开不了。他会一直转下去，而且屏幕上每一步看起来都成功了。
+    //
+    // `activate` 本身很便宜（几个 stat 加一次 env 判断），而且是幂等的
+    // （`prepend_path` 认得出已经在里面的目录），所以每次问之前挂一遍是
+    // 安全的。挂了才问，顺序不能反。
+    crate::runtime::activate(&crate::runtime::runtime_dir_for_socket(&app.socket));
+
     if crate::git::is_repo(dir) {
         return RepoPrep::Ready;
     }
@@ -1597,6 +1610,38 @@ mod tests {
         assert!(
             content.contains(&hint),
             "标题要先说这儿不是 git 仓库：{content}"
+        );
+    }
+
+    /// **这条钉的是一个会把用户困在原地转圈的 bug。**
+    ///
+    /// 没有 git 的学生选 agent → dct 开个窗口跑 `dct install git` → 装完了。
+    /// 但那是**另一个进程**的 PATH。界面这个进程要是不重新挂一遍自带运行时，
+    /// `git::available()` 就还是假：他再选一次 agent，又开一个装 git 的窗口，
+    /// 那边说「已经有了」，回来还是开不了——一直转下去，而且每一步看起来
+    /// 都成功了。这正好卡住这个功能唯一服务的那种用户。
+    ///
+    /// 所以 `prepare_repo` 每次都要先 `activate`。这里放一个假的 git 进
+    /// 自带运行时，然后确认那个目录真的被挂上了 PATH。
+    #[test]
+    fn preparing_the_repo_remounts_the_bundled_runtime_so_a_just_installed_git_is_seen() {
+        let (mut app, d) = App::test_app();
+        // 自带运行时跟着 socket 走，而 test_app 的 socket 在临时目录里。
+        let rt = crate::runtime::runtime_dir_for_socket(&app.socket);
+        let bin = crate::runtime::git_bin_dir(&rt);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("git.exe"), b"pretend git").unwrap();
+
+        let before = std::env::var("PATH").unwrap_or_default();
+        let dir = app.current_dir();
+        let _ = prepare_repo(&mut app, &dir);
+        let after = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", &before); // 别把进程级 PATH 留给后面的测试
+
+        assert!(
+            after.contains(&*bin.to_string_lossy()),
+            "问 git 在不在之前，必须先把自带的那份挂上 PATH（{}）：{after}",
+            d.path().display()
         );
     }
 

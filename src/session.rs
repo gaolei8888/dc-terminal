@@ -558,6 +558,15 @@ pub struct SessionManager {
     /// 真实路径——同 `journal` 的模式，绝不能让测试写到用户真实的
     /// `~/.dct/last-sessions.toml`。
     last_sessions_path: Mutex<Option<PathBuf>>,
+    /// dct 自带的那份运行时（`~/.dct/runtime`）在哪。`None` = 不知道，
+    /// 也就不去挂它（默认；单元测试拿到的就是这种）。只有
+    /// `daemon.rs::run_with_manager` 会给它一个真实路径——同 `journal` 和
+    /// `last_sessions_path` 的模式。
+    ///
+    /// 存起来是因为**守护进程启动时挂过一次还不够**：那个学生的机器上
+    /// 启动那一刻可能根本没有 git，是后来 `dct install git` 装进这个目录的。
+    /// 建 agent 会话之前要拍第一张快照，那时候必须再挂一遍才找得到它。
+    runtime_dir: Mutex<Option<PathBuf>>,
     /// 上面那次 resolve 为什么失败。**只有用户确实写了 `[llm]` 却接不上时
     /// 才是 `Some`**——没写 `[llm]` 是绝大多数人的正常状态，不是问题，
     /// 那种情况这里始终是 `None`。存下来是因为守护进程的 stderr 被丢弃了
@@ -615,6 +624,7 @@ impl SessionManager {
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),
             last_sessions_path: Mutex::new(None),
+            runtime_dir: Mutex::new(None),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
             resume_skips: Mutex::new(Vec::new()),
@@ -714,6 +724,27 @@ impl SessionManager {
     /// 单元测试因此不会碰到真实的 `~/.dct/last-sessions.toml`。
     pub fn set_last_sessions_path(&self, path: PathBuf) {
         *recover(self.last_sessions_path.lock()) = Some(path);
+    }
+
+    /// 装上自带运行时的位置。只有 `daemon.rs::run_with_manager` 会调用。
+    pub fn set_runtime_dir(&self, path: PathBuf) {
+        *recover(self.runtime_dir.lock()) = Some(path);
+    }
+
+    /// 把自带运行时重新挂一遍守护进程的 PATH。
+    ///
+    /// **建 agent 会话之前必须调一次。** 守护进程启动时已经挂过，但那一刻
+    /// 机器上可能还没有 git——它是用户后来在 dct 里选 agent 时才被
+    /// `dct install git` 装进 `~/.dct/runtime/git` 的。不重挂的话，第一张
+    /// 快照会失败在「git 跑不起来」上，而用户刚刚亲眼看着它装完，屏幕上
+    /// 那句话会显得莫名其妙。
+    ///
+    /// 幂等且便宜（几个 stat，`prepend_path` 认得出已经在 PATH 里的目录）。
+    fn reactivate_runtime(&self) {
+        let dir = recover(self.runtime_dir.lock()).clone();
+        if let Some(d) = dir {
+            crate::runtime::activate(&d);
+        }
     }
 
     /// 把此刻还活着（非 `Stopped`）的会话整份重写进 `last-sessions.toml`。
@@ -863,6 +894,12 @@ impl SessionManager {
         // 没有并发正确性需要靠锁来保护。
         // agent 直接在用户的真实项目里干活。检查点是隐藏快照，不动分支和历史，
         // 所以仍然要求是 git 仓库——没有 git 就没有撤销。
+        // 自带运行时重挂一遍再问 git 的事。理由见 `reactivate_runtime`：
+        // 守护进程启动那一刻机器上可能还没有 git，它是用户刚刚在界面里
+        // 装进 `~/.dct/runtime/git` 的。
+        if profile.is_agent {
+            self.reactivate_runtime();
+        }
         if profile.is_agent && !git::is_repo(dir) {
             return Err(coded(ErrorCode::NotAGitRepo(dir.display().to_string())));
         }

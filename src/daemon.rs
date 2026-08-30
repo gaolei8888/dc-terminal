@@ -47,6 +47,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 既在菜单上显示成「可用」，又真的启动得起来。放在 `bind_private`
     // 之后是因为那一句才是「我确实是那个守护进程」的分界线。
     crate::runtime::activate(&crate::runtime::runtime_dir_for_socket(socket));
+    // 位置也记给 SessionManager：启动时挂这一次**不够**。学生的机器上，
+    // 这一刻可能连 git 都还没有——它是后来他在界面里选 agent 时才被
+    // `dct install git` 装进这个目录的。建 agent 会话之前要再挂一遍，
+    // 否则第一张快照会失败在「git 跑不起来」上。见 `reactivate_runtime`。
+    mgr.set_runtime_dir(crate::runtime::runtime_dir_for_socket(socket));
 
     // 存放位置跟着 socket 走，测试把 socket 放临时目录就自动隔离，
     // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml / ~/.dct/profiles/。
