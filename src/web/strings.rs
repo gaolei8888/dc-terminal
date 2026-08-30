@@ -24,6 +24,11 @@ pub const NEEDED: &[(&str, Key)] = &[
     ("title", Key::BoardTitle),
     ("empty", Key::NoSessionsHere),
     ("offline", Key::PhoneOffline),
+    // 经中转时的两种断法。局域网上用不到（那条路分不清），但表是一张，
+    // 两种模式共用——多带两句话的代价是几十个字节，而按模式发两张表的
+    // 代价是"哪句话在哪张表里"从此要有人记着。
+    ("gone", Key::PhoneComputerGone),
+    ("silent", Key::PhoneComputerSilent),
     // 返回列表那个「‹」按钮的无障碍标签。**图标也要有名字**——读屏软件
     // 念不出一个箭头字符，而这一页是给手机用的，手机上读屏用户很多。
     ("back", Key::BackToListWord),

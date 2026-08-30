@@ -262,12 +262,28 @@
   // 有效期给 30 天而不是"关掉浏览器就失效"：后者意味着每次重开浏览器都要
   // 重新扫一次码，而扫码要人走到电脑跟前——这个功能本来就是给不在电脑跟前
   // 的人用的。撤销靠换令牌（设置页），不靠 cookie 短命。
-  (function claimToken() {
-    var m = /(?:^|[#&])t=([^&]+)/.exec(location.hash || "");
-    if (!m) { return; }
-    document.cookie =
-      "dct_web=" + m[1] + "; path=/; max-age=2592000; SameSite=Strict";
-    history.replaceState(null, "", location.pathname);
+  // 经中转的时候码里还带着**要看哪台电脑**（`#d=`），走的是同一条路：
+  // 存下来、把地址栏抹干净。
+  var CFG = (function claim() {
+    function keep(name, value) {
+      document.cookie =
+        name + "=" + value + "; path=/; max-age=2592000; SameSite=Strict";
+    }
+    function saved(name) {
+      var m = new RegExp("(?:^|; )" + name + "=([^;]*)").exec(document.cookie);
+      return m ? m[1] : "";
+    }
+    function fromHash(key) {
+      var m = new RegExp("(?:^|[#&])" + key + "=([^&]+)").exec(location.hash || "");
+      return m ? m[1] : "";
+    }
+
+    var token = fromHash("t");
+    var device = fromHash("d");
+    if (token) { keep("dct_web", token); }
+    if (device) { keep("dct_device", device); }
+    if (token || device) { history.replaceState(null, "", location.pathname); }
+    return { token: saved("dct_web"), device: saved("dct_device") };
   })();
 
   // 文案表。**空表也要能跑**——网络没起来时页面照样显示结构，
@@ -299,12 +315,19 @@
 
   // ——数据从哪儿来——————————————————————————————————————————————
   //
-  // **整页只有 `wire` 这一处知道会话在哪儿、怎么问它。** 局域网这一版直接
-  // 问守护进程在你自己网络上开的那个口。以后要在任何网络下看家里的电脑，
-  // 换的就是这一个对象——画面、按键、翻历史、输入法那些代码一行都不用动，
-  // 而那些正是这一页里最难写对、最不该为了换根管子再动一遍的部分。
+  // **整页只有 `wire` 这一处知道会话在哪儿、怎么问它。** 底下有两份实现，
+  // 上面所有画面、按键、翻历史、输入法的代码一行都不知道自己在用哪一份——
+  // 那些正是这一页里最难写对、最不该为了换根管子再动一遍的部分。
   //
-  // 有一条守卫钉着这件事：`/api/` 那几个路径只许出现在这个对象里。
+  // - `lanWire`：页面是守护进程自己在你的网络上发的，直接问它。
+  // - `relayWire`：页面是中转发的，请求要装进信封，中转按信封上的名字送到
+  //   你家里那台电脑，再把答复原样带回来。**中转不看信封里的东西。**
+  //
+  // 两份实现的返回值形状**完全一样**，因为两边最终都是同一个 `Response`
+  // ——网页消费的从来就是协议本身（见 `web/routes.rs` 开头）。
+  //
+  // 两条守卫钉着这件事：`/api/` 只许出现在 `lanWire` 里，`/link/` 只许
+  // 出现在 `relayWire` 里。
 
   function getJson(path) {
     return fetch(path, { credentials: "same-origin" }).then(function (r) {
@@ -324,26 +347,112 @@
     });
   }
 
-  var wire = {
-    strings: function (lang) {
-      return getJson("/api/strings?lang=" + encodeURIComponent(lang));
-    },
-    sessions: function () {
-      return getJson("/api/sessions");
-    },
-    screen: function (id) {
-      return getJson("/api/screen?id=" + encodeURIComponent(id));
-    },
-    input: function (id, text) {
-      return postJson("/api/input", { id: id, text: text });
-    },
-    key: function (id, name) {
-      return postJson("/api/key", { id: id, key: name });
-    },
-    scroll: function (id, by) {
-      return postJson("/api/scroll", { id: id, by: by });
+  function lanWire() {
+    return {
+      strings: function (lang) {
+        return getJson("/api/strings?lang=" + encodeURIComponent(lang));
+      },
+      sessions: function () {
+        return getJson("/api/sessions");
+      },
+      screen: function (id) {
+        return getJson("/api/screen?id=" + encodeURIComponent(id));
+      },
+      input: function (id, text) {
+        return postJson("/api/input", { id: id, text: text });
+      },
+      key: function (id, name) {
+        return postJson("/api/key", { id: id, key: name });
+      },
+      scroll: function (id, by) {
+        return postJson("/api/scroll", { id: id, by: by });
+      }
+    };
+  }
+
+  // 信封的版本。**必须跟 `dct-link` 的 `LINK_VERSION` 一样**，对不上中转
+  // 会当场说 VersionMismatch。有一条守卫盯着这两个数字（在 `dct-srv` 的
+  // 测试里，那是唯一同时够得着这一页和那个常量的地方）。
+  var LINK_VERSION = 3;
+
+  // payload 是**字节**，不是文本（第二期那里是密文）。所以走 base64，而且
+  // 要先按 UTF-8 编码——`btoa` 只认每个码位都小于 256 的字符串，直接喂中文
+  // 会当场抛异常。
+  function toBase64(text) {
+    var bytes = new TextEncoder().encode(text);
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+    return btoa(s);
+  }
+
+  function fromBase64(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+    return new TextDecoder().decode(bytes);
+  }
+
+  function relayWire(cfg) {
+    var seq = 0;
+    // 这一页在中转上叫什么。**每开一次页面换一个名字**：中转是按
+    // (谁, seq) 给问题和答复配对的，两个标签页要是同名，它们的 seq 会撞在
+    // 一起，撞上那一下等于两个问题共用一个挂号，其中一个永远等不到答复。
+    var me = "phone:" + Math.random().toString(36).slice(2, 12);
+
+    function ask(request) {
+      seq += 1;
+      return fetch("/link/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          auth: {
+            version: LINK_VERSION,
+            kind: "Phone",
+            endpoint: me,
+            token: cfg.token
+          },
+          envelope: {
+            from: me,
+            to: cfg.device,
+            seq: seq,
+            payload: toBase64(JSON.stringify(request)),
+            recipients: []
+          }
+        })
+      }).then(function (r) {
+        if (r.ok) {
+          return r.json().then(function (env) {
+            return JSON.parse(fromBase64(env.payload));
+          });
+        }
+        // 坏消息带着码回来。**把码留在异常上**，`offline()` 要靠它决定
+        // 说哪一句——「你的电脑离线了」和「你的电脑没回话」指向完全不同
+        // 的地方，合成一句会把人指去查网络，而问题在他那台机器上。
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          var e = new Error("link " + r.status);
+          e.linkError = body.error || "";
+          throw e;
+        });
+      });
     }
-  };
+
+    return {
+      strings: function (lang) { return ask({ WebStrings: { lang: lang } }); },
+      sessions: function () { return ask("List"); },
+      screen: function (id) { return ask({ Screen: { id: id } }); },
+      input: function (id, text) { return ask({ Input: { id: id, text: text } }); },
+      key: function (id, name) { return ask({ Key: { id: id, name: name } }); },
+      scroll: function (id, by) { return ask({ Scroll: { id: id, by: by } }); }
+    };
+  }
+
+  // 用哪一份，**看地址里有没有一台电脑的名字**。
+  //
+  // 局域网的码是 `#t=<令牌>`；经中转的码是 `#d=<电脑>&t=<令牌>`。
+  //
+  // **这是第一期的临时办法。** 任务 5 接上 dc_classroom 之后，选哪台电脑
+  // 来自登录之后的设备列表，`#d=` 就该整个消失——别在它上面盖东西。
+  var wire = CFG.device ? relayWire(CFG) : lanWire();
 
   // 协议里的会话状态是一个字符串枚举（SessionState），这里只把它映射到
   // 文案表的键上。**认不出来的一律当 unknown**：编一个状态出来比承认
@@ -881,13 +990,25 @@
   // 最后一帧），只在列表上写一句话的话，正在看某个会话的人什么都不会发现，
   // 然后对着一屏早就过期的内容做判断。所以标题整条变红并写明原因——
   // 跟桌面端断连时那条红标题是同一个做法。
-  function offline() {
+  // **中转能分清两种断法，局域网分不清。**
+  //
+  // `Offline` = 你的电脑根本没在问中转要东西（关机了、dct 没跑、那头断网）。
+  // `NoAnswer` = 信封送到了，它没回话（多半是刚睡过去，或者 dct 卡住了）。
+  //
+  // 两句话让人去看的地方完全不同：一句是"去开机/去开 dct"，一句是"去动一下
+  // 那台电脑"。合成一句的话，一台睡着的电脑会把人指去查网络。
+  //
+  // 局域网那条路上没有这个信息（连不上就是连不上），仍旧用原来那句合起来
+  // 说的话。
+  function offline(err) {
+    var code = (err && err.linkError) || "";
+    var key = code === "Offline" ? "gone" : code === "NoAnswer" ? "silent" : "offline";
     dotEl.className = "off";
     headEl.className = "stale";
-    whyEl.textContent = t("offline");
+    whyEl.textContent = t(key);
     if (open === null) {
       listEl.textContent = "";
-      listEl.appendChild(notice(t("offline"), true));
+      listEl.appendChild(notice(t(key), true));
     }
   }
 

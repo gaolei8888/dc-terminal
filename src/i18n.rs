@@ -332,6 +332,10 @@ pub enum Key {
     /// 「dct 被关掉了」「换了个 WiFi」这三种，而说死一种就有三分之二的概率
     /// 在骗人。把三种可能都摆出来，用户自己一眼就知道是哪种。
     PhoneOffline,
+    /// 经中转时的第一种断法：那台电脑根本没在问中转要东西。
+    PhoneComputerGone,
+    /// 第二种：信封送到了，它没回话。
+    PhoneComputerSilent,
     /// 空项目组头上接在「还没有会话」后面的那半句：`上次用 claude`
     LastUsedAgent,
     /// 九宫格的整屏空态：一个格子都没有，屏幕正中就这一句话。
@@ -694,6 +698,19 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "can't reach your computer — it may be asleep, or dct was closed",
             zh: "连不上你的电脑——可能是它睡着了，或者 dct 已经关掉",
+        ),
+        // 上面那句是局域网上唯一说得出的话：连不上就是连不上，分不清是哪
+        // 一种。经中转的时候中转分得清，下面这两句就该各说各的——一句让人
+        // 去开机，一句让人去动一下那台机器。指错方向比不说更费时间。
+        PhoneComputerGone => t!(
+            lang,
+            en: "your computer isn't connected — it may be off, or dct isn't running",
+            zh: "你的电脑没连上——可能关机了，或者 dct 没在跑",
+        ),
+        PhoneComputerSilent => t!(
+            lang,
+            en: "your computer is connected but isn't answering — it may have gone to sleep",
+            zh: "你的电脑连着，但没回话——多半是刚睡过去",
         ),
         // 空项目的组头上，这半句接在上面那条后面：`还没有会话 · 上次用 claude`。
         // 「哪个项目用哪个 agent」在别处只有底栏那一条，而底栏 80 列上会把
@@ -1931,6 +1948,8 @@ mod tests {
             HiddenCharsInName,
             NoSessionsHere,
             PhoneOffline,
+            PhoneComputerGone,
+            PhoneComputerSilent,
             LastUsedAgent,
             NoSessionsRunningPressN,
             ProjectDirGone,
@@ -2025,7 +2044,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 152, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 154, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

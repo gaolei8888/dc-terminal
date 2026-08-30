@@ -684,6 +684,23 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// 网页里那个 `LINK_VERSION` 必须跟这儿的一样。
+    ///
+    /// 那是整页唯一一个**抄过来的**数字——JS 引用不了 Rust 的常量。抄错或者
+    /// 漏改的症状是：中转当场回一句 `VersionMismatch`，而手机上什么都打不开，
+    /// 没有任何线索指向"页面里那个数字没跟着加一"。
+    ///
+    /// 这条测试写在这儿，是因为 `dct-srv` 是唯一同时够得着这一页和那个常量
+    /// 的地方（`dct-page` 故意没有任何依赖）。
+    #[test]
+    fn the_page_speaks_the_same_envelope_version_this_relay_does() {
+        let want = format!("var LINK_VERSION = {LINK_VERSION};");
+        assert!(
+            dct_page::PAGE.contains(&want),
+            "网页里找不到 `{want}`——信封版本改了，那一页没跟上"
+        );
+    }
+
     /// 中转发的网页必须**逐字节**等于守护进程发的那一份。
     ///
     /// 这条测试是"只有一份网页"那件事唯一的看门人。哪天有人图省事在

@@ -1048,31 +1048,110 @@ mod tests {
     /// 字号自适配——没有一样跟"数据从哪儿来"有关。经中转看家里的电脑那一期
     /// 要换的只是取数那一层；这条守卫保证到那天为止，取数没有再长出第二处
     /// 来。散出去一处，那一处就是将来被漏改的那处。
+    /// 取一段以给定那行开头、以单独一行 `  }` 收尾的函数体，外加剩下的部分。
+    fn body_of(code: &str, header: &str) -> (String, String) {
+        let start = code
+            .find(header)
+            .unwrap_or_else(|| panic!("页面里应该有 {header}"));
+        let len = code[start..]
+            .find("\n  }")
+            .unwrap_or_else(|| panic!("{header} 该以单独一行收尾"));
+        (
+            code[start..start + len].to_string(),
+            format!("{}{}", &code[..start], &code[start + len..]),
+        )
+    }
+
     #[test]
     fn only_one_place_knows_where_the_data_comes_from() {
         let code = page_without_comments();
-        let start = code
-            .find("var wire = {")
-            .expect("页面里应该有 wire 这个对象");
-        let len = code[start..]
-            .find("\n  };")
-            .expect("wire 该以单独一行 `  };` 收尾");
-        let (inside, outside) = (
-            &code[start..start + len],
-            format!("{}{}", &code[..start], &code[start + len..]),
-        );
 
+        let (lan, not_lan) = body_of(&code, "function lanWire() {");
         assert_eq!(
-            outside.matches("/api/").count(),
+            not_lan.matches("/api/").count(),
             0,
-            "`/api/` 只许出现在 wire 里。散在别处的那一处，就是换中转那天被漏改的那处。"
+            "`/api/` 只许出现在 lanWire 里"
         );
-        // 上面那条在 wire 空掉、调用方全都改回写死路径时**照样绿**——那时候
+        // 上面那条在 lanWire 被掏空、路径全写回调用处时**照样绿**——那时候
         // 页面里一个 `/api/` 都没有了。所以还要确认它们真在里面。
         assert_eq!(
-            inside.matches("/api/").count(),
+            lan.matches("/api/").count(),
             6,
-            "wire 该正好盖住六件事：文案、列表、画面、打字、按键、翻历史。"
+            "lanWire 该正好盖住六件事：文案、列表、画面、打字、按键、翻历史"
+        );
+
+        let (relay, not_relay) = body_of(&code, "function relayWire(cfg) {");
+        assert_eq!(
+            not_relay.matches("/link/").count(),
+            0,
+            "`/link/` 只许出现在 relayWire 里"
+        );
+        assert_eq!(
+            relay.matches("/link/").count(),
+            1,
+            "relayWire 只该问中转一条路径：挂着等答复的那条"
+        );
+    }
+
+    /// 经中转那份取数，**发的必须是跟局域网那份同一批请求**。
+    ///
+    /// 名字对不上的症状只在一种模式下出现：局域网一切正常，而经中转时守护
+    /// 进程把它当成解析失败——同一个按钮，在家里能用，出了门不能用，而且
+    /// 两边的日志都不会说为什么。这类"只在另一种模式下坏"的 bug 是拆成两份
+    /// 实现之后最贵的一种，也是没人会想到去对比的一种。
+    ///
+    /// 名字不是手打的，是从**真类型**序列化出来的：把 `Request::Key` 在 Rust
+    /// 这边改个名，这条测试立刻红，而手打的清单只会继续绿着。
+    #[test]
+    fn the_relay_wire_asks_for_the_same_things_the_lan_routes_do() {
+        use crate::session::ScrollBy;
+        let code = page_without_comments();
+        let (relay, _) = body_of(&code, "function relayWire(cfg) {");
+
+        for req in [
+            Request::List,
+            Request::Screen { id: 1 },
+            Request::Input {
+                id: 1,
+                text: String::new(),
+            },
+            Request::Key {
+                id: 1,
+                name: String::new(),
+            },
+            Request::Scroll {
+                id: 1,
+                by: ScrollBy::Bottom,
+            },
+            Request::WebStrings {
+                lang: String::new(),
+            },
+        ] {
+            // 形如 `"List"` 或 `{"Screen":{…}}`，取出里面那个变体名。
+            let json = serde_json::to_string(&req).unwrap();
+            let name = json
+                .trim_start_matches(['{', '"'])
+                .split('"')
+                .next()
+                .unwrap();
+            assert!(
+                relay.contains(name),
+                "经中转那份取数里没有 {name}——这条请求出了门就发不出去了"
+            );
+        }
+    }
+
+    /// 页面得**真的在两份取数之间选**。
+    ///
+    /// 写死成局域网那份的话，局域网下一切照常、所有测试全绿，而经中转时
+    /// 页面会去问一个中转根本不提供的 `/api/*`——一进门就是一片"连不上"。
+    /// 变异测试试出来的：这一处不钉，改掉它没有任何东西会红。
+    #[test]
+    fn the_page_picks_its_wire_by_whether_it_was_told_a_computer() {
+        let code = page_without_comments();
+        assert!(
+            code.contains("CFG.device ? relayWire(CFG) : lanWire()"),
+            "页面没有在两份取数之间选——经中转那条路等于没接"
         );
     }
 
@@ -1087,13 +1166,8 @@ mod tests {
     #[test]
     fn every_path_the_page_asks_for_is_one_the_router_serves() {
         let code = page_without_comments();
-        let start = code
-            .find("var wire = {")
-            .expect("页面里应该有 wire 这个对象");
-        let len = code[start..]
-            .find("\n  };")
-            .expect("wire 该以单独一行 `  };` 收尾");
-        let inside = &code[start..start + len];
+        let (inside, _) = body_of(&code, "function lanWire() {");
+        let inside = inside.as_str();
 
         let paths: Vec<&str> = inside
             .match_indices("/api/")
