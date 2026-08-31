@@ -214,13 +214,27 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     } else if let Some(text) = key_to_input(&key) {
         // 发送失败时不能静默吞掉——用户打字没反应会分不清是卡顿还是断连。
         // “连不上”这个视觉状态统一交给循环顶部的 List/Screen 探测去判定。
-        if app
+        //
+        // **两种失败要分开**，以前这里只认第一种，于是第二种一个字都不显示：
+        //
+        // - `Err(..)`：这条连接本身出事了（写不出去、读不回来、超时），
+        //   键真的没送到 → `InputNotSent`。
+        // - `Ok(Response::Error(..))`：守护进程收到了、也办了，只是**顺带
+        //   那件事**没办成。回车这一支就是这样：`session::send_input` 已经
+        //   把回车写进 pty 了，报回来的是「这一轮快照没拍上」这个告警
+        //   （约定见那边的注释）。原样报码显示，别翻译成「没送到」——它送到了。
+        match app
             .client()
             .and_then(|c| c.call(Request::Input { id, text }))
-            .is_err()
         {
-            app.message =
-                Msg::err(crate::i18n::text(crate::i18n::Key::InputNotSent, app.lang).into());
+            Err(_) => {
+                app.message =
+                    Msg::err(crate::i18n::text(crate::i18n::Key::InputNotSent, app.lang).into());
+            }
+            Ok(crate::proto::Response::Error(e)) => {
+                app.message = Msg::err(crate::i18n::msg::error(app.lang, &e));
+            }
+            Ok(_) => {}
         }
     }
     Ok(())

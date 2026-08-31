@@ -1079,26 +1079,56 @@ impl SessionManager {
                 (s.dir.clone(), s.id, s.checkpoints.len(), s.is_agent)
             };
 
+            // **快照拍不上也一定要把回车发出去。** 这里曾经是 `?` 早退：
+            // `git::checkpoint` 一失败就 return，下面写回车那句永远走不到——
+            // 而别的键走的是本函数最后那条不碰 git 的路，照发不误。现场表现
+            // 是「字打得进去，回车按了没反应，而且再也不会有反应」：会话目录
+            // 被搬走或删掉（`rev-parse --git-dir` 直接 fatal）、机器上没有
+            // git、上一次 git 被硬杀留下 `.git/dct-index-N.lock`——这几种都是
+            // **一旦发生就永远失败**，于是那个会话的回车就此死掉，而用户没有
+            // 任何办法看出为什么。
+            //
+            // 快照是 dct 给用户的便利，回车是用户自己的意图；便利拿不到，
+            // 不能反过来把意图扣下。所以失败只记一笔，末尾照样发回车，再把
+            // 错误码报给界面当**告警**（`ui::attach` 画在底栏）——那句话本来
+            // 就写着「这一步的改动可能没法撤销」，正是实情。
+            //
+            // 拍快照仍然排在写回车**前面**，不是后面：快照要的是「agent 动手
+            // 之前的样子」，先把回车放出去再拍，拍到的可能已经掺了 agent 刚
+            // 改的东西。失败那条路本来就快（第一句 `rev-parse` 就报错），
+            // 不会让回车明显变慢。
+            let mut checkpoint_failed = false;
             if is_agent {
                 // 慢，无锁。失败时给中文上下文，理由同 create() 里那处——
                 // 见那边的注释。
-                let sha = git::checkpoint(&dir, sid, seq)
-                    .map_err(|_| coded(ErrorCode::OperationFailed(Operation::Checkpoint)))?;
-                let mut s = recover(arc.lock());
-                if s.checkpoints.last() != Some(&sha) {
-                    s.checkpoints.push(sha);
+                match git::checkpoint(&dir, sid, seq) {
+                    Ok(sha) => {
+                        let mut s = recover(arc.lock());
+                        if s.checkpoints.last() != Some(&sha) {
+                            s.checkpoints.push(sha);
+                        }
+                    }
+                    Err(_) => checkpoint_failed = true,
                 }
-                s.state = SessionState::Working;
-            } else {
-                recover(arc.lock()).state = SessionState::Working;
+            }
+            recover(arc.lock()).state = SessionState::Working;
+
+            {
+                let mut g = recover(arc.lock());
+                // 一敲键就回到底部。滚上去的时候打字，字会落在看不见的地方，
+                // 用户会以为键盘坏了。归零之后字符照常送出去，不吞。
+                g.pty.scroll_to_bottom();
+                g.scroll_mark = 0;
+                g.pty.write(b"\r")?;
             }
 
-            let mut g = recover(arc.lock());
-            // 一敲键就回到底部。滚上去的时候打字，字会落在看不见的地方，
-            // 用户会以为键盘坏了。归零之后字符照常送出去，不吞。
-            g.pty.scroll_to_bottom();
-            g.scroll_mark = 0;
-            return g.pty.write(b"\r");
+            // 回车已经发出去了才报这个错。**它是告警不是失败**——界面靠这条
+            // 消息把「这一轮没快照」说出来，别把它当成「这次输入没送到」
+            // （约定钉在 `ui::attach` 那一侧）。
+            if checkpoint_failed {
+                return Err(coded(ErrorCode::OperationFailed(Operation::Checkpoint)));
+            }
+            return Ok(());
         }
 
         let mut g = recover(arc.lock());
@@ -2854,6 +2884,66 @@ mod tests {
         );
         assert!(!dir.contains("dct-worktrees"), "不该再建副本了：{dir}");
     }
+
+    /// **回车不许被快照吃掉。**
+    ///
+    /// 现场：项目目录被搬走（会话的 cwd 还在，`.git` 没了），从那一刻起
+    /// `git::checkpoint` 每次都在第一句 `rev-parse --git-dir` 上 fatal。
+    /// 旧写法在那儿 `?` 早退，写回车那句永远走不到——而别的键不碰 git，
+    /// 照发不误。于是那个会话「字打得进去，回车按了没反应，而且再也不会
+    /// 有反应」，屏幕上一个字的解释都没有。
+    ///
+    /// 这条钉两件事：回车照样进 pty（`cat` 会把整行回显出来），以及失败
+    /// 要**报出来**（告警码，不是静默成功）。
+    #[test]
+    fn enter_still_reaches_the_agent_when_the_checkpoint_fails() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+
+        // 先确认这个会话本来是好的：打字能上屏。
+        m.send_input(id, "PING").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !m.screen_text_for_test(id).contains("PING") {
+            assert!(Instant::now() < deadline, "会话没起来，字都没上屏");
+            sleep(Duration::from_millis(20));
+        }
+
+        // 把项目变回「不是 git 仓库」——现场那一例的样子。
+        fs::remove_dir_all(repo.path().join(".git")).unwrap();
+
+        let err = m
+            .send_input(id, "")
+            .expect_err("快照拍不上就得报出来，不能静默成功");
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
+        assert!(
+            matches!(
+                code,
+                ErrorCode::OperationFailed(crate::proto::Operation::Checkpoint)
+            ),
+            "实际错误: {code:?}"
+        );
+
+        // 报了错，但回车确实送到了：`cat` 收到整行之后会把它再吐一遍，
+        // 屏幕上于是有两个 PING（一个是回显，一个是 cat 吐的）。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if m.screen_text_for_test(id).matches("PING").count() >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "回车被吞了——屏幕上只有回显那一个 PING：{}",
+                m.screen_text_for_test(id)
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn rejects_agent_session_outside_repo() {
         let plain = tempfile::tempdir().unwrap();
