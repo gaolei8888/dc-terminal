@@ -59,6 +59,19 @@ impl Default for LlmConfig {
     }
 }
 
+/// 菜单上只留哪几项。给一个班、一个团队统一发机器的人用的。
+///
+/// 空列表（没写这一段、写了空的、名字全填错）= 不裁，全都显示。**裁到
+/// 一个不剩时也是全都显示**——理由见 `profile::trim_menu`。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MenuConfig {
+    /// profile 名，**按写下的顺序**显示。写一个不存在的名字不报错也不显示，
+    /// 因为这份文件是发机器的人自己写的，而收到机器的学生对着一条
+    /// 「profile 名写错了」的警告什么也做不了。
+    #[serde(default)]
+    pub agents: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     /// `None` = 用户没写 `[llm]` 这一段，出错解释功能整个关着。**默认值
@@ -67,6 +80,10 @@ pub struct Config {
     /// 模块头注释，这是隐私边界，不是随手选的类型。
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+    /// `[menu]` 跟 `[llm]` 不一样，**不是 `Option`**：它不碰任何隐私边界，
+    /// 「没写」和「写了但空着」要的是同一件事——菜单原样显示。
+    #[serde(default)]
+    pub menu: MenuConfig,
 }
 
 impl Config {
@@ -99,6 +116,20 @@ impl Config {
 /// 跟着 socket 走，测试自动隔离（同 `secrets_path_for_socket`）。
 pub fn config_path_for_socket(socket: &Path) -> PathBuf {
     match socket.parent() {
+        Some(d) => d.join("config.toml"),
+        None => PathBuf::from("config.toml"),
+    }
+}
+
+/// 同一份文件，从 profiles 目录反推。
+///
+/// `daemon::handle` 拿不到 socket——它只拿得到 profiles 目录——而「菜单裁不裁」
+/// 是每次开选择器都要问一遍的事（发机器的人改完配置，学生不该为了让它生效
+/// 去重启守护进程）。两个函数指向的必须是同一个文件：`profiles` 是 socket
+/// 同级目录下的子目录，所以它的父目录就是 socket 的父目录。改任何一边都要
+/// 回来看另一边，下面那条测试钉着这件事。
+pub fn config_path_for_profiles_dir(profiles_dir: &Path) -> PathBuf {
+    match profiles_dir.parent() {
         Some(d) => d.join("config.toml"),
         None => PathBuf::from("config.toml"),
     }
@@ -195,5 +226,30 @@ mod tests {
     fn config_path_sits_next_to_the_socket() {
         let p = config_path_for_socket(std::path::Path::new("/home/x/.dct/daemon.sock"));
         assert_eq!(p, std::path::PathBuf::from("/home/x/.dct/config.toml"));
+    }
+
+    /// 两条推导必须落在同一个文件上——落不到一起的话，发机器的人写下的
+    /// `[menu]` 会静静地不生效，而他手里没有任何线索能查出为什么。
+    #[test]
+    fn both_paths_point_at_the_same_file() {
+        let sock = std::path::Path::new("/home/x/.dct/daemon.sock");
+        let profiles = crate::profile::profiles_dir_for_socket(sock);
+        assert_eq!(
+            config_path_for_profiles_dir(&profiles),
+            config_path_for_socket(sock)
+        );
+    }
+
+    #[test]
+    fn parses_a_menu_section() {
+        let c = Config::from_toml("[menu]\nagents = [\"dc\", \"shell\"]\n").unwrap();
+        assert_eq!(c.menu.agents, vec!["dc".to_string(), "shell".to_string()]);
+    }
+
+    /// 绝大多数用户没有这一段，那必须等于「菜单原样显示」。
+    #[test]
+    fn no_menu_section_means_no_trimming() {
+        assert!(Config::default().menu.agents.is_empty());
+        assert!(Config::from_toml("[llm]\n").unwrap().menu.agents.is_empty());
     }
 }

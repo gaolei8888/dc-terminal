@@ -144,6 +144,7 @@ pub struct Profile {
     pub resume_args: Vec<String>,
 }
 
+const DC: &str = include_str!("../profiles/dc.toml");
 const CLAUDE: &str = include_str!("../profiles/claude.toml");
 const CODEX: &str = include_str!("../profiles/codex.toml");
 const OPENCODE: &str = include_str!("../profiles/opencode.toml");
@@ -161,6 +162,7 @@ impl Profile {
 
     pub fn builtin(name: &str) -> Option<Profile> {
         let src = match name {
+            "dc" => DC,
             "claude" => CLAUDE,
             "codex" => CODEX,
             "opencode" => OPENCODE,
@@ -177,18 +179,27 @@ impl Profile {
         // 某类机器上落空（macOS 有 /bin/zsh，Ubuntu 默认没有），而落空的后果
         // 不是「换一个 shell 跑」，是「命令行」整行被标成没安装、按下去只剩
         // 一句找不到。它偏偏是唯一 `is_agent = false` 的内置 profile——在不是
-        // git 仓库的目录里，别的八项全被 `NotAGitRepo` 挡住，它是仅剩的那一项。
+        // git 仓库的目录里，别的九项全被 `NotAGitRepo` 挡住，它是仅剩的那一项。
         if p.name == "shell" {
             p.command = vec![login_shell()];
         }
         Some(p)
     }
 
-    /// 返回顺序就是菜单顺序：先独立 CLI，再 API 形态，命令行垫底。
-    /// 命令行放最后是因为它对目标用户价值最低——非程序员不需要裸终端。
+    /// 返回顺序就是菜单顺序：训练营那一项排头，然后独立 CLI，再 API 形态，
+    /// 命令行垫底。命令行放最后是因为它对目标用户价值最低——非程序员不需要
+    /// 裸终端。
+    ///
+    /// **`dc` 排第一不是偏心，是那一项是唯一一个新学生按下去就能跑的。**
+    /// 第一位在这里是有实际后果的：一个从没开过会话的项目，`n` 弹出选择器
+    /// 且光标落在第一项上（`quick_start_target` 只在「上次那个仍然 Ready」
+    /// 时才直开），而学生第一次选的那个会被记成这个项目的 last_profile，
+    /// 从此 `n` 一直开它。第一位放 `claude`，中国学生的第一下就落在一个
+    /// 要外币订阅才起得来的东西上。
     pub fn builtin_names() -> Vec<&'static str> {
         vec![
-            "claude", "codex", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api", "shell",
+            "dc", "claude", "codex", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api",
+            "shell",
         ]
     }
 
@@ -374,6 +385,39 @@ pub fn all_profiles(dir: &Path) -> (Vec<Profile>, Vec<WarningCode>) {
         }
     }
     (out, errs)
+}
+
+/// 按 `[menu] agents` 把菜单裁短，顺序照那份清单写的来。
+///
+/// 谁需要这个：给一个班、一个团队统一发机器的人。十项摆在零基础的人面前，
+/// 其中八项要么他这辈子不会用，要么要他自己去某个网站注册充值——而那正是
+/// 发机器的人替他免掉的那一步。
+///
+/// **空清单 = 不裁。** 绝大多数用户没写这一段，他们要看到全部。
+///
+/// **裁到一个不剩时也不裁。** 清单里的名字全写错了（改了自定义 profile 的
+/// 名字、删了一个 toml），照裁的话用户会打开一个空菜单——一个什么都开不了、
+/// 也不解释为什么的界面，比多几项没用的东西糟得多。宁可多显示，不可无路可走。
+///
+/// **必须在 `status_of` 之后调用，不能先裁 profile 再算状态。** 状态里的
+/// `NeedsDependency` 要回头在全量清单里找「这条命令归谁」（`dc` 跑的是
+/// `claude` 那个二进制），先裁掉 `claude` 的话，这一步就找不到那个用来
+/// 显示的名字了。
+pub fn trim_menu(
+    entries: Vec<crate::proto::ProfileEntry>,
+    only: &[String],
+) -> Vec<crate::proto::ProfileEntry> {
+    if only.is_empty() {
+        return entries;
+    }
+    let kept: Vec<_> = only
+        .iter()
+        .filter_map(|name| entries.iter().find(|e| &e.name == name).cloned())
+        .collect();
+    if kept.is_empty() {
+        return entries;
+    }
+    kept
 }
 
 /// 这个 profile 现在能不能用，不能的话卡在哪。
@@ -680,7 +724,7 @@ mod tests {
     /// 错误文案也一样。漏掉任何一个，那个 agent 就会静默地坏着。
     #[test]
     fn every_claude_based_profile_detects_the_same_errors() {
-        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["dc", "claude", "kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             let re = p
                 .error_regex()
@@ -879,7 +923,7 @@ mod tests {
             assert!(!p.command.is_empty(), "{name}: command 不能为空");
             assert!(
                 p.label.get(Lang::Zh).is_some(),
-                "{name}: 必须有中文 label，九个选项摆在非程序员面前没说明等于没得选"
+                "{name}: 必须有中文 label，十个选项摆在非程序员面前没说明等于没得选"
             );
             // 正则必须能编译，否则一到 tick 就报错
             p.idle_regex().unwrap();
@@ -892,15 +936,16 @@ mod tests {
         assert_eq!(
             Profile::builtin_names(),
             vec![
-                "claude", "codex", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api",
+                "dc", "claude", "codex", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api",
                 "shell",
-            ]
+            ],
+            "第一项是新学生按下去就能跑的那个——理由写在 builtin_names 上"
         );
     }
 
     #[test]
     fn api_shaped_profiles_run_claude_and_need_a_secret() {
-        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["dc", "kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             assert_eq!(p.command[0], "claude", "{name}: API 形态跑的是 claude");
             assert!(
@@ -945,6 +990,7 @@ mod tests {
     #[test]
     fn every_agent_we_know_the_flag_for_actually_carries_it() {
         for (name, flag) in [
+            ("dc", "--dangerously-skip-permissions"),
             ("claude", "--dangerously-skip-permissions"),
             ("codex", "--dangerously-bypass-approvals-and-sandbox"),
             ("qwen", "--approval-mode=yolo"),
@@ -1058,7 +1104,7 @@ mod tests {
 
         let (all, _) = all_profiles(tmp.path());
         assert_eq!(all.last().unwrap().name, "mine", "新增的排在内置后面");
-        assert_eq!(all[0].name, "claude", "内置顺序不受影响");
+        assert_eq!(all[0].name, "dc", "内置顺序不受影响");
     }
 
     #[test]
@@ -1219,7 +1265,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (all, errs) = all_profiles(&tmp.path().join("根本没这个目录"));
         assert!(errs.is_empty(), "没建过自定义目录是常态，不是错误");
-        assert_eq!(all.len(), 9, "只有内置");
+        // 跟着 `builtin_names()` 走，不写死数字：加一个内置 profile 是
+        // 正常的事，为它改一个跟这条测试要断言的东西无关的数字不是。
+        assert_eq!(all.len(), Profile::builtin_names().len(), "只有内置");
     }
 
     #[test]
@@ -1283,7 +1331,7 @@ mod tests {
 
     #[test]
     fn api_shaped_profiles_declare_an_api_block() {
-        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["dc", "kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             let api = p
                 .api
@@ -1305,7 +1353,7 @@ mod tests {
     fn the_api_base_url_matches_the_env_base_url() {
         // 两个字段现在值相同但用途不同（env 给子进程，api 给 dct 自己）。
         // 不合并，但要一致——不一致意味着有人只改了一边。
-        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["dc", "kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             let env = p.env.get("ANTHROPIC_BASE_URL").unwrap();
             assert_eq!(
@@ -1328,7 +1376,7 @@ mod tests {
     /// 靠这个接回原来的对话。
     #[test]
     fn claude_based_profiles_declare_continue_as_resume_args() {
-        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+        for name in ["dc", "claude", "deepseek", "glm", "kimi", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             assert_eq!(
                 p.resume_args,
@@ -1350,5 +1398,58 @@ mod tests {
                 "{name}: 恢复方式没实测过，不该编 resume_args"
             );
         }
+    }
+
+    fn entry(name: &str) -> crate::proto::ProfileEntry {
+        crate::proto::ProfileEntry {
+            name: name.to_string(),
+            label: name.to_string(),
+            note: String::new(),
+            status: ProfileStatus::Ready,
+            secret: None,
+            install: None,
+            has_secret: false,
+            backend_only: false,
+        }
+    }
+
+    fn names(v: &[crate::proto::ProfileEntry]) -> Vec<&str> {
+        v.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// 绝大多数用户没写 `[menu]`，他们要看到全部十项。
+    #[test]
+    fn an_empty_menu_list_keeps_everything() {
+        let all = vec![entry("dc"), entry("claude"), entry("shell")];
+        assert_eq!(names(&trim_menu(all, &[])), vec!["dc", "claude", "shell"]);
+    }
+
+    #[test]
+    fn the_menu_list_decides_both_which_and_in_what_order() {
+        let all = vec![entry("dc"), entry("claude"), entry("shell")];
+        let only = vec!["shell".to_string(), "dc".to_string()];
+        assert_eq!(
+            names(&trim_menu(all, &only)),
+            vec!["shell", "dc"],
+            "顺序照清单写的来，不是照内置顺序"
+        );
+    }
+
+    /// 名字写错了就当没写这一项——发这份配置的人自己会发现少了一项，
+    /// 而收到机器的学生对着一条「名字拼错了」的警告什么也做不了。
+    #[test]
+    fn a_name_that_matches_nothing_is_skipped() {
+        let all = vec![entry("dc"), entry("shell")];
+        let only = vec!["dc".to_string(), "typo".to_string()];
+        assert_eq!(names(&trim_menu(all, &only)), vec!["dc"]);
+    }
+
+    /// **裁到一个不剩就不裁。** 空菜单是一个什么都开不了、也不说为什么的
+    /// 界面，比多几项用不上的东西糟得多。宁可多显示，不可无路可走。
+    #[test]
+    fn a_list_that_matches_nothing_falls_back_to_the_whole_menu() {
+        let all = vec![entry("dc"), entry("shell")];
+        let only = vec!["nope".to_string()];
+        assert_eq!(names(&trim_menu(all, &only)), vec!["dc", "shell"]);
     }
 }

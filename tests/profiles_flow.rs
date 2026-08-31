@@ -19,9 +19,12 @@ fn profiles_returns_entries_with_labels_and_status() {
         panic!("应当返回 Profiles");
     };
     assert!(warnings.is_empty(), "干净环境不该有告警");
-    assert_eq!(entries.len(), 9);
-    assert_eq!(entries[0].name, "claude");
-    assert_eq!(entries[0].label, "Claude", "要带中文 label");
+    assert_eq!(entries.len(), dct::profile::Profile::builtin_names().len());
+    assert_eq!(
+        entries[0].name, "dc",
+        "没写 [menu] 的机器上，菜单第一项就是内置清单的第一项"
+    );
+    assert_eq!(entries[0].label, "DC", "要带中文 label");
     let shell = entries.iter().find(|e| e.name == "shell").unwrap();
     assert_eq!(
         shell.status,
@@ -222,4 +225,34 @@ fn create_without_remember_does_not_record() {
         .unwrap(),
         Response::LastProfile(None)
     ));
+}
+
+/// `[menu]` 走一遍真 socket。
+///
+/// 单元测试证明的是「裁剪函数按清单裁」，这一条证明的是另一件事：daemon
+/// 真的**找得到**那份配置。菜单那条路拿不到 socket，配置文件的位置是从
+/// profiles 目录反推的（`config_path_for_profiles_dir`），推错的话什么都
+/// 不会报错——发机器的人写下的 `[menu]` 只是静静地不生效。
+#[test]
+fn the_menu_section_trims_the_list_the_daemon_hands_back() {
+    let h = common::start_daemon();
+    std::fs::write(
+        dct::config::config_path_for_socket(&h.sock),
+        "[menu]
+agents = [\"shell\", \"dc\"]
+",
+    )
+    .unwrap();
+
+    let mut c = h.client();
+    let Response::Profiles { entries, .. } = c
+        .call(Request::Profiles {
+            lang: dct::i18n::Lang::Zh,
+        })
+        .unwrap()
+    else {
+        panic!("应当返回 Profiles");
+    };
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["shell", "dc"], "只留清单里那两项，顺序照清单");
 }

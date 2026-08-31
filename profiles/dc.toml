@@ -1,0 +1,62 @@
+# 训练营自己的网关。学生不注册、不充值，钥匙由老师发。
+#
+# **上线前必须换掉两个地方**：下面 `[env]`/`[api]`/`[secret.verify]` 里的
+# 主机名，和 `[secret].url`（学生领钥匙的那一页）。现在填的是 `.example`
+# 占位——那是保留域名，永远解析不到，所以填错了会当场看得出来，不会
+# 悄悄打到别人的服务器上。
+name = "dc"
+command = ["claude", "--dangerously-skip-permissions"]
+is_agent = true
+# 下面三条正则跟 `claude.toml` 一模一样，**不是抄的，是同一份实测**：
+# 这个 profile 跑的就是 claude 那个二进制，只换了 `ANTHROPIC_BASE_URL`，
+# 而 base_url 不改变它画在屏幕上的任何东西。换掉命令的那天，这三条
+# 要跟着重新实测（见 claude.toml 里那段说明它们是怎么测出来的注释）。
+busy_pattern = "esc to interrupt"
+idle_pattern = "(?m)^❯|bypass permissions on"
+error_pattern = "API Error|Connection closed mid-response"
+resume_args = ["--continue"]
+
+[label]
+zh = "DC"
+en = "DC"
+
+[note]
+zh = "训练营自带，钥匙问老师要"
+en = "Bundled with the camp; ask your teacher for the key"
+
+# 装的是 claude 那个 CLI——这个 profile 只是把它指向别处，没有自己的包。
+# 名字仍然写 `dc`：界面发给 shell 的是 `dct install dc`，学生看到的
+# 是他自己选的那一项，不是一个他没听过的牌子。
+[install]
+command = ["npm", "i", "-g", "@anthropic-ai/claude-code"]
+
+[install.note]
+zh = "需要先装 Node.js"
+en = "Requires Node.js"
+
+[env]
+ANTHROPIC_BASE_URL = "https://llm.dc.example/anthropic"
+# 网关如果做不到「进来什么模型名都落到默认模型」，就把下面两行打开、
+# 填上真名字。**两行都要**：claude 那个 CLI 干活用一个模型，起标题、
+# 扫文件这类杂活另外叫一个便宜的快模型，只钉住前一个的话，杂活会以
+# 课堂上没人查得出来的方式坏掉。
+# ANTHROPIC_MODEL = "..."
+# ANTHROPIC_SMALL_FAST_MODEL = "..."
+
+[secret]
+env = "ANTHROPIC_AUTH_TOKEN"
+url = "https://dc.example/key"
+
+[secret.hint]
+zh = "老师发给你的那串字符，粘进来就行"
+en = "Paste the key your teacher gave you"
+
+[secret.verify]
+url = "https://llm.dc.example/anthropic/v1/messages"
+
+[api]
+base_url = "https://llm.dc.example/anthropic"
+wire = "anthropic"
+
+[headless]
+command = ["claude", "-p"]

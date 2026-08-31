@@ -58,7 +58,7 @@ guessed as "working".
 the SSH connection, shut the lid: they keep running, and typing `dct` puts you
 back exactly where you left.
 
-**Nine agents, one installer.** `dct install claude` brings the Node it needs
+**Ten agents, one installer.** `dct install claude` brings the Node it needs
 with it, and keys all live in `~/.dct/secrets.toml` — no remembering what each
 vendor calls its environment variable.
 
@@ -270,9 +270,9 @@ of each other's way.
 
 ---
 
-## Nine agents, one door
+## Ten agents, one door
 
-Press `N` and you get all nine, **including the ones that don't work on this
+Press `N` and you get all ten, **including the ones that don't work on this
 machine**. Those are greyed out with the reason, and picking one takes you toward
 fixing it instead of just saying no:
 
@@ -287,6 +287,7 @@ fixing it instead of just saying no:
 
 | | | needs |
 |---|---|---|
+| DC | the training camp's own endpoint, wearing Claude's face | `claude` + a key |
 | Claude | Anthropic's CLI | `claude` |
 | Codex | OpenAI's CLI | `codex` |
 | OpenCode | open source, many models | `opencode` |
@@ -297,9 +298,16 @@ fixing it instead of just saying no:
 | Qwen API | same trick | `claude` + a key |
 | Terminal | a plain shell | |
 
-Those last four aren't separate programs at all. They're `claude` pointed at
-somebody else's Anthropic-compatible endpoint, which is why they want both the
-binary and a key.
+DC and the last four aren't separate programs at all. They're `claude` pointed
+at another Anthropic-compatible endpoint, which is why they want both the binary
+and a key.
+
+**DC has no signup page**: its key is handed out by 疯狂AI训练营 to the people
+taking the course, which is the whole point of it sitting first in the list — for
+a student on their first day it's the one line in that table that needs no
+account, no card and no VPN. Everyone else can ignore it, or point it somewhere
+else: it's an ordinary profile, and a `dc.toml` of your own in `~/.dct/profiles/`
+replaces it.
 
 Keys live in `~/.dct/secrets.toml`, mode 0600. They never go anywhere near the
 profile files, which is deliberate: those you can copy between machines or hand
@@ -342,6 +350,30 @@ is worse than admitting you don't know.
 There's also `env` for environment variables, `secret` if your agent needs a key
 from the user, and `install` for how to install it. Get the TOML wrong and the
 picker tells you which file and which line.
+
+</details>
+
+<details>
+<summary>Handing out machines: showing fewer than ten</summary>
+
+<br>
+
+Ten choices is a lot to put in front of someone on their first day, and most of
+those rows ask them to go and register somewhere. If you're setting up machines
+for a class or a team, name the ones you want in `~/.dct/config.toml`:
+
+```toml
+[menu]
+agents = ["dc", "shell"]
+```
+
+The order you write is the order they appear in. Leave the section out — which is
+what everybody else has — and nothing is trimmed. A name that matches no profile
+is skipped, and if none of them match, the full list comes back rather than an
+empty menu you can't start anything from.
+
+This is read on every request, so editing the file is enough; there's nothing to
+restart, and nobody has to lose their running sessions over a menu change.
 
 </details>
 
@@ -507,6 +539,11 @@ rules-only theme.
 and have never been tested with a real account.** A key can verify fine and the
 session still fail to start. Until somebody runs them with real credentials,
 treat Kimi, GLM, DeepSeek and Qwen API as unverified.
+
+**DC points at an address that isn't live yet.** It's first in the list because
+that's where it belongs once the course starts, but until the camp's endpoint is
+switched on there is nothing behind it. Picking it today gets you a session that
+can't reach anything.
 
 **Permissions are auto-accepted, which means an agent can write outside the
 project directory.** Those writes are outside the snapshot and undo won't bring

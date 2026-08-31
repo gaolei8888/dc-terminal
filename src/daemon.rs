@@ -602,6 +602,19 @@ fn handle(
                     }
                 })
                 .collect();
+            // 裁菜单放在最后，**不能提前到 `all` 那一步**：上面的 `status_of`
+            // 要拿全量清单去查「这条命令归谁」，先裁就查不着了（理由写在
+            // `trim_menu` 上）。
+            //
+            // 每次开选择器都重读一遍配置文件：这是一个几百字节的文件，一次
+            // 开选择器读一次的代价看不见；换来的是发机器的人改完配置，学生
+            // 不用为了让它生效去重启守护进程——而「重启守护进程」对他意味着
+            // 手上所有会话一起断。
+            let menu = crate::config::Config::load(&crate::config::config_path_for_profiles_dir(
+                profiles_dir,
+            ))
+            .menu;
+            let entries = crate::profile::trim_menu(entries, &menu.agents);
             Ok(Response::Profiles { entries, warnings })
         }
         Request::Projects => {
