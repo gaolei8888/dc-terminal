@@ -78,6 +78,22 @@ pub enum SessionState {
 ///   用户以为 agent 在等他，其实那一轮已经废了。
 /// - **busy 优先于 idle。** agent 干活时的「按 esc 中断」提示是稳定的，
 ///   而空闲时的输入框占位符用户一打字就没了。
+///
+/// # 两条都声明时，「都没匹配上」不再算空闲
+///
+/// 原来这里是「`busy_re` 一旦存在就不看 `idle_re`」：匹上是干活中，匹不上
+/// 是空闲。那个推断只在 agent 的界面还活着的时候成立——而它卡死的时候，
+/// 那行忙碌标记是因为**相反的原因**消失的。
+///
+/// 真出过一次：一个会话的 API 流在收到 8k token 之后半途断了，对端不再发
+/// 字节也没关连接，claude 阻塞在那个读上，CPU 0%、六秒零读写、界面一帧都
+/// 不再画。屏幕上没有忙碌标记，于是看板把它报成**「空闲」**——所有答案里
+/// 最误导的那一个，它等于在对用户说「它在等你输入」。
+///
+/// 所以：两条都声明的 profile，「忙没匹上、闲也没匹上」得到的是 `None`
+/// ——不表态，保持原状态。看板宁可继续写「干活中」（它确实还没干完），
+/// 也不许谎称在等人。**只声明一条的 profile 行为一个字都没变**：那时候
+/// 我们没有第二个标记，分不清「不忙」和「说不清」，只能沿用旧推断。
 fn classify(
     text: &str,
     error_re: Option<&regex::Regex>,
@@ -87,21 +103,29 @@ fn classify(
     if error_re.is_some_and(|re| re.is_match(text)) {
         return Some(SessionState::Failed);
     }
-    if let Some(re) = busy_re {
-        return Some(if re.is_match(text) {
+    match (busy_re, idle_re) {
+        // 唯一分得清「不忙」和「说不清」的组合，见上面那段。
+        (Some(busy), Some(idle)) => {
+            if busy.is_match(text) {
+                Some(SessionState::Working)
+            } else if idle.is_match(text) {
+                Some(SessionState::Idle)
+            } else {
+                None
+            }
+        }
+        (Some(busy), None) => Some(if busy.is_match(text) {
             SessionState::Working
         } else {
             SessionState::Idle
-        });
-    }
-    if let Some(re) = idle_re {
-        return Some(if re.is_match(text) {
+        }),
+        (None, Some(idle)) => Some(if idle.is_match(text) {
             SessionState::Idle
         } else {
             SessionState::Working
-        });
+        }),
+        (None, None) => None,
     }
-    None
 }
 
 /// 该不该为这个会话叫醒用户的手机？三道门，全 AND。
@@ -109,11 +133,16 @@ fn classify(
 /// - `is_agent`：命令行会话（shell）从来不该推送——用户自己在敲的东西，
 ///   没有「停下来了」这个概念。
 /// - `!first_input_empty`（这里传入的是 `first_input_empty` 本身）：**这道
-///   是关键。** 真实 profile（claude/codex/glm/kimi/deepseek/qwen-api）
-///   全都只声明 `busy_pattern`，`classify()` 在 busy 串不在屏幕上时就判
-///   Idle——而刚创建、还停在启动画面上的会话正是这样。没有这道门，
-///   **每开一个会话手机就响一次**。跟 `tick()` 里起名字用的是同一个
-///   判据、同一个理由，见那边的长注释。
+///   是关键。** 只声明了 `busy_pattern` 的 profile（codex，以及用户自己
+///   写的），`classify()` 在 busy 串不在屏幕上时就判 Idle——而刚创建、
+///   还停在启动画面上的会话正是这样。没有这道门，**每开一个会话手机就
+///   响一次**。跟 `tick()` 里起名字用的是同一个判据、同一个理由，见那边
+///   的长注释。
+///
+///   claude 系现在两条 pattern 都声明了（见 `classify` 的文档），启动画面
+///   两条都匹不上，得到的是「不表态」而不是 Idle——那条路上这道门已经
+///   用不着了。**但它不能删**：codex 和用户自己写的 profile 还是老形状，
+///   而这道门的代价只是一个空串判断。
 /// - `has_channel`：没配手机通知（`SessionManager::set_event_sink` 没被
 ///   调过，或者被 `clear_event_sink` 收回过）就没有地方可推，试都不用试。
 ///   **修复 1（最终整分支 review）之前这道门是摆设**：`daemon.rs` 不管
@@ -1400,10 +1429,12 @@ impl SessionManager {
                     // 才有它到底在做什么的实证。
                     //
                     // `!s.first_input.is_empty()` 这一半不是锦上添花，是必需的：
-                    // 真实 profile（claude/codex/glm/kimi/deepseek/qwen-api）
-                    // 全都只声明 `busy_pattern`，不声明 `idle_pattern`——`classify()`
-                    // 在 busy_pattern 存在时，busy 串**不在**屏幕上就判 Idle，
-                    // 而刚创建、还停在启动画面上的会话正是这样。没有这道判断，
+                    // 只声明了 `busy_pattern` 的 profile（codex，以及用户自己写的）
+                    // ——`classify()` 在只有这一条时，busy 串**不在**屏幕上就判
+                    // Idle，而刚创建、还停在启动画面上的会话正是这样。claude 系
+                    // 两条都声明之后走的是「不表态」那条路（见 `classify` 的文档），
+                    // 这道判断在那条路上已经用不着，但老形状的 profile 还在，
+                    // 而它的代价只是一个空串判断。没有这道判断，
                     // `create()` 之后的第一个 tick 就会把 `was == Working`（创建时
                     // 因为有 pattern 而置的初始状态）→ `next == Idle`（启动画面）
                     // 读成「干完一轮活」，用空的 `first_input` 把名字永久钉成空串。
@@ -1693,6 +1724,128 @@ mod tests {
         }
     }
 
+    /// 同一台机器上，同一个 agent **卡死了**。
+    ///
+    /// 逐字抄自一次真实故障的截屏：那个会话的 API 流在收到 8k token 之后
+    /// 半途断了——对端不再发字节，也没关连接，claude 阻塞在那个读上，
+    /// CPU 0%、六秒零读写、界面一帧都不再画。
+    ///
+    /// 要点全在**没有什么**上：没有 `esc to interrupt`（连转圈那一行都
+    /// 丢了它的后半句），没有输入框那一行，没有底栏。屏幕上剩下的只是
+    /// 冻住的那一刻的对话正文。
+    const CLAUDE_WEDGED: &str = "\
+● node --check 通过（eslint 没装，devDependencies 里只有 vscode，我
+
+  Ran 3 shell commands
+
+● 一处隐患：clearTimeout(giveUp) 在 giveUp 声明之前的闭包里（实际
+
+● Running 1 shell command…
+  └ $ cd \"C:/Users/gaole/Documents/work/dc/dc-grails-vs\" && py
+
+✳ Perambulating… (1m 55s · ↓ 8.0k tokens)
+
+  连片段级的补全都没有：snippets/grails-snippets.json 里那 3 个（
+
+  ---
+";
+
+    /// **卡死的会话不许被报成「在等你输入」。**
+    ///
+    /// 这是这条修复的全部理由。原来的判定是「`busy_pattern` 匹不上就是
+    /// 空闲」——那个推断只在 agent 的界面还活着的时候成立，而它卡死的
+    /// 时候，那行忙碌标记是因为**相反的原因**消失的。于是看板对着一个
+    /// 一动不动的会话说「它在等你输入」，是所有答案里最误导的那一个：
+    /// 用户会去敲字，而那边没有任何东西在读。
+    ///
+    /// 断言写成「不是 Idle」而不是「等于某个具体状态」：这条要钉死的是
+    /// **不许撒这个谎**，至于是保持原状态（`None`）还是将来多一档
+    /// 「没反应了」，那是上层的事，改了不该惊动这条。
+    #[test]
+    fn a_wedged_claude_is_never_reported_as_waiting_for_you() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = crate::profile::Profile::builtin(name).unwrap();
+            let state = classify(
+                CLAUDE_WEDGED,
+                p.error_regex().unwrap().as_ref(),
+                p.busy_regex().unwrap().as_ref(),
+                p.idle_regex().unwrap().as_ref(),
+            );
+            assert_ne!(
+                state,
+                Some(SessionState::Idle),
+                "{name}：卡死的屏幕被报成了「空闲」——看板会告诉用户去敲字，而那边没人在读"
+            );
+            assert_eq!(
+                state, None,
+                "{name}：两条标记都不在屏幕上，就该不表态、保持原状态"
+            );
+        }
+    }
+
+    /// 上一条要成立，claude 系的 profile 就必须**两条 pattern 都声明**——
+    /// 只有一条的时候 `classify` 分不清「不忙」和「说不清」，只能沿用
+    /// 旧推断。谁把 `idle_pattern` 删了，这条先红。
+    ///
+    /// 不查具体正则长什么样（那是 profile 自己的事，claude 换了皮就得改），
+    /// 只查「两条都在」这个前提还在不在。
+    #[test]
+    fn the_claude_family_declares_both_markers_not_just_the_busy_one() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = crate::profile::Profile::builtin(name).unwrap();
+            assert!(
+                p.busy_regex().unwrap().is_some() && p.idle_regex().unwrap().is_some(),
+                "{name}：少了任何一条，卡死的会话就会重新被报成「空闲」"
+            );
+        }
+    }
+
+    /// `classify` 的分支表，四种组合一次说清。
+    ///
+    /// **只声明一条的 profile 行为一个字都没变**是这次改动的承诺：用户
+    /// 自己写的 profile、以及 codex（它的 TUI 没实测过，按仓库的规矩不许
+    /// 瞎填空闲标记）都还只有一条 pattern，那时候我们没有第二个标记，
+    /// 分不清「不忙」和「说不清」，只能沿用旧推断。这条把承诺钉住。
+    #[test]
+    fn only_a_profile_with_both_markers_can_say_i_dont_know() {
+        let busy = regex::Regex::new("BUSY").unwrap();
+        let idle = regex::Regex::new("READY").unwrap();
+        let call = |text, b, i| classify(text, None, b, i);
+
+        // 两条都有：这是唯一分得清「不忙」和「说不清」的组合
+        let both = (Some(&busy), Some(&idle));
+        assert_eq!(call("BUSY", both.0, both.1), Some(SessionState::Working));
+        assert_eq!(call("READY", both.0, both.1), Some(SessionState::Idle));
+        assert_eq!(
+            call("什么都没有", both.0, both.1),
+            None,
+            "两条都没匹上就不表态"
+        );
+        assert_eq!(
+            call("BUSY READY", both.0, both.1),
+            Some(SessionState::Working),
+            "两条同时在屏幕上时忙优先——干活时输入框也一直画着"
+        );
+
+        // 只有 busy：旧行为，不忙就当空闲
+        assert_eq!(call("BUSY", Some(&busy), None), Some(SessionState::Working));
+        assert_eq!(
+            call("什么都没有", Some(&busy), None),
+            Some(SessionState::Idle),
+            "只有一条标记时没得选，只能沿用旧推断"
+        );
+
+        // 只有 idle：旧行为，不闲就当在干活
+        assert_eq!(call("READY", None, Some(&idle)), Some(SessionState::Idle));
+        assert_eq!(
+            call("什么都没有", None, Some(&idle)),
+            Some(SessionState::Working)
+        );
+
+        // 一条都没有：本来就说明不了任何事
+        assert_eq!(call("随便什么", None, None), None);
+    }
+
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -1837,11 +1990,14 @@ mod tests {
         }
     }
 
-    // 真实 profile 的形状：claude/codex/glm/kimi/deepseek/qwen-api 全都只
-    // 声明 `busy_pattern`（比如「esc to interrupt」），不声明 `idle_pattern`——
-    // `profiles/*.toml` 里 `idle_pattern` 这个词只出现在解释「为什么故意不写」
-    // 的注释里。`classify()` 在 busy_pattern 存在时，busy 串**不在**屏幕上
-    // 就判 Idle：刚创建、还停在启动画面上的会话，第一个 tick 就是这个读法。
+    // 只声明 `busy_pattern`（比如「esc to interrupt」）的那种形状：codex 现在
+    // 就是这样（它的 TUI 没实测过，按仓库的规矩不许瞎填空闲标记），用户自己
+    // 写的 profile 也多半是。`classify()` 在只有这一条时，busy 串**不在**屏幕
+    // 上就判 Idle：刚创建、还停在启动画面上的会话，第一个 tick 就是这个读法。
+    //
+    // claude 系已经两条都声明了，走的是「两条都匹不上就不表态」那条路
+    // （见 `classify` 的文档）——所以这个 fixture 现在钉的是**老形状**，
+    // 而老形状还真实存在，那道 `!first_input.is_empty()` 的门就还得留着。
     fn busy_only_agent() -> Profile {
         Profile {
             name: "busy-only".into(),
@@ -2277,9 +2433,8 @@ mod tests {
         }
     }
 
-    /// **钉死这个仓库真正会踩的坑**：所有真实 profile（claude/codex/glm/
-    /// kimi/deepseek/qwen-api）都只声明 `busy_pattern`，没有一个声明
-    /// `idle_pattern`。`classify()` 在只有 busy_pattern 时，busy 串**不在**
+    /// **钉死这个仓库真正会踩的坑**：只声明 `busy_pattern` 的 profile
+    /// （codex，以及用户自己写的）在 `classify()` 里，busy 串**不在**
     /// 屏幕上就判 Idle——刚创建、还停在启动画面上的会话，第一个 tick
     /// 就是这个读法：`was == Working`（创建时因为有 pattern 而置的初始
     /// 状态）→ `next == Idle`（启动画面，还没人跟它说过话）。没有

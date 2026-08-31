@@ -2,10 +2,26 @@ name = "kimi"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
 # 干活时底部一定有「(12s · esc to interrupt)」。
-# 不能拿 `? for shortcuts` 当 idle_pattern：上面这条命令带的
+# 拿不了 `? for shortcuts` 当空闲标记：上面这条命令带的
 # `--dangerously-skip-permissions` 会让底栏常驻「bypass permissions on」，
-# 正好把那行顶掉——profile 会用自己的启动参数保证自己永远判不出空闲。
+# 正好把那行顶掉。**但顶替它的那句本身就是个更好的标记**——见下面
+# `idle_pattern` 那段。
 busy_pattern = "esc to interrupt"
+# 界面还活着的凭据，跟 `busy_pattern` 一起用（见 `session.rs::classify`）。
+# 两个都不在屏幕上 = agent 的界面根本没在画，那时候「不忙」不等于「空闲」。
+#
+# **两条都是实测出来的，不是猜的**（v2.1.251，本机三个真实会话）：
+# - `^❯` 是输入框那一行，干活时和空闲时都在，跟 shift+tab 切到哪个
+#   权限档无关——它是输入框，不是档位提示。
+# - `bypass permissions on` 是底栏那一行。dct 自己用
+#   `--dangerously-skip-permissions` 起 claude，所以这一档是默认档；
+#   上面那条注释把它当成障碍，其实正因为是我们自己的启动参数带出来的，
+#   它反而比 `? for shortcuts` 更靠得住。
+#
+# 写成两条「或」是为了各自兜住对方的失效面：切了权限档，底栏那句会变，
+# 输入框还在；哪天输入框改了样子，底栏那句还在。两条同时失效的话，
+# 判定退回「不表态」——保持原状态，不会退回到谎称空闲。
+idle_pattern = "(?m)^❯|bypass permissions on"
 error_pattern = "API Error|Connection closed mid-response"
 # 恢复守护进程重启前的会话时用：跑的是 claude 二进制，`--continue`
 # 接回这个目录下最近一次对话。
