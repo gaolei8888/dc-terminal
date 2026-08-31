@@ -108,7 +108,20 @@ pub fn checkpoint(dir: &Path, session: u32, seq: usize) -> Result<String> {
         .context("索引路径不是合法 UTF-8")?
         .to_string();
 
-    git_env(dir, &["add", "-A"], &[("GIT_INDEX_FILE", &index)])?;
+    // 上一次 git 被硬杀在 `add` 中途（守护进程被任务管理器结束、机器休眠、
+    // 崩溃）会留下一个 `dct-index-N.lock`，而 git 见到锁就一直失败——**那把
+    // 锁不会自己消失**，于是这个会话从此每一轮都拍不上快照。撞上就清掉重来
+    // 一次。
+    //
+    // 清它是安全的：`dct-index-N` 是 dct 自己的临时索引，只有本会话的检查点
+    // 写它，用户真正的 `.git/index` 从头到尾没被碰过（全程 `GIT_INDEX_FILE`
+    // 指开了）。最坏情况也只是一张快照算错，而快照本来就是可以重拍的东西。
+    if let Err(e) = git_env(dir, &["add", "-A"], &[("GIT_INDEX_FILE", &index)]) {
+        if !clear_index_lock(&index) {
+            return Err(e);
+        }
+        git_env(dir, &["add", "-A"], &[("GIT_INDEX_FILE", &index)])?;
+    }
     let tree = git_env(dir, &["write-tree"], &[("GIT_INDEX_FILE", &index)])?;
 
     let head = git(dir, &["rev-parse", "HEAD"]).ok();
@@ -122,6 +135,14 @@ pub fn checkpoint(dir: &Path, session: u32, seq: usize) -> Result<String> {
     let refname = format!("refs/dct/{session}/{seq}");
     git(dir, &["update-ref", &refname, &commit])?;
     Ok(commit)
+}
+
+/// 把临时索引旁边那把锁删掉。真删掉了才返回 `true`——**没有锁不算删掉**，
+/// 不然 `checkpoint` 会拿「其实是别的原因失败」当成「清完了可以重来」，
+/// 白跑一遍再报同一个错。
+fn clear_index_lock(index: &str) -> bool {
+    let lock = std::path::PathBuf::from(format!("{index}.lock"));
+    lock.exists() && std::fs::remove_file(&lock).is_ok()
 }
 
 /// 恢复到某张快照：工作区内容和暂存区都回到拍照那一刻，
@@ -243,6 +264,32 @@ mod tests {
             "改了\n"
         );
         assert!(repo.path().join("b.txt").exists());
+    }
+
+    /// 上一次 git 被硬杀留下的那把锁，不能让这个会话的快照从此全废。
+    ///
+    /// 现场是「回车按了没反应」那条 bug 的另一半来源：锁不会自己消失，
+    /// 于是这个会话每一轮 `git add -A` 都失败，而快照失败在修好之前
+    /// 会把回车一起吃掉（见 `session::send_input`）。
+    #[test]
+    fn a_leftover_index_lock_does_not_kill_this_sessions_checkpoints() {
+        let repo = init_repo();
+        // 先拍一张，把 dct-index-9 建出来——现场那把锁就是躺在它旁边的。
+        checkpoint(repo.path(), 9, 0).unwrap();
+        let lock = repo.path().join(".git").join("dct-index-9.lock");
+        fs::write(&lock, "上一次 git 被杀在这儿了\n").unwrap();
+
+        fs::write(repo.path().join("a.txt"), "锁着也得拍上\n").unwrap();
+        let snap = checkpoint(repo.path(), 9, 1).expect("撞上残留的锁要能自己缓过来");
+
+        assert!(!lock.exists(), "锁清掉了才算数，不然下一轮还是同一个死结");
+        // 拍到的得是真内容，不是「装作成功」。
+        fs::write(repo.path().join("a.txt"), "又改了\n").unwrap();
+        restore(repo.path(), &snap).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "锁着也得拍上\n"
+        );
     }
 
     #[test]
