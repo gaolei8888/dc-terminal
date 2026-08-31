@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "dct"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "crossterm",
