@@ -233,11 +233,11 @@ impl PtySession {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.parser
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .screen_mut()
-            .set_size(rows, cols);
+        resize_parser(
+            &mut self.parser.lock().unwrap_or_else(|e| e.into_inner()),
+            rows,
+            cols,
+        );
         Ok(())
     }
 
@@ -560,6 +560,68 @@ pub fn encode_mouse(
     }
 }
 
+/// 把解析器的画面改成新尺寸。**变矮的时候先把内容往上顶**，顶到该留的
+/// 最后一行正好落在新画面的底边上，再交给 `set_size`。
+///
+/// 不这么做的话，`set_size` 变矮就是 `rows.resize()`：从**下面**截，截掉的
+/// 行连滚屏历史都不进（vt100 0.16 `grid.rs`）。真终端变矮是把**上面**的行
+/// 推进历史、保住光标那一头——而 agent 的输入框恰恰住在最下面那几行。
+/// 于是每一次「窗口变矮一格」都在悄悄删掉 Claude Code 的输入框，屏幕上
+/// 剩下一片正文、一个字都打不进去，用户还以为是 agent 卡了（这个形状的
+/// 事故已经真的发生过：`dct ps` 里那个会话的最后一行是正文，别的会话是
+/// 「⏵⏵ bypass permissions…」那条状态行）。
+///
+/// 更糟的是它连累了 agent 的下一次重绘：Ink（Claude Code 的渲染层）擦上
+/// 一帧的办法是「按上一帧画了多少行把光标往上抬」，dct 这边已经把那些行
+/// 删了、还顺手把光标夹上去了，这一抬就抬错位置，重画落在别的行上——
+/// 截图里那段重复出现的正文就是这么来的。
+///
+/// 顶多少行由**锚**决定：光标行和最后一个非空行里靠下的那个。真终端只看
+/// 光标，这里多看一眼最后一行内容，因为 agent 藏着光标满屏重绘的时候
+/// （Claude Code 转圈时就是），光标可能正停在画面上方，只看它就又把底下
+/// 的输入框删了。多顶出来的那几行进的是滚屏历史，翻得回来，不会丢。
+///
+/// 备用屏上不顶：那边没有滚屏历史，整屏本来就归 agent 自己重画，顶一下
+/// 只会把它画的东西挪歪。设了滚动区（DECSTBM）的主屏也会被这一顶挪歪，
+/// 但那是全屏 TUI 的做法，而全屏 TUI 都在备用屏上，上面那一条已经把它们
+/// 挡在外面了。
+fn resize_parser(parser: &mut vt100::Parser, rows: u16, cols: u16) {
+    // 先回到底部再量。`contents_between` 读的是**翻到哪儿就算哪儿**的那一屏
+    // （`visible_rows`），而 `set_size` 动的永远是当前这一屏——用户正翻在
+    // 半空中时改尺寸，锚就会量到几十行之前的内容上。调用方（
+    // `SessionManager::resize`）事后也要归零（按新宽度重排之后偏移指的
+    // 已经不是同一行了），这里提前一步，量的和改的才是同一批行。
+    parser.screen_mut().set_scrollback(0);
+    if let Some(k) = rows_to_lift(parser.screen(), rows) {
+        let (cur_row, cur_col) = parser.screen().cursor_position();
+        // `\x1b[{k}S`（SU）只搬内容不动光标，所以光标要自己跟着往上走
+        // 同样的 k 行——不补这一步，`set_size` 只会把它夹到新的底边上，
+        // 而「夹到底边」正好是锚比光标更靠下时的错答案。
+        let row = cur_row.saturating_sub(k) + 1;
+        let col = cur_col + 1;
+        parser.process(format!("\x1b[{k}S\x1b[{row};{col}H").as_bytes());
+    }
+    parser.screen_mut().set_size(rows, cols);
+}
+
+/// 变矮之前要把画面往上顶几行。`None` = 一行都不用顶。
+fn rows_to_lift(screen: &vt100::Screen, new_rows: u16) -> Option<u16> {
+    if screen.alternate_screen() || new_rows == 0 {
+        return None;
+    }
+    let (old_rows, _) = screen.size();
+    if new_rows >= old_rows {
+        return None;
+    }
+    let last_used = (0..old_rows)
+        .rev()
+        .find(|&r| !screen.contents_between(r, 0, r + 1, 0).trim().is_empty());
+    let (cur_row, _) = screen.cursor_position();
+    let anchor = cur_row.max(last_used.unwrap_or(0));
+    let k = anchor.saturating_sub(new_rows - 1);
+    (k > 0).then_some(k)
+}
+
 /// vt100 不公开「现在攒了多少行历史」。但 `set_scrollback` 内部会
 /// `.min(scrollback.len())` 钳一次，所以设一个大得离谱的值再读回来，
 /// 读到的就是真实上限。三次字段写，不分配不拷贝。
@@ -604,6 +666,123 @@ mod tests {
             sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    /// 造一块画满 `rows` 行的画面：第 r 行写 `line{r}`，光标停在最后一行。
+    /// 这正是 agent 闲着的样子——最后那几行是它的输入框。
+    fn filled(rows: u16, cols: u16) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
+        let mut s = String::new();
+        for r in 0..rows {
+            if r > 0 {
+                s.push_str("\r\n");
+            }
+            s.push_str(&format!("line{r}"));
+        }
+        p.process(s.as_bytes());
+        p
+    }
+
+    /// 变矮不许吃掉画面底下那几行——agent 的输入框就在那儿。改动前
+    /// `set_size` 直接从下面截，line8/line9 连滚屏历史都进不去，用户看到
+    /// 的是一屏正文加一个打不进字的会话。
+    #[test]
+    fn shrinking_keeps_the_bottom_of_the_screen_where_the_input_box_lives() {
+        let mut p = filled(10, 20);
+
+        resize_parser(&mut p, 8, 20);
+
+        let seen = p.screen().contents();
+        assert!(
+            seen.contains("line9") && seen.contains("line8"),
+            "底下两行被吃掉了：\n{seen}"
+        );
+        assert!(!seen.contains("line0"), "顶上那两行该进历史了：\n{seen}");
+        assert_eq!(p.screen().size(), (8, 20));
+    }
+
+    /// 顶上去的行进的是滚屏历史，翻得回来——不是被删掉。
+    #[test]
+    fn the_rows_lifted_off_the_top_go_into_the_scrollback() {
+        let mut p = filled(10, 20);
+
+        resize_parser(&mut p, 8, 20);
+        p.screen_mut().set_scrollback(2);
+
+        assert!(
+            p.screen().contents().contains("line0"),
+            "翻回去应该还看得见 line0"
+        );
+    }
+
+    /// 光标要跟着内容一起往上走。它是 agent「我打的字落在哪」的唯一坐标，
+    /// 也是 Ink 擦上一帧的参照点——错一行，下一次重绘就画在别的行上。
+    #[test]
+    fn the_cursor_rides_along_with_the_content_it_was_sitting_on() {
+        let mut p = filled(10, 20);
+        assert_eq!(p.screen().cursor_position().0, 9);
+
+        resize_parser(&mut p, 8, 20);
+
+        let (row, _) = p.screen().cursor_position();
+        assert_eq!(row, 7, "光标该停在新画面的底边上，也就是它原来那一行");
+        assert!(
+            p.screen()
+                .contents_between(row, 0, row + 1, 0)
+                .contains("line9"),
+            "光标底下该还是它原来坐着的那一行"
+        );
+    }
+
+    /// agent 转圈的时候光标常常停在画面上方（Claude Code 藏起光标满屏
+    /// 重绘就是这样）。只看光标的话，底下那几行照样被截掉——所以锚要取
+    /// 「光标行」和「最后一个非空行」里靠下的那个。
+    #[test]
+    fn a_cursor_parked_up_top_does_not_license_eating_the_rows_below_it() {
+        let mut p = filled(10, 20);
+        p.process(b"\x1b[1;1H"); // 光标回到第一行，内容不动
+
+        resize_parser(&mut p, 8, 20);
+
+        let seen = p.screen().contents();
+        assert!(seen.contains("line9"), "底下那行还是被吃了：\n{seen}");
+    }
+
+    /// 备用屏上不顶：那边没有滚屏历史，整屏归 agent 自己重画。
+    #[test]
+    fn the_alternate_screen_is_left_alone() {
+        let mut p = vt100::Parser::new(10, 20, SCROLLBACK_ROWS);
+        p.process(b"\x1b[?1049h");
+        assert!(p.screen().alternate_screen());
+
+        assert_eq!(rows_to_lift(p.screen(), 8), None);
+    }
+
+    /// 变高、尺寸没变、以及底下本来就空着的时候，一行都不用顶。
+    #[test]
+    fn nothing_is_lifted_when_there_is_nothing_to_save() {
+        let p = filled(10, 20);
+        assert_eq!(rows_to_lift(p.screen(), 12), None, "变高不用顶");
+        assert_eq!(rows_to_lift(p.screen(), 10), None, "尺寸没变不用顶");
+
+        let mut empty = vt100::Parser::new(10, 20, SCROLLBACK_ROWS);
+        empty.process(b"line0");
+        assert_eq!(rows_to_lift(empty.screen(), 8), None, "底下空着不用顶");
+    }
+
+    /// 用户翻在半空中的时候改尺寸，锚必须量当前这一屏——`contents_between`
+    /// 读的是翻到哪儿算哪儿，不先归零就会照着几十行之前的内容算。
+    #[test]
+    fn a_scrolled_back_view_does_not_fool_the_anchor() {
+        let mut p = filled(10, 20);
+        p.process(b"\r\nline10\r\nline11");
+        p.screen_mut().set_scrollback(5);
+
+        resize_parser(&mut p, 8, 20);
+
+        let seen = p.screen().contents();
+        assert_eq!(p.screen().scrollback(), 0, "改完尺寸应该回到底部");
+        assert!(seen.contains("line11"), "最后一行被吃掉了：\n{seen}");
     }
 
     #[test]

@@ -2331,8 +2331,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 也别把这行空白改成「色条高两行、文字居中」：那样色条会占掉两行的
     // 底色面积，比现在更抢眼，而多出来的面积一个字都不承载。
     let bar_chrome = if bar_style(app.bar).is_some() { 1 } else { 2 };
-    let bar_h = ((help_lines.len() as u16).max(1) + bar_chrome).min((f.area().height / 3).max(3));
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(bar_h)]).split(f.area());
+    let bar_of = |lines: u16| {
+        let h = (lines.max(1) + bar_chrome).min((f.area().height / 3).max(3));
+        Layout::vertical([Constraint::Min(3), Constraint::Length(h)]).split(f.area())
+    };
+    let chunks = bar_of(help_lines.len() as u16);
+
+    // **会话画面的高度不跟着底栏的行数走。** 底栏是按文案真正折出几行算高的
+    // （见上面那段），于是一句折成两行的消息会把会话内容区挤矮一行——而
+    // 内容区的高度就是 dct 发给 agent 的 `Resize`（见 `run()` 里那段）。
+    // 一条转瞬即逝的提示因此变成「窗口矮一行、消息过期又高回来」两次真的
+    // 改尺寸：agent 每次都要整屏重绘一遍，屏幕上看得见跳动，而 Claude Code
+    // 那种按上一帧行数往上抬光标的渲染器，抬错一次就把输入框画到别处去。
+    //
+    // 所以这一档消息**盖**在会话画面上，不去改它的尺寸：底栏长高的那一两行
+    // 暂时遮住 agent 画面的最后一两行，消息一过就露出来。遮住是可逆的，
+    // 改尺寸不是。只有会话视图这么办——别的视图里内容是 dct 自己画的，
+    // 挤矮一行没有任何代价。
+    let attached = bar_of(1)[0];
 
     // 穷尽匹配而不是 if/else 链：少一个 View 变体的分支，if/else 链的兜底
     // `else` 会悄悄把新变体也归给 secret::draw，画出一片空白也照样编译通过；
@@ -2342,7 +2358,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 等函数，`match &app.view` 留着的借用会跟这些调用打架。
     match app.view.clone() {
         View::Board => board::draw(f, chunks[0], app),
-        View::Attached(_) => attach::draw(f, chunks[0], app),
+        View::Attached(_) => attach::draw(f, attached, app),
         View::Grid { .. } => grid::draw(f, chunks[0], app),
         View::PickProfile { .. } => pick::draw(f, chunks[0], app),
         // 选项目是**浮层**：先照常画用户的家视图，再在中间盖一层。
@@ -2382,6 +2398,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     // 要的是「我在哪」和「这里能干什么」挨在一起读。项目现在是框内的中段。
     // 实色档：整条底栏铺一层背景，不画边框。铺的是 `chunks[1]` 整块而不是
     // 逐段刷——三段之间的间隔列也得有底色，否则色条会被切成三截。
+    // 底栏这一块先擦干净再画。平时是空操作（每帧的缓冲本来就是干净的），
+    // 只有会话视图里底栏比常态高的那几帧不是——那时候它盖着 agent 画面的
+    // 最后一两行（见上面 `attached` 那段），不擦就是两层字叠在一起。
+    f.render_widget(ratatui::widgets::Clear, chunks[1]);
     let inner = match bar_style(app.bar) {
         Some(bar) => {
             // 上面那一行留白，色条铺在剩下的部分。留白**不铺底色**——它要的
@@ -4408,6 +4428,38 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let c = text_of(&term);
         assert!(c.contains("n新建"), "看板要显示自己的按键表：{c}");
+    }
+
+    /// 一句长消息可以**盖**住会话画面的最后一行，但绝不许把它挤矮：
+    /// 内容区的高度就是 dct 发给 agent 的尺寸，一条转瞬即逝的提示不该
+    /// 变成两次真的 resize（agent 每次都整屏重绘，Claude Code 那种按上
+    /// 一帧行数抬光标的渲染器抬错一次就把输入框画丢，见 `pty::resize_parser`）。
+    #[test]
+    fn a_long_message_covers_the_agent_screen_instead_of_shrinking_it() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let quiet = app.screen_area.expect("画过一帧就该记下尺寸");
+
+        // 60 列的窗口里底栏右段只有 28 列（`bar_widths`），而 `wrap_help`
+        // 是按**两个空格**断词的，所以这句话得这么造：折三行左右，够让
+        // 底栏长高，又不到「三分之一屏」那个上限被截掉。
+        app.message = format!("{}END", "xxxxxx  ".repeat(8)).into();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        assert_eq!(
+            app.screen_area,
+            Some(quiet),
+            "消息只该盖住画面，不该改 agent 的尺寸"
+        );
+        // 消息真的折了好几行才算数：底栏还是一行的话，这条测试什么都没测到。
+        assert!(
+            buffer_text(term.backend().buffer()).contains("END"),
+            "长消息该整句显示出来（底栏为它长高了），否则这条断言是空的"
+        );
     }
 
     #[test]
