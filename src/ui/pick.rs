@@ -11,7 +11,7 @@ use crate::proto::{Request, Response, SecretPrompt};
 
 use super::app::App;
 use super::view::{
-    digit_index, expand_path, pick_action, Pane, PickAction, ProjectPicker, SecretPhase, View,
+    digit_index, expand_path, pick_action, PickAction, PickRow, ProjectPicker, SecretPhase, View,
 };
 use super::widgets::{pad_to, short_path, truncate, Msg};
 use super::{accent, danger, dim, move_sel_n};
@@ -302,6 +302,14 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                             // 红边框和 `g` 那条出路在说（见 `handle_pick_profile`），
                             // 在这里把用户按回输入框只会让他重打一遍名字，
                             // 而重打解决不了「机器上没装 git」。
+                            //
+                            // 动手之前先把自带的运行时挂一遍 PATH，理由跟
+                            // `prepare_repo` 那条一模一样：`dct install git`
+                            // 装的 git 在**另一个进程**的 PATH 上，界面这个
+                            // 进程不挂一遍就还是找不到它。挂了才问，顺序不能反。
+                            crate::runtime::activate(&crate::runtime::runtime_dir_for_socket(
+                                &app.socket,
+                            ));
                             if let Err(e) = crate::git::init(&dir) {
                                 app.message =
                                     Msg::err(msg::git_init_failed(app.lang, &e.to_string()));
@@ -376,102 +384,112 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    let rows = p.rows();
     match key.code {
+        // ——Esc 是一级一级退的梯子，不是一步关掉整屏——
+        //
+        // 上一版无论屏幕上是什么状态，Esc 都直接离开选择器。那对**打岔了**
+        // 的用户是最坏的一种：他打了两个字母没找到东西，想把那两个字母去掉
+        // 重来，而搜索词那时候还是看不见的——他唯一想得到的键（Esc）把他整个
+        // 弹出了这一屏。梯子的每一级都对应屏幕上真的有的一样东西：先是搜索词，
+        // 再是「正翻着文件夹」这一层，最后才是这一屏本身。底栏左段跟着一级
+        // 一级换文案（见 `view::escape_hint`）。
         KeyCode::Esc => {
-            app.view = super::home_view(app);
-            return Ok(());
-        }
-        KeyCode::Tab | KeyCode::BackTab => {
-            p.focus = match p.focus {
-                Pane::Recent => Pane::Browse,
-                Pane::Browse => Pane::Recent,
-            };
-            // 过滤词是对着上一栏打的，换了焦点就不成立了
-            p.filter.clear();
+            if !p.filter.is_empty() {
+                p.filter.clear();
+                reset_cursor(&mut p);
+            } else if p.browsing {
+                p.back_to_recent();
+            } else {
+                app.view = super::home_view(app);
+                return Ok(());
+            }
         }
         KeyCode::Down | KeyCode::Up => {
             let d = if key.code == KeyCode::Down { 1 } else { -1 };
-            match p.focus {
-                // +1 是末行那个「手输路径…」，它不参与过滤，永远在
-                // +2 是末尾那两行「手输路径…」「新建项目…」，它们不参与
-                // 过滤，永远在。
-                Pane::Recent => {
-                    let n = p.shown_recent().len() + 2;
-                    move_sel_n(&mut p.recent_state, n, d);
-                }
-                Pane::Browse => {
-                    let n = p.shown_entries().len();
-                    move_sel_n(&mut p.browse_state, n, d);
+            move_sel_n(&mut p.state, rows.len(), d);
+        }
+        // 十几二十个最近项目一行一行按到底是个体力活，而这一屏正是
+        // 「项目多了才需要」的那一屏。
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let d = if key.code == KeyCode::PageDown {
+                10
+            } else {
+                -10
+            };
+            move_sel_n(&mut p.state, rows.len(), d);
+        }
+        KeyCode::Home => move_sel_n(&mut p.state, rows.len(), -(rows.len() as i32)),
+        KeyCode::End => move_sel_n(&mut p.state, rows.len(), rows.len() as i32),
+        // `←` 也是那把梯子的一级：先退目录，退到头（没有上一级了）就退回
+        // 最近那一层。走到根目录之后原地不动是上一版的行为，而那时候屏幕上
+        // 唯一还能按的方向键就成了个死键。
+        KeyCode::Left => {
+            if p.browsing {
+                match p.cwd.parent().map(|x| x.to_path_buf()) {
+                    Some(parent) => p.browse_to(parent),
+                    None => p.back_to_recent(),
                 }
             }
         }
-        // `→` 是「往里走」：在浏览栏进子目录，在最近栏把浏览器切到那个项目
-        // 所在的位置——用户想从一个熟悉的项目附近开始找，这是最短的一步。
-        KeyCode::Right => match p.focus {
-            Pane::Browse => {
-                let shown = p.shown_entries();
-                if let Some(row) = p.browse_state.selected().and_then(|i| shown.get(i)) {
-                    let next = p.cwd.join(&row.name);
+        // `Enter` 和 `→` 落在同一个地方：这一屏上「往里走」和「就是它」
+        // 从来都由**光标脚下那一行是什么**决定，不由按的是哪个键决定。
+        // 上一版两个键在两栏里各有各的含义（左栏 Enter 是打开、右栏 Enter
+        // 是选定、右栏 → 才是进入），四种组合要背——而「在文件夹上按 Enter
+        // 会进去」是所有人从文件管理器带过来的反射，上一版里那一下会直接
+        // 把他送进选 agent 那一屏。
+        KeyCode::Enter | KeyCode::Right => {
+            let Some(row) = rows.get(p.cursor()).cloned() else {
+                app.view = View::PickProject(p);
+                return Ok(());
+            };
+            match row {
+                // `→` 在最近项目上是「从这个项目边上开始翻」——用户要找的
+                // 新项目十有八九跟他熟悉的那个是邻居。
+                PickRow::Recent(path) if key.code == KeyCode::Right => {
+                    p.browse_to(PathBuf::from(path));
+                }
+                PickRow::Recent(path) => {
+                    let dir = PathBuf::from(&path);
+                    if dir.is_dir() {
+                        super::pin_project(app, dir);
+                        return Ok(());
+                    }
+                    // 列表里那条不删——可能只是外置盘没挂
+                    app.message = Msg::err(msg::cannot_find_anymore(
+                        app.lang,
+                        &short_path(&dir.display().to_string()),
+                    ));
+                }
+                PickRow::UseThis => {
+                    let dir = p.cwd.clone();
+                    if dir.is_dir() {
+                        super::pin_project(app, dir);
+                        return Ok(());
+                    }
+                    app.message = Msg::err(msg::cannot_find_anymore(
+                        app.lang,
+                        &short_path(&p.cwd.display().to_string()),
+                    ));
+                }
+                // **打开目录用 `row.name` 原始值**：`truncate` 只清洗显示，
+                // 名字里那些看不见的字节是路径的一部分，拿清洗过的名字去
+                // 拼路径会指到一个不存在的目录上。
+                PickRow::Dir(r) => {
+                    let next = p.cwd.join(&r.name);
                     p.browse_to(next);
                 }
-            }
-            Pane::Recent => {
-                let shown = p.shown_recent();
-                if let Some(dir) = p.recent_state.selected().and_then(|i| shown.get(i)) {
-                    p.browse_to(PathBuf::from(dir));
-                    p.focus = Pane::Browse;
+                PickRow::Browse => {
+                    let here = p.cwd.clone();
+                    p.browse_to(here);
                 }
-            }
-        },
-        KeyCode::Left => {
-            if p.focus == Pane::Browse {
-                // 已经在根目录时 parent() 是 None——原地不动，不 panic
-                if let Some(parent) = p.cwd.parent().map(|x| x.to_path_buf()) {
-                    p.browse_to(parent);
+                // 名字预填成搜索词：搜不到正是最该新建的时候，而他要的名字
+                // 就是刚打的那个词，不该让他再打一遍。
+                PickRow::New => {
+                    p.naming = Some(p.filter.trim().to_string());
+                    p.filter.clear();
                 }
-            }
-        }
-        KeyCode::Enter => {
-            let chosen: Option<PathBuf> = match p.focus {
-                Pane::Recent => {
-                    let shown = p.shown_recent();
-                    let i = p.recent_state.selected().unwrap_or(0);
-                    match shown.get(i) {
-                        Some(dir) => Some(PathBuf::from(dir)),
-                        // 过了最后一条数据之后是两个动作行：先「手输路径…」，
-                        // 再「新建项目…」。顺序跟画出来的一致，靠的是同一个
-                        // `shown_recent().len()` 做基准。
-                        None => {
-                            if i == shown.len() {
-                                p.typing_path = Some(String::new());
-                            } else {
-                                p.naming = Some(String::new());
-                            }
-                            None
-                        }
-                    }
-                }
-                // 浏览栏的 Enter 是**选定**，不是进入。走到一个目录上多半是
-                // 因为它就是要找的项目；想再往下钻有 `→`，那是个方向键，
-                // 语义天然就是「往里走」。
-                Pane::Browse => {
-                    let shown = p.shown_entries();
-                    p.browse_state
-                        .selected()
-                        .and_then(|i| shown.get(i))
-                        .map(|row| p.cwd.join(&row.name))
-                }
-            };
-            if let Some(dir) = chosen {
-                if dir.is_dir() {
-                    super::pin_project(app, dir);
-                    return Ok(());
-                }
-                // 列表里那条不删——可能只是外置盘没挂
-                app.message = Msg::err(msg::cannot_find_anymore(
-                    app.lang,
-                    &short_path(&dir.display().to_string()),
-                ));
+                PickRow::TypePath => p.typing_path = Some(String::new()),
             }
         }
         KeyCode::Backspace => {
@@ -488,7 +506,6 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// 过滤变了就把光标收回第一行，否则它会停在一个已经被过滤掉的行号上。
 /// 新建项目时，名字有什么毛病。**分开三种**：三句话不一样，而一句
 /// 「名字不合法」等于让用户自己猜是哪儿不对。
 #[derive(Debug, PartialEq, Eq)]
@@ -523,15 +540,27 @@ pub(crate) fn new_project_path(parent: &Path, name: &str) -> Result<PathBuf, Nam
     Ok(dir)
 }
 
+/// 搜索词变了就把光标收回去，否则它会停在一个已经被滤掉的行号上。
+///
+/// 落点不是死板的第 0 行：搜出来一片空的时候收到「新建项目…」那一行上。
+/// **搜不到正是最该新建的时候**，而那一行这时候写的正是他刚打的那个名字
+/// （见 `msg::new_project_named`）——光标停在那儿，Enter 一下就是他要的
+/// 下一步，不用再往下按三次。
 fn reset_cursor(p: &mut ProjectPicker) {
-    match p.focus {
-        Pane::Recent => p.recent_state.select(Some(0)),
-        Pane::Browse => p.browse_state.select(if p.shown_entries().is_empty() {
-            None
-        } else {
-            Some(0)
-        }),
-    }
+    let rows = p.rows();
+    let landing = if rows.top.is_empty() && rows.list.is_empty() && !p.filter.is_empty() {
+        rows.top.len()
+            + rows.list.len()
+            + rows
+                .bottom
+                .iter()
+                .position(|r| matches!(r, PickRow::New))
+                .unwrap_or(0)
+    } else {
+        0
+    };
+    p.state.select(Some(landing));
+    p.offset = 0;
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
@@ -645,14 +674,15 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::PickProject(p) = &app.view else {
-        return;
-    };
     let lang = app.lang;
-    let border_style = if app.connected {
-        Style::default()
-    } else {
-        danger()
+    // 断连时用红色边框给出明确的视觉提示：界面上的数据是上一次成功请求
+    // 留下的陈旧快照，不代表守护进程现在的真实状态。
+    // 断连时整块细线变红：界面上的数据是上一次成功请求留下的陈旧快照，
+    // 不代表守护进程现在的真实状态。连着的时候用强调色——这一屏只剩一条线了，
+    // 它同时也是「表头到此为止」那道界线。
+    let border_style = if app.connected { accent() } else { danger() };
+    let View::PickProject(p) = &mut app.view else {
+        return;
     };
 
     // 新建态跟手输态一样占满整层：这时候屏幕上只有一件事在发生。
@@ -664,138 +694,217 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // 手输态占满整层，不分栏：这时候屏幕上只有一件事在发生。
+    // 手输态占满整层：这时候屏幕上只有一件事在发生。
     if let Some(buf) = &p.typing_path {
         let body = super::widgets::header(f, area, text(Key::TypePathTitle, lang), border_style);
         f.render_widget(Paragraph::new(format!("{buf}▌")), body);
         return;
     }
 
-    // 左边窄一点：最近项目只有名字和路径，而右边要放得下目录名加 git 标记。
-    // 两栏之间留一个空档。**不留的话两条细线会接成一整条**，看上去是一条
-    // 横贯全屏的线，而不是两块各自的表头——分栏这件事就在视觉上消失了。
-    let cols = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .spacing(2)
-        .split(area)
-        .to_vec();
+    let rows = p.rows();
+    let cursor = p.cursor();
+    // 先把画行要用的几样东西抄出来：底下要把算好的滚动偏移写回 `p`，
+    // 而借着 `p` 的闭包活到那一步就会跟那次写入撞上。
+    let cwd = p.cwd.clone();
+    let filter = p.filter.clone();
+    let browsing = p.browsing;
 
-    // ——左：最近——
-    let shown = p.shown_recent();
-    let mut items: Vec<ListItem> = shown
-        .iter()
-        .map(|path| {
-            let short = short_path(path);
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| short.clone());
-            ListItem::new(Line::from(vec![
-                Span::raw(pad_to(&truncate(&name, 18), 18)),
-                Span::styled(truncate(&short, 22), dim()),
-            ]))
-        })
-        .collect();
-    // 两个动作行不参与过滤，永远在最后：先「手输路径…」，再「新建项目…」。
-    // 顺序跟 `handle_pick_project` 里那个 `i == shown.len()` 的判断绑在一起，
-    // 改这里就要改那里。
-    items.push(ListItem::new(Line::from(Span::styled(
-        text(Key::ManualPath, lang),
-        accent(),
-    ))));
-    items.push(ListItem::new(Line::from(Span::styled(
-        text(Key::NewProject, lang),
-        accent(),
-    ))));
-    let left = super::widgets::header(
-        f,
-        cols[0],
-        text(Key::RecentProjects, lang),
-        rule_style(p.focus == Pane::Recent, border_style),
-    );
-    f.render_stateful_widget(
-        List::new(items)
-            // **只有有焦点的那一栏画光标。** 两栏都画的话，屏幕上同时
-            // 有两个长得一模一样的 `▶`，而按 Tab 之后唯一变的东西是边框
-            // 颜色——那一档差别在不少主题下几乎看不出来。用户于是既看不出
-            // 焦点在哪，也看不出 Tab 有没有生效，方向键动的那一栏跟他盯着
-            // 的那个光标对不上。空字符串留两格，是为了让列表本身的缩进
-            // 在两种状态下一样宽，不然切焦点时整栏文字会横跳一下。
-            .highlight_symbol(if p.focus == Pane::Recent {
-                "▶ "
-            } else {
-                "  "
-            }),
-        left,
-        &mut p.recent_state.clone(),
-    );
+    // ——表头：这一层是什么 + 搜索框——
+    //
+    // 标题跟着层走：最近那一层写「最近的项目」，翻文件夹那一层写正翻着的
+    // 路径。上一版两栏各有各的表头，用户得先弄清自己在哪一栏，才知道哪个
+    // 标题跟自己有关；一层只有一个标题就没有这一步。
+    let title = if browsing {
+        short_path(&cwd.display().to_string())
+    } else {
+        text(Key::RecentProjects, lang).to_string()
+    };
+    let body =
+        super::widgets::header_with(f, area, &title, search_box(&filter, lang), border_style);
 
-    // ——右：浏览——
-    let rows = p.shown_entries();
-    let right = super::widgets::header(
-        f,
-        cols[1],
-        &short_path(&p.cwd.display().to_string()),
-        rule_style(p.focus == Pane::Browse, border_style),
-    );
-    if rows.is_empty() {
-        // 空目录和读不了的目录落在同一句话上：对用户来说这两种情况
-        // 能做的事完全一样（← 回上一级，或者去别处找）。
+    // ——三段：钉住的上段 / 会滚的中段 / 空一行 / 钉住的下段——
+    //
+    // 空一行而不是画一条分隔线：动作行本来就用强调色跟数据分开了，
+    // 再加一条线就是这一屏第三条横线（见 `widgets::header` 那段
+    // 「屏幕上少一半的线」）。
+    let gap = u16::from(!rows.bottom.is_empty());
+    let cols = Layout::vertical([
+        Constraint::Length(rows.top.len() as u16),
+        Constraint::Min(1),
+        Constraint::Length(gap),
+        Constraint::Length(rows.bottom.len() as u16),
+    ])
+    .split(body)
+    .to_vec();
+
+    // 钉住的两段没有滚动，光标落在里面时按段内下标高亮。
+    let pinned = |f: &mut Frame, area: Rect, seg: &[PickRow], base: usize| {
+        if seg.is_empty() {
+            return;
+        }
+        let items: Vec<ListItem> = seg
+            .iter()
+            .map(|r| row_item(r, &cwd, &filter, lang, row_cols(area)))
+            .collect();
+        let mut st = ratatui::widgets::ListState::default();
+        if cursor >= base && cursor < base + seg.len() {
+            st.select(Some(cursor - base));
+        }
+        f.render_stateful_widget(cursor_list(items), area, &mut st);
+    };
+    pinned(f, cols[0], &rows.top, 0);
+    pinned(f, cols[3], &rows.bottom, rows.top.len() + rows.list.len());
+
+    // ——会滚的中段——
+    if rows.list.is_empty() {
+        // 空手而归的两种情况说的是两句不同的话：翻文件夹翻到一个没有子目录
+        // 的地方（← 回上一级），和搜索词一个项目都没对上（底下钉着的三行
+        // 就是出路）。合成一句「没有内容」等于把用户的下一步也一起抹掉。
+        let word = if browsing {
+            text(Key::NoSubfolders, lang)
+        } else {
+            text(Key::NoMatchingProject, lang)
+        };
         f.render_widget(
-            Paragraph::new(text(Key::NoSubfolders, lang)).centered(),
-            right,
+            Paragraph::new(Line::from(Span::styled(word, dim()))).centered(),
+            cols[1],
         );
     } else {
         let items: Vec<ListItem> = rows
+            .list
             .iter()
-            .map(|r| {
-                let mark = if r.is_git { " ●" } else { "  " };
-                let mut spans = vec![
-                    Span::raw(truncate(&r.name, 30)),
-                    // git 仓库的标记压暗：它是辅助信息，不该比目录名还抢眼
-                    Span::styled(mark, dim()),
-                ];
-                // POSIX 目录名里只有 `/` 和 NUL 不合法——转义序列这类看不见
-                // 的字节完全合法，而 `truncate` 已经把它们从上面那个 span
-                // 的显示里滤掉了。不在这里补一句，这种名字选中前跟一个正常
-                // 目录长得一模一样，用户没有任何办法在选之前发现不对劲。
-                // **打开目录仍然用 `row.name` 原始值**（见 `handle_pick_project`
-                // 里的 `p.cwd.join(&row.name)`）——这一句只负责让异常在选择
-                // 的那一刻被看见，绝不能反过来去动打开逻辑。
-                if r.name.chars().any(|c| c.is_control()) {
-                    spans.push(Span::styled(
-                        format!(" {}", text(Key::HiddenCharsInName, lang)),
-                        dim(),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
+            .map(|r| row_item(r, &cwd, &filter, lang, row_cols(cols[1])))
             .collect();
-        f.render_stateful_widget(
-            List::new(items)
-                // 同左栏：焦点不在这儿就不画光标，见那边的注释。
-                .highlight_symbol(if p.focus == Pane::Browse {
-                    "▶ "
-                } else {
-                    "  "
-                }),
-            right,
-            &mut p.browse_state.clone(),
+        let mut st = p.state.clone();
+        st.select(
+            (cursor >= rows.top.len() && cursor < rows.top.len() + rows.list.len())
+                .then(|| cursor - rows.top.len()),
         );
+        // 偏移自己存（见 `ProjectPicker::offset`）：每帧从 0 重算的话，
+        // 光标一旦滚下去，整块列表会在每次上下移动时跳一下。
+        *st.offset_mut() = p.offset;
+        f.render_stateful_widget(cursor_list(items), cols[1], &mut st);
+        p.offset = st.offset();
     }
 }
 
-/// 有焦点那一栏的边框加亮。两栏并排时，用户必须一眼看出打字会落在哪一边——
-/// 看不出来的话，他打的字会在他以为的另一栏里过滤，而那一栏毫无反应。
-/// 有焦点那一栏的细线用强调色，另一栏压暗。
+/// 一段列表，光标那一行前面画 `▶`。
 ///
-/// 只剩这一条线要上色了——上下两条横线夹着标题的画法换成了「标题一行、
-/// 底下一条细线」（`widgets::header`），屏幕上的线少了一半。
-fn rule_style(focused: bool, base: Style) -> Style {
-    if focused {
-        accent()
-    } else {
-        base.patch(dim())
+/// **`HighlightSpacing::Always` 不能省。** 默认是「选中了才留位子」，而这一
+/// 屏的光标会离开某一段（跑到钉住的动作行上去）——那一刻那一段整块往左跳
+/// 两列，三段之间的对齐也就散了。位子永远留着，跳的只有 `▶` 自己。
+fn cursor_list<'a>(items: Vec<ListItem<'a>>) -> List<'a> {
+    List::new(items)
+        .highlight_symbol("▶ ")
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+}
+
+/// 表头右端那个搜索框。空着的时候写一句压暗的占位话——**这一屏唯一告诉
+/// 用户「可以打字」的地方**，而且它跟回显是同一个框：他打下去的字就出现在
+/// 刚才写着「打字搜索」的地方，两件事对得上。
+fn search_box(filter: &str, lang: crate::i18n::Lang) -> Line<'static> {
+    if filter.is_empty() {
+        return Line::from(Span::styled(
+            format!("{} ", text(Key::SearchPlaceholder, lang)),
+            dim(),
+        ));
     }
+    Line::from(vec![
+        Span::raw(filter.to_string()),
+        Span::styled("▌ ", accent()),
+    ])
+}
+
+/// 一行里真正能写字的宽度：`List` 给 `highlight_symbol("▶ ")` 在**每一行**
+/// 都留了两列（`HighlightSpacing::Always`），那两列不归内容。
+fn row_cols(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+/// 一行画成什么样。**画和按键共用 `PickRow`**，所以这里不需要知道自己
+/// 画的是第几行——上一版那句「改这里就要改那里」的注释没有了。
+fn row_item<'a>(
+    row: &PickRow,
+    cwd: &Path,
+    filter: &str,
+    lang: crate::i18n::Lang,
+    width: usize,
+) -> ListItem<'a> {
+    match row {
+        PickRow::Recent(path) => {
+            let short = short_path(path);
+            let name = Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| short.clone());
+            // 路径**从左边省略**：一屏项目常常全在同一个上级目录底下，
+            // 从右边裁留下的是十几行一模一样的开头（见 `widgets::path_tail`）。
+            let parent = Path::new(&short)
+                .parent()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // 名字列按实际宽度分，不写死：浮层宽度跟着终端走，写死的话窄
+            // 终端上路径会被挤成一个 `…`，宽终端上名字和路径中间空一大片。
+            let name_cols = (width * 2 / 5).clamp(8, 32);
+            let path_cols = width.saturating_sub(name_cols + 1);
+            ListItem::new(Line::from(vec![
+                Span::raw(pad_to(&truncate(&name, name_cols), name_cols)),
+                Span::styled(super::widgets::path_tail(&parent, path_cols), dim()),
+            ]))
+        }
+        PickRow::Dir(r) => {
+            let mut spans = vec![
+                // 目录行没有第二列，整行都归名字——减 2 是后面那个 git 标记。
+                Span::raw(truncate(&r.name, width.saturating_sub(2))),
+                // git 仓库的标记压暗：它是辅助信息，不该比目录名还抢眼
+                Span::styled(if r.is_git { " ●" } else { "  " }, dim()),
+            ];
+            // POSIX 目录名里只有 `/` 和 NUL 不合法——转义序列这类看不见
+            // 的字节完全合法，而 `truncate` 已经把它们从上面那个 span
+            // 的显示里滤掉了。不在这里补一句，这种名字选中前跟一个正常
+            // 目录长得一模一样，用户没有任何办法在选之前发现不对劲。
+            // **打开目录仍然用原始名**（见 `handle_pick_project` 里的
+            // `p.cwd.join(&r.name)`）——这一句只负责让异常在选择的那一刻
+            // 被看见，绝不能反过来去动打开逻辑。
+            if r.name.chars().any(|c| c.is_control()) {
+                spans.push(Span::styled(
+                    format!(" {}", text(Key::HiddenCharsInName, lang)),
+                    dim(),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        }
+        // 「就用这个文件夹」把目录名再说一遍：翻了几层之后，屏幕上离这一行
+        // 最近的路径在表头上，而用户按下去的后果是整个项目切过去。
+        PickRow::UseThis => {
+            let name = cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.display().to_string());
+            ListItem::new(Line::from(Span::styled(
+                format!(
+                    "{} · {}",
+                    text(Key::UseThisFolder, lang),
+                    truncate(&name, 24)
+                ),
+                accent(),
+            )))
+        }
+        PickRow::Browse => action_item(text(Key::BrowseFolders, lang).to_string()),
+        // 打了搜索词就把它写进这一行：「新建项目「dc-te」…」比一句泛泛的
+        // 「新建项目…」多说了一件用户此刻正想着的事——见 `msg::new_project_named`。
+        PickRow::New => action_item(match filter.trim() {
+            "" => text(Key::NewProject, lang).to_string(),
+            q => msg::new_project_named(lang, q),
+        }),
+        PickRow::TypePath => action_item(text(Key::ManualPath, lang).to_string()),
+    }
+}
+
+/// 动作行统一用强调色：它们是**动作**不是数据，混在一片项目名里读起来
+/// 就是又几个项目。
+fn action_item<'a>(label: String) -> ListItem<'a> {
+    ListItem::new(Line::from(Span::styled(label, accent())))
 }
 
 #[cfg(test)]
@@ -1017,7 +1126,7 @@ mod tests {
     }
 
     /// 新建输入态整层只画一件事，而且标题必须**把目录说出来**——「叫什么
-    /// 名字」少了「建在哪儿」，用户没法确认自己是不是先把浏览栏挪对了。
+    /// 名字」少了「建在哪儿」，用户没法确认自己是不是先翻到了对的地方。
     #[test]
     fn the_naming_prompt_names_the_directory_it_will_build_in() {
         let (_t, _g, mut app, root) = tree(&["outer"]);
@@ -1039,8 +1148,8 @@ mod tests {
         assert!(screen.contains("abc"), "打进去的名字没上屏：\n{screen}");
     }
 
-    /// 「新建项目…」那一行永远在左栏末尾，**过滤也删不掉它**——它是个
-    /// 动作，不是一条数据。过滤词把它滤没了的话，用户越是找不到项目
+    /// 「新建项目…」那一行永远钉在列表底下，**搜索也删不掉它**——它是个
+    /// 动作，不是一条数据。搜索词把它滤没了的话，用户越是找不到项目
     /// （正是最该新建的时候），这个入口越是不见。
     #[test]
     fn the_new_project_row_is_always_there() {
@@ -1057,13 +1166,15 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
 
-        let label: String = text(Key::NewProject, app.lang)
+        // 搜索词非空时这一行写的是「新建项目「zz」…」——入口在，而且已经
+        // 把名字预告出来了（见 `msg::new_project_named`）。
+        let label: String = msg::new_project_named(app.lang, "zz")
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
             screen.contains(&label),
-            "过滤之后新建入口不见了：\n{screen}"
+            "搜不到的时候新建入口不见了：\n{screen}"
         );
     }
 
@@ -1073,7 +1184,7 @@ mod tests {
     fn enter_on_the_new_project_row_asks_for_a_name() {
         let (_t, _g, mut app, root) = tree(&["a"]);
         open_picker(&mut app, vec![root.join("a").display().to_string()], root);
-        // 最近栏：0 = a，1 = 手输路径…，2 = 新建项目…
+        // 最近那一层：0 = a，1 = 翻文件夹找…，2 = 新建项目…
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
@@ -1081,13 +1192,13 @@ mod tests {
         assert_eq!(picker(&app).naming, Some(String::new()), "没进新建输入态");
     }
 
-    /// 打完名字回车：目录建在**浏览栏当前那个目录**里，顺手 `git init`，
+    /// 打完名字回车：目录建在**这一屏当前停着的那个目录**里，顺手 `git init`，
     /// 然后直接进选 agent 那一屏——新建一个项目的全部意义就是马上开工。
     #[test]
     fn naming_creates_the_folder_and_goes_on_to_pick_an_agent() {
         let (_t, _g, mut app, root) = tree(&[]);
         open_picker(&mut app, vec![], root.clone());
-        // 没有最近项目，所以左栏只有两行：0 = 手输路径…，1 = 新建项目…
+        // 没有最近项目，所以只剩三条动作行：0 = 翻文件夹找…，1 = 新建项目…
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         for c in "my-thing".chars() {
@@ -1099,9 +1210,10 @@ mod tests {
         assert!(made.is_dir(), "目录没建出来");
         assert!(made.join(".git").exists(), "没有 git init");
         // 建完就当它是被选中的项目往下走。测试里没有守护进程，所以
-        // `open_new_session` 拉不到 agent 列表、停在看板上——跟「在浏览栏
-        // 选中一个已有目录」那条路的落点完全一样（见
-        // `choosing_a_folder_pins_it`），这里钉的是**项目切过去了**。
+        // `open_new_session` 拉不到 agent 列表、停在看板上——跟「翻到一个
+        // 已有目录、按「就用这个文件夹」」那条路的落点完全一样（见
+        // `stepping_into_a_folder_lands_the_cursor_on_use_this_folder`），
+        // 这里钉的是**项目切过去了**。
         assert!(
             app.current_dir().ends_with("my-thing"),
             "新建完没把它当成当前项目：{}",
@@ -1184,13 +1296,14 @@ mod tests {
 
     /// **屏幕上只能有一个光标。**
     ///
-    /// 两栏各画各的 `▶`、只靠边框颜色区分焦点，是这一屏最要命的一个洞：
-    /// 用户按 Tab 之后屏幕上什么明显的东西都没变（边框那一档颜色差在很多
-    /// 主题下几乎看不出来），而另一栏那个 `▶` 看上去跟真光标一模一样——
-    /// 于是「Tab 没反应」「方向键动的是另一栏」这两句抱怨其实是同一个 bug。
-    /// 焦点在哪，`▶` 就只能在哪。
+    /// 上一版两栏各画各的 `▶`、只靠边框颜色区分焦点：用户按 Tab 之后屏幕上
+    /// 什么明显的东西都没变（边框那一档颜色差在很多主题下几乎看不出来），
+    /// 而另一栏那个 `▶` 看上去跟真光标一模一样——「Tab 没反应」「方向键动的
+    /// 是另一栏」这两句抱怨其实是同一个 bug。现在只有一个列表，光标自然
+    /// 只有一个；这条测试盯的是**三段（钉住的上下段 + 会滚的中段）不许各画
+    /// 一个**，那是同一个错法换了个地方复活。
     #[test]
-    fn only_the_focused_pane_shows_a_cursor() {
+    fn there_is_exactly_one_cursor_on_screen() {
         let (_t, _g, mut app, root) = tree(&["a", "b"]);
         open_picker(&mut app, vec![root.join("a").display().to_string()], root);
 
@@ -1205,58 +1318,46 @@ mod tests {
         );
     }
 
-    /// 光标跟着焦点走。按一下 Tab，`▶` 必须**从左栏挪到右栏**——数目对
-    /// 不代表位置对，上面那条只钉住「只有一个」，这条钉住「在正确的一边」。
+    /// 「翻文件夹找…」把同一块地方换成目录浏览器，Esc 换回来。**进出各
+    /// 一个键**，而且两个键都在屏幕上：那一行自己写着字，Esc 写在底栏左段
+    /// （`escape_hint` 那时候写的是「回最近」）。上一版这件事是 `Tab`——
+    /// 一个屏幕上写着、但按下去只有边框颜色变的键。
     #[test]
-    fn the_cursor_moves_to_the_other_pane_on_tab() {
-        let (_t, _g, mut app, root) = tree(&["a", "b"]);
-        open_picker(&mut app, vec![root.join("a").display().to_string()], root);
-        press(&mut app, KeyCode::Tab);
-
-        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
-        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
-        let buf = term.backend().buffer().clone();
-
-        // 两栏是 42% / 58% 分的（见 `draw_pick_project` 的 `Layout`），
-        // 不是对半——按 42% 那条线分，才是「在哪一栏」的正确判据。
-        let half = buf.area.width * 42 / 100;
-        let mut left = 0;
-        let mut right = 0;
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                if buf.cell((x, y)).map(|c| c.symbol()) == Some("\u{25b6}") {
-                    if x < half {
-                        left += 1;
-                    } else {
-                        right += 1;
-                    }
-                }
-            }
-        }
-        assert_eq!((left, right), (0, 1), "Tab 之后光标没挪到右栏");
-    }
-
-    /// Tab 在两栏之间来回切。没有这一步，右边那栏就是个只能看不能用的装饰。
-    #[test]
-    fn tab_moves_the_focus_back_and_forth() {
+    fn the_browse_layer_is_one_key_in_and_one_key_out() {
         let (_t, _g, mut app, root) = tree(&["a"]);
-        open_picker(&mut app, vec![], root);
-        assert_eq!(picker(&app).focus, Pane::Recent, "开在最近那一栏");
-        press(&mut app, KeyCode::Tab);
-        assert_eq!(picker(&app).focus, Pane::Browse);
-        press(&mut app, KeyCode::Tab);
-        assert_eq!(picker(&app).focus, Pane::Recent);
+        open_picker(&mut app, vec![], root.clone());
+        assert!(!picker(&app).browsing, "开在最近那一层");
+
+        // 没有最近项目时，「翻文件夹找…」就是第一行
+        press(&mut app, KeyCode::Enter);
+        assert!(picker(&app).browsing, "没进浏览层");
+        assert_eq!(picker(&app).cwd, root, "翻的是原来停着的那个目录");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!picker(&app).browsing, "Esc 该退回最近那一层");
+        assert!(matches!(app.view, View::PickProject(_)), "但不许退出这一屏");
     }
 
-    /// `→` 进子目录，`←` 回上一级。这是「目录浏览器」这四个字的全部含义。
+    /// 浏览层里 `Enter` 和 `→` 都是「进去」，`←` 是「上一级」。
+    ///
+    /// **`Enter` 在文件夹上进目录，这是上一版最要命的一处。** 那时候右栏的
+    /// `Enter` 是「选定」，`→` 才是「进入」——而「在文件夹上按 Enter 会进去」
+    /// 是所有人从文件管理器带过来的反射，那一下会把用户直接送进选 agent
+    /// 那一屏，落在一个他只是想路过的目录上。
     #[test]
-    fn right_descends_and_left_goes_up() {
+    fn enter_and_right_both_go_into_a_folder_and_left_comes_back() {
         let (_t, _g, mut app, root) = tree(&["outer/inner"]);
         open_picker(&mut app, vec![], root.clone());
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
 
-        press(&mut app, KeyCode::Right);
-        assert_eq!(picker(&app).cwd, root.join("outer"), "→ 要走进去");
+        // 0 = 就用这个文件夹，1 = outer
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(picker(&app).cwd, root.join("outer"), "Enter 要走进去");
+        assert!(
+            matches!(app.view, View::PickProject(_)),
+            "进目录不许当成「选定这个项目」"
+        );
         assert_eq!(
             picker(&app)
                 .entries
@@ -1269,38 +1370,39 @@ mod tests {
 
         press(&mut app, KeyCode::Left);
         assert_eq!(picker(&app).cwd, root, "← 要回上一级");
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(picker(&app).cwd, root.join("outer"), "→ 也要走进去");
     }
 
-    /// 一路 `←` 走到根目录不能 panic，也不能卡住不动就静默——原地停住即可。
+    /// 走进一个目录之后，光标停在「就用这个文件夹」上——**进去、再按一下
+    /// 同一个键，就是选定它**。这是「Enter 改成进目录」之后选一个项目要付
+    /// 的全部代价：多按一下 Enter，而不是多学一个键。
     #[test]
-    fn going_up_from_the_root_stays_put() {
-        let (_t, _g, mut app, _root) = tree(&[]);
-        open_picker(&mut app, vec![], std::path::PathBuf::from("/"));
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Left);
-        assert_eq!(picker(&app).cwd, std::path::PathBuf::from("/"));
-    }
-
-    /// **浏览栏的 Enter 是「选定」，不是「进入」。** 用户走到一个目录上，
-    /// 多半是因为它就是他要的项目；想再往下钻有 `→`。
-    #[test]
-    fn enter_in_the_browser_picks_the_highlighted_folder() {
+    fn stepping_into_a_folder_lands_the_cursor_on_use_this_folder() {
         let (_t, _g, mut app, root) = tree(&["proj/sub"]);
         open_picker(&mut app, vec![], root.clone());
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Down); // proj
+        press(&mut app, KeyCode::Enter); // 进 proj
+
+        assert_eq!(
+            picker(&app).selected(),
+            Some(PickRow::UseThis),
+            "进来之后光标不在「就用这个文件夹」上"
+        );
+
         press(&mut app, KeyCode::Enter);
         // 比末段而不是整条路径：`current_dir()` 给的是分组键（已归一化），
         // macOS 上 `/var/...` 会变成 `/private/var/...`。要问的是「选中的是
         // 不是 proj 这个目录」，归一化不改变这个答案。
         assert!(
             app.current_dir().ends_with("proj"),
-            "选定的是高亮那个目录，实际 {}",
+            "第二下 Enter 该把这个目录选走，实际 {}",
             app.current_dir().display()
         );
         assert!(matches!(app.view, View::Board), "选完就回家");
-        // 原来这里断言底栏出现一句「已切到 X」。`p` 降格成「把项目摆上看板」
-        // 之后那句话没了：换项目是 `Tab`，而摆上看板这件事屏幕自己看得见——
-        // 多出来一个组、光标落进去。断言改成断言那两件看得见的事。
         assert!(
             app.groups.iter().any(|g| g.name == "proj"),
             "选中的项目要作为一个组出现在看板上"
@@ -1310,6 +1412,20 @@ mod tests {
             Some("proj".to_string()),
             "光标要落进那个组"
         );
+    }
+
+    /// 一路 `←` 走到根目录不能 panic，也不能变成一个按下去没反应的死键：
+    /// 没有上一级了就退回最近那一层——`←` 和 `Esc` 是同一把梯子。
+    #[test]
+    fn going_up_from_the_root_falls_back_to_the_recent_layer() {
+        let (_t, _g, mut app, _root) = tree(&[]);
+        open_picker(&mut app, vec![], std::path::PathBuf::from("/"));
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        assert!(picker(&app).browsing);
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(picker(&app).cwd, std::path::PathBuf::from("/"), "目录不动");
+        assert!(!picker(&app).browsing, "退回最近那一层");
     }
 
     /// 选中一个名字里带看不见字符的目录之后，真正打开的必须是**磁盘上那个
@@ -1327,8 +1443,10 @@ mod tests {
         let weird = "weird\x1bname";
         let (_t, _g, mut app, root) = tree(&[weird]);
         open_picker(&mut app, vec![], root.clone());
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Down); // 那个目录
+        press(&mut app, KeyCode::Enter); // 走进去
+        press(&mut app, KeyCode::Enter); // 就用这个文件夹
 
         assert_eq!(
             app.current_group().map(|g| g.dir.clone()),
@@ -1337,7 +1455,7 @@ mod tests {
         );
     }
 
-    /// 浏览栏画目录名时，含看不见字符的目录要挂一个压暗提示；正常目录
+    /// 浏览层画目录名时，含看不见字符的目录要挂一个压暗提示；正常目录
     /// **不能**挂——后一半同样重要，否则每一行都挂着它，提示就失去了意义。
     /// 名字里带控制字符的目录**在 Windows 上造不出来**：NTFS 不允许
     /// 0x00-0x1F 出现在文件名里，`create_dir` 直接报「文件名语法不正确」。
@@ -1348,7 +1466,7 @@ mod tests {
     fn draw_marks_directories_whose_name_hides_something_invisible() {
         let (_t, _g, mut app, root) = tree(&["normal", "weird\x1bname"]);
         open_picker(&mut app, vec![], root);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
@@ -1383,8 +1501,8 @@ mod tests {
         );
     }
 
-    /// 最近栏的 `→` 把浏览器切到那个项目所在的位置——用户想从一个熟悉的
-    /// 项目附近开始找，这是最短的一步。
+    /// 最近项目上的 `→` 直接把浏览层开在那个项目所在的位置——用户要找的
+    /// 新项目十有八九跟他熟悉的那个是邻居，这是最短的一步。
     #[test]
     fn right_on_a_recent_project_opens_the_browser_there() {
         let (_t, _g, mut app, root) = tree(&["proj/sub"]);
@@ -1392,33 +1510,159 @@ mod tests {
         open_picker(&mut app, vec![proj.display().to_string()], root);
         press(&mut app, KeyCode::Right);
         assert_eq!(picker(&app).cwd, proj);
-        assert_eq!(picker(&app).focus, Pane::Browse, "焦点跟着过去");
+        assert!(picker(&app).browsing, "要落在浏览层里");
     }
 
-    /// 打字只过滤**当前焦点那一栏**。共用一个过滤词的话，用户在左边找项目，
-    /// 右边的目录列表会跟着变空，而他并没有要求那件事。
+    /// **打了什么字，屏幕上必须看得见。**
+    ///
+    /// 这是这一屏原来最要命的一个洞：底栏写着「直接打字过滤」，而打下去
+    /// 之后搜索词只活在内存里——行悄悄少了，用户看不出是自己打的字造成的，
+    /// 也没法确认自己打错了哪个字母，更不知道该按几下退格才能清干净。
     #[test]
-    fn typing_filters_only_the_focused_pane() {
+    fn what_you_type_shows_up_on_screen() {
+        let (_t, _g, mut app, root) = tree(&["alpha", "beta"]);
+        open_picker(&mut app, vec!["/w/alpha".into(), "/w/beta".into()], root);
+
+        // 什么都没打的时候，框里是那句「可以打字」的占位话
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let idle: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let hint: String = text(Key::SearchPlaceholder, app.lang)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(idle.contains(&hint), "搜索框里没有占位提示：\n{idle}");
+
+        for c in "alp".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let typed: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(typed.contains("alp"), "打进去的字没上屏：\n{typed}");
+        assert!(
+            !typed.contains(&hint),
+            "打了字之后占位提示还赖着不走：\n{typed}"
+        );
+    }
+
+    /// 搜索只作用于**眼前这一层**，而且换层就清空：搜索词是对着一屏具体的
+    /// 东西打的，换了一屏它就不成立了——留着的话，用户翻进一个目录看到的是
+    /// 一份被上一层的搜索词滤过的列表，而屏幕上没有任何东西解释为什么。
+    #[test]
+    fn the_search_belongs_to_the_layer_it_was_typed_on() {
         let (_t, _g, mut app, root) = tree(&["alpha", "beta"]);
         open_picker(&mut app, vec!["/w/alpha".into(), "/w/beta".into()], root);
 
         press(&mut app, KeyCode::Char('a'));
-        let p = picker(&app);
-        assert_eq!(p.shown_recent().len(), 2, "「a」在两条路径里都有");
-        assert_eq!(p.shown_entries().len(), 2, "浏览栏不该被左栏的过滤词影响");
+        assert_eq!(picker(&app).rows().list.len(), 2, "「a」在两条路径里都有");
 
-        press(&mut app, KeyCode::Tab); // 切到浏览栏，过滤词清空
+        press(&mut app, KeyCode::Esc); // 先把搜索词清掉（梯子第一级）
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        assert_eq!(picker(&app).filter, "", "换层之后搜索词必须是空的");
+
         press(&mut app, KeyCode::Char('b'));
-        let p = picker(&app);
         assert_eq!(
-            p.shown_entries()
+            picker(&app)
+                .shown_entries()
                 .iter()
                 .map(|r| r.name.clone())
                 .collect::<Vec<_>>(),
             vec!["beta"],
-            "现在过滤的是浏览栏"
+            "现在搜的是目录"
         );
-        assert_eq!(p.shown_recent().len(), 2, "左栏不受影响");
+    }
+
+    /// **Esc 是一级一级退的梯子。** 每一级都对应屏幕上真的有的一样东西：
+    /// 先是搜索词，再是「正翻着文件夹」这一层，最后才是这一屏本身。
+    ///
+    /// 上一版无论屏幕上是什么状态 Esc 都直接离开——对打岔了的用户是最坏的
+    /// 一种：他打了两个字母没找到东西想重来，唯一想得到的那个键把他整个
+    /// 弹出了这一屏。
+    #[test]
+    fn escape_climbs_down_one_rung_at_a_time() {
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        open_picker(&mut app, vec![], root);
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Char('a')); // 打点字
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(picker(&app).filter, "", "第一级：清搜索词");
+        assert!(picker(&app).browsing, "还在浏览层里");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!picker(&app).browsing, "第二级：退回最近那一层");
+        assert!(matches!(app.view, View::PickProject(_)), "还在这一屏上");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::Board), "第三级：才离开");
+    }
+
+    /// 底栏左段必须跟着梯子走。写死一句「回看板」，用户按下去看到的是列表
+    /// 变长或者换了一层，而他被告知的是自己会离开。
+    #[test]
+    fn the_bar_says_which_rung_escape_is_on() {
+        use crate::ui::view::escape_hint;
+        let (_t, _g, mut app, root) = tree(&["a"]);
+        open_picker(&mut app, vec![], root);
+        let lang = app.lang;
+
+        assert_eq!(escape_hint(&app.view, lang), text(Key::BackToBoard, lang));
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        assert_eq!(escape_hint(&app.view, lang), text(Key::BackToRecent, lang));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(escape_hint(&app.view, lang), text(Key::ClearSearch, lang));
+    }
+
+    /// **动作行不许跟着列表滚走。** 项目一多，「新建项目…」「手输路径…」
+    /// 就在屏幕外面了——而找不到项目正是最该用它们的时候。它们钉在列表
+    /// 底下，跟有多少个最近项目无关。
+    #[test]
+    fn the_action_rows_stay_put_no_matter_how_long_the_list_is() {
+        let (_t, _g, mut app, root) = tree(&[]);
+        let many: Vec<String> = (0..40).map(|i| format!("/w/proj{i}")).collect();
+        open_picker(&mut app, many, root);
+
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let screen: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        for k in [Key::BrowseFolders, Key::NewProject, Key::ManualPath] {
+            let label: String = text(k, app.lang)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                screen.contains(&label),
+                "「{label}」被列表挤没了：\n{screen}"
+            );
+        }
+    }
+
+    /// 搜不到的时候光标落在「新建项目」那一行上——**搜不到正是最该新建的
+    /// 时候**，而那一行这时候写的正是他刚打的名字。落在第 0 行的话，他还得
+    /// 自己往下按两次才够得着。
+    #[test]
+    fn a_search_that_finds_nothing_puts_the_cursor_on_new_project() {
+        let (_t, _g, mut app, root) = tree(&[]);
+        open_picker(&mut app, vec!["/w/alpha".into()], root);
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(picker(&app).selected(), Some(PickRow::New));
+
+        // 而且 Enter 下去名字是预填好的，不用再打一遍
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(picker(&app).naming, Some("zzz".to_string()));
     }
 
     /// 手输路径态按 Esc 退的是**一层**——回两栏那一屏，不是一步关掉整个
@@ -1621,16 +1865,24 @@ mod tests {
     /// 那边说「已经有了」，回来还是开不了——一直转下去，而且每一步看起来
     /// 都成功了。这正好卡住这个功能唯一服务的那种用户。
     ///
-    /// 所以 `prepare_repo` 每次都要先 `activate`。这里放一个假的 git 进
-    /// 自带运行时，然后确认那个目录真的被挂上了 PATH。
+    /// 所以 `prepare_repo` 每次都要先 `activate`。这里往自带运行时里放一份
+    /// 假的**运行时**，然后确认那个目录真的被挂上了 PATH。
+    ///
+    /// **探针用的是 node 不是 git，这一点是刻意的。** `activate` 把 node 和
+    /// git 两份各挂各的（见它自己的注释），所以 node 的目录出现在 PATH 上
+    /// 同样证明「`prepare_repo` 每次都重新挂了一遍」——而这条测试要钉的正是
+    /// 这件事。反过来，往全进程的 PATH 最前面放一个不能跑的 `git.exe`，
+    /// 同时跑在别的线程上的测试（建仓库、打检查点）会真的调用到它，隔三差五
+    /// 冒出一两条跟 git 有关、报错完全指不到这儿的失败。
     #[test]
     fn preparing_the_repo_remounts_the_bundled_runtime_so_a_just_installed_git_is_seen() {
         let (mut app, d) = App::test_app();
         // 自带运行时跟着 socket 走，而 test_app 的 socket 在临时目录里。
         let rt = crate::runtime::runtime_dir_for_socket(&app.socket);
-        let bin = crate::runtime::git_bin_dir(&rt);
+        let bin = crate::runtime::node_bin_dir(&rt);
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("git.exe"), b"pretend git").unwrap();
+        let exe = if cfg!(windows) { "node.exe" } else { "node" };
+        std::fs::write(bin.join(exe), b"pretend node").unwrap();
 
         let before = std::env::var("PATH").unwrap_or_default();
         let dir = app.current_dir();

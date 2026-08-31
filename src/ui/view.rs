@@ -472,11 +472,53 @@ pub(crate) fn filter_projects(all: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
-/// 哪一栏有焦点。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Pane {
-    Recent,
+/// 选项目那一屏上的一行。**画和按键共用这一份**——两边各自算一遍
+/// 「第几行是什么」是这一屏历史上最能出错的地方：原来的写法靠
+/// `i == shown.len()` 这类下标算术把动作行对上，注释里还得写一句
+/// 「改这里就要改那里」。行的身份写进类型里之后，那种错法编译器就拦住了。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickRow {
+    /// 一个最近开过的项目（完整路径）
+    Recent(String),
+    /// 浏览层里的一个子目录
+    Dir(DirRow),
+    /// 浏览层的第一行：就用现在停着的这个目录
+    UseThis,
+    /// 最近层的动作行：翻文件夹去找
     Browse,
+    /// 动作行：新建一个项目（名字预填搜索词）
+    New,
+    /// 动作行：直接粘一条路径进来
+    TypePath,
+}
+
+/// 一屏的行，按光标从上到下的顺序分成三段。
+///
+/// **分段是为了让动作行不跟着滚走。** 原来六七行动作混在列表末尾，
+/// 十几个最近项目一挡，「新建项目…」就在屏幕外面了——而找不到项目
+/// 正是最该新建的时候。`top`/`bottom` 钉在列表上下两端，`list` 是
+/// 唯一会滚的那一段。
+#[derive(Clone, Debug, Default)]
+pub struct PickRows {
+    pub top: Vec<PickRow>,
+    pub list: Vec<PickRow>,
+    pub bottom: Vec<PickRow>,
+}
+
+impl PickRows {
+    pub fn len(&self) -> usize {
+        self.top.len() + self.list.len() + self.bottom.len()
+    }
+
+    /// 光标下标是**跨三段连续**的，所以取行必须走这里，不许在调用方
+    /// 自己拿下标减去 `top.len()` 再判——那正是上一版的错法。
+    pub fn get(&self, i: usize) -> Option<&PickRow> {
+        self.top
+            .iter()
+            .chain(self.list.iter())
+            .chain(self.bottom.iter())
+            .nth(i)
+    }
 }
 
 /// 选项目那一层浮层的全部状态。
@@ -484,19 +526,31 @@ pub enum Pane {
 /// 收成一个结构体而不是继续在 `View::PickProject` 上平铺字段：字段从 4 个
 /// 涨到 8 个之后，每处 `match` 解构都要抄一长串，而且加一个字段就得改遍
 /// 所有分支。
+///
+/// **一个列表，一个光标。** 上一版是左右两栏、`Tab` 切焦点，各带一个
+/// `ListState`：屏幕上同时有两个长得一样的 `▶`，按 `Tab` 只有边框颜色变
+/// （很多主题下看不出来），而底栏得写七个键才交代得完。现在最近项目和
+/// 目录浏览是**同一块地方的两层**（`browsing`），进出各一个键。
 #[derive(Clone)]
 pub struct ProjectPicker {
     /// 守护进程给的最近项目，过滤不改动它
     pub recent: Vec<String>,
-    pub recent_state: ListState,
-    /// 浏览器现在停在哪个目录
+    /// 浏览层停在哪个目录。**最近层时它也有值**：那是「新建项目…」的落点，
+    /// 也是按下「浏览文件夹…」之后第一眼看到的地方。
     pub cwd: PathBuf,
     pub entries: Vec<DirRow>,
-    pub browse_state: ListState,
-    pub focus: Pane,
-    /// **只作用于当前焦点那一栏。** 两栏共用一个过滤词的话，用户在左边打字
-    /// 找项目，右边的目录列表会跟着变空，而他并没有要求那件事。
+    /// `false` = 最近项目那一层，`true` = 翻文件夹那一层。
+    pub browsing: bool,
+    /// 唯一的光标，下标落在 `rows()` 上。
+    pub state: ListState,
+    /// 搜索词。**现在它画得出来**（见 `pick.rs` 的表头）——上一版它只在
+    /// 内存里，用户打字看着行消失却没有任何东西说明发生了什么，也没有
+    /// 办法确认自己打了什么。
     pub filter: String,
+    /// 会滚那一段的滚动偏移。跟光标分开存：光标是跨三段的下标，偏移只
+    /// 对得上中间那一段。存下来而不是每帧从 0 重算，列表才不会在光标
+    /// 往回走的时候整块跳。
+    pub offset: usize,
     /// Some 表示正处在「手输路径」的输入态
     pub typing_path: Option<String>,
     /// Some 表示正处在「新建项目」的输入态，装着已经打进去的**名字**。
@@ -511,61 +565,90 @@ pub struct ProjectPicker {
 impl ProjectPicker {
     pub fn new(recent: Vec<String>, cwd: PathBuf) -> ProjectPicker {
         let entries = list_dirs(&cwd);
-        let mut recent_state = ListState::default();
-        recent_state.select(Some(0));
-        let mut browse_state = ListState::default();
-        if !entries.is_empty() {
-            browse_state.select(Some(0));
-        }
+        let mut state = ListState::default();
+        state.select(Some(0));
         ProjectPicker {
             recent,
-            recent_state,
             cwd,
             entries,
-            browse_state,
-            // 开在「最近」那一栏：绝大多数时候用户要的项目就在里面，
-            // 浏览器是给「不在里面」那种情况准备的。
-            focus: Pane::Recent,
+            // 开在最近项目那一层：绝大多数时候用户要的项目就在里面，
+            // 翻文件夹是给「不在里面」那种情况准备的。
+            browsing: false,
+            state,
             filter: String::new(),
+            offset: 0,
             typing_path: None,
             naming: None,
         }
     }
 
-    /// 把浏览器挪到另一个目录，并把光标收回第一行——换了目录还留着旧行号，
-    /// 光标会落在一个跟刚才毫无关系的条目上。
+    /// 这一屏现在有哪些行。**画和按键都只认这一个函数。**
+    pub fn rows(&self) -> PickRows {
+        if self.browsing {
+            PickRows {
+                // 「就用这个文件夹」钉在最上面：翻到这儿来就是为了选它，
+                // 而按 Enter 走进一个目录之后光标正好停在这一行上——
+                // 「进去，再确认」是两下同一个键。
+                top: vec![PickRow::UseThis],
+                list: self.shown_entries().into_iter().map(PickRow::Dir).collect(),
+                // 新建项目落在**正翻着的这个目录**里，所以它属于这一层，
+                // 不只是最近那一层的入口。
+                bottom: vec![PickRow::New],
+            }
+        } else {
+            PickRows {
+                top: Vec::new(),
+                list: filter_projects(&self.recent, &self.filter)
+                    .into_iter()
+                    .map(PickRow::Recent)
+                    .collect(),
+                bottom: vec![PickRow::Browse, PickRow::New, PickRow::TypePath],
+            }
+        }
+    }
+
+    /// 光标脚下那一行。底栏靠它决定 `Enter` 那一格写什么字——同一个物理键
+    /// 在「就用这个文件夹」和一个子目录上做的是两件事，写死一句话必然
+    /// 在其中一行上说谎。
+    pub fn selected(&self) -> Option<PickRow> {
+        self.rows().get(self.cursor()).cloned()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.state.selected().unwrap_or(0)
+    }
+
+    /// 翻到另一个目录去，并把光标收回「就用这个文件夹」那一行。
     pub fn browse_to(&mut self, dir: PathBuf) {
         self.entries = list_dirs(&dir);
         self.cwd = dir;
-        self.browse_state.select(if self.entries.is_empty() {
-            None
-        } else {
-            Some(0)
-        });
-        // 过滤词是对着上一个目录打的，换了目录就不成立了
+        self.browsing = true;
+        // 搜索词是对着上一个目录打的，换了目录就不成立了
         self.filter.clear();
+        self.state.select(Some(0));
+        self.offset = 0;
     }
 
-    /// 当前焦点那一栏里，过滤之后真正显示的行。
-    pub fn shown_recent(&self) -> Vec<String> {
-        match self.focus {
-            Pane::Recent => filter_projects(&self.recent, &self.filter),
-            Pane::Browse => self.recent.clone(),
-        }
+    /// 从浏览层退回最近那一层。`cwd` 留在原地——用户下次再按「浏览文件夹…」
+    /// 回到的是他刚才翻到的位置，而不是被打回起点重翻一遍。
+    pub fn back_to_recent(&mut self) {
+        self.browsing = false;
+        self.filter.clear();
+        self.state.select(Some(0));
+        self.offset = 0;
     }
 
+    /// 搜索之后真正显示的目录行。
     pub fn shown_entries(&self) -> Vec<DirRow> {
-        match self.focus {
-            Pane::Browse if !self.filter.is_empty() => {
-                let f = self.filter.to_lowercase();
-                self.entries
-                    .iter()
-                    .filter(|r| r.name.to_lowercase().contains(&f))
-                    .cloned()
-                    .collect()
-            }
-            _ => self.entries.clone(),
+        if self.filter.is_empty() {
+            return self.entries.clone();
         }
+        let f = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|r| r.name.to_lowercase().contains(&f))
+            .cloned()
+            .collect()
     }
 }
 
@@ -1030,6 +1113,13 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         View::PickProject(p) if p.typing_path.is_some() || p.naming.is_some() => {
             text(Key::BackToList, lang).to_string()
         }
+        // 选项目那一屏的 Esc 是**一级一级退的梯子**（见
+        // `pick.rs::handle_pick_project`），左段必须跟着走：搜索词还在的时候
+        // 它清的是搜索词，翻着文件夹的时候它退的是那一层，两种情况下都还
+        // 留在这一屏上。写死一句「回看板」，用户按下去看到的是列表变长
+        // 或者换了一层，而他被告知的是自己会离开。
+        View::PickProject(p) if !p.filter.is_empty() => text(Key::ClearSearch, lang).to_string(),
+        View::PickProject(p) if p.browsing => text(Key::BackToRecent, lang).to_string(),
         // 跟 `secret.rs` 的 Esc 分支保持一致：从密钥设置页进来的填密钥，退出
         // 回设置页，不是选择器，也不是看板——三条路各回各的，文案不能含糊成
         // 一句话。
@@ -1243,20 +1333,32 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
             lang,
         ),
-        // 目录浏览器的三个键（Tab/→/←）必须写出来：它们是这一层唯一
-        // 「学过才知道」的部分，不写就等于没做浏览器。
-        View::PickProject(_) => help_items(
-            &[
-                ("Tab", Key::SwitchPane),
-                ("↑↓", Key::Select),
-                ("→", Key::EnterFolder),
-                ("←", Key::GoUp),
-                ("Enter", Key::Confirm),
-                ("", Key::TypeToFilter),
-                ("Esc", Key::Cancel),
-            ],
-            lang,
-        ),
+        // **`Enter` 那一格写什么，由光标脚下那一行决定。**
+        //
+        // 这一屏上同一个物理键在三种行上做三件事：在最近项目上是「打开」，
+        // 在一个文件夹上是「进去」，在「就用这个文件夹」上是「就用它」。
+        // 写死一句话必然在其中两种行上说谎，而这个仓库的规矩是屏幕和键盘
+        // 必须对得上——两个方向都算。
+        //
+        // 表本身也短了：上一版七条（Tab/↑↓/→/←/Enter/打字/Esc），窄终端上
+        // `fit_help` 从尾巴开始丢，最先没的正是 `Esc`。现在两三条，
+        // 「怎么打字搜索」交给搜索框自己的占位文案（见 `pick.rs::search_box`），
+        // `Esc` 交给底栏左段（`escape_hint`），都不必再挤进这一行。
+        View::PickProject(p) => {
+            let mut items: Vec<(&'static str, Key)> = vec![("↑↓", Key::Select)];
+            items.push(match p.selected() {
+                Some(PickRow::Recent(_)) => ("Enter", Key::OpenProject),
+                Some(PickRow::Dir(_)) => ("Enter", Key::EnterFolder),
+                Some(PickRow::UseThis) => ("Enter", Key::UseThisFolder),
+                _ => ("Enter", Key::Confirm),
+            });
+            // `←` 只在翻文件夹那一层管用；最近那一层上它什么都不做，
+            // 也就不写——屏幕上不写按不动的键。
+            if p.browsing {
+                items.push(("←", Key::GoUp));
+            }
+            help_items(&items, lang)
+        }
         // 看板：进会话 / 新建 / 换项目，最多三条（见 `board_keys`）。
         //
         // `x 移除` 只在「pinned 且空」的组上写——它也只有在那种组上才真的
@@ -1857,20 +1959,64 @@ mod tests {
         );
     }
 
-    /// 目录浏览器的三个键必须写在屏幕上。它们是这一层唯一「学过才知道」
-    /// 的部分——不写就等于做了个浏览器但没人知道怎么用。
+    /// **`Enter` 那一格写什么，得跟光标脚下那一行对得上。**
+    ///
+    /// 这一屏上同一个物理键在三种行上做三件事：在最近项目上是「打开」，在
+    /// 一个文件夹上是「进去」，在「就用这个文件夹」上是「就用它」。写死
+    /// 一句话必然在其中两种行上说谎——而这个仓库的规矩是屏幕和键盘必须
+    /// 对得上，两个方向都算。
     #[test]
-    fn the_browser_advertises_its_three_keys() {
-        let help = help_of(
-            &View::PickProject(ProjectPicker::new(
-                Vec::new(),
-                std::path::PathBuf::from("/tmp"),
-            )),
-            Lang::Zh,
+    fn the_enter_hint_follows_the_row_under_the_cursor() {
+        let base = ProjectPicker::new(
+            vec!["/w/proj".to_string()],
+            std::path::PathBuf::from("/tmp"),
         );
-        for k in ["Tab 切换左右", "→ 进入文件夹", "← 上一级"] {
-            assert!(help.contains(k), "帮助行少了「{k}」：{help}");
-        }
+
+        // 最近那一层，光标停在一个项目上
+        let help = help_of(&View::PickProject(base.clone()), Lang::Zh);
+        assert!(
+            help.contains("Enter 打开"),
+            "最近项目上该写「打开」：{help}"
+        );
+        assert!(!help.contains("← 上一级"), "这一层 `←` 按不动，就不许写");
+
+        // 浏览层，光标停在「就用这个文件夹」上（`browse_to` 的落点）
+        let mut browsing = base.clone();
+        browsing.browse_to(std::path::PathBuf::from("/tmp"));
+        let help = help_of(&View::PickProject(browsing.clone()), Lang::Zh);
+        assert!(
+            help.contains(&format!(
+                "Enter {}",
+                crate::i18n::text(crate::i18n::Key::UseThisFolder, Lang::Zh)
+            )),
+            "「就用这个文件夹」那一行上该写「就用它」：{help}"
+        );
+        assert!(help.contains("← 上一级"), "这一层 `←` 管用，就得写：{help}");
+    }
+
+    /// 反过来：光标真落在一个文件夹上时，`Enter` 写的是「进去」。这一半
+    /// 单独钉住——它正是上一版最要命的那处语义（那时候文件夹上的 Enter
+    /// 是「选定」，一下就把人送进了选 agent 那一屏）。
+    #[test]
+    fn the_enter_hint_says_go_in_when_the_cursor_is_on_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut p = ProjectPicker::new(Vec::new(), dir.path().to_path_buf());
+        p.browse_to(dir.path().to_path_buf());
+        p.state.select(Some(1)); // 0 是「就用这个文件夹」，1 才是 sub
+        assert!(
+            matches!(p.selected(), Some(PickRow::Dir(_))),
+            "光标没落在目录上"
+        );
+
+        let help = help_of(&View::PickProject(p), Lang::Zh);
+        assert!(
+            help.contains(&format!(
+                "Enter {}",
+                crate::i18n::text(crate::i18n::Key::EnterFolder, Lang::Zh)
+            )),
+            "文件夹上该写「进去」：{help}"
+        );
     }
 
     /// `g` 现在不进底栏了（右段只有三个位子），它的去处是 `?` 浮层。

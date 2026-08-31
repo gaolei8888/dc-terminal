@@ -49,6 +49,62 @@ pub fn header(f: &mut Frame, area: Rect, title: &str, rule: Style) -> Rect {
     rows[1]
 }
 
+/// 带右端附件的表头：左边标题，右边贴一段（选项目那一屏的搜索框）。
+///
+/// **搜索框必须跟标题同一行。**它下面那条细线是「表头到此为止」的界线，
+/// 把框放到线底下就等于占掉一行列表；而放在标题行的右端，它跟标题一起
+/// 说明「这一屏是什么、你正在里面找什么」，读的是同一眼。
+///
+/// 标题按剩下的宽度截断——右端那段是用户正在打的字，一个字都不能丢，
+/// 该让位的是标题。
+pub fn header_with(f: &mut Frame, area: Rect, title: &str, right: Line<'_>, rule: Style) -> Rect {
+    let rw = right.width();
+    // 表头都画不下的时候（`header` 自己会整块让给内容），右端也没地方贴。
+    if area.height < 3 || area.width as usize <= rw + 4 {
+        return header(f, area, title, rule);
+    }
+    let body = header(
+        f,
+        area,
+        &truncate(title, area.width as usize - rw - 2),
+        rule,
+    );
+    // 贴在标题那一行（表头两行里的第一行）的右端。覆盖式渲染：上面
+    // `header` 已经把标题画完了，这一笔只落在右边空着的那几格上。
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(right).right_aligned(),
+        Rect { height: 1, ..area },
+    );
+    body
+}
+
+/// 一条路径塞进 `cols` 列，**从左边省略**：`…\work\dc`。
+///
+/// `truncate` 是从右边裁的，对路径正好裁反了——一屏项目全在
+/// `~\Documents\work\dc` 底下时，右裁留下的是十几行一模一样的
+/// `~\Documents\work`，而用来分辨它们的那半截全没了。
+pub(crate) fn path_tail(p: &str, cols: usize) -> String {
+    if display_width(p) <= cols || cols == 0 {
+        return p.to_string();
+    }
+    // 留一格给 `…`
+    let budget = cols - 1;
+    let mut w = 0;
+    let mut keep = String::new();
+    for ch in p.chars().rev() {
+        if ch.is_control() {
+            continue;
+        }
+        let cw = char_width(ch);
+        if w + cw > budget {
+            break;
+        }
+        w += cw;
+        keep.push(ch);
+    }
+    format!("…{}", keep.chars().rev().collect::<String>())
+}
+
 /// 状态在界面上的样式。返回 `Style` 而不是 `Color`：Stopped/Unknown 要用
 /// `dim()`，而 `dim()` 在 `Theme::Unknown` 下表达的是 DIM 修饰符、不是某个
 /// 颜色，`Color` 装不下。给 `dim()` 再开一个返回 `Color` 的孪生函数只能退回
@@ -529,6 +585,22 @@ mod tests {
     fn truncate_strips_control_bytes_before_they_can_reach_the_render_path() {
         assert_eq!(truncate("\x1b[Afix\x7f", 20), "[Afix");
         assert_eq!(truncate("\x1b\x01hi", 20), "hi");
+    }
+
+    /// **路径从左边省略，不从右边。** `truncate` 对路径正好裁反了：一屏
+    /// 项目全在同一个上级目录底下时，右裁留下的是十几行一模一样的开头，
+    /// 而用来分辨它们的那半截全没了。
+    #[test]
+    fn path_tail_keeps_the_end_that_tells_paths_apart() {
+        // 放得下就一个字都不动
+        assert_eq!(path_tail("~/work/dc", 20), "~/work/dc");
+        assert_eq!(path_tail("~/work/dc", 9), "~/work/dc");
+        // 放不下就砍开头，留结尾—— 自己占一列
+        assert_eq!(path_tail("~/Documents/work/dc", 8), "…work/dc");
+        // 宽字符按显示宽度算，不按字符数：两个中文字占 4 列
+        assert_eq!(path_tail("~/项目/一二", 5), "…一二");
+        // 0 列是个合法的极端（窄终端把这一列挤没了），不许 panic
+        assert_eq!(path_tail("~/work/dc", 0), "~/work/dc");
     }
 
     /// 控制字符不占宽度预算（`char_width` 早就把它们算成 0 列），丢弃

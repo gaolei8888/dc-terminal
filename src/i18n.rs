@@ -156,7 +156,6 @@ pub enum Key {
     BackToListWord,
     BackToSettingsWord,
     OrPressDigit,
-    TypeToFilter,
     Language,
     /// 设置页里那一项的名字，同时也是配色子列表的标题。
     BarTheme,
@@ -271,6 +270,12 @@ pub enum Key {
     BackToBoardF2,
     BackToList,
     BackToSettings,
+    /// 选项目那一屏、搜索词非空时的逃生键：`Esc` 这时候清的是搜索词，
+    /// 退不出这一屏。**底栏说什么就得真能做到什么**——写成「回看板」的话，
+    /// 用户按下去只会看到列表变长，而他被告知的是自己会离开。
+    ClearSearch,
+    /// 同上，翻文件夹那一层的 `Esc`：退回最近项目那一层，不是回看板。
+    BackToRecent,
     // —— 视图标题 ——
     BoardTitle,
     /// 底栏中段那块牌子前面的那个名词：`project` / `项目`。
@@ -301,9 +306,9 @@ pub enum Key {
     SettingsTitle,
     CurrentProject,
     ManualPath,
-    /// 左栏最后那一行：在浏览栏当前停着的目录里新建一个项目。**跟
-    /// `ManualPath` 一样不参与过滤**，永远在列表末尾——它是个动作，
-    /// 不是一条数据。
+    /// 动作行：在这一屏当前停着的目录里新建一个项目。**跟 `ManualPath`
+    /// 一样不参与搜索**，钉在列表底下——它是个动作，不是一条数据，而且
+    /// 恰恰在搜不到东西的时候最该看得见。
     NewProject,
     /// 新建项目时那一行提示：名字建到哪个目录里去。目录名由
     /// `msg::new_project_in` 那句带上，这条只是它的兜底标题。
@@ -313,11 +318,27 @@ pub enum Key {
     /// 名字里有 `/` 或 `..`
     NewProjectBadName,
     RecentProjects,
-    SwitchPane,
+    /// 搜索框空着时框里那句压暗的话。**这一屏唯一告诉用户「可以打字」的
+    /// 地方**——上一版把它写在底栏（「直接打字过滤」），而打下去之后屏幕上
+    /// 没有任何东西回显他打了什么：行悄悄少了，原因看不见，也没法确认自己
+    /// 打错了哪个字母。现在提示和回显是同一个框，占位文案就得住在框里。
+    SearchPlaceholder,
+    /// 最近层的动作行：从最近项目切到翻文件夹那一层。
+    BrowseFolders,
+    /// 光标停在一个最近项目上时，`Enter` 那一格写的字。**不能用 `Open`**
+    /// （「进会话」）：这一下打开的是一个**项目**，接着还要选 agent，
+    /// 会话是再下一步的事。
+    OpenProject,
+    /// 浏览层钉在最上面那一行：就用现在停着的这个目录。
+    UseThisFolder,
+    /// 搜索词一条最近项目都没匹配上时，列表那块地方写的话。
+    /// **不写「无结果」这种话**：用户要的是下一步，而下一步（翻文件夹 /
+    /// 新建 / 手输路径）就钉在这句话底下。
+    NoMatchingProject,
     EnterFolder,
     GoUp,
     NoSubfolders,
-    /// 浏览栏里，目录名单靠肉眼分辨不出异常时贴的压暗提示（见 `pick.rs`
+    /// 翻文件夹那一层里，目录名单靠肉眼分辨不出异常时贴的压暗提示（见 `pick.rs`
     /// 里挑目录那一段的说明）。POSIX 目录名里只有 `/` 和 NUL 不合法，
     /// 转义序列这类看不见的字节完全合法，`truncate` 又把它们从**显示**里
     /// 滤掉了——不贴这个提示，用户没有任何办法在选中之前发现这一行不对劲。
@@ -508,7 +529,6 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "其余按键都发给 agent",
         ),
         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
-        TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
         Language => t!(lang, en: "language", zh: "语言"),
         BarTheme => t!(lang, en: "colors", zh: "配色"),
         ThemeGray => t!(lang, en: "gray", zh: "灰"),
@@ -630,6 +650,8 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         BackToBoardF2 => t!(lang, en: "F2 main", zh: "F2 回看板"),
         BackToList => t!(lang, en: "Esc back", zh: "Esc 回列表"),
         BackToSettings => t!(lang, en: "Esc settings", zh: "Esc 回设置"),
+        ClearSearch => t!(lang, en: "Esc clear", zh: "Esc 清空"),
+        BackToRecent => t!(lang, en: "Esc recent", zh: "Esc 回最近"),
 
         // 看板只有这一个标题了：它现在**永远**是全部项目——分组之后
         // 「只看本项目 / 看全部项目」这对模式整个消失，标题不再随模式变。
@@ -684,9 +706,17 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "只写名字——不要 / 也不要 ..（要建到别处用「手输路径…」）",
         ),
 
-        RecentProjects => t!(lang, en: "Recent", zh: "最近"),
-        SwitchPane => t!(lang, en: "switch side", zh: "切换左右"),
-        EnterFolder => t!(lang, en: "open folder", zh: "进入文件夹"),
+        RecentProjects => t!(lang, en: "Recent projects", zh: "最近的项目"),
+        SearchPlaceholder => t!(lang, en: "type to search", zh: "打字搜索"),
+        BrowseFolders => t!(lang, en: "Browse folders…", zh: "翻文件夹找…"),
+        OpenProject => t!(lang, en: "open", zh: "打开"),
+        UseThisFolder => t!(lang, en: "Use this folder", zh: "就用这个文件夹"),
+        NoMatchingProject => t!(
+            lang,
+            en: "No project matches that",
+            zh: "没有项目对得上",
+        ),
+        EnterFolder => t!(lang, en: "go in", zh: "进去"),
         GoUp => t!(lang, en: "go up", zh: "上一级"),
         NoSubfolders => t!(
             lang,
@@ -1095,8 +1125,21 @@ pub mod msg {
     // 落在哪个组上就是当前项目，屏幕自己看得见——再补一句话反而会盖掉
     // 底栏上别的更要紧的提示（见 board.rs 头上 `e0ba1ec` 那段）。
 
+    /// 「新建项目…」那一行，在用户已经打了搜索词的时候写的字。
+    ///
+    /// **搜索不到正是最该新建的时候**，而这时候用户想要的名字就是他刚打的
+    /// 那个词。把它写进行里（而不是让他进输入态再打一遍），这一行就从
+    /// 「一个泛泛的入口」变成「就叫这个，建吧」——Enter 之后名字也是预填好的。
+    pub fn new_project_named(lang: Lang, name: &str) -> String {
+        t!(
+            lang,
+            en: format!("New project “{name}”…"),
+            zh: format!("新建项目「{name}」…"),
+        )
+    }
+
     /// 新建项目那一行的提示：**把目录说出来**。「新目录叫什么名字」少了
-    /// 「建在哪儿」这半句，用户没法确认自己是不是先把浏览栏挪对了地方。
+    /// 「建在哪儿」这半句，用户没法确认自己是不是先翻到了对的地方。
     pub fn new_project_in(lang: Lang, dir: &str) -> String {
         t!(
             lang,
@@ -2023,7 +2066,6 @@ mod tests {
             BackToListWord,
             BackToSettingsWord,
             OrPressDigit,
-            TypeToFilter,
             Language,
             BarTheme,
             ThemeGray,
@@ -2044,6 +2086,8 @@ mod tests {
             BackToBoard,
             BackToBoardF2,
             BackToList,
+            ClearSearch,
+            BackToRecent,
             BackToSettings,
             BoardTitle,
             ProjectChipLabel,
@@ -2058,6 +2102,15 @@ mod tests {
             CurrentProject,
             ManualPath,
             NewProject,
+            RecentProjects,
+            SearchPlaceholder,
+            BrowseFolders,
+            OpenProject,
+            UseThisFolder,
+            NoMatchingProject,
+            EnterFolder,
+            GoUp,
+            NoSubfolders,
             NewProjectPrompt,
             NewProjectNoName,
             NewProjectBadName,
@@ -2163,7 +2216,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 157, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 167, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

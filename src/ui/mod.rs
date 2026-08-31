@@ -1670,14 +1670,17 @@ fn join_warnings(
 /// 用户此刻非做不可的事，挡住他没有意义（跟九宫格不同——那一屏本来就是
 /// 「看一眼」，看不了就先别看）。
 fn popup_area(area: Rect) -> Rect {
-    // 再小就放不下两栏了：每栏各要两列边框，加上目录名和 git 标记。
-    // 比这还小的终端，浮层已经没有「浮」的意义——全屏给他。
+    // 再小就放不下一行「名字 + 路径」了。比这还小的终端，浮层已经没有
+    // 「浮」的意义——全屏给他。
     const MIN_COLS: u16 = 40;
     const MIN_ROWS: u16 = 8;
     if area.width < MIN_COLS || area.height < MIN_ROWS {
         return area;
     }
-    let w = (area.width.saturating_mul(4) / 5).clamp(MIN_COLS, 100);
+    // **上限从 100 收到 72。** 那 100 是给左右两栏定的；现在只有一个列表，
+    // 一行最长也就是「名字 + 一段路径」，再宽出去的部分全是空白——而一个
+    // 横跨大半个屏幕的空框子，读起来比一个真正的对话框费劲得多。
+    let w = (area.width.saturating_mul(4) / 5).clamp(MIN_COLS, 72);
     let h = (area.height.saturating_mul(3) / 4).clamp(MIN_ROWS, 24);
     Rect {
         x: area.x + (area.width - w) / 2,

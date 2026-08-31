@@ -169,6 +169,35 @@ pub fn activate(runtime: &Path) {
     // 两份运行时各挂各的：Node 没装不该拦着 git 上 PATH，反过来也一样。
     // 早先这里是 `if !node_installed { return; }` 打头，把 git 一起挡在
     // 了外面——那时候只有 Node，现在不是了。
+    let dirs = runtime_bin_dirs(runtime);
+    if dirs.is_empty() {
+        return;
+    }
+    let current = std::env::var("PATH").unwrap_or_default();
+    let next = activated_path(&current, &dirs);
+    if next != current {
+        std::env::set_var("PATH", next);
+    }
+}
+
+/// `activate` 的纯函数内核：挂完这几个目录之后 PATH 该长什么样。
+///
+/// **抽出来是为了让测试问得出答案而不用去动进程级 PATH。** 原来那条
+/// 「没装 Node 也要挂上 git」的测试是这么写的：往临时目录里放一个假的
+/// `git.exe`、调 `activate`、读 PATH、再把 PATH 放回去。它自己是对的，
+/// 但那几微秒里**整个测试进程**的 PATH 最前面挂着一个不能跑的 `git.exe`
+/// ——而同时跑在别的线程上的测试（建仓库、打检查点）真的会调用到它，
+/// 于是隔三差五冒出一两条跟 git 有关的失败，报错还完全指不到这儿。
+pub fn activated_path(current: &str, dirs: &[PathBuf]) -> String {
+    let mut next = current.to_string();
+    for d in dirs {
+        next = prepend_path(&next, d);
+    }
+    next
+}
+
+/// 这份运行时里有哪些 bin 目录该上 PATH。`activate` 和它的测试共用。
+pub fn runtime_bin_dirs(runtime: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if node_installed(runtime) {
         dirs.push(node_bin_dir(runtime));
@@ -176,17 +205,7 @@ pub fn activate(runtime: &Path) {
     if git_installed(runtime) {
         dirs.push(git_bin_dir(runtime));
     }
-    if dirs.is_empty() {
-        return;
-    }
-    let current = std::env::var("PATH").unwrap_or_default();
-    let mut next = current.clone();
-    for d in &dirs {
-        next = prepend_path(&next, d);
-    }
-    if next != current {
-        std::env::set_var("PATH", next);
-    }
+    dirs
 }
 
 /// 下载进度怎么说出去。抽成 trait 是因为这件事有两个去处：`dct install`
@@ -696,10 +715,10 @@ ccc  node-v22.11.0-win-x64.zip
         std::fs::write(bin.join("git.exe"), b"not really git").unwrap();
         assert!(!node_installed(rt), "这条测的就是没有 Node 的那种机器");
 
-        let before = std::env::var("PATH").unwrap_or_default();
-        activate(rt);
-        let after = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", &before); // 别把进程级 PATH 留给后面的测试
+        // 问的是 `activate` 的纯函数内核，不动进程级 PATH：这个目录里
+        // 那个 `git.exe` 是个文本文件，挂到全进程的 PATH 最前面会让并行
+        // 跑着的别的测试真的调用到它（见 `activated_path` 的注释）。
+        let after = activated_path("/usr/bin", &runtime_bin_dirs(rt));
 
         assert!(
             after.contains(&*bin.to_string_lossy()),
