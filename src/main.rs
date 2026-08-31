@@ -22,14 +22,16 @@ dct —— vibe coding 终端
                    缺 Node 运行时会自己补上一份，只给 dct 自己用
   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
                    靠它，没有它撤销是死的；同样只给 dct 自己用
-  dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）
+  dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
+                   后台空着就直接起一个新的
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面
   dct --version    看装的是哪一版
   dct --help       看这段
 
-ps / stop / kill / prune / restart 都不会拉起守护进程：问「有没有东西在跑」不该把
-「没有」变成「有」。
+ps / stop / kill / prune 都不会拉起守护进程：问「有没有东西在跑」不该把
+「没有」变成「有」。restart 不在此列——它是一句祈使句，要的是「敲完之后
+后台跑着新的」。
 ";
 
 fn main() -> Result<()> {
@@ -71,13 +73,27 @@ fn main() -> Result<()> {
             }
         },
         // restart 换掉的是**整个**守护进程，所有会话跟着断，所以默认要问一句
-        // （`-y` 免问）。它跟 ps/stop 一样不会顺手拉起一个——理由在
+        // （`-y` 免问）。后台空着的时候它不拦着，直接当「启动」办——理由在
         // `cli::run_restart` 上。
         Some("restart") => {
             let target = dct::cli::parse_restart_args(&args[1..], cli_lang());
             let exe = std::env::current_exe()?;
-            let code = dct::cli::run_restart(&socket_path(), &exe, cli_lang(), target)?;
-            std::process::exit(code)
+            match dct::cli::run_restart(&socket_path(), &exe, cli_lang(), target)? {
+                dct::cli::Restarted::Exit(code) => std::process::exit(code),
+                // 「起一个新的 dct」走的就是裸 `dct` 那条路：问要不要接回上次
+                // 的会话、拉守护进程、进看板，一步不少。**不复制一份简化版**
+                // ——那样迟早跟 `run_ui` 走散。
+                //
+                // 没有终端的时候（脚本、cron、CI）退回去只拉守护进程：TUI 在
+                // 那种地方开不起来，而「后台跑起来」恰恰是脚本真正想要的那半。
+                dct::cli::Restarted::StartFresh => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        run_ui()
+                    } else {
+                        start_daemon_headless(&exe)
+                    }
+                }
+            }
         }
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
         // 通路，跟会话、pty 都无关。
@@ -173,6 +189,29 @@ fn run_ui() -> Result<()> {
     // 会话在干什么——后者才是「一屏管好几个 agent」这件事的样子。
     let mode = dct::settings::load_view_mode(&settings).unwrap_or(dct::ui::ViewMode::Grid);
     dct::ui::run(client, std::env::current_dir()?, lang, sock.clone(), mode)
+}
+
+/// 没有终端时 `dct restart` 走的那半条路：只把守护进程拉起来，不开界面。
+///
+/// 脚本里敲 `dct restart` 要的是「后台跑着新的」，而 TUI 在没有终端的地方
+/// 开不起来。这里也不问「要不要接回上次的会话」——没人在场，`run_ui` 里那
+/// 句问话同样会被跳过，守护进程照它自己的默认流程去读那份清单。
+fn start_daemon_headless(exe: &Path) -> Result<()> {
+    let sock = socket_path();
+    let lang = cli_lang();
+    if dct::client::spawn_daemon(exe, &sock).is_err() {
+        eprintln!("{}", text(Key::RestartStartFailed, lang));
+        std::process::exit(1);
+    }
+    for _ in 0..50 {
+        if Client::connect(&sock).is_ok() {
+            println!("{}", text(Key::RestartStartedDaemonOnly, lang));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("{}", text(Key::RestartStartFailed, lang));
+    std::process::exit(1);
 }
 
 /// 这次要拉起的是一个全新的守护进程（`Client::connect` 刚判定连不上），

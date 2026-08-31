@@ -229,8 +229,9 @@ it carries on with the old one.
 `dct restart` does that swap on demand, without opening the board — for when the
 rebuild produced the same version number and nothing notices anything is stale.
 It asks the same question first, listing what will die; `dct restart -y` skips
-the question. With nothing running it says so and starts nothing: restarting is
-not starting.
+the question. With nothing running there is no old daemon to swap and nothing to
+ask about, so it just starts a fresh one — the board, or in a script (no
+terminal) the background service alone.
 
 </details>
 

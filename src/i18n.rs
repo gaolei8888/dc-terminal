@@ -408,6 +408,12 @@ pub enum Key {
     RestartCancelled,
     RestartDone,
     RestartFailed,
+    /// `dct restart` 时后台本来就空着：这就给你起一个。
+    RestartNothingToRestart,
+    /// 同上，但没有终端可以开界面，只把守护进程拉起来了。
+    RestartStartedDaemonOnly,
+    /// 连守护进程都没拉起来。
+    RestartStartFailed,
     // —— 守护进程重启后，问要不要接回上次的会话 ——
     ResumeSessionsExplain,
     ResumeSessionsAsk,
@@ -889,6 +895,23 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Could not restart it. The old one is still running.",
             zh: "没能重启，旧的还在跑",
+        ),
+        // 后台空着的时候 `restart` 干的是「启动」，所以先把这句话说出来再
+        // 动手——用户敲的是 restart，屏幕上直接冒出看板会让人以为敲错了。
+        RestartNothingToRestart => t!(
+            lang,
+            en: "Nothing was running in the background. Starting a fresh one…",
+            zh: "后台本来就没东西在跑，这就给你起一个…",
+        ),
+        RestartStartedDaemonOnly => t!(
+            lang,
+            en: "Background service started. Run `dct` to open the board.",
+            zh: "后台服务已启动。敲 `dct` 打开看板",
+        ),
+        RestartStartFailed => t!(
+            lang,
+            en: "Could not start the background service.",
+            zh: "没能启动后台服务",
         ),
         ResumeSessionsExplain => t!(
             lang,
@@ -2098,6 +2121,9 @@ mod tests {
             RestartCancelled,
             RestartDone,
             RestartFailed,
+            RestartNothingToRestart,
+            RestartStartedDaemonOnly,
+            RestartStartFailed,
             ResumeSessionsExplain,
             ResumeSessionsAsk,
             ResumeSessionsWillContinue,
@@ -2137,7 +2163,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 154, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 157, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

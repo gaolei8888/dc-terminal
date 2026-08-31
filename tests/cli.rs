@@ -443,16 +443,29 @@ mod restart {
         );
     }
 
-    /// 没有守护进程时 `dct restart` 不许拉起一个：重启不是启动。
+    /// 没有守护进程时 `dct restart` 就地起一个。
+    ///
+    /// 用户敲 restart 要的是「敲完之后后台跑着新的」，后台此刻空不空是过程
+    /// 细节。把这条当成「重启不是启动」拦下来，用户只会照提示再敲一次
+    /// `dct`——那一步不给他任何东西。
+    ///
+    /// 这里没有终端（`output()` 给的 stdin 是关掉的），所以走的是「只拉守护
+    /// 进程、不开界面」那半条路——TUI 在测试进程里本来也开不起来。
     #[test]
-    fn restart_without_a_daemon_says_so_and_starts_nothing() {
+    fn restart_without_a_daemon_starts_one() {
         let home = tempfile::tempdir().unwrap();
-        let (out, _, code) = run_with_home(home.path(), &["restart", "-y"]);
-        assert_eq!(code, 0, "「本来没东西在跑」是正常答案");
-        assert!(!out.trim().is_empty(), "得说一句话");
-        assert!(
-            !home.path().join(".dct").join("daemon.sock").exists(),
-            "restart 把守护进程拉起来了——重启不是启动"
-        );
+        let sock = home.path().join(".dct").join("daemon.sock");
+        let (out, err, code) = run_with_home(home.path(), &["restart", "-y"]);
+
+        // 起来的那个不是任何 `Child`（`spawn_daemon` 是脱开的），只能按 socket
+        // 上报的 pid 收拾——**断言之前先杀**，否则断言一挂就在开发机上留一个
+        // 常驻守护进程。
+        let pid = current_pid(&sock);
+        if let Some(pid) = pid {
+            dct::sys::proc::hard_kill(pid);
+        }
+
+        assert_eq!(code, 0, "该起成功：stdout={out} stderr={err}");
+        assert!(pid.is_some(), "restart 没把守护进程拉起来：{out}");
     }
 }

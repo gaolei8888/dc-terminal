@@ -246,6 +246,17 @@ pub fn parse_restart_args(args: &[String], lang: Lang) -> Restart {
     }
 }
 
+/// `run_restart` 干完之后，还剩什么要 `main` 接着做。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Restarted {
+    /// 事情办完了（或者压根没往下走），按这个退出码退出。
+    Exit(i32),
+    /// 后台本来就空着，没有「旧的」可换。剩下的活是**启动**，而启动要开
+    /// 界面、要问「接不接回上次的会话」——那些都长在 `main::run_ui` 上，
+    /// 这里只把球传回去。
+    StartFresh,
+}
+
 /// `dct restart`：把守护进程换成当前这个二进制，不开界面。
 ///
 /// 为什么要有它：换掉守护进程这条路本来只有一个入口——界面启动时撞上旧版本
@@ -255,25 +266,30 @@ pub fn parse_restart_args(args: &[String], lang: Lang) -> Restart {
 /// `pkill -f "dct daemon"` 可用——而那条路认的是进程不是会话，跟本模块开头
 /// 说的是同一个问题。
 ///
-/// **它跟 `ps`/`stop` 一样不会拉起守护进程。** 本来没东西在跑的时候，
-/// `restart` 想要的那个东西（换掉在跑的那个）压根不存在；顺手起一个等于
-/// 把「重启」偷偷变成「启动」，而启动是 `dct` 自己的事。
+/// **后台空着的时候它会起一个**，跟 `ps`/`stop` 那条「绝不顺手拉起」的规矩
+/// 不一样，这是故意的：`ps` 问的是「有没有东西在跑」，把「没有」变成「有」
+/// 是答非所问；而 `restart` 是一句祈使句——用户要的是「敲完这行，后台跑着
+/// 新的」，后台此刻空不空是过程细节，不是他要的答案。拿这个当「重启不是
+/// 启动」拦下来，用户只会照着提示再敲一次 `dct`，那一步不给他任何东西。
 ///
-/// 返回值是退出码：换成了 0，参数不对 2，没换成 1。**「本来就没东西在跑」
-/// 是 0**，跟 `ps` 同一条规矩：那是个正常答案，不是错误。
-pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result<i32> {
+/// 返回 `StartFresh` 的时候**这里一句话都还没干**：连守护进程都没拉，因为
+/// 拉起之前还有一句「要不要接回上次的会话」要问（`main::run_ui`）。
+pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result<Restarted> {
     let ask = match args {
         Restart::Usage(msg) => {
             eprintln!("{msg}");
-            return Ok(2);
+            return Ok(Restarted::Exit(2));
         }
         Restart::Ask => true,
         Restart::Yes => false,
     };
 
     let Some(mut c) = connect(sock) else {
-        println!("{}", text(Key::NoDaemonRunning, lang));
-        return Ok(0);
+        // 没有旧的可换，也就没有「会断掉正在跑的会话」这个代价——所以这条
+        // 路**不问 y/n**，`-y` 在这里没有意义：要问的那句话（接不接回上次
+        // 的会话）在 `run_ui` 里，那是另一个问题。
+        println!("{}", text(Key::RestartNothingToRestart, lang));
+        return Ok(Restarted::StartFresh);
     };
 
     if ask {
@@ -301,7 +317,7 @@ pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result
             && answer.trim().eq_ignore_ascii_case("y");
         if !said_yes {
             println!("{}", text(Key::RestartCancelled, lang));
-            return Ok(0);
+            return Ok(Restarted::Exit(0));
         }
     }
 
@@ -311,11 +327,11 @@ pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result
     match crate::client::restart_daemon(sock, exe) {
         Ok(()) => {
             println!("{}", text(Key::RestartDone, lang));
-            Ok(0)
+            Ok(Restarted::Exit(0))
         }
         Err(_) => {
             eprintln!("{}", text(Key::RestartFailed, lang));
-            Ok(1)
+            Ok(Restarted::Exit(1))
         }
     }
 }
