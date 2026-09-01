@@ -306,3 +306,33 @@ Task 5: complete (commits cd4a6cb..c951e0c, review clean) — 846 lib tests.
   no test; the new test asserts from the destinations side instead. Fine today, worth closing when
   someone next touches the fake.
 BASE for Task 6 = c951e0c
+Task 6: initial (commits 826c6c6..feaabe5) — 857 lib tests. Implementer caught the NINTH plan error:
+  set_event_sink's signature said mpsc::Sender, which has no try_send and is UNBOUNDED — directly
+  contradicting the task's own "bounded, drop when full, never block". It compiled a probe to
+  confirm, then used SyncSender. Reviewer: copying the plan verbatim would have silently turned
+  "bounded, drop when full" into "unbounded, grow forever", leaking two Strings per session every
+  200ms behind a dead consumer.
+Task 6: review 1 — spec ✅, quality NOT APPROVED. 3 Important.
+  I1 ONE DEBOUNCE WINDOW IS SHARED ACROSS ALL THREE EVENT KINDS, so a terminal event is swallowed
+     permanently: agent finishes a round (Stopped fires, last_notified = t), process exits within
+     30s -> the Vanished event is silently discarded, and Vanished is ONE-SHOT — no later tick
+     retries it. MY SPEC'S FAULT: the debounce paragraph scopes the window to Idle->Working->Idle
+     flapping while the same spec calls the death event 「你最该知道的事」.
+  I2 two of the three call sites have ZERO coverage — delete the Failed or Vanished call outright
+     and the suite stays green. The sweep found exactly this bug at the Stopped site; the same
+     mutation at the other two is undetectable.
+  I3 consume_events does not recheck is_retired() — Task 5's Critical 2 shape again: the user gets
+     a Telegram message AFTER pressing x. Dropping the sender does not save you, because recv()
+     drains buffered values before reporting disconnection.
+  TENTH PLAN ERROR, and the worst so far: NOTHING WIRES set_event_sink OR run_events INTO daemon.rs,
+     and no later task's file list claims daemon.rs either. The feature is inert at runtime, and
+     because both fns are pub, NO DEAD-CODE WARNING SURFACES IT — nothing in a build or test run
+     would ever tell you. The implementer was right to decline guessing (Bridge's lifecycle in
+     daemon.rs carries Task 5's Critical 2 ordering argument that no type enforces).
+     Task 11's end-to-end step cannot pass without it, so it is not optional polish.
+     Reviewer produced the smallest correct wiring + 7 invariants; dispatched as item 4.
+     Key insight I had missed: set_event_sink(None) dropping the only SyncSender is the ONLY
+     mechanism that can terminate a blocked consume_events thread — so Option is structurally
+     necessary, not stylistic.
+CARRY-FORWARD TO TASK 11: SyncSender drops NEWEST; the plan's Task 11 QUEUE_CAP test specifies
+  drop-OLDEST. Settle it there or the divergence surfaces at Step 5.
