@@ -1,9 +1,11 @@
-# 训练营自己的网关。学生不注册、不充值，钥匙由老师发。
+# 训练营自己的网关。学生自己注册，钥匙在自己的个人空间里拿。
 #
-# **上线前必须换掉两个地方**：下面 `[env]`/`[api]`/`[secret.verify]` 里的
-# 主机名，和 `[secret].url`（学生领钥匙的那一页）。现在填的是 `.example`
-# 占位——那是保留域名，永远解析不到，所以填错了会当场看得出来，不会
-# 悄悄打到别人的服务器上。
+# 主机名指向 dc-llm.tzspace.cn —— 同一个域名下，`/` 是控制台（注册、个人
+# 空间），`/v1/*` 是网关本身。所以下面三处地址同源，不是三个服务。
+#
+# base_url 不带 `/v1`：Claude Code 自己会往后面接 `/v1/messages`。写成
+# `.../v1` 会让它去请求 `/v1/v1/messages`，那是一个 404，而错误信息里
+# 只会说找不到，不会说是谁多写了一段。
 name = "dc"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
@@ -21,8 +23,8 @@ zh = "DC"
 en = "DC"
 
 [note]
-zh = "训练营自带，钥匙问老师要"
-en = "Bundled with the camp; ask your teacher for the key"
+zh = "训练营自带，钥匙在个人空间里拿"
+en = "Bundled with the camp; get your key from your own account page"
 
 # 装的是 claude 那个 CLI——这个 profile 只是把它指向别处，没有自己的包。
 # 名字仍然写 `dc`：界面发给 shell 的是 `dct install dc`，学生看到的
@@ -35,7 +37,7 @@ zh = "需要先装 Node.js"
 en = "Requires Node.js"
 
 [env]
-ANTHROPIC_BASE_URL = "https://llm.dc.example/anthropic"
+ANTHROPIC_BASE_URL = "https://dc-llm.tzspace.cn"
 # 网关如果做不到「进来什么模型名都落到默认模型」，就把下面两行打开、
 # 填上真名字。**两行都要**：claude 那个 CLI 干活用一个模型，起标题、
 # 扫文件这类杂活另外叫一个便宜的快模型，只钉住前一个的话，杂活会以
@@ -45,17 +47,17 @@ ANTHROPIC_BASE_URL = "https://llm.dc.example/anthropic"
 
 [secret]
 env = "ANTHROPIC_AUTH_TOKEN"
-url = "https://dc.example/key"
+url = "https://dc-llm.tzspace.cn/me"
 
 [secret.hint]
-zh = "老师发给你的那串字符，粘进来就行"
-en = "Paste the key your teacher gave you"
+zh = "在 dc-llm.tzspace.cn 登录后，个人空间里复制自己的密钥"
+en = "Sign in at dc-llm.tzspace.cn and copy the key from your account page"
 
 [secret.verify]
-url = "https://llm.dc.example/anthropic/v1/messages"
+url = "https://dc-llm.tzspace.cn/v1/messages"
 
 [api]
-base_url = "https://llm.dc.example/anthropic"
+base_url = "https://dc-llm.tzspace.cn"
 wire = "anthropic"
 
 [headless]
