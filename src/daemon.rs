@@ -24,22 +24,28 @@ use crate::verify::{send_probe, verify_with, VerifyOutcome};
 /// 停不掉的话，用户退出去了，后台还在替他领钥匙。
 type PairTable = BTreeMap<String, PairSlot>;
 
-// `started`/`opt_in_llm` 目前只被写入、不被这张表自己读回——真正要用它们
-// 的是被 `spawn_pair_poller` 直接 move 进后台线程闭包的那一份拷贝
-// （出于同样理由，`started` 会在轮询线程结束后跟着线程一起消失）。
-// 留在 `PairSlot` 上是因为这张表是配对状态唯一对外可查的地方：将来
-// 任何要在不碰后台线程的前提下问「这条配对当初是哪个 device_code/
-// 勾没勾 opt-in」的代码（诊断、Task 6 的网页）都该来读这里，而不是
-// 各自再想办法把这份状态传一遍。
+// `started` 只被写入、不被这张表自己读回——真正要用它的是被
+// `spawn_pair_poller` 直接 move 进后台线程闭包的那一份拷贝（出于同样
+// 理由，它会在轮询线程结束后跟着线程一起消失）。留在 `PairSlot` 上是
+// 因为这张表是配对状态唯一对外可查的地方：将来任何要在不碰后台线程的
+// 前提下问「这条配对当初是哪个 device_code」的代码（诊断、网页）都该
+// 来读这里，而不是各自再想办法把这份状态传一遍。
+// `opt_in_llm` 不在此列——它是真的共享状态，`PairPoll` 写、后台线程读。
 #[allow(dead_code)]
 struct PairSlot {
     started: crate::pair::Started,
     tick: PairTick,
-    /// Ruling 2：学生在配对屏上勾没勾「报错看不懂时让 AI 解释」，跟着这条
-    /// 配对一路带到后台线程结束的那一刻——落盘（`pair_apply::apply`）
-    /// 发生在那时候，界面早已经不在这条调用栈上了，不存的话这个勾选就是
-    /// 死代码。
-    opt_in_llm: bool,
+    /// 学生在配对屏上勾没勾「报错看不懂时让 AI 解释」，跟着这条配对一路
+    /// 带到后台线程结束的那一刻——落盘（`pair_apply::apply`）发生在那时候，
+    /// 界面早已经不在这条调用栈上了。
+    ///
+    /// **是 `Arc<AtomicBool>` 而不是 `bool`，因为这个值会变。** 学生是在
+    /// `PairStart` 已经发出去之后才在屏幕上看见那行文案的（那一屏要等
+    /// 网关先回一串码），他随后按 `l` 改主意时，唯一还在飞的请求是每
+    /// 500ms 一次的 `PairPoll`——那条请求于是捎着当前值，落在这里，
+    /// 后台线程在真正落盘的那一刻读它。共享一格而不是各存一份，是因为
+    /// 「学生最后一次点头是什么」只能有一个答案。
+    opt_in_llm: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -949,12 +955,23 @@ fn handle(
                 }
             }
         }
-        Request::PairPoll { profile } => Ok(Response::PairTick(
-            recover(pairs.lock())
-                .get(&profile)
-                .map(|s| s.tick.clone())
-                .unwrap_or(PairTick::Waiting),
-        )),
+        Request::PairPoll {
+            profile,
+            opt_in_llm,
+        } => {
+            let pairs = recover(pairs.lock());
+            let slot = pairs.get(&profile);
+            // 顺带把勾选框的当前值收下——界面每 500ms 发一次这条请求，
+            // 学生按 `l` 改的主意就是这么传过来的（见
+            // `proto::Request::PairPoll` 的字段注释）。后台线程在批准
+            // 落地那一刻读同一格，所以「最后一次点头」永远是最新的那次。
+            if let Some(slot) = slot {
+                slot.opt_in_llm.store(opt_in_llm, Ordering::SeqCst);
+            }
+            Ok(Response::PairTick(
+                slot.map(|s| s.tick.clone()).unwrap_or(PairTick::Waiting),
+            ))
+        }
         Request::PairCancel { profile } => {
             if let Some(slot) = recover(pairs.lock()).remove(&profile) {
                 slot.cancel.store(true, Ordering::SeqCst);
@@ -1202,6 +1219,7 @@ fn spawn_pair_poller(
     home: PathBuf,
 ) {
     let cancel = Arc::new(AtomicBool::new(false));
+    let opt_in_llm = Arc::new(AtomicBool::new(opt_in_llm));
     // **顶掉一条旧配对就要先把它停了。** 这张表一个 profile 只有一格，
     // 学生按 `r` 重来（或者界面超时之后重发一条 `PairStart`）时，
     // `insert` 会把上一条的 `PairSlot` 悄悄丢掉——而那条的轮询线程还活着，
@@ -1215,7 +1233,7 @@ fn spawn_pair_poller(
         PairSlot {
             started: started.clone(),
             tick: PairTick::Waiting,
-            opt_in_llm,
+            opt_in_llm: opt_in_llm.clone(),
             cancel: cancel.clone(),
         },
     ) {
@@ -1234,8 +1252,10 @@ fn spawn_pair_poller(
             std::thread::sleep(Duration::from_millis(250));
             let send = |dc: &str| crate::pair_http::poll(&origin, dc, &agent);
             let apply = |a: &crate::pair::Approved| {
-                // 落盘在这里做完，钥匙不过 socket。
-                crate::pair_apply::apply(a, &home, &secrets, opt_in_llm)
+                // 落盘在这里做完，钥匙不过 socket。**勾选框的值在这一刻
+                // 才读**，不是起步那一刻：学生是在看见那行文案之后才决定
+                // 的，`PairPoll` 一路把他的最新答案捎到了这一格。
+                crate::pair_apply::apply(a, &home, &secrets, opt_in_llm.load(Ordering::SeqCst))
             };
             let now = std::time::Instant::now();
             let projected = match pair_poll_once(&mut machine, now, &cancel, &send, &apply) {

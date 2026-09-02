@@ -484,10 +484,24 @@ pub enum Key {
     PairDoneQwenOnly,
     /// `p` 键的说明：手动填密钥这条退路，四个阶段都在。
     PairManualHint,
-    /// Waiting/Done 屏上那一行小字：这次配对有没有顺手打开「报错时的 AI
-    /// 解释」——读的是本地 `[llm]` 写没写（`pair_view::opt_in_llm` 的
-    /// 文档注释），不是又开一屏问一遍。
+    /// Done 屏上那一行小字：这次配对顺手打开了「报错时的 AI 解释」。
+    /// 只在学生真的勾着走完的时候出现——没勾就整行不出现，沉默本身就是
+    /// 「没开」。
     PairLlmOptIn,
+    /// 配对屏上那个勾选框，**勾着**的样子。文案要说清代价而不只是好处：
+    /// 打开这个功能意味着一个失败会话屏幕上最后 2000 个字符会被原样送到
+    /// 训练营网关（见 `config.rs` 开头那段隐私边界）。学生看不见代价就
+    /// 谈不上「他决定过」，这一行的措辞是这条边界成立的前提。
+    PairLlmToggleOn,
+    /// 同上，**没勾**的样子。两条词条只差那个方框里的字符，分成两条而不是
+    /// 现拼一个前缀，是因为 `[×]`/`[ ]` 在两种语言里都要能被译者原样看见。
+    PairLlmToggleOff,
+    /// 配对屏上代替勾选框的那一行：`~/.dct/config.toml` 里已经有 `[llm]` 了。
+    /// 这个决定用户自己做过，配对不去改它，也不再问一遍——`llm_optin::enable`
+    /// 那条「已经有就一个字都不动」的规矩在屏幕上的样子。
+    PairLlmAlreadySet,
+    /// 底栏：`l` 切换上面那个勾选框。
+    PairLlmToggle,
     /// 底栏：重开浏览器（Waiting 阶段的 `o`）。
     ReopenBrowser,
     /// 底栏：重试（`Failed { retryable: true }` 阶段的 `r`）。
@@ -1059,8 +1073,28 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         }
         PairLlmOptIn => t!(
             lang,
-            en: "AI error explanations: on (from your [llm] config)",
-            zh: "报错时的 AI 解释：已开启（读的是你的 [llm] 配置）",
+            en: "AI error explanations are now on.",
+            zh: "报错时的 AI 解释：已经替你打开了",
+        ),
+        PairLlmToggleOn => t!(
+            lang,
+            en: "[x] Let AI explain errors you can't read (sends the raw error text from your terminal to the camp gateway)",
+            zh: "[×] 报错看不懂时让 AI 解释（会把终端上的报错原文发给训练营网关）",
+        ),
+        PairLlmToggleOff => t!(
+            lang,
+            en: "[ ] Let AI explain errors you can't read (sends the raw error text from your terminal to the camp gateway)",
+            zh: "[ ] 报错看不懂时让 AI 解释（会把终端上的报错原文发给训练营网关）",
+        ),
+        PairLlmAlreadySet => t!(
+            lang,
+            en: "Your config.toml already has an [llm] section, so pairing leaves it exactly as it is.",
+            zh: "你的 config.toml 里已经写了 [llm]，这次配对不会去改它",
+        ),
+        PairLlmToggle => t!(
+            lang,
+            en: "AI explanations on/off",
+            zh: "AI 解释开关",
         ),
         ReopenBrowser => t!(lang, en: "reopen browser", zh: "重开浏览器"),
         Retry => t!(lang, en: "retry", zh: "重试"),
@@ -2330,6 +2364,10 @@ mod tests {
             PairDoneQwenOnly,
             PairManualHint,
             PairLlmOptIn,
+            PairLlmToggleOn,
+            PairLlmToggleOff,
+            PairLlmAlreadySet,
+            PairLlmToggle,
             ReopenBrowser,
             Retry,
             ManualEntry,
@@ -2362,7 +2400,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 182, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 186, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

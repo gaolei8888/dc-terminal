@@ -76,7 +76,13 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 11 = 配对。多了 `Request::PairStart` / `PairPoll` / `PairCancel`，
 /// `Response::PairStarted` / `PairTick`。旧守护进程完全不认识这三条请求，
 /// 界面发过去只会得到一句解析失败——跟 `Kill`/`Prune` 那次加一是同一个理由。
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// 12 = 配对屏上那个 `[llm]` 勾选框真的能按了。`PairPoll` 多了一个
+/// `opt_in_llm` 字段：学生是在 `PairStart` 已经发出去之后才看见那行文案的，
+/// 改主意得有一条路送到 daemon，而每 500ms 就要发一次的 `PairPoll` 正是
+/// 那条路（理由见 `ui::pair_view::pair_poll_request`）。旧守护进程解不出
+/// 多了一个字段的 `PairPoll`——形状变了就得加一，这条规矩没有例外。
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +333,14 @@ pub enum Request {
     /// 因为它要跑 15 分钟，而界面这条连接 5 秒就超时（`client.rs:11`）。
     PairPoll {
         profile: String,
+        /// 勾选框的**当前**值，每一轮捎带一次。
+        ///
+        /// `PairStart` 带的那一份是起步那一刻的，而学生是在那之后才看见
+        /// 「会把终端上的报错原文发给训练营网关」这句话的——他取消勾选
+        /// 时，起步请求早飞走了。捎在这条本来就要发的请求上，而不是新加
+        /// 一条「改主意了」：捎带是幂等的，丢一次下一轮自己补上；一条
+        /// 单发的通知丢了就再没有人会发现。daemon 一直读到批准落地为止。
+        opt_in_llm: bool,
     },
     /// 取消。**必须真的停线程并丢掉 `device_code`**：不停的话，用户退出去了，
     /// 后台还在替他领钥匙，领到了写进 secrets，而他以为自己取消了。
@@ -470,9 +484,13 @@ impl std::fmt::Debug for Request {
                 .field("profile", profile)
                 .field("opt_in_llm", opt_in_llm)
                 .finish(),
-            Request::PairPoll { profile } => f
+            Request::PairPoll {
+                profile,
+                opt_in_llm,
+            } => f
                 .debug_struct("PairPoll")
                 .field("profile", profile)
+                .field("opt_in_llm", opt_in_llm)
                 .finish(),
             Request::PairCancel { profile } => f
                 .debug_struct("PairCancel")
@@ -938,6 +956,7 @@ mod tests {
             },
             Request::PairPoll {
                 profile: "p".into(),
+                opt_in_llm: true,
             },
             Request::PairCancel {
                 profile: "p".into(),
@@ -978,8 +997,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                11,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p"}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
+                12,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1033,6 +1052,7 @@ mod tests {
             },
             Request::PairPoll {
                 profile: "dc".into(),
+                opt_in_llm: true,
             },
             Request::PairCancel {
                 profile: "dc".into(),
@@ -1099,7 +1119,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                11,
+                12,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1206,7 +1226,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (11, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (12, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

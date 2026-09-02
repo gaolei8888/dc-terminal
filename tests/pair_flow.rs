@@ -37,7 +37,7 @@ fn a_full_pairing_writes_both_secrets_and_both_model_names() {
         other => panic!("配对没能起步：{other:?}"),
     }
 
-    let tick = common::wait_for_tick(&d, "dc", Duration::from_secs(10));
+    let tick = common::wait_for_tick(&d, "dc", true, Duration::from_secs(10));
     assert!(
         matches!(
             tick,
@@ -127,4 +127,63 @@ fn cancelling_means_nothing_is_ever_written() {
         !home.path().join("config.toml").exists(),
         "取消之后 [llm] 更不该被自举出来"
     );
+}
+
+/// **勾选框取消掉之后，`[llm]` 一个字都不许被写出来。**
+///
+/// 这条测试钉的是那条链子的中段。`PairStart` 是在学生看见那行文案之前
+/// 就发出去的（那一屏要先等网关回一串码），所以他按 `l` 取消勾选时，
+/// 唯一还能把新答案送到 daemon 的东西是每一轮的 `PairPoll`。中段一旦断了
+/// ——`PairPoll` 不带这个字段，或者 daemon 收下了却不用它——屏幕上那个框
+/// 照样能勾能取消，磁盘上却永远按起步那一刻的值来。那种坏法在界面上
+/// 完全看不出来，只有这里能抓住。
+///
+/// 用卡住的假网关是为了让取消勾选**落在批准之前**：轮询已经发出去、
+/// 正堵在网络上，这时候界面捎来一个 `false`，随后网关才批准。
+#[test]
+fn unticking_the_box_before_approval_keeps_llm_out_of_the_config() {
+    let gw = common::fake_gateway_gated();
+    let home = tempfile::tempdir().unwrap();
+    let d = common::daemon_with(home.path(), &gw.origin());
+
+    // 起步时框还勾着——那是默认值，学生还没看见那一屏。
+    match d.call(Request::PairStart {
+        profile: "dc".into(),
+        opt_in_llm: true,
+    }) {
+        Response::PairStarted(Ok(_)) => {}
+        other => panic!("配对没能起步：{other:?}"),
+    }
+
+    gw.wait_for_poll_inflight(Duration::from_secs(10));
+
+    // 学生读完那行「会把终端上的报错原文发给训练营网关」，按了 `l`。
+    // 界面下一轮的 `PairPoll` 就是这条。
+    match d.call(Request::PairPoll {
+        profile: "dc".into(),
+        opt_in_llm: false,
+    }) {
+        Response::PairTick(_) => {}
+        other => panic!("轮询该照常回一个 tick：{other:?}"),
+    }
+
+    gw.approve();
+    let tick = common::wait_for_tick(&d, "dc", false, Duration::from_secs(10));
+    assert!(
+        matches!(tick, PairTick::Done { .. }),
+        "配对本身要照常成功：{tick:?}"
+    );
+
+    // 钥匙照写——取消的是「AI 解释」这一件事，不是整条配对。
+    let secrets = std::fs::read_to_string(home.path().join("secrets.toml")).unwrap();
+    assert!(secrets.contains("dc"), "{secrets}");
+
+    // 而 `[llm]` 一个字都不该有。
+    match std::fs::read_to_string(home.path().join("config.toml")) {
+        Err(_) => {}
+        Ok(cfg) => assert!(
+            !cfg.contains("[llm]"),
+            "学生取消了勾选，配对却还是把 [llm] 写了出来：{cfg}"
+        ),
+    }
 }

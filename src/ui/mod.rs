@@ -643,10 +643,11 @@ pub fn run(
                 if let View::Pair {
                     profile,
                     phase: PairPhase::Starting,
+                    opt_in,
                 } = app.view.clone()
                 {
                     if profile == stamped_profile {
-                        app.view = pair_view::apply_started(&mut app, profile, outcome);
+                        app.view = pair_view::apply_started(&mut app, profile, opt_in, outcome);
                     }
                 }
             }
@@ -659,19 +660,27 @@ pub fn run(
         if let View::Pair {
             profile,
             phase: PairPhase::Waiting { .. },
+            opt_in,
         } = app.view.clone()
         {
             let due = app
                 .pair_last_fetch
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
             if due {
-                if let Ok(Response::PairTick(tick)) = app.client().and_then(|c| {
-                    c.call(Request::PairPoll {
-                        profile: profile.clone(),
-                    })
-                }) {
-                    if let View::Pair { phase: current, .. } = app.view.clone() {
-                        app.view = pair_view::apply_tick(app.lang, profile, current, tick);
+                // 这条请求顺带把勾选框的当前值送给 daemon——学生按 `l`
+                // 改的主意只有这一条路能到那边（见
+                // `pair_view::pair_poll_request`）。
+                let req = pair_view::pair_poll_request(profile.clone(), opt_in);
+                if let Ok(Response::PairTick(tick)) = app.client().and_then(|c| c.call(req)) {
+                    // 勾选框的值从**此刻的视图**上重新取一遍：上面那次
+                    // clone 到现在之间，用户完全可能刚按过 `l`。
+                    if let View::Pair {
+                        phase: current,
+                        opt_in,
+                        ..
+                    } = app.view.clone()
+                    {
+                        app.view = pair_view::apply_tick(app.lang, profile, opt_in, current, tick);
                     }
                 }
                 app.pair_last_fetch = Some(std::time::Instant::now());

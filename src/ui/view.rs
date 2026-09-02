@@ -217,7 +217,46 @@ pub(crate) enum View {
     Pair {
         profile: String,
         phase: PairPhase,
+        /// 「报错看不懂时让 AI 解释」那个勾选框的状态。**住在视图里，不是
+        /// 全局**：它属于这一次配对，学生退出去再进来就该重新按默认值来，
+        /// 而不是继承上一次的手感。spec 第 3 节要求这个勾选框存在，并且
+        /// 默认勾上、文案说清代价——`config.rs` 开头那段隐私边界的全部
+        /// 依据就是「有个人当面看着代价点了头」，看不见的勾等于没有。
+        opt_in: LlmOptIn,
     },
+}
+
+/// 配对屏上那个「报错看不懂时让 AI 解释」的勾选框。
+///
+/// 三态压成两支：能选（`Choice`）和这个决定已经做过了（`AlreadyConfigured`）。
+/// 后者是 `~/.dct/config.toml` 里已经有 `[llm]` 那一段的情形——
+/// `llm_optin::enable` 在那种文件上一个字都不动（它没法知道用户当初写下
+/// 那段时是怎么想的），所以屏幕上也不该摆一个按下去什么都不会发生的勾选框。
+/// 那一屏改成说一句「已经有了，这次配对不动它」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LlmOptIn {
+    /// 学生可以勾/取消，`bool` 是当前值。起步默认 `true`（spec 第 3 节）。
+    Choice(bool),
+    /// 配置里已经有 `[llm]`，不给勾选框，也不发一个会被拒绝的请求。
+    AlreadyConfigured,
+}
+
+impl LlmOptIn {
+    /// 送上线的那个 bool。`AlreadyConfigured` 一律 `false`——不是「学生不
+    /// 想要」，是「这次配对没有资格去动那一段」。让 daemon 去调
+    /// `llm_optin::enable` 再被它拒绝也能得到同样的结果，但那要靠两处逻辑
+    /// 恰好互补；在这里就说清楚，少一个会漂开的耦合。
+    pub(crate) fn wire(&self) -> bool {
+        matches!(self, LlmOptIn::Choice(true))
+    }
+
+    /// `l` 键：只有可选的那一支会变。
+    pub(crate) fn toggled(&self) -> LlmOptIn {
+        match self {
+            LlmOptIn::Choice(v) => LlmOptIn::Choice(!v),
+            LlmOptIn::AlreadyConfigured => LlmOptIn::AlreadyConfigured,
+        }
+    }
 }
 
 /// 配对屏正处在哪个阶段。
@@ -1610,7 +1649,7 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 道理——`r` 只在 `retryable` 的失败上写，`o` 只在等码的那一屏写
         // （那是唯一存着 URL 的阶段），`p`（手动填）在**每一个**阶段都写：
         // 见 `pair_view.rs` 的 `manual_entry_stays_reachable_from_every_phase`。
-        View::Pair { phase, .. } => {
+        View::Pair { phase, opt_in, .. } => {
             let mut items: Vec<(&'static str, Key)> = Vec::new();
             match phase {
                 PairPhase::Starting => items.push(("", Key::Verifying)),
@@ -1624,6 +1663,15 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
                     retryable: false, ..
                 }
                 | PairPhase::Done { .. } => {}
+            }
+            // `l` 只在还改得动的时候写：批准落地之后（`Done`）那个勾选
+            // 已经被 daemon 用掉了，一个按下去不会有任何效果的键写在底栏
+            // 上比不写更坏。已经有 `[llm]` 的那一支同理——那一屏摆的是
+            // 一句说明，不是一个勾选框。
+            if matches!(opt_in, LlmOptIn::Choice(_))
+                && matches!(phase, PairPhase::Starting | PairPhase::Waiting { .. })
+            {
+                items.push(("l", Key::PairLlmToggle));
             }
             items.push(("p", Key::ManualEntry));
             items.push(("Esc", Key::Cancel));

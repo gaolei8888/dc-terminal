@@ -29,7 +29,7 @@ use crate::i18n::{msg, text, Key, Lang};
 use crate::proto::{socket_path, PairStartedInfo, PairTick, Request, Response, SecretPrompt};
 
 use super::app::App;
-use super::view::{is_plain_key, PairPhase, SecretPhase, View};
+use super::view::{is_plain_key, LlmOptIn, PairPhase, SecretPhase, View};
 use super::widgets::Msg;
 use super::{accent, danger, dim, open_url};
 
@@ -41,37 +41,67 @@ fn origin_for(app: &App, profile: &str) -> Option<String> {
     crate::daemon::pair_origin(&dir, profile)
 }
 
-/// 这次配对要不要顺手打开「报错时的 AI 解释」。**唯一的信号来源是本地
-/// `[llm]` 那一段写没写**——`config.rs` 头上那段说得很清楚：用户显式写下
-/// `[llm]`，哪怕一个字段都不填，就是那个隐私边界上唯一一次人的点头。
-/// 配对屏不另开一屏重新问一遍：那份点头（或者没有点头）已经躺在磁盘上，
-/// 这里只是如实带上，交给 `Request::PairStart`——真正落盘发生在 daemon
-/// 的后台线程里（见 `proto::Request::PairStart` 的文档注释），界面这一刻
-/// 早就不在那条调用栈上了，所以这个 bool 必须现在就问清楚、跟着请求走。
-pub(crate) fn opt_in_llm(app: &App) -> bool {
+/// 这次配对的勾选框从什么状态起步。
+///
+/// **默认勾上**（spec 第 3 节），除非 `~/.dct/config.toml` 里已经有 `[llm]`
+/// 那一段——那种情况下这个决定用户自己做过了，`llm_optin::enable` 也拒绝
+/// 去动一份已经有 `[llm]` 的文件（它没法知道用户当初是怎么想的），所以
+/// 屏幕上摆一个按下去什么都不会发生的勾选框是骗人。那一支给
+/// `AlreadyConfigured`，屏上换成一句说明。
+///
+/// 这里读盘一次，读到的值随即住进 `View::Pair`：真正落盘发生在 daemon 的
+/// 后台线程里（见 `proto::Request::PairStart` 的文档注释），界面那一刻早
+/// 不在这条调用栈上，所以这个状态必须现在就问清楚、跟着请求走。
+pub(crate) fn initial_opt_in(app: &App) -> LlmOptIn {
     let path = crate::config::config_path_for_socket(&app.socket);
-    crate::config::Config::load(&path).llm.is_some()
+    if crate::config::Config::load(&path).llm.is_some() {
+        LlmOptIn::AlreadyConfigured
+    } else {
+        LlmOptIn::Choice(true)
+    }
+}
+
+/// 起步那条请求。**抽成一个函数是为了让「界面默认勾着」和「线上真的送了
+/// true」之间那一段能被测试钉住**——这条链子的中段一直没人测：两头
+/// （界面读配置、daemon 收到 true 就写 `[llm]`）各有测试，而中间那一段
+/// 一旦断了，勾选框就是个装饰品，屏幕上照样画着，谁都不会红。
+pub(crate) fn pair_start_request(profile: String, opt_in: LlmOptIn) -> Request {
+    Request::PairStart {
+        profile,
+        opt_in_llm: opt_in.wire(),
+    }
+}
+
+/// 每一轮读状态的那条请求，**顺带把勾选框的当前值捎给 daemon**。
+///
+/// 起步那一刻发出去的值可能已经不作数了：学生看见那行文案之后才决定取消
+/// 勾选，而 `PairStart` 早就发出去了。用的是这条本来每 500ms 就要发一次的
+/// 请求，而不是新加一条「改主意了」的请求：捎带是幂等的，丢一次下一轮
+/// 自己就补上了，一条单发的通知丢了就再也没有人会发现。批准落地之前
+/// daemon 会一直读到最新值，落地之后再改也没有意义（那时候 `[llm]` 已经
+/// 写完或者已经决定不写），所以窗口正好是学生看得见勾选框的那段时间。
+pub(crate) fn pair_poll_request(profile: String, opt_in: LlmOptIn) -> Request {
+    Request::PairPoll {
+        profile,
+        opt_in_llm: opt_in.wire(),
+    }
 }
 
 /// 起一条配对：真网络（daemon 转发到网关的 `/pair/start`），**必须丢给
 /// 后台线程**——同 `secret.rs`/`phone.rs` 里「Enter 提交」的道理，不能堵
 /// 在按键循环里，等待的这几秒会话视图也要继续刷新。
 pub(crate) fn start_pairing(app: &mut App, profile: String) {
-    let opt_in = opt_in_llm(app);
+    let opt_in = initial_opt_in(app);
     let (tx, rx) = std::sync::mpsc::channel();
     let sock = socket_path();
     // 发起时的身份留一份在这——线程闭包要吃掉 `profile` 本体去发请求，
     // 视图和送回来的结果都得靠这份拷贝对上号（同 `verify_rx` 的道理）。
     let view_profile = profile.clone();
     let stamped = profile.clone();
+    let req = pair_start_request(profile, opt_in);
     std::thread::spawn(move || {
         let outcome = crate::client::Client::connect(&sock)
-            .and_then(|mut c| {
-                c.call(Request::PairStart {
-                    profile,
-                    opt_in_llm: opt_in,
-                })
-            })
+            .and_then(|mut c| c.call(req))
             .map(|r| match r {
                 Response::PairStarted(res) => res,
                 _ => Err("unreachable".to_string()),
@@ -83,6 +113,7 @@ pub(crate) fn start_pairing(app: &mut App, profile: String) {
     app.view = View::Pair {
         profile: view_profile,
         phase: PairPhase::Starting,
+        opt_in,
     };
 }
 
@@ -91,6 +122,7 @@ pub(crate) fn start_pairing(app: &mut App, profile: String) {
 pub(crate) fn apply_started(
     app: &mut App,
     profile: String,
+    opt_in: LlmOptIn,
     outcome: Result<PairStartedInfo, String>,
 ) -> View {
     match outcome {
@@ -111,6 +143,7 @@ pub(crate) fn apply_started(
                         message: text(Key::PairProfileUnreadable, app.lang).to_string(),
                         retryable: false,
                     },
+                    opt_in,
                 };
             };
             let url = format!("{origin}{}?code={}", info.verify_path, info.user_code);
@@ -128,6 +161,7 @@ pub(crate) fn apply_started(
                     deadline: std::time::Instant::now()
                         + std::time::Duration::from_secs(info.expires_in),
                 },
+                opt_in,
             }
         }
         Err(reason) => View::Pair {
@@ -136,6 +170,7 @@ pub(crate) fn apply_started(
                 message: fail_message(&reason, app.lang),
                 retryable: true,
             },
+            opt_in,
         },
     }
 }
@@ -143,11 +178,18 @@ pub(crate) fn apply_started(
 /// 一次 `PairPoll` 的结果（`ui/mod.rs` 主循环里节流调用）变成下一屏。
 /// `current` 是眼下这一屏的 `PairPhase`——`PairTick::Waiting` 时原样
 /// 留着（`user_code`/`url`/`deadline` 都不该被一次「还没好」的轮询抹掉）。
-pub(crate) fn apply_tick(lang: Lang, profile: String, current: PairPhase, tick: PairTick) -> View {
+pub(crate) fn apply_tick(
+    lang: Lang,
+    profile: String,
+    opt_in: LlmOptIn,
+    current: PairPhase,
+    tick: PairTick,
+) -> View {
     match tick {
         PairTick::Waiting => View::Pair {
             profile,
             phase: current,
+            opt_in,
         },
         PairTick::Done {
             anthropic_ready,
@@ -158,6 +200,7 @@ pub(crate) fn apply_tick(lang: Lang, profile: String, current: PairPhase, tick: 
                 anthropic: anthropic_ready,
                 openai: openai_ready,
             },
+            opt_in,
         },
         // 两种过期不能共享一句话——见 `PairPhase::Failed` 的文档注释和
         // 下面 `the_two_expiries_do_not_share_one_sentence`。`retryable`
@@ -175,6 +218,7 @@ pub(crate) fn apply_tick(lang: Lang, profile: String, current: PairPhase, tick: 
                 },
                 retryable,
             },
+            opt_in,
         },
         PairTick::Failed(reason) => View::Pair {
             profile,
@@ -182,6 +226,7 @@ pub(crate) fn apply_tick(lang: Lang, profile: String, current: PairPhase, tick: 
                 message: fail_message(&reason, lang),
                 retryable: true,
             },
+            opt_in,
         },
     }
 }
@@ -203,7 +248,12 @@ fn fail_message(reason: &str, lang: Lang) -> String {
 /// **这个函数里永远不要 `continue`。** 理由见模块头注释——它是从主循环的
 /// `match app.view.clone()` 里调用的独立函数，`return` 目前是安全的。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::Pair { profile, phase } = app.view.clone() else {
+    let View::Pair {
+        profile,
+        phase,
+        opt_in,
+    } = app.view.clone()
+    else {
         return Ok(());
     };
     // Esc 在任何阶段都是真取消：发 `Request::PairCancel`，不能只切视图。
@@ -243,6 +293,24 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             })
         });
         app.view = manual_entry_view(app, &profile);
+        return Ok(());
+    }
+    // `l`：那个勾选框。**只在批准落地之前认**——`Done` 那一刻 daemon 已经
+    // 拿这个值决定过写不写 `[llm]` 了，再让它翻转只会在屏幕上显示一个跟
+    // 磁盘上不一致的状态。`AlreadyConfigured` 那一支也不认：那一屏摆的是
+    // 一句说明，不是勾选框（`LlmOptIn::toggled` 于是原样返回）。
+    //
+    // 选 `l` 是因为它没和这一屏已有的键（`o` 重开浏览器、`p` 手动填、
+    // `r` 重来、`Esc` 取消）撞上，而且 `llm` 这一段配置本来就叫这个名字。
+    if key.code == KeyCode::Char('l')
+        && is_plain_key(&key)
+        && matches!(phase, PairPhase::Starting | PairPhase::Waiting { .. })
+    {
+        app.view = View::Pair {
+            profile,
+            phase,
+            opt_in: opt_in.toggled(),
+        };
         return Ok(());
     }
     match phase {
@@ -336,8 +404,18 @@ pub(crate) fn phase_line(phase: &PairPhase, lang: Lang) -> String {
     }
 }
 
+/// 勾选框那一行的文字。抽出来是为了让测试直接比对这句话，而不是去屏幕
+/// 缓冲里认一个 `[×]`——那个方框字符在窄终端上会被折行切开。
+pub(crate) fn opt_in_line(opt_in: LlmOptIn, lang: Lang) -> &'static str {
+    match opt_in {
+        LlmOptIn::Choice(true) => text(Key::PairLlmToggleOn, lang),
+        LlmOptIn::Choice(false) => text(Key::PairLlmToggleOff, lang),
+        LlmOptIn::AlreadyConfigured => text(Key::PairLlmAlreadySet, lang),
+    }
+}
+
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Pair { phase, .. } = app.view.clone() else {
+    let View::Pair { phase, opt_in, .. } = app.view.clone() else {
         return;
     };
     let border_style = if app.connected {
@@ -383,12 +461,29 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         )));
     }
 
+    // 勾选框。**学生必须在按下确认之前看见这一行**——spec 第 3 节要的不是
+    // 一个开关，是「一个人当面看着代价点了头」，而代价（终端上的报错原文
+    // 会被送到训练营网关）只有写在他正盯着的这一屏上才算数。所以它跟那串
+    // 大字码待在同一屏，而不是藏在设置页里。
+    //
+    // `Starting` 也画：那一屏可能要等好几秒（网关在教室网络那头），学生
+    // 这时候读到这句话就该能立刻按 `l`，不用先等一个网络往返。批准落地
+    // 之后（`Done`）就不再是个能按的东西了，见下面那一支。
+    if matches!(phase, PairPhase::Starting | PairPhase::Waiting { .. }) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            opt_in_line(opt_in, app.lang),
+            dim(),
+        )));
+    }
+
     // 免费账号那句要点名「Qwen 那一路」+「Claude 需要付费升级」，两句都
     // 已经在 `PairDoneQwenOnly` 里说了；这里只在 Done 阶段额外补一行
-    // 「报错时的 AI 解释」——只在勾了的时候写，没勾就整行不出现（沉默
-    // 本身就是「没开」，不用另开一句「未开启」去提醒一件用户自己决定
-    // 没要的事）。
-    if matches!(phase, PairPhase::Done { .. }) && opt_in_llm(app) {
+    // 「报错时的 AI 解释：已经替你打开了」——只在真勾着走完的时候写，
+    // 没勾就整行不出现（沉默本身就是「没开」，不用另开一句「未开启」去
+    // 提醒一件用户自己决定没要的事）。已经有 `[llm]` 的那一支也不写：
+    // 那不是这次配对干的。
+    if matches!(phase, PairPhase::Done { .. }) && opt_in.wire() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             text(Key::PairLlmOptIn, app.lang),
@@ -427,15 +522,19 @@ mod tests {
     }
 
     // 带着 `TempDir` guard 一起交出去——同 `App::test_app` 文档注释里的
-    // 提醒：不接住它会在函数返回时被立刻删掉，而 `draw()` 里的
-    // `opt_in_llm` 真的会去读 `app.socket` 派生出来的那个配置文件路径
-    // （文件不存在时 `Config::load` 退化成默认值，不会报错，但目录本身
-    // 要还在）。
+    // 提醒：不接住它会在函数返回时被立刻删掉，而 `initial_opt_in` 真的
+    // 会去读 `app.socket` 派生出来的那个配置文件路径（文件不存在时
+    // `Config::load` 退化成默认值，不会报错，但目录本身要还在）。
     fn test_app_with_phase(phase: PairPhase) -> (App, tempfile::TempDir) {
+        test_app_with(phase, LlmOptIn::Choice(true))
+    }
+
+    fn test_app_with(phase: PairPhase, opt_in: LlmOptIn) -> (App, tempfile::TempDir) {
         let (mut app, dir) = App::test_app();
         app.view = View::Pair {
             profile: "dc".into(),
             phase,
+            opt_in,
         };
         (app, dir)
     }
@@ -477,7 +576,12 @@ mod tests {
             verify_path: "/pair".into(),
             expires_in: 900,
         });
-        let view = apply_started(&mut app, "no-such-profile".into(), outcome);
+        let view = apply_started(
+            &mut app,
+            "no-such-profile".into(),
+            LlmOptIn::Choice(true),
+            outcome,
+        );
         match view {
             View::Pair {
                 phase: PairPhase::Failed { retryable, message },
@@ -509,6 +613,7 @@ mod tests {
         app.view = View::Pair {
             profile: "dc".into(),
             phase: phase_waiting(),
+            opt_in: LlmOptIn::Choice(true),
         };
 
         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
@@ -590,6 +695,7 @@ mod tests {
         app.view = View::Pair {
             profile: "dc".into(),
             phase: phase_waiting(),
+            opt_in: LlmOptIn::Choice(true),
         };
 
         handle_key(&mut app, key(KeyCode::Char('p'))).unwrap();
@@ -606,6 +712,141 @@ mod tests {
                 .any(|r| matches!(r, Request::PairCancel { profile } if profile == "dc")),
             "p 必须真的发出 PairCancel，不能把轮询线程留在后台替学生领钥匙"
         );
+    }
+
+    /// **勾选框默认勾着，而且那句话说的是代价。** spec 第 3 节把这两件事
+    /// 都写死了：`[×] 报错看不懂时让 AI 解释（会把终端上的报错原文发给
+    /// 训练营网关）`。没有人看见代价的话，`config.rs` 开头那条隐私边界
+    /// 就只剩一句自我安慰。
+    #[test]
+    fn the_waiting_screen_shows_a_ticked_box_that_names_the_cost() {
+        let (mut app, _dir) = test_app_in_pair_waiting();
+        let lang = app.lang;
+        let lines = render_lines(&mut app);
+        // 宽字符在 ratatui 的 buffer 里占两格，第二格是空串，逐格拼回来的
+        // 字符串于是每个汉字后面多一个空格。比对前把空白全部去掉——这条
+        // 测试关心的是"这句话在不在屏幕上"，不是它怎么排版。
+        assert!(
+            squeeze(&lines.join("")).contains(&squeeze(opt_in_line(LlmOptIn::Choice(true), lang))),
+            "默认勾上的那一行、连同它说的代价，必须印在这一屏上：{lines:?}"
+        );
+        // 那句话本身也要真的说代价，不能只说好处——词条改成一句漂亮话
+        // 的时候这条断言要红。
+        let copy = opt_in_line(LlmOptIn::Choice(true), lang);
+        assert!(copy.starts_with("[×]"), "{copy}");
+        assert!(
+            squeeze(copy).contains(&squeeze("报错原文发给训练营网关")),
+            "{copy}"
+        );
+    }
+
+    /// 逐格读回来的屏幕里，宽字符后面跟着一个空格；比对文案时先挤掉所有
+    /// 空白，测的才是"这句话在不在"，不是它怎么排版。
+    fn squeeze(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// 一个还没写过 `[llm]` 的家目录：起步状态是「可选，且勾着」，
+    /// 送上线的那个 bool 是 `true`。**这是那条链子的中段**——两头
+    /// （界面读配置、daemon 收到 `true` 就写 `[llm]`）本来就有测试，
+    /// 中间这一段一旦断了，勾选框就是个装饰品，屏幕上照样画着，
+    /// 却没有任何东西会红。
+    #[test]
+    fn a_fresh_machine_starts_ticked_and_that_is_what_goes_on_the_wire() {
+        let (app, _dir) = App::test_app();
+        let opt_in = initial_opt_in(&app);
+        assert_eq!(opt_in, LlmOptIn::Choice(true), "默认必须是勾上的");
+        match pair_start_request("dc".into(), opt_in) {
+            Request::PairStart {
+                profile,
+                opt_in_llm,
+            } => {
+                assert_eq!(profile, "dc");
+                assert!(opt_in_llm, "勾着的框必须真的送一个 true 上线");
+            }
+            other => panic!("该是 PairStart，实际 {other:?}"),
+        }
+        match pair_poll_request("dc".into(), opt_in.toggled()) {
+            Request::PairPoll { opt_in_llm, .. } => {
+                assert!(!opt_in_llm, "取消勾选之后每一轮轮询都要把新答案捎给 daemon")
+            }
+            other => panic!("该是 PairPoll，实际 {other:?}"),
+        }
+    }
+
+    /// `l` 翻转勾选框，而且**只在批准落地之前**。`Done` 之后 daemon 已经
+    /// 拿这个值决定过写不写 `[llm]` 了，再让它在屏幕上翻转就是显示一个跟
+    /// 磁盘不一致的状态。
+    #[test]
+    fn l_toggles_the_box_before_approval_and_is_inert_after() {
+        let (mut app, _dir) = test_app_in_pair_waiting();
+        handle_key(&mut app, key(KeyCode::Char('l'))).unwrap();
+        let View::Pair { opt_in, .. } = app.view.clone() else {
+            panic!("按 l 不该离开配对屏");
+        };
+        assert_eq!(opt_in, LlmOptIn::Choice(false), "l 要能取消勾选");
+        handle_key(&mut app, key(KeyCode::Char('l'))).unwrap();
+        let View::Pair { opt_in, .. } = app.view.clone() else {
+            panic!("按 l 不该离开配对屏");
+        };
+        assert_eq!(opt_in, LlmOptIn::Choice(true), "再按一次要能勾回去");
+
+        let (mut app, _dir) = test_app_with(
+            PairPhase::Done {
+                anthropic: false,
+                openai: true,
+            },
+            LlmOptIn::Choice(true),
+        );
+        handle_key(&mut app, key(KeyCode::Char('l'))).unwrap();
+        let View::Pair { opt_in, .. } = app.view.clone() else {
+            panic!("按 l 不该离开配对屏");
+        };
+        assert_eq!(
+            opt_in,
+            LlmOptIn::Choice(true),
+            "批准落地之后再翻转只会显示一个跟磁盘不一致的状态"
+        );
+    }
+
+    /// 家目录里已经有 `[llm]`：不给勾选框，屏上说一句「已经有了，不动它」。
+    /// `llm_optin::enable` 在那种文件上本来就一个字都不写——摆一个按下去
+    /// 什么都不会发生的勾选框是骗人。
+    #[test]
+    fn an_existing_llm_section_is_reported_not_offered_for_overwrite() {
+        let (app, dir) = App::test_app();
+        let cfg = crate::config::config_path_for_socket(&app.socket);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "[llm]\nprovider = \"kimi\"\nmodel = \"k2\"\n").unwrap();
+
+        let opt_in = initial_opt_in(&app);
+        assert_eq!(opt_in, LlmOptIn::AlreadyConfigured);
+        assert!(!opt_in.wire(), "已经做过的决定不该被这次配对再送一遍");
+        assert_eq!(
+            opt_in.toggled(),
+            LlmOptIn::AlreadyConfigured,
+            "这一支没有可翻转的东西"
+        );
+
+        let (mut app, _dir2) = test_app_with(phase_waiting(), opt_in);
+        // `test_app_with` 换了一个新的 App（socket 也换了），把文件补到
+        // 它自己的家目录里，屏幕上那句话才是同一件事的说明。
+        let cfg = crate::config::config_path_for_socket(&app.socket);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "[llm]\n").unwrap();
+        let screen = squeeze(&render_lines(&mut app).join(""));
+        assert!(
+            !screen.contains("[×]") && !screen.contains("[]"),
+            "已经写过 [llm] 的机器上不该出现勾选框：{screen}"
+        );
+        assert!(
+            screen.contains(&squeeze(opt_in_line(
+                LlmOptIn::AlreadyConfigured,
+                crate::i18n::Lang::Zh
+            ))),
+            "该说一句「已经有了，这次不动它」：{screen}"
+        );
+        drop(dir);
     }
 
     /// 浏览器打不开是常态（SSH、WSL、没设默认浏览器），屏上必须有个能
@@ -679,6 +920,7 @@ mod tests {
         let retryable = apply_tick(
             Lang::Zh,
             "dc".into(),
+            LlmOptIn::Choice(true),
             PairPhase::Starting,
             PairTick::Expired {
                 retryable: true,
@@ -701,6 +943,7 @@ mod tests {
         let not_retryable = apply_tick(
             Lang::Zh,
             "dc".into(),
+            LlmOptIn::Choice(true),
             PairPhase::Starting,
             PairTick::Expired {
                 retryable: false,

@@ -435,11 +435,16 @@ pub fn daemon_with(home: &std::path::Path, origin: &str) -> Daemon {
 /// 就会在机器慢的时候随机失败，猜多了就是白白拖慢每一次跑测试。改成
 /// 「一直问，问到状态变了为止」，快的时候几十毫秒就返回，慢的时候也不会
 /// 因为差一点点就误判成失败。
-pub fn wait_for_tick(d: &Daemon, profile: &str, timeout: Duration) -> PairTick {
+/// `opt_in_llm` 是界面每一轮捎给 daemon 的勾选框当前值（见
+/// `proto::Request::PairPoll`）——测试要模仿的是界面，所以它也得一路捎着
+/// 同一个值，而不是随手填一个 `true`：填错了就等于测试自己在中途替学生
+/// 改了主意。
+pub fn wait_for_tick(d: &Daemon, profile: &str, opt_in_llm: bool, timeout: Duration) -> PairTick {
     let deadline = Instant::now() + timeout;
     loop {
         if let Response::PairTick(tick) = d.call(Request::PairPoll {
             profile: profile.to_string(),
+            opt_in_llm,
         }) {
             if !matches!(tick, PairTick::Waiting) {
                 return tick;
