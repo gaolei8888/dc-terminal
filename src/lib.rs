@@ -11,6 +11,7 @@ pub mod journal;
 pub mod last_sessions;
 pub mod link;
 pub mod llm;
+pub mod llm_optin;
 pub mod pair;
 pub mod pair_apply;
 pub mod pair_http;
