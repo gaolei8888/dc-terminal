@@ -1114,6 +1114,60 @@ fn pair_origin(profiles_dir: &Path, profile: &str) -> Option<String> {
     Some(format!("{}://{}", rest.0, host))
 }
 
+/// 轮询线程一次迭代的核心逻辑，从 `spawn_pair_poller` 里抽出来，为的是
+/// 不起线程、不打真网络就能测「取消到达之后这里绝不会再落盘」这条属性。
+///
+/// 返回 `None` 表示这次迭代不该在任何地方留下痕迹——`pairs` 表不写、钥匙
+/// 也不写：`send` 阻塞的那段时间（真实世界里是最多 `pair_http::TIMEOUT`
+/// 那么久的一次 HTTP 等待）足够让 `PairCancel` 落地、把表项删掉，如果
+/// 这次迭代还是照常把 tick 写回去或者把钥匙落盘，学生按了 Esc 却什么都
+/// 没被取消——`Some(tick)` 的调用方因此也不该在 `None` 时碰 `pairs` 表。
+fn pair_poll_once(
+    machine: &mut crate::pair::Machine,
+    now: std::time::Instant,
+    cancel: &AtomicBool,
+    send: &dyn Fn(&str) -> Result<crate::pair::Poll, String>,
+    apply: &dyn Fn(&crate::pair::Approved) -> Result<crate::pair_apply::Ready, String>,
+) -> Option<PairTick> {
+    let tick = machine.step(now, send);
+    // **取消要在这里再查一次，不能只信循环开头那次。** 从那次检查到这里，
+    // 线程至少睡了 250ms，`send`（真实实现里就是一次 HTTP 请求）还可能
+    // 又花了最多 `pair_http::TIMEOUT` 那么久——`PairCancel` 落在这段窗口
+    // 里的话，标志已经置上、表项已经从 `pairs` 里删掉，而这条线程如果
+    // 对着一张已经不存在的表项继续往下写，学生看到的就是"取消了"而实际
+    // 什么都没停。
+    if cancel.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(match tick {
+        crate::pair::Tick::Waiting => PairTick::Waiting,
+        crate::pair::Tick::Expired { retryable, message } => {
+            PairTick::Expired { retryable, message }
+        }
+        crate::pair::Tick::Failed(e) => PairTick::Failed(e),
+        crate::pair::Tick::Done(a) => {
+            // **取消要在这里再查一次，不能只在循环开头查。** 那一次检查之
+            // 后，线程还要睡 250ms、再花最多 `pair_http::TIMEOUT` 等一个
+            // HTTP 响应——`PairCancel` 落在这段窗口里的话，标志已经置上、
+            // 表项已经删掉，而这条线程照样会把钥匙写进 secrets。学生按了
+            // Esc，以为什么都没发生。
+            //
+            // 网关那边这把钥匙已经标成 claimed 了，所以这里放弃它是真的
+            // 放弃：那正是取消该有的语义，不是遗憾的副作用。
+            if cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            match apply(&a) {
+                Ok(ready) => PairTick::Done {
+                    anthropic_ready: ready.anthropic,
+                    openai_ready: ready.openai,
+                },
+                Err(e) => PairTick::Failed(e),
+            }
+        }
+    })
+}
+
 /// 起一条配对的后台轮询线程，登记进 `pairs` 表。
 ///
 /// `home` 是 dct 的家目录（`socket.parent()`）——Ruling 1：`pair_apply::apply`
@@ -1152,24 +1206,16 @@ fn spawn_pair_poller(
             // `Machine::step` 自己判断，睡多短都不会多打一次网络。
             std::thread::sleep(Duration::from_millis(250));
             let send = |dc: &str| crate::pair_http::poll(&origin, dc, &agent);
-            let tick = machine.step(std::time::Instant::now(), &send);
-            let projected = match &tick {
-                crate::pair::Tick::Waiting => PairTick::Waiting,
-                crate::pair::Tick::Expired { retryable, message } => PairTick::Expired {
-                    retryable: *retryable,
-                    message: message.clone(),
-                },
-                crate::pair::Tick::Failed(e) => PairTick::Failed(e.clone()),
-                crate::pair::Tick::Done(a) => {
-                    // 落盘在这里做完，钥匙不过 socket。
-                    match crate::pair_apply::apply(a, &home, &secrets, opt_in_llm) {
-                        Ok(ready) => PairTick::Done {
-                            anthropic_ready: ready.anthropic,
-                            openai_ready: ready.openai,
-                        },
-                        Err(e) => PairTick::Failed(e),
-                    }
-                }
+            let apply = |a: &crate::pair::Approved| {
+                // 落盘在这里做完，钥匙不过 socket。
+                crate::pair_apply::apply(a, &home, &secrets, opt_in_llm)
+            };
+            let now = std::time::Instant::now();
+            let projected = match pair_poll_once(&mut machine, now, &cancel, &send, &apply) {
+                Some(p) => p,
+                // 取消在这次迭代里追上了我们：`pair_poll_once` 的文档注释
+                // 说得很清楚，这种情况下什么都不该写，直接退出线程。
+                None => return,
             };
             let done = !matches!(projected, PairTick::Waiting);
             if let Some(slot) = recover(pairs.lock()).get_mut(&profile) {
@@ -1224,6 +1270,116 @@ mod tests {
     /// 同上——大多数测试不关心配对，给一张空表就行。
     fn test_pairs() -> Arc<Mutex<PairTable>> {
         Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    fn test_pair_started() -> crate::pair::Started {
+        crate::pair::Started {
+            device_code: "d".into(),
+            user_code: "HJ4K-9QTZ".into(),
+            verify_path: "/pair".into(),
+            interval: 0, // 0 秒间隔：测试里第一次 `step` 就该到点发请求
+            expires_in: 900,
+        }
+    }
+
+    fn test_approved() -> crate::pair::Poll {
+        crate::pair::Poll::Approved {
+            api_key: "sk-live".into(),
+            models: crate::pair::Models::default(),
+            platforms: Default::default(),
+            quota: None,
+        }
+    }
+
+    /// **Critical 回归测试。** 取消如果只在循环开头查一次，`send`（真实
+    /// 世界里是一次可能耗时 `pair_http::TIMEOUT` 的 HTTP 请求）返回的
+    /// 那一刻，取消标志即使已经在这段时间里被置上，旧代码也会视而不见，
+    /// 照常把 `Tick::Done` 落盘——学生按了 Esc，钥匙还是被写了下去。
+    ///
+    /// 这里用 `send` 闭包本身去模拟"取消恰好在等待网络响应期间到达"：
+    /// `send` 被调用时才把标志置上，紧接着返回 `Approved`，也就是最坏的
+    /// 那种时序——`pair_poll_once` 必须在这之后、落盘之前再查一次，
+    /// 发现已取消就直接放弃，`apply` 一次都不该被调用。
+    #[test]
+    fn a_cancel_that_lands_while_waiting_on_the_network_wins_over_a_pending_approval() {
+        let t0 = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut machine = crate::pair::Machine::new(test_pair_started(), t0);
+        let applied = std::cell::Cell::new(false);
+        let send = |_: &str| {
+            // 时序：`Machine::step` 已经决定要发这次请求，`send` 正在
+            // "打网络"——这一刻用户按了 Esc。
+            cancel.store(true, Ordering::SeqCst);
+            Ok(test_approved())
+        };
+        let apply = |_: &crate::pair::Approved| {
+            applied.set(true);
+            Ok(crate::pair_apply::Ready {
+                anthropic: true,
+                openai: true,
+            })
+        };
+
+        // t0 + 1s：`test_pair_started` 的 `interval` 被 `Machine::new` 夹到
+        // 最小 1 秒，这里让时间过了到点，`step` 才会真的调用 `send`。
+        let due = t0 + Duration::from_secs(1);
+        let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
+
+        assert!(result.is_none(), "取消之后这次迭代不该产生任何 tick");
+        assert!(!applied.get(), "取消之后绝不能把钥匙落盘");
+    }
+
+    /// 对照组：没有取消的话，`Tick::Done` 照常落盘、照常报 `Done`——
+    /// 免得上面那条测试是靠一个永远返回 `None` 的桩糊弄过去的。
+    #[test]
+    fn without_a_cancel_an_approval_is_applied_and_reported() {
+        let t0 = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut machine = crate::pair::Machine::new(test_pair_started(), t0);
+        let applied = std::cell::Cell::new(false);
+        let send = |_: &str| Ok(test_approved());
+        let apply = |_: &crate::pair::Approved| {
+            applied.set(true);
+            Ok(crate::pair_apply::Ready {
+                anthropic: true,
+                openai: false,
+            })
+        };
+
+        let due = t0 + Duration::from_secs(1);
+        let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
+
+        assert!(applied.get(), "没取消就该落盘");
+        match result {
+            Some(PairTick::Done {
+                anthropic_ready,
+                openai_ready,
+            }) => {
+                assert!(anthropic_ready);
+                assert!(!openai_ready);
+            }
+            other => panic!("该是 Done，实际 {other:?}"),
+        }
+    }
+
+    /// 取消也要能拦住一个已经跑到终态、但还没写回 `pairs` 表的 tick——
+    /// 不止拦落盘，普通的 `Expired`/`Failed` 同样不该在取消之后被写回去，
+    /// 不然界面已经关掉的那个屏幕会看见一个它没资格再看见的终态。
+    #[test]
+    fn a_cancel_also_suppresses_a_stale_terminal_tick_that_is_not_an_approval() {
+        let t0 = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut machine = crate::pair::Machine::new(test_pair_started(), t0);
+        let send = |_: &str| {
+            cancel.store(true, Ordering::SeqCst);
+            Ok(crate::pair::Poll::Denied)
+        };
+        let apply = |_: &crate::pair::Approved| panic!("denied 不该走到 apply");
+
+        let due = t0 + Duration::from_secs(1);
+        let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
+
+        assert!(result.is_none(), "取消之后即使是普通终态也不该写回表");
     }
 
     /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
