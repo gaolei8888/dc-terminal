@@ -134,9 +134,12 @@ POST /admin/api/pair/approve                            cookie + CSRF（现有 c
 POST /admin/api/pair/poll                               无认证，device_code 即凭据
   → {"device_code": "<64 hex>"}
   ← 200 {"status": "pending"}
-  ← 200 {"status": "approved", "api_key": "...", "base_url": "...",
-         "models": {...}, "quota": {...}}
-  ← 200 {"status": "denied" | "expired" | "claimed"}
+  ← 200 {"status": "approved", "api_key": "...",
+         "models": {...}, "platforms": {"<model>": "<platform>"},
+         "quota": {...}}
+  ← 200 {"status": "denied" | "claimed"}
+  ← 200 {"status": "expired", "reason": "ttl" | "key_unreadable",
+         "message": "<给学生看的中文>"}
   ← 404  device_code 不认识
   ← 429  轮询过快
 ```
@@ -169,6 +172,27 @@ dct/<CARGO_PKG_VERSION> (<std::env::consts::OS>; <std::env::consts::ARCH>)
 
 只有版本、系统、架构。**不带主机名、不带用户名**——那一行是要显示在网页上给人看的，
 它的用处是「这台设备是不是我」，不是「这台设备是谁」。
+
+**`base_url` 不在响应里，dct 一律用它配对时用的那个 origin。**
+（2026-09-02 落地时定的，跟 `verify_path` 同一条理由但更硬：`verify_path` 最坏是把学生
+骗到一个假登录页，`base_url` 最坏是**把学生的钥匙连同每一次请求送到别人的机器上**。
+网关那边这个字段只在运营显式设了 `DC_ADMIN_PAIR_PUBLIC_BASE_URL` 时才出现，今天没设。
+dct 侧的决定是：**这个字段收到也忽略**。哪天真有运营要把 API 指到别的主机，那属于
+dct 自己的 profile 配置——origin 本来就住在那儿。）
+
+**`platforms` 是一张 `{模型名: 平台}` 的平表**，跟 `models` 并列。额度那个 `window`
+是按平台分的，所以 dct 用 `platforms[models.openai.default]` 找到该显示哪个窗口。
+`models` 里的值仍然是纯字符串，解析不变。
+
+**`expired` 带 `reason`**，两种，文案必须不一样：
+
+- `ttl` —— 码放过期了。「这串码过期了，按 `r` 换一串」
+- `key_unreadable` —— 那个 409 老账号。**不能说「过期」**，要说网关给的那句：
+  去 `/me` 点「重新生成」，并且知道旧钥匙会全部失效。让这两种共用一句「过期了」，
+  学生会按 `r` 重来无数次，而每一次都会走到同一个地方
+
+**另有一个 dct 不调的接口**：`GET /admin/api/pair/pending/{user_code}`（cookie 认证），
+确认页用它渲染「这是不是你那台机器」。记在这里只是为了让契约完整。
 
 `models` 和 `quota` 的形状见下两节。
 
