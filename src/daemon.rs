@@ -1202,7 +1202,15 @@ fn spawn_pair_poller(
     home: PathBuf,
 ) {
     let cancel = Arc::new(AtomicBool::new(false));
-    recover(pairs.lock()).insert(
+    // **顶掉一条旧配对就要先把它停了。** 这张表一个 profile 只有一格，
+    // 学生按 `r` 重来（或者界面超时之后重发一条 `PairStart`）时，
+    // `insert` 会把上一条的 `PairSlot` 悄悄丢掉——而那条的轮询线程还活着，
+    // 它的取消标志刚刚跟着 `PairSlot` 一起消失，从此没有任何人握着它。
+    // 那条孤儿线程会接着打网关，可能在学生早已取消之后还把一把钥匙写进
+    // secrets，还会把自己的 tick 写进这一格（`get_mut(&profile)` 认的是
+    // profile 名，不是线程），让新的一条读到旧的状态。置上标志，
+    // 让它自己在下一次循环开头退出——`PairCancel` 走的是同一条路。
+    if let Some(old) = recover(pairs.lock()).insert(
         profile.to_string(),
         PairSlot {
             started: started.clone(),
@@ -1210,7 +1218,9 @@ fn spawn_pair_poller(
             opt_in_llm,
             cancel: cancel.clone(),
         },
-    );
+    ) {
+        old.cancel.store(true, Ordering::SeqCst);
+    }
     let (profile, origin) = (profile.to_string(), origin.to_string());
     std::thread::spawn(move || {
         let agent = crate::pair_http::agent();
@@ -1397,6 +1407,58 @@ mod tests {
         let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
 
         assert!(result.is_none(), "取消之后即使是普通终态也不该写回表");
+    }
+
+    /// **顶掉一格就要停掉住在那一格里的线程。** 一个 profile 只有一格：
+    /// 学生按 `r` 重来、或者界面 5 秒超时之后重发一条 `PairStart`，第二次
+    /// `spawn_pair_poller` 会 `insert` 到同一个键上，第一条的 `PairSlot`
+    /// （连同唯一一份取消标志）就这么没了，而它的线程还活着——它会接着打
+    /// 网关、可能在学生取消之后还落一把钥匙，还会把自己的 tick 写进这一格
+    /// 让新的一条读到旧状态。
+    ///
+    /// origin 指着一个必然拒绝连接的地址，两条线程都会很快自己失败退出；
+    /// 这条测试要的不是它们的结局，是**第一条的取消标志被置上了**——那正是
+    /// 它自己会在下一次循环开头看见并退出的信号。
+    #[test]
+    fn starting_a_second_pairing_cancels_the_poller_it_displaces() {
+        let pairs = test_pairs();
+        let home = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &home.path().join("secrets.toml"),
+        )));
+        // 端口 1 上不会有人监听——两条线程都会立刻拿到 connection refused。
+        let origin = "http://127.0.0.1:1";
+
+        spawn_pair_poller(
+            "dc",
+            origin,
+            test_pair_started(),
+            false,
+            pairs.clone(),
+            secrets.clone(),
+            home.path().to_path_buf(),
+        );
+        let first = recover(pairs.lock())
+            .get("dc")
+            .expect("第一条该在表里")
+            .cancel
+            .clone();
+        assert!(!first.load(Ordering::SeqCst), "前提：第一条还没被取消");
+
+        spawn_pair_poller(
+            "dc",
+            origin,
+            test_pair_started(),
+            false,
+            pairs,
+            secrets,
+            home.path().to_path_buf(),
+        );
+
+        assert!(
+            first.load(Ordering::SeqCst),
+            "被顶掉的那条轮询线程成了孤儿：没有任何人还握着它的取消标志"
+        );
     }
 
     /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时

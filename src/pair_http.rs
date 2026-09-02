@@ -4,9 +4,24 @@ use crate::pair::{Poll, Started};
 use serde_json::Value;
 use std::time::Duration;
 
-/// 单次请求的预算。比 `verify::PROBE_TIMEOUT` 略宽——配对这条路不挂在
-/// 界面那 5 秒的连接上（轮询在 daemon 后台线程里），但也不该无限等。
-const TIMEOUT: Duration = Duration::from_secs(8);
+/// 单次请求的预算，4 秒，跟 `verify::PROBE_TIMEOUT` 同一个数字、同一个理由。
+///
+/// **`/pair/start` 是同步的：界面那条连接就在上面等着。** `daemon::handle`
+/// 的 `PairStart` 分支在回话之前先真打一次 `/admin/api/pair/start`，而界面
+/// 那条连接 5 秒就超时（`client::READ_TIMEOUT`）。8 秒的预算意味着一个慢
+/// 网络下界面先判定「守护进程没响应」、屏上给出一个可以按 `r` 的失败，而
+/// 守护进程还在那条请求上等着，随后照样起一条轮询线程——学生按 `r`，
+/// 于是有两条。教室网络正是这份 spec 写给的那批人所在的网络，这不是边角
+/// 情况。压进 5 秒预算之内，失败就在界面还在听的时候到达。
+///
+/// 轮询那一半（`poll`）跑在 daemon 的后台线程里，本来没有这个约束，但也
+/// 没有理由要更长：`Machine` 的 `interval` 是 3 秒，一次比一轮间隔还久的
+/// 请求只会让退避的节奏变形。两处共用一个数字，少一个会漂开的常量。
+///
+/// 跟 `verify` 那边一样，这个预算必须同时喂给 `.timeout()` 和
+/// `.timeout_connect()`——ureq 的默认建连超时是 30 秒，且建连阶段优先认它
+/// （理由的完整版在 `verify::PROBE_TIMEOUT` 上）。
+const TIMEOUT: Duration = Duration::from_secs(4);
 
 pub fn agent() -> ureq::Agent {
     crate::sys::tls::agent_builder()
@@ -104,6 +119,33 @@ pub fn parse_poll(status: u16, body: &str) -> Poll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`/pair/start` 的预算必须严格小于界面愿意等的时间。** 大于它的话，
+    /// 慢网络下界面先超时、屏上给出一个能按 `r` 的失败，而守护进程还在
+    /// 等那条请求、随后照样起一条轮询线程；学生按 `r` 就有了两条。
+    /// 抄一个 `5` 在这里没有意义——引用 `client::READ_TIMEOUT` 本身，
+    /// 改那一边的人才会看到红。
+    #[test]
+    fn the_start_budget_fits_inside_what_the_ui_will_wait_for() {
+        assert!(
+            TIMEOUT < crate::client::READ_TIMEOUT,
+            "配对起步 {TIMEOUT:?} 比界面的读超时 {:?} 还长",
+            crate::client::READ_TIMEOUT
+        );
+    }
+
+    /// 建连阶段也要被这个预算兜住，否则会退回 ureq 默认的 30 秒——
+    /// 同 `verify::probe_agent_bounds_the_connect_phase_too`，那条测试
+    /// 就是从这个 bug 上长出来的。建 `Agent` 不发请求，不碰网络。
+    #[test]
+    fn the_agent_bounds_the_connect_phase_too() {
+        let debug = format!("{:?}", agent());
+        assert!(
+            debug.contains("timeout_connect: Some(4s)"),
+            "建连阶段没有被 TIMEOUT 兜住：{debug}"
+        );
+        assert!(debug.contains("timeout: Some(4s)"), "{debug}");
+    }
 
     /// 生命周期状态一律 200 + status 字段，不看错误体。契约见 spec。
     #[test]
