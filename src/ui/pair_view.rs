@@ -94,13 +94,24 @@ pub(crate) fn apply_started(
 ) -> View {
     match outcome {
         Ok(info) => {
-            // origin 拿不到多半是 profile 文件在两次读之间被人手改坏了——
-            // daemon 在 `PairStart` 成功之前已经用同一个函数验证过一次
-            // （见 `daemon::pair_origin` 头上的注释）。退化成空串，而不是
-            // 把这次已经成功的起步整个作废：`user_code` 和倒计时仍然是
-            // 真的，空 origin 拼出来的地址打不开，但学生手上「在浏览器里
-            // 输入这个码」这件事本身没有理由跟着白白丢掉。
-            let origin = origin_for(app, &profile).unwrap_or_default();
+            // origin 拿不到——profile 文件在两次读之间被人手改坏了，或者
+            // 磁盘上根本没有这个 profile 了（daemon 在 `PairStart` 成功
+            // 之前已经用同一个函数验证过一次，见 `daemon::pair_origin`
+            // 头上的注释，所以这一刻的失败发生在那之后）。**不能退化成
+            // 空 origin 硬凑一个 URL**：`open_url` 打不开一个语法都不完整
+            // 的地址，而屏幕上还会印出这句打不开的地址让学生手抄——手抄
+            // 也打不开，比不给地址更坏。落一个不可重试的 `Failed`：
+            // 再按 `r` 只会撞上同一个读不出来的文件，`retryable: false`
+            // 如实说明这一点。
+            let Some(origin) = origin_for(app, &profile) else {
+                return View::Pair {
+                    profile,
+                    phase: PairPhase::Failed {
+                        message: text(Key::PairProfileUnreadable, app.lang).to_string(),
+                        retryable: false,
+                    },
+                };
+            };
             let url = format!("{origin}{}?code={}", info.verify_path, info.user_code);
             // MINOR 8 同款的顾虑（见 `secret.rs` Ctrl+O 分支）：`open_url`
             // 打不开的话必须说一声，不能让这一屏看着有个地址、其实浏览器
@@ -428,6 +439,34 @@ mod tests {
 
     fn render_phase(phase: &PairPhase) -> String {
         phase_line(phase, Lang::Zh)
+    }
+
+    /// **MINOR (round 1 review).** 一个语法都不完整的 URL（空 origin +
+    /// `verify_path`）比不给地址更坏：`open_url` 打不开，屏幕上还印着
+    /// 一句手抄也没用的话。origin 拿不到时必须落一个不可重试的
+    /// `Failed`，而不是把这次已经成功的起步硬凑成一屏能看却打不开的
+    /// `Waiting`。用一个磁盘上压根不存在的 profile 名字触发
+    /// `origin_for` 返回 `None`——真正的 `"dc"` 是内置 profile，
+    /// `all_profiles` 找得到它，这里要的是"找不到"的那一分支。
+    #[test]
+    fn a_profile_that_cannot_be_read_back_fails_instead_of_composing_a_broken_url() {
+        let (mut app, _dir) = App::test_app();
+        let outcome = Ok(PairStartedInfo {
+            user_code: "HJ4K-9QTZ".into(),
+            verify_path: "/pair".into(),
+            expires_in: 900,
+        });
+        let view = apply_started(&mut app, "no-such-profile".into(), outcome);
+        match view {
+            View::Pair {
+                phase: PairPhase::Failed { retryable, message },
+                ..
+            } => {
+                assert!(!retryable, "读不出配置不是过期，按 r 换不来别的结果");
+                assert!(!message.is_empty());
+            }
+            _ => panic!("origin 拿不到时该落一个不可重试的 Failed"),
+        }
     }
 
     /// **Esc 要能真的取消。** 不发 `PairCancel` 的话，用户退出去了，

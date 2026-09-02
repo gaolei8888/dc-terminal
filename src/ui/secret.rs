@@ -254,6 +254,17 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                 .selected()
                 .and_then(|i| rows.get(i))
                 .and_then(|(name, _)| entries.iter().find(|e| &e.name == name));
+            // `"dc"`（训练营网关）能自动配对——同 `pick.rs` 那条 `AskSecret`
+            // 分支一个理由：密钥页这一屏也不该是学生填 `"dc"` 密钥的地方，
+            // spec 原话是学生根本不该主动去找「配对」这个词。手动填退化成
+            // `View::Pair` 里随时能按的 `p`。
+            if let Some(e) = target {
+                if e.name == "dc" {
+                    let name = e.name.clone();
+                    super::pair_view::start_pairing(app, name);
+                    return Ok(());
+                }
+            }
             app.view = match target {
                 Some(e) => View::EnterSecret {
                     profile: e.name.clone(),
@@ -606,6 +617,28 @@ mod tests {
         assert!(
             !matches!(app.view, View::Secrets { .. }),
             "Esc 要真的离开密钥页，武装状态才谈得上作废"
+        );
+    }
+
+    /// **入口不能是密钥输入框，密钥页也一样。** spec 原话：学生根本不该
+    /// 主动去找「配对」这个词——在密钥设置页上选中 `"dc"`（训练营网关）
+    /// 按 Enter，该直接进配对屏，不是像别的 agent 一样落进要粘贴密钥的
+    /// 输入框。跟 `pick.rs::choosing_dc_with_no_key_goes_straight_to_pairing_not_the_key_box`
+    /// 是同一条属性在密钥页这条入口上的版本。
+    #[test]
+    fn enter_on_the_dc_row_of_the_secrets_page_goes_straight_to_pairing() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::Secrets {
+            entries: vec![with_secret(entry("dc", ProfileStatus::NeedsSecret))],
+            state,
+            pending_delete: None,
+        };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(
+            matches!(app.view, View::Pair { .. }),
+            "选中 dc 按 Enter 该直接进配对屏，不是密钥输入框"
         );
     }
 

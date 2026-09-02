@@ -471,6 +471,10 @@ pub enum Key {
     PairDenied,
     /// 网关的配对开关关着（`not_enabled`，无论是起步时还是轮询时撞上）。
     PairNotEnabled,
+    /// 起步成功之后，界面这一侧独立读 `[api].base_url` 算 origin 时失败了
+    /// （profile 文件在两次读之间被人手改坏、或者整个不见了）。`retryable`
+    /// 为假：这不是码过期，再按 `r` 只会撞上同一份读不出来的文件。
+    PairProfileUnreadable,
     /// Done 阶段：两条路都开了（Anthropic + Qwen）。
     PairDoneBoth,
     /// Done 阶段：**免费账号只有这一条**——必须点名「Qwen 那一路」，也要
@@ -1033,6 +1037,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "Pairing is turned off on the camp gateway right now",
             zh: "训练营网关现在关着配对功能",
+        ),
+        PairProfileUnreadable => t!(
+            lang,
+            en: "Could not read this profile's configuration, so pairing can't continue. Try again from the key page, or fill in a key by hand.",
+            zh: "读不出这个 profile 的配置，配对没法继续。回密钥页重试一次，或者手动填密钥。",
         ),
         PairDoneBoth => t!(
             lang,
@@ -2300,6 +2309,7 @@ mod tests {
             PairKeyUnreadable,
             PairDenied,
             PairNotEnabled,
+            PairProfileUnreadable,
             PairDoneBoth,
             PairDoneQwenOnly,
             PairManualHint,
@@ -2336,7 +2346,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 181, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 182, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -230,6 +230,17 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // （见 PickAction 的注释）。真下标是这里的 i，
                 // 从 entries[i] 取出来的正是被选中的这一行。
                 let e = &entries[i];
+                // `"dc"`（训练营网关）能自动配对——**这正是这个选择器的
+                // 默认路必须走的地方**，不是密钥输入的一个附加选项。spec
+                // 原话：学生根本不该主动去找「配对」这个词。选中一个还
+                // 没密钥的 `"dc"` 时直接起步配对；密钥手填退化成
+                // `View::Pair` 里随时能按的 `p`（`pair_view::handle_key`
+                // 已经从每个阶段都接回 `View::EnterSecret`，见它的测试）。
+                if e.name == "dc" {
+                    let name = e.name.clone();
+                    super::pair_view::start_pairing(app, name);
+                    return Ok(());
+                }
                 View::EnterSecret {
                     profile: e.name.clone(),
                     label: e.label.clone(),
@@ -1823,6 +1834,53 @@ mod tests {
             has_secret: false,
             backend_only: false,
         }]
+    }
+
+    fn one_dc_needs_secret_entry() -> Vec<crate::proto::ProfileEntry> {
+        vec![crate::proto::ProfileEntry {
+            name: "dc".into(),
+            label: "DC".into(),
+            note: String::new(),
+            status: ProfileStatus::NeedsSecret,
+            secret: Some(SecretPrompt {
+                hint: String::new(),
+                url: None,
+            }),
+            install: None,
+            has_secret: false,
+            backend_only: false,
+        }]
+    }
+
+    /// **入口不能是密钥输入框。** spec 原话：学生根本不该主动去找「配对」
+    /// 这个词——选中一个还没密钥的 `"dc"`（训练营网关）就该直接进配对屏，
+    /// 而不是像别的 agent 一样落进一个要学生粘贴密钥的空白输入框（那正是
+    /// 这整个功能想消灭的那道门槛）。手动填密钥没有丢，它退化成
+    /// `View::Pair` 里随时能按的 `p`（见 `pair_view.rs` 的
+    /// `manual_entry_stays_reachable_from_every_phase`）。
+    #[test]
+    fn choosing_dc_with_no_key_goes_straight_to_pairing_not_the_key_box() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::PickProfile {
+            entries: one_dc_needs_secret_entry(),
+            state,
+            warning: None,
+            no_git: false,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(app.view, View::Pair { .. }),
+            "选中没密钥的 dc 该直接进配对屏，不是密钥输入框：{:?}",
+            match &app.view {
+                View::EnterSecret { .. } => "落进了 EnterSecret",
+                View::Pair { .. } => "Pair",
+                _ => "别的视图",
+            }
+        );
     }
 
     /// 不是 git 仓库的项目里，这一屏九项 agent 一个都开不起来（拒绝在
