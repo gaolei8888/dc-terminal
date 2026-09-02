@@ -575,9 +575,22 @@ pub enum Response {
     Strings(std::collections::BTreeMap<String, String>),
     /// 对 [`Request::PairStart`] 的回答。`Err` 是一句已经本地化过的原因
     /// （网关关着、连不上）。
-    PairStarted(Result<crate::pair::Started, String>),
+    PairStarted(Result<PairStartedInfo, String>),
     /// 对 [`Request::PairPoll`] 的回答。
     PairTick(PairTick),
+}
+
+/// `pair::Started` 给界面看的那一面。**故意不是 `Started` 本身**：那个类型里有
+/// `device_code`，而它是这条流程的凭据——界面要的只是画屏用的三样东西。
+/// 同 `PairTick` 之于 `Tick`：少一个能装凭据的类型，就少一处它能漏出去的地方。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairStartedInfo {
+    /// 大字印在屏幕上，学生照着念或照着敲。
+    pub user_code: String,
+    /// 路径，不是完整 URL——origin 由 dct 自己拼，见 spec 里那段钓鱼面的分析。
+    pub verify_path: String,
+    /// 倒计时用。
+    pub expires_in: u64,
 }
 
 /// `pair::Tick` 给界面看的那一面。**故意不是 `Tick` 本身**：`Tick::Done`
@@ -969,6 +982,20 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(!json.contains("api_key"), "{json}");
         assert!(!json.contains("sk-"), "{json}");
+    }
+
+    /// **`PairStarted` 的响应里绝不许出现 `device_code`。** 它是这条流程的
+    /// 凭据，spec 说它只活在 daemon 里、一次也不许过 socket——`PairStartedInfo`
+    /// 存在正是为了让这条 socket 上的类型物理上装不下它。
+    #[test]
+    fn a_pair_started_response_never_carries_the_device_code() {
+        let r = Response::PairStarted(Ok(PairStartedInfo {
+            user_code: "HJ4K-9QTZ".into(),
+            verify_path: "/pair".into(),
+            expires_in: 900,
+        }));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("device_code"), "{json}");
     }
 
     /// `device_code` 是凭据，跟密钥一个待遇：手写的 Debug 要把它挡住。
