@@ -519,17 +519,22 @@ mod tests {
     /// 的假守护进程，本机 Unix socket，不碰真正的网络。返回收到的每一条
     /// `Request`——测试用它断言"某个请求真的被发出去了"，而不是只信任
     /// 代码读起来像是发了。
-    #[cfg(unix)]
     fn fake_daemon() -> (
         std::path::PathBuf,
         tempfile::TempDir,
         std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
     ) {
         use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("s.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        // `sys::ipc::bind_private` 而不是 `std::os::unix::net::UnixListener`：
+        // 那一行只在 Unix 上存在，而这条测试本身没有 `#[cfg(unix)]`——整个
+        // 测试二进制于是在 Windows 上编译不过，`cargo test` 在那个平台上
+        // 连跑都跑不起来。Windows 的学生正是「零 C 依赖」那条规矩存在的
+        // 理由，不能让测试套件把这个平台漏在外面。`sys::ipc` 那一层的全部
+        // 用处就是把这个差异收在一个地方（Windows 走 `uds_windows`，形状
+        // 一模一样），生产代码早就只认它了，测试没有理由绕过去。
+        let listener = crate::sys::ipc::bind_private(&sock).unwrap();
         let received: std::sync::Arc<std::sync::Mutex<Vec<Request>>> = Default::default();
         let recv2 = received.clone();
         std::thread::spawn(move || {
