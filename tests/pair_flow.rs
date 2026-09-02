@@ -75,11 +75,14 @@ fn a_full_pairing_writes_both_secrets_and_both_model_names() {
 /// 取消之后，哪怕网关随后批准了，也一个字节都不许落盘。
 ///
 /// 这是唯一能抓住「轮询线程活得比学生关掉的那块屏幕还久」这种 bug 的
-/// 办法：假网关故意晚两秒才批准，`PairCancel` 紧跟在 `PairStart` 后面
-/// 发出去，然后等过批准那一刻，确认磁盘上什么都没多出来。
+/// 办法。**取消必须发生在一次轮询真的在途的时候**：假网关接到 `/pair/poll`
+/// 之后卡住不回，等测试确认这个请求已经堵住了再发 `PairCancel`——这样
+/// 取消才落在 `pair_poll_once` 里两道「再查一次取消」的门守着的那段窗口
+/// 里，而不是抢在第一次轮询发出之前就把表项删掉（那样两道门永远不会被
+/// 走到，删掉它们测试也照样绿）。
 #[test]
 fn cancelling_means_nothing_is_ever_written() {
-    let gw = common::fake_gateway_slow_approve(Duration::from_secs(2));
+    let gw = common::fake_gateway_gated();
     let home = tempfile::tempdir().unwrap();
     let d = common::daemon_with(home.path(), &gw.origin());
 
@@ -90,6 +93,10 @@ fn cancelling_means_nothing_is_ever_written() {
         Response::PairStarted(Ok(_)) => {}
         other => panic!("配对没能起步：{other:?}"),
     }
+
+    // 等到网关确认已经真的收到一次轮询、正堵在那儿——不靠猜时间。
+    gw.wait_for_poll_inflight(Duration::from_secs(10));
+
     match d.call(Request::PairCancel {
         profile: "dc".into(),
     }) {
@@ -97,9 +104,13 @@ fn cancelling_means_nothing_is_ever_written() {
         other => panic!("取消应该总是 Ok：{other:?}"),
     }
 
-    // 等过假网关「批准」的那一刻，给后台线程留足够的时间——万一它没被
-    // 真的停掉，这段时间够它把钥匙写下去。
-    std::thread::sleep(Duration::from_secs(4));
+    // 放行那个卡住的轮询，让它收到 approved——如果两道门没守住，
+    // 轮询线程接下来就会把这把钥匙落盘。
+    gw.approve();
+
+    // 给后台线程留足够的时间——万一它没被真的停掉，这段时间够它把
+    // apply 跑完、把钥匙写下去。
+    std::thread::sleep(Duration::from_secs(1));
 
     assert!(
         !home.path().join("secrets.toml").exists()

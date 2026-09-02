@@ -19,6 +19,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -209,8 +211,8 @@ const START_BODY: &str =
     r#"{"device_code":"d","user_code":"HJ4K-9QTZ","verify_path":"/pair","interval":1,"expires_in":30}"#;
 
 /// 起一个后台线程，把「给定请求路径 → 该回什么 JSON body」这件事交给
-/// 调用方的闭包决定。`fake_gateway` 和 `fake_gateway_slow_approve` 都是
-/// 在这上面包一层不同的应答策略。
+/// 调用方的闭包决定。`fake_gateway` 就是在这上面包一层应答策略；
+/// [`fake_gateway_gated`] 要在轮询请求上"卡住"，接线方式不一样，单独写。
 fn spawn_gateway<F>(mut respond: F) -> FakeGateway
 where
     F: FnMut(&str) -> String + Send + 'static,
@@ -248,23 +250,93 @@ pub fn fake_gateway(poll_bodies: Vec<&'static str>) -> FakeGateway {
     })
 }
 
-/// 一个只在 `delay` 之后才批准的假网关，`cancelling_means_nothing_is_ever_written`
-/// 专用：批准前的每一次 poll 都回 pending，批准之后才回 approved。
-pub fn fake_gateway_slow_approve(delay: Duration) -> FakeGateway {
-    let started_at = Instant::now();
-    spawn_gateway(move |path| {
-        if path.contains("/pair/start") {
-            return START_BODY.to_string();
+/// 一个会在 `/pair/poll` 上"卡住"的假网关：接到轮询请求之后先把
+/// `poll_inflight` 置真（测试拿它当信号，不靠猜时间），然后**堵住不回**，
+/// 直到测试调用 [`GatedGateway::approve`] 才把 `approved` 的 body 写回去。
+///
+/// 这是 `cancelling_means_nothing_is_ever_written` 真正需要的东西。光是
+/// `PairStart` 后面紧跟一个 `PairCancel`（这份测试原来的写法）永远赶在
+/// 第一次真正的轮询之前落地——`pair::Machine::new` 把首次到点的时间点
+/// 排在 `now + interval`（至少 1 秒）之后，取消这时候早就把 `pairs` 表
+/// 项删了、轮询线程在下一次醒来时看一眼 `cancel` 标志就直接退出，连
+/// `pair_poll_once` 里两道"再查一次取消"的门都没走到。删掉那两道门，
+/// 这份测试原来的写法照样通过——它测的不是这两道门，是"取消发生在第一
+/// 次轮询发出之前"这件事，那件事从来不需要门就是对的。
+///
+/// 这个网关把窗口撑开：轮询线程已经真的把 `/pair/poll` 发出去、正堵在
+/// 等一个网络响应上，取消这时候才到——逼真正的门被走到、被测到。
+pub struct GatedGateway {
+    port: u16,
+    poll_inflight: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl GatedGateway {
+    pub fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// 等到假网关确认"一个 `/pair/poll` 请求已经到达、正堵着不回"。
+    ///
+    /// 靠事件而不是靠钟：睡一个固定时长再假设"这会儿应该已经在轮询了"
+    /// 是一句会随机落空的猜测——机器慢一点、CI 抖一下都能让猜测提前
+    /// 到期。这里改成直接问网关自己的状态，事情快就早点往下走，事情慢
+    /// 也不会因为差一点点就被判成失败。
+    pub fn wait_for_poll_inflight(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !self.poll_inflight.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "{timeout:?} 内假网关都没等到一次卡住的 /pair/poll"
+            );
+            sleep(Duration::from_millis(20));
         }
-        if started_at.elapsed() >= delay {
-            r#"{"status":"approved","api_key":"sk-live-should-never-land-on-disk",
-                "models":{"anthropic":{},"openai":{"default":"qwen3.5:35b","small_fast":"gemma4:31b"}},
-                "platforms":{"qwen3.5:35b":"local"}}"#
-                .to_string()
-        } else {
-            r#"{"status":"pending"}"#.to_string()
+    }
+
+    /// 放行那个卡住的轮询请求，让它收到 `approved`。
+    pub fn approve(&self) {
+        let (lock, cvar) = &*self.release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
+/// 起一个只在 `/pair/poll` 上卡住的假网关，见 [`GatedGateway`] 上的文档。
+pub fn fake_gateway_gated() -> GatedGateway {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let poll_inflight = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (pi, rel) = (poll_inflight.clone(), release.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let path = read_request_path(&mut stream);
+            if path.contains("/pair/start") {
+                write_json_response(&mut stream, START_BODY);
+                continue;
+            }
+            // 这个测试只需要卡住第一次轮询：报个信号，然后堵在这儿，
+            // 直到 `approve()` 把门闩打开。
+            pi.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &*rel;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cvar.wait(released).unwrap();
+            }
+            write_json_response(
+                &mut stream,
+                r#"{"status":"approved","api_key":"sk-live-should-never-land-on-disk",
+                    "models":{"anthropic":{},"openai":{"default":"qwen3.5:35b","small_fast":"gemma4:31b"}},
+                    "platforms":{"qwen3.5:35b":"local"}}"#,
+            );
         }
-    })
+    });
+    GatedGateway {
+        port,
+        poll_inflight,
+        release,
+    }
 }
 
 /// 一条已经连上假网关的守护进程。跟 [`start_daemon`] 的区别只有一点：
@@ -297,7 +369,7 @@ pub fn daemon_with(home: &std::path::Path, origin: &str) -> Daemon {
     std::fs::write(
         profiles_dir.join("dc.toml"),
         format!(
-            "name = \"dc\"\ncommand = [\"echo\"]\n\n[api]\nbase_url = \"{origin}\"\nwire = \"anthropic\"\n"
+            "name = \"dc\"\ncommand = [\"echo\"]\npairable = true\n\n[api]\nbase_url = \"{origin}\"\nwire = \"anthropic\"\n"
         ),
     )
     .unwrap();
