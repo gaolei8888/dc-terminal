@@ -185,6 +185,12 @@ pub struct ProfileEntry {
     /// 理由写在 `profile::Profile::backend_only` 上。
     #[serde(default)]
     pub backend_only: bool,
+    /// 这个 profile 的密钥能不能靠配对拿到，而不是让用户粘贴——照抄自
+    /// `profile::Profile::pairable`，理由写在那儿。UI 手上只有
+    /// `ProfileEntry`，拿不到 `Profile`，所以这个 bool 必须跟着一起过桥，
+    /// 不能让选择器/密钥页回去按名字特判（那正是这个字段要消灭的写法）。
+    #[serde(default)]
+    pub pairable: bool,
 }
 
 /// 九宫格一格的内容。跟 `Response::Screen` 不同，不带光标——

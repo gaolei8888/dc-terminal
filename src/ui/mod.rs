@@ -460,6 +460,7 @@ pub fn run(
                     prompt,
                     buf,
                     return_to_settings,
+                    pairable,
                     ..
                 } = app.view.clone()
                 {
@@ -482,6 +483,7 @@ pub fn run(
                                 buf,
                                 phase: SecretPhase::Failed(m),
                                 return_to_settings,
+                                pairable,
                             },
                             // 通过：先存盘。存密钥必须先于「开会话」/「回设置页」两条
                             // 后续路径都成立的前提——回设置页要读一份刷新过的 has_secret
@@ -531,6 +533,7 @@ pub fn run(
                                                 app.lang, e,
                                             )),
                                             return_to_settings,
+                                            pairable,
                                         },
                                         _ => View::EnterSecret {
                                             profile,
@@ -545,6 +548,7 @@ pub fn run(
                                                 .into(),
                                             ),
                                             return_to_settings,
+                                            pairable,
                                         },
                                     }
                                 }
@@ -557,6 +561,7 @@ pub fn run(
                                         app.lang, e,
                                     )),
                                     return_to_settings,
+                                    pairable,
                                 },
                                 _ => View::EnterSecret {
                                     profile,
@@ -571,6 +576,7 @@ pub fn run(
                                         .into(),
                                     ),
                                     return_to_settings,
+                                    pairable,
                                 },
                             },
                         };
@@ -3132,6 +3138,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         };
 
@@ -3413,6 +3420,7 @@ mod tests {
                 buf: "sk-abc123".into(),
                 phase,
                 return_to_settings: false,
+                pairable: false,
             };
             term.draw(|f| draw(f, &mut app)).unwrap();
         }
@@ -4170,6 +4178,7 @@ mod tests {
                 buf: String::new(),
                 phase: view::SecretPhase::Typing,
                 return_to_settings: true,
+                pairable: false,
             },
             View::EnterSecret {
                 profile: String::new(),
@@ -4181,6 +4190,7 @@ mod tests {
                 buf: String::new(),
                 phase: view::SecretPhase::Typing,
                 return_to_settings: false,
+                pairable: false,
             },
             View::Phone {
                 status: crate::proto::PhoneStatus {

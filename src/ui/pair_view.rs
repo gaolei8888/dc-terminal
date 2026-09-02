@@ -1,10 +1,11 @@
 //! 配对三屏：Starting → Waiting → Done，或者在任何一步落进 Failed。
 //!
 //! 入口不在这个文件里——它在 `secret.rs`：`EnterSecret` 屏幕上，profile
-//! 是 `"dc"`（训练营网关那个内置 profile，见 `profile.rs::builtin_names`
-//! 和 `pair_apply.rs` 头上「往 dc/qwen 两把钥匙写」那段）时的 Ctrl+A。
-//! 不占用一个字母键——`o` 早就留给了密钥输入本身（见 `secret.rs` 那条
-//! 「Ctrl+O 不用 o」的注释），这里是同一条键位规矩的另一个例子。
+//! 可配对（`Profile::pairable`，目前是 `"dc"`/`"qwen"` 两个内置 profile，
+//! 见 `profile.rs::builtin_names` 和 `pair_apply.rs` 头上「往 dc/qwen 两把
+//! 钥匙写」那段）时的 Ctrl+A。不占用一个字母键——`o` 早就留给了密钥输入
+//! 本身（见 `secret.rs` 那条「Ctrl+O 不用 o」的注释），这里是同一条键位
+//! 规矩的另一个例子。
 //!
 //! **URL 在本地拼，绝不接受线上答复里的 origin。** `daemon::pair_origin`
 //! 只读这个 profile 自己的 `[api].base_url`，取它的 origin；界面这一侧
@@ -262,20 +263,27 @@ fn manual_entry_view(app: &mut App, profile: &str) -> View {
             Response::Profiles { entries, .. } => entries.into_iter().find(|e| e.name == profile),
             _ => None,
         });
-    let (label, prompt) = match found {
+    let (label, prompt, pairable) = match found {
         Some(e) => (
             e.label,
             e.secret.unwrap_or(SecretPrompt {
                 hint: String::new(),
                 url: None,
             }),
+            e.pairable,
         ),
+        // 找不回这条 profile（daemon 连不上/文件被删）时兜个 `true`，不是
+        // `false`：能走到这个函数，说明用户此刻正站在 `View::Pair` 里，
+        // 而只有 `pairable` 的 profile 才起得了 `View::Pair`（见
+        // `pick.rs`/`secret.rs` 里 `start_pairing` 的调用点）——`false`
+        // 会在 Ctrl+A 上悄悄关掉一条本该还开着的退路。
         None => (
             profile.to_string(),
             SecretPrompt {
                 hint: String::new(),
                 url: None,
             },
+            true,
         ),
     };
     View::EnterSecret {
@@ -287,6 +295,7 @@ fn manual_entry_view(app: &mut App, profile: &str) -> View {
         // 从配对屏改道过来的意图是「先把密钥填上」，不是「回设置页」——
         // 跟从选择器进来的 `AskSecret` 走的是同一条约定（见 `pick.rs`）。
         return_to_settings: false,
+        pairable,
     }
 }
 

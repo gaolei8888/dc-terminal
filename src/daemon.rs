@@ -640,6 +640,7 @@ fn handle(
                         }),
                         has_secret,
                         backend_only: p.backend_only,
+                        pairable: p.pairable,
                     }
                 })
                 .collect();
@@ -1643,6 +1644,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -1850,6 +1852,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2492,6 +2495,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }

@@ -9,6 +9,9 @@
 name = "dc"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
+# 同一把钥匙、同一个网关的另一个入口是 qwen.toml——它也要写这一行。
+# 见 profile.rs::Profile::pairable 的文档注释。
+pairable = true
 # 下面三条正则跟 `claude.toml` 一模一样，**不是抄的，是同一份实测**：
 # 这个 profile 跑的就是 claude 那个二进制，只换了 `ANTHROPIC_BASE_URL`，
 # 而 base_url 不改变它画在屏幕上的任何东西。换掉命令的那天，这三条

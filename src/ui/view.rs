@@ -156,6 +156,11 @@ pub(crate) enum View {
         /// （意图是开工）。两条路都会落到这同一个视图，成功之后该去哪不能靠
         /// 猜——建这个视图的地方必须显式填它，别指望靠别的字段反推。
         return_to_settings: bool,
+        /// 这个 profile 能不能靠配对拿到密钥（`profile::Profile::pairable`
+        /// 经 `ProfileEntry` 过桥）。Ctrl+A 认不认这个键，就靠这里，而不是
+        /// 再去按 `profile == "dc"` 猜——那正是这个字段要消灭的写法，见
+        /// `Profile::pairable` 的文档注释。
+        pairable: bool,
     },
     /// 「全部按键」浮层：底栏放不下的键都在这里。`?` 开，`Esc` 回。
     ///
@@ -204,8 +209,8 @@ pub(crate) enum View {
     /// 同一个地方，两页读的就是同一份真相）。
     Web,
     /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
-    /// 屏幕上，profile 是 `"dc"` 时的 Ctrl+A——跟 Ctrl+O 开申领页同一个
-    /// 键位规矩，不占用一个字母，密钥输入本身还要用它们）。
+    /// 屏幕上，profile 可配对（`pairable`）时的 Ctrl+A——跟 Ctrl+O 开
+    /// 申领页同一个键位规矩，不占用一个字母，密钥输入本身还要用它们）。
     ///
     /// 三个阶段，**每一个都必须有一条出路**——没有出路的错误屏等于死路，
     /// 见 `pair_view.rs` 的按键处理和它的测试。
@@ -1487,15 +1492,15 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             phase: SecretPhase::Verifying,
             ..
         } => help_items(&[("", Key::Verifying)], lang),
-        // `"dc"` 这个内置 profile 多一条 Ctrl+A（自动配对，见
-        // `secret.rs`/`pair_view.rs`）——只有它认这个键，其余 profile 底栏
-        // 不写，因为它们那边 `a` 就是敲进密钥里的一个普通字母，按下去不会
-        // 发生这里写的事。
+        // 可配对的 profile（`"dc"`/`"qwen"`，见 `Profile::pairable`）多一条
+        // Ctrl+A（自动配对，见 `secret.rs`/`pair_view.rs`）——只有它们认
+        // 这个键，其余 profile 底栏不写，因为它们那边 `a` 就是敲进密钥里
+        // 的一个普通字母，按下去不会发生这里写的事。
         View::EnterSecret {
-            profile,
             return_to_settings: true,
+            pairable: true,
             ..
-        } if profile == "dc" => help_items(
+        } => help_items(
             &[
                 ("", Key::PasteOrTypeKey),
                 ("Ctrl+A", Key::AutoPair),
@@ -1504,7 +1509,9 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
-        View::EnterSecret { profile, .. } if profile == "dc" => help_items(
+        View::EnterSecret {
+            pairable: true, ..
+        } => help_items(
             &[
                 ("", Key::PasteOrTypeKey),
                 ("Ctrl+A", Key::AutoPair),
@@ -1757,6 +1764,7 @@ mod tests {
             buf: String::new(),
             phase,
             return_to_settings,
+            pairable: false,
         };
         let mut typing = ProjectPicker::new(vec![], PathBuf::from("/"));
         typing.typing_path = Some(String::new());
@@ -2402,6 +2410,9 @@ mod tests {
             secret: None,
             install: None,
             backend_only: false,
+            // pick_action/digit_index 不看这个字段——它们的测试从不需要
+            // 一个可配对的 fixture。
+            pairable: false,
         }
     }
 
@@ -2682,6 +2693,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: false,
+            pairable: false,
             },
             Lang::Zh,
         );
@@ -2701,6 +2713,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
+            pairable: false,
             },
             Lang::Zh,
         );
@@ -2722,6 +2735,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
+            pairable: false,
             },
             Lang::Zh,
         );

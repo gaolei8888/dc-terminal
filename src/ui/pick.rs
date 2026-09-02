@@ -230,13 +230,16 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // （见 PickAction 的注释）。真下标是这里的 i，
                 // 从 entries[i] 取出来的正是被选中的这一行。
                 let e = &entries[i];
-                // `"dc"`（训练营网关）能自动配对——**这正是这个选择器的
-                // 默认路必须走的地方**，不是密钥输入的一个附加选项。spec
-                // 原话：学生根本不该主动去找「配对」这个词。选中一个还
-                // 没密钥的 `"dc"` 时直接起步配对；密钥手填退化成
-                // `View::Pair` 里随时能按的 `p`（`pair_view::handle_key`
-                // 已经从每个阶段都接回 `View::EnterSecret`，见它的测试）。
-                if e.name == "dc" {
+                // 可配对的 profile（`e.pairable`，见 `Profile::pairable`
+                // 的文档注释——目前是 `"dc"`/`"qwen"`）能自动配对——**这
+                // 正是这个选择器的默认路必须走的地方**，不是密钥输入的
+                // 一个附加选项。spec 原话：学生根本不该主动去找「配对」
+                // 这个词。选中一个还没密钥的可配对 profile 时直接起步
+                // 配对；密钥手填退化成 `View::Pair` 里随时能按的 `p`
+                // （`pair_view::handle_key` 已经从每个阶段都接回
+                // `View::EnterSecret`，见它的测试）。**不按名字判**——
+                // 判据长在 profile 上，不然 `qwen` 会漏掉这条路。
+                if e.pairable {
                     let name = e.name.clone();
                     super::pair_view::start_pairing(app, name);
                     return Ok(());
@@ -256,6 +259,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                     // 从选择器进来的意图是「开工」，存完直接建会话，
                     // 不回这里。
                     return_to_settings: false,
+                    pairable: e.pairable,
                 }
             }
             Some((_, PickAction::Install { profile, command })) => {
@@ -967,6 +971,7 @@ mod tests {
                 install: None,
                 has_secret: false,
                 backend_only: false,
+                pairable: false,
             },
             ProfileEntry {
                 name: "kimi".into(),
@@ -977,6 +982,7 @@ mod tests {
                 install: None,
                 has_secret: false,
                 backend_only: false,
+                pairable: false,
             },
             ProfileEntry {
                 name: "glm".into(),
@@ -989,6 +995,7 @@ mod tests {
                 install: None,
                 has_secret: false,
                 backend_only: false,
+                pairable: false,
             },
             ProfileEntry {
                 name: "codex".into(),
@@ -1009,6 +1016,7 @@ mod tests {
                 }),
                 has_secret: false,
                 backend_only: false,
+                pairable: false,
             },
         ];
         app.view = View::PickProfile {
@@ -1806,6 +1814,7 @@ mod tests {
                 install: None,
                 has_secret: false,
                 backend_only: false,
+                pairable: false,
             }],
             state: ratatui::widgets::ListState::default(),
             warning: None,
@@ -1833,6 +1842,7 @@ mod tests {
             install: None,
             has_secret: false,
             backend_only: false,
+            pairable: false,
         }]
     }
 
@@ -1849,6 +1859,7 @@ mod tests {
             install: None,
             has_secret: false,
             backend_only: false,
+            pairable: true,
         }]
     }
 
@@ -1878,6 +1889,93 @@ mod tests {
             match &app.view {
                 View::EnterSecret { .. } => "落进了 EnterSecret",
                 View::Pair { .. } => "Pair",
+                _ => "别的视图",
+            }
+        );
+    }
+
+    /// **这条是这次改动的全部意义。** `dc` 和 `qwen` 是同一把钥匙、同一个
+    /// 网关的两个方言（`pair_apply::apply` 一次写两个键）——先点 Qwen Code
+    /// 的学生跟先点 DC 的学生是同一批人，不该因为选了另一个名字就撞上
+    /// 粘贴框。这条测试如果绿了是因为判据真的长在 `pairable` 字段上，
+    /// 不是因为凑巧又把 `"qwen"` 加进了一份按名字特判的清单。
+    #[test]
+    fn choosing_qwen_with_no_key_also_goes_straight_to_pairing() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let entries = vec![crate::proto::ProfileEntry {
+            name: "qwen".into(),
+            label: "Qwen Code".into(),
+            note: String::new(),
+            status: ProfileStatus::NeedsSecret,
+            secret: Some(SecretPrompt {
+                hint: String::new(),
+                url: None,
+            }),
+            install: None,
+            has_secret: false,
+            backend_only: false,
+            pairable: true,
+        }];
+        app.view = View::PickProfile {
+            entries,
+            state,
+            warning: None,
+            no_git: false,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(app.view, View::Pair { .. }),
+            "选中没密钥的 qwen 也该直接进配对屏，不是密钥输入框：{:?}",
+            match &app.view {
+                View::EnterSecret { .. } => "落进了 EnterSecret",
+                View::Pair { .. } => "Pair",
+                _ => "别的视图",
+            }
+        );
+    }
+
+    /// **不可配对的 profile 一个字节都不能变。** 把判据从按名字改成按字段，
+    /// 最容易出的错是把所有人都变成可配对——`kimi` 指向月之暗面，不是训练营
+    /// 网关，配对会把学生送去一个那个厂商从没发过密钥的地方。这条钉住的是
+    /// `pairable: false` 的 profile 仍然落进老老实实的密钥输入框。
+    #[test]
+    fn choosing_a_non_pairable_profile_still_falls_through_to_the_key_box() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let entries = vec![crate::proto::ProfileEntry {
+            name: "kimi".into(),
+            label: "Kimi".into(),
+            note: String::new(),
+            status: ProfileStatus::NeedsSecret,
+            secret: Some(SecretPrompt {
+                hint: String::new(),
+                url: None,
+            }),
+            install: None,
+            has_secret: false,
+            backend_only: false,
+            pairable: false,
+        }];
+        app.view = View::PickProfile {
+            entries,
+            state,
+            warning: None,
+            no_git: false,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(app.view, View::EnterSecret { .. }),
+            "kimi 不可配对，选中没密钥的它该落进密钥输入框，不是配对屏：{:?}",
+            match &app.view {
+                View::EnterSecret { .. } => "EnterSecret",
+                View::Pair { .. } => "落进了 Pair",
                 _ => "别的视图",
             }
         );

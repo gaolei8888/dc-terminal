@@ -1916,6 +1916,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -1982,6 +1983,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2009,6 +2011,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2037,6 +2040,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2798,6 +2802,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
         });
         m.set_backend(Some(Arc::new(ByScreenTail)));
         let id = m

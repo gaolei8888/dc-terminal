@@ -40,6 +40,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
         mut buf,
         phase,
         return_to_settings,
+        pairable,
     } = app.view.clone()
     else {
         return Ok(());
@@ -78,6 +79,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Verifying,
                     return_to_settings,
+                    pairable,
                 };
             }
         }
@@ -140,6 +142,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Verifying,
                     return_to_settings,
+                    pairable,
                 };
             }
             KeyCode::Backspace => {
@@ -151,15 +154,17 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Typing,
                     return_to_settings,
+                    pairable,
                 };
             }
-            // Ctrl+A 不用 a：训练营网关那个内置 profile（`"dc"`）能自动
-            // 配对，不用学生自己去网关网站抄一串密钥——但只有这一个
+            // Ctrl+A 不用 a：可配对的 profile（`pairable`，见
+            // `Profile::pairable` 的文档注释——目前是 `"dc"`/`"qwen"`）
+            // 能自动配对，不用学生自己去网关网站抄一串密钥——但只有这类
             // profile 认这个键，其余 profile 的密钥输入里 `a` 就是个
             // 普通字母，不能被这条分支吞掉。跟 Ctrl+O 同一条键位规矩
             // （见上面那条注释）：不占用一个字母键，密钥输入本身还要用它。
             KeyCode::Char('a')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && profile == "dc" =>
+                if key.modifiers.contains(KeyModifiers::CONTROL) && pairable =>
             {
                 super::pair_view::start_pairing(app, profile);
             }
@@ -183,6 +188,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase,
                     return_to_settings,
+                    pairable,
                 };
             }
             KeyCode::Char(c) => {
@@ -194,6 +200,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Typing,
                     return_to_settings,
+                    pairable,
                 };
             }
             _ => {
@@ -204,6 +211,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase,
                     return_to_settings,
+                    pairable,
                 };
             }
         },
@@ -254,12 +262,13 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                 .selected()
                 .and_then(|i| rows.get(i))
                 .and_then(|(name, _)| entries.iter().find(|e| &e.name == name));
-            // `"dc"`（训练营网关）能自动配对——同 `pick.rs` 那条 `AskSecret`
-            // 分支一个理由：密钥页这一屏也不该是学生填 `"dc"` 密钥的地方，
-            // spec 原话是学生根本不该主动去找「配对」这个词。手动填退化成
-            // `View::Pair` 里随时能按的 `p`。
+            // 可配对的 profile（`e.pairable`，见 `Profile::pairable`）能自动
+            // 配对——同 `pick.rs` 那条 `AskSecret` 分支一个理由：密钥页这
+            // 一屏也不该是学生填这类密钥的地方，spec 原话是学生根本不该
+            // 主动去找「配对」这个词。手动填退化成 `View::Pair` 里随时能按
+            // 的 `p`。**不按名字判**——判据长在 profile 上，见字段文档。
             if let Some(e) = target {
-                if e.name == "dc" {
+                if e.pairable {
                     let name = e.name.clone();
                     super::pair_view::start_pairing(app, name);
                     return Ok(());
@@ -280,6 +289,7 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                     phase: SecretPhase::Typing,
                     // 从设置页进来，改完要回设置页
                     return_to_settings: true,
+                    pairable: e.pairable,
                 },
                 // Enter 也是「其他键」，没找到目标（没有选中行）时
                 // 留在原地也要把武装状态清掉。
@@ -542,6 +552,11 @@ mod tests {
             secret: None,
             install: None,
             backend_only: false,
+            // 这个 fixture 只在这个文件里跑到 `"dc"`——照真实 `dc.toml` 的样子
+            // 把它标成可配对，其余名字（`"kimi"`/`"glm"`/`"claude"`）留 false，
+            // 这样下面那条「不可配对的 profile 一个字节都不能变」的测试才有
+            // 意义（不然它测的是一个从来不会为真的分支）。
+            pairable: name == "dc",
         }
     }
 
@@ -573,6 +588,7 @@ mod tests {
             buf: String::new(),
             phase: SecretPhase::Typing,
             return_to_settings,
+        pairable: false,
         }
     }
 
@@ -672,6 +688,7 @@ mod tests {
             buf: "x".repeat(200),
             phase: SecretPhase::Typing,
             return_to_settings: false,
+        pairable: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
     }
@@ -695,6 +712,7 @@ mod tests {
             buf: "sk-abc123".into(),
             phase: SecretPhase::Typing,
             return_to_settings: false,
+        pairable: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
         assert!(
@@ -724,6 +742,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings,
+            pairable: false,
             };
             term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
             buffer_text(term.backend().buffer())

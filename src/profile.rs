@@ -91,6 +91,14 @@ pub struct Profile {
     pub command: Vec<String>,
     #[serde(default)]
     pub is_agent: bool,
+    /// 这个 profile 的密钥能不能靠配对拿到（`View::Pair`），而不是让用户粘贴。
+    ///
+    /// **不按名字判。** 曾经是 `if name == "dc"`，而 `qwen` 用的是同一把钥匙、
+    /// 同一个网关，于是先点 Qwen Code 的学生照样撞上粘贴框——那正是配对要
+    /// 消灭的那一屏。判据要长在 profile 上，因为「能不能配对」是这个端点的
+    /// 性质，不是某个名字的性质。
+    #[serde(default)]
+    pub pairable: bool,
     #[serde(default)]
     pub idle_pattern: Option<String>,
     /// agent 干活时屏幕上一定有的串（比如 codex 的 `esc to interrupt`）。
@@ -1400,6 +1408,41 @@ mod tests {
         }
     }
 
+    /// `pairable` 的默认值必须是 `false`：用户自己写的 profile 没提这个
+    /// 字段时，不该莫名其妙获得一条指向训练营网关的配对流程。这里直接测
+    /// 反序列化一份**没写 `pairable`** 的 TOML，而不是测 `Profile` 字面量——
+    /// 字面量测不出 `#[serde(default)]` 到底生没生效，能骗过编译器的地方
+    /// 只有反序列化这条路。
+    #[test]
+    fn pairable_defaults_to_false_when_a_profile_does_not_declare_it() {
+        let p = Profile::from_toml(
+            r#"
+            name = "homemade"
+            command = ["echo", "hi"]
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !p.pairable,
+            "没写 pairable 的 profile 不该被当成可配对"
+        );
+    }
+
+    /// `dc`/`qwen` 是同一把钥匙、同一个网关的两个方言——两个都要标
+    /// `pairable = true`，其余内置 profile 都指向别的厂商，标了就会把
+    /// 学生送去一个那个厂商从没发过密钥的地方。
+    #[test]
+    fn only_dc_and_qwen_are_pairable_among_the_builtins() {
+        for name in Profile::builtin_names() {
+            let p = Profile::builtin(name).unwrap();
+            let should_be_pairable = name == "dc" || name == "qwen";
+            assert_eq!(
+                p.pairable, should_be_pairable,
+                "{name}: pairable 该是 {should_be_pairable}"
+            );
+        }
+    }
+
     fn entry(name: &str) -> crate::proto::ProfileEntry {
         crate::proto::ProfileEntry {
             name: name.to_string(),
@@ -1410,6 +1453,7 @@ mod tests {
             install: None,
             has_secret: false,
             backend_only: false,
+            pairable: false,
         }
     }
 

@@ -66,6 +66,7 @@ fn test_shell_profile() -> Profile {
         label: Default::default(),
         note: Default::default(),
         resume_args: Default::default(),
+        pairable: false,
         backend_only: false,
     }
 }
