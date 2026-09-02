@@ -153,6 +153,16 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     return_to_settings,
                 };
             }
+            // Ctrl+A 不用 a：训练营网关那个内置 profile（`"dc"`）能自动
+            // 配对，不用学生自己去网关网站抄一串密钥——但只有这一个
+            // profile 认这个键，其余 profile 的密钥输入里 `a` 就是个
+            // 普通字母，不能被这条分支吞掉。跟 Ctrl+O 同一条键位规矩
+            // （见上面那条注释）：不占用一个字母键，密钥输入本身还要用它。
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && profile == "dc" =>
+            {
+                super::pair_view::start_pairing(app, profile);
+            }
             // Ctrl+O 不用 o：o 得留给密钥输入本身
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // MINOR 8（最终整分支 code review）：`open` 只在 macOS

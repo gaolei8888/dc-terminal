@@ -203,6 +203,58 @@ pub(crate) enum View {
     /// 塞在视图里的状态会被无声冲掉；这一页没有那条路，但把状态放在
     /// 同一个地方，两页读的就是同一份真相）。
     Web,
+    /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
+    /// 屏幕上，profile 是 `"dc"` 时的 Ctrl+A——跟 Ctrl+O 开申领页同一个
+    /// 键位规矩，不占用一个字母，密钥输入本身还要用它们）。
+    ///
+    /// 三个阶段，**每一个都必须有一条出路**——没有出路的错误屏等于死路，
+    /// 见 `pair_view.rs` 的按键处理和它的测试。
+    Pair {
+        profile: String,
+        phase: PairPhase,
+    },
+}
+
+/// 配对屏正处在哪个阶段。
+#[derive(Clone)]
+pub(crate) enum PairPhase {
+    /// 已经发出 `Request::PairStart`，真网络请求在后台线程里飞着——结果
+    /// 回来之前这一屏没有任何键能按，同 `SecretPhase::Verifying` 的道理
+    /// （`Esc` 除外：那条键必须永远能退，见 `pair_view::handle_key`）。
+    Starting,
+    /// 拿到了 `user_code`，等学生在浏览器里输完。
+    Waiting {
+        /// 大字印在屏幕上，学生照着念或照着敲。
+        user_code: String,
+        /// **本地拼好的完整地址**，daemon 给的只是 `verify_path`——origin
+        /// 由 dct 自己从这个 profile 的 `[api].base_url` 里取，绝不接受
+        /// 线上答复里可能出现的任何 origin（`/pair/start` 无认证，这是
+        /// 钓鱼面）。同一份文本既拿去开浏览器，也印在屏上：浏览器打不开
+        /// 是常态（SSH、WSL、没设默认浏览器），没有这行地址学生就卡死。
+        url: String,
+        /// 倒计时用。
+        deadline: std::time::Instant,
+    },
+    /// 拿不到钥匙——起步失败、码过期、被拒、钥匙读不出来，网关的各种
+    /// 「没成」统一收在这一个阶段里，靠 `message`/`retryable` 分岔文案
+    /// 和按键。
+    Failed {
+        /// 已经组好的人话。**`retryable` 为假时这句必须原样带着网关自己
+        /// 给的那句话**（比如「这个账号还没有可读取的密钥，请点『重新
+        /// 生成』」）——把它显示成跟可重试那种一样的「过期了」，学生会
+        /// 按 `r` 按到天荒地老，每一次都走到同一个地方。
+        message: String,
+        /// 按 `r` 换一次新码有没有意义。`false` 的那一种按多少次都是
+        /// 同一个死结，`r` 键在渲染和按键处理里都不认。
+        retryable: bool,
+    },
+    /// 成功。免费账号只有 `openai`（Qwen 那一路），必须**明说**——不然
+    /// 学生会拿着新配好的账号试 Claude，撞上一个没有任何解释的失败，
+    /// 而没人告诉过他这是免费账号的正常边界，付费升级才有 Claude。
+    Done {
+        anthropic: bool,
+        openai: bool,
+    },
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
@@ -1144,6 +1196,10 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 从设置页进来，退出回设置页——同 `EnterSecret` 的 `return_to_settings`
         // 分支一个道理，这一页没有别的来路。
         View::Phone { .. } => text(Key::BackToSettings, lang).to_string(),
+        // 配对屏的 Esc 是真取消（发 `PairCancel`），落点是回家——它没有
+        // `EnterSecret` 那种 `return_to_settings` 记忆（`View::Pair` 只带
+        // `profile`/`phase` 两个字段，见它的文档注释），退出去了就是回家。
+        View::Pair { .. } => text(Key::BackToBoard, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
@@ -1431,6 +1487,32 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             phase: SecretPhase::Verifying,
             ..
         } => help_items(&[("", Key::Verifying)], lang),
+        // `"dc"` 这个内置 profile 多一条 Ctrl+A（自动配对，见
+        // `secret.rs`/`pair_view.rs`）——只有它认这个键，其余 profile 底栏
+        // 不写，因为它们那边 `a` 就是敲进密钥里的一个普通字母，按下去不会
+        // 发生这里写的事。
+        View::EnterSecret {
+            profile,
+            return_to_settings: true,
+            ..
+        } if profile == "dc" => help_items(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Ctrl+A", Key::AutoPair),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToSettingsWord),
+            ],
+            lang,
+        ),
+        View::EnterSecret { profile, .. } if profile == "dc" => help_items(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Ctrl+A", Key::AutoPair),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToListWord),
+            ],
+            lang,
+        ),
         // 跟 escape_hint 一样要分 return_to_settings：从设置页进来的 Esc
         // 回设置页，不是「列表」——两处文案哪怕只有半句话不一致，都是
         // 「底栏说什么就得真能做到什么」这条原则被破坏了一半。
@@ -1520,6 +1602,24 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             // 上面几个键「前提不在就不写」的道理不冲突——它没有前提。
             items.push(("w", Key::WebToggle));
             items.push(("Esc", Key::BackToSettingsWord));
+            help_items(&items, lang)
+        }
+        // 三个阶段各有各的能按的键，跟手机页「能不能按也决定写不写」同一个
+        // 道理——`r` 只在 `retryable` 的失败上写，`o` 只在等码的那一屏写
+        // （那是唯一存着 URL 的阶段），`p`（手动填）在**每一个**阶段都写：
+        // 见 `pair_view.rs` 的 `manual_entry_stays_reachable_from_every_phase`。
+        View::Pair { phase, .. } => {
+            let mut items: Vec<(&'static str, Key)> = Vec::new();
+            match phase {
+                PairPhase::Starting => items.push(("", Key::Verifying)),
+                PairPhase::Waiting { .. } => {
+                    items.push(("o", Key::ReopenBrowser));
+                }
+                PairPhase::Failed { retryable: true, .. } => items.push(("r", Key::Retry)),
+                PairPhase::Failed { retryable: false, .. } | PairPhase::Done { .. } => {}
+            }
+            items.push(("p", Key::ManualEntry));
+            items.push(("Esc", Key::Cancel));
             help_items(&items, lang)
         }
     }

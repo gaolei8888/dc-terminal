@@ -75,19 +75,29 @@ fn apply_inner(
     // 更坏，学生会撞上一个没有任何解释的 404。空的那一组不落一个 section，
     // 而不是落一个空 section——`[dc]` 段存在与否，直接就是「这个账号有没有
     // Anthropic 那一路」这件事本身，不用去看里面有没有键。
+    // 网关现在保证一组模型要么两个都有要么两个都没有（有一份网关侧的测试
+    // 钉着这件事），所以下面这个「有 default 没 small_fast 就借 default
+    // 顶上」的分支照今天的契约永远走不到。留着它是防那份保证哪天悄悄破了：
+    // 不这样兜的话，`ANTHROPIC_SMALL_FAST_MODEL` 就是没写，起标题、扫文件
+    // 那个便宜模型悄悄用回 agent 自己的默认值——会话看起来一切正常（主模型
+    // 照常答问题），只有标题和文件扫描这两件不起眼的小事在课堂上时好时坏，
+    // 没有人能把这种「有时候不好使」跟一个具体原因对上。一行 belt，防一个
+    // 今天看不见、一旦发生没人能诊断的失败。
     let mut dc_env = BTreeMap::new();
     if let Some(m) = &a.models.anthropic.default {
         dc_env.insert("ANTHROPIC_MODEL".to_string(), m.clone());
-    }
-    if let Some(m) = &a.models.anthropic.small_fast {
-        dc_env.insert("ANTHROPIC_SMALL_FAST_MODEL".to_string(), m.clone());
+        dc_env.insert(
+            "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
+            a.models.anthropic.small_fast.clone().unwrap_or_else(|| m.clone()),
+        );
     }
     let mut qwen_env = BTreeMap::new();
     if let Some(m) = &a.models.openai.default {
         qwen_env.insert("OPENAI_MODEL".to_string(), m.clone());
-    }
-    if let Some(m) = &a.models.openai.small_fast {
-        qwen_env.insert("OPENAI_SMALL_FAST_MODEL".to_string(), m.clone());
+        qwen_env.insert(
+            "OPENAI_SMALL_FAST_MODEL".to_string(),
+            a.models.openai.small_fast.clone().unwrap_or_else(|| m.clone()),
+        );
     }
     let mut sections = BTreeMap::new();
     if !dc_env.is_empty() {
@@ -208,6 +218,34 @@ mod tests {
         assert!(
             raw.contains("ANTHROPIC_SMALL_FAST_MODEL = \"claude-small\""),
             "{raw}"
+        );
+    }
+
+    /// 网关保证一组模型要么两个都有要么两个都没有，今天这条按契约永远
+    /// 走不到——写它是防那份保证哪天悄悄破了：`default` 有、`small_fast`
+    /// 没有的时候，两个变量都该落在 `default` 上，而不是把
+    /// `*_SMALL_FAST_MODEL` 悬空。悬空的后果是会话看起来一切正常（主模型
+    /// 照常答问题），只有起标题、扫文件这两件不起眼的小事在课堂上时好时坏
+    /// ——没人会把这种「有时候不好使」跟一个具体原因对上，见这个改动的
+    /// 提交信息。Anthropic 和 openai 两组各测一遍。
+    #[test]
+    fn a_default_without_a_small_fast_model_borrows_default_for_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(crate::secrets::SecretStore::load(
+            &dir.path().join("secrets.toml"),
+        ));
+        let mut a = approved_with_both_wires();
+        a.models.anthropic.small_fast = None;
+        a.models.openai.small_fast = None;
+        apply(&a, dir.path(), &store, false).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
+        assert!(
+            raw.contains("ANTHROPIC_SMALL_FAST_MODEL = \"claude-x\""),
+            "缺 small_fast 时该借 default 顶上：{raw}"
+        );
+        assert!(
+            raw.contains("OPENAI_SMALL_FAST_MODEL = \"qwen3.8:27b\""),
+            "openai 那一组也一样：{raw}"
         );
     }
 

@@ -1106,7 +1106,12 @@ fn web_disable(web: Option<&Arc<Mutex<Option<crate::web::Server>>>>) -> Response
 /// 配对用哪个 origin：从这个 profile 的 `[api].base_url` 里取，**只取 origin**。
 /// 这是整条流程的信任锚——它随仓库发布，不来自网络（spec 里那段
 /// 「origin 是信任锚，路径是配置」）。
-fn pair_origin(profiles_dir: &Path, profile: &str) -> Option<String> {
+///
+/// `pub(crate)`：`ui::pair_view` 也要用它，而且必须用**同一个函数**——
+/// 界面进程独立算一遍 origin 正是「不信线上答复」这条安全属性的落点
+/// （`PairStartedInfo` 连一个 origin 字段都没有），两边分别抄一份逻辑
+/// 只会在某一天悄悄漂开，那时候这条安全属性就名存实亡了。
+pub(crate) fn pair_origin(profiles_dir: &Path, profile: &str) -> Option<String> {
     let (all, _) = all_profiles(profiles_dir);
     let base = all
         .iter()

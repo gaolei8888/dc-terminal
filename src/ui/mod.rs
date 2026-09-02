@@ -29,6 +29,7 @@ mod attach;
 mod board;
 mod grid;
 mod keys;
+mod pair_view;
 mod phone;
 mod pick;
 mod secret;
@@ -41,7 +42,7 @@ pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
     verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
-use view::{escape_hint, idle_help, message_after_transition, session_ended_notice, View};
+use view::{escape_hint, idle_help, message_after_transition, session_ended_notice, PairPhase, View};
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
 ///
@@ -622,6 +623,52 @@ pub fn run(
             }
         }
 
+        // 配对起步的结果，同上面 `verify_rx`/`phone_verify_rx` 一个理由：
+        // 必须在 `term.draw` 之前收，不然这一帧画的还是「正在联系网关…」。
+        if let Some(rx) = &app.pair_start_rx {
+            if let Ok((stamped_profile, outcome)) = rx.try_recv() {
+                app.pair_start_rx = None;
+                // 用户可能已经 Esc/`p` 离开了配对屏，或者（理论上）在
+                // 这条起步结果飞着的时候又开了另一条——用 profile 现比对
+                // 一遍，同 `verify_rx` 收尾那段「视图对不上就不应用」的
+                // 道理，不满足就扔掉，不切视图。
+                if let View::Pair {
+                    profile,
+                    phase: PairPhase::Starting,
+                } = app.view.clone()
+                {
+                    if profile == stamped_profile {
+                        app.view = pair_view::apply_started(&mut app, profile, outcome);
+                    }
+                }
+            }
+        }
+        // 等码的那一屏要能眼看着状态从「等着」变成「成功」/「过期」——
+        // 配对本身是异步的（守护进程在后台线程里一直轮询网关），没有这
+        // 一段轮询，用户守着这一页也看不到任何变化。跟手机页 300ms 一轮
+        // 同一个理由，只是这里按 500ms（配对是「等几分钟」的事，比手机
+        // 通知的「等一下」更松，没必要刷得那么勤）。
+        if let View::Pair {
+            profile,
+            phase: PairPhase::Waiting { .. },
+        } = app.view.clone()
+        {
+            let due = app
+                .pair_last_fetch
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
+            if due {
+                if let Ok(Response::PairTick(tick)) = app
+                    .client()
+                    .and_then(|c| c.call(Request::PairPoll { profile: profile.clone() }))
+                {
+                    if let View::Pair { phase: current, .. } = app.view.clone() {
+                        app.view = pair_view::apply_tick(app.lang, profile, current, tick);
+                    }
+                }
+                app.pair_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
             match app.client().and_then(|c| c.call(Request::List)) {
@@ -975,6 +1022,7 @@ pub fn run(
             View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             View::Phone { .. } => phone::handle_key(&mut app, key)?,
             View::Web => web::handle_key(&mut app, key)?,
+            View::Pair { .. } => pair_view::handle_key(&mut app, key)?,
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
@@ -2392,6 +2440,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
         View::Phone { .. } => phone::draw(f, chunks[0], app),
         View::Web => web::draw(f, chunks[0], app),
+        View::Pair { .. } => pair_view::draw(f, chunks[0], app),
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
