@@ -95,6 +95,12 @@ dct」，这里是「把网关账号配给 dct」，信任模型不同，硬套�
 | `user_id` | 批准时才填 |
 | `created_at` / `expires_at` | 有效期 5 分钟 |
 | `poll_count` | 轮询次数，用于限流 |
+| `client_ip` / `client_ua` | `start` 时记下，确认页要显示（见下） |
+
+`user_code` 要**唯一索引 + 冲突重试**：8 位、去掉易混字符的字母表，撞是迟早的事，
+而撞上的后果是「批准了另一条流程」。过期的行在下一次 `/pair/start` 时顺手清掉，
+不为这个加调度器。（这两条 2026-09-02 由 `dc-llm-01` 补，SQLite 上唯一索引要用
+`create_index(..., unique=True)`，见本节末尾的迁移注意事项。）
 
 ### 三个接口：冻结的线上契约
 
@@ -110,9 +116,10 @@ dct」，这里是「把网关账号配给 dct」，信任模型不同，硬套�
 ```
 POST /admin/api/pair/start                              无认证
   → {"client": "dct", "version": "0.2.5"}
+     User-Agent: dct/0.2.5 (macos; aarch64)
   ← 200 {"device_code": "<64 hex>",
          "user_code": "HJ4K-9QTZ",
-         "verify_url": "https://dc-llm.tzspace.cn/pair?code=HJ4K-9QTZ",
+         "verify_path": "/pair",
          "interval": 3,
          "expires_in": 900}
   ← 404  开关关着
@@ -138,6 +145,30 @@ POST /admin/api/pair/poll                               无认证，device_code 
 问题」（不认识的码、太快、功能关着）才用状态码。理由是 dct 那侧：状态机读一个
 `status` 枚举，比既解析状态码又解析错误体少一半出错的地方，而 `denied` / `expired`
 是**正常的**流程终点，不是错误。
+
+**网关返回的是 `verify_path`，不是完整 URL——origin 由 dct 自己拼。**
+（2026-09-02 修正，起因是 `dc-llm-01` 在实现时发现的钓鱼面。）
+
+原稿让网关返回整条 `verify_url`。但 `/pair/start` 是**无认证**的，而 dct 拿到那个字符串
+就**直接开浏览器**。网关若从 `X-Forwarded-Host` 之类推导 origin，任何能打到这个接口的人
+都能让 dct 打开一个他控制的页面——而那个页面要的正是学生的控制台登录。
+
+所以 origin 只能来自 dct **本地已经知道**的那个值（`profiles/dc.toml` 里 `[api].base_url`
+的同源地址，随仓库发布，不来自网络）。dct 拼 `<本地已知 origin><verify_path>?code=<user_code>`。
+网关连一个可被影响的 origin 都不必持有，这条路径上没有任何东西可以被伪造成别的站点。
+
+留 `verify_path` 而不是让 dct 把路径也写死：SPA 哪天改路由，网关改一个字符串就行，
+不用等 dct 发版。**路径是配置，origin 是信任锚**，两者不能混。
+
+**dct 发的 User-Agent**（确认页要显示它，所以这里定死）：
+
+```
+dct/<CARGO_PKG_VERSION> (<std::env::consts::OS>; <std::env::consts::ARCH>)
+例：dct/0.2.5 (macos; aarch64)
+```
+
+只有版本、系统、架构。**不带主机名、不带用户名**——那一行是要显示在网页上给人看的，
+它的用处是「这台设备是不是我」，不是「这台设备是谁」。
 
 `models` 和 `quota` 的形状见下两节。
 
@@ -238,8 +269,20 @@ FastAPI 上挂一个 `/v1/{full_path:path}` 的 catch-all，先做 key 认证、
 ```
 GET /v1/me/quota    Authorization: Bearer <api_key>
   ← 200 {"used_micro": int, "limit_micro": int | null,
-         "period_end": "<ISO 8601>" | null, "plan": str}
+         "period_end": "<ISO 8601>" | null, "plan": str,
+         "window": {"<platform>": {"used_tokens": int,
+                                   "limit_tokens": int,
+                                   "resets_at": "<ISO 8601>"}}}
 ```
+
+**`window` 是 2026-09-02 加的，而且它才是真正会拦住学生的那个限额。**
+（来源：`dc-llm-01`。）钱包按钱算，`usage_window` 按 token 算——免费档每平台
+5 小时 20 万 token，从首次使用起算。**一轮 Claude Code 的对话在「贵」之前先「长」**，
+所以学生会在面板还写着「还剩 ¥3.21」的时候被拒绝，理由是「本时段额度已用完」。
+那读起来就是 dct 的 bug。
+
+dct 侧的规矩：**显示两者中更接近耗尽的那个**，并且把话说成人话
+（「本时段额度约 20 分钟后恢复」而不是「window.resets_at」）。
 
 `poll` 的 `approved` 里那个 `quota` 用**同一个形状**，值取 `free_quota.snapshot(db, user_id)`
 ——跟 playground 面板同一个来源，两处不许各算各的。
@@ -262,6 +305,16 @@ catch-all 会把这个路径吞掉转给上游。
 `console/src/views/` 下加一个配对确认页，`verify_url` 指向它。页面上要有：
 学生自己输入或从 URL 带入的 `user_code`、一句「dct 想拿走你的密钥」、
 确认和拒绝两个按钮。**拒绝必须是个真按钮**——没有拒绝的确认页教人闭眼点确认。
+
+**页面要显示这是哪台设备，不能只显示那串码。** 第 1 节说了「谁登录谁都能批准任何一串
+码」是设计如此——但那正好是设备码钓鱼的形状：攻击者起一条流程，把自己的码念给学生
+（「你把这个念一下就算装好了」），学生一批准，攻击者那边轮询就把钥匙收走了。码要**手输**
+挡掉一部分，但它不告诉学生**他在给谁授权**。
+
+所以 `/pair/start` 时记下 IP 和 User-Agent，确认页上原样显示：
+`请求来自 192.168.1.10 · dct/0.2.5 (macos; aarch64)`。这不能阻止钓鱼，但它给了学生
+一样具体的、能看出不对劲的东西——而「你自己那台机器的地址」是他唯一有可能认得出的
+证据。再加一条：同一 session 每分钟能批准的次数要有上限。
 
 **SPA 路由有个坑，不处理这页会跳走**：`console/src/router/index.ts:79` 是
 `if (auth.isConsumer && to.name !== 'my-playground') return { name: 'my-playground' }`
