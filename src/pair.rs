@@ -13,7 +13,13 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// `POST /admin/api/pair/start` 的响应。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **`Debug` 是手写的，因为 `device_code` 是凭据。** 跟 `proto.rs` 里
+/// `SetSecret`/`VerifySecret` 那两个手写 `Debug` 一个理由：今天没有哪一行
+/// 代码打印它，但一条 `panic!("… {other:?}")`、一句临时加的 `dbg!`、
+/// 一行日志就够把它送进终端回滚缓冲、CI 日志或者学生贴出来的截图里。
+/// 派生的 `Debug` 让那一天变成默认，手写的让它变成一次显式的改动。
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Started {
     pub device_code: String,
     pub user_code: String,
@@ -64,7 +70,9 @@ pub struct Window {
 }
 
 /// `POST /admin/api/pair/poll` 的响应，已经从 JSON 归一化过。
-#[derive(Debug, Clone)]
+///
+/// `Debug` 手写：`Approved` 那一支装着 `api_key`，理由同 `Started`。
+#[derive(Clone)]
 pub enum Poll {
     Pending,
     Approved {
@@ -98,12 +106,70 @@ pub enum Tick {
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+/// `Debug` 手写：`api_key` 就是学生那把钥匙本身，理由同 `Started`。
+/// `pair.rs` 自己的测试就有一条 `panic!("该是 …，实际 {other:?}")` 打在
+/// 装着这个类型的 `Tick` 上——派生的 `Debug` 会让一次测试失败直接把钥匙
+/// 打进 CI 日志。
+#[derive(Clone)]
 pub struct Approved {
     pub api_key: String,
     pub models: Models,
     pub platforms: BTreeMap<String, String>,
     pub quota: Option<Quota>,
+}
+
+impl std::fmt::Debug for Started {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Started")
+            // `user_code` 照常打印：它本来就印在屏幕上给人念，不是凭据
+            // （spec 第 1 节那四条安全约束里的第三条说的就是这件事）。
+            .field("user_code", &self.user_code)
+            .field("device_code", &"<redacted>")
+            .field("verify_path", &self.verify_path)
+            .field("interval", &self.interval)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Approved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Approved")
+            .field("api_key", &"<redacted>")
+            .field("models", &self.models)
+            .field("platforms", &self.platforms)
+            .field("quota", &self.quota)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Poll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Poll::Pending => f.write_str("Pending"),
+            Poll::Approved {
+                models,
+                platforms,
+                quota,
+                ..
+            } => f
+                .debug_struct("Approved")
+                .field("api_key", &"<redacted>")
+                .field("models", models)
+                .field("platforms", platforms)
+                .field("quota", quota)
+                .finish(),
+            Poll::Denied => f.write_str("Denied"),
+            Poll::Claimed => f.write_str("Claimed"),
+            Poll::Expired { reason, message } => f
+                .debug_struct("Expired")
+                .field("reason", reason)
+                .field("message", message)
+                .finish(),
+            Poll::RateLimited => f.write_str("RateLimited"),
+            Poll::NotEnabled => f.write_str("NotEnabled"),
+        }
+    }
 }
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -332,6 +398,51 @@ mod tests {
             }
             other => panic!("该是 Expired，实际 {other:?}"),
         }
+    }
+
+    /// **凭据一个字都不许出现在 `Debug` 输出里。** 手写的 `Debug` 是为了
+    /// 这条属性存在的，没有测试钉着它，下一个人给这几个类型加回一个
+    /// `#[derive(Debug)]` 时不会有任何东西变红。同 `proto.rs` 里
+    /// `pair_requests_do_not_print_anything_sensitive` 一条属性两个文件。
+    #[test]
+    fn debug_output_never_carries_a_credential() {
+        let s = format!(
+            "{:?}",
+            Started {
+                device_code: "dev-code-secret".into(),
+                ..started()
+            }
+        );
+        assert!(
+            !s.contains("dev-code-secret"),
+            "device_code 漏进了 Debug：{s}"
+        );
+        assert!(s.contains("HJ4K-9QTZ"), "user_code 该照常打印：{s}");
+
+        let approved = Approved {
+            api_key: "sk-live-secret".into(),
+            models: Models::default(),
+            platforms: BTreeMap::new(),
+            quota: None,
+        };
+        let s = format!("{approved:?}");
+        assert!(!s.contains("sk-live-secret"), "api_key 漏进了 Debug：{s}");
+
+        // 真正会打印的是包着它的 `Tick`（`pair.rs` 自己的测试就在
+        // `panic!` 里这么干），所以连包了一层也要一起钉住。
+        let s = format!("{:?}", Tick::Done(Box::new(approved.clone())));
+        assert!(!s.contains("sk-live-secret"), "{s}");
+
+        let s = format!(
+            "{:?}",
+            Poll::Approved {
+                api_key: approved.api_key.clone(),
+                models: Models::default(),
+                platforms: BTreeMap::new(),
+                quota: None,
+            }
+        );
+        assert!(!s.contains("sk-live-secret"), "{s}");
     }
 
     /// UA 里不许出现主机名和用户名：这一行要渲染在网页上给人看。

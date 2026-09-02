@@ -1013,14 +1013,53 @@ mod tests {
     }
 
     /// `device_code` 是凭据，跟密钥一个待遇：手写的 Debug 要把它挡住。
+    ///
+    /// **这条测试要断言的是"没有"，不是"有"。** 它原来只查了
+    /// `s.contains("dc")`——那句话证明的是 profile 名照常打印，跟脱敏
+    /// 半点关系没有，一个把凭据原样打出来的 `Debug` 也照样能让它变绿。
+    /// 一条只断言正面的脱敏测试比没有测试更坏：它让人以为这件事有人守着。
     #[test]
     fn pair_requests_do_not_print_anything_sensitive() {
-        let r = Request::PairStart {
-            profile: "dc".into(),
-            opt_in_llm: true,
-        };
-        let s = format!("{r:?}");
-        assert!(s.contains("dc"), "profile 该照常打印，排查问题要用：{s}");
+        // 配对这三条请求里**装不下**凭据——`device_code` 只活在 daemon
+        // 自己的内存里，`Request` 的类型本身就没有这个字段。所以这里能
+        // 断言的负面是：任何一条配对请求的 `Debug` 输出里都不许出现
+        // 密钥形状的东西，而 `SetSecret`/`VerifySecret` 这两条真装着密钥的
+        // 请求必须把它盖掉。三条一起测，是因为脱敏这件事一旦漏，
+        // 漏的一定是新加的那一条。
+        for r in [
+            Request::PairStart {
+                profile: "dc".into(),
+                opt_in_llm: true,
+            },
+            Request::PairPoll {
+                profile: "dc".into(),
+            },
+            Request::PairCancel {
+                profile: "dc".into(),
+            },
+        ] {
+            let s = format!("{r:?}");
+            assert!(s.contains("dc"), "profile 该照常打印，排查问题要用：{s}");
+            assert!(!s.contains("device_code"), "凭据的字段名都不该出现：{s}");
+            assert!(!s.contains("sk-"), "{s}");
+        }
+
+        let s = format!(
+            "{:?}",
+            Request::SetSecret {
+                profile: "dc".into(),
+                value: "sk-live-secret".into(),
+            }
+        );
+        assert!(!s.contains("sk-live-secret"), "密钥漏进了 Debug：{s}");
+        let s = format!(
+            "{:?}",
+            Request::VerifySecret {
+                profile: "dc".into(),
+                value: "sk-live-secret".into(),
+            }
+        );
+        assert!(!s.contains("sk-live-secret"), "密钥漏进了 Debug：{s}");
     }
 
     /// 请求那条 pin 只钉了**发出去**的形状，回来的没人管——而 2026-08-06
