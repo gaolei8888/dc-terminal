@@ -187,3 +187,69 @@ fn unticking_the_box_before_approval_keeps_llm_out_of_the_config() {
         ),
     }
 }
+
+/// **取消勾选是粘的：这一次配对之内，`false` 之后再来的 `true` 不算数。**
+///
+/// 两条时钟对不齐。界面每 500ms 把勾选框的当前值捎在 `PairPoll` 上，
+/// 轮询线程每 250ms 醒一次、网关一回 `approved` 就立刻落盘——落盘那一刻
+/// 读到的值不保证是学生屏幕上的那个。两个方向都会抢输，但只有一个方向
+/// 不能接受：默认勾着的那个抢输，学生停在他看见过也没反对过的值上；
+/// 而取消勾选抢输，是他当面读完「会把终端上的报错原文发给训练营网关」
+/// 之后明确拒绝了，然后这个拒绝输给了一次网络往返。
+///
+/// 所以 daemon 那一格只允许 true→false。这条测试走真守护进程、真协议：
+/// 先捎一个 `false`（学生按了 `l`），再捎一个 `true`（他又按了一下，
+/// 或者只是界面上一轮还没来得及更新的旧值），然后才批准——`[llm]` 一个
+/// 字都不该被写出来。
+#[test]
+fn a_refusal_is_sticky_for_the_rest_of_the_pairing() {
+    let gw = common::fake_gateway_gated();
+    let home = tempfile::tempdir().unwrap();
+    let d = common::daemon_with(home.path(), &gw.origin());
+
+    match d.call(Request::PairStart {
+        profile: "dc".into(),
+        opt_in_llm: true,
+    }) {
+        Response::PairStarted(Ok(_)) => {}
+        other => panic!("配对没能起步：{other:?}"),
+    }
+
+    gw.wait_for_poll_inflight(Duration::from_secs(10));
+
+    // 学生读完那行文案，按 `l` 取消勾选。
+    match d.call(Request::PairPoll {
+        profile: "dc".into(),
+        opt_in_llm: false,
+    }) {
+        Response::PairTick(_) => {}
+        other => panic!("轮询该照常回一个 tick：{other:?}"),
+    }
+    // 随后又来了一条 `true`。这一条不许把上面那个「不」翻回去。
+    match d.call(Request::PairPoll {
+        profile: "dc".into(),
+        opt_in_llm: true,
+    }) {
+        Response::PairTick(_) => {}
+        other => panic!("轮询该照常回一个 tick：{other:?}"),
+    }
+
+    gw.approve();
+    let tick = common::wait_for_tick(&d, "dc", true, Duration::from_secs(10));
+    assert!(
+        matches!(tick, PairTick::Done { .. }),
+        "配对本身要照常成功：{tick:?}"
+    );
+
+    // 钥匙照写——学生拒绝的是「AI 解释」这一件事，不是整条配对。
+    let secrets = std::fs::read_to_string(home.path().join("secrets.toml")).unwrap();
+    assert!(secrets.contains("dc"), "{secrets}");
+
+    match std::fs::read_to_string(home.path().join("config.toml")) {
+        Err(_) => {}
+        Ok(cfg) => assert!(
+            !cfg.contains("[llm]"),
+            "学生拒绝过一次，后面的 true 不该把它翻回来：{cfg}"
+        ),
+    }
+}

@@ -45,6 +45,11 @@ struct PairSlot {
     /// 500ms 一次的 `PairPoll`——那条请求于是捎着当前值，落在这里，
     /// 后台线程在真正落盘的那一刻读它。共享一格而不是各存一份，是因为
     /// 「学生最后一次点头是什么」只能有一个答案。
+    ///
+    /// **只往一个方向变：true→false，一次配对之内不可逆。** 写它的
+    /// `PairPoll` 分支用的是 `fetch_and` 而不是 `store`，理由写在那里：
+    /// 界面和轮询线程两条时钟对不齐，而「学生当面拒绝了却因为抢输被当成
+    /// 同意」是这个 bool 唯一不能出的错。
     opt_in_llm: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
 }
@@ -963,10 +968,24 @@ fn handle(
             let slot = pairs.get(&profile);
             // 顺带把勾选框的当前值收下——界面每 500ms 发一次这条请求，
             // 学生按 `l` 改的主意就是这么传过来的（见
-            // `proto::Request::PairPoll` 的字段注释）。后台线程在批准
-            // 落地那一刻读同一格，所以「最后一次点头」永远是最新的那次。
+            // `proto::Request::PairPoll` 的字段注释）。
+            //
+            // **`fetch_and` 而不是 `store`：`false` 一旦落进来就再也翻不
+            // 回去。** 这两条时钟对不齐——界面每 500ms 捎一次当前值，轮询
+            // 线程每 250ms 醒一次、网关一回 `approved` 就立刻落盘，所以
+            // 落盘那一刻读到的值不保证是学生屏幕上的那个。两个方向都会
+            // 抢输，但只有一个方向是不能接受的：默认勾着的那个抢输，学生
+            // 停在他看见过、也没有反对过的值上；而**取消勾选抢输，是学生
+            // 当面读完代价、明确拒绝了，然后这个拒绝输给了一次网络往返，
+            // 之后 dct 照样把他终端上的报错原文发给第三方**。`config.rs`
+            // 开头那段隐私边界的全部依据是「有个人当面看着代价点了头」，
+            // 一个会输掉的「不」等于没有点头。所以这一格只允许 true→false。
+            //
+            // 代价是学生取消勾选之后再勾回来，这一次配对不认了。那是可以
+            // 接受的：他事后随时能从设置里打开（`llm_optin` 那条路还在），
+            // 而反过来那一半是不可逆的——报错原文已经发出去了。
             if let Some(slot) = slot {
-                slot.opt_in_llm.store(opt_in_llm, Ordering::SeqCst);
+                slot.opt_in_llm.fetch_and(opt_in_llm, Ordering::SeqCst);
             }
             Ok(Response::PairTick(
                 slot.map(|s| s.tick.clone()).unwrap_or(PairTick::Waiting),
