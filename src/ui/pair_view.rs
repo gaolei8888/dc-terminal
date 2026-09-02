@@ -228,8 +228,20 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // p：手动填一直在，见模块头注释——老用户、离线课堂、网关配对坏掉的
     // 那天都要它。四个阶段都认：哪怕请求还飞着（`Starting`），用户也该
     // 能随时改主意换成手填，不用先等一个不知道多久的网络往返。
+    //
+    // **`p` 跟 `Esc` 一样是真取消，不能只切视图。** 上面那段说的危险在这
+    // 条路上更具体：学生按 `p`、自己粘一把钥匙进 `secrets.toml`，几分钟后
+    // 顺手把还开着的那个浏览器页面点了确认——后台那条还在跑的轮询线程
+    // 于是领到钥匙，把两个 profile 和 `pair-models.toml` 全部覆盖掉，
+    // 发生在他离开那块屏幕之后，而屏幕上不会有任何东西说这件事。
+    // 学生自己填的那把钥匙就这么被换掉了，他无从知道。
     if key.code == KeyCode::Char('p') && is_plain_key(&key) {
         app.pair_start_rx = None;
+        let _ = app.client().and_then(|c| {
+            c.call(Request::PairCancel {
+                profile: profile.clone(),
+            })
+        });
         app.view = manual_entry_view(app, &profile);
         return Ok(());
     }
@@ -559,6 +571,41 @@ mod tests {
             }
         });
         (sock, dir, received)
+    }
+
+    /// **`p` 也要真的取消。** 形状照抄 `esc_sends_a_cancel_and_leaves_the_view`，
+    /// 理由更具体：不发 `PairCancel` 的话，学生按 `p` 自己粘了一把钥匙，
+    /// 几分钟后顺手确认了那个还开着的浏览器页面，后台那条没人停的轮询
+    /// 线程就会把他刚填的钥匙连同两个 profile 的模型名一起覆盖掉——
+    /// 发生在他早已离开这块屏幕之后，屏上一个字都不会说。
+    ///
+    /// 同那条测试：一个断连的 `App::test_app()` 证明不了这件事，必须对着
+    /// 一个真的（本机、只认这一条协议的）假守护进程断言请求真的落到了
+    /// 它的记录上。
+    #[test]
+    fn p_sends_a_cancel_too_before_switching_to_manual_entry() {
+        let (sock, _fake_dir, received) = fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.view = View::Pair {
+            profile: "dc".into(),
+            phase: phase_waiting(),
+        };
+
+        handle_key(&mut app, key(KeyCode::Char('p'))).unwrap();
+
+        assert!(
+            matches!(app.view, View::EnterSecret { .. }),
+            "p 应该进手动填"
+        );
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, Request::PairCancel { profile } if profile == "dc")),
+            "p 必须真的发出 PairCancel，不能把轮询线程留在后台替学生领钥匙"
+        );
     }
 
     /// 浏览器打不开是常态（SSH、WSL、没设默认浏览器），屏上必须有个能
