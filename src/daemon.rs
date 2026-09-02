@@ -1,6 +1,8 @@
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,12 +12,36 @@ use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
-    ErrorCode, InstallPrompt, PhoneState, PhoneStatus, ProfileEntry, Request, Response,
-    SecretPrompt, WebInfo,
+    ErrorCode, InstallPrompt, PairStartedInfo, PairTick, PhoneState, PhoneStatus, ProfileEntry,
+    Request, Response, SecretPrompt, WebInfo,
 };
 use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_OWNER_KEY, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
+
+/// 正在进行的配对，按 profile 名。**`device_code` 只活在这里。**
+/// `Option` 里那个 `cancel` 标志是为了 `PairCancel` 能真的把线程停掉：
+/// 停不掉的话，用户退出去了，后台还在替他领钥匙。
+type PairTable = BTreeMap<String, PairSlot>;
+
+// `started`/`opt_in_llm` 目前只被写入、不被这张表自己读回——真正要用它们
+// 的是被 `spawn_pair_poller` 直接 move 进后台线程闭包的那一份拷贝
+// （出于同样理由，`started` 会在轮询线程结束后跟着线程一起消失）。
+// 留在 `PairSlot` 上是因为这张表是配对状态唯一对外可查的地方：将来
+// 任何要在不碰后台线程的前提下问「这条配对当初是哪个 device_code/
+// 勾没勾 opt-in」的代码（诊断、Task 6 的网页）都该来读这里，而不是
+// 各自再想办法把这份状态传一遍。
+#[allow(dead_code)]
+struct PairSlot {
+    started: crate::pair::Started,
+    tick: PairTick,
+    /// Ruling 2：学生在配对屏上勾没勾「报错看不懂时让 AI 解释」，跟着这条
+    /// 配对一路带到后台线程结束的那一刻——落盘（`pair_apply::apply`）
+    /// 发生在那时候，界面早已经不在这条调用栈上了，不存的话这个勾选就是
+    /// 死代码。
+    opt_in_llm: bool,
+    cancel: Arc<AtomicBool>,
+}
 
 pub fn run(socket: &Path) -> Result<()> {
     let mgr = SessionManager::new();
@@ -169,6 +195,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 不是装了 dct 就有的默认行为。
     let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
 
+    // 正在进行的配对，按 profile 名。跟 `secrets`/`phone` 一样是长活在
+    // 这个进程里的共享状态，同样的理由：多个连接（桌面、后面 Task 6 的
+    // 网页）都可能问起同一条正在跑的配对。
+    let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -179,8 +210,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let br = bridge.clone();
         let et = event_tx.clone();
         let wb = web.clone();
+        let pr = pairs.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -484,6 +516,7 @@ fn serve(
     bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: std::sync::mpsc::Sender<Event>,
     web: Arc<Mutex<Option<crate::web::Server>>>,
+    pairs: Arc<Mutex<PairTable>>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -506,6 +539,7 @@ fn serve(
                 &bridge,
                 &event_tx,
                 Some(&web),
+                &pairs,
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -533,6 +567,7 @@ fn handle(
     // 挡在路由里的话，将来谁加一条新路由就可能顺手把它绕过去，而这里
     // 拿不到 `web` 是物理上做不到。
     web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
+    pairs: &Arc<Mutex<PairTable>>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -837,6 +872,7 @@ fn handle(
             phone,
             bridge,
             event_tx,
+            pairs,
         )),
         Request::WebDisable => Ok(web_disable(web)),
         Request::PhoneDisable => {
@@ -860,11 +896,60 @@ fn handle(
             *recover(phone.lock()) = status.clone();
             Ok(Response::Phone(status))
         }
-        // TODO(Task 3): 真正接上 `pair::Machine` 和后台轮询线程。这里先占位，
-        // 不然新增的三个 `Request` 变体会让这个 match 编不过——`daemon.rs`
-        // 不知道 pair 的落地细节，那是下一个任务的事。
-        Request::PairStart { .. } | Request::PairPoll { .. } | Request::PairCancel { .. } => {
-            Ok(Response::Error(ErrorCode::Internal("not_implemented".into())))
+        Request::PairStart { profile, opt_in_llm } => {
+            let origin = pair_origin(profiles_dir, &profile);
+            match origin {
+                None => Ok(Response::PairStarted(Err("no_api_base_url".into()))),
+                Some(origin) => {
+                    let agent = crate::pair_http::agent();
+                    match crate::pair_http::start(&origin, &agent) {
+                        Err(e) => Ok(Response::PairStarted(Err(e))),
+                        Ok(started) => {
+                            // 给界面的那一面**不带** `device_code`——
+                            // `PairStartedInfo` 的类型本身就装不下它，见它
+                            // 上面的注释和 `proto.rs` 那条钉住这件事的测试。
+                            let info = PairStartedInfo {
+                                user_code: started.user_code.clone(),
+                                verify_path: started.verify_path.clone(),
+                                expires_in: started.expires_in,
+                            };
+                            // Ruling 1: `pair_apply::apply` 要的是 dct 的家
+                            // 目录，不是 profiles 目录——落盘既可能写
+                            // `home/secrets.toml` 也可能写 `home/profiles/`，
+                            // 两者是同一个锚下的两个子路径。`profiles_dir`
+                            // 本身就是 `home/profiles`（见
+                            // `profile::profiles_dir_for_socket`），
+                            // 往上退一层就是那个锚。
+                            let home = profiles_dir
+                                .parent()
+                                .map(Path::to_path_buf)
+                                .unwrap_or_else(|| profiles_dir.to_path_buf());
+                            spawn_pair_poller(
+                                &profile,
+                                &origin,
+                                started,
+                                opt_in_llm,
+                                pairs.clone(),
+                                secrets.clone(),
+                                home,
+                            );
+                            Ok(Response::PairStarted(Ok(info)))
+                        }
+                    }
+                }
+            }
+        }
+        Request::PairPoll { profile } => Ok(Response::PairTick(
+            recover(pairs.lock())
+                .get(&profile)
+                .map(|s| s.tick.clone())
+                .unwrap_or(PairTick::Waiting),
+        )),
+        Request::PairCancel { profile } => {
+            if let Some(slot) = recover(pairs.lock()).remove(&profile) {
+                slot.cancel.store(true, Ordering::SeqCst);
+            }
+            Ok(Response::Ok)
         }
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
@@ -954,6 +1039,7 @@ fn web_enable(
     phone: &Arc<Mutex<PhoneStatus>>,
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: &std::sync::mpsc::Sender<Event>,
+    pairs: &Arc<Mutex<PairTable>>,
 ) -> Response {
     let Some(web) = web else { return web_refused() };
     let mut slot = recover(web.lock());
@@ -981,7 +1067,7 @@ fn web_enable(
 
     // **HTTP 那一路走的是同一个 `handle`**，只是 `web` 传 `None`。
     // 另写一份分派等于养出第二套真相，而手机看到的东西必须跟桌面一致。
-    let (m, s, sec, pd, ph, br, et) = (
+    let (m, s, sec, pd, ph, br, et, pr) = (
         mgr.clone(),
         store.clone(),
         secrets.clone(),
@@ -989,8 +1075,9 @@ fn web_enable(
         phone.clone(),
         bridge.clone(),
         event_tx.clone(),
+        pairs.clone(),
     );
-    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None);
+    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr);
     let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
     let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
     let port = server.addr().port();
@@ -1008,6 +1095,91 @@ fn web_disable(web: Option<&Arc<Mutex<Option<crate::web::Server>>>>) -> Response
         url: None,
         address_unknown: false,
     })
+}
+
+/// 配对用哪个 origin：从这个 profile 的 `[api].base_url` 里取，**只取 origin**。
+/// 这是整条流程的信任锚——它随仓库发布，不来自网络（spec 里那段
+/// 「origin 是信任锚，路径是配置」）。
+fn pair_origin(profiles_dir: &Path, profile: &str) -> Option<String> {
+    let (all, _) = all_profiles(profiles_dir);
+    let base = all
+        .iter()
+        .find(|p| p.name == profile)?
+        .api
+        .as_ref()?
+        .base_url
+        .clone();
+    let rest = base.split_once("://")?;
+    let host = rest.1.split('/').next()?;
+    Some(format!("{}://{}", rest.0, host))
+}
+
+/// 起一条配对的后台轮询线程，登记进 `pairs` 表。
+///
+/// `home` 是 dct 的家目录（`socket.parent()`）——Ruling 1：`pair_apply::apply`
+/// 既要往 `home/secrets.toml` 写钥匙，也可能要往 `home/profiles/` 写一份新
+/// profile，两者是同一个锚下的两个子路径，跟 `secrets_path_for_socket` 用的
+/// 是同一个锚，才能让测试按 socket 隔离。
+#[allow(clippy::too_many_arguments)]
+fn spawn_pair_poller(
+    profile: &str,
+    origin: &str,
+    started: crate::pair::Started,
+    opt_in_llm: bool,
+    pairs: Arc<Mutex<PairTable>>,
+    secrets: Arc<Mutex<SecretStore>>,
+    home: PathBuf,
+) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    recover(pairs.lock()).insert(
+        profile.to_string(),
+        PairSlot {
+            started: started.clone(),
+            tick: PairTick::Waiting,
+            opt_in_llm,
+            cancel: cancel.clone(),
+        },
+    );
+    let (profile, origin) = (profile.to_string(), origin.to_string());
+    std::thread::spawn(move || {
+        let agent = crate::pair_http::agent();
+        let mut machine = crate::pair::Machine::new(started, std::time::Instant::now());
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            // 短睡是为了让 `PairCancel` 响应得快——真正「到点才发」由
+            // `Machine::step` 自己判断，睡多短都不会多打一次网络。
+            std::thread::sleep(Duration::from_millis(250));
+            let send = |dc: &str| crate::pair_http::poll(&origin, dc, &agent);
+            let tick = machine.step(std::time::Instant::now(), &send);
+            let projected = match &tick {
+                crate::pair::Tick::Waiting => PairTick::Waiting,
+                crate::pair::Tick::Expired { retryable, message } => PairTick::Expired {
+                    retryable: *retryable,
+                    message: message.clone(),
+                },
+                crate::pair::Tick::Failed(e) => PairTick::Failed(e.clone()),
+                crate::pair::Tick::Done(a) => {
+                    // 落盘在这里做完，钥匙不过 socket。
+                    match crate::pair_apply::apply(a, &home, &secrets, opt_in_llm) {
+                        Ok(ready) => PairTick::Done {
+                            anthropic_ready: ready.anthropic,
+                            openai_ready: ready.openai,
+                        },
+                        Err(e) => PairTick::Failed(e),
+                    }
+                }
+            };
+            let done = !matches!(projected, PairTick::Waiting);
+            if let Some(slot) = recover(pairs.lock()).get_mut(&profile) {
+                slot.tick = projected;
+            }
+            if done {
+                return;
+            }
+        }
+    });
 }
 
 fn phone_set_token_failure_message(e: ChannelError) -> String {
@@ -1047,6 +1219,11 @@ mod tests {
     /// 同上——大多数测试不关心手机通知，`bridge` 槽给个空的就行。
     fn test_bridge() -> Arc<Mutex<Option<crate::bridge::BridgeHandle>>> {
         Arc::new(Mutex::new(None))
+    }
+
+    /// 同上——大多数测试不关心配对，给一张空表就行。
+    fn test_pairs() -> Arc<Mutex<PairTable>> {
+        Arc::new(Mutex::new(BTreeMap::new()))
     }
 
     /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
@@ -1331,6 +1508,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -1389,6 +1567,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -1456,6 +1635,7 @@ mod tests {
                 &test_bridge(),
                 &test_event_tx(),
                 None,
+                &test_pairs(),
             );
             (t.elapsed(), resp)
         });
@@ -1561,6 +1741,7 @@ mod tests {
                 &test_bridge(),
                 &test_event_tx(),
                 None,
+                &test_pairs(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -1594,6 +1775,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -1680,6 +1862,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1727,6 +1910,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1786,6 +1970,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -1839,6 +2024,7 @@ mod tests {
             &bridge,
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -1909,6 +2095,7 @@ mod tests {
             &bridge,
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -2251,6 +2438,7 @@ mod web_tests {
         phone: Arc<Mutex<PhoneStatus>>,
         bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
         tx: std::sync::mpsc::Sender<Event>,
+        pairs: Arc<Mutex<PairTable>>,
         /// 临时目录得跟着 fixture 活着，不然 secrets/projects 的路径当场失效。
         _dir: tempfile::TempDir,
     }
@@ -2269,6 +2457,7 @@ mod web_tests {
                 &self.phone,
                 &self.bridge,
                 &self.tx,
+                &self.pairs,
             )
         }
     }
@@ -2288,6 +2477,7 @@ mod web_tests {
             })),
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
+            pairs: Arc::new(Mutex::new(BTreeMap::new())),
             _dir: dir,
         }
     }

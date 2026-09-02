@@ -12,6 +12,8 @@ pub mod last_sessions;
 pub mod link;
 pub mod llm;
 pub mod pair;
+pub mod pair_apply;
+pub mod pair_http;
 pub mod profile;
 pub mod projects;
 pub mod proto;
