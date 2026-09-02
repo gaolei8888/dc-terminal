@@ -1176,10 +1176,12 @@ fn pair_poll_once(
 
 /// 起一条配对的后台轮询线程，登记进 `pairs` 表。
 ///
-/// `home` 是 dct 的家目录（`socket.parent()`）——Ruling 1：`pair_apply::apply`
-/// 既要往 `home/secrets.toml` 写钥匙，也可能要往 `home/profiles/` 写一份新
-/// profile，两者是同一个锚下的两个子路径，跟 `secrets_path_for_socket` 用的
-/// 是同一个锚，才能让测试按 socket 隔离。
+/// `home` 是 dct 的家目录（`socket.parent()`）——`pair_apply::apply` 既要往
+/// `home/secrets.toml` 写钥匙，也要往 `home/pair-models.toml` 写模型名，
+/// 两者是同一个锚下的两个子路径，跟 `secrets_path_for_socket` 用的是同一个
+/// 锚，才能让测试按 socket 隔离。（模型名不写进 `home/profiles/`：一份
+/// user-dir profile 会整份替换内置的那份，而 `Profile.command` 没有 serde
+/// 默认值，半份 profile 根本解析不出来——这条路已经在 Task 4 里被否掉了。）
 #[allow(clippy::too_many_arguments)]
 fn spawn_pair_poller(
     profile: &str,
