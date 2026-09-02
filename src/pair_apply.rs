@@ -1,5 +1,6 @@
-//! 配对成功之后落盘的那几件事：把 `pair::Approved` 写进 `secrets`/`profiles`，
-//! 并按学生在配对屏上的勾选决定要不要顺手把 `[llm]` 也接上。
+//! 配对成功之后落盘的那几件事：把 `pair::Approved` 写进 `secrets`/
+//! `pair-models.toml`，并按学生在配对屏上的勾选决定要不要顺手把 `[llm]`
+//! 也接上。
 //!
 //! **不假装它是原子的。** `secrets.rs` 那套「save 失败就回滚内存」是按
 //! 单键写的，两次 set 就是两次落盘。第二次失败**不回滚第一次**——回滚会把
@@ -7,10 +8,21 @@
 //! 回来了。领取是一次性的，这是这里唯一重要的约束。
 //!
 //! **写盘顺序按最坏情况排。** Task 3 的裁决留了一个口子：`apply` 跑到一半，
-//! 取消可能已经到了，这扇窗口没关上。所以顺序是钥匙 → profile 覆盖层 →
-//! `[llm]`：一把只有钥匙没有模型名的 profile 还能用（学生自己在配置里填
-//! 模型名），一个只有模型名没有钥匙的 `[llm]` 不能用——先写最坏情况下也
-//! 有用的那部分。
+//! 取消可能已经到了，这扇窗口没关上。所以顺序是钥匙 → 模型名 → `[llm]`：
+//! 一把只有钥匙没有模型名的账号还能用（学生自己在配置里填模型名），一个
+//! 只有模型名没有钥匙的 `[llm]` 不能用——先写最坏情况下也有用的那部分。
+//!
+//! **模型名不写进 `~/.dct/profiles/`。** 这看起来更自然，但两个理由都
+//! 站不住：`Profile::command` 没有 `#[serde(default)]`（`profile.rs`），
+//! 一份只有 `name`/`[env]` 的文件解析不过去，`load_dir` 会把它当成一个
+//! 「坏掉的自定义 profile」报警——报的还是 dct 自己写的文件。就算写成
+//! 完整的一份，`all_profiles` 按整条记录替换合并（`profile.rs` 的
+//! `*slot = p`），用户目录里的 `dc.toml` 不是给内置那份「加上」`[env]`，
+//! 是把它整个换掉，`command`/`[api]`/`[secret]` 全部消失，而且冻住了
+//! 今天这份内置 profile——以后 dct 升级修 `dc.toml` 也到不了已经配过对
+//! 的学生手上。所以模型名单独存一个小文件（`pair-models.toml`），
+//! `session.rs::create_inner` 在算子进程 env 的时候把它按 profile 名合
+//! 进去，profile 文件本身一个字节不动。
 
 use crate::pair::Approved;
 use std::collections::BTreeMap;
@@ -22,12 +34,12 @@ pub struct Ready {
     pub openai: bool,
 }
 
-/// 覆盖层文件的第一行。认这行才敢重写——没有它的文件是用户自己写的。
-const MARK: &str = "# 这个文件由 dct 配对自动生成，下次配对会重写。手改请删掉这一行。";
+/// 侧写文件的第一行。认这行才敢重写——没有它的文件是用户自己写的。
+const MARK: &str = "# 由 dct 配对写入：这个账号在网关上能用的模型名。下次配对会重写。手改请删掉这一行。";
 
 /// `home` 是 dct 的家目录（`socket.parent()`），不是 profiles 目录——这一步
-/// 既要往 `home/secrets.toml` 写钥匙，也可能要往 `home/profiles/` 写一份
-/// 新 profile，两者是同一个锚下的两个子路径。
+/// 既要往 `home/secrets.toml` 写钥匙，也要往 `home/pair-models.toml` 写
+/// 模型名，两者是同一个锚下的两个子路径。
 pub fn apply(
     a: &Approved,
     home: &Path,
@@ -58,9 +70,11 @@ fn apply_inner(
             .map_err(|e| format!("qwen_secret_write_failed: {e}"))?;
     }
 
-    // 第二步：profile 覆盖层——模型名，不是钥匙。免费账号的 anthropic 那组
-    // 是空的，这里绝不编一个模型名进去：一个解析不出模型的 `ANTHROPIC_MODEL`
-    // 比没有这行更坏，学生会撞上一个没有任何解释的 404。
+    // 第二步：模型名，不是钥匙。免费账号的 anthropic 那组是空的，这里绝不
+    // 编一个模型名进去：一个解析不出模型的 `ANTHROPIC_MODEL` 比没有这行
+    // 更坏，学生会撞上一个没有任何解释的 404。空的那一组不落一个 section，
+    // 而不是落一个空 section——`[dc]` 段存在与否，直接就是「这个账号有没有
+    // Anthropic 那一路」这件事本身，不用去看里面有没有键。
     let mut dc_env = BTreeMap::new();
     if let Some(m) = &a.models.anthropic.default {
         dc_env.insert("ANTHROPIC_MODEL".to_string(), m.clone());
@@ -75,9 +89,14 @@ fn apply_inner(
     if let Some(m) = &a.models.openai.small_fast {
         qwen_env.insert("OPENAI_SMALL_FAST_MODEL".to_string(), m.clone());
     }
-
-    write_override(home, "dc", &dc_env)?;
-    write_override(home, "qwen", &qwen_env)?;
+    let mut sections = BTreeMap::new();
+    if !dc_env.is_empty() {
+        sections.insert("dc".to_string(), dc_env);
+    }
+    if !qwen_env.is_empty() {
+        sections.insert("qwen".to_string(), qwen_env);
+    }
+    write_pair_models(home, &sections)?;
 
     // 第三步：`[llm]` 自举，只有学生在配对屏上勾了才做。写在最后——它是
     // 三件事里唯一「没有前面两步就没意义」的一件：`[llm]` 指着一个模型名，
@@ -105,31 +124,53 @@ fn apply_inner(
     })
 }
 
-/// 覆盖层只写 `[env]`。仓库里那两份 profile 一行都不动——它们是要能提交的
-/// 文件，运行时的东西不该长在里面。
-pub fn render_override(name: &str, env: &BTreeMap<String, String>) -> String {
-    let mut out = format!("{MARK}\nname = \"{name}\"\n\n[env]\n");
-    for (k, v) in env {
-        out.push_str(&format!("{k} = \"{v}\"\n"));
+/// 渲染 `pair-models.toml`：每个有模型名的 profile 一个 section。空 map
+/// 的调用方（`write_pair_models` 在真没有任何东西可写时）不会走到这里。
+fn render_pair_models(sections: &BTreeMap<String, BTreeMap<String, String>>) -> String {
+    let mut out = format!("{MARK}\n");
+    for (name, env) in sections {
+        out.push_str(&format!("\n[{name}]\n"));
+        for (k, v) in env {
+            out.push_str(&format!("{k} = \"{v}\"\n"));
+        }
     }
     out
 }
 
-fn write_override(home: &Path, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
-    // 即使这个方言口一个模型名都没有（免费账号的 anthropic 那组），文件也
-    // 要落地——只是 `[env]` 是空的。这样调用方（还有测试）总能在
-    // `profiles/{name}.toml` 里读到「没有编出来的模型名」这件事本身，而不是
-    // 靠「文件压根不存在」去猜。
-    let profiles = home.join("profiles");
-    std::fs::create_dir_all(&profiles).map_err(|e| format!("{e}"))?;
-    let f = profiles.join(format!("{name}.toml"));
+fn write_pair_models(
+    home: &Path,
+    sections: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), String> {
+    let f = home.join("pair-models.toml");
     if let Ok(existing) = std::fs::read_to_string(&f) {
         // 用户手改过的文件不许动。他写在里面的东西比我们知道的多。
         if !existing.starts_with(MARK) {
             return Ok(());
         }
     }
-    std::fs::write(&f, render_override(name, env)).map_err(|e| format!("{e}"))
+    std::fs::create_dir_all(home).map_err(|e| format!("{e}"))?;
+    std::fs::write(&f, render_pair_models(sections)).map_err(|e| format!("{e}"))
+}
+
+/// 配对给某个 profile 存下的模型名，供 `session.rs::create_inner` 在起
+/// 子进程前合进 env。**缺文件、文件损坏、这个 profile 没配过对**——
+/// 三种情况一律退化成空 map，绝不能因为一个坏掉的侧写文件让会话起不来：
+/// 有没有模型名从来不是能不能开会话的前提，密钥缺失在 `create_inner`
+/// 里都不拦（见那边的注释），这里比密钥还次要。
+pub fn env_for(home: &Path, profile: &str) -> BTreeMap<String, String> {
+    let Ok(raw) = std::fs::read_to_string(home.join("pair-models.toml")) else {
+        return BTreeMap::new();
+    };
+    let Ok(doc) = raw.parse::<toml::Table>() else {
+        return BTreeMap::new();
+    };
+    let Some(section) = doc.get(profile).and_then(|v| v.as_table()) else {
+        return BTreeMap::new();
+    };
+    section
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
 }
 
 #[cfg(test)]
@@ -153,8 +194,8 @@ mod tests {
         assert_eq!(s.get("qwen"), Some("sk-live"));
     }
 
-    /// 两个 Anthropic 变量都要写。只钉主模型的话，起标题、扫文件那个便宜的
-    /// 快模型会以课堂上没人查得出来的方式坏掉（`profiles/dc.toml` 里那段注释）。
+    /// 两个 Anthropic 变量都要写进 `[dc]` 段。只钉主模型的话，起标题、扫
+    /// 文件那个便宜的快模型会以课堂上没人查得出来的方式坏掉。
     #[test]
     fn both_anthropic_model_variables_get_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -162,15 +203,19 @@ mod tests {
             &dir.path().join("secrets.toml"),
         ));
         apply(&approved_with_both_wires(), dir.path(), &store, false).unwrap();
-        let dc = std::fs::read_to_string(dir.path().join("profiles/dc.toml")).unwrap();
-        assert!(dc.contains("ANTHROPIC_MODEL = \"claude-x\""), "{dc}");
-        assert!(dc.contains("ANTHROPIC_SMALL_FAST_MODEL = \"claude-small\""), "{dc}");
+        let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
+        assert!(raw.contains("ANTHROPIC_MODEL = \"claude-x\""), "{raw}");
+        assert!(
+            raw.contains("ANTHROPIC_SMALL_FAST_MODEL = \"claude-small\""),
+            "{raw}"
+        );
     }
 
     /// 免费账号：anthropic 那一组是空的。钥匙照写，**模型名一个都不许编**——
     /// 写一个跑不通的模型名比不写更坏，学生会撞上一个没有任何解释的 404。
+    /// 文件里只该有 `[qwen]`，`[dc]`/`ANTHROPIC_MODEL` 一处都不该出现。
     #[test]
-    fn a_free_account_gets_the_key_but_no_invented_model_name() {
+    fn a_free_account_gets_only_the_qwen_section_and_no_invented_model_name() {
         let dir = tempfile::tempdir().unwrap();
         let store = Mutex::new(crate::secrets::SecretStore::load(
             &dir.path().join("secrets.toml"),
@@ -179,24 +224,44 @@ mod tests {
         assert!(!ready.anthropic, "免费账号没有 Anthropic 那一路");
         assert!(ready.openai);
         assert_eq!(store.lock().unwrap().get("dc"), Some("sk-live"));
-        let dc = std::fs::read_to_string(dir.path().join("profiles/dc.toml")).unwrap();
-        assert!(!dc.contains("ANTHROPIC_MODEL"), "没有就不许写：{dc}");
+        let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
+        assert!(!raw.contains("ANTHROPIC_MODEL"), "没有就不许写：{raw}");
+        assert!(!raw.contains("[dc]"), "没有模型名就不该有这个 section：{raw}");
+        assert!(raw.contains("[qwen]"), "{raw}");
     }
 
-    /// 覆盖层文件要带一行标记：下次配对认它才敢重写。用户手改过的文件
+    /// 侧写文件要带一行标记：下次配对认它才敢重写。用户手改过的文件
     /// （没有这行）绝不覆盖。
     #[test]
-    fn a_hand_edited_override_is_never_clobbered() {
+    fn a_hand_edited_pair_models_file_is_never_clobbered() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
-        let f = dir.path().join("profiles/dc.toml");
-        std::fs::write(&f, "# 我自己写的\n[env]\nANTHROPIC_MODEL = \"mine\"\n").unwrap();
+        let f = dir.path().join("pair-models.toml");
+        std::fs::write(&f, "# 我自己写的\n[dc]\nANTHROPIC_MODEL = \"mine\"\n").unwrap();
         let store = Mutex::new(crate::secrets::SecretStore::load(
             &dir.path().join("secrets.toml"),
         ));
         apply(&approved_with_both_wires(), dir.path(), &store, false).unwrap();
         let after = std::fs::read_to_string(&f).unwrap();
         assert!(after.contains("mine"), "用户手写的东西不许动：{after}");
+    }
+
+    /// `env_for`：`[dc]` 段里的键给 `"dc"`，不泄漏给 `"qwen"`；文件不存在
+    /// 退化成空 map，不是错误——见函数上面那段注释，坏文件不该拦会话起来。
+    #[test]
+    fn env_for_reads_its_own_section_and_degrades_to_empty_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pair-models.toml"),
+            format!("{MARK}\n\n[dc]\nANTHROPIC_MODEL = \"claude-x\"\n"),
+        )
+        .unwrap();
+        let dc = env_for(dir.path(), "dc");
+        assert_eq!(dc.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-x"));
+        assert!(env_for(dir.path(), "qwen").is_empty());
+        assert!(env_for(dir.path(), "does-not-exist").is_empty());
+
+        let missing = tempfile::tempdir().unwrap();
+        assert!(env_for(missing.path(), "dc").is_empty());
     }
 
     /// `opt_in_llm` 为真、免费账号：没有 Anthropic 模型名，落到 openai 那组，

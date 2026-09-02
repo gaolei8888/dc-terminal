@@ -86,6 +86,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         socket,
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
+    // `pair-models.toml` 锚在跟 `profiles_dir` 同一层的家目录下——见
+    // `pair_apply.rs` 文件头和 `spawn_pair_poller` 上面 Ruling 1 那段：
+    // `profiles_dir` 本身就是 `home/profiles`，往上退一层就是那个锚。
+    if let Some(home) = profiles_dir.parent() {
+        mgr.set_pair_models_home(home.to_path_buf());
+    }
 
     // 上次守护进程还活着时留下的会话清单——**先读出来，再装路径**。
     // 装路径本身不写盘（`set_last_sessions_path` 只记一个 `PathBuf`），
