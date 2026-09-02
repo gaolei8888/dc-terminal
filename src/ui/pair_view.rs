@@ -1,11 +1,23 @@
 //! 配对三屏：Starting → Waiting → Done，或者在任何一步落进 Failed。
 //!
-//! 入口不在这个文件里——它在 `secret.rs`：`EnterSecret` 屏幕上，profile
+//! 入口不在这个文件里，一共三条，都指向 `start_pairing`——profile 必须
 //! 可配对（`Profile::pairable`，目前是 `"dc"`/`"qwen"` 两个内置 profile，
 //! 见 `profile.rs::builtin_names` 和 `pair_apply.rs` 头上「往 dc/qwen 两把
-//! 钥匙写」那段）时的 Ctrl+A。不占用一个字母键——`o` 早就留给了密钥输入
-//! 本身（见 `secret.rs` 那条「Ctrl+O 不用 o」的注释），这里是同一条键位
-//! 规矩的另一个例子。
+//! 钥匙写」那段）：
+//!
+//! - `pick.rs`：选择器里选中一个还没钥匙的可配对 profile（spec 的入口
+//!   一节：学生根本不该主动去找「配对」这个词）。这条路带
+//!   `PairReturn::StartSession`——他要的是开工，配对只是路上的一道门。
+//! - `secret.rs`：密钥页上一行**还没配钥匙**的可配对 profile 按回车。
+//!   已经有钥匙的那一行不走这条——换钥匙的人手里拿着新的那一串，
+//!   不该被劫进一整圈浏览器授权。
+//! - `secret.rs`：`EnterSecret` 屏幕上的 Ctrl+A。不占用一个字母键——`o`
+//!   早就留给了密钥输入本身（见那条「Ctrl+O 不用 o」的注释）。
+//!
+//! 这一屏自己的键是 `l`（`[llm]` 那个勾选框）、`o`（重开浏览器）、
+//! `p`（改成手动填）、`r`（换一串码）、Esc（取消）、以及成功屏上的
+//! Enter（只在 `PairReturn::StartSession` 那条路上）。`p` 和 `Esc` 都发
+//! `Request::PairCancel`：不发的话后台还在替一个已经走开的人领钥匙。
 //!
 //! **URL 在本地拼，绝不接受线上答复里的 origin。** `daemon::pair_origin`
 //! 只读这个 profile 自己的 `[api].base_url`，取它的 origin；界面这一侧

@@ -307,7 +307,12 @@ yet, hit enter, and it goes straight into pairing — a confirmation page opens 
 your browser, you click approve once, and the key plus model names get written
 back automatically, no account page to open or paste into. Manual entry is still
 there if you want it: press `p` from any step of the pairing screen to switch to
-it. Pairing is why DC sits first in the list — for a student on their first day
+it. The pairing screen also carries one ticked box — "let AI explain errors you
+can't read" — and it states its cost rather than its benefit, because turning it
+on means the raw error text from your terminal gets sent to the camp gateway.
+Press `l` to untick it before you approve in the browser; if your
+`~/.dct/config.toml` already has an `[llm]` section, pairing says so and leaves
+your own setting alone. Pairing is why DC sits first in the list — for a student on their first day
 it's the one line in that table that needs no account, no card and no VPN.
 Everyone else can ignore it, or point it somewhere else: it's an ordinary
 profile, and a `dc.toml` of your own in `~/.dct/profiles/` replaces it.
