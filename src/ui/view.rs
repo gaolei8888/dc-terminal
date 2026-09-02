@@ -223,7 +223,30 @@ pub(crate) enum View {
         /// 默认勾上、文案说清代价——`config.rs` 开头那段隐私边界的全部
         /// 依据就是「有个人当面看着代价点了头」，看不见的勾等于没有。
         opt_in: LlmOptIn,
+        /// 配对成功之后该把学生送到哪儿去。
+        ///
+        /// **配对不是目的地。** 从选择器里选中 `DC` 起会话的那条路，
+        /// 在配对存在之前的终点是 `EnterSecret`：存下钥匙**并且**把学生
+        /// 要的那个会话开起来。配对接管了这条路却只做了前半——学生对着
+        /// 一屏「配对成功」，然后被丢回看板，得自己再走一遍选择器。
+        /// 对第一天上课的人来说，那正是他判定「这东西没弄好」的地方。
+        return_to: PairReturn,
     },
+}
+
+/// 配对成功之后回哪儿。哪条路把学生领进配对屏，就由哪条路决定终点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairReturn {
+    /// 从密钥页/设置页进来的：意图是「把钥匙配上」，配完就完了。
+    Home,
+    /// 从选择器进来的：意图是「用这个 agent 开工」，钥匙只是路上的一道
+    /// 门。成功屏上按 Enter 直接把那个会话开起来。
+    ///
+    /// **为什么是按一下 Enter，不是自动跳。** 成功屏上有学生只有这一次
+    /// 机会看见的话——免费账号只有 Qwen、Claude 要付费升级（见
+    /// `PairPhase::Done`）。自动跳会让那句话一闪而过，而它正是学生下一次
+    /// 撞上「Claude 用不了」时唯一的解释来源。底栏上写着这个 Enter。
+    StartSession,
 }
 
 /// 配对屏上那个「报错看不懂时让 AI 解释」的勾选框。
@@ -1237,9 +1260,11 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 从设置页进来，退出回设置页——同 `EnterSecret` 的 `return_to_settings`
         // 分支一个道理，这一页没有别的来路。
         View::Phone { .. } => text(Key::BackToSettings, lang).to_string(),
-        // 配对屏的 Esc 是真取消（发 `PairCancel`），落点是回家——它没有
-        // `EnterSecret` 那种 `return_to_settings` 记忆（`View::Pair` 只带
-        // `profile`/`phase` 两个字段，见它的文档注释），退出去了就是回家。
+        // 配对屏的 Esc 是真取消（发 `PairCancel`），落点是回家。
+        // `View::Pair` 确实带着一个 `return_to`，但那记的是**配对成功**
+        // 之后该去哪儿（回家，还是把学生要的那个会话开起来）；取消的
+        // 语义是「这件事我不做了」，没有一个「接着做」的下一步可去，
+        // 所以它跟别的取消一样回看板。
         View::Pair { .. } => text(Key::BackToBoard, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
@@ -1649,7 +1674,12 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 道理——`r` 只在 `retryable` 的失败上写，`o` 只在等码的那一屏写
         // （那是唯一存着 URL 的阶段），`p`（手动填）在**每一个**阶段都写：
         // 见 `pair_view.rs` 的 `manual_entry_stays_reachable_from_every_phase`。
-        View::Pair { phase, opt_in, .. } => {
+        View::Pair {
+            phase,
+            opt_in,
+            return_to,
+            ..
+        } => {
             let mut items: Vec<(&'static str, Key)> = Vec::new();
             match phase {
                 PairPhase::Starting => items.push(("", Key::Verifying)),
@@ -1663,6 +1693,15 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
                     retryable: false, ..
                 }
                 | PairPhase::Done { .. } => {}
+            }
+            // 成功屏上的 Enter 只有从选择器进来的那条路才有——那条路的
+            // 终点是「把学生要的那个会话开起来」（见 `PairReturn`）。
+            // 从密钥页进来的人没有这个下一步，底栏就不该写一个按下去
+            // 什么都不发生的键。
+            if matches!(phase, PairPhase::Done { .. })
+                && matches!(return_to, PairReturn::StartSession)
+            {
+                items.push(("Enter", Key::PairStartSession));
             }
             // `l` 只在还改得动的时候写：批准落地之后（`Done`）那个勾选
             // 已经被 daemon 用掉了，一个按下去不会有任何效果的键写在底栏

@@ -11,7 +11,8 @@ use crate::proto::{Request, Response, SecretPrompt};
 
 use super::app::App;
 use super::view::{
-    digit_index, expand_path, pick_action, PickAction, PickRow, ProjectPicker, SecretPhase, View,
+    digit_index, expand_path, pick_action, PairReturn, PickAction, PickRow, ProjectPicker,
+    SecretPhase, View,
 };
 use super::widgets::{pad_to, short_path, truncate, Msg};
 use super::{accent, danger, dim, move_sel_n};
@@ -241,7 +242,12 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 // 判据长在 profile 上，不然 `qwen` 会漏掉这条路。
                 if e.pairable {
                     let name = e.name.clone();
-                    super::pair_view::start_pairing(app, name);
+                    // 从选择器进来的意图是「用这个 agent 开工」——配对
+                    // 成功屏上的 Enter 要把这个会话真的开起来，不能把
+                    // 学生丢回看板让他再走一遍这个选择器（老路上
+                    // `EnterSecret` 存完钥匙就直接建会话，那个终点不能
+                    // 因为换成配对就丢了）。
+                    super::pair_view::start_pairing(app, name, PairReturn::StartSession);
                     return Ok(());
                 }
                 View::EnterSecret {
@@ -1891,6 +1897,17 @@ mod tests {
                 View::Pair { .. } => "Pair",
                 _ => "别的视图",
             }
+        );
+        // 而且配对屏要记着**为什么**来的：老路（`EnterSecret`）存完钥匙
+        // 会顺手把这个会话建起来，配对接管了这条路，那个终点不能丢，
+        // 不然学生成功之后被丢回看板、还得自己再走一遍这个选择器。
+        let View::Pair { return_to, .. } = app.view else {
+            unreachable!("上面刚断言过是 Pair");
+        };
+        assert_eq!(
+            return_to,
+            PairReturn::StartSession,
+            "从选择器起步的配对，终点是那个会话"
         );
     }
 

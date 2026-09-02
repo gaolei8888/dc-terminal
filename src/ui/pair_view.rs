@@ -29,7 +29,7 @@ use crate::i18n::{msg, text, Key, Lang};
 use crate::proto::{socket_path, PairStartedInfo, PairTick, Request, Response, SecretPrompt};
 
 use super::app::App;
-use super::view::{is_plain_key, LlmOptIn, PairPhase, SecretPhase, View};
+use super::view::{is_plain_key, LlmOptIn, PairPhase, PairReturn, SecretPhase, View};
 use super::widgets::Msg;
 use super::{accent, danger, dim, open_url};
 
@@ -90,7 +90,7 @@ pub(crate) fn pair_poll_request(profile: String, opt_in: LlmOptIn) -> Request {
 /// 起一条配对：真网络（daemon 转发到网关的 `/pair/start`），**必须丢给
 /// 后台线程**——同 `secret.rs`/`phone.rs` 里「Enter 提交」的道理，不能堵
 /// 在按键循环里，等待的这几秒会话视图也要继续刷新。
-pub(crate) fn start_pairing(app: &mut App, profile: String) {
+pub(crate) fn start_pairing(app: &mut App, profile: String, return_to: PairReturn) {
     let opt_in = initial_opt_in(app);
     let (tx, rx) = std::sync::mpsc::channel();
     let sock = socket_path();
@@ -114,6 +114,7 @@ pub(crate) fn start_pairing(app: &mut App, profile: String) {
         profile: view_profile,
         phase: PairPhase::Starting,
         opt_in,
+        return_to,
     };
 }
 
@@ -123,6 +124,7 @@ pub(crate) fn apply_started(
     app: &mut App,
     profile: String,
     opt_in: LlmOptIn,
+    return_to: PairReturn,
     outcome: Result<PairStartedInfo, String>,
 ) -> View {
     match outcome {
@@ -144,6 +146,7 @@ pub(crate) fn apply_started(
                         retryable: false,
                     },
                     opt_in,
+                    return_to,
                 };
             };
             let url = format!("{origin}{}?code={}", info.verify_path, info.user_code);
@@ -162,6 +165,7 @@ pub(crate) fn apply_started(
                         + std::time::Duration::from_secs(info.expires_in),
                 },
                 opt_in,
+                return_to,
             }
         }
         Err(reason) => View::Pair {
@@ -171,6 +175,7 @@ pub(crate) fn apply_started(
                 retryable: true,
             },
             opt_in,
+            return_to,
         },
     }
 }
@@ -182,6 +187,7 @@ pub(crate) fn apply_tick(
     lang: Lang,
     profile: String,
     opt_in: LlmOptIn,
+    return_to: PairReturn,
     current: PairPhase,
     tick: PairTick,
 ) -> View {
@@ -190,6 +196,7 @@ pub(crate) fn apply_tick(
             profile,
             phase: current,
             opt_in,
+            return_to,
         },
         PairTick::Done {
             anthropic_ready,
@@ -201,6 +208,7 @@ pub(crate) fn apply_tick(
                 openai: openai_ready,
             },
             opt_in,
+            return_to,
         },
         // 两种过期不能共享一句话——见 `PairPhase::Failed` 的文档注释和
         // 下面 `the_two_expiries_do_not_share_one_sentence`。`retryable`
@@ -219,6 +227,7 @@ pub(crate) fn apply_tick(
                 retryable,
             },
             opt_in,
+            return_to,
         },
         PairTick::Failed(reason) => View::Pair {
             profile,
@@ -227,6 +236,7 @@ pub(crate) fn apply_tick(
                 retryable: true,
             },
             opt_in,
+            return_to,
         },
     }
 }
@@ -252,6 +262,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         profile,
         phase,
         opt_in,
+        return_to,
     } = app.view.clone()
     else {
         return Ok(());
@@ -292,7 +303,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 profile: profile.clone(),
             })
         });
-        app.view = manual_entry_view(app, &profile);
+        app.view = manual_entry_view(app, &profile, return_to);
         return Ok(());
     }
     // `l`：那个勾选框。**只在批准落地之前认**——`Done` 那一刻 daemon 已经
@@ -310,7 +321,38 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             profile,
             phase,
             opt_in: opt_in.toggled(),
+            return_to,
         };
+        return Ok(());
+    }
+    // 成功屏上的 Enter：把学生当初要的那个会话开起来。
+    //
+    // **配对不是目的地。** 从选择器选 `DC` 起会话那条路，在配对存在之前
+    // 的终点是 `EnterSecret`——存下钥匙并且**建会话**（见 `ui/mod.rs` 里
+    // `verify_rx` 那段的 `return_to_settings` 分支）。配对接管了这条路，
+    // 终点不能跟着丢：一个第一天上课的学生被丢回看板、还得自己再走一遍
+    // 选择器，他会判定这东西没弄好。
+    //
+    // 走 `create_session` 而不是自己发 `Request::Create`：底栏那句
+    // 「n 新建 <agent>」的缓存由它统一跟上（见它的文档，以及
+    // `every_create_goes_through_the_one_helper_that_updates_the_cache`）。
+    if key.code == KeyCode::Enter
+        && matches!(phase, PairPhase::Done { .. })
+        && matches!(return_to, PairReturn::StartSession)
+    {
+        let dir = app.current_dir().display().to_string();
+        match super::create_session(app, &dir, &profile, true) {
+            Ok(Response::Created { id }) => {
+                app.need_sessions = true; // 会话标题要显示项目名
+                app.view = View::Attached(id);
+            }
+            // 建不起来就留在这一屏说一句：钥匙已经配好了，学生按 Esc
+            // 回看板再起一次会话就行，不该被丢进一个没有出路的错误屏。
+            Ok(Response::Error(ref e)) => {
+                app.message = Msg::err(crate::i18n::msg::error(app.lang, e))
+            }
+            _ => app.message = Msg::err(text(Key::SessionOpenFailed, app.lang).to_string()),
+        }
         return Ok(());
     }
     match phase {
@@ -322,7 +364,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         PairPhase::Failed { retryable, .. } => {
             if retryable && key.code == KeyCode::Char('r') && is_plain_key(&key) {
-                start_pairing(app, profile);
+                // 重来一次要沿用同一个终点：学生当初是为了开工才走进
+                // 配对的，换一串码不改变这件事。
+                start_pairing(app, profile, return_to);
             }
         }
     }
@@ -333,7 +377,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 /// 拿到真提示**（申领页链接、人话提示），但拿不到也不能把这条退路堵死——
 /// 见模块头「手动填一直在」那句：daemon 连不上、这个 profile 没声明密钥
 /// 提示，都不该让 `p` 变成一个按下去没反应的键。
-fn manual_entry_view(app: &mut App, profile: &str) -> View {
+fn manual_entry_view(app: &mut App, profile: &str, return_to: PairReturn) -> View {
     let lang = app.lang;
     let found = app
         .client()
@@ -372,9 +416,10 @@ fn manual_entry_view(app: &mut App, profile: &str) -> View {
         prompt,
         buf: String::new(),
         phase: SecretPhase::Typing,
-        // 从配对屏改道过来的意图是「先把密钥填上」，不是「回设置页」——
-        // 跟从选择器进来的 `AskSecret` 走的是同一条约定（见 `pick.rs`）。
-        return_to_settings: false,
+        // 配对屏的终点原样带过去：从选择器进来的（`StartSession`）填完
+        // 密钥就该直接开工，从密钥页进来的（`Home`）填完回密钥页。`p` 换
+        // 的只是「钥匙怎么来」，不是「学生本来想干什么」。
+        return_to_settings: matches!(return_to, PairReturn::Home),
         pairable,
     }
 }
@@ -535,6 +580,7 @@ mod tests {
             profile: "dc".into(),
             phase,
             opt_in,
+            return_to: PairReturn::Home,
         };
         (app, dir)
     }
@@ -580,6 +626,7 @@ mod tests {
             &mut app,
             "no-such-profile".into(),
             LlmOptIn::Choice(true),
+            PairReturn::Home,
             outcome,
         );
         match view {
@@ -614,6 +661,7 @@ mod tests {
             profile: "dc".into(),
             phase: phase_waiting(),
             opt_in: LlmOptIn::Choice(true),
+            return_to: PairReturn::Home,
         };
 
         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
@@ -667,8 +715,15 @@ mod tests {
                     let Ok(req) = serde_json::from_str::<Request>(&line) else {
                         break;
                     };
+                    // `Request::Create` 要回一个真的 `Created`：成功屏上
+                    // 那个 Enter 会去建会话，回 `Ok` 的话它看起来像是
+                    // 建失败了，测不到「学生真的被送进了会话」这件事。
+                    let answer = match &req {
+                        Request::Create { .. } => Response::Created { id: 7 },
+                        _ => Response::Ok,
+                    };
                     recv2.lock().unwrap().push(req);
-                    let resp = serde_json::to_string(&Response::Ok).unwrap();
+                    let resp = serde_json::to_string(&answer).unwrap();
                     if writeln!(writer, "{resp}").is_err() {
                         break;
                     }
@@ -696,6 +751,7 @@ mod tests {
             profile: "dc".into(),
             phase: phase_waiting(),
             opt_in: LlmOptIn::Choice(true),
+            return_to: PairReturn::Home,
         };
 
         handle_key(&mut app, key(KeyCode::Char('p'))).unwrap();
@@ -849,6 +905,73 @@ mod tests {
         drop(dir);
     }
 
+    /// **从选择器起步的配对，终点是那个会话，不是看板。**
+    ///
+    /// 配对存在之前，选择器里选中一个缺钥匙的 agent 走的是 `EnterSecret`，
+    /// 而那条路存完钥匙**并且**把会话建起来（`ui/mod.rs` 的 `verify_rx`
+    /// 分支）。配对接管了这条路，终点不能跟着丢：一个第一天上课的学生
+    /// 对着「配对成功」，然后被丢回看板、还得自己再走一遍选择器，
+    /// 他会判定这东西没弄好。
+    #[test]
+    fn a_pairing_started_from_the_picker_ends_in_the_session_it_was_started_for() {
+        let (sock, _fake_dir, received) = fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.view = View::Pair {
+            profile: "dc".into(),
+            phase: PairPhase::Done {
+                anthropic: false,
+                openai: true,
+            },
+            opt_in: LlmOptIn::Choice(true),
+            return_to: PairReturn::StartSession,
+        };
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(app.view, View::Attached(7)),
+            "配对成功之后按 Enter 该直接进会话"
+        );
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, Request::Create { profile, .. } if profile == "dc")),
+            "开的必须是他当初选的那个 agent"
+        );
+    }
+
+    /// 从密钥页进来的那条路没有这个下一步：意图是「把钥匙配上」，
+    /// 不该替他起一个他没要的会话。
+    #[test]
+    fn a_pairing_started_from_the_key_page_does_not_open_a_session() {
+        let (sock, _fake_dir, received) = fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.view = View::Pair {
+            profile: "dc".into(),
+            phase: PairPhase::Done {
+                anthropic: false,
+                openai: true,
+            },
+            opt_in: LlmOptIn::Choice(true),
+            return_to: PairReturn::Home,
+        };
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            !received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, Request::Create { .. })),
+            "他要的是配一把钥匙，不是开一个会话"
+        );
+    }
+
     /// 浏览器打不开是常态（SSH、WSL、没设默认浏览器），屏上必须有个能
     /// 手抄的地址，否则学生就卡死在这一屏。
     #[test]
@@ -921,6 +1044,7 @@ mod tests {
             Lang::Zh,
             "dc".into(),
             LlmOptIn::Choice(true),
+            PairReturn::Home,
             PairPhase::Starting,
             PairTick::Expired {
                 retryable: true,
@@ -944,6 +1068,7 @@ mod tests {
             Lang::Zh,
             "dc".into(),
             LlmOptIn::Choice(true),
+            PairReturn::Home,
             PairPhase::Starting,
             PairTick::Expired {
                 retryable: false,

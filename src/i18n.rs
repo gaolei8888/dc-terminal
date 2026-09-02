@@ -502,6 +502,10 @@ pub enum Key {
     PairLlmAlreadySet,
     /// 底栏：`l` 切换上面那个勾选框。
     PairLlmToggle,
+    /// 成功屏上那一行、也是底栏那一条：按 Enter 把学生当初要的那个会话
+    /// 开起来。只在从选择器进来的那条路上出现（`PairReturn::StartSession`）
+    /// ——从密钥页进来的人要的是「把钥匙配上」，不是开工。
+    PairStartSession,
     /// 底栏：重开浏览器（Waiting 阶段的 `o`）。
     ReopenBrowser,
     /// 底栏：重试（`Failed { retryable: true }` 阶段的 `r`）。
@@ -1095,6 +1099,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "AI explanations on/off",
             zh: "AI 解释开关",
+        ),
+        PairStartSession => t!(
+            lang,
+            en: "start the session",
+            zh: "开始使用",
         ),
         ReopenBrowser => t!(lang, en: "reopen browser", zh: "重开浏览器"),
         Retry => t!(lang, en: "retry", zh: "重试"),
@@ -2368,6 +2377,7 @@ mod tests {
             PairLlmToggleOff,
             PairLlmAlreadySet,
             PairLlmToggle,
+            PairStartSession,
             ReopenBrowser,
             Retry,
             ManualEntry,
@@ -2400,7 +2410,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 186, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 187, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

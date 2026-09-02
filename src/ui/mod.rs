@@ -644,10 +644,12 @@ pub fn run(
                     profile,
                     phase: PairPhase::Starting,
                     opt_in,
+                    return_to,
                 } = app.view.clone()
                 {
                     if profile == stamped_profile {
-                        app.view = pair_view::apply_started(&mut app, profile, opt_in, outcome);
+                        app.view =
+                            pair_view::apply_started(&mut app, profile, opt_in, return_to, outcome);
                     }
                 }
             }
@@ -661,6 +663,7 @@ pub fn run(
             profile,
             phase: PairPhase::Waiting { .. },
             opt_in,
+            return_to,
         } = app.view.clone()
         {
             let due = app
@@ -680,7 +683,9 @@ pub fn run(
                         ..
                     } = app.view.clone()
                     {
-                        app.view = pair_view::apply_tick(app.lang, profile, opt_in, current, tick);
+                        app.view = pair_view::apply_tick(
+                            app.lang, profile, opt_in, return_to, current, tick,
+                        );
                     }
                 }
                 app.pair_last_fetch = Some(std::time::Instant::now());

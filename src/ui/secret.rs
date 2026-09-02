@@ -9,7 +9,7 @@ use crate::verify::VerifyOutcome;
 
 use super::app::App;
 use super::view::{
-    decide_delete_key, is_plain_key, secret_rows, DeleteKeyAction, SecretPhase, View,
+    decide_delete_key, is_plain_key, secret_rows, DeleteKeyAction, PairReturn, SecretPhase, View,
 };
 use super::widgets::{pad_to, truncate, Msg};
 use super::{accent, danger, dim, move_sel_n, open_url, refetch_secrets};
@@ -164,7 +164,15 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
             // 普通字母，不能被这条分支吞掉。跟 Ctrl+O 同一条键位规矩
             // （见上面那条注释）：不占用一个字母键，密钥输入本身还要用它。
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && pairable => {
-                super::pair_view::start_pairing(app, profile);
+                // 这一屏自己记着学生本来要去哪儿（从设置页来的改配置，
+                // 从选择器来的是要开工），配对屏原样接过去——Ctrl+A 换的
+                // 只是「钥匙怎么来」，不是「他本来想干什么」。
+                let return_to = if return_to_settings {
+                    PairReturn::Home
+                } else {
+                    PairReturn::StartSession
+                };
+                super::pair_view::start_pairing(app, profile, return_to);
             }
             // Ctrl+O 不用 o：o 得留给密钥输入本身
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -276,7 +284,9 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
             if let Some(e) = target {
                 if e.pairable && !e.has_secret {
                     let name = e.name.clone();
-                    super::pair_view::start_pairing(app, name);
+                    // 密钥页进来的意图是「把钥匙配上」，不是「开工」——
+                    // 配完就完了，不替他起一个他没要的会话。
+                    super::pair_view::start_pairing(app, name, PairReturn::Home);
                     return Ok(());
                 }
             }
