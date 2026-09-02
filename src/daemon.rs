@@ -860,6 +860,12 @@ fn handle(
             *recover(phone.lock()) = status.clone();
             Ok(Response::Phone(status))
         }
+        // TODO(Task 3): 真正接上 `pair::Machine` 和后台轮询线程。这里先占位，
+        // 不然新增的三个 `Request` 变体会让这个 match 编不过——`daemon.rs`
+        // 不知道 pair 的落地细节，那是下一个任务的事。
+        Request::PairStart { .. } | Request::PairPoll { .. } | Request::PairCancel { .. } => {
+            Ok(Response::Error(ErrorCode::Internal("not_implemented".into())))
+        }
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
 }

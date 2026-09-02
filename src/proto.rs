@@ -72,7 +72,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 跟版本 9 是同一件事的第二半——键名翻成字节原来在 `web::routes` 里做
 /// （`web::keys::bytes_for`），那同样是中转做不了的翻译。**凡是路由层
 /// 「顺手算一下」的东西，经中转那一期都要还这笔债**，这是最后一处。
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// 11 = 配对。多了 `Request::PairStart` / `PairPoll` / `PairCancel`，
+/// `Response::PairStarted` / `PairTick`。旧守护进程完全不认识这三条请求，
+/// 界面发过去只会得到一句解析失败——跟 `Kill`/`Prune` 那次加一是同一个理由。
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +307,26 @@ pub enum Request {
         profile: String,
         value: String,
     },
+    /// 起一条配对：daemon 打 `/admin/api/pair/start`，成功就在自己内存里
+    /// 开一个轮询线程。**`device_code` 不在响应里**，它一次也不过 socket。
+    PairStart {
+        profile: String,
+        /// 学生在配对屏上勾没勾「报错看不懂时让 AI 解释」。**必须跟着这条请求走**：
+        /// 落盘发生在 daemon 的后台线程里，那时候界面早已经不在这条调用栈上了。
+        /// `config.rs` 开头那段说 `[llm]` 缺席是隐私边界而不是缺省值——这个 bool
+        /// 就是那个边界上唯一一次人的点头，把它丢在界面里等于把边界拆了。
+        opt_in_llm: bool,
+    },
+    /// 读一次配对的当前状态。非阻塞——真正的轮询在 daemon 的后台线程里跑，
+    /// 因为它要跑 15 分钟，而界面这条连接 5 秒就超时（`client.rs:11`）。
+    PairPoll {
+        profile: String,
+    },
+    /// 取消。**必须真的停线程并丢掉 `device_code`**：不停的话，用户退出去了，
+    /// 后台还在替他领钥匙，领到了写进 secrets，而他以为自己取消了。
+    PairCancel {
+        profile: String,
+    },
     /// 「这个 `Failed` 会话到底出了什么事」，人话版。答案可能还没算出来
     /// （问模型是异步的，见 `session.rs::request_explanation`），也可能
     /// 压根没配 LLM——两种情况都回 `Response::Explanation(None)`，界面
@@ -430,6 +454,20 @@ impl std::fmt::Debug for Request {
                 .field("profile", profile)
                 .field("value", &"<redacted>")
                 .finish(),
+            // 没有密钥可脱敏——`device_code` 从不出现在 `Request` 里，
+            // 它只活在 daemon 自己的内存中（见 `PairStart` 上的注释）。
+            Request::PairStart { profile, opt_in_llm } => f
+                .debug_struct("PairStart")
+                .field("profile", profile)
+                .field("opt_in_llm", opt_in_llm)
+                .finish(),
+            Request::PairPoll { profile } => {
+                f.debug_struct("PairPoll").field("profile", profile).finish()
+            }
+            Request::PairCancel { profile } => f
+                .debug_struct("PairCancel")
+                .field("profile", profile)
+                .finish(),
             Request::Explanation { id } => f.debug_struct("Explanation").field("id", id).finish(),
             Request::Scroll { id, by } => f
                 .debug_struct("Scroll")
@@ -535,6 +573,30 @@ pub enum Response {
     /// `BTreeMap` 不是 `HashMap`：序列化出来的顺序要稳定，否则那条钉住线上
     /// 形状的测试每次跑都可能换个顺序。
     Strings(std::collections::BTreeMap<String, String>),
+    /// 对 [`Request::PairStart`] 的回答。`Err` 是一句已经本地化过的原因
+    /// （网关关着、连不上）。
+    PairStarted(Result<crate::pair::Started, String>),
+    /// 对 [`Request::PairPoll`] 的回答。
+    PairTick(PairTick),
+}
+
+/// `pair::Tick` 给界面看的那一面。**故意不是 `Tick` 本身**：`Tick::Done`
+/// 里装着 `api_key`，而界面一个字节都不需要它——钥匙落盘在 daemon 那边
+/// 已经做完了。少一个能装钥匙的类型，就少一处它能漏出去的地方。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PairTick {
+    Waiting,
+    Done {
+        /// 有没有拿到 Anthropic 那一组模型。免费账号是 false，
+        /// 成功屏要据此换一句话说。
+        anthropic_ready: bool,
+        openai_ready: bool,
+    },
+    Expired {
+        retryable: bool,
+        message: String,
+    },
+    Failed(String),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -847,6 +909,12 @@ mod tests {
                 profile: "p".into(),
                 value: "v".into(),
             },
+            Request::PairStart {
+                profile: "p".into(),
+                opt_in_llm: true,
+            },
+            Request::PairPoll { profile: "p".into() },
+            Request::PairCancel { profile: "p".into() },
             Request::Explanation { id: 1 },
             Request::Scroll {
                 id: 1,
@@ -883,11 +951,35 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                10,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
+                11,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p"}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
+    }
+
+    /// **配对的响应里绝不许出现钥匙。** UI 不需要它——落盘在 daemon 那边做完了。
+    /// 一旦它过一次 socket，它就会出现在任何一个手滑加上的 `{resp:?}` 里。
+    #[test]
+    fn a_pair_tick_never_carries_the_key() {
+        let t = PairTick::Done {
+            anthropic_ready: true,
+            openai_ready: true,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("api_key"), "{json}");
+        assert!(!json.contains("sk-"), "{json}");
+    }
+
+    /// `device_code` 是凭据，跟密钥一个待遇：手写的 Debug 要把它挡住。
+    #[test]
+    fn pair_requests_do_not_print_anything_sensitive() {
+        let r = Request::PairStart {
+            profile: "dc".into(),
+            opt_in_llm: true,
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("dc"), "profile 该照常打印，排查问题要用：{s}");
     }
 
     /// 请求那条 pin 只钉了**发出去**的形状，回来的没人管——而 2026-08-06
@@ -927,7 +1019,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                10,
+                11,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1034,7 +1126,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (10, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (11, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
