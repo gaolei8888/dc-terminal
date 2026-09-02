@@ -104,6 +104,34 @@ pub(crate) fn pair_poll_request(profile: String, opt_in: LlmOptIn) -> Request {
 /// 在按键循环里，等待的这几秒会话视图也要继续刷新。
 pub(crate) fn start_pairing(app: &mut App, profile: String, return_to: PairReturn) {
     let opt_in = initial_opt_in(app);
+    start_pairing_with(app, profile, return_to, opt_in);
+}
+
+/// 换一串码重来（`Failed { retryable: true }` 上的 `r`），**带着学生已经
+/// 给过的答案**。
+///
+/// `start_pairing` 会重新去磁盘上算一遍 `initial_opt_in`，而磁盘上没有
+/// 学生刚才按 `l` 做的那个决定——他取消了勾选、撞上一个可重试的失败、
+/// 按了 `r`，框就又被勾回去了。他已经回答过这个问题了，一次网络故障
+/// 不是重新问一遍的理由，更不该把答案默默改成相反的那个。
+///
+/// **`AlreadyConfigured` 仍然现读磁盘**：那一支说的不是学生想要什么，
+/// 是「这台机器上已经有一段 `[llm]`，这次配对没有资格去动它」，而这件事
+/// 在两次尝试之间是会变的（另一个进程写了配置、用户自己手改了）。所以
+/// 带过来的只有 `Choice`，磁盘说已经有了就以磁盘为准。
+fn restart_pairing(app: &mut App, profile: String, return_to: PairReturn, carried: LlmOptIn) {
+    let opt_in = match (initial_opt_in(app), carried) {
+        // 磁盘上现在有 `[llm]`：这次配对不许碰它，学生带过来的答案不适用。
+        (LlmOptIn::AlreadyConfigured, _) => LlmOptIn::AlreadyConfigured,
+        // 带过来的是「上次进来时磁盘上有 `[llm]`」而现在没有了：那不是一个
+        // 学生做过的选择，退回按磁盘现状算出来的默认值。
+        (fresh, LlmOptIn::AlreadyConfigured) => fresh,
+        (_, carried @ LlmOptIn::Choice(_)) => carried,
+    };
+    start_pairing_with(app, profile, return_to, opt_in);
+}
+
+fn start_pairing_with(app: &mut App, profile: String, return_to: PairReturn, opt_in: LlmOptIn) {
     let (tx, rx) = std::sync::mpsc::channel();
     let sock = socket_path();
     // 发起时的身份留一份在这——线程闭包要吃掉 `profile` 本体去发请求，
@@ -379,8 +407,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         PairPhase::Failed { retryable, .. } => {
             if retryable && key.code == KeyCode::Char('r') && is_plain_key(&key) {
                 // 重来一次要沿用同一个终点：学生当初是为了开工才走进
-                // 配对的，换一串码不改变这件事。
-                start_pairing(app, profile, return_to);
+                // 配对的，换一串码不改变这件事。勾选框的答案同理——
+                // 见 `restart_pairing`：他已经回答过那个问题了。
+                restart_pairing(app, profile, return_to, opt_in);
             }
         }
     }
@@ -892,6 +921,70 @@ mod tests {
             opt_in,
             LlmOptIn::Choice(true),
             "批准落地之后再翻转只会显示一个跟磁盘不一致的状态"
+        );
+    }
+
+    /// **可重试的失败之后按 `r`，学生的答案要跟着走。**
+    ///
+    /// `r` 走的曾经是 `start_pairing`，而那个函数从磁盘上重算
+    /// `initial_opt_in`——磁盘上没有他刚才按 `l` 做的那个决定。于是：
+    /// 取消勾选、撞上一次网络故障、按 `r`，框自己又勾回去了。他已经
+    /// 回答过这个问题了，一次重试不是重新问一遍的理由，更不该把答案
+    /// 默默改成相反的那一个。
+    ///
+    /// `start_pairing` 真会去起一个后台线程发请求，这里的 `App` 连不上
+    /// daemon，那个线程只会自己失败掉——这条测试看的是它留在视图上的
+    /// `opt_in`，不是那次请求。
+    #[test]
+    fn retrying_after_a_failure_keeps_the_answer_the_student_already_gave() {
+        let (mut app, _dir) = test_app_with(
+            phase_expired(true, String::new()),
+            // 学生取消过勾选。
+            LlmOptIn::Choice(false),
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+
+        let View::Pair { opt_in, phase, .. } = app.view.clone() else {
+            panic!("r 应该重新起一条配对，还留在配对屏上");
+        };
+        assert!(matches!(phase, PairPhase::Starting), "r 要真的重来一次");
+        assert_eq!(
+            opt_in,
+            LlmOptIn::Choice(false),
+            "他已经取消过勾选了，重试不该把它勾回去"
+        );
+    }
+
+    /// 上面那条的反面：磁盘上现在有一段 `[llm]` 的时候，`AlreadyConfigured`
+    /// 仍然要现读磁盘算出来，不能被带过来的 `Choice` 顶掉。那一支说的不是
+    /// 「学生想要什么」，是「这次配对没有资格去动这份文件」，而这件事在
+    /// 两次尝试之间会变（另一个进程写了配置、用户自己手改了）。
+    #[test]
+    fn a_retry_still_re_derives_already_configured_from_disk() {
+        let (app, _dir) = App::test_app();
+        let cfg = crate::config::config_path_for_socket(&app.socket);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "[llm]\nprovider = \"kimi\"\nmodel = \"k2\"\n").unwrap();
+
+        let mut app = app;
+        app.view = View::Pair {
+            profile: "dc".into(),
+            phase: phase_expired(true, String::new()),
+            // 带过来一个 `Choice(true)`——磁盘现在说了不算他说了算是错的。
+            opt_in: LlmOptIn::Choice(true),
+            return_to: PairReturn::Home,
+        };
+
+        handle_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+
+        let View::Pair { opt_in, .. } = app.view.clone() else {
+            panic!("r 应该重新起一条配对，还留在配对屏上");
+        };
+        assert_eq!(
+            opt_in,
+            LlmOptIn::AlreadyConfigured,
+            "磁盘上已经有 [llm]，这次配对没有资格去动它"
         );
     }
 
