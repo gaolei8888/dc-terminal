@@ -502,9 +502,14 @@ pub enum Key {
     PairLlmAlreadySet,
     /// 底栏：`l` 切换上面那个勾选框。
     PairLlmToggle,
-    /// 成功屏上那一行、也是底栏那一条：按 Enter 把学生当初要的那个会话
-    /// 开起来。只在从选择器进来的那条路上出现（`PairReturn::StartSession`）
-    /// ——从密钥页进来的人要的是「把钥匙配上」，不是开工。
+    /// 底栏那一条：按 Enter 把学生当初要的那个会话开起来。只在从选择器
+    /// 进来的那条路上出现（`PairReturn::StartSession`）——从密钥页进来的人
+    /// 要的是「把钥匙配上」，不是开工。
+    ///
+    /// **底栏这一条自己说不清 Enter 会开什么**（它只是「开始使用」四个
+    /// 字），成功屏正文里那一句由 `msg::pair_start_session_line` 给，
+    /// 那句话点名 agent 的名字。这条注释以前说自己也是「成功屏上那一行」，
+    /// 而屏上从来没有过那一行——差一点就让这个缺口一直留着。
     PairStartSession,
     /// 底栏：重开浏览器（Waiting 阶段的 `o`）。
     ReopenBrowser,
@@ -1444,6 +1449,25 @@ pub mod msg {
             lang,
             en: format!("{m:02}:{s:02} left"),
             zh: format!("剩余 {m:02}:{s:02}"),
+        )
+    }
+
+    /// 成功屏正文里那一句：Enter 会打开什么。
+    ///
+    /// **这一屏必须自己说出 Enter 干什么。** 它要按一下 Enter 而不是自动
+    /// 跳，是为了让免费账号的学生先读到「Claude 需要付费升级」那句话
+    /// （见 `ui::view::PairReturn::StartSession`）。可是这个可供性以前只
+    /// 写在底栏的「Enter 开始使用」里，而那四个字没说开始使用什么——最
+    /// 可能的误读是「配对已经办完了，Esc 就是出口」，而 Esc 恰好会把他
+    /// 要的那个会话丢掉，正是那道门要防的那件事。
+    ///
+    /// 只在真有会话可回的时候说（`PairReturn::StartSession`）；从密钥页
+    /// 进来的那条路 Enter 没有东西可开，这句话在那儿就是假的。
+    pub fn pair_start_session_line(lang: Lang, profile: &str) -> String {
+        t!(
+            lang,
+            en: format!("Press Enter to start this project with {profile}."),
+            zh: format!("按 Enter 用 {profile} 开始这个项目"),
         )
     }
 

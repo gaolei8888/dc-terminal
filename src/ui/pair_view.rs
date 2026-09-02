@@ -15,8 +15,9 @@
 //!   早就留给了密钥输入本身（见那条「Ctrl+O 不用 o」的注释）。
 //!
 //! 这一屏自己的键是 `l`（`[llm]` 那个勾选框）、`o`（重开浏览器）、
-//! `p`（改成手动填）、`r`（换一串码）、Esc（取消）、以及成功屏上的
-//! Enter（只在 `PairReturn::StartSession` 那条路上）。`p` 和 `Esc` 都发
+//! `p`（改成手动填）、`r`（换一串码，带着学生已经给过的勾选答案，
+//! 见 `restart_pairing`）、Esc（取消）、以及成功屏上的 Enter（只在
+//! `PairReturn::StartSession` 那条路上，屏上正文里点名它会开什么）。`p` 和 `Esc` 都发
 //! `Request::PairCancel`：不发的话后台还在替一个已经走开的人领钥匙。
 //!
 //! **URL 在本地拼，绝不接受线上答复里的 origin。** `daemon::pair_origin`
@@ -505,7 +506,13 @@ pub(crate) fn opt_in_line(opt_in: LlmOptIn, lang: Lang) -> &'static str {
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Pair { phase, opt_in, .. } = app.view.clone() else {
+    let View::Pair {
+        profile,
+        phase,
+        opt_in,
+        return_to,
+    } = app.view.clone()
+    else {
         return;
     };
     let border_style = if app.connected {
@@ -591,6 +598,23 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(Span::styled(
             text(Key::PairLlmOptIn, app.lang),
             dim(),
+        )));
+    }
+
+    // 成功屏必须自己说出 Enter 干什么。这一屏要按一下 Enter 而不是自动
+    // 跳，是为了让免费账号的学生先读到「Claude 需要付费升级」那句话
+    // （见 `PairReturn::StartSession`）；可这个可供性以前只写在底栏的
+    // 「Enter 开始使用」里，那四个字没说开始使用什么。最可能的误读是
+    // 「配对已经办完了，Esc 就是出口」——而 Esc 会把他当初要的那个会话
+    // 丢掉，正是那道门要防的那件事。
+    //
+    // 只在真有会话可回的时候写：从密钥页进来的那条路（`PairReturn::Home`）
+    // Enter 没有东西可开，这句话在那儿就是一句假话。
+    if matches!(phase, PairPhase::Done { .. }) && matches!(return_to, PairReturn::StartSession) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            msg::pair_start_session_line(app.lang, &profile),
+            accent(),
         )));
     }
 
@@ -1064,6 +1088,47 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Request::Create { profile, .. } if profile == "dc")),
             "开的必须是他当初选的那个 agent"
+        );
+    }
+
+    /// **成功屏要自己说出 Enter 会开什么。**
+    ///
+    /// 这一屏要求按一下 Enter 而不是自动跳，是为了让免费账号的学生先读到
+    /// 「Claude 需要付费升级」那句话。可这个可供性以前只活在底栏的
+    /// 「Enter 开始使用」里，那四个字没说开始使用什么——最可能的误读是
+    /// 「配对已经办完了，Esc 就是出口」，而 Esc 恰好会把他当初要的那个
+    /// 会话丢掉，正是那道门要防的那件事。
+    ///
+    /// 反面同样要钉住：从密钥页进来的那条路 Enter 没有东西可开
+    /// （`a_pairing_started_from_the_key_page_does_not_open_a_session`），
+    /// 那儿写这句话就是骗人。
+    #[test]
+    fn the_done_screen_says_what_enter_opens_only_when_there_is_something_to_open() {
+        let shown = |return_to: PairReturn| {
+            let (mut app, _dir) = App::test_app();
+            app.view = View::Pair {
+                profile: "dc".into(),
+                phase: PairPhase::Done {
+                    anthropic: false,
+                    openai: true,
+                    llm_written: false,
+                },
+                opt_in: LlmOptIn::Choice(true),
+                return_to,
+            };
+            // 空格全去掉再比：宽字符在 `TestBackend` 的缓冲里占两格，
+            // 后一格的 symbol 是一个空格。
+            let squeeze = |s: &str| s.replace(' ', "");
+            let want = squeeze(&msg::pair_start_session_line(app.lang, "dc"));
+            squeeze(&render_lines(&mut app).join("")).contains(&want)
+        };
+        assert!(
+            shown(PairReturn::StartSession),
+            "有会话可回的时候，屏上必须说出 Enter 会开什么"
+        );
+        assert!(
+            !shown(PairReturn::Home),
+            "Enter 在这条路上没有东西可开，这句话在这儿是假的"
         );
     }
 
