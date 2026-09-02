@@ -213,11 +213,13 @@ pub(crate) fn apply_tick(
         PairTick::Done {
             anthropic_ready,
             openai_ready,
+            llm_written,
         } => View::Pair {
             profile,
             phase: PairPhase::Done {
                 anthropic: anthropic_ready,
                 openai: openai_ready,
+                llm_written,
             },
             opt_in,
             return_to,
@@ -443,7 +445,9 @@ pub(crate) fn phase_line(phase: &PairPhase, lang: Lang) -> String {
         PairPhase::Starting => text(Key::PairContacting, lang).to_string(),
         PairPhase::Waiting { .. } => text(Key::PairEnterCodeInBrowser, lang).to_string(),
         PairPhase::Failed { message, .. } => message.clone(),
-        PairPhase::Done { anthropic, openai } => {
+        PairPhase::Done {
+            anthropic, openai, ..
+        } => {
             if *anthropic && *openai {
                 text(Key::PairDoneBoth, lang).to_string()
             } else if *openai {
@@ -536,11 +540,24 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 
     // 免费账号那句要点名「Qwen 那一路」+「Claude 需要付费升级」，两句都
     // 已经在 `PairDoneQwenOnly` 里说了；这里只在 Done 阶段额外补一行
-    // 「报错时的 AI 解释：已经替你打开了」——只在真勾着走完的时候写，
-    // 没勾就整行不出现（沉默本身就是「没开」，不用另开一句「未开启」去
-    // 提醒一件用户自己决定没要的事）。已经有 `[llm]` 的那一支也不写：
-    // 那不是这次配对干的。
-    if matches!(phase, PairPhase::Done { .. }) && opt_in.wire() {
+    // 「报错时的 AI 解释：已经替你打开了」——没写就整行不出现（沉默本身
+    // 就是「没开」，不用另开一句「未开启」去提醒一件用户自己决定没要的事）。
+    //
+    // **条件是 `llm_written`，不是 `opt_in.wire()`。** 后者是界面自己的
+    // 意图，而这一行陈述的是磁盘上的一件事实，两者至少在三种情况下对不上：
+    // 勾选框的值和落盘那一刻读到的值抢输（`daemon.rs` 那格 `fetch_and`）、
+    // 两组模型名都是空的于是 `pair_apply::apply` 一个字都没写、
+    // `llm_optin::enable` 发现文件里中途冒出了一段 `[llm]` 于是拒绝动它。
+    // 宣布一个其实关着的隐私功能已经打开，比不说话坏得多。已经有 `[llm]`
+    // 的那一支照样不写，只不过现在是因为 `llm_written` 本来就是 false，
+    // 不用界面再去猜一遍。
+    if matches!(
+        phase,
+        PairPhase::Done {
+            llm_written: true,
+            ..
+        }
+    ) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             text(Key::PairLlmOptIn, app.lang),
@@ -863,6 +880,7 @@ mod tests {
             PairPhase::Done {
                 anthropic: false,
                 openai: true,
+                llm_written: false,
             },
             LlmOptIn::Choice(true),
         );
@@ -934,6 +952,7 @@ mod tests {
             phase: PairPhase::Done {
                 anthropic: false,
                 openai: true,
+                llm_written: false,
             },
             opt_in: LlmOptIn::Choice(true),
             return_to: PairReturn::StartSession,
@@ -967,6 +986,7 @@ mod tests {
             phase: PairPhase::Done {
                 anthropic: false,
                 openai: true,
+                llm_written: false,
             },
             opt_in: LlmOptIn::Choice(true),
             return_to: PairReturn::Home,
@@ -981,6 +1001,39 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Request::Create { .. })),
             "他要的是配一把钥匙，不是开一个会话"
+        );
+    }
+
+    /// **成功屏上那句「已经替你打开了」只从事实来，不从界面的意图来。**
+    ///
+    /// 它以前渲染的是 `opt_in.wire()`——界面自己那个勾选框的值，也就是
+    /// 界面在陈述它想要什么，而不是磁盘上发生了什么。至少三种情况下两者
+    /// 对不上：勾选框的值和落盘那一刻读到的值抢输、两组模型名都是空的于是
+    /// `pair_apply::apply` 一个字都没写、`llm_optin::enable` 发现文件里中途
+    /// 冒出了一段 `[llm]` 于是拒绝动它。宣布一个其实关着的隐私功能已经
+    /// 打开，比不说话坏得多——所以这里钉的是「勾着但没写成，就闭嘴」。
+    #[test]
+    fn the_done_screen_only_claims_the_llm_feature_when_it_was_really_written() {
+        let claimed = |llm_written: bool| {
+            let (mut app, _dir) = test_app_with(
+                PairPhase::Done {
+                    anthropic: false,
+                    openai: true,
+                    llm_written,
+                },
+                // 勾选框自始至终勾着——正是那个「意图」，它不该有发言权。
+                LlmOptIn::Choice(true),
+            );
+            // 空格全去掉再比：宽字符在 `TestBackend` 的缓冲里占两格，
+            // 后一格的 symbol 是一个空格，照原样比对永远对不上。
+            let squeeze = |s: &str| s.replace(' ', "");
+            let want = squeeze(text(Key::PairLlmOptIn, app.lang));
+            squeeze(&render_lines(&mut app).join("")).contains(&want)
+        };
+        assert!(claimed(true), "真写出去了就该说一声");
+        assert!(
+            !claimed(false),
+            "勾着但一个字都没写，屏上不能宣布这个功能已经打开"
         );
     }
 
@@ -1017,6 +1070,7 @@ mod tests {
             PairPhase::Done {
                 anthropic: true,
                 openai: true,
+                llm_written: false,
             },
         ] {
             let (mut app, _dir) = test_app_with_phase(phase);
@@ -1036,6 +1090,7 @@ mod tests {
             &PairPhase::Done {
                 anthropic: false,
                 openai: true,
+                llm_written: false,
             },
             Lang::Zh,
         );
@@ -1120,6 +1175,7 @@ mod tests {
                 PairPhase::Done {
                     anthropic: true,
                     openai: true,
+                    llm_written: false,
                 },
             ] {
                 assert!(!phase_line(&phase, *lang).is_empty());

@@ -318,7 +318,16 @@ pub(crate) enum PairPhase {
     /// 成功。免费账号只有 `openai`（Qwen 那一路），必须**明说**——不然
     /// 学生会拿着新配好的账号试 Claude，撞上一个没有任何解释的失败，
     /// 而没人告诉过他这是免费账号的正常边界，付费升级才有 Claude。
-    Done { anthropic: bool, openai: bool },
+    Done {
+        anthropic: bool,
+        openai: bool,
+        /// 这次配对**真的**把 `[llm]` 写出去了没有，从 `PairTick::Done`
+        /// 原样带过来的一件事实。屏上那句「报错时的 AI 解释：已经替你
+        /// 打开了」只认这个，不认 `opt_in`——后者是界面自己的意图，而
+        /// 勾着却什么都没写的路有好几条（见 `pair_apply::Ready::llm_written`）。
+        /// 没写就整行不出现：一个关着的隐私功能，沉默好过一句假话。
+        llm_written: bool,
+    },
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给

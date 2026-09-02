@@ -1212,6 +1212,9 @@ fn pair_poll_once(
                 Ok(ready) => PairTick::Done {
                     anthropic_ready: ready.anthropic,
                     openai_ready: ready.openai,
+                    // 报的是 `apply` 真的做了什么，不是勾选框的值——
+                    // 见 `pair_apply::Ready::llm_written`。
+                    llm_written: ready.llm_written,
                 },
                 Err(e) => PairTick::Failed(e),
             }
@@ -1383,6 +1386,7 @@ mod tests {
             Ok(crate::pair_apply::Ready {
                 anthropic: true,
                 openai: true,
+                llm_written: false,
             })
         };
 
@@ -1409,6 +1413,7 @@ mod tests {
             Ok(crate::pair_apply::Ready {
                 anthropic: true,
                 openai: false,
+                llm_written: false,
             })
         };
 
@@ -1420,6 +1425,7 @@ mod tests {
             Some(PairTick::Done {
                 anthropic_ready,
                 openai_ready,
+                ..
             }) => {
                 assert!(anthropic_ready);
                 assert!(!openai_ready);

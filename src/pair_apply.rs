@@ -32,6 +32,15 @@ use std::path::Path;
 pub struct Ready {
     pub anthropic: bool,
     pub openai: bool,
+    /// **这次配对到底有没有把 `[llm]` 写出去。** 不是「学生勾了没有」——
+    /// 成功屏上那句「报错时的 AI 解释：已经替你打开了」以前是从界面自己
+    /// 那个勾选框的值渲染的，也就是界面在陈述一个它的意图，而不是一件
+    /// 发生过的事。三种情况下那句话是错的：勾选框的值和落盘那一刻读到的
+    /// 值抢输（见 `daemon.rs` 那格 `fetch_and` 上面的分析）、两组模型名
+    /// 都是空的于是下面那条提前返回一个字都没写、`llm_optin::enable`
+    /// 发现文件里在这中间冒出了一段 `[llm]` 于是拒绝动它。宣布一个其实
+    /// 关着的隐私功能已经打开，比不说话坏得多。
+    pub llm_written: bool,
 }
 
 /// 侧写文件的第一行。认这行才敢重写——没有它的文件是用户自己写的。
@@ -120,26 +129,38 @@ fn apply_inner(
     // 第三步：`[llm]` 自举，只有学生在配对屏上勾了才做。写在最后——它是
     // 三件事里唯一「没有前面两步就没意义」的一件：`[llm]` 指着一个模型名，
     // 但那个模型名要靠的钥匙如果还没落盘，`[llm]` 写了也用不了。
+    //
+    // `llm_written` 记的是**真的写了没有**，不是「学生勾了没有」：下面
+    // 三条路都能让一个勾着的配对什么都不写（两组模型名全空、`enable`
+    // 拒绝去动一份已经有 `[llm]` 的文件、以及最外层压根没勾），成功屏
+    // 要说的是发生过的事，不是界面的意图。见 `Ready::llm_written`。
+    let mut llm_written = false;
     if opt_in_llm {
-        let (provider, model) = if let Some(m) = &a.models.anthropic.default {
-            ("dc", m.clone())
-        } else if let Some(m) = &a.models.openai.default {
-            ("qwen", m.clone())
-        } else {
-            // 两边都没有模型名：写一个没有模型的 `[llm]` 段等于写了个解析
-            // 不出来的配置，什么都不写好过写这个。
-            return Ok(Ready {
-                anthropic: a.models.anthropic.default.is_some(),
-                openai: a.models.openai.default.is_some(),
-            });
-        };
-        let config_path = home.join("config.toml");
-        llm_enable(&config_path, provider, &model)?;
+        if let Some((provider, model)) = a
+            .models
+            .anthropic
+            .default
+            .as_ref()
+            .map(|m| ("dc", m.clone()))
+            .or_else(|| {
+                a.models
+                    .openai
+                    .default
+                    .as_ref()
+                    .map(|m| ("qwen", m.clone()))
+            })
+        {
+            let config_path = home.join("config.toml");
+            llm_written = llm_enable(&config_path, provider, &model)?;
+        }
+        // 两边都没有模型名：写一个没有模型的 `[llm]` 段等于写了个解析
+        // 不出来的配置，什么都不写好过写这个，`llm_written` 就留在 false。
     }
 
     Ok(Ready {
         anthropic: a.models.anthropic.default.is_some(),
         openai: a.models.openai.default.is_some(),
+        llm_written,
     })
 }
 
@@ -358,6 +379,47 @@ mod tests {
         };
         apply_inner(&approved_with_both_wires(), dir.path(), &store, false, hook).unwrap();
         assert!(!called.get(), "opt_in_llm=false 时不许碰 llm_optin::enable");
+    }
+
+    /// **`llm_written` 报的是发生过的事，不是学生的意图。** 成功屏上
+    /// 那句「报错时的 AI 解释：已经替你打开了」以前是从界面自己那个勾选
+    /// 框渲染的，于是三种「勾着但一个字都没写」的情况下它在撒谎。这里
+    /// 把三种都钉住，外加正常那一条的对照。
+    #[test]
+    fn llm_written_reports_what_actually_happened_not_what_was_asked_for() {
+        let write = |a: &crate::pair::Approved, opt_in: bool, hook_result: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Mutex::new(crate::secrets::SecretStore::load(
+                &dir.path().join("secrets.toml"),
+            ));
+            let hook = move |_: &Path, _: &str, _: &str| Ok(hook_result);
+            apply_inner(a, dir.path(), &store, opt_in, hook)
+                .unwrap()
+                .llm_written
+        };
+
+        // 对照组：勾了，有模型名，`enable` 也真的写了。
+        assert!(write(&approved_with_both_wires(), true, true));
+
+        // 没勾：`enable` 一次都没被调用过（`opt_in_false_never_calls_the_hook`
+        // 钉着这一半），当然也没写。
+        assert!(!write(&approved_with_both_wires(), false, true));
+
+        // 勾了，但两组模型名都是空的：上面那条早退分支一个字都没写——
+        // 写一个没有 `model` 的 `[llm]` 等于写了段解析不出来的配置。
+        let mut nothing = approved_with_both_wires();
+        nothing.models = Default::default();
+        assert!(
+            !write(&nothing, true, true),
+            "两组模型名都空的时候什么都没写，不能报成写了"
+        );
+
+        // 勾了、有模型名，但 `llm_optin::enable` 拒绝去动一份中途冒出
+        // `[llm]` 的文件（那条路它返回 `Ok(false)`）。
+        assert!(
+            !write(&approved_with_both_wires(), true, false),
+            "enable 拒绝写的时候也不能报成写了"
+        );
     }
 
     fn approved_with_both_wires() -> crate::pair::Approved {

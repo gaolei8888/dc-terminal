@@ -82,7 +82,15 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 改主意得有一条路送到 daemon，而每 500ms 就要发一次的 `PairPoll` 正是
 /// 那条路（理由见 `ui::pair_view::pair_poll_request`）。旧守护进程解不出
 /// 多了一个字段的 `PairPoll`——形状变了就得加一，这条规矩没有例外。
-pub const PROTOCOL_VERSION: u32 = 12;
+///
+/// 13 = 成功屏改成陈述事实。`PairTick::Done` 多了一个 `llm_written`：
+/// 那一屏上「报错时的 AI 解释：已经替你打开了」以前是从界面自己那个勾选
+/// 框渲染的，也就是界面在陈述它的意图，而 `[llm]` 到底写没写只有
+/// `pair_apply::apply` 知道（勾了也可能一个字都没写，见
+/// `pair_apply::Ready::llm_written`）。这一次变的是**响应**的形状而不是
+/// 请求的：旧界面解不出多了一个字段的 `Done`，一条成功的配对会在最后
+/// 一刻变成一句解析失败——形状变了就得加一，这条规矩对哪一侧都一样。
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +640,12 @@ pub enum PairTick {
         /// 成功屏要据此换一句话说。
         anthropic_ready: bool,
         openai_ready: bool,
+        /// 这次配对**真的**往 `~/.dct/config.toml` 里写了一段 `[llm]`
+        /// 没有。不是「学生勾了没有」——界面拿自己那个勾选框的值去渲染
+        /// 「已经替你打开了」，等于让它陈述一个意图；勾着却什么都没写
+        /// 的路有好几条（见 `pair_apply::Ready::llm_written`）。成功屏
+        /// 上宣布一个其实关着的隐私功能已经打开，比不说话坏得多。
+        llm_written: bool,
     },
     Expired {
         retryable: bool,
@@ -997,7 +1011,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                12,
+                13,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1011,10 +1025,22 @@ mod tests {
         let t = PairTick::Done {
             anthropic_ready: true,
             openai_ready: true,
+            llm_written: true,
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(!json.contains("api_key"), "{json}");
         assert!(!json.contains("sk-"), "{json}");
+        // 请求那一侧的形状由 `the_request_shape_is_pinned_to_the_protocol_version`
+        // 钉着，`Done` 是响应，落在那张网外面——而版本 13 变的正是它。
+        // 把它一起钉住，下一次给它加字段的人才会被同一句话拦下来。
+        assert_eq!(
+            (PROTOCOL_VERSION, json.as_str()),
+            (
+                13,
+                r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
+            ),
+            "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
     }
 
     /// **`PairStarted` 的响应里绝不许出现 `device_code`。** 它是这条流程的
@@ -1119,7 +1145,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                12,
+                13,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1226,7 +1252,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (12, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (13, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

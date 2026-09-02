@@ -44,6 +44,9 @@ fn a_full_pairing_writes_both_secrets_and_both_model_names() {
             PairTick::Done {
                 anthropic_ready: false,
                 openai_ready: true,
+                // 勾了 `opt_in_llm`，两组模型名里 openai 那组有货——
+                // `[llm]` 真的被写出去了，成功屏那句话才有资格出现。
+                llm_written: true,
             }
         ),
         "免费账号只有 openai 那一路：{tick:?}"
