@@ -21,6 +21,16 @@
 - User-Agent 定死：`dct/<CARGO_PKG_VERSION> (<std::env::consts::OS>; <std::env::consts::ARCH>)`，例 `dct/0.2.5 (macos; aarch64)`。不带主机名、不带用户名。
 - **`base_url` 收到也忽略**，origin 永远用配对时那个（从 profile 的 `[api].base_url` 推）。
 - `verify_path` 是路径，dct 自己拼 `<origin><verify_path>?code=<user_code>`。
+  **网关已上线并实测确认路径是 `/pair`**（`dc-llm-01`，提交 `790fa5f`，迁移
+  `q8r9s0t1u2v3`）。页面会读 query 里的 code，且输入框可编辑——码敲错了在网页上改，
+  不用回终端重来。
+- **网关那边实测到的真实响应**，写测试时照这个形状，别照我编的：
+  `user_code` 形如 `Y3BG-MDPQ`，`interval` 3，`expires_in` 900，钥匙 49 个字符，
+  免费账号 `models` 是 `{"anthropic": {}, "openai": {"default": "qwen3.5:35b",
+  "small_fast": "gemma4:31b"}}`。第二次 poll 回 `claimed` 且不带钥匙；
+  拿 `user_code` 当凭据去 poll 回 404。
+- **`key_unreadable` 那句文案由网关给，dct 原样显示**，不许自己造：
+  「这个账号的密钥读不回来了，请到体验台点「重新生成」后重新配对」。
 - 面向用户的文案一律走 `crate::i18n`，zh + en 两份，不许在 UI 里写字面量。
 - 测试不打网络。传输层一律注入（照 `verify.rs:44` 的 `verify_with`）。
 - 提交信息用英文，正文说清「为什么」，句子完整。
@@ -1576,11 +1586,14 @@ by hand and wonder why pairing overwrote nothing."
 
 ## 上线顺序（spec 第 4 节，这里重复一遍因为它是执行顺序）
 
-1. 网关先上（**已完成**，`DC_ADMIN_PAIRING_ENABLED` 默认关）
+1. 网关先上（**已完成并已部署到生产**，`790fa5f`；`DC_ADMIN_PAIRING_ENABLED`
+   在生产 .env 里没设，三个接口一律 404）
 2. Task 1–7 做完，本地对着 QA 实例手工跑一遍全程——**这一步没法自动化**，要真开浏览器、真点确认
 3. 告诉 `dc-llm-01` 要合并，它挂起部署
 4. 合入 dc-terminal，`profiles/` 里两个文件只动注释
-5. 网关开开关，dct 发版
+5. **两边同时在场**才开开关：对方改一行 .env 加重启容器（不用重建），我这边
+   拿一个测试账号真跑一遍。这一步的不对称是硬的——我测不了它那半，它也部署不了
+   我这半，所以第一次真实端到端必须两个人同时在。
 
 ## 自查
 
