@@ -96,24 +96,59 @@ dct」，这里是「把网关账号配给 dct」，信任模型不同，硬套�
 | `created_at` / `expires_at` | 有效期 5 分钟 |
 | `poll_count` | 轮询次数，用于限流 |
 
-### 三个接口
+### 三个接口：冻结的线上契约
+
+**这一节是契约，不是示意。** 两个仓库分头实现，字段名和类型以这里为准，
+两边都不许临场发挥（2026-09-02 与 `dc-llm-01` 约定）。
+
+**整套接口挂在 `DC_ADMIN_PAIRING_ENABLED` 下，默认 `False`。** 关着的时候三个接口
+一律 404（不是 403——不存在的功能就该像不存在）。样板是 `config.py:111` 的
+`free_quota_on_v1`，区别是那个默认 `True`，这个必须默认 `False`：生产只有一台机器、
+没有 staging、`dev` 上的代码会被下一次部署带上线（dc_llm 今天已经推了四次）。
+上线之后这个开关还有第二个用处——上课上到一半能把配对关掉。
 
 ```
-POST /admin/api/pair/start        无认证
-  ← 200 {device_code, user_code, verify_url, interval: 2, expires_in: 300}
+POST /admin/api/pair/start                              无认证
+  → {"client": "dct", "version": "0.2.5"}
+  ← 200 {"device_code": "<64 hex>",
+         "user_code": "HJ4K-9QTZ",
+         "verify_url": "https://dc-llm.tzspace.cn/pair?code=HJ4K-9QTZ",
+         "interval": 3,
+         "expires_in": 900}
+  ← 404  开关关着
+  ← 429  同 IP 刷 start
 
-POST /admin/api/pair/approve      cookie 认证（现有 current_user）
-  → {user_code, decision: "approve" | "deny"}
+POST /admin/api/pair/approve                            cookie + CSRF（现有 current_user）
+  → {"user_code": "HJ4K-9QTZ", "decision": "approve" | "deny"}
   ← 204
-  只认 pending 且未过期的；user_code 比对前把大小写和连字符归一化
+  ← 400  未知 / 已过期 / 已经表过态的码
+  ← 401  没登录        ← 403  CSRF 不对
 
-POST /admin/api/pair/poll         无认证，device_code 本身即凭据
-  → {device_code}
-  ← 200 {status: "pending"}
-  ← 200 {status: "approved", api_key, base_url, models, quota}
-  ← 400 {status: "denied" | "expired" | "claimed"}
-  ← 429 轮询过快
+POST /admin/api/pair/poll                               无认证，device_code 即凭据
+  → {"device_code": "<64 hex>"}
+  ← 200 {"status": "pending"}
+  ← 200 {"status": "approved", "api_key": "...", "base_url": "...",
+         "models": {...}, "quota": {...}}
+  ← 200 {"status": "denied" | "expired" | "claimed"}
+  ← 404  device_code 不认识
+  ← 429  轮询过快
 ```
+
+**`poll` 的生命周期状态一律走 200 + `status` 字段，不走 4xx。** 只有「这个请求本身有
+问题」（不认识的码、太快、功能关着）才用状态码。理由是 dct 那侧：状态机读一个
+`status` 枚举，比既解析状态码又解析错误体少一半出错的地方，而 `denied` / `expired`
+是**正常的**流程终点，不是错误。
+
+`models` 和 `quota` 的形状见下两节。
+
+**节奏与时限，由 dct 侧定，网关的限流数照这个配：**
+
+| 值 | 定值 | 为什么 |
+|---|---|---|
+| `expires_in` | **900 秒** | 原稿写 300 秒，不够。学生很可能是**在这条流程里第一次注册**——收短信、设密码、看确认页，五分钟能烧完，而码一过期他要从头再来一遍 |
+| `interval` | **3 秒** | 15 分钟最多 300 次轮询。1 秒太吵，5 秒让确认后的等待肉眼可见 |
+| 429 退避 | 翻倍，封顶 **30 秒** | dct 侧自己退，不指望网关教它 |
+| 网关节流阈值 | 快于 **2 秒**就 429 | 比 `interval` 松一档，别让正常客户端的抖动撞上限流 |
 
 ### `models` 的形状：按 wire 分组的列表，不是一个名字
 
@@ -125,7 +160,15 @@ POST /admin/api/pair/poll         无认证，device_code 本身即凭据
 - 免费账号默认平台是 `["local", "cloud"]`（`config.py:129`），免费那条路上的模型是
   `qwen3.8:27b` 一类。
 
-所以按 wire 分组返回**这个账号当前能用的**，dct 各取所需：
+**列表只能有一个来源。** `routes_free_playground.py:59` 的 `my_models` 已经在算这件事：
+`ModelPrice` × `entitlements.active_for` × `served_models(db)`。配对**必须复用同一段
+代码**（抽成一个共享函数，两处都调），不许在 pair handler 里另拼一份。那段注释写了
+不用 `served_models` 的后果：没启用 anthropic provider 时，一个 `claude-*` 请求
+**不会被拒绝**，它会掉到路由最后一步的 ollama 上，而那台机器没听说过这个模型。
+两份列表一旦漂移，症状就是网页 playground 提供一个 dct 用不了的模型（或者反过来），
+而且**没有任何东西会响**。
+
+按 wire 分组返回**这个账号当前能用的**，dct 各取所需：
 
 ```json
 "models": {
@@ -194,8 +237,18 @@ FastAPI 上挂一个 `/v1/{full_path:path}` 的 catch-all，先做 key 认证、
 
 ```
 GET /v1/me/quota    Authorization: Bearer <api_key>
-  ← {used_micro, limit_micro, period_end, plan}
+  ← 200 {"used_micro": int, "limit_micro": int | null,
+         "period_end": "<ISO 8601>" | null, "plan": str}
 ```
+
+`poll` 的 `approved` 里那个 `quota` 用**同一个形状**，值取 `free_quota.snapshot(db, user_id)`
+——跟 playground 面板同一个来源，两处不许各算各的。
+
+**分两期，因为 9 月 6 日有课**（今天 9 月 2 日）：
+
+- **一期**（课前必须有）：`quota` 快照跟着 `poll` 回来，配对成功屏上显示一次。不需要新接口。
+- **二期**：`GET /v1/me/quota`，给密钥页那个「本月还剩多少」的实时值。这条晚一周
+  不影响任何人配对成功。
 
 **必须注册在 `mount_proxy` 之前**（`main.py:107` 那行注释就是这个意思），否则
 catch-all 会把这个路径吞掉转给上游。
@@ -456,6 +509,27 @@ token 窗口、平台准入、每账号一个在飞请求）。在那之前，�
 脚本、应用会一起停。这正是配对流程自己绝不许悄悄调它的原因（见第 1 节）。
 
 ---
+
+## 谁写哪半
+
+2026-09-02 与 `dc-llm-01` 会话约定，**按仓库切，不按功能切**。理由是雷都在 dc_llm 那边
+而它正站在上面：今天它修了三个迁移、落了 `/v1` 计量和密钥读取、往生产推了四次。
+这周 `admin-proxy/` 有第二双手，就是 alembic 两个头加生产上一个半开的接口。
+
+**dc_llm 那边（`dc-llm-01` 写）**：三个接口、设备码表的迁移（带全新安装守卫）、
+`poll` 的响应组装、console 里的确认页和路由守卫改动、`/me` 那个「连接你的工具」
+版块的 DC-TERMINAL 分支、二期的 `/v1/me/quota`。迁移从 `p7q8r9s0t1u2` 分出去。
+
+**dc-terminal 这边（本仓库写）**：这份 spec 以及线上契约的最终解释权、dct 客户端
+（start / 开浏览器 / 轮询 / 退避 / 超时）、`View::Pair` 那几屏和失败文案、
+钥匙写入 `secrets.toml` 并**用一次配对填两个 profile 各自的模型名**、`[llm]` 那个勾。
+
+**四条不许越界的规矩：**
+
+1. `admin-proxy/` 和 `console/` 只有 dc_llm 那边提交。这边要改，发消息过去。
+2. 开关打开、真在生产上服务之前，dct 这侧必须先对着它跑通过一次。
+3. 这边合并期间 dc_llm 那边挂起部署；不在合并期就照常从 `dev` 推。
+4. 迁移只有一个头：这边一个都不加。
 
 ## 顺带发现，不在本设计范围内
 
