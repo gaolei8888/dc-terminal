@@ -1,0 +1,119 @@
+//! Task 7：整条配对流程打一个假网关，不碰真实网络。
+//!
+//! 两条测试各自钉住 spec 里最容易悄悄坏掉的一半：
+//! - 一条成功的配对，必须真的经过一次 `pending`——一次就批准的测试永远
+//!   测不到「等」这个状态，而学生大部分时间正待在这个状态里。
+//! - 取消之后哪怕网关随后批准，也不许有一个字节落盘——这是唯一能抓住
+//!   「后台轮询线程活得比学生关掉的那块屏幕还久」这种 bug 的办法。
+
+use dct::proto::{PairTick, Request, Response};
+use std::time::Duration;
+
+mod common;
+
+/// 完整一条：start → pending → approved。断言落盘的三处都对，外加
+/// `opt_in_llm: true` 时 `config.toml` 也真的长出一段 `Config::load`
+/// 认得的 `[llm]`。
+#[test]
+fn a_full_pairing_writes_both_secrets_and_both_model_names() {
+    let gw = common::fake_gateway(vec![
+        // 第一次 poll 还没批准，第二次批准——真实节奏就是这样，一次就成的
+        // 测试测不到「等」这件事。
+        r#"{"status":"pending"}"#,
+        // 这是网关真实回过的形状：免费账号 anthropic 那一组是空的，只有
+        // openai（qwen 方言）那一组有模型名。
+        r#"{"status":"approved","api_key":"sk-live-0123456789abcdef0123456789abcdef01234567",
+            "models":{"anthropic":{},"openai":{"default":"qwen3.5:35b","small_fast":"gemma4:31b"}},
+            "platforms":{"qwen3.5:35b":"local"}}"#,
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let d = common::daemon_with(home.path(), &gw.origin());
+
+    match d.call(Request::PairStart {
+        profile: "dc".into(),
+        opt_in_llm: true,
+    }) {
+        Response::PairStarted(Ok(_)) => {}
+        other => panic!("配对没能起步：{other:?}"),
+    }
+
+    let tick = common::wait_for_tick(&d, "dc", Duration::from_secs(10));
+    assert!(
+        matches!(
+            tick,
+            PairTick::Done {
+                anthropic_ready: false,
+                openai_ready: true,
+            }
+        ),
+        "免费账号只有 openai 那一路：{tick:?}"
+    );
+
+    // 第一处：secrets.toml 里 dc 和 qwen 都拿到了同一把钥匙。
+    let secrets = std::fs::read_to_string(home.path().join("secrets.toml")).unwrap();
+    assert!(secrets.contains("dc"), "{secrets}");
+    assert!(secrets.contains("qwen"), "{secrets}");
+
+    // 第二处：pair-models.toml 里有网关给的两个模型名。
+    let models = std::fs::read_to_string(home.path().join("pair-models.toml")).unwrap();
+    assert!(models.contains("qwen3.5:35b"), "{models}");
+    assert!(models.contains("gemma4:31b"), "{models}");
+    assert!(
+        !models.contains("ANTHROPIC_MODEL"),
+        "免费账号没有 anthropic 那一路，不该编一个模型名出来：{models}"
+    );
+
+    // 第三处：勾了 opt_in_llm，config.toml 长出一段 Config::load 认得的
+    // [llm]——不是「文件里出现了字符串」，是「解析器真的把它读回来了」。
+    let cfg_raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let cfg = dct::config::Config::from_toml(&cfg_raw).unwrap();
+    let llm = cfg.llm.expect("勾了 opt_in_llm，[llm] 应该被写出来");
+    assert_eq!(llm.provider, "qwen", "免费账号只有 openai 那一路能用来自举");
+    assert_eq!(llm.model.as_deref(), Some("qwen3.5:35b"));
+}
+
+/// 取消之后，哪怕网关随后批准了，也一个字节都不许落盘。
+///
+/// 这是唯一能抓住「轮询线程活得比学生关掉的那块屏幕还久」这种 bug 的
+/// 办法：假网关故意晚两秒才批准，`PairCancel` 紧跟在 `PairStart` 后面
+/// 发出去，然后等过批准那一刻，确认磁盘上什么都没多出来。
+#[test]
+fn cancelling_means_nothing_is_ever_written() {
+    let gw = common::fake_gateway_slow_approve(Duration::from_secs(2));
+    let home = tempfile::tempdir().unwrap();
+    let d = common::daemon_with(home.path(), &gw.origin());
+
+    match d.call(Request::PairStart {
+        profile: "dc".into(),
+        opt_in_llm: true,
+    }) {
+        Response::PairStarted(Ok(_)) => {}
+        other => panic!("配对没能起步：{other:?}"),
+    }
+    match d.call(Request::PairCancel {
+        profile: "dc".into(),
+    }) {
+        Response::Ok => {}
+        other => panic!("取消应该总是 Ok：{other:?}"),
+    }
+
+    // 等过假网关「批准」的那一刻，给后台线程留足够的时间——万一它没被
+    // 真的停掉，这段时间够它把钥匙写下去。
+    std::thread::sleep(Duration::from_secs(4));
+
+    assert!(
+        !home.path().join("secrets.toml").exists()
+            || !std::fs::read_to_string(home.path().join("secrets.toml"))
+                .unwrap()
+                .contains("sk-live-should-never-land-on-disk"),
+        "取消之后落盘了，说明后台线程没停"
+    );
+    assert!(
+        !home.path().join("pair-models.toml").exists(),
+        "取消之后模型名不该落盘"
+    );
+    assert!(
+        !home.path().join("config.toml").exists(),
+        "取消之后 [llm] 更不该被自举出来"
+    );
+}

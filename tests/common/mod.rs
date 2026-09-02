@@ -16,11 +16,14 @@
 // `git_repo()`）。逐个文件加 `#[allow(dead_code)]` 太啰嗦，这里整体放开。
 #![allow(dead_code)]
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dct::client::Client;
+use dct::proto::{PairTick, Request, Response};
 
 /// 一个已经起来的守护进程。`home` 是它的 `~/.dct` 替身，跟着这个 handle 的
 /// 生命周期走——测试结束、handle 被 drop，临时目录才被清掉，所以只要 handle
@@ -131,5 +134,211 @@ pub fn posix_tool(name: &str) -> String {
                 String::from_utf8_lossy(&out.stdout).replace('\n', " ")
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 假网关：`tests/pair_flow.rs` 的脚手架。
+//
+// **手写在 `TcpListener` 上，不加依赖。** 这个仓库的依赖树里没有一行 C——
+// 这正是 Windows 学生不用装 Visual Studio Build Tools 就能编译 dct 的原因。
+// 引一个 HTTP 服务器/mock 框架进来会把这条属性用在一个测试文件上就打破。
+// 配对走的又只是「发一个 JSON body，收一个 JSON body」这么单薄的一层协议，
+// 手写起来比拉一个依赖更省事。
+
+/// 一个假的训练营网关：`origin()` 就是它监听的 `http://127.0.0.1:<port>`，
+/// 拿去写进测试 profile 的 `[api].base_url`。
+///
+/// 后台线程会一直 `accept()` 下去，直到测试进程退出——集成测试里每个文件
+/// 编译成独立的二进制，进程结束线程自然收场，不需要显式关闭。
+pub struct FakeGateway {
+    port: u16,
+}
+
+impl FakeGateway {
+    pub fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// 读一条 HTTP/1.1 请求，只要它的请求行（`POST /admin/api/pair/poll ...`）。
+///
+/// **不解析 body。** 假网关的回答只看「敲的是 start 还是 poll 这条路」和
+/// 「这是第几次敲」，从不看学生这边发了什么设备码——`pair_http.rs` 已经有
+/// 单元测试钉住「dct 发出去的 body 长什么样」，这里不用重复验证。不读 body
+/// 会让 `Content-Length` 之后的字节留在 TCP 缓冲区里，但因为每次请求后都
+/// `connection: close`，那点残留字节跟着这条连接一起被扔掉，不会串到下一
+/// 条请求头里。
+fn read_request_path(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        // 请求头以空行结束；请求行永远是第一行，早于这个空行到达。
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn write_json_response(stream: &mut TcpStream, body: &str) {
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+/// `/admin/api/pair/start` 的固定回答。**`interval` 给 1，不是生产的 3**：
+/// 那是网关侧真实的节奏，但测试没有理由为了跟一个节奏保持逼真而多等两秒
+/// 一次——`pair::Machine::new` 把 `interval` 夹到最小 1 秒，1 已经是能测到
+/// 「等」这件事的最小值。
+const START_BODY: &str =
+    r#"{"device_code":"d","user_code":"HJ4K-9QTZ","verify_path":"/pair","interval":1,"expires_in":30}"#;
+
+/// 起一个后台线程，把「给定请求路径 → 该回什么 JSON body」这件事交给
+/// 调用方的闭包决定。`fake_gateway` 和 `fake_gateway_slow_approve` 都是
+/// 在这上面包一层不同的应答策略。
+fn spawn_gateway<F>(mut respond: F) -> FakeGateway
+where
+    F: FnMut(&str) -> String + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let path = read_request_path(&mut stream);
+            let body = respond(&path);
+            write_json_response(&mut stream, &body);
+        }
+    });
+    FakeGateway { port }
+}
+
+/// 一个按队列走的假网关：`/pair/start` 永远回 [`START_BODY`]；`/pair/poll`
+/// 按 `poll_bodies` 的顺序逐条回，用完了就一直重复最后一条——轮询线程在
+/// 收到终止态之前不会停，重复最后一条兜住它万一多敲了一次。
+pub fn fake_gateway(poll_bodies: Vec<&'static str>) -> FakeGateway {
+    let next = std::sync::Mutex::new(0usize);
+    spawn_gateway(move |path| {
+        if path.contains("/pair/start") {
+            return START_BODY.to_string();
+        }
+        let mut i = next.lock().unwrap();
+        let body = poll_bodies
+            .get(*i)
+            .or_else(|| poll_bodies.last())
+            .copied()
+            .unwrap_or(r#"{"status":"pending"}"#);
+        *i += 1;
+        body.to_string()
+    })
+}
+
+/// 一个只在 `delay` 之后才批准的假网关，`cancelling_means_nothing_is_ever_written`
+/// 专用：批准前的每一次 poll 都回 pending，批准之后才回 approved。
+pub fn fake_gateway_slow_approve(delay: Duration) -> FakeGateway {
+    let started_at = Instant::now();
+    spawn_gateway(move |path| {
+        if path.contains("/pair/start") {
+            return START_BODY.to_string();
+        }
+        if started_at.elapsed() >= delay {
+            r#"{"status":"approved","api_key":"sk-live-should-never-land-on-disk",
+                "models":{"anthropic":{},"openai":{"default":"qwen3.5:35b","small_fast":"gemma4:31b"}},
+                "platforms":{"qwen3.5:35b":"local"}}"#
+                .to_string()
+        } else {
+            r#"{"status":"pending"}"#.to_string()
+        }
+    })
+}
+
+/// 一条已经连上假网关的守护进程。跟 [`start_daemon`] 的区别只有一点：
+/// `home` 由调用方给定（测试要在起daemon *之前*往 `home/profiles/dc.toml`
+/// 里写一份指向假网关的 profile），而不是内部自己 new 一个临时目录。
+pub struct Daemon {
+    client: std::sync::Mutex<Client>,
+}
+
+impl Daemon {
+    /// 转发给底层 `Client::call`。用 `Mutex` 包一层是因为
+    /// `Client::call` 要 `&mut self`，而测试里 `d.call(...)` 每次都是对
+    /// 同一个 `d` 变量、不可变地调用——跟真实 TUI 用一条连接反复 `call`
+    /// 的用法一致，也省得测试自己去处理可变借用。
+    pub fn call(&self, req: Request) -> Response {
+        self.client.lock().unwrap().call(req).unwrap()
+    }
+}
+
+/// 起一个连着 `origin` 这个（真的或假的）网关的守护进程。
+///
+/// **`dc` 这份 profile 必须整份手写，不能只写 `[api]`。** `Profile::command`
+/// 没有 `#[serde(default)]`（`profile.rs`），一份只有 `name`/`[api]` 的
+/// 文件在 `load_dir` 眼里是「解析失败」，不是「一份不完整但能用的 profile」，
+/// 那样 `pair_origin` 就找不到这个 profile，配对第一步就会失败在
+/// `no_api_base_url` 上——错的位置离真正想测的东西很远，排查起来很绕。
+pub fn daemon_with(home: &std::path::Path, origin: &str) -> Daemon {
+    let profiles_dir = home.join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    std::fs::write(
+        profiles_dir.join("dc.toml"),
+        format!(
+            "name = \"dc\"\ncommand = [\"echo\"]\n\n[api]\nbase_url = \"{origin}\"\nwire = \"anthropic\"\n"
+        ),
+    )
+    .unwrap();
+
+    let sock = home.join("daemon.sock");
+    let s = sock.clone();
+    std::thread::spawn(move || {
+        let _ = dct::daemon::run(&s);
+    });
+    for _ in 0..50 {
+        if sock.exists() {
+            return Daemon {
+                client: std::sync::Mutex::new(Client::connect(&sock).unwrap()),
+            };
+        }
+        sleep(Duration::from_millis(50));
+    }
+    panic!("守护进程没起来：{}", sock.display());
+}
+
+/// 轮询 `Request::PairPoll` 直到不再是 `Waiting`。
+///
+/// **不能睡一个固定的时长再看一眼。** 配对是 daemon 后台线程在跑，界面
+/// （这里是测试）读到的是一份缓存的 tick——睡多久才够全凭猜，猜少了测试
+/// 就会在机器慢的时候随机失败，猜多了就是白白拖慢每一次跑测试。改成
+/// 「一直问，问到状态变了为止」，快的时候几十毫秒就返回，慢的时候也不会
+/// 因为差一点点就误判成失败。
+pub fn wait_for_tick(d: &Daemon, profile: &str, timeout: Duration) -> PairTick {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Response::PairTick(tick) = d.call(Request::PairPoll {
+            profile: profile.to_string(),
+        }) {
+            if !matches!(tick, PairTick::Waiting) {
+                return tick;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{timeout:?} 内配对都没有走出 Waiting"
+        );
+        sleep(Duration::from_millis(100));
     }
 }
