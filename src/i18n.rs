@@ -1054,7 +1054,9 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Paired on the free plan: only Qwen is ready. Claude needs a paid upgrade on the camp gateway.",
             zh: "配对成功，但这是免费账号：只有 Qwen 那一路能用。Claude 需要在训练营网关上付费升级",
         ),
-        PairManualHint => t!(lang, en: "p to fill in a key by hand instead", zh: "按 p 改成手动填密钥"),
+        PairManualHint => {
+            t!(lang, en: "p to fill in a key by hand instead", zh: "按 p 改成手动填密钥")
+        }
         PairLlmOptIn => t!(
             lang,
             en: "AI error explanations: on (from your [llm] config)",

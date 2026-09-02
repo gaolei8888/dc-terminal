@@ -256,10 +256,7 @@ pub(crate) enum PairPhase {
     /// 成功。免费账号只有 `openai`（Qwen 那一路），必须**明说**——不然
     /// 学生会拿着新配好的账号试 Claude，撞上一个没有任何解释的失败，
     /// 而没人告诉过他这是免费账号的正常边界，付费升级才有 Claude。
-    Done {
-        anthropic: bool,
-        openai: bool,
-    },
+    Done { anthropic: bool, openai: bool },
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
@@ -1509,9 +1506,7 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             ],
             lang,
         ),
-        View::EnterSecret {
-            pairable: true, ..
-        } => help_items(
+        View::EnterSecret { pairable: true, .. } => help_items(
             &[
                 ("", Key::PasteOrTypeKey),
                 ("Ctrl+A", Key::AutoPair),
@@ -1622,8 +1617,13 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
                 PairPhase::Waiting { .. } => {
                     items.push(("o", Key::ReopenBrowser));
                 }
-                PairPhase::Failed { retryable: true, .. } => items.push(("r", Key::Retry)),
-                PairPhase::Failed { retryable: false, .. } | PairPhase::Done { .. } => {}
+                PairPhase::Failed {
+                    retryable: true, ..
+                } => items.push(("r", Key::Retry)),
+                PairPhase::Failed {
+                    retryable: false, ..
+                }
+                | PairPhase::Done { .. } => {}
             }
             items.push(("p", Key::ManualEntry));
             items.push(("Esc", Key::Cancel));
@@ -2693,7 +2693,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: false,
-            pairable: false,
+                pairable: false,
             },
             Lang::Zh,
         );
@@ -2713,7 +2713,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
-            pairable: false,
+                pairable: false,
             },
             Lang::Zh,
         );
@@ -2735,7 +2735,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
-            pairable: false,
+                pairable: false,
             },
             Lang::Zh,
         );

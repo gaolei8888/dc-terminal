@@ -163,9 +163,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
             // profile 认这个键，其余 profile 的密钥输入里 `a` 就是个
             // 普通字母，不能被这条分支吞掉。跟 Ctrl+O 同一条键位规矩
             // （见上面那条注释）：不占用一个字母键，密钥输入本身还要用它。
-            KeyCode::Char('a')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && pairable =>
-            {
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && pairable => {
                 super::pair_view::start_pairing(app, profile);
             }
             // Ctrl+O 不用 o：o 得留给密钥输入本身
@@ -588,7 +586,7 @@ mod tests {
             buf: String::new(),
             phase: SecretPhase::Typing,
             return_to_settings,
-        pairable: false,
+            pairable: false,
         }
     }
 
@@ -688,7 +686,7 @@ mod tests {
             buf: "x".repeat(200),
             phase: SecretPhase::Typing,
             return_to_settings: false,
-        pairable: false,
+            pairable: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
     }
@@ -712,7 +710,7 @@ mod tests {
             buf: "sk-abc123".into(),
             phase: SecretPhase::Typing,
             return_to_settings: false,
-        pairable: false,
+            pairable: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
         assert!(
@@ -742,7 +740,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings,
-            pairable: false,
+                pairable: false,
             };
             term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
             buffer_text(term.backend().buffer())

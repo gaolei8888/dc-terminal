@@ -79,10 +79,8 @@ pub fn parse_poll(status: u16, body: &str) -> Poll {
                 .to_string(),
             models: serde_json::from_value(v.get("models").cloned().unwrap_or(Value::Null))
                 .unwrap_or_default(),
-            platforms: serde_json::from_value(
-                v.get("platforms").cloned().unwrap_or(Value::Null),
-            )
-            .unwrap_or_default(),
+            platforms: serde_json::from_value(v.get("platforms").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default(),
             quota: serde_json::from_value(v.get("quota").cloned().unwrap_or(Value::Null)).ok(),
         },
         "denied" => Poll::Denied,
@@ -158,7 +156,10 @@ mod tests {
                 assert_eq!(api_key, "sk-live");
                 assert_eq!(models.openai.default.as_deref(), Some("qwen3.8:27b"));
                 assert_eq!(models.anthropic.default, None, "免费账号这一组是空的");
-                assert_eq!(platforms.get("qwen3.8:27b").map(String::as_str), Some("local"));
+                assert_eq!(
+                    platforms.get("qwen3.8:27b").map(String::as_str),
+                    Some("local")
+                );
             }
             other => panic!("该是 Approved，实际 {other:?}"),
         }

@@ -75,7 +75,10 @@ pub enum Poll {
     },
     Denied,
     Claimed,
-    Expired { reason: String, message: String },
+    Expired {
+        reason: String,
+        message: String,
+    },
     RateLimited,
     /// 开关关着，网关三个接口一律 404。
     NotEnabled,
@@ -88,7 +91,10 @@ pub enum Tick {
     Done(Box<Approved>),
     /// `retryable` = 按 `r` 换一串码有意义。`ttl` 到点是 true，
     /// `key_unreadable` 是 false——那一种按多少次都走到同一个地方。
-    Expired { retryable: bool, message: String },
+    Expired {
+        retryable: bool,
+        message: String,
+    },
     Failed(String),
 }
 

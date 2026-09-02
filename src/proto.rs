@@ -462,14 +462,18 @@ impl std::fmt::Debug for Request {
                 .finish(),
             // 没有密钥可脱敏——`device_code` 从不出现在 `Request` 里，
             // 它只活在 daemon 自己的内存中（见 `PairStart` 上的注释）。
-            Request::PairStart { profile, opt_in_llm } => f
+            Request::PairStart {
+                profile,
+                opt_in_llm,
+            } => f
                 .debug_struct("PairStart")
                 .field("profile", profile)
                 .field("opt_in_llm", opt_in_llm)
                 .finish(),
-            Request::PairPoll { profile } => {
-                f.debug_struct("PairPoll").field("profile", profile).finish()
-            }
+            Request::PairPoll { profile } => f
+                .debug_struct("PairPoll")
+                .field("profile", profile)
+                .finish(),
             Request::PairCancel { profile } => f
                 .debug_struct("PairCancel")
                 .field("profile", profile)
@@ -932,8 +936,12 @@ mod tests {
                 profile: "p".into(),
                 opt_in_llm: true,
             },
-            Request::PairPoll { profile: "p".into() },
-            Request::PairCancel { profile: "p".into() },
+            Request::PairPoll {
+                profile: "p".into(),
+            },
+            Request::PairCancel {
+                profile: "p".into(),
+            },
             Request::Explanation { id: 1 },
             Request::Scroll {
                 id: 1,

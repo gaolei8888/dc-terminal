@@ -42,7 +42,9 @@ pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
     verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
-use view::{escape_hint, idle_help, message_after_transition, session_ended_notice, PairPhase, View};
+use view::{
+    escape_hint, idle_help, message_after_transition, session_ended_notice, PairPhase, View,
+};
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
 ///
@@ -663,10 +665,11 @@ pub fn run(
                 .pair_last_fetch
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
             if due {
-                if let Ok(Response::PairTick(tick)) = app
-                    .client()
-                    .and_then(|c| c.call(Request::PairPoll { profile: profile.clone() }))
-                {
+                if let Ok(Response::PairTick(tick)) = app.client().and_then(|c| {
+                    c.call(Request::PairPoll {
+                        profile: profile.clone(),
+                    })
+                }) {
                     if let View::Pair { phase: current, .. } = app.view.clone() {
                         app.view = pair_view::apply_tick(app.lang, profile, current, tick);
                     }

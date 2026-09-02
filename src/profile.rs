@@ -1422,10 +1422,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(
-            !p.pairable,
-            "没写 pairable 的 profile 不该被当成可配对"
-        );
+        assert!(!p.pairable, "没写 pairable 的 profile 不该被当成可配对");
     }
 
     /// `dc`/`qwen` 是同一把钥匙、同一个网关的两个方言——两个都要标

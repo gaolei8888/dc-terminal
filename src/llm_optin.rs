@@ -9,7 +9,10 @@
 pub fn enable(config_path: &std::path::Path, provider: &str, model: &str) -> Result<bool, String> {
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
     // 已经有 [llm] 就不动：用户（或上一次配对）已经决定过了。
-    if existing.lines().any(|l| l.trim_start().starts_with("[llm]")) {
+    if existing
+        .lines()
+        .any(|l| l.trim_start().starts_with("[llm]"))
+    {
         return Ok(false);
     }
     let mut out = existing;

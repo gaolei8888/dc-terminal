@@ -35,7 +35,8 @@ pub struct Ready {
 }
 
 /// 侧写文件的第一行。认这行才敢重写——没有它的文件是用户自己写的。
-const MARK: &str = "# 由 dct 配对写入：这个账号在网关上能用的模型名。下次配对会重写。手改请删掉这一行。";
+const MARK: &str =
+    "# 由 dct 配对写入：这个账号在网关上能用的模型名。下次配对会重写。手改请删掉这一行。";
 
 /// `home` 是 dct 的家目录（`socket.parent()`），不是 profiles 目录——这一步
 /// 既要往 `home/secrets.toml` 写钥匙，也要往 `home/pair-models.toml` 写
@@ -88,7 +89,11 @@ fn apply_inner(
         dc_env.insert("ANTHROPIC_MODEL".to_string(), m.clone());
         dc_env.insert(
             "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
-            a.models.anthropic.small_fast.clone().unwrap_or_else(|| m.clone()),
+            a.models
+                .anthropic
+                .small_fast
+                .clone()
+                .unwrap_or_else(|| m.clone()),
         );
     }
     let mut qwen_env = BTreeMap::new();
@@ -96,7 +101,11 @@ fn apply_inner(
         qwen_env.insert("OPENAI_MODEL".to_string(), m.clone());
         qwen_env.insert(
             "OPENAI_SMALL_FAST_MODEL".to_string(),
-            a.models.openai.small_fast.clone().unwrap_or_else(|| m.clone()),
+            a.models
+                .openai
+                .small_fast
+                .clone()
+                .unwrap_or_else(|| m.clone()),
         );
     }
     let mut sections = BTreeMap::new();
@@ -264,7 +273,10 @@ mod tests {
         assert_eq!(store.lock().unwrap().get("dc"), Some("sk-live"));
         let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
         assert!(!raw.contains("ANTHROPIC_MODEL"), "没有就不许写：{raw}");
-        assert!(!raw.contains("[dc]"), "没有模型名就不该有这个 section：{raw}");
+        assert!(
+            !raw.contains("[dc]"),
+            "没有模型名就不该有这个 section：{raw}"
+        );
         assert!(raw.contains("[qwen]"), "{raw}");
     }
 
@@ -294,7 +306,10 @@ mod tests {
         )
         .unwrap();
         let dc = env_for(dir.path(), "dc");
-        assert_eq!(dc.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-x"));
+        assert_eq!(
+            dc.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("claude-x")
+        );
         assert!(env_for(dir.path(), "qwen").is_empty());
         assert!(env_for(dir.path(), "does-not-exist").is_empty());
 
@@ -311,8 +326,7 @@ mod tests {
         let store = Mutex::new(crate::secrets::SecretStore::load(
             &dir.path().join("secrets.toml"),
         ));
-        let calls: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>> =
-            Default::default();
+        let calls: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>> = Default::default();
         let calls2 = calls.clone();
         let hook = move |_path: &Path, provider: &str, model: &str| {
             calls2

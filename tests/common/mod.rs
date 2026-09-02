@@ -207,8 +207,7 @@ fn write_json_response(stream: &mut TcpStream, body: &str) {
 /// 那是网关侧真实的节奏，但测试没有理由为了跟一个节奏保持逼真而多等两秒
 /// 一次——`pair::Machine::new` 把 `interval` 夹到最小 1 秒，1 已经是能测到
 /// 「等」这件事的最小值。
-const START_BODY: &str =
-    r#"{"device_code":"d","user_code":"HJ4K-9QTZ","verify_path":"/pair","interval":1,"expires_in":30}"#;
+const START_BODY: &str = r#"{"device_code":"d","user_code":"HJ4K-9QTZ","verify_path":"/pair","interval":1,"expires_in":30}"#;
 
 /// 起一个后台线程，把「给定请求路径 → 该回什么 JSON body」这件事交给
 /// 调用方的闭包决定。`fake_gateway` 就是在这上面包一层应答策略；

@@ -634,7 +634,11 @@ mod tests {
             },
         );
         let View::Pair {
-            phase: PairPhase::Failed { message: a, retryable: true },
+            phase:
+                PairPhase::Failed {
+                    message: a,
+                    retryable: true,
+                },
             ..
         } = retryable
         else {
@@ -652,7 +656,11 @@ mod tests {
             },
         );
         let View::Pair {
-            phase: PairPhase::Failed { message: b, retryable: false },
+            phase:
+                PairPhase::Failed {
+                    message: b,
+                    retryable: false,
+                },
             ..
         } = not_retryable
         else {

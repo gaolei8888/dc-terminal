@@ -903,7 +903,10 @@ fn handle(
             *recover(phone.lock()) = status.clone();
             Ok(Response::Phone(status))
         }
-        Request::PairStart { profile, opt_in_llm } => {
+        Request::PairStart {
+            profile,
+            opt_in_llm,
+        } => {
             let origin = pair_origin(profiles_dir, &profile);
             match origin {
                 None => Ok(Response::PairStarted(Err("no_api_base_url".into()))),
