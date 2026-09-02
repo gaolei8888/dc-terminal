@@ -453,9 +453,10 @@ pub enum Key {
     GroupNotEmpty,
 
     // —— 配对（跟训练营网关换一把钥匙）——
-    /// `EnterSecret` 屏幕上 Ctrl+A 的说明（profile 是 `"dc"` 时才会出现）。
-    /// 不占用一个字母键——`o` 已经留给密钥输入本身（`Ctrl+O` 那条注释），
-    /// 这里跟它同一个键位规矩。
+    /// `EnterSecret` 屏幕上 Ctrl+A 的说明（`profile.pairable` 为真时才会
+    /// 出现——目前是 `dc` 和 `qwen`，见 `Profile::pairable`，不再是按名字
+    /// 认 `"dc"`）。不占用一个字母键——`o` 已经留给密钥输入本身
+    /// （`Ctrl+O` 那条注释），这里跟它同一个键位规矩。
     AutoPair,
     /// Starting 阶段：已经发出请求，真网络在飞，这一屏没有别的话可说。
     PairContacting,
