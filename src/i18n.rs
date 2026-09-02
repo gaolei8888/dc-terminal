@@ -2112,6 +2112,19 @@ pub mod msg {
             zh: format!("{label} 已经装好了。"),
         )
     }
+
+    /// 设置页顶上那一行——**唯一能跟下载页上「敲 `dct --version` 看到的
+    /// 数字」对上的地方**（界面别处一处都不印版本号）。`version` 从调用方
+    /// 传进来，取自 `env!("CARGO_PKG_VERSION")`（跟 `pair::user_agent()`
+    /// 同一个来源），不在这里写死——写死的字符串会在下一次发版时悄悄
+    /// 变成一句假话，而不会有任何编译错误提醒改这里的人。
+    pub fn dct_version(lang: Lang, version: &str) -> String {
+        t!(
+            lang,
+            en: format!("dct version {version}"),
+            zh: format!("dct 版本 {version}"),
+        )
+    }
 }
 
 #[cfg(test)]
