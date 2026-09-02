@@ -265,8 +265,16 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
             // 一屏也不该是学生填这类密钥的地方，spec 原话是学生根本不该
             // 主动去找「配对」这个词。手动填退化成 `View::Pair` 里随时能按
             // 的 `p`。**不按名字判**——判据长在 profile 上，见字段文档。
+            //
+            // **但只在这台机器还没有这把钥匙的时候。** 配对是「让小白装完
+            // 就能用」那条路，它回答的是「我还没有钥匙」；一行已经配好的
+            // 密钥按 Enter，意思是「我要换掉它」，那是手填那条路的问题，
+            // 而且换钥匙的人通常手里正拿着新的那一串。把这条也劫走，
+            // 等于让唯一一个换钥匙的入口绕一整圈浏览器授权——而两份 README
+            // 描述的新行为本来就是「这台机器还没有钥匙时」，只有选择器
+            // 那条路（`pick.rs` 的 `AskSecret`，按定义就是没钥匙）符合。
             if let Some(e) = target {
-                if e.pairable {
+                if e.pairable && !e.has_secret {
                     let name = e.name.clone();
                     super::pair_view::start_pairing(app, name);
                     return Ok(());
@@ -654,6 +662,27 @@ mod tests {
             matches!(app.view, View::Pair { .. }),
             "选中 dc 按 Enter 该直接进配对屏，不是密钥输入框"
         );
+    }
+
+    /// **已经有钥匙那一行的 Enter 还是手填。** 配对回答的是「我还没有
+    /// 钥匙」；换一把钥匙的人手里拿着新的那一串，不该被劫进一整圈浏览器
+    /// 授权——那会让换钥匙这件事在界面上没有入口。
+    #[test]
+    fn enter_on_a_pairable_row_that_already_has_a_key_still_opens_the_paste_box() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::Secrets {
+            // `ProfileStatus::Ready` 的那一行 `has_secret` 是 true（见 `entry`）
+            entries: vec![with_secret(entry("dc", ProfileStatus::Ready))],
+            state,
+            pending_delete: None,
+        };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        match app.view {
+            View::EnterSecret { ref profile, .. } => assert_eq!(profile, "dc"),
+            _ => panic!("已经配了钥匙的一行该进手填，不该被配对劫走"),
+        }
     }
 
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
