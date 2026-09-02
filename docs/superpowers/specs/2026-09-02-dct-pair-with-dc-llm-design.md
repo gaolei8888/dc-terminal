@@ -57,6 +57,7 @@ dct  开浏览器到 verify_url，同时把 user_code 用大字印在终端上
 
 dct  → POST /admin/api/pair/poll {device_code}     每 2 秒
      ← {status:"pending"} … 直到 ← {status:"approved", api_key, models, quota}
+       （models 是按 wire 分组的**列表**，不是一个名字——见第 1 节）
 ```
 
 **为什么是这条，不是别的两条：**
@@ -114,11 +115,27 @@ POST /admin/api/pair/poll         无认证，device_code 本身即凭据
   ← 429 轮询过快
 ```
 
-`models` 的形状，三个字段各有各的去处：
+### `models` 的形状：按 wire 分组的列表，不是一个名字
+
+**这一条 2026-09-02 修正过**（来源：`dc-llm-01` 会话，已核实）。原稿写的是
+`{"default", "small_fast", "openai"}` 三个固定名字，不成立，两个原因：
+
+- Claude 是**付费限定**。免费账号拿不到，给它写一个 Anthropic 模型名等于配一条
+  跑不通的路。
+- 免费账号默认平台是 `["local", "cloud"]`（`config.py:129`），免费那条路上的模型是
+  `qwen3.8:27b` 一类。
+
+所以按 wire 分组返回**这个账号当前能用的**，dct 各取所需：
 
 ```json
-"models": {"default": "...", "small_fast": "...", "openai": "..."}
+"models": {
+  "anthropic": {"default": "...", "small_fast": "..."},   // 付费才非空
+  "openai":    {"default": "qwen3.8:27b", "small_fast": "..."}
+}
 ```
+
+`anthropic` 为空时 dct 的行为写在第 3 节：`dc` profile 照样配钥匙，但不写模型名，
+也不拿它当 `[llm]` 的 provider——那种账号该走 `qwen`。
 
 ### 四条安全约束
 
@@ -128,33 +145,77 @@ POST /admin/api/pair/poll         无认证，device_code 本身即凭据
 3. **`user_code` 只用来批准，绝不用来领钥匙。** 它短、会被念出口、可能被旁人看见；
    `device_code` 才是凭据，它只在 dct 的内存里待过。
 4. **`start` 按 IP 限流，`poll` 按 `device_code` 限流**（快于 1.5 秒回 429）。
-   `routes_register.py` 里那个 `_PW_FAILS` 进程内节流是现成样板——同样的理由、
-   同样的做法，包括「多副本部署时要搬去 Redis」那条注释。
+   `routes_register.py` 里那个 `_PW_FAILS` 进程内节流是现成样板。**今天成立**：
+   `Dockerfile:30` 是 `hypercorn app.main:app --bind 0.0.0.0:8700`，没有 `--workers`，
+   生产 compose 也没有 `deploy.replicas`——一个容器一个事件循环。但它离失效只有一个
+   flag：加上 `--workers 2`，每个 worker 一份自己的计数器，限流**静悄悄地**失守
+   （`consumer_gate.InFlight` 建立在同一个假设上）。所以这里要的是**启动时的断言或
+   一行日志**，不是一句注释——加副本的那个人不会来读注释。
 
-### 钥匙从哪来
+### 钥匙从哪来：直接读，**绝不 rotate**
 
-调现有 `_key_row` / `my_api_key` 那段逻辑（`routes_free_playground.py:234`）。
-账号还没有可读明文就当场 rotate 一把。那段代码的注释写的就是这件事的理由：
-「一把谁也读不回来的钥匙，就是一把没人能粘进 agent 的钥匙」——明文特意加密存在
-hash 旁边，为的就是今天这个场景。
+明文特意加密存在 hash 旁边，为的就是今天这个场景——`routes_free_playground.py:234`
+那段注释说得很清楚：「一把谁也读不回来的钥匙，就是一把没人能粘进 agent 的钥匙」。
+
+但**不要调 `my_api_key` 那个接口**：它是 `Depends(current_user)` + `_require_consumer`，
+cookie + CSRF，只给浏览器。配对在 `approve` 那一刻手里就有 session，直接调 `_key_row()`
+和 `SettingKV` 解密那两步。
+
+**409 那条路不许 rotate。这是 2026-09-02 修正的一处真危险**（来源：`dc-llm-01`，
+已核实 `routes_free_playground.py:295`）。原稿写「账号没有可读明文就当场 rotate 一把」，
+而 `rotate_my_api_key` 撤销的是**这个租户下每一把 active key**，不是「换一把新的」。
+学生粘在别处的钥匙——他另一台机器上的 dct、一个脚本、一个应用——会跟着一起死，
+而他做的事只是「在训练营网页上点了个确认」。
+
+改成：409 时配对**失败**，屏上说「你这个账号的密钥读不回来了，去
+`dc-llm.tzspace.cn/me` 点『重新生成』再来配对」，并且那个页面上必须写明**旧钥匙会
+全部失效**。撤销是个该由人当面拍板的动作，不是配对流程的副作用。
+
+409 什么时候发生：`SettingKV["playground_key:<uid>"]` 缺失或解不开。注册流程一定会写
+（`routes_register.py:390`），所以只剩早于那套安排的老账号，很少。
+
+**审计要单列一个 reason。** 现在 reveal 记的是 `api_key_revealed`；配对要用自己的
+（`api_key_paired`），否则「钥匙交给了一台设备」和「学生在浏览器里看了一眼自己的
+钥匙」在审计里长得一模一样——出事那天要分的就是这两者。
 
 ### 额度接口
 
-现有 `/admin/api/me/quota` **只认 cookie**，dct 手里只有 key，用不了。新增：
+现有 `/admin/api/me/quota` **只认 cookie**（`auth.py:13`），dct 手里只有 key，用不了。
+
+**`/v1/*` 终结在 admin-proxy，不是 Ollama。** 原稿在这里判断错了：读到的是 GPU 机器上
+那份 appliance Caddyfile；生产用的 `deploy/production/caddy/Caddyfile` 是
+`handle /v1/* { reverse_proxy admin-proxy:8700 }`，`upstream.py:mount_proxy` 在
+FastAPI 上挂一个 `/v1/{full_path:path}` 的 catch-all，先做 key 认证、租户归属、
+限流、预算、内容过滤、审计，再转上游。
+
+所以新接口有现成的窝，也有现成的先例：`routes_public.py::create_public_router` 里
+`/v1/key`、`/v1/usage`、`/v1/credits` 三个都是 Bearer 认证的读接口，走同一个
+`auth.resolve_api_key`。新增：
 
 ```
 GET /v1/me/quota    Authorization: Bearer <api_key>
   ← {used_micro, limit_micro, period_end, plan}
 ```
 
-放在 `/v1/*` 下不是随便挑的：那一段本来就是 key 认证的地盘，`/admin/api/*` 是
-cookie 的地盘。两套认证不混在同一个前缀下。
+**必须注册在 `mount_proxy` 之前**（`main.py:107` 那行注释就是这个意思），否则
+catch-all 会把这个路径吞掉转给上游。
+
+为什么不复用那三个现成的（都看过了，都不是这个东西）：`/v1/usage` 是按天按模型的
+历史 token 数，`/v1/credits` 是充值余额和流水。学生要看的「这个月免费额度还剩多少」
+两个都不回答——那个数在 `consumer_gate.py` 的钱包里。新接口的活就是把它读出来。
 
 ### `/me` 页面的确认 UI
 
 `console/src/views/` 下加一个配对确认页，`verify_url` 指向它。页面上要有：
 学生自己输入或从 URL 带入的 `user_code`、一句「dct 想拿走你的密钥」、
 确认和拒绝两个按钮。**拒绝必须是个真按钮**——没有拒绝的确认页教人闭眼点确认。
+
+**SPA 路由有个坑，不处理这页会跳走**：`console/src/router/index.ts:79` 是
+`if (auth.isConsumer && to.name !== 'my-playground') return { name: 'my-playground' }`
+——消费者账号访问任何别的路由都会被钉回 `/me`。新路由名要加进这个条件。
+
+同时**不要**把它放进 `PUBLIC`（`index.ts:60`）：这条流程的全部意义就是「先登录，
+再确认」，它必须要求 session。另外 SPA 现在从 `/` 提供，运营端在 `/admin/*` 下。
 
 ---
 
@@ -246,7 +307,7 @@ Request::PairCancel { profile: String }  → Response::Ok
 ```toml
 [llm]
 provider = "dc"
-model = "<poll 回来的 models.default>"
+model = "<models.anthropic.default，为空则退到 provider = \"qwen\" + models.openai.default>"
 transport = "http"
 ```
 
@@ -267,13 +328,21 @@ transport = "http"
 （`profile.rs:378` 的 `all_profiles` 已经在做用户目录覆盖仓库的合并），写进那份的
 `[env]`：
 
-- `ANTHROPIC_MODEL` = `models.default`
-- `ANTHROPIC_SMALL_FAST_MODEL` = `models.small_fast`
-- `~/.dct/profiles/qwen.toml` 的 `OPENAI_MODEL` = `models.openai`
+- `~/.dct/profiles/dc.toml` 的 `ANTHROPIC_MODEL` = `models.anthropic.default`
+- 同一份的 `ANTHROPIC_SMALL_FAST_MODEL` = `models.anthropic.small_fast`
+- `~/.dct/profiles/qwen.toml` 的 `OPENAI_MODEL` = `models.openai.default`
 
 两个 Anthropic 变量**都要写**。`dc.toml` 里那段注释已经把理由写死了：claude 那个 CLI
 干活用一个模型，起标题、扫文件这类杂活另外叫一个便宜的快模型，只钉住前一个的话，
 杂活会以课堂上没人查得出来的方式坏掉。
+
+**`models.anthropic` 为空怎么办**（免费账号的常态，Claude 是付费限定）：钥匙照写给
+`dc`，但**不写模型名，也不把 `dc` 当 `[llm]` 的 provider**——那种账号该用 `qwen`，
+`[llm]` 就写 `provider = "qwen"`、`model = models.openai.default`。配对成功屏上多一句
+「你的账号现在走通义千问那条；Claude 需要付费开通」。
+
+写一个跑不通的模型名比不写更坏：学生选了 `DC`，会话起来了，第一句话换回一个 404，
+而屏幕上没有任何东西指向「你的账号没开这个」。
 
 仓库里那两份 profile 保持现在的注释状态，一行不动。
 
@@ -306,7 +375,8 @@ transport = "http"
 | `denied` | 立刻停，屏上说「你在网页上点了拒绝」 |
 | 429 | 退避到 `interval × 2`，不放弃 |
 | `approved` 但 `api_key` 是空串 | 当失败处理，绝不写一个空钥匙进 secrets |
-| `approved` 但没有 `models.default` | 钥匙照写，`[llm]` 不写——`resolve()` 没 model 会拒绝，宁可不开也不写一份跑不起来的配置 |
+| `approved` 但 `models` 两个 wire 都空 | 钥匙照写，`[llm]` 不写——`resolve()` 没 model 会拒绝，宁可不开也不写一份跑不起来的配置 |
+| `approved` 但只有 `models.openai`（免费账号常态） | 钥匙两个 profile 都写，`dc` 不写模型名，`[llm]` 用 `provider = "qwen"` |
 | 网络断 | 不算失败，接着轮询到过期 |
 | `approved` 收到两次 | 第二次忽略，不重复写 secrets |
 
@@ -322,6 +392,21 @@ transport = "http"
 - 过期的 `user_code` 去 `approve` → 400
 - `start` 同 IP 刷 → 429
 - 表里存的是 `device_code` 的 hash 不是明文（直接断言列的内容）
+
+### 网关侧的迁移有个坑
+
+基线迁移是 `Base.metadata.create_all()`
+（`alembic/versions/20260418_1235_44b113166eb6_baseline.py:27`），所以**全新装出来的库
+已经有当前模型声明的每一张表**。新 revision 里不加守卫的 `create_table` 会在全新安装上
+直接炸「table already exists」。抄
+`20260824_1200_f6g7h8i9j0k1_consumer_signup.py` 里的 `_has_table` / `_has_column` /
+`_has_index` 守卫（2026-09-02 那两个修复 `d9b33dd`、`e1ac8b7` 就是踩这个踩出来的）。
+
+另外默认存储是 SQLite（`config.py:9`），Postgres 只在生产：
+
+- 不许 `op.create_unique_constraint`（SQLite 不能往已有表上 ALTER 约束）——用
+  `create_index(..., unique=True)`
+- 不许不带方言判断的 `op.alter_column` 改类型
 
 ### dct 集成测试
 
@@ -353,11 +438,22 @@ start → pending → approved 整条，断言 `secrets.toml` 里两个键都在
 3. dct 合入，`profiles/` 里两个文件不动
 4. 网关上生产，dct 发版
 
+### 一条让这件事今天才安全的前提
+
+消费者的 key 在 `/v1` 上**现在是计量的**（`app/consumer_gate.py`：日钱包、5 小时
+token 窗口、平台准入、每账号一个在飞请求）。在那之前，把一把 key 发出去等于绕过
+所有额度上限。**配对流程之所以现在能做，是因为这一层已经在了**——它哪天被摘掉或绕过，
+这份设计的风险评估就要重做。
+
 ### 撤销义务
 
-配对领出去的每一把钥匙都是可撤的：`POST /admin/api/me/api-key/rotate` 作废旧的。
-学生钥匙泄漏（贴群里、提交进作业仓库）的处置就是这一条。`/me` 页面上要有这个按钮，
-dct 的密钥页里也要提一句它在哪。
+配对领出去的每一把钥匙都是可撤的：`POST /admin/api/me/api-key/rotate`。学生钥匙泄漏
+（贴群里、提交进作业仓库）的处置就是这一条。`/me` 页面上要有这个按钮，dct 的密钥页里
+也要提一句它在哪。
+
+**按钮旁边必须写清它的范围**：这个接口撤销的是该租户下**每一把** active key
+（`routes_free_playground.py:295`），不是「换掉当前这一把」。学生别处配好的 dct、
+脚本、应用会一起停。这正是配对流程自己绝不许悄悄调它的原因（见第 1 节）。
 
 ---
 
