@@ -161,6 +161,19 @@ pub struct App {
     /// 上次自动刷新手机状态的时刻，把轮询压到 300ms 一轮——同
     /// `grid_last_fetch` 一个理由：这是「偶尔扫一眼」的东西，不用每帧都问。
     pub phone_last_fetch: Option<std::time::Instant>,
+    /// 配对起步（`Request::PairStart`）的结果通道。**必须丢给后台线程**：
+    /// 这条请求最终会打真网络（daemon 转发到网关的 `/pair/start`），
+    /// 同 `phone_verify_rx`/`verify_rx` 一个理由，不能堵在按键循环里。
+    /// `Some` 就是「正在起步」这件事的全部真相，见 `View::Pair` 的
+    /// `PairPhase::Starting`。元组里带着发起时的 profile 名，跟
+    /// `verify_rx` 一样在收的时候现比对一遍——用户可能已经 Esc 退出去，
+    /// 一次迟到的结果不该套在一个不相干的视图上。
+    pub pair_start_rx:
+        Option<std::sync::mpsc::Receiver<(String, Result<crate::proto::PairStartedInfo, String>)>>,
+    /// 上次轮询配对状态（`Request::PairPoll`）的时刻，把它压到 500ms 一轮——
+    /// 同 `phone_last_fetch`/`grid_last_fetch` 一个理由，这是「偶尔扫一眼」
+    /// 的东西，不用每帧都问。
+    pub pair_last_fetch: Option<std::time::Instant>,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
@@ -252,6 +265,8 @@ impl App {
             phone_buf: None,
             phone_verify_rx: None,
             phone_last_fetch: None,
+            pair_start_rx: None,
+            pair_last_fetch: None,
             lang,
             socket,
             start_dir: default_dir,

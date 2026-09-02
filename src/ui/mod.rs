@@ -29,6 +29,7 @@ mod attach;
 mod board;
 mod grid;
 mod keys;
+mod pair_view;
 mod phone;
 mod pick;
 mod secret;
@@ -41,7 +42,9 @@ pub use view::{
     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
     verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
-use view::{escape_hint, idle_help, message_after_transition, session_ended_notice, View};
+use view::{
+    escape_hint, idle_help, message_after_transition, session_ended_notice, PairPhase, View,
+};
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
 ///
@@ -459,6 +462,7 @@ pub fn run(
                     prompt,
                     buf,
                     return_to_settings,
+                    pairable,
                     ..
                 } = app.view.clone()
                 {
@@ -481,6 +485,7 @@ pub fn run(
                                 buf,
                                 phase: SecretPhase::Failed(m),
                                 return_to_settings,
+                                pairable,
                             },
                             // 通过：先存盘。存密钥必须先于「开会话」/「回设置页」两条
                             // 后续路径都成立的前提——回设置页要读一份刷新过的 has_secret
@@ -530,6 +535,7 @@ pub fn run(
                                                 app.lang, e,
                                             )),
                                             return_to_settings,
+                                            pairable,
                                         },
                                         _ => View::EnterSecret {
                                             profile,
@@ -544,6 +550,7 @@ pub fn run(
                                                 .into(),
                                             ),
                                             return_to_settings,
+                                            pairable,
                                         },
                                     }
                                 }
@@ -556,6 +563,7 @@ pub fn run(
                                         app.lang, e,
                                     )),
                                     return_to_settings,
+                                    pairable,
                                 },
                                 _ => View::EnterSecret {
                                     profile,
@@ -570,6 +578,7 @@ pub fn run(
                                         .into(),
                                     ),
                                     return_to_settings,
+                                    pairable,
                                 },
                             },
                         };
@@ -619,6 +628,67 @@ pub fn run(
                     app.connected = true;
                 }
                 app.phone_last_fetch = Some(std::time::Instant::now());
+            }
+        }
+
+        // 配对起步的结果，同上面 `verify_rx`/`phone_verify_rx` 一个理由：
+        // 必须在 `term.draw` 之前收，不然这一帧画的还是「正在联系网关…」。
+        if let Some(rx) = &app.pair_start_rx {
+            if let Ok((stamped_profile, outcome)) = rx.try_recv() {
+                app.pair_start_rx = None;
+                // 用户可能已经 Esc/`p` 离开了配对屏，或者（理论上）在
+                // 这条起步结果飞着的时候又开了另一条——用 profile 现比对
+                // 一遍，同 `verify_rx` 收尾那段「视图对不上就不应用」的
+                // 道理，不满足就扔掉，不切视图。
+                if let View::Pair {
+                    profile,
+                    phase: PairPhase::Starting,
+                    opt_in,
+                    return_to,
+                } = app.view.clone()
+                {
+                    if profile == stamped_profile {
+                        app.view =
+                            pair_view::apply_started(&mut app, profile, opt_in, return_to, outcome);
+                    }
+                }
+            }
+        }
+        // 等码的那一屏要能眼看着状态从「等着」变成「成功」/「过期」——
+        // 配对本身是异步的（守护进程在后台线程里一直轮询网关），没有这
+        // 一段轮询，用户守着这一页也看不到任何变化。跟手机页 300ms 一轮
+        // 同一个理由，只是这里按 500ms（配对是「等几分钟」的事，比手机
+        // 通知的「等一下」更松，没必要刷得那么勤）。
+        if let View::Pair {
+            profile,
+            phase: PairPhase::Waiting { .. },
+            opt_in,
+            return_to,
+        } = app.view.clone()
+        {
+            let due = app
+                .pair_last_fetch
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
+            if due {
+                // 这条请求顺带把勾选框的当前值送给 daemon——学生按 `l`
+                // 改的主意只有这一条路能到那边（见
+                // `pair_view::pair_poll_request`）。
+                let req = pair_view::pair_poll_request(profile.clone(), opt_in);
+                if let Ok(Response::PairTick(tick)) = app.client().and_then(|c| c.call(req)) {
+                    // 勾选框的值从**此刻的视图**上重新取一遍：上面那次
+                    // clone 到现在之间，用户完全可能刚按过 `l`。
+                    if let View::Pair {
+                        phase: current,
+                        opt_in,
+                        ..
+                    } = app.view.clone()
+                    {
+                        app.view = pair_view::apply_tick(
+                            app.lang, profile, opt_in, return_to, current, tick,
+                        );
+                    }
+                }
+                app.pair_last_fetch = Some(std::time::Instant::now());
             }
         }
 
@@ -975,6 +1045,7 @@ pub fn run(
             View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             View::Phone { .. } => phone::handle_key(&mut app, key)?,
             View::Web => web::handle_key(&mut app, key)?,
+            View::Pair { .. } => pair_view::handle_key(&mut app, key)?,
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
@@ -2392,6 +2463,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
         View::Phone { .. } => phone::draw(f, chunks[0], app),
         View::Web => web::draw(f, chunks[0], app),
+        View::Pair { .. } => pair_view::draw(f, chunks[0], app),
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
@@ -3083,6 +3155,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         };
 
@@ -3364,6 +3437,7 @@ mod tests {
                 buf: "sk-abc123".into(),
                 phase,
                 return_to_settings: false,
+                pairable: false,
             };
             term.draw(|f| draw(f, &mut app)).unwrap();
         }
@@ -4121,6 +4195,7 @@ mod tests {
                 buf: String::new(),
                 phase: view::SecretPhase::Typing,
                 return_to_settings: true,
+                pairable: false,
             },
             View::EnterSecret {
                 profile: String::new(),
@@ -4132,6 +4207,7 @@ mod tests {
                 buf: String::new(),
                 phase: view::SecretPhase::Typing,
                 return_to_settings: false,
+                pairable: false,
             },
             View::Phone {
                 status: crate::proto::PhoneStatus {

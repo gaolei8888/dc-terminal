@@ -9,6 +9,9 @@
 name = "dc"
 command = ["claude", "--dangerously-skip-permissions"]
 is_agent = true
+# 同一把钥匙、同一个网关的另一个入口是 qwen.toml——它也要写这一行。
+# 见 profile.rs::Profile::pairable 的文档注释。
+pairable = true
 # 下面三条正则跟 `claude.toml` 一模一样，**不是抄的，是同一份实测**：
 # 这个 profile 跑的就是 claude 那个二进制，只换了 `ANTHROPIC_BASE_URL`，
 # 而 base_url 不改变它画在屏幕上的任何东西。换掉命令的那天，这三条
@@ -38,10 +41,13 @@ en = "Requires Node.js"
 
 [env]
 ANTHROPIC_BASE_URL = "https://dc-llm.tzspace.cn"
-# 网关如果做不到「进来什么模型名都落到默认模型」，就把下面两行打开、
-# 填上真名字。**两行都要**：claude 那个 CLI 干活用一个模型，起标题、
-# 扫文件这类杂活另外叫一个便宜的快模型，只钉住前一个的话，杂活会以
-# 课堂上没人查得出来的方式坏掉。
+# 下面两行永远保持注释状态——真的模型名不写在这份文件里。配对成功之后，
+# dct 把它们写进 `~/.dct/pair-models.toml` 的 `[dc]` 段，`session.rs::
+# create_inner` 起会话时把那个侧写文件合进子进程的 env，这份 profile 一个
+# 字节不动。本来想过的路子是往 `~/.dct/profiles/dc.toml` 放一份局部覆盖，
+# 但走不通：`all_profiles` 是整条记录替换，不是逐字段合并（见
+# `pair_apply.rs` 文件头那段），一份只写 `[env]` 两行的局部文件连 `command`
+# 都没有，`Profile::command` 又没有 `#[serde(default)]`，根本解析不过去。
 # ANTHROPIC_MODEL = "..."
 # ANTHROPIC_SMALL_FAST_MODEL = "..."
 

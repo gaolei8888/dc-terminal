@@ -1,6 +1,8 @@
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,12 +12,47 @@ use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
-    ErrorCode, InstallPrompt, PhoneState, PhoneStatus, ProfileEntry, Request, Response,
-    SecretPrompt, WebInfo,
+    ErrorCode, InstallPrompt, PairStartedInfo, PairTick, PhoneState, PhoneStatus, ProfileEntry,
+    Request, Response, SecretPrompt, WebInfo,
 };
 use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_OWNER_KEY, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
 use crate::verify::{send_probe, verify_with, VerifyOutcome};
+
+/// 正在进行的配对，按 profile 名。**`device_code` 只活在这里。**
+/// `Option` 里那个 `cancel` 标志是为了 `PairCancel` 能真的把线程停掉：
+/// 停不掉的话，用户退出去了，后台还在替他领钥匙。
+type PairTable = BTreeMap<String, PairSlot>;
+
+// `started` 只被写入、不被这张表自己读回——真正要用它的是被
+// `spawn_pair_poller` 直接 move 进后台线程闭包的那一份拷贝（出于同样
+// 理由，它会在轮询线程结束后跟着线程一起消失）。留在 `PairSlot` 上是
+// 因为这张表是配对状态唯一对外可查的地方：将来任何要在不碰后台线程的
+// 前提下问「这条配对当初是哪个 device_code」的代码（诊断、网页）都该
+// 来读这里，而不是各自再想办法把这份状态传一遍。
+// `opt_in_llm` 不在此列——它是真的共享状态，`PairPoll` 写、后台线程读。
+#[allow(dead_code)]
+struct PairSlot {
+    started: crate::pair::Started,
+    tick: PairTick,
+    /// 学生在配对屏上勾没勾「报错看不懂时让 AI 解释」，跟着这条配对一路
+    /// 带到后台线程结束的那一刻——落盘（`pair_apply::apply`）发生在那时候，
+    /// 界面早已经不在这条调用栈上了。
+    ///
+    /// **是 `Arc<AtomicBool>` 而不是 `bool`，因为这个值会变。** 学生是在
+    /// `PairStart` 已经发出去之后才在屏幕上看见那行文案的（那一屏要等
+    /// 网关先回一串码），他随后按 `l` 改主意时，唯一还在飞的请求是每
+    /// 500ms 一次的 `PairPoll`——那条请求于是捎着当前值，落在这里，
+    /// 后台线程在真正落盘的那一刻读它。共享一格而不是各存一份，是因为
+    /// 「学生最后一次点头是什么」只能有一个答案。
+    ///
+    /// **只往一个方向变：true→false，一次配对之内不可逆。** 写它的
+    /// `PairPoll` 分支用的是 `fetch_and` 而不是 `store`，理由写在那里：
+    /// 界面和轮询线程两条时钟对不齐，而「学生当面拒绝了却因为抢输被当成
+    /// 同意」是这个 bool 唯一不能出的错。
+    opt_in_llm: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+}
 
 pub fn run(socket: &Path) -> Result<()> {
     let mgr = SessionManager::new();
@@ -60,6 +97,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         socket,
     ))));
     let profiles_dir = profiles_dir_for_socket(socket);
+    // `pair-models.toml` 锚在跟 `profiles_dir` 同一层的家目录下——见
+    // `pair_apply.rs` 文件头和 `spawn_pair_poller` 上面 Ruling 1 那段：
+    // `profiles_dir` 本身就是 `home/profiles`，往上退一层就是那个锚。
+    if let Some(home) = profiles_dir.parent() {
+        mgr.set_pair_models_home(home.to_path_buf());
+    }
 
     // 上次守护进程还活着时留下的会话清单——**先读出来，再装路径**。
     // 装路径本身不写盘（`set_last_sessions_path` 只记一个 `PathBuf`），
@@ -169,6 +212,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 不是装了 dct 就有的默认行为。
     let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
 
+    // 正在进行的配对，按 profile 名。跟 `secrets`/`phone` 一样是长活在
+    // 这个进程里的共享状态，同样的理由：多个连接（桌面、后面 Task 6 的
+    // 网页）都可能问起同一条正在跑的配对。
+    let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -179,8 +227,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let br = bridge.clone();
         let et = event_tx.clone();
         let wb = web.clone();
+        let pr = pairs.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -484,6 +533,7 @@ fn serve(
     bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: std::sync::mpsc::Sender<Event>,
     web: Arc<Mutex<Option<crate::web::Server>>>,
+    pairs: Arc<Mutex<PairTable>>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -506,6 +556,7 @@ fn serve(
                 &bridge,
                 &event_tx,
                 Some(&web),
+                &pairs,
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -533,6 +584,7 @@ fn handle(
     // 挡在路由里的话，将来谁加一条新路由就可能顺手把它绕过去，而这里
     // 拿不到 `web` 是物理上做不到。
     web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
+    pairs: &Arc<Mutex<PairTable>>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -599,6 +651,7 @@ fn handle(
                         }),
                         has_secret,
                         backend_only: p.backend_only,
+                        pairable: p.pairable,
                     }
                 })
                 .collect();
@@ -837,6 +890,7 @@ fn handle(
             phone,
             bridge,
             event_tx,
+            pairs,
         )),
         Request::WebDisable => Ok(web_disable(web)),
         Request::PhoneDisable => {
@@ -859,6 +913,89 @@ fn handle(
             };
             *recover(phone.lock()) = status.clone();
             Ok(Response::Phone(status))
+        }
+        Request::PairStart {
+            profile,
+            opt_in_llm,
+        } => {
+            let origin = pair_origin(profiles_dir, &profile);
+            match origin {
+                None => Ok(Response::PairStarted(Err("no_api_base_url".into()))),
+                Some(origin) => {
+                    let agent = crate::pair_http::agent();
+                    match crate::pair_http::start(&origin, &agent) {
+                        Err(e) => Ok(Response::PairStarted(Err(e))),
+                        Ok(started) => {
+                            // 给界面的那一面**不带** `device_code`——
+                            // `PairStartedInfo` 的类型本身就装不下它，见它
+                            // 上面的注释和 `proto.rs` 那条钉住这件事的测试。
+                            let info = PairStartedInfo {
+                                user_code: started.user_code.clone(),
+                                verify_path: started.verify_path.clone(),
+                                expires_in: started.expires_in,
+                            };
+                            // Ruling 1: `pair_apply::apply` 要的是 dct 的家
+                            // 目录，不是 profiles 目录——落盘既可能写
+                            // `home/secrets.toml` 也可能写 `home/profiles/`，
+                            // 两者是同一个锚下的两个子路径。`profiles_dir`
+                            // 本身就是 `home/profiles`（见
+                            // `profile::profiles_dir_for_socket`），
+                            // 往上退一层就是那个锚。
+                            let home = profiles_dir
+                                .parent()
+                                .map(Path::to_path_buf)
+                                .unwrap_or_else(|| profiles_dir.to_path_buf());
+                            spawn_pair_poller(
+                                &profile,
+                                &origin,
+                                started,
+                                opt_in_llm,
+                                pairs.clone(),
+                                secrets.clone(),
+                                home,
+                            );
+                            Ok(Response::PairStarted(Ok(info)))
+                        }
+                    }
+                }
+            }
+        }
+        Request::PairPoll {
+            profile,
+            opt_in_llm,
+        } => {
+            let pairs = recover(pairs.lock());
+            let slot = pairs.get(&profile);
+            // 顺带把勾选框的当前值收下——界面每 500ms 发一次这条请求，
+            // 学生按 `l` 改的主意就是这么传过来的（见
+            // `proto::Request::PairPoll` 的字段注释）。
+            //
+            // **`fetch_and` 而不是 `store`：`false` 一旦落进来就再也翻不
+            // 回去。** 这两条时钟对不齐——界面每 500ms 捎一次当前值，轮询
+            // 线程每 250ms 醒一次、网关一回 `approved` 就立刻落盘，所以
+            // 落盘那一刻读到的值不保证是学生屏幕上的那个。两个方向都会
+            // 抢输，但只有一个方向是不能接受的：默认勾着的那个抢输，学生
+            // 停在他看见过、也没有反对过的值上；而**取消勾选抢输，是学生
+            // 当面读完代价、明确拒绝了，然后这个拒绝输给了一次网络往返，
+            // 之后 dct 照样把他终端上的报错原文发给第三方**。`config.rs`
+            // 开头那段隐私边界的全部依据是「有个人当面看着代价点了头」，
+            // 一个会输掉的「不」等于没有点头。所以这一格只允许 true→false。
+            //
+            // 代价是学生取消勾选之后再勾回来，这一次配对不认了。那是可以
+            // 接受的：他事后随时能从设置里打开（`llm_optin` 那条路还在），
+            // 而反过来那一半是不可逆的——报错原文已经发出去了。
+            if let Some(slot) = slot {
+                slot.opt_in_llm.fetch_and(opt_in_llm, Ordering::SeqCst);
+            }
+            Ok(Response::PairTick(
+                slot.map(|s| s.tick.clone()).unwrap_or(PairTick::Waiting),
+            ))
+        }
+        Request::PairCancel { profile } => {
+            if let Some(slot) = recover(pairs.lock()).remove(&profile) {
+                slot.cancel.store(true, Ordering::SeqCst);
+            }
+            Ok(Response::Ok)
         }
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
@@ -948,6 +1085,7 @@ fn web_enable(
     phone: &Arc<Mutex<PhoneStatus>>,
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: &std::sync::mpsc::Sender<Event>,
+    pairs: &Arc<Mutex<PairTable>>,
 ) -> Response {
     let Some(web) = web else { return web_refused() };
     let mut slot = recover(web.lock());
@@ -975,7 +1113,7 @@ fn web_enable(
 
     // **HTTP 那一路走的是同一个 `handle`**，只是 `web` 传 `None`。
     // 另写一份分派等于养出第二套真相，而手机看到的东西必须跟桌面一致。
-    let (m, s, sec, pd, ph, br, et) = (
+    let (m, s, sec, pd, ph, br, et, pr) = (
         mgr.clone(),
         store.clone(),
         secrets.clone(),
@@ -983,8 +1121,9 @@ fn web_enable(
         phone.clone(),
         bridge.clone(),
         event_tx.clone(),
+        pairs.clone(),
     );
-    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None);
+    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr);
     let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
     let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
     let port = server.addr().port();
@@ -1002,6 +1141,160 @@ fn web_disable(web: Option<&Arc<Mutex<Option<crate::web::Server>>>>) -> Response
         url: None,
         address_unknown: false,
     })
+}
+
+/// 配对用哪个 origin：从这个 profile 的 `[api].base_url` 里取，**只取 origin**。
+/// 这是整条流程的信任锚——它随仓库发布，不来自网络（spec 里那段
+/// 「origin 是信任锚，路径是配置」）。
+///
+/// `pub(crate)`：`ui::pair_view` 也要用它，而且必须用**同一个函数**——
+/// 界面进程独立算一遍 origin 正是「不信线上答复」这条安全属性的落点
+/// （`PairStartedInfo` 连一个 origin 字段都没有），两边分别抄一份逻辑
+/// 只会在某一天悄悄漂开，那时候这条安全属性就名存实亡了。
+pub(crate) fn pair_origin(profiles_dir: &Path, profile: &str) -> Option<String> {
+    let (all, _) = all_profiles(profiles_dir);
+    let base = all
+        .iter()
+        .find(|p| p.name == profile)?
+        .api
+        .as_ref()?
+        .base_url
+        .clone();
+    let rest = base.split_once("://")?;
+    let host = rest.1.split('/').next()?;
+    Some(format!("{}://{}", rest.0, host))
+}
+
+/// 轮询线程一次迭代的核心逻辑，从 `spawn_pair_poller` 里抽出来，为的是
+/// 不起线程、不打真网络就能测「取消到达之后这里绝不会再落盘」这条属性。
+///
+/// 返回 `None` 表示这次迭代不该在任何地方留下痕迹——`pairs` 表不写、钥匙
+/// 也不写：`send` 阻塞的那段时间（真实世界里是最多 `pair_http::TIMEOUT`
+/// 那么久的一次 HTTP 等待）足够让 `PairCancel` 落地、把表项删掉，如果
+/// 这次迭代还是照常把 tick 写回去或者把钥匙落盘，学生按了 Esc 却什么都
+/// 没被取消——`Some(tick)` 的调用方因此也不该在 `None` 时碰 `pairs` 表。
+fn pair_poll_once(
+    machine: &mut crate::pair::Machine,
+    now: std::time::Instant,
+    cancel: &AtomicBool,
+    send: &dyn Fn(&str) -> Result<crate::pair::Poll, String>,
+    apply: &dyn Fn(&crate::pair::Approved) -> Result<crate::pair_apply::Ready, String>,
+) -> Option<PairTick> {
+    let tick = machine.step(now, send);
+    // **取消要在这里再查一次，不能只信循环开头那次。** 从那次检查到这里，
+    // 线程至少睡了 250ms，`send`（真实实现里就是一次 HTTP 请求）还可能
+    // 又花了最多 `pair_http::TIMEOUT` 那么久——`PairCancel` 落在这段窗口
+    // 里的话，标志已经置上、表项已经从 `pairs` 里删掉，而这条线程如果
+    // 对着一张已经不存在的表项继续往下写，学生看到的就是"取消了"而实际
+    // 什么都没停。
+    if cancel.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(match tick {
+        crate::pair::Tick::Waiting => PairTick::Waiting,
+        crate::pair::Tick::Expired { retryable, message } => {
+            PairTick::Expired { retryable, message }
+        }
+        crate::pair::Tick::Failed(e) => PairTick::Failed(e),
+        crate::pair::Tick::Done(a) => {
+            // **取消要在这里再查一次，不能只在循环开头查。** 那一次检查之
+            // 后，线程还要睡 250ms、再花最多 `pair_http::TIMEOUT` 等一个
+            // HTTP 响应——`PairCancel` 落在这段窗口里的话，标志已经置上、
+            // 表项已经删掉，而这条线程照样会把钥匙写进 secrets。学生按了
+            // Esc，以为什么都没发生。
+            //
+            // 网关那边这把钥匙已经标成 claimed 了，所以这里放弃它是真的
+            // 放弃：那正是取消该有的语义，不是遗憾的副作用。
+            if cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            match apply(&a) {
+                Ok(ready) => PairTick::Done {
+                    anthropic_ready: ready.anthropic,
+                    openai_ready: ready.openai,
+                    // 报的是 `apply` 真的做了什么，不是勾选框的值——
+                    // 见 `pair_apply::Ready::llm_written`。
+                    llm_written: ready.llm_written,
+                },
+                Err(e) => PairTick::Failed(e),
+            }
+        }
+    })
+}
+
+/// 起一条配对的后台轮询线程，登记进 `pairs` 表。
+///
+/// `home` 是 dct 的家目录（`socket.parent()`）——`pair_apply::apply` 既要往
+/// `home/secrets.toml` 写钥匙，也要往 `home/pair-models.toml` 写模型名，
+/// 两者是同一个锚下的两个子路径，跟 `secrets_path_for_socket` 用的是同一个
+/// 锚，才能让测试按 socket 隔离。（模型名不写进 `home/profiles/`：一份
+/// user-dir profile 会整份替换内置的那份，而 `Profile.command` 没有 serde
+/// 默认值，半份 profile 根本解析不出来——这条路已经在 Task 4 里被否掉了。）
+#[allow(clippy::too_many_arguments)]
+fn spawn_pair_poller(
+    profile: &str,
+    origin: &str,
+    started: crate::pair::Started,
+    opt_in_llm: bool,
+    pairs: Arc<Mutex<PairTable>>,
+    secrets: Arc<Mutex<SecretStore>>,
+    home: PathBuf,
+) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let opt_in_llm = Arc::new(AtomicBool::new(opt_in_llm));
+    // **顶掉一条旧配对就要先把它停了。** 这张表一个 profile 只有一格，
+    // 学生按 `r` 重来（或者界面超时之后重发一条 `PairStart`）时，
+    // `insert` 会把上一条的 `PairSlot` 悄悄丢掉——而那条的轮询线程还活着，
+    // 它的取消标志刚刚跟着 `PairSlot` 一起消失，从此没有任何人握着它。
+    // 那条孤儿线程会接着打网关，可能在学生早已取消之后还把一把钥匙写进
+    // secrets，还会把自己的 tick 写进这一格（`get_mut(&profile)` 认的是
+    // profile 名，不是线程），让新的一条读到旧的状态。置上标志，
+    // 让它自己在下一次循环开头退出——`PairCancel` 走的是同一条路。
+    if let Some(old) = recover(pairs.lock()).insert(
+        profile.to_string(),
+        PairSlot {
+            started: started.clone(),
+            tick: PairTick::Waiting,
+            opt_in_llm: opt_in_llm.clone(),
+            cancel: cancel.clone(),
+        },
+    ) {
+        old.cancel.store(true, Ordering::SeqCst);
+    }
+    let (profile, origin) = (profile.to_string(), origin.to_string());
+    std::thread::spawn(move || {
+        let agent = crate::pair_http::agent();
+        let mut machine = crate::pair::Machine::new(started, std::time::Instant::now());
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            // 短睡是为了让 `PairCancel` 响应得快——真正「到点才发」由
+            // `Machine::step` 自己判断，睡多短都不会多打一次网络。
+            std::thread::sleep(Duration::from_millis(250));
+            let send = |dc: &str| crate::pair_http::poll(&origin, dc, &agent);
+            let apply = |a: &crate::pair::Approved| {
+                // 落盘在这里做完，钥匙不过 socket。**勾选框的值在这一刻
+                // 才读**，不是起步那一刻：学生是在看见那行文案之后才决定
+                // 的，`PairPoll` 一路把他的最新答案捎到了这一格。
+                crate::pair_apply::apply(a, &home, &secrets, opt_in_llm.load(Ordering::SeqCst))
+            };
+            let now = std::time::Instant::now();
+            let projected = match pair_poll_once(&mut machine, now, &cancel, &send, &apply) {
+                Some(p) => p,
+                // 取消在这次迭代里追上了我们：`pair_poll_once` 的文档注释
+                // 说得很清楚，这种情况下什么都不该写，直接退出线程。
+                None => return,
+            };
+            let done = !matches!(projected, PairTick::Waiting);
+            if let Some(slot) = recover(pairs.lock()).get_mut(&profile) {
+                slot.tick = projected;
+            }
+            if done {
+                return;
+            }
+        }
+    });
 }
 
 fn phone_set_token_failure_message(e: ChannelError) -> String {
@@ -1041,6 +1334,176 @@ mod tests {
     /// 同上——大多数测试不关心手机通知，`bridge` 槽给个空的就行。
     fn test_bridge() -> Arc<Mutex<Option<crate::bridge::BridgeHandle>>> {
         Arc::new(Mutex::new(None))
+    }
+
+    /// 同上——大多数测试不关心配对，给一张空表就行。
+    fn test_pairs() -> Arc<Mutex<PairTable>> {
+        Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    fn test_pair_started() -> crate::pair::Started {
+        crate::pair::Started {
+            device_code: "d".into(),
+            user_code: "HJ4K-9QTZ".into(),
+            verify_path: "/pair".into(),
+            interval: 0, // 0 秒间隔：测试里第一次 `step` 就该到点发请求
+            expires_in: 900,
+        }
+    }
+
+    fn test_approved() -> crate::pair::Poll {
+        crate::pair::Poll::Approved {
+            api_key: "sk-live".into(),
+            models: crate::pair::Models::default(),
+            platforms: Default::default(),
+            quota: None,
+        }
+    }
+
+    /// **Critical 回归测试。** 取消如果只在循环开头查一次，`send`（真实
+    /// 世界里是一次可能耗时 `pair_http::TIMEOUT` 的 HTTP 请求）返回的
+    /// 那一刻，取消标志即使已经在这段时间里被置上，旧代码也会视而不见，
+    /// 照常把 `Tick::Done` 落盘——学生按了 Esc，钥匙还是被写了下去。
+    ///
+    /// 这里用 `send` 闭包本身去模拟"取消恰好在等待网络响应期间到达"：
+    /// `send` 被调用时才把标志置上，紧接着返回 `Approved`，也就是最坏的
+    /// 那种时序——`pair_poll_once` 必须在这之后、落盘之前再查一次，
+    /// 发现已取消就直接放弃，`apply` 一次都不该被调用。
+    #[test]
+    fn a_cancel_that_lands_while_waiting_on_the_network_wins_over_a_pending_approval() {
+        let t0 = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut machine = crate::pair::Machine::new(test_pair_started(), t0);
+        let applied = std::cell::Cell::new(false);
+        let send = |_: &str| {
+            // 时序：`Machine::step` 已经决定要发这次请求，`send` 正在
+            // "打网络"——这一刻用户按了 Esc。
+            cancel.store(true, Ordering::SeqCst);
+            Ok(test_approved())
+        };
+        let apply = |_: &crate::pair::Approved| {
+            applied.set(true);
+            Ok(crate::pair_apply::Ready {
+                anthropic: true,
+                openai: true,
+                llm_written: false,
+            })
+        };
+
+        // t0 + 1s：`test_pair_started` 的 `interval` 被 `Machine::new` 夹到
+        // 最小 1 秒，这里让时间过了到点，`step` 才会真的调用 `send`。
+        let due = t0 + Duration::from_secs(1);
+        let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
+
+        assert!(result.is_none(), "取消之后这次迭代不该产生任何 tick");
+        assert!(!applied.get(), "取消之后绝不能把钥匙落盘");
+    }
+
+    /// 对照组：没有取消的话，`Tick::Done` 照常落盘、照常报 `Done`——
+    /// 免得上面那条测试是靠一个永远返回 `None` 的桩糊弄过去的。
+    #[test]
+    fn without_a_cancel_an_approval_is_applied_and_reported() {
+        let t0 = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut machine = crate::pair::Machine::new(test_pair_started(), t0);
+        let applied = std::cell::Cell::new(false);
+        let send = |_: &str| Ok(test_approved());
+        let apply = |_: &crate::pair::Approved| {
+            applied.set(true);
+            Ok(crate::pair_apply::Ready {
+                anthropic: true,
+                openai: false,
+                llm_written: false,
+            })
+        };
+
+        let due = t0 + Duration::from_secs(1);
+        let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
+
+        assert!(applied.get(), "没取消就该落盘");
+        match result {
+            Some(PairTick::Done {
+                anthropic_ready,
+                openai_ready,
+                ..
+            }) => {
+                assert!(anthropic_ready);
+                assert!(!openai_ready);
+            }
+            other => panic!("该是 Done，实际 {other:?}"),
+        }
+    }
+
+    /// 取消也要能拦住一个已经跑到终态、但还没写回 `pairs` 表的 tick——
+    /// 不止拦落盘，普通的 `Expired`/`Failed` 同样不该在取消之后被写回去，
+    /// 不然界面已经关掉的那个屏幕会看见一个它没资格再看见的终态。
+    #[test]
+    fn a_cancel_also_suppresses_a_stale_terminal_tick_that_is_not_an_approval() {
+        let t0 = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut machine = crate::pair::Machine::new(test_pair_started(), t0);
+        let send = |_: &str| {
+            cancel.store(true, Ordering::SeqCst);
+            Ok(crate::pair::Poll::Denied)
+        };
+        let apply = |_: &crate::pair::Approved| panic!("denied 不该走到 apply");
+
+        let due = t0 + Duration::from_secs(1);
+        let result = pair_poll_once(&mut machine, due, &cancel, &send, &apply);
+
+        assert!(result.is_none(), "取消之后即使是普通终态也不该写回表");
+    }
+
+    /// **顶掉一格就要停掉住在那一格里的线程。** 一个 profile 只有一格：
+    /// 学生按 `r` 重来、或者界面 5 秒超时之后重发一条 `PairStart`，第二次
+    /// `spawn_pair_poller` 会 `insert` 到同一个键上，第一条的 `PairSlot`
+    /// （连同唯一一份取消标志）就这么没了，而它的线程还活着——它会接着打
+    /// 网关、可能在学生取消之后还落一把钥匙，还会把自己的 tick 写进这一格
+    /// 让新的一条读到旧状态。
+    ///
+    /// origin 指着一个必然拒绝连接的地址，两条线程都会很快自己失败退出；
+    /// 这条测试要的不是它们的结局，是**第一条的取消标志被置上了**——那正是
+    /// 它自己会在下一次循环开头看见并退出的信号。
+    #[test]
+    fn starting_a_second_pairing_cancels_the_poller_it_displaces() {
+        let pairs = test_pairs();
+        let home = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Mutex::new(SecretStore::load(
+            &home.path().join("secrets.toml"),
+        )));
+        // 端口 1 上不会有人监听——两条线程都会立刻拿到 connection refused。
+        let origin = "http://127.0.0.1:1";
+
+        spawn_pair_poller(
+            "dc",
+            origin,
+            test_pair_started(),
+            false,
+            pairs.clone(),
+            secrets.clone(),
+            home.path().to_path_buf(),
+        );
+        let first = recover(pairs.lock())
+            .get("dc")
+            .expect("第一条该在表里")
+            .cancel
+            .clone();
+        assert!(!first.load(Ordering::SeqCst), "前提：第一条还没被取消");
+
+        spawn_pair_poller(
+            "dc",
+            origin,
+            test_pair_started(),
+            false,
+            pairs,
+            secrets,
+            home.path().to_path_buf(),
+        );
+
+        assert!(
+            first.load(Ordering::SeqCst),
+            "被顶掉的那条轮询线程成了孤儿：没有任何人还握着它的取消标志"
+        );
     }
 
     /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
@@ -1291,6 +1754,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -1325,6 +1789,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -1383,6 +1848,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -1450,6 +1916,7 @@ mod tests {
                 &test_bridge(),
                 &test_event_tx(),
                 None,
+                &test_pairs(),
             );
             (t.elapsed(), resp)
         });
@@ -1495,6 +1962,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -1555,6 +2023,7 @@ mod tests {
                 &test_bridge(),
                 &test_event_tx(),
                 None,
+                &test_pairs(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -1588,6 +2057,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -1674,6 +2144,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1721,6 +2192,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -1780,6 +2252,7 @@ mod tests {
             &test_bridge(),
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -1833,6 +2306,7 @@ mod tests {
             &bridge,
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -1903,6 +2377,7 @@ mod tests {
             &bridge,
             &test_event_tx(),
             None,
+            &test_pairs(),
         );
 
         match resp {
@@ -2130,6 +2605,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2245,6 +2721,7 @@ mod web_tests {
         phone: Arc<Mutex<PhoneStatus>>,
         bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
         tx: std::sync::mpsc::Sender<Event>,
+        pairs: Arc<Mutex<PairTable>>,
         /// 临时目录得跟着 fixture 活着，不然 secrets/projects 的路径当场失效。
         _dir: tempfile::TempDir,
     }
@@ -2263,6 +2740,7 @@ mod web_tests {
                 &self.phone,
                 &self.bridge,
                 &self.tx,
+                &self.pairs,
             )
         }
     }
@@ -2282,6 +2760,7 @@ mod web_tests {
             })),
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
+            pairs: Arc::new(Mutex::new(BTreeMap::new())),
             _dir: dir,
         }
     }

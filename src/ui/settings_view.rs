@@ -10,9 +10,9 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use crate::i18n::{text, Key, Lang};
+use crate::i18n::{msg, text, Key, Lang};
 use crate::proto::{Request, Response};
 use crate::settings::{save_bar_theme, save_lang, settings_path_for_socket};
 
@@ -264,7 +264,20 @@ fn draw_settings_items(f: &mut Frame, area: Rect, app: &mut App, state: &ListSta
 
     let mut s = state.clone();
     let body = super::widgets::header(f, area, text(Key::SettingsTitle, app.lang), rule(app));
-    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut s);
+    // 版本号只有 `dct --version` 打得出来，界面里原来一处都没有——ai-mania
+    // 下载页让学生装完敲这条命令跟页面上的数字对，界面上没有可对的东西。
+    // 放在设置页第一行而不是底栏：底栏宽度是死的，`fit_help` 窄屏下会
+    // 整条丢按键（见 `SwitchProject` 那条注释），加一个版本号等于挤掉
+    // 一个键；设置页才是「让学生去那儿看一眼」说得出口的地方。
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            msg::dct_version(app.lang, env!("CARGO_PKG_VERSION")),
+            dim(),
+        ))),
+        rows[0],
+    );
+    f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), rows[1], &mut s);
 }
 
 /// 表头那条细线的颜色：断连时整条变红，跟原来边框的行为一致。
@@ -762,6 +775,32 @@ mod tests {
         assert!(
             c.contains(text(Key::Phone, app.lang)),
             "顶层要写「Phone」这个设置项：{c}"
+        );
+    }
+
+    /// **ai-mania 下载页让学生装完敲 `dct --version` 确认，界面里原来一处
+    /// 都不印这个数字，学生手上没有可对的东西。** 断言的是
+    /// `env!("CARGO_PKG_VERSION")` 这个常量本身，不是写死的版本号字面
+    /// 量——写死的数字会在下一次发版时变红，而那次变红跟这次改动毫无
+    /// 关系，只会教会维护者无视这条测试的失败。
+    #[test]
+    fn the_settings_page_shows_the_running_version() {
+        let (mut app, _dir) = App::test_app();
+        on_settings_items(&mut app, 0);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        let c: String = (0..a.height)
+            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            c.contains(env!("CARGO_PKG_VERSION")),
+            "设置页第一行要印着运行中的版本号：{c}"
         );
     }
 }

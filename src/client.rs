@@ -8,7 +8,10 @@ use crate::sys::ipc::Stream;
 
 /// 读超时：TUI 主循环在 `term.draw` 之前会先发 `List`，守护进程一卡住整个界面
 /// 就会跟着冻结，连 `q` 都按不动。5 秒对正常操作留了充分余量。
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// `pub(crate)`：`pair_http` 的超时必须能被断言压在这个数之内——
+/// `/pair/start` 是同步的，界面那条连接就在它上面等。让那条测试引用
+/// 这个常量而不是抄一个 `5`，是为了将来改这里的人会看到红。
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 换掉 socket 那头的守护进程：先请它走，走不动就硬来，然后拉一个新的
 /// 起来，确认新的真的能服务了才返回。

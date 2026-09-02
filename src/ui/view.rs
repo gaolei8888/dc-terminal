@@ -156,6 +156,11 @@ pub(crate) enum View {
         /// （意图是开工）。两条路都会落到这同一个视图，成功之后该去哪不能靠
         /// 猜——建这个视图的地方必须显式填它，别指望靠别的字段反推。
         return_to_settings: bool,
+        /// 这个 profile 能不能靠配对拿到密钥（`profile::Profile::pairable`
+        /// 经 `ProfileEntry` 过桥）。Ctrl+A 认不认这个键，就靠这里，而不是
+        /// 再去按 `profile == "dc"` 猜——那正是这个字段要消灭的写法，见
+        /// `Profile::pairable` 的文档注释。
+        pairable: bool,
     },
     /// 「全部按键」浮层：底栏放不下的键都在这里。`?` 开，`Esc` 回。
     ///
@@ -203,6 +208,126 @@ pub(crate) enum View {
     /// 塞在视图里的状态会被无声冲掉；这一页没有那条路，但把状态放在
     /// 同一个地方，两页读的就是同一份真相）。
     Web,
+    /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
+    /// 屏幕上，profile 可配对（`pairable`）时的 Ctrl+A——跟 Ctrl+O 开
+    /// 申领页同一个键位规矩，不占用一个字母，密钥输入本身还要用它们）。
+    ///
+    /// 三个阶段，**每一个都必须有一条出路**——没有出路的错误屏等于死路，
+    /// 见 `pair_view.rs` 的按键处理和它的测试。
+    Pair {
+        profile: String,
+        phase: PairPhase,
+        /// 「报错看不懂时让 AI 解释」那个勾选框的状态。**住在视图里，不是
+        /// 全局**：它属于这一次配对，学生退出去再进来就该重新按默认值来，
+        /// 而不是继承上一次的手感。spec 第 3 节要求这个勾选框存在，并且
+        /// 默认勾上、文案说清代价——`config.rs` 开头那段隐私边界的全部
+        /// 依据就是「有个人当面看着代价点了头」，看不见的勾等于没有。
+        opt_in: LlmOptIn,
+        /// 配对成功之后该把学生送到哪儿去。
+        ///
+        /// **配对不是目的地。** 从选择器里选中 `DC` 起会话的那条路，
+        /// 在配对存在之前的终点是 `EnterSecret`：存下钥匙**并且**把学生
+        /// 要的那个会话开起来。配对接管了这条路却只做了前半——学生对着
+        /// 一屏「配对成功」，然后被丢回看板，得自己再走一遍选择器。
+        /// 对第一天上课的人来说，那正是他判定「这东西没弄好」的地方。
+        return_to: PairReturn,
+    },
+}
+
+/// 配对成功之后回哪儿。哪条路把学生领进配对屏，就由哪条路决定终点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairReturn {
+    /// 从密钥页/设置页进来的：意图是「把钥匙配上」，配完就完了。
+    Home,
+    /// 从选择器进来的：意图是「用这个 agent 开工」，钥匙只是路上的一道
+    /// 门。成功屏上按 Enter 直接把那个会话开起来。
+    ///
+    /// **为什么是按一下 Enter，不是自动跳。** 成功屏上有学生只有这一次
+    /// 机会看见的话——免费账号只有 Qwen、Claude 要付费升级（见
+    /// `PairPhase::Done`）。自动跳会让那句话一闪而过，而它正是学生下一次
+    /// 撞上「Claude 用不了」时唯一的解释来源。底栏上写着这个 Enter。
+    StartSession,
+}
+
+/// 配对屏上那个「报错看不懂时让 AI 解释」的勾选框。
+///
+/// 三态压成两支：能选（`Choice`）和这个决定已经做过了（`AlreadyConfigured`）。
+/// 后者是 `~/.dct/config.toml` 里已经有 `[llm]` 那一段的情形——
+/// `llm_optin::enable` 在那种文件上一个字都不动（它没法知道用户当初写下
+/// 那段时是怎么想的），所以屏幕上也不该摆一个按下去什么都不会发生的勾选框。
+/// 那一屏改成说一句「已经有了，这次配对不动它」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LlmOptIn {
+    /// 学生可以勾/取消，`bool` 是当前值。起步默认 `true`（spec 第 3 节）。
+    Choice(bool),
+    /// 配置里已经有 `[llm]`，不给勾选框，也不发一个会被拒绝的请求。
+    AlreadyConfigured,
+}
+
+impl LlmOptIn {
+    /// 送上线的那个 bool。`AlreadyConfigured` 一律 `false`——不是「学生不
+    /// 想要」，是「这次配对没有资格去动那一段」。让 daemon 去调
+    /// `llm_optin::enable` 再被它拒绝也能得到同样的结果，但那要靠两处逻辑
+    /// 恰好互补；在这里就说清楚，少一个会漂开的耦合。
+    pub(crate) fn wire(&self) -> bool {
+        matches!(self, LlmOptIn::Choice(true))
+    }
+
+    /// `l` 键：只有可选的那一支会变。
+    pub(crate) fn toggled(&self) -> LlmOptIn {
+        match self {
+            LlmOptIn::Choice(v) => LlmOptIn::Choice(!v),
+            LlmOptIn::AlreadyConfigured => LlmOptIn::AlreadyConfigured,
+        }
+    }
+}
+
+/// 配对屏正处在哪个阶段。
+#[derive(Clone)]
+pub(crate) enum PairPhase {
+    /// 已经发出 `Request::PairStart`，真网络请求在后台线程里飞着——结果
+    /// 回来之前这一屏没有任何键能按，同 `SecretPhase::Verifying` 的道理
+    /// （`Esc` 除外：那条键必须永远能退，见 `pair_view::handle_key`）。
+    Starting,
+    /// 拿到了 `user_code`，等学生在浏览器里输完。
+    Waiting {
+        /// 大字印在屏幕上，学生照着念或照着敲。
+        user_code: String,
+        /// **本地拼好的完整地址**，daemon 给的只是 `verify_path`——origin
+        /// 由 dct 自己从这个 profile 的 `[api].base_url` 里取，绝不接受
+        /// 线上答复里可能出现的任何 origin（`/pair/start` 无认证，这是
+        /// 钓鱼面）。同一份文本既拿去开浏览器，也印在屏上：浏览器打不开
+        /// 是常态（SSH、WSL、没设默认浏览器），没有这行地址学生就卡死。
+        url: String,
+        /// 倒计时用。
+        deadline: std::time::Instant,
+    },
+    /// 拿不到钥匙——起步失败、码过期、被拒、钥匙读不出来，网关的各种
+    /// 「没成」统一收在这一个阶段里，靠 `message`/`retryable` 分岔文案
+    /// 和按键。
+    Failed {
+        /// 已经组好的人话。**`retryable` 为假时这句必须原样带着网关自己
+        /// 给的那句话**（比如「这个账号还没有可读取的密钥，请点『重新
+        /// 生成』」）——把它显示成跟可重试那种一样的「过期了」，学生会
+        /// 按 `r` 按到天荒地老，每一次都走到同一个地方。
+        message: String,
+        /// 按 `r` 换一次新码有没有意义。`false` 的那一种按多少次都是
+        /// 同一个死结，`r` 键在渲染和按键处理里都不认。
+        retryable: bool,
+    },
+    /// 成功。免费账号只有 `openai`（Qwen 那一路），必须**明说**——不然
+    /// 学生会拿着新配好的账号试 Claude，撞上一个没有任何解释的失败，
+    /// 而没人告诉过他这是免费账号的正常边界，付费升级才有 Claude。
+    Done {
+        anthropic: bool,
+        openai: bool,
+        /// 这次配对**真的**把 `[llm]` 写出去了没有，从 `PairTick::Done`
+        /// 原样带过来的一件事实。屏上那句「报错时的 AI 解释：已经替你
+        /// 打开了」只认这个，不认 `opt_in`——后者是界面自己的意图，而
+        /// 勾着却什么都没写的路有好几条（见 `pair_apply::Ready::llm_written`）。
+        /// 没写就整行不出现：一个关着的隐私功能，沉默好过一句假话。
+        llm_written: bool,
+    },
 }
 
 /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
@@ -1144,6 +1269,12 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 从设置页进来，退出回设置页——同 `EnterSecret` 的 `return_to_settings`
         // 分支一个道理，这一页没有别的来路。
         View::Phone { .. } => text(Key::BackToSettings, lang).to_string(),
+        // 配对屏的 Esc 是真取消（发 `PairCancel`），落点是回家。
+        // `View::Pair` 确实带着一个 `return_to`，但那记的是**配对成功**
+        // 之后该去哪儿（回家，还是把学生要的那个会话开起来）；取消的
+        // 语义是「这件事我不做了」，没有一个「接着做」的下一步可去，
+        // 所以它跟别的取消一样回看板。
+        View::Pair { .. } => text(Key::BackToBoard, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
@@ -1431,6 +1562,32 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             phase: SecretPhase::Verifying,
             ..
         } => help_items(&[("", Key::Verifying)], lang),
+        // 可配对的 profile（`"dc"`/`"qwen"`，见 `Profile::pairable`）多一条
+        // Ctrl+A（自动配对，见 `secret.rs`/`pair_view.rs`）——只有它们认
+        // 这个键，其余 profile 底栏不写，因为它们那边 `a` 就是敲进密钥里
+        // 的一个普通字母，按下去不会发生这里写的事。
+        View::EnterSecret {
+            return_to_settings: true,
+            pairable: true,
+            ..
+        } => help_items(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Ctrl+A", Key::AutoPair),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToSettingsWord),
+            ],
+            lang,
+        ),
+        View::EnterSecret { pairable: true, .. } => help_items(
+            &[
+                ("", Key::PasteOrTypeKey),
+                ("Ctrl+A", Key::AutoPair),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::BackToListWord),
+            ],
+            lang,
+        ),
         // 跟 escape_hint 一样要分 return_to_settings：从设置页进来的 Esc
         // 回设置页，不是「列表」——两处文案哪怕只有半句话不一致，都是
         // 「底栏说什么就得真能做到什么」这条原则被破坏了一半。
@@ -1520,6 +1677,52 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             // 上面几个键「前提不在就不写」的道理不冲突——它没有前提。
             items.push(("w", Key::WebToggle));
             items.push(("Esc", Key::BackToSettingsWord));
+            help_items(&items, lang)
+        }
+        // 三个阶段各有各的能按的键，跟手机页「能不能按也决定写不写」同一个
+        // 道理——`r` 只在 `retryable` 的失败上写，`o` 只在等码的那一屏写
+        // （那是唯一存着 URL 的阶段），`p`（手动填）在**每一个**阶段都写：
+        // 见 `pair_view.rs` 的 `manual_entry_stays_reachable_from_every_phase`。
+        View::Pair {
+            phase,
+            opt_in,
+            return_to,
+            ..
+        } => {
+            let mut items: Vec<(&'static str, Key)> = Vec::new();
+            match phase {
+                PairPhase::Starting => items.push(("", Key::Verifying)),
+                PairPhase::Waiting { .. } => {
+                    items.push(("o", Key::ReopenBrowser));
+                }
+                PairPhase::Failed {
+                    retryable: true, ..
+                } => items.push(("r", Key::Retry)),
+                PairPhase::Failed {
+                    retryable: false, ..
+                }
+                | PairPhase::Done { .. } => {}
+            }
+            // 成功屏上的 Enter 只有从选择器进来的那条路才有——那条路的
+            // 终点是「把学生要的那个会话开起来」（见 `PairReturn`）。
+            // 从密钥页进来的人没有这个下一步，底栏就不该写一个按下去
+            // 什么都不发生的键。
+            if matches!(phase, PairPhase::Done { .. })
+                && matches!(return_to, PairReturn::StartSession)
+            {
+                items.push(("Enter", Key::PairStartSession));
+            }
+            // `l` 只在还改得动的时候写：批准落地之后（`Done`）那个勾选
+            // 已经被 daemon 用掉了，一个按下去不会有任何效果的键写在底栏
+            // 上比不写更坏。已经有 `[llm]` 的那一支同理——那一屏摆的是
+            // 一句说明，不是一个勾选框。
+            if matches!(opt_in, LlmOptIn::Choice(_))
+                && matches!(phase, PairPhase::Starting | PairPhase::Waiting { .. })
+            {
+                items.push(("l", Key::PairLlmToggle));
+            }
+            items.push(("p", Key::ManualEntry));
+            items.push(("Esc", Key::Cancel));
             help_items(&items, lang)
         }
     }
@@ -1657,6 +1860,7 @@ mod tests {
             buf: String::new(),
             phase,
             return_to_settings,
+            pairable: false,
         };
         let mut typing = ProjectPicker::new(vec![], PathBuf::from("/"));
         typing.typing_path = Some(String::new());
@@ -2302,6 +2506,9 @@ mod tests {
             secret: None,
             install: None,
             backend_only: false,
+            // pick_action/digit_index 不看这个字段——它们的测试从不需要
+            // 一个可配对的 fixture。
+            pairable: false,
         }
     }
 
@@ -2582,6 +2789,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: false,
+                pairable: false,
             },
             Lang::Zh,
         );
@@ -2601,6 +2809,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
+                pairable: false,
             },
             Lang::Zh,
         );
@@ -2622,6 +2831,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings: true,
+                pairable: false,
             },
             Lang::Zh,
         );

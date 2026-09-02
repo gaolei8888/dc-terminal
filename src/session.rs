@@ -596,6 +596,12 @@ pub struct SessionManager {
     /// 启动那一刻可能根本没有 git，是后来 `dct install git` 装进这个目录的。
     /// 建 agent 会话之前要拍第一张快照，那时候必须再挂一遍才找得到它。
     runtime_dir: Mutex<Option<PathBuf>>,
+    /// dct 的家目录（`socket.parent()`），配对写下的 `pair-models.toml`
+    /// 就锚在这下面。`None` = 不知道（默认；单元测试拿到的就是这种），
+    /// `create_inner` 这种情况下不去读那个文件，效果等同于「这个 profile
+    /// 没配过对」——同 `runtime_dir`/`last_sessions_path` 的模式，只有
+    /// `daemon.rs::run_with_manager` 会给它一个真实路径。
+    pair_models_home: Mutex<Option<PathBuf>>,
     /// 上面那次 resolve 为什么失败。**只有用户确实写了 `[llm]` 却接不上时
     /// 才是 `Some`**——没写 `[llm]` 是绝大多数人的正常状态，不是问题，
     /// 那种情况这里始终是 `None`。存下来是因为守护进程的 stderr 被丢弃了
@@ -654,6 +660,7 @@ impl SessionManager {
             journal: crate::journal::Journal::new(),
             last_sessions_path: Mutex::new(None),
             runtime_dir: Mutex::new(None),
+            pair_models_home: Mutex::new(None),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
             resume_skips: Mutex::new(Vec::new()),
@@ -758,6 +765,13 @@ impl SessionManager {
     /// 装上自带运行时的位置。只有 `daemon.rs::run_with_manager` 会调用。
     pub fn set_runtime_dir(&self, path: PathBuf) {
         *recover(self.runtime_dir.lock()) = Some(path);
+    }
+
+    /// 装上 dct 的家目录，`create_inner` 据此去读配对写下的
+    /// `pair-models.toml`。只有 `daemon.rs::run_with_manager` 会调用——
+    /// 同上面几个 setter 的模式，单元测试不装就是「没有任何配对模型名」。
+    pub fn set_pair_models_home(&self, path: PathBuf) {
+        *recover(self.pair_models_home.lock()) = Some(path);
     }
 
     /// 把自带运行时重新挂一遍守护进程的 PATH。
@@ -956,6 +970,15 @@ impl SessionManager {
             if let Some(key) = secret {
                 env.insert(spec.env.clone(), key.to_string());
             }
+        }
+
+        // 配对给这个 profile 存的模型名（`pair_apply::env_for`），密钥之后
+        // 合进来——同一个理由：profile 文件本身不该带运行时的东西，这份
+        // 东西也不在 profile 文件里，是配对单独写在 `pair-models.toml` 里
+        // 的。没装家目录（单元测试的默认状态）或者这个 profile 没配过对，
+        // 都退化成什么都不加，不拦会话起来。
+        if let Some(home) = recover(self.pair_models_home.lock()).clone() {
+            env.extend(crate::pair_apply::env_for(&home, profile_name));
         }
 
         // 只在恢复路径上、且这个 profile 真的声明过恢复参数时才追加——
@@ -1893,6 +1916,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -1959,6 +1983,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -1986,6 +2011,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2014,6 +2040,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
             backend_only: false,
         }
     }
@@ -2775,6 +2802,7 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            pairable: false,
         });
         m.set_backend(Some(Arc::new(ByScreenTail)));
         let id = m
@@ -3509,6 +3537,51 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "没看到注入的环境变量：{text}"
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 配对写的模型名要真的进到子进程 env 里——这是这整条线路里唯一
+    /// 「接没接上」看不出来的地方：`pair_apply::apply` 写文件的测试钉不住
+    /// 这件事，因为它不经过 `session.rs`。这里从 `set_pair_models_home`
+    /// 开始，走真正的 `create`，在屏幕上看到模型名，才算这条线是通的。
+    #[test]
+    fn a_paired_model_name_reaches_the_child_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        std::fs::write(
+            tmp.path().join("pair-models.toml"),
+            "# 由 dct 配对写入\n\n[fake-paired]\nANTHROPIC_MODEL = \"claude-paired\"\n",
+        )
+        .unwrap();
+
+        let mgr = SessionManager::new();
+        mgr.set_pair_models_home(tmp.path().to_path_buf());
+        mgr.register_profile(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
+                r#"
+            name = "fake-paired"
+            command = ["/bin/sh", "-c", "echo MODEL=$ANTHROPIC_MODEL; sleep 5"]
+            is_agent = false
+            "#,
+            ))
+            .unwrap(),
+        );
+
+        let id = mgr.create(&proj, "fake-paired", None, &[]).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let text = mgr.screen_text_for_test(id);
+            if text.contains("MODEL=claude-paired") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "配对写的模型名没有进到子进程 env 里：{text}"
             );
             sleep(Duration::from_millis(50));
         }

@@ -72,7 +72,25 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 跟版本 9 是同一件事的第二半——键名翻成字节原来在 `web::routes` 里做
 /// （`web::keys::bytes_for`），那同样是中转做不了的翻译。**凡是路由层
 /// 「顺手算一下」的东西，经中转那一期都要还这笔债**，这是最后一处。
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// 11 = 配对。多了 `Request::PairStart` / `PairPoll` / `PairCancel`，
+/// `Response::PairStarted` / `PairTick`。旧守护进程完全不认识这三条请求，
+/// 界面发过去只会得到一句解析失败——跟 `Kill`/`Prune` 那次加一是同一个理由。
+///
+/// 12 = 配对屏上那个 `[llm]` 勾选框真的能按了。`PairPoll` 多了一个
+/// `opt_in_llm` 字段：学生是在 `PairStart` 已经发出去之后才看见那行文案的，
+/// 改主意得有一条路送到 daemon，而每 500ms 就要发一次的 `PairPoll` 正是
+/// 那条路（理由见 `ui::pair_view::pair_poll_request`）。旧守护进程解不出
+/// 多了一个字段的 `PairPoll`——形状变了就得加一，这条规矩没有例外。
+///
+/// 13 = 成功屏改成陈述事实。`PairTick::Done` 多了一个 `llm_written`：
+/// 那一屏上「报错时的 AI 解释：已经替你打开了」以前是从界面自己那个勾选
+/// 框渲染的，也就是界面在陈述它的意图，而 `[llm]` 到底写没写只有
+/// `pair_apply::apply` 知道（勾了也可能一个字都没写，见
+/// `pair_apply::Ready::llm_written`）。这一次变的是**响应**的形状而不是
+/// 请求的：旧界面解不出多了一个字段的 `Done`，一条成功的配对会在最后
+/// 一刻变成一句解析失败——形状变了就得加一，这条规矩对哪一侧都一样。
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +199,12 @@ pub struct ProfileEntry {
     /// 理由写在 `profile::Profile::backend_only` 上。
     #[serde(default)]
     pub backend_only: bool,
+    /// 这个 profile 的密钥能不能靠配对拿到，而不是让用户粘贴——照抄自
+    /// `profile::Profile::pairable`，理由写在那儿。UI 手上只有
+    /// `ProfileEntry`，拿不到 `Profile`，所以这个 bool 必须跟着一起过桥，
+    /// 不能让选择器/密钥页回去按名字特判（那正是这个字段要消灭的写法）。
+    #[serde(default)]
+    pub pairable: bool,
 }
 
 /// 九宫格一格的内容。跟 `Response::Screen` 不同，不带光标——
@@ -302,6 +326,34 @@ pub enum Request {
     VerifySecret {
         profile: String,
         value: String,
+    },
+    /// 起一条配对：daemon 打 `/admin/api/pair/start`，成功就在自己内存里
+    /// 开一个轮询线程。**`device_code` 不在响应里**，它一次也不过 socket。
+    PairStart {
+        profile: String,
+        /// 学生在配对屏上勾没勾「报错看不懂时让 AI 解释」。**必须跟着这条请求走**：
+        /// 落盘发生在 daemon 的后台线程里，那时候界面早已经不在这条调用栈上了。
+        /// `config.rs` 开头那段说 `[llm]` 缺席是隐私边界而不是缺省值——这个 bool
+        /// 就是那个边界上唯一一次人的点头，把它丢在界面里等于把边界拆了。
+        opt_in_llm: bool,
+    },
+    /// 读一次配对的当前状态。非阻塞——真正的轮询在 daemon 的后台线程里跑，
+    /// 因为它要跑 15 分钟，而界面这条连接 5 秒就超时（`client.rs:11`）。
+    PairPoll {
+        profile: String,
+        /// 勾选框的**当前**值，每一轮捎带一次。
+        ///
+        /// `PairStart` 带的那一份是起步那一刻的，而学生是在那之后才看见
+        /// 「会把终端上的报错原文发给训练营网关」这句话的——他取消勾选
+        /// 时，起步请求早飞走了。捎在这条本来就要发的请求上，而不是新加
+        /// 一条「改主意了」：捎带是幂等的，丢一次下一轮自己补上；一条
+        /// 单发的通知丢了就再没有人会发现。daemon 一直读到批准落地为止。
+        opt_in_llm: bool,
+    },
+    /// 取消。**必须真的停线程并丢掉 `device_code`**：不停的话，用户退出去了，
+    /// 后台还在替他领钥匙，领到了写进 secrets，而他以为自己取消了。
+    PairCancel {
+        profile: String,
     },
     /// 「这个 `Failed` 会话到底出了什么事」，人话版。答案可能还没算出来
     /// （问模型是异步的，见 `session.rs::request_explanation`），也可能
@@ -430,6 +482,28 @@ impl std::fmt::Debug for Request {
                 .field("profile", profile)
                 .field("value", &"<redacted>")
                 .finish(),
+            // 没有密钥可脱敏——`device_code` 从不出现在 `Request` 里，
+            // 它只活在 daemon 自己的内存中（见 `PairStart` 上的注释）。
+            Request::PairStart {
+                profile,
+                opt_in_llm,
+            } => f
+                .debug_struct("PairStart")
+                .field("profile", profile)
+                .field("opt_in_llm", opt_in_llm)
+                .finish(),
+            Request::PairPoll {
+                profile,
+                opt_in_llm,
+            } => f
+                .debug_struct("PairPoll")
+                .field("profile", profile)
+                .field("opt_in_llm", opt_in_llm)
+                .finish(),
+            Request::PairCancel { profile } => f
+                .debug_struct("PairCancel")
+                .field("profile", profile)
+                .finish(),
             Request::Explanation { id } => f.debug_struct("Explanation").field("id", id).finish(),
             Request::Scroll { id, by } => f
                 .debug_struct("Scroll")
@@ -535,6 +609,49 @@ pub enum Response {
     /// `BTreeMap` 不是 `HashMap`：序列化出来的顺序要稳定，否则那条钉住线上
     /// 形状的测试每次跑都可能换个顺序。
     Strings(std::collections::BTreeMap<String, String>),
+    /// 对 [`Request::PairStart`] 的回答。`Err` 是一句已经本地化过的原因
+    /// （网关关着、连不上）。
+    PairStarted(Result<PairStartedInfo, String>),
+    /// 对 [`Request::PairPoll`] 的回答。
+    PairTick(PairTick),
+}
+
+/// `pair::Started` 给界面看的那一面。**故意不是 `Started` 本身**：那个类型里有
+/// `device_code`，而它是这条流程的凭据——界面要的只是画屏用的三样东西。
+/// 同 `PairTick` 之于 `Tick`：少一个能装凭据的类型，就少一处它能漏出去的地方。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairStartedInfo {
+    /// 大字印在屏幕上，学生照着念或照着敲。
+    pub user_code: String,
+    /// 路径，不是完整 URL——origin 由 dct 自己拼，见 spec 里那段钓鱼面的分析。
+    pub verify_path: String,
+    /// 倒计时用。
+    pub expires_in: u64,
+}
+
+/// `pair::Tick` 给界面看的那一面。**故意不是 `Tick` 本身**：`Tick::Done`
+/// 里装着 `api_key`，而界面一个字节都不需要它——钥匙落盘在 daemon 那边
+/// 已经做完了。少一个能装钥匙的类型，就少一处它能漏出去的地方。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PairTick {
+    Waiting,
+    Done {
+        /// 有没有拿到 Anthropic 那一组模型。免费账号是 false，
+        /// 成功屏要据此换一句话说。
+        anthropic_ready: bool,
+        openai_ready: bool,
+        /// 这次配对**真的**往 `~/.dct/config.toml` 里写了一段 `[llm]`
+        /// 没有。不是「学生勾了没有」——界面拿自己那个勾选框的值去渲染
+        /// 「已经替你打开了」，等于让它陈述一个意图；勾着却什么都没写
+        /// 的路有好几条（见 `pair_apply::Ready::llm_written`）。成功屏
+        /// 上宣布一个其实关着的隐私功能已经打开，比不说话坏得多。
+        llm_written: bool,
+    },
+    Expired {
+        retryable: bool,
+        message: String,
+    },
+    Failed(String),
 }
 
 /// 守护进程报「哪一类错 + 参数」，**不组句**。
@@ -847,6 +964,17 @@ mod tests {
                 profile: "p".into(),
                 value: "v".into(),
             },
+            Request::PairStart {
+                profile: "p".into(),
+                opt_in_llm: true,
+            },
+            Request::PairPoll {
+                profile: "p".into(),
+                opt_in_llm: true,
+            },
+            Request::PairCancel {
+                profile: "p".into(),
+            },
             Request::Explanation { id: 1 },
             Request::Scroll {
                 id: 1,
@@ -883,11 +1011,101 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                10,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
+                13,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
+    }
+
+    /// **配对的响应里绝不许出现钥匙。** UI 不需要它——落盘在 daemon 那边做完了。
+    /// 一旦它过一次 socket，它就会出现在任何一个手滑加上的 `{resp:?}` 里。
+    #[test]
+    fn a_pair_tick_never_carries_the_key() {
+        let t = PairTick::Done {
+            anthropic_ready: true,
+            openai_ready: true,
+            llm_written: true,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("api_key"), "{json}");
+        assert!(!json.contains("sk-"), "{json}");
+        // 请求那一侧的形状由 `the_request_shape_is_pinned_to_the_protocol_version`
+        // 钉着，`Done` 是响应，落在那张网外面——而版本 13 变的正是它。
+        // 把它一起钉住，下一次给它加字段的人才会被同一句话拦下来。
+        assert_eq!(
+            (PROTOCOL_VERSION, json.as_str()),
+            (
+                13,
+                r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
+            ),
+            "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// **`PairStarted` 的响应里绝不许出现 `device_code`。** 它是这条流程的
+    /// 凭据，spec 说它只活在 daemon 里、一次也不许过 socket——`PairStartedInfo`
+    /// 存在正是为了让这条 socket 上的类型物理上装不下它。
+    #[test]
+    fn a_pair_started_response_never_carries_the_device_code() {
+        let r = Response::PairStarted(Ok(PairStartedInfo {
+            user_code: "HJ4K-9QTZ".into(),
+            verify_path: "/pair".into(),
+            expires_in: 900,
+        }));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("device_code"), "{json}");
+    }
+
+    /// `device_code` 是凭据，跟密钥一个待遇：手写的 Debug 要把它挡住。
+    ///
+    /// **这条测试要断言的是"没有"，不是"有"。** 它原来只查了
+    /// `s.contains("dc")`——那句话证明的是 profile 名照常打印，跟脱敏
+    /// 半点关系没有，一个把凭据原样打出来的 `Debug` 也照样能让它变绿。
+    /// 一条只断言正面的脱敏测试比没有测试更坏：它让人以为这件事有人守着。
+    #[test]
+    fn pair_requests_do_not_print_anything_sensitive() {
+        // 配对这三条请求里**装不下**凭据——`device_code` 只活在 daemon
+        // 自己的内存里，`Request` 的类型本身就没有这个字段。所以这里能
+        // 断言的负面是：任何一条配对请求的 `Debug` 输出里都不许出现
+        // 密钥形状的东西，而 `SetSecret`/`VerifySecret` 这两条真装着密钥的
+        // 请求必须把它盖掉。三条一起测，是因为脱敏这件事一旦漏，
+        // 漏的一定是新加的那一条。
+        for r in [
+            Request::PairStart {
+                profile: "dc".into(),
+                opt_in_llm: true,
+            },
+            Request::PairPoll {
+                profile: "dc".into(),
+                opt_in_llm: true,
+            },
+            Request::PairCancel {
+                profile: "dc".into(),
+            },
+        ] {
+            let s = format!("{r:?}");
+            assert!(s.contains("dc"), "profile 该照常打印，排查问题要用：{s}");
+            assert!(!s.contains("device_code"), "凭据的字段名都不该出现：{s}");
+            assert!(!s.contains("sk-"), "{s}");
+        }
+
+        let s = format!(
+            "{:?}",
+            Request::SetSecret {
+                profile: "dc".into(),
+                value: "sk-live-secret".into(),
+            }
+        );
+        assert!(!s.contains("sk-live-secret"), "密钥漏进了 Debug：{s}");
+        let s = format!(
+            "{:?}",
+            Request::VerifySecret {
+                profile: "dc".into(),
+                value: "sk-live-secret".into(),
+            }
+        );
+        assert!(!s.contains("sk-live-secret"), "密钥漏进了 Debug：{s}");
     }
 
     /// 请求那条 pin 只钉了**发出去**的形状，回来的没人管——而 2026-08-06
@@ -927,7 +1145,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                10,
+                13,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1034,7 +1252,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (10, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (13, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

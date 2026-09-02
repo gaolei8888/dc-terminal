@@ -302,12 +302,20 @@ DC and the last four aren't separate programs at all. They're `claude` pointed
 at another Anthropic-compatible endpoint, which is why they want both the binary
 and a key.
 
-**DC has no signup page**: its key is handed out by 疯狂AI训练营 to the people
-taking the course, which is the whole point of it sitting first in the list — for
-a student on their first day it's the one line in that table that needs no
-account, no card and no VPN. Everyone else can ignore it, or point it somewhere
-else: it's an ordinary profile, and a `dc.toml` of your own in `~/.dct/profiles/`
-replaces it.
+**DC needs no copy-pasted key**: pick it while this machine has no key configured
+yet, hit enter, and it goes straight into pairing — a confirmation page opens in
+your browser, you click approve once, and the key plus model names get written
+back automatically, no account page to open or paste into. Manual entry is still
+there if you want it: press `p` from any step of the pairing screen to switch to
+it. The pairing screen also carries one ticked box — "let AI explain errors you
+can't read" — and it states its cost rather than its benefit, because turning it
+on means the raw error text from your terminal gets sent to the camp gateway.
+Press `l` to untick it before you approve in the browser; if your
+`~/.dct/config.toml` already has an `[llm]` section, pairing says so and leaves
+your own setting alone. Pairing is why DC sits first in the list — for a student on their first day
+it's the one line in that table that needs no account, no card and no VPN.
+Everyone else can ignore it, or point it somewhere else: it's an ordinary
+profile, and a `dc.toml` of your own in `~/.dct/profiles/` replaces it.
 
 Keys live in `~/.dct/secrets.toml`, mode 0600. They never go anywhere near the
 profile files, which is deliberate: those you can copy between machines or hand

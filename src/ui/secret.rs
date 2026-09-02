@@ -9,7 +9,7 @@ use crate::verify::VerifyOutcome;
 
 use super::app::App;
 use super::view::{
-    decide_delete_key, is_plain_key, secret_rows, DeleteKeyAction, SecretPhase, View,
+    decide_delete_key, is_plain_key, secret_rows, DeleteKeyAction, PairReturn, SecretPhase, View,
 };
 use super::widgets::{pad_to, truncate, Msg};
 use super::{accent, danger, dim, move_sel_n, open_url, refetch_secrets};
@@ -40,6 +40,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
         mut buf,
         phase,
         return_to_settings,
+        pairable,
     } = app.view.clone()
     else {
         return Ok(());
@@ -78,6 +79,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Verifying,
                     return_to_settings,
+                    pairable,
                 };
             }
         }
@@ -140,6 +142,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Verifying,
                     return_to_settings,
+                    pairable,
                 };
             }
             KeyCode::Backspace => {
@@ -151,7 +154,25 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Typing,
                     return_to_settings,
+                    pairable,
                 };
+            }
+            // Ctrl+A 不用 a：可配对的 profile（`pairable`，见
+            // `Profile::pairable` 的文档注释——目前是 `"dc"`/`"qwen"`）
+            // 能自动配对，不用学生自己去网关网站抄一串密钥——但只有这类
+            // profile 认这个键，其余 profile 的密钥输入里 `a` 就是个
+            // 普通字母，不能被这条分支吞掉。跟 Ctrl+O 同一条键位规矩
+            // （见上面那条注释）：不占用一个字母键，密钥输入本身还要用它。
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && pairable => {
+                // 这一屏自己记着学生本来要去哪儿（从设置页来的改配置，
+                // 从选择器来的是要开工），配对屏原样接过去——Ctrl+A 换的
+                // 只是「钥匙怎么来」，不是「他本来想干什么」。
+                let return_to = if return_to_settings {
+                    PairReturn::Home
+                } else {
+                    PairReturn::StartSession
+                };
+                super::pair_view::start_pairing(app, profile, return_to);
             }
             // Ctrl+O 不用 o：o 得留给密钥输入本身
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -173,6 +194,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase,
                     return_to_settings,
+                    pairable,
                 };
             }
             KeyCode::Char(c) => {
@@ -184,6 +206,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase: SecretPhase::Typing,
                     return_to_settings,
+                    pairable,
                 };
             }
             _ => {
@@ -194,6 +217,7 @@ fn handle_enter_secret(app: &mut App, key: KeyEvent) -> Result<()> {
                     buf,
                     phase,
                     return_to_settings,
+                    pairable,
                 };
             }
         },
@@ -244,6 +268,28 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                 .selected()
                 .and_then(|i| rows.get(i))
                 .and_then(|(name, _)| entries.iter().find(|e| &e.name == name));
+            // 可配对的 profile（`e.pairable`，见 `Profile::pairable`）能自动
+            // 配对——同 `pick.rs` 那条 `AskSecret` 分支一个理由：密钥页这
+            // 一屏也不该是学生填这类密钥的地方，spec 原话是学生根本不该
+            // 主动去找「配对」这个词。手动填退化成 `View::Pair` 里随时能按
+            // 的 `p`。**不按名字判**——判据长在 profile 上，见字段文档。
+            //
+            // **但只在这台机器还没有这把钥匙的时候。** 配对是「让小白装完
+            // 就能用」那条路，它回答的是「我还没有钥匙」；一行已经配好的
+            // 密钥按 Enter，意思是「我要换掉它」，那是手填那条路的问题，
+            // 而且换钥匙的人通常手里正拿着新的那一串。把这条也劫走，
+            // 等于让唯一一个换钥匙的入口绕一整圈浏览器授权——而两份 README
+            // 描述的新行为本来就是「这台机器还没有钥匙时」，只有选择器
+            // 那条路（`pick.rs` 的 `AskSecret`，按定义就是没钥匙）符合。
+            if let Some(e) = target {
+                if e.pairable && !e.has_secret {
+                    let name = e.name.clone();
+                    // 密钥页进来的意图是「把钥匙配上」，不是「开工」——
+                    // 配完就完了，不替他起一个他没要的会话。
+                    super::pair_view::start_pairing(app, name, PairReturn::Home);
+                    return Ok(());
+                }
+            }
             app.view = match target {
                 Some(e) => View::EnterSecret {
                     profile: e.name.clone(),
@@ -259,6 +305,7 @@ fn handle_secrets(app: &mut App, key: KeyEvent) -> Result<()> {
                     phase: SecretPhase::Typing,
                     // 从设置页进来，改完要回设置页
                     return_to_settings: true,
+                    pairable: e.pairable,
                 },
                 // Enter 也是「其他键」，没找到目标（没有选中行）时
                 // 留在原地也要把武装状态清掉。
@@ -521,6 +568,11 @@ mod tests {
             secret: None,
             install: None,
             backend_only: false,
+            // 这个 fixture 只在这个文件里跑到 `"dc"`——照真实 `dc.toml` 的样子
+            // 把它标成可配对，其余名字（`"kimi"`/`"glm"`/`"claude"`）留 false，
+            // 这样下面那条「不可配对的 profile 一个字节都不能变」的测试才有
+            // 意义（不然它测的是一个从来不会为真的分支）。
+            pairable: name == "dc",
         }
     }
 
@@ -552,6 +604,7 @@ mod tests {
             buf: String::new(),
             phase: SecretPhase::Typing,
             return_to_settings,
+            pairable: false,
         }
     }
 
@@ -599,6 +652,49 @@ mod tests {
         );
     }
 
+    /// **入口不能是密钥输入框，密钥页也一样。** spec 原话：学生根本不该
+    /// 主动去找「配对」这个词——在密钥设置页上选中 `"dc"`（训练营网关）
+    /// 按 Enter，该直接进配对屏，不是像别的 agent 一样落进要粘贴密钥的
+    /// 输入框。跟 `pick.rs::choosing_dc_with_no_key_goes_straight_to_pairing_not_the_key_box`
+    /// 是同一条属性在密钥页这条入口上的版本。
+    #[test]
+    fn enter_on_the_dc_row_of_the_secrets_page_goes_straight_to_pairing() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::Secrets {
+            entries: vec![with_secret(entry("dc", ProfileStatus::NeedsSecret))],
+            state,
+            pending_delete: None,
+        };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(
+            matches!(app.view, View::Pair { .. }),
+            "选中 dc 按 Enter 该直接进配对屏，不是密钥输入框"
+        );
+    }
+
+    /// **已经有钥匙那一行的 Enter 还是手填。** 配对回答的是「我还没有
+    /// 钥匙」；换一把钥匙的人手里拿着新的那一串，不该被劫进一整圈浏览器
+    /// 授权——那会让换钥匙这件事在界面上没有入口。
+    #[test]
+    fn enter_on_a_pairable_row_that_already_has_a_key_still_opens_the_paste_box() {
+        let (mut app, _dir) = App::test_app();
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::Secrets {
+            // `ProfileStatus::Ready` 的那一行 `has_secret` 是 true（见 `entry`）
+            entries: vec![with_secret(entry("dc", ProfileStatus::Ready))],
+            state,
+            pending_delete: None,
+        };
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        match app.view {
+            View::EnterSecret { ref profile, .. } => assert_eq!(profile, "dc"),
+            _ => panic!("已经配了钥匙的一行该进手填，不该被配对劫走"),
+        }
+    }
+
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         let area = buf.area;
         let mut s = String::new();
@@ -629,6 +725,7 @@ mod tests {
             buf: "x".repeat(200),
             phase: SecretPhase::Typing,
             return_to_settings: false,
+            pairable: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
     }
@@ -652,6 +749,7 @@ mod tests {
             buf: "sk-abc123".into(),
             phase: SecretPhase::Typing,
             return_to_settings: false,
+            pairable: false,
         };
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
         assert!(
@@ -681,6 +779,7 @@ mod tests {
                 buf: String::new(),
                 phase: SecretPhase::Typing,
                 return_to_settings,
+                pairable: false,
             };
             term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
             buffer_text(term.backend().buffer())

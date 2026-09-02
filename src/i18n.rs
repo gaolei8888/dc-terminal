@@ -451,6 +451,72 @@ pub enum Key {
     ReasonNotInstalled,
     /// `x` 按在一个还有会话的组上
     GroupNotEmpty,
+
+    // —— 配对（跟训练营网关换一把钥匙）——
+    /// `EnterSecret` 屏幕上 Ctrl+A 的说明（`profile.pairable` 为真时才会
+    /// 出现——目前是 `dc` 和 `qwen`，见 `Profile::pairable`，不再是按名字
+    /// 认 `"dc"`）。不占用一个字母键——`o` 已经留给密钥输入本身
+    /// （`Ctrl+O` 那条注释），这里跟它同一个键位规矩。
+    AutoPair,
+    /// Starting 阶段：已经发出请求，真网络在飞，这一屏没有别的话可说。
+    PairContacting,
+    /// Waiting 阶段的说明句：在浏览器里，用这个码。
+    PairEnterCodeInBrowser,
+    /// 可重试的过期（`retryable == true`）：网关没告诉我们具体原因
+    /// （到点的 ttl 过期一律是空 `message`），这句是 dct 自己给的人话。
+    PairCodeExpired,
+    /// `PairTick::Failed("empty_key")`：网关批了但给出的钥匙是空的——
+    /// 学生这边什么都没做错，是网关那侧的账号还没有可读的钥匙。
+    PairKeyUnreadable,
+    /// `PairTick::Failed("denied")`：有人在确认页点了拒绝。
+    PairDenied,
+    /// 网关的配对开关关着（`not_enabled`，无论是起步时还是轮询时撞上）。
+    PairNotEnabled,
+    /// 起步成功之后，界面这一侧独立读 `[api].base_url` 算 origin 时失败了
+    /// （profile 文件在两次读之间被人手改坏、或者整个不见了）。`retryable`
+    /// 为假：这不是码过期，再按 `r` 只会撞上同一份读不出来的文件。
+    PairProfileUnreadable,
+    /// Done 阶段：两条路都开了（Anthropic + Qwen）。
+    PairDoneBoth,
+    /// Done 阶段：**免费账号只有这一条**——必须点名「Qwen 那一路」，也要
+    /// 说清「Claude 需要付费升级」，不能让学生对着一个用不了的 Claude
+    /// 猜为什么。见 `pair_view.rs` 头上关于这句话的分析。
+    PairDoneQwenOnly,
+    /// `p` 键的说明：手动填密钥这条退路，四个阶段都在。
+    PairManualHint,
+    /// Done 屏上那一行小字：这次配对顺手打开了「报错时的 AI 解释」。
+    /// 只在学生真的勾着走完的时候出现——没勾就整行不出现，沉默本身就是
+    /// 「没开」。
+    PairLlmOptIn,
+    /// 配对屏上那个勾选框，**勾着**的样子。文案要说清代价而不只是好处：
+    /// 打开这个功能意味着一个失败会话屏幕上最后 2000 个字符会被原样送到
+    /// 训练营网关（见 `config.rs` 开头那段隐私边界）。学生看不见代价就
+    /// 谈不上「他决定过」，这一行的措辞是这条边界成立的前提。
+    PairLlmToggleOn,
+    /// 同上，**没勾**的样子。两条词条只差那个方框里的字符，分成两条而不是
+    /// 现拼一个前缀，是因为 `[×]`/`[ ]` 在两种语言里都要能被译者原样看见。
+    PairLlmToggleOff,
+    /// 配对屏上代替勾选框的那一行：`~/.dct/config.toml` 里已经有 `[llm]` 了。
+    /// 这个决定用户自己做过，配对不去改它，也不再问一遍——`llm_optin::enable`
+    /// 那条「已经有就一个字都不动」的规矩在屏幕上的样子。
+    PairLlmAlreadySet,
+    /// 底栏：`l` 切换上面那个勾选框。
+    PairLlmToggle,
+    /// 底栏那一条：按 Enter 把学生当初要的那个会话开起来。只在从选择器
+    /// 进来的那条路上出现（`PairReturn::StartSession`）——从密钥页进来的人
+    /// 要的是「把钥匙配上」，不是开工。
+    ///
+    /// **底栏这一条自己说不清 Enter 会开什么**（它只是「开始使用」四个
+    /// 字），成功屏正文里那一句由 `msg::pair_start_session_line` 给，
+    /// 那句话点名 agent 的名字。这条注释以前说自己也是「成功屏上那一行」，
+    /// 而屏上从来没有过那一行——差一点就让这个缺口一直留着。
+    PairStartSession,
+    /// 底栏：重开浏览器（Waiting 阶段的 `o`）。
+    ReopenBrowser,
+    /// 底栏：重试（`Failed { retryable: true }` 阶段的 `r`）。
+    Retry,
+    /// 底栏：手动填密钥（配对屏任何阶段的 `p`）。
+    ManualEntry,
 }
 
 /// 一段文字里有没有汉字。
@@ -973,6 +1039,81 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "这个项目还有会话，先停掉才能移除。"
         ),
 
+        AutoPair => t!(lang, en: "auto-pair with the camp gateway", zh: "自动配对训练营网关"),
+        PairContacting => t!(lang, en: "Contacting the camp gateway…", zh: "正在联系训练营网关…"),
+        PairEnterCodeInBrowser => t!(
+            lang,
+            en: "Enter this code in the page that just opened",
+            zh: "在刚打开的页面里输入这个码",
+        ),
+        PairCodeExpired => t!(
+            lang,
+            en: "This code expired. Press r for a new one.",
+            zh: "这个码过期了，按 r 换一个新的",
+        ),
+        PairKeyUnreadable => t!(
+            lang,
+            en: "The gateway approved this but the key came back unreadable — this is not something pressing r again will fix.",
+            zh: "网关批了，但钥匙读不出来——这不是再按一次 r 能解决的",
+        ),
+        PairDenied => t!(lang, en: "Pairing was denied", zh: "配对被拒绝了"),
+        PairNotEnabled => t!(
+            lang,
+            en: "Pairing is turned off on the camp gateway right now",
+            zh: "训练营网关现在关着配对功能",
+        ),
+        PairProfileUnreadable => t!(
+            lang,
+            en: "Could not read this profile's configuration, so pairing can't continue. Try again from the key page, or fill in a key by hand.",
+            zh: "读不出这个 profile 的配置，配对没法继续。回密钥页重试一次，或者手动填密钥。",
+        ),
+        PairDoneBoth => t!(
+            lang,
+            en: "Paired. Both Claude and Qwen are ready to use.",
+            zh: "配对成功，Claude 和 Qwen 两条路都能用了",
+        ),
+        PairDoneQwenOnly => t!(
+            lang,
+            en: "Paired on the free plan: only Qwen is ready. Claude needs a paid upgrade on the camp gateway.",
+            zh: "配对成功，但这是免费账号：只有 Qwen 那一路能用。Claude 需要在训练营网关上付费升级",
+        ),
+        PairManualHint => {
+            t!(lang, en: "p to fill in a key by hand instead", zh: "按 p 改成手动填密钥")
+        }
+        PairLlmOptIn => t!(
+            lang,
+            en: "AI error explanations are now on.",
+            zh: "报错时的 AI 解释：已经替你打开了",
+        ),
+        PairLlmToggleOn => t!(
+            lang,
+            en: "[x] Let AI explain errors you can't read (sends the raw error text from your terminal to the camp gateway)",
+            zh: "[×] 报错看不懂时让 AI 解释（会把终端上的报错原文发给训练营网关）",
+        ),
+        PairLlmToggleOff => t!(
+            lang,
+            en: "[ ] Let AI explain errors you can't read (sends the raw error text from your terminal to the camp gateway)",
+            zh: "[ ] 报错看不懂时让 AI 解释（会把终端上的报错原文发给训练营网关）",
+        ),
+        PairLlmAlreadySet => t!(
+            lang,
+            en: "Your config.toml already has an [llm] section, so pairing leaves it exactly as it is.",
+            zh: "你的 config.toml 里已经写了 [llm]，这次配对不会去改它",
+        ),
+        PairLlmToggle => t!(
+            lang,
+            en: "AI explanations on/off",
+            zh: "AI 解释开关",
+        ),
+        PairStartSession => t!(
+            lang,
+            en: "start the session",
+            zh: "开始使用",
+        ),
+        ReopenBrowser => t!(lang, en: "reopen browser", zh: "重开浏览器"),
+        Retry => t!(lang, en: "retry", zh: "重试"),
+        ManualEntry => t!(lang, en: "fill in by hand", zh: "手动填"),
+
         StaleData => t!(
             lang,
             en: "Cannot reach the dct service — what you see may be out of date",
@@ -1283,6 +1424,50 @@ pub mod msg {
             lang,
             en: format!("Could not open a browser — visit {url} yourself"),
             zh: format!("打不开浏览器，自己去访问 {url}"),
+        )
+    }
+
+    /// 配对起步/轮询撞上的、dct 没有专门词条的失败原因（`PairStarted`
+    /// 的 `Err` 字符串、`PairTick::Failed` 兜底那一支）。**原样带上原因码**
+    /// ——报码不组句是 daemon 一侧的规矩（见 `proto::ErrorCode` 头上的
+    /// 注释），这里在界面这一侧把它套进一句人话，但不替它编一个更具体的
+    /// 说法：编错了比说不清更容易把人导向错误的下一步。
+    pub fn pair_failed(lang: Lang, reason: &str) -> String {
+        t!(
+            lang,
+            en: format!("Pairing failed ({reason})"),
+            zh: format!("配对失败（{reason}）"),
+        )
+    }
+
+    /// Waiting 屏上的倒计时。分:秒，`0` 封底——`deadline` 已经过了的那一帧
+    /// 不该显示负数，轮询很快会把这一屏换成 `Failed`，这一帧只是过渡。
+    pub fn pair_countdown(lang: Lang, remaining: std::time::Duration) -> String {
+        let secs = remaining.as_secs();
+        let (m, s) = (secs / 60, secs % 60);
+        t!(
+            lang,
+            en: format!("{m:02}:{s:02} left"),
+            zh: format!("剩余 {m:02}:{s:02}"),
+        )
+    }
+
+    /// 成功屏正文里那一句：Enter 会打开什么。
+    ///
+    /// **这一屏必须自己说出 Enter 干什么。** 它要按一下 Enter 而不是自动
+    /// 跳，是为了让免费账号的学生先读到「Claude 需要付费升级」那句话
+    /// （见 `ui::view::PairReturn::StartSession`）。可是这个可供性以前只
+    /// 写在底栏的「Enter 开始使用」里，而那四个字没说开始使用什么——最
+    /// 可能的误读是「配对已经办完了，Esc 就是出口」，而 Esc 恰好会把他
+    /// 要的那个会话丢掉，正是那道门要防的那件事。
+    ///
+    /// 只在真有会话可回的时候说（`PairReturn::StartSession`）；从密钥页
+    /// 进来的那条路 Enter 没有东西可开，这句话在那儿就是假的。
+    pub fn pair_start_session_line(lang: Lang, profile: &str) -> String {
+        t!(
+            lang,
+            en: format!("Press Enter to start this project with {profile}."),
+            zh: format!("按 Enter 用 {profile} 开始这个项目"),
         )
     }
 
@@ -1997,6 +2182,19 @@ pub mod msg {
             zh: format!("{label} 已经装好了。"),
         )
     }
+
+    /// 设置页顶上那一行——**唯一能跟下载页上「敲 `dct --version` 看到的
+    /// 数字」对上的地方**（界面别处一处都不印版本号）。`version` 从调用方
+    /// 传进来，取自 `env!("CARGO_PKG_VERSION")`（跟 `pair::user_agent()`
+    /// 同一个来源），不在这里写死——写死的字符串会在下一次发版时悄悄
+    /// 变成一句假话，而不会有任何编译错误提醒改这里的人。
+    pub fn dct_version(lang: Lang, version: &str) -> String {
+        t!(
+            lang,
+            en: format!("dct version {version}"),
+            zh: format!("dct 版本 {version}"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2187,6 +2385,26 @@ mod tests {
             ReasonNeedsSecret,
             ReasonNotInstalled,
             GroupNotEmpty,
+            AutoPair,
+            PairContacting,
+            PairEnterCodeInBrowser,
+            PairCodeExpired,
+            PairKeyUnreadable,
+            PairDenied,
+            PairNotEnabled,
+            PairProfileUnreadable,
+            PairDoneBoth,
+            PairDoneQwenOnly,
+            PairManualHint,
+            PairLlmOptIn,
+            PairLlmToggleOn,
+            PairLlmToggleOff,
+            PairLlmAlreadySet,
+            PairLlmToggle,
+            PairStartSession,
+            ReopenBrowser,
+            Retry,
+            ManualEntry,
         ]
     };
 
@@ -2216,7 +2434,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 167, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 187, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
