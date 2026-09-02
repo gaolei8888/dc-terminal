@@ -48,6 +48,11 @@ en = "Requires Node.js"
 OPENAI_BASE_URL = "https://dc-llm.tzspace.cn/v1"
 # 带 `/v1`：这个 CLI 把 base_url 当成 API 根，后面自己接 `/chat/completions`。
 # 实测里正是这样落到网关上的。
+#
+# 这里没有、也永远不会有一对注释掉的 OPENAI_MODEL / OPENAI_SMALL_FAST_MODEL：
+# 配对把它们写进 `~/.dct/pair-models.toml` 的 `[qwen]` 段，`session.rs::
+# create_inner` 起会话时合进子进程 env，这份 profile 文件不动——原因跟
+# `dc.toml` 里 `[env]` 那段一样，不重复。
 
 [secret]
 env = "OPENAI_API_KEY"
