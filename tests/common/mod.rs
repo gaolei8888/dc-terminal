@@ -165,28 +165,62 @@ impl FakeGateway {
 
 /// 读一条 HTTP/1.1 请求，只要它的请求行（`POST /admin/api/pair/poll ...`）。
 ///
-/// **不解析 body。** 假网关的回答只看「敲的是 start 还是 poll 这条路」和
-/// 「这是第几次敲」，从不看学生这边发了什么设备码——`pair_http.rs` 已经有
-/// 单元测试钉住「dct 发出去的 body 长什么样」，这里不用重复验证。不读 body
-/// 会让 `Content-Length` 之后的字节留在 TCP 缓冲区里，但因为每次请求后都
-/// `connection: close`，那点残留字节跟着这条连接一起被扔掉，不会串到下一
-/// 条请求头里。
+/// **body 的内容不解析。** 假网关的回答只看「敲的是 start 还是 poll 这条
+/// 路」和「这是第几次敲」，从不看学生这边发了什么设备码——`pair_http.rs`
+/// 已经有单元测试钉住「dct 发出去的 body 长什么样」，这里不用重复验证。
+///
+/// **但字节数必须读干净，不能只读到头部的空行就撒手。** 这里原来的理由
+/// 是「反正 `connection: close`，body 剩下的字节跟着这条连接一起被扔
+/// 掉」——这个理由是错的：关一个接收缓冲区里还有未读数据的 socket，内核
+/// 发的是 RST，不是干净的 FIN（POSIX「abortive close」那条规则）。
+/// `write_json_response` 写完响应就让 `stream`在调用方的循环末尾被
+/// drop，如果这时候 ureq 发的 POST body 还有字节没读，对端看到的就是
+/// 连接被重置，而不是一次正常收尾——ureq 把它报成一句看不出原因的
+/// 「header 解析失败」（`Error encountered in a header`），线程数一多，
+/// 响应写完到 ureq 读完之间的窗口变宽，这条报错就从「测不出来」变成
+/// 「常常炸」。把 body 按 `Content-Length` 读干净，关的时候接收缓冲区
+/// 是空的，内核走的才是正常的 FIN。
 fn read_request_path(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    loop {
+    let header_end = loop {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            // 对端提前断了连接：没有头部，也没有 body 可等。
+            return String::new();
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        // 请求头以空行结束；请求行永远是第一行，早于这个空行到达。
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    // 大小写不敏感——ureq 发的是小写，但没理由把这一点焊死在测试夹具里。
+    let content_length: usize = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    // 头部结束之后，`buf` 里可能已经带了一部分甚至全部 body——一次 `read`
+    // 拿到的是内核缓冲区里当时有的所有字节，不会精确停在头部结尾那一个
+    // 字节上。剩下的才需要继续读。
+    let mut have = buf.len() - header_end;
+    while have < content_length {
         let n = stream.read(&mut chunk).unwrap_or(0);
         if n == 0 {
             break;
         }
-        buf.extend_from_slice(&chunk[..n]);
-        // 请求头以空行结束；请求行永远是第一行，早于这个空行到达。
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
+        have += n;
     }
-    let text = String::from_utf8_lossy(&buf);
-    text.lines()
+    header_text
+        .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("")
@@ -201,6 +235,11 @@ fn write_json_response(stream: &mut TcpStream, body: &str) {
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
+    // 主动半关闭写端，而不是把 `stream`留给调用方的循环末尾去 drop——
+    // 请求的 body 已经在 `read_request_path` 里读干净了，所以这一步换来
+    // 的是一次正常的连接收尾，不再依赖「drop 的时候内核那边正好也没有
+    // 别的动作」这种巧合。
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 /// `/admin/api/pair/start` 的固定回答。**`interval` 给 1，不是生产的 3**：
