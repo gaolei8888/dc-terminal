@@ -108,6 +108,9 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 自己在哪。所以不再用 `msg::title_with` 把两句拼成一个 `String`。
     let base = text(Key::BoardTitle, app.lang);
     let mut title = vec![Span::raw(format!("{base} "))];
+    // 这一行左半边（标题 + 牌子 + 断连）实际吃掉了多少列——版本号是否有
+    // 命放在右边，得拿这个数去跟屏幕宽度比，不能只看牌子自己的预算。
+    let mut used = display_width(base) + 1;
     if let Some(gi) = current {
         let g = &app.groups[gi];
         // 预算：整行减掉标题、断连那半句、和右边至少留的几列横线。量不下
@@ -121,19 +124,46 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 display_width(text(Key::Disconnected, app.lang)) + 4
             };
         let room = (area.width as usize).saturating_sub(taken + 6);
-        let chip = project_label(&g.name, &g.parent, room.saturating_sub(2));
+        let chip = format!(
+            " {} ",
+            project_label(&g.name, &g.parent, room.saturating_sub(2))
+        );
+        used += display_width(&chip);
         title.push(Span::styled(
-            format!(" {chip} "),
+            chip,
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
         ));
     }
     if !app.connected {
-        title.push(Span::styled(
-            format!("（{}）", text(Key::Disconnected, app.lang)),
-            Style::default().fg(Color::Red),
-        ));
+        let warn = format!("（{}）", text(Key::Disconnected, app.lang));
+        used += display_width(&warn);
+        title.push(Span::styled(warn, Style::default().fg(Color::Red)));
     }
     let title = Line::from(title);
+
+    // 版本号：这一行上最不值钱的一段。学生装完在下载页被告知来对版本号，
+    // 但眼睛第一眼看的是看板，不是要另外翻到的设置页——所以补一份，跟
+    // 设置页共用同一个 `msg::dct_version`，两处不会因为各写一份文案而
+    // 吵起来（也不会有人在这里手写版本号）。
+    //
+    // 位置钉在整行最右端（`title_top` 独立于左边那个 `title`，靠
+    // `right_aligned` 贴边框右角），不是接在断连那半句后面——那半句已经
+    // 是全屏唯一一处红字，版本号没资格再往它旁边挤。
+    //
+    // 但它得给别人让路：宽度不够时，横线先被压缩、牌子先退化、断连那句
+    // 红字最后才可能被牺牲——版本号必须在这一切发生之前就自己消失，不
+    // 能靠 `Block` 自动裁剪硬挤掉别的东西（两个 title 的宽度加起来超过
+    // 屏幕宽度时谁盖住谁是未定义的观感，不能拿去赌）。所以这里手动算宽度、
+    // 手动决定要不要贴这个 title，而不是无条件塞给 `title_top`。
+    let version = msg::dct_version(app.lang, env!("CARGO_PKG_VERSION"));
+    let version_width = display_width(&version);
+    // 版本号和左边内容之间至少留一格空白，版本号右边（贴着边框角）至少
+    // 留 2 列可见的横线——不然它会看着像是被边框切掉了一半，而不是特意
+    // 贴边显示。
+    const MIN_GAP_BEFORE_VERSION: usize = 1;
+    const MIN_RULE_AFTER_VERSION: usize = 2;
+    let show_version = (area.width as usize)
+        >= used + MIN_GAP_BEFORE_VERSION + version_width + MIN_RULE_AFTER_VERSION;
 
     let items: Vec<ListItem> = app
         .rows
@@ -297,15 +327,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 花在了「背景还剩多少看得见」上。
     //
     // 底下那条边框还是去掉了：少一条线，还给列表一行。
+    let mut block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(border_style)
+        .title(title);
+    if show_version {
+        block = block.title_top(Line::from(Span::styled(version, dim())).right_aligned());
+    }
     f.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(border_style)
-                    .title(title),
-            )
-            .highlight_symbol("▶ "),
+        List::new(items).block(block).highlight_symbol("▶ "),
         area,
         &mut app.list_state,
     );
@@ -730,6 +760,55 @@ mod tests {
             .find("连接已断开")
             .unwrap_or_else(|| panic!("少了断连提示：{title}"));
         assert!(name_at < warn_at, "牌子要在断连那半句前面：{title}");
+    }
+
+    /// **宽屏下标题行右端写着运行版本号。** 断言用的是
+    /// `env!("CARGO_PKG_VERSION")`，不是某个写死的字符串——版本号一发新版
+    /// 就会变，字面量断言下一次发版就得红。
+    #[test]
+    fn the_title_shows_the_running_version_when_there_is_room() {
+        let (mut app, dir) = App::test_app();
+        let mine = real_dir(&dir, "dc-terminal");
+        app.set_sessions(vec![sess(1, &mine)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let title = title_text(&term);
+        assert!(
+            title.contains(env!("CARGO_PKG_VERSION")),
+            "宽屏下标题行要写版本号：{title}"
+        );
+    }
+
+    /// **窄屏下版本号是第一个让路的东西**，项目名和断连提示都还得在。
+    ///
+    /// 这条测试钉住优先级：版本号在这一行上最不值钱，横线可以被压没、
+    /// 牌子可以退化、断连那句红字最后才可能被牺牲，但版本号必须先消失。
+    /// 少了这条测试，下一个碰这段代码的人不会知道这个顺序是刻意的。
+    #[test]
+    fn a_narrow_title_drops_the_version_before_anything_else() {
+        let (mut app, dir) = App::test_app();
+        // 名字选得够短，保证 60 列上不会被牌子自己的退化逻辑先截断——
+        // 这条测试要钉住的是版本号的优先级，不是牌子退化的行为，两者
+        // 混在一起断言，牌子那边的正常截断会被误读成版本号抢了它的位置。
+        let mine = real_dir(&dir, "app");
+        app.set_sessions(vec![sess(1, &mine)]);
+        app.connected = false;
+
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let title = title_text(&term);
+        assert!(
+            !title.contains(env!("CARGO_PKG_VERSION")),
+            "60 列上版本号该已经被让掉了：{title}"
+        );
+        assert!(title.contains("app"), "项目名不许被版本号挤掉：{title}");
+        assert!(
+            title.contains("连接已断开"),
+            "断连提示不许被版本号挤掉：{title}"
+        );
     }
 
     /// **戴上牌子之后，80 列的中文项目名仍然挤不掉行尾那句红字。**
