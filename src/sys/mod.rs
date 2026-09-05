@@ -15,6 +15,7 @@
 //! 达不到同样强度的地方，在各自的文件里点名说清楚，不假装。
 pub mod fs;
 pub mod ipc;
+pub mod job;
 pub mod proc;
 pub mod shell;
 pub mod signal;

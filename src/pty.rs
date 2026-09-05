@@ -128,6 +128,11 @@ pub struct PtySession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     alive: Arc<AtomicBool>,
+    /// 这个会话的整棵进程树，Windows 上才有（见 `sys::job`）。
+    ///
+    /// 拿在手里而不是圈完就扔：`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 挂在
+    /// 最后一个句柄上，扔掉等于当场把刚起来的会话杀了。
+    job: Option<crate::sys::job::Job>,
     _master: Box<dyn MasterPty + Send>,
 }
 
@@ -190,6 +195,11 @@ impl PtySession {
             crate::proto::coded(crate::proto::ErrorCode::CannotStart(cmd[0].clone()))
         })?;
 
+        // **紧接着 spawn 圈进 job**，中间不插任何别的事：那几微秒正是
+        // `sys::job` 头里说的那道缝。拿不到 pid 说明子进程已经没了，那时候
+        // 也没什么要圈的；圈不上（`None`）会话照常起，见 `Job::confine`。
+        let job = child.process_id().and_then(crate::sys::job::Job::confine);
+
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_ROWS)));
         let writer = Arc::new(Mutex::new(pty.master.take_writer()?));
         let alive = Arc::new(AtomicBool::new(true));
@@ -216,6 +226,7 @@ impl PtySession {
             writer,
             child: Arc::new(Mutex::new(child)),
             alive,
+            job,
             _master: pty.master,
         })
     }
@@ -373,8 +384,22 @@ impl PtySession {
         let _ = child.kill();
         let _ = child.wait();
         drop(child);
+        // **直接子进程死了不等于这个会话死了。** Windows 上我们 spawn 的是
+        // `cmd.exe /c ...\claude.CMD`，真正的 agent 是它的孩子，上面那一下
+        // 打不到（实测：`dct kill` 报了「已杀」，`claude.exe` 还活着）。
+        // 放在 `child.kill()` **之后**是为了不吃掉那 200ms 宽限期——先让
+        // agent 有机会自己收尾，收完再扫一遍剩下的。
+        self.sweep();
         self.alive.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// 把整棵进程树扫掉。Unix 上是空操作（那边靠 pty 的进程组，见
+    /// `sys::job`），所以它不是 `kill()` 的替代品，是它的补充。
+    fn sweep(&self) {
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
     }
 
     /// 立刻 SIGKILL，不给宽限期。
@@ -390,6 +415,9 @@ impl PtySession {
     /// 拿不到 pid（子进程已经没了）不算失败：目标状态就是「它不在了」，
     /// 而它确实不在了。照样 wait 一次把可能存在的尸体收掉。
     pub fn kill_now(&mut self) -> Result<()> {
+        // 这条路的意思就是「一次都别等」，所以整棵树先一起打掉，再走下面
+        // 那一下 + 收尸。顺序跟 `kill()` 相反，理由也正相反。
+        self.sweep();
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pid) = child.process_id() {
             // pid 来自我们自己 spawn 的子进程，最坏情况是它已经退出、这一下
@@ -856,6 +884,71 @@ mod tests {
         // 没收尸」，那正是它要守的东西。
         let alive_in_table = crate::sys::proc::alive(pid);
         assert!(!alive_in_table, "{pid} 还留在进程表里，说明没 wait 收尸");
+    }
+
+    /// `dct kill` 曾经说了一句它没做到的话。
+    ///
+    /// 2026-09-05 真机实测：`dct kill 3` 打印 `Killed session 3`、`dct ps`
+    /// 立刻变 `stopped`，而那个会话的 `claude.exe` 还在进程表里活着——因为
+    /// Windows 上 spawn 的是 `cmd.exe /c ...\claude.CMD`，`TerminateProcess`
+    /// 只打得到 `cmd.exe` 那一层。补法见 `sys::job`。
+    ///
+    /// **判据用文件长度，不用 pid**：夹具里的孙子进程是 MSYS 的 sh 起的，
+    /// `$!` 给的是 MSYS 自己那套 pid，跟 `sys::proc::alive` 认的 Windows pid
+    /// 不是一回事。杀完之后文件还在长，就是孙子还活着——这一条不依赖任何
+    /// pid 翻译。
+    ///
+    /// 孙子进程写满 200 次自己就停（约 40 秒）。这条测试要是红了，说明整棵
+    /// 树没杀干净，那时候正好不该再留一个永远循环的进程在机器上。
+    ///
+    /// Unix 不跑这一条：那边的保证来自 pty 的前台进程组，跟这里的 job
+    /// object 是两套东西（见 `sys::job` 模块头）。
+    #[test]
+    #[cfg(windows)]
+    fn kill_takes_the_whole_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        // 相对路径：pty 的 cwd 就是这个临时目录，省掉把 Windows 路径塞进
+        // sh 脚本时的反斜杠转义。
+        let mut p = PtySession::spawn(
+            &crate::sys::testing::sh_c(
+                "for i in $(seq 1 200); do echo x >> tick; sleep 0.2; done &                  echo READY; sleep 300",
+            ),
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&p, "READY"), "夹具没起来");
+
+        let tick = dir.path().join("tick");
+        let grew = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = 0;
+            while Instant::now() < deadline {
+                if let Ok(m) = std::fs::metadata(&tick) {
+                    if m.len() > seen && seen > 0 {
+                        break;
+                    }
+                    seen = m.len();
+                }
+                sleep(Duration::from_millis(100));
+            }
+            seen > 0
+        };
+        assert!(grew, "孙子进程根本没跑起来，这条测试就守不住任何东西");
+
+        p.kill().unwrap();
+
+        let after_kill = std::fs::metadata(&tick).map(|m| m.len()).unwrap_or(0);
+        // 孙子每 200ms 写一次，等 1.5 秒足够看出它还在不在写。
+        sleep(Duration::from_millis(1500));
+        let later = std::fs::metadata(&tick).map(|m| m.len()).unwrap_or(0);
+
+        assert_eq!(
+            after_kill, later,
+            "杀掉会话之后孙子进程还在写（{after_kill} → {later}），             整棵进程树没带走——这正是 `dct kill` 报「已杀」却留下 claude.exe 的那个洞"
+        );
     }
 
     #[test]
