@@ -99,6 +99,72 @@ touches nothing already on the system). macOS and Linux usually have git
 already; when they don't, the installer names the one command to run.
 
 <details>
+<summary>Will this machine do?</summary>
+
+<br>
+
+**Recommended** — buy to this column. It's what "ten agents, one front door"
+costs when you actually open ten:
+
+| | |
+|---|---|
+| OS | Windows 11 / macOS 14 / Ubuntu 24.04 |
+| CPU | 8 cores |
+| RAM | **16 GB** |
+| Disk | SSD, 20 GB free |
+
+**Minimum** — the floor for *running at all*, **not a recommendation**: two or
+three agents fill it, and the fourth starts swapping.
+
+| | |
+|---|---|
+| OS | Windows 10 1809 (build 17763) / macOS 12 / Ubuntu 22.04 |
+| CPU | dual core, x86_64 or Apple Silicon |
+| RAM | **8 GB** |
+| Disk | 5 GB free |
+
+The RAM row is **measured, not guessed**. With five claude sessions open at once
+on one machine: each `claude.exe` holds 250–400 MB resident (301 MB average), the
+daemon itself 23 MB, plus a ten-odd MB shell process per session. That's about
+**320 MB per agent**. On 8 GB, after the OS and a browser, two or three is the
+honest number; a full board needs 16 GB.
+
+**CPU is not the bottleneck — don't size the machine by it.** dct itself burns
+almost none, and agents spend most of their time waiting on an API. What actually
+eats CPU is the builds and tests the agent runs for you, so pick core count by
+how long *your project* takes to compile, not by how many agents you want.
+
+Disk is dominated by the layer underneath dct, not dct itself (a 5.5 MB
+executable). Measured here: 95 MB for the Node runtime, 416 MB for the `claude`
+npm package alone, plus 45 MB for the portable git on Windows machines that
+lack one. Around 600 MB installed; the rest is your projects, the git snapshots,
+and the transcripts — and those grow: `~/.claude` reached 185 MB in a week here.
+
+**These are hard floors, not preferences:**
+
+- **Windows 10 1809 (build 17763).** dct's pseudo-terminal is ConPTY, a system
+  API that arrived in 1809, and there is no winpty fallback in the code. Note
+  that **the installer only checks the PowerShell version** (5.0+), so 1607-era
+  Windows 10 installs fine and then fails to start. Check `winver` first.
+- **64-bit only.** The published builds are x86_64 and Apple Silicon. No 32-bit.
+- **No native Windows on ARM build.** It should run under the x64 compatibility
+  layer, but that is untested — don't standardize a classroom on it.
+- **Linux is x86_64 only, and needs glibc 2.35+** (the package is built on
+  Ubuntu 22.04). Ubuntu 20.04 won't start, and the error it prints is a dynamic
+  linker message with nothing to do with dct. No prebuilt package for ARM boards.
+- **Older macOS is untested, not ruled out.** Apple Silicon is 11+ by
+  construction; the Intel build is cross-compiled against the macOS 14 SDK with
+  no deployment target pinned, so below 12 is unknown territory.
+- **git is required, not optional** — the pre-turn snapshot is built on it, and
+  that snapshot is the whole reason dct dares turn permission prompts off.
+
+**The machine running the models is not in this table.** Everything above sizes
+the machine that *drives* the agents. The model lives behind the gateway, so
+this machine **needs no GPU**.
+
+</details>
+
+<details>
 <summary>When the classroom network can't reach GitHub</summary>
 
 <br>
