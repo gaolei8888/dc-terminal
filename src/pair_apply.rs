@@ -80,31 +80,7 @@ fn apply_inner(
             .map_err(|e| format!("qwen_secret_write_failed: {e}"))?;
     }
 
-    // 第二步：模型名，不是钥匙。免费账号的 anthropic 那组是空的，这里绝不
-    // 编一个模型名进去：一个解析不出模型的 `ANTHROPIC_MODEL` 比没有这行
-    // 更坏，学生会撞上一个没有任何解释的 404。空的那一组不落一个 section，
-    // 而不是落一个空 section——`[dc]` 段存在与否，直接就是「这个账号有没有
-    // Anthropic 那一路」这件事本身，不用去看里面有没有键。
-    // 网关现在保证一组模型要么两个都有要么两个都没有（有一份网关侧的测试
-    // 钉着这件事），所以下面这个「有 default 没 small_fast 就借 default
-    // 顶上」的分支照今天的契约永远走不到。留着它是防那份保证哪天悄悄破了：
-    // 不这样兜的话，`ANTHROPIC_SMALL_FAST_MODEL` 就是没写，起标题、扫文件
-    // 那个便宜模型悄悄用回 agent 自己的默认值——会话看起来一切正常（主模型
-    // 照常答问题），只有标题和文件扫描这两件不起眼的小事在课堂上时好时坏，
-    // 没有人能把这种「有时候不好使」跟一个具体原因对上。一行 belt，防一个
-    // 今天看不见、一旦发生没人能诊断的失败。
-    let mut dc_env = BTreeMap::new();
-    if let Some(m) = &a.models.anthropic.default {
-        dc_env.insert("ANTHROPIC_MODEL".to_string(), m.clone());
-        dc_env.insert(
-            "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
-            a.models
-                .anthropic
-                .small_fast
-                .clone()
-                .unwrap_or_else(|| m.clone()),
-        );
-    }
+    // DC 与 Qwen 都运行 Qwen Code，只使用网关返回的 OpenAI 模型名。
     let mut qwen_env = BTreeMap::new();
     if let Some(m) = &a.models.openai.default {
         qwen_env.insert("OPENAI_MODEL".to_string(), m.clone());
@@ -118,10 +94,8 @@ fn apply_inner(
         );
     }
     let mut sections = BTreeMap::new();
-    if !dc_env.is_empty() {
-        sections.insert("dc".to_string(), dc_env);
-    }
     if !qwen_env.is_empty() {
+        sections.insert("dc".to_string(), qwen_env.clone());
         sections.insert("qwen".to_string(), qwen_env);
     }
     write_pair_models(home, &sections)?;
@@ -138,17 +112,10 @@ fn apply_inner(
     if opt_in_llm {
         if let Some((provider, model)) = a
             .models
-            .anthropic
+            .openai
             .default
             .as_ref()
-            .map(|m| ("dc", m.clone()))
-            .or_else(|| {
-                a.models
-                    .openai
-                    .default
-                    .as_ref()
-                    .map(|m| ("qwen", m.clone()))
-            })
+            .map(|m| ("qwen", m.clone()))
         {
             let config_path = home.join("config.toml");
             llm_written = llm_enable(&config_path, provider, &model)?;
@@ -204,6 +171,13 @@ pub fn env_for(home: &Path, profile: &str) -> BTreeMap<String, String> {
     let Ok(doc) = raw.parse::<toml::Table>() else {
         return BTreeMap::new();
     };
+    // 旧版本的自动配对文件把 DC 存成 Anthropic 模型；升级后使用同文件的
+    // Qwen 模型。手写文件仍逐段读取，不猜测用户意图。
+    let profile = if profile == "dc" && raw.starts_with(MARK) {
+        "qwen"
+    } else {
+        profile
+    };
     let Some(section) = doc.get(profile).and_then(|v| v.as_table()) else {
         return BTreeMap::new();
     };
@@ -234,30 +208,23 @@ mod tests {
         assert_eq!(s.get("qwen"), Some("sk-live"));
     }
 
-    /// 两个 Anthropic 变量都要写进 `[dc]` 段。只钉主模型的话，起标题、扫
-    /// 文件那个便宜的快模型会以课堂上没人查得出来的方式坏掉。
+    /// 配对保存网关给出的主模型和小模型。
     #[test]
-    fn both_anthropic_model_variables_get_written() {
+    fn both_openai_model_variables_get_written() {
         let dir = tempfile::tempdir().unwrap();
         let store = Mutex::new(crate::secrets::SecretStore::load(
             &dir.path().join("secrets.toml"),
         ));
         apply(&approved_with_both_wires(), dir.path(), &store, false).unwrap();
         let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
-        assert!(raw.contains("ANTHROPIC_MODEL = \"claude-x\""), "{raw}");
+        assert!(raw.contains("OPENAI_MODEL = \"qwen3.8:27b\""), "{raw}");
         assert!(
-            raw.contains("ANTHROPIC_SMALL_FAST_MODEL = \"claude-small\""),
+            raw.contains("OPENAI_SMALL_FAST_MODEL = \"qwen-small\""),
             "{raw}"
         );
     }
 
-    /// 网关保证一组模型要么两个都有要么两个都没有，今天这条按契约永远
-    /// 走不到——写它是防那份保证哪天悄悄破了：`default` 有、`small_fast`
-    /// 没有的时候，两个变量都该落在 `default` 上，而不是把
-    /// `*_SMALL_FAST_MODEL` 悬空。悬空的后果是会话看起来一切正常（主模型
-    /// 照常答问题），只有起标题、扫文件这两件不起眼的小事在课堂上时好时坏
-    /// ——没人会把这种「有时候不好使」跟一个具体原因对上，见这个改动的
-    /// 提交信息。Anthropic 和 openai 两组各测一遍。
+    /// 缺少 small_fast 时，两个入口都使用网关的 default。
     #[test]
     fn a_default_without_a_small_fast_model_borrows_default_for_both() {
         let dir = tempfile::tempdir().unwrap();
@@ -268,22 +235,18 @@ mod tests {
         a.models.anthropic.small_fast = None;
         a.models.openai.small_fast = None;
         apply(&a, dir.path(), &store, false).unwrap();
-        let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
-        assert!(
-            raw.contains("ANTHROPIC_SMALL_FAST_MODEL = \"claude-x\""),
-            "缺 small_fast 时该借 default 顶上：{raw}"
-        );
-        assert!(
-            raw.contains("OPENAI_SMALL_FAST_MODEL = \"qwen3.8:27b\""),
-            "openai 那一组也一样：{raw}"
-        );
+        for profile in ["dc", "qwen"] {
+            let env = env_for(dir.path(), profile);
+            assert_eq!(env["OPENAI_MODEL"], "qwen3.8:27b");
+            assert_eq!(env["OPENAI_SMALL_FAST_MODEL"], "qwen3.8:27b");
+        }
     }
 
     /// 免费账号：anthropic 那一组是空的。钥匙照写，**模型名一个都不许编**——
     /// 写一个跑不通的模型名比不写更坏，学生会撞上一个没有任何解释的 404。
-    /// 文件里只该有 `[qwen]`，`[dc]`/`ANTHROPIC_MODEL` 一处都不该出现。
+    /// 文件里应有 `[dc]` 和 `[qwen]`，不应有 `ANTHROPIC_MODEL`。
     #[test]
-    fn a_free_account_gets_only_the_qwen_section_and_no_invented_model_name() {
+    fn a_free_account_gets_dc_and_qwen_with_the_same_openai_models() {
         let dir = tempfile::tempdir().unwrap();
         let store = Mutex::new(crate::secrets::SecretStore::load(
             &dir.path().join("secrets.toml"),
@@ -294,10 +257,7 @@ mod tests {
         assert_eq!(store.lock().unwrap().get("dc"), Some("sk-live"));
         let raw = std::fs::read_to_string(dir.path().join("pair-models.toml")).unwrap();
         assert!(!raw.contains("ANTHROPIC_MODEL"), "没有就不许写：{raw}");
-        assert!(
-            !raw.contains("[dc]"),
-            "没有模型名就不该有这个 section：{raw}"
-        );
+        assert!(raw.contains("[dc]"), "DC 应使用相同的 OpenAI 模型：{raw}");
         assert!(raw.contains("[qwen]"), "{raw}");
     }
 
@@ -323,7 +283,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("pair-models.toml"),
-            format!("{MARK}\n\n[dc]\nANTHROPIC_MODEL = \"claude-x\"\n"),
+            "[dc]\nANTHROPIC_MODEL = \"claude-x\"\n",
         )
         .unwrap();
         let dc = env_for(dir.path(), "dc");
@@ -336,6 +296,17 @@ mod tests {
 
         let missing = tempfile::tempdir().unwrap();
         assert!(env_for(missing.path(), "dc").is_empty());
+    }
+
+    #[test]
+    fn dc_reuses_qwen_models_from_an_old_generated_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pair-models.toml"), format!(
+            "{MARK}\n[dc]\nANTHROPIC_MODEL = \"claude-old\"\n[qwen]\nOPENAI_MODEL = \"qwen-existing\"\n"
+        )).unwrap();
+        let env = env_for(dir.path(), "dc");
+        assert_eq!(env["OPENAI_MODEL"], "qwen-existing");
+        assert!(!env.contains_key("ANTHROPIC_MODEL"));
     }
 
     /// `opt_in_llm` 为真、免费账号：没有 Anthropic 模型名，落到 openai 那组，

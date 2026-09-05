@@ -31,7 +31,7 @@ command = ["npm", "i", "-g", "@qwen-code/qwen-code"]
 zh = "需要先装 Node.js"
 en = "Requires Node.js"
 
-# 这个 profile 是 OpenAI 方言那一侧的入口，和 `dc.toml` 互补。
+# 这个 profile 是 OpenAI 方言那一侧的入口，与 `dc.toml` 使用相同运行时。
 #
 # Claude Code 只说 Anthropic 方言，而我们自己的 GPU 上跑的模型说 OpenAI 方言，
 # 中间没有翻译——所以在 Claude Code 里选千问会撞上网关的 404（见
@@ -51,8 +51,7 @@ OPENAI_BASE_URL = "https://dc-llm.tzspace.cn/v1"
 #
 # 这里没有、也永远不会有一对注释掉的 OPENAI_MODEL / OPENAI_SMALL_FAST_MODEL：
 # 配对把它们写进 `~/.dct/pair-models.toml` 的 `[qwen]` 段，`session.rs::
-# create_inner` 起会话时合进子进程 env，这份 profile 文件不动——原因跟
-# `dc.toml` 里 `[env]` 那段一样，不重复。
+# create_inner` 起会话时合进子进程 env，这份 profile 文件不动——无需覆盖用户的 profile。
 
 [secret]
 env = "OPENAI_API_KEY"

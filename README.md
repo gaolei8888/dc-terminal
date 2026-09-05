@@ -287,7 +287,7 @@ fixing it instead of just saying no:
 
 | | | needs |
 |---|---|---|
-| DC | the training camp's own endpoint, wearing Claude's face | `claude` + a key |
+| DC | the training camp's gateway, using Qwen Code by default | `qwen` + a key |
 | Claude | Anthropic's CLI | `claude` |
 | Codex | OpenAI's CLI | `codex` |
 | OpenCode | open source, many models | `opencode` |
@@ -297,6 +297,12 @@ fixing it instead of just saying no:
 | DeepSeek | same trick | `claude` + a key |
 | Qwen API | same trick | `claude` + a key |
 | Terminal | a plain shell | |
+
+DC now runs Qwen Code by default and reuses Qwen models saved by earlier automatic
+pairing. A custom `profiles/dc.toml` still overrides the builtin. If your existing
+`[llm]` uses `provider = "dc"` with a Claude model, change it to `provider = "qwen"`,
+`transport = "http"`, and an OpenAI-compatible `model` available to your account.
+Existing `[llm]` settings are not rewritten automatically.
 
 DC and the last four aren't separate programs at all. They're `claude` pointed
 at another Anthropic-compatible endpoint, which is why they want both the binary

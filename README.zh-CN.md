@@ -247,7 +247,7 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。你选的项目
 
 | | | 需要 |
 |---|---|---|
-| DC | 训练营自己的端点，套着 Claude 的壳 | `claude` + 一份密钥 |
+| DC | 训练营自己的网关，默认运行 Qwen Code | `qwen` + 一份密钥 |
 | Claude | Anthropic 官方命令行 | `claude` |
 | Codex | OpenAI 官方命令行 | `codex` |
 | OpenCode | 开源，能接不少模型 | `opencode` |
@@ -257,6 +257,11 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。你选的项目
 | DeepSeek | 同样的路子 | `claude` + 一份密钥 |
 | Qwen API | 同样的路子 | `claude` + 一份密钥 |
 | 命令行 | 就是个 shell | |
+
+DC 现在默认运行 Qwen Code。旧版自动配对保存的 Qwen 模型会继续使用；自定义
+`profiles/dc.toml` 仍优先于内置配置。如果之前的 `[llm]` 使用 `provider = "dc"`
+和 Claude 模型，请将它改为 `provider = "qwen"`、`transport = "http"`，并把
+`model` 改为账号可用的 OpenAI 兼容模型；已有 `[llm]` 不会自动改写。
 
 DC 和后面四个都不是独立程序，是把 `claude` 的地址指到另一个 Anthropic 兼容端点上，
 所以它们既要那个二进制，又要一份自己的密钥。

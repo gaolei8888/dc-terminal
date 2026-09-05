@@ -1,70 +1,43 @@
-# 训练营自己的网关。学生自己注册，钥匙在自己的个人空间里拿。
-#
-# 主机名指向 dc-llm.tzspace.cn —— 同一个域名下，`/` 是控制台（注册、个人
-# 空间），`/v1/*` 是网关本身。所以下面三处地址同源，不是三个服务。
-#
-# base_url 不带 `/v1`：Claude Code 自己会往后面接 `/v1/messages`。写成
-# `.../v1` 会让它去请求 `/v1/v1/messages`，那是一个 404，而错误信息里
-# 只会说找不到，不会说是谁多写了一段。
 name = "dc"
-command = ["claude", "--dangerously-skip-permissions"]
+# 使用已验证的 Qwen 启动参数；屏幕状态和恢复参数尚未验证，暂不声明。
+command = ["qwen", "--approval-mode=yolo"]
 is_agent = true
-# 同一把钥匙、同一个网关的另一个入口是 qwen.toml——它也要写这一行。
-# 见 profile.rs::Profile::pairable 的文档注释。
 pairable = true
-# 下面三条正则跟 `claude.toml` 一模一样，**不是抄的，是同一份实测**：
-# 这个 profile 跑的就是 claude 那个二进制，只换了 `ANTHROPIC_BASE_URL`，
-# 而 base_url 不改变它画在屏幕上的任何东西。换掉命令的那天，这三条
-# 要跟着重新实测（见 claude.toml 里那段说明它们是怎么测出来的注释）。
-busy_pattern = "esc to interrupt"
-idle_pattern = "(?m)^❯|bypass permissions on"
-error_pattern = "API Error|Connection closed mid-response"
-resume_args = ["--continue"]
 
 [label]
 zh = "DC"
 en = "DC"
 
 [note]
-zh = "训练营自带，钥匙在个人空间里拿"
-en = "Bundled with the camp; get your key from your own account page"
+zh = "训练营自带，默认使用 Qwen Code"
+en = "Qwen Code through the camp gateway"
 
-# 装的是 claude 那个 CLI——这个 profile 只是把它指向别处，没有自己的包。
-# 名字仍然写 `dc`：界面发给 shell 的是 `dct install dc`，学生看到的
-# 是他自己选的那一项，不是一个他没听过的牌子。
 [install]
-command = ["npm", "i", "-g", "@anthropic-ai/claude-code"]
+command = ["npm", "i", "-g", "@qwen-code/qwen-code"]
 
 [install.note]
 zh = "需要先装 Node.js"
 en = "Requires Node.js"
 
+# DC 默认用 Qwen Code，走网关的 OpenAI 兼容接口。
 [env]
-ANTHROPIC_BASE_URL = "https://dc-llm.tzspace.cn"
-# 下面两行永远保持注释状态——真的模型名不写在这份文件里。配对成功之后，
-# dct 把它们写进 `~/.dct/pair-models.toml` 的 `[dc]` 段，`session.rs::
-# create_inner` 起会话时把那个侧写文件合进子进程的 env，这份 profile 一个
-# 字节不动。本来想过的路子是往 `~/.dct/profiles/dc.toml` 放一份局部覆盖，
-# 但走不通：`all_profiles` 是整条记录替换，不是逐字段合并（见
-# `pair_apply.rs` 文件头那段），一份只写 `[env]` 两行的局部文件连 `command`
-# 都没有，`Profile::command` 又没有 `#[serde(default)]`，根本解析不过去。
-# ANTHROPIC_MODEL = "..."
-# ANTHROPIC_SMALL_FAST_MODEL = "..."
+OPENAI_BASE_URL = "https://dc-llm.tzspace.cn/v1"
+# 模型名由配对写入 pair-models.toml 的 [dc] 段。
 
 [secret]
-env = "ANTHROPIC_AUTH_TOKEN"
+env = "OPENAI_API_KEY"
 url = "https://dc-llm.tzspace.cn/me"
 
 [secret.hint]
-zh = "在 dc-llm.tzspace.cn 登录后，个人空间里复制自己的密钥"
+zh = "在 dc-llm.tzspace.cn 登录后，从个人空间复制自己的密钥"
 en = "Sign in at dc-llm.tzspace.cn and copy the key from your account page"
 
+# 指向 chat/completions 而不是 messages：校验只看状态码，有效的 key 会因为
+# 探测请求里那个假模型名换回 400（放行），无效的 key 换回 401（判坏）。
+# 见 `verify.rs::verify_with`。
 [secret.verify]
-url = "https://dc-llm.tzspace.cn/v1/messages"
+url = "https://dc-llm.tzspace.cn/v1/chat/completions"
 
 [api]
-base_url = "https://dc-llm.tzspace.cn"
-wire = "anthropic"
-
-[headless]
-command = ["claude", "-p"]
+base_url = "https://dc-llm.tzspace.cn/v1"
+wire = "openai"

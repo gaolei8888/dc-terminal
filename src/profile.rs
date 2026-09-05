@@ -732,7 +732,7 @@ mod tests {
     /// 错误文案也一样。漏掉任何一个，那个 agent 就会静默地坏着。
     #[test]
     fn every_claude_based_profile_detects_the_same_errors() {
-        for name in ["dc", "claude", "kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             let re = p
                 .error_regex()
@@ -750,7 +750,7 @@ mod tests {
     /// 东西，然后就不再相信这个标记了。
     #[test]
     fn profiles_with_unknown_error_text_declare_nothing() {
-        for name in ["codex", "opencode", "qwen", "shell"] {
+        for name in ["dc", "codex", "opencode", "qwen", "shell"] {
             assert!(
                 Profile::builtin(name).unwrap().error_pattern.is_none(),
                 "{name} 的错误文案还没见过实物，不该凭空编一条"
@@ -952,8 +952,22 @@ mod tests {
     }
 
     #[test]
+    fn dc_defaults_to_qwen_through_the_camp_gateway() {
+        let p = Profile::builtin("dc").unwrap();
+        assert_eq!(p.command, ["qwen", "--approval-mode=yolo"]);
+        assert_eq!(
+            p.install.unwrap().command,
+            ["npm", "i", "-g", "@qwen-code/qwen-code"]
+        );
+        assert_eq!(p.secret.unwrap().env, "OPENAI_API_KEY");
+        assert_eq!(p.api.as_ref().unwrap().wire, Wire::Openai);
+        assert_eq!(p.env["OPENAI_BASE_URL"], p.api.unwrap().base_url);
+        assert!(p.pairable);
+    }
+
+    #[test]
     fn api_shaped_profiles_run_claude_and_need_a_secret() {
-        for name in ["dc", "kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             assert_eq!(p.command[0], "claude", "{name}: API 形态跑的是 claude");
             assert!(
@@ -998,7 +1012,7 @@ mod tests {
     #[test]
     fn every_agent_we_know_the_flag_for_actually_carries_it() {
         for (name, flag) in [
-            ("dc", "--dangerously-skip-permissions"),
+            ("dc", "--approval-mode=yolo"),
             ("claude", "--dangerously-skip-permissions"),
             ("codex", "--dangerously-bypass-approvals-and-sandbox"),
             ("qwen", "--approval-mode=yolo"),
@@ -1062,7 +1076,7 @@ mod tests {
     fn unverified_profiles_have_no_pattern() {
         // opencode / qwen 的 TUI 没实测过。宁可状态显示「—」，不能瞎猜一个 pattern
         // 然后在看板上编状态。
-        for name in ["opencode", "qwen"] {
+        for name in ["dc", "opencode", "qwen"] {
             let p = Profile::builtin(name).unwrap();
             assert!(
                 p.idle_pattern.is_none() && p.busy_pattern.is_none(),
@@ -1326,7 +1340,9 @@ mod tests {
     /// 和「没验过就不填 pattern」是同一条纪律。不要把这些块加回去。
     #[test]
     fn unverified_clis_declare_no_headless_command() {
-        for name in ["opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api"] {
+        for name in [
+            "dc", "opencode", "qwen", "kimi", "glm", "deepseek", "qwen-api",
+        ] {
             let p = Profile::builtin(name).unwrap();
             assert!(
                 p.headless.is_none(),
@@ -1339,7 +1355,7 @@ mod tests {
 
     #[test]
     fn api_shaped_profiles_declare_an_api_block() {
-        for name in ["dc", "kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             let api = p
                 .api
@@ -1361,7 +1377,7 @@ mod tests {
     fn the_api_base_url_matches_the_env_base_url() {
         // 两个字段现在值相同但用途不同（env 给子进程，api 给 dct 自己）。
         // 不合并，但要一致——不一致意味着有人只改了一边。
-        for name in ["dc", "kimi", "glm", "deepseek", "qwen-api"] {
+        for name in ["kimi", "glm", "deepseek", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             let env = p.env.get("ANTHROPIC_BASE_URL").unwrap();
             assert_eq!(
@@ -1384,7 +1400,7 @@ mod tests {
     /// 靠这个接回原来的对话。
     #[test]
     fn claude_based_profiles_declare_continue_as_resume_args() {
-        for name in ["dc", "claude", "deepseek", "glm", "kimi", "qwen-api"] {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
             let p = Profile::builtin(name).unwrap();
             assert_eq!(
                 p.resume_args,
@@ -1399,7 +1415,7 @@ mod tests {
     /// 这比老实告诉他「这个重开了」更糟。
     #[test]
     fn unverified_profiles_declare_no_resume_args() {
-        for name in ["codex", "opencode", "qwen", "shell"] {
+        for name in ["dc", "codex", "opencode", "qwen", "shell"] {
             let p = Profile::builtin(name).unwrap();
             assert!(
                 p.resume_args.is_empty(),
