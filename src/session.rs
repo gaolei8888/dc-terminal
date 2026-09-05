@@ -3904,7 +3904,7 @@ mod tests {
 
         // 等它第一次真的翻到 Idle 过一次——这一下必然落盘（第一次没有
         // 「上次」可比），之后的抖动才是这条测试真正要验的部分。
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             m.tick();
             if state_of(&m, id) == SessionState::Idle {
@@ -3931,7 +3931,7 @@ mod tests {
 
         // 窗口过了（防抖是 2 秒，上面已经过了 1 秒，再等够）之后再抖一次，
         // 时间戳才允许往前走——证明这不是「永远冻结」，只是节流。
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             m.tick();
             let now = crate::last_sessions::load(&record_path)[0].last_active;
@@ -4044,6 +4044,11 @@ mod tests {
     // 就轮询等 Working」这个动作本身证明不了 tick() 的判定逻辑真的跑对了——它完全可能是撞上
     // 构造函数给的默认值退出循环的，tick() 一次都没被断言检验过。想让测试真的验到 tick()，
     // 断言目标得选 Idle、Unknown，或者「状态没被 tick 动过」这类够不到默认值的东西。
+    // 这两个循环的 deadline 是 30 秒，不是 5 秒，而**这个数不是在断言速度**：
+    // 它只防死等。5 秒那一版在全量并行跑里大约每三次红一次——93 个 session
+    // 测试同时起真的 `/bin/sh` 子进程，子进程连被调度到执行 `clear` 的机会
+    // 都排不上，而 `--test-threads=1` 跑四遍全绿。放宽是因为超时值本来就不是
+    // 这条测试要验的性质；真卡住了 30 秒照样会红，只是慢一点知道。
     #[test]
     fn busy_pattern_marks_working_then_idle() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4067,7 +4072,7 @@ mod tests {
             .unwrap();
 
         // 屏幕上有 busy 串 → 干活中
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             mgr.tick();
             if state_of(&mgr, id) == SessionState::Working {
@@ -4078,7 +4083,7 @@ mod tests {
         }
 
         // 串消失 → 空闲
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             mgr.tick();
             if state_of(&mgr, id) == SessionState::Idle {

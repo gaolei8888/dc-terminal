@@ -184,6 +184,17 @@ pub struct Server {
     addr: std::net::SocketAddr,
     stopping: Arc<AtomicBool>,
     accept: Option<std::thread::JoinHandle<()>>,
+    /// accept 线程**把监听套接字丢掉之后**才置起来的标志。
+    ///
+    /// 存在的理由只有一个：让「端口真的关了」这件事在进程内可观测。
+    /// 从外面观测是做不稳的——端口是绑 `:0` 让系统挑的，`stop()` 之后再去
+    /// 连一次那个地址，连上了也不能说明什么，因为并行跑的别的测试完全
+    /// 可能已经绑到这个刚被释放的端口上了（这条测试以前就是那么写的，
+    /// 大约每六次全量跑红一次，单跑却永远是绿的）。
+    ///
+    /// 只有测试读它，所以非测试构建下"没人读"是对的，不是漏了什么。
+    #[cfg_attr(not(test), allow(dead_code))]
+    closed: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -191,6 +202,12 @@ impl Server {
     /// 不能在别处硬写一个端口号——设置页要把它显示给用户，二维码里也是它。
     pub fn addr(&self) -> std::net::SocketAddr {
         self.addr
+    }
+
+    /// 监听套接字有没有真的被丢掉。见 [`Server::closed`] 字段上的注释。
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// 停掉监听。
@@ -216,9 +233,11 @@ pub fn serve(listener: TcpListener, token: String, handler: Arc<dyn Handler>) ->
     let addr = listener.local_addr().expect("监听器必须已经绑好");
     let stopping = Arc::new(AtomicBool::new(false));
     let inflight = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicBool::new(false));
 
     let accept = {
         let stopping = Arc::clone(&stopping);
+        let closed = Arc::clone(&closed);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if stopping.load(Ordering::SeqCst) {
@@ -249,6 +268,11 @@ pub fn serve(listener: TcpListener, token: String, handler: Arc<dyn Handler>) ->
                     inflight.fetch_sub(1, Ordering::SeqCst);
                 });
             }
+            // **先丢掉监听套接字，再落标志。** 顺序就是这条标志的全部含义：
+            // 标志为真 = 端口已经不在我们手里了。反过来写的话，标志会在
+            // 套接字还开着的时候就为真，那它什么都不保证。
+            drop(listener);
+            closed.store(true, Ordering::SeqCst);
         })
     };
 
@@ -256,6 +280,7 @@ pub fn serve(listener: TcpListener, token: String, handler: Arc<dyn Handler>) ->
         addr,
         stopping,
         accept: Some(accept),
+        closed,
     }
 }
 
@@ -741,10 +766,33 @@ mod tests {
     fn stopping_really_closes_the_port() {
         let (s, addr, _t) = up();
         assert!(TcpStream::connect(&addr).is_ok(), "前提：现在连得上");
+        assert!(!s.is_closed(), "前提：还没停，标志不该已经立起来");
+
+        // 拿一个自己的 `Arc` 副本，因为 `stop()` 要吃掉 `s`。
+        let closed = Arc::clone(&s.closed);
         s.stop();
+
+        // **`stop()` 返回时监听套接字必须已经被丢掉。**
+        //
+        // 这一条以前是从外面测的：`stop()` 之后再连一次那个地址，断言连不上。
+        // 那么写**大约每六次全量跑红一次**，单独跑却永远是绿的——端口是绑
+        // `:0` 让系统挑的，释放之后并行跑的别的测试完全可能立刻绑到同一个
+        // 端口上，于是"连得上"根本不代表我们的服务还在。它测的是地址，而
+        // 地址会被操作系统重新发出去。
+        //
+        // **这条断言有多强，说清楚，别高估它。** 试过两个变异：删掉 `stop()`
+        // 里的 `join`、把 `drop(listener)` 挪到落标志之后——**两个它都抓不到**，
+        // 因为 accept 线程被那次自连唤醒之后微秒级就跑完了，断言执行时标志
+        // 早已立起。真正保证这件事的是所有权：`listener` 是 move 进线程的，
+        // 线程一结束就 drop，而 `stop()` join 了它。这条断言只是把那个不变量
+        // 写成可执行的形式，外加挡住"标志根本没人置"这种整段丢失的改动。
+        //
+        // 不改回从外面连的写法，是因为那个版本抖，而**一条会随机变红的测试
+        // 比一条弱测试更贵**：它训练人忽略红色。要真做强，得让线程退出这件事
+        // 可控（比如注入一个能挡住它的闸），那是另一件事，现在没做。
         assert!(
-            TcpStream::connect(&addr).is_err(),
-            "停了之后还连得上：{addr}"
+            closed.load(Ordering::SeqCst),
+            "stop() 回来了，但监听套接字还没被丢掉：{addr}"
         );
     }
 
