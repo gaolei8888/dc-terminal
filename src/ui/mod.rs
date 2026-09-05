@@ -1629,13 +1629,60 @@ pub(crate) fn create_session(
     profile: &str,
     remember: bool,
 ) -> Result<Response> {
-    let r = app.client().and_then(|c| {
-        c.call(Request::Create {
-            dir: dir.to_string(),
-            profile: profile.to_string(),
-            remember,
-        })
-    });
+    let mut r = ask_to_create(app, dir, profile, remember);
+
+    // **「这儿还不是 git 仓库」不是一句该甩给用户的拒绝，是一件顺手办掉
+    // 的事。** 理由整段写在 `pick::prepare_repo` 上面，不再抄一遍；这里说
+    // 的是**为什么办在这个函数里**。
+    //
+    // 原来只有选择器那一条路（按 `N` 挑 agent、回车）会先过一遍
+    // `prepare_repo`。而建会话的路不止那一条：`n` 快速新建、密钥填完之后
+    // 接着建、配对成功之后接着建，这三条都是直奔守护进程要一个新会话。于是
+    // 在一个新文件夹里按 `n`——**README 里教用户敲的正是这个键**——只会
+    // 撞上一句「不是 git 仓库，无法开 agent 会话」，而屏幕上没有任何东西
+    // 告诉他下一步该干什么。`n` 在新文件夹里还一定会走到这条路上：
+    // `last_profile_for` 查不到这个项目时会退回「你最近用的那个」
+    // （`projects.rs` 里那段注释是故意这么设计的），所以快速新建总有一个
+    // 目标，总会直奔 `Create`。
+    //
+    // 收在这一处的理由跟下面那笔 profile 缓存是同一条（见该处注释）：
+    // 各个调用点各补一次的话，下一个新加建会话路径的人没有任何提示要去
+    // 补这一段。
+    //
+    // **用「先问、被拒了再办」，不是「先建好再问」**：谁算 agent 这条规矩
+    // 只有守护进程说了算（`session.rs::create_inner` 里 `profile.is_agent
+    // && !git::is_repo` 那一句）。反过来在界面这边先判一次，就得在这儿复制
+    // 一份「哪些 profile 算 agent」，而复制出来的那份迟早跟真的那份走岔——
+    // 到那天，开一个普通命令行会顺手在用户的文件夹里建出一个他没要过的
+    // `.git`。顺带还避开一个死循环：缺 git 时 `prepare_repo` 自己会开一个
+    // shell 会话去跑 `dct install git`，那一次同样走这个函数，而 shell 永远
+    // 拿不到 `NotAGitRepo`。
+    let mut made_repo = false;
+    if matches!(
+        &r,
+        Ok(Response::Error(crate::proto::ErrorCode::NotAGitRepo(_)))
+    ) {
+        match pick::prepare_repo(app, Path::new(dir)) {
+            pick::RepoPrep::Ready => {
+                made_repo = true;
+                r = ask_to_create(app, dir, profile, remember);
+            }
+            // 缺 git，`prepare_repo` 已经开了一个窗口在装。那个窗口本身
+            // 就是一个真会话，照常交给调用方 attach 过去——它现在正是用户
+            // 该看到的东西。**提前返回**：用户要的那个 agent 这一次并没有
+            // 建起来，下面那笔「这个项目上次用的是谁」不能记，记了他下次
+            // 按 `n` 会掉进一个装 git 的命令行。
+            pick::RepoPrep::Ready2Install(View::Attached(id)) => {
+                app.copy_mode = false;
+                return Ok(Response::Created { id });
+            }
+            pick::RepoPrep::Ready2Install(_) => {}
+            // 建不成就把守护进程原来那句错误留在返回值里——它说的
+            // 「不是 git 仓库」仍然是真的，而更具体的原因由消息条带出去。
+            pick::RepoPrep::Failed(m) => app.message = Msg::err(m),
+        }
+    }
+
     // 只有真建成了才跟着记：守护进程侧也是这条规矩（`daemon.rs` 里
     // `if r.is_ok()`），建失败的目录不该留下「上次用的是它」。
     // `remember: false` 是「帮你装 CLI」那条路径开的 shell 会话，守护进程
@@ -1652,7 +1699,27 @@ pub(crate) fn create_session(
     // `View::Attached`，复位一次不占谁的便宜，也不用为了「只在成功时」
     // 再包一层判断。
     app.copy_mode = false;
+
+    // **替他建了仓库就说一声。** 悄悄在别人的文件夹里多放一个 `.git` 而
+    // 一个字不说是另一种毛病——他哪天自己发现，会不知道那是谁干的、能不能
+    // 删。（选择器那条路自己已经说过一次，那条路不会走到这里：它在发请求
+    // 之前就把仓库建好了，守护进程根本不会回 `NotAGitRepo`。）
+    if made_repo && matches!(r, Ok(Response::Created { .. })) {
+        app.message = crate::i18n::msg::git_repo_created_for_you(app.lang).into();
+    }
     r
+}
+
+/// 发那一句 `Create`。单独拆出来是因为 `create_session` 要发两次——第二次
+/// 是替用户把 git 仓库建好之后的重试，两次的参数必须一模一样。
+fn ask_to_create(app: &mut App, dir: &str, profile: &str, remember: bool) -> Result<Response> {
+    app.client().and_then(|c| {
+        c.call(Request::Create {
+            dir: dir.to_string(),
+            profile: profile.to_string(),
+            remember,
+        })
+    })
 }
 
 /// 进一个会话。
@@ -2909,6 +2976,98 @@ mod tests {
         );
     }
 
+    /// 起一个真守护进程，外加一个只在这条测试里存在的 agent profile。
+    ///
+    /// 内置的 `claude` 那几个不能用：它们要么这台机器上没装（`create` 走不
+    /// 到 git 那一步），要么装了——那更糟，测试会真的拉起一个 agent。
+    fn daemon_with_a_fake_agent() -> (PathBuf, tempfile::TempDir) {
+        let (sock, home) = start_daemon_for_test();
+        let pdir = crate::profile::profiles_dir_for_socket(&sock);
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("fake-agent.toml"),
+            crate::sys::testing::toml_with_sh(
+                "name = \"fake-agent\"
+command = [\"/bin/sh\", \"-c\", \"sleep 2\"]
+is_agent = true
+",
+            ),
+        )
+        .unwrap();
+        (sock, home)
+    }
+
+    /// **一个刚建出来的文件夹里，`n` 必须开得出 agent。**
+    ///
+    /// 现场是这样的：用户新建一个文件夹，进去敲 `dct`，按 `n`——README 里
+    /// 教的就是这个键——屏幕上回一句「不是 git 仓库，无法开 agent 会话」，
+    /// 然后没有下一步。会自动建仓库的只有「按 `N` 挑一个 agent 再回车」
+    /// 那一条路，因为只有它过了 `pick::prepare_repo`；`n` 是直接发
+    /// `Request::Create` 的，绕过了那一步。
+    ///
+    /// 而 `n` 在新文件夹里一定会走到那条路上：`last_profile_for` 查不到这个
+    /// 项目时会退回「你最近用的那个」，所以快速新建总有目标、总会直奔
+    /// `Create`。密钥填完之后接着建、配对成功之后接着建，也是同一个绕法。
+    #[test]
+    fn a_brand_new_folder_is_not_a_reason_to_refuse_an_agent() {
+        use crate::client::Client;
+
+        let (sock, _home) = daemon_with_a_fake_agent();
+        let work = tempfile::tempdir().unwrap();
+        assert!(
+            !crate::git::is_repo(work.path()),
+            "前提：这是个刚建出来的文件夹，还不是 git 仓库"
+        );
+
+        let dir = work.path().display().to_string();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+
+        let r = create_session(&mut app, &dir, "fake-agent", true);
+        assert!(
+            matches!(r, Ok(Response::Created { .. })),
+            "新文件夹里开不出 agent，用户按 `n` 只会拿到一句拒绝：{r:?}"
+        );
+        assert!(
+            crate::git::is_repo(work.path()),
+            "会话建起来了却没有仓库，等于撤销是死的——而撤销正是敢关掉权限确认的前提"
+        );
+    }
+
+    /// **反过来的那一半：开一个普通命令行，不许在人家文件夹里建仓库。**
+    ///
+    /// 上面那条修法的诱惑是「发请求之前先 `git init` 一下」。那样写的话，
+    /// 用户开一个普通终端也会平白多出一个他没要过的 `.git`。真正的规矩是
+    /// 「agent 才需要仓库」，而那条规矩只有守护进程说了算——所以界面这边
+    /// 只在**被拒之后**才动手，shell 根本不会被拒。
+    #[test]
+    fn opening_a_plain_terminal_never_creates_a_repo() {
+        use crate::client::Client;
+
+        let (sock, _home) = start_daemon_for_test();
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().display().to_string();
+        let mut app = App::new(
+            Client::connect(&sock).unwrap(),
+            work.path().to_path_buf(),
+            crate::i18n::Lang::Zh,
+            sock.clone(),
+            ViewMode::List,
+        );
+
+        let r = create_session(&mut app, &dir, "shell", false);
+        assert!(matches!(r, Ok(Response::Created { .. })), "{r:?}");
+        assert!(
+            !crate::git::is_repo(work.path()),
+            "开个终端而已，不该在用户的文件夹里留下一个他没要过的 .git"
+        );
+    }
+
     /// `remember: false` 那条路（「帮你装 CLI」开的 shell 会话）不能进缓存——
     /// 守护进程侧也不记，两边记的东西一旦不一样，底栏说的就不是守护进程会做的。
     #[test]
@@ -2994,7 +3153,7 @@ mod tests {
         assert_eq!(
             prod.matches(needle).count(),
             1,
-            "mod.rs 里只该有 create_session 那一处 Create"
+            "mod.rs 里只该有 `ask_to_create` 那一处 Create——它是 `create_session`              的私有助手（建仓库之后要原样重发一次，所以拆了出来），除它之外             任何一处都绕过了缓存更新"
         );
     }
 

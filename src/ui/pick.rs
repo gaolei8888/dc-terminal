@@ -44,7 +44,7 @@ fn set_view(app: &mut App, v: View) -> Result<()> {
 }
 
 /// 开会话之前，把「这儿得是个 git 仓库」这件事办好之后的结果。
-enum RepoPrep {
+pub(super) enum RepoPrep {
     /// 可以开会话了——本来就是仓库，或者刚刚替他建好。
     Ready,
     /// 这台电脑上没有 git，已经开了个窗口在装。这就是要切过去的那一屏。
@@ -71,7 +71,7 @@ enum RepoPrep {
 /// 判「是不是仓库」用 `is_repo` 当场问，不用界面上那个 `no_git` 标志：
 /// 那个标志是这一屏建出来的时候算的，而用户可能在别的窗口里已经把仓库
 /// 建好了。要动手的那一刻，问的必须是文件系统。
-fn prepare_repo(app: &mut App, dir: &std::path::Path) -> RepoPrep {
+pub(super) fn prepare_repo(app: &mut App, dir: &std::path::Path) -> RepoPrep {
     // **每次都先把自带的运行时挂一遍 PATH，不能只在启动时挂。**
     //
     // 这一步少了会变成一个死循环，而且正好卡住这个功能唯一服务的那种用户：
