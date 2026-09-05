@@ -71,6 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts
 irm https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts/install.ps1 | iex
 ```
 
+这条命令认 Windows 10 和 11，它们自带的 PowerShell 就够用。更老的系统（Win7、
+Win8.1）上，安装脚本会先说一句人话再停下，而不是装到一半糊你一屏红字。
+
 装下来的是一个几 MB 的可执行文件。**不需要 Rust，不需要编译器，不需要等编译。**
 装完新开一个终端窗口，进到任何一个文件夹里敲 `dct`。
 

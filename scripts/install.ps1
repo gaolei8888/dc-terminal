@@ -113,6 +113,35 @@ function Stop-WithMessage {
 	exit 1
 }
 
+# **这个脚本要 PowerShell 5.0 以上，低于这个版本就在这儿停住。**
+#
+# 下面用到三样老版本没有的东西：`Invoke-WebRequest`（下载，3.0 才有）、
+# `Get-FileHash`（验校验和，4.0）、`Expand-Archive`（解包，5.0）。不拦的话，
+# 一台 4.0 的机器会先把十几 MB 下完、校验和也过了，才死在 `Expand-Archive`
+# 这个名字上——而且因为顶上是 `$ErrorActionPreference = 'Stop'`，那句话是
+# 连着行号和一段指向本文件的箭头一起印出来的红字，正是 `Stop-WithMessage`
+# 上面那段注释说绝不能给用户看的东西。
+#
+# 拦在这里而不是文件第一行，是因为要用 `Stop-WithMessage` 说人话，而它
+# 上面那些（设 TLS、关进度条、拼默认地址）在任何版本上都跑得动。真正的
+# 底线是**整份文件得先能被解析**：PowerShell 是整份解析完再执行的，文件里
+# 任何一处新语法都会让这段话根本印不出来，换成一句语法错误。所以这个文件
+# 不用 3.0 以后才有的语法（`*>` 那种重定向就是一例，见文件末尾那处
+# `2>&1 | Out-Null` 的注释）——哪怕一台 2.0 的机器，也要能读到上面这段话。
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+	Stop-WithMessage @"
+这台电脑上的 PowerShell 太老了（现在是 $($PSVersionTable.PSVersion)，装 dct 要 5.0 以上）。
+
+Windows 10 和 11 自带的就是 5.1，够用。会看到这句话，多半是 Win7 或 Win8.1。
+那就装一份微软官方的升级包（免费），装完重启电脑，再跑一遍同一条命令：
+
+    https://www.microsoft.com/download/details.aspx?id=54616
+
+装不上、或者装完还是这句话，那就是这台电脑的系统太旧了，dct 支持不了。
+换一台 Windows 10 以上的机器。
+"@
+}
+
 function Add-ToUserPath {
 	param([string]$Dir)
 
@@ -475,7 +504,11 @@ Write-Note $version
 # dct 要的是**跑得起来**的那一个。
 $hasGit = $false
 try {
-	& git --version *> $null
+	# 这里写 `2>&1 | Out-Null` 而不是更顺手的 `*> $null`，理由跟 git 无关：
+	# `*>` 是 PowerShell 3.0 才有的**语法**，而语法错误是在整份文件被解析时
+	# 报出来的，早于第一行代码执行。文件里留一个 `*>`，上面那道版本闸就永远
+	# 印不出来，一台老机器上的用户拿到的会是一句语法错误——比没拦还糟。
+	& git --version 2>&1 | Out-Null
 	$hasGit = ($LASTEXITCODE -eq 0)
 } catch { $hasGit = $false }
 

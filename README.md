@@ -82,6 +82,10 @@ curl -fsSL https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts
 irm https://raw.githubusercontent.com/gaolei8888/dc-terminal/main/scripts/install.ps1 | iex
 ```
 
+Windows 10 and 11 are what this is built for, and both ship the PowerShell the
+installer needs. On anything older it stops with one sentence telling you what
+to do, rather than failing halfway down with a wall of red.
+
 What comes down is a single executable of a few megabytes. **No Rust, no
 compiler, no waiting for a build.** Open a fresh terminal window afterwards,
 step into any folder, and run `dct`.
