@@ -308,9 +308,12 @@ pairing. A custom `profiles/dc.toml` still overrides the builtin. If your existi
 `transport = "http"`, and an OpenAI-compatible `model` available to your account.
 Existing `[llm]` settings are not rewritten automatically.
 
-DC and the last four aren't separate programs at all. They're `claude` pointed
-at another Anthropic-compatible endpoint, which is why they want both the binary
-and a key.
+The last four — Kimi, GLM, DeepSeek and Qwen API — aren't separate programs at
+all. They're `claude` pointed at another Anthropic-compatible endpoint, which is
+why they want both the binary and a key. DC is the same trick on the other side
+of the fence: it runs `qwen` against the camp gateway's OpenAI-compatible API.
+The dialect differs because the models behind that gateway speak that one, and
+Claude Code can't.
 
 **DC needs no copy-pasted key**: pick it while this machine has no key configured
 yet, hit enter, and it goes straight into pairing — a confirmation page opens in
@@ -558,10 +561,12 @@ and have never been tested with a real account.** A key can verify fine and the
 session still fail to start. Until somebody runs them with real credentials,
 treat Kimi, GLM, DeepSeek and Qwen API as unverified.
 
-**DC points at an address that isn't live yet.** It's first in the list because
-that's where it belongs once the course starts, but until the camp's endpoint is
-switched on there is nothing behind it. Picking it today gets you a session that
-can't reach anything.
+**DC shows no status on the board, and has no resume.** It runs Qwen Code, whose
+screen tells and resume flag nobody has measured yet — and this repo does not
+invent either, so DC's cell reads `—` forever and closing a DC session and
+reopening it starts a fresh one (the interface says as much). The endpoint itself
+is up and keys are obtainable; it's these two conveniences that are missing until
+someone measures that TUI once.
 
 **Permissions are auto-accepted, which means an agent can write outside the
 project directory.** Those writes are outside the snapshot and undo won't bring
