@@ -33,9 +33,17 @@ Node 运行时和 agent CLI 在**构建期**装好，不留给运行时下载。
 `fc51cc0` 那条「kill 打不穿外面那层壳」在 Linux 上不存在——`sys::job` 在 Unix 是
 一个永远返回 `None` 的空壳，那边的保证来自 pty 的前台进程组。
 
-**三、`docker stop` 在这里是真的优雅退出。** `sys::proc` 开头那段说 Windows 没有 SIGTERM
-这句话、守护进程被换掉时来不及让 agent 收尾。容器里 PID 1 收到的正是 SIGTERM——
-这是搬到 Linux 白捡的一件事，值得在文档里写给运维看。
+**三、`docker stop` 走的是 SIGTERM——但白捡的没有我原先写的那么多。**
+~~容器里 PID 1 收到的正是 SIGTERM，守护进程于是能让每个 agent 收尾。~~
+**2026-09-06 实测推翻了这一条**：`docker stop` 0.35 秒返回、退出码 143（=128+15），
+确实是 SIGTERM 不是 SIGKILL；但 `daemon.rs` 里**没有** SIGTERM 处理器——
+`sys::signal` 那一套是给 TUI 还原终端用的，守护进程一次都没调过。所以它是被默认
+动作直接打死的，并没有「自己把 pty 收拾干净」。agent 照样会被清掉，但那是**内核**
+关掉 pty 主端之后发的 SIGHUP（`sys::job` 模块头描述的正是这条 Unix 路径）。
+
+差别是实打实的：没有 `PtySession::kill` 里那 200ms 宽限期，agent 没机会自己收尾
+落盘。**候选改进（不在第一期）**：在 `daemon.rs` 装一个 SIGTERM 处理器走正常停机
+路径。那是 dct 的改动，值得单独排。
 
 **四、数字来自 `2dd5381` 那次实测，不是估的。** 一个 agent 常驻约 320 MB；
 Node 运行时 95 MB，`claude` 那个 npm 包 416 MB。前者定容器的内存 limit，后者定镜像大小。
@@ -160,16 +168,47 @@ workspace/              # 本仓库，自足
 
 ## Tasks
 
-### 任务 1：镜像骨架，容器里能起守护进程
-- [ ] 多阶段 Dockerfile：构建阶段编 `dct`，运行时阶段只留二进制 + Node + agent CLI
-- [ ] 非 root 用户，`~/.dct` 和 `~/.claude` 是卷
-- [ ] **验收**：容器里 `dct ps` 能连上守护进程；`docker stop` 之后没有留下进程
-- [ ] **记下镜像实际大小**，跟上面 511 MB 的估算对一下，对不上就把差额写进本文件
+### 任务 1：镜像骨架，容器里能起守护进程 ✅（2026-09-06）
+- [x] 多阶段 Dockerfile：构建阶段编 `dct`，运行时阶段只留二进制 + Node + agent CLI
+- [x] 非 root 用户（uid 1000 `dc`），`~/.dct` / `~/.claude` / `~/work` 是卷
+- [x] **验收**：`dct ps` 回「No sessions」（守护进程在、socket 通）；进程树是
+      `1 tini → 7 dct`，`docker stop` 0.35 秒返回、退出码 143，之后无残留
+- [x] 守护进程的 PATH 是 `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`，
+      `node`/`npm`/`git`/`qwen`/`claude` 全在里面——**「dct 一行不用改就认得」这条
+      成立，实测过了**。socket 是 `srw-------`、目录 `drwx------`，`bind_private`
+      在容器里照常生效
+
+**镜像实际 676 MB，估的是 511 MB，差 165 MB。** 差在哪：
+
+| 层 | 大小 | 估算里有没有 |
+|---|---|---|
+| debian:bookworm-slim 底 | 74.8 MB | ❌ 没算 |
+| apt（ca-certificates + git + tini + procps） | 95 MB | ❌ 没算，git 是大头 |
+| node 二进制 | 125 MB | 估的 95 MB，低了 |
+| npm 自己 | 11.9 MB | ❌ 没算 |
+| `npm i -g` 两个 agent CLI | 358 MB | 估的 416 MB，高了 |
+| dct 二进制 | 9.5 MB | ✅ |
+
+结论：**估算漏的全是「底座」，不是 agent。** 以后再估容器大小，先记 180 MB 的
+debian+apt 底子。
+
+第一次建出来是 684 MB，其中 9.5 MB 是白扔的——`RUN chmod` 会重写文件，那个二进制
+在镜像里存了两份。改成 `COPY --chmod=0755` 之后 676 MB。
+
+构建耗时：**cargo release 38 秒**（32 核），整体首次 66 秒、改一行重建 34 秒。
+Docker Hub 在这台机器上拉 `debian:bookworm-slim` 用了 5.2 秒，**基础镜像不需要换
+国内源**；npm 仍走 `registry.npmmirror.com`，那是为了跟 `runtime.rs` 的
+`CN_NPM_REGISTRY` 对齐，不是因为快慢。
+
+**建镜像之前踩的一个坑，记下来免得重来**：Docker 引擎起不来、每个 API 都回 500，
+根因是 Windows 服务 `com.docker.service` 停着（不是 WSL、不是网络）。`docker version`
+仍能答客户端版本，正是这个形状。
 
 ### 任务 2：PID 1 与收尸
-- [ ] `--init` 或 tini
+- [x] tini 已经在 ENTRYPOINT 上，进程树实测是 `1 tini → 7 dct`
+- [x] 镜像里装了 `procps`——slim 里没有 `ps`/`pgrep`，**没有它这一条根本问不出来**
 - [ ] **验收**：起一个会话，让 agent 的父进程先死，确认孤儿被 reap 掉、进程表干净。
-      这是上面那条「我还没验过」的约束，验完把结论写回 Global Constraints
+      这是 Global Constraints 里那条「还没验过」的约束，验完把结论写回去
 
 ### 任务 3：那道门（第二期原样复用）
 - [ ] token 的产生、落盘、常数时间校验，写成一个模块——**不是** `ttyd --credential`
@@ -198,6 +237,10 @@ workspace/              # 本仓库，自足
       这三条是选 C 时明知要付的代价，付得起付不起要有实测才知道
 
 ### 任务 4.5：容器里粘不了图，而它现在的说法像是用户的错
+
+**顺带一个信号**：Linux 上编 `dct` 会出 4 条 dead-code 警告，全来自这个模块
+（`read_failed`、`paste_dir`、`new_png_path` 在非 macOS/Windows 上没人调用）。
+警告本身无害，但它正好指着这一条——修这个任务时顺手让它安静下来。
 
 **已查实，不是推断：** `clipboard.rs` 的 `image_to_file` 在
 `cfg(not(any(target_os = "macos", windows)))` 那一支直接返回 `Ok(None)`，

@@ -55,8 +55,11 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 # `git` 是硬依赖，不是可选：dct 的检查点和撤销全靠它（`git.rs`），而撤销是
 # 敢让 agent 不问就动手的全部前提。
 # `tini` 见 `entrypoint.sh` 里那段——任务 2 会真正验它。
+# `procps` 给的是 `ps`/`pgrep`。它不是「方便调试」——**任务 2 的验收条件是
+# 「确认孤儿被 reap 掉、进程表干净」，没有 ps 就问不出这句话**。第一次建完
+# 镜像去查进程树时才发现 slim 里没有，记在这儿免得有人当成冗余给删掉。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git tini \
+ && apt-get install -y --no-install-recommends ca-certificates git tini procps \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
@@ -76,14 +79,17 @@ RUN npm config set registry "$NPM_REGISTRY" \
  && npm i -g @qwen-code/qwen-code @anthropic-ai/claude-code \
  && npm cache clean --force
 
-COPY --from=build /out/dct /usr/local/bin/dct
-COPY container/entrypoint.sh /usr/local/bin/entrypoint.sh
-
-# **必须显式 chmod，不能指望源文件的权限位。** 这个镜像是在 Windows 上构建的
-# （见计划里那节），而 Windows 的构建上下文没有 Unix 权限位——COPY 进来的
-# 脚本是 0644，`tini -- entrypoint.sh` 会直接 Permission denied。仓库里那个
-# 文件确实有 +x，git 也记着，但它到不了这里。
-RUN chmod 0755 /usr/local/bin/dct /usr/local/bin/entrypoint.sh
+# **权限位写在 COPY 上，不用事后 `RUN chmod`。** 两件事：
+#
+# 一、必须显式给，不能指望源文件——镜像在 Windows 上构建，而 Windows 的构建
+# 上下文没有 Unix 权限位，COPY 进来的脚本是 0644，`tini -- entrypoint.sh` 会
+# 直接 Permission denied。仓库里那个文件确实有 +x、git 也记着，但它到不了这里。
+#
+# 二、**用 `--chmod` 而不是 `RUN chmod`**：chmod 会重写文件，于是那个 9.54 MB
+# 的二进制在镜像里存了两份。第一次建出来 684 MB，`docker history` 里明晃晃两条
+# 9.54 MB——白扔的。
+COPY --from=build --chmod=0755 /out/dct /usr/local/bin/dct
+COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # 不以 root 跑：agent 会在项目目录里写文件，root 写出来的东西在绑定挂载那条
 # 路上会变成宿主上删不掉的。uid 固定 1000，绑定挂载时好对。
