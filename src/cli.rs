@@ -596,18 +596,6 @@ fn fetch_problem(lang: Lang, e: &crate::runtime::FetchError) -> String {
     }
 }
 
-/// npm 该去哪个仓库拿包。国内课堂设 `DCT_NPM_REGISTRY`，别处不设就是官方。
-///
-/// 跟 `DCT_NODE_BASE` 分成两个变量而不是一个「中国模式」开关：这两件事
-/// 会分别失效（镜像站可能只镜像了其中一样），而一个开关同时管两样的话，
-/// 出问题时没法只换一半。
-fn npm_registry() -> Option<String> {
-    std::env::var("DCT_NPM_REGISTRY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// `dct install <agent>`：把一个 agent 装到能用为止。
 ///
 /// **这条命令存在的理由，是把「学生看到的第一句英文报错」换掉。** 在它
@@ -686,7 +674,7 @@ pub fn run_install(name: &str, lang: Lang) -> i32 {
     }
 
     if uses_npm {
-        if let Some(reg) = npm_registry() {
+        if let Some(reg) = crate::update::npm_registry_override() {
             argv.push("--registry".into());
             argv.push(reg);
         }
