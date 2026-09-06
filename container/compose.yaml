@@ -1,0 +1,40 @@
+# 单人版：一条 `docker compose up` 起一份能用的 dc-workspace。
+#
+# **这一份必须自足。** 计划里立了一条能证伪的规矩：本仓库的任何测试、任何
+# CI、任何 README 步骤，都不许出现部署方仓库的名字。「三十个学生怎么发、
+# 反代、证书、配额」是部署方的事；这里只负责「起一份，能用」——发三十份就是
+# 跑三十次。
+name: dc-workspace
+
+services:
+  dc:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    image: dc-workspace:dev
+
+    # PID 1 的收尸问题在 Dockerfile 里用 tini 解决了，这里不再叠一层
+    # `init: true`——两个 init 串起来只是多一层，不多一分保证。
+
+    # 一个 agent 常驻约 320 MB（实测，见 README 那节），加上容器底子。
+    # 这个数字是**单人**的：一个人同时开三个 agent 还有余量。
+    mem_limit: 2g
+
+    volumes:
+      # 状态，缺一个学生就丢东西（见 Dockerfile 里 VOLUME 那段）。
+      - dct-state:/home/dc/.dct
+      - claude-state:/home/dc/.claude
+      # 代码。**这里是命名卷**——IO 原速、git 检查点原速，代价是宿主上看不到
+      # 文件。换成绑定挂载（`- ./work:/home/dc/work`）能用本地编辑器，但
+      # Windows/macOS 上会拖垮编译，换行和权限还会咬 git 检查点。
+      # 两种都要在任务 5 里各跑一遍检查点和撤销，代价写进 container/README.md。
+      - work:/home/dc/work
+
+    # 任务 1 只到「守护进程起得来」。进去看看：
+    #   docker compose exec dc dct ps
+    # 浏览器那一步是任务 4。
+
+volumes:
+  dct-state:
+  claude-state:
+  work:
