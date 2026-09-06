@@ -1467,6 +1467,8 @@ mod tests {
             has_secret: false,
             backend_only: false,
             pairable: false,
+            update: None,
+            managed: false,
         }
     }
 

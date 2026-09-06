@@ -2509,6 +2509,8 @@ mod tests {
             // pick_action/digit_index 不看这个字段——它们的测试从不需要
             // 一个可配对的 fixture。
             pairable: false,
+            update: None,
+            managed: false,
         }
     }
 

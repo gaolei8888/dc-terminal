@@ -978,6 +978,8 @@ mod tests {
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
+                update: None,
+                managed: false,
             },
             ProfileEntry {
                 name: "kimi".into(),
@@ -989,6 +991,8 @@ mod tests {
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
+                update: None,
+                managed: false,
             },
             ProfileEntry {
                 name: "glm".into(),
@@ -1002,6 +1006,8 @@ mod tests {
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
+                update: None,
+                managed: false,
             },
             ProfileEntry {
                 name: "codex".into(),
@@ -1023,6 +1029,8 @@ mod tests {
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
+                update: None,
+                managed: false,
             },
         ];
         app.view = View::PickProfile {
@@ -1821,6 +1829,8 @@ mod tests {
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
+                update: None,
+                managed: false,
             }],
             state: ratatui::widgets::ListState::default(),
             warning: None,
@@ -1849,6 +1859,8 @@ mod tests {
             has_secret: false,
             backend_only: false,
             pairable: false,
+            update: None,
+            managed: false,
         }]
     }
 
@@ -1866,6 +1878,8 @@ mod tests {
             has_secret: false,
             backend_only: false,
             pairable: true,
+            update: None,
+            managed: false,
         }]
     }
 
@@ -1934,6 +1948,8 @@ mod tests {
             has_secret: false,
             backend_only: false,
             pairable: true,
+            update: None,
+            managed: false,
         }];
         app.view = View::PickProfile {
             entries,
@@ -1977,6 +1993,8 @@ mod tests {
             has_secret: false,
             backend_only: false,
             pairable: false,
+            update: None,
+            managed: false,
         }];
         app.view = View::PickProfile {
             entries,

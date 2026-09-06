@@ -573,6 +573,8 @@ mod tests {
             // 这样下面那条「不可配对的 profile 一个字节都不能变」的测试才有
             // 意义（不然它测的是一个从来不会为真的分支）。
             pairable: name == "dc",
+            update: None,
+            managed: false,
         }
     }
 

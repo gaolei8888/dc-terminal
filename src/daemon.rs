@@ -217,6 +217,26 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 网页）都可能问起同一条正在跑的配对。
     let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
 
+    // agent 有没有新版本。跟 `pairs`/`phone` 一样是长活在这个进程里的共享
+    // 状态：查这件事必须在守护进程的 PATH 里做（同 `command_exists` 的
+    // 理由），而每个连上来的界面都要读同一个答案。
+    //
+    // 起来 30 秒之后才查第一次——**不在启动路径上**，第一个连上来的界面
+    // 不用等一次网络请求；之后一天一次。整个过程发 HTTP，所以放在自己的
+    // 线程里，绝不能挂在 accept 循环上。
+    let updates = crate::update::new_table();
+    {
+        let t = updates.clone();
+        let pd = profiles_dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(crate::update::FIRST_CHECK_AFTER);
+            loop {
+                crate::update::check_updates(&pd, &t, None, &crate::update::fetch_latest);
+                std::thread::sleep(crate::update::CHECK_EVERY);
+            }
+        });
+    }
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -228,8 +248,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let et = event_tx.clone();
         let wb = web.clone();
         let pr = pairs.clone();
+        let up = updates.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, up) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -534,6 +555,7 @@ fn serve(
     event_tx: std::sync::mpsc::Sender<Event>,
     web: Arc<Mutex<Option<crate::web::Server>>>,
     pairs: Arc<Mutex<PairTable>>,
+    updates: crate::update::UpdateTable,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -557,6 +579,7 @@ fn serve(
                 &event_tx,
                 Some(&web),
                 &pairs,
+                &updates,
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -585,6 +608,9 @@ fn handle(
     // 拿不到 `web` 是物理上做不到。
     web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
     pairs: &Arc<Mutex<PairTable>>,
+    // 后台线程查出来的「有没有新版本」。`Profiles` 只**读**它，绝不在这条
+    // 请求路径上现查——那会让开一次选择器变成一次网络往返。
+    updates: &crate::update::UpdateTable,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -618,6 +644,9 @@ fn handle(
             // 为什么」的路。排在最后：前面几条都是「你现在要用的东西
             // 坏了」，这条是「有一件过去的事没能完全成功」，优先级最低。
             warnings.extend(mgr.resume_skips());
+            // 锁只握到 clone 完：下面那个 map 里还要 `status_of` 去查命令
+            // 存不存在（会摸磁盘），不能攥着这把锁做那件事。
+            let table = recover(updates.lock()).clone();
             let entries = all
                 .iter()
                 .map(|p| {
@@ -652,6 +681,10 @@ fn handle(
                         has_secret,
                         backend_only: p.backend_only,
                         pairable: p.pairable,
+                        // 表里有它 = 追溯到了 npm 包 = `dct install --update`
+                        // 管得了它，见 `update::UpdateTable`。
+                        update: table.get(&p.name).and_then(crate::update::prompt_for),
+                        managed: table.contains_key(&p.name),
                     }
                 })
                 .collect();
@@ -891,6 +924,7 @@ fn handle(
             bridge,
             event_tx,
             pairs,
+            updates,
         )),
         Request::WebDisable => Ok(web_disable(web)),
         Request::PhoneDisable => {
@@ -997,6 +1031,23 @@ fn handle(
             }
             Ok(Response::Ok)
         }
+        // 查要发 HTTP，可能花掉 5 秒，而界面这条连接 5 秒就超时
+        // （`client.rs:11`）——所以另起一个线程，立刻回 `Ok`。发这条的人
+        // （`dct install` 装完）本来也不等结果：他要的是「下次开选择器时
+        // 那条提示已经没了」。
+        Request::RecheckUpdates { profile } => {
+            let t = updates.clone();
+            let pd = profiles_dir.to_path_buf();
+            std::thread::spawn(move || {
+                crate::update::check_updates(
+                    &pd,
+                    &t,
+                    profile.as_deref(),
+                    &crate::update::fetch_latest,
+                );
+            });
+            Ok(Response::Ok)
+        }
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
 }
@@ -1086,6 +1137,7 @@ fn web_enable(
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: &std::sync::mpsc::Sender<Event>,
     pairs: &Arc<Mutex<PairTable>>,
+    updates: &crate::update::UpdateTable,
 ) -> Response {
     let Some(web) = web else { return web_refused() };
     let mut slot = recover(web.lock());
@@ -1113,7 +1165,7 @@ fn web_enable(
 
     // **HTTP 那一路走的是同一个 `handle`**，只是 `web` 传 `None`。
     // 另写一份分派等于养出第二套真相，而手机看到的东西必须跟桌面一致。
-    let (m, s, sec, pd, ph, br, et, pr) = (
+    let (m, s, sec, pd, ph, br, et, pr, up) = (
         mgr.clone(),
         store.clone(),
         secrets.clone(),
@@ -1122,8 +1174,10 @@ fn web_enable(
         bridge.clone(),
         event_tx.clone(),
         pairs.clone(),
+        updates.clone(),
     );
-    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr);
+    let dispatch =
+        move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr, &up);
     let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
     let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
     let port = server.addr().port();
@@ -1790,6 +1844,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
 
         match resp {
@@ -1849,6 +1904,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -1865,6 +1921,51 @@ mod tests {
             "中文下 shell 的名字是「命令行」：{zh}"
         );
         assert_ne!(zh, en, "换了语言，菜单文案必须真的跟着变");
+    }
+
+    fn test_updates() -> crate::update::UpdateTable {
+        crate::update::new_table()
+    }
+
+    /// `Profiles` 响应里的 `update`/`managed` 来自那张共享表，不是这里现算的：
+    /// 表里有它 → 归 dct 管、按版本决定要不要提示；表里没有 → 两个字段都空。
+    #[test]
+    fn profiles_carry_the_update_prompt_from_the_shared_table() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let updates = test_updates();
+        updates.lock().unwrap().insert(
+            "shell".into(),
+            crate::update::UpdateInfo {
+                package: "fake".into(),
+                installed: "1.0.0".into(),
+                latest: Some("2.0.0".into()),
+                checked_at: None,
+            },
+        );
+        let resp = handle(
+            Request::Profiles {
+                lang: crate::i18n::Lang::Zh,
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &updates,
+        );
+        let Response::Profiles { entries, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        let shell = entries.iter().find(|e| e.name == "shell").unwrap();
+        assert!(shell.managed, "表里有它就是归 dct 管");
+        let p = shell.update.as_ref().expect("1.0.0 → 2.0.0 该带提示");
+        assert_eq!(p.latest, "2.0.0");
+        let claude = entries.iter().find(|e| e.name == "claude").unwrap();
+        assert!(claude.update.is_none() && !claude.managed);
     }
 
     /// 回归测试，对应审查发现「密钥仓的锁被握过了整个 create()」：以前 `handle()`
@@ -1917,6 +2018,7 @@ mod tests {
                 &test_event_tx(),
                 None,
                 &test_pairs(),
+                &test_updates(),
             );
             (t.elapsed(), resp)
         });
@@ -2024,6 +2126,7 @@ mod tests {
                 &test_event_tx(),
                 None,
                 &test_pairs(),
+                &test_updates(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -2058,6 +2161,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -2145,6 +2249,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -2193,6 +2298,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -2253,6 +2359,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
 
         match resp {
@@ -2307,6 +2414,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
 
         match resp {
@@ -2378,6 +2486,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_updates(),
         );
 
         match resp {
@@ -2722,6 +2831,7 @@ mod web_tests {
         bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
         tx: std::sync::mpsc::Sender<Event>,
         pairs: Arc<Mutex<PairTable>>,
+        updates: crate::update::UpdateTable,
         /// 临时目录得跟着 fixture 活着，不然 secrets/projects 的路径当场失效。
         _dir: tempfile::TempDir,
     }
@@ -2741,6 +2851,7 @@ mod web_tests {
                 &self.bridge,
                 &self.tx,
                 &self.pairs,
+                &self.updates,
             )
         }
     }
@@ -2761,6 +2872,7 @@ mod web_tests {
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
             pairs: Arc::new(Mutex::new(BTreeMap::new())),
+            updates: crate::update::new_table(),
             _dir: dir,
         }
     }

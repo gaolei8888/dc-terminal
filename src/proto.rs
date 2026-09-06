@@ -90,7 +90,23 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// `pair_apply::Ready::llm_written`）。这一次变的是**响应**的形状而不是
 /// 请求的：旧界面解不出多了一个字段的 `Done`，一条成功的配对会在最后
 /// 一刻变成一句解析失败——形状变了就得加一，这条规矩对哪一侧都一样。
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// 14 = agent 有新版本。`ProfileEntry` 多了 `update` / `managed`，
+/// 请求那边多了 `Request::RecheckUpdates`。**加一的理由是新增了请求变体**，
+/// 同 `Kill`/`Prune`、同配对那三条：旧守护进程收到 `RecheckUpdates` 只会回
+/// 一句解析失败，而用户看到的是「装完了，提示还挂着」。响应那边加的两个
+/// 字段都带 `serde(default)`，所以旧界面配新守护进程解得出来——但那不是
+/// 免检条件，形状变了就得加一，这条规矩对哪一侧都一样。
+pub const PROTOCOL_VERSION: u32 = 14;
+
+/// 这个 agent 装的是几、仓库上最新是几。**只在后者更新时才存在**——
+/// 「已经是最新」和「还没查到」在界面上是同一回事（什么都不显示），
+/// 所以协议里不给第三种状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePrompt {
+    pub installed: String,
+    pub latest: String,
+}
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +221,16 @@ pub struct ProfileEntry {
     /// 不能让选择器/密钥页回去按名字特判（那正是这个字段要消灭的写法）。
     #[serde(default)]
     pub pairable: bool,
+    /// 有新版本。`None` = 不归 dct 管 / 还没查到 / 已经是最新——三种情况
+    /// 界面上都一样：什么都不显示。
+    #[serde(default)]
+    pub update: Option<UpdatePrompt>,
+    /// 守护进程把这个命令追溯到了一个 npm 包，也就是 `dct install --update`
+    /// 更新得了它。界面靠它在用户按 `u` 时区分「已经是最新了」和「这份不是
+    /// dct 装的，请用你原来装它的方式更新」——两句话给的下一步完全不同，
+    /// 而光看 `update: None` 分不出是哪一种。
+    #[serde(default)]
+    pub managed: bool,
 }
 
 /// 九宫格一格的内容。跟 `Response::Screen` 不同，不带光标——
@@ -355,6 +381,13 @@ pub enum Request {
     PairCancel {
         profile: String,
     },
+    /// 立刻重查一遍有没有新版本。`dct install` 装完发一条，不然提示要挂到
+    /// 下一次每日检查才消失。`None` = 全部。**立刻回 `Response::Ok`**，
+    /// 查是在守护进程自己的线程里做的：这条请求走的是界面那根 5 秒就超时
+    /// 的连接（`client.rs:11`），而问仓库本身就允许花掉 5 秒。
+    RecheckUpdates {
+        profile: Option<String>,
+    },
     /// 「这个 `Failed` 会话到底出了什么事」，人话版。答案可能还没算出来
     /// （问模型是异步的，见 `session.rs::request_explanation`），也可能
     /// 压根没配 LLM——两种情况都回 `Response::Explanation(None)`，界面
@@ -502,6 +535,10 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::PairCancel { profile } => f
                 .debug_struct("PairCancel")
+                .field("profile", profile)
+                .finish(),
+            Request::RecheckUpdates { profile } => f
+                .debug_struct("RecheckUpdates")
                 .field("profile", profile)
                 .finish(),
             Request::Explanation { id } => f.debug_struct("Explanation").field("id", id).finish(),
@@ -975,6 +1012,7 @@ mod tests {
             Request::PairCancel {
                 profile: "p".into(),
             },
+            Request::RecheckUpdates { profile: None },
             Request::Explanation { id: 1 },
             Request::Scroll {
                 id: 1,
@@ -1011,8 +1049,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                13,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
+                14,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"RecheckUpdates":{"profile":null}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1036,7 +1074,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                13,
+                14,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1145,7 +1183,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                13,
+                14,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1252,7 +1290,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (13, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (14, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
