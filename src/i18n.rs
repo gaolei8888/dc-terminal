@@ -2183,6 +2183,68 @@ pub mod msg {
         )
     }
 
+    /// `--update` 撞上正在跑的会话。**拒绝，不是警告**：正在跑的 node 进程
+    /// 底下换文件，Qwen Code 这种几百个文件的包会在下一次 require 时读到
+    /// 新旧混杂的东西。
+    ///
+    /// 数字要印出来——「有会话在跑」是一句用户没法照着做的话，「2 个」
+    /// 才让他知道要去关几个。
+    pub fn update_refused_sessions_running(lang: Lang, n: usize, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("Close the {n} running {label} session(s) first, then update."),
+            zh: format!("先关掉正在跑的 {n} 个 {label} 会话再更新。"),
+        )
+    }
+
+    /// 命令找得到，但追溯不到 npm 包：官方安装器、brew、自己编的。不猜他
+    /// 用的是哪种，只说「用原来的方式」——猜错的那句话会把他带去一条
+    /// 走不通的路，而他本来是知道自己怎么装的。
+    pub fn not_managed_by_dct(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("This {label} was not installed by dct. Update it the way you installed it."),
+            zh: format!("这份 {label} 不是 dct 装的，请用你原来装它的方式更新。"),
+        )
+    }
+
+    pub fn updating_agent(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("Updating {label}."),
+            zh: format!("正在更新 {label}。"),
+        )
+    }
+
+    /// 更新完那句话要接着说下一步怎么走，跟 `install_succeeded` 同一个理由：
+    /// 用户此刻在一个跑完就停住的窗口里，不告诉他按什么，他就只会关掉它。
+    pub fn update_succeeded(lang: Lang, label: &str, version: &str) -> String {
+        t!(
+            lang,
+            en: format!("{label} is now {version}. Press Esc to go back to the board, then N to start it."),
+            zh: format!("{label} 已更新到 {version}。按 Esc 回看板，再按 N 就能开它。"),
+        )
+    }
+
+    /// 装的就是仓库上最新的那一版。**这不是失败**：用户要的是「让它最新」，
+    /// 而它已经最新了，退出码 0。
+    pub fn already_latest(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("{label} is already the latest version."),
+            zh: format!("{label} 已经是最新的了。"),
+        )
+    }
+
+    pub fn install_usage(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Usage: dct install <agent> [--update]   e.g. dct install claude",
+            zh: "用法：dct install <agent> [--update]   比如：dct install claude",
+        )
+        .to_string()
+    }
+
     /// 设置页顶上那一行——**唯一能跟下载页上「敲 `dct --version` 看到的
     /// 数字」对上的地方**（界面别处一处都不印版本号）。`version` 从调用方
     /// 传进来，取自 `env!("CARGO_PKG_VERSION")`（跟 `pair::user_agent()`

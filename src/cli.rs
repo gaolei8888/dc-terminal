@@ -596,6 +596,190 @@ fn fetch_problem(lang: Lang, e: &crate::runtime::FetchError) -> String {
     }
 }
 
+/// `dct install <agent> [--update]` 的参数解析结果。
+#[derive(Debug)]
+pub enum InstallArgs {
+    /// 装上（没装才装，装了就说一声）
+    Install(String),
+    /// 升到最新版
+    Update(String),
+    /// 参数不对，把该说的话说清楚
+    Usage(String),
+}
+
+/// 解析 `dct install` 后面的参数。认的只有一个 `--update`。
+///
+/// 跟 `parse_restart_args` 一个脾气：**不认识的参数是用法错误，不是
+/// 「当没看见」**。`dct install claude --dry-run` 要是被当成裸
+/// `dct install claude` 跑，用户以为自己什么都没动，实际真装下去了。
+/// 同一个开关给两遍、给两个名字，都归到同一条路上——那都说明用户对
+/// 自己敲了什么没有把握，猜一个不如让他重敲。
+pub fn parse_install_args(args: &[String], lang: Lang) -> InstallArgs {
+    let mut name: Option<String> = None;
+    let mut update = false;
+    for a in args {
+        match a.as_str() {
+            "--update" if !update => update = true,
+            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
+            _ => return InstallArgs::Usage(crate::i18n::msg::install_usage(lang)),
+        }
+    }
+    match (name, update) {
+        (Some(n), false) => InstallArgs::Install(n),
+        (Some(n), true) => InstallArgs::Update(n),
+        (None, _) => InstallArgs::Usage(crate::i18n::msg::install_usage(lang)),
+    }
+}
+
+/// 这个 profile 有几个还活着的会话。
+///
+/// `Stopped` 不算——进程已经没了，底下换文件伤不到它。别的 profile 也
+/// 不算：更新 claude 的时候 codex 在跑，跟这件事无关，拦下来只会让用户
+/// 去关一个他根本不必关的东西。
+pub(crate) fn live_sessions_of(sessions: &[SessionInfo], profile: &str) -> usize {
+    sessions
+        .iter()
+        .filter(|s| s.profile == profile && s.state != SessionState::Stopped)
+        .count()
+}
+
+/// 问守护进程要会话列表。
+///
+/// **守护进程没起 → 空列表**：没有守护进程就没有会话，这不是「查不到」
+/// 而是「确实没有」。把连不上当成错误拦住更新，等于让一个刚开机的人
+/// 先去起一个他不需要的后台进程。
+fn sessions_now(socket: &Path) -> Vec<SessionInfo> {
+    let Ok(mut c) = Client::connect(socket) else {
+        return Vec::new();
+    };
+    match c.call(Request::List) {
+        Ok(Response::Sessions(v)) => v,
+        _ => Vec::new(),
+    }
+}
+
+/// 装完（或更新完）告诉守护进程重查这一个。
+///
+/// 发不出去不算错——守护进程没起的话，它起来 30 秒后自己会查。没有这一句
+/// 的话，装完之后界面上那条「有新版本」还会挂着，要等一天才消失。
+fn recheck(socket: &Path, name: &str) {
+    if let Ok(mut c) = Client::connect(socket) {
+        let _ = c.call(Request::RecheckUpdates {
+            profile: Some(name.to_string()),
+        });
+    }
+}
+
+/// `dct install <agent> --update`：把一个已经装好的 agent 升到最新版。
+///
+/// 走的是跟安装一模一样的那条路（缺 npm 先补自带的 Node、同一个
+/// `--registry`、跑完真的再读一遍版本），差别只有两处：动手之前先确认
+/// 没有会话在跑，以及追溯不到 npm 包时明说「不是 dct 装的」而不是硬装。
+fn run_update(
+    socket: &Path,
+    runtime: &Path,
+    p: &crate::profile::Profile,
+    label: &str,
+    cmd0: &str,
+    lang: Lang,
+) -> i32 {
+    // 先问会话再干别的：正在跑的 node 进程底下换文件，Qwen Code 这种
+    // 几百个文件的包会在下一次 require 时读到新旧混杂的东西。**拒绝，
+    // 不是警告**——警告了照样换，坏的还是同一件事。
+    //
+    // 已知的窟窿：按 profile 名数，而被换掉的是**包**。`dc` 和 `qwen` 共用
+    // `@qwen-code/qwen-code`，所以更新 `qwen` 的时候一个在跑的 `dc` 会话
+    // 拦不住。要堵得改成「所有追溯到同一个包的 profile 一起数」。今天不堵
+    // 是因为这个组合只在 profile 里出现过一次，而改判据会把界面那一侧
+    // （按 profile 画的更新提示）一起牵动。
+    let n = live_sessions_of(&sessions_now(socket), &p.name);
+    if n > 0 {
+        eprintln!(
+            "{}",
+            crate::i18n::msg::update_refused_sessions_running(lang, n, label)
+        );
+        return 1;
+    }
+
+    let Some(package) = p
+        .install
+        .as_ref()
+        .and_then(|i| crate::update::npm_package_of(&i.command))
+    else {
+        eprintln!("{}", crate::i18n::msg::not_managed_by_dct(lang, label));
+        return 1;
+    };
+
+    let Some(exe) = crate::sys::fs::find_command(cmd0) else {
+        // 没装就走安装路——`--update` 对一个没装的 agent 就是「装上」。
+        // 让他先敲一遍 `dct install` 再敲一遍 `--update` 没有任何意义。
+        return run_install(&p.name, false, lang);
+    };
+    let Some(before) = crate::update::installed_version(&exe, &package) else {
+        // profile 里写着 npm，但机器上这一份追溯不到 npm 包：官方安装器
+        // 装的那种。硬跑 `npm i -g` 会装出第二份，PATH 上先找到哪个全看
+        // 运气——那比不更新糟得多。
+        eprintln!("{}", crate::i18n::msg::not_managed_by_dct(lang, label));
+        return 1;
+    };
+
+    if !crate::profile::command_exists("npm") {
+        if let Err(e) = crate::runtime::ensure_node(runtime, lang, &TermProgress::default()) {
+            eprintln!("{}", fetch_problem(lang, &e));
+            return 1;
+        }
+    }
+
+    let mut argv = vec![
+        "npm".to_string(),
+        "i".into(),
+        "-g".into(),
+        format!("{package}@latest"),
+    ];
+    if let Some(reg) = crate::update::npm_registry_override() {
+        argv.push("--registry".into());
+        argv.push(reg);
+    }
+
+    println!("{}", crate::i18n::msg::updating_agent(lang, label));
+
+    // Windows 上要经过 `launch_argv`，理由同 `run_install`（见 `sys::shell`）。
+    let argv = crate::sys::shell::launch_argv(&argv);
+    let ok = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("{}", crate::i18n::msg::install_failed(lang, label));
+        return 1;
+    }
+
+    // 跑完再读一遍。「npm 说成功」和「版本变了」不是一回事：仓库上就是
+    // 这一版的时候 npm 一样是成功退出的。
+    let after = crate::sys::fs::find_command(cmd0)
+        .and_then(|e| crate::update::installed_version(&e, &package));
+    recheck(socket, &p.name);
+    match after {
+        Some(v) if v != before => {
+            println!("{}", crate::i18n::msg::update_succeeded(lang, label, &v));
+            0
+        }
+        // 已经是最新的**不是失败**：用户要的是「让它最新」，而它已经最新了。
+        Some(_) => {
+            println!("{}", crate::i18n::msg::already_latest(lang, label));
+            0
+        }
+        None => {
+            eprintln!(
+                "{}",
+                crate::i18n::msg::install_finished_but_missing(lang, cmd0)
+            );
+            1
+        }
+    }
+}
+
 /// `dct install <agent>`：把一个 agent 装到能用为止。
 ///
 /// **这条命令存在的理由，是把「学生看到的第一句英文报错」换掉。** 在它
@@ -608,7 +792,10 @@ fn fetch_problem(lang: Lang, e: &crate::runtime::FetchError) -> String {
 /// **最后真的再查一遍那个命令是不是找得到了**。最后这一步不能省：
 /// 「npm 说成功了」和「敲得出这个命令了」不是同一件事——npm 装到别的
 /// prefix 去、或者包本身没带 bin，都会长成「成功但没有」。
-pub fn run_install(name: &str, lang: Lang) -> i32 {
+///
+/// `update = true` 时走的是 `run_update`：把「命令找得到就说装好了、退出」
+/// 那一步换成「升到最新版」。
+pub fn run_install(name: &str, update: bool, lang: Lang) -> i32 {
     let socket = crate::proto::socket_path();
     let runtime = crate::runtime::runtime_dir_for_socket(&socket);
 
@@ -642,6 +829,12 @@ pub fn run_install(name: &str, lang: Lang) -> i32 {
         eprintln!("{}", crate::i18n::msg::agent_has_no_installer(lang, &label));
         return 1;
     };
+
+    // `--update` 要在「已经装好了」这句话之前拐弯：那句话正是它要替换掉的
+    // 那一步。放在后面的话，更新永远走不到——能更新的东西一定是装好的。
+    if update {
+        return run_update(&socket, &runtime, &p, &label, &cmd0, lang);
+    }
 
     if crate::profile::command_exists(&cmd0) {
         println!(
@@ -699,6 +892,9 @@ pub fn run_install(name: &str, lang: Lang) -> i32 {
 
     // 装完再查一遍。见函数头注释：这一步是这条命令跟直接敲 npm 的全部差别。
     if crate::profile::command_exists(&cmd0) {
+        // 顺手让守护进程重查这一个的版本。不发的话，界面上这个 agent 的
+        // 版本要等到下一轮（最多一天）才对得上。
+        recheck(&socket, name);
         println!("{}", crate::i18n::msg::install_succeeded(lang, &label));
         0
     } else {
@@ -868,15 +1064,105 @@ mod tests {
         }
     }
 
+    /// 一份最小的会话信息，测试里只覆盖自己关心的那一两个字段。
+    /// 加新字段时只有这一处要改。
+    fn test_session_info() -> SessionInfo {
+        SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/w/dc-terminal".into(),
+            state: SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+            tag: String::new(),
+        }
+    }
+
     fn s(id: u32, state: SessionState, activity: &str) -> SessionInfo {
         SessionInfo {
             id,
-            profile: "claude".into(),
-            dir: "/w/dc-terminal".into(),
             state,
             activity: activity.into(),
-            is_agent: true,
-            tag: String::new(),
+            ..test_session_info()
+        }
+    }
+
+    /// `dct install <agent>` 只认 `--update` 一个开关，别的一律用法错误。
+    ///
+    /// 钉死「不认识的参数不等于没参数」，跟 `parse_restart_args` 一个脾气：
+    /// `dct install claude --dry-run` 要是被当成裸 `dct install claude` 跑，
+    /// 用户以为自己什么都没动，实际真装下去了。
+    #[test]
+    fn install_args_accept_only_the_update_flag() {
+        let lang = Lang::Zh;
+        assert!(
+            matches!(parse_install_args(&args(&["claude"]), lang), InstallArgs::Install(n) if n == "claude")
+        );
+        assert!(
+            matches!(parse_install_args(&args(&["claude", "--update"]), lang), InstallArgs::Update(n) if n == "claude")
+        );
+        assert!(
+            matches!(parse_install_args(&args(&["--update", "claude"]), lang), InstallArgs::Update(n) if n == "claude")
+        );
+        assert!(matches!(
+            parse_install_args(&args(&[]), lang),
+            InstallArgs::Usage(_)
+        ));
+        assert!(matches!(
+            parse_install_args(&args(&["claude", "--foo"]), lang),
+            InstallArgs::Usage(_)
+        ));
+        assert!(matches!(
+            parse_install_args(&args(&["claude", "codex"]), lang),
+            InstallArgs::Usage(_)
+        ));
+        // 同一个开关给两遍也是用法错误：说明用户对自己敲了什么没有把握。
+        assert!(matches!(
+            parse_install_args(&args(&["claude", "--update", "--update"]), lang),
+            InstallArgs::Usage(_)
+        ));
+        // 只给开关不给名字，不知道要更新谁。
+        assert!(matches!(
+            parse_install_args(&args(&["--update"]), lang),
+            InstallArgs::Usage(_)
+        ));
+    }
+
+    /// 「这个 agent 还有几个会话活着」——`--update` 拒不拒绝就看它。
+    ///
+    /// 两条边界都得钉：**别的 profile 的会话不算**（更新 claude 的时候
+    /// codex 在跑，跟它无关），**`Stopped` 不算**（进程已经没了，底下换
+    /// 文件伤不到它）。数错任何一边的代价都是真的：多算了就是用户明明
+    /// 什么都没开却更新不了，少算了就是在活着的 node 进程底下换文件。
+    #[test]
+    fn live_sessions_count_only_this_profile_and_only_the_living() {
+        let s = |profile: &str, state| SessionInfo {
+            profile: profile.into(),
+            state,
+            ..test_session_info()
+        };
+        let list = vec![
+            s("claude", SessionState::Working),
+            s("claude", SessionState::Idle),
+            s("claude", SessionState::Stopped),
+            s("codex", SessionState::Working),
+        ];
+        assert_eq!(live_sessions_of(&list, "claude"), 2);
+        assert_eq!(live_sessions_of(&list, "codex"), 1);
+        assert_eq!(live_sessions_of(&list, "qwen"), 0);
+    }
+
+    /// 用法提示得把那个开关写出来——用户看不到就等于没有这个功能。
+    #[test]
+    fn the_install_usage_hint_mentions_the_update_flag() {
+        for lang in [Lang::Zh, Lang::En] {
+            match parse_install_args(&args(&["claude", "--foo"]), lang) {
+                InstallArgs::Usage(m) => {
+                    assert!(m.contains("--update"), "用法里该有 --update：{m}");
+                    assert!(m.contains("dct install"), "用法里该有命令本身：{m}");
+                }
+                other => panic!("该是用法提示，实际 {other:?}"),
+            }
         }
     }
 

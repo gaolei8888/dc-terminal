@@ -20,6 +20,7 @@ dct —— vibe coding 终端
   dct prune        把已经停掉的会话从列表里清掉
   dct install <名字> 装一个 agent（claude / codex / qwen / opencode）。
                    缺 Node 运行时会自己补上一份，只给 dct 自己用
+  dct install <名字> --update  把它升到最新版；有会话在跑时会拒绝
   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
                    靠它，没有它撤销是死的；同样只给 dct 自己用
   dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
@@ -65,10 +66,18 @@ fn main() -> Result<()> {
         // `install` 也不连守护进程：它装的是磁盘上的东西，跟有没有会话
         // 在跑无关。界面开一个 shell 会话把这一行敲进去，学生因此看得见
         // 整个过程——那正是这条命令要给他的东西。
-        Some("install") => match args.get(1) {
-            Some(name) => std::process::exit(dct::cli::run_install(name, cli_lang())),
-            None => {
-                eprintln!("要装哪个？比如：dct install claude");
+        //
+        // `--update` 是唯一的例外，它要连：更新之前得先确认这个 agent
+        // 没有会话在跑（`cli::run_update`）。连不上就是没有会话，放行。
+        Some("install") => match dct::cli::parse_install_args(&args[1..], cli_lang()) {
+            dct::cli::InstallArgs::Install(n) => {
+                std::process::exit(dct::cli::run_install(&n, false, cli_lang()))
+            }
+            dct::cli::InstallArgs::Update(n) => {
+                std::process::exit(dct::cli::run_install(&n, true, cli_lang()))
+            }
+            dct::cli::InstallArgs::Usage(u) => {
+                eprintln!("{u}");
                 std::process::exit(2)
             }
         },
