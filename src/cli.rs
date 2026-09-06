@@ -639,11 +639,40 @@ pub fn parse_install_args(args: &[String], lang: Lang) -> InstallArgs {
 ///
 /// 收的是**一串**名字而不是一个，因为被换掉的是**包**不是 profile：
 /// `dc` 和 `qwen` 跑的是同一个二进制、同一个 npm 包（见 `sibling_profiles`）。
-pub(crate) fn live_sessions_of(sessions: &[SessionInfo], profiles: &[String]) -> usize {
+///
+/// **回的是每个会话的 profile 名，不是个数。** 长度就是「有几个」，去重之后
+/// 就是「都是谁」——拒绝那句话两样都要：只报个数的话，`dct install kimi
+/// --update` 被两个 claude 会话拦住时只能说「2 个 Kimi 会话」，而一个 Kimi
+/// 会话都没有，用户会去找两个不存在的东西。
+pub(crate) fn live_sessions_of(sessions: &[SessionInfo], profiles: &[String]) -> Vec<String> {
     sessions
         .iter()
         .filter(|s| profiles.iter().any(|n| n == &s.profile) && s.state != SessionState::Stopped)
-        .count()
+        .map(|s| s.profile.clone())
+        .collect()
+}
+
+/// 把一串 profile 名翻成菜单上那些名字，**按出现顺序去重**。
+///
+/// 拒绝那句话里要列的就是它。认不出的名字原样留着：那说明会话是一个已经被
+/// 删掉的自定义 profile 起的，印它的原名总比印一个空括号强。
+pub(crate) fn distinct_labels(
+    all: &[crate::profile::Profile],
+    profile_names: &[String],
+    lang: Lang,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in profile_names {
+        let label = all
+            .iter()
+            .find(|p| &p.name == name)
+            .map(|p| p.display_label(lang))
+            .unwrap_or_else(|| name.clone());
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
 }
 
 /// 跟 `cmd0` 跑同一条命令的 profile 有哪些（包含它自己）。
@@ -661,6 +690,30 @@ pub(crate) fn sibling_profiles(all: &[crate::profile::Profile], cmd0: &str) -> V
         .filter(|p| p.command.first().map(String::as_str) == Some(cmd0))
         .map(|p| p.name.clone())
         .collect()
+}
+
+/// 有会话在跑就给出该说的那句话，没有就是 `None`（可以往下更新）。
+///
+/// **整段判断都在这儿，`run_update` 里不留任何拼装。** 这个函数**拿不到**
+/// 被更新那个 agent 的名字——那正是重点：句子里该出现的是那些会话自己的
+/// 名字，而只要 `label` 还递得进来，就总有人会顺手用它，于是又变回
+/// 「先关掉 2 个 Kimi 会话」这种指向不存在东西的话。递不进来就写不出来。
+pub(crate) fn refusal_for_running_sessions(
+    all: &[crate::profile::Profile],
+    sessions: &[SessionInfo],
+    family: &[String],
+    lang: Lang,
+) -> Option<String> {
+    let running = live_sessions_of(sessions, family);
+    if running.is_empty() {
+        return None;
+    }
+    let who = distinct_labels(all, &running, lang);
+    Some(crate::i18n::msg::update_refused_sessions_running(
+        lang,
+        running.len(),
+        &who,
+    ))
 }
 
 /// 问守护进程要会话列表的结果。
@@ -795,18 +848,8 @@ fn run_update(
             return 1;
         }
     };
-    let n = live_sessions_of(&sessions, &family);
-    if n > 0 {
-        // 已知的措辞问题：数是跨兄弟数的，句子里印的却是**被更新那个**的
-        // 名字。`dct install kimi --update` 撞上两个 claude 会话，印出来是
-        // 「先关掉正在跑的 2 个 Kimi 会话」——而一个 Kimi 会话都没有，
-        // 用户会去找两个不存在的东西。要修得让这句话点名到底是哪几个
-        // profile（`update_refused_sessions_running` 得多收一个名字列表），
-        // 那会动到界面那一侧共用的同一句文案，留给一次单独的改动。
-        eprintln!(
-            "{}",
-            crate::i18n::msg::update_refused_sessions_running(lang, n, label)
-        );
+    if let Some(msg) = refusal_for_running_sessions(all, &sessions, &family, lang) {
+        eprintln!("{msg}");
         return 1;
     }
 
@@ -1235,22 +1278,28 @@ mod tests {
             s("codex", SessionState::Working),
             s("dc", SessionState::Working),
         ];
-        assert_eq!(live_sessions_of(&list, &names(&["claude"])), 2);
-        assert_eq!(live_sessions_of(&list, &names(&["codex"])), 1);
-        assert_eq!(live_sessions_of(&list, &names(&["qwen"])), 0);
+        assert_eq!(live_sessions_of(&list, &names(&["claude"])).len(), 2);
+        assert_eq!(live_sessions_of(&list, &names(&["codex"])).len(), 1);
+        assert_eq!(live_sessions_of(&list, &names(&["qwen"])).len(), 0);
 
         // 更新 `qwen` 的时候一个在跑的 `dc` 会话必须拦得住：两个 profile 跑的
         // 是同一个二进制、同一个 npm 包，`dc` 那个 node 进程底下的文件正是
         // 要被换掉的那批。
-        assert_eq!(live_sessions_of(&list, &names(&["qwen", "dc"])), 1);
+        assert_eq!(live_sessions_of(&list, &names(&["qwen", "dc"])).len(), 1);
         // 但 `codex` 仍然不该被牵连——它是另一个包。
-        assert_eq!(live_sessions_of(&list, &names(&["qwen", "dc"])), 1);
         assert_eq!(
-            live_sessions_of(&list, &names(&["claude", "kimi", "glm"])),
+            live_sessions_of(&list, &names(&["claude", "kimi", "glm"])).len(),
             2
         );
         // 一个名字都不给 = 没有兄弟可数，不该把所有会话都算进来。
-        assert_eq!(live_sessions_of(&list, &[]), 0);
+        assert_eq!(live_sessions_of(&list, &[]).len(), 0);
+
+        // 回的是**每个会话的 profile 名**，不只是个数——拒绝那句话要拿它
+        // 说清楚到底是谁在跑。顺序照会话列表，重复不去（`claude` 两个）。
+        assert_eq!(
+            live_sessions_of(&list, &names(&["claude", "dc"])),
+            names(&["claude", "claude", "dc"])
+        );
     }
 
     /// 「跑同一条命令的 profile 有哪些」——`--update` 要拦谁，全看它。
@@ -1291,15 +1340,89 @@ mod tests {
     /// 括号里的 `(s)` 是写给程序员看的偷懒写法。
     #[test]
     fn the_refusal_sentence_reads_naturally_for_one_session() {
-        let one = crate::i18n::msg::update_refused_sessions_running(Lang::En, 1, "Claude Code");
+        let labels = names(&["Claude"]);
+        let one = crate::i18n::msg::update_refused_sessions_running(Lang::En, 1, &labels);
         assert!(one.contains("session"), "{one}");
         assert!(!one.contains("(s)"), "单数不该印 (s)：{one}");
         assert!(!one.contains("sessions"), "1 个不该用复数：{one}");
 
-        let many = crate::i18n::msg::update_refused_sessions_running(Lang::En, 2, "Claude Code");
+        let many = crate::i18n::msg::update_refused_sessions_running(Lang::En, 2, &labels);
         assert!(many.contains("2 running"), "{many}");
         assert!(many.contains("sessions"), "多个要用复数：{many}");
         assert!(!many.contains("(s)"), "{many}");
+    }
+
+    /// 好几个兄弟一起被数进来时，名字要全列出来，中英各用各的顿号。
+    #[test]
+    fn the_refusal_sentence_names_every_agent_it_counted() {
+        let labels = names(&["Claude", "Kimi"]);
+        let zh = crate::i18n::msg::update_refused_sessions_running(Lang::Zh, 3, &labels);
+        assert!(zh.contains("Claude、Kimi"), "中文用顿号连：{zh}");
+        assert!(zh.contains('3'), "{zh}");
+
+        let en = crate::i18n::msg::update_refused_sessions_running(Lang::En, 3, &labels);
+        assert!(en.contains("Claude, Kimi"), "英文用逗号连：{en}");
+    }
+
+    /// **拒绝那句话必须点名用户真找得到的东西。**
+    ///
+    /// `dct install kimi --update` 撞上两个 `claude` 会话时，一个 Kimi 会话
+    /// 都不存在——印「先关掉正在跑的 2 个 Kimi 会话」等于让用户去找两个
+    /// 不存在的东西。要印的是那两个会话**自己**的名字。
+    #[test]
+    fn the_refusal_names_the_sessions_that_exist_not_the_agent_being_updated() {
+        let all = crate::profile::Profile::builtins();
+        let live = vec![
+            SessionInfo {
+                profile: "claude".into(),
+                state: SessionState::Working,
+                ..test_session_info()
+            },
+            SessionInfo {
+                profile: "claude".into(),
+                state: SessionState::Idle,
+                ..test_session_info()
+            },
+        ];
+
+        // 更新 kimi：兄弟里包含 claude，所以这两个会话拦得住它。走的是
+        // `run_update` 真正调的那个函数，不是把几步拼起来自己模拟一遍——
+        // 拼装本身出过错（把被更新那个的 label 递进去），得由测试盯着。
+        let family = sibling_profiles(&all, "claude");
+        let sentence = refusal_for_running_sessions(&all, &live, &family, Lang::Zh)
+            .expect("两个 claude 会话活着，必须拦住");
+
+        assert!(sentence.contains('2'), "得说清有几个：{sentence}");
+        assert!(
+            sentence.contains("Claude"),
+            "得点名真在跑的那个：{sentence}"
+        );
+        assert!(
+            !sentence.contains("Kimi"),
+            "一个 Kimi 会话都没有，不该让用户去找：{sentence}"
+        );
+
+        // 都停了就不该拦——那时候底下换文件伤不到任何东西。
+        let stopped = vec![SessionInfo {
+            profile: "claude".into(),
+            state: SessionState::Stopped,
+            ..test_session_info()
+        }];
+        assert!(refusal_for_running_sessions(&all, &stopped, &family, Lang::Zh).is_none());
+    }
+
+    /// 去重按出现顺序，认不出的 profile 名原样留着——总比印一个空括号强。
+    #[test]
+    fn labels_are_deduplicated_in_order_and_fall_back_to_the_raw_name() {
+        let all = crate::profile::Profile::builtins();
+        assert_eq!(
+            distinct_labels(&all, &names(&["dc", "qwen", "dc"]), Lang::Zh),
+            names(&["DC", "Qwen Code"])
+        );
+        assert_eq!(
+            distinct_labels(&all, &names(&["ghost"]), Lang::Zh),
+            names(&["ghost"])
+        );
     }
 
     /// 守护进程在、但这句话它答不上来（旧版本、协议对不上）→ **拒绝**。

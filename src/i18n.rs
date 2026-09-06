@@ -2190,17 +2190,25 @@ pub mod msg {
     /// 数字要印出来——「有会话在跑」是一句用户没法照着做的话，「2 个」
     /// 才让他知道要去关几个。
     ///
+    /// `labels` 是**那些会话自己**的 agent 名（去过重），不是被更新的那个。
+    /// 两者常常对不上：好几个 agent 跑同一个二进制（`kimi` 跑的是 `claude`、
+    /// `dc` 跑的是 `qwen`），更新其中一个会被另一个的会话拦住。这时候印被
+    /// 更新那个的名字，等于让用户去找一个根本不存在的会话。
+    ///
     /// 英文分单复数，**不写 `session(s)`**：那个括号是写给程序员看的偷懒
     /// 写法，而这句话的读者是零基础的人。中文不分，本来就不分。
-    pub fn update_refused_sessions_running(lang: Lang, n: usize, label: &str) -> String {
+    pub fn update_refused_sessions_running(lang: Lang, n: usize, labels: &[String]) -> String {
         t!(
             lang,
-            en: if n == 1 {
-                format!("Close the running {label} session first, then update.")
-            } else {
-                format!("Close the {n} running {label} sessions first, then update.")
+            en: {
+                let who = labels.join(", ");
+                if n == 1 {
+                    format!("Close the running session ({who}) first, then update.")
+                } else {
+                    format!("Close the {n} running sessions ({who}) first, then update.")
+                }
             },
-            zh: format!("先关掉正在跑的 {n} 个 {label} 会话再更新。"),
+            zh: format!("先关掉正在跑的 {n} 个会话（{}）再更新。", labels.join("、")),
         )
     }
 
