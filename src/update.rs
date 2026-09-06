@@ -17,8 +17,11 @@ use std::path::Path;
 
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 
-/// `DCT_NPM_REGISTRY`，跟 `runtime.rs` 的 `DCT_NODE_BASE` 分成两个变量，
-/// 理由写在原来 `cli.rs` 那份注释里（镜像站可能只镜像了其中一样）。
+/// npm 该去哪个仓库拿包。国内课堂设 `DCT_NPM_REGISTRY`，别处不设就是官方。
+///
+/// 跟 `DCT_NODE_BASE` 分成两个变量而不是一个「中国模式」开关：这两件事
+/// 会分别失效（镜像站可能只镜像了其中一样），而一个开关同时管两样的话，
+/// 出问题时没法只换一半。
 pub fn npm_registry_override() -> Option<String> {
     std::env::var("DCT_NPM_REGISTRY")
         .ok()
@@ -27,7 +30,8 @@ pub fn npm_registry_override() -> Option<String> {
 }
 
 pub fn registry() -> String {
-    npm_registry_override().unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
+    let r = npm_registry_override().unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    r.trim_end_matches('/').to_string()
 }
 
 pub fn latest_url(registry: &str, package: &str) -> String {
@@ -43,7 +47,7 @@ pub fn npm_package_of(command: &[String]) -> Option<String> {
         return None;
     }
     match it.next().map(String::as_str) {
-        Some("i") | Some("install") | Some("add") => {}
+        Some("i") | Some("install") => {}
         _ => return None,
     }
     it.find(|a| !a.starts_with('-')).cloned()
@@ -258,5 +262,24 @@ mod tests {
             latest_url("https://registry.npmmirror.com", "opencode-ai"),
             "https://registry.npmmirror.com/opencode-ai/latest"
         );
+    }
+
+    /// `registry()` 跟 `latest_url` 一样要去掉末尾的 `/`——老师把镜像地址
+    /// 抄进环境变量时，带不带这一个斜杠全凭手感，两种都不能拼出
+    /// `.../` + `/@pkg/latest` 这种双斜杠。
+    ///
+    /// 用完把变量还原：这个变量在整个测试进程里只有这一处读写
+    /// （见 `grep DCT_NPM_REGISTRY src/`），跟 `runtime.rs` 里
+    /// `the_mingit_address_can_be_pointed_at_a_classroom_mirror`
+    /// 对 `DCT_MINGIT_URL` 的做法一样，不会跟其它测试抢同一个变量。
+    #[test]
+    fn registry_trims_a_trailing_slash_from_the_override() {
+        let saved = std::env::var("DCT_NPM_REGISTRY").ok();
+        std::env::set_var("DCT_NPM_REGISTRY", "https://x/");
+        assert_eq!(registry(), "https://x");
+        match saved {
+            Some(v) => std::env::set_var("DCT_NPM_REGISTRY", v),
+            None => std::env::remove_var("DCT_NPM_REGISTRY"),
+        }
     }
 }
