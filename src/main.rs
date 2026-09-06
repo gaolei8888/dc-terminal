@@ -68,7 +68,9 @@ fn main() -> Result<()> {
         // 整个过程——那正是这条命令要给他的东西。
         //
         // `--update` 是唯一的例外，它要连：更新之前得先确认这个 agent
-        // 没有会话在跑（`cli::run_update`）。连不上就是没有会话，放行。
+        // 没有会话在跑（`cli::run_update`）。**连不上**（守护进程没起）
+        // 就是没有会话，放行；**连上了却答不出来**（旧守护进程）是未知，
+        // 拒绝——那两种情况在这条命令上的分量完全不同。
         Some("install") => match dct::cli::parse_install_args(&args[1..], cli_lang()) {
             dct::cli::InstallArgs::Install(n) => {
                 std::process::exit(dct::cli::run_install(&n, false, cli_lang()))

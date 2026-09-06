@@ -633,41 +633,136 @@ pub fn parse_install_args(args: &[String], lang: Lang) -> InstallArgs {
 
 /// 这个 profile 有几个还活着的会话。
 ///
-/// `Stopped` 不算——进程已经没了，底下换文件伤不到它。别的 profile 也
-/// 不算：更新 claude 的时候 codex 在跑，跟这件事无关，拦下来只会让用户
+/// `Stopped` 不算——进程已经没了，底下换文件伤不到它。不在名单里的 profile
+/// 也不算：更新 claude 的时候 codex 在跑，跟这件事无关，拦下来只会让用户
 /// 去关一个他根本不必关的东西。
-pub(crate) fn live_sessions_of(sessions: &[SessionInfo], profile: &str) -> usize {
+///
+/// 收的是**一串**名字而不是一个，因为被换掉的是**包**不是 profile：
+/// `dc` 和 `qwen` 跑的是同一个二进制、同一个 npm 包（见 `sibling_profiles`）。
+pub(crate) fn live_sessions_of(sessions: &[SessionInfo], profiles: &[String]) -> usize {
     sessions
         .iter()
-        .filter(|s| s.profile == profile && s.state != SessionState::Stopped)
+        .filter(|s| profiles.iter().any(|n| n == &s.profile) && s.state != SessionState::Stopped)
         .count()
+}
+
+/// 跟 `cmd0` 跑同一条命令的 profile 有哪些（包含它自己）。
+///
+/// 这是「更新会动到谁」的正确判据。`npm i -g <pkg>` 换掉的是磁盘上那个包，
+/// 而好几个 profile 可能共用它：`kimi`/`glm`/`deepseek`/`qwen-api` 的
+/// `command[0]` 都是 `claude`，`dc` 的是 `qwen`。只按 profile 名数会话的话，
+/// 更新 `qwen` 时一个在跑的 `dc` 会话拦不住，而它那个 node 进程底下的文件
+/// 正是要被换掉的那批。
+///
+/// **不写死配对**，从传进来的 profile 全集里算——哪天有人改了 toml、加了
+/// 新的，这里自动跟上，不用有人记得回来改一份清单。
+pub(crate) fn sibling_profiles(all: &[crate::profile::Profile], cmd0: &str) -> Vec<String> {
+    all.iter()
+        .filter(|p| p.command.first().map(String::as_str) == Some(cmd0))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// 问守护进程要会话列表的结果。
+#[derive(Debug)]
+pub(crate) enum Sessions {
+    /// 问出来了。空列表是一个**确定的答案**（守护进程没起 = 确实没有会话）。
+    Known(Vec<SessionInfo>),
+    /// 守护进程在，但这句话它答不上来。**有没有会话是未知的**。
+    Unusable,
+}
+
+/// 把 `List` 的结果翻成「能不能动手」。抽成纯函数是因为这是条安全边界：
+/// 判错的代价是在一堆活着的进程底下换文件，而它不该只能靠真守护进程测。
+///
+/// **答不上来 ≠ 没有会话。** `Client::connect` 只是连上 socket，**没有任何
+/// 版本握手**（见 `client::Client::connect`），所以对面是个旧守护进程时
+/// 连得上、`List` 才失败——回一个解析不了的 `SessionInfo`，或者干脆答非
+/// 所问。那种失败必须拦住更新。
+pub(crate) fn sessions_from(r: Result<Response>) -> Sessions {
+    match r {
+        Ok(Response::Sessions(v)) => Sessions::Known(v),
+        _ => Sessions::Unusable,
+    }
 }
 
 /// 问守护进程要会话列表。
 ///
-/// **守护进程没起 → 空列表**：没有守护进程就没有会话，这不是「查不到」
-/// 而是「确实没有」。把连不上当成错误拦住更新，等于让一个刚开机的人
-/// 先去起一个他不需要的后台进程。
-fn sessions_now(socket: &Path) -> Vec<SessionInfo> {
-    let Ok(mut c) = Client::connect(socket) else {
-        return Vec::new();
-    };
-    match c.call(Request::List) {
-        Ok(Response::Sessions(v)) => v,
-        _ => Vec::new(),
+/// **连不上（守护进程没起）→ 空列表**：没有守护进程就没有会话，这不是
+/// 「查不到」而是「确实没有」。把这一种也拦住，等于让一个刚开机的人先去
+/// 起一个他不需要的后台进程。连上了却答不出来是另一回事，见 `sessions_from`。
+fn sessions_now(socket: &Path) -> Sessions {
+    match Client::connect(socket) {
+        Err(_) => Sessions::Known(Vec::new()),
+        Ok(mut c) => sessions_from(c.call(Request::List)),
     }
 }
 
-/// 装完（或更新完）告诉守护进程重查这一个。
+/// 装完（或更新完）告诉守护进程重查版本。
 ///
 /// 发不出去不算错——守护进程没起的话，它起来 30 秒后自己会查。没有这一句
 /// 的话，装完之后界面上那条「有新版本」还会挂着，要等一天才消失。
-fn recheck(socket: &Path, name: &str) {
+///
+/// **重查全部，不是只查刚动过的那个**：换掉一个包会让共用它的那几个
+/// profile 一起变（`dc` 和 `qwen`），只报刚敲的那个名字的话，另一个的
+/// 提示还挂着。一次全量扫描很便宜，而且永远是对的。
+fn recheck(socket: &Path) {
     if let Ok(mut c) = Client::connect(socket) {
-        let _ = c.call(Request::RecheckUpdates {
-            profile: Some(name.to_string()),
-        });
+        let _ = c.call(Request::RecheckUpdates { profile: None });
     }
+}
+
+/// 跑一条 `npm i -g …`：缺 npm 先补一份自带的 Node，追加镜像，Windows 上
+/// 经过 `launch_argv`（npm 装出来的是 `.cmd`，见 `sys::shell`）。
+///
+/// `banner` 是补完 Node、真正动手之前对用户说的那句话（「正在装 X」/
+/// 「正在更新 X」）。**由这里印而不是调用方印**，为的是顺序：先说运行时
+/// 准备好了，再说开始装——反过来的话，用户会先看到「正在装 Claude Code」，
+/// 然后卡在一段跟 Claude Code 无关的下载上。
+fn run_npm_global(mut argv: Vec<String>, runtime: &Path, lang: Lang, banner: &str) -> NpmRun {
+    if !crate::profile::command_exists("npm") {
+        if let Err(e) = crate::runtime::ensure_node(runtime, lang, &TermProgress::default()) {
+            eprintln!("{}", fetch_problem(lang, &e));
+            return NpmRun::NoNpm;
+        }
+        println!("{}", crate::i18n::msg::node_ready(lang));
+    }
+
+    if let Some(reg) = crate::update::npm_registry_override() {
+        argv.push("--registry".into());
+        argv.push(reg);
+    }
+
+    if spawn_status(&argv, banner) {
+        NpmRun::Ok
+    } else {
+        NpmRun::Failed
+    }
+}
+
+/// 印一句「接下来这一段是它自己在说话」，然后跑，回它成没成。
+///
+/// Windows 上 npm 装出来的是 `.cmd`，而 CreateProcess 只启动真正的可执行
+/// 映像——`launch_argv` 就是为这件事存在的（见 `sys::shell`）。
+fn spawn_status(argv: &[String], banner: &str) -> bool {
+    println!("{banner}");
+    let argv = crate::sys::shell::launch_argv(argv);
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `run_npm_global` 的三种结局。**「失败」和「压根没跑成」得分开**：
+/// 前者后面该接一句「上面那几行是安装程序自己说的话」（`install_failed`），
+/// 而后者上面那几行是 dct 自己在说下载运行时出了什么事——对它补那一句
+/// 等于把用户指向一段根本不存在的安装程序输出。
+enum NpmRun {
+    Ok,
+    Failed,
+    /// 连 npm 都没弄到，为什么已经印过了。
+    NoNpm,
 }
 
 /// `dct install <agent> --update`：把一个已经装好的 agent 升到最新版。
@@ -678,6 +773,7 @@ fn recheck(socket: &Path, name: &str) {
 fn run_update(
     socket: &Path,
     runtime: &Path,
+    all: &[crate::profile::Profile],
     p: &crate::profile::Profile,
     label: &str,
     cmd0: &str,
@@ -687,13 +783,26 @@ fn run_update(
     // 几百个文件的包会在下一次 require 时读到新旧混杂的东西。**拒绝，
     // 不是警告**——警告了照样换，坏的还是同一件事。
     //
-    // 已知的窟窿：按 profile 名数，而被换掉的是**包**。`dc` 和 `qwen` 共用
-    // `@qwen-code/qwen-code`，所以更新 `qwen` 的时候一个在跑的 `dc` 会话
-    // 拦不住。要堵得改成「所有追溯到同一个包的 profile 一起数」。今天不堵
-    // 是因为这个组合只在 profile 里出现过一次，而改判据会把界面那一侧
-    // （按 profile 画的更新提示）一起牵动。
-    let n = live_sessions_of(&sessions_now(socket), &p.name);
+    // 数的是**跑同一条命令的所有 profile**，不是 `p.name` 一个：被换掉的是
+    // 磁盘上那个包，而 `dc` 和 `qwen` 共用它（见 `sibling_profiles`）。
+    let family = sibling_profiles(all, cmd0);
+    let sessions = match sessions_now(socket) {
+        Sessions::Known(v) => v,
+        // 守护进程在、却答不出有哪些会话（旧版本）。**这一条必须拦住**：
+        // 「不知道」被当成「没有」的代价，正是这个检查要防的那件事。
+        Sessions::Unusable => {
+            eprintln!("{}", crate::i18n::msg::daemon_too_old_to_check(lang));
+            return 1;
+        }
+    };
+    let n = live_sessions_of(&sessions, &family);
     if n > 0 {
+        // 已知的措辞问题：数是跨兄弟数的，句子里印的却是**被更新那个**的
+        // 名字。`dct install kimi --update` 撞上两个 claude 会话，印出来是
+        // 「先关掉正在跑的 2 个 Kimi 会话」——而一个 Kimi 会话都没有，
+        // 用户会去找两个不存在的东西。要修得让这句话点名到底是哪几个
+        // profile（`update_refused_sessions_running` 得多收一个名字列表），
+        // 那会动到界面那一侧共用的同一句文案，留给一次单独的改动。
         eprintln!(
             "{}",
             crate::i18n::msg::update_refused_sessions_running(lang, n, label)
@@ -723,43 +832,27 @@ fn run_update(
         return 1;
     };
 
-    if !crate::profile::command_exists("npm") {
-        if let Err(e) = crate::runtime::ensure_node(runtime, lang, &TermProgress::default()) {
-            eprintln!("{}", fetch_problem(lang, &e));
-            return 1;
-        }
-    }
-
-    let mut argv = vec![
+    let argv = vec![
         "npm".to_string(),
         "i".into(),
         "-g".into(),
         format!("{package}@latest"),
     ];
-    if let Some(reg) = crate::update::npm_registry_override() {
-        argv.push("--registry".into());
-        argv.push(reg);
-    }
-
-    println!("{}", crate::i18n::msg::updating_agent(lang, label));
-
-    // Windows 上要经过 `launch_argv`，理由同 `run_install`（见 `sys::shell`）。
-    let argv = crate::sys::shell::launch_argv(&argv);
-    let ok = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        eprintln!("{}", crate::i18n::msg::install_failed(lang, label));
-        return 1;
+    let banner = crate::i18n::msg::updating_agent(lang, label);
+    match run_npm_global(argv, runtime, lang, &banner) {
+        NpmRun::Ok => {}
+        NpmRun::Failed => {
+            eprintln!("{}", crate::i18n::msg::install_failed(lang, label));
+            return 1;
+        }
+        NpmRun::NoNpm => return 1,
     }
 
     // 跑完再读一遍。「npm 说成功」和「版本变了」不是一回事：仓库上就是
     // 这一版的时候 npm 一样是成功退出的。
     let after = crate::sys::fs::find_command(cmd0)
         .and_then(|e| crate::update::installed_version(&e, &package));
-    recheck(socket, &p.name);
+    recheck(socket);
     match after {
         Some(v) if v != before => {
             println!("{}", crate::i18n::msg::update_succeeded(lang, label, &v));
@@ -833,7 +926,7 @@ pub fn run_install(name: &str, update: bool, lang: Lang) -> i32 {
     // `--update` 要在「已经装好了」这句话之前拐弯：那句话正是它要替换掉的
     // 那一步。放在后面的话，更新永远走不到——能更新的东西一定是装好的。
     if update {
-        return run_update(&socket, &runtime, &p, &label, &cmd0, lang);
+        return run_update(&socket, &runtime, &custom, &p, &label, &cmd0, lang);
     }
 
     if crate::profile::command_exists(&cmd0) {
@@ -849,52 +942,41 @@ pub fn run_install(name: &str, update: bool, lang: Lang) -> i32 {
         return 1;
     };
 
-    let mut argv = spec.command.clone();
+    // `--registry` 不在这里追加了：那是 npm 专有的一步，跟补 Node、
+    // Windows 上包一层一起搬进了 `run_npm_global`。
+    let argv = spec.command.clone();
     if argv.is_empty() {
         eprintln!("{}", crate::i18n::msg::agent_has_no_installer(lang, &label));
         return 1;
     }
 
     // 只有 npm 那条路要运行时。将来有人写一个 `[install]` 跑别的东西
-    // （brew、pip、winget），不该被拖去下一份 Node。
+    // （brew、pip、winget），不该被拖去下一份 Node，也不该被塞 `--registry`。
     let uses_npm = argv[0] == "npm" || argv[0] == "npx";
-    if uses_npm && !crate::profile::command_exists("npm") {
-        if let Err(e) = crate::runtime::ensure_node(&runtime, lang, &TermProgress::default()) {
-            eprintln!("{}", fetch_problem(lang, &e));
-            return 1;
+    let banner = crate::i18n::msg::installing_agent(lang, &label);
+    let ok = if uses_npm {
+        // 跟 `--update` 共用同一段（`run_npm_global`）：补 Node、加镜像、
+        // Windows 上包一层，三件事在两条路上必须一模一样。
+        match run_npm_global(argv, &runtime, lang, &banner) {
+            NpmRun::Ok => true,
+            NpmRun::Failed => false,
+            // 没弄到 npm，为什么已经印过了，不要再补一句「装程序说的话」。
+            NpmRun::NoNpm => return 1,
         }
-        println!("{}", crate::i18n::msg::node_ready(lang));
-    }
+    } else {
+        spawn_status(&argv, &banner)
+    };
 
-    if uses_npm {
-        if let Some(reg) = crate::update::npm_registry_override() {
-            argv.push("--registry".into());
-            argv.push(reg);
-        }
-    }
-
-    println!("{}", crate::i18n::msg::installing_agent(lang, &label));
-
-    // Windows 上 npm 装出来的是 `.cmd`，而 CreateProcess 只启动真正的
-    // 可执行映像——`launch_argv` 就是为这件事存在的（见 `sys::shell`）。
-    let argv = crate::sys::shell::launch_argv(&argv);
-    let ran = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status();
-
-    match ran {
-        Ok(st) if st.success() => {}
-        _ => {
-            eprintln!("{}", crate::i18n::msg::install_failed(lang, &label));
-            return 1;
-        }
+    if !ok {
+        eprintln!("{}", crate::i18n::msg::install_failed(lang, &label));
+        return 1;
     }
 
     // 装完再查一遍。见函数头注释：这一步是这条命令跟直接敲 npm 的全部差别。
     if crate::profile::command_exists(&cmd0) {
-        // 顺手让守护进程重查这一个的版本。不发的话，界面上这个 agent 的
-        // 版本要等到下一轮（最多一天）才对得上。
-        recheck(&socket, name);
+        // 顺手让守护进程重查版本。不发的话，界面上这个 agent 的版本要等到
+        // 下一轮（最多一天）才对得上。
+        recheck(&socket);
         println!("{}", crate::i18n::msg::install_succeeded(lang, &label));
         0
     } else {
@@ -1128,12 +1210,17 @@ mod tests {
         ));
     }
 
-    /// 「这个 agent 还有几个会话活着」——`--update` 拒不拒绝就看它。
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 「这几个 profile 还有几个会话活着」——`--update` 拒不拒绝就看它。
     ///
-    /// 两条边界都得钉：**别的 profile 的会话不算**（更新 claude 的时候
-    /// codex 在跑，跟它无关），**`Stopped` 不算**（进程已经没了，底下换
-    /// 文件伤不到它）。数错任何一边的代价都是真的：多算了就是用户明明
-    /// 什么都没开却更新不了，少算了就是在活着的 node 进程底下换文件。
+    /// 三条边界都得钉：**不相干的 profile 不算**（更新 claude 的时候 codex
+    /// 在跑，跟它无关），**`Stopped` 不算**（进程已经没了，底下换文件伤不到
+    /// 它），**同一条命令的兄弟要算**（`dc` 跑的就是 `qwen` 那个二进制）。
+    /// 数错任何一边的代价都是真的：多算了就是用户明明什么都没开却更新不了，
+    /// 少算了就是在活着的 node 进程底下换文件。
     #[test]
     fn live_sessions_count_only_this_profile_and_only_the_living() {
         let s = |profile: &str, state| SessionInfo {
@@ -1146,10 +1233,115 @@ mod tests {
             s("claude", SessionState::Idle),
             s("claude", SessionState::Stopped),
             s("codex", SessionState::Working),
+            s("dc", SessionState::Working),
         ];
-        assert_eq!(live_sessions_of(&list, "claude"), 2);
-        assert_eq!(live_sessions_of(&list, "codex"), 1);
-        assert_eq!(live_sessions_of(&list, "qwen"), 0);
+        assert_eq!(live_sessions_of(&list, &names(&["claude"])), 2);
+        assert_eq!(live_sessions_of(&list, &names(&["codex"])), 1);
+        assert_eq!(live_sessions_of(&list, &names(&["qwen"])), 0);
+
+        // 更新 `qwen` 的时候一个在跑的 `dc` 会话必须拦得住：两个 profile 跑的
+        // 是同一个二进制、同一个 npm 包，`dc` 那个 node 进程底下的文件正是
+        // 要被换掉的那批。
+        assert_eq!(live_sessions_of(&list, &names(&["qwen", "dc"])), 1);
+        // 但 `codex` 仍然不该被牵连——它是另一个包。
+        assert_eq!(live_sessions_of(&list, &names(&["qwen", "dc"])), 1);
+        assert_eq!(
+            live_sessions_of(&list, &names(&["claude", "kimi", "glm"])),
+            2
+        );
+        // 一个名字都不给 = 没有兄弟可数，不该把所有会话都算进来。
+        assert_eq!(live_sessions_of(&list, &[]), 0);
+    }
+
+    /// 「跑同一条命令的 profile 有哪些」——`--update` 要拦谁，全看它。
+    ///
+    /// **不写死配对**，从真实的内置 profile 里算：`kimi`/`glm`/`deepseek`/
+    /// `qwen-api` 的 `command[0]` 都是 `claude`，`dc` 的是 `qwen`。哪天有人
+    /// 改了 toml 或加了新的，这里跟着变，不用有人记得回来改一份清单。
+    #[test]
+    fn siblings_are_the_profiles_that_run_the_same_command() {
+        let all = crate::profile::Profile::builtins();
+
+        let claude_side = sibling_profiles(&all, "claude");
+        for n in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
+            assert!(
+                claude_side.contains(&n.to_string()),
+                "{n} 跑的就是 claude：{claude_side:?}"
+            );
+        }
+        assert!(!claude_side.contains(&"codex".to_string()));
+        assert!(!claude_side.contains(&"qwen".to_string()));
+
+        let qwen_side = sibling_profiles(&all, "qwen");
+        for n in ["qwen", "dc"] {
+            assert!(
+                qwen_side.contains(&n.to_string()),
+                "{n} 跑的就是 qwen：{qwen_side:?}"
+            );
+        }
+        assert!(!qwen_side.contains(&"claude".to_string()));
+
+        // 自己一定在里面——更新 codex 时它自己的会话当然要算。
+        assert_eq!(sibling_profiles(&all, "codex"), vec!["codex".to_string()]);
+        // 没有 profile 跑这条命令：空的，不是「全部」。
+        assert!(sibling_profiles(&all, "nobody-runs-this").is_empty());
+    }
+
+    /// 会话数是 1 的时候英文不能印 `session(s)`：这句话的读者是零基础的人，
+    /// 括号里的 `(s)` 是写给程序员看的偷懒写法。
+    #[test]
+    fn the_refusal_sentence_reads_naturally_for_one_session() {
+        let one = crate::i18n::msg::update_refused_sessions_running(Lang::En, 1, "Claude Code");
+        assert!(one.contains("session"), "{one}");
+        assert!(!one.contains("(s)"), "单数不该印 (s)：{one}");
+        assert!(!one.contains("sessions"), "1 个不该用复数：{one}");
+
+        let many = crate::i18n::msg::update_refused_sessions_running(Lang::En, 2, "Claude Code");
+        assert!(many.contains("2 running"), "{many}");
+        assert!(many.contains("sessions"), "多个要用复数：{many}");
+        assert!(!many.contains("(s)"), "{many}");
+    }
+
+    /// 守护进程在、但这句话它答不上来（旧版本、协议对不上）→ **拒绝**。
+    ///
+    /// 这一条是安全边界，不是体验问题：`Client::connect` 只是连上 socket，
+    /// **没有任何版本握手**，所以对面是个旧守护进程时连得上、`List` 才失败。
+    /// 把那种失败当成「没有会话」，就是在一堆活着的进程底下换文件。
+    /// 连都连不上（守护进程没起）是另一回事——那时确实没有会话。
+    #[test]
+    fn a_daemon_that_cannot_answer_blocks_the_update_but_a_missing_one_does_not() {
+        // 守护进程答得上来：拿它的答案。
+        assert!(
+            matches!(
+                sessions_from(Ok(Response::Sessions(vec![test_session_info()]))),
+                Sessions::Known(v) if v.len() == 1
+            ),
+            "答得上来就该照答案办"
+        );
+        assert!(matches!(
+            sessions_from(Ok(Response::Sessions(Vec::new()))),
+            Sessions::Known(v) if v.is_empty()
+        ));
+
+        // 连上了却答不出这句话——旧守护进程正是这样：`List` 解析失败，或者
+        // 回一个别的东西。这时候「有没有会话」是**未知**，不是「没有」。
+        assert!(
+            matches!(
+                sessions_from(Err(anyhow::anyhow!("解析不了"))),
+                Sessions::Unusable
+            ),
+            "答不上来 = 不知道有没有会话 = 不能动手"
+        );
+        assert!(matches!(
+            sessions_from(Ok(Response::Ok)),
+            Sessions::Unusable
+        ));
+        assert!(matches!(
+            sessions_from(Ok(Response::Error(crate::proto::ErrorCode::NoSuchSession(
+                1
+            )))),
+            Sessions::Unusable
+        ));
     }
 
     /// 用法提示得把那个开关写出来——用户看不到就等于没有这个功能。

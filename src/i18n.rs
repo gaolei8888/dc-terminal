@@ -2189,12 +2189,33 @@ pub mod msg {
     ///
     /// 数字要印出来——「有会话在跑」是一句用户没法照着做的话，「2 个」
     /// 才让他知道要去关几个。
+    ///
+    /// 英文分单复数，**不写 `session(s)`**：那个括号是写给程序员看的偷懒
+    /// 写法，而这句话的读者是零基础的人。中文不分，本来就不分。
     pub fn update_refused_sessions_running(lang: Lang, n: usize, label: &str) -> String {
         t!(
             lang,
-            en: format!("Close the {n} running {label} session(s) first, then update."),
+            en: if n == 1 {
+                format!("Close the running {label} session first, then update.")
+            } else {
+                format!("Close the {n} running {label} sessions first, then update.")
+            },
             zh: format!("先关掉正在跑的 {n} 个 {label} 会话再更新。"),
         )
+    }
+
+    /// 后台那个 dct 是旧的，问不出有哪些会话开着。
+    ///
+    /// **这是拒绝，不是提示。** 更新会把磁盘上的文件换掉，而「有没有会话
+    /// 在跑」此刻是未知的——把未知当成「没有」，正是那条拒绝规则要防的
+    /// 事故。给的出路只有一条、也只需要一条：把后台换成新的。
+    pub fn daemon_too_old_to_check(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "The dct running in the background is an older one and cannot say which sessions are open. Run `dct restart` first, then update.",
+            zh: "后台跑着的 dct 是旧的，问不出现在有哪些会话开着。先敲 `dct restart` 把它换成新的，再更新。",
+        )
+        .to_string()
     }
 
     /// 命令找得到，但追溯不到 npm 包：官方安装器、brew、自己编的。不猜他
@@ -2236,11 +2257,13 @@ pub mod msg {
         )
     }
 
+    /// 中文这里写 `<名字>` 而不是 `<agent>`：`dct --help` 里那几行用的就是
+    /// `<名字>`，两处对不上会让人以为是两条不同的命令。
     pub fn install_usage(lang: Lang) -> String {
         t!(
             lang,
             en: "Usage: dct install <agent> [--update]   e.g. dct install claude",
-            zh: "用法：dct install <agent> [--update]   比如：dct install claude",
+            zh: "用法：dct install <名字> [--update]   比如：dct install claude",
         )
         .to_string()
     }
