@@ -951,9 +951,13 @@ pub fn run_install(name: &str, update: bool, lang: Lang) -> i32 {
     }
 
     let profiles_dir = crate::profile::profiles_dir_for_socket(&socket);
-    let (custom, _) = crate::profile::all_profiles(&profiles_dir);
+    // **内置的加磁盘上的，全都在这里面**（`all_profiles` 已经把两边并过了），
+    // 不是只有用户自己写的那几个。`run_update` 要拿整份清单去问两件事：
+    // 这条命令归谁所有（`update::package_for`），以及还有谁跑着同一个二进制
+    // （`sibling_profiles`）——少一个都会算错。
+    let (all, _) = crate::profile::all_profiles(&profiles_dir);
 
-    let Some(p) = custom
+    let Some(p) = all
         .iter()
         .find(|p| p.name == name)
         .cloned()
@@ -976,7 +980,7 @@ pub fn run_install(name: &str, update: bool, lang: Lang) -> i32 {
     // `--update` 要在「已经装好了」这句话之前拐弯：那句话正是它要替换掉的
     // 那一步。放在后面的话，更新永远走不到——能更新的东西一定是装好的。
     if update {
-        return run_update(&socket, &runtime, &custom, &p, &label, &cmd0, lang);
+        return run_update(&socket, &runtime, &all, &p, &label, &cmd0, lang);
     }
 
     if crate::profile::command_exists(&cmd0) {

@@ -2713,6 +2713,26 @@ mod tests {
         v
     }
 
+    /// 断言失败时说清楚**当时停在哪一屏**。`View` 没有 `Debug`（里面装着
+    /// `ListState`、`ProjectPicker` 这些），所以这里手写一个名字——把
+    /// `matches!(…)` 的结果印出来只会得到一个 `false`，那等于什么都没说。
+    fn view_name(v: &View) -> &'static str {
+        match v {
+            View::Board => "Board",
+            View::Attached(_) => "Attached",
+            View::Grid { .. } => "Grid",
+            View::PickProfile { .. } => "PickProfile",
+            View::PickProject(_) => "PickProject",
+            View::Settings { .. } => "Settings",
+            View::EnterSecret { .. } => "EnterSecret",
+            View::Keys { .. } => "Keys",
+            View::Secrets { .. } => "Secrets",
+            View::Phone { .. } => "Phone",
+            View::Web => "Web",
+            View::Pair { .. } => "Pair",
+        }
+    }
+
     fn picker_on(entries: Vec<crate::proto::ProfileEntry>) -> View {
         let mut state = ListState::default();
         state.select(Some(0));
@@ -2742,8 +2762,13 @@ mod tests {
 
         assert!(
             matches!(app.view, View::Attached(7)),
-            "该把用户送进那个正在更新的窗口：{:?}",
-            matches!(app.view, View::PickProfile { .. })
+            "该把用户送进那个正在更新的窗口，实际停在 {}",
+            view_name(&app.view)
+        );
+        assert_eq!(
+            app.message.text,
+            msg::updating(app.lang, "Claude"),
+            "窗口开出来那一刻，屏幕上得有一句话说清楚里面在干嘛"
         );
         let got = received.lock().unwrap();
         assert!(

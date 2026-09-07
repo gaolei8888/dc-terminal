@@ -231,7 +231,18 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         std::thread::spawn(move || {
             std::thread::sleep(crate::update::FIRST_CHECK_AFTER);
             loop {
-                crate::update::check_updates(&pd, &t, None, &crate::update::fetch_latest);
+                // 兜住 panic 再接着睡。这个循环是**唯一**一处定期查版本的
+                // 地方，一次 panic 就是这个守护进程往后再也不查了——而它
+                // 常驻好几天，用户只会看见「提示怎么一直不出现」，屏幕上
+                // 没有一个字说得清为什么。查版本要碰磁盘和网络（读别人写
+                // 的 package.json、解析别人回的 JSON），不是一段能保证不
+                // panic 的代码。
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::update::check_updates(&pd, &t, None, &crate::update::fetch_latest);
+                }));
+                if r.is_err() {
+                    eprintln!("检查更新：这一轮出错了，跳过，下一轮再查");
+                }
                 std::thread::sleep(crate::update::CHECK_EVERY);
             }
         });
