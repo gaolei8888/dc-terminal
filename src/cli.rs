@@ -732,6 +732,11 @@ pub(crate) enum Sessions {
 /// 版本握手**（见 `client::Client::connect`），所以对面是个旧守护进程时
 /// 连得上、`List` 才失败——回一个解析不了的 `SessionInfo`，或者干脆答非
 /// 所问。那种失败必须拦住更新。
+///
+/// **旧守护进程不是唯一的成因**：一个好端端的守护进程正忙着，这条连接
+/// 5 秒读超时（`client.rs`）也落到这里。两种都是「不知道」，拦法一样，
+/// 但对用户说的那句话不能咬定是哪一种——见
+/// `msg::cannot_confirm_open_sessions`。
 pub(crate) fn sessions_from(r: Result<Response>) -> Sessions {
     match r {
         Ok(Response::Sessions(v)) => Sessions::Known(v),
@@ -841,10 +846,12 @@ fn run_update(
     let family = sibling_profiles(all, cmd0);
     let sessions = match sessions_now(socket) {
         Sessions::Known(v) => v,
-        // 守护进程在、却答不出有哪些会话（旧版本）。**这一条必须拦住**：
-        // 「不知道」被当成「没有」的代价，正是这个检查要防的那件事。
+        // 守护进程在、却没给出会话列表。旧版本是一种可能，正忙着、5 秒
+        // 读超时是另一种——两种都到这儿，所以那句话不咬定是哪一种。
+        // **这一条必须拦住**：「不知道」被当成「没有」的代价，正是这个
+        // 检查要防的那件事。
         Sessions::Unusable => {
-            eprintln!("{}", crate::i18n::msg::daemon_too_old_to_check(lang));
+            eprintln!("{}", crate::i18n::msg::cannot_confirm_open_sessions(lang));
             return 1;
         }
     };

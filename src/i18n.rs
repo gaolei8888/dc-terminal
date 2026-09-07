@@ -2247,16 +2247,24 @@ pub mod msg {
         )
     }
 
-    /// 后台那个 dct 是旧的，问不出有哪些会话开着。
+    /// 问不出有哪些会话开着。
     ///
     /// **这是拒绝，不是提示。** 更新会把磁盘上的文件换掉，而「有没有会话
     /// 在跑」此刻是未知的——把未知当成「没有」，正是那条拒绝规则要防的
-    /// 事故。给的出路只有一条、也只需要一条：把后台换成新的。
-    pub fn daemon_too_old_to_check(lang: Lang) -> String {
+    /// 事故。
+    ///
+    /// **只说「问不出来」，不咬定后台是旧的。** 触发这一条的是
+    /// `cli::sessions_from` 里那个「`List` 没给出会话列表」的分支，而它至少
+    /// 有两种成因：对面真是个旧守护进程（连得上、答不出，因为
+    /// `Client::connect` 不做版本握手），以及一个好端端的守护进程正忙、
+    /// 5 秒读超时（`client.rs`）。后一种下咬定「你的后台是旧的」是句错话，
+    /// 而它给出的出路——`dct restart`——会把用户手上每一个会话都杀掉。
+    /// 所以旧版本只作为一种**可能**提一句，让用户自己判断值不值得重启。
+    pub fn cannot_confirm_open_sessions(lang: Lang) -> String {
         t!(
             lang,
-            en: "The dct running in the background is an older one and cannot say which sessions are open. Run `dct restart` first, then update.",
-            zh: "后台跑着的 dct 是旧的，问不出现在有哪些会话开着。先敲 `dct restart` 把它换成新的，再更新。",
+            en: "Could not check which sessions are open right now (the dct in the background may be an older one). Run `dct restart` first, then update.",
+            zh: "问不出后台现在开着哪些会话（后台的 dct 可能是旧版本）。先敲 `dct restart`，再更新。",
         )
         .to_string()
     }
