@@ -467,7 +467,9 @@ pub fn command_exists(cmd: &str) -> bool {
 /// kimi/glm/deepseek/qwen-api 的 command[0] 都是 `claude`，归 `claude` 这个
 /// profile 所有；`claude` 自己的名字就是 `claude`，所以它是自己的 owner。
 /// 靠这个区分「我没装」和「我依赖的东西没装」。
-fn dependency_owner<'a>(all: &'a [Profile], cmd: &str) -> Option<&'a Profile> {
+/// **`update::package_for` 也用它**：没有 `[install]` 的那几个（kimi/glm/
+/// deepseek/qwen-api）要跟着 owner 的 npm 包走，问的是同一个问题。
+pub(crate) fn dependency_owner<'a>(all: &'a [Profile], cmd: &str) -> Option<&'a Profile> {
     let base = Path::new(cmd)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())

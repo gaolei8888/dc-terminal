@@ -853,11 +853,11 @@ fn run_update(
         return 1;
     }
 
-    let Some(package) = p
-        .install
-        .as_ref()
-        .and_then(|i| crate::update::npm_package_of(&i.command))
-    else {
+    // 自己没有 `[install]` 的（kimi/glm/deepseek/qwen-api）跟着 owner 的包
+    // 走——磁盘上那份 `claude` 就是 dct 装的（见 `update::package_for`）。
+    // 横幅上仍然印 `label`：用户敲的是 `dct install kimi --update`，此刻
+    // 该看见「正在更新 Kimi」，包名是实现细节。
+    let Some(package) = crate::update::package_for(p, all) else {
         eprintln!("{}", crate::i18n::msg::not_managed_by_dct(lang, label));
         return 1;
     };

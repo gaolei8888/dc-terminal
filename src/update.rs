@@ -65,6 +65,33 @@ pub fn npm_package_of(command: &[String]) -> Option<String> {
     it.find(|a| !a.starts_with('-')).cloned()
 }
 
+/// 这个 profile 要更新的话，动的是 npm 上哪个包。
+///
+/// **自己没有 `[install]` 的，跟着 owner 走。** kimi/glm/deepseek/qwen-api
+/// 的 `command[0]` 都是 `claude`，它们自己一行 `[install]` 都没有——但磁盘上
+/// 那份 `claude` 正是 dct 用 `@anthropic-ai/claude-code` 装的。不认这层关系
+/// 的话，这四个在列表上永远不带「有新版本」，而在它们身上按 `u` 会得到
+/// 一句「这份 Kimi 不是 dct 装的」——一句假话。
+///
+/// `owner.name == p.name` 那一句是**写给读的人看的，不是为了改结果**：
+/// `claude` 自己的 owner 就是它自己（见 `profile::dependency_owner`），
+/// 而走到那儿意味着上面那行已经从 `p.install` 里没问出包名——同一个
+/// `install` 再问一遍还是 `None`。删掉它一条测试都不会红，试过了。
+/// 留着是因为「跟着别人走」这句话里的「别人」得在代码里看得见。
+pub fn package_for(p: &crate::profile::Profile, all: &[crate::profile::Profile]) -> Option<String> {
+    if let Some(pkg) = p.install.as_ref().and_then(|i| npm_package_of(&i.command)) {
+        return Some(pkg);
+    }
+    let owner = crate::profile::dependency_owner(all, p.command.first()?)?;
+    if owner.name == p.name {
+        return None;
+    }
+    owner
+        .install
+        .as_ref()
+        .and_then(|i| npm_package_of(&i.command))
+}
+
 /// 本机装的是几。`exe` 是 `sys::fs::find_command` 找到的那个文件。
 ///
 /// 先按 npm 全局安装的两种布局找 `package.json`（Unix `../lib/node_modules`，
@@ -169,29 +196,37 @@ pub fn check_updates(
     fetch: &dyn Fn(&str) -> Option<String>,
 ) {
     let (all, _) = crate::profile::all_profiles(profiles_dir);
+    // 一个包只问仓库一次。**五个 profile 跑同一个 `claude`**（claude 自己
+    // 加上 kimi/glm/deepseek/qwen-api），逐个问就是五次同样的请求、五份
+    // 同样的答案；网差的教室里那是五个 5 秒。
+    let mut asked: BTreeMap<String, Option<String>> = BTreeMap::new();
     for p in all.iter().filter(|p| only.is_none_or(|o| o == p.name)) {
         // 「装没装」「装的是几」都必须在守护进程这个 PATH 里问——同
         // `profile::command_exists` 的理由，答案只能来自子进程真正会
         // 拿到的那个环境。
-        let managed = p
-            .install
-            .as_ref()
-            .and_then(|i| npm_package_of(&i.command))
-            .and_then(|pkg| {
-                let exe = crate::sys::fs::find_command(p.command.first()?)?;
-                let installed = installed_version(&exe, &pkg)?;
-                Some((pkg, installed))
-            });
+        let managed = package_for(p, &all).and_then(|pkg| {
+            let exe = crate::sys::fs::find_command(p.command.first()?)?;
+            let installed = installed_version(&exe, &pkg)?;
+            Some((pkg, installed))
+        });
         let Some((package, installed)) = managed else {
             recover(table.lock()).remove(&p.name);
             continue;
         };
-        let latest = fetch(&package);
-        if latest.is_none() {
-            // 界面上什么都不显示（没网的教室里不该冒一行关于 npm 仓库的
-            // 红字），但排查的人得有一行可看。
-            eprintln!("检查更新：{}（{package}）没问到最新版本", p.name);
-        }
+        let latest = match asked.get(&package) {
+            Some(v) => v.clone(),
+            None => {
+                let v = fetch(&package);
+                if v.is_none() {
+                    // 界面上什么都不显示（没网的教室里不该冒一行关于 npm
+                    // 仓库的红字），但排查的人得有一行可看。**跟着请求印，
+                    // 不是跟着 profile 印**：一次没问到不该刷出五行。
+                    eprintln!("检查更新：{package} 没问到最新版本");
+                }
+                asked.insert(package.clone(), v.clone());
+                v
+            }
+        };
         recover(table.lock()).insert(
             p.name.clone(),
             UpdateInfo {
@@ -403,10 +438,10 @@ mod tests {
         }
     }
 
-    /// 一份假的「npm 全局前缀」外加一个指着它的 profile：
-    /// `prefix/bin/fakeagent` + `prefix/lib/node_modules/fake-agent/package.json`。
-    /// `command` 写绝对路径，`find_command` 就不用去碰这台机器真实的 PATH。
-    fn managed_profile_dir(t: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    /// 一份假的「npm 全局前缀」：`prefix/bin/fakeagent` 旁边摆着
+    /// `prefix/lib/node_modules/fake-agent/package.json`（1.0.0）。回那个
+    /// 可执行文件的绝对路径。
+    fn fake_npm_prefix(t: &tempfile::TempDir) -> PathBuf {
         let prefix = t.path().join("prefix");
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         write_pkg(
@@ -421,6 +456,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        exe
+    }
+
+    /// 一份假的「npm 全局前缀」外加一个指着它的 profile：
+    /// `prefix/bin/fakeagent` + `prefix/lib/node_modules/fake-agent/package.json`。
+    /// `command` 写绝对路径，`find_command` 就不用去碰这台机器真实的 PATH。
+    fn managed_profile_dir(t: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let exe = fake_npm_prefix(t);
         let profiles = t.path().join("profiles");
         std::fs::create_dir_all(&profiles).unwrap();
         std::fs::write(
@@ -543,6 +586,133 @@ mod tests {
             !table.lock().unwrap().contains_key("shell"),
             "不归 dct 管了就得从表里消失，不然旧提示永远挂着"
         );
+    }
+
+    /// 同一份假前缀，两个 profile：`fakeagent` 有 `[install]`，`faketwin`
+    /// 没有、跑的是同一个二进制。现实里就是 claude 与 kimi/glm/deepseek/
+    /// qwen-api 的关系。
+    ///
+    /// owner 那份的**名字必须等于二进制的文件名**——`dependency_owner`
+    /// 就是这么找 owner 的（`claude` 这个 profile owns `claude` 这条命令）。
+    fn dependent_profile_dir(t: &tempfile::TempDir) -> PathBuf {
+        let exe = fake_npm_prefix(t);
+        let profiles = t.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("fakeagent.toml"),
+            format!(
+                "name = \"fakeagent\"\ncommand = [{:?}]\nis_agent = true\n[install]\ncommand = [\"npm\", \"i\", \"-g\", \"fake-agent\"]\n",
+                exe.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            profiles.join("faketwin.toml"),
+            format!(
+                "name = \"faketwin\"\ncommand = [{:?}]\nis_agent = true\n",
+                exe.display()
+            ),
+        )
+        .unwrap();
+        profiles
+    }
+
+    /// kimi/glm/deepseek/qwen-api 那一类：自己一行 `[install]` 都没有，
+    /// 但跑的 `claude` 正是 dct 装的。不认这层关系的话，这四个永远不带
+    /// 「有新版本」，按 `u` 还会被告知「这份 Kimi 不是 dct 装的」——假话。
+    #[test]
+    fn a_profile_without_install_inherits_its_binary_owners_package() {
+        let t = tempfile::tempdir().unwrap();
+        let profiles = dependent_profile_dir(&t);
+        let table = new_table();
+        check_updates(&profiles, &table, Some("faketwin"), &|pkg| {
+            assert_eq!(pkg, "fake-agent", "问的得是 owner 那个包");
+            Some("1.2.0".into())
+        });
+        let g = table.lock().unwrap();
+        let info = g.get("faketwin").expect("跟着 owner 走，该进表");
+        assert_eq!(info.package, "fake-agent");
+        assert_eq!(info.installed, "1.0.0");
+        assert_eq!(info.latest.as_deref(), Some("1.2.0"));
+        assert!(prompt_for(info).is_some(), "1.0.0 → 1.2.0 该提示");
+    }
+
+    /// 没有 `[install]`、命令也追溯不到任何 owner（没有哪个 profile 叫
+    /// 这个名字）→ 不归 dct 管。**这一条钉的是 `package_for` 里那个
+    /// 「owner 得是另一个 profile」的边界**：少了它，一个自己就是自己
+    /// owner、却没有 `[install]` 的 profile 会绕回来问自己一遍。
+    #[test]
+    fn a_profile_with_no_install_and_no_owner_is_not_managed() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = fake_npm_prefix(&t);
+        let profiles = t.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("lonely.toml"),
+            format!(
+                "name = \"lonely\"\ncommand = [{:?}]\nis_agent = true\n",
+                exe.display()
+            ),
+        )
+        .unwrap();
+        let table = new_table();
+        check_updates(&profiles, &table, Some("lonely"), &|_| {
+            panic!("没有 [install]、也没有 owner，不该发请求")
+        });
+        assert!(!table.lock().unwrap().contains_key("lonely"));
+    }
+
+    /// 内置的那几个真名字，钉在这儿。上面两条用的是假 profile，而这条
+    /// 回答的是当初报上来的那个 bug 本身：在 Kimi 上按 `u`，dct 到底认不认
+    /// 得那份 claude。内置清单是编进二进制的，跟这台机器装了什么无关。
+    #[test]
+    fn the_claude_family_all_map_to_the_claude_code_package() {
+        let all = crate::profile::Profile::builtins();
+        let pkg = |name: &str| {
+            let p = all.iter().find(|p| p.name == name).expect(name);
+            package_for(p, &all)
+        };
+        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
+            assert_eq!(
+                pkg(name).as_deref(),
+                Some("@anthropic-ai/claude-code"),
+                "{name} 跑的是 claude 这个二进制，更新动的就是这个包"
+            );
+        }
+        // `dc` 自己有 `[install]`，用自己的那条，不去问 owner。
+        assert_eq!(pkg("dc").as_deref(), Some("@qwen-code/qwen-code"));
+        // `shell` 没有 `[install]`，`command[0]` 也不归任何 profile 所有。
+        assert_eq!(pkg("shell"), None);
+    }
+
+    /// 两个 profile 落到同一个包上，只问仓库一次。五个 profile 跑同一个
+    /// `claude`，逐个问就是五次同样的请求；网差的教室里那是五个 5 秒。
+    ///
+    /// **只数 `fake-agent` 那些请求**：`only = None` 会把这台机器上真装着
+    /// 的 npm agent 也扫一遍，数全部的话这条测试的绿灯就取决于跑它的人
+    /// 装了什么（同 `checking_everything_covers_the_managed_agent_too`）。
+    #[test]
+    fn two_profiles_sharing_a_package_are_only_asked_once() {
+        let t = tempfile::tempdir().unwrap();
+        let profiles = dependent_profile_dir(&t);
+        let table = new_table();
+        // `Cell` 而不是 `let mut`：`fetch` 是 `&dyn Fn`，闭包改不了捕获的变量。
+        let calls = std::cell::Cell::new(0);
+        check_updates(&profiles, &table, None, &|pkg| {
+            if pkg == "fake-agent" {
+                calls.set(calls.get() + 1);
+            }
+            Some("1.2.0".into())
+        });
+        assert_eq!(calls.get(), 1, "同一个包问两遍就是白等一次网络往返");
+        let g = table.lock().unwrap();
+        for name in ["fakeagent", "faketwin"] {
+            assert_eq!(
+                g.get(name).unwrap().latest.as_deref(),
+                Some("1.2.0"),
+                "{name} 也得拿到那一次的结果，不是只有先问的那个有"
+            );
+        }
     }
 
     #[test]
