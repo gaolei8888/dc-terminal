@@ -334,6 +334,19 @@ Keys live in `~/.dct/secrets.toml`, mode 0600. They never go anywhere near the
 profile files, which is deliberate: those you can copy between machines or hand
 to a colleague.
 
+**It tells you when an agent is stale.** Once a day `dct` asks the npm registry, and any
+agent with a newer version gets a note on its line in the picker: "update 2.1.251 → 2.1.260,
+press u". Press `u` and `dct` opens a window and runs the update while you watch. Outside
+the interface, `dct install claude --update` is the same thing. It never updates on its
+own: everyone in a classroom should be on the same build, and the moment it changes is
+the keypress you make.
+
+It also says when it can't. `dct` only recognises the copy that it (or npm) installed —
+a Claude from the official installer or a Codex from brew is invisible to it and never
+touched; press `u` on one of those and it says so and tells you to update it the way you
+installed it. Point `DCT_NPM_REGISTRY` at a mirror and both the version check and the
+install go there.
+
 <details>
 <summary>Your own agents, no recompile</summary>
 
@@ -620,6 +633,12 @@ for now.
 
 The interface comes in Chinese and English. `l` switches it, `DCT_LANG=en`
 overrides it for one run, and with neither it follows your system locale.
+
+**No sessions of that agent may be running while it updates.** `dct` refuses and names
+the ones to close. Swapping files under a live process means its next read of itself
+can land on a mix of old and new. What gets counted is every session running the **same
+binary**, not just the name you picked — a Kimi session also runs `claude` and blocks a
+Claude update; a `dc` session runs `qwen` and blocks a Qwen Code update.
 
 ---
 
