@@ -299,6 +299,12 @@ pub enum Key {
     /// **只在选 agent 那一屏、且当前项目确实不是 git 仓库时才写得出来**
     /// ——这个项目的规矩是「屏幕上不写按不动的键」。
     InitGitRepo,
+    /// `u` 的说明：把高亮那一项更新到最新版。
+    ///
+    /// **只在高亮那一项真的有新版本时才写得出来**——同 `InitGitRepo`，
+    /// 这个项目的规矩是「屏幕上不写按不动的键」。没有新版本时 `u` 按下去
+    /// 只会得到一句「已经是最新」，不值得常年占掉底栏最稀缺的一格。
+    Update,
     /// `g` 成功之后那句话。
     GitRepoCreated,
     PickProjectTitle,
@@ -742,6 +748,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "还不是 git 仓库 —— 开 agent 时自动建",
         ),
         InitGitRepo => t!(lang, en: "init git", zh: "建仓库"),
+        Update => t!(lang, en: "update", zh: "更新"),
         GitRepoCreated => t!(
             lang,
             en: "git project created, agents can work here now",
@@ -1476,6 +1483,34 @@ pub mod msg {
             lang,
             en: format!("Installing {profile}. When it finishes, press Esc then N."),
             zh: format!("正在安装 {profile}，装完按 Esc 回看板再按 N"),
+        )
+    }
+
+    /// `installing` 的更新版——同一个窗口、同一条「装完按什么」的尾巴，
+    /// 只是这一次那个 agent 本来就在。
+    ///
+    /// 跟 `updating_agent` 不是一回事，别合并：那句是 `dct install --update`
+    /// 自己在命令行上打的开场白（用户此刻正盯着那条命令的输出），这句是
+    /// 界面在**开完窗口之后**贴在底栏上的，必须说出「装完回哪儿去」——
+    /// 用户在一个跑完就停住的窗口里，不告诉他按什么，他只会关掉它。
+    pub fn updating(lang: Lang, label: &str) -> String {
+        t!(
+            lang,
+            en: format!("Updating {label}. When it finishes, press Esc then N."),
+            zh: format!("正在更新 {label}，装完按 Esc 回看板再按 N"),
+        )
+    }
+
+    /// 选 agent 那一屏，某一行尾巴上接的一句。压暗显示，不抢「没装」
+    /// 「没密钥」的眼——那些是真的挡着路，这一条只是「可以更好」。
+    ///
+    /// 把按键写进这句话里（而不是只写版本号）：这一屏上没有别的地方
+    /// 说得出「怎么更新」，而底栏那一格随时可能被窄终端截掉。
+    pub fn update_available(lang: Lang, installed: &str, latest: &str) -> String {
+        t!(
+            lang,
+            en: format!("update {installed} → {latest}, press u"),
+            zh: format!("有新版本 {installed} → {latest}，按 u 更新"),
         )
     }
 
@@ -2386,6 +2421,7 @@ mod tests {
             PickAgentTitle,
             NotAGitRepoHint,
             InitGitRepo,
+            Update,
             GitRepoCreated,
             PickProjectTitle,
             TypePathTitle,
@@ -2527,7 +2563,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 187, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 188, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

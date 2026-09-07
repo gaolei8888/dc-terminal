@@ -11,8 +11,8 @@ use crate::proto::{Request, Response, SecretPrompt};
 
 use super::app::App;
 use super::view::{
-    digit_index, expand_path, pick_action, PairReturn, PickAction, PickRow, ProjectPicker,
-    SecretPhase, View,
+    digit_index, expand_path, pick_action, update_action, PairReturn, PickAction, PickRow,
+    ProjectPicker, SecretPhase, UpdateAction, View,
 };
 use super::widgets::{pad_to, short_path, truncate, Msg};
 use super::{accent, danger, dim, move_sel_n};
@@ -160,6 +160,47 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.message = Msg::err(m);
                 same(entries, state, no_git)
             }
+        };
+    } else if key.code == KeyCode::Char('u') {
+        // **`u` 只挪不进：它不经过下面那个 `chosen` 的路。** 那条路算的是
+        // 「用户选定了第几项」，落点是 `pick_action`——开会话、填密钥、装
+        // CLI。`u` 要的是同一行上的另一件事，两者不共用出口，所以在这里
+        // 就地处理完，`app.view` 自己收尾。
+        let act = state
+            .selected()
+            .and_then(|i| entries.get(i))
+            .map(|e| (e.label.clone(), update_action(e, app.lang)));
+        app.view = match act {
+            Some((label, UpdateAction::Run { command })) => {
+                // 跟「没装 → 回车 → 开窗口装」一模一样的路，连
+                // `remember: false` 的理由都一样：这个 shell 窗口不是用户
+                // 选的 agent，记了下次按 `n` 会掉进命令行。
+                let dir = app.current_dir().display().to_string();
+                match super::create_session(app, &dir, "shell", false) {
+                    Ok(Response::Created { id }) => {
+                        let line = format!("{}\n", command.join(" "));
+                        let _ = app
+                            .client()
+                            .and_then(|c| c.call(Request::Input { id, text: line }));
+                        // 说给用户听的是 label（「Claude」），不是命令行里
+                        // 那个 name（`claude`）——他在屏幕上认的一直是前者。
+                        app.message = msg::updating(app.lang, &label).into();
+                        app.need_sessions = true;
+                        View::Attached(id)
+                    }
+                    _ => {
+                        app.message = Msg::err(text(Key::CannotOpenInstallWindow, app.lang).into());
+                        same(entries, state, no_git)
+                    }
+                }
+            }
+            Some((_, UpdateAction::Say(s))) => {
+                // 不是错误：他要的是「让它最新」，而它已经最新了 / 本来就
+                // 不归 dct 管。红字会让人以为自己弄坏了什么。
+                app.message = s.into();
+                same(entries, state, no_git)
+            }
+            _ => same(entries, state, no_git),
         };
     } else {
         // ↑↓ 只挪光标、不选定，所以放在算「选中第几项」之前：
@@ -618,13 +659,21 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 "   ".to_string()
             };
-            let reason = match &e.status {
-                ProfileStatus::Ready => String::new(),
-                ProfileStatus::NeedsSecret => text(Key::ReasonNeedsSecret, app.lang).into(),
-                ProfileStatus::NeedsDependency { label } => {
+            // 「有新版本」跟「没装」「没密钥」共用**同一格**，所以在同一个
+            // match 里分完——一行上只有这一处能说话。它们不会打架：`Ready`
+            // 的行上这一格本来就是空的，而不 `Ready` 的行上「为什么用不了」
+            // 才是要紧的那句，「可以升个级」得让位（那些行按 `u` 也确实
+            // 什么都不做，见 `update_action`）。
+            let reason = match (&e.status, &e.update) {
+                (ProfileStatus::Ready, Some(p)) => {
+                    msg::update_available(app.lang, &p.installed, &p.latest)
+                }
+                (ProfileStatus::Ready, None) => String::new(),
+                (ProfileStatus::NeedsSecret, _) => text(Key::ReasonNeedsSecret, app.lang).into(),
+                (ProfileStatus::NeedsDependency { label }, _) => {
                     msg::reason_needs_dependency(app.lang, label)
                 }
-                ProfileStatus::NotInstalled { .. } => {
+                (ProfileStatus::NotInstalled { .. }, _) => {
                     text(Key::ReasonNotInstalled, app.lang).into()
                 }
             };
@@ -2652,5 +2701,105 @@ mod tests {
             matches!(app.view, View::Grid { focus: 0, .. }),
             "还在九宫格里，焦点收拢到一个真实存在的格子"
         );
+    }
+
+    fn one_updatable_entry() -> Vec<crate::proto::ProfileEntry> {
+        let mut v = one_ready_entry();
+        v[0].managed = true;
+        v[0].update = Some(crate::proto::UpdatePrompt {
+            installed: "1.0.0".into(),
+            latest: "1.1.0".into(),
+        });
+        v
+    }
+
+    fn picker_on(entries: Vec<crate::proto::ProfileEntry>) -> View {
+        let mut state = ListState::default();
+        state.select(Some(0));
+        View::PickProfile {
+            entries,
+            state,
+            warning: None,
+            no_git: false,
+        }
+    }
+
+    /// **`u` 走的是「没装 → 回车 → 开窗口装」那条现成的路**，只是敲进去的
+    /// 那一行不一样。断言敲进去的字，不是只断言视图切了：切对了视图而敲错
+    /// 一行字，用户看到的是一个跑着别的命令的窗口，而屏幕上没有一个字
+    /// 说得清刚才发生了什么。
+    ///
+    /// `remember: false` 跟装 CLI 那条一个理由——这个 shell 窗口不是用户
+    /// 选的 agent，记了下次按 `n` 会掉进命令行。
+    #[test]
+    fn pressing_u_on_an_updatable_agent_opens_a_window_running_the_update() {
+        let (sock, _fake, received) = super::super::tests::fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.view = picker_on(one_updatable_entry());
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(
+            matches!(app.view, View::Attached(7)),
+            "该把用户送进那个正在更新的窗口：{:?}",
+            matches!(app.view, View::PickProfile { .. })
+        );
+        let got = received.lock().unwrap();
+        assert!(
+            got.iter().any(|r| matches!(
+                r,
+                Request::Input { text, .. } if text == "dct install claude --update\n"
+            )),
+            "敲进窗口的必须正是那条更新命令：{got:?}"
+        );
+        drop(got);
+        assert!(
+            app.profiles.is_empty() && app.profiles_asked.is_empty(),
+            "更新窗口是个 shell 会话，不是用户选的 agent，不该被记成这个项目的 agent"
+        );
+    }
+
+    /// 追溯不到 npm 包的那一份：`u` 只能说一句话，不能开窗口——`dct install
+    /// --update` 更新不了它，开出来的窗口只会印一句报错。用户留在列表上，
+    /// 手里拿着「用你原来装它的方式更新」这句下一步。
+    #[test]
+    fn pressing_u_on_an_unmanaged_agent_only_shows_a_message() {
+        let (sock, _fake, received) = super::super::tests::fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.view = picker_on(one_ready_entry()); // managed: false
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(
+            matches!(app.view, View::PickProfile { .. }),
+            "不该切走：这一行没有窗口可开"
+        );
+        let m = &app.message.text;
+        assert!(m.contains("不是 dct 装的"), "{m}");
+        assert!(!app.message.error, "不是错误：他要的事没做成，但也没坏");
+        // 只锁一次：`assert!` 的格式参数是在断言失败时才求值的，那时第一把
+        // 锁还攥在手里——std 的 Mutex 不可重入，两次 lock 会当场死锁，
+        // 而死锁的测试连那句失败信息都印不出来。
+        let got = received.lock().unwrap();
+        assert!(got.is_empty(), "一个会话都不该建：{got:?}");
+    }
+
+    /// **那句提示得真的画在列表上。** 底栏那一格随时会被窄终端截掉
+    /// （`fit_help` 从前往后丢），而这一屏别处一个字都没说「这个 agent
+    /// 有新版本」——行尾这一句是用户唯一可能看见它的地方。
+    #[test]
+    fn a_row_with_a_new_version_says_so_on_the_row_itself() {
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _d) = App::test_app();
+        app.view = picker_on(one_updatable_entry());
+
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let content = squeeze(&buffer_text(term.backend().buffer()));
+        let want = squeeze(&msg::update_available(app.lang, "1.0.0", "1.1.0"));
+        assert!(content.contains(&want), "行尾要写出这一句：{content}");
     }
 }

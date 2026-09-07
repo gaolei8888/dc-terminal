@@ -2691,6 +2691,67 @@ mod tests {
         (sock, home)
     }
 
+    /// 起一个只认协议帧（一行 JSON 请求，一行 JSON 响应）的假守护进程，
+    /// 本机 Unix socket，不碰真正的网络、也不开真 pty。返回收到的每一条
+    /// `Request`——测试用它断言「某个请求真的被发出去了、里面装的正是这些
+    /// 字」，而不是只信任代码读起来像是发了。
+    ///
+    /// **住在 `mod.rs` 的测试里，不在 `pick.rs`/`pair_view.rs` 里。**
+    /// `every_create_goes_through_the_one_helper_that_updates_the_cache`
+    /// 扫的是那几个文件的**整份源码**（拦「谁绕过 `create_session` 自己发
+    /// Create」），一个假守护进程里的 `Request::Create { .. }` 会被它数进去；
+    /// 而 `mod.rs` 那一侧它只扫 `#[cfg(test)]` 之前的生产代码。放在这里
+    /// 两件事都成立：守卫照旧管用，假守护进程也只有一份。
+    ///
+    /// `sys::ipc::bind_private` 而不是 `std::os::unix::net::UnixListener`：
+    /// 那一行只在 Unix 上存在，而调用它的测试没有 `#[cfg(unix)]`——整个
+    /// 测试二进制于是在 Windows 上编译不过，`cargo test` 在那个平台上连跑
+    /// 都跑不起来。Windows 的学生正是「零 C 依赖」那条规矩存在的理由，
+    /// 不能让测试套件把这个平台漏在外面。`sys::ipc` 那一层的全部用处就是
+    /// 把这个差异收在一个地方（Windows 走 `uds_windows`，形状一模一样），
+    /// 生产代码早就只认它了，测试没有理由绕过去。
+    pub(super) fn fake_daemon() -> (
+        PathBuf,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let listener = crate::sys::ipc::bind_private(&sock).unwrap();
+        let received: std::sync::Arc<std::sync::Mutex<Vec<Request>>> = Default::default();
+        let recv2 = received.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    let Ok(req) = serde_json::from_str::<Request>(&line) else {
+                        break;
+                    };
+                    // 建会话要回一个真的 `Created`：配对成功屏上那个 Enter、
+                    // 选择器上那个 `u`，两条路都要建会话，回 `Ok` 的话它们
+                    // 看起来像是建失败了，测不到「用户真的被送进了会话」。
+                    let answer = match &req {
+                        Request::Create { .. } => Response::Created { id: 7 },
+                        _ => Response::Ok,
+                    };
+                    recv2.lock().unwrap().push(req);
+                    let resp = serde_json::to_string(&answer).unwrap();
+                    if writeln!(writer, "{resp}").is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (sock, dir, received)
+    }
+
     fn sess_at(id: u32, dir: &str) -> SessionInfo {
         SessionInfo {
             id,

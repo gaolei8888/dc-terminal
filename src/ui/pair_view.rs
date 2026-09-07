@@ -736,7 +736,7 @@ mod tests {
     /// 读代码相信它发了。
     #[test]
     fn esc_sends_a_cancel_and_leaves_the_view() {
-        let (sock, _fake_dir, received) = fake_daemon();
+        let (sock, _fake_dir, received) = super::super::tests::fake_daemon();
         let (mut app, _dir) = App::test_app();
         app.client = Some(crate::client::Client::connect(&sock).unwrap());
         app.view = View::Pair {
@@ -762,59 +762,6 @@ mod tests {
         );
     }
 
-    /// 起一个只认协议帧（一行 JSON 请求，一行 JSON `Response::Ok` 回答）
-    /// 的假守护进程，本机 Unix socket，不碰真正的网络。返回收到的每一条
-    /// `Request`——测试用它断言"某个请求真的被发出去了"，而不是只信任
-    /// 代码读起来像是发了。
-    fn fake_daemon() -> (
-        std::path::PathBuf,
-        tempfile::TempDir,
-        std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
-    ) {
-        use std::io::{BufRead, BufReader, Write};
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("s.sock");
-        // `sys::ipc::bind_private` 而不是 `std::os::unix::net::UnixListener`：
-        // 那一行只在 Unix 上存在，而这条测试本身没有 `#[cfg(unix)]`——整个
-        // 测试二进制于是在 Windows 上编译不过，`cargo test` 在那个平台上
-        // 连跑都跑不起来。Windows 的学生正是「零 C 依赖」那条规矩存在的
-        // 理由，不能让测试套件把这个平台漏在外面。`sys::ipc` 那一层的全部
-        // 用处就是把这个差异收在一个地方（Windows 走 `uds_windows`，形状
-        // 一模一样），生产代码早就只认它了，测试没有理由绕过去。
-        let listener = crate::sys::ipc::bind_private(&sock).unwrap();
-        let received: std::sync::Arc<std::sync::Mutex<Vec<Request>>> = Default::default();
-        let recv2 = received.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut writer = stream;
-                loop {
-                    let mut line = String::new();
-                    let n = reader.read_line(&mut line).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    let Ok(req) = serde_json::from_str::<Request>(&line) else {
-                        break;
-                    };
-                    // `Request::Create` 要回一个真的 `Created`：成功屏上
-                    // 那个 Enter 会去建会话，回 `Ok` 的话它看起来像是
-                    // 建失败了，测不到「学生真的被送进了会话」这件事。
-                    let answer = match &req {
-                        Request::Create { .. } => Response::Created { id: 7 },
-                        _ => Response::Ok,
-                    };
-                    recv2.lock().unwrap().push(req);
-                    let resp = serde_json::to_string(&answer).unwrap();
-                    if writeln!(writer, "{resp}").is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        (sock, dir, received)
-    }
-
     /// **`p` 也要真的取消。** 形状照抄 `esc_sends_a_cancel_and_leaves_the_view`，
     /// 理由更具体：不发 `PairCancel` 的话，学生按 `p` 自己粘了一把钥匙，
     /// 几分钟后顺手确认了那个还开着的浏览器页面，后台那条没人停的轮询
@@ -826,7 +773,7 @@ mod tests {
     /// 它的记录上。
     #[test]
     fn p_sends_a_cancel_too_before_switching_to_manual_entry() {
-        let (sock, _fake_dir, received) = fake_daemon();
+        let (sock, _fake_dir, received) = super::super::tests::fake_daemon();
         let (mut app, _dir) = App::test_app();
         app.client = Some(crate::client::Client::connect(&sock).unwrap());
         app.view = View::Pair {
@@ -1061,7 +1008,7 @@ mod tests {
     /// 他会判定这东西没弄好。
     #[test]
     fn a_pairing_started_from_the_picker_ends_in_the_session_it_was_started_for() {
-        let (sock, _fake_dir, received) = fake_daemon();
+        let (sock, _fake_dir, received) = super::super::tests::fake_daemon();
         let (mut app, _dir) = App::test_app();
         app.client = Some(crate::client::Client::connect(&sock).unwrap());
         app.view = View::Pair {
@@ -1136,7 +1083,7 @@ mod tests {
     /// 不该替他起一个他没要的会话。
     #[test]
     fn a_pairing_started_from_the_key_page_does_not_open_a_session() {
-        let (sock, _fake_dir, received) = fake_daemon();
+        let (sock, _fake_dir, received) = super::super::tests::fake_daemon();
         let (mut app, _dir) = App::test_app();
         app.client = Some(crate::client::Client::connect(&sock).unwrap());
         app.view = View::Pair {

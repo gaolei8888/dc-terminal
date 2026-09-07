@@ -409,6 +409,54 @@ pub fn pick_action(e: &ProfileEntry, lang: Lang) -> PickAction {
     }
 }
 
+/// 在选 agent 的列表上按 `u` 该干什么。跟 `pick_action` 一样是纯函数，
+/// 一样在这儿单测——按键循环要连真 socket，测不了。
+#[derive(Debug)]
+pub enum UpdateAction {
+    /// 开一个 shell 会话跑这条命令，走 `PickAction::Install` 那条现成的路。
+    ///
+    /// **只带命令，不像 `PickAction::Install` 那样再带一份 `profile`。**
+    /// 那边的 `profile` 有真正的用处（`msg::installing` 拿它凑那句提示），
+    /// 这边没有：底栏那句话要说的是 `label`（用户在屏幕上认的是「Claude」，
+    /// 不是命令行里的 `claude`），而 `label` 在 `ProfileEntry` 上，调用方
+    /// 本来就拿得着。再放一个 name 进来，它唯一的读者会是单测——那是把
+    /// 死字段伪装成接口。名字要从这里看的话，它就在 `command` 里。
+    Run { command: Vec<String> },
+    /// 只说一句话，不切视图。
+    Say(String),
+    /// 这一行的状态各有各的出路（没装 → Enter 装；没密钥 → Enter 填），
+    /// `u` 不抢它们的活。
+    Nothing,
+}
+
+/// **`Ready` 的行上 `u` 永远有回应**，三条里必有一条：有新版本就更新，
+/// 没有就说「已经是最新」，不是 dct 装的就说「用你原来的方式更新」。
+/// 一个按下去毫无反应的键，用户只会以为它坏了，然后再按几下。
+///
+/// 「已经是最新」和「不是 dct 装的」分不开的话就只能说一句含糊话：
+/// `update: None` 同时盖着「查过了，是最新」和「压根不归 dct 管」两种情况，
+/// 而这两种情况下用户的下一步完全不同。`managed` 就是为这一刀存在的
+/// （见 `ProfileEntry::managed`）。
+pub fn update_action(e: &ProfileEntry, lang: Lang) -> UpdateAction {
+    if !matches!(e.status, ProfileStatus::Ready) {
+        return UpdateAction::Nothing;
+    }
+    match (&e.update, e.managed) {
+        // 有 `update` 就一定是守护进程追溯到了 npm 包才填得出来的
+        // （见 daemon 那侧），所以这里不必再看 `managed`。
+        (Some(_), _) => UpdateAction::Run {
+            command: vec![
+                "dct".into(),
+                "install".into(),
+                e.name.clone(),
+                "--update".into(),
+            ],
+        },
+        (None, true) => UpdateAction::Say(crate::i18n::msg::already_latest(lang, &e.label)),
+        (None, false) => UpdateAction::Say(crate::i18n::msg::not_managed_by_dct(lang, &e.label)),
+    }
+}
+
 /// 密钥设置页要列哪些行：只列声明了密钥的 profile——`claude`/`codex`/`命令行`
 /// 这种不需要密钥的东西出现在这一页只会让用户以为自己也得配点什么。
 ///
@@ -1441,25 +1489,33 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // 排在「或者按数字」前面：在一个非 git 仓库里，↑↓ 和数字选中的九项
         // 里有九项按下去只会被拒，`g` 才是这一屏唯一走得通的路，它不能是
         // 第一个被丢掉的那条。尾巴仍然是 `Esc`——那是退出这一屏的唯一说明。
-        View::PickProfile { no_git: true, .. } => help_items(
-            &[
-                ("↑↓", Key::Select),
-                ("Enter", Key::Confirm),
-                ("g", Key::InitGitRepo),
-                ("", Key::OrPressDigit),
-                ("Esc", Key::Cancel),
-            ],
-            lang,
-        ),
-        View::PickProfile { .. } => help_items(
-            &[
-                ("↑↓", Key::Select),
-                ("Enter", Key::Confirm),
-                ("", Key::OrPressDigit),
-                ("Esc", Key::Cancel),
-            ],
-            lang,
-        ),
+        //
+        // `u 更新` 同一条规矩：只在**高亮那一项**真的有新版本时才写。没有
+        // 新版本时按 `u` 只会得到一句「已经是最新」，那不值得常年占掉这一行
+        // 最稀缺的一格。它排在 `g` 后面、「或者按数字」前面——`g` 在非 git
+        // 仓库里是唯一走得通的路，比「顺手升个级」要紧。
+        View::PickProfile {
+            entries,
+            state,
+            no_git,
+            ..
+        } => {
+            let has_update = state
+                .selected()
+                .and_then(|i| entries.get(i))
+                .is_some_and(|e| e.update.is_some());
+            let mut items: Vec<(&'static str, Key)> =
+                vec![("↑↓", Key::Select), ("Enter", Key::Confirm)];
+            if *no_git {
+                items.push(("g", Key::InitGitRepo));
+            }
+            if has_update {
+                items.push(("u", Key::Update));
+            }
+            items.push(("", Key::OrPressDigit));
+            items.push(("Esc", Key::Cancel));
+            help_items(&items, lang)
+        }
         View::PickProject(p) if p.typing_path.is_some() || p.naming.is_some() => help_items(
             &[("Enter", Key::Confirm), ("Esc", Key::BackToListWord)],
             lang,
@@ -2622,6 +2678,108 @@ mod tests {
             }
             other => panic!("得到 {other:?}"),
         }
+    }
+
+    // ———— `u`：选 agent 的列表上「有新版本」那条路 ————
+
+    #[test]
+    fn u_on_an_entry_with_an_update_runs_dct_install_update() {
+        let mut e = entry("claude", ProfileStatus::Ready);
+        e.managed = true;
+        e.update = Some(crate::proto::UpdatePrompt {
+            installed: "1.0.0".into(),
+            latest: "1.1.0".into(),
+        });
+        match update_action(&e, Lang::Zh) {
+            // 命令里那个 `claude` 就是「更新的是哪一个 agent」的唯一说法——
+            // 敲进窗口的正是这一行字，它写错了，用户看到的就是一个在更新
+            // 别人的窗口。
+            UpdateAction::Run { command } => {
+                assert_eq!(command, vec!["dct", "install", "claude", "--update"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 装的就是最新那一版。**这不是「什么都不做」**——用户按了键就得有回应，
+    /// 不然他只会以为这个键坏了，再按几下。
+    #[test]
+    fn u_on_a_managed_entry_without_an_update_says_it_is_current() {
+        let mut e = entry("claude", ProfileStatus::Ready);
+        e.managed = true;
+        let UpdateAction::Say(s) = update_action(&e, Lang::Zh) else {
+            panic!("按 u 必须说点什么");
+        };
+        assert!(s.contains("最新"), "{s}");
+    }
+
+    /// 追溯不到 npm 包的那一份（官方安装器 / brew / 自己编的）：`--update`
+    /// 更新不了它，所以这里说的不能是「已经是最新」——那是一句假话，
+    /// 而他手上那份可能真的旧了。
+    #[test]
+    fn u_on_an_unmanaged_entry_says_dct_did_not_install_it() {
+        let e = entry("claude", ProfileStatus::Ready);
+        let UpdateAction::Say(s) = update_action(&e, Lang::Zh) else {
+            panic!("按 u 必须说点什么");
+        };
+        assert!(s.contains("不是 dct 装的"), "{s}");
+    }
+
+    /// 没装、缺依赖、缺密钥各有各的出路（Enter 装 / Enter 填），`u` 不抢
+    /// 它们的活——在那些行上多说一句只会把用户从唯一走得通的那条路上带走。
+    #[test]
+    fn u_on_a_blocked_entry_does_nothing() {
+        for st in [
+            ProfileStatus::NotInstalled {
+                command: "x".into(),
+            },
+            ProfileStatus::NeedsSecret,
+            ProfileStatus::NeedsDependency {
+                label: "Claude".into(),
+            },
+        ] {
+            let e = entry("x", st);
+            assert!(
+                matches!(update_action(&e, Lang::Zh), UpdateAction::Nothing),
+                "{:?} 上按 u 不该有任何反应",
+                e.status
+            );
+        }
+    }
+
+    /// 屏幕上不写按不动的键（同 `g` 只在非 git 仓库时写）：一个 agent
+    /// 没有新版本的时候，`u` 按下去只会得到一句「已经是最新」——那不值得
+    /// 常年占掉底栏最稀缺的一格。
+    #[test]
+    fn the_help_line_mentions_u_only_when_the_highlighted_entry_has_an_update() {
+        let picker = |has_update: bool| {
+            let mut e = entry("claude", ProfileStatus::Ready);
+            e.managed = true;
+            if has_update {
+                e.update = Some(crate::proto::UpdatePrompt {
+                    installed: "1.0.0".into(),
+                    latest: "1.1.0".into(),
+                });
+            }
+            let mut state = ListState::default();
+            state.select(Some(0));
+            View::PickProfile {
+                entries: vec![e],
+                state,
+                warning: None,
+                no_git: false,
+            }
+        };
+        let with = help_of(&picker(true), Lang::Zh);
+        let without = help_of(&picker(false), Lang::Zh);
+        assert!(
+            with.contains("u 更新"),
+            "有新版本时底栏要写出这个键：{with}"
+        );
+        assert!(
+            !without.contains("u 更新"),
+            "没有新版本时不该挂一个按了只会被顶回来的键：{without}"
+        );
     }
 
     // ———— Task 12：n 直连上次的 agent 、N 才进选择器 ————
