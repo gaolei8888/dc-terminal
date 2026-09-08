@@ -2,3 +2,5 @@ target/
 .DS_Store
 .claude/worktrees/
 dist/
+# 按 container/README.md 换成绑定挂载时，学生的代码会落在这里。
+container/work/

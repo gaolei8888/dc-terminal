@@ -341,14 +341,76 @@ dct 对「还不是 git 仓库」的项目会自动 `git init`（那是撤销能
 - [ ] 顺带记下另外两样在浏览器终端里会变差的东西（中文输入法、Ctrl 组合键），
       跟任务 4 那份手感实测合在一起写进 `workspace/README.md`
 
-### 任务 5：两种代码位置各验一遍
-- [ ] 命名卷：开会话 → 让 agent 改文件 → 检查点 → 撤销
-- [ ] 绑定挂载：同一套，外加 `core.autocrlf` 和文件权限那两个坑
-- [ ] **podman 也要测一遍**，不能只测 docker：rootless podman 的 uid 映射咬的
-      正是上面那条文件权限。这条的理由是 podman 本身就是个真实的运行目标，
-      不是因为某个部署方在用它
-- [ ] **验收**：两条路径上撤销都真的回滚了。哪条不灵，就在 README 里写明它不灵，
-      而不是写「建议使用另一种」
+### 任务 5：两种代码位置各验一遍 ✅（2026-09-07，podman 那条除外）
+
+**这一条挖出两个致命的东西，而且都不是「容器里的小毛病」——它们各自让整个
+容器里一个 agent 会话都开不出来。** 之前一路顺是因为我测的全是「命令行」
+会话：`session.rs:1152` 那个 `if is_agent` 决定了只有 agent 会话才拍检查点，
+所以 shell 会话把这两个坑整个绕过去了。
+
+**坑一（dct 的 bug，不是容器的）：没配 git 身份的机器上，一个 agent 会话都
+开不出来。** `git.rs` 的检查点最后一步是 `commit-tree`，而它**一定要一个
+身份**；拿不到 `user.email` 时 git 去猜 `<用户名>@<主机名>`，主机名没有域
+就直接 fatal：
+
+```text
+fatal: unable to auto-detect email address (got 'dc@4c2120397151.(none)')
+```
+
+容器里这是必然的，**任何刚装完 git、还没跑过 `git config --global user.email`
+的机器上也是必然的——那正是这个产品服务的那批人**。而 `Session::create` 里
+第一张检查点拍不上就直接拒绝开会话（`Operation::FirstCheckpoint`），界面上
+只有一句「拍不了检查点，这个会话没法安全撤销」。
+
+修法：检查点用 **dct 自己的身份**（`CHECKPOINT_IDENTITY`，env 压过配置）。
+这也更诚实——那个 commit 挂在 `refs/dct/` 底下，用户的 `git log` 里看不见，
+它不该顶着用户的名字。用户（或 agent）自己敲的 `git commit` 不受影响。
+
+**这个 bug 藏得住，是因为测试夹具替被测代码把条件抹平了。** `git.rs` 的
+`init_repo()` 里有两行 `git config user.email/user.name`——现场大量机器上
+根本没有那两行。补了两条测试，其中
+`a_checkpoint_is_signed_by_dct_not_by_whoever_owns_the_machine` 是真正钉住
+修复的那条：在一台配了全局身份的开发机上，撤掉修复它照样红。
+
+**坑二（容器的，不是 dct 的）：绑定挂载那条路上 git 拒绝干活。**
+
+```text
+fatal: detected dubious ownership in repository at '/home/dc/work'
+```
+
+Docker Desktop 把宿主目录挂进来时全显示成 `root:root 0777`，容器里跑的是
+dc(1000)。后果同上——一个 agent 会话都开不出来。
+
+修在**镜像**里（`git config --system --add safe.directory '*'`），不修在 dct
+里：那个检查防的是「多用户机器上别人的仓库里藏着 hook」，而这个镜像的
+Global Constraints 第一条就是**一人一容器**，它防的事在这里不存在；反过来
+让 dct 给每条 git 命令加 `-c safe.directory`，等于把用户**真实的多用户机器**
+上那道检查也关掉。**这一行的安全性完全建立在「一人一容器」上**，那条约束
+哪天破了，先回来删它。
+
+- [x] 命名卷：开 agent 会话 → 改文件 → `d` 看改动 → `u` 撤销。实测
+      `hello.txt` 回到改之前，快照之后新建的文件被清掉
+- [x] 绑定挂载：同一套，而且是**在宿主那一侧**看结果——绑定挂载的意义就在
+      这儿。同样全过
+- [x] 检查点署名实测是 `dct <dct@localhost>`
+- [ ] **podman 还没测。** 这台机器上没装（Windows 上没有，WSL 的 Ubuntu 里
+      装它要交互式 sudo 密码，我给不了）。rootless podman 的 uid 映射咬的
+      正是上面坑二那条，所以这一条不能靠推理，得真跑
+
+**两个预料中的坑，一个成立一个不成立：**
+
+- **文件权限：成立，而且比预想的更细。** 0777 的绑定挂载让 git 把每个文件都
+  记成 `100755`。容器里前后一致所以检查点和撤销不受影响，但同一个仓库在宿主
+  上用真 git 打开，会看到**每个文件都是模式变更**。
+- **换行（`core.autocrlf`）：没咬。** 容器里的 git 没设 `core.autocrlf`
+  （Linux 默认 false），CRLF 文件在快照里是逐字节原样的 `\r\n`，`d` 也没把
+  它误报成改动。风险其实在**宿主**那一侧：宿主的 git 如果 `autocrlf=true`，
+  会在 agent 干活的同时改写工作区文件。
+
+**还有一件事没定，留给你**：容器里没有 git 身份，所以**学生（或 agent）自己
+敲 `git commit` 会失败**。检查点已经不受影响了，但真提交仍然要身份。
+在镜像里塞一个默认署名会把假名字永久写进他的提交历史；不塞就是一句英文报错。
+我倾向不塞、写进文档，但这是产品决定，没替你做。
 
 ### 任务 6：一人一容器（本仓库这一半）
 - [ ] 单人版 `compose.yaml` 里的内存 limit 按「一个 agent 320 MB × 几个」定，

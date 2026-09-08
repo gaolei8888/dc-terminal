@@ -107,6 +107,25 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git tini procps \
  && rm -rf /var/lib/apt/lists/*
 
+# **绑定挂载那条路上，git 会拒绝干活。** 实测（2026-09-07）：Docker Desktop
+# 把宿主目录挂进来时全部显示成 `root:root 0777`，而容器里跑的是 dc(1000)，
+# 于是每一条 git 命令都是
+#
+#   fatal: detected dubious ownership in repository at '/home/dc/work'
+#
+# 后果跟 git 身份那条一样重：第一张检查点拍不上，`Session::create` 直接拒绝，
+# **一个 agent 会话都开不出来**。命名卷那条路没这个问题（那个目录属于 dc）。
+#
+# **修在镜像里，不修在 dct 里。** 那个检查防的是「多用户机器上，别人的仓库
+# 里藏着 hook 和 config」——而这个镜像的 Global Constraints 第一条就是
+# **一人一容器**：这里面只有一个用户，它防的那件事在这里不存在。
+# 反过来，让 dct 给每条 git 命令都加 `-c safe.directory`，就等于在**用户
+# 真实的多用户机器上**也把这道检查关掉了，那是另一回事。
+#
+# **这一行的安全性完全建立在「一人一容器」上。** 哪天那条约束破了，
+# 先回来删掉这一行。
+RUN git config --system --add safe.directory '*'
+
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \

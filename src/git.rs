@@ -94,6 +94,36 @@ pub fn init(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 检查点用 **dct 自己的身份**，不借用户配的那个。
+///
+/// **这不是图省事，是因为借不到。** `commit-tree` 一定要一个身份；拿不到
+/// `user.email` 时 git 会去猜 `<用户名>@<主机名>`，而主机名没有域的机器上
+/// 那一猜是失败的，git 直接 fatal：
+///
+/// ```text
+/// fatal: unable to auto-detect email address (got 'dc@4c2120397151.(none)')
+/// ```
+///
+/// 容器里这是**必然**的（2026-09-07 实测），刚装完 git、还没跑过
+/// `git config --global user.email` 的机器上同样必然——**而那正是这个产品
+/// 服务的那批人**。
+///
+/// 后果不是「少拍一张快照」那么轻：`Session::create` 里第一张检查点拍不上
+/// 就直接拒绝开会话（`Operation::FirstCheckpoint`），于是那台机器上**一个
+/// agent 会话都开不出来**，界面只说一句「拍不了检查点」。
+///
+/// 用 dct 自己的名字也更诚实：这个 commit 不是用户写的，它挂在 `refs/dct/`
+/// 底下，用户的 `git log` 里根本看不见。**它不该顶着用户的名字。**
+///
+/// 这里只管 dct 自己造的 commit。用户（或者 agent）自己敲的 `git commit`
+/// 仍然要用户自己的身份——那是他真实的提交历史，替他编一个署名比报错更坏。
+const CHECKPOINT_IDENTITY: &[(&str, &str)] = &[
+    ("GIT_AUTHOR_NAME", "dct"),
+    ("GIT_AUTHOR_EMAIL", "dct@localhost"),
+    ("GIT_COMMITTER_NAME", "dct"),
+    ("GIT_COMMITTER_EMAIL", "dct@localhost"),
+];
+
 /// 给项目当前状态拍一张隐藏快照，返回快照的 commit sha。
 ///
 /// **不动用户的分支、提交历史和暂存区**——agent 在你的真项目里干活，
@@ -130,7 +160,7 @@ pub fn checkpoint(dir: &Path, session: u32, seq: usize) -> Result<String> {
         args.push("-p");
         args.push(h);
     }
-    let commit = git(dir, &args)?;
+    let commit = git_env(dir, &args, CHECKPOINT_IDENTITY)?;
 
     let refname = format!("refs/dct/{session}/{seq}");
     git(dir, &["update-ref", &refname, &commit])?;
@@ -190,12 +220,74 @@ mod tests {
                 .unwrap();
         };
         run(&["init", "-q"]);
+        // **这两行是一个真 bug 藏了三个月的地方。** 夹具替被测代码把唯一
+        // 会出事的条件抹平了：现场大量机器上 `user.email` 根本没配，而
+        // `commit-tree` 没身份就 fatal。见 `init_repo_without_identity`。
         run(&["config", "user.email", "t@example.com"]);
         run(&["config", "user.name", "t"]);
         fs::write(p.join("a.txt"), "hello\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "init"]);
         dir
+    }
+
+    /// 一个**没配 git 身份**的仓库，跟 `init_repo` 只差那两行 config
+    /// （也因此没有初始 commit——建 commit 本身就要身份）。
+    ///
+    /// 现场什么时候长这样：容器里（2026-09-07 实测），以及任何刚装完 git、
+    /// 还没跑过 `git config --global user.email` 的机器——**正是这个产品
+    /// 服务的那批人**。
+    fn init_repo_without_identity() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        fs::write(p.join("a.txt"), "hello\n").unwrap();
+        dir
+    }
+
+    /// **这一条才是真正钉住修复的那个。**
+    ///
+    /// 下面那条「没身份也拍得上」在一台配了全局 `user.email` 的开发机上，
+    /// 就算把修复撤掉也照样绿（git 会去用全局那个）。而这一条不会：环境
+    /// 变量压过一切配置，署名不是 `dct` 就说明 `CHECKPOINT_IDENTITY` 没生效；
+    /// 而在一台没有任何身份的机器上，撤掉修复连 `checkpoint` 都会直接失败。
+    /// 两种机器上它都红。
+    #[test]
+    fn a_checkpoint_is_signed_by_dct_not_by_whoever_owns_the_machine() {
+        let dir = init_repo();
+        let sha = checkpoint(dir.path(), 1, 0).unwrap();
+        let who = git(dir.path(), &["show", "-s", "--format=%an <%ae>", &sha]).unwrap();
+        assert_eq!(
+            who, "dct <dct@localhost>",
+            "检查点是 dct 自己造的对象，不该顶着用户的名字"
+        );
+    }
+
+    /// 没有 git 身份的机器上，检查点和撤销都必须照常。
+    ///
+    /// 拍不上第一张检查点的后果不是「少一张快照」：`Session::create` 会直接
+    /// 拒绝开会话（`Operation::FirstCheckpoint`），于是那台机器上**一个
+    /// agent 会话都开不出来**。
+    #[test]
+    fn checkpoints_and_undo_work_with_no_git_identity_configured() {
+        let dir = init_repo_without_identity();
+        let sha = checkpoint(dir.path(), 1, 0).expect("没配 git 身份也必须拍得上检查点");
+        fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "junk\n").unwrap();
+        restore(dir.path(), &sha).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hello\n",
+            "撤销没把内容还原回去"
+        );
+        assert!(
+            !dir.path().join("new.txt").exists(),
+            "撤销没清掉快照之后新建的文件"
+        );
     }
 
     fn git_out(dir: &Path, args: &[&str]) -> String {
