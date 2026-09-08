@@ -109,14 +109,21 @@ docker compose -f container/compose.yaml exec dc dct gate --link --url http://12
 | 参数 | 默认 | 用途 |
 |---|---|---|
 | `NPM_REGISTRY` | `https://registry.npmmirror.com` | 跟 `runtime.rs` 的 `CN_NPM_REGISTRY` 保持同一个源 |
-| `TTYD_URL` / `TTYD_SHA256` | 空（走 GitHub） | 换国内镜像时**两个一起给**。只给 URL 不给哈希 = 谁给什么装什么 |
-| `APT_MIRROR` | 空（Debian 官方源） | **国内机器上几乎必给**，见下面那段。例：`https://mirrors.aliyun.com/debian` |
+| `TTYD_URL` | 空（走 GitHub） | **国内机器上必给**：直连 GitHub 会在 302 之后卡死。只给 URL 就行，哈希是钉死的。例：`https://gh-proxy.com/https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64` |
+| `TTYD_SHA256` | amd64 的那一个 | 只有换架构（arm64）时才要给 |
+| `APT_MIRROR` | 空（Debian 官方源） | **国内机器上几乎必给**，见下面那段。例：`http://mirrors.aliyun.com/debian`（**必须 http**，见下） |
 | `RUST_TAG` | `1-slim-bookworm` | 构建阶段的 rust 镜像 |
 
 **`APT_MIRROR` 在国内的机器上几乎是必给的。** 之前这里写着「基础镜像不需要换
 国内源」——那句话是在一台**加州**的开发机上量的（Docker Hub 拉底包 5 秒），
 换到目标机器上就不成立了：2026-09-08 实测，**一个 apt 步骤 1343 秒（22 分钟）**，
 而这样的步骤有两个。这是今天第二次栽在「从错的地方量」上，所以写清楚。
+
+**`APT_MIRROR` 必须给 `http://` 的地址。** 这一步要装的正是 `ca-certificates`，
+在它装上之前 apt 验不了任何 TLS 证书，给 https 的源会直接失败：
+`Certificate verification failed: The certificate is NOT trusted.`
+Debian 自己的默认源用 http 也是这个原因——安全性不靠 TLS，apt 验的是每个包
+的 GPG 签名。
 
 Docker Hub 那一段仍然是快的（他们的 daemon.json 里配了 registry 镜像），慢的是
 **构建过程中的 apt**，两件事。GitHub 拉 ttyd（1.36 MB）通，但也慢，网络不行的

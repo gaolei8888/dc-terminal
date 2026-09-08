@@ -55,6 +55,17 @@ FROM node:22-bookworm-slim AS node
 # 没换，取回来的东西不对就当场失败。没有这一条，「换个源」就等于「谁给我
 # 什么我装什么」。
 #
+# **所以换源时只要给 URL，不用再给哈希**：amd64 那一个是同一份文件，哈希不变。
+# 这是有意的——换镜像的人不该还得自己去算一遍一个已知文件的哈希，那既麻烦又
+# 正好给了他一个「算不出来就随便填一个」的机会。
+#
+# 2026-09-08 在国内的机器上实测：直连 GitHub 会在 302 之后卡死
+# （objects.githubusercontent.com 拉不动），下面这两个都通、都是 1362040 字节、
+# 哈希对得上：
+#   --build-arg TTYD_URL=https://gh-proxy.com/https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64
+#   --build-arg TTYD_URL=https://ghfast.top/https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64
+# 这类代理来来去去，能随便换正是因为哈希钉死了。
+#
 # 单独开一个阶段，是为了把 curl 和它那串 apt 留在这里、不进运行镜像。
 FROM debian:bookworm-slim AS ttyd
 ARG TARGETARCH
@@ -65,7 +76,14 @@ ARG TARGETARCH
 #
 # 这跟 `NPM_REGISTRY` 是同一条：源的选择是**构建参数**，不写死。默认留空
 # （官方源），要快就传一个，例如：
-#   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian
+#   --build-arg APT_MIRROR=http://mirrors.aliyun.com/debian
+#
+# **必须是 `http://`，不能是 `https://`。** 这一步要装的正是
+# `ca-certificates`——在它装上之前，apt 验不了任何 TLS 证书，给 https 的源
+# 会直接失败（实测）：
+#   Certificate verification failed: The certificate is NOT trusted.
+# Debian 自己的默认源用 http 也是这个原因。安全性不靠 TLS：apt 验的是每个
+# 包的 GPG 签名，换 http 不降低这一条。
 #
 # bookworm 的源在 deb822 格式的 `debian.sources` 里，老格式的 `sources.list`
 # 也一并替换——两个文件哪个存在就改哪个，都不存在也不报错。
@@ -90,15 +108,17 @@ RUN apt-get update \
 # "exec format error" 的 arm 镜像。arm64 的资产叫 ttyd.aarch64。
 RUN set -eu; \
     url="$TTYD_URL"; sha="$TTYD_SHA256"; \
-    if [ -z "$url" ]; then \
-      case "${TARGETARCH:-amd64}" in \
-        amd64) url="https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"; \
-               sha="8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55" ;; \
-        *) echo "本 Dockerfile 只钉了 amd64 的 ttyd 校验和，当前是 ${TARGETARCH}。" >&2; \
-           echo "自己下一份算 sha256，然后 --build-arg TTYD_URL=... --build-arg TTYD_SHA256=..." >&2; \
-           exit 1 ;; \
-      esac; \
-    fi; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) \
+        [ -n "$url" ] || url="https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"; \
+        [ -n "$sha" ] || sha="8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55" ;; \
+      *) \
+        if [ -z "$url" ] || [ -z "$sha" ]; then \
+          echo "本 Dockerfile 只钉了 amd64 的 ttyd 校验和，当前是 ${TARGETARCH}。" >&2; \
+          echo "自己下一份算 sha256，然后 --build-arg TTYD_URL=... --build-arg TTYD_SHA256=..." >&2; \
+          exit 1; \
+        fi ;; \
+    esac; \
     # `--retry`：目标机器上实测这一步会**断流**（curl 退出码 18，
     # "not closed cleanly before end of the underlying stream"），跨境链路上
     # 是常态。断了重来比整个构建失败便宜得多。
@@ -123,7 +143,14 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 #
 # 这跟 `NPM_REGISTRY` 是同一条：源的选择是**构建参数**，不写死。默认留空
 # （官方源），要快就传一个，例如：
-#   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian
+#   --build-arg APT_MIRROR=http://mirrors.aliyun.com/debian
+#
+# **必须是 `http://`，不能是 `https://`。** 这一步要装的正是
+# `ca-certificates`——在它装上之前，apt 验不了任何 TLS 证书，给 https 的源
+# 会直接失败（实测）：
+#   Certificate verification failed: The certificate is NOT trusted.
+# Debian 自己的默认源用 http 也是这个原因。安全性不靠 TLS：apt 验的是每个
+# 包的 GPG 签名，换 http 不降低这一条。
 #
 # bookworm 的源在 deb822 格式的 `debian.sources` 里，老格式的 `sources.list`
 # 也一并替换——两个文件哪个存在就改哪个，都不存在也不报错。
