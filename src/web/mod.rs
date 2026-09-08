@@ -459,7 +459,9 @@ pub const COOKIE_NAME: &str = "dct_web";
 ///
 /// 长度不同直接返回假：token 长度本来就是公开的（32 字节十六进制），
 /// 从长度上读不出任何秘密。
-fn same_secret(a: &str, b: &str) -> bool {
+/// `gate.rs` 也用这一份——那道门要的正是同一件事，
+/// 而两份常数时间比对迟早有一份被人「优化」成 `==`。
+pub(crate) fn same_secret(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;

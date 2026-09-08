@@ -31,18 +31,24 @@ services:
       - work:/home/dc/work
 
     ports:
-      # **绑在宿主的环回上，不是 0.0.0.0。这一条现在是硬的。**
-      # 任务 3 那道门还没做——ttyd 前面此刻什么都没有，谁连上这个端口，谁就
-      # 拿到一个以容器里那个用户的身份、能执行任意命令的终端。写成
-      # `"7681:7681"` 就是把它挂到局域网上（Docker 还会替你在防火墙上开好），
-      # 那跟 `dct-srv` 里 `must_be_loopback` 拦的是同一件事。
+      # **仍然绑在宿主的环回上。** 门（`dct gate`）已经在了：没带对钥匙的
+      # 请求一律 401，路径存不存在都问不出来。但**这一层还没有加密**——
+      # 明文 HTTP 上，cookie 里那把钥匙每个请求都在线上裸奔。
       #
-      # 门做完之前，要给别人用就自己在前面架一层带鉴权的反代。
-      # ttyd 认 `-H/--auth-header`（把鉴权交给反代），任务 3 会用到。
+      # 所以要给别人用，改成 `"7681:7681"` 之前先在前面架一层 TLS 反代，
+      # 并把 DCW_PUBLIC_URL 指到反代那个地址上。这跟 `dct-srv` 的
+      # `must_be_loopback` 是同一条线：没有加密之前，不许当成对外可用。
       - "127.0.0.1:7681:7681"
 
-    # 起来之后：浏览器打开 http://127.0.0.1:7681 就是完整的 dct 看板。
-    # 想从命令行看一眼：docker compose exec dc dct ps
+    environment:
+      # 门用它拼那条发得出去的链接。默认就是上面那条端口映射看到的地址；
+      # 架了反代就改成反代的地址，容器自己不可能知道。
+      DCW_PUBLIC_URL: "http://127.0.0.1:7681"
+
+    # 起来之后钥匙在日志里（**那是一条凭据**，别把日志贴到公开的地方）：
+    #   docker compose -f container/compose.yaml logs dc | grep '#t='
+    # 只想重新拿一次链接、不重启：
+    #   docker compose -f container/compose.yaml exec dc dct gate --link --url http://127.0.0.1:7681
 
 volumes:
   dct-state:

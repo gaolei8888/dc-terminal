@@ -45,6 +45,14 @@ pub const WEB_TOKEN_KEY: &str = "__web__";
 /// 配对就只在真正第一次填令牌之后发生一次，不会随重启反复重开。
 pub const PHONE_OWNER_KEY: &str = "__phone_owner__";
 
+/// 远程版那道门（`gate.rs`）的钥匙。**跟 `WEB_TOKEN_KEY` 是两把，别复用。**
+///
+/// 手机端那把给的是只读画面加一行输入；这一把给的是一整台机器上的终端
+/// （谁进得去谁就能在容器里执行任意命令）。泄漏后果不是一个量级，撤销的
+/// 时机也不一样——共用一个键会让「换掉远程的钥匙」顺手把手机踢下线，
+/// 而那正是 `WEB_TOKEN_KEY` 上面那段说过一遍的坑。
+pub const GATE_TOKEN_KEY: &str = "__gate__";
+
 /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
 pub fn secrets_path_for_socket(socket: &Path) -> PathBuf {
     match socket.parent() {

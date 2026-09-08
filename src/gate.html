@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="__LANG__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{display:flex;align-items:center;justify-content:center;
+       background:#1e1e1e;color:#d0d0d0;
+       font:16px/1.6 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif}
+  p{max-width:32em;padding:0 1.5em;text-align:center}
+</style>
+</head>
+<body>
+<p id="m">__NEEDS_LINK__</p>
+<script>
+// 钥匙放在 fragment（`#t=…`），不放查询串——查询串会进浏览器历史、进任何
+// 中间日志，而 fragment 根本不上行。这跟 `crates/dct-page/page.html` 顶上
+// 那段是同一条路、同一个理由，只是这里换完 cookie 之后要重载：门后面那一页
+// 是 ttyd 发的，不是这一页自己画的。
+//
+// 30 天而不是「关掉浏览器就失效」：这条链接的用户是没有合适环境的人，
+// 让他每次开浏览器都回去找那条链接，等于把门槛又加回来。撤销靠换钥匙。
+function claim() {
+  var m = /(?:^|[#&])t=([^&]+)/.exec(location.hash || "");
+  if (!m) return;                       // 没带钥匙：上面那句话就是全部答案
+  document.cookie =
+    "__COOKIE__=" + m[1] + "; path=/; max-age=2592000; SameSite=Strict";
+  // 先把地址栏里那一截抹掉再重载，否则钥匙会留在这一条历史记录里。
+  history.replaceState(null, "", location.pathname);
+  location.reload();
+}
+claim();
+// **这一行是实测出来的，不是想周全。** 已经打开着这一页的人，看到「要一条
+// 完整链接」之后最自然的动作就是把链接粘进同一个标签的地址栏——而那只改了
+// fragment，浏览器按同文档导航处理，整个脚本一次都不会再跑，页面纹丝不动。
+// 他会以为链接也是坏的。
+window.addEventListener("hashchange", claim);
+</script>
+</body>
+</html>

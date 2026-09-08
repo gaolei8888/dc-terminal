@@ -26,6 +26,9 @@ dct —— vibe coding 终端
                    后台空着就直接起一个新的
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct daemon       只跑守护进程，不开界面
+  dct gate         远程版那道门：守着一个端口，只放带对钥匙的人进去。
+                   默认只绑环回，要给别的机器用得显式 --bind，
+                   而且前面必须有 TLS——它自己不加密。`--link` 只印链接
   dct --version    看装的是哪一版
   dct --help       看这段
 
@@ -45,6 +48,10 @@ fn main() -> Result<()> {
             let sock = args.get(1).map(PathBuf::from).unwrap_or_else(socket_path);
             dct::daemon::run(&sock)
         }
+        // `gate` 也不连守护进程：它守的是一个 TCP 端口，读的是密钥仓里那把
+        // 钥匙，跟有没有会话在跑无关。远程版（容器）里它由 entrypoint 起，
+        // 跟 `dct daemon` 是同一层的两个进程。
+        Some("gate") => std::process::exit(dct::gate::run_cli(&args[1..], cli_lang())),
         // ps / stop 走的是**已经在跑**的守护进程，连不上就如实说没有，
         // 绝不顺手拉起一个——见 `cli` 的模块注释。
         Some("ps") => dct::cli::run_ps(&socket_path(), cli_lang()),

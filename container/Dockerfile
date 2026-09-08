@@ -3,8 +3,9 @@
 # dc-workspace：把 dct 和它要用的一切装进一个镜像。
 #
 # 计划：`docs/superpowers/plans/2026-09-06-dc-workspace-phase1.md`
-# 现在到了**任务 4**：守护进程 + ttyd，浏览器里就是完整的 dct 看板。
-# **那道门（任务 3）还没做**——见 `compose.yaml` 里端口那段：在它做完之前，
+# 任务 4 + 任务 3：守护进程 + ttyd（只绑容器内环回）+ `dct gate`（唯一对外的
+# 那个端口，只放带对钥匙的人进去）。浏览器里就是完整的 dct 看板。
+# **门不加密**——见 `compose.yaml` 里端口那段：前面没有 TLS 之前，
 # 这个端口只许绑在宿主的环回上。
 #
 # 契约（计划里那一条，写在这里是因为改 Dockerfile 的人最容易破它）：
@@ -177,21 +178,27 @@ VOLUME ["/home/dc/.dct", "/home/dc/.claude", "/home/dc/work"]
 #                locale > En，而 LANG=C.UTF-8 认不出主码，落到的是 **En**。
 #                这个镜像服务的是训练营的学生，默认给 zh；发到别处就
 #                `-e DCT_LANG=en`。学生在界面里改过之后以存的为准。
-#   DCW_PORT  —— ttyd 监听哪个端口。**只有端口，没有绑定地址**：ttyd 的 -i
-#                收的是网卡名不是 IP，拿它当「只绑环回」用是想当然。要限制
-#                谁连得上，那是宿主侧的端口映射（compose 里那条）和任务 3
-#                那道门的事。
+#   DCW_PORT  —— **对外**那个端口，`dct gate` 守着它。它不是 ttyd 的端口：
+#                ttyd 只绑容器内环回（见 entrypoint.sh），门是唯一对外的
+#                入口，而且这一条是网络层面成立的，不是靠「我们没映射它」。
+#   DCW_TTYD_PORT —— ttyd 在容器内环回上监听哪个端口。基本不用动，留着是
+#                因为「门和上游是两个端口」这件事得能看见。
+#   DCW_PUBLIC_URL —— 外面看到的地址前缀（`https://box.example.com`）。门用
+#                它拼那条能直接发出去的链接。**容器不知道自己被映射到哪儿**
+#                ——这正是那条契约（镜像不知道自己被起了几份）的落点。
+#                不给的话门会按容器网桥地址猜一条，并明说那是猜的。
 ENV HOME=/home/dc \
     LANG=C.UTF-8 \
     DCW_PORT=7681 \
     TERM=xterm-256color \
-    DCT_LANG=zh
+    DCT_LANG=zh \
+    DCW_TTYD_PORT=7682
 
 EXPOSE 7681
 
 # `tini -g`：信号发给子进程**所在的进程组**，不只是那一个子进程。任务 1 那会儿
 # entrypoint 是 `exec dct daemon`，底下只有一个进程，`-g` 没意义。现在它下面
-# 挂着守护进程和 ttyd 两个，没有 `-g` 的话 `docker stop` 只打到中间那个 shell，
-# 那两个要等十秒超时后被 SIGKILL。理由的另一半（凭什么说那两个进程确实在
-# 同一个组里）写在 entrypoint.sh 里。
+# 挂着守护进程、ttyd、门三个，没有 `-g` 的话 `docker stop` 只打到中间那个
+# shell，那三个要等十秒超时后被 SIGKILL。理由的另一半（凭什么说那几个进程
+# 确实在同一个组里）写在 entrypoint.sh 里。
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]

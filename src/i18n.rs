@@ -353,6 +353,12 @@ pub enum Key {
     /// 「dct 被关掉了」「换了个 WiFi」这三种，而说死一种就有三分之二的概率
     /// 在骗人。把三种可能都摆出来，用户自己一眼就知道是哪种。
     PhoneOffline,
+    /// 远程版那道门（`gate.rs`）门口那一页上的唯一一句话：链接里没带钥匙。
+    ///
+    /// **不说「未授权」「401」「token 无效」。** 这一页的读者是训练营里
+    /// 「压根没有合适环境」的那个人，他手上只有别人发来的一条链接——
+    /// 能帮到他的只有一句：这条链接不完整，回去要一条新的。
+    GateNeedsLink,
     /// 经中转时的第一种断法：那台电脑根本没在问中转要东西。
     PhoneComputerGone,
     /// 第二种：信封送到了，它没回话。
@@ -810,6 +816,13 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 上面那句是局域网上唯一说得出的话：连不上就是连不上，分不清是哪
         // 一种。经中转的时候中转分得清，下面这两句就该各说各的——一句让人
         // 去开机，一句让人去动一下那台机器。指错方向比不说更费时间。
+        // 「打不开」而不是「没有权限」：他没做错任何事，是链接不完整。
+        // 英文那句同样不提 token / unauthorized —— 同一个理由。
+        GateNeedsLink => t!(
+            lang,
+            en: "This page needs the full link that was sent to you \u{2014} ask for a new one.",
+            zh: "这个页面要用别人发给你的完整链接才能打开，回去再要一条。",
+        ),
         PhoneComputerGone => t!(
             lang,
             en: "your computer isn't connected — it may be off, or dct isn't running",
@@ -2315,6 +2328,7 @@ mod tests {
             HiddenCharsInName,
             NoSessionsHere,
             PhoneOffline,
+            GateNeedsLink,
             PhoneComputerGone,
             PhoneComputerSilent,
             LastUsedAgent,
@@ -2434,7 +2448,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 187, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 188, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
