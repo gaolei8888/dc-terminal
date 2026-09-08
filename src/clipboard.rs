@@ -10,7 +10,32 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// 一次「粘图」的结果。**三种，不是两种。**
+///
+/// 原来的返回类型是 `Option<PathBuf>`，`None` 同时背着两个意思：
+/// 「剪贴板里不是图」和「这个平台上 dct 根本读不了剪贴板」。前者是用户的
+/// 状态，后者是这个构建的状态，而界面对两者说的是同一句「剪贴板里没有
+/// 图片」——于是在 Linux（含容器）上，学生截了图、按了 F5，拿到的是一句
+/// **听起来像是他自己没复制**的话。
+///
+/// 这个仓库对这种坏法有明确立场（`sys::proc`、`shell.rs` 里都是同一条：
+/// 达不到同样强度的地方点名说清楚，不假装）。所以把这两件事分开命名，
+/// 让调用方没法再用同一句话糊过去。
+pub enum Pasted {
+    /// 剪贴板里确实是图，已经存成文件了
+    Image(PathBuf),
+    /// 剪贴板里没有图（是文字、是空的）。**最常见的情况，不是异常**
+    NoImage,
+    /// **这个平台上读不了剪贴板里的图**，跟剪贴板里有什么无关
+    Unsupported,
+}
+
 /// 读剪贴板这件事失败了。界面上只给码，句子由 `i18n::msg::error` 组。
+#[cfg_attr(
+    not(any(target_os = "macos", windows, test)),
+    allow(dead_code, reason = "只有 mac/windows 那两支取图的路会用到；\
+         别的平台直接答 Unsupported，但这几个函数照样编，免得跟着走散")
+)]
 fn read_failed() -> anyhow::Error {
     crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
         crate::proto::Operation::ReadClipboard,
@@ -18,6 +43,11 @@ fn read_failed() -> anyhow::Error {
 }
 
 /// 存放粘贴出来的图片。放在系统临时目录里，不污染用户的项目。
+#[cfg_attr(
+    not(any(target_os = "macos", windows, test)),
+    allow(dead_code, reason = "只有 mac/windows 那两支取图的路会用到；\
+         别的平台直接答 Unsupported，但这几个函数照样编，免得跟着走散")
+)]
 fn paste_dir() -> PathBuf {
     std::env::temp_dir().join("dct-pastes")
 }
@@ -27,6 +57,11 @@ fn paste_dir() -> PathBuf {
 /// 名字里带 pid：同一台机器上可以同时开着好几个 dct 界面，光靠一个进程内的
 /// 计数器，第二个界面第一次粘贴就会覆盖掉第一个界面刚存下的图——而那张图的
 /// 路径可能已经躺在某个 agent 的输入框里了。
+#[cfg_attr(
+    not(any(target_os = "macos", windows, test)),
+    allow(dead_code, reason = "只有 mac/windows 那两支取图的路会用到；\
+         别的平台直接答 Unsupported，但这几个函数照样编，免得跟着走散")
+)]
 fn new_png_path() -> Result<PathBuf> {
     let dir = paste_dir();
     std::fs::create_dir_all(&dir).map_err(|_| read_failed())?;
@@ -34,9 +69,9 @@ fn new_png_path() -> Result<PathBuf> {
     Ok(dir.join(format!("paste-{}-{}.png", std::process::id(), n)))
 }
 
-/// 剪贴板里如果是图片，存成 PNG 并返回路径；不是图片返回 `None`。
+/// 剪贴板里如果是图片，存成 PNG 并返回路径。见 [`Pasted`]。
 #[cfg(target_os = "macos")]
-pub fn image_to_file() -> Result<Option<PathBuf>> {
+pub fn image_to_file() -> Result<Pasted> {
     let path = new_png_path()?;
     let path_str = path.to_str().ok_or_else(read_failed)?;
 
@@ -61,8 +96,8 @@ return "OK""#
         .map_err(|_| read_failed())?;
 
     match String::from_utf8_lossy(&out.stdout).trim() {
-        "OK" => Ok(Some(path)),
-        "NO_IMAGE" => Ok(None),
+        "OK" => Ok(Pasted::Image(path)),
+        "NO_IMAGE" => Ok(Pasted::NoImage),
         _ => Err(read_failed()),
     }
 }
@@ -115,7 +150,7 @@ const READ_CLIPBOARD_PS1: &str = concat!(
 );
 
 #[cfg(windows)]
-pub fn image_to_file() -> Result<Option<PathBuf>> {
+pub fn image_to_file() -> Result<Pasted> {
     let path = new_png_path()?;
 
     let mut cmd = std::process::Command::new("powershell.exe");
@@ -143,19 +178,28 @@ pub fn image_to_file() -> Result<Option<PathBuf>> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout.trim();
     match line {
-        "OK" => Ok(Some(path)),
-        "NO_IMAGE" => Ok(None),
+        "OK" => Ok(Pasted::Image(path)),
+        "NO_IMAGE" => Ok(Pasted::NoImage),
         _ => match line.strip_prefix("FILE:") {
-            Some(p) if !p.is_empty() => Ok(Some(PathBuf::from(p))),
+            Some(p) if !p.is_empty() => Ok(Pasted::Image(PathBuf::from(p))),
             _ => Err(read_failed()),
         },
     }
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-pub fn image_to_file() -> Result<Option<PathBuf>> {
-    // 其它平台暂不支持；返回 None 让调用方给出「剪贴板里没有图片」那句话。
-    Ok(None)
+pub fn image_to_file() -> Result<Pasted> {
+    // **答 `Unsupported`，不答 `NoImage`。** 这两个在界面上是两句不同的话，
+    // 而这里的真相是后一句：dct 在这个平台上没实现读剪贴板，跟用户复制了
+    // 什么没有关系。答 `NoImage` 就是把自己的没做完说成用户的操作失误。
+    //
+    // 远程版（浏览器里那个终端）也走这一支，而且**在那里补不上**：图片要
+    // 从浏览器进来，得让 ttyd 的前端页面接住 paste 事件再传上来，而那一页
+    // 是 ttyd 二进制里内嵌的 730 KB 单文件，换它等于把它整份 vendor 进来跟
+    // 着版本走；那道门（`gate.rs`）又是一根刻意不解析 HTTP 正文的字节管道，
+    // 在它身上改写页面会把那条「不解析所以没有走私问题」的保证一起拆掉。
+    // 所以这一期的验收线就是这一句话说准，不是把功能补上。
+    Ok(Pasted::Unsupported)
 }
 
 #[cfg(test)]
@@ -200,9 +244,20 @@ mod tests {
             c.stdin.as_mut().unwrap().write_all(b"just text").unwrap();
             c.wait().unwrap();
 
-            assert!(matches!(image_to_file(), Ok(None)));
+            assert!(matches!(image_to_file(), Ok(Pasted::NoImage)));
         }
         // Windows 上这条不自动化：唯一的做法是往用户**真的**剪贴板里写东西，
         // 跑一次测试就顺手清掉了开发者手里正拷着的内容。
+    }
+
+    /// 没实现取图的平台上必须答 `Unsupported`，**不能答 `NoImage`**。
+    ///
+    /// 这两个分支在界面上是两句不同的话，而 `NoImage` 那句
+    /// （「剪贴板里没有图片」）在这里是假的——它把 dct 自己的没做完说成
+    /// 用户的操作失误。容器里跑的正是这一支。
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn a_platform_without_image_paste_says_so_instead_of_blaming_the_clipboard() {
+        assert!(matches!(image_to_file(), Ok(Pasted::Unsupported)));
     }
 }

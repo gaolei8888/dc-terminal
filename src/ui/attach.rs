@@ -253,8 +253,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 /// 送路径而不是别的：终端这根管子只过字节，图片过不去；而 agent 拿到一条
 /// 路径就能自己去读那张图——Claude Code、codex 都是这么用的。
 fn paste_image(app: &mut App, id: u32) {
+    use crate::clipboard::Pasted;
     match crate::clipboard::image_to_file() {
-        Ok(Some(path)) => {
+        Ok(Pasted::Image(path)) => {
             let text = path_as_input(&path);
             // 失败的处理跟下面手打字符那条完全一样，理由也一样：静默吞掉
             // 的话，用户分不清是「dct 没读到图」还是「发出去了但 agent 卡着」。
@@ -269,8 +270,16 @@ fn paste_image(app: &mut App, id: u32) {
         }
         // 剪贴板里是文字、是空的，都走这一条，而且**不是红字**：用户按了
         // 一个键、什么都没发生，他需要的只是一句「这里没有图」。
-        Ok(None) => {
+        Ok(Pasted::NoImage) => {
             app.message = crate::i18n::text(crate::i18n::Key::NoImageInClipboard, app.lang).into()
+        }
+        // **这一句跟上面那句不能合并**，虽然它们看上去都是「什么都没发生」。
+        // 上面那句说的是剪贴板，这一句说的是这个环境——合并的话，Linux 和
+        // 容器里的用户会被告知「你没复制图片」，而他明明复制了。
+        // 同样不是红字：他没做错任何事。
+        Ok(Pasted::Unsupported) => {
+            app.message =
+                crate::i18n::text(crate::i18n::Key::ImagePasteUnsupportedHere, app.lang).into()
         }
         Err(e) => {
             app.message = Msg::err(

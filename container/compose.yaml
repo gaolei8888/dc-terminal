@@ -16,8 +16,16 @@ services:
     # PID 1 的收尸问题在 Dockerfile 里用 tini 解决了，这里不再叠一层
     # `init: true`——两个 init 串起来只是多一层，不多一分保证。
 
-    # 一个 agent 常驻约 320 MB（实测，见 README 那节），加上容器底子。
-    # 这个数字是**单人**的：一个人同时开三个 agent 还有余量。
+    # 2026-09-07 在这台机器上量的（`docker stats`，两份并排跑着比出来的）：
+    #
+    #   底座（daemon + ttyd + gate + tini，0 个会话）        22.6 MiB
+    #   再加一个**闲着的** claude 会话                       105  MiB（净增约 82）
+    #
+    # 但定 limit 不能用这个数：闲着的 agent 还没装进任何上下文。**干活时**那个
+    # 数是根目录 README 里实测的约 320 MB/agent。按「一个人同时开三个」算：
+    # 23 + 3×320 ≈ 1 GB，2 GiB 留了一倍余量给峰值。
+    #
+    # 这个数字是**单人**的。三十个人是三十个容器，不是把这里调大。
     mem_limit: 2g
 
     volumes:
@@ -31,6 +39,14 @@ services:
       - work:/home/dc/work
 
     ports:
+      # **宿主那一侧的端口必须可换。** 写死 7681 的话这份 compose 只能起一份
+      # ——第二份直接
+      #   Bind for 127.0.0.1:7681 failed: port is already allocated
+      # 而计划里写着「发三十个学生就是跑三十次」，那句话在写死端口的版本上
+      # 是假的（2026-09-07 真跑了一次才发现）。起第二份：
+      #   DCW_HOST_PORT=7691 docker compose -p 学生2 -f container/compose.yaml up -d
+      # 项目名（-p）不同，卷名也跟着不同，两份的状态天然不共享。
+      #
       # **仍然绑在宿主的环回上。** 门（`dct gate`）已经在了：没带对钥匙的
       # 请求一律 401，路径存不存在都问不出来。但**这一层还没有加密**——
       # 明文 HTTP 上，cookie 里那把钥匙每个请求都在线上裸奔。
@@ -38,12 +54,12 @@ services:
       # 所以要给别人用，改成 `"7681:7681"` 之前先在前面架一层 TLS 反代，
       # 并把 DCW_PUBLIC_URL 指到反代那个地址上。这跟 `dct-srv` 的
       # `must_be_loopback` 是同一条线：没有加密之前，不许当成对外可用。
-      - "127.0.0.1:7681:7681"
+      - "127.0.0.1:${DCW_HOST_PORT:-7681}:7681"
 
     environment:
       # 门用它拼那条发得出去的链接。默认就是上面那条端口映射看到的地址；
       # 架了反代就改成反代的地址，容器自己不可能知道。
-      DCW_PUBLIC_URL: "http://127.0.0.1:7681"
+      DCW_PUBLIC_URL: "${DCW_PUBLIC_URL:-http://127.0.0.1:${DCW_HOST_PORT:-7681}}"
 
     # 起来之后钥匙在日志里（**那是一条凭据**，别把日志贴到公开的地方）：
     #   docker compose -f container/compose.yaml logs dc | grep '#t='

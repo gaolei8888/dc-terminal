@@ -358,6 +358,12 @@ pub enum Key {
     /// **不说「未授权」「401」「token 无效」。** 这一页的读者是训练营里
     /// 「压根没有合适环境」的那个人，他手上只有别人发来的一条链接——
     /// 能帮到他的只有一句：这条链接不完整，回去要一条新的。
+    /// 按了「粘贴图片」，而这个平台上 dct 根本读不了剪贴板。
+    ///
+    /// **跟 `NoImageInClipboard` 不是一句话。** 那句说的是剪贴板里没有图
+    /// （用户的状态），这句说的是这个环境做不到（dct 的状态）。在 Linux 和
+    /// 容器里用那一句，等于把自己的没做完说成用户的操作失误。
+    ImagePasteUnsupportedHere,
     GateNeedsLink,
     /// 经中转时的第一种断法：那台电脑根本没在问中转要东西。
     PhoneComputerGone,
@@ -818,6 +824,13 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 去开机，一句让人去动一下那台机器。指错方向比不说更费时间。
         // 「打不开」而不是「没有权限」：他没做错任何事，是链接不完整。
         // 英文那句同样不提 token / unauthorized —— 同一个理由。
+        // 说清楚是「这里」做不到，并且给一条真的走得通的退路——把路径打
+        // 给 agent 本来就是 dct 自己用的那条路（`paste_image` 送的就是路径）。
+        ImagePasteUnsupportedHere => t!(
+            lang,
+            en: "can't paste images in this environment \u{2014} save the image to a file and type its path",
+            zh: "这个环境里粘不了图——把图片存成文件，再把路径打进去",
+        ),
         GateNeedsLink => t!(
             lang,
             en: "This page needs the full link that was sent to you \u{2014} ask for a new one.",
@@ -2328,6 +2341,7 @@ mod tests {
             HiddenCharsInName,
             NoSessionsHere,
             PhoneOffline,
+            ImagePasteUnsupportedHere,
             GateNeedsLink,
             PhoneComputerGone,
             PhoneComputerSilent,
@@ -2448,7 +2462,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 188, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 189, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
