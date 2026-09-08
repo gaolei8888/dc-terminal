@@ -3,8 +3,9 @@
 # dc-workspace：把 dct 和它要用的一切装进一个镜像。
 #
 # 计划：`docs/superpowers/plans/2026-09-06-dc-workspace-phase1.md`
-# 这一份是**任务 1 的骨架**——容器里能起守护进程，`dct ps` 连得上。
-# ttyd（把终端搬进浏览器）和那道门是任务 3、4，还没在这儿。
+# 现在到了**任务 4**：守护进程 + ttyd，浏览器里就是完整的 dct 看板。
+# **那道门（任务 3）还没做**——见 `compose.yaml` 里端口那段：在它做完之前，
+# 这个端口只许绑在宿主的环回上。
 #
 # 契约（计划里那一条，写在这里是因为改 Dockerfile 的人最容易破它）：
 # **这个镜像不知道自己被起了几份、挂了什么卷、前面有什么反代。**
@@ -43,6 +44,44 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM node:22-bookworm-slim AS node
 
 # ---------------------------------------------------------------------------
+# ttyd：把那个终端搬进浏览器的那一层
+# ---------------------------------------------------------------------------
+# **不走 apt**——Debian bookworm 里根本没这个包（`apt-cache policy ttyd` 是空表，
+# 查过了）。官方发布的是一个静态链接的单文件，1.36 MB，没有运行时依赖。
+#
+# **校验和钉死，理由不是防 GitHub 变卦**（release 资产本来就不可变），而是：
+# 下面那个 URL 允许用 `--build-arg TTYD_URL=` 换成国内镜像。URL 换了、校验和
+# 没换，取回来的东西不对就当场失败。没有这一条，「换个源」就等于「谁给我
+# 什么我装什么」。
+#
+# 单独开一个阶段，是为了把 curl 和它那串 apt 留在这里、不进运行镜像。
+FROM debian:bookworm-slim AS ttyd
+ARG TARGETARCH
+ARG TTYD_VERSION=1.7.7
+ARG TTYD_URL=""
+ARG TTYD_SHA256=""
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+# 只钉了 amd64 那一个哈希——那是真下过、真算过的。别的架构不假装支持：这里
+# 直接失败并说清怎么办，好过建出一个装着 x86 二进制、跑起来才报
+# "exec format error" 的 arm 镜像。arm64 的资产叫 ttyd.aarch64。
+RUN set -eu; \
+    url="$TTYD_URL"; sha="$TTYD_SHA256"; \
+    if [ -z "$url" ]; then \
+      case "${TARGETARCH:-amd64}" in \
+        amd64) url="https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"; \
+               sha="8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55" ;; \
+        *) echo "本 Dockerfile 只钉了 amd64 的 ttyd 校验和，当前是 ${TARGETARCH}。" >&2; \
+           echo "自己下一份算 sha256，然后 --build-arg TTYD_URL=... --build-arg TTYD_SHA256=..." >&2; \
+           exit 1 ;; \
+      esac; \
+    fi; \
+    curl -fsSL -o /ttyd "$url"; \
+    echo "$sha  /ttyd" | sha256sum -c -
+
+
+# ---------------------------------------------------------------------------
 # 运行镜像
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -58,6 +97,11 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 # `procps` 给的是 `ps`/`pgrep`。它不是「方便调试」——**任务 2 的验收条件是
 # 「确认孤儿被 reap 掉、进程表干净」，没有 ps 就问不出这句话**。第一次建完
 # 镜像去查进程树时才发现 slim 里没有，记在这儿免得有人当成冗余给删掉。
+# **terminfo 不用装，已经在里面了**：debian:bookworm-slim 自带 ncurses-base 6.4-4，
+# `TERM=xterm-256color tput colors` 直接答 256。写在这儿是因为我差点白加一个包：
+# 我先查的是 `/usr/share/terminfo`（空的），而 Debian 把库放在 `/lib/terminfo`。
+# dct 自己本来也不查 terminfo（走 ratatui/crossterm），要它的是看板里开出来的
+# 那种 shell 会话——`clear`、`less`、`vi`。两边都已经满足，这一条不用做任何事。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git tini procps \
  && rm -rf /var/lib/apt/lists/*
@@ -89,6 +133,7 @@ RUN npm config set registry "$NPM_REGISTRY" \
 # 的二进制在镜像里存了两份。第一次建出来 684 MB，`docker history` 里明晃晃两条
 # 9.54 MB——白扔的。
 COPY --from=build --chmod=0755 /out/dct /usr/local/bin/dct
+COPY --from=ttyd --chmod=0755 /ttyd /usr/local/bin/ttyd
 COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # 不以 root 跑：agent 会在项目目录里写文件，root 写出来的东西在绑定挂载那条
@@ -100,7 +145,14 @@ COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN useradd -m -u 1000 -s /bin/bash dc  && mkdir -p /home/dc/.dct /home/dc/.claude /home/dc/work  && chown -R dc:dc /home/dc
 
 USER dc
-WORKDIR /home/dc
+# **WORKDIR 必须是 ~/work，不能是 ~。这一条是安全问题，不是整洁问题。**
+# 守护进程的 cwd 就是看板里的默认项目，而 dct 对「还不是 git 仓库」的项目会
+# 自动 `git init`（那是撤销能成立的前提）。cwd 停在 /home/dc 的话，被 init 的
+# 就是家目录本身，而 `git.rs` 的检查点是 `git add -A`（含未跟踪文件）——
+# **`~/.dct/secrets.toml` 会被写进快照对象**，`~/.claude` 那 185 MB 对话记录
+# 每轮都要重算一遍。2026-09-07 实测：cwd=/home/dc 时 `git status` 在新建的
+# 仓库里已经列着 `?? .dct/`。挪到 ~/work 之后，两个状态目录都在项目之外。
+WORKDIR /home/dc/work
 
 # 状态必须落在卷上，两处缺一个学生就丢东西：
 #   ~/.dct    —— secrets.toml / projects.json / last-sessions.toml /
@@ -111,7 +163,35 @@ WORKDIR /home/dc
 #   ~/work    —— 学生的代码。命名卷还是绑定挂载由起容器的人决定，见任务 5。
 VOLUME ["/home/dc/.dct", "/home/dc/.claude", "/home/dc/work"]
 
+# **下面这几样就是契约本身**（计划里那句「镜像只认环境变量和卷路径」）。
+# 加一样就是改契约，得同时改 container/README.md。
+#   HOME      —— `store_path_for_socket` 靠它推出 ~/.dct 里的一切
+#   LANG      —— 不给就是 POSIX，中文在看板里直接变问号
+#   TERM      —— **不给的话会话里是 `dumb`**，不是「没设」。守护进程在容器里
+#                没有终端可继承（实测它的 environ 里根本没有 TERM），
+#                portable-pty 于是给子进程填了 `dumb`：`tput` 直接报错、
+#                `clear`/`less`/`vi` 全废、agent 也认不出这是彩色终端。桌面上
+#                看不到这个坑，因为那边 dct 是从一个真终端里敲起来的。填什么
+#                值不用猜——前面就是 ttyd，它报的正是 xterm-256color。
+#   DCT_LANG  —— 看板语言。dct 的顺序是 DCT_LANG > 用户存过的设置 > 系统
+#                locale > En，而 LANG=C.UTF-8 认不出主码，落到的是 **En**。
+#                这个镜像服务的是训练营的学生，默认给 zh；发到别处就
+#                `-e DCT_LANG=en`。学生在界面里改过之后以存的为准。
+#   DCW_PORT  —— ttyd 监听哪个端口。**只有端口，没有绑定地址**：ttyd 的 -i
+#                收的是网卡名不是 IP，拿它当「只绑环回」用是想当然。要限制
+#                谁连得上，那是宿主侧的端口映射（compose 里那条）和任务 3
+#                那道门的事。
 ENV HOME=/home/dc \
-    LANG=C.UTF-8
+    LANG=C.UTF-8 \
+    DCW_PORT=7681 \
+    TERM=xterm-256color \
+    DCT_LANG=zh
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+EXPOSE 7681
+
+# `tini -g`：信号发给子进程**所在的进程组**，不只是那一个子进程。任务 1 那会儿
+# entrypoint 是 `exec dct daemon`，底下只有一个进程，`-g` 没意义。现在它下面
+# 挂着守护进程和 ttyd 两个，没有 `-g` 的话 `docker stop` 只打到中间那个 shell，
+# 那两个要等十秒超时后被 SIGKILL。理由的另一半（凭什么说那两个进程确实在
+# 同一个组里）写在 entrypoint.sh 里。
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]
