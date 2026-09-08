@@ -149,8 +149,9 @@ GitHub 拉 ttyd（1.36 MB）也通，网络不行的地方才需要 `TTYD_URL`�
   逐字节原样的，`d` 也不会把它误报成改动。风险在**宿主**那一侧：宿主的 git
   如果 `autocrlf=true`，会在 agent 干活的同时改写工作区文件。
 
-**podman 还没测**（这台机器上没装）。rootless podman 的 uid 映射咬的正是上面
-那条权限，所以在它上面跑之前，这段结论只对 docker 成立。
+**只支持 docker。** rootless podman 的 uid 映射咬的正是上面那条权限
+（`safe.directory` 那一行是按 docker 的 `root:root 0777` 挂法来的），所以
+上面这段结论只对 docker 成立；真要上 podman，得把这一节重跑一遍。
 
 ## 已知会变差的地方
 
@@ -161,10 +162,13 @@ GitHub 拉 ttyd（1.36 MB）也通，网络不行的地方才需要 `TTYD_URL`�
 - **一个容器一个人。** 谁连得上 `~/.dct/daemon.sock`，谁就能以那个身份执行任意
   命令。一个容器塞多个学生 = 互相能进对方的会话、读对方的密钥。这条不做取舍。
   镜像里那条 `safe.directory '*'` 的安全性也建立在它上面。
-- **容器里没有 git 身份**，所以学生（或 agent）自己敲 `git commit` 会失败，
-  要自己先 `git config --global user.email/user.name`。**检查点和撤销不受
-  影响**——那是 dct 自己的对象，用的是 dct 自己的署名。镜像不替学生编一个
-  署名：假名字会永久写进他真实的提交历史。
+- **学生自己提交时的署名是个占位符**：镜像在 `--system` 层配了
+  `dc-workspace user <user@dc-workspace.local>`，好让他 `git commit` 得成，
+  而不是撞一句英文报错。**这一期学生的 git 只做本地提交**，那份历史不流到
+  别人那里，所以占位署名的代价是可接受的。他自己
+  `git config --global user.email/user.name` 之后，他那份就赢。
+  **dct 的检查点跟这个无关**——它用的是自己的署名（`dct <dct@localhost>`，
+  环境变量压过所有配置），改这两行不会影响撤销。
 
 ## 内存
 

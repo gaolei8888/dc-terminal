@@ -80,7 +80,8 @@ Node 运行时 95 MB，`claude` 那个 npm 包 416 MB。前者定容器的内存
 **PID 1 必须会收尸。** 用 `--init`（或镜像里放 tini）。理由不是守护进程漏收——
 它自己 `child.wait()` 收得干净（`pty.rs` 那条 `no_zombie` 测试盯着）——而是**父进程先死时
 孤儿会被 reparent 到 PID 1**，而一个不 reap 的 PID 1 会让僵尸堆到进程表满。
-这一条我**还没在容器里验过**，任务 2 的验收条件就是验它。
+**2026-09-07 验过了**（任务 2）：孤儿确实 reparent 到 PID 1，而且只有 PID 1
+是 tini 时才会被收掉——换成一个不 wait 的 PID 1，同一个孤儿就永久留在进程表里。
 
 **运行时预装进镜像，不现下。** `runtime.rs` 那套「下一份 Node 放 `~/.dct/runtime/node`」
 是给单机用户写的。三十个学生同时开容器各下 500 MB 是另一回事。构建期装好，
@@ -207,11 +208,35 @@ Docker Hub 在这台机器上拉 `debian:bookworm-slim` 用了 5.2 秒，**基�
 根因是 Windows 服务 `com.docker.service` 停着（不是 WSL、不是网络）。`docker version`
 仍能答客户端版本，正是这个形状。
 
-### 任务 2：PID 1 与收尸
-- [x] tini 已经在 ENTRYPOINT 上，进程树实测是 `1 tini → 7 dct`
+### 任务 2：PID 1 与收尸 ✅（2026-09-07）
+
+- [x] tini 已经在 ENTRYPOINT 上，进程树实测 `1 tini → 7 bash → {daemon, ttyd, gate}`
 - [x] 镜像里装了 `procps`——slim 里没有 `ps`/`pgrep`，**没有它这一条根本问不出来**
-- [ ] **验收**：起一个会话，让 agent 的父进程先死，确认孤儿被 reap 掉、进程表干净。
-      这是 Global Constraints 里那条「还没验过」的约束，验完把结论写回去
+- [x] **验收**：起一个会话，让父进程先死，孤儿被 reparent 到 PID 1、进程表干净
+
+怎么验的：看板上开一个 shell 会话，在里面 `sleep 400 &`（`&` 让它自己一个
+进程组，所以 `dct kill` 打前台组打不到它），然后 `dct kill 2` 强杀会话。
+杀之前 `sleep 400` 的 PPID 是 1695（会话那个 bash），杀之后变成 **1**——
+reparent 实测到了。全表扫 `Z`：0 个。
+
+**但「没看到僵尸」本身不算验证**，得有反例。第一次构造的反例是错的：让
+PID 1 是一个普通 `sh`，结果它照样把孤儿收了——因为它正阻塞在 `wait()` 上
+等自己的子进程，而 `wait` 会顺手收掉**任何**一个子进程，包括刚 reparent
+过来的。改成「PID 1 派完子进程就 `exec` 成 `sleep`，从此永不 wait」之后，
+对比才成立：
+
+| PID 1 | 进程表 | 僵尸 |
+|---|---|---|
+| `sleep`（不收尸） | `1 sleep`、`7 Z sh`、`8 Z sleep`（PPID 都是 1） | **2 个，永久** |
+| `tini -g` | `1 tini`、`7 sleep`、`8 Z sh`（PPID 是 7） | 1 个，**且不是 reparent 来的那个** |
+
+结论钉死：**reparent 到 PID 1 的那个孤儿，只有 PID 1 是 tini 时才会被收掉。**
+Global Constraints 里那条「还没在容器里验过」可以划掉了。
+
+**tini 不是万灵药，顺带记下来**：上表 B 里那个剩下的僵尸挂在 pid 7 底下，
+tini 收不了——它不是 tini 的孩子。中间那一层自己 spawn 又从不 wait 的话，
+照样漏。我们这儿两层中间进程都收：`entrypoint.sh` 最后是 `wait`，守护进程
+是 `child.wait()`（`pty.rs` 那条 `no_zombie` 测试盯着）。
 
 ### 任务 3：那道门 ✅（2026-09-07）
 
@@ -341,7 +366,7 @@ dct 对「还不是 git 仓库」的项目会自动 `git init`（那是撤销能
 - [ ] 顺带记下另外两样在浏览器终端里会变差的东西（中文输入法、Ctrl 组合键），
       跟任务 4 那份手感实测合在一起写进 `workspace/README.md`
 
-### 任务 5：两种代码位置各验一遍 ✅（2026-09-07，podman 那条除外）
+### 任务 5：两种代码位置各验一遍 ✅（2026-09-07）
 
 **这一条挖出两个致命的东西，而且都不是「容器里的小毛病」——它们各自让整个
 容器里一个 agent 会话都开不出来。** 之前一路顺是因为我测的全是「命令行」
@@ -393,9 +418,12 @@ Global Constraints 第一条就是**一人一容器**，它防的事在这里不
 - [x] 绑定挂载：同一套，而且是**在宿主那一侧**看结果——绑定挂载的意义就在
       这儿。同样全过
 - [x] 检查点署名实测是 `dct <dct@localhost>`
-- [ ] **podman 还没测。** 这台机器上没装（Windows 上没有，WSL 的 Ubuntu 里
-      装它要交互式 sudo 密码，我给不了）。rootless podman 的 uid 映射咬的
-      正是上面坑二那条，所以这一条不能靠推理，得真跑
+- [x] ~~podman 也要测一遍~~ **2026-09-07 决定：不测，只支持 docker。**
+      原计划里那条理由（「podman 本身就是个真实的运行目标」）现在不成立——
+      运行目标由部署方定，而部署方用的是 docker。**代价说清楚**：rootless
+      podman 的 uid 映射咬的正是上面坑二那条（`safe.directory` 那一行是按
+      docker 的 `root:root 0777` 挂法来的），所以哪天真要上 podman，这一条
+      必须回来重跑，不能拿上面 docker 的结论顶。
 
 **两个预料中的坑，一个成立一个不成立：**
 

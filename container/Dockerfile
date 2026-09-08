@@ -126,6 +126,25 @@ RUN apt-get update \
 # 先回来删掉这一行。
 RUN git config --system --add safe.directory '*'
 
+# **学生自己敲 `git commit` 也要有个身份，否则报的是一句英文。**
+#
+# 这跟上面 dct 检查点那件事**不是**同一回事：检查点用的是 dct 自己的署名
+# （`git.rs` 的 `CHECKPOINT_IDENTITY`，环境变量压过一切配置），跟这里配什么
+# 无关，也不会被这两行影响。这两行只管学生（和 agent）自己发起的提交。
+#
+# 之前不敢配，怕把一个假名字永久写进他真实的提交历史。**2026-09-07 定了：
+# 这一期学生的 git 只做本地提交**，不往任何地方推，那份历史不会流到别人
+# 那里去，于是「先让他 commit 得成」压过「署名要准」。
+#
+# 落在 `--system`（`/etc/gitconfig`），不是 `--global`：学生哪天自己
+# `git config --global user.email` 了，他那份就赢——这两行只是在他还没配的
+# 时候兜住，不会盖掉他的。
+#
+# 名字取得一眼就看得出是占位符：读 `git log` 的人应该立刻想到「这台机器没
+# 设过名字」，而不是去猜「dc 是谁」。
+RUN git config --system user.name "dc-workspace user" \
+ && git config --system user.email "user@dc-workspace.local"
+
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
