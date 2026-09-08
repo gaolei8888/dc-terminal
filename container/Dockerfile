@@ -58,6 +58,27 @@ FROM node:22-bookworm-slim AS node
 # 单独开一个阶段，是为了把 curl 和它那串 apt 留在这里、不进运行镜像。
 FROM debian:bookworm-slim AS ttyd
 ARG TARGETARCH
+# **换 Debian 源，不换就慢到没法用。**
+#
+# 2026-09-08 在目标机器（国内，电信）上实测：**一个 `apt-get update && install`
+# 步骤 1343 秒（22 分钟）**，而这样的步骤有两个。走 Debian 官方源就是这个数。
+#
+# 这跟 `NPM_REGISTRY` 是同一条：源的选择是**构建参数**，不写死。默认留空
+# （官方源），要快就传一个，例如：
+#   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian
+#
+# bookworm 的源在 deb822 格式的 `debian.sources` 里，老格式的 `sources.list`
+# 也一并替换——两个文件哪个存在就改哪个，都不存在也不报错。
+ARG APT_MIRROR=""
+RUN set -eu; \
+    if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
+        [ -f "$f" ] || continue; \
+        sed -i "s|https\?://deb.debian.org/debian|$APT_MIRROR|g; \
+                s|https\?://security.debian.org/debian-security|$APT_MIRROR-security|g" "$f"; \
+      done; \
+    fi
+
 ARG TTYD_VERSION=1.7.7
 ARG TTYD_URL=""
 ARG TTYD_SHA256=""
@@ -78,7 +99,10 @@ RUN set -eu; \
            exit 1 ;; \
       esac; \
     fi; \
-    curl -fsSL -o /ttyd "$url"; \
+    # `--retry`：目标机器上实测这一步会**断流**（curl 退出码 18，
+    # "not closed cleanly before end of the underlying stream"），跨境链路上
+    # 是常态。断了重来比整个构建失败便宜得多。
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o /ttyd "$url"; \
     echo "$sha  /ttyd" | sha256sum -c -
 
 
@@ -91,6 +115,27 @@ FROM debian:bookworm-slim AS runtime
 # 的 `CN_NPM_REGISTRY` 就是它，两处保持同一个源，学生在容器里和在本地装到的
 # 是同一份东西。要换源：`--build-arg NPM_REGISTRY=...`。
 ARG NPM_REGISTRY=https://registry.npmmirror.com
+
+# **换 Debian 源，不换就慢到没法用。**
+#
+# 2026-09-08 在目标机器（国内，电信）上实测：**一个 `apt-get update && install`
+# 步骤 1343 秒（22 分钟）**，而这样的步骤有两个。走 Debian 官方源就是这个数。
+#
+# 这跟 `NPM_REGISTRY` 是同一条：源的选择是**构建参数**，不写死。默认留空
+# （官方源），要快就传一个，例如：
+#   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian
+#
+# bookworm 的源在 deb822 格式的 `debian.sources` 里，老格式的 `sources.list`
+# 也一并替换——两个文件哪个存在就改哪个，都不存在也不报错。
+ARG APT_MIRROR=""
+RUN set -eu; \
+    if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
+        [ -f "$f" ] || continue; \
+        sed -i "s|https\?://deb.debian.org/debian|$APT_MIRROR|g; \
+                s|https\?://security.debian.org/debian-security|$APT_MIRROR-security|g" "$f"; \
+      done; \
+    fi
 
 # `git` 是硬依赖，不是可选：dct 的检查点和撤销全靠它（`git.rs`），而撤销是
 # 敢让 agent 不问就动手的全部前提。
