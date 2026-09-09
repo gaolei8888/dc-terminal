@@ -194,7 +194,8 @@ pub(crate) fn apply_started(
             // MINOR 8 同款的顾虑（见 `secret.rs` Ctrl+O 分支）：`open_url`
             // 打不开的话必须说一声，不能让这一屏看着有个地址、其实浏览器
             // 根本没弹出来，用户会以为是自己眼花。
-            if !open_url(&url) {
+            let browser_opened = open_url(&url);
+            if !browser_opened {
                 app.message = Msg::err(msg::cannot_open_browser(app.lang, &url));
             }
             View::Pair {
@@ -204,6 +205,7 @@ pub(crate) fn apply_started(
                     url,
                     deadline: std::time::Instant::now()
                         + std::time::Duration::from_secs(info.expires_in),
+                    browser_opened,
                 },
                 opt_in,
                 return_to,
@@ -473,7 +475,13 @@ fn manual_entry_view(app: &mut App, profile: &str, return_to: PairReturn) -> Vie
 pub(crate) fn phase_line(phase: &PairPhase, lang: Lang) -> String {
     match phase {
         PairPhase::Starting => text(Key::PairContacting, lang).to_string(),
-        PairPhase::Waiting { .. } => text(Key::PairEnterCodeInBrowser, lang).to_string(),
+        // 浏览器没弹出来的时候不能说「刚打开的页面」——那一句在远程版上
+        // 对每一个学生都是假的。见 `PairPhase::Waiting::browser_opened`。
+        PairPhase::Waiting {
+            browser_opened: true,
+            ..
+        } => text(Key::PairEnterCodeInBrowser, lang).to_string(),
+        PairPhase::Waiting { .. } => text(Key::PairOpenThisLink, lang).to_string(),
         PairPhase::Failed { message, .. } => message.clone(),
         PairPhase::Done {
             anthropic, openai, ..
@@ -537,6 +545,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         user_code,
         url,
         deadline,
+        ..
     } = &phase
     {
         lines.push(Line::from(""));
@@ -641,6 +650,25 @@ mod tests {
             user_code: "HJ4K-9QTZ".into(),
             url: "https://dc-llm.tzspace.cn/pair?code=HJ4K-9QTZ".into(),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
+            browser_opened: true,
+        }
+    }
+
+    /// 浏览器没弹出来的那一种。远程版（容器里的看板）上**只会**是这一种。
+    fn phase_waiting_no_browser() -> PairPhase {
+        match phase_waiting() {
+            PairPhase::Waiting {
+                user_code,
+                url,
+                deadline,
+                ..
+            } => PairPhase::Waiting {
+                user_code,
+                url,
+                deadline,
+                browser_opened: false,
+            },
+            other => other,
         }
     }
 
@@ -1210,6 +1238,25 @@ mod tests {
     /// 过期的两种理由文案不一样：能重试的说按 r，不能的说去用网关自己
     /// 给的那句话（比如去重新生成）。
     #[test]
+    /// 浏览器弹出来了和没弹出来，标题不能是同一句。
+    ///
+    /// 没弹出来还说「在刚打开的页面里」，说的是一件没发生过的事，而纠正只在
+    /// 底栏一行红字里——用户是从上往下读的。远程版上这不是边缘情况：容器里
+    /// 没有浏览器可开，**每一个学生**都会走到这一支。
+    #[test]
+    fn the_heading_does_not_claim_a_page_opened_when_none_did() {
+        let opened = phase_line(&phase_waiting(), Lang::Zh);
+        let not = phase_line(&phase_waiting_no_browser(), Lang::Zh);
+        assert_ne!(opened, not, "两种情况必须是两句话");
+        assert!(
+            !not.contains("刚打开"),
+            "浏览器没开的时候不许说「刚打开的页面」：{not}"
+        );
+        for lang in Lang::all() {
+            assert!(!phase_line(&phase_waiting_no_browser(), *lang).trim().is_empty());
+        }
+    }
+
     fn the_two_expiries_do_not_share_one_sentence() {
         let a = phase_expired(true, String::new());
         let b = phase_expired(false, "请点「重新生成」".into());

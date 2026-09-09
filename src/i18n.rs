@@ -474,6 +474,12 @@ pub enum Key {
     PairContacting,
     /// Waiting 阶段的说明句：在浏览器里，用这个码。
     PairEnterCodeInBrowser,
+    /// 同一件事，但浏览器没弹出来的那一种说法。
+    ///
+    /// **不能跟 `PairEnterCodeInBrowser` 合并。** 那一句说「在刚打开的页面里」，
+    /// 而远程版（容器里的看板）根本开不出浏览器——对那里的每一个学生，那句话
+    /// 都是在描述一件没发生过的事。见 `PairPhase::Waiting::browser_opened`。
+    PairOpenThisLink,
     /// 可重试的过期（`retryable == true`）：网关没告诉我们具体原因
     /// （到点的 ttl 过期一律是空 `message`），这句是 dct 自己给的人话。
     PairCodeExpired,
@@ -1067,6 +1073,13 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
 
         AutoPair => t!(lang, en: "auto-pair with the camp gateway", zh: "自动配对训练营网关"),
         PairContacting => t!(lang, en: "Contacting the camp gateway…", zh: "正在联系训练营网关…"),
+        // 「打开下面这个地址」——地址就印在下一行，而且在浏览器终端里是
+        // 可以直接点的链接（ttyd 的 web-links，实测过）。
+        PairOpenThisLink => t!(
+            lang,
+            en: "open the link below, then enter this code",
+            zh: "打开下面这个地址，再输入这个码",
+        ),
         PairEnterCodeInBrowser => t!(
             lang,
             en: "Enter this code in the page that just opened",
@@ -2416,6 +2429,7 @@ mod tests {
             AutoPair,
             PairContacting,
             PairEnterCodeInBrowser,
+            PairOpenThisLink,
             PairCodeExpired,
             PairKeyUnreadable,
             PairDenied,
@@ -2462,7 +2476,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 189, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 190, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
