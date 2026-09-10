@@ -692,6 +692,15 @@ pub enum ErrorCode {
     Git(String),
     /// agent 的命令跑不起来。带上命令名——用户至少知道该去修哪个。
     CannotStart(String),
+    /// 这个 agent 还没登录，而**它要跑的那台机器**开不了浏览器，所以它自己
+    /// 那条「跳到 localhost」的登录路走不通（见 `profile::LoginSpec`）。
+    ///
+    /// 带上该跑的那条登录命令：界面拿它开一个命令行会话，让用户看着设备码
+    /// 印出来。跟 `NotAGitRepo` 一样是「先问、被拒了再办」——**判断归守护
+    /// 进程**，因为登录状态和「有没有浏览器」都是 agent 那台机器的属性。
+    NeedsRemoteLogin {
+        command: Vec<String>,
+    },
     /// 守护进程那边没反应了（连不上、超时、连接被关）。三种情况用户能做的
     /// 是同一件事，所以不分。
     DaemonNotResponding,

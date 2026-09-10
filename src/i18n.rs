@@ -1654,6 +1654,18 @@ pub mod msg {
                 en: format!("{dir} does not exist"),
                 zh: format!("目录不存在：{dir}"),
             ),
+            // **正常情况下用户看不到这一句。** 界面接住这个码之后会直接开一个
+            // 登录窗口（见 `ui::create_session`），根本不会显示错误。这句话是
+            // 兜底：万一哪条路径没接住，至少说清楚该干什么，而不是甩一句
+            // 「开不了会话」。
+            NeedsRemoteLogin { command } => {
+                let cmd = command.join(" ");
+                t!(
+                    lang,
+                    en: format!("This agent is not signed in yet, and this machine has no browser to open. Run: {cmd}"),
+                    zh: format!("这个 agent 还没登录，而这台机器上开不了浏览器。运行：{cmd}"),
+                )
+            }
             NotAGitRepo(dir) => t!(
                 lang,
                 en: format!("{dir} is not a git project, so an agent cannot work there"),

@@ -1657,6 +1657,33 @@ pub(crate) fn create_session(
     // `.git`。顺带还避开一个死循环：缺 git 时 `prepare_repo` 自己会开一个
     // shell 会话去跑 `dct install git`，那一次同样走这个函数，而 shell 永远
     // 拿不到 `NotAGitRepo`。
+    // **还没登录：开一个登录窗口，而不是把错误甩给用户。**
+    //
+    // 收在这里而不是选择器里，是因为建会话有三条路（选择器、`n`/`N` 快速新建、
+    // 密钥验证通过后），而这里是它们共同的收口。2026-09-10 的教训：只在选择器
+    // 那条上判断过，用 `n` 快速新建的用户照样被送进一条连不上的回环登录页。
+    //
+    // 跟下面 `NotAGitRepo` 那支同一个形状：守护进程拒绝并说明原因，界面把它
+    // 变成一件用户能看着完成的事。
+    if let Ok(Response::Error(crate::proto::ErrorCode::NeedsRemoteLogin { command })) = &r {
+        let command = command.clone();
+        // `remember: false` —— 这不是用户选的 agent，记了下次按 `n` 会掉进
+        // 一个命令行。同「帮你装 CLI」那条路。
+        if let Ok(Response::Created { id }) = ask_to_create(app, dir, "shell", false) {
+            let line = format!("{}
+", command.join(" "));
+            let _ = app
+                .client()
+                .and_then(|c| c.call(Request::Input { id, text: line }));
+            app.message = crate::i18n::msg::logging_in(app.lang, profile).into();
+            app.need_sessions = true;
+            app.copy_mode = false;
+            return Ok(Response::Created { id });
+        }
+        // 连登录窗口都开不出来时，把守护进程原来那句留在返回值里——`i18n::error`
+        // 会把它说成「还没登录，运行：<命令>」，用户至少知道该敲什么。
+    }
+
     let mut made_repo = false;
     if matches!(
         &r,

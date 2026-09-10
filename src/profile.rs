@@ -478,6 +478,44 @@ fn login_shell() -> String {
 /// Unix 看权限位，Windows 看扩展名，而且用户敲的 `claude` 和磁盘上的
 /// `claude.cmd` 根本不是同一个字符串。这个名字留在这里不动，是因为
 /// `status_of` 和一串测试都按它的形状写的。
+/// 这个 profile 现在是不是「差一次登录，而且这台机器开不了浏览器」。
+///
+/// 返回该跑的那条命令，`None` = 不需要（没声明 `[login]`、这台机器有浏览器
+/// 可开、或者已经登录了）。
+///
+/// **在守护进程这一侧算，不在界面那一侧算。** 登录状态和「有没有浏览器」
+/// 是 agent 要跑的那台机器的属性，而界面将来可能跑在别的机器上（本地 TUI
+/// 直连远程守护进程，见 `gate.rs` 模块头提到的第二期）。放在界面那边算，
+/// 到那天答的就是另一台机器的情况了。
+/// `has_browser` 由调用方查好传进来，**不在这里自己查**。理由跟
+/// `status_of` 把 `command_exists` 当参数注进去是同一条：不注的话，这个函数
+/// 的答案就取决于跑测试的那台机器有没有装桌面环境——开发机上（Windows）
+/// 它恒为真，于是「没登录该被拦住」这条测试**在开发机上永远是绿的，而
+/// 在真正要它管用的容器里从没被验过**。
+pub fn needs_remote_login(spec: Option<&LoginSpec>, has_browser: bool) -> Option<Vec<String>> {
+    let spec = spec?;
+    // 有浏览器就什么都不用管：回环那条路在本机是通的，agent 自己会办。
+    if has_browser {
+        return None;
+    }
+    let (cmd, args) = spec.status.split_first()?;
+    let ok = std::process::Command::new(cmd)
+        .args(args)
+        // 问一句状态而已，别把它的输出漏到守护进程的日志里。
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        // 命令跑不起来时**当成不需要登录**：真实原因更可能是「这个 CLI
+        // 没装」，而那件事由 `ProfileStatus` 去说，说得比这里准。报成
+        // 「需要登录」会把用户推向一条跑不起来的命令。
+        .unwrap_or(true);
+    if ok {
+        return None;
+    }
+    Some(spec.remote.clone())
+}
 /// 这台机器上有没有能开网页的东西。
 ///
 /// 判断的是**运行 agent 的那台机器**，不是学生眼前那台。两者不同正是

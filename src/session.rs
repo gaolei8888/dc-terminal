@@ -587,6 +587,14 @@ pub struct SessionManager {
     /// 真实路径——同 `journal` 的模式，绝不能让测试写到用户真实的
     /// `~/.dct/last-sessions.toml`。
     last_sessions_path: Mutex<Option<PathBuf>>,
+    /// 「这台机器开不开得了浏览器」的覆盖值，**只给测试用**。`None` = 去问
+    /// 真实环境（生产上永远是这个）。
+    ///
+    /// 有它是因为这个问题的答案取决于跑测试的机器：开发机是 Windows，
+    /// `has_local_browser()` 恒为真，于是「没登录的 agent 该被拦住」那条
+    /// 测试在开发机上永远是绿的 —— 而它要管用的地方恰恰是没有浏览器的
+    /// 容器。不注进来的话，那条测试等于没写。
+    has_browser_for_test: Mutex<Option<bool>>,
     /// dct 自带的那份运行时（`~/.dct/runtime`）在哪。`None` = 不知道，
     /// 也就不去挂它（默认；单元测试拿到的就是这种）。只有
     /// `daemon.rs::run_with_manager` 会给它一个真实路径——同 `journal` 和
@@ -660,6 +668,7 @@ impl SessionManager {
             journal: crate::journal::Journal::new(),
             last_sessions_path: Mutex::new(None),
             runtime_dir: Mutex::new(None),
+            has_browser_for_test: Mutex::new(None),
             pair_models_home: Mutex::new(None),
             backend: Mutex::new(None),
             llm_problem: Mutex::new(None),
@@ -747,6 +756,11 @@ impl SessionManager {
     /// 文档。
     pub fn backend(&self) -> Option<Arc<dyn crate::llm::Backend>> {
         recover(self.backend.lock()).clone()
+    }
+
+    /// 假装这台机器有/没有浏览器。**只给测试用**，见字段上那段。
+    pub fn set_has_browser_for_test(&self, v: bool) {
+        *recover(self.has_browser_for_test.lock()) = Some(v);
     }
 
     /// 注册内置之外的 profile（测试用，也是将来从磁盘加载自定义 profile 的入口）
@@ -945,6 +959,27 @@ impl SessionManager {
         }
         if profile.is_agent && !git::is_repo(dir) {
             return Err(coded(ErrorCode::NotAGitRepo(dir.display().to_string())));
+        }
+
+        // **登录也归这里管，跟上面那条 git 检查同一个理由。**
+        //
+        // 界面上有三条建会话的路：选择器、`n`/`N` 快速新建、密钥验证通过后。
+        // 2026-09-10 的教训是只在选择器那条上判断了——而快速新建用的是记住的
+        // profile，根本不经过选择器，于是 codex 照样被直接拉起来、跑它那条
+        // 学生连不上的回环登录，屏幕上还是那个 ERR_CONNECTION_REFUSED。
+        //
+        // 收在这一处，三条路一次盖住，以后新加的第四条也自动被盖住。
+        //
+        // 只管 agent：开一个普通命令行不该被登录状态挡住，用户可能正是要进去
+        // 手动登录。
+        if profile.is_agent {
+            if let Some(command) = crate::profile::needs_remote_login(
+                profile.login.as_ref(),
+                recover(self.has_browser_for_test.lock())
+                    .unwrap_or_else(crate::profile::has_local_browser),
+            ) {
+                return Err(coded(ErrorCode::NeedsRemoteLogin { command }));
+            }
         }
 
         let idle_re = profile.idle_regex()?;
@@ -3130,6 +3165,68 @@ mod tests {
             );
             sleep(Duration::from_millis(20));
         }
+    }
+
+    /// **还没登录的 agent 不许被开起来 —— 不管是从哪条路来的。**
+    ///
+    /// 2026-09-10 真出过：判断只写在选择器里，而用户按的是 `n`（用记住的
+    /// profile 快速新建），那条路根本不经过选择器。codex 于是被直接拉起来、
+    /// 跑它那条本地回环登录，学生的浏览器跳到 `localhost:1455` 然后
+    /// `ERR_CONNECTION_REFUSED`，屏幕上没有任何解释。
+    ///
+    /// 收在 `create_inner` 里，三条路一次盖住。这条测试钉的就是「收在这里」。
+    #[test]
+    fn an_agent_that_is_not_signed_in_is_refused_before_it_can_start() {
+        let dir = init_repo();
+        let m = SessionManager::new();
+        let mut p = fake_agent();
+        p.name = "needs-login".into();
+        // 一条必然失败的「问状态」命令 = 没登录；`remote` 是该给用户的那条。
+        p.login = Some(crate::profile::LoginSpec {
+            status: vec![crate::sys::testing::tool("false")],
+            remote: vec!["some-agent".into(), "login".into(), "--device-auth".into()],
+        });
+        m.register_profile(p);
+        m.set_has_browser_for_test(false); // 容器里就是这样
+
+        let err = m
+            .create(dir.path(), "needs-login", empty_secrets(), &[])
+            .expect_err("没登录就不该开出会话");
+        let code = err
+            .downcast::<crate::proto::CodedError>()
+            .expect("要带上错误码")
+            .0;
+
+        match code {
+            ErrorCode::NeedsRemoteLogin { command } => assert_eq!(
+                command.last().map(String::as_str),
+                Some("--device-auth"),
+                "要把该跑的那条登录命令带给界面，不然它只能干瞪眼"
+            ),
+            other => panic!("该报「需要登录」，报的是 {other:?}"),
+        }
+    }
+
+    /// 普通命令行不受这条挡。用户可能正是要开一个 shell 进去手动登录——
+    /// 把他也挡住就成了一个出不去的圈。
+    #[test]
+    fn a_plain_shell_is_never_blocked_by_a_missing_sign_in() {
+        let dir = init_repo();
+        let m = SessionManager::new();
+        let mut p = fake_agent();
+        p.name = "plain".into();
+        p.is_agent = false;
+        p.login = Some(crate::profile::LoginSpec {
+            status: vec![crate::sys::testing::tool("false")],
+            remote: vec!["never".into(), "runs".into()],
+        });
+        m.register_profile(p);
+        m.set_has_browser_for_test(false);
+
+        assert!(
+            m.create(dir.path(), "plain", empty_secrets(), &[]).is_ok(),
+            "命令行会话不该被登录状态挡住"
+        );
     }
 
     #[test]
