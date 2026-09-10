@@ -127,6 +127,16 @@ pub struct InstallPrompt {
     pub note: String,
 }
 
+/// 「这个 agent 还没登录，而这台机器开不了浏览器」时，要敲进命令行会话的
+/// 那条命令。
+///
+/// **它是 Some 就等于「需要登录」**——守护进程只在确实需要时才填它（见
+/// `daemon.rs` 里算这个字段那一段），界面不用再判断一遍。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginPrompt {
+    pub command: Vec<String>,
+}
+
 /// 手机通知的状态。**只有四种，每一种都要给用户一条能做的下一步**——
 /// `Paired` 除外，那是终点，不需要下一步（见 `ui::phone::next_step`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +198,10 @@ pub struct ProfileEntry {
     pub status: ProfileStatus,
     pub secret: Option<SecretPrompt>,
     pub install: Option<InstallPrompt>,
+    /// 见 `LoginPrompt`。`Some` = 装好了、密钥齐了，只差登录，而且这台机器
+    /// 上没有浏览器可开。
+    #[serde(default)]
+    pub login: Option<LoginPrompt>,
     /// 密钥仓里现在是不是真有这个 profile 的密钥。跟 `status` 分开存是因为
     /// `status_of` 里「装没装排在密钥前面」（见 profile.rs），一个 CLI 没装的
     /// profile 不管密钥填没填都会报 `NeedsDependency`/`NotInstalled`——从

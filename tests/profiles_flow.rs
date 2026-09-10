@@ -141,6 +141,7 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
         env: Default::default(),
         secret: None,
         install: None,
+        login: None,
         headless: None,
         api: None,
         label: Default::default(),

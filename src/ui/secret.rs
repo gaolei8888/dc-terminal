@@ -564,6 +564,7 @@ mod tests {
             label: name.into(),
             note: String::new(),
             has_secret: status != ProfileStatus::NeedsSecret,
+            login: None,
             status,
             secret: None,
             install: None,

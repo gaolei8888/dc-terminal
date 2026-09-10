@@ -461,6 +461,10 @@ pub enum Key {
     // —— 选择器里的「为什么用不了」——
     ReasonNeedsSecret,
     ReasonNotInstalled,
+    /// 装好了、密钥齐了，只差一次登录——而且这台机器开不了浏览器，所以
+    /// 那个 agent 自己那条「跳到 localhost」的登录路走不通。见
+    /// `profile::LoginSpec`。
+    ReasonNeedsLogin,
     /// `x` 按在一个还有会话的组上
     GroupNotEmpty,
 
@@ -1064,6 +1068,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
 
         ReasonNeedsSecret => t!(lang, en: "(no key yet)", zh: "（未填密钥）"),
         ReasonNotInstalled => t!(lang, en: "(not installed)", zh: "（未安装）"),
+        ReasonNeedsLogin => t!(lang, en: "(needs sign-in)", zh: "（需要登录）"),
 
         GroupNotEmpty => t!(
             lang,
@@ -1515,6 +1520,19 @@ pub mod msg {
             lang,
             en: format!("Installing {profile}. When it finishes, press Esc then N."),
             zh: format!("正在安装 {profile}，装完按 Esc 回看板再按 N"),
+        )
+    }
+
+    /// 开了个窗口在登录。**必须说清「登完还要回来再按一次」**——那个窗口
+    /// 跑完之后停在一个命令行上，用户会以为已经进 agent 了，然后对着一个
+    /// shell 提示符发愣。跟 `installing` 同一句形状，同一个理由。
+    pub fn logging_in(lang: Lang, profile: &str) -> String {
+        t!(
+            lang,
+            en: format!(
+                "Signing in to {profile}: open the link it prints and enter the code.                  When it says you are signed in, press Esc then N."
+            ),
+            zh: format!("正在登录 {profile}：打开它印出来的网址、输入那段码。登好之后按 Esc 回看板再按 N"),
         )
     }
 
@@ -2425,6 +2443,7 @@ mod tests {
             NoChanges,
             ReasonNeedsSecret,
             ReasonNotInstalled,
+            ReasonNeedsLogin,
             GroupNotEmpty,
             AutoPair,
             PairContacting,
@@ -2476,7 +2495,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 190, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 191, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -3737,6 +3737,7 @@ mod tests {
             env: Default::default(),
             secret: None,
             install: None,
+            login: None,
             headless: None,
             api: None,
             label: Default::default(),

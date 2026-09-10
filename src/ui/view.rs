@@ -390,12 +390,31 @@ pub enum PickAction {
         profile: String,
         command: Vec<String>,
     },
+    /// 装好了、密钥齐了，只差一次登录，而这台机器开不了浏览器。跟
+    /// `Install` 同一个形状：开一个命令行会话，把那条命令敲进去，让用户
+    /// 看着它跑。
+    Login {
+        profile: String,
+        command: Vec<String>,
+    },
     Blocked(String),
 }
 
 /// 按下某一项时该干什么。抽成纯函数是为了能单测——`run()` 的按键循环
 /// 要连真 socket，测不了（同 `back_one_level`）。
 pub fn pick_action(e: &ProfileEntry, lang: Lang) -> PickAction {
+    // **登录排在 `Ready` 前面。**
+    //
+    // 守护进程只在这个 profile 本来就 `Ready` 时才去问「登录了吗」（见
+    // `daemon.rs` 里算这个字段那一段），所以 `login` 是 `Some` 就等于
+    // 「装好了、密钥齐了、只差登录」——不用在这儿再判断一遍，也不该判断：
+    // 那会在界面这侧复制一份守护进程的顺序规则，两份迟早走岔。
+    if let Some(l) = &e.login {
+        return PickAction::Login {
+            profile: e.name.clone(),
+            command: l.command.clone(),
+        };
+    }
     match &e.status {
         ProfileStatus::Ready => PickAction::Start(e.name.clone()),
         ProfileStatus::NeedsSecret => PickAction::AskSecret(0),
@@ -2516,6 +2535,7 @@ mod tests {
             status,
             secret: None,
             install: None,
+            login: None,
             backend_only: false,
             // pick_action/digit_index 不看这个字段——它们的测试从不需要
             // 一个可配对的 fixture。
@@ -2549,6 +2569,36 @@ mod tests {
             pick_action(&e, Lang::Zh),
             PickAction::AskSecret(_)
         ));
+    }
+
+    /// **需要登录要排在「可以开工」前面。**
+    ///
+    /// 需要登录的 profile 状态正是 `Ready`（守护进程只在 Ready 时才去问
+    /// 登录），所以判断顺序反了的话，按下去就直接去开 agent —— 而那个
+    /// agent 第一件事就是拉起一个学生连不上的回环登录页。
+    #[test]
+    fn a_profile_that_needs_signing_in_offers_the_sign_in_not_the_agent() {
+        let mut e = entry("codex", ProfileStatus::Ready);
+        e.login = Some(crate::proto::LoginPrompt {
+            command: vec!["codex".into(), "login".into(), "--device-auth".into()],
+        });
+
+        match pick_action(&e, Lang::Zh) {
+            PickAction::Login { profile, command } => {
+                assert_eq!(profile, "codex");
+                assert_eq!(command.last().map(String::as_str), Some("--device-auth"));
+            }
+            other => panic!("该给登录动作，给的是 {other:?}"),
+        }
+    }
+
+    /// 没声明登录、或者已经登录过的（守护进程那侧就不会填 `login`），
+    /// 照旧直接开工 —— 这一条钉住「不需要登录的 agent 什么都没变」。
+    #[test]
+    fn a_profile_with_nothing_to_sign_in_to_starts_as_before() {
+        let mut e = entry("claude", ProfileStatus::Ready);
+        e.login = None;
+        assert!(matches!(pick_action(&e, Lang::Zh), PickAction::Start(_)));
     }
 
     #[test]

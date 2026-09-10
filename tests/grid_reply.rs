@@ -61,6 +61,7 @@ fn test_shell_profile() -> Profile {
         env,
         secret: None,
         install: None,
+        login: None,
         headless: None,
         api: None,
         label: Default::default(),

@@ -58,6 +58,23 @@ pub struct InstallSpec {
     pub note: LocalizedText,
 }
 
+/// 这个 agent 怎么判断「登录了吗」，以及在开不了浏览器的机器上怎么登。
+///
+/// 只给**登录会走本地回环重定向**的 agent 写。那种 agent 在 dc-workspace
+/// 里必然登不上：回环监听在容器里，浏览器在学生自己机器上，两个 localhost
+/// 不是同一台机器。`remote` 是官方给的另一条路（通常是设备码）。
+///
+/// 不写这一节的 agent 什么都不会变。Claude Code 就不需要——它本来就是
+/// 「网页给一段 code，粘回终端」，跨机器天然成立。
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoginSpec {
+    /// 问「登录了吗」。**退出码 0 = 已登录**，不解析输出——输出的措辞会
+    /// 随版本改，退出码不会。
+    pub status: Vec<String>,
+    /// 这台机器开不了浏览器时该跑哪条登录命令。
+    pub remote: Vec<String>,
+}
+
 /// 怎么把这个 profile 用**无界面**方式跑一次（dct 自己要用模型时走这条）。
 ///
 /// 命令后面会追加提示词，stdout 就是回答。
@@ -131,6 +148,9 @@ pub struct Profile {
     pub backend_only: bool,
     #[serde(default)]
     pub install: Option<InstallSpec>,
+    /// 见 `LoginSpec`。只有登录走本地回环的 agent 需要填。
+    #[serde(default)]
+    pub login: Option<LoginSpec>,
     #[serde(default)]
     pub headless: Option<HeadlessSpec>,
     #[serde(default)]
@@ -458,6 +478,25 @@ fn login_shell() -> String {
 /// Unix 看权限位，Windows 看扩展名，而且用户敲的 `claude` 和磁盘上的
 /// `claude.cmd` 根本不是同一个字符串。这个名字留在这里不动，是因为
 /// `status_of` 和一串测试都按它的形状写的。
+/// 这台机器上有没有能开网页的东西。
+///
+/// 判断的是**运行 agent 的那台机器**，不是学生眼前那台。两者不同正是
+/// `[login].remote` 存在的全部理由：agent 在容器里，它起的回环监听也在容器
+/// 里，而浏览器在学生自己机器上——回环那条路跨不过去。
+///
+/// Windows 和 macOS 上一律算有：那两个系统上「打开默认浏览器」是系统能力，
+/// 不是某个可执行文件在不在 PATH 上。Linux 上看 `xdg-open`/`open`——桌面
+/// 环境都会带 `xdg-open`，而 debian-slim 这类容器基础镜像不带。
+///
+/// **只查在不在，不真的去开。** `ui::open_url` 那个是真去开（用户按了键在
+/// 等页面弹出来），这里是在回答一个问题，不能有副作用。
+pub fn has_local_browser() -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        return true;
+    }
+    ["xdg-open", "open"].iter().any(|c| command_exists(c))
+}
+
 pub fn command_exists(cmd: &str) -> bool {
     crate::sys::fs::command_exists(cmd)
 }
@@ -580,6 +619,44 @@ mod tests {
             status_of(shell, &all, false, &|_| true, Lang::Zh),
             ProfileStatus::Ready
         ));
+    }
+
+    /// `[login]` 那一节要能被解出来。**这是 codex 在浏览器里能不能登录的
+    /// 唯一开关**——解不出来的话，`needs_remote_login` 永远拿到 `None`，
+    /// 学生又会掉回那个 `ERR_CONNECTION_REFUSED`，而且一点提示都没有。
+    #[test]
+    fn the_codex_profile_declares_how_to_sign_in_without_a_browser() {
+        let p = Profile::builtin("codex").expect("内置 codex profile");
+        let l = p.login.as_ref().expect("codex 必须声明 [login]");
+        assert_eq!(l.status, vec!["codex", "login", "status"]);
+        assert!(
+            l.remote.iter().any(|a| a == "--device-auth"),
+            "远程登录那条必须走设备码，不然又回到本地回环：{:?}",
+            l.remote
+        );
+    }
+
+    /// Claude 不需要这一节：它的登录本来就是「网页给一段 code、粘回终端」，
+    /// 跨机器天然成立。钉住它**没有**被顺手加上——加了就等于在一条本来
+    /// 好用的路上插一道多余的门。
+    #[test]
+    fn claude_needs_no_special_sign_in_path() {
+        let p = Profile::builtin("claude").expect("内置 claude profile");
+        assert!(p.login.is_none(), "claude 不该声明 [login]");
+    }
+
+    /// 这台开发机上有没有浏览器不好断言（CI 上是 Linux 无桌面，
+    /// 开发机是 Windows），但**它必须不 panic、而且答案稳定**——
+    /// 它是「要不要走设备码」的唯一依据，抖一下就会让同一台机器上
+    /// 一会儿需要登录一会儿不需要。
+    #[test]
+    fn asking_whether_this_machine_has_a_browser_is_stable() {
+        let a = has_local_browser();
+        let b = has_local_browser();
+        assert_eq!(a, b);
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(a, "Windows/macOS 上「能开浏览器」是系统能力，恒为真");
+        }
     }
 
     #[test]
@@ -1464,6 +1541,7 @@ mod tests {
             status: ProfileStatus::Ready,
             secret: None,
             install: None,
+            login: None,
             has_secret: false,
             backend_only: false,
             pairable: false,

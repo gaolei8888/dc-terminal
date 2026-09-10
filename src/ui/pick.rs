@@ -289,6 +289,33 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
                     }
                 }
             }
+            // 跟上面 `Install` 那一支同一个形状，理由也同一条：让用户看着
+            // 它跑，而不是干等一句「登录不了」。
+            //
+            // 这一支存在的原因是 codex 那类 agent 的登录默认走**本地回环
+            // 重定向**：它在本机监听一个端口，让浏览器跳到
+            // `http://localhost:<port>/…`。在 dc-workspace 里那必然失败——
+            // 监听在容器里，浏览器在学生自己机器上，两个 localhost 不是
+            // 同一台机器，学生看到的是 `ERR_CONNECTION_REFUSED`，**而屏幕上
+            // 没有任何东西告诉他为什么**。
+            Some((_, PickAction::Login { profile, command })) => {
+                let dir = app.current_dir().display().to_string();
+                match super::create_session(app, &dir, "shell", false) {
+                    Ok(Response::Created { id }) => {
+                        let line = format!("{}\n", command.join(" "));
+                        let _ = app
+                            .client()
+                            .and_then(|c| c.call(Request::Input { id, text: line }));
+                        app.message = msg::logging_in(app.lang, &profile).into();
+                        app.need_sessions = true;
+                        View::Attached(id)
+                    }
+                    _ => {
+                        app.message = Msg::err(text(Key::CannotOpenInstallWindow, app.lang).into());
+                        same(entries, state, no_git)
+                    }
+                }
+            }
             Some((_, PickAction::Blocked(msg))) => {
                 app.message = Msg::err(msg);
                 same(entries, state, no_git)
@@ -619,6 +646,10 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
                 "   ".to_string()
             };
             let reason = match &e.status {
+                // **这一支必须排在 `Ready` 前面。** 需要登录的 profile 状态
+                // 正是 `Ready`（守护进程只在 Ready 时才去问登录），排在后面
+                // 等于永远命中不到，那一行会显示成「可以用」。
+                _ if e.login.is_some() => text(Key::ReasonNeedsLogin, app.lang).into(),
                 ProfileStatus::Ready => String::new(),
                 ProfileStatus::NeedsSecret => text(Key::ReasonNeedsSecret, app.lang).into(),
                 ProfileStatus::NeedsDependency { label } => {
@@ -629,8 +660,9 @@ fn draw_pick_profile(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             };
             // 不可用的整行压暗，不只是把原因压暗——用户是先看名字再看原因的，
-            // 名字亮着会让他先以为能用
-            let base = if matches!(e.status, ProfileStatus::Ready) {
+            // 名字亮着会让他先以为能用。**还差一次登录的也算不可用**：按下去
+            // 开出来的是一个登录窗口，不是他要的那个 agent。
+            let base = if matches!(e.status, ProfileStatus::Ready) && e.login.is_none() {
                 Style::default()
             } else {
                 dim()
@@ -975,6 +1007,7 @@ mod tests {
                 status: ProfileStatus::Ready,
                 secret: None,
                 install: None,
+                login: None,
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
@@ -986,6 +1019,7 @@ mod tests {
                 status: ProfileStatus::NeedsSecret,
                 secret: None,
                 install: None,
+                login: None,
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
@@ -999,6 +1033,7 @@ mod tests {
                 },
                 secret: None,
                 install: None,
+                login: None,
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
@@ -1011,6 +1046,7 @@ mod tests {
                     command: "codex".into(),
                 },
                 secret: None,
+                login: None,
                 install: Some(InstallPrompt {
                     command: vec![
                         "npm".into(),
@@ -1818,6 +1854,7 @@ mod tests {
                 status: ProfileStatus::Ready,
                 secret: None,
                 install: None,
+                login: None,
                 has_secret: false,
                 backend_only: false,
                 pairable: false,
@@ -1846,6 +1883,7 @@ mod tests {
             status: ProfileStatus::Ready,
             secret: None,
             install: None,
+            login: None,
             has_secret: false,
             backend_only: false,
             pairable: false,
@@ -1863,6 +1901,7 @@ mod tests {
                 url: None,
             }),
             install: None,
+            login: None,
             has_secret: false,
             backend_only: false,
             pairable: true,
@@ -1931,6 +1970,7 @@ mod tests {
                 url: None,
             }),
             install: None,
+            login: None,
             has_secret: false,
             backend_only: false,
             pairable: true,
@@ -1974,6 +2014,7 @@ mod tests {
                 url: None,
             }),
             install: None,
+            login: None,
             has_secret: false,
             backend_only: false,
             pairable: false,

@@ -20,6 +20,23 @@ command = ["npm", "i", "-g", "@openai/codex"]
 zh = "需要先装 Node.js"
 en = "Requires Node.js"
 
+# **Codex 的登录默认走本地回环重定向**：它在本机监听 localhost:1455，
+# 让浏览器跳到 http://localhost:1455/auth/callback?code=…。在 dc-workspace
+# 里那必然失败 —— 监听在容器里，而学生的浏览器在他自己的机器上，那个
+# localhost 指的是他自己，什么都没监听，于是 ERR_CONNECTION_REFUSED。
+#
+# `--device-auth` 是官方给这种场景的路：印一个网址加一段一次性码，不碰回环。
+# 实测 codex v0.154.0，2026-09-10。
+#
+# 没有任何配置能把它变成默认：`forced_login_method` 只接受 `chatgpt` 和
+# `api`（选的是凭据类型，不是重定向），所以只能靠这个参数。
+[login]
+# 「登录了吗」。**靠退出码，不靠输出里那行字**：实测未登录时退出 1 并印
+# "Not logged in"，但那句话是会随版本改的，退出码不会。
+status = ["codex", "login", "status"]
+# 这台机器开不了浏览器时该走哪条登录路径。
+remote = ["codex", "login", "--device-auth"]
+
 [headless]
 # 实测 codex v0.146.0：`codex exec` 是官方的非交互模式。
 command = ["codex", "exec"]
