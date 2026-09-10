@@ -175,8 +175,10 @@ RUN set -eu; \
 # 我先查的是 `/usr/share/terminfo`（空的），而 Debian 把库放在 `/lib/terminfo`。
 # dct 自己本来也不查 terminfo（走 ratatui/crossterm），要它的是看板里开出来的
 # 那种 shell 会话——`clear`、`less`、`vi`。两边都已经满足，这一条不用做任何事。
+# `curl` 是给**学生**的，不是给我们的：容器里没有它的时候，从一个 URL 取
+# 东西只能写 `node -e 'fetch(...)'`，那是没法在课上教的一句话。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git tini procps \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tini procps \
  && rm -rf /var/lib/apt/lists/*
 
 # **绑定挂载那条路上，git 会拒绝干活。** 实测（2026-09-07）：Docker Desktop
@@ -251,6 +253,45 @@ RUN npm config set registry "$NPM_REGISTRY" \
 COPY --from=build --chmod=0755 /out/dct /usr/local/bin/dct
 COPY --from=ttyd --chmod=0755 /ttyd /usr/local/bin/ttyd
 COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# 把上传栏拼进 ttyd 自己那份 index.html，`entrypoint.sh` 用 `ttyd -I` 发这一份。
+#
+# **为什么要在构建时起一次 ttyd 才能拿到那一页**：ttyd 把整个前端编进了二进制
+# 里（1.7.7 是 728 KB 的单文件，JS/CSS 全内联，没有任何外链），除了向它自己要
+# 一次，没有别的办法取出来。取出来之后在 `</body>` 前插入我们那段就完事。
+#
+# **为什么不让那道门去改写响应**：`gate.rs` 的立身之本是「不重写 HTTP，只决定
+# 放不放行」。要往响应里注东西，它就得开始解析 Content-Length / chunked /
+# gzip——那正是它的模块文档里写明拒绝去做的事，也是请求走私那一类问题的入口。
+# 定制放在 ttyd 这一层，门一行都不用改。
+#
+# 这一份烧死在镜像里，所以它跟 ttyd 的版本绑在一起。ttyd 一升版，这一步会自动
+# 用新的那一页重新拼——**除非它改了 `</body>` 的形状**，那时候下面那个
+# `grep -c dcw-panel` 会当场失败，而不是建出一个没有上传栏的镜像。
+COPY container/upload-panel.html /tmp/upload-panel.html
+RUN set -eu; \
+    mkdir -p /usr/local/share/dcw; \
+    ttyd --interface 127.0.0.1 --port 7999 --writable sh & \
+    ttyd_pid=$!; \
+    ok=0; \
+    for _ in $(seq 1 50); do \
+      if node -e 'fetch("http://127.0.0.1:7999/").then(()=>process.exit(0),()=>process.exit(1))'; then ok=1; break; fi; \
+      sleep 0.2; \
+    done; \
+    [ "$ok" = 1 ] || { echo "ttyd 没起来，取不到它那一页" >&2; exit 1; }; \
+    node -e ' \
+      const fs = require("fs"); \
+      fetch("http://127.0.0.1:7999/").then(r => r.text()).then(html => { \
+        const panel = fs.readFileSync("/tmp/upload-panel.html", "utf8"); \
+        const at = html.lastIndexOf("</body>"); \
+        if (at < 0) { console.error("ttyd 那一页里没有 </body>，形状变了"); process.exit(1); } \
+        fs.writeFileSync("/usr/local/share/dcw/index.html", html.slice(0, at) + panel + html.slice(at)); \
+      }).catch(e => { console.error(e); process.exit(1); }); \
+    '; \
+    kill "$ttyd_pid" 2>/dev/null || true; \
+    rm -f /tmp/upload-panel.html; \
+    [ -s /usr/local/share/dcw/index.html ]; \
+    grep -c dcw-panel /usr/local/share/dcw/index.html
 
 # 不以 root 跑：agent 会在项目目录里写文件，root 写出来的东西在绑定挂载那条
 # 路上会变成宿主上删不掉的。uid 固定 1000，绑定挂载时好对。

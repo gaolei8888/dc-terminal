@@ -1,0 +1,260 @@
+<!--
+  agent 窗口旁边那条上传栏。
+
+  这段东西**在构建时被拼进 ttyd 自己那份 index.html 的 </body> 之前**，
+  然后用 `ttyd -I` 让它发这一份（见 Dockerfile 里 `dcw-index` 那一步）。
+
+  为什么是这个位置，而不是让那道门去改写 ttyd 的响应：`gate.rs` 的立身之本
+  是「不重写 HTTP，只决定放不放行」——没带对钥匙就 401，带对了就退化成一根
+  字节管道，中间不解析任何东西。为了一个上传按钮让它开始解析响应
+  （Content-Length / chunked / gzip）就是把学生容器和公网之间唯一那层东西的
+  可审计性拿去换 UX。定制发生在 ttyd 这一层，门一行都不用改。
+
+  ttyd 那一页的结构非常简单，实测过（2026-09-10，1.7.7）：
+
+      body{margin:0;height:100%;overflow:hidden}
+        div#terminal-container{height:100%;width:auto}
+          div.terminal.xterm
+
+  所以这里做的事就是：body 改成 flex 行，终端占剩余空间，我们这条栏在右边。
+  折叠/展开之后补一个 resize 事件，xterm 的 fit 会自己重新贴合。
+
+  **文案硬编码在这里，这是一处有意的例外。** 仓库的规矩是「决定用户看到什么
+  字的地方只有一个」（`web/strings.rs` 顶上那条），而这一页是构建进容器镜像
+  的，跑的时候 dct 的 i18n 够不着它。折中办法是把所有字集中在下面 `S` 这一个
+  对象里：真要出英文班的时候，改的还是一个地方。
+-->
+<style>
+  body { display: flex; }
+  #terminal-container { flex: 1 1 auto; min-width: 0; }
+
+  #dcw-panel {
+    flex: 0 0 260px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    box-sizing: border-box;
+    padding: 12px;
+    background: #16181d;
+    color: #c8ccd4;
+    border-left: 1px solid #2b2f38;
+    font: 13px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+    overflow-y: auto;
+  }
+  #dcw-panel.dcw-collapsed { flex-basis: 34px; padding: 8px 6px; }
+  #dcw-panel.dcw-collapsed > :not(.dcw-toggle) { display: none; }
+
+  .dcw-toggle {
+    align-self: flex-end;
+    cursor: pointer;
+    border: 0;
+    background: transparent;
+    color: #6f7684;
+    font: inherit;
+    padding: 2px 6px;
+  }
+  .dcw-toggle:hover { color: #c8ccd4; }
+
+  .dcw-title { font-weight: 600; color: #e6e9ef; }
+  .dcw-note { color: #767d8b; font-size: 12px; }
+  .dcw-note code {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    color: #9aa3b2;
+  }
+
+  #dcw-drop {
+    border: 1px dashed #3b414d;
+    border-radius: 6px;
+    padding: 18px 10px;
+    text-align: center;
+    cursor: pointer;
+    color: #8b93a1;
+  }
+  #dcw-drop:hover, #dcw-drop.dcw-over { border-color: #5b8dd6; color: #c8ccd4; }
+
+  #dcw-list { display: flex; flex-direction: column; gap: 8px; }
+  .dcw-item { font-size: 12px; }
+  .dcw-item .dcw-name {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #c8ccd4;
+  }
+  .dcw-bar { height: 3px; background: #2b2f38; border-radius: 2px; margin-top: 4px; }
+  .dcw-bar > i { display: block; height: 100%; width: 0; background: #5b8dd6; border-radius: 2px; }
+  .dcw-ok  { color: #7fb069; }
+  .dcw-err { color: #d97070; }
+
+  /* 拖到窗口任何地方都算——包括终端上面。整页盖一层提示，
+     不然学生会以为必须精确瞄准右边那个框。 */
+  #dcw-veil {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(20, 22, 27, 0.82);
+    color: #e6e9ef;
+    font: 600 18px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+    pointer-events: none;
+  }
+  #dcw-veil.dcw-on { display: flex; }
+</style>
+
+<aside id="dcw-panel">
+  <button class="dcw-toggle" type="button" title="折叠 / 展开">⟩</button>
+  <div class="dcw-title">上传文件</div>
+  <div class="dcw-note">拖到窗口任何地方都行。文件会落在 <code>uploads/</code>。</div>
+  <div id="dcw-drop">把文件拖进来<br><span class="dcw-note">或点这里选择</span></div>
+  <input id="dcw-file" type="file" multiple hidden>
+  <div id="dcw-list"></div>
+</aside>
+<div id="dcw-veil">松手就传到 uploads/</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // 所有会被人看见的字，集中在这里。见文件顶上那段说明。
+  var S = {
+    collapsed: '⟨',
+    expanded: '⟩',
+    done: '已放进 uploads/',
+    tooBig: '太大了，单个文件上限 64 MB',
+    noName: '这个文件名不能用（不能带斜杠、不能以点开头）',
+    noLength: '浏览器没说文件多大，传不了',
+    failed: '没传上去',
+    broke: '连接断了，没传完',
+    // 半截文件比没有文件更坏，所以服务端不会留下它——这句是说给用户听的。
+    retry: '重试一次试试'
+  };
+
+  var UPLOAD_URL = '/_dct/upload?name=';
+  var panel = document.getElementById('dcw-panel');
+  var list = document.getElementById('dcw-list');
+  var drop = document.getElementById('dcw-drop');
+  var picker = document.getElementById('dcw-file');
+  var veil = document.getElementById('dcw-veil');
+  var toggle = panel.querySelector('.dcw-toggle');
+
+  // ---- 折叠 -------------------------------------------------------------
+  // 记住选择：这是每个人自己的偏好，存在他自己的浏览器里就够了。读写都包在
+  // try 里——无痕窗口、禁了站点数据的浏览器上，取存储本身就会抛。
+  function setCollapsed(on) {
+    panel.classList.toggle('dcw-collapsed', on);
+    toggle.textContent = on ? S.collapsed : S.expanded;
+    try { localStorage.setItem('dcw-collapsed', on ? '1' : '0'); } catch (e) {}
+    // xterm 的 fit 挂在 window 的 resize 上。宽度是我们改的，浏览器不会替
+    // 我们发这个事件——不补一下，终端就还按旧宽度画，右边空一条。
+    window.dispatchEvent(new Event('resize'));
+  }
+  var startCollapsed = false;
+  try { startCollapsed = localStorage.getItem('dcw-collapsed') === '1'; } catch (e) {}
+  setCollapsed(startCollapsed);
+  toggle.addEventListener('click', function () {
+    setCollapsed(!panel.classList.contains('dcw-collapsed'));
+  });
+
+  // ---- 一条上传的进度行 --------------------------------------------------
+  function row(name) {
+    var el = document.createElement('div');
+    el.className = 'dcw-item';
+    var n = document.createElement('span');
+    n.className = 'dcw-name';
+    n.textContent = name;          // textContent，不是 innerHTML：文件名来自用户
+    var bar = document.createElement('div');
+    bar.className = 'dcw-bar';
+    var fill = document.createElement('i');
+    bar.appendChild(fill);
+    var msg = document.createElement('span');
+    msg.className = 'dcw-note';
+    el.appendChild(n);
+    el.appendChild(bar);
+    el.appendChild(msg);
+    list.insertBefore(el, list.firstChild);
+    return {
+      progress: function (f) { fill.style.width = Math.round(f * 100) + '%'; },
+      ok: function (text) { bar.remove(); msg.className = 'dcw-ok'; msg.textContent = text; },
+      fail: function (text) { bar.remove(); msg.className = 'dcw-err'; msg.textContent = text; }
+    };
+  }
+
+  // 服务端的状态码翻成人话。**不把状态码本身给学生看**——「413」对他没有
+  // 任何意义，「太大了，上限 64 MB」才是他能据此行动的东西。
+  function reason(status) {
+    if (status === 413) return S.tooBig;
+    if (status === 400) return S.noName;
+    if (status === 411) return S.noLength;
+    return S.failed;
+  }
+
+  function send(file) {
+    var r = row(file.name);
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', UPLOAD_URL + encodeURIComponent(file.name));
+    xhr.upload.addEventListener('progress', function (e) {
+      if (e.lengthComputable) r.progress(e.loaded / e.total);
+    });
+    xhr.addEventListener('load', function () {
+      if (xhr.status === 201) r.ok(S.done);
+      else r.fail(reason(xhr.status));
+    });
+    // 断线跟「服务端拒绝」要分开说：一个是重试有用，一个是重试没用。
+    xhr.addEventListener('error', function () { r.fail(S.broke + ' · ' + S.retry); });
+    xhr.addEventListener('abort', function () { r.fail(S.broke); });
+    xhr.send(file);
+  }
+
+  function sendAll(files) {
+    for (var i = 0; i < files.length; i++) send(files[i]);
+  }
+
+  // ---- 选文件 ------------------------------------------------------------
+  drop.addEventListener('click', function () { picker.click(); });
+  picker.addEventListener('change', function () {
+    sendAll(picker.files);
+    picker.value = '';   // 清掉，否则同一个文件选第二次不触发 change
+  });
+
+  // ---- 拖放 --------------------------------------------------------------
+  // 挂在 window 上，**整页都是拖放区**：学生的直觉是把文件丢到终端上，
+  // 而不是先找到右边那个框。
+  //
+  // dragenter/dragleave 会在子元素之间来回冒泡，光靠它们那层遮罩会闪。
+  // 用一个计数器记「现在还在几层里面」，归零才收——这是这类遮罩的通行做法。
+  var depth = 0;
+  function hasFiles(e) {
+    var t = e.dataTransfer;
+    if (!t || !t.types) return false;
+    for (var i = 0; i < t.types.length; i++) if (t.types[i] === 'Files') return true;
+    return false;
+  }
+  window.addEventListener('dragenter', function (e) {
+    if (!hasFiles(e)) return;
+    depth++;
+    veil.classList.add('dcw-on');
+  });
+  window.addEventListener('dragover', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();                    // 不拦的话浏览器会直接打开这个文件
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  window.addEventListener('dragleave', function (e) {
+    if (!hasFiles(e)) return;
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) veil.classList.remove('dcw-on');
+  });
+  window.addEventListener('drop', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    veil.classList.remove('dcw-on');
+    sendAll(e.dataTransfer.files);
+  });
+  drop.addEventListener('dragenter', function () { drop.classList.add('dcw-over'); });
+  drop.addEventListener('dragleave', function () { drop.classList.remove('dcw-over'); });
+  drop.addEventListener('drop', function () { drop.classList.remove('dcw-over'); });
+})();
+</script>

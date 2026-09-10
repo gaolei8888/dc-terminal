@@ -84,6 +84,10 @@ done
 #   跑」，弹一句暗示「你要丢东西了」等于当面拆自己的台。
 # `-m 8`：**这不是一道门**（门是下面那个进程）。它挡的是「页面卡了就狂刷新」
 #   ——每刷一次就是一个新的 TUI 进程，不封顶的话一个人能把自己那 2 GB 刷满。
+# `--index` 指的是构建时拼好的那一页：ttyd 自己的前端，加上右边那条上传栏
+# （Dockerfile 里 `upload-panel.html` 那一步）。**上传本身由 `dct gate` 接**，
+# ttyd 只是把那段界面发出去——它对上传这件事一无所知。
+#
 # `-T xterm-256color` 是 ttyd 的默认值，写出来是因为它跟 Dockerfile 里那个
 #   `ENV TERM` 必须是同一个值：守护进程从 ENV 拿 TERM，这条连接从 ttyd 拿，
 #   两处报的不是一回事的话，会话里的画面和界面就对不上。
@@ -103,6 +107,7 @@ ttyd \
   --max-clients 8 \
   --terminal-type xterm-256color \
   --client-option disableLeaveAlert=true \
+  --index /usr/local/share/dcw/index.html \
   dct &
 ttyd_pid=$!
 

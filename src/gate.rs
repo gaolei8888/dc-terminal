@@ -52,10 +52,24 @@
 //! 一根字节管道，我们不再解析里面的东西。这是有意的：要每个请求都查，就得
 //! 完整地解析 HTTP 的消息边界（`Content-Length`、chunked、pipelining），
 //! 而那正是 `web/mod.rs` 顶上「不引框架、把支持的子集写清楚」拒绝去做的事。
-//! 一根不复用、不解析、不回收的管道没有请求走私那一类问题——走私要的是
-//! 前后端对消息边界看法不一致**并且连接被复用**，这两条我们都不占。
-//! 代价诚实地说：拿到过钥匙的人可以在同一条连接上继续发请求。而他本来
-//! 就有钥匙。
+//!
+//! **这条成立的前提是「一条连接属于一个人」，而这个前提不是自动成立的。**
+//! 浏览器直连时它成立。但一旦前面架了反向代理，代理默认会**复用**到上游的
+//! 连接：A 用钥匙授权出来的那条管道，会被拿去送 B 不带钥匙的请求，整道门
+//! 就这样被绕过——**这不是假想，2026-09-09 在线上实测到了**：全新连接不带
+//! 钥匙是 401，但只要有一个带钥匙的请求先过，之后不带钥匙的全是 200。
+//!
+//! 所以部署侧必须关掉到这道门的连接复用（Caddy 里是 `reverse_proxy` 的
+//! `transport http { keepalive off }`，理由写在 `dc_deploy/dc-workspace/dcw.sh`
+//! 生成配置那一段）。关掉之后每个请求都是一条新连接，门就每个请求都查一次。
+//!
+//! 换句话说：**这里省下的 HTTP 解析，代价记在部署配置上了。** 谁把这道门
+//! 架到一个会复用连接的东西后面，谁就把它关掉了。这一条不能只靠代码保证，
+//! 只能靠这段话和那份部署配置里的注释一起钉住。
+//!
+//! 走私那一类问题倒是真的不成立：走私要的是前后端对消息边界看法不一致，
+//! 而我们压根不解析边界。上传端点也不破这一条——它由门自己终结，处理完
+//! 就断，那条连接上不会有第二个请求。
 //!
 //! **二、这道门不做加密。** 明文 HTTP 上，cookie 里那把钥匙每个请求都在线上
 //! 裸奔。所以它前面必须有 TLS 才能给真实用户用——那是部署方的事（反代 +
@@ -64,6 +78,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +98,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 同时在处理的连接数上限。一个浏览器标签大约占两条（页面 + WebSocket），
 /// 所以这个数字不是「几个人」，是「几条连接」。超了立刻回 503 并关掉。
 const MAX_INFLIGHT: usize = 64;
+
+/// 上传端点的路径。`_dct` 这个前缀是给上游让路的：ttyd 现在用 `/`、`/ws`、
+/// `/token`，将来它加了新路径也不会跟我们撞。
+const UPLOAD_PATH: &str = "/_dct/upload";
+
+/// 单个文件的上限。**这不是性能调优，是磁盘。** 门后面是学生的容器，而
+/// 三十个容器共享同一块盘：没有上限的话，一个人就能把整台机器写满，
+/// 连累其余二十九个人和机器上别的东西。
+const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 读 body 的超时。握手那 10 秒在这里不够用：64 MB 走一条跨洋的家用上行
+/// 要几分钟，而中途被踢掉的现象是「传到一半没了」，最难跟学生解释的那种。
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 这道门自己的 cookie 名。
 ///
@@ -154,7 +182,13 @@ impl Gate {
 /// 测试绑 `127.0.0.1:0`，容器里绑 `0.0.0.0:<DCW_PORT>`（前面是宿主的端口
 /// 映射和反代）。把这个选择留在外面，测试就不会顺手把一个真的对外开放的
 /// 端口带起来。
-pub fn serve(listener: TcpListener, token: String, upstream: SocketAddr, lang: Lang) -> Gate {
+pub fn serve(
+    listener: TcpListener,
+    token: String,
+    upstream: SocketAddr,
+    lang: Lang,
+    upload_dir: PathBuf,
+) -> Gate {
     let addr = listener.local_addr().expect("监听器必须已经绑好");
     let stopping = Arc::new(AtomicBool::new(false));
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -177,13 +211,14 @@ pub fn serve(listener: TcpListener, token: String, upstream: SocketAddr, lang: L
                 }
 
                 let token = token.clone();
+                let upload_dir = upload_dir.clone();
                 let inflight = Arc::clone(&inflight);
                 inflight.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
                     // 一条连接上的 panic 只能毁掉这条连接：这个进程后面还
                     // 连着别人的会话。同 `web::serve`。
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_conn(stream, &token, upstream, lang);
+                        handle_conn(stream, &token, upstream, lang, &upload_dir);
                     }));
                     inflight.fetch_sub(1, Ordering::SeqCst);
                 });
@@ -199,7 +234,13 @@ pub fn serve(listener: TcpListener, token: String, upstream: SocketAddr, lang: L
     }
 }
 
-fn handle_conn(mut down: TcpStream, token: &str, upstream: SocketAddr, lang: Lang) {
+fn handle_conn(
+    mut down: TcpStream,
+    token: &str,
+    upstream: SocketAddr,
+    lang: Lang,
+    upload_dir: &Path,
+) {
     let _ = down.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = down.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
@@ -221,6 +262,18 @@ fn handle_conn(mut down: TcpStream, token: &str, upstream: SocketAddr, lang: Lan
         } else {
             let _ = write_status(&mut down, 401);
         }
+        return;
+    }
+
+    // 上传由这道门**自己终结**：读完 body、写完文件、答一句、断开，
+    // 不连上游、不进管道。
+    //
+    // 放在这里（认证之后、连上游之前）有两个后果，都是要的：一是没钥匙
+    // 的人连「有没有这个端点」都问不出来——上面那个 401 已经把他挡住了；
+    // 二是这条连接从头到尾只承载一个请求，所以仍然没有「跨请求的消息
+    // 边界」这回事，模块头里那条推理在这条路上照样成立。
+    if head.method == "POST" && head.path == UPLOAD_PATH {
+        let _ = handle_upload(&mut down, &head, upload_dir);
         return;
     }
 
@@ -272,6 +325,14 @@ struct Head {
     method: String,
     path: String,
     cookie: Option<String>,
+    /// `?` 后面那一截，原样不解码。上传端点用它取文件名。
+    query: Option<String>,
+    /// 只在**这道门自己要读 body** 时才用得上（上传端点）。转发那条路
+    /// 上它一眼都不看——body 归管道，边界归上游。
+    content_length: Option<u64>,
+    /// 读头时被 `BufReader` 顺手预读进来的那几个 body 字节。转发路径靠
+    /// `raw` 把它们原样吐出去，上传路径要把它们当成 body 的开头。
+    body_prefix: Vec<u8>,
 }
 
 /// 逐行读到空行为止，同时盯着总长度。**只读头，不读 body**：body 属于
@@ -316,16 +377,24 @@ fn read_head(stream: &mut TcpStream) -> Result<Head, u16> {
     let target = parts.next().ok_or(400u16)?;
     // 请求行必须是三段。两段的是 HTTP/0.9，那是另一种协议，别猜。
     parts.next().ok_or(400u16)?;
-    let path = match target.split_once('?') {
-        Some((p, _)) => p.to_string(),
-        None => target.to_string(),
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (target.to_string(), None),
     };
 
     let mut cookie = None;
+    let mut content_length = None;
     for l in lines {
         let Some((name, value)) = l.split_once(':') else {
             continue;
         };
+        // **多解一个 `Content-Length` 不违反上面那条「只解三样」。**
+        // 那条规矩防的是「跟上游对同一个字段有两套理解」——而这个字段只在
+        // 这道门自己终结的请求上用（上传端点，处理完就断，不进管道）。
+        // 转发那条路一个字节都不看它，上游怎么理解还是上游的事。
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse::<u64>().ok();
+        }
         if name.trim().eq_ignore_ascii_case("cookie") {
             // 多条 Cookie 头是合法的，全都要看：只认第一条的话，浏览器把
             // 顺序换一下这道门就打不开了。
@@ -342,8 +411,200 @@ fn read_head(stream: &mut TcpStream) -> Result<Head, u16> {
         method,
         path,
         cookie,
+        query,
+        content_length,
+        body_prefix: buffered,
     })
 }
+
+/// 接住一个上传：读完 body、落盘、答一句、断开。
+///
+/// **这道门在这里第一次真的读 body**，所以这一段的每一条限制都是必需的，
+/// 不是防御性编程的客套：
+///
+/// - 必须有 `Content-Length`。不接 chunked——接了就要自己实现分块解析，
+///   而那正是模块头拒绝去做的事。没有就 411，明说要什么。
+/// - 有上限（`MAX_UPLOAD_BYTES`），先看声明的长度，再在读的时候按实际
+///   字节数兜一次底：**只信头里的数字是不够的**，客户端可以撒谎。
+/// - 文件名必须是**一段**安全名字，见 `safe_name`。
+/// - 先写临时文件再 `rename`：中途断线不会留下一个「看着像但内容不全」
+///   的文件，而那种文件比没有更坏——学生会拿它去跑。
+fn handle_upload(down: &mut TcpStream, head: &Head, dir: &Path) -> std::io::Result<()> {
+    let Some(name) = head.query.as_deref().and_then(query_name).and_then(safe_name) else {
+        return write_status(down, 400);
+    };
+    let Some(len) = head.content_length else {
+        return write_status(down, 411);
+    };
+    if len > MAX_UPLOAD_BYTES {
+        return write_status(down, 413);
+    }
+
+    if ensure_dir(dir).is_err() {
+        return write_status(down, 500);
+    }
+
+    let _ = down.set_read_timeout(Some(UPLOAD_TIMEOUT));
+    let tmp = dir.join(format!(
+        ".dcw-upload-{}-{}",
+        std::process::id(),
+        UPLOAD_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let written = write_body(down, head, len, &tmp);
+    match written {
+        Ok(()) => {
+            // `rename` 不跟符号链接走：目标是个指向别处的链接时，被换掉的是
+            // 链接本身，不是它指向的那个文件。这正是我们要的。
+            if std::fs::rename(&tmp, dir.join(&name)).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return write_status(down, 500);
+            }
+            write_uploaded(down, &name)
+        }
+        Err(status) => {
+            let _ = std::fs::remove_file(&tmp);
+            write_status(down, status)
+        }
+    }
+}
+
+/// 把 body 写进临时文件。**边读边数**，超了就停——头里那个数字只是声明。
+fn write_body(down: &mut TcpStream, head: &Head, len: u64, tmp: &Path) -> Result<(), u16> {
+    let mut f = std::fs::File::create(tmp).map_err(|_| 500u16)?;
+    let mut left = len;
+
+    let prefix = head.body_prefix.len().min(left as usize);
+    f.write_all(&head.body_prefix[..prefix]).map_err(|_| 500u16)?;
+    left -= prefix as u64;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = buf.len().min(left as usize);
+        let n = down.read(&mut buf[..want]).map_err(|_| 400u16)?;
+        if n == 0 {
+            // 说好的字节没送完就断了。**当成失败**，不当成「传完了」——
+            // 半个文件比没有文件更坏。
+            return Err(400);
+        }
+        f.write_all(&buf[..n]).map_err(|_| 500u16)?;
+        left -= n as u64;
+    }
+    f.flush().map_err(|_| 500u16)
+}
+
+/// 建上传目录，并让它**把自己**从 git 里摘出去。
+///
+/// 那个 `.gitignore` 的内容是 `*` 加 `!.gitignore`：忽略这个目录里的一切，
+/// 但把这条规则本身留在版本里——不留的话，学生一看 `git status` 干干净净，
+/// 会以为上传的东西已经提交了。
+///
+/// 已经存在就不动它：学生可能自己往里放了东西，或者改了那条规则，那都是
+/// 他的目录。**只在我们第一次创建它的时候写那个文件。**
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    // 写不成不算失败：目录建出来了，上传就能用。少一条 git 规则的后果是
+    // 检查点里多了几个文件，比「因为写不了一个说明文件就拒绝上传」轻得多。
+    let _ = std::fs::write(dir.join(".gitignore"), "*\n!.gitignore\n");
+    Ok(())
+}
+
+/// 从查询串里取 `name=`，百分号解码。**不认别的参数**——这个端点只需要
+/// 一个名字，多认一个就多一处要想清楚的输入。
+fn query_name(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("name=") {
+            return percent_decode(v);
+        }
+    }
+    None
+}
+
+/// 百分号解码，顺带把 `+` 还原成空格（浏览器 `encodeURIComponent` 不产生
+/// `+`，但表单编码会，而两种都可能出现在这里）。非法转义直接判废，不猜。
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let h = b.get(i + 1)?;
+                let l = b.get(i + 2)?;
+                let hex = |c: u8| (c as char).to_digit(16);
+                out.push((hex(*h)? * 16 + hex(*l)?) as u8);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// 把一个客户端给的名字变成「能安全地在目标目录里创建」的名字，不行就
+/// `None`。**白名单式判断**：这里不做「把坏字符替换掉」那种修补，因为
+/// 修补之后得到的名字是我们编的，而用户以为是他给的。
+///
+/// 挡住的东西和各自的后果：
+///
+/// - 含 `/` 或 `\`：`a/../../etc/x` 这类，能写到目标目录之外去；
+/// - `.` 和 `..`：`rename` 到它们身上是另一种东西，不是「创建文件」；
+/// - 以 `.` 开头：会跟我们自己的临时文件（`.dcw-upload-…`）混在一起，
+///   而且在 `ls` 里是隐形的——学生传了个文件却看不见；
+/// - 控制字符：能把终端里的 `ls` 输出弄成任意样子（转义序列注入）；
+/// - 超过 255 字节：多数文件系统的单段上限，超了是 `ENAMETOOLONG`。
+fn safe_name(name: String) -> Option<String> {
+    if name.is_empty() || name.len() > 255 {
+        return None;
+    }
+    if name.starts_with('.') {
+        return None;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(name)
+}
+
+/// 传完了那一句。**只回显我们自己清洗过的名字**，不回显任何别的东西——
+/// 这个响应是这道门唯一一个带 body 的成功响应，让它继续什么都不泄露。
+fn write_uploaded(stream: &mut TcpStream, name: &str) -> std::io::Result<()> {
+    let body = format!("{{\"name\":\"{}\"}}", json_escape(name));
+    let head = format!(
+        "HTTP/1.1 201 Created\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// JSON 字符串里必须转义的那几个。名字已经过了 `safe_name`（没有控制字符），
+/// 所以只剩引号和反斜杠——但**转义不是给今天写的**，同 `html_escape` 那条。
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// 临时文件名的序号。同一个进程里可能有好几条上传同时在跑，光靠 pid
+/// 不够——两条撞在同一个临时名上，就是一个文件写着另一条的内容。
+static UPLOAD_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// cookie 里那把钥匙对不对。**只认 cookie，不认查询串**——查询串会进浏览器
 /// 历史和任何中间日志，而这一整条路的设计就是不让钥匙进那些地方。
@@ -551,7 +812,21 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
     if args.bind == "127.0.0.1" || args.bind == "::1" || args.bind == "localhost" {
         eprintln!("只绑了 {addr}（默认）。要让别的机器连得上，加 --bind 0.0.0.0，并且**在前面架一层 TLS**——这道门自己不加密。");
     }
-    let mut gate = serve(listener, token, upstream, lang);
+    // **上传落在工作目录下的 `uploads/`，命令行上没有旋钮。**
+    //
+    // 不给旋钮：「往哪儿写文件」配错一次的后果是往容器里任意位置写，而这条
+    // 链路上没有任何人需要它指向别处。容器里工作目录就是 `/home/dc/work`，
+    // 也正是看板里那个默认项目。
+    //
+    // 为什么是子目录而不是工作目录本身：**工作目录是 dct 的检查点仓库**
+    // （进去就 `git init`，撤销全靠它）。上传落在仓库根上就会被扫进每一次
+    // 检查点——学生拖一个 60 MB 的数据集，之后每个检查点的树里都挂着它。
+    // `uploads/` 里那个自我忽略的 `.gitignore` 把这一整块摘出去，同时**不动
+    // 项目根上的 `.gitignore`**：那是学生的文件，不该替他改。
+    let upload_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("uploads");
+    let mut gate = serve(listener, token, upstream, lang, upload_dir);
     eprintln!("门开在 {}，上游 {upstream}。", gate.addr());
     // accept 线程就是这个进程的全部工作，join 到它自己结束为止。
     //
@@ -633,10 +908,41 @@ mod tests {
     }
 
     fn gate_with(token: &str) -> (Gate, FakeUpstream) {
-        let up = fake_upstream();
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let g = serve(l, token.to_string(), up.addr, Lang::Zh);
+        let (g, up, _dir) = gate_with_dir(token);
+        // 临时目录随 `TempDir` 一起没掉——不碰上传的测试本来就不该依赖它存在。
         (g, up)
+    }
+
+    fn gate_with_dir(token: &str) -> (Gate, FakeUpstream, tempfile::TempDir) {
+        let up = fake_upstream();
+        let dir = tempfile::tempdir().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let g = serve(
+            l,
+            token.to_string(),
+            up.addr,
+            Lang::Zh,
+            dir.path().join("uploads"),
+        );
+        (g, up, dir)
+    }
+
+    /// 发一条带 body 的上传，返回整个响应。
+    fn upload(addr: SocketAddr, name: &str, body: &[u8], cookie: Option<&str>) -> String {
+        let c = cookie
+            .map(|c| format!("Cookie: {c}\r\n"))
+            .unwrap_or_default();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "POST /_dct/upload?name={name} HTTP/1.1\r\nHost: x\r\n{c}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        s.write_all(body).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     /// 发一条请求，返回整个响应（含头）。
@@ -801,7 +1107,8 @@ mod tests {
             l.local_addr().unwrap()
         };
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let g = serve(l, "aaaa".into(), dead, Lang::Zh);
+        let d = tempfile::tempdir().unwrap();
+        let g = serve(l, "aaaa".into(), dead, Lang::Zh, d.path().join("uploads"));
         let r = get(g.addr(), "/x", Some("dct_gate=aaaa"));
         assert!(r.starts_with("HTTP/1.1 502 "), "{r}");
         assert!(r.ends_with("\r\n\r\n"), "502 也不许带 body：{r}");
@@ -877,4 +1184,193 @@ mod tests {
         let v: Vec<String> = ["--port", "abc"].iter().map(|s| s.to_string()).collect();
         assert!(parse_gate_args(&v).unwrap_err().contains("--port"));
     }
+
+    // -----------------------------------------------------------------------
+    // 上传
+    // -----------------------------------------------------------------------
+
+    /// **认证仍然在路由之前。** 上传端点跟别的路径一样：没钥匙就是 401，
+    /// 连「有没有这个端点」都问不出来。
+    #[test]
+    fn uploading_without_the_key_is_the_same_401_as_everything_else() {
+        let (g, _up, _d) = gate_with_dir("aaaa");
+        let r = upload(g.addr(), "a.txt", b"hello", None);
+        assert!(r.starts_with("HTTP/1.1 401 "), "{r}");
+        assert!(r.ends_with("\r\n\r\n"), "401 后面不该跟 body：{r}");
+        g.stop();
+    }
+
+    /// 带对钥匙就能落盘，内容一个字节不差。
+    #[test]
+    fn an_upload_lands_in_the_uploads_dir_byte_for_byte() {
+        let (g, _up, d) = gate_with_dir("aaaa");
+        let body: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        let r = upload(g.addr(), "data.bin", &body, Some("dct_gate=aaaa"));
+        assert!(r.starts_with("HTTP/1.1 201 "), "{r}");
+        let got = std::fs::read(d.path().join("uploads").join("data.bin")).unwrap();
+        assert_eq!(got, body, "落盘的内容跟传上去的不一样");
+        g.stop();
+    }
+
+    /// 上传**不碰上游**：这条连接由门自己终结。上游是死的也照样能传——
+    /// 钉住这一点，免得哪天有人把它改成先连上游再判断。
+    #[test]
+    fn an_upload_never_touches_the_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        // 一个没人监听的地址：连上去必然失败。
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let g = serve(l, "aaaa".into(), dead, Lang::Zh, dir.path().join("uploads"));
+
+        let r = upload(g.addr(), "a.txt", b"hi", Some("dct_gate=aaaa"));
+
+        assert!(r.starts_with("HTTP/1.1 201 "), "上游死了也该能传：{r}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("uploads").join("a.txt")).unwrap(),
+            "hi"
+        );
+        g.stop();
+    }
+
+    /// 目录第一次建出来时带一个自我忽略的 `.gitignore`——工作目录是 dct 的
+    /// 检查点仓库，不摘出去的话学生拖进来的东西会进每一次检查点。
+    #[test]
+    fn the_uploads_dir_excludes_itself_from_the_checkpoint_repo() {
+        let (g, _up, d) = gate_with_dir("aaaa");
+        upload(g.addr(), "a.txt", b"hi", Some("dct_gate=aaaa"));
+        let ignore = std::fs::read_to_string(d.path().join("uploads").join(".gitignore")).unwrap();
+        assert!(ignore.contains('*'), "要忽略这个目录里的一切：{ignore:?}");
+        assert!(
+            ignore.contains("!.gitignore"),
+            "规则本身要留在版本里，否则 git status 干干净净会让人以为已经提交了：{ignore:?}"
+        );
+        g.stop();
+    }
+
+    /// **能写到目录外面去的名字，一个都不许放过。**
+    ///
+    /// 这是这个端点上唯一能出大事的地方：放过一个，就是让任何拿到钥匙的人
+    /// 往容器里任意位置写文件。
+    #[test]
+    fn a_name_that_could_escape_the_directory_is_refused() {
+        let (g, _up, d) = gate_with_dir("aaaa");
+        let bad = [
+            "..%2F..%2Fetc%2Fpasswd",
+            "a%2Fb",
+            "..",
+            ".",
+            ".bashrc",
+            ".dcw-upload-1-0",
+            "",
+            "a%00b",
+            "a%0Ab",
+        ];
+        for name in bad {
+            let r = upload(g.addr(), name, b"x", Some("dct_gate=aaaa"));
+            assert!(
+                r.starts_with("HTTP/1.1 400 "),
+                "名字 {name:?} 应该被拒，实际：{r}"
+            );
+        }
+        let dir = d.path().join("uploads");
+        if dir.is_dir() {
+            let leftovers: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != ".gitignore")
+                .collect();
+            assert!(leftovers.is_empty(), "不该留下任何东西：{leftovers:?}");
+        }
+        assert!(
+            !d.path().join("passwd").exists() && !d.path().join("etc").exists(),
+            "有东西写到 uploads 外面去了"
+        );
+        g.stop();
+    }
+
+    /// 中文名要能用。学生的文件名十有八九是中文的，而 `encodeURIComponent`
+    /// 把它编成一串 `%E4%B8%AD`——解不出来就等于「中文文件传不了」。
+    #[test]
+    fn a_chinese_filename_survives_percent_encoding() {
+        let (g, _up, d) = gate_with_dir("aaaa");
+        let r = upload(g.addr(), "%E4%BD%9C%E4%B8%9A.txt", b"hi", Some("dct_gate=aaaa"));
+        assert!(r.starts_with("HTTP/1.1 201 "), "{r}");
+        assert!(d.path().join("uploads").join("作业.txt").exists());
+        g.stop();
+    }
+
+    /// 没有 `Content-Length` 就 411，不猜。接 chunked 等于自己实现分块解析，
+    /// 那正是模块头拒绝去做的事。
+    #[test]
+    fn an_upload_without_a_length_is_refused_instead_of_guessed() {
+        let (g, _up, _d) = gate_with_dir("aaaa");
+        let r = request(
+            g.addr(),
+            "POST /_dct/upload?name=a.txt HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(r.starts_with("HTTP/1.1 411 "), "{r}");
+        g.stop();
+    }
+
+    /// 声明超过上限的直接 413，**不读 body**——不然一个人就能把磁盘写满，
+    /// 而这块盘是三十个学生共用的。
+    #[test]
+    fn an_oversized_upload_is_refused_by_its_declared_length() {
+        let (g, _up, d) = gate_with_dir("aaaa");
+        let mut s = TcpStream::connect(g.addr()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "POST /_dct/upload?name=big.bin HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nContent-Length: {}\r\n\r\n",
+            MAX_UPLOAD_BYTES + 1
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let r = String::from_utf8_lossy(&out);
+        assert!(r.starts_with("HTTP/1.1 413 "), "{r}");
+        assert!(!d.path().join("uploads").join("big.bin").exists());
+        g.stop();
+    }
+
+    /// 说好的字节没送完就断线，**不许留下半个文件**。半个文件比没有更坏：
+    /// 学生会拿它去跑，然后得到一个跟上传毫无关系的错误。
+    #[test]
+    fn a_truncated_upload_leaves_nothing_behind() {
+        let (g, _up, d) = gate_with_dir("aaaa");
+        let mut s = TcpStream::connect(g.addr()).unwrap();
+        s.write_all(
+            b"POST /_dct/upload?name=half.bin HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nContent-Length: 100\r\n\r\n",
+        )
+        .unwrap();
+        s.write_all(b"only ten b").unwrap();
+        drop(s);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let dir = d.path().join("uploads");
+        assert!(!dir.join("half.bin").exists(), "留下了一个半截文件");
+        let temps: Vec<String> = std::fs::read_dir(&dir)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".dcw-upload-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(temps.is_empty(), "临时文件没清掉：{temps:?}");
+        g.stop();
+    }
+
+    /// `GET /_dct/upload` 不是上传——它跟别的路径一样转给上游。钉住
+    /// 「只有 POST 走这条路」，免得哪天有人顺手让 GET 也进来。
+    #[test]
+    fn only_post_is_the_upload_endpoint() {
+        let (g, up, _d) = gate_with_dir("aaaa");
+        let r = get(g.addr(), "/_dct/upload", Some("dct_gate=aaaa"));
+        assert!(r.starts_with("HTTP/1.1 200 "), "GET 应该照常转给上游：{r}");
+        let seen = String::from_utf8_lossy(&up.seen.lock().unwrap().clone()).into_owned();
+        assert!(seen.contains("/_dct/upload"), "上游没收到这条 GET：{seen}");
+        g.stop();
+    }
+
 }
