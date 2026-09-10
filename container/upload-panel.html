@@ -157,23 +157,40 @@
     setCollapsed(!panel.classList.contains('dcw-collapsed'));
   });
 
-  // **首次加载也要补一次 resize。**
+  // **首次加载要一直补 resize，直到 xterm 的贴合结果不再变。**
   //
-  // 我们这一段是拼在 ttyd 自己那个 script 后面的，谁先跑不由我们决定：
-  // xterm 很可能在上面那段 CSS 生效之前就已经量过一次宽度了。实测
-  // （2026-09-10，s1.dct.tzspace.cn）首次进来终端是 2219px，折叠再展开
-  // 之后变成 2268px——**差的那 49px 约 5 列，是首次那一次量错了**。
+  // 现象（2026-09-10 在 s1.dct.tzspace.cn 上实测）：首次进来终端是 2219px，
+  // 而容器有 2297px；把面板折叠再展开一次，它就变成 2268px 并从此稳住。
+  // 差的那 49px 约 5 列——**首次那一次贴合算少了**，学生看到的是一个莫名
+  // 其妙窄一截的终端，而他不会知道，只会觉得「这个终端有点怪」。
   //
-  // 不补的话，每个学生第一次打开都会拿到一个比可用宽度窄一截的终端，
-  // 而且他不会知道，只会觉得「这个终端有点怪」。
+  // 走过的两条错路，写下来免得有人再走一遍：
   //
-  // 补两次是有意的：`load` 覆盖「资源还没加载完就量了」，那个 300ms 覆盖
-  // 「ttyd 自己是异步挂载的、load 时还没挂上」。多发一次 resize 是无害的
-  // ——fit 算出来一样就什么都不做。
-  window.addEventListener('load', function () {
-    window.dispatchEvent(new Event('resize'));
-  });
-  setTimeout(function () { window.dispatchEvent(new Event('resize')); }, 300);
+  // 1. 以为是「我们的 CSS 比 xterm 的首次贴合晚生效」，于是在 `load` 和
+  //    300ms 各补一次 resize。**没用**——那两个时刻 fit 算出来的仍是 2219。
+  // 2. 以为是 flex 的反馈环（`flex:1 1 auto` 的基准取自内容宽度，而内容
+  //    宽度又由 fit 按容器宽度算）。**也不是**——容器在两种状态下都是
+  //    2297px，变的只有终端本身。
+  //
+  // 真实情况是：正确的结果要过一段时间才算得出来（300ms 时还不行），而
+  // 一旦补上一次晚一点的 resize 就对了，并且此后稳定。既然拿不准那个时间
+  // 点，就不要猜——**补到它不再变为止**。
+  //
+  // 循环自己会停：连续两次量到一样就收工，最多 15 轮。fit 是幂等的，多发
+  // 几次 resize 什么都不会发生，代价只有开头两秒里终端重排一下。
+  (function settleFit() {
+    var last = -1;
+    var stable = 0;
+    var rounds = 0;
+    var timer = setInterval(function () {
+      window.dispatchEvent(new Event('resize'));
+      var el = document.querySelector('.xterm-screen');
+      var w = el ? Math.round(el.getBoundingClientRect().width) : -1;
+      stable = (w === last) ? stable + 1 : 0;
+      last = w;
+      if (++rounds >= 15 || stable >= 2) clearInterval(timer);
+    }, 200);
+  })();
 
   // ---- 一条上传的进度行 --------------------------------------------------
   function row(name) {
