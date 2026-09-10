@@ -613,6 +613,226 @@ pub fn encode_mouse(
 /// 只会把它画的东西挪歪。设了滚动区（DECSTBM）的主屏也会被这一顶挪歪，
 /// 但那是全屏 TUI 的做法，而全屏 TUI 都在备用屏上，上面那一条已经把它们
 /// 挡在外面了。
+/// 宽度变了就按新宽度**重新折行**，而不是让 vt100 把超出去的格子扔掉。
+///
+/// `vt100` 0.16 的 `set_size` 在宽度一变时做两件事（`grid.rs:66-80`）：
+///
+/// 1. 把所有行的 `wrapped` 标记清空 —— 「这一行还没完」的信息就没了；
+/// 2. 逐行 `row.resize(cols)`，变窄时右边超出的格子**直接扔掉**。
+///
+/// 合起来是：一条折了行的长行会被从中间截断，而**屏幕上一点看不出来**——
+/// 剩下的部分照样是一行像模像样的文字。2026-09-09 真出过事：Claude Code
+/// 登录印的那条 450 字符 OAuth URL，在浏览器窗口变窄之后少了 10 个字符，
+/// 拷出来打开只会得到一个含义不明的登录失败，没人猜得到是改过窗口大小。
+///
+/// 做法是把当前这一屏按**逻辑行**（连着 `wrapped` 的若干物理行算一条）重新
+/// 喂一遍：逻辑行之间发一个换行，一条逻辑行内部什么都不发，让它按新宽度自己
+/// 折回去。
+///
+/// **全程不发绝对光标定位**，这是这段代码唯一的关键点。`contents_formatted`
+/// 那种按行发 CUP 的输出在这里是错的：变窄之后逻辑行会变高，后面那些行的
+/// 定位就打在已经被前一条占掉的行上，糊成一团。
+///
+/// 不动的两处：备用屏（归 agent 自己重画，而且没有滚屏历史，重放只会把它画
+/// 的东西挪歪），以及已经滚进历史的行（vt100 的历史保持原宽度，这里够不着，
+/// 所以**已经滚上去的长行仍然是截断的** —— 这是本函数的已知边界）。
+fn reflow_to_width(parser: &mut vt100::Parser, cols: u16) {
+    let (rows, old_cols) = parser.screen().size();
+    if cols == 0 || cols == old_cols || rows == 0 || parser.screen().alternate_screen() {
+        return;
+    }
+
+    let Some(plan) = plan_reflow(parser.screen(), old_cols) else {
+        return; // 整屏是空的，没什么可搬的
+    };
+
+    parser.screen_mut().set_size(rows, cols);
+    parser.process(&plan.bytes);
+
+    // 光标落点自己算。上面那一遍重放结束时光标停在**内容末尾**，而它原来
+    // 未必在那儿（agent 满屏重绘时常把光标停在上方）。
+    if let Some((row, col)) = cursor_after_reflow(parser.screen(), &plan, cols) {
+        parser.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    }
+}
+
+/// 重放计划：要喂进去的字节，加上光标原来落在第几条逻辑行、行内第几个格子。
+struct Reflow {
+    bytes: Vec<u8>,
+    /// 一共几条逻辑行（含滚出去的）。
+    lines: usize,
+    /// 光标所在的逻辑行下标，和它在那条逻辑行里的偏移。
+    cursor: Option<(usize, usize)>,
+}
+
+/// 把这一屏拆成逻辑行，编成一段「不含任何绝对定位」的字节流。
+fn plan_reflow(screen: &vt100::Screen, old_cols: u16) -> Option<Reflow> {
+    let (rows, _) = screen.size();
+    // 底下那一片空行不要 —— 照着发换行会把内容顶出屏幕。
+    let last_used = (0..rows)
+        .rev()
+        .find(|&r| !screen.contents_between(r, 0, r + 1, 0).trim().is_empty())?;
+    let (cur_row, cur_col) = screen.cursor_position();
+
+    // 从干净的一屏、从左上角开始重放。不清的话这一段会接在原内容后面
+    // 写出去，等于把整屏又抄了一遍。`[2J` 在 vt100 里只清行、不往
+    // 滚屏历史里推（`grid.rs:455`），所以历史不会被这一下污染。
+    let mut out: Vec<u8> = b"[m[H[2J".to_vec();
+    let mut sgr = Sgr::default();
+    let mut cursor = None;
+    let mut lines = 0usize;
+    let mut r = 0u16;
+    while r <= last_used {
+        if lines > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        let mut offset = 0usize;
+        loop {
+            let wrapped = screen.row_wrapped(r) && r < last_used;
+            // 折行的中间行是满的，末行要把右边的空白削掉：不削的话那串空格
+            // 到了窄屏上会自己折出几行空行来。
+            let width = if wrapped { old_cols } else { used_width(screen, r, old_cols) };
+            if r == cur_row {
+                cursor = Some((lines, offset + usize::from(cur_col.min(width))));
+            }
+            offset += usize::from(width);
+            write_row_cells(&mut out, screen, r, width, &mut sgr);
+            if wrapped {
+                r += 1;
+            } else {
+                break;
+            }
+        }
+        lines += 1;
+        r += 1;
+    }
+    if sgr != Sgr::default() {
+        out.extend_from_slice(b"\x1b[m");
+    }
+    Some(Reflow { bytes: out, lines, cursor })
+}
+
+/// 这一行右边削掉空白之后还剩几格。
+fn used_width(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
+    (0..cols)
+        .rev()
+        .find(|&c| screen.cell(row, c).is_some_and(vt100::Cell::has_contents))
+        .map_or(0, |c| c + 1)
+}
+
+/// 重放之后光标该停哪儿。`None` = 不用管，自然落点就是对的。
+///
+/// 逻辑行的顺序在重放前后是一样的，只是前面若干条可能已经滚出屏幕，所以
+/// 「原来的第 L 条」对应现在可见的第 `L - (总数 - 可见条数)` 条。
+fn cursor_after_reflow(screen: &vt100::Screen, plan: &Reflow, cols: u16) -> Option<(u16, u16)> {
+    let (line, offset) = plan.cursor?;
+    let (rows, _) = screen.size();
+    let starts: Vec<u16> = logical_line_starts(screen, rows);
+    let scrolled_off = plan.lines.checked_sub(starts.len())?;
+    let start = starts.get(line.checked_sub(scrolled_off)?)?;
+    let row = start.saturating_add((offset / usize::from(cols)) as u16);
+    let col = (offset % usize::from(cols)) as u16;
+    (row < rows).then(|| (row, col.min(cols - 1)))
+}
+
+/// 每条逻辑行在这一屏上是从第几行开始的。
+fn logical_line_starts(screen: &vt100::Screen, rows: u16) -> Vec<u16> {
+    let mut starts = Vec::new();
+    let mut r = 0u16;
+    while r < rows {
+        starts.push(r);
+        while screen.row_wrapped(r) && r + 1 < rows {
+            r += 1;
+        }
+        r += 1;
+    }
+    starts
+}
+
+/// 一行里前 `width` 个格子，带上属性变化。
+fn write_row_cells(out: &mut Vec<u8>, screen: &vt100::Screen, row: u16, width: u16, sgr: &mut Sgr) {
+    let mut c = 0u16;
+    while c < width {
+        let Some(cell) = screen.cell(row, c) else { break };
+        if cell.is_wide_continuation() {
+            c += 1;
+            continue;
+        }
+        let want = Sgr::of(cell);
+        if want != *sgr {
+            want.write(out);
+            *sgr = want;
+        }
+        let text = cell.contents();
+        if text.is_empty() {
+            out.push(b' ');
+        } else {
+            out.extend_from_slice(text.as_bytes());
+        }
+        c += if cell.is_wide() { 2 } else { 1 };
+    }
+}
+
+/// 一个格子的显示属性。**变了就整套重发**（先 `\x1b[m` 再把该开的全开）：
+/// 比逐项算差量长几个字节，但不可能算错，而重排一屏的字节数无关紧要。
+#[derive(Clone, Copy, PartialEq, Default)]
+struct Sgr {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl Sgr {
+    fn of(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    fn write(self, out: &mut Vec<u8>) {
+        let mut p: Vec<String> = vec!["0".into()];
+        if self.bold {
+            p.push("1".into());
+        }
+        if self.dim {
+            p.push("2".into());
+        }
+        if self.italic {
+            p.push("3".into());
+        }
+        if self.underline {
+            p.push("4".into());
+        }
+        if self.inverse {
+            p.push("7".into());
+        }
+        color_params(&mut p, self.fg, false);
+        color_params(&mut p, self.bg, true);
+        out.extend_from_slice(format!("\x1b[{}m", p.join(";")).as_bytes());
+    }
+}
+
+fn color_params(p: &mut Vec<String>, color: vt100::Color, background: bool) {
+    let base = if background { 40 } else { 30 };
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(i @ 0..=7) => p.push((base + u16::from(i)).to_string()),
+        vt100::Color::Idx(i @ 8..=15) => p.push((base + 60 + u16::from(i - 8)).to_string()),
+        vt100::Color::Idx(i) => p.push(format!("{};5;{i}", base + 8)),
+        vt100::Color::Rgb(r, g, b) => p.push(format!("{};2;{r};{g};{b}", base + 8)),
+    }
+}
+
 fn resize_parser(parser: &mut vt100::Parser, rows: u16, cols: u16) {
     // 先回到底部再量。`contents_between` 读的是**翻到哪儿就算哪儿**的那一屏
     // （`visible_rows`），而 `set_size` 动的永远是当前这一屏——用户正翻在
@@ -620,6 +840,10 @@ fn resize_parser(parser: &mut vt100::Parser, rows: u16, cols: u16) {
     // `SessionManager::resize`）事后也要归零（按新宽度重排之后偏移指的
     // 已经不是同一行了），这里提前一步，量的和改的才是同一批行。
     parser.screen_mut().set_scrollback(0);
+    // **先重排宽度，再处理高度。** 顺序不能反：重排是照着「当前这一屏」算
+    // 的，高度那一步会把内容往上顶、把行推进历史，先做的话重排就够不着被
+    // 顶上去的那几行了。反过来则互不干扰——重排只动可见区，不改行数。
+    reflow_to_width(parser, cols);
     if let Some(k) = rows_to_lift(parser.screen(), rows) {
         let (cur_row, cur_col) = parser.screen().cursor_position();
         // `\x1b[{k}S`（SU）只搬内容不动光标，所以光标要自己跟着往上走
@@ -796,6 +1020,120 @@ mod tests {
         let mut empty = vt100::Parser::new(10, 20, SCROLLBACK_ROWS);
         empty.process(b"line0");
         assert_eq!(rows_to_lift(empty.screen(), 8), None, "底下空着不用顶");
+    }
+
+    /// 一条折了行的长行，在终端**变窄**之后不许丢字符。
+    ///
+    /// vt100 0.16 的 `set_size` 变窄就是逐行 `row.resize(cols)`，右边超出的
+    /// 格子直接扔掉；再加上它在宽度一变就把所有 `wrapped` 标记清空
+    /// （`grid.rs:66`），一条折行的长行会被从中间截断，而**屏幕上完全看不
+    /// 出来**——剩下的部分照样是一行正常的文字。
+    #[test]
+    fn narrowing_does_not_eat_the_tail_of_a_wrapped_line() {
+        let mut p = vt100::Parser::new(4, 20, SCROLLBACK_ROWS);
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789";
+        p.process(long.as_bytes());
+
+        resize_parser(&mut p, 4, 15);
+
+        let seen: String = p.screen().contents().lines().collect();
+        assert!(
+            seen.contains(long),
+            "变窄之后丢了字符——屏幕上看不出来，但内容已经不是原来那条了：
+{seen}"
+        );
+    }
+
+    /// 变**宽**也不许把一条折行的长行拆成两条独立的行。
+    ///
+    /// `set_size` 一律清 `wrapped`，于是「这一行还没完」的信息没了：拷出来
+    /// 会在折行处多一个换行，粘到别处就是两截。
+    #[test]
+    fn widening_keeps_a_wrapped_line_in_one_piece() {
+        let mut p = vt100::Parser::new(4, 20, SCROLLBACK_ROWS);
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789";
+        p.process(long.as_bytes());
+
+        resize_parser(&mut p, 4, 40);
+
+        let first = p.screen().contents_between(0, 0, 1, 0);
+        assert_eq!(first.trim_end(), long, "变宽之后应该躺成完整的一行：{first:?}");
+    }
+
+    /// 真实形状：Claude Code 登录印的那条 OAuth URL。450 个字符，在宽屏上
+    /// 折成两行，窗口一窄就少了十来个字符 —— 这是 2026-09-09 真踩到的那次。
+    #[test]
+    fn a_long_url_survives_the_window_getting_narrower() {
+        let url: String = std::iter::repeat_n("abcdefghij", 45).collect();
+        assert_eq!(url.len(), 450);
+        let mut p = vt100::Parser::new(24, 200, SCROLLBACK_ROWS);
+        p.process(url.as_bytes());
+
+        resize_parser(&mut p, 24, 120);
+
+        let seen: String = p.screen().contents().lines().collect();
+        assert!(seen.contains(&url), "450 字符的 URL 被截断了：{} 字符", seen.len());
+    }
+
+    /// 重排是逐格重发的，颜色不能在这一下丢掉 —— 丢了的话学生看到的是
+    /// 「改了一下窗口大小，整屏变成灰的」。
+    #[test]
+    fn colors_survive_the_reflow() {
+        let mut p = vt100::Parser::new(4, 20, SCROLLBACK_ROWS);
+        p.process(b"\x1b[31;1mred\x1b[m plain");
+
+        resize_parser(&mut p, 4, 12);
+
+        let c = p.screen().cell(0, 0).expect("第一个格子");
+        assert_eq!(c.fgcolor(), vt100::Color::Idx(1), "红色没了");
+        assert!(c.bold(), "粗体没了");
+        let plain = p.screen().cell(0, 4).expect("第五个格子");
+        assert_eq!(plain.fgcolor(), vt100::Color::Default, "属性没关回去");
+    }
+
+    /// 光标要落在它原来那个字符上，不是「重放完停在哪算哪」。折行的长行
+    /// 变窄之后行数会变，只按行列硬搬就搬错了。
+    #[test]
+    fn the_cursor_lands_on_the_same_character_it_was_on() {
+        let mut p = vt100::Parser::new(4, 20, SCROLLBACK_ROWS);
+        p.process(b"abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_eq!(p.screen().cursor_position(), (1, 16), "36 个字符，20 列");
+
+        resize_parser(&mut p, 4, 15);
+
+        // 逻辑行内偏移还是 36：36 / 15 = 2 行，36 % 15 = 6 列
+        assert_eq!(p.screen().cursor_position(), (2, 6));
+    }
+
+    /// 备用屏不重排：那边归 agent 自己重画，而且没有滚屏历史，重放只会把
+    /// 它画的东西挪歪。**这是有意留下的边界**，不是漏掉的分支。
+    #[test]
+    fn the_alternate_screen_is_not_reflowed() {
+        let mut p = vt100::Parser::new(4, 20, SCROLLBACK_ROWS);
+        p.process(b"\x1b[?1049h");
+        p.process(b"abcdefghijklmnopqrstuvwxyz0123456789");
+
+        resize_parser(&mut p, 4, 15);
+
+        let first = p.screen().contents_between(0, 0, 1, 0);
+        assert_eq!(first.trim_end().len(), 15, "备用屏应该原样交给 set_size 去截");
+    }
+
+    /// 底下那一片空行不许被当成内容发出去 —— 照着发换行会把真正的内容
+    /// 顶出屏幕，变成「改了下窗口，上面的东西全没了」。
+    #[test]
+    fn the_blank_rows_below_the_content_do_not_push_it_off_the_screen() {
+        let mut p = vt100::Parser::new(10, 20, SCROLLBACK_ROWS);
+        p.process(b"first line");
+
+        resize_parser(&mut p, 10, 12);
+
+        assert!(
+            p.screen().contents().contains("first line"),
+            "内容被顶走了：{:?}",
+            p.screen().contents()
+        );
+        assert_eq!(p.screen().scrollback(), 0);
     }
 
     /// 用户翻在半空中的时候改尺寸，锚必须量当前这一屏——`contents_between`

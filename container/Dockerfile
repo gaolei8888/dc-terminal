@@ -228,10 +228,15 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # 就退回系统 PATH——而 `command_exists` 查的正是 PATH。所以 dct 一行不用改
 # 就认得这里装的东西。
 #
-# 两个：`@qwen-code/qwen-code` 是 DC（默认那个）要的，
-# `@anthropic-ai/claude-code` 是 claude profile 要的。
+# 三个，对应三个 profile：`@qwen-code/qwen-code` 是 DC（默认那个）要的，
+# `@anthropic-ai/claude-code` 是 claude 要的，`@openai/codex` 是 codex 要的。
+#
+# **codex 必须预装在镜像里，不能指望学生自己 `dct install`。** 两个理由：
+# 一、训练营明确要求学生用 Claude 或 Codex，装不上等于这门课上不了；
+# 二、容器里的全局包是 root 装的，运行身份却是 `dc`，学生跑 `dct install`
+#    会撞 npm EACCES —— 那个坑还没修，别让三十个人一起踩。
 RUN npm config set registry "$NPM_REGISTRY" \
- && npm i -g @qwen-code/qwen-code @anthropic-ai/claude-code \
+ && npm i -g @qwen-code/qwen-code @anthropic-ai/claude-code @openai/codex \
  && npm cache clean --force
 
 # **权限位写在 COPY 上，不用事后 `RUN chmod`。** 两件事：

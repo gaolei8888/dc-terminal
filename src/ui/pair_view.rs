@@ -1237,7 +1237,6 @@ mod tests {
 
     /// 过期的两种理由文案不一样：能重试的说按 r，不能的说去用网关自己
     /// 给的那句话（比如去重新生成）。
-    #[test]
     /// 浏览器弹出来了和没弹出来，标题不能是同一句。
     ///
     /// 没弹出来还说「在刚打开的页面里」，说的是一件没发生过的事，而纠正只在
@@ -1257,6 +1256,8 @@ mod tests {
         }
     }
 
+    /// 两种过期（能重试 / 不能）必须是两句话。
+    #[test]
     fn the_two_expiries_do_not_share_one_sentence() {
         let a = phase_expired(true, String::new());
         let b = phase_expired(false, "请点「重新生成」".into());
