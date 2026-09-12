@@ -11,6 +11,10 @@ const here = fileURLToPath(new URL('.', import.meta.url));
 const json = (res, status, value) => { const body = JSON.stringify(value); res.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'}); res.end(body); };
 const html = (res, body) => { res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "frame-ancestors 'self'"}); res.end(body); };
 const fail = (status, message) => Object.assign(new Error(message), {status});
+// 一场直播最多几路。**跟 dct 那边的 `dct_link::live::MAX_LANES` 是同一个数**，
+// 超了守护进程会拒，而那时候老师已经点下去了——在这儿先截断，他看到的是
+// 「播了前四路」而不是一句拒绝。
+const LIVE_MAX_LANES = 4;
 const js = value => JSON.stringify(value).replaceAll('<', '\\u003c');
 async function body(req) {
   if (!String(req.headers['content-type'] || '').startsWith('application/json')) throw fail(400, '请求格式无效');
@@ -96,11 +100,39 @@ export class Classroom {
     if (!this.sessions.has(key)) this.sessions.set(key, {key, role: 'student', student: w.id, generation: w.generation, expires: Date.now() + 7 * 86400000});
     return this.sessions.get(key);
   }
-  safeRow(w, status = {}) { return {id: w.id, name: w.name, shared: !!w.shared, status: w.disabled ? 'disabled' : status.status || 'new', memoryBytes: status.memoryBytes ?? null, diskBytes: status.diskBytes ?? null, connections: [...this.connections].filter(c => c.student === w.id && c.session.role === 'student').length, assisting: !!this.lease(w), classId: w.classId || '', className: w.className || ''}; }
+  safeRow(w, status = {}) { return {id: w.id, name: w.name, shared: !!w.shared, status: w.disabled ? 'disabled' : status.status || 'new', memoryBytes: status.memoryBytes ?? null, diskBytes: status.diskBytes ?? null, connections: [...this.connections].filter(c => c.student === w.id && c.session.role === 'student').length, assisting: !!this.lease(w), live: status.live || null, classId: w.classId || '', className: w.className || ''}; }
+  // 往某个工作区的守护进程发一条直播请求。
+  //
+  // **旧版本的 dct 不认识这几条请求**，它会回一句解析失败——直接把那句话
+  // 抛给老师的话，他看到的是「无法解析请求：unknown variant LiveStart」，
+  // 而他需要知道的其实是「这个工作区的镜像该换了」。
+  async liveRpc(w, request) {
+    const answer = await this.driver.rpc(w, request);
+    if (answer.Error) {
+      const reason = Object.values(answer.Error)[0];
+      if (typeof reason === 'string' && /unknown variant|missing field/.test(reason)) {
+        throw fail(409, '这个工作区的 dct 版本还不支持直播，请先停止它再启动（会换成新镜像）');
+      }
+      throw fail(409, typeof reason === 'string' ? reason : '工作区拒绝了这次操作');
+    }
+    return answer;
+  }
+  // 这个工作区此刻在不在播。没在播、或者问不出来，一律当没在播——
+  // 管理台上「没显示在播」必须意味着「确实没在播」，不能因为一次 RPC 抖动
+  // 就把一场真的直播藏起来……所以问不出来时不是静默 null，是让调用方决定。
+  async liveStatus(w) {
+    const info = (await this.liveRpc(w, 'LiveStatus')).Live;
+    if (!info || !info.id) return null;
+    return {url: info.url, viewers: info.viewers, staged: info.staged, readiness: info.readiness};
+  }
   async state(session) {
     if (session) await this.sso.syncRoster(session);
     const students = []; let running = 0;
-    for (const w of this.store.data.students) { const status = await this.driver.status(w); if (status.status === 'running') running++; if (!session || this.sso.allowed(session, w)) students.push(this.safeRow(w, status)); }
+    for (const w of this.store.data.students) { const status = await this.driver.status(w); if (status.status === 'running') running++;
+      // 在播的话把链接和人数一并带上：老师那一列要一眼看得见「谁在播、
+      // 几个人在看」，为此每行再发一次请求不值得。问不出来就当没在播，
+      // 一次抖动不该让整张表打不开。
+      if (status.status === 'running') { try { status.live = await this.liveStatus(w); } catch { status.live = null; } } if (!session || this.sso.allowed(session, w)) students.push(this.safeRow(w, status)); }
     return {students, capacity: {running, max: this.driver.maxRunning, totalMemory: os.totalmem()}, audit: session?.external ? [] : this.store.data.audit.slice(0, 30), permissions: {manageAccess: !session?.external}};
   }
   async handle(req, res) {
@@ -183,6 +215,9 @@ export class Classroom {
         if (suffix && !/^\/(current|[a-f0-9]{32})\/download$/.test(suffix)) throw fail(404, '项目不存在');
         return this.proxy(req, res, w, '/_dct/projects' + suffix, '', session, true);
       }
+      // 这个工作区在不在播。答复直接来自它自己的守护进程（LiveStatus），
+      // 不在这儿另存一份状态——存了就会跟真相漂，而真相只有那边知道。
+      if (action === 'live') return json(res, 200, {live: await this.liveStatus(w)});
       throw fail(404, '接口不存在');
     }
     if (req.method !== 'POST' || suffix) throw fail(404, '接口不存在');
@@ -198,6 +233,25 @@ export class Classroom {
       if (action === 'end-assist') { this.endAssistance(w.id); this.store.audit('结束协助', w); return json(res, 200, {ok: true}); }
       if (action === 'rotate') { w.token = secret(); w.generation++; this.revoke(w); this.store.audit('重置学生链接', w); return json(res, 200, {url: `${this.origin}/w/${w.id}/#t=${w.token}`}); }
       if (action === 'disable' || action === 'enable') { w.disabled = action === 'disable'; if (w.disabled) this.revoke(w); this.store.audit(w.disabled ? '停用学生链接' : '启用学生链接', w); return json(res, 200, {ok: true}); }
+      if (action === 'live-start' || action === 'live-stop') {
+        if ((await this.driver.status(w)).status !== 'running') throw fail(409, '请先启动工作区');
+        if (action === 'live-stop') {
+          await this.liveRpc(w, 'LiveStop');
+          this.store.audit('停止直播工作区', w);
+          return json(res, 200, {live: null});
+        }
+        const list = await this.liveRpc(w, 'List');
+        // 只上架还活着的会话。已停止的推过去也是一屏死画面，学生看不出
+        // 那是「老师还没开始」还是「这一路本来就没东西」。
+        const alive = (list.Sessions || []).filter(x => x.state !== 'Stopped').slice(0, LIVE_MAX_LANES);
+        if (!alive.length) throw fail(409, '这个工作区里没有在跑的会话，先让它起一个再直播');
+        // 路名会出现在学生那一页上。用学生自己的名字：一屋子人本来就认识
+        // 彼此，而「第 1 路」对看的人毫无信息。会话标题和目录仍然不出去。
+        const names = alive.map((x, i) => alive.length > 1 ? `${w.name} · ${i + 1}` : w.name);
+        await this.liveRpc(w, {LiveStart: {ids: alive.map(x => x.id), names}});
+        this.store.audit('开始直播工作区', w);
+        return json(res, 200, {live: await this.liveStatus(w)});
+      }
       if (action === 'start' || action === 'stop') {
         if (action === 'start' && w.disabled) throw fail(409, '请先启用学生链接');
         try { if (action === 'start') await this.driver.start(w, this.store.data.students); else { await this.driver.stop(w); this.revoke(w); } }

@@ -84,3 +84,76 @@ test('Docker driver validates ownership, isolated volumes and 3 GiB budget', asy
   assert.equal(commands.length, 1);
   await assert.rejects(driver.stop({shared: true, containerName: 'dcw-workspace-1'}), /共享/);
 });
+
+test('强制直播：只上架活着的会话、路名用学生名字、旧版本 dct 给一句人话', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-live-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  let live = null, sent = [], speaksLive = true;
+  const driver = {
+    maxRunning: 2,
+    status: async () => ({status: 'running'}),
+    rpc: async (_, request) => {
+      sent.push(request);
+      if (request === 'List') {
+        return {Sessions: [
+          {id: 1, profile: 'claude', state: 'Idle'},
+          {id: 2, profile: 'shell', state: 'Stopped'},
+          {id: 3, profile: 'codex', state: 'Working'},
+        ]};
+      }
+      if (request === 'LiveStatus') return {Live: live || {id: '', token: '', url: '', staged: [], viewers: 0, readiness: 'Pending'}};
+      if (request === 'LiveStop') { live = null; return {Ok: null}; }
+      if (request.LiveStart) {
+        // 旧版本的守护进程不认识这条请求，回的就是这句。
+        if (!speaksLive) return {Error: {BadRequest: 'unknown variant `LiveStart`'}};
+        live = {id: 'abc', token: 't'.repeat(64), url: 'https://live.example/live/abc#t=' + 't'.repeat(64),
+                staged: request.LiveStart.ids.map((id, i) => [id, request.LiveStart.names[i]]), viewers: 3, readiness: 'Ready'};
+        return {Live: live};
+      }
+      return {Ok: null};
+    },
+  };
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const request = (url, body, cookie) => fetch(origin + url, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: {...(body === undefined ? {} : {'Content-Type': 'application/json'}), ...(cookie ? {Cookie: cookie} : {})},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  try {
+    const admin = (await request('/admin/api/login', {password: 'test-admin'})).headers.get('set-cookie').split(';')[0];
+
+    const started = await request(`/admin/api/students/${ming.id}/live-start`, {}, admin);
+    assert.equal(started.status, 200);
+    const payload = await started.json();
+    assert.equal(payload.live.viewers, 3);
+    assert.match(payload.live.url, /^https:\/\/live\.example\/live\/abc#t=/);
+
+    // 已停止的那一路不该被播出去：学生看到的会是一屏死画面，分不清是
+    // 「老师还没开始」还是「这一路本来就没东西」。
+    const start = sent.find(r => r.LiveStart);
+    assert.deepEqual(start.LiveStart.ids, [1, 3], '上架的不该包含已停止的会话');
+    // 路名用学生的名字——「第 1 路」对看的人毫无信息。
+    assert.deepEqual(start.LiveStart.names, ['小明 · 1', '小明 · 2']);
+
+    // 列表上要看得见谁在播、几个人在看。
+    const state = await (await request('/admin/api/state', undefined, admin)).json();
+    assert.equal(state.students.find(s => s.id === ming.id).live.viewers, 3);
+
+    const stopped = await request(`/admin/api/students/${ming.id}/live-stop`, {}, admin);
+    assert.equal(stopped.status, 200);
+    assert.equal((await stopped.json()).live, null);
+    assert.ok(sent.includes('LiveStop'));
+
+    // 旧镜像的工作区：老师该看到「换镜像」，不是「unknown variant」。
+    speaksLive = false;
+    const refused = await request(`/admin/api/students/${ming.id}/live-start`, {}, admin);
+    assert.equal(refused.status, 409);
+    assert.match((await refused.json()).error, /版本还不支持直播/);
+  } finally {
+    app.server.close();
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
