@@ -344,6 +344,30 @@
   var ended = false;
   var state = "live";
 
+  // ——`wait` 被掐掉时的那条退路——
+  //
+  // 整个带宽模型建立在「中转真的挂 `WAIT_TIMEOUT`（25 秒）」上：画面不变
+  // 的几十秒里 200 个学生一个字节都不传。可 `?wait=1` 是查询串上的一句
+  // 请求，不是合同——中间任何一层代理（学校出口、CDN、企业网关）都可能
+  // 把它吃掉或者自己先超时，那时候 304 会立刻回来，而 `schedule(0)` 就是
+  // 零延迟再发一次：200 个学生一起变成一场不限速的自 DDoS，中转和老师
+  // 的网都会被自己的学生打垮。
+  //
+  // 所以「什么都没变」的那几条路都过一道地板：响应回得比这个还快，就等
+  // 到这个间隔再发下一次。这是 spec 里「普通轮询那条路留着，作为 wait 被
+  // 中间代理掐掉时的退路」的落地——退路要真的是一条能走的路，一秒一次的
+  // 普通轮询扛得住 200 人，零延迟的轮询扛不住任何人。
+  //
+  // 长轮询正常工作时这道地板一次都不会生效（25 秒 > 1.5 秒），所以它不
+  // 拖慢任何东西：画面真变了那一条路径照旧立刻重拉。
+  var MIN_IDLE_GAP_MS = 1500;
+  var sentAt = 0;
+
+  // 「这一轮什么都没变」时该等多久：够慢就立刻再来，快得离谱就补足地板。
+  function scheduleIdle() {
+    schedule(Math.max(0, MIN_IDLE_GAP_MS - (Date.now() - sentAt)));
+  }
+
   var ICON = { live: "●", paused: "◌", ended: "×" };
 
   function render() {
@@ -388,13 +412,17 @@
   function pull() {
     if (ended || inflight || document.visibilityState !== "visible") { return; }
     inflight = true;
+    sentAt = Date.now();
     var headers = { "x-live-token": TOKEN };
     if (etag !== null) { headers["If-None-Match"] = "\"" + etag + "\""; }
     fetch(frameUrl(), { headers: headers, credentials: "omit" })
       .then(function (r) {
         inflight = false;
         if (r.status === 304) {
-          schedule(0);
+          // 画面没变。`wait` 正常工作的话这里已经挂过 25 秒，`scheduleIdle`
+          // 当场就放行；被中间代理掐掉的话它把节奏压回一秒多一次，见上面
+          // `MIN_IDLE_GAP_MS` 那段。
+          scheduleIdle();
           return;
         }
         if (!r.ok) {
@@ -408,13 +436,13 @@
           if (newEtag) { etag = newEtag.replace(/"/g, ""); }
           // 一路还没被老师推过帧：`Live` 里新开的 lane 起手是空 body。
           // 这跟"直播结束了"不是一回事，继续等下一轮就好。
-          if (!text) { schedule(0); return; }
+          if (!text) { scheduleIdle(); return; }
           var frame;
-          try { frame = JSON.parse(text); } catch (e) { schedule(0); return; }
+          try { frame = JSON.parse(text); } catch (e) { scheduleIdle(); return; }
           // `frame` 就是"行的数组"本身（见 `draw` 上面那段注释）。
           // **空数组是合法的一帧**（老师推了一屏空画面），跟上面"空 body
           // ＝还没推过帧"是两回事——数组存在就该照画，哪怕它长度是 0。
-          if (!Array.isArray(frame)) { schedule(0); return; }
+          if (!Array.isArray(frame)) { scheduleIdle(); return; }
           lastChangeAt = Date.now();
           if (state !== "live") { state = "live"; }
           draw(frame);

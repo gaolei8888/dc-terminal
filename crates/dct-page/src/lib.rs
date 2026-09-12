@@ -136,6 +136,42 @@ mod tests {
         );
     }
 
+    /// **`wait` 被中间代理掐掉之后，学生页不许变成一场自 DDoS。**
+    ///
+    /// 整个带宽模型建立在「中转真的挂 25 秒」上。`?wait=1` 只是查询串上的
+    /// 一句请求，不是合同：学校出口、CDN、企业网关都可能把它吃掉或者自己
+    /// 先超时。那时候 304 立刻回来，而「回来就立刻再发一次」就是 200 个
+    /// 学生一起对中转不限速地打——spec 里「普通轮询那条路留着，作为 wait
+    /// 被中间代理掐掉时的退路」说的就是这条路要真的能走。
+    ///
+    /// 这条测试钉的是那道地板还在：页面里有一个非零的最小间隔常量，而且
+    /// 「什么都没变」的那几条路走的是它而不是 `schedule(0)`。
+    #[test]
+    fn a_student_page_that_gets_no_new_frame_backs_off_instead_of_hammering() {
+        let page = super::live_page();
+
+        assert!(
+            page.contains("MIN_IDLE_GAP_MS = 1500"),
+            "那道最小间隔的地板不见了——`wait` 一旦被中间代理掐掉，学生页会\
+             以零延迟反复重拉"
+        );
+        assert!(
+            page.contains("function scheduleIdle()"),
+            "scheduleIdle 不见了，下面那条检查就失去意义了"
+        );
+        assert!(
+            page.contains("scheduleIdle();"),
+            "没有任何地方走那道地板"
+        );
+        // 304 那一支必须走地板。原来的写法是 `schedule(0)`，零延迟。
+        let at = page.find("r.status === 304").expect("304 那一支不见了");
+        let window = &page[at..(at + 400).min(page.len())];
+        assert!(
+            window.contains("scheduleIdle()"),
+            "304 之后仍然是零延迟重拉：{window:?}"
+        );
+    }
+
     /// 两页共用同一份渲染。各留一份的话，迟早只有一页修对了某个渲染 bug。
     #[test]
     fn both_pages_share_one_painter() {
