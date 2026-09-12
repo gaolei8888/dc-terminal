@@ -1086,9 +1086,11 @@ fn live_restage(
     };
     match live.restage(staged) {
         Some(info) => Response::Live(info),
-        None => Response::Error(ErrorCode::BadRequest(
-            "LiveRestage：现在没在播，没有上架名单可改".into(),
-        )),
+        // **报码，不组句。** 早先这里是 `BadRequest("LiveRestage：现在没在
+        // 播……")`，英文界面上会显示 "dct could not understand that request:
+        // LiveRestage：现在没在播……"——正是 `LiveStagingProblem` 这个类型
+        // 要根除的那个形状。
+        None => Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive)),
     }
 }
 
@@ -3051,9 +3053,11 @@ mod tests {
         );
 
         assert!(
-            matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
-            "期待 BadRequest（没在播是「请求跟状态对不上」，不是上架名单的问题），\
-             得到 {resp:?}"
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive))
+            ),
+            "期待 LiveStagingRejected(NotLive)，得到 {resp:?}"
         );
         assert!(live.info().id.is_empty(), "restage 不该凭空开出一场直播");
     }

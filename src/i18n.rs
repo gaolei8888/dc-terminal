@@ -1815,6 +1815,11 @@ pub mod msg {
                         en: format!("at most {max} lanes can be staged, this was {got}"),
                         zh: format!("最多只能上架 {max} 路，这次是 {got} 路"),
                     ),
+                    P::NotLive => t!(
+                        lang,
+                        en: "nothing is live right now, there is no staging to change".to_string(),
+                        zh: "现在没在播，没有上架名单可改".to_string(),
+                    ),
                     P::UnknownSessions(ids) => {
                         let list = ids
                             .iter()
@@ -2701,6 +2706,7 @@ mod tests {
             LiveStagingRejected(crate::proto::LiveStagingProblem::Empty),
             LiveStagingRejected(crate::proto::LiveStagingProblem::TooMany { max: 4, got: 5 }),
             LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![7, 9])),
+            LiveStagingRejected(crate::proto::LiveStagingProblem::NotLive),
             Git("fatal: not a repository".into()),
             SecretsFileBroken {
                 path: "/h/.dct/secrets.toml".into(),

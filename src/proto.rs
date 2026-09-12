@@ -795,6 +795,12 @@ pub enum LiveStagingProblem {
     /// 这几个会话 id 守护进程不认识。**不静默丢弃**：老师上架了三路、屏幕
     /// 上却只显示两路，他不会知道第三路去哪了。
     UnknownSessions(Vec<u32>),
+    /// 现在没在播，没有上架名单可改（只有 `LiveRestage` 会撞上）。
+    ///
+    /// 界面本来就只在 `is_live` 为真时才发那条请求，走到这儿说明两侧对
+    /// 「在不在播」的判断岔了。**要说出来，不能悄悄开一场新的直播**——
+    /// 那正是 `LiveRestage` 这条协议要避免的事。
+    NotLive,
 }
 
 impl std::fmt::Debug for LiveInfo {
