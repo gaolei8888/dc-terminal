@@ -84,7 +84,7 @@ token 打通全部路由的双向通道，发给学生等于把终端的写权�
 链接形如：
 
 ```
-https://link.tzspace.cn/live/7f3a2c91#t=<64 位十六进制>
+https://live.dataclue.cn/live/7f3a2c91#t=<64 位十六进制>
 ```
 
 token 放在 fragment 里：浏览器不会把 `#` 后面的内容发给服务器，它不进任何一层

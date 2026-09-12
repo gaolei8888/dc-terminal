@@ -294,7 +294,13 @@ fn recover<T>(r: std::sync::LockResult<T>) -> T {
 
 /// 环境变量没设的时候，中转用这个地址。**改这个值就是改中转地址唯一
 /// 该改的地方**——见模块头「中转地址从哪来」那一段。
-const DEFAULT_RELAY_BASE: &str = "https://link.tzspace.cn";
+///
+/// 这个值必须指向一个**真的在跑**的中转：装完 dct 的人按 `L` 就该能播，
+/// 而不是先去读一遍文档才知道要设个环境变量。上一版这里写的是一个从来
+/// 没解析过的域名（写 spec 时假设会用的那个），于是默认路径上开播必然
+/// 失败——「默认值指向不存在的东西」是那种每个新用户都会踩、而写代码的
+/// 人永远踩不到的坑。
+const DEFAULT_RELAY_BASE: &str = "https://live.dataclue.cn";
 
 /// 覆盖中转地址用的环境变量名。
 const RELAY_ENV: &str = "DCT_RELAY";

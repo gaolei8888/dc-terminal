@@ -11,11 +11,12 @@ a mess, `u` puts it back.
 
 With nobody to babysit, one person can run several at once: a board, a nine-up
 grid, one glance to see who's working and who's stuck. Close the terminal and
-they keep going. Leave the house and check them from your phone.
+they keep going. Leave the house and check them from your phone. Teaching a class,
+hand out one link and a roomful of people watch — read-only.
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.5](https://img.shields.io/badge/version-0.2.5-444?style=flat-square)
+![version 0.2.16](https://img.shields.io/badge/version-0.2.16-444?style=flat-square)
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
@@ -650,6 +651,9 @@ piece of work, designed but not built: see
 
 Press `L` in a session for the live panel: stage a few sessions, get a link and a
 QR code, hand it out. Students open it in a browser and **can only watch**.
+
+It works out of the box — frames travel through the relay at `live.dataclue.cn`
+(point `DCT_RELAY` at your own to use a different one).
 
 "Only watch" is not a check somewhere in the code — the pipe runs one way. The
 daemon pushes the staged screens to a relay twice a second and students read from

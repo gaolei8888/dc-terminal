@@ -8,11 +8,11 @@ coding agent 要你守着，是因为它每隔几分钟就问一句「这样可�
 自动答应——**底气是每一轮开始之前，它给你的项目拍一张隐藏快照。** 搞砸了按 `u` 退回去。
 
 没人守着，一个人就能同时开好几个：一块看板、一个九宫格，谁在干活谁卡住一眼看得出。
-终端关了它们照样跑，出了门用手机看。
+终端关了它们照样跑，出了门用手机看，上课时发一条链接让一屋子人只读旁观。
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.5](https://img.shields.io/badge/version-0.2.5-444?style=flat-square)
+![version 0.2.16](https://img.shields.io/badge/version-0.2.16-444?style=flat-square)
 
 [English](README.md) · 设计记录在 [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
@@ -547,6 +547,9 @@ WiFi 下**的手机扫一下，就能看到你的会话、每个会话的实时�
 
 上课时想让一屋子人看你的终端，按 `L` 进直播面板：挑几个会话「上架」，拿到一条
 链接和一个二维码，发出去。学生用浏览器打开**只能看，不能操作**。
+
+装完就能用，不用配什么——画面经 `live.dataclue.cn` 那个中转过一道（换自己的
+中转就设 `DCT_RELAY`）。
 
 「只能看」不是某处代码判出来的，是这条管子只有一个方向：守护进程每秒两次把
 上架那几路的画面推到中转，学生只从中转读。**学生那一侧只有 GET，没有任何一条

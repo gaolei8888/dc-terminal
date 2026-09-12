@@ -30,12 +30,26 @@
 而白名单就写在反代上。**不要为了"方便"去掉那道硬闸**：去掉它，这份文档
 里的一切都不再成立。
 
+## 线上现状（2026-09-12）
+
+这份文档不是纸上谈兵，下面这套就是 `live.dataclue.cn` 上真在跑的：
+
+| | |
+| --- | --- |
+| 机器 | `dataclue.cn`（8 vCPU / 8 GB），跟课堂容器同一台 |
+| 中转 | `/usr/local/bin/dct-srv`，systemd 单元 `dct-srv.service`，听 `127.0.0.1:8787` |
+| 源码 | `/opt/dct-relay/src`，在 Docker 里的 `rust:1-slim` 编的（宿主机上没装工具链） |
+| 反代 | Caddy，站点块 `live.dataclue.cn`，只放行 `/live/*` |
+| 验收 | `/link/poll`、`/link/send`、`/link/ask`、`/` 四条全是 404 |
+
+换机器或重装时照下面三节走一遍即可，顺序别改。
+
 ## 一、反向代理：只放行 `/live/*`
 
 线上用的是 Caddy。下面这段是完整可用的最小配置：
 
 ```caddyfile
-live.tzspace.cn {
+live.dataclue.cn {
 	# 只有这一组路径对公网开。写成 handle 而不是 reverse_proxy 一把梭：
 	# handle 之外的一切都落到最后那个兜底 respond 上。
 	handle /live/* {
@@ -81,15 +95,15 @@ live.tzspace.cn {
 
 ```bash
 # 学生页那条路：通（401 或 200 都算通——它到了中转，是中转在答话）
-curl -s -o /dev/null -w '%{http_code}\n' https://live.tzspace.cn/live/deadbeef
+curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/live/deadbeef
 
 # 配对那三条：必须是 404，而且是 Caddy 答的，不是中转答的
-curl -s -o /dev/null -w '%{http_code}\n' https://live.tzspace.cn/link/poll
-curl -s -o /dev/null -w '%{http_code}\n' https://live.tzspace.cn/link/send
-curl -s -o /dev/null -w '%{http_code}\n' https://live.tzspace.cn/link/ask
+curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/link/poll
+curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/link/send
+curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/link/ask
 
 # 根路径（手机端那页）：也必须是 404
-curl -s -o /dev/null -w '%{http_code}\n' https://live.tzspace.cn/
+curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/
 ```
 
 `/link/*` 任意一条不是 404，就是白名单没生效，**立刻把站点停掉再排查**。
@@ -102,7 +116,7 @@ origin——**设错了，老师拿到的链接指向一个打不开的地方**�
 
 ```bash
 # 老师的机器上，写进 shell 配置里（尾部斜杠有没有都行）
-export DCT_RELAY=https://live.tzspace.cn
+export DCT_RELAY=https://live.dataclue.cn
 ```
 
 设完重开 dct 的守护进程（推帧线程在守护进程启动时才起）。验收：在 dct 里
