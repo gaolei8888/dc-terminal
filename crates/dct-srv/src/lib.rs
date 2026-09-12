@@ -378,10 +378,17 @@ async fn live_frame_route(
         .into_response())
 }
 
-/// 老师停播：整场直播连同两把钥匙一起立刻蒸发。
-async fn live_stop_route(State(live): State<Arc<Live>>, Path(id): Path<String>) -> StatusCode {
-    live.stop(&id);
-    StatusCode::NO_CONTENT
+/// 老师停播：整场直播连同两把钥匙一起立刻蒸发。跟推帧同一把 `x-live-push`
+/// 校验——live-id 对每个学生都是已知的，停播要是只认 id，随便一个学生打开
+/// devtools 发一个 `DELETE` 就能掐断全班的课，比伪造画面还省事。
+async fn live_stop_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Rejected> {
+    let secret = header(&headers, "x-live-push").ok_or(LinkError::Unauthorized)?;
+    live.stop(&id, secret)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 手机网页本体。
@@ -1067,6 +1074,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 学生那把钥匙也停不掉直播：拿 viewer token 当 push secret 去
+    /// `DELETE` 必须 401，而且直播还活着——之后还能正常取到帧。live-id
+    /// 对每个学生都是已知的，停播若只认 id，随便一个学生打开 devtools
+    /// 发一个 `DELETE` 就能掐断全班的课，比伪造画面还省事。
+    #[tokio::test]
+    async fn a_viewer_token_cannot_stop_the_live_over_http() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        live.push("abc", &push_secret(), 0, b"hello".to_vec())
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/live/abc")
+                    .header("x-live-push", "t".repeat(64)) // 学生的 token，不是 push secret
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 直播还活着：正常取帧不受影响。
+        let still_there = get_frame(&app, "abc", &"t".repeat(64), None).await;
+        assert_eq!(still_there.status, 200, "假 secret 停播不该成功");
     }
 
     /// 中转仍然不看帧里面是什么——这是 spec 决定一在直播上的那条线。

@@ -158,8 +158,19 @@ impl Live {
             .unwrap_or(0)
     }
 
-    pub fn stop(&self, id: &str) {
-        self.rooms.lock().expect("live 锁").remove(id);
+    /// 老师停播。**跟推帧同一把 push secret**——理由对称：live-id 对每个
+    /// 学生都是已知的，停播要是只认 id，随便一个学生打开 devtools 发一个
+    /// `DELETE` 就能掐断全班的直播，单次请求、确定性拒绝服务，比伪造画面
+    /// 帧还省事。认不出来和这场直播根本不存在回同一句话，理由同 `push`。
+    pub fn stop(&self, id: &str, push_secret: &str) -> Result<(), LinkError> {
+        let mut rooms = self.rooms.lock().expect("live 锁");
+        match rooms.get(id) {
+            Some(room) if same(&room.push_hash, &hash(push_secret)) => {
+                rooms.remove(id);
+                Ok(())
+            }
+            _ => Err(LinkError::Unauthorized),
+        }
     }
 
     pub fn sweep(&self, now: Instant) {
@@ -296,11 +307,25 @@ mod tests {
     #[test]
     fn stopping_takes_it_away_immediately() {
         let live = started();
-        live.stop("abc");
+        live.stop("abc", &"p".repeat(64)).unwrap();
         assert_eq!(
             live.lanes("abc", &"t".repeat(64)).unwrap_err(),
             LinkError::Unauthorized
         );
+    }
+
+    /// 学生那把钥匙停不掉直播。live-id 对每个学生都是已知的，停播若只认
+    /// id，随便一个学生就能掐断全班的课——单次请求的拒绝服务，比伪造画面
+    /// 还省事。
+    #[test]
+    fn a_viewer_token_cannot_stop_the_live() {
+        let live = started();
+        assert_eq!(
+            live.stop("abc", &"t".repeat(64)).unwrap_err(),
+            LinkError::Unauthorized
+        );
+        // 停不掉：直播还活着。
+        assert!(live.lanes("abc", &"t".repeat(64)).is_ok());
     }
 
     /// 在看的人数是挂着的订阅数：订阅两次数到 2，drop 掉一个之后数回 1。
