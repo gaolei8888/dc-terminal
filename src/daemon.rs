@@ -218,10 +218,16 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
 
     // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
-    // `base`（学生链接的 origin）先给空串——算出真实的中转地址是 Task 5
-    // 推帧线程要接的那根线（它本来就得知道中转在哪儿才能把帧 POST 过去），
-    // 这里只负责把这个槽本身的生死和 dispatch 接好。
-    let live: Arc<crate::live::LiveState> = Arc::new(crate::live::LiveState::new(String::new()));
+    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——`DCT_RELAY`
+    // 环境变量优先，没设就用内置默认值。这是临时办法：将来 dct 接上
+    // dc_classroom 登录之后，中转地址该从配对结果里来，见那个函数的文档
+    // 注释。
+    let live: Arc<crate::live::LiveState> =
+        Arc::new(crate::live::LiveState::new(crate::live::relay_base()));
+    // 推帧线程，整个守护进程生命周期只起一条：它自己每一轮去问「现在在播
+    // 哪一场」，没播就什么也不做（见 `live::spawn_pusher` 的文档注释）。
+    // 自己的线程——绝不能让这条线的网络 IO 混进上面那个 200ms 的 tick。
+    crate::live::spawn_pusher(live.clone(), mgr.clone());
 
     for conn in listener.incoming() {
         let conn = conn?;
