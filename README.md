@@ -16,7 +16,7 @@ hand out one link and a roomful of people watch — read-only.
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.16](https://img.shields.io/badge/version-0.2.16-444?style=flat-square)
+![version 0.2.16](https://img.shields.io/badge/version-0.2.17-444?style=flat-square)
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
