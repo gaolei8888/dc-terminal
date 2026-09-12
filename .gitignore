@@ -4,3 +4,7 @@ target/
 dist/
 # 按 container/README.md 换成绑定挂载时，学生的代码会落在这里。
 container/work/
+
+# Python 字节码：跟源文件不同步的时候最难查，而且每台机器的都不一样。
+__pycache__/
+*.pyc
