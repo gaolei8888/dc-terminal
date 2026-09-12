@@ -319,6 +319,34 @@ pub fn relay_base() -> String {
     resolve_relay_base(std::env::var(RELAY_ENV).ok().as_deref())
 }
 
+/// 开播（`POST /live/start`）连着失败几次之后，各等多久再试。
+///
+/// **跟学生页那套退避同构**（`live.html` 的 `BACKOFF_MS`），理由也一样：
+/// 一个必然失败的请求不该以最高频率反复打。
+const START_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+
+/// 开播第 `fails` 次失败之后该等多久。**纯函数，好测。**
+///
+/// # 为什么不能是固定的 `PUSH_INTERVAL`
+///
+/// 中转那一侧对建房有节流（`MAX_STARTS_PER_WINDOW` 次 / `START_RATE_WINDOW`）。
+/// 每 500ms 无退避重试的话，任何「请求真的到了中转但被拒」的情形（典型是
+/// 房间满，回 429）都会在 5 秒内把这个来源的节流额度烧光，此后整整一分钟
+/// 收到的都是「敲太快了」——**老师屏幕上的原因从「中转满了」变成了另一
+/// 回事**。它会自愈，但诊断已经被带偏了。
+///
+/// 这套间隔（1/2/5/15 秒）在一个 60 秒窗口里最多试 7 次，稳稳在 10 次的
+/// 额度之内。
+fn start_backoff(fails: u32) -> Duration {
+    let i = (fails.max(1) as usize - 1).min(START_BACKOFF.len() - 1);
+    START_BACKOFF[i]
+}
+
 /// 该不该推这一帧。**纯函数，好测**——推帧线程剩下的部分全是 IO。
 fn should_push(last: Option<u64>, now: u64, since: Duration) -> bool {
     match last {
@@ -429,6 +457,11 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     // 多少人」，而多一条按 `PUSH_INTERVAL` 跑的请求，200 人的课上就是
     // 中转每 500ms 多挨一次问。`None` = 还没读过，下一轮立刻读一次。
     let mut viewers_at: Option<Instant> = None;
+    // 当前这一场（这一版上架名单）连着开播失败了几次，和它是哪一场。
+    // 换一场（或者换一份上架名单）就从头开始退避——那是一次全新的尝试，
+    // 不该继承上一场的失败次数。
+    let mut start_fails: u32 = 0;
+    let mut last_attempt: Option<(String, u64)> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match live.snapshot() {
@@ -464,18 +497,31 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                 // 原地留着，下一轮 `PUSH_INTERVAL` 自动重试；`LiveInfo`
                 // 那侧的 `readiness` 字段能让老师那块屏幕如实反映这件事，
                 // 而不是无条件显示"已经能用了"。
-                if started.as_ref() != Some(&(room.id.clone(), room.staged_rev)) {
+                let this = (room.id.clone(), room.staged_rev);
+                if started.as_ref() != Some(&this) {
+                    if last_attempt.as_ref() != Some(&this) {
+                        // 换了一场（或者换了上架名单）：这是一次全新的
+                        // 尝试，退避从头开始。
+                        start_fails = 0;
+                        last_attempt = Some(this.clone());
+                    }
                     match start_room(&agent, &base, &room) {
                         Ok(()) => {
                             live.mark_ready(&room.id, room.staged_rev);
-                            started = Some((room.id.clone(), room.staged_rev));
+                            started = Some(this);
+                            start_fails = 0;
                             // 新的一场（或者换了上架名单），旧的哈希对不上号，
                             // 从头判断该不该推。
                             lanes.clear();
                         }
                         Err(reason) => {
                             live.mark_failed(&room.id, room.staged_rev, reason);
-                            nap(stop, PUSH_INTERVAL);
+                            // **退避，不是原速重试。** 每 500ms 打一次会在
+                            // 5 秒内把中转那侧的建房节流额度烧光，此后一
+                            // 整分钟老师看到的原因都变成「敲太快了」而不是
+                            // 真正的那一条。见 `start_backoff`。
+                            start_fails += 1;
+                            nap(stop, start_backoff(start_fails));
                             continue;
                         }
                     }
@@ -526,6 +572,8 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                 }
                 started = None;
                 viewers_at = None;
+                start_fails = 0;
+                last_attempt = None;
             }
         }
         nap(stop, PUSH_INTERVAL);
@@ -932,6 +980,54 @@ mod tests {
     #[test]
     fn a_still_screen_is_still_kept_alive() {
         assert!(should_push(Some(7), 7, KEEPALIVE));
+    }
+
+    /// **开播失败要退避，不能原速重试。**
+    ///
+    /// 中转那一侧对建房有节流。每 `PUSH_INTERVAL`（500ms）打一次的话，任何
+    /// 「请求真的到了中转但被拒」的情形（典型是房间满，回 429）都会在 5 秒
+    /// 内把这个来源的额度烧光，此后整整一分钟老师看到的原因都变成「敲太快
+    /// 了」——会自愈，但诊断被带偏了。
+    #[test]
+    fn a_failed_start_backs_off_instead_of_retrying_at_full_speed() {
+        assert!(
+            start_backoff(1) > PUSH_INTERVAL,
+            "第一次失败之后就该比原速慢"
+        );
+        // 单调不减，而且到顶之后不再涨。
+        for n in 1..8 {
+            assert!(
+                start_backoff(n + 1) >= start_backoff(n),
+                "退避在第 {n} 次之后反而变快了"
+            );
+        }
+        assert_eq!(start_backoff(99), *START_BACKOFF.last().unwrap());
+        // `fails` 理论上不会是 0（调用点先加一再问），但别让它越界 panic。
+        assert_eq!(start_backoff(0), START_BACKOFF[0]);
+    }
+
+    /// **退避必须真的挡得住中转那侧的建房节流。** 一个 `START_RATE_WINDOW`
+    /// 窗口里按这套间隔最多试几次，必须少于 `MAX_STARTS_PER_WINDOW`——
+    /// 这条测试把「两侧的数对不对得上」变成编译进 CI 的事实，而不是靠
+    /// 谁记得改了一个常量之后回来核另一个。
+    #[test]
+    fn the_start_backoff_stays_within_the_relays_rate_limit() {
+        let window = dct_link::live::START_RATE_WINDOW;
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 1u32; // 第一次尝试发生在 t=0
+        loop {
+            elapsed += start_backoff(attempts);
+            if elapsed >= window {
+                break;
+            }
+            attempts += 1;
+        }
+        assert!(
+            attempts < dct_link::live::MAX_STARTS_PER_WINDOW,
+            "一个 {window:?} 窗口里会试 {attempts} 次，而中转的额度是 {} 次——\
+             退避太快，会把额度烧光",
+            dct_link::live::MAX_STARTS_PER_WINDOW
+        );
     }
 
     /// 帧是压过的：一屏终端压完该比原文小得多，不然带宽那三条里最重的一条
