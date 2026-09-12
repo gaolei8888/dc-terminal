@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use dct_srv::{Config, Relay};
+use dct_srv::{Config, Live, Relay};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 
@@ -30,6 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("dct-srv 在 http://{local} 上，只收本机的连接");
-    dct_srv::serve(listener, Arc::new(Relay::new(Config::default()))).await?;
+    dct_srv::serve(
+        listener,
+        Arc::new(Relay::new(Config::default())),
+        Arc::new(Live::new()),
+    )
+    .await?;
     Ok(())
 }
