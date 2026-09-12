@@ -1322,10 +1322,24 @@ pub mod msg {
         )
     }
 
-    /// 中转拒绝了这场直播的原因——`reason` 已经是本地化过的人话（见
-    /// `proto::LiveReadiness::Failed` 的文档注释），这里只负责拼进「开播
-    /// 失败」的前缀。
-    pub fn live_start_failed(lang: Lang, reason: &str) -> String {
+    /// 开播失败的整句话。**原因由这里组，不是守护进程拼好的**——推帧线程
+    /// 手上没有 `Lang`，它只报一个 `LiveFailure` 码（见那个类型上的文档
+    /// 注释：早先那一版在那里直接拼中文，英文界面会显示 "Failed to go
+    /// live: 连不上中转"）。
+    pub fn live_start_failed(lang: Lang, why: &crate::proto::LiveFailure) -> String {
+        use crate::proto::LiveFailure;
+        let reason = match why {
+            LiveFailure::Unreachable => t!(
+                lang,
+                en: "cannot reach the relay, will keep retrying".to_string(),
+                zh: "连不上中转，稍后会自动重试".to_string(),
+            ),
+            LiveFailure::Refused(code) => t!(
+                lang,
+                en: format!("the relay refused it (HTTP {code})"),
+                zh: format!("中转拒绝了这场直播（状态码 {code}）"),
+            ),
+        };
         t!(
             lang,
             en: format!("Failed to go live: {reason}"),
@@ -1781,6 +1795,40 @@ pub mod msg {
                 en: format!("dct could not understand that request: {detail}"),
                 zh: format!("请求解析失败：{detail}"),
             ),
+            // 上架名单为什么不能用。**句子在这里组**——守护进程只报码，
+            // 见 `proto::LiveStagingProblem` 上那段。
+            LiveStagingRejected(p) => {
+                use crate::proto::LiveStagingProblem as P;
+                match p {
+                    P::NamesMismatch => t!(
+                        lang,
+                        en: "the staged sessions and their names do not line up".to_string(),
+                        zh: "上架的会话和名字对不上号".to_string(),
+                    ),
+                    P::Empty => t!(
+                        lang,
+                        en: "nothing is staged — there is nothing to broadcast".to_string(),
+                        zh: "一路都没上架，没有可播的内容".to_string(),
+                    ),
+                    P::TooMany { max, got } => t!(
+                        lang,
+                        en: format!("at most {max} lanes can be staged, this was {got}"),
+                        zh: format!("最多只能上架 {max} 路，这次是 {got} 路"),
+                    ),
+                    P::UnknownSessions(ids) => {
+                        let list = ids
+                            .iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        t!(
+                            lang,
+                            en: format!("session(s) {list} no longer exist and cannot be staged"),
+                            zh: format!("会话 {list} 已经不在了，没法上架"),
+                        )
+                    }
+                }
+            }
             // git 的 stderr 照抄，只翻外面那半句——那是 git 按它自己的
             // `LANG` 输出的，dct 翻不动也不该翻。
             Git(raw) => t!(
@@ -2649,6 +2697,10 @@ mod tests {
             NoCheckpoint,
             NotAnAgentSession,
             BadRequest("bad json".into()),
+            LiveStagingRejected(crate::proto::LiveStagingProblem::NamesMismatch),
+            LiveStagingRejected(crate::proto::LiveStagingProblem::Empty),
+            LiveStagingRejected(crate::proto::LiveStagingProblem::TooMany { max: 4, got: 5 }),
+            LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![7, 9])),
             Git("fatal: not a repository".into()),
             SecretsFileBroken {
                 path: "/h/.dct/secrets.toml".into(),

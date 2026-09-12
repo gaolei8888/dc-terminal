@@ -46,7 +46,9 @@ pub(crate) fn live_banner(info: &LiveInfo, lang: Lang) -> String {
     match &info.readiness {
         LiveReadiness::Ready => base,
         LiveReadiness::Pending => format!("{base} · {}", text(Key::LiveConnectingToRelay, lang)),
-        LiveReadiness::Failed(reason) => format!("{base} · {}", msg::live_start_failed(lang, reason)),
+        // 本地化就在这里发生——`reason` 是一个码，不是句子（见
+        // `LiveReadiness` 的文档注释）。
+        LiveReadiness::Failed(why) => format!("{base} · {}", msg::live_start_failed(lang, why)),
     }
 }
 
@@ -339,6 +341,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::LiveFailure;
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -415,15 +418,34 @@ mod tests {
         );
     }
 
-    /// 同上，`Failed` 那一档要把本地化过的原因带出来。
+    /// 同上，`Failed` 那一档要把原因说出来——**由界面这一侧组句**，
+    /// 守护进程给的只是一个码。
     #[test]
     fn failed_readiness_carries_the_reason() {
         let line = live_banner(
-            &info(vec![], 0, LiveReadiness::Failed("网络不通".into())),
+            &info(vec![], 0, LiveReadiness::Failed(LiveFailure::Unreachable)),
             Lang::Zh,
         );
-        assert!(line.contains("网络不通"), "{line}");
+        assert!(line.contains("中转"), "{line}");
         assert!(line.contains("失败"), "{line}");
+    }
+
+    /// **英文界面上不许冒出中文。**
+    ///
+    /// 早先 `LiveReadiness::Failed` 带的是一句守护进程拼好的中文，于是
+    /// `Lang::En` 下这一行会是 "Failed to go live: 连不上中转，稍后会自动
+    /// 重试"。仓库里那条「英文文案里不许有汉字」的守卫钉的是 `Key` 那张
+    /// 表，一句带参数拼出来的话从它旁边绕了过去——这条测试补的正是那道缝。
+    #[test]
+    fn the_english_banner_never_says_anything_in_chinese() {
+        use crate::i18n::has_han;
+        for why in [LiveFailure::Unreachable, LiveFailure::Refused(413)] {
+            let line = live_banner(&info(vec![], 0, LiveReadiness::Failed(why.clone())), Lang::En);
+            assert!(!has_han(&line), "英文界面上说了中文：{line}");
+        }
+        // `Pending` 那一档走的是 `Key` 表，顺手一起钉住。
+        let pending = live_banner(&info(vec![], 0, LiveReadiness::Pending), Lang::En);
+        assert!(!has_han(&pending), "英文界面上说了中文：{pending}");
     }
 
     /// 没有 fragment 的地址原样返回——剪的是 token，不是地址本身。

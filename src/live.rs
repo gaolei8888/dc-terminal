@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use dct_link::live::{KEEPALIVE, MAX_FRAME_BYTES, PATH_FRAME, PUSH_INTERVAL};
 
-use crate::proto::{LiveInfo, LiveReadiness};
+use crate::proto::{LiveFailure, LiveInfo, LiveReadiness};
 use crate::pty::ScreenSpan;
 use crate::session::SessionManager;
 
@@ -203,9 +203,10 @@ impl LiveState {
         }
     }
 
-    /// 同 [`Self::mark_ready`]，但这次是失败——`reason` 是一句已经本地化
-    /// 过的人话，不是原始错误文本。
-    pub(crate) fn mark_failed(&self, id: &str, rev: u64, reason: String) {
+    /// 同 [`Self::mark_ready`]，但这次是失败——`reason` 是一个**错误码**，
+    /// 不是一句已经成文的话。组句归界面，见 `LiveReadiness` 的文档注释：
+    /// 这条线程手上没有 `Lang`，在这里拼中文就是让英文界面显示中文。
+    pub(crate) fn mark_failed(&self, id: &str, rev: u64, reason: LiveFailure) {
         if let Some(room) = recover(self.room.lock()).as_mut() {
             if room.id == id && room.staged_rev == rev {
                 room.readiness = LiveReadiness::Failed(reason);
@@ -606,13 +607,17 @@ struct StartBody<'a> {
 /// 之前成功过一次**——不然中转认不出这个 id，第一次推帧会被当成「这场
 /// 直播不存在」拒收。
 ///
-/// 回 `Result<(), String>`：失败的原因是一句已经本地化过的人话（连不上
-/// 中转 / 中转拒绝了），要经 `LiveState::mark_failed` 走到 `LiveInfo`
-/// 上给界面看——**绝不能是原始错误文本**，那可能带着 URL 之外的实现
-/// 细节；也**绝不能是 `push_secret`**，这条路径就是为了不让它上协议线。
+/// 回 `Result<(), LiveFailure>`：失败的原因是一个**错误码**，要经
+/// `LiveState::mark_failed` 走到 `LiveInfo` 上给界面看，由界面那一侧组句
+/// （`i18n::msg::live_start_failed`）。**这条线程手上没有 `Lang`**，在这里
+/// 拼一句中文就是让英文界面显示中文——早先那一版正是这么做的。
+///
+/// 码里也**绝不能带原始错误文本**（那可能带着 URL 之外的实现细节），更
+/// **绝不能带 `push_secret`**，这条路径就是为了不让它上协议线。
+///
 /// `pusher_loop` 靠这个返回值决定要不要往下推帧：失败就原地留着，下一轮
 /// `PUSH_INTERVAL` 再试一次，绝不假装成功。
-fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> Result<(), String> {
+fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> Result<(), LiveFailure> {
     let url = format!("{base}{}", dct_link::live::PATH_START);
     let lanes = room.staged.iter().map(|(_, name)| name.as_str()).collect();
     let body = StartBody {
@@ -623,8 +628,8 @@ fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> Result<()
     };
     match agent.post(&url).send_json(body) {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("中转拒绝了这场直播（状态码 {code}）")),
-        Err(ureq::Error::Transport(_)) => Err("连不上中转，稍后会自动重试".to_string()),
+        Err(ureq::Error::Status(code, _)) => Err(LiveFailure::Refused(code)),
+        Err(ureq::Error::Transport(_)) => Err(LiveFailure::Unreachable),
     }
 }
 
@@ -1252,7 +1257,9 @@ mod tests {
         };
         // 127.0.0.1:1 没人监听，连接会被立刻拒绝——不需要真的等超时。
         let err = start_room(&agent, "http://127.0.0.1:1", &room).unwrap_err();
-        assert!(!err.contains("push-s"), "失败原因里绝不能带着凭据：{err}");
+        // 报的是码，不是句子——句子里带不带凭据这个问题从此不存在，因为
+        // 这个类型根本装不下自由文本（见 `LiveFailure` 的文档注释）。
+        assert_eq!(err, LiveFailure::Unreachable, "连不上该报 Unreachable：{err:?}");
     }
 
     /// **推送失败之后，下一轮仍然会带着内容重推，而不是发空 body 保活。**
@@ -1421,15 +1428,16 @@ mod tests {
         assert_eq!(live.info().readiness, crate::proto::LiveReadiness::Ready);
     }
 
-    /// 注册失败要留下原因，供界面显示。
+    /// 注册失败要留下原因，供界面显示。**留的是码不是句子**——组句归界面，
+    /// 这条线程手上没有 `Lang`。
     #[test]
-    fn marking_failed_records_a_reason() {
+    fn marking_failed_records_a_reason_code_not_a_sentence() {
         let live = LiveState::new("https://x".into());
         let info = live.start(vec![(1, "前端".into())]);
-        live.mark_failed(&info.id, 0, "连不上中转".into());
+        live.mark_failed(&info.id, 0, LiveFailure::Refused(429));
         assert_eq!(
             live.info().readiness,
-            crate::proto::LiveReadiness::Failed("连不上中转".into())
+            LiveReadiness::Failed(LiveFailure::Refused(429))
         );
     }
 

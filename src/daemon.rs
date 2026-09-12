@@ -12,8 +12,8 @@ use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
-    ErrorCode, InstallPrompt, LoginPrompt, PairStartedInfo, PairTick, PhoneState, PhoneStatus, ProfileEntry,
-    Request, Response, SecretPrompt, WebInfo,
+    ErrorCode, InstallPrompt, LiveStagingProblem, LoginPrompt, PairStartedInfo, PairTick, PhoneState,
+    PhoneStatus, ProfileEntry, Request, Response, SecretPrompt, WebInfo,
 };
 use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_OWNER_KEY, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
@@ -1061,7 +1061,7 @@ fn live_start(
     ids: Vec<u32>,
     names: Vec<String>,
 ) -> Response {
-    match validated_staging(mgr, "LiveStart", ids, names) {
+    match validated_staging(mgr, ids, names) {
         Ok(staged) => Response::Live(live.start(staged)),
         Err(e) => Response::Error(e),
     }
@@ -1080,7 +1080,7 @@ fn live_restage(
     ids: Vec<u32>,
     names: Vec<String>,
 ) -> Response {
-    let staged = match validated_staging(mgr, "LiveRestage", ids, names) {
+    let staged = match validated_staging(mgr, ids, names) {
         Ok(s) => s,
         Err(e) => return Response::Error(e),
     };
@@ -1093,23 +1093,25 @@ fn live_restage(
 }
 
 /// `LiveStart` / `LiveRestage` 共用的入参校验：把 `ids` 跟 `names` 拼成
-/// `(id, name)`，拼不出来就回一个说得清是哪一条请求出的错的 `ErrorCode`。
+/// `(id, name)`，拼不出来就回一个 `ErrorCode::LiveStagingRejected`。
 ///
 /// 回的是 `ErrorCode` 而不是整个 `Response`：`Response` 里最大的那个变体
 /// 上百字节，塞进 `Result` 的 `Err` 一侧每次调用都要背着它（clippy 的
 /// `result_large_err`），而调用方本来就只会把它包进 `Response::Error`。
 ///
-/// `what` 只进错误消息，好让老师（和日志）看得出是开播还是改上架被拒了。
+/// **只报码，不组句**（见 `proto::LiveStagingProblem`）：守护进程不知道
+/// 界面用的是哪种语言。码里也不区分是 `LiveStart` 还是 `LiveRestage` 被
+/// 拒了——对老师来说这两句话是同一件事（「这份上架名单不能用」），而他按
+/// 的是哪个键他自己知道。
 fn validated_staging(
     mgr: &Arc<SessionManager>,
-    what: &str,
     ids: Vec<u32>,
     names: Vec<String>,
 ) -> Result<Vec<(u32, String)>, ErrorCode> {
     if ids.len() != names.len() {
-        return Err(ErrorCode::BadRequest(format!(
-            "{what}：ids 和 names 的条数对不上"
-        )));
+        return Err(ErrorCode::LiveStagingRejected(
+            LiveStagingProblem::NamesMismatch,
+        ));
     }
     // **路数的两条边界必须在这里就拦住，不能留给中转。** 中转对空 lanes
     // 和超过 `MAX_LANES` 都回 413，而守护进程这边已经把本地状态设成「在
@@ -1118,16 +1120,13 @@ fn validated_staging(
     // ——一个不会自己好转的死循环。取消最后一路（`ids` 空）就是最容易走
     // 到的那条路。
     if ids.is_empty() {
-        return Err(ErrorCode::BadRequest(format!(
-            "{what}：一路都没上架，没有可播的内容"
-        )));
+        return Err(ErrorCode::LiveStagingRejected(LiveStagingProblem::Empty));
     }
     if ids.len() > dct_link::live::MAX_LANES {
-        return Err(ErrorCode::BadRequest(format!(
-            "{what}：最多只能上架 {} 路，这次是 {} 路",
-            dct_link::live::MAX_LANES,
-            ids.len()
-        )));
+        return Err(ErrorCode::LiveStagingRejected(LiveStagingProblem::TooMany {
+            max: dct_link::live::MAX_LANES,
+            got: ids.len(),
+        }));
     }
     let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
     let missing: Vec<u32> = ids
@@ -1136,9 +1135,9 @@ fn validated_staging(
         .filter(|id| !known.contains(id))
         .collect();
     if !missing.is_empty() {
-        return Err(ErrorCode::BadRequest(format!(
-            "{what}：会话 {missing:?} 不存在，没法上架"
-        )));
+        return Err(ErrorCode::LiveStagingRejected(
+            LiveStagingProblem::UnknownSessions(missing),
+        ));
     }
     Ok(ids.into_iter().zip(names).collect())
 }
@@ -2892,10 +2891,12 @@ mod tests {
         );
 
         match resp {
-            Response::Error(ErrorCode::BadRequest(msg)) => {
-                assert!(msg.contains("999"), "错误消息该点名是哪个 id：{msg}");
+            Response::Error(ErrorCode::LiveStagingRejected(
+                LiveStagingProblem::UnknownSessions(ids),
+            )) => {
+                assert_eq!(ids, vec![999], "错误码该点名是哪个 id");
             }
-            other => panic!("期待 Response::Error(BadRequest)，得到 {other:?}"),
+            other => panic!("期待 LiveStagingRejected(UnknownSessions)，得到 {other:?}"),
         }
     }
 
@@ -2937,8 +2938,11 @@ mod tests {
         );
 
         assert!(
-            matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
-            "期待 BadRequest，得到 {resp:?}"
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::Empty))
+            ),
+            "期待 LiveStagingRejected(Empty)，得到 {resp:?}"
         );
         assert!(live.info().id.is_empty(), "0 路的直播根本不该开起来");
     }
@@ -2969,11 +2973,14 @@ mod tests {
         );
 
         match resp {
-            Response::Error(ErrorCode::BadRequest(m)) => assert!(
-                m.contains(&dct_link::live::MAX_LANES.to_string()),
-                "错误消息该说清楚上限是几路：{m}"
-            ),
-            other => panic!("期待 BadRequest，得到 {other:?}"),
+            Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::TooMany {
+                max,
+                got,
+            })) => {
+                assert_eq!(max, dct_link::live::MAX_LANES, "错误码该带上上限是几路");
+                assert_eq!(got, n, "错误码该带上这次是几路");
+            }
+            other => panic!("期待 LiveStagingRejected(TooMany)，得到 {other:?}"),
         }
         assert!(live.info().id.is_empty(), "超上限的直播根本不该开起来");
     }
@@ -3045,7 +3052,8 @@ mod tests {
 
         assert!(
             matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
-            "期待 BadRequest，得到 {resp:?}"
+            "期待 BadRequest（没在播是「请求跟状态对不上」，不是上架名单的问题），\
+             得到 {resp:?}"
         );
         assert!(live.info().id.is_empty(), "restage 不该凭空开出一场直播");
     }

@@ -104,7 +104,12 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 16 = 多了 `Request::LiveRestage`：改上架名单而**不换链接**。在这之前
 /// 界面改勾选走的是 `LiveStart`，每按一次空格就换一把新 token，已经发给
 /// 全班的链接当场作废、学生一起掉线。新增 `Request` 变体那条规矩同 14。
-pub const PROTOCOL_VERSION: u32 = 16;
+///
+/// 17 = 直播这一侧的失败原因从「已经成文的句子」换成错误码：
+/// `LiveReadiness::Failed(LiveFailure)`、`ErrorCode::LiveStagingRejected`。
+/// 两处都是**响应**的形状变了（旧界面解不出 `Failed` 里那个对象），照 13
+/// 那次的规矩加一。
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,9 +742,16 @@ pub struct LiveInfo {
     pub readiness: LiveReadiness,
 }
 
-/// 见 [`LiveInfo::readiness`]。`Failed` 带的原因是一句已经本地化过的人话
-/// （连不上中转 / 中转拒绝了），**绝不是原始错误文本或者 `push_secret`**
-/// ——这个类型要经手协议线，见 `LiveInfo` 上的文档注释。
+/// 见 [`LiveInfo::readiness`]。
+///
+/// **`Failed` 带的是错误码，不是句子。** 这跟 `ErrorCode` 是同一条规矩
+/// （见它上面那段「守护进程报码，不组句」）：拼这句话的地方是推帧线程，
+/// 它手上根本没有 `Lang`——早先那一版在那里直接拼中文，于是英文界面会显示
+/// 「Failed to go live: 连不上中转，稍后会自动重试」。仓库里那条「英文文案
+/// 里不许有汉字」的守卫（`has_han`）钉的是 `Key` 那张表，一句带参数拼出来
+/// 的话从它旁边绕了过去。
+///
+/// 组句在界面那一侧：`i18n::msg::live_failure`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LiveReadiness {
     /// 本地已经生成好链接，但还没成功告诉过中转——这时候把链接发出去，
@@ -748,7 +760,41 @@ pub enum LiveReadiness {
     /// 中转已经收下这场直播，链接现在真的能用。
     Ready,
     /// 上一次尝试告诉中转失败了。
-    Failed(String),
+    Failed(LiveFailure),
+}
+
+/// 告诉中转「这场直播存在」为什么没成功。**只报码，不组句**，理由见
+/// [`LiveReadiness`]。
+///
+/// **绝不携带原始错误文本，更不携带 `push_secret`**——这个类型要经手协议
+/// 线（见 `LiveInfo` 上的文档注释）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiveFailure {
+    /// 连不上中转（DNS、网络、中转没起来）。会自动重试。
+    Unreachable,
+    /// 连上了，但中转拒绝了这场直播。带 HTTP 状态码：429/413 这类码本身
+    /// 就是给人看的线索，而它不是自由文本，翻译得动。
+    Refused(u16),
+}
+
+/// 一份上架名单为什么不能用。同样**只报码，不组句**——拼这句话的是守护
+/// 进程（`daemon.rs::validated_staging`），它不知道界面用的是哪种语言。
+///
+/// 早先这几条走的是 `ErrorCode::BadRequest(String)`，而那个 `String` 里
+/// 直接写着中文：英文界面上会显示 "dct could not understand that request:
+/// LiveStart：会话 [7] 不存在，没法上架"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiveStagingProblem {
+    /// `ids` 跟 `names` 的条数对不上。
+    NamesMismatch,
+    /// 一路都没上架——见 `daemon.rs::validated_staging` 里那段「0 路的直播
+    /// 是个死循环」。
+    Empty,
+    /// 超过一场直播能有的路数上限。
+    TooMany { max: usize, got: usize },
+    /// 这几个会话 id 守护进程不认识。**不静默丢弃**：老师上架了三路、屏幕
+    /// 上却只显示两路，他不会知道第三路去哪了。
+    UnknownSessions(Vec<u32>),
 }
 
 impl std::fmt::Debug for LiveInfo {
@@ -820,6 +866,10 @@ pub enum ErrorCode {
     NotAnAgentSession,
     /// 请求解析失败，带上原始错误供排查
     BadRequest(String),
+    /// 上架名单不能用。**独立一条，不走 `BadRequest(String)`**：那条的
+    /// 参数是自由文本，而自由文本只能由守护进程写死成某一种语言——见
+    /// [`LiveStagingProblem`] 上那段。
+    LiveStagingRejected(LiveStagingProblem),
     /// git 自己的 stderr。**刻意留的兜底**：那是 git 按它自己的 `LANG` 输出的，
     /// dct 翻不动也不该翻。界面显示成「操作失败：<原文>」——外面那半句是
     /// 翻译过的，里面照抄。
@@ -1178,7 +1228,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                16,
+                17,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1203,7 +1253,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                16,
+                17,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1312,7 +1362,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                16,
+                17,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1419,7 +1469,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (16, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (17, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
