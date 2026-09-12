@@ -1035,10 +1035,13 @@ fn handle(
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
 }
 
-/// 开一场直播：把 `ids` 跟 `names` 拼成 `(id, name)`，只上架 `mgr` 认识的
-/// 那些会话——一个已经退出、或者压根没这个 id 的条目不该出现在学生看到
-/// 的名单里。`ids`/`names` 条数对不上直接拒绝：见
-/// `staging_carries_one_name_per_session` 上的注释，这不是可以将就的输入。
+/// 开一场直播：把 `ids` 跟 `names` 拼成 `(id, name)`。`ids`/`names` 条数
+/// 对不上直接拒绝：见 `staging_carries_one_name_per_session` 上的注释，
+/// 这不是可以将就的输入。
+///
+/// **`ids` 里有 `mgr` 不认识的会话就整体拒绝，不静默丢弃。** 静默丢的话，
+/// 老师上架了三路、屏幕上却只显示两路在播，而他不会知道第三路去哪了——
+/// 一个报不出名字的会话消失得悄无声息，比直接拒绝更让人摸不着头脑。
 fn live_start(
     mgr: &Arc<SessionManager>,
     live: &Arc<crate::live::LiveState>,
@@ -1051,11 +1054,17 @@ fn live_start(
         ));
     }
     let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
-    let staged: Vec<(u32, String)> = ids
-        .into_iter()
-        .zip(names)
-        .filter(|(id, _)| known.contains(id))
+    let missing: Vec<u32> = ids
+        .iter()
+        .copied()
+        .filter(|id| !known.contains(id))
         .collect();
+    if !missing.is_empty() {
+        return Response::Error(ErrorCode::BadRequest(format!(
+            "LiveStart：会话 {missing:?} 不存在，没法上架"
+        )));
+    }
+    let staged: Vec<(u32, String)> = ids.into_iter().zip(names).collect();
     Response::Live(live.start(staged))
 }
 
@@ -2781,6 +2790,38 @@ mod tests {
         }
 
         crate::bridge::stop_current(&bridge);
+    }
+
+    /// 上架一个 `mgr` 不认识的会话 id：整条请求都要被拒绝，不能悄悄漏掉
+    /// 那一路——老师上架了三路、屏幕上却只显示两路在播，而他不会知道
+    /// 第三路去哪了。
+    #[test]
+    fn staging_an_unknown_session_id_is_refused_not_silently_dropped() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![999],
+                names: vec!["不存在".into()],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &test_live(),
+        );
+
+        match resp {
+            Response::Error(ErrorCode::BadRequest(msg)) => {
+                assert!(msg.contains("999"), "错误消息该点名是哪个 id：{msg}");
+            }
+            other => panic!("期待 Response::Error(BadRequest)，得到 {other:?}"),
+        }
     }
 }
 

@@ -660,20 +660,22 @@ pub enum Response {
 
 /// 一场直播眼下的样子。
 ///
-/// **`token` 和 `push_secret` 是两把不同的钥匙**：`token` 是学生那把，只读，
-/// **它会出现在发给一屋子人的链接里**；`push_secret` 是老师那把，只用来
-/// 推帧和停播，**绝不进链接、绝不上屏幕**。两把钥匙不能合成一把——合了的话
-/// 学生手上那份链接就能拿去推假画面（详见 `LiveState::start`）。
+/// **老师那把推帧/停播用的钥匙（`push_secret`）不在这个类型里。**
+/// `LiveInfo` 是要经过协议线的形状——它会被序列化发给手机网页，将来还可能
+/// 经中转那条信封路转一趟。`LiveState` 和推帧线程活在同一个进程里，取
+/// `push_secret` 根本不需要绕道协议；一旦它上了这条线，任何一个能读到
+/// `Response::Live` 的人都会拿到那把本该只有老师能用的钥匙——见
+/// `a_live_response_never_carries_the_push_secret_to_the_wire`。
 ///
-/// 手写 `Debug`：`token`/`push_secret` 都不许原样出现在任何 `{info:?}` 里，
-/// 见 `live_info_debug_redacts_both_secrets`。
+/// `token` 是学生那把，只读，**它会出现在发给一屋子人的链接里**。
+///
+/// 手写 `Debug`：`token` 不许原样出现在任何 `{info:?}` 里，见
+/// `live_info_debug_redacts_the_viewer_token`。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LiveInfo {
     pub id: String,
     /// 学生那把钥匙，只读。**它会出现在发给一屋子人的链接里。**
     pub token: String,
-    /// 老师那把钥匙，只用来推帧和停播。**绝不进链接、绝不上屏幕。**
-    pub push_secret: String,
     pub url: String,
     pub staged: Vec<(u32, String)>,
     pub viewers: u32,
@@ -684,7 +686,6 @@ impl std::fmt::Debug for LiveInfo {
         f.debug_struct("LiveInfo")
             .field("id", &self.id)
             .field("token", &"<redacted>")
-            .field("push_secret", &"<redacted>")
             .field("url", &"<redacted>")
             .field("staged", &self.staged)
             .field("viewers", &self.viewers)
@@ -1367,16 +1368,14 @@ mod tests {
         }
     }
 
-    /// `LiveInfo` 装着两把钥匙，`token` 会经手机屏幕/聊天软件转发，
-    /// `push_secret` 更绝对不能出现在任何地方。**`url` 里拼进了 `token`
-    /// （放在 fragment 里），一旦原样打印就等于把 token 也漏了**——三个字段
-    /// 都要断言看不见。
+    /// `token` 会经手机屏幕/聊天软件转发，绝不能原样出现在任何 `{info:?}`
+    /// 里。**`url` 里拼进了 `token`（放在 fragment 里），一旦原样打印就等于
+    /// 把 token 也漏了**——两个字段都要断言看不见。
     #[test]
-    fn live_info_debug_redacts_both_secrets() {
+    fn live_info_debug_redacts_the_viewer_token() {
         let info = LiveInfo {
             id: "7f3a2c91".into(),
             token: "student-secret-token".into(),
-            push_secret: "teacher-push-secret".into(),
             url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
             staged: vec![(1, "前端".into())],
             viewers: 2,
@@ -1384,6 +1383,26 @@ mod tests {
         let s = format!("{info:?}");
         assert!(s.contains("7f3a2c91"), "id 不敏感，该照常打印：{s}");
         assert!(!s.contains("student-secret-token"), "token 泄露了：{s}");
-        assert!(!s.contains("teacher-push-secret"), "push_secret 泄露了：{s}");
+    }
+
+    /// **`Response::Live` 序列化出来的 JSON 里不许出现老师那把推帧/停播用
+    /// 的钥匙。** `LiveInfo` 类型上已经没有 `push_secret` 这个字段了，这条
+    /// 测试钉住的是这件事本身不会被以后哪次改动悄悄加回来——`push_secret`
+    /// 只活在 `LiveState` 内部，取用口是 `pub(crate)` 的，物理上不会被
+    /// 序列化进任何一条协议响应。
+    #[test]
+    fn a_live_response_never_carries_the_push_secret_to_the_wire() {
+        let r = Response::Live(LiveInfo {
+            id: "7f3a2c91".into(),
+            token: "student-secret-token".into(),
+            url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
+            staged: vec![(1, "前端".into())],
+            viewers: 2,
+        });
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("push_secret"),
+            "老师那把推帧/停播用的钥匙不该出现在任何一条能发到网页上的答复里：{json}"
+        );
     }
 }
