@@ -29,6 +29,7 @@ pub(crate) mod attach;
 mod board;
 mod grid;
 mod keys;
+mod live;
 mod pair_view;
 mod phone;
 mod pick;
@@ -43,7 +44,8 @@ pub use view::{
     verify_message, verify_outcome_applies_to, PickAction, ViewMode,
 };
 use view::{
-    escape_hint, idle_help, message_after_transition, session_ended_notice, PairPhase, View,
+    escape_hint, idle_help, is_plain_key, message_after_transition, session_ended_notice,
+    PairPhase, View,
 };
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
@@ -1034,9 +1036,21 @@ pub fn run(
         // 现在每个键都直接进视图自己的处理函数。必须 clone：分支里要给 view
         // 赋值，match &view 会被借用检查器拒掉。
         match app.view.clone() {
+            // `L` 进直播面板。只在看板和附着视图里接：这两个是老师干活时
+            // 真的会停留的两屏，其余视图（选择器、设置页……）都是路过的，
+            // 接了反而是在一个偶然路过的地方多埋一个不相关的键。放在
+            // 各自的 `handle_key` 之前拦一道，而不是塞进 board.rs/attach.rs——
+            // `App::live` 和 `View::Live` 都是这个任务新加的，拦在分派这一层
+            // 不用碰那两个模块自己的按键表。
+            View::Board if key.code == KeyCode::Char('L') && is_plain_key(&key) => {
+                live::open(&mut app)
+            }
             View::Board => board::handle_key(&mut app, key)?,
             View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
             View::PickProject(_) => pick::handle_key(&mut app, key)?,
+            View::Attached(_) if key.code == KeyCode::Char('L') && is_plain_key(&key) => {
+                live::open(&mut app)
+            }
             View::Attached(_) => attach::handle_key(&mut app, key)?,
             View::Grid { .. } => grid::handle_key(&mut app, key)?,
             View::Keys { .. } => keys::handle_key(&mut app, key)?,
@@ -1045,6 +1059,7 @@ pub fn run(
             View::Secrets { .. } => secret::handle_key(&mut app, key)?,
             View::Phone { .. } => phone::handle_key(&mut app, key)?,
             View::Web => web::handle_key(&mut app, key)?,
+            View::Live { .. } => live::handle_key(&mut app, key)?,
             View::Pair { .. } => pair_view::handle_key(&mut app, key)?,
         }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
@@ -1301,6 +1316,7 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
         // 那一页会被置成 `Some`，其它任何视图下这里恒为 `false`。
         phone_editing: app.phone_buf.is_some(),
         web_on: app.web.on,
+        live_on: !app.live.id.is_empty(),
     }
 }
 
@@ -2424,6 +2440,17 @@ fn draw(f: &mut Frame, app: &mut App) {
             BarContent::Text(crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string()),
             danger(),
         )
+    } else if live::is_live(&app.live) {
+        // **这一档压过 `message`、滚动提示、按键表——所有人。** 这是整个
+        // 直播功能里最要紧的一条规矩：老师在播的时候，不管此刻站在哪一个
+        // 视图（看板、九宫格、附着到某个会话……），底栏都必须说着「你在播」，
+        // 一个字都不能被别的提示挤掉。这个功能最危险的失败模式不是链接
+        // 泄露，是老师忘了自己在播、切去处理一件私事——常驻、不能折叠、
+        // 不能关，就是为了防这一件事。
+        (
+            BarContent::Text(live::live_banner(&app.live, app.lang)),
+            live::banner_style(&app.live),
+        )
     } else if app.message.text.is_empty() {
         // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
         // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
@@ -2557,6 +2584,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
         View::Phone { .. } => phone::draw(f, chunks[0], app),
         View::Web => web::draw(f, chunks[0], app),
+        View::Live { .. } => live::draw(f, chunks[0], app),
         View::Pair { .. } => pair_view::draw(f, chunks[0], app),
     }
 
@@ -4784,6 +4812,34 @@ is_agent = true
 
         assert!(c.contains("已切到某个项目"), "消息该赢，没显示出来：{c}");
         assert!(!c.contains("按End回到底部"), "滚动提示不该盖过消息：{c}");
+    }
+
+    /// **这是整个直播功能最要紧的一条守卫。** 老师在播的时候，不管站在
+    /// 哪个视图、不管此刻有没有别的消息/错误在排队，底栏都必须说着
+    /// 「你在播」——这个功能最危险的失败模式不是链接泄露，是老师忘了
+    /// 自己在播、切去处理一件私事。所以这一档必须压过消息，甚至压过
+    /// 错误消息，见 `ui::mod::draw` 里那段注释。
+    #[test]
+    fn the_live_banner_beats_every_other_bar_content() {
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.message = crate::ui::widgets::Msg::err("出了点问题".into());
+        app.live = crate::proto::LiveInfo {
+            id: "abc".into(),
+            token: "t".repeat(64),
+            url: "https://x/live/abc#t=deadbeef".into(),
+            staged: vec![(1, "claude".into())],
+            viewers: 3,
+            readiness: crate::proto::LiveReadiness::Ready,
+        };
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let bar = bar_text(&term);
+
+        assert!(bar.contains("正在直播"), "在播时底栏没说「正在直播」：{bar}");
+        assert!(!bar.contains("出了点问题"), "错误消息不该压过直播提示：{bar}");
     }
 
     /// 模式看不见就是下一个隐形状态，而这个仓库刚花一整轮改造消灭掉那种东西。

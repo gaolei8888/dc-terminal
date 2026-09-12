@@ -208,6 +208,14 @@ pub(crate) enum View {
     /// 塞在视图里的状态会被无声冲掉；这一页没有那条路，但把状态放在
     /// 同一个地方，两页读的就是同一份真相）。
     Web,
+    /// 直播面板：上架/下架会话、看链接和二维码、停播。看板/附着视图按 `L` 进。
+    ///
+    /// 状态（链接、token、上架列表、人数、readiness）全在 `App::live` 上，
+    /// 理由同 `View::Web`。这里只带一份光标——`state` 指向 `App::sessions`
+    /// 里的哪一行，空格勾它上不上架。
+    Live {
+        state: ListState,
+    },
     /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
     /// 屏幕上，profile 可配对（`pairable`）时的 Ctrl+A——跟 Ctrl+O 开
     /// 申领页同一个键位规矩，不占用一个字母，密钥输入本身还要用它们）。
@@ -1305,6 +1313,11 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 语义是「这件事我不做了」，没有一个「接着做」的下一步可去，
         // 所以它跟别的取消一样回看板。
         View::Pair { .. } => text(Key::BackToBoard, lang).to_string(),
+        // 直播面板从看板/附着视图进来，退出就回那一屏——跟 `Web` 不一样，
+        // 这一页没有一个固定的「上一层」（设置页），所以走跟 `Web`
+        // 一样落到默认分支的那句「回看板」，这里显式写出来只是让读代码的人
+        // 不用去猜通配分支答的是什么。
+        View::Live { .. } => text(Key::BackToBoard, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
 }
@@ -1347,6 +1360,9 @@ pub(crate) struct HelpCtx {
     /// 「Enter 打开」还是「x 关掉」——写错那一个，屏幕上就是一个按下去
     /// 没反应的键。
     pub web_on: bool,
+    /// 眼下有没有在播（`App::live.id` 是否非空）——直播面板拿它决定
+    /// `c`/`r`/`s` 写不写得出来，跟 `web_on` 同一个道理。
+    pub live_on: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1674,6 +1690,20 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
             items.push(("Esc", Key::BackToSettingsWord));
             help_items(&items, lang)
         }
+        // 直播面板：`c`/`r`/`s` 只在真的在播（`live_on`）时才写得出来——
+        // 没有链接可复制/换，没有播可停，写出来就是三个按下去没反应的键，
+        // 犯的是这一页别处反复防的那条错。空格和 Esc 不论在不在播都能按。
+        View::Live { .. } => {
+            let mut items: Vec<(&'static str, Key)> = Vec::new();
+            items.push((" ", Key::LiveToggleStaged));
+            if ctx.live_on {
+                items.push(("c", Key::LiveCopyLink));
+                items.push(("r", Key::LiveNewLink));
+                items.push(("s", Key::LiveStop));
+            }
+            items.push(("Esc", Key::BackToBoard));
+            help_items(&items, lang)
+        }
         View::Phone { status } => {
             use crate::proto::PhoneState;
             // **修复 6。** 令牌输入框开着的时候别再画 `status` 派生的那几个
@@ -1830,6 +1860,7 @@ mod tests {
             can_switch_project: true,
             phone_editing: false,
             web_on: false,
+            live_on: false,
         }
     }
 
@@ -1841,6 +1872,7 @@ mod tests {
             can_switch_project: true,
             phone_editing: false,
             web_on: false,
+            live_on: false,
         }
     }
 
@@ -1856,6 +1888,7 @@ mod tests {
             can_switch_project: true,
             phone_editing: false,
             web_on: false,
+            live_on: false,
         }
     }
 

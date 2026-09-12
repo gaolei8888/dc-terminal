@@ -218,7 +218,38 @@ pub enum Key {
     WebToggle,
     /// 窗口太窄，二维码放不下。**这不是错误**——码画不下是个尺寸问题，
     /// 出路有两条（拉宽窗口，或者照着地址手输），这一句两条都得说。
+    /// 直播面板的二维码也共用这一句——同一件事，不必另写一条。
     WebQrTooNarrow,
+    // —— 直播观众链接（老师这一侧的面板） ——
+    /// 面板标题。
+    LiveSection,
+    /// 还没上架任何会话——没在播。
+    LiveOffLine,
+    /// `readiness` 还是 `Pending`：链接已经生成，但中转还没被推帧线程
+    /// 告知这场直播存在——这时候把链接发出去，学生大概率打不开。见
+    /// `proto::LiveInfo::readiness` 的文档注释。
+    LiveConnectingToRelay,
+    /// 会话列表里，正在直播的那几路旁边的标记。**不能只画一个点**：
+    /// 光一个圆点不说人话，老师切到别的会话时得一眼认出「还在播的是这几路」。
+    LiveOnAirMark,
+    /// 空格键的说明：把光标这一行加进/踢出直播。
+    LiveToggleStaged,
+    /// `c` 键：把带 token 的完整链接复制进系统剪贴板（走 OSC 52，不上屏）。
+    LiveCopyLink,
+    /// `r` 键：换一条新链接（旧的立刻失效，token 跟着换掉）。
+    LiveNewLink,
+    /// `s` 键：整个停播。
+    LiveStop,
+    /// 这个项目现在一个能上架的会话都没有。
+    LiveNoSessionsToStage,
+    /// 「允许观众提问」那个开关——这一版还没做，先占个位置、说清楚现在
+    /// 还按不了，好过屏幕上凭空出现一处看着能点却毫无反应的东西。
+    LiveQuestionsPlaceholder,
+    /// `c` 按下去之后的确认——**不能把链接本身回显在这句话里**，那正是
+    /// 复制这一步要避免的事：链接已经进了剪贴板，再打在屏幕上就白复制了。
+    LiveLinkCopied,
+    /// `s` 停播之后的确认。
+    LiveStoppedMessage,
     /// 手机端画面上那两个字号按钮的名字。**图标也要有名字**——读屏软件
     /// 念不出「A−」，而手机上读屏用户很多（同网页里 `back` 那一条）。
     TextSmaller,
@@ -682,6 +713,34 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "The window is too narrow for the code — widen it, or type the address into the phone",
             zh: "窗口太窄，二维码放不下——把窗口拉宽，或者照着地址在手机上手输",
         ),
+        LiveSection => t!(lang, en: "Live viewer link", zh: "直播观众链接"),
+        LiveOffLine => t!(lang, en: "Not live — nothing staged", zh: "没在播——还没上架任何会话"),
+        LiveConnectingToRelay => t!(
+            lang,
+            en: "still connecting to the relay — do not send this link out yet",
+            zh: "还在连接中转，先别把这条链接发出去",
+        ),
+        LiveOnAirMark => t!(lang, en: "\u{25cf} live", zh: "\u{25cf} 播"),
+        LiveToggleStaged => t!(lang, en: "stage/unstage", zh: "上/下架"),
+        LiveCopyLink => t!(lang, en: "copy link", zh: "复制链接"),
+        LiveNewLink => t!(lang, en: "new link", zh: "换链接"),
+        LiveStop => t!(lang, en: "stop", zh: "停播"),
+        LiveNoSessionsToStage => t!(
+            lang,
+            en: "No sessions in this project yet — open one first",
+            zh: "这个项目还没有会话——先开一个",
+        ),
+        LiveQuestionsPlaceholder => t!(
+            lang,
+            en: "Let viewers ask questions — coming soon, not on yet",
+            zh: "允许观众提问——还没做好，现在按不了",
+        ),
+        LiveLinkCopied => t!(
+            lang,
+            en: "Link copied to the clipboard",
+            zh: "链接已复制到剪贴板",
+        ),
+        LiveStoppedMessage => t!(lang, en: "Stopped the broadcast", zh: "已停播"),
         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
         PhoneReconnectingLine => t!(
@@ -1253,6 +1312,38 @@ pub mod msg {
 
     pub fn not_a_session_id(lang: Lang, arg: &str) -> String {
         t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
+    }
+
+    /// 顶栏那行常驻提示的正文：「正在直播 · N 路 · M 人在看」。**这一句
+    /// 是整个功能最重要的一块文案**——不带人数的话，老师看不出这行字是
+    /// 「活的」还是昨天就一直挂在那儿的死文案（见 `ui::live` 的文档注释）。
+    pub fn live_on_air(lang: Lang, routes: usize, viewers: u32) -> String {
+        t!(
+            lang,
+            en: format!("\u{25cf} LIVE \u{b7} {routes} lane(s) \u{b7} {viewers} watching"),
+            zh: format!("\u{25cf} 正在直播 \u{b7} {routes} 路 \u{b7} {viewers} 人在看"),
+        )
+    }
+
+    /// 中转拒绝了这场直播的原因——`reason` 已经是本地化过的人话（见
+    /// `proto::LiveReadiness::Failed` 的文档注释），这里只负责拼进「开播
+    /// 失败」的前缀。
+    pub fn live_start_failed(lang: Lang, reason: &str) -> String {
+        t!(
+            lang,
+            en: format!("Failed to go live: {reason}"),
+            zh: format!("开播失败：{reason}"),
+        )
+    }
+
+    /// `LiveStart` 被守护进程整体拒绝时的提示——**把它说出来**：老师看到
+    /// 的是「按了开关，链接却没变」，而真正原因是勾的某一路会话已经不在了。
+    pub fn live_start_rejected(lang: Lang, reason: &str) -> String {
+        t!(
+            lang,
+            en: format!("Could not update the broadcast: {reason}"),
+            zh: format!("上/下架没成功：{reason}"),
+        )
     }
 
     pub fn stopped_session(lang: Lang, id: u32) -> String {
@@ -2322,6 +2413,18 @@ mod tests {
             WebNextStepOn,
             WebNextStepAddressUnknown,
             WebQrTooNarrow,
+            LiveSection,
+            LiveOffLine,
+            LiveConnectingToRelay,
+            LiveOnAirMark,
+            LiveToggleStaged,
+            LiveCopyLink,
+            LiveNewLink,
+            LiveStop,
+            LiveNoSessionsToStage,
+            LiveQuestionsPlaceholder,
+            LiveLinkCopied,
+            LiveStoppedMessage,
             TextSmaller,
             TextBigger,
             KeyboardCapture,
@@ -2507,7 +2610,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 191, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 203, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
