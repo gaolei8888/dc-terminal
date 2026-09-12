@@ -90,7 +90,12 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// `pair_apply::Ready::llm_written`）。这一次变的是**响应**的形状而不是
 /// 请求的：旧界面解不出多了一个字段的 `Done`，一条成功的配对会在最后
 /// 一刻变成一句解析失败——形状变了就得加一，这条规矩对哪一侧都一样。
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// 14 = 直播观众链接。多了 `Request::LiveStart` / `LiveStop` / `LiveStatus`
+/// 和 `Response::Live(LiveInfo)`。**加一，没有例外可讲**：新增 `Request`
+/// 变体那条规矩没得商量——旧守护进程收到 `LiveStart` 只会回一句解析失败，
+/// 而用户看到的是「按了开关什么都没发生」。同 `WebEnable` 那次。
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,6 +440,19 @@ pub enum Request {
     WebStatus,
     WebEnable,
     WebDisable,
+    /// 开一场直播：把 `ids` 指到的会话上架，配上 `names` 给学生看的名字。
+    ///
+    /// **`names` 跟 `ids` 必须一一对应**——名字的条数跟会话数对不上，
+    /// 学生看到的第 2 路可能其实是第 3 个会话（见
+    /// `staging_carries_one_name_per_session`）。
+    LiveStart {
+        ids: Vec<u32>,
+        names: Vec<String>,
+    },
+    /// 停播。
+    LiveStop,
+    /// 现在有没有在播、播的是什么。
+    LiveStatus,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -543,6 +561,14 @@ impl std::fmt::Debug for Request {
             Request::WebStatus => write!(f, "WebStatus"),
             Request::WebEnable => write!(f, "WebEnable"),
             Request::WebDisable => write!(f, "WebDisable"),
+            // ids/names 都不是密钥，照常打印排查用。
+            Request::LiveStart { ids, names } => f
+                .debug_struct("LiveStart")
+                .field("ids", ids)
+                .field("names", names)
+                .finish(),
+            Request::LiveStop => write!(f, "LiveStop"),
+            Request::LiveStatus => write!(f, "LiveStatus"),
         }
     }
 }
@@ -628,6 +654,42 @@ pub enum Response {
     PairStarted(Result<PairStartedInfo, String>),
     /// 对 [`Request::PairPoll`] 的回答。
     PairTick(PairTick),
+    /// `LiveStart` / `LiveStop` / `LiveStatus` 三条的共同回答。
+    Live(LiveInfo),
+}
+
+/// 一场直播眼下的样子。
+///
+/// **`token` 和 `push_secret` 是两把不同的钥匙**：`token` 是学生那把，只读，
+/// **它会出现在发给一屋子人的链接里**；`push_secret` 是老师那把，只用来
+/// 推帧和停播，**绝不进链接、绝不上屏幕**。两把钥匙不能合成一把——合了的话
+/// 学生手上那份链接就能拿去推假画面（详见 `LiveState::start`）。
+///
+/// 手写 `Debug`：`token`/`push_secret` 都不许原样出现在任何 `{info:?}` 里，
+/// 见 `live_info_debug_redacts_both_secrets`。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LiveInfo {
+    pub id: String,
+    /// 学生那把钥匙，只读。**它会出现在发给一屋子人的链接里。**
+    pub token: String,
+    /// 老师那把钥匙，只用来推帧和停播。**绝不进链接、绝不上屏幕。**
+    pub push_secret: String,
+    pub url: String,
+    pub staged: Vec<(u32, String)>,
+    pub viewers: u32,
+}
+
+impl std::fmt::Debug for LiveInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveInfo")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("push_secret", &"<redacted>")
+            .field("url", &"<redacted>")
+            .field("staged", &self.staged)
+            .field("viewers", &self.viewers)
+            .finish()
+    }
 }
 
 /// `pair::Started` 给界面看的那一面。**故意不是 `Started` 本身**：那个类型里有
@@ -1028,14 +1090,20 @@ mod tests {
             Request::WebStatus,
             Request::WebEnable,
             Request::WebDisable,
+            Request::LiveStart {
+                ids: vec![1],
+                names: vec!["n".into()],
+            },
+            Request::LiveStop,
+            Request::LiveStatus,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                13,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
+                14,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1059,7 +1127,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                13,
+                14,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1168,7 +1236,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                13,
+                14,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1275,8 +1343,47 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (13, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (14, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
+    }
+
+    /// 上架的每一路都要有名字，而且名字的条数必须跟会话数对得上——
+    /// 对不上就会出现「学生看到的第 2 路其实是第 3 个会话」。
+    #[test]
+    fn staging_carries_one_name_per_session() {
+        let req = Request::LiveStart {
+            ids: vec![3, 5],
+            names: vec!["前端调试".into(), "后端接口".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::LiveStart { ids, names } => {
+                assert_eq!(ids.len(), names.len());
+                assert_eq!(names[1], "后端接口");
+            }
+            other => panic!("解出来的不是 LiveStart：{other:?}"),
+        }
+    }
+
+    /// `LiveInfo` 装着两把钥匙，`token` 会经手机屏幕/聊天软件转发，
+    /// `push_secret` 更绝对不能出现在任何地方。**`url` 里拼进了 `token`
+    /// （放在 fragment 里），一旦原样打印就等于把 token 也漏了**——三个字段
+    /// 都要断言看不见。
+    #[test]
+    fn live_info_debug_redacts_both_secrets() {
+        let info = LiveInfo {
+            id: "7f3a2c91".into(),
+            token: "student-secret-token".into(),
+            push_secret: "teacher-push-secret".into(),
+            url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
+            staged: vec![(1, "前端".into())],
+            viewers: 2,
+        };
+        let s = format!("{info:?}");
+        assert!(s.contains("7f3a2c91"), "id 不敏感，该照常打印：{s}");
+        assert!(!s.contains("student-secret-token"), "token 泄露了：{s}");
+        assert!(!s.contains("teacher-push-secret"), "push_secret 泄露了：{s}");
     }
 }

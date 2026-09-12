@@ -217,6 +217,12 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 网页）都可能问起同一条正在跑的配对。
     let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
 
+    // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
+    // `base`（学生链接的 origin）先给空串——算出真实的中转地址是 Task 5
+    // 推帧线程要接的那根线（它本来就得知道中转在哪儿才能把帧 POST 过去），
+    // 这里只负责把这个槽本身的生死和 dispatch 接好。
+    let live: Arc<crate::live::LiveState> = Arc::new(crate::live::LiveState::new(String::new()));
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -228,8 +234,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let et = event_tx.clone();
         let wb = web.clone();
         let pr = pairs.clone();
+        let lv = live.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -534,6 +541,7 @@ fn serve(
     event_tx: std::sync::mpsc::Sender<Event>,
     web: Arc<Mutex<Option<crate::web::Server>>>,
     pairs: Arc<Mutex<PairTable>>,
+    live: Arc<crate::live::LiveState>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -557,6 +565,7 @@ fn serve(
                 &event_tx,
                 Some(&web),
                 &pairs,
+                &live,
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -585,6 +594,11 @@ fn handle(
     // 拿不到 `web` 是物理上做不到。
     web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
     pairs: &Arc<Mutex<PairTable>>,
+    // 直播那个状态槽。跟 `phone` 一样是长活在这个进程里的共享状态：
+    // 无论请求从桌面这条本机 socket 来还是从局域网手机端来，看到的都得是
+    // 同一场直播（是不是允许后一条路控制开关，是下一个任务接配对身份时
+    // 要定的边界，这里先跟 `phone` 一样两边都能看）。
+    live: &Arc<crate::live::LiveState>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -901,6 +915,7 @@ fn handle(
             bridge,
             event_tx,
             pairs,
+            live,
         )),
         Request::WebDisable => Ok(web_disable(web)),
         Request::PhoneDisable => {
@@ -1007,8 +1022,41 @@ fn handle(
             }
             Ok(Response::Ok)
         }
+        // `Ok(...)` 包一层是因为这个 match 的返回类型是
+        // `anyhow::Result<Response>`：`live_start` 本身不会失败到需要
+        // `anyhow::Error` 的地步——校验不过直接答 `Response::Error`。
+        Request::LiveStart { ids, names } => Ok(live_start(mgr, live, ids, names)),
+        Request::LiveStop => {
+            live.stop();
+            Ok(Response::Ok)
+        }
+        Request::LiveStatus => Ok(Response::Live(live.info())),
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
+}
+
+/// 开一场直播：把 `ids` 跟 `names` 拼成 `(id, name)`，只上架 `mgr` 认识的
+/// 那些会话——一个已经退出、或者压根没这个 id 的条目不该出现在学生看到
+/// 的名单里。`ids`/`names` 条数对不上直接拒绝：见
+/// `staging_carries_one_name_per_session` 上的注释，这不是可以将就的输入。
+fn live_start(
+    mgr: &Arc<SessionManager>,
+    live: &Arc<crate::live::LiveState>,
+    ids: Vec<u32>,
+    names: Vec<String>,
+) -> Response {
+    if ids.len() != names.len() {
+        return Response::Error(ErrorCode::BadRequest(
+            "LiveStart：ids 和 names 的条数对不上".into(),
+        ));
+    }
+    let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
+    let staged: Vec<(u32, String)> = ids
+        .into_iter()
+        .zip(names)
+        .filter(|(id, _)| known.contains(id))
+        .collect();
+    Response::Live(live.start(staged))
 }
 
 /// `PhoneSetToken` 打 `getMe` 没成功时，给用户看的那句人话。**这里就是
@@ -1096,6 +1144,7 @@ fn web_enable(
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: &std::sync::mpsc::Sender<Event>,
     pairs: &Arc<Mutex<PairTable>>,
+    live: &Arc<crate::live::LiveState>,
 ) -> Response {
     let Some(web) = web else { return web_refused() };
     let mut slot = recover(web.lock());
@@ -1123,7 +1172,7 @@ fn web_enable(
 
     // **HTTP 那一路走的是同一个 `handle`**，只是 `web` 传 `None`。
     // 另写一份分派等于养出第二套真相，而手机看到的东西必须跟桌面一致。
-    let (m, s, sec, pd, ph, br, et, pr) = (
+    let (m, s, sec, pd, ph, br, et, pr, lv) = (
         mgr.clone(),
         store.clone(),
         secrets.clone(),
@@ -1132,8 +1181,10 @@ fn web_enable(
         bridge.clone(),
         event_tx.clone(),
         pairs.clone(),
+        live.clone(),
     );
-    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr);
+    let dispatch =
+        move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr, &lv);
     let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
     let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
     let port = server.addr().port();
@@ -1349,6 +1400,11 @@ mod tests {
     /// 同上——大多数测试不关心配对，给一张空表就行。
     fn test_pairs() -> Arc<Mutex<PairTable>> {
         Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    /// 同上——大多数测试不关心直播，给一个空槽就行。
+    fn test_live() -> Arc<crate::live::LiveState> {
+        Arc::new(crate::live::LiveState::new("https://x".into()))
     }
 
     fn test_pair_started() -> crate::pair::Started {
@@ -1801,6 +1857,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -1860,6 +1917,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -1928,6 +1986,7 @@ mod tests {
                 &test_event_tx(),
                 None,
                 &test_pairs(),
+                &test_live(),
             );
             (t.elapsed(), resp)
         });
@@ -2036,6 +2095,7 @@ mod tests {
                 &test_event_tx(),
                 None,
                 &test_pairs(),
+                &test_live(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -2070,6 +2130,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -2157,6 +2218,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -2205,6 +2267,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -2265,6 +2328,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -2319,6 +2383,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -2390,6 +2455,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -2735,6 +2801,7 @@ mod web_tests {
         bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
         tx: std::sync::mpsc::Sender<Event>,
         pairs: Arc<Mutex<PairTable>>,
+        live: Arc<crate::live::LiveState>,
         /// 临时目录得跟着 fixture 活着，不然 secrets/projects 的路径当场失效。
         _dir: tempfile::TempDir,
     }
@@ -2754,6 +2821,7 @@ mod web_tests {
                 &self.bridge,
                 &self.tx,
                 &self.pairs,
+                &self.live,
             )
         }
     }
@@ -2774,6 +2842,7 @@ mod web_tests {
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
             pairs: Arc::new(Mutex::new(BTreeMap::new())),
+            live: Arc::new(crate::live::LiveState::new("https://x".into())),
             _dir: dir,
         }
     }
