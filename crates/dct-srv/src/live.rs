@@ -4,8 +4,9 @@
 //!
 //! 原话是「中转只搬信封，不看里面」。这里多出来的是一个**角色**（记住最新
 //! 一帧），不是一份**理解**：帧对中转始终是不透明字节，它不解析、不认识里面
-//! 是 span 还是别的。有一条守卫钉着这一点（见 `lib.rs` 的
-//! `the_relay_never_looks_inside_a_frame_either`）。
+//! 是 span 还是别的——这个模块里没有一行反序列化 `frame`。这条性质本任务
+//! 没有专门的守卫测试钉住它，留给下一个任务（HTTP 路由）随路由一起落地：
+//! 那时请求体真正从网络进来，才有实际的反序列化路径可测。
 //!
 //! # 为什么不是队列
 //!
@@ -138,8 +139,17 @@ impl Live {
         Some(rooms.get(id)?.lanes.get(lane)?.tx.subscribe())
     }
 
-    /// 在看的人数 = 挂着的订阅数。这是老师那行常驻提示里的「7 人在看」，
-    /// 也是他唯一会一直看着的那个数。
+    /// 在看的人数——**近似值**，数的是此刻挂在长轮询上的订阅数，不是精确
+    /// 名册。这是老师那行常驻提示里的「7 人在看」，也是他唯一会一直看着的
+    /// 那个数。
+    ///
+    /// 学生页一次只显示一路画面，所以按 lane 累加不会把一个人算成两个——
+    /// 一个学生同一时刻只订阅自己正在看的那一路。
+    ///
+    /// 会偏低的情况：短轮询本身有间隙（拿到一帧、还没发起下一次订阅的那一
+    /// 小段时间没人挂着），学生数会在这段间隙里被漏掉。这个近似是可以接受
+    /// 的——老师要的是「有没有人、大概多少人」，不是逐个对花名册，为了这几
+    /// 个名额去维护一份精确在线表不值得。
     pub fn viewers(&self, id: &str) -> u32 {
         let rooms = self.rooms.lock().expect("live 锁");
         rooms
@@ -291,6 +301,17 @@ mod tests {
             live.lanes("abc", &"t".repeat(64)).unwrap_err(),
             LinkError::Unauthorized
         );
+    }
+
+    /// 在看的人数是挂着的订阅数：订阅两次数到 2，drop 掉一个之后数回 1。
+    #[test]
+    fn viewers_counts_currently_held_subscriptions() {
+        let live = started();
+        let a = live.subscribe("abc", 0).unwrap();
+        let _b = live.subscribe("abc", 1).unwrap();
+        assert_eq!(live.viewers("abc"), 2, "两个订阅应该数出 2 个人在看");
+        drop(a);
+        assert_eq!(live.viewers("abc"), 1, "掉了一个订阅之后应该数回 1");
     }
 
     /// 挂着的学生要被新帧叫醒，这是 `?wait=1` 的全部机制。
