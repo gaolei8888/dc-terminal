@@ -127,6 +127,20 @@ impl Library {
         let id = unique()?;
         let dir = self.base.join("work").join(&id);
         fs::create_dir(&dir)?;
+        // **新项目必须是 git 仓库，否则它一个 agent 会话都开不起来。**
+        //
+        // dct 拒绝在非 git 目录里开 agent（`session.rs` 的 `NotAGitRepo`），
+        // 因为检查点和撤销全靠 git——没有仓库就没有那张网，而那张网正是
+        // 「替用户把所有确认都答应了」的全部底气。桌面端遇到非仓库目录时
+        // 会当场问用户要不要 init（`ui::pick`），而这条路上没有人可问：
+        // 学生点的是「创建项目」，他要的就是一个能用的项目。
+        //
+        // init 不成就把目录删掉再报错：一个开不了会话的空项目留在列表里，
+        // 比没有这个项目更糟——学生每次点开都会撞上同一句看不懂的话。
+        if let Err(e) = crate::git::init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e.context("项目建好了但没能初始化 git 仓库"));
+        }
         let p = Project {
             id,
             name: name.into(),

@@ -21,9 +21,17 @@ export function localRequest(port, token, route, body) {
   });
 }
 export class DockerDriver {
-  constructor({image = 'dc-workspace:0.2.14-classroom', maxRunning, command = exec} = {}) {
+  // `memory` 是每个工作区的内存上限，`maxRunning` 是同时能跑几个。
+  //
+  // 默认值按「一台机器留 1 GB 给自己，其余按每人 3 GB 分」算。3 GB 是很宽
+  // 的余量——实测一个 agent 会话吃 150–320 MB，加上学生跑起来的 dev server
+  // 也就 400–500 MB。真正卡住的是名额：一台 8 GB 的机器只分得出 2 个，而
+  // 共享工作区自己就占一个。所以两个数都能用环境变量压过去，调完重启
+  // 服务即可，不用改代码、不用发版。
+  constructor({image = 'dc-workspace:0.2.14-classroom', maxRunning, memory, command = exec} = {}) {
     this.image = image;
-    this.maxRunning = maxRunning || Math.max(1, Math.floor((os.totalmem() - GiB) / (3 * GiB)));
+    this.memory = memory || process.env.CLASSROOM_MEMORY || '3g';
+    this.maxRunning = maxRunning || Number(process.env.CLASSROOM_MAX_RUNNING) || Math.max(1, Math.floor((os.totalmem() - GiB) / (3 * GiB)));
     this.command = command;
     this.usage = new Map();
   }
@@ -93,7 +101,7 @@ export class DockerDriver {
         await this.docker(['volume', 'create', '--label', 'dcw.classroom=1', volume]);
         mounts.push('--mount', `type=volume,source=${volume},target=${destination}`);
       }
-      await this.docker(['run', '-d', '--name', name, '--label', 'dcw.classroom=1', '--label', `dcw.student=${w.id}`, '--restart', 'unless-stopped', '--memory', '3g', '--memory-swap', '3g', '--pids-limit', '512', '--security-opt', 'no-new-privileges:true', '--cap-drop', 'ALL', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3', '--env', 'DCW_STUDENT=1', '--env', 'DCW_PUBLIC_URL=https://dataclue.cn', '-p', '127.0.0.1::7681', ...mounts, this.image], 120000);
+      await this.docker(['run', '-d', '--name', name, '--label', 'dcw.classroom=1', '--label', `dcw.student=${w.id}`, '--restart', 'unless-stopped', '--memory', this.memory, '--memory-swap', this.memory, '--pids-limit', '512', '--security-opt', 'no-new-privileges:true', '--cap-drop', 'ALL', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3', '--env', 'DCW_STUDENT=1', '--env', 'DCW_PUBLIC_URL=https://dataclue.cn', '-p', '127.0.0.1::7681', ...mounts, this.image], 120000);
     }
     delete w.backendToken;
     for (let n = 0; n < 40; n++) {
@@ -102,8 +110,14 @@ export class DockerDriver {
     }
     throw new Error('工作区正在启动，请稍后重试');
   }
+  // 停一个工作区：先把每个项目归档，再停容器。**顺序不能反**——反过来
+  // 就是「停完了才发现归档失败」，而那时候会话已经没了。
+  //
+  // 共享工作区以前在这里是硬拒的（理由是它背着教师端那条旧链接）。但在
+  // 一台只有两个名额的机器上，那条规矩的实际后果是：共享的那个白占一个，
+  // 全班只剩一个名额能用。所以改成允许停——代价（教师端链接在它停着的
+  // 时候打不开）写在按钮的确认框里，交给点的人判断，而不是替他决定。
   async stop(w) {
-    if (w.shared) throw new Error('共享工作区正在兼容旧链接，请单独管理；未停止运行');
     if ((await this.status(w)).status !== 'running') return;
     const b = await this.backend(w);
     const list = await localRequest(b.apiPort, b.token, '/_dct/projects');

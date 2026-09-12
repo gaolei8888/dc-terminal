@@ -82,7 +82,18 @@ test('Docker driver validates ownership, isolated volumes and 3 GiB budget', asy
   assert.throws(() => driver.name({id: '--privileged'}));
   await assert.rejects(driver.inspect(w), /标识/);
   assert.equal(commands.length, 1);
-  await assert.rejects(driver.stop({shared: true, containerName: 'dcw-workspace-1'}), /共享/);
+  // 共享工作区**不再**被一口回绝：在只有两三个名额的机器上，那条规矩的
+  // 实际后果是共享的那个白占一个名额、全班只剩一个能用。现在它跟别的
+  // 工作区走同一条路（没在跑就直接返回），代价写在界面的确认框里。
+  const friendly = new DockerDriver({command: async (_, args) => args[0] === 'inspect'
+    ? {stdout: JSON.stringify([{State: {Running: false}, Config: {Labels: {'dcw.classroom': '1'}}, NetworkSettings: {Ports: {}}, Mounts: []}])}
+    : {stdout: ''}});
+  await friendly.stop({shared: true, containerName: 'dcw-workspace-1'});
+
+  // 名额和单容器内存都能用环境变量压过去——一台机器该跑几个学生是部署
+  // 时的判断，不该是重新发一版才能改的东西。
+  assert.equal(new DockerDriver({maxRunning: 5, memory: '1200m'}).maxRunning, 5);
+  assert.equal(new DockerDriver({maxRunning: 5, memory: '1200m'}).memory, '1200m');
 });
 
 test('强制直播：只上架活着的会话、路名用学生名字、旧版本 dct 给一句人话', async () => {
