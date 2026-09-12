@@ -416,7 +416,7 @@ async fn live_stop_route(
 
 /// 手机网页本体。
 ///
-/// **跟守护进程在局域网上发的是同一份字节**（`dct_page::PAGE`），不是抄过来
+/// **跟守护进程在局域网上发的是同一份字节**（`dct_page::page()`），不是抄过来
 /// 的一份。两份各自演化的网页，最贵的地方在于其中一份的 bug 只在另一种模式
 /// 下才复现，而那时候没人会想到去对比两个文件。
 ///
@@ -424,7 +424,14 @@ async fn live_stop_route(
 /// 是下一步的事。现在就把路由接上，是因为"两边发同一份"这条性质要从它有
 /// 第二个服务端的第一天起就成立——补挂上去的那天，多半已经有人拷过一份了。
 async fn page_route() -> axum::response::Html<&'static str> {
-    axum::response::Html(dct_page::PAGE)
+    axum::response::Html(dct_page::page())
+}
+
+/// 直播观众页。**只读，只有中转发**——它没有局域网那一档（学生从来不在
+/// 老师家的局域网里）。跟 `page_route` 同一个理由挂在这儿：`dct-page` 是
+/// 两边唯一的真相来源，这里只是把已经打包好的字节交给 axum。
+async fn live_page_route() -> axum::response::Html<&'static str> {
+    axum::response::Html(dct_page::live_page())
 }
 
 async fn poll_route(
@@ -460,7 +467,10 @@ pub fn router(state: AppState) -> Router {
         .route(dct_link::live::PATH_START, post(live_start_route))
         .route(dct_link::live::PATH_FRAME, post(live_push_route))
         .route("/live/{id}/frame", get(live_frame_route))
-        .route("/live/{id}", axum::routing::delete(live_stop_route))
+        .route(
+            "/live/{id}",
+            get(live_page_route).delete(live_stop_route),
+        )
         // base64 放大 1.33 倍，再给信封的其余字段留点空。比这还大的东西在
         // 读进内存之前就该被挡掉——`send` 里那条 `TooBig` 管的是这条线以下、
         // `MAX_PAYLOAD` 以上的部分，那部分才值得回一个说得清的错误码。
@@ -930,7 +940,7 @@ mod tests {
     fn the_page_speaks_the_same_envelope_version_this_relay_does() {
         let want = format!("var LINK_VERSION = {LINK_VERSION};");
         assert!(
-            dct_page::PAGE.contains(&want),
+            dct_page::page().contains(&want),
             "网页里找不到 `{want}`——信封版本改了，那一页没跟上"
         );
     }
@@ -958,7 +968,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             body.as_ref(),
-            dct_page::PAGE.as_bytes(),
+            dct_page::page().as_bytes(),
             "中转发的网页跟守护进程发的不是同一份了"
         );
     }

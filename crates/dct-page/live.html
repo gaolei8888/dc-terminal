@@ -1,0 +1,384 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>dct</title>
+<!--
+  直播观众页：学生打开老师分享的链接看到的整个前端。**只读**，第 0 期。
+
+  规矩，改这个文件之前先读：
+
+  1. **这一页没有任何一条能把字节送回老师终端的路。** 不是某处 `if` 判出来
+     的只读——是这份字节里根本没有那些路径：没有输入框、没有虚拟键、没有
+     `/api/*`、没有任何一处调用会把东西 POST 回老师那台机器。`dct-page`
+     里有一条测试专门扫这份文件，钉的就是这件事；它比自觉可靠，但**不能
+     代替**——加新功能之前想一想它是不是在往这份字节里加一条送出去的路。
+  2. **一个字的用户可见文案都不许是英文字面量。** 中文字面量这一版**允许**
+     ——`/live/<id>/strings` 那张文案表还没接上（是后面一个任务的事），
+     先把中文写死在这里，等文案表接上再换成 `t("key")`。这是唯一一处跟
+     `page.html` 的老规矩不一样的地方，写在这儿是因为它是暂时的、有意的
+     豁免，不是疏漏。
+  3. **没有外部资源。** 没有 CDN、没有字体、没有图。
+  4. **不改 PTY 尺寸。** 这一页只看画面，尺寸归开播那台电脑的桌面端决定
+     （跟手机端同一条规矩）。
+  5. **渲染那一份代码（配色、主题三档、`paint`/`fitFont`/`cellSize`）跟
+     `page.html` 共用一份**，接在 `<!--SHARED-->` 那个占位符的位置——理由
+     和对这段文本的约定写在 `shared.js` 开头。
+-->
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #14161b;
+    --dim: #5b6472;
+    --line: #d9dde3;
+    --accent: #005f87;
+    --ok: #2f6f3e;
+    --busy: #8a5a00;
+    --bad: #a8322a;
+  }
+  /* 深色那一档写两遍，同 `page.html` 那段注释：一份跟系统、一份跟用户
+     在这一页上明确选过的那一档，两份都要能压过对方。 */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1116;
+      --card: #171a20;
+      --ink: #e7eaef;
+      --dim: #8b95a5;
+      --line: #262b34;
+      --accent: #63b3d9;
+      --ok: #7fc08c;
+      --busy: #e8c07d;
+      --bad: #e88c7d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1116;
+    --card: #171a20;
+    --ink: #e7eaef;
+    --dim: #8b95a5;
+    --line: #262b34;
+    --accent: #63b3d9;
+    --ok: #7fc08c;
+    --busy: #e8c07d;
+    --bad: #e88c7d;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #14161b;
+    --dim: #5b6472;
+    --line: #d9dde3;
+    --accent: #005f87;
+    --ok: #2f6f3e;
+    --busy: #8a5a00;
+    --bad: #a8322a;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+    padding: .8rem 1rem;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+  }
+  header.bad { background: var(--bad); color: var(--bg); border-color: var(--bad); }
+  header.warn { background: var(--busy); color: var(--bg); border-color: var(--busy); }
+  #dot { font-size: 1rem; line-height: 1; }
+  #status { font-weight: 600; font-size: .95rem; }
+  #viewers { font-size: .8rem; color: var(--dim); }
+  header.bad #viewers, header.warn #viewers { color: var(--bg); }
+  #lanes { display: flex; gap: .3rem; flex-wrap: wrap; margin-left: auto; }
+  #lanes button {
+    background: none; border: 1px solid var(--line); border-radius: .35rem;
+    min-width: 2rem; min-height: 1.8rem;
+    font: inherit; font-size: .8rem; color: var(--ink); cursor: pointer;
+  }
+  #lanes button.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  #tools { display: flex; gap: .3rem; }
+  #tools button {
+    background: none; border: 1px solid var(--line); border-radius: .35rem;
+    min-width: 2rem; min-height: 1.8rem;
+    font: inherit; font-size: .8rem; color: var(--ink); cursor: pointer;
+  }
+  header.bad #lanes button, header.bad #tools button,
+  header.warn #lanes button, header.warn #tools button {
+    border-color: var(--bg); color: var(--bg);
+  }
+  #screen { flex: 1 1 auto; min-height: 0; position: relative; padding: .5rem; overflow: auto; }
+  :root { --mono: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace; }
+  #screen pre {
+    margin: 0;
+    font-family: var(--mono);
+    line-height: 1.2;
+    white-space: pre;
+    -webkit-text-size-adjust: none;
+    text-size-adjust: none;
+  }
+  #ruler { position: absolute; visibility: hidden; white-space: pre; font-family: var(--mono); }
+  .notice { padding: 2rem 1rem; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<header id="head">
+  <span id="dot"></span>
+  <span id="status"></span>
+  <span id="viewers" hidden></span>
+  <span id="lanes"></span>
+  <span id="tools">
+    <button type="button" id="zoomout" aria-label="缩小">A&minus;</button>
+    <button type="button" id="zoomin" aria-label="放大">A+</button>
+    <button type="button" id="theme" aria-label="配色">&#9681;</button>
+  </span>
+</header>
+<div id="screen"><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre></div>
+<script>
+(function () {
+  "use strict";
+
+  var canvasEl = document.getElementById("canvas");
+  var rulerEl = document.getElementById("ruler");
+  var screenEl = document.getElementById("screen");
+  var headEl = document.getElementById("head");
+  var dotEl = document.getElementById("dot");
+  var statusEl = document.getElementById("status");
+  var viewersEl = document.getElementById("viewers");
+  var lanesEl = document.getElementById("lanes");
+  var themeEl = document.getElementById("theme");
+
+  // ——渲染那一份，跟 page.html 共用——
+  <!--SHARED-->
+
+  // ——身份：这一场直播的 id，和学生那把只读钥匙——
+  //
+  // id 是路径最后一段（`/live/<id>`）；钥匙在链接的 fragment 里
+  // （`#t=<token>`），fragment 不上行、不进任何中间日志。读一次就把地址栏
+  // 抹干净——同手机端 `page.html` 那一套的理由：**但**这里额外存进
+  // `sessionStorage`（不是 30 天的 cookie）：直播本身是这堂课这一次性的
+  // 东西，教室里刷新一次页面不该要求老师再发一遍链接，可它也不值得像手机
+  // 端那样长期免登录 30 天。
+  var LIVE_ID = (function () {
+    var parts = location.pathname.split("/").filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "";
+  })();
+
+  var TOKEN = (function claim() {
+    var storeKey = "dct-live-token-" + LIVE_ID;
+    var m = /(?:^|[#&])t=([^&]+)/.exec(location.hash || "");
+    if (m) {
+      try { sessionStorage.setItem(storeKey, m[1]); } catch (e) {}
+      history.replaceState(null, "", location.pathname);
+      return m[1];
+    }
+    try { return sessionStorage.getItem(storeKey) || ""; } catch (e) { return ""; }
+  })();
+
+  // ——上架的几路——
+  //
+  // 中转眼下还没有一条路径能把"这场直播开了哪几路、叫什么名字"告诉学生页
+  // （那条路径留给以后接文案/看板的任务）。这一版先按老师那边的硬上限
+  // （`dct_link::live::MAX_LANES`，JS 引用不了 Rust 的常量，这里抄一份，
+  // 数字对不上就改这里）摆出固定几个按钮，点哪个就看哪一路；老师没开的
+  // 那几路点了看不到画面，跟直播还没开始时长得一样。
+  var MAX_LANES = 4;
+  var lane = 0;
+
+  function buildLanes() {
+    lanesEl.textContent = "";
+    for (var i = 0; i < MAX_LANES; i++) {
+      (function (idx) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.textContent = String(idx + 1);
+        b.className = idx === lane ? "on" : "";
+        b.addEventListener("click", function () { pickLane(idx); });
+        lanesEl.appendChild(b);
+      })(i);
+    }
+  }
+
+  function pickLane(idx) {
+    if (idx === lane) { return; }
+    lane = idx;
+    etag = null;
+    ended = false;
+    lastChangeAt = Date.now();
+    Array.prototype.forEach.call(lanesEl.children, function (b, i) {
+      b.className = i === lane ? "on" : "";
+    });
+    render();
+    pull();
+  }
+
+  // ——字号——
+  //
+  // 纯本地：调整只改这台设备上的显示，不发任何请求。跟手机端 `page.html`
+  // 同一个键（`dct-zoom`）——两页各自的 origin 不同，存储互不相干。
+  var zoom = 1;
+  try {
+    var saved = parseFloat(localStorage.getItem("dct-zoom"));
+    if (saved > 0.3 && saved < 4) { zoom = saved; }
+  } catch (e) {}
+
+  function setZoom(z) {
+    zoom = Math.max(0.5, Math.min(3, z));
+    try { localStorage.setItem("dct-zoom", String(zoom)); } catch (e) {}
+    fitFont(lastCols, lastRows);
+  }
+
+  document.getElementById("zoomout").addEventListener("click", function () { setZoom(zoom / 1.15); });
+  document.getElementById("zoomin").addEventListener("click", function () { setZoom(zoom * 1.15); });
+
+  // ——主题三档，纯本地——
+  var lastLines = null;
+  function repaint() { if (lastLines) { paint(lastLines); } }
+  function applyTheme() {
+    var t = THEMES[themeIdx];
+    if (t === "system") { document.documentElement.removeAttribute("data-theme"); }
+    else { document.documentElement.setAttribute("data-theme", t); }
+    repaint();
+  }
+  if (window.matchMedia) {
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    var onSys = function () { if (THEMES[themeIdx] === "system") { applyTheme(); } };
+    if (mq.addEventListener) { mq.addEventListener("change", onSys); }
+    else if (mq.addListener) { mq.addListener(onSys); }
+  }
+  themeEl.addEventListener("click", function () {
+    themeIdx = (themeIdx + 1) % THEMES.length;
+    try { localStorage.setItem("dct-theme", THEMES[themeIdx]); } catch (e) {}
+    applyTheme();
+  });
+
+  window.addEventListener("resize", function () { fitFont(lastCols, lastRows); });
+
+  // ——三种状态——
+  //
+  // `live`：最近一次拉帧成功。`paused`：拉帧还在成功，只是画面已经
+  // `STALE_MS` 没变过——**这是纯客户端的猜测**，中转不会告诉学生"老师在
+  // 发呆"，能看到的只有"画面变没变"。`ended`：拉帧本身失败了（这场直播
+  // 在中转那边已经不存在，或者这把令牌不对——两者中转故意回同一个错，学生
+  // 分不出来，也不需要分：不管哪一种，这一页对这个学生来说都到头了）。
+  var lastCols = 0, lastRows = 0;
+  var STALE_MS = 60000;
+  var etag = null;
+  var lastChangeAt = Date.now();
+  var inflight = false;
+  var ended = false;
+  var state = "live";
+
+  var ICON = { live: "●", paused: "◌", ended: "×" };
+  var TEXT = { live: "直播中", paused: "老师暂停了", ended: "这场直播结束了" };
+
+  function render() {
+    dotEl.textContent = ICON[state];
+    statusEl.textContent = TEXT[state];
+    headEl.className = state === "ended" ? "bad" : state === "paused" ? "warn" : "";
+  }
+
+  function frameUrl() {
+    return "/live/" + LIVE_ID + "/frame?lane=" + lane + "&wait=1";
+  }
+
+  function draw(screen) {
+    var lines = screen.lines || [];
+    lastLines = lines;
+    var cols = paint(lines);
+    lastCols = cols;
+    lastRows = lines.length;
+    fitFont(cols, lines.length);
+  }
+
+  function markEnded() {
+    ended = true;
+    state = "ended";
+    render();
+  }
+
+  // 一次只飞一个请求，答案回来之前不发下一个——同手机端 `screenInflight`
+  // 那道闸,理由一样：链路一慢，叠起来的请求只会越叠越慢。
+  function pull() {
+    if (ended || inflight || document.visibilityState !== "visible") { return; }
+    inflight = true;
+    var headers = { "x-live-token": TOKEN };
+    if (etag !== null) { headers["If-None-Match"] = "\"" + etag + "\""; }
+    fetch(frameUrl(), { headers: headers, credentials: "omit" })
+      .then(function (r) {
+        inflight = false;
+        if (r.status === 304) {
+          schedule(0);
+          return;
+        }
+        if (!r.ok) {
+          markEnded();
+          return;
+        }
+        var newEtag = r.headers.get("etag");
+        // body 是 gzip 过的 JSON——**浏览器已经按 Content-Encoding 解开了**，
+        // 这里拿到的就是明文文本，不能再喂给 DecompressionStream 解第二遍。
+        return r.text().then(function (text) {
+          if (newEtag) { etag = newEtag.replace(/"/g, ""); }
+          // 一路还没被老师推过帧：`Live` 里新开的 lane 起手是空 body。
+          // 这跟"直播结束了"不是一回事，继续等下一轮就好。
+          if (!text) { schedule(0); return; }
+          var frame;
+          try { frame = JSON.parse(text); } catch (e) { schedule(0); return; }
+          if (!frame || !frame.Screen) { schedule(0); return; }
+          lastChangeAt = Date.now();
+          if (state !== "live") { state = "live"; }
+          draw(frame.Screen);
+          render();
+          schedule(0);
+        });
+      })
+      .catch(function () {
+        inflight = false;
+        // 网络本身抖了一下，不代表直播真的没了——退避重试，不当场判死刑。
+        schedule(2000);
+      });
+  }
+
+  function schedule(delay) {
+    setTimeout(pull, delay);
+  }
+
+  // 每几秒检查一次"画面是不是太久没变了"——这一档跟拉帧成不成功无关，
+  // 纯粹是本地一个计时器，所以单独摆一个循环，不挂在 `pull` 的回调链上。
+  setInterval(function () {
+    if (ended) { return; }
+    var stale = Date.now() - lastChangeAt > STALE_MS;
+    var next = stale ? "paused" : "live";
+    if (next !== state) {
+      state = next;
+      render();
+    }
+  }, 2000);
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") { pull(); }
+  });
+
+  buildLanes();
+  applyTheme();
+  render();
+  pull();
+})();
+</script>
+</body>
+</html>
