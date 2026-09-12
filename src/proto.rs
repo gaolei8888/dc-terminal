@@ -95,7 +95,12 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 和 `Response::Live(LiveInfo)`。**加一，没有例外可讲**：新增 `Request`
 /// 变体那条规矩没得商量——旧守护进程收到 `LiveStart` 只会回一句解析失败，
 /// 而用户看到的是「按了开关什么都没发生」。同 `WebEnable` 那次。
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// 15 = `LiveInfo` 多了 `readiness` 字段：中转认没认得这场直播（老师拿到
+/// 链接那一刻，中转很可能还没被推帧线程告知这场直播存在）。旧界面解不出
+/// 多了一个必填字段的 `LiveInfo`——形状变了就得加一，跟 13 那次是同一条
+/// 规矩。
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,6 +684,28 @@ pub struct LiveInfo {
     pub url: String,
     pub staged: Vec<(u32, String)>,
     pub viewers: u32,
+    /// 中转认没认得这场直播。
+    ///
+    /// `LiveState::start()` 是同步的，一返回就有完整的学生链接；而真正
+    /// 告诉中转「这场直播存在」（`POST /live/start`）是推帧线程按
+    /// `PUSH_INTERVAL` 异步去做的。没有这个字段，老师点完「开始直播」的
+    /// 那一瞬就会拿着一条链接去发给全班，而那时中转很可能还不知道这场
+    /// 直播——界面无从分辨「链接已经能用」和「刚生成、还在等中转答应」。
+    pub readiness: LiveReadiness,
+}
+
+/// 见 [`LiveInfo::readiness`]。`Failed` 带的原因是一句已经本地化过的人话
+/// （连不上中转 / 中转拒绝了），**绝不是原始错误文本或者 `push_secret`**
+/// ——这个类型要经手协议线，见 `LiveInfo` 上的文档注释。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiveReadiness {
+    /// 本地已经生成好链接，但还没成功告诉过中转——这时候把链接发出去，
+    /// 学生打开大概率是打不开的。
+    Pending,
+    /// 中转已经收下这场直播，链接现在真的能用。
+    Ready,
+    /// 上一次尝试告诉中转失败了。
+    Failed(String),
 }
 
 impl std::fmt::Debug for LiveInfo {
@@ -689,6 +716,7 @@ impl std::fmt::Debug for LiveInfo {
             .field("url", &"<redacted>")
             .field("staged", &self.staged)
             .field("viewers", &self.viewers)
+            .field("readiness", &self.readiness)
             .finish()
     }
 }
@@ -1103,7 +1131,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                14,
+                15,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1128,7 +1156,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                14,
+                15,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1237,7 +1265,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                14,
+                15,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1344,7 +1372,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (14, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (15, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1379,6 +1407,7 @@ mod tests {
             url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
             staged: vec![(1, "前端".into())],
             viewers: 2,
+            readiness: LiveReadiness::Pending,
         };
         let s = format!("{info:?}");
         assert!(s.contains("7f3a2c91"), "id 不敏感，该照常打印：{s}");
@@ -1398,6 +1427,7 @@ mod tests {
             url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
             staged: vec![(1, "前端".into())],
             viewers: 2,
+            readiness: LiveReadiness::Ready,
         });
         let json = serde_json::to_string(&r).unwrap();
         assert!(

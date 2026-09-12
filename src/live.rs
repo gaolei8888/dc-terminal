@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dct_link::live::{KEEPALIVE, PATH_FRAME, PUSH_INTERVAL};
+use dct_link::live::{KEEPALIVE, MAX_FRAME_BYTES, PATH_FRAME, PUSH_INTERVAL};
 
-use crate::proto::LiveInfo;
+use crate::proto::{LiveInfo, LiveReadiness};
 use crate::pty::ScreenSpan;
 use crate::session::SessionManager;
 
@@ -46,6 +46,10 @@ struct Room {
     #[allow(dead_code)]
     push_secret: String,
     staged: Vec<(u32, String)>,
+    /// 中转认没认得这场直播——见 `LiveInfo::readiness` 的文档注释。
+    /// `start()` 时总是 `Pending`：这一刻中转还完全没听说过这个 id，
+    /// 推帧线程调用 `POST /live/start` 成功之后才会翻成 `Ready`。
+    readiness: LiveReadiness,
 }
 
 /// 守护进程里的直播状态槽。
@@ -87,6 +91,10 @@ impl LiveState {
             url,
             staged: staged.clone(),
             viewers: 0,
+            // 这一刻中转还完全不知道这场直播存在——`readiness` 如实说
+            // 「还没就绪」，不能骗调用方（最终是老师那块屏幕）说链接已经
+            // 能用了。见 `LiveInfo::readiness` 的文档注释。
+            readiness: LiveReadiness::Pending,
         };
 
         *recover(self.room.lock()) = Some(Room {
@@ -94,6 +102,7 @@ impl LiveState {
             token,
             push_secret,
             staged,
+            readiness: LiveReadiness::Pending,
         });
 
         info
@@ -118,6 +127,7 @@ impl LiveState {
                 url: format!("{}/live/{}#t={}", self.base, room.id, room.token),
                 staged: room.staged.clone(),
                 viewers: 0,
+                readiness: room.readiness.clone(),
             },
             None => LiveInfo {
                 id: String::new(),
@@ -125,7 +135,31 @@ impl LiveState {
                 url: String::new(),
                 staged: Vec::new(),
                 viewers: 0,
+                readiness: LiveReadiness::Pending,
             },
+        }
+    }
+
+    /// 推帧线程告诉中转「这场直播存在」成功之后调这个方法，把 `readiness`
+    /// 翻成 `Ready`。**只在 `id` 还对得上时才生效**：推帧线程这次
+    /// `POST /live/start` 可能是对着一场已经被 `stop()`/被新的一场顶掉的
+    /// 直播做的（网络慢、正好撞上老师连点两下），这时候写回来的「已就绪」
+    /// 属于一场已经不存在的直播，不能套到当前这一场头上。
+    pub(crate) fn mark_ready(&self, id: &str) {
+        if let Some(room) = recover(self.room.lock()).as_mut() {
+            if room.id == id {
+                room.readiness = LiveReadiness::Ready;
+            }
+        }
+    }
+
+    /// 同 [`Self::mark_ready`]，但这次是失败——`reason` 是一句已经本地化
+    /// 过的人话，不是原始错误文本。
+    pub(crate) fn mark_failed(&self, id: &str, reason: String) {
+        if let Some(room) = recover(self.room.lock()).as_mut() {
+            if room.id == id {
+                room.readiness = LiveReadiness::Failed(reason);
+            }
         }
     }
 
@@ -240,14 +274,15 @@ fn frame_of(lines: &[Vec<ScreenSpan>]) -> Vec<u8> {
 
 /// 这一屏现在长什么样，压成一个能比较的数。
 ///
-/// **哈希的是压缩前的 JSON，不是 `frame_of` 的输出。** gzip 的头里带着
-/// 时间戳（`flate2` 默认的 `GzHeader` 不是空的），同一屏内容两次压缩出来
-/// 的字节不保证相同——拿压缩后的字节去比较「画面变没变」，会把「没变」
-/// 误判成「变了」，`should_push` 因此永远推，白白丢掉这个函数存在的意义。
-/// `ScreenSpan`/`ScreenStyle` 没派生 `Hash`（它们是协议类型，不该为了这
-/// 一处内部用途多背一个 derive），序列化成 JSON 再哈希就绕开了这件事，
-/// 代价是每一路每一轮多算一次 JSON——量级上跟 `frame_of` 自己那次持平，
-/// 换一次画面不变时省下的整条网络请求，这笔账划算。
+/// **哈希的是压缩前的 JSON，不是 `frame_of` 的输出**——不是因为 gzip 头
+/// 的时间戳（本仓库锁定的 `flate2` + `rust_backend` 组合下 mtime 恒为 0，
+/// 同一份输入两次压缩字节完全相同，压缩后的字节其实也能拿来比较），而是
+/// 不想让「画面变没变」这个判断依赖某个压缩库版本/后端的实现细节——
+/// 哪天 `flate2` 的默认行为变了（比如换后端、换了 mtime 策略），这里不该
+/// 跟着遭殃。`ScreenSpan`/`ScreenStyle` 没派生 `Hash`（它们是协议类型，
+/// 不该为了这一处内部用途多背一个 derive），序列化成 JSON 再哈希顺带绕开
+/// 了这件事，代价是每一路每一轮多算一次 JSON——量级上跟 `frame_of` 自己
+/// 那次持平，换一次画面不变时省下的整条网络请求，这笔账划算。
 fn hash_of(lines: &[Vec<ScreenSpan>]) -> u64 {
     let json = serde_json::to_vec(lines).unwrap_or_default();
     let mut h = DefaultHasher::new();
@@ -276,6 +311,11 @@ impl PusherHandle {
 /// 只起一条：同一时刻最多一场直播（见 `LiveState` 上的文档注释），这条
 /// 线程整个守护进程生命周期里只需要有一个，它自己每一轮去问「现在在播
 /// 哪一场」，没有播就什么也不做。
+///
+/// 返回的 `PusherHandle` 在生产唯一的调用点（`daemon.rs::run_with_manager`）
+/// **有意具名丢弃**：这条线程本就该活到进程退出，没有谁会在运行中把它
+/// 叫停——`stop()` 存在只是为了让测试能在一次 `cargo test` 里干净地结束
+/// 这条线程，不是给生产代码用的开关。
 pub fn spawn_pusher(live: Arc<LiveState>, mgr: Arc<SessionManager>) -> PusherHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let st = stop.clone();
@@ -286,8 +326,9 @@ pub fn spawn_pusher(live: Arc<LiveState>, mgr: Arc<SessionManager>) -> PusherHan
 }
 
 /// 推帧线程的主循环。**IO 薄薄一层**：该不该推（`should_push`）、帧长什么
-/// 样（`frame_of`/`hash_of`）都是上面那几个纯函数，这里只负责醒过来、
-/// 读一次会话屏幕、决定发不发、真的发。
+/// 样（`frame_of`/`hash_of`）、一路该怎么处理一次尝试（`attempt_lane`）都
+/// 是能脱离整条线程单独测的函数，这里只负责醒过来、读一次会话屏幕、把
+/// 结果记回 `lanes`。
 fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     let agent = crate::sys::tls::agent_builder()
         .timeout_connect(Duration::from_secs(5))
@@ -296,9 +337,9 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
         .build();
     let base = live.base().to_string();
 
-    // 每一路各自的「上次哈希、上次推的时间」，按会话 id 记账（不是下标）：
-    // 一场直播里 `staged` 的顺序定了就不会再变，但用 id 对齐比信任下标
-    // 稳——万一将来上架顺序会变，这里不用跟着改。
+    // 每一路各自的「上次**成功推送**的哈希、时间」，按会话 id 记账（不是
+    // 下标）：一场直播里 `staged` 的顺序定了就不会再变，但用 id 对齐比
+    // 信任下标稳——万一将来上架顺序会变，这里不用跟着改。
     let mut lanes: HashMap<u32, (u64, Instant)> = HashMap::new();
     // 上一轮看到的房间，停播时要靠它才知道该对哪个 id、拿哪把钥匙发
     // `DELETE`——那一轮 `snapshot()` 已经答不出来了。
@@ -317,20 +358,34 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                 // 绝不推帧——推了也是白推，中转会把它当成「这场直播不
                 // 存在」拒收，而更要紧的是：**不能把「本地生成了 id、
                 // 拼好了链接」悄悄当成「学生的链接已经能打开」**。失败就
-                // 原地留着，下一轮 `PUSH_INTERVAL` 自动重试。
+                // 原地留着，下一轮 `PUSH_INTERVAL` 自动重试；`LiveInfo`
+                // 那侧的 `readiness` 字段能让老师那块屏幕如实反映这件事，
+                // 而不是无条件显示"已经能用了"。
                 if started_id.as_deref() != Some(room.id.as_str()) {
-                    if !start_room(&agent, &base, &room) {
-                        nap(stop, PUSH_INTERVAL);
-                        continue;
+                    match start_room(&agent, &base, &room) {
+                        Ok(()) => {
+                            live.mark_ready(&room.id);
+                            started_id = Some(room.id.clone());
+                            // 新的一场，旧的哈希对不上号，从头判断该不该推。
+                            lanes.clear();
+                        }
+                        Err(reason) => {
+                            live.mark_failed(&room.id, reason);
+                            nap(stop, PUSH_INTERVAL);
+                            continue;
+                        }
                     }
-                    started_id = Some(room.id.clone());
-                    // 新的一场，旧的哈希对不上号，从头判断该不该推。
-                    lanes.clear();
                 }
                 last_room = Some((room.id.clone(), room.push_secret.clone()));
                 let ids: Vec<u32> = room.staged.iter().map(|(id, _)| *id).collect();
                 let screens = mgr.screens(&ids);
                 let now = Instant::now();
+                let client = RelayClient {
+                    agent: &agent,
+                    base: &base,
+                    id: &room.id,
+                    secret: &room.push_secret,
+                };
                 for (lane, (sid, _name)) in room.staged.iter().enumerate() {
                     // 会话可能在上架之后、这一轮之前就没了（被停掉、被
                     // 强杀）：跳过，不是错误——下一次上架会给出一份新的
@@ -338,25 +393,14 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     let Some(entry) = screens.iter().find(|e| e.id == *sid) else {
                         continue;
                     };
-                    let hash = hash_of(&entry.lines);
-                    let (last_hash, since) = match lanes.get(sid) {
-                        Some((h, t)) => (Some(*h), now.duration_since(*t)),
-                        None => (None, Duration::ZERO),
-                    };
-                    if !should_push(last_hash, hash, since) {
-                        continue;
+                    match attempt_lane(&client, lane, &entry.lines, lanes.get(sid).copied(), now) {
+                        Some(recorded) => {
+                            lanes.insert(*sid, recorded);
+                        }
+                        None => {
+                            lanes.remove(sid);
+                        }
                     }
-                    // 画面没变、纯粹是保活：空 body，中转只续 TTL，不换
-                    // etag、不叫醒任何学生（见 `dct-srv` 那侧 `Live::push`
-                    // 的注释）。
-                    let keepalive = last_hash == Some(hash);
-                    let body = if keepalive {
-                        Vec::new()
-                    } else {
-                        frame_of(&entry.lines)
-                    };
-                    push_frame(&agent, &base, &room.id, &room.push_secret, lane, body);
-                    lanes.insert(*sid, (hash, now));
                 }
             }
             None => {
@@ -375,6 +419,66 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     }
 }
 
+/// 一路一轮该做什么、做完之后这一路的记账该更新成什么样。从 `pusher_loop`
+/// 里抽出来，好让「失败不改记账，下一轮带着真内容重试」这条规则脱离整条
+/// 线程、只用一个假中转就能测（见 `attempt_lane` 相关测试）。
+///
+/// `last` 是这一路上次**成功**推送的 `(哈希, 时间)`；返回值是这一路推完
+/// 这一次尝试之后该记的新值——`None` 表示「什么都还没成功过，保持
+/// `lanes` 里没有这一路」。
+///
+/// **只有真的推成功才更新记账。** 早先的版本无条件 `lanes.insert`，导致
+/// 任何一次真实失败（网络抖动、中转不可达、`413`）都会被本地记成
+/// "已送达"：此后只要画面不再变化，`should_push` 走的是保活分支、发的是
+/// 空 body——那一帧真正的内容再也没有机会重发，除非画面又变成一个新
+/// hash。现在失败就原样返回 `last`，下一轮 `should_push` 看到的还是那个
+/// 没被更新的旧记账，会认为内容还没送到，带着真内容重试。
+///
+/// 这一轮里推帧要用到的四样跟"这场直播、这个中转"有关、每一路都一样的
+/// 东西——拆出来是为了让 `attempt_lane` 的参数少一点（clippy 的
+/// `too_many_arguments`），不是有什么别的意义。
+struct RelayClient<'a> {
+    agent: &'a ureq::Agent,
+    base: &'a str,
+    id: &'a str,
+    secret: &'a str,
+}
+
+fn attempt_lane(
+    client: &RelayClient,
+    lane: usize,
+    lines: &[Vec<ScreenSpan>],
+    last: Option<(u64, Instant)>,
+    now: Instant,
+) -> Option<(u64, Instant)> {
+    let hash = hash_of(lines);
+    let (last_hash, since) = match last {
+        Some((h, t)) => (Some(h), now.duration_since(t)),
+        None => (None, Duration::ZERO),
+    };
+    if !should_push(last_hash, hash, since) {
+        return last;
+    }
+    // 画面没变、纯粹是保活：空 body，中转只续 TTL，不换 etag、不叫醒任何
+    // 学生（见 `dct-srv` 那侧 `Live::push` 的注释）。
+    let keepalive = last_hash == Some(hash);
+    let body = if keepalive { Vec::new() } else { frame_of(lines) };
+    if !keepalive && body.len() > MAX_FRAME_BYTES {
+        // 帧本身压完还是超过中转能收的上限：这不是网络抖动，重试没有
+        // 意义——同样的内容再压一次还是这么大，一直重试就是用一个必然
+        // 失败的请求换不会成功的结果，是个死循环。这里按「已经处理过」
+        // 记账（等价于推成功），好让 `should_push` 不再对着**同一屏内容**
+        // 反复触发；等画面变了（哈希变了）才会再试一次——学生就是会停在
+        // 上一帧能用的画面上，这比无限重试或者假装发出去了都诚实。
+        return Some((hash, now));
+    }
+    if push_frame(client.agent, client.base, client.id, client.secret, lane, &body) {
+        Some((hash, now))
+    } else {
+        last
+    }
+}
+
 /// `POST {base}/live/start` 的请求体——跟 `dct-srv::LiveStartRequest` 字段
 /// 一一对应，两边各写各的、靠字段名对齐（两个 crate 谁也不依赖谁，见
 /// 模块头）。
@@ -390,13 +494,13 @@ struct StartBody<'a> {
 /// 之前成功过一次**——不然中转认不出这个 id，第一次推帧会被当成「这场
 /// 直播不存在」拒收。
 ///
-/// 回 `bool`，不是 `Result`：调用点只关心「成功了没有」，失败的原因（连
-/// 不上中转、中转认为这把钥匙不对）都只导向同一个动作——这一轮先别推，
-/// 下一轮 `PUSH_INTERVAL` 再试一次。**绝不能在失败时假装成功**：那等于
-/// 老师看着一条已经生成好的链接，学生打开却永远转圈，而 dct 这边毫无
-/// 察觉——`pusher_loop` 靠这个返回值决定要不要往下推帧，正是为了不让这
-/// 件事发生。
-fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> bool {
+/// 回 `Result<(), String>`：失败的原因是一句已经本地化过的人话（连不上
+/// 中转 / 中转拒绝了），要经 `LiveState::mark_failed` 走到 `LiveInfo`
+/// 上给界面看——**绝不能是原始错误文本**，那可能带着 URL 之外的实现
+/// 细节；也**绝不能是 `push_secret`**，这条路径就是为了不让它上协议线。
+/// `pusher_loop` 靠这个返回值决定要不要往下推帧：失败就原地留着，下一轮
+/// `PUSH_INTERVAL` 再试一次，绝不假装成功。
+fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> Result<(), String> {
     let url = format!("{base}{}", dct_link::live::PATH_START);
     let lanes = room.staged.iter().map(|(_, name)| name.as_str()).collect();
     let body = StartBody {
@@ -405,21 +509,26 @@ fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> bool {
         push_secret: &room.push_secret,
         lanes,
     };
-    agent.post(&url).send_json(body).is_ok()
+    match agent.post(&url).send_json(body) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("中转拒绝了这场直播（状态码 {code}）")),
+        Err(ureq::Error::Transport(_)) => Err("连不上中转，稍后会自动重试".to_string()),
+    }
 }
 
-/// 推一帧。发不出去就算了——理由同 `link.rs::Link::send`：直播是允许丢的
-/// 那条单向线，下一轮 `PUSH_INTERVAL` 会再试一次，反复重试只会让下一帧
-/// 排更久；**不能把 push_secret 或者失败原因写进日志**，前者是凭据，后者
-/// 多半就是网络错误本身，没有值得诊断的信息。
-fn push_frame(agent: &ureq::Agent, base: &str, id: &str, secret: &str, lane: usize, body: Vec<u8>) {
+/// 推一帧。**回成没成功**——调用点靠这个决定记不记账，见 `attempt_lane`
+/// 上面那段「只有真的推成功才更新记账」的注释；**不能把 push_secret 或者
+/// 失败原因写进日志**，前者是凭据，后者多半就是网络错误本身，没有值得
+/// 诊断的信息。
+fn push_frame(agent: &ureq::Agent, base: &str, id: &str, secret: &str, lane: usize, body: &[u8]) -> bool {
     let url = format!("{base}{PATH_FRAME}");
-    let _ = agent
+    agent
         .post(&url)
         .set("x-live-id", id)
         .set("x-live-lane", &lane.to_string())
         .set("x-live-push", secret)
-        .send_bytes(&body);
+        .send_bytes(body)
+        .is_ok()
 }
 
 /// 停播：告诉中转把这场直播连同两把钥匙一起收掉。同样发不出去就算了——
@@ -575,24 +684,6 @@ mod tests {
         assert!(a.url.contains("#t="), "token 必须在 fragment 里：{}", a.url);
     }
 
-    /// 画面完全一样的两屏，哈希也该一样——`should_push` 全靠这件事才分得清
-    /// 「没变」和「变了」。
-    #[test]
-    fn identical_screens_hash_the_same() {
-        let a = vec![vec![span("hi".into())]];
-        let b = vec![vec![span("hi".into())]];
-        assert_eq!(hash_of(&a), hash_of(&b));
-    }
-
-    /// 哪怕只多一个字符，哈希也要变——不然一屏内容悄悄改了却被当成「没变」，
-    /// 学生就永远看着一帧旧画面。
-    #[test]
-    fn a_changed_screen_hashes_differently() {
-        let a = vec![vec![span("hi".into())]];
-        let b = vec![vec![span("hi!".into())]];
-        assert_ne!(hash_of(&a), hash_of(&b));
-    }
-
     /// 环境变量没设的时候用内置默认值。
     #[test]
     fn no_env_var_falls_back_to_the_default() {
@@ -619,13 +710,21 @@ mod tests {
         );
     }
 
-    /// 假中转：只认推帧和停播这两条路径，记下收到的方法/路径/头/body，
-    /// 好让测试断言真正发出去的请求长什么样。照抄 `link.rs::FakeSrv` 的
-    /// 做法——不拉真的 `dct-srv` 进来，这里只关心 `push_frame`/`stop_room`
-    /// 自己拼的请求对不对，不重新验一遍中转怎么处理它。
+    /// 假中转：只认推帧/开播/停播这三条路径，记下收到的方法/路径/头/body，
+    /// 好让测试断言真正发出去的请求长什么样；还能按吩咐故意失败几次——
+    /// 照抄 `link.rs::FakeSrv` 的做法，不拉真的 `dct-srv` 进来，这里只关心
+    /// `push_frame`/`stop_room`/`start_room`/`attempt_lane` 自己拼的请求
+    /// 对不对，也测「网络抖了一下」这种不重新验一遍中转怎么处理它。
     struct FakeSrv {
         addr: std::net::SocketAddr,
-        got: Arc<Mutex<Vec<Seen>>>,
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        seen: Vec<Seen>,
+        /// 接下来还要故意失败几次（连响应都不给，直接摔断连接）。
+        fail: usize,
     }
 
     #[derive(Debug, Clone)]
@@ -641,24 +740,28 @@ mod tests {
             use std::net::TcpListener;
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-            let got = Arc::new(Mutex::new(Vec::new()));
-            let g = got.clone();
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let s = state.clone();
             std::thread::spawn(move || {
                 for conn in listener.incoming() {
                     let Ok(conn) = conn else { break };
-                    let g = g.clone();
-                    std::thread::spawn(move || serve_one(conn, g));
+                    let s = s.clone();
+                    std::thread::spawn(move || serve_one(conn, s));
                 }
             });
-            FakeSrv { addr, got }
+            FakeSrv { addr, state }
         }
 
         fn base(&self) -> String {
             format!("http://{}", self.addr)
         }
+
+        fn seen(&self) -> Vec<Seen> {
+            recover(self.state.lock()).seen.clone()
+        }
     }
 
-    fn serve_one(mut conn: std::net::TcpStream, got: Arc<Mutex<Vec<Seen>>>) {
+    fn serve_one(mut conn: std::net::TcpStream, state: Arc<Mutex<FakeState>>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let mut reader = BufReader::new(conn.try_clone().unwrap());
         let mut line = String::new();
@@ -688,12 +791,20 @@ mod tests {
         let mut body = vec![0u8; len];
         let _ = reader.read_exact(&mut body);
 
-        recover(got.lock()).push(Seen {
+        let mut st = recover(state.lock());
+        if st.fail > 0 {
+            st.fail -= 1;
+            // 连响应都不给，直接把连接摔上——这是网络抖动/中转挂掉时
+            // 最像的样子（照抄 `link.rs::FakeSrv` 的做法）。
+            return;
+        }
+        st.seen.push(Seen {
             method,
             path,
             headers,
             body,
         });
+        drop(st);
 
         let out = "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = conn.write_all(out.as_bytes());
@@ -701,14 +812,14 @@ mod tests {
 
     /// `push_frame` 带着约定好的三个头（id/lane/push secret）POST 到
     /// `{base}{PATH_FRAME}`，body 就是传进去的那份字节——学生那把 token
-    /// 绝不出现在这条请求里。
+    /// 绝不出现在这条请求里，成功回 `true`。
     #[test]
     fn push_frame_sends_the_agreed_headers_to_the_agreed_path() {
         let srv = FakeSrv::start();
         let agent = crate::sys::tls::agent_builder().build();
-        push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 2, vec![1, 2, 3]);
+        assert!(push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 2, &[1, 2, 3]));
 
-        let seen = recover(srv.got.lock());
+        let seen = srv.seen();
         assert_eq!(seen.len(), 1);
         let req = &seen[0];
         assert_eq!(req.method, "POST");
@@ -724,9 +835,9 @@ mod tests {
     fn a_keepalive_push_has_an_empty_body() {
         let srv = FakeSrv::start();
         let agent = crate::sys::tls::agent_builder().build();
-        push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 0, Vec::new());
+        assert!(push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 0, &[]));
 
-        let seen = recover(srv.got.lock());
+        let seen = srv.seen();
         assert!(seen[0].body.is_empty());
     }
 
@@ -737,7 +848,7 @@ mod tests {
         let agent = crate::sys::tls::agent_builder().build();
         stop_room(&agent, &srv.base(), "abc123", "s3cr3t");
 
-        let seen = recover(srv.got.lock());
+        let seen = srv.seen();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].method, "DELETE");
         assert_eq!(seen[0].path, "/live/abc123");
@@ -757,9 +868,12 @@ mod tests {
             push_secret: "push-s".into(),
             staged: vec![(1, "前端".into()), (2, "后端".into())],
         };
-        assert!(start_room(&agent, &srv.base(), &room), "假中转总是回 204，不该失败");
+        assert!(
+            start_room(&agent, &srv.base(), &room).is_ok(),
+            "假中转总是回 204，不该失败"
+        );
 
-        let seen = recover(srv.got.lock());
+        let seen = srv.seen();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].method, "POST");
         assert_eq!(seen[0].path, dct_link::live::PATH_START);
@@ -770,8 +884,9 @@ mod tests {
         assert_eq!(body["lanes"], serde_json::json!(["前端", "后端"]));
     }
 
-    /// 中转连不上（或者拒了）的时候，`start_room` 必须老实回 `false`——
-    /// `pusher_loop` 靠这个决定要不要往下推帧，绝不能假装开播成功。
+    /// 中转连不上（或者拒了）的时候，`start_room` 必须老实回 `Err`——
+    /// `pusher_loop` 靠这个决定要不要往下推帧，绝不能假装开播成功；原因
+    /// 是一句人话，不能是原始错误文本或者 `push_secret`。
     #[test]
     fn start_room_reports_failure_when_the_relay_is_unreachable() {
         let agent = crate::sys::tls::agent_builder()
@@ -784,6 +899,165 @@ mod tests {
             staged: vec![(1, "前端".into())],
         };
         // 127.0.0.1:1 没人监听，连接会被立刻拒绝——不需要真的等超时。
-        assert!(!start_room(&agent, "http://127.0.0.1:1", &room));
+        let err = start_room(&agent, "http://127.0.0.1:1", &room).unwrap_err();
+        assert!(!err.contains("push-s"), "失败原因里绝不能带着凭据：{err}");
+    }
+
+    /// **推送失败之后，下一轮仍然会带着内容重推，而不是发空 body 保活。**
+    /// 这是本模块要挡住的那个真实 bug：早先的实现无条件记账，失败之后
+    /// `should_push` 会误以为「已经推过了」，此后只发保活的空 body，真内容
+    /// 再也没有机会重发。
+    #[test]
+    fn a_failed_push_is_retried_with_content_not_a_keepalive() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).fail = 1; // 第一次网络请求故意失败
+        let agent = crate::sys::tls::agent_builder().build();
+        let base = srv.base();
+        let client = RelayClient {
+            agent: &agent,
+            base: &base,
+            id: "abc",
+            secret: "s3cr3t",
+        };
+        let lines = vec![vec![span("hi".into())]];
+
+        let now0 = Instant::now();
+        let after_first = attempt_lane(&client, 0, &lines, None, now0);
+        assert_eq!(after_first, None, "第一次没发出去，不该记账");
+
+        let now1 = now0 + Duration::from_millis(10);
+        let after_second = attempt_lane(&client, 0, &lines, after_first, now1);
+        assert!(after_second.is_some(), "第二次该发成功、记上账");
+
+        let seen = srv.seen();
+        assert_eq!(seen.len(), 1, "失败的那次假中转直接摔断连接，不该被记成收到");
+        assert!(!seen[0].body.is_empty(), "第二次带的必须是真内容，不是保活的空 body");
+    }
+
+    /// 帧压完仍然超过中转能收的上限：这不是网络抖动，重试没有意义——一直
+    /// 重试同一份必然超限的内容就是死循环。这里要按「已经处理过」记账，
+    /// 好让 `should_push` 不再对着同一屏内容反复触发，而且这份超限的帧
+    /// 根本不该被发出去。
+    #[test]
+    fn an_oversized_frame_is_skipped_and_not_retried_forever() {
+        let srv = FakeSrv::start();
+        let agent = crate::sys::tls::agent_builder().build();
+        let base = srv.base();
+        let client = RelayClient {
+            agent: &agent,
+            base: &base,
+            id: "abc",
+            secret: "s3cr3t",
+        };
+        let lines = noisy_lines(4000, 160);
+        let frame = frame_of(&lines);
+        assert!(
+            frame.len() > dct_link::live::MAX_FRAME_BYTES,
+            "测试前提不成立：这一屏压完只有 {} 字节，没触发该测的分支",
+            frame.len()
+        );
+
+        let now = Instant::now();
+        let after = attempt_lane(&client, 0, &lines, None, now);
+        assert!(after.is_some(), "超限也要记账，不然会对着同一屏内容永远重试");
+        assert!(srv.seen().is_empty(), "超限的帧根本不该被发出去");
+    }
+
+    /// 同一屏画面连着两轮：第一轮推真内容，紧接着第二轮（时间没到保活线）
+    /// 什么都不该发，撑到保活线的第三轮发的必须是空 body——不是内容。
+    #[test]
+    fn the_same_screen_across_rounds_sends_content_once_then_a_keepalive_later() {
+        let srv = FakeSrv::start();
+        let agent = crate::sys::tls::agent_builder().build();
+        let base = srv.base();
+        let client = RelayClient {
+            agent: &agent,
+            base: &base,
+            id: "abc",
+            secret: "s3cr3t",
+        };
+        let lines = vec![vec![span("hi".into())]];
+
+        let now0 = Instant::now();
+        let after_first = attempt_lane(&client, 0, &lines, None, now0);
+        assert!(after_first.is_some());
+
+        let now1 = now0 + Duration::from_millis(10);
+        let after_second = attempt_lane(&client, 0, &lines, after_first, now1);
+        assert_eq!(after_second, after_first, "画面没变又没到保活线，不该动");
+
+        let now2 = now0 + KEEPALIVE;
+        let after_third = attempt_lane(&client, 0, &lines, after_second, now2);
+        assert!(after_third.is_some());
+
+        let seen = srv.seen();
+        assert_eq!(seen.len(), 2, "只有第一轮和保活那一轮真的发了请求");
+        assert!(!seen[0].body.is_empty(), "第一轮该是真内容");
+        assert!(seen[1].body.is_empty(), "保活那一轮该是空 body");
+    }
+
+    /// 刚 `start()` 完，中转还完全没听说过这场直播——`readiness` 必须如实
+    /// 说「还没就绪」，不能让老师那块屏幕以为链接已经能用了。
+    #[test]
+    fn a_freshly_started_live_is_not_ready_yet() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "前端".into())]);
+        assert_eq!(info.readiness, crate::proto::LiveReadiness::Pending);
+    }
+
+    /// 推帧线程告诉中转成功之后，`readiness` 要翻成 `Ready`。
+    #[test]
+    fn marking_ready_flips_the_readiness() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "前端".into())]);
+        live.mark_ready(&info.id);
+        assert_eq!(live.info().readiness, crate::proto::LiveReadiness::Ready);
+    }
+
+    /// 注册失败要留下原因，供界面显示。
+    #[test]
+    fn marking_failed_records_a_reason() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "前端".into())]);
+        live.mark_failed(&info.id, "连不上中转".into());
+        assert_eq!(
+            live.info().readiness,
+            crate::proto::LiveReadiness::Failed("连不上中转".into())
+        );
+    }
+
+    /// 一场已经不是当前这一场的直播（被 `stop()`/被新的一场顶掉）不该再
+    /// 被一次迟到的 `mark_ready`/`mark_failed` 写坏——那次网络请求本来就
+    /// 是对着一场已经不存在的直播做的。
+    #[test]
+    fn marking_a_stale_id_does_not_touch_the_current_room() {
+        let live = LiveState::new("https://x".into());
+        let stale = live.start(vec![(1, "前端".into())]);
+        let current = live.start(vec![(2, "后端".into())]);
+        live.mark_ready(&stale.id);
+        assert_eq!(
+            live.info().readiness,
+            crate::proto::LiveReadiness::Pending,
+            "迟到的 mark_ready 认错了 id，不该影响当前这一场"
+        );
+        assert_eq!(live.info().id, current.id);
+    }
+
+    /// 造一屏「看起来随机」的内容：足够大、足够没有重复模式，让 gzip 压不
+    /// 小——不需要真随机，一个简单的异或移位生成器就够。
+    fn noisy_lines(rows: usize, cols: usize) -> Vec<Vec<ScreenSpan>> {
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..rows)
+            .map(|_| {
+                let text: String = (0..cols).map(|_| format!("{:x}", next() & 0xf)).collect();
+                vec![span(text)]
+            })
+            .collect()
     }
 }
