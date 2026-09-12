@@ -279,6 +279,35 @@ pub fn bar_style(t: BarTheme) -> Option<Style> {
     t.style()
 }
 
+/// 底栏上「出事了」的那一对颜色（bg, fg）。
+///
+/// **自带背景，不借底栏的。** 理由和 `bar_style` 头上那条是同一条，只是再往
+/// 下一层：错误提示得是红的，而红读不读得清取决于它压在什么底色上——十四档
+/// 底栏的底色从 17 号（近黑）铺到 253 号（近白），没有哪个红能在这一整排上
+/// 都及格。`Amber`（底色 94 = #875f00）是最硬的那一档：整个色立方里对它最
+/// 有利的红也只有 4.35:1，够不着正文要的 4.5。
+///
+/// 所以这里照搬底栏自己的解法——**连底色一起给**，对比度于是不再取决于底下
+/// 那一档是什么：224 压 52 是 8.07:1，十四档下都是这个数。
+/// `every_bar_theme_is_readable` 会把这件事钉住。
+const BAR_DANGER: (u8, u8) = (52, 224);
+
+/// 底栏上一条错误提示该用什么样式。
+///
+/// `Lines` 档（以及 `NO_COLOR`）走 `danger()`，因为那时候底栏**没有**自己的
+/// 背景，字是落在终端背景上的——而那正是 `danger()` 被设计来应付的场合。
+/// 反过来，实色档下调 `danger()` 就是拿「终端背景是深是浅」去猜一个跟终端
+/// 背景毫无关系的问题：浅色终端上它给的是 124 号深红，压在 Slate 那档
+/// #5f5f87 的底上只有 1.21:1，整句话等于没画。
+fn bar_danger(t: BarTheme) -> Style {
+    match bar_style(t) {
+        Some(_) => Style::default()
+            .bg(Color::Indexed(BAR_DANGER.0))
+            .fg(Color::Indexed(BAR_DANGER.1)),
+        None => danger(),
+    }
+}
+
 /// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
 ///
 /// 抽成自由函数是因为有两个调用方——`TerminalGuard::drop` 和信号线程。
@@ -2561,7 +2590,10 @@ fn draw(f: &mut Frame, app: &mut App) {
             None => (BarContent::Keys(bar_keys(app, help_cols)), Style::default()),
         }
     } else if app.message.error {
-        (BarContent::Text(app.message.text.clone()), danger())
+        (
+            BarContent::Text(app.message.text.clone()),
+            bar_danger(app.bar),
+        )
     } else {
         (BarContent::Text(app.message.text.clone()), Style::default())
     };
@@ -2573,9 +2605,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         BarContent::Keys(items) => vec![Line::from(widgets::help_spans(&widgets::fit_help(
             items, help_cols,
         )))],
+        // 样式挂在 **span** 上而不是整个 `Paragraph` 上：错误提示自带底色
+        // （`bar_danger`），挂在 `Paragraph` 上会把右段整块矩形刷红——连句尾
+        // 那截空白和撑高之后的空行一起。挂在 span 上，红的就只有字。
         BarContent::Text(t) => widgets::wrap_help(t, help_cols)
             .into_iter()
-            .map(Line::from)
+            .map(|l| Line::from(Span::styled(l, style)))
             .collect(),
     };
 
@@ -2705,8 +2740,17 @@ fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Min(0),
     ])
     .split(inner);
+    // 左段只加粗，**不挑颜色**：这几个字画在色条自己铺的底上，而
+    // `accent()` 挑的是「压在终端背景上读得清」的颜色（见 `bar_style` 头上
+    // 那条）。两件事一错位就出事——浅色终端上 `accent()` 是 24 号深蓝，压在
+    // `Slate` 那档 #5f5f87 的底上只有 1.16:1，而这句话正是用户卡住时唯一的
+    // 出路。不给 fg 就继承色条自己的那一个，对比度由 `BarTheme::style` 保证。
+    //
+    // 整句都加粗，不像右段那样只粗键名：左段就这么几个字，而且它是逃生口，
+    // 整块有点重量正好把它和右段那排普通动作分开。
     f.render_widget(
-        Paragraph::new(escape_hint(&app.view, app.lang)).style(accent()),
+        Paragraph::new(escape_hint(&app.view, app.lang))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
         bar[0],
     );
     // 中段：当前项目。**永不让位。**
@@ -2766,7 +2810,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         help_cols, bar[2].width as usize,
         "预留底栏高度用的宽度必须跟真正画的宽度一致"
     );
-    f.render_widget(Paragraph::new(help_lines).style(style), bar[2]);
+    // 这里不再 `.style(style)`：样式已经在上面挂到每个 span 上了，理由见
+    // 那儿。按键表那一支本来就用 `Style::default()`，挂不挂都一样。
+    f.render_widget(Paragraph::new(help_lines), bar[2]);
 }
 
 /// 底栏中段牌子上的字：`项目 dc/dc-terminal`，写不下名词就只写路径。
@@ -3353,6 +3399,106 @@ is_agent = true
                 ratio >= 4.5,
                 "{t:?} 的对比度只有 {ratio:.2}:1，正文字号要 4.5:1 才读得清"
             );
+        }
+
+        // 错误提示那一对同样要过这条线。它自带底色，所以**只算一次**就够了
+        // ——这正是它自带底色的理由：十四档底栏底色各不相同，而它一档都不靠。
+        let ratio = crate::theme::contrast(luminance(BAR_DANGER.0), luminance(BAR_DANGER.1));
+        assert!(
+            ratio >= 4.5,
+            "底栏错误色的对比度只有 {ratio:.2}:1，正文字号要 4.5:1 才读得清"
+        );
+    }
+
+    /// **底栏铺了实色的时候，上面每一段的前景色都不许跟着 `THEME` 走。**
+    ///
+    /// `theme.rs` 那一整套语义色（`accent`/`danger`/`strong`/…）挑的是「压在
+    /// **终端自己的背景**上读得清的颜色」，`bar_style` 头上那段注释把这件事
+    /// 讲得很清楚，也讲了实色条为什么刻意不看 `THEME`：它自己铺底，对比度是
+    /// 构造出来的，不是猜出来的。
+    ///
+    /// 少了这条守卫，两边就会悄悄合流。真事故：左段那句逃生提示一直用的是
+    /// `accent()`，在浅色终端上算出来是 24 号深蓝（#005f87），而它画在
+    /// `Slate` 那档 #5f5f87 的底上——1.16:1，屏幕上只剩个影子。而逃生提示
+    /// 正是用户卡住时唯一的出路。错误提示走 `danger()` 是同一个 bug，同一块
+    /// 底栏上算出来 1.21:1。
+    ///
+    /// 两条既有的守卫都盖不到这个组合：`every_bar_theme_is_readable` 只算
+    /// 色条自己的 fg/bg，`every_semantic_color_is_readable_on_its_own_background`
+    /// 只算语义色压终端背景。这条补的就是中间那块。
+    ///
+    /// 判据是**枚举白名单**而不是「不等于某某语义色」：后者要跟着 `theme.rs`
+    /// 手工同步，加一档语义色就漏一档。底栏上合法的前景只有两种——色条自己
+    /// 的 fg（反白的项目牌子也只动修饰符，不动 fg），和错误提示那对自带
+    /// 底色的红。任何第三种颜色出现在底栏上，都是有人又拿终端背景去猜了。
+    ///
+    /// `Lines` 档不在守卫范围内，这是**故意的**：那一档没有实色底，字确实落
+    /// 在终端背景上，`danger()` 在那儿是对的那个红。
+    #[test]
+    fn nothing_on_a_solid_bar_takes_its_color_from_the_terminal_theme() {
+        use ratatui::backend::TestBackend;
+
+        // 三屏覆盖底栏三段各自的画法：按键表（右段，BOLD 修饰符）、会话视图
+        // 的逃生提示（左段，出事的就是它）、一条错误消息（右段，自带底色）。
+        /// 一屏的名字和搭它的法子。`TempDir` 得一起带回来——它一 drop，
+        /// `App` 底下那个目录就没了。
+        type Case = (&'static str, fn() -> (App, tempfile::TempDir));
+
+        let cases: [Case; 3] = [
+            ("看板按键表", || {
+                app_with_one_agent_session(View::Board)
+            }),
+            ("会话逃生提示", || {
+                app_with_one_agent_session(View::Attached(1))
+            }),
+            ("错误提示", || {
+                let (mut app, dir) = app_with_one_agent_session(View::Board);
+                app.message = Msg::err("不是一个目录".into());
+                (app, dir)
+            }),
+        ];
+
+        for t in BarTheme::all() {
+            let Some(bar) = bar_style(*t) else { continue };
+            let fg = bar.fg.expect("实色条必须给出前景色");
+            let danger_fg = Color::Indexed(BAR_DANGER.1);
+            let danger_bg = Color::Indexed(BAR_DANGER.0);
+
+            for (label, make) in cases {
+                let (mut app, _dir) = make();
+                app.bar = *t;
+                let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+
+                let top = bar_first_line(&term, *t);
+                let buf = term.backend().buffer();
+                for y in top..buf.area.height {
+                    // 双宽字符（底栏上全是中文）后面那一格是**占位格**：ratatui
+                    // 把它 `reset()` 成默认样式，再在 `Buffer::diff` 里按前一格
+                    // 的宽度跳过，终端上由那个宽字形自己盖住。它的颜色不会画到
+                    // 屏幕上，跳过它——不跳的话这条守卫抓的全是占位格。
+                    let mut skip = 0usize;
+                    for x in 0..buf.area.width {
+                        let c = buf.cell((x, y)).expect("底栏的格子总该在缓冲里");
+                        if skip > 0 {
+                            skip -= 1;
+                            continue;
+                        }
+                        skip = widgets::display_width(c.symbol()).saturating_sub(1);
+                        let ok = c.fg == fg || (c.fg == danger_fg && c.bg == danger_bg);
+                        assert!(
+                            ok,
+                            "{t:?} 档「{label}」第 {y} 行第 {x} 列（{:?}）的前景是 {:?}\
+                             （底色 {:?}），既不是色条自己的 {fg:?}，也不是错误提示那对\
+                             自带底色的红——底栏上出现第三种颜色，意味着有人又拿终端\
+                             背景去猜了",
+                            c.symbol(),
+                            c.fg,
+                            c.bg
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -4725,26 +4871,56 @@ is_agent = true
         assert!(reversed, "底栏中段的项目名要反白成一块牌子");
     }
 
+    /// 错误提示必须是红的——不然它跟一条「已切到 …」长得一模一样，而这两件
+    /// 事要用户做的动作完全相反。
+    ///
+    /// 红从哪儿来分两档，理由见 `bar_danger`：实色条上红是**自带底色**的一
+    /// 小块（52 底 224 字，跟底下哪一档无关），横线档上才是 `danger()` 那个
+    /// 挑给终端背景的红。两档都要验——只验一档的话，另一档哪天变成隐形也
+    /// 没人知道，而这正是 `Slate` 上真出过的事。
     #[test]
-    fn error_message_is_red() {
+    fn error_message_is_red_in_both_bar_themes() {
         use ratatui::backend::TestBackend;
 
-        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let (mut app, _dir) = App::test_app();
-        app.view = View::Board;
-        app.message = Msg::err("不是一个目录".into());
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let draw_error = |bar: BarTheme| {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let (mut app, _dir) = App::test_app();
+            app.view = View::Board;
+            app.bar = bar;
+            app.message = Msg::err("不是一个目录".into());
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter_map(|(x, y)| {
+                    buf.cell((x, y))
+                        .map(|c| (c.symbol().to_string(), c.style()))
+                })
+                .filter(|(sym, _)| sym.trim() != "")
+                .map(|(_, st)| st)
+                .collect::<Vec<_>>()
+        };
 
-        let buf = term.backend().buffer();
-        let area = buf.area;
-        let red = (0..area.height).any(|y| {
-            (0..area.width).any(|x| {
-                buf.cell((x, y))
-                    .map(|c| c.style().fg == Some(Color::Red) && c.symbol() != " ")
-                    .unwrap_or(false)
-            })
-        });
-        assert!(red, "错误提示必须用红字，否则跟成功提示长得一样");
+        // 实色档：自带的那一对，跟底栏是哪一档无关。
+        for bar in [BarTheme::Gray, BarTheme::Slate, BarTheme::Light] {
+            let styles = draw_error(bar);
+            assert!(
+                styles
+                    .iter()
+                    .any(|st| st.fg == Some(Color::Indexed(BAR_DANGER.1))
+                        && st.bg == Some(Color::Indexed(BAR_DANGER.0))),
+                "{bar:?} 档上的错误提示必须是自带底色的那块红"
+            );
+        }
+
+        // 横线档：没有实色底，字落在终端背景上，这时候才该用 `danger()`。
+        // 测试里 `THEME` 没探测过，`danger()` 的 `Unknown` 那档是 ANSI 红。
+        let styles = draw_error(BarTheme::Lines);
+        assert!(
+            styles.iter().any(|st| st.fg == Some(Color::Red)),
+            "横线档上的错误提示必须还是红字"
+        );
     }
 
     #[test]
