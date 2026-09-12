@@ -46,6 +46,12 @@ struct Room {
     #[allow(dead_code)]
     push_secret: String,
     staged: Vec<(u32, String)>,
+    /// 上架名单改过几次。**推帧线程靠它认出「同一场直播，但 lanes 换了」**
+    /// ——`restage()` 有意保持 `id` 不变（链接不作废），可中转那边存的还是
+    /// 旧的一份 lanes，非得再调一次 `POST /live/start` 才会换过来。光看
+    /// `id` 的话推帧线程会以为「这一场早注册过了」，于是学生看到的路名
+    /// 永远停在老师第一次上架的那一份。
+    staged_rev: u64,
     /// 中转认没认得这场直播——见 `LiveInfo::readiness` 的文档注释。
     /// `start()` 时总是 `Pending`：这一刻中转还完全没听说过这个 id，
     /// 推帧线程调用 `POST /live/start` 成功之后才会翻成 `Ready`。
@@ -102,10 +108,45 @@ impl LiveState {
             token,
             push_secret,
             staged,
+            staged_rev: 0,
             readiness: LiveReadiness::Pending,
         });
 
         info
+    }
+
+    /// 改上架名单，**链接一个字都不变**：同一个 id、同一把学生 token、
+    /// 同一把 push_secret，只换 lanes。
+    ///
+    /// # 为什么这条路必须跟 `start()` 分开
+    ///
+    /// 老师上架「后端」、把链接发给全班之后想再加一路「前端」，按的是同一个
+    /// 空格键。走 `start()` 的话每次都生成新 id、新 token——200 个学生手里
+    /// 那条链接当场作废、同时掉线，而老师屏幕上什么提示都没有。改上架和
+    /// 开新场是两件事，钥匙换不换是它们唯一的区别，所以它们必须是两条
+    /// 不同的请求。
+    ///
+    /// 中转那一侧本来就支持这件事：`Live::start` 带同一把 push_secret 重开
+    /// 会替换 lanes 而不是拒绝（`starting_again_with_the_same_secret_replaces_the_lanes`
+    /// 钉着）。这里把 `staged_rev` 加一，推帧线程看到它就会重新注册一次。
+    ///
+    /// `readiness` 退回 `Pending`：新的 lanes 这一刻中转还不知道，说
+    /// `Ready` 就是骗老师。没在播时回 `None`——没有房间可改，调用方
+    /// （`daemon.rs::live_restage`）要把它变成一句说得清的错误。
+    pub fn restage(&self, staged: Vec<(u32, String)>) -> Option<LiveInfo> {
+        let mut guard = recover(self.room.lock());
+        let room = guard.as_mut()?;
+        room.staged = staged;
+        room.staged_rev += 1;
+        room.readiness = LiveReadiness::Pending;
+        Some(LiveInfo {
+            id: room.id.clone(),
+            token: room.token.clone(),
+            url: format!("{}/live/{}#t={}", self.base, room.id, room.token),
+            staged: room.staged.clone(),
+            viewers: 0,
+            readiness: room.readiness.clone(),
+        })
     }
 
     pub fn stop(&self) {
@@ -145,9 +186,13 @@ impl LiveState {
     /// `POST /live/start` 可能是对着一场已经被 `stop()`/被新的一场顶掉的
     /// 直播做的（网络慢、正好撞上老师连点两下），这时候写回来的「已就绪」
     /// 属于一场已经不存在的直播，不能套到当前这一场头上。
-    pub(crate) fn mark_ready(&self, id: &str) {
+    ///
+    /// **`rev` 也要对得上**：`restage()` 保持 `id` 不变只换 lanes，光比 id
+    /// 的话，一次针对旧 lanes 的 `POST /live/start` 在改上架之后才回来，
+    /// 就会把「中转已认得新 lanes」这句假话写上去。
+    pub(crate) fn mark_ready(&self, id: &str, rev: u64) {
         if let Some(room) = recover(self.room.lock()).as_mut() {
-            if room.id == id {
+            if room.id == id && room.staged_rev == rev {
                 room.readiness = LiveReadiness::Ready;
             }
         }
@@ -155,9 +200,9 @@ impl LiveState {
 
     /// 同 [`Self::mark_ready`]，但这次是失败——`reason` 是一句已经本地化
     /// 过的人话，不是原始错误文本。
-    pub(crate) fn mark_failed(&self, id: &str, reason: String) {
+    pub(crate) fn mark_failed(&self, id: &str, rev: u64, reason: String) {
         if let Some(room) = recover(self.room.lock()).as_mut() {
-            if room.id == id {
+            if room.id == id && room.staged_rev == rev {
                 room.readiness = LiveReadiness::Failed(reason);
             }
         }
@@ -186,6 +231,7 @@ impl LiveState {
             token: r.token.clone(),
             push_secret: r.push_secret.clone(),
             staged: r.staged.clone(),
+            staged_rev: r.staged_rev,
         })
     }
 
@@ -204,6 +250,9 @@ struct RoomSnapshot {
     token: String,
     push_secret: String,
     staged: Vec<(u32, String)>,
+    /// 见 `Room::staged_rev`：推帧线程要靠它认出「同一场直播，但 lanes
+    /// 换了」，光比 `id` 的话改上架永远传不到中转。
+    staged_rev: u64,
 }
 
 /// 生成 `hex_len` 个十六进制字符的随机串，取自系统 CSPRNG。**不是**时间戳、
@@ -349,7 +398,12 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     // 那边是不是真的已经认得这一场」——一次 `/live/start` 失败之后
     // `last_room` 照样会更新（下一轮还得知道找谁 DELETE），但绝不能把
     // 这个也标记成功，否则就是本节点自己骗自己「已经开播了」。
-    let mut started_id: Option<String> = None;
+    //
+    // **记的是 `(id, staged_rev)` 而不是光一个 id**：`restage()` 改上架时
+    // 有意保持 id 不变（链接不作废），可中转那边存的还是旧的一份 lanes，
+    // 非得再调一次 `POST /live/start` 才换得过来。只比 id 的话，学生看到
+    // 的路名会永远停在老师第一次上架的那一份。
+    let mut started: Option<(String, u64)> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match live.snapshot() {
@@ -361,16 +415,17 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                 // 原地留着，下一轮 `PUSH_INTERVAL` 自动重试；`LiveInfo`
                 // 那侧的 `readiness` 字段能让老师那块屏幕如实反映这件事，
                 // 而不是无条件显示"已经能用了"。
-                if started_id.as_deref() != Some(room.id.as_str()) {
+                if started.as_ref() != Some(&(room.id.clone(), room.staged_rev)) {
                     match start_room(&agent, &base, &room) {
                         Ok(()) => {
-                            live.mark_ready(&room.id);
-                            started_id = Some(room.id.clone());
-                            // 新的一场，旧的哈希对不上号，从头判断该不该推。
+                            live.mark_ready(&room.id, room.staged_rev);
+                            started = Some((room.id.clone(), room.staged_rev));
+                            // 新的一场（或者换了上架名单），旧的哈希对不上号，
+                            // 从头判断该不该推。
                             lanes.clear();
                         }
                         Err(reason) => {
-                            live.mark_failed(&room.id, reason);
+                            live.mark_failed(&room.id, room.staged_rev, reason);
                             nap(stop, PUSH_INTERVAL);
                             continue;
                         }
@@ -412,7 +467,7 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     stop_room(&agent, &base, &id, &secret);
                     lanes.clear();
                 }
-                started_id = None;
+                started = None;
             }
         }
         nap(stop, PUSH_INTERVAL);
@@ -633,6 +688,69 @@ mod tests {
         let info = live.info();
         assert_eq!(info.id, second.id);
         assert_eq!(info.staged, vec![(2, "后端".into())]);
+    }
+
+    /// **改上架名单不许动链接。** 老师上架「后端」把链接发给全班之后再加
+    /// 一路「前端」，走 `start()` 的话 200 个学生当场一起掉线——id、学生
+    /// token、push_secret 三样一个都不能变。
+    #[test]
+    fn restaging_keeps_the_id_and_both_keys_so_the_link_stays_valid() {
+        let live = LiveState::new("https://x".into());
+        let first = live.start(vec![(1, "后端".into())]);
+        let secret_before = live.push_secret().unwrap();
+
+        let after = live
+            .restage(vec![(1, "后端".into()), (2, "前端".into())])
+            .expect("在播的时候 restage 该成功");
+
+        assert_eq!(after.id, first.id, "改上架换了 id，全班的链接就作废了");
+        assert_eq!(after.token, first.token, "改上架换了学生 token，全班当场掉线");
+        assert_eq!(after.url, first.url, "链接必须一个字都不变");
+        assert_eq!(
+            live.push_secret().unwrap(),
+            secret_before,
+            "push_secret 也得留着——中转靠它认出「还是同一个老师在重开这一场」"
+        );
+        assert_eq!(after.staged.len(), 2, "新上架的那一路没生效");
+    }
+
+    /// 改完上架，中转还不知道新的 lanes——`readiness` 要如实退回 `Pending`，
+    /// 不能继续说 `Ready`。
+    #[test]
+    fn restaging_drops_back_to_pending_until_the_relay_knows_the_new_lanes() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "后端".into())]);
+        live.mark_ready(&info.id, 0);
+
+        live.restage(vec![(2, "前端".into())]).unwrap();
+
+        assert_eq!(live.info().readiness, LiveReadiness::Pending);
+    }
+
+    /// 改上架之后，一次针对**旧** lanes 的迟到 `mark_ready` 不该把
+    /// 「中转已经认得新 lanes」这句假话写上去——`id` 没变，只有 `rev` 能
+    /// 分辨这两次。
+    #[test]
+    fn a_late_mark_ready_for_the_previous_staging_does_not_claim_the_new_one_is_ready() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "后端".into())]);
+        live.restage(vec![(2, "前端".into())]).unwrap();
+
+        live.mark_ready(&info.id, 0); // 旧那一版的回执，迟到了
+
+        assert_eq!(
+            live.info().readiness,
+            LiveReadiness::Pending,
+            "旧 lanes 的回执被当成了新 lanes 的"
+        );
+    }
+
+    /// 没在播的时候没有名单可改——回 `None`，不能悄悄开一场新的。
+    #[test]
+    fn restaging_when_nothing_is_live_answers_none() {
+        let live = LiveState::new("https://x".into());
+        assert!(live.restage(vec![(1, "前端".into())]).is_none());
+        assert!(live.info().id.is_empty(), "restage 不该凭空开出一场直播");
     }
 
     fn span(text: String) -> ScreenSpan {
@@ -934,6 +1052,7 @@ mod tests {
             token: "viewer-t".into(),
             push_secret: "push-s".into(),
             staged: vec![(1, "前端".into()), (2, "后端".into())],
+            staged_rev: 0,
         };
         assert!(
             start_room(&agent, &srv.base(), &room).is_ok(),
@@ -964,6 +1083,7 @@ mod tests {
             token: "viewer-t".into(),
             push_secret: "push-s".into(),
             staged: vec![(1, "前端".into())],
+            staged_rev: 0,
         };
         // 127.0.0.1:1 没人监听，连接会被立刻拒绝——不需要真的等超时。
         let err = start_room(&agent, "http://127.0.0.1:1", &room).unwrap_err();
@@ -1077,7 +1197,7 @@ mod tests {
     fn marking_ready_flips_the_readiness() {
         let live = LiveState::new("https://x".into());
         let info = live.start(vec![(1, "前端".into())]);
-        live.mark_ready(&info.id);
+        live.mark_ready(&info.id, 0);
         assert_eq!(live.info().readiness, crate::proto::LiveReadiness::Ready);
     }
 
@@ -1086,7 +1206,7 @@ mod tests {
     fn marking_failed_records_a_reason() {
         let live = LiveState::new("https://x".into());
         let info = live.start(vec![(1, "前端".into())]);
-        live.mark_failed(&info.id, "连不上中转".into());
+        live.mark_failed(&info.id, 0, "连不上中转".into());
         assert_eq!(
             live.info().readiness,
             crate::proto::LiveReadiness::Failed("连不上中转".into())
@@ -1101,7 +1221,7 @@ mod tests {
         let live = LiveState::new("https://x".into());
         let stale = live.start(vec![(1, "前端".into())]);
         let current = live.start(vec![(2, "后端".into())]);
-        live.mark_ready(&stale.id);
+        live.mark_ready(&stale.id, 0);
         assert_eq!(
             live.info().readiness,
             crate::proto::LiveReadiness::Pending,

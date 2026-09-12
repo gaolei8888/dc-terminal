@@ -156,20 +156,44 @@ pub(crate) fn open(app: &mut App) {
     app.view = View::Live { state };
 }
 
-/// 空格/`s`/`r` 共用的落地：把新的上架名单发给守护进程，按回答更新
+/// 空格/`r` 共用的落地：把新的上架名单发给守护进程，按回答更新
 /// `App::live`。**上架不认识的会话 id 会被整体拒绝**（`daemon.rs` 的
-/// `live_start`），这条错误必须显示出来，不能悄悄吞掉——否则老师会以为
-/// 自己按的勾生效了，而实际上整条名单都没改。
-fn apply_staged(app: &mut App, staged: Vec<(u32, String)>) {
-    let ids = staged.iter().map(|(id, _)| *id).collect();
-    let names = staged.iter().map(|(_, n)| n.clone()).collect();
-    match app.client().and_then(|c| c.call(Request::LiveStart { ids, names })) {
+/// `validated_staging`），这条错误必须显示出来，不能悄悄吞掉——否则老师会
+/// 以为自己按的勾生效了，而实际上整条名单都没改。
+///
+/// # 开场和改上架走的是两条不同的请求
+///
+/// `new_link = false`（勾选框）：已经在播的时候发 `LiveRestage`——**链接
+/// 一个字都不变**。走 `LiveStart` 的话每按一次空格就换一把新 token，已经
+/// 发给全班的链接当场作废、200 个学生一起掉线，而老师屏幕上没有任何提示。
+///
+/// `new_link = true`（`r` 键）：发 `LiveStart`，真的换一条新链接、旧的
+/// 作废——那才是那个键该有的唯一语义。
+///
+/// 没在播的时候（第一次勾选）无论哪种都只能是 `LiveStart`：还没有房间
+/// 可改。
+fn apply_staged(app: &mut App, staged: Vec<(u32, String)>, new_link: bool) {
+    let req = staging_request(&app.live, staged, new_link);
+    match app.client().and_then(|c| c.call(req)) {
         Ok(Response::Live(info)) => app.live = info,
         Ok(Response::Error(e)) => {
             let reason = msg::error(app.lang, &e);
             app.message = Msg::err(msg::live_start_rejected(app.lang, &reason));
         }
         _ => app.message = Msg::err(text(Key::RequestFailed, app.lang).into()),
+    }
+}
+
+/// 该发哪一条请求。**纯函数，好测**——这个判断本身就是 I1 那个 bug 的
+/// 全部内容（勾一下复选框把全班的链接作废了），它不该只活在一段要真守护
+/// 进程才跑得到的代码里。
+fn staging_request(live: &LiveInfo, staged: Vec<(u32, String)>, new_link: bool) -> Request {
+    let ids = staged.iter().map(|(id, _)| *id).collect();
+    let names = staged.iter().map(|(_, n)| n.clone()).collect();
+    if new_link || !is_live(live) {
+        Request::LiveStart { ids, names }
+    } else {
+        Request::LiveRestage { ids, names }
     }
 }
 
@@ -191,16 +215,19 @@ fn toggle_selected(app: &mut App, state: &ListState) {
         }
         None => staged.push((id, name)),
     }
-    apply_staged(app, staged);
+    // **改勾选绝不换链接。** 已经在播就走 `LiveRestage`，见 `apply_staged`
+    // 上那段注释：老师加一路的时候不该把全班的链接作废掉。
+    apply_staged(app, staged, false);
 }
 
-/// `r` 换链接：原样重发一次当前的上架名单。**`LiveStart` 每次都会起一个
-/// 新房间、发一把新 token**（`LiveState::start` 的约定，见
-/// `starting_again_replaces_the_previous_room`），所以重发就是「换一条
-/// 新链接、旧的立刻失效」，不需要另开一条协议。
+/// `r` 换链接：原样重发一次当前的上架名单，但走的是 `LiveStart`。
+/// **`LiveStart` 每次都会起一个新房间、发一把新 token**（`LiveState::start`
+/// 的约定，见 `starting_again_replaces_the_previous_room`），所以重发就是
+/// 「换一条新链接、旧的立刻失效」——这是 `r` 唯一该有的语义，也是这一支跟
+/// 勾选框那一支（`LiveRestage`）唯一的区别。
 fn regenerate_link(app: &mut App) {
     let staged = app.live.staged.clone();
-    apply_staged(app, staged);
+    apply_staged(app, staged, true);
 }
 
 /// `s` 停播。
@@ -483,6 +510,44 @@ mod tests {
         }
 
         assert!(app.live.id.is_empty(), "没在播的时候不该凭空冒出一个房间");
+    }
+
+    /// **已经在播的时候改勾选，走的必须是 `LiveRestage`。** 走 `LiveStart`
+    /// 的话每按一次空格就换一把新 token：老师上架「后端」发了链接，想再
+    /// 加一路「前端」按一下空格，200 个学生同时掉线，而他屏幕上什么提示
+    /// 都没有。
+    #[test]
+    fn toggling_a_checkbox_while_live_restages_instead_of_reissuing_the_link() {
+        let live = info(vec![(1, "后端".into())], 0, LiveReadiness::Ready);
+        let req = staging_request(&live, vec![(1, "后端".into()), (2, "前端".into())], false);
+        assert!(
+            matches!(req, Request::LiveRestage { .. }),
+            "改勾选发的不是 LiveRestage，全班的链接会当场作废：{req:?}"
+        );
+    }
+
+    /// 还没在播的时候只能是 `LiveStart`——没有房间可改。
+    #[test]
+    fn the_first_checkbox_starts_a_new_broadcast() {
+        let off = LiveInfo {
+            id: String::new(),
+            token: String::new(),
+            url: String::new(),
+            staged: vec![],
+            viewers: 0,
+            readiness: LiveReadiness::Pending,
+        };
+        let req = staging_request(&off, vec![(1, "前端".into())], false);
+        assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
+    }
+
+    /// `r` 键是真的换一条链接、旧的作废——**这是它唯一该有的语义**，所以
+    /// 哪怕正在播也走 `LiveStart`。
+    #[test]
+    fn the_new_link_key_really_does_reissue_the_link() {
+        let live = info(vec![(1, "后端".into())], 0, LiveReadiness::Ready);
+        let req = staging_request(&live, vec![(1, "后端".into())], true);
+        assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
     }
 
     /// `is_live` 只看 `id` 是不是空串。

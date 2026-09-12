@@ -100,7 +100,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 链接那一刻，中转很可能还没被推帧线程告知这场直播存在）。旧界面解不出
 /// 多了一个必填字段的 `LiveInfo`——形状变了就得加一，跟 13 那次是同一条
 /// 规矩。
-pub const PROTOCOL_VERSION: u32 = 15;
+///
+/// 16 = 多了 `Request::LiveRestage`：改上架名单而**不换链接**。在这之前
+/// 界面改勾选走的是 `LiveStart`，每按一次空格就换一把新 token，已经发给
+/// 全班的链接当场作废、学生一起掉线。新增 `Request` 变体那条规矩同 14。
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,6 +458,20 @@ pub enum Request {
         ids: Vec<u32>,
         names: Vec<String>,
     },
+    /// 改上架名单，**链接一个字都不变**：同一个 id、同一把学生 token、
+    /// 同一把 push_secret，只换 lanes。
+    ///
+    /// **跟 `LiveStart` 分开是这条协议存在的全部理由。** 老师上架「后端」
+    /// 把链接发给全班之后想再加一路「前端」，按的是同一个空格键；走
+    /// `LiveStart` 的话每次都换新 id、新 token，200 个学生当场一起掉线，
+    /// 而老师屏幕上没有任何提示。`LiveStart`（以及界面上的 `r` 键）留给
+    /// 「换一条新链接、旧的作废」——那才是它该有的唯一语义。
+    ///
+    /// 字段的约定跟 `LiveStart` 一样：`names` 与 `ids` 一一对应。
+    LiveRestage {
+        ids: Vec<u32>,
+        names: Vec<String>,
+    },
     /// 停播。
     LiveStop,
     /// 现在有没有在播、播的是什么。
@@ -569,6 +587,11 @@ impl std::fmt::Debug for Request {
             // ids/names 都不是密钥，照常打印排查用。
             Request::LiveStart { ids, names } => f
                 .debug_struct("LiveStart")
+                .field("ids", ids)
+                .field("names", names)
+                .finish(),
+            Request::LiveRestage { ids, names } => f
+                .debug_struct("LiveRestage")
                 .field("ids", ids)
                 .field("names", names)
                 .finish(),
@@ -1129,6 +1152,10 @@ mod tests {
                 ids: vec![1],
                 names: vec!["n".into()],
             },
+            Request::LiveRestage {
+                ids: vec![1],
+                names: vec!["n".into()],
+            },
             Request::LiveStop,
             Request::LiveStatus,
         ];
@@ -1137,8 +1164,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                15,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
+                16,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1162,7 +1189,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                15,
+                16,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1271,7 +1298,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                15,
+                16,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1378,7 +1405,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (15, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (16, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

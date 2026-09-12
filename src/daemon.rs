@@ -1032,6 +1032,7 @@ fn handle(
         // `anyhow::Result<Response>`：`live_start` 本身不会失败到需要
         // `anyhow::Error` 的地步——校验不过直接答 `Response::Error`。
         Request::LiveStart { ids, names } => Ok(live_start(mgr, live, ids, names)),
+        Request::LiveRestage { ids, names } => Ok(live_restage(mgr, live, ids, names)),
         // **答 `Response::Live`，不是 `Response::Ok`。** 界面那一侧
         // （`ui::live::stop_live`）只认 `Response::Live(info)`——它要拿这份
         // 空状态把 `App::live` 清掉，那行压过一切的「● 正在直播」才会消失。
@@ -1060,10 +1061,51 @@ fn live_start(
     ids: Vec<u32>,
     names: Vec<String>,
 ) -> Response {
+    match validated_staging(mgr, "LiveStart", ids, names) {
+        Ok(staged) => Response::Live(live.start(staged)),
+        Err(e) => e,
+    }
+}
+
+/// 改上架名单，**链接一个字都不变**（见 `Request::LiveRestage` 的文档
+/// 注释）。校验跟 `live_start` 共用一份——两条路上「什么算一份能用的上架
+/// 名单」必须是同一个答案，各写一份就是「一边改了另一边没改」。
+///
+/// 没在播的时候回 `BadRequest`：没有房间可改。界面本来就只在 `is_live`
+/// 为真时才发这条请求，走到这儿说明两侧对「在不在播」的判断岔了，得说出
+/// 来，不能悄悄开一场新的直播——那正是这条协议要避免的事。
+fn live_restage(
+    mgr: &Arc<SessionManager>,
+    live: &Arc<crate::live::LiveState>,
+    ids: Vec<u32>,
+    names: Vec<String>,
+) -> Response {
+    let staged = match validated_staging(mgr, "LiveRestage", ids, names) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match live.restage(staged) {
+        Some(info) => Response::Live(info),
+        None => Response::Error(ErrorCode::BadRequest(
+            "LiveRestage：现在没在播，没有上架名单可改".into(),
+        )),
+    }
+}
+
+/// `LiveStart` / `LiveRestage` 共用的入参校验：把 `ids` 跟 `names` 拼成
+/// `(id, name)`，拼不出来就回一个说得清是哪一条请求出的错的 `Response`。
+///
+/// `what` 只进错误消息，好让老师（和日志）看得出是开播还是改上架被拒了。
+fn validated_staging(
+    mgr: &Arc<SessionManager>,
+    what: &str,
+    ids: Vec<u32>,
+    names: Vec<String>,
+) -> Result<Vec<(u32, String)>, Response> {
     if ids.len() != names.len() {
-        return Response::Error(ErrorCode::BadRequest(
-            "LiveStart：ids 和 names 的条数对不上".into(),
-        ));
+        return Err(Response::Error(ErrorCode::BadRequest(format!(
+            "{what}：ids 和 names 的条数对不上"
+        ))));
     }
     let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
     let missing: Vec<u32> = ids
@@ -1072,12 +1114,11 @@ fn live_start(
         .filter(|id| !known.contains(id))
         .collect();
     if !missing.is_empty() {
-        return Response::Error(ErrorCode::BadRequest(format!(
-            "LiveStart：会话 {missing:?} 不存在，没法上架"
-        )));
+        return Err(Response::Error(ErrorCode::BadRequest(format!(
+            "{what}：会话 {missing:?} 不存在，没法上架"
+        ))));
     }
-    let staged: Vec<(u32, String)> = ids.into_iter().zip(names).collect();
-    Response::Live(live.start(staged))
+    Ok(ids.into_iter().zip(names).collect())
 }
 
 /// `PhoneSetToken` 打 `getMe` 没成功时，给用户看的那句人话。**这里就是
@@ -2834,6 +2875,71 @@ mod tests {
             }
             other => panic!("期待 Response::Error(BadRequest)，得到 {other:?}"),
         }
+    }
+
+    /// `LiveRestage` 换 lanes 但**链接一个字都不变**——这正是它跟
+    /// `LiveStart` 唯一的区别，也是它存在的全部理由。
+    #[test]
+    fn restaging_through_the_daemon_keeps_the_same_link() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+        let first = live.start(vec![]);
+
+        let resp = handle(
+            Request::LiveRestage {
+                ids: vec![],
+                names: vec![],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        match resp {
+            Response::Live(info) => {
+                assert_eq!(info.id, first.id, "改上架换了 id，全班的链接就作废了");
+                assert_eq!(info.url, first.url, "链接必须一个字都不变");
+            }
+            other => panic!("期待 Response::Live，得到 {other:?}"),
+        }
+    }
+
+    /// 没在播的时候改上架：说出来，不许悄悄开一场新的直播——那正是这条
+    /// 协议要避免的事。
+    #[test]
+    fn restaging_while_nothing_is_live_is_refused_not_silently_started() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+
+        let resp = handle(
+            Request::LiveRestage {
+                ids: vec![],
+                names: vec![],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
+            "期待 BadRequest，得到 {resp:?}"
+        );
+        assert!(live.info().id.is_empty(), "restage 不该凭空开出一场直播");
     }
 
     /// **停播必须答 `Response::Live` 的空状态，不能答 `Response::Ok`。**
