@@ -401,6 +401,34 @@ async fn live_frame_route(
         .into_response())
 }
 
+/// `GET /live/{id}/lanes` 的答复：老师起的名字，不是会话标题或项目路径——
+/// 那两样一个字都不许上公网（整份 spec 的前提之一）。`viewers` 搭这班车
+/// 一起回，是因为学生页开场只该拉一次这条路径，之后人数跟着帧的节奏走，
+/// 不该为了一个数字单独起一条轮询。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LiveLanesResponse {
+    lanes: Vec<String>,
+    viewers: u32,
+}
+
+/// 学生页开场问一次「这场直播上架了哪几路，叫什么名字」。
+///
+/// 鉴权跟取帧同一条路（`x-live-token`），也跟取帧一样**认不出来和这场
+/// 直播根本不存在回同一个 401**——`Live::lanes` 内部走的是跟 `Live::frame`
+/// 同一个 `authed()`，理由写在 `live.rs` 那段注释里：分开回的话，拿一把
+/// 猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠错误码反推出哪个 id
+/// 现在正播着，把这条路径当探测器用。
+async fn live_lanes_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<LiveLanesResponse>, Rejected> {
+    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+    let lanes = live.lanes(&id, token)?;
+    let viewers = live.viewers(&id);
+    Ok(Json(LiveLanesResponse { lanes, viewers }))
+}
+
 /// 老师停播：整场直播连同两把钥匙一起立刻蒸发。跟推帧同一把 `x-live-push`
 /// 校验——live-id 对每个学生都是已知的，停播要是只认 id，随便一个学生打开
 /// devtools 发一个 `DELETE` 就能掐断全班的课，比伪造画面还省事。
@@ -467,6 +495,7 @@ pub fn router(state: AppState) -> Router {
         .route(dct_link::live::PATH_START, post(live_start_route))
         .route(dct_link::live::PATH_FRAME, post(live_push_route))
         .route("/live/{id}/frame", get(live_frame_route))
+        .route("/live/{id}/lanes", get(live_lanes_route))
         .route(
             "/live/{id}",
             get(live_page_route).delete(live_stop_route),
@@ -1048,6 +1077,67 @@ mod tests {
         let again = get_frame(&app, "abc", &"t".repeat(64), Some(&etag)).await;
         assert_eq!(again.status, 304);
         assert!(again.body.is_empty(), "304 不该带 body");
+    }
+
+    /// 学生页拿到的名字必须是老师起的那几个——**不是数字，不是会话标题**。
+    /// 这条直接对着 `POST /live/start` 传进去的 `lanes` 核对，钉的是
+    /// "路由没有偷偷换一套名字出来"这件事。
+    #[tokio::test]
+    async fn the_lanes_route_returns_the_names_given_at_start() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端调试".into(), "后端接口".into()],
+        )
+        .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/live/abc/lanes")
+                    .header("x-live-token", "t".repeat(64))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: LiveLanesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.lanes, vec!["前端调试", "后端接口"]);
+    }
+
+    /// 跟取帧同一条规矩：令牌不对，连「这场直播存不存在」都不告诉他。
+    #[tokio::test]
+    async fn a_wrong_token_cannot_list_the_lanes() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/live/abc/lanes")
+                    .header("x-live-token", "x".repeat(64))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// 认证在路由之前：错 token 连「这场直播存不存在」都不告诉他。

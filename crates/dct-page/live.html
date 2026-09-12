@@ -15,11 +15,13 @@
      `/api/*`、没有任何一处调用会把东西 POST 回老师那台机器。`dct-page`
      里有一条测试专门扫这份文件，钉的就是这件事；它比自觉可靠，但**不能
      代替**——加新功能之前想一想它是不是在往这份字节里加一条送出去的路。
-  2. **一个字的用户可见文案都不许是英文字面量。** 中文字面量这一版**允许**
-     ——`/live/<id>/strings` 那张文案表还没接上（是后面一个任务的事），
-     先把中文写死在这里，等文案表接上再换成 `t("key")`。这是唯一一处跟
-     `page.html` 的老规矩不一样的地方，写在这儿是因为它是暂时的、有意的
-     豁免，不是疏漏。
+  2. **一个字的用户可见文案都不许写死在正文逻辑里。** 但也不走 `page.html`
+     那条"问守护进程要 `t("key")`"的路——这一页发自中转，中转认不出 dct
+     的协议（spec 决定一：中转只搬信封，不看里面），够不着守护进程那份
+     i18n；专门为它开一条 `/live/<id>/strings` 换来的只是多一条中转本不该
+     懂的路径。所以文案表就近放在这个文件顶部的 `<script>` 里，中英两份，
+     按 `navigator.language` 选一次——页面里其余地方一个文案字面量都不许
+     出现，规矩没变，只是集中的地方跟手机端不同。
   3. **没有外部资源。** 没有 CDN、没有字体、没有图。
   4. **不改 PTY 尺寸。** 这一页只看画面，尺寸归开播那台电脑的桌面端决定
      （跟手机端同一条规矩）。
@@ -107,7 +109,8 @@
   #lanes { display: flex; gap: .3rem; flex-wrap: wrap; margin-left: auto; }
   #lanes button {
     background: none; border: 1px solid var(--line); border-radius: .35rem;
-    min-width: 2rem; min-height: 1.8rem;
+    max-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-height: 1.8rem; padding: 0 .5rem;
     font: inherit; font-size: .8rem; color: var(--ink); cursor: pointer;
   }
   #lanes button.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
@@ -142,9 +145,9 @@
   <span id="viewers" hidden></span>
   <span id="lanes"></span>
   <span id="tools">
-    <button type="button" id="zoomout" aria-label="缩小">A&minus;</button>
-    <button type="button" id="zoomin" aria-label="放大">A+</button>
-    <button type="button" id="theme" aria-label="配色">&#9681;</button>
+    <button type="button" id="zoomout">A&minus;</button>
+    <button type="button" id="zoomin">A+</button>
+    <button type="button" id="theme">&#9681;</button>
   </span>
 </header>
 <div id="screen"><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre></div>
@@ -160,10 +163,45 @@
   var statusEl = document.getElementById("status");
   var viewersEl = document.getElementById("viewers");
   var lanesEl = document.getElementById("lanes");
+  var zoomOutEl = document.getElementById("zoomout");
+  var zoomInEl = document.getElementById("zoomin");
   var themeEl = document.getElementById("theme");
 
   // ——渲染那一份，跟 page.html 共用——
   <!--SHARED-->
+
+  // ——文案表——
+  //
+  // 见文件顶部那段注释的第 2 条：这一页够不着守护进程的 i18n，所以文案表
+  // 就近摆在这里，不走 `t("key")` 问协议那一套。**页面其余地方一个文案
+  // 字面量都不许出现**——新加一句提示，先来这张表里加一对键，两种语言
+  // 都要填，不能只填一半（认不出语言时退英文，参照手机端同一条规矩）。
+  var STRINGS = {
+    zh: {
+      live: "直播中",
+      paused: "老师暂停了",
+      ended: "这场直播结束了",
+      smaller: "缩小",
+      bigger: "放大",
+      theme: "配色",
+      viewers: function (n) { return n + " 人在看"; }
+    },
+    en: {
+      live: "Live",
+      paused: "Teacher paused",
+      ended: "This live session has ended",
+      smaller: "Smaller text",
+      bigger: "Bigger text",
+      theme: "Theme",
+      viewers: function (n) { return n + " watching"; }
+    }
+  };
+  var LANG = (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+  var S = STRINGS[LANG];
+
+  zoomOutEl.setAttribute("aria-label", S.smaller);
+  zoomInEl.setAttribute("aria-label", S.bigger);
+  themeEl.setAttribute("aria-label", S.theme);
 
   // ——身份：这一场直播的 id，和学生那把只读钥匙——
   //
@@ -191,26 +229,24 @@
 
   // ——上架的几路——
   //
-  // 中转眼下还没有一条路径能把"这场直播开了哪几路、叫什么名字"告诉学生页
-  // （那条路径留给以后接文案/看板的任务）。这一版先按老师那边的硬上限
-  // （`dct_link::live::MAX_LANES`，JS 引用不了 Rust 的常量，这里抄一份，
-  // 数字对不上就改这里）摆出固定几个按钮，点哪个就看哪一路；老师没开的
-  // 那几路点了看不到画面，跟直播还没开始时长得一样。
-  var MAX_LANES = 4;
+  // 名字是**老师起的**，从 `GET /live/{id}/lanes` 来——**不是数字，不是
+  // 会话标题**。会话标题和项目路径一个字都不许上公网（整份 spec 的前提
+  // 之一），数字按钮达不到"学生认得出这是哪一路"这个目的，而且老师在
+  // 直播面板上改了名字，数字按钮完全反映不出来。同一条路径把在线人数
+  // 一起带回来（见下面 `refreshLanes`），省得为一个数字单开一条轮询。
   var lane = 0;
 
-  function buildLanes() {
+  function renderLaneButtons(names) {
     lanesEl.textContent = "";
-    for (var i = 0; i < MAX_LANES; i++) {
-      (function (idx) {
-        var b = document.createElement("button");
-        b.type = "button";
-        b.textContent = String(idx + 1);
-        b.className = idx === lane ? "on" : "";
-        b.addEventListener("click", function () { pickLane(idx); });
-        lanesEl.appendChild(b);
-      })(i);
-    }
+    if (lane >= names.length) { lane = 0; }
+    names.forEach(function (name, idx) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = name;
+      b.className = idx === lane ? "on" : "";
+      b.addEventListener("click", function () { pickLane(idx); });
+      lanesEl.appendChild(b);
+    });
   }
 
   function pickLane(idx) {
@@ -224,6 +260,25 @@
     });
     render();
     pull();
+  }
+
+  // 开场拉一次，之后**跟着已经在跑的那个两秒计时器**（下面 `setInterval`
+  // 那个，本来就在查"画面是不是太久没变了"）捎带着刷新，不为人数单独起
+  // 一条轮询。拉不到就沉默：这不是决定这一页看起来对不对的那条请求，
+  // 拉帧才是。
+  function refreshLanes() {
+    fetch("/live/" + LIVE_ID + "/lanes", {
+      headers: { "x-live-token": TOKEN },
+      credentials: "omit"
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) { return; }
+        renderLaneButtons(data.lanes || []);
+        viewersEl.hidden = false;
+        viewersEl.textContent = S.viewers(data.viewers || 0);
+      })
+      .catch(function () {});
   }
 
   // ——字号——
@@ -242,8 +297,8 @@
     fitFont(lastCols, lastRows);
   }
 
-  document.getElementById("zoomout").addEventListener("click", function () { setZoom(zoom / 1.15); });
-  document.getElementById("zoomin").addEventListener("click", function () { setZoom(zoom * 1.15); });
+  zoomOutEl.addEventListener("click", function () { setZoom(zoom / 1.15); });
+  zoomInEl.addEventListener("click", function () { setZoom(zoom * 1.15); });
 
   // ——主题三档，纯本地——
   var lastLines = null;
@@ -272,9 +327,15 @@
   //
   // `live`：最近一次拉帧成功。`paused`：拉帧还在成功，只是画面已经
   // `STALE_MS` 没变过——**这是纯客户端的猜测**，中转不会告诉学生"老师在
-  // 发呆"，能看到的只有"画面变没变"。`ended`：拉帧本身失败了（这场直播
-  // 在中转那边已经不存在，或者这把令牌不对——两者中转故意回同一个错，学生
-  // 分不出来，也不需要分：不管哪一种，这一页对这个学生来说都到头了）。
+  // 发呆"，能看到的只有"画面变没变"。`ended`：拉帧本身失败了。
+  //
+  // **这里故意不区分"直播不存在"和"令牌不对"，因为中转本来就没把这两件
+  // 事分开。** `Live::frame`/`Live::lanes` 的 `authed()` 认不出房间和认出
+  // 房间但令牌对不上，回的是同一个 401——如果分开回，任何一个人拿一把
+  // 猜的/过期的令牌去试一堆 live-id，就能靠错误码是"401 不存在"还是
+  // "401 令牌错"反推出"这个 id 现在是不是正播着"，把中转当探测器用。
+  // 学生页跟着这条设计走：两种情况看到的都是同一句"这场直播结束了"，不去
+  // 猜是哪一种。
   var lastCols = 0, lastRows = 0;
   var STALE_MS = 60000;
   var etag = null;
@@ -284,11 +345,10 @@
   var state = "live";
 
   var ICON = { live: "●", paused: "◌", ended: "×" };
-  var TEXT = { live: "直播中", paused: "老师暂停了", ended: "这场直播结束了" };
 
   function render() {
     dotEl.textContent = ICON[state];
-    statusEl.textContent = TEXT[state];
+    statusEl.textContent = S[state];
     headEl.className = state === "ended" ? "bad" : state === "paused" ? "warn" : "";
   }
 
@@ -312,7 +372,7 @@
   }
 
   // 一次只飞一个请求，答案回来之前不发下一个——同手机端 `screenInflight`
-  // 那道闸,理由一样：链路一慢，叠起来的请求只会越叠越慢。
+  // 那道闸，理由一样：链路一慢，叠起来的请求只会越叠越慢。
   function pull() {
     if (ended || inflight || document.visibilityState !== "visible") { return; }
     inflight = true;
@@ -358,9 +418,11 @@
     setTimeout(pull, delay);
   }
 
-  // 每几秒检查一次"画面是不是太久没变了"——这一档跟拉帧成不成功无关，
-  // 纯粹是本地一个计时器，所以单独摆一个循环，不挂在 `pull` 的回调链上。
+  // 每几秒检查一次"画面是不是太久没变了"，顺带刷新在线人数（跟名字一起
+  // 从 `refreshLanes` 来）——**不为人数单开一条轮询**，这个计时器本来就
+  // 在跑，捎带上就够了。
   setInterval(function () {
+    refreshLanes();
     if (ended) { return; }
     var stale = Date.now() - lastChangeAt > STALE_MS;
     var next = stale ? "paused" : "live";
@@ -374,9 +436,9 @@
     if (document.visibilityState === "visible") { pull(); }
   });
 
-  buildLanes();
   applyTheme();
   render();
+  refreshLanes();
   pull();
 })();
 </script>
