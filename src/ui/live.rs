@@ -300,6 +300,14 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(""));
         // 画的是**带 token 的完整地址**：手机扫到的必须是能直接打开的
         // 链接，屏幕上写的字（上面那一行）才是打点过的那份。
+        //
+        // **所以这块码是可扫的，投影和录屏要注意。** 「token 不上老师的
+        // 屏幕」那条规矩只覆盖人类可读的形式（写成字的那一行、复制走的
+        // 是看不见的 OSC 52），到这块码为止它就不成立了——面板开着的时候
+        // 投影或录屏，等于把链接发给了能看见这块屏的每一个人。这不是疏忽，
+        // 是这块码的用途本身；代价写在这里，好让下一个人不必从
+        // `the_token_never_reaches_the_screen` 那条测试的名字里推断出一条
+        // 它并没有证明的性质。真要作废，按 `r` 换一条链接。
         match super::web::qr_lines(&live.url, body.width) {
             Some(qr) => lines.extend(qr),
             // 宽度不够就换成话，不留半块码——同 `web::qr_lines` 的约定。
@@ -392,7 +400,11 @@ mod tests {
         assert!(line.contains('7'), "没说几个人在看：{line}");
     }
 
-    /// token 不许出现在屏幕上——老师会录屏，会投影。
+    /// token 不许以**人能抄下来的形式**出现在屏幕上——老师会录屏，会投影。
+    ///
+    /// **这条测试证明的只是这一行文字。** 屏幕上那块二维码画的是带 token
+    /// 的完整链接（学生要扫它），这条测试够不着也不该够得着它，见 `draw`
+    /// 里二维码那一段上的注释。
     #[test]
     fn the_token_never_reaches_the_screen() {
         let mut i = info(vec![], 0, LiveReadiness::Ready);
@@ -456,8 +468,12 @@ mod tests {
         assert_eq!(link_line(&i), "https://x/live/abc#t=········");
     }
 
-    /// **令牌不许出现在屏幕上任何地方**——同 `web.rs` 的
+    /// **令牌不许以文字形式出现在屏幕上任何地方**——同 `web.rs` 的
     /// `the_token_is_nowhere_on_the_screen`。
+    ///
+    /// 二维码那块字符不是文字，也不会在这里被匹配出来——它画的确实是带
+    /// token 的完整链接（学生要扫它）。这条测试和它在 `web.rs` 的孪生兄弟
+    /// 都只管"能不能被人抄下来"，管不着"能不能被摄像头读走"。
     #[test]
     fn the_token_is_nowhere_on_the_screen() {
         let (mut app, _dir) = App::test_app();
