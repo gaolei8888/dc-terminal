@@ -149,6 +149,7 @@ impl LiveState {
     fn snapshot(&self) -> Option<RoomSnapshot> {
         recover(self.room.lock()).as_ref().map(|r| RoomSnapshot {
             id: r.id.clone(),
+            token: r.token.clone(),
             push_secret: r.push_secret.clone(),
             staged: r.staged.clone(),
         })
@@ -164,6 +165,9 @@ impl LiveState {
 /// 全部内容。
 struct RoomSnapshot {
     id: String,
+    /// 学生那把只读的钥匙——`start_room` 拼 `/live/start` 的请求体要用，
+    /// 中转靠它认学生的读请求（`x-live-token`）。
+    token: String,
     push_secret: String,
     staged: Vec<(u32, String)>,
 }
@@ -299,10 +303,30 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     // 上一轮看到的房间，停播时要靠它才知道该对哪个 id、拿哪把钥匙发
     // `DELETE`——那一轮 `snapshot()` 已经答不出来了。
     let mut last_room: Option<(String, String)> = None;
+    // **成功** `start_room` 过的那个 id。跟 `last_room` 分开是因为它们回答
+    // 不同的问题：`last_room` 是「上一轮看到的是哪一场」，这个是「中转
+    // 那边是不是真的已经认得这一场」——一次 `/live/start` 失败之后
+    // `last_room` 照样会更新（下一轮还得知道找谁 DELETE），但绝不能把
+    // 这个也标记成功，否则就是本节点自己骗自己「已经开播了」。
+    let mut started_id: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match live.snapshot() {
             Some(room) => {
+                // 新的一场（或者中转还没答应过这一场）：先注册，成功之前
+                // 绝不推帧——推了也是白推，中转会把它当成「这场直播不
+                // 存在」拒收，而更要紧的是：**不能把「本地生成了 id、
+                // 拼好了链接」悄悄当成「学生的链接已经能打开」**。失败就
+                // 原地留着，下一轮 `PUSH_INTERVAL` 自动重试。
+                if started_id.as_deref() != Some(room.id.as_str()) {
+                    if !start_room(&agent, &base, &room) {
+                        nap(stop, PUSH_INTERVAL);
+                        continue;
+                    }
+                    started_id = Some(room.id.clone());
+                    // 新的一场，旧的哈希对不上号，从头判断该不该推。
+                    lanes.clear();
+                }
                 last_room = Some((room.id.clone(), room.push_secret.clone()));
                 let ids: Vec<u32> = room.staged.iter().map(|(id, _)| *id).collect();
                 let screens = mgr.screens(&ids);
@@ -344,10 +368,44 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     stop_room(&agent, &base, &id, &secret);
                     lanes.clear();
                 }
+                started_id = None;
             }
         }
         nap(stop, PUSH_INTERVAL);
     }
+}
+
+/// `POST {base}/live/start` 的请求体——跟 `dct-srv::LiveStartRequest` 字段
+/// 一一对应，两边各写各的、靠字段名对齐（两个 crate 谁也不依赖谁，见
+/// 模块头）。
+#[derive(serde::Serialize)]
+struct StartBody<'a> {
+    id: &'a str,
+    viewer_token: &'a str,
+    push_secret: &'a str,
+    lanes: Vec<&'a str>,
+}
+
+/// 开播：告诉中转这场直播的两把钥匙、上架了哪几路。**必须在第一次推帧
+/// 之前成功过一次**——不然中转认不出这个 id，第一次推帧会被当成「这场
+/// 直播不存在」拒收。
+///
+/// 回 `bool`，不是 `Result`：调用点只关心「成功了没有」，失败的原因（连
+/// 不上中转、中转认为这把钥匙不对）都只导向同一个动作——这一轮先别推，
+/// 下一轮 `PUSH_INTERVAL` 再试一次。**绝不能在失败时假装成功**：那等于
+/// 老师看着一条已经生成好的链接，学生打开却永远转圈，而 dct 这边毫无
+/// 察觉——`pusher_loop` 靠这个返回值决定要不要往下推帧，正是为了不让这
+/// 件事发生。
+fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> bool {
+    let url = format!("{base}{}", dct_link::live::PATH_START);
+    let lanes = room.staged.iter().map(|(_, name)| name.as_str()).collect();
+    let body = StartBody {
+        id: &room.id,
+        viewer_token: &room.token,
+        push_secret: &room.push_secret,
+        lanes,
+    };
+    agent.post(&url).send_json(body).is_ok()
 }
 
 /// 推一帧。发不出去就算了——理由同 `link.rs::Link::send`：直播是允许丢的
@@ -684,5 +742,48 @@ mod tests {
         assert_eq!(seen[0].method, "DELETE");
         assert_eq!(seen[0].path, "/live/abc123");
         assert_eq!(seen[0].headers.get("x-live-push").unwrap(), "s3cr3t");
+    }
+
+    /// `start_room` 把两把钥匙和 lane 名字都带上，POST 到 `PATH_START`——
+    /// 中转靠这条请求才知道这场直播存在，不然第一次推帧会被当成「这场
+    /// 直播不存在」拒收。
+    #[test]
+    fn start_room_sends_both_keys_and_the_lane_names() {
+        let srv = FakeSrv::start();
+        let agent = crate::sys::tls::agent_builder().build();
+        let room = RoomSnapshot {
+            id: "abc123".into(),
+            token: "viewer-t".into(),
+            push_secret: "push-s".into(),
+            staged: vec![(1, "前端".into()), (2, "后端".into())],
+        };
+        assert!(start_room(&agent, &srv.base(), &room), "假中转总是回 204，不该失败");
+
+        let seen = recover(srv.got.lock());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].path, dct_link::live::PATH_START);
+        let body: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+        assert_eq!(body["id"], "abc123");
+        assert_eq!(body["viewer_token"], "viewer-t");
+        assert_eq!(body["push_secret"], "push-s");
+        assert_eq!(body["lanes"], serde_json::json!(["前端", "后端"]));
+    }
+
+    /// 中转连不上（或者拒了）的时候，`start_room` 必须老实回 `false`——
+    /// `pusher_loop` 靠这个决定要不要往下推帧，绝不能假装开播成功。
+    #[test]
+    fn start_room_reports_failure_when_the_relay_is_unreachable() {
+        let agent = crate::sys::tls::agent_builder()
+            .timeout_connect(Duration::from_millis(200))
+            .build();
+        let room = RoomSnapshot {
+            id: "abc123".into(),
+            token: "viewer-t".into(),
+            push_secret: "push-s".into(),
+            staged: vec![(1, "前端".into())],
+        };
+        // 127.0.0.1:1 没人监听，连接会被立刻拒绝——不需要真的等超时。
+        assert!(!start_room(&agent, "http://127.0.0.1:1", &room));
     }
 }

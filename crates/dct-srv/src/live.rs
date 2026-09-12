@@ -54,6 +54,15 @@ impl Live {
         Live::default()
     }
 
+    /// 开一场直播（或者老师自己重开同一场）。
+    ///
+    /// **这一期还没有配对身份可验**，谁都能拿一个 id 来调这个方法——所以
+    /// `id` 已经在播的时候，必须先证明「你就是当初开这场直播的那个人」才
+    /// 允许顶掉它：带的 `push_secret` 要跟房间里存的那把对得上。不然任何
+    /// 人拿老师正在播的那个 id 重开一次，就能把老师的画面换成自己的——
+    /// 老师那边屏幕一切正常，学生看到的却是别人推的东西。校验放在这里
+    /// （而不是路由层），是因为「同一把钥匙才能重开」是这个类型自己的
+    /// 不变量，不是某一条路由的临时规矩。
     pub fn start(
         &self,
         id: String,
@@ -64,6 +73,15 @@ impl Live {
         if lanes.is_empty() || lanes.len() > MAX_LANES {
             return Err(LinkError::TooBig);
         }
+        let mut rooms = self.rooms.lock().expect("live 锁");
+        // 常数时间比较（`same`），不能提前 return——理由跟 `authed` 一样：
+        // 早退出的分支耗时不同，就是一个能拿响应时间探测「这把钥匙对不对」
+        // 的边信道。
+        if let Some(existing) = rooms.get(&id) {
+            if !same(&existing.push_hash, &hash(&push_secret)) {
+                return Err(LinkError::Unauthorized);
+            }
+        }
         let lanes = lanes
             .into_iter()
             .map(|name| Lane {
@@ -73,7 +91,6 @@ impl Live {
                 tx: watch::channel(0).0,
             })
             .collect();
-        let mut rooms = self.rooms.lock().expect("live 锁");
         rooms.insert(
             id,
             Session {
@@ -337,6 +354,49 @@ mod tests {
         assert_eq!(live.viewers("abc"), 2, "两个订阅应该数出 2 个人在看");
         drop(a);
         assert_eq!(live.viewers("abc"), 1, "掉了一个订阅之后应该数回 1");
+    }
+
+    /// 别人拿老师正在播的那个 id、换一把 push_secret 去 `start`，必须被拒
+    /// ——不然任何知道 id 的人都能把老师正在播的那场顶掉，老师那边一切
+    /// 正常，学生看到的却是别人推的画面。**而且第一场必须还活着**：被拒
+    /// 的这次尝试不能把原来那场顺手抹掉。
+    #[test]
+    fn starting_with_the_wrong_secret_does_not_steal_an_existing_live() {
+        let live = started();
+        let err = live
+            .start(
+                "abc".into(),
+                "t".repeat(64),
+                "别人的钥匙".repeat(20),
+                vec!["抢来的一路".into()],
+            )
+            .unwrap_err();
+        assert_eq!(err, LinkError::Unauthorized);
+        // 原来那场没被换掉：老师原来的 push_secret 还能推、原来的
+        // viewer_token 还能读。
+        assert!(live.push("abc", &"p".repeat(64), 0, b"still mine".to_vec()).is_ok());
+        assert_eq!(
+            live.frame("abc", &"t".repeat(64), 0).unwrap().0,
+            b"still mine"
+        );
+    }
+
+    /// 老师自己重开同一场（换上架列表、断线重连）：带着同一把 push_secret
+    /// 必须放行，而且新的 lanes 要真的生效。
+    #[test]
+    fn starting_again_with_the_same_secret_replaces_the_lanes() {
+        let live = started();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            "p".repeat(64),
+            vec!["新的一路".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            live.lanes("abc", &"t".repeat(64)).unwrap(),
+            vec!["新的一路".to_string()]
+        );
     }
 
     /// 挂着的学生要被新帧叫醒，这是 `?wait=1` 的全部机制。

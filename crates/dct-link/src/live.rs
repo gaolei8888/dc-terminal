@@ -6,6 +6,11 @@
 
 use std::time::Duration;
 
+/// 老师开播（或者自己重开同一场）的路径。body 里带 `id`/`viewer_token`/
+/// `push_secret`/`lanes`——这是中转唯一得知这几件事的地方，推帧线程在
+/// 第一次推帧之前必须先调这条路径，不然中转不认得这个 id。
+pub const PATH_START: &str = "/live/start";
+
 /// 老师推帧的路径。live-id 和 lane 在 body 的头里，不在 URL 上——推帧要带
 /// 配对身份，URL 上再带一遍 id 只是多一处会对不上的地方。
 pub const PATH_FRAME: &str = "/live/frame";

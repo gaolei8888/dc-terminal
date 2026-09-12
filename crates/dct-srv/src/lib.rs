@@ -321,6 +321,29 @@ fn parse_query(uri: &Uri) -> HashMap<String, String> {
         .collect()
 }
 
+/// `POST /live/start` 的请求体：老师开播（或者自己重开同一场）时带来的
+/// 一切——两把钥匙和这场直播上架了哪几路。**这一期没有配对身份可验**，
+/// 认不认这次 `start` 全靠 `Live::start` 自己那条「已存在的 id 只认原来
+/// 那把 push_secret」的规矩，路由这一层不做额外校验。
+#[derive(serde::Deserialize)]
+struct LiveStartRequest {
+    id: String,
+    viewer_token: String,
+    push_secret: String,
+    lanes: Vec<String>,
+}
+
+/// 老师开播：把 `Live::start` 接到网上。守护进程的推帧线程在第一次推帧
+/// 之前调它，好让中转认得 `viewer_token`/`push_secret` 和这场直播上架了
+/// 哪几路——不然中转会把第一次推帧当成「这场直播不存在」拒收。
+async fn live_start_route(
+    State(live): State<Arc<Live>>,
+    Json(req): Json<LiveStartRequest>,
+) -> Result<StatusCode, Rejected> {
+    live.start(req.id, req.viewer_token, req.push_secret, req.lanes)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 老师推一帧。带的是 push secret（`x-live-push`），不是学生那把
 /// viewer token——推帧是写，看帧是读，两件事不共用凭据（见
 /// `live.rs` 顶上「两把钥匙，不是一把」那段）。live-id 和 lane 也在头里，
@@ -434,6 +457,7 @@ pub fn router(state: AppState) -> Router {
         .route(PATH_POLL, post(poll_route))
         .route(PATH_SEND, post(send_route))
         .route(PATH_ASK, post(ask_route))
+        .route(dct_link::live::PATH_START, post(live_start_route))
         .route(dct_link::live::PATH_FRAME, post(live_push_route))
         .route("/live/{id}/frame", get(live_frame_route))
         .route("/live/{id}", axum::routing::delete(live_stop_route))
