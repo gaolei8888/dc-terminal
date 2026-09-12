@@ -242,11 +242,13 @@ pub enum Key {
     LiveStop,
     /// 这个项目现在一个能上架的会话都没有。
     LiveNoSessionsToStage,
-    /// 「允许观众提问」那个开关——这一版还没做，先占个位置、说清楚现在
-    /// 还按不了，好过屏幕上凭空出现一处看着能点却毫无反应的东西。
-    LiveQuestionsPlaceholder,
-    /// `c` 按下去之后的确认——**不能把链接本身回显在这句话里**，那正是
-    /// 复制这一步要避免的事：链接已经进了剪贴板，再打在屏幕上就白复制了。
+    /// `c` 按下去之后的提示——**不许打包票说复制成功了**。OSC 52 是单向
+    /// 的转义序列，终端收没收、系统剪贴板真的变没变，dct 这边永远拿不到
+    /// 回执；老终端、某些 ssh/tmux 中转会原样吞掉它。说了「已复制」而
+    /// 剪贴板其实没变，老师会把剪贴板里的旧内容当成链接发给全班——这比
+    /// 不提供复制更糟。所以这句话只说「已经发给终端了」，并且指一条不靠
+    /// 剪贴板的退路：屏幕上那块二维码。也**不能把链接本身回显在这句话
+    /// 里**——那正是复制这一步要避免的事。
     LiveLinkCopied,
     /// `s` 停播之后的确认。
     LiveStoppedMessage,
@@ -730,15 +732,10 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "No sessions in this project yet — open one first",
             zh: "这个项目还没有会话——先开一个",
         ),
-        LiveQuestionsPlaceholder => t!(
-            lang,
-            en: "Let viewers ask questions — coming soon, not on yet",
-            zh: "允许观众提问——还没做好，现在按不了",
-        ),
         LiveLinkCopied => t!(
             lang,
-            en: "Link copied to the clipboard",
-            zh: "链接已复制到剪贴板",
+            en: "Sent to the terminal's clipboard — if it did not take, scan the code above instead",
+            zh: "已发给终端的剪贴板——若终端不支持，请扫上面的二维码",
         ),
         LiveStoppedMessage => t!(lang, en: "Stopped the broadcast", zh: "已停播"),
         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
@@ -2422,7 +2419,6 @@ mod tests {
             LiveNewLink,
             LiveStop,
             LiveNoSessionsToStage,
-            LiveQuestionsPlaceholder,
             LiveLinkCopied,
             LiveStoppedMessage,
             TextSmaller,
@@ -2610,7 +2606,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 203, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 202, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -4823,23 +4823,66 @@ is_agent = true
     fn the_live_banner_beats_every_other_bar_content() {
         use ratatui::backend::TestBackend;
 
-        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let (mut app, _dir) = app_with_one_agent_session(View::Board);
-        app.message = crate::ui::widgets::Msg::err("出了点问题".into());
-        app.live = crate::proto::LiveInfo {
-            id: "abc".into(),
-            token: "t".repeat(64),
-            url: "https://x/live/abc#t=deadbeef".into(),
-            staged: vec![(1, "claude".into())],
-            viewers: 3,
-            readiness: crate::proto::LiveReadiness::Ready,
-        };
+        fn live_info() -> crate::proto::LiveInfo {
+            crate::proto::LiveInfo {
+                id: "abc".into(),
+                token: "t".repeat(64),
+                url: "https://x/live/abc#t=deadbeef".into(),
+                staged: vec![(1, "claude".into())],
+                viewers: 3,
+                readiness: crate::proto::LiveReadiness::Ready,
+            }
+        }
 
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let bar = bar_text(&term);
+        // 档一：普通消息（错误消息也算——这一档平时的优先级最高）。
+        {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = app_with_one_agent_session(View::Board);
+            app.message = crate::ui::widgets::Msg::err("出了点问题".into());
+            app.live = live_info();
 
-        assert!(bar.contains("正在直播"), "在播时底栏没说「正在直播」：{bar}");
-        assert!(!bar.contains("出了点问题"), "错误消息不该压过直播提示：{bar}");
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let bar = bar_text(&term);
+
+            assert!(bar.contains("正在直播"), "有消息时底栏没说「正在直播」：{bar}");
+            assert!(!bar.contains("出了点问题"), "错误消息不该压过直播提示：{bar}");
+        }
+
+        // 档二：附着视图里正显示着滚动提示（`attach::scroll_hint`）。
+        {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+            app.scroll = crate::session::ScrollState {
+                agent_owns: false,
+                alt_screen: false,
+                max: 500,
+                offset: 40,
+                new_lines: 0,
+            };
+            app.live = live_info();
+
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let bar = bar_text(&term);
+
+            assert!(bar.contains("正在直播"), "滚动提示时底栏没说「正在直播」：{bar}");
+            assert!(!bar.contains("按End回到底部"), "滚动提示不该压过直播提示：{bar}");
+        }
+
+        // 档三：看板上平时会画按键表（`n`/`p`/`c`……）的那一档。
+        {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = app_with_one_agent_session(View::Board);
+            app.live = live_info();
+
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let bar = bar_text(&term);
+
+            assert!(bar.contains("正在直播"), "按键表那一档底栏没说「正在直播」：{bar}");
+            assert!(
+                !bar.contains(&crate::i18n::text(crate::i18n::Key::New, app.lang).replace(' ', "")),
+                "按键表不该压过直播提示：{bar}"
+            );
+        }
     }
 
     /// 模式看不见就是下一个隐形状态，而这个仓库刚花一整轮改造消灭掉那种东西。

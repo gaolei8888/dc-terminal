@@ -75,9 +75,14 @@ pub(crate) fn link_line(info: &LiveInfo) -> String {
     format!("{base}#t={}", "·".repeat(8))
 }
 
-/// 当前项目里能上架的会话——直播只认**当前项目**这一批，不是全体会话：
-/// 教室场景下老师直播的是手头这个项目，把别的项目的会话也混进来挑只会
-/// 让这张清单变得没法用。
+/// 当前项目里能上架的会话——直播只认**当前项目**这一批，不是全体会话。
+///
+/// **这是有意的取舍，不是漏做。** 教室场景下老师直播的是手头这一个项目，
+/// 把别的项目的会话也混进同一张清单只会让它变得没法用——项目一多，
+/// 找到自己要的那几路全靠肉眼在几十行里翻。代价也写在这里：**要上架
+/// 别的项目的会话，得先把光标切到那个项目再进这一页**（`L` 键读的是
+/// `App::current_group()`，也就是看板/九宫格光标当下停在哪个项目上）；
+/// 这一页本身不提供跨项目选择的入口。
 fn current_project_sessions(app: &App) -> Vec<SessionInfo> {
     app.current_group()
         .map(|g| g.sessions.clone())
@@ -118,6 +123,15 @@ fn base64_encode(data: &[u8]) -> String {
 /// 跟真的往 alternate screen 里画字是两回事——token 因此不会因为这一个
 /// 键而破了「绝不上屏」那条规矩。副作用没法单测，跟 `ui::mod` 里那几处
 /// `execute!` 写光标形状是同一个道理。
+///
+/// **OSC 52 是单向的，没有回执。** dct 把这段转义序列写给终端之后，
+/// 终端收没收、系统剪贴板真的变没变，这个进程永远不知道——老终端、
+/// 某些 ssh/tmux 中转会原样吞掉它，既不报错也不生效。所以调用方
+/// （`handle_key` 里的 `c` 分支）**不能把这次调用当成"复制成功了"**，
+/// 只能说"已经发给终端了"，并且必须同时给一条不靠剪贴板的退路——
+/// 面板上那块二维码，见 `Key::LiveLinkCopied` 的措辞。说了"已复制"而
+/// 剪贴板其实没变，比不提供复制更糟：老师会把剪贴板里的旧内容当成
+/// 链接发给全班。
 fn write_osc52_clipboard(text: &str) {
     let payload = base64_encode(text.as_bytes());
     let _ = crossterm::execute!(
@@ -269,13 +283,6 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(text(Key::LiveOffLine, lang)));
     }
 
-    lines.push(Line::from(""));
-    // 「允许观众提问」的占位——这一版还没做，说清楚现在按不了，好过屏幕上
-    // 凭空出现一处看着能点却毫无反应的东西。
-    lines.push(Line::from(Span::styled(
-        text(Key::LiveQuestionsPlaceholder, lang),
-        dim(),
-    )));
     lines.push(Line::from(""));
 
     let sessions = current_project_sessions(app);
