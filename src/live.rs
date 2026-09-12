@@ -432,6 +432,30 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         match live.snapshot() {
             Some(room) => {
+                // **换了一场（`r` 换链接、或者直接开另一场）：先把上一场
+                // 从中转上删掉。**
+                //
+                // 不删的话旧那场还在中转上活满 `LIVE_TTL`（60 秒）——拿着
+                // 旧链接的人这一分钟里照样看得见最后那一帧。spec 写的是
+                // 「一键换链接……旧的当场死掉；上节课的链接这节课打不开」，
+                // 而「作废」是这个功能对老师的全部承诺：链接发出去就收不
+                // 回来，设计上不假装能拦，只保证能作废。晚 60 秒的作废是
+                // 一句打了折的承诺。
+                //
+                // 放在注册新一场**之前**：新一场要是连不上中转，旧那场也
+                // 不该因此多活一分钟——老师按下换链接那一刻就已经决定旧的
+                // 不要了。
+                if let Some((old_id, old_secret)) = last_room.as_ref() {
+                    if old_id != &room.id {
+                        stop_room(&agent, &base, old_id, old_secret);
+                        // 换了一场，上一场的人数跟这一场没关系，立刻重读。
+                        viewers_at = None;
+                    }
+                }
+                // 记账挪到注册**之前**：注册失败会 `continue`，记账要是留在
+                // 后面，下一轮就会看到「上一场」还是那个已经删掉的旧 id，
+                // 于是每 500ms 对它重发一次 DELETE。
+                last_room = Some((room.id.clone(), room.push_secret.clone()));
                 // 新的一场（或者中转还没答应过这一场）：先注册，成功之前
                 // 绝不推帧——推了也是白推，中转会把它当成「这场直播不
                 // 存在」拒收，而更要紧的是：**不能把「本地生成了 id、
@@ -455,7 +479,6 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                         }
                     }
                 }
-                last_room = Some((room.id.clone(), room.push_secret.clone()));
                 // 「N 人在看」是 spec 四道防线里的第二道——它必须是活的：
                 // 一个恒为 0 的数字比没有这个数字更糟，老师会据此以为没人
                 // 在看。读不到就留着上一次的值，不归零。
@@ -1261,6 +1284,61 @@ mod tests {
         let seen = srv.seen();
         assert_eq!(seen.len(), 1, "失败的那次假中转直接摔断连接，不该被记成收到");
         assert!(!seen[0].body.is_empty(), "第二次带的必须是真内容，不是保活的空 body");
+    }
+
+    /// 等到 `what` 成立，最多等两秒——照抄 `dct-srv` 测试里那个 `until`：
+    /// 推帧线程按 `PUSH_INTERVAL` 醒一次，固定 sleep 一个数字要么不够
+    /// 要么白等。
+    fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("等了两秒也没等到：{what}");
+    }
+
+    /// **换链接/换会话的时候，旧那场要在中转上当场死掉，不是等 60 秒
+    /// TTL。** spec 写的是「一键换链接……旧的当场死掉；上节课的链接这节
+    /// 课打不开」——晚 60 秒的作废是一句打了折的承诺，而「链接发出去收
+    /// 不回来，只保证能作废」是这个功能对老师的全部承诺。
+    #[test]
+    fn switching_to_a_new_live_deletes_the_old_one_on_the_relay() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        let pusher = spawn_pusher(live.clone(), mgr);
+
+        let first = live.start(vec![]);
+        until("第一场在中转上注册好", || {
+            srv.seen()
+                .iter()
+                .any(|s| s.method == "POST" && s.path == dct_link::live::PATH_START)
+        });
+
+        // 换一条链接：新 id、新的两把钥匙。
+        let second = live.start(vec![]);
+        assert_ne!(first.id, second.id, "测试前提不成立：两场的 id 该不一样");
+
+        let want = format!("/live/{}", first.id);
+        until("旧那场收到 DELETE", || {
+            srv.seen()
+                .iter()
+                .any(|s| s.method == "DELETE" && s.path == want)
+        });
+
+        // 删的是旧那场，不是新开的这一场。
+        let new_path = format!("/live/{}", second.id);
+        assert!(
+            !srv.seen()
+                .iter()
+                .any(|s| s.method == "DELETE" && s.path == new_path),
+            "把刚开的这一场也删了"
+        );
+
+        pusher.stop();
     }
 
     /// 帧压完仍然超过中转能收的上限：这不是网络抖动，重试没有意义——一直
