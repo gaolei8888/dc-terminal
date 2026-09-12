@@ -172,6 +172,44 @@ mod tests {
         );
     }
 
+    /// **一次失败不许被判成「这场直播结束了」。**
+    ///
+    /// 原来是 `if (!r.ok) markEnded()`：反代抖一个 502，学生页就永久显示
+    /// 「结束了」，除了刷新没有别的出路。更硬的那条是老师重开时减少了路
+    /// 数——学生停在越界的 lane 上吃 401 判死，之后 `lane` 被收回 0，而
+    /// 点第 0 路又因为 `idx === lane` 直接 return，`ended` 永远解不开。
+    ///
+    /// 这条测试钉住三件事：判死之前要复核、有退避重试、`ended` 的时候
+    /// 点回同一路能解开。
+    #[test]
+    fn a_single_failed_frame_does_not_end_the_broadcast_for_the_student() {
+        let page = super::live_page();
+
+        // 判死要经过复核，而且得连着失败够多次。
+        assert!(
+            page.contains("FAIL_LIMIT") && page.contains("function afterFailure()"),
+            "判死的复核路径不见了"
+        );
+        // `!r.ok` 那一支不许直接 markEnded。
+        let at = page.find("if (!r.ok)").expect("拉帧的失败分支不见了");
+        let window = &page[at..(at + 200).min(page.len())];
+        assert!(
+            window.contains("afterFailure()") && !window.contains("markEnded()"),
+            "一次非 2xx 仍然当场判死：{window:?}"
+        );
+        // 退避重试真的存在（不是零延迟硬打）。
+        assert!(
+            page.contains("BACKOFF_MS") && page.contains("function backoff()"),
+            "5xx 之后没有退避"
+        );
+        // `ended` 的时候点回同一路必须解得开。
+        assert!(
+            page.contains("if (idx === lane && !ended)"),
+            "pickLane 仍然对同一路直接 return——判死之后 lane 被收回 0，\
+             学生点第 0 路就再也解不开了"
+        );
+    }
+
     /// 两页共用同一份渲染。各留一份的话，迟早只有一页修对了某个渲染 bug。
     #[test]
     fn both_pages_share_one_painter() {

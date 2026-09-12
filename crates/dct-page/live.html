@@ -249,8 +249,12 @@
     });
   }
 
+  // **`ended` 的时候必须允许点回同一路。** 老师重开时减少了路数，学生停在
+  // 一个越界的 lane 上会先吃一记失败，随后 `renderLaneButtons` 把 `lane`
+  // 收回 0；这时候学生点第 0 路，要是因为 `idx === lane` 直接 return，
+  // `ended` 就永远解不开，只能刷新页面。
   function pickLane(idx) {
-    if (idx === lane) { return; }
+    if (idx === lane && !ended) { return; }
     lane = idx;
     etag = null;
     ended = false;
@@ -266,19 +270,31 @@
   // 那个，本来就在查"画面是不是太久没变了"）捎带着刷新，不为人数单独起
   // 一条轮询。拉不到就沉默：这不是决定这一页看起来对不对的那条请求，
   // 拉帧才是。
-  function refreshLanes() {
-    fetch("/live/" + LIVE_ID + "/lanes", {
+  //
+  // **拉帧失败之后的复核走的也是这一条**（见 `afterFailure`），不另开一次
+  // `fetch`：它答得出来就说明这场直播还活着、手上的令牌也还有效，那么刚才
+  // 那次失败就不是"直播结束了"。
+  function fetchLanes() {
+    return fetch("/live/" + LIVE_ID + "/lanes", {
       headers: { "x-live-token": TOKEN },
       credentials: "omit"
     })
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        if (!data) { return; }
-        renderLaneButtons(data.lanes || []);
-        viewersEl.hidden = false;
-        viewersEl.textContent = S.viewers(data.viewers || 0);
-      })
-      .catch(function () {});
+      .catch(function () { return null; });
+  }
+
+  // 把一份 lanes 答复画到屏幕上。回 `true` 表示"中转答得出来"——`afterFailure`
+  // 拿这个当"这场直播还活着"的凭据。
+  function applyLanes(data) {
+    if (!data) { return false; }
+    renderLaneButtons(data.lanes || []);
+    viewersEl.hidden = false;
+    viewersEl.textContent = S.viewers(data.viewers || 0);
+    return true;
+  }
+
+  function refreshLanes() {
+    fetchLanes().then(applyLanes);
   }
 
   // ——字号——
@@ -327,7 +343,10 @@
   //
   // `live`：最近一次拉帧成功。`paused`：拉帧还在成功，只是画面已经
   // `STALE_MS` 没变过——**这是纯客户端的猜测**，中转不会告诉学生"老师在
-  // 发呆"，能看到的只有"画面变没变"。`ended`：拉帧本身失败了。
+  // 发呆"，能看到的只有"画面变没变"。`ended`：**复核过的**失败——连着几次
+  // 拉帧失败，而且连 `/lanes` 都答不出来了（见 `afterFailure`）。单独
+  // 一次失败不算：反代抖一个 502、或者老师重开时减少了路数让我们停在一个
+  // 越界的 lane 上，都不是"直播结束了"。
   //
   // **这里故意不区分"直播不存在"和"令牌不对"，因为中转本来就没把这两件
   // 事分开。** `Live::frame`/`Live::lanes` 的 `authed()` 认不出房间和认出
@@ -407,6 +426,49 @@
     render();
   }
 
+  // ——一次失败不等于直播结束——
+  //
+  // 原来这里是「响应不是 2xx 就直接判死」：反代抖一个 502，学生页就永久显示
+  // 「这场直播结束了」，除了刷新没有别的出路。两种最常见的失败都不该判死：
+  //
+  // 1. **5xx**：反代/中转抖一下。退避重试就好。
+  // 2. **401 而 lane 越界**：老师重开时减少了路数，学生停在第 3 路而现在
+  //    只剩 2 路。中转对"这场直播不存在"和"令牌不对"**故意回同一个 401**
+  //    （见上面那段状态注释），`Live::frame` 对越界的 lane 回的也是 401
+  //    ——光看状态码分不出这三件事。
+  //
+  // 所以判死要经过复核：再问一次 `/live/{id}/lanes`。它答得出来，就说明
+  // 这场直播还活着、手上的令牌也还有效，刚才那次失败只能是这一路的事，
+  // `renderLaneButtons` 顺手把 `lane` 收回合法范围，接着看就是了；它也
+  // 答不出来，而且连着失败够多次，才算真的结束。
+  var FAIL_LIMIT = 3;
+  var BACKOFF_MS = [1000, 2000, 4000, 8000];
+  var failures = 0;
+
+  function backoff() {
+    return BACKOFF_MS[Math.min(failures, BACKOFF_MS.length - 1)];
+  }
+
+  function afterFailure() {
+    failures += 1;
+    fetchLanes().then(function (data) {
+      if (applyLanes(data)) {
+        // 直播还活着、令牌也还有效。`lane` 已经被收回合法范围，换一路
+        // 就得重新拿 etag——旧那个是另一路的。走地板重来，别对着一个
+        // 一直抖 5xx 的反代打转。
+        failures = 0;
+        etag = null;
+        scheduleIdle();
+        return;
+      }
+      if (failures >= FAIL_LIMIT) {
+        markEnded();
+        return;
+      }
+      schedule(backoff());
+    });
+  }
+
   // 一次只飞一个请求，答案回来之前不发下一个——同手机端 `screenInflight`
   // 那道闸，理由一样：链路一慢，叠起来的请求只会越叠越慢。
   function pull() {
@@ -426,7 +488,8 @@
           return;
         }
         if (!r.ok) {
-          markEnded();
+          // **不当场判死**——先复核，见 `afterFailure` 上面那段。
+          afterFailure();
           return;
         }
         var newEtag = r.headers.get("etag");
@@ -444,6 +507,7 @@
           // ＝还没推过帧"是两回事——数组存在就该照画，哪怕它长度是 0。
           if (!Array.isArray(frame)) { scheduleIdle(); return; }
           lastChangeAt = Date.now();
+          failures = 0;
           if (state !== "live") { state = "live"; }
           draw(frame);
           render();
