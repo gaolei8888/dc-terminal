@@ -176,8 +176,16 @@ pub(crate) fn open(app: &mut App) {
 /// 可改。
 fn apply_staged(app: &mut App, staged: Vec<(u32, String)>, new_link: bool) {
     let req = staging_request(&app.live, staged, new_link);
+    // 取消最后一路会被翻译成停播（见 `staging_request`），那一下要给出
+    // 跟按 `s` 一样的反馈——不然屏幕上什么都没说，而直播已经没了。
+    let stopping = matches!(req, Request::LiveStop);
     match app.client().and_then(|c| c.call(req)) {
-        Ok(Response::Live(info)) => app.live = info,
+        Ok(Response::Live(info)) => {
+            app.live = info;
+            if stopping {
+                app.message = text(Key::LiveStoppedMessage, app.lang).into();
+            }
+        }
         Ok(Response::Error(e)) => {
             let reason = msg::error(app.lang, &e);
             app.message = Msg::err(msg::live_start_rejected(app.lang, &reason));
@@ -190,6 +198,16 @@ fn apply_staged(app: &mut App, staged: Vec<(u32, String)>, new_link: bool) {
 /// 全部内容（勾一下复选框把全班的链接作废了），它不该只活在一段要真守护
 /// 进程才跑得到的代码里。
 fn staging_request(live: &LiveInfo, staged: Vec<(u32, String)>, new_link: bool) -> Request {
+    // **把最后一路取消掉 = 停播。** 老师按那一下想的是「不播了」，而空的
+    // 上架名单在守护进程那一侧本来就是要被拒的（`validated_staging` 的
+    // `Empty`）——照直发过去，屏幕上就是弹一句错、而直播还开着，等于让
+    // 他再去找停播键。这里把那一下翻译成他真正的意思。
+    //
+    // `new_link`（按 `r`）不走这条：那是「换一条链接」，名单空着的时候
+    // 它没有意义，照旧让守护进程回那句说得清的错。
+    if staged.is_empty() && !new_link && is_live(live) {
+        return Request::LiveStop;
+    }
     let ids = staged.iter().map(|(id, _)| *id).collect();
     let names = staged.iter().map(|(_, n)| n.clone()).collect();
     if new_link || !is_live(live) {
@@ -585,6 +603,42 @@ mod tests {
     fn the_new_link_key_really_does_reissue_the_link() {
         let live = info(vec![(1, "后端".into())], 0, LiveReadiness::Ready);
         let req = staging_request(&live, vec![(1, "后端".into())], true);
+        assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
+    }
+
+    /// **取消最后一路就是「不播了」。**
+    ///
+    /// 空的上架名单在守护进程那一侧本来要被拒（`validated_staging` 的
+    /// `Empty`），照直发过去屏幕上就是弹一句错、而直播还开着——老师按那
+    /// 一下想的是停播，却还得再去找停播键。
+    #[test]
+    fn unstaging_the_last_lane_stops_the_broadcast() {
+        let live = info(vec![(1, "后端".into())], 3, LiveReadiness::Ready);
+        let req = staging_request(&live, vec![], false);
+        assert!(
+            matches!(req, Request::LiveStop),
+            "取消最后一路该翻译成停播，实际是 {req:?}"
+        );
+    }
+
+    /// 但没在播的时候清空名单不是停播——没有什么可停的，照旧让守护进程
+    /// 回那句说得清的错。
+    #[test]
+    fn clearing_the_list_while_off_air_is_not_a_stop() {
+        // `info()` 造的永远是「在播」（id 非空），这里要的是相反的那个。
+        let off = LiveInfo {
+            id: String::new(),
+            ..info(vec![], 0, LiveReadiness::Pending)
+        };
+        let req = staging_request(&off, vec![], false);
+        assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
+    }
+
+    /// `r` 也不走那条路：换链接跟停播是两回事，名单空着的时候它没有意义。
+    #[test]
+    fn the_new_link_key_never_turns_into_a_stop() {
+        let live = info(vec![(1, "后端".into())], 3, LiveReadiness::Ready);
+        let req = staging_request(&live, vec![], true);
         assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
     }
 
