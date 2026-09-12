@@ -1063,7 +1063,7 @@ fn live_start(
 ) -> Response {
     match validated_staging(mgr, "LiveStart", ids, names) {
         Ok(staged) => Response::Live(live.start(staged)),
-        Err(e) => e,
+        Err(e) => Response::Error(e),
     }
 }
 
@@ -1082,7 +1082,7 @@ fn live_restage(
 ) -> Response {
     let staged = match validated_staging(mgr, "LiveRestage", ids, names) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return Response::Error(e),
     };
     match live.restage(staged) {
         Some(info) => Response::Live(info),
@@ -1093,7 +1093,11 @@ fn live_restage(
 }
 
 /// `LiveStart` / `LiveRestage` 共用的入参校验：把 `ids` 跟 `names` 拼成
-/// `(id, name)`，拼不出来就回一个说得清是哪一条请求出的错的 `Response`。
+/// `(id, name)`，拼不出来就回一个说得清是哪一条请求出的错的 `ErrorCode`。
+///
+/// 回的是 `ErrorCode` 而不是整个 `Response`：`Response` 里最大的那个变体
+/// 上百字节，塞进 `Result` 的 `Err` 一侧每次调用都要背着它（clippy 的
+/// `result_large_err`），而调用方本来就只会把它包进 `Response::Error`。
 ///
 /// `what` 只进错误消息，好让老师（和日志）看得出是开播还是改上架被拒了。
 fn validated_staging(
@@ -1101,11 +1105,11 @@ fn validated_staging(
     what: &str,
     ids: Vec<u32>,
     names: Vec<String>,
-) -> Result<Vec<(u32, String)>, Response> {
+) -> Result<Vec<(u32, String)>, ErrorCode> {
     if ids.len() != names.len() {
-        return Err(Response::Error(ErrorCode::BadRequest(format!(
+        return Err(ErrorCode::BadRequest(format!(
             "{what}：ids 和 names 的条数对不上"
-        ))));
+        )));
     }
     // **路数的两条边界必须在这里就拦住，不能留给中转。** 中转对空 lanes
     // 和超过 `MAX_LANES` 都回 413，而守护进程这边已经把本地状态设成「在
@@ -1114,16 +1118,16 @@ fn validated_staging(
     // ——一个不会自己好转的死循环。取消最后一路（`ids` 空）就是最容易走
     // 到的那条路。
     if ids.is_empty() {
-        return Err(Response::Error(ErrorCode::BadRequest(format!(
+        return Err(ErrorCode::BadRequest(format!(
             "{what}：一路都没上架，没有可播的内容"
-        ))));
+        )));
     }
     if ids.len() > dct_link::live::MAX_LANES {
-        return Err(Response::Error(ErrorCode::BadRequest(format!(
+        return Err(ErrorCode::BadRequest(format!(
             "{what}：最多只能上架 {} 路，这次是 {} 路",
             dct_link::live::MAX_LANES,
             ids.len()
-        ))));
+        )));
     }
     let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
     let missing: Vec<u32> = ids
@@ -1132,9 +1136,9 @@ fn validated_staging(
         .filter(|id| !known.contains(id))
         .collect();
     if !missing.is_empty() {
-        return Err(Response::Error(ErrorCode::BadRequest(format!(
+        return Err(ErrorCode::BadRequest(format!(
             "{what}：会话 {missing:?} 不存在，没法上架"
-        ))));
+        )));
     }
     Ok(ids.into_iter().zip(names).collect())
 }

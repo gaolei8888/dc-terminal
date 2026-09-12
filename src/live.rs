@@ -52,6 +52,10 @@ struct Room {
     /// `id` 的话推帧线程会以为「这一场早注册过了」，于是学生看到的路名
     /// 永远停在老师第一次上架的那一份。
     staged_rev: u64,
+    /// 此刻有几个人挂在中转的长轮询上——由推帧线程搭着保活那一拍去
+    /// `GET /live/{id}/lanes` 读回来。见 `LiveInfo::viewers` 的文档注释：
+    /// 它是个**偏低**的近似值，不是名册。
+    viewers: u32,
     /// 中转认没认得这场直播——见 `LiveInfo::readiness` 的文档注释。
     /// `start()` 时总是 `Pending`：这一刻中转还完全没听说过这个 id，
     /// 推帧线程调用 `POST /live/start` 成功之后才会翻成 `Ready`。
@@ -109,6 +113,7 @@ impl LiveState {
             push_secret,
             staged,
             staged_rev: 0,
+            viewers: 0,
             readiness: LiveReadiness::Pending,
         });
 
@@ -144,7 +149,7 @@ impl LiveState {
             token: room.token.clone(),
             url: format!("{}/live/{}#t={}", self.base, room.id, room.token),
             staged: room.staged.clone(),
-            viewers: 0,
+            viewers: room.viewers,
             readiness: room.readiness.clone(),
         })
     }
@@ -158,8 +163,8 @@ impl LiveState {
     /// 的形状，`Option<LiveInfo>` 才是「有没有在播」该长的样子，但这一层
     /// 就要先定下「没有」具体长什么样，好让界面不用先判断一次「有没有这个
     /// 字段」才能往下渲染；空串本身就是一个不会被误认成真实 id/链接的值。
-    /// 观众数眼下没有真实来源（推帧线程是下一个任务的事），在播时也先答
-    /// 0，不假装知道。
+    /// 没在播时观众数当然是 0；在播时答的是推帧线程最近一次从中转读回来
+    /// 的那个数（见 `LiveInfo::viewers`）。
     pub fn info(&self) -> LiveInfo {
         match &*recover(self.room.lock()) {
             Some(room) => LiveInfo {
@@ -167,7 +172,7 @@ impl LiveState {
                 token: room.token.clone(),
                 url: format!("{}/live/{}#t={}", self.base, room.id, room.token),
                 staged: room.staged.clone(),
-                viewers: 0,
+                viewers: room.viewers,
                 readiness: room.readiness.clone(),
             },
             None => LiveInfo {
@@ -204,6 +209,20 @@ impl LiveState {
         if let Some(room) = recover(self.room.lock()).as_mut() {
             if room.id == id && room.staged_rev == rev {
                 room.readiness = LiveReadiness::Failed(reason);
+            }
+        }
+    }
+
+    /// 推帧线程从中转读回来的在看人数，写回这一场。**只在 `id` 还对得上
+    /// 时才生效**，理由同 [`Self::mark_ready`]：这次读到的数属于哪一场，
+    /// 网络回来之后已经不一定还是当前这一场了。
+    ///
+    /// 不比 `staged_rev`：人数跟上架了哪几路无关，改一次名单不该把刚读到
+    /// 的人数扔掉。
+    pub(crate) fn set_viewers(&self, id: &str, viewers: u32) {
+        if let Some(room) = recover(self.room.lock()).as_mut() {
+            if room.id == id {
+                room.viewers = viewers;
             }
         }
     }
@@ -404,6 +423,11 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     // 非得再调一次 `POST /live/start` 才换得过来。只比 id 的话，学生看到
     // 的路名会永远停在老师第一次上架的那一份。
     let mut started: Option<(String, u64)> = None;
+    // 上次去中转读「几个人在看」是什么时候。**搭在保活那一拍上，不另开
+    // 一条轮询**：这个数不需要比保活更快——老师要的是「有没有人、大概
+    // 多少人」，而多一条按 `PUSH_INTERVAL` 跑的请求，200 人的课上就是
+    // 中转每 500ms 多挨一次问。`None` = 还没读过，下一轮立刻读一次。
+    let mut viewers_at: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match live.snapshot() {
@@ -432,6 +456,15 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     }
                 }
                 last_room = Some((room.id.clone(), room.push_secret.clone()));
+                // 「N 人在看」是 spec 四道防线里的第二道——它必须是活的：
+                // 一个恒为 0 的数字比没有这个数字更糟，老师会据此以为没人
+                // 在看。读不到就留着上一次的值，不归零。
+                if viewers_at.is_none_or(|t| t.elapsed() >= KEEPALIVE) {
+                    viewers_at = Some(Instant::now());
+                    if let Some(n) = fetch_viewers(&agent, &base, &room.id, &room.token) {
+                        live.set_viewers(&room.id, n);
+                    }
+                }
                 let ids: Vec<u32> = room.staged.iter().map(|(id, _)| *id).collect();
                 let screens = mgr.screens(&ids);
                 let now = Instant::now();
@@ -468,6 +501,7 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     lanes.clear();
                 }
                 started = None;
+                viewers_at = None;
             }
         }
         nap(stop, PUSH_INTERVAL);
@@ -584,6 +618,34 @@ fn push_frame(agent: &ureq::Agent, base: &str, id: &str, secret: &str, lane: usi
         .set("x-live-push", secret)
         .send_bytes(body)
         .is_ok()
+}
+
+/// `GET /live/{id}/lanes` 的答复里推帧线程要的那一半。中转那侧的
+/// `LiveLanesResponse` 还带着 lanes 名字——那是给学生页渲染按钮用的，
+/// 这里用不上，`serde` 会自动忽略多出来的字段。
+#[derive(serde::Deserialize)]
+struct LanesBody {
+    viewers: u32,
+}
+
+/// 去中转问一次「现在几个人在看」。
+///
+/// **用的是学生那把只读 token**（`x-live-token`）：这是一条读路由，
+/// `push_secret` 在这里不管用也不该用——推帧线程手上本来就有 viewer
+/// token（`RoomSnapshot::token`），没必要为一次读把写的钥匙拿出来。
+///
+/// 读不到就答 `None`，调用方原样留着上一次的数——网络抖一下不该让老师
+/// 屏幕上的人数瞬间归零，那比慢几秒更容易被误读成「学生都走了」。
+fn fetch_viewers(agent: &ureq::Agent, base: &str, id: &str, token: &str) -> Option<u32> {
+    let url = format!("{base}{}/{id}/lanes", dct_link::live::LIVE_PREFIX);
+    let body: LanesBody = agent
+        .get(&url)
+        .set("x-live-token", token)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    Some(body.viewers)
 }
 
 /// 停播：告诉中转把这场直播连同两把钥匙一起收掉。同样发不出去就算了——
@@ -743,6 +805,75 @@ mod tests {
             LiveReadiness::Pending,
             "旧 lanes 的回执被当成了新 lanes 的"
         );
+    }
+
+    /// 「N 人在看」必须是活的——spec 四道防线里的第二道。推帧线程读回来
+    /// 的数要真的走到 `info()` 上，而不是一个恒为 0 的硬编码。
+    #[test]
+    fn the_viewer_count_comes_from_the_relay_not_a_hardcoded_zero() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "前端".into())]);
+        assert_eq!(info.viewers, 0, "刚开播还没人，也还没读过");
+
+        live.set_viewers(&info.id, 7);
+
+        assert_eq!(live.info().viewers, 7);
+    }
+
+    /// 改上架不该把刚读到的人数扔掉——人数跟上架了哪几路无关。
+    #[test]
+    fn restaging_keeps_the_viewer_count() {
+        let live = LiveState::new("https://x".into());
+        let info = live.start(vec![(1, "前端".into())]);
+        live.set_viewers(&info.id, 12);
+
+        let after = live.restage(vec![(2, "后端".into())]).unwrap();
+
+        assert_eq!(after.viewers, 12);
+    }
+
+    /// 一次迟到的人数回执不该落到另一场直播头上。
+    #[test]
+    fn a_late_viewer_count_for_a_previous_live_is_ignored() {
+        let live = LiveState::new("https://x".into());
+        let stale = live.start(vec![(1, "前端".into())]);
+        live.start(vec![(2, "后端".into())]);
+
+        live.set_viewers(&stale.id, 99);
+
+        assert_eq!(live.info().viewers, 0, "上一场的人数被套到这一场头上了");
+    }
+
+    /// `fetch_viewers` 走的是学生那条只读路由：`GET /live/{id}/lanes`，
+    /// 带 `x-live-token`——**push_secret 绝不出现在这条读请求里**。
+    #[test]
+    fn fetch_viewers_asks_the_lanes_route_with_the_read_only_token() {
+        let srv = FakeSrv::start();
+        let agent = crate::sys::tls::agent_builder().build();
+
+        let n = fetch_viewers(&agent, &srv.base(), "abc123", "viewer-t");
+
+        assert_eq!(n, Some(5), "假中转答的是 5 个人在看");
+        let seen = srv.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].path, "/live/abc123/lanes");
+        assert_eq!(seen[0].headers.get("x-live-token").unwrap(), "viewer-t");
+        assert!(
+            !seen[0].headers.contains_key("x-live-push"),
+            "读人数是读，不该把写的钥匙带上"
+        );
+    }
+
+    /// 读不到就留着上一次的数，不归零——网络抖一下让屏幕上的人数瞬间变
+    /// 成 0，比慢几秒更容易被误读成「学生都走了」。
+    #[test]
+    fn an_unreachable_relay_leaves_the_viewer_count_alone() {
+        let agent = crate::sys::tls::agent_builder()
+            .timeout_connect(Duration::from_millis(200))
+            .build();
+        // 127.0.0.1:1 没人监听。
+        assert_eq!(fetch_viewers(&agent, "http://127.0.0.1:1", "abc", "t"), None);
     }
 
     /// 没在播的时候没有名单可改——回 `None`，不能悄悄开一场新的。
@@ -983,6 +1114,9 @@ mod tests {
             // 最像的样子（照抄 `link.rs::FakeSrv` 的做法）。
             return;
         }
+        // 读人数那条路要答一份真的 JSON，别的路（开播/推帧/停播）答 204
+        // 就够——调用方只看成没成功。
+        let lanes_query = path.ends_with("/lanes");
         st.seen.push(Seen {
             method,
             path,
@@ -991,7 +1125,15 @@ mod tests {
         });
         drop(st);
 
-        let out = "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let out = if lanes_query {
+            let json = r#"{"lanes":["前端"],"viewers":5}"#;
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            )
+        } else {
+            "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
         let _ = conn.write_all(out.as_bytes());
     }
 
