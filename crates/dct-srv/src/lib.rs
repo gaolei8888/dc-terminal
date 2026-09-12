@@ -24,6 +24,9 @@
 //! `token` 现在没人验（任务 5 才接 dc_classroom），所以**这个服务在第一期
 //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
 
+mod live;
+pub use live::Live;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

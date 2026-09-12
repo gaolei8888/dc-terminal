@@ -321,6 +321,7 @@ dependencies = [
  "dct-link",
  "dct-page",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
 ]

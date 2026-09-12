@@ -17,6 +17,8 @@ dct-page = { path = "../dct-page" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde_json = "1"
+# token 只存摘要，不存原文：中转上留着一屋子人的明文钥匙没有任何必要。
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
