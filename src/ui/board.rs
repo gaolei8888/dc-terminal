@@ -312,6 +312,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     // 会话行不重复项目名——组头已经说了，宽度还给 activity，
                     // 它是屏幕上最先被截断的信息。
                     spans.push(Span::raw(truncate(&s.activity, 70)));
+                    // 上架标记接在最末尾，不抢前面任何一列的宽度：老师切到
+                    // 别的会话时，得一眼认出「还在播的是这几路」，而这件事
+                    // 只有在直播面板上勾过的那几行才成立（`App::live.staged`）。
+                    if app.live.staged.iter().any(|(id, _)| *id == s.id) {
+                        spans.push(Span::styled(
+                            format!(" {}", text(Key::LiveOnAirMark, app.lang)),
+                            accent(),
+                        ));
+                    }
                 }
             }
             ListItem::new(Line::from(spans))
@@ -443,6 +452,31 @@ mod tests {
     /// `"[Afix"`（`[` 和 `A` 是转义序列里的普通可打印字符，`truncate`
     /// 不做整条转义序列的识别，只逐字符丢控制字节，见它自己的文档）。
     /// 两条assert 合起来才是「标签画出来了，而且是干净的」。
+    /// 会话列表里，上架的那几路要有「● 播」标记：老师切到别的会话时，
+    /// 一眼能看出播的仍然是这几路。没上架的会话不该带这个标记。
+    #[test]
+    fn staged_sessions_are_marked_live_in_the_session_list() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        app.set_sessions(vec![sess(1, &proj), sess(2, &proj)]);
+        app.live.staged = vec![(1, "claude".into())];
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        let c = screen_text(&term);
+        let mark = crate::i18n::text(crate::i18n::Key::LiveOnAirMark, app.lang)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        assert!(c.contains(&mark), "上架的会话没有播标记：{c}");
+        assert_eq!(
+            c.matches(&mark).count(),
+            1,
+            "只有一路上架，标记不该出现第二次：{c}"
+        );
+    }
+
     #[test]
     fn a_tag_with_control_bytes_never_reaches_the_rendered_buffer() {
         let (mut app, dir) = App::test_app();

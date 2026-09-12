@@ -41,6 +41,9 @@ qrcode = { version = "0.14.1", default-features = false }
 # Build Tools 的全部理由，不能为了一个哈希把它丢掉。
 sha2 = "0.10"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+# 帧要压过再上网：一屏终端 30 KB，压完 3–5 KB，两百个学生就是这两个数的
+# 差别。rust_backend 是纯 Rust（miniz_oxide），不破「一行 C 都没有」。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 rqrr = "0.10.1"

@@ -12,8 +12,8 @@ use crate::profile::Profile;
 use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
-    ErrorCode, InstallPrompt, LoginPrompt, PairStartedInfo, PairTick, PhoneState, PhoneStatus, ProfileEntry,
-    Request, Response, SecretPrompt, WebInfo,
+    ErrorCode, InstallPrompt, LiveStagingProblem, LoginPrompt, PairStartedInfo, PairTick, PhoneState,
+    PhoneStatus, ProfileEntry, Request, Response, SecretPrompt, WebInfo,
 };
 use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_OWNER_KEY, PHONE_TOKEN_KEY};
 use crate::session::{recover, SessionManager};
@@ -217,6 +217,18 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 网页）都可能问起同一条正在跑的配对。
     let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
 
+    // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
+    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——`DCT_RELAY`
+    // 环境变量优先，没设就用内置默认值。这是临时办法：将来 dct 接上
+    // dc_classroom 登录之后，中转地址该从配对结果里来，见那个函数的文档
+    // 注释。
+    let live: Arc<crate::live::LiveState> =
+        Arc::new(crate::live::LiveState::new(crate::live::relay_base()));
+    // 推帧线程，整个守护进程生命周期只起一条：它自己每一轮去问「现在在播
+    // 哪一场」，没播就什么也不做（见 `live::spawn_pusher` 的文档注释）。
+    // 自己的线程——绝不能让这条线的网络 IO 混进上面那个 200ms 的 tick。
+    crate::live::spawn_pusher(live.clone(), mgr.clone());
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -228,8 +240,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let et = event_tx.clone();
         let wb = web.clone();
         let pr = pairs.clone();
+        let lv = live.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -534,6 +547,7 @@ fn serve(
     event_tx: std::sync::mpsc::Sender<Event>,
     web: Arc<Mutex<Option<crate::web::Server>>>,
     pairs: Arc<Mutex<PairTable>>,
+    live: Arc<crate::live::LiveState>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -557,6 +571,7 @@ fn serve(
                 &event_tx,
                 Some(&web),
                 &pairs,
+                &live,
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -585,6 +600,11 @@ fn handle(
     // 拿不到 `web` 是物理上做不到。
     web: Option<&Arc<Mutex<Option<crate::web::Server>>>>,
     pairs: &Arc<Mutex<PairTable>>,
+    // 直播那个状态槽。跟 `phone` 一样是长活在这个进程里的共享状态：
+    // 无论请求从桌面这条本机 socket 来还是从局域网手机端来，看到的都得是
+    // 同一场直播（是不是允许后一条路控制开关，是下一个任务接配对身份时
+    // 要定的边界，这里先跟 `phone` 一样两边都能看）。
+    live: &Arc<crate::live::LiveState>,
 ) -> Response {
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
@@ -901,6 +921,7 @@ fn handle(
             bridge,
             event_tx,
             pairs,
+            live,
         )),
         Request::WebDisable => Ok(web_disable(web)),
         Request::PhoneDisable => {
@@ -1007,8 +1028,120 @@ fn handle(
             }
             Ok(Response::Ok)
         }
+        // `Ok(...)` 包一层是因为这个 match 的返回类型是
+        // `anyhow::Result<Response>`：`live_start` 本身不会失败到需要
+        // `anyhow::Error` 的地步——校验不过直接答 `Response::Error`。
+        Request::LiveStart { ids, names } => Ok(live_start(mgr, live, ids, names)),
+        Request::LiveRestage { ids, names } => Ok(live_restage(mgr, live, ids, names)),
+        // **答 `Response::Live`，不是 `Response::Ok`。** 界面那一侧
+        // （`ui::live::stop_live`）只认 `Response::Live(info)`——它要拿这份
+        // 空状态把 `App::live` 清掉，那行压过一切的「● 正在直播」才会消失。
+        // 答 `Ok` 的话它落进 `_ =>` 分支：直播真的停了，屏幕却弹「请求失败」
+        // 并且继续常驻「正在直播」——屏幕说在播而其实没播，正是 spec 点名
+        // 的最危险失败模式的镜像，下一次就没人信那行字了。
+        Request::LiveStop => {
+            live.stop();
+            Ok(Response::Live(live.info()))
+        }
+        Request::LiveStatus => Ok(Response::Live(live.info())),
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
+}
+
+/// 开一场直播：把 `ids` 跟 `names` 拼成 `(id, name)`。`ids`/`names` 条数
+/// 对不上直接拒绝：见 `staging_carries_one_name_per_session` 上的注释，
+/// 这不是可以将就的输入。
+///
+/// **`ids` 里有 `mgr` 不认识的会话就整体拒绝，不静默丢弃。** 静默丢的话，
+/// 老师上架了三路、屏幕上却只显示两路在播，而他不会知道第三路去哪了——
+/// 一个报不出名字的会话消失得悄无声息，比直接拒绝更让人摸不着头脑。
+fn live_start(
+    mgr: &Arc<SessionManager>,
+    live: &Arc<crate::live::LiveState>,
+    ids: Vec<u32>,
+    names: Vec<String>,
+) -> Response {
+    match validated_staging(mgr, ids, names) {
+        Ok(staged) => Response::Live(live.start(staged)),
+        Err(e) => Response::Error(e),
+    }
+}
+
+/// 改上架名单，**链接一个字都不变**（见 `Request::LiveRestage` 的文档
+/// 注释）。校验跟 `live_start` 共用一份——两条路上「什么算一份能用的上架
+/// 名单」必须是同一个答案，各写一份就是「一边改了另一边没改」。
+///
+/// 没在播的时候回 `BadRequest`：没有房间可改。界面本来就只在 `is_live`
+/// 为真时才发这条请求，走到这儿说明两侧对「在不在播」的判断岔了，得说出
+/// 来，不能悄悄开一场新的直播——那正是这条协议要避免的事。
+fn live_restage(
+    mgr: &Arc<SessionManager>,
+    live: &Arc<crate::live::LiveState>,
+    ids: Vec<u32>,
+    names: Vec<String>,
+) -> Response {
+    let staged = match validated_staging(mgr, ids, names) {
+        Ok(s) => s,
+        Err(e) => return Response::Error(e),
+    };
+    match live.restage(staged) {
+        Some(info) => Response::Live(info),
+        // **报码，不组句。** 早先这里是 `BadRequest("LiveRestage：现在没在
+        // 播……")`，英文界面上会显示 "dct could not understand that request:
+        // LiveRestage：现在没在播……"——正是 `LiveStagingProblem` 这个类型
+        // 要根除的那个形状。
+        None => Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive)),
+    }
+}
+
+/// `LiveStart` / `LiveRestage` 共用的入参校验：把 `ids` 跟 `names` 拼成
+/// `(id, name)`，拼不出来就回一个 `ErrorCode::LiveStagingRejected`。
+///
+/// 回的是 `ErrorCode` 而不是整个 `Response`：`Response` 里最大的那个变体
+/// 上百字节，塞进 `Result` 的 `Err` 一侧每次调用都要背着它（clippy 的
+/// `result_large_err`），而调用方本来就只会把它包进 `Response::Error`。
+///
+/// **只报码，不组句**（见 `proto::LiveStagingProblem`）：守护进程不知道
+/// 界面用的是哪种语言。码里也不区分是 `LiveStart` 还是 `LiveRestage` 被
+/// 拒了——对老师来说这两句话是同一件事（「这份上架名单不能用」），而他按
+/// 的是哪个键他自己知道。
+fn validated_staging(
+    mgr: &Arc<SessionManager>,
+    ids: Vec<u32>,
+    names: Vec<String>,
+) -> Result<Vec<(u32, String)>, ErrorCode> {
+    if ids.len() != names.len() {
+        return Err(ErrorCode::LiveStagingRejected(
+            LiveStagingProblem::NamesMismatch,
+        ));
+    }
+    // **路数的两条边界必须在这里就拦住，不能留给中转。** 中转对空 lanes
+    // 和超过 `MAX_LANES` 都回 413，而守护进程这边已经把本地状态设成「在
+    // 播」了：推帧线程于是每 `PUSH_INTERVAL` 重试一次、永远被 413 拒、
+    // `readiness` 永远停在 `Failed`，老师屏幕上挂着一场根本开不起来的直播
+    // ——一个不会自己好转的死循环。取消最后一路（`ids` 空）就是最容易走
+    // 到的那条路。
+    if ids.is_empty() {
+        return Err(ErrorCode::LiveStagingRejected(LiveStagingProblem::Empty));
+    }
+    if ids.len() > dct_link::live::MAX_LANES {
+        return Err(ErrorCode::LiveStagingRejected(LiveStagingProblem::TooMany {
+            max: dct_link::live::MAX_LANES,
+            got: ids.len(),
+        }));
+    }
+    let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
+    let missing: Vec<u32> = ids
+        .iter()
+        .copied()
+        .filter(|id| !known.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(ErrorCode::LiveStagingRejected(
+            LiveStagingProblem::UnknownSessions(missing),
+        ));
+    }
+    Ok(ids.into_iter().zip(names).collect())
 }
 
 /// `PhoneSetToken` 打 `getMe` 没成功时，给用户看的那句人话。**这里就是
@@ -1096,6 +1229,7 @@ fn web_enable(
     bridge: &Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
     event_tx: &std::sync::mpsc::Sender<Event>,
     pairs: &Arc<Mutex<PairTable>>,
+    live: &Arc<crate::live::LiveState>,
 ) -> Response {
     let Some(web) = web else { return web_refused() };
     let mut slot = recover(web.lock());
@@ -1123,7 +1257,7 @@ fn web_enable(
 
     // **HTTP 那一路走的是同一个 `handle`**，只是 `web` 传 `None`。
     // 另写一份分派等于养出第二套真相，而手机看到的东西必须跟桌面一致。
-    let (m, s, sec, pd, ph, br, et, pr) = (
+    let (m, s, sec, pd, ph, br, et, pr, lv) = (
         mgr.clone(),
         store.clone(),
         secrets.clone(),
@@ -1132,8 +1266,10 @@ fn web_enable(
         bridge.clone(),
         event_tx.clone(),
         pairs.clone(),
+        live.clone(),
     );
-    let dispatch = move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr);
+    let dispatch =
+        move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr, &lv);
     let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
     let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
     let port = server.addr().port();
@@ -1349,6 +1485,11 @@ mod tests {
     /// 同上——大多数测试不关心配对，给一张空表就行。
     fn test_pairs() -> Arc<Mutex<PairTable>> {
         Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    /// 同上——大多数测试不关心直播，给一个空槽就行。
+    fn test_live() -> Arc<crate::live::LiveState> {
+        Arc::new(crate::live::LiveState::new("https://x".into()))
     }
 
     fn test_pair_started() -> crate::pair::Started {
@@ -1801,6 +1942,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -1860,6 +2002,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -1928,6 +2071,7 @@ mod tests {
                 &test_event_tx(),
                 None,
                 &test_pairs(),
+                &test_live(),
             );
             (t.elapsed(), resp)
         });
@@ -2036,6 +2180,7 @@ mod tests {
                 &test_event_tx(),
                 None,
                 &test_pairs(),
+                &test_live(),
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -2070,6 +2215,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -2157,6 +2303,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -2205,6 +2352,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -2265,6 +2413,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -2319,6 +2468,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -2390,6 +2540,7 @@ mod tests {
             &test_event_tx(),
             None,
             &test_pairs(),
+            &test_live(),
         );
 
         match resp {
@@ -2716,6 +2867,234 @@ mod tests {
 
         crate::bridge::stop_current(&bridge);
     }
+
+    /// 上架一个 `mgr` 不认识的会话 id：整条请求都要被拒绝，不能悄悄漏掉
+    /// 那一路——老师上架了三路、屏幕上却只显示两路在播，而他不会知道
+    /// 第三路去哪了。
+    #[test]
+    fn staging_an_unknown_session_id_is_refused_not_silently_dropped() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![999],
+                names: vec!["不存在".into()],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &test_live(),
+        );
+
+        match resp {
+            Response::Error(ErrorCode::LiveStagingRejected(
+                LiveStagingProblem::UnknownSessions(ids),
+            )) => {
+                assert_eq!(ids, vec![999], "错误码该点名是哪个 id");
+            }
+            other => panic!("期待 LiveStagingRejected(UnknownSessions)，得到 {other:?}"),
+        }
+    }
+
+    /// 造一个能上架的真会话——`live_start`/`live_restage` 都要先在
+    /// `mgr.list()` 里认出这个 id 才肯往下走。跑的是 `cat`，不等任何输出。
+    /// 临时目录得跟着返回，不然会话的工作目录当场失效。
+    fn one_staged_session(mgr: &Arc<SessionManager>) -> (u32, tempfile::TempDir) {
+        mgr.register_profile(plain_shell());
+        let dir = tempfile::tempdir().unwrap();
+        let id = mgr
+            .create(dir.path(), "daemon-wire-fake", None, &[])
+            .unwrap();
+        (id, dir)
+    }
+
+    /// **取消最后一路不能变成一场 0 路的直播。** 中转对空 lanes 回 413，
+    /// 而本地状态已经是「在播」了：推帧线程每 500ms 重试、永远被拒、
+    /// `readiness` 永远 `Failed`——一个不会自己好转的死循环。
+    #[test]
+    fn staging_nothing_at_all_is_refused_before_it_becomes_a_zero_lane_broadcast() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![],
+                names: vec![],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        assert!(
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::Empty))
+            ),
+            "期待 LiveStagingRejected(Empty)，得到 {resp:?}"
+        );
+        assert!(live.info().id.is_empty(), "0 路的直播根本不该开起来");
+    }
+
+    /// 超过 `MAX_LANES` 同理：中转回 413，本地却以为在播。**校验要在守护
+    /// 进程这一侧先做**，别把一个必然失败的请求交给推帧线程去无限重试。
+    #[test]
+    fn staging_more_lanes_than_the_relay_accepts_is_refused_locally() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+        let n = dct_link::live::MAX_LANES + 1;
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: (0..n as u32).collect(),
+                names: (0..n).map(|i| format!("第 {i} 路")).collect(),
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        match resp {
+            Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::TooMany {
+                max,
+                got,
+            })) => {
+                assert_eq!(max, dct_link::live::MAX_LANES, "错误码该带上上限是几路");
+                assert_eq!(got, n, "错误码该带上这次是几路");
+            }
+            other => panic!("期待 LiveStagingRejected(TooMany)，得到 {other:?}"),
+        }
+        assert!(live.info().id.is_empty(), "超上限的直播根本不该开起来");
+    }
+
+    /// `LiveRestage` 换 lanes 但**链接一个字都不变**——这正是它跟
+    /// `LiveStart` 唯一的区别，也是它存在的全部理由。
+    #[test]
+    fn restaging_through_the_daemon_keeps_the_same_link() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
+        let live = test_live();
+        let first = live.start(vec![(id, "后端".into())]);
+
+        let resp = handle(
+            Request::LiveRestage {
+                ids: vec![id],
+                names: vec!["改了名字的后端".into()],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        match resp {
+            Response::Live(info) => {
+                assert_eq!(info.id, first.id, "改上架换了 id，全班的链接就作废了");
+                assert_eq!(info.url, first.url, "链接必须一个字都不变");
+                assert_eq!(
+                    info.staged,
+                    vec![(id, "改了名字的后端".to_string())],
+                    "新的上架名单没生效"
+                );
+            }
+            other => panic!("期待 Response::Live，得到 {other:?}"),
+        }
+    }
+
+    /// 没在播的时候改上架：说出来，不许悄悄开一场新的直播——那正是这条
+    /// 协议要避免的事。
+    #[test]
+    fn restaging_while_nothing_is_live_is_refused_not_silently_started() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
+        let live = test_live();
+
+        let resp = handle(
+            Request::LiveRestage {
+                ids: vec![id],
+                names: vec!["前端".into()],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        assert!(
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive))
+            ),
+            "期待 LiveStagingRejected(NotLive)，得到 {resp:?}"
+        );
+        assert!(live.info().id.is_empty(), "restage 不该凭空开出一场直播");
+    }
+
+    /// **停播必须答 `Response::Live` 的空状态，不能答 `Response::Ok`。**
+    /// 界面只认 `Response::Live(info)`（`ui::live::stop_live`），拿它把
+    /// `App::live` 清掉；答 `Ok` 的话直播真停了，屏幕却弹「请求失败」而且
+    /// 继续常驻「● 正在直播」——屏幕说在播而其实没播。
+    #[test]
+    fn stopping_the_broadcast_answers_with_the_empty_live_state() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+        live.start(vec![(1, "前端".into())]);
+
+        let resp = handle(
+            Request::LiveStop,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        match resp {
+            Response::Live(info) => {
+                assert!(info.id.is_empty(), "停播之后不该还留着一个房间 id：{info:?}");
+                assert!(info.url.is_empty(), "停播之后不该还留着链接");
+                assert!(info.staged.is_empty(), "停播之后不该还留着上架名单");
+            }
+            other => panic!("停播该答 Response::Live 的空状态，得到 {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2735,6 +3114,7 @@ mod web_tests {
         bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
         tx: std::sync::mpsc::Sender<Event>,
         pairs: Arc<Mutex<PairTable>>,
+        live: Arc<crate::live::LiveState>,
         /// 临时目录得跟着 fixture 活着，不然 secrets/projects 的路径当场失效。
         _dir: tempfile::TempDir,
     }
@@ -2754,6 +3134,7 @@ mod web_tests {
                 &self.bridge,
                 &self.tx,
                 &self.pairs,
+                &self.live,
             )
         }
     }
@@ -2774,6 +3155,7 @@ mod web_tests {
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
             pairs: Arc::new(Mutex::new(BTreeMap::new())),
+            live: Arc::new(crate::live::LiveState::new("https://x".into())),
             _dir: dir,
         }
     }

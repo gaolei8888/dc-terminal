@@ -535,32 +535,12 @@
 
   // ——会话画面————————————————————————————————————————————————
 
-  // 256 色索引 → CSS。0–15 是终端自己的十六色（各家主题不一样，这里用一套
-  // 常见的取值），16–231 是 6×6×6 色立方，232–255 是灰阶。跟
-  // `ui::mod.rs` 里那条对比度守卫算的是同一套公式。
-  // ——配色——
+  // ——会话画面——
   //
-  // 三档：跟随系统（默认）、浅、深。选过的存 localStorage，**只存在这台
-  // 手机上**：同一个 dct 可能同时被好几个人打开，一个人挑的颜色不该跳到
-  // 另一个人的屏幕上，更不该跑回桌面去（桌面那一侧的配色归桌面自己，
-  // 同 spec 决定四「手机没有 resize 权」那条道理）。
-  var THEMES = ["system", "light", "dark"];
-  var themeIdx = 0;
-  try {
-    var saved = localStorage.getItem("dct-theme");
-    if (THEMES.indexOf(saved) > 0) { themeIdx = THEMES.indexOf(saved); }
-  } catch (e) {
-    // 隐私模式下 localStorage 会抛。选不过是记不住，页面照常能用。
-  }
-
-  // 眼下到底是深还是浅。**跟随系统那一档要去问系统**，不能只看属性：
-  // 画屏幕那套色号靠它选调色板，看错了整屏字会压在同色背景上。
-  function isDark() {
-    var t = THEMES[themeIdx];
-    if (t === "dark") { return true; }
-    if (t === "light") { return false; }
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-  }
+  // 配色、主题三档、`paint`/`fitFont`/`cellSize` 这几件事跟学生只读那页
+  // （`live.html`）共用同一份实现——两页画的是同一块终端画布，理由和这份
+  // 共享代码本身的约定见 `shared.js` 开头那段注释。
+  <!--SHARED-->
 
   var lastLines = null;
 
@@ -590,103 +570,6 @@
     else if (mq.addListener) { mq.addListener(onSys); }
   }
 
-  // ANSI 的 0–15 号没有固定的 RGB——终端主题自己定。这里要两套，因为
-  // **同一套色号在深底和浅底上不可能都读得清**：经典 xterm 那套是为黑底
-  // 配的，把它压在白底上，11 号亮黄（#ffff00）和 15 号白（#ffffff）直接
-  // 隐形；反过来浅底那套压在黑底上，0 号黑也一样看不见。
-  //
-  // 浅底那套里 7/15 号**故意不是白色**：在黑底终端上它们是默认前景（也就是
-  // 正文），照字面画成白色的话，一屏正文在白底上全部消失。所有「亮」色也
-  // 相应压暗——亮色在浅底上的作用是「更重」，不是「更亮」。
-  var PALETTE = {
-    dark: [
-      "#000000", "#cd0000", "#00cd00", "#cdcd00",
-      "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
-      "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
-      "#5c5cff", "#ff00ff", "#00ffff", "#ffffff"
-    ],
-    light: [
-      "#2b2f36", "#a8322a", "#2f6f3e", "#8a5a00",
-      "#005f87", "#8b3a8b", "#16697a", "#3a3f4a",
-      "#5b6472", "#c0392b", "#3d8b50", "#a06a00",
-      "#0a6f9c", "#a34aa3", "#1c7f92", "#14161b"
-    ]
-  };
-  function idxColor(i) {
-    var base = PALETTE[isDark() ? "dark" : "light"];
-    if (i < 16) { return base[i]; }
-    if (i >= 232) {
-      var v = 8 + 10 * (i - 232);
-      return "rgb(" + v + "," + v + "," + v + ")";
-    }
-    var STEP = [0, 95, 135, 175, 215, 255];
-    var n = i - 16;
-    return "rgb(" + STEP[Math.floor(n / 36)] + "," +
-      STEP[Math.floor((n % 36) / 6)] + "," + STEP[n % 6] + ")";
-  }
-
-  // 协议里的颜色是三选一：字符串 "Default"、{Idx:n}、{Rgb:[r,g,b]}。
-  //
-  // **判 Idx 必须用 typeof，不能用真值判断**：0 号色是黑色，而 `if (c.Idx)`
-  // 对 0 是假的——一整屏的黑字会被当成"没上色"。
-  function cssColor(c) {
-    if (!c || c === "Default") { return null; }
-    if (typeof c.Idx === "number") { return idxColor(c.Idx); }
-    if (c.Rgb) { return "rgb(" + c.Rgb.join(",") + ")"; }
-    return null;
-  }
-
-  function styleOf(st) {
-    if (!st) { return ""; }
-    var fg = cssColor(st.fg);
-    var bg = cssColor(st.bg);
-    // 反显 = 前景背景对调。哪一边本来没有具体颜色，就拿页面自己的那一档补上——
-    // 不补的话，一屏默认色上的"反显"什么都看不出来（而反显正是 dct 自己用来
-    // 标"当前项目"的手法）。
-    if (st.inverse) {
-      var swapped = [bg || "var(--bg)", fg || "var(--ink)"];
-      fg = swapped[0];
-      bg = swapped[1];
-    }
-    var out = "";
-    if (fg) { out += "color:" + fg + ";"; }
-    if (bg) { out += "background:" + bg + ";"; }
-    if (st.bold) { out += "font-weight:600;"; }
-    if (st.italic) { out += "font-style:italic;"; }
-    if (st.underline) { out += "text-decoration:underline;"; }
-    return out;
-  }
-
-  // 一整屏画成 <pre> 里的一串 <span>。**用 textContent 塞字**，
-  // 不拼 HTML 字符串——屏幕上的内容来自 agent，里面什么字节都可能有。
-  function paint(lines) {
-    canvasEl.textContent = "";
-    var cols = 0;
-    lines.forEach(function (spans, row) {
-      var width = 0;
-      // **每一行套一个 `<span class="row">`。** 点一行要把这一行的字取出来，
-      // 而原来所有 span 是平铺的，点中之后无从知道自己落在第几行。
-      // 换行符仍然留在行外面：`pageStep()` 靠 `canvasEl.textContent` 数行数，
-      // 把 `\n` 收进行里会让那个数字变，而它管的是翻页步长。
-      var line = document.createElement("span");
-      line.className = "row";
-      spans.forEach(function (sp) {
-        var el = document.createElement("span");
-        var css = styleOf(sp.style);
-        if (css) { el.setAttribute("style", css); }
-        el.textContent = sp.text;
-        width += sp.text.length;
-        line.appendChild(el);
-      });
-      canvasEl.appendChild(line);
-      if (width > cols) { cols = width; }
-      if (row < lines.length - 1) {
-        canvasEl.appendChild(document.createTextNode("\n"));
-      }
-    });
-    return cols;
-  }
-
   // 用户自己调过的倍数。1 = 完全按屏幕自动适配。
   //
   // 记在 localStorage 里：把字号调舒服是一次性的动作，每次打开都要重调一遍
@@ -714,30 +597,6 @@
   // 6px 封底：再小不是"小"，是"看不见"。上限 28px 是给调大的人留的余地——
   // 超出屏幕的部分由 `#screen` 自己滚（底栏不动，它在 flex 外面）。
   var lastCols = 0, lastRows = 0, lastCursor = null, lastCursorHidden = true;
-
-  function fitFont(cols, rows) {
-    if (!cols || !rows) { return; }
-    var probe = 16;
-    rulerEl.style.fontSize = probe + "px";
-    var per = rulerEl.getBoundingClientRect().width / 10;
-    if (!per) { return; }
-
-    var padding = 16;
-    var byWidth = ((screenEl.clientWidth - padding) / (cols * per)) * probe;
-    // 行高是 1.2（见 `#screen pre` 的 CSS），高度这一侧要按它折算。
-    var byHeight = (screenEl.clientHeight - padding) / (rows * 1.2);
-    var size = Math.floor(Math.min(byWidth, byHeight) * zoom);
-    canvasEl.style.fontSize = Math.max(6, Math.min(28, size)) + "px";
-  }
-
-  // 一个格子多宽多高。**画光标和认滚轮落在哪个格子上，量的必须是同一个
-  // 格子**——各量一遍的话，两处迟早在某个字号上错开一列，而错开的那一处
-  // 是「点在这儿、agent 以为点在旁边」这种没人查得出来的偏差。
-  function cellSize() {
-    var size = parseFloat(canvasEl.style.fontSize) || 16;
-    rulerEl.style.fontSize = size + "px";
-    return { w: rulerEl.getBoundingClientRect().width / 10, h: size * 1.2 };
-  }
 
   function placeCursor(pos, hidden) {
     if (hidden || !pos) { cursorEl.hidden = true; return; }

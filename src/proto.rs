@@ -90,7 +90,26 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// `pair_apply::Ready::llm_written`）。这一次变的是**响应**的形状而不是
 /// 请求的：旧界面解不出多了一个字段的 `Done`，一条成功的配对会在最后
 /// 一刻变成一句解析失败——形状变了就得加一，这条规矩对哪一侧都一样。
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// 14 = 直播观众链接。多了 `Request::LiveStart` / `LiveStop` / `LiveStatus`
+/// 和 `Response::Live(LiveInfo)`。**加一，没有例外可讲**：新增 `Request`
+/// 变体那条规矩没得商量——旧守护进程收到 `LiveStart` 只会回一句解析失败，
+/// 而用户看到的是「按了开关什么都没发生」。同 `WebEnable` 那次。
+///
+/// 15 = `LiveInfo` 多了 `readiness` 字段：中转认没认得这场直播（老师拿到
+/// 链接那一刻，中转很可能还没被推帧线程告知这场直播存在）。旧界面解不出
+/// 多了一个必填字段的 `LiveInfo`——形状变了就得加一，跟 13 那次是同一条
+/// 规矩。
+///
+/// 16 = 多了 `Request::LiveRestage`：改上架名单而**不换链接**。在这之前
+/// 界面改勾选走的是 `LiveStart`，每按一次空格就换一把新 token，已经发给
+/// 全班的链接当场作废、学生一起掉线。新增 `Request` 变体那条规矩同 14。
+///
+/// 17 = 直播这一侧的失败原因从「已经成文的句子」换成错误码：
+/// `LiveReadiness::Failed(LiveFailure)`、`ErrorCode::LiveStagingRejected`。
+/// 两处都是**响应**的形状变了（旧界面解不出 `Failed` 里那个对象），照 13
+/// 那次的规矩加一。
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,6 +454,33 @@ pub enum Request {
     WebStatus,
     WebEnable,
     WebDisable,
+    /// 开一场直播：把 `ids` 指到的会话上架，配上 `names` 给学生看的名字。
+    ///
+    /// **`names` 跟 `ids` 必须一一对应**——名字的条数跟会话数对不上，
+    /// 学生看到的第 2 路可能其实是第 3 个会话（见
+    /// `staging_carries_one_name_per_session`）。
+    LiveStart {
+        ids: Vec<u32>,
+        names: Vec<String>,
+    },
+    /// 改上架名单，**链接一个字都不变**：同一个 id、同一把学生 token、
+    /// 同一把 push_secret，只换 lanes。
+    ///
+    /// **跟 `LiveStart` 分开是这条协议存在的全部理由。** 老师上架「后端」
+    /// 把链接发给全班之后想再加一路「前端」，按的是同一个空格键；走
+    /// `LiveStart` 的话每次都换新 id、新 token，200 个学生当场一起掉线，
+    /// 而老师屏幕上没有任何提示。`LiveStart`（以及界面上的 `r` 键）留给
+    /// 「换一条新链接、旧的作废」——那才是它该有的唯一语义。
+    ///
+    /// 字段的约定跟 `LiveStart` 一样：`names` 与 `ids` 一一对应。
+    LiveRestage {
+        ids: Vec<u32>,
+        names: Vec<String>,
+    },
+    /// 停播。
+    LiveStop,
+    /// 现在有没有在播、播的是什么。
+    LiveStatus,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -543,6 +589,19 @@ impl std::fmt::Debug for Request {
             Request::WebStatus => write!(f, "WebStatus"),
             Request::WebEnable => write!(f, "WebEnable"),
             Request::WebDisable => write!(f, "WebDisable"),
+            // ids/names 都不是密钥，照常打印排查用。
+            Request::LiveStart { ids, names } => f
+                .debug_struct("LiveStart")
+                .field("ids", ids)
+                .field("names", names)
+                .finish(),
+            Request::LiveRestage { ids, names } => f
+                .debug_struct("LiveRestage")
+                .field("ids", ids)
+                .field("names", names)
+                .finish(),
+            Request::LiveStop => write!(f, "LiveStop"),
+            Request::LiveStatus => write!(f, "LiveStatus"),
         }
     }
 }
@@ -628,6 +687,133 @@ pub enum Response {
     PairStarted(Result<PairStartedInfo, String>),
     /// 对 [`Request::PairPoll`] 的回答。
     PairTick(PairTick),
+    /// `LiveStart` / `LiveStop` / `LiveStatus` 三条的共同回答。
+    ///
+    /// **停播也答这个，不答 `Response::Ok`**——答的是「停完之后的状态」，
+    /// 也就是 `LiveState::info()` 那份空形状。界面只认 `Response::Live`，
+    /// 拿它把 `App::live` 清掉；答 `Ok` 就会落进界面的 `_ =>` 分支，直播
+    /// 真停了而屏幕继续常驻「正在直播」。见 `daemon.rs` 里 `LiveStop` 那
+    /// 一支上的注释。
+    Live(LiveInfo),
+}
+
+/// 一场直播眼下的样子。
+///
+/// **老师那把推帧/停播用的钥匙（`push_secret`）不在这个类型里。**
+/// `LiveInfo` 是要经过协议线的形状——它会被序列化发给手机网页，将来还可能
+/// 经中转那条信封路转一趟。`LiveState` 和推帧线程活在同一个进程里，取
+/// `push_secret` 根本不需要绕道协议；一旦它上了这条线，任何一个能读到
+/// `Response::Live` 的人都会拿到那把本该只有老师能用的钥匙——见
+/// `a_live_response_never_carries_the_push_secret_to_the_wire`。
+///
+/// `token` 是学生那把，只读，**它会出现在发给一屋子人的链接里**。
+///
+/// 手写 `Debug`：`token` 不许原样出现在任何 `{info:?}` 里，见
+/// `live_info_debug_redacts_the_viewer_token`。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LiveInfo {
+    pub id: String,
+    /// 学生那把钥匙，只读。**它会出现在发给一屋子人的链接里。**
+    pub token: String,
+    pub url: String,
+    pub staged: Vec<(u32, String)>,
+    /// 在看的人数。**这是一个偏低的近似值，不是名册。**
+    ///
+    /// 它数的是「此刻正挂在中转长轮询上的人」——中转那边就是这么数的
+    /// （`dct-srv::Live::viewers` 数 `watch` 订阅数）。学生页拿到一帧之后
+    /// 到发起下一次长轮询之间有一小段空隙，那段时间里这个学生不挂在任何
+    /// 订阅上，就数不进来；讲课时画面一直在变，每一帧都把全班从长轮询里
+    /// 放出来一次，所以**多数时刻反而是大部分人都不挂着**，这个数会明显
+    /// 低于真实在看人数。老师安静不动的时候它最准。
+    ///
+    /// 所以它回答的是「有没有人、大概多少人」，不是「谁在、到底几个人」。
+    /// 界面上不能拿它当点名册用，也不该据此说「没人在看」。
+    ///
+    /// 另外它是推帧线程搭着保活那一拍（`KEEPALIVE`）读回来的，最多会旧
+    /// 上那么一拍。
+    pub viewers: u32,
+    /// 中转认没认得这场直播。
+    ///
+    /// `LiveState::start()` 是同步的，一返回就有完整的学生链接；而真正
+    /// 告诉中转「这场直播存在」（`POST /live/start`）是推帧线程按
+    /// `PUSH_INTERVAL` 异步去做的。没有这个字段，老师点完「开始直播」的
+    /// 那一瞬就会拿着一条链接去发给全班，而那时中转很可能还不知道这场
+    /// 直播——界面无从分辨「链接已经能用」和「刚生成、还在等中转答应」。
+    pub readiness: LiveReadiness,
+}
+
+/// 见 [`LiveInfo::readiness`]。
+///
+/// **`Failed` 带的是错误码，不是句子。** 这跟 `ErrorCode` 是同一条规矩
+/// （见它上面那段「守护进程报码，不组句」）：拼这句话的地方是推帧线程，
+/// 它手上根本没有 `Lang`——早先那一版在那里直接拼中文，于是英文界面会显示
+/// 「Failed to go live: 连不上中转，稍后会自动重试」。仓库里那条「英文文案
+/// 里不许有汉字」的守卫（`has_han`）钉的是 `Key` 那张表，一句带参数拼出来
+/// 的话从它旁边绕了过去。
+///
+/// 组句在界面那一侧：`i18n::msg::live_failure`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiveReadiness {
+    /// 本地已经生成好链接，但还没成功告诉过中转——这时候把链接发出去，
+    /// 学生打开大概率是打不开的。
+    Pending,
+    /// 中转已经收下这场直播，链接现在真的能用。
+    Ready,
+    /// 上一次尝试告诉中转失败了。
+    Failed(LiveFailure),
+}
+
+/// 告诉中转「这场直播存在」为什么没成功。**只报码，不组句**，理由见
+/// [`LiveReadiness`]。
+///
+/// **绝不携带原始错误文本，更不携带 `push_secret`**——这个类型要经手协议
+/// 线（见 `LiveInfo` 上的文档注释）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiveFailure {
+    /// 连不上中转（DNS、网络、中转没起来）。会自动重试。
+    Unreachable,
+    /// 连上了，但中转拒绝了这场直播。带 HTTP 状态码：429/413 这类码本身
+    /// 就是给人看的线索，而它不是自由文本，翻译得动。
+    Refused(u16),
+}
+
+/// 一份上架名单为什么不能用。同样**只报码，不组句**——拼这句话的是守护
+/// 进程（`daemon.rs::validated_staging`），它不知道界面用的是哪种语言。
+///
+/// 早先这几条走的是 `ErrorCode::BadRequest(String)`，而那个 `String` 里
+/// 直接写着中文：英文界面上会显示 "dct could not understand that request:
+/// LiveStart：会话 [7] 不存在，没法上架"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiveStagingProblem {
+    /// `ids` 跟 `names` 的条数对不上。
+    NamesMismatch,
+    /// 一路都没上架——见 `daemon.rs::validated_staging` 里那段「0 路的直播
+    /// 是个死循环」。
+    Empty,
+    /// 超过一场直播能有的路数上限。
+    TooMany { max: usize, got: usize },
+    /// 这几个会话 id 守护进程不认识。**不静默丢弃**：老师上架了三路、屏幕
+    /// 上却只显示两路，他不会知道第三路去哪了。
+    UnknownSessions(Vec<u32>),
+    /// 现在没在播，没有上架名单可改（只有 `LiveRestage` 会撞上）。
+    ///
+    /// 界面本来就只在 `is_live` 为真时才发那条请求，走到这儿说明两侧对
+    /// 「在不在播」的判断岔了。**要说出来，不能悄悄开一场新的直播**——
+    /// 那正是 `LiveRestage` 这条协议要避免的事。
+    NotLive,
+}
+
+impl std::fmt::Debug for LiveInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveInfo")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("url", &"<redacted>")
+            .field("staged", &self.staged)
+            .field("viewers", &self.viewers)
+            .field("readiness", &self.readiness)
+            .finish()
+    }
 }
 
 /// `pair::Started` 给界面看的那一面。**故意不是 `Started` 本身**：那个类型里有
@@ -686,6 +872,10 @@ pub enum ErrorCode {
     NotAnAgentSession,
     /// 请求解析失败，带上原始错误供排查
     BadRequest(String),
+    /// 上架名单不能用。**独立一条，不走 `BadRequest(String)`**：那条的
+    /// 参数是自由文本，而自由文本只能由守护进程写死成某一种语言——见
+    /// [`LiveStagingProblem`] 上那段。
+    LiveStagingRejected(LiveStagingProblem),
     /// git 自己的 stderr。**刻意留的兜底**：那是 git 按它自己的 `LANG` 输出的，
     /// dct 翻不动也不该翻。界面显示成「操作失败：<原文>」——外面那半句是
     /// 翻译过的，里面照抄。
@@ -1028,14 +1218,24 @@ mod tests {
             Request::WebStatus,
             Request::WebEnable,
             Request::WebDisable,
+            Request::LiveStart {
+                ids: vec![1],
+                names: vec!["n".into()],
+            },
+            Request::LiveRestage {
+                ids: vec![1],
+                names: vec!["n".into()],
+            },
+            Request::LiveStop,
+            Request::LiveStatus,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                13,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable"]"#
+                17,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1059,7 +1259,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                13,
+                17,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1168,7 +1368,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                13,
+                17,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1275,8 +1475,67 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (13, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (17, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// 上架的每一路都要有名字，而且名字的条数必须跟会话数对得上——
+    /// 对不上就会出现「学生看到的第 2 路其实是第 3 个会话」。
+    #[test]
+    fn staging_carries_one_name_per_session() {
+        let req = Request::LiveStart {
+            ids: vec![3, 5],
+            names: vec!["前端调试".into(), "后端接口".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::LiveStart { ids, names } => {
+                assert_eq!(ids.len(), names.len());
+                assert_eq!(names[1], "后端接口");
+            }
+            other => panic!("解出来的不是 LiveStart：{other:?}"),
+        }
+    }
+
+    /// `token` 会经手机屏幕/聊天软件转发，绝不能原样出现在任何 `{info:?}`
+    /// 里。**`url` 里拼进了 `token`（放在 fragment 里），一旦原样打印就等于
+    /// 把 token 也漏了**——两个字段都要断言看不见。
+    #[test]
+    fn live_info_debug_redacts_the_viewer_token() {
+        let info = LiveInfo {
+            id: "7f3a2c91".into(),
+            token: "student-secret-token".into(),
+            url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
+            staged: vec![(1, "前端".into())],
+            viewers: 2,
+            readiness: LiveReadiness::Pending,
+        };
+        let s = format!("{info:?}");
+        assert!(s.contains("7f3a2c91"), "id 不敏感，该照常打印：{s}");
+        assert!(!s.contains("student-secret-token"), "token 泄露了：{s}");
+    }
+
+    /// **`Response::Live` 序列化出来的 JSON 里不许出现老师那把推帧/停播用
+    /// 的钥匙。** `LiveInfo` 类型上已经没有 `push_secret` 这个字段了，这条
+    /// 测试钉住的是这件事本身不会被以后哪次改动悄悄加回来——`push_secret`
+    /// 只活在 `LiveState` 内部，取用口是 `pub(crate)` 的，物理上不会被
+    /// 序列化进任何一条协议响应。
+    #[test]
+    fn a_live_response_never_carries_the_push_secret_to_the_wire() {
+        let r = Response::Live(LiveInfo {
+            id: "7f3a2c91".into(),
+            token: "student-secret-token".into(),
+            url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
+            staged: vec![(1, "前端".into())],
+            viewers: 2,
+            readiness: LiveReadiness::Ready,
+        });
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("push_secret"),
+            "老师那把推帧/停播用的钥匙不该出现在任何一条能发到网页上的答复里：{json}"
         );
     }
 }

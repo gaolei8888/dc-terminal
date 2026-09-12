@@ -1,0 +1,553 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>dct</title>
+<!--
+  直播观众页：学生打开老师分享的链接看到的整个前端。**只读**，第 0 期。
+
+  规矩，改这个文件之前先读：
+
+  1. **这一页没有任何一条能把字节送回老师终端的路。** 不是某处 `if` 判出来
+     的只读——是这份字节里根本没有那些路径：没有输入框、没有虚拟键、没有
+     `/api/*`、没有任何一处调用会把东西 POST 回老师那台机器。`dct-page`
+     里有一条测试专门扫这份文件，钉的就是这件事；它比自觉可靠，但**不能
+     代替**——加新功能之前想一想它是不是在往这份字节里加一条送出去的路。
+  2. **一个字的用户可见文案都不许写死在正文逻辑里。** 但也不走 `page.html`
+     那条"问守护进程要 `t("key")`"的路——这一页发自中转，中转认不出 dct
+     的协议（spec 决定一：中转只搬信封，不看里面），够不着守护进程那份
+     i18n；专门为它开一条 `/live/<id>/strings` 换来的只是多一条中转本不该
+     懂的路径。所以文案表就近放在这个文件顶部的 `<script>` 里，中英两份，
+     按 `navigator.language` 选一次——页面里其余地方一个文案字面量都不许
+     出现，规矩没变，只是集中的地方跟手机端不同。
+  3. **没有外部资源。** 没有 CDN、没有字体、没有图。
+  4. **不改 PTY 尺寸。** 这一页只看画面，尺寸归开播那台电脑的桌面端决定
+     （跟手机端同一条规矩）。
+  5. **渲染那一份代码（配色、主题三档、`paint`/`fitFont`/`cellSize`）跟
+     `page.html` 共用一份**，接在 `<!--SHARED-->` 那个占位符的位置——理由
+     和对这段文本的约定写在 `shared.js` 开头。
+-->
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #14161b;
+    --dim: #5b6472;
+    --line: #d9dde3;
+    --accent: #005f87;
+    --ok: #2f6f3e;
+    --busy: #8a5a00;
+    --bad: #a8322a;
+  }
+  /* 深色那一档写两遍，同 `page.html` 那段注释：一份跟系统、一份跟用户
+     在这一页上明确选过的那一档，两份都要能压过对方。 */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1116;
+      --card: #171a20;
+      --ink: #e7eaef;
+      --dim: #8b95a5;
+      --line: #262b34;
+      --accent: #63b3d9;
+      --ok: #7fc08c;
+      --busy: #e8c07d;
+      --bad: #e88c7d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1116;
+    --card: #171a20;
+    --ink: #e7eaef;
+    --dim: #8b95a5;
+    --line: #262b34;
+    --accent: #63b3d9;
+    --ok: #7fc08c;
+    --busy: #e8c07d;
+    --bad: #e88c7d;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #14161b;
+    --dim: #5b6472;
+    --line: #d9dde3;
+    --accent: #005f87;
+    --ok: #2f6f3e;
+    --busy: #8a5a00;
+    --bad: #a8322a;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+    padding: .8rem 1rem;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+  }
+  header.bad { background: var(--bad); color: var(--bg); border-color: var(--bad); }
+  header.warn { background: var(--busy); color: var(--bg); border-color: var(--busy); }
+  #dot { font-size: 1rem; line-height: 1; }
+  #status { font-weight: 600; font-size: .95rem; }
+  #viewers { font-size: .8rem; color: var(--dim); }
+  header.bad #viewers, header.warn #viewers { color: var(--bg); }
+  #lanes { display: flex; gap: .3rem; flex-wrap: wrap; margin-left: auto; }
+  #lanes button {
+    background: none; border: 1px solid var(--line); border-radius: .35rem;
+    max-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-height: 1.8rem; padding: 0 .5rem;
+    font: inherit; font-size: .8rem; color: var(--ink); cursor: pointer;
+  }
+  #lanes button.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  #tools { display: flex; gap: .3rem; }
+  #tools button {
+    background: none; border: 1px solid var(--line); border-radius: .35rem;
+    min-width: 2rem; min-height: 1.8rem;
+    font: inherit; font-size: .8rem; color: var(--ink); cursor: pointer;
+  }
+  header.bad #lanes button, header.bad #tools button,
+  header.warn #lanes button, header.warn #tools button {
+    border-color: var(--bg); color: var(--bg);
+  }
+  #screen { flex: 1 1 auto; min-height: 0; position: relative; padding: .5rem; overflow: auto; }
+  :root { --mono: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace; }
+  #screen pre {
+    margin: 0;
+    font-family: var(--mono);
+    line-height: 1.2;
+    white-space: pre;
+    -webkit-text-size-adjust: none;
+    text-size-adjust: none;
+  }
+  #ruler { position: absolute; visibility: hidden; white-space: pre; font-family: var(--mono); }
+  .notice { padding: 2rem 1rem; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<header id="head">
+  <span id="dot"></span>
+  <span id="status"></span>
+  <span id="viewers" hidden></span>
+  <span id="lanes"></span>
+  <span id="tools">
+    <button type="button" id="zoomout">A&minus;</button>
+    <button type="button" id="zoomin">A+</button>
+    <button type="button" id="theme">&#9681;</button>
+  </span>
+</header>
+<div id="screen"><span id="ruler">MMMMMMMMMM</span><pre id="canvas"></pre></div>
+<script>
+(function () {
+  "use strict";
+
+  var canvasEl = document.getElementById("canvas");
+  var rulerEl = document.getElementById("ruler");
+  var screenEl = document.getElementById("screen");
+  var headEl = document.getElementById("head");
+  var dotEl = document.getElementById("dot");
+  var statusEl = document.getElementById("status");
+  var viewersEl = document.getElementById("viewers");
+  var lanesEl = document.getElementById("lanes");
+  var zoomOutEl = document.getElementById("zoomout");
+  var zoomInEl = document.getElementById("zoomin");
+  var themeEl = document.getElementById("theme");
+
+  // ——渲染那一份，跟 page.html 共用——
+  <!--SHARED-->
+
+  // ——文案表——
+  //
+  // 见文件顶部那段注释的第 2 条：这一页够不着守护进程的 i18n，所以文案表
+  // 就近摆在这里，不走 `t("key")` 问协议那一套。**页面其余地方一个文案
+  // 字面量都不许出现**——新加一句提示，先来这张表里加一对键，两种语言
+  // 都要填，不能只填一半（认不出语言时退英文，参照手机端同一条规矩）。
+  var STRINGS = {
+    zh: {
+      live: "直播中",
+      paused: "老师暂停了",
+      ended: "这场直播结束了",
+      smaller: "缩小",
+      bigger: "放大",
+      theme: "配色",
+      viewers: function (n) { return n + " 人在看"; }
+    },
+    en: {
+      live: "Live",
+      paused: "Teacher paused",
+      ended: "This live session has ended",
+      smaller: "Smaller text",
+      bigger: "Bigger text",
+      theme: "Theme",
+      viewers: function (n) { return n + " watching"; }
+    }
+  };
+  var LANG = (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+  var S = STRINGS[LANG];
+
+  zoomOutEl.setAttribute("aria-label", S.smaller);
+  zoomInEl.setAttribute("aria-label", S.bigger);
+  themeEl.setAttribute("aria-label", S.theme);
+
+  // ——身份：这一场直播的 id，和学生那把只读钥匙——
+  //
+  // id 是路径最后一段（`/live/<id>`）；钥匙在链接的 fragment 里
+  // （`#t=<token>`），fragment 不上行、不进任何中间日志。读一次就把地址栏
+  // 抹干净——同手机端 `page.html` 那一套的理由：**但**这里额外存进
+  // `sessionStorage`（不是 30 天的 cookie）：直播本身是这堂课这一次性的
+  // 东西，教室里刷新一次页面不该要求老师再发一遍链接，可它也不值得像手机
+  // 端那样长期免登录 30 天。
+  var LIVE_ID = (function () {
+    var parts = location.pathname.split("/").filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "";
+  })();
+
+  var TOKEN = (function claim() {
+    var storeKey = "dct-live-token-" + LIVE_ID;
+    var m = /(?:^|[#&])t=([^&]+)/.exec(location.hash || "");
+    if (m) {
+      try { sessionStorage.setItem(storeKey, m[1]); } catch (e) {}
+      history.replaceState(null, "", location.pathname);
+      return m[1];
+    }
+    try { return sessionStorage.getItem(storeKey) || ""; } catch (e) { return ""; }
+  })();
+
+  // ——上架的几路——
+  //
+  // 名字是**老师起的**，从 `GET /live/{id}/lanes` 来——**不是数字，不是
+  // 会话标题**。会话标题和项目路径一个字都不许上公网（整份 spec 的前提
+  // 之一），数字按钮达不到"学生认得出这是哪一路"这个目的，而且老师在
+  // 直播面板上改了名字，数字按钮完全反映不出来。同一条路径把在线人数
+  // 一起带回来（见下面 `refreshLanes`），省得为一个数字单开一条轮询。
+  var lane = 0;
+
+  function renderLaneButtons(names) {
+    lanesEl.textContent = "";
+    if (lane >= names.length) { lane = 0; }
+    names.forEach(function (name, idx) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = name;
+      b.className = idx === lane ? "on" : "";
+      b.addEventListener("click", function () { pickLane(idx); });
+      lanesEl.appendChild(b);
+    });
+  }
+
+  // **`ended` 的时候必须允许点回同一路。** 老师重开时减少了路数，学生停在
+  // 一个越界的 lane 上会先吃一记失败，随后 `renderLaneButtons` 把 `lane`
+  // 收回 0；这时候学生点第 0 路，要是因为 `idx === lane` 直接 return，
+  // `ended` 就永远解不开，只能刷新页面。
+  function pickLane(idx) {
+    if (idx === lane && !ended) { return; }
+    lane = idx;
+    etag = null;
+    ended = false;
+    lastChangeAt = Date.now();
+    Array.prototype.forEach.call(lanesEl.children, function (b, i) {
+      b.className = i === lane ? "on" : "";
+    });
+    render();
+    pull();
+  }
+
+  // 开场拉一次，之后**跟着已经在跑的那个两秒计时器**（下面 `setInterval`
+  // 那个，本来就在查"画面是不是太久没变了"）捎带着刷新，不为人数单独起
+  // 一条轮询。拉不到就沉默：这不是决定这一页看起来对不对的那条请求，
+  // 拉帧才是。
+  //
+  // **拉帧失败之后的复核走的也是这一条**（见 `afterFailure`），不另开一次
+  // `fetch`：它答得出来就说明这场直播还活着、手上的令牌也还有效，那么刚才
+  // 那次失败就不是"直播结束了"。
+  function fetchLanes() {
+    return fetch("/live/" + LIVE_ID + "/lanes", {
+      headers: { "x-live-token": TOKEN },
+      credentials: "omit"
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  }
+
+  // 把一份 lanes 答复画到屏幕上。回 `true` 表示"中转答得出来"——`afterFailure`
+  // 拿这个当"这场直播还活着"的凭据。
+  function applyLanes(data) {
+    if (!data) { return false; }
+    renderLaneButtons(data.lanes || []);
+    viewersEl.hidden = false;
+    viewersEl.textContent = S.viewers(data.viewers || 0);
+    return true;
+  }
+
+  function refreshLanes() {
+    fetchLanes().then(applyLanes);
+  }
+
+  // ——字号——
+  //
+  // 纯本地：调整只改这台设备上的显示，不发任何请求。跟手机端 `page.html`
+  // 同一个键（`dct-zoom`）——两页各自的 origin 不同，存储互不相干。
+  var zoom = 1;
+  try {
+    var saved = parseFloat(localStorage.getItem("dct-zoom"));
+    if (saved > 0.3 && saved < 4) { zoom = saved; }
+  } catch (e) {}
+
+  function setZoom(z) {
+    zoom = Math.max(0.5, Math.min(3, z));
+    try { localStorage.setItem("dct-zoom", String(zoom)); } catch (e) {}
+    fitFont(lastCols, lastRows);
+  }
+
+  zoomOutEl.addEventListener("click", function () { setZoom(zoom / 1.15); });
+  zoomInEl.addEventListener("click", function () { setZoom(zoom * 1.15); });
+
+  // ——主题三档，纯本地——
+  var lastLines = null;
+  function repaint() { if (lastLines) { paint(lastLines); } }
+  function applyTheme() {
+    var t = THEMES[themeIdx];
+    if (t === "system") { document.documentElement.removeAttribute("data-theme"); }
+    else { document.documentElement.setAttribute("data-theme", t); }
+    repaint();
+  }
+  if (window.matchMedia) {
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    var onSys = function () { if (THEMES[themeIdx] === "system") { applyTheme(); } };
+    if (mq.addEventListener) { mq.addEventListener("change", onSys); }
+    else if (mq.addListener) { mq.addListener(onSys); }
+  }
+  themeEl.addEventListener("click", function () {
+    themeIdx = (themeIdx + 1) % THEMES.length;
+    try { localStorage.setItem("dct-theme", THEMES[themeIdx]); } catch (e) {}
+    applyTheme();
+  });
+
+  window.addEventListener("resize", function () { fitFont(lastCols, lastRows); });
+
+  // ——三种状态——
+  //
+  // `live`：最近一次拉帧成功。`paused`：拉帧还在成功，只是画面已经
+  // `STALE_MS` 没变过——**这是纯客户端的猜测**，中转不会告诉学生"老师在
+  // 发呆"，能看到的只有"画面变没变"。`ended`：**复核过的**失败——连着几次
+  // 拉帧失败，而且连 `/lanes` 都答不出来了（见 `afterFailure`）。单独
+  // 一次失败不算：反代抖一个 502、或者老师重开时减少了路数让我们停在一个
+  // 越界的 lane 上，都不是"直播结束了"。
+  //
+  // **这里故意不区分"直播不存在"和"令牌不对"，因为中转本来就没把这两件
+  // 事分开。** `Live::frame`/`Live::lanes` 的 `authed()` 认不出房间和认出
+  // 房间但令牌对不上，回的是同一个 401——如果分开回，任何一个人拿一把
+  // 猜的/过期的令牌去试一堆 live-id，就能靠错误码是"401 不存在"还是
+  // "401 令牌错"反推出"这个 id 现在是不是正播着"，把中转当探测器用。
+  // 学生页跟着这条设计走：两种情况看到的都是同一句"这场直播结束了"，不去
+  // 猜是哪一种。
+  var lastCols = 0, lastRows = 0;
+  var STALE_MS = 60000;
+  var etag = null;
+  var lastChangeAt = Date.now();
+  var inflight = false;
+  var ended = false;
+  var state = "live";
+
+  // ——`wait` 被掐掉时的那条退路——
+  //
+  // 整个带宽模型建立在「中转真的挂 `WAIT_TIMEOUT`（25 秒）」上：画面不变
+  // 的几十秒里 200 个学生一个字节都不传。可 `?wait=1` 是查询串上的一句
+  // 请求，不是合同——中间任何一层代理（学校出口、CDN、企业网关）都可能
+  // 把它吃掉或者自己先超时，那时候 304 会立刻回来，而 `schedule(0)` 就是
+  // 零延迟再发一次：200 个学生一起变成一场不限速的自 DDoS，中转和老师
+  // 的网都会被自己的学生打垮。
+  //
+  // 所以「什么都没变」的那几条路都过一道地板：响应回得比这个还快，就等
+  // 到这个间隔再发下一次。这是 spec 里「普通轮询那条路留着，作为 wait 被
+  // 中间代理掐掉时的退路」的落地——退路要真的是一条能走的路，一秒一次的
+  // 普通轮询扛得住 200 人，零延迟的轮询扛不住任何人。
+  //
+  // 长轮询正常工作时这道地板一次都不会生效（25 秒 > 1.5 秒），所以它不
+  // 拖慢任何东西：画面真变了那一条路径照旧立刻重拉。
+  var MIN_IDLE_GAP_MS = 1500;
+  var sentAt = 0;
+
+  // 「这一轮什么都没变」时该等多久：够慢就立刻再来，快得离谱就补足地板。
+  function scheduleIdle() {
+    schedule(Math.max(0, MIN_IDLE_GAP_MS - (Date.now() - sentAt)));
+  }
+
+  var ICON = { live: "●", paused: "◌", ended: "×" };
+
+  function render() {
+    dotEl.textContent = ICON[state];
+    statusEl.textContent = S[state];
+    headEl.className = state === "ended" ? "bad" : state === "paused" ? "warn" : "";
+  }
+
+  function frameUrl() {
+    return "/live/" + LIVE_ID + "/frame?lane=" + lane + "&wait=1";
+  }
+
+  // **`lines` 本身就是一帧，不是包了一层 `{"Screen": {...}}` 的对象。**
+  //
+  // 推帧那一侧（`src/live.rs` 的 `frame_of`）序列化的是 `lines: &[Vec<
+  // ScreenSpan>]` 自己（`serde_json::to_vec(lines)`），从来没有套过
+  // `Response::Screen` 那层壳——那层壳只在守护进程直接答复
+  // `Request::Screen`（手机端 `page.html` 走的那条路）时才存在。这一页
+  // 走的是直播那条独立的推帧管道，收到的 JSON 顶层就是"行的数组"。第一版
+  // 把这两条管道的形状搞混了，误以为帧外面还套了那层壳，于是每一帧都在
+  // 这里被判成"形状不对"而静默丢弃——`dct-page`/`dct` 两侧的单元测试各自都是
+  // 绿的（一侧测"能序列化"，一侧测"读了该读的字段"），没有一条测试跨过
+  // 中间这道缝，直到有人拿真浏览器打开链接才看见画面一直是空的。
+  // `src/live.rs::the_wire_shape_frame_of_sends_is_the_shape_the_student_page_reads`
+  // 就是补的这条缝。
+  function draw(lines) {
+    lastLines = lines;
+    var cols = paint(lines);
+    lastCols = cols;
+    lastRows = lines.length;
+    fitFont(cols, lines.length);
+  }
+
+  function markEnded() {
+    ended = true;
+    state = "ended";
+    render();
+  }
+
+  // ——一次失败不等于直播结束——
+  //
+  // 原来这里是「响应不是 2xx 就直接判死」：反代抖一个 502，学生页就永久显示
+  // 「这场直播结束了」，除了刷新没有别的出路。两种最常见的失败都不该判死：
+  //
+  // 1. **5xx**：反代/中转抖一下。退避重试就好。
+  // 2. **401 而 lane 越界**：老师重开时减少了路数，学生停在第 3 路而现在
+  //    只剩 2 路。中转对"这场直播不存在"和"令牌不对"**故意回同一个 401**
+  //    （见上面那段状态注释），`Live::frame` 对越界的 lane 回的也是 401
+  //    ——光看状态码分不出这三件事。
+  //
+  // 所以判死要经过复核：再问一次 `/live/{id}/lanes`。它答得出来，就说明
+  // 这场直播还活着、手上的令牌也还有效，刚才那次失败只能是这一路的事，
+  // `renderLaneButtons` 顺手把 `lane` 收回合法范围，接着看就是了；它也
+  // 答不出来，而且连着失败够多次，才算真的结束。
+  var FAIL_LIMIT = 3;
+  var BACKOFF_MS = [1000, 2000, 4000, 8000];
+  var failures = 0;
+
+  function backoff() {
+    return BACKOFF_MS[Math.min(failures, BACKOFF_MS.length - 1)];
+  }
+
+  function afterFailure() {
+    failures += 1;
+    fetchLanes().then(function (data) {
+      if (applyLanes(data)) {
+        // 直播还活着、令牌也还有效。`lane` 已经被收回合法范围，换一路
+        // 就得重新拿 etag——旧那个是另一路的。走地板重来，别对着一个
+        // 一直抖 5xx 的反代打转。
+        failures = 0;
+        etag = null;
+        scheduleIdle();
+        return;
+      }
+      if (failures >= FAIL_LIMIT) {
+        markEnded();
+        return;
+      }
+      schedule(backoff());
+    });
+  }
+
+  // 一次只飞一个请求，答案回来之前不发下一个——同手机端 `screenInflight`
+  // 那道闸，理由一样：链路一慢，叠起来的请求只会越叠越慢。
+  function pull() {
+    if (ended || inflight || document.visibilityState !== "visible") { return; }
+    inflight = true;
+    sentAt = Date.now();
+    var headers = { "x-live-token": TOKEN };
+    if (etag !== null) { headers["If-None-Match"] = "\"" + etag + "\""; }
+    fetch(frameUrl(), { headers: headers, credentials: "omit" })
+      .then(function (r) {
+        inflight = false;
+        if (r.status === 304) {
+          // 画面没变。`wait` 正常工作的话这里已经挂过 25 秒，`scheduleIdle`
+          // 当场就放行；被中间代理掐掉的话它把节奏压回一秒多一次，见上面
+          // `MIN_IDLE_GAP_MS` 那段。
+          scheduleIdle();
+          return;
+        }
+        if (!r.ok) {
+          // **不当场判死**——先复核，见 `afterFailure` 上面那段。
+          afterFailure();
+          return;
+        }
+        var newEtag = r.headers.get("etag");
+        // body 是 gzip 过的 JSON——**浏览器已经按 Content-Encoding 解开了**，
+        // 这里拿到的就是明文文本，不能再喂给 DecompressionStream 解第二遍。
+        return r.text().then(function (text) {
+          if (newEtag) { etag = newEtag.replace(/"/g, ""); }
+          // 一路还没被老师推过帧：`Live` 里新开的 lane 起手是空 body。
+          // 这跟"直播结束了"不是一回事，继续等下一轮就好。
+          if (!text) { scheduleIdle(); return; }
+          var frame;
+          try { frame = JSON.parse(text); } catch (e) { scheduleIdle(); return; }
+          // `frame` 就是"行的数组"本身（见 `draw` 上面那段注释）。
+          // **空数组是合法的一帧**（老师推了一屏空画面），跟上面"空 body
+          // ＝还没推过帧"是两回事——数组存在就该照画，哪怕它长度是 0。
+          if (!Array.isArray(frame)) { scheduleIdle(); return; }
+          lastChangeAt = Date.now();
+          failures = 0;
+          if (state !== "live") { state = "live"; }
+          draw(frame);
+          render();
+          schedule(0);
+        });
+      })
+      .catch(function () {
+        inflight = false;
+        // 网络本身抖了一下，不代表直播真的没了——退避重试，不当场判死刑。
+        schedule(2000);
+      });
+  }
+
+  function schedule(delay) {
+    setTimeout(pull, delay);
+  }
+
+  // 每几秒检查一次"画面是不是太久没变了"，顺带刷新在线人数（跟名字一起
+  // 从 `refreshLanes` 来）——**不为人数单开一条轮询**，这个计时器本来就
+  // 在跑，捎带上就够了。
+  setInterval(function () {
+    refreshLanes();
+    if (ended) { return; }
+    var stale = Date.now() - lastChangeAt > STALE_MS;
+    var next = stale ? "paused" : "live";
+    if (next !== state) {
+      state = next;
+      render();
+    }
+  }, 2000);
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") { pull(); }
+  });
+
+  applyTheme();
+  render();
+  refreshLanes();
+  pull();
+})();
+</script>
+</body>
+</html>

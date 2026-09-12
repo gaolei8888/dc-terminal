@@ -11,6 +11,7 @@ pub mod i18n;
 pub mod journal;
 pub mod last_sessions;
 pub mod link;
+pub mod live;
 pub mod llm;
 pub mod llm_optin;
 pub mod pair;

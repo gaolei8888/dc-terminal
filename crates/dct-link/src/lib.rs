@@ -284,6 +284,8 @@ impl std::fmt::Display for LinkError {
 
 impl std::error::Error for LinkError {}
 
+pub mod live;
+
 /// `Vec<u8>` ⇄ base64 字符串。理由见 `Cargo.toml` 里 base64 那条注释。
 mod payload_b64 {
     use base64::{engine::general_purpose::STANDARD, Engine as _};

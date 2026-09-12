@@ -4,7 +4,7 @@
 //! 手机把信封 POST 过来，中转按 `to` 找到那个挂着的轮询、把信封递过去。
 //! `payload` 对它自始至终是一段不透明的字节——第一期是明文 JSON，第二期是
 //! 密文，而中转两期的代码完全一样。**任何一天这里出现
-//! `from_slice::<Request>`，spec 决定一就已经破了。**
+//! `from_slice` 把 payload 认成一个 `Request`，spec 决定一就已经破了。**
 //!
 //! # 在线是什么意思
 //!
@@ -24,12 +24,15 @@
 //! `token` 现在没人验（任务 5 才接 dc_classroom），所以**这个服务在第一期
 //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
 
+mod live;
+pub use live::Live;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, FromRef, Path, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -273,9 +276,210 @@ impl From<LinkError> for Rejected {
     }
 }
 
+/// 中转的全部状态：配对信封那半（`relay`）和直播那半（`live`）。两者互不
+/// 知道对方存在——直播的路由只碰 `live`，配对的路由只碰 `relay`；合流只是
+/// 因为 axum 的 `Router` 一次只挂一份 state，`FromRef` 让各自的 handler
+/// 照旧各拿各的那一半，不用互相知道。
+#[derive(Clone)]
+pub struct AppState {
+    pub relay: Arc<Relay>,
+    pub live: Arc<Live>,
+}
+
+impl FromRef<AppState> for Arc<Relay> {
+    fn from_ref(state: &AppState) -> Self {
+        state.relay.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<Live> {
+    fn from_ref(state: &AppState) -> Self {
+        state.live.clone()
+    }
+}
+
+/// 从请求头里取一个字符串值。取不到、或者不是合法 UTF-8，一律当作没带。
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+/// 手写的查询串解析。不用 axum 的 `Query` 提取器——那需要额外打开一个
+/// cargo feature（`query`，牵出 `serde_urlencoded`/`serde_path_to_error`），
+/// 而这里只需要两个数字参数，用不上一整套 serde 反序列化。
+fn parse_query(uri: &Uri) -> HashMap<String, String> {
+    uri.query()
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| {
+            let mut it = kv.splitn(2, '=');
+            let k = it.next()?;
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), it.next().unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
+/// `POST /live/start` 的请求体：老师开播（或者自己重开同一场）时带来的
+/// 一切——两把钥匙和这场直播上架了哪几路。**这一期没有配对身份可验**，
+/// 认不认这次 `start` 全靠 `Live::start` 自己那条「已存在的 id 只认原来
+/// 那把 push_secret」的规矩，路由这一层不做额外校验。
+#[derive(serde::Deserialize)]
+struct LiveStartRequest {
+    id: String,
+    viewer_token: String,
+    push_secret: String,
+    lanes: Vec<String>,
+}
+
+/// 老师开播：把 `Live::start` 接到网上。守护进程的推帧线程在第一次推帧
+/// 之前调它，好让中转认得 `viewer_token`/`push_secret` 和这场直播上架了
+/// 哪几路——不然中转会把第一次推帧当成「这场直播不存在」拒收。
+/// **这条路由是 spec 里唯一要对公网开的东西，而这一期它没有配对身份可验。**
+/// 所以它自己得带两道闸：房间总数有上限（`Live::start` 里判，回
+/// `QuotaExceeded` → 429），以及按来源的建房节流（`Live::note_start`，回
+/// `Busy` → 429）。两道都在，缺一道就是另一半攻击面敞着——只有总数上限，
+/// 一个脚本把上限占满就能让真正的老师开不了播；只有节流，换一堆来源照样
+/// 能把内存撑爆。
+///
+/// 节流在建房**之前**：一次会被拒的建房不该先把房间表动一遍。
+async fn live_start_route(
+    State(live): State<Arc<Live>>,
+    headers: HeaderMap,
+    Json(req): Json<LiveStartRequest>,
+) -> Result<StatusCode, Rejected> {
+    live.note_start(&client_key(&headers), Instant::now())?;
+    live.start(req.id, req.viewer_token, req.push_secret, req.lanes)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 建房限流按什么分桶。
+///
+/// **中转永远只听本机**（`must_be_loopback`），所以公网上的请求必然经过
+/// 反向代理，真正的来源只在 `X-Forwarded-For` 里——取头一跳。部署文档
+/// （`docs/deploy-live-relay.md`）因此把「反代必须设这个头」写成了要求
+/// 而不是建议。
+///
+/// 两个头都没有（本机直连、单元测试）就归到同一个桶：那时候这条限流退化
+/// 成「整体每分钟 N 次」，仍然是一道闸，只是不再分得清是谁。
+///
+/// **这不是身份。** `X-Forwarded-For` 是请求方写得出来的东西——反代会把它
+/// 覆盖掉，没有反代的时候谁都能伪造。它只是一个够用的分桶依据：能换的人
+/// 自然换得动，但那时 `MAX_RATE_KEYS` 那条上限接着拦。
+fn client_key(headers: &HeaderMap) -> String {
+    for name in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(raw) = header(headers, name) {
+            let first = raw.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    "direct".to_string()
+}
+
+/// 老师推一帧。带的是 push secret（`x-live-push`），不是学生那把
+/// viewer token——推帧是写，看帧是读，两件事不共用凭据（见
+/// `live.rs` 顶上「两把钥匙，不是一把」那段）。live-id 和 lane 也在头里，
+/// 不在 URL 上：一条 `PATH_FRAME` 服务所有直播，省得 URL 上再带一遍 id、
+/// 多一处会对不上的地方。
+async fn live_push_route(
+    State(live): State<Arc<Live>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, Rejected> {
+    let id = header(&headers, "x-live-id").ok_or(LinkError::Unauthorized)?;
+    let lane: usize = header(&headers, "x-live-lane")
+        .and_then(|v| v.parse().ok())
+        .ok_or(LinkError::Unauthorized)?;
+    let secret = header(&headers, "x-live-push").ok_or(LinkError::Unauthorized)?;
+    // 空 body（保活）也是合法的推帧，`Live::push` 自己认得出来，这里不用
+    // 再另外判断一次。
+    live.push(id, secret, lane, body.to_vec())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 学生拉一帧。`If-None-Match` 命中回一个空的 304；`?wait=1` 时挂到换帧或
+/// 超时——超时也回 304，不是错误，学生页会立刻再挂一次。
+async fn live_frame_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, Rejected> {
+    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+    let query = parse_query(&uri);
+    let lane: usize = query.get("lane").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let wait = query.contains_key("wait");
+    let seen: Option<u64> = header(&headers, "if-none-match")
+        .and_then(|v| v.trim_matches('"').parse().ok());
+
+    let (mut body, mut etag) = live.frame(&id, token, lane)?;
+    if wait && seen == Some(etag) {
+        if let Some(mut rx) = live.subscribe(&id, lane) {
+            let _ = tokio::time::timeout(dct_link::live::WAIT_TIMEOUT, rx.changed()).await;
+        }
+        (body, etag) = live.frame(&id, token, lane)?;
+    }
+    if seen == Some(etag) {
+        return Ok(StatusCode::NOT_MODIFIED.into_response());
+    }
+    Ok((
+        [
+            (axum::http::header::ETAG, format!("\"{etag}\"")),
+            (axum::http::header::CONTENT_ENCODING, "gzip".to_string()),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// `GET /live/{id}/lanes` 的答复：老师起的名字，不是会话标题或项目路径——
+/// 那两样一个字都不许上公网（整份 spec 的前提之一）。`viewers` 搭这班车
+/// 一起回，是因为学生页开场只该拉一次这条路径，之后人数跟着帧的节奏走，
+/// 不该为了一个数字单独起一条轮询。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LiveLanesResponse {
+    lanes: Vec<String>,
+    viewers: u32,
+}
+
+/// 学生页开场问一次「这场直播上架了哪几路，叫什么名字」。
+///
+/// 鉴权跟取帧同一条路（`x-live-token`），也跟取帧一样**认不出来和这场
+/// 直播根本不存在回同一个 401**——`Live::lanes` 内部走的是跟 `Live::frame`
+/// 同一个 `authed()`，理由写在 `live.rs` 那段注释里：分开回的话，拿一把
+/// 猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠错误码反推出哪个 id
+/// 现在正播着，把这条路径当探测器用。
+async fn live_lanes_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<LiveLanesResponse>, Rejected> {
+    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+    let lanes = live.lanes(&id, token)?;
+    let viewers = live.viewers(&id);
+    Ok(Json(LiveLanesResponse { lanes, viewers }))
+}
+
+/// 老师停播：整场直播连同两把钥匙一起立刻蒸发。跟推帧同一把 `x-live-push`
+/// 校验——live-id 对每个学生都是已知的，停播要是只认 id，随便一个学生打开
+/// devtools 发一个 `DELETE` 就能掐断全班的课，比伪造画面还省事。
+async fn live_stop_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Rejected> {
+    let secret = header(&headers, "x-live-push").ok_or(LinkError::Unauthorized)?;
+    live.stop(&id, secret)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 手机网页本体。
 ///
-/// **跟守护进程在局域网上发的是同一份字节**（`dct_page::PAGE`），不是抄过来
+/// **跟守护进程在局域网上发的是同一份字节**（`dct_page::page()`），不是抄过来
 /// 的一份。两份各自演化的网页，最贵的地方在于其中一份的 bug 只在另一种模式
 /// 下才复现，而那时候没人会想到去对比两个文件。
 ///
@@ -283,7 +487,14 @@ impl From<LinkError> for Rejected {
 /// 是下一步的事。现在就把路由接上，是因为"两边发同一份"这条性质要从它有
 /// 第二个服务端的第一天起就成立——补挂上去的那天，多半已经有人拷过一份了。
 async fn page_route() -> axum::response::Html<&'static str> {
-    axum::response::Html(dct_page::PAGE)
+    axum::response::Html(dct_page::page())
+}
+
+/// 直播观众页。**只读，只有中转发**——它没有局域网那一档（学生从来不在
+/// 老师家的局域网里）。跟 `page_route` 同一个理由挂在这儿：`dct-page` 是
+/// 两边唯一的真相来源，这里只是把已经打包好的字节交给 axum。
+async fn live_page_route() -> axum::response::Html<&'static str> {
+    axum::response::Html(dct_page::live_page())
 }
 
 async fn poll_route(
@@ -310,24 +521,45 @@ async fn ask_route(
     Ok(Json(relay.ask(&req).await?))
 }
 
-pub fn router(relay: Arc<Relay>) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(page_route))
         .route(PATH_POLL, post(poll_route))
         .route(PATH_SEND, post(send_route))
         .route(PATH_ASK, post(ask_route))
+        .route(dct_link::live::PATH_START, post(live_start_route))
+        .route(dct_link::live::PATH_FRAME, post(live_push_route))
+        .route("/live/{id}/frame", get(live_frame_route))
+        .route("/live/{id}/lanes", get(live_lanes_route))
+        .route(
+            "/live/{id}",
+            get(live_page_route).delete(live_stop_route),
+        )
         // base64 放大 1.33 倍，再给信封的其余字段留点空。比这还大的东西在
         // 读进内存之前就该被挡掉——`send` 里那条 `TooBig` 管的是这条线以下、
         // `MAX_PAYLOAD` 以上的部分，那部分才值得回一个说得清的错误码。
+        // `MAX_FRAME_BYTES`（256KB）比这个上限小得多，直播那三条路由借用
+        // 同一层就够。
         .layer(DefaultBodyLimit::max(MAX_PAYLOAD * 2 + 4096))
-        .with_state(relay)
+        .with_state(state)
 }
 
 pub async fn serve(
     listener: tokio::net::TcpListener,
     relay: Arc<Relay>,
+    live: Arc<Live>,
 ) -> Result<(), std::io::Error> {
-    axum::serve(listener, router(relay)).await
+    // TTL 清扫：老师断线（拔网线、合上笔记本）之后，直播连同两把钥匙要在
+    // 一分钟内自己收掉，不然就是永远播着。见 `live.rs` 里 `sweep` 的注释。
+    let sweeping = live.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            sweeping.sweep(Instant::now());
+        }
+    });
+    axum::serve(listener, router(AppState { relay, live })).await
 }
 
 /// 第一期只许在环回地址上跑。
@@ -366,6 +598,128 @@ mod tests {
 
     fn id(s: &str) -> EndpointId {
         EndpointId::new(s).unwrap()
+    }
+
+    /// 只测配对信封那半路由时，直播那半随便配一个就够——这些既有测试不碰
+    /// `Live`，用不着关心它。
+    fn app(relay: Arc<Relay>) -> Router {
+        router(AppState {
+            relay,
+            live: Arc::new(Live::new()),
+        })
+    }
+
+    /// 直播路由测试的底子：一份挂着直播路由的 `Router`，和它背后那个还没
+    /// 开播的 `Live`——每条测试自己 `start`，各测各的 viewer/push token。
+    fn app_with_live() -> (Router, Arc<Live>) {
+        let live = Arc::new(Live::new());
+        let app = router(AppState {
+            relay: Arc::new(Relay::new(cfg(200))),
+            live: live.clone(),
+        });
+        (app, live)
+    }
+
+    /// 走 `POST /live/start` 开一场，带上一个来源标识（反代会设的那个头）。
+    /// 回状态码。
+    async fn post_start(app: &Router, id: &str, from: &str) -> u16 {
+        let body = format!(
+            r#"{{"id":"{id}","viewer_token":"{}","push_secret":"{}","lanes":["一路"]}}"#,
+            "t".repeat(64),
+            push_secret()
+        );
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(dct_link::live::PATH_START)
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", from)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// **建房这条路对公网开着，所以它自己得带一道节流闸。** 同一个来源
+    /// 连着建房，超过窗口上限要回 429——不是 401（那是「你没资格」），
+    /// 是「等一下再来」。
+    #[tokio::test]
+    async fn opening_rooms_too_fast_from_one_source_is_throttled() {
+        let (app, _live) = app_with_live();
+        for i in 0..dct_link::live::MAX_STARTS_PER_WINDOW {
+            assert_eq!(
+                post_start(&app, &format!("room{i}"), "1.2.3.4").await,
+                204,
+                "窗口之内该放行"
+            );
+        }
+        assert_eq!(
+            post_start(&app, "one-too-many", "1.2.3.4").await,
+            429,
+            "同一个来源建房没有节流"
+        );
+        // 换一个来源不受连累。
+        assert_eq!(post_start(&app, "someone-else", "5.6.7.8").await, 204);
+    }
+
+    /// 本文件里所有直播测试统一用的 push secret——固定值，因为推帧测试
+    /// 只关心「带对了 push secret 能不能推上去」，不关心它具体是什么。
+    fn push_secret() -> String {
+        "p".repeat(64)
+    }
+
+    struct FrameResp {
+        status: u16,
+        etag: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn get_frame(app: &Router, id: &str, token: &str, if_none_match: Option<&str>) -> FrameResp {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("/live/{id}/frame"))
+            .header("x-live-token", token);
+        if let Some(tag) = if_none_match {
+            req = req.header("if-none-match", format!("\"{tag}\""));
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let etag = res
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_matches('"').to_string());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        FrameResp { status, etag, body }
+    }
+
+    async fn push_frame(app: &Router, id: &str, lane: usize, body: Vec<u8>) -> u16 {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(dct_link::live::PATH_FRAME)
+                    .header("x-live-id", id)
+                    .header("x-live-lane", lane.to_string())
+                    .header("x-live-push", push_secret())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        res.status().as_u16()
     }
 
     /// 等一个条件成立，**必须带死线**。
@@ -696,7 +1050,7 @@ mod tests {
     fn the_page_speaks_the_same_envelope_version_this_relay_does() {
         let want = format!("var LINK_VERSION = {LINK_VERSION};");
         assert!(
-            dct_page::PAGE.contains(&want),
+            dct_page::page().contains(&want),
             "网页里找不到 `{want}`——信封版本改了，那一页没跟上"
         );
     }
@@ -708,7 +1062,7 @@ mod tests {
     #[tokio::test]
     async fn the_relay_serves_the_very_same_page_the_daemon_does() {
         let relay = Arc::new(Relay::new(cfg(50)));
-        let res = router(relay)
+        let res = app(relay)
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -724,7 +1078,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             body.as_ref(),
-            dct_page::PAGE.as_bytes(),
+            dct_page::page().as_bytes(),
             "中转发的网页跟守护进程发的不是同一份了"
         );
     }
@@ -735,7 +1089,7 @@ mod tests {
 
         // 空手而归的轮询：200 + envelope 为 null，不是错误。
         let (status, body) = post(
-            router(relay.clone()),
+            app(relay.clone()),
             PATH_POLL,
             &serde_json::to_string(&auth("b")).unwrap(),
         )
@@ -745,7 +1099,7 @@ mod tests {
 
         // 投给刚刚来过的 b：204，没有 body。
         let (status, body) = post(
-            router(relay.clone()),
+            app(relay.clone()),
             PATH_SEND,
             &serde_json::to_string(&letter("a", "b", b"hi")).unwrap(),
         )
@@ -755,7 +1109,7 @@ mod tests {
 
         // 投给谁都不是的人：坏消息要带着码回来，光有状态码不够。
         let (status, body) = post(
-            router(relay),
+            app(relay),
             PATH_SEND,
             &serde_json::to_string(&letter("a", "nobody", b"hi")).unwrap(),
         )
@@ -771,12 +1125,216 @@ mod tests {
         assert_eq!(relay.poll(&auth("mute")).await.unwrap(), None);
 
         let (status, body) = post(
-            router(relay),
+            app(relay),
             PATH_ASK,
             &serde_json::to_string(&question("phone:1", "mute", 1)).unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(body, r#"{"error":"NoAnswer"}"#);
+    }
+
+    // ——— 直播路由 ———
+
+    /// 学生带着上一帧的 etag 再来，没换帧就该拿到一个空的 304——老师手停
+    /// 着不动的那几十秒里，两百个学生一个字节都不该传。
+    #[tokio::test]
+    async fn an_unchanged_frame_comes_back_as_an_empty_304() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        live.push("abc", &push_secret(), 0, b"hello".to_vec())
+            .unwrap();
+
+        let first = get_frame(&app, "abc", &"t".repeat(64), None).await;
+        assert_eq!(first.status, 200);
+        let etag = first.etag.clone().expect("第一帧该带 ETag");
+
+        let again = get_frame(&app, "abc", &"t".repeat(64), Some(&etag)).await;
+        assert_eq!(again.status, 304);
+        assert!(again.body.is_empty(), "304 不该带 body");
+    }
+
+    /// 学生页拿到的名字必须是老师起的那几个——**不是数字，不是会话标题**。
+    /// 这条直接对着 `POST /live/start` 传进去的 `lanes` 核对，钉的是
+    /// "路由没有偷偷换一套名字出来"这件事。
+    #[tokio::test]
+    async fn the_lanes_route_returns_the_names_given_at_start() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端调试".into(), "后端接口".into()],
+        )
+        .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/live/abc/lanes")
+                    .header("x-live-token", "t".repeat(64))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: LiveLanesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.lanes, vec!["前端调试", "后端接口"]);
+    }
+
+    /// 跟取帧同一条规矩：令牌不对，连「这场直播存不存在」都不告诉他。
+    #[tokio::test]
+    async fn a_wrong_token_cannot_list_the_lanes() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/live/abc/lanes")
+                    .header("x-live-token", "x".repeat(64))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 认证在路由之前：错 token 连「这场直播存不存在」都不告诉他。
+    #[tokio::test]
+    async fn a_wrong_token_learns_nothing_about_the_live() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        let real = get_frame(&app, "abc", &"w".repeat(64), None).await;
+        let fake = get_frame(&app, "zzz", &"w".repeat(64), None).await;
+        assert_eq!(real.status, 401);
+        assert_eq!(fake.status, 401);
+    }
+
+    #[tokio::test]
+    async fn a_frame_over_the_cap_is_refused_with_413() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        let body = vec![b'x'; dct_link::live::MAX_FRAME_BYTES + 1];
+        assert_eq!(push_frame(&app, "abc", 0, body).await, 413);
+    }
+
+    /// 学生那把钥匙推不动帧：`x-live-push` 缺失或者错都得当场 401，
+    /// 不能靠 `x-live-token` 蒙混过去——推帧是写，看帧是读。
+    #[tokio::test]
+    async fn a_viewer_cannot_push_by_reusing_their_read_token() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(dct_link::live::PATH_FRAME)
+                    .header("x-live-id", "abc")
+                    .header("x-live-lane", "0")
+                    .header("x-live-push", "t".repeat(64)) // 学生的 token，不是 push secret
+                    .body(Body::from("假画面".as_bytes().to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 学生那把钥匙也停不掉直播：拿 viewer token 当 push secret 去
+    /// `DELETE` 必须 401，而且直播还活着——之后还能正常取到帧。live-id
+    /// 对每个学生都是已知的，停播若只认 id，随便一个学生打开 devtools
+    /// 发一个 `DELETE` 就能掐断全班的课，比伪造画面还省事。
+    #[tokio::test]
+    async fn a_viewer_token_cannot_stop_the_live_over_http() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        live.push("abc", &push_secret(), 0, b"hello".to_vec())
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/live/abc")
+                    .header("x-live-push", "t".repeat(64)) // 学生的 token，不是 push secret
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 直播还活着：正常取帧不受影响。
+        let still_there = get_frame(&app, "abc", &"t".repeat(64), None).await;
+        assert_eq!(still_there.status, 200, "假 secret 停播不该成功");
+    }
+
+    /// 中转仍然不看帧里面是什么——这是 spec 决定一在直播上的那条线。
+    ///
+    /// 用 `concat!` 把每个禁词拆成两半再拼，是因为这条测试本身也会被
+    /// `include_str!("lib.rs")` 读进来：要是禁词整个原样写在这个文件里，
+    /// 它就会命中自己这一行，红得毫无意义。
+    #[test]
+    fn the_relay_never_looks_inside_a_frame_either() {
+        let src = concat!(include_str!("live.rs"), include_str!("lib.rs"));
+        let banned = [
+            concat!("Screen", "Span"),
+            concat!("from_slice::<", "Request>"),
+            concat!("dct", "::proto"),
+        ];
+        for name in banned {
+            assert!(
+                !src.contains(name),
+                "{name} 出现在中转里——它开始认识 dct 的协议了"
+            );
+        }
     }
 }

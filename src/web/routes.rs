@@ -26,7 +26,9 @@ use super::{Handler, Req, Resp};
 ///
 /// **文件本身在 `crates/dct-page`**，因为中转也要发同一份。理由见那个 crate
 /// 的模块注释。
-const PAGE: &str = dct_page::PAGE;
+fn page() -> &'static str {
+    dct_page::page()
+}
 
 /// 「把这个 `Request` 交给守护进程，给我 `Response`」。
 ///
@@ -79,7 +81,7 @@ impl Handler for Routes {
             // 网页本体。`/` 之外不给别的入口——一个静态文件服务器会长出
             // 路径穿越那一类问题，而这里总共只有一个文件。
             "/" => match req.method {
-                "GET" => Resp::html(PAGE),
+                "GET" => Resp::html(page()),
                 _ => Resp::status(405),
             },
             // 网页上的每一句话都从这儿来，网页里一个字都不写死。
@@ -248,7 +250,7 @@ mod tests {
             "dct-theme",
         ] {
             assert!(
-                PAGE.contains(needle),
+                page().contains(needle),
                 "网页里少了 {needle}——配色这套东西缺一块就只剩一半能用"
             );
         }
@@ -260,7 +262,7 @@ mod tests {
     /// 白底上一整屏正文直接消失——这不是配色难看，是页面没内容。
     #[test]
     fn the_light_palette_never_paints_body_text_white() {
-        let light = PAGE
+        let light = page()
             .split("light: [")
             .nth(1)
             .expect("浅色调色板不见了")
@@ -479,7 +481,7 @@ mod tests {
             out.push_str(rest);
             out
         }
-        let code = strip(PAGE, "<!--", "-->");
+        let code = strip(page(), "<!--", "-->");
         let code = strip(&code, "/*", "*/");
         // 行尾注释也要剥，不只是整行注释——`var x = 1;  // 说明` 里的中文
         // 同样不会显示给用户。`://` 不算（`http://…` 这种），那是 URL 的一部分。
@@ -935,7 +937,7 @@ mod tests {
     /// 另一处，这个缺陷就原样回来了，而且症状很难联想到字体。
     #[test]
     fn the_ruler_measures_in_the_same_font_the_screen_paints_in() {
-        let code = PAGE;
+        let code = page();
         assert!(
             code.contains("--mono:"),
             "等宽字体没有单独一处定义——尺子和画面迟早各用各的"

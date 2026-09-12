@@ -152,6 +152,11 @@ pub struct App {
     /// 那个变体里的局域网状态会被这条刷新路径无声地冲掉。放在 `App` 上
     /// 就不受它影响，跟 `phone_buf` 是同一条理由的另一面。
     pub web: crate::proto::WebInfo,
+    /// 直播眼下的状态：`id` 空串 = 没在播。**放在 `App`，不放 `View::Live`**，
+    /// 理由跟上面 `web` 一模一样——顶栏那行常驻提示要在**任何**视图下都能读到
+    /// 这份状态（老师切去附着视图、切去看板都不能让它凭空消失），塞进
+    /// `View::Live` 只有停在那一屏时才读得到。
+    pub live: crate::proto::LiveInfo,
     pub phone_buf: Option<String>,
     /// 手机令牌验证的结果通道。跟 `verify_rx` 一样：`Request::PhoneSetToken`
     /// 会打真的 Telegram 网络，不能堵在按键循环里，丢给后台线程，主循环
@@ -261,6 +266,14 @@ impl App {
                 on: false,
                 url: None,
                 address_unknown: false,
+            },
+            live: crate::proto::LiveInfo {
+                id: String::new(),
+                token: String::new(),
+                url: String::new(),
+                staged: Vec::new(),
+                viewers: 0,
+                readiness: crate::proto::LiveReadiness::Pending,
             },
             phone_buf: None,
             phone_verify_rx: None,
