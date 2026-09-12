@@ -194,9 +194,13 @@ fn serve_a_live_for_a_manual_look() {
 
     println!("MANUAL_NOTE 这条链接是这次验收专用的一次性链接——带着学生令牌，\
               中转和守护进程一起退出（这个测试进程一结束）就永久失效");
-    println!("MANUAL_CHECK 1 用两个浏览器标签页分别打开上面这条 MANUAL_URL");
-    println!("MANUAL_CHECK 2 画面是不是跟着老师那边（这个终端窗口打出来的字）动");
-    println!("MANUAL_CHECK 3 学生页上有没有任何能打字的地方——应该一个都没有");
+    // 这一行是操作指令（该做什么），不是验收项（该看到什么）——不占
+    // MANUAL_CHECK 的编号，免得 `grep MANUAL_CHECK` 出来的清单里混进一条
+    // 没有"对/错"可言的步骤。
+    println!("MANUAL_NOTE 用两个浏览器标签页分别打开上面这条 MANUAL_URL，再往下看四条验收项");
+    println!("MANUAL_CHECK 1 画面是不是跟着老师那边（这个终端窗口打出来的字）动");
+    println!("MANUAL_CHECK 2 学生页上有没有任何能打字的地方——应该一个都没有");
+    println!("MANUAL_CHECK 3 老师这边停播之后，学生页是不是显示「这场直播结束了」（5 分钟后这份脚手架会自动停播，见下面）");
     println!("MANUAL_CHECK 4 两个标签页都开着的时候，页面顶栏是不是显示「2 人在看」");
     println!("MANUAL_NOTE 接下来 5 分钟，这个测试会每隔 3 秒往会话里敲一行新内容");
 
@@ -213,8 +217,8 @@ fn serve_a_live_for_a_manual_look() {
         });
     }
 
-    println!("MANUAL_NOTE 5 分钟到，现在模拟老师停播——去学生页确认它显示\
-              「这场直播结束了」");
+    println!("MANUAL_CHECK 3 5 分钟到，现在模拟老师停播——去学生页确认它显示\
+              「这场直播结束了」（对应上面的验收项 3）");
     let _ = c.call(Request::LiveStop);
 
     // 给人 2 分钟去确认"已结束"这条界面文案，再收尾。
