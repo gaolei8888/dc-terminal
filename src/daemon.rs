@@ -1032,9 +1032,15 @@ fn handle(
         // `anyhow::Result<Response>`：`live_start` 本身不会失败到需要
         // `anyhow::Error` 的地步——校验不过直接答 `Response::Error`。
         Request::LiveStart { ids, names } => Ok(live_start(mgr, live, ids, names)),
+        // **答 `Response::Live`，不是 `Response::Ok`。** 界面那一侧
+        // （`ui::live::stop_live`）只认 `Response::Live(info)`——它要拿这份
+        // 空状态把 `App::live` 清掉，那行压过一切的「● 正在直播」才会消失。
+        // 答 `Ok` 的话它落进 `_ =>` 分支：直播真的停了，屏幕却弹「请求失败」
+        // 并且继续常驻「正在直播」——屏幕说在播而其实没播，正是 spec 点名
+        // 的最危险失败模式的镜像，下一次就没人信那行字了。
         Request::LiveStop => {
             live.stop();
-            Ok(Response::Ok)
+            Ok(Response::Live(live.info()))
         }
         Request::LiveStatus => Ok(Response::Live(live.info())),
     };
@@ -2827,6 +2833,40 @@ mod tests {
                 assert!(msg.contains("999"), "错误消息该点名是哪个 id：{msg}");
             }
             other => panic!("期待 Response::Error(BadRequest)，得到 {other:?}"),
+        }
+    }
+
+    /// **停播必须答 `Response::Live` 的空状态，不能答 `Response::Ok`。**
+    /// 界面只认 `Response::Live(info)`（`ui::live::stop_live`），拿它把
+    /// `App::live` 清掉；答 `Ok` 的话直播真停了，屏幕却弹「请求失败」而且
+    /// 继续常驻「● 正在直播」——屏幕说在播而其实没播。
+    #[test]
+    fn stopping_the_broadcast_answers_with_the_empty_live_state() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+        live.start(vec![(1, "前端".into())]);
+
+        let resp = handle(
+            Request::LiveStop,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        match resp {
+            Response::Live(info) => {
+                assert!(info.id.is_empty(), "停播之后不该还留着一个房间 id：{info:?}");
+                assert!(info.url.is_empty(), "停播之后不该还留着链接");
+                assert!(info.staged.is_empty(), "停播之后不该还留着上架名单");
+            }
+            other => panic!("停播该答 Response::Live 的空状态，得到 {other:?}"),
         }
     }
 }

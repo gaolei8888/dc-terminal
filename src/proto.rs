@@ -660,6 +660,12 @@ pub enum Response {
     /// 对 [`Request::PairPoll`] 的回答。
     PairTick(PairTick),
     /// `LiveStart` / `LiveStop` / `LiveStatus` 三条的共同回答。
+    ///
+    /// **停播也答这个，不答 `Response::Ok`**——答的是「停完之后的状态」，
+    /// 也就是 `LiveState::info()` 那份空形状。界面只认 `Response::Live`，
+    /// 拿它把 `App::live` 清掉；答 `Ok` 就会落进界面的 `_ =>` 分支，直播
+    /// 真停了而屏幕继续常驻「正在直播」。见 `daemon.rs` 里 `LiveStop` 那
+    /// 一支上的注释。
     Live(LiveInfo),
 }
 
