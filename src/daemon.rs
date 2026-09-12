@@ -1107,6 +1107,24 @@ fn validated_staging(
             "{what}：ids 和 names 的条数对不上"
         ))));
     }
+    // **路数的两条边界必须在这里就拦住，不能留给中转。** 中转对空 lanes
+    // 和超过 `MAX_LANES` 都回 413，而守护进程这边已经把本地状态设成「在
+    // 播」了：推帧线程于是每 `PUSH_INTERVAL` 重试一次、永远被 413 拒、
+    // `readiness` 永远停在 `Failed`，老师屏幕上挂着一场根本开不起来的直播
+    // ——一个不会自己好转的死循环。取消最后一路（`ids` 空）就是最容易走
+    // 到的那条路。
+    if ids.is_empty() {
+        return Err(Response::Error(ErrorCode::BadRequest(format!(
+            "{what}：一路都没上架，没有可播的内容"
+        ))));
+    }
+    if ids.len() > dct_link::live::MAX_LANES {
+        return Err(Response::Error(ErrorCode::BadRequest(format!(
+            "{what}：最多只能上架 {} 路，这次是 {} 路",
+            dct_link::live::MAX_LANES,
+            ids.len()
+        ))));
+    }
     let known: std::collections::HashSet<u32> = mgr.list().into_iter().map(|s| s.id).collect();
     let missing: Vec<u32> = ids
         .iter()
@@ -2877,18 +2895,98 @@ mod tests {
         }
     }
 
+    /// 造一个能上架的真会话——`live_start`/`live_restage` 都要先在
+    /// `mgr.list()` 里认出这个 id 才肯往下走。跑的是 `cat`，不等任何输出。
+    /// 临时目录得跟着返回，不然会话的工作目录当场失效。
+    fn one_staged_session(mgr: &Arc<SessionManager>) -> (u32, tempfile::TempDir) {
+        mgr.register_profile(plain_shell());
+        let dir = tempfile::tempdir().unwrap();
+        let id = mgr
+            .create(dir.path(), "daemon-wire-fake", None, &[])
+            .unwrap();
+        (id, dir)
+    }
+
+    /// **取消最后一路不能变成一场 0 路的直播。** 中转对空 lanes 回 413，
+    /// 而本地状态已经是「在播」了：推帧线程每 500ms 重试、永远被拒、
+    /// `readiness` 永远 `Failed`——一个不会自己好转的死循环。
+    #[test]
+    fn staging_nothing_at_all_is_refused_before_it_becomes_a_zero_lane_broadcast() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![],
+                names: vec![],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
+            "期待 BadRequest，得到 {resp:?}"
+        );
+        assert!(live.info().id.is_empty(), "0 路的直播根本不该开起来");
+    }
+
+    /// 超过 `MAX_LANES` 同理：中转回 413，本地却以为在播。**校验要在守护
+    /// 进程这一侧先做**，别把一个必然失败的请求交给推帧线程去无限重试。
+    #[test]
+    fn staging_more_lanes_than_the_relay_accepts_is_refused_locally() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let live = test_live();
+        let n = dct_link::live::MAX_LANES + 1;
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: (0..n as u32).collect(),
+                names: (0..n).map(|i| format!("第 {i} 路")).collect(),
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        match resp {
+            Response::Error(ErrorCode::BadRequest(m)) => assert!(
+                m.contains(&dct_link::live::MAX_LANES.to_string()),
+                "错误消息该说清楚上限是几路：{m}"
+            ),
+            other => panic!("期待 BadRequest，得到 {other:?}"),
+        }
+        assert!(live.info().id.is_empty(), "超上限的直播根本不该开起来");
+    }
+
     /// `LiveRestage` 换 lanes 但**链接一个字都不变**——这正是它跟
     /// `LiveStart` 唯一的区别，也是它存在的全部理由。
     #[test]
     fn restaging_through_the_daemon_keeps_the_same_link() {
         let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
         let live = test_live();
-        let first = live.start(vec![]);
+        let first = live.start(vec![(id, "后端".into())]);
 
         let resp = handle(
             Request::LiveRestage {
-                ids: vec![],
-                names: vec![],
+                ids: vec![id],
+                names: vec!["改了名字的后端".into()],
             },
             &mgr,
             &store,
@@ -2906,6 +3004,11 @@ mod tests {
             Response::Live(info) => {
                 assert_eq!(info.id, first.id, "改上架换了 id，全班的链接就作废了");
                 assert_eq!(info.url, first.url, "链接必须一个字都不变");
+                assert_eq!(
+                    info.staged,
+                    vec![(id, "改了名字的后端".to_string())],
+                    "新的上架名单没生效"
+                );
             }
             other => panic!("期待 Response::Live，得到 {other:?}"),
         }
@@ -2916,12 +3019,13 @@ mod tests {
     #[test]
     fn restaging_while_nothing_is_live_is_refused_not_silently_started() {
         let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
         let live = test_live();
 
         let resp = handle(
             Request::LiveRestage {
-                ids: vec![],
-                names: vec![],
+                ids: vec![id],
+                names: vec!["前端".into()],
             },
             &mgr,
             &store,
