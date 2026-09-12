@@ -646,6 +646,40 @@ piece of work, designed but not built: see
 - Anyone on that network who has the token can type into your sessions. It is off
   by default and one keypress from off again.
 
+## Live to a room
+
+Press `L` in a session for the live panel: stage a few sessions, get a link and a
+QR code, hand it out. Students open it in a browser and **can only watch**.
+
+"Only watch" is not a check somewhere in the code — the pipe runs one way. The
+daemon pushes the staged screens to a relay twice a second and students read from
+the relay. **Their side has GET and nothing else; no route carries a byte back to
+your terminal.**
+
+- **50–200 watching at once.** Your machine's load does not depend on how many —
+  one student and two hundred get the same frame. Bandwidth is held down by three
+  things: unchanged screens aren't pushed, frames are gzipped, and a request hangs
+  waiting for a change (near-zero traffic while you think, everyone lights up the
+  moment the screen moves).
+- **Text goes over the wire, not pictures.** A screen is 3–5 KB gzipped, and
+  students get real text rendering — their own font size, their own dark mode.
+- **Two keys**: the students' one only reads, yours only writes, and yours
+  **never travels over the protocol**. Knowing the link doesn't let anyone push a
+  fake screen or stop your broadcast.
+- **Only the staged sessions leave the building**, under names you chose — session
+  titles and project paths never go out. Switching to another session doesn't
+  broadcast it.
+- **The screen keeps saying you are live**: `● live · 2 lanes · 7 watching`, not
+  dismissible, and it outranks every other bar message. The dangerous failure was
+  never a leaked link — it's forgetting you are broadcasting.
+- Changing what's staged keeps the link; `r` is what mints a new one and kills the
+  old immediately. After you stop, the student page says the session has ended.
+- The QR code on the panel encodes the **full link, token and all** — students
+  have to scan it. So don't project the live panel itself.
+- Before putting the relay on the public internet, read
+  [`docs/deploy-live-relay.md`](docs/deploy-live-relay.md): the reverse proxy must
+  allow **`/live/*` and nothing else**.
+
 ## Colours
 
 `F6` inside a session, or the settings page, opens the same list of fourteen
