@@ -152,14 +152,49 @@ Node 运行时 95 MB，`claude` 那个 npm 包自己 416 MB，Windows 上没有 
 先设一个环境变量。**学生那条安装命令一个字都不用改**，校验和照样会验。
 
 ```sh
-export DCT_RELEASE_BASE=https://你的地址/dct
+export DCT_RELEASE_BASE=https://你的地址
 curl -fsSL https://你的地址/install.sh | sh
 ```
 
 ```
-$env:DCT_RELEASE_BASE = 'https://你的地址/dct'
+$env:DCT_RELEASE_BASE = 'https://你的地址'
 irm https://你的地址/install.ps1 | iex
 ```
+
+**建这个镜像用 `scripts/mirror-sync.sh`**，别手抄：
+
+```sh
+./scripts/mirror-sync.sh --out ./mirror     # 拉 latest，验一遍，摆好
+./scripts/mirror-sync.sh --tag v0.2.14      # 要某个具体版本
+```
+
+它把四个平台包、`SHA256SUMS`、外加 `install.sh` / `install.ps1` 放进同一个目录。
+`install.sh` 自己也必须在镜像里——学生连 `raw.githubusercontent.com` 都连不上，
+不然第一条命令就卡在那儿了。
+
+校验和在镜像端**也验一遍**，对不上就拒绝上线。学生那端当然也验，但那道检查发生在
+几十台机器上、在课堂中间、在你没法调试的时候；镜像端多验这一遍，是把同一个错误提前
+到一台机器、一个人、一个能重跑的时刻。
+
+发新版就把同一条命令再跑一遍、把目录再传一次。**产物名字里不带版本号**是 release.yml
+特意的设计，所以「发新版」在镜像端等于「覆盖同名文件」，学生那条命令永远不变。
+
+<br>
+
+**放哪儿？** 任何一个能 HTTP GET 到的静态目录都行——对象存储、学校自己的 nginx、
+甚至一个 Gitee 仓库。`install.sh` 对下载源没有任何 GitHub 特有的假设，它拼的就是
+`$base/<文件名>` 和 `$base/SHA256SUMS`，两个 `curl`。
+
+用 Gitee 的话，**走 raw 路径，不要走「发行版」**：
+
+```sh
+export DCT_RELEASE_BASE=https://gitee.com/<你>/<仓库>/raw/main/dist
+curl -fsSL https://gitee.com/<你>/<仓库>/raw/main/dist/install.sh | sh
+```
+
+Gitee 的发行版附件地址绑定具体 tag，**没有 `latest` 的等价物**（`/releases/latest/download/<名字>`
+在 Gitee 上返回的是通用 API 的 JSON 404，根本没这条路由），而整套设计的立足点正是
+「固定名字 + latest」。raw 路径没这个问题：它就是一个普通的静态目录。
 
 Windows 上那份便携 git 也一样，用 `DCT_MINGIT_URL` 换地址。
 

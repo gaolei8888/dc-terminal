@@ -175,13 +175,53 @@ stays exactly the same**, and checksums are still verified.
 
 ```sh
 export DCT_RELEASE_BASE=https://your.host/dct
-curl -fsSL https://your.host/install.sh | sh
+curl -fsSL https://your.host/dct/install.sh | sh
 ```
 
 ```
 $env:DCT_RELEASE_BASE = 'https://your.host/dct'
-irm https://your.host/install.ps1 | iex
+irm https://your.host/dct/install.ps1 | iex
 ```
+
+**Build that mirror with `scripts/mirror-sync.sh`** rather than by hand:
+
+```sh
+./scripts/mirror-sync.sh --out ./mirror     # fetch latest, verify, lay it out
+./scripts/mirror-sync.sh --tag v0.2.14      # or a specific version
+```
+
+It puts the four platform archives, `SHA256SUMS`, and `install.sh` /
+`install.ps1` in one directory. The installer scripts have to live in the mirror
+too — a student who can't reach GitHub can't reach `raw.githubusercontent.com`
+either, and would be stuck on the very first command.
+
+Checksums are verified **on the mirror side as well**, and a mismatch refuses to
+publish. Students verify too, but that check happens on forty machines, mid-class,
+where you can't debug it; verifying here moves the same failure to one machine,
+one person, and a moment where you can just run it again.
+
+To ship a new version, run the same command and re-upload. **Asset names carry no
+version number** — that is deliberate in `release.yml`, so releasing on a mirror
+means overwriting files of the same name, and the student's command never changes.
+
+<br>
+
+**Where to host it?** Any static directory reachable over HTTP: object storage,
+the school's own nginx, even a Gitee repo. `install.sh` makes no GitHub-specific
+assumption about its source — it builds `$base/<name>` and `$base/SHA256SUMS`
+and runs two `curl`s.
+
+On Gitee, **use a raw path, not Releases**:
+
+```sh
+export DCT_RELEASE_BASE=https://gitee.com/<you>/<repo>/raw/main/dist
+curl -fsSL https://gitee.com/<you>/<repo>/raw/main/dist/install.sh | sh
+```
+
+Gitee's release attachments are addressed per tag and have **no `latest`
+equivalent** (`/releases/latest/download/<name>` there returns a generic JSON 404
+— the route simply doesn't exist), and fixed-name-plus-latest is the whole basis
+of this design. A raw path has no such problem: it is an ordinary static directory.
 
 The portable git on Windows works the same way, through `DCT_MINGIT_URL`.
 

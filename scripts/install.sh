@@ -128,7 +128,7 @@ download_release() {
 
 	say "下预编译包：$asset"
 	if ! fetch_to "$base/$asset" "$workdir/$asset" 2>/dev/null; then
-		note "没下到（$base/$asset）"
+		note "没下到（$base/${asset}）"
 		return 1
 	fi
 
@@ -219,7 +219,7 @@ install_binary() {
 	status=0
 	"$dest" --help >/dev/null 2>&1 || status=$?
 	if [ "$status" -ne 0 ]; then
-		printf '%s\n' "install.sh：装是装上了，但 $dest 跑不起来（退出码 $status）。" >&2
+		printf '%s\n' "install.sh：装是装上了，但 $dest 跑不起来（退出码 ${status}）。" >&2
 		if [ "$status" -eq 137 ]; then
 			printf '%s\n' "  137 是被 SIGKILL 了。看一眼 ~/Library/Logs/DiagnosticReports/dct-*.ips，" >&2
 			printf '%s\n' "  如果写着 CODESIGNING，说明覆盖没换成新 inode——把 $dest 删掉再跑一次。" >&2
