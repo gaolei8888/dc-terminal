@@ -154,6 +154,25 @@ impl Handler for Routes {
                 },
                 _ => Resp::status(405),
             },
+            // 滚轮。**跟 `/api/scroll` 是两件事**：这一条是「把这一下滚轮
+            // 原样交给 agent」，那一条是「dct 自己翻它攥着的历史」。桌面端
+            // 的 `attach::wheel_action` 把这两档分得很清——`agent_owns` 为真
+            // （Claude Code、pager 这类自己管视口的）时滚轮该落到 agent 手上，
+            // 由它自己决定滚什么；轮不到 dct 代劳。网页原来只有后一条路，
+            // 于是那种会话上滚轮整个是死的。
+            //
+            // 事件形状直接用 `proto::MouseForward`——这一层不重新定义一份
+            // 平行的鼠标语义，跟 `ScrollBody` 借 `ScrollBy` 是同一条规矩。
+            "/api/mouse" => match req.method {
+                "POST" => match serde_json::from_slice::<MouseBody>(req.body) {
+                    Ok(b) => self.answer(Request::Mouse {
+                        id: b.id,
+                        event: b.event,
+                    }),
+                    Err(_) => Resp::status(400),
+                },
+                _ => Resp::status(405),
+            },
             _ => Resp::status(404),
         }
     }
@@ -167,6 +186,16 @@ impl Handler for Routes {
 struct ScrollBody {
     id: u32,
     by: crate::session::ScrollBy,
+}
+
+/// `POST /api/mouse` 的请求体。
+///
+/// `event` 直接用 `proto::MouseForward`——列/行 0 起算，编码成什么转义序列
+/// 由守护进程那侧按 PTY 当前的鼠标协议决定，网页只说「在哪个格子上做了什么」。
+#[derive(serde::Deserialize)]
+struct MouseBody {
+    id: u32,
+    event: crate::proto::MouseForward,
 }
 
 /// `POST /api/input` 的请求体。
@@ -1028,6 +1057,73 @@ mod tests {
         }
     }
 
+    /// 滚轮转发走 `Request::Mouse`，**不是 `Request::Scroll`**。
+    ///
+    /// 这两条是桌面 `attach::wheel_action` 分得很清的两档：`agent_owns` 为真
+    /// 时滚轮该原样落到 agent 手上（它自己管视口），dct 不代劳。合成一条的
+    /// 症状就是网页原来那个样子——Claude Code 会话上滚轮整个是死的。
+    #[test]
+    fn the_wheel_forwards_a_mouse_event_not_a_scroll() {
+        use crate::proto::MouseForwardKind;
+        let (r, fake) = routes(Response::Ok);
+        let body = r#"{"id":5,"event":{"col":3,"row":7,"kind":"WheelUp","shift":false,"alt":false,"ctrl":false}}"#;
+        assert_eq!(r.handle(&post("/api/mouse", body)).status, 200);
+
+        let seen = fake.seen.lock().unwrap();
+        match seen.as_slice() {
+            [Request::Mouse { id: 5, event }] => {
+                assert_eq!((event.col, event.row), (3, 7));
+                assert!(matches!(event.kind, MouseForwardKind::WheelUp));
+            }
+            other => panic!("预期一条 Mouse，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_mouse_never_reaches_the_daemon() {
+        for body in [
+            r#"{"id":1}"#,
+            r#"{"id":1,"event":{"col":1,"row":1,"kind":"Sideways","shift":false,"alt":false,"ctrl":false}}"#,
+            r#"{"id":1,"event":{"col":"三","row":1,"kind":"WheelUp","shift":false,"alt":false,"ctrl":false}}"#,
+            "[]",
+        ] {
+            let (r, fake) = routes(Response::Ok);
+            assert_eq!(r.handle(&post("/api/mouse", body)).status, 400, "{body}");
+            assert!(fake.seen.lock().unwrap().is_empty(), "{body} 不该往下走");
+        }
+    }
+
+    /// **滚轮那三档都要在。**
+    ///
+    /// 跟 `the_page_routes_history_the_way_the_desktop_does` 同一个道理，钉的
+    /// 是 `attach::wheel_action` 的三档在网页上都接着：`agent_owns` 转发真
+    /// 滚轮、没历史时不动、其余 dct 自己滚。少哪一档都是「某类会话上滚轮
+    /// 没反应」，而那正是这次要修的毛病。
+    ///
+    /// 匹配「接上了」的形状而不是「名字还在」：只查标识符的话，把分支改成
+    /// `if (false)` 一样绿。
+    #[test]
+    fn the_page_routes_the_wheel_the_way_the_desktop_does() {
+        let code = page_without_comments();
+        for needle in [
+            "canvasEl.addEventListener(\"wheel\", onWheel, { passive: false })",
+            "if (scrollState.agent_owns)",
+            "sent(wire.mouse(open,",
+            "if (!(scrollState.max > 0)) { wheelRows = 0; return; }",
+            "sent(wire.scroll(open, { Rows: rows }))",
+        ] {
+            assert!(code.contains(needle), "少了 {needle:?}——滚轮那条路由断了一档");
+        }
+
+        // 一格三行跟桌面同一个数。桌面改了这里就该跟着改，不然同一下滚轮
+        // 在两个客户端上滚出来的距离不一样。
+        let desktop = crate::ui::attach::WHEEL_ROWS;
+        assert!(
+            code.contains(&format!("var WHEEL_ROWS = {desktop};")),
+            "网页那边的一格滚轮跟桌面 attach::WHEEL_ROWS（{desktop}）对不上"
+        );
+    }
+
     #[test]
     fn a_malformed_scroll_never_reaches_the_daemon() {
         for body in [
@@ -1076,8 +1172,8 @@ mod tests {
         // 页面里一个 `/api/` 都没有了。所以还要确认它们真在里面。
         assert_eq!(
             lan.matches("/api/").count(),
-            6,
-            "lanWire 该正好盖住六件事：文案、列表、画面、打字、按键、翻历史"
+            7,
+            "lanWire 该正好盖住七件事：文案、列表、画面、打字、按键、翻历史、滚轮"
         );
 
         let (relay, not_relay) = body_of(&code, "function relayWire(cfg) {");
@@ -1122,6 +1218,17 @@ mod tests {
             Request::Scroll {
                 id: 1,
                 by: ScrollBy::Bottom,
+            },
+            Request::Mouse {
+                id: 1,
+                event: crate::proto::MouseForward {
+                    col: 0,
+                    row: 0,
+                    kind: crate::proto::MouseForwardKind::WheelUp,
+                    shift: false,
+                    alt: false,
+                    ctrl: false,
+                },
             },
             Request::WebStrings {
                 lang: String::new(),
@@ -1179,7 +1286,7 @@ mod tests {
                 &rest[..end]
             })
             .collect();
-        assert_eq!(paths.len(), 6, "wire 里该正好六条路径：{paths:?}");
+        assert_eq!(paths.len(), 7, "wire 里该正好七条路径：{paths:?}");
 
         let (r, _fake) = routes(Response::Sessions(Vec::new()));
         for p in paths {

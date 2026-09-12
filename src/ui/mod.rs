@@ -25,7 +25,7 @@ pub use widgets::{status_label, status_style, Msg};
 mod app;
 use app::App;
 
-mod attach;
+pub(crate) mod attach;
 mod board;
 mod grid;
 mod keys;

@@ -17,7 +17,7 @@ use super::{danger, move_sel_n, BarTheme};
 
 /// 滚轮一格滚几行。3 是终端惯例，改了会跟用户在别处（浏览器、编辑器）的
 /// 肌肉记忆打架。
-const WHEEL_ROWS: i32 = 3;
+pub(crate) const WHEEL_ROWS: i32 = 3;
 
 /// 一次滚轮/翻页该做什么。纯函数，好测。
 pub(crate) enum ScrollAction {

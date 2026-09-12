@@ -366,6 +366,9 @@
       },
       scroll: function (id, by) {
         return postJson("/api/scroll", { id: id, by: by });
+      },
+      mouse: function (id, event) {
+        return postJson("/api/mouse", { id: id, event: event });
       }
     };
   }
@@ -442,7 +445,8 @@
       screen: function (id) { return ask({ Screen: { id: id } }); },
       input: function (id, text) { return ask({ Input: { id: id, text: text } }); },
       key: function (id, name) { return ask({ Key: { id: id, name: name } }); },
-      scroll: function (id, by) { return ask({ Scroll: { id: id, by: by } }); }
+      scroll: function (id, by) { return ask({ Scroll: { id: id, by: by } }); },
+      mouse: function (id, event) { return ask({ Mouse: { id: id, event: event } }); }
     };
   }
 
@@ -726,17 +730,23 @@
     canvasEl.style.fontSize = Math.max(6, Math.min(28, size)) + "px";
   }
 
-  function placeCursor(pos, hidden) {
-    if (hidden || !pos) { cursorEl.hidden = true; return; }
+  // 一个格子多宽多高。**画光标和认滚轮落在哪个格子上，量的必须是同一个
+  // 格子**——各量一遍的话，两处迟早在某个字号上错开一列，而错开的那一处
+  // 是「点在这儿、agent 以为点在旁边」这种没人查得出来的偏差。
+  function cellSize() {
     var size = parseFloat(canvasEl.style.fontSize) || 16;
     rulerEl.style.fontSize = size + "px";
-    var per = rulerEl.getBoundingClientRect().width / 10;
-    var lineH = size * 1.2;
+    return { w: rulerEl.getBoundingClientRect().width / 10, h: size * 1.2 };
+  }
+
+  function placeCursor(pos, hidden) {
+    if (hidden || !pos) { cursorEl.hidden = true; return; }
+    var cell = cellSize();
     cursorEl.hidden = false;
-    cursorEl.style.width = per + "px";
-    cursorEl.style.height = lineH + "px";
-    cursorEl.style.left = (8 + pos[1] * per) + "px";
-    cursorEl.style.top = (8 + pos[0] * lineH) + "px";
+    cursorEl.style.width = cell.w + "px";
+    cursorEl.style.height = cell.h + "px";
+    cursorEl.style.left = (8 + pos[1] * cell.w) + "px";
+    cursorEl.style.top = (8 + pos[0] * cell.h) + "px";
   }
 
   function drawScreen(resp) {
@@ -841,6 +851,113 @@
   function pageStep() {
     var rows = canvasEl.textContent.split("\n").length;
     return Math.max(1, rows - 2);
+  }
+
+  // ——滚轮————————————————————————————————————————————————————————
+  //
+  // 一格滚轮几行。跟 `attach::WHEEL_ROWS` 是同一个数（有条守卫盯着），
+  // 只在**把攒下的行数重新切成"格"**时用得上——转发给 agent 的是一个个
+  // 滚轮事件，不是行数，得先换算回来。
+  //
+  // dct 自己滚的那一档不走它：浏览器给的是像素，按行高折算过去多少就滚
+  // 多少，跟网页上别的滚动一样跟手。硬凑成 3 的倍数反而是把触摸板的
+  // 连续滚动切成一跳一跳的。
+  var WHEEL_ROWS = 3;
+
+  // **滚轮归谁，照抄 `attach::wheel_action` 的三档。**
+  //
+  //   - `agent_owns`（Claude Code、pager 这类自己管视口的）→ 把这一下
+  //     原样转发给 agent（`Request::Mouse`），滚什么由它说了算；
+  //   - `max == 0`（没有历史可翻）→ 什么也不做；
+  //   - 其余 → dct 滚自己的缓冲（`Request::Scroll`）。
+  //
+  // 上面翻页键那条路由（`scrollGoesToAgent`）为什么不能直接复用：那一档
+  // 送给 agent 的是 `PageUp`/`PageDown` 键名，而滚轮一格是三行——按键名
+  // 发出去，一格滚轮就成了一次整页跳，跟桌面差得远。同一条规则、两种表达。
+  //
+  // 这份判断跟 `attach.rs` 那个函数是**同一条规则的两处实现**，改一处就要
+  // 改另一处；理由同 `scrollGoesToAgent()` 上面那段：路由必须在客户端做。
+
+  // 攒下来还没发出去的行数（正数 = 往上翻，跟 `ScrollBy::Rows` 同向），
+  // 外加这一串滚轮最后落在哪个格子上（转发给 agent 时要带上）。
+  var wheelRows = 0;
+  var wheelAt = null;
+  var wheelQueued = false;
+
+  // 这一下滚轮是几行。`deltaMode` 0 = 像素、1 = 行、2 = 页——**三种都要认**：
+  // 触摸板给的是很碎的像素，Firefox 给的是行，而按页那档得按一屏折算。
+  function wheelLines(e) {
+    if (e.deltaMode === 1) { return e.deltaY; }
+    if (e.deltaMode === 2) { return e.deltaY * pageStep(); }
+    return e.deltaY / (cellSize().h || 16);
+  }
+
+  // 指针落在哪个格子上。0 起算，跟 `Response::Screen` 的 `cursor` 一致；
+  // 超出画面的一律夹回去——agent 拿到一个不存在的格子只会更糊涂。
+  function cellAt(e) {
+    var box = canvasEl.getBoundingClientRect();
+    var cell = cellSize();
+    if (!cell.w || !cell.h) { return { col: 0, row: 0 }; }
+    var col = Math.floor((e.clientX - box.left) / cell.w);
+    var row = Math.floor((e.clientY - box.top) / cell.h);
+    return {
+      col: Math.max(0, Math.min(Math.max(0, lastCols - 1), col)),
+      row: Math.max(0, Math.min(Math.max(0, lastRows - 1), row))
+    };
+  }
+
+  // 攒够一整行再发。**不攒的话触摸板一划就是几十条请求**——每个像素级的
+  // `wheel` 事件都发一次，会把 `/api/scroll` 打爆，而屏幕上看到的只是同一
+  // 段滚动。攒下的零头留着，下一次接着攒，滚起来才是连续的。
+  function flushWheel() {
+    wheelQueued = false;
+    var rows = Math.trunc(wheelRows);
+    if (!rows) { return; }
+    wheelRows -= rows;
+    if (!canSend()) { wheelRows = 0; return; }
+    if (scrollState.agent_owns) {
+      var kind = rows > 0 ? "WheelUp" : "WheelDown";
+      // 攒下的行数切回"格"（一格 `WHEEL_ROWS` 行，同桌面）。封顶 5 格：甩一下触摸板能攒出几百行，
+      // 照着发就是一串发不完的请求，而 agent 收 5 格和收 50 格在屏幕上
+      // 已经没有区别了。
+      var notches = Math.min(5, Math.max(1, Math.round(Math.abs(rows) / WHEEL_ROWS)));
+      for (var i = 0; i < notches; i++) {
+        sent(wire.mouse(open, {
+          col: wheelAt ? wheelAt.col : 0,
+          row: wheelAt ? wheelAt.row : 0,
+          kind: kind,
+          shift: wheelAt ? wheelAt.shift : false,
+          alt: wheelAt ? wheelAt.alt : false,
+          ctrl: wheelAt ? wheelAt.ctrl : false
+        }));
+      }
+      return;
+    }
+    // 没有历史可翻的时候什么也不做——跟桌面 `wheel_action` 的 `max == 0`
+    // 那一档一样。这里不能退回去发翻页键：滚轮在一个没有历史的会话上
+    // 本来就该是没反应的，发键过去等于凭空多敲了一个 PageUp。
+    if (!(scrollState.max > 0)) { wheelRows = 0; return; }
+    sent(wire.scroll(open, { Rows: rows }));
+  }
+
+  function onWheel(e) {
+    // 画布被捏放大到超出屏幕时，`#screen` 自己是能滚的——那时候滚轮在
+    // 平移画面，不许抢过来翻历史，不然放大之后就再也看不到下半屏。
+    if (screenEl.scrollHeight > screenEl.clientHeight + 1) { return; }
+    if (open === null) { return; }
+    e.preventDefault();
+    // 往上滚（`deltaY < 0`）= 往历史里翻 = `Rows` 为正，跟 ⇞ 那个按钮同向。
+    wheelRows += -wheelLines(e);
+    var at = cellAt(e);
+    at.shift = e.shiftKey;
+    at.alt = e.altKey;
+    at.ctrl = e.ctrlKey;
+    wheelAt = at;
+    // 一帧只发一次：`wheel` 事件比帧还密，逐个发等于同一段滚动发好几遍。
+    if (!wheelQueued) {
+      wheelQueued = true;
+      requestAnimationFrame(flushWheel);
+    }
   }
 
   // 虚拟键行。手机键盘上没有这些键，而 agent 全都要用：Esc 关弹窗、
@@ -1226,6 +1343,11 @@
   //
   // **只认真正的「点」，不认滑动。** 画面区自己要滚，手指一划就取消——
   // 不判这一下的话，每次滚动都会往输入框里塞一行。
+  // 滚轮。`passive: false` 是必须的——要 `preventDefault()` 挡掉浏览器
+  // 自己那套滚动（画面是一整块贴合屏幕的画布，浏览器那一下什么也滚不动，
+  // 只会在 iOS 上把整页拽出橡皮筋）。
+  canvasEl.addEventListener("wheel", onWheel, { passive: false });
+
   var tapFrom = null;
   var tapCancelled = false;
   canvasEl.addEventListener("touchstart", function (e) {
