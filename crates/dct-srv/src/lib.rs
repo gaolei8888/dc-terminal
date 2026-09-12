@@ -336,12 +336,47 @@ struct LiveStartRequest {
 /// 老师开播：把 `Live::start` 接到网上。守护进程的推帧线程在第一次推帧
 /// 之前调它，好让中转认得 `viewer_token`/`push_secret` 和这场直播上架了
 /// 哪几路——不然中转会把第一次推帧当成「这场直播不存在」拒收。
+/// **这条路由是 spec 里唯一要对公网开的东西，而这一期它没有配对身份可验。**
+/// 所以它自己得带两道闸：房间总数有上限（`Live::start` 里判，回
+/// `QuotaExceeded` → 429），以及按来源的建房节流（`Live::note_start`，回
+/// `Busy` → 429）。两道都在，缺一道就是另一半攻击面敞着——只有总数上限，
+/// 一个脚本把上限占满就能让真正的老师开不了播；只有节流，换一堆来源照样
+/// 能把内存撑爆。
+///
+/// 节流在建房**之前**：一次会被拒的建房不该先把房间表动一遍。
 async fn live_start_route(
     State(live): State<Arc<Live>>,
+    headers: HeaderMap,
     Json(req): Json<LiveStartRequest>,
 ) -> Result<StatusCode, Rejected> {
+    live.note_start(&client_key(&headers), Instant::now())?;
     live.start(req.id, req.viewer_token, req.push_secret, req.lanes)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 建房限流按什么分桶。
+///
+/// **中转永远只听本机**（`must_be_loopback`），所以公网上的请求必然经过
+/// 反向代理，真正的来源只在 `X-Forwarded-For` 里——取头一跳。部署文档
+/// （`docs/deploy-live-relay.md`）因此把「反代必须设这个头」写成了要求
+/// 而不是建议。
+///
+/// 两个头都没有（本机直连、单元测试）就归到同一个桶：那时候这条限流退化
+/// 成「整体每分钟 N 次」，仍然是一道闸，只是不再分得清是谁。
+///
+/// **这不是身份。** `X-Forwarded-For` 是请求方写得出来的东西——反代会把它
+/// 覆盖掉，没有反代的时候谁都能伪造。它只是一个够用的分桶依据：能换的人
+/// 自然换得动，但那时 `MAX_RATE_KEYS` 那条上限接着拦。
+fn client_key(headers: &HeaderMap) -> String {
+    for name in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(raw) = header(headers, name) {
+            let first = raw.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    "direct".to_string()
 }
 
 /// 老师推一帧。带的是 push secret（`x-live-push`），不是学生那把
@@ -583,6 +618,52 @@ mod tests {
             live: live.clone(),
         });
         (app, live)
+    }
+
+    /// 走 `POST /live/start` 开一场，带上一个来源标识（反代会设的那个头）。
+    /// 回状态码。
+    async fn post_start(app: &Router, id: &str, from: &str) -> u16 {
+        let body = format!(
+            r#"{{"id":"{id}","viewer_token":"{}","push_secret":"{}","lanes":["一路"]}}"#,
+            "t".repeat(64),
+            push_secret()
+        );
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(dct_link::live::PATH_START)
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", from)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// **建房这条路对公网开着，所以它自己得带一道节流闸。** 同一个来源
+    /// 连着建房，超过窗口上限要回 429——不是 401（那是「你没资格」），
+    /// 是「等一下再来」。
+    #[tokio::test]
+    async fn opening_rooms_too_fast_from_one_source_is_throttled() {
+        let (app, _live) = app_with_live();
+        for i in 0..dct_link::live::MAX_STARTS_PER_WINDOW {
+            assert_eq!(
+                post_start(&app, &format!("room{i}"), "1.2.3.4").await,
+                204,
+                "窗口之内该放行"
+            );
+        }
+        assert_eq!(
+            post_start(&app, "one-too-many", "1.2.3.4").await,
+            429,
+            "同一个来源建房没有节流"
+        );
+        // 换一个来源不受连累。
+        assert_eq!(post_start(&app, "someone-else", "5.6.7.8").await, 204);
     }
 
     /// 本文件里所有直播测试统一用的 push secret——固定值，因为推帧测试

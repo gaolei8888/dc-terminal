@@ -26,6 +26,28 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// 把中转的内存吃光。
 pub const MAX_LANES: usize = 4;
 
+/// 中转上最多同时活着几场直播。
+///
+/// **`POST /live/start` 是 spec 里唯一要对公网开的路由，而它这一期没有
+/// 配对身份可验**——谁都能建房间。没有这条上限的话，一个脚本几秒钟就能
+/// 建出几十万间，每间 `MAX_LANES` 路、每路最大 `MAX_FRAME_BYTES`，中转
+/// 的内存就是这么被吃光的。
+///
+/// 64 的来历：最坏情况 64 × 4 × 256 KB = 64 MB，一台小机器扛得住；而
+/// 「同一台中转上同时有 64 位老师在直播」已经远超这个功能眼下的部署形态
+/// （一所学校一台）。不够用的那天把这个数改大，别把这条上限拿掉。
+pub const MAX_ROOMS: usize = 64;
+
+/// 同一个来源在 [`START_RATE_WINDOW`] 里最多能建几场直播。
+///
+/// 房间总数有上限之后，剩下的攻击是「把上限占满」：反复建房间，让真正的
+/// 老师开不了播。按来源节流拦的是这个——一位老师一节课开一次播，偶尔换
+/// 几次链接，10 次一分钟绰绰有余。
+pub const MAX_STARTS_PER_WINDOW: u32 = 10;
+
+/// 建房限流的窗口长度。
+pub const START_RATE_WINDOW: Duration = Duration::from_secs(60);
+
 /// 推帧最快多久一次。终端不是视频，2 Hz 已经快过人读字。
 pub const PUSH_INTERVAL: Duration = Duration::from_millis(500);
 

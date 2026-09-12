@@ -44,9 +44,27 @@ struct Session {
     next_etag: u64,
 }
 
+/// 一个来源最近这一个窗口里建了几场。见 [`Live::note_start`]。
+struct Starts {
+    /// 这个窗口是什么时候开始的。到点就整段翻篇，不做滑动窗口——建房是
+    /// 稀疏事件，滑动窗口那点精度换不来什么，反倒要给每个来源存一串时间戳。
+    since: Instant,
+    count: u32,
+}
+
+/// 限流表最多记几个来源。
+///
+/// 表本身也得有上限：`X-Forwarded-For` 是请求方写的，换一个值就是一个新
+/// 键，不封顶的话「限流表」自己就成了那个能把内存吃光的东西。满了之后
+/// 不认识的来源一律先拒——这一条只在真的被打的时候才会生效。
+const MAX_RATE_KEYS: usize = 4096;
+
 #[derive(Default)]
 pub struct Live {
     rooms: Mutex<HashMap<String, Session>>,
+    /// 建房限流的账本，按来源记。跟 `rooms` 分开一把锁：它只在
+    /// `POST /live/start` 那一条路上被碰，而 `rooms` 是每一帧都要碰的。
+    starts: Mutex<HashMap<String, Starts>>,
 }
 
 impl Live {
@@ -77,10 +95,24 @@ impl Live {
         // 常数时间比较（`same`），不能提前 return——理由跟 `authed` 一样：
         // 早退出的分支耗时不同，就是一个能拿响应时间探测「这把钥匙对不对」
         // 的边信道。
-        if let Some(existing) = rooms.get(&id) {
-            if !same(&existing.push_hash, &hash(&push_secret)) {
-                return Err(LinkError::Unauthorized);
+        let reopening = match rooms.get(&id) {
+            Some(existing) => {
+                if !same(&existing.push_hash, &hash(&push_secret)) {
+                    return Err(LinkError::Unauthorized);
+                }
+                true
             }
+            None => false,
+        };
+        // **房间数有上限。** `POST /live/start` 是 spec 里唯一要对公网开的
+        // 路由，而这一期它没有配对身份可验：没有这条上限，一个脚本几秒钟
+        // 就能把中转的内存吃光（见 `MAX_ROOMS` 的文档注释）。
+        //
+        // 只拦新开的那一种：老师带着同一把 push_secret 重开自己已经在播的
+        // 那一场（改 lanes、断线重连）不占新名额，满了也不该把正在上课的
+        // 人踢出去。
+        if !reopening && rooms.len() >= dct_link::live::MAX_ROOMS {
+            return Err(LinkError::QuotaExceeded);
         }
         let lanes = lanes
             .into_iter()
@@ -101,6 +133,42 @@ impl Live {
                 next_etag: 1,
             },
         );
+        Ok(())
+    }
+
+    /// 记一次建房尝试，顺便判断这个来源是不是敲得太快了。
+    ///
+    /// **在 `start` 之前调**，路由层负责：房间总数有上限之后，剩下的攻击
+    /// 是「把上限占满」——反复建房间让真正的老师开不了播。按来源节流拦的
+    /// 是这个。
+    ///
+    /// `who` 是路由层算出来的来源标识（反代给的 `X-Forwarded-For` 头一跳，
+    /// 没有就是对端地址）。它不是身份，只是一个够用的分桶依据：能换的人
+    /// 自然换得动，但那时 `MAX_RATE_KEYS` 那条上限接着拦。
+    ///
+    /// 超了回 `Busy`（→ 429）。**不是 `Unauthorized`**：这不是"你没资格"，
+    /// 是"等一下再来"，而这两句话该让调用方做的事完全不同。
+    pub fn note_start(&self, who: &str, now: Instant) -> Result<(), LinkError> {
+        let mut starts = self.starts.lock().expect("live 限流锁");
+        // 过期的窗口先扫掉——不扫的话这张表只增不减，而键是请求方能随手
+        // 换的东西。
+        starts.retain(|_, s| now.duration_since(s.since) < dct_link::live::START_RATE_WINDOW);
+        match starts.get_mut(who) {
+            Some(s) => {
+                if s.count >= dct_link::live::MAX_STARTS_PER_WINDOW {
+                    return Err(LinkError::Busy);
+                }
+                s.count += 1;
+            }
+            None => {
+                // 扫完还是满的：正在被人拿一堆假来源打。不认识的来源一律
+                // 先拒，别让这张表自己成了那个吃内存的东西。
+                if starts.len() >= MAX_RATE_KEYS {
+                    return Err(LinkError::Busy);
+                }
+                starts.insert(who.to_string(), Starts { since: now, count: 1 });
+            }
+        }
         Ok(())
     }
 
@@ -397,6 +465,99 @@ mod tests {
             live.lanes("abc", &"t".repeat(64)).unwrap(),
             vec!["新的一路".to_string()]
         );
+    }
+
+    /// **房间数有上限。** `POST /live/start` 是 spec 里唯一要对公网开的
+    /// 路由，而这一期它没有配对身份可验：没有这条上限，一个脚本几秒钟就能
+    /// 把中转的内存吃光。
+    #[test]
+    fn the_relay_refuses_to_open_more_rooms_than_it_can_hold() {
+        let live = Live::new();
+        for i in 0..dct_link::live::MAX_ROOMS {
+            live.start(
+                format!("room{i}"),
+                "t".repeat(64),
+                "p".repeat(64),
+                vec!["一路".into()],
+            )
+            .expect("上限之内该开得起来");
+        }
+        assert_eq!(
+            live.start(
+                "one-too-many".into(),
+                "t".repeat(64),
+                "p".repeat(64),
+                vec!["一路".into()],
+            )
+            .unwrap_err(),
+            LinkError::QuotaExceeded,
+            "满了要回一个说得清的错误码"
+        );
+    }
+
+    /// 满了也不许把正在上课的人踢出去：老师带着同一把 push_secret 重开
+    /// 自己那一场（改 lanes、断线重连）不占新名额。
+    #[test]
+    fn a_full_relay_still_lets_an_existing_teacher_reopen_their_own_room() {
+        let live = Live::new();
+        for i in 0..dct_link::live::MAX_ROOMS {
+            live.start(
+                format!("room{i}"),
+                "t".repeat(64),
+                "p".repeat(64),
+                vec!["一路".into()],
+            )
+            .unwrap();
+        }
+        assert!(
+            live.start(
+                "room0".into(),
+                "t".repeat(64),
+                "p".repeat(64),
+                vec!["换了的一路".into()],
+            )
+            .is_ok(),
+            "中转满了就连原来的老师都重开不了自己那一场，等于把正在上的课掐了"
+        );
+    }
+
+    /// 按来源节流：房间总数有上限之后，剩下的攻击是「把上限占满」，让真正
+    /// 的老师开不了播。
+    #[test]
+    fn one_source_cannot_keep_opening_rooms_forever() {
+        let live = Live::new();
+        let now = Instant::now();
+        for _ in 0..dct_link::live::MAX_STARTS_PER_WINDOW {
+            live.note_start("1.2.3.4", now).expect("窗口之内该放行");
+        }
+        assert_eq!(
+            live.note_start("1.2.3.4", now).unwrap_err(),
+            LinkError::Busy,
+            "同一个来源在一个窗口里建房没有上限"
+        );
+    }
+
+    /// 节流是按来源分桶的：一个人敲爆了不该连累别人。
+    #[test]
+    fn throttling_one_source_does_not_block_another() {
+        let live = Live::new();
+        let now = Instant::now();
+        for _ in 0..dct_link::live::MAX_STARTS_PER_WINDOW {
+            live.note_start("1.2.3.4", now).unwrap();
+        }
+        assert!(live.note_start("5.6.7.8", now).is_ok());
+    }
+
+    /// 窗口过去就翻篇——限流是"等一下再来"，不是"今天别来了"。
+    #[test]
+    fn the_throttle_window_rolls_over() {
+        let live = Live::new();
+        let now = Instant::now();
+        for _ in 0..dct_link::live::MAX_STARTS_PER_WINDOW {
+            live.note_start("1.2.3.4", now).unwrap();
+        }
+        let later = now + dct_link::live::START_RATE_WINDOW + Duration::from_secs(1);
+        assert!(live.note_start("1.2.3.4", later).is_ok());
     }
 
     /// 挂着的学生要被新帧叫醒，这是 `?wait=1` 的全部机制。
