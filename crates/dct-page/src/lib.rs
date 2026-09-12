@@ -53,21 +53,87 @@ mod tests {
         assert!(super::page().len() > 10_000, "网页短得不像话，是不是被截了");
     }
 
-    /// **学生页里没有任何一条能把字节送回老师终端的路。**
+    /// **学生页里没有任何一条能把字节送回老师终端的路（黑名单这一半）。**
     ///
     /// 这条守卫是这个功能全部安全性的落点：只读不是某处 `if` 判出来的，是这份
     /// 字节里根本没有那些路径。开关式实现（同一页加个只读模式）做不到这一点——
     /// 那一页上「能不能送东西出去」有十几个调用点，漏一个就是学生能往老师终端
     /// 里敲字，而这件事老师在自己机器上永远试不出来。
+    ///
+    /// **黑名单只拦得住写得出来的那几种坏写法**——把 `"/api/input"` 拆成
+    /// `"/ap" + "i/input"`，或者不叫 `wire.key` 而是随便起个变量名，字面量
+    /// 子串匹配就什么都测不到了。这一条留着是因为它仍然拦得住最常见的低级
+    /// 错误（抄一段桌面端代码没删干净），但真正钉住"将来会不会长出新出口"
+    /// 这件事的是下面那条白名单守卫。
     #[test]
     fn the_student_page_has_no_way_to_send_anything_to_a_session() {
         let page = super::live_page();
         for banned in [
             "/api/input", "/api/key", "/api/mouse", "/api/scroll",
             "wire.key", "wire.input", "<input", "<textarea",
+            // 这几个都是绕过 `fetch` 白名单的现成出口：`sendBeacon` 能悄悄
+            // 发一次 POST 且不等答复，`<form` 能在没有 JS 的情况下提交，
+            // `XMLHttpRequest`/`WebSocket`/`EventSource` 都是另一条能发
+            // 请求或建连接的路，白名单守卫（下面那条）只数得到 `fetch(`，
+            // 数不到这几个。
+            "XMLHttpRequest", "sendBeacon", "WebSocket", "EventSource", "<form",
         ] {
             assert!(!page.contains(banned), "学生页里出现了 {banned:?}");
         }
+    }
+
+    /// **学生页里没有任何一条能把字节送回老师终端的路（白名单这一半）。**
+    ///
+    /// 黑名单只拦得住"想得到的坏写法"——把字符串拆开拼接、把方法名换成一个
+    /// 不叫 `wire.key` 的变量，子串匹配就完全看不见。这条反过来：**这一页
+    /// 唯一被允许的发请求方式是 `fetch(`**，把它出现的每一处都数出来（数量
+    /// 写死，多一处就红——新增一个出口必须有人特意回来改这条测试才能通过），
+    /// 逐一验证目标都是 `/live/` 开头，再确认页面里没有任何"请求方法不是
+    /// GET"的痕迹（`fetch` 不传 `method` 就是 GET，这一页也不该有任何理由
+    /// 去传别的方法）。
+    ///
+    /// 这条测试防的不是"今天这份代码里有没有坏词"，是"将来某个人顺手加了
+    /// 一条新出口，会不会有东西替他喊一声"。
+    #[test]
+    fn every_exit_the_student_page_has_is_a_get_to_a_live_path() {
+        let page = super::live_page();
+
+        let exits: Vec<usize> = page.match_indices("fetch(").map(|(i, _)| i).collect();
+        assert_eq!(
+            exits.len(),
+            2,
+            "学生页里 fetch( 出现的次数变了（{} 处）——新增或删掉一处发请求的\
+             出口，都要回来核对这条守卫是不是还盯得住",
+            exits.len()
+        );
+
+        for at in &exits {
+            // 不是一个真正的表达式解析器，只在 `fetch(` 后面一小段窗口里找
+            // 目标：要么是拼在调用现场的字符串字面量（`"/live/" + id + ...`），
+            // 要么是像 `frameUrl()` 这样转一手的函数——两种情况都该在窗口里
+            // 见到 `/live/` 这个前缀，或者见到那个转手函数的名字（下面单独
+            // 钉住 `frameUrl()` 自己的目标）。
+            let window = &page[*at..(*at + 80).min(page.len())];
+            assert!(
+                window.contains("/live/") || window.contains("frameUrl()"),
+                "第 {at} 个字节处的 fetch( 附近看不到 /live/ 也看不到 \
+                 frameUrl()：{window:?}"
+            );
+        }
+
+        assert!(
+            page.contains("return \"/live/\" + LIVE_ID"),
+            "frameUrl() 不见了，或者它的目标不再是 /live/ 开头——上面那条对 \
+             fetch(frameUrl()) 的检查就失去意义了"
+        );
+
+        // `fetch` 不传第二个参数的 `method` 字段就是 GET。这一页不该有任何
+        // 理由发 GET 之外的请求，所以整页不该出现 `method:` 这个 key——
+        // 一旦出现，说明某处在悄悄发 POST/PUT/DELETE。
+        assert!(
+            !page.contains("method:"),
+            "学生页里出现了 method:——是不是有请求换成了非 GET？"
+        );
     }
 
     /// 两页共用同一份渲染。各留一份的话，迟早只有一页修对了某个渲染 bug。
