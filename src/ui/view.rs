@@ -1424,6 +1424,16 @@ fn board_keys(
 /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
 /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
 pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> {
+    idle_help_for_terminal(
+        view,
+        lang,
+        ctx,
+        std::env::var("DCT_BROWSER_TERMINAL").as_deref() == Ok("1"),
+    )
+}
+
+/// Browser-specific clipboard hints live in the HTML footbar, which knows the client OS.
+fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) -> Vec<HelpItem> {
     use crate::i18n::{help_items, Key};
     match view {
         // 不再写「F2 同效」：左段的逃生键本身就是「F2 回看板」，
@@ -1450,15 +1460,15 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> 
         // - `F6` 排在 `F4` 前面，也就是**最先丢**的那一条：其余三条丢了就
         //   真的做不到（这一层按 `?` 打不开浮层），配色丢了还有设置页那条路
         //   （F2 回看板、`l`、配色），而且它是四条里唯一一条「不干活也行」的。
-        View::Attached(_) => help_items(
-            &[
+        View::Attached(_) => {
+            let keys = [
                 ("F5", Key::PasteImage),
                 ("F3", Key::NextSession),
                 ("F6", Key::BarTheme),
                 ("F4", Key::EnterCopyMode),
-            ],
-            lang,
-        ),
+            ];
+            help_items(if browser { &keys[1..] } else { &keys }, lang)
+        }
         // 浮层自己就是一整屏按键表，右段再列一遍是重复；左段的
         // 「Esc 返回」已经把这里唯一能按的键交代完了。
         View::Keys { .. } => Vec::new(),
@@ -1810,6 +1820,21 @@ mod tests {
     /// 「这个键在不在表里」，不是「什么时候不该在」。后者由 `help_when` 单独问。
     fn help_of(view: &View, lang: Lang) -> String {
         help_when(view, lang, on_a_session())
+    }
+
+    #[test]
+    fn browser_clipboard_hint_belongs_to_the_browser_but_local_f5_remains() {
+        for lang in [Lang::Zh, Lang::En] {
+            let browser = idle_help_for_terminal(&View::Attached(1), lang, on_a_session(), true);
+            assert!(!browser.iter().any(|item| item.key == "F5"));
+            assert!(browser.iter().any(|item| item.key == "F4"));
+            let local = idle_help_for_terminal(&View::Attached(1), lang, on_a_session(), false);
+            assert!(local.iter().any(|item| item.key == "F5"));
+            assert_eq!(
+                idle_help_for_terminal(&View::Board, lang, on_a_session(), true),
+                idle_help_for_terminal(&View::Board, lang, on_a_session(), false)
+            );
+        }
     }
 
     fn help_when(view: &View, lang: Lang, ctx: HelpCtx) -> String {

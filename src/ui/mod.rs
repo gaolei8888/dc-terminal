@@ -22,6 +22,7 @@ mod widgets;
 use widgets::short_path;
 pub use widgets::{status_label, status_style, Msg};
 
+mod agent_theme;
 mod app;
 use app::App;
 
@@ -29,6 +30,7 @@ pub(crate) mod attach;
 mod board;
 mod grid;
 mod keys;
+mod links;
 mod pair_view;
 mod phone;
 mod pick;
@@ -76,27 +78,29 @@ pub fn init_theme() {
 /// 没探测过就按 `Unknown` 算——那是三种取值里最保守的一个（只挂 DIM 修饰符，
 /// 不钉任何颜色），所以测试和任何绕过 `run()` 的路径都能正常渲染。
 pub fn dim() -> Style {
-    THEME.get().copied().unwrap_or(Theme::Unknown).dim()
+    theme_now().dim()
 }
 
 /// 这一刻算出来的主题。探测没跑过就按 `Unknown` 算（最保守的一档）。
 pub fn theme_now() -> Theme {
-    THEME.get().copied().unwrap_or(Theme::Unknown)
+    agent_theme::active()
+        .or_else(|| THEME.get().copied())
+        .unwrap_or(Theme::Unknown)
 }
 
 /// 焦点、可按的动作。取代原来满屏的 `Color::Cyan`，理由见 `Theme::accent`。
 pub fn accent() -> Style {
-    THEME.get().copied().unwrap_or(Theme::Unknown).accent()
+    theme_now().accent()
 }
 
 /// 选中那一行。
 pub fn strong() -> Style {
-    THEME.get().copied().unwrap_or(Theme::Unknown).strong()
+    theme_now().strong()
 }
 
 /// **只给真的错误用**，理由见 `Theme::danger`。
 pub fn danger() -> Style {
-    THEME.get().copied().unwrap_or(Theme::Unknown).danger()
+    theme_now().danger()
 }
 
 /// 标题条/底栏的实色样式。返回 `None` 表示这一档不可用，调用方退回画横线。
@@ -281,6 +285,12 @@ pub fn bar_style(t: BarTheme) -> Option<Style> {
 /// 两步都 `let _ =` 吞错：`Drop` 里不能 panic，而且这里能做的补救本来就只有
 /// 「尽量多还原一点」。
 fn restore_terminal() {
+    if std::env::var_os("DCW_PUBLIC_URL").is_some() {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(agent_theme::browser_sequence(None).as_bytes());
+        let _ = out.flush();
+    }
     let _ = disable_raw_mode();
     // 无条件关鼠标捕获，不管这次运行有没有真的开过：没开过时多发一次关闭
     // 序列是无害的，而漏关会让用户的终端从此点哪儿都冒出 SGR 乱码——
@@ -425,7 +435,12 @@ pub fn run(
         SetCursorStyle::SteadyBar
     )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
+    let mut screen_links = links::Links::default();
 
+    let mut follower = agent_theme::Follower::new(&socket);
+    let browser = std::env::var_os("DCW_PUBLIC_URL").is_some();
+    let mut previous_theme = None;
+    let follow_agent_theme = std::env::var_os("NO_COLOR").is_none();
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
     // 用户存过的配色。没存过就留在 `App::new` 给的默认档，跟 `load_view_mode`
     // 那边一样：「盘上没有可用的选择」由调用方定默认，settings 只管读写。
@@ -443,6 +458,7 @@ pub fn run(
     // 「开机那次兜底补启动目录」有没有做过。一次性的：做完之后用户 `x` 掉
     // 所有组是他自己的选择，不该被这段逻辑一次次撤销回来。
     let mut seeded = false;
+    let student_browser = std::env::var_os("DCW_STUDENT").is_some_and(|v| v == "1");
 
     // 有标签是因为下面排空鼠标事件那段需要从一个嵌套的 `while` 里跳回
     // 这个循环的顶部，而不是跳回 `while` 自己——普通的无标签 `continue`
@@ -717,6 +733,14 @@ pub fn run(
                     if !seeded {
                         seeded = true;
                         seed_start_project(&mut app);
+                        // A prepared student workspace usually has one running
+                        // agent. Reopening its browser should resume typing there.
+                        // Multiple live sessions keep the existing selection UI.
+                        if student_browser {
+                            if let Some(id) = sole_live_session(&app.sessions) {
+                                enter_session(&mut app, id);
+                            }
+                        }
                     }
                 }
                 _ => app.connected = false,
@@ -932,7 +956,35 @@ pub fn run(
             mouse_captured = enable;
         }
 
-        term.draw(|f| draw(f, &mut app))?;
+        let profile = match app.view {
+            View::Attached(id) => app
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.profile.as_str()),
+            _ => None,
+        };
+        let appearance = follower.poll(
+            profile.filter(|_| follow_agent_theme),
+            std::time::Instant::now(),
+        );
+        if browser && appearance != previous_theme {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            out.write_all(agent_theme::browser_sequence(appearance).as_bytes())?;
+            out.flush()?;
+        }
+        previous_theme = appearance;
+        let frame = term.draw(|f| draw_with_theme(f, &mut app, appearance))?;
+        let link_area = if matches!(app.view, View::Attached(_)) && app.theme_pick.is_none() {
+            app.screen_origin
+                .zip(app.screen_area)
+                .map(|((x, y), (width, height))| Rect::new(x, y, width, height))
+        } else {
+            None
+        };
+        let link_runs = screen_links.prepare(frame.buffer, link_area);
+        links::paint(term.backend_mut(), &link_runs)?;
 
         // 会话里要跟手：刷新慢了，你敲的字要等下一轮才显示，每次按键都像卡了一下。
         // 看板不需要这么勤快，150ms 足够，也省得每轮都去锁一遍所有会话。
@@ -1754,6 +1806,12 @@ fn ask_to_create(app: &mut App, dir: &str, profile: &str, remember: bool) -> Res
 /// 这里**不再**改写任何「当前项目」——它不再是一个字段，而是光标所在的
 /// 那个组。从别的组进一个会话时，光标本来就已经在那个组里了（不然那一行
 /// 根本不会被选中），所以既没有什么可改，也没有什么可报告。
+fn sole_live_session(sessions: &[crate::session::SessionInfo]) -> Option<u32> {
+    let mut live = sessions.iter().filter(|s| s.state != crate::session::SessionState::Stopped);
+    let first = live.next()?.id;
+    live.next().is_none().then_some(first)
+}
+
 pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 会话标题要显示项目名
     app.need_sessions = true;
@@ -2399,6 +2457,24 @@ fn bar_widths(inner: u16) -> (u16, u16, u16) {
 
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
+fn draw_with_theme(f: &mut Frame, app: &mut App, theme: Option<Theme>) {
+    let _scope = agent_theme::Scope::new(theme);
+    draw(f, app);
+    if let Some(theme) = theme {
+        let (fg, bg) = agent_theme::colors(theme);
+        // Resolve only terminal-default colors. Agent accents, diff backgrounds,
+        // and the user's chosen dct bar colors remain exactly as drawn.
+        for cell in &mut f.buffer_mut().content {
+            if cell.fg == Color::Reset {
+                cell.fg = fg;
+            }
+            if cell.bg == Color::Reset {
+                cell.bg = bg;
+            }
+        }
+    }
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     // 提示必须跟着视图走。底部栏原来不分视图，进了会话仍写着看板的按键表，
     // 而那些键在会话视图里全部被转发给 agent——用户照着按 n，字母 n 会落进
@@ -2816,6 +2892,17 @@ mod tests {
             profiles_to_fetch(&app).is_empty(),
             "问过就不再问，哪怕答案是「没有」"
         );
+    }
+
+    #[test]
+    fn student_resume_only_chooses_an_unambiguous_live_session() {
+        let active = sess_at(1, "/work");
+        let mut stopped = sess_at(2, "/old");
+        stopped.state = crate::session::SessionState::Stopped;
+        assert_eq!(sole_live_session(&[]), None);
+        assert_eq!(sole_live_session(&[stopped.clone()]), None);
+        assert_eq!(sole_live_session(&[active.clone(), stopped]), Some(1));
+        assert_eq!(sole_live_session(&[active, sess_at(3, "/another")]), None);
     }
 
     /// 已经知道答案的组也不再问。

@@ -64,6 +64,10 @@ PORT="${DCW_PORT:-7681}"
 TTYD_PORT="${DCW_TTYD_PORT:-7682}"
 SOCK="$HOME/.dct/daemon.sock"
 
+# Install shared skills into every bundled agent discovery directory.
+dct-install-skills /usr/local/share/dct-skills
+
+
 dct daemon &
 daemon_pid=$!
 
@@ -108,7 +112,7 @@ ttyd \
   --terminal-type xterm-256color \
   --client-option disableLeaveAlert=true \
   --index /usr/local/share/dcw/index.html \
-  dct &
+  env DCT_BROWSER_TERMINAL=1 dct &
 ttyd_pid=$!
 
 # 那道门。**它是这个容器里唯一绑 0.0.0.0 的进程**，前面就是宿主的端口映射。

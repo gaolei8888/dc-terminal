@@ -25,6 +25,7 @@ pub mod runtime;
 pub mod secrets;
 pub mod session;
 pub mod settings;
+pub mod student_projects;
 pub mod sys;
 pub mod theme;
 pub mod ui;

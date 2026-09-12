@@ -178,7 +178,7 @@ RUN set -eu; \
 # `curl` 是给**学生**的，不是给我们的：容器里没有它的时候，从一个 URL 取
 # 东西只能写 `node -e 'fetch(...)'`，那是没法在课上教的一句话。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git tini procps \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tini procps python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # **绑定挂载那条路上，git 会拒绝干活。** 实测（2026-09-07）：Docker Desktop
@@ -253,6 +253,10 @@ RUN npm config set registry "$NPM_REGISTRY" \
 COPY --from=build --chmod=0755 /out/dct /usr/local/bin/dct
 COPY --from=ttyd --chmod=0755 /ttyd /usr/local/bin/ttyd
 COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 container/bin/dct-publish /usr/local/bin/dct-publish
+COPY container/bin/dct-install-skills /usr/local/bin/dct-install-skills
+RUN chmod 0755 /usr/local/bin/dct-install-skills
+COPY container/skills/ai-pub/SKILL.md /usr/local/share/dct-skills/ai-pub/SKILL.md
 
 # 把上传栏拼进 ttyd 自己那份 index.html，`entrypoint.sh` 用 `ttyd -I` 发这一份。
 #
@@ -299,7 +303,7 @@ RUN set -eu; \
 # **建目录并交给 dc，放在 `USER` 之前**：下面 VOLUME 声明的三个路径，第一次
 # 起容器时由 Docker 按镜像里该路径的属主创建。这里不先建好、不 chown，卷就会
 # 是 root 的，而容器里跑的是 dc——学生第一次开会话就写不进去。
-RUN useradd -m -u 1000 -s /bin/bash dc  && mkdir -p /home/dc/.dct /home/dc/.claude /home/dc/work  && chown -R dc:dc /home/dc
+RUN useradd -m -u 1000 -s /bin/bash dc  && mkdir -p /home/dc/.dct /home/dc/.claude /home/dc/.codex /home/dc/work  && chown -R dc:dc /home/dc
 
 USER dc
 # **WORKDIR 必须是 ~/work，不能是 ~。这一条是安全问题，不是整洁问题。**

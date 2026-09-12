@@ -1,0 +1,27 @@
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import http from 'node:http';
+import {Store} from './store.mjs';import {Classroom} from './server.mjs';
+test('school identity login binds browser, consumes once and enforces live teacher roster',async()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'dcw-sso-'));let denied=false,fail=false,role='teacher';const teacherStudents=[{tenant:'school-a',subject:'1',name:'同名',classId:'10',className:'一班'}];
+ const issuer=http.createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;if(fail){res.writeHead(503);return res.end();}const q=JSON.parse(raw);assert.ok(['Bearer student-key','Bearer teacher-key'].includes(req.headers.authorization));res.setHeader('Content-Type','application/json');res.end(JSON.stringify({active:!denied,role:req.url==='/student'?'student':role,students:teacherStudents}));});await new Promise(r=>issuer.listen(0,'127.0.0.1',r));const endpoint='http://127.0.0.1:'+issuer.address().port;
+ const store=new Store(dir,{password:'local-password'}),driver={maxRunning:2,status:async()=>({status:'new'}),rpc:async()=>({Sessions:[]})};
+ const app=new Classroom({store,driver,secure:false,origin:'http://127.0.0.1',issuers:{classroom:{key:'student-key',launchUrl:endpoint+'/launch',permissionsUrl:endpoint+'/student'},classeditor:{key:'teacher-key',launchUrl:endpoint+'/launch',permissionsUrl:endpoint+'/teacher'}},ssoAllowHttp:true});await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;app.origin=base;
+ const get=(p,cookie)=>fetch(base+p,{headers:cookie?{Cookie:cookie}:{},redirect:'manual'});const post=(p,data,headers={})=>fetch(base+p,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(data),redirect:'manual'});
+ async function start(issuer='classroom'){const r=await get('/sso/start?issuer='+issuer);assert.equal(r.status,302);return {state:new URL(r.headers.get('location')).searchParams.get('state'),cookie:r.headers.get('set-cookie').split(';')[0]};}
+ async function mint(challenge,tenant='school-a',subject='1',issuer='classroom'){const r=await post('/integration/tickets',{tenant,subject,name:'同名',state:challenge.state},{Authorization:'Bearer '+(issuer==='classroom'?'student-key':'teacher-key'),'X-DCT-Issuer':issuer});assert.equal(r.status,200,await r.clone().text());const url=(await r.json()).url;assert.equal(new URL(url).pathname,'/sso/');return new URLSearchParams(new URL(url).hash.slice(1)).get('ticket');}
+ try{
+  const ch=await start();const token=await mint(ch);
+  assert.equal((await post('/sso/consume',{ticket:token},{Cookie:'dcw_sso_state='+'a'.repeat(64),Origin:base})).status,401,'wrong browser rejected');
+  const redeemed=await post('/sso/consume',{ticket:token},{Cookie:ch.cookie,Origin:base});assert.equal(redeemed.status,200);const url=(await redeemed.json()).url;assert.match(url,/^\/w\/[a-f0-9]{32}\/$/);assert.ok(!url.includes('#t='));const studentCookie=redeemed.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('/sso/consume',{ticket:token},{Cookie:ch.cookie,Origin:base})).status,401,'ticket single use');assert.equal((await get('/admin/api/state',studentCookie)).status,401);
+  const again=await start();const repeat=await post('/sso/consume',{ticket:await mint(again)},{Cookie:again.cookie,Origin:base});assert.equal((await repeat.json()).url,url,'stable identity reopens own workspace');
+  const other=await start();const r2=await post('/sso/consume',{ticket:await mint(other,'school-b')},{Cookie:other.cookie,Origin:base});assert.notEqual((await r2.json()).url,url,'same user ID in another tenant stays isolated');
+  const teacher=await start('classeditor');const rt=await post('/sso/consume',{ticket:await mint(teacher,'school-a','2','classeditor')},{Cookie:teacher.cookie,Origin:base});assert.equal(rt.status,200);const tc=rt.headers.get('set-cookie').split(';')[0];const state=await(await get('/admin/api/state',tc)).json();assert.equal(state.students.length,1);assert.equal(state.permissions.manageAccess,false);const own=state.students[0].id,foreign=store.data.students.find(w=>w.externalIdentity.tenant==='school-b').id;
+  assert.equal((await get('/admin/api/students/'+foreign+'/observe',tc)).status,403);assert.equal((await get('/admin/api/students/'+own+'/observe',tc)).status,200);
+  assert.equal((await post('/admin/api/students/'+own+'/link',{}, {Cookie:tc})).status,403);assert.equal((await post('/admin/api/students',{names:['fake']},{Cookie:tc})).status,403);
+  app.sso.cache.clear();teacherStudents.splice(0);assert.equal((await get('/admin/api/students/'+own+'/observe',tc)).status,403,'roster revocation applies');
+  app.sso.cache.clear();fail=true;assert.equal((await get('/admin/api/state',tc)).status,503,'issuer outage fails closed');fail=false;
+  assert.equal((await post('/integration/tickets',{},{Authorization:'Bearer wrong','X-DCT-Issuer':'classeditor'})).status,401);
+  const expiry=await start();const expired=await mint(expiry);store.data.ssoTickets.find(t=>t.key).expires=0;assert.equal((await post('/sso/consume',{ticket:expired},{Cookie:expiry.cookie,Origin:base})).status,401);
+  assert.equal((await get('/sso/start?issuer=unknown')).status,400);
+ }finally{await app.close();await new Promise(r=>issuer.close(r));fs.rmSync(dir,{recursive:true,force:true});}
+});

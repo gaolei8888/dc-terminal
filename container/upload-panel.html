@@ -1,295 +1,388 @@
-<!--
-  agent 窗口旁边那条上传栏。
-
-  这段东西**在构建时被拼进 ttyd 自己那份 index.html 的 </body> 之前**，
-  然后用 `ttyd -I` 让它发这一份（见 Dockerfile 里 `dcw-index` 那一步）。
-
-  为什么是这个位置，而不是让那道门去改写 ttyd 的响应：`gate.rs` 的立身之本
-  是「不重写 HTTP，只决定放不放行」——没带对钥匙就 401，带对了就退化成一根
-  字节管道，中间不解析任何东西。为了一个上传按钮让它开始解析响应
-  （Content-Length / chunked / gzip）就是把学生容器和公网之间唯一那层东西的
-  可审计性拿去换 UX。定制发生在 ttyd 这一层，门一行都不用改。
-
-  ttyd 那一页的结构非常简单，实测过（2026-09-10，1.7.7）：
-
-      body{margin:0;height:100%;overflow:hidden}
-        div#terminal-container{height:100%;width:auto}
-          div.terminal.xterm
-
-  所以这里做的事就是：body 改成 flex 行，终端占剩余空间，我们这条栏在右边。
-  折叠/展开之后补一个 resize 事件，xterm 的 fit 会自己重新贴合。
-
-  **文案硬编码在这里，这是一处有意的例外。** 仓库的规矩是「决定用户看到什么
-  字的地方只有一个」（`web/strings.rs` 顶上那条），而这一页是构建进容器镜像
-  的，跑的时候 dct 的 i18n 够不着它。折中办法是把所有字集中在下面 `S` 这一个
-  对象里：真要出英文班的时候，改的还是一个地方。
--->
+<!-- Injected into ttyd before </body>. Project requests use the authenticated gate.
+     The terminal owns the remaining flex space; appearance can follow or override the agent. -->
 <style>
-  body { display: flex; }
-  #terminal-container { flex: 1 1 auto; min-width: 0; }
+body { display:flex; flex-direction:column; align-items:stretch; }
+#terminal-container[data-dcw-invert="true"] { filter:invert(1) hue-rotate(180deg); }
+#terminal-container { flex:1 1 auto; width:100%; min-width:0; min-height:0; align-self:stretch; }
+#dcw-panel { --bg:#191c23; --card:#222733; --ink:#e0e5ee; --muted:#a1adbf; --line:#3b4454; --accent:#9bb6ff; box-sizing:border-box; flex:0 0 340px; width:340px; padding:14px; overflow:auto; background:var(--bg); color:var(--ink); border-left:1px solid var(--line); font:13px/1.6 system-ui,-apple-system,"PingFang SC",sans-serif; }
+#dcw-panel[data-theme="light"] { --bg:#f5f6f8; --card:#fff; --ink:#202635; --muted:#59667a; --line:#d5dce7; --accent:#315bea; }
+#dcw-panel * { box-sizing:border-box; }
+#dcw-panel button,#dcw-panel input,#dcw-panel select,#dcw-panel textarea { font:inherit; color:var(--ink); background:var(--card); border:1px solid var(--line); border-radius:7px; padding:7px 10px; }
+#dcw-panel button { cursor:pointer; }
+#dcw-panel button:hover { border-color:var(--accent); }
+#dcw-panel button:disabled { opacity:.55; cursor:wait; }
+#dcw-panel button.primary { background:#315bea; border-color:#315bea; color:white; }
+#dcw-panel h2 { font-size:18px; margin:14px 0 4px; overflow-wrap:anywhere; }
+#dcw-panel p { margin:8px 0; }
+#dcw-panel .dcw-note { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+.dcw-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.dcw-head { justify-content:space-between; }
+.dcw-tabs { display:flex; gap:8px; margin:14px 0; }
+#dcw-panel .dcw-tabs button[aria-selected="true"] { color:var(--accent); border-color:var(--accent); }
+.dcw-card { border:1px solid var(--line); border-radius:9px; padding:12px; margin:12px 0; background:var(--card); }
+#dcw-panel .dcw-card h2 { margin:0; font-size:15px; }
+.dcw-file { display:flex; gap:8px; align-items:center; justify-content:space-between; padding:9px 0; border-bottom:1px solid var(--line); }
+.dcw-file span { min-width:0; overflow-wrap:anywhere; }
+.dcw-file button { flex-shrink:0; }
+.dcw-file-info { min-width:0; flex:1; }
+.dcw-file-name { display:block; overflow-wrap:anywhere; font-weight:600; }
+#dcw-panel .dcw-file .dcw-note { margin-top:3px; font-size:11px; }
+#dcw-file-tabs { gap:4px; margin:14px 0 10px; }
+#dcw-file-tabs button { flex:1; padding:7px 3px; white-space:nowrap; font-size:12px; }
+#dcw-file-filters { display:flex; gap:6px; margin-bottom:8px; }
+#dcw-file-search { flex:1; min-width:0; width:100%; }
+#dcw-file-type { flex:0 0 94px; min-width:0; width:94px; }
+#dcw-file-count { color:var(--muted); font-size:12px; }
+#dcw-panel #dcw-file-clear { border:0; background:none; padding:4px; font-size:12px; color:var(--accent); }
+#dcw-files-more { width:100%; margin-top:10px; }
+#dcw-status { white-space:pre-wrap; overflow-wrap:anywhere; }
+#dcw-status[data-error="true"] { color:#e97676; }
+#dcw-panel[data-theme="light"] #dcw-status[data-error="true"] { color:#b32727; }
 
-  #dcw-panel {
-    flex: 0 0 260px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    box-sizing: border-box;
-    padding: 12px;
-    background: #16181d;
-    color: #c8ccd4;
-    border-left: 1px solid #2b2f38;
-    font: 13px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
-    overflow-y: auto;
-  }
-  #dcw-panel.dcw-collapsed { flex-basis: 34px; padding: 8px 6px; }
-  #dcw-panel.dcw-collapsed > :not(.dcw-toggle) { display: none; }
-
-  .dcw-toggle {
-    align-self: flex-end;
-    cursor: pointer;
-    border: 0;
-    background: transparent;
-    color: #6f7684;
-    font: inherit;
-    padding: 2px 6px;
-  }
-  .dcw-toggle:hover { color: #c8ccd4; }
-
-  .dcw-title { font-weight: 600; color: #e6e9ef; }
-  .dcw-note { color: #767d8b; font-size: 12px; }
-  .dcw-note code {
-    font-family: ui-monospace, Menlo, Consolas, monospace;
-    color: #9aa3b2;
-  }
-
-  #dcw-drop {
-    border: 1px dashed #3b414d;
-    border-radius: 6px;
-    padding: 18px 10px;
-    text-align: center;
-    cursor: pointer;
-    color: #8b93a1;
-  }
-  #dcw-drop:hover, #dcw-drop.dcw-over { border-color: #5b8dd6; color: #c8ccd4; }
-
-  #dcw-list { display: flex; flex-direction: column; gap: 8px; }
-  .dcw-item { font-size: 12px; }
-  .dcw-item .dcw-name {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: #c8ccd4;
-  }
-  .dcw-bar { height: 3px; background: #2b2f38; border-radius: 2px; margin-top: 4px; }
-  .dcw-bar > i { display: block; height: 100%; width: 0; background: #5b8dd6; border-radius: 2px; }
-  .dcw-ok  { color: #7fb069; }
-  .dcw-err { color: #d97070; }
-
-  /* 拖到窗口任何地方都算——包括终端上面。整页盖一层提示，
-     不然学生会以为必须精确瞄准右边那个框。 */
-  #dcw-veil {
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    background: rgba(20, 22, 27, 0.82);
-    color: #e6e9ef;
-    font: 600 18px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
-    pointer-events: none;
-  }
-  #dcw-veil.dcw-on { display: flex; }
+#dcw-panel progress { width:100%; accent-color:#315bea; }
+#dcw-panel [hidden] { display:none!important; }
+#dcw-panel { order:-1; flex:0 0 auto; width:100%; padding:7px 12px; border-left:0; border-bottom:1px solid var(--line); overflow:visible; }
+#dcw-panel .dcw-head { flex-wrap:nowrap; }
+#dcw-project-name { font-size:14px!important; margin:0!important; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+#dcw-panel .dcw-actions { flex-shrink:0; gap:5px; flex-wrap:nowrap; }
+#dcw-panel .dcw-actions button { padding:5px 8px; }
+#dcw-drawer { position:fixed; right:0; top:51px; bottom:0; z-index:1001; width:min(340px,calc(100vw - 38px)); padding:14px; overflow:auto; background:var(--bg); border-left:1px solid var(--line); box-shadow:-8px 0 30px #0003; }
+#dcw-panel.dcw-collapsed #dcw-drawer { display:none; }
+#dcw-dialog { padding:14px; border:1px solid var(--accent); border-radius:9px; margin:12px 0; background:var(--card); }
+#dcw-dialog input { width:100%; margin:8px 0; }
+#dcw-veil { display:none; position:fixed; inset:0; z-index:9999; background:#172033cc; color:white; align-items:center; justify-content:center; font:600 18px system-ui; pointer-events:none; }
+#dcw-veil.dcw-on { display:flex; }
+#dcw-backdrop { display:none; }
+#dcw-backdrop.dcw-on { display:block; position:fixed; inset:51px 0 0; z-index:1000; background:#17203370; border:0; }
+#dcw-presence { margin:0!important; color:var(--accent); font-size:12px; }
+#dcw-publishing label { display:block; margin:12px 0; }
+#dcw-publishing input,#dcw-publishing textarea { display:block; width:100%; margin-top:4px; }
+#dcw-publishing textarea { resize:vertical; }
+#dcw-publishing a { color:var(--accent); overflow-wrap:anywhere; }
+#dcw-publish-message[data-error="true"] { color:#e97676; }
+#dcw-panel[data-theme="light"] #dcw-publish-message[data-error="true"] { color:#b32727; }
+#dcw-publish-result { overflow-wrap:anywhere; }
+@media(max-width:700px) { #dcw-panel { padding:7px 6px; } #dcw-panel .dcw-actions { gap:3px; } }
+@media(max-width:520px) { #dcw-panel .dcw-head:first-child { flex-wrap:wrap; } #dcw-panel .dcw-actions { flex-wrap:wrap; } }
+#dcw-footbar { flex:0 0 auto; order:2; padding:5px 12px; font:12px/1.5 system-ui,-apple-system,"PingFang SC",sans-serif; color:#a1adbf; background:#191c23; border-top:1px solid #3b4454; }
+#dcw-footbar[data-theme="light"] { color:#59667a; background:#f5f6f8; border-color:#d5dce7; }
+#dcw-paste-preview img { width:100px; height:80px; object-fit:contain; border-radius:6px; }
+#dcw-paste-preview .dcw-row { margin-bottom:8px; }
+#dcw-paste-note { width:100%; resize:vertical; margin:8px 0; }
+#dcw-paste-message[data-error="true"] { color:#e97676; }
 </style>
+<button id="dcw-backdrop" aria-label="关闭项目面板" type="button"></button>
+<aside id="dcw-panel" aria-label="项目与文件">
+ <div class="dcw-row dcw-head"><h2 id="dcw-project-name">正在加载…</h2><div class="dcw-row dcw-actions"><button id="dcw-nav-library">我的项目</button><button id="dcw-drop">上传</button><button id="dcw-download">下载</button><button id="dcw-publish">发布作品</button><button id="dcw-theme" type="button" aria-label="切换到浅色" title="切换到浅色">☀</button><button class="dcw-toggle" type="button" aria-label="展开文件面板" aria-expanded="false">文件</button></div></div>
+ <p id="dcw-presence" role="status" hidden>管理员正在协助</p>
+ <div id="dcw-drawer"><div class="dcw-row dcw-head"><button id="dcw-nav-work">当前项目</button><button id="dcw-close" aria-label="关闭项目面板">关闭</button></div>
+ <div id="dcw-status" role="status" aria-live="polite"></div>
+ <section id="dcw-paste" class="dcw-card" aria-label="粘贴图片" hidden><h2>粘贴图片</h2><div id="dcw-paste-preview"></div><label for="dcw-paste-note">补充说明（可选）</label><textarea id="dcw-paste-note" rows="2"></textarea><p id="dcw-paste-message" role="status" aria-live="polite"></p><button id="dcw-paste-upload" type="button" class="primary">上传图片</button><button id="dcw-paste-insert" type="button" class="primary" hidden>插入当前会话</button></section>
+ <section id="dcw-dialog" hidden aria-label="项目操作确认"><h2 id="dcw-dialog-title"></h2><p id="dcw-dialog-note" class="dcw-note"></p><label id="dcw-name-label">项目名称<input id="dcw-name" maxlength="80" placeholder="例如：我的第一个网页"></label><label id="dcw-opening" hidden>使用工具 <select id="dcw-profile"><option value="claude">Claude</option><option value="codex">Codex</option><option value="shell">Shell</option></select></label><div class="dcw-row"><button id="dcw-confirm" class="primary">确定</button><button id="dcw-cancel">取消</button></div></section>
+ <section id="dcw-work">
+  <p id="dcw-saved" class="dcw-note">项目文件会保留，结束练习时会保存项目。</p>
+  <button id="dcw-end">结束练习</button>
+  <input id="dcw-file" type="file" multiple hidden><div id="dcw-uploads"></div>
+  <div id="dcw-file-tabs" class="dcw-tabs" role="tablist" aria-label="文件分类"><button id="dcw-files-project" role="tab" aria-selected="true" aria-controls="dcw-file-results">项目文件</button><button id="dcw-files-uploads" role="tab" aria-selected="false" aria-controls="dcw-file-results" tabindex="-1">上传资料</button><button id="dcw-files-downloads" role="tab" aria-selected="false" aria-controls="dcw-file-results" tabindex="-1">下载记录</button></div>
+  <div id="dcw-file-filters"><input id="dcw-file-search" type="search" aria-label="搜索文件" placeholder="搜索文件名或文件夹"><select id="dcw-file-type" aria-label="文件类型"><option value="all">全部类型</option><option value="code">代码</option><option value="image">图片</option><option value="document">文档</option><option value="data">数据</option><option value="archive">压缩包</option><option value="other">其他</option></select></div>
+  <div class="dcw-row dcw-head"><span id="dcw-file-count" role="status"></span><button id="dcw-file-clear" hidden>清除筛选</button><button id="dcw-refresh">刷新</button></div>
+  <p id="dcw-file-hint" class="dcw-note"></p><div id="dcw-file-results" role="tabpanel"><div id="dcw-files"></div><button id="dcw-files-more" hidden>显示更多</button></div>
+ </section>
+ <section id="dcw-library" hidden><div class="dcw-row dcw-head"><h2>我的项目</h2><button id="dcw-new" class="primary">新建项目</button></div><div id="dcw-projects"></div></section>
+ <section id="dcw-publishing" hidden aria-label="发布作品">
+  <h2>发布作品</h2><p class="dcw-note">先预览网页，确认后提交审核。审核通过后即可分享公开链接。</p>
+  <label>作品标题<input id="dcw-publish-title" maxlength="100" required></label>
+  <label>静态网页文件夹<input id="dcw-publish-dir" value="dist" placeholder="dist"></label>
+  <p class="dcw-note">填写项目内生成网页的文件夹，例如 dist。还没有网页时，请先让 Agent 生成。</p>
+  <label>作品简介（可选）<textarea id="dcw-publish-summary" rows="3" maxlength="500"></textarea></label>
+  <button id="dcw-publish-prepare" class="primary">生成预览</button>
+  <p id="dcw-publish-message" role="status" aria-live="polite"></p>
+  <div id="dcw-publish-result" class="dcw-card" hidden><h2 id="dcw-publish-result-title"></h2><p id="dcw-publish-result-summary"></p><p id="dcw-publish-details" class="dcw-note"></p><a id="dcw-publish-preview" target="_blank" rel="noopener noreferrer" hidden>打开预览</a><p><a id="dcw-publish-public" target="_blank" rel="noopener noreferrer" hidden>打开当前公开作品</a></p></div>
+  <div class="dcw-row"><button id="dcw-publish-submit" class="primary" disabled>确认提交</button><button id="dcw-publish-refresh" hidden>刷新状态</button></div>
+ </section>
+ <p class="dcw-note">可拖入文件上传。同名文件请改名后上传。</p>
+ <details><summary>下载说明</summary><p class="dcw-note">下载不包含密码、环境配置、依赖和缓存等文件。这些文件仍保留在服务器。</p><p id="dcw-excluded" class="dcw-note"></p><p id="dcw-limit" class="dcw-note"></p></details>
+ </div>
+</aside><footer id="dcw-footbar"><span id="dcw-paste-shortcut"></span> · F5 刷新页面</footer><div id="dcw-veil">松手上传文件</div>
+<script>
+(function () {
+ 'use strict';
+ var $ = function(id) { return document.getElementById('dcw-' + id); };
+ var panel=$('panel'), toggle=panel.querySelector('.dcw-toggle'), selected=null, projects=[], busy=false, page='work', filesGeneration=0;
+ var prefix=typeof window.DCW_BASE_PATH==='string'?window.DCW_BASE_PATH.replace(/\/$/,''):'';
+ var base=prefix+'/_dct/projects', selectionKey=prefix?'dcw-project:'+prefix:'dcw-project';
+ if(window.DCW_STUDENT_NAME)panel.setAttribute('aria-label',String(window.DCW_STUDENT_NAME)+'的项目与文件');
+ var presenceStopped=false; async function presence(){if(presenceStopped)return;try{var r=await fetch(prefix+'/_dct/presence',{credentials:'same-origin'});if(r.status===404){presenceStopped=true;$('presence').hidden=true;return;}if(r.ok){var shown=!(await r.json()).assisting;if($('presence').hidden!==shown){$('presence').hidden=shown;fitDrawer();window.dispatchEvent(new Event('resize'));}}}catch(e){}} presence();setInterval(presence,5000);
+ function plainError(message) {return typeof message==='string'&&/[\u3400-\u9fff]/.test(message)?message:'操作未完成，请稍后重试';}
+ function status(text,error) { $('status').textContent=text; $('status').dataset.error=error?'true':'false'; if(error)setCollapsed(false); }
+ function fitDrawer(){var top=panel.getBoundingClientRect().bottom+'px';$('drawer').style.top=top;$('backdrop').style.top=top;}
+ window.addEventListener('resize',fitDrawer);
+ function focusTerminal() { var input=document.querySelector('.xterm-helper-textarea'); if(input) input.focus({preventScroll:true}); }
+ function setCollapsed(on) { panel.classList.toggle('dcw-collapsed',on); toggle.textContent='文件'; toggle.setAttribute('aria-expanded',String(!on)); toggle.setAttribute('aria-label',on?'展开项目面板':'折叠项目面板'); $('backdrop').classList.toggle('dcw-on',!on); fitDrawer(); window.dispatchEvent(new Event('resize')); if(on) focusTerminal(); }
+ setCollapsed(true);
+ toggle.onclick=function(){if(page==='publish')showPage('work');setCollapsed(!panel.classList.contains('dcw-collapsed'));}; $('backdrop').onclick=$('close').onclick=function(){setCollapsed(true);};
+ document.addEventListener('keydown',function(e){if(e.key==='Escape'){if(!$('dialog').hidden && !busy) $('dialog').hidden=true; else if(!panel.classList.contains('dcw-collapsed')) setCollapsed(true);}});
+ // Keep fitting through late xterm/font mounting; absent or zero-sized terminals
+ // must never count as a stable fit. Require at least one second of settling.
+ (function(){var last=-1,stable=0,rounds=0;var timer=setInterval(function(){window.dispatchEvent(new Event('resize'));var el=document.querySelector('.xterm-screen');var w=el?Math.round(el.getBoundingClientRect().width):0;stable=w>0&&w===last?stable+1:0;last=w;if(++rounds>=15||(rounds>=5&&stable>=2))clearInterval(timer);},200);})();
+ function url(id,suffix) {return base+'/'+encodeURIComponent(id)+(suffix||'');}
+ async function request(path,options) {var response=await fetch(path,Object.assign({credentials:'same-origin'},options));if(!response.ok){var message='请求失败，请重试';try{message=(await response.json()).error||message;}catch(e){}throw new Error(plainError(message));}return response;}
+ async function json(path,body) {return (await request(path,body===undefined?undefined:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();}
+ function setBusy(on) {busy=on;panel.querySelectorAll('button,input,select,textarea').forEach(function(el){if(el!==toggle&&el!==$('close')&&el!==$('theme'))el.disabled=on;});publishControls();}
+ async function action(fn) {if(busy)return;setBusy(true);status('正在处理…');try{await fn();}catch(e){status(plainError(e.message),true);}finally{setBusy(false);}}
+ function showPage(next) {page=next;$('work').hidden=next!=='work';$('library').hidden=next!=='library';$('publishing').hidden=next!=='publish';['work','library'].forEach(function(p){$('nav-'+p).setAttribute('aria-selected',String(p===next));});}
+ function savedText(p) {return p.saved_at?'最近保存：'+new Date(p.saved_at*1000).toLocaleString('zh-CN'):'项目文件会保留';}
+ function element(tag,text,cls) {var el=document.createElement(tag);el.textContent=text;if(cls)el.className=cls;return el;}
+ function button(text,fn) {var el=element('button',text);el.type='button';el.onclick=fn;el.disabled=busy;return el;}
+ function current() {return projects.find(function(p){return p.id===selected;});}
+ function render() {var p=current();$('project-name').textContent=p?p.name:'暂无项目';$('saved').textContent=p?'项目文件会保留，结束练习时会保存项目。':'请到“我的项目”新建项目';$('projects').replaceChildren();projects.forEach(function(p){var card=element('article','','dcw-card');card.append(element('h2',p.name),element('p',savedText(p),'dcw-note'));var row=element('div','','dcw-row');row.append(button('打开项目',function(){action(async function(){await select(p.id);dialog('continue');});}),button('下载',function(){action(function(){return download(p);});}));card.append(row);$('projects').append(card);});}
+ async function loadProjects() {var data=await json(base);projects=data.projects;var remembered;try{remembered=sessionStorage.getItem(selectionKey);}catch(e){}if(!current())selected=projects.some(function(p){return p.id===remembered;})?remembered:(projects[0]||{}).id;render();$('limit').textContent=data.max_archive_bytes?'下载大小上限：'+size(data.max_archive_bytes):'';}
+ async function select(id) {if(selected!==id)resetPublishing();selected=id;fileSource='project';clearFilters();$('uploads').replaceChildren();try{sessionStorage.setItem(selectionKey,id);}catch(e){}render();showPage('work');await loadFiles();}
+ function size(n) {return n>=1048576?(n/1048576).toFixed(1)+' MB':n>=1024?(n/1024).toFixed(1)+' KB':n+' B';}
+ var fileEntries=[],fileSource='project',fileLimit=100;
+ var identity=prefix.match(/^\/w\/([^/]+)/)||prefix.match(/^\/admin\/workspaces\/([^/]+)/);
+ var historyKey='dcw-downloads:'+(identity?identity[1]:'shared'),downloads=[];
+ try{var saved=JSON.parse(localStorage.getItem(historyKey)||'[]');if(Array.isArray(saved))downloads=saved.filter(function(r){return r&&typeof r.project==='string'&&typeof r.name==='string'&&(r.path===null||typeof r.path==='string')&&Number.isFinite(r.at);}).slice(0,50);}catch(e){}
+ function fileType(name){
+  var ext=name.split('.').pop().toLowerCase();
+  var groups={code:['mjs','cjs','astro','php','rb','swift','kt','kts','lua','r','dart','ex','exs','bash','zsh','js','jsx','ts','tsx','html','htm','css','scss','vue','svelte','py','rs','go','java','c','h','cpp','cs','sh','sql','ipynb'],image:['png','jpg','jpeg','gif','svg','webp','avif','ico','bmp','heic'],document:['md','txt','pdf','doc','docx','ppt','pptx','rtf','odt'],data:['csv','tsv','json','jsonl','xlsx','xls','yaml','yml','xml','toml'],archive:['zip','tar','gz','tgz','7z','rar']};
+  return Object.keys(groups).find(function(k){return groups[k].includes(ext);})||'other';
+ }
+ function clearFilters(){ $('file-search').value='';$('file-type').value='all';fileLimit=100; }
+ function source(next){fileSource=next;clearFilters();renderFiles();}
+ function rememberDownload(p,path,name){
+  var record={project:p.id,path:path||null,name:name,at:Date.now()};
+  downloads=downloads.filter(function(r){return r.project!==record.project||r.path!==record.path;});downloads.unshift(record);downloads=downloads.slice(0,50);
+  try{localStorage.setItem(historyKey,JSON.stringify(downloads));}catch(e){}
+  if(fileSource==='downloads')renderFiles();
+ }
+ function renderFiles(){
+  ['project','uploads','downloads'].forEach(function(k){$('files-'+k).setAttribute('aria-selected',String(k===fileSource));$('files-'+k).tabIndex=k===fileSource?0:-1;});
+  var rows=fileSource==='downloads'?downloads.filter(function(r){return r.project===selected;}):fileEntries.filter(function(f){return f.path.startsWith('uploads/')===(fileSource==='uploads');});
+  var query=$('file-search').value.trim().toLocaleLowerCase(),type=$('file-type').value;
+  var matches=rows.filter(function(f){var name=f.name||f.path;return (!query||(name+' '+(f.path||'')).toLocaleLowerCase().includes(query))&&(type==='all'||fileType(name)===type);});
+  $('files').replaceChildren();$('file-count').textContent=matches.length+' / '+rows.length+' 项';$('file-clear').hidden=!query&&type==='all';
+  $('file-hint').textContent=fileSource==='downloads'?'本浏览器最近 50 条下载记录；再次下载获取最新文件。':fileSource==='uploads'?'上传资料保存在 uploads 文件夹，可让 Agent 从这里读取。':'当前项目的代码与作品；上传资料单独存放。';
+  $('file-results').setAttribute('aria-labelledby','dcw-files-'+fileSource);
+  var owner=current();
+  matches.slice(0,fileLimit).forEach(function(f){
+   var path=f.path,name=f.name||(path.split('/').pop()),folder=path&&path.includes('/')?path.slice(0,path.lastIndexOf('/')):'项目根目录';
+   if(fileSource==='uploads')folder=folder==='uploads'?'上传资料':folder.replace(/^uploads\//,'');
+   var row=element('div','','dcw-file'),info=element('div','','dcw-file-info');
+   info.append(element('strong',name,'dcw-file-name'),element('div',fileSource==='downloads'?new Date(f.at).toLocaleString('zh-CN')+' · 已发起下载':folder+' · '+size(f.size),'dcw-note'));
+   var downloadButton=button(fileSource==='downloads'?'再次下载':'下载',function(){action(function(){return download(owner,path);});});
+   downloadButton.setAttribute('aria-label',(fileSource==='downloads'?'再次下载':'下载')+' '+name);
+   row.append(info,downloadButton);$('files').append(row);
+  });
+  if(!matches.length){
+   var message=rows.length?'没有匹配的文件，试试清除筛选。':fileSource==='downloads'?'还没有下载记录。':fileSource==='uploads'?'还没有上传资料，点击顶部“上传”即可添加。':'还没有项目文件，让 Agent 开始创建吧。';
+   $('files').append(element('p',message,'dcw-note'));
+  }
+  $('files-more').hidden=matches.length<=fileLimit;
+ }
+ ['project','uploads','downloads'].forEach(function(k,i){var tab=$('files-'+k);tab.onclick=function(){source(k);};tab.onkeydown=function(e){if(e.key==='ArrowRight'||e.key==='ArrowLeft'){e.preventDefault();var next=['project','uploads','downloads'][(i+(e.key==='ArrowRight'?1:2))%3];source(next);$('files-'+next).focus();}};});
+ $('file-search').oninput=$('file-type').onchange=function(){fileLimit=100;renderFiles();};
+ $('file-clear').onclick=function(){clearFilters();renderFiles();$('file-search').focus();};
+ $('files-more').onclick=function(){fileLimit+=100;renderFiles();};
+ async function loadFiles(){
+  var id=selected,generation=++filesGeneration;fileEntries=[];renderFiles();if(!id)return;
+  var data=await json(url(id,'/files'));if(id!==selected||generation!==filesGeneration)return;
+  fileEntries=data.files;renderFiles();$('excluded').textContent=data.excluded.length?'本次排除：'+data.excluded.join('、'):'';
+ }
+ async function download(p,path) {if(!p)throw new Error('请先选择项目');status(path?'正在下载文件…':'正在准备项目下载…');var response=await request(url(p.id,path?'/file?path='+encodeURIComponent(path):'/download'));var blob=await response.blob();var href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download=path?path.split('/').pop():p.name+'.zip';document.body.append(a);a.click();rememberDownload(p,path,a.download);a.remove();setTimeout(function(){URL.revokeObjectURL(href);},60000);status('下载文件已准备完成，已交给浏览器。');if(!path)await loadProjects();}
+ function requireProject() {var p=current();if(!p)throw new Error('请先新建或选择项目');return p;}
+ var publishingBase=prefix+'/_dct/publish',publishVersion=null,publishData=null,publishVerified=false;
+ function publishControls(){
+  $('publish-submit').disabled=busy||!publishVerified||!publishData||publishData.status!=='prepared';
+  $('publish-refresh').hidden=!publishVersion;
+ }
+ function publishMessage(text,error){$('publish-message').textContent=text;$('publish-message').dataset.error=error?'true':'false';}
+ function publishLink(id,value){
+  var link=$(id);link.hidden=true;link.removeAttribute('href');
+  if(typeof value!=='string'||!value)return null;
+  try{var target=new URL(value,location.href);if(!['http:','https:'].includes(target.protocol))return null;link.href=target.href;link.hidden=false;return target.href;}catch(e){return null;}
+ }
+ function resetPublishing(){
+  publishVersion=null;publishData=null;publishVerified=false;$('publish-title').value='';$('publish-dir').value='dist';$('publish-summary').value='';$('publish-result').hidden=true;publishMessage('');publishControls();
+ }
+ function displayPublishing(data){
+  if(!data||!['prepared','pending','approved','rejected'].includes(data.status)||!publishVersion)throw new Error('发布状态不完整，请刷新重试');
+  publishData=data;publishVerified=true;
+  $('publish-result').hidden=false;
+  $('publish-result-title').textContent=typeof data.title==='string'?data.title:$('publish-title').value;
+  $('publish-result-summary').textContent=typeof data.summary==='string'?data.summary:$('publish-summary').value;
+  if(typeof data.title==='string')$('publish-title').value=data.title;
+  if(typeof data.summary==='string')$('publish-summary').value=data.summary;
+  if(typeof data.dir==='string')$('publish-dir').value=data.dir;
+  $('publish-details').textContent=Number.isFinite(data.files)&&Number.isFinite(data.bytes)?data.files+' 个文件 · '+size(data.bytes):'';
+  publishLink('publish-preview',data.previewUrl);publishLink('publish-public',data.projectUrl);
+  publishMessage({prepared:'预览已准备好，请查看后确认提交',pending:'已提交，等待审核',approved:'审核通过，作品已公开',rejected:'未通过审核，请修改作品后重新生成预览'}[data.status]);publishControls();
+ }
+ async function publishingAction(fn){
+  if(busy)return;setBusy(true);status('');publishMessage('正在处理…');
+  try{await fn();}catch(e){publishMessage(plainError(e.message),true);setCollapsed(false);}finally{setBusy(false);}
+ }
+ async function loadPublishing(){
+  publishVerified=false;publishControls();
+  var data=await json(publishingBase+'/status?version='+encodeURIComponent(publishVersion));
+  if(data.version!==publishVersion)throw new Error('发布版本不一致，请重新打开确认链接');
+  displayPublishing(data);
+ }
+ $('publish').onclick=function(){
+  showPage('publish');$('dialog').hidden=true;setCollapsed(false);
+  if(!$('publish-title').value&&current())$('publish-title').value=current().name;
+ };
+ ['title','dir','summary'].forEach(function(field){$('publish-'+field).oninput=function(){
+  publishVersion=null;publishData=null;publishVerified=false;$('publish-result').hidden=true;publishMessage('内容已修改，请重新生成预览');publishControls();
+ };});
+ $('publish-prepare').onclick=function(){
+  if(busy)return;
+  var title=$('publish-title').value.trim();if(!title){publishMessage('请输入作品标题',true);$('publish-title').focus();return;}
+  var p=current();if(!p){publishMessage('请先新建或选择项目',true);return;}
+  var body={projectId:p.id,dir:$('publish-dir').value.trim()||'dist',title:title,summary:$('publish-summary').value.trim()};
+  // Open during the click so browsers allow the preview tab after preparation.
+  var preview=window.open('about:blank','_blank');if(preview){preview.opener=null;preview.document.body.textContent='正在准备预览…';}
+  publishingAction(async function(){
+   publishVersion=null;publishData=null;publishVerified=false;$('publish-result').hidden=true;publishControls();
+   try{
+    var data=await json(publishingBase+'/prepare',body);
+    if(!data||!/^[a-f0-9]{32}$/.test(data.version)||data.status!=='prepared')throw new Error('预览信息不完整，请重新生成');
+    publishVersion=data.version;displayPublishing(data);
+    var href=$('publish-preview').getAttribute('href');if(preview){if(href)preview.location.replace(href);else preview.close();}
+   }catch(e){if(preview)preview.close();throw e;}
+  });
+ };
+ $('publish-submit').onclick=function(){
+  if(!publishVerified||!publishData||publishData.status!=='prepared')return;
+  publishingAction(async function(){var result=await json(publishingBase+'/submit',{version:publishVersion});displayPublishing(Object.assign({},publishData,result));});
+ };
+ $('publish-refresh').onclick=function(){if(publishVersion)publishingAction(loadPublishing);};
+ function updateSaved(p,data) {p.saved_at=data.saved_at;render();}
+ $('nav-work').onclick=function(){showPage('work');};$('nav-library').onclick=function(){action(async function(){await loadProjects();showPage('library');setCollapsed(false);status('');});};
+ $('refresh').onclick=function(){action(async function(){await loadFiles();status('文件列表已刷新');});};
+ $('download').onclick=function(){action(function(){return download(requireProject());});};
+ function dialog(kind) {$('dialog').hidden=false;$('dialog-title').textContent=kind==='new'?'新建项目':kind==='continue'?'打开项目':'结束本次练习？';$('dialog-note').textContent=kind==='new'?'给你的项目起个名字。':kind==='continue'?'选择工具后，在终端看板中进入会话。':'保存项目并结束本次练习，文件会保留。';$('name-label').hidden=kind!=='new';$('opening').hidden=kind!=='continue';$('confirm').textContent=kind==='new'?'创建项目':kind==='continue'?'打开':'保存并结束';$('confirm').onclick=function(){action(async function(){if(kind==='new'){var name=$('name').value.trim();if(!name)throw new Error('请输入项目名称');var p=await json(base,{name:name});await loadProjects();await select(p.id);$('name').value='';dialog('continue');status('项目已创建。');return;}else if(kind==='continue'){var p=requireProject();await json(url(p.id,'/continue'),{profile:$('profile').value});status('项目已打开，请在终端看板中进入会话。');}else{if(window.DCW_MANAGED_STUDENT){await json(prefix+'/finish',{});location.href=prefix+'/?finished=1';return;}var p=requireProject();updateSaved(p,await json(url(p.id,'/end'),{}));await loadProjects();showPage('library');status('本次练习已结束，项目已保存。');}$('dialog').hidden=true;});};(kind==='new'?$('name'):$('confirm')).focus();}
+ $('new').onclick=function(){dialog('new');};$('end').onclick=function(){if(current())dialog('end');else status('请先选择项目',true);};$('cancel').onclick=function(){$('dialog').hidden=true;};
+ function upload(file,id) {return new Promise(function(resolve,reject){var row=element('div','','dcw-card'),bar=document.createElement('progress'),note=element('span','等待上传','dcw-note');bar.max=1;bar.value=0;row.append(element('div',file.name),bar,note);$('uploads').prepend(row);var xhr=new XMLHttpRequest();xhr.open('POST',url(id,'/upload?name='+encodeURIComponent(file.name)));xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.upload.onprogress=function(e){if(e.lengthComputable){bar.value=e.loaded/e.total;note.textContent=Math.round(bar.value*100)+'% · 等待服务器确认';}};xhr.onload=function(){bar.remove();if(xhr.status>=200&&xhr.status<300){note.textContent='上传成功';resolve();}else{var message='上传失败，请重试';try{message=JSON.parse(xhr.responseText).error||message;}catch(e){}note.textContent=plainError(message);reject(new Error(note.textContent));}};xhr.onerror=xhr.onabort=function(){bar.remove();note.textContent='连接中断，未完成上传';reject(new Error(note.textContent));};xhr.send(file);});}
+ function sendAll(files) {if(busy)return;var batch=Array.from(files);if(!batch.length)return;action(async function(){var p=requireProject();showPage('work');setCollapsed(false);$('uploads').replaceChildren();source('uploads');var failures=[];for(var file of batch){try{await upload(file,p.id);}catch(e){failures.push(e.message);}}await loadFiles();if(!failures.length)$('uploads').replaceChildren();status(failures.length?'部分文件上传失败：'+failures.join('；'):'上传完成，文件列表已刷新。',!!failures.length);});}
+ $('drop').onclick=function(){$('file').click();};$('file').onchange=function(){sendAll(this.files);this.value='';};
+ // The browser owns its clipboard. Never ask the Linux container to read it.
+ var pasteKey=/Mac|iPhone|iPad|iPod/i.test(navigator.platform||navigator.userAgent)?'⌘V':'Ctrl+V';
+ $('paste-shortcut').textContent=pasteKey+' 粘贴文字或图片';
+ var pasted=[],pasteProject=null,pasteUploading=false;
+ function pasteMessage(text,error){$('paste-message').textContent=text;$('paste-message').dataset.error=error?'true':'false';}
+ function clearPasted(){pasted.forEach(function(p){URL.revokeObjectURL(p.preview);});pasted=[];pasteProject=null;$('paste-preview').replaceChildren();$('paste-note').value='';$('paste').hidden=true;}
+ function renderPasted(){
+  $('paste-preview').replaceChildren();
+  pasted.forEach(function(p){var row=element('div','','dcw-row'),img=document.createElement('img');img.src=p.preview;img.alt='待发送图片';var remove=button('移除图片',function(){URL.revokeObjectURL(p.preview);pasted=pasted.filter(function(item){return item!==p;});renderPasted();});remove.disabled=pasteUploading;row.append(img,remove);$('paste-preview').append(row);});
+  var ready=pasted.length>0&&pasted.every(function(p){return p.uploaded;});
+  $('paste').hidden=!pasted.length;$('paste-upload').hidden=ready;$('paste-upload').disabled=pasteUploading||busy;$('paste-insert').hidden=!ready;
+ }
+ document.addEventListener('paste',function(e){
+  if(!e.target.closest||!e.target.closest('#terminal-container')||!e.clipboardData)return;
+  var images=Array.from(e.clipboardData.items||[]).filter(function(item){return item.kind==='file'&&/^image\//.test(item.type);}).map(function(item){return item.getAsFile();}).filter(Boolean);
+  if(!images.length)return; // xterm continues to handle text paste, including multiline text.
+  e.preventDefault();e.stopImmediatePropagation();
+  setCollapsed(false);showPage('work');
+  if(busy||pasteUploading){pasteMessage('正在上传，请稍后再粘贴图片',true);return;}
+  var project=current();if(!project){status('请先选择项目，再粘贴图片',true);return;}
+  if(images.some(function(file){return !/^image\/(png|jpeg|gif|webp)$/.test(file.type)||file.size>64*1024*1024;})){status('请粘贴 PNG、JPEG、GIF 或 WebP 图片，单张不超过 64 MiB',true);return;}
+  if(pasted.length+images.length>8){pasteMessage('一次最多准备 8 张图片，请先处理已有图片',true);return;}
+  if(pasteProject&&pasteProject.id!==project.id)clearPasted();
+  pasteProject={id:project.id,dir:project.dir};
+  images.forEach(function(file){var ext=file.type==='image/jpeg'?'jpg':file.type.split('/')[1];var name='paste-'+crypto.randomUUID()+'.'+ext;pasted.push({file:new File([file],name,{type:file.type}),preview:URL.createObjectURL(file),uploaded:false});});
+  var text=e.clipboardData.getData('text/plain');if(text)$('paste-note').value+=text;
+  renderPasted();pasteMessage('图片尚未发送。上传后可插入当前会话，再按 Enter 发送。');
+ },true);
+ // F5 stays a browser refresh, even when xterm has focus. Do not cancel its default.
+ document.addEventListener('keydown',function(e){if(e.key==='F5')e.stopImmediatePropagation();},true);
+ $('paste-upload').onclick=async function(){
+  if(busy||pasteUploading||!pasted.length)return;
+  if(!current()||current().id!==pasteProject.id){pasteMessage('项目已切换，请回到原项目或重新粘贴图片',true);return;}
+  pasteUploading=true;setBusy(true);renderPasted();pasteMessage('正在上传图片…');
+  try{
+   for(var item of pasted){if(item.uploaded)continue;await upload(item.file,pasteProject.id);item.uploaded=true;}
+   pasteMessage('图片已上传。请确认终端已进入目标会话，再点击插入。');
+  }catch(e){pasteMessage(plainError(e.message),true);}
+  finally{pasteUploading=false;setBusy(false);renderPasted();}
+ };
+ $('paste-insert').onclick=function(){
+  if(busy||pasteUploading||!pasted.length||pasted.some(function(p){return !p.uploaded;}))return;
+  if(!current()||current().id!==pasteProject.id){pasteMessage('项目已切换，请回到原项目再插入图片',true);return;}
+  if(!window.term||typeof window.term.paste!=='function'||window.term.options&&window.term.options.disableStdin){pasteMessage('终端尚未连接，请连接后再插入图片',true);return;}
+  var dir=pasteProject.dir;
+  if(typeof dir!=='string'||dir[0]!=='/'||/[\x00-\x1f\x7f]/.test(dir)){pasteMessage('无法确认图片路径，请重新打开项目',true);return;}
+  var paths=pasted.map(function(p){return "'"+(dir.replace(/\/$/,'')+'/uploads/'+p.file.name).replace(/'/g,"'\\''")+"'";});
+  var note=$('paste-note').value.replace(/[\x00-\x1f\x7f]+/g,' ').trim();
+  window.term.paste(paths.join(' ')+(note?' '+note:''));
+  clearPasted();setCollapsed(true);focusTerminal();
+  $('paste-shortcut').textContent=pasteKey+' 粘贴文字或图片 · 已插入，请检查后按 Enter 发送';
+ };
 
-<aside id="dcw-panel">
-  <button class="dcw-toggle" type="button" title="折叠 / 展开">⟩</button>
-  <div class="dcw-title">上传文件</div>
-  <div class="dcw-note">拖到窗口任何地方都行。文件会落在 <code>uploads/</code>。</div>
-  <div id="dcw-drop">把文件拖进来<br><span class="dcw-note">或点这里选择</span></div>
-  <input id="dcw-file" type="file" multiple hidden>
-  <div id="dcw-list"></div>
-</aside>
-<div id="dcw-veil">松手就传到 uploads/</div>
-
+ var depth=0;function hasFiles(e){return e.dataTransfer&&Array.from(e.dataTransfer.types||[]).includes('Files');}
+ window.addEventListener('dragenter',function(e){if(hasFiles(e)&&!busy){depth++;$('veil').classList.add('dcw-on');}});
+ window.addEventListener('dragover',function(e){if(hasFiles(e)){e.preventDefault();e.dataTransfer.dropEffect=busy?'none':'copy';}});
+ window.addEventListener('dragleave',function(e){if(hasFiles(e)&&--depth<=0){depth=0;$('veil').classList.remove('dcw-on');}});
+ window.addEventListener('drop',function(e){if(hasFiles(e)){e.preventDefault();depth=0;$('veil').classList.remove('dcw-on');sendAll(e.dataTransfer.files);}});
+ action(async function(){
+  await loadProjects();await loadFiles();if(!current()){showPage('library');setCollapsed(false);}status('');
+  var requestedVersion=new URLSearchParams(location.search).get('publish');
+  if(requestedVersion!==null){
+   showPage('publish');setCollapsed(false);
+   if(!/^[a-f0-9]{32}$/.test(requestedVersion)){publishMessage('确认链接不完整，请重新打开 Agent 提供的链接',true);return;}
+   publishVersion=requestedVersion;publishMessage('正在读取作品…');
+   try{await loadPublishing();}catch(e){publishMessage(plainError(e.message),true);}
+  }
+ });
+})();
+</script>
 <script>
 (function () {
   'use strict';
-
-  // 所有会被人看见的字，集中在这里。见文件顶上那段说明。
-  var S = {
-    collapsed: '⟨',
-    expanded: '⟩',
-    done: '已放进 uploads/',
-    tooBig: '太大了，单个文件上限 64 MB',
-    noName: '这个文件名不能用（不能带斜杠、不能以点开头）',
-    noLength: '浏览器没说文件多大，传不了',
-    failed: '没传上去',
-    broke: '连接断了，没传完',
-    // 半截文件比没有文件更坏，所以服务端不会留下它——这句是说给用户听的。
-    retry: '重试一次试试'
-  };
-
-  var UPLOAD_URL = '/_dct/upload?name=';
-  var panel = document.getElementById('dcw-panel');
-  var list = document.getElementById('dcw-list');
-  var drop = document.getElementById('dcw-drop');
-  var picker = document.getElementById('dcw-file');
-  var veil = document.getElementById('dcw-veil');
-  var toggle = panel.querySelector('.dcw-toggle');
-
-  // ---- 折叠 -------------------------------------------------------------
-  // 记住选择：这是每个人自己的偏好，存在他自己的浏览器里就够了。读写都包在
-  // try 里——无痕窗口、禁了站点数据的浏览器上，取存储本身就会抛。
-  function setCollapsed(on) {
-    panel.classList.toggle('dcw-collapsed', on);
-    toggle.textContent = on ? S.collapsed : S.expanded;
-    try { localStorage.setItem('dcw-collapsed', on ? '1' : '0'); } catch (e) {}
-    // xterm 的 fit 挂在 window 的 resize 上。宽度是我们改的，浏览器不会替
-    // 我们发这个事件——不补一下，终端就还按旧宽度画，右边空一条。
+  var panel=document.getElementById('dcw-panel'),button=document.getElementById('dcw-theme');
+  var prefix=typeof window.DCW_BASE_PATH==='string'?window.DCW_BASE_PATH:'';
+  var student=prefix.match(/^\/w\/([^/]+)/)||prefix.match(/^\/admin\/workspaces\/([^/]+)/);
+  var key='dcw-appearance:'+(student?student[1]:'shared'),chosen=null,nativeTheme='dark';
+  function valid(value){return value==='light'||value==='dark'?value:null;}
+  try{chosen=valid(localStorage.getItem(key));}catch(e){}
+  function apply(){
+    var theme=chosen||nativeTheme,light=theme==='light',terminal=document.getElementById('terminal-container');
+    panel.dataset.theme=theme;
+    document.getElementById("dcw-footbar").dataset.theme=theme;
+    document.documentElement.style.colorScheme=theme;
+    document.body.style.backgroundColor=light?'#f5f6f8':'#191c23';
+    // xterm may use a WebGL canvas and agents may emit explicit RGB cells.
+    // Transform the rendered terminal as one surface, including its cursor and
+    // selection. This preserves running sessions and never injects terminal input.
+    // When the agent already matches the requested appearance, leave it untouched.
+    if(terminal)terminal.dataset.dcwInvert=String(theme!==nativeTheme);
+    button.textContent=light?'☾':'☀';
+    button.setAttribute('aria-label',light?'切换到深色':'切换到浅色');
+    button.title=button.getAttribute('aria-label');
+  }
+  button.onclick=function(){
+    chosen=(chosen||nativeTheme)==='light'?'dark':'light';
+    try{localStorage.setItem(key,chosen);}catch(e){}
+    apply();
     window.dispatchEvent(new Event('resize'));
+  };
+  window.addEventListener('storage',function(e){if(e.key===key||e.key===null){chosen=valid(e.newValue);apply();}});
+  apply();
+  var mounting=new MutationObserver(watchTheme);
+  function watchTheme(){
+    var viewport=document.querySelector('.xterm-viewport');
+    if(!viewport)return;
+    mounting.disconnect();
+    function sync(){
+      var rgb=getComputedStyle(viewport).backgroundColor.match(/[\d.]+/g);
+      if(!rgb||rgb.length<3)return;
+      nativeTheme=Number(rgb[0])*0.2126+Number(rgb[1])*0.7152+Number(rgb[2])*0.0722>128?'light':'dark';
+      apply();
+    }
+    new MutationObserver(sync).observe(viewport,{attributes:true,attributeFilter:['style','class']});
+    sync();
   }
-  var startCollapsed = false;
-  try { startCollapsed = localStorage.getItem('dcw-collapsed') === '1'; } catch (e) {}
-  setCollapsed(startCollapsed);
-  toggle.addEventListener('click', function () {
-    setCollapsed(!panel.classList.contains('dcw-collapsed'));
-  });
-
-  // **首次加载要一直补 resize，直到 xterm 的贴合结果不再变。**
-  //
-  // 现象（2026-09-10 在 s1.dct.tzspace.cn 上实测）：首次进来终端是 2219px，
-  // 而容器有 2297px；把面板折叠再展开一次，它就变成 2268px 并从此稳住。
-  // 差的那 49px 约 5 列——**首次那一次贴合算少了**，学生看到的是一个莫名
-  // 其妙窄一截的终端，而他不会知道，只会觉得「这个终端有点怪」。
-  //
-  // 走过的两条错路，写下来免得有人再走一遍：
-  //
-  // 1. 以为是「我们的 CSS 比 xterm 的首次贴合晚生效」，于是在 `load` 和
-  //    300ms 各补一次 resize。**没用**——那两个时刻 fit 算出来的仍是 2219。
-  // 2. 以为是 flex 的反馈环（`flex:1 1 auto` 的基准取自内容宽度，而内容
-  //    宽度又由 fit 按容器宽度算）。**也不是**——容器在两种状态下都是
-  //    2297px，变的只有终端本身。
-  //
-  // 真实情况是：正确的结果要过一段时间才算得出来（300ms 时还不行），而
-  // 一旦补上一次晚一点的 resize 就对了，并且此后稳定。既然拿不准那个时间
-  // 点，就不要猜——**补到它不再变为止**。
-  //
-  // 循环自己会停：连续两次量到一样就收工，最多 15 轮。fit 是幂等的，多发
-  // 几次 resize 什么都不会发生，代价只有开头两秒里终端重排一下。
-  (function settleFit() {
-    var last = -1;
-    var stable = 0;
-    var rounds = 0;
-    var timer = setInterval(function () {
-      window.dispatchEvent(new Event('resize'));
-      var el = document.querySelector('.xterm-screen');
-      var w = el ? Math.round(el.getBoundingClientRect().width) : -1;
-      stable = (w === last) ? stable + 1 : 0;
-      last = w;
-      if (++rounds >= 15 || stable >= 2) clearInterval(timer);
-    }, 200);
-  })();
-
-  // ---- 一条上传的进度行 --------------------------------------------------
-  function row(name) {
-    var el = document.createElement('div');
-    el.className = 'dcw-item';
-    var n = document.createElement('span');
-    n.className = 'dcw-name';
-    n.textContent = name;          // textContent，不是 innerHTML：文件名来自用户
-    var bar = document.createElement('div');
-    bar.className = 'dcw-bar';
-    var fill = document.createElement('i');
-    bar.appendChild(fill);
-    var msg = document.createElement('span');
-    msg.className = 'dcw-note';
-    el.appendChild(n);
-    el.appendChild(bar);
-    el.appendChild(msg);
-    list.insertBefore(el, list.firstChild);
-    return {
-      progress: function (f) { fill.style.width = Math.round(f * 100) + '%'; },
-      ok: function (text) { bar.remove(); msg.className = 'dcw-ok'; msg.textContent = text; },
-      fail: function (text) { bar.remove(); msg.className = 'dcw-err'; msg.textContent = text; }
-    };
-  }
-
-  // 服务端的状态码翻成人话。**不把状态码本身给学生看**——「413」对他没有
-  // 任何意义，「太大了，上限 64 MB」才是他能据此行动的东西。
-  function reason(status) {
-    if (status === 413) return S.tooBig;
-    if (status === 400) return S.noName;
-    if (status === 411) return S.noLength;
-    return S.failed;
-  }
-
-  function send(file) {
-    var r = row(file.name);
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', UPLOAD_URL + encodeURIComponent(file.name));
-    xhr.upload.addEventListener('progress', function (e) {
-      if (e.lengthComputable) r.progress(e.loaded / e.total);
-    });
-    xhr.addEventListener('load', function () {
-      if (xhr.status === 201) r.ok(S.done);
-      else r.fail(reason(xhr.status));
-    });
-    // 断线跟「服务端拒绝」要分开说：一个是重试有用，一个是重试没用。
-    xhr.addEventListener('error', function () { r.fail(S.broke + ' · ' + S.retry); });
-    xhr.addEventListener('abort', function () { r.fail(S.broke); });
-    xhr.send(file);
-  }
-
-  function sendAll(files) {
-    for (var i = 0; i < files.length; i++) send(files[i]);
-  }
-
-  // ---- 选文件 ------------------------------------------------------------
-  drop.addEventListener('click', function () { picker.click(); });
-  picker.addEventListener('change', function () {
-    sendAll(picker.files);
-    picker.value = '';   // 清掉，否则同一个文件选第二次不触发 change
-  });
-
-  // ---- 拖放 --------------------------------------------------------------
-  // 挂在 window 上，**整页都是拖放区**：学生的直觉是把文件丢到终端上，
-  // 而不是先找到右边那个框。
-  //
-  // dragenter/dragleave 会在子元素之间来回冒泡，光靠它们那层遮罩会闪。
-  // 用一个计数器记「现在还在几层里面」，归零才收——这是这类遮罩的通行做法。
-  var depth = 0;
-  function hasFiles(e) {
-    var t = e.dataTransfer;
-    if (!t || !t.types) return false;
-    for (var i = 0; i < t.types.length; i++) if (t.types[i] === 'Files') return true;
-    return false;
-  }
-  window.addEventListener('dragenter', function (e) {
-    if (!hasFiles(e)) return;
-    depth++;
-    veil.classList.add('dcw-on');
-  });
-  window.addEventListener('dragover', function (e) {
-    if (!hasFiles(e)) return;
-    e.preventDefault();                    // 不拦的话浏览器会直接打开这个文件
-    e.dataTransfer.dropEffect = 'copy';
-  });
-  window.addEventListener('dragleave', function (e) {
-    if (!hasFiles(e)) return;
-    depth = Math.max(0, depth - 1);
-    if (depth === 0) veil.classList.remove('dcw-on');
-  });
-  window.addEventListener('drop', function (e) {
-    if (!hasFiles(e)) return;
-    e.preventDefault();
-    depth = 0;
-    veil.classList.remove('dcw-on');
-    sendAll(e.dataTransfer.files);
-  });
-  drop.addEventListener('dragenter', function () { drop.classList.add('dcw-over'); });
-  drop.addEventListener('dragleave', function () { drop.classList.remove('dcw-over'); });
-  drop.addEventListener('drop', function () { drop.classList.remove('dcw-over'); });
+  mounting.observe(document.body,{childList:true,subtree:true});
+  watchTheme();
 })();
 </script>

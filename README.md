@@ -664,6 +664,12 @@ running there asks for it, so click-and-drag text selection and copying work
 exactly as they always do. The cost is that the wheel no longer scrolls `dct`'s
 own history in those sessions; use `PageUp`/`PageDown`/`End` instead.
 
+Visible `http://` and `https://` addresses within a screen row are emitted as terminal
+hyperlinks. Use your terminal's open-link gesture (usually Cmd-click or Ctrl-click).
+If the agent captures the mouse, press `F4` first. This also works in browser
+terminals that support OSC 8. Links hidden behind labels and URLs split across
+rows are not recovered from the current text-only screen snapshots.
+
 To copy inside a session where the agent wants the mouse, press `F4` to enter
 copy mode: the mouse goes back to the terminal, the bottom bar says so, and
 pressing `F4` again leaves it once you're done. You can also use your terminal's

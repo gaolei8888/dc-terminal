@@ -40,6 +40,7 @@ qrcode = { version = "0.14.1", default-features = false }
 # 「整棵依赖树里一行 C 都没有」这条性质是 Windows 上不用装 Visual Studio
 # Build Tools 的全部理由，不能为了一个哈希把它丢掉。
 sha2 = "0.10"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 rqrr = "0.10.1"

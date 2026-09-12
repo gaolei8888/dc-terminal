@@ -48,28 +48,15 @@
 //!
 //! ## 明说的两条边界
 //!
-//! **一、鉴权是一条 TCP 连接查一次，在它的第一个请求上。** 之后这条连接就是
-//! 一根字节管道，我们不再解析里面的东西。这是有意的：要每个请求都查，就得
-//! 完整地解析 HTTP 的消息边界（`Content-Length`、chunked、pipelining），
-//! 而那正是 `web/mod.rs` 顶上「不引框架、把支持的子集写清楚」拒绝去做的事。
+//! **一、鉴权和路由在每条 TCP 连接的第一个请求上进行。** WebSocket 升级
+//! 请求原样转发，随后双向传输。普通 HTTP 请求强制向上游发送
+//! `Connection: close`，上游响应后关闭连接；浏览器下次请求重新经过鉴权和
+//! 本地项目路由。否则浏览器直连时复用 ttyd 连接，会把项目 API 错送到 ttyd。
 //!
-//! **这条成立的前提是「一条连接属于一个人」，而这个前提不是自动成立的。**
-//! 浏览器直连时它成立。但一旦前面架了反向代理，代理默认会**复用**到上游的
-//! 连接：A 用钥匙授权出来的那条管道，会被拿去送 B 不带钥匙的请求，整道门
-//! 就这样被绕过——**这不是假想，2026-09-09 在线上实测到了**：全新连接不带
-//! 钥匙是 401，但只要有一个带钥匙的请求先过，之后不带钥匙的全是 200。
-//!
-//! 所以部署侧必须关掉到这道门的连接复用（Caddy 里是 `reverse_proxy` 的
-//! `transport http { keepalive off }`，理由写在 `dc_deploy/dc-workspace/dcw.sh`
-//! 生成配置那一段）。关掉之后每个请求都是一条新连接，门就每个请求都查一次。
-//!
-//! 换句话说：**这里省下的 HTTP 解析，代价记在部署配置上了。** 谁把这道门
-//! 架到一个会复用连接的东西后面，谁就把它关掉了。这一条不能只靠代码保证，
-//! 只能靠这段话和那份部署配置里的注释一起钉住。
-//!
-//! 走私那一类问题倒是真的不成立：走私要的是前后端对消息边界看法不一致，
-//! 而我们压根不解析边界。上传端点也不破这一条——它由门自己终结，处理完
-//! 就断，那条连接上不会有第二个请求。
+//! 这里没有实现通用 HTTP 消息边界解析或 pipelining。上游必须遵守
+//! `Connection: close`。部署侧仍需保留 Caddy 的 `transport http { keepalive off }`
+//! 配置，避免代理把不同用户的请求放到同一条已经授权的连接上。
+//! 本地上传和项目 API 自己终结请求，并始终关闭连接。
 //!
 //! **二、这道门不做加密。** 明文 HTTP 上，cookie 里那把钥匙每个请求都在线上
 //! 裸奔。所以它前面必须有 TLS 才能给真实用户用——那是部署方的事（反代 +
@@ -189,6 +176,17 @@ pub fn serve(
     lang: Lang,
     upload_dir: PathBuf,
 ) -> Gate {
+    serve_with_library(listener, token, upstream, lang, upload_dir, None)
+}
+
+pub fn serve_with_library(
+    listener: TcpListener,
+    token: String,
+    upstream: SocketAddr,
+    lang: Lang,
+    upload_dir: PathBuf,
+    library: Option<Arc<crate::student_projects::Library>>,
+) -> Gate {
     let addr = listener.local_addr().expect("监听器必须已经绑好");
     let stopping = Arc::new(AtomicBool::new(false));
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -212,13 +210,21 @@ pub fn serve(
 
                 let token = token.clone();
                 let upload_dir = upload_dir.clone();
+                let library = library.clone();
                 let inflight = Arc::clone(&inflight);
                 inflight.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
                     // 一条连接上的 panic 只能毁掉这条连接：这个进程后面还
                     // 连着别人的会话。同 `web::serve`。
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_conn(stream, &token, upstream, lang, &upload_dir);
+                        handle_conn(
+                            stream,
+                            &token,
+                            upstream,
+                            lang,
+                            &upload_dir,
+                            library.as_deref(),
+                        );
                     }));
                     inflight.fetch_sub(1, Ordering::SeqCst);
                 });
@@ -240,6 +246,7 @@ fn handle_conn(
     upstream: SocketAddr,
     lang: Lang,
     upload_dir: &Path,
+    library: Option<&crate::student_projects::Library>,
 ) {
     let _ = down.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = down.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
@@ -272,7 +279,26 @@ fn handle_conn(
     // 的人连「有没有这个端点」都问不出来——上面那个 401 已经把他挡住了；
     // 二是这条连接从头到尾只承载一个请求，所以仍然没有「跨请求的消息
     // 边界」这回事，模块头里那条推理在这条路上照样成立。
+    if head.path == "/_dct/projects" || head.path.starts_with("/_dct/projects/") {
+        let _ = handle_projects(&mut down, &head, library);
+        return;
+    }
     if head.method == "POST" && head.path == UPLOAD_PATH {
+        if !same_origin(&head) {
+            let _ = write_status(&mut down, 400);
+            return;
+        }
+        if head.invalid_body {
+            let _ = write_status(
+                &mut down,
+                if head.content_length.is_none() {
+                    411
+                } else {
+                    400
+                },
+            );
+            return;
+        }
         let _ = handle_upload(&mut down, &head, upload_dir);
         return;
     }
@@ -283,13 +309,51 @@ fn handle_conn(
         let _ = write_status(&mut down, 502);
         return;
     };
-    // 已经读进来的那一段头要原样吐给上游，一个字节不改：这道门不重写 HTTP，
-    // 它只是决定放不放行。改了的话，`Upgrade`/`Sec-WebSocket-Key` 这些握手
-    // 用的头就得由我们负责正确重建，而那是另一个能出错的地方。
-    if up.write_all(&head.raw).is_err() {
+    // Preserve WebSocket handshakes byte-for-byte. Ordinary responses must close
+    // so the next browser request re-enters authentication and local routing.
+    if up.write_all(&upstream_head(&head)).is_err() {
         return;
     }
     pump_both(down, up);
+}
+
+fn upstream_head(head: &Head) -> Vec<u8> {
+    let header_len = head.raw.len() - head.body_prefix.len();
+    let text = std::str::from_utf8(&head.raw[..header_len]).expect("validated headers");
+    let fields: Vec<_> = text
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .collect();
+    let token = |key: &str, wanted: &str| {
+        fields.iter().any(|(name, value)| {
+            name.trim().eq_ignore_ascii_case(key)
+                && value
+                    .split(',')
+                    .any(|v| v.trim().eq_ignore_ascii_case(wanted))
+        })
+    };
+    if token("connection", "upgrade") && token("upgrade", "websocket") {
+        return head.raw.clone();
+    }
+    let mut out = Vec::with_capacity(head.raw.len() + 24);
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if index != 0
+            && line.split_once(':').is_some_and(|(name, _)| {
+                name.trim().eq_ignore_ascii_case("connection")
+                    || name.trim().eq_ignore_ascii_case("keep-alive")
+            })
+        {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(&head.body_prefix);
+    out
 }
 
 /// 两个方向各一条泵，谁先读到 EOF 就把对面的写端半关，让另一条也收工。
@@ -333,6 +397,10 @@ struct Head {
     /// 读头时被 `BufReader` 顺手预读进来的那几个 body 字节。转发路径靠
     /// `raw` 把它们原样吐出去，上传路径要把它们当成 body 的开头。
     body_prefix: Vec<u8>,
+    invalid_body: bool,
+    host: Option<String>,
+    origin: Option<String>,
+    fetch_site: Option<String>,
 }
 
 /// 逐行读到空行为止，同时盯着总长度。**只读头，不读 body**：body 属于
@@ -384,6 +452,11 @@ fn read_head(stream: &mut TcpStream) -> Result<Head, u16> {
 
     let mut cookie = None;
     let mut content_length = None;
+    let mut lengths = 0;
+    let mut invalid_body = false;
+    let mut host = None;
+    let mut origin = None;
+    let mut fetch_site = None;
     for l in lines {
         let Some((name, value)) = l.split_once(':') else {
             continue;
@@ -393,7 +466,24 @@ fn read_head(stream: &mut TcpStream) -> Result<Head, u16> {
         // 这道门自己终结的请求上用（上传端点，处理完就断，不进管道）。
         // 转发那条路一个字节都不看它，上游怎么理解还是上游的事。
         if name.trim().eq_ignore_ascii_case("content-length") {
+            lengths += 1;
             content_length = value.trim().parse::<u64>().ok();
+            invalid_body |= lengths > 1
+                || content_length.is_none()
+                || !value.trim().bytes().all(|b| b.is_ascii_digit());
+        }
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            invalid_body = true;
+        }
+        for (key, slot) in [
+            ("host", &mut host),
+            ("origin", &mut origin),
+            ("sec-fetch-site", &mut fetch_site),
+        ] {
+            if name.trim().eq_ignore_ascii_case(key) {
+                invalid_body |= slot.is_some();
+                *slot = Some(value.trim().to_string());
+            }
         }
         if name.trim().eq_ignore_ascii_case("cookie") {
             // 多条 Cookie 头是合法的，全都要看：只认第一条的话，浏览器把
@@ -414,7 +504,298 @@ fn read_head(stream: &mut TcpStream) -> Result<Head, u16> {
         query,
         content_length,
         body_prefix: buffered,
+        invalid_body,
+        host,
+        origin,
+        fetch_site,
     })
+}
+
+// Local API requests terminate here, so no HTTP connection is reused upstream.
+fn same_origin(head: &Head) -> bool {
+    if head
+        .fetch_site
+        .as_deref()
+        .is_some_and(|s| !matches!(s, "same-origin" | "none"))
+    {
+        return false;
+    }
+    match head.origin.as_deref() {
+        None => true,
+        Some(origin) => origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .zip(head.host.as_deref())
+            .is_some_and(|(authority, host)| {
+                !authority.contains('/') && authority.eq_ignore_ascii_case(host)
+            }),
+    }
+}
+
+fn project_json(
+    down: &mut TcpStream,
+    status: u16,
+    value: serde_json::Value,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&value)?;
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    write!(down, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n", body.len())?;
+    down.write_all(&body)
+}
+
+fn project_error(down: &mut TcpStream, status: u16, message: &str) -> std::io::Result<()> {
+    project_json(down, status, serde_json::json!({"error": message}))
+}
+
+fn project_body(down: &mut TcpStream, head: &Head) -> Result<serde_json::Value, u16> {
+    let len = head.content_length.ok_or(411u16)?;
+    if len > 4096 {
+        return Err(413);
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    head.body_prefix
+        .as_slice()
+        .chain(&mut *down)
+        .take(len)
+        .read_to_end(&mut bytes)
+        .map_err(|_| 400u16)?;
+    if bytes.len() as u64 != len {
+        return Err(400);
+    }
+    if bytes.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| 400u16)?;
+    if !value.is_object() {
+        return Err(400);
+    }
+    Ok(value)
+}
+
+fn project_attachment(
+    down: &mut TcpStream,
+    file: std::fs::File,
+    name: &str,
+    mime: &str,
+) -> std::io::Result<()> {
+    let length = file.metadata()?.len();
+    let encoded: String = name
+        .as_bytes()
+        .iter()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.".contains(b) {
+                (*b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    write!(down, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {length}\r\nContent-Disposition: attachment; filename=\"download\"; filename*=UTF-8''{encoded}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n")?;
+    std::io::copy(&mut file.take(length), down)?;
+    Ok(())
+}
+
+fn handle_projects(
+    down: &mut TcpStream,
+    head: &Head,
+    library: Option<&crate::student_projects::Library>,
+) -> std::io::Result<()> {
+    if !same_origin(head) {
+        return project_error(down, 403, "请从当前工作台操作");
+    }
+    if head.invalid_body {
+        return project_error(down, 400, "请求正文格式无效");
+    }
+    let Some(library) = library else {
+        return project_error(down, 503, "项目库暂时不可用");
+    };
+    let _guard = match library.operation.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return project_error(down, 409, "项目操作进行中，请稍后重试")
+        }
+    };
+    // Catch while still holding the guard: a failed operation must not poison it.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        project_route(down, head, library)
+    })) {
+        Ok(result) => result,
+        Err(_) => project_error(down, 500, "项目操作失败，文件已保留"),
+    }
+}
+
+fn project_route(
+    down: &mut TcpStream,
+    head: &Head,
+    library: &crate::student_projects::Library,
+) -> std::io::Result<()> {
+    use serde_json::json;
+    let route = head.path.strip_prefix("/_dct/projects").unwrap_or("");
+    let parts: Vec<_> = route.trim_start_matches('/').split('/').collect();
+    let upload = parts.len() == 2 && parts[1] == "upload" && head.method == "POST";
+    let body = if head.method == "POST" && !upload {
+        match project_body(down, head) {
+            Ok(body) => body,
+            Err(status) => {
+                return project_error(down, status, "请求正文无效、缺少长度或超过 4 KiB")
+            }
+        }
+    } else {
+        json!({})
+    };
+    if route.is_empty() {
+        return match head.method.as_str() {
+            "GET" => match library.list() {
+                Ok(projects) => project_json(
+                    down,
+                    200,
+                    json!({"projects": projects, "max_archive_bytes": crate::student_projects::MAX_ARCHIVE_BYTES}),
+                ),
+                Err(_) => project_error(down, 500, "读取项目列表失败，请重试"),
+            },
+            "POST" => {
+                let Some(name) = body.get("name").and_then(|v| v.as_str()) else {
+                    return project_error(down, 400, "请输入项目名");
+                };
+                if name.trim().is_empty()
+                    || name.trim().chars().count() > 80
+                    || name.chars().any(char::is_control)
+                {
+                    return project_error(down, 400, "项目名需要 1–80 个字符");
+                }
+                match library.create(name) {
+                    Ok(project) => project_json(down, 201, json!(project)),
+                    Err(_) => project_error(down, 409, "创建项目失败，请检查项目数量和可用空间"),
+                }
+            }
+            _ => project_error(down, 404, "接口不存在"),
+        };
+    }
+    if parts.len() != 2 {
+        return project_error(down, 404, "接口不存在");
+    }
+    let project = match library.project(parts[0]) {
+        Ok(p) => p,
+        Err(_) => return project_error(down, 404, "项目不存在或不可用"),
+    };
+    match (head.method.as_str(), parts[1]) {
+        ("GET", "files") => match library.files(&project) {
+            Ok(files) => project_json(
+                down,
+                200,
+                json!({"files":files, "excluded":crate::student_projects::EXCLUDED, "truncated":false}),
+            ),
+            Err(_) => project_error(
+                down,
+                409,
+                "文件列表暂不可用，请检查文件数量、大小或正在进行的写入",
+            ),
+        },
+        ("GET", "file") => {
+            let path = head.query.as_deref().and_then(|q| {
+                q.split('&')
+                    .find_map(|pair| pair.strip_prefix("path=").and_then(percent_decode))
+            });
+            let Some(path) = path else {
+                return project_error(down, 400, "文件路径无效");
+            };
+            match library.download_file(&project, &path) {
+                Ok(file) => project_attachment(
+                    down,
+                    file,
+                    path.rsplit('/').next().unwrap_or("download"),
+                    "application/octet-stream",
+                ),
+                Err(_) => project_error(down, 404, "文件不存在或不可导出"),
+            }
+        }
+        ("POST", "save") | ("GET", "download") => match library.save(&project) {
+            Ok((saved, file)) => {
+                if head.method == "GET" {
+                    project_attachment(
+                        down,
+                        file,
+                        &format!("{}.zip", project.id),
+                        "application/zip",
+                    )
+                } else {
+                    project_json(down, 200, json!(saved))
+                }
+            }
+            Err(_) => project_error(
+                down,
+                409,
+                "归档失败：文件可能正在变化或超过上限；原文件和上次归档已保留",
+            ),
+        },
+        ("POST", "continue") => {
+            let profile = body.get("profile").and_then(|v| v.as_str()).unwrap_or("");
+            if !["claude", "codex", "shell"].contains(&profile) {
+                return project_error(down, 400, "请选择有效的会话类型");
+            }
+            match library.continue_project(&project, profile) {
+                Ok(id) => project_json(down, 200, json!({"id":id, "dir":project.dir})),
+                Err(_) => project_error(
+                    down,
+                    409,
+                    "无法打开会话，请检查终端服务和 agent 配置；文件已保留",
+                ),
+            }
+        }
+        ("POST", "end") => match library.end(&project) {
+            Ok((saved, stopped)) => project_json(
+                down,
+                200,
+                json!({"saved_at":saved.saved_at, "bytes":saved.bytes, "files":saved.files, "stopped":stopped}),
+            ),
+            // end() puts a safe, stage-specific message on every failure.
+            Err(error) => project_error(down, 409, &error.to_string()),
+        },
+        ("POST", "upload") => {
+            let Some(len) = head.content_length else {
+                return project_error(down, 411, "上传需要文件长度");
+            };
+            if len > MAX_UPLOAD_BYTES {
+                return project_error(down, 413, "文件超过 64 MiB 上传上限");
+            }
+            let Some(name) = head
+                .query
+                .as_deref()
+                .and_then(query_name)
+                .and_then(safe_name)
+            else {
+                return project_error(down, 400, "文件名无效");
+            };
+            let _ = down.set_read_timeout(Some(UPLOAD_TIMEOUT));
+            let result = library.upload(
+                &project,
+                &name,
+                &mut head.body_prefix.as_slice().chain(&mut *down).take(len),
+                len,
+            );
+            match result {
+                Ok(name) => project_json(down, 201, json!({"name":name})),
+                Err(_) => project_error(
+                    down,
+                    409,
+                    "上传失败，请检查文件名、同名文件和剩余空间；未覆盖已有文件",
+                ),
+            }
+        }
+        _ => project_error(down, 404, "接口不存在"),
+    }
 }
 
 /// 接住一个上传：读完 body、落盘、答一句、断开。
@@ -430,7 +811,12 @@ fn read_head(stream: &mut TcpStream) -> Result<Head, u16> {
 /// - 先写临时文件再 `rename`：中途断线不会留下一个「看着像但内容不全」
 ///   的文件，而那种文件比没有更坏——学生会拿它去跑。
 fn handle_upload(down: &mut TcpStream, head: &Head, dir: &Path) -> std::io::Result<()> {
-    let Some(name) = head.query.as_deref().and_then(query_name).and_then(safe_name) else {
+    let Some(name) = head
+        .query
+        .as_deref()
+        .and_then(query_name)
+        .and_then(safe_name)
+    else {
         return write_status(down, 400);
     };
     let Some(len) = head.content_length else {
@@ -475,7 +861,8 @@ fn write_body(down: &mut TcpStream, head: &Head, len: u64, tmp: &Path) -> Result
     let mut left = len;
 
     let prefix = head.body_prefix.len().min(left as usize);
-    f.write_all(&head.body_prefix[..prefix]).map_err(|_| 500u16)?;
+    f.write_all(&head.body_prefix[..prefix])
+        .map_err(|_| 500u16)?;
     left -= prefix as u64;
 
     let mut buf = vec![0u8; 64 * 1024];
@@ -626,7 +1013,10 @@ fn page(lang: Lang) -> String {
     include_str!("gate.html")
         .replace("__LANG__", lang.code())
         .replace("__TITLE__", &html_escape(text(Key::BoardTitle, lang)))
-        .replace("__NEEDS_LINK__", &html_escape(text(Key::GateNeedsLink, lang)))
+        .replace(
+            "__NEEDS_LINK__",
+            &html_escape(text(Key::GateNeedsLink, lang)),
+        )
         .replace("__COOKIE__", COOKIE_NAME)
 }
 
@@ -725,9 +1115,9 @@ pub fn parse_gate_args(args: &[String]) -> Result<GateArgs, String> {
                 i += 2;
             }
             "--port" => {
-                out.port = need(i)?
-                    .parse()
-                    .map_err(|_| format!("--port 要一个 1..65535 的数，收到的是 {}", args[i + 1]))?;
+                out.port = need(i)?.parse().map_err(|_| {
+                    format!("--port 要一个 1..65535 的数，收到的是 {}", args[i + 1])
+                })?;
                 i += 2;
             }
             "--upstream" => {
@@ -756,9 +1146,11 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
     let args = match parse_gate_args(args) {
         Ok(a) => a,
         Err(msg) => {
-            eprintln!("{msg}
+            eprintln!(
+                "{msg}
 
-用法：dct gate [--bind 地址] [--port 端口] [--upstream 主机:端口] [--url 外面看到的地址] [--link]");
+用法：dct gate [--bind 地址] [--port 端口] [--upstream 主机:端口] [--url 外面看到的地址] [--link]"
+            );
             return 2;
         }
     };
@@ -779,9 +1171,10 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
         }
     };
 
-    let base = args.public_url.clone().unwrap_or_else(|| {
-        format!("http://{}:{}", guessed_host(&args.bind), args.port)
-    });
+    let base = args
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}:{}", guessed_host(&args.bind), args.port));
     println!("{}", link(&base, &token));
     if args.public_url.is_none() {
         // **明说是猜的。** 容器里 `lan_ip()` 拿到的是网桥上那个 172.x，
@@ -789,7 +1182,10 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
         // 地址发给学生，而学生只会说「打不开」。
         eprintln!("（上面这条链接的地址是猜的。外面看到的不是这个的话，用 --url 告诉它。）");
     }
-    eprintln!("这条链接本身就是钥匙，别发到公开的地方。换钥匙：删掉 {} 里的 __gate__ 这一项。", path.display());
+    eprintln!(
+        "这条链接本身就是钥匙，别发到公开的地方。换钥匙：删掉 {} 里的 __gate__ 这一项。",
+        path.display()
+    );
     if args.link_only {
         return 0;
     }
@@ -826,7 +1222,17 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
     let upload_dir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("uploads");
-    let mut gate = serve(listener, token, upstream, lang, upload_dir);
+    let library = std::env::current_dir().ok().and_then(|cwd| {
+        let base = sock.parent()?.join("student-projects");
+        match crate::student_projects::Library::open(base, cwd, sock.clone()) {
+            Ok(library) => Some(Arc::new(library)),
+            Err(error) => {
+                eprintln!("项目库初始化失败，项目 API 暂不可用：{error}");
+                None
+            }
+        }
+    });
+    let mut gate = serve_with_library(listener, token, upstream, lang, upload_dir, library);
     eprintln!("门开在 {}，上游 {upstream}。", gate.addr());
     // accept 线程就是这个进程的全部工作，join 到它自己结束为止。
     //
@@ -893,6 +1299,12 @@ mod tests {
                         }
                     }
                     seen.lock().unwrap().extend_from_slice(&head);
+                    if String::from_utf8_lossy(&head).contains("Connection: close") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+                        );
+                        return;
+                    }
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
                     // 之后原样回显，用来验双向对穿。
                     let mut buf = [0u8; 1024];
@@ -959,10 +1371,7 @@ mod tests {
         let c = cookie
             .map(|c| format!("Cookie: {c}\r\n"))
             .unwrap_or_default();
-        request(
-            addr,
-            &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{c}\r\n"),
-        )
+        request(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{c}\r\n"))
     }
 
     #[test]
@@ -1021,7 +1430,10 @@ mod tests {
     #[test]
     fn the_door_page_hands_the_key_to_the_same_cookie_the_gate_checks() {
         let html = page(Lang::Zh);
-        assert!(html.contains(COOKIE_NAME), "页面里没有服务端认的那个 cookie 名");
+        assert!(
+            html.contains(COOKIE_NAME),
+            "页面里没有服务端认的那个 cookie 名"
+        );
         assert!(html.contains("location.hash"), "页面没去读 fragment");
         // 把链接粘进已经打开着这一页的那个标签，只会改 fragment，脚本不会
         // 再跑一次——没有这个监听器，页面就纹丝不动，而那是最自然的动作。
@@ -1076,7 +1488,7 @@ mod tests {
         let (g, _up) = gate_with("aaaa");
         let mut s = TcpStream::connect(g.addr()).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        s.write_all(b"GET /ws HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\n\r\n")
+        s.write_all(b"GET /ws HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
             .unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut line = String::new();
@@ -1164,10 +1576,20 @@ mod tests {
 
     #[test]
     fn gate_args_are_parsed() {
-        let v: Vec<String> = ["--bind", "0.0.0.0", "--port", "8080", "--upstream", "127.0.0.1:9", "--url", "https://x.example", "--link"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let v: Vec<String> = [
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--upstream",
+            "127.0.0.1:9",
+            "--url",
+            "https://x.example",
+            "--link",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let a = parse_gate_args(&v).unwrap();
         assert_eq!(a.bind, "0.0.0.0");
         assert_eq!(a.port, 8080);
@@ -1179,8 +1601,12 @@ mod tests {
     #[test]
     fn bad_gate_args_say_what_is_wrong() {
         let one = |s: &str| vec![s.to_string()];
-        assert!(parse_gate_args(&one("--nope")).unwrap_err().contains("--nope"));
-        assert!(parse_gate_args(&one("--port")).unwrap_err().contains("要跟一个值"));
+        assert!(parse_gate_args(&one("--nope"))
+            .unwrap_err()
+            .contains("--nope"));
+        assert!(parse_gate_args(&one("--port"))
+            .unwrap_err()
+            .contains("要跟一个值"));
         let v: Vec<String> = ["--port", "abc"].iter().map(|s| s.to_string()).collect();
         assert!(parse_gate_args(&v).unwrap_err().contains("--port"));
     }
@@ -1294,7 +1720,12 @@ mod tests {
     #[test]
     fn a_chinese_filename_survives_percent_encoding() {
         let (g, _up, d) = gate_with_dir("aaaa");
-        let r = upload(g.addr(), "%E4%BD%9C%E4%B8%9A.txt", b"hi", Some("dct_gate=aaaa"));
+        let r = upload(
+            g.addr(),
+            "%E4%BD%9C%E4%B8%9A.txt",
+            b"hi",
+            Some("dct_gate=aaaa"),
+        );
         assert!(r.starts_with("HTTP/1.1 201 "), "{r}");
         assert!(d.path().join("uploads").join("作业.txt").exists());
         g.stop();
@@ -1372,5 +1803,203 @@ mod tests {
         assert!(seen.contains("/_dct/upload"), "上游没收到这条 GET：{seen}");
         g.stop();
     }
+    fn project_gate() -> (
+        Gate,
+        Arc<crate::student_projects::Library>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("work")).unwrap();
+        let library = Arc::new(
+            crate::student_projects::Library::open(
+                dir.path().join("state"),
+                dir.path().join("work"),
+                dir.path().join("sock"),
+            )
+            .unwrap(),
+        );
+        let gate = serve_with_library(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            "aaaa".into(),
+            "127.0.0.1:1".parse().unwrap(),
+            Lang::Zh,
+            dir.path().join("work/uploads"),
+            Some(library.clone()),
+        );
+        (gate, library, dir)
+    }
 
+    #[test]
+    fn project_api_auth_paths_and_file_downloads() {
+        let (gate, library, _dir) = project_gate();
+        let p = library.project("current").unwrap();
+        std::fs::write(p.dir.join("hello.txt"), "hello world").unwrap();
+        for path in [
+            "/_dct/projects",
+            "/_dct/projects/current/files",
+            "/_dct/projects/missing/download",
+        ] {
+            assert!(get(gate.addr(), path, None).starts_with("HTTP/1.1 401 "));
+        }
+        let list = get(gate.addr(), "/_dct/projects", Some("dct_gate=aaaa"));
+        assert!(list.starts_with("HTTP/1.1 200 "), "{list}");
+        assert!(list.contains("current"));
+        for path in [
+            "/_dct/projects/missing/files",
+            "/_dct/projects/current/file?path=..%2Fsecret",
+            "/_dct/projects/current/file?path=%2Fetc%2Fpasswd",
+        ] {
+            let response = get(gate.addr(), path, Some("dct_gate=aaaa"));
+            assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+            assert!(response.contains("Cache-Control: no-store"));
+        }
+        let response = get(
+            gate.addr(),
+            "/_dct/projects/current/file?path=hello.txt",
+            Some("dct_gate=aaaa"),
+        );
+        assert!(response.ends_with("hello world"), "{response}");
+        assert!(response.contains("Content-Disposition: attachment"));
+        let response = get(
+            gate.addr(),
+            "/_dct/projects/current/download",
+            Some("dct_gate=aaaa"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(response.contains("application/zip"));
+        gate.stop();
+    }
+
+    #[test]
+    fn project_api_rejects_bad_bodies_cross_origin_and_busy_operations() {
+        let (gate, library, _dir) = project_gate();
+        for (headers, body, expected) in [
+            ("", "", 411),
+            ("Content-Length: 4097\r\n", "", 413),
+            ("Content-Length: 2\r\nContent-Length: 2\r\n", "{}", 400),
+            (
+                "Transfer-Encoding: chunked\r\nContent-Length: 2\r\n",
+                "{}",
+                400,
+            ),
+            ("Content-Length: 1\r\n", "x", 400),
+            (
+                "Content-Length: 2\r\nOrigin: https://evil.example\r\n",
+                "{}",
+                403,
+            ),
+            (
+                "Content-Length: 2\r\nSec-Fetch-Site: cross-site\r\n",
+                "{}",
+                403,
+            ),
+        ] {
+            let response = request(gate.addr(), &format!("POST /_dct/projects/current/save HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\n{headers}\r\n{body}"));
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected} ")),
+                "{response}"
+            );
+            assert!(response.contains("\"error\""));
+        }
+        let guard = library.operation.lock().unwrap();
+        assert!(
+            get(gate.addr(), "/_dct/projects", Some("dct_gate=aaaa")).starts_with("HTTP/1.1 409 ")
+        );
+        drop(guard);
+        gate.stop();
+    }
+
+    #[test]
+    fn project_api_create_upload_save_and_no_overwrite() {
+        let (gate, _library, _dir) = project_gate();
+        let body = r#"{"name":"test project"}"#;
+        let response = request(gate.addr(), &format!("POST /_dct/projects HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+        assert!(response.starts_with("HTTP/1.1 201 "), "{response}");
+        let value: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let id = value["id"].as_str().unwrap();
+        for expected in [201, 409] {
+            let response = request(gate.addr(), &format!("POST /_dct/projects/{id}/upload?name=a.txt HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nContent-Length: 3\r\n\r\nabc"));
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected} ")),
+                "{response}"
+            );
+        }
+        let response = request(gate.addr(), &format!("POST /_dct/projects/{id}/save HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nContent-Length: 2\r\n\r\n{{}}"));
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(response.contains("saved_at"));
+        gate.stop();
+    }
+    #[test]
+    fn proxy_closes_http_but_preserves_websocket_and_buffered_body() {
+        let body = vec![0, 255, 42];
+        let make = |fields: &str| {
+            let mut raw =
+                format!("POST /proxy HTTP/1.1\r\nHost: x\r\n{fields}Content-Length: 3\r\n\r\n")
+                    .into_bytes();
+            raw.extend_from_slice(&body);
+            Head {
+                raw,
+                method: "POST".into(),
+                path: "/proxy".into(),
+                cookie: None,
+                query: None,
+                content_length: Some(3),
+                body_prefix: body.clone(),
+                invalid_body: false,
+                host: Some("x".into()),
+                origin: None,
+                fetch_site: None,
+            }
+        };
+        let ordinary = make("Connection: keep-alive\r\nKeep-Alive: timeout=100\r\n");
+        let rewritten = upstream_head(&ordinary);
+        assert!(rewritten.ends_with(&body));
+        let headers = String::from_utf8_lossy(&rewritten[..rewritten.len() - body.len()]);
+        assert!(headers.contains("Connection: close\r\n"));
+        assert!(!headers.to_lowercase().contains("keep-alive"));
+        let upgraded = make("Connection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: example\r\n");
+        assert_eq!(upstream_head(&upgraded), upgraded.raw);
+    }
+
+    #[test]
+    fn http_page_closes_and_next_project_request_is_routed_locally() {
+        let upstream = fake_upstream();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("work")).unwrap();
+        let library = Arc::new(
+            crate::student_projects::Library::open(
+                dir.path().join("state"),
+                dir.path().join("work"),
+                dir.path().join("sock"),
+            )
+            .unwrap(),
+        );
+        let gate = serve_with_library(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            "aaaa".into(),
+            upstream.addr,
+            Lang::Zh,
+            dir.path().join("work/uploads"),
+            Some(library),
+        );
+        let mut browser = TcpStream::connect(gate.addr()).unwrap();
+        browser
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        browser.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        let mut response = String::new();
+        browser
+            .read_to_string(&mut response)
+            .expect("upstream must close without waiting for browser timeout");
+        assert!(response.contains("Connection: close"), "{response}");
+        assert!(get(
+            gate.addr(),
+            "/_dct/projects/current/files",
+            Some("dct_gate=aaaa")
+        )
+        .contains("\"files\""));
+        assert!(!String::from_utf8_lossy(&upstream.seen.lock().unwrap()).contains("/_dct/projects"));
+        gate.stop();
+    }
 }
