@@ -673,6 +673,73 @@ mod tests {
         );
     }
 
+    /// **两侧对"一帧长什么样"的理解必须是同一件事——这条测试钉的正是这个
+    /// 缝，而不是"多一个断言"。**
+    ///
+    /// 这个 bug 是怎么发生的：`frame_of` 序列化的是 `lines` 本身
+    /// （`serde_json::to_vec(lines)`，一个 `Vec<Vec<ScreenSpan>>`），学生页
+    /// 第一版却当它是包了一层 `Response::Screen` 的对象（`if (!frame ||
+    /// !frame.Screen)`）——那层壳只在守护进程直接答复 `Request::Screen`
+    /// 时才存在（手机端 `page.html` 走的是那条路），直播这条独立的推帧
+    /// 管道从来没套过它。于是每一帧都在网页那一行判断里被当成"形状不对"
+    /// 静默丢弃：`dct` 这边的单元测试测的是"`frame_of` 能不能序列化/
+    /// 压缩"，`dct-page` 那边的单元测试测的是"页面有没有读该读的字段"，
+    /// 两边各自都是绿的，**但中间"Rust 发的形状"和"JS 读的形状"是不是
+    /// 同一个东西，两边都没有测过**——这道缝只有真的拿浏览器打开链接才
+    /// 看得见：画面永远是空的，60 秒后 staleness 计时器还会把"页面根本
+    /// 没解析成功"误报成「老师暂停了」，很容易被当成"老师没在动"。
+    ///
+    /// 所以这条测试让 Rust 这边发的真实字节，流过页面读它的那一行代码：
+    /// 拿一屏真实的 `lines` 走 `frame_of` 编码、解压回 JSON，断言它的形状
+    /// 是"顶层数组、每行是数组、每个 span 有 `text` 字段"；再反过来断言
+    /// `live.html` 里没有那种只在"包了一层 Screen"的假设下才成立的写法。
+    #[test]
+    fn the_wire_shape_frame_of_sends_is_the_shape_the_student_page_reads() {
+        use std::io::Read;
+
+        let lines = vec![
+            vec![span("hi".into())],
+            vec![span("there".into())],
+        ];
+
+        let gz = frame_of(&lines);
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(gz.as_slice())
+            .read_to_end(&mut plain)
+            .expect("frame_of 编出来的不是合法 gzip——学生页那边解不开");
+        let value: serde_json::Value = serde_json::from_slice(&plain)
+            .expect("解压出来的不是合法 JSON");
+
+        // 顶层是"行的数组"，不是带 `Screen` 键的对象——这正是当初读错的
+        // 那个形状。
+        let rows = value
+            .as_array()
+            .unwrap_or_else(|| panic!("frame_of 发的顶层不是数组了：{value}"));
+        assert_eq!(rows.len(), 2, "行数对不上，frame_of 的形状变了？");
+        let first_row = rows[0]
+            .as_array()
+            .unwrap_or_else(|| panic!("行不是数组：{}", rows[0]));
+        assert_eq!(
+            first_row[0]["text"], "hi",
+            "span 里没有 text 字段，或者根本不是同一个形状"
+        );
+
+        // 学生页必须读的是这同一个形状：数组本身，不是某个包了一层的对象
+        // ——`.Screen`/`frame.lines` 都是"以为帧外面还套了一层"才会写出来
+        // 的取法，`frame_of` 从来没套过那一层。
+        let page = dct_page::live_page();
+        assert!(
+            !page.contains(".Screen"),
+            "学生页里出现了 .Screen——但 frame_of 发的是行数组本身，没有 \
+             Screen 这层包装，这正是让画面一直空白的那个 bug"
+        );
+        assert!(
+            !page.contains("frame.lines"),
+            "学生页在读 frame.lines——但 frame_of 发的顶层就是行数组，没有 \
+             lines 这层包装"
+        );
+    }
+
     /// 链接里那串东西必须够长、而且每次都不一样。
     #[test]
     fn two_lives_never_get_the_same_link() {

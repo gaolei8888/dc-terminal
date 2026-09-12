@@ -356,8 +356,20 @@
     return "/live/" + LIVE_ID + "/frame?lane=" + lane + "&wait=1";
   }
 
-  function draw(screen) {
-    var lines = screen.lines || [];
+  // **`lines` 本身就是一帧，不是包了一层 `{"Screen": {...}}` 的对象。**
+  //
+  // 推帧那一侧（`src/live.rs` 的 `frame_of`）序列化的是 `lines: &[Vec<
+  // ScreenSpan>]` 自己（`serde_json::to_vec(lines)`），从来没有套过
+  // `Response::Screen` 那层壳——那层壳只在守护进程直接答复
+  // `Request::Screen`（手机端 `page.html` 走的那条路）时才存在。这一页
+  // 走的是直播那条独立的推帧管道，收到的 JSON 顶层就是"行的数组"。第一版
+  // 把这两条管道的形状搞混了，误以为帧外面还套了那层壳，于是每一帧都在
+  // 这里被判成"形状不对"而静默丢弃——`dct-page`/`dct` 两侧的单元测试各自都是
+  // 绿的（一侧测"能序列化"，一侧测"读了该读的字段"），没有一条测试跨过
+  // 中间这道缝，直到有人拿真浏览器打开链接才看见画面一直是空的。
+  // `src/live.rs::the_wire_shape_frame_of_sends_is_the_shape_the_student_page_reads`
+  // 就是补的这条缝。
+  function draw(lines) {
     lastLines = lines;
     var cols = paint(lines);
     lastCols = cols;
@@ -399,10 +411,13 @@
           if (!text) { schedule(0); return; }
           var frame;
           try { frame = JSON.parse(text); } catch (e) { schedule(0); return; }
-          if (!frame || !frame.Screen) { schedule(0); return; }
+          // `frame` 就是"行的数组"本身（见 `draw` 上面那段注释）。
+          // **空数组是合法的一帧**（老师推了一屏空画面），跟上面"空 body
+          // ＝还没推过帧"是两回事——数组存在就该照画，哪怕它长度是 0。
+          if (!Array.isArray(frame)) { schedule(0); return; }
           lastChangeAt = Date.now();
           if (state !== "live") { state = "live"; }
-          draw(frame.Screen);
+          draw(frame);
           render();
           schedule(0);
         });
