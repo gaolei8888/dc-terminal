@@ -1688,9 +1688,8 @@ mod tests {
         }
     }
 
-    /// 造一个文件足够多的仓库，让 agent 会话建立时的首次 git checkpoint 慢到能
-    /// 测出来。手法照抄 `tests/concurrency.rs` 的 `init_big_repo`——那边已经验证过
-    /// 8000 个文件在这台机器的规模下够慢、够稳。
+    /// 造一个首次 git checkpoint 慢到能测出来的仓库。手法照抄
+    /// `tests/concurrency.rs` 的 `init_big_repo`，慢从哪来见那边的注释。
     fn init_big_repo(path: &Path, n: usize) {
         let run = |args: &[&str]| {
             std::process::Command::new("git")
@@ -1712,6 +1711,10 @@ mod tests {
         }
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "init"]);
+        // 慢靠 git 的 clean filter 造出来，不靠文件多——理由见
+        // `tests/concurrency.rs` 里同名函数末尾那段。
+        std::fs::write(path.join(".gitattributes"), "files/* filter=dct-slow\n").unwrap();
+        run(&["config", "filter.dct-slow.clean", "sleep 0.05; cat"]);
     }
 
     fn init_repo(path: &Path) {
@@ -2032,7 +2035,7 @@ mod tests {
     #[test]
     fn create_does_not_hold_the_secrets_lock_across_the_slow_work() {
         let repo = tempfile::tempdir().unwrap();
-        init_big_repo(repo.path(), 8000);
+        init_big_repo(repo.path(), 20);
 
         let mgr = Arc::new(SessionManager::new());
         mgr.register_profile(fake_agent());

@@ -25,7 +25,7 @@ mod common;
 /// rc 文件有多重，满载并行跑 `cargo test` 时经常输给固定的等待期限
 /// （详见 `.superpowers/sdd/2026-08-09-dct-session-auto-name/followup-2-brief.md`）。
 ///
-/// 换成一个测试自己注册的 profile：`/bin/sh --noediting`。选它是因为：
+/// 换成一个测试自己注册的 profile：`bash --norc --noediting`。选它是因为：
 /// - `--noediting` 关掉 GNU Readline，shell 就不会在某个不确定的时刻把
 ///   终端切成 raw 模式——不然那次切换本身又是一个新的竞态窗口。
 /// - `env.ENV = "/dev/null"`：sh 以 `sh` 这个名字启动、且是交互式时，会去读
@@ -53,7 +53,15 @@ fn test_shell_profile() -> Profile {
     env.insert("PS1".to_string(), PROMPT.to_string());
     Profile {
         name: TEST_SHELL_PROFILE.into(),
-        command: vec![common::posix_tool("sh"), "--noediting".into()],
+        // bash 而不是 sh：Debian/Ubuntu 的 `/bin/sh` 是 dash，见到 `--noediting`
+        // 就报 "Illegal option" 退出——macOS 上 `/bin/sh` 恰好是 bash，所以这条
+        // 测试以前只在 Mac 上过。`--norc`：以 `bash` 名义起的交互 shell 读
+        // `~/.bashrc` 而不是 `ENV`。
+        command: vec![
+            common::posix_tool("bash"),
+            "--norc".into(),
+            "--noediting".into(),
+        ],
         is_agent: false,
         idle_pattern: None,
         busy_pattern: None,

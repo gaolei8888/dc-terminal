@@ -3589,7 +3589,14 @@ is_agent = true
         env.insert("PS1".to_string(), PROMPT.to_string());
         let test_shell = Profile {
             name: "scroll-test-shell".into(),
-            command: crate::sys::testing::sh_argv(&["--noediting"]),
+            // bash 而不是 sh：见 `sys::testing::bash`。`--norc` 是因为以
+            // `bash` 名义起的交互 shell 读 `~/.bashrc` 而不是 `ENV`，不关掉的话
+            // 上面那句 `ENV=/dev/null` 就管不住它。
+            command: vec![
+                crate::sys::testing::bash(),
+                "--norc".into(),
+                "--noediting".into(),
+            ],
             is_agent: false,
             idle_pattern: None,
             busy_pattern: None,

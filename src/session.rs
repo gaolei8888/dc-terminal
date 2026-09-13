@@ -2977,13 +2977,17 @@ mod tests {
         let proj = tmp.path().join("proj");
         std::fs::create_dir(&proj).unwrap();
         let mgr = SessionManager::new();
-        // 先 BOOM（第一次失败），clear 掉再打 READY（恢复成 Idle——手法同
-        // `busy_pattern_marks_working_then_idle`：`clear` 把 BOOM 从可见屏幕
+        // 先 BOOM（第一次失败），清屏再打 READY（恢复成 Idle——手法同
+        // `busy_pattern_marks_working_then_idle`：清屏把 BOOM 从可见屏幕
         // 上抹掉，error_re 才会真的不再匹配），再 BOOM 一次（第二次失败）。
+        //
+        // 清屏直接写 `ESC[H ESC[2J`，**不调 `clear`**：`clear` 要查 `TERM`
+        // 才知道该发什么，而 CI 的 runner 上没有 `TERM`，它只会在 stderr
+        // 上说一句 "TERM environment variable not set"，屏幕纹丝不动。
         mgr.register_profile(
             Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
                 name = "flaky"
-                command = ["/bin/sh", "-c", "echo BOOM; sleep 0.3; clear; echo READY; sleep 0.3; echo BOOM; sleep 5"]
+                command = ["/bin/sh", "-c", "echo BOOM; sleep 0.3; printf '\\033[H\\033[2J'; echo READY; sleep 0.3; echo BOOM; sleep 5"]
                 is_agent = false
                 idle_pattern = "READY"
                 error_pattern = "BOOM"
@@ -4161,7 +4165,7 @@ mod tests {
         mgr.register_profile(
             Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
                 name = "busy-demo"
-                command = ["/bin/sh", "-c", "echo esc to interrupt; sleep 1; clear; echo done; sleep 5"]
+                command = ["/bin/sh", "-c", "echo esc to interrupt; sleep 1; printf '\\033[H\\033[2J'; echo done; sleep 5"]
                 is_agent = false
                 busy_pattern = "esc to interrupt"
                 "#),

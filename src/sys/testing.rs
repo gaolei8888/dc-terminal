@@ -31,6 +31,13 @@ pub fn tool(name: &str) -> String {
     }
 }
 
+/// 交互夹具用的 bash。**不是 `sh`**：macOS 的 `/bin/sh` 恰好是 bash，认得
+/// `--noediting`/`--norc`；Debian/Ubuntu 的 `/bin/sh` 是 dash，见到
+/// `--noediting` 就报 "Illegal option" 退出，提示符永远等不到。
+pub fn bash() -> String {
+    tool("bash")
+}
+
 /// `/bin/sh` 的等价物。用得太多，单开一个名字。
 pub fn sh() -> String {
     tool("sh")
