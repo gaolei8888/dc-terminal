@@ -14,7 +14,7 @@ use std::time::Duration;
 use dct_link::{
     AuthFrame, EndpointId, EndpointKind, Envelope, SendRequest, LINK_VERSION, PATH_POLL, PATH_SEND,
 };
-use dct_srv::{Config, Live, Relay};
+use dct_srv::{Config, Live, Relay, Routes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -64,7 +64,12 @@ async fn a_letter_crosses_a_real_socket() {
         poll_timeout: Duration::from_millis(300),
         inbox: 4,
     }));
-    tokio::spawn(dct_srv::serve(listener, relay, Arc::new(Live::new())));
+    tokio::spawn(dct_srv::serve(
+        listener,
+        relay,
+        Arc::new(Live::new()),
+        Routes::WithLink,
+    ));
 
     // b 露个面，好让它算在线。这一轮什么都等不到。
     let (status, body) = post(addr, PATH_POLL, &serde_json::to_string(&auth("b")).unwrap()).await;
@@ -103,6 +108,7 @@ async fn an_offline_peer_comes_back_as_a_code_over_http() {
         listener,
         Arc::new(Relay::new(Config::default())),
         Arc::new(Live::new()),
+        Routes::WithLink,
     ));
 
     let letter = SendRequest {

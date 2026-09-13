@@ -1145,7 +1145,20 @@ fn validated_staging(
             LiveStagingProblem::UnknownSessions(missing),
         ));
     }
-    Ok(ids.into_iter().zip(names).collect())
+    // 路名截到中转收得下的长度。**截，不拒**：名字是界面或课堂管理台起的，
+    // 一个长名字的学生不该让整场直播被中转 413 掉。截短是看得见的——老师面板
+    // 上显示的就是带省略号的这个名字。
+    let fit = |name: String| {
+        let max = dct_link::live::MAX_LANE_NAME_CHARS;
+        if name.chars().count() <= max {
+            name
+        } else {
+            let mut short: String = name.chars().take(max - 1).collect();
+            short.push('…');
+            short
+        }
+    };
+    Ok(ids.into_iter().zip(names.into_iter().map(fit)).collect())
 }
 
 /// `PhoneSetToken` 打 `getMe` 没成功时，给用户看的那句人话。**这里就是
@@ -3065,6 +3078,42 @@ mod tests {
             "期待 LiveRelayNotConfigured，得到 {resp:?}"
         );
         assert!(live.info().id.is_empty(), "没有中转不该开出一场直播");
+    }
+
+    /// **路名太长就截短，不让整场直播被中转拒掉。** 中转只收
+    /// `MAX_LANE_NAME_CHARS` 个字符以内的路名（超了回 413），而名字是界面或
+    /// 课堂管理台起的——一个长名字的学生不该让老师拿到一条推不上画面的链接。
+    /// 截短是看得见的：老师面板上显示的就是截短后的那个名字，带省略号。
+    #[test]
+    fn a_lane_name_longer_than_the_relay_accepts_is_shortened_visibly() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
+        let live = test_live();
+        let long = "名".repeat(dct_link::live::MAX_LANE_NAME_CHARS + 10);
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![id],
+                names: vec![long],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        let Response::Live(info) = resp else {
+            panic!("期待 Response::Live，得到 {resp:?}")
+        };
+        let name = &info.staged[0].1;
+        assert_eq!(name.chars().count(), dct_link::live::MAX_LANE_NAME_CHARS);
+        assert!(name.ends_with('…'), "截短要看得出来：{name}");
     }
 
     /// 没在播的时候改上架：说出来，不许悄悄开一场新的直播——那正是这条

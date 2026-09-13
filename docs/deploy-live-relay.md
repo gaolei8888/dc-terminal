@@ -25,6 +25,14 @@
 `/live/*` 自带鉴权，可以对公网开。`/link/*` 一旦漏到公网上，任何人都能冒充
 任何一台设备收发信封——那是老师终端的读写通道。
 
+**所以 `dct-srv` 默认根本不挂 `/link/*` 和 `/`**，只有带 `--with-link` 起的
+进程才有（只给本机开发用）。下面那条反代白名单因此是第二道闸，不再是唯一
+一道：哪天反代配置被人改成「全部转发」，这几条路照样不存在。两道都留着。
+
+另外两条跟公网有关的限制在中转自己身上：建房请求里的 id、两把钥匙、路名都有
+长度上下限（请求体整体不超过 16 KB），建房限流按 `X-Forwarded-For` **最右边**
+那一跳分桶——最左边是请求方自己写得出来的。
+
 进程本身有一道硬闸：`dct-srv` 的 `main.rs` 拒绝绑非环回地址
 （`must_be_loopback`）。所以中转只听 `127.0.0.1`，对外必须经过反向代理，
 而白名单就写在反代上。**不要为了"方便"去掉那道硬闸**：去掉它，这份文档
@@ -40,7 +48,7 @@
 | 中转 | `/usr/local/bin/dct-srv`，systemd 单元 `dct-srv.service`，听 `127.0.0.1:8787` |
 | 源码 | `/opt/dct-relay/src`，在 Docker 里的 `rust:1-slim` 编的（宿主机上没装工具链） |
 | 反代 | Caddy，站点块 `live.dataclue.cn`，只放行 `/live/*` |
-| 验收 | `/link/poll`、`/link/send`、`/link/ask`、`/` 四条全是 404 |
+| 验收 | `/link/poll`、`/link/send`、`/link/ask`、`/` 四条全是 404（反代答一次，中转自己也不挂这几条） |
 
 换机器或重装时照下面三节走一遍即可，顺序别改。
 
@@ -139,7 +147,7 @@ systemd unit 里加一行：
 
 ```ini
 [Unit]
-Description=dct-srv（直播中转 + 配对信封）
+Description=dct-srv（直播中转；不带 --with-link，不挂配对信封那组路由）
 After=network.target
 
 [Service]

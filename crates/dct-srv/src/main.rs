@@ -10,14 +10,26 @@
 
 use std::sync::Arc;
 
-use dct_srv::{Config, Live, Relay};
+use dct_srv::{Config, Live, Relay, Routes};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 
+/// 打开配对信封那组没有鉴权的路由（`/link/*` 和 `/`）。默认不开，理由见
+/// `dct_srv::Routes`。
+const WITH_LINK: &str = "--with-link";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let routes = if args.iter().any(|a| a == WITH_LINK) {
+        Routes::WithLink
+    } else {
+        Routes::LiveOnly
+    };
+    let addr = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| DEFAULT_ADDR.into());
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -29,11 +41,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(why.into());
     }
 
-    println!("dct-srv 在 http://{local} 上，只收本机的连接");
+    println!(
+        "dct-srv 在 http://{local} 上，只收本机的连接{}",
+        if routes == Routes::WithLink {
+            "（已打开没有鉴权的 /link/*，只许本机开发用）"
+        } else {
+            ""
+        }
+    );
     dct_srv::serve(
         listener,
         Arc::new(Relay::new(Config::default())),
         Arc::new(Live::new()),
+        routes,
     )
     .await?;
     Ok(())

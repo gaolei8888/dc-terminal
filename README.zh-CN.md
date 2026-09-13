@@ -700,7 +700,8 @@ src/proto.rs       线上契约
 src/web/           局域网手机端：一个极小的 HTTP 服务和那一页网页
 src/link.rs        主动出网连中转、长轮询（还没接上开关，见下）
 crates/dct-link/   守护进程和中转共用的信封，不含 Request/Response
-crates/dct-srv/    中转服务。第一期没有鉴权也没有加密，只许绑本机地址
+crates/dct-srv/    中转服务。默认只挂 /live/*（--with-link 才加上没有鉴权的配对路由，只给本机开发用）。
+                   第一期没有鉴权也没有加密，只许绑本机地址
 ```
 
 动代码之前有三个决定值得先知道。
