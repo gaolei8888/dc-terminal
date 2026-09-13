@@ -73,7 +73,7 @@ body { display:flex; flex-direction:column; align-items:stretch; }
 </style>
 <button id="dcw-backdrop" aria-label="关闭项目面板" type="button"></button>
 <aside id="dcw-panel" aria-label="项目与文件">
- <div class="dcw-row dcw-head"><h2 id="dcw-project-name">正在加载…</h2><div class="dcw-row dcw-actions"><button id="dcw-nav-library">我的项目</button><button id="dcw-drop">上传</button><button id="dcw-download">下载</button><button id="dcw-publish">发布作品</button><button id="dcw-theme" type="button" aria-label="切换到浅色" title="切换到浅色">☀</button><button class="dcw-toggle" type="button" aria-label="展开文件面板" aria-expanded="false">文件</button></div></div>
+ <div class="dcw-row dcw-head"><h2 id="dcw-project-name">正在加载…</h2><div class="dcw-row dcw-actions"><button id="dcw-nav-library">我的项目</button><button id="dcw-mic" aria-live="polite">🎤 说话</button><button id="dcw-drop">上传</button><button id="dcw-download">下载</button><button id="dcw-publish">发布作品</button><button id="dcw-theme" type="button" aria-label="切换到浅色" title="切换到浅色">☀</button><button class="dcw-toggle" type="button" aria-label="展开文件面板" aria-expanded="false">文件</button></div></div>
  <p id="dcw-presence" role="status" hidden>管理员正在协助</p>
  <div id="dcw-drawer"><div class="dcw-row dcw-head"><button id="dcw-nav-work">当前项目</button><button id="dcw-close" aria-label="关闭项目面板">关闭</button></div>
  <div id="dcw-status" role="status" aria-live="polite"></div>
@@ -305,6 +305,44 @@ body { display:flex; flex-direction:column; align-items:stretch; }
    pasteMessage('图片已上传。请确认终端已进入目标会话，再点击插入。');
   }catch(e){pasteMessage(plainError(e.message),true);}
   finally{pasteUploading=false;setBusy(false);renderPasted();}
+ };
+
+ // 语音输入：点一下开始录，再点一下结束、转写、把文字**填进终端但不回车**。
+ //
+ // 不自动回车是有意的：识别一定会有错字，而这些字是要发给 agent 的——
+ // 让人看一眼再按回车，比事后撤销一次跑偏的改动便宜得多。
+ var recorder=null,chunks=[],micTimer=null,micStart=0;
+ function micLabel(text){$('mic').textContent=text;}
+ function micStop(){if(micTimer){clearInterval(micTimer);micTimer=null;}if(recorder&&recorder.state!=='inactive')recorder.stop();}
+ // 60 秒上限跟服务端那条对齐：说太长一句话既转不准，也容易撞上传上限。
+ function micTick(){var left=60-Math.floor((Date.now()-micStart)/1000);if(left<=0){micStop();return;}micLabel('■ 停止 '+left+'s');}
+ $('mic').onclick=function(){
+  if(recorder&&recorder.state==='recording'){micStop();return;}
+  if(!navigator.mediaDevices||!window.MediaRecorder){status('这个浏览器不支持录音，换一个浏览器打开试试。',true);return;}
+  action(async function(){
+   var stream=await navigator.mediaDevices.getUserMedia({audio:true});
+   chunks=[];recorder=new MediaRecorder(stream);
+   recorder.ondataavailable=function(e){if(e.data&&e.data.size)chunks.push(e.data);};
+   recorder.onstop=function(){
+    stream.getTracks().forEach(function(t){t.stop();});
+    micLabel('🎤 说话');
+    var blob=new Blob(chunks,{type:recorder.mimeType||'audio/webm'});
+    if(!blob.size){status('没录到声音，再试一次。',true);return;}
+    action(async function(){
+     micLabel('转写中…');
+     var r=await fetch(prefix+'/_dct/transcribe',{method:'POST',credentials:'same-origin',headers:{'Content-Type':blob.type},body:blob});
+     var data=await r.json().catch(function(){return {};});
+     micLabel('🎤 说话');
+     if(!r.ok)throw new Error(data.error||'转写失败，请重试');
+     var text=(data.text||'').trim();
+     if(!text){status('没听清，再说一次试试。',true);return;}
+     if(!window.term||typeof window.term.paste!=='function'||(window.term.options&&window.term.options.disableStdin)){status('终端还没连上，连上再说话。',true);return;}
+     window.term.paste(text);
+     status('已填进终端，看一眼再按回车。');
+    });
+   };
+   recorder.start();micStart=Date.now();micTick();micTimer=setInterval(micTick,1000);
+  });
  };
  $('paste-insert').onclick=function(){
   if(busy||pasteUploading||!pasted.length||pasted.some(function(p){return !p.uploaded;}))return;

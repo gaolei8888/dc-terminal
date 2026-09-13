@@ -23,6 +23,16 @@ async function body(req) {
   try { const data = JSON.parse(Buffer.concat(chunks)); if (!data || Array.isArray(data) || typeof data !== 'object') throw Error(); return data; }
   catch { throw fail(400, '请求格式无效'); }
 }
+// 音频的上限。**不是随手定的**：60 秒的 opus 大约 500 KB–1 MB，5 MB 已经
+// 是「这不对劲」的量级；而没有上限的读循环，等于让任何一个学生把课堂服务
+// 的内存吃光。
+const STT_MAX_BYTES = 5 * 1024 * 1024;
+async function rawBody(req, limit) {
+  let size = 0; const chunks = [];
+  for await (const chunk of req) { size += chunk.length; if (size > limit) throw fail(413, '录音太长了，说短一点再试'); chunks.push(chunk); }
+  if (!size) throw fail(400, '没有收到录音');
+  return Buffer.concat(chunks);
+}
 function cookie(req, name) { return (req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(name + '='))?.slice(name.length + 1); }
 function studentPage(prefix, starting = false) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学习工作区</title><style>body{font:16px/1.7 system-ui;background:#f5f7fa;color:#263248;display:grid;place-content:center;min-height:90vh;padding:24px}main{max-width:430px}button{font:inherit;padding:10px 18px;border:0;border-radius:8px;background:#315bea;color:white}</style><main><h1>学习工作区</h1><p id="message">${starting ? '正在打开你的工作区…' : '请使用老师发给你的完整链接。'}</p><button hidden id="retry">重试</button></main><script>
@@ -33,7 +43,15 @@ function finishedPage(prefix) {
 }
 
 export class Classroom {
-  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing} = {}) {
+  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, stt = {}} = {}) {
+    // 语音转写的上游。**没配也要能正常开课**——按钮那边会说「还没配」，
+    // 而不是每按一次就抛一个看不懂的错。
+    this.stt = {
+      url: stt.url ?? process.env.CLASSROOM_STT_URL ?? '',
+      key: stt.key ?? process.env.CLASSROOM_STT_KEY ?? '',
+      model: stt.model ?? process.env.CLASSROOM_STT_MODEL ?? 'whisper-1',
+      language: stt.language ?? process.env.CLASSROOM_STT_LANGUAGE ?? 'zh',
+    };
     this.store = store;
     this.driver = driver;
     this.origin = new URL(origin).origin;
@@ -191,6 +209,38 @@ export class Classroom {
         this.store.audit('学生保存并结束学习', w);
         return json(res, 200, {ok: true});
       });
+    }
+    // 语音输入：学生在自己那一页按下录音，音频到这儿，文字回去。
+    //
+    // **key 只活在这一层。** 转写要拿 dc_llm 的 bearer，而那把钥匙既不该
+    // 进每个学生的容器（一个容器被玩坏就全班的额度跟着没），也绝不该进
+    // 浏览器。所以这条路由由课堂服务自己接住，不往容器转发。
+    if (sub === '/_dct/transcribe' && req.method === 'POST') {
+      this.rate(req, 'stt:' + w.id);
+      if (!this.stt.url || !this.stt.key) throw fail(503, '还没配语音转写，请联系老师');
+      const audio = await rawBody(req, STT_MAX_BYTES);
+      const type = String(req.headers['content-type'] || 'audio/webm').split(';')[0];
+      const form = new FormData();
+      form.append('file', new Blob([audio], {type}), 'speech.webm');
+      form.append('model', this.stt.model);
+      // 说中文的学生里夹着英文术语（「import 那个包」），不写死语言的话
+      // 整句会被猜成英文。
+      form.append('language', this.stt.language);
+      let answer;
+      try {
+        const upstream = await fetch(this.stt.url.replace(/\/$/, '') + '/v1/audio/transcriptions', {
+          method: 'POST', body: form, headers: {Authorization: 'Bearer ' + this.stt.key},
+          signal: AbortSignal.timeout(30000),
+        });
+        // **不要把上游的原话透出去**：那里面可能带着账号、额度、甚至 key 的
+        // 片段，而学生页是给一屋子人开的。
+        if (!upstream.ok) throw Error(String(upstream.status));
+        answer = await upstream.json();
+      } catch (e) {
+        throw fail(502, e?.message === 'The operation was aborted due to timeout' ? '转写超时了，再说一次试试' : '语音转写暂时不可用');
+      }
+      const text = typeof answer?.text === 'string' ? answer.text.trim() : '';
+      return json(res, 200, {text});
     }
     if (sub === '/start' && req.method === 'POST') {
       await body(req); return this.store.mutate(async () => { if (!this.authenticate(req, 'student', w)) throw fail(403, '链接已停用或重置'); try { await this.driver.start(w, this.store.data.students); } catch (e) { throw fail(409, e.message); } this.store.audit('学生打开工作区', w); return json(res, 200, {ok: true}); });

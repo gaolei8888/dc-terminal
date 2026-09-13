@@ -220,3 +220,59 @@ test('强制直播：只上架活着的会话、路名用学生名字、旧版�
     fs.rmSync(dir, {recursive: true, force: true});
   }
 });
+
+test('语音输入：没配就给人话、太大就拒、key 不出现在答复里', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-stt-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async () => ({Live: {id: ''}})};
+
+  // 假的 dc_llm 网关：把它收到的 Authorization 记下来，回一段转写。
+  let seenAuth = null;
+  const gateway = http.createServer(async (req, res) => {
+    seenAuth = req.headers.authorization;
+    for await (const _ of req) { /* 读完 */ }
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({text: '把这一行改成 import os'}));
+  });
+  await new Promise(r => gateway.listen(0, '127.0.0.1', r));
+  const gatewayUrl = `http://127.0.0.1:${gateway.address().port}`;
+
+  const unconfigured = new Classroom({store, driver, origin: 'http://localhost', secure: false, stt: {url: '', key: ''}});
+  await new Promise(r => unconfigured.server.listen(0, '127.0.0.1', r));
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false,
+    stt: {url: gatewayUrl, key: 'SECRET-GATEWAY-KEY', model: 'whisper-1', language: 'zh'}});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+
+  const speak = async (server, bytes, cookie) => fetch(`http://127.0.0.1:${server.address().port}/w/${ming.id}/_dct/transcribe`, {
+    method: 'POST', headers: {'Content-Type': 'audio/webm', ...(cookie ? {Cookie: cookie} : {})}, body: Buffer.alloc(bytes, 1),
+  });
+  try {
+    const login = await fetch(`http://127.0.0.1:${app.server.address().port}/w/${ming.id}/login`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: ming.token})});
+    const student = login.headers.get('set-cookie').split(';')[0];
+
+    // 没登录的人不能拿它当免费的转写服务用。
+    assert.equal((await speak(app.server, 16)).status, 401);
+
+    // 没配 key：一句人话，不是 500。（会话是跟着实例走的，这台要自己登一次。）
+    const offLogin = await fetch(`http://127.0.0.1:${unconfigured.server.address().port}/w/${ming.id}/login`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: ming.token})});
+    const off = await speak(unconfigured.server, 16, offLogin.headers.get('set-cookie').split(';')[0]);
+    assert.equal(off.status, 503);
+    assert.match((await off.json()).error, /还没配/);
+
+    const ok = await speak(app.server, 2048, student);
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).text, '把这一行改成 import os');
+    assert.equal(seenAuth, 'Bearer SECRET-GATEWAY-KEY', 'key 该由服务端带上，不该让浏览器碰');
+
+    // 超过上限的录音在读进内存之前就被挡掉。
+    const big = await speak(app.server, 6 * 1024 * 1024, student);
+    assert.equal(big.status, 413);
+    assert.doesNotMatch(JSON.stringify(await big.json()), /SECRET-GATEWAY-KEY/, 'key 绝不能出现在给浏览器的答复里');
+  } finally {
+    app.server.close(); unconfigured.server.close(); gateway.close();
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
