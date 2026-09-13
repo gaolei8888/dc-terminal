@@ -69,6 +69,7 @@ async fn a_letter_crosses_a_real_socket() {
         relay,
         Arc::new(Live::new()),
         Routes::WithLink,
+        None,
     ));
 
     // b 露个面，好让它算在线。这一轮什么都等不到。
@@ -109,6 +110,7 @@ async fn an_offline_peer_comes_back_as_a_code_over_http() {
         Arc::new(Relay::new(Config::default())),
         Arc::new(Live::new()),
         Routes::WithLink,
+        None,
     ));
 
     let letter = SendRequest {

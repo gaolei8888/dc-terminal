@@ -75,8 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
     // 首次打开就坏的密钥文件：拒绝启动，而不是悄悄当成「没开公开功能」。
+    let publish_keys_path = publish_keys.clone();
     let publish_keys = publish_keys.map(dct_srv::keys::KeyFile::open).transpose()?;
-    let _ = publish_keys;
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local = listener.local_addr()?;
@@ -88,11 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "dct-srv 在 http://{local} 上，只收本机的连接{}",
+        "dct-srv 在 http://{local} 上，只收本机的连接{}{}",
         if routes == Routes::WithLink {
             "（已打开没有鉴权的 /link/*，只许本机开发用）"
         } else {
             ""
+        },
+        match &publish_keys_path {
+            Some(p) => format!("；已开启公开直播（密钥文件：{}）", p.display()),
+            None => String::new(),
         }
     );
     dct_srv::serve(
@@ -100,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(Relay::new(Config::default())),
         Arc::new(Live::new()),
         routes,
+        publish_keys,
     )
     .await?;
     Ok(())

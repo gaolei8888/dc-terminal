@@ -285,6 +285,9 @@ impl From<LinkError> for Rejected {
 pub struct AppState {
     pub relay: Arc<Relay>,
     pub live: Arc<Live>,
+    /// 当前生效的发布密钥。`None` = 没开公开功能（没带 `--publish-keys`）。
+    /// 重载任务（见 `serve`）写，公开路由（`live_publish_route`）读。
+    pub keys: Arc<std::sync::RwLock<Option<crate::keys::PublishKeys>>>,
 }
 
 impl FromRef<AppState> for Arc<Relay> {
@@ -302,6 +305,24 @@ impl FromRef<AppState> for Arc<Live> {
 /// 从请求头里取一个字符串值。取不到、或者不是合法 UTF-8，一律当作没带。
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
+}
+
+/// 令牌头：没带、或者带了个空串，都当成没带。
+///
+/// 观看页在没有令牌时也会发起请求（读公开房间），一个空字符串的
+/// `x-live-token` 不该因为"带了这个头"就被当成"带了令牌"去跟正确的哈希比。
+fn token_header(headers: &HeaderMap) -> Option<&str> {
+    header(headers, "x-live-token").filter(|t| !t.is_empty())
+}
+
+/// 证明控制房间的那个头：推帧钥匙优先，其次凭证。
+///
+/// 两者都没带，交给调用方按各自路由的规矩回 401——公开/取消公开这两条路
+/// 跟推帧、停播一样，都要求证明控制房间。
+fn control_header(headers: &HeaderMap) -> Option<crate::live::Control<'_>> {
+    header(headers, "x-live-push")
+        .map(crate::live::Control::Push)
+        .or_else(|| header(headers, "x-live-grant").map(crate::live::Control::Grant))
 }
 
 /// 手写的查询串解析。不用 axum 的 `Query` 提取器——那需要额外打开一个
@@ -417,19 +438,21 @@ async fn live_frame_route(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, Rejected> {
-    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+    // 没带令牌不再当场拒绝：公开的房间允许无令牌读帧（`Live::frame`/`authed`
+    // 自己判断这场是不是公开的），私密房间照旧回 401。
+    let token = token_header(&headers);
     let query = parse_query(&uri);
     let lane: usize = query.get("lane").and_then(|v| v.parse().ok()).unwrap_or(0);
     let wait = query.contains_key("wait");
     let seen: Option<u64> = header(&headers, "if-none-match")
         .and_then(|v| v.trim_matches('"').parse().ok());
 
-    let (mut body, mut etag) = live.frame(&id, Some(token), lane)?;
+    let (mut body, mut etag) = live.frame(&id, token, lane)?;
     if wait && seen == Some(etag) {
         if let Some(mut rx) = live.subscribe(&id, lane) {
             let _ = tokio::time::timeout(dct_link::live::WAIT_TIMEOUT, rx.changed()).await;
         }
-        (body, etag) = live.frame(&id, Some(token), lane)?;
+        (body, etag) = live.frame(&id, token, lane)?;
     }
     if seen == Some(etag) {
         return Ok(StatusCode::NOT_MODIFIED.into_response());
@@ -449,28 +472,42 @@ async fn live_frame_route(
 /// 那两样一个字都不许上公网（整份 spec 的前提之一）。`viewers` 搭这班车
 /// 一起回，是因为学生页开场只该拉一次这条路径，之后人数跟着帧的节奏走，
 /// 不该为了一个数字单独起一条轮询。
+/// 这场直播公开着的话，公开标题另起一段——`title` 只在这里出现，观众页
+/// 用它跟自己已经知道的路名（`lanes`）分开显示。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublicTitle {
+    title: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LiveLanesResponse {
     lanes: Vec<String>,
     viewers: u32,
+    /// 公开就是 `Some`，私密是 `None`。观众页拿它判断"这场直播现在是不是
+    /// 公开的"——包括管理台代为公开的情况。
+    public: Option<PublicTitle>,
 }
 
 /// 学生页开场问一次「这场直播上架了哪几路，叫什么名字」。
 ///
-/// 鉴权跟取帧同一条路（`x-live-token`），也跟取帧一样**认不出来和这场
-/// 直播根本不存在回同一个 401**——`Live::lanes` 内部走的是跟 `Live::frame`
-/// 同一个 `authed()`，理由写在 `live.rs` 那段注释里：分开回的话，拿一把
-/// 猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠错误码反推出哪个 id
-/// 现在正播着，把这条路径当探测器用。
+/// 鉴权跟取帧同一条路（`x-live-token`），带着令牌走的时候也跟取帧一样
+/// **认不出来和这场直播根本不存在回同一个 401**——`Live::lanes` 内部走的
+/// 是跟 `Live::frame` 同一个 `authed()`，理由写在 `live.rs` 那段注释里：
+/// 分开回的话，拿一把猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠
+/// 错误码反推出哪个 id 现在正播着，把这条路径当探测器用。**没带令牌**
+/// （或者带了个空串，见 `token_header`）只放行公开的房间。
 async fn live_lanes_route(
     State(live): State<Arc<Live>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<LiveLanesResponse>, Rejected> {
-    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
-    let lanes = live.lanes(&id, Some(token))?.0;
+    let (lanes, public) = live.lanes(&id, token_header(&headers))?;
     let viewers = live.viewers(&id);
-    Ok(Json(LiveLanesResponse { lanes, viewers }))
+    Ok(Json(LiveLanesResponse {
+        lanes,
+        viewers,
+        public: public.map(|title| PublicTitle { title }),
+    }))
 }
 
 /// 老师停播：整场直播连同两把钥匙一起立刻蒸发。跟推帧同一把 `x-live-push`
@@ -486,7 +523,7 @@ async fn live_stop_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 手机网页本体。
+/// 手机网页本体。挂在 `/phone`——`/` 现在是公开列表页（`public_page_route`）。
 ///
 /// **跟守护进程在局域网上发的是同一份字节**（`dct_page::page()`），不是抄过来
 /// 的一份。两份各自演化的网页，最贵的地方在于其中一份的 bug 只在另一种模式
@@ -497,6 +534,58 @@ async fn live_stop_route(
 /// 第二个服务端的第一天起就成立——补挂上去的那天，多半已经有人拷过一份了。
 async fn page_route() -> axum::response::Html<&'static str> {
     axum::response::Html(dct_page::page())
+}
+
+/// 请求体：`{"title": "...", "key": "..."}`。
+#[derive(serde::Deserialize)]
+struct PublishRequest {
+    title: String,
+    key: String,
+}
+
+/// 老师（或者代他操作的管理台）公开这场直播。跟建房共用按来源的限流
+/// （`Live::note_start`，同一本账）——这条路一样对公网开着、一样没有配对
+/// 身份可验，攻击面跟 `POST /live/start` 一样大。
+///
+/// 判断顺序交给 `Live::publish`（先证明控制房间再看总开关再验发布密钥），
+/// 这里只是把 HTTP 那几个头翻译成它要的参数。
+async fn live_publish_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<PublishRequest>,
+) -> Result<StatusCode, Rejected> {
+    state.live.note_start(&client_key(&headers), Instant::now())?;
+    let control = control_header(&headers).ok_or(LinkError::Unauthorized)?;
+    let keys = state.keys.read().expect("keys 锁");
+    state
+        .live
+        .publish(&id, control, keys.as_ref(), &req.key, &req.title)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 取消公开。跟公开同一把控制凭据，`Live::unpublish` 本身是幂等的。
+async fn live_unpublish_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Rejected> {
+    let control = control_header(&headers).ok_or(LinkError::Unauthorized)?;
+    live.unpublish(&id, control)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 公开列表。谁都能读，不需要任何令牌——这就是"公开"的意思。
+async fn live_public_list_route(
+    State(live): State<Arc<Live>>,
+) -> Json<Vec<crate::live::PublicEntry>> {
+    Json(live.public_list())
+}
+
+/// 公开列表页。**Task 5 之前的占位**：`dct_page::public_page()` 还没写，
+/// Task 5 落地那天把这行换掉就是了。
+async fn public_page_route() -> axum::response::Html<&'static str> {
+    axum::response::Html("<!doctype html><title>公开直播</title>")
 }
 
 /// 直播观众页。**只读，只有中转发**——它没有局域网那一档（学生从来不在
@@ -532,17 +621,19 @@ async fn ask_route(
 
 /// 中转挂哪些路由。
 ///
-/// **默认只有直播那一组。** 配对信封那三条（`/link/*`）和手机网页（`/`）没有
-/// 鉴权（见 [`must_be_loopback`]），以前全靠部署方在反代上写一条「只放行
-/// `/live/*`」的白名单挡着——那是一条配置里的约定，换一份「全部转发」的反代
-/// 配置它就没了，公网上的任何人就能冒充任何一台设备收发信封。现在不打开就
-/// 根本不存在，安全不再取决于反代写没写对。
+/// **默认只有直播那一组，外加公开列表。** 配对信封那三条（`/link/*`）和
+/// 手机网页（`/phone`）没有鉴权（见 [`must_be_loopback`]），以前全靠部署方
+/// 在反代上写一条「只放行 `/live/*`」的白名单挡着——那是一条配置里的约定，
+/// 换一份「全部转发」的反代配置它就没了，公网上的任何人就能冒充任何一台
+/// 设备收发信封。现在不打开就根本不存在，安全不再取决于反代写没写对。
+/// `/` 和 `GET /live/public` 是例外：公开列表本来就该谁都能读，两档都挂。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Routes {
-    /// 只有 `/live/*`。生产上跑的就是这一档。
+    /// 只有 `/live/*`（含公开列表 `/`、`/live/public`）。生产上跑的就是
+    /// 这一档。
     LiveOnly,
-    /// 再加上 `/link/*` 和 `/`。只给本机开发、以及鉴权落地之后用
-    /// （`dct-srv --with-link`）。
+    /// 再加上 `/link/*` 和 `/phone`（手机网页）。只给本机开发、以及鉴权
+    /// 落地之后用（`dct-srv --with-link`）。
     WithLink,
 }
 
@@ -550,13 +641,26 @@ pub fn router(state: AppState, routes: Routes) -> Router {
     let app = Router::new();
     let app = match routes {
         Routes::LiveOnly => app,
+        // 手机网页挂在 `/phone`，不再是 `/`——那个位置现在是公开列表页，
+        // 两档都挂（见下面 `.route("/", ...)`）。
         Routes::WithLink => app
-            .route("/", get(page_route))
+            .route("/phone", get(page_route))
             .route(PATH_POLL, post(poll_route))
             .route(PATH_SEND, post(send_route))
             .route(PATH_ASK, post(ask_route)),
     };
     app
+        // 公开列表页和列表接口：谁都能读，两档都挂。
+        .route("/", get(public_page_route))
+        .route(dct_link::live::PATH_PUBLIC_LIST, get(live_public_list_route))
+        .route(
+            "/live/{id}/public",
+            axum::routing::put(live_publish_route)
+                .delete(live_unpublish_route)
+                // 跟 `PATH_START` 一样：请求体只有一个标题和一把密钥，
+                // 16 KB 绰绰有余，不该跟信封共用两兆。
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         // 建房的请求体只有两把钥匙和几个路名，16 KB 绰绰有余。单独给它一个
         // 小上限：这是对公网开着、谁都能调的那一条，不该跟信封共用两兆。
         .route(
@@ -584,6 +688,7 @@ pub async fn serve(
     relay: Arc<Relay>,
     live: Arc<Live>,
     routes: Routes,
+    keys: Option<crate::keys::KeyFile>,
 ) -> Result<(), std::io::Error> {
     // TTL 清扫：老师断线（拔网线、合上笔记本）之后，直播连同两把钥匙要在
     // 一分钟内自己收掉，不然就是永远播着。见 `live.rs` 里 `sweep` 的注释。
@@ -595,7 +700,51 @@ pub async fn serve(
             sweeping.sweep(Instant::now());
         }
     });
-    axum::serve(listener, router(AppState { relay, live }, routes)).await
+
+    // 发布密钥的重载任务：没带 `--publish-keys` 就没有这个任务，公开路由
+    // 读到的 `keys` 一直是 `None`（没开公开功能）。
+    let shared = Arc::new(std::sync::RwLock::new(
+        keys.as_ref().map(|k| k.keys().clone()),
+    ));
+    if let Some(mut file) = keys {
+        let shared = shared.clone();
+        let live = live.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(dct_link::live::PUBLISH_KEYS_RELOAD);
+            loop {
+                tick.tick().await;
+                match file.reload_if_changed() {
+                    Ok(true) => {
+                        let fresh = file.keys().clone();
+                        // 先收回失效的公开，再让路由看见新密钥——顺序反了
+                        // 的话，中间那一小段窗口里吊销掉的密钥仍然公开着。
+                        live.reconcile(Some(&fresh));
+                        *shared.write().expect("keys 锁") = Some(fresh);
+                    }
+                    Ok(false) => {}
+                    // 坏文件：保留上一份，只记日志，见
+                    // `KeyFile::reload_if_changed` 那段注释——写坏文件不能
+                    // 等于吊销全部，也不能等于全部放行。
+                    Err(why) => {
+                        eprintln!("dct-srv：发布密钥文件没重新加载，继续用上一份：{why}")
+                    }
+                }
+            }
+        });
+    }
+
+    axum::serve(
+        listener,
+        router(
+            AppState {
+                relay,
+                live,
+                keys: shared,
+            },
+            routes,
+        ),
+    )
+    .await
 }
 
 /// 第一期只许在环回地址上跑。
@@ -732,6 +881,7 @@ mod tests {
             AppState {
                 relay,
                 live: Arc::new(Live::new()),
+                keys: Arc::new(std::sync::RwLock::new(None)),
             },
             Routes::WithLink,
         )
@@ -746,33 +896,80 @@ mod tests {
             AppState {
                 relay: Arc::new(Relay::new(cfg(200))),
                 live: live.clone(),
+                keys: Arc::new(std::sync::RwLock::new(None)),
             },
             Routes::LiveOnly,
         );
         (app, live)
     }
 
-    /// **不开口子的中转，`/link/*` 和 `/` 根本不存在。** 这几条路由没有鉴权
-    /// （见 `must_be_loopback`），以前全靠反代上那条「只放行 `/live/*`」的白名单
-    /// 挡着——换一份「全部转发」的反代配置，公网上的任何人就能冒充任何一台
-    /// 设备收发信封。现在不带 `--with-link` 起的中转自己就不答这几条路。
+    /// 公开路由测试的底子：一场已经开播的直播，加一把能公开它的发布密钥。
+    fn app_with_keys() -> (Router, Arc<Live>, String) {
+        let live = Arc::new(Live::new());
+        let mut k = crate::keys::PublishKeys::default();
+        let key = k.add("姜老师", 0).unwrap();
+        let app = router(
+            AppState {
+                relay: Arc::new(Relay::new(cfg(200))),
+                live: live.clone(),
+                keys: Arc::new(std::sync::RwLock::new(Some(k))),
+            },
+            Routes::LiveOnly,
+        );
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        (app, live, key)
+    }
+
+    /// 发一条带任意方法/头/body 的请求，把状态码和 body 读回来。
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// **不开口子的中转，配对信封那三条和手机网页根本不存在。** 这几条路由
+    /// 没有鉴权（见 `must_be_loopback`），以前全靠反代上那条「只放行
+    /// `/live/*`」的白名单挡着——换一份「全部转发」的反代配置，公网上的
+    /// 任何人就能冒充任何一台设备收发信封。现在不带 `--with-link` 起的中转
+    /// 自己就不答这几条路。**`/` 是例外**：它是公开列表页，本来就该谁都能
+    /// 看，两档都挂。
     #[tokio::test]
     async fn the_default_relay_does_not_answer_the_unauthenticated_routes() {
         let (app, _live) = app_with_live();
-        for path in [PATH_POLL, PATH_SEND, PATH_ASK] {
+        for path in [PATH_POLL, PATH_SEND, PATH_ASK, "/phone"] {
             let (status, _) = post(app.clone(), path, "{}").await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path} 不该在默认中转上存在");
         }
+        // `/` 是公开列表页，两档都挂。
         let root = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            root.status(),
-            StatusCode::NOT_FOUND,
-            "`/` 不该在默认中转上存在"
-        );
+        assert_eq!(root.status(), StatusCode::OK, "`/` 该在默认中转上打得开");
         // 直播那一半照常：学生页打得开
         let page = app
             .oneshot(
@@ -1249,6 +1446,8 @@ mod tests {
     ///
     /// 这条测试是"只有一份网页"那件事唯一的看门人。哪天有人图省事在
     /// `dct-srv` 里放一份自己的 `page.html`，它当场就红。
+    ///
+    /// 手机网页挂在 `/phone`——`/` 现在是公开列表页。
     #[tokio::test]
     async fn the_relay_serves_the_very_same_page_the_daemon_does() {
         let relay = Arc::new(Relay::new(cfg(50)));
@@ -1256,7 +1455,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/")
+                    .uri("/phone")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1505,6 +1704,117 @@ mod tests {
         // 直播还活着：正常取帧不受影响。
         let still_there = get_frame(&app, "abc", &"t".repeat(64), None).await;
         assert_eq!(still_there.status, 200, "假 secret 停播不该成功");
+    }
+
+    /// 公开 → 列表里出现 → 无令牌能读路名（带公开标题）→ 取消公开 → 无令牌被拒。
+    #[tokio::test]
+    async fn publishing_over_http_end_to_end() {
+        let (app, _live, key) = app_with_keys();
+        let push = push_secret();
+        let body = format!(r#"{{"title":"第3课","key":"{key}"}}"#);
+        let ct = ("content-type", "application/json");
+
+        let (s, _) = call(&app, "PUT", "/live/abc/public", &[ct, ("x-live-push", &push)], &body).await;
+        assert_eq!(s, 204);
+        let (s, list) = call(&app, "GET", "/live/public", &[], "").await;
+        assert_eq!(s, 200);
+        assert!(list.contains("第3课") && list.contains("前端") && !list.contains("姜老师"), "{list}");
+        let (s, lanes) = call(&app, "GET", "/live/abc/lanes", &[], "").await;
+        assert_eq!(s, 200, "公开房间无令牌能读路名");
+        assert!(lanes.contains(r#""public":{"title":"第3课"}"#), "{lanes}");
+
+        let (s, _) = call(&app, "DELETE", "/live/abc/public", &[("x-live-push", &push)], "").await;
+        assert_eq!(s, 204);
+        let (s, _) = call(&app, "GET", "/live/abc/lanes", &[], "").await;
+        assert_eq!(s, 401);
+    }
+
+    #[tokio::test]
+    async fn a_grant_header_can_publish() {
+        let (app, _live, key) = app_with_keys();
+        let grant = dct_link::live::publish_grant(&dct_link::live::push_hash(&push_secret()), "abc");
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[("content-type", "application/json"), ("x-live-grant", &grant)],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 204);
+    }
+
+    /// 服务器没开公开功能：403；公开页照样打得开（空列表）。
+    #[tokio::test]
+    async fn without_a_key_file_publishing_is_forbidden_and_the_list_is_empty() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        let body = format!(r#"{{"title":"课","key":"{}"}}"#, "0".repeat(64));
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[
+                ("content-type", "application/json"),
+                ("x-live-push", &push_secret()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 403);
+        assert_eq!(
+            call(&app, "GET", "/live/public", &[], "").await,
+            (200, "[]".to_string())
+        );
+        assert_eq!(call(&app, "GET", "/", &[], "").await.0, 200);
+    }
+
+    /// 既没带推帧钥匙也没带凭证：401，跟推帧、停播一样。
+    #[tokio::test]
+    async fn publishing_without_proof_of_control_is_unauthorized() {
+        let (app, _live, key) = app_with_keys();
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[("content-type", "application/json")],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 401);
+    }
+
+    /// 空的 `x-live-token` 当成没带：观看页没有令牌时不该因为发了个空头就被拒。
+    #[tokio::test]
+    async fn an_empty_token_header_counts_as_no_token() {
+        let (app, _live, key) = app_with_keys();
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[
+                ("content-type", "application/json"),
+                ("x-live-push", &push_secret()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 204);
+        assert_eq!(
+            call(&app, "GET", "/live/abc/lanes", &[("x-live-token", "")], "")
+                .await
+                .0,
+            200
+        );
     }
 
     /// 中转仍然不看帧里面是什么——这是 spec 决定一在直播上的那条线。
