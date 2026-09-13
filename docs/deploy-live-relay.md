@@ -110,14 +110,18 @@ curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/
 
 ## 二、老师那一侧：`DCT_RELAY` 指到这个域名
 
-守护进程的推帧线程从环境变量 `DCT_RELAY` 里读中转地址，没设就用内置默认值
-（`src/live.rs` 的 `DEFAULT_RELAY_BASE`）。它同时也是拼给学生的那条链接的
-origin——**设错了，老师拿到的链接指向一个打不开的地方**。
+守护进程的推帧线程从环境变量 `DCT_RELAY` 里读中转地址，**没有默认值**：没设
+就没有中转，开播会被拒绝（`ErrorCode::LiveRelayNotConfigured`）。它同时也是拼
+给学生的那条链接的 origin——**设错了，老师拿到的链接指向一个打不开的地方**。
 
 ```bash
 # 老师的机器上，写进 shell 配置里（尾部斜杠有没有都行）
-export DCT_RELAY=https://live.dataclue.cn
+export DCT_RELAY=https://live.example.com
 ```
+
+课堂管理台（`container/classroom`）起的学生工作区不读老师机器上的环境变量：
+在管理服务的 systemd 配置里设 `CLASSROOM_LIVE_RELAY`，它会在**创建**容器时作为
+`DCT_RELAY` 交进去。改了之后，已有的工作区要停止、启动一次才拿得到。
 
 设完重开 dct 的守护进程（推帧线程在守护进程启动时才起）。验收：在 dct 里
 按 `L` 开一场直播，看顶栏那行常驻提示——它说「正在直播」而**不带**「正在

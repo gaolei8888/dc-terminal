@@ -99,6 +99,27 @@ test('Docker driver validates ownership, isolated volumes and 3 GiB budget', asy
 // 换镜像这件事以前只存在于提示文案里：「请先停止它再启动（会换成新镜像）」。
 // 可 `stop()` 只是 `docker stop`，`start()` 看到容器还在就 `docker start`——
 // 拉起来的永远是当初那个镜像，老师照着点一百遍也换不上。
+// dct 不再带内置中转地址，所以直播中转必须由部署方交给工作区——而交给它的
+// 唯一途径是创建容器时的环境变量。没配就不传：传一个空的 `DCT_RELAY=` 进去
+// 跟没传是一回事，只会让人以为配过了。
+test('Docker driver: 配了 CLASSROOM_LIVE_RELAY 才把 DCT_RELAY 交给新工作区', async () => {
+  const {DockerDriver} = await import('./docker.mjs');
+  const id = 'c'.repeat(32), w = {id, name: 'Student'};
+  const runWith = async relay => {
+    const commands = [];
+    const driver = new DockerDriver({image: 'img', maxRunning: 9, relay, command: async (_, args) => {
+      commands.push(args);
+      if (args[0] === 'inspect') { const e = new Error('none'); e.stderr = 'No such object'; throw e; }
+      return {stdout: ''};
+    }});
+    driver.backend = async () => ({port: 1, apiPort: 1, token: 't'});
+    await driver.start(w).catch(() => {});
+    return commands.find(c => c[0] === 'run');
+  };
+  assert.ok((await runWith('https://relay.example')).includes('DCT_RELAY=https://relay.example'));
+  assert.ok(!(await runWith(undefined)).some(a => String(a).startsWith('DCT_RELAY')), '没配就不许传');
+});
+
 test('Docker driver: 停着的容器镜像过期了，启动时删容器、留卷、用新镜像重建', async () => {
   const {DockerDriver} = await import('./docker.mjs');
   const id = 'b'.repeat(32), w = {id, name: 'Student'};
@@ -152,7 +173,7 @@ test('强制直播：只上架活着的会话、路名用学生名字、旧版�
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-live-test-'));
   const store = new Store(dir, {password: 'test-admin'});
   const [ming] = store.add(['小明']);
-  let live = null, sent = [], speaksLive = true;
+  let live = null, sent = [], speaksLive = true, hasRelay = true;
   const driver = {
     maxRunning: 2,
     status: async () => ({status: 'running'}),
@@ -170,6 +191,8 @@ test('强制直播：只上架活着的会话、路名用学生名字、旧版�
       if (request.LiveStart) {
         // 旧版本的守护进程不认识这条请求，回的就是这句。
         if (!speaksLive) return {Error: {BadRequest: 'unknown variant `LiveStart`'}};
+        // 没带参数的错误码在线上就是一个裸字符串，不是对象。
+        if (!hasRelay) return {Error: 'LiveRelayNotConfigured'};
         live = {id: 'abc', token: 't'.repeat(64), url: 'https://live.example/live/abc#t=' + 't'.repeat(64),
                 staged: request.LiveStart.ids.map((id, i) => [id, request.LiveStart.names[i]]), viewers: 3, readiness: 'Ready'};
         return {Live: live};
@@ -215,6 +238,13 @@ test('强制直播：只上架活着的会话、路名用学生名字、旧版�
     const refused = await request(`/admin/api/students/${ming.id}/live-start`, {}, admin);
     assert.equal(refused.status, 409);
     assert.match((await refused.json()).error, /版本还不支持直播/);
+
+    // 工作区里的 dct 没配中转：老师该看到「管理员去配中转」，不是一个
+    // 被 `Object.values` 拆成单个字母的 "L"。
+    speaksLive = true; hasRelay = false;
+    const noRelay = await request(`/admin/api/students/${ming.id}/live-start`, {}, admin);
+    assert.equal(noRelay.status, 409);
+    assert.match((await noRelay.json()).error, /没有配置直播中转/);
   } finally {
     app.server.close();
     fs.rmSync(dir, {recursive: true, force: true});

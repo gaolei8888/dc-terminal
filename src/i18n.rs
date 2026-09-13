@@ -1841,6 +1841,11 @@ pub mod msg {
                 en: format!("git failed: {raw}"),
                 zh: format!("git 操作失败：{raw}"),
             ),
+            LiveRelayNotConfigured => t!(
+                lang,
+                en: "live broadcasting has no relay configured — set DCT_RELAY to your relay's address (for example https://live.example.com) before starting dct".to_string(),
+                zh: "直播还没配置中转：启动 dct 之前把环境变量 DCT_RELAY 设成中转地址（例如 https://live.example.com）".to_string(),
+            ),
             CannotStart(cmd) => t!(
                 lang,
                 en: format!("{cmd} would not start — it may be installed incorrectly"),
@@ -2707,6 +2712,7 @@ mod tests {
             LiveStagingRejected(crate::proto::LiveStagingProblem::TooMany { max: 4, got: 5 }),
             LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![7, 9])),
             LiveStagingRejected(crate::proto::LiveStagingProblem::NotLive),
+            LiveRelayNotConfigured,
             Git("fatal: not a repository".into()),
             SecretsFileBroken {
                 path: "/h/.dct/secrets.toml".into(),

@@ -13,12 +13,18 @@
 //! 所以这条线程自己起（`spawn_pusher`），线程体包 `catch_unwind`——直播
 //! 死掉是遗憾，会话死掉是灾难，两件事不能连在一起。
 //!
-//! # 中转地址从哪来（临时办法）
+//! # 中转地址从哪来
 //!
-//! 眼下 dct 还没有配对信息可用，`relay_base()` 只能从环境变量
-//! `DCT_RELAY` 或者一个内置默认值里猜。**这是临时办法**：将来 dct 接上
-//! dc_classroom 登录之后，中转地址该从配对结果里来，而不是从进程环境变量
-//! 猜——到那一天之前，`resolve_relay_base` 是唯一定义这件事的地方。
+//! 只从环境变量 `DCT_RELAY` 来，**没有内置默认值**。没设就是没有中转，
+//! 守护进程拒绝开播（`ErrorCode::LiveRelayNotConfigured`）。
+//!
+//! 以前这里写死过一个作者自己在跑的中转。那等于每个装了 dct 的人按 `L`，
+//! 画面就推到一台跟他毫无关系的机器上：带宽、费用、滥用、谁对画面内容
+//! 负责，全落在那台机器的主人头上，而用户自己根本不知道画面去了哪儿。
+//! 中转在哪儿是部署方的决定，不是这个仓库替他做的决定。
+//!
+//! 将来 dct 接上 dc_classroom 登录之后，中转地址该从配对结果里来——到那
+//! 一天之前，`resolve_relay_base` 是唯一定义这件事的地方。
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -67,20 +73,26 @@ pub struct LiveState {
     /// 学生链接的 origin，比如 `https://example.tzspace.cn`——`start()` 拼
     /// 链接时要用，跟中转那一侧约定好的地址由调用方传进来，这里不猜。
     ///
-    /// **这个任务给的是空串。** 真正的中转地址是下一个任务（推帧线程）要
-    /// 接的线——它本来就得知道中转在哪儿才能把帧 POST 过去。空串期间
-    /// `start()`/`info()` 拼出来的 `url` 的 host 部分是空的，**不能直接给
-    /// 学生用**；谁把这里换成真实地址，谁就接手了这条职责。
-    base: String,
+    /// `None` = 没配中转（`DCT_RELAY` 没设）。这时候守护进程在 `LiveStart`
+    /// 那一步就拒绝（见 `daemon.rs::live_start`），根本不会有房间，所以下面
+    /// 拼 `url` 时不会真的拿空 host 去拼一条发给学生的链接。
+    base: Option<String>,
     room: Mutex<Option<Room>>,
 }
 
 impl LiveState {
-    pub fn new(base: String) -> Self {
+    /// 收 `impl Into<Option<String>>`：给一个 `String` 就是有中转，给 `None`
+    /// 就是没有——测试和守护进程写起来都不用多包一层 `Some`。
+    pub fn new(base: impl Into<Option<String>>) -> Self {
         Self {
-            base,
+            base: base.into(),
             room: Mutex::new(None),
         }
+    }
+
+    /// 配没配中转。守护进程开播之前先问这一句。
+    pub fn has_relay(&self) -> bool {
+        self.base.is_some()
     }
 
     /// 开一场：生成 live-id、两把钥匙、拼出学生链接。
@@ -93,7 +105,7 @@ impl LiveState {
         let push_secret = new_hex(dct_link::live::LIVE_TOKEN_LEN);
         // token 放在 fragment 里：浏览器不会把 `#` 后面的东西发给服务器，
         // 它不进任何一层访问日志（中转的、反代的都不进）。
-        let url = format!("{}/live/{id}#t={token}", self.base);
+        let url = format!("{}/live/{id}#t={token}", self.base());
 
         let info = LiveInfo {
             id: id.clone(),
@@ -147,7 +159,7 @@ impl LiveState {
         Some(LiveInfo {
             id: room.id.clone(),
             token: room.token.clone(),
-            url: format!("{}/live/{}#t={}", self.base, room.id, room.token),
+            url: format!("{}/live/{}#t={}", self.base(), room.id, room.token),
             staged: room.staged.clone(),
             viewers: room.viewers,
             readiness: room.readiness.clone(),
@@ -170,7 +182,7 @@ impl LiveState {
             Some(room) => LiveInfo {
                 id: room.id.clone(),
                 token: room.token.clone(),
-                url: format!("{}/live/{}#t={}", self.base, room.id, room.token),
+                url: format!("{}/live/{}#t={}", self.base(), room.id, room.token),
                 staged: room.staged.clone(),
                 viewers: room.viewers,
                 readiness: room.readiness.clone(),
@@ -255,9 +267,10 @@ impl LiveState {
         })
     }
 
-    /// 中转的地址，给推帧线程拼 URL 用。
+    /// 中转的地址，给推帧线程和拼学生链接用。没配中转时是空串——那种状态
+    /// 下根本开不出房间（见 `base` 字段的文档），推帧线程也就无帧可推。
     fn base(&self) -> &str {
-        &self.base
+        self.base.as_deref().unwrap_or("")
     }
 }
 
@@ -292,17 +305,7 @@ fn recover<T>(r: std::sync::LockResult<T>) -> T {
     r.unwrap_or_else(|e| e.into_inner())
 }
 
-/// 环境变量没设的时候，中转用这个地址。**改这个值就是改中转地址唯一
-/// 该改的地方**——见模块头「中转地址从哪来」那一段。
-///
-/// 这个值必须指向一个**真的在跑**的中转：装完 dct 的人按 `L` 就该能播，
-/// 而不是先去读一遍文档才知道要设个环境变量。上一版这里写的是一个从来
-/// 没解析过的域名（写 spec 时假设会用的那个），于是默认路径上开播必然
-/// 失败——「默认值指向不存在的东西」是那种每个新用户都会踩、而写代码的
-/// 人永远踩不到的坑。
-const DEFAULT_RELAY_BASE: &str = "https://live.dataclue.cn";
-
-/// 覆盖中转地址用的环境变量名。
+/// 指定中转地址的环境变量名。**没有默认值**，见模块头「中转地址从哪来」。
 const RELAY_ENV: &str = "DCT_RELAY";
 
 /// 中转地址该是什么。**纯函数，好测**：真正去读环境变量的是
@@ -310,18 +313,18 @@ const RELAY_ENV: &str = "DCT_RELAY";
 ///
 /// 尾部斜杠有没有都要能用，做法照抄 `link.rs::LinkConfig::url()`：在这里
 /// 一次性去掉，下游拼 `{base}{path}` 就不用各自再处理一遍——两处各自
-/// trim 是「一边改了另一边没改」的那种 bug。空字符串当成没设（`DCT_RELAY=`
-/// 这种半吊子配置不该悄悄指向一个空 host）。
-fn resolve_relay_base(env: Option<&str>) -> String {
-    let raw = env.filter(|s| !s.is_empty()).unwrap_or(DEFAULT_RELAY_BASE);
-    raw.trim_end_matches('/').to_string()
+/// trim 是「一边改了另一边没改」的那种 bug。空字符串、全是空白都当成没设
+/// （`DCT_RELAY=` 这种半吊子配置不该悄悄指向一个空 host）。
+fn resolve_relay_base(env: Option<&str>) -> Option<String> {
+    let raw = env.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(raw.trim_end_matches('/').to_string())
 }
 
-/// 中转地址：`DCT_RELAY` 环境变量优先，没设就用内置默认值。
+/// 中转地址：`DCT_RELAY` 环境变量，没设就是 `None`（没有中转）。
 ///
-/// **临时办法**——见模块头「中转地址从哪来」那一段：将来 dct 接上
-/// dc_classroom 登录之后，这个值该从配对结果里来，而不是从进程环境变量猜。
-pub fn relay_base() -> String {
+/// 将来 dct 接上 dc_classroom 登录之后，这个值该从配对结果里来，而不是从
+/// 进程环境变量猜。
+pub fn relay_base() -> Option<String> {
     resolve_relay_base(std::env::var(RELAY_ENV).ok().as_deref())
 }
 
@@ -756,7 +759,7 @@ mod tests {
     /// 字段存不存在」才能往下渲染。
     #[test]
     fn info_before_any_start_is_an_empty_but_complete_shape() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.info();
         assert_eq!(info.id, "");
         assert_eq!(info.token, "");
@@ -768,7 +771,7 @@ mod tests {
     /// 链接形状固定：`{base}/live/{id}#t={token}`，token 在 fragment 里。
     #[test]
     fn start_builds_the_student_link_with_the_token_in_the_fragment() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "前端".into())]);
         assert_eq!(
             info.url,
@@ -781,7 +784,7 @@ mod tests {
     /// 只能从 `LiveState::push_secret()` 这条 crate 内部的口子拿。
     #[test]
     fn the_viewer_token_and_the_push_secret_are_different_keys() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![]);
         let secret = live.push_secret().expect("刚开播，该有 push_secret");
         assert_ne!(info.token, secret);
@@ -791,7 +794,7 @@ mod tests {
     /// 两个 crate 各写一份长度就是「一边改了另一边没改」。
     #[test]
     fn the_generated_lengths_match_the_shared_constants() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![]);
         assert_eq!(info.id.len(), dct_link::live::LIVE_ID_LEN);
         assert_eq!(info.token.len(), dct_link::live::LIVE_TOKEN_LEN);
@@ -805,7 +808,7 @@ mod tests {
     /// 上一场留下来的钥匙以为自己还能推。
     #[test]
     fn push_secret_is_none_when_nothing_is_live() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         assert!(live.push_secret().is_none());
     }
 
@@ -813,7 +816,7 @@ mod tests {
     /// 尾巴——尤其是钥匙，停播之后它们不该再答得出来。
     #[test]
     fn stop_clears_the_room() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         live.start(vec![(1, "前端".into())]);
         live.stop();
         let info = live.info();
@@ -825,7 +828,7 @@ mod tests {
     /// 再开一场直接顶掉上一场——不用先手动停播。
     #[test]
     fn starting_again_replaces_the_previous_room() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let first = live.start(vec![(1, "前端".into())]);
         let second = live.start(vec![(2, "后端".into())]);
         assert_ne!(first.id, second.id);
@@ -839,7 +842,7 @@ mod tests {
     /// token、push_secret 三样一个都不能变。
     #[test]
     fn restaging_keeps_the_id_and_both_keys_so_the_link_stays_valid() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let first = live.start(vec![(1, "后端".into())]);
         let secret_before = live.push_secret().unwrap();
 
@@ -862,7 +865,7 @@ mod tests {
     /// 不能继续说 `Ready`。
     #[test]
     fn restaging_drops_back_to_pending_until_the_relay_knows_the_new_lanes() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "后端".into())]);
         live.mark_ready(&info.id, 0);
 
@@ -876,7 +879,7 @@ mod tests {
     /// 分辨这两次。
     #[test]
     fn a_late_mark_ready_for_the_previous_staging_does_not_claim_the_new_one_is_ready() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "后端".into())]);
         live.restage(vec![(2, "前端".into())]).unwrap();
 
@@ -893,7 +896,7 @@ mod tests {
     /// 的数要真的走到 `info()` 上，而不是一个恒为 0 的硬编码。
     #[test]
     fn the_viewer_count_comes_from_the_relay_not_a_hardcoded_zero() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "前端".into())]);
         assert_eq!(info.viewers, 0, "刚开播还没人，也还没读过");
 
@@ -905,7 +908,7 @@ mod tests {
     /// 改上架不该把刚读到的人数扔掉——人数跟上架了哪几路无关。
     #[test]
     fn restaging_keeps_the_viewer_count() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "前端".into())]);
         live.set_viewers(&info.id, 12);
 
@@ -917,7 +920,7 @@ mod tests {
     /// 一次迟到的人数回执不该落到另一场直播头上。
     #[test]
     fn a_late_viewer_count_for_a_previous_live_is_ignored() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let stale = live.start(vec![(1, "前端".into())]);
         live.start(vec![(2, "后端".into())]);
 
@@ -961,7 +964,7 @@ mod tests {
     /// 没在播的时候没有名单可改——回 `None`，不能悄悄开一场新的。
     #[test]
     fn restaging_when_nothing_is_live_answers_none() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         assert!(live.restage(vec![(1, "前端".into())]).is_none());
         assert!(live.info().id.is_empty(), "restage 不该凭空开出一场直播");
     }
@@ -1122,25 +1125,31 @@ mod tests {
     /// 链接里那串东西必须够长、而且每次都不一样。
     #[test]
     fn two_lives_never_get_the_same_link() {
-        let a = LiveState::new("https://x".into()).start(vec![(1, "一".into())]);
-        let b = LiveState::new("https://x".into()).start(vec![(1, "一".into())]);
+        let a = LiveState::new("https://x".to_string()).start(vec![(1, "一".into())]);
+        let b = LiveState::new("https://x".to_string()).start(vec![(1, "一".into())]);
         assert_ne!(a.token, b.token);
         assert_eq!(a.token.len(), dct_link::live::LIVE_TOKEN_LEN);
         assert!(a.url.starts_with("https://x/live/"), "链接形状不对：{}", a.url);
         assert!(a.url.contains("#t="), "token 必须在 fragment 里：{}", a.url);
     }
 
-    /// 环境变量没设的时候用内置默认值。
+    /// **没设就是没有中转，不许退回任何内置地址。** 一个写死的默认值意味着
+    /// 每个装了 dct 的人按 `L`，画面就推到仓库作者自己的那台机器上——带宽、
+    /// 费用、滥用、谁对画面内容负责，全落在一个跟这个用户毫无关系的人头上。
     #[test]
-    fn no_env_var_falls_back_to_the_default() {
-        assert_eq!(resolve_relay_base(None), DEFAULT_RELAY_BASE);
-        assert_eq!(resolve_relay_base(Some("")), DEFAULT_RELAY_BASE, "空字符串不算设了");
+    fn no_env_var_means_no_relay() {
+        assert_eq!(resolve_relay_base(None), None);
+        assert_eq!(resolve_relay_base(Some("")), None, "空字符串不算设了");
+        assert_eq!(resolve_relay_base(Some("   ")), None, "全是空白也不算设了");
     }
 
     /// 环境变量设了就用它。
     #[test]
-    fn an_env_var_overrides_the_default() {
-        assert_eq!(resolve_relay_base(Some("https://relay.example")), "https://relay.example");
+    fn an_env_var_names_the_relay() {
+        assert_eq!(
+            resolve_relay_base(Some("https://relay.example")).as_deref(),
+            Some("https://relay.example")
+        );
     }
 
     /// 尾部斜杠有没有都要能用，答案得一样——照 `LinkConfig::url()` 的做法。
@@ -1150,10 +1159,13 @@ mod tests {
             resolve_relay_base(Some("https://relay.example/")),
             resolve_relay_base(Some("https://relay.example"))
         );
-        assert_eq!(
-            resolve_relay_base(None),
-            resolve_relay_base(Some(&format!("{DEFAULT_RELAY_BASE}/")))
-        );
+    }
+
+    /// 没有中转的状态槽自己说得出「我没有中转」，守护进程靠它拒绝开播。
+    #[test]
+    fn a_live_state_knows_whether_it_has_a_relay() {
+        assert!(LiveState::new("https://x".to_string()).has_relay());
+        assert!(!LiveState::new(None).has_relay());
     }
 
     /// 假中转：只认推帧/开播/停播这三条路径，记下收到的方法/路径/头/body，
@@ -1516,7 +1528,7 @@ mod tests {
     /// 说「还没就绪」，不能让老师那块屏幕以为链接已经能用了。
     #[test]
     fn a_freshly_started_live_is_not_ready_yet() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "前端".into())]);
         assert_eq!(info.readiness, crate::proto::LiveReadiness::Pending);
     }
@@ -1524,7 +1536,7 @@ mod tests {
     /// 推帧线程告诉中转成功之后，`readiness` 要翻成 `Ready`。
     #[test]
     fn marking_ready_flips_the_readiness() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "前端".into())]);
         live.mark_ready(&info.id, 0);
         assert_eq!(live.info().readiness, crate::proto::LiveReadiness::Ready);
@@ -1534,7 +1546,7 @@ mod tests {
     /// 这条线程手上没有 `Lang`。
     #[test]
     fn marking_failed_records_a_reason_code_not_a_sentence() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let info = live.start(vec![(1, "前端".into())]);
         live.mark_failed(&info.id, 0, LiveFailure::Refused(429));
         assert_eq!(
@@ -1548,7 +1560,7 @@ mod tests {
     /// 是对着一场已经不存在的直播做的。
     #[test]
     fn marking_a_stale_id_does_not_touch_the_current_room() {
-        let live = LiveState::new("https://x".into());
+        let live = LiveState::new("https://x".to_string());
         let stale = live.start(vec![(1, "前端".into())]);
         let current = live.start(vec![(2, "后端".into())]);
         live.mark_ready(&stale.id, 0);

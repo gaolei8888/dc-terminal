@@ -652,8 +652,12 @@ piece of work, designed but not built: see
 Press `L` in a session for the live panel: stage a few sessions, get a link and a
 QR code, hand it out. Students open it in a browser and **can only watch**.
 
-It works out of the box — frames travel through the relay at `live.dataclue.cn`
-(point `DCT_RELAY` at your own to use a different one).
+It needs a relay, and **dct ships without one**: set `DCT_RELAY` to the address of
+a relay you run (`dct-srv` in this repo; setup in
+[`docs/deploy-live-relay.md`](docs/deploy-live-relay.md)) before starting dct.
+Without it, starting a broadcast says so instead of handing you a link that goes
+nowhere. Where your screen travels is your call, not a default baked into the
+binary.
 
 "Only watch" is not a check somewhere in the code — the pipe runs one way. The
 daemon pushes the staged screens to a relay twice a second and students read from

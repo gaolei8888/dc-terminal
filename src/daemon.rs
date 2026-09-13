@@ -218,10 +218,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
 
     // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
-    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——`DCT_RELAY`
-    // 环境变量优先，没设就用内置默认值。这是临时办法：将来 dct 接上
-    // dc_classroom 登录之后，中转地址该从配对结果里来，见那个函数的文档
-    // 注释。
+    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——只看
+    // `DCT_RELAY` 环境变量，**没有默认值**：没设就没有中转，`LiveStart`
+    // 会被拒绝。见 `live.rs` 模块头「中转地址从哪来」。
     let live: Arc<crate::live::LiveState> =
         Arc::new(crate::live::LiveState::new(crate::live::relay_base()));
     // 推帧线程，整个守护进程生命周期只起一条：它自己每一轮去问「现在在播
@@ -1061,6 +1060,11 @@ fn live_start(
     ids: Vec<u32>,
     names: Vec<String>,
 ) -> Response {
+    // 没有中转就不开播，而且**先于**上架校验：名单再合法，没有地方可推
+    // 也是白搭，老师该先知道的是这一件。
+    if !live.has_relay() {
+        return Response::Error(ErrorCode::LiveRelayNotConfigured);
+    }
     match validated_staging(mgr, ids, names) {
         Ok(staged) => Response::Live(live.start(staged)),
         Err(e) => Response::Error(e),
@@ -1489,7 +1493,7 @@ mod tests {
 
     /// 同上——大多数测试不关心直播，给一个空槽就行。
     fn test_live() -> Arc<crate::live::LiveState> {
-        Arc::new(crate::live::LiveState::new("https://x".into()))
+        Arc::new(crate::live::LiveState::new("https://x".to_string()))
     }
 
     fn test_pair_started() -> crate::pair::Started {
@@ -3030,6 +3034,39 @@ mod tests {
         }
     }
 
+    /// **没配中转就不开播。** 不拒绝的话，守护进程照样生成一条链接、把状态
+    /// 设成「在播」，老师拿着一条 host 是空的链接发给全班，推帧线程却无处
+    /// 可推——屏幕上挂着一场永远连不上的直播。拒绝要报码，不组句。
+    #[test]
+    fn starting_a_broadcast_without_a_relay_is_refused() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
+        let live = Arc::new(crate::live::LiveState::new(None));
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![id],
+                names: vec!["前端".into()],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::LiveRelayNotConfigured)),
+            "期待 LiveRelayNotConfigured，得到 {resp:?}"
+        );
+        assert!(live.info().id.is_empty(), "没有中转不该开出一场直播");
+    }
+
     /// 没在播的时候改上架：说出来，不许悄悄开一场新的直播——那正是这条
     /// 协议要避免的事。
     #[test]
@@ -3158,7 +3195,7 @@ mod web_tests {
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
             pairs: Arc::new(Mutex::new(BTreeMap::new())),
-            live: Arc::new(crate::live::LiveState::new("https://x".into())),
+            live: Arc::new(crate::live::LiveState::new("https://x".to_string())),
             _dir: dir,
         }
     }
