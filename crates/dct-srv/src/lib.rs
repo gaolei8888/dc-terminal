@@ -424,12 +424,12 @@ async fn live_frame_route(
     let seen: Option<u64> = header(&headers, "if-none-match")
         .and_then(|v| v.trim_matches('"').parse().ok());
 
-    let (mut body, mut etag) = live.frame(&id, token, lane)?;
+    let (mut body, mut etag) = live.frame(&id, Some(token), lane)?;
     if wait && seen == Some(etag) {
         if let Some(mut rx) = live.subscribe(&id, lane) {
             let _ = tokio::time::timeout(dct_link::live::WAIT_TIMEOUT, rx.changed()).await;
         }
-        (body, etag) = live.frame(&id, token, lane)?;
+        (body, etag) = live.frame(&id, Some(token), lane)?;
     }
     if seen == Some(etag) {
         return Ok(StatusCode::NOT_MODIFIED.into_response());
@@ -468,7 +468,7 @@ async fn live_lanes_route(
     headers: HeaderMap,
 ) -> Result<Json<LiveLanesResponse>, Rejected> {
     let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
-    let lanes = live.lanes(&id, token)?;
+    let lanes = live.lanes(&id, Some(token))?.0;
     let viewers = live.viewers(&id);
     Ok(Json(LiveLanesResponse { lanes, viewers }))
 }
