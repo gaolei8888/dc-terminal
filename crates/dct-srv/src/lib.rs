@@ -26,6 +26,7 @@
 
 mod live;
 pub use live::Live;
+pub mod keys;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -616,6 +617,95 @@ pub fn must_be_loopback(addr: std::net::SocketAddr) -> Result<(), String> {
     ))
 }
 
+/// 中转的五种启动方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cli {
+    Serve {
+        addr: String,
+        with_link: bool,
+        publish_keys: Option<std::path::PathBuf>,
+    },
+    KeyAdd {
+        name: String,
+        file: std::path::PathBuf,
+    },
+    KeyRevoke {
+        name: String,
+        file: std::path::PathBuf,
+    },
+    KeyList {
+        file: std::path::PathBuf,
+    },
+    Takedown {
+        id: String,
+        file: std::path::PathBuf,
+    },
+}
+
+/// 手写解析：五种形状，不值得为此引一个参数库。
+pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
+        match args.iter().position(|a| a == flag) {
+            None => Ok(None),
+            Some(i) => args
+                .get(i + 1)
+                .filter(|v| !v.starts_with("--"))
+                .map(|v| Some(v.into()))
+                .ok_or_else(|| format!("{flag} 后面要跟一个文件路径")),
+        }
+    }
+    let need_file = |args: &[String]| {
+        flag_value(args, "--file")?.ok_or_else(|| "管理命令要写明 --file <密钥文件>".to_string())
+    };
+    match args.first().map(String::as_str) {
+        Some("key") => {
+            let name = || args.get(2).cloned().ok_or_else(|| "缺少名字".to_string());
+            match args.get(1).map(String::as_str) {
+                Some("add") => Ok(Cli::KeyAdd {
+                    name: name()?,
+                    file: need_file(args)?,
+                }),
+                Some("revoke") => Ok(Cli::KeyRevoke {
+                    name: name()?,
+                    file: need_file(args)?,
+                }),
+                Some("list") => Ok(Cli::KeyList {
+                    file: need_file(args)?,
+                }),
+                _ => Err("用法：dct-srv key add|revoke|list ...".into()),
+            }
+        }
+        Some("takedown") => Ok(Cli::Takedown {
+            id: args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "缺少房间号".to_string())?,
+            file: need_file(args)?,
+        }),
+        _ => {
+            let publish_keys = flag_value(args, "--publish-keys")?;
+            let mut skip_next = false;
+            let mut addr = None;
+            for a in args {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if a == "--publish-keys" {
+                    skip_next = true;
+                } else if !a.starts_with("--") && addr.is_none() {
+                    addr = Some(a.clone());
+                }
+            }
+            Ok(Cli::Serve {
+                addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
+                with_link: args.iter().any(|a| a == "--with-link"),
+                publish_keys,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,7 +863,12 @@ mod tests {
         body: Vec<u8>,
     }
 
-    async fn get_frame(app: &Router, id: &str, token: &str, if_none_match: Option<&str>) -> FrameResp {
+    async fn get_frame(
+        app: &Router,
+        id: &str,
+        token: &str,
+        if_none_match: Option<&str>,
+    ) -> FrameResp {
         let mut req = Request::builder()
             .method("GET")
             .uri(format!("/live/{id}/frame"))
@@ -1431,5 +1526,58 @@ mod tests {
                 "{name} 出现在中转里——它开始认识 dct 的协议了"
             );
         }
+    }
+
+    #[test]
+    fn the_command_line_is_parsed_into_one_of_five_shapes() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&a("")).unwrap(),
+            Cli::Serve {
+                addr: "127.0.0.1:8787".into(),
+                with_link: false,
+                publish_keys: None
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("127.0.0.1:9000 --with-link --publish-keys /k.json")).unwrap(),
+            Cli::Serve {
+                addr: "127.0.0.1:9000".into(),
+                with_link: true,
+                publish_keys: Some("/k.json".into())
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("key add 姜老师 --file /k.json")).unwrap(),
+            Cli::KeyAdd {
+                name: "姜老师".into(),
+                file: "/k.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("key revoke a --file /k.json")).unwrap(),
+            Cli::KeyRevoke {
+                name: "a".into(),
+                file: "/k.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("key list --file /k.json")).unwrap(),
+            Cli::KeyList {
+                file: "/k.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("takedown abc --file /k.json")).unwrap(),
+            Cli::Takedown {
+                id: "abc".into(),
+                file: "/k.json".into()
+            }
+        );
+        assert!(
+            parse_cli(&a("key add a")).is_err(),
+            "管理命令必须写明 --file"
+        );
+        assert!(parse_cli(&a("--publish-keys")).is_err(), "参数缺值要报错");
     }
 }
