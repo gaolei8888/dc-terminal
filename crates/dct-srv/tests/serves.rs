@@ -14,7 +14,7 @@ use std::time::Duration;
 use dct_link::{
     AuthFrame, EndpointId, EndpointKind, Envelope, SendRequest, LINK_VERSION, PATH_POLL, PATH_SEND,
 };
-use dct_srv::{Config, Live, Relay, Routes};
+use dct_srv::{Config, Control, Live, Relay, Routes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -144,4 +144,35 @@ fn the_relay_refuses_to_listen_anywhere_but_loopback() {
         // 报错要说清楚下一步，不能只说"不行"。
         assert!(why.contains("端到端加密"), "{why}");
     }
+}
+
+/// 手工看公开页：`cargo test -p dct-srv --test serves serve_a_public_room_for_a_manual_look -- --ignored --nocapture`
+/// 然后浏览器打开打印出来的地址。
+#[tokio::test]
+#[ignore]
+async fn serve_a_public_room_for_a_manual_look() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("keys.json");
+    let mut k = dct_srv::keys::PublishKeys::default();
+    let key = k.add("手工验收", 0).unwrap();
+    k.save(&file).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let live = Arc::new(Live::new());
+    let push = "p".repeat(64);
+    live.start("demo01".into(), "t".repeat(64), push.clone(), vec!["前端".into(), "后端".into()]).unwrap();
+    let keys = dct_srv::keys::KeyFile::open(file).unwrap();
+    live.publish("demo01", Control::Push(&push), Some(keys.keys()), &key, "手工验收 · <script>alert(1)</script>").unwrap();
+    // 房间 60 秒没推帧会被 TTL 回收：每 20 秒推一次空帧保活。
+    let keepalive = live.clone();
+    let keepalive_secret = push.clone();
+    tokio::spawn(async move {
+        loop {
+            let _ = keepalive.push("demo01", &keepalive_secret, 0, Vec::new());
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    });
+    tokio::spawn(dct_srv::serve(listener, Arc::new(Relay::new(Config::default())), live, Routes::LiveOnly, Some(keys)));
+    println!("公开页：http://{addr}/   （标题里那段 <script> 必须原样显示成文字）");
+    tokio::time::sleep(Duration::from_secs(600)).await;
 }

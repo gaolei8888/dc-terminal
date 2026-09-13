@@ -25,7 +25,7 @@
 //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
 
 mod live;
-pub use live::Live;
+pub use live::{Control, Live, PublicEntry};
 pub mod keys;
 
 use std::collections::HashMap;
@@ -582,10 +582,10 @@ async fn live_public_list_route(
     Json(live.public_list())
 }
 
-/// 公开列表页。**Task 5 之前的占位**：`dct_page::public_page()` 还没写，
-/// Task 5 落地那天把这行换掉就是了。
+/// 公开列表页。跟 `page_route`/`live_page_route` 同一个理由挂在这儿：
+/// `dct-page` 是两边唯一的真相来源，这里只是把已经打包好的字节交给 axum。
 async fn public_page_route() -> axum::response::Html<&'static str> {
-    axum::response::Html("<!doctype html><title>公开直播</title>")
+    axum::response::Html(dct_page::public_page())
 }
 
 /// 直播观众页。**只读，只有中转发**——它没有局域网那一档（学生从来不在

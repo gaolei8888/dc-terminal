@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 const SHARED: &str = include_str!("../shared.js");
 const PAGE_SRC: &str = include_str!("../page.html");
 const LIVE_SRC: &str = include_str!("../live.html");
+const PUBLIC_SRC: &str = include_str!("../public.html");
 
 /// 占位符只此一个写法，两页都用它。
 const MARK: &str = "<!--SHARED-->";
@@ -42,6 +43,11 @@ pub fn page() -> &'static str {
 pub fn live_page() -> &'static str {
     static IT: OnceLock<String> = OnceLock::new();
     IT.get_or_init(|| LIVE_SRC.replace(MARK, SHARED))
+}
+
+/// 公开直播列表页，只由中转发（`GET /`）。不用共享渲染代码，所以不做占位符替换。
+pub fn public_page() -> &'static str {
+    PUBLIC_SRC
 }
 
 #[cfg(test)]
@@ -227,5 +233,32 @@ mod tests {
     fn neither_page_is_empty() {
         assert!(super::page().len() > 10_000);
         assert!(super::live_page().len() > 4_000);
+    }
+
+    /// 公开页真的打包进来了，而且是给公众看的那一页。
+    #[test]
+    fn the_public_page_is_here() {
+        let p = super::public_page();
+        assert!(p.contains("<!doctype html>"));
+        assert!(p.contains("/live/public"), "公开页要去拉公开列表");
+    }
+
+    /// **标题和路名是别人填的自由文本，只能当纯文本塞进页面。** 两页都不许
+    /// 出现 `innerHTML`：一个 `<script>` 写进标题，就是公开页上的存储型 XSS。
+    #[test]
+    fn neither_page_ever_uses_inner_html() {
+        for (name, src) in [("public.html", super::public_page()), ("live.html", super::live_page())] {
+            assert!(!src.contains("innerHTML"), "{name} 里出现了 innerHTML");
+            assert!(!src.contains("outerHTML"), "{name} 里出现了 outerHTML");
+            assert!(!src.contains("insertAdjacentHTML"), "{name} 里出现了 insertAdjacentHTML");
+        }
+    }
+
+    /// 观看页没有令牌时不能发一个空的 `x-live-token`，而要干脆不带。
+    #[test]
+    fn the_live_page_omits_the_token_header_when_it_has_none() {
+        let src = super::live_page();
+        assert!(src.contains("function tokenHeaders()"), "拉帧和拉路名要走同一个取头的函数");
+        assert!(!src.contains(r#"headers: { "x-live-token": TOKEN }"#), "还有地方直接写死了令牌头");
     }
 }
