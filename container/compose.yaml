@@ -32,6 +32,11 @@ services:
       # 状态，缺一个学生就丢东西（见 Dockerfile 里 VOLUME 那段）。
       - dct-state:/home/dc/.dct
       - claude-state:/home/dc/.claude
+      # **codex 的登录也要挂出来。** 少了这一行，它只活在容器的可写层里：
+      # 换一次镜像、重建一次容器，登录就没了，而症状是学生点「打开项目」
+      # 得到一句「无法打开会话，请检查终端服务和 agent 配置」——指向了
+      # 完全不相干的地方。线上因为这个连撞两次。
+      - codex-state:/home/dc/.codex
       # 代码。**这里是命名卷**——IO 原速、git 检查点原速，代价是宿主上看不到
       # 文件。换成绑定挂载（`- ./work:/home/dc/work`）能用本地编辑器，但
       # Windows/macOS 上会拖垮编译，换行和权限还会咬 git 检查点。
@@ -69,4 +74,5 @@ services:
 volumes:
   dct-state:
   claude-state:
+  codex-state:
   work:
