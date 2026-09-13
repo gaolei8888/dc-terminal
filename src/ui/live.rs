@@ -142,6 +142,42 @@ fn write_osc52_clipboard(text: &str) {
     );
 }
 
+/// 多久问一次守护进程「现在在不在播」。
+///
+/// 2 秒是「学生看得出自己被播了」和「每帧都打一次 socket」之间的折中：这是
+/// 本机 socket 上的一次请求，便宜，但主循环一秒要转好几十圈，不能每圈都问。
+/// 被开播之后最多 2 秒屏幕上就出现那行字，比老师把链接发出去、学生点开
+/// 要快得多。
+pub(crate) const LIVE_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 定时把 `App::live` 跟守护进程对一遍，**不管站在哪一屏**。
+///
+/// 为什么需要它：`App::live` 原来只在自己按 `L`、在面板里操作时才更新。
+/// 可开播不一定是这个界面发起的——课堂管理台会直接往学生工作区的守护进程
+/// 发 `LiveStart`（老师强制直播），另一个 dct 窗口也可能开播。那时候这一侧
+/// 从没进过面板，那行「● 正在直播」就永远不出现：全班在看，被看的人自己
+/// 屏幕上一个字都没有。
+///
+/// 不搭会话列表的便车：主循环在会话视图里不拉列表，而浏览器里的学生打开
+/// 页面就被送进他那个唯一的会话——正好是最该看到这行字的人。
+///
+/// 连不上的时候不问，也不清手里那份：断线不等于停播。
+pub(crate) fn poll_status(app: &mut App, now: std::time::Instant) {
+    if !app.connected {
+        return;
+    }
+    if app
+        .live_last_fetch
+        .is_some_and(|t| now.saturating_duration_since(t) < LIVE_POLL_EVERY)
+    {
+        return;
+    }
+    app.live_last_fetch = Some(now);
+    if let Ok(Response::Live(info)) = app.client().and_then(|c| c.call(Request::LiveStatus)) {
+        app.live = info;
+    }
+}
+
 /// 看板/附着视图按 `L` 进这一页。**先问一次 `LiveStatus`**，不是直接切
 /// 视图再等下一帧：这一屏从第一帧起就要说清楚「到底在不在播」，拿一份
 /// 好几秒前的旧状态开场，跟一开场就说错话是一回事（同
@@ -383,6 +419,109 @@ mod tests {
             viewers,
             readiness,
         }
+    }
+
+    /// 一个只答 `LiveStatus` 的假守护进程：回它手里此刻那份 `LiveInfo`，并记下
+    /// 被问了几次。测试改 `answer` 就是「管理台那边刚开播/停播了」。
+    fn fake_live_daemon(
+        answer: std::sync::Arc<std::sync::Mutex<LiveInfo>>,
+    ) -> (
+        std::path::PathBuf,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        // 同 `pair_view::tests::fake_daemon`：走 `sys::ipc`，Windows 上也编得过。
+        let listener = crate::sys::ipc::bind_private(&sock).unwrap();
+        let asked: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let asked2 = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let Ok(req) = serde_json::from_str::<Request>(&line) else {
+                        break;
+                    };
+                    let resp = match req {
+                        Request::LiveStatus => {
+                            asked2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Response::Live(answer.lock().unwrap().clone())
+                        }
+                        _ => Response::Ok,
+                    };
+                    if writeln!(writer, "{}", serde_json::to_string(&resp).unwrap()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (sock, dir, asked)
+    }
+
+    fn not_live() -> LiveInfo {
+        LiveInfo {
+            id: String::new(),
+            token: String::new(),
+            url: String::new(),
+            staged: Vec::new(),
+            viewers: 0,
+            readiness: LiveReadiness::Pending,
+        }
+    }
+
+    /// **不是自己按 `L` 开的播，屏幕上也得说「你在播」。**
+    ///
+    /// 课堂管理台能直接往学生工作区的守护进程发 `LiveStart`（老师强制直播）。
+    /// 那一刻学生的界面从没进过直播面板，`App::live` 以前就一直停在「没在播」
+    /// ——全班在看他的屏幕，他自己屏幕上一个字都没有。这是这个功能最危险的
+    /// 失败模式（见模块头）换了个更糟的形状：连「忘了」都谈不上，是根本不知道。
+    ///
+    /// 断言落在**会话视图**里：浏览器里的学生打开页面就被直接送进他那个唯一
+    /// 的会话，而会话视图恰恰是主循环不拉会话列表的那一屏——搭列表的便车
+    /// 就正好漏掉最该看到这行字的人。
+    #[test]
+    fn a_broadcast_started_elsewhere_reaches_the_banner_even_inside_a_session() {
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(not_live()));
+        let (sock, _fake, asked) = fake_live_daemon(answer.clone());
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.connected = true;
+        app.view = View::Attached(1);
+        let t0 = std::time::Instant::now();
+
+        // 管理台那边开播了
+        *answer.lock().unwrap() = info(vec![(1, "小明".into())], 5, LiveReadiness::Ready);
+        poll_status(&mut app, t0);
+        assert!(is_live(&app.live), "别处开的播必须被这一侧看见");
+        assert!(matches!(app.view, View::Attached(1)), "轮询不许把人从会话里拽出来");
+
+        // 间隔之内不再问：这是每帧都会走到的路，不能每帧打一次 socket
+        poll_status(&mut app, t0 + LIVE_POLL_EVERY / 2);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 管理台那边停播了：那行字必须跟着消失，屏幕不能说在播而其实没播
+        *answer.lock().unwrap() = not_live();
+        poll_status(&mut app, t0 + LIVE_POLL_EVERY);
+        assert!(!is_live(&app.live), "别处停的播也必须被这一侧看见");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// 连不上守护进程的时候不去问，也不把手里那份状态清掉——断线不等于停播，
+    /// 清掉就是在一场可能还在进行的直播上说「没在播」。
+    #[test]
+    fn a_disconnected_ui_keeps_what_it_last_knew() {
+        let (mut app, _dir) = App::test_app();
+        app.connected = false;
+        app.live = info(vec![(1, "小明".into())], 5, LiveReadiness::Ready);
+        poll_status(&mut app, std::time::Instant::now());
+        assert!(is_live(&app.live));
     }
 
     fn screen_of(app: &mut App, width: u16, height: u16) -> String {

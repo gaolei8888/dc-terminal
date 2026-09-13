@@ -179,6 +179,8 @@ pub struct App {
     /// 同 `phone_last_fetch`/`grid_last_fetch` 一个理由，这是「偶尔扫一眼」
     /// 的东西，不用每帧都问。
     pub pair_last_fetch: Option<std::time::Instant>,
+    /// 上次问守护进程「在不在播」的时刻，见 `live::poll_status`。
+    pub live_last_fetch: Option<std::time::Instant>,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
@@ -280,6 +282,7 @@ impl App {
             phone_last_fetch: None,
             pair_start_rx: None,
             pair_last_fetch: None,
+            live_last_fetch: None,
             lang,
             socket,
             start_dir: default_dir,
