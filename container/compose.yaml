@@ -65,6 +65,10 @@ services:
       # 门用它拼那条发得出去的链接。默认就是上面那条端口映射看到的地址；
       # 架了反代就改成反代的地址，容器自己不可能知道。
       DCW_PUBLIC_URL: "${DCW_PUBLIC_URL:-http://127.0.0.1:${DCW_HOST_PORT:-7681}}"
+      # 直播中转。**dct 不带任何内置地址**（见 src/live.rs 的 relay_base），
+      # 不设这一条，按 L 开播会被当场拒掉并说明原因——那是有意的：内置一个
+      # 别人的中转，等于替用户决定他的画面往哪儿发。
+      DCT_RELAY: "${DCT_RELAY:-}"
 
     # 起来之后钥匙在日志里（**那是一条凭据**，别把日志贴到公开的地方）：
     #   docker compose -f container/compose.yaml logs dc | grep '#t='
