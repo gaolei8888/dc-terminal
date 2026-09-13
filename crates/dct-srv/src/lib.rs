@@ -716,10 +716,24 @@ pub async fn serve(
                 match file.reload_if_changed() {
                     Ok(true) => {
                         let fresh = file.keys().clone();
-                        // 先收回失效的公开，再让路由看见新密钥——顺序反了
-                        // 的话，中间那一小段窗口里吊销掉的密钥仍然公开着。
+                        // **先换密钥，再 `reconcile`。** `live_publish_route`
+                        // 在调 `Live::publish` 期间全程攥着 `keys` 的读锁；
+                        // 这里的写锁因此会等到每一个正拿着旧密钥在办公开的
+                        // 请求做完才能拿到手。锁一到手，新密钥立刻对之后
+                        // 所有请求生效，而紧接着这一次 `reconcile` 用的正是
+                        // 这份新密钥，收得掉"刚才那个请求拿着旧密钥、在写锁
+                        // 排队的当口侥幸公开成功"的房间。
+                        //
+                        // 反过来做（先 `reconcile` 后换密钥）会漏：
+                        // `reconcile` 只碰 `rooms` 那把锁，跟 `keys` 的锁毫
+                        // 无关系，一放手就有窗口——一个正拿着旧读锁执行
+                        // `Live::publish` 的请求会在这条窗口里用一把已经
+                        // 吊销的密钥把房间发布出去，而 `reconcile` 不会
+                        // 再跑第二次（下一次触发要等文件再变一次），那间
+                        // 房就一直公开到自然下线为止，破了"10 秒内收回"
+                        // 的承诺。
+                        *shared.write().expect("keys 锁") = Some(fresh.clone());
                         live.reconcile(Some(&fresh));
-                        *shared.write().expect("keys 锁") = Some(fresh);
                     }
                     Ok(false) => {}
                     // 坏文件：保留上一份，只记日志，见
@@ -1814,6 +1828,78 @@ mod tests {
                 .await
                 .0,
             200
+        );
+    }
+
+    /// **取帧路由跟取路名同一条规矩，不止 `/lanes`。** 公开的房间没带令牌、
+    /// 或者带了个空的 `x-live-token`，都该读得到帧。
+    #[tokio::test]
+    async fn a_published_rooms_frame_can_be_read_without_a_token_over_http() {
+        let (app, live, key) = app_with_keys();
+        live.push("abc", &push_secret(), 0, b"hi".to_vec()).unwrap();
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[
+                ("content-type", "application/json"),
+                ("x-live-push", &push_secret()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 204);
+
+        assert_eq!(
+            call(&app, "GET", "/live/abc/frame?lane=0", &[], "").await.0,
+            200,
+            "公开房间没带令牌该读得到帧"
+        );
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/live/abc/frame?lane=0",
+                &[("x-live-token", "")],
+                "",
+            )
+            .await
+            .0,
+            200,
+            "空令牌当成没带"
+        );
+    }
+
+    /// 私密房间不因为"没带令牌"就被放行——没带、带空串，取帧都得 401。
+    #[tokio::test]
+    async fn a_private_rooms_frame_stays_401_without_a_token_over_http() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            call(&app, "GET", "/live/abc/frame?lane=0", &[], "").await.0,
+            401,
+            "私密房间没带令牌不该放行"
+        );
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/live/abc/frame?lane=0",
+                &[("x-live-token", "")],
+                "",
+            )
+            .await
+            .0,
+            401,
+            "空令牌不该借着私密房间照旧放行"
         );
     }
 
