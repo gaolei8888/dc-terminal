@@ -2,5 +2,6 @@
 name = "dct-page"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 # 没有依赖，也不该有。这个 crate 只有一件事：让那一页网页在仓库里**只存在一份**。

@@ -883,3 +883,7 @@ once — `e0ba1ec`, where a routine "switched to X" message covered up the only 
 on screen telling the user how to quit.
 
 </details>
+
+## License
+
+[MIT](LICENSE)
