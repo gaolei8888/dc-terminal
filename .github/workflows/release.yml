@@ -22,7 +22,12 @@ permissions:
   contents: write
 
 jobs:
+  # 测试不过就不出包。调的是 ci.yml 同一份，不在这里另抄一遍——两份迟早会漂。
+  test:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: test
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
