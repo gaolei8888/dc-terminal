@@ -14,7 +14,7 @@ use dct::session::SessionManager;
 
 mod common;
 
-/// 造一个文件足够多的仓库，让快照慢到能测出来
+/// 造一个快照慢到能测出来的仓库（慢从哪来见函数末尾）
 fn big_repo(files: usize) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
@@ -35,6 +35,12 @@ fn big_repo(files: usize) -> tempfile::TempDir {
     }
     run(&["add", "-A"]);
     run(&["commit", "-q", "-m", "init"]);
+    // **慢靠 git 的 clean filter，不靠文件多。** 以前 6000 个文件只在 macOS 的
+    // APFS 上够慢，Linux 上快照几十毫秒就做完，测试报「没测到并发」。filter
+    // 装在初始提交之后：造仓库不慢，而快照要重新哈希被改过的文件，每个都得
+    // 过一遍 filter——走的仍是真实的 git 路径，只是每个文件多花 50ms。
+    std::fs::write(p.join(".gitattributes"), "d*/* filter=dct-slow\n").unwrap();
+    run(&["config", "filter.dct-slow.clean", "sleep 0.05; cat"]);
     dir
 }
 
@@ -79,7 +85,7 @@ fn checkpoint_cost(dir: &Path) -> Duration {
 
 #[test]
 fn slow_checkpoint_does_not_block_the_board() {
-    let repo = big_repo(6000);
+    let repo = big_repo(20);
 
     let m = Arc::new(SessionManager::new());
     m.register_profile(fake_agent());
@@ -91,7 +97,7 @@ fn slow_checkpoint_does_not_block_the_board() {
 
     // 模拟 agent 干了一大堆活：快照必须重新哈希这些文件，才会真的慢。
     // 不这么做的话 git 的索引缓存会让第二次快照快到测不出东西。
-    dirty_everything(repo.path(), 6000);
+    dirty_everything(repo.path(), 20);
 
     // 确认这个场景下的快照确实够慢，否则这个测试证明不了任何事
     let cost = checkpoint_cost(repo.path());
@@ -99,7 +105,7 @@ fn slow_checkpoint_does_not_block_the_board() {
         cost > Duration::from_millis(150),
         "快照只花了 {cost:?}，测不出持锁的影响"
     );
-    dirty_everything(repo.path(), 6000);
+    dirty_everything(repo.path(), 20);
 
     // 后台线程发一次回车，触发慢快照
     let m2 = m.clone();

@@ -109,7 +109,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// `LiveReadiness::Failed(LiveFailure)`、`ErrorCode::LiveStagingRejected`。
 /// 两处都是**响应**的形状变了（旧界面解不出 `Failed` 里那个对象），照 13
 /// 那次的规矩加一。
-pub const PROTOCOL_VERSION: u32 = 17;
+///
+/// 18 = 多了 `ErrorCode::LiveRelayNotConfigured`：dct 不再带内置中转地址，
+/// 没设 `DCT_RELAY` 时开播会被拒绝。**响应**里多了一个旧界面解不出的变体，
+/// 照 13 那次的规矩加一。
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -876,6 +880,9 @@ pub enum ErrorCode {
     /// 参数是自由文本，而自由文本只能由守护进程写死成某一种语言——见
     /// [`LiveStagingProblem`] 上那段。
     LiveStagingRejected(LiveStagingProblem),
+    /// 没配直播中转（`DCT_RELAY` 没设），所以不开播。dct 不带任何内置中转
+    /// 地址——中转在哪儿是部署方的决定，见 `live.rs` 模块头。
+    LiveRelayNotConfigured,
     /// git 自己的 stderr。**刻意留的兜底**：那是 git 按它自己的 `LANG` 输出的，
     /// dct 翻不动也不该翻。界面显示成「操作失败：<原文>」——外面那半句是
     /// 翻译过的，里面照抄。
@@ -1234,7 +1241,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                17,
+                18,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1259,7 +1266,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                17,
+                18,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1368,7 +1375,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                17,
+                18,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1462,6 +1469,20 @@ mod tests {
         assert!(s.contains("Mouse"));
     }
 
+    /// 「没配直播中转」这个错误码的线上形状是**跨语言**的契约：课堂管理台
+    /// （`container/classroom/server.mjs` 的 `liveRpc`）按字面 `"LiveRelayNotConfigured"`
+    /// 认它，而单元变体在 serde 里是一个裸字符串、不是 `{码: 参数}` 对象。
+    /// 谁把它改成带参数的变体，那边就会把整个对象当成未知错误——钉在这里。
+    #[test]
+    fn the_no_relay_error_is_a_bare_string_on_the_wire() {
+        let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
+        assert_eq!(
+            (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
+            (18, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
+        );
+    }
+
     /// `Projects` 的回程形状同样是契约：`pinned` 是这一版新加的字段，旧守护
     /// 进程回的 JSON 里没有它。跟上面两条一样钉在 `PROTOCOL_VERSION` 上——
     /// 光钉一个裸字符串的话，谁把这个变体改了形状、只顺手更新这里的期望值，
@@ -1475,7 +1496,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (17, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (18, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }

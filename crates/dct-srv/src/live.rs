@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use dct_link::live::{LIVE_TTL, MAX_FRAME_BYTES, MAX_LANES};
+use dct_link::live::{
+    LIVE_TTL, MAX_FRAME_BYTES, MAX_KEY_CHARS, MAX_LANES, MAX_LANE_NAME_CHARS, MAX_LIVE_ID_CHARS,
+    MIN_KEY_CHARS,
+};
 use dct_link::LinkError;
 use tokio::sync::watch;
 
@@ -90,6 +93,32 @@ impl Live {
     ) -> Result<(), LinkError> {
         if lanes.is_empty() || lanes.len() > MAX_LANES {
             return Err(LinkError::TooBig);
+        }
+        // **每个字段都有上下限，而且查在碰房间表之前。** 这些全是请求方自己写
+        // 的：不设上限，64 间房 × 每间两兆的路名就能把中转撑爆（它跟学生容器
+        // 住在同一台机器上）；不设下限，一个字符的钥匙也照收。太长回 `TooBig`，
+        // 不像样回 `Unauthorized`——不为「格式不对」单开一个码，免得多一处能
+        // 拿来摸底的差别。
+        if id.chars().count() > MAX_LIVE_ID_CHARS
+            || [&viewer_token, &push_secret]
+                .iter()
+                .any(|k| k.chars().count() > MAX_KEY_CHARS)
+            || lanes
+                .iter()
+                .any(|n| n.is_empty() || n.chars().count() > MAX_LANE_NAME_CHARS)
+        {
+            return Err(LinkError::TooBig);
+        }
+        // id 会原样出现在学生链接的路径里：只许字母数字和 `-`/`_`。
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || [&viewer_token, &push_secret]
+                .iter()
+                .any(|k| k.chars().count() < MIN_KEY_CHARS)
+        {
+            return Err(LinkError::Unauthorized);
         }
         let mut rooms = self.rooms.lock().expect("live 锁");
         // 常数时间比较（`same`），不能提前 return——理由跟 `authed` 一样：
@@ -308,6 +337,79 @@ mod tests {
         )
         .unwrap();
         live
+    }
+
+    /// **建房的每个字段都有上下限。** `POST /live/start` 对公网开着、没有身份
+    /// 可验，而 id、两把钥匙、路名全是请求方自己写的：不设上限，64 间房 × 每间
+    /// 两兆的路名就能把跟学生容器同住一台 8 GB 机器的中转撑爆；不设下限，
+    /// 一把一个字符的钥匙也照收。太长回 `TooBig`（413），不像样回
+    /// `Unauthorized`（401）——不多给一个错误码，免得多一处能摸底的差别。
+    #[test]
+    fn start_refuses_fields_outside_their_bounds() {
+        use dct_link::live::{
+            MAX_KEY_CHARS, MAX_LANE_NAME_CHARS, MAX_LIVE_ID_CHARS, MIN_KEY_CHARS,
+        };
+        let ok_key = "k".repeat(MIN_KEY_CHARS);
+        let start = |id: &str, viewer: &str, push: &str, lanes: Vec<String>| {
+            Live::new().start(id.into(), viewer.into(), push.into(), lanes)
+        };
+        let one = || vec!["前端".to_string()];
+
+        assert!(
+            start("abc", &ok_key, &ok_key, one()).is_ok(),
+            "边界之内要放行"
+        );
+        assert_eq!(
+            start(
+                "abc",
+                &ok_key,
+                &ok_key,
+                vec!["名".repeat(MAX_LANE_NAME_CHARS)]
+            )
+            .err(),
+            None,
+            "正好卡在路名上限要放行（按字符算，不按字节）"
+        );
+
+        assert_eq!(
+            start(&"a".repeat(MAX_LIVE_ID_CHARS + 1), &ok_key, &ok_key, one()),
+            Err(LinkError::TooBig)
+        );
+        assert_eq!(
+            start("", &ok_key, &ok_key, one()),
+            Err(LinkError::Unauthorized)
+        );
+        assert_eq!(
+            start("../x", &ok_key, &ok_key, one()),
+            Err(LinkError::Unauthorized),
+            "id 只许字母数字和 -_"
+        );
+        assert_eq!(
+            start("abc", &"k".repeat(MIN_KEY_CHARS - 1), &ok_key, one()),
+            Err(LinkError::Unauthorized)
+        );
+        assert_eq!(
+            start("abc", &ok_key, &"k".repeat(MIN_KEY_CHARS - 1), one()),
+            Err(LinkError::Unauthorized)
+        );
+        assert_eq!(
+            start("abc", &"k".repeat(MAX_KEY_CHARS + 1), &ok_key, one()),
+            Err(LinkError::TooBig)
+        );
+        assert_eq!(
+            start(
+                "abc",
+                &ok_key,
+                &ok_key,
+                vec!["名".repeat(MAX_LANE_NAME_CHARS + 1)]
+            ),
+            Err(LinkError::TooBig)
+        );
+        assert_eq!(
+            start("abc", &ok_key, &ok_key, vec![String::new()]),
+            Err(LinkError::TooBig),
+            "空路名"
+        );
     }
 
     #[test]

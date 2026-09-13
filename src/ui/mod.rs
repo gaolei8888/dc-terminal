@@ -308,6 +308,27 @@ fn bar_danger(t: BarTheme) -> Style {
     }
 }
 
+/// 底栏上那行「● 正在直播」该用什么样式。
+///
+/// `live::banner_style` 挑的是 `accent`/`dim`/`danger`——压在**终端背景**上
+/// 读得清的颜色，直播面板里那一行用它没错。可同一句话画进底栏时底下是色条
+/// 自己铺的底：浅色终端上 `accent()` 是 24 号深蓝，压在 `Slate` 那档 #5f5f87
+/// 上 1.16:1。这是整块屏幕上最要紧的一行字，偏偏最读不清。
+///
+/// 所以实色档下三种状态只用色条自己能保证的东西区分：就绪加粗、还在等中转
+/// 是平常字、失败用自带底色的那块红（`bar_danger`）。横线档没有实色底，照旧
+/// 走 `live::banner_style`。
+fn bar_live_style(info: &crate::proto::LiveInfo, t: BarTheme) -> Style {
+    if bar_style(t).is_none() {
+        return live::banner_style(info);
+    }
+    match &info.readiness {
+        crate::proto::LiveReadiness::Ready => Style::default().add_modifier(Modifier::BOLD),
+        crate::proto::LiveReadiness::Pending => Style::default(),
+        crate::proto::LiveReadiness::Failed(_) => bar_danger(t),
+    }
+}
+
 /// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
 ///
 /// 抽成自由函数是因为有两个调用方——`TerminalGuard::drop` 和信号线程。
@@ -738,6 +759,11 @@ pub fn run(
                 app.pair_last_fetch = Some(std::time::Instant::now());
             }
         }
+
+        // 「在不在播」跟守护进程对一遍——每一屏都要，见 `live::poll_status`。
+        // 放在拉列表**之前**且不跟它共用条件：会话视图里不拉列表，而那正是
+        // 最该看到「● 正在直播」的一屏。
+        live::poll_status(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
@@ -2543,7 +2569,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (bar, style) = if !app.connected {
         (
             BarContent::Text(crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string()),
-            danger(),
+            // 不是 `danger()`：这句话画在色条上，理由见 `bar_danger`。
+            bar_danger(app.bar),
         )
     } else if live::is_live(&app.live) {
         // **这一档压过 `message`、滚动提示、按键表——所有人。** 这是整个
@@ -2554,7 +2581,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         // 不能关，就是为了防这一件事。
         (
             BarContent::Text(live::live_banner(&app.live, app.lang)),
-            live::banner_style(&app.live),
+            bar_live_style(&app.live, app.bar),
         )
     } else if app.message.text.is_empty() {
         // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
@@ -3444,7 +3471,20 @@ is_agent = true
         /// `App` 底下那个目录就没了。
         type Case = (&'static str, fn() -> (App, tempfile::TempDir));
 
-        let cases: [Case; 3] = [
+        fn live(readiness: crate::proto::LiveReadiness) -> (App, tempfile::TempDir) {
+            let (mut app, dir) = app_with_one_agent_session(View::Attached(1));
+            app.live = crate::proto::LiveInfo {
+                id: "abc".into(),
+                token: "t".repeat(64),
+                url: "https://x/live/abc#t=…".into(),
+                staged: vec![(1, "小明".into())],
+                viewers: 3,
+                readiness,
+            };
+            (app, dir)
+        }
+
+        let cases: [Case; 7] = [
             ("看板按键表", || {
                 app_with_one_agent_session(View::Board)
             }),
@@ -3455,6 +3495,19 @@ is_agent = true
                 let (mut app, dir) = app_with_one_agent_session(View::Board);
                 app.message = Msg::err("不是一个目录".into());
                 (app, dir)
+            }),
+            // 断连提示和「正在直播」都是压过一切的那一档，更不能读不清。
+            ("断连提示", || {
+                let (mut app, dir) = app_with_one_agent_session(View::Board);
+                app.connected = false;
+                (app, dir)
+            }),
+            ("正在直播", || live(crate::proto::LiveReadiness::Ready)),
+            ("正在连接中转", || live(crate::proto::LiveReadiness::Pending)),
+            ("开播失败", || {
+                live(crate::proto::LiveReadiness::Failed(
+                    crate::proto::LiveFailure::Unreachable,
+                ))
             }),
         ];
 
@@ -3485,7 +3538,11 @@ is_agent = true
                             continue;
                         }
                         skip = widgets::display_width(c.symbol()).saturating_sub(1);
-                        let ok = c.fg == fg || (c.fg == danger_fg && c.bg == danger_bg);
+                        // DIM 也不许有：测试里 `THEME` 是 `Unknown`，`dim()` 在这一档
+                        // 只挂 DIM、不给颜色，光查前景色会漏掉它；而真实的深色终端上
+                        // 它是 245 号灰，压在 `Light` 那档 253 的底上一样读不清。
+                        let ok = (c.fg == fg || (c.fg == danger_fg && c.bg == danger_bg))
+                            && !c.modifier.contains(Modifier::DIM);
                         assert!(
                             ok,
                             "{t:?} 档「{label}」第 {y} 行第 {x} 列（{:?}）的前景是 {:?}\
@@ -3589,7 +3646,14 @@ is_agent = true
         env.insert("PS1".to_string(), PROMPT.to_string());
         let test_shell = Profile {
             name: "scroll-test-shell".into(),
-            command: crate::sys::testing::sh_argv(&["--noediting"]),
+            // bash 而不是 sh：见 `sys::testing::bash`。`--norc` 是因为以
+            // `bash` 名义起的交互 shell 读 `~/.bashrc` 而不是 `ENV`，不关掉的话
+            // 上面那句 `ENV=/dev/null` 就管不住它。
+            command: vec![
+                crate::sys::testing::bash(),
+                "--norc".into(),
+                "--noediting".into(),
+            ],
             is_agent: false,
             idle_pattern: None,
             busy_pattern: None,

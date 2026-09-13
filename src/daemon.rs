@@ -218,10 +218,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
 
     // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
-    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——`DCT_RELAY`
-    // 环境变量优先，没设就用内置默认值。这是临时办法：将来 dct 接上
-    // dc_classroom 登录之后，中转地址该从配对结果里来，见那个函数的文档
-    // 注释。
+    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——只看
+    // `DCT_RELAY` 环境变量，**没有默认值**：没设就没有中转，`LiveStart`
+    // 会被拒绝。见 `live.rs` 模块头「中转地址从哪来」。
     let live: Arc<crate::live::LiveState> =
         Arc::new(crate::live::LiveState::new(crate::live::relay_base()));
     // 推帧线程，整个守护进程生命周期只起一条：它自己每一轮去问「现在在播
@@ -1061,6 +1060,11 @@ fn live_start(
     ids: Vec<u32>,
     names: Vec<String>,
 ) -> Response {
+    // 没有中转就不开播，而且**先于**上架校验：名单再合法，没有地方可推
+    // 也是白搭，老师该先知道的是这一件。
+    if !live.has_relay() {
+        return Response::Error(ErrorCode::LiveRelayNotConfigured);
+    }
     match validated_staging(mgr, ids, names) {
         Ok(staged) => Response::Live(live.start(staged)),
         Err(e) => Response::Error(e),
@@ -1141,7 +1145,20 @@ fn validated_staging(
             LiveStagingProblem::UnknownSessions(missing),
         ));
     }
-    Ok(ids.into_iter().zip(names).collect())
+    // 路名截到中转收得下的长度。**截，不拒**：名字是界面或课堂管理台起的，
+    // 一个长名字的学生不该让整场直播被中转 413 掉。截短是看得见的——老师面板
+    // 上显示的就是带省略号的这个名字。
+    let fit = |name: String| {
+        let max = dct_link::live::MAX_LANE_NAME_CHARS;
+        if name.chars().count() <= max {
+            name
+        } else {
+            let mut short: String = name.chars().take(max - 1).collect();
+            short.push('…');
+            short
+        }
+    };
+    Ok(ids.into_iter().zip(names.into_iter().map(fit)).collect())
 }
 
 /// `PhoneSetToken` 打 `getMe` 没成功时，给用户看的那句人话。**这里就是
@@ -1489,7 +1506,7 @@ mod tests {
 
     /// 同上——大多数测试不关心直播，给一个空槽就行。
     fn test_live() -> Arc<crate::live::LiveState> {
-        Arc::new(crate::live::LiveState::new("https://x".into()))
+        Arc::new(crate::live::LiveState::new("https://x".to_string()))
     }
 
     fn test_pair_started() -> crate::pair::Started {
@@ -1688,9 +1705,8 @@ mod tests {
         }
     }
 
-    /// 造一个文件足够多的仓库，让 agent 会话建立时的首次 git checkpoint 慢到能
-    /// 测出来。手法照抄 `tests/concurrency.rs` 的 `init_big_repo`——那边已经验证过
-    /// 8000 个文件在这台机器的规模下够慢、够稳。
+    /// 造一个首次 git checkpoint 慢到能测出来的仓库。手法照抄
+    /// `tests/concurrency.rs` 的 `init_big_repo`，慢从哪来见那边的注释。
     fn init_big_repo(path: &Path, n: usize) {
         let run = |args: &[&str]| {
             std::process::Command::new("git")
@@ -1712,6 +1728,10 @@ mod tests {
         }
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "init"]);
+        // 慢靠 git 的 clean filter 造出来，不靠文件多——理由见
+        // `tests/concurrency.rs` 里同名函数末尾那段。
+        std::fs::write(path.join(".gitattributes"), "files/* filter=dct-slow\n").unwrap();
+        run(&["config", "filter.dct-slow.clean", "sleep 0.05; cat"]);
     }
 
     fn init_repo(path: &Path) {
@@ -2032,7 +2052,7 @@ mod tests {
     #[test]
     fn create_does_not_hold_the_secrets_lock_across_the_slow_work() {
         let repo = tempfile::tempdir().unwrap();
-        init_big_repo(repo.path(), 8000);
+        init_big_repo(repo.path(), 20);
 
         let mgr = Arc::new(SessionManager::new());
         mgr.register_profile(fake_agent());
@@ -3027,6 +3047,75 @@ mod tests {
         }
     }
 
+    /// **没配中转就不开播。** 不拒绝的话，守护进程照样生成一条链接、把状态
+    /// 设成「在播」，老师拿着一条 host 是空的链接发给全班，推帧线程却无处
+    /// 可推——屏幕上挂着一场永远连不上的直播。拒绝要报码，不组句。
+    #[test]
+    fn starting_a_broadcast_without_a_relay_is_refused() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
+        let live = Arc::new(crate::live::LiveState::new(None));
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![id],
+                names: vec!["前端".into()],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::LiveRelayNotConfigured)),
+            "期待 LiveRelayNotConfigured，得到 {resp:?}"
+        );
+        assert!(live.info().id.is_empty(), "没有中转不该开出一场直播");
+    }
+
+    /// **路名太长就截短，不让整场直播被中转拒掉。** 中转只收
+    /// `MAX_LANE_NAME_CHARS` 个字符以内的路名（超了回 413），而名字是界面或
+    /// 课堂管理台起的——一个长名字的学生不该让老师拿到一条推不上画面的链接。
+    /// 截短是看得见的：老师面板上显示的就是截短后的那个名字，带省略号。
+    #[test]
+    fn a_lane_name_longer_than_the_relay_accepts_is_shortened_visibly() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        let (id, _dir) = one_staged_session(&mgr);
+        let live = test_live();
+        let long = "名".repeat(dct_link::live::MAX_LANE_NAME_CHARS + 10);
+
+        let resp = handle(
+            Request::LiveStart {
+                ids: vec![id],
+                names: vec![long],
+            },
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &live,
+        );
+
+        let Response::Live(info) = resp else {
+            panic!("期待 Response::Live，得到 {resp:?}")
+        };
+        let name = &info.staged[0].1;
+        assert_eq!(name.chars().count(), dct_link::live::MAX_LANE_NAME_CHARS);
+        assert!(name.ends_with('…'), "截短要看得出来：{name}");
+    }
+
     /// 没在播的时候改上架：说出来，不许悄悄开一场新的直播——那正是这条
     /// 协议要避免的事。
     #[test]
@@ -3155,7 +3244,7 @@ mod web_tests {
             bridge: Arc::new(Mutex::new(None)),
             tx: std::sync::mpsc::channel().0,
             pairs: Arc::new(Mutex::new(BTreeMap::new())),
-            live: Arc::new(crate::live::LiveState::new("https://x".into())),
+            live: Arc::new(crate::live::LiveState::new("https://x".to_string())),
             _dir: dir,
         }
     }

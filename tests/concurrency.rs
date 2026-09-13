@@ -33,8 +33,8 @@ fn fake_agent() -> Profile {
     }
 }
 
-/// 造一个有几千个文件的仓库，复现审查者报告里"create_worktree 里的 git checkout 因为文件多
-/// 而变慢"的真实场景，而不是用 sleep() 假装慢。
+/// 造一个首次 checkpoint 很慢的仓库，复现审查者报告里"create_worktree 里的 git 操作
+/// 因为仓库大而变慢"的场景。慢从哪来见函数末尾那段。
 fn init_big_repo(path: &Path, n: usize) {
     let run = |args: &[&str]| {
         std::process::Command::new("git")
@@ -56,6 +56,14 @@ fn init_big_repo(path: &Path, n: usize) {
     }
     run(&["add", "-A"]);
     run(&["commit", "-q", "-m", "init"]);
+    // **慢是靠 git 自己的 clean filter 造出来的，不是靠文件多。** 以前这里
+    // 靠 8000 个文件把首次 checkpoint 拖过 300ms——那只在 macOS 的 APFS 上
+    // 成立，Linux 上同样的 `git add -A` 47ms 就做完，测试直接报「场景失真」。
+    // filter 装在初始提交**之后**，所以造仓库本身不慢；而 checkpoint 用的是
+    // 一份全新的临时索引，每个文件都得重新过一遍 filter，走的仍然是真实的
+    // `git add` 那条路，只是每个文件多花 50ms，哪台机器上都一样。
+    std::fs::write(path.join(".gitattributes"), "files/* filter=dct-slow\n").unwrap();
+    run(&["config", "filter.dct-slow.clean", "sleep 0.05; cat"]);
 }
 
 #[test]
@@ -64,7 +72,7 @@ fn list_is_not_blocked_by_slow_create() {
     let sock: PathBuf = dir.path().join("slow.sock");
 
     let repo = tempfile::tempdir().unwrap();
-    init_big_repo(repo.path(), 8000);
+    init_big_repo(repo.path(), 20);
 
     let mgr = std::sync::Arc::new(SessionManager::new());
     mgr.register_profile(fake_agent());

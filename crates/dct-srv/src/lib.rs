@@ -364,15 +364,23 @@ async fn live_start_route(
 /// 两个头都没有（本机直连、单元测试）就归到同一个桶：那时候这条限流退化
 /// 成「整体每分钟 N 次」，仍然是一道闸，只是不再分得清是谁。
 ///
-/// **这不是身份。** `X-Forwarded-For` 是请求方写得出来的东西——反代会把它
-/// 覆盖掉，没有反代的时候谁都能伪造。它只是一个够用的分桶依据：能换的人
-/// 自然换得动，但那时 `MAX_RATE_KEYS` 那条上限接着拦。
+/// **取最右边那一跳，不是最左边。** `X-Forwarded-For` 最左边是请求方自己
+/// 写的：Caddy 按部署文档那样 `header_up X-Forwarded-For {remote_host}` 会整个
+/// 覆盖掉，两种取法没区别；可 nginx 默认的 `$proxy_add_x_forwarded_for` 只是
+/// 把真实来源**追加**在后面。取最左边的话，一个脚本每次换一个假前缀就是一个
+/// 新桶，这道闸形同虚设。最右边那一跳是离中转最近的那个反代写的，请求方够不着。
+///
+/// 前面还有一层 CDN 的时候，最右边会是 CDN 的地址，所有人落进同一个桶——
+/// 那是偏严，不是被绕过；那种部署该让反代把真实来源写成单值。
+///
+/// **这仍然不是身份**，只是一个够用的分桶依据；桶被换着花样打满时，
+/// `MAX_RATE_KEYS` 那条上限接着拦。
 fn client_key(headers: &HeaderMap) -> String {
     for name in ["x-forwarded-for", "x-real-ip"] {
         if let Some(raw) = header(headers, name) {
-            let first = raw.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return first.to_string();
+            let last = raw.rsplit(',').next().unwrap_or("").trim();
+            if !last.is_empty() {
+                return last.to_string();
             }
         }
     }
@@ -521,13 +529,39 @@ async fn ask_route(
     Ok(Json(relay.ask(&req).await?))
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(page_route))
-        .route(PATH_POLL, post(poll_route))
-        .route(PATH_SEND, post(send_route))
-        .route(PATH_ASK, post(ask_route))
-        .route(dct_link::live::PATH_START, post(live_start_route))
+/// 中转挂哪些路由。
+///
+/// **默认只有直播那一组。** 配对信封那三条（`/link/*`）和手机网页（`/`）没有
+/// 鉴权（见 [`must_be_loopback`]），以前全靠部署方在反代上写一条「只放行
+/// `/live/*`」的白名单挡着——那是一条配置里的约定，换一份「全部转发」的反代
+/// 配置它就没了，公网上的任何人就能冒充任何一台设备收发信封。现在不打开就
+/// 根本不存在，安全不再取决于反代写没写对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Routes {
+    /// 只有 `/live/*`。生产上跑的就是这一档。
+    LiveOnly,
+    /// 再加上 `/link/*` 和 `/`。只给本机开发、以及鉴权落地之后用
+    /// （`dct-srv --with-link`）。
+    WithLink,
+}
+
+pub fn router(state: AppState, routes: Routes) -> Router {
+    let app = Router::new();
+    let app = match routes {
+        Routes::LiveOnly => app,
+        Routes::WithLink => app
+            .route("/", get(page_route))
+            .route(PATH_POLL, post(poll_route))
+            .route(PATH_SEND, post(send_route))
+            .route(PATH_ASK, post(ask_route)),
+    };
+    app
+        // 建房的请求体只有两把钥匙和几个路名，16 KB 绰绰有余。单独给它一个
+        // 小上限：这是对公网开着、谁都能调的那一条，不该跟信封共用两兆。
+        .route(
+            dct_link::live::PATH_START,
+            post(live_start_route).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .route(dct_link::live::PATH_FRAME, post(live_push_route))
         .route("/live/{id}/frame", get(live_frame_route))
         .route("/live/{id}/lanes", get(live_lanes_route))
@@ -548,6 +582,7 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     relay: Arc<Relay>,
     live: Arc<Live>,
+    routes: Routes,
 ) -> Result<(), std::io::Error> {
     // TTL 清扫：老师断线（拔网线、合上笔记本）之后，直播连同两把钥匙要在
     // 一分钟内自己收掉，不然就是永远播着。见 `live.rs` 里 `sweep` 的注释。
@@ -559,7 +594,7 @@ pub async fn serve(
             sweeping.sweep(Instant::now());
         }
     });
-    axum::serve(listener, router(AppState { relay, live })).await
+    axum::serve(listener, router(AppState { relay, live }, routes)).await
 }
 
 /// 第一期只许在环回地址上跑。
@@ -603,21 +638,81 @@ mod tests {
     /// 只测配对信封那半路由时，直播那半随便配一个就够——这些既有测试不碰
     /// `Live`，用不着关心它。
     fn app(relay: Arc<Relay>) -> Router {
-        router(AppState {
-            relay,
-            live: Arc::new(Live::new()),
-        })
+        router(
+            AppState {
+                relay,
+                live: Arc::new(Live::new()),
+            },
+            Routes::WithLink,
+        )
     }
 
     /// 直播路由测试的底子：一份挂着直播路由的 `Router`，和它背后那个还没
     /// 开播的 `Live`——每条测试自己 `start`，各测各的 viewer/push token。
     fn app_with_live() -> (Router, Arc<Live>) {
         let live = Arc::new(Live::new());
-        let app = router(AppState {
-            relay: Arc::new(Relay::new(cfg(200))),
-            live: live.clone(),
-        });
+        // 默认那一档：生产上跑的就是它。
+        let app = router(
+            AppState {
+                relay: Arc::new(Relay::new(cfg(200))),
+                live: live.clone(),
+            },
+            Routes::LiveOnly,
+        );
         (app, live)
+    }
+
+    /// **不开口子的中转，`/link/*` 和 `/` 根本不存在。** 这几条路由没有鉴权
+    /// （见 `must_be_loopback`），以前全靠反代上那条「只放行 `/live/*`」的白名单
+    /// 挡着——换一份「全部转发」的反代配置，公网上的任何人就能冒充任何一台
+    /// 设备收发信封。现在不带 `--with-link` 起的中转自己就不答这几条路。
+    #[tokio::test]
+    async fn the_default_relay_does_not_answer_the_unauthenticated_routes() {
+        let (app, _live) = app_with_live();
+        for path in [PATH_POLL, PATH_SEND, PATH_ASK] {
+            let (status, _) = post(app.clone(), path, "{}").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} 不该在默认中转上存在");
+        }
+        let root = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            root.status(),
+            StatusCode::NOT_FOUND,
+            "`/` 不该在默认中转上存在"
+        );
+        // 直播那一半照常：学生页打得开
+        let page = app
+            .oneshot(
+                Request::builder()
+                    .uri("/live/abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+    }
+
+    /// **限流按最右边那一跳分桶，不是最左边。** `X-Forwarded-For` 最左边
+    /// 是请求方自己写的；nginx 默认的 `$proxy_add_x_forwarded_for` 只是把
+    /// 真实来源**追加**在后面。按最左边分桶，一个脚本每次换一个假前缀就是
+    /// 一个新桶，那道闸形同虚设——十几秒就能把 `MAX_ROOMS` 占满，真正的
+    /// 老师开不了播。
+    #[tokio::test]
+    async fn a_forged_leftmost_hop_does_not_escape_the_throttle() {
+        let (app, _live) = app_with_live();
+        for i in 0..dct_link::live::MAX_STARTS_PER_WINDOW {
+            let from = format!("10.0.0.{i}, 1.2.3.4");
+            assert_eq!(post_start(&app, &format!("room{i}"), &from).await, 204);
+        }
+        assert_eq!(
+            post_start(&app, "one-too-many", "10.9.9.9, 1.2.3.4").await,
+            429,
+            "换一个伪造的前缀就绕过了节流"
+        );
     }
 
     /// 走 `POST /live/start` 开一场，带上一个来源标识（反代会设的那个头）。

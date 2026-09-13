@@ -29,6 +29,10 @@ Docker socket。`dcw-classroom.service` 是 dataclue.cn 使用的配置。
 5. Caddy 将整个站点转发到 17700，保留 TLS；不要留下同域名上直接转发
    学生 HTML 的路径。终端 HTTP/WebSocket 均由管理服务逐次检查身份。
 
+配置 `CLASSROOM_LIVE_RELAY=<中转地址>` 后，新建的学生工作区才能直播（它在创建容器时作为
+`DCT_RELAY` 交进去）。dct 不带默认中转，不配就是这台服务器上的工作区播不了；改了之后
+已有工作区要停止、启动一次。
+
 配置 `CLASSROOM_LEGACY_CONTAINER=dcw-workspace-1` 可接入原共享工作区。
 首次接入沿用原访问链接，此后复制/重置/停用链接均在管理台完成。共享
 工作区仍标为共享，原文件保留。共享容器不支持页面一键停止，避免影响旧课堂；

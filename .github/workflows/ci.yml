@@ -1,0 +1,58 @@
+# 每次推到 main、每个 PR 都跑一遍测试；发版（release.yml）也先调它，测试不过就不出包。
+#
+# 在这之前测试只在作者自己的 Mac 上跑过。第一次拿 Linux 容器试跑就挂了 4 条——
+# 全是「只在 macOS 上成立」的假设（`/bin/sh` 恰好是 bash、终端里恰好有 TERM、
+# APFS 上 8000 个文件恰好够慢），跟 dct 本身无关，但也从来没人知道。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # release.yml 打 tag 时调用这份，保证「发出去的包」和「测过的代码」是同一份。
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了也要看到另外两个的结果——「只在 Windows 上挂」本身就是线索。
+      fail-fast: false
+      matrix:
+        # 跟 release.yml 出包的平台对齐：Linux 用 22.04（出包也在这儿），
+        # macOS 用 Apple Silicon，Windows 走 msvc。
+        os: [ubuntu-22.04, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装工具链
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      # `--no-fail-fast`：不加的话第一个挂掉的测试二进制会让后面的全部不跑，
+      # `tests/` 下的集成测试就这样整批被跳过、而输出里看不出来。
+      - name: 测试
+        run: cargo test --workspace --locked --no-fail-fast
+
+  clippy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装工具链
+        run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # 课堂管理台是 Node，不在 cargo 的测试里。`admin-ui.test.cjs` 要一个装好的
+  # Playwright 浏览器，这里不跑它。
+  classroom:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 测试
+        working-directory: container/classroom
+        run: node --test server.test.mjs publishing.test.mjs sso.test.mjs

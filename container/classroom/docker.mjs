@@ -28,8 +28,13 @@ export class DockerDriver {
   // 也就 400–500 MB。真正卡住的是名额：一台 8 GB 的机器只分得出 2 个，而
   // 共享工作区自己就占一个。所以两个数都能用环境变量压过去，调完重启
   // 服务即可，不用改代码、不用发版。
-  constructor({image = 'dc-workspace:0.2.17-live', maxRunning, memory, command = exec} = {}) {
+  // `relay` 是交给每个新工作区的直播中转地址（容器里的 `DCT_RELAY`）。dct 自己
+  // 不带任何默认中转，所以没配就是这台服务器上的工作区播不了——而不是悄悄把
+  // 学生画面推到某个谁都没选过的地方。只在**创建**容器时生效：改了之后，已有
+  // 的工作区要停止、启动一次才会拿到（跟换镜像同一条路）。
+  constructor({image = 'dc-workspace:0.2.17-live', maxRunning, memory, relay, command = exec} = {}) {
     this.image = image;
+    this.relay = relay ?? process.env.CLASSROOM_LIVE_RELAY ?? '';
     this.memory = memory || process.env.CLASSROOM_MEMORY || '3g';
     this.maxRunning = maxRunning || Number(process.env.CLASSROOM_MAX_RUNNING) || Math.max(1, Math.floor((os.totalmem() - GiB) / (3 * GiB)));
     this.command = command;
@@ -120,7 +125,7 @@ export class DockerDriver {
         await this.docker(['volume', 'create', '--label', 'dcw.classroom=1', volume]);
         mounts.push('--mount', `type=volume,source=${volume},target=${destination}`);
       }
-      await this.docker(['run', '-d', '--name', name, '--label', 'dcw.classroom=1', '--label', `dcw.student=${w.id}`, '--restart', 'unless-stopped', '--memory', this.memory, '--memory-swap', this.memory, '--pids-limit', '512', '--security-opt', 'no-new-privileges:true', '--cap-drop', 'ALL', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3', '--env', 'DCW_STUDENT=1', '--env', 'DCW_PUBLIC_URL=https://dataclue.cn', '-p', '127.0.0.1::7681', ...mounts, this.image], 120000);
+      await this.docker(['run', '-d', '--name', name, '--label', 'dcw.classroom=1', '--label', `dcw.student=${w.id}`, '--restart', 'unless-stopped', '--memory', this.memory, '--memory-swap', this.memory, '--pids-limit', '512', '--security-opt', 'no-new-privileges:true', '--cap-drop', 'ALL', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3', '--env', 'DCW_STUDENT=1', '--env', 'DCW_PUBLIC_URL=https://dataclue.cn', ...(this.relay ? ['--env', `DCT_RELAY=${this.relay}`] : []), '-p', '127.0.0.1::7681', ...mounts, this.image], 120000);
     }
     delete w.backendToken;
     for (let n = 0; n < 40; n++) {

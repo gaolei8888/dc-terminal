@@ -64,6 +64,20 @@ pub const WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 /// live-id 的十六进制长度（4 字节随机数）。
 pub const LIVE_ID_LEN: usize = 8;
 
+/// 中转收的 live-id 最长几个字符。dct 自己发的只有 [`LIVE_ID_LEN`] 个；这条
+/// 上限管的是别人拿 `POST /live/start` 随手写的东西——那条路对公网开着、
+/// 没有身份可验，不设限的 id 就是一块谁都能往中转内存里塞的地方。
+pub const MAX_LIVE_ID_CHARS: usize = 64;
+
+/// 两把钥匙（viewer token / push secret）最短、最长几个字符。dct 发的都是
+/// [`LIVE_TOKEN_LEN`] 个。下限挡的是一个字符的钥匙，上限挡的是塞内存。
+pub const MIN_KEY_CHARS: usize = 32;
+pub const MAX_KEY_CHARS: usize = 128;
+
+/// 一路的名字最多几个**字符**（不是字节，中文名字按字算）。守护进程在上架时
+/// 把更长的名字截到这个长度（带省略号），中转则拒收——两边共用这一个数。
+pub const MAX_LANE_NAME_CHARS: usize = 64;
+
 /// 学生那把钥匙的十六进制长度（32 字节随机数）。
 pub const LIVE_TOKEN_LEN: usize = 64;
 

@@ -127,7 +127,12 @@ export class Classroom {
   async liveRpc(w, request) {
     const answer = await this.driver.rpc(w, request);
     if (answer.Error) {
-      const reason = Object.values(answer.Error)[0];
+      // 没带参数的错误码在线上是一个裸字符串（serde 的单元变体），不是
+      // `{码: 参数}` 对象——对它 `Object.values` 会拆出单个字母 "L"。
+      if (answer.Error === 'LiveRelayNotConfigured') {
+        throw fail(409, '这台服务器还没有配置直播中转，请管理员设置 CLASSROOM_LIVE_RELAY 后重启管理服务，再把这个工作区停止、启动一次');
+      }
+      const reason = typeof answer.Error === 'string' ? answer.Error : Object.values(answer.Error)[0];
       if (typeof reason === 'string' && /unknown variant|missing field/.test(reason)) {
         throw fail(409, '这个工作区的 dct 版本还不支持直播，请先停止它再启动（会换成新镜像）');
       }
