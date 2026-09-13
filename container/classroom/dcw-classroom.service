@@ -10,7 +10,7 @@ ExecStart=/opt/dc-terminal/classroom/node /opt/dc-terminal/classroom/server.mjs
 Environment=CLASSROOM_STATE=/var/lib/dcw-classroom
 Environment=CLASSROOM_ORIGIN=https://dataclue.cn
 Environment=CLASSROOM_LEGACY_CONTAINER=dcw-workspace-1
-Environment=CLASSROOM_IMAGE=dc-workspace:0.2.14-classroom
+Environment=CLASSROOM_IMAGE=dc-workspace:0.2.17-live
 Restart=on-failure
 RestartSec=3
 MemoryMax=256M

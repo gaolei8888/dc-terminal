@@ -28,7 +28,7 @@ export class DockerDriver {
   // 也就 400–500 MB。真正卡住的是名额：一台 8 GB 的机器只分得出 2 个，而
   // 共享工作区自己就占一个。所以两个数都能用环境变量压过去，调完重启
   // 服务即可，不用改代码、不用发版。
-  constructor({image = 'dc-workspace:0.2.14-classroom', maxRunning, memory, command = exec} = {}) {
+  constructor({image = 'dc-workspace:0.2.17-live', maxRunning, memory, command = exec} = {}) {
     this.image = image;
     this.memory = memory || process.env.CLASSROOM_MEMORY || '3g';
     this.maxRunning = maxRunning || Number(process.env.CLASSROOM_MAX_RUNNING) || Math.max(1, Math.floor((os.totalmem() - GiB) / (3 * GiB)));
@@ -93,7 +93,26 @@ export class DockerDriver {
     const names = (await this.docker(['ps', '--format', '{{.Names}}'])).trim().split('\n');
     const count = names.filter(n => n === 'dcw-workspace-1' || /^dcw-student-[a-f0-9]{32}$/.test(n)).length;
     if (count >= this.maxRunning) throw new Error('当前运行名额已满，请联系老师结束其他工作区后再试');
-    if (current) await this.docker(['start', this.name(w)], 60000);
+    // 停着的容器如果还是旧镜像，删掉重建，不 `docker start` 它。
+    //
+    // 不这样的话「换镜像」根本无路可走：`stop()` 只是 `docker stop`，这里
+    // 看到容器还在就原样拉起来，改了 `CLASSROOM_IMAGE` 也只对从没建过容器
+    // 的学生生效——老师照着「先停止再启动」点多少遍都还是旧的 dct。
+    //
+    // 比的是镜像 **ID** 不是名字：同一个 tag 重新 build 过，名字一字不差，
+    // 里面的 dct 已经换了。`docker rm` 不带 `-v`，四个命名卷（作品、dct 状态、
+    // Claude/Codex 登录态）原样留着，下面 `docker run` 按同样的名字挂回去。
+    //
+    // 共享工作区除外：它不是这个服务建的，删了这里建不回来。
+    let fresh = !current;
+    if (current && !w.shared) {
+      const wanted = (await this.docker(['image', 'inspect', '--format', '{{.Id}}', this.image])).trim();
+      if (wanted && current.Image !== wanted) {
+        await this.docker(['rm', this.name(w)], 30000);
+        fresh = true;
+      }
+    }
+    if (!fresh) await this.docker(['start', this.name(w)], 60000);
     else {
       const name = this.name(w), mounts = [];
       for (const [suffix, destination] of [['state', '/home/dc/.dct'], ['claude', '/home/dc/.claude'], ['codex', '/home/dc/.codex'], ['work', '/home/dc/work']]) {

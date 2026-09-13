@@ -19,7 +19,7 @@ agent 配置，不输入命令或重启会话；终端图片和自定义颜色�
 监听 `127.0.0.1:17700`。Docker 控制能力只在宿主服务，学生容器不挂载
 Docker socket。`dcw-classroom.service` 是 dataclue.cn 使用的配置。
 
-1. 构建 `dc-workspace:0.2.14-classroom`，使用本仓库 `container/Dockerfile`。
+1. 构建 `dc-workspace:0.2.17-live`，使用本仓库 `container/Dockerfile`。
 2. 将本目录的 mjs、admin.html 和 Node 可执行文件放到 `/opt/dc-terminal/classroom`。
 3. 从受信构建镜像复制 `/usr/local/share/dcw/index.html` 到同目录 `terminal.html`，
    属主 root，学生不可写。管理服务只提供这份固定终端页面，不转发学生进程

@@ -96,6 +96,58 @@ test('Docker driver validates ownership, isolated volumes and 3 GiB budget', asy
   assert.equal(new DockerDriver({maxRunning: 5, memory: '1200m'}).memory, '1200m');
 });
 
+// 换镜像这件事以前只存在于提示文案里：「请先停止它再启动（会换成新镜像）」。
+// 可 `stop()` 只是 `docker stop`，`start()` 看到容器还在就 `docker start`——
+// 拉起来的永远是当初那个镜像，老师照着点一百遍也换不上。
+test('Docker driver: 停着的容器镜像过期了，启动时删容器、留卷、用新镜像重建', async () => {
+  const {DockerDriver} = await import('./docker.mjs');
+  const id = 'b'.repeat(32), w = {id, name: 'Student'};
+  const drive = ({containerImage, shared = false}) => {
+    const commands = [];
+    const driver = new DockerDriver({image: 'dc-workspace:new', maxRunning: 9, command: async (_, args) => {
+      commands.push(args);
+      if (args[0] === 'inspect') {
+        // 删掉之后再问就是「没有这个容器」，跟真 docker 一样
+        if (commands.some(c => c[0] === 'rm')) { const e = new Error('gone'); e.stderr = 'No such object'; throw e; }
+        return {stdout: JSON.stringify([{Image: containerImage, State: {Running: false}, Config: {Labels: {'dcw.classroom': '1', 'dcw.student': id}}, NetworkSettings: {Ports: {}}, Mounts: []}])};
+      }
+      if (args[0] === 'image') return {stdout: 'sha256:new\n'};
+      return {stdout: ''};
+    }});
+    // 真去等工作区就绪要 10 秒，这里只关心 docker 被怎么调
+    driver.backend = async () => ({port: 1, apiPort: 1, token: 't'});
+    return {driver, commands};
+  };
+
+  {
+    const {driver, commands} = drive({containerImage: 'sha256:old'});
+    await driver.start(w).catch(() => {});
+    const verbs = commands.map(c => c[0]);
+    assert.ok(verbs.includes('rm'), `镜像过期必须删掉旧容器：${JSON.stringify(verbs)}`);
+    assert.ok(!verbs.includes('start'), '删掉之后不该再 docker start 那个旧的');
+    const rm = commands.find(c => c[0] === 'rm');
+    assert.ok(!rm.includes('-v') && !rm.includes('--volumes'), '只删容器，四个命名卷（作品、登录态）必须留着');
+    const run = commands.find(c => c[0] === 'run');
+    assert.ok(run, '删完要用新镜像重建');
+    assert.equal(run.at(-1), 'dc-workspace:new');
+    assert.ok(run.includes(`type=volume,source=dcw-student-${id}-work,target=/home/dc/work`), '重建必须挂回原来的作品卷');
+  }
+  {
+    // 镜像没变：照旧 docker start，不许白白删一次容器
+    const {driver, commands} = drive({containerImage: 'sha256:new'});
+    await driver.start(w).catch(() => {});
+    const verbs = commands.map(c => c[0]);
+    assert.ok(verbs.includes('start') && !verbs.includes('rm') && !verbs.includes('run'), `镜像没变不该重建：${JSON.stringify(verbs)}`);
+  }
+  {
+    // 共享工作区不是这里建的，删了就再也建不回来——镜像再旧也只 start
+    const {driver, commands} = drive({containerImage: 'sha256:old'});
+    await driver.start({shared: true, containerName: 'dcw-workspace-1', id}).catch(() => {});
+    const verbs = commands.map(c => c[0]);
+    assert.ok(!verbs.includes('rm') && !verbs.includes('run'), `共享工作区绝不能被删：${JSON.stringify(verbs)}`);
+  }
+});
+
 test('强制直播：只上架活着的会话、路名用学生名字、旧版本 dct 给一句人话', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-live-test-'));
   const store = new Store(dir, {password: 'test-admin'});
