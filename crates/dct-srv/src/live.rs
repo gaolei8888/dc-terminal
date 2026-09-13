@@ -54,7 +54,15 @@ struct Session {
 
 struct Public {
     title: String,
+    /// 只给日志/管理台看的名字——**`reconcile` 不认它**：吊销之后拿同一个
+    /// 名字重发一把新钥匙，新旧两把的名字相同、摘要不同，认名字会让旧钥匙
+    /// 公开过的房间借着新条目继续公开，破了「10 秒内收回」的承诺。这一期
+    /// 还没有审计日志/管理台读它，先留着字段，免得等那条路由落地时又要
+    /// 从别处把「谁发布的」这条信息找回来。
+    #[allow(dead_code)]
     key_name: String,
+    /// 发布时那把密钥的摘要（`KeyEntry.hash`）。`reconcile` 认这个。
+    key_hash: String,
 }
 
 /// 证明「你控制这场直播」的两种方式。
@@ -307,7 +315,7 @@ impl Live {
             return Err(LinkError::Unauthorized);
         }
         let keys = keys.ok_or(LinkError::NotYours)?;
-        let key_name = keys.name_for(key).ok_or(LinkError::Unauthorized)?;
+        let (key_name, key_hash) = keys.entry_for(key).ok_or(LinkError::Unauthorized)?;
         if keys.is_blocked(id) {
             return Err(LinkError::NotYours);
         }
@@ -318,6 +326,7 @@ impl Live {
         room.public = Some(Public {
             title: title.to_string(),
             key_name,
+            key_hash,
         });
         Ok(())
     }
@@ -359,9 +368,7 @@ impl Live {
             let keep = match (keys, room.public.as_ref()) {
                 (_, None) => continue,
                 (None, Some(_)) => false,
-                (Some(k), Some(p)) => {
-                    !k.is_blocked(id) && k.keys.iter().any(|e| e.name == p.key_name)
-                }
+                (Some(k), Some(p)) => !k.is_blocked(id) && k.has_hash(&p.key_hash),
             };
             if !keep {
                 room.public = None;
@@ -1006,6 +1013,34 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// 吊销之后拿**同一个名字**重发一把新钥匙（正常的密钥轮换：两步都在
+    /// 一个 10 秒重载窗口之内做完），旧钥匙公开过的房间必须收回——
+    /// `reconcile` 认的是摘要，不是名字，不能被新条目的同名字糊弄过去。
+    #[test]
+    fn reconcile_revokes_by_key_not_by_name() {
+        let live = started();
+        let (mut keys, key) = keys_with("姜老师");
+        live.publish(
+            "abc",
+            Control::Push(&"p".repeat(64)),
+            Some(&keys),
+            &key,
+            "课",
+        )
+        .unwrap();
+        keys.revoke("姜老师");
+        keys.add("姜老师", 1).unwrap();
+        live.reconcile(Some(&keys));
+        assert!(
+            live.public_list().is_empty(),
+            "吊销后同名重开，不该借新钥匙的条目继续公开"
+        );
+        assert_eq!(
+            live.frame("abc", None, 0).err(),
+            Some(LinkError::Unauthorized)
+        );
     }
 
     #[test]

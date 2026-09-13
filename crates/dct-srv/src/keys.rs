@@ -99,11 +99,21 @@ impl PublishKeys {
 
     /// 这把密钥是谁的。**把每一条都比一遍**，不在第一条命中时提前返回。
     pub fn name_for(&self, key: &str) -> Option<String> {
+        self.entry_for(key).map(|(name, _)| name)
+    }
+
+    /// 这把密钥的主人和摘要。`publish` 把摘要存进 `Public`，好让
+    /// `reconcile` 认「文件里还有没有这把钥匙」——不能只认名字：吊销
+    /// 之后拿同一个名字重发一把新钥匙，新钥匙的摘要跟旧的不一样，不该
+    /// 让旧钥匙公开过的房间借着这个新条目继续公开着。
+    ///
+    /// 常数时间比较：`key` 是调用方给的，跟 `name_for` 一样的理由。
+    pub fn entry_for(&self, key: &str) -> Option<(String, String)> {
         let want = digest_hex(key);
         let mut found = None;
         for k in &self.keys {
             if same_hex(&k.hash, &want) {
-                found = Some(k.name.clone());
+                found = Some((k.name.clone(), k.hash.clone()));
             }
         }
         found
@@ -111,6 +121,12 @@ impl PublishKeys {
 
     pub fn is_blocked(&self, id: &str) -> bool {
         self.blocked.iter().any(|b| b == id)
+    }
+
+    /// 这个摘要还在文件里吗。摘要来自文件本身，不是调用方能选的东西
+    /// （不像 `entry_for` 里的 `key`），用不着常数时间比较。
+    pub fn has_hash(&self, hash: &str) -> bool {
+        self.keys.iter().any(|k| k.hash == hash)
     }
 }
 
