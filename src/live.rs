@@ -46,10 +46,6 @@ use crate::session::SessionManager;
 struct Room {
     id: String,
     token: String,
-    // 眼下唯一的读者是下面的 `push_secret()`，而它本身要等推帧线程
-    // （下一个任务）落地才有真正的调用点——先把字段和取用口都建好，
-    // 免得那个任务一上来就要碰这个类型的私有字段。
-    #[allow(dead_code)]
     push_secret: String,
     staged: Vec<(u32, String)>,
     /// 上架名单改过几次。**推帧线程靠它认出「同一场直播，但 lanes 换了」**
@@ -66,6 +62,15 @@ struct Room {
     /// `start()` 时总是 `Pending`：这一刻中转还完全没听说过这个 id，
     /// 推帧线程调用 `POST /live/start` 成功之后才会翻成 `Ready`。
     readiness: LiveReadiness,
+    /// 本机想让它公开时的标题；`None` = 本机没请求公开（可能是管理台公开的）。
+    want_public: Option<String>,
+    /// 本机请求公开时拿到的发布密钥。**只活在守护进程内存里**，不进 `LiveInfo`。
+    public_key: Option<String>,
+    /// 界面看到的公开状态，见 `LivePublic`。
+    public: LivePublic,
+    /// 公开意图改过几次。推帧线程靠它认出「要重新 PUT/DELETE」，也靠它
+    /// 挡住迟到的结果，理由同 `staged_rev`。
+    public_rev: u64,
 }
 
 /// 守护进程里的直播状态槽。
@@ -128,6 +133,11 @@ impl LiveState {
             staged_rev: 0,
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            // 新的一场一律私密：公开是对某一个房间号的决定，不跟着老师走。
+            want_public: None,
+            public_key: None,
+            public: LivePublic::Private,
+            public_rev: 0,
         });
 
         info
@@ -164,7 +174,7 @@ impl LiveState {
             staged: room.staged.clone(),
             viewers: room.viewers,
             readiness: room.readiness.clone(),
-            public: LivePublic::Private,
+            public: room.public.clone(),
         })
     }
 
@@ -188,7 +198,7 @@ impl LiveState {
                 staged: room.staged.clone(),
                 viewers: room.viewers,
                 readiness: room.readiness.clone(),
-                public: LivePublic::Private,
+                public: room.public.clone(),
             },
             None => LiveInfo {
                 id: String::new(),
@@ -244,12 +254,81 @@ impl LiveState {
         }
     }
 
+    /// 公开这场直播：记下标题和发布密钥，公开状态先是 `Pending`，推帧线程
+    /// 送达之后才翻成 `Listed`。没在播回 `None`。
+    ///
+    /// **每调一次都算一版新的意图**（`public_rev` 加一）：被 401/403/413 拒过
+    /// 之后推帧线程不再自己重试，老师再按一次 `p` 就是靠这个让它重新试。
+    pub fn publish(&self, title: String, key: String) -> Option<LiveInfo> {
+        {
+            let mut guard = recover(self.room.lock());
+            let room = guard.as_mut()?;
+            room.public = LivePublic::Pending {
+                title: title.clone(),
+            };
+            room.want_public = Some(title);
+            room.public_key = Some(key);
+            room.public_rev += 1;
+        }
+        Some(self.info())
+    }
+
+    /// 取消公开。界面立刻看到 `Private`；推帧线程随后发 `DELETE`。没在播回 `None`。
+    pub fn unpublish(&self) -> Option<LiveInfo> {
+        {
+            let mut guard = recover(self.room.lock());
+            let room = guard.as_mut()?;
+            room.public = LivePublic::Private;
+            room.want_public = None;
+            room.public_key = None;
+            room.public_rev += 1;
+        }
+        Some(self.info())
+    }
+
+    /// 管理台用的公开凭证（见 `dct_link::live::publish_grant`）。没在播是 `None`。
+    /// 凭证只能切换公开状态，推帧钥匙原文仍然不出这个进程。
+    pub fn grant(&self) -> Option<String> {
+        recover(self.room.lock()).as_ref().map(|r| {
+            dct_link::live::publish_grant(&dct_link::live::push_hash(&r.push_secret), &r.id)
+        })
+    }
+
+    /// 推帧线程把一次 `PUT` 的结果写回。**`id` 和 `rev` 都要对得上**，理由同
+    /// [`Self::mark_ready`]：老师可能在请求路上又按了一次 `p`（或者取消了），
+    /// 旧意图的结果不能盖到新意图头上。
+    pub(crate) fn mark_public(&self, id: &str, rev: u64, public: LivePublic) {
+        if let Some(room) = recover(self.room.lock()).as_mut() {
+            if room.id == id && room.public_rev == rev {
+                room.public = public;
+            }
+        }
+    }
+
+    /// 推帧线程把中转说的公开状态写回；回 `true` 表示要重新 PUT 一次（自愈，
+    /// 见 [`seen_public`]）。`rev` 是这一轮快照里的那一版：读人数那次请求
+    /// 发出去之后老师取消了公开，读回来的「公开」就不能把界面翻回 `Listed`。
+    pub(crate) fn set_public_seen(&self, id: &str, rev: u64, relay_title: Option<String>) -> bool {
+        let mut guard = recover(self.room.lock());
+        let Some(room) = guard.as_mut() else {
+            return false;
+        };
+        if room.id != id || room.public_rev != rev {
+            return false;
+        }
+        let (next, heal) = seen_public(room.want_public.as_deref(), &room.public, relay_title);
+        room.public = next;
+        heal
+    }
+
     /// 老师那把推帧/停播用的钥匙。**`pub(crate)`，不经过协议**——取用者是
     /// 跟 `LiveState` 活在同一个进程里的推帧线程，它没有理由绕道
     /// `Request`/`Response` 去问 daemon 自己已经握在手里的东西；一旦这条
     /// 路走了协议，`push_secret` 就会跟着 `Response::Live` 一起发到手机
     /// 网页上，等于把它交给了每一个能读状态的人（详见 `LiveInfo` 上的
     /// 文档注释）。没在播就是 `None`。
+    // 生产代码里推帧线程一次锁拿全（`snapshot`），`grant` 也在同一把锁里算，
+    // 眼下只有测试用它核对「发出去的钥匙是不是这一场的」。
     #[allow(dead_code)]
     pub(crate) fn push_secret(&self) -> Option<String> {
         recover(self.room.lock())
@@ -268,6 +347,9 @@ impl LiveState {
             push_secret: r.push_secret.clone(),
             staged: r.staged.clone(),
             staged_rev: r.staged_rev,
+            want_public: r.want_public.clone(),
+            public_key: r.public_key.clone(),
+            public_rev: r.public_rev,
         })
     }
 
@@ -290,6 +372,12 @@ struct RoomSnapshot {
     /// 见 `Room::staged_rev`：推帧线程要靠它认出「同一场直播，但 lanes
     /// 换了」，光比 `id` 的话改上架永远传不到中转。
     staged_rev: u64,
+    /// 见 `Room::want_public`。
+    want_public: Option<String>,
+    /// 见 `Room::public_key`。
+    public_key: Option<String>,
+    /// 见 `Room::public_rev`。
+    public_rev: u64,
 }
 
 /// 生成 `hex_len` 个十六进制字符的随机串，取自系统 CSPRNG。**不是**时间戳、
@@ -368,6 +456,61 @@ fn should_push(last: Option<u64>, now: u64, since: Duration) -> bool {
         // 画面没变，但太久没说话了：中转按 `LIVE_TTL` 回收，保活是这条
         // 链路上唯一阻止「老师想事情想久了直播自己断掉」的东西。
         _ => since >= KEEPALIVE,
+    }
+}
+
+/// 推帧线程这一轮该对中转的公开状态做什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicAction {
+    Nothing,
+    Put,
+    Delete,
+}
+
+/// 这一版公开意图（`rev`）该对中转做什么。**纯函数，好测。**
+///
+/// `applied` = 这一版已经送达；`stuck` = 这一版被 401/403/413 拒过——不重试，
+/// 直到老师再按一次 `p`（那是新的一版）。运营方的吊销和下线不能被守护进程
+/// 悄悄绕回去，也不该让它每一轮去撞一次中转。
+///
+/// `rev == 0` 且不想公开 = 这一场从没碰过公开，不必发 `DELETE`。
+fn public_action(want: Option<&str>, applied: bool, stuck: bool, rev: u64) -> PublicAction {
+    if applied || stuck {
+        return PublicAction::Nothing;
+    }
+    match want {
+        Some(_) => PublicAction::Put,
+        None if rev > 0 => PublicAction::Delete,
+        None => PublicAction::Nothing,
+    }
+}
+
+/// 以中转为准写回公开状态，并判断要不要自愈。**纯函数，好测。**
+///
+/// 唯一的自愈规则：本机想公开、之前已上列表、中转却说不公开（中转重启、
+/// 房间被回收、密钥被吊销、被下线——守护进程分不出来，也不需要分）→ 回到
+/// `Pending`，再 PUT 一次，由那次答复定结果。
+///
+/// 本机不想公开的（包括管理台代为公开的），只照实显示，从不自己去 PUT。
+/// 已经 `Failed` 的保持原样：被拒的不重试，连不上的由推帧线程按退避重试。
+fn seen_public(
+    want: Option<&str>,
+    current: &LivePublic,
+    relay_title: Option<String>,
+) -> (LivePublic, bool) {
+    match (want, relay_title) {
+        (None, Some(t)) => (LivePublic::Listed { title: t }, false),
+        (None, None) => (LivePublic::Private, false),
+        (Some(_), Some(t)) => (LivePublic::Listed { title: t }, false),
+        (Some(w), None) => match current {
+            LivePublic::Listed { .. } => (
+                LivePublic::Pending {
+                    title: w.to_string(),
+                },
+                true,
+            ),
+            other => (other.clone(), false),
+        },
     }
 }
 
@@ -475,6 +618,14 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
     // 不该继承上一场的失败次数。
     let mut start_fails: u32 = 0;
     let mut last_attempt: Option<(String, u64)> = None;
+    // 这一场、这一版公开意图（`(id, public_rev)`）已经送达 / 被 401/403/413
+    // 拒过（不再重试，直到老师再按一次 `p`，那是新的一版）。
+    let mut public_applied: Option<(String, u64)> = None;
+    let mut public_stuck: Option<(String, u64)> = None;
+    // 连不上中转时：哪一版在退避、什么时候再试；连着失败几次。复用开播的
+    // 退避表。**记一个时刻，不 `nap`**：公开重试绝不能把推帧拖住。
+    let mut public_retry: Option<((String, u64), Instant)> = None;
+    let mut public_fails: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         match live.snapshot() {
@@ -523,6 +674,10 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                             live.mark_ready(&room.id, room.staged_rev);
                             started = Some(this);
                             start_fails = 0;
+                            // 中转重开房间**不继承公开状态**，已经送达过的那一版
+                            // 得再送一次。被拒过的（`public_stuck`）不清：重开
+                            // 房间不是老师再按了一次 `p`。
+                            public_applied = None;
                             // 新的一场（或者换了上架名单），旧的哈希对不上号，
                             // 从头判断该不该推。
                             lanes.clear();
@@ -539,13 +694,75 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                         }
                     }
                 }
+                // 公开意图送到中转。放在读人数**之前**：这一轮刚 PUT 过的
+                // 话，紧接着读回来的就已经是新状态，不会先闪一下旧的。
+                let pub_this = (room.id.clone(), room.public_rev);
+                // 换了一版意图（又按了 `p`、取消了、换了一场）：退避从头开始。
+                if public_retry.as_ref().is_some_and(|(v, _)| v != &pub_this) {
+                    public_retry = None;
+                    public_fails = 0;
+                }
+                let due = public_retry
+                    .as_ref()
+                    .is_none_or(|(_, at)| Instant::now() >= *at);
+                let action = public_action(
+                    room.want_public.as_deref(),
+                    public_applied.as_ref() == Some(&pub_this),
+                    public_stuck.as_ref() == Some(&pub_this),
+                    room.public_rev,
+                );
+                if due && action != PublicAction::Nothing {
+                    let result = match action {
+                        PublicAction::Put => {
+                            let title = room.want_public.clone().unwrap_or_default();
+                            let key = room.public_key.as_deref().unwrap_or_default();
+                            let r =
+                                put_public(&agent, &base, &room.id, &room.push_secret, &title, key);
+                            let shown = match &r {
+                                Ok(()) => LivePublic::Listed { title },
+                                Err(reason) => LivePublic::Failed {
+                                    title,
+                                    reason: reason.clone(),
+                                },
+                            };
+                            live.mark_public(&room.id, room.public_rev, shown);
+                            r
+                        }
+                        // `Delete`（`Nothing` 上面已经排除）。
+                        _ => delete_public(&agent, &base, &room.id, &room.push_secret),
+                    };
+                    match result {
+                        Ok(()) => {
+                            public_applied = Some(pub_this);
+                            public_retry = None;
+                            public_fails = 0;
+                        }
+                        // 运营方拒了（密钥吊销、被下线、标题越界）：不重试。
+                        Err(LiveFailure::Refused(401 | 403 | 413)) => {
+                            public_stuck = Some(pub_this);
+                            public_retry = None;
+                            public_fails = 0;
+                        }
+                        // 连不上、太频繁（429）之类：按开播退避再试。
+                        Err(_) => {
+                            public_fails += 1;
+                            public_retry =
+                                Some((pub_this, Instant::now() + start_backoff(public_fails)));
+                        }
+                    }
+                }
                 // 「N 人在看」是 spec 四道防线里的第二道——它必须是活的：
                 // 一个恒为 0 的数字比没有这个数字更糟，老师会据此以为没人
                 // 在看。读不到就留着上一次的值，不归零。
                 if viewers_at.is_none_or(|t| t.elapsed() >= KEEPALIVE) {
                     viewers_at = Some(Instant::now());
-                    if let Some(n) = fetch_viewers(&agent, &base, &room.id, &room.token) {
+                    if let Some((n, public)) = fetch_lanes(&agent, &base, &room.id, &room.token) {
                         live.set_viewers(&room.id, n);
+                        // 公开状态以中转为准（管理台代为公开的也在这里显示出来）。
+                        if live.set_public_seen(&room.id, room.public_rev, public) {
+                            // 自愈：本机想公开、中转却说不公开——下一轮再 PUT 一次。
+                            public_applied = None;
+                        }
                     }
                 }
                 let ids: Vec<u32> = room.staged.iter().map(|(id, _)| *id).collect();
@@ -587,6 +804,10 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                 viewers_at = None;
                 start_fails = 0;
                 last_attempt = None;
+                public_applied = None;
+                public_stuck = None;
+                public_retry = None;
+                public_fails = 0;
             }
         }
         nap(stop, PUSH_INTERVAL);
@@ -712,12 +933,22 @@ fn push_frame(agent: &ureq::Agent, base: &str, id: &str, secret: &str, lane: usi
 /// `GET /live/{id}/lanes` 的答复里推帧线程要的那一半。中转那侧的
 /// `LiveLanesResponse` 还带着 lanes 名字——那是给学生页渲染按钮用的，
 /// 这里用不上，`serde` 会自动忽略多出来的字段。
+///
+/// `public` 是这场直播此刻的公开标题（私密是 `null`）。`#[serde(default)]`：
+/// 还没升级的中转不带这个字段，当成私密读，别让读人数跟着一起失败。
 #[derive(serde::Deserialize)]
 struct LanesBody {
     viewers: u32,
+    #[serde(default)]
+    public: Option<PublicTitleBody>,
 }
 
-/// 去中转问一次「现在几个人在看」。
+#[derive(serde::Deserialize)]
+struct PublicTitleBody {
+    title: String,
+}
+
+/// 去中转问一次「现在几个人在看、这场公不公开」。
 ///
 /// **用的是学生那把只读 token**（`x-live-token`）：这是一条读路由，
 /// `push_secret` 在这里不管用也不该用——推帧线程手上本来就有 viewer
@@ -725,7 +956,12 @@ struct LanesBody {
 ///
 /// 读不到就答 `None`，调用方原样留着上一次的数——网络抖一下不该让老师
 /// 屏幕上的人数瞬间归零，那比慢几秒更容易被误读成「学生都走了」。
-fn fetch_viewers(agent: &ureq::Agent, base: &str, id: &str, token: &str) -> Option<u32> {
+fn fetch_lanes(
+    agent: &ureq::Agent,
+    base: &str,
+    id: &str,
+    token: &str,
+) -> Option<(u32, Option<String>)> {
     let url = format!("{base}{}/{id}/lanes", dct_link::live::LIVE_PREFIX);
     let body: LanesBody = agent
         .get(&url)
@@ -734,7 +970,55 @@ fn fetch_viewers(agent: &ureq::Agent, base: &str, id: &str, token: &str) -> Opti
         .ok()?
         .into_json()
         .ok()?;
-    Some(body.viewers)
+    Some((body.viewers, body.public.map(|p| p.title)))
+}
+
+/// `PUT /live/{id}/public` 的请求体——跟 `dct-srv::PublishRequest` 靠字段名对齐。
+/// **不派生 `Debug`**：里面是发布密钥。
+#[derive(serde::Serialize)]
+struct PublishBody<'a> {
+    title: &'a str,
+    key: &'a str,
+}
+
+/// 公开这场直播：推帧钥匙证明「这是我的房间」，发布密钥证明「我有资格公开」。
+/// 失败回码不回句子，理由同 `start_room`；密钥和钥匙都不进任何日志。
+fn put_public(
+    agent: &ureq::Agent,
+    base: &str,
+    id: &str,
+    secret: &str,
+    title: &str,
+    key: &str,
+) -> Result<(), LiveFailure> {
+    let url = format!("{base}{}", dct_link::live::public_path(id));
+    match agent
+        .put(&url)
+        .set("x-live-push", secret)
+        .send_json(PublishBody { title, key })
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(LiveFailure::Refused(code)),
+        Err(ureq::Error::Transport(_)) => Err(LiveFailure::Unreachable),
+    }
+}
+
+/// 取消公开。中转那一侧是幂等的。
+///
+/// **中转答了任何状态码都算送达**：204 是撤下了；401 是房间已经不在（中转
+/// 重启、被回收），不在的房间谈不上公开，再发多少次也还是 401。只有连不上
+/// 才值得重试——不然一个已经没了的房间会被每 500ms 撞一次。
+fn delete_public(
+    agent: &ureq::Agent,
+    base: &str,
+    id: &str,
+    secret: &str,
+) -> Result<(), LiveFailure> {
+    let url = format!("{base}{}", dct_link::live::public_path(id));
+    match agent.delete(&url).set("x-live-push", secret).call() {
+        Ok(_) | Err(ureq::Error::Status(..)) => Ok(()),
+        Err(ureq::Error::Transport(_)) => Err(LiveFailure::Unreachable),
+    }
 }
 
 /// 停播：告诉中转把这场直播连同两把钥匙一起收掉。同样发不出去就算了——
@@ -940,9 +1224,9 @@ mod tests {
         let srv = FakeSrv::start();
         let agent = crate::sys::tls::agent_builder().build();
 
-        let n = fetch_viewers(&agent, &srv.base(), "abc123", "viewer-t");
+        let n = fetch_lanes(&agent, &srv.base(), "abc123", "viewer-t");
 
-        assert_eq!(n, Some(5), "假中转答的是 5 个人在看");
+        assert_eq!(n, Some((5, None)), "假中转答的是 5 个人在看、没公开");
         let seen = srv.seen();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].method, "GET");
@@ -962,7 +1246,20 @@ mod tests {
             .timeout_connect(Duration::from_millis(200))
             .build();
         // 127.0.0.1:1 没人监听。
-        assert_eq!(fetch_viewers(&agent, "http://127.0.0.1:1", "abc", "t"), None);
+        assert_eq!(fetch_lanes(&agent, "http://127.0.0.1:1", "abc", "t"), None);
+    }
+
+    /// `/lanes` 答复里的 `public` 标题要一起读回来——管理台代为公开的直播，
+    /// 本机只能靠这一条知道。
+    #[test]
+    fn fetch_lanes_reads_the_public_title_back() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).lanes_public = Some("第3课".into());
+        let agent = crate::sys::tls::agent_builder().build();
+        assert_eq!(
+            fetch_lanes(&agent, &srv.base(), "abc123", "viewer-t"),
+            Some((5, Some("第3课".into())))
+        );
     }
 
     /// 没在播的时候没有名单可改——回 `None`，不能悄悄开一场新的。
@@ -1187,6 +1484,16 @@ mod tests {
         seen: Vec<Seen>,
         /// 接下来还要故意失败几次（连响应都不给，直接摔断连接）。
         fail: usize,
+        /// `PUT .../public` 要答的状态码（默认 0，当 204）。
+        public_status: u16,
+        /// `GET .../lanes` 答复里的 `public` 标题（默认 `None`）。跟真中转
+        /// 一样，答了 204 的 `PUT .../public` 会把标题记在这里，`DELETE` 清掉。
+        lanes_public: Option<String>,
+        /// 答 204 却不记下公开——模拟「送达之后中转又把公开弄丢了」
+        /// （重启、回收、吊销），用来测自愈。
+        forget_public: bool,
+        /// `DELETE .../public` 要答的状态码（默认 0，当 204）。
+        unpublish_status: u16,
     }
 
     #[derive(Debug, Clone)]
@@ -1263,6 +1570,18 @@ mod tests {
         // 读人数那条路要答一份真的 JSON，别的路（开播/推帧/停播）答 204
         // 就够——调用方只看成没成功。
         let lanes_query = path.ends_with("/lanes");
+        let public_put = method == "PUT" && path.ends_with("/public");
+        let public_status = st.public_status;
+        let public_delete = method == "DELETE" && path.ends_with("/public");
+        let unpublish_status = st.unpublish_status;
+        if public_put && matches!(public_status, 0 | 204) && !st.forget_public {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            st.lanes_public = v["title"].as_str().map(str::to_string);
+        }
+        if method == "DELETE" && path.ends_with("/public") {
+            st.lanes_public = None;
+        }
+        let lanes_public = st.lanes_public.clone();
         st.seen.push(Seen {
             method,
             path,
@@ -1272,10 +1591,20 @@ mod tests {
         drop(st);
 
         let out = if lanes_query {
-            let json = r#"{"lanes":["前端"],"viewers":5}"#;
+            let public = match lanes_public {
+                Some(t) => format!(r#"{{"title":"{t}"}}"#),
+                None => "null".to_string(),
+            };
+            let json = format!(r#"{{"lanes":["前端"],"viewers":5,"public":{public}}}"#);
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
                 json.len()
+            )
+        } else if public_put && public_status != 0 && public_status != 204 {
+            format!("HTTP/1.1 {public_status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        } else if public_delete && unpublish_status != 0 && unpublish_status != 204 {
+            format!(
+                "HTTP/1.1 {unpublish_status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
         } else {
             "HTTP/1.1 204 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -1341,6 +1670,9 @@ mod tests {
             push_secret: "push-s".into(),
             staged: vec![(1, "前端".into()), (2, "后端".into())],
             staged_rev: 0,
+            want_public: None,
+            public_key: None,
+            public_rev: 0,
         };
         assert!(
             start_room(&agent, &srv.base(), &room).is_ok(),
@@ -1372,6 +1704,9 @@ mod tests {
             push_secret: "push-s".into(),
             staged: vec![(1, "前端".into())],
             staged_rev: 0,
+            want_public: None,
+            public_key: None,
+            public_rev: 0,
         };
         // 127.0.0.1:1 没人监听，连接会被立刻拒绝——不需要真的等超时。
         let err = start_room(&agent, "http://127.0.0.1:1", &room).unwrap_err();
@@ -1574,6 +1909,466 @@ mod tests {
             "迟到的 mark_ready 认错了 id，不该影响当前这一场"
         );
         assert_eq!(live.info().id, current.id);
+    }
+
+    fn live_with_room() -> LiveState {
+        let live = LiveState::new("https://x".to_string());
+        live.start(vec![(1, "一".into())]);
+        live
+    }
+
+    #[test]
+    fn publishing_needs_a_room_and_records_pending() {
+        let live = LiveState::new("https://x".to_string());
+        assert!(
+            live.publish("课".into(), "k".into()).is_none(),
+            "没在播不能公开"
+        );
+        assert!(live.unpublish().is_none(), "没在播也谈不上取消公开");
+        let live = live_with_room();
+        let info = live.publish("课".into(), "k".into()).unwrap();
+        assert_eq!(
+            info.public,
+            LivePublic::Pending {
+                title: "课".into()
+            }
+        );
+        assert_eq!(
+            live.info().public,
+            LivePublic::Pending {
+                title: "课".into()
+            }
+        );
+        assert_eq!(live.unpublish().unwrap().public, LivePublic::Private);
+    }
+
+    /// 改上架名单不动公开意图：链接不变，老师要的「公开」也不变。
+    #[test]
+    fn restaging_keeps_the_public_state() {
+        let live = live_with_room();
+        live.publish("课".into(), "k".into());
+        let info = live.restage(vec![(2, "二".into())]).unwrap();
+        assert_eq!(
+            info.public,
+            LivePublic::Pending {
+                title: "课".into()
+            }
+        );
+    }
+
+    /// 开新的一场不继承上一场的公开：那是另一个房间号、另一条链接。
+    #[test]
+    fn a_new_live_starts_private() {
+        let live = live_with_room();
+        live.publish("课".into(), "k".into());
+        let info = live.start(vec![(1, "一".into())]);
+        assert_eq!(info.public, LivePublic::Private);
+        assert_eq!(live.info().public, LivePublic::Private);
+    }
+
+    #[test]
+    fn the_grant_is_the_shared_hmac_of_this_rooms_push_secret() {
+        let live = live_with_room();
+        let secret = live.push_secret().unwrap();
+        let id = live.info().id;
+        assert_eq!(
+            live.grant().unwrap(),
+            dct_link::live::publish_grant(&dct_link::live::push_hash(&secret), &id)
+        );
+        live.stop();
+        assert!(live.grant().is_none());
+    }
+
+    /// 发布密钥不许从 `info()` 或 `Debug` 漏出去。
+    #[test]
+    fn the_publish_key_never_leaves_the_state() {
+        let live = live_with_room();
+        let info = live
+            .publish("课".into(), "SUPER-SECRET-KEY".into())
+            .unwrap();
+        assert!(!serde_json::to_string(&info)
+            .unwrap()
+            .contains("SUPER-SECRET-KEY"));
+        assert!(!format!("{info:?}").contains("SUPER-SECRET-KEY"));
+    }
+
+    #[test]
+    fn what_to_tell_the_relay_about_publicity() {
+        use PublicAction::*;
+        assert_eq!(
+            public_action(None, false, false, 0),
+            Nothing,
+            "从没碰过公开"
+        );
+        assert_eq!(public_action(Some("课"), false, false, 1), Put);
+        assert_eq!(
+            public_action(Some("课"), true, false, 1),
+            Nothing,
+            "这一版已经送达"
+        );
+        assert_eq!(
+            public_action(Some("课"), false, true, 1),
+            Nothing,
+            "被 401/403/413 拒过，不重试"
+        );
+        assert_eq!(public_action(None, false, false, 2), Delete, "撤销过公开");
+        assert_eq!(public_action(None, true, false, 2), Nothing);
+    }
+
+    /// 以中转为准，外加唯一一条自愈规则。
+    #[test]
+    fn reading_publicity_back_from_the_relay() {
+        let listed = LivePublic::Listed {
+            title: "课".into()
+        };
+        // 本机不想公开：照实显示中转说的（管理台代为公开的就是这种）
+        assert_eq!(
+            seen_public(None, &LivePublic::Private, Some("课".into())),
+            (listed.clone(), false)
+        );
+        assert_eq!(
+            seen_public(None, &listed, None),
+            (LivePublic::Private, false)
+        );
+        // 本机想公开、中转也说公开
+        assert_eq!(
+            seen_public(
+                Some("课"),
+                &LivePublic::Pending {
+                    title: "课".into()
+                },
+                Some("课".into())
+            ),
+            (listed.clone(), false)
+        );
+        // 本机想公开、之前已上列表、中转却说不公开 → 回到 Pending 并要求再 PUT 一次
+        assert_eq!(
+            seen_public(Some("课"), &listed, None),
+            (
+                LivePublic::Pending {
+                    title: "课".into()
+                },
+                true
+            )
+        );
+        // 已经 Failed（被拒）的，中转说不公开是意料之中：保持失败，不重试
+        let failed = LivePublic::Failed {
+            title: "课".into(),
+            reason: LiveFailure::Refused(401),
+        };
+        assert_eq!(
+            seen_public(Some("课"), &failed, None),
+            (failed.clone(), false)
+        );
+    }
+
+    /// 迟到的公开结果不许写到新的一版意图（或新的一场）头上——同 `mark_ready` 的规矩。
+    #[test]
+    fn a_late_publicity_result_for_an_older_intent_is_ignored() {
+        let live = live_with_room();
+        let id = live.info().id;
+        live.publish("旧".into(), "k".into()); // rev 1
+        live.unpublish(); // rev 2
+        live.mark_public(
+            &id,
+            1,
+            LivePublic::Listed {
+                title: "旧".into()
+            },
+        );
+        assert_eq!(
+            live.info().public,
+            LivePublic::Private,
+            "rev 1 的 PUT 结果盖掉了 rev 2 的取消公开"
+        );
+        assert!(!live.set_public_seen(&id, 1, Some("旧".into())));
+        assert_eq!(
+            live.info().public,
+            LivePublic::Private,
+            "rev 1 那一轮读回的公开盖掉了 rev 2 的取消公开"
+        );
+        assert!(!live.set_public_seen("别的房间", 2, Some("旧".into())));
+        assert_eq!(live.info().public, LivePublic::Private);
+        live.mark_public(
+            &id,
+            2,
+            LivePublic::Failed {
+                title: "x".into(),
+                reason: LiveFailure::Unreachable,
+            },
+        );
+        assert!(
+            matches!(live.info().public, LivePublic::Failed { .. }),
+            "对得上的那一版要生效"
+        );
+    }
+
+    /// 公开：推帧线程带着推帧钥匙和发布密钥去 PUT，成功后状态翻成 Listed。
+    #[test]
+    fn the_pusher_publishes_with_the_push_secret_and_the_key() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("第3课".into(), "the-key".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("PUT 发出去", || {
+            srv.seen()
+                .iter()
+                .any(|s| s.method == "PUT" && s.path.ends_with("/public"))
+        });
+        let put = srv.seen().into_iter().find(|s| s.method == "PUT").unwrap();
+        assert_eq!(put.path, dct_link::live::public_path(&live.info().id));
+        assert_eq!(put.headers.get("x-live-push"), live.push_secret().as_ref());
+        let body = String::from_utf8(put.body).unwrap();
+        assert!(
+            body.contains(r#""title":"第3课""#) && body.contains(r#""key":"the-key""#),
+            "{body}"
+        );
+        until("状态翻成 Listed", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "第3课".into(),
+                }
+        });
+        pusher.stop();
+    }
+
+    /// 被 401 拒：Failed，而且**不再重试**。
+    #[test]
+    fn a_refused_publication_is_not_retried() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).public_status = 401;
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "bad".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("失败", || {
+            matches!(live.info().public, LivePublic::Failed { .. })
+        });
+        assert_eq!(
+            live.info().public,
+            LivePublic::Failed {
+                title: "课".into(),
+                reason: LiveFailure::Refused(401)
+            }
+        );
+        std::thread::sleep(PUSH_INTERVAL * 6);
+        let puts = srv
+            .seen()
+            .iter()
+            .filter(|s| s.method == "PUT" && s.path.ends_with("/public"))
+            .count();
+        assert_eq!(puts, 1, "被拒之后又去撞了中转 {puts} 次");
+        pusher.stop();
+    }
+
+    /// 被拒之后老师再按一次 `p`（新的一版意图）：这一次要真的再试。
+    #[test]
+    fn pressing_publish_again_after_a_refusal_tries_again() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).public_status = 403;
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("失败", || {
+            matches!(live.info().public, LivePublic::Failed { .. })
+        });
+        recover(srv.state.lock()).public_status = 204;
+        live.publish("课".into(), "k".into());
+        until("再按一次之后上了列表", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "课".into()
+                }
+        });
+        pusher.stop();
+    }
+
+    /// 连不上中转：Failed { Unreachable }，按开播退避再试，而不是停在失败上。
+    #[test]
+    fn an_unreachable_publication_is_retried_after_a_backoff() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        let pusher = spawn_pusher(live.clone(), mgr);
+        // 等开播和第一次读人数都过去，接下来的第一条请求就是 PUT。
+        until("读过一次人数", || {
+            srv.seen().iter().any(|s| s.path.ends_with("/lanes"))
+        });
+        recover(srv.state.lock()).fail = 1;
+        live.publish("课".into(), "k".into());
+        until("连不上", || {
+            live.info().public
+                == LivePublic::Failed {
+                    title: "课".into(),
+                    reason: LiveFailure::Unreachable,
+                }
+        });
+        let failed_at = Instant::now();
+        until("退避之后再试成功", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "课".into()
+                }
+        });
+        assert!(
+            // 留 250ms 余量给 `until` 的轮询粒度；不退避的话这里只有 ~500ms。
+            failed_at.elapsed() + Duration::from_millis(250) >= start_backoff(1),
+            "连不上之后没有退避就立刻重试了"
+        );
+        pusher.stop();
+    }
+
+    /// 自愈：送达过的公开被中转弄丢了（读人数时它说不公开）→ 再 PUT 一次，
+    /// 由那次答复定结果；而且只补这一次，不是每轮都 PUT。
+    #[test]
+    fn a_publication_the_relay_lost_is_put_once_more() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).forget_public = true;
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        let puts = || srv.seen().iter().filter(|s| s.method == "PUT").count();
+        // 第一轮：开播 → PUT → 读人数（中转说不公开）→ 下一轮再 PUT。
+        until("自愈又 PUT 了一次", || puts() == 2);
+        until("再次送达之后是 Listed", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "课".into()
+                }
+        });
+        std::thread::sleep(PUSH_INTERVAL * 4);
+        assert_eq!(puts(), 2, "自愈只补一次，不该每轮都 PUT");
+        pusher.stop();
+    }
+
+    /// 改上架名单会让中转重开房间，而重开**不继承公开状态**——所以要再送达一次。
+    #[test]
+    fn restaging_sends_the_publication_again() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("先公开", || {
+            matches!(live.info().public, LivePublic::Listed { .. })
+        });
+        let puts = || srv.seen().iter().filter(|s| s.method == "PUT").count();
+        assert_eq!(puts(), 1);
+        live.restage(vec![]);
+        until("重开之后再 PUT 一次", || puts() == 2);
+        pusher.stop();
+    }
+
+    /// 改上架名单让中转重开了房间，但那不是老师再按了一次 `p`：被拒过的
+    /// 公开照样不重试（运营方的吊销、下线不能被改一次名单绕回去）。
+    #[test]
+    fn restaging_does_not_retry_a_refused_publication() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).public_status = 403;
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("失败", || {
+            matches!(live.info().public, LivePublic::Failed { .. })
+        });
+        live.restage(vec![]);
+        let starts = || {
+            srv.seen()
+                .iter()
+                .filter(|s| s.path == dct_link::live::PATH_START)
+                .count()
+        };
+        until("重开了房间", || starts() == 2);
+        std::thread::sleep(PUSH_INTERVAL * 3);
+        let puts = srv.seen().iter().filter(|s| s.method == "PUT").count();
+        assert_eq!(puts, 1, "改一次名单就又去撞了中转");
+        pusher.stop();
+    }
+
+    /// 取消公开：发 DELETE。
+    #[test]
+    fn unpublishing_sends_a_delete() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("先公开", || {
+            matches!(live.info().public, LivePublic::Listed { .. })
+        });
+        live.unpublish();
+        until("DELETE 发出去", || {
+            srv.seen()
+                .iter()
+                .any(|s| s.method == "DELETE" && s.path.ends_with("/public"))
+        });
+        let del = srv
+            .seen()
+            .into_iter()
+            .find(|s| s.method == "DELETE")
+            .unwrap();
+        assert_eq!(del.headers.get("x-live-push"), live.push_secret().as_ref());
+        std::thread::sleep(PUSH_INTERVAL * 3);
+        let deletes = srv.seen().iter().filter(|s| s.method == "DELETE").count();
+        assert_eq!(deletes, 1, "取消公开送达之后又发了 {deletes} 次 DELETE");
+        pusher.stop();
+    }
+
+    /// 中转对取消公开答了 401（房间已经不在：重启、回收）：不在的房间谈不上
+    /// 公开，这一版就算送达——不能每 500ms 对着它再撞一次。
+    #[test]
+    fn an_unpublish_the_relay_answered_is_not_retried() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("先公开", || {
+            matches!(live.info().public, LivePublic::Listed { .. })
+        });
+        recover(srv.state.lock()).unpublish_status = 401;
+        live.unpublish();
+        let deletes = || srv.seen().iter().filter(|s| s.method == "DELETE").count();
+        until("DELETE 发出去", || deletes() == 1);
+        std::thread::sleep(PUSH_INTERVAL * 4);
+        assert_eq!(deletes(), 1, "中转已经答过了，又撞了 {} 次", deletes() - 1);
+        assert_eq!(live.info().public, LivePublic::Private);
+        pusher.stop();
+    }
+
+    /// 管理台代为公开：本机没请求过，但中转的 lanes 说公开 → 界面显示 Listed，且本机不发 PUT。
+    #[test]
+    fn a_publication_made_elsewhere_is_reflected_without_a_put() {
+        let srv = FakeSrv::start();
+        recover(srv.state.lock()).lanes_public = Some("管理台公开的".into());
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        let pusher = spawn_pusher(live.clone(), mgr);
+        until("读到公开", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "管理台公开的".into(),
+                }
+        });
+        assert!(
+            !srv.seen().iter().any(|s| s.method == "PUT"),
+            "不是本机发起的公开，本机不许 PUT"
+        );
+        pusher.stop();
     }
 
     /// 造一屏「看起来随机」的内容：足够大、足够没有重复模式，让 gzip 压不

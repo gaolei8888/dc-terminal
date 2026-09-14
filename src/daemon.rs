@@ -1043,20 +1043,47 @@ fn handle(
             Ok(Response::Live(live.info()))
         }
         Request::LiveStatus => Ok(Response::Live(live.info())),
-        // TODO(Task 7): 这三条眼下只是让协议 19 能编译过——真正的公开/取消
-        // 公开/发凭证逻辑（读写 `secrets::LIVE_PUBLISH_KEY`、打
-        // `PUT/DELETE /live/{id}/public`）在 Task 7 补上，届时这三支会被替换掉。
-        Request::LivePublish { title: _ } => Ok(Response::Error(ErrorCode::Internal(
-            "LivePublish not implemented yet".into(),
-        ))),
-        Request::LiveUnpublish => Ok(Response::Error(ErrorCode::Internal(
-            "LiveUnpublish not implemented yet".into(),
-        ))),
-        Request::LivePublishGrant => Ok(Response::Error(ErrorCode::Internal(
-            "LivePublishGrant not implemented yet".into(),
-        ))),
+        Request::LivePublish { title } => Ok(live_publish(live, secrets, title)),
+        // 这里只改意图；`DELETE /live/{id}/public` 由推帧线程发（见 `live.rs`）。
+        Request::LiveUnpublish => Ok(match live.unpublish() {
+            Some(info) => Response::Live(info),
+            None => Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive)),
+        }),
+        Request::LivePublishGrant => Ok(match live.grant() {
+            Some(g) => Response::LiveGrant(crate::proto::LiveGrantToken(g)),
+            None => Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive)),
+        }),
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
+}
+
+/// 公开这场直播：用本机存的发布密钥。**密钥从这里进 `LiveState`，不经过任何响应**
+/// ——界面进程只知道「填没填」，真正的 `PUT` 由推帧线程发。
+///
+/// 标题先去首尾空白、再截到中转收得下的长度（按字符，不按字节），理由同路名
+/// （`validated_staging`）：超长的话中转回 413，老师看到的是一句「标题太长」
+/// 而不是公开成功。先查钥匙再查在不在播：没钥匙时界面该引导去设置页，这句
+/// 提示不该被「没在播」盖掉。
+fn live_publish(
+    live: &Arc<crate::live::LiveState>,
+    secrets: &Arc<Mutex<SecretStore>>,
+    title: String,
+) -> Response {
+    let Some(key) = recover(secrets.lock())
+        .get(crate::secrets::LIVE_PUBLISH_KEY)
+        .map(str::to_string)
+    else {
+        return Response::Error(ErrorCode::LivePublishKeyMissing);
+    };
+    let title: String = title
+        .trim()
+        .chars()
+        .take(dct_link::live::MAX_PUBLIC_TITLE_CHARS)
+        .collect();
+    match live.publish(title, key) {
+        Some(info) => Response::Live(info),
+        None => Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive)),
+    }
 }
 
 /// 开一场直播：把 `ids` 跟 `names` 拼成 `(id, name)`。`ids`/`names` 条数
@@ -3195,6 +3222,146 @@ mod tests {
             }
             other => panic!("停播该答 Response::Live 的空状态，得到 {other:?}"),
         }
+    }
+
+    /// 公开/取消公开/发凭证三条请求，都走同一个 `handle`。
+    fn live_call(
+        req: Request,
+        secrets: &Arc<Mutex<SecretStore>>,
+        live: &Arc<crate::live::LiveState>,
+    ) -> Response {
+        let (mgr, store, _, profiles_dir) = bare_handle_deps();
+        handle(
+            req,
+            &mgr,
+            &store,
+            secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            live,
+        )
+    }
+
+    #[test]
+    fn live_publish_without_a_key_is_refused_with_a_code() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        let live = test_live();
+        live.start(vec![(1, "一".into())]);
+        let resp = live_call(
+            Request::LivePublish {
+                title: "课".into()
+            },
+            &secrets,
+            &live,
+        );
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::LivePublishKeyMissing)),
+            "{resp:?}"
+        );
+        assert_eq!(
+            live.info().public,
+            crate::proto::LivePublic::Private,
+            "没钥匙不该留下公开意图"
+        );
+    }
+
+    #[test]
+    fn live_publish_uses_the_stored_key_and_truncates_the_title() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        recover(secrets.lock())
+            .set(crate::secrets::LIVE_PUBLISH_KEY, "the-stored-key")
+            .unwrap();
+        let live = test_live();
+        live.start(vec![(1, "一".into())]);
+        let long = format!(
+            "  {}  ",
+            "字".repeat(dct_link::live::MAX_PUBLIC_TITLE_CHARS + 5)
+        );
+        let resp = live_call(Request::LivePublish { title: long }, &secrets, &live);
+        assert!(
+            !serde_json::to_string(&resp)
+                .unwrap()
+                .contains("the-stored-key"),
+            "发布密钥不许出现在响应里"
+        );
+        let Response::Live(info) = resp else {
+            panic!("{resp:?}")
+        };
+        let crate::proto::LivePublic::Pending { title } = info.public else {
+            panic!("{:?}", info.public)
+        };
+        assert_eq!(
+            title,
+            "字".repeat(dct_link::live::MAX_PUBLIC_TITLE_CHARS),
+            "要先去掉首尾空白再截断"
+        );
+    }
+
+    #[test]
+    fn live_publish_needs_a_live_room() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        recover(secrets.lock())
+            .set(crate::secrets::LIVE_PUBLISH_KEY, "k")
+            .unwrap();
+        let resp = live_call(
+            Request::LivePublish {
+                title: "课".into()
+            },
+            &secrets,
+            &test_live(),
+        );
+        assert!(
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive))
+            ),
+            "{resp:?}"
+        );
+    }
+
+    #[test]
+    fn live_unpublish_answers_the_private_state_and_needs_a_room() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        let live = test_live();
+        let resp = live_call(Request::LiveUnpublish, &secrets, &live);
+        assert!(
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive))
+            ),
+            "{resp:?}"
+        );
+        live.start(vec![(1, "一".into())]);
+        live.publish("课".into(), "k".into());
+        let resp = live_call(Request::LiveUnpublish, &secrets, &live);
+        let Response::Live(info) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(info.public, crate::proto::LivePublic::Private);
+    }
+
+    #[test]
+    fn a_grant_needs_a_live_room() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        let live = test_live();
+        let resp = live_call(Request::LivePublishGrant, &secrets, &live);
+        assert!(
+            matches!(
+                resp,
+                Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive))
+            ),
+            "{resp:?}"
+        );
+        live.start(vec![(1, "一".into())]);
+        let resp = live_call(Request::LivePublishGrant, &secrets, &live);
+        let Response::LiveGrant(crate::proto::LiveGrantToken(g)) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(Some(g), live.grant());
     }
 }
 
