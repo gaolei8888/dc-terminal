@@ -756,13 +756,23 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                 // 在看。读不到就留着上一次的值，不归零。
                 if viewers_at.is_none_or(|t| t.elapsed() >= KEEPALIVE) {
                     viewers_at = Some(Instant::now());
-                    if let Some((n, public)) = fetch_lanes(&agent, &base, &room.id, &room.token) {
-                        live.set_viewers(&room.id, n);
-                        // 公开状态以中转为准（管理台代为公开的也在这里显示出来）。
-                        if live.set_public_seen(&room.id, room.public_rev, public) {
-                            // 自愈：本机想公开、中转却说不公开——下一轮再 PUT 一次。
-                            public_applied = None;
+                    match fetch_lanes(&agent, &base, &room.id, &room.token) {
+                        Ok((n, public)) => {
+                            live.set_viewers(&room.id, n);
+                            // 公开状态以中转为准（管理台代为公开的也在这里显示出来）。
+                            if live.set_public_seen(&room.id, room.public_rev, public) {
+                                // 自愈：本机想公开、中转却说不公开——下一轮再 PUT 一次。
+                                public_applied = None;
+                            }
                         }
+                        // 中转把这场直播忘了：跟推帧那边看到 401 一样处理——见下面
+                        // `saw_401` 那段注释，`started` 清掉之后下一轮重新
+                        // `start_room`，公开状态跟着自动补上。
+                        Err(LiveFailure::Refused(401)) => {
+                            started = None;
+                        }
+                        // 单纯连不上、超时之类：留着上一次的数，不牵连房间注册状态。
+                        Err(_) => {}
                     }
                 }
                 let ids: Vec<u32> = room.staged.iter().map(|(id, _)| *id).collect();
@@ -774,6 +784,11 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     id: &room.id,
                     secret: &room.push_secret,
                 };
+                // 这一轮有没有哪一路被中转以 401 拒过——见 `attempt_lane`
+                // 上面那段「第二项」的注释：只要有一路撞见，就说明中转已经
+                // 不认这个房间了，跟哪一路撞见的没关系，清一次 `started`
+                // 就够，下一轮重新 `start_room`。
+                let mut saw_401 = false;
                 for (lane, (sid, _name)) in room.staged.iter().enumerate() {
                     // 会话可能在上架之后、这一轮之前就没了（被停掉、被
                     // 强杀）：跳过，不是错误——下一次上架会给出一份新的
@@ -781,7 +796,12 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                     let Some(entry) = screens.iter().find(|e| e.id == *sid) else {
                         continue;
                     };
-                    match attempt_lane(&client, lane, &entry.lines, lanes.get(sid).copied(), now) {
+                    let (recorded, unauthorized) =
+                        attempt_lane(&client, lane, &entry.lines, lanes.get(sid).copied(), now);
+                    if unauthorized {
+                        saw_401 = true;
+                    }
+                    match recorded {
                         Some(recorded) => {
                             lanes.insert(*sid, recorded);
                         }
@@ -789,6 +809,13 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                             lanes.remove(sid);
                         }
                     }
+                }
+                if saw_401 {
+                    // 中转把这场直播忘了（多半是它重启过）：清掉 `started`，
+                    // 下一轮 `PUSH_INTERVAL` 重新 `start_room`——同一个 id、
+                    // 同一对钥匙。那条成功路径本来就会把 `public_applied`
+                    // 清空，公开状态跟着自动补上。
+                    started = None;
                 }
             }
             None => {
@@ -818,9 +845,11 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
 /// 里抽出来，好让「失败不改记账，下一轮带着真内容重试」这条规则脱离整条
 /// 线程、只用一个假中转就能测（见 `attempt_lane` 相关测试）。
 ///
-/// `last` 是这一路上次**成功**推送的 `(哈希, 时间)`；返回值是这一路推完
-/// 这一次尝试之后该记的新值——`None` 表示「什么都还没成功过，保持
-/// `lanes` 里没有这一路」。
+/// `last` 是这一路上次**成功**推送的 `(哈希, 时间)`；返回值第一项是这一路
+/// 推完这一次尝试之后该记的新值——`None` 表示「什么都还没成功过，保持
+/// `lanes` 里没有这一路」。**第二项是「这一次是不是被 401 拒了」**：中转
+/// 说不认这个房间，那不是这一路自己的事——`pusher_loop` 靠它决定要不要
+/// 清掉 `started`，重新 `start_room`（见那边的调用点）。
 ///
 /// **只有真的推成功才更新记账。** 早先的版本无条件 `lanes.insert`，导致
 /// 任何一次真实失败（网络抖动、中转不可达、`413`）都会被本地记成
@@ -845,14 +874,14 @@ fn attempt_lane(
     lines: &[Vec<ScreenSpan>],
     last: Option<(u64, Instant)>,
     now: Instant,
-) -> Option<(u64, Instant)> {
+) -> (Option<(u64, Instant)>, bool) {
     let hash = hash_of(lines);
     let (last_hash, since) = match last {
         Some((h, t)) => (Some(h), now.duration_since(t)),
         None => (None, Duration::ZERO),
     };
     if !should_push(last_hash, hash, since) {
-        return last;
+        return (last, false);
     }
     // 画面没变、纯粹是保活：空 body，中转只续 TTL，不换 etag、不叫醒任何
     // 学生（见 `dct-srv` 那侧 `Live::push` 的注释）。
@@ -865,12 +894,16 @@ fn attempt_lane(
         // 记账（等价于推成功），好让 `should_push` 不再对着**同一屏内容**
         // 反复触发；等画面变了（哈希变了）才会再试一次——学生就是会停在
         // 上一帧能用的画面上，这比无限重试或者假装发出去了都诚实。
-        return Some((hash, now));
+        return (Some((hash, now)), false);
     }
-    if push_frame(client.agent, client.base, client.id, client.secret, lane, &body) {
-        Some((hash, now))
-    } else {
-        last
+    match push_frame(client.agent, client.base, client.id, client.secret, lane, &body) {
+        Ok(()) => (Some((hash, now)), false),
+        // 中转说不认这个房间：多半是它重启忘了，不是这一帧内容的问题。
+        // 不更新记账（跟别的失败一样，下一轮带着真内容重试），但要把
+        // 「见过 401」带回给 `pusher_loop`——它靠这个决定要不要清掉
+        // `started`，重新 `start_room`。
+        Err(LiveFailure::Refused(401)) => (last, true),
+        Err(_) => (last, false),
     }
 }
 
@@ -915,19 +948,34 @@ fn start_room(agent: &ureq::Agent, base: &str, room: &RoomSnapshot) -> Result<()
     }
 }
 
-/// 推一帧。**回成没成功**——调用点靠这个决定记不记账，见 `attempt_lane`
-/// 上面那段「只有真的推成功才更新记账」的注释；**不能把 push_secret 或者
-/// 失败原因写进日志**，前者是凭据，后者多半就是网络错误本身，没有值得
-/// 诊断的信息。
-fn push_frame(agent: &ureq::Agent, base: &str, id: &str, secret: &str, lane: usize, body: &[u8]) -> bool {
+/// 推一帧。**回成没成功、不成功具体是哪一种**——调用点靠 `Ok`/`Err` 决定
+/// 记不记账，见 `attempt_lane` 上面那段「只有真的推成功才更新记账」的
+/// 注释；`Err` 里的码还要能分清「中转不认这个房间了（401，多半是中转
+/// 重启把这场直播忘了）」和「单纯连不上、超时」——前者要让 `pusher_loop`
+/// 知道该清掉 `started`、重新 `start_room`，后者只是网络抖动，原地退避
+/// 重试就够，不该牵连到房间注册状态。**不能把 push_secret 或者失败原因
+/// 写进日志**，前者是凭据，后者多半就是网络错误本身，没有值得诊断的
+/// 信息。
+fn push_frame(
+    agent: &ureq::Agent,
+    base: &str,
+    id: &str,
+    secret: &str,
+    lane: usize,
+    body: &[u8],
+) -> Result<(), LiveFailure> {
     let url = format!("{base}{PATH_FRAME}");
-    agent
+    match agent
         .post(&url)
         .set("x-live-id", id)
         .set("x-live-lane", &lane.to_string())
         .set("x-live-push", secret)
         .send_bytes(body)
-        .is_ok()
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(LiveFailure::Refused(code)),
+        Err(ureq::Error::Transport(_)) => Err(LiveFailure::Unreachable),
+    }
 }
 
 /// `GET /live/{id}/lanes` 的答复里推帧线程要的那一半。中转那侧的
@@ -954,23 +1002,27 @@ struct PublicTitleBody {
 /// `push_secret` 在这里不管用也不该用——推帧线程手上本来就有 viewer
 /// token（`RoomSnapshot::token`），没必要为一次读把写的钥匙拿出来。
 ///
-/// 读不到就答 `None`，调用方原样留着上一次的数——网络抖一下不该让老师
-/// 屏幕上的人数瞬间归零，那比慢几秒更容易被误读成「学生都走了」。
+/// 回 `Result`：`Err(Refused(401))` 是「中转不认这个房间了」（多半是它
+/// 重启把这场直播忘了），`pusher_loop` 靠这个决定要不要清掉 `started`、
+/// 重新 `start_room`。**除此之外的任何失败**（连不上、超时、答复解析不
+/// 出来），调用方原样留着上一次的数、不清 `started`——网络抖一下不该让
+/// 老师屏幕上的人数瞬间归零，那比慢几秒更容易被误读成「学生都走了」，
+/// 也不该被当成中转真的忘了这场直播。
 fn fetch_lanes(
     agent: &ureq::Agent,
     base: &str,
     id: &str,
     token: &str,
-) -> Option<(u32, Option<String>)> {
+) -> Result<(u32, Option<String>), LiveFailure> {
     let url = format!("{base}{}/{id}/lanes", dct_link::live::LIVE_PREFIX);
-    let body: LanesBody = agent
-        .get(&url)
-        .set("x-live-token", token)
-        .call()
-        .ok()?
-        .into_json()
-        .ok()?;
-    Some((body.viewers, body.public.map(|p| p.title)))
+    match agent.get(&url).set("x-live-token", token).call() {
+        Ok(resp) => {
+            let body: LanesBody = resp.into_json().map_err(|_| LiveFailure::Unreachable)?;
+            Ok((body.viewers, body.public.map(|p| p.title)))
+        }
+        Err(ureq::Error::Status(code, _)) => Err(LiveFailure::Refused(code)),
+        Err(ureq::Error::Transport(_)) => Err(LiveFailure::Unreachable),
+    }
 }
 
 /// `PUT /live/{id}/public` 的请求体——跟 `dct-srv::PublishRequest` 靠字段名对齐。
@@ -1226,7 +1278,7 @@ mod tests {
 
         let n = fetch_lanes(&agent, &srv.base(), "abc123", "viewer-t");
 
-        assert_eq!(n, Some((5, None)), "假中转答的是 5 个人在看、没公开");
+        assert_eq!(n, Ok((5, None)), "假中转答的是 5 个人在看、没公开");
         let seen = srv.seen();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].method, "GET");
@@ -1246,7 +1298,10 @@ mod tests {
             .timeout_connect(Duration::from_millis(200))
             .build();
         // 127.0.0.1:1 没人监听。
-        assert_eq!(fetch_lanes(&agent, "http://127.0.0.1:1", "abc", "t"), None);
+        assert_eq!(
+            fetch_lanes(&agent, "http://127.0.0.1:1", "abc", "t"),
+            Err(LiveFailure::Unreachable)
+        );
     }
 
     /// `/lanes` 答复里的 `public` 标题要一起读回来——管理台代为公开的直播，
@@ -1258,7 +1313,7 @@ mod tests {
         let agent = crate::sys::tls::agent_builder().build();
         assert_eq!(
             fetch_lanes(&agent, &srv.base(), "abc123", "viewer-t"),
-            Some((5, Some("第3课".into())))
+            Ok((5, Some("第3课".into())))
         );
     }
 
@@ -1494,6 +1549,10 @@ mod tests {
         forget_public: bool,
         /// `DELETE .../public` 要答的状态码（默认 0，当 204）。
         unpublish_status: u16,
+        /// 模拟「中转重启，把这场房间忘了」：推帧、读人数一律答 401；
+        /// `POST /live/start` 不受影响（那正是用来重新认得这个房间的
+        /// 路径），一收到就把这个标志翻回去，好让重开之后的一切照常。
+        forget_room: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -1570,6 +1629,26 @@ mod tests {
         // 读人数那条路要答一份真的 JSON，别的路（开播/推帧/停播）答 204
         // 就够——调用方只看成没成功。
         let lanes_query = path.ends_with("/lanes");
+        let is_frame_push = path == PATH_FRAME;
+        let is_start = path == dct_link::live::PATH_START;
+        if is_start && st.forget_room {
+            // 房间重新登记：中转（重新）认得这场直播了。
+            st.forget_room = false;
+        }
+        if st.forget_room && (is_frame_push || lanes_query) {
+            // 中转忘了这个房间（模拟重启）：推帧、读人数都当成「没有这场
+            // 直播」拒收，`start_room` 不受影响——那正是重新认得它的路径。
+            st.seen.push(Seen {
+                method,
+                path,
+                headers,
+                body,
+            });
+            drop(st);
+            let out = "HTTP/1.1 401 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+            let _ = conn.write_all(out.as_bytes());
+            return;
+        }
         let public_put = method == "PUT" && path.ends_with("/public");
         let public_status = st.public_status;
         let public_delete = method == "DELETE" && path.ends_with("/public");
@@ -1614,12 +1693,15 @@ mod tests {
 
     /// `push_frame` 带着约定好的三个头（id/lane/push secret）POST 到
     /// `{base}{PATH_FRAME}`，body 就是传进去的那份字节——学生那把 token
-    /// 绝不出现在这条请求里，成功回 `true`。
+    /// 绝不出现在这条请求里，成功回 `Ok(())`。
     #[test]
     fn push_frame_sends_the_agreed_headers_to_the_agreed_path() {
         let srv = FakeSrv::start();
         let agent = crate::sys::tls::agent_builder().build();
-        assert!(push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 2, &[1, 2, 3]));
+        assert_eq!(
+            push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 2, &[1, 2, 3]),
+            Ok(())
+        );
 
         let seen = srv.seen();
         assert_eq!(seen.len(), 1);
@@ -1637,7 +1719,7 @@ mod tests {
     fn a_keepalive_push_has_an_empty_body() {
         let srv = FakeSrv::start();
         let agent = crate::sys::tls::agent_builder().build();
-        assert!(push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 0, &[]));
+        assert_eq!(push_frame(&agent, &srv.base(), "abc123", "s3cr3t", 0, &[]), Ok(()));
 
         let seen = srv.seen();
         assert!(seen[0].body.is_empty());
@@ -1734,12 +1816,15 @@ mod tests {
         let lines = vec![vec![span("hi".into())]];
 
         let now0 = Instant::now();
-        let after_first = attempt_lane(&client, 0, &lines, None, now0);
+        let (after_first, unauthorized_first) = attempt_lane(&client, 0, &lines, None, now0);
         assert_eq!(after_first, None, "第一次没发出去，不该记账");
+        assert!(!unauthorized_first, "连接被摔断是网络抖动，不是 401");
 
         let now1 = now0 + Duration::from_millis(10);
-        let after_second = attempt_lane(&client, 0, &lines, after_first, now1);
+        let (after_second, unauthorized_second) =
+            attempt_lane(&client, 0, &lines, after_first, now1);
         assert!(after_second.is_some(), "第二次该发成功、记上账");
+        assert!(!unauthorized_second);
 
         let seen = srv.seen();
         assert_eq!(seen.len(), 1, "失败的那次假中转直接摔断连接，不该被记成收到");
@@ -1825,8 +1910,9 @@ mod tests {
         );
 
         let now = Instant::now();
-        let after = attempt_lane(&client, 0, &lines, None, now);
+        let (after, unauthorized) = attempt_lane(&client, 0, &lines, None, now);
         assert!(after.is_some(), "超限也要记账，不然会对着同一屏内容永远重试");
+        assert!(!unauthorized, "根本没发出去，谈不上被 401 拒");
         assert!(srv.seen().is_empty(), "超限的帧根本不该被发出去");
     }
 
@@ -1846,15 +1932,15 @@ mod tests {
         let lines = vec![vec![span("hi".into())]];
 
         let now0 = Instant::now();
-        let after_first = attempt_lane(&client, 0, &lines, None, now0);
+        let (after_first, _) = attempt_lane(&client, 0, &lines, None, now0);
         assert!(after_first.is_some());
 
         let now1 = now0 + Duration::from_millis(10);
-        let after_second = attempt_lane(&client, 0, &lines, after_first, now1);
+        let (after_second, _) = attempt_lane(&client, 0, &lines, after_first, now1);
         assert_eq!(after_second, after_first, "画面没变又没到保活线，不该动");
 
         let now2 = now0 + KEEPALIVE;
-        let after_third = attempt_lane(&client, 0, &lines, after_second, now2);
+        let (after_third, _) = attempt_lane(&client, 0, &lines, after_second, now2);
         assert!(after_third.is_some());
 
         let seen = srv.seen();
@@ -2246,6 +2332,113 @@ mod tests {
         });
         std::thread::sleep(PUSH_INTERVAL * 4);
         assert_eq!(puts(), 2, "自愈只补一次，不该每轮都 PUT");
+        pusher.stop();
+    }
+
+    /// 造一个内容会自己不停变的会话——推帧要靠画面哈希变了才会再发一次
+    /// 请求，光靠等 `KEEPALIVE`（20 秒）测太慢，这里用一个不停打印的
+    /// shell 逼着每一轮都有真请求发出去。
+    fn ticking_session(mgr: &crate::session::SessionManager, name: &str) -> u32 {
+        mgr.register_profile(
+            crate::profile::Profile::from_toml(&crate::sys::testing::toml_with_sh(&format!(
+                r#"
+                name = "{name}"
+                command = ["/bin/sh", "-c", "i=0; while true; do i=$((i+1)); echo $i; sleep 0.1; done"]
+                is_agent = false
+                "#
+            )))
+            .unwrap(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // 目录只用来给这个会话当 cwd，会话活多久用不着它继续存在——泄漏掉
+        // `TempDir` 守卫，别让它在这个函数返回时把目录删掉。
+        std::mem::forget(tmp);
+        mgr.create(&dir, name, None, &[]).unwrap()
+    }
+
+    /// **中转重启忘了这场房间：推帧、读人数都会答 401，公开状态也跟着丢。**
+    /// 这是本轮要挡住的真实 bug——早先的实现只清「上一场是哪个 id」那份
+    /// 记账，从没清过「中转是不是真的还认得这个 id」，于是 `started` 一直
+    /// 留着旧值，`start_room` 再也不会被调用，直播和它的公开状态就这么
+    /// 悄悄死掉，界面上却看不出任何异常。
+    ///
+    /// 修复之后：撞见 401 就清掉 `started`，下一轮重新 `POST /live/start`
+    /// （同一个 id、同一对钥匙）；那条成功路径本来就会把 `public_applied`
+    /// 清空，公开也就跟着自动补一次 `PUT`。
+    #[test]
+    fn a_relay_that_forgets_the_room_is_reregistered_and_republished() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        let sid = ticking_session(&mgr, "ticker-forget");
+
+        live.start(vec![(sid, "前端".into())]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+
+        let starts = || {
+            srv.seen()
+                .iter()
+                .filter(|s| s.path == dct_link::live::PATH_START)
+                .count()
+        };
+        let puts = || srv.seen().iter().filter(|s| s.method == "PUT").count();
+
+        until("先注册、先公开", || starts() == 1 && puts() == 1);
+        until("先变成 Listed", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "课".into(),
+                }
+        });
+
+        // 模拟中转重启：忘了这个房间——推帧、读人数都答 401，公开状态也丢。
+        {
+            let mut st = recover(srv.state.lock());
+            st.forget_room = true;
+            st.lanes_public = None;
+        }
+
+        until("中转忘了房间之后重新 start", || starts() == 2);
+        until("重新注册之后再 PUT 一次公开", || puts() == 2);
+        until("界面上重新变回 Listed", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "课".into(),
+                }
+        });
+
+        pusher.stop();
+    }
+
+    /// 网络抖一下（连接被摔断，不是 401）不该被当成「中转忘了房间」：
+    /// `started` 不该被清掉，不会有第二次 `POST /live/start`——转发退避
+    /// 表（`start_backoff`）管的是「连不上」这类失败，不该跟房间注册状态
+    /// 混在一起。
+    #[test]
+    fn a_transport_failure_does_not_trigger_reregistration() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        let sid = ticking_session(&mgr, "ticker-transport");
+
+        live.start(vec![(sid, "前端".into())]);
+        let pusher = spawn_pusher(live.clone(), mgr);
+
+        let starts = || {
+            srv.seen()
+                .iter()
+                .filter(|s| s.path == dct_link::live::PATH_START)
+                .count()
+        };
+        until("先注册", || starts() == 1);
+
+        // 接下来几次请求（推帧/读人数）故意摔断连接——网络抖动，不是 401。
+        recover(srv.state.lock()).fail = 6;
+        std::thread::sleep(PUSH_INTERVAL * 4);
+
+        assert_eq!(starts(), 1, "网络抖动不该触发重新 start");
         pusher.stop();
     }
 
