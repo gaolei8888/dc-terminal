@@ -113,7 +113,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 18 = 多了 `ErrorCode::LiveRelayNotConfigured`：dct 不再带内置中转地址，
 /// 没设 `DCT_RELAY` 时开播会被拒绝。**响应**里多了一个旧界面解不出的变体，
 /// 照 13 那次的规矩加一。
-pub const PROTOCOL_VERSION: u32 = 18;
+///
+/// 19 = 公开直播列表：多了 `Request::LivePublish`/`LiveUnpublish`/`LivePublishGrant`、
+/// `Response::LiveGrant`、`ErrorCode::LivePublishKeyMissing`，`LiveInfo` 多了 `public`。
+/// 新增 `Request` 变体那条规矩同 14。
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +489,12 @@ pub enum Request {
     LiveStop,
     /// 现在有没有在播、播的是什么。
     LiveStatus,
+    /// 公开这场直播。守护进程用自己存的发布密钥（`secrets::LIVE_PUBLISH_KEY`），
+    /// 密钥**不在这条请求里**。标题超过 `MAX_PUBLIC_TITLE_CHARS` 由守护进程截断。
+    LivePublish { title: String },
+    LiveUnpublish,
+    /// 给管理台一张只能切换公开状态的凭证。没在播回 `LiveStagingRejected(NotLive)`。
+    LivePublishGrant,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -606,6 +616,12 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::LiveStop => write!(f, "LiveStop"),
             Request::LiveStatus => write!(f, "LiveStatus"),
+            // 标题不是密钥，照常打印。
+            Request::LivePublish { title } => {
+                f.debug_struct("LivePublish").field("title", title).finish()
+            }
+            Request::LiveUnpublish => write!(f, "LiveUnpublish"),
+            Request::LivePublishGrant => write!(f, "LivePublishGrant"),
         }
     }
 }
@@ -699,6 +715,8 @@ pub enum Response {
     /// 真停了而屏幕继续常驻「正在直播」。见 `daemon.rs` 里 `LiveStop` 那
     /// 一支上的注释。
     Live(LiveInfo),
+    /// 对 [`Request::LivePublishGrant`] 的回答：一张只能切换公开状态的凭证。
+    LiveGrant(LiveGrantToken),
 }
 
 /// 一场直播眼下的样子。
@@ -744,6 +762,9 @@ pub struct LiveInfo {
     /// 那一瞬就会拿着一条链接去发给全班，而那时中转很可能还不知道这场
     /// 直播——界面无从分辨「链接已经能用」和「刚生成、还在等中转答应」。
     pub readiness: LiveReadiness,
+    /// 公开列表上的状态，见 [`LivePublic`]。旧 JSON 没有这个字段时读成 `Private`。
+    #[serde(default)]
+    pub public: LivePublic,
 }
 
 /// 见 [`LiveInfo::readiness`]。
@@ -781,6 +802,31 @@ pub enum LiveFailure {
     Refused(u16),
 }
 
+/// 这场直播在公开列表上的状态。**以中转为准**：推帧线程每次保活时从
+/// `GET /live/{id}/lanes` 的 `public` 字段读回来（包括管理台代为公开的情况）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LivePublic {
+    #[default]
+    Private,
+    /// 本机请求了公开，中转还没答应。
+    Pending { title: String },
+    Listed { title: String },
+    /// 本机请求的公开被拒了。原因是码，组句在界面（`msg::live_publish_failed`）。
+    Failed { title: String, reason: LiveFailure },
+}
+
+/// 守护进程签发给管理台的公开凭证（见 `dct_link::live::publish_grant`）。
+/// 手写 `Debug`：它能拿去公开这场直播，不许原样进日志。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LiveGrantToken(pub String);
+
+impl std::fmt::Debug for LiveGrantToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveGrantToken(<redacted>)")
+    }
+}
+
 /// 一份上架名单为什么不能用。同样**只报码，不组句**——拼这句话的是守护
 /// 进程（`daemon.rs::validated_staging`），它不知道界面用的是哪种语言。
 ///
@@ -816,6 +862,7 @@ impl std::fmt::Debug for LiveInfo {
             .field("staged", &self.staged)
             .field("viewers", &self.viewers)
             .field("readiness", &self.readiness)
+            .field("public", &self.public)
             .finish()
     }
 }
@@ -883,6 +930,8 @@ pub enum ErrorCode {
     /// 没配直播中转（`DCT_RELAY` 没设），所以不开播。dct 不带任何内置中转
     /// 地址——中转在哪儿是部署方的决定，见 `live.rs` 模块头。
     LiveRelayNotConfigured,
+    /// 要公开直播，但本机还没填公开直播密钥。
+    LivePublishKeyMissing,
     /// git 自己的 stderr。**刻意留的兜底**：那是 git 按它自己的 `LANG` 输出的，
     /// dct 翻不动也不该翻。界面显示成「操作失败：<原文>」——外面那半句是
     /// 翻译过的，里面照抄。
@@ -1235,14 +1284,17 @@ mod tests {
             },
             Request::LiveStop,
             Request::LiveStatus,
+            Request::LivePublish { title: "t".into() },
+            Request::LiveUnpublish,
+            Request::LivePublishGrant,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                18,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
+                19,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1266,7 +1318,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                18,
+                19,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1375,7 +1427,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                18,
+                19,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1478,7 +1530,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (18, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (19, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1496,7 +1548,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (18, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (19, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1532,6 +1584,7 @@ mod tests {
             staged: vec![(1, "前端".into())],
             viewers: 2,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         };
         let s = format!("{info:?}");
         assert!(s.contains("7f3a2c91"), "id 不敏感，该照常打印：{s}");
@@ -1552,11 +1605,48 @@ mod tests {
             staged: vec![(1, "前端".into())],
             viewers: 2,
             readiness: LiveReadiness::Ready,
+            public: LivePublic::Private,
         });
         let json = serde_json::to_string(&r).unwrap();
         assert!(
             !json.contains("push_secret"),
             "老师那把推帧/停播用的钥匙不该出现在任何一条能发到网页上的答复里：{json}"
+        );
+    }
+
+    /// `LiveInfo` 的公开状态上线形状，以及旧 JSON（没有这个字段）读成 `Private`。
+    #[test]
+    fn the_live_public_shape_is_pinned() {
+        let shape = |p: &LivePublic| serde_json::to_string(p).unwrap();
+        assert_eq!(
+            (
+                PROTOCOL_VERSION,
+                shape(&LivePublic::Private),
+                shape(&LivePublic::Listed { title: "课".into() })
+            ),
+            (
+                19,
+                r#""Private""#.to_string(),
+                r#"{"Listed":{"title":"课"}}"#.to_string()
+            )
+        );
+        assert_eq!(
+            shape(&LivePublic::Failed {
+                title: "课".into(),
+                reason: LiveFailure::Refused(401)
+            }),
+            r#"{"Failed":{"title":"课","reason":{"Refused":401}}}"#
+        );
+    }
+
+    /// 凭证能当一次公开，不许在任何日志里原样出现。
+    #[test]
+    fn a_live_grant_is_redacted_in_debug() {
+        let r = Response::LiveGrant(LiveGrantToken("deadbeef".repeat(8)));
+        assert!(!format!("{r:?}").contains("deadbeef"));
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            format!(r#"{{"LiveGrant":"{}"}}"#, "deadbeef".repeat(8))
         );
     }
 }

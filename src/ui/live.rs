@@ -403,7 +403,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::LiveFailure;
+    use crate::proto::{LiveFailure, LivePublic};
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -418,6 +418,7 @@ mod tests {
             staged,
             viewers,
             readiness,
+            public: LivePublic::Private,
         }
     }
 
@@ -473,6 +474,7 @@ mod tests {
             staged: Vec::new(),
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         }
     }
 
@@ -644,6 +646,7 @@ mod tests {
             staged: vec![],
             viewers: 3,
             readiness: LiveReadiness::Ready,
+            public: LivePublic::Private,
         };
 
         let screen = screen_of(&mut app, 80, 40);
@@ -668,6 +671,7 @@ mod tests {
             staged: vec![],
             viewers: 0,
             readiness: LiveReadiness::Ready,
+            public: LivePublic::Private,
         };
 
         let screen = screen_of(&mut app, 20, 20);
@@ -731,6 +735,7 @@ mod tests {
             staged: vec![],
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         };
         let req = staging_request(&off, vec![(1, "前端".into())], false);
         assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
@@ -791,6 +796,7 @@ mod tests {
             staged: vec![],
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         };
         assert!(!is_live(&off));
         assert!(is_live(&info(vec![], 0, LiveReadiness::Ready)));

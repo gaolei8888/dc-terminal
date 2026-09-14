@@ -1043,6 +1043,18 @@ fn handle(
             Ok(Response::Live(live.info()))
         }
         Request::LiveStatus => Ok(Response::Live(live.info())),
+        // TODO(Task 7): 这三条眼下只是让协议 19 能编译过——真正的公开/取消
+        // 公开/发凭证逻辑（读写 `secrets::LIVE_PUBLISH_KEY`、打
+        // `PUT/DELETE /live/{id}/public`）在 Task 7 补上，届时这三支会被替换掉。
+        Request::LivePublish { title: _ } => Ok(Response::Error(ErrorCode::Internal(
+            "LivePublish not implemented yet".into(),
+        ))),
+        Request::LiveUnpublish => Ok(Response::Error(ErrorCode::Internal(
+            "LiveUnpublish not implemented yet".into(),
+        ))),
+        Request::LivePublishGrant => Ok(Response::Error(ErrorCode::Internal(
+            "LivePublishGrant not implemented yet".into(),
+        ))),
     };
     r.unwrap_or_else(|e| Response::Error(to_code(e)))
 }

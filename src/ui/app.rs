@@ -276,6 +276,7 @@ impl App {
                 staged: Vec::new(),
                 viewers: 0,
                 readiness: crate::proto::LiveReadiness::Pending,
+                public: crate::proto::LivePublic::Private,
             },
             phone_buf: None,
             phone_verify_rx: None,

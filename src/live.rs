@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use dct_link::live::{KEEPALIVE, MAX_FRAME_BYTES, PATH_FRAME, PUSH_INTERVAL};
 
-use crate::proto::{LiveFailure, LiveInfo, LiveReadiness};
+use crate::proto::{LiveFailure, LiveInfo, LivePublic, LiveReadiness};
 use crate::pty::ScreenSpan;
 use crate::session::SessionManager;
 
@@ -117,6 +117,7 @@ impl LiveState {
             // 「还没就绪」，不能骗调用方（最终是老师那块屏幕）说链接已经
             // 能用了。见 `LiveInfo::readiness` 的文档注释。
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         };
 
         *recover(self.room.lock()) = Some(Room {
@@ -163,6 +164,7 @@ impl LiveState {
             staged: room.staged.clone(),
             viewers: room.viewers,
             readiness: room.readiness.clone(),
+            public: LivePublic::Private,
         })
     }
 
@@ -186,6 +188,7 @@ impl LiveState {
                 staged: room.staged.clone(),
                 viewers: room.viewers,
                 readiness: room.readiness.clone(),
+                public: LivePublic::Private,
             },
             None => LiveInfo {
                 id: String::new(),
@@ -194,6 +197,7 @@ impl LiveState {
                 staged: Vec::new(),
                 viewers: 0,
                 readiness: LiveReadiness::Pending,
+                public: LivePublic::Private,
             },
         }
     }

@@ -3480,6 +3480,7 @@ is_agent = true
                 staged: vec![(1, "小明".into())],
                 viewers: 3,
                 readiness,
+                public: crate::proto::LivePublic::Private,
             };
             (app, dir)
         }
@@ -5158,6 +5159,7 @@ is_agent = true
                 staged: vec![(1, "claude".into())],
                 viewers: 3,
                 readiness: crate::proto::LiveReadiness::Ready,
+                public: crate::proto::LivePublic::Private,
             }
         }
 
