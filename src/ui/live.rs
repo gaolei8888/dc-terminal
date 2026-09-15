@@ -41,8 +41,22 @@ pub(crate) fn is_live(info: &LiveInfo) -> bool {
 /// `readiness` 不是 `Ready` 的时候要如实说：中转还没认得这场直播的时候，
 /// 这句话绝不能看着像「一切正常」——那正是老师会把一条当时打不开的链接
 /// 发给全班的那一刻。
+///
+/// `info.public` 另外决定文案本体是「正在直播」还是「正在公开直播 ·
+/// 标题」——公开与否跟中转是否就绪是两件独立的事，所以先按 `public`
+/// 选出带不带标题的那句底稿，再各自叠一句后缀，两条后缀能同时出现。
 pub(crate) fn live_banner(info: &LiveInfo, lang: Lang) -> String {
-    let base = msg::live_on_air(lang, info.staged.len(), info.viewers);
+    let base = match &info.public {
+        LivePublic::Listed { title } | LivePublic::Pending { title } | LivePublic::Failed { title, .. } => {
+            msg::live_on_air_public(lang, title, info.staged.len(), info.viewers)
+        }
+        LivePublic::Private => msg::live_on_air(lang, info.staged.len(), info.viewers),
+    };
+    let base = match &info.public {
+        LivePublic::Pending { .. } => format!("{base} · {}", text(Key::LivePublicPending, lang)),
+        LivePublic::Failed { reason, .. } => format!("{base} · {}", msg::live_publish_failed(lang, reason)),
+        _ => base,
+    };
     match &info.readiness {
         LiveReadiness::Ready => base,
         LiveReadiness::Pending => format!("{base} · {}", text(Key::LiveConnectingToRelay, lang)),
@@ -54,8 +68,13 @@ pub(crate) fn live_banner(info: &LiveInfo, lang: Lang) -> String {
 
 /// 这一行常驻提示该用什么颜色画：`Ready` 是安心的强调色，`Pending` 只是
 /// 平常字（还没到出错的地步，但也不该看着跟 `Ready` 一样安心），
-/// `Failed` 是红——它字面上就是一句错误。
+/// `Failed` 是红——它字面上就是一句错误。公开失败（`info.public` 是
+/// `Failed`）同样是红，且优先于 `readiness` 判断：中转明明就绪，但公开
+/// 没成功，这一行也不该看着安心。
 pub(crate) fn banner_style(info: &LiveInfo) -> Style {
+    if matches!(info.public, LivePublic::Failed { .. }) {
+        return danger();
+    }
     match &info.readiness {
         LiveReadiness::Ready => accent(),
         LiveReadiness::Pending => dim(),
@@ -571,6 +590,20 @@ mod tests {
             readiness,
             public: LivePublic::Private,
         }
+    }
+
+    #[test]
+    fn the_banner_says_public_with_the_title() {
+        let mut live = info(vec![(1, "一".into())], 7, LiveReadiness::Ready);
+        live.public = LivePublic::Listed { title: "第3课".into() };
+        let s = live_banner(&live, Lang::Zh);
+        assert!(s.contains("正在公开直播") && s.contains("第3课") && s.contains('7'), "{s}");
+
+        live.public = LivePublic::Failed { title: "第3课".into(), reason: crate::proto::LiveFailure::Refused(401) };
+        assert!(live_banner(&live, Lang::Zh).contains("吊销"), "失败原因要说出来");
+
+        live.public = LivePublic::Private;
+        assert!(!live_banner(&live, Lang::Zh).contains("公开"), "私密直播不许说公开");
     }
 
     /// 一个只答 `LiveStatus` 的假守护进程：回它手里此刻那份 `LiveInfo`，并记下

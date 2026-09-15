@@ -318,9 +318,16 @@ fn bar_danger(t: BarTheme) -> Style {
 /// 所以实色档下三种状态只用色条自己能保证的东西区分：就绪加粗、还在等中转
 /// 是平常字、失败用自带底色的那块红（`bar_danger`）。横线档没有实色底，照旧
 /// 走 `live::banner_style`。
+///
+/// 公开失败（`info.public` 是 `Failed`）也用 `bar_danger`，且判在
+/// `readiness` 之前——理由跟 `live::banner_style` 一样：中转就绪不等于
+/// 公开成功。
 fn bar_live_style(info: &crate::proto::LiveInfo, t: BarTheme) -> Style {
     if bar_style(t).is_none() {
         return live::banner_style(info);
+    }
+    if matches!(info.public, crate::proto::LivePublic::Failed { .. }) {
+        return bar_danger(t);
     }
     match &info.readiness {
         crate::proto::LiveReadiness::Ready => Style::default().add_modifier(Modifier::BOLD),
@@ -3485,7 +3492,7 @@ is_agent = true
             (app, dir)
         }
 
-        let cases: [Case; 7] = [
+        let cases: [Case; 9] = [
             ("看板按键表", || {
                 app_with_one_agent_session(View::Board)
             }),
@@ -3509,6 +3516,19 @@ is_agent = true
                 live(crate::proto::LiveReadiness::Failed(
                     crate::proto::LiveFailure::Unreachable,
                 ))
+            }),
+            ("正在公开直播", || {
+                let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
+                app.live.public = crate::proto::LivePublic::Listed { title: "第3课".into() };
+                (app, dir)
+            }),
+            ("公开失败", || {
+                let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
+                app.live.public = crate::proto::LivePublic::Failed {
+                    title: "第3课".into(),
+                    reason: crate::proto::LiveFailure::Refused(401),
+                };
+                (app, dir)
             }),
         ];
 
