@@ -1,0 +1,223 @@
+# Review package: 8e69a54..HEAD
+
+## Commits
+63d3c11 feat(link): constants and the publish grant shared by relay and daemon
+
+## Files changed
+ Cargo.lock                  | 12 ++++++++
+ crates/dct-link/Cargo.toml  |  4 +++
+ crates/dct-link/src/live.rs | 74 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 90 insertions(+)
+
+## Diff
+diff --git a/Cargo.lock b/Cargo.lock
+index 0cbb726..9ae8859 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -327,22 +327,24 @@ dependencies = [
+  "vt100",
+  "windows-sys 0.59.0",
+  "zip",
+ ]
+ 
+ [[package]]
+ name = "dct-link"
+ version = "0.1.0"
+ dependencies = [
+  "base64",
++ "hmac",
+  "serde",
+  "serde_json",
++ "sha2",
+ ]
+ 
+ [[package]]
+ name = "dct-page"
+ version = "0.1.0"
+ 
+ [[package]]
+ name = "dct-srv"
+ version = "0.1.0"
+ dependencies = [
+@@ -357,20 +359,21 @@ dependencies = [
+ ]
+ 
+ [[package]]
+ name = "digest"
+ version = "0.10.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+ dependencies = [
+  "block-buffer",
+  "crypto-common",
++ "subtle",
+ ]
+ 
+ [[package]]
+ name = "displaydoc"
+ version = "0.2.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -594,20 +597,29 @@ name = "hashbrown"
+ version = "0.17.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+ 
+ [[package]]
+ name = "heck"
+ version = "0.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+ 
++[[package]]
++name = "hmac"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
++dependencies = [
++ "digest",
++]
++
+ [[package]]
+ name = "http"
+ version = "1.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
+ dependencies = [
+  "bytes",
+  "itoa",
+ ]
+ 
+diff --git a/crates/dct-link/Cargo.toml b/crates/dct-link/Cargo.toml
+index 41327d3..7621960 100644
+--- a/crates/dct-link/Cargo.toml
++++ b/crates/dct-link/Cargo.toml
+@@ -5,10 +5,14 @@ edition = "2021"
+ license = "MIT"
+ 
+ [dependencies]
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ # 信封的 payload 是任意字节（第一期是 JSON 文本，第二期是密文），而信封本身
+ # 走 JSON。serde 默认会把 `Vec<u8>` 写成一个数字数组——一个字节四五个字符，
+ # 整屏画面那种东西上公网时这个放大倍数是要命的。base64 只放大 1.33 倍。
+ # 纯 Rust，没有 C，符合仓库那条「整棵依赖树一行 C 都没有」的规矩。
+ base64 = "0.22"
++# 公开直播的「凭证」：HMAC-SHA256(推帧钥匙的摘要, "publish:" + id)。中转和守护进程
++# 必须算出同一个值，所以算法只在这里写一次。两个都是纯 Rust，没有 C。
++sha2 = "0.10"
++hmac = "0.12"
+diff --git a/crates/dct-link/src/live.rs b/crates/dct-link/src/live.rs
+index 915d96a..1929626 100644
+--- a/crates/dct-link/src/live.rs
++++ b/crates/dct-link/src/live.rs
+@@ -71,20 +71,60 @@ pub const MAX_LIVE_ID_CHARS: usize = 64;
+ 
+ /// 两把钥匙（viewer token / push secret）最短、最长几个字符。dct 发的都是
+ /// [`LIVE_TOKEN_LEN`] 个。下限挡的是一个字符的钥匙，上限挡的是塞内存。
+ pub const MIN_KEY_CHARS: usize = 32;
+ pub const MAX_KEY_CHARS: usize = 128;
+ 
+ /// 一路的名字最多几个**字符**（不是字节，中文名字按字算）。守护进程在上架时
+ /// 把更长的名字截到这个长度（带省略号），中转则拒收——两边共用这一个数。
+ pub const MAX_LANE_NAME_CHARS: usize = 64;
+ 
++/// 公开直播的标题最多几个**字符**。中转拒收更长的；守护进程和管理台在发之前截断。
++pub const MAX_PUBLIC_TITLE_CHARS: usize = 60;
++
++/// 公开列表占用的那个词。它同时是 `GET /live/public` 的最后一段，所以不能再当房间号：
++/// 不拒的话，房间号恰好叫 `public` 的那场直播，观看页 `/live/public` 会被列表接口挡住。
++pub const RESERVED_LIVE_ID: &str = "public";
++
++/// 公开列表的路径。
++pub const PATH_PUBLIC_LIST: &str = "/live/public";
++
++/// 中转多久检查一次发布密钥文件。吊销、下线最多这么久生效。
++pub const PUBLISH_KEYS_RELOAD: Duration = Duration::from_secs(10);
++
++/// 公开 / 取消公开这场直播的路径（`PUT` / `DELETE`）。
++pub fn public_path(id: &str) -> String {
++    format!("{LIVE_PREFIX}/{id}/public")
++}
++
++/// 推帧钥匙的摘要。中转只存它（`Session::push_hash`），凭证也以它为 HMAC 密钥——
++/// 这样中转验得了凭证，而推帧钥匙原文始终不离开守护进程。
++pub fn push_hash(push_secret: &str) -> [u8; 32] {
++    use sha2::{Digest, Sha256};
++    Sha256::digest(push_secret.as_bytes()).into()
++}
++
++/// 「只能用来切换这场直播公开状态」的凭证。管理台拿它代学生工作区公开，
++/// 推帧、停播都不认它。
++pub fn publish_grant(push_hash: &[u8; 32], id: &str) -> String {
++    use hmac::{Hmac, Mac};
++    let mut mac =
++        <Hmac<sha2::Sha256> as Mac>::new_from_slice(push_hash).expect("HMAC 接受任意长度的密钥");
++    mac.update(b"publish:");
++    mac.update(id.as_bytes());
++    mac.finalize()
++        .into_bytes()
++        .iter()
++        .map(|b| format!("{b:02x}"))
++        .collect()
++}
++
+ /// 学生那把钥匙的十六进制长度（32 字节随机数）。
+ pub const LIVE_TOKEN_LEN: usize = 64;
+ 
+ /// 学生拉某一路画面的路径。
+ pub fn frame_path(id: &str, lane: usize) -> String {
+     format!("{LIVE_PREFIX}/{id}/frame?lane={lane}")
+ }
+ 
+ /// 学生页本体的路径。
+ pub fn page_path(id: &str) -> String {
+@@ -105,11 +145,45 @@ mod tests {
+ 
+     /// 保活必须明显快过 TTL，否则老师盯着屏幕想事情的时候直播自己就没了。
+     #[test]
+     fn the_keepalive_beats_the_ttl_with_room_to_spare() {
+         assert!(
+             KEEPALIVE * 2 < LIVE_TTL,
+             "保活 {KEEPALIVE:?} 对 TTL {LIVE_TTL:?} 来说太慢，丢一次就断播"
+         );
+         assert!(PUSH_INTERVAL <= KEEPALIVE);
+     }
++
++    /// **凭证是跨 crate 的契约**：中转验、守护进程签，两边调的都是这一个函数。
++    /// 固定向量由 Python `hmac.new(sha256(b"p"*64).digest(), b"publish:abc", sha256)`
++    /// 独立算出——改了算法或者拼接格式，这里当场红。
++    #[test]
++    fn the_publish_grant_matches_a_fixed_vector() {
++        let h = push_hash(&"p".repeat(64));
++        assert_eq!(
++            publish_grant(&h, "abc"),
++            "74df63dc9e0620cba63084d7dbeec29068ecbf8a7ed31168d1c22895a5a10281"
++        );
++        let other = push_hash(&"q".repeat(64));
++        assert_eq!(
++            publish_grant(&other, "abc"),
++            "64b549e882f6a84b91dd4ffe27594e24667fa314ff7e0a236061114951ad5c79",
++            "换一把推帧钥匙，凭证必须跟着变"
++        );
++        assert_ne!(
++            publish_grant(&h, "abc"),
++            publish_grant(&h, "abd"),
++            "凭证要绑房间号"
++        );
++    }
++
++    #[test]
++    fn the_public_path_is_built_in_exactly_one_place() {
++        assert_eq!(public_path("abc"), "/live/abc/public");
++        assert_eq!(PATH_PUBLIC_LIST, "/live/public");
++        assert_eq!(
++            RESERVED_LIVE_ID, "public",
++            "列表路径和保留房间号必须是同一个词"
++        );
++        assert!(PATH_PUBLIC_LIST.ends_with(RESERVED_LIVE_ID));
++    }
+ }

@@ -1,0 +1,650 @@
+# Review package: 63d3c11..HEAD
+
+## Commits
+13edaa9 feat(srv): publish key file with add, revoke, list and takedown commands
+
+## Files changed
+ Cargo.lock                 |   2 +
+ crates/dct-srv/Cargo.toml  |   3 +
+ crates/dct-srv/src/keys.rs | 243 +++++++++++++++++++++++++++++++++++++++++++++
+ crates/dct-srv/src/lib.rs  | 150 +++++++++++++++++++++++++++-
+ crates/dct-srv/src/main.rs |  76 +++++++++++---
+ 5 files changed, 458 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/Cargo.lock b/Cargo.lock
+index 9ae8859..a2d03be 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -344,23 +344,25 @@ dependencies = [
+ name = "dct-page"
+ version = "0.1.0"
+ 
+ [[package]]
+ name = "dct-srv"
+ version = "0.1.0"
+ dependencies = [
+  "axum",
+  "dct-link",
+  "dct-page",
++ "getrandom 0.2.17",
+  "serde",
+  "serde_json",
+  "sha2",
++ "tempfile",
+  "tokio",
+  "tower",
+ ]
+ 
+ [[package]]
+ name = "digest"
+ version = "0.10.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+ dependencies = [
+diff --git a/crates/dct-srv/Cargo.toml b/crates/dct-srv/Cargo.toml
+index fcc7823..182f1dd 100644
+--- a/crates/dct-srv/Cargo.toml
++++ b/crates/dct-srv/Cargo.toml
+@@ -14,15 +14,18 @@ dct-page = { path = "../dct-page" }
+ # 中转上是刻舟求剑：中转的全部工作就是同时挂着几千条空闲长连接，这正是 async
+ # 唯一真正不可替代的场景。一个教室 1000 台设备用线程模型就是 1000 条常驻线程。
+ #
+ # 这是独立 crate，`cargo tree -p dct` 里看不到 tokio——那条验收在任务 1 里。
+ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+ axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ # token 只存摘要，不存原文：中转上留着一屋子人的明文钥匙没有任何必要。
+ sha2 = "0.10"
++# 发布密钥由 `dct-srv key add` 当场生成，必须来自系统随机数（同 `dct` 的 getrandom 用法）。
++getrandom = "0.2"
+ 
+ [dev-dependencies]
+ tower = { version = "0.5", features = ["util"] }
+ # 只有测试要自己拼 HTTP 请求（见 tests/serves.rs），服务本身用不到读写扩展。
+ tokio = { version = "1", features = ["io-util"] }
++tempfile = "3"
+diff --git a/crates/dct-srv/src/keys.rs b/crates/dct-srv/src/keys.rs
+new file mode 100644
+index 0000000..65ad400
+--- /dev/null
++++ b/crates/dct-srv/src/keys.rs
+@@ -0,0 +1,243 @@
++//! 发布密钥文件。见 `docs/superpowers/specs/2026-09-13-public-live-listing-design.md`
++//! 「发布密钥与总开关」。
++
++use std::path::{Path, PathBuf};
++use std::time::SystemTime;
++
++#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct PublishKeys {
++    #[serde(default)]
++    pub keys: Vec<KeyEntry>,
++    /// 被运营方下线的房间号（`dct-srv takedown`）。停播之前都公开不了。
++    #[serde(default)]
++    pub blocked: Vec<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct KeyEntry {
++    pub name: String,
++    /// SHA-256 的小写 hex。**原文不落盘**，同直播那两把钥匙的做法。
++    pub hash: String,
++    /// 创建时间，Unix 秒。只给 `key list` 看。
++    pub created: u64,
++}
++
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++fn digest_hex(key: &str) -> String {
++    use sha2::{Digest, Sha256};
++    hex(&Sha256::digest(key.as_bytes()))
++}
++
++/// 常数时间比较两个等长 hex 串；长度不同直接不等（长度不是秘密）。
++fn same_hex(a: &str, b: &str) -> bool {
++    a.len() == b.len()
++        && a.bytes()
++            .zip(b.bytes())
++            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
++            == 0
++}
++
++impl PublishKeys {
++    pub fn load(path: &Path) -> Result<PublishKeys, String> {
++        let raw =
++            std::fs::read_to_string(path).map_err(|e| format!("读不了 {}：{e}", path.display()))?;
++        serde_json::from_str(&raw)
++            .map_err(|e| format!("{} 不是合法的密钥文件：{e}", path.display()))
++    }
++
++    /// 先写同目录临时文件再改名：写到一半断电，读到的要么是旧文件要么是新文件。
++    pub fn save(&self, path: &Path) -> std::io::Result<()> {
++        let tmp = path.with_extension("tmp");
++        let body = serde_json::to_vec_pretty(self).expect("PublishKeys 总能序列化");
++        {
++            let mut opts = std::fs::OpenOptions::new();
++            opts.write(true).create(true).truncate(true);
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::OpenOptionsExt;
++                opts.mode(0o600);
++            }
++            let mut f = opts.open(&tmp)?;
++            std::io::Write::write_all(&mut f, &body)?;
++            f.sync_all()?;
++        }
++        std::fs::rename(&tmp, path)
++    }
++
++    pub fn add(&mut self, name: &str, now: u64) -> Result<String, String> {
++        if name.trim().is_empty() {
++            return Err("名字不能为空".into());
++        }
++        if self.keys.iter().any(|k| k.name == name) {
++            return Err(format!("已经有一把叫「{name}」的密钥了"));
++        }
++        let mut raw = [0u8; 32];
++        getrandom::getrandom(&mut raw).map_err(|e| format!("系统随机数不可用：{e}"))?;
++        let key = hex(&raw);
++        self.keys.push(KeyEntry {
++            name: name.to_string(),
++            hash: digest_hex(&key),
++            created: now,
++        });
++        Ok(key)
++    }
++
++    pub fn revoke(&mut self, name: &str) -> bool {
++        let before = self.keys.len();
++        self.keys.retain(|k| k.name != name);
++        self.keys.len() != before
++    }
++
++    pub fn block(&mut self, id: &str) {
++        if !self.is_blocked(id) {
++            self.blocked.push(id.to_string());
++        }
++    }
++
++    /// 这把密钥是谁的。**把每一条都比一遍**，不在第一条命中时提前返回。
++    pub fn name_for(&self, key: &str) -> Option<String> {
++        let want = digest_hex(key);
++        let mut found = None;
++        for k in &self.keys {
++            if same_hex(&k.hash, &want) {
++                found = Some(k.name.clone());
++            }
++        }
++        found
++    }
++
++    pub fn is_blocked(&self, id: &str) -> bool {
++        self.blocked.iter().any(|b| b == id)
++    }
++}
++
++/// 运行中的中转手里那份密钥文件：记着上次读到的修改时间，变了才重读。
++pub struct KeyFile {
++    path: PathBuf,
++    stamp: Option<SystemTime>,
++    keys: PublishKeys,
++}
++
++impl KeyFile {
++    /// 首次打开：读不了或者解析失败就报错——调用方据此拒绝启动。
++    pub fn open(path: PathBuf) -> Result<KeyFile, String> {
++        let keys = PublishKeys::load(&path)?;
++        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
++        Ok(KeyFile { path, stamp, keys })
++    }
++
++    pub fn keys(&self) -> &PublishKeys {
++        &self.keys
++    }
++
++    /// 文件变了就重读。**解析失败保留上一份**并报错，由调用方写日志。
++    pub fn reload_if_changed(&mut self) -> Result<bool, String> {
++        let stamp = std::fs::metadata(&self.path)
++            .and_then(|m| m.modified())
++            .ok();
++        if stamp == self.stamp {
++            return Ok(false);
++        }
++        self.stamp = stamp;
++        self.keys = PublishKeys::load(&self.path)?;
++        Ok(true)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn tmp_file() -> (tempfile::TempDir, std::path::PathBuf) {
++        let d = tempfile::tempdir().unwrap();
++        let p = d.path().join("publish-keys.json");
++        (d, p)
++    }
++
++    /// 生成的密钥只返回一次，文件里只有摘要；拿原文能认出是谁的。
++    #[test]
++    fn a_key_is_stored_as_a_digest_and_recognised_by_name() {
++        let mut k = PublishKeys::default();
++        let key = k.add("姜老师", 1).unwrap();
++        assert_eq!(key.len(), 64);
++        assert!(
++            !serde_json::to_string(&k).unwrap().contains(&key),
++            "文件里不许有原文"
++        );
++        assert_eq!(k.name_for(&key).as_deref(), Some("姜老师"));
++        assert_eq!(k.name_for(&"0".repeat(64)), None);
++        assert!(k.add("姜老师", 2).is_err(), "重名要拒");
++    }
++
++    #[test]
++    fn revoking_and_blocking() {
++        let mut k = PublishKeys::default();
++        let key = k.add("a", 1).unwrap();
++        assert!(k.revoke("a"));
++        assert!(!k.revoke("a"), "吊销不存在的名字回 false");
++        assert_eq!(k.name_for(&key), None);
++        k.block("room1");
++        k.block("room1");
++        assert!(k.is_blocked("room1"));
++        assert_eq!(k.blocked.len(), 1, "重复下线不重复记");
++    }
++
++    #[test]
++    fn save_then_load_round_trips_with_owner_only_permissions() {
++        let (_d, p) = tmp_file();
++        let mut k = PublishKeys::default();
++        k.add("a", 1).unwrap();
++        k.save(&p).unwrap();
++        assert_eq!(PublishKeys::load(&p).unwrap(), k);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
++            assert_eq!(mode, 0o600);
++        }
++    }
++
++    /// **写坏文件不能等于吊销全部，也不能等于全部放行**：保留上一份。
++    #[test]
++    fn a_broken_file_keeps_the_last_good_keys() {
++        let (_d, p) = tmp_file();
++        let mut k = PublishKeys::default();
++        let key = k.add("a", 1).unwrap();
++        k.save(&p).unwrap();
++        let mut f = KeyFile::open(p.clone()).unwrap();
++        // 保证 mtime 真的变了（有些文件系统精度是秒）
++        std::thread::sleep(std::time::Duration::from_millis(1100));
++        std::fs::write(&p, "{ not json").unwrap();
++        assert!(f.reload_if_changed().is_err());
++        assert_eq!(
++            f.keys().name_for(&key).as_deref(),
++            Some("a"),
++            "坏文件不能冲掉旧密钥"
++        );
++    }
++
++    #[test]
++    fn a_changed_file_is_picked_up() {
++        let (_d, p) = tmp_file();
++        let mut k = PublishKeys::default();
++        let key = k.add("a", 1).unwrap();
++        k.save(&p).unwrap();
++        let mut f = KeyFile::open(p.clone()).unwrap();
++        assert_eq!(f.reload_if_changed(), Ok(false), "没变就不重读");
++        std::thread::sleep(std::time::Duration::from_millis(1100));
++        k.revoke("a");
++        k.save(&p).unwrap();
++        assert_eq!(f.reload_if_changed(), Ok(true));
++        assert_eq!(f.keys().name_for(&key), None);
++    }
++
++    #[test]
++    fn opening_a_broken_file_fails_outright() {
++        let (_d, p) = tmp_file();
++        std::fs::write(&p, "nope").unwrap();
++        assert!(KeyFile::open(p).is_err(), "首次启动就坏的文件：拒绝启动");
++    }
++}
+diff --git a/crates/dct-srv/src/lib.rs b/crates/dct-srv/src/lib.rs
+index 781e2f2..9f272b0 100644
+--- a/crates/dct-srv/src/lib.rs
++++ b/crates/dct-srv/src/lib.rs
+@@ -19,20 +19,21 @@
+ //! 信箱只在设备还活着的时候存在，进程一停就什么都没了，有界，满了就明说
+ //! （`Busy`），不落盘。
+ //!
+ //! # 第一期没有鉴权
+ //!
+ //! `token` 现在没人验（任务 5 才接 dc_classroom），所以**这个服务在第一期
+ //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
+ 
+ mod live;
+ pub use live::Live;
++pub mod keys;
+ 
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+ use axum::extract::{DefaultBodyLimit, FromRef, Path, State};
+ use axum::http::{HeaderMap, StatusCode, Uri};
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use axum::{Json, Router};
+@@ -609,20 +610,109 @@ pub fn must_be_loopback(addr: std::net::SocketAddr) -> Result<(), String> {
+     if addr.ip().is_loopback() {
+         return Ok(());
+     }
+     Err(format!(
+         "{addr} 不是环回地址。第一期的中转没有鉴权也没有加密，只能在 \
+          127.0.0.1 上跑；要对外提供服务，先做完任务 5（接 dc_classroom）\
+          和第二期（端到端加密）。"
+     ))
+ }
+ 
++/// 中转的五种启动方式。
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Cli {
++    Serve {
++        addr: String,
++        with_link: bool,
++        publish_keys: Option<std::path::PathBuf>,
++    },
++    KeyAdd {
++        name: String,
++        file: std::path::PathBuf,
++    },
++    KeyRevoke {
++        name: String,
++        file: std::path::PathBuf,
++    },
++    KeyList {
++        file: std::path::PathBuf,
++    },
++    Takedown {
++        id: String,
++        file: std::path::PathBuf,
++    },
++}
++
++/// 手写解析：五种形状，不值得为此引一个参数库。
++pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
++    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
++        match args.iter().position(|a| a == flag) {
++            None => Ok(None),
++            Some(i) => args
++                .get(i + 1)
++                .filter(|v| !v.starts_with("--"))
++                .map(|v| Some(v.into()))
++                .ok_or_else(|| format!("{flag} 后面要跟一个文件路径")),
++        }
++    }
++    let need_file = |args: &[String]| {
++        flag_value(args, "--file")?.ok_or_else(|| "管理命令要写明 --file <密钥文件>".to_string())
++    };
++    match args.first().map(String::as_str) {
++        Some("key") => {
++            let name = || args.get(2).cloned().ok_or_else(|| "缺少名字".to_string());
++            match args.get(1).map(String::as_str) {
++                Some("add") => Ok(Cli::KeyAdd {
++                    name: name()?,
++                    file: need_file(args)?,
++                }),
++                Some("revoke") => Ok(Cli::KeyRevoke {
++                    name: name()?,
++                    file: need_file(args)?,
++                }),
++                Some("list") => Ok(Cli::KeyList {
++                    file: need_file(args)?,
++                }),
++                _ => Err("用法：dct-srv key add|revoke|list ...".into()),
++            }
++        }
++        Some("takedown") => Ok(Cli::Takedown {
++            id: args
++                .get(1)
++                .cloned()
++                .ok_or_else(|| "缺少房间号".to_string())?,
++            file: need_file(args)?,
++        }),
++        _ => {
++            let publish_keys = flag_value(args, "--publish-keys")?;
++            let mut skip_next = false;
++            let mut addr = None;
++            for a in args {
++                if skip_next {
++                    skip_next = false;
++                    continue;
++                }
++                if a == "--publish-keys" {
++                    skip_next = true;
++                } else if !a.starts_with("--") && addr.is_none() {
++                    addr = Some(a.clone());
++                }
++            }
++            Ok(Cli::Serve {
++                addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
++                with_link: args.iter().any(|a| a == "--with-link"),
++                publish_keys,
++            })
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use axum::body::Body;
+     use axum::http::Request;
+     use dct_link::EndpointKind;
+     use tower::ServiceExt;
+ 
+     fn cfg(ms: u64) -> Config {
+         Config {
+@@ -766,21 +856,26 @@ mod tests {
+     fn push_secret() -> String {
+         "p".repeat(64)
+     }
+ 
+     struct FrameResp {
+         status: u16,
+         etag: Option<String>,
+         body: Vec<u8>,
+     }
+ 
+-    async fn get_frame(app: &Router, id: &str, token: &str, if_none_match: Option<&str>) -> FrameResp {
++    async fn get_frame(
++        app: &Router,
++        id: &str,
++        token: &str,
++        if_none_match: Option<&str>,
++    ) -> FrameResp {
+         let mut req = Request::builder()
+             .method("GET")
+             .uri(format!("/live/{id}/frame"))
+             .header("x-live-token", token);
+         if let Some(tag) = if_none_match {
+             req = req.header("if-none-match", format!("\"{tag}\""));
+         }
+         let res = app
+             .clone()
+             .oneshot(req.body(Body::empty()).unwrap())
+@@ -1425,11 +1520,64 @@ mod tests {
+             concat!("from_slice::<", "Request>"),
+             concat!("dct", "::proto"),
+         ];
+         for name in banned {
+             assert!(
+                 !src.contains(name),
+                 "{name} 出现在中转里——它开始认识 dct 的协议了"
+             );
+         }
+     }
++
++    #[test]
++    fn the_command_line_is_parsed_into_one_of_five_shapes() {
++        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
++        assert_eq!(
++            parse_cli(&a("")).unwrap(),
++            Cli::Serve {
++                addr: "127.0.0.1:8787".into(),
++                with_link: false,
++                publish_keys: None
++            }
++        );
++        assert_eq!(
++            parse_cli(&a("127.0.0.1:9000 --with-link --publish-keys /k.json")).unwrap(),
++            Cli::Serve {
++                addr: "127.0.0.1:9000".into(),
++                with_link: true,
++                publish_keys: Some("/k.json".into())
++            }
++        );
++        assert_eq!(
++            parse_cli(&a("key add 姜老师 --file /k.json")).unwrap(),
++            Cli::KeyAdd {
++                name: "姜老师".into(),
++                file: "/k.json".into()
++            }
++        );
++        assert_eq!(
++            parse_cli(&a("key revoke a --file /k.json")).unwrap(),
++            Cli::KeyRevoke {
++                name: "a".into(),
++                file: "/k.json".into()
++            }
++        );
++        assert_eq!(
++            parse_cli(&a("key list --file /k.json")).unwrap(),
++            Cli::KeyList {
++                file: "/k.json".into()
++            }
++        );
++        assert_eq!(
++            parse_cli(&a("takedown abc --file /k.json")).unwrap(),
++            Cli::Takedown {
++                id: "abc".into(),
++                file: "/k.json".into()
++            }
++        );
++        assert!(
++            parse_cli(&a("key add a")).is_err(),
++            "管理命令必须写明 --file"
++        );
++        assert!(parse_cli(&a("--publish-keys")).is_err(), "参数缺值要报错");
++    }
+ }
+diff --git a/crates/dct-srv/src/main.rs b/crates/dct-srv/src/main.rs
+index 4dd7fc9..cf26e71 100644
+--- a/crates/dct-srv/src/main.rs
++++ b/crates/dct-srv/src/main.rs
+@@ -5,39 +5,85 @@
+ //! 现在 `token` 根本没人验（任务 5 才接 dc_classroom），这个服务对公网开口
+ //! 的那一刻，任何人都能冒充任何一台设备收发信封。加密也还没有（第二期）。
+ //!
+ //! 所以拒绝绑非环回地址的判断写在这里，不写在文档里。等任务 5 和第二期落地，
+ //! 再把它换成一个明确的、要人动手打开的开关。
+ 
+ use std::sync::Arc;
+ 
+ use dct_srv::{Config, Live, Relay, Routes};
+ 
+-const DEFAULT_ADDR: &str = "127.0.0.1:8787";
+-
+-/// 打开配对信封那组没有鉴权的路由（`/link/*` 和 `/`）。默认不开，理由见
+-/// `dct_srv::Routes`。
+-const WITH_LINK: &str = "--with-link";
+-
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+-    let routes = if args.iter().any(|a| a == WITH_LINK) {
+-        Routes::WithLink
+-    } else {
+-        Routes::LiveOnly
++    let cli = dct_srv::parse_cli(&args)?;
++    let now = || {
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_secs())
++            .unwrap_or(0)
++    };
++    let load_or_new = |file: &std::path::Path| {
++        if file.exists() {
++            dct_srv::keys::PublishKeys::load(file)
++        } else {
++            Ok(dct_srv::keys::PublishKeys::default())
++        }
++    };
++    let (addr, routes, publish_keys) = match cli {
++        dct_srv::Cli::KeyAdd { name, file } => {
++            let mut k = load_or_new(&file)?;
++            let key = k.add(&name, now())?;
++            k.save(&file)?;
++            println!("{key}");
++            eprintln!("这把密钥只显示这一次。文件里只存了它的摘要。");
++            return Ok(());
++        }
++        dct_srv::Cli::KeyRevoke { name, file } => {
++            let mut k = dct_srv::keys::PublishKeys::load(&file)?;
++            if !k.revoke(&name) {
++                return Err(format!("没有叫「{name}」的密钥").into());
++            }
++            k.save(&file)?;
++            eprintln!("已吊销「{name}」。运行中的中转最多 10 秒后生效。");
++            return Ok(());
++        }
++        dct_srv::Cli::KeyList { file } => {
++            for e in dct_srv::keys::PublishKeys::load(&file)?.keys {
++                println!("{}\t创建于 {}", e.name, e.created);
++            }
++            return Ok(());
++        }
++        dct_srv::Cli::Takedown { id, file } => {
++            let mut k = load_or_new(&file)?;
++            k.block(&id);
++            k.save(&file)?;
++            eprintln!("已下线「{id}」。运行中的中转最多 10 秒后生效。");
++            return Ok(());
++        }
++        dct_srv::Cli::Serve {
++            addr,
++            with_link,
++            publish_keys,
++        } => (
++            addr,
++            if with_link {
++                Routes::WithLink
++            } else {
++                Routes::LiveOnly
++            },
++            publish_keys,
++        ),
+     };
+-    let addr = args
+-        .iter()
+-        .find(|a| !a.starts_with("--"))
+-        .cloned()
+-        .unwrap_or_else(|| DEFAULT_ADDR.into());
++    // 首次打开就坏的密钥文件：拒绝启动，而不是悄悄当成「没开公开功能」。
++    let publish_keys = publish_keys.map(dct_srv::keys::KeyFile::open).transpose()?;
++    let _ = publish_keys;
+ 
+     let listener = tokio::net::TcpListener::bind(&addr).await?;
+     let local = listener.local_addr()?;
+     if let Err(why) = dct_srv::must_be_loopback(local) {
+         // 已经绑上了才发现——那就关掉。宁可启动失败，也不要一个没鉴权的
+         // 中转在公网上多活一秒。
+         drop(listener);
+         return Err(why.into());
+     }
+ 

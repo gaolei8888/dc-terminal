@@ -1,0 +1,32 @@
+Task 1: minor (deferred): publish_grant .expect relies on Hmac::new_from_slice accepting any key length; comment could cite the guarantee
+Task 2: minor (deferred): keys.rs save() — mode(0o600) only applies when tmp file is created; pre-existing tmp keeps looser perms (file holds digests, not keys)
+Task 2: minor (deferred): keys.rs save() — fixed tmp filename; concurrent management commands can clobber each other
+Task 2: minor (deferred): parse_cli `key add --file X` (name omitted) creates a key named "--file" (plan-mandated reference code)
+Task 2: minor (deferred): report said all reformatted hunks were new code; get_frame test helper signature was reformatted (cosmetic)
+Task 3: minor (deferred): no tests pinning probe-safe check order (wrong control + blocked/empty title/None keys must all be 401)
+Task 3: minor (deferred): public_list viewers-desc sort untested (single-room tests)
+Task 3: minor (deferred): viewer sum duplicated in public_list and viewers()
+Task 3: minor (deferred): removed doc line explaining push_secret cannot read (authed)
+Task 3: minor (deferred): implementer used shared git stash in worktree (process)
+Task 4: minor (deferred): reload task wiring (reconcile + shared write) untested
+Task 4: minor (deferred): PUT public route — note_start rate limit and 16KB body limit untested
+Task 4: minor (deferred): LiveLanesResponse doc comment now sits on PublicTitle
+Task 4: minor (deferred): new tests not rustfmt-shaped (long lines)
+Task 4: minor (deferred): PUT spends a rate-limit slot before proof of control; manager self-heal after relay restart from one source can hit 10/min (429 is retried, not stuck) — weigh at final review
+Task 4: minor (deferred): reload-race fix verified by reasoning only (no deterministic concurrency test)
+Task 5: minor (deferred): public.html has no [data-theme="dark"] override (no toggle on that page; cosmetic)
+Task 5: minor (deferred): live.html render() concatenates endedPublic + " · " + link text
+Task 6: minor (deferred): no literal round-trip test of LiveInfo JSON missing `public`
+Task 7: minor (deferred): stuck intent + manager publish then withdraw → seen_public shows Pending forever (public_stuck blocks the PUT)
+Task 7: minor (deferred): extra idempotent DELETE after each restage once unpublished (clear public_applied only when want_public.is_some())
+Task 7: minor (deferred): publish key frozen at press time; changing key needs pressing p again (matches spec)
+Task 7: minor (deferred): pusher_loop publicity block ~60 lines could be a helper; live.rs 2391 lines
+Task 7: minor (deferred): timing-based backoff test margin; "heals once" check weak (20s cadence vs 2s window)
+Task 8: minor (deferred): SetSecret RPC failure closes the key input instead of keeping it open for retry (matches brief)
+Task 9: minor (deferred): stored livePublic.title not truncated to 60 while relay copy is
+Task 9: minor (deferred): live-stop leaves livePublicError on the row
+Task 9: minor (deferred): room id parsed by pathname.split('/').pop() (brittle to trailing slash)
+Task 9: minor (deferred): admin live-public/live-start publish path still calls the (10s-bounded) relay fetch inside store.mutate
+Task 9: minor (deferred): relayPublic re-calls liveStatus that healPublic just made (duplicate RPC per heal)
+Task 9: minor (deferred): this.healing not initialized in constructor
+Task 10: minor (deferred): menu "公开这场直播" folds the privacy warning into the prompt label instead of a separate confirm() like live-start
