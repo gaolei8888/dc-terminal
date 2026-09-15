@@ -737,11 +737,40 @@ fn pusher_loop(live: &LiveState, mgr: &SessionManager, stop: &AtomicBool) {
                             public_retry = None;
                             public_fails = 0;
                         }
-                        // 运营方拒了（密钥吊销、被下线、标题越界）：不重试。
-                        Err(LiveFailure::Refused(401 | 403 | 413)) => {
+                        // 运营方拒了（标题越界等）：不重试。
+                        Err(LiveFailure::Refused(403 | 413)) => {
                             public_stuck = Some(pub_this);
                             public_retry = None;
                             public_fails = 0;
+                        }
+                        // PUT 401 有两种起因，长得一模一样：密钥真被吊销了，
+                        // 或者中转刚重启/回收、压根不认这个房间——见
+                        // `fetch_lanes` 那边同一种 401 的处理。拿 viewer
+                        // token 探一次人数分清楚：探测也 401 就是房间真的
+                        // 没了，清 `started` 让下一轮重新 `start_room`，
+                        // **不能**标 `public_stuck`，不然重新注册出来的
+                        // 房间会被一次性拉黑，再也发不出公开请求；探测认
+                        // 这个房间，才说明是密钥本身被拒，标 stuck 跟老
+                        // 行为一样；探测自己连不上/超时，结论不明，按普通
+                        // 网络失败退避重试，不妄下结论。
+                        Err(LiveFailure::Refused(401)) => {
+                            match fetch_lanes(&agent, &base, &room.id, &room.token) {
+                                Err(LiveFailure::Refused(401)) => {
+                                    started = None;
+                                }
+                                Ok(_) => {
+                                    public_stuck = Some(pub_this);
+                                    public_retry = None;
+                                    public_fails = 0;
+                                }
+                                Err(_) => {
+                                    public_fails += 1;
+                                    public_retry = Some((
+                                        pub_this,
+                                        Instant::now() + start_backoff(public_fails),
+                                    ));
+                                }
+                            }
                         }
                         // 连不上、太频繁（429）之类：按开播退避再试。
                         Err(_) => {
@@ -1631,13 +1660,17 @@ mod tests {
         let lanes_query = path.ends_with("/lanes");
         let is_frame_push = path == PATH_FRAME;
         let is_start = path == dct_link::live::PATH_START;
+        let is_public_put = method == "PUT" && path.ends_with("/public");
         if is_start && st.forget_room {
             // 房间重新登记：中转（重新）认得这场直播了。
             st.forget_room = false;
         }
-        if st.forget_room && (is_frame_push || lanes_query) {
-            // 中转忘了这个房间（模拟重启）：推帧、读人数都当成「没有这场
-            // 直播」拒收，`start_room` 不受影响——那正是重新认得它的路径。
+        if st.forget_room && (is_frame_push || lanes_query || is_public_put) {
+            // 中转忘了这个房间（模拟重启）：推帧、读人数、公开 PUT 都当成
+            // 「没有这场直播」拒收，`start_room` 不受影响——那正是重新
+            // 认得它的路径。公开 PUT 跟着一起 401 才是 M1 要盖住的真实
+            // 竞态：单纯密钥被拒（`public_status`）跟房间被重启回收，
+            // 中转答的是同一个状态码。
             st.seen.push(Seen {
                 method,
                 path,
@@ -1649,7 +1682,7 @@ mod tests {
             let _ = conn.write_all(out.as_bytes());
             return;
         }
-        let public_put = method == "PUT" && path.ends_with("/public");
+        let public_put = is_public_put;
         let public_status = st.public_status;
         let public_delete = method == "DELETE" && path.ends_with("/public");
         let unpublish_status = st.unpublish_status;
@@ -2406,6 +2439,55 @@ mod tests {
             live.info().public
                 == LivePublic::Listed {
                     title: "课".into(),
+                }
+        });
+
+        pusher.stop();
+    }
+
+    /// **M1：中转重启的窗口期里，`PUT .../public` 也会答 401——跟密钥真
+    /// 被吊销长得一模一样。** 老师已经在播，中转这时候重启忘了房间，
+    /// daemon 的 `started` 还没来得及发现；老师偏偏在这个窗口按了 `p`
+    /// 换标题，触发一次新的 PUT，撞见 401。
+    ///
+    /// 早先的实现见 401 就标 `public_stuck`，从此再也不会去 PUT——房间
+    /// 明明后面会被重新注册出来，公开却被永久拉黑。修复之后：PUT 撞见
+    /// 401 时用 viewer token 探一次 `lanes`，探测也 401 才说明房间真的
+    /// 没了，清 `started` 触发重新注册，不标 `stuck`；重新注册之后公开
+    /// 会自动补上。
+    #[test]
+    fn a_put_401_during_a_relay_restart_is_not_mistaken_for_a_real_key_rejection() {
+        let srv = FakeSrv::start();
+        let live = Arc::new(LiveState::new(srv.base()));
+        let mgr = Arc::new(crate::session::SessionManager::new());
+        live.start(vec![]);
+        live.publish("课".into(), "k".into());
+        let pusher = spawn_pusher(live.clone(), mgr);
+
+        until("先公开成功", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "课".into(),
+                }
+        });
+
+        // 模拟中转重启：PUT/推帧/读人数全都当成「没有这场直播」401。
+        // daemon 这边的 `started` 还没来得及发现，老师这时候按 `p`
+        // 换了个新标题——这就是那个竞态窗口。
+        recover(srv.state.lock()).forget_room = true;
+        live.publish("新课".into(), "k".into());
+
+        let starts = || {
+            srv.seen()
+                .iter()
+                .filter(|s| s.path == dct_link::live::PATH_START)
+                .count()
+        };
+        until("探测发现房间真的没了，重新注册", || starts() == 2);
+        until("重新注册之后最终还是公开成功——没有被永久拉黑", || {
+            live.info().public
+                == LivePublic::Listed {
+                    title: "新课".into(),
                 }
         });
 
