@@ -160,11 +160,13 @@ export class Classroom {
     return id;
   }
   // 公开这个工作区的直播；供管理台接口和 live-start 里的「顺便公开」共用。
+  // 记的是这一场直播的房间号，不是这个工作区——房间号一变就说明这场
+  // 播完了，见 healPublic 里的比对。
   async publishLive(w, title) {
     title = String(title || '').trim();
     if (!title) throw fail(400, '请填写公开标题');
-    await this.relayPublic(w, 'PUT', title);
-    w.livePublic = {title}; delete w.livePublicError;
+    const id = await this.relayPublic(w, 'PUT', title);
+    w.livePublic = {title, id}; delete w.livePublicError;
     this.store.audit('公开直播工作区', w);
   }
   // 取消公开；不影响直播本身是否还在播。
@@ -172,6 +174,18 @@ export class Classroom {
     await this.relayPublic(w, 'DELETE');
     delete w.livePublic;
     this.store.audit('取消公开直播', w);
+  }
+  // 中转重启之后，房间要等守护进程重新汇报（约 20 秒）才会重新「认得」，
+  // 这段时间里 PUT public 答的 401 跟真的密钥被吊销长得一模一样。这里用
+  // 学生端的直播查看口令去探一下 lanes：房间还没注册，lanes 也会答 401
+  // 或者干脆连不上；房间在，lanes 才会给 200。
+  async probeLanes(url, id) {
+    let token;
+    try { token = new URLSearchParams(new URL(url).hash.slice(1)).get('t'); } catch { token = null; }
+    try {
+      const r = await fetch(`${this.publicLive.relay}/live/${encodeURIComponent(id)}/lanes`, {headers: token ? {'x-live-token': token} : {}, signal: AbortSignal.timeout(RELAY_TIMEOUT_MS)});
+      return r.status === 200;
+    } catch { return false; }
   }
   // 后台自愈：记着要公开的工作区，中转说不公开就再公开一次；被吊销/下线就停。
   //
@@ -190,6 +204,7 @@ export class Classroom {
       } catch { return; }
       for (const w of this.store.data.students.filter(s => s.livePublic)) {
         const title = w.livePublic.title;
+        const recordId = w.livePublic.id;
         let status;
         // 问不出来（RPC 失败/超时）不等于「确认没在播」——那是
         // `liveStatus` 自己的约定：查不出来时把决定权交给调用方，不能
@@ -201,12 +216,37 @@ export class Classroom {
           continue;
         }
         const id = new URL(status.url).pathname.split('/').pop();
+        if (recordId !== undefined && recordId !== id) {
+          // 公开记录记的是那一场直播的房间号；房间号变了说明那场已经
+          // 播完，不是「这个工作区」的开关。清掉，不算被拒绝，不报错，
+          // 也不去公开这个新房间——公开新的一场要老师重新点。
+          await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title && w.livePublic.id === recordId) delete w.livePublic; });
+          continue;
+        }
+        if (recordId === undefined) {
+          // 老版本写的记录没有房间号，没法判断是不是同一场——认领当前
+          // 房间，当作本来就是它。
+          await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title && w.livePublic.id === undefined) w.livePublic.id = id; });
+        }
         if (listed.has(id)) continue;
         try {
           await this.relayPublic(w, 'PUT', title);
           await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title) delete w.livePublicError; });
         } catch (e) {
-          if (e.relayStatus === 401 || e.relayStatus === 403) {
+          if (e.relayStatus === 403) {
+            await this.store.mutate(async () => {
+              if (w.livePublic && w.livePublic.title === title) {
+                w.livePublicError = e.message;
+                delete w.livePublic;
+                this.store.audit(`公开直播被中转拒绝（${e.message}）`, w);
+              }
+            });
+          } else if (e.relayStatus === 401) {
+            // 401 两种原因长得一样：密钥真被吊销，或者房间在中转重启后
+            // 还没被守护进程重新汇报。探一下 lanes 分清楚——房间不在，
+            // 留着记录等下一轮；房间在，才是真的被拒绝。
+            const present = await this.probeLanes(status.url, id);
+            if (!present) continue;
             await this.store.mutate(async () => {
               if (w.livePublic && w.livePublic.title === title) {
                 w.livePublicError = e.message;
@@ -337,7 +377,7 @@ export class Classroom {
         if ((await this.driver.status(w)).status !== 'running') throw fail(409, '请先启动工作区');
         if (action === 'live-stop') {
           await this.liveRpc(w, 'LiveStop');
-          delete w.livePublic;
+          delete w.livePublic; delete w.livePublicError;
           this.store.audit('停止直播工作区', w);
           return json(res, 200, {live: null});
         }
