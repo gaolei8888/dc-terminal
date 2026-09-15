@@ -84,6 +84,33 @@ impl View {
     }
 }
 
+/// 直播面板里正在填的那一行。
+#[derive(Clone, PartialEq)]
+#[allow(dead_code)] // 构造端在后续任务里接上
+pub enum LiveInput {
+    /// 公开标题。
+    Title(String),
+    /// 公开直播密钥。`then_publish` = 填完之后继续用这个标题公开
+    /// （按 `p` 时守护进程报 `LivePublishKeyMissing` 转过来的）。
+    Key {
+        buf: String,
+        then_publish: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for LiveInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveInput::Title(t) => f.debug_tuple("Title").field(t).finish(),
+            LiveInput::Key { then_publish, .. } => f
+                .debug_struct("Key")
+                .field("buf", &"<redacted>")
+                .field("then_publish", then_publish)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum View {
     Board,
@@ -212,9 +239,12 @@ pub(crate) enum View {
     ///
     /// 状态（链接、token、上架列表、人数、readiness）全在 `App::live` 上，
     /// 理由同 `View::Web`。这里只带一份光标——`state` 指向 `App::sessions`
-    /// 里的哪一行，空格勾它上不上架。
+    /// 里的哪一行，空格勾它上不上架。`input` 是正在填的那一行；没有输入
+    /// 行打开时是 `None`。
     Live {
         state: ListState,
+        #[allow(dead_code)] // 读取端在后续任务里接上
+        input: Option<LiveInput>,
     },
     /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
     /// 屏幕上，profile 可配对（`pairable`）时的 Ctrl+A——跟 Ctrl+O 开
@@ -1803,6 +1833,17 @@ mod tests {
     use super::*;
     use crate::proto::InstallPrompt;
     use crate::ui::key_to_input;
+
+    /// 正在填的密钥不许出现在 `Debug` 里。
+    #[test]
+    fn a_live_key_being_typed_is_redacted_in_debug() {
+        let k = LiveInput::Key {
+            buf: "SUPER-SECRET".into(),
+            then_publish: Some("课".into()),
+        };
+        assert!(!format!("{k:?}").contains("SUPER-SECRET"));
+        assert!(format!("{:?}", LiveInput::Title("课".into())).contains("课"));
+    }
 
     /// 手机页的底栏要写着 `w`——这一页上局域网那一节的开关只有这一个入口，
     /// 底栏不写就没有任何地方告诉用户它存在。

@@ -191,7 +191,7 @@ pub(crate) fn open(app: &mut App) {
     if !current_project_sessions(app).is_empty() {
         state.select(Some(0));
     }
-    app.view = View::Live { state };
+    app.view = View::Live { state, input: None };
 }
 
 /// 空格/`r` 共用的落地：把新的上架名单发给守护进程，按回答更新
@@ -301,7 +301,7 @@ fn stop_live(app: &mut App) {
 /// 末尾还有一段清理陈旧 `message` 的逻辑，跳过它会让一句普通反馈盖掉
 /// 屏幕上唯一的出路。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::Live { mut state } = app.view.clone() else {
+    let View::Live { mut state, .. } = app.view.clone() else {
         return Ok(());
     };
     match key.code {
@@ -329,12 +329,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('s') if is_plain_key(&key) && is_live(&app.live) => stop_live(app),
         _ => {}
     }
-    app.view = View::Live { state };
+    app.view = View::Live { state, input: None };
     Ok(())
 }
 
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Live { state } = app.view.clone() else {
+    let View::Live { state, .. } = app.view.clone() else {
         return;
     };
     let rule = if app.connected { dim() } else { danger() };
@@ -638,6 +638,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
         app.live = LiveInfo {
             id: "abc".into(),
@@ -663,6 +664,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
         app.live = LiveInfo {
             id: "abc".into(),
@@ -689,6 +691,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
 
         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
@@ -702,6 +705,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
 
         for code in [KeyCode::Char('c'), KeyCode::Char('r'), KeyCode::Char('s')] {
