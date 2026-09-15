@@ -15,6 +15,14 @@ const fail = (status, message) => Object.assign(new Error(message), {status});
 // 超了守护进程会拒，而那时候老师已经点下去了——在这儿先截断，他看到的是
 // 「播了前四路」而不是一句拒绝。
 const LIVE_MAX_LANES = 4;
+// 中转对公开/取消公开的答复码翻成人话。跟发布密钥、推帧钥匙、凭证本身
+// 一样，这几句话不带任何密钥内容。
+const PUBLIC_ERRORS = {
+  401: '发布密钥无效或已吊销',
+  403: '服务器没有开启公开直播，或这场直播已被下线',
+  413: '标题太长（最多 60 个字）',
+  429: '操作太频繁，请一分钟后再试',
+};
 const js = value => JSON.stringify(value).replaceAll('<', '\\u003c');
 async function body(req) {
   if (!String(req.headers['content-type'] || '').startsWith('application/json')) throw fail(400, '请求格式无效');
@@ -33,7 +41,7 @@ function finishedPage(prefix) {
 }
 
 export class Classroom {
-  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing} = {}) {
+  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, live} = {}) {
     this.store = store;
     this.driver = driver;
     this.origin = new URL(origin).origin;
@@ -43,6 +51,9 @@ export class Classroom {
     this.publishing = publishing ? new Publishing(this, publishing) : null;
     this.sessions = new Map((store.data.sessions || []).filter(s => s.expires > Date.now()).map(s => [s.key, s]));
     this.assistance = new Map(); this.connections = new Set(); this.rates = new Map(); this.stats = null;
+    // 公开直播：管理台自己的发布密钥 + 中转地址。缺一样就不开这个功能。
+    this.publicLive = live && live.relay && live.publishKey ? {relay: live.relay.replace(/\/+$/, ''), key: live.publishKey} : null;
+    if (this.publicLive) this.healTimer = setInterval(() => this.healPublic().catch(() => {}), 30000).unref();
     this.server = http.createServer((req, res) => this.handle(req, res).catch(e => { if (!res.headersSent) json(res, e.status || 409, {error: e.publicMessage || (e.status ? e.message : '操作未完成，请稍后重试；学生文件已保留')}); else res.destroy(); }));
     this.server.on('upgrade', (req, socket, head) => this.upgrade(req, socket, head).catch(() => socket.destroy()));
     this.timer = setInterval(() => {
@@ -52,7 +63,7 @@ export class Classroom {
       for (const session of active.values()) if (session.external) this.sso.ensure(session).catch(() => {});
     }, 5000).unref();
   }
-  close() { clearInterval(this.timer); for (const c of this.connections) c.socket.destroy(); this.publishing?.server.close(); return new Promise(r => this.server.close(r)); }
+  close() { clearInterval(this.timer); clearInterval(this.healTimer); for (const c of this.connections) c.socket.destroy(); this.publishing?.server.close(); return new Promise(r => this.server.close(r)); }
   writeOrigin(req) {
     if (req.headers.origin && req.headers.origin !== this.origin) throw fail(403, '请从当前管理台或工作区操作');
     if (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(req.headers['sec-fetch-site'])) throw fail(403, '请从当前工作区操作');
@@ -100,7 +111,7 @@ export class Classroom {
     if (!this.sessions.has(key)) this.sessions.set(key, {key, role: 'student', student: w.id, generation: w.generation, expires: Date.now() + 7 * 86400000});
     return this.sessions.get(key);
   }
-  safeRow(w, status = {}) { return {id: w.id, name: w.name, shared: !!w.shared, status: w.disabled ? 'disabled' : status.status || 'new', memoryBytes: status.memoryBytes ?? null, diskBytes: status.diskBytes ?? null, connections: [...this.connections].filter(c => c.student === w.id && c.session.role === 'student').length, assisting: !!this.lease(w), live: status.live || null, classId: w.classId || '', className: w.className || ''}; }
+  safeRow(w, status = {}) { return {id: w.id, name: w.name, shared: !!w.shared, status: w.disabled ? 'disabled' : status.status || 'new', memoryBytes: status.memoryBytes ?? null, diskBytes: status.diskBytes ?? null, connections: [...this.connections].filter(c => c.student === w.id && c.session.role === 'student').length, assisting: !!this.lease(w), live: status.live || null, classId: w.classId || '', className: w.className || '', livePublicError: w.livePublicError || null}; }
   // 往某个工作区的守护进程发一条直播请求。
   //
   // **旧版本的 dct 不认识这几条请求**，它会回一句解析失败——直接把那句话
@@ -128,7 +139,61 @@ export class Classroom {
   async liveStatus(w) {
     const info = (await this.liveRpc(w, 'LiveStatus')).Live;
     if (!info || !info.id) return null;
-    return {url: info.url, viewers: info.viewers, staged: info.staged, readiness: info.readiness};
+    return {url: info.url, viewers: info.viewers, staged: info.staged, readiness: info.readiness, public: info.public && info.public.Listed ? {title: info.public.Listed.title} : null};
+  }
+  // 对中转公开 / 取消公开这一场。凭证由学生工作区的守护进程签发，发布密钥只在管理台进程里。
+  async relayPublic(w, method, title) {
+    const status = await this.liveStatus(w);
+    if (!status) throw fail(409, '这个工作区现在没在直播');
+    const id = new URL(status.url).pathname.split('/').pop();
+    const answer = await this.liveRpc(w, 'LivePublishGrant');
+    const grant = answer.LiveGrant;
+    if (typeof grant !== 'string') throw fail(409, '这个工作区的 dct 版本还不支持，请先停止它再启动（会换成新镜像）');
+    const headers = {'x-live-grant': grant};
+    let body;
+    if (method === 'PUT') { headers['content-type'] = 'application/json'; body = JSON.stringify({title: [...title].slice(0, 60).join(''), key: this.publicLive.key}); }
+    let res;
+    try { res = await fetch(`${this.publicLive.relay}/live/${encodeURIComponent(id)}/public`, {method, headers, body}); }
+    catch { throw fail(409, '连不上直播中转，请稍后再试'); }
+    if (res.status !== 204) throw Object.assign(fail(409, PUBLIC_ERRORS[res.status] || `直播中转拒绝了（状态码 ${res.status}）`), {relayStatus: res.status});
+    return id;
+  }
+  // 公开这个工作区的直播；供管理台接口和 live-start 里的「顺便公开」共用。
+  async publishLive(w, title) {
+    title = String(title || '').trim();
+    if (!title) throw fail(400, '请填写公开标题');
+    await this.relayPublic(w, 'PUT', title);
+    w.livePublic = {title}; delete w.livePublicError;
+    this.store.audit('公开直播工作区', w);
+  }
+  // 取消公开；不影响直播本身是否还在播。
+  async unpublishLive(w) {
+    await this.relayPublic(w, 'DELETE');
+    delete w.livePublic;
+    this.store.audit('取消公开直播', w);
+  }
+  // 后台自愈：记着要公开的工作区，中转说不公开就再公开一次；被吊销/下线就停。
+  async healPublic() {
+    if (!this.publicLive) return;
+    let listed;
+    try { const r = await fetch(`${this.publicLive.relay}/live/public`); listed = new Set((await r.json()).map(x => x.id)); }
+    catch { return; }
+    for (const w of this.store.data.students.filter(s => s.livePublic)) {
+      await this.store.mutate(async () => {
+        const status = await this.liveStatus(w).catch(() => null);
+        if (!status) { delete w.livePublic; return; }
+        const id = new URL(status.url).pathname.split('/').pop();
+        if (listed.has(id)) return;
+        try { await this.relayPublic(w, 'PUT', w.livePublic.title); delete w.livePublicError; }
+        catch (e) {
+          if (e.relayStatus === 401 || e.relayStatus === 403) {
+            w.livePublicError = e.message;
+            delete w.livePublic;
+            this.store.audit(`公开直播被中转拒绝（${e.message}）`, w);
+          }
+        }
+      });
+    }
   }
   async state(session) {
     if (session) await this.sso.syncRoster(session);
@@ -138,7 +203,7 @@ export class Classroom {
       // 几个人在看」，为此每行再发一次请求不值得。问不出来就当没在播，
       // 一次抖动不该让整张表打不开。
       if (status.status === 'running') { try { status.live = await this.liveStatus(w); } catch { status.live = null; } } if (!session || this.sso.allowed(session, w)) students.push(this.safeRow(w, status)); }
-    return {students, capacity: {running, max: this.driver.maxRunning, totalMemory: os.totalmem()}, audit: session?.external ? [] : this.store.data.audit.slice(0, 30), permissions: {manageAccess: !session?.external}};
+    return {students, capacity: {running, max: this.driver.maxRunning, totalMemory: os.totalmem()}, audit: session?.external ? [] : this.store.data.audit.slice(0, 30), permissions: {manageAccess: !session?.external}, features: {publicLive: !!this.publicLive}};
   }
   async handle(req, res) {
     const u = new URL(req.url, this.origin), route = u.pathname;
@@ -226,7 +291,7 @@ export class Classroom {
       throw fail(404, '接口不存在');
     }
     if (req.method !== 'POST' || suffix) throw fail(404, '接口不存在');
-    await body(req);
+    const data = await body(req);
     return this.store.mutate(async () => {
       if (action === 'link') return json(res, 200, {url: `${this.origin}/w/${w.id}/#t=${w.token}`});
       if (action === 'assist') {
@@ -238,10 +303,17 @@ export class Classroom {
       if (action === 'end-assist') { this.endAssistance(w.id); this.store.audit('结束协助', w); return json(res, 200, {ok: true}); }
       if (action === 'rotate') { w.token = secret(); w.generation++; this.revoke(w); this.store.audit('重置学生链接', w); return json(res, 200, {url: `${this.origin}/w/${w.id}/#t=${w.token}`}); }
       if (action === 'disable' || action === 'enable') { w.disabled = action === 'disable'; if (w.disabled) this.revoke(w); this.store.audit(w.disabled ? '停用学生链接' : '启用学生链接', w); return json(res, 200, {ok: true}); }
+      if (action === 'live-public' || action === 'live-private') {
+        if (!this.publicLive) throw fail(404, '接口不存在');
+        if (action === 'live-public') await this.publishLive(w, data.title);
+        else await this.unpublishLive(w);
+        return json(res, 200, {live: await this.liveStatus(w)});
+      }
       if (action === 'live-start' || action === 'live-stop') {
         if ((await this.driver.status(w)).status !== 'running') throw fail(409, '请先启动工作区');
         if (action === 'live-stop') {
           await this.liveRpc(w, 'LiveStop');
+          delete w.livePublic;
           this.store.audit('停止直播工作区', w);
           return json(res, 200, {live: null});
         }
@@ -255,7 +327,10 @@ export class Classroom {
         const names = alive.map((x, i) => alive.length > 1 ? `${w.name} · ${i + 1}` : w.name);
         await this.liveRpc(w, {LiveStart: {ids: alive.map(x => x.id), names}});
         this.store.audit('开始直播工作区', w);
-        return json(res, 200, {live: await this.liveStatus(w)});
+        // 顺手公开：直播照常算开成功，公开失败只报在 publicError 里。
+        let publicError;
+        if (data.public && this.publicLive) { try { await this.publishLive(w, data.title); } catch (e) { publicError = e.message; } }
+        return json(res, 200, {live: await this.liveStatus(w), ...(publicError ? {publicError} : {})});
       }
       if (action === 'start' || action === 'stop') {
         if (action === 'start' && w.disabled) throw fail(409, '请先启用学生链接');
@@ -357,7 +432,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const origin = process.env.CLASSROOM_ORIGIN || 'https://dataclue.cn';
   const issuers = process.env.CLASSROOM_SSO_ISSUERS_FILE ? JSON.parse(fs.readFileSync(process.env.CLASSROOM_SSO_ISSUERS_FILE, 'utf8')) : {};
   const publishing = process.env.CLASSROOM_PUBLISH_CONFIG ? JSON.parse(fs.readFileSync(process.env.CLASSROOM_PUBLISH_CONFIG, 'utf8')) : undefined;
-  const app = new Classroom({store, driver, origin, issuers, publishing, secure: origin.startsWith('https:')});
+  const publishKeyFile = process.env.CLASSROOM_LIVE_PUBLISH_KEY_FILE;
+  const live = publishKeyFile ? {relay: process.env.CLASSROOM_LIVE_RELAY, publishKey: fs.readFileSync(publishKeyFile, 'utf8').trim()} : undefined;
+  const app = new Classroom({store, driver, origin, issuers, publishing, live, secure: origin.startsWith('https:')});
   if (app.publishing) app.publishing.server.listen(Number(process.env.CLASSROOM_WORKS_PORT || 17701), '127.0.0.1');
   app.server.listen(Number(process.env.CLASSROOM_PORT || 17700), '127.0.0.1', () => console.log('Classroom manager listening on loopback'));
   process.on('SIGTERM', () => app.close().then(() => process.exit(0)));

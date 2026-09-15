@@ -250,3 +250,98 @@ test('强制直播：只上架活着的会话、路名用学生名字、旧版�
     fs.rmSync(dir, {recursive: true, force: true});
   }
 });
+
+test('公开直播：凭证 + 管理台密钥去中转公开；错误码说人话；自愈遇到吊销就停', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-public-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  // 假中转：记下请求，按吩咐回状态码，并维护一份「公开列表」
+  const seen = []; let putStatus = 204; const listed = new Set();
+  const relay = http.createServer((req, res) => {
+    let body = ''; req.on('data', c => body += c); req.on('end', () => {
+      seen.push({method: req.method, url: req.url, headers: req.headers, body});
+      if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end(JSON.stringify([...listed].map(id => ({id, title: 't', lanes: [], viewers: 0})))); }
+      const m = req.url.match(/^\/live\/([^/]+)\/public$/);
+      if (m && req.method === 'PUT') { if (putStatus === 204) listed.add(m[1]); res.writeHead(putStatus); return res.end(); }
+      if (m && req.method === 'DELETE') { listed.delete(m[1]); res.writeHead(204); return res.end(); }
+      res.writeHead(404); res.end();
+    });
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  let live = {id: 'room01', token: 't'.repeat(64), url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, staged: [[1, '小明']], viewers: 2, readiness: 'Ready', public: 'Private'};
+  const driver = {
+    maxRunning: 2,
+    status: async () => ({status: 'running'}),
+    rpc: async (_, request) => {
+      if (request === 'LiveStatus') return {Live: live};
+      if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)};
+      if (request === 'List') return {Sessions: [{id: 1, profile: 'claude', state: 'Idle'}]};
+      if (request.LiveStart) return {Live: live};
+      return {Ok: null};
+    },
+  };
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const request = (url, body, cookie) => fetch(origin + url, {method: body === undefined ? 'GET' : 'POST', headers: {...(body === undefined ? {} : {'Content-Type': 'application/json'}), ...(cookie ? {Cookie: cookie} : {})}, body: body === undefined ? undefined : JSON.stringify(body)});
+  try {
+    const admin = (await request('/admin/api/login', {password: 'test-admin'})).headers.get('set-cookie').split(';')[0];
+    assert.equal((await (await request('/admin/api/state', undefined, admin)).json()).features.publicLive, true);
+
+    const ok = await request(`/admin/api/students/${ming.id}/live-public`, {title: '小明 的工作区'}, admin);
+    assert.equal(ok.status, 200);
+    const put = seen.find(s => s.method === 'PUT');
+    assert.equal(put.url, '/live/room01/public');
+    assert.equal(put.headers['x-live-grant'], 'g'.repeat(64), '用凭证，不用推帧钥匙');
+    assert.deepEqual(JSON.parse(put.body), {title: '小明 的工作区', key: 'K'.repeat(64)});
+    assert.deepEqual(new Store(dir).student(ming.id).livePublic, {title: '小明 的工作区'});
+    assert.ok(new Store(dir).data.audit.some(a => /公开直播工作区/.test(a.action || a.text || JSON.stringify(a))));
+
+    // 自愈：中转重启丢了公开状态 → 重新 PUT
+    listed.clear(); seen.length = 0;
+    await app.healPublic();
+    assert.ok(seen.some(s => s.method === 'PUT'), '中转说不公开时要重新公开');
+
+    // 吊销：中转回 401 → 不再重试、清记录、行上带原因
+    listed.clear(); putStatus = 401; seen.length = 0;
+    await app.healPublic();
+    await app.healPublic();
+    assert.equal(seen.filter(s => s.method === 'PUT').length, 1, '被吊销之后又去撞了中转');
+    const state = await (await request('/admin/api/state', undefined, admin)).json();
+    const row = state.students.find(s => s.id === ming.id);
+    assert.match(row.livePublicError, /吊销/);
+
+    // 错误映射
+    for (const [code, text] of [[401, /吊销/], [403, /没有开启公开直播|下线/], [413, /标题太长/]]) {
+      putStatus = code;
+      const r = await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin);
+      assert.equal(r.status, 409);
+      assert.match((await r.json()).error, text);
+    }
+
+    // 取消公开
+    putStatus = 204;
+    await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin);
+    const off = await request(`/admin/api/students/${ming.id}/live-private`, {}, admin);
+    assert.equal(off.status, 200);
+    assert.ok(seen.some(s => s.method === 'DELETE' && s.headers['x-live-grant'] === 'g'.repeat(64)));
+    assert.equal(new Store(dir).student(ming.id).livePublic, undefined);
+  } finally { app.server.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('没配发布密钥：管理台不开公开功能', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-public-off-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async () => ({Ok: null})};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const request = (url, body, cookie) => fetch(origin + url, {method: body === undefined ? 'GET' : 'POST', headers: {...(body === undefined ? {} : {'Content-Type': 'application/json'}), ...(cookie ? {Cookie: cookie} : {})}, body: body === undefined ? undefined : JSON.stringify(body)});
+  try {
+    const admin = (await request('/admin/api/login', {password: 'test-admin'})).headers.get('set-cookie').split(';')[0];
+    assert.equal((await (await request('/admin/api/state', undefined, admin)).json()).features.publicLive, false);
+    assert.equal((await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin)).status, 404);
+  } finally { app.server.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
