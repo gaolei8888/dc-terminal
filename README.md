@@ -854,8 +854,9 @@ src/proto.rs       the wire contract
 src/web/           the LAN phone client: a tiny HTTP server and one page
 src/link.rs        dials out to a relay and long-polls it (no switch yet)
 crates/dct-link/   the envelope the daemon and the relay share; no Request
-crates/dct-srv/    the relay. Only /live/* by default (--with-link adds the unauthenticated
-                   pairing routes, for local development). Phase one has no auth and no encryption, and
+crates/dct-srv/    the relay. Only /live/* and the public listing page / by default (--with-link adds
+                   the unauthenticated pairing routes, for local development; --publish-keys turns
+                   on publishing). Phase one has no auth and no encryption, and
                    refuses to bind anything but loopback
 ```
 
