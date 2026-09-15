@@ -468,17 +468,17 @@ async fn live_frame_route(
         .into_response())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublicTitle {
+    title: String,
+}
+
 /// `GET /live/{id}/lanes` 的答复：老师起的名字，不是会话标题或项目路径——
 /// 那两样一个字都不许上公网（整份 spec 的前提之一）。`viewers` 搭这班车
 /// 一起回，是因为学生页开场只该拉一次这条路径，之后人数跟着帧的节奏走，
 /// 不该为了一个数字单独起一条轮询。
 /// 这场直播公开着的话，公开标题另起一段——`title` 只在这里出现，观众页
 /// 用它跟自己已经知道的路名（`lanes`）分开显示。
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PublicTitle {
-    title: String,
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LiveLanesResponse {
     lanes: Vec<String>,
@@ -822,7 +822,16 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
     };
     match args.first().map(String::as_str) {
         Some("key") => {
-            let name = || args.get(2).cloned().ok_or_else(|| "缺少名字".to_string());
+            // `args.get(2)` 直接当名字用的话，`key add --file X`（漏了名字，
+            // `--file` 紧跟在 `add` 后面）会把 `--file` 当成密钥的名字，
+            // 而 `--file` 后面那个真正的文件路径反而没人管——过滤掉长得
+            // 像另一个 flag 的值，走到 `ok_or_else` 那句一样的「缺少名字」。
+            let name = || {
+                args.get(2)
+                    .filter(|n| !n.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| "缺少名字".to_string())
+            };
             match args.get(1).map(String::as_str) {
                 Some("add") => Ok(Cli::KeyAdd {
                     name: name()?,
@@ -1975,5 +1984,18 @@ mod tests {
             "管理命令必须写明 --file"
         );
         assert!(parse_cli(&a("--publish-keys")).is_err(), "参数缺值要报错");
+    }
+
+    /// T2：漏了名字直接写 `--file`（`key add --file X`）不该把 `--file`
+    /// 当成密钥的名字——那样一来真正的文件路径 `X` 就没人认领了，会往
+    /// `need_file` 里再吃一次 `--file` 之后的下一个词，拼出一把名叫
+    /// `"--file"` 的密钥。得报「缺少名字」，就像压根没写这个参数一样。
+    #[test]
+    fn key_add_without_a_name_does_not_treat_the_file_flag_as_the_name() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let err = parse_cli(&a("key add --file /k.json")).unwrap_err();
+        assert_eq!(err, "缺少名字", "{err}");
+        let err = parse_cli(&a("key revoke --file /k.json")).unwrap_err();
+        assert_eq!(err, "缺少名字", "{err}");
     }
 }
