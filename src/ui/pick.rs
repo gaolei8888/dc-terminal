@@ -474,10 +474,7 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
         // 唯一还能按的方向键就成了个死键。
         KeyCode::Left => {
             if p.browsing {
-                match p.cwd.parent().map(|x| x.to_path_buf()) {
-                    Some(parent) => p.browse_to(parent),
-                    None => p.back_to_recent(),
-                }
+                p.go_up();
             }
         }
         // `Enter` 和 `→` 落在同一个地方：这一屏上「往里走」和「就是它」
@@ -509,6 +506,8 @@ fn handle_pick_project(app: &mut App, key: KeyEvent) -> Result<()> {
                         &short_path(&dir.display().to_string()),
                     ));
                 }
+                // 跟 `←` 同一件事，落点也一样（见 `ProjectPicker::go_up`）。
+                PickRow::Up => p.go_up(),
                 PickRow::UseThis => {
                     let dir = p.cwd.clone();
                     if dir.is_dir() {
@@ -605,7 +604,8 @@ fn reset_cursor(p: &mut ProjectPicker) {
                 .position(|r| matches!(r, PickRow::New))
                 .unwrap_or(0)
     } else {
-        0
+        // 不是 0：浏览层的第 0 行是「上一级」，见 `ProjectPicker::home_index`。
+        p.home_index()
     };
     p.state.select(Some(landing));
     p.offset = 0;
@@ -926,6 +926,17 @@ fn row_item<'a>(
                 ));
             }
             ListItem::new(Line::from(spans))
+        }
+        // 「上一级」写上要回到的那个目录的名字，跟「就用这个文件夹 · tmp」一个
+        // 格式——光一个「上一级」说不清会落到哪儿。回到根目录时名字是空的，
+        // 就写整条路径（`/`）。
+        PickRow::Up => {
+            let parent = cwd.parent().unwrap_or(cwd);
+            let name = parent
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| parent.display().to_string());
+            action_item(format!("{} · {}", text(Key::GoUp, lang), truncate(&name, 24)))
         }
         // 「就用这个文件夹」把目录名再说一遍：翻了几层之后，屏幕上离这一行
         // 最近的路径在表头上，而用户按下去的后果是整个项目切过去。
@@ -1432,9 +1443,120 @@ mod tests {
         press(&mut app, KeyCode::Left);
         assert_eq!(picker(&app).cwd, root, "← 要回上一级");
 
-        press(&mut app, KeyCode::Down);
+        // 回来之后光标已经停在 outer 上（刚出来的那个），不用再往下找
         press(&mut app, KeyCode::Right);
         assert_eq!(picker(&app).cwd, root.join("outer"), "→ 也要走进去");
+    }
+
+    /// **浏览层列表里要有一行「上一级」。** 以前往上走只有 `←` 一条路，写在
+    /// 屏幕最底下的底栏里——而这一屏的规矩是「动作做成一行」：顶上钉着「就用
+    /// 这个文件夹」，底下钉着「新建项目…」，唯独往上走不是一行。离列表最近、
+    /// 最像「返回」的是左段那句「Esc 回最近」，它一步跳回最近项目，不是回上一级。
+    ///
+    /// 这一行写上父目录的名字，跟「就用这个文件夹 · tmp」一个格式。进一个
+    /// 目录之后光标**仍然**落在「就用这个文件夹」上，「进去、再按一下」的
+    /// 节奏不变。
+    #[test]
+    fn the_browsing_layer_offers_a_go_up_row_above_use_this_folder() {
+        let (_t, _g, mut app, root) = tree(&["proj/sub"]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Down); // proj
+        press(&mut app, KeyCode::Enter); // 进 proj
+
+        let p = picker(&app);
+        assert_eq!(p.rows().top, vec![PickRow::Up, PickRow::UseThis]);
+        assert_eq!(p.selected(), Some(PickRow::UseThis), "进目录的落点不能变");
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        // 去掉空白再比：中文是双宽字符，缓冲里每个字后面跟一个占位格。
+        let screen: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let parent = root.file_name().unwrap().to_string_lossy().to_string();
+        let want = format!("{}·{parent}", text(Key::GoUp, app.lang));
+        assert!(screen.contains(&want), "要写「{want}」：\n{screen}");
+    }
+
+    /// 在「上一级」那一行上按 `Enter` 就是往上走，而且**光标停在刚出来的
+    /// 那个文件夹上**——退一层多半是要去它隔壁，落回顶上就得从头往下数。
+    #[test]
+    fn going_up_through_the_row_lands_on_the_folder_we_came_out_of() {
+        let (_t, _g, mut app, root) = tree(&["a", "b/inner", "c"]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Down); // a
+        press(&mut app, KeyCode::Down); // b
+        press(&mut app, KeyCode::Enter); // 进 b
+        assert_eq!(picker(&app).cwd, root.join("b"));
+
+        press(&mut app, KeyCode::Up); // 从「就用这个文件夹」挪到「上一级」
+        assert_eq!(picker(&app).selected(), Some(PickRow::Up));
+        press(&mut app, KeyCode::Enter);
+
+        let p = picker(&app);
+        assert_eq!(p.cwd, root, "Enter 在「上一级」上要往上走");
+        assert!(
+            matches!(p.selected(), Some(PickRow::Dir(ref r)) if r.name == "b"),
+            "光标要停在刚出来的 b 上，实际 {:?}",
+            p.selected()
+        );
+    }
+
+    /// `←` 跟那一行是同一件事，落点也一样。
+    #[test]
+    fn left_lands_on_the_folder_we_came_out_of_too() {
+        let (_t, _g, mut app, root) = tree(&["a", "b/inner", "c"]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Down); // a
+        press(&mut app, KeyCode::Down); // b
+        press(&mut app, KeyCode::Down); // c
+        press(&mut app, KeyCode::Enter); // 进 c
+
+        press(&mut app, KeyCode::Left);
+        let p = picker(&app);
+        assert_eq!(p.cwd, root);
+        assert!(
+            matches!(p.selected(), Some(PickRow::Dir(ref r)) if r.name == "c"),
+            "光标要停在刚出来的 c 上，实际 {:?}",
+            p.selected()
+        );
+    }
+
+    /// 根目录没有上一级，就不写这一行——屏幕上不写按不动的东西。
+    #[test]
+    fn the_root_has_no_go_up_row() {
+        let (_t, _g, mut app, _root) = tree(&[]);
+        open_picker(&mut app, vec![], std::path::PathBuf::from("/"));
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        assert_eq!(picker(&app).rows().top, vec![PickRow::UseThis]);
+    }
+
+    /// 打字搜索时光标回到「就用这个文件夹」，**不是**顶上那行「上一级」：
+    /// 不然打几个字母再按 Enter，人就被带回上一层去了。
+    #[test]
+    fn typing_a_search_never_parks_the_cursor_on_go_up() {
+        let (_t, _g, mut app, root) = tree(&["alpha", "beta"]);
+        open_picker(&mut app, vec![], root.clone());
+        press(&mut app, KeyCode::Enter); // 翻文件夹找…
+        press(&mut app, KeyCode::Char('b'));
+        assert_ne!(picker(&app).selected(), Some(PickRow::Up));
+        press(&mut app, KeyCode::Enter);
+        assert_ne!(
+            picker_or_none(&app).map(|p| p.cwd),
+            Some(root.parent().unwrap().to_path_buf()),
+            "打完字按 Enter 不该往上走"
+        );
+    }
+
+    fn picker_or_none(app: &App) -> Option<ProjectPicker> {
+        match &app.view {
+            View::PickProject(p) => Some(p.clone()),
+            _ => None,
+        }
     }
 
     /// 走进一个目录之后，光标停在「就用这个文件夹」上——**进去、再按一下

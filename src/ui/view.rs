@@ -645,7 +645,9 @@ pub enum PickRow {
     Recent(String),
     /// 浏览层里的一个子目录
     Dir(DirRow),
-    /// 浏览层的第一行：就用现在停着的这个目录
+    /// 浏览层最顶上那行：回到上一级目录。根目录没有上一级，就没有这一行。
+    Up,
+    /// 浏览层的「就用现在停着的这个目录」
     UseThis,
     /// 最近层的动作行：翻文件夹去找
     Browse,
@@ -749,10 +751,20 @@ impl ProjectPicker {
     pub fn rows(&self) -> PickRows {
         if self.browsing {
             PickRows {
-                // 「就用这个文件夹」钉在最上面：翻到这儿来就是为了选它，
-                // 而按 Enter 走进一个目录之后光标正好停在这一行上——
-                // 「进去，再确认」是两下同一个键。
-                top: vec![PickRow::UseThis],
+                // 「上一级」钉在最顶上，对应文件管理器里 `..` 的位置。以前往上
+                // 走只有 `←`，写在屏幕最底下的底栏里，而这一屏别的动作都是
+                // 一行——唯独它不是，用户在列表里找不到回去的路。
+                //
+                // 「就用这个文件夹」紧跟在它下面：翻到这儿来就是为了选它，
+                // 而按 Enter 走进一个目录之后光标停在这一行上（`home_index`）
+                // ——「进去，再确认」仍然是两下同一个键。
+                top: self
+                    .cwd
+                    .parent()
+                    .map(|_| PickRow::Up)
+                    .into_iter()
+                    .chain([PickRow::UseThis])
+                    .collect(),
                 list: self.shown_entries().into_iter().map(PickRow::Dir).collect(),
                 // 新建项目落在**正翻着的这个目录**里，所以它属于这一层，
                 // 不只是最近那一层的入口。
@@ -781,6 +793,18 @@ impl ProjectPicker {
         self.state.selected().unwrap_or(0)
     }
 
+    /// 光标「回家」该落在哪一行：浏览层是「就用这个文件夹」，最近层是第一行。
+    ///
+    /// **不是 0**：浏览层的第 0 行是「上一级」。落在它上面的话，进一个目录、
+    /// 或者打几个字搜索之后顺手按 Enter，人就被带回上一层去了。
+    pub fn home_index(&self) -> usize {
+        self.rows()
+            .top
+            .iter()
+            .position(|r| matches!(r, PickRow::UseThis))
+            .unwrap_or(0)
+    }
+
     /// 翻到另一个目录去，并把光标收回「就用这个文件夹」那一行。
     pub fn browse_to(&mut self, dir: PathBuf) {
         self.entries = list_dirs(&dir);
@@ -788,8 +812,37 @@ impl ProjectPicker {
         self.browsing = true;
         // 搜索词是对着上一个目录打的，换了目录就不成立了
         self.filter.clear();
-        self.state.select(Some(0));
+        self.state.select(Some(self.home_index()));
         self.offset = 0;
+    }
+
+    /// 往上走一级，**光标停在刚出来的那个文件夹上**。`←` 和「上一级」那一行
+    /// 走的都是这里。
+    ///
+    /// 退一层多半是要去它隔壁：落回「就用这个文件夹」的话，得从头往下数到
+    /// 刚才那个位置。刚出来的那个目录不在列表里（比如它是 `node_modules`
+    /// 这种被滤掉的噪音目录）就退回平常的落点。
+    ///
+    /// 已经在根目录、没有上一级了，就退回最近那一层——`←` 和 `Esc` 是同一把
+    /// 梯子，走到头不能变成一个按下去没反应的死键。
+    pub fn go_up(&mut self) {
+        let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) else {
+            self.back_to_recent();
+            return;
+        };
+        let came_from = self
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string());
+        self.browse_to(parent);
+        let rows = self.rows();
+        if let Some(i) = came_from.and_then(|name| {
+            rows.list
+                .iter()
+                .position(|r| matches!(r, PickRow::Dir(d) if d.name == name))
+        }) {
+            self.state.select(Some(rows.top.len() + i));
+        }
     }
 
     /// 从浏览层退回最近那一层。`cwd` 留在原地——用户下次再按「浏览文件夹…」
@@ -1537,6 +1590,7 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
                 Some(PickRow::Recent(_)) => ("Enter", Key::OpenProject),
                 Some(PickRow::Dir(_)) => ("Enter", Key::EnterFolder),
                 Some(PickRow::UseThis) => ("Enter", Key::UseThisFolder),
+                Some(PickRow::Up) => ("Enter", Key::GoUp),
                 _ => ("Enter", Key::Confirm),
             });
             // `←` 只在翻文件夹那一层管用；最近那一层上它什么都不做，
@@ -2284,6 +2338,12 @@ mod tests {
             "「就用这个文件夹」那一行上该写「就用它」：{help}"
         );
         assert!(help.contains("← 上一级"), "这一层 `←` 管用，就得写：{help}");
+
+        // 光标停在「上一级」那一行上：`Enter` 写的也是「上一级」
+        browsing.state.select(Some(0));
+        assert_eq!(browsing.selected(), Some(PickRow::Up));
+        let help = help_of(&View::PickProject(browsing), Lang::Zh);
+        assert!(help.contains("Enter 上一级"), "「上一级」那一行上 Enter 就是往上走：{help}");
     }
 
     /// 反过来：光标真落在一个文件夹上时，`Enter` 写的是「进去」。这一半
@@ -2295,7 +2355,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let mut p = ProjectPicker::new(Vec::new(), dir.path().to_path_buf());
         p.browse_to(dir.path().to_path_buf());
-        p.state.select(Some(1)); // 0 是「就用这个文件夹」，1 才是 sub
+        p.state.select(Some(2)); // 0 是「上一级」，1 是「就用这个文件夹」，2 才是 sub
         assert!(
             matches!(p.selected(), Some(PickRow::Dir(_))),
             "光标没落在目录上"
