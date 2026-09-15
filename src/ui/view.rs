@@ -1345,6 +1345,9 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 这一页没有一个固定的「上一层」（设置页），所以走跟 `Web`
         // 一样落到默认分支的那句「回看板」，这里显式写出来只是让读代码的人
         // 不用去猜通配分支答的是什么。
+        // 输入行开着的时候 Esc 是「取消这次填」，不是「离开整个面板」——
+        // 跟 `Phone { .. }` 编辑态、`Pair` 输入态一个道理。
+        View::Live { input: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
         View::Live { .. } => text(Key::BackToBoard, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
@@ -1731,6 +1734,12 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
         // 直播面板：`c`/`r`/`s` 只在真的在播（`live_on`）时才写得出来——
         // 没有链接可复制/换，没有播可停，写出来就是三个按下去没反应的键，
         // 犯的是这一页别处反复防的那条错。空格和 Esc 不论在不在播都能按。
+        // 输入行开着的时候别再画 `c`/`r`/`s`/空格那一套——同 `Phone { .. }`
+        // 编辑态那条「底栏说什么就得真能做到什么」的规矩，`Enter` 提交，
+        // `Esc` 取消，别的键这会儿都只是敲进输入框的字符。
+        View::Live { input: Some(_), .. } => {
+            help_items(&[("Enter", Key::Confirm), ("Esc", Key::Cancel)], lang)
+        }
         View::Live { .. } => {
             let mut items: Vec<(&'static str, Key)> = Vec::new();
             items.push((" ", Key::LiveToggleStaged));
@@ -1738,7 +1747,9 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
                 items.push(("c", Key::LiveCopyLink));
                 items.push(("r", Key::LiveNewLink));
                 items.push(("s", Key::LiveStop));
+                items.push(("p", Key::LivePublishToggle));
             }
+            items.push(("K", Key::LiveChangeKey));
             items.push(("Esc", Key::BackToBoard));
             help_items(&items, lang)
         }
@@ -1858,6 +1869,28 @@ mod tests {
     fn the_lan_toggle_is_not_offered_while_typing_a_token() {
         let bar = help_for_phone_page(true);
         assert!(!bar.contains('w'), "打字的时候底栏还写着 w：{bar}");
+    }
+
+    /// 直播面板的输入行开着的时候，底栏只写 `Enter`/`Esc`——`c`/`r`/`s`
+    /// 这会儿按下去都只是敲进输入框的字符，写出来就是骗人（同「修复 6」
+    /// 那条规矩）。
+    #[test]
+    fn the_live_input_line_shrinks_the_help_bar_to_confirm_and_cancel() {
+        let view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Title("第3课".into())),
+        };
+        let ctx = HelpCtx {
+            live_on: true,
+            ..on_a_session()
+        };
+        let items = idle_help(&view, Lang::Zh, ctx);
+        let keys: Vec<&str> = items.iter().map(|i| i.key).collect();
+        assert!(keys.contains(&"Enter"), "{keys:?}");
+        assert!(keys.contains(&"Esc"), "{keys:?}");
+        for absent in ["c", "r", "s", " ", "p", "K"] {
+            assert!(!keys.contains(&absent), "{absent} 不该出现：{keys:?}");
+        }
     }
 
     fn help_for_phone_page(editing: bool) -> String {

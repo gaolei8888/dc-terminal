@@ -462,8 +462,21 @@ fn unpublish(app: &mut App) {
     }
 }
 
+/// 正在填的那一行拼成要画的字。密钥永远打点，绝不把 `buf` 本身画出来——
+/// 屏幕上的字符会被投影、录屏、旁人瞥到。
+fn input_line(input: &Option<LiveInput>, lang: Lang) -> Option<String> {
+    input.as_ref().map(|input| match input {
+        LiveInput::Title(buf) => format!("{}{buf}▏", text(Key::LiveTitlePrompt, lang)),
+        LiveInput::Key { buf, .. } => format!(
+            "{}{}▏",
+            text(Key::LiveKeyPrompt, lang),
+            "•".repeat(buf.chars().count())
+        ),
+    })
+}
+
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Live { state, .. } = app.view.clone() else {
+    let View::Live { state, input } = app.view.clone() else {
         return;
     };
     let rule = if app.connected { dim() } else { danger() };
@@ -499,8 +512,17 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 dim(),
             ))),
         }
+        if let Some(line) = input_line(&input, lang) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(line, accent())));
+        }
     } else {
         lines.push(Line::from(text(Key::LiveOffLine, lang)));
+        // 没在播也能按 `K` 换密钥（下次开播用）；输入行画在最上面，
+        // 免得跟下面的会话列表混在一起看不清在填什么。
+        if let Some(line) = input_line(&input, lang) {
+            lines.push(Line::from(Span::styled(line, accent())));
+        }
     }
 
     lines.push(Line::from(""));
@@ -1057,5 +1079,38 @@ mod tests {
         press_live(&mut app, KeyCode::Char('p'));
         assert_eq!(app.live.public, LivePublic::Private);
         assert!(matches!(&app.view, View::Live { input: None, .. }));
+    }
+
+    /// 正在填的密钥不许出现在屏幕上。
+    #[test]
+    fn the_key_being_typed_is_never_drawn() {
+        let (mut app, _dir) = App::test_app();
+        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        app.view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Key {
+                buf: "SUPER-SECRET".into(),
+                then_publish: None,
+            }),
+        };
+        let screen = screen_of(&mut app, 100, 40);
+        assert!(!screen.contains("SUPER-SECRET"), "{screen}");
+        assert!(screen.contains("•"), "要画打点，让人知道打进去了：{screen}");
+    }
+
+    /// 标题输入行画出来，用户看得见自己在打什么。
+    #[test]
+    fn the_title_being_typed_is_drawn() {
+        let (mut app, _dir) = App::test_app();
+        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        app.view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Title("第3课".into())),
+        };
+        let screen: String = screen_of(&mut app, 100, 40)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(screen.contains("第3课"), "{screen}");
     }
 }
