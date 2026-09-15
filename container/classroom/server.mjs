@@ -143,10 +143,14 @@ export class Classroom {
     return {url: info.url, viewers: info.viewers, staged: info.staged, readiness: info.readiness, public: info.public && info.public.Listed ? {title: info.public.Listed.title} : null};
   }
   // 对中转公开 / 取消公开这一场。凭证由学生工作区的守护进程签发，发布密钥只在管理台进程里。
-  async relayPublic(w, method, title) {
+  //
+  // `expectId`：自愈时传入刚比对过的房间号。中间换了一场就不动它——新的一场
+  // 要老师重新点公开，下一轮自愈会按房间号变了清掉记录。
+  async relayPublic(w, method, title, expectId) {
     const status = await this.liveStatus(w);
     if (!status) throw fail(409, '这个工作区现在没在直播');
     const id = new URL(status.url).pathname.split('/').pop();
+    if (expectId !== undefined && id !== expectId) throw fail(409, '这场直播已经换了一场');
     const answer = await this.liveRpc(w, 'LivePublishGrant');
     const grant = answer.LiveGrant;
     if (typeof grant !== 'string') throw fail(409, '这个工作区的 dct 版本还不支持，请先停止它再启动（会换成新镜像）');
@@ -230,7 +234,7 @@ export class Classroom {
         }
         if (listed.has(id)) continue;
         try {
-          await this.relayPublic(w, 'PUT', title);
+          await this.relayPublic(w, 'PUT', title, id);
           await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title) delete w.livePublicError; });
         } catch (e) {
           if (e.relayStatus === 403) {
