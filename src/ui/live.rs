@@ -17,11 +17,11 @@ use ratatui::prelude::*;
 use ratatui::widgets::{ListState, Paragraph, Wrap};
 
 use crate::i18n::{msg, text, Key, Lang};
-use crate::proto::{LiveInfo, LiveReadiness, Request, Response};
+use crate::proto::{LiveInfo, LivePublic, LiveReadiness, Request, Response};
 use crate::session::SessionInfo;
 
 use super::app::App;
-use super::view::{is_plain_key, View};
+use super::view::{is_plain_key, LiveInput, View};
 use super::widgets::{session_label, Msg};
 use super::{accent, danger, dim, move_sel_n};
 
@@ -41,8 +41,22 @@ pub(crate) fn is_live(info: &LiveInfo) -> bool {
 /// `readiness` 不是 `Ready` 的时候要如实说：中转还没认得这场直播的时候，
 /// 这句话绝不能看着像「一切正常」——那正是老师会把一条当时打不开的链接
 /// 发给全班的那一刻。
+///
+/// `info.public` 另外决定文案本体是「正在直播」还是「正在公开直播 ·
+/// 标题」——公开与否跟中转是否就绪是两件独立的事，所以先按 `public`
+/// 选出带不带标题的那句底稿，再各自叠一句后缀，两条后缀能同时出现。
 pub(crate) fn live_banner(info: &LiveInfo, lang: Lang) -> String {
-    let base = msg::live_on_air(lang, info.staged.len(), info.viewers);
+    let base = match &info.public {
+        LivePublic::Listed { title } | LivePublic::Pending { title } | LivePublic::Failed { title, .. } => {
+            msg::live_on_air_public(lang, title, info.staged.len(), info.viewers)
+        }
+        LivePublic::Private => msg::live_on_air(lang, info.staged.len(), info.viewers),
+    };
+    let base = match &info.public {
+        LivePublic::Pending { .. } => format!("{base} · {}", text(Key::LivePublicPending, lang)),
+        LivePublic::Failed { reason, .. } => format!("{base} · {}", msg::live_publish_failed(lang, reason)),
+        _ => base,
+    };
     match &info.readiness {
         LiveReadiness::Ready => base,
         LiveReadiness::Pending => format!("{base} · {}", text(Key::LiveConnectingToRelay, lang)),
@@ -54,8 +68,13 @@ pub(crate) fn live_banner(info: &LiveInfo, lang: Lang) -> String {
 
 /// 这一行常驻提示该用什么颜色画：`Ready` 是安心的强调色，`Pending` 只是
 /// 平常字（还没到出错的地步，但也不该看着跟 `Ready` 一样安心），
-/// `Failed` 是红——它字面上就是一句错误。
+/// `Failed` 是红——它字面上就是一句错误。公开失败（`info.public` 是
+/// `Failed`）同样是红，且优先于 `readiness` 判断：中转明明就绪，但公开
+/// 没成功，这一行也不该看着安心。
 pub(crate) fn banner_style(info: &LiveInfo) -> Style {
+    if matches!(info.public, LivePublic::Failed { .. }) {
+        return danger();
+    }
     match &info.readiness {
         LiveReadiness::Ready => accent(),
         LiveReadiness::Pending => dim(),
@@ -191,7 +210,7 @@ pub(crate) fn open(app: &mut App) {
     if !current_project_sessions(app).is_empty() {
         state.select(Some(0));
     }
-    app.view = View::Live { state };
+    app.view = View::Live { state, input: None };
 }
 
 /// 空格/`r` 共用的落地：把新的上架名单发给守护进程，按回答更新
@@ -301,9 +320,16 @@ fn stop_live(app: &mut App) {
 /// 末尾还有一段清理陈旧 `message` 的逻辑，跳过它会让一句普通反馈盖掉
 /// 屏幕上唯一的出路。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let View::Live { mut state } = app.view.clone() else {
+    let View::Live { mut state, input } = app.view.clone() else {
         return Ok(());
     };
+    // 有输入行开着的时候，输入行吃掉所有按键——不落到下面那个 match
+    // 里，否则输入标题的时候按空格会把光标下那行会话上/下架。
+    if let Some(field) = input {
+        let next = edit_live_input(app, field, key);
+        app.view = View::Live { state, input: next };
+        return Ok(());
+    }
     match key.code {
         KeyCode::Esc => {
             app.view = super::home_view(app);
@@ -327,14 +353,149 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('r') if is_plain_key(&key) && is_live(&app.live) => regenerate_link(app),
         KeyCode::Char('s') if is_plain_key(&key) && is_live(&app.live) => stop_live(app),
+        // 公开/取消公开。已经公开就直接下架；没公开就先要个标题——密钥
+        // 缺不缺留给 `publish` 去发现，界面这里不用先猜。
+        KeyCode::Char('p') if is_plain_key(&key) && is_live(&app.live) => {
+            if matches!(app.live.public, LivePublic::Private) {
+                app.view = View::Live {
+                    state,
+                    input: Some(LiveInput::Title(app.last_public_title.clone())),
+                };
+                return Ok(());
+            }
+            unpublish(app);
+        }
+        // 单独开一条填密钥的路：不经过「先按 p」也能直接改密钥。
+        KeyCode::Char('K') if is_plain_key(&key) => {
+            app.view = View::Live {
+                state,
+                input: Some(LiveInput::Key {
+                    buf: String::new(),
+                    then_publish: None,
+                }),
+            };
+            return Ok(());
+        }
         _ => {}
     }
-    app.view = View::Live { state };
+    app.view = View::Live { state, input: None };
     Ok(())
 }
 
+/// 输入行上的一次按键：编辑缓冲区，或者在 Enter/Esc 时了结这一行。
+/// 返回 `None` 表示输入行该关掉了；`Some` 表示还要继续输（或者重新弹回来，
+/// 比如空标题）。
+fn edit_live_input(app: &mut App, field: LiveInput, key: KeyEvent) -> Option<LiveInput> {
+    match key.code {
+        KeyCode::Esc => None,
+        KeyCode::Backspace => Some(match field {
+            LiveInput::Title(mut t) => {
+                t.pop();
+                LiveInput::Title(t)
+            }
+            LiveInput::Key { mut buf, then_publish } => {
+                buf.pop();
+                LiveInput::Key { buf, then_publish }
+            }
+        }),
+        KeyCode::Char(c) if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            Some(match field {
+                LiveInput::Title(mut t) => {
+                    t.push(c);
+                    LiveInput::Title(t)
+                }
+                LiveInput::Key { mut buf, then_publish } => {
+                    buf.push(c);
+                    LiveInput::Key { buf, then_publish }
+                }
+            })
+        }
+        KeyCode::Enter => match field {
+            LiveInput::Title(t) => {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    app.message = Msg::err(text(Key::LiveTitleEmpty, app.lang).into());
+                    return Some(LiveInput::Title(t));
+                }
+                publish(app, trimmed.to_string())
+            }
+            LiveInput::Key { buf, then_publish } => {
+                match app.client().and_then(|c| {
+                    c.call(Request::SetSecret {
+                        profile: crate::secrets::LIVE_PUBLISH_KEY.into(),
+                        value: buf,
+                    })
+                }) {
+                    Ok(Response::Ok) => {
+                        app.message = text(Key::LiveKeySaved, app.lang).into();
+                        then_publish.and_then(|t| publish(app, t))
+                    }
+                    _ => {
+                        app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
+                        None
+                    }
+                }
+            }
+        },
+        _ => Some(field),
+    }
+}
+
+/// 请求公开。守护进程如果说密钥没配，界面就地转去填密钥、记下这次的
+/// 标题，填完接着公开——用户不用把这次公开重新按一遍。
+fn publish(app: &mut App, title: String) -> Option<LiveInput> {
+    match app
+        .client()
+        .and_then(|c| c.call(Request::LivePublish { title: title.clone() }))
+    {
+        Ok(Response::Live(info)) => {
+            app.live = info;
+            app.last_public_title = title;
+            None
+        }
+        Ok(Response::Error(crate::proto::ErrorCode::LivePublishKeyMissing)) => {
+            Some(LiveInput::Key {
+                buf: String::new(),
+                then_publish: Some(title),
+            })
+        }
+        Ok(Response::Error(e)) => {
+            app.message = Msg::err(msg::error(app.lang, &e));
+            None
+        }
+        _ => {
+            app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
+            None
+        }
+    }
+}
+
+/// 取消公开。
+fn unpublish(app: &mut App) {
+    match app.client().and_then(|c| c.call(Request::LiveUnpublish)) {
+        Ok(Response::Live(info)) => {
+            app.live = info;
+            app.message = text(Key::LiveUnpublished, app.lang).into();
+        }
+        _ => app.message = Msg::err(text(Key::RequestFailed, app.lang).into()),
+    }
+}
+
+/// 正在填的那一行拼成要画的字。密钥永远打点，绝不把 `buf` 本身画出来——
+/// 屏幕上的字符会被投影、录屏、旁人瞥到。
+fn input_line(input: &Option<LiveInput>, lang: Lang) -> Option<String> {
+    input.as_ref().map(|input| match input {
+        LiveInput::Title(buf) => format!("{}{buf}▏", text(Key::LiveTitlePrompt, lang)),
+        LiveInput::Key { buf, .. } => format!(
+            "{}{}▏",
+            text(Key::LiveKeyPrompt, lang),
+            "•".repeat(buf.chars().count())
+        ),
+    })
+}
+
 pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let View::Live { state } = app.view.clone() else {
+    let View::Live { state, input } = app.view.clone() else {
         return;
     };
     let rule = if app.connected { dim() } else { danger() };
@@ -370,8 +531,17 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 dim(),
             ))),
         }
+        if let Some(line) = input_line(&input, lang) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(line, accent())));
+        }
     } else {
         lines.push(Line::from(text(Key::LiveOffLine, lang)));
+        // 没在播也能按 `K` 换密钥（下次开播用）；输入行画在最上面，
+        // 免得跟下面的会话列表混在一起看不清在填什么。
+        if let Some(line) = input_line(&input, lang) {
+            lines.push(Line::from(Span::styled(line, accent())));
+        }
     }
 
     lines.push(Line::from(""));
@@ -403,7 +573,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::LiveFailure;
+    use crate::proto::{LiveFailure, LivePublic};
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -418,13 +588,29 @@ mod tests {
             staged,
             viewers,
             readiness,
+            public: LivePublic::Private,
         }
+    }
+
+    #[test]
+    fn the_banner_says_public_with_the_title() {
+        let mut live = info(vec![(1, "一".into())], 7, LiveReadiness::Ready);
+        live.public = LivePublic::Listed { title: "第3课".into() };
+        let s = live_banner(&live, Lang::Zh);
+        assert!(s.contains("正在公开直播") && s.contains("第3课") && s.contains('7'), "{s}");
+
+        live.public = LivePublic::Failed { title: "第3课".into(), reason: crate::proto::LiveFailure::Refused(401) };
+        assert!(live_banner(&live, Lang::Zh).contains("吊销"), "失败原因要说出来");
+
+        live.public = LivePublic::Private;
+        assert!(!live_banner(&live, Lang::Zh).contains("公开"), "私密直播不许说公开");
     }
 
     /// 一个只答 `LiveStatus` 的假守护进程：回它手里此刻那份 `LiveInfo`，并记下
     /// 被问了几次。测试改 `answer` 就是「管理台那边刚开播/停播了」。
     fn fake_live_daemon(
         answer: std::sync::Arc<std::sync::Mutex<LiveInfo>>,
+        has_key: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> (
         std::path::PathBuf,
         tempfile::TempDir,
@@ -437,6 +623,7 @@ mod tests {
         let listener = crate::sys::ipc::bind_private(&sock).unwrap();
         let asked: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
         let asked2 = asked.clone();
+        let has_key2 = has_key.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -453,6 +640,26 @@ mod tests {
                         Request::LiveStatus => {
                             asked2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             Response::Live(answer.lock().unwrap().clone())
+                        }
+                        Request::LivePublish { title } => {
+                            if has_key2.load(std::sync::atomic::Ordering::SeqCst) {
+                                let mut info = answer.lock().unwrap().clone();
+                                info.public = LivePublic::Pending { title };
+                                Response::Live(info)
+                            } else {
+                                Response::Error(crate::proto::ErrorCode::LivePublishKeyMissing)
+                            }
+                        }
+                        Request::SetSecret { profile, .. }
+                            if profile == crate::secrets::LIVE_PUBLISH_KEY =>
+                        {
+                            has_key2.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Response::Ok
+                        }
+                        Request::LiveUnpublish => {
+                            let mut info = answer.lock().unwrap().clone();
+                            info.public = LivePublic::Private;
+                            Response::Live(info)
                         }
                         _ => Response::Ok,
                     };
@@ -473,6 +680,7 @@ mod tests {
             staged: Vec::new(),
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         }
     }
 
@@ -489,7 +697,8 @@ mod tests {
     #[test]
     fn a_broadcast_started_elsewhere_reaches_the_banner_even_inside_a_session() {
         let answer = std::sync::Arc::new(std::sync::Mutex::new(not_live()));
-        let (sock, _fake, asked) = fake_live_daemon(answer.clone());
+        let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sock, _fake, asked) = fake_live_daemon(answer.clone(), has_key);
         let (mut app, _dir) = App::test_app();
         app.client = Some(crate::client::Client::connect(&sock).unwrap());
         app.connected = true;
@@ -636,6 +845,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
         app.live = LiveInfo {
             id: "abc".into(),
@@ -644,6 +854,7 @@ mod tests {
             staged: vec![],
             viewers: 3,
             readiness: LiveReadiness::Ready,
+            public: LivePublic::Private,
         };
 
         let screen = screen_of(&mut app, 80, 40);
@@ -660,6 +871,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
         app.live = LiveInfo {
             id: "abc".into(),
@@ -668,6 +880,7 @@ mod tests {
             staged: vec![],
             viewers: 0,
             readiness: LiveReadiness::Ready,
+            public: LivePublic::Private,
         };
 
         let screen = screen_of(&mut app, 20, 20);
@@ -685,6 +898,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
 
         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
@@ -698,6 +912,7 @@ mod tests {
         let (mut app, _dir) = App::test_app();
         app.view = View::Live {
             state: ListState::default(),
+            input: None,
         };
 
         for code in [KeyCode::Char('c'), KeyCode::Char('r'), KeyCode::Char('s')] {
@@ -731,6 +946,7 @@ mod tests {
             staged: vec![],
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         };
         let req = staging_request(&off, vec![(1, "前端".into())], false);
         assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
@@ -791,8 +1007,143 @@ mod tests {
             staged: vec![],
             viewers: 0,
             readiness: LiveReadiness::Pending,
+            public: LivePublic::Private,
         };
         assert!(!is_live(&off));
         assert!(is_live(&info(vec![], 0, LiveReadiness::Ready)));
+    }
+
+    fn press_live(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+    }
+
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press_live(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn publishing_asks_for_a_title_then_a_key_when_missing_then_continues() {
+        let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(info(
+            vec![(1, "一".into())],
+            0,
+            LiveReadiness::Ready,
+        )));
+        let (sock, _fake, _asked) = fake_live_daemon(answer, has_key.clone());
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.connected = true;
+        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        app.view = View::Live {
+            state: ListState::default(),
+            input: None,
+        };
+        press_live(&mut app, KeyCode::Char('p'));
+        assert!(matches!(
+            &app.view,
+            View::Live {
+                input: Some(LiveInput::Title(_)),
+                ..
+            }
+        ));
+        type_text(&mut app, "第3课");
+        press_live(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.view,
+            View::Live {
+                input: Some(LiveInput::Key { then_publish: Some(t), .. }),
+                ..
+            } if t == "第3课"
+        ));
+        type_text(&mut app, "the-key");
+        press_live(&mut app, KeyCode::Enter);
+        assert!(
+            has_key.load(std::sync::atomic::Ordering::SeqCst),
+            "密钥要存进守护进程"
+        );
+        assert!(
+            matches!(app.live.public, LivePublic::Pending { .. }),
+            "存完密钥要自动继续公开"
+        );
+        assert!(matches!(&app.view, View::Live { input: None, .. }));
+        assert_eq!(app.last_public_title, "第3课");
+    }
+
+    #[test]
+    fn an_empty_title_is_refused_on_the_spot() {
+        let (mut app, _dir) = App::test_app();
+        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        app.view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Title("   ".into())),
+        };
+        press_live(&mut app, KeyCode::Enter);
+        assert!(app.message.error, "空标题要当场说");
+        assert!(matches!(
+            &app.view,
+            View::Live {
+                input: Some(LiveInput::Title(_)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn p_on_a_public_live_unpublishes() {
+        let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(info(
+            vec![(1, "一".into())],
+            0,
+            LiveReadiness::Ready,
+        )));
+        let (sock, _fake, _asked) = fake_live_daemon(answer, has_key);
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.connected = true;
+        let mut live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        live.public = LivePublic::Listed { title: "课".into() };
+        app.live = live;
+        app.view = View::Live {
+            state: ListState::default(),
+            input: None,
+        };
+        press_live(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.live.public, LivePublic::Private);
+        assert!(matches!(&app.view, View::Live { input: None, .. }));
+    }
+
+    /// 正在填的密钥不许出现在屏幕上。
+    #[test]
+    fn the_key_being_typed_is_never_drawn() {
+        let (mut app, _dir) = App::test_app();
+        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        app.view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Key {
+                buf: "SUPER-SECRET".into(),
+                then_publish: None,
+            }),
+        };
+        let screen = screen_of(&mut app, 100, 40);
+        assert!(!screen.contains("SUPER-SECRET"), "{screen}");
+        assert!(screen.contains("•"), "要画打点，让人知道打进去了：{screen}");
+    }
+
+    /// 标题输入行画出来，用户看得见自己在打什么。
+    #[test]
+    fn the_title_being_typed_is_drawn() {
+        let (mut app, _dir) = App::test_app();
+        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
+        app.view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Title("第3课".into())),
+        };
+        let screen: String = screen_of(&mut app, 100, 40)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(screen.contains("第3课"), "{screen}");
     }
 }

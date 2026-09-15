@@ -680,13 +680,19 @@ your terminal.**
 - **The screen keeps saying you are live**: `● live · 2 lanes · 7 watching`, not
   dismissible, and it outranks every other bar message. The dangerous failure was
   never a leaked link — it's forgetting you are broadcasting.
+- **Publish to a fixed address**: press `p` in the panel and give it a title; the session appears on the
+  relay's public list, watchable by anyone without a link. The first time you'll be asked for the public
+  live key your operator issued (`K` changes it later). Press `p` again to unpublish; private links keep
+  working. While public, the bar reads "● LIVE PUBLICLY · <title>".
 - Changing what's staged keeps the link; `r` is what mints a new one and kills the
   old immediately. After you stop, the student page says the session has ended.
 - The QR code on the panel encodes the **full link, token and all** — students
   have to scan it. So don't project the live panel itself.
 - Before putting the relay on the public internet, read
   [`docs/deploy-live-relay.md`](docs/deploy-live-relay.md): the reverse proxy must
-  allow **`/live/*` and nothing else**.
+  allow **`/live/*` and the public listing page `/`, and nothing else**. To enable
+  "publish to a fixed address," the operator also issues and installs a publish
+  key with `dct-srv key add`/`--publish-keys`.
 
 ## Colours
 
@@ -848,8 +854,9 @@ src/proto.rs       the wire contract
 src/web/           the LAN phone client: a tiny HTTP server and one page
 src/link.rs        dials out to a relay and long-polls it (no switch yet)
 crates/dct-link/   the envelope the daemon and the relay share; no Request
-crates/dct-srv/    the relay. Only /live/* by default (--with-link adds the unauthenticated
-                   pairing routes, for local development). Phase one has no auth and no encryption, and
+crates/dct-srv/    the relay. Only /live/* and the public listing page / by default (--with-link adds
+                   the unauthenticated pairing routes, for local development; --publish-keys turns
+                   on publishing). Phase one has no auth and no encryption, and
                    refuses to bind anything but loopback
 ```
 

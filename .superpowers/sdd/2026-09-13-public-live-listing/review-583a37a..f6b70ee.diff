@@ -1,0 +1,1111 @@
+# Review package: 583a37a..HEAD
+
+## Commits
+f6b70ee feat(proto): protocol 19 carries the public live state, publish requests and grant
+
+## Files changed
+ src/daemon.rs  |  12 +++++++
+ src/i18n.rs    | 111 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ src/live.rs    |   6 +++-
+ src/proto.rs   | 104 +++++++++++++++++++++++++++++++++++++++++++++++++----
+ src/secrets.rs |   4 +++
+ src/ui/app.rs  |   1 +
+ src/ui/live.rs |   8 ++++-
+ src/ui/mod.rs  |   2 ++
+ 8 files changed, 238 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 358ddf6..106d1df 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -1036,20 +1036,32 @@ fn handle(
+         // （`ui::live::stop_live`）只认 `Response::Live(info)`——它要拿这份
+         // 空状态把 `App::live` 清掉，那行压过一切的「● 正在直播」才会消失。
+         // 答 `Ok` 的话它落进 `_ =>` 分支：直播真的停了，屏幕却弹「请求失败」
+         // 并且继续常驻「正在直播」——屏幕说在播而其实没播，正是 spec 点名
+         // 的最危险失败模式的镜像，下一次就没人信那行字了。
+         Request::LiveStop => {
+             live.stop();
+             Ok(Response::Live(live.info()))
+         }
+         Request::LiveStatus => Ok(Response::Live(live.info())),
++        // TODO(Task 7): 这三条眼下只是让协议 19 能编译过——真正的公开/取消
++        // 公开/发凭证逻辑（读写 `secrets::LIVE_PUBLISH_KEY`、打
++        // `PUT/DELETE /live/{id}/public`）在 Task 7 补上，届时这三支会被替换掉。
++        Request::LivePublish { title: _ } => Ok(Response::Error(ErrorCode::Internal(
++            "LivePublish not implemented yet".into(),
++        ))),
++        Request::LiveUnpublish => Ok(Response::Error(ErrorCode::Internal(
++            "LiveUnpublish not implemented yet".into(),
++        ))),
++        Request::LivePublishGrant => Ok(Response::Error(ErrorCode::Internal(
++            "LivePublishGrant not implemented yet".into(),
++        ))),
+     };
+     r.unwrap_or_else(|e| Response::Error(to_code(e)))
+ }
+ 
+ /// 开一场直播：把 `ids` 跟 `names` 拼成 `(id, name)`。`ids`/`names` 条数
+ /// 对不上直接拒绝：见 `staging_carries_one_name_per_session` 上的注释，
+ /// 这不是可以将就的输入。
+ ///
+ /// **`ids` 里有 `mgr` 不认识的会话就整体拒绝，不静默丢弃。** 静默丢的话，
+ /// 老师上架了三路、屏幕上却只显示两路在播，而他不会知道第三路去哪了——
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 9519ecb..813249c 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -245,20 +245,36 @@ pub enum Key {
+     /// `c` 按下去之后的提示——**不许打包票说复制成功了**。OSC 52 是单向
+     /// 的转义序列，终端收没收、系统剪贴板真的变没变，dct 这边永远拿不到
+     /// 回执；老终端、某些 ssh/tmux 中转会原样吞掉它。说了「已复制」而
+     /// 剪贴板其实没变，老师会把剪贴板里的旧内容当成链接发给全班——这比
+     /// 不提供复制更糟。所以这句话只说「已经发给终端了」，并且指一条不靠
+     /// 剪贴板的退路：屏幕上那块二维码。也**不能把链接本身回显在这句话
+     /// 里**——那正是复制这一步要避免的事。
+     LiveLinkCopied,
+     /// `s` 停播之后的确认。
+     LiveStoppedMessage,
++    /// `p` 键：把这场直播加进/撤出公开列表。
++    LivePublishToggle,
++    /// `K` 键：换一把公开直播密钥（管理台重新发的那把）。
++    LiveChangeKey,
++    /// 公开前先问标题时那一行提示。
++    LiveTitlePrompt,
++    /// 第一次公开、或者密钥不对时，问密钥的那一行提示。
++    LiveKeyPrompt,
++    /// 已经发出公开请求、中转还没答应之前的过渡态提示。
++    LivePublicPending,
++    /// 密钥填完存下去之后的确认。
++    LiveKeySaved,
++    /// `p` 撤出公开列表之后的确认。
++    LiveUnpublished,
++    /// 标题输入框留空就按确认时的提示。
++    LiveTitleEmpty,
+     /// 手机端画面上那两个字号按钮的名字。**图标也要有名字**——读屏软件
+     /// 念不出「A−」，而手机上读屏用户很多（同网页里 `back` 那一条）。
+     TextSmaller,
+     TextBigger,
+     /// 手机端那个「用键盘打字」开关的名字。接了实体键盘（iPad + 妙控键盘、
+     /// 或者随便一个蓝牙键盘）之后，人会本能地直接打字，而不是先点那个单行框。
+     KeyboardCapture,
+     // —— 手机通知页 ——
+     /// 还没填过令牌
+     PhoneOffLine,
+@@ -731,20 +747,28 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+             lang,
+             en: "No sessions in this project yet — open one first",
+             zh: "这个项目还没有会话——先开一个",
+         ),
+         LiveLinkCopied => t!(
+             lang,
+             en: "Sent to the terminal's clipboard — if it did not take, scan the code above instead",
+             zh: "已发给终端的剪贴板——若终端不支持，请扫上面的二维码",
+         ),
+         LiveStoppedMessage => t!(lang, en: "Stopped the broadcast", zh: "已停播"),
++        LivePublishToggle => t!(lang, en: "p public/private", zh: "公开/取消公开"),
++        LiveChangeKey => t!(lang, en: "K change key", zh: "换公开密钥"),
++        LiveTitlePrompt => t!(lang, en: "Public title: ", zh: "公开标题："),
++        LiveKeyPrompt => t!(lang, en: "Public live key: ", zh: "公开直播密钥："),
++        LivePublicPending => t!(lang, en: "Making it public…", zh: "正在公开…"),
++        LiveKeySaved => t!(lang, en: "Public live key saved", zh: "公开直播密钥已保存"),
++        LiveUnpublished => t!(lang, en: "No longer public", zh: "已取消公开"),
++        LiveTitleEmpty => t!(lang, en: "The title cannot be empty", zh: "标题不能为空"),
+         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
+         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
+         PhoneReconnectingLine => t!(
+             lang,
+             en: "Reconnecting, one moment",
+             zh: "正在重新接上，请稍候",
+         ),
+         PhoneBrokenLine => t!(
+             lang,
+             en: "Cannot reach the phone notification service right now",
+@@ -1315,20 +1339,72 @@ pub mod msg {
+     /// 是整个功能最重要的一块文案**——不带人数的话，老师看不出这行字是
+     /// 「活的」还是昨天就一直挂在那儿的死文案（见 `ui::live` 的文档注释）。
+     pub fn live_on_air(lang: Lang, routes: usize, viewers: u32) -> String {
+         t!(
+             lang,
+             en: format!("\u{25cf} LIVE \u{b7} {routes} lane(s) \u{b7} {viewers} watching"),
+             zh: format!("\u{25cf} 正在直播 \u{b7} {routes} 路 \u{b7} {viewers} 人在看"),
+         )
+     }
+ 
++    /// 同上，但这场直播已经公开上了列表——多带一句标题，让老师一眼确认
++    /// 「公开的是哪一场」。
++    pub fn live_on_air_public(lang: Lang, title: &str, routes: usize, viewers: u32) -> String {
++        t!(
++            lang,
++            en: format!("\u{25cf} LIVE PUBLICLY \u{b7} {title} \u{b7} {routes} lane(s) \u{b7} {viewers} watching"),
++            zh: format!("\u{25cf} 正在公开直播 \u{b7} {title} \u{b7} {routes} 路 \u{b7} {viewers} 人在看"),
++        )
++    }
++
++    /// 公开失败的整句话。401/403/413/429 各有一句人话，别的码照实报出来。
++    pub fn live_publish_failed(lang: Lang, why: &crate::proto::LiveFailure) -> String {
++        use crate::proto::LiveFailure;
++        let reason = match why {
++            LiveFailure::Unreachable => t!(
++                lang,
++                en: "cannot reach the relay, will keep retrying".to_string(),
++                zh: "连不上中转，稍后会自动重试".to_string(),
++            ),
++            LiveFailure::Refused(401) => t!(
++                lang,
++                en: "the public live key is wrong or has been revoked".to_string(),
++                zh: "公开直播密钥不对，或者已被吊销".to_string(),
++            ),
++            LiveFailure::Refused(403) => t!(
++                lang,
++                en: "the server does not allow public lives, or this one was taken down".to_string(),
++                zh: "服务器没有开启公开直播，或者这场直播已被下线".to_string(),
++            ),
++            LiveFailure::Refused(413) => t!(
++                lang,
++                en: "the title is too long".to_string(),
++                zh: "标题太长".to_string(),
++            ),
++            LiveFailure::Refused(429) => t!(
++                lang,
++                en: "too many attempts, try again in a minute".to_string(),
++                zh: "操作太频繁，一分钟后再试".to_string(),
++            ),
++            LiveFailure::Refused(code) => t!(
++                lang,
++                en: format!("the relay refused it (HTTP {code})"),
++                zh: format!("中转拒绝了（状态码 {code}）"),
++            ),
++        };
++        t!(
++            lang,
++            en: format!("Not public: {reason}"),
++            zh: format!("没能公开：{reason}"),
++        )
++    }
++
+     /// 开播失败的整句话。**原因由这里组，不是守护进程拼好的**——推帧线程
+     /// 手上没有 `Lang`，它只报一个 `LiveFailure` 码（见那个类型上的文档
+     /// 注释：早先那一版在那里直接拼中文，英文界面会显示 "Failed to go
+     /// live: 连不上中转"）。
+     pub fn live_start_failed(lang: Lang, why: &crate::proto::LiveFailure) -> String {
+         use crate::proto::LiveFailure;
+         let reason = match why {
+             LiveFailure::Unreachable => t!(
+                 lang,
+                 en: "cannot reach the relay, will keep retrying".to_string(),
+@@ -1839,20 +1915,25 @@ pub mod msg {
+             Git(raw) => t!(
+                 lang,
+                 en: format!("git failed: {raw}"),
+                 zh: format!("git 操作失败：{raw}"),
+             ),
+             LiveRelayNotConfigured => t!(
+                 lang,
+                 en: "live broadcasting has no relay configured — set DCT_RELAY to your relay's address (for example https://live.example.com) before starting dct".to_string(),
+                 zh: "直播还没配置中转：启动 dct 之前把环境变量 DCT_RELAY 设成中转地址（例如 https://live.example.com）".to_string(),
+             ),
++            LivePublishKeyMissing => t!(
++                lang,
++                en: "no public live key yet — press K in the live panel to enter the one your operator gave you".to_string(),
++                zh: "还没填公开直播密钥：在直播面板里按 K，填上管理员发给你的那把".to_string(),
++            ),
+             CannotStart(cmd) => t!(
+                 lang,
+                 en: format!("{cmd} would not start — it may be installed incorrectly"),
+                 zh: format!("启动不了 {cmd}，它可能装坏了"),
+             ),
+             DaemonNotResponding => t!(
+                 lang,
+                 en: "The dct service is not responding".to_string(),
+                 zh: "守护进程没有回应".to_string(),
+             ),
+@@ -2472,20 +2553,28 @@ mod tests {
+             LiveOffLine,
+             LiveConnectingToRelay,
+             LiveOnAirMark,
+             LiveToggleStaged,
+             LiveCopyLink,
+             LiveNewLink,
+             LiveStop,
+             LiveNoSessionsToStage,
+             LiveLinkCopied,
+             LiveStoppedMessage,
++            LivePublishToggle,
++            LiveChangeKey,
++            LiveTitlePrompt,
++            LiveKeyPrompt,
++            LivePublicPending,
++            LiveKeySaved,
++            LiveUnpublished,
++            LiveTitleEmpty,
+             TextSmaller,
+             TextBigger,
+             KeyboardCapture,
+             WebToggle,
+             WebTurnOn,
+             TapLineToInsert,
+             WebTurnOff,
+             OtherKeysGoToAgent,
+             BackToListWord,
+             BackToSettingsWord,
+@@ -2657,21 +2746,21 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 202, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 210, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
+     /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
+     /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
+     /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
+@@ -2706,20 +2795,21 @@ mod tests {
+             NoSuchSession(7),
+             NoCheckpoint,
+             NotAnAgentSession,
+             BadRequest("bad json".into()),
+             LiveStagingRejected(crate::proto::LiveStagingProblem::NamesMismatch),
+             LiveStagingRejected(crate::proto::LiveStagingProblem::Empty),
+             LiveStagingRejected(crate::proto::LiveStagingProblem::TooMany { max: 4, got: 5 }),
+             LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![7, 9])),
+             LiveStagingRejected(crate::proto::LiveStagingProblem::NotLive),
+             LiveRelayNotConfigured,
++            LivePublishKeyMissing,
+             Git("fatal: not a repository".into()),
+             SecretsFileBroken {
+                 path: "/h/.dct/secrets.toml".into(),
+             },
+             OperationFailed(crate::proto::Operation::FirstCheckpoint),
+             OperationFailed(crate::proto::Operation::Checkpoint),
+             OperationFailed(crate::proto::Operation::Undo),
+             OperationFailed(crate::proto::Operation::Diff),
+             OperationFailed(crate::proto::Operation::SaveSecret),
+             OperationFailed(crate::proto::Operation::SaveSettings),
+@@ -2737,20 +2827,39 @@ mod tests {
+                 !has_han(&msg::error(Lang::En, c)),
+                 "{c:?} 的英文里有汉字：{}",
+                 msg::error(Lang::En, c)
+             );
+         }
+         // `Internal` 是刻意的例外：它照抄原文（多半是还没归类的内部错误
+         // 或 git 的 stderr），翻不动也不该翻。
+         assert_eq!(msg::error(Lang::En, &Internal("原文".into())), "原文");
+     }
+ 
++    /// 公开直播那几句带参文案：两种语言都组得出话，人数和标题都要露面，
++    /// 英文里不许有汉字。
++    #[test]
++    fn public_live_strings_compose_in_both_languages() {
++        use crate::proto::LiveFailure;
++        for l in Lang::all() {
++            let on = msg::live_on_air_public(*l, "第3课", 2, 7);
++            assert!(on.contains("第3课") && on.contains('7'), "{on}");
++            for code in [401u16, 403, 413, 429, 500] {
++                let s = msg::live_publish_failed(*l, &LiveFailure::Refused(code));
++                assert!(!s.trim().is_empty());
++                if *l == Lang::En {
++                    assert!(!has_han(&s), "{s}");
++                }
++            }
++            assert!(!msg::live_publish_failed(*l, &LiveFailure::Unreachable).is_empty());
++        }
++    }
++
+     /// 警告码跟错误码同样的要求：两种语言都组得出话，英文里不许有汉字。
+     #[test]
+     fn every_warning_code_composes_in_both_languages() {
+         use crate::proto::{IoReason, WarningCode::*};
+         let codes = [
+             ProfileDirUnreadable {
+                 name: "profiles".into(),
+                 reason: IoReason::PermissionDenied,
+             },
+             ProfileUnreadable {
+diff --git a/src/live.rs b/src/live.rs
+index b3c055a..6e1f70d 100644
+--- a/src/live.rs
++++ b/src/live.rs
+@@ -29,21 +29,21 @@
+ use std::collections::hash_map::DefaultHasher;
+ use std::collections::HashMap;
+ use std::hash::{Hash, Hasher};
+ use std::panic::{catch_unwind, AssertUnwindSafe};
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+ use dct_link::live::{KEEPALIVE, MAX_FRAME_BYTES, PATH_FRAME, PUSH_INTERVAL};
+ 
+-use crate::proto::{LiveFailure, LiveInfo, LiveReadiness};
++use crate::proto::{LiveFailure, LiveInfo, LivePublic, LiveReadiness};
+ use crate::pty::ScreenSpan;
+ use crate::session::SessionManager;
+ 
+ /// 一场直播的内部记录。跟 [`LiveInfo`] 分开，是因为 [`LiveInfo`] 要经手线
+ /// 上协议——`push_secret` 压根不许出现在那个类型里（见它上面的文档注释），
+ /// 而这里是 daemon 自己进程内存里的那一份原文，两者不能是同一个类型。
+ struct Room {
+     id: String,
+     token: String,
+     // 眼下唯一的读者是下面的 `push_secret()`，而它本身要等推帧线程
+@@ -110,20 +110,21 @@ impl LiveState {
+         let info = LiveInfo {
+             id: id.clone(),
+             token: token.clone(),
+             url,
+             staged: staged.clone(),
+             viewers: 0,
+             // 这一刻中转还完全不知道这场直播存在——`readiness` 如实说
+             // 「还没就绪」，不能骗调用方（最终是老师那块屏幕）说链接已经
+             // 能用了。见 `LiveInfo::readiness` 的文档注释。
+             readiness: LiveReadiness::Pending,
++            public: LivePublic::Private,
+         };
+ 
+         *recover(self.room.lock()) = Some(Room {
+             id,
+             token,
+             push_secret,
+             staged,
+             staged_rev: 0,
+             viewers: 0,
+             readiness: LiveReadiness::Pending,
+@@ -156,20 +157,21 @@ impl LiveState {
+         room.staged = staged;
+         room.staged_rev += 1;
+         room.readiness = LiveReadiness::Pending;
+         Some(LiveInfo {
+             id: room.id.clone(),
+             token: room.token.clone(),
+             url: format!("{}/live/{}#t={}", self.base(), room.id, room.token),
+             staged: room.staged.clone(),
+             viewers: room.viewers,
+             readiness: room.readiness.clone(),
++            public: LivePublic::Private,
+         })
+     }
+ 
+     pub fn stop(&self) {
+         *recover(self.room.lock()) = None;
+     }
+ 
+     /// 没在播的时候：`id`/`token`/`url` 都是空串，`staged` 是空表，
+     /// `viewers` 是 0。**空串而不是 `Option`**——`LiveInfo` 是要经过协议线
+     /// 的形状，`Option<LiveInfo>` 才是「有没有在播」该长的样子，但这一层
+@@ -179,28 +181,30 @@ impl LiveState {
+     /// 的那个数（见 `LiveInfo::viewers`）。
+     pub fn info(&self) -> LiveInfo {
+         match &*recover(self.room.lock()) {
+             Some(room) => LiveInfo {
+                 id: room.id.clone(),
+                 token: room.token.clone(),
+                 url: format!("{}/live/{}#t={}", self.base(), room.id, room.token),
+                 staged: room.staged.clone(),
+                 viewers: room.viewers,
+                 readiness: room.readiness.clone(),
++                public: LivePublic::Private,
+             },
+             None => LiveInfo {
+                 id: String::new(),
+                 token: String::new(),
+                 url: String::new(),
+                 staged: Vec::new(),
+                 viewers: 0,
+                 readiness: LiveReadiness::Pending,
++                public: LivePublic::Private,
+             },
+         }
+     }
+ 
+     /// 推帧线程告诉中转「这场直播存在」成功之后调这个方法，把 `readiness`
+     /// 翻成 `Ready`。**只在 `id` 还对得上时才生效**：推帧线程这次
+     /// `POST /live/start` 可能是对着一场已经被 `stop()`/被新的一场顶掉的
+     /// 直播做的（网络慢、正好撞上老师连点两下），这时候写回来的「已就绪」
+     /// 属于一场已经不存在的直播，不能套到当前这一场头上。
+     ///
+diff --git a/src/proto.rs b/src/proto.rs
+index 54b6f2e..e3ecbea 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -106,21 +106,25 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
+ /// 全班的链接当场作废、学生一起掉线。新增 `Request` 变体那条规矩同 14。
+ ///
+ /// 17 = 直播这一侧的失败原因从「已经成文的句子」换成错误码：
+ /// `LiveReadiness::Failed(LiveFailure)`、`ErrorCode::LiveStagingRejected`。
+ /// 两处都是**响应**的形状变了（旧界面解不出 `Failed` 里那个对象），照 13
+ /// 那次的规矩加一。
+ ///
+ /// 18 = 多了 `ErrorCode::LiveRelayNotConfigured`：dct 不再带内置中转地址，
+ /// 没设 `DCT_RELAY` 时开播会被拒绝。**响应**里多了一个旧界面解不出的变体，
+ /// 照 13 那次的规矩加一。
+-pub const PROTOCOL_VERSION: u32 = 18;
++///
++/// 19 = 公开直播列表：多了 `Request::LivePublish`/`LiveUnpublish`/`LivePublishGrant`、
++/// `Response::LiveGrant`、`ErrorCode::LivePublishKeyMissing`，`LiveInfo` 多了 `public`。
++/// 新增 `Request` 变体那条规矩同 14。
++pub const PROTOCOL_VERSION: u32 = 19;
+ 
+ /// 对面那个守护进程能不能用。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum DaemonStatus {
+     /// 同一份协议，正常用。
+     Same,
+     /// 号对不上，或者老到连 `Hello` 都不认识。
+     Stale,
+ }
+ 
+@@ -478,20 +482,26 @@ pub enum Request {
+     ///
+     /// 字段的约定跟 `LiveStart` 一样：`names` 与 `ids` 一一对应。
+     LiveRestage {
+         ids: Vec<u32>,
+         names: Vec<String>,
+     },
+     /// 停播。
+     LiveStop,
+     /// 现在有没有在播、播的是什么。
+     LiveStatus,
++    /// 公开这场直播。守护进程用自己存的发布密钥（`secrets::LIVE_PUBLISH_KEY`），
++    /// 密钥**不在这条请求里**。标题超过 `MAX_PUBLIC_TITLE_CHARS` 由守护进程截断。
++    LivePublish { title: String },
++    LiveUnpublish,
++    /// 给管理台一张只能切换公开状态的凭证。没在播回 `LiveStagingRejected(NotLive)`。
++    LivePublishGrant,
+ }
+ 
+ /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
+ /// `value` 是用户的明文密钥。今天没有任何地方真的 `{req:?}` 打印一个
+ /// `Request`（已核实），但 `serve()` 解析失败那条分支离
+ /// `eprintln!("bad request: {req:?}")` 只有一行距离——一旦有人图省事加了
+ /// 这行调试日志，密钥就会写进守护进程的 stderr（很可能重定向进一个存活
+ /// 比进程本身久得多的日志文件）。这里把 `value` 换成占位符，`profile`
+ /// 这种不敏感的字段照常打印，排查问题时还能看出是哪个 profile 出的请求。
+ impl std::fmt::Debug for Request {
+@@ -599,20 +609,26 @@ impl std::fmt::Debug for Request {
+                 .field("ids", ids)
+                 .field("names", names)
+                 .finish(),
+             Request::LiveRestage { ids, names } => f
+                 .debug_struct("LiveRestage")
+                 .field("ids", ids)
+                 .field("names", names)
+                 .finish(),
+             Request::LiveStop => write!(f, "LiveStop"),
+             Request::LiveStatus => write!(f, "LiveStatus"),
++            // 标题不是密钥，照常打印。
++            Request::LivePublish { title } => {
++                f.debug_struct("LivePublish").field("title", title).finish()
++            }
++            Request::LiveUnpublish => write!(f, "LiveUnpublish"),
++            Request::LivePublishGrant => write!(f, "LivePublishGrant"),
+         }
+     }
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ pub enum Response {
+     /// 对 [`Request::Hello`] 的回答。同样不许改形状。
+     Hello {
+         protocol: u32,
+     },
+@@ -692,20 +708,22 @@ pub enum Response {
+     /// 对 [`Request::PairPoll`] 的回答。
+     PairTick(PairTick),
+     /// `LiveStart` / `LiveStop` / `LiveStatus` 三条的共同回答。
+     ///
+     /// **停播也答这个，不答 `Response::Ok`**——答的是「停完之后的状态」，
+     /// 也就是 `LiveState::info()` 那份空形状。界面只认 `Response::Live`，
+     /// 拿它把 `App::live` 清掉；答 `Ok` 就会落进界面的 `_ =>` 分支，直播
+     /// 真停了而屏幕继续常驻「正在直播」。见 `daemon.rs` 里 `LiveStop` 那
+     /// 一支上的注释。
+     Live(LiveInfo),
++    /// 对 [`Request::LivePublishGrant`] 的回答：一张只能切换公开状态的凭证。
++    LiveGrant(LiveGrantToken),
+ }
+ 
+ /// 一场直播眼下的样子。
+ ///
+ /// **老师那把推帧/停播用的钥匙（`push_secret`）不在这个类型里。**
+ /// `LiveInfo` 是要经过协议线的形状——它会被序列化发给手机网页，将来还可能
+ /// 经中转那条信封路转一趟。`LiveState` 和推帧线程活在同一个进程里，取
+ /// `push_secret` 根本不需要绕道协议；一旦它上了这条线，任何一个能读到
+ /// `Response::Live` 的人都会拿到那把本该只有老师能用的钥匙——见
+ /// `a_live_response_never_carries_the_push_secret_to_the_wire`。
+@@ -737,20 +755,23 @@ pub struct LiveInfo {
+     /// 上那么一拍。
+     pub viewers: u32,
+     /// 中转认没认得这场直播。
+     ///
+     /// `LiveState::start()` 是同步的，一返回就有完整的学生链接；而真正
+     /// 告诉中转「这场直播存在」（`POST /live/start`）是推帧线程按
+     /// `PUSH_INTERVAL` 异步去做的。没有这个字段，老师点完「开始直播」的
+     /// 那一瞬就会拿着一条链接去发给全班，而那时中转很可能还不知道这场
+     /// 直播——界面无从分辨「链接已经能用」和「刚生成、还在等中转答应」。
+     pub readiness: LiveReadiness,
++    /// 公开列表上的状态，见 [`LivePublic`]。旧 JSON 没有这个字段时读成 `Private`。
++    #[serde(default)]
++    pub public: LivePublic,
+ }
+ 
+ /// 见 [`LiveInfo::readiness`]。
+ ///
+ /// **`Failed` 带的是错误码，不是句子。** 这跟 `ErrorCode` 是同一条规矩
+ /// （见它上面那段「守护进程报码，不组句」）：拼这句话的地方是推帧线程，
+ /// 它手上根本没有 `Lang`——早先那一版在那里直接拼中文，于是英文界面会显示
+ /// 「Failed to go live: 连不上中转，稍后会自动重试」。仓库里那条「英文文案
+ /// 里不许有汉字」的守卫（`has_han`）钉的是 `Key` 那张表，一句带参数拼出来
+ /// 的话从它旁边绕了过去。
+@@ -774,20 +795,45 @@ pub enum LiveReadiness {
+ /// 线（见 `LiveInfo` 上的文档注释）。
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum LiveFailure {
+     /// 连不上中转（DNS、网络、中转没起来）。会自动重试。
+     Unreachable,
+     /// 连上了，但中转拒绝了这场直播。带 HTTP 状态码：429/413 这类码本身
+     /// 就是给人看的线索，而它不是自由文本，翻译得动。
+     Refused(u16),
+ }
+ 
++/// 这场直播在公开列表上的状态。**以中转为准**：推帧线程每次保活时从
++/// `GET /live/{id}/lanes` 的 `public` 字段读回来（包括管理台代为公开的情况）。
++#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
++pub enum LivePublic {
++    #[default]
++    Private,
++    /// 本机请求了公开，中转还没答应。
++    Pending { title: String },
++    Listed { title: String },
++    /// 本机请求的公开被拒了。原因是码，组句在界面（`msg::live_publish_failed`）。
++    Failed { title: String, reason: LiveFailure },
++}
++
++/// 守护进程签发给管理台的公开凭证（见 `dct_link::live::publish_grant`）。
++/// 手写 `Debug`：它能拿去公开这场直播，不许原样进日志。
++#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(transparent)]
++pub struct LiveGrantToken(pub String);
++
++impl std::fmt::Debug for LiveGrantToken {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("LiveGrantToken(<redacted>)")
++    }
++}
++
+ /// 一份上架名单为什么不能用。同样**只报码，不组句**——拼这句话的是守护
+ /// 进程（`daemon.rs::validated_staging`），它不知道界面用的是哪种语言。
+ ///
+ /// 早先这几条走的是 `ErrorCode::BadRequest(String)`，而那个 `String` 里
+ /// 直接写着中文：英文界面上会显示 "dct could not understand that request:
+ /// LiveStart：会话 [7] 不存在，没法上架"。
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum LiveStagingProblem {
+     /// `ids` 跟 `names` 的条数对不上。
+     NamesMismatch,
+@@ -809,20 +855,21 @@ pub enum LiveStagingProblem {
+ 
+ impl std::fmt::Debug for LiveInfo {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("LiveInfo")
+             .field("id", &self.id)
+             .field("token", &"<redacted>")
+             .field("url", &"<redacted>")
+             .field("staged", &self.staged)
+             .field("viewers", &self.viewers)
+             .field("readiness", &self.readiness)
++            .field("public", &self.public)
+             .finish()
+     }
+ }
+ 
+ /// `pair::Started` 给界面看的那一面。**故意不是 `Started` 本身**：那个类型里有
+ /// `device_code`，而它是这条流程的凭据——界面要的只是画屏用的三样东西。
+ /// 同 `PairTick` 之于 `Tick`：少一个能装凭据的类型，就少一处它能漏出去的地方。
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct PairStartedInfo {
+     /// 大字印在屏幕上，学生照着念或照着敲。
+@@ -876,20 +923,22 @@ pub enum ErrorCode {
+     NotAnAgentSession,
+     /// 请求解析失败，带上原始错误供排查
+     BadRequest(String),
+     /// 上架名单不能用。**独立一条，不走 `BadRequest(String)`**：那条的
+     /// 参数是自由文本，而自由文本只能由守护进程写死成某一种语言——见
+     /// [`LiveStagingProblem`] 上那段。
+     LiveStagingRejected(LiveStagingProblem),
+     /// 没配直播中转（`DCT_RELAY` 没设），所以不开播。dct 不带任何内置中转
+     /// 地址——中转在哪儿是部署方的决定，见 `live.rs` 模块头。
+     LiveRelayNotConfigured,
++    /// 要公开直播，但本机还没填公开直播密钥。
++    LivePublishKeyMissing,
+     /// git 自己的 stderr。**刻意留的兜底**：那是 git 按它自己的 `LANG` 输出的，
+     /// dct 翻不动也不该翻。界面显示成「操作失败：<原文>」——外面那半句是
+     /// 翻译过的，里面照抄。
+     Git(String),
+     /// agent 的命令跑不起来。带上命令名——用户至少知道该去修哪个。
+     CannotStart(String),
+     /// 这个 agent 还没登录，而**它要跑的那台机器**开不了浏览器，所以它自己
+     /// 那条「跳到 localhost」的登录路走不通（见 `profile::LoginSpec`）。
+     ///
+     /// 带上该跑的那条登录命令：界面拿它开一个命令行会话，让用户看着设备码
+@@ -1228,28 +1277,31 @@ mod tests {
+             Request::LiveStart {
+                 ids: vec![1],
+                 names: vec!["n".into()],
+             },
+             Request::LiveRestage {
+                 ids: vec![1],
+                 names: vec!["n".into()],
+             },
+             Request::LiveStop,
+             Request::LiveStatus,
++            Request::LivePublish { title: "t".into() },
++            Request::LiveUnpublish,
++            Request::LivePublishGrant,
+         ];
+ 
+         let shape = serde_json::to_string(&all).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+-                18,
+-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus"]"#
++                19,
++                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant"]"#
+             ),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     /// **配对的响应里绝不许出现钥匙。** UI 不需要它——落盘在 daemon 那边做完了。
+     /// 一旦它过一次 socket，它就会出现在任何一个手滑加上的 `{resp:?}` 里。
+     #[test]
+     fn a_pair_tick_never_carries_the_key() {
+         let t = PairTick::Done {
+@@ -1259,21 +1311,21 @@ mod tests {
+         };
+         let json = serde_json::to_string(&t).unwrap();
+         assert!(!json.contains("api_key"), "{json}");
+         assert!(!json.contains("sk-"), "{json}");
+         // 请求那一侧的形状由 `the_request_shape_is_pinned_to_the_protocol_version`
+         // 钉着，`Done` 是响应，落在那张网外面——而版本 13 变的正是它。
+         // 把它一起钉住，下一次给它加字段的人才会被同一句话拦下来。
+         assert_eq!(
+             (PROTOCOL_VERSION, json.as_str()),
+             (
+-                18,
++                19,
+                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
+             ),
+             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     /// **`PairStarted` 的响应里绝不许出现 `device_code`。** 它是这条流程的
+     /// 凭据，spec 说它只活在 daemon 里、一次也不许过 socket——`PairStartedInfo`
+     /// 存在正是为了让这条 socket 上的类型物理上装不下它。
+     #[test]
+@@ -1368,21 +1420,21 @@ mod tests {
+             dir: "/d".into(),
+             state: SessionState::Idle,
+             activity: "a".into(),
+             is_agent: true,
+             tag: String::new(),
+         };
+         let shape = serde_json::to_string(&info).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+-                18,
++                19,
+                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
+             ),
+             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     #[test]
+     fn screens_response_round_trips() {
+         use crate::pty::{ScreenSpan, ScreenStyle};
+         let resp = Response::Screens {
+@@ -1471,39 +1523,39 @@ mod tests {
+ 
+     /// 「没配直播中转」这个错误码的线上形状是**跨语言**的契约：课堂管理台
+     /// （`container/classroom/server.mjs` 的 `liveRpc`）按字面 `"LiveRelayNotConfigured"`
+     /// 认它，而单元变体在 serde 里是一个裸字符串、不是 `{码: 参数}` 对象。
+     /// 谁把它改成带参数的变体，那边就会把整个对象当成未知错误——钉在这里。
+     #[test]
+     fn the_no_relay_error_is_a_bare_string_on_the_wire() {
+         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
+         assert_eq!(
+             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
+-            (18, r#"{"Error":"LiveRelayNotConfigured"}"#),
++            (19, r#"{"Error":"LiveRelayNotConfigured"}"#),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
+         );
+     }
+ 
+     /// `Projects` 的回程形状同样是契约：`pinned` 是这一版新加的字段，旧守护
+     /// 进程回的 JSON 里没有它。跟上面两条一样钉在 `PROTOCOL_VERSION` 上——
+     /// 光钉一个裸字符串的话，谁把这个变体改了形状、只顺手更新这里的期望值，
+     /// 就能一路绿灯地把版本号留在原地，而那正是 2026-08-05 那次事故的形状。
+     #[test]
+     fn projects_response_carries_both_lists() {
+         let r = Response::Projects {
+             recent: vec!["/a".into()],
+             pinned: vec!["/b".into()],
+         };
+         let s = serde_json::to_string(&r).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, s.as_str()),
+-            (18, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
++            (19, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     /// 上架的每一路都要有名字，而且名字的条数必须跟会话数对得上——
+     /// 对不上就会出现「学生看到的第 2 路其实是第 3 个会话」。
+     #[test]
+     fn staging_carries_one_name_per_session() {
+         let req = Request::LiveStart {
+             ids: vec![3, 5],
+@@ -1525,38 +1577,76 @@ mod tests {
+     /// 把 token 也漏了**——两个字段都要断言看不见。
+     #[test]
+     fn live_info_debug_redacts_the_viewer_token() {
+         let info = LiveInfo {
+             id: "7f3a2c91".into(),
+             token: "student-secret-token".into(),
+             url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
+             staged: vec![(1, "前端".into())],
+             viewers: 2,
+             readiness: LiveReadiness::Pending,
++            public: LivePublic::Private,
+         };
+         let s = format!("{info:?}");
+         assert!(s.contains("7f3a2c91"), "id 不敏感，该照常打印：{s}");
+         assert!(!s.contains("student-secret-token"), "token 泄露了：{s}");
+     }
+ 
+     /// **`Response::Live` 序列化出来的 JSON 里不许出现老师那把推帧/停播用
+     /// 的钥匙。** `LiveInfo` 类型上已经没有 `push_secret` 这个字段了，这条
+     /// 测试钉住的是这件事本身不会被以后哪次改动悄悄加回来——`push_secret`
+     /// 只活在 `LiveState` 内部，取用口是 `pub(crate)` 的，物理上不会被
+     /// 序列化进任何一条协议响应。
+     #[test]
+     fn a_live_response_never_carries_the_push_secret_to_the_wire() {
+         let r = Response::Live(LiveInfo {
+             id: "7f3a2c91".into(),
+             token: "student-secret-token".into(),
+             url: "http://x/live/7f3a2c91#t=student-secret-token".into(),
+             staged: vec![(1, "前端".into())],
+             viewers: 2,
+             readiness: LiveReadiness::Ready,
++            public: LivePublic::Private,
+         });
+         let json = serde_json::to_string(&r).unwrap();
+         assert!(
+             !json.contains("push_secret"),
+             "老师那把推帧/停播用的钥匙不该出现在任何一条能发到网页上的答复里：{json}"
+         );
+     }
++
++    /// `LiveInfo` 的公开状态上线形状，以及旧 JSON（没有这个字段）读成 `Private`。
++    #[test]
++    fn the_live_public_shape_is_pinned() {
++        let shape = |p: &LivePublic| serde_json::to_string(p).unwrap();
++        assert_eq!(
++            (
++                PROTOCOL_VERSION,
++                shape(&LivePublic::Private),
++                shape(&LivePublic::Listed { title: "课".into() })
++            ),
++            (
++                19,
++                r#""Private""#.to_string(),
++                r#"{"Listed":{"title":"课"}}"#.to_string()
++            )
++        );
++        assert_eq!(
++            shape(&LivePublic::Failed {
++                title: "课".into(),
++                reason: LiveFailure::Refused(401)
++            }),
++            r#"{"Failed":{"title":"课","reason":{"Refused":401}}}"#
++        );
++    }
++
++    /// 凭证能当一次公开，不许在任何日志里原样出现。
++    #[test]
++    fn a_live_grant_is_redacted_in_debug() {
++        let r = Response::LiveGrant(LiveGrantToken("deadbeef".repeat(8)));
++        assert!(!format!("{r:?}").contains("deadbeef"));
++        assert_eq!(
++            serde_json::to_string(&r).unwrap(),
++            format!(r#"{{"LiveGrant":"{}"}}"#, "deadbeef".repeat(8))
++        );
++    }
+ }
+diff --git a/src/secrets.rs b/src/secrets.rs
+index 631968c..fb623a0 100644
+--- a/src/secrets.rs
++++ b/src/secrets.rs
+@@ -46,20 +46,24 @@ pub const WEB_TOKEN_KEY: &str = "__web__";
+ pub const PHONE_OWNER_KEY: &str = "__phone_owner__";
+ 
+ /// 远程版那道门（`gate.rs`）的钥匙。**跟 `WEB_TOKEN_KEY` 是两把，别复用。**
+ ///
+ /// 手机端那把给的是只读画面加一行输入；这一把给的是一整台机器上的终端
+ /// （谁进得去谁就能在容器里执行任意命令）。泄漏后果不是一个量级，撤销的
+ /// 时机也不一样——共用一个键会让「换掉远程的钥匙」顺手把手机踢下线，
+ /// 而那正是 `WEB_TOKEN_KEY` 上面那段说过一遍的坑。
+ pub const GATE_TOKEN_KEY: &str = "__gate__";
+ 
++/// 公开直播的发布密钥（运营方在中转上用 `dct-srv key add` 签发）。同样用一个
++/// profile 不可能占用的名字；它只在守护进程里用，不经过任何发给界面的响应。
++pub const LIVE_PUBLISH_KEY: &str = "__live_publish__";
++
+ /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
+ pub fn secrets_path_for_socket(socket: &Path) -> PathBuf {
+     match socket.parent() {
+         Some(d) => d.join("secrets.toml"),
+         None => PathBuf::from("secrets.toml"),
+     }
+ }
+ 
+ impl SecretStore {
+     pub fn load(path: &Path) -> SecretStore {
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 61d19ba..f685337 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -269,20 +269,21 @@ impl App {
+                 url: None,
+                 address_unknown: false,
+             },
+             live: crate::proto::LiveInfo {
+                 id: String::new(),
+                 token: String::new(),
+                 url: String::new(),
+                 staged: Vec::new(),
+                 viewers: 0,
+                 readiness: crate::proto::LiveReadiness::Pending,
++                public: crate::proto::LivePublic::Private,
+             },
+             phone_buf: None,
+             phone_verify_rx: None,
+             phone_last_fetch: None,
+             pair_start_rx: None,
+             pair_last_fetch: None,
+             live_last_fetch: None,
+             lang,
+             socket,
+             start_dir: default_dir,
+diff --git a/src/ui/live.rs b/src/ui/live.rs
+index 355db45..0a24ab8 100644
+--- a/src/ui/live.rs
++++ b/src/ui/live.rs
+@@ -396,35 +396,36 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+             lines.push(Line::from(Span::styled(row, style)));
+         }
+     }
+ 
+     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::proto::LiveFailure;
++    use crate::proto::{LiveFailure, LivePublic};
+     use crossterm::event::KeyModifiers;
+ 
+     fn key(code: KeyCode) -> KeyEvent {
+         KeyEvent::new(code, KeyModifiers::NONE)
+     }
+ 
+     fn info(staged: Vec<(u32, String)>, viewers: u32, readiness: LiveReadiness) -> LiveInfo {
+         LiveInfo {
+             id: "abc".into(),
+             token: "t".repeat(64),
+             url: "https://x/live/abc#t=…".into(),
+             staged,
+             viewers,
+             readiness,
++            public: LivePublic::Private,
+         }
+     }
+ 
+     /// 一个只答 `LiveStatus` 的假守护进程：回它手里此刻那份 `LiveInfo`，并记下
+     /// 被问了几次。测试改 `answer` 就是「管理台那边刚开播/停播了」。
+     fn fake_live_daemon(
+         answer: std::sync::Arc<std::sync::Mutex<LiveInfo>>,
+     ) -> (
+         std::path::PathBuf,
+         tempfile::TempDir,
+@@ -466,20 +467,21 @@ mod tests {
+     }
+ 
+     fn not_live() -> LiveInfo {
+         LiveInfo {
+             id: String::new(),
+             token: String::new(),
+             url: String::new(),
+             staged: Vec::new(),
+             viewers: 0,
+             readiness: LiveReadiness::Pending,
++            public: LivePublic::Private,
+         }
+     }
+ 
+     /// **不是自己按 `L` 开的播，屏幕上也得说「你在播」。**
+     ///
+     /// 课堂管理台能直接往学生工作区的守护进程发 `LiveStart`（老师强制直播）。
+     /// 那一刻学生的界面从没进过直播面板，`App::live` 以前就一直停在「没在播」
+     /// ——全班在看他的屏幕，他自己屏幕上一个字都没有。这是这个功能最危险的
+     /// 失败模式（见模块头）换了个更糟的形状：连「忘了」都谈不上，是根本不知道。
+     ///
+@@ -637,20 +639,21 @@ mod tests {
+         app.view = View::Live {
+             state: ListState::default(),
+         };
+         app.live = LiveInfo {
+             id: "abc".into(),
+             token: "deadbeefcafe".repeat(4),
+             url: format!("https://x/live/abc#t={}", "deadbeefcafe".repeat(4)),
+             staged: vec![],
+             viewers: 3,
+             readiness: LiveReadiness::Ready,
++            public: LivePublic::Private,
+         };
+ 
+         let screen = screen_of(&mut app, 80, 40);
+ 
+         assert!(
+             !screen.contains("deadbeefcafe"),
+             "令牌被写到屏幕上了：\n{screen}"
+         );
+     }
+ 
+@@ -661,20 +664,21 @@ mod tests {
+         app.view = View::Live {
+             state: ListState::default(),
+         };
+         app.live = LiveInfo {
+             id: "abc".into(),
+             token: "t".repeat(64),
+             url: "https://x/live/abc#t=deadbeefcafe".into(),
+             staged: vec![],
+             viewers: 0,
+             readiness: LiveReadiness::Ready,
++            public: LivePublic::Private,
+         };
+ 
+         let screen = screen_of(&mut app, 20, 20);
+         let squeeze = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+ 
+         assert!(
+             screen.contains(&squeeze(text(Key::WebQrTooNarrow, app.lang))),
+             "窄窗口下没给出路：\n{screen}"
+         );
+     }
+@@ -724,20 +728,21 @@ mod tests {
+     /// 还没在播的时候只能是 `LiveStart`——没有房间可改。
+     #[test]
+     fn the_first_checkbox_starts_a_new_broadcast() {
+         let off = LiveInfo {
+             id: String::new(),
+             token: String::new(),
+             url: String::new(),
+             staged: vec![],
+             viewers: 0,
+             readiness: LiveReadiness::Pending,
++            public: LivePublic::Private,
+         };
+         let req = staging_request(&off, vec![(1, "前端".into())], false);
+         assert!(matches!(req, Request::LiveStart { .. }), "{req:?}");
+     }
+ 
+     /// `r` 键是真的换一条链接、旧的作废——**这是它唯一该有的语义**，所以
+     /// 哪怕正在播也走 `LiveStart`。
+     #[test]
+     fn the_new_link_key_really_does_reissue_the_link() {
+         let live = info(vec![(1, "后端".into())], 0, LiveReadiness::Ready);
+@@ -784,15 +789,16 @@ mod tests {
+     /// `is_live` 只看 `id` 是不是空串。
+     #[test]
+     fn is_live_is_purely_about_the_id() {
+         let off = LiveInfo {
+             id: String::new(),
+             token: String::new(),
+             url: String::new(),
+             staged: vec![],
+             viewers: 0,
+             readiness: LiveReadiness::Pending,
++            public: LivePublic::Private,
+         };
+         assert!(!is_live(&off));
+         assert!(is_live(&info(vec![], 0, LiveReadiness::Ready)));
+     }
+ }
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 06c60af..1b42fc9 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -3473,20 +3473,21 @@ is_agent = true
+ 
+         fn live(readiness: crate::proto::LiveReadiness) -> (App, tempfile::TempDir) {
+             let (mut app, dir) = app_with_one_agent_session(View::Attached(1));
+             app.live = crate::proto::LiveInfo {
+                 id: "abc".into(),
+                 token: "t".repeat(64),
+                 url: "https://x/live/abc#t=…".into(),
+                 staged: vec![(1, "小明".into())],
+                 viewers: 3,
+                 readiness,
++                public: crate::proto::LivePublic::Private,
+             };
+             (app, dir)
+         }
+ 
+         let cases: [Case; 7] = [
+             ("看板按键表", || {
+                 app_with_one_agent_session(View::Board)
+             }),
+             ("会话逃生提示", || {
+                 app_with_one_agent_session(View::Attached(1))
+@@ -5151,20 +5152,21 @@ is_agent = true
+         use ratatui::backend::TestBackend;
+ 
+         fn live_info() -> crate::proto::LiveInfo {
+             crate::proto::LiveInfo {
+                 id: "abc".into(),
+                 token: "t".repeat(64),
+                 url: "https://x/live/abc#t=deadbeef".into(),
+                 staged: vec![(1, "claude".into())],
+                 viewers: 3,
+                 readiness: crate::proto::LiveReadiness::Ready,
++                public: crate::proto::LivePublic::Private,
+             }
+         }
+ 
+         // 档一：普通消息（错误消息也算——这一档平时的优先级最高）。
+         {
+             let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+             let (mut app, _dir) = app_with_one_agent_session(View::Board);
+             app.message = crate::ui::widgets::Msg::err("出了点问题".into());
+             app.live = live_info();
+ 

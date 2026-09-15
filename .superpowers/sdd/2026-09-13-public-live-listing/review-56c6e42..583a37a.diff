@@ -1,0 +1,471 @@
+# Review package: 56c6e42..HEAD
+
+## Commits
+583a37a feat(page): public listing page and tokenless viewing of public rooms
+
+## Files changed
+ crates/dct-page/live.html      | 26 +++++++++--
+ crates/dct-page/public.html    | 97 ++++++++++++++++++++++++++++++++++++++++++
+ crates/dct-page/src/lib.rs     | 33 ++++++++++++++
+ crates/dct-srv/src/lib.rs      |  8 ++--
+ crates/dct-srv/tests/serves.rs | 33 +++++++++++++-
+ 5 files changed, 189 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/crates/dct-page/live.html b/crates/dct-page/live.html
+index e9ffbbb..b24a69e 100644
+--- a/crates/dct-page/live.html
++++ b/crates/dct-page/live.html
+@@ -174,29 +174,33 @@
+   //
+   // 见文件顶部那段注释的第 2 条：这一页够不着守护进程的 i18n，所以文案表
+   // 就近摆在这里，不走 `t("key")` 问协议那一套。**页面其余地方一个文案
+   // 字面量都不许出现**——新加一句提示，先来这张表里加一对键，两种语言
+   // 都要填，不能只填一半（认不出语言时退英文，参照手机端同一条规矩）。
+   var STRINGS = {
+     zh: {
+       live: "直播中",
+       paused: "老师暂停了",
+       ended: "这场直播结束了",
++      endedPublic: "这场直播已结束或不再公开",
++      backToList: "回到公开列表",
+       smaller: "缩小",
+       bigger: "放大",
+       theme: "配色",
+       viewers: function (n) { return n + " 人在看"; }
+     },
+     en: {
+       live: "Live",
+       paused: "Teacher paused",
+       ended: "This live session has ended",
++      endedPublic: "This live session has ended or is no longer public",
++      backToList: "Back to the public list",
+       smaller: "Smaller text",
+       bigger: "Bigger text",
+       theme: "Theme",
+       viewers: function (n) { return n + " watching"; }
+     }
+   };
+   var LANG = (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+   var S = STRINGS[LANG];
+ 
+   zoomOutEl.setAttribute("aria-label", S.smaller);
+@@ -220,20 +224,26 @@
+     var storeKey = "dct-live-token-" + LIVE_ID;
+     var m = /(?:^|[#&])t=([^&]+)/.exec(location.hash || "");
+     if (m) {
+       try { sessionStorage.setItem(storeKey, m[1]); } catch (e) {}
+       history.replaceState(null, "", location.pathname);
+       return m[1];
+     }
+     try { return sessionStorage.getItem(storeKey) || ""; } catch (e) { return ""; }
+   })();
+ 
++  // 没有令牌就**不带**这个头：公开的直播不需要令牌，而一个空的 x-live-token
++  // 会被当成「带了、但是不对」。拉帧和拉路名都从这里取头，别再各写一份。
++  function tokenHeaders() {
++    return TOKEN ? { "x-live-token": TOKEN } : {};
++  }
++
+   // ——上架的几路——
+   //
+   // 名字是**老师起的**，从 `GET /live/{id}/lanes` 来——**不是数字，不是
+   // 会话标题**。会话标题和项目路径一个字都不许上公网（整份 spec 的前提
+   // 之一），数字按钮达不到"学生认得出这是哪一路"这个目的，而且老师在
+   // 直播面板上改了名字，数字按钮完全反映不出来。同一条路径把在线人数
+   // 一起带回来（见下面 `refreshLanes`），省得为一个数字单开一条轮询。
+   var lane = 0;
+ 
+   function renderLaneButtons(names) {
+@@ -269,21 +279,21 @@
+   // 开场拉一次，之后**跟着已经在跑的那个两秒计时器**（下面 `setInterval`
+   // 那个，本来就在查"画面是不是太久没变了"）捎带着刷新，不为人数单独起
+   // 一条轮询。拉不到就沉默：这不是决定这一页看起来对不对的那条请求，
+   // 拉帧才是。
+   //
+   // **拉帧失败之后的复核走的也是这一条**（见 `afterFailure`），不另开一次
+   // `fetch`：它答得出来就说明这场直播还活着、手上的令牌也还有效，那么刚才
+   // 那次失败就不是"直播结束了"。
+   function fetchLanes() {
+     return fetch("/live/" + LIVE_ID + "/lanes", {
+-      headers: { "x-live-token": TOKEN },
++      headers: tokenHeaders(),
+       credentials: "omit"
+     })
+       .then(function (r) { return r.ok ? r.json() : null; })
+       .catch(function () { return null; });
+   }
+ 
+   // 把一份 lanes 答复画到屏幕上。回 `true` 表示"中转答得出来"——`afterFailure`
+   // 拿这个当"这场直播还活着"的凭据。
+   function applyLanes(data) {
+     if (!data) { return false; }
+@@ -384,21 +394,31 @@
+ 
+   // 「这一轮什么都没变」时该等多久：够慢就立刻再来，快得离谱就补足地板。
+   function scheduleIdle() {
+     schedule(Math.max(0, MIN_IDLE_GAP_MS - (Date.now() - sentAt)));
+   }
+ 
+   var ICON = { live: "●", paused: "◌", ended: "×" };
+ 
+   function render() {
+     dotEl.textContent = ICON[state];
+-    statusEl.textContent = S[state];
++    // 没有令牌的观众是从公开列表点进来的：结束和「切回私密」对他是同一件事
++    // （中转回的也是同一个 401），说一句能涵盖两者的话，并给一条回列表的路。
++    if (state === "ended" && !TOKEN) {
++      statusEl.textContent = S.endedPublic + " · ";
++      var back = document.createElement("a");
++      back.href = "/";
++      back.textContent = S.backToList;
++      statusEl.appendChild(back);
++    } else {
++      statusEl.textContent = S[state];
++    }
+     headEl.className = state === "ended" ? "bad" : state === "paused" ? "warn" : "";
+   }
+ 
+   function frameUrl() {
+     return "/live/" + LIVE_ID + "/frame?lane=" + lane + "&wait=1";
+   }
+ 
+   // **`lines` 本身就是一帧，不是包了一层 `{"Screen": {...}}` 的对象。**
+   //
+   // 推帧那一侧（`src/live.rs` 的 `frame_of`）序列化的是 `lines: &[Vec<
+@@ -468,21 +488,21 @@
+       schedule(backoff());
+     });
+   }
+ 
+   // 一次只飞一个请求，答案回来之前不发下一个——同手机端 `screenInflight`
+   // 那道闸，理由一样：链路一慢，叠起来的请求只会越叠越慢。
+   function pull() {
+     if (ended || inflight || document.visibilityState !== "visible") { return; }
+     inflight = true;
+     sentAt = Date.now();
+-    var headers = { "x-live-token": TOKEN };
++    var headers = tokenHeaders();
+     if (etag !== null) { headers["If-None-Match"] = "\"" + etag + "\""; }
+     fetch(frameUrl(), { headers: headers, credentials: "omit" })
+       .then(function (r) {
+         inflight = false;
+         if (r.status === 304) {
+           // 画面没变。`wait` 正常工作的话这里已经挂过 25 秒，`scheduleIdle`
+           // 当场就放行；被中间代理掐掉的话它把节奏压回一秒多一次，见上面
+           // `MIN_IDLE_GAP_MS` 那段。
+           scheduleIdle();
+           return;
+diff --git a/crates/dct-page/public.html b/crates/dct-page/public.html
+new file mode 100644
+index 0000000..c2ed842
+--- /dev/null
++++ b/crates/dct-page/public.html
+@@ -0,0 +1,97 @@
++<!doctype html>
++<html lang="zh">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<meta name="referrer" content="no-referrer">
++<title>公开直播</title>
++<!--
++  公开直播列表。只由中转发（`GET /`）。
++
++  规矩：
++  - 标题和路名是老师或管理台填的自由文本：**只用 textContent** 写进 DOM，
++    不许用任何"把字符串当 HTML 解析"的 DOM API（`dct-page` 的
++    `neither_page_ever_uses_inner_html` 钉着这条，连这个文件自己的注释里都
++    不许出现那几个 API 名字，免得字面匹配把自己也算进去）。
++  - 不设 cookie、不带 referrer、不引外部资源。
++  - 每 5 秒拉一次 `/live/public`；标签页在后台时不拉，回到前台立刻拉一次。
++-->
++<style>
++  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafafa; --card: #fff; --dim: #6e6e73; --accent: #0a7d5a; }
++  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8ea; --bg: #111; --card: #1c1c1e; --dim: #98989d; --accent: #3ccf9a; } }
++  body { margin: 0; padding: 24px 16px; font: 16px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; color: var(--fg); background: var(--bg); }
++  main { max-width: 760px; margin: 0 auto; }
++  h1 { font-size: 22px; margin: 0 0 16px; }
++  .empty { color: var(--dim); }
++  a.card { display: block; padding: 14px 16px; margin: 0 0 12px; border-radius: 12px; background: var(--card); color: inherit; text-decoration: none; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
++  .title { font-weight: 600; font-size: 18px; }
++  .lanes { margin: 6px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
++  .lane { font-size: 13px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--dim); color: var(--dim); }
++  .viewers { margin-top: 6px; font-size: 13px; color: var(--accent); }
++</style>
++</head>
++<body>
++<main>
++  <h1 id="heading"></h1>
++  <p id="empty" class="empty" hidden></p>
++  <div id="list"></div>
++</main>
++<script>
++(function () {
++  "use strict";
++  var STRINGS = {
++    zh: { heading: "正在公开直播", empty: "现在没有公开直播", viewers: function (n) { return n + " 人在看"; } },
++    en: { heading: "Live now", empty: "Nothing is live publicly right now", viewers: function (n) { return n + " watching"; } }
++  };
++  var LANG = (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
++  var S = STRINGS[LANG];
++  document.documentElement.lang = LANG;
++  document.getElementById("heading").textContent = S.heading;
++  var emptyEl = document.getElementById("empty");
++  var listEl = document.getElementById("list");
++  var REFRESH_MS = 5000;
++
++  function render(items) {
++    listEl.textContent = "";
++    emptyEl.hidden = items.length > 0;
++    emptyEl.textContent = S.empty;
++    items.forEach(function (it) {
++      var a = document.createElement("a");
++      a.className = "card";
++      a.href = "/live/" + encodeURIComponent(it.id);
++      var t = document.createElement("div");
++      t.className = "title";
++      t.textContent = it.title;
++      a.appendChild(t);
++      var lanes = document.createElement("div");
++      lanes.className = "lanes";
++      (it.lanes || []).forEach(function (name) {
++        var l = document.createElement("span");
++        l.className = "lane";
++        l.textContent = name;
++        lanes.appendChild(l);
++      });
++      a.appendChild(lanes);
++      var v = document.createElement("div");
++      v.className = "viewers";
++      v.textContent = S.viewers(it.viewers || 0);
++      a.appendChild(v);
++      listEl.appendChild(a);
++    });
++  }
++
++  function pull() {
++    if (document.hidden) { return; }
++    fetch("/live/public", { credentials: "omit", cache: "no-store" })
++      .then(function (r) { return r.ok ? r.json() : null; })
++      .then(function (items) { if (items) { render(items); } })
++      .catch(function () {});
++  }
++
++  document.addEventListener("visibilitychange", function () { if (!document.hidden) { pull(); } });
++  setInterval(pull, REFRESH_MS);
++  pull();
++})();
++</script>
++</body>
++</html>
+diff --git a/crates/dct-page/src/lib.rs b/crates/dct-page/src/lib.rs
+index 48b6259..6d641a5 100644
+--- a/crates/dct-page/src/lib.rs
++++ b/crates/dct-page/src/lib.rs
+@@ -21,36 +21,42 @@
+ //! 页面本身怎么写（一个字的文案都不许写死、不许有外部资源、不许改 PTY 尺寸），
+ //! 规矩写在 `page.html` 开头那段注释里；`live.html` 有它自己的一段，因为
+ //! 它是给学生看的只读页，规矩不完全一样——最要紧的一条是**它没有任何一条
+ //! 能把字节送回老师终端的路**，下面那条测试钉着这件事。
+ 
+ use std::sync::OnceLock;
+ 
+ const SHARED: &str = include_str!("../shared.js");
+ const PAGE_SRC: &str = include_str!("../page.html");
+ const LIVE_SRC: &str = include_str!("../live.html");
++const PUBLIC_SRC: &str = include_str!("../public.html");
+ 
+ /// 占位符只此一个写法，两页都用它。
+ const MARK: &str = "<!--SHARED-->";
+ 
+ /// 手机端网页，两个服务端共用。
+ pub fn page() -> &'static str {
+     static IT: OnceLock<String> = OnceLock::new();
+     IT.get_or_init(|| PAGE_SRC.replace(MARK, SHARED))
+ }
+ 
+ /// 直播观众页，只读，只由中转发。
+ pub fn live_page() -> &'static str {
+     static IT: OnceLock<String> = OnceLock::new();
+     IT.get_or_init(|| LIVE_SRC.replace(MARK, SHARED))
+ }
+ 
++/// 公开直播列表页，只由中转发（`GET /`）。不用共享渲染代码，所以不做占位符替换。
++pub fn public_page() -> &'static str {
++    PUBLIC_SRC
++}
++
+ #[cfg(test)]
+ mod tests {
+     /// 一份网页要是空的，两个服务端都会安静地发一张白纸出去。
+     #[test]
+     fn the_page_is_actually_here() {
+         assert!(super::page().contains("<!doctype html>"), "网页没被打包进来");
+         assert!(super::page().len() > 10_000, "网页短得不像话，是不是被截了");
+     }
+ 
+     /// **学生页里没有任何一条能把字节送回老师终端的路（黑名单这一半）。**
+@@ -221,11 +227,38 @@ mod tests {
+             2,
+             "等宽字体名在两页里合计不是两次——共享那一份被拷开了"
+         );
+     }
+ 
+     #[test]
+     fn neither_page_is_empty() {
+         assert!(super::page().len() > 10_000);
+         assert!(super::live_page().len() > 4_000);
+     }
++
++    /// 公开页真的打包进来了，而且是给公众看的那一页。
++    #[test]
++    fn the_public_page_is_here() {
++        let p = super::public_page();
++        assert!(p.contains("<!doctype html>"));
++        assert!(p.contains("/live/public"), "公开页要去拉公开列表");
++    }
++
++    /// **标题和路名是别人填的自由文本，只能当纯文本塞进页面。** 两页都不许
++    /// 出现 `innerHTML`：一个 `<script>` 写进标题，就是公开页上的存储型 XSS。
++    #[test]
++    fn neither_page_ever_uses_inner_html() {
++        for (name, src) in [("public.html", super::public_page()), ("live.html", super::live_page())] {
++            assert!(!src.contains("innerHTML"), "{name} 里出现了 innerHTML");
++            assert!(!src.contains("outerHTML"), "{name} 里出现了 outerHTML");
++            assert!(!src.contains("insertAdjacentHTML"), "{name} 里出现了 insertAdjacentHTML");
++        }
++    }
++
++    /// 观看页没有令牌时不能发一个空的 `x-live-token`，而要干脆不带。
++    #[test]
++    fn the_live_page_omits_the_token_header_when_it_has_none() {
++        let src = super::live_page();
++        assert!(src.contains("function tokenHeaders()"), "拉帧和拉路名要走同一个取头的函数");
++        assert!(!src.contains(r#"headers: { "x-live-token": TOKEN }"#), "还有地方直接写死了令牌头");
++    }
+ }
+diff --git a/crates/dct-srv/src/lib.rs b/crates/dct-srv/src/lib.rs
+index e34a5d0..07e5c3e 100644
+--- a/crates/dct-srv/src/lib.rs
++++ b/crates/dct-srv/src/lib.rs
+@@ -18,21 +18,21 @@
+ //! 这不违反 spec 的「不排队、不落盘」：那条说的是**不给离线的人存东西**。
+ //! 信箱只在设备还活着的时候存在，进程一停就什么都没了，有界，满了就明说
+ //! （`Busy`），不落盘。
+ //!
+ //! # 第一期没有鉴权
+ //!
+ //! `token` 现在没人验（任务 5 才接 dc_classroom），所以**这个服务在第一期
+ //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
+ 
+ mod live;
+-pub use live::Live;
++pub use live::{Control, Live, PublicEntry};
+ pub mod keys;
+ 
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+ use axum::extract::{DefaultBodyLimit, FromRef, Path, State};
+ use axum::http::{HeaderMap, StatusCode, Uri};
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+@@ -575,24 +575,24 @@ async fn live_unpublish_route(
+     Ok(StatusCode::NO_CONTENT)
+ }
+ 
+ /// 公开列表。谁都能读，不需要任何令牌——这就是"公开"的意思。
+ async fn live_public_list_route(
+     State(live): State<Arc<Live>>,
+ ) -> Json<Vec<crate::live::PublicEntry>> {
+     Json(live.public_list())
+ }
+ 
+-/// 公开列表页。**Task 5 之前的占位**：`dct_page::public_page()` 还没写，
+-/// Task 5 落地那天把这行换掉就是了。
++/// 公开列表页。跟 `page_route`/`live_page_route` 同一个理由挂在这儿：
++/// `dct-page` 是两边唯一的真相来源，这里只是把已经打包好的字节交给 axum。
+ async fn public_page_route() -> axum::response::Html<&'static str> {
+-    axum::response::Html("<!doctype html><title>公开直播</title>")
++    axum::response::Html(dct_page::public_page())
+ }
+ 
+ /// 直播观众页。**只读，只有中转发**——它没有局域网那一档（学生从来不在
+ /// 老师家的局域网里）。跟 `page_route` 同一个理由挂在这儿：`dct-page` 是
+ /// 两边唯一的真相来源，这里只是把已经打包好的字节交给 axum。
+ async fn live_page_route() -> axum::response::Html<&'static str> {
+     axum::response::Html(dct_page::live_page())
+ }
+ 
+ async fn poll_route(
+diff --git a/crates/dct-srv/tests/serves.rs b/crates/dct-srv/tests/serves.rs
+index 128c214..7d14611 100644
+--- a/crates/dct-srv/tests/serves.rs
++++ b/crates/dct-srv/tests/serves.rs
+@@ -7,21 +7,21 @@
+ //!
+ //! 客户端是手写的：为了一个测试往依赖树里塞一个 HTTP 客户端不值得，而这条
+ //! 请求简单到十几行就能写完。
+ 
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use dct_link::{
+     AuthFrame, EndpointId, EndpointKind, Envelope, SendRequest, LINK_VERSION, PATH_POLL, PATH_SEND,
+ };
+-use dct_srv::{Config, Live, Relay, Routes};
++use dct_srv::{Config, Control, Live, Relay, Routes};
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::TcpStream;
+ 
+ /// 发一条 POST，把状态码和 body 读回来。
+ async fn post(addr: std::net::SocketAddr, path: &str, body: &str) -> (u16, String) {
+     let mut s = TcpStream::connect(addr).await.unwrap();
+     let req = format!(
+         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         body.len()
+@@ -138,10 +138,41 @@ fn the_relay_refuses_to_listen_anywhere_but_loopback() {
+             "{ok}"
+         );
+     }
+     for bad in ["0.0.0.0:8787", "192.168.1.19:8787", "[::]:8787"] {
+         let why = dct_srv::must_be_loopback(bad.parse().unwrap())
+             .expect_err(&format!("{bad} 不该被允许"));
+         // 报错要说清楚下一步，不能只说"不行"。
+         assert!(why.contains("端到端加密"), "{why}");
+     }
+ }
++
++/// 手工看公开页：`cargo test -p dct-srv --test serves serve_a_public_room_for_a_manual_look -- --ignored --nocapture`
++/// 然后浏览器打开打印出来的地址。
++#[tokio::test]
++#[ignore]
++async fn serve_a_public_room_for_a_manual_look() {
++    let dir = tempfile::tempdir().unwrap();
++    let file = dir.path().join("keys.json");
++    let mut k = dct_srv::keys::PublishKeys::default();
++    let key = k.add("手工验收", 0).unwrap();
++    k.save(&file).unwrap();
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    let live = Arc::new(Live::new());
++    let push = "p".repeat(64);
++    live.start("demo01".into(), "t".repeat(64), push.clone(), vec!["前端".into(), "后端".into()]).unwrap();
++    let keys = dct_srv::keys::KeyFile::open(file).unwrap();
++    live.publish("demo01", Control::Push(&push), Some(keys.keys()), &key, "手工验收 · <script>alert(1)</script>").unwrap();
++    // 房间 60 秒没推帧会被 TTL 回收：每 20 秒推一次空帧保活。
++    let keepalive = live.clone();
++    let keepalive_secret = push.clone();
++    tokio::spawn(async move {
++        loop {
++            let _ = keepalive.push("demo01", &keepalive_secret, 0, Vec::new());
++            tokio::time::sleep(Duration::from_secs(20)).await;
++        }
++    });
++    tokio::spawn(dct_srv::serve(listener, Arc::new(Relay::new(Config::default())), live, Routes::LiveOnly, Some(keys)));
++    println!("公开页：http://{addr}/   （标题里那段 <script> 必须原样显示成文字）");
++    tokio::time::sleep(Duration::from_secs(600)).await;
++}

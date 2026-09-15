@@ -1,0 +1,216 @@
+# Review package: e3291d1..HEAD
+
+## Commits
+198ae89 fix(classroom): bound relay calls with timeouts, guard heal reentrancy, don't treat RPC errors as offline
+
+## Files changed
+ container/classroom/server.mjs      | 58 ++++++++++++++++++++++++----------
+ container/classroom/server.test.mjs | 62 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+), 17 deletions(-)
+
+## Diff
+diff --git a/container/classroom/server.mjs b/container/classroom/server.mjs
+index d9bfe8b..c678ba6 100644
+--- a/container/classroom/server.mjs
++++ b/container/classroom/server.mjs
+@@ -16,20 +16,21 @@ const fail = (status, message) => Object.assign(new Error(message), {status});
+ // 「播了前四路」而不是一句拒绝。
+ const LIVE_MAX_LANES = 4;
+ // 中转对公开/取消公开的答复码翻成人话。跟发布密钥、推帧钥匙、凭证本身
+ // 一样，这几句话不带任何密钥内容。
+ const PUBLIC_ERRORS = {
+   401: '发布密钥无效或已吊销',
+   403: '服务器没有开启公开直播，或这场直播已被下线',
+   413: '标题太长（最多 60 个字）',
+   429: '操作太频繁，请一分钟后再试',
+ };
++const RELAY_TIMEOUT_MS = 10000;
+ const js = value => JSON.stringify(value).replaceAll('<', '\\u003c');
+ async function body(req) {
+   if (!String(req.headers['content-type'] || '').startsWith('application/json')) throw fail(400, '请求格式无效');
+   let size = 0, chunks = [];
+   for await (const chunk of req) { size += chunk.length; if (size > 16384) throw fail(413, '请求过大'); chunks.push(chunk); }
+   try { const data = JSON.parse(Buffer.concat(chunks)); if (!data || Array.isArray(data) || typeof data !== 'object') throw Error(); return data; }
+   catch { throw fail(400, '请求格式无效'); }
+ }
+ function cookie(req, name) { return (req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(name + '='))?.slice(name.length + 1); }
+ function studentPage(prefix, starting = false) {
+@@ -146,61 +147,84 @@ export class Classroom {
+     const status = await this.liveStatus(w);
+     if (!status) throw fail(409, '这个工作区现在没在直播');
+     const id = new URL(status.url).pathname.split('/').pop();
+     const answer = await this.liveRpc(w, 'LivePublishGrant');
+     const grant = answer.LiveGrant;
+     if (typeof grant !== 'string') throw fail(409, '这个工作区的 dct 版本还不支持，请先停止它再启动（会换成新镜像）');
+     const headers = {'x-live-grant': grant};
+     let body;
+     if (method === 'PUT') { headers['content-type'] = 'application/json'; body = JSON.stringify({title: [...title].slice(0, 60).join(''), key: this.publicLive.key}); }
+     let res;
+-    try { res = await fetch(`${this.publicLive.relay}/live/${encodeURIComponent(id)}/public`, {method, headers, body}); }
++    try { res = await fetch(`${this.publicLive.relay}/live/${encodeURIComponent(id)}/public`, {method, headers, body, signal: AbortSignal.timeout(RELAY_TIMEOUT_MS)}); }
+     catch { throw fail(409, '连不上直播中转，请稍后再试'); }
+     if (res.status !== 204) throw Object.assign(fail(409, PUBLIC_ERRORS[res.status] || `直播中转拒绝了（状态码 ${res.status}）`), {relayStatus: res.status});
+     return id;
+   }
+   // 公开这个工作区的直播；供管理台接口和 live-start 里的「顺便公开」共用。
+   async publishLive(w, title) {
+     title = String(title || '').trim();
+     if (!title) throw fail(400, '请填写公开标题');
+     await this.relayPublic(w, 'PUT', title);
+     w.livePublic = {title}; delete w.livePublicError;
+     this.store.audit('公开直播工作区', w);
+   }
+   // 取消公开；不影响直播本身是否还在播。
+   async unpublishLive(w) {
+     await this.relayPublic(w, 'DELETE');
+     delete w.livePublic;
+     this.store.audit('取消公开直播', w);
+   }
+   // 后台自愈：记着要公开的工作区，中转说不公开就再公开一次；被吊销/下线就停。
++  //
++  // 守护进程 RPC 和中转的 HTTP 请求都在 `store.mutate` 的队列**之外**做——那
++  // 是全局唯一一条 FIFO，管理台和学生的每个改动请求都要排它，一次卡住的
++  // 中转不该把其他人挡分钟级。真正写状态时才短暂进队列，写之前重新核对
++  // 这条记录没被同时发生的别的操作改掉（标题变了、被手动取消公开……）。
+   async healPublic() {
+-    if (!this.publicLive) return;
+-    let listed;
+-    try { const r = await fetch(`${this.publicLive.relay}/live/public`); listed = new Set((await r.json()).map(x => x.id)); }
+-    catch { return; }
+-    for (const w of this.store.data.students.filter(s => s.livePublic)) {
+-      await this.store.mutate(async () => {
+-        const status = await this.liveStatus(w).catch(() => null);
+-        if (!status) { delete w.livePublic; return; }
++    if (!this.publicLive || this.healing) return;
++    this.healing = true;
++    try {
++      let listed;
++      try {
++        const r = await fetch(`${this.publicLive.relay}/live/public`, {signal: AbortSignal.timeout(RELAY_TIMEOUT_MS)});
++        listed = new Set((await r.json()).map(x => x.id));
++      } catch { return; }
++      for (const w of this.store.data.students.filter(s => s.livePublic)) {
++        const title = w.livePublic.title;
++        let status;
++        // 问不出来（RPC 失败/超时）不等于「确认没在播」——那是
++        // `liveStatus` 自己的约定：查不出来时把决定权交给调用方，不能
++        // 静默当成没在播。这里的决定是：保留公开记录，下一轮再试。
++        try { status = await this.liveStatus(w); }
++        catch { continue; }
++        if (!status) {
++          await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title) delete w.livePublic; });
++          continue;
++        }
+         const id = new URL(status.url).pathname.split('/').pop();
+-        if (listed.has(id)) return;
+-        try { await this.relayPublic(w, 'PUT', w.livePublic.title); delete w.livePublicError; }
+-        catch (e) {
++        if (listed.has(id)) continue;
++        try {
++          await this.relayPublic(w, 'PUT', title);
++          await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title) delete w.livePublicError; });
++        } catch (e) {
+           if (e.relayStatus === 401 || e.relayStatus === 403) {
+-            w.livePublicError = e.message;
+-            delete w.livePublic;
+-            this.store.audit(`公开直播被中转拒绝（${e.message}）`, w);
++            await this.store.mutate(async () => {
++              if (w.livePublic && w.livePublic.title === title) {
++                w.livePublicError = e.message;
++                delete w.livePublic;
++                this.store.audit(`公开直播被中转拒绝（${e.message}）`, w);
++              }
++            });
+           }
+         }
+-      });
+-    }
++      }
++    } finally { this.healing = false; }
+   }
+   async state(session) {
+     if (session) await this.sso.syncRoster(session);
+     const students = []; let running = 0;
+     for (const w of this.store.data.students) { const status = await this.driver.status(w); if (status.status === 'running') running++;
+       // 在播的话把链接和人数一并带上：老师那一列要一眼看得见「谁在播、
+       // 几个人在看」，为此每行再发一次请求不值得。问不出来就当没在播，
+       // 一次抖动不该让整张表打不开。
+       if (status.status === 'running') { try { status.live = await this.liveStatus(w); } catch { status.live = null; } } if (!session || this.sso.allowed(session, w)) students.push(this.safeRow(w, status)); }
+     return {students, capacity: {running, max: this.driver.maxRunning, totalMemory: os.totalmem()}, audit: session?.external ? [] : this.store.data.audit.slice(0, 30), permissions: {manageAccess: !session?.external}, features: {publicLive: !!this.publicLive}};
+diff --git a/container/classroom/server.test.mjs b/container/classroom/server.test.mjs
+index 2de0774..4347970 100644
+--- a/container/classroom/server.test.mjs
++++ b/container/classroom/server.test.mjs
+@@ -338,10 +338,72 @@ test('没配发布密钥：管理台不开公开功能', async () => {
+   const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+   await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+   const origin = `http://127.0.0.1:${app.server.address().port}`;
+   const request = (url, body, cookie) => fetch(origin + url, {method: body === undefined ? 'GET' : 'POST', headers: {...(body === undefined ? {} : {'Content-Type': 'application/json'}), ...(cookie ? {Cookie: cookie} : {})}, body: body === undefined ? undefined : JSON.stringify(body)});
+   try {
+     const admin = (await request('/admin/api/login', {password: 'test-admin'})).headers.get('set-cookie').split(';')[0];
+     assert.equal((await (await request('/admin/api/state', undefined, admin)).json()).features.publicLive, false);
+     assert.equal((await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin)).status, 404);
+   } finally { app.server.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+ });
++
++test('自愈：daemon RPC 失败时保留公开记录，不清空、不写审计', async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-rpcfail-'));
++  const store = new Store(dir, {password: 'test-admin'});
++  const [ming] = store.add(['小明']);
++  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
++  const auditBefore = store.data.audit.length;
++  const relay = http.createServer((req, res) => {
++    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
++    res.writeHead(404); res.end();
++  });
++  await new Promise(r => relay.listen(0, '127.0.0.1', r));
++  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
++  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') throw new Error('daemon socket timeout'); return {Ok: null}; }};
++  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
++  try {
++    await app.healPublic();
++    assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播'}, 'RPC 打不通不该被当成「没在播」');
++    assert.equal(store.data.audit.length, auditBefore, '不该因为一次 RPC 失败就写审计');
++  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
++});
++
++test('自愈：daemon 确认没在播时清空公开记录', async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-notlive-'));
++  const store = new Store(dir, {password: 'test-admin'});
++  const [ming] = store.add(['小明']);
++  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
++  const relay = http.createServer((req, res) => {
++    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
++    res.writeHead(404); res.end();
++  });
++  await new Promise(r => relay.listen(0, '127.0.0.1', r));
++  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
++  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: {id: ''}}; return {Ok: null}; }};
++  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
++  try {
++    await app.healPublic();
++    assert.equal(store.data.students.find(s => s.id === ming.id).livePublic, undefined);
++  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
++});
++
++test('自愈：重入守卫挡住并发调用，中转只挨一次 PUT', async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-concurrent-'));
++  const store = new Store(dir, {password: 'test-admin'});
++  const [ming] = store.add(['小明']);
++  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
++  let puts = 0;
++  const relay = http.createServer((req, res) => {
++    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
++    if (req.method === 'PUT' && req.url === '/live/room01/public') { puts++; return setTimeout(() => { res.writeHead(204); res.end(); }, 200); }
++    res.writeHead(404); res.end();
++  });
++  await new Promise(r => relay.listen(0, '127.0.0.1', r));
++  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
++  const live = {id: 'room01', url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
++  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
++  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
++  try {
++    await Promise.all([app.healPublic(), app.healPublic()]);
++    assert.equal(puts, 1, '第二次调用该被重入守卫挡住');
++  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
++});

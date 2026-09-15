@@ -1,0 +1,15 @@
+# Fix wave (node): classroom manager public-live heal
+Worktree /Users/lei/work/dc/dc-terminal/.claude/worktrees/public-live. Files: container/classroom/server.mjs, container/classroom/server.test.mjs ONLY. A parallel agent edits Rust files in the same worktree — commit only your paths (`git commit -m ... -- container/classroom/server.mjs container/classroom/server.test.mjs`); if git reports index.lock, wait a few seconds and retry. Never git stash. English commit message, no AI attribution/Co-Authored-By lines. Reads ≤60 lines per call (grep -n first). Tests: `cd container/classroom && node --test server.test.mjs`.
+
+Context: server.mjs ~150-225 has relayPublic / publishLive / unpublishLive / healPublic. The relay (crates/dct-srv/src/live.rs:311-325) answers PUT /live/{id}/public with 401 BOTH when the room is not registered (e.g. relay restarted and the student's daemon hasn't re-started the room yet — it notices within ~20s) AND when the publish key is invalid; 403 when publishing disabled or room blocked (takedown); 413 bad title. `GET /live/{id}/lanes` with header `x-live-token: <viewer token>` returns 200 if the room exists and the token is right, 401 if the room doesn't exist. The viewer token is in the daemon's live url fragment `#t=<token>` (confirm by grepping how status.url is built / used in server.mjs or the tests' fake daemon; if the fragment key differs, use what the code uses).
+
+## I1 — relay restart must not permanently unpublish
+In healPublic, when the PUT fails with relayStatus 401: probe lanes with the viewer token (AbortSignal.timeout(RELAY_TIMEOUT_MS)). If the probe returns 401 or throws → room not (yet) registered: keep w.livePublic, set nothing, try next tick. Only if the probe returns 200 (room present) is the 401 a real key rejection → existing clear+error+audit path. 403 stays terminal as today. Add a test: relay fake where the room is absent (PUT → 401, lanes → 401) for one tick, then present → record kept and publication restored, no livePublicError. Also a test that a real bad key (room present, PUT 401) still clears with the error.
+
+## I2 — a publish is for one room
+publishLive stores `w.livePublic = {title, id}` where id is the room id relayPublic used (it returns id). healPublic: if status's room id !== w.livePublic.id → the live that was published has ended; clear the record (inside store.mutate with the same concurrency re-check, compare both title and id) with NO error and no re-publish. Existing records without id (written by the previous version): treat as the current room (adopt id on first heal) — or clear; pick adopt and say so. Test: publish room A, daemon now reports room B → heal clears record, does not PUT B.
+
+## T9 minor — live-stop clears livePublicError
+Around server.mjs:336-345 live-stop path: also `delete w.livePublicError` (and livePublic if not already). Test or assert in an existing test.
+
+Report: write .superpowers/sdd/2026-09-13-public-live-listing/fix-node-report.md (≤30 lines): commit SHA, what changed, test count. Final message ≤8 lines.

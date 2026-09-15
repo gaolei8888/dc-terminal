@@ -1,0 +1,208 @@
+# Review package: cea5faa..HEAD
+
+## Commits
+285f05f fix(srv): reconcile revoked publications by key digest, not name
+
+## Files changed
+ crates/dct-srv/src/keys.rs | 18 +++++++++++++++++-
+ crates/dct-srv/src/live.rs | 43 +++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 56 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/crates/dct-srv/src/keys.rs b/crates/dct-srv/src/keys.rs
+index 65ad400..0ed9817 100644
+--- a/crates/dct-srv/src/keys.rs
++++ b/crates/dct-srv/src/keys.rs
+@@ -92,33 +92,49 @@ impl PublishKeys {
+     }
+ 
+     pub fn block(&mut self, id: &str) {
+         if !self.is_blocked(id) {
+             self.blocked.push(id.to_string());
+         }
+     }
+ 
+     /// 这把密钥是谁的。**把每一条都比一遍**，不在第一条命中时提前返回。
+     pub fn name_for(&self, key: &str) -> Option<String> {
++        self.entry_for(key).map(|(name, _)| name)
++    }
++
++    /// 这把密钥的主人和摘要。`publish` 把摘要存进 `Public`，好让
++    /// `reconcile` 认「文件里还有没有这把钥匙」——不能只认名字：吊销
++    /// 之后拿同一个名字重发一把新钥匙，新钥匙的摘要跟旧的不一样，不该
++    /// 让旧钥匙公开过的房间借着这个新条目继续公开着。
++    ///
++    /// 常数时间比较：`key` 是调用方给的，跟 `name_for` 一样的理由。
++    pub fn entry_for(&self, key: &str) -> Option<(String, String)> {
+         let want = digest_hex(key);
+         let mut found = None;
+         for k in &self.keys {
+             if same_hex(&k.hash, &want) {
+-                found = Some(k.name.clone());
++                found = Some((k.name.clone(), k.hash.clone()));
+             }
+         }
+         found
+     }
+ 
+     pub fn is_blocked(&self, id: &str) -> bool {
+         self.blocked.iter().any(|b| b == id)
+     }
++
++    /// 这个摘要还在文件里吗。摘要来自文件本身，不是调用方能选的东西
++    /// （不像 `entry_for` 里的 `key`），用不着常数时间比较。
++    pub fn has_hash(&self, hash: &str) -> bool {
++        self.keys.iter().any(|k| k.hash == hash)
++    }
+ }
+ 
+ /// 运行中的中转手里那份密钥文件：记着上次读到的修改时间，变了才重读。
+ pub struct KeyFile {
+     path: PathBuf,
+     stamp: Option<SystemTime>,
+     keys: PublishKeys,
+ }
+ 
+ impl KeyFile {
+diff --git a/crates/dct-srv/src/live.rs b/crates/dct-srv/src/live.rs
+index 70bfc9e..5906bc2 100644
+--- a/crates/dct-srv/src/live.rs
++++ b/crates/dct-srv/src/live.rs
+@@ -47,21 +47,29 @@ struct Session {
+     lanes: Vec<Lane>,
+     fed_at: Instant,
+     next_etag: u64,
+     /// 这场直播是否公开，以及是哪把发布密钥公开的（名字只给服务器上的人看，
+     /// 不进公开列表）。**重开同一个房间号不继承它**。
+     public: Option<Public>,
+ }
+ 
+ struct Public {
+     title: String,
++    /// 只给日志/管理台看的名字——**`reconcile` 不认它**：吊销之后拿同一个
++    /// 名字重发一把新钥匙，新旧两把的名字相同、摘要不同，认名字会让旧钥匙
++    /// 公开过的房间借着新条目继续公开，破了「10 秒内收回」的承诺。这一期
++    /// 还没有审计日志/管理台读它，先留着字段，免得等那条路由落地时又要
++    /// 从别处把「谁发布的」这条信息找回来。
++    #[allow(dead_code)]
+     key_name: String,
++    /// 发布时那把密钥的摘要（`KeyEntry.hash`）。`reconcile` 认这个。
++    key_hash: String,
+ }
+ 
+ /// 证明「你控制这场直播」的两种方式。
+ pub enum Control<'a> {
+     /// 老师本机守护进程的推帧钥匙。
+     Push(&'a str),
+     /// 守护进程签发给管理台的凭证，见 `dct_link::live::publish_grant`。
+     Grant(&'a str),
+ }
+ 
+@@ -300,31 +308,32 @@ impl Live {
+         keys: Option<&PublishKeys>,
+         key: &str,
+         title: &str,
+     ) -> Result<(), LinkError> {
+         let mut rooms = self.rooms.lock().expect("live 锁");
+         let room = rooms.get_mut(id).ok_or(LinkError::Unauthorized)?;
+         if !controls(room, id, &control) {
+             return Err(LinkError::Unauthorized);
+         }
+         let keys = keys.ok_or(LinkError::NotYours)?;
+-        let key_name = keys.name_for(key).ok_or(LinkError::Unauthorized)?;
++        let (key_name, key_hash) = keys.entry_for(key).ok_or(LinkError::Unauthorized)?;
+         if keys.is_blocked(id) {
+             return Err(LinkError::NotYours);
+         }
+         let n = title.chars().count();
+         if n == 0 || n > MAX_PUBLIC_TITLE_CHARS {
+             return Err(LinkError::TooBig);
+         }
+         room.public = Some(Public {
+             title: title.to_string(),
+             key_name,
++            key_hash,
+         });
+         Ok(())
+     }
+ 
+     /// 取消公开。**幂等**：没公开也回成功。
+     pub fn unpublish(&self, id: &str, control: Control) -> Result<(), LinkError> {
+         let mut rooms = self.rooms.lock().expect("live 锁");
+         let room = rooms.get_mut(id).ok_or(LinkError::Unauthorized)?;
+         if !controls(room, id, &control) {
+             return Err(LinkError::Unauthorized);
+@@ -352,23 +361,21 @@ impl Live {
+     }
+ 
+     /// 密钥文件重载之后调：吊销了的密钥公开的、被下线的、以及总开关关掉时的
+     /// 全部公开，立刻收回。
+     pub fn reconcile(&self, keys: Option<&PublishKeys>) {
+         let mut rooms = self.rooms.lock().expect("live 锁");
+         for (id, room) in rooms.iter_mut() {
+             let keep = match (keys, room.public.as_ref()) {
+                 (_, None) => continue,
+                 (None, Some(_)) => false,
+-                (Some(k), Some(p)) => {
+-                    !k.is_blocked(id) && k.keys.iter().any(|e| e.name == p.key_name)
+-                }
++                (Some(k), Some(p)) => !k.is_blocked(id) && k.has_hash(&p.key_hash),
+             };
+             if !keep {
+                 room.public = None;
+             }
+         }
+     }
+ 
+     pub fn subscribe(&self, id: &str, lane: usize) -> Option<watch::Receiver<u64>> {
+         let rooms = self.rooms.lock().expect("live 锁");
+         Some(rooms.get(id)?.lanes.get(lane)?.tx.subscribe())
+@@ -1001,20 +1008,48 @@ mod tests {
+             }
+             assert!(live.public_list().is_empty(), "{case} 之后还挂在公开列表上");
+             assert_eq!(
+                 live.frame("abc", None, 0).err(),
+                 Some(LinkError::Unauthorized),
+                 "{case}"
+             );
+         }
+     }
+ 
++    /// 吊销之后拿**同一个名字**重发一把新钥匙（正常的密钥轮换：两步都在
++    /// 一个 10 秒重载窗口之内做完），旧钥匙公开过的房间必须收回——
++    /// `reconcile` 认的是摘要，不是名字，不能被新条目的同名字糊弄过去。
++    #[test]
++    fn reconcile_revokes_by_key_not_by_name() {
++        let live = started();
++        let (mut keys, key) = keys_with("姜老师");
++        live.publish(
++            "abc",
++            Control::Push(&"p".repeat(64)),
++            Some(&keys),
++            &key,
++            "课",
++        )
++        .unwrap();
++        keys.revoke("姜老师");
++        keys.add("姜老师", 1).unwrap();
++        live.reconcile(Some(&keys));
++        assert!(
++            live.public_list().is_empty(),
++            "吊销后同名重开，不该借新钥匙的条目继续公开"
++        );
++        assert_eq!(
++            live.frame("abc", None, 0).err(),
++            Some(LinkError::Unauthorized)
++        );
++    }
++
+     #[test]
+     fn reopening_a_room_does_not_inherit_its_public_state() {
+         let live = started();
+         let (keys, key) = keys_with("a");
+         let push = "p".repeat(64);
+         live.publish("abc", Control::Push(&push), Some(&keys), &key, "课")
+             .unwrap();
+         live.start("abc".into(), "t".repeat(64), push, vec!["前端".into()])
+             .unwrap();
+         assert!(live.public_list().is_empty());

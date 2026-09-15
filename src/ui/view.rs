@@ -84,6 +84,32 @@ impl View {
     }
 }
 
+/// 直播面板里正在填的那一行。
+#[derive(Clone, PartialEq)]
+pub enum LiveInput {
+    /// 公开标题。
+    Title(String),
+    /// 公开直播密钥。`then_publish` = 填完之后继续用这个标题公开
+    /// （按 `p` 时守护进程报 `LivePublishKeyMissing` 转过来的）。
+    Key {
+        buf: String,
+        then_publish: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for LiveInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveInput::Title(t) => f.debug_tuple("Title").field(t).finish(),
+            LiveInput::Key { then_publish, .. } => f
+                .debug_struct("Key")
+                .field("buf", &"<redacted>")
+                .field("then_publish", then_publish)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum View {
     Board,
@@ -212,9 +238,11 @@ pub(crate) enum View {
     ///
     /// 状态（链接、token、上架列表、人数、readiness）全在 `App::live` 上，
     /// 理由同 `View::Web`。这里只带一份光标——`state` 指向 `App::sessions`
-    /// 里的哪一行，空格勾它上不上架。
+    /// 里的哪一行，空格勾它上不上架。`input` 是正在填的那一行；没有输入
+    /// 行打开时是 `None`。
     Live {
         state: ListState,
+        input: Option<LiveInput>,
     },
     /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
     /// 屏幕上，profile 可配对（`pairable`）时的 Ctrl+A——跟 Ctrl+O 开
@@ -1370,6 +1398,9 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         // 这一页没有一个固定的「上一层」（设置页），所以走跟 `Web`
         // 一样落到默认分支的那句「回看板」，这里显式写出来只是让读代码的人
         // 不用去猜通配分支答的是什么。
+        // 输入行开着的时候 Esc 是「取消这次填」，不是「离开整个面板」——
+        // 跟 `Phone { .. }` 编辑态、`Pair` 输入态一个道理。
+        View::Live { input: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
         View::Live { .. } => text(Key::BackToBoard, lang).to_string(),
         _ => text(Key::BackToBoard, lang).to_string(),
     }
@@ -1757,6 +1788,12 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
         // 直播面板：`c`/`r`/`s` 只在真的在播（`live_on`）时才写得出来——
         // 没有链接可复制/换，没有播可停，写出来就是三个按下去没反应的键，
         // 犯的是这一页别处反复防的那条错。空格和 Esc 不论在不在播都能按。
+        // 输入行开着的时候别再画 `c`/`r`/`s`/空格那一套——同 `Phone { .. }`
+        // 编辑态那条「底栏说什么就得真能做到什么」的规矩，`Enter` 提交，
+        // `Esc` 取消，别的键这会儿都只是敲进输入框的字符。
+        View::Live { input: Some(_), .. } => {
+            help_items(&[("Enter", Key::Confirm), ("Esc", Key::Cancel)], lang)
+        }
         View::Live { .. } => {
             let mut items: Vec<(&'static str, Key)> = Vec::new();
             items.push((" ", Key::LiveToggleStaged));
@@ -1764,7 +1801,9 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
                 items.push(("c", Key::LiveCopyLink));
                 items.push(("r", Key::LiveNewLink));
                 items.push(("s", Key::LiveStop));
+                items.push(("p", Key::LivePublishToggle));
             }
+            items.push(("K", Key::LiveChangeKey));
             items.push(("Esc", Key::BackToBoard));
             help_items(&items, lang)
         }
@@ -1858,6 +1897,17 @@ mod tests {
     use crate::proto::InstallPrompt;
     use crate::ui::key_to_input;
 
+    /// 正在填的密钥不许出现在 `Debug` 里。
+    #[test]
+    fn a_live_key_being_typed_is_redacted_in_debug() {
+        let k = LiveInput::Key {
+            buf: "SUPER-SECRET".into(),
+            then_publish: Some("课".into()),
+        };
+        assert!(!format!("{k:?}").contains("SUPER-SECRET"));
+        assert!(format!("{:?}", LiveInput::Title("课".into())).contains("课"));
+    }
+
     /// 手机页的底栏要写着 `w`——这一页上局域网那一节的开关只有这一个入口，
     /// 底栏不写就没有任何地方告诉用户它存在。
     #[test]
@@ -1873,6 +1923,28 @@ mod tests {
     fn the_lan_toggle_is_not_offered_while_typing_a_token() {
         let bar = help_for_phone_page(true);
         assert!(!bar.contains('w'), "打字的时候底栏还写着 w：{bar}");
+    }
+
+    /// 直播面板的输入行开着的时候，底栏只写 `Enter`/`Esc`——`c`/`r`/`s`
+    /// 这会儿按下去都只是敲进输入框的字符，写出来就是骗人（同「修复 6」
+    /// 那条规矩）。
+    #[test]
+    fn the_live_input_line_shrinks_the_help_bar_to_confirm_and_cancel() {
+        let view = View::Live {
+            state: ListState::default(),
+            input: Some(LiveInput::Title("第3课".into())),
+        };
+        let ctx = HelpCtx {
+            live_on: true,
+            ..on_a_session()
+        };
+        let items = idle_help(&view, Lang::Zh, ctx);
+        let keys: Vec<&str> = items.iter().map(|i| i.key).collect();
+        assert!(keys.contains(&"Enter"), "{keys:?}");
+        assert!(keys.contains(&"Esc"), "{keys:?}");
+        for absent in ["c", "r", "s", " ", "p", "K"] {
+            assert!(!keys.contains(&absent), "{absent} 不该出现：{keys:?}");
+        }
     }
 
     fn help_for_phone_page(editing: bool) -> String {

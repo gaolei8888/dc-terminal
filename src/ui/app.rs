@@ -181,6 +181,8 @@ pub struct App {
     pub pair_last_fetch: Option<std::time::Instant>,
     /// 上次问守护进程「在不在播」的时刻，见 `live::poll_status`。
     pub live_last_fetch: Option<std::time::Instant>,
+    /// 上次公开时用过的标题，按 `p` 时预填。
+    pub last_public_title: String,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
@@ -276,6 +278,7 @@ impl App {
                 staged: Vec::new(),
                 viewers: 0,
                 readiness: crate::proto::LiveReadiness::Pending,
+                public: crate::proto::LivePublic::Private,
             },
             phone_buf: None,
             phone_verify_rx: None,
@@ -283,6 +286,7 @@ impl App {
             pair_start_rx: None,
             pair_last_fetch: None,
             live_last_fetch: None,
+            last_public_title: String::new(),
             lang,
             socket,
             start_dir: default_dir,

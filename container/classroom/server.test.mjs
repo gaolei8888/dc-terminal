@@ -306,3 +306,269 @@ test('语音输入：没配就给人话、太大就拒、key 不出现在答复�
     fs.rmSync(dir, {recursive: true, force: true});
   }
 });
+
+test('公开直播：凭证 + 管理台密钥去中转公开；错误码说人话；自愈遇到吊销就停', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-public-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  // 假中转：记下请求，按吩咐回状态码，并维护一份「公开列表」。room01 全程
+  // 当成中转已经认得的房间（守护进程一直在跑），跟「中转还没认得」是另一个
+  // 场景，见下面专门的自愈测试。
+  const seen = []; let putStatus = 204; const listed = new Set(); const registered = new Set(['room01']);
+  const relay = http.createServer((req, res) => {
+    let body = ''; req.on('data', c => body += c); req.on('end', () => {
+      seen.push({method: req.method, url: req.url, headers: req.headers, body});
+      if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end(JSON.stringify([...listed].map(id => ({id, title: 't', lanes: [], viewers: 0})))); }
+      const lanes = req.url.match(/^\/live\/([^/]+)\/lanes$/);
+      if (lanes && req.method === 'GET') { if (registered.has(lanes[1]) && req.headers['x-live-token'] === 't'.repeat(64)) { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); } res.writeHead(401); return res.end(); }
+      const m = req.url.match(/^\/live\/([^/]+)\/public$/);
+      if (m && req.method === 'PUT') { if (putStatus === 204) listed.add(m[1]); res.writeHead(putStatus); return res.end(); }
+      if (m && req.method === 'DELETE') { listed.delete(m[1]); res.writeHead(204); return res.end(); }
+      res.writeHead(404); res.end();
+    });
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  let live = {id: 'room01', token: 't'.repeat(64), url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, staged: [[1, '小明']], viewers: 2, readiness: 'Ready', public: 'Private'};
+  const driver = {
+    maxRunning: 2,
+    status: async () => ({status: 'running'}),
+    rpc: async (_, request) => {
+      if (request === 'LiveStatus') return {Live: live};
+      if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)};
+      if (request === 'List') return {Sessions: [{id: 1, profile: 'claude', state: 'Idle'}]};
+      if (request.LiveStart) return {Live: live};
+      return {Ok: null};
+    },
+  };
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const request = (url, body, cookie) => fetch(origin + url, {method: body === undefined ? 'GET' : 'POST', headers: {...(body === undefined ? {} : {'Content-Type': 'application/json'}), ...(cookie ? {Cookie: cookie} : {})}, body: body === undefined ? undefined : JSON.stringify(body)});
+  try {
+    const admin = (await request('/admin/api/login', {password: 'test-admin'})).headers.get('set-cookie').split(';')[0];
+    assert.equal((await (await request('/admin/api/state', undefined, admin)).json()).features.publicLive, true);
+
+    const ok = await request(`/admin/api/students/${ming.id}/live-public`, {title: '小明 的工作区'}, admin);
+    assert.equal(ok.status, 200);
+    const put = seen.find(s => s.method === 'PUT');
+    assert.equal(put.url, '/live/room01/public');
+    assert.equal(put.headers['x-live-grant'], 'g'.repeat(64), '用凭证，不用推帧钥匙');
+    assert.deepEqual(JSON.parse(put.body), {title: '小明 的工作区', key: 'K'.repeat(64)});
+    assert.deepEqual(new Store(dir).student(ming.id).livePublic, {title: '小明 的工作区', id: 'room01'});
+    assert.ok(new Store(dir).data.audit.some(a => /公开直播工作区/.test(a.action || a.text || JSON.stringify(a))));
+
+    // 自愈：中转重启丢了公开状态 → 重新 PUT
+    listed.clear(); seen.length = 0;
+    await app.healPublic();
+    assert.ok(seen.some(s => s.method === 'PUT'), '中转说不公开时要重新公开');
+
+    // 吊销：中转回 401 → 不再重试、清记录、行上带原因
+    listed.clear(); putStatus = 401; seen.length = 0;
+    await app.healPublic();
+    await app.healPublic();
+    assert.equal(seen.filter(s => s.method === 'PUT').length, 1, '被吊销之后又去撞了中转');
+    const state = await (await request('/admin/api/state', undefined, admin)).json();
+    const row = state.students.find(s => s.id === ming.id);
+    assert.match(row.livePublicError, /吊销/);
+
+    // T9：直播停掉之后不该还留着旧的公开错误提示
+    const stopped = await request(`/admin/api/students/${ming.id}/live-stop`, {}, admin);
+    assert.equal(stopped.status, 200);
+    assert.equal(new Store(dir).student(ming.id).livePublicError, undefined, '停止直播应该清掉公开错误提示');
+
+    // 错误映射
+    for (const [code, text] of [[401, /吊销/], [403, /没有开启公开直播|下线/], [413, /标题太长/]]) {
+      putStatus = code;
+      const r = await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin);
+      assert.equal(r.status, 409);
+      assert.match((await r.json()).error, text);
+    }
+
+    // 取消公开
+    putStatus = 204;
+    await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin);
+    const off = await request(`/admin/api/students/${ming.id}/live-private`, {}, admin);
+    assert.equal(off.status, 200);
+    assert.ok(seen.some(s => s.method === 'DELETE' && s.headers['x-live-grant'] === 'g'.repeat(64)));
+    assert.equal(new Store(dir).student(ming.id).livePublic, undefined);
+  } finally { app.server.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('没配发布密钥：管理台不开公开功能', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-public-off-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async () => ({Ok: null})};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const request = (url, body, cookie) => fetch(origin + url, {method: body === undefined ? 'GET' : 'POST', headers: {...(body === undefined ? {} : {'Content-Type': 'application/json'}), ...(cookie ? {Cookie: cookie} : {})}, body: body === undefined ? undefined : JSON.stringify(body)});
+  try {
+    const admin = (await request('/admin/api/login', {password: 'test-admin'})).headers.get('set-cookie').split(';')[0];
+    assert.equal((await (await request('/admin/api/state', undefined, admin)).json()).features.publicLive, false);
+    assert.equal((await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin)).status, 404);
+  } finally { app.server.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：daemon RPC 失败时保留公开记录，不清空、不写审计', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-rpcfail-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  const auditBefore = store.data.audit.length;
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') throw new Error('daemon socket timeout'); return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播'}, 'RPC 打不通不该被当成「没在播」');
+    assert.equal(store.data.audit.length, auditBefore, '不该因为一次 RPC 失败就写审计');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：daemon 确认没在播时清空公开记录', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-notlive-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: {id: ''}}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublic, undefined);
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：重入守卫挡住并发调用，中转只挨一次 PUT', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-concurrent-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  let puts = 0;
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    if (req.method === 'PUT' && req.url === '/live/room01/public') { puts++; return setTimeout(() => { res.writeHead(204); res.end(); }, 200); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const live = {id: 'room01', url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await Promise.all([app.healPublic(), app.healPublic()]);
+    assert.equal(puts, 1, '第二次调用该被重入守卫挡住');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：中转刚重启还没认得房间时，401 不能当成密钥被吊销——留着记录，等房间出现再补公开', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-notregistered-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播', id: 'room01'}; store.audit('公开直播工作区', ming); });
+  let registered = false, puts = 0;
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    if (req.method === 'GET' && req.url === '/live/room01/lanes') { if (registered && req.headers['x-live-token'] === 't'.repeat(64)) { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); } res.writeHead(401); return res.end(); }
+    if (req.method === 'PUT' && req.url === '/live/room01/public') { puts++; res.writeHead(registered ? 204 : 401); return res.end(); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const live = {id: 'room01', url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播', id: 'room01'}, '房间还没在中转注册，不该清记录');
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublicError, undefined, '房间还没注册不算被拒绝，不该报错');
+
+    registered = true;
+    await app.healPublic();
+    assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播', id: 'room01'}, '房间出现之后记录还在');
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublicError, undefined);
+    assert.equal(puts, 2, '两轮都该去 PUT，第二次才成功');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：房间一直在中转注册着，PUT 却始终 401——是真的密钥被吊销，照常清记录报错', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-realreject-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播', id: 'room01'}; store.audit('公开直播工作区', ming); });
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    if (req.method === 'GET' && req.url === '/live/room01/lanes') { if (req.headers['x-live-token'] === 't'.repeat(64)) { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); } res.writeHead(401); return res.end(); }
+    if (req.method === 'PUT' && req.url === '/live/room01/public') { res.writeHead(401); return res.end(); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const live = {id: 'room01', url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublic, undefined, '房间在，密钥被拒就该清记录');
+    assert.match(store.data.students.find(s => s.id === ming.id).livePublicError, /吊销/);
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：房间号变了说明那场直播已经播完，清记录但不当成被拒绝，也不去公开新房间', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-roomchanged-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播', id: 'roomA'}; store.audit('公开直播工作区', ming); });
+  const auditBefore = store.data.audit.length;
+  let puts = 0;
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    if (req.method === 'PUT') { puts++; res.writeHead(204); return res.end(); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const live = {id: 'roomB', url: `${relayUrl}/live/roomB#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublic, undefined, '老房间那场已经结束，该清记录');
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublicError, undefined, '这不是被拒绝，不该报错');
+    assert.equal(puts, 0, '不该去公开新房间——那要老师重新点');
+    assert.equal(store.data.audit.length, auditBefore, '不该因为房间号变了就写审计');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：老版本写的记录没有房间号，认领当前房间而不是清掉', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-legacyid-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    if (req.method === 'PUT' && req.url === '/live/room01/public') { res.writeHead(204); return res.end(); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const live = {id: 'room01', url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播', id: 'room01'}, '应该认领当前房间，不是清掉');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});

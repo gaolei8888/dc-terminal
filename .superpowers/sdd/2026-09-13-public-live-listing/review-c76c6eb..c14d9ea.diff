@@ -1,0 +1,1078 @@
+# Review package: c76c6eb..HEAD
+
+## Commits
+c14d9ea feat(ui): say "live publicly" on the bar, readable on every bar color
+2a145d6 feat(ui): show the title or masked key being typed, and the keys that apply
+64948c6 feat(ui): publish and unpublish from the live panel with p, enter the key with K
+f9beb2b refactor(ui): the live panel can carry an input line
+
+## Files changed
+ src/i18n.rs    |   4 +-
+ src/ui/app.rs  |   3 +
+ src/ui/live.rs | 363 +++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ src/ui/mod.rs  |  22 +++-
+ src/ui/view.rs |  74 +++++++++++-
+ 5 files changed, 453 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 813249c..57d8206 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -747,22 +747,22 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+             lang,
+             en: "No sessions in this project yet — open one first",
+             zh: "这个项目还没有会话——先开一个",
+         ),
+         LiveLinkCopied => t!(
+             lang,
+             en: "Sent to the terminal's clipboard — if it did not take, scan the code above instead",
+             zh: "已发给终端的剪贴板——若终端不支持，请扫上面的二维码",
+         ),
+         LiveStoppedMessage => t!(lang, en: "Stopped the broadcast", zh: "已停播"),
+-        LivePublishToggle => t!(lang, en: "p public/private", zh: "公开/取消公开"),
+-        LiveChangeKey => t!(lang, en: "K change key", zh: "换公开密钥"),
++        LivePublishToggle => t!(lang, en: "public/private", zh: "公开/取消公开"),
++        LiveChangeKey => t!(lang, en: "change key", zh: "换公开密钥"),
+         LiveTitlePrompt => t!(lang, en: "Public title: ", zh: "公开标题："),
+         LiveKeyPrompt => t!(lang, en: "Public live key: ", zh: "公开直播密钥："),
+         LivePublicPending => t!(lang, en: "Making it public…", zh: "正在公开…"),
+         LiveKeySaved => t!(lang, en: "Public live key saved", zh: "公开直播密钥已保存"),
+         LiveUnpublished => t!(lang, en: "No longer public", zh: "已取消公开"),
+         LiveTitleEmpty => t!(lang, en: "The title cannot be empty", zh: "标题不能为空"),
+         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
+         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
+         PhoneReconnectingLine => t!(
+             lang,
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index f685337..56ed79f 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -174,20 +174,22 @@ pub struct App {
+     /// `verify_rx` 一样在收的时候现比对一遍——用户可能已经 Esc 退出去，
+     /// 一次迟到的结果不该套在一个不相干的视图上。
+     pub pair_start_rx:
+         Option<std::sync::mpsc::Receiver<(String, Result<crate::proto::PairStartedInfo, String>)>>,
+     /// 上次轮询配对状态（`Request::PairPoll`）的时刻，把它压到 500ms 一轮——
+     /// 同 `phone_last_fetch`/`grid_last_fetch` 一个理由，这是「偶尔扫一眼」
+     /// 的东西，不用每帧都问。
+     pub pair_last_fetch: Option<std::time::Instant>,
+     /// 上次问守护进程「在不在播」的时刻，见 `live::poll_status`。
+     pub live_last_fetch: Option<std::time::Instant>,
++    /// 上次公开时用过的标题，按 `p` 时预填。
++    pub last_public_title: String,
+     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
+     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
+     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
+     pub lang: crate::i18n::Lang,
+     /// 守护进程 socket 的路径。设置文件就在它旁边（见
+     /// `settings::settings_path_for_socket`），所以改语言时要用到它。
+     /// 存路径而不是存设置文件路径：将来别的「跟着 socket 走」的文件
+     /// （profiles 目录、projects.json）也都从它推导，只留一个源头。
+     pub socket: PathBuf,
+     /// dct 启动时的目录，只用来解析用户敲进来的相对路径、以及看板上一个组
+@@ -277,20 +279,21 @@ impl App {
+                 viewers: 0,
+                 readiness: crate::proto::LiveReadiness::Pending,
+                 public: crate::proto::LivePublic::Private,
+             },
+             phone_buf: None,
+             phone_verify_rx: None,
+             phone_last_fetch: None,
+             pair_start_rx: None,
+             pair_last_fetch: None,
+             live_last_fetch: None,
++            last_public_title: String::new(),
+             lang,
+             socket,
+             start_dir: default_dir,
+             quit: false,
+             explained_failure: None,
+             copy_mode: false,
+         }
+     }
+ 
+     pub fn new(
+diff --git a/src/ui/live.rs b/src/ui/live.rs
+index 0a24ab8..bf0efc3 100644
+--- a/src/ui/live.rs
++++ b/src/ui/live.rs
+@@ -10,59 +10,78 @@
+ //! 同一个槽位，但优先级更高、而且不会被 `message` 盖掉）——这个功能最
+ //! 危险的失败模式不是链接泄露，是老师忘了自己在播、切去处理一件私事。
+ //! 常驻、不能折叠、不能关，就是为了防这件事。
+ 
+ use anyhow::Result;
+ use crossterm::event::{KeyCode, KeyEvent};
+ use ratatui::prelude::*;
+ use ratatui::widgets::{ListState, Paragraph, Wrap};
+ 
+ use crate::i18n::{msg, text, Key, Lang};
+-use crate::proto::{LiveInfo, LiveReadiness, Request, Response};
++use crate::proto::{LiveInfo, LivePublic, LiveReadiness, Request, Response};
+ use crate::session::SessionInfo;
+ 
+ use super::app::App;
+-use super::view::{is_plain_key, View};
++use super::view::{is_plain_key, LiveInput, View};
+ use super::widgets::{session_label, Msg};
+ use super::{accent, danger, dim, move_sel_n};
+ 
+ /// 在不在播——只看 `id` 是不是空串，见 `LiveState::info()` 那份约定
+ /// （没有房间时回一个 `id: String::new()` 的 `LiveInfo`，不是 `Option`，
+ /// 这样 `LiveInfo` 才能原样经过协议线又不必包一层 `Option`）。
+ pub(crate) fn is_live(info: &LiveInfo) -> bool {
+     !info.id.is_empty()
+ }
+ 
+ /// **屏幕上必须一直说着「你在播」。**
+ ///
+ /// 这个功能最危险的失败模式不是链接泄露，是老师忘了自己在播、切去处理一件
+ /// 私事。所以这一行常驻、不折叠、不可关，而且带着实时人数——「7 人在看」
+ /// 比任何提示语都有效。
+ ///
+ /// `readiness` 不是 `Ready` 的时候要如实说：中转还没认得这场直播的时候，
+ /// 这句话绝不能看着像「一切正常」——那正是老师会把一条当时打不开的链接
+ /// 发给全班的那一刻。
++///
++/// `info.public` 另外决定文案本体是「正在直播」还是「正在公开直播 ·
++/// 标题」——公开与否跟中转是否就绪是两件独立的事，所以先按 `public`
++/// 选出带不带标题的那句底稿，再各自叠一句后缀，两条后缀能同时出现。
+ pub(crate) fn live_banner(info: &LiveInfo, lang: Lang) -> String {
+-    let base = msg::live_on_air(lang, info.staged.len(), info.viewers);
++    let base = match &info.public {
++        LivePublic::Listed { title } | LivePublic::Pending { title } | LivePublic::Failed { title, .. } => {
++            msg::live_on_air_public(lang, title, info.staged.len(), info.viewers)
++        }
++        LivePublic::Private => msg::live_on_air(lang, info.staged.len(), info.viewers),
++    };
++    let base = match &info.public {
++        LivePublic::Pending { .. } => format!("{base} · {}", text(Key::LivePublicPending, lang)),
++        LivePublic::Failed { reason, .. } => format!("{base} · {}", msg::live_publish_failed(lang, reason)),
++        _ => base,
++    };
+     match &info.readiness {
+         LiveReadiness::Ready => base,
+         LiveReadiness::Pending => format!("{base} · {}", text(Key::LiveConnectingToRelay, lang)),
+         // 本地化就在这里发生——`reason` 是一个码，不是句子（见
+         // `LiveReadiness` 的文档注释）。
+         LiveReadiness::Failed(why) => format!("{base} · {}", msg::live_start_failed(lang, why)),
+     }
+ }
+ 
+ /// 这一行常驻提示该用什么颜色画：`Ready` 是安心的强调色，`Pending` 只是
+ /// 平常字（还没到出错的地步，但也不该看着跟 `Ready` 一样安心），
+-/// `Failed` 是红——它字面上就是一句错误。
++/// `Failed` 是红——它字面上就是一句错误。公开失败（`info.public` 是
++/// `Failed`）同样是红，且优先于 `readiness` 判断：中转明明就绪，但公开
++/// 没成功，这一行也不该看着安心。
+ pub(crate) fn banner_style(info: &LiveInfo) -> Style {
++    if matches!(info.public, LivePublic::Failed { .. }) {
++        return danger();
++    }
+     match &info.readiness {
+         LiveReadiness::Ready => accent(),
+         LiveReadiness::Pending => dim(),
+         LiveReadiness::Failed(_) => danger(),
+     }
+ }
+ 
+ /// 屏幕上要显示的链接：**token 打点，一个字符都不许露**。
+ ///
+ /// 跟 `web::address_for_display` 不一样的地方是这里不止剪掉 `#t=…`，
+@@ -184,21 +203,21 @@ pub(crate) fn poll_status(app: &mut App, now: std::time::Instant) {
+ /// `settings_view::open_web` 的取舍）。拿不到就当作没在播，宁可少说。
+ pub(crate) fn open(app: &mut App) {
+     app.live = match app.client().and_then(|c| c.call(Request::LiveStatus)) {
+         Ok(Response::Live(info)) => info,
+         _ => app.live.clone(),
+     };
+     let mut state = ListState::default();
+     if !current_project_sessions(app).is_empty() {
+         state.select(Some(0));
+     }
+-    app.view = View::Live { state };
++    app.view = View::Live { state, input: None };
+ }
+ 
+ /// 空格/`r` 共用的落地：把新的上架名单发给守护进程，按回答更新
+ /// `App::live`。**上架不认识的会话 id 会被整体拒绝**（`daemon.rs` 的
+ /// `validated_staging`），这条错误必须显示出来，不能悄悄吞掉——否则老师会
+ /// 以为自己按的勾生效了，而实际上整条名单都没改。
+ ///
+ /// # 开场和改上架走的是两条不同的请求
+ ///
+ /// `new_link = false`（勾选框）：已经在播的时候发 `LiveRestage`——**链接
+@@ -294,23 +313,30 @@ fn stop_live(app: &mut App) {
+             app.message = text(Key::LiveStoppedMessage, app.lang).into();
+         }
+         _ => app.message = Msg::err(text(Key::RequestFailed, app.lang).into()),
+     }
+ }
+ 
+ /// **这个函数里永远不要 `continue`。** 理由同 `web.rs`/`board.rs`：循环
+ /// 末尾还有一段清理陈旧 `message` 的逻辑，跳过它会让一句普通反馈盖掉
+ /// 屏幕上唯一的出路。
+ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+-    let View::Live { mut state } = app.view.clone() else {
++    let View::Live { mut state, input } = app.view.clone() else {
+         return Ok(());
+     };
++    // 有输入行开着的时候，输入行吃掉所有按键——不落到下面那个 match
++    // 里，否则输入标题的时候按空格会把光标下那行会话上/下架。
++    if let Some(field) = input {
++        let next = edit_live_input(app, field, key);
++        app.view = View::Live { state, input: next };
++        return Ok(());
++    }
+     match key.code {
+         KeyCode::Esc => {
+             app.view = super::home_view(app);
+             return Ok(());
+         }
+         KeyCode::Down if is_plain_key(&key) => {
+             let len = current_project_sessions(app).len();
+             move_sel_n(&mut state, len, 1);
+         }
+         KeyCode::Up if is_plain_key(&key) => {
+@@ -320,28 +346,163 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+         KeyCode::Char(' ') if is_plain_key(&key) => toggle_selected(app, &state),
+         // `c`/`r`/`s` 只在真的在播的时候才有意义——没有链接可复制/换，
+         // 没有播可停。**没有前提也不判**：屏幕上按 Esc 之外的键什么都
+         // 不发生，比按下去报一句看不懂的错要老实。
+         KeyCode::Char('c') if is_plain_key(&key) && is_live(&app.live) => {
+             write_osc52_clipboard(&app.live.url);
+             app.message = text(Key::LiveLinkCopied, app.lang).into();
+         }
+         KeyCode::Char('r') if is_plain_key(&key) && is_live(&app.live) => regenerate_link(app),
+         KeyCode::Char('s') if is_plain_key(&key) && is_live(&app.live) => stop_live(app),
++        // 公开/取消公开。已经公开就直接下架；没公开就先要个标题——密钥
++        // 缺不缺留给 `publish` 去发现，界面这里不用先猜。
++        KeyCode::Char('p') if is_plain_key(&key) && is_live(&app.live) => {
++            if matches!(app.live.public, LivePublic::Private) {
++                app.view = View::Live {
++                    state,
++                    input: Some(LiveInput::Title(app.last_public_title.clone())),
++                };
++                return Ok(());
++            }
++            unpublish(app);
++        }
++        // 单独开一条填密钥的路：不经过「先按 p」也能直接改密钥。
++        KeyCode::Char('K') if is_plain_key(&key) => {
++            app.view = View::Live {
++                state,
++                input: Some(LiveInput::Key {
++                    buf: String::new(),
++                    then_publish: None,
++                }),
++            };
++            return Ok(());
++        }
+         _ => {}
+     }
+-    app.view = View::Live { state };
++    app.view = View::Live { state, input: None };
+     Ok(())
+ }
+ 
++/// 输入行上的一次按键：编辑缓冲区，或者在 Enter/Esc 时了结这一行。
++/// 返回 `None` 表示输入行该关掉了；`Some` 表示还要继续输（或者重新弹回来，
++/// 比如空标题）。
++fn edit_live_input(app: &mut App, field: LiveInput, key: KeyEvent) -> Option<LiveInput> {
++    match key.code {
++        KeyCode::Esc => None,
++        KeyCode::Backspace => Some(match field {
++            LiveInput::Title(mut t) => {
++                t.pop();
++                LiveInput::Title(t)
++            }
++            LiveInput::Key { mut buf, then_publish } => {
++                buf.pop();
++                LiveInput::Key { buf, then_publish }
++            }
++        }),
++        KeyCode::Char(c) if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
++            Some(match field {
++                LiveInput::Title(mut t) => {
++                    t.push(c);
++                    LiveInput::Title(t)
++                }
++                LiveInput::Key { mut buf, then_publish } => {
++                    buf.push(c);
++                    LiveInput::Key { buf, then_publish }
++                }
++            })
++        }
++        KeyCode::Enter => match field {
++            LiveInput::Title(t) => {
++                let trimmed = t.trim();
++                if trimmed.is_empty() {
++                    app.message = Msg::err(text(Key::LiveTitleEmpty, app.lang).into());
++                    return Some(LiveInput::Title(t));
++                }
++                publish(app, trimmed.to_string())
++            }
++            LiveInput::Key { buf, then_publish } => {
++                match app.client().and_then(|c| {
++                    c.call(Request::SetSecret {
++                        profile: crate::secrets::LIVE_PUBLISH_KEY.into(),
++                        value: buf,
++                    })
++                }) {
++                    Ok(Response::Ok) => {
++                        app.message = text(Key::LiveKeySaved, app.lang).into();
++                        then_publish.and_then(|t| publish(app, t))
++                    }
++                    _ => {
++                        app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
++                        None
++                    }
++                }
++            }
++        },
++        _ => Some(field),
++    }
++}
++
++/// 请求公开。守护进程如果说密钥没配，界面就地转去填密钥、记下这次的
++/// 标题，填完接着公开——用户不用把这次公开重新按一遍。
++fn publish(app: &mut App, title: String) -> Option<LiveInput> {
++    match app
++        .client()
++        .and_then(|c| c.call(Request::LivePublish { title: title.clone() }))
++    {
++        Ok(Response::Live(info)) => {
++            app.live = info;
++            app.last_public_title = title;
++            None
++        }
++        Ok(Response::Error(crate::proto::ErrorCode::LivePublishKeyMissing)) => {
++            Some(LiveInput::Key {
++                buf: String::new(),
++                then_publish: Some(title),
++            })
++        }
++        Ok(Response::Error(e)) => {
++            app.message = Msg::err(msg::error(app.lang, &e));
++            None
++        }
++        _ => {
++            app.message = Msg::err(text(Key::RequestFailed, app.lang).into());
++            None
++        }
++    }
++}
++
++/// 取消公开。
++fn unpublish(app: &mut App) {
++    match app.client().and_then(|c| c.call(Request::LiveUnpublish)) {
++        Ok(Response::Live(info)) => {
++            app.live = info;
++            app.message = text(Key::LiveUnpublished, app.lang).into();
++        }
++        _ => app.message = Msg::err(text(Key::RequestFailed, app.lang).into()),
++    }
++}
++
++/// 正在填的那一行拼成要画的字。密钥永远打点，绝不把 `buf` 本身画出来——
++/// 屏幕上的字符会被投影、录屏、旁人瞥到。
++fn input_line(input: &Option<LiveInput>, lang: Lang) -> Option<String> {
++    input.as_ref().map(|input| match input {
++        LiveInput::Title(buf) => format!("{}{buf}▏", text(Key::LiveTitlePrompt, lang)),
++        LiveInput::Key { buf, .. } => format!(
++            "{}{}▏",
++            text(Key::LiveKeyPrompt, lang),
++            "•".repeat(buf.chars().count())
++        ),
++    })
++}
++
+ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+-    let View::Live { state } = app.view.clone() else {
++    let View::Live { state, input } = app.view.clone() else {
+         return;
+     };
+     let rule = if app.connected { dim() } else { danger() };
+     let body = super::widgets::header(f, area, text(Key::LiveSection, app.lang), rule);
+ 
+     let live = app.live.clone();
+     let lang = app.lang;
+     let mut lines: Vec<Line> = Vec::new();
+ 
+     if is_live(&live) {
+@@ -363,22 +524,31 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+         // `the_token_never_reaches_the_screen` 那条测试的名字里推断出一条
+         // 它并没有证明的性质。真要作废，按 `r` 换一条链接。
+         match super::web::qr_lines(&live.url, body.width) {
+             Some(qr) => lines.extend(qr),
+             // 宽度不够就换成话，不留半块码——同 `web::qr_lines` 的约定。
+             None => lines.push(Line::from(Span::styled(
+                 text(Key::WebQrTooNarrow, lang),
+                 dim(),
+             ))),
+         }
++        if let Some(line) = input_line(&input, lang) {
++            lines.push(Line::from(""));
++            lines.push(Line::from(Span::styled(line, accent())));
++        }
+     } else {
+         lines.push(Line::from(text(Key::LiveOffLine, lang)));
++        // 没在播也能按 `K` 换密钥（下次开播用）；输入行画在最上面，
++        // 免得跟下面的会话列表混在一起看不清在填什么。
++        if let Some(line) = input_line(&input, lang) {
++            lines.push(Line::from(Span::styled(line, accent())));
++        }
+     }
+ 
+     lines.push(Line::from(""));
+ 
+     let sessions = current_project_sessions(app);
+     if sessions.is_empty() {
+         lines.push(Line::from(Span::styled(
+             text(Key::LiveNoSessionsToStage, lang),
+             dim(),
+         )));
+@@ -415,53 +585,89 @@ mod tests {
+             id: "abc".into(),
+             token: "t".repeat(64),
+             url: "https://x/live/abc#t=…".into(),
+             staged,
+             viewers,
+             readiness,
+             public: LivePublic::Private,
+         }
+     }
+ 
++    #[test]
++    fn the_banner_says_public_with_the_title() {
++        let mut live = info(vec![(1, "一".into())], 7, LiveReadiness::Ready);
++        live.public = LivePublic::Listed { title: "第3课".into() };
++        let s = live_banner(&live, Lang::Zh);
++        assert!(s.contains("正在公开直播") && s.contains("第3课") && s.contains('7'), "{s}");
++
++        live.public = LivePublic::Failed { title: "第3课".into(), reason: crate::proto::LiveFailure::Refused(401) };
++        assert!(live_banner(&live, Lang::Zh).contains("吊销"), "失败原因要说出来");
++
++        live.public = LivePublic::Private;
++        assert!(!live_banner(&live, Lang::Zh).contains("公开"), "私密直播不许说公开");
++    }
++
+     /// 一个只答 `LiveStatus` 的假守护进程：回它手里此刻那份 `LiveInfo`，并记下
+     /// 被问了几次。测试改 `answer` 就是「管理台那边刚开播/停播了」。
+     fn fake_live_daemon(
+         answer: std::sync::Arc<std::sync::Mutex<LiveInfo>>,
++        has_key: std::sync::Arc<std::sync::atomic::AtomicBool>,
+     ) -> (
+         std::path::PathBuf,
+         tempfile::TempDir,
+         std::sync::Arc<std::sync::atomic::AtomicUsize>,
+     ) {
+         use std::io::{BufRead, BufReader, Write};
+         let dir = tempfile::tempdir().unwrap();
+         let sock = dir.path().join("s.sock");
+         // 同 `pair_view::tests::fake_daemon`：走 `sys::ipc`，Windows 上也编得过。
+         let listener = crate::sys::ipc::bind_private(&sock).unwrap();
+         let asked: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+         let asked2 = asked.clone();
++        let has_key2 = has_key.clone();
+         std::thread::spawn(move || {
+             for stream in listener.incoming().flatten() {
+                 let mut reader = BufReader::new(stream.try_clone().unwrap());
+                 let mut writer = stream;
+                 loop {
+                     let mut line = String::new();
+                     if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                         break;
+                     }
+                     let Ok(req) = serde_json::from_str::<Request>(&line) else {
+                         break;
+                     };
+                     let resp = match req {
+                         Request::LiveStatus => {
+                             asked2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                             Response::Live(answer.lock().unwrap().clone())
+                         }
++                        Request::LivePublish { title } => {
++                            if has_key2.load(std::sync::atomic::Ordering::SeqCst) {
++                                let mut info = answer.lock().unwrap().clone();
++                                info.public = LivePublic::Pending { title };
++                                Response::Live(info)
++                            } else {
++                                Response::Error(crate::proto::ErrorCode::LivePublishKeyMissing)
++                            }
++                        }
++                        Request::SetSecret { profile, .. }
++                            if profile == crate::secrets::LIVE_PUBLISH_KEY =>
++                        {
++                            has_key2.store(true, std::sync::atomic::Ordering::SeqCst);
++                            Response::Ok
++                        }
++                        Request::LiveUnpublish => {
++                            let mut info = answer.lock().unwrap().clone();
++                            info.public = LivePublic::Private;
++                            Response::Live(info)
++                        }
+                         _ => Response::Ok,
+                     };
+                     if writeln!(writer, "{}", serde_json::to_string(&resp).unwrap()).is_err() {
+                         break;
+                     }
+                 }
+             }
+         });
+         (sock, dir, asked)
+     }
+@@ -484,21 +690,22 @@ mod tests {
+     /// 那一刻学生的界面从没进过直播面板，`App::live` 以前就一直停在「没在播」
+     /// ——全班在看他的屏幕，他自己屏幕上一个字都没有。这是这个功能最危险的
+     /// 失败模式（见模块头）换了个更糟的形状：连「忘了」都谈不上，是根本不知道。
+     ///
+     /// 断言落在**会话视图**里：浏览器里的学生打开页面就被直接送进他那个唯一
+     /// 的会话，而会话视图恰恰是主循环不拉会话列表的那一屏——搭列表的便车
+     /// 就正好漏掉最该看到这行字的人。
+     #[test]
+     fn a_broadcast_started_elsewhere_reaches_the_banner_even_inside_a_session() {
+         let answer = std::sync::Arc::new(std::sync::Mutex::new(not_live()));
+-        let (sock, _fake, asked) = fake_live_daemon(answer.clone());
++        let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let (sock, _fake, asked) = fake_live_daemon(answer.clone(), has_key);
+         let (mut app, _dir) = App::test_app();
+         app.client = Some(crate::client::Client::connect(&sock).unwrap());
+         app.connected = true;
+         app.view = View::Attached(1);
+         let t0 = std::time::Instant::now();
+ 
+         // 管理台那边开播了
+         *answer.lock().unwrap() = info(vec![(1, "小明".into())], 5, LiveReadiness::Ready);
+         poll_status(&mut app, t0);
+         assert!(is_live(&app.live), "别处开的播必须被这一侧看见");
+@@ -631,20 +838,21 @@ mod tests {
+     /// `the_token_is_nowhere_on_the_screen`。
+     ///
+     /// 二维码那块字符不是文字，也不会在这里被匹配出来——它画的确实是带
+     /// token 的完整链接（学生要扫它）。这条测试和它在 `web.rs` 的孪生兄弟
+     /// 都只管"能不能被人抄下来"，管不着"能不能被摄像头读走"。
+     #[test]
+     fn the_token_is_nowhere_on_the_screen() {
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Live {
+             state: ListState::default(),
++            input: None,
+         };
+         app.live = LiveInfo {
+             id: "abc".into(),
+             token: "deadbeefcafe".repeat(4),
+             url: format!("https://x/live/abc#t={}", "deadbeefcafe".repeat(4)),
+             staged: vec![],
+             viewers: 3,
+             readiness: LiveReadiness::Ready,
+             public: LivePublic::Private,
+         };
+@@ -656,20 +864,21 @@ mod tests {
+             "令牌被写到屏幕上了：\n{screen}"
+         );
+     }
+ 
+     /// 窗口太窄画不下码的时候，不许留一块画不全的码。
+     #[test]
+     fn a_narrow_window_says_so_instead_of_drawing_half_a_code() {
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Live {
+             state: ListState::default(),
++            input: None,
+         };
+         app.live = LiveInfo {
+             id: "abc".into(),
+             token: "t".repeat(64),
+             url: "https://x/live/abc#t=deadbeefcafe".into(),
+             staged: vec![],
+             viewers: 0,
+             readiness: LiveReadiness::Ready,
+             public: LivePublic::Private,
+         };
+@@ -682,33 +891,35 @@ mod tests {
+             "窄窗口下没给出路：\n{screen}"
+         );
+     }
+ 
+     /// Esc 退回家视图——列表模式下就是看板。
+     #[test]
+     fn escape_goes_home() {
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Live {
+             state: ListState::default(),
++            input: None,
+         };
+ 
+         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+ 
+         assert!(matches!(app.view, View::Board));
+     }
+ 
+     /// 不在播的时候，`c`/`r`/`s` 什么都不该发生——没有链接可复制/换/停。
+     #[test]
+     fn c_r_s_do_nothing_when_not_live() {
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Live {
+             state: ListState::default(),
++            input: None,
+         };
+ 
+         for code in [KeyCode::Char('c'), KeyCode::Char('r'), KeyCode::Char('s')] {
+             handle_key(&mut app, key(code)).unwrap();
+         }
+ 
+         assert!(app.live.id.is_empty(), "没在播的时候不该凭空冒出一个房间");
+     }
+ 
+     /// **已经在播的时候改勾选，走的必须是 `LiveRestage`。** 走 `LiveStart`
+@@ -794,11 +1005,145 @@ mod tests {
+             token: String::new(),
+             url: String::new(),
+             staged: vec![],
+             viewers: 0,
+             readiness: LiveReadiness::Pending,
+             public: LivePublic::Private,
+         };
+         assert!(!is_live(&off));
+         assert!(is_live(&info(vec![], 0, LiveReadiness::Ready)));
+     }
++
++    fn press_live(app: &mut App, code: KeyCode) {
++        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
++    }
++
++    fn type_text(app: &mut App, s: &str) {
++        for c in s.chars() {
++            press_live(app, KeyCode::Char(c));
++        }
++    }
++
++    #[test]
++    fn publishing_asks_for_a_title_then_a_key_when_missing_then_continues() {
++        let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let answer = std::sync::Arc::new(std::sync::Mutex::new(info(
++            vec![(1, "一".into())],
++            0,
++            LiveReadiness::Ready,
++        )));
++        let (sock, _fake, _asked) = fake_live_daemon(answer, has_key.clone());
++        let (mut app, _dir) = App::test_app();
++        app.client = Some(crate::client::Client::connect(&sock).unwrap());
++        app.connected = true;
++        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
++        app.view = View::Live {
++            state: ListState::default(),
++            input: None,
++        };
++        press_live(&mut app, KeyCode::Char('p'));
++        assert!(matches!(
++            &app.view,
++            View::Live {
++                input: Some(LiveInput::Title(_)),
++                ..
++            }
++        ));
++        type_text(&mut app, "第3课");
++        press_live(&mut app, KeyCode::Enter);
++        assert!(matches!(
++            &app.view,
++            View::Live {
++                input: Some(LiveInput::Key { then_publish: Some(t), .. }),
++                ..
++            } if t == "第3课"
++        ));
++        type_text(&mut app, "the-key");
++        press_live(&mut app, KeyCode::Enter);
++        assert!(
++            has_key.load(std::sync::atomic::Ordering::SeqCst),
++            "密钥要存进守护进程"
++        );
++        assert!(
++            matches!(app.live.public, LivePublic::Pending { .. }),
++            "存完密钥要自动继续公开"
++        );
++        assert!(matches!(&app.view, View::Live { input: None, .. }));
++        assert_eq!(app.last_public_title, "第3课");
++    }
++
++    #[test]
++    fn an_empty_title_is_refused_on_the_spot() {
++        let (mut app, _dir) = App::test_app();
++        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
++        app.view = View::Live {
++            state: ListState::default(),
++            input: Some(LiveInput::Title("   ".into())),
++        };
++        press_live(&mut app, KeyCode::Enter);
++        assert!(app.message.error, "空标题要当场说");
++        assert!(matches!(
++            &app.view,
++            View::Live {
++                input: Some(LiveInput::Title(_)),
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn p_on_a_public_live_unpublishes() {
++        let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
++        let answer = std::sync::Arc::new(std::sync::Mutex::new(info(
++            vec![(1, "一".into())],
++            0,
++            LiveReadiness::Ready,
++        )));
++        let (sock, _fake, _asked) = fake_live_daemon(answer, has_key);
++        let (mut app, _dir) = App::test_app();
++        app.client = Some(crate::client::Client::connect(&sock).unwrap());
++        app.connected = true;
++        let mut live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
++        live.public = LivePublic::Listed { title: "课".into() };
++        app.live = live;
++        app.view = View::Live {
++            state: ListState::default(),
++            input: None,
++        };
++        press_live(&mut app, KeyCode::Char('p'));
++        assert_eq!(app.live.public, LivePublic::Private);
++        assert!(matches!(&app.view, View::Live { input: None, .. }));
++    }
++
++    /// 正在填的密钥不许出现在屏幕上。
++    #[test]
++    fn the_key_being_typed_is_never_drawn() {
++        let (mut app, _dir) = App::test_app();
++        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
++        app.view = View::Live {
++            state: ListState::default(),
++            input: Some(LiveInput::Key {
++                buf: "SUPER-SECRET".into(),
++                then_publish: None,
++            }),
++        };
++        let screen = screen_of(&mut app, 100, 40);
++        assert!(!screen.contains("SUPER-SECRET"), "{screen}");
++        assert!(screen.contains("•"), "要画打点，让人知道打进去了：{screen}");
++    }
++
++    /// 标题输入行画出来，用户看得见自己在打什么。
++    #[test]
++    fn the_title_being_typed_is_drawn() {
++        let (mut app, _dir) = App::test_app();
++        app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
++        app.view = View::Live {
++            state: ListState::default(),
++            input: Some(LiveInput::Title("第3课".into())),
++        };
++        let screen: String = screen_of(&mut app, 100, 40)
++            .chars()
++            .filter(|c| !c.is_whitespace())
++            .collect();
++        assert!(screen.contains("第3课"), "{screen}");
++    }
+ }
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 1b42fc9..3c0219d 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -311,24 +311,31 @@ fn bar_danger(t: BarTheme) -> Style {
+ /// 底栏上那行「● 正在直播」该用什么样式。
+ ///
+ /// `live::banner_style` 挑的是 `accent`/`dim`/`danger`——压在**终端背景**上
+ /// 读得清的颜色，直播面板里那一行用它没错。可同一句话画进底栏时底下是色条
+ /// 自己铺的底：浅色终端上 `accent()` 是 24 号深蓝，压在 `Slate` 那档 #5f5f87
+ /// 上 1.16:1。这是整块屏幕上最要紧的一行字，偏偏最读不清。
+ ///
+ /// 所以实色档下三种状态只用色条自己能保证的东西区分：就绪加粗、还在等中转
+ /// 是平常字、失败用自带底色的那块红（`bar_danger`）。横线档没有实色底，照旧
+ /// 走 `live::banner_style`。
++///
++/// 公开失败（`info.public` 是 `Failed`）也用 `bar_danger`，且判在
++/// `readiness` 之前——理由跟 `live::banner_style` 一样：中转就绪不等于
++/// 公开成功。
+ fn bar_live_style(info: &crate::proto::LiveInfo, t: BarTheme) -> Style {
+     if bar_style(t).is_none() {
+         return live::banner_style(info);
+     }
++    if matches!(info.public, crate::proto::LivePublic::Failed { .. }) {
++        return bar_danger(t);
++    }
+     match &info.readiness {
+         crate::proto::LiveReadiness::Ready => Style::default().add_modifier(Modifier::BOLD),
+         crate::proto::LiveReadiness::Pending => Style::default(),
+         crate::proto::LiveReadiness::Failed(_) => bar_danger(t),
+     }
+ }
+ 
+ /// 还原终端：退出 raw mode、关掉括号粘贴、离开 alternate screen。
+ ///
+ /// 抽成自由函数是因为有两个调用方——`TerminalGuard::drop` 和信号线程。
+@@ -3478,21 +3485,21 @@ is_agent = true
+                 token: "t".repeat(64),
+                 url: "https://x/live/abc#t=…".into(),
+                 staged: vec![(1, "小明".into())],
+                 viewers: 3,
+                 readiness,
+                 public: crate::proto::LivePublic::Private,
+             };
+             (app, dir)
+         }
+ 
+-        let cases: [Case; 7] = [
++        let cases: [Case; 9] = [
+             ("看板按键表", || {
+                 app_with_one_agent_session(View::Board)
+             }),
+             ("会话逃生提示", || {
+                 app_with_one_agent_session(View::Attached(1))
+             }),
+             ("错误提示", || {
+                 let (mut app, dir) = app_with_one_agent_session(View::Board);
+                 app.message = Msg::err("不是一个目录".into());
+                 (app, dir)
+@@ -3503,20 +3510,33 @@ is_agent = true
+                 app.connected = false;
+                 (app, dir)
+             }),
+             ("正在直播", || live(crate::proto::LiveReadiness::Ready)),
+             ("正在连接中转", || live(crate::proto::LiveReadiness::Pending)),
+             ("开播失败", || {
+                 live(crate::proto::LiveReadiness::Failed(
+                     crate::proto::LiveFailure::Unreachable,
+                 ))
+             }),
++            ("正在公开直播", || {
++                let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
++                app.live.public = crate::proto::LivePublic::Listed { title: "第3课".into() };
++                (app, dir)
++            }),
++            ("公开失败", || {
++                let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
++                app.live.public = crate::proto::LivePublic::Failed {
++                    title: "第3课".into(),
++                    reason: crate::proto::LiveFailure::Refused(401),
++                };
++                (app, dir)
++            }),
+         ];
+ 
+         for t in BarTheme::all() {
+             let Some(bar) = bar_style(*t) else { continue };
+             let fg = bar.fg.expect("实色条必须给出前景色");
+             let danger_fg = Color::Indexed(BAR_DANGER.1);
+             let danger_bg = Color::Indexed(BAR_DANGER.0);
+ 
+             for (label, make) in cases {
+                 let (mut app, _dir) = make();
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index 8596e77..a4cdba3 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -77,20 +77,46 @@ impl View {
+     ///
+     /// **所有「进/回九宫格」的地方都走这里。** 把 `reply` 显式写成 `None`
+     /// 散落在几十个构造点上，只要漏一处就是「切个视图回来，刚打的半句话
+     /// 还在框里」——而那半句话下一个回车就发给 agent 了。开框永远是用户的
+     /// 一次显式动作（按 `i`），没有任何一条路径该顺手把它带开。
+     pub(crate) fn grid(focus: usize) -> View {
+         View::Grid { focus, reply: None }
+     }
+ }
+ 
++/// 直播面板里正在填的那一行。
++#[derive(Clone, PartialEq)]
++pub enum LiveInput {
++    /// 公开标题。
++    Title(String),
++    /// 公开直播密钥。`then_publish` = 填完之后继续用这个标题公开
++    /// （按 `p` 时守护进程报 `LivePublishKeyMissing` 转过来的）。
++    Key {
++        buf: String,
++        then_publish: Option<String>,
++    },
++}
++
++impl std::fmt::Debug for LiveInput {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            LiveInput::Title(t) => f.debug_tuple("Title").field(t).finish(),
++            LiveInput::Key { then_publish, .. } => f
++                .debug_struct("Key")
++                .field("buf", &"<redacted>")
++                .field("then_publish", then_publish)
++                .finish(),
++        }
++    }
++}
++
+ #[derive(Clone)]
+ pub(crate) enum View {
+     Board,
+     Attached(u32),
+     /// 九宫格：平铺所有会话的实时画面。`focus` 是**全体会话**里的下标
+     /// （不是当页内的），当前页从它推导，见 `grid::page_of`。
+     ///
+     /// **格子本身始终只读**，这是设计约束不是偷懒：一个会话的 PTY 只有一份
+     /// 尺寸，要让 agent 的完整界面在格子里能用，就得把 PTY 缩到格子那么小
+     /// ——80×24 终端下格子内区只有 25×5，Claude Code 光是底部那条状态栏就要
+@@ -205,23 +231,25 @@ pub(crate) enum View {
+     ///
+     /// **一个字段都不带**：这一页要显示的状态全在 `App::web` 上，理由见
+     /// 那个字段的文档注释（手机通知那条异步刷新会重建 `View::Phone`，
+     /// 塞在视图里的状态会被无声冲掉；这一页没有那条路，但把状态放在
+     /// 同一个地方，两页读的就是同一份真相）。
+     Web,
+     /// 直播面板：上架/下架会话、看链接和二维码、停播。看板/附着视图按 `L` 进。
+     ///
+     /// 状态（链接、token、上架列表、人数、readiness）全在 `App::live` 上，
+     /// 理由同 `View::Web`。这里只带一份光标——`state` 指向 `App::sessions`
+-    /// 里的哪一行，空格勾它上不上架。
++    /// 里的哪一行，空格勾它上不上架。`input` 是正在填的那一行；没有输入
++    /// 行打开时是 `None`。
+     Live {
+         state: ListState,
++        input: Option<LiveInput>,
+     },
+     /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
+     /// 屏幕上，profile 可配对（`pairable`）时的 Ctrl+A——跟 Ctrl+O 开
+     /// 申领页同一个键位规矩，不占用一个字母，密钥输入本身还要用它们）。
+     ///
+     /// 三个阶段，**每一个都必须有一条出路**——没有出路的错误屏等于死路，
+     /// 见 `pair_view.rs` 的按键处理和它的测试。
+     Pair {
+         profile: String,
+         phase: PairPhase,
+@@ -1310,20 +1338,23 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
+         // 配对屏的 Esc 是真取消（发 `PairCancel`），落点是回家。
+         // `View::Pair` 确实带着一个 `return_to`，但那记的是**配对成功**
+         // 之后该去哪儿（回家，还是把学生要的那个会话开起来）；取消的
+         // 语义是「这件事我不做了」，没有一个「接着做」的下一步可去，
+         // 所以它跟别的取消一样回看板。
+         View::Pair { .. } => text(Key::BackToBoard, lang).to_string(),
+         // 直播面板从看板/附着视图进来，退出就回那一屏——跟 `Web` 不一样，
+         // 这一页没有一个固定的「上一层」（设置页），所以走跟 `Web`
+         // 一样落到默认分支的那句「回看板」，这里显式写出来只是让读代码的人
+         // 不用去猜通配分支答的是什么。
++        // 输入行开着的时候 Esc 是「取消这次填」，不是「离开整个面板」——
++        // 跟 `Phone { .. }` 编辑态、`Pair` 输入态一个道理。
++        View::Live { input: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
+         View::Live { .. } => text(Key::BackToBoard, lang).to_string(),
+         _ => text(Key::BackToBoard, lang).to_string(),
+     }
+ }
+ 
+ /// 底栏画按键表时需要知道的「现在能干什么」。
+ ///
+ /// 不传整个 `App` 是为了能单测：这一屏的规则全是「有没有选中 / 选中的是什么」
+ /// 的组合，拿两个字段就能穷举，拽进一个连着 socket 的 `App` 只会让测试
+ /// 写不出来。
+@@ -1696,28 +1727,36 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool)
+                 items.push(("x", Key::WebTurnOff));
+             } else {
+                 items.push(("Enter", Key::WebTurnOn));
+             }
+             items.push(("Esc", Key::BackToSettingsWord));
+             help_items(&items, lang)
+         }
+         // 直播面板：`c`/`r`/`s` 只在真的在播（`live_on`）时才写得出来——
+         // 没有链接可复制/换，没有播可停，写出来就是三个按下去没反应的键，
+         // 犯的是这一页别处反复防的那条错。空格和 Esc 不论在不在播都能按。
++        // 输入行开着的时候别再画 `c`/`r`/`s`/空格那一套——同 `Phone { .. }`
++        // 编辑态那条「底栏说什么就得真能做到什么」的规矩，`Enter` 提交，
++        // `Esc` 取消，别的键这会儿都只是敲进输入框的字符。
++        View::Live { input: Some(_), .. } => {
++            help_items(&[("Enter", Key::Confirm), ("Esc", Key::Cancel)], lang)
++        }
+         View::Live { .. } => {
+             let mut items: Vec<(&'static str, Key)> = Vec::new();
+             items.push((" ", Key::LiveToggleStaged));
+             if ctx.live_on {
+                 items.push(("c", Key::LiveCopyLink));
+                 items.push(("r", Key::LiveNewLink));
+                 items.push(("s", Key::LiveStop));
++                items.push(("p", Key::LivePublishToggle));
+             }
++            items.push(("K", Key::LiveChangeKey));
+             items.push(("Esc", Key::BackToBoard));
+             help_items(&items, lang)
+         }
+         View::Phone { status } => {
+             use crate::proto::PhoneState;
+             // **修复 6。** 令牌输入框开着的时候别再画 `status` 派生的那几个
+             // 键——`Enter 填令牌`/`x 关掉` 在这个状态下是假的：`Enter` 会把
+             // 这行提交成新令牌，`x` 只是敲进输入框的一个字母，真正能取消的
+             // 是 `Esc`。继续画旧的那三个键，就是「底栏说什么就得真能做到
+             // 什么」在这一页被破坏的样子。
+@@ -1797,37 +1836,70 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool)
+         }
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::proto::InstallPrompt;
+     use crate::ui::key_to_input;
+ 
++    /// 正在填的密钥不许出现在 `Debug` 里。
++    #[test]
++    fn a_live_key_being_typed_is_redacted_in_debug() {
++        let k = LiveInput::Key {
++            buf: "SUPER-SECRET".into(),
++            then_publish: Some("课".into()),
++        };
++        assert!(!format!("{k:?}").contains("SUPER-SECRET"));
++        assert!(format!("{:?}", LiveInput::Title("课".into())).contains("课"));
++    }
++
+     /// 手机页的底栏要写着 `w`——这一页上局域网那一节的开关只有这一个入口，
+     /// 底栏不写就没有任何地方告诉用户它存在。
+     #[test]
+     fn the_phone_page_offers_the_lan_toggle() {
+         let bar = help_for_phone_page(false);
+         assert!(bar.contains('w'), "底栏没写 w：{bar}");
+     }
+ 
+     /// 但**正在打令牌的时候不写**：那会儿 `w` 是敲进输入框的一个字母，
+     /// 不是开关（见 `phone::w_while_typing_a_token_is_just_a_letter`）。
+     /// 底栏说什么就得真能做到什么——这一页早就有这条规矩（「修复 6」）。
+     #[test]
+     fn the_lan_toggle_is_not_offered_while_typing_a_token() {
+         let bar = help_for_phone_page(true);
+         assert!(!bar.contains('w'), "打字的时候底栏还写着 w：{bar}");
+     }
+ 
++    /// 直播面板的输入行开着的时候，底栏只写 `Enter`/`Esc`——`c`/`r`/`s`
++    /// 这会儿按下去都只是敲进输入框的字符，写出来就是骗人（同「修复 6」
++    /// 那条规矩）。
++    #[test]
++    fn the_live_input_line_shrinks_the_help_bar_to_confirm_and_cancel() {
++        let view = View::Live {
++            state: ListState::default(),
++            input: Some(LiveInput::Title("第3课".into())),
++        };
++        let ctx = HelpCtx {
++            live_on: true,
++            ..on_a_session()
++        };
++        let items = idle_help(&view, Lang::Zh, ctx);
++        let keys: Vec<&str> = items.iter().map(|i| i.key).collect();
++        assert!(keys.contains(&"Enter"), "{keys:?}");
++        assert!(keys.contains(&"Esc"), "{keys:?}");
++        for absent in ["c", "r", "s", " ", "p", "K"] {
++            assert!(!keys.contains(&absent), "{absent} 不该出现：{keys:?}");
++        }
++    }
++
+     fn help_for_phone_page(editing: bool) -> String {
+         let view = View::Phone {
+             status: crate::proto::PhoneStatus {
+                 state: crate::proto::PhoneState::Off,
+                 bot: None,
+                 owner: None,
+             },
+         };
+         let ctx = HelpCtx {
+             phone_editing: editing,

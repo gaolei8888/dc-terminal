@@ -1,0 +1,742 @@
+# Review package: 13edaa9..HEAD
+
+## Commits
+cea5faa feat(srv): rooms can be published, read without a token while public, and withdrawn
+
+## Files changed
+ crates/dct-srv/src/lib.rs  |   6 +-
+ crates/dct-srv/src/live.rs | 399 ++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 383 insertions(+), 22 deletions(-)
+
+## Diff
+diff --git a/crates/dct-srv/src/lib.rs b/crates/dct-srv/src/lib.rs
+index 9f272b0..055f1d0 100644
+--- a/crates/dct-srv/src/lib.rs
++++ b/crates/dct-srv/src/lib.rs
+@@ -417,26 +417,26 @@ async fn live_frame_route(
+     uri: Uri,
+     headers: HeaderMap,
+ ) -> Result<Response, Rejected> {
+     let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+     let query = parse_query(&uri);
+     let lane: usize = query.get("lane").and_then(|v| v.parse().ok()).unwrap_or(0);
+     let wait = query.contains_key("wait");
+     let seen: Option<u64> = header(&headers, "if-none-match")
+         .and_then(|v| v.trim_matches('"').parse().ok());
+ 
+-    let (mut body, mut etag) = live.frame(&id, token, lane)?;
++    let (mut body, mut etag) = live.frame(&id, Some(token), lane)?;
+     if wait && seen == Some(etag) {
+         if let Some(mut rx) = live.subscribe(&id, lane) {
+             let _ = tokio::time::timeout(dct_link::live::WAIT_TIMEOUT, rx.changed()).await;
+         }
+-        (body, etag) = live.frame(&id, token, lane)?;
++        (body, etag) = live.frame(&id, Some(token), lane)?;
+     }
+     if seen == Some(etag) {
+         return Ok(StatusCode::NOT_MODIFIED.into_response());
+     }
+     Ok((
+         [
+             (axum::http::header::ETAG, format!("\"{etag}\"")),
+             (axum::http::header::CONTENT_ENCODING, "gzip".to_string()),
+             (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+         ],
+@@ -461,21 +461,21 @@ struct LiveLanesResponse {
+ /// 直播根本不存在回同一个 401**——`Live::lanes` 内部走的是跟 `Live::frame`
+ /// 同一个 `authed()`，理由写在 `live.rs` 那段注释里：分开回的话，拿一把
+ /// 猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠错误码反推出哪个 id
+ /// 现在正播着，把这条路径当探测器用。
+ async fn live_lanes_route(
+     State(live): State<Arc<Live>>,
+     Path(id): Path<String>,
+     headers: HeaderMap,
+ ) -> Result<Json<LiveLanesResponse>, Rejected> {
+     let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+-    let lanes = live.lanes(&id, token)?;
++    let lanes = live.lanes(&id, Some(token))?.0;
+     let viewers = live.viewers(&id);
+     Ok(Json(LiveLanesResponse { lanes, viewers }))
+ }
+ 
+ /// 老师停播：整场直播连同两把钥匙一起立刻蒸发。跟推帧同一把 `x-live-push`
+ /// 校验——live-id 对每个学生都是已知的，停播要是只认 id，随便一个学生打开
+ /// devtools 发一个 `DELETE` 就能掐断全班的课，比伪造画面还省事。
+ async fn live_stop_route(
+     State(live): State<Arc<Live>>,
+     Path(id): Path<String>,
+diff --git a/crates/dct-srv/src/live.rs b/crates/dct-srv/src/live.rs
+index f084196..70bfc9e 100644
+--- a/crates/dct-srv/src/live.rs
++++ b/crates/dct-srv/src/live.rs
+@@ -20,38 +20,64 @@
+ //! 全部前提是**学生只读**。所以拆成两把钥匙：`viewer_token` 只能读
+ //! （`frame`/`lanes`），`push_secret` 只能写（`push`）。两把都只存摘要，
+ //! 不存原文。
+ 
+ use std::collections::HashMap;
+ use std::sync::Mutex;
+ use std::time::Instant;
+ 
+ use dct_link::live::{
+     LIVE_TTL, MAX_FRAME_BYTES, MAX_KEY_CHARS, MAX_LANES, MAX_LANE_NAME_CHARS, MAX_LIVE_ID_CHARS,
+-    MIN_KEY_CHARS,
++    MAX_PUBLIC_TITLE_CHARS, MIN_KEY_CHARS, RESERVED_LIVE_ID,
+ };
+ use dct_link::LinkError;
+ use tokio::sync::watch;
+ 
++use crate::keys::PublishKeys;
++
+ struct Lane {
+     name: String,
+     frame: Vec<u8>,
+     etag: u64,
+     tx: watch::Sender<u64>,
+ }
+ 
+ struct Session {
+     viewer_hash: [u8; 32],
+     push_hash: [u8; 32],
+     lanes: Vec<Lane>,
+     fed_at: Instant,
+     next_etag: u64,
++    /// 这场直播是否公开，以及是哪把发布密钥公开的（名字只给服务器上的人看，
++    /// 不进公开列表）。**重开同一个房间号不继承它**。
++    public: Option<Public>,
++}
++
++struct Public {
++    title: String,
++    key_name: String,
++}
++
++/// 证明「你控制这场直播」的两种方式。
++pub enum Control<'a> {
++    /// 老师本机守护进程的推帧钥匙。
++    Push(&'a str),
++    /// 守护进程签发给管理台的凭证，见 `dct_link::live::publish_grant`。
++    Grant(&'a str),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
++pub struct PublicEntry {
++    pub id: String,
++    pub title: String,
++    pub lanes: Vec<String>,
++    pub viewers: u32,
+ }
+ 
+ /// 一个来源最近这一个窗口里建了几场。见 [`Live::note_start`]。
+ struct Starts {
+     /// 这个窗口是什么时候开始的。到点就整段翻篇，不做滑动窗口——建房是
+     /// 稀疏事件，滑动窗口那点精度换不来什么，反倒要给每个来源存一串时间戳。
+     since: Instant,
+     count: u32,
+ }
+ 
+@@ -104,20 +130,21 @@ impl Live {
+                 .iter()
+                 .any(|k| k.chars().count() > MAX_KEY_CHARS)
+             || lanes
+                 .iter()
+                 .any(|n| n.is_empty() || n.chars().count() > MAX_LANE_NAME_CHARS)
+         {
+             return Err(LinkError::TooBig);
+         }
+         // id 会原样出现在学生链接的路径里：只许字母数字和 `-`/`_`。
+         if id.is_empty()
++            || id == RESERVED_LIVE_ID
+             || !id
+                 .chars()
+                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+             || [&viewer_token, &push_secret]
+                 .iter()
+                 .any(|k| k.chars().count() < MIN_KEY_CHARS)
+         {
+             return Err(LinkError::Unauthorized);
+         }
+         let mut rooms = self.rooms.lock().expect("live 锁");
+@@ -153,20 +180,21 @@ impl Live {
+             })
+             .collect();
+         rooms.insert(
+             id,
+             Session {
+                 viewer_hash: hash(&viewer_token),
+                 push_hash: hash(&push_secret),
+                 lanes,
+                 fed_at: Instant::now(),
+                 next_etag: 1,
++                public: None,
+             },
+         );
+         Ok(())
+     }
+ 
+     /// 记一次建房尝试，顺便判断这个来源是不是敲得太快了。
+     ///
+     /// **在 `start` 之前调**，路由层负责：房间总数有上限之后，剩下的攻击
+     /// 是「把上限占满」——反复建房间让真正的老师开不了播。按来源节流拦的
+     /// 是这个。
+@@ -228,31 +256,124 @@ impl Live {
+         // 空 body = 保活，只续 `fed_at`，不动画面也不叫醒任何人。
+         if frame.is_empty() {
+             return Ok(slot.etag);
+         }
+         slot.frame = frame;
+         slot.etag = etag;
+         let _ = slot.tx.send(etag);
+         Ok(etag)
+     }
+ 
+-    pub fn frame(&self, id: &str, token: &str, lane: usize) -> Result<(Vec<u8>, u64), LinkError> {
++    pub fn frame(
++        &self,
++        id: &str,
++        token: Option<&str>,
++        lane: usize,
++    ) -> Result<(Vec<u8>, u64), LinkError> {
+         let rooms = self.rooms.lock().expect("live 锁");
+         let room = authed(&rooms, id, token)?;
+         let slot = room.lanes.get(lane).ok_or(LinkError::Unauthorized)?;
+         Ok((slot.frame.clone(), slot.etag))
+     }
+ 
+-    pub fn lanes(&self, id: &str, token: &str) -> Result<Vec<String>, LinkError> {
++    /// 路名，以及公开标题（私密房间是 `None`）。推帧线程靠这第二个值得知
++    /// 「我这场现在公不公开」——包括管理台代为公开的情况。
++    pub fn lanes(
++        &self,
++        id: &str,
++        token: Option<&str>,
++    ) -> Result<(Vec<String>, Option<String>), LinkError> {
+         let rooms = self.rooms.lock().expect("live 锁");
+         let room = authed(&rooms, id, token)?;
+-        Ok(room.lanes.iter().map(|l| l.name.clone()).collect())
++        Ok((
++            room.lanes.iter().map(|l| l.name.clone()).collect(),
++            room.public.as_ref().map(|p| p.title.clone()),
++        ))
++    }
++
++    /// 公开这场直播。判断顺序就是 spec 那张答复表的顺序：先证明控制房间
++    /// （401 不给探测差别），再看总开关（403），再验发布密钥（401），再看
++    /// 黑名单（403），最后标题（413）。
++    pub fn publish(
++        &self,
++        id: &str,
++        control: Control,
++        keys: Option<&PublishKeys>,
++        key: &str,
++        title: &str,
++    ) -> Result<(), LinkError> {
++        let mut rooms = self.rooms.lock().expect("live 锁");
++        let room = rooms.get_mut(id).ok_or(LinkError::Unauthorized)?;
++        if !controls(room, id, &control) {
++            return Err(LinkError::Unauthorized);
++        }
++        let keys = keys.ok_or(LinkError::NotYours)?;
++        let key_name = keys.name_for(key).ok_or(LinkError::Unauthorized)?;
++        if keys.is_blocked(id) {
++            return Err(LinkError::NotYours);
++        }
++        let n = title.chars().count();
++        if n == 0 || n > MAX_PUBLIC_TITLE_CHARS {
++            return Err(LinkError::TooBig);
++        }
++        room.public = Some(Public {
++            title: title.to_string(),
++            key_name,
++        });
++        Ok(())
++    }
++
++    /// 取消公开。**幂等**：没公开也回成功。
++    pub fn unpublish(&self, id: &str, control: Control) -> Result<(), LinkError> {
++        let mut rooms = self.rooms.lock().expect("live 锁");
++        let room = rooms.get_mut(id).ok_or(LinkError::Unauthorized)?;
++        if !controls(room, id, &control) {
++            return Err(LinkError::Unauthorized);
++        }
++        room.public = None;
++        Ok(())
++    }
++
++    /// 公开列表，按在看人数降序。**不含发布者。**
++    pub fn public_list(&self) -> Vec<PublicEntry> {
++        let rooms = self.rooms.lock().expect("live 锁");
++        let mut list: Vec<PublicEntry> = rooms
++            .iter()
++            .filter_map(|(id, r)| {
++                r.public.as_ref().map(|p| PublicEntry {
++                    id: id.clone(),
++                    title: p.title.clone(),
++                    lanes: r.lanes.iter().map(|l| l.name.clone()).collect(),
++                    viewers: r.lanes.iter().map(|l| l.tx.receiver_count() as u32).sum(),
++                })
++            })
++            .collect();
++        list.sort_by(|a, b| b.viewers.cmp(&a.viewers).then_with(|| a.id.cmp(&b.id)));
++        list
++    }
++
++    /// 密钥文件重载之后调：吊销了的密钥公开的、被下线的、以及总开关关掉时的
++    /// 全部公开，立刻收回。
++    pub fn reconcile(&self, keys: Option<&PublishKeys>) {
++        let mut rooms = self.rooms.lock().expect("live 锁");
++        for (id, room) in rooms.iter_mut() {
++            let keep = match (keys, room.public.as_ref()) {
++                (_, None) => continue,
++                (None, Some(_)) => false,
++                (Some(k), Some(p)) => {
++                    !k.is_blocked(id) && k.keys.iter().any(|e| e.name == p.key_name)
++                }
++            };
++            if !keep {
++                room.public = None;
++            }
++        }
+     }
+ 
+     pub fn subscribe(&self, id: &str, lane: usize) -> Option<watch::Receiver<u64>> {
+         let rooms = self.rooms.lock().expect("live 锁");
+         Some(rooms.get(id)?.lanes.get(lane)?.tx.subscribe())
+     }
+ 
+     /// 在看的人数——**近似值**，数的是此刻挂在长轮询上的订阅数，不是精确
+     /// 名册。这是老师那行常驻提示里的「7 人在看」，也是他唯一会一直看着的
+     /// 那个数。
+@@ -290,32 +411,45 @@ impl Live {
+     pub fn sweep(&self, now: Instant) {
+         self.rooms
+             .lock()
+             .expect("live 锁")
+             .retain(|_, r| now.duration_since(r.fed_at) < LIVE_TTL);
+     }
+ }
+ 
+ /// 认证在取数之前，而且**认不出来和不存在回同一句话**。
+ ///
+-/// 这里只认 `viewer_hash`——`push_secret` 不能拿来读，也没必要：老师端如果
+-/// 想看自己推的画面，走的是同一个学生页面、同一把 viewer token。
++/// 没带令牌（`None`）：只有公开的房间放行。带了令牌：照旧只认 viewer 那把，
++/// 带错的**不会**因为房间公开而被放行。
+ fn authed<'a>(
+     rooms: &'a HashMap<String, Session>,
+     id: &str,
+-    token: &str,
++    token: Option<&str>,
+ ) -> Result<&'a Session, LinkError> {
+     let room = rooms.get(id).ok_or(LinkError::Unauthorized)?;
+-    if !same(&room.viewer_hash, &hash(token)) {
+-        return Err(LinkError::Unauthorized);
++    match token {
++        None if room.public.is_some() => Ok(room),
++        None => Err(LinkError::Unauthorized),
++        Some(t) if same(&room.viewer_hash, &hash(t)) => Ok(room),
++        Some(_) => Err(LinkError::Unauthorized),
++    }
++}
++
++/// 这一方到底控不控制这个房间。常数时间，理由同 `same`。
++fn controls(room: &Session, id: &str, control: &Control) -> bool {
++    match control {
++        Control::Push(secret) => same(&room.push_hash, &hash(secret)),
++        Control::Grant(grant) => {
++            let want = dct_link::live::publish_grant(&room.push_hash, id);
++            same(&hash(&want), &hash(grant))
++        }
+     }
+-    Ok(room)
+ }
+ 
+ /// 常数时间比对，理由同 `web::mod` 里那一处：`==` 会按第一个不同的字节
+ /// 提前返回，而那个时间差是可测的。
+ fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
+     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+ }
+ 
+ fn hash(token: &str) -> [u8; 32] {
+     use sha2::{Digest, Sha256};
+@@ -409,42 +543,42 @@ mod tests {
+             start("abc", &ok_key, &ok_key, vec![String::new()]),
+             Err(LinkError::TooBig),
+             "空路名"
+         );
+     }
+ 
+     #[test]
+     fn a_frame_goes_in_and_comes_back_out_with_an_etag() {
+         let live = started();
+         let etag = live.push("abc", &"p".repeat(64), 0, b"hello".to_vec()).unwrap();
+-        let (body, tag) = live.frame("abc", &"t".repeat(64), 0).unwrap();
++        let (body, tag) = live.frame("abc", Some(&"t".repeat(64)), 0).unwrap();
+         assert_eq!(body, b"hello");
+         assert_eq!(tag, etag);
+     }
+ 
+     /// 每换一帧 etag 必须变，否则学生那边的 304 会把新画面挡在外面。
+     #[test]
+     fn every_new_frame_gets_a_new_etag() {
+         let live = started();
+         let a = live.push("abc", &"p".repeat(64), 0, b"one".to_vec()).unwrap();
+         let b = live.push("abc", &"p".repeat(64), 0, b"two".to_vec()).unwrap();
+         assert_ne!(a, b);
+     }
+ 
+     /// 错的 token 一律 Unauthorized，**不告诉他这场直播存不存在**——
+     /// 拿旧链接的人不该能把中转上正在播的号摸一遍。
+     #[test]
+     fn a_wrong_token_cannot_tell_a_live_apart_from_a_missing_one() {
+         let live = started();
+         live.push("abc", &"p".repeat(64), 0, b"x".to_vec()).unwrap();
+-        let wrong = live.frame("abc", &"w".repeat(64), 0).unwrap_err();
+-        let missing = live.frame("nope", &"t".repeat(64), 0).unwrap_err();
++        let wrong = live.frame("abc", Some(&"w".repeat(64)), 0).unwrap_err();
++        let missing = live.frame("nope", Some(&"t".repeat(64)), 0).unwrap_err();
+         assert_eq!(wrong, LinkError::Unauthorized);
+         assert_eq!(missing, LinkError::Unauthorized);
+     }
+ 
+     /// 学生那把钥匙只能读。拿它去推帧必须失败——每个学生都知道 live-id，
+     /// 要是推帧只认 id，随便一个学生就能往这场直播里推假画面，而这个功能的
+     /// 全部前提是学生只读。
+     #[test]
+     fn a_viewer_token_cannot_push_a_frame() {
+         let live = started();
+@@ -479,47 +613,47 @@ mod tests {
+     }
+ 
+     /// 老师停推之后整条直播连同两把钥匙一起蒸发——只有 TTL 没有主动删，
+     /// 拔网线就等于永远播着；只有主动删没有 TTL，合上笔记本就收不回来。
+     #[test]
+     fn a_live_that_stopped_being_fed_disappears_with_its_token() {
+         let live = started();
+         live.push("abc", &"p".repeat(64), 0, b"x".to_vec()).unwrap();
+         live.sweep(Instant::now() + dct_link::live::LIVE_TTL + Duration::from_secs(1));
+         assert_eq!(
+-            live.frame("abc", &"t".repeat(64), 0).unwrap_err(),
++            live.frame("abc", Some(&"t".repeat(64)), 0).unwrap_err(),
+             LinkError::Unauthorized
+         );
+     }
+ 
+     #[test]
+     fn stopping_takes_it_away_immediately() {
+         let live = started();
+         live.stop("abc", &"p".repeat(64)).unwrap();
+         assert_eq!(
+-            live.lanes("abc", &"t".repeat(64)).unwrap_err(),
++            live.lanes("abc", Some(&"t".repeat(64))).unwrap_err(),
+             LinkError::Unauthorized
+         );
+     }
+ 
+     /// 学生那把钥匙停不掉直播。live-id 对每个学生都是已知的，停播若只认
+     /// id，随便一个学生就能掐断全班的课——单次请求的拒绝服务，比伪造画面
+     /// 还省事。
+     #[test]
+     fn a_viewer_token_cannot_stop_the_live() {
+         let live = started();
+         assert_eq!(
+             live.stop("abc", &"t".repeat(64)).unwrap_err(),
+             LinkError::Unauthorized
+         );
+         // 停不掉：直播还活着。
+-        assert!(live.lanes("abc", &"t".repeat(64)).is_ok());
++        assert!(live.lanes("abc", Some(&"t".repeat(64))).is_ok());
+     }
+ 
+     /// 在看的人数是挂着的订阅数：订阅两次数到 2，drop 掉一个之后数回 1。
+     #[test]
+     fn viewers_counts_currently_held_subscriptions() {
+         let live = started();
+         let a = live.subscribe("abc", 0).unwrap();
+         let _b = live.subscribe("abc", 1).unwrap();
+         assert_eq!(live.viewers("abc"), 2, "两个订阅应该数出 2 个人在看");
+         drop(a);
+@@ -539,39 +673,39 @@ mod tests {
+                 "t".repeat(64),
+                 "别人的钥匙".repeat(20),
+                 vec!["抢来的一路".into()],
+             )
+             .unwrap_err();
+         assert_eq!(err, LinkError::Unauthorized);
+         // 原来那场没被换掉：老师原来的 push_secret 还能推、原来的
+         // viewer_token 还能读。
+         assert!(live.push("abc", &"p".repeat(64), 0, b"still mine".to_vec()).is_ok());
+         assert_eq!(
+-            live.frame("abc", &"t".repeat(64), 0).unwrap().0,
++            live.frame("abc", Some(&"t".repeat(64)), 0).unwrap().0,
+             b"still mine"
+         );
+     }
+ 
+     /// 老师自己重开同一场（换上架列表、断线重连）：带着同一把 push_secret
+     /// 必须放行，而且新的 lanes 要真的生效。
+     #[test]
+     fn starting_again_with_the_same_secret_replaces_the_lanes() {
+         let live = started();
+         live.start(
+             "abc".into(),
+             "t".repeat(64),
+             "p".repeat(64),
+             vec!["新的一路".into()],
+         )
+         .unwrap();
+         assert_eq!(
+-            live.lanes("abc", &"t".repeat(64)).unwrap(),
++            live.lanes("abc", Some(&"t".repeat(64))).unwrap().0,
+             vec!["新的一路".to_string()]
+         );
+     }
+ 
+     /// **房间数有上限。** `POST /live/start` 是 spec 里唯一要对公网开的
+     /// 路由，而这一期它没有配对身份可验：没有这条上限，一个脚本几秒钟就能
+     /// 把中转的内存吃光。
+     #[test]
+     fn the_relay_refuses_to_open_more_rooms_than_it_can_hold() {
+         let live = Live::new();
+@@ -662,13 +796,240 @@ mod tests {
+         assert!(live.note_start("1.2.3.4", later).is_ok());
+     }
+ 
+     /// 挂着的学生要被新帧叫醒，这是 `?wait=1` 的全部机制。
+     #[tokio::test]
+     async fn a_waiting_viewer_is_woken_by_a_new_frame() {
+         let live = started();
+         let mut rx = live.subscribe("abc", 0).unwrap();
+         live.push("abc", &"p".repeat(64), 0, b"new".to_vec()).unwrap();
+         rx.changed().await.unwrap();
+-        assert_eq!(*rx.borrow(), live.frame("abc", &"t".repeat(64), 0).unwrap().1);
++        assert_eq!(*rx.borrow(), live.frame("abc", Some(&"t".repeat(64)), 0).unwrap().1);
++    }
++
++    fn keys_with(name: &str) -> (crate::keys::PublishKeys, String) {
++        let mut k = crate::keys::PublishKeys::default();
++        let key = k.add(name, 0).unwrap();
++        (k, key)
++    }
++
++    /// 公开的鉴权矩阵，逐行对应 spec 那张表。
++    #[test]
++    fn publishing_follows_the_answer_table() {
++        let live = started();
++        let (keys, key) = keys_with("姜老师");
++        let push = "p".repeat(64);
++        let grant = dct_link::live::publish_grant(&dct_link::live::push_hash(&push), "abc");
++
++        // 房间不存在 / 推帧钥匙不对 / 凭证不对 → 401
++        assert_eq!(
++            live.publish("nope", Control::Push(&push), Some(&keys), &key, "课"),
++            Err(LinkError::Unauthorized)
++        );
++        assert_eq!(
++            live.publish(
++                "abc",
++                Control::Push(&"x".repeat(64)),
++                Some(&keys),
++                &key,
++                "课"
++            ),
++            Err(LinkError::Unauthorized)
++        );
++        assert_eq!(
++            live.publish("abc", Control::Grant("00"), Some(&keys), &key, "课"),
++            Err(LinkError::Unauthorized)
++        );
++        // 没开公开功能 → 403
++        assert_eq!(
++            live.publish("abc", Control::Push(&push), None, &key, "课"),
++            Err(LinkError::NotYours)
++        );
++        // 发布密钥不对 → 401
++        assert_eq!(
++            live.publish(
++                "abc",
++                Control::Push(&push),
++                Some(&keys),
++                &"0".repeat(64),
++                "课"
++            ),
++            Err(LinkError::Unauthorized)
++        );
++        // 标题越界 → 413
++        assert_eq!(
++            live.publish("abc", Control::Push(&push), Some(&keys), &key, ""),
++            Err(LinkError::TooBig)
++        );
++        let long = "字".repeat(dct_link::live::MAX_PUBLIC_TITLE_CHARS + 1);
++        assert_eq!(
++            live.publish("abc", Control::Push(&push), Some(&keys), &key, &long),
++            Err(LinkError::TooBig)
++        );
++        // 成功：推帧钥匙和凭证都行
++        assert_eq!(
++            live.publish("abc", Control::Push(&push), Some(&keys), &key, "第3课"),
++            Ok(())
++        );
++        assert_eq!(
++            live.publish("abc", Control::Grant(&grant), Some(&keys), &key, "第4课"),
++            Ok(())
++        );
++        assert_eq!(live.public_list()[0].title, "第4课", "重复公开覆盖标题");
++        // 黑名单 → 403
++        let mut blocked = keys.clone();
++        blocked.block("abc");
++        assert_eq!(
++            live.publish("abc", Control::Push(&push), Some(&blocked), &key, "课"),
++            Err(LinkError::NotYours)
++        );
++    }
++
++    /// 凭证只认公开这件事：推帧、停播都不认它。
++    #[test]
++    fn a_grant_cannot_push_or_stop() {
++        let live = started();
++        let grant =
++            dct_link::live::publish_grant(&dct_link::live::push_hash(&"p".repeat(64)), "abc");
++        assert_eq!(
++            live.push("abc", &grant, 0, b"x".to_vec()),
++            Err(LinkError::Unauthorized)
++        );
++        assert_eq!(live.stop("abc", &grant), Err(LinkError::Unauthorized));
++    }
++
++    #[test]
++    fn unpublishing_is_idempotent_and_needs_control() {
++        let live = started();
++        let (keys, key) = keys_with("a");
++        let push = "p".repeat(64);
++        assert_eq!(
++            live.unpublish("abc", Control::Push(&push)),
++            Ok(()),
++            "没公开也回成功"
++        );
++        live.publish("abc", Control::Push(&push), Some(&keys), &key, "课")
++            .unwrap();
++        assert_eq!(
++            live.unpublish("abc", Control::Push(&"x".repeat(64))),
++            Err(LinkError::Unauthorized)
++        );
++        assert_eq!(live.unpublish("abc", Control::Push(&push)), Ok(()));
++        assert!(live.public_list().is_empty());
++    }
++
++    /// 无令牌只能读公开的房间；私密、不存在的房间对无令牌请求同一个 401；
++    /// 带错令牌不因为房间公开而放行。
++    #[test]
++    fn tokenless_reads_only_reach_public_rooms() {
++        let live = started();
++        let (keys, key) = keys_with("a");
++        let push = "p".repeat(64);
++        live.push("abc", &push, 0, b"hi".to_vec()).unwrap();
++
++        assert_eq!(
++            live.frame("abc", None, 0).err(),
++            Some(LinkError::Unauthorized),
++            "私密房间"
++        );
++        assert_eq!(
++            live.frame("zzz", None, 0).err(),
++            Some(LinkError::Unauthorized),
++            "不存在的房间"
++        );
++        assert_eq!(live.lanes("abc", None).err(), Some(LinkError::Unauthorized));
++
++        live.publish("abc", Control::Push(&push), Some(&keys), &key, "课")
++            .unwrap();
++        assert_eq!(live.frame("abc", None, 0).unwrap().0, b"hi");
++        assert_eq!(
++            live.lanes("abc", None).unwrap(),
++            (
++                vec!["前端".to_string(), "后端".to_string()],
++                Some("课".to_string())
++            )
++        );
++        assert_eq!(
++            live.frame("abc", Some(&"w".repeat(64)), 0).err(),
++            Some(LinkError::Unauthorized),
++            "带错令牌照拒"
++        );
++        assert_eq!(
++            live.lanes("abc", Some(&"t".repeat(64))).unwrap().1,
++            Some("课".to_string())
++        );
++    }
++
++    #[test]
++    fn the_public_list_has_title_lanes_viewers_and_no_publisher() {
++        let live = started();
++        let (keys, key) = keys_with("姜老师");
++        live.publish(
++            "abc",
++            Control::Push(&"p".repeat(64)),
++            Some(&keys),
++            &key,
++            "第3课",
++        )
++        .unwrap();
++        let list = live.public_list();
++        assert_eq!(list.len(), 1);
++        assert_eq!(list[0].id, "abc");
++        assert_eq!(list[0].lanes, vec!["前端", "后端"]);
++        let json = serde_json::to_string(&list).unwrap();
++        assert!(!json.contains("姜老师"), "列表里不许出现发布者：{json}");
++    }
++
++    /// 吊销、下线、关总开关：重载之后公开状态立刻收回。
++    #[test]
++    fn reconcile_withdraws_revoked_blocked_and_disabled_publications() {
++        let push = "p".repeat(64);
++        for case in ["revoke", "block", "disable"] {
++            let live = started();
++            let (mut keys, key) = keys_with("a");
++            live.publish("abc", Control::Push(&push), Some(&keys), &key, "课")
++                .unwrap();
++            match case {
++                "revoke" => {
++                    keys.revoke("a");
++                    live.reconcile(Some(&keys));
++                }
++                "block" => {
++                    keys.block("abc");
++                    live.reconcile(Some(&keys));
++                }
++                _ => live.reconcile(None),
++            }
++            assert!(live.public_list().is_empty(), "{case} 之后还挂在公开列表上");
++            assert_eq!(
++                live.frame("abc", None, 0).err(),
++                Some(LinkError::Unauthorized),
++                "{case}"
++            );
++        }
++    }
++
++    #[test]
++    fn reopening_a_room_does_not_inherit_its_public_state() {
++        let live = started();
++        let (keys, key) = keys_with("a");
++        let push = "p".repeat(64);
++        live.publish("abc", Control::Push(&push), Some(&keys), &key, "课")
++            .unwrap();
++        live.start("abc".into(), "t".repeat(64), push, vec!["前端".into()])
++            .unwrap();
++        assert!(live.public_list().is_empty());
++    }
++
++    #[test]
++    fn the_reserved_word_cannot_be_a_room_id() {
++        assert_eq!(
++            Live::new().start(
++                dct_link::live::RESERVED_LIVE_ID.into(),
++                "t".repeat(64),
++                "p".repeat(64),
++                vec!["x".into()]
++            ),
++            Err(LinkError::Unauthorized)
++        );
+     }
+ }

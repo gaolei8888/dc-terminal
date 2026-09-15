@@ -21,8 +21,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # token 只存摘要，不存原文：中转上留着一屋子人的明文钥匙没有任何必要。
 sha2 = "0.10"
+# 发布密钥由 `dct-srv key add` 当场生成，必须来自系统随机数（同 `dct` 的 getrandom 用法）。
+getrandom = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 # 只有测试要自己拼 HTTP 请求（见 tests/serves.rs），服务本身用不到读写扩展。
 tokio = { version = "1", features = ["io-util"] }
+tempfile = "3"

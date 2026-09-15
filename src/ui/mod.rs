@@ -47,7 +47,7 @@ pub use view::{
 };
 use view::{
     escape_hint, idle_help, is_plain_key, message_after_transition, session_ended_notice,
-    PairPhase, View,
+    LiveInput, PairPhase, View,
 };
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
@@ -318,9 +318,16 @@ fn bar_danger(t: BarTheme) -> Style {
 /// 所以实色档下三种状态只用色条自己能保证的东西区分：就绪加粗、还在等中转
 /// 是平常字、失败用自带底色的那块红（`bar_danger`）。横线档没有实色底，照旧
 /// 走 `live::banner_style`。
+///
+/// 公开失败（`info.public` 是 `Failed`）也用 `bar_danger`，且判在
+/// `readiness` 之前——理由跟 `live::banner_style` 一样：中转就绪不等于
+/// 公开成功。
 fn bar_live_style(info: &crate::proto::LiveInfo, t: BarTheme) -> Style {
     if bar_style(t).is_none() {
         return live::banner_style(info);
+    }
+    if matches!(info.public, crate::proto::LivePublic::Failed { .. }) {
+        return bar_danger(t);
     }
     match &info.readiness {
         crate::proto::LiveReadiness::Ready => Style::default().add_modifier(Modifier::BOLD),
@@ -436,6 +443,17 @@ impl Drop for TerminalGuard {
 /// 这是 `TerminalGuard` 盖不住的那一半：`Drop` 在被杀时不跑。
 fn spawn_signal_restore() {
     crate::sys::signal::restore_terminal_when_killed(restore_terminal);
+}
+
+/// 把粘贴的整段文本塞进直播面板正在填的那一行。密钥跟 `EnterSecret`
+/// 走同一套 `clean_secret`；标题只挖掉换行/控制字符，别的原样接受——
+/// 粘贴是这类值最常见的输入方式，逐字符敲键盘那条路已经在
+/// `edit_live_input` 里管着字符上限。
+fn paste_into_live_input(input: &mut LiveInput, text: &str) {
+    match input {
+        LiveInput::Key { buf, .. } => buf.push_str(&clean_secret(text)),
+        LiveInput::Title(t) => t.extend(text.chars().filter(|c| !c.is_control())),
+    }
 }
 
 pub fn run(
@@ -1117,6 +1135,13 @@ pub fn run(
                 {
                     buf.push_str(&clean_secret(&text));
                 }
+                // 直播面板的手输行：密钥跟 EnterSecret 一样洗一遍；标题
+                // 只需要把换行/控制字符去掉，不然粘进来的多行文本会拼出
+                // 一个带换行的标题，服务端和展示都不指望标题里有换行。
+                View::Live {
+                    input: Some(input_field),
+                    ..
+                } => paste_into_live_input(input_field, &text),
                 _ => {}
             }
             continue;
@@ -3480,11 +3505,12 @@ is_agent = true
                 staged: vec![(1, "小明".into())],
                 viewers: 3,
                 readiness,
+                public: crate::proto::LivePublic::Private,
             };
             (app, dir)
         }
 
-        let cases: [Case; 7] = [
+        let cases: [Case; 9] = [
             ("看板按键表", || {
                 app_with_one_agent_session(View::Board)
             }),
@@ -3508,6 +3534,19 @@ is_agent = true
                 live(crate::proto::LiveReadiness::Failed(
                     crate::proto::LiveFailure::Unreachable,
                 ))
+            }),
+            ("正在公开直播", || {
+                let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
+                app.live.public = crate::proto::LivePublic::Listed { title: "第3课".into() };
+                (app, dir)
+            }),
+            ("公开失败", || {
+                let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
+                app.live.public = crate::proto::LivePublic::Failed {
+                    title: "第3课".into(),
+                    reason: crate::proto::LiveFailure::Refused(401),
+                };
+                (app, dir)
             }),
         ];
 
@@ -5158,6 +5197,7 @@ is_agent = true
                 staged: vec![(1, "claude".into())],
                 viewers: 3,
                 readiness: crate::proto::LiveReadiness::Ready,
+                public: crate::proto::LivePublic::Private,
             }
         }
 
@@ -5495,5 +5535,33 @@ is_agent = true
     fn a_fresh_app_is_not_in_copy_mode() {
         let (app, _d) = App::test_app();
         assert!(!app.copy_mode);
+    }
+
+    /// 粘贴 64 位十六进制密钥进 Key 输入行，整段落进 `buf`——不是拆成
+    /// 单字符敲进去的那条路。
+    #[test]
+    fn pasting_a_key_fills_the_live_key_buf() {
+        let mut input = LiveInput::Key {
+            buf: String::new(),
+            then_publish: None,
+        };
+        let key = "a".repeat(64);
+        paste_into_live_input(&mut input, &key);
+        match input {
+            LiveInput::Key { buf, .. } => assert_eq!(buf, key),
+            LiveInput::Title(_) => panic!("还是 Key 变体"),
+        }
+    }
+
+    /// 粘贴带换行的文本进 Title 输入行，换行被挖掉，不会拼出一个带换行
+    /// 的标题。
+    #[test]
+    fn pasting_into_the_live_title_strips_newlines() {
+        let mut input = LiveInput::Title(String::new());
+        paste_into_live_input(&mut input, "a\nb");
+        match input {
+            LiveInput::Title(t) => assert_eq!(t, "ab"),
+            LiveInput::Key { .. } => panic!("还是 Title 变体"),
+        }
     }
 }

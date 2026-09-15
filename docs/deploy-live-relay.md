@@ -25,9 +25,11 @@
 `/live/*` 自带鉴权，可以对公网开。`/link/*` 一旦漏到公网上，任何人都能冒充
 任何一台设备收发信封——那是老师终端的读写通道。
 
-**所以 `dct-srv` 默认根本不挂 `/link/*` 和 `/`**，只有带 `--with-link` 起的
-进程才有（只给本机开发用）。下面那条反代白名单因此是第二道闸，不再是唯一
-一道：哪天反代配置被人改成「全部转发」，这几条路照样不存在。两道都留着。
+**所以 `dct-srv` 默认根本不挂 `/link/*`**，只有带 `--with-link` 起的进程才有
+（只给本机开发用）。公开列表页 `/` 和 `GET /live/public` 是例外，两档都挂——
+谁都能读的东西本来就不需要那道闸（见本文第四节「公开直播」）。下面那条反代
+白名单因此是第二道闸，不再是唯一一道：哪天反代配置被人改成「全部转发」，
+`/link/*` 照样不存在。
 
 另外两条跟公网有关的限制在中转自己身上：建房请求里的 id、两把钥匙、路名都有
 长度上下限（请求体整体不超过 16 KB），建房限流按 `X-Forwarded-For` **最右边**
@@ -47,12 +49,12 @@
 | 机器 | `dataclue.cn`（8 vCPU / 8 GB），跟课堂容器同一台 |
 | 中转 | `/usr/local/bin/dct-srv`，systemd 单元 `dct-srv.service`，听 `127.0.0.1:8787` |
 | 源码 | `/opt/dct-relay/src`，在 Docker 里的 `rust:1-slim` 编的（宿主机上没装工具链） |
-| 反代 | Caddy，站点块 `live.dataclue.cn`，只放行 `/live/*` |
-| 验收 | `/link/poll`、`/link/send`、`/link/ask`、`/` 四条全是 404（反代答一次，中转自己也不挂这几条） |
+| 反代 | Caddy，站点块 `live.dataclue.cn`，放行 `/live/*` 和公开列表 `/` |
+| 验收 | `/link/poll`、`/link/send`、`/link/ask`、`/phone` 四条全是 404；`/` 是 200（公开列表页） |
 
-换机器或重装时照下面三节走一遍即可，顺序别改。
+换机器或重装时照下面四节走一遍即可，顺序别改。
 
-## 一、反向代理：只放行 `/live/*`
+## 一、反向代理：`/live/*` 和公开列表 `/`
 
 线上用的是 Caddy。下面这段是完整可用的最小配置：
 
@@ -78,7 +80,12 @@ live.dataclue.cn {
 		}
 	}
 
-	# 兜底：除了 /live/* 之外，什么都不转发。
+	# 公开直播列表页。**精确匹配 `/`**，不是 `/*`——其余路径照旧落到下面的 404。
+	handle / {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# 兜底：除了 /live/* 和 / 之外，什么都不转发。
 	# **这一条就是那条白名单。** 没有它，/link/* 会跟着一起上公网。
 	handle {
 		respond "Not Found" 404
@@ -88,8 +95,9 @@ live.dataclue.cn {
 
 要点，逐条核对：
 
-1. `handle /live/*` 是**唯一**一条 `reverse_proxy`。多写一条就是多开一个口。
-2. 兜底的 `handle { respond 404 }` 必须在。只写 `handle /live/*` 而不写兜底，
+1. `handle /live/*` 和精确匹配的 `handle /` 是**仅有**的两条 `reverse_proxy`。
+   多写一条就是多开一个口。
+2. 兜底的 `handle { respond 404 }` 必须在。只写这两条 `handle` 而不写兜底，
    Caddy 对别的路径的行为取决于站点块里还有什么——别赌，明写。
 3. 上游读超时要大于 25 秒。这是最容易踩的一脚：配置本身"能用"，只是每个
    学生每 25 秒掉一次线，而且现象像是网不好。
@@ -110,11 +118,15 @@ curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/link/poll
 curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/link/send
 curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/link/ask
 
-# 根路径（手机端那页）：也必须是 404
+# 手机端那页：也必须是 404（只有带 --with-link 起的进程才挂 /phone，线上不带）
+curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/phone
+
+# 根路径（公开直播列表页）：必须是 200
 curl -s -o /dev/null -w '%{http_code}\n' https://live.dataclue.cn/
 ```
 
-`/link/*` 任意一条不是 404，就是白名单没生效，**立刻把站点停掉再排查**。
+`/link/*` 或 `/phone` 任意一条不是 404，就是白名单没生效，**立刻把站点停掉再排查**。
+`/` 不是 200，多半是这一节的 `handle /` 没写或者没 reload 成功。
 
 ## 二、老师那一侧：`DCT_RELAY` 指到这个域名
 
@@ -173,6 +185,24 @@ cat /proc/$(pidof dct-srv)/limits | grep 'open files'
 
 Caddy 自己也要够：它同样是一个学生一个连接。Caddy 官方的 systemd unit
 默认已经带 `LimitNOFILE=1048576`，如果是自己写的 unit，照样加上这一行。
+
+## 四、公开直播：发布密钥
+
+中转默认没有公开功能。要开，先签发密钥，再带着密钥文件启动：
+
+```bash
+dct-srv key add 管理台 --file /etc/dct-srv/publish-keys.json   # 打印一次密钥，交给管理台
+dct-srv key add 姜老师 --file /etc/dct-srv/publish-keys.json   # 每位老师一把
+chmod 600 /etc/dct-srv/publish-keys.json
+```
+
+systemd 的 `ExecStart` 改成 `/usr/local/bin/dct-srv 127.0.0.1:8787 --publish-keys /etc/dct-srv/publish-keys.json`。
+
+- 吊销：`dct-srv key revoke 姜老师 --file ...`，运行中的中转最多 10 秒生效，那把密钥公开的直播自动变回私密。
+- 下线某一场：`dct-srv takedown <房间号> --file ...`，同样 10 秒内生效，停播之前公开不了。
+- 查看：`dct-srv key list --file ...`。
+- 文件写坏了：中转保留上一份并在日志里报错；首次启动就坏则拒绝启动。
+- **回滚**：去掉 `--publish-keys` 重启，公开列表清空，私密直播不受影响。
 
 ## 边界值一览（都在 `crates/dct-link/src/live.rs` 里）
 

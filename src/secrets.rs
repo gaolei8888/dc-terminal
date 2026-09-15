@@ -53,6 +53,10 @@ pub const PHONE_OWNER_KEY: &str = "__phone_owner__";
 /// 而那正是 `WEB_TOKEN_KEY` 上面那段说过一遍的坑。
 pub const GATE_TOKEN_KEY: &str = "__gate__";
 
+/// 公开直播的发布密钥（运营方在中转上用 `dct-srv key add` 签发）。同样用一个
+/// profile 不可能占用的名字；它只在守护进程里用，不经过任何发给界面的响应。
+pub const LIVE_PUBLISH_KEY: &str = "__live_publish__";
+
 /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
 pub fn secrets_path_for_socket(socket: &Path) -> PathBuf {
     match socket.parent() {

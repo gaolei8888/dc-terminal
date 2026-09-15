@@ -181,6 +181,8 @@
       live: "直播中",
       paused: "老师暂停了",
       ended: "这场直播结束了",
+      endedPublic: "这场直播已结束或不再公开",
+      backToList: "回到公开列表",
       smaller: "缩小",
       bigger: "放大",
       theme: "配色",
@@ -190,6 +192,8 @@
       live: "Live",
       paused: "Teacher paused",
       ended: "This live session has ended",
+      endedPublic: "This live session has ended or is no longer public",
+      backToList: "Back to the public list",
       smaller: "Smaller text",
       bigger: "Bigger text",
       theme: "Theme",
@@ -226,6 +230,12 @@
     }
     try { return sessionStorage.getItem(storeKey) || ""; } catch (e) { return ""; }
   })();
+
+  // 没有令牌就**不带**这个头：公开的直播不需要令牌，而一个空的 x-live-token
+  // 会被当成「带了、但是不对」。拉帧和拉路名都从这里取头，别再各写一份。
+  function tokenHeaders() {
+    return TOKEN ? { "x-live-token": TOKEN } : {};
+  }
 
   // ——上架的几路——
   //
@@ -276,7 +286,7 @@
   // 那次失败就不是"直播结束了"。
   function fetchLanes() {
     return fetch("/live/" + LIVE_ID + "/lanes", {
-      headers: { "x-live-token": TOKEN },
+      headers: tokenHeaders(),
       credentials: "omit"
     })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -391,7 +401,17 @@
 
   function render() {
     dotEl.textContent = ICON[state];
-    statusEl.textContent = S[state];
+    // 没有令牌的观众是从公开列表点进来的：结束和「切回私密」对他是同一件事
+    // （中转回的也是同一个 401），说一句能涵盖两者的话，并给一条回列表的路。
+    if (state === "ended" && !TOKEN) {
+      statusEl.textContent = S.endedPublic + " · ";
+      var back = document.createElement("a");
+      back.href = "/";
+      back.textContent = S.backToList;
+      statusEl.appendChild(back);
+    } else {
+      statusEl.textContent = S[state];
+    }
     headEl.className = state === "ended" ? "bad" : state === "paused" ? "warn" : "";
   }
 
@@ -475,7 +495,7 @@
     if (ended || inflight || document.visibilityState !== "visible") { return; }
     inflight = true;
     sentAt = Date.now();
-    var headers = { "x-live-token": TOKEN };
+    var headers = tokenHeaders();
     if (etag !== null) { headers["If-None-Match"] = "\"" + etag + "\""; }
     fetch(frameUrl(), { headers: headers, credentials: "omit" })
       .then(function (r) {

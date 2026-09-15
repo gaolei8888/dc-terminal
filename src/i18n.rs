@@ -252,6 +252,22 @@ pub enum Key {
     LiveLinkCopied,
     /// `s` 停播之后的确认。
     LiveStoppedMessage,
+    /// `p` 键：把这场直播加进/撤出公开列表。
+    LivePublishToggle,
+    /// `K` 键：换一把公开直播密钥（管理台重新发的那把）。
+    LiveChangeKey,
+    /// 公开前先问标题时那一行提示。
+    LiveTitlePrompt,
+    /// 第一次公开、或者密钥不对时，问密钥的那一行提示。
+    LiveKeyPrompt,
+    /// 已经发出公开请求、中转还没答应之前的过渡态提示。
+    LivePublicPending,
+    /// 密钥填完存下去之后的确认。
+    LiveKeySaved,
+    /// `p` 撤出公开列表之后的确认。
+    LiveUnpublished,
+    /// 标题输入框留空就按确认时的提示。
+    LiveTitleEmpty,
     /// 手机端画面上那两个字号按钮的名字。**图标也要有名字**——读屏软件
     /// 念不出「A−」，而手机上读屏用户很多（同网页里 `back` 那一条）。
     TextSmaller,
@@ -738,6 +754,14 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "已发给终端的剪贴板——若终端不支持，请扫上面的二维码",
         ),
         LiveStoppedMessage => t!(lang, en: "Stopped the broadcast", zh: "已停播"),
+        LivePublishToggle => t!(lang, en: "public/private", zh: "公开/取消公开"),
+        LiveChangeKey => t!(lang, en: "change key", zh: "换公开密钥"),
+        LiveTitlePrompt => t!(lang, en: "Public title: ", zh: "公开标题："),
+        LiveKeyPrompt => t!(lang, en: "Public live key: ", zh: "公开直播密钥："),
+        LivePublicPending => t!(lang, en: "Making it public…", zh: "正在公开…"),
+        LiveKeySaved => t!(lang, en: "Public live key saved", zh: "公开直播密钥已保存"),
+        LiveUnpublished => t!(lang, en: "No longer public", zh: "已取消公开"),
+        LiveTitleEmpty => t!(lang, en: "The title cannot be empty", zh: "标题不能为空"),
         PhoneOffLine => t!(lang, en: "Phone notifications are off", zh: "手机通知还没打开"),
         PhonePairedLine => t!(lang, en: "Connected", zh: "已连上"),
         PhoneReconnectingLine => t!(
@@ -1322,6 +1346,58 @@ pub mod msg {
         )
     }
 
+    /// 同上，但这场直播已经公开上了列表——多带一句标题，让老师一眼确认
+    /// 「公开的是哪一场」。
+    pub fn live_on_air_public(lang: Lang, title: &str, routes: usize, viewers: u32) -> String {
+        t!(
+            lang,
+            en: format!("\u{25cf} LIVE PUBLICLY \u{b7} {title} \u{b7} {routes} lane(s) \u{b7} {viewers} watching"),
+            zh: format!("\u{25cf} 正在公开直播 \u{b7} {title} \u{b7} {routes} 路 \u{b7} {viewers} 人在看"),
+        )
+    }
+
+    /// 公开失败的整句话。401/403/413/429 各有一句人话，别的码照实报出来。
+    pub fn live_publish_failed(lang: Lang, why: &crate::proto::LiveFailure) -> String {
+        use crate::proto::LiveFailure;
+        let reason = match why {
+            LiveFailure::Unreachable => t!(
+                lang,
+                en: "cannot reach the relay, will keep retrying".to_string(),
+                zh: "连不上中转，稍后会自动重试".to_string(),
+            ),
+            LiveFailure::Refused(401) => t!(
+                lang,
+                en: "the public live key is wrong or has been revoked".to_string(),
+                zh: "公开直播密钥不对，或者已被吊销".to_string(),
+            ),
+            LiveFailure::Refused(403) => t!(
+                lang,
+                en: "the server does not allow public lives, or this one was taken down".to_string(),
+                zh: "服务器没有开启公开直播，或者这场直播已被下线".to_string(),
+            ),
+            LiveFailure::Refused(413) => t!(
+                lang,
+                en: "the title is too long".to_string(),
+                zh: "标题太长".to_string(),
+            ),
+            LiveFailure::Refused(429) => t!(
+                lang,
+                en: "too many attempts, try again in a minute".to_string(),
+                zh: "操作太频繁，一分钟后再试".to_string(),
+            ),
+            LiveFailure::Refused(code) => t!(
+                lang,
+                en: format!("the relay refused it (HTTP {code})"),
+                zh: format!("中转拒绝了（状态码 {code}）"),
+            ),
+        };
+        t!(
+            lang,
+            en: format!("Not public: {reason}"),
+            zh: format!("没能公开：{reason}"),
+        )
+    }
+
     /// 开播失败的整句话。**原因由这里组，不是守护进程拼好的**——推帧线程
     /// 手上没有 `Lang`，它只报一个 `LiveFailure` 码（见那个类型上的文档
     /// 注释：早先那一版在那里直接拼中文，英文界面会显示 "Failed to go
@@ -1845,6 +1921,11 @@ pub mod msg {
                 lang,
                 en: "live broadcasting has no relay configured — set DCT_RELAY to your relay's address (for example https://live.example.com) before starting dct".to_string(),
                 zh: "直播还没配置中转：启动 dct 之前把环境变量 DCT_RELAY 设成中转地址（例如 https://live.example.com）".to_string(),
+            ),
+            LivePublishKeyMissing => t!(
+                lang,
+                en: "no public live key yet — press K in the live panel to enter the one your operator gave you".to_string(),
+                zh: "还没填公开直播密钥：在直播面板里按 K，填上管理员发给你的那把".to_string(),
             ),
             CannotStart(cmd) => t!(
                 lang,
@@ -2479,6 +2560,14 @@ mod tests {
             LiveNoSessionsToStage,
             LiveLinkCopied,
             LiveStoppedMessage,
+            LivePublishToggle,
+            LiveChangeKey,
+            LiveTitlePrompt,
+            LiveKeyPrompt,
+            LivePublicPending,
+            LiveKeySaved,
+            LiveUnpublished,
+            LiveTitleEmpty,
             TextSmaller,
             TextBigger,
             KeyboardCapture,
@@ -2664,7 +2753,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 202, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 210, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
@@ -2713,6 +2802,7 @@ mod tests {
             LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![7, 9])),
             LiveStagingRejected(crate::proto::LiveStagingProblem::NotLive),
             LiveRelayNotConfigured,
+            LivePublishKeyMissing,
             Git("fatal: not a repository".into()),
             SecretsFileBroken {
                 path: "/h/.dct/secrets.toml".into(),
@@ -2742,6 +2832,25 @@ mod tests {
         // `Internal` 是刻意的例外：它照抄原文（多半是还没归类的内部错误
         // 或 git 的 stderr），翻不动也不该翻。
         assert_eq!(msg::error(Lang::En, &Internal("原文".into())), "原文");
+    }
+
+    /// 公开直播那几句带参文案：两种语言都组得出话，人数和标题都要露面，
+    /// 英文里不许有汉字。
+    #[test]
+    fn public_live_strings_compose_in_both_languages() {
+        use crate::proto::LiveFailure;
+        for l in Lang::all() {
+            let on = msg::live_on_air_public(*l, "第3课", 2, 7);
+            assert!(on.contains("第3课") && on.contains('7'), "{on}");
+            for code in [401u16, 403, 413, 429, 500] {
+                let s = msg::live_publish_failed(*l, &LiveFailure::Refused(code));
+                assert!(!s.trim().is_empty());
+                if *l == Lang::En {
+                    assert!(!has_han(&s), "{s}");
+                }
+            }
+            assert!(!msg::live_publish_failed(*l, &LiveFailure::Unreachable).is_empty());
+        }
     }
 
     /// 警告码跟错误码同样的要求：两种语言都组得出话，英文里不许有汉字。

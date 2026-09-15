@@ -25,7 +25,8 @@
 //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
 
 mod live;
-pub use live::Live;
+pub use live::{Control, Live, PublicEntry};
+pub mod keys;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -284,6 +285,9 @@ impl From<LinkError> for Rejected {
 pub struct AppState {
     pub relay: Arc<Relay>,
     pub live: Arc<Live>,
+    /// 当前生效的发布密钥。`None` = 没开公开功能（没带 `--publish-keys`）。
+    /// 重载任务（见 `serve`）写，公开路由（`live_publish_route`）读。
+    pub keys: Arc<std::sync::RwLock<Option<crate::keys::PublishKeys>>>,
 }
 
 impl FromRef<AppState> for Arc<Relay> {
@@ -301,6 +305,24 @@ impl FromRef<AppState> for Arc<Live> {
 /// 从请求头里取一个字符串值。取不到、或者不是合法 UTF-8，一律当作没带。
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
+}
+
+/// 令牌头：没带、或者带了个空串，都当成没带。
+///
+/// 观看页在没有令牌时也会发起请求（读公开房间），一个空字符串的
+/// `x-live-token` 不该因为"带了这个头"就被当成"带了令牌"去跟正确的哈希比。
+fn token_header(headers: &HeaderMap) -> Option<&str> {
+    header(headers, "x-live-token").filter(|t| !t.is_empty())
+}
+
+/// 证明控制房间的那个头：推帧钥匙优先，其次凭证。
+///
+/// 两者都没带，交给调用方按各自路由的规矩回 401——公开/取消公开这两条路
+/// 跟推帧、停播一样，都要求证明控制房间。
+fn control_header(headers: &HeaderMap) -> Option<crate::live::Control<'_>> {
+    header(headers, "x-live-push")
+        .map(crate::live::Control::Push)
+        .or_else(|| header(headers, "x-live-grant").map(crate::live::Control::Grant))
 }
 
 /// 手写的查询串解析。不用 axum 的 `Query` 提取器——那需要额外打开一个
@@ -416,7 +438,9 @@ async fn live_frame_route(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, Rejected> {
-    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
+    // 没带令牌不再当场拒绝：公开的房间允许无令牌读帧（`Live::frame`/`authed`
+    // 自己判断这场是不是公开的），私密房间照旧回 401。
+    let token = token_header(&headers);
     let query = parse_query(&uri);
     let lane: usize = query.get("lane").and_then(|v| v.parse().ok()).unwrap_or(0);
     let wait = query.contains_key("wait");
@@ -444,32 +468,46 @@ async fn live_frame_route(
         .into_response())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublicTitle {
+    title: String,
+}
+
 /// `GET /live/{id}/lanes` 的答复：老师起的名字，不是会话标题或项目路径——
 /// 那两样一个字都不许上公网（整份 spec 的前提之一）。`viewers` 搭这班车
 /// 一起回，是因为学生页开场只该拉一次这条路径，之后人数跟着帧的节奏走，
 /// 不该为了一个数字单独起一条轮询。
+/// 这场直播公开着的话，公开标题另起一段——`title` 只在这里出现，观众页
+/// 用它跟自己已经知道的路名（`lanes`）分开显示。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LiveLanesResponse {
     lanes: Vec<String>,
     viewers: u32,
+    /// 公开就是 `Some`，私密是 `None`。观众页拿它判断"这场直播现在是不是
+    /// 公开的"——包括管理台代为公开的情况。
+    public: Option<PublicTitle>,
 }
 
 /// 学生页开场问一次「这场直播上架了哪几路，叫什么名字」。
 ///
-/// 鉴权跟取帧同一条路（`x-live-token`），也跟取帧一样**认不出来和这场
-/// 直播根本不存在回同一个 401**——`Live::lanes` 内部走的是跟 `Live::frame`
-/// 同一个 `authed()`，理由写在 `live.rs` 那段注释里：分开回的话，拿一把
-/// 猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠错误码反推出哪个 id
-/// 现在正播着，把这条路径当探测器用。
+/// 鉴权跟取帧同一条路（`x-live-token`），带着令牌走的时候也跟取帧一样
+/// **认不出来和这场直播根本不存在回同一个 401**——`Live::lanes` 内部走的
+/// 是跟 `Live::frame` 同一个 `authed()`，理由写在 `live.rs` 那段注释里：
+/// 分开回的话，拿一把猜的/过期的令牌把一串 live-id 挨个问一遍，就能靠
+/// 错误码反推出哪个 id 现在正播着，把这条路径当探测器用。**没带令牌**
+/// （或者带了个空串，见 `token_header`）只放行公开的房间。
 async fn live_lanes_route(
     State(live): State<Arc<Live>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<LiveLanesResponse>, Rejected> {
-    let token = header(&headers, "x-live-token").ok_or(LinkError::Unauthorized)?;
-    let lanes = live.lanes(&id, token)?;
+    let (lanes, public) = live.lanes(&id, token_header(&headers))?;
     let viewers = live.viewers(&id);
-    Ok(Json(LiveLanesResponse { lanes, viewers }))
+    Ok(Json(LiveLanesResponse {
+        lanes,
+        viewers,
+        public: public.map(|title| PublicTitle { title }),
+    }))
 }
 
 /// 老师停播：整场直播连同两把钥匙一起立刻蒸发。跟推帧同一把 `x-live-push`
@@ -485,7 +523,7 @@ async fn live_stop_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 手机网页本体。
+/// 手机网页本体。挂在 `/phone`——`/` 现在是公开列表页（`public_page_route`）。
 ///
 /// **跟守护进程在局域网上发的是同一份字节**（`dct_page::page()`），不是抄过来
 /// 的一份。两份各自演化的网页，最贵的地方在于其中一份的 bug 只在另一种模式
@@ -496,6 +534,58 @@ async fn live_stop_route(
 /// 第二个服务端的第一天起就成立——补挂上去的那天，多半已经有人拷过一份了。
 async fn page_route() -> axum::response::Html<&'static str> {
     axum::response::Html(dct_page::page())
+}
+
+/// 请求体：`{"title": "...", "key": "..."}`。
+#[derive(serde::Deserialize)]
+struct PublishRequest {
+    title: String,
+    key: String,
+}
+
+/// 老师（或者代他操作的管理台）公开这场直播。跟建房共用按来源的限流
+/// （`Live::note_start`，同一本账）——这条路一样对公网开着、一样没有配对
+/// 身份可验，攻击面跟 `POST /live/start` 一样大。
+///
+/// 判断顺序交给 `Live::publish`（先证明控制房间再看总开关再验发布密钥），
+/// 这里只是把 HTTP 那几个头翻译成它要的参数。
+async fn live_publish_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<PublishRequest>,
+) -> Result<StatusCode, Rejected> {
+    state.live.note_start(&client_key(&headers), Instant::now())?;
+    let control = control_header(&headers).ok_or(LinkError::Unauthorized)?;
+    let keys = state.keys.read().expect("keys 锁");
+    state
+        .live
+        .publish(&id, control, keys.as_ref(), &req.key, &req.title)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 取消公开。跟公开同一把控制凭据，`Live::unpublish` 本身是幂等的。
+async fn live_unpublish_route(
+    State(live): State<Arc<Live>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Rejected> {
+    let control = control_header(&headers).ok_or(LinkError::Unauthorized)?;
+    live.unpublish(&id, control)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 公开列表。谁都能读，不需要任何令牌——这就是"公开"的意思。
+async fn live_public_list_route(
+    State(live): State<Arc<Live>>,
+) -> Json<Vec<crate::live::PublicEntry>> {
+    Json(live.public_list())
+}
+
+/// 公开列表页。跟 `page_route`/`live_page_route` 同一个理由挂在这儿：
+/// `dct-page` 是两边唯一的真相来源，这里只是把已经打包好的字节交给 axum。
+async fn public_page_route() -> axum::response::Html<&'static str> {
+    axum::response::Html(dct_page::public_page())
 }
 
 /// 直播观众页。**只读，只有中转发**——它没有局域网那一档（学生从来不在
@@ -531,17 +621,19 @@ async fn ask_route(
 
 /// 中转挂哪些路由。
 ///
-/// **默认只有直播那一组。** 配对信封那三条（`/link/*`）和手机网页（`/`）没有
-/// 鉴权（见 [`must_be_loopback`]），以前全靠部署方在反代上写一条「只放行
-/// `/live/*`」的白名单挡着——那是一条配置里的约定，换一份「全部转发」的反代
-/// 配置它就没了，公网上的任何人就能冒充任何一台设备收发信封。现在不打开就
-/// 根本不存在，安全不再取决于反代写没写对。
+/// **默认只有直播那一组，外加公开列表。** 配对信封那三条（`/link/*`）和
+/// 手机网页（`/phone`）没有鉴权（见 [`must_be_loopback`]），以前全靠部署方
+/// 在反代上写一条「只放行 `/live/*`」的白名单挡着——那是一条配置里的约定，
+/// 换一份「全部转发」的反代配置它就没了，公网上的任何人就能冒充任何一台
+/// 设备收发信封。现在不打开就根本不存在，安全不再取决于反代写没写对。
+/// `/` 和 `GET /live/public` 是例外：公开列表本来就该谁都能读，两档都挂。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Routes {
-    /// 只有 `/live/*`。生产上跑的就是这一档。
+    /// 只有 `/live/*`（含公开列表 `/`、`/live/public`）。生产上跑的就是
+    /// 这一档。
     LiveOnly,
-    /// 再加上 `/link/*` 和 `/`。只给本机开发、以及鉴权落地之后用
-    /// （`dct-srv --with-link`）。
+    /// 再加上 `/link/*` 和 `/phone`（手机网页）。只给本机开发、以及鉴权
+    /// 落地之后用（`dct-srv --with-link`）。
     WithLink,
 }
 
@@ -549,13 +641,26 @@ pub fn router(state: AppState, routes: Routes) -> Router {
     let app = Router::new();
     let app = match routes {
         Routes::LiveOnly => app,
+        // 手机网页挂在 `/phone`，不再是 `/`——那个位置现在是公开列表页，
+        // 两档都挂（见下面 `.route("/", ...)`）。
         Routes::WithLink => app
-            .route("/", get(page_route))
+            .route("/phone", get(page_route))
             .route(PATH_POLL, post(poll_route))
             .route(PATH_SEND, post(send_route))
             .route(PATH_ASK, post(ask_route)),
     };
     app
+        // 公开列表页和列表接口：谁都能读，两档都挂。
+        .route("/", get(public_page_route))
+        .route(dct_link::live::PATH_PUBLIC_LIST, get(live_public_list_route))
+        .route(
+            "/live/{id}/public",
+            axum::routing::put(live_publish_route)
+                .delete(live_unpublish_route)
+                // 跟 `PATH_START` 一样：请求体只有一个标题和一把密钥，
+                // 16 KB 绰绰有余，不该跟信封共用两兆。
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         // 建房的请求体只有两把钥匙和几个路名，16 KB 绰绰有余。单独给它一个
         // 小上限：这是对公网开着、谁都能调的那一条，不该跟信封共用两兆。
         .route(
@@ -583,6 +688,7 @@ pub async fn serve(
     relay: Arc<Relay>,
     live: Arc<Live>,
     routes: Routes,
+    keys: Option<crate::keys::KeyFile>,
 ) -> Result<(), std::io::Error> {
     // TTL 清扫：老师断线（拔网线、合上笔记本）之后，直播连同两把钥匙要在
     // 一分钟内自己收掉，不然就是永远播着。见 `live.rs` 里 `sweep` 的注释。
@@ -594,7 +700,65 @@ pub async fn serve(
             sweeping.sweep(Instant::now());
         }
     });
-    axum::serve(listener, router(AppState { relay, live }, routes)).await
+
+    // 发布密钥的重载任务：没带 `--publish-keys` 就没有这个任务，公开路由
+    // 读到的 `keys` 一直是 `None`（没开公开功能）。
+    let shared = Arc::new(std::sync::RwLock::new(
+        keys.as_ref().map(|k| k.keys().clone()),
+    ));
+    if let Some(mut file) = keys {
+        let shared = shared.clone();
+        let live = live.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(dct_link::live::PUBLISH_KEYS_RELOAD);
+            loop {
+                tick.tick().await;
+                match file.reload_if_changed() {
+                    Ok(true) => {
+                        let fresh = file.keys().clone();
+                        // **先换密钥，再 `reconcile`。** `live_publish_route`
+                        // 在调 `Live::publish` 期间全程攥着 `keys` 的读锁；
+                        // 这里的写锁因此会等到每一个正拿着旧密钥在办公开的
+                        // 请求做完才能拿到手。锁一到手，新密钥立刻对之后
+                        // 所有请求生效，而紧接着这一次 `reconcile` 用的正是
+                        // 这份新密钥，收得掉"刚才那个请求拿着旧密钥、在写锁
+                        // 排队的当口侥幸公开成功"的房间。
+                        //
+                        // 反过来做（先 `reconcile` 后换密钥）会漏：
+                        // `reconcile` 只碰 `rooms` 那把锁，跟 `keys` 的锁毫
+                        // 无关系，一放手就有窗口——一个正拿着旧读锁执行
+                        // `Live::publish` 的请求会在这条窗口里用一把已经
+                        // 吊销的密钥把房间发布出去，而 `reconcile` 不会
+                        // 再跑第二次（下一次触发要等文件再变一次），那间
+                        // 房就一直公开到自然下线为止，破了"10 秒内收回"
+                        // 的承诺。
+                        *shared.write().expect("keys 锁") = Some(fresh.clone());
+                        live.reconcile(Some(&fresh));
+                    }
+                    Ok(false) => {}
+                    // 坏文件：保留上一份，只记日志，见
+                    // `KeyFile::reload_if_changed` 那段注释——写坏文件不能
+                    // 等于吊销全部，也不能等于全部放行。
+                    Err(why) => {
+                        eprintln!("dct-srv：发布密钥文件没重新加载，继续用上一份：{why}")
+                    }
+                }
+            }
+        });
+    }
+
+    axum::serve(
+        listener,
+        router(
+            AppState {
+                relay,
+                live,
+                keys: shared,
+            },
+            routes,
+        ),
+    )
+    .await
 }
 
 /// 第一期只许在环回地址上跑。
@@ -614,6 +778,104 @@ pub fn must_be_loopback(addr: std::net::SocketAddr) -> Result<(), String> {
          127.0.0.1 上跑；要对外提供服务，先做完任务 5（接 dc_classroom）\
          和第二期（端到端加密）。"
     ))
+}
+
+/// 中转的五种启动方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cli {
+    Serve {
+        addr: String,
+        with_link: bool,
+        publish_keys: Option<std::path::PathBuf>,
+    },
+    KeyAdd {
+        name: String,
+        file: std::path::PathBuf,
+    },
+    KeyRevoke {
+        name: String,
+        file: std::path::PathBuf,
+    },
+    KeyList {
+        file: std::path::PathBuf,
+    },
+    Takedown {
+        id: String,
+        file: std::path::PathBuf,
+    },
+}
+
+/// 手写解析：五种形状，不值得为此引一个参数库。
+pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
+        match args.iter().position(|a| a == flag) {
+            None => Ok(None),
+            Some(i) => args
+                .get(i + 1)
+                .filter(|v| !v.starts_with("--"))
+                .map(|v| Some(v.into()))
+                .ok_or_else(|| format!("{flag} 后面要跟一个文件路径")),
+        }
+    }
+    let need_file = |args: &[String]| {
+        flag_value(args, "--file")?.ok_or_else(|| "管理命令要写明 --file <密钥文件>".to_string())
+    };
+    match args.first().map(String::as_str) {
+        Some("key") => {
+            // `args.get(2)` 直接当名字用的话，`key add --file X`（漏了名字，
+            // `--file` 紧跟在 `add` 后面）会把 `--file` 当成密钥的名字，
+            // 而 `--file` 后面那个真正的文件路径反而没人管——过滤掉长得
+            // 像另一个 flag 的值，走到 `ok_or_else` 那句一样的「缺少名字」。
+            let name = || {
+                args.get(2)
+                    .filter(|n| !n.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| "缺少名字".to_string())
+            };
+            match args.get(1).map(String::as_str) {
+                Some("add") => Ok(Cli::KeyAdd {
+                    name: name()?,
+                    file: need_file(args)?,
+                }),
+                Some("revoke") => Ok(Cli::KeyRevoke {
+                    name: name()?,
+                    file: need_file(args)?,
+                }),
+                Some("list") => Ok(Cli::KeyList {
+                    file: need_file(args)?,
+                }),
+                _ => Err("用法：dct-srv key add|revoke|list ...".into()),
+            }
+        }
+        Some("takedown") => Ok(Cli::Takedown {
+            id: args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "缺少房间号".to_string())?,
+            file: need_file(args)?,
+        }),
+        _ => {
+            let publish_keys = flag_value(args, "--publish-keys")?;
+            let mut skip_next = false;
+            let mut addr = None;
+            for a in args {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if a == "--publish-keys" {
+                    skip_next = true;
+                } else if !a.starts_with("--") && addr.is_none() {
+                    addr = Some(a.clone());
+                }
+            }
+            Ok(Cli::Serve {
+                addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
+                with_link: args.iter().any(|a| a == "--with-link"),
+                publish_keys,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +904,7 @@ mod tests {
             AppState {
                 relay,
                 live: Arc::new(Live::new()),
+                keys: Arc::new(std::sync::RwLock::new(None)),
             },
             Routes::WithLink,
         )
@@ -656,33 +919,80 @@ mod tests {
             AppState {
                 relay: Arc::new(Relay::new(cfg(200))),
                 live: live.clone(),
+                keys: Arc::new(std::sync::RwLock::new(None)),
             },
             Routes::LiveOnly,
         );
         (app, live)
     }
 
-    /// **不开口子的中转，`/link/*` 和 `/` 根本不存在。** 这几条路由没有鉴权
-    /// （见 `must_be_loopback`），以前全靠反代上那条「只放行 `/live/*`」的白名单
-    /// 挡着——换一份「全部转发」的反代配置，公网上的任何人就能冒充任何一台
-    /// 设备收发信封。现在不带 `--with-link` 起的中转自己就不答这几条路。
+    /// 公开路由测试的底子：一场已经开播的直播，加一把能公开它的发布密钥。
+    fn app_with_keys() -> (Router, Arc<Live>, String) {
+        let live = Arc::new(Live::new());
+        let mut k = crate::keys::PublishKeys::default();
+        let key = k.add("姜老师", 0).unwrap();
+        let app = router(
+            AppState {
+                relay: Arc::new(Relay::new(cfg(200))),
+                live: live.clone(),
+                keys: Arc::new(std::sync::RwLock::new(Some(k))),
+            },
+            Routes::LiveOnly,
+        );
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        (app, live, key)
+    }
+
+    /// 发一条带任意方法/头/body 的请求，把状态码和 body 读回来。
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// **不开口子的中转，配对信封那三条和手机网页根本不存在。** 这几条路由
+    /// 没有鉴权（见 `must_be_loopback`），以前全靠反代上那条「只放行
+    /// `/live/*`」的白名单挡着——换一份「全部转发」的反代配置，公网上的
+    /// 任何人就能冒充任何一台设备收发信封。现在不带 `--with-link` 起的中转
+    /// 自己就不答这几条路。**`/` 是例外**：它是公开列表页，本来就该谁都能
+    /// 看，两档都挂。
     #[tokio::test]
     async fn the_default_relay_does_not_answer_the_unauthenticated_routes() {
         let (app, _live) = app_with_live();
-        for path in [PATH_POLL, PATH_SEND, PATH_ASK] {
+        for path in [PATH_POLL, PATH_SEND, PATH_ASK, "/phone"] {
             let (status, _) = post(app.clone(), path, "{}").await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path} 不该在默认中转上存在");
         }
+        // `/` 是公开列表页，两档都挂。
         let root = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            root.status(),
-            StatusCode::NOT_FOUND,
-            "`/` 不该在默认中转上存在"
-        );
+        assert_eq!(root.status(), StatusCode::OK, "`/` 该在默认中转上打得开");
         // 直播那一半照常：学生页打得开
         let page = app
             .oneshot(
@@ -773,7 +1083,12 @@ mod tests {
         body: Vec<u8>,
     }
 
-    async fn get_frame(app: &Router, id: &str, token: &str, if_none_match: Option<&str>) -> FrameResp {
+    async fn get_frame(
+        app: &Router,
+        id: &str,
+        token: &str,
+        if_none_match: Option<&str>,
+    ) -> FrameResp {
         let mut req = Request::builder()
             .method("GET")
             .uri(format!("/live/{id}/frame"))
@@ -1154,6 +1469,8 @@ mod tests {
     ///
     /// 这条测试是"只有一份网页"那件事唯一的看门人。哪天有人图省事在
     /// `dct-srv` 里放一份自己的 `page.html`，它当场就红。
+    ///
+    /// 手机网页挂在 `/phone`——`/` 现在是公开列表页。
     #[tokio::test]
     async fn the_relay_serves_the_very_same_page_the_daemon_does() {
         let relay = Arc::new(Relay::new(cfg(50)));
@@ -1161,7 +1478,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/")
+                    .uri("/phone")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1412,6 +1729,189 @@ mod tests {
         assert_eq!(still_there.status, 200, "假 secret 停播不该成功");
     }
 
+    /// 公开 → 列表里出现 → 无令牌能读路名（带公开标题）→ 取消公开 → 无令牌被拒。
+    #[tokio::test]
+    async fn publishing_over_http_end_to_end() {
+        let (app, _live, key) = app_with_keys();
+        let push = push_secret();
+        let body = format!(r#"{{"title":"第3课","key":"{key}"}}"#);
+        let ct = ("content-type", "application/json");
+
+        let (s, _) = call(&app, "PUT", "/live/abc/public", &[ct, ("x-live-push", &push)], &body).await;
+        assert_eq!(s, 204);
+        let (s, list) = call(&app, "GET", "/live/public", &[], "").await;
+        assert_eq!(s, 200);
+        assert!(list.contains("第3课") && list.contains("前端") && !list.contains("姜老师"), "{list}");
+        let (s, lanes) = call(&app, "GET", "/live/abc/lanes", &[], "").await;
+        assert_eq!(s, 200, "公开房间无令牌能读路名");
+        assert!(lanes.contains(r#""public":{"title":"第3课"}"#), "{lanes}");
+
+        let (s, _) = call(&app, "DELETE", "/live/abc/public", &[("x-live-push", &push)], "").await;
+        assert_eq!(s, 204);
+        let (s, _) = call(&app, "GET", "/live/abc/lanes", &[], "").await;
+        assert_eq!(s, 401);
+    }
+
+    #[tokio::test]
+    async fn a_grant_header_can_publish() {
+        let (app, _live, key) = app_with_keys();
+        let grant = dct_link::live::publish_grant(&dct_link::live::push_hash(&push_secret()), "abc");
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[("content-type", "application/json"), ("x-live-grant", &grant)],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 204);
+    }
+
+    /// 服务器没开公开功能：403；公开页照样打得开（空列表）。
+    #[tokio::test]
+    async fn without_a_key_file_publishing_is_forbidden_and_the_list_is_empty() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+        let body = format!(r#"{{"title":"课","key":"{}"}}"#, "0".repeat(64));
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[
+                ("content-type", "application/json"),
+                ("x-live-push", &push_secret()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 403);
+        assert_eq!(
+            call(&app, "GET", "/live/public", &[], "").await,
+            (200, "[]".to_string())
+        );
+        assert_eq!(call(&app, "GET", "/", &[], "").await.0, 200);
+    }
+
+    /// 既没带推帧钥匙也没带凭证：401，跟推帧、停播一样。
+    #[tokio::test]
+    async fn publishing_without_proof_of_control_is_unauthorized() {
+        let (app, _live, key) = app_with_keys();
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[("content-type", "application/json")],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 401);
+    }
+
+    /// 空的 `x-live-token` 当成没带：观看页没有令牌时不该因为发了个空头就被拒。
+    #[tokio::test]
+    async fn an_empty_token_header_counts_as_no_token() {
+        let (app, _live, key) = app_with_keys();
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[
+                ("content-type", "application/json"),
+                ("x-live-push", &push_secret()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 204);
+        assert_eq!(
+            call(&app, "GET", "/live/abc/lanes", &[("x-live-token", "")], "")
+                .await
+                .0,
+            200
+        );
+    }
+
+    /// **取帧路由跟取路名同一条规矩，不止 `/lanes`。** 公开的房间没带令牌、
+    /// 或者带了个空的 `x-live-token`，都该读得到帧。
+    #[tokio::test]
+    async fn a_published_rooms_frame_can_be_read_without_a_token_over_http() {
+        let (app, live, key) = app_with_keys();
+        live.push("abc", &push_secret(), 0, b"hi".to_vec()).unwrap();
+        let body = format!(r#"{{"title":"课","key":"{key}"}}"#);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/live/abc/public",
+            &[
+                ("content-type", "application/json"),
+                ("x-live-push", &push_secret()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(s, 204);
+
+        assert_eq!(
+            call(&app, "GET", "/live/abc/frame?lane=0", &[], "").await.0,
+            200,
+            "公开房间没带令牌该读得到帧"
+        );
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/live/abc/frame?lane=0",
+                &[("x-live-token", "")],
+                "",
+            )
+            .await
+            .0,
+            200,
+            "空令牌当成没带"
+        );
+    }
+
+    /// 私密房间不因为"没带令牌"就被放行——没带、带空串，取帧都得 401。
+    #[tokio::test]
+    async fn a_private_rooms_frame_stays_401_without_a_token_over_http() {
+        let (app, live) = app_with_live();
+        live.start(
+            "abc".into(),
+            "t".repeat(64),
+            push_secret(),
+            vec!["前端".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            call(&app, "GET", "/live/abc/frame?lane=0", &[], "").await.0,
+            401,
+            "私密房间没带令牌不该放行"
+        );
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/live/abc/frame?lane=0",
+                &[("x-live-token", "")],
+                "",
+            )
+            .await
+            .0,
+            401,
+            "空令牌不该借着私密房间照旧放行"
+        );
+    }
+
     /// 中转仍然不看帧里面是什么——这是 spec 决定一在直播上的那条线。
     ///
     /// 用 `concat!` 把每个禁词拆成两半再拼，是因为这条测试本身也会被
@@ -1431,5 +1931,71 @@ mod tests {
                 "{name} 出现在中转里——它开始认识 dct 的协议了"
             );
         }
+    }
+
+    #[test]
+    fn the_command_line_is_parsed_into_one_of_five_shapes() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&a("")).unwrap(),
+            Cli::Serve {
+                addr: "127.0.0.1:8787".into(),
+                with_link: false,
+                publish_keys: None
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("127.0.0.1:9000 --with-link --publish-keys /k.json")).unwrap(),
+            Cli::Serve {
+                addr: "127.0.0.1:9000".into(),
+                with_link: true,
+                publish_keys: Some("/k.json".into())
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("key add 姜老师 --file /k.json")).unwrap(),
+            Cli::KeyAdd {
+                name: "姜老师".into(),
+                file: "/k.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("key revoke a --file /k.json")).unwrap(),
+            Cli::KeyRevoke {
+                name: "a".into(),
+                file: "/k.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("key list --file /k.json")).unwrap(),
+            Cli::KeyList {
+                file: "/k.json".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("takedown abc --file /k.json")).unwrap(),
+            Cli::Takedown {
+                id: "abc".into(),
+                file: "/k.json".into()
+            }
+        );
+        assert!(
+            parse_cli(&a("key add a")).is_err(),
+            "管理命令必须写明 --file"
+        );
+        assert!(parse_cli(&a("--publish-keys")).is_err(), "参数缺值要报错");
+    }
+
+    /// T2：漏了名字直接写 `--file`（`key add --file X`）不该把 `--file`
+    /// 当成密钥的名字——那样一来真正的文件路径 `X` 就没人认领了，会往
+    /// `need_file` 里再吃一次 `--file` 之后的下一个词，拼出一把名叫
+    /// `"--file"` 的密钥。得报「缺少名字」，就像压根没写这个参数一样。
+    #[test]
+    fn key_add_without_a_name_does_not_treat_the_file_flag_as_the_name() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let err = parse_cli(&a("key add --file /k.json")).unwrap_err();
+        assert_eq!(err, "缺少名字", "{err}");
+        let err = parse_cli(&a("key revoke --file /k.json")).unwrap_err();
+        assert_eq!(err, "缺少名字", "{err}");
     }
 }
