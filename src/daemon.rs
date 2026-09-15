@@ -1080,6 +1080,12 @@ fn live_publish(
         .chars()
         .take(dct_link::live::MAX_PUBLIC_TITLE_CHARS)
         .collect();
+    // 界面在填标题那一步已经拦过空标题（`edit_live_input`），这里是
+    // 兜底：正常用户走不到，但协议本身不该允许把「空标题」当成一次
+    // 合法的公开意图送进 `LiveState`——不摸直播状态，原样拒掉。
+    if title.is_empty() {
+        return Response::Error(ErrorCode::BadRequest("标题不能为空".into()));
+    }
     match live.publish(title, key) {
         Some(info) => Response::Live(info),
         None => Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive)),
@@ -3320,6 +3326,39 @@ mod tests {
                 Response::Error(ErrorCode::LiveStagingRejected(LiveStagingProblem::NotLive))
             ),
             "{resp:?}"
+        );
+    }
+
+    /// M3：界面本来在填标题那步就拦了空标题（`edit_live_input`），这里是
+    /// 协议层的兜底——标题去首尾空白、截断之后要是空的，直接拒掉，
+    /// **不摸 `LiveState`**：不能把一个空标题当成一次合法的公开意图记
+    /// 下来，也不能把已经在播的公开状态悄悄改掉。
+    #[test]
+    fn live_publish_refuses_a_title_that_is_empty_after_trimming() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        recover(secrets.lock())
+            .set(crate::secrets::LIVE_PUBLISH_KEY, "k")
+            .unwrap();
+        let live = test_live();
+        live.start(vec![(1, "一".into())]);
+        live.publish("原标题".into(), "k".into());
+        let before = live.info().public;
+
+        let resp = live_call(
+            Request::LivePublish {
+                title: "   ".into(),
+            },
+            &secrets,
+            &live,
+        );
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
+            "{resp:?}"
+        );
+        assert_eq!(
+            live.info().public,
+            before,
+            "空标题被拒之后不该动到既有的公开状态"
         );
     }
 
