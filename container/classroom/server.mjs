@@ -23,6 +23,7 @@ const PUBLIC_ERRORS = {
   413: '标题太长（最多 60 个字）',
   429: '操作太频繁，请一分钟后再试',
 };
+const RELAY_TIMEOUT_MS = 10000;
 const js = value => JSON.stringify(value).replaceAll('<', '\\u003c');
 async function body(req) {
   if (!String(req.headers['content-type'] || '').startsWith('application/json')) throw fail(400, '请求格式无效');
@@ -153,7 +154,7 @@ export class Classroom {
     let body;
     if (method === 'PUT') { headers['content-type'] = 'application/json'; body = JSON.stringify({title: [...title].slice(0, 60).join(''), key: this.publicLive.key}); }
     let res;
-    try { res = await fetch(`${this.publicLive.relay}/live/${encodeURIComponent(id)}/public`, {method, headers, body}); }
+    try { res = await fetch(`${this.publicLive.relay}/live/${encodeURIComponent(id)}/public`, {method, headers, body, signal: AbortSignal.timeout(RELAY_TIMEOUT_MS)}); }
     catch { throw fail(409, '连不上直播中转，请稍后再试'); }
     if (res.status !== 204) throw Object.assign(fail(409, PUBLIC_ERRORS[res.status] || `直播中转拒绝了（状态码 ${res.status}）`), {relayStatus: res.status});
     return id;
@@ -173,27 +174,50 @@ export class Classroom {
     this.store.audit('取消公开直播', w);
   }
   // 后台自愈：记着要公开的工作区，中转说不公开就再公开一次；被吊销/下线就停。
+  //
+  // 守护进程 RPC 和中转的 HTTP 请求都在 `store.mutate` 的队列**之外**做——那
+  // 是全局唯一一条 FIFO，管理台和学生的每个改动请求都要排它，一次卡住的
+  // 中转不该把其他人挡分钟级。真正写状态时才短暂进队列，写之前重新核对
+  // 这条记录没被同时发生的别的操作改掉（标题变了、被手动取消公开……）。
   async healPublic() {
-    if (!this.publicLive) return;
-    let listed;
-    try { const r = await fetch(`${this.publicLive.relay}/live/public`); listed = new Set((await r.json()).map(x => x.id)); }
-    catch { return; }
-    for (const w of this.store.data.students.filter(s => s.livePublic)) {
-      await this.store.mutate(async () => {
-        const status = await this.liveStatus(w).catch(() => null);
-        if (!status) { delete w.livePublic; return; }
+    if (!this.publicLive || this.healing) return;
+    this.healing = true;
+    try {
+      let listed;
+      try {
+        const r = await fetch(`${this.publicLive.relay}/live/public`, {signal: AbortSignal.timeout(RELAY_TIMEOUT_MS)});
+        listed = new Set((await r.json()).map(x => x.id));
+      } catch { return; }
+      for (const w of this.store.data.students.filter(s => s.livePublic)) {
+        const title = w.livePublic.title;
+        let status;
+        // 问不出来（RPC 失败/超时）不等于「确认没在播」——那是
+        // `liveStatus` 自己的约定：查不出来时把决定权交给调用方，不能
+        // 静默当成没在播。这里的决定是：保留公开记录，下一轮再试。
+        try { status = await this.liveStatus(w); }
+        catch { continue; }
+        if (!status) {
+          await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title) delete w.livePublic; });
+          continue;
+        }
         const id = new URL(status.url).pathname.split('/').pop();
-        if (listed.has(id)) return;
-        try { await this.relayPublic(w, 'PUT', w.livePublic.title); delete w.livePublicError; }
-        catch (e) {
+        if (listed.has(id)) continue;
+        try {
+          await this.relayPublic(w, 'PUT', title);
+          await this.store.mutate(async () => { if (w.livePublic && w.livePublic.title === title) delete w.livePublicError; });
+        } catch (e) {
           if (e.relayStatus === 401 || e.relayStatus === 403) {
-            w.livePublicError = e.message;
-            delete w.livePublic;
-            this.store.audit(`公开直播被中转拒绝（${e.message}）`, w);
+            await this.store.mutate(async () => {
+              if (w.livePublic && w.livePublic.title === title) {
+                w.livePublicError = e.message;
+                delete w.livePublic;
+                this.store.audit(`公开直播被中转拒绝（${e.message}）`, w);
+              }
+            });
           }
         }
-      });
-    }
+      }
+    } finally { this.healing = false; }
   }
   async state(session) {
     if (session) await this.sso.syncRoster(session);

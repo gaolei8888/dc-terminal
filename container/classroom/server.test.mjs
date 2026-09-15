@@ -345,3 +345,65 @@ test('没配发布密钥：管理台不开公开功能', async () => {
     assert.equal((await request(`/admin/api/students/${ming.id}/live-public`, {title: 't'}, admin)).status, 404);
   } finally { app.server.close(); fs.rmSync(dir, {recursive: true, force: true}); }
 });
+
+test('自愈：daemon RPC 失败时保留公开记录，不清空、不写审计', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-rpcfail-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  const auditBefore = store.data.audit.length;
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') throw new Error('daemon socket timeout'); return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播'}, 'RPC 打不通不该被当成「没在播」');
+    assert.equal(store.data.audit.length, auditBefore, '不该因为一次 RPC 失败就写审计');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：daemon 确认没在播时清空公开记录', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-notlive-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: {id: ''}}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await app.healPublic();
+    assert.equal(store.data.students.find(s => s.id === ming.id).livePublic, undefined);
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('自愈：重入守卫挡住并发调用，中转只挨一次 PUT', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-heal-concurrent-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  await store.mutate(async () => { ming.livePublic = {title: '小明的直播'}; store.audit('公开直播工作区', ming); });
+  let puts = 0;
+  const relay = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/live/public') { res.writeHead(200, {'content-type': 'application/json'}); return res.end('[]'); }
+    if (req.method === 'PUT' && req.url === '/live/room01/public') { puts++; return setTimeout(() => { res.writeHead(204); res.end(); }, 200); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const relayUrl = `http://127.0.0.1:${relay.address().port}`;
+  const live = {id: 'room01', url: `${relayUrl}/live/room01#t=${'t'.repeat(64)}`, viewers: 0, readiness: 'Ready', public: 'Private'};
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), rpc: async (_, request) => { if (request === 'LiveStatus') return {Live: live}; if (request === 'LivePublishGrant') return {LiveGrant: 'g'.repeat(64)}; return {Ok: null}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, live: {relay: relayUrl, publishKey: 'K'.repeat(64)}});
+  try {
+    await Promise.all([app.healPublic(), app.healPublic()]);
+    assert.equal(puts, 1, '第二次调用该被重入守卫挡住');
+  } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
