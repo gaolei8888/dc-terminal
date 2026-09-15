@@ -86,7 +86,6 @@ impl View {
 
 /// 直播面板里正在填的那一行。
 #[derive(Clone, PartialEq)]
-#[allow(dead_code)] // 构造端在后续任务里接上
 pub enum LiveInput {
     /// 公开标题。
     Title(String),
@@ -243,7 +242,6 @@ pub(crate) enum View {
     /// 行打开时是 `None`。
     Live {
         state: ListState,
-        #[allow(dead_code)] // 读取端在后续任务里接上
         input: Option<LiveInput>,
     },
     /// 配对：跟训练营网关换一把钥匙。入口在 `secret.rs`（`EnterSecret`
