@@ -16,7 +16,7 @@ hand out one link and a roomful of people watch — read-only.
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.16](https://img.shields.io/badge/version-0.2.17-444?style=flat-square)
+![version 0.2.17](https://img.shields.io/badge/version-0.2.17-444?style=flat-square)
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
@@ -36,6 +36,32 @@ q quit         ai-mania         Enter open  n new  Tab project  ? …
 
 Grouped by project. The bar down the left marks where you are — that's the
 project `n` opens in.
+
+---
+
+## What's new
+
+- **[Telegram tells you when it's done](#telegram-tells-you-when-its-done).** A
+  session that stops, fails or dies sends you a message; reply to it and your
+  words go into that session.
+- **[Sessions come back after a restart](#sessions-outlive-the-terminal).** When
+  the background service starts over, dct offers to bring back what was running,
+  and agents that can resume carry on the same conversation.
+- **[A failure, in one sentence](#a-failure-in-one-sentence).** With `[llm]`
+  set, a failed session's bottom bar says what went wrong in plain words.
+  `dct llm check` tests that connection.
+- **[A project picker you can search](#picking-a-project).** Type to filter,
+  browse folders with a row that goes up a level, make a new project or paste a
+  path.
+- **[No more "press `g`"](#it-never-asks-is-this-okay).** A folder that isn't a
+  git repository becomes one by itself, and a machine without git is offered it.
+- **[Publish a live session to a fixed address](#live-to-a-room).** `p` in the
+  live panel puts it on the relay's public list.
+- **[dct in a browser](#dct-in-a-browser),** for machines that can't install
+  anything: a container, a link instead of a password, an upload panel, and a
+  classroom console.
+- **[Every command on one list](#commands).**
+- The running version is on the board's title line and on the settings page.
 
 ---
 
@@ -364,9 +390,12 @@ branches, your staging area and your `git log` stay clean.
 | `d` | what did this session actually change |
 | `s` | stop it |
 
-Agents only run inside a git project — that's where undo comes from. If the one
-you picked isn't a repository yet, the agent picker says so before you choose,
-and `g` creates one on the spot.
+Agents only run inside a git project — that's where undo comes from. **You don't
+have to set that up.** Start an agent in a folder that isn't a repository yet and
+dct runs `git init` there first. On a machine with no git at all it opens a
+session running `dct install git` instead, so you can watch it: on Windows that
+fetches a portable git into dct's own directory, elsewhere it names the one
+command to run. Pick the agent again once it's done.
 
 ---
 
@@ -378,6 +407,36 @@ exactly where they were. `dct` itself is just the window you reattach with.
 
 The board holds several agents at once, each in its own project directory, out
 of each other's way.
+
+**If the daemon itself goes away** — a reboot, a crash, `dct restart` — the next
+`dct` lists what was open last time and asks whether to bring it back. Each line
+says what you'll get: `continues` means the agent reopens the same conversation
+(Claude, and the four agents that run through it, can), `starts fresh` means a
+new session in the same folder with the same agent. Press Enter instead and you start with an empty board.
+
+---
+
+## Commands
+
+`dct` on its own opens the board and starts the daemon if it isn't running.
+Everything else:
+
+| | |
+|---|---|
+| `dct ps` | list the sessions running in the background |
+| `dct stop <n>…` / `--all` | stop sessions, giving them time to wind down |
+| `dct kill <n>…` / `--all` | kill sessions outright |
+| `dct prune` | clear stopped sessions off the list |
+| `dct restart` | swap in the current binary as the daemon (ends every session; `-y` skips the question) |
+| `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
+| `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
+| `dct daemon` | run only the daemon, no board |
+| `dct gate` | the door in front of [dct in a browser](#dct-in-a-browser) |
+| `dct --version` | which one you have |
+
+`ps`, `stop`, `kill` and `prune` never start a daemon: asking "is anything
+running?" shouldn't turn the answer from no into yes. `restart` does start one,
+because what you asked for is a daemon running the new binary.
 
 ---
 
@@ -535,6 +594,23 @@ which one you're about to get before you press anything (`n new claude`).
 `p` is the one place you say "I want to go to that project", so it goes on to ask
 which agent and opens the session. `Tab` and the digits only move the cursor.
 
+The title line ends with the version that's running, and so does the settings
+page — it's the first thing anyone helping you will ask.
+
+### Picking a project
+
+`p` opens a list of the projects you've used, most recent first, with a search
+box above it: start typing and the list narrows. Below the list are three rows
+that never scroll away, however long it gets:
+
+- **browse folders** — walk the disk from where you are. The top row goes up a
+  level, and so does `←`; going up puts the cursor on the folder you just came
+  out of, not back at the top. A "use this folder" row picks where you're
+  standing.
+- **new project** — its name starts as whatever you typed in the search box,
+  because not finding a project is exactly when you want to make one.
+- **type a path** — paste a path you already have.
+
 <details>
 <summary>The bottom bar, the grid, and what a session keeps for you</summary>
 
@@ -610,6 +686,25 @@ hand in this version.
 
 ---
 
+## A failure, in one sentence
+
+When a session fails, the bottom bar says why in words you can act on, instead
+of leaving you to read a screen of someone else's error output. It asks the same
+`[llm]` model the names come from, and only ever sends **the end of the failed
+screen** — that's where the error is.
+
+**This is off until you write an `[llm]` section yourself.** It isn't a default
+anyone else can switch on for you, because the end of a failed screen is exactly
+where `Invalid API key: sk-…`, `Authorization: Bearer …` and the contents of a
+`.env` tend to appear. DC's pairing screen offers to add the section for you, as
+a box you untick with `l`; it adds to your `config.toml` without rewriting it,
+and leaves an existing `[llm]` alone.
+
+`dct llm check` makes one real call through that connection and says whether it
+worked, so you find out now rather than on the next failure.
+
+---
+
 ## On your phone
 
 Settings has a "use your phone" switch. Turn it on and dct prints a QR code in
@@ -618,8 +713,9 @@ sessions, each one's live screen, and a line to type into.
 
 It is a page served by the daemon on your own network. Nothing goes to a server
 — there isn't one — so this works with no internet at all, and stops working the
-moment you leave the house. Reaching your machine from anywhere is a separate
-piece of work, designed but not built: see
+moment you leave the house. Out of the house, [Telegram](#telegram-tells-you-when-its-done)
+reaches you instead. Opening this page itself from anywhere goes through a relay,
+which is designed and partly written but not switched on: see
 [`docs/superpowers/specs/2026-08-23-dc-terminal-srv-design.md`](docs/superpowers/specs/2026-08-23-dc-terminal-srv-design.md).
 
 - **The first time, your system asks whether to allow it.** Say yes for private
@@ -646,6 +742,31 @@ piece of work, designed but not built: see
   desktop's.
 - Anyone on that network who has the token can type into your sessions. It is off
   by default and one keypress from off again.
+
+## Telegram tells you when it's done
+
+The phone page needs the same Wi-Fi; this doesn't — though it does need Telegram,
+which mainland China can't reach without a VPN. Make a bot with Telegram's
+BotFather, then in settings open **phone notifications** and paste the token it
+gave you. Send the bot any message and you're paired.
+
+- **A message arrives when a session stops, fails, or dies**, with its name and
+  project. Several at once are batched into one message rather than buzzing your
+  pocket for each.
+- **Reply to a message** and what you type goes into that session — no picking,
+  no guessing. With `[llm]` set, a session waiting on a choice arrives with the
+  choices already listed.
+- A message that isn't a reply goes to the one session that's waiting. If
+  several are waiting, the bot asks which rather than guessing: text typed into
+  the wrong agent costs far more than one more question. `/ls` lists the
+  sessions, `/use <n>` points your next messages at one of them.
+- **The first person to message the bot after you paste the token becomes its
+  owner, and everyone else is ignored for good.** Bot names are public and anyone
+  can message one, so this is the line between "my phone" and "a stranger typing
+  into my terminal". That owner is saved, so a restart doesn't reopen pairing;
+  "re-pair" in settings does.
+- Only text dct has already written for you leaves the machine — the name, the
+  project, the choices. The raw screen never does.
 
 ## Live to a room
 
@@ -693,6 +814,36 @@ your terminal.**
   allow **`/live/*` and the public listing page `/`, and nothing else**. To enable
   "publish to a fixed address," the operator also issues and installs a publish
   key with `dct-srv key add`/`--publish-keys`.
+
+## dct in a browser
+
+Everything above assumes a machine that meets [the hardware
+table](#install). For the people it doesn't — an old laptop, a locked-down work
+computer, a Chromebook, a tablet — [`container/`](container/README.md) runs the
+whole board on a server, and they open a link. Closing the browser leaves the
+sessions running, same as closing a terminal.
+
+- **`dct gate` is the door.** The link carries its key, trades it for a 30-day
+  cookie on first open, and wipes it from the address bar. Anything arriving
+  without the key gets the same refusal whatever path it asked for. It does not
+  encrypt, so it binds to loopback unless you say `--bind`, and **must sit
+  behind TLS** before anyone else can reach it.
+- **Beside the terminal is a panel for what a terminal can't carry:** paste or
+  upload images (preview, add a note, then insert them into the session), upload
+  files into the project's `uploads/` folder where the agent can read them,
+  download a file or the whole project as a ZIP. Behind the classroom server
+  there's also a microphone button that turns what you say into text in the
+  input line. Ending a practice never
+  deletes the code.
+- **For a class**, [`container/classroom/`](container/classroom/README.md) is the
+  teacher's console: add students by name, hand each one their own link, watch
+  a student's terminal read-only or step in to help, and put a student's
+  workspace live — publicly, if you choose.
+
+Setup, the environment variables, and what gets worse in a container are all in
+[`container/README.md`](container/README.md).
+
+---
 
 ## Colours
 
@@ -784,7 +935,7 @@ overrides it for one run, and with neither it follows your system locale.
 ---
 
 <details>
-<summary><b>Where this is going</b> — none of it is written yet</summary>
+<summary><b>Where this is going</b> — what isn't written yet</summary>
 
 <br>
 
@@ -799,9 +950,10 @@ in between shouldn't need you watching.
 - **Agents come find you instead of sitting there.** An `ask_human` tool: the
   agent calls it and blocks, the question goes to your phone, your answer comes
   back as the tool's return value, and it carries on.
-- **Phone channels.** Telegram first, because it's the only one that doesn't need
-  a public callback address; then Feishu, WeCom, SMS. If the primary channel
-  fails to send, it falls back automatically and says so in the message.
+- **More phone channels.** [Telegram is done](#telegram-tells-you-when-its-done)
+  — it went first because it's the only one that doesn't need a public callback
+  address. Feishu, WeCom and SMS aren't. Nor is falling back: if the primary
+  channel fails to send, the next one should carry the message and say so.
   Fallbacks have to be chosen in advance — you can't ask someone which channel
   they'd like when the thing that's broken is how you ask them things.
 - **Exactly one message format.** Outbound is always one sentence plus numbered,
@@ -850,10 +1002,22 @@ src/secrets.rs     ~/.dct/secrets.toml
 src/verify.rs      the API-key probe
 src/git.rs         hidden snapshots
 src/projects.rs    recent projects, last agent used
+src/last_sessions.rs  what was running, so a restarted daemon can offer it back
+src/journal.rs     how each session started and how it ended (asked to stop, or vanished)
 src/proto.rs       the wire contract
+src/config.rs      ~/.dct/config.toml; [llm] is off unless written
+src/llm/           the [llm] connection: CLI or HTTP, and which credential may go where
+src/runtime.rs     dct's own Node and git, under ~/.dct/runtime
+src/pair*.rs       DC pairing: the state machine, its HTTP, writing the result
+src/channel/       phone channels; only Telegram so far. Knows nothing of sessions
+src/bridge.rs      sessions <-> channel: who the owner is, which reply goes where
+src/live.rs        pushes staged screens to the relay (DCT_RELAY)
+src/gate.rs        dct gate, the key-checking door for the browser version
 src/web/           the LAN phone client: a tiny HTTP server and one page
 src/link.rs        dials out to a relay and long-polls it (no switch yet)
+src/sys/           everything that differs between Unix and Windows
 crates/dct-link/   the envelope the daemon and the relay share; no Request
+crates/dct-page/   the only two web pages: the phone client and the live viewer's
 crates/dct-srv/    the relay. Only /live/* and the public listing page / by default (--with-link adds
                    the unauthenticated pairing routes, for local development; --publish-keys turns
                    on publishing). Phase one has no auth and no encryption, and
