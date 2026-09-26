@@ -1,7 +1,7 @@
 # dct judge：像 Jev 一样回答「选哪个、打几分、是不是」
 
 日期：2026-09-26
-状态：方向已确认，设计待用户审阅
+状态：方向已确认，设计待用户审阅（已按「dct 去控制别的软件，而不是让别的软件来连 dct」收窄：第一版不开 HTTP 服务）
 关联：`~/work/dc/dc-vault/docs/superpowers/specs/2026-09-26-dc-vault-design.md`（「dct 替你做决定」四块的总图）；
 参考：TypeSafe Jev 的 `POST /v1/systemone`、laya-serve（`github.com/NandhaKishorM/laya`，自称与 Jev 格式逐字段一致）、
 Allan 的文章「A Jev-like wrapper for LLMs, including vision models」（2026-09）
@@ -13,18 +13,20 @@ Allan 的文章「A Jev-like wrapper for LLMs, including vision models」（2026
 
 用户的要求原话：「Jev 能做的事情我们都应该可以做」「dct 用来控制，dcv 用来记忆」「要支持中文」。
 
-本设计只做**引擎和对外接口**。把它接到 dct 自己的决定上（给 DC/opencode 判断状态、替换 Telegram 那边
+本设计只做**引擎和 `dct judge` 命令**。把它接到 dct 自己的决定上（给 DC/opencode 判断状态、替换 Telegram 那边
 「是不是在等选择」、判断一步撤不撤得回）是下一份设计。
 
 ## 讨论中已经定下的事（不在本设计里再议）
 
-- **两个都要，先做引擎和对外接口**，再一件件接到 dct 自己的决定上。
+- **两个都要，先做引擎**，再一件件接到 dct 自己的决定上。
+- **不开让别的软件来连 dct 的 HTTP 服务。** 用户的方向是「dct 去控制别的软件」：别人不会为 dct 改自己的软件，
+  所以 dct 主动去连别人已经开好的门（MCP、HTTP 接口、命令行、AppleScript、浏览器），那是另一份设计。
+  judge 在这里的角色是**给 dct 自己做决定用的引擎**，外加一条给人和脚本用的命令。
 - **方法用 logprobs**，不训练模型：把选项标成字母，让模型只答一个字母，读它给每个字母的概率，在选项之间归一化。
   这个方法对看图的模型同样有效。
 - **模型走 dct 现有的 `[llm]`**（也就是 DC 网关，默认 `qwen3-vl:30b-64k`：能看图、中文是母语）。
 - **格式跟 Jev 逐字段一致**，现有 Jev 客户端改个地址就能用；在此之上加一个 `attachments`（图片）扩展。
 - **不编概率**：拿不到 logprobs 就报错，不拿一个假的 100% 充数。
-- **HTTP 服务单独跑**（`dct judge --serve`），不进守护进程。
 
 ## 请求：跟 Jev 一样
 
@@ -45,14 +47,13 @@ Allan 的文章「A Jev-like wrapper for LLMs, including vision models」（2026
 ```
 
 - `choice`：`criteria` 是「选项名 → 说明（可为 null）」，**2 到 20 个**（字母 A–T）。选项名原样当答案回传。
-- `score`：`criteria` 是**有序**的等级说明数组，2 到 20 级；每一级都必须有说明（与 laya-serve 相同，空的回 422）。
+- `score`：`criteria` 是**有序**的等级说明数组，2 到 20 级；每一级都必须有说明（与 laya-serve 相同，空的就报错）。
 - `noul`：两个选项固定为 `false`、`true`，`criteria` 可选，用来给这两个选项配说明。返回 `true` 的概率。
 - `attachments`（我们的扩展）：图片，`data:image/...;base64,` 或本机文件路径（png/jpeg/webp/gif）。
-  **HTTP 接口只接受 data URL，拒绝文件路径**——否则任何能连上来的程序都能让 dct 读你磁盘上的图发给网关。
   命令行两种都行。
 
 上限（防止一次请求把额度或内存打爆，数字取自 laya-serve）：问题 ≤ 64 个；`state` ≤ 50 000 字；
-图片 ≤ 4 张；整个请求 ≤ 16 MiB（没有图片时 ≤ 2 MiB）。超了回 413 / 422，说清是哪一条。
+图片 ≤ 4 张；整个请求 ≤ 16 MiB（没有图片时 ≤ 2 MiB）。超了就报错，说清是哪一条。
 
 ## 回复：跟 Jev 一样
 
@@ -143,35 +144,18 @@ Allan 的文章「A Jev-like wrapper for LLMs, including vision models」（2026
   「按目的地主机判断凭据」那条规矩只在 `resolve_endpoint()` 里写一次。
 - 超时：每个子请求连接 5 秒、总共 60 秒（`.timeout()` 和 `.timeout_connect()` 都设，理由见 `llm/http.rs`）。
 
-## 对外接口
+## 命令
 
 ### 命令：`dct judge`
 
 ```
 dct judge [文件]          从文件或标准输入读一个 Jev 请求，输出 Jev 回复（JSON）
 dct judge --probe         用一个固定的问题打一次，只看后端给不给得出概率
-dct judge --serve [--port 47900]
-dct judge --token         印出 HTTP 服务的密钥
 ```
 
 - 成功退出码 0；请求本身写错了退出码 2，错误说明写 stderr；后端出错退出码 1。
 - 输出只有 JSON；任何给人看的话写 stderr，好让脚本直接用管道接。
 
-### HTTP：`dct judge --serve`
-
-- `POST /v1/systemone`：请求和回复同上。`GET /health`：`{"ok": true, "model": "..."}`，不打后端。
-- **只绑 `127.0.0.1`**，默认端口 **47900**（避开 dc_workbench 的 47832）。
-- **必须带 `Authorization: Bearer <密钥>`**：本机任何程序都能连上来花你的网关额度、读回判断结果。
-  密钥第一次 `--serve` 时生成，存在 `~/.dct/secrets.toml` 一个 profile 不可能占用的名字下（同 `gate` 的做法），
-  `dct judge --token` 印出来。比对用常数时间比较。
-- 同时最多处理 8 个请求，多的回 503。请求体按上面的上限先查大小再读。
-- 出错统一回 `{"error": {"code": "...", "message": "一句人话"}}`：401 没带或带错密钥；413 太大；
-  422 请求写错了（指出哪个问题的哪个字段）；502 后端出错或给不出概率。**不回堆栈、不回原始系统错误。**
-- 每个请求在 stderr 记一行：时间、问题数、用时、成功与否。**不记 `state` 和图片的内容。**
-
-**为什么不放进守护进程**：放进去就要改协议版本，而旧守护进程遇到新 CLI 会让 `ps/stop/kill/prune` 吐原始报错、
-升级还要重启并断掉所有会话（见 README「Building from source」）。judge 服务和会话没有任何关系，单独跑就没有这些代价。
-以后如果 dct 自己的决定要用它，守护进程直接调引擎模块（同一个 crate 里的函数），不走 HTTP。
 
 ## 代码放哪儿
 
@@ -179,13 +163,11 @@ dct judge --token         印出 HTTP 服务的密钥
 src/judge/mod.rs      请求/回复的类型、校验、上限、并发调度、usage 汇总
 src/judge/prompt.rs   中英文模板、选项字母、图片组装
 src/judge/logprobs.rs 从 top_logprobs 算概率（缺席字母规则、softmax、confidence、answer_confidence）
-src/judge/serve.rs    HTTP 服务（鉴权、上限、并发上限、错误格式）
 src/llm/resolve.rs    拆出 resolve_endpoint()
 src/cli.rs / main.rs  `dct judge` 子命令、HELP 文案
 ```
 
-HTTP 服务复用 `src/web/mod.rs` 已有的请求解析和常数时间比对，不再写第二份 HTTP 解析。传输层照 `llm/http.rs`
-的做法注入（`with_sender`），测试不打网络。整棵依赖树仍然没有 C。
+传输层照 `llm/http.rs` 的做法注入（`with_sender`），测试不打网络。守护进程以后要用它，直接调这个模块里的函数。整棵依赖树仍然没有 C。
 
 ## 动手的第一步：先验证，不先写引擎
 
@@ -220,14 +202,12 @@ HTTP 服务复用 `src/web/mod.rs` 已有的请求解析和常数时间比对，
 - **算概率**：给定 top_logprobs，分布、`choice`、期望等级、`noul`、两种 confidence 都对；token 带空格照样认；
   同一字母多次取最大；缺席字母占比 < 10⁻⁶ 记 0、≥ 10⁻⁶ 报错；一个字母都没有时报错并带上第一个 token。
 - **格式**：请求里每一种写错（类型不认识、选项 < 2 或 > 20、score 某级没说明、问题 > 64、`state` 过长）
-  都回 422 并指出位置；回复逐字段对得上 laya-serve 测试里的样例。
+  都报错并指出位置（命令退出码 2）；回复逐字段对得上 laya-serve 测试里的样例。
 - **提示词**：中文 `state` 用中文模板、英文用英文模板；`state` 在最前面；图片在文字后面；
   没图片时 `content` 是字符串。
 - **拿不到 logprobs**：后端回复里没有 `logprobs` → 明确报错，绝不返回概率。
 - **连接**：`[llm]` 没配、是 CLI 方式、是 Anthropic 接口，三种情况各给一句能照着改的话；凭据只发往 `[llm]`
   那台主机（复用 resolve 的测试）。
-- **HTTP**：没带 / 带错密钥 401；超大 413；只绑 127.0.0.1；第 9 个并发请求 503；文件路径型附件被拒；
-  错误回复里不出现堆栈和原始系统错误。
 - **并发**：三个问题的三个子请求确实同时发出（假后端记录到达时间）；`usage` 是三者之和。
 - 所有测试用注入的假后端，不打网络。`--probe` 的真实运行结果贴进实施报告。
 
