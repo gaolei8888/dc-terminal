@@ -33,19 +33,31 @@ def _wifi(c, timeout_s=20):
     return w
 
 def _camera():
-    # OV3660 在这版驱动里出不了硬件 JPEG（构造时或 reconfigure 指定 JPEG 都失败，别人在 XIAO S3 Sense 上也一样），
-    # 所以拍 RGB565，再用固件自带的 jpeg 模块（esp_new_jpeg，S3 向量指令加速）压一下：
-    # 实测 QVGA 压一帧 33 ms、150KB → 3.8KB。24MHz + 两个缓冲 + 总取最新一帧：拍+压 14 帧/秒。
+    # 两块板，两种接法，按顺序试，第一个成功的就用（返回 cam, enc；enc 为 None 表示传感器自己出 JPEG）：
+    # 1. KIDVIEDU（OV2640）：模组自带时钟，xclk 不接（-1）；传感器硬件 JPEG 完好，QVGA 27 帧/秒、每帧 4.4KB。
+    #    它的 RGB565 反而会丢数据（cam_hal: FB-SIZE 不符），所以只用 JPEG。
+    # 2. N16R8（OV3660）：时钟接 15；这版驱动里 OV3660 出不了硬件 JPEG，只能拍 RGB565，
+    #    再用固件自带的 jpeg 模块（esp_new_jpeg，S3 向量指令加速）压：QVGA 33 ms、150KB → 3.8KB，拍+压 14 帧/秒。
     # 压缩只是打包，不是判断——判断全在大模型那边。
-    import jpeg
     from camera import Camera, PixelFormat, FrameSize, GrabMode
-    cam = Camera(data_pins=[11, 9, 8, 10, 12, 18, 17, 16], pclk_pin=13, vsync_pin=6, href_pin=7,
-                 sda_pin=4, scl_pin=5, xclk_pin=15, powerdown_pin=-1, reset_pin=-1,
-                 xclk_freq=24000000, pixel_format=PixelFormat.RGB565, frame_size=FrameSize.QVGA,
-                 fb_count=2, grab_mode=GrabMode.LATEST)
+    pins = dict(data_pins=[11, 9, 8, 10, 12, 18, 17, 16], pclk_pin=13, vsync_pin=6, href_pin=7,
+                sda_pin=4, scl_pin=5, powerdown_pin=-1, reset_pin=-1,
+                frame_size=FrameSize.QVGA, fb_count=2, grab_mode=GrabMode.LATEST)
+    try:
+        cam = Camera(xclk_pin=-1, xclk_freq=24000000, pixel_format=PixelFormat.JPEG, jpeg_quality=85, **pins)
+        cam.capture()
+        return cam, None
+    except Exception as e:
+        print("dct_cam: 不是 KIDVIEDU 接法（%s），换 N16R8 接法" % e)
+    import jpeg
+    cam = Camera(xclk_pin=15, xclk_freq=24000000, pixel_format=PixelFormat.RGB565, **pins)
     enc = jpeg.Encoder(pixel_format="RGB565_BE", quality=60,
                        width=cam.get_pixel_width(), height=cam.get_pixel_height())
     return cam, enc
+
+def _jpeg(cam, enc):
+    img = cam.capture()
+    return bytes(img) if enc is None else enc.encode(img)
 
 def _same(a, b):
     # 常数时间比较，别让响应时间泄露 token 对了几位
@@ -114,16 +126,16 @@ def serve(port=80):
             elif path.startswith("/capture"):
                 img = cam.capture()
                 extra = "X-Width: %d\r\nX-Height: %d\r\n" % (cam.get_pixel_width(), cam.get_pixel_height())
-                if "raw=1" in path:
+                if "raw=1" in path and enc is not None:
                     _reply(cl, "200 OK", bytes(img), "application/octet-stream", extra + "X-Format: rgb565be\r\n")
                 else:
-                    _reply(cl, "200 OK", enc.encode(img), "image/jpeg", extra)
+                    _reply(cl, "200 OK", bytes(img) if enc is None else enc.encode(img), "image/jpeg", extra)
             elif path.startswith("/stream"):
                 # MJPEG：浏览器原生就能播。一直推到对方断开；推流期间这个单线程服务不接别的请求。
                 cl.settimeout(None)
                 cl.send(b"HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-cache\r\n\r\n")
                 while True:
-                    out = enc.encode(cam.capture())
+                    out = _jpeg(cam, enc)
                     cl.send(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(out))
                     mv = memoryview(out)
                     while mv:
