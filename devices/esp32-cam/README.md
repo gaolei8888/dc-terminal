@@ -10,8 +10,8 @@
 | 芯片 | ESP32-S3（QFN56，v0.2），内置 8MB PSRAM，16MB flash（N16R8） |
 | 摄像头 | **OV3660** |
 | 引脚 | `data=[11,9,8,10,12,18,17,16] pclk=13 vsync=6 href=7 sda=4 scl=5 xclk=15`，pwdn/reset 不接 |
-| 时钟 | `xclk_freq=10MHz` |
-| 画面格式 | **RGB565 能用；JPEG 不能用**（构造时报「拍不到第一帧」，运行中切到 JPEG 拍出 0 字节，原因未查） |
+| 时钟 | `xclk_freq=24MHz`，`fb_count=2`，`GrabMode.LATEST` |
+| 画面格式 | 传感器拍 RGB565，板上用固件自带的 `jpeg` 模块压成 JPEG（见下）。**传感器自己的 JPEG 在这版驱动里用不了** |
 
 两个 USB-C 口：
 - **UART 口（WCH 串口，macOS 上是 `/dev/cu.usbserial-*`）——刷机和传文件用这个。** esptool 能自动让板子进下载模式。
@@ -60,7 +60,8 @@ python3 -m mpremote connect $PORT cp dct_cam.py :dct_cam.py + cp main.py :main.p
 | | |
 |---|---|
 | `GET /status` | `{"ip", "rssi", "sensor", "uptime_ms", "free"}` |
-| `GET /capture` | 一帧原始画面。响应头 `X-Width`、`X-Height`、`X-Format: rgb565be`（高字节在前）。QVGA 一帧 153600 字节 |
+| `GET /capture` | 一张 JPEG（320×240，约 3.8KB）。加 `?raw=1` 回原始 RGB565（`X-Format: rgb565be`，153600 字节） |
+| `GET /stream` | MJPEG 视频流，浏览器直接能播。浏览器的 `<img>` 带不了请求头，所以这里也认网址里的 `?t=<token>`。**一次只接一个观看者**：推流期间别的请求都在排队 |
 
 ## 2026-09-26 实测：整条路通了
 
@@ -75,3 +76,31 @@ python3 -m mpremote connect $PORT cp dct_cam.py :dct_cam.py + cp main.py :main.p
 dct 要在弹窗之前先用一句话说明，跟手机端「防火墙会问你」同一个做法。
 
 ⚠️ ESP32 只能连 2.4GHz。路由器把两个频段分成两个名字时（比如 `xxx-2.4g` / `xxx-5G`），要选 2.4g 那个。
+
+## JPEG：为什么在板上压、压得多快
+
+**传感器自带的 JPEG 用不了。** 36 组参数（时钟 5/8/10/16/20/24MHz × 画质 20/50/85 × 缓冲 1/2 × 取帧方式）全部报
+「拍不到第一帧」；先用 RGB565 启动再 `reconfigure` 到 JPEG，拍出来 0 字节。别人在同款传感器上结论一样：
+[XIAO-ESP32S3-Sense-Setup](https://github.com/jouellnyc/XIAO-ESP32S3-Sense-Setup) 写着
+「`reconfigure()` and constructor-time `pixel_format=PixelFormat.JPEG` cause init failures on OV3660」；
+乐鑫驱动 [issue #862](https://github.com/espressif/esp32-camera/issues/862)（S3 + OV3660，初始化成功但一帧都拿不到）没有官方结论。
+
+**所以拍 RGB565、在板上用固件自带的 `jpeg` 模块压**（cnadler86 固件带的 mp_jpeg，底下是乐鑫的 esp_new_jpeg，S3 向量指令加速）。
+压缩必须在板上做：瓶颈是 Wi-Fi 那一段，到了电脑上再压就晚了。压缩只是打包，不是判断。实测：
+
+| 分辨率 / 画质 | 压一帧 | 大小 |
+|---|---|---|
+| 320×240 / 60 | 33 ms | 150KB → 3.4KB（45 倍） |
+| 640×480 / 60 | 188 ms | 600KB → 7.3KB（84 倍） |
+
+**拍才是瓶颈**（10MHz、一个缓冲时拍一帧 270–360 ms）。320×240、画质 60 时「拍 + 压」的帧率：
+
+| 时钟 | 1 个缓冲，等下一帧 | 2 个缓冲，取最新一帧 |
+|---|---|---|
+| 10MHz | 2.7 帧/秒 | 5.5 |
+| 16MHz | 4.4 | 8.8 |
+| 20MHz | 5.5 | 11.0 |
+| **24MHz** | 7.3 | **14.3** |
+
+更狠的压缩（H.264，乐鑫有给 S3 的软件编码器，静止画面比 JPEG 再小 5–10 倍）不在这版 MicroPython 固件里，
+要自己用 C 编固件。JPEG 够用之前不碰。
