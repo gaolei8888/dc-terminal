@@ -122,3 +122,25 @@ dct 要在弹窗之前先用一句话说明，跟手机端「防火墙会问你�
 （这块板的 GPIO0 读 0，不能拿它当对照。）
 
 板上出厂就是 camera 版 MicroPython 1.27，不用刷机，直接装服务。实测单张 `/capture` 5.7KB、0.72 秒。
+
+## KIDVIEDU 的屏幕和喇叭（2026-09-26 实测）
+
+**屏幕** ST7789 240×320，用 russhughes 的 `st7789py.py`（[上游](https://github.com/russhughes/st7789py_mpy)，放在板上 `/lib/`）：
+
+```python
+spi = SPI(1, baudrate=40_000_000, polarity=1, sck=Pin(46), mosi=Pin(3))   # polarity=1 不能省
+tft = st7789py.ST7789(spi, 240, 320, dc=Pin(1, Pin.OUT), cs=Pin(14, Pin.OUT))
+```
+
+- **`polarity=1` 不能省**：不写就不亮，而且 `init` 照样不报错。这组参数和 dc_desktop
+  `packages/device-peripherals/src/display/driver.py` 里已验证过的一致；SPI 用 1 号——2 号在 SPIRAM_OCT 固件上被八线 PSRAM 占着，会崩。
+- **模组要插实**：几次「完全黑 / 微微有一点光」都是没插到位，跟摄像头同一个毛病。程序跑完不报错，不代表屏幕亮了——要问看的人。
+
+**喇叭** I2S，在主板上（不用插模组）：
+
+```python
+spk = I2S(0, sck=Pin(42), ws=Pin(39), sd=Pin(41), mode=I2S.TX, bits=16, format=I2S.MONO, rate=16000, ibuf=16384)
+```
+
+- **振幅 2000（满格的约 6%）是默认音量**：8000（24%）和 4000（12%）都破音，1000 偏小。
+- **整块送数据**（比如一次 0.1 秒），别一个波形周期一个周期地 `write`：MicroPython 跟不上会断音。
