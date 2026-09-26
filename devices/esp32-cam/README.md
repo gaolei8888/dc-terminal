@@ -61,3 +61,17 @@ python3 -m mpremote connect $PORT cp dct_cam.py :dct_cam.py + cp main.py :main.p
 |---|---|
 | `GET /status` | `{"ip", "rssi", "sensor", "uptime_ms", "free"}` |
 | `GET /capture` | 一帧原始画面。响应头 `X-Width`、`X-Height`、`X-Format: rgb565be`（高字节在前）。QVGA 一帧 153600 字节 |
+
+## 2026-09-26 实测：整条路通了
+
+- 板子连上家里的 2.4GHz 网络，拿到局域网地址，信号 -45 dBm。
+- 不带 token → 401；\`/status\` → 正常；\`/capture\` → 320×240 RGB565，153600 字节，**经 Wi-Fi 2.35 秒**。
+- Wi-Fi 密码从 Mac 钥匙串读出、直接写进板子的 \`/wifi.json\`，没显示、没落盘。
+  板子的 token 存在 Mac 钥匙串：服务名 \`dct-esp32-cam\`，账户 \`token\`
+  （\`security find-generic-password -s dct-esp32-cam -a token -w\`）。
+
+⚠️ **macOS 的「本地网络」权限按程序单独给。** pyenv 装的 Python 连板子报 \`No route to host\`（errno 65），
+同一时刻系统自带的 \`curl\` 能连、\`ping\` 也通。dct 第一次连板子时 macOS 会弹窗问要不要允许——
+dct 要在弹窗之前先用一句话说明，跟手机端「防火墙会问你」同一个做法。
+
+⚠️ ESP32 只能连 2.4GHz。路由器把两个频段分成两个名字时（比如 `xxx-2.4g` / `xxx-5G`），要选 2.4g 那个。
