@@ -2259,14 +2259,17 @@ mod tests {
             *n += 1;
             Ok(id)
         }
-        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
+        fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
             *self.poll_calls.lock().unwrap() += 1;
-            let result = self
-                .poll_results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(Vec::new()));
+            let queued = self.poll_results.lock().unwrap().pop_front();
+            // 真的通道是长轮询：没有新消息时会等上一阵才返回。这里立刻返回的话，
+            // 轮询线程就是一个空转的死循环（CI 上两秒转了一千一百多万圈），
+            // 在核少、测试并行的机器上把发送线程饿到一次都发不出去。没东西可给
+            // 时略等一下，行为才像真的；有排好的结果照旧立刻给。
+            if queued.is_none() {
+                std::thread::sleep(timeout.min(Duration::from_millis(2)));
+            }
+            let result = queued.unwrap_or(Ok(Vec::new()));
             if let Some(f) = self.on_poll_return.lock().unwrap().as_ref() {
                 f();
             }
