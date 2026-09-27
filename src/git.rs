@@ -13,8 +13,13 @@ pub struct FileStat {
 /// 所有 git 调用的唯一出口。**`no_console` 必须走这里**：检查点是守护进程
 /// 干的，而守护进程没有控制台，少了那一句每敲一次回车 Windows 就闪一排黑
 /// 窗口（理由写在 `sys::proc::no_console`）。
+///
+/// **`core.autocrlf=false` 也必须在这里**：Git for Windows 装好默认就是
+/// `true`，检查点存进去的是 LF，撤销写回来时会被转成 CRLF——撤销改掉了用户
+/// 每一个文本文件的每一行。检查点要的是「原样存、原样还」。
 fn cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");
+    c.args(["-c", "core.autocrlf=false"]);
     c.current_dir(dir);
     crate::sys::proc::no_console(&mut c);
     c
