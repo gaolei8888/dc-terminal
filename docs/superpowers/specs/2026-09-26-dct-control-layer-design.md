@@ -144,9 +144,18 @@ params = { to = "string", text = "string" }
   不能拿去发另一句话，也不能重放。守护进程验签通过才执行；签名和人话一起记进 journal。
 - `read` / `self` 两档不要授权，照旧（见上表）。dcv 里你亲手写的 `rule` 可以让 `content` 类免问，**但免不掉 passkey 的只有 `money`**——这一点待用户确认：规则放行之后是否还要按指纹。
 
-**别的平台**：Windows 用 Windows Hello（同样有硬件保护的密钥）；Linux 没有等价物——**没有 passkey 的机器上，
-`content` 和 `money` 两档直接关闭**，不退化成「点一下同意」。手机上按面容（WebAuthn）要求 HTTPS 页面，
-而手机端现在是局域网明文 HTTP，所以手机授权要走带 TLS 的中转，单独设计。
+**每台设备用它自己的 passkey**（用户：「手机上就是手机的人脸、指纹」「Windows 上就用 Windows 的 passkey」）：
+
+| 设备 | 你怎么确认 | 密钥在哪 |
+|---|---|---|
+| Mac | Touch ID | 安全隔区（Secure Enclave） |
+| Windows | Windows Hello（指纹 / 人脸 / PIN） | TPM |
+| 手机 | 手机自己的面容 / 指纹 | iPhone 安全隔区 / 安卓的硬件密钥库 |
+
+三者是同一套标准（WebAuthn / passkey），dct 只实现一次「发起签名 + 核对签名」。
+**手机授权最有用**：人不在电脑前时，请求推到手机上，刷一下脸就批了。门槛是 WebAuthn 只能在 **HTTPS** 页面里用，
+而手机端现在是局域网明文 HTTP——确认页要放在带证书的中转上（可以沿用 `live.dataclue.cn` 那套 TLS 中转），单独设计。
+**没有 passkey 的机器（比如普通 Linux）上，`content` 和 `money` 两档直接关闭**，不退化成「点一下同意」。
 
 **实现**：dct 是 Rust，调 Security.framework / LocalAuthentication 用一个很小的辅助程序（Swift 写、单独签名），
 或者 objc2 绑定；不往 dct 的依赖树里带 C 代码。
