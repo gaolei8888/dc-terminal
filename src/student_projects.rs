@@ -54,8 +54,10 @@ pub struct Library {
 impl Library {
     pub fn open(base: PathBuf, legacy: PathBuf, socket: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base)?;
-        let base = base.canonicalize()?;
-        let legacy = legacy.canonicalize()?;
+        // 走 `sys::fs::canonicalize`：Windows 上 std 的版本会带 `\\?\` 前缀，
+        // 而建项目时 git 要在这个目录里跑，git 不认这个前缀。
+        let base = crate::sys::fs::canonicalize(&base)?;
+        let legacy = crate::sys::fs::canonicalize(&legacy)?;
         ensure!(!base.starts_with(&legacy), "项目库必须在工作目录之外");
         for d in ["work", "archives"] {
             fs::create_dir_all(base.join(d))?;
@@ -627,7 +629,15 @@ fn open_relative(root: &Path, rel: &str) -> Result<File> {
         p.canonicalize()?.starts_with(root.canonicalize()?),
         "文件不在项目内"
     );
-    Ok(File::open(p)?)
+    // Windows 上 `File::open` 打不开目录（缺 FILE_FLAG_BACKUP_SEMANTICS，报
+    // Access is denied），而 `project()` 正是拿这个函数去确认项目目录还在——
+    // 不带这个标志，Windows 上建项目、列项目、看文件全部失败。对普通文件无害。
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    Ok(fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(p)?)
 }
 
 fn unique() -> Result<String> {
