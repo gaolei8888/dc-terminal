@@ -5,6 +5,12 @@
 关联：`2026-09-26-dct-judge-design.md`（判断引擎）；`~/work/dc/dc-vault/docs/superpowers/specs/2026-09-26-dc-vault-design.md`（记忆）；
 `~/work/dc/dc_desktop/docs/superpowers/specs/2026-08-06-platform-connectors-design.md`（dc_desktop 的连接器，本设计要与它对齐）
 
+> **2026-09-27 更新：屏幕和键鼠、设备这两类连接器改由 dc-octo 实现**（`~/work/dc/dc-octo`，命令 `dco`，
+> 设计见 `~/work/dc/dc-octo/docs/superpowers/specs/2026-09-27-dc-octo-design.md`）。dc-octo 是每台设备上的「触手」：
+> 看、做、等、按流程毫秒级重放，自己不调用模型。dct 通过 MCP 连它（下文「四种后端」里的 MCP 那一种），
+> 负责判断、定档、签执行票；dct 里的 agent 经 `dct mcp` 用它，不直接连。软件连接器（Mac 自带 App、飞书、Laya）仍在 dct。
+> 下文里关于摄像头、截屏、键鼠、手机的实测记录保留作背景，实现以 dc-octo 设计为准。
+
 ## 要解决什么
 
 用户的原话：「我想 dct 来控制其他软件」「我本身就想带 dc_desktop 那样的连接器」「我想 dct 能帮我打游戏」
@@ -199,8 +205,8 @@ dct 里跑的 agent 开着「跳过权限确认」，它可以不经过连接器
 0. **judge**（已设计）：先跑 `dct judge --probe`，验证网关给不给概率。**拿不到网关密钥，后面全部停在这一步。**
 1. **底座**：连接器规范、分档把关、**你本人的 passkey 授权（Touch ID + 安全隔区签名）**、授权开关、提示行、journal 记录、`dct mcp` 骨架、协议加一。
    同时实测 Claude Code 钩子。
-2. **摄像头**：只读。先 ESP32（板子已调通，只差装上 Wi-Fi 服务），再 Mac 自带摄像头。拍帧 → judge → 事件；第一个「看到 X 就做 Y」的循环。
-3. **屏幕和键鼠**：电脑截屏 + 模拟键鼠 + 急停；然后安卓手机（adb）。第一个游戏选一个回合制的单机游戏
+2. **摄像头**（→ 由 dc-octo 实现，见其设计第 10 节第 4 步；dct 这边只做连接和判断）：只读。先 ESP32（板子已调通，只差装上 Wi-Fi 服务），再 Mac 自带摄像头。拍帧 → judge → 事件；第一个「看到 X 就做 Y」的循环。
+3. **屏幕和键鼠**（→ 由 dc-octo 实现，见其设计第 10 节第 0–3 步）：电脑截屏 + 模拟键鼠 + 急停；然后安卓手机（adb）。第一个游戏选一个回合制的单机游戏
    （或者有官方接口的，如 lichess 下棋）。iPhone 走 iPhone 镜像窗口，和电脑上的其他窗口同一套。
 4. **软件连接器（接口那一路）**：Mac 自带 App、Laya（MCP）、飞书。先定与 dc_desktop 共用的格式。
 5. **软件连接器（浏览器那一路）**：抖音 / 小红书 / 淘宝，与 dc_desktop 的浏览器能力宿主对齐。
