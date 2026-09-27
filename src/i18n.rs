@@ -159,6 +159,8 @@ pub enum Key {
     Language,
     /// 设置页里那一项的名字，同时也是配色子列表的标题。
     BarTheme,
+    /// 会话视图底栏「F7 直播」的那个动词。
+    OpenLive,
     ThemeGray,
     ThemeBlue,
     ThemeIndigo,
@@ -668,6 +670,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
         Language => t!(lang, en: "language", zh: "语言"),
         BarTheme => t!(lang, en: "colors", zh: "配色"),
+        OpenLive => t!(lang, en: "live", zh: "直播"),
         ThemeGray => t!(lang, en: "gray", zh: "灰"),
         ThemeIndigo => t!(lang, en: "indigo", zh: "靛"),
         ThemeTeal => t!(lang, en: "teal", zh: "青"),
@@ -2581,6 +2584,7 @@ mod tests {
             OrPressDigit,
             Language,
             BarTheme,
+            OpenLive,
             ThemeGray,
             ThemeBlue,
             ThemeIndigo,
@@ -2753,7 +2757,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 210, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 211, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
