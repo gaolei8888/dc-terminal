@@ -1561,13 +1561,20 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
         //   真的做不到（这一层按 `?` 打不开浮层），配色丢了还有设置页那条路
         //   （F2 回看板、`l`、配色），而且它是四条里唯一一条「不干活也行」的。
         View::Attached(_) => {
-            let keys = [
+            // `F7` 紧挨在最后一项前面，也就是**最先丢**的那一条（`fit_help`
+            // 从前往后塞、只保证最后一项）：直播是老师上课才用的，看板上还有
+            // `L` 这条路。浏览器里没有本地剪贴板，`F5` 不写。
+            let keys: Vec<(&str, Key)> = [
                 ("F5", Key::PasteImage),
                 ("F3", Key::NextSession),
                 ("F6", Key::BarTheme),
+                ("F7", Key::OpenLive),
                 ("F4", Key::EnterCopyMode),
-            ];
-            help_items(if browser { &keys[1..] } else { &keys }, lang)
+            ]
+            .into_iter()
+            .filter(|(k, _)| !(browser && *k == "F5"))
+            .collect();
+            help_items(&keys, lang)
         }
         // 浮层自己就是一整屏按键表，右段再列一遍是重复；左段的
         // 「Esc 返回」已经把这里唯一能按的键交代完了。

@@ -197,7 +197,7 @@ pub(crate) fn poll_status(app: &mut App, now: std::time::Instant) {
     }
 }
 
-/// 看板/附着视图按 `L` 进这一页。**先问一次 `LiveStatus`**，不是直接切
+/// 看板按 `L`、附着视图按 `F7` 进这一页。**先问一次 `LiveStatus`**，不是直接切
 /// 视图再等下一帧：这一屏从第一帧起就要说清楚「到底在不在播」，拿一份
 /// 好几秒前的旧状态开场，跟一开场就说错话是一回事（同
 /// `settings_view::open_web` 的取舍）。拿不到就当作没在播，宁可少说。

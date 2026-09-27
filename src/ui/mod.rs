@@ -456,6 +456,46 @@ fn paste_into_live_input(input: &mut LiveInput, text: &str) {
     }
 }
 
+/// 把一次按键交给当前视图。从主循环里抽出来，测试才能不起终端直接按键。
+fn dispatch_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // 这里以前先拦一道全局 Ctrl+Q（「退一层，一直按就退到头」）。它没了：
+    // 每个视图的退路都写在底栏左段上，而且每个视图都已经有一个——会话
+    // 视图 F2、其余视图 Esc、看板和九宫格 `q`。少一个全局键的代价是
+    // 「猜不到就得看底栏」，收益是 0x11 重新归 agent，而且底栏上写的键
+    // 就是全部的键，没有第二套暗规则。
+    //
+    // 现在每个键都直接进视图自己的处理函数。必须 clone：分支里要给 view
+    // 赋值，match &view 会被借用检查器拒掉。
+    match app.view.clone() {
+        // 看板上 `L`、会话里 `F7` 进直播面板。会话里不能用 `L`：那一层除了
+        // F 功能键，其余键一律归 agent（见 `attach::handle_key`），截走 `L`
+        // 就是在 Claude Code 里打不出大写 L。
+        //
+        // 只在看板和附着视图里接：这两个是老师干活时
+        // 真的会停留的两屏，其余视图（选择器、设置页……）都是路过的，
+        // 接了反而是在一个偶然路过的地方多埋一个不相关的键。放在
+        // 各自的 `handle_key` 之前拦一道，而不是塞进 board.rs/attach.rs——
+        // `App::live` 和 `View::Live` 都是这个任务新加的，拦在分派这一层
+        // 不用碰那两个模块自己的按键表。
+        View::Board if key.code == KeyCode::Char('L') && is_plain_key(&key) => live::open(app),
+        View::Board => board::handle_key(app, key)?,
+        View::PickProfile { .. } => pick::handle_key(app, key)?,
+        View::PickProject(_) => pick::handle_key(app, key)?,
+        View::Attached(_) if key.code == KeyCode::F(7) => live::open(app),
+        View::Attached(_) => attach::handle_key(app, key)?,
+        View::Grid { .. } => grid::handle_key(app, key)?,
+        View::Keys { .. } => keys::handle_key(app, key)?,
+        View::Settings { .. } => settings_view::handle_key(app, key)?,
+        View::EnterSecret { .. } => secret::handle_key(app, key)?,
+        View::Secrets { .. } => secret::handle_key(app, key)?,
+        View::Phone { .. } => phone::handle_key(app, key)?,
+        View::Web => web::handle_key(app, key)?,
+        View::Live { .. } => live::handle_key(app, key)?,
+        View::Pair { .. } => pair_view::handle_key(app, key)?,
+    }
+    Ok(())
+}
+
 pub fn run(
     client: Client,
     default_dir: PathBuf,
@@ -1159,41 +1199,7 @@ pub fn run(
         let message_text_before = app.message.text.clone();
         let message_error_before = app.message.error;
 
-        // 这里以前先拦一道全局 Ctrl+Q（「退一层，一直按就退到头」）。它没了：
-        // 每个视图的退路都写在底栏左段上，而且每个视图都已经有一个——会话
-        // 视图 F2、其余视图 Esc、看板和九宫格 `q`。少一个全局键的代价是
-        // 「猜不到就得看底栏」，收益是 0x11 重新归 agent，而且底栏上写的键
-        // 就是全部的键，没有第二套暗规则。
-        //
-        // 现在每个键都直接进视图自己的处理函数。必须 clone：分支里要给 view
-        // 赋值，match &view 会被借用检查器拒掉。
-        match app.view.clone() {
-            // `L` 进直播面板。只在看板和附着视图里接：这两个是老师干活时
-            // 真的会停留的两屏，其余视图（选择器、设置页……）都是路过的，
-            // 接了反而是在一个偶然路过的地方多埋一个不相关的键。放在
-            // 各自的 `handle_key` 之前拦一道，而不是塞进 board.rs/attach.rs——
-            // `App::live` 和 `View::Live` 都是这个任务新加的，拦在分派这一层
-            // 不用碰那两个模块自己的按键表。
-            View::Board if key.code == KeyCode::Char('L') && is_plain_key(&key) => {
-                live::open(&mut app)
-            }
-            View::Board => board::handle_key(&mut app, key)?,
-            View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
-            View::PickProject(_) => pick::handle_key(&mut app, key)?,
-            View::Attached(_) if key.code == KeyCode::Char('L') && is_plain_key(&key) => {
-                live::open(&mut app)
-            }
-            View::Attached(_) => attach::handle_key(&mut app, key)?,
-            View::Grid { .. } => grid::handle_key(&mut app, key)?,
-            View::Keys { .. } => keys::handle_key(&mut app, key)?,
-            View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
-            View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
-            View::Secrets { .. } => secret::handle_key(&mut app, key)?,
-            View::Phone { .. } => phone::handle_key(&mut app, key)?,
-            View::Web => web::handle_key(&mut app, key)?,
-            View::Live { .. } => live::handle_key(&mut app, key)?,
-            View::Pair { .. } => pair_view::handle_key(&mut app, key)?,
-        }
+        dispatch_key(&mut app, key)?;
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
         // 放在整个 match 之后而不是逐个按键分支里：那些分支散在四个模块里，
@@ -5529,6 +5535,58 @@ is_agent = true
 
         let keys: Vec<&str> = during.iter().map(|i| i.key).collect();
         assert_eq!(keys, vec!["↑↓", "Enter", "Esc"]);
+    }
+
+    /// 会话视图里除了 F 功能键，其余键一律归 agent。大写 `L` 以前被 dct
+    /// 截去开直播面板，在 Claude Code 里打不出一个大写 L。
+    #[test]
+    fn capital_l_in_a_session_goes_to_the_agent_not_the_live_panel() {
+        let (mut app, _d) = App::test_app();
+        app.view = View::Attached(1);
+        let shift_l = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        // 测试里没有守护进程，转发会失败；这里只关心 dct 有没有把它截走。
+        let _ = dispatch_key(&mut app, shift_l);
+        assert!(
+            matches!(app.view, View::Attached(1)),
+            "会话里的大写 L 必须留给 agent，不能跳到直播面板：{:?}",
+            std::mem::discriminant(&app.view)
+        );
+    }
+
+    /// 会话视图里开直播面板的键是 F7，跟 F2…F6 同一条规矩：只偷 F 功能键。
+    #[test]
+    fn f7_in_a_session_opens_the_live_panel() {
+        let (mut app, _d) = App::test_app();
+        app.view = View::Attached(1);
+        dispatch_key(&mut app, KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE)).unwrap();
+        assert!(matches!(app.view, View::Live { .. }));
+    }
+
+    /// 看板上不打字，`L` 照旧开直播面板。
+    #[test]
+    fn capital_l_on_the_board_still_opens_the_live_panel() {
+        let (mut app, _d) = App::test_app();
+        app.view = View::Board;
+        dispatch_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert!(matches!(app.view, View::Live { .. }));
+    }
+
+    /// 不写在底栏上的键等于不存在：会话视图这一层按 `?` 打不开浮层。
+    #[test]
+    fn the_session_bar_advertises_f7_for_live() {
+        let (mut app, _d) = App::test_app();
+        app.view = View::Attached(1);
+        let keys = bar_keys(&app, 200);
+        assert!(keys.iter().any(|i| i.key == "F7"), "底栏要写出 F7");
+    }
+
+    #[test]
+    fn f7_is_never_forwarded_to_the_agent() {
+        assert_eq!(key_to_input(&key(KeyCode::F(7))), None);
     }
 
     #[test]
