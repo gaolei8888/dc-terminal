@@ -191,10 +191,10 @@ mod imp {
         Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
     }
 
-    pub fn restrict(path: &Path, _dir: bool) -> std::io::Result<()> {
-        // 目录和文件在这里不分家：Windows 的 ACL 没有「执行位」这一说，
-        // 「只有属主」就是同一串条目。dir 参数留着是为了两边同一个签名。
-        crate::sys::acl::set_owner_only(path)
+    pub fn restrict(path: &Path, dir: bool) -> std::io::Result<()> {
+        // 目录和文件的差别只在继承：目录上那条「只有属主」要传给里面的东西，
+        // 否则里面的东西连属主都打不开。见 `acl::set_owner_only`。
+        crate::sys::acl::set_owner_only(path, dir)
     }
 
     fn is_exec(p: &Path) -> bool {

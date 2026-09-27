@@ -1918,6 +1918,9 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
         let id = value["id"].as_str().unwrap();
+        // 上传只在 Linux/macOS 工作区实现（Windows 的 `upload_to` 直接拒绝，
+        // 见 student_projects.rs）；建项目和保存在所有平台都要能用。
+        #[cfg(unix)]
         for expected in [201, 409] {
             let response = request(gate.addr(), &format!("POST /_dct/projects/{id}/upload?name=a.txt HTTP/1.1\r\nHost: x\r\nCookie: dct_gate=aaaa\r\nContent-Length: 3\r\n\r\nabc"));
             assert!(

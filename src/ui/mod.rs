@@ -4243,7 +4243,12 @@ is_agent = true
 
         let real = tempfile::Builder::new()
             .prefix("dct-bar-")
-            .tempdir_in("/tmp")
+            // `/tmp` 在 Windows 上是当前盘的根下的 tmp，不存在。
+            .tempdir_in(if cfg!(unix) {
+                std::path::PathBuf::from("/tmp")
+            } else {
+                std::env::temp_dir()
+            })
             .unwrap();
         let typed = real.path().display().to_string();
 
