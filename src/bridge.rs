@@ -3812,13 +3812,20 @@ mod tests {
         );
         handle.bridge.enqueue(ev(1));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // 十秒，不是两秒：发送线程要先睡满 `SEND_INTERVAL`（按
+        // `STOP_CHECK_GRANULARITY` 切成 25 小段），而 CI 上负载重的 macOS
+        // 机器每段都会睡过头——同一次失败里轮询线程两秒只转了 135 圈，每圈
+        // 本该只睡 2ms。条件一成立就往下走，快机器不多等。
+        let deadline = Instant::now() + Duration::from_secs(10);
         while *ch.poll_calls.lock().unwrap() == 0 || ch.sends().is_empty() {
             assert!(
                 Instant::now() < deadline,
-                "两条线程都该真的跑起来：poll_calls={} sends={}",
+                "两条线程都该真的跑起来：poll_calls={} sends={} 队列里还剩={}",
                 *ch.poll_calls.lock().unwrap(),
-                ch.sends().len()
+                ch.sends().len(),
+                // 还剩 1：发送线程根本没醒来取；剩 0 却没发：取走之后卡在了
+                // 发送前（主人、拼消息）。两种失败要查的地方完全不同。
+                handle.bridge.queued().len()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
