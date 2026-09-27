@@ -1864,18 +1864,20 @@ mod tests {
         assert!(!seen[0].body.is_empty(), "第二次带的必须是真内容，不是保活的空 body");
     }
 
-    /// 等到 `what` 成立，最多等两秒——照抄 `dct-srv` 测试里那个 `until`：
+    /// 等到 `what` 成立，最多等十秒——照抄 `dct-srv` 测试里那个 `until`，
+    /// 但两秒在 CI 的慢机器上不够：重新注册那条链只要一次请求失败，退避就是
+    /// 1 秒再 2 秒，一下就把两秒用光。条件一成立就返回，快机器不多等。
     /// 推帧线程按 `PUSH_INTERVAL` 醒一次，固定 sleep 一个数字要么不够
     /// 要么白等。
     fn until(what: &str, mut ready: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if ready() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("等了两秒也没等到：{what}");
+        panic!("等了十秒也没等到：{what}");
     }
 
     /// **换链接/换会话的时候，旧那场要在中转上当场死掉，不是等 60 秒
