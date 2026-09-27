@@ -26,7 +26,7 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL,
     DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-    SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+    SECURITY_DESCRIPTOR, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -144,14 +144,25 @@ impl Drop for OwnerOnly {
 }
 
 /// 把一个已经存在的文件或目录的 DACL 换成「只有当前用户」，并切断继承。
-pub fn set_owner_only(path: &Path) -> io::Result<()> {
+///
+/// **目录上这条 ACE 必须往下继承**（`dir = true`）。切断继承（PROTECTED）之后，
+/// 子项手里原先那些「从上面继承来的」条目会被重新按这个目录算一遍；这条 ACE
+/// 要是 `NO_INHERITANCE`，算出来就是空的——目录里已有的和以后新建的每个文件、
+/// 子目录都拿到一张空 DACL，连属主自己都打不开（Access is denied）。守护进程
+/// 在 `~/.dct` 上调这个函数，于是一启动，profiles、密钥、项目全都读不了。
+/// 继承下去的也只有「当前用户完全控制」这一条，没有放宽任何人。
+pub fn set_owner_only(path: &Path, dir: bool) -> io::Result<()> {
     let token = current_user_sid()?;
     let sid = sid_of(&token);
 
     let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
     ea.grfAccessPermissions = FILE_ALL_ACCESS;
     ea.grfAccessMode = SET_ACCESS;
-    ea.grfInheritance = NO_INHERITANCE;
+    ea.grfInheritance = if dir {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
     ea.Trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
         MultipleTrusteeOperation: 0,
