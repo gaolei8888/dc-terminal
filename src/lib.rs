@@ -18,6 +18,7 @@ pub mod llm_optin;
 pub mod pair;
 pub mod pair_apply;
 pub mod pair_http;
+pub mod procedures;
 pub mod profile;
 pub mod projects;
 pub mod proto;
