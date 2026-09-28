@@ -64,8 +64,8 @@ pub const PATH_SEND: &str = "/link/send";
 pub const PATH_ASK: &str = "/link/ask";
 
 /// 在线是谁：跟自己同账号、在线、不是自己的端点。请求体是 `AuthFrame`，
-/// 答复体是 `PeersResponse`。中转拿账号隔离同一条规矩来算这份名单——见
-/// `LinkError::NotYours`。
+/// 答复体是 `PeersResponse`。别的账号的端点**不出现在名单里**，就像它们
+/// 压根不在线——这份名单不该让人靠"列出来了/没列出来"反推别的账号谁在线。
 pub const PATH_PEERS: &str = "/link/peers";
 
 /// 一个 payload 最多多少字节。

@@ -34,6 +34,17 @@ pub fn parse_relay_keys(raw: &str) -> Result<Vec<[u8; 65]>, String> {
             .map_err(|_| format!("第 {} 行不是 65 字节的公钥", i + 1))?;
         out.push(key);
     }
+    if out.is_empty() {
+        // 一把公钥都没有的话，`Relay::with_issuers` 会验不过任何令牌——
+        // 那不是"先跑起来再说"，是"整台中转从此拒绝所有人"，得当场说清楚，
+        // 不能悄悄放行成一个空名单，让人一头雾水地去查为什么所有令牌都是
+        // Unauthorized。
+        return Err(
+            "relay-keys 文件里一把公钥都没有（是不是只剩注释和空行了？）。\
+             中转拿着空名单会拒绝所有令牌。"
+                .to_string(),
+        );
+    }
     Ok(out)
 }
 
@@ -229,12 +240,13 @@ mod tests {
         assert!(parse_relay_keys("not base64!!\n").is_err());
     }
 
+    /// 一把公钥都没有的 relay-keys 文件（只剩注释和空行）不能悄悄当成
+    /// 「空名单，谁都验不过」放行——那会让整台中转拒绝所有令牌，还没有
+    /// 任何线索指向"是不是这份文件漏了内容"。得在加载的时候就说清楚。
     #[test]
-    fn an_empty_relay_keys_file_is_an_empty_list_not_an_error() {
-        assert_eq!(
-            parse_relay_keys("# only comments\n\n").unwrap(),
-            Vec::<[u8; 65]>::new()
-        );
+    fn an_empty_relay_keys_file_is_refused_with_a_clear_error() {
+        let err = parse_relay_keys("# only comments\n\n").unwrap_err();
+        assert!(err.contains("一把公钥都没有"), "{err}");
     }
 
     fn tmp_file() -> (tempfile::TempDir, std::path::PathBuf) {
