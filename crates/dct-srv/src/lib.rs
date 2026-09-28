@@ -104,6 +104,12 @@ struct WaitSlot {
     /// 账号隔离，`send()` 那边也一样处理。回答者验过的账号必须跟这个一样，
     /// 才轮到 `endpoint` 那条比对——两条都要对上。
     account: Option<String>,
+    /// 这个挂号实例自己的编号。`forget()` 拿它认「这还是不是我插的那个」——
+    /// 同一个 `(endpoint, seq)` 键完全可能先被一次真实的答复消费掉、随即
+    /// 又被另一次 `ask()` 重新占用，两件事都发生在原来那次 `ask()` 决定要
+    /// `forget` 自己、却还没真正拿到锁的那条缝里。光比键不比这个号，`forget`
+    /// 就可能替一个迟到的失败清理，顺手把别人刚插进去的合法挂号也摘了。
+    id: u64,
 }
 
 /// 正挂在 `/link/ask` 上等答复的人。键是「等的是谁的、哪一个 `seq`」，
@@ -117,6 +123,9 @@ pub struct Relay {
     /// 这个中转信任哪几个签令牌的 issuer。`None` = 不验令牌（`Relay::new`），
     /// 只给已有测试和本机开发用——**不能**对公网开口，见 `main.rs`。
     issuers: Option<Vec<[u8; 65]>>,
+    /// 发 `WaitSlot::id` 用的计数器。只需要「跟这个进程里其它所有挂号都
+    /// 不一样」，不需要跨进程、不需要有序——`Relaxed` 就够。
+    next_wait_id: std::sync::atomic::AtomicU64,
 }
 
 /// 当前 unix 秒——喂给 `relay_token::verify` 判断 `exp`。
@@ -134,6 +143,7 @@ impl Relay {
             waiting: Mutex::new(HashMap::new()),
             cfg,
             issuers: None,
+            next_wait_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -147,6 +157,7 @@ impl Relay {
             waiting: Mutex::new(HashMap::new()),
             cfg,
             issuers: Some(issuers),
+            next_wait_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -323,35 +334,60 @@ impl Relay {
         // 那边知道「该谁回、那是哪个账号」，不能只靠 `(to, seq)` 配对。
         let account = self.check(&req.auth)?;
 
+        // **必须在碰挂号表之前就比对身份。** `send()` 也会比这一下，但那时候
+        // 已经晚了——一个把 `from` 填成别人 id 的请求，要是先被允许把挂号表
+        // 插一遍，就能在 `send()` 替我们查出这一点之前，顶掉那个真正的人挂着
+        // 的挂号（见下面插入前的「绝不顶掉」注释）。
+        if req.envelope.from != req.auth.endpoint {
+            return Err(LinkError::Unauthorized);
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let key = (req.envelope.from.clone(), req.envelope.seq);
+        let id = self
+            .next_wait_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // **先挂号再投递。** 反过来的话，笔记本答得够快就会在挂号之前把答复
-        // 送到，那一封找不到人等它，于是走进设备信箱再也没人取——而提问的人
-        // 在这头一直挂到超时。这种 bug 只在快的机器上出现。
-        self.waiting.lock().expect("waiting table poisoned").insert(
-            key.clone(),
-            WaitSlot {
-                tx,
-                from: req.envelope.to.clone(),
-                account,
-            },
-        );
+        // **先挂号再投递，而且绝不顶掉已经挂着的挂号。** 反过来（先投递）的
+        // 话，笔记本答得够快就会在挂号之前把答复送到，那一封找不到人等它，
+        // 于是走进设备信箱再也没人取——而提问的人在这头一直挂到超时，这种
+        // bug 只在快的机器上出现。**顶掉**已有挂号则是另一个方向的问题：
+        // `(endpoint, seq)` 撞上，只可能是重放、或者两个账号巧合选中了同一对
+        // 值——真撞上的话，正确的反应是让这一次的提问者知道「现在不行」
+        // （`Busy`），而不是把原来那个挂号偷偷摘掉、让它在毫无预兆的情况下
+        // 收到一句 `NoAnswer`。
+        {
+            let mut waiting = self.waiting.lock().expect("waiting table poisoned");
+            if waiting.contains_key(&key) {
+                return Err(LinkError::Busy);
+            }
+            waiting.insert(
+                key.clone(),
+                WaitSlot {
+                    tx,
+                    from: req.envelope.to.clone(),
+                    account,
+                    id,
+                },
+            );
+        }
 
         if let Err(e) = self.send(req) {
-            self.forget(&key);
+            self.forget(&key, id);
             return Err(e);
         }
 
         match tokio::time::timeout(self.cfg.poll_timeout, rx).await {
             Ok(Ok(env)) => Ok(env),
-            // 发端没了：只可能是别处把这个挂号顶掉了（同一个 seq 被用了两次）。
+            // 发端没了：只可能是一次真实的答复先一步把这个挂号取走、可它
+            // 没赶上这次超时之内送到 `rx`——留给 `forget` 去判断这个号是不是
+            // 还归我们，归我们才清。
             Ok(Err(_)) => {
-                self.forget(&key);
+                self.forget(&key, id);
                 Err(LinkError::NoAnswer)
             }
             Err(_) => {
-                self.forget(&key);
+                self.forget(&key, id);
                 Err(LinkError::NoAnswer)
             }
         }
@@ -359,11 +395,16 @@ impl Relay {
 
     /// 不等了。**必须清掉**，否则一个超时的提问会在表里留下一个永远没人
     /// 取走的挂号，而那正是这类表长成内存泄漏的方式。
-    fn forget(&self, key: &(EndpointId, u64)) {
-        self.waiting
-            .lock()
-            .expect("waiting table poisoned")
-            .remove(key);
+    ///
+    /// **只清自己插的那一个。** `id` 是插的时候发的号；表里这把键现在挂着
+    /// 的不是这个号，说明原来那个挂号已经被一次真实的答复消费、清走，
+    /// 键随后又被另一次 `ask()` 重新占用——那是**别人**刚插的、还活着的
+    /// 挂号，不能被这次迟到的 `forget` 连累着摘掉。
+    fn forget(&self, key: &(EndpointId, u64), id: u64) {
+        let mut waiting = self.waiting.lock().expect("waiting table poisoned");
+        if waiting.get(key).is_some_and(|slot| slot.id == id) {
+            waiting.remove(key);
+        }
     }
 }
 
@@ -1815,6 +1856,229 @@ mod tests {
         assert_eq!(got.payload, b"real-answer");
     }
 
+    /// **挂号必须在碰挂号表之前就验身份。** `ask()` 以前是先把挂号插进表里、
+    /// 再靠 `send()` 去发现 `from` 是伪造的——插的那一下要是撞上了受害者
+    /// 正挂着的键（`(to, seq)`，没有账号参与配对），会把受害者的挂号直接
+    /// 顶掉：受害者的 `rx` 那头因为 sender 被丢弃立刻收到一个 `NoAnswer`，
+    /// 而真正的答复后来一到，挂号已经不在了，只能落到 `Offline`。
+    #[tokio::test]
+    async fn a_forged_from_cannot_hijack_someone_elses_pending_ask() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        // laptop（账号 acct-a）先上线，好让受害者真正的问题送得出去。
+        let laptop_token = token_for(&sk, "acct-a", "laptop");
+        {
+            let r = relay.clone();
+            let a = authed("laptop", laptop_token.clone());
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("laptop 挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id("laptop"))
+        })
+        .await;
+
+        // 受害者：phone:1（账号 acct-a）问 laptop，seq=7，挂着等答复。
+        let victim_token = token_for(&sk, "acct-a", "phone:1");
+        let victim_asking = SendRequest {
+            auth: authed("phone:1", victim_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 7,
+                payload: b"victim question".to_vec(),
+                recipients: vec![],
+            },
+        };
+        let r = relay.clone();
+        let victim_asked = tokio::spawn(async move { r.ask(&victim_asking).await });
+        until("受害者的挂号建立", || {
+            relay.waiting.lock().unwrap().len() == 1
+        })
+        .await;
+
+        // 攻击者：自己的账号是 acct-evil，自己的身份是 "attacker"，但把
+        // 信封的 `from` 填成受害者的 "phone:1"，`seq` 也猜中了同一个 7，
+        // 想顶掉受害者挂着的那个挂号。
+        let attacker_token = token_for(&sk, "acct-evil", "attacker");
+        let forged_ask = SendRequest {
+            auth: authed("attacker", attacker_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 7,
+                payload: b"forged question".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(
+            relay.ask(&forged_ask).await,
+            Err(LinkError::Unauthorized),
+            "伪造的 from 该在碰挂号表之前就被拒"
+        );
+        // 受害者的挂号必须原封不动——没被攻击者的尝试顶掉。
+        assert_eq!(
+            relay.waiting.lock().unwrap().len(),
+            1,
+            "受害者的挂号不该被顶掉"
+        );
+
+        // 真正的回答到了：受害者该拿到它，不是 `NoAnswer`。
+        let real = SendRequest {
+            auth: authed("laptop", laptop_token),
+            envelope: Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 7,
+                payload: b"real answer".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(relay.send(&real), Ok(()));
+
+        let got = victim_asked.await.unwrap().unwrap();
+        assert_eq!(got.payload, b"real answer");
+    }
+
+    /// **撞键不能顶掉别人的挂号。** `(endpoint, seq)` 这个键没有账号参与
+    /// 配对——两个不同账号巧合都选中了同一个 `from` 字符串（比如都自称
+    /// "phone:1"）和同一个 `seq`，是完全合法各自持有令牌的两个人，不是
+    /// 攻击。第二个撞上的必须干脆地拿到 `Busy`，第一个的挂号继续有效。
+    #[tokio::test]
+    async fn two_askers_colliding_on_the_same_endpoint_and_seq_do_not_corrupt_each_other() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        let laptop_token = token_for(&sk, "acct-a", "laptop");
+        {
+            let r = relay.clone();
+            let a = authed("laptop", laptop_token.clone());
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("laptop 挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id("laptop"))
+        })
+        .await;
+
+        // 第一个提问者：账号 acct-a，自称 "phone:1"。
+        let asker1_token = token_for(&sk, "acct-a", "phone:1");
+        let asking1 = SendRequest {
+            auth: authed("phone:1", asker1_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 1,
+                payload: b"q1".to_vec(),
+                recipients: vec![],
+            },
+        };
+        let r = relay.clone();
+        let asked1 = tokio::spawn(async move { r.ask(&asking1).await });
+        until("第一个挂号建立", || {
+            relay.waiting.lock().unwrap().len() == 1
+        })
+        .await;
+
+        // 第二个提问者：不同账号 acct-b，但也合法地拿到了一把写着
+        // endpoint="phone:1" 的令牌——跟第一个撞上了同一个键。
+        let asker2_token = token_for(&sk, "acct-b", "phone:1");
+        let asking2 = SendRequest {
+            auth: authed("phone:1", asker2_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 1,
+                payload: b"q2".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(
+            relay.ask(&asking2).await,
+            Err(LinkError::Busy),
+            "键撞上了，第二个该被拒，不该把第一个顶掉"
+        );
+        assert_eq!(
+            relay.waiting.lock().unwrap().len(),
+            1,
+            "第一个的挂号还应该在"
+        );
+
+        // 第一个的挂号没受影响：真正的答复照样送得到。
+        let real = SendRequest {
+            auth: authed("laptop", laptop_token),
+            envelope: Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 1,
+                payload: b"real answer".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(relay.send(&real), Ok(()));
+
+        let got = asked1.await.unwrap().unwrap();
+        assert_eq!(got.payload, b"real answer");
+    }
+
+    /// **`forget` 只能清自己插的那一个挂号。** 这条测试直接摆弄挂号表，
+    /// 复现一条黑盒测试够不着的竞态：一个挂号被一次真实的答复消费、从表里
+    /// 摘走，键随即被另一次 `ask()` 合法地重新占用——这两件事都发生在
+    /// 原来那次 `ask()` 决定要 `forget` 自己、却还没真正拿到锁的那条缝里。
+    /// 迟到的 `forget`（带着旧的 id）必须认得出"现在这把键上挂着的已经
+    /// 不是我插的那个了"，放过它，不能把后来者的挂号也摘了。
+    #[tokio::test]
+    async fn forget_never_removes_a_slot_it_did_not_create() {
+        let relay = Relay::new(cfg(2000)); // 只关心挂号表自己的行为，用不着令牌
+        let key = (id("phone:1"), 1u64);
+
+        // 旧挂号：已经被"一次真实的答复"消费、移出了表——原来那次 `ask()`
+        // 还不知道，稍后会拿着这个旧 id 调 `forget`。
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let old_id = 100;
+        relay.waiting.lock().unwrap().insert(
+            key.clone(),
+            WaitSlot {
+                tx: tx1,
+                from: id("laptop"),
+                account: None,
+                id: old_id,
+            },
+        );
+        relay.waiting.lock().unwrap().remove(&key);
+
+        // 键被重新占用：另一次 `ask()` 合法地插了一个新挂号，id 不一样。
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let new_id = 200;
+        relay.waiting.lock().unwrap().insert(
+            key.clone(),
+            WaitSlot {
+                tx: tx2,
+                from: id("laptop"),
+                account: None,
+                id: new_id,
+            },
+        );
+
+        // 迟到的 forget，带着旧的 id——不该碰新的这个。
+        relay.forget(&key, old_id);
+        let slot = relay.waiting.lock().unwrap().remove(&key);
+        let slot = slot.expect("新挂号被一个迟到的、属于别人的 forget 误删了");
+        assert_eq!(slot.id, new_id, "留下来的不该是旧的那个挂号");
+
+        // 新挂号照样能收到它自己的答复。
+        slot.tx
+            .send(Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 1,
+                payload: b"still works".to_vec(),
+                recipients: vec![],
+            })
+            .unwrap();
+        let got = rx2.await.unwrap();
+        assert_eq!(got.payload, b"still works");
+    }
+
     /// **端点抢注。** 一个 id 还在场的时候，换一个账号的合法令牌来冒充它，
     /// 必须被拒（`NotYours`），而且**什么都不能动**——账号不能被改写，
     /// 信箱不能被打断，`peers` 看到的还得是原来那个账号。
@@ -1986,18 +2250,24 @@ mod tests {
         assert!(bind_check("127.0.0.1:8787".parse().unwrap(), None).is_ok());
     }
 
-    /// **中转只认识 `dct_mesh` 底下的 `relay_token`，别的模块一概不该碰。**
-    /// 点对点消息的线上形状、解密那些模块认识了 payload 的样子，spec 决定
-    /// 一就破了——中转永远只转发不透明字节。
+    /// **中转只认识 dct-mesh 底下的 relay_token 模块，别的一概不该碰。**
+    /// 点对点消息的线上形状、解密——认得了这些，payload 就不再是不透明
+    /// 字节，spec 决定一就破了。
     ///
-    /// 光找一个固定的禁用字符串（比如某个模块名整个拼出来）挡不住分组写法：
-    /// 把好几个名字一次点出来的 `use` 能绕过那种检查。这条测试直接解析
-    /// 每一处 `dct_mesh` 后面点开的第一层是什么，两种写法都盯得住——单独
-    /// 点下去的，和花括号里一次列好几个的。
+    /// 光解析"点开的第一层是不是 relay_token"还不够：`use dct-mesh::*`
+    /// 这种通配符导入、`use dct-mesh as m` 这种改名导入，压根不会留下一个
+    /// 能这样解析的普通路径。稳妥的办法反过来做：只承认两种精确写法——
+    /// 独立出现的这个 crate 名字后面必须紧跟着 `::relay_token`（可以再往
+    /// 下点，比如 `::relay_token::verify`），别的任何一种独立出现，一律
+    /// 算违规，不管是通配符、改名、分组导入（`{wire, relay_token}`），
+    /// 还是压根没点开（`use dct-mesh;`）。
     ///
-    /// 这条测试自己也活在被扫描的目录里：它当然会扫到自己 `use` 进来的
-    /// `relay_token`，那没问题，它比对的是"点开的第一层是不是 relay_token"，
-    /// 不是"这个词有没有出现过"。
+    /// "独立出现"（词边界）是必须的，不然连它自己的函数名（这个词本来就
+    /// 是这条测试名字的一部分）都会被当成一次出现。
+    ///
+    /// crate 名字在这条测试里被拆成两半用 `concat!` 接起来，理由跟
+    /// `the_relay_never_looks_inside_a_frame_either` 那条一样：它自己也
+    /// 活在被扫描的目录里，原样写一遍会扫到自己这行定义，红得毫无意义。
     #[test]
     fn dct_srv_only_ever_touches_dct_mesh_relay_token() {
         fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2011,59 +2281,58 @@ mod tests {
             }
         }
 
-        /// 一个标识符最长能读到哪：字母、数字、下划线之外的第一个字符
-        /// 就是它的结尾。
-        fn first_ident(s: &str) -> &str {
-            let end = s
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(s.len());
-            &s[..end]
+        fn is_ident_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
         }
 
-        /// 找出 `src` 里每一处 `marker` 后面紧跟 `::` 点开的第一层名字。
-        /// `marker::{a, b}` 这种花括号写法拆成好几个名字分别返回。
-        fn segments_after(marker: &str, src: &str) -> Vec<String> {
+        /// `src` 里每一处独立出现的 `marker`（不是某个更长标识符的一部分）
+        /// 的字节偏移。
+        fn word_occurrences(marker: &str, src: &str) -> Vec<usize> {
             let mut out = Vec::new();
-            let mut rest = src;
-            while let Some(i) = rest.find(marker) {
-                let after = &rest[i + marker.len()..];
-                if let Some(after) = after.trim_start().strip_prefix("::") {
-                    let after = after.trim_start();
-                    if let Some(inside) = after.strip_prefix('{') {
-                        if let Some(end) = inside.find('}') {
-                            for item in inside[..end].split(',') {
-                                let seg = first_ident(item.trim());
-                                if !seg.is_empty() {
-                                    out.push(seg.to_string());
-                                }
-                            }
-                        }
-                    } else {
-                        let seg = first_ident(after);
-                        if !seg.is_empty() {
-                            out.push(seg.to_string());
-                        }
-                    }
+            let mut idx = 0;
+            while let Some(off) = src[idx..].find(marker) {
+                let start = idx + off;
+                let end = start + marker.len();
+                let before_ok = src[..start]
+                    .chars()
+                    .next_back()
+                    .map(|c| !is_ident_char(c))
+                    .unwrap_or(true);
+                let after_ok = src[end..]
+                    .chars()
+                    .next()
+                    .map(|c| !is_ident_char(c))
+                    .unwrap_or(true);
+                if before_ok && after_ok {
+                    out.push(start);
                 }
-                rest = &rest[i + marker.len()..];
+                idx = end;
             }
             out
         }
+
+        let marker = concat!("dct_", "mesh");
+        let allowed = concat!("dct_", "mesh", "::relay_token");
 
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         rs_files(&src_dir, &mut files);
         assert!(!files.is_empty(), "扫描目录是空的，这条测试没有意义");
 
-        let marker = "dct_mesh";
         for path in &files {
             let src = std::fs::read_to_string(path).unwrap();
-            for seg in segments_after(marker, &src) {
-                assert_eq!(
-                    seg,
-                    "relay_token",
-                    "{} 里出现了 {marker} 下面的 `{seg}`——中转只该碰 \
-                     {marker} 下面的 relay_token",
+            for start in word_occurrences(marker, &src) {
+                let tail = &src[start..];
+                let is_allowed = tail.starts_with(allowed)
+                    && tail[allowed.len()..]
+                        .chars()
+                        .next()
+                        .map(|c| !is_ident_char(c))
+                        .unwrap_or(true);
+                assert!(
+                    is_allowed,
+                    "{} 在字节偏移 {start} 处出现了一处不是 `{allowed}` 的 \
+                     `{marker}` 用法——中转只该碰 relay_token",
                     path.display()
                 );
             }
