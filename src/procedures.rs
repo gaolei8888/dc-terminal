@@ -114,8 +114,15 @@ impl Approvals {
             .unwrap_or_else(|| PathBuf::from("approvals"))
     }
 
-    fn path(&self, steps_sha256: &str) -> PathBuf {
-        self.dir.join(format!("{}.json", steps_sha256.trim_start_matches("sha256:")))
+    /// 文件名按 `sha256(流程全名 ‖ steps_sha256)` 算，两个字段各自长度前缀编码，
+    /// 不会因为字符串直接拼接而互相「串」到一起。只按 `steps_sha256` 命名会让
+    /// 两条步骤碰巧一样的流程共用同一份批准记录，互相覆盖。
+    fn path(&self, full_name: &str, steps_sha256: &str) -> PathBuf {
+        let mut bytes = Vec::new();
+        dct_brain::canon::field(&mut bytes, full_name);
+        dct_brain::canon::field(&mut bytes, steps_sha256);
+        let id = dct_brain::canon::sha256_id(&bytes);
+        self.dir.join(format!("{}.json", id.trim_start_matches("sha256:")))
     }
 
     /// 批准记录里可能带着「哪一步该改低哪一档」这种敏感判断，目录 0700、
@@ -125,20 +132,50 @@ impl Approvals {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建批准记录目录 {} 失败", self.dir.display()))?;
         crate::sys::fs::restrict_dir_to_owner(&self.dir)
             .with_context(|| format!("批准记录目录 {} 的权限设置失败", self.dir.display()))?;
-        let path = self.path(&sa.approval.steps_sha256);
+        let path = self.path(&sa.approval.procedure, &sa.approval.steps_sha256);
         let mut f = crate::sys::fs::create_private(&path).with_context(|| format!("写批准记录 {} 失败", path.display()))?;
         f.write_all(&serde_json::to_vec_pretty(sa)?)
             .with_context(|| format!("写批准记录 {} 失败", path.display()))?;
         Ok(())
     }
 
-    pub fn load(&self, steps_sha256: &str) -> Result<Option<SignedApproval>> {
-        let path = self.path(steps_sha256);
+    pub fn load(&self, full_name: &str, steps_sha256: &str) -> Result<Option<SignedApproval>> {
+        let path = self.path(full_name, steps_sha256);
         match std::fs::read(&path) {
             Ok(b) => Ok(Some(serde_json::from_slice(&b).context("批准记录坏了")?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("读批准记录 {} 失败", path.display())),
         }
+    }
+}
+
+/// 把秒数写成人话：分钟/小时/天，不到一分钟才照实说秒数。凑得整的按单个单位说
+/// （"2 小时"），凑不整的按两级拼起来（"1 小时 30 分钟"），最多两级，够弹窗里
+/// 一眼看懂，不用心算一串裸秒数。
+fn human_duration(total_secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    if total_secs < MINUTE {
+        return format!("{total_secs} 秒");
+    }
+    if total_secs < HOUR {
+        let m = total_secs / MINUTE;
+        let s = total_secs % MINUTE;
+        return if s == 0 { format!("{m} 分钟") } else { format!("{m} 分钟 {s} 秒") };
+    }
+    if total_secs < DAY {
+        let h = total_secs / HOUR;
+        let m = (total_secs % HOUR) / MINUTE;
+        return if m == 0 { format!("{h} 小时") } else { format!("{h} 小时 {m} 分钟") };
+    }
+    let d = total_secs / DAY;
+    let h = (total_secs % DAY) / HOUR;
+    if h == 0 {
+        format!("{d} 天")
+    } else {
+        format!("{d} 天 {h} 小时")
     }
 }
 
@@ -289,7 +326,7 @@ pub fn ticket(
     }
     let steps_sha = steps_sha256(&shown.params, &shown.steps);
     let not_approved = || anyhow!("这条流程还没批准，或者改过了，先运行 dct procedure approve {full_name}");
-    let sa = approvals.load(&steps_sha)?.ok_or_else(not_approved)?;
+    let sa = approvals.load(full_name, &steps_sha)?.ok_or_else(not_approved)?;
     verify_approval(&sa, &keys.trusted()?, full_name, &steps_sha).map_err(|_| not_approved())?;
     let tier = sa.approval.run_tier();
     // 时间只能往上加，绝不能悄悄绕回去：溢出算错误，不算「立刻生效」。
@@ -314,24 +351,26 @@ pub fn ticket(
         _ => SignerRole::Auto,
     };
     let signer = keys.signer(role, se)?;
+    // 每一步点名它真实的档位——动钱的步骤要说「动钱」，不能笼统写成「对外」，
+    // 不然用户以为要签的是发布帖子，其实是在花钱。
     let strict: Vec<String> = shown
         .steps
         .iter()
         .zip(&sa.approval.step_tiers)
         .filter(|(_, t)| **t >= Tier::Content)
-        .map(|(s, _)| format!("第{}步", s.n))
+        .map(|(s, t)| format!("第{}步{}", s.n, tier_zh(*t)))
         .collect();
     // 有效期从什么时候开始、能用多久，弹窗里得说清楚，别让人瞎猜「现在按了
-    // 是不是马上就执行」。
+    // 是不是马上就执行」；单位换算成分钟/小时/天，不糊一串裸秒数上去。
     let period = if start_in == 0 {
-        format!("从现在起 {window} 秒内有效")
+        format!("从现在起 {} 内有效", human_duration(window))
     } else {
-        format!("{start_in} 秒后开始，此后 {window} 秒内有效")
+        format!("{} 后开始，此后 {} 内有效", human_duration(start_in), human_duration(window))
     };
     let reason = if strict.is_empty() {
         format!("执行流程 {full_name}：{period}")
     } else {
-        format!("执行流程 {full_name}（{}对外）：{period}", strict.join("、"))
+        format!("执行流程 {full_name}（{}）：{period}", strict.join("、"))
     };
     sign_one(t, &signer, &reason).map_err(|e| anyhow!("{e}"))
 }
@@ -529,7 +568,7 @@ mod tests {
         assert_eq!(w.dcv.approve_calls.get(), 1);
         let reasons = w.se.reasons.borrow();
         assert!(reasons[0].contains("social:edit-bio") && reasons[0].contains("保存"), "{reasons:?}");
-        assert!(w.approvals.load(STEPS_A).unwrap().is_some());
+        assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_some());
     }
 
     #[test]
@@ -545,7 +584,7 @@ mod tests {
         w.se.cancel_user.set(true);
         assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).is_err());
         assert_eq!(w.dcv.approve_calls.get(), 0, "没按指纹就不该去 dcv 里确认");
-        assert!(w.approvals.load(STEPS_A).unwrap().is_none());
+        assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_none());
     }
 
     #[test]
@@ -553,7 +592,7 @@ mod tests {
         let w = world();
         *w.dcv.approved_body.borrow_mut() = "sha256:changed".into();
         assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).is_err());
-        assert!(w.approvals.load(STEPS_A).unwrap().is_none());
+        assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_none());
     }
 
     #[test]
@@ -653,6 +692,33 @@ mod tests {
     }
 
     #[test]
+    fn two_procedures_with_identical_steps_keep_independent_approval_files() {
+        let d = tempfile::tempdir().unwrap();
+        let approvals = Approvals::at(d.path().to_path_buf());
+        let user = SoftSigner::from_seed(SignerRole::User, 2);
+        let mk = |procedure: &str, tiers: Vec<Tier>| Approval {
+            v: APPROVAL_VERSION,
+            procedure: procedure.to_string(),
+            steps_sha256: STEPS_A.to_string(),
+            body_sha256: format!("sha256:{}", "ab".repeat(32)),
+            step_tiers: tiers,
+            approved_at: 1000,
+        };
+        let sa1 = sign_approval(mk("social:a", vec![Tier::SelfOnly]), &user, "").unwrap();
+        let sa2 = sign_approval(mk("social:b", vec![Tier::Content]), &user, "").unwrap();
+        approvals.save(&sa1).unwrap();
+        approvals.save(&sa2).unwrap();
+
+        let loaded1 = approvals.load("social:a", STEPS_A).unwrap().expect("social:a should be saved");
+        let loaded2 = approvals.load("social:b", STEPS_A).unwrap().expect("social:b should be saved");
+        assert_eq!(loaded1.approval.step_tiers, vec![Tier::SelfOnly]);
+        assert_eq!(loaded2.approval.step_tiers, vec![Tier::Content]);
+        // 两条流程的批准文件真的是两个不同的文件，不是同一份被后写的覆盖了先写的。
+        assert!(approvals.load("social:a", STEPS_A).unwrap().is_some());
+        assert!(approvals.load("social:b", STEPS_A).unwrap().is_some());
+    }
+
+    #[test]
     fn an_override_of_a_nonexistent_step_is_an_error() {
         let w = world();
         assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(99, Tier::Content)], 1000).is_err());
@@ -722,5 +788,51 @@ mod tests {
         let mut v = edit_bio(true);
         v["steps"][1]["n"] = json!(1);
         assert!(Shown::parse("social:edit-bio", &v).is_err());
+    }
+
+    #[test]
+    fn human_duration_uses_minutes_hours_and_days() {
+        assert_eq!(human_duration(0), "0 秒");
+        assert_eq!(human_duration(45), "45 秒");
+        assert_eq!(human_duration(60), "1 分钟");
+        assert_eq!(human_duration(90), "1 分钟 30 秒");
+        assert_eq!(human_duration(600), "10 分钟");
+        assert_eq!(human_duration(3600), "1 小时");
+        assert_eq!(human_duration(5400), "1 小时 30 分钟");
+        assert_eq!(human_duration(86_400), "1 天");
+        assert_eq!(human_duration(90_000), "1 天 1 小时");
+        assert_eq!(human_duration(2_592_000), "30 天");
+    }
+
+    #[test]
+    fn the_ticket_prompt_describes_money_steps_as_paying_money_not_outward() {
+        let w = world();
+        let mut v = edit_bio(false);
+        v["steps"][3]["arg"] = json!("立即支付");
+        *w.dcv.show.borrow_mut() = v;
+        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
+        let mut executable = edit_bio(true);
+        executable["steps"][3]["arg"] = json!("立即支付");
+        *w.dcv.show.borrow_mut() = executable;
+        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
+        ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).unwrap();
+        let reasons = w.se.reasons.borrow();
+        let reason = reasons.last().unwrap();
+        assert!(reason.contains("第4步动钱"), "{reason}");
+        assert!(!reason.contains("对外"), "{reason}");
+    }
+
+    #[test]
+    fn the_ticket_prompt_shows_the_validity_period_in_human_units() {
+        let w = world();
+        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
+        *w.dcv.show.borrow_mut() = edit_bio(true);
+        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
+        ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 90, 5400, 2000).unwrap();
+        let reasons = w.se.reasons.borrow();
+        let reason = reasons.last().unwrap();
+        assert!(reason.contains("1 分钟 30 秒"), "{reason}");
+        assert!(reason.contains("1 小时 30 分钟"), "{reason}");
+        assert!(!reason.contains("90 秒") && !reason.contains("5400 秒"), "{reason}");
     }
 }
