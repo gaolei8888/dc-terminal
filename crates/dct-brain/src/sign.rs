@@ -89,6 +89,8 @@ pub enum VerifyError {
     Expired,
     /// 批准记录对应的流程步骤已经变了（Task 6）。
     StepsChanged,
+    /// 批准记录是给另一条流程的。
+    WrongProcedure,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -104,6 +106,7 @@ impl std::fmt::Display for VerifyError {
             VerifyError::TooEarly => "还没到可以执行的时间",
             VerifyError::Expired => "票已经过期",
             VerifyError::StepsChanged => "流程的步骤改过了，要重新批准",
+            VerifyError::WrongProcedure => "这份批准记录是给另一条流程的",
         };
         f.write_str(s)
     }

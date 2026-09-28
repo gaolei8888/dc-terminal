@@ -56,9 +56,17 @@ pub fn sign_approval(a: Approval, s: &dyn Signer, reason: &str) -> Result<Signed
     Ok(SignedApproval { approval: a, signature })
 }
 
-pub fn verify_approval(sa: &SignedApproval, trusted: &[TrustedKey], steps_sha256: &str) -> Result<(), VerifyError> {
+pub fn verify_approval(
+    sa: &SignedApproval,
+    trusted: &[TrustedKey],
+    procedure: &str,
+    steps_sha256: &str,
+) -> Result<(), VerifyError> {
     if sa.approval.v != APPROVAL_VERSION {
         return Err(VerifyError::Unsupported);
+    }
+    if sa.approval.procedure != procedure {
+        return Err(VerifyError::WrongProcedure);
     }
     if sa.approval.steps_sha256 != steps_sha256 {
         return Err(VerifyError::StepsChanged);
@@ -110,7 +118,7 @@ mod tests {
         assert!(sign_approval(approval(), &auto, "").is_err());
         let user = SoftSigner::from_seed(SignerRole::User, 2);
         let sa = sign_approval(approval(), &user, "批准").unwrap();
-        assert_eq!(verify_approval(&sa, &[user.trusted()], STEPS), Ok(()));
+        assert_eq!(verify_approval(&sa, &[user.trusted()], "social:edit-bio", STEPS), Ok(()));
     }
 
     #[test]
@@ -119,8 +127,8 @@ mod tests {
         let sa = sign_approval(approval(), &user, "").unwrap();
         let mut lowered = sa.clone();
         lowered.approval.step_tiers[3] = Tier::SelfOnly;
-        assert_eq!(verify_approval(&lowered, &[user.trusted()], STEPS), Err(VerifyError::BadSignature));
-        assert_eq!(verify_approval(&sa, &[user.trusted()], "sha256:other"), Err(VerifyError::StepsChanged));
+        assert_eq!(verify_approval(&lowered, &[user.trusted()], "social:edit-bio", STEPS), Err(VerifyError::BadSignature));
+        assert_eq!(verify_approval(&sa, &[user.trusted()], "social:edit-bio", "sha256:other"), Err(VerifyError::StepsChanged));
     }
 
     #[test]
@@ -130,8 +138,19 @@ mod tests {
         let sig = crate::sign::make_signature(&auto, &approval().canonical_bytes(), "").unwrap();
         let sa = SignedApproval { approval: approval(), signature: sig };
         assert_eq!(
-            verify_approval(&sa, &[auto.trusted()], STEPS),
+            verify_approval(&sa, &[auto.trusted()], "social:edit-bio", STEPS),
             Err(VerifyError::WrongRole { need: SignerRole::User })
+        );
+    }
+
+    #[test]
+    fn approval_for_one_procedure_does_not_verify_for_another() {
+        let user = SoftSigner::from_seed(SignerRole::User, 2);
+        let sa = sign_approval(approval(), &user, "批准").unwrap();
+        assert_eq!(verify_approval(&sa, &[user.trusted()], "social:edit-bio", STEPS), Ok(()));
+        assert_eq!(
+            verify_approval(&sa, &[user.trusted()], "social:edit-bio-copy", STEPS),
+            Err(VerifyError::WrongProcedure)
         );
     }
 }
