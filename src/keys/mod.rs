@@ -1,6 +1,8 @@
 //! dct 的两把钥匙（设计第 2 节）：自动钥匙签 `self` / `physical`，用户钥匙签
 //! `content` / `money`，每次都要当场按 Touch ID。私钥在 Mac 安全芯片里，磁盘上只有
-//! 安全芯片加密过的「把手」（只有这台 Mac 能用）和公钥。
+//! 安全芯片加密过的「把手」（只有这台 Mac 能用）和公钥。**需要 macOS 11 或更新**
+//! （build.rs 把 Swift 那半边编到 macOS 11.0 部署目标）；非 Mac 平台目前还没有
+//! 实现，`init` 会直接拒绝。
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use dct_brain::sign::{key_id, SignError, Signer, TrustedKey};
@@ -36,8 +38,10 @@ impl SecureEnclave for NoEnclave {
     }
 }
 
-/// 这台机器上的安全芯片。没有 passkey 的平台上，对外和动钱两档直接关闭，
-/// 不退化成「点一下同意」（控制层设计）。
+/// 这台机器上的安全芯片。非 Mac 平台还没实现，`NoEnclave` 让 `create`/`sign`
+/// 一律返回 `Unavailable`，`init` 因此直接拒绝——两把钥匙一把都建不出来，
+/// 不是只关掉对外和动钱两档，是这些平台上现在**整个没有**票能被签出来，
+/// 连只影响自己的档也不行。绝不退化成「点一下同意」（控制层设计）。
 pub fn platform_enclave() -> Box<dyn SecureEnclave> {
     #[cfg(target_os = "macos")]
     {
@@ -217,7 +221,7 @@ impl Signer for EnclaveSigner<'_> {
     }
 }
 
-/// `dct keys init | show | test`。
+/// `dct keys init | show | test`。需要 macOS 11 或更新；别的平台上 `init` 会拒绝。
 pub fn run_cli(args: &[String]) -> i32 {
     let ks = KeyStore::at(KeyStore::default_dir());
     let se = platform_enclave();
