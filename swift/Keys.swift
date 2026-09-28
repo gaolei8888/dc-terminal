@@ -1,3 +1,5 @@
+// 注意：build.rs 为了在 macOS 11 上跑，关掉了 Swift 5.6 / 并发 / dynamic replacement 的兼容垫片。
+// 这里不能用 async/await、Task、actor、@_dynamicReplacement——能编过，但在旧系统上一跑就崩。
 // dct 的两把钥匙放在 Mac 的安全芯片里（设计：docs/superpowers/specs/2026-09-27-dct-brain-design.md 第 2 节）。
 // 私钥永远不出安全芯片；我们拿到的 dataRepresentation 是它加密过的「把手」，只有这台 Mac 能用。
 // 状态码：0 成功，1 没有安全芯片，2 把手打不开，3 用户没通过指纹 / 取消，4 缓冲区太小，

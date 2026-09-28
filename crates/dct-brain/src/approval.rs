@@ -86,6 +86,9 @@ pub fn verify_approval(
 ///
 /// 不改任何 canonical form 或 golden 值：这只是把已有的 `verify` 和 `verify_approval`
 /// 接起来，多加一条档位比较。
+///
+/// 这里只证明「票和批准记录对得上」。dco 还必须自己用 `steps::steps_sha256` 算一遍
+/// 它**马上要跑的**步骤，跟票里的 steps_sha256 比对——不比，就可能拿对得上的票跑别的步骤。
 pub fn verify_procedure_ticket(
     st: &SignedTicket,
     sa: &SignedApproval,

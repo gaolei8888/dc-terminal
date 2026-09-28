@@ -52,8 +52,8 @@ impl Tier {
 // 英文按整词比（「Posts」标签页不是「post」）。
 const CONTENT_ZH: &[&str] = &["发布", "发表", "发送", "分享", "转发", "上传", "保存", "提交", "确认", "完成"];
 const CONTENT_EN: &[&str] = &["post", "publish", "send", "share", "repost", "upload", "save", "submit", "confirm", "done"];
-const MONEY_ZH: &[&str] = &["支付", "购买", "下单", "充值", "付款"];
-const MONEY_EN: &[&str] = &["pay", "buy", "order", "checkout", "purchase"];
+const MONEY_ZH: &[&str] = &["支付", "购买", "下单", "充值", "付款", "付费", "结算", "订阅"];
+const MONEY_EN: &[&str] = &["pay", "buy", "order", "checkout", "purchase", "payment", "subscribe"];
 // 发布流程的最后一步常常只写这些。单看字说不清是不是对外，**提议**时按对外算，
 // 用户批准时可以改低。运行时的兜底不看这张表，否则又回到「太严」。
 const AMBIGUOUS_ZH: &[&str] = &["下一步", "继续", "确定", "好的"];
@@ -63,7 +63,7 @@ const AMBIGUOUS_EN: &[&str] = &["next", "continue", "ok", "okay", "yes", "allow"
 // 「Save for later」被当成否定。无论怎么判否定，含钱词的子句永远不会被否定压低
 // （见 `is_money_clause` / `effectively_negated`）。
 const NEGATION_ZH: &[&str] = &[
-    "不要", "不用", "不保存", "不发", "不了", "不再", "不需要", "不同意", "不允许", "取消", "暂不", "以后再说", "稍后", "放弃", "别",
+    "不要", "不用", "不保存", "不发", "不分享", "不上传", "不转发", "不提交", "不确认", "不完成", "不了", "不再", "不需要", "不同意", "不允许", "取消", "暂不", "以后再说", "稍后", "放弃", "别",
 ];
 const NEGATION_EN: &[&str] = &["don't", "dont", "not", "cancel", "no", "skip", "later", "discard"];
 
@@ -352,6 +352,12 @@ mod tests {
         // Hyphenated English negation token ("no") still splits out, but the
         // clause names money so it stays Money regardless.
         assert_eq!(tier_for_label("No-fee checkout"), Tier::Money);
+        for arg in ["付费解锁", "去结算", "Subscribe", "Payment"] {
+            assert_eq!(tier_for_label(arg), Tier::Money, "{arg}");
+        }
+        for arg in ["不分享", "不上传", "不转发", "不提交", "不确认"] {
+            assert_eq!(tier_for_step("tap_by_intent", arg), Tier::SelfOnly, "{arg}");
+        }
         assert_eq!(tier_for_step("tap_by_intent", "No-fee checkout"), Tier::Money);
 
         // An explicit negation word paired with a money word: money wins.
