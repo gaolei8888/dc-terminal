@@ -2,8 +2,9 @@
 //! 流程文件本身不写档位（dcv 定的），档位随这份记录保存；记录带用户签名，
 //! 本机文件被人改过就不再认。
 use crate::canon::field;
-use crate::sign::{make_signature, verify_sig, SignError, Signature, Signer, TrustedKey, VerifyError};
+use crate::sign::{make_signature, verify, verify_sig, SignError, SignedTicket, Signature, Signer, TrustedKey, VerifyError};
 use crate::tier::{SignerRole, Tier};
+use crate::ticket::Subject;
 use serde::{Deserialize, Serialize};
 
 pub const APPROVAL_VERSION: u32 = 1;
@@ -78,10 +79,40 @@ pub fn verify_approval(
     Ok(())
 }
 
+/// dco 拿到一张流程票要跑之前，把票和批准记录一起验：票本身要过 `sign::verify`
+/// （签名、设备、时间窗口、签名角色够不够这一档）；批准记录要是给票里写的同一条
+/// 流程、同一份步骤签的；而且**票的档位不能比批准记录算出来的档位低**——否则
+/// 拿一张自动钥匙签的自用档票，去跑一条批准记录写明要用户签的对外流程。
+///
+/// 不改任何 canonical form 或 golden 值：这只是把已有的 `verify` 和 `verify_approval`
+/// 接起来，多加一条档位比较。
+pub fn verify_procedure_ticket(
+    st: &SignedTicket,
+    sa: &SignedApproval,
+    trusted: &[TrustedKey],
+    device: &str,
+    now: u64,
+) -> Result<(), VerifyError> {
+    verify(st, trusted, device, now)?;
+    let (name, steps_sha256) = match &st.ticket.subject {
+        Subject::Procedure { name, steps_sha256, .. } => (name.as_str(), steps_sha256.as_str()),
+        // 批准记录只管流程；一张单动作票没有对应的批准记录可比。
+        Subject::Action { .. } => return Err(VerifyError::WrongProcedure),
+    };
+    verify_approval(sa, trusted, name, steps_sha256)?;
+    if st.ticket.tier < sa.approval.run_tier() {
+        return Err(VerifyError::TierBelowApproval);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sign::soft::SoftSigner;
+    use crate::sign::sign_one;
+    use crate::ticket::{params_sha256, Ticket, TICKET_VERSION};
+    use std::collections::BTreeMap;
 
     const STEPS: &str = "sha256:4d1077af6efac1184e410d23b0b7b120fd42f29d7dade3304ef2041ca10b565c";
 
@@ -151,6 +182,82 @@ mod tests {
         assert_eq!(
             verify_approval(&sa, &[user.trusted()], "social:edit-bio-copy", STEPS),
             Err(VerifyError::WrongProcedure)
+        );
+    }
+
+    fn ticket_for(tier: Tier) -> Ticket {
+        Ticket {
+            v: TICKET_VERSION,
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            device: "mac-lei".into(),
+            tier,
+            subject: Subject::Procedure {
+                name: "social:edit-bio".into(),
+                steps_sha256: STEPS.into(),
+                body_sha256: format!("sha256:{}", "ab".repeat(32)),
+            },
+            params_sha256: params_sha256(&BTreeMap::new()),
+            earliest: 100,
+            expires: 200,
+        }
+    }
+
+    #[test]
+    fn a_valid_ticket_and_approval_pair_verifies() {
+        let user = SoftSigner::from_seed(SignerRole::User, 2);
+        let sa = sign_approval(approval(), &user, "批准").unwrap(); // run_tier() == Content
+        let st = sign_one(ticket_for(Tier::Content), &user, "发到 TikTok").unwrap();
+        assert_eq!(verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150), Ok(()));
+    }
+
+    #[test]
+    fn a_self_tier_ticket_cannot_ride_a_content_approval() {
+        let user = SoftSigner::from_seed(SignerRole::User, 2);
+        let auto = SoftSigner::from_seed(SignerRole::Auto, 1);
+        let trusted = vec![user.trusted(), auto.trusted()];
+        let sa = sign_approval(approval(), &user, "批准").unwrap(); // run_tier() == Content
+        let st = sign_one(ticket_for(Tier::SelfOnly), &auto, "").unwrap();
+        assert_eq!(
+            verify_procedure_ticket(&st, &sa, &trusted, "mac-lei", 150),
+            Err(VerifyError::TierBelowApproval)
+        );
+    }
+
+    #[test]
+    fn ticket_for_a_different_procedure_or_steps_is_refused() {
+        let user = SoftSigner::from_seed(SignerRole::User, 2);
+        let sa = sign_approval(approval(), &user, "批准").unwrap();
+
+        let mut wrong_name = ticket_for(Tier::Content);
+        if let Subject::Procedure { name, .. } = &mut wrong_name.subject {
+            *name = "social:edit-bio-copy".into();
+        }
+        let st = sign_one(wrong_name, &user, "").unwrap();
+        assert_eq!(
+            verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150),
+            Err(VerifyError::WrongProcedure)
+        );
+
+        let mut wrong_steps = ticket_for(Tier::Content);
+        if let Subject::Procedure { steps_sha256, .. } = &mut wrong_steps.subject {
+            *steps_sha256 = "sha256:other".into();
+        }
+        let st2 = sign_one(wrong_steps, &user, "").unwrap();
+        assert_eq!(
+            verify_procedure_ticket(&st2, &sa, &[user.trusted()], "mac-lei", 150),
+            Err(VerifyError::StepsChanged)
+        );
+    }
+
+    #[test]
+    fn a_tampered_approval_fails_ticket_verification() {
+        let user = SoftSigner::from_seed(SignerRole::User, 2);
+        let mut sa = sign_approval(approval(), &user, "批准").unwrap();
+        sa.approval.step_tiers[3] = Tier::SelfOnly;
+        let st = sign_one(ticket_for(Tier::Content), &user, "").unwrap();
+        assert_eq!(
+            verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150),
+            Err(VerifyError::BadSignature)
         );
     }
 }

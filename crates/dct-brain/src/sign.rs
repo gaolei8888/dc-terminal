@@ -108,6 +108,8 @@ pub enum VerifyError {
     StepsChanged,
     /// 批准记录是给另一条流程的。
     WrongProcedure,
+    /// 票的档位比批准记录要求的还低——批准记录写着要用户签的档，票却按自动档签的。
+    TierBelowApproval,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -124,6 +126,7 @@ impl std::fmt::Display for VerifyError {
             VerifyError::Expired => "票已经过期",
             VerifyError::StepsChanged => "流程的步骤改过了，要重新批准",
             VerifyError::WrongProcedure => "这份批准记录是给另一条流程的",
+            VerifyError::TierBelowApproval => "这张票的档位比批准记录还低",
         };
         f.write_str(s)
     }
