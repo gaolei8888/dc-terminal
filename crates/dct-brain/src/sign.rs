@@ -3,6 +3,11 @@
 //!
 //! 验签只回答「这张票是不是配对过的钥匙签的、档位够不够、设备和时间对不对」。
 //! **一次性编号不在这里查**：通过之后由调用方（dco）记住 nonce，直到票过期。
+//!
+//! **防重放认 nonce（或票的 digest），绝不能认签名字节或签过的 JSON 的哈希**：
+//! P-256 的 `s` 取 `s` 或 `n-s` 对同一条消息都是合法签名（CryptoKit / WebAuthn
+//! 都不保证只出低 S），同一张票能有不止一个合法签名字节串。按签名字节去重，
+//! 一次已批准的发布或付款就可能被重放第二次。
 use crate::canon::{field, sha256_id};
 use crate::ticket::{Ticket, TICKET_VERSION};
 use crate::tier::{SignerRole, Tier};
@@ -73,6 +78,9 @@ pub struct TrustedKey {
 pub enum VerifyError {
     Unsupported,
     UnknownKey,
+    /// 同一把公钥在 `trusted` 里配对了不止一次（哪怕角色不同）：按 key_id 认不出该给
+    /// 哪个角色，不猜、不按列表顺序挑，直接拒。
+    AmbiguousKey,
     WrongRole { need: SignerRole },
     BadSignature,
     NotInBatch,
@@ -88,6 +96,7 @@ impl std::fmt::Display for VerifyError {
         let s = match self {
             VerifyError::Unsupported => "票的版本或算法不认识",
             VerifyError::UnknownKey => "签名的钥匙没配对过",
+            VerifyError::AmbiguousKey => "同一把钥匙配对了不止一次，不认",
             VerifyError::WrongRole { .. } => "这一档要用户本人签名",
             VerifyError::BadSignature => "签名不对",
             VerifyError::NotInBatch => "这张票不在签过的那一批里",
@@ -145,10 +154,12 @@ pub fn verify_sig(sig: &Signature, msg: &[u8], trusted: &[TrustedKey]) -> Result
     if sig.alg != ALG {
         return Err(VerifyError::Unsupported);
     }
-    let key = trusted
-        .iter()
-        .find(|k| key_id(&k.public_key) == sig.key_id)
-        .ok_or(VerifyError::UnknownKey)?;
+    let mut matching = trusted.iter().filter(|k| key_id(&k.public_key) == sig.key_id);
+    let key = matching.next().ok_or(VerifyError::UnknownKey)?;
+    // 同一把钥匙配对了不止一次（哪怕角色不同）：不按列表顺序挑一个，直接拒。
+    if matching.next().is_some() {
+        return Err(VerifyError::AmbiguousKey);
+    }
     let raw = STANDARD.decode(&sig.sig).map_err(|_| VerifyError::BadSignature)?;
     let es = EcSig::from_slice(&raw).map_err(|_| VerifyError::BadSignature)?;
     let vk = VerifyingKey::from_sec1_bytes(&key.public_key).map_err(|_| VerifyError::BadSignature)?;
@@ -163,6 +174,9 @@ fn role_may_sign(tier: Tier, role: SignerRole) -> bool {
     }
 }
 
+/// 通过之后，重放要靠调用方按 `ticket.nonce`（或 `ticket.digest()`）记账，**不能**
+/// 按 `signature.sig` 或签过的 JSON 的哈希去重——同一票的合法签名字节不止一种
+/// （`s` 和 `n-s` 都对得上），按签名字节记账挡不住重放。
 pub fn verify(st: &SignedTicket, trusted: &[TrustedKey], device: &str, now: u64) -> Result<(), VerifyError> {
     let t = &st.ticket;
     if t.v != TICKET_VERSION {
@@ -357,5 +371,58 @@ mod tests {
         let back: SignedTicket = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
         assert_eq!(verify(&back, &trusted, "mac-lei", 150), Ok(()));
         assert!(!serde_json::to_string(&st).unwrap().contains("batch"));
+    }
+
+    #[test]
+    fn a_batch_signed_by_the_automatic_key_still_needs_the_users_key_for_outward_tickets() {
+        let (auto, _, trusted) = keys();
+        let batch = sign_batch(vec![ticket(Tier::SelfOnly, 'a'), ticket(Tier::Content, 'b')], &auto, "").unwrap();
+        assert_eq!(
+            verify(&batch[1], &trusted, "mac-lei", 150),
+            Err(VerifyError::WrongRole { need: SignerRole::User })
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_list_never_contains_the_ticket() {
+        let (auto, _, trusted) = keys();
+        let mut st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
+        st.batch = Some(vec![]);
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::NotInBatch));
+    }
+
+    #[test]
+    fn an_unknown_algorithm_is_unsupported() {
+        let (auto, _, trusted) = keys();
+        let mut st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
+        st.signature.alg = "rs256".into();
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::Unsupported));
+    }
+
+    #[test]
+    fn the_same_key_paired_under_two_roles_is_refused() {
+        let auto = SoftSigner::from_seed(SignerRole::Auto, 1);
+        let trusted = vec![
+            TrustedKey { role: SignerRole::Auto, public_key: auto.public_key() },
+            TrustedKey { role: SignerRole::User, public_key: auto.public_key() },
+        ];
+        let st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::AmbiguousKey));
+    }
+
+    #[test]
+    fn high_s_twin_of_a_valid_signature_still_verifies() {
+        // p256/ecdsa 不保证只出低 S：s 和 n-s 对同一条消息都是合法签名。verify 两个都要认，
+        // 重放要靠调用方按 nonce/digest 挡，不能指望「签名字节唯一」。
+        let (auto, _, trusted) = keys();
+        let st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
+        let raw = STANDARD.decode(&st.signature.sig).unwrap();
+        let es = EcSig::from_slice(&raw).unwrap();
+        let twin = EcSig::from_scalars(es.r(), -es.s()).expect("negated s is still a valid scalar");
+        assert_ne!(twin.to_bytes(), es.to_bytes(), "twin must actually be the other root, not the same signature");
+
+        let mut twinned = st.clone();
+        twinned.signature.sig = STANDARD.encode(twin.to_bytes());
+        assert_eq!(verify(&twinned, &trusted, "mac-lei", 150), Ok(()));
     }
 }
