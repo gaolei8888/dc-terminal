@@ -201,7 +201,7 @@ device code 流程（上面引用的那份文档）登录 dct，拿到的是网�
 钥匙只认网关。这里定义的接口就是分界线：dct 拿 `api_key` 跟网关换一张中转令牌，
 中转自己永远看不到、也不需要认得 `api_key`。
 
-**整套接口挂在 `DC_RELAY_TOKENS_ENABLED` 下，默认关闭。** 关着的时候直接 404
+**整套接口挂在 `DC_RELAY_TOKENS_ENABLED`（网关里实际的环境变量名是 `DC_ADMIN_RELAY_TOKENS_ENABLED`，沿用 `DC_ADMIN_` 前缀）下，默认关闭。** 关着的时候直接 404
 （不是 403——不存在的功能就该像不存在，同 `DC_ADMIN_PAIRING_ENABLED` 的先例）。
 
 ```
@@ -210,7 +210,7 @@ POST /admin/api/relay/token
   → {"endpoint": "c-<20 hex>"}
   ← 200 {"token": "<relay token>", "exp": <unix 秒>}
   ← 401 {"error": "invalid_api_key"}
-  ← 404  功能开关 DC_RELAY_TOKENS_ENABLED 关着
+  ← 404  功能开关 DC_ADMIN_RELAY_TOKENS_ENABLED 关着
   ← 400  endpoint 不合法（不是 c- 加 20 位小写十六进制）
 ```
 
@@ -299,7 +299,7 @@ nonce，比如 RFC 6979，且实现细节完全一致）。因此第 5 节的向
 令牌本身是 **`base64url`（不带 padding）** 编码的一段 JSON：
 
 ```json
-{"account": "<十进制字符串>", "endpoint": "<c- 加 20 位小写十六进制>", "exp": <整数>, "sig": "<标准 base64，带 padding>"}
+{"account": "<账号标识符，对调用方不透明>", "endpoint": "<c- 加 20 位小写十六进制>", "exp": <整数>, "sig": "<标准 base64，带 padding>"}
 ```
 
 **JSON 里四个字段的先后顺序不重要**——中转和 dct 验证时验的是第 1 节那串按固定
@@ -377,3 +377,10 @@ true——Task 5 的连接线程按这个信号调 `fetch_token` 续期；续期
 过期时间存旁边的 `mesh::login::RELAY_TOKEN_EXP_KEY`（`"__relay_exp__"`）。两个都是
 「profile 不可能占用的名字」那一类保留键，同 `PHONE_TOKEN_KEY` / `WEB_TOKEN_KEY`
 等的先例——不会出现在密钥页（`c`）里。
+
+### 网关实现备注（2026-09-28，dc_llm `d05aff1`）
+
+- `account` 是 dc_llm 的 `User.id`（ULID，形如 `usr_01J...`），对中转和 dct 都是不透明字符串。
+- api_key 到 account 的映射：用 `ApiKey.created_by_user_id`。管理员给整个租户开的共享 key 没有单一归属人，返回 401，不拿租户 id 顶替，否则同租户几个人的电脑会落进同一个 account，互相看得见。多电脑第 1 步只连「自己的电脑」，这个行为正确。
+- 签名私钥放在环境变量 `DC_ADMIN_RELAY_SIGNING_KEY`（64 位十六进制）。填成第 5 节公开的测试私钥时按值拒签，返回 503。开关开着但没配私钥时也返回 503。
+- 公钥用 `python -m scripts.relay_signing_key show` 导出一行，就是中转 `--relay-keys` 文件里的一行。
