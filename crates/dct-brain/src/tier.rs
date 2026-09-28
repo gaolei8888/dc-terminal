@@ -83,20 +83,49 @@ fn negated(label: &str) -> bool {
         || words(t).first().is_some_and(|w| NEGATION_EN.contains(&w.as_str()))
 }
 
-/// 按钮上的字**至少**意味着哪一档。说明不了什么（空、否定、普通词）就是 `Read`，
-/// 也就是不往上调。
-pub fn tier_for_label(label: &str) -> Tier {
-    let label = label.trim();
-    if label.is_empty() || negated(label) {
-        return Tier::Read;
-    }
-    if hit(label, MONEY_ZH, MONEY_EN) {
+fn split_clauses(label: &str) -> Vec<&str> {
+    label
+        .split(['，', ',', ';', '；', '、', '。', '.', '!', '！', '?', '？'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn score_clause(clause: &str) -> Tier {
+    if hit(clause, MONEY_ZH, MONEY_EN) {
         Tier::Money
-    } else if hit(label, CONTENT_ZH, CONTENT_EN) {
+    } else if hit(clause, CONTENT_ZH, CONTENT_EN) {
         Tier::Content
     } else {
         Tier::Read
     }
+}
+
+/// 按钮上的字**至少**意味着哪一档。分句判断否定，避免「放弃草稿，直接发布」这类
+/// 多意图的标签被前半句的否定完全压低。每句开头的否定说不清本意，只有非否定句
+/// 才能撑起来。
+pub fn tier_for_label(label: &str) -> Tier {
+    let label = label.trim();
+    if label.is_empty() {
+        return Tier::Read;
+    }
+
+    let clauses = split_clauses(label);
+    if clauses.is_empty() {
+        return Tier::Read;
+    }
+
+    clauses
+        .iter()
+        .filter_map(|clause| {
+            if negated(clause) {
+                None
+            } else {
+                Some(score_clause(clause))
+            }
+        })
+        .max()
+        .unwrap_or(Tier::Read)
 }
 
 /// 没确认过的元素（模型第一次认出来的图标、按钮）至少按对外算（设计第 4 节）。
@@ -125,15 +154,32 @@ pub fn tier_for_step(action: &str, arg: &str) -> Tier {
         "pick_file" => Tier::Content,
         "tap_by_intent" | "confirm_dialog" => {
             let a = arg.trim();
-            if negated(a) {
+            let clauses = split_clauses(a);
+
+            // Only return SelfOnly if EVERY clause is negated.
+            if !clauses.is_empty() && clauses.iter().all(|c| negated(c)) {
                 return Tier::SelfOnly;
             }
-            let default = if action == "confirm_dialog" || hit(a, AMBIGUOUS_ZH, AMBIGUOUS_EN) {
+
+            // Compute label tier using per-clause logic.
+            let label_tier = tier_for_label(a);
+
+            // Determine default: ambiguous words and confirm_dialog apply to non-negated clauses only.
+            let default = if action == "confirm_dialog" {
                 Tier::Content
             } else {
-                Tier::SelfOnly
+                // For tap_by_intent, check if any non-negated clause has ambiguous words.
+                let has_ambiguous_in_nonnegated = clauses
+                    .iter()
+                    .any(|c| !negated(c) && hit(c, AMBIGUOUS_ZH, AMBIGUOUS_EN));
+                if has_ambiguous_in_nonnegated {
+                    Tier::Content
+                } else {
+                    Tier::SelfOnly
+                }
             };
-            tier_for_label(a).max(default)
+
+            label_tier.max(default)
         }
         // dcv 写入时就拒绝词表外的动作；万一漏进来，按对外算。
         _ => Tier::Content,
@@ -225,7 +271,7 @@ mod tests {
 
     #[test]
     fn negations_are_not_the_thing_they_negate() {
-        for arg in ["Don't save", "Don't save", "不保存", "取消发布", "Not now", "Cancel", "暂不上传", "Discard post"] {
+        for arg in ["Don't save", "Don\u{2019}t save", "不保存", "取消发布", "Not now", "Cancel", "暂不上传", "Discard post"] {
             assert_eq!(tier_for_step("tap_by_intent", arg), Tier::SelfOnly, "{arg}");
         }
         assert_eq!(tier_for_step("confirm_dialog", "Cancel"), Tier::SelfOnly);
@@ -267,5 +313,17 @@ mod tests {
         assert_eq!(raise(Tier::SelfOnly, "", false), Tier::Content);
         assert_eq!(raise(Tier::SelfOnly, "支付", false), Tier::Money);
         assert_eq!(floor_for_element("编辑资料", true), Tier::Read);
+    }
+
+    #[test]
+    fn multi_clause_labels_judge_negation_per_clause() {
+        // Negated first clause doesn't suppress content in later clause.
+        assert_eq!(tier_for_step("tap_by_intent", "放弃草稿，直接发布"), Tier::Content);
+        assert_eq!(tier_for_step("tap_by_intent", "No, post anyway"), Tier::Content);
+        assert_eq!(tier_for_label("放弃草稿，直接发布"), Tier::Content);
+        assert_eq!(tier_for_label("No, post anyway"), Tier::Content);
+        assert_eq!(raise(Tier::SelfOnly, "No, post anyway", true), Tier::Content);
+        // All clauses negated still counts as negation.
+        assert_eq!(tier_for_step("tap_by_intent", "Not now, maybe later"), Tier::SelfOnly);
     }
 }
