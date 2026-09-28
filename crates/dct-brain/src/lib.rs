@@ -5,6 +5,7 @@
 //! - 没有 C 依赖（dct 的老规矩，也方便安卓用 NDK 编）。
 //! - 不直接碰磁盘和网络：钥匙怎么存、流程从哪来，都由调用方传进来。测试不打网络，
 //!   同一份代码在手机上也能跑。
+pub mod approval;
 pub mod canon;
 pub mod sign;
 pub mod steps;
