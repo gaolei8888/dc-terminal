@@ -185,3 +185,67 @@
 - **中转部署**：dataclue.cn 上开新路径，还是用子域名；证书用现成的吗。
 - **Windows 上电脑钥匙的保护**：DPAPI 还是只靠文件 ACL。第一版先用 ACL，和 `secrets.toml` 一样。
 - **留言多久算送不到**：7 天是暂定值。
+
+---
+
+## 附录：网关签中转令牌（冻结的线上契约）
+
+**这一节是契约，不是示意。** 网关（dc_llm 仓）和 dct 分头实现，状态码、字段名、
+错误文案以这里为准，两边都不许临场发挥——沿用 `2026-09-02-dct-pair-with-dc-llm-design.md`
+「三个接口：冻结的线上契约」那节定下的先例。dct 这半边已经照着实现
+（`src/mesh/login.rs`）；网关那半边由 dc_llm 会话接手，**本任务不改 dc_llm 仓库**。
+
+这一步要解的是「待定」一节里已经定下的那句：**中转鉴权不要直接收 LLM 的
+`api_key`，凭据要按用途分开，给中转另发一个只能连中转的令牌。** 学生用已有的
+device code 流程（上面引用的那份文档）登录 dct，拿到的是网关的 `api_key`——那把
+钥匙只认网关。这里定义的接口就是分界线：dct 拿 `api_key` 跟网关换一张中转令牌，
+中转自己永远看不到、也不需要认得 `api_key`。
+
+**整套接口挂在 `DC_RELAY_TOKENS_ENABLED` 下，默认关闭。** 关着的时候直接 404
+（不是 403——不存在的功能就该像不存在，同 `DC_ADMIN_PAIRING_ENABLED` 的先例）。
+
+```
+POST /admin/api/relay/token
+  Authorization: Bearer <学生的 api_key>        ← 只发给网关，永不发给中转
+  → {"endpoint": "c-<20 hex>"}
+  ← 200 {"token": "<relay token>", "exp": <unix 秒>}
+  ← 401 {"error": "invalid_api_key"}
+  ← 404  功能开关 DC_RELAY_TOKENS_ENABLED 关着
+  ← 400  endpoint 不合法（不是 c- 加 20 位小写十六进制）
+```
+
+- **`endpoint`** 是发请求这台电脑自己的中转端点 id，由 `dct_mesh::id::endpoint_for`
+  从这台电脑的 P-256 签名公钥算出（`"c-"` 加该公钥 SHA-256 摘要前 20 位十六进制，
+  `crates/dct-mesh/src/id.rs`）。dct 自己算出来的值恒合法，400 这条分支是网关对
+  输入的防御，不是 dct 正常路径会走到的地方。
+- **令牌格式是 `dct_mesh::relay_token`**（`crates/dct-mesh/src/relay_token.rs`）：
+  `base64url`（无 padding）编码的 `{account, endpoint, exp, sig}`。
+  - `account`：网关里这个账号的用户 id，十进制字符串。
+  - `endpoint`：原样回填请求里的那个 `endpoint`。
+  - `exp`：签发时刻 + 7 天，unix 秒。
+  - `sig`：对 `relay_token::bytes(&claims)` 的 P-256 ECDSA(SHA-256) 签名，
+    标准 base64。
+- **签名钥匙是网关自己的一把 P-256**，跟每台电脑各自的身份钥匙无关。公钥交给
+  中转，写进中转启动参数 `--relay-keys` 指向的文件；中转验证令牌时依次试文件里
+  每一把公钥，任一把验过就算数（`relay_token::verify` 已经是这个形状），这样
+  网关将来轮换签名钥匙、加第二把，不用两边同时发版。
+- `api_key` **只出现在这一次请求的 `Authorization` 头里**：不进请求体、不进日志、
+  也绝不转发给中转——中转往后只看得到这张令牌，看不到 `api_key` 本身。
+
+**dct 这边的失败文案**（`mesh::login::fetch_token` 直接返回给学生看的中文，不是
+错误码——这个模块今天没有自己的 i18n key，往后接 TUI 时再决定要不要挪过去）：
+
+- 401 → 「登录已失效，请先在 dct 里重新配对 DC 账号」
+- 404 → 「服务器还没开放多电脑功能」
+- 400 → 「这台电脑的身份码不合法，没法申请多电脑令牌」（正常路径走不到，见上）
+- 网络本身连不上（超时、DNS、连接被拒……）→ 「连不上网关，检查一下网络，然后重试」
+- 其它状态码 → 「网关出错了（&lt;状态码&gt;），请稍后再试」
+
+**续期**：`mesh::login::needs_renewal(exp, now)` 剩不到 1 天（86400 秒）就返回
+true——Task 5 的连接线程按这个信号调 `fetch_token` 续期；续期失败只记一条警告、
+继续用旧令牌，不打断已经在跑的连接，旧令牌只要没到 `exp` 仍然有效。
+
+**落盘**：令牌存 `secrets.toml` 的 `mesh::login::RELAY_TOKEN_KEY`（`"__relay__"`）；
+过期时间存旁边的 `mesh::login::RELAY_TOKEN_EXP_KEY`（`"__relay_exp__"`）。两个都是
+「profile 不可能占用的名字」那一类保留键，同 `PHONE_TOKEN_KEY` / `WEB_TOKEN_KEY`
+等的先例——不会出现在密钥页（`c`）里。
