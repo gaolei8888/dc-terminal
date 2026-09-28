@@ -1,8 +1,41 @@
 //! 发布密钥文件。见 `docs/superpowers/specs/2026-09-13-public-live-listing-design.md`
 //! 「发布密钥与总开关」。
+//!
+//! 这个文件里还有 relay-keys：中转信任哪几个签令牌的 issuer 公钥
+//! （`--relay-keys`），格式跟发布密钥完全不是一回事——那是摘要，这是明文
+//! 公钥（公钥本来就不是秘密）——放在同一个文件只是因为两者都是「一份
+//! 密钥列表，按行读」。
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+/// relay-keys 文件：每行一把 STANDARD base64 的 65 字节 SEC1 公钥，`#`
+/// 开头的是注释，空行忽略。
+pub fn load_relay_keys(path: &Path) -> Result<Vec<[u8; 65]>, String> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("读不了 {}：{e}", path.display()))?;
+    parse_relay_keys(&raw)
+}
+
+/// `load_relay_keys` 的纯逻辑那一半，供测试直接喂字符串。
+pub fn parse_relay_keys(raw: &str) -> Result<Vec<[u8; 65]>, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let mut out = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bytes = STANDARD
+            .decode(line)
+            .map_err(|e| format!("第 {} 行不是合法的 base64：{e}", i + 1))?;
+        let key: [u8; 65] = bytes
+            .try_into()
+            .map_err(|_| format!("第 {} 行不是 65 字节的公钥", i + 1))?;
+        out.push(key);
+    }
+    Ok(out)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishKeys {
@@ -166,6 +199,43 @@ impl KeyFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn b64_pub(byte: u8) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut pk = [0u8; 65];
+        pk[0] = 0x04;
+        pk[1] = byte;
+        STANDARD.encode(pk)
+    }
+
+    #[test]
+    fn relay_keys_parses_one_key_per_line_and_skips_comments_and_blanks() {
+        let a = b64_pub(1);
+        let b = b64_pub(2);
+        let raw = format!("# comment\n{a}\n\n{b}\n");
+        let keys = parse_relay_keys(&raw).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0][1], 1);
+        assert_eq!(keys[1][1], 2);
+    }
+
+    #[test]
+    fn relay_keys_rejects_a_line_that_is_not_65_bytes() {
+        assert!(parse_relay_keys("aGVsbG8=\n").is_err(), "太短的公钥要报错");
+    }
+
+    #[test]
+    fn relay_keys_rejects_invalid_base64() {
+        assert!(parse_relay_keys("not base64!!\n").is_err());
+    }
+
+    #[test]
+    fn an_empty_relay_keys_file_is_an_empty_list_not_an_error() {
+        assert_eq!(
+            parse_relay_keys("# only comments\n\n").unwrap(),
+            Vec::<[u8; 65]>::new()
+        );
+    }
 
     fn tmp_file() -> (tempfile::TempDir, std::path::PathBuf) {
         let d = tempfile::tempdir().unwrap();

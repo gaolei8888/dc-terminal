@@ -26,6 +26,7 @@
 
 mod live;
 pub use live::{Control, Live, PublicEntry};
+pub mod issuer;
 pub mod keys;
 
 use std::collections::HashMap;
@@ -38,9 +39,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dct_link::{
-    AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PollResponse, SendRequest, LINK_VERSION,
-    MAX_PAYLOAD, PATH_ASK, PATH_POLL, PATH_SEND,
+    AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PeersResponse, PollResponse,
+    SendRequest, LINK_VERSION, MAX_PAYLOAD, PATH_ASK, PATH_PEERS, PATH_POLL, PATH_SEND,
 };
+use dct_mesh::relay_token;
 use tokio::sync::mpsc;
 
 /// 一次长轮询最多挂多久。**这个数字两边共用**，理由见 `dct_link::POLL_TIMEOUT`
@@ -85,6 +87,10 @@ struct Device {
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     /// 最后一次**发起**轮询的时刻。见 `Config::presence_ttl`。
     last_poll: Instant,
+    /// 这台设备属于哪个账号。`None` = 中转没配 issuer（`Relay::new`），没人
+    /// 验过令牌，账号无从知道——这时候账号隔离和 `peers` 都不该假装认得出
+    /// 「同账号」是什么意思。
+    account: Option<String>,
 }
 
 /// 正挂在 `/link/ask` 上等答复的人。键是「等的是谁的、哪一个 `seq`」，
@@ -95,6 +101,17 @@ pub struct Relay {
     devices: Mutex<HashMap<EndpointId, Device>>,
     waiting: Waiting,
     cfg: Config,
+    /// 这个中转信任哪几个签令牌的 issuer。`None` = 不验令牌（`Relay::new`），
+    /// 只给已有测试和本机开发用——**不能**对公网开口，见 `main.rs`。
+    issuers: Option<Vec<[u8; 65]>>,
+}
+
+/// 当前 unix 秒——喂给 `relay_token::verify` 判断 `exp`。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Relay {
@@ -103,23 +120,47 @@ impl Relay {
             devices: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             cfg,
+            issuers: None,
         }
     }
 
-    /// 出示凭据的人说得通吗。
-    fn check(&self, auth: &AuthFrame) -> Result<(), LinkError> {
+    /// 验令牌的中转。`issuers` 是这个中转信任的签发方公钥——任何一把验过
+    /// 就算数（见 `relay_token::verify`）。**正式令牌由网关签**（任务 4 的
+    /// 契约）；这个构造函数本身对谁签的、签得对不对一无所知，光是把
+    /// `check()` 从「不验」切到「验」。
+    pub fn with_issuers(cfg: Config, issuers: Vec<[u8; 65]>) -> Self {
+        Relay {
+            devices: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            cfg,
+            issuers: Some(issuers),
+        }
+    }
+
+    /// 出示凭据的人说得通吗。验过的话，一并把令牌里的账号交回去——`poll`
+    /// 拿它记进 `Device`，`send`/`ask`/`peers` 拿它做账号隔离。`None` 有两种
+    /// 意思，调用方分不清也不需要分清：要么没配 issuer（`Relay::new`），
+    /// 要么就是没这回事——两种情况下都不该拿它去比账号。
+    fn check(&self, auth: &AuthFrame) -> Result<Option<String>, LinkError> {
         if auth.version != LINK_VERSION {
             return Err(LinkError::VersionMismatch);
         }
-        // TODO(任务 5)：`auth.token` 还没人验，`auth.kind` 也还没用上——它存在
-        // 就是为了让那时候的中转知道该拿哪个验证器去验。在那之前这个服务只
-        // 监听环回地址（见 `main.rs`）。
-        Ok(())
+        let Some(issuers) = &self.issuers else {
+            return Ok(None);
+        };
+        let claims = relay_token::verify(&auth.token, issuers, now_secs())
+            .map_err(|_| LinkError::Unauthorized)?;
+        // 令牌验得过，但它是签给别人的：出示凭据的人拿着一把不属于自己的
+        // 有效令牌，这跟令牌本身伪造是两件事，要用不同的码说清楚。
+        if claims.endpoint != auth.endpoint.as_str() {
+            return Err(LinkError::NotYours);
+        }
+        Ok(Some(claims.account))
     }
 
     /// 有我的东西吗。没有就挂着，挂到超时为止。
     pub async fn poll(&self, auth: &AuthFrame) -> Result<Option<Envelope>, LinkError> {
-        self.check(auth)?;
+        let account = self.check(auth)?;
 
         let rx = {
             let mut map = self.devices.lock().expect("device table poisoned");
@@ -135,9 +176,13 @@ impl Relay {
                     tx,
                     rx: Arc::new(tokio::sync::Mutex::new(rx)),
                     last_poll: Instant::now(),
+                    account: account.clone(),
                 }
             });
             d.last_poll = Instant::now();
+            // 每次轮询都刷新一遍：一台设备换了新令牌（比如续期后账号变了），
+            // 下一次轮询就该跟着变，不该卡在它第一次露面时的那份账号。
+            d.account = account.clone();
             d.rx.clone()
         };
 
@@ -153,7 +198,7 @@ impl Relay {
 
     /// 投一个信封。**不排队给不在线的人**，投不到就当场说。
     pub fn send(&self, req: &SendRequest) -> Result<(), LinkError> {
-        self.check(&req.auth)?;
+        let account = self.check(&req.auth)?;
 
         // 信封上的寄件人必须就是出示凭据的那个人。不比这一下，任何一个连得上
         // 中转的人都能冒充别人发东西——而收件方唯一能用来判断"这是谁说的"的
@@ -168,7 +213,10 @@ impl Relay {
 
         // **先看有没有人正挂着等这一封。** 走 `/link/ask` 的手机根本不轮询，
         // 它不在设备表里；这一步要是排在在线检查后面，笔记本发回去的答复
-        // 会被判成"收件人不在线"直接丢掉，而提问的人还在那头挂着。
+        // 会被判成"收件人不在线"直接丢掉，而提问的人还在那头挂着。挂号表里
+        // 的这一位从没经过账号校验（它压根没有 `Device` 条目），但这没关系：
+        // 它的挂号是由 `ask()` 里那一次普通 `send()` 建立的，那一次已经把
+        // 提问者和被问者的账号比过了。
         if let Some(tx) = self
             .waiting
             .lock()
@@ -184,7 +232,16 @@ impl Relay {
         let tx = {
             let map = self.devices.lock().expect("device table poisoned");
             match map.get(&req.envelope.to) {
-                Some(d) if d.last_poll.elapsed() < self.cfg.presence_ttl() => d.tx.clone(),
+                Some(d) if d.last_poll.elapsed() < self.cfg.presence_ttl() => {
+                    // 账号隔离：只在两边都验过令牌（`account` 是 `Some`）时才
+                    // 判——`Relay::new` 从来分不清账号，不该假装能拦跨账号。
+                    if let Some(sender) = &account {
+                        if d.account.as_deref() != Some(sender.as_str()) {
+                            return Err(LinkError::NotYours);
+                        }
+                    }
+                    d.tx.clone()
+                }
                 _ => return Err(LinkError::Offline),
             }
         };
@@ -194,6 +251,23 @@ impl Relay {
             // 取件的一端被清扫掉了：设备已经不在了，跟从没来过一样。
             mpsc::error::TrySendError::Closed(_) => LinkError::Offline,
         })
+    }
+
+    /// 跟我同账号、在线、不是我自己的端点，按字典序排。
+    pub fn peers(&self, auth: &AuthFrame) -> Result<Vec<EndpointId>, LinkError> {
+        let account = self.check(auth)?;
+
+        let mut map = self.devices.lock().expect("device table poisoned");
+        let ttl = self.cfg.presence_ttl();
+        map.retain(|_, d| d.last_poll.elapsed() < ttl);
+
+        let mut out: Vec<EndpointId> = map
+            .iter()
+            .filter(|(ep, d)| **ep != auth.endpoint && d.account.as_deref() == account.as_deref())
+            .map(|(ep, _)| ep.clone())
+            .collect();
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -619,6 +693,15 @@ async fn ask_route(
     Ok(Json(relay.ask(&req).await?))
 }
 
+async fn peers_route(
+    State(relay): State<Arc<Relay>>,
+    Json(auth): Json<AuthFrame>,
+) -> Result<Json<PeersResponse>, Rejected> {
+    Ok(Json(PeersResponse {
+        online: relay.peers(&auth)?,
+    }))
+}
+
 /// 中转挂哪些路由。
 ///
 /// **默认只有直播那一组，外加公开列表。** 配对信封那三条（`/link/*`）和
@@ -647,7 +730,8 @@ pub fn router(state: AppState, routes: Routes) -> Router {
             .route("/phone", get(page_route))
             .route(PATH_POLL, post(poll_route))
             .route(PATH_SEND, post(send_route))
-            .route(PATH_ASK, post(ask_route)),
+            .route(PATH_ASK, post(ask_route))
+            .route(PATH_PEERS, post(peers_route)),
     };
     app
         // 公开列表页和列表接口：谁都能读，两档都挂。
@@ -780,13 +864,32 @@ pub fn must_be_loopback(addr: std::net::SocketAddr) -> Result<(), String> {
     ))
 }
 
-/// 中转的五种启动方式。
+/// 这个地址允不允许绑。带了 `--relay-keys`（令牌要验）就放行任何地址；
+/// 没带就退回 [`must_be_loopback`]。
+///
+/// 这条判断跟 `must_be_loopback` 分开、也写在库里，理由一样：`main` 没法测，
+/// 而「公网开口的前提是有 issuer 公钥」跟「第一期只能环回」是两条不同的
+/// 判断，`--with-link` 不带 `--relay-keys` 的话公网照样要拒。
+pub fn bind_check(
+    addr: std::net::SocketAddr,
+    relay_keys: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if relay_keys.is_some() {
+        return Ok(());
+    }
+    must_be_loopback(addr)
+}
+
+/// 中转的七种启动方式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cli {
     Serve {
         addr: String,
         with_link: bool,
         publish_keys: Option<std::path::PathBuf>,
+        /// 中转信任的 issuer 公钥文件。带了它才验令牌，也才允许绑非环回
+        /// 地址——见 [`bind_check`]。
+        relay_keys: Option<std::path::PathBuf>,
     },
     KeyAdd {
         name: String,
@@ -803,24 +906,67 @@ pub enum Cli {
         id: String,
         file: std::path::PathBuf,
     },
+    /// `token keygen --out <dir>`：生成一对 issuer 钥匙，只给开发和本机
+    /// 端到端测试用——正式令牌由网关签（任务 4 的契约）。
+    TokenKeygen {
+        out: std::path::PathBuf,
+    },
+    /// `token mint --key <file> --account <a> --endpoint <e> --ttl <secs>`：
+    /// 用一把 issuer 钥匙签一个令牌，打印到标准输出。同上，只给开发用。
+    TokenMint {
+        key: std::path::PathBuf,
+        account: String,
+        endpoint: String,
+        ttl: u64,
+    },
 }
 
-/// 手写解析：五种形状，不值得为此引一个参数库。
+/// 手写解析：不值得为此引一个参数库。
 pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
+    fn flag_str<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
         match args.iter().position(|a| a == flag) {
             None => Ok(None),
             Some(i) => args
                 .get(i + 1)
                 .filter(|v| !v.starts_with("--"))
-                .map(|v| Some(v.into()))
-                .ok_or_else(|| format!("{flag} 后面要跟一个文件路径")),
+                .map(|v| Some(v.as_str()))
+                .ok_or_else(|| format!("{flag} 后面要跟一个值")),
         }
+    }
+    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(flag_str(args, flag)?.map(std::path::PathBuf::from))
     }
     let need_file = |args: &[String]| {
         flag_value(args, "--file")?.ok_or_else(|| "管理命令要写明 --file <密钥文件>".to_string())
     };
     match args.first().map(String::as_str) {
+        Some("token") => match args.get(1).map(String::as_str) {
+            Some("keygen") => Ok(Cli::TokenKeygen {
+                out: flag_value(args, "--out")?
+                    .ok_or_else(|| "token keygen 要写明 --out <目录>".to_string())?,
+            }),
+            Some("mint") => {
+                let key = flag_value(args, "--key")?
+                    .ok_or_else(|| "token mint 要写明 --key <issuer 钥匙文件>".to_string())?;
+                let account = flag_str(args, "--account")?
+                    .ok_or_else(|| "token mint 要写明 --account <账号>".to_string())?
+                    .to_string();
+                let endpoint = flag_str(args, "--endpoint")?
+                    .ok_or_else(|| "token mint 要写明 --endpoint <端点>".to_string())?
+                    .to_string();
+                let ttl = flag_str(args, "--ttl")?
+                    .ok_or_else(|| "token mint 要写明 --ttl <秒数>".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--ttl 后面要跟一个数字".to_string())?;
+                Ok(Cli::TokenMint {
+                    key,
+                    account,
+                    endpoint,
+                    ttl,
+                })
+            }
+            _ => Err("用法：dct-srv token keygen|mint ...".into()),
+        },
         Some("key") => {
             // `args.get(2)` 直接当名字用的话，`key add --file X`（漏了名字，
             // `--file` 紧跟在 `add` 后面）会把 `--file` 当成密钥的名字，
@@ -856,6 +1002,8 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
         }),
         _ => {
             let publish_keys = flag_value(args, "--publish-keys")?;
+            let relay_keys = flag_value(args, "--relay-keys")?;
+            let flags_with_values = ["--publish-keys", "--relay-keys"];
             let mut skip_next = false;
             let mut addr = None;
             for a in args {
@@ -863,7 +1011,7 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
                     skip_next = false;
                     continue;
                 }
-                if a == "--publish-keys" {
+                if flags_with_values.contains(&a.as_str()) {
                     skip_next = true;
                 } else if !a.starts_with("--") && addr.is_none() {
                     addr = Some(a.clone());
@@ -873,6 +1021,7 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
                 with_link: args.iter().any(|a| a == "--with-link"),
                 publish_keys,
+                relay_keys,
             })
         }
     }
@@ -884,6 +1033,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use dct_link::EndpointKind;
+    use dct_mesh::relay_token::{issue, Claims};
+    use p256::ecdsa::SigningKey;
     use tower::ServiceExt;
 
     fn cfg(ms: u64) -> Config {
@@ -982,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn the_default_relay_does_not_answer_the_unauthenticated_routes() {
         let (app, _live) = app_with_live();
-        for path in [PATH_POLL, PATH_SEND, PATH_ASK, "/phone"] {
+        for path in [PATH_POLL, PATH_SEND, PATH_ASK, PATH_PEERS, "/phone"] {
             let (status, _) = post(app.clone(), path, "{}").await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path} 不该在默认中转上存在");
         }
@@ -1425,6 +1576,187 @@ mod tests {
 
         assert_eq!(q1.await.unwrap().unwrap().payload, b"first");
         assert_eq!(q2.await.unwrap().unwrap().payload, b"second");
+    }
+
+    // ——— 令牌鉴权、账号隔离、在线查询（任务 3）———
+
+    /// 一把假想的 issuer 钥匙：签名种子和它的公钥。跟
+    /// `dct_mesh::relay_token` 测试里同一个套路。
+    fn issuer(byte: u8) -> (SigningKey, [u8; 65]) {
+        let sk = SigningKey::from_slice(&[byte.max(1); 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let mut pk = [0u8; 65];
+        pk.copy_from_slice(point.as_bytes());
+        (sk, pk)
+    }
+
+    /// 签一个还没过期的令牌（`exp` 是很远的未来，不会在测试跑的这几毫秒里过期）。
+    fn token_for(sk: &SigningKey, account: &str, endpoint: &str) -> String {
+        issue(
+            &Claims {
+                account: account.into(),
+                endpoint: endpoint.into(),
+                exp: 4_000_000_000,
+            },
+            sk,
+        )
+    }
+
+    /// 同一个 `AuthFrame`，只是把 `token` 换成给定的那个。
+    fn authed(who: &str, token: String) -> AuthFrame {
+        AuthFrame { token, ..auth(who) }
+    }
+
+    #[tokio::test]
+    async fn with_issuers_a_missing_or_forged_token_is_unauthorized() {
+        let (_sk, pk) = issuer(1);
+        let (forged_sk, _forged_pk) = issuer(2);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]);
+
+        // `auth("b")` 默认带的是 `"t"`，压根不是这个格式的令牌。
+        assert_eq!(relay.poll(&auth("b")).await, Err(LinkError::Unauthorized));
+
+        // 另一个 issuer 签的——不在这个中转信任的名单里。
+        let forged = token_for(&forged_sk, "acct", "b");
+        assert_eq!(
+            relay.poll(&authed("b", forged)).await,
+            Err(LinkError::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_for_another_endpoint_is_not_yours() {
+        let (sk, pk) = issuer(1);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]);
+        // 令牌验得过，但它是签给 "someone-else" 的，不是出示这令牌的 "b"。
+        let token = token_for(&sk, "acct", "someone-else");
+        assert_eq!(
+            relay.poll(&authed("b", token)).await,
+            Err(LinkError::NotYours)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_unauthorized() {
+        let (sk, pk) = issuer(1);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]);
+        let expired = issue(
+            &Claims {
+                account: "acct".into(),
+                endpoint: "b".into(),
+                exp: 1,
+            },
+            &sk,
+        );
+        assert_eq!(
+            relay.poll(&authed("b", expired)).await,
+            Err(LinkError::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn envelopes_do_not_cross_accounts() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(200), vec![pk]));
+
+        // b 上线，账号是 acct-b。
+        let b_token = token_for(&sk, "acct-b", "b");
+        assert_eq!(relay.poll(&authed("b", b_token)).await, Ok(None));
+
+        // a 是另一个账号，发给 b：即便 b 在线，也不是它能碰的设备。
+        let a_token = token_for(&sk, "acct-a", "a");
+        let mut cross = letter("a", "b", b"x");
+        cross.auth = authed("a", a_token);
+        assert_eq!(relay.send(&cross), Err(LinkError::NotYours));
+    }
+
+    #[tokio::test]
+    async fn peers_lists_only_same_account_online_others() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(200), vec![pk]));
+
+        let a_token = token_for(&sk, "acct-a", "a");
+        let b_token = token_for(&sk, "acct-a", "b");
+        let c_token = token_for(&sk, "acct-other", "c");
+
+        assert_eq!(relay.poll(&authed("a", a_token.clone())).await, Ok(None));
+        assert_eq!(relay.poll(&authed("b", b_token)).await, Ok(None));
+        assert_eq!(relay.poll(&authed("c", c_token)).await, Ok(None));
+
+        // a 自己看到的名单：同账号、在线、不是自己——只有 b。c 是另一个账号，
+        // a 自己也不列进自己的名单。
+        assert_eq!(relay.peers(&authed("a", a_token)).unwrap(), vec![id("b")]);
+    }
+
+    /// 已有测试的前提：不带 issuers 的中转（`Relay::new`）不验令牌，
+    /// 任何字符串都当成合法凭据。
+    #[tokio::test]
+    async fn relay_new_without_issuers_still_accepts_anything() {
+        let relay = Arc::new(Relay::new(cfg(200)));
+        assert_eq!(relay.poll(&auth("b")).await, Ok(None));
+        assert!(relay.send(&letter("a", "b", b"x")).is_ok());
+    }
+
+    #[test]
+    fn public_bind_needs_relay_keys() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+
+        // `--with-link` 不带 `--relay-keys`：解析没问题，但绑公网地址该被拒。
+        let cli = parse_cli(&a("0.0.0.0:8787 --with-link")).unwrap();
+        let Cli::Serve { relay_keys, .. } = &cli else {
+            panic!("{cli:?}")
+        };
+        assert!(relay_keys.is_none());
+        assert!(bind_check("0.0.0.0:8787".parse().unwrap(), relay_keys.as_deref()).is_err());
+
+        // 带了 `--relay-keys`：同一个地址该被放行。
+        let cli = parse_cli(&a("0.0.0.0:8787 --with-link --relay-keys /k.txt")).unwrap();
+        let Cli::Serve { relay_keys, .. } = &cli else {
+            panic!("{cli:?}")
+        };
+        assert_eq!(relay_keys.as_deref(), Some(std::path::Path::new("/k.txt")));
+        assert!(bind_check("0.0.0.0:8787".parse().unwrap(), relay_keys.as_deref()).is_ok());
+
+        // 环回地址不管带不带 `--relay-keys` 都该放行。
+        assert!(bind_check("127.0.0.1:8787".parse().unwrap(), None).is_ok());
+    }
+
+    /// **中转不认识 mesh 的信封格式，只认识 `relay_token`。** `dct-mesh` 的
+    /// `wire` 模块是设备之间点对点消息的线上形状，`seal` 模块的 `open` 是
+    /// 解密——两样中转都不该碰：它只转发不透明字节，见文件头 spec 决定一。
+    ///
+    /// 把禁词拆成两半拼，是因为这条测试本身也在 `crates/dct-srv/src` 里，
+    /// 会被自己扫到；原样写在这儿会让测试红得毫无意义（跟
+    /// `the_relay_never_looks_inside_a_frame_either` 同一个理由）。
+    #[test]
+    fn dct_srv_never_opens_mesh_payloads() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src_dir, &mut files);
+        assert!(!files.is_empty(), "扫描目录是空的，这条测试没有意义");
+
+        let banned = [concat!("dct_mesh", "::wire"), concat!("seal", "::open")];
+        for path in files {
+            let src = std::fs::read_to_string(&path).unwrap();
+            for name in banned {
+                assert!(
+                    !src.contains(name),
+                    "{name} 出现在 {}——中转开始认识 mesh 的 payload 了",
+                    path.display()
+                );
+            }
+        }
     }
 
     // ——— 接口这一层 ———
@@ -1934,14 +2266,15 @@ mod tests {
     }
 
     #[test]
-    fn the_command_line_is_parsed_into_one_of_five_shapes() {
+    fn the_command_line_is_parsed_into_one_of_seven_shapes() {
         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
         assert_eq!(
             parse_cli(&a("")).unwrap(),
             Cli::Serve {
                 addr: "127.0.0.1:8787".into(),
                 with_link: false,
-                publish_keys: None
+                publish_keys: None,
+                relay_keys: None,
             }
         );
         assert_eq!(
@@ -1949,8 +2282,50 @@ mod tests {
             Cli::Serve {
                 addr: "127.0.0.1:9000".into(),
                 with_link: true,
-                publish_keys: Some("/k.json".into())
+                publish_keys: Some("/k.json".into()),
+                relay_keys: None,
             }
+        );
+        assert_eq!(
+            parse_cli(&a(
+                "127.0.0.1:9000 --with-link --relay-keys /r.txt --publish-keys /k.json"
+            ))
+            .unwrap(),
+            Cli::Serve {
+                addr: "127.0.0.1:9000".into(),
+                with_link: true,
+                publish_keys: Some("/k.json".into()),
+                relay_keys: Some("/r.txt".into()),
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("token keygen --out /keys")).unwrap(),
+            Cli::TokenKeygen {
+                out: "/keys".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a(
+                "token mint --key /k.key --account acct --endpoint c-abc --ttl 3600"
+            ))
+            .unwrap(),
+            Cli::TokenMint {
+                key: "/k.key".into(),
+                account: "acct".into(),
+                endpoint: "c-abc".into(),
+                ttl: 3600,
+            }
+        );
+        assert!(
+            parse_cli(&a("token keygen")).is_err(),
+            "token keygen 必须写明 --out"
+        );
+        assert!(
+            parse_cli(&a(
+                "token mint --key /k.key --account acct --endpoint c-abc"
+            ))
+            .is_err(),
+            "token mint 必须写明 --ttl"
         );
         assert_eq!(
             parse_cli(&a("key add 姜老师 --file /k.json")).unwrap(),

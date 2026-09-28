@@ -6,6 +6,9 @@ license = "MIT"
 
 [dependencies]
 dct-link = { path = "../dct-link" }
+# 令牌鉴权（`relay_token::{verify, issue, Claims}`）和 issuer 钥匙（P-256）。
+# 只有这个中转需要"验"和"给 token mint 签"，笔记本和手机不该带上这份依赖。
+dct-mesh = { path = "../dct-mesh" }
 # 手机端那一页网页。**跟 `dct` 发的是同一份字节**——它不住在这两个 crate 的
 # 任何一个里面，正是为了让"发两份不一样的网页"这件事需要有人特意去做。
 dct-page = { path = "../dct-page" }
@@ -23,6 +26,11 @@ serde_json = "1"
 sha2 = "0.10"
 # 发布密钥由 `dct-srv key add` 当场生成，必须来自系统随机数（同 `dct` 的 getrandom 用法）。
 getrandom = "0.2"
+# relay-keys 文件（issuer 公钥）和 `token keygen`/`token mint` 落盘的都是 base64。
+base64 = "0.22"
+# `token keygen`/`token mint` 只在这里签 issuer 令牌，要点名 `dct_mesh::relay_token::issue`
+# 要的 `SigningKey` 类型（版本跟 dct-mesh 保持一致）。
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
