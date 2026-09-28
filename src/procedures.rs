@@ -18,8 +18,9 @@ const MAX_WINDOW: u64 = 24 * 3600;
 
 pub trait Dcv {
     fn show(&self, full_name: &str) -> Result<serde_json::Value>;
+    /// `body_sha256` 是 show 时看到的版本：dcv 会拒绝确认一个已经被改过的文件。
     /// 返回 dcv 记下的 `approved_body`。
-    fn approve(&self, full_name: &str) -> Result<String>;
+    fn approve(&self, full_name: &str, body_sha256: &str) -> Result<String>;
 }
 
 pub struct RealDcv;
@@ -30,7 +31,12 @@ fn run_dcv(args: &[&str]) -> Result<serde_json::Value> {
     crate::sys::proc::no_console(&mut c);
     let out = c.output().context("找不到 dcv 命令")?;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        // 带 --json 时 dcv 把错误写在 stdout 的 `error` 里，stderr 可能是空的。
+        let from_json = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(String::from));
+        let msg = from_json.unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_string());
+        bail!("{msg}");
     }
     serde_json::from_slice(&out.stdout).context("dcv 的回复读不懂")
 }
@@ -39,8 +45,8 @@ impl Dcv for RealDcv {
     fn show(&self, full_name: &str) -> Result<serde_json::Value> {
         run_dcv(&["show", full_name, "--json"])
     }
-    fn approve(&self, full_name: &str) -> Result<String> {
-        let v = run_dcv(&["approve", full_name, "--json"])?;
+    fn approve(&self, full_name: &str, body_sha256: &str) -> Result<String> {
+        let v = run_dcv(&["approve", full_name, "--sha", body_sha256, "--json"])?;
         v["approved_body"].as_str().map(String::from).ok_or_else(|| anyhow!("dcv 没有回 approved_body"))
     }
 }
@@ -272,7 +278,7 @@ pub fn approve(
     let user = keys.signer(SignerRole::User, se)?;
     let reason = approval_reason(full_name, &shown.steps, &proposed, &tiers, overrides);
     let signed = sign_approval(approval, &user, &reason).map_err(|e| anyhow!("{e}"))?;
-    let approved_body = dcv.approve(full_name).with_context(|| format!("确认流程 {full_name} 失败"))?;
+    let approved_body = dcv.approve(full_name, &shown.body_sha256).with_context(|| format!("确认流程 {full_name} 失败"))?;
     if approved_body != shown.body_sha256 {
         bail!("流程在确认的过程中被改过了（看到的是 {}，dcv 确认的是 {approved_body}），这次不算，请重新看一遍再批准", shown.body_sha256);
     }
@@ -495,13 +501,15 @@ mod tests {
         show: RefCell<serde_json::Value>,
         approved_body: RefCell<String>,
         approve_calls: Cell<u32>,
+        approve_sha: RefCell<String>,
     }
     impl Dcv for FakeDcv {
         fn show(&self, _: &str) -> Result<serde_json::Value> {
             Ok(self.show.borrow().clone())
         }
-        fn approve(&self, _: &str) -> Result<String> {
+        fn approve(&self, _: &str, body_sha256: &str) -> Result<String> {
             self.approve_calls.set(self.approve_calls.get() + 1);
+            *self.approve_sha.borrow_mut() = body_sha256.to_string();
             Ok(self.approved_body.borrow().clone())
         }
     }
@@ -539,6 +547,7 @@ mod tests {
                 show: RefCell::new(edit_bio(false)),
                 approved_body: RefCell::new(format!("sha256:{}", "ab".repeat(32))),
                 approve_calls: Cell::new(0),
+                approve_sha: RefCell::new(String::new()),
             },
             approvals: Approvals::at(d.path().join("approvals")),
             keys,
@@ -565,6 +574,8 @@ mod tests {
             vec![Tier::SelfOnly, Tier::SelfOnly, Tier::SelfOnly, Tier::Content]
         );
         assert_eq!(sa.approval.steps_sha256, STEPS_A);
+        // dcv 只肯确认它刚给我们看的那一版：approve 必须带上 show 时的 body_sha256。
+        assert_eq!(*w.dcv.approve_sha.borrow(), format!("sha256:{}", "ab".repeat(32)));
         assert_eq!(w.dcv.approve_calls.get(), 1);
         let reasons = w.se.reasons.borrow();
         assert!(reasons[0].contains("social:edit-bio") && reasons[0].contains("保存"), "{reasons:?}");
