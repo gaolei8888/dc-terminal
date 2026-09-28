@@ -8,3 +8,4 @@
 pub mod canon;
 pub mod steps;
 pub mod tier;
+pub mod ticket;
