@@ -49,7 +49,7 @@ mod tests {
         }
     }
 
-    // 三组用例来自 dcv（dc-vault 会话用独立的 Python 实现算出，dct 这边另算一遍核对过）。
+    // A–D 四组用例来自 dcv（dc-vault 会话用独立的 Python 实现算出，dct 这边另算一遍核对过）。
 
     #[test]
     fn case_a_chinese_and_steps_without_done_marks() {
@@ -91,6 +91,23 @@ mod tests {
             steps_sha256(&params, &steps),
             "sha256:014dba248173199af5e3c250d123137720811f3bae1594a3a4a3a188579fc1c0"
         );
+    }
+
+    // 用例 D：dcv 2.1 的 read_value（「标签 → 指标名」）。算法没变，只是新动作词。
+    #[test]
+    fn case_d_read_value_steps() {
+        let params = vec!["account".to_string()];
+        let steps = vec![
+            step(1, "open_app", "X", None),
+            step(2, "navigate_by_intent", "搜索 → {account} → 主页", None),
+            step(3, "read_value", "「关注者」 → followers", Some("主页上显示「关注者」")),
+            step(4, "read_value", "正在关注 → following", None),
+        ];
+        assert_eq!(
+            steps_sha256(&params, &steps),
+            "sha256:27e24c912984ad0ed99db4ba066db17cb3e7e667d70913532d9960329d147912"
+        );
+        assert!(steps.iter().filter(|s| s.action == "read_value").all(|s| crate::tier::tier_for_step(&s.action, &s.arg) == crate::tier::Tier::Read));
     }
 
     #[test]
