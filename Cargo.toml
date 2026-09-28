@@ -3,7 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
-members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv"]
+members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain"]
 
 [package]
 name = "dct"
@@ -13,10 +13,13 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 # 跟中转服务共用的信封。`dct` 和 `dct-srv` 谁也不依赖谁，共同依赖这个。
 dct-link = { path = "crates/dct-link" }
 # 手机端那一页网页。放在共享 crate 里是因为中转也要发同一份——见那边的注释。
 dct-page = { path = "crates/dct-page" }
+# 定档、执行票、签名核对。dct 和 dco 的安卓 App 共用，只写一份——见 crates/dct-brain 的模块说明。
+dct-brain = { path = "crates/dct-brain" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,6 +52,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 [dev-dependencies]
 rqrr = "0.10.1"
 tempfile = "3"
+dct-brain = { path = "crates/dct-brain", features = ["soft-signer"] }
 
 # TLS 后端按平台分叉。
 #

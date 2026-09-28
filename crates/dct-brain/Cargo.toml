@@ -1,0 +1,17 @@
+[package]
+name = "dct-brain"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+# 软件钥匙：只给测试用，冒充安全芯片。正式构建不打开。
+soft-signer = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+# 纯 Rust 的 P-256 ECDSA，没有 C。安全芯片和手机 passkey 签出来的都是这条曲线。
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
