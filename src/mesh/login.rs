@@ -22,6 +22,9 @@ pub const RELAY_TOKEN_KEY: &str = "__relay__";
 /// 令牌的过期时间（unix 秒，十进制字符串），存在 `RELAY_TOKEN_KEY` 旁边。
 pub const RELAY_TOKEN_EXP_KEY: &str = "__relay_exp__";
 
+/// 换令牌用的是哪个 profile 的 `api_key`：DC 配对拿到的那一把。
+pub const DC_PROFILE: &str = "dc";
+
 /// 一天的秒数。`needs_renewal` 的阈值。
 const ONE_DAY_SECS: u64 = 24 * 60 * 60;
 
@@ -76,6 +79,88 @@ pub fn fetch_token(
 /// `saturating_sub` 把它归到「剩 0 秒」，同样小于一天。
 pub fn needs_renewal(exp: u64, now: u64) -> bool {
     exp.saturating_sub(now) < ONE_DAY_SECS
+}
+
+/// 生产路径的 `Transport`：真打 `ureq`。**测试不走这里**（仓库规矩：测试
+/// 不碰网络），`fetch_token`/`renew_if_due` 的测试都注入假的。
+pub fn http_transport(url: &str, bearer: &str, body: &str) -> Result<(u16, String), String> {
+    let agent = crate::sys::tls::agent_builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    match agent
+        .post(url)
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .set("Content-Type", "application/json")
+        .send_string(body)
+    {
+        Ok(r) => {
+            let code = r.status();
+            Ok((code, r.into_string().unwrap_or_default()))
+        }
+        Err(ureq::Error::Status(code, r)) => Ok((code, r.into_string().unwrap_or_default())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `renew_if_due` 做了什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Renewal {
+    /// 还剩一天以上，什么都没做。
+    NotDue,
+    /// 换到了新令牌：内存里那一格和 secrets 都换了。
+    Renewed,
+    /// 该换没换成。**旧令牌原样留着**，能用到它过期为止。
+    Failed(String),
+}
+
+/// 令牌剩不到一天就跟网关换一张新的。在连接线程上调（它会打网络），
+/// **不在 tick 上**。
+///
+/// 过期时间读不到（没存、存坏了）当成已经过期：宁可多换一次，也不要拿着
+/// 一张不知道什么时候作废的令牌一直用到被中转拒掉。
+///
+/// 打网络的那一段**不攥着 secrets 的锁**：一次 HTTP 最长十几秒，那段时间里
+/// 界面问密钥页、配对落盘都要这把锁。
+pub fn renew_if_due(
+    secrets: &std::sync::Mutex<crate::secrets::SecretStore>,
+    token: &crate::link::Token,
+    origin: Option<&str>,
+    endpoint: &str,
+    now: u64,
+    send: Transport,
+) -> Renewal {
+    let api_key = {
+        let s = secrets.lock().unwrap_or_else(|e| e.into_inner());
+        let exp = s
+            .get(RELAY_TOKEN_EXP_KEY)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if !needs_renewal(exp, now) {
+            return Renewal::NotDue;
+        }
+        match s.get(DC_PROFILE) {
+            Some(k) => k.to_string(),
+            None => return Renewal::Failed("没有 DC 账号的密钥，续不了中转令牌".into()),
+        }
+    };
+    let Some(origin) = origin else {
+        return Renewal::Failed("找不到 DC 网关的地址，续不了中转令牌".into());
+    };
+    let (new_token, exp) = match fetch_token(origin, &api_key, endpoint, send) {
+        Ok(v) => v,
+        Err(e) => return Renewal::Failed(e),
+    };
+    token.set(new_token.clone());
+    let mut s = secrets.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = s
+        .set(RELAY_TOKEN_KEY, &new_token)
+        .and_then(|_| s.set(RELAY_TOKEN_EXP_KEY, &exp.to_string()));
+    match saved {
+        Ok(()) => Renewal::Renewed,
+        // 内存里已经换上了，这次进程里照样能用；下次启动会发现过期时间还是
+        // 旧的，再换一次。
+        Err(e) => Renewal::Failed(format!("新令牌存不下：{e}")),
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +298,100 @@ mod tests {
     #[test]
     fn needs_renewal_is_false_with_plenty_of_time_left() {
         assert!(!needs_renewal(1_000_000, 0));
+    }
+
+    mod renewal {
+        use super::*;
+        use crate::link::Token;
+        use crate::secrets::SecretStore;
+        use std::sync::Mutex;
+
+        const NOW: u64 = 1_800_000_000;
+
+        fn secrets(
+            exp: Option<u64>,
+            dc_key: Option<&str>,
+        ) -> (tempfile::TempDir, Mutex<SecretStore>) {
+            let t = tempfile::tempdir().unwrap();
+            let mut s = SecretStore::load(&t.path().join("secrets.toml"));
+            s.set(RELAY_TOKEN_KEY, "old").unwrap();
+            if let Some(e) = exp {
+                s.set(RELAY_TOKEN_EXP_KEY, &e.to_string()).unwrap();
+            }
+            if let Some(k) = dc_key {
+                s.set(DC_PROFILE, k).unwrap();
+            }
+            (t, Mutex::new(s))
+        }
+
+        fn never(_: &str, _: &str, _: &str) -> Result<(u16, String), String> {
+            panic!("不该打网络")
+        }
+
+        #[test]
+        fn a_token_with_more_than_a_day_left_is_left_alone() {
+            let (_t, s) = secrets(Some(NOW + 2 * ONE_DAY_SECS), Some("sk"));
+            let tok = Token::new("old");
+            assert_eq!(
+                renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &never),
+                Renewal::NotDue
+            );
+            assert_eq!(tok.get(), "old");
+        }
+
+        #[test]
+        fn a_token_about_to_expire_is_renewed_in_memory_and_on_disk() {
+            let (t, s) = secrets(Some(NOW + 60), Some("sk-live"));
+            let tok = Token::new("old");
+            let fake =
+                FakeSend::returning(Ok((200, r#"{"token":"fresh","exp":1900000000}"#.into())));
+            let got = renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &fake.as_fn());
+            assert_eq!(got, Renewal::Renewed);
+            assert_eq!(tok.get(), "fresh");
+            let (url, bearer, body) = fake.last_call();
+            assert_eq!(url, "https://gw/admin/api/relay/token");
+            assert_eq!(bearer, "sk-live");
+            assert_eq!(body, r#"{"endpoint":"c-aa"}"#);
+            let disk = SecretStore::load(&t.path().join("secrets.toml"));
+            assert_eq!(disk.get(RELAY_TOKEN_KEY), Some("fresh"));
+            assert_eq!(disk.get(RELAY_TOKEN_EXP_KEY), Some("1900000000"));
+        }
+
+        #[test]
+        fn a_failed_renewal_keeps_the_old_token() {
+            let (t, s) = secrets(Some(NOW + 60), Some("sk"));
+            let tok = Token::new("old");
+            let fake = FakeSend::returning(Ok((401, String::new())));
+            let got = renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &fake.as_fn());
+            assert!(matches!(got, Renewal::Failed(_)), "{got:?}");
+            assert_eq!(tok.get(), "old");
+            let disk = SecretStore::load(&t.path().join("secrets.toml"));
+            assert_eq!(disk.get(RELAY_TOKEN_KEY), Some("old"));
+        }
+
+        #[test]
+        fn a_missing_expiry_counts_as_due() {
+            let (_t, s) = secrets(None, Some("sk"));
+            let tok = Token::new("old");
+            let fake = FakeSend::returning(Ok((200, r#"{"token":"fresh","exp":1}"#.into())));
+            let got = renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &fake.as_fn());
+            assert_eq!(got, Renewal::Renewed);
+        }
+
+        #[test]
+        fn no_dc_key_or_no_origin_fails_without_touching_the_network() {
+            let (_t, s) = secrets(Some(NOW), None);
+            let tok = Token::new("old");
+            assert!(matches!(
+                renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &never),
+                Renewal::Failed(_)
+            ));
+            let (_t2, s2) = secrets(Some(NOW), Some("sk"));
+            assert!(matches!(
+                renew_if_due(&s2, &tok, None, "c-aa", NOW, &never),
+                Renewal::Failed(_)
+            ));
+            assert_eq!(tok.get(), "old");
+        }
     }
 }

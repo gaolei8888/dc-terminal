@@ -201,6 +201,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     }
     crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
 
+    // 多电脑：secrets 里有中转令牌才起。起在自己的线程上（`link::spawn`），
+    // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
+    // 绑在这个变量上活到进程结束；Task 6/7 从这里拿 `mesh` 和 `net`。
+    let _mesh = start_mesh(socket, &secrets, &profiles_dir, mgr.journal.path());
+
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -247,6 +252,107 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// 守护进程里多电脑那一路还活着的东西。
+// `mesh`/`net` 这一步还没人读：登录、加入、留言（Task 6/7）才用得上。
+#[allow(dead_code)]
+pub(crate) struct MeshRuntime {
+    pub mesh: Arc<Mutex<crate::mesh::Mesh>>,
+    pub net: Arc<dyn crate::mesh::net::Net>,
+    pub link: crate::link::LinkHandle,
+}
+
+/// 续期失败之后多久再试。续期在令牌剩一天时就开始，一小时一次足够在过期
+/// 前试上二十几回，又不至于在网关挂掉时每 30 秒敲它一下。
+const RELAY_RENEW_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// secrets 里有中转令牌，就读出（第一次就生成）这台电脑的钥匙和名单，起一条
+/// 连中转的线程。没有令牌就什么都不做——还没 `dct login` 过。
+///
+/// 中转地址来自 `config.toml` 的 `[mesh] relay`，默认 `mesh::DEFAULT_RELAY`。
+/// 那个地址上线前连不上：`Link::run` 按退避一直重试，不报错、不刷屏。
+fn start_mesh(
+    socket: &Path,
+    secrets: &Arc<Mutex<SecretStore>>,
+    profiles_dir: &Path,
+    journal_path: Option<PathBuf>,
+) -> Option<MeshRuntime> {
+    use crate::mesh::login::{self, Renewal, DC_PROFILE, RELAY_TOKEN_KEY};
+
+    let token = recover(secrets.lock()).get(RELAY_TOKEN_KEY)?.to_string();
+
+    let journal = Arc::new(crate::journal::Journal::new());
+    if let Some(p) = journal_path {
+        journal.set_path(p);
+    }
+    let store = crate::mesh::store::Store::at(crate::mesh::store::dir_for_socket(socket));
+    let mesh = match crate::mesh::Mesh::load(store) {
+        Ok(m) => m.with_journal(journal.clone()),
+        Err(e) => {
+            journal.mesh(&format!("not_started err={e}"));
+            return None;
+        }
+    };
+    let endpoint = mesh.endpoint().to_string();
+    let Ok(endpoint_id) = dct_link::EndpointId::new(endpoint.clone()) else {
+        // `endpoint_for` 算出来的恒合法；走到这里说明那边的格式变了。
+        journal.mesh("not_started err=bad_endpoint");
+        return None;
+    };
+
+    let relay = crate::config::Config::load(&crate::config::config_path_for_socket(socket))
+        .mesh
+        .relay();
+    let cfg = crate::link::LinkConfig::new(relay, endpoint_id, token);
+
+    let mesh = Arc::new(Mutex::new(mesh));
+    let net: Arc<dyn crate::mesh::net::Net> = Arc::new(crate::mesh::net::LinkNet::new(cfg.clone()));
+
+    let renew = {
+        let secrets = secrets.clone();
+        let token = cfg.token.clone();
+        let origin = pair_origin(profiles_dir, DC_PROFILE);
+        let journal = journal.clone();
+        let last_failure: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        Arc::new(move || {
+            let mut last = recover(last_failure.lock());
+            if last.is_some_and(|t| t.elapsed() < RELAY_RENEW_RETRY) {
+                return;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match login::renew_if_due(
+                &secrets,
+                &token,
+                origin.as_deref(),
+                &endpoint,
+                now,
+                &login::http_transport,
+            ) {
+                Renewal::NotDue => {}
+                Renewal::Renewed => {
+                    *last = None;
+                    journal.mesh("relay_token_renewed");
+                }
+                // 记一条就接着用旧令牌：它可能还有将近一天。
+                Renewal::Failed(e) => {
+                    *last = Some(std::time::Instant::now());
+                    journal.mesh(&format!("relay_token_renewal_failed {e}"));
+                }
+            }
+        }) as crate::link::BeforePoll
+    };
+
+    let link = crate::link::Link::with_handler(cfg, crate::mesh::route(mesh.clone(), None))
+        .before_poll(renew);
+    Some(MeshRuntime {
+        mesh,
+        net,
+        link: crate::link::spawn(link),
+    })
 }
 
 /// 守护进程刚起来（或者刚被 `run_with_manager` 构造出来）时，手机通知该
@@ -3550,5 +3656,132 @@ mod web_tests {
             .to_string();
         assert_eq!(first, second, "关了再开换了令牌，扫过码的手机全掉线");
         web_disable(Some(&web));
+    }
+}
+
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+    use crate::mesh::login::{RELAY_TOKEN_EXP_KEY, RELAY_TOKEN_KEY};
+    use std::io::Read as _;
+    use std::time::Instant;
+
+    /// 一个只会回「这一轮没东西」的假中转，记下每次轮询带来的 `AuthFrame`。
+    fn fake_relay() -> (String, Arc<Mutex<Vec<dct_link::AuthFrame>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                if line.contains(dct_link::PATH_POLL) {
+                    if let Ok(a) = serde_json::from_slice(&body) {
+                        s.lock().unwrap().push(a);
+                    }
+                }
+                let payload = r#"{"envelope":null}"#;
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn home() -> (tempfile::TempDir, PathBuf, Arc<Mutex<SecretStore>>) {
+        let t = tempfile::tempdir().unwrap();
+        let socket = t.path().join("daemon.sock");
+        let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path_for_socket(
+            &socket,
+        ))));
+        (t, socket, secrets)
+    }
+
+    #[test]
+    fn no_relay_token_means_no_mesh_and_nothing_on_disk() {
+        let (t, socket, secrets) = home();
+        assert!(start_mesh(&socket, &secrets, &t.path().join("profiles"), None).is_none());
+        assert!(
+            !crate::mesh::store::dir_for_socket(&socket).exists(),
+            "没登录过就不该生成钥匙"
+        );
+    }
+
+    /// 有令牌就真的连上中转：从 `config.toml` 读地址，拿本机钥匙算出来的
+    /// 端点和 secrets 里的令牌去轮询。
+    #[test]
+    fn a_relay_token_starts_a_real_connection_with_this_machines_endpoint() {
+        let (t, socket, secrets) = home();
+        let (relay, seen) = fake_relay();
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            format!("[mesh]\nrelay = \"{relay}\"\n"),
+        )
+        .unwrap();
+        {
+            let mut s = secrets.lock().unwrap();
+            s.set(RELAY_TOKEN_KEY, "relay-tok").unwrap();
+            // 还剩很久：这条测试里续期不该去打网关。
+            s.set(RELAY_TOKEN_EXP_KEY, &u64::MAX.to_string()).unwrap();
+        }
+
+        let rt = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).expect("该起来");
+        let endpoint = rt.mesh.lock().unwrap().endpoint().to_string();
+        assert!(endpoint.starts_with("c-"));
+        let dir = crate::mesh::store::dir_for_socket(&socket);
+        assert!(dir.join("sign.key").exists() && dir.join("kx.key").exists());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let auth = loop {
+            if let Some(a) = seen.lock().unwrap().first().cloned() {
+                break a;
+            }
+            assert!(Instant::now() < deadline, "没等到轮询");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        rt.link.stop();
+        assert_eq!(auth.endpoint.as_str(), endpoint);
+        assert_eq!(auth.token, "relay-tok");
+        assert_eq!(auth.kind, dct_link::EndpointKind::Computer);
+    }
+
+    /// 重启之后还是同一台电脑：端点由落盘的钥匙决定。
+    #[test]
+    fn a_restarted_daemon_keeps_its_endpoint() {
+        let (t, socket, secrets) = home();
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            "[mesh]\nrelay = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        secrets.lock().unwrap().set(RELAY_TOKEN_KEY, "t").unwrap();
+        let a = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).unwrap();
+        let b = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).unwrap();
+        a.link.stop();
+        b.link.stop();
+        assert_eq!(
+            a.mesh.lock().unwrap().endpoint(),
+            b.mesh.lock().unwrap().endpoint()
+        );
     }
 }
