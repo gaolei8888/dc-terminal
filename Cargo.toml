@@ -13,6 +13,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 # 跟中转服务共用的信封。`dct` 和 `dct-srv` 谁也不依赖谁，共同依赖这个。
 dct-link = { path = "crates/dct-link" }
 # 手机端那一页网页。放在共享 crate 里是因为中转也要发同一份——见那边的注释。

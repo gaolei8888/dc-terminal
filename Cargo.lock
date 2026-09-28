@@ -335,6 +335,7 @@ name = "dct"
 version = "0.2.18"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "dct-brain",
  "dct-link",

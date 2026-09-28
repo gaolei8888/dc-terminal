@@ -210,6 +210,12 @@ pub fn verify(st: &SignedTicket, trusted: &[TrustedKey], device: &str, now: u64)
     Ok(())
 }
 
+/// 测试用：对任意消息签一个 `Signature`，好在 crate 外面验证 `Signer` 的实现。
+#[cfg(any(test, feature = "soft-signer"))]
+pub fn make_signature_for_tests(s: &dyn Signer, msg: &[u8]) -> Signature {
+    make_signature(s, msg, "").expect("sign")
+}
+
 /// 软件钥匙：只给测试用，冒充安全芯片。正式构建里没有这个模块。
 #[cfg(any(test, feature = "soft-signer"))]
 pub mod soft {
