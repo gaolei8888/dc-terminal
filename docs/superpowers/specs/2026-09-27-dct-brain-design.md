@@ -131,6 +131,61 @@ dct：核对签名 → 把票连同签名交给 dco → dco 再验一次 → 执
 - **提前批准，到点执行**：明早 9 点发的视频，今晚就能批。票上写「最早 9:00、最晚 11:00」，dco 早于 9 点不做，过了 11 点作废。卡片的 30 分钟指的是「等用户批准」的时限，跟票上的执行时间窗是两回事。
 - **运行统计放在 dct**：哪些流程老失败、哪个平台可能改版了，用来提醒「TikTok 发布流程可能要重新学」。不写进 dcv。
 
+**暂停、急停，和给菜单栏读的状态**（用户定，2026-09-28）
+
+小白的入口改成**菜单栏小程序 + 本机网页**（dc_desktop 目前没有上线计划）。菜单栏小程序和安装包放在新仓库 dc-local，由 dco 那边做；它只读三方公开的状态、转发按钮，自己不做判断。本机网页由谁托管（dcv 的网页、dct 的卡片、dc-local），三方以后一起定。dct 的会话列表、日志这类开发者的东西不进菜单，留在 TUI。
+
+dct 给外部的接口是**命令行 + JSON**，不让外部直接讲守护进程的 socket 协议——那是内部协议，带版本握手，dct 一升级外部程序就会坏。命令自己去连守护进程。
+
+- `dct status --json`：
+  ```json
+  {
+    "schema_version": 1,
+    "daemon": "up",
+    "paused": false,
+    "paused_by": null,
+    "sessions": {"busy": 1, "idle": 2, "total": 3},
+    "queue": [{"id": "…", "title": "发《…》到 TikTok", "account": "@gaoleiai",
+               "earliest": "2026-09-29T09:00:00+08:00", "latest": "2026-09-29T11:00:00+08:00"}],
+    "next_at": "2026-09-29T09:00:00+08:00",
+    "cards_pending": 2,
+    "cards_expiring_soon": 1,
+    "attention": [
+      {"level": "red", "kind": "dct.account_held", "text": "TikTok @gaoleiai 出现验证码，已暂停到明早 9:00",
+       "until": "2026-09-29T09:00:00+08:00", "open": "schedule"}
+    ]
+  }
+  ```
+  - `attention` 是「要用户注意的事」，dct 已经判断好、按用户语言写好，菜单只管取 `level` 最高的显示和弹通知，不认识每种 `kind` 也能用。`kind` 带来源前缀（`dct.` / `dco.`），`level` 只有 `red` / `yellow`；菜单合并三方时 red 优先、同级取最新。第一批 `kind`：
+    - `dct.keys_unavailable`（红）：签票钥匙没设置、Touch ID 用不了、锁屏时自动钥匙签不了——这时自动任务会全部失败；
+    - `dct.account_held`（红/黄）：某账号被风控暂停，来自 dco 报回的 `risk_control`；
+    - `dct.procedure_failing`（黄）：同一流程连续失败 3 次已停，「可能要重新教」；
+    - `dct.quota_blocked`（黄）：防封号额度用完，导致有任务排不进去（平时的剩余额度只在安排页显示，不进菜单）。
+  - 正常的状态不进 `attention`：钥匙好好的就什么都不显示。
+  - `cards_expiring_soon`：10 分钟内过期的卡片数，菜单并进「等你确认」那一行。
+  - 守护进程没起来时照样退出码 0，只输出 `{"schema_version": 1, "daemon": "down"}`，不吐报错（旧守护进程的情况同样处理，不能像 `ps/stop/kill/prune` 那样吐原始错误）。
+  - `paused_by` 取 `null` / `"user"` / `"dco_halt"`，菜单上据此显示「你暂停的」还是「急停带停的」。
+  - 字段只加不改；要改含义就升 `schema_version`。
+  - 调用方每 5–10 秒查一次就够。要推送时再加 `--watch`（一行一个 JSON），第一版不做。
+- `dct auto pause` / `dct auto resume`：幂等，重复按不报错；输出同 `dct status --json` 的新状态。
+
+**暂停时 dct 做什么**
+- **不再签新票**，自动签的 `self` 票、`physical` 票也不签。
+- **队列挂起**，不派发。
+- **已经签出去的票，dco 在急停或暂停期间一律拒绝执行**（dco 那边实现）。
+- **恢复后不补做**：票上的执行时间窗照常走，过了「最晚」的票作废，重新排；不会一口气补发，那样会撞上面的次数上限。
+- **不动 agent 会话**：claude / codex 这些 PTY 会话照常跑，暂停只管自动任务。
+- **暂停状态写到磁盘**，守护进程重启后还是暂停——往安全的一边偏。
+
+**和 dco 急停怎么联动**
+- dco 急停**不依赖 dct**，dct 不在线也照样停。
+- dco 急停时，dct 读到后**自动进入暂停**（`paused_by: "dco_halt"`）。
+- **恢复两边各自解除**：dct 恢复不会顺带解除 dco 的急停，dco 恢复也不会自动解除 dct 的暂停——免得一次误操作解开两道锁。
+- 菜单上的「急停」一次按到底：dc-local 先调 dco 急停，再调 `dct auto pause`。
+- dco 的工具名和状态格式（halt / resume / status.activity / run_status）等 dco 急停做完后补进来。
+
+这几条命令跟排程、卡片一起实现；在那之前 `dct status --json` 只能给出守护进程和会话这几项。
+
 ## 5. 从纠正里学
 
 | 来源 | 记成什么 | 什么时候生效 |
@@ -159,6 +214,16 @@ dct：核对签名 → 把票连同签名交给 dco → dco 再验一次 → 执
   - 每次运行有编号，能取消，有超时。
   - 能查状态：运行中、需要帮助、被挡住、完成。dco 还没有主动推送，先由 dct 轮询。
   - `read_value` 的结果除了换算后的数，还带画面原文和位置，dct 发现异常时拿原文复核。
+- **dco 已定要做的**（用户 2026-09-28 确认，dco 路线第 ①② 步）：
+  - 状态带 `schema_version` 和 `attention` 列表，格式同第 4 节 dct 的那份；
+  - 验票被拒给原因码：`expired / not_yet / bad_sig / replay / steps_mismatch / tier_mismatch / halted / busy`，dct 据此翻成人话、决定重签还是作废；
+  - 用过的 nonce 写磁盘；一张签名覆盖一批票时只核对自己那张；已在跑流程时回 `busy`，不排队（排队归 dct）；
+  - 结果回报 `steps_sha256`，以及实际做了几个对外动作、在哪个平台哪个账号——dct 的额度按这个算，不按签了几张票算；
+  - 失败原因分类，每条带截图：`element_not_found / page_changed / login_required / risk_control / permission_missing / network / timeout / halted / ticket_rejected / unknown`。`risk_control` 让 dct 把该账号退避（第 4 节 `dct.account_held`）；
+  - 换钉住的公钥必须用用户钥匙（Touch ID / 手机 passkey）签，dct 的自动钥匙签的不认；
+  - 中转有鉴权之前，只接本机的 dct；
+  - `~/.dco/endpoint.json` 补：设备名、平台、触手、协议版本、公钥、是否急停；
+  - 预演模式（跑到最后一个对外动作前停住，截图并读回实际填写的内容，同一个 run 里等最后一张票）跟 dct 的动作卡片一起做；页面保留多久、超时怎么办，到时再定。
 - **agent 不直接连 dco**：`dct mcp` 把 dco 的能力列成工具，agent 调用时 dct 在中间定档、签票，agent 手里永远没有钥匙。
 
 ## 7. 示范一遍，系统学会（用户提出，2026-09-27）

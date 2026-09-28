@@ -376,7 +376,7 @@
   // 信封的版本。**必须跟 `dct-link` 的 `LINK_VERSION` 一样**，对不上中转
   // 会当场说 VersionMismatch。有一条守卫盯着这两个数字（在 `dct-srv` 的
   // 测试里，那是唯一同时够得着这一页和那个常量的地方）。
-  var LINK_VERSION = 3;
+  var LINK_VERSION = 4;
 
   // payload 是**字节**，不是文本（第二期那里是密文）。所以走 base64，而且
   // 要先按 UTF-8 编码——`btoa` 只认每个码位都小于 256 的字符串，直接喂中文

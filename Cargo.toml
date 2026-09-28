@@ -3,7 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
-members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain"]
+members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh"]
 
 [package]
 name = "dct"
@@ -20,6 +20,8 @@ dct-link = { path = "crates/dct-link" }
 dct-page = { path = "crates/dct-page" }
 # 定档、执行票、签名核对。dct 和 dco 的安卓 App 共用，只写一份——见 crates/dct-brain 的模块说明。
 dct-brain = { path = "crates/dct-brain" }
+# 多机之间通过中转互相认识：机器 id、6 位核对码、机器钥匙、签过名的组名单。
+dct-mesh = { path = "crates/dct-mesh" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

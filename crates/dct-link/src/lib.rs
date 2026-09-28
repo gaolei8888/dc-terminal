@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 /// 免费的；等真有人在用了，免费的就只剩后悔。
 ///
 /// 3 = 多了 `/link/ask`（发一个信封、挂着等配对的答复）和 `LinkError::NoAnswer`。
-pub const LINK_VERSION: u32 = 3;
+///
+/// 4 = 令牌要验、`/link/peers`。
+pub const LINK_VERSION: u32 = 4;
 
 /// 长轮询：**我有什么要收的吗**。请求体就是 `AuthFrame`。
 pub const PATH_POLL: &str = "/link/poll";
@@ -60,6 +62,11 @@ pub const PATH_SEND: &str = "/link/send";
 ///
 /// 中转依然不看 payload：配对只用信封上的 `to` 和 `seq`。
 pub const PATH_ASK: &str = "/link/ask";
+
+/// 在线是谁：跟自己同账号、在线、不是自己的端点。请求体是 `AuthFrame`，
+/// 答复体是 `PeersResponse`。别的账号的端点**不出现在名单里**，就像它们
+/// 压根不在线——这份名单不该让人靠"列出来了/没列出来"反推别的账号谁在线。
+pub const PATH_PEERS: &str = "/link/peers";
 
 /// 一个 payload 最多多少字节。
 ///
@@ -226,6 +233,12 @@ pub struct SendRequest {
     pub envelope: Envelope,
 }
 
+/// `POST /link/peers` 的答复：同账号在线的其它端点，按字典序排。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersResponse {
+    pub online: Vec<EndpointId>,
+}
+
 /// 中转回坏消息时的响应体。成功不回 body（`204`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -333,7 +346,7 @@ mod tests {
         assert_eq!(
             (LINK_VERSION, shape.as_str()),
             (
-                3,
+                4,
                 r#"{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}"#
             ),
             "信封的线上形状变了。把 LINK_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -353,7 +366,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&auth).unwrap(),
-            r#"{"version":3,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
+            r#"{"version":4,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
         );
         assert_eq!(
             serde_json::to_string(&EndpointKind::Phone).unwrap(),
@@ -393,7 +406,7 @@ mod tests {
                 envelope: sample()
             })
             .unwrap(),
-            r#"{"auth":{"version":3,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
+            r#"{"auth":{"version":4,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
         );
         assert_eq!(
             serde_json::to_string(&PollResponse { envelope: None }).unwrap(),
@@ -405,6 +418,13 @@ mod tests {
             })
             .unwrap(),
             r#"{"error":"Offline"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PeersResponse {
+                online: vec![EndpointId::new("laptop-1").unwrap()]
+            })
+            .unwrap(),
+            r#"{"online":["laptop-1"]}"#
         );
     }
 

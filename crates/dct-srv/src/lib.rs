@@ -26,6 +26,7 @@
 
 mod live;
 pub use live::{Control, Live, PublicEntry};
+pub mod issuer;
 pub mod keys;
 
 use std::collections::HashMap;
@@ -38,9 +39,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dct_link::{
-    AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PollResponse, SendRequest, LINK_VERSION,
-    MAX_PAYLOAD, PATH_ASK, PATH_POLL, PATH_SEND,
+    AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PeersResponse, PollResponse,
+    SendRequest, LINK_VERSION, MAX_PAYLOAD, PATH_ASK, PATH_PEERS, PATH_POLL, PATH_SEND,
 };
+use dct_mesh::relay_token;
 use tokio::sync::mpsc;
 
 /// 一次长轮询最多挂多久。**这个数字两边共用**，理由见 `dct_link::POLL_TIMEOUT`
@@ -85,16 +87,53 @@ struct Device {
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     /// 最后一次**发起**轮询的时刻。见 `Config::presence_ttl`。
     last_poll: Instant,
+    /// 这台设备属于哪个账号。`None` = 中转没配 issuer（`Relay::new`），没人
+    /// 验过令牌，账号无从知道——这时候账号隔离和 `peers` 都不该假装认得出
+    /// 「同账号」是什么意思。
+    account: Option<String>,
+}
+
+/// 一个挂着的 `/link/ask` 提问：谁在等，等的是**谁**回、那个人是**哪个账号**。
+struct WaitSlot {
+    tx: tokio::sync::oneshot::Sender<Envelope>,
+    /// 只有这个端点发来的信封才配填这个挂号。`seq` 是发起方自己挑的号，
+    /// 光靠 `(to, seq)` 配对的话，谁都能猜一个正在用的 `seq` 把自己的信封
+    /// 塞进别人的挂号——这个字段就是防这个。
+    from: EndpointId,
+    /// 提问者验过的账号。`None` = 没配 issuer（`Relay::new`），这时候没有
+    /// 账号隔离，`send()` 那边也一样处理。回答者验过的账号必须跟这个一样，
+    /// 才轮到 `endpoint` 那条比对——两条都要对上。
+    account: Option<String>,
+    /// 这个挂号实例自己的编号。`forget()` 拿它认「这还是不是我插的那个」——
+    /// 同一个 `(endpoint, seq)` 键完全可能先被一次真实的答复消费掉、随即
+    /// 又被另一次 `ask()` 重新占用，两件事都发生在原来那次 `ask()` 决定要
+    /// `forget` 自己、却还没真正拿到锁的那条缝里。光比键不比这个号，`forget`
+    /// 就可能替一个迟到的失败清理，顺手把别人刚插进去的合法挂号也摘了。
+    id: u64,
 }
 
 /// 正挂在 `/link/ask` 上等答复的人。键是「等的是谁的、哪一个 `seq`」，
 /// 也就是答复信封上的 `to` 和 `seq`。
-type Waiting = Mutex<HashMap<(EndpointId, u64), tokio::sync::oneshot::Sender<Envelope>>>;
+type Waiting = Mutex<HashMap<(EndpointId, u64), WaitSlot>>;
 
 pub struct Relay {
     devices: Mutex<HashMap<EndpointId, Device>>,
     waiting: Waiting,
     cfg: Config,
+    /// 这个中转信任哪几个签令牌的 issuer。`None` = 不验令牌（`Relay::new`），
+    /// 只给已有测试和本机开发用——**不能**对公网开口，见 `main.rs`。
+    issuers: Option<Vec<[u8; 65]>>,
+    /// 发 `WaitSlot::id` 用的计数器。只需要「跟这个进程里其它所有挂号都
+    /// 不一样」，不需要跨进程、不需要有序——`Relaxed` 就够。
+    next_wait_id: std::sync::atomic::AtomicU64,
+}
+
+/// 当前 unix 秒——喂给 `relay_token::verify` 判断 `exp`。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Relay {
@@ -103,23 +142,49 @@ impl Relay {
             devices: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             cfg,
+            issuers: None,
+            next_wait_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// 出示凭据的人说得通吗。
-    fn check(&self, auth: &AuthFrame) -> Result<(), LinkError> {
+    /// 验令牌的中转。`issuers` 是这个中转信任的签发方公钥——任何一把验过
+    /// 就算数（见 `relay_token::verify`）。**正式令牌由网关签**（任务 4 的
+    /// 契约）；这个构造函数本身对谁签的、签得对不对一无所知，光是把
+    /// `check()` 从「不验」切到「验」。
+    pub fn with_issuers(cfg: Config, issuers: Vec<[u8; 65]>) -> Self {
+        Relay {
+            devices: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            cfg,
+            issuers: Some(issuers),
+            next_wait_id: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 出示凭据的人说得通吗。验过的话，一并把令牌里的账号交回去——`poll`
+    /// 拿它记进 `Device`，`send`/`ask`/`peers` 拿它做账号隔离。`None` 有两种
+    /// 意思，调用方分不清也不需要分清：要么没配 issuer（`Relay::new`），
+    /// 要么就是没这回事——两种情况下都不该拿它去比账号。
+    fn check(&self, auth: &AuthFrame) -> Result<Option<String>, LinkError> {
         if auth.version != LINK_VERSION {
             return Err(LinkError::VersionMismatch);
         }
-        // TODO(任务 5)：`auth.token` 还没人验，`auth.kind` 也还没用上——它存在
-        // 就是为了让那时候的中转知道该拿哪个验证器去验。在那之前这个服务只
-        // 监听环回地址（见 `main.rs`）。
-        Ok(())
+        let Some(issuers) = &self.issuers else {
+            return Ok(None);
+        };
+        let claims = relay_token::verify(&auth.token, issuers, now_secs())
+            .map_err(|_| LinkError::Unauthorized)?;
+        // 令牌验得过，但它是签给别人的：出示凭据的人拿着一把不属于自己的
+        // 有效令牌，这跟令牌本身伪造是两件事，要用不同的码说清楚。
+        if claims.endpoint != auth.endpoint.as_str() {
+            return Err(LinkError::NotYours);
+        }
+        Ok(Some(claims.account))
     }
 
     /// 有我的东西吗。没有就挂着，挂到超时为止。
     pub async fn poll(&self, auth: &AuthFrame) -> Result<Option<Envelope>, LinkError> {
-        self.check(auth)?;
+        let account = self.check(auth)?;
 
         let rx = {
             let mut map = self.devices.lock().expect("device table poisoned");
@@ -128,6 +193,20 @@ impl Relay {
             let ttl = self.cfg.presence_ttl();
             map.retain(|_, d| d.last_poll.elapsed() < ttl);
 
+            // **端点抢注。** 这个 id 还在场（没被上面那次清扫收走），但这次
+            // 带来的账号跟它在场时记着的不一样——拒，而且**什么都不碰**：
+            // 不刷新 last_poll、不换账号、不碰信箱。不这样做的话，只要
+            // 另一个账号也弄得到一把写着同一个 endpoint 的合法令牌（令牌本身
+            // 没验过谁真的坐在那台设备后面，验的只是签名和 `exp`），就能在
+            // 原来那个账号的设备还在线的时候把它的账号标签改写掉——账号隔离
+            // 和 `peers` 立刻就穿了。等这个 id 自然过期（下次清扫会收走它），
+            // 才轮到新账号重新认领同一个 id。
+            if let Some(existing) = map.get(&auth.endpoint) {
+                if existing.account != account {
+                    return Err(LinkError::NotYours);
+                }
+            }
+
             let inbox = self.cfg.inbox;
             let d = map.entry(auth.endpoint.clone()).or_insert_with(|| {
                 let (tx, rx) = mpsc::channel(inbox);
@@ -135,9 +214,15 @@ impl Relay {
                     tx,
                     rx: Arc::new(tokio::sync::Mutex::new(rx)),
                     last_poll: Instant::now(),
+                    // 占位。上面那条抢注检查已经保证了：这里要么是全新的
+                    // 条目（还没有账号），要么账号跟 `account` 相等——真正
+                    // 的值统一由下面那一行写，别在两个地方各写一份、早晚
+                    // 对不上。
+                    account: None,
                 }
             });
             d.last_poll = Instant::now();
+            d.account = account.clone();
             d.rx.clone()
         };
 
@@ -153,7 +238,7 @@ impl Relay {
 
     /// 投一个信封。**不排队给不在线的人**，投不到就当场说。
     pub fn send(&self, req: &SendRequest) -> Result<(), LinkError> {
-        self.check(&req.auth)?;
+        let account = self.check(&req.auth)?;
 
         // 信封上的寄件人必须就是出示凭据的那个人。不比这一下，任何一个连得上
         // 中转的人都能冒充别人发东西——而收件方唯一能用来判断"这是谁说的"的
@@ -166,25 +251,49 @@ impl Relay {
             return Err(LinkError::TooBig);
         }
 
-        // **先看有没有人正挂着等这一封。** 走 `/link/ask` 的手机根本不轮询，
-        // 它不在设备表里；这一步要是排在在线检查后面，笔记本发回去的答复
-        // 会被判成"收件人不在线"直接丢掉，而提问的人还在那头挂着。
-        if let Some(tx) = self
-            .waiting
-            .lock()
-            .expect("waiting table poisoned")
-            .remove(&(req.envelope.to.clone(), req.envelope.seq))
+        // **先看有没有人正挂着等这一封，而且这一封确实是它等的那个人、
+        // 那个账号发的。** 走 `/link/ask` 的手机根本不轮询，它不在设备表里；
+        // 这一步要是排在在线检查后面，笔记本发回去的答复会被判成"收件人
+        // 不在线"直接丢掉，而提问的人还在那头挂着。**光匹配 `(to, seq)` 不
+        // 够**：`seq` 是发起方自己挑的号，谁都能猜一个正在用的 `seq`，塞一封
+        // 自己的信封进别人的挂号——所以还要比对 `ask()` 挂号时记下的
+        // 「该谁回」和「那是哪个账号」，两条有一条对不上就**不碰这个挂号**，
+        // 让它继续挂着，这一封改走下面普通的路由（多半会落到 `Offline`，
+        // 因为提问的人从不在设备表里）。
         {
-            // 送不进去只有一种可能：提问的人已经不等了（超时或者断开）。
-            // 那封答复就没有意义了，丢掉是对的。
-            let _ = tx.send(req.envelope.clone());
-            return Ok(());
+            let mut waiting = self.waiting.lock().expect("waiting table poisoned");
+            let key = (req.envelope.to.clone(), req.envelope.seq);
+            let fills_the_slot = waiting
+                .get(&key)
+                .map(|slot| slot.from == req.envelope.from && slot.account == account)
+                .unwrap_or(false);
+            if fills_the_slot {
+                let slot = waiting.remove(&key).expect("just matched it above");
+                drop(waiting);
+                // 送不进去只有一种可能：提问的人已经不等了（超时或者断开）。
+                // 那封答复就没有意义了，丢掉是对的。
+                let _ = slot.tx.send(req.envelope.clone());
+                return Ok(());
+            }
         }
 
         let tx = {
             let map = self.devices.lock().expect("device table poisoned");
             match map.get(&req.envelope.to) {
-                Some(d) if d.last_poll.elapsed() < self.cfg.presence_ttl() => d.tx.clone(),
+                Some(d) if d.last_poll.elapsed() < self.cfg.presence_ttl() => {
+                    // 账号隔离：只在两边都验过令牌（`account` 是 `Some`）时才
+                    // 判——`Relay::new` 从来分不清账号，不该假装能拦跨账号。
+                    // **回 `Offline`，不回 `NotYours`**：回 `NotYours` 等于
+                    // 告诉发件人「这个 id 存在、而且在线，只是不归你」——
+                    // 这就把另一个账号的设备在不在线泄露出去了。对不属于
+                    // 自己账号的收件人，说法要跟"压根没这个人"一模一样。
+                    if let Some(sender) = &account {
+                        if d.account.as_deref() != Some(sender.as_str()) {
+                            return Err(LinkError::Offline);
+                        }
+                    }
+                    d.tx.clone()
+                }
                 _ => return Err(LinkError::Offline),
             }
         };
@@ -195,6 +304,23 @@ impl Relay {
             mpsc::error::TrySendError::Closed(_) => LinkError::Offline,
         })
     }
+
+    /// 跟我同账号、在线、不是我自己的端点，按字典序排。
+    pub fn peers(&self, auth: &AuthFrame) -> Result<Vec<EndpointId>, LinkError> {
+        let account = self.check(auth)?;
+
+        let mut map = self.devices.lock().expect("device table poisoned");
+        let ttl = self.cfg.presence_ttl();
+        map.retain(|_, d| d.last_poll.elapsed() < ttl);
+
+        let mut out: Vec<EndpointId> = map
+            .iter()
+            .filter(|(ep, d)| **ep != auth.endpoint && d.account.as_deref() == account.as_deref())
+            .map(|(ep, _)| ep.clone())
+            .collect();
+        out.sort();
+        Ok(out)
+    }
 }
 
 impl Relay {
@@ -204,31 +330,64 @@ impl Relay {
     /// 哪个还没兑现的 Promise」的簿记——那份簿记要是放在页面里，就落在这个
     /// 仓库里唯一跑不了测试的地方。
     pub async fn ask(&self, req: &SendRequest) -> Result<Envelope, LinkError> {
+        // 提问者是谁、哪个账号，验在这儿——挂号里要记下来，好让 `send()`
+        // 那边知道「该谁回、那是哪个账号」，不能只靠 `(to, seq)` 配对。
+        let account = self.check(&req.auth)?;
+
+        // **必须在碰挂号表之前就比对身份。** `send()` 也会比这一下，但那时候
+        // 已经晚了——一个把 `from` 填成别人 id 的请求，要是先被允许把挂号表
+        // 插一遍，就能在 `send()` 替我们查出这一点之前，顶掉那个真正的人挂着
+        // 的挂号（见下面插入前的「绝不顶掉」注释）。
+        if req.envelope.from != req.auth.endpoint {
+            return Err(LinkError::Unauthorized);
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let key = (req.envelope.from.clone(), req.envelope.seq);
+        let id = self
+            .next_wait_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // **先挂号再投递。** 反过来的话，笔记本答得够快就会在挂号之前把答复
-        // 送到，那一封找不到人等它，于是走进设备信箱再也没人取——而提问的人
-        // 在这头一直挂到超时。这种 bug 只在快的机器上出现。
-        self.waiting
-            .lock()
-            .expect("waiting table poisoned")
-            .insert(key.clone(), tx);
+        // **先挂号再投递，而且绝不顶掉已经挂着的挂号。** 反过来（先投递）的
+        // 话，笔记本答得够快就会在挂号之前把答复送到，那一封找不到人等它，
+        // 于是走进设备信箱再也没人取——而提问的人在这头一直挂到超时，这种
+        // bug 只在快的机器上出现。**顶掉**已有挂号则是另一个方向的问题：
+        // `(endpoint, seq)` 撞上，只可能是重放、或者两个账号巧合选中了同一对
+        // 值——真撞上的话，正确的反应是让这一次的提问者知道「现在不行」
+        // （`Busy`），而不是把原来那个挂号偷偷摘掉、让它在毫无预兆的情况下
+        // 收到一句 `NoAnswer`。
+        {
+            let mut waiting = self.waiting.lock().expect("waiting table poisoned");
+            if waiting.contains_key(&key) {
+                return Err(LinkError::Busy);
+            }
+            waiting.insert(
+                key.clone(),
+                WaitSlot {
+                    tx,
+                    from: req.envelope.to.clone(),
+                    account,
+                    id,
+                },
+            );
+        }
 
         if let Err(e) = self.send(req) {
-            self.forget(&key);
+            self.forget(&key, id);
             return Err(e);
         }
 
         match tokio::time::timeout(self.cfg.poll_timeout, rx).await {
             Ok(Ok(env)) => Ok(env),
-            // 发端没了：只可能是别处把这个挂号顶掉了（同一个 seq 被用了两次）。
+            // 发端没了：只可能是一次真实的答复先一步把这个挂号取走、可它
+            // 没赶上这次超时之内送到 `rx`——留给 `forget` 去判断这个号是不是
+            // 还归我们，归我们才清。
             Ok(Err(_)) => {
-                self.forget(&key);
+                self.forget(&key, id);
                 Err(LinkError::NoAnswer)
             }
             Err(_) => {
-                self.forget(&key);
+                self.forget(&key, id);
                 Err(LinkError::NoAnswer)
             }
         }
@@ -236,11 +395,16 @@ impl Relay {
 
     /// 不等了。**必须清掉**，否则一个超时的提问会在表里留下一个永远没人
     /// 取走的挂号，而那正是这类表长成内存泄漏的方式。
-    fn forget(&self, key: &(EndpointId, u64)) {
-        self.waiting
-            .lock()
-            .expect("waiting table poisoned")
-            .remove(key);
+    ///
+    /// **只清自己插的那一个。** `id` 是插的时候发的号；表里这把键现在挂着
+    /// 的不是这个号，说明原来那个挂号已经被一次真实的答复消费、清走，
+    /// 键随后又被另一次 `ask()` 重新占用——那是**别人**刚插的、还活着的
+    /// 挂号，不能被这次迟到的 `forget` 连累着摘掉。
+    fn forget(&self, key: &(EndpointId, u64), id: u64) {
+        let mut waiting = self.waiting.lock().expect("waiting table poisoned");
+        if waiting.get(key).is_some_and(|slot| slot.id == id) {
+            waiting.remove(key);
+        }
     }
 }
 
@@ -619,6 +783,15 @@ async fn ask_route(
     Ok(Json(relay.ask(&req).await?))
 }
 
+async fn peers_route(
+    State(relay): State<Arc<Relay>>,
+    Json(auth): Json<AuthFrame>,
+) -> Result<Json<PeersResponse>, Rejected> {
+    Ok(Json(PeersResponse {
+        online: relay.peers(&auth)?,
+    }))
+}
+
 /// 中转挂哪些路由。
 ///
 /// **默认只有直播那一组，外加公开列表。** 配对信封那三条（`/link/*`）和
@@ -647,7 +820,8 @@ pub fn router(state: AppState, routes: Routes) -> Router {
             .route("/phone", get(page_route))
             .route(PATH_POLL, post(poll_route))
             .route(PATH_SEND, post(send_route))
-            .route(PATH_ASK, post(ask_route)),
+            .route(PATH_ASK, post(ask_route))
+            .route(PATH_PEERS, post(peers_route)),
     };
     app
         // 公开列表页和列表接口：谁都能读，两档都挂。
@@ -780,13 +954,32 @@ pub fn must_be_loopback(addr: std::net::SocketAddr) -> Result<(), String> {
     ))
 }
 
-/// 中转的五种启动方式。
+/// 这个地址允不允许绑。带了 `--relay-keys`（令牌要验）就放行任何地址；
+/// 没带就退回 [`must_be_loopback`]。
+///
+/// 这条判断跟 `must_be_loopback` 分开、也写在库里，理由一样：`main` 没法测，
+/// 而「公网开口的前提是有 issuer 公钥」跟「第一期只能环回」是两条不同的
+/// 判断，`--with-link` 不带 `--relay-keys` 的话公网照样要拒。
+pub fn bind_check(
+    addr: std::net::SocketAddr,
+    relay_keys: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if relay_keys.is_some() {
+        return Ok(());
+    }
+    must_be_loopback(addr)
+}
+
+/// 中转的七种启动方式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cli {
     Serve {
         addr: String,
         with_link: bool,
         publish_keys: Option<std::path::PathBuf>,
+        /// 中转信任的 issuer 公钥文件。带了它才验令牌，也才允许绑非环回
+        /// 地址——见 [`bind_check`]。
+        relay_keys: Option<std::path::PathBuf>,
     },
     KeyAdd {
         name: String,
@@ -803,24 +996,67 @@ pub enum Cli {
         id: String,
         file: std::path::PathBuf,
     },
+    /// `token keygen --out <dir>`：生成一对 issuer 钥匙，只给开发和本机
+    /// 端到端测试用——正式令牌由网关签（任务 4 的契约）。
+    TokenKeygen {
+        out: std::path::PathBuf,
+    },
+    /// `token mint --key <file> --account <a> --endpoint <e> --ttl <secs>`：
+    /// 用一把 issuer 钥匙签一个令牌，打印到标准输出。同上，只给开发用。
+    TokenMint {
+        key: std::path::PathBuf,
+        account: String,
+        endpoint: String,
+        ttl: u64,
+    },
 }
 
-/// 手写解析：五种形状，不值得为此引一个参数库。
+/// 手写解析：不值得为此引一个参数库。
 pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
+    fn flag_str<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
         match args.iter().position(|a| a == flag) {
             None => Ok(None),
             Some(i) => args
                 .get(i + 1)
                 .filter(|v| !v.starts_with("--"))
-                .map(|v| Some(v.into()))
-                .ok_or_else(|| format!("{flag} 后面要跟一个文件路径")),
+                .map(|v| Some(v.as_str()))
+                .ok_or_else(|| format!("{flag} 后面要跟一个值")),
         }
+    }
+    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(flag_str(args, flag)?.map(std::path::PathBuf::from))
     }
     let need_file = |args: &[String]| {
         flag_value(args, "--file")?.ok_or_else(|| "管理命令要写明 --file <密钥文件>".to_string())
     };
     match args.first().map(String::as_str) {
+        Some("token") => match args.get(1).map(String::as_str) {
+            Some("keygen") => Ok(Cli::TokenKeygen {
+                out: flag_value(args, "--out")?
+                    .ok_or_else(|| "token keygen 要写明 --out <目录>".to_string())?,
+            }),
+            Some("mint") => {
+                let key = flag_value(args, "--key")?
+                    .ok_or_else(|| "token mint 要写明 --key <issuer 钥匙文件>".to_string())?;
+                let account = flag_str(args, "--account")?
+                    .ok_or_else(|| "token mint 要写明 --account <账号>".to_string())?
+                    .to_string();
+                let endpoint = flag_str(args, "--endpoint")?
+                    .ok_or_else(|| "token mint 要写明 --endpoint <端点>".to_string())?
+                    .to_string();
+                let ttl = flag_str(args, "--ttl")?
+                    .ok_or_else(|| "token mint 要写明 --ttl <秒数>".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--ttl 后面要跟一个数字".to_string())?;
+                Ok(Cli::TokenMint {
+                    key,
+                    account,
+                    endpoint,
+                    ttl,
+                })
+            }
+            _ => Err("用法：dct-srv token keygen|mint ...".into()),
+        },
         Some("key") => {
             // `args.get(2)` 直接当名字用的话，`key add --file X`（漏了名字，
             // `--file` 紧跟在 `add` 后面）会把 `--file` 当成密钥的名字，
@@ -856,6 +1092,8 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
         }),
         _ => {
             let publish_keys = flag_value(args, "--publish-keys")?;
+            let relay_keys = flag_value(args, "--relay-keys")?;
+            let flags_with_values = ["--publish-keys", "--relay-keys"];
             let mut skip_next = false;
             let mut addr = None;
             for a in args {
@@ -863,7 +1101,7 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
                     skip_next = false;
                     continue;
                 }
-                if a == "--publish-keys" {
+                if flags_with_values.contains(&a.as_str()) {
                     skip_next = true;
                 } else if !a.starts_with("--") && addr.is_none() {
                     addr = Some(a.clone());
@@ -873,6 +1111,7 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
                 with_link: args.iter().any(|a| a == "--with-link"),
                 publish_keys,
+                relay_keys,
             })
         }
     }
@@ -884,6 +1123,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use dct_link::EndpointKind;
+    use dct_mesh::relay_token::{issue, Claims};
+    use p256::ecdsa::SigningKey;
     use tower::ServiceExt;
 
     fn cfg(ms: u64) -> Config {
@@ -982,7 +1223,7 @@ mod tests {
     #[tokio::test]
     async fn the_default_relay_does_not_answer_the_unauthenticated_routes() {
         let (app, _live) = app_with_live();
-        for path in [PATH_POLL, PATH_SEND, PATH_ASK, "/phone"] {
+        for path in [PATH_POLL, PATH_SEND, PATH_ASK, PATH_PEERS, "/phone"] {
             let (status, _) = post(app.clone(), path, "{}").await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path} 不该在默认中转上存在");
         }
@@ -1425,6 +1666,677 @@ mod tests {
 
         assert_eq!(q1.await.unwrap().unwrap().payload, b"first");
         assert_eq!(q2.await.unwrap().unwrap().payload, b"second");
+    }
+
+    // ——— 令牌鉴权、账号隔离、在线查询（任务 3）———
+
+    /// 一把假想的 issuer 钥匙：签名种子和它的公钥。跟
+    /// `dct_mesh::relay_token` 测试里同一个套路。
+    fn issuer(byte: u8) -> (SigningKey, [u8; 65]) {
+        let sk = SigningKey::from_slice(&[byte.max(1); 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let mut pk = [0u8; 65];
+        pk.copy_from_slice(point.as_bytes());
+        (sk, pk)
+    }
+
+    /// 签一个还没过期的令牌（`exp` 是很远的未来，不会在测试跑的这几毫秒里过期）。
+    fn token_for(sk: &SigningKey, account: &str, endpoint: &str) -> String {
+        issue(
+            &Claims {
+                account: account.into(),
+                endpoint: endpoint.into(),
+                exp: 4_000_000_000,
+            },
+            sk,
+        )
+    }
+
+    /// 同一个 `AuthFrame`，只是把 `token` 换成给定的那个。
+    fn authed(who: &str, token: String) -> AuthFrame {
+        AuthFrame { token, ..auth(who) }
+    }
+
+    #[tokio::test]
+    async fn with_issuers_a_missing_or_forged_token_is_unauthorized() {
+        let (_sk, pk) = issuer(1);
+        let (forged_sk, _forged_pk) = issuer(2);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]);
+
+        // `auth("b")` 默认带的是 `"t"`，压根不是这个格式的令牌。
+        assert_eq!(relay.poll(&auth("b")).await, Err(LinkError::Unauthorized));
+
+        // 另一个 issuer 签的——不在这个中转信任的名单里。
+        let forged = token_for(&forged_sk, "acct", "b");
+        assert_eq!(
+            relay.poll(&authed("b", forged)).await,
+            Err(LinkError::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_for_another_endpoint_is_not_yours() {
+        let (sk, pk) = issuer(1);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]);
+        // 令牌验得过，但它是签给 "someone-else" 的，不是出示这令牌的 "b"。
+        let token = token_for(&sk, "acct", "someone-else");
+        assert_eq!(
+            relay.poll(&authed("b", token)).await,
+            Err(LinkError::NotYours)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_unauthorized() {
+        let (sk, pk) = issuer(1);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]);
+        let expired = issue(
+            &Claims {
+                account: "acct".into(),
+                endpoint: "b".into(),
+                exp: 1,
+            },
+            &sk,
+        );
+        assert_eq!(
+            relay.poll(&authed("b", expired)).await,
+            Err(LinkError::Unauthorized)
+        );
+    }
+
+    /// 跨账号发信：即便收件人在线，回的码也得跟"压根没这个人"一模一样。
+    /// **不能回 `NotYours`**——那等于告诉发件人"这个 id 存在，而且在线，
+    /// 只是不归你"，把另一个账号的设备在不在线泄露出去了。
+    #[tokio::test]
+    async fn envelopes_do_not_cross_accounts() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(200), vec![pk]));
+
+        // b 上线，账号是 acct-b。
+        let b_token = token_for(&sk, "acct-b", "b");
+        assert_eq!(relay.poll(&authed("b", b_token)).await, Ok(None));
+
+        // a 是另一个账号，发给 b：即便 b 在线，回的码也得跟发给一个从没
+        // 出现过的 id 一样。
+        let a_token = token_for(&sk, "acct-a", "a");
+        let mut cross = letter("a", "b", b"x");
+        cross.auth = authed("a", a_token);
+        assert_eq!(relay.send(&cross), Err(LinkError::Offline));
+    }
+
+    /// **挂号只该填给它等的那个人、那个账号。** `(to, seq)` 光凭发起方自己
+    /// 挑的号配对是不够的——`seq` 猜得中，账号或者 endpoint 对不上的信封
+    /// 就该完全碰不到这个挂号，落到普通路由（多半是 `Offline`，因为提问的
+    /// 人从不注册成设备）。三段都要测到：账号不对不行，endpoint 不对不行，
+    /// 两个都对了才行。
+    #[tokio::test]
+    async fn ask_reply_slot_only_fills_for_the_asked_endpoint_and_its_account() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        // laptop（账号 acct-a）先上线，好让下面那个问题真的送得出去。
+        let laptop_token = token_for(&sk, "acct-a", "laptop");
+        {
+            let r = relay.clone();
+            let a = authed("laptop", laptop_token.clone());
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("laptop 挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id("laptop"))
+        })
+        .await;
+
+        let asker_token = token_for(&sk, "acct-a", "phone:1");
+        let asking = SendRequest {
+            auth: authed("phone:1", asker_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 7,
+                payload: b"q".to_vec(),
+                recipients: vec![],
+            },
+        };
+        let r = relay.clone();
+        let asked = tokio::spawn(async move { r.ask(&asking).await });
+        until("挂号建立", || relay.waiting.lock().unwrap().len() == 1).await;
+
+        // 1) 账号不对：签的 endpoint 也是 "laptop"，但账号是另一个。
+        let wrong_account_token = token_for(&sk, "acct-b", "laptop");
+        let forged_account = SendRequest {
+            auth: authed("laptop", wrong_account_token),
+            envelope: Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 7,
+                payload: b"forged-account".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(
+            relay.send(&forged_account),
+            Err(LinkError::Offline),
+            "账号不对不该填这个挂号"
+        );
+        assert_eq!(relay.waiting.lock().unwrap().len(), 1, "挂号应该还在");
+
+        // 2) 账号对，但不是被问的那个 endpoint。
+        let other_token = token_for(&sk, "acct-a", "other-device");
+        let wrong_from = SendRequest {
+            auth: authed("other-device", other_token),
+            envelope: Envelope {
+                from: id("other-device"),
+                to: id("phone:1"),
+                seq: 7,
+                payload: b"forged-from".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(
+            relay.send(&wrong_from),
+            Err(LinkError::Offline),
+            "endpoint 不对不该填这个挂号"
+        );
+        assert_eq!(relay.waiting.lock().unwrap().len(), 1, "挂号应该还在");
+
+        // 3) 真正的回答：endpoint 和账号都对，挂号被填上，`ask()` 拿到它。
+        let real = SendRequest {
+            auth: authed("laptop", laptop_token),
+            envelope: Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 7,
+                payload: b"real-answer".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(relay.send(&real), Ok(()));
+
+        let got = asked.await.unwrap().unwrap();
+        assert_eq!(got.payload, b"real-answer");
+    }
+
+    /// **挂号必须在碰挂号表之前就验身份。** `ask()` 以前是先把挂号插进表里、
+    /// 再靠 `send()` 去发现 `from` 是伪造的——插的那一下要是撞上了受害者
+    /// 正挂着的键（`(to, seq)`，没有账号参与配对），会把受害者的挂号直接
+    /// 顶掉：受害者的 `rx` 那头因为 sender 被丢弃立刻收到一个 `NoAnswer`，
+    /// 而真正的答复后来一到，挂号已经不在了，只能落到 `Offline`。
+    #[tokio::test]
+    async fn a_forged_from_cannot_hijack_someone_elses_pending_ask() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        // laptop（账号 acct-a）先上线，好让受害者真正的问题送得出去。
+        let laptop_token = token_for(&sk, "acct-a", "laptop");
+        {
+            let r = relay.clone();
+            let a = authed("laptop", laptop_token.clone());
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("laptop 挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id("laptop"))
+        })
+        .await;
+
+        // 受害者：phone:1（账号 acct-a）问 laptop，seq=7，挂着等答复。
+        let victim_token = token_for(&sk, "acct-a", "phone:1");
+        let victim_asking = SendRequest {
+            auth: authed("phone:1", victim_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 7,
+                payload: b"victim question".to_vec(),
+                recipients: vec![],
+            },
+        };
+        let r = relay.clone();
+        let victim_asked = tokio::spawn(async move { r.ask(&victim_asking).await });
+        until("受害者的挂号建立", || {
+            relay.waiting.lock().unwrap().len() == 1
+        })
+        .await;
+
+        // 攻击者：自己的账号是 acct-evil，自己的身份是 "attacker"，但把
+        // 信封的 `from` 填成受害者的 "phone:1"，`seq` 也猜中了同一个 7，
+        // 想顶掉受害者挂着的那个挂号。
+        let attacker_token = token_for(&sk, "acct-evil", "attacker");
+        let forged_ask = SendRequest {
+            auth: authed("attacker", attacker_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 7,
+                payload: b"forged question".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(
+            relay.ask(&forged_ask).await,
+            Err(LinkError::Unauthorized),
+            "伪造的 from 该在碰挂号表之前就被拒"
+        );
+        // 受害者的挂号必须原封不动——没被攻击者的尝试顶掉。
+        assert_eq!(
+            relay.waiting.lock().unwrap().len(),
+            1,
+            "受害者的挂号不该被顶掉"
+        );
+
+        // 真正的回答到了：受害者该拿到它，不是 `NoAnswer`。
+        let real = SendRequest {
+            auth: authed("laptop", laptop_token),
+            envelope: Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 7,
+                payload: b"real answer".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(relay.send(&real), Ok(()));
+
+        let got = victim_asked.await.unwrap().unwrap();
+        assert_eq!(got.payload, b"real answer");
+    }
+
+    /// **撞键不能顶掉别人的挂号。** `(endpoint, seq)` 这个键没有账号参与
+    /// 配对——两个不同账号巧合都选中了同一个 `from` 字符串（比如都自称
+    /// "phone:1"）和同一个 `seq`，是完全合法各自持有令牌的两个人，不是
+    /// 攻击。第二个撞上的必须干脆地拿到 `Busy`，第一个的挂号继续有效。
+    #[tokio::test]
+    async fn two_askers_colliding_on_the_same_endpoint_and_seq_do_not_corrupt_each_other() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        let laptop_token = token_for(&sk, "acct-a", "laptop");
+        {
+            let r = relay.clone();
+            let a = authed("laptop", laptop_token.clone());
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("laptop 挂上轮询", || {
+            relay.devices.lock().unwrap().contains_key(&id("laptop"))
+        })
+        .await;
+
+        // 第一个提问者：账号 acct-a，自称 "phone:1"。
+        let asker1_token = token_for(&sk, "acct-a", "phone:1");
+        let asking1 = SendRequest {
+            auth: authed("phone:1", asker1_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 1,
+                payload: b"q1".to_vec(),
+                recipients: vec![],
+            },
+        };
+        let r = relay.clone();
+        let asked1 = tokio::spawn(async move { r.ask(&asking1).await });
+        until("第一个挂号建立", || {
+            relay.waiting.lock().unwrap().len() == 1
+        })
+        .await;
+
+        // 第二个提问者：不同账号 acct-b，但也合法地拿到了一把写着
+        // endpoint="phone:1" 的令牌——跟第一个撞上了同一个键。
+        let asker2_token = token_for(&sk, "acct-b", "phone:1");
+        let asking2 = SendRequest {
+            auth: authed("phone:1", asker2_token),
+            envelope: Envelope {
+                from: id("phone:1"),
+                to: id("laptop"),
+                seq: 1,
+                payload: b"q2".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(
+            relay.ask(&asking2).await,
+            Err(LinkError::Busy),
+            "键撞上了，第二个该被拒，不该把第一个顶掉"
+        );
+        assert_eq!(
+            relay.waiting.lock().unwrap().len(),
+            1,
+            "第一个的挂号还应该在"
+        );
+
+        // 第一个的挂号没受影响：真正的答复照样送得到。
+        let real = SendRequest {
+            auth: authed("laptop", laptop_token),
+            envelope: Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 1,
+                payload: b"real answer".to_vec(),
+                recipients: vec![],
+            },
+        };
+        assert_eq!(relay.send(&real), Ok(()));
+
+        let got = asked1.await.unwrap().unwrap();
+        assert_eq!(got.payload, b"real answer");
+    }
+
+    /// **`forget` 只能清自己插的那一个挂号。** 这条测试直接摆弄挂号表，
+    /// 复现一条黑盒测试够不着的竞态：一个挂号被一次真实的答复消费、从表里
+    /// 摘走，键随即被另一次 `ask()` 合法地重新占用——这两件事都发生在
+    /// 原来那次 `ask()` 决定要 `forget` 自己、却还没真正拿到锁的那条缝里。
+    /// 迟到的 `forget`（带着旧的 id）必须认得出"现在这把键上挂着的已经
+    /// 不是我插的那个了"，放过它，不能把后来者的挂号也摘了。
+    #[tokio::test]
+    async fn forget_never_removes_a_slot_it_did_not_create() {
+        let relay = Relay::new(cfg(2000)); // 只关心挂号表自己的行为，用不着令牌
+        let key = (id("phone:1"), 1u64);
+
+        // 旧挂号：已经被"一次真实的答复"消费、移出了表——原来那次 `ask()`
+        // 还不知道，稍后会拿着这个旧 id 调 `forget`。
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let old_id = 100;
+        relay.waiting.lock().unwrap().insert(
+            key.clone(),
+            WaitSlot {
+                tx: tx1,
+                from: id("laptop"),
+                account: None,
+                id: old_id,
+            },
+        );
+        relay.waiting.lock().unwrap().remove(&key);
+
+        // 键被重新占用：另一次 `ask()` 合法地插了一个新挂号，id 不一样。
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let new_id = 200;
+        relay.waiting.lock().unwrap().insert(
+            key.clone(),
+            WaitSlot {
+                tx: tx2,
+                from: id("laptop"),
+                account: None,
+                id: new_id,
+            },
+        );
+
+        // 迟到的 forget，带着旧的 id——不该碰新的这个。
+        relay.forget(&key, old_id);
+        let slot = relay.waiting.lock().unwrap().remove(&key);
+        let slot = slot.expect("新挂号被一个迟到的、属于别人的 forget 误删了");
+        assert_eq!(slot.id, new_id, "留下来的不该是旧的那个挂号");
+
+        // 新挂号照样能收到它自己的答复。
+        slot.tx
+            .send(Envelope {
+                from: id("laptop"),
+                to: id("phone:1"),
+                seq: 1,
+                payload: b"still works".to_vec(),
+                recipients: vec![],
+            })
+            .unwrap();
+        let got = rx2.await.unwrap();
+        assert_eq!(got.payload, b"still works");
+    }
+
+    /// **端点抢注。** 一个 id 还在场的时候，换一个账号的合法令牌来冒充它，
+    /// 必须被拒（`NotYours`），而且**什么都不能动**——账号不能被改写，
+    /// 信箱不能被打断，`peers` 看到的还得是原来那个账号。
+    #[tokio::test]
+    async fn polling_with_a_different_account_while_present_is_refused_and_leaves_it_untouched() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(100), vec![pk])); // ttl = 300ms
+
+        let a_token = token_for(&sk, "acct-a", "laptop");
+        assert_eq!(
+            relay.poll(&authed("laptop", a_token.clone())).await,
+            Ok(None)
+        );
+
+        // 账号 B 也弄到了一把写着 endpoint="laptop" 的合法令牌，想在它还
+        // 在场的时候把这个 id 占为己有。
+        let b_token = token_for(&sk, "acct-b", "laptop");
+        assert_eq!(
+            relay.poll(&authed("laptop", b_token)).await,
+            Err(LinkError::NotYours)
+        );
+
+        // 抢注没有得手：laptop 还挂在账号 A 名下——peers 看得到它，A 的信
+        // 还送得进去，信箱没被打断。
+        let peer_token = token_for(&sk, "acct-a", "peer");
+        assert_eq!(
+            relay.poll(&authed("peer", peer_token.clone())).await,
+            Ok(None)
+        );
+        assert_eq!(
+            relay.peers(&authed("peer", peer_token)).unwrap(),
+            vec![id("laptop")],
+            "抢注失败之后，laptop 应该还是账号 A 的"
+        );
+
+        let a_sender_token = token_for(&sk, "acct-a", "a-sender");
+        let mut still_a = letter("a-sender", "laptop", b"still mine");
+        still_a.auth = authed("a-sender", a_sender_token);
+        assert_eq!(relay.send(&still_a), Ok(()), "信箱不该被抢注弄坏");
+    }
+
+    /// 一旦这个 id 自然过期（没人再替它保鲜），下一个账号就能重新认领它——
+    /// 抢注挡的是"还在场的时候"，不是永久占用这个名字。
+    #[tokio::test]
+    async fn a_dropped_endpoint_can_be_re_registered_under_a_different_account() {
+        let (sk, pk) = issuer(1);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]); // ttl = 150ms
+
+        let a_token = token_for(&sk, "acct-a", "laptop");
+        assert_eq!(relay.poll(&authed("laptop", a_token)).await, Ok(None));
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let b_token = token_for(&sk, "acct-b", "laptop");
+        assert_eq!(
+            relay.poll(&authed("laptop", b_token)).await,
+            Ok(None),
+            "laptop 已经过期了，另一个账号该能重新认领这个 id"
+        );
+    }
+
+    /// **排除自己**这条规矩要在调用者自己确实还在场的时候测，不然测试
+    /// 只是巧合地通过——如果 "a" 早被 `peers()` 自己那次 `retain` 顺手清
+    /// 走了，去掉 `**ep != auth.endpoint` 那道过滤器也不会让它多冒出来，
+    /// 断言照样是绿的，但什么都没测到。这里让三个都并发挂着轮询，"a" 保证
+    /// 还在场。
+    #[tokio::test]
+    async fn peers_excludes_the_caller_even_though_they_are_present_too() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        let a_token = token_for(&sk, "acct-a", "a");
+        let b_token = token_for(&sk, "acct-a", "b");
+        let c_token = token_for(&sk, "acct-other", "c");
+
+        for (who, token) in [("a", a_token.clone()), ("b", b_token), ("c", c_token)] {
+            let r = relay.clone();
+            let a = authed(who, token);
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("三个都挂上轮询", || {
+            let map = relay.devices.lock().unwrap();
+            ["a", "b", "c"].iter().all(|w| map.contains_key(&id(w)))
+        })
+        .await;
+
+        assert_eq!(relay.peers(&authed("a", a_token)).unwrap(), vec![id("b")]);
+    }
+
+    /// `peers()` 自己也得 `retain` 一遍，不能指望"总有别的调用替它先扫过"——
+    /// 这条测试里，"b" 过期之后**没有任何人**再调用 `poll`，只有直接调用
+    /// `peers()`：它要是不自己清，"b" 就会一直挂在名单里。
+    #[tokio::test]
+    async fn peers_does_not_list_a_device_that_stopped_polling() {
+        let (sk, pk) = issuer(1);
+        let relay = Relay::with_issuers(cfg(50), vec![pk]); // ttl = 150ms
+
+        let a_token = token_for(&sk, "acct-a", "a");
+        let b_token = token_for(&sk, "acct-a", "b");
+        assert_eq!(relay.poll(&authed("a", a_token.clone())).await, Ok(None));
+        assert_eq!(relay.poll(&authed("b", b_token)).await, Ok(None));
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert_eq!(
+            relay.peers(&authed("a", a_token)).unwrap(),
+            Vec::<EndpointId>::new(),
+            "b 已经过期，peers 不该还把它算进在线名单"
+        );
+    }
+
+    /// `peers()` 按字典序排。名字故意不按顺序上线——HashMap 的遍历顺序本来
+    /// 就不保证跟插入顺序一样，用够多个名字才压得住"巧合已经是有序的"这种
+    /// 侥幸（6 个打乱的名字，巧合有序的概率是 1/720）。
+    #[tokio::test]
+    async fn peers_come_back_sorted_lexicographically() {
+        let (sk, pk) = issuer(1);
+        let relay = Arc::new(Relay::with_issuers(cfg(2000), vec![pk]));
+
+        let names = ["caller", "f", "d", "a", "e", "c", "b"];
+        for n in names {
+            let r = relay.clone();
+            let a = authed(n, token_for(&sk, "acct-a", n));
+            tokio::spawn(async move { r.poll(&a).await });
+        }
+        until("全都挂上轮询", || {
+            let map = relay.devices.lock().unwrap();
+            names.iter().all(|n| map.contains_key(&id(n)))
+        })
+        .await;
+
+        let caller_token = token_for(&sk, "acct-a", "caller");
+        assert_eq!(
+            relay.peers(&authed("caller", caller_token)).unwrap(),
+            vec![id("a"), id("b"), id("c"), id("d"), id("e"), id("f")]
+        );
+    }
+
+    /// 已有测试的前提：不带 issuers 的中转（`Relay::new`）不验令牌，
+    /// 任何字符串都当成合法凭据。
+    #[tokio::test]
+    async fn relay_new_without_issuers_still_accepts_anything() {
+        let relay = Arc::new(Relay::new(cfg(200)));
+        assert_eq!(relay.poll(&auth("b")).await, Ok(None));
+        assert!(relay.send(&letter("a", "b", b"x")).is_ok());
+    }
+
+    #[test]
+    fn public_bind_needs_relay_keys() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+
+        // `--with-link` 不带 `--relay-keys`：解析没问题，但绑公网地址该被拒。
+        let cli = parse_cli(&a("0.0.0.0:8787 --with-link")).unwrap();
+        let Cli::Serve { relay_keys, .. } = &cli else {
+            panic!("{cli:?}")
+        };
+        assert!(relay_keys.is_none());
+        assert!(bind_check("0.0.0.0:8787".parse().unwrap(), relay_keys.as_deref()).is_err());
+
+        // 带了 `--relay-keys`：同一个地址该被放行。
+        let cli = parse_cli(&a("0.0.0.0:8787 --with-link --relay-keys /k.txt")).unwrap();
+        let Cli::Serve { relay_keys, .. } = &cli else {
+            panic!("{cli:?}")
+        };
+        assert_eq!(relay_keys.as_deref(), Some(std::path::Path::new("/k.txt")));
+        assert!(bind_check("0.0.0.0:8787".parse().unwrap(), relay_keys.as_deref()).is_ok());
+
+        // 环回地址不管带不带 `--relay-keys` 都该放行。
+        assert!(bind_check("127.0.0.1:8787".parse().unwrap(), None).is_ok());
+    }
+
+    /// **中转只认识 dct-mesh 底下的 relay_token 模块，别的一概不该碰。**
+    /// 点对点消息的线上形状、解密——认得了这些，payload 就不再是不透明
+    /// 字节，spec 决定一就破了。
+    ///
+    /// 光解析"点开的第一层是不是 relay_token"还不够：`use dct-mesh::*`
+    /// 这种通配符导入、`use dct-mesh as m` 这种改名导入，压根不会留下一个
+    /// 能这样解析的普通路径。稳妥的办法反过来做：只承认两种精确写法——
+    /// 独立出现的这个 crate 名字后面必须紧跟着 `::relay_token`（可以再往
+    /// 下点，比如 `::relay_token::verify`），别的任何一种独立出现，一律
+    /// 算违规，不管是通配符、改名、分组导入（`{wire, relay_token}`），
+    /// 还是压根没点开（`use dct-mesh;`）。
+    ///
+    /// "独立出现"（词边界）是必须的，不然连它自己的函数名（这个词本来就
+    /// 是这条测试名字的一部分）都会被当成一次出现。
+    ///
+    /// crate 名字在这条测试里被拆成两半用 `concat!` 接起来，理由跟
+    /// `the_relay_never_looks_inside_a_frame_either` 那条一样：它自己也
+    /// 活在被扫描的目录里，原样写一遍会扫到自己这行定义，红得毫无意义。
+    #[test]
+    fn dct_srv_only_ever_touches_dct_mesh_relay_token() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        fn is_ident_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
+
+        /// `src` 里每一处独立出现的 `marker`（不是某个更长标识符的一部分）
+        /// 的字节偏移。
+        fn word_occurrences(marker: &str, src: &str) -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut idx = 0;
+            while let Some(off) = src[idx..].find(marker) {
+                let start = idx + off;
+                let end = start + marker.len();
+                let before_ok = src[..start]
+                    .chars()
+                    .next_back()
+                    .map(|c| !is_ident_char(c))
+                    .unwrap_or(true);
+                let after_ok = src[end..]
+                    .chars()
+                    .next()
+                    .map(|c| !is_ident_char(c))
+                    .unwrap_or(true);
+                if before_ok && after_ok {
+                    out.push(start);
+                }
+                idx = end;
+            }
+            out
+        }
+
+        let marker = concat!("dct_", "mesh");
+        let allowed = concat!("dct_", "mesh", "::relay_token");
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src_dir, &mut files);
+        assert!(!files.is_empty(), "扫描目录是空的，这条测试没有意义");
+
+        for path in &files {
+            let src = std::fs::read_to_string(path).unwrap();
+            for start in word_occurrences(marker, &src) {
+                let tail = &src[start..];
+                let is_allowed = tail.starts_with(allowed)
+                    && tail[allowed.len()..]
+                        .chars()
+                        .next()
+                        .map(|c| !is_ident_char(c))
+                        .unwrap_or(true);
+                assert!(
+                    is_allowed,
+                    "{} 在字节偏移 {start} 处出现了一处不是 `{allowed}` 的 \
+                     `{marker}` 用法——中转只该碰 relay_token",
+                    path.display()
+                );
+            }
+        }
     }
 
     // ——— 接口这一层 ———
@@ -1934,14 +2846,15 @@ mod tests {
     }
 
     #[test]
-    fn the_command_line_is_parsed_into_one_of_five_shapes() {
+    fn the_command_line_is_parsed_into_one_of_seven_shapes() {
         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
         assert_eq!(
             parse_cli(&a("")).unwrap(),
             Cli::Serve {
                 addr: "127.0.0.1:8787".into(),
                 with_link: false,
-                publish_keys: None
+                publish_keys: None,
+                relay_keys: None,
             }
         );
         assert_eq!(
@@ -1949,8 +2862,50 @@ mod tests {
             Cli::Serve {
                 addr: "127.0.0.1:9000".into(),
                 with_link: true,
-                publish_keys: Some("/k.json".into())
+                publish_keys: Some("/k.json".into()),
+                relay_keys: None,
             }
+        );
+        assert_eq!(
+            parse_cli(&a(
+                "127.0.0.1:9000 --with-link --relay-keys /r.txt --publish-keys /k.json"
+            ))
+            .unwrap(),
+            Cli::Serve {
+                addr: "127.0.0.1:9000".into(),
+                with_link: true,
+                publish_keys: Some("/k.json".into()),
+                relay_keys: Some("/r.txt".into()),
+            }
+        );
+        assert_eq!(
+            parse_cli(&a("token keygen --out /keys")).unwrap(),
+            Cli::TokenKeygen {
+                out: "/keys".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&a(
+                "token mint --key /k.key --account acct --endpoint c-abc --ttl 3600"
+            ))
+            .unwrap(),
+            Cli::TokenMint {
+                key: "/k.key".into(),
+                account: "acct".into(),
+                endpoint: "c-abc".into(),
+                ttl: 3600,
+            }
+        );
+        assert!(
+            parse_cli(&a("token keygen")).is_err(),
+            "token keygen 必须写明 --out"
+        );
+        assert!(
+            parse_cli(&a(
+                "token mint --key /k.key --account acct --endpoint c-abc"
+            ))
+            .is_err(),
+            "token mint 必须写明 --ttl"
         );
         assert_eq!(
             parse_cli(&a("key add 姜老师 --file /k.json")).unwrap(),

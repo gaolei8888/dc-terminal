@@ -1,12 +1,13 @@
 //! 起中转。
 //!
-//! **第一期只监听环回地址，而且是硬性的。** 计划里那句「srv 只监听内网地址」
-//! 是任务 7 的验收条件，但把它推迟到任务 7 才写是在赌中间这几天没人手滑：
-//! 现在 `token` 根本没人验（任务 5 才接 dc_classroom），这个服务对公网开口
-//! 的那一刻，任何人都能冒充任何一台设备收发信封。加密也还没有（第二期）。
+//! **第一期只监听环回地址，除非带了 `--relay-keys`。** 计划里那句「srv 只监听
+//! 内网地址」是任务 7 的验收条件，但把它推迟到任务 7 才写是在赌中间这几天
+//! 没人手滑：`token` 现在只有配了 issuer 公钥（`--relay-keys`）才会验
+//! （见 `Relay::with_issuers`），加密也还没有（第二期）。没有 `--relay-keys`
+//! 的中转对公网开口的那一刻，任何人都能冒充任何一台设备收发信封。
 //!
-//! 所以拒绝绑非环回地址的判断写在这里，不写在文档里。等任务 5 和第二期落地，
-//! 再把它换成一个明确的、要人动手打开的开关。
+//! 所以「这个地址能不能绑」写成代码而不是文档里的一句话，并且写在库里而
+//! 不是这儿——`main` 没法测（`dct_srv::bind_check`）。
 
 use std::sync::Arc;
 
@@ -29,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(dct_srv::keys::PublishKeys::default())
         }
     };
-    let (addr, routes, publish_keys) = match cli {
+    let (addr, routes, publish_keys, relay_keys) = match cli {
         dct_srv::Cli::KeyAdd { name, file } => {
             let mut k = load_or_new(&file)?;
             let key = k.add(&name, now())?;
@@ -60,10 +61,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("已下线「{id}」。运行中的中转最多 10 秒后生效。");
             return Ok(());
         }
+        dct_srv::Cli::TokenKeygen { out } => {
+            std::fs::create_dir_all(&out)?;
+            let (seed, pub_key) = dct_srv::issuer::generate();
+            dct_srv::issuer::write_issuer_files(&out, &seed, &pub_key)?;
+            eprintln!(
+                "写好了 {}/issuer.key（私钥，只在这台机器上留一份）和 {}/issuer.pub（公钥，\
+                 中转拿 --relay-keys 指过去）。这两个文件只给开发和本机端到端测试用——\
+                 正式令牌由网关签。",
+                out.display(),
+                out.display()
+            );
+            return Ok(());
+        }
+        dct_srv::Cli::TokenMint {
+            key,
+            account,
+            endpoint,
+            ttl,
+        } => {
+            let raw = std::fs::read_to_string(&key)
+                .map_err(|e| format!("读不了 {}：{e}", key.display()))?;
+            let signing_key = dct_srv::issuer::signing_key_from_seed_b64(&raw)?;
+            let token = dct_srv::issuer::mint(&signing_key, &account, &endpoint, ttl, now());
+            println!("{token}");
+            return Ok(());
+        }
         dct_srv::Cli::Serve {
             addr,
             with_link,
             publish_keys,
+            relay_keys,
         } => (
             addr,
             if with_link {
@@ -72,15 +100,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Routes::LiveOnly
             },
             publish_keys,
+            relay_keys,
         ),
     };
     // 首次打开就坏的密钥文件：拒绝启动，而不是悄悄当成「没开公开功能」。
     let publish_keys_path = publish_keys.clone();
     let publish_keys = publish_keys.map(dct_srv::keys::KeyFile::open).transpose()?;
 
+    // 同理：relay-keys 文件读不出来就拒绝启动，不能悄悄当成「不验令牌」——
+    // 那样一份写坏的文件会把中转的鉴权静默关掉。
+    let relay = match &relay_keys {
+        Some(path) => {
+            let issuers = dct_srv::keys::load_relay_keys(path)?;
+            Arc::new(Relay::with_issuers(Config::default(), issuers))
+        }
+        None => Arc::new(Relay::new(Config::default())),
+    };
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local = listener.local_addr()?;
-    if let Err(why) = dct_srv::must_be_loopback(local) {
+    if let Err(why) = dct_srv::bind_check(local, relay_keys.as_deref()) {
         // 已经绑上了才发现——那就关掉。宁可启动失败，也不要一个没鉴权的
         // 中转在公网上多活一秒。
         drop(listener);
@@ -88,9 +127,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "dct-srv 在 http://{local} 上，只收本机的连接{}{}",
+        "dct-srv 在 http://{local} 上{}{}{}",
+        if relay_keys.is_some() {
+            "，只收带着有效令牌的连接"
+        } else {
+            "，只收本机的连接"
+        },
         if routes == Routes::WithLink {
-            "（已打开没有鉴权的 /link/*，只许本机开发用）"
+            match &relay_keys {
+                Some(_) => "（已打开 /link/*）",
+                None => "（已打开没有鉴权的 /link/*，只许本机开发用）",
+            }
         } else {
             ""
         },
@@ -99,13 +146,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => String::new(),
         }
     );
-    dct_srv::serve(
-        listener,
-        Arc::new(Relay::new(Config::default())),
-        Arc::new(Live::new()),
-        routes,
-        publish_keys,
-    )
-    .await?;
+    dct_srv::serve(listener, relay, Arc::new(Live::new()), routes, publish_keys).await?;
     Ok(())
 }
