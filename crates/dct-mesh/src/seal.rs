@@ -1,14 +1,23 @@
 //! 一条留言：先用发件方的签名钥匙签一份规范字节（`dct-msg-v1`），把
 //! `{"m": <消息>, "sig": <签名>}` 序列化成 JSON，再用收件方的 X25519 公钥
-//! 加密——中转只能看见密文和一个临时公钥，看不到消息内容、收发双方是谁。
+//! 加密——中转看不到 `kind`/`body`/会话名这些内容，但**路由本身不保密**：
+//! 中转要知道这条 `Sealed` 是发给哪个 endpoint 的才能转发，`open` 也要调用
+//! 方在信封上另外附一个 `envelope_from`（见下）——所以中转看得到、也必须看
+//! 得到收发双方是谁，密文只藏内容，不藏地址。
 //!
 //! 加密用的是「每条消息一把新临时钥匙」的 ECIES：调用方给一个 `eph_seed`
-//! （这个 crate 不生成随机数，见 lib.rs），派生出一次性的 X25519 密钥对，跟
-//! 收件方的公钥做 Diffie-Hellman，再用 HKDF-SHA256 把共享点拉成一把
-//! ChaCha20-Poly1305 密钥。nonce 固定用全 0——这是安全的，因为每条消息的
-//! 临时密钥都是新算出来的，同一把密钥只会被用来加密这一条消息、只用这一个
-//! nonce，ChaCha20-Poly1305 真正要防的「同一把密钥、不同消息复用 nonce」的
-//! 场景根本不会发生。
+//! （这个 crate 不生成随机数，见 lib.rs）。真正喂给 X25519 的临时私钥不是
+//! `eph_seed` 本身，而是 `SHA-256("dct-seal-eph-v1" ‖ eph_seed ‖ plain)`——
+//! 把加密前的明文也拌进去，这样即使调用方不小心对两条**不同**的消息传了同
+//! 一个种子，算出来的临时私钥也不同（明文不同，摘要就不同）。但这不是纵容
+//! 调用方省事：`eph_seed` 仍然必须每次调用都用新鲜的随机数——两条内容完全
+//! 相同的消息如果还用同一个种子，会算出一模一样的密文，等于告诉中转「这是
+//! 同一条消息又发了一遍」，这是这份哈希绑定防不住的。
+//!
+//! 临时私钥跟收件方的公钥做 Diffie-Hellman，再用 HKDF-SHA256 把共享点拉成
+//! 一把 ChaCha20-Poly1305 密钥。nonce 固定用全 0——这是安全的，因为派生出来
+//! 的对称密钥已经绑死了这一条消息的明文，不会有「同一把密钥、两条不同明文
+//! 共用同一个 nonce」这种 ChaCha20-Poly1305 真正怕的情况。
 use crate::canon::field;
 use crate::id;
 use crate::keys::{self, MachineKeys};
@@ -18,7 +27,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as KxPublicKey, StaticSecret};
 
 pub const MSG_VERSION_TAG: &str = "dct-msg-v1";
@@ -66,8 +75,9 @@ pub struct Sealed {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenError {
-    /// 密文解不开——钥匙不对、被中转改过，或者 `eph`/`ct` 根本不是合法的
-    /// base64/密文。
+    /// 密文解不开——钥匙不对、被中转改过，`eph`/`ct` 根本不是合法的
+    /// base64/密文，`v` 不是这份代码认识的版本，或者 `eph` 是一个会让
+    /// Diffie-Hellman 算出全零共享密钥的恶意/退化公钥。
     Decrypt,
     /// 解密出来的明文不是 `SignedMessage` 期望的 JSON 形状。
     BadJson,
@@ -121,6 +131,7 @@ fn kind_str(k: Kind) -> String {
 }
 
 const SEAL_INFO: &[u8] = b"dct-seal-v1";
+const EPH_INFO: &[u8] = b"dct-seal-eph-v1";
 
 fn derive_key(eph_pub: &[u8; 32], to_kx_pub: &[u8; 32], shared: &[u8; 32]) -> [u8; 32] {
     let mut salt = Vec::with_capacity(64);
@@ -133,6 +144,21 @@ fn derive_key(eph_pub: &[u8; 32], to_kx_pub: &[u8; 32], shared: &[u8; 32]) -> [u
     key
 }
 
+/// 临时 X25519 私钥不是 `eph_seed` 本身，而是把它跟（加密前的）明文一起做
+/// 一次 SHA-256：`SHA-256("dct-seal-eph-v1" || eph_seed || plain)`。见模块
+/// 顶部的注释——这样同一个种子配不同的消息也不会撞出同一把临时钥匙，但
+/// `eph_seed` 本身仍然必须是调用方每次给的新鲜随机数。
+fn ephemeral_secret(eph_seed: [u8; 32], plain: &[u8]) -> StaticSecret {
+    let mut hasher = Sha256::new();
+    hasher.update(EPH_INFO);
+    hasher.update(eph_seed);
+    hasher.update(plain);
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+    StaticSecret::from(seed)
+}
+
 /// 签名并加密一条消息，只有掌握 `to_kx_pub` 对应私钥的那台电脑能打开。
 pub fn seal(m: &Message, me: &MachineKeys, to_kx_pub: &[u8; 32], eph_seed: [u8; 32]) -> Sealed {
     let sig = me.sign(&bytes(m));
@@ -142,7 +168,7 @@ pub fn seal(m: &Message, me: &MachineKeys, to_kx_pub: &[u8; 32], eph_seed: [u8; 
     };
     let plain = serde_json::to_vec(&inner).expect("SignedMessage always serializes");
 
-    let eph = StaticSecret::from(eph_seed);
+    let eph = ephemeral_secret(eph_seed, &plain);
     let eph_pub = KxPublicKey::from(&eph);
     let their_pub = KxPublicKey::from(*to_kx_pub);
     let shared = eph.diffie_hellman(&their_pub);
@@ -188,17 +214,33 @@ fn bound_sender_key(roster: &Roster, endpoint: &str) -> Option<[u8; 65]> {
 
 /// 打开一条密封留言。`envelope_from` 是中转在这条消息外面附的「这是谁发的」
 /// 元数据（不是加密内容的一部分），必须跟解密后签过名的 `m.from` 一致。
+///
+/// **这个函数不做重放保护。** 它只管「这条留言是不是真的、没被改过、是发
+/// 给我的」，不管「我是不是已经处理过这一条了」——两次 `open` 同一个
+/// `Sealed` 会两次成功返回同一个 `Message`。按 `(m.from, m.id)` 去重、再给
+/// `m.sent_at` 卡一个时间窗口，这是调用方（存留言的那一层）的活。
 pub fn open(
     s: &Sealed,
     me: &MachineKeys,
     roster: &Roster,
     envelope_from: &str,
 ) -> Result<Message, OpenError> {
+    if s.v != 1 {
+        return Err(OpenError::Decrypt);
+    }
+
     let eph_raw = STANDARD.decode(&s.eph).map_err(|_| OpenError::Decrypt)?;
     let eph_pub: [u8; 32] = eph_raw.try_into().map_err(|_| OpenError::Decrypt)?;
     let ct = STANDARD.decode(&s.ct).map_err(|_| OpenError::Decrypt)?;
 
     let shared = me.diffie_hellman(&eph_pub);
+    if shared == [0u8; 32] {
+        // `eph` 是攻击者能自由构造的（它就是密文旁边那个"临时公钥"字段）。
+        // 用一个退化/低阶点（比如全零）当公钥，可以让 Diffie-Hellman 不管
+        // 我的私钥是什么都算出全零共享密钥——不拒绝的话，攻击者就拿到了一
+        // 把跟我的私钥完全脱钩、自己就能算出来的"共享密钥"。
+        return Err(OpenError::Decrypt);
+    }
     let my_kx_pub = me.kx_pub();
     let key_bytes = derive_key(&eph_pub, &my_kx_pub, &shared);
     let key = Key::from_slice(&key_bytes);
@@ -327,21 +369,151 @@ mod tests {
     }
 
     #[test]
-    fn a_sender_whose_roster_entry_fails_endpoint_binding_is_refused() {
+    fn a_roster_entry_whose_endpoint_does_not_match_its_own_key_is_refused() {
+        // `roster.member(endpoint)` looks entries up *by* `endpoint`, so a
+        // record whose `endpoint` field doesn't match its own key can only
+        // be found by looking it up under the (wrong) `endpoint` it claims —
+        // which is exactly what happens here. This is the scenario the
+        // binding check inside `bound_sender_key` exists to catch: without
+        // it, whoever controls `mallory`'s key could sign as `x` and have it
+        // accepted, because the roster entry *claims* `x` even though it was
+        // never bound to `x`'s real key.
         let alice = keys_for(1);
         let bob = keys_for(2);
-        let mut a = member_from(&alice, "alice");
-        // 名单里的记录被人改了：endpoint 不再是从 alice 的 sign_pub 算出来的。
-        let real_from = a.endpoint.clone();
-        a.endpoint = "c-0000000000000000000f".into();
-        let roster = roster_of(vec![a, member_from(&bob, "bob")]);
+        let mallory = keys_for(3);
+        let x = id::endpoint_for(&alice.sign_pub());
 
-        let m = sample_message(&real_from, &id::endpoint_for(&bob.sign_pub()));
-        let sealed = seal(&m, &alice, &bob.kx_pub(), [7u8; 32]);
+        let forged = Member {
+            name: "alice".into(),
+            endpoint: x.clone(),
+            sign_pub: STANDARD.encode(mallory.sign_pub()),
+            kx_pub: STANDARD.encode(mallory.kx_pub()),
+            added_at: 0,
+        };
+        let roster = roster_of(vec![forged, member_from(&bob, "bob")]);
+
+        // Mallory crafts and signs (with her own real key) a message that
+        // claims to be from `x`.
+        let m = sample_message(&x, &id::endpoint_for(&bob.sign_pub()));
+        let sealed = seal(&m, &mallory, &bob.kx_pub(), [7u8; 32]);
 
         assert_eq!(
-            open(&sealed, &bob, &roster, &real_from),
+            open(&sealed, &bob, &roster, &x),
             Err(OpenError::UnknownSender)
+        );
+    }
+
+    #[test]
+    fn a_message_forged_by_another_member_claiming_to_be_someone_else_is_refused() {
+        // Alice is a genuine, correctly bound roster member. Mallory (also a
+        // genuine roster member, under her own key) crafts a message whose
+        // `from` field claims to be Alice, and signs it with her own key
+        // instead. The roster lookup succeeds (Alice's real entry), so this
+        // can only be caught by verifying the signature against Alice's key
+        // — which must fail, because it was never made by Alice.
+        let alice = keys_for(1);
+        let bob = keys_for(2);
+        let mallory = keys_for(3);
+        let a = member_from(&alice, "alice");
+        let roster = roster_of(vec![
+            a.clone(),
+            member_from(&bob, "bob"),
+            member_from(&mallory, "mallory"),
+        ]);
+
+        let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
+        let sealed = seal(&m, &mallory, &bob.kx_pub(), [7u8; 32]);
+
+        assert_eq!(
+            open(&sealed, &bob, &roster, &a.endpoint),
+            Err(OpenError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn an_unsupported_sealed_version_is_rejected() {
+        let alice = keys_for(1);
+        let bob = keys_for(2);
+        let a = member_from(&alice, "alice");
+        let roster = roster_of(vec![a.clone(), member_from(&bob, "bob")]);
+
+        let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
+        let mut sealed = seal(&m, &alice, &bob.kx_pub(), [7u8; 32]);
+        sealed.v = 2;
+
+        assert_eq!(
+            open(&sealed, &bob, &roster, &a.endpoint),
+            Err(OpenError::Decrypt)
+        );
+    }
+
+    #[test]
+    fn an_all_zero_shared_secret_is_rejected() {
+        let alice = keys_for(1);
+        let bob = keys_for(2);
+        let roster = roster_of(vec![member_from(&alice, "alice"), member_from(&bob, "bob")]);
+
+        // `[0u8; 32]` is a well-known low-order X25519 public key: the DH
+        // result is all-zero regardless of the recipient's private key.
+        let forged = Sealed {
+            v: 1,
+            eph: STANDARD.encode([0u8; 32]),
+            ct: STANDARD.encode([0u8; 16]),
+        };
+
+        assert_eq!(
+            open(&forged, &bob, &roster, &id::endpoint_for(&alice.sign_pub())),
+            Err(OpenError::Decrypt)
+        );
+    }
+
+    #[test]
+    fn an_all_zero_shared_secret_is_rejected_even_when_the_ciphertext_would_otherwise_open() {
+        // The test above uses garbage ciphertext, so it can't tell the
+        // explicit all-zero-shared-secret check apart from the AEAD tag
+        // just happening to fail anyway. This test crafts ciphertext that
+        // genuinely *would* decrypt and verify successfully under the key
+        // the all-zero shared secret derives to, so it only passes if the
+        // explicit check is the thing doing the rejecting.
+        let alice = keys_for(1);
+        let bob = keys_for(2);
+        let a = member_from(&alice, "alice");
+        let roster = roster_of(vec![a.clone(), member_from(&bob, "bob")]);
+
+        let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
+        let sig = alice.sign(&bytes(&m));
+        let inner = SignedMessage {
+            m: m.clone(),
+            sig: STANDARD.encode(sig),
+        };
+        let plain = serde_json::to_vec(&inner).unwrap();
+
+        // Same key derivation `open` would use for this `eph`/`to_kx_pub`
+        // pair *if* it didn't reject an all-zero shared secret first.
+        let eph_pub = [0u8; 32];
+        let key_bytes = derive_key(&eph_pub, &bob.kx_pub(), &[0u8; 32]);
+        let key = Key::from_slice(&key_bytes);
+        let cipher = ChaCha20Poly1305::new(key);
+        let nonce = Nonce::from_slice(&[0u8; 12]);
+        let ct = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &plain,
+                    aad: SEAL_INFO,
+                },
+            )
+            .unwrap();
+
+        let forged = Sealed {
+            v: 1,
+            eph: STANDARD.encode(eph_pub),
+            ct: STANDARD.encode(ct),
+        };
+
+        assert_eq!(
+            open(&forged, &bob, &roster, &a.endpoint),
+            Err(OpenError::Decrypt)
         );
     }
 
@@ -418,6 +590,59 @@ mod tests {
 
         assert_ne!(s1.eph, s2.eph);
         assert_ne!(s1.ct, s2.ct);
+    }
+
+    #[test]
+    fn same_eph_seed_but_a_different_message_gives_a_different_ephemeral_key() {
+        // The ephemeral private key is derived from `eph_seed` *and* the
+        // plaintext (see the module doc), specifically so that a caller
+        // accidentally reusing a seed across two different messages still
+        // gets a fresh key each time.
+        let alice = keys_for(1);
+        let bob = keys_for(2);
+        let a = member_from(&alice, "alice");
+
+        let m1 = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
+        let mut m2 = m1.clone();
+        m2.body = "a different message entirely".into();
+
+        let s1 = seal(&m1, &alice, &bob.kx_pub(), [7u8; 32]);
+        let s2 = seal(&m2, &alice, &bob.kx_pub(), [7u8; 32]);
+
+        assert_ne!(s1.eph, s2.eph);
+    }
+
+    #[test]
+    fn seal_matches_a_known_answer_vector() {
+        // Pins the full crypto pipeline (ephemeral key derivation, HKDF,
+        // ChaCha20-Poly1305) for a fixed set of inputs, so a change to any
+        // step's constants/ordering shows up as a diff here instead of only
+        // as "round-trips still work" (which a compatible-on-both-sides bug
+        // would never catch).
+        let alice = MachineKeys::from_seeds([1u8; 32], [2u8; 32]).unwrap();
+        let bob = MachineKeys::from_seeds([3u8; 32], [4u8; 32]).unwrap();
+        let m = Message {
+            id: "kat-1".into(),
+            kind: Kind::Msg,
+            from: id::endpoint_for(&alice.sign_pub()),
+            from_session: "laptop/dc-terminal".into(),
+            to: id::endpoint_for(&bob.sign_pub()),
+            to_session: "desktop/dc-terminal".into(),
+            body: "known answer".into(),
+            sent_at: 1_700_000_000,
+        };
+        let sealed = seal(&m, &alice, &bob.kx_pub(), [9u8; 32]);
+
+        assert_eq!(sealed.eph, "2o+txP0fptgL9khgRgMoteHSoimDytrPGNjUSL8ytSg=");
+        assert_eq!(
+            sealed.ct,
+            "Z5juSC8J3a51ggq2BqI/eKrUgZQ2nPLBksI+IqIf4jNaGgvRu4U/cfvHhax6xdXpYXF3ybTqQOqgx30j\
+             /ofubdwJDLw49t8eqcqnD4JSNleXerU3ndG4mcPoswwekYxd5esEwI0FfKjW0hHag/zrMnPDE4VxzWWs\
+             c1HCsEp5MZsPAdydxfVDoSV0prgGjtfMHGhFpkXJ6GJo0+kJS2Y4kGgIse35WMWE3yLBG9vruld8dKwN\
+             O5dGDKwt9fdHDleCe7Kj4PCw2TMv8VGve4VpQU4Cjuy+effrivxxaAhwsnxHblnrYuWK7JzalbB1dNc0\
+             eaRTaUlisi09OdTPIy93NeyTjXY8//RZxaqAoybC6pNfnB9mSnb8mIQJHp+KMA+5DBqZ2d3bVxEQxgPR\
+             ov+3IOPjSVA/gEsvSHLGEl3VNz0/fA=="
+        );
     }
 
     #[test]

@@ -25,7 +25,8 @@ struct Envelope {
     endpoint: String,
     exp: u64,
     /// P-256 ECDSA(SHA-256) 对 `bytes(&claims)` 签的名，64 字节 `r||s`，
-    /// 标准 base64。
+    /// 标准 base64。ECDSA 签名可延展（见 `keys::MachineKeys::sign` 的文
+    /// 档），所以这个字段、乃至整个令牌字符串，都不能当 id 或去重键用。
     sig: String,
 }
 
@@ -176,6 +177,50 @@ mod tests {
         let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&env).unwrap());
 
         assert_eq!(verify(&tampered, &[pk], 50), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn changing_the_account_inside_the_token_breaks_it() {
+        let (sk, pk) = issuer(1);
+        let token = issue(&claims(), &sk);
+
+        let json = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let mut env: Envelope = serde_json::from_slice(&json).unwrap();
+        env.account = "someone-elses-account".into();
+        let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&env).unwrap());
+
+        assert_eq!(verify(&tampered, &[pk], 50), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn changing_the_exp_inside_the_token_breaks_it() {
+        let (sk, pk) = issuer(1);
+        let token = issue(&claims(), &sk);
+
+        let json = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let mut env: Envelope = serde_json::from_slice(&json).unwrap();
+        env.exp = 999_999;
+        let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&env).unwrap());
+
+        assert_eq!(verify(&tampered, &[pk], 50), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn an_empty_issuer_list_never_verifies() {
+        let (sk, _pk) = issuer(1);
+        let token = issue(&claims(), &sk);
+        assert_eq!(verify(&token, &[], 50), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn bytes_matches_a_known_vector() {
+        let c = Claims {
+            account: "acct".into(),
+            endpoint: "c-known0000000000000f".into(),
+            exp: 1_700_000_000,
+        };
+        let expected: &[u8] = b"18:dct-relay-token-v14:acct21:c-known0000000000000f10:1700000000";
+        assert_eq!(bytes(&c), expected);
     }
 
     #[test]

@@ -55,6 +55,15 @@ impl MachineKeys {
     }
 
     /// 对 `msg` 签名（内部先做 SHA-256），返回 64 字节 `r||s`。
+    ///
+    /// **ECDSA 签名是可延展的（malleable）：** `(r, s)` 和 `(r, n-s)`
+    /// （"low-S" 和 "high-S"）对同一条消息、同一把私钥都是合法签名，这个
+    /// 函数不保证只产出其中一种。谁都能拿一个合法签名算出另一个同样合法、
+    /// 但字节不同的签名，不需要私钥。所以这里返回的字节，以及所有拿它当
+    /// 字段用的地方（`SignedRoster::sig`、`wire::JoinRequest::sig`、
+    /// `relay_token` 令牌里的 `sig`……）**都不能被当成 id 或去重键**——同一
+    /// 条逻辑上的消息可能对应两种不同的签名字节。真要去重/防重放，认
+    /// 消息自己的字段（比如 `seal::Message::id`），不要认签名或整个信封。
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
         let sig: EcSig = self.sign.sign(msg);
         let mut out = [0u8; 64];

@@ -2,6 +2,7 @@
 //! `Payload`，`t` 字段说明它是密封留言、加入请求、整份名单，还是「你的加入
 //! 申请还在等别人批」。
 use crate::canon::field;
+use crate::id;
 use crate::keys::{self, MachineKeys};
 use crate::roster::{Member, SignedRoster};
 use crate::seal::Sealed;
@@ -21,7 +22,8 @@ pub enum Payload {
 
 /// 新电脑请求加入组：`member` 是它自己的名单条目（还没被任何人签认），
 /// `sig` 是它用自己的钥匙对 `member` 的 `dct-join-v1` 规范字节签的名——证明
-/// 它真的掌握 `member.sign_pub` 对应的私钥。
+/// 它真的掌握 `member.sign_pub` 对应的私钥。ECDSA 签名可延展（见
+/// `keys::MachineKeys::sign` 的文档），`sig` 不能当 id 或去重键用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub member: Member,
@@ -56,8 +58,11 @@ pub fn sign_member(m: &Member, keys: &MachineKeys) -> String {
     STANDARD.encode(keys.sign(&member_bytes(m)))
 }
 
-/// 校验 `sig` 是不是 `m` 自己的钥匙（`m.sign_pub`）对 `m` 签的名。任何解不
-/// 出来的 base64/公钥/签名都当作没验过，不 panic。
+/// 校验 `sig` 是不是 `m` 自己的钥匙（`m.sign_pub`）对 `m` 签的名，并且
+/// `m.endpoint` 真的是从 `m.sign_pub` 算出来的——单有签名不够：签名只证明
+/// 「这份 `Member` 记录是这把 `sign_pub` 的主人认可的」，不证明它认领的
+/// `endpoint` 就是自己的（一个合法成员完全可以自签一条 `endpoint` 写着别
+/// 人地址的记录）。任何解不出来的 base64/公钥/签名都当作没验过，不 panic。
 pub fn verify_member(m: &Member, sig: &str) -> bool {
     let Ok(raw_pub) = STANDARD.decode(&m.sign_pub) else {
         return false;
@@ -65,6 +70,9 @@ pub fn verify_member(m: &Member, sig: &str) -> bool {
     let Ok(sign_pub): Result<[u8; 65], _> = raw_pub.try_into() else {
         return false;
     };
+    if id::endpoint_for(&sign_pub) != m.endpoint {
+        return false;
+    }
     let Ok(raw_sig) = STANDARD.decode(sig) else {
         return false;
     };
@@ -77,7 +85,6 @@ pub fn verify_member(m: &Member, sig: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id;
     use crate::roster::Roster;
 
     fn keys_for(byte: u8) -> MachineKeys {
@@ -186,6 +193,32 @@ mod tests {
         let mut tampered = m;
         tampered.sign_pub = STANDARD.encode(other.sign_pub());
         assert!(!verify_member(&tampered, &sig));
+    }
+
+    #[test]
+    fn verify_member_rejects_a_self_consistent_signature_whose_endpoint_is_someone_elses() {
+        // `m` is genuinely, correctly signed by `k` over exactly these bytes
+        // -- the signature check alone has nothing to object to. The only
+        // thing wrong is that `m.endpoint` doesn't actually belong to `k`.
+        let k = keys_for(1);
+        let mut m = member_from(&k, "alice");
+        m.endpoint = "c-notmykey0000000000".into();
+        let sig = sign_member(&m, &k);
+        assert!(!verify_member(&m, &sig));
+    }
+
+    #[test]
+    fn member_bytes_matches_a_known_vector() {
+        let m = Member {
+            name: "alice".into(),
+            endpoint: "c-known0000000000000f".into(),
+            sign_pub: "signpubb64".into(),
+            kx_pub: "kxpubb64".into(),
+            added_at: 1_700_000_000,
+        };
+        let expected: &[u8] =
+            b"11:dct-join-v15:alice21:c-known0000000000000f10:signpubb648:kxpubb6410:1700000000";
+        assert_eq!(member_bytes(&m), expected);
     }
 
     #[test]
