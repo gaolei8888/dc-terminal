@@ -8,9 +8,13 @@
 //! `field(sign_pub)`、`field(kx_pub)`、`field(added_at 十进制)`。签名是
 //! P-256 ECDSA（SHA-256）对这串字节签的，64 字节 `r||s`，标准 base64。
 use crate::canon::field;
+use crate::id;
 use crate::keys::{self, MachineKeys};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+
+/// 名字最长多少字符（跟界面上「电脑名」输入框的上限对齐）。
+pub const MAX_NAME_LEN: usize = 32;
 
 pub const ROSTER_VERSION_TAG: &str = "dct-roster-v1";
 
@@ -108,8 +112,13 @@ pub enum RosterError {
     BadSignature,
     /// 成员里有重复的 name 或 endpoint。
     Duplicate,
-    /// 有成员的公钥解不出来（sign_pub 不是 65 字节 0x04 开头，或 kx_pub 不是 32 字节）。
+    /// 有成员的公钥解不出来（sign_pub 不是 65 字节 0x04 开头、不在曲线上，或
+    /// kx_pub 不是 32 字节），或者成员的 `endpoint` 跟它自己的 `sign_pub` 对
+    /// 不上——`endpoint` 是从公钥算出来的，两者必须一致，否则名单就能把一个
+    /// endpoint 偷偷映射到另一把钥匙上。
     BadKey,
+    /// 成员名字是空串、带 `/`，或者超过 `MAX_NAME_LEN` 个字符。
+    BadName,
     /// 签名者在自己签的这一版里把自己从名单上删掉了——这类改动必须由别的在
     /// 任成员签，不能自己签自己退出。
     SignerRemoved,
@@ -126,7 +135,10 @@ impl std::fmt::Display for RosterError {
             RosterError::UnknownSigner => "signer is not a member of the current roster",
             RosterError::BadSignature => "roster signature does not verify",
             RosterError::Duplicate => "roster has a duplicate name or endpoint",
-            RosterError::BadKey => "a member's public key cannot be decoded",
+            RosterError::BadKey => {
+                "a member's public key cannot be decoded, or its endpoint does not match it"
+            }
+            RosterError::BadName => "a member's name is empty, contains '/', or is too long",
             RosterError::SignerRemoved => "the signer cannot remove itself in the version it signs",
         })
     }
@@ -139,9 +151,37 @@ fn decode_sign_pub(b64: &str) -> Option<[u8; 65]> {
     if raw.len() != 65 || raw[0] != 0x04 {
         return None;
     }
+    // Shape alone isn't enough: 65 bytes starting with 0x04 can still not be a
+    // point on the P-256 curve. Parse it for real so a garbage "key" is caught
+    // here as `BadKey`, instead of surfacing later as a `BadSignature` (or,
+    // for a non-signer member, not being caught at all).
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw).ok()?;
     let mut out = [0u8; 65];
     out.copy_from_slice(&raw);
     Some(out)
+}
+
+fn validate_name(name: &str) -> Result<(), RosterError> {
+    if name.is_empty() || name.contains('/') || name.chars().count() > MAX_NAME_LEN {
+        return Err(RosterError::BadName);
+    }
+    Ok(())
+}
+
+/// 结构性校验，跟「这是不是合法的下一版名单」这件事本身无关，对 `incoming`
+/// 里的每个成员都必须成立：名字合法，公钥能解出来，而且 `endpoint` 真的是
+/// 从这把 `sign_pub` 算出来的——不然一份签过名的名单就能悄悄把某个 endpoint
+/// 换成另一把钥匙，配对时读的 6 位数对不上，但除此之外没有别的防线。
+fn validate_members(members: &[Member]) -> Result<(), RosterError> {
+    for m in members {
+        validate_name(&m.name)?;
+        let sign_pub = decode_sign_pub(&m.sign_pub).ok_or(RosterError::BadKey)?;
+        decode_kx_pub(&m.kx_pub).ok_or(RosterError::BadKey)?;
+        if m.endpoint != id::endpoint_for(&sign_pub) {
+            return Err(RosterError::BadKey);
+        }
+    }
+    Ok(())
 }
 
 fn decode_kx_pub(b64: &str) -> Option<[u8; 32]> {
@@ -175,19 +215,32 @@ fn has_duplicates(members: &[Member]) -> bool {
     false
 }
 
-fn all_keys_decode(members: &[Member]) -> bool {
-    members
-        .iter()
-        .all(|m| decode_sign_pub(&m.sign_pub).is_some() && decode_kx_pub(&m.kx_pub).is_some())
-}
-
-/// 校验一份新收到的（签过名的）名单能不能取代 `current`。规则见模块顶部：
-/// 没有 `current` 时只接受创世名单；有 `current` 时要求 group 相同、版本
-/// 严格变新、签名者是 `current` 里的成员且签名用它在 `current` 里的公钥验
-/// 得过、新名单没有重复项、所有公钥都能解码、签名者没有把自己从这一版里删掉。
+/// 校验一份新收到的（签过名的）名单能不能取代 `current`。
+///
+/// `current = None` 只用于**这台电脑自己**创建的第一份名单——也就是
+/// [`genesis`] 生成、还没有任何名单存过的那种情况。一台**加入**别人组的新
+/// 电脑没有旧名单，但它收到的第一份名单不能走这条路径：它必须验证签名者
+/// 就是给自己算过 6 位核对码、当面确认过的那台电脑，这条规则比「version 1
+/// 且自签」更强，属于另一个函数 `accept_invite`（后续任务）的活，不在这里。
+///
+/// 规则：
+/// - 名单里每个成员：名字合法、公钥能解出来、`endpoint` 跟 `sign_pub` 对得上；
+/// - 没有重复的 name 或 endpoint；
+/// - `current` 为 `None`：`incoming` 必须是版本 1、只有一个成员、而且那个
+///   成员就是签名者；
+/// - `current` 为 `Some`：`group` 相同、版本严格变新、签名者是 `current`
+///   里的成员，并且用签名者在 `current` 里的公钥验证签名；
+/// - 签名者不能在自己签的这一版里把自己从名单上删掉（退出必须由别的在任
+///   成员签）。
 pub fn accept(current: Option<&SignedRoster>, incoming: &SignedRoster) -> Result<(), RosterError> {
     let msg = bytes(&incoming.roster);
     let sig = decode_sig(&incoming.sig).ok_or(RosterError::BadSignature)?;
+
+    validate_members(&incoming.roster.members)?;
+
+    if has_duplicates(&incoming.roster.members) {
+        return Err(RosterError::Duplicate);
+    }
 
     let signer_sign_pub = match current {
         None => {
@@ -217,14 +270,6 @@ pub fn accept(current: Option<&SignedRoster>, incoming: &SignedRoster) -> Result
 
     if !keys::verify(&signer_sign_pub, &msg, &sig) {
         return Err(RosterError::BadSignature);
-    }
-
-    if has_duplicates(&incoming.roster.members) {
-        return Err(RosterError::Duplicate);
-    }
-
-    if !all_keys_decode(&incoming.roster.members) {
-        return Err(RosterError::BadKey);
     }
 
     if incoming.roster.member(&incoming.signer).is_none() {
@@ -440,5 +485,223 @@ mod tests {
         assert_eq!(r.by_name("B"), Some(&b));
         assert_eq!(r.by_name("nobody"), None);
         assert_eq!(r.member("c-doesnotexist"), None);
+    }
+
+    // -- I1: endpoint must be bound to the actual signing key ---------------
+
+    #[test]
+    fn a_members_endpoint_must_match_its_own_signing_key() {
+        // `a`'s `endpoint` field claims to belong to `ka`'s key, but it's
+        // actually a different (still well-formed) endpoint string. Nothing
+        // else in `accept` would catch this: the `signer` field is copied
+        // from this same (wrong) endpoint, so the genesis self-check passes,
+        // and the signature itself is valid because it really was made with
+        // `ka`. Only checking `endpoint == id::endpoint_for(sign_pub)` catches it.
+        let ka = keys_for(1);
+        let mut a = member_from(&ka, "A");
+        a.endpoint = "c-0000000000000000000f".into();
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadKey));
+    }
+
+    #[test]
+    fn a_new_members_endpoint_must_match_its_own_signing_key_in_a_later_version() {
+        let ka = keys_for(1);
+        let kb = keys_for(2);
+        let a = member_from(&ka, "A");
+        let g = genesis(a.clone(), "mine-a".into(), &ka);
+
+        let mut b = member_from(&kb, "B");
+        b.endpoint = "c-1111111111111111111f".into();
+        let v2 = Roster {
+            group: "mine-a".into(),
+            version: 2,
+            members: vec![a.clone(), b],
+        };
+        let signed = sign(v2, &a, &ka);
+        assert_eq!(accept(Some(&g), &signed), Err(RosterError::BadKey));
+    }
+
+    // -- I2: kill mutations that the existing suite let through -------------
+
+    #[test]
+    fn duplicate_names_with_different_endpoints_are_refused() {
+        let ka = keys_for(1);
+        let kb = keys_for(2);
+        let a = member_from(&ka, "A");
+        let g = genesis(a.clone(), "mine-a".into(), &ka);
+
+        let b = member_from(&kb, "A"); // same name, genuinely different key/endpoint
+        let v2 = Roster {
+            group: "mine-a".into(),
+            version: 2,
+            members: vec![a.clone(), b],
+        };
+        let signed = sign(v2, &a, &ka);
+        assert_eq!(accept(Some(&g), &signed), Err(RosterError::Duplicate));
+    }
+
+    #[test]
+    fn a_sign_pub_of_the_wrong_length_is_a_bad_key() {
+        let ka = keys_for(1);
+        let mut a = member_from(&ka, "A");
+        a.sign_pub = STANDARD.encode([4u8; 64]); // one byte short
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadKey));
+    }
+
+    #[test]
+    fn a_sign_pub_without_the_0x04_prefix_is_a_bad_key() {
+        let ka = keys_for(1);
+        let real = STANDARD.decode(STANDARD.encode(ka.sign_pub())).unwrap();
+        let mut compressed_looking = real.clone();
+        compressed_looking[0] = 0x03;
+        let mut a = member_from(&ka, "A");
+        a.sign_pub = STANDARD.encode(compressed_looking);
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadKey));
+    }
+
+    #[test]
+    fn a_sign_pub_that_is_not_on_the_curve_is_a_bad_key() {
+        let ka = keys_for(1);
+        let mut a = member_from(&ka, "A");
+        // Correctly shaped (65 bytes, 0x04 prefix) but not an actual curve point.
+        a.sign_pub = STANDARD.encode([0x04u8; 65]);
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadKey));
+    }
+
+    #[test]
+    fn a_kx_pub_of_the_wrong_length_is_a_bad_key() {
+        let ka = keys_for(1);
+        let mut a = member_from(&ka, "A");
+        a.kx_pub = STANDARD.encode([2u8; 31]); // one byte short
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadKey));
+    }
+
+    #[test]
+    fn a_signature_with_invalid_base64_is_refused() {
+        let ka = keys_for(1);
+        let a = member_from(&ka, "A");
+        let mut g = genesis(a, "mine-a".into(), &ka);
+        g.sig = "not-base64!!".into();
+        assert_eq!(accept(None, &g), Err(RosterError::BadSignature));
+    }
+
+    #[test]
+    fn a_signature_of_the_wrong_length_is_refused() {
+        let ka = keys_for(1);
+        let a = member_from(&ka, "A");
+        let mut g = genesis(a, "mine-a".into(), &ka);
+        g.sig = STANDARD.encode([0u8; 63]); // one byte short of 64
+        assert_eq!(accept(None, &g), Err(RosterError::BadSignature));
+    }
+
+    #[test]
+    fn a_genesis_roster_must_be_version_1() {
+        let ka = keys_for(1);
+        let a = member_from(&ka, "A");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 2,
+            members: vec![a.clone()],
+        };
+        let signed = sign(r, &a, &ka);
+        assert_eq!(accept(None, &signed), Err(RosterError::NotGenesis));
+    }
+
+    #[test]
+    fn a_genesis_roster_must_have_exactly_one_member() {
+        let ka = keys_for(1);
+        let kb = keys_for(2);
+        let a = member_from(&ka, "A");
+        let b = member_from(&kb, "B");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 1,
+            members: vec![a.clone(), b],
+        };
+        let signed = sign(r, &a, &ka);
+        assert_eq!(accept(None, &signed), Err(RosterError::NotGenesis));
+    }
+
+    #[test]
+    fn a_genesis_roster_signer_field_must_equal_its_member() {
+        let ka = keys_for(1);
+        let a = member_from(&ka, "A");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 1,
+            members: vec![a.clone()],
+        };
+        // Signed for real with the sole member's key, but the `signer` field
+        // claims someone else. If the "signer == the sole member" check were
+        // ever dropped, this would still verify (it's the same key), so this
+        // is the only thing that can catch it.
+        let msg = bytes(&r);
+        let sig = ka.sign(&msg);
+        let forged = SignedRoster {
+            roster: r,
+            signer: "c-not-the-member0000".into(),
+            sig: STANDARD.encode(sig),
+        };
+        assert_eq!(accept(None, &forged), Err(RosterError::NotGenesis));
+    }
+
+    #[test]
+    fn a_non_member_cannot_add_itself_and_self_sign() {
+        let ka = keys_for(1);
+        let kc = keys_for(3);
+        let a = member_from(&ka, "A");
+        let c = member_from(&kc, "C");
+        let g = genesis(a.clone(), "mine-a".into(), &ka);
+
+        // c was never part of `g`, but tries to add itself to v2 and sign
+        // with its own (genuine, well-formed) key.
+        let v2 = Roster {
+            group: "mine-a".into(),
+            version: 2,
+            members: vec![a, c.clone()],
+        };
+        let signed = sign(v2, &c, &kc);
+        assert_eq!(accept(Some(&g), &signed), Err(RosterError::UnknownSigner));
+    }
+
+    // -- M2: member name shape ------------------------------------------------
+
+    #[test]
+    fn an_empty_member_name_is_refused() {
+        let ka = keys_for(1);
+        let a = member_from(&ka, "");
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadName));
+    }
+
+    #[test]
+    fn a_member_name_with_a_slash_is_refused() {
+        let ka = keys_for(1);
+        let a = member_from(&ka, "lap/top");
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadName));
+    }
+
+    #[test]
+    fn a_member_name_over_32_chars_is_refused() {
+        let ka = keys_for(1);
+        let long_name = "a".repeat(MAX_NAME_LEN + 1);
+        let a = member_from(&ka, &long_name);
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Err(RosterError::BadName));
+    }
+
+    #[test]
+    fn a_member_name_of_exactly_the_max_length_is_accepted() {
+        let ka = keys_for(1);
+        let name = "a".repeat(MAX_NAME_LEN);
+        let a = member_from(&ka, &name);
+        let g = genesis(a, "mine-a".into(), &ka);
+        assert_eq!(accept(None, &g), Ok(()));
     }
 }
