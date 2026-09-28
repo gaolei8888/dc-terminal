@@ -20,6 +20,12 @@ const SIGN_KEY: &str = "sign.key";
 const KX_KEY: &str = "kx.key";
 const NAME: &str = "name";
 const ROSTER: &str = "roster.json";
+const KEYS_LOCK: &str = ".keys.lock";
+
+/// 等别的进程生成钥匙最多等多久。生成本身是几毫秒的事。
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 锁文件多旧就当成是崩掉的进程留下的。
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct Store {
     dir: PathBuf,
@@ -47,24 +53,26 @@ impl Store {
     /// `sign.key` 算出），整套重新生成是安全的。反过来「有 `sign.key` 没有
     /// `kx.key`」不可能由我们自己写出来，是有人动过这个目录，**不猜、报错**：
     /// 悄悄补一把新的 `kx.key` 等于让组里其它电脑加密给我的东西全都解不开。
+    ///
+    /// **名单还在、钥匙却不全，一律报错，不重新生成。** 那种情况下生成一把新
+    /// 钥匙，这台电脑的端点就悄悄换了：名单上写着的还是旧端点，组里谁发来
+    /// 的东西都解不开、验不过，而用户看到的只是「多电脑不灵了」。要重来就让
+    /// 用户自己删掉整个目录，那是一个看得见的决定。
+    ///
+    /// 生成的那一段在 `.keys.lock` 里做：`dct login` 和守护进程可能同一刻
+    /// 都发现「还没有钥匙」，没有这把锁，两边各写一半，落盘的就是一把
+    /// 进程 A 的 `kx.key` 配进程 B 的 `sign.key`。
     pub fn load_or_create_keys(&self, rand: &dyn Fn() -> [u8; 32]) -> Result<MachineKeys> {
-        let sign_path = self.dir.join(SIGN_KEY);
-        let kx_path = self.dir.join(KX_KEY);
-        if sign_path.exists() {
-            if !kx_path.exists() {
-                bail!(
-                    "{} 在，{} 却不见了——不会替你重新生成（那会换掉这台电脑的加密钥匙）",
-                    sign_path.display(),
-                    kx_path.display()
-                );
-            }
-            let sign = read_seed(&sign_path)?;
-            let kx = read_seed(&kx_path)?;
-            return MachineKeys::from_seeds(sign, kx)
-                .map_err(|e| anyhow!("{} 不是一把能用的钥匙：{e}", sign_path.display()));
+        if let Some(k) = self.existing_keys()? {
+            return Ok(k);
+        }
+        self.ensure_dir()?;
+        let _lock = KeysLock::acquire(&self.dir.join(KEYS_LOCK), LOCK_WAIT, LOCK_STALE)?;
+        // 等锁的时候别人可能已经生成好了。
+        if let Some(k) = self.existing_keys()? {
+            return Ok(k);
         }
 
-        self.ensure_dir()?;
         // P-256 的种子要落在 [1, n) 里，随机 32 字节落在外面的概率约 2^-32；
         // 连着好几次都落在外面，说明 `rand` 坏了，不是运气差。
         let mut attempt = 0;
@@ -79,9 +87,38 @@ impl Store {
                 bail!("随机数给不出一把合法的签名钥匙，随机源可能坏了");
             }
         };
-        write_atomic(&kx_path, STANDARD.encode(kx).as_bytes())?;
-        write_atomic(&sign_path, STANDARD.encode(sign).as_bytes())?;
+        write_atomic(&self.dir.join(KX_KEY), STANDARD.encode(kx).as_bytes())?;
+        write_atomic(&self.dir.join(SIGN_KEY), STANDARD.encode(sign).as_bytes())?;
         Ok(keys)
+    }
+
+    /// 磁盘上已经有完整的一对就读出来；还没有（可以生成）就是 `None`；
+    /// 不能生成（见 `load_or_create_keys`）就报错。
+    fn existing_keys(&self) -> Result<Option<MachineKeys>> {
+        let sign_path = self.dir.join(SIGN_KEY);
+        let kx_path = self.dir.join(KX_KEY);
+        let (has_sign, has_kx) = (sign_path.exists(), kx_path.exists());
+        if has_sign && has_kx {
+            let sign = read_seed(&sign_path)?;
+            let kx = read_seed(&kx_path)?;
+            return MachineKeys::from_seeds(sign, kx)
+                .map(Some)
+                .map_err(|e| anyhow!("{} 不是一把能用的钥匙：{e}", sign_path.display()));
+        }
+        if self.dir.join(ROSTER).exists() {
+            bail!(
+                "这台电脑的多电脑钥匙丢了，但组名单还在；要重置请删除 {} 后重新 dct login",
+                self.dir.display()
+            );
+        }
+        if has_sign {
+            bail!(
+                "{} 在，{} 却不见了——不会替你重新生成（那会换掉这台电脑的加密钥匙）",
+                sign_path.display(),
+                kx_path.display()
+            );
+        }
+        Ok(None)
     }
 
     /// 这台电脑在组里叫什么。没设过就是主机名（整理成名单接受的样子）。
@@ -137,6 +174,61 @@ pub fn dir_for_socket(socket: &Path) -> PathBuf {
     match socket.parent() {
         Some(d) => d.join("mesh"),
         None => PathBuf::from("mesh"),
+    }
+}
+
+/// 跨进程的「我在生成钥匙」：独占创建一个文件，用完删掉。
+///
+/// 进程崩在中间会留下锁文件，所以超过 `stale` 的锁当成没人拿着、删掉重来；
+/// 生成钥匙只要几毫秒，一把一分钟前的锁不可能还有人在用。
+struct KeysLock {
+    path: PathBuf,
+}
+
+impl KeysLock {
+    fn acquire(
+        path: &Path,
+        wait: std::time::Duration,
+        stale: std::time::Duration,
+    ) -> Result<KeysLock> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => {
+                    return Ok(KeysLock {
+                        path: path.to_path_buf(),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok());
+                    if age.is_some_and(|a| a > stale) {
+                        let _ = std::fs::remove_file(path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "另一个 dct 正在生成多电脑钥匙，等不到它结束（{}）",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(e).with_context(|| format!("建不了 {}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for KeysLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -313,6 +405,121 @@ mod tests {
         }
         let dir_mode = std::fs::metadata(s.dir()).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn missing_keys_with_a_roster_present_is_an_error_not_a_new_identity() {
+        let (_t, s) = store();
+        let k = s.load_or_create_keys(&counter_rand()).unwrap();
+        s.save_roster(&genesis(member_of(&k, "laptop"), "mine".into(), &k))
+            .unwrap();
+
+        for gone in [&[SIGN_KEY, KX_KEY][..], &[SIGN_KEY][..], &[KX_KEY][..]] {
+            let (_t2, s2) = store();
+            std::fs::create_dir_all(s2.dir()).unwrap();
+            for f in [SIGN_KEY, KX_KEY, ROSTER] {
+                std::fs::copy(s.dir().join(f), s2.dir().join(f)).unwrap();
+            }
+            for f in gone {
+                std::fs::remove_file(s2.dir().join(f)).unwrap();
+            }
+            let err = s2
+                .load_or_create_keys(&|| panic!("不该生成新钥匙"))
+                .err()
+                .unwrap_or_else(|| panic!("少了 {gone:?} 该报错"));
+            assert!(
+                err.to_string().contains("钥匙丢了，但组名单还在"),
+                "{gone:?}: {err}"
+            );
+            for f in [SIGN_KEY, KX_KEY] {
+                if gone.contains(&f) {
+                    assert!(!s2.dir().join(f).exists(), "{f} 不该被补上");
+                }
+            }
+        }
+    }
+
+    /// 写入顺序：`kx.key` 先落盘。让 `kx.key` 那一步失败，`sign.key` 就绝不
+    /// 能出现——顺序反过来的话，这里会留下一把孤零零的 `sign.key`，下次启动
+    /// 就是「有 sign 没 kx」那个报错。
+    #[test]
+    fn kx_key_is_written_before_sign_key() {
+        let (_t, s) = store();
+        std::fs::create_dir_all(s.dir()).unwrap();
+        std::fs::create_dir(s.dir().join("kx.key.tmp")).unwrap();
+        assert!(s.load_or_create_keys(&counter_rand()).is_err());
+        assert!(!s.dir().join(SIGN_KEY).exists());
+    }
+
+    /// 别的进程拿着锁的时候，这边等它，然后读它生成的那一对，不自己再生成。
+    #[test]
+    fn a_held_keys_lock_makes_the_other_creator_wait_and_reuse_the_keys() {
+        let (t, s) = store();
+        std::fs::create_dir_all(s.dir()).unwrap();
+        let lock = KeysLock::acquire(
+            &s.dir().join(KEYS_LOCK),
+            std::time::Duration::from_secs(1),
+            LOCK_STALE,
+        )
+        .unwrap();
+        let dir = t.path().join("mesh");
+        let waiter = std::thread::spawn(move || {
+            Store::at(dir)
+                .load_or_create_keys(&|| [5u8; 32])
+                .map(|k| k.sign_pub())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "锁还在，不该往下走");
+        assert!(!s.dir().join(SIGN_KEY).exists());
+        // 「另一个进程」在锁里把钥匙写好，然后放锁。
+        let mine = MachineKeys::from_seeds([7; 32], [8; 32]).unwrap();
+        write_atomic(&s.dir().join(KX_KEY), STANDARD.encode([8u8; 32]).as_bytes()).unwrap();
+        write_atomic(
+            &s.dir().join(SIGN_KEY),
+            STANDARD.encode([7u8; 32]).as_bytes(),
+        )
+        .unwrap();
+        drop(lock);
+        assert_eq!(waiter.join().unwrap().unwrap(), mine.sign_pub());
+        assert!(!s.dir().join(KEYS_LOCK).exists(), "用完要删锁");
+    }
+
+    #[test]
+    fn a_stale_keys_lock_left_by_a_crash_is_broken() {
+        let (_t, s) = store();
+        std::fs::create_dir_all(s.dir()).unwrap();
+        let f = std::fs::File::create(s.dir().join(KEYS_LOCK)).unwrap();
+        f.set_modified(std::time::SystemTime::now() - LOCK_STALE * 2)
+            .unwrap();
+        drop(f);
+        assert!(s.load_or_create_keys(&counter_rand()).is_ok());
+    }
+
+    /// 两个进程同时第一次建钥匙：拿到的必须是同一对，磁盘上也是那一对。
+    #[test]
+    fn concurrent_creators_end_up_with_one_matching_pair() {
+        for _ in 0..20 {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("mesh");
+            let spawn = |seed: u8| {
+                let d = dir.clone();
+                std::thread::spawn(move || {
+                    let n = Cell::new(seed);
+                    Store::at(d)
+                        .load_or_create_keys(&move || {
+                            n.set(n.get().wrapping_add(1));
+                            [n.get(); 32]
+                        })
+                        .map(|k| (k.sign_pub(), k.kx_pub()))
+                        .unwrap()
+                })
+            };
+            let (a, b) = (spawn(10), spawn(100));
+            let (a, b) = (a.join().unwrap(), b.join().unwrap());
+            assert_eq!(a, b);
+            let disk = Store::at(dir).load_or_create_keys(&|| [1; 32]).unwrap();
+            assert_eq!((disk.sign_pub(), disk.kx_pub()), a);
+        }
     }
 
     #[test]

@@ -55,28 +55,48 @@ pub struct QueuedMsg {
     pub received_at: Instant,
 }
 
-/// 最近见过的 `(from, id)`，先进先出、有上限。
+/// 最近见过的 `(from, id)`，带着它的 `sent_at`。
+///
+/// 两种方式往外挤：按年龄（`sent_at` 已经落到窗口外面的，反正回放进来也会
+/// 被窗口挡掉，不用再记），和按条数（`SEEN_CAP`，兜底，防一个发件人刷爆
+/// 内存）。
 #[derive(Default)]
 struct Seen {
-    order: VecDeque<(String, String)>,
+    order: VecDeque<(String, String, u64)>,
     set: HashSet<(String, String)>,
 }
 
 impl Seen {
     /// 第一次见返回 `true` 并记下；见过返回 `false`。
-    fn first_time(&mut self, from: &str, id: &str) -> bool {
+    fn first_time(&mut self, from: &str, id: &str, sent_at: u64, now: u64) -> bool {
+        self.evict_older_than(now.saturating_sub(SENT_AT_WINDOW_SECS));
         let key = (from.to_string(), id.to_string());
         if self.set.contains(&key) {
             return false;
         }
         if self.order.len() >= SEEN_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
+            if let Some((f, i, _)) = self.order.pop_front() {
+                self.set.remove(&(f, i));
             }
         }
-        self.order.push_back(key.clone());
+        self.order
+            .push_back((key.0.clone(), key.1.clone(), sent_at));
         self.set.insert(key);
         true
+    }
+
+    /// 扔掉 `sent_at` 早于 `cutoff` 的。`order` 按收到的顺序排，不按
+    /// `sent_at` 排，所以要扫一遍而不是只看队头——一条未来时间的留言排在
+    /// 前面，不该挡住后面已经过期的。
+    fn evict_older_than(&mut self, cutoff: u64) {
+        let set = &mut self.set;
+        self.order.retain(|(f, i, t)| {
+            let keep = *t >= cutoff;
+            if !keep {
+                set.remove(&(f.clone(), i.clone()));
+            }
+            keep
+        });
     }
 }
 
@@ -95,6 +115,10 @@ pub struct Mesh {
     store: Option<store::Store>,
     journal: Arc<Journal>,
     seen: Seen,
+    /// 这个进程从什么时候开始收（unix 秒）。`sent_at` 早于它的留言一律不收：
+    /// 去重表只活在内存里，重启就空了，没有这一条，重启前收过的留言在窗口
+    /// 之内可以原样再回放一遍。第一步没有离线留言，合法的东西不会因此丢。
+    started_at: u64,
     clock: Clock,
     rand: Rand,
 }
@@ -123,6 +147,7 @@ impl Mesh {
             store: None,
             journal: Arc::new(Journal::new()),
             seen: Seen::default(),
+            started_at: unix_now(),
             clock: Box::new(unix_now),
             rand: Box::new(os_rand),
         }
@@ -147,8 +172,17 @@ impl Mesh {
         self
     }
 
+    /// 换时钟。进程起点跟着换成这个时钟的「现在」——见 `started_at`。
     pub fn with_clock(mut self, c: impl Fn() -> u64 + Send + 'static) -> Mesh {
+        self.started_at = c();
         self.clock = Box::new(c);
+        self
+    }
+
+    /// 测试用：直接指定进程起点。
+    #[cfg(test)]
+    fn with_started_at(mut self, t: u64) -> Mesh {
+        self.started_at = t;
         self
     }
 
@@ -217,7 +251,10 @@ impl Mesh {
         if now.abs_diff(m.sent_at) > SENT_AT_WINDOW_SECS {
             return self.drop(env, "stale");
         }
-        if !self.seen.first_time(&m.from, &m.id) {
+        if m.sent_at < self.started_at {
+            return self.drop(env, "before_start");
+        }
+        if !self.seen.first_time(&m.from, &m.id, m.sent_at, now) {
             return self.drop(env, "replay");
         }
         match m.kind {
@@ -336,8 +373,13 @@ mod tests {
         r2.version = 2;
         r2.members.push(mb);
         let v2 = roster::sign(r2, &ma, &ka);
-        let a = Mesh::new(ka, "A".into(), Some(v2.clone())).with_clock(|| NOW);
-        let b = Mesh::new(kb, "B".into(), Some(v2.clone())).with_clock(|| NOW);
+        // 进程起点放在窗口之前，窗口那几条测试才测得到窗口本身。
+        let a = Mesh::new(ka, "A".into(), Some(v2.clone()))
+            .with_clock(|| NOW)
+            .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS);
+        let b = Mesh::new(kb, "B".into(), Some(v2.clone()))
+            .with_clock(|| NOW)
+            .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS);
         (a, b, v2)
     }
 
@@ -463,13 +505,47 @@ mod tests {
     fn the_seen_set_is_bounded() {
         let mut s = Seen::default();
         for i in 0..SEEN_CAP + 10 {
-            assert!(s.first_time("c-a", &i.to_string()));
+            assert!(s.first_time("c-a", &i.to_string(), NOW, NOW));
         }
         assert_eq!(s.order.len(), SEEN_CAP);
         assert_eq!(s.set.len(), SEEN_CAP);
-        assert!(!s.first_time("c-a", &(SEEN_CAP + 9).to_string()));
-        assert!(s.first_time("c-a", "0"), "最老的已经被挤出去了");
-        assert!(s.first_time("c-b", "5"), "去重键里有 from");
+        assert!(!s.first_time("c-a", &(SEEN_CAP + 9).to_string(), NOW, NOW));
+        assert!(s.first_time("c-a", "0", NOW, NOW), "最老的已经被挤出去了");
+        assert!(s.first_time("c-b", "5", NOW, NOW), "去重键里有 from");
+    }
+
+    /// 按年龄挤：`sent_at` 落到窗口外的条目被清掉，窗口内的留着。
+    #[test]
+    fn the_seen_set_forgets_entries_older_than_the_window() {
+        let mut s = Seen::default();
+        assert!(s.first_time("c-a", "old", NOW, NOW));
+        // 一条未来时间的排在中间，不该挡住后面过期条目的清理。
+        assert!(s.first_time("c-a", "future", NOW + 500, NOW));
+        assert!(s.first_time("c-a", "young", NOW + 100, NOW + 100));
+        let later = NOW + SENT_AT_WINDOW_SECS + 1;
+        assert!(s.first_time("c-a", "x", later, later));
+        let ids: Vec<&str> = s.order.iter().map(|(_, i, _)| i.as_str()).collect();
+        assert_eq!(ids, ["future", "young", "x"]);
+        assert_eq!(s.set.len(), 3);
+    }
+
+    /// 重启之后，去重表是空的——窗口之内的旧留言靠「早于进程起点」挡住。
+    #[test]
+    fn a_message_accepted_before_a_restart_is_refused_after_it() {
+        let (a, mut b, v2) = pair_ab();
+        let e = sealed_env(&a, &b, &msg(&a, &b, Kind::Msg, "m1", NOW));
+        assert!(b.on_envelope(&e).is_some());
+
+        // 「重启」：同一把钥匙、同一份名单，一个新的 Mesh，起点在 NOW 之后。
+        let restarted_keys = keys(2);
+        let mut b2 = Mesh::new(restarted_keys, "B".into(), Some(v2)).with_clock(|| NOW + 30);
+        assert_eq!(b2.endpoint(), b.endpoint());
+        assert_eq!(b2.on_envelope(&e), None, "重启前收过的不该再收一次");
+        assert!(b2.queues.is_empty());
+
+        // 重启之后新发的照收。
+        let fresh = sealed_env(&a, &b2, &msg(&a, &b2, Kind::Msg, "m2", NOW + 30));
+        assert!(b2.on_envelope(&fresh).is_some());
     }
 
     #[test]
