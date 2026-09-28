@@ -565,11 +565,34 @@ mod tests {
     #[test]
     fn a_sign_pub_that_is_not_on_the_curve_is_a_bad_key() {
         let ka = keys_for(1);
-        let mut a = member_from(&ka, "A");
         // Correctly shaped (65 bytes, 0x04 prefix) but not an actual curve point.
-        a.sign_pub = STANDARD.encode([0x04u8; 65]);
+        let off_curve = [0x04u8; 65];
+        let mut a = member_from(&ka, "A");
+        a.sign_pub = STANDARD.encode(off_curve);
+        // Bind `endpoint` to this same (invalid) key. If it stayed bound to
+        // `ka`'s real key instead, the endpoint-binding check (I1) would
+        // reject this roster on its own, and a mutant that deletes the
+        // curve-validity parse in `decode_sign_pub` would go unnoticed: the
+        // test would still see `BadKey`, just for the wrong reason.
+        a.endpoint = id::endpoint_for(&off_curve);
         let g = genesis(a, "mine-a".into(), &ka);
         assert_eq!(accept(None, &g), Err(RosterError::BadKey));
+    }
+
+    #[test]
+    fn decode_sign_pub_rejects_wrong_length_missing_prefix_and_off_curve_points() {
+        // Direct unit tests on the private decoder itself, not through
+        // `accept`: going through `accept`/`genesis` can let an unrelated
+        // check (or, for the signature, `keys::verify` failing on bogus
+        // material) produce the same outer error for the wrong reason, which
+        // is exactly how a mutated decoder can hide behind a passing test.
+        assert_eq!(decode_sign_pub(&STANDARD.encode([4u8; 64])), None); // wrong length
+        let mut wrong_prefix = [4u8; 65];
+        wrong_prefix[0] = 0x03;
+        assert_eq!(decode_sign_pub(&STANDARD.encode(wrong_prefix)), None); // not 0x04
+        assert_eq!(decode_sign_pub(&STANDARD.encode([4u8; 65])), None); // right shape, off curve
+        let real = keys_for(1).sign_pub();
+        assert_eq!(decode_sign_pub(&STANDARD.encode(real)), Some(real));
     }
 
     #[test]
@@ -597,6 +620,22 @@ mod tests {
         let mut g = genesis(a, "mine-a".into(), &ka);
         g.sig = STANDARD.encode([0u8; 63]); // one byte short of 64
         assert_eq!(accept(None, &g), Err(RosterError::BadSignature));
+    }
+
+    #[test]
+    fn decode_sig_rejects_anything_that_is_not_exactly_64_bytes() {
+        // Direct unit test on the private decoder, not through `accept`: a
+        // mutant that replaces `decode_sig`'s body with a constant (e.g.
+        // always `Some([0; 64])`, ignoring length entirely) would still make
+        // `accept` fail with `BadSignature` downstream — an all-zero r||s is
+        // never a valid signature — so `a_signature_of_the_wrong_length_is_
+        // refused` above can't tell a working length check from a deleted
+        // one. This test can: it uses a non-zero fill, so a constant-valued
+        // mutant is caught on the *valid*-length case too.
+        assert_eq!(decode_sig(&STANDARD.encode([7u8; 63])), None);
+        assert_eq!(decode_sig(&STANDARD.encode([7u8; 65])), None);
+        assert_eq!(decode_sig(&STANDARD.encode([7u8; 64])), Some([7u8; 64]));
+        assert_eq!(decode_sig("not valid base64!!"), None);
     }
 
     #[test]
