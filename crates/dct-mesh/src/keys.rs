@@ -1,6 +1,6 @@
 //! 一台电脑的两把钥匙：P-256 用来签名单（跟 dct-brain 的票据签名同一条曲线，
-//! 纯 Rust，没有 C），X25519 用来以后的会话加密（第一期名单和消息先明文走，
-//! 这把钥匙先占位）。种子由调用方给——这个 crate 不碰随机数生成器，见 lib.rs。
+//! 纯 Rust，没有 C），X25519 用来给 `seal` 模块的留言做端到端加密。种子由
+//! 调用方给——这个 crate 不碰随机数生成器，见 lib.rs。
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature as EcSig, SigningKey, VerifyingKey};
 use x25519_dalek::{PublicKey as KxPublicKey, StaticSecret};
@@ -45,6 +45,13 @@ impl MachineKeys {
 
     pub fn kx_pub(&self) -> [u8; 32] {
         KxPublicKey::from(&self.kx).to_bytes()
+    }
+
+    /// 跟另一台电脑的 X25519 公钥做 Diffie-Hellman，给 `seal` 模块派生对称
+    /// 密钥用。两边各自用「自己的私钥 + 对方的公钥」算，算出同一个共享点。
+    pub fn diffie_hellman(&self, their_kx_pub: &[u8; 32]) -> [u8; 32] {
+        let their = KxPublicKey::from(*their_kx_pub);
+        self.kx.diffie_hellman(&their).to_bytes()
     }
 
     /// 对 `msg` 签名（内部先做 SHA-256），返回 64 字节 `r||s`。
@@ -124,5 +131,20 @@ mod tests {
     #[test]
     fn garbage_public_keys_and_signatures_fail_closed_instead_of_panicking() {
         assert!(!verify(&[0u8; 65], b"hello", &[0u8; 64]));
+    }
+
+    #[test]
+    fn diffie_hellman_is_symmetric_between_two_machines() {
+        let a = keys(1);
+        let b = keys(2);
+        assert_eq!(a.diffie_hellman(&b.kx_pub()), b.diffie_hellman(&a.kx_pub()));
+    }
+
+    #[test]
+    fn diffie_hellman_differs_for_a_different_peer() {
+        let a = keys(1);
+        let b = keys(2);
+        let c = keys(3);
+        assert_ne!(a.diffie_hellman(&b.kx_pub()), a.diffie_hellman(&c.kx_pub()));
     }
 }

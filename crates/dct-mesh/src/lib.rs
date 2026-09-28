@@ -8,8 +8,11 @@
 pub mod canon;
 pub mod id;
 pub mod keys;
+pub mod relay_token;
 pub mod roster;
 pub mod sas;
+pub mod seal;
+pub mod wire;
 
 pub use id::{AddrError, Address};
 pub use keys::{KeyError, MachineKeys};
