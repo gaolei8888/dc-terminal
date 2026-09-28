@@ -218,19 +218,147 @@ POST /admin/api/relay/token
   从这台电脑的 P-256 签名公钥算出（`"c-"` 加该公钥 SHA-256 摘要前 20 位十六进制，
   `crates/dct-mesh/src/id.rs`）。dct 自己算出来的值恒合法，400 这条分支是网关对
   输入的防御，不是 dct 正常路径会走到的地方。
-- **令牌格式是 `dct_mesh::relay_token`**（`crates/dct-mesh/src/relay_token.rs`）：
-  `base64url`（无 padding）编码的 `{account, endpoint, exp, sig}`。
-  - `account`：网关里这个账号的用户 id，十进制字符串。
-  - `endpoint`：原样回填请求里的那个 `endpoint`。
-  - `exp`：签发时刻 + 7 天，unix 秒。
-  - `sig`：对 `relay_token::bytes(&claims)` 的 P-256 ECDSA(SHA-256) 签名，
-    标准 base64。
-- **签名钥匙是网关自己的一把 P-256**，跟每台电脑各自的身份钥匙无关。公钥交给
-  中转，写进中转启动参数 `--relay-keys` 指向的文件；中转验证令牌时依次试文件里
-  每一把公钥，任一把验过就算数（`relay_token::verify` 已经是这个形状），这样
-  网关将来轮换签名钥匙、加第二把，不用两边同时发版。
 - `api_key` **只出现在这一次请求的 `Authorization` 头里**：不进请求体、不进日志、
   也绝不转发给中转——中转往后只看得到这张令牌，看不到 `api_key` 本身。
+
+**这一节到「已知答案向量」为止，字节精确到位——目标是让一个完全不认识
+`dct-mesh` 这个 Rust crate 的仓库（比如网关那边用 Python 实现签发）能只靠这几段
+文字把令牌签对，不用去读 `relay_token.rs` 的源码。** dct 这半边的等价实现和验证
+都在 `crates/dct-mesh/src/relay_token.rs`；最下面那条已知答案向量有一个 Rust
+测试钉着（`relay_token::tests::the_appendix_known_answer_vector_is_accepted`），
+这几段文字改了、代码没跟着改，或者代码改了、这几段文字没跟着改，这条测试就红。
+
+### 1. 规范签名字节（canonical bytes），精确到位
+
+依次对四个字段做「长度前缀」编码，首尾相接，中间不留分隔符——每个字段自己
+的长度前缀已经防住了相邻字段粘连（`crates/dct-mesh/src/canon.rs::field`）：
+
+```
+encode(s) = <UTF-8 字节长度的十进制 ASCII>":"<s 的 UTF-8 字节>
+bytes(claims) = encode("dct-relay-token-v1")
+              + encode(account)
+              + encode(endpoint)
+              + encode(str(exp))       # exp 先转成十进制字符串再编码，
+                                        # 不是把 exp 的数值按二进制写进去
+```
+
+**四个字段的顺序固定死**：版本标签、`account`、`endpoint`、`exp`，谁也不能重排。
+版本标签是字面量字符串 `"dct-relay-token-v1"`（18 个字节），不是版本号变量。
+
+这几个字段（版本标签、十进制的 account、`c-` 加十六进制的 endpoint、十进制的
+exp）全部落在 ASCII 可打印字符集里，所以整条 `bytes(claims)` 本身就是一段可以
+当文本打印、复制、逐字符核对的字符串——不需要转 16 进制才能看。
+
+**worked example**（跟下面第 5 节的已知答案向量共用同一组 claims）：
+
+```
+account  = "424242"
+endpoint = "c-0011223344556677889a"
+exp      = 1735689600
+
+bytes(claims) =
+  "18:dct-relay-token-v1" + "6:424242" + "22:c-0011223344556677889a" + "10:1735689600"
+
+也就是这一整条、67 个字节、逐字符如下（可以直接复制去跟自己的实现比对）：
+
+18:dct-relay-token-v16:42424222:c-0011223344556677889a10:1735689600
+```
+
+### 2. 签名
+
+对上面那串 `bytes(claims)` 做 **P-256（secp256r1）ECDSA，哈希用 SHA-256**（也就是
+`ECDSA-SHA256`：先对整条 `bytes(claims)` 算 SHA-256，再对摘要做 ECDSA，不是对
+原始字节做别的哈希）。签名编码成 **64 字节的 `r || s`**（`r` 32 字节大端、`s` 32
+字节大端，首尾相接，不是 DER），再用**标准 base64（`+`/`/`，带 `=` padding）**
+编码成字符串，装进令牌 JSON 的 `sig` 字段。
+
+**Python 的 `cryptography` 库默认吐出的是 DER 编码的签名，必须转换**：
+
+```python
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+r, s = decode_dss_signature(der_signature)          # der_signature 是 ecdsa.sign() 的返回值
+sig64 = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+sig_b64 = base64.b64encode(sig64).decode()           # 标准 base64，带 padding
+```
+
+反过来，中转/dct 验证从别处收到的签名时也是同一套：先从 64 字节切成两个 32
+字节大端整数当 `r`、`s`，要验证就把它们编回 DER（或者直接喂给一个接受 `(r, s)`
+元组的验证函数），不能拿 64 字节原始拼接直接当 DER 用。
+
+**ECDSA 签名本身是可延展的（malleable）**：同一条消息、同一把私钥，`(r, s)` 和
+`(r, n-s)` 都是合法签名。所以下面已知答案向量里给出的 `sig`／`token` 是**这一次
+签出来的一个合法值**，不是唯一合法值——网关那边用 Python 重新签同样的 claims、
+同样的私钥，大概率会得到字节不同但同样合法的另一个 `sig`（除非两边都用确定性
+nonce，比如 RFC 6979，且实现细节完全一致）。因此第 5 节的向量不是拿来比对「签出
+来的字节是否完全相同」，而是拿来确认「用这把公钥去验这个固定的 token，必须通过」
+——这才是网关和 dct 双方都要对得上的那件事。
+
+### 3. 令牌字符串
+
+令牌本身是 **`base64url`（不带 padding）** 编码的一段 JSON：
+
+```json
+{"account": "<十进制字符串>", "endpoint": "<c- 加 20 位小写十六进制>", "exp": <整数>, "sig": "<标准 base64，带 padding>"}
+```
+
+**JSON 里四个字段的先后顺序不重要**——中转和 dct 验证时验的是第 1 节那串按固定
+顺序拼出来的 `bytes(claims)`，不是直接验这段 JSON 的字节，所以序列化库输出的字段
+顺序（Python 的 dict 插入序、Rust 的 struct 字段序……)怎么样都不影响验证结果。
+`exp` 在 JSON 里是数字，不是字符串——只有喂给第 1 节 `encode()` 的时候才转成
+十进制字符串。
+
+### 4. 中转信任的公钥
+
+中转的 `--relay-keys` 文件是一份公钥清单，**一行一把**，每一行是该公钥的
+**SEC1 未压缩编码**（65 字节：`0x04` 前缀 + 32 字节 X 坐标 + 32 字节 Y 坐标）用
+**标准 base64**（带 padding）编码后的字符串。中转启动时把文件每一行都解码成一把
+公钥，验证令牌时依次去试，任一把验过就算数——`relay_token::verify` 的实现已经
+是这个形状（`crates/dct-mesh/src/relay_token.rs`），这样网关将来轮换签名钥匙、
+同时挂两把，不需要中转和网关同时发版。**这把签名钥匙是网关自己单独一把**，跟每
+台电脑各自的身份钥匙（`MachineKeys`）无关，也不需要落在 dct 这边。
+
+### 5. 已知答案向量（Known-Answer Vector）
+
+**下面这把私钥只用于这条向量，任何环境都不许用它签发真令牌**——它的明文写在
+这份文档和 git 历史里，永远公开。
+
+```
+issuer 私钥（32 个字节，全部是 0x01，仅测试用，绝不能用于生产）：
+  十进制字节数组：[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  十六进制（64 个字符 = 32 字节）：
+  0101010101010101010101010101010101010101010101010101010101010101
+
+claims：
+  account  = "424242"
+  endpoint = "c-0011223344556677889a"
+  exp      = 1735689600
+
+bytes(claims)（第 1 节给过一遍，这里重复方便对照）：
+  18:dct-relay-token-v16:42424222:c-0011223344556677889a10:1735689600
+
+issuer 公钥（SEC1 未压缩，65 字节，标准 base64——这就是 --relay-keys 文件里的
+一行）：
+  BG/wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW/AdxT9sCwx+7ni0DG/30lqW4igrmJzvccFEo=
+
+一个由上面这把私钥对上面这条 claims 签出的合法 token（第 2 节说过，这不是唯一
+合法值，但必须能被下面这把公钥验证通过）：
+  eyJhY2NvdW50IjoiNDI0MjQyIiwiZW5kcG9pbnQiOiJjLTAwMTEyMjMzNDQ1NTY2Nzc4ODlhIiwiZXhwIjoxNzM1Njg5NjAwLCJzaWciOiJka2F6YklDdXhPRTBubkp5d1V6MmlTQ2FkOUR2b21ZeitRcCtGTDduNmtVejFvOHZwYldOZWpQUGJuWFJQQ050TWJBNlFNUzZDN3RKUDltU1c3SktTQT09In0
+```
+
+**要通过的检查**：`dct-mesh` 的 `relay_token::verify(token, &[issuer_pub], now)`
+（`now` 取任何小于 `1735689600` 的值，比如 `0`）必须返回
+`Ok(Claims { account: "424242", endpoint: "c-0011223344556677889a", exp: 1735689600 })`。
+网关那边（Python 或别的语言）如果要自测「我签的令牌是不是这份契约要的形状」，
+最直接的办法就是照第 1–3 节自己实现一遍编码/签名/打包，再让 dct 或一份独立的
+`relay_token::verify` 调用去验——而不是去比对跟这里给出的 `sig`/`token` 字节
+完全一致（那由 ECDSA 的可延展性决定，永远对不上）。
+
+dct 侧的对应测试是
+`relay_token::tests::the_appendix_known_answer_vector_is_accepted`
+（`crates/dct-mesh/src/relay_token.rs`）：拿这份文档里原样抄出来的公钥和 token
+调 `verify`，钉住这段文字不会跟代码走岔。
 
 **dct 这边的失败文案**（`mesh::login::fetch_token` 直接返回给学生看的中文，不是
 错误码——这个模块今天没有自己的 i18n key，往后接 TUI 时再决定要不要挪过去）：

@@ -239,4 +239,46 @@ mod tests {
             Err(TokenError::Malformed)
         );
     }
+
+    /// **Pins the known-answer vector printed in the design doc's appendix**
+    /// (`docs/superpowers/specs/2026-09-28-dct-multi-machine-design.md`,
+    /// "附录：网关签中转令牌") so the doc cannot silently drift from what this
+    /// code actually accepts. If `canon::field`'s encoding, `relay_token`'s
+    /// JSON shape, or the base64 alphabet/padding used anywhere in this file
+    /// ever changes, this test breaks — that is the point: whoever changes it
+    /// must also update the appendix's worked example, because a separate
+    /// (e.g. Python) implementation of the gateway has nothing else to check
+    /// itself against but that worked example.
+    ///
+    /// The issuer key below (`sign_seed = [1u8; 32]`) is a fixed, published,
+    /// test-only scalar — **never use it for anything real**, its private
+    /// key is printed in this repository's history forever.
+    #[test]
+    fn the_appendix_known_answer_vector_is_accepted() {
+        let claims = Claims {
+            account: "424242".into(),
+            endpoint: "c-0011223344556677889a".into(),
+            exp: 1_735_689_600,
+        };
+
+        // Canonical bytes, exactly as the appendix shows them (all-ASCII, so
+        // the doc can print them as text rather than hex).
+        assert_eq!(
+            bytes(&claims),
+            b"18:dct-relay-token-v16:42424222:c-0011223344556677889a10:1735689600".to_vec()
+        );
+
+        // Issuer public key, exactly as the appendix's `--relay-keys` line.
+        let issuer_pub_b64 =
+            "BG/wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW/AdxT9sCwx+7ni0DG/30lqW4igrmJzvccFEo=";
+        let issuer_pub_bytes = STANDARD.decode(issuer_pub_b64).expect("valid base64");
+        let mut issuer_pub = [0u8; 65];
+        issuer_pub.copy_from_slice(&issuer_pub_bytes);
+
+        // Token, exactly as the appendix prints it.
+        let token = "eyJhY2NvdW50IjoiNDI0MjQyIiwiZW5kcG9pbnQiOiJjLTAwMTEyMjMzNDQ1NTY2Nzc4ODlhIiwiZXhwIjoxNzM1Njg5NjAwLCJzaWciOiJka2F6YklDdXhPRTBubkp5d1V6MmlTQ2FkOUR2b21ZeitRcCtGTDduNmtVejFvOHZwYldOZWpQUGJuWFJQQ050TWJBNlFNUzZDN3RKUDltU1c3SktTQT09In0";
+
+        // now = 0: any exp in the vector (a 2025 date) is safely in the future.
+        assert_eq!(verify(token, &[issuer_pub], 0), Ok(claims));
+    }
 }
