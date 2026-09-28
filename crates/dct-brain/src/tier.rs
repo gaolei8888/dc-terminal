@@ -58,9 +58,13 @@ const MONEY_EN: &[&str] = &["pay", "buy", "order", "checkout", "purchase"];
 // 用户批准时可以改低。运行时的兜底不看这张表，否则又回到「太严」。
 const AMBIGUOUS_ZH: &[&str] = &["下一步", "继续", "确定", "好的"];
 const AMBIGUOUS_EN: &[&str] = &["next", "continue", "ok", "okay", "yes", "allow"];
-// 否定：「不保存」「Don't save」不是保存。中文只认开头，免得「保存不了」被当成否定；
-// 英文只认第一个词，免得「Save for later」被当成否定。
-const NEGATION_ZH: &[&str] = &["不", "取消", "暂不", "以后再说", "稍后", "放弃", "别"];
+// 否定：「不保存」「Don't save」不是保存。中文只认明确的否定词开头（不是裸「不」），
+// 免得「不限量购买」「保存不了」这类词被当成否定；英文只认第一个词，免得
+// 「Save for later」被当成否定。无论怎么判否定，含钱词的子句永远不会被否定压低
+// （见 `is_money_clause` / `effectively_negated`）。
+const NEGATION_ZH: &[&str] = &[
+    "不要", "不用", "不保存", "不发", "不了", "不再", "不需要", "不同意", "不允许", "取消", "暂不", "以后再说", "稍后", "放弃", "别",
+];
 const NEGATION_EN: &[&str] = &["don't", "dont", "not", "cancel", "no", "skip", "later", "discard"];
 
 fn words(label: &str) -> Vec<String> {
@@ -77,10 +81,20 @@ fn hit(label: &str, zh: &[&str], en: &[&str]) -> bool {
     zh.iter().any(|z| label.contains(z)) || words(label).iter().any(|w| en.contains(&w.as_str()))
 }
 
+fn is_money_clause(clause: &str) -> bool {
+    hit(clause, MONEY_ZH, MONEY_EN)
+}
+
 fn negated(label: &str) -> bool {
     let t = label.trim_start();
     NEGATION_ZH.iter().any(|n| t.starts_with(n))
         || words(t).first().is_some_and(|w| NEGATION_EN.contains(&w.as_str()))
+}
+
+/// A clause that names money can never be hidden by a negation word — see
+/// design ruling: 「不限量购买」/"No-fee checkout" must still read as `Money`.
+fn effectively_negated(clause: &str) -> bool {
+    !is_money_clause(clause) && negated(clause)
 }
 
 fn split_clauses(label: &str) -> Vec<&str> {
@@ -118,7 +132,7 @@ pub fn tier_for_label(label: &str) -> Tier {
     clauses
         .iter()
         .filter_map(|clause| {
-            if negated(clause) {
+            if effectively_negated(clause) {
                 None
             } else {
                 Some(score_clause(clause))
@@ -156,8 +170,9 @@ pub fn tier_for_step(action: &str, arg: &str) -> Tier {
             let a = arg.trim();
             let clauses = split_clauses(a);
 
-            // Only return SelfOnly if EVERY clause is negated.
-            if !clauses.is_empty() && clauses.iter().all(|c| negated(c)) {
+            // Only return SelfOnly if EVERY clause is negated (a money clause is
+            // never "effectively" negated, so its presence rules this out).
+            if !clauses.is_empty() && clauses.iter().all(|c| effectively_negated(c)) {
                 return Tier::SelfOnly;
             }
 
@@ -171,7 +186,7 @@ pub fn tier_for_step(action: &str, arg: &str) -> Tier {
                 // For tap_by_intent, check if any non-negated clause has ambiguous words.
                 let has_ambiguous_in_nonnegated = clauses
                     .iter()
-                    .any(|c| !negated(c) && hit(c, AMBIGUOUS_ZH, AMBIGUOUS_EN));
+                    .any(|c| !effectively_negated(c) && hit(c, AMBIGUOUS_ZH, AMBIGUOUS_EN));
                 if has_ambiguous_in_nonnegated {
                     Tier::Content
                 } else {
@@ -325,5 +340,22 @@ mod tests {
         assert_eq!(raise(Tier::SelfOnly, "No, post anyway", true), Tier::Content);
         // All clauses negated still counts as negation.
         assert_eq!(tier_for_step("tap_by_intent", "Not now, maybe later"), Tier::SelfOnly);
+    }
+
+    #[test]
+    fn money_clauses_are_never_suppressed_by_negation() {
+        // 「不限量购买」: bare 「不」 is not one of the explicit negation words,
+        // and even if it were, a money clause can never be negated away.
+        assert_eq!(tier_for_label("不限量购买"), Tier::Money);
+        assert_eq!(tier_for_step("tap_by_intent", "不限量购买"), Tier::Money);
+
+        // Hyphenated English negation token ("no") still splits out, but the
+        // clause names money so it stays Money regardless.
+        assert_eq!(tier_for_label("No-fee checkout"), Tier::Money);
+        assert_eq!(tier_for_step("tap_by_intent", "No-fee checkout"), Tier::Money);
+
+        // An explicit negation word paired with a money word: money wins.
+        assert_eq!(tier_for_label("不要付款"), Tier::Money);
+        assert_eq!(tier_for_step("tap_by_intent", "不要付款"), Tier::Money);
     }
 }
