@@ -26,7 +26,16 @@ fn main() {
     let lib = out.join("libDctMac.a");
     let status = Command::new("xcrun")
         .args(["swiftc", "-parse-as-library", "-emit-library", "-static", "-module-name", "DctMac", "-swift-version", "5", "-O"])
-        .args(["-target", &format!("{arch}-apple-macos13.0"), "-o"])
+        // macOS 11.0 目标下，swiftc 默认会自动链接 Swift 5.6/并发/动态替换这几个向后
+        // 兼容库（swiftCompatibility56、swiftCompatibilityConcurrency 等）；Command
+        // Line Tools 不带这几个静态库，链接会报符号找不到。Keys.swift 没用并发、也没用
+        // 动态替换，关掉这三项自动链接就行，不需要装完整 Xcode。
+        .args([
+            "-disable-autolinking-runtime-compatibility",
+            "-disable-autolinking-runtime-compatibility-concurrency",
+            "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+        ])
+        .args(["-target", &format!("{arch}-apple-macos11.0"), "-o"])
         .arg(&lib)
         .args(&sources)
         .status()
