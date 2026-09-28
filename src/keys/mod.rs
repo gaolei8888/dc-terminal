@@ -75,6 +75,15 @@ fn decode(e: &PublicEntry) -> Result<[u8; 65]> {
     raw.try_into().map_err(|_| anyhow!("公钥长度不对"))
 }
 
+/// `init` 建钥匙失败时给用户看的话：`SignError` 的 `Display` 是从「签名」的角度写的
+/// （比如 `Other` 变体套着「签名失败：」），这里是在「建钥匙」，得换个说法。
+fn create_failed_message(e: &SignError) -> String {
+    match e {
+        SignError::Other(m) => format!("创建钥匙失败：{m}"),
+        other => format!("创建钥匙失败：{other}"),
+    }
+}
+
 impl KeyStore {
     pub fn at(dir: PathBuf) -> Self {
         KeyStore { dir }
@@ -107,25 +116,66 @@ impl KeyStore {
         }
     }
 
+    /// 有钥匙把手文件、却没有 public.json 的那些角色的文件名。正常情况下永远是空的
+    /// （两者一起建、一起在的），非空说明状态半途而废——可能是 public.json 被误删，
+    /// 也可能是有人手动拷过来一半。这种时候不能猜着重建，猜错了就把还能用的把手
+    /// 文件覆盖掉了。
+    fn stray_handles(&self) -> Vec<&'static str> {
+        [(SignerRole::Auto, "auto.se"), (SignerRole::User, "user.se")]
+            .into_iter()
+            .filter(|(role, _)| self.blob_path(*role).exists())
+            .map(|(_, name)| name)
+            .collect()
+    }
+
     /// 已经有钥匙就原样返回，**不重建**：重建会换公钥，配对过的 dco 就全都不认了。
     pub fn init(&self, se: &dyn SecureEnclave) -> Result<PublicKeys> {
         if let Some(k) = self.public_keys()? {
             return Ok(k);
         }
+        let stray = self.stray_handles();
+        if !stray.is_empty() {
+            return Err(anyhow!(
+                "发现钥匙文件（{}），但公钥记录 public.json 不见了。为了不覆盖已经有的钥匙，\
+                 这里不会自动建新的，请先检查 {}",
+                stray.join("、"),
+                self.dir.display()
+            ));
+        }
         if !se.available() {
             return Err(anyhow!("这台电脑没有安全芯片，没法建钥匙"));
         }
         std::fs::create_dir_all(&self.dir)?;
+        self.create_both(se).inspect_err(|_| {
+            // 别把没建完的钥匙留在磁盘上：下次 init 才能干净地重来，
+            // 不然会被上面那条 stray_handles 检查拦住。
+            for role in [SignerRole::Auto, SignerRole::User] {
+                let _ = std::fs::remove_file(self.blob_path(role));
+            }
+        })
+    }
+
+    fn create_both(&self, se: &dyn SecureEnclave) -> Result<PublicKeys> {
         let mut made = Vec::new();
         for (role, biometric) in [(SignerRole::Auto, false), (SignerRole::User, true)] {
-            let (blob, public) = se.create(biometric).map_err(|e| anyhow!("{e}"))?;
+            let (blob, public) = se.create(biometric).map_err(|e| anyhow!(create_failed_message(&e)))?;
             let mut f = crate::sys::fs::create_private(&self.blob_path(role))?;
             f.write_all(&blob)?;
             made.push(entry(&public));
         }
         let keys = PublicKeys { user: made.pop().unwrap(), auto: made.pop().unwrap() };
-        std::fs::write(self.public_path(), serde_json::to_vec_pretty(&keys)?)?;
+        self.write_public_atomic(&keys)?;
         Ok(keys)
+    }
+
+    /// 先写临时文件、再原地改名覆盖 public.json：改名在同一个文件系统上是原子的，
+    /// 半路崩了也不会留下一份写了一半、解析不出来的 public.json。公钥不是秘密，
+    /// 权限沿用 `std::fs::write` 的默认行为，不额外收紧。
+    fn write_public_atomic(&self, keys: &PublicKeys) -> Result<()> {
+        let tmp = self.dir.join(format!(".public.json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(keys)?)?;
+        std::fs::rename(&tmp, self.public_path())?;
+        Ok(())
     }
 
     /// 两把公钥，给验签用（批准记录、执行票；以后配对 dco 时也交给它）。
@@ -220,11 +270,14 @@ mod tests {
     struct FakeEnclave {
         next_seed: RefCell<u8>,
         cancel_user: bool,
+        /// 建用户钥匙（`biometric == true`）时故意失败一次，用来测「自动钥匙建好了、
+        /// 用户钥匙没建成」这一半路失败要怎么收场。
+        fail_user_create: bool,
     }
 
     impl FakeEnclave {
         fn new() -> Self {
-            FakeEnclave { next_seed: RefCell::new(1), cancel_user: false }
+            FakeEnclave { next_seed: RefCell::new(1), cancel_user: false, fail_user_create: false }
         }
         fn soft(blob: &[u8]) -> SoftSigner {
             let role = if blob[1] == 1 { SignerRole::User } else { SignerRole::Auto };
@@ -237,6 +290,9 @@ mod tests {
             true
         }
         fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
+            if biometric && self.fail_user_create {
+                return Err(SignError::Other("模拟：安全芯片建用户钥匙失败".into()));
+            }
             let mut s = self.next_seed.borrow_mut();
             let blob = vec![*s, biometric as u8];
             *s += 1;
@@ -296,5 +352,54 @@ mod tests {
         let ks = KeyStore::at(d.path().join("keys"));
         assert!(ks.public_keys().unwrap().is_none());
         assert!(ks.signer(SignerRole::Auto, &FakeEnclave::new()).is_err());
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_trace_and_a_retry_succeeds() {
+        let d = tempfile::tempdir().unwrap();
+        let keys_dir = d.path().join("keys");
+        let ks = KeyStore::at(keys_dir.clone());
+        let mut se = FakeEnclave::new();
+        se.fail_user_create = true;
+
+        // 自动钥匙建成了，用户钥匙没建成：这次 init 必须整体失败，且不留下
+        // 半成品——否则下一次 init 会被 stray_handles 检查拦住，永远建不成。
+        assert!(ks.init(&se).is_err());
+        assert!(!keys_dir.join("public.json").exists());
+        assert!(!keys_dir.join("auto.se").exists());
+        assert!(!keys_dir.join("user.se").exists());
+
+        se.fail_user_create = false;
+        let keys = ks.init(&se).unwrap();
+        assert_ne!(keys.auto.key_id, keys.user.key_id);
+        assert!(keys_dir.join("public.json").exists());
+        assert!(keys_dir.join("auto.se").exists());
+        assert!(keys_dir.join("user.se").exists());
+    }
+
+    #[test]
+    fn init_refuses_when_a_handle_file_exists_without_public_json() {
+        let d = tempfile::tempdir().unwrap();
+        let keys_dir = d.path().join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::write(keys_dir.join("auto.se"), b"leftover from somewhere").unwrap();
+        let ks = KeyStore::at(keys_dir.clone());
+
+        let err = ks.init(&FakeEnclave::new()).unwrap_err();
+        assert!(err.to_string().contains("auto.se"), "message was: {err}");
+
+        // 拒绝之后什么都不该改：把手文件原样在，没有新建 user.se 或 public.json。
+        assert!(keys_dir.join("auto.se").exists());
+        assert!(!keys_dir.join("user.se").exists());
+        assert!(!keys_dir.join("public.json").exists());
+    }
+
+    #[test]
+    fn chip_message_maps_locked_terminal_status_to_an_actionable_sentence() {
+        assert_eq!(
+            dct_brain::sign::chip_message(-25308),
+            "安全芯片现在不能用：请在已解锁的 Mac 上、从普通终端窗口运行"
+        );
+        assert_eq!(dct_brain::sign::chip_message(-1), "安全芯片出错（代码 -1）");
     }
 }

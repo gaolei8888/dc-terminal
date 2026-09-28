@@ -5,17 +5,45 @@ use std::os::raw::c_char;
 
 extern "C" {
     fn dct_se_available() -> bool;
-    fn dct_se_create(biometric: bool, blob_out: *mut u8, blob_cap: isize, blob_len: *mut isize, pub_out: *mut u8) -> i32;
-    fn dct_se_sign(blob: *const u8, blob_len: isize, msg: *const u8, msg_len: isize, reason: *const c_char, sig_out: *mut u8) -> i32;
+    fn dct_se_create(
+        biometric: bool,
+        blob_out: *mut u8,
+        blob_cap: isize,
+        blob_len: *mut isize,
+        pub_out: *mut u8,
+        status_out: *mut i32,
+    ) -> i32;
+    fn dct_se_sign(
+        blob: *const u8,
+        blob_len: isize,
+        msg: *const u8,
+        msg_len: isize,
+        reason: *const c_char,
+        sig_out: *mut u8,
+        status_out: *mut i32,
+    ) -> i32;
 }
 
-fn status(code: i32) -> SignError {
+/// 把 Swift 的返回码翻成 `SignError`。`status` 是 Swift 侧 `(error as NSError).code`，
+/// 只有 code 是 2（把手打不开）或 6（安全芯片的其它错误）时才有意义。
+fn status_error(code: i32, status: i32) -> SignError {
     match code {
         1 => SignError::Unavailable,
+        2 => SignError::Other(load_failed_message(status)),
         3 => SignError::Cancelled,
-        2 => SignError::Other("钥匙文件不对，可能是从别的电脑拷来的".into()),
         4 => SignError::Other("钥匙太大".into()),
+        6 => SignError::Chip(status),
         c => SignError::Other(format!("安全芯片返回 {c}")),
+    }
+}
+
+/// 钥匙的「把手」文件打不开：可能是磁盘坏了，也可能是从别的 Mac 拷过来的——
+/// 安全芯片加密过的把手离开这台机器就没用了。不猜是哪一种，只说打不开。
+fn load_failed_message(status: i32) -> String {
+    if status == 0 {
+        "钥匙文件打不开（可能已损坏或不属于这台 Mac）".into()
+    } else {
+        format!("钥匙文件打不开（可能已损坏或不属于这台 Mac，错误码 {status}）")
     }
 }
 
@@ -30,9 +58,19 @@ impl super::SecureEnclave for MacEnclave {
         let mut blob = vec![0u8; 1024];
         let mut len: isize = 0;
         let mut public = [0u8; 65];
-        let rc = unsafe { dct_se_create(biometric, blob.as_mut_ptr(), blob.len() as isize, &mut len, public.as_mut_ptr()) };
+        let mut status: i32 = 0;
+        let rc = unsafe {
+            dct_se_create(
+                biometric,
+                blob.as_mut_ptr(),
+                blob.len() as isize,
+                &mut len,
+                public.as_mut_ptr(),
+                &mut status,
+            )
+        };
         if rc != 0 {
-            return Err(status(rc));
+            return Err(status_error(rc, status));
         }
         blob.truncate(len as usize);
         Ok((blob, public))
@@ -42,11 +80,20 @@ impl super::SecureEnclave for MacEnclave {
         // 人话里不该有 NUL；有就去掉，别让整次签名失败。
         let reason = CString::new(reason.replace('\0', "")).unwrap();
         let mut sig = [0u8; 64];
+        let mut status: i32 = 0;
         let rc = unsafe {
-            dct_se_sign(blob.as_ptr(), blob.len() as isize, msg.as_ptr(), msg.len() as isize, reason.as_ptr(), sig.as_mut_ptr())
+            dct_se_sign(
+                blob.as_ptr(),
+                blob.len() as isize,
+                msg.as_ptr(),
+                msg.len() as isize,
+                reason.as_ptr(),
+                sig.as_mut_ptr(),
+                &mut status,
+            )
         };
         if rc != 0 {
-            return Err(status(rc));
+            return Err(status_error(rc, status));
         }
         Ok(sig)
     }

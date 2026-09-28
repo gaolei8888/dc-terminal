@@ -23,6 +23,10 @@ pub enum SignError {
     Unavailable,
     /// 用户取消了 Touch ID，或者没通过。
     Cancelled,
+    /// 安全芯片返回的其它错误（既不是「没有芯片」也不是用户主动取消），带着
+    /// 操作系统给的错误码——比如 -25308（`errSecInteractionNotAllowed`）就是
+    /// 设备锁屏、或者不是从普通终端会话里调用时最常见的失败。
+    Chip(i32),
     Other(String),
 }
 
@@ -31,12 +35,25 @@ impl std::fmt::Display for SignError {
         match self {
             SignError::Unavailable => write!(f, "这台电脑上用不了安全芯片签名"),
             SignError::Cancelled => write!(f, "没有通过指纹确认"),
+            SignError::Chip(status) => f.write_str(&chip_message(*status)),
             SignError::Other(m) => write!(f, "签名失败：{m}"),
         }
     }
 }
 
 impl std::error::Error for SignError {}
+
+/// 安全芯片返回非取消错误时，给不懂编程的用户看的那句话。单独挑出来是纯函数，
+/// 好独立测试这条最常踩到的映射：-25308 几乎总是「不在已解锁的普通终端会话里」，
+/// 而不是硬件坏了，别的错误码就老实报个数字，不瞎猜原因。
+pub fn chip_message(status: i32) -> String {
+    const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+    if status == ERR_SEC_INTERACTION_NOT_ALLOWED {
+        "安全芯片现在不能用：请在已解锁的 Mac 上、从普通终端窗口运行".to_string()
+    } else {
+        format!("安全芯片出错（代码 {status}）")
+    }
+}
 
 pub trait Signer {
     fn role(&self) -> SignerRole;
@@ -398,6 +415,17 @@ mod tests {
         let mut st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
         st.batch = Some(vec![]);
         assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::NotInBatch));
+    }
+
+    #[test]
+    fn chip_message_calls_out_the_locked_terminal_case_by_name() {
+        assert_eq!(
+            chip_message(-25308),
+            "安全芯片现在不能用：请在已解锁的 Mac 上、从普通终端窗口运行"
+        );
+        // 别的错误码不瞎猜原因，只报个数字。
+        assert_eq!(chip_message(-1), "安全芯片出错（代码 -1）");
+        assert_eq!(chip_message(0), "安全芯片出错（代码 0）");
     }
 
     #[test]
