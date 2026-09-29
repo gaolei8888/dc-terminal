@@ -2055,6 +2055,17 @@ pub mod msg {
         )
     }
 
+    /// 多电脑命令撞上旧守护进程：跟界面启动时同一段解释，再告诉他怎么换。
+    /// 不问 y/n、不替他重启——重启会断掉正在跑的会话。
+    pub fn mesh_stale_daemon(lang: Lang) -> String {
+        let explain = text(Key::StaleDaemonExplain, lang);
+        t!(
+            lang,
+            en: format!("{explain}\n\nTo restart it, run: dct restart"),
+            zh: format!("{explain}\n\n要重启，运行：dct restart"),
+        )
+    }
+
     pub fn mesh_logged_in(lang: Lang, name: &str) -> String {
         t!(
             lang,

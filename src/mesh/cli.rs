@@ -89,34 +89,60 @@ pub fn run(args: &[String]) -> i32 {
             Ok(_) => Some(line.trim().to_string()),
         }
     };
+    dispatch(cmd, rest, &mut call, &mut ask, &mut out, &mut err, lang)
+}
+
+/// 连上守护进程之后的全部：先握手，再按子命令办。
+fn dispatch(
+    cmd: &str,
+    rest: &[String],
+    call: Call,
+    ask: Ask,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    lang: Lang,
+) -> i32 {
+    if !daemon_is_current(call, err, lang) {
+        return 1;
+    }
     match cmd {
-        "login" => login(&mut call, &mut out, &mut err, lang),
+        "login" => login(call, out, err, lang),
         "join" => match parse_join(rest) {
-            Some(opts) => join(
-                &mut call,
-                &mut ask,
-                &mut out,
-                &mut err,
-                lang,
-                &opts,
-                JOIN_WAIT,
-                &|| std::thread::sleep(JOIN_POLL),
-            ),
+            Some(opts) => join(call, ask, out, err, lang, &opts, JOIN_WAIT, &|| {
+                std::thread::sleep(JOIN_POLL)
+            }),
             None => {
                 let _ = writeln!(err, "{}", msg::mesh_join_usage(lang));
                 2
             }
         },
-        "peers" => peers(&mut call, &mut ask, &mut out, &mut err, lang, rest),
+        "peers" => peers(call, ask, out, err, lang, rest),
         "send" => {
             // 在 dct 的会话里跑的，守护进程给子进程设过这个变量（`session.rs`）。
             let from = std::env::var(crate::session::SESSION_ID_ENV)
                 .ok()
                 .and_then(|v| v.trim().parse().ok());
-            send(&mut call, &mut out, &mut err, lang, rest, from)
+            send(call, out, err, lang, rest, from)
         }
         _ => 2,
     }
+}
+
+/// 跟界面启动时同一个握手（`main::run_ui` 里的 `daemon_status`）。守护进程
+/// 一活好几天，「新命令碰上旧守护进程」是常态：它不认得 `Mesh*` 请求，直接
+/// 送过去换回来的是一句 serde 的原话。这里先问清楚，旧了就说人话、退 1。
+///
+/// **不替用户重启**：重启会断掉正在跑的会话，那得他自己决定（`dct restart`）。
+fn daemon_is_current(call: Call, err: &mut dyn Write, lang: Lang) -> bool {
+    let protocol = match call(Request::Hello) {
+        Ok(Response::Hello { protocol }) => Some(protocol),
+        _ => None,
+    };
+    if crate::proto::daemon_status(protocol) == crate::proto::DaemonStatus::Same {
+        return true;
+    }
+    let _ = writeln!(err, "{}", msg::mesh_stale_daemon(lang));
+    false
 }
 
 /// 跟 `ps`/`stop` 同一个语言来源。
@@ -614,6 +640,90 @@ mod tests {
         let mut out = vec![];
         assert_eq!(login(&mut sc.call(), &mut out, &mut err, Lang::Zh), 0);
         assert!(!s(&out).contains("第一台"));
+    }
+
+    /// 昨天的守护进程还在跑：它认得 `Hello`，报的是旧协议号。每一条多电脑
+    /// 命令都要先握手，说人话、退 1——不能把 `MeshStatus` 送过去换回一句
+    /// 「请求解析失败：unknown variant」。
+    #[test]
+    fn every_mesh_command_stops_at_a_stale_daemon_with_the_restart_hint() {
+        let cases: &[&[&str]] = &[
+            &["login"],
+            &["join"],
+            &["peers"],
+            &["peers", "approve", "B"],
+            &["peers", "remove", "B"],
+            &["send", "B/x", "hi"],
+        ];
+        for argv in cases {
+            let (cmd, rest) = argv.split_first().unwrap();
+            let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+            let sc = Script::new(vec![Response::Hello {
+                protocol: crate::proto::PROTOCOL_VERSION - 1,
+            }]);
+            let (mut out, mut err) = (vec![], vec![]);
+            let code = dispatch(
+                cmd,
+                &rest,
+                &mut sc.call(),
+                &mut no_ask,
+                &mut out,
+                &mut err,
+                Lang::Zh,
+            );
+            assert_eq!(code, 1, "{argv:?}");
+            assert_eq!(sc.seen.borrow().as_slice(), ["Hello"], "{argv:?}");
+            let e = s(&err);
+            assert!(e.contains("后台服务还是旧版本"), "{argv:?}: {e}");
+            assert!(e.contains("dct restart"), "{argv:?}: {e}");
+            assert!(!e.contains("unknown variant"), "{e}");
+        }
+    }
+
+    /// 老到连 `Hello` 都不认得的守护进程：答不上来本身就是答案。
+    #[test]
+    fn a_daemon_that_cannot_answer_hello_counts_as_stale() {
+        let mut call = |_: Request| -> Result<Response> {
+            Err(anyhow::anyhow!("请求解析失败：unknown variant `Hello`"))
+        };
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = dispatch(
+            "login",
+            &[],
+            &mut call,
+            &mut no_ask,
+            &mut out,
+            &mut err,
+            Lang::Zh,
+        );
+        assert_eq!(code, 1);
+        assert!(s(&err).contains("dct restart"), "{}", s(&err));
+    }
+
+    #[test]
+    fn a_current_daemon_passes_the_handshake() {
+        let sc = Script::new(vec![
+            Response::Hello {
+                protocol: crate::proto::PROTOCOL_VERSION,
+            },
+            Response::Mesh(view(true, &[("B", true)])),
+            Response::Mesh(view(true, &[("B", true)])),
+        ]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = dispatch(
+            "login",
+            &[],
+            &mut sc.call(),
+            &mut no_ask,
+            &mut out,
+            &mut err,
+            Lang::Zh,
+        );
+        assert_eq!(code, 0, "{}", s(&err));
+        assert_eq!(
+            sc.seen.borrow().as_slice(),
+            ["Hello", "MeshStatus", "MeshLogin"]
+        );
     }
 
     #[test]
