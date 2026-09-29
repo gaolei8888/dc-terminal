@@ -388,20 +388,30 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         View::Grid { focus, reply } => (*focus, reply.clone()),
         _ => return,
     };
-    // 有电脑在等批准：顶上一行暖色提醒回看板（y/n 只在看板上接）。整句
-    // 折行、不截，下面的格子让出这几行。
-    let notice = super::computers::grid_notice_lines(&app.mesh, app.lang, area.width as usize);
+    // 有电脑在等批准：顶上暖色提醒回看板（y/n 只在看板上接）。整句折行、
+    // 不截。
+    //
+    // 格子让出这几行**只在让得起的时候**：80×24 下内容区正好是 `MIN_ROWS`，
+    // 切掉两行整个九宫格就换成「窗口太小」（同 `draw_reply` 为什么是盖上去
+    // 的）。让不起就先画格子，再把提醒**盖**在最上面几行——压掉的是第一排
+    // 格子的上边框和开头几行，格子本身还在。
+    //
+    // 回复框开着的时候不提醒：那时按 `g` 是往框里打字，这句话就说错了。
+    let notice = if draft.is_none() {
+        super::computers::grid_notice_lines(&app.mesh, app.lang, area.width as usize)
+    } else {
+        Vec::new()
+    };
     let nh = (notice.len().min(u16::MAX as usize) as u16).min(area.height);
-    if nh > 0 {
-        f.render_widget(
-            ratatui::widgets::Paragraph::new(notice),
-            Rect { height: nh, ..area },
-        );
-    }
-    let area = Rect {
-        y: area.y + nh,
-        height: area.height - nh,
-        ..area
+    let notice_area = Rect { height: nh, ..area };
+    let area = if area.height.saturating_sub(nh) >= MIN_ROWS {
+        Rect {
+            y: area.y + nh,
+            height: area.height - nh,
+            ..area
+        }
+    } else {
+        area
     };
     let visible = app.grid_sessions();
     draw_grid(
@@ -416,6 +426,10 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         },
         !app.sessions.is_empty(),
     );
+    if nh > 0 {
+        f.render_widget(ratatui::widgets::Clear, notice_area);
+        f.render_widget(Paragraph::new(notice), notice_area);
+    }
     if let Some(draft) = draft {
         let who = visible
             .iter()

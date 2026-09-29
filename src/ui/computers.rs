@@ -705,6 +705,83 @@ pub(crate) mod tests {
         }
     }
 
+    fn grid_app_with_sessions() -> (App, tempfile::TempDir) {
+        let (mut app, dir) = App::test_app();
+        app.connected = true;
+        app.set_sessions(
+            (1..=4)
+                .map(|i| crate::session::SessionInfo {
+                    id: i,
+                    profile: "claude".into(),
+                    dir: "/tmp/a".into(),
+                    state: crate::session::SessionState::Idle,
+                    activity: String::new(),
+                    is_agent: true,
+                    tag: format!("tile{i}"),
+                })
+                .collect(),
+        );
+        app.view = View::grid(0);
+        (app, dir)
+    }
+
+    fn whole_screen(app: &mut App, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 80×24 整屏：九宫格的内容区正好是 `MIN_ROWS`。提醒要在，格子也要在，
+    /// 不能换成「窗口太小」——提醒是盖上去的，不是切掉两行。
+    #[test]
+    fn the_grid_notice_keeps_the_tiles_on_an_80_by_24_terminal() {
+        let (mut app, _d) = grid_app_with_sessions();
+        app.mesh.set_view(two_waiting(), long_ago());
+        let c = whole_screen(&mut app, 80, 24);
+        let notice: String = msg::mesh_grid_notice(Lang::Zh)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(c.contains(&notice), "{c}");
+        assert!(!c.contains("窗口太小"), "{c}");
+        assert!(
+            c.contains("tile2") && c.contains("tile4"),
+            "格子该还在：{c}"
+        );
+        // 九宫格自己拿到的内容区正好是 `MIN_ROWS`（底栏多占两行时 80×24 就是
+        // 这样）：让不起，只能盖。
+        for h in [20, 21] {
+            let r = grid_rows(&mut app, 80, h).concat();
+            assert!(r.contains(&notice), "{h}: {r}");
+            assert!(!r.contains("窗口太小"), "{h}: {r}");
+            // 盖住的是第一排格子的标题行；第二排整个都在。
+            assert!(r.contains("tile3") && r.contains("tile4"), "{h}: {r}");
+        }
+        // 高得多的窗口里让得起：提醒在上面，格子一个不少
+        let c = whole_screen(&mut app, 80, 40);
+        assert!(c.contains(&notice) && c.contains("tile1"), "{c}");
+        assert!(!c.contains("窗口太小"), "{c}");
+    }
+
+    /// 回复框开着时不提醒：那时按 g 是往框里打字，「按 g 切到看板」是错话。
+    #[test]
+    fn the_grid_notice_is_not_shown_while_the_reply_box_is_open() {
+        let (mut app, _d) = grid_app_with_sessions();
+        app.mesh.set_view(two_waiting(), long_ago());
+        crate::ui::grid::handle_key(&mut app, key('i')).unwrap();
+        assert!(matches!(app.view, View::Grid { reply: Some(_), .. }));
+        let c = whole_screen(&mut app, 80, 24);
+        assert!(!c.contains("有电脑想加入"), "{c}");
+    }
+
     /// I1：九宫格里也每 5 秒问一次（不然根本不知道有人在等）。
     #[test]
     fn status_is_asked_in_the_grid_too() {
