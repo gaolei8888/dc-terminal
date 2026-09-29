@@ -178,11 +178,17 @@ pub const RENEW_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// 前试上二十几回，又不至于在网关挂掉时每 30 秒敲它一下。
 pub const RENEW_RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// 给 `renew_if_due` 限速：连接线程每一轮轮询前调一次 `tick`。
+/// 令牌**已经过期**、续期又失败时多久再试。这时手上没有能用的令牌（比如
+/// 电脑睡过了 `exp`，醒来 Wi-Fi 还没连上），等一小时就是断一小时。
+pub const RENEW_RETRY_WHEN_EXPIRED: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 给 `renew_if_due` 限速：连接线程每一轮轮询前调一次 `tick`。成功之后隔
+/// `RENEW_MIN_INTERVAL`；失败之后隔 `RENEW_RETRY_AFTER_FAILURE`，令牌已经
+/// 过期的话只隔 `RENEW_RETRY_WHEN_EXPIRED`。
 #[derive(Debug, Default)]
 pub struct Renewer {
-    /// 上一次真打了网关的时刻，以及那一次失败没有。
-    last: Option<(std::time::Instant, bool)>,
+    /// 上一次真打了网关的时刻，以及那一次之后要等多久。
+    last: Option<(std::time::Instant, std::time::Duration)>,
 }
 
 impl Renewer {
@@ -199,12 +205,7 @@ impl Renewer {
         now: u64,
         send: Transport,
     ) -> Option<Renewal> {
-        if let Some((t, failed)) = self.last {
-            let wait = if failed {
-                RENEW_RETRY_AFTER_FAILURE
-            } else {
-                RENEW_MIN_INTERVAL
-            };
+        if let Some((t, wait)) = self.last {
             if at.saturating_duration_since(t) < wait {
                 return None;
             }
@@ -212,8 +213,22 @@ impl Renewer {
         let r = renew_if_due(secrets, token, origin, endpoint, now, send);
         match &r {
             Renewal::NotDue => {}
-            Renewal::Renewed => self.last = Some((at, false)),
-            Renewal::Failed(_) => self.last = Some((at, true)),
+            Renewal::Renewed => self.last = Some((at, RENEW_MIN_INTERVAL)),
+            Renewal::Failed(_) => {
+                // 过期时间读不到也当已经过期（同 `renew_if_due`）。
+                let expired = secrets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(RELAY_TOKEN_EXP_KEY)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_none_or(|exp| exp <= now);
+                let wait = if expired {
+                    RENEW_RETRY_WHEN_EXPIRED
+                } else {
+                    RENEW_RETRY_AFTER_FAILURE
+                };
+                self.last = Some((at, wait));
+            }
         }
         Some(r)
     }
@@ -507,6 +522,41 @@ mod tests {
                 &send,
             );
             assert_eq!(fake.calls.borrow().len(), 2);
+        }
+
+        /// 令牌已经过期（比如电脑睡过了 `exp`），醒来第一次续期又失败了
+        /// （Wi-Fi 还没连上）：这时手上什么能用的令牌都没有，等一小时太久，
+        /// 一分钟后就再试。
+        #[test]
+        fn an_expired_token_whose_renewal_fails_is_retried_after_a_minute() {
+            let (_t, s) = secrets(Some(NOW - 60), Some("sk"));
+            let tok = Token::new("old");
+            let fake = FakeSend::returning(Err("offline".into()));
+            let send = fake.as_fn();
+            let mut r = Renewer::default();
+            let t0 = std::time::Instant::now();
+            r.tick(t0, &s, &tok, Some("https://gw"), "c-aa", NOW, &send);
+            r.tick(
+                t0 + std::time::Duration::from_secs(30),
+                &s,
+                &tok,
+                Some("https://gw"),
+                "c-aa",
+                NOW + 30,
+                &send,
+            );
+            assert_eq!(fake.calls.borrow().len(), 1, "一分钟之内不再试");
+            r.tick(
+                t0 + RENEW_RETRY_WHEN_EXPIRED,
+                &s,
+                &tok,
+                Some("https://gw"),
+                "c-aa",
+                NOW + 60,
+                &send,
+            );
+            assert_eq!(fake.calls.borrow().len(), 2, "过期了，一分钟后再试");
+            assert!(RENEW_RETRY_WHEN_EXPIRED <= std::time::Duration::from_secs(5 * 60));
         }
 
         #[test]
