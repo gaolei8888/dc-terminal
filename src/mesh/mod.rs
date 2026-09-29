@@ -69,6 +69,15 @@ const MAX_PENDING: usize = 16;
 /// 几次；正常用一次 `dct join` 只亮一个。
 pub const MAX_CODES_PER_TTL: usize = 20;
 
+/// 新电脑加入时最多问几台已有的电脑（中转报的在线列表去重之后）。
+///
+/// 邀请方那边一个窗口最多亮 `MAX_CODES_PER_TTL` 个数字，这边也得有个数：
+/// 中转能在「谁在线」里列出任意多台假电脑，每台都回一句签得对的
+/// `JoinPending`、名字照抄用户的真电脑。每多一台，新电脑屏幕上就多一个
+/// 数字，就多一次百万分之一的「碰巧对上」。超过这个数就一台都不问
+/// （`MeshProblem::TooManyAnswered`）——自己的电脑同时在线不会有这么多。
+pub const MAX_JOIN_ASK: usize = 16;
+
 /// 这台电脑是邀请方时，一条等人批准的加入请求。
 #[derive(Debug, Clone)]
 pub struct PendingReq {

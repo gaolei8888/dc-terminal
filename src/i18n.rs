@@ -1986,6 +1986,11 @@ pub mod msg {
                 en: "None of your other computers answered. Make sure dct is running and signed in on one of them, then try again".to_string(),
                 zh: "你的其它电脑一台都没回应。确认有一台已有的电脑开着 dct、登录过多电脑，再试一次".to_string(),
             ),
+            TooManyAnswered => t!(
+                lang,
+                en: "Too many computers answered at once, which should not happen. Nothing was shown to compare. Try again later".to_string(),
+                zh: "一下子回应的电脑太多了，这不正常，这次不给你核对数字。过一会儿再试一次".to_string(),
+            ),
             BadName => t!(
                 lang,
                 en: "A computer name cannot be empty, contain /, or be longer than 32 characters".to_string(),
@@ -3251,6 +3256,7 @@ mod tests {
             Mesh(crate::proto::MeshProblem::NoDcAccount),
             Mesh(crate::proto::MeshProblem::AlreadyInGroup),
             Mesh(crate::proto::MeshProblem::NoOneAnswered),
+            Mesh(crate::proto::MeshProblem::TooManyAnswered),
             Mesh(crate::proto::MeshProblem::BadName),
             Mesh(crate::proto::MeshProblem::NoSuchMachine("pc".into())),
             Mesh(crate::proto::MeshProblem::NoSuchRequest("pc".into())),

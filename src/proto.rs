@@ -1157,6 +1157,10 @@ pub enum MeshProblem {
     AlreadyInGroup,
     /// 一台在线的、能回答的已有电脑都没有。
     NoOneAnswered,
+    /// 中转报上来的在线电脑多得不像话（超过 `mesh::MAX_JOIN_ASK` 台）：一台
+    /// 都不问、一个数字都不给看。每多一个数字，就多一次让冒充的电脑碰巧
+    /// 对上老电脑屏幕的机会。
+    TooManyAnswered,
     /// 电脑名不合规（空、带 `/`、太长）。
     BadName,
     /// 组里没有这台电脑。

@@ -108,7 +108,17 @@ pub fn join(
             m.rename(n)?;
         }
     }
-    let peers = net.peers().unwrap_or_default();
+    // 中转报的在线列表：去重（同一台列好几遍只问一次），太多就一台都不问、
+    // 一个数字都不给看（`MAX_JOIN_ASK`）。
+    let mut peers = net.peers().unwrap_or_default();
+    peers.sort();
+    peers.dedup();
+    if peers.len() > super::MAX_JOIN_ASK {
+        lock(mesh)
+            .journal
+            .mesh(&format!("join_too_many_peers n={}", peers.len()));
+        return Err(MeshProblem::TooManyAnswered);
+    }
     // 每台一个随机数、一份承诺。同一个随机数给好几台用的话，揭晓给第一台
     // 之后中转就知道了它，还没回话的那几台可以等看过它再编答复。
     let asks: Vec<(String, sas::Nonce, JoinRequest)> = {
@@ -1136,6 +1146,8 @@ mod tests {
         for seed in 10..(10 + cap as u8 + 5) {
             let n = Node::new(&hub, seed, &format!("n{seed}"));
             raw_join(&n, &a.ep);
+            // 灌完就下线：B 下面重跑 `dct join` 时，在线的只有 A。
+            hub.set_online(&n.ep, false);
         }
         let impostor = Node::new(&hub, 99, "B");
         let req = impostor.mesh.lock().unwrap().join_request(&[1; 32]);
@@ -1150,6 +1162,7 @@ mod tests {
         assert_eq!(pending.len(), cap);
         assert!(pending.iter().any(|p| p == &shown), "B 那一条没被挤掉");
         assert!(!pending.iter().any(|p| p.endpoint == impostor.ep));
+        hub.set_online(&impostor.ep, false);
 
         // 已经挂着的那台再问一次（比如重跑 dct join）：表满也照样更新。
         // 两边出的随机数都换了新的，所以数字也换了：上一次看过的那个作废。
@@ -1482,5 +1495,122 @@ mod tests {
         let c = net.commits.lock().unwrap().clone();
         assert_eq!(c.len(), 2);
         assert_ne!(c[0], c[1]);
+    }
+
+    // —— 复审：加入方这一侧也要限住能猜几次 ——
+
+    /// 中转可以在「谁在线」里列一大串假电脑，每台都用自己的钥匙、自签的
+    /// `JoinPending` 回话，名字都照抄用户真电脑的。每多一台，新电脑屏幕上
+    /// 就多一个数字，就多一次「碰巧跟老电脑屏幕上那个一样」的机会。
+    struct FakeCrowd {
+        list: Vec<String>,
+        members: std::collections::HashMap<String, (Member, u8)>,
+        asked: Mutex<Vec<String>>,
+    }
+    impl FakeCrowd {
+        fn new(n: usize, dup: usize) -> FakeCrowd {
+            let mut members = std::collections::HashMap::new();
+            let mut list = Vec::new();
+            for i in 0..n {
+                let seed = 10 + i as u8;
+                // 每台一把新钥匙，名字都叫 家里Mac。
+                let me = Mesh::new(keys(seed), "家里Mac".into(), None).me.clone();
+                list.push(me.endpoint.clone());
+                members.insert(me.endpoint.clone(), (me, seed));
+            }
+            // 同一个端点列好几遍。
+            for _ in 0..dup {
+                list.push(list[0].clone());
+            }
+            FakeCrowd {
+                list,
+                members,
+                asked: Mutex::new(vec![]),
+            }
+        }
+    }
+    impl Net for FakeCrowd {
+        fn peers(&self) -> Result<Vec<String>, crate::link::LinkError> {
+            Ok(self.list.clone())
+        }
+        fn send(&self, _: &str, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+            Ok(())
+        }
+        fn ask(
+            &self,
+            to: &str,
+            _: Vec<u8>,
+            _: Duration,
+        ) -> Result<Vec<u8>, crate::link::LinkError> {
+            self.asked.lock().unwrap().push(to.to_string());
+            let (me, seed) = self.members[to].clone();
+            Ok(wire::encode(&Payload::JoinPending {
+                sig: wire::sign_member(&me, &keys(seed)),
+                member: me,
+                nonce: wire::encode32(&[seed; 32]),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_relay_listing_100_computers_gets_no_codes_shown_and_no_one_asked() {
+        let hub = FakeHub::new();
+        let b = Node::new(&hub, 2, "B");
+        b.login();
+        let net = FakeCrowd::new(100, 0);
+        assert_eq!(join(&b.mesh, &net, None), Err(MeshProblem::TooManyAnswered));
+        assert!(
+            net.asked.lock().unwrap().len() <= super::super::MAX_JOIN_ASK,
+            "问了 {} 台",
+            net.asked.lock().unwrap().len()
+        );
+        assert!(
+            b.mesh.lock().unwrap().invites.is_empty(),
+            "一个数字都不给看"
+        );
+        assert!(b.view().joining.is_empty());
+    }
+
+    #[test]
+    fn the_same_computer_listed_many_times_is_asked_once() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+        struct Repeat<'a>(&'a FakeNet, String, Mutex<usize>);
+        impl Net for Repeat<'_> {
+            fn peers(&self) -> Result<Vec<String>, crate::link::LinkError> {
+                Ok(vec![self.1.clone(); 50])
+            }
+            fn send(&self, to: &str, p: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                self.0.send(to, p)
+            }
+            fn ask(
+                &self,
+                to: &str,
+                p: Vec<u8>,
+                t: Duration,
+            ) -> Result<Vec<u8>, crate::link::LinkError> {
+                *self.2.lock().unwrap() += 1;
+                self.0.ask(to, p, t)
+            }
+        }
+        let net = Repeat(&b.net, a.ep.clone(), Mutex::new(0));
+        let codes = join(&b.mesh, &net, None).unwrap();
+        assert_eq!(codes.len(), 1);
+        assert_eq!(*net.2.lock().unwrap(), 1);
+    }
+
+    /// 上限之内（16 台）照常问、照常给数字。
+    #[test]
+    fn up_to_the_cap_every_computer_is_asked() {
+        let hub = FakeHub::new();
+        let b = Node::new(&hub, 2, "B");
+        b.login();
+        let net = FakeCrowd::new(super::super::MAX_JOIN_ASK, 3);
+        let codes = join(&b.mesh, &net, None).unwrap();
+        assert_eq!(codes.len(), super::super::MAX_JOIN_ASK);
+        assert_eq!(net.asked.lock().unwrap().len(), super::super::MAX_JOIN_ASK);
     }
 }
