@@ -63,6 +63,7 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
             })
             .collect(),
         joining: joining(&m),
+        messages: m.delivered_counts(),
     }
 }
 

@@ -129,7 +129,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 22 = 留言：多了 `Request::MeshPeers` / `MeshSend`、`Response::MeshPeers` /
 /// `MeshSent`，`MeshProblem` 多了 `TooLong` / `BadAddress`。新增 `Request`
 /// 变体那条规矩同 14。
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// 23 = 看板上的「我的电脑」：`MeshView` 多了 `messages`（这次守护进程运行
+/// 期间，别的电脑送进每个会话的留言条数）。**响应**的形状变了，照 13 那次
+/// 的规矩加一。
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,6 +875,9 @@ pub struct MeshView {
     pub pending: Vec<PendingJoin>,
     /// 这台电脑自己在请求加入：问到的每台已有电脑，和给它算的 6 位数。
     pub joining: Vec<PendingJoin>,
+    /// 会话 id → 这次守护进程运行期间送进这个会话的留言条数（看板上的
+    /// 「✉ N」）。只记真的敲进去了的，排着队的不算。
+    pub messages: std::collections::BTreeMap<u32, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1522,7 +1529,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                22,
+                23,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","code":"123456","yes":true}},{"MeshRemove":{"name":"n"}},{"MeshConfirmInviter":{"endpoint":"c-x"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1547,7 +1554,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                22,
+                23,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1656,7 +1663,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                22,
+                23,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1759,7 +1766,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (22, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (23, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1777,7 +1784,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (22, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (23, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1854,7 +1861,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                22,
+                23,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -1891,13 +1898,52 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
             (
-                22,
+                23,
                 r#"{"MeshSent":"Delivered"}"#,
                 r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
                 r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
+    }
+
+    /// 多电脑现状的线上形状（看板每 5 秒拉一次）。
+    #[test]
+    fn the_mesh_view_shape_is_pinned() {
+        let v = Response::Mesh(MeshView {
+            logged_in: true,
+            name: "A".into(),
+            endpoint: "c-a".into(),
+            in_group: true,
+            members: vec![MemberView {
+                name: "A".into(),
+                endpoint: "c-a".into(),
+                online: true,
+                is_me: true,
+            }],
+            pending: vec![PendingJoin {
+                name: "B".into(),
+                endpoint: "c-b".into(),
+                code: "123456".into(),
+            }],
+            joining: Vec::new(),
+            messages: [(7, 2)].into_iter().collect(),
+        });
+        assert_eq!(
+            (PROTOCOL_VERSION, serde_json::to_string(&v).unwrap().as_str()),
+            (
+                23,
+                r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"pending":[{"name":"B","endpoint":"c-b","code":"123456"}],"joining":[],"messages":{"7":2}}}"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+        let (Response::Mesh(back), Response::Mesh(sent)) = (
+            serde_json::from_str::<Response>(&serde_json::to_string(&v).unwrap()).unwrap(),
+            v,
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(back, sent);
     }
 
     /// 留言正文不进 `Debug`：只报长度。

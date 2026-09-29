@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use super::app::App;
 use super::view::is_plain_key;
@@ -20,12 +20,20 @@ use crate::i18n::{msg, text, Key};
 /// 序号 3、折叠箭头 2、项目名 18、父目录 18。
 const HEADER_PREFIX_COLS: usize = 2 + 1 + 3 + 2 + 18 + 18;
 
+/// 会话行上 activity 之前占几列：`highlight_symbol` 2、项目色条 1、
+/// `  {id:>3}  ` 7、状态 8、名字 16。
+const SESSION_PREFIX_COLS: usize = 2 + 1 + 7 + 8 + 16;
+
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
 /// 一个 `continue` 跳过了它，一句普通的「已切到 X」盖掉了屏幕上唯一告诉
 /// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
 /// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // 顶部挂着一条加入确认时，y / n 先归它（`n` 平时是新建会话）。
+    if super::computers::handle_key(app, &key) {
+        return Ok(());
+    }
     match key.code {
         KeyCode::Char('q') if is_plain_key(&key) => app.quit = true,
         KeyCode::Down => super::move_row(app, 1),
@@ -309,17 +317,33 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     // 时候返回的是 max + 1 列（那个 `…` 是长度判断之后才追加的），
                     // 照 16 传的话省略号会把列宽顶宽一格。
                     spans.push(Span::raw(pad_to(&truncate(session_label(s), 15), 16)));
-                    // 会话行不重复项目名——组头已经说了，宽度还给 activity，
-                    // 它是屏幕上最先被截断的信息。
-                    spans.push(Span::raw(truncate(&s.activity, 70)));
+                    // 行尾的标记：上架（在播）和别的电脑送来的留言条数。
+                    let mut marks: Vec<String> = Vec::new();
                     // 上架标记接在最末尾，不抢前面任何一列的宽度：老师切到
                     // 别的会话时，得一眼认出「还在播的是这几路」，而这件事
                     // 只有在直播面板上勾过的那几行才成立（`App::live.staged`）。
                     if app.live.staged.iter().any(|(id, _)| *id == s.id) {
-                        spans.push(Span::styled(
-                            format!(" {}", text(Key::LiveOnAirMark, app.lang)),
-                            accent(),
-                        ));
+                        marks.push(format!(" {}", text(Key::LiveOnAirMark, app.lang)));
+                    }
+                    // 「✉ N」：这次运行期间别的电脑送进这个会话几条留言。
+                    let n = app.mesh.messages_for(s.id);
+                    if n > 0 {
+                        marks.push(format!(" {}", msg::mesh_messages_mark(n)));
+                    }
+                    // 会话行不重复项目名——组头已经说了，宽度还给 activity，
+                    // 它是屏幕上最先被截断的信息。有行尾标记时，activity
+                    // 给它们让出位置：标记被右边挤掉就等于没有。
+                    let marks_w: usize = marks.iter().map(|m| display_width(m)).sum();
+                    let activity_room = if marks_w == 0 {
+                        70
+                    } else {
+                        (area.width as usize)
+                            .saturating_sub(SESSION_PREFIX_COLS + marks_w + 1)
+                            .min(70)
+                    };
+                    spans.push(Span::raw(truncate(&s.activity, activity_room)));
+                    for m in marks {
+                        spans.push(Span::styled(m, accent()));
                     }
                 }
             }
@@ -343,11 +367,38 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     if show_version {
         block = block.title_top(Line::from(Span::styled(version, dim())).right_aligned());
     }
+    // 多电脑那两块：标题下面一行加入确认，底部一段「我的电脑」。都是现成
+    // 的数据（`App::mesh`），这里不发请求。
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    let prompt = super::computers::prompt_lines(&app.mesh, app.lang, width);
+    let section = super::computers::section_lines(&app.mesh, app.lang, width);
+    let (prompt_area, list_area, section_area) = split(inner, prompt.len(), section.len());
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(prompt), prompt_area);
     f.render_stateful_widget(
-        List::new(items).block(block).highlight_symbol("▶ "),
-        area,
+        List::new(items).highlight_symbol("▶ "),
+        list_area,
         &mut app.list_state,
     );
+    f.render_widget(Paragraph::new(section), section_area);
+}
+
+/// 把标题下面那块分成三截：确认行、列表、「我的电脑」。高度不够时先保
+/// 确认行（要人拍板的事），再给列表留至少一行，剩下的才给底部那一段。
+fn split(inner: Rect, prompt: usize, section: usize) -> (Rect, Rect, Rect) {
+    let h = inner.height;
+    let ph = (prompt.min(u16::MAX as usize) as u16).min(h);
+    let rest = h - ph;
+    let sh = (section.min(u16::MAX as usize) as u16).min(rest.saturating_sub(1));
+    let lh = rest - sh;
+    let at = |y: u16, height: u16| Rect {
+        x: inner.x,
+        y: inner.y + y,
+        width: inner.width,
+        height,
+    };
+    (at(0, ph), at(ph, lh), at(ph + lh, sh))
 }
 
 #[cfg(test)]
@@ -1234,5 +1285,198 @@ mod tests {
             crate::ui::ViewMode::Grid,
             "g 切的是**模式**，不是打开一个附属页面——下次回家也该落在九宫格"
         );
+    }
+
+    // —— 多电脑：「我的电脑」、加入确认、留言计数 ——
+
+    use super::super::computers::tests::mesh_view;
+
+    /// 每一行，空白洗掉（CJK 宽字符后面那一格是空白）。
+    fn rows(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        let a = buf.area;
+        (0..a.height)
+            .map(|y| {
+                (0..a.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn draw_mesh(view: Option<crate::proto::MeshView>, w: u16, h: u16) -> Terminal<TestBackend> {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        app.set_sessions(vec![sess(1, &proj)]);
+        app.mesh.view = view;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        term
+    }
+
+    /// 没登录多电脑：底部只有一行灰字，不列名单、不画标题。
+    #[test]
+    fn not_logged_in_shows_a_single_gray_line_at_the_bottom() {
+        let term = draw_mesh(Some(mesh_view(false, &[], &[])), 80, 12);
+        let r = rows(&term);
+        assert_eq!(r[11], "多电脑未开启·运行dctlogin");
+        assert!(!r[10].contains("我的电脑"), "{r:?}");
+        assert_eq!(r.iter().filter(|l| l.contains("多电脑未开启")).count(), 1);
+        let buf = term.backend().buffer();
+        let first = (0..80)
+            .find(|x| buf.cell((*x, 11)).is_some_and(|c| c.symbol() == "多"))
+            .unwrap();
+        assert_eq!(
+            buf.cell((first, 11)).unwrap().style().add_modifier,
+            crate::ui::dim().add_modifier,
+            "是灰字"
+        );
+        assert_eq!(
+            buf.cell((first, 11)).unwrap().fg,
+            crate::ui::dim().fg.unwrap_or_default()
+        );
+    }
+
+    /// 还没问到过（守护进程太老、刚启动）：那一段整个不画，不猜「没登录」。
+    #[test]
+    fn nothing_is_drawn_before_the_first_answer() {
+        let r = rows(&draw_mesh(None, 80, 12));
+        assert!(r[1].contains("proj"), "{r:?}");
+        assert!(r[3..].iter().all(|l| l.is_empty()), "{r:?}");
+    }
+
+    /// 三台电脑：本机在最前，然后在线的，然后离线的；实心圆是在线。
+    #[test]
+    fn three_computers_are_listed_with_their_state() {
+        let v = mesh_view(
+            true,
+            &[
+                ("云服务器", false, false),
+                ("公司Windows", true, false),
+                ("家里Mac", true, true),
+            ],
+            &[],
+        );
+        let r = rows(&draw_mesh(Some(v), 80, 12));
+        assert_eq!(
+            r[8..],
+            [
+                "我的电脑",
+                "●家里Mac本机",
+                "●公司Windows在线",
+                "○云服务器离线"
+            ],
+            "{r:?}"
+        );
+    }
+
+    /// 超过 5 台：列 5 台，剩下的说「还有 N 台」。
+    #[test]
+    fn more_than_five_computers_say_how_many_more() {
+        let names = ["A1", "A2", "A3", "A4", "A5", "A6", "A7"];
+        let members: Vec<(&str, bool, bool)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, true, i == 0))
+            .collect();
+        let r = rows(&draw_mesh(Some(mesh_view(true, &members, &[])), 80, 14));
+        assert_eq!(r[13], "还有2台", "{r:?}");
+        assert_eq!(r[7], "我的电脑");
+        assert_eq!(
+            r[8..13],
+            ["●A1本机", "●A2在线", "●A3在线", "●A4在线", "●A5在线"]
+        );
+        assert!(!r.iter().any(|l| l.contains("A6")));
+    }
+
+    /// 有电脑在等：标题下面一行黄字确认，带名字和数字；下面一行灰字提醒
+    /// 一次只加一台。80 列放得下整句。
+    #[test]
+    fn a_pending_join_shows_the_confirm_line_under_the_title() {
+        let v = mesh_view(
+            true,
+            &[("家里Mac", true, true)],
+            &[("公司Windows", "c-w", "123456")],
+        );
+        let term = draw_mesh(Some(v), 80, 12);
+        let r = rows(&term);
+        assert_eq!(
+            r[1],
+            "一台叫公司Windows的电脑想加入「我的电脑」。它屏幕上的数字是123456吗？(y/n)"
+        );
+        assert_eq!(r[2], "一次只加一台新电脑：两台同时加入，可能互相批准进错组");
+        assert!(!r.iter().any(|l| l.contains("还有")));
+        let buf = term.backend().buffer();
+        assert_eq!(
+            buf.cell((0, 1)).unwrap().fg,
+            crate::ui::theme_now().asking().fg.unwrap(),
+            "确认行是「等你拍板」那一档暖色"
+        );
+        // 会话行还在，被挤到下面
+        assert!(r.iter().any(|l| l.contains("proj")));
+    }
+
+    /// 等着的不止一台：只问最早的那台，后面说「还有 N 条」。
+    #[test]
+    fn several_pending_joins_are_asked_one_at_a_time() {
+        let v = mesh_view(
+            true,
+            &[("家里Mac", true, true)],
+            &[
+                ("甲", "c-a", "111111"),
+                ("乙", "c-b", "222222"),
+                ("丙", "c-c", "333333"),
+            ],
+        );
+        let c: String = rows(&draw_mesh(Some(v), 80, 12)).concat();
+        assert!(c.contains("一台叫甲的电脑") && c.contains("111111"), "{c}");
+        assert!(c.contains("还有2条"), "{c}");
+        assert!(!c.contains("222222") && !c.contains("333333"), "{c}");
+    }
+
+    /// 窄终端上折行，数字和 (y/n) 一个都不能丢；再窄再矮也不 panic。
+    #[test]
+    fn narrow_and_tiny_terminals_keep_the_code_and_never_panic() {
+        let v = mesh_view(
+            true,
+            &[
+                ("家里Mac", true, true),
+                ("一个特别特别长的电脑名字啊啊啊", false, false),
+            ],
+            &[("公司Windows", "c-w", "123456")],
+        );
+        let c: String = rows(&draw_mesh(Some(v.clone()), 30, 20)).concat();
+        assert!(c.contains("123456") && c.contains("(y/n)"), "{c}");
+        // 矮到放不下：确认行先保，列表至少留一行，剩下的才给「我的电脑」。
+        let r = rows(&draw_mesh(Some(v.clone()), 80, 5));
+        assert!(r[1].contains("123456"), "{r:?}");
+        assert!(r[3].contains("proj"), "列表还剩一行：{r:?}");
+        assert_eq!(r[4], "我的电脑");
+        for (w, h) in [(80, 24), (30, 10), (30, 3), (10, 5), (1, 1), (2, 2), (0, 0)] {
+            draw_mesh(Some(v.clone()), w, h);
+            draw_mesh(Some(mesh_view(false, &[], &[])), w, h);
+        }
+    }
+
+    /// 会话收到过留言：那一行末尾「✉ N」。activity 再长也不能把它挤出屏幕。
+    #[test]
+    fn a_session_that_got_messages_shows_the_count_at_the_end_of_its_row() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut a = sess(1, &proj);
+        a.activity = "x".repeat(200);
+        app.set_sessions(vec![a, sess(2, &proj)]);
+        let mut v = mesh_view(true, &[("家里Mac", true, true)], &[]);
+        v.messages = [(1, 3)].into_iter().collect();
+        app.mesh.view = Some(v);
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let row = row_with(&term, "✉");
+        assert!(row.trim_end().ends_with("✉ 3"), "{row:?}");
+        assert!(row.contains("  1  "), "是会话 #1 那一行：{row:?}");
+        assert_eq!(rows(&term).iter().filter(|l| l.contains('✉')).count(), 1);
     }
 }

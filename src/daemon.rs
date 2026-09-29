@@ -394,6 +394,7 @@ fn mesh_view(ctl: &MeshCtl) -> crate::proto::MeshView {
         members: Vec::new(),
         pending: Vec::new(),
         joining: Vec::new(),
+        messages: Default::default(),
     }
 }
 

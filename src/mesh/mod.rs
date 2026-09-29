@@ -9,7 +9,7 @@
 //! - `cli`：`dct login` / `dct join` / `dct peers` / `dct send`；
 //! - 这里：`Mesh`，守护进程里这台电脑在组里的全部状态，以及电脑信封唯一的
 //!   入口 `Mesh::on_envelope`。
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -152,6 +152,9 @@ pub struct Mesh {
     /// 此刻正在（锁外）往里敲字的会话。标着的会话，新来的留言排到队里、
     /// 投递线程也不再给它送——一次只送一条，先来的先送。
     in_flight: HashSet<u32>,
+    /// 这次运行期间送进每个会话的留言条数（`MeshView::messages`，看板上的
+    /// 「✉ N」）。
+    delivered: BTreeMap<u32, u32>,
     store: Option<store::Store>,
     journal: Arc<Journal>,
     seen: Seen,
@@ -189,6 +192,7 @@ impl Mesh {
             queues: HashMap::new(),
             inbox: None,
             in_flight: HashSet::new(),
+            delivered: BTreeMap::new(),
             store: None,
             journal: Arc::new(Journal::new()),
             seen: Seen::default(),
@@ -279,6 +283,11 @@ impl Mesh {
     }
 
     /// 敲完之后（锁又拿回来了）：清掉「正在敲」，回回执。
+    /// 看板上「✉ N」的底数。
+    pub fn delivered_counts(&self) -> BTreeMap<u32, u32> {
+        self.delivered.clone()
+    }
+
     fn finish_incoming(
         &mut self,
         t: &deliver::Typing,

@@ -39,6 +39,7 @@ mod secret;
 mod settings_view;
 mod web;
 
+mod computers;
 mod view;
 use view::SecretPhase;
 pub use view::{
@@ -822,6 +823,8 @@ pub fn run(
         // 放在拉列表**之前**且不跟它共用条件：会话视图里不拉列表，而那正是
         // 最该看到「● 正在直播」的一屏。
         live::poll_status(&mut app, std::time::Instant::now());
+        // 多电脑现状：后台线程问、这里收，绘制路径上不发请求（见 `computers`）。
+        computers::poll(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {

@@ -181,6 +181,9 @@ pub struct App {
     pub pair_last_fetch: Option<std::time::Instant>,
     /// 上次问守护进程「在不在播」的时刻，见 `live::poll_status`。
     pub live_last_fetch: Option<std::time::Instant>,
+    /// 看板上「我的电脑」那一块：多电脑现状、加入确认、留言计数。后台线程
+    /// 每 5 秒问一次，见 `computers::poll`。
+    pub(crate) mesh: super::computers::MeshPanel,
     /// 上次公开时用过的标题，按 `p` 时预填。
     pub last_public_title: String,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
@@ -286,6 +289,7 @@ impl App {
             pair_start_rx: None,
             pair_last_fetch: None,
             live_last_fetch: None,
+            mesh: Default::default(),
             last_public_title: String::new(),
             lang,
             socket,

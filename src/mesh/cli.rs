@@ -559,6 +559,7 @@ mod tests {
                 .collect(),
             pending: vec![],
             joining: vec![],
+            messages: Default::default(),
         }
     }
 

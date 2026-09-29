@@ -2171,6 +2171,55 @@ pub mod msg {
         )
     }
 
+    /// 看板上那一行加入确认之后，还有几条排着（一次只问一条，先来的先问）。
+    pub fn mesh_more_requests(lang: Lang, n: usize) -> String {
+        t!(lang, en: format!("{n} more waiting"), zh: format!("还有 {n} 条"))
+    }
+
+    /// 看板上加入确认下面那行灰字：两台**新**电脑同时加入，会互相看到对方
+    /// 的请求、互相批准，进错组。
+    pub fn mesh_cross_join_hint(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Add one new computer at a time: two joining at once can approve each other".to_string(),
+            zh: "一次只加一台新电脑：两台同时加入，可能互相批准进错组".to_string(),
+        )
+    }
+
+    /// 看板底部「我的电脑」那一段：没登录多电脑时唯一的一行。
+    pub fn mesh_board_off(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Multi-computer is off · run dct login".to_string(),
+            zh: "多电脑未开启 · 运行 dct login".to_string(),
+        )
+    }
+
+    pub fn mesh_board_header(lang: Lang) -> String {
+        t!(lang, en: "My computers".to_string(), zh: "我的电脑".to_string())
+    }
+
+    /// 看板上一台电脑名字后面那两个字。
+    pub fn mesh_board_state(lang: Lang, online: bool, is_me: bool) -> String {
+        match (is_me, online) {
+            (true, _) => t!(lang, en: "this computer", zh: "本机"),
+            (false, true) => t!(lang, en: "online", zh: "在线"),
+            (false, false) => t!(lang, en: "offline", zh: "离线"),
+        }
+        .to_string()
+    }
+
+    /// 「我的电脑」超过 5 台，剩下的只报个数。
+    pub fn mesh_board_more(lang: Lang, n: usize) -> String {
+        t!(lang, en: format!("{n} more"), zh: format!("还有 {n} 台"))
+    }
+
+    /// 看板会话行末尾：这次运行期间别的电脑送进来几条留言。`✉` 是字符，
+    /// 不是彩色 emoji。
+    pub fn mesh_messages_mark(n: u32) -> String {
+        format!("✉ {n}")
+    }
+
     /// `dct peers` 里，一条等批准的请求下面那行：怎么批、怎么拒。
     pub fn mesh_approve_hint(lang: Lang, target: &str) -> String {
         t!(
@@ -3236,6 +3285,25 @@ mod tests {
         );
         assert_eq!(msg::mesh_code_line(Lang::Zh, "家里Mac", "000123"), "  家里Mac：000123");
         assert_eq!(msg::mesh_joined_group(Lang::Zh), "已加入");
+        // 看板（Task 8）
+        assert_eq!(msg::mesh_board_off(Lang::Zh), "多电脑未开启 · 运行 dct login");
+        assert_eq!(msg::mesh_board_more(Lang::Zh, 3), "还有 3 台");
+        assert_eq!(msg::mesh_board_state(Lang::Zh, true, true), "本机");
+        assert_eq!(msg::mesh_board_state(Lang::Zh, true, false), "在线");
+        assert_eq!(msg::mesh_board_state(Lang::Zh, false, false), "离线");
+        assert_eq!(msg::mesh_messages_mark(2), "✉ 2");
+        for s in [
+            msg::mesh_board_off(Lang::En),
+            msg::mesh_board_more(Lang::En, 3),
+            msg::mesh_board_header(Lang::En),
+            msg::mesh_board_state(Lang::En, true, true),
+            msg::mesh_board_state(Lang::En, true, false),
+            msg::mesh_board_state(Lang::En, false, false),
+            msg::mesh_more_requests(Lang::En, 2),
+            msg::mesh_cross_join_hint(Lang::En),
+        ] {
+            assert!(!has_han(&s), "{s}");
+        }
         let login = msg::error(
             Lang::En,
             &ErrorCode::Mesh(MeshProblem::LoginFailed("服务器还没开放多电脑功能".into())),

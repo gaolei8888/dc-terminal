@@ -502,6 +502,9 @@ impl Mesh {
             Ok(Typed::NoCheckpoint) => (Receipt::Delivered, "delivered_no_checkpoint"),
             Err(_) => (Receipt::Refused, "type_failed"),
         };
+        if receipt == Receipt::Delivered {
+            *self.delivered.entry(t.session).or_default() += 1;
+        }
         let what = if t.queued { "queued_msg" } else { "msg" };
         self.journal.mesh(&format!(
             "{what} from={} id={} session={} result={how}",
@@ -1755,6 +1758,39 @@ mod tests {
         assert_eq!(*free.lock().unwrap(), [true, true], "敲字时锁该是空的");
         assert_eq!(inbox.typed().len(), 2);
         assert!(b.lock().unwrap().in_flight.is_empty(), "敲完要清掉标记");
+    }
+
+    /// 看板上的「✉ N」：每个会话真的敲进去了几条（收到就敲的、排队后敲的
+    /// 都算；排着的、没敲进去的不算），经 `MeshStatus` 带回去。
+    #[test]
+    fn the_status_view_counts_messages_typed_into_each_session() {
+        let (b, inbox, r) = shared_receiver(Idle);
+        inbox.add(8, "", "/w/other", Idle, true);
+        let hub = FakeHub::new();
+        let ep = b.lock().unwrap().endpoint().to_string();
+        let net = hub.net_for(&ep);
+        let counts = || crate::mesh::group::view(&b, &net, true).messages;
+        assert!(counts().is_empty());
+
+        let reply = crate::mesh::handle(&b, &env_from_a(&r, "c1", "#7", "一"));
+        assert_eq!(receipt_of(&b, &r, reply), Receipt::Delivered);
+        let reply = crate::mesh::handle(&b, &env_from_a(&r, "c2", "#7", "二"));
+        assert_eq!(receipt_of(&b, &r, reply), Receipt::Queued);
+        assert_eq!(counts(), [(7, 1)].into_iter().collect(), "排着的不算");
+
+        inbox.set_state(7, Idle);
+        tick(&b);
+        assert_eq!(counts(), [(7, 2)].into_iter().collect());
+
+        *inbox.fail.lock().unwrap() = Some(Err("pty closed".into()));
+        let reply = crate::mesh::handle(&b, &env_from_a(&r, "c3", "#8", "没进去"));
+        assert_eq!(receipt_of(&b, &r, reply), Receipt::Refused);
+        assert_eq!(counts(), [(7, 2)].into_iter().collect(), "没敲进去的不算");
+
+        *inbox.fail.lock().unwrap() = Some(Ok(Typed::NoCheckpoint));
+        let reply = crate::mesh::handle(&b, &env_from_a(&r, "c4", "#8", "进去了"));
+        assert_eq!(receipt_of(&b, &r, reply), Receipt::Delivered);
+        assert_eq!(counts(), [(7, 2), (8, 1)].into_iter().collect());
     }
 
     /// 装一个只 panic 一次的敲字回调。
