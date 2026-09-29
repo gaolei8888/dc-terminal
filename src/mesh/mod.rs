@@ -626,11 +626,13 @@ pub fn handle(mesh: &Mutex<Mesh>, env: &Envelope) -> Option<Vec<u8>> {
     match step {
         Step::Done(r) => r,
         Step::Type(t) => {
+            // 敲字半路 panic 也得把「正在敲」清掉，见 `deliver::InFlight`。
+            let guard = deliver::InFlight::new(mesh, t.session);
             let r = match &inbox {
                 Some(i) => i.type_into(t.session, &t.text),
                 None => Err("no inbox".into()),
             };
-            lock().finish_incoming(&t, r)
+            guard.finish(|m| m.finish_incoming(&t, r))
         }
     }
 }
@@ -641,7 +643,11 @@ pub fn handle(mesh: &Mutex<Mesh>, env: &Envelope) -> Option<Vec<u8>> {
 pub fn route(mesh: Arc<Mutex<Mesh>>, proto: Option<Handler>) -> Handler {
     Arc::new(move |env: &Envelope| {
         if env.from.as_str().starts_with(COMPUTER_PREFIX) {
-            handle(&mesh, env)
+            // 一封信封处理到一半 panic（比如敲字那一下）不能把整条连接线
+            // 带走：`link::spawn` 的 `catch_unwind` 包的是整个 `run`，线
+            // 就停了，这台电脑从此收不到任何东西。这一封不回就是了。
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&mesh, env)))
+                .unwrap_or(None)
         } else {
             proto.as_ref().and_then(|h| h(env))
         }
