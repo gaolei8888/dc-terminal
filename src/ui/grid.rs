@@ -388,6 +388,21 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         View::Grid { focus, reply } => (*focus, reply.clone()),
         _ => return,
     };
+    // 有电脑在等批准：顶上一行暖色提醒回看板（y/n 只在看板上接）。整句
+    // 折行、不截，下面的格子让出这几行。
+    let notice = super::computers::grid_notice_lines(&app.mesh, app.lang, area.width as usize);
+    let nh = (notice.len().min(u16::MAX as usize) as u16).min(area.height);
+    if nh > 0 {
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(notice),
+            Rect { height: nh, ..area },
+        );
+    }
+    let area = Rect {
+        y: area.y + nh,
+        height: area.height - nh,
+        ..area
+    };
     let visible = app.grid_sessions();
     draw_grid(
         f,

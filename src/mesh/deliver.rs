@@ -82,7 +82,7 @@ fn looks_like_marker(line: &str) -> bool {
 /// Unicode 的 `Cf`（格式字符）：零宽空格、零宽连接符、字节序标记、双向
 /// 控制符……都不占位置、不显示。这里没有能查字符类别的依赖（要纯 Rust、
 /// 不为这一处多拉一个 crate），照 Unicode 15 的 `Cf` 表抄全。
-fn is_format_char(c: char) -> bool {
+pub(crate) fn is_format_char(c: char) -> bool {
     matches!(
         c as u32,
         0x00AD
@@ -865,6 +865,14 @@ pub fn tick(mesh: &Mutex<Mesh>) {
     for (t, guard) in jobs {
         let r = inbox.type_into(t.session, &t.text);
         guard.finish(|m| m.finish_typing(&t, r));
+    }
+}
+
+/// 守护进程的投递线程用这个：一拍里 panic 了，接住、记一行，线程接着
+/// 跑（死了之后谁的排队都不再送）。「正在敲」的标记由 `InFlight` 清。
+pub fn tick_catching(mesh: &Mutex<Mesh>) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tick(mesh))).is_err() {
+        lock(mesh).journal.mesh("mesh_panic where=tick");
     }
 }
 
@@ -1812,6 +1820,8 @@ mod tests {
     #[test]
     fn a_panic_while_typing_an_incoming_message_does_not_wedge_the_session() {
         let (b, inbox, r) = shared_receiver(Idle);
+        let (_t, j, path) = journaled();
+        b.lock().unwrap().journal = j;
         panic_once(&inbox);
         // 连接线程走的是 `route`：这一封不回，线不能跟着死。
         let route = crate::mesh::route(b.clone(), None);
@@ -1820,6 +1830,8 @@ mod tests {
             Some(None),
             "panic 要在 route 里接住"
         );
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.contains("mesh_panic where=route"), "{log}");
         assert!(
             b.lock().unwrap().in_flight.is_empty(),
             "panic 之后标记要清掉"
@@ -1840,8 +1852,13 @@ mod tests {
         }
         inbox.set_state(7, Idle);
         inbox.set_state(8, Idle);
+        let (_t, j, path) = journaled();
+        b.lock().unwrap().journal = j;
         panic_once(&inbox);
-        assert!(quietly(|| tick(&b)).is_err());
+        // 守护进程的投递线程走 `tick_catching`：接住、记一行。
+        tick_catching(&b);
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.contains("mesh_panic where=tick"), "{log}");
         assert!(
             b.lock().unwrap().in_flight.is_empty(),
             "两个会话的标记都要清掉"

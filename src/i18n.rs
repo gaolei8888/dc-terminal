@@ -2186,6 +2186,16 @@ pub mod msg {
         )
     }
 
+    /// 九宫格顶上：有电脑在等批准。y/n 只在看板上接，这里只说怎么过去。
+    /// `g` 切的是**保存下来的**模式（九宫格 ↔ 看板），照实说。
+    pub fn mesh_grid_notice(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "A computer wants to join \"My computers\". Press g to switch to the board and confirm (g also makes the board your default view; press g again to go back to the grid)".to_string(),
+            zh: "有电脑想加入「我的电脑」。按 g 切到看板确认（g 会把默认视图也换成看板，确认完再按 g 换回九宫格）".to_string(),
+        )
+    }
+
     /// 看板底部「我的电脑」那一段：没登录多电脑时唯一的一行。
     pub fn mesh_board_off(lang: Lang) -> String {
         t!(
@@ -3301,6 +3311,7 @@ mod tests {
             msg::mesh_board_state(Lang::En, false, false),
             msg::mesh_more_requests(Lang::En, 2),
             msg::mesh_cross_join_hint(Lang::En),
+            msg::mesh_grid_notice(Lang::En),
         ] {
             assert!(!has_han(&s), "{s}");
         }

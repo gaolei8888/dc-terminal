@@ -24,6 +24,10 @@ pub(crate) const POLL_EVERY: Duration = Duration::from_secs(5);
 /// 批准要把新名单发给组里每台电脑，比本机答一句慢得多（同 `dct peers
 /// approve` 用的慢超时）。
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(40);
+/// 确认行上换了一条（或者刚出现）之后，多久内 y/n 不算数：一次刷新恰好在
+/// 按键前把 A 换成了 B，这一下不能落到用户没看过的 B 上；平时当「新建会话」
+/// 按的 `n` 也不能拒掉一条刚冒出来、还没看清的请求。
+pub(crate) const SETTLE: Duration = Duration::from_millis(500);
 /// 「我的电脑」最多列几台，多的只报个数。
 pub(crate) const MAX_SHOWN: usize = 5;
 
@@ -33,8 +37,12 @@ type Reply = Result<Response, String>;
 #[derive(Default)]
 pub(crate) struct MeshPanel {
     /// 最近一次拿到的现状。`None` = 还没问到过（守护进程太老、刚启动），
-    /// 这时候那一段整个不画，不猜。
+    /// 这时候那一段整个不画，不猜。**换它走 `set_view`**：那里记着确认行
+    /// 上那一条是什么时候出现的（`SETTLE`）。
     pub view: Option<MeshView>,
+    /// 确认行上此刻那一条（端点、数字），以及它从什么时候开始挂在那儿。
+    shown: Option<(String, String)>,
+    shown_since: Option<Instant>,
     status_rx: Option<Receiver<Reply>>,
     last_fetch: Option<Instant>,
     answer_rx: Option<Receiver<Reply>>,
@@ -44,6 +52,29 @@ pub(crate) struct MeshPanel {
 }
 
 impl MeshPanel {
+    /// 换上一份新的现状。确认行上那一条的身份（端点、数字）变了，就从
+    /// `now` 重新计时。
+    pub(crate) fn set_view(&mut self, v: MeshView, now: Instant) {
+        let id = v
+            .pending
+            .first()
+            .map(|p| (p.endpoint.clone(), p.code.clone()));
+        if id != self.shown {
+            self.shown = id;
+            self.shown_since = Some(now);
+        }
+        self.view = Some(v);
+    }
+
+    /// 确认行上那一条已经挂够 `SETTLE` 了吗。`view` 被绕过 `set_view` 换掉
+    /// 的话身份对不上，一律当没挂够——宁可这一下不算数。
+    fn settled(&self, p: &PendingJoin, now: Instant) -> bool {
+        self.shown.as_ref() == Some(&(p.endpoint.clone(), p.code.clone()))
+            && self
+                .shown_since
+                .is_some_and(|t| now.saturating_duration_since(t) >= SETTLE)
+    }
+
     /// 此刻确认行上问的是哪一条：最早来的那一条（`pending` 按到达顺序排）。
     pub(crate) fn asking(&self) -> Option<&PendingJoin> {
         if self.answering.is_some() {
@@ -74,7 +105,8 @@ fn spawn_call(socket: PathBuf, req: Request, timeout: Duration) -> Receiver<Repl
 }
 
 /// 主循环每轮调一次：收后台的结果；到点了、又没有一条在飞，就再问一次。
-/// 只在看板上问——别的视图不画这一块。
+/// 只在看板和九宫格上问（九宫格上有人想加入时要提醒一句）——别的视图不画
+/// 这一块。
 pub(crate) fn poll(app: &mut App, now: Instant) {
     if let Some(rx) = &app.mesh.answer_rx {
         if let Ok(r) = rx.try_recv() {
@@ -84,24 +116,30 @@ pub(crate) fn poll(app: &mut App, now: Instant) {
             app.mesh.status_rx = None;
             match (r, answered) {
                 (Ok(Response::Mesh(v)), Some((asked, yes))) => {
-                    app.message = if yes {
-                        msg::mesh_member_joined(app.lang, &clean(&asked.name))
-                    } else {
-                        msg::mesh_member_refused(app.lang, &clean(&asked.name))
-                    }
-                    .into();
-                    app.mesh.view = Some(v);
+                    say(
+                        app,
+                        if yes {
+                            msg::mesh_member_joined(app.lang, &clean(&asked.name))
+                        } else {
+                            msg::mesh_member_refused(app.lang, &clean(&asked.name))
+                        }
+                        .into(),
+                    );
+                    app.mesh.set_view(v, now);
                     app.mesh.last_fetch = Some(now);
                 }
                 (Ok(Response::Error(e)), _) => {
-                    app.message = Msg::err(msg::error(app.lang, &e));
+                    say(app, Msg::err(msg::error(app.lang, &e)));
                     app.mesh.last_fetch = None;
                 }
                 _ => {
-                    app.message = Msg::err(msg::error(
-                        app.lang,
-                        &crate::proto::ErrorCode::DaemonNotResponding,
-                    ));
+                    say(
+                        app,
+                        Msg::err(msg::error(
+                            app.lang,
+                            &crate::proto::ErrorCode::DaemonNotResponding,
+                        )),
+                    );
                     app.mesh.last_fetch = None;
                 }
             }
@@ -113,7 +151,7 @@ pub(crate) fn poll(app: &mut App, now: Instant) {
                 app.mesh.status_rx = None;
                 // 问不到（断线、守护进程太老不认识这条）就留着手里那份。
                 if let Ok(Response::Mesh(v)) = r {
-                    app.mesh.view = Some(v);
+                    app.mesh.set_view(v, now);
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -126,7 +164,7 @@ pub(crate) fn poll(app: &mut App, now: Instant) {
         .is_none_or(|t| now.saturating_duration_since(t) >= POLL_EVERY);
     if due
         && app.connected
-        && matches!(app.view, View::Board)
+        && matches!(app.view, View::Board | View::Grid { .. })
         && app.mesh.status_rx.is_none()
         && app.mesh.answering.is_none()
     {
@@ -139,9 +177,22 @@ pub(crate) fn poll(app: &mut App, now: Instant) {
     }
 }
 
+/// 回答晚到的那句话：人已经在会话里了就不说——会话视图的底栏是给 agent
+/// 那一屏用的，一句「已加入」盖上去没人需要。
+fn say(app: &mut App, m: Msg) {
+    if !matches!(app.view, View::Attached(_)) {
+        app.message = m;
+    }
+}
+
 /// 看板上按了 y / n：确认行在的时候由它接管（返回 `true`）。**只从
-/// `board::handle_key` 调**——会话视图里 y/n 归 agent。
+/// `board::handle_key` 调**——会话视图里 y/n 归 agent，九宫格里也不接
+/// （那边 `n` 是新建会话，只提醒一句「回看板确认」）。
 pub(crate) fn handle_key(app: &mut App, key: &KeyEvent) -> bool {
+    handle_key_at(app, key, Instant::now())
+}
+
+pub(crate) fn handle_key_at(app: &mut App, key: &KeyEvent, now: Instant) -> bool {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
@@ -160,6 +211,11 @@ pub(crate) fn handle_key(app: &mut App, key: &KeyEvent) -> bool {
     let Some(p) = app.mesh.asking().cloned() else {
         return false;
     };
+    // 刚换上来的一条还没挂够：这一下不算它的（y 什么都不做，n 照旧是新建
+    // 会话）。
+    if !app.mesh.settled(&p, now) {
+        return false;
+    }
     // 发的就是屏幕上这一条的端点和数字，守护进程两样都对上才批。
     app.mesh.answer_rx = Some(spawn_call(
         app.socket.clone(),
@@ -174,9 +230,27 @@ pub(crate) fn handle_key(app: &mut App, key: &KeyEvent) -> bool {
     true
 }
 
-/// 别的电脑给的名字：洗掉控制字符和转义序列，才能往终端上画。
+/// 别的电脑给的名字：洗掉控制字符和转义序列，再去掉看不见的格式字符
+/// （零宽、双向控制符——它们会把后面的字倒过来画、或者让宽度算错），才能
+/// 往终端上画。
 fn clean(s: &str) -> String {
     crate::session::sanitize(s)
+        .chars()
+        .filter(|c| !crate::mesh::deliver::is_format_char(*c))
+        .collect()
+}
+
+/// 九宫格顶上那几行：有电脑在等批准时提醒一句回看板（y/n 只在看板上接）。
+/// 整句折行，不截。
+pub(crate) fn grid_notice_lines(panel: &MeshPanel, lang: Lang, width: usize) -> Vec<Line<'static>> {
+    if panel.asking().is_none() {
+        return Vec::new();
+    }
+    let style = theme_now().asking().add_modifier(Modifier::BOLD);
+    wrap(&msg::mesh_grid_notice(lang), width)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, style)))
+        .collect()
 }
 
 /// 按显示宽度折行（中文占两列）。`width` 为 0 时什么都不出。
@@ -400,6 +474,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// 早于 `SETTLE`：确认行已经挂够了。
+    pub(crate) fn long_ago() -> Instant {
+        let now = Instant::now();
+        now.checked_sub(SETTLE * 4).unwrap_or(now)
+    }
+
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
@@ -421,7 +501,7 @@ pub(crate) mod tests {
         let got = fake_daemon(&app.socket, status.clone());
         app.connected = true;
         app.view = View::Board;
-        app.mesh.view = Some(status);
+        app.mesh.set_view(status, long_ago());
         (app, dir, got)
     }
 
@@ -528,7 +608,7 @@ pub(crate) mod tests {
         let (mut app, _d, got) = board_app(mesh_view(true, &[("家里Mac", true, true)], &[]));
         assert!(!handle_key(&mut app, &key('n')));
         assert!(!handle_key(&mut app, &key('y')));
-        app.mesh.view = Some(two_waiting());
+        app.mesh.set_view(two_waiting(), long_ago());
         assert!(!handle_key(
             &mut app,
             &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
@@ -580,6 +660,160 @@ pub(crate) mod tests {
         poll(&mut app, Instant::now() + POLL_EVERY * 2);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(statuses(&got), 0);
+    }
+
+    fn grid_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::grid::draw(f, f.area(), app))
+            .unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// I1：九宫格里有电脑在等：顶上一行暖色提醒，整句不截（80 列折成两行）；
+    /// 没人等就不画。
+    #[test]
+    fn the_grid_tells_you_to_go_to_the_board_when_a_computer_waits() {
+        let (mut app, _d) = App::test_app();
+        app.view = View::grid(0);
+        app.mesh
+            .set_view(mesh_view(true, &[("家里Mac", true, true)], &[]), long_ago());
+        let r = grid_rows(&mut app, 80, 20);
+        assert!(!r.concat().contains("有电脑想加入"), "{r:?}");
+
+        app.mesh.set_view(two_waiting(), long_ago());
+        let r = grid_rows(&mut app, 80, 20);
+        let want: String = msg::mesh_grid_notice(Lang::Zh)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(r[0..2].concat(), want, "{r:?}");
+        assert!(r[0].starts_with("有电脑想加入"));
+        // 窄、矮都不 panic
+        for (w, h) in [(30, 10), (10, 3), (1, 1), (0, 0)] {
+            grid_rows(&mut app, w, h);
+        }
+    }
+
+    /// I1：九宫格里也每 5 秒问一次（不然根本不知道有人在等）。
+    #[test]
+    fn status_is_asked_in_the_grid_too() {
+        let (mut app, _d, got) = board_app(mesh_view(true, &[], &[]));
+        app.view = View::grid(0);
+        app.mesh.view = None;
+        poll(&mut app, Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while statuses(&got) < 1 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// I1：九宫格里 y/n 不接（`n` 在那边是新建会话）。
+    #[test]
+    fn y_and_n_in_the_grid_send_no_approval() {
+        let (mut app, _d, got) = board_app(two_waiting());
+        app.view = View::grid(0);
+        crate::ui::dispatch_key(&mut app, key('y')).unwrap();
+        crate::ui::dispatch_key(&mut app, key('n')).unwrap();
+        assert!(app.mesh.answering.is_none());
+        std::thread::sleep(Duration::from_millis(200));
+        poll(&mut app, Instant::now());
+        assert!(approvals(&got).is_empty(), "{:?}", approvals(&got));
+    }
+
+    /// M1：确认行上那一条刚出现、或者刚被换成另一条，`SETTLE` 之内 y/n 不算数。
+    #[test]
+    fn a_request_that_just_appeared_or_changed_is_not_answered_yet() {
+        let (mut app, _d, got) = board_app(mesh_view(true, &[], &[]));
+        let t0 = Instant::now();
+        let a = mesh_view(true, &[], &[("甲", "c-a", "111111")]);
+        let b = mesh_view(true, &[], &[("乙", "c-b", "222222")]);
+
+        // 刚出现
+        app.mesh.set_view(a.clone(), t0);
+        assert!(!handle_key_at(&mut app, &key('y'), t0 + SETTLE / 5));
+        assert!(!handle_key_at(&mut app, &key('n'), t0 + SETTLE / 5));
+        // 同一条再刷新一次不重新计时
+        app.mesh.set_view(a.clone(), t0 + SETTLE / 2);
+        // A 在按键前一刻被换成了 B
+        let t1 = t0 + SETTLE * 3;
+        app.mesh.set_view(b.clone(), t1);
+        assert!(!handle_key_at(&mut app, &key('y'), t1 + SETTLE / 5));
+        assert!(approvals(&got).is_empty());
+        // B 挂够了才算
+        assert!(handle_key_at(&mut app, &key('y'), t1 + SETTLE));
+        wait_until(&mut app, |a| a.mesh.answering.is_none());
+        assert_eq!(
+            approvals(&got),
+            [("c-b".to_string(), "222222".to_string(), true)]
+        );
+
+        // 绕过 `set_view` 换掉的现状：身份对不上，一律不算数。
+        let (mut app, _d3, got3) = board_app(mesh_view(true, &[], &[]));
+        app.mesh.set_view(a.clone(), t0);
+        app.mesh.view = Some(b.clone());
+        assert!(!handle_key_at(&mut app, &key('y'), t0 + SETTLE * 10));
+        assert!(approvals(&got3).is_empty());
+
+        // 同一条被刷新（身份没变）：从第一次出现算起。
+        let (mut app, _d2, got) = board_app(mesh_view(true, &[], &[]));
+        app.mesh.set_view(a.clone(), t0);
+        app.mesh.set_view(a, t0 + SETTLE / 2);
+        assert!(handle_key_at(&mut app, &key('n'), t0 + SETTLE));
+        wait_until(&mut app, |a| a.mesh.answering.is_none());
+        assert_eq!(approvals(&got).len(), 1);
+    }
+
+    /// M4：别的电脑给的名字里有双向控制符、零宽字符：画之前去掉。
+    #[test]
+    fn format_characters_in_a_remote_name_never_reach_the_screen() {
+        let name = "\u{202E}公司\u{200B}Win\u{2066}";
+        let panel = {
+            let mut p = MeshPanel::default();
+            p.set_view(
+                mesh_view(true, &[(name, true, false)], &[(name, "c-x", "123456")]),
+                long_ago(),
+            );
+            p
+        };
+        let text: String = prompt_lines(&panel, Lang::Zh, 80)
+            .into_iter()
+            .chain(section_lines(&panel, Lang::Zh, 80))
+            .flat_map(|l| l.spans.into_iter().map(|s| s.content.into_owned()))
+            .collect();
+        assert!(text.contains("公司Win"), "{text:?}");
+        assert!(
+            !text.chars().any(crate::mesh::deliver::is_format_char),
+            "{text:?}"
+        );
+    }
+
+    /// M6：回答晚到、人已经进了会话：不往会话的底栏上说话；现状照样换上。
+    #[test]
+    fn a_late_answer_does_not_talk_over_the_session_view() {
+        let (mut app, _d, got) = board_app(two_waiting());
+        crate::ui::dispatch_key(&mut app, key('y')).unwrap();
+        app.view = View::Attached(1);
+        app.message = "会话里的话".into();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while approvals(&got).is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait_until(&mut app, |a| a.mesh.answering.is_none());
+        assert_eq!(app.message.text, "会话里的话");
+        assert_eq!(app.mesh.view.as_ref().unwrap().pending.len(), 1);
     }
 
     #[test]

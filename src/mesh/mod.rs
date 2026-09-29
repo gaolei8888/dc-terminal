@@ -656,7 +656,12 @@ pub fn route(mesh: Arc<Mutex<Mesh>>, proto: Option<Handler>) -> Handler {
             // 带走：`link::spawn` 的 `catch_unwind` 包的是整个 `run`，线
             // 就停了，这台电脑从此收不到任何东西。这一封不回就是了。
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&mesh, env)))
-                .unwrap_or(None)
+                .unwrap_or_else(|_| {
+                    let m = mesh.lock().unwrap_or_else(|e| e.into_inner());
+                    m.journal
+                        .mesh(&format!("mesh_panic where=route from={}", env.from.as_str()));
+                    None
+                })
         } else {
             proto.as_ref().and_then(|h| h(env))
         }

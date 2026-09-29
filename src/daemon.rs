@@ -226,11 +226,8 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         std::thread::spawn(move || loop {
             std::thread::sleep(crate::mesh::deliver::TICK);
             if let Some((m, _)) = mc.running() {
-                // 一拍里敲字 panic 了，这条线不能跟着死：死了之后谁的排队
-                // 都不再送。「正在敲」的标记由 `deliver::InFlight` 清掉。
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::mesh::deliver::tick(&m)
-                }));
+                // 一拍里敲字 panic 了，这条线不能跟着死（`tick_catching`）。
+                crate::mesh::deliver::tick_catching(&m);
             }
         });
     }
