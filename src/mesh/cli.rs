@@ -204,6 +204,13 @@ fn pick<'a>(list: &'a [PendingJoin], who: &str) -> Result<&'a PendingJoin, usize
     }
 }
 
+/// 别的电脑报来的东西（名字、系统、会话……）印到终端之前都过一遍：
+/// 一个 `\x1b[8m` 就能把后面那行核对数字藏起来。守护进程给的现状已经洗过
+/// （`group::view`），这里是第二道，跟界面用的是同一份洗法。
+fn c(s: &str) -> String {
+    crate::mesh::deliver::clean_name(s)
+}
+
 fn say_error(err: &mut dyn Write, lang: Lang, e: &ErrorCode) {
     let _ = writeln!(err, "{}", msg::error(lang, e));
 }
@@ -241,7 +248,7 @@ pub(crate) fn login(call: Call, out: &mut dyn Write, err: &mut dyn Write, lang: 
     if !before.in_group && after.in_group {
         let _ = writeln!(out, "{}", msg::mesh_first_computer(lang));
     }
-    let _ = writeln!(out, "{}", msg::mesh_logged_in(lang, &after.name));
+    let _ = writeln!(out, "{}", msg::mesh_logged_in(lang, &c(&after.name)));
     0
 }
 
@@ -288,14 +295,18 @@ pub(crate) fn join(
     let line = |j: &PendingJoin| {
         let dup = asked.joining.iter().filter(|x| x.name == j.name).count() > 1;
         if dup {
-            msg::mesh_code_line_with_endpoint(lang, &j.name, &j.endpoint, &j.code)
+            msg::mesh_code_line_with_endpoint(lang, &c(&j.name), &c(&j.endpoint), &c(&j.code))
         } else {
-            msg::mesh_code_line(lang, &j.name, &j.code)
+            msg::mesh_code_line(lang, &c(&j.name), &c(&j.code))
         }
     };
     match asked.joining.as_slice() {
         [one] => {
-            let _ = writeln!(out, "{}", msg::mesh_compare_codes(lang, Some(&one.code)));
+            let _ = writeln!(
+                out,
+                "{}",
+                msg::mesh_compare_codes(lang, Some(&c(&one.code)))
+            );
             let _ = writeln!(out, "{}", line(one));
         }
         many => {
@@ -389,7 +400,7 @@ pub(crate) fn peers(
                         let _ = writeln!(
                             out,
                             "{}",
-                            msg::mesh_member_line(lang, &m.name, m.online, m.is_me)
+                            msg::mesh_member_line(lang, &c(&m.name), m.online, m.is_me)
                         );
                     }
                 }
@@ -398,8 +409,12 @@ pub(crate) fn peers(
                 // 两台同名就只能按端点批，提示里直接给端点。
                 let dup = v.pending.iter().filter(|q| q.name == p.name).count() > 1;
                 let target = if dup { &p.endpoint } else { &p.name };
-                let _ = writeln!(out, "{}", msg::mesh_join_prompt(lang, &p.name, &p.code));
-                let _ = writeln!(out, "{}", msg::mesh_approve_hint(lang, target));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    msg::mesh_join_prompt(lang, &c(&p.name), &c(&p.code))
+                );
+                let _ = writeln!(out, "{}", msg::mesh_approve_hint(lang, &c(target)));
             }
             0
         }
@@ -430,7 +445,7 @@ pub(crate) fn peers(
                 }
             };
             if yes {
-                let q = format!("{} ", msg::mesh_join_prompt(lang, &p.name, &p.code));
+                let q = format!("{} ", msg::mesh_join_prompt(lang, &c(&p.name), &c(&p.code)));
                 let said_yes = ask(&q).is_some_and(|a| a.trim().eq_ignore_ascii_case("y"));
                 if !said_yes {
                     let _ = writeln!(out, "{}", msg::mesh_not_approved(lang));
@@ -446,9 +461,9 @@ pub(crate) fn peers(
                 return 1;
             }
             if yes {
-                let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &p.name));
+                let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &c(&p.name)));
             } else {
-                let _ = writeln!(out, "{}", msg::mesh_member_refused(lang, &p.name));
+                let _ = writeln!(out, "{}", msg::mesh_member_refused(lang, &c(&p.name)));
             }
             0
         }
@@ -476,7 +491,7 @@ fn print_peers(out: &mut dyn Write, lang: Lang, v: &MeshView, list: &[PeerView])
         let _ = writeln!(
             out,
             "{}",
-            msg::mesh_peer_line(lang, &p.name, p.online, is_me, &p.os)
+            msg::mesh_peer_line(lang, &c(&p.name), p.online, is_me, &c(&p.os))
         );
         if !p.online {
             continue;
@@ -485,10 +500,17 @@ fn print_peers(out: &mut dyn Write, lang: Lang, v: &MeshView, list: &[PeerView])
             let _ = writeln!(out, "{}", msg::mesh_no_sessions(lang));
         }
         for s in &p.sessions {
-            let _ = writeln!(out, "    {}  {}  {}", s.name, s.state, s.dir);
+            let _ = writeln!(out, "    {}  {}  {}", c(&s.name), c(&s.state), c(&s.dir));
         }
         if !p.tentacles.is_empty() {
-            let _ = writeln!(out, "{}", msg::mesh_tentacles_line(lang, &p.tentacles));
+            let _ = writeln!(
+                out,
+                "{}",
+                msg::mesh_tentacles_line(
+                    lang,
+                    &p.tentacles.iter().map(|t| c(t)).collect::<Vec<_>>()
+                )
+            );
         }
     }
 }
@@ -718,6 +740,89 @@ mod tests {
         }
         assert_eq!(crate::mesh::worst_case(&Request::Hello), None);
         assert_eq!(wait_for(&Request::Hello), crate::client::READ_TIMEOUT);
+    }
+
+    /// I1：别的电脑报的名字（加入请求、名单、详情）印到终端之前洗干净：
+    /// 一个 `\x1b[8m` 就能把后面那行数字藏起来。
+    #[test]
+    fn names_from_other_computers_are_cleaned_before_printing() {
+        let evil = "W\x1b[8m\u{202e}in";
+        let mut v = view(true, &[("B", true)]);
+        v.members.push(crate::proto::MemberView {
+            name: evil.into(),
+            endpoint: "c-e".into(),
+            online: false,
+            is_me: false,
+        });
+        v.pending = vec![pj(evil, "c-w", "123456")];
+        let sc = Script::new(vec![
+            Response::Mesh(v),
+            Response::Error(ErrorCode::DaemonNotResponding),
+        ]);
+        let (mut out, mut err) = (vec![], vec![]);
+        assert_eq!(
+            peers(
+                &mut sc.call(),
+                &mut no_ask,
+                &mut out,
+                &mut err,
+                Lang::Zh,
+                &[]
+            ),
+            0
+        );
+        let o = s(&out);
+        assert!(
+            !o.chars()
+                .any(|c| (c.is_control() && c != '\n') || crate::mesh::deliver::is_format_char(c)),
+            "{o:?}"
+        );
+        assert!(o.contains("Win"), "{o}");
+
+        // 详情那一路也一样。
+        let mut v = view(true, &[("B", true)]);
+        v.members[0].is_me = true;
+        let list = vec![PeerView {
+            name: evil.into(),
+            online: true,
+            os: "linux".into(),
+            sessions: vec![],
+            tentacles: vec![],
+        }];
+        let sc = Script::new(vec![Response::Mesh(v), Response::MeshPeers(list)]);
+        let (mut out, mut err) = (vec![], vec![]);
+        peers(
+            &mut sc.call(),
+            &mut no_ask,
+            &mut out,
+            &mut err,
+            Lang::Zh,
+            &[],
+        );
+        let o = s(&out);
+        assert!(!o.contains('\x1b') && !o.contains('\u{202e}'), "{o:?}");
+
+        // `dct join` 列数字的那几行。
+        let mut asked = view(true, &[("B", true)]);
+        asked.joining = vec![pj(evil, "c-a1", "111111")];
+        let sc = Script::new(vec![
+            Response::Mesh(view(true, &[("B", true)])),
+            Response::Mesh(asked),
+        ]);
+        let mut ask = |_: &str| None;
+        let (mut out, mut err) = (vec![], vec![]);
+        join(
+            &mut sc.call(),
+            &mut ask,
+            &mut out,
+            &mut err,
+            Lang::Zh,
+            &opts(None),
+            Duration::from_secs(60),
+            &|| {},
+        );
+        let o = s(&out);
+        assert!(!o.contains('\x1b') && !o.contains('\u{202e}'), "{o:?}");
     }
 
     /// 老到连 `Hello` 都不认得的守护进程：答不上来本身就是答案。

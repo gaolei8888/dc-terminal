@@ -117,7 +117,8 @@ pub enum RosterError {
     /// 不上——`endpoint` 是从公钥算出来的，两者必须一致，否则名单就能把一个
     /// endpoint 偷偷映射到另一把钥匙上。
     BadKey,
-    /// 成员名字是空串、带 `/`，或者超过 `MAX_NAME_LEN` 个字符。
+    /// 成员名字不合 `valid_name`：空串、带 `/`、超过 `MAX_NAME_LEN` 个字符，
+    /// 或者带控制字符、格式字符。
     BadName,
     /// 签名者在自己签的这一版里把自己从名单上删掉了——这类改动必须由别的在
     /// 任成员签，不能自己签自己退出。
@@ -164,8 +165,53 @@ fn decode_sign_pub(b64: &str) -> Option<[u8; 65]> {
     Some(out)
 }
 
+/// Unicode 的 `Cf`（格式字符）：零宽空格、零宽连接符、字节序标记、双向
+/// 控制符……都不占位置、不显示。这里没有能查字符类别的依赖（要纯 Rust、
+/// 不为这一处多拉一个 crate），照 Unicode 15 的 `Cf` 表抄全。
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// 名单接受的电脑名：非空、不带 `/`、不超过 `MAX_NAME_LEN` 个字符，而且
+/// **没有控制字符（`Cc`）和格式字符（`Cf`）**。
+///
+/// 名字是别的电脑自己报的，会被原样印到用户的终端上（`dct peers`、
+/// `dct join`），也会写进敲给智能体的留言标记行里。控制字符能改写屏幕、
+/// 打断智能体（Esc、Ctrl-C）、把标记行单独提交（`\r`）；格式字符看不见，
+/// 双向控制符还能把后面的字倒过来画。所有收名字的地方——名单、加入请求、
+/// 本机改名——都走这一条。
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && name.chars().count() <= MAX_NAME_LEN
+        && !name.chars().any(|c| c.is_control() || is_format_char(c))
+}
+
 fn validate_name(name: &str) -> Result<(), RosterError> {
-    if name.is_empty() || name.contains('/') || name.chars().count() > MAX_NAME_LEN {
+    if !valid_name(name) {
         return Err(RosterError::BadName);
     }
     Ok(())
@@ -947,5 +993,49 @@ mod tests {
         let a = member_from(&ka, &name);
         let g = genesis(a, "mine-a".into(), &ka);
         assert_eq!(accept(None, &g), Ok(()));
+    }
+
+    // -- 名字里藏着的控制字符、格式字符 -----------------------------------------
+
+    /// 名字会被印到终端（`dct peers`）、敲进智能体的会话（留言的标记行）。
+    /// `\x1b` 能改写屏幕、`\x03`/Esc 能打断智能体、`\r` 能把标记行单独
+    /// 提交；U+202E 这类双向控制符能把后面的字倒过来画——都不许进名单。
+    #[test]
+    fn member_names_with_control_or_format_characters_are_refused() {
+        let ka = keys_for(1);
+        for bad in [
+            "a\x1bb",
+            "a\x1b[8mb",
+            "a\x03b",
+            "a\rb",
+            "a\nb",
+            "a\tb",
+            "a\x7fb",
+            "a\u{0085}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{200b}b",
+            "a\u{feff}b",
+            "a\u{00ad}b",
+        ] {
+            assert!(!valid_name(bad), "{bad:?}");
+            let a = member_from(&ka, bad);
+            let g = genesis(a, "mine-a".into(), &ka);
+            assert_eq!(accept(None, &g), Err(RosterError::BadName), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_names_in_any_script_are_still_fine() {
+        for good in [
+            "公司Windows",
+            "家里 Mac",
+            "laptop-2",
+            "ノート",
+            "Ünïcödé",
+            "a b",
+        ] {
+            assert!(valid_name(good), "{good:?}");
+        }
     }
 }

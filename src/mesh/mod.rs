@@ -634,7 +634,7 @@ pub fn worst_case(req: &crate::proto::Request) -> Option<std::time::Duration> {
 
 /// 名单接受的名字（同 `roster` 里的规则、同 `store::set_name`）。
 pub(crate) fn valid_name(n: &str) -> bool {
-    !n.is_empty() && !n.contains('/') && n.chars().count() <= roster::MAX_NAME_LEN
+    roster::valid_name(n)
 }
 
 fn valid_kx_pub(b64: &str) -> bool {

@@ -12,6 +12,7 @@ use dct_mesh::roster::{self, Roster};
 use dct_mesh::sas;
 use dct_mesh::wire::{self, Payload};
 
+use super::deliver::clean_name;
 use super::net::Net;
 use super::Mesh;
 use crate::proto::{MemberView, MeshProblem, MeshView, PendingJoin};
@@ -39,7 +40,7 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
                 .members
                 .iter()
                 .map(|x| MemberView {
-                    name: x.name.clone(),
+                    name: clean_name(&x.name),
                     endpoint: x.endpoint.clone(),
                     online: x.endpoint == me || online.contains(&x.endpoint),
                     is_me: x.endpoint == me,
@@ -49,7 +50,7 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
         .unwrap_or_default();
     MeshView {
         logged_in,
-        name: m.me.name.clone(),
+        name: clean_name(&m.me.name),
         endpoint: me,
         in_group: m.roster.is_some(),
         members,
@@ -57,7 +58,7 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
             .pending_joins
             .iter()
             .map(|(j, code, _)| PendingJoin {
-                name: j.member.name.clone(),
+                name: clean_name(&j.member.name),
                 endpoint: j.member.endpoint.clone(),
                 code: code.clone(),
             })
@@ -71,7 +72,7 @@ fn joining(m: &Mesh) -> Vec<PendingJoin> {
     m.invites
         .iter()
         .map(|i| PendingJoin {
-            name: i.member.name.clone(),
+            name: clean_name(&i.member.name),
             endpoint: i.member.endpoint.clone(),
             code: i.code.clone(),
         })
@@ -123,7 +124,9 @@ pub fn join(
     for (peer, bytes) in replies {
         match wire::decode(&bytes) {
             Ok(Payload::JoinPending { member, sig })
-                if member.endpoint == peer && wire::verify_member(&member, &sig) =>
+                if member.endpoint == peer
+                    && wire::verify_member(&member, &sig)
+                    && super::valid_name(&member.name) =>
             {
                 let code = sas::code(&m.me, &member);
                 found.push((member, code));
@@ -1143,5 +1146,53 @@ mod tests {
             "6 台花了 {:?}",
             t.elapsed()
         );
+    }
+
+    /// I1：名字里带控制字符、格式字符的加入请求，跟签名不对的一样当场丢掉：
+    /// 不挂起、不回话，更不会被印到用户的终端上。
+    #[test]
+    fn a_join_whose_name_has_control_or_format_characters_is_dropped() {
+        for bad in ["evil\x1b[8m", "a\u{202e}b", "a\rb"] {
+            let hub = FakeHub::new();
+            let a = Node::new(&hub, 1, "A");
+            let x = Node::new(&hub, 2, bad);
+            a.login();
+            x.login();
+            assert_eq!(x.join(), Err(MeshProblem::NoOneAnswered), "{bad:?}");
+            assert!(a.view().pending.is_empty(), "{bad:?}");
+        }
+    }
+
+    /// I1 反过来：回我 `JoinPending` 的那台，名字不合规也不算邀请。
+    #[test]
+    fn a_join_reply_whose_name_has_control_characters_is_not_an_invite() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A\x1b[2J");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+        assert_eq!(b.join(), Err(MeshProblem::NoOneAnswered));
+        assert!(b.mesh.lock().unwrap().invites.is_empty());
+    }
+
+    /// I1 第二道防线：名单里要是已经有一个脏名字（旧版本存下的），现状里
+    /// 给界面和命令行的也是洗过的。
+    #[test]
+    fn the_view_hands_out_cleaned_names() {
+        let ka = keys(1);
+        let me = Mesh::new(keys(1), "A".into(), None).me.clone();
+        let mut other = Mesh::new(keys(2), "B".into(), None).me.clone();
+        other.name = "B\x1b[8m\u{202e}x".into();
+        let r = Roster {
+            group: "g".into(),
+            version: 2,
+            members: vec![me.clone(), other],
+        };
+        let signed = roster::sign(r, &me, &ka);
+        let mesh = Mutex::new(Mesh::new(ka, "A".into(), Some(signed)));
+        let hub = FakeHub::new();
+        let v = view(&mesh, &hub.net_for(&me.endpoint), true);
+        let names: Vec<&str> = v.members.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Bx"), "{names:?}");
     }
 }

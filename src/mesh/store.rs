@@ -134,8 +134,8 @@ impl Store {
     /// 就拦住，免得存进去一个将来签不进名单的名字。
     pub fn set_name(&self, n: &str) -> Result<()> {
         let n = n.trim();
-        if n.is_empty() || n.contains('/') || n.chars().count() > MAX_NAME_LEN {
-            bail!("电脑名不能为空、不能带 /，最长 {MAX_NAME_LEN} 个字");
+        if !dct_mesh::roster::valid_name(n) {
+            bail!("电脑名不能为空、不能带 / 和看不见的控制字符，最长 {MAX_NAME_LEN} 个字");
         }
         self.ensure_dir()?;
         write_atomic(&self.dir.join(NAME), n.as_bytes())
@@ -269,7 +269,7 @@ fn tidy_name(raw: &str) -> String {
     let base = raw.trim().split('.').next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| *c != '/' && !c.is_control())
+        .filter(|c| *c != '/' && !c.is_control() && !dct_mesh::roster::is_format_char(*c))
         .take(MAX_NAME_LEN)
         .collect();
     if cleaned.is_empty() {
@@ -572,6 +572,9 @@ mod tests {
         assert!(s.set_name("").is_err());
         assert!(s.set_name("a/b").is_err());
         assert!(s.set_name(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
+        assert!(s.set_name("a\x1bb").is_err());
+        assert!(s.set_name("a\u{202e}b").is_err());
+        assert!(s.set_name("a\u{200b}b").is_err());
     }
 
     #[test]
@@ -580,6 +583,7 @@ mod tests {
         assert_eq!(tidy_name(""), "dct");
         assert_eq!(tidy_name("a/b"), "ab");
         assert_eq!(tidy_name(&"y".repeat(80)).chars().count(), MAX_NAME_LEN);
+        assert_eq!(tidy_name("mac\u{202e}\u{200b}\x1bbook"), "macbook");
     }
 
     #[test]

@@ -230,14 +230,9 @@ pub(crate) fn handle_key_at(app: &mut App, key: &KeyEvent, now: Instant) -> bool
     true
 }
 
-/// 别的电脑给的名字：洗掉控制字符和转义序列，再去掉看不见的格式字符
-/// （零宽、双向控制符——它们会把后面的字倒过来画、或者让宽度算错），才能
-/// 往终端上画。
+/// 别的电脑给的名字：跟命令行、标记行同一份洗法（`deliver::clean_name`）。
 fn clean(s: &str) -> String {
-    crate::session::sanitize(s)
-        .chars()
-        .filter(|c| !crate::mesh::deliver::is_format_char(*c))
-        .collect()
+    crate::mesh::deliver::clean_name(s)
 }
 
 /// 九宫格顶上那几行：有电脑在等批准时提醒一句回看板（y/n 只在看板上接）。
