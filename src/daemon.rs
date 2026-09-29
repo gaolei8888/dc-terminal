@@ -465,10 +465,6 @@ fn mesh_login(
     Ok(())
 }
 
-/// 续期失败之后多久再试。续期在令牌剩一天时就开始，一小时一次足够在过期
-/// 前试上二十几回，又不至于在网关挂掉时每 30 秒敲它一下。
-const RELAY_RENEW_RETRY: Duration = Duration::from_secs(60 * 60);
-
 /// secrets 里有中转令牌，就读出（第一次就生成）这台电脑的钥匙和名单，起一条
 /// 连中转的线程。没有令牌就什么都不做——还没 `dct login` 过。
 ///
@@ -523,17 +519,16 @@ fn start_mesh(
         let token = cfg.token.clone();
         let origin = pair_origin(profiles_dir, DC_PROFILE);
         let journal = journal.clone();
-        let last_failure: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        // 限速在 `Renewer` 里：成不成都至少隔十分钟，失败之后隔一小时。
+        let renewer: Mutex<login::Renewer> = Mutex::new(login::Renewer::default());
         Arc::new(move || {
-            let mut last = recover(last_failure.lock());
-            if last.is_some_and(|t| t.elapsed() < RELAY_RENEW_RETRY) {
-                return;
-            }
+            let mut r = recover(renewer.lock());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            match login::renew_if_due(
+            match r.tick(
+                std::time::Instant::now(),
                 &secrets,
                 &token,
                 origin.as_deref(),
@@ -541,15 +536,11 @@ fn start_mesh(
                 now,
                 &login::http_transport,
             ) {
-                Renewal::NotDue => {}
-                Renewal::Renewed => {
-                    *last = None;
-                    journal.mesh("relay_token_renewed");
-                }
+                None | Some(Renewal::NotDue) => {}
+                Some(Renewal::Renewed) => journal.mesh("relay_token_renewed"),
                 // 记一条就接着用旧令牌：它可能还有将近一天。
-                Renewal::Failed(e) => {
-                    *last = Some(std::time::Instant::now());
-                    journal.mesh(&format!("relay_token_renewal_failed {e}"));
+                Some(Renewal::Failed(e)) => {
+                    journal.mesh(&format!("relay_token_renewal_failed {e}"))
                 }
             }
         }) as crate::link::BeforePoll

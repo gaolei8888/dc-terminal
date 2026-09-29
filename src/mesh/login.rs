@@ -163,6 +163,59 @@ pub fn renew_if_due(
     }
 }
 
+/// 两次续期尝试之间最少隔多久，**不管上一次成没成**。
+///
+/// 只有「失败之后等一小时」是不够的：网关哪天把令牌有效期调到一天以内（或者
+/// 它的时钟歪了，回一个已经过去的 `exp`），`needs_renewal` 每一轮都说「该续
+/// 了」，而每一封信封、每一次退避重试都会结束一轮轮询——每台装了 dct 的电脑
+/// 就成了打网关的压测机。
+pub const RENEW_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// 续期失败之后多久再试。续期在令牌剩一天时就开始，一小时一次足够在过期
+/// 前试上二十几回，又不至于在网关挂掉时每 30 秒敲它一下。
+pub const RENEW_RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// 给 `renew_if_due` 限速：连接线程每一轮轮询前调一次 `tick`。
+#[derive(Debug, Default)]
+pub struct Renewer {
+    /// 上一次真打了网关的时刻，以及那一次失败没有。
+    last: Option<(std::time::Instant, bool)>,
+}
+
+impl Renewer {
+    /// 离上一次尝试太近就什么都不做，返回 `None`；否则照 `renew_if_due` 办。
+    /// `NotDue` 没打网络，不算一次尝试。
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick(
+        &mut self,
+        at: std::time::Instant,
+        secrets: &std::sync::Mutex<crate::secrets::SecretStore>,
+        token: &crate::link::Token,
+        origin: Option<&str>,
+        endpoint: &str,
+        now: u64,
+        send: Transport,
+    ) -> Option<Renewal> {
+        if let Some((t, failed)) = self.last {
+            let wait = if failed {
+                RENEW_RETRY_AFTER_FAILURE
+            } else {
+                RENEW_MIN_INTERVAL
+            };
+            if at.saturating_duration_since(t) < wait {
+                return None;
+            }
+        }
+        let r = renew_if_due(secrets, token, origin, endpoint, now, send);
+        match &r {
+            Renewal::NotDue => {}
+            Renewal::Renewed => self.last = Some((at, false)),
+            Renewal::Failed(_) => self.last = Some((at, true)),
+        }
+        Some(r)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +445,90 @@ mod tests {
                 Renewal::Failed(_)
             ));
             assert_eq!(tok.get(), "old");
+        }
+
+        /// 网关发的令牌只有一小时（比「剩一天就续」的阈值还短）：每一轮轮询
+        /// 前都「该续了」。节流之前，每一轮都打一次网关、重写一次 secrets。
+        #[test]
+        fn a_short_lived_token_is_renewed_at_most_once_per_interval() {
+            let (_t, s) = secrets(Some(NOW + 60), Some("sk"));
+            let tok = Token::new("old");
+            let body = format!(r#"{{"token":"fresh","exp":{}}}"#, NOW + 3600);
+            let fake = FakeSend::returning(Ok((200, body)));
+            let send = fake.as_fn();
+            let mut r = Renewer::default();
+            let t0 = std::time::Instant::now();
+            let mut renewed = 0;
+            for i in 0..200u64 {
+                let at = t0 + std::time::Duration::from_secs(i);
+                if let Some(Renewal::Renewed) =
+                    r.tick(at, &s, &tok, Some("https://gw"), "c-aa", NOW + i, &send)
+                {
+                    renewed += 1;
+                }
+            }
+            assert_eq!(fake.calls.borrow().len(), 1, "200 秒里只该打一次网关");
+            assert_eq!(renewed, 1);
+
+            let later = t0 + RENEW_MIN_INTERVAL;
+            r.tick(later, &s, &tok, Some("https://gw"), "c-aa", NOW, &send);
+            assert_eq!(fake.calls.borrow().len(), 2, "过了最短间隔可以再试");
+        }
+
+        #[test]
+        fn a_failed_renewal_waits_the_long_retry_before_trying_again() {
+            let (_t, s) = secrets(Some(NOW + 60), Some("sk"));
+            let tok = Token::new("old");
+            let fake = FakeSend::returning(Ok((500, String::new())));
+            let send = fake.as_fn();
+            let mut r = Renewer::default();
+            let t0 = std::time::Instant::now();
+            r.tick(t0, &s, &tok, Some("https://gw"), "c-aa", NOW, &send);
+            r.tick(
+                t0 + RENEW_MIN_INTERVAL,
+                &s,
+                &tok,
+                Some("https://gw"),
+                "c-aa",
+                NOW,
+                &send,
+            );
+            assert_eq!(fake.calls.borrow().len(), 1, "失败之后一小时内不再试");
+            r.tick(
+                t0 + RENEW_RETRY_AFTER_FAILURE,
+                &s,
+                &tok,
+                Some("https://gw"),
+                "c-aa",
+                NOW,
+                &send,
+            );
+            assert_eq!(fake.calls.borrow().len(), 2);
+        }
+
+        #[test]
+        fn a_token_that_is_not_due_does_not_start_the_clock() {
+            // 没到续期的时候，这一拍不算一次尝试：不打网络，也不该把下一次
+            // 真该续的时候往后推。
+            let (_t, s) = secrets(Some(NOW + 2 * ONE_DAY_SECS), Some("sk"));
+            let tok = Token::new("old");
+            let mut r = Renewer::default();
+            let t0 = std::time::Instant::now();
+            assert_eq!(
+                r.tick(t0, &s, &tok, Some("https://gw"), "c-aa", NOW, &never),
+                Some(Renewal::NotDue)
+            );
+            let fake = FakeSend::returning(Ok((200, r#"{"token":"fresh","exp":1}"#.into())));
+            let got = r.tick(
+                t0 + std::time::Duration::from_secs(1),
+                &s,
+                &tok,
+                Some("https://gw"),
+                "c-aa",
+                NOW + 2 * ONE_DAY_SECS,
+                &fake.as_fn(),
+            );
+            assert_eq!(got, Some(Renewal::Renewed));
         }
     }
 }
