@@ -607,6 +607,31 @@ impl Mesh {
     }
 }
 
+/// 守护进程办一条 `Mesh*` 请求最坏要多久（不是这类请求就是 `None`）。
+///
+/// 每一次打中转都有上限：`peers`/`send` 是 `net::CALL_TIMEOUT`，`ask` 是各自
+/// 给的超时，换令牌是 `login::GATEWAY_TIMEOUT`；一次发给好几台（广播名单、
+/// 加入时揭晓随机数）是并排发的，只算一次。命令行等的比这个长（`cli::wait_for`）。
+///
+/// 发给**这台电脑自己**的会话（`dct send 本机/…`）不经过中转，但要在本机
+/// 敲字，敲字前的 git 快照没有上限；那一条不算在这里。
+pub fn worst_case(req: &crate::proto::Request) -> Option<std::time::Duration> {
+    use crate::proto::Request as R;
+    let call = net::CALL_TIMEOUT;
+    Some(match req {
+        R::MeshStatus | R::MeshConfirmInviter { .. } => call,
+        R::MeshLogin => login::GATEWAY_TIMEOUT + call,
+        // 问谁在线、并排问每台、并排揭晓、再看一眼现状。
+        R::MeshJoin { .. } => call + group::JOIN_ASK_TIMEOUT + call + call,
+        // 并排广播新名单，再看一眼现状。
+        R::MeshApprove { .. } | R::MeshRemove { .. } => call + call,
+        R::MeshPeers => call + deliver::STATUS_ASK_TIMEOUT,
+        // 中转回 `Busy` 时换个 id 再问一次。
+        R::MeshSend { .. } => deliver::SEND_ASK_TIMEOUT * 2,
+        _ => return None,
+    })
+}
+
 /// 名单接受的名字（同 `roster` 里的规则、同 `store::set_name`）。
 pub(crate) fn valid_name(n: &str) -> bool {
     !n.is_empty() && !n.contains('/') && n.chars().count() <= roster::MAX_NAME_LEN

@@ -23,8 +23,17 @@ pub trait Net: Send + Sync {
     fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError>;
 }
 
+/// `peers`、`send` 一次最多等多久（连接加读写，整条请求）。`ask` 另按调用方
+/// 给的 `timeout` 算。
+///
+/// 这一侧的调用全是命令行在等着的（`dct peers`、`dct join`、批准……），所以
+/// 不能用连接线程那个为长轮询配的 40 秒读超时：守护进程在这里挂多久，命令行
+/// 就得等多久，等不起就会在守护进程其实办成了之后报失败。各条请求最坏要花
+/// 多久见 `mesh::worst_case`。
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// 真的走中转。跟 `Link` 共用同一个 `LinkConfig`（于是共用同一格令牌，
-/// 续期一次两边都换上）。
+/// 续期一次两边都换上），但 HTTP 客户端是自己的一个：超时短，见 `CALL_TIMEOUT`。
 pub struct LinkNet {
     cfg: LinkConfig,
     agent: ureq::Agent,
@@ -33,7 +42,12 @@ pub struct LinkNet {
 
 impl LinkNet {
     pub fn new(cfg: LinkConfig) -> LinkNet {
-        let agent = link::agent(&cfg);
+        LinkNet::with_call_timeout(cfg, CALL_TIMEOUT)
+    }
+
+    /// 同 `new`，但 `peers`/`send` 的整条请求最多等 `timeout`。
+    pub fn with_call_timeout(cfg: LinkConfig, timeout: Duration) -> LinkNet {
+        let agent = crate::sys::tls::agent_builder().timeout(timeout).build();
         LinkNet {
             cfg,
             agent,
@@ -222,6 +236,47 @@ mod tests {
     #[test]
     fn seq_does_not_restart_from_zero() {
         assert!(net().envelope("c-bbbb", vec![]).unwrap().seq > 1_000_000);
+    }
+
+    /// 中转收了连接却一个字也不回（防火墙吞包、中转卡死）：`peers`/`send`
+    /// 要在 `CALL_TIMEOUT` 左右放弃，不能挂满连接线程那 40 秒的读超时——
+    /// 守护进程里一次 `dct peers approve` 要是挂 40 秒，命令行早就报「没
+    /// 响应」了，而名单其实已经签好、发出去了。
+    #[test]
+    fn a_relay_that_never_answers_is_given_up_on_within_the_call_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 收下连接、攥着不放、一个字不回。
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                for c in listener.incoming().flatten() {
+                    held.lock().unwrap().push(c);
+                }
+            });
+        }
+        let n = LinkNet::with_call_timeout(
+            LinkConfig::new(
+                format!("http://{addr}"),
+                EndpointId::new("c-aaaa").unwrap(),
+                "t",
+            ),
+            Duration::from_millis(300),
+        );
+        let t = std::time::Instant::now();
+        assert_eq!(n.peers(), Err(LinkError::Unreachable));
+        assert_eq!(n.send("c-bbbb", vec![]), Err(LinkError::Unreachable));
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "两次调用花了 {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_production_call_timeout_is_short() {
+        assert!(CALL_TIMEOUT <= Duration::from_secs(10));
     }
 
     #[test]

@@ -251,13 +251,24 @@ fn recipients(m: &Mesh, r: &dct_mesh::SignedRoster) -> Vec<String> {
 
 /// 发给每一台，不等答复。不在线的这一次收不到（第一步没有离线留言），
 /// 记一行 journal。**调用时没攥着锁**，记 journal 时才短暂拿一下。
+///
+/// 并排发：一台卡到超时不拖着别的，整次广播只花一次 `send` 的时间
+/// （`mesh::worst_case` 按这个算命令行该等多久）。
 fn broadcast(mesh: &Mutex<Mesh>, net: &dyn Net, to: &[String], payload: &[u8]) {
-    for ep in to {
-        if let Err(e) = net.send(ep, payload.to_vec()) {
-            lock(mesh)
-                .journal
-                .mesh(&format!("roster_not_delivered to={ep} err={e:?}"));
-        }
+    let failed: Vec<(String, crate::link::LinkError)> = std::thread::scope(|s| {
+        let hs: Vec<_> = to
+            .iter()
+            .map(|ep| s.spawn(move || (ep.clone(), net.send(ep, payload.to_vec()))))
+            .collect();
+        hs.into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter_map(|(ep, r)| r.err().map(|e| (ep, e)))
+            .collect()
+    });
+    for (ep, e) in failed {
+        lock(mesh)
+            .journal
+            .mesh(&format!("roster_not_delivered to={ep} err={e:?}"));
     }
 }
 
@@ -1099,5 +1110,38 @@ mod tests {
         );
         assert_eq!(a.names(), ["A"]);
         assert_eq!(a.view().pending.len(), 1, "请求还挂着");
+    }
+
+    /// 广播名单是并排发的：一台卡住（中转那头挂满超时）不拖着别的，整次
+    /// 广播也就只花一次 `send` 的时间——`mesh::worst_case` 是这么算的。
+    #[test]
+    fn a_broadcast_takes_one_send_not_one_per_member() {
+        struct Slow;
+        impl Net for Slow {
+            fn peers(&self) -> Result<Vec<String>, crate::link::LinkError> {
+                Ok(vec![])
+            }
+            fn send(&self, _: &str, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            }
+            fn ask(
+                &self,
+                _: &str,
+                _: Vec<u8>,
+                _: Duration,
+            ) -> Result<Vec<u8>, crate::link::LinkError> {
+                Err(crate::link::LinkError::Unreachable)
+            }
+        }
+        let mesh = Mutex::new(Mesh::new(keys(1), "A".into(), None));
+        let to: Vec<String> = (0..6).map(|i| format!("c-{i:020x}")).collect();
+        let t = std::time::Instant::now();
+        broadcast(&mesh, &Slow, &to, b"x");
+        assert!(
+            t.elapsed() < Duration::from_millis(1200),
+            "6 台花了 {:?}",
+            t.elapsed()
+        );
     }
 }

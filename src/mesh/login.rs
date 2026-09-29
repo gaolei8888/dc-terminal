@@ -81,11 +81,14 @@ pub fn needs_renewal(exp: u64, now: u64) -> bool {
     exp.saturating_sub(now) < ONE_DAY_SECS
 }
 
+/// 跟网关换一次令牌最多等多久（整条请求）。
+pub const GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 生产路径的 `Transport`：真打 `ureq`。**测试不走这里**（仓库规矩：测试
 /// 不碰网络），`fetch_token`/`renew_if_due` 的测试都注入假的。
 pub fn http_transport(url: &str, bearer: &str, body: &str) -> Result<(u16, String), String> {
     let agent = crate::sys::tls::agent_builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(GATEWAY_TIMEOUT)
         .build();
     match agent
         .post(url)

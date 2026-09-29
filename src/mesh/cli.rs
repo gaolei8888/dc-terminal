@@ -21,8 +21,21 @@ use crate::proto::{
 const JOIN_WAIT: Duration = crate::mesh::JOIN_TTL;
 /// 等同意时多久问一次守护进程。
 const JOIN_POLL: Duration = Duration::from_secs(1);
-/// 守护进程替我们打网络的那几条请求（换令牌、问别的电脑）等多久。
-const SLOW_CALL: Duration = Duration::from_secs(40);
+/// 守护进程替我们打网络的那几条请求（换令牌、问别的电脑、广播名单）等多久。
+/// 必须比守护进程那边最坏的情况（`mesh::worst_case`）长出一截，见 `wait_for`。
+const MESH_CALL_WAIT: Duration = Duration::from_secs(60);
+
+/// 这一条请求命令行等多久：多电脑的请求等 `MESH_CALL_WAIT`，别的（握手）
+/// 按本机答一句的 `READ_TIMEOUT`。
+///
+/// 等不够的代价不是「慢一点」：守护进程可能在命令行放弃之后才办成——批准
+/// 已经签进名单、发给了每一台，屏幕上却说失败，用户会再批一次。
+fn wait_for(req: &Request) -> Duration {
+    match crate::mesh::worst_case(req) {
+        Some(_) => MESH_CALL_WAIT,
+        None => crate::client::READ_TIMEOUT,
+    }
+}
 
 type Call<'a> = &'a mut dyn FnMut(Request) -> Result<Response>;
 /// 把一句提示给用户看、读回他敲的一行。读不到（没有终端、EOF）是 `None`。
@@ -67,18 +80,8 @@ pub fn run(args: &[String]) -> i32 {
     };
     let mut client = client;
     let mut call = |req: Request| {
-        let slow = matches!(
-            req,
-            Request::MeshLogin
-                | Request::MeshJoin { .. }
-                | Request::MeshPeers
-                | Request::MeshSend { .. }
-        );
-        if slow {
-            client.call_within(req, SLOW_CALL)
-        } else {
-            client.call(req)
-        }
+        let wait = wait_for(&req);
+        client.call_within(req, wait)
     };
     let mut ask = |prompt: &str| {
         print!("{prompt}");
@@ -678,6 +681,43 @@ mod tests {
             assert!(e.contains("dct restart"), "{argv:?}: {e}");
             assert!(!e.contains("unknown variant"), "{e}");
         }
+    }
+
+    /// 守护进程替命令行打中转、打网关的请求，命令行都要等得比守护进程最坏
+    /// 情况更久：不然在断网、中转卡死的时候，命令行报「没响应」，守护进程
+    /// 那边却已经把批准签好、发出去了。
+    #[test]
+    fn the_cli_outwaits_the_daemon_on_every_mesh_request() {
+        let all = [
+            Request::MeshStatus,
+            Request::MeshLogin,
+            Request::MeshJoin { name: "n".into() },
+            Request::MeshApprove {
+                endpoint: "c-x".into(),
+                code: "123456".into(),
+                yes: true,
+            },
+            Request::MeshConfirmInviter {
+                endpoint: "c-x".into(),
+            },
+            Request::MeshRemove { name: "n".into() },
+            Request::MeshPeers,
+            Request::MeshSend {
+                to: "a/b".into(),
+                text: "t".into(),
+                from_session: None,
+            },
+        ];
+        for req in &all {
+            let worst = crate::mesh::worst_case(req).unwrap_or_else(|| panic!("{req:?}"));
+            let wait = wait_for(req);
+            assert!(
+                wait >= worst + Duration::from_secs(10),
+                "{req:?}: 命令行等 {wait:?}，守护进程最坏要 {worst:?}"
+            );
+        }
+        assert_eq!(crate::mesh::worst_case(&Request::Hello), None);
+        assert_eq!(wait_for(&Request::Hello), crate::client::READ_TIMEOUT);
     }
 
     /// 老到连 `Hello` 都不认得的守护进程：答不上来本身就是答案。
