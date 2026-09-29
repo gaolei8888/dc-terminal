@@ -203,8 +203,18 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
 
     // 多电脑：secrets 里有中转令牌才起。起在自己的线程上（`link::spawn`），
     // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
-    // 绑在这个变量上活到进程结束；Task 6/7 从这里拿 `mesh` 和 `net`。
-    let _mesh = start_mesh(socket, &secrets, &profiles_dir, mgr.journal.path());
+    // 放在一个槽里活到进程结束：守护进程开着的时候 `dct login`，要在这里
+    // 把连接（重新）起起来，不能等下次重启。
+    let mesh_ctl = Arc::new(MeshCtl {
+        socket: socket.to_path_buf(),
+        journal_path: mgr.journal.path(),
+        slot: Mutex::new(start_mesh(
+            socket,
+            &secrets,
+            &profiles_dir,
+            mgr.journal.path(),
+        )),
+    });
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
@@ -245,8 +255,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let wb = web.clone();
         let pr = pairs.clone();
         let lv = live.clone();
+        let mc = mesh_ctl.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -255,12 +266,150 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
 }
 
 /// 守护进程里多电脑那一路还活着的东西。
-// `mesh`/`net` 这一步还没人读：登录、加入、留言（Task 6/7）才用得上。
-#[allow(dead_code)]
 pub(crate) struct MeshRuntime {
     pub mesh: Arc<Mutex<crate::mesh::Mesh>>,
     pub net: Arc<dyn crate::mesh::net::Net>,
+    /// 连接线程和 `net` 共用的那一格令牌。再 `dct login` 一次就换这里。
+    pub token: crate::link::Token,
+    // 只为让连接线程活着；叫停在测试里用。
+    #[allow(dead_code)]
     pub link: crate::link::LinkHandle,
+}
+
+type MeshParts = (
+    Arc<Mutex<crate::mesh::Mesh>>,
+    Arc<dyn crate::mesh::net::Net>,
+);
+
+/// 多电脑那个槽，以及（重新）起它要用到的东西。
+pub(crate) struct MeshCtl {
+    socket: PathBuf,
+    journal_path: Option<PathBuf>,
+    slot: Mutex<Option<MeshRuntime>>,
+}
+
+impl MeshCtl {
+    /// 槽里那一份的 `mesh` 和 `net`。拿到就放开槽锁——后面要打网络。
+    fn running(&self) -> Option<MeshParts> {
+        recover(self.slot.lock())
+            .as_ref()
+            .map(|rt| (rt.mesh.clone(), rt.net.clone()))
+    }
+}
+
+/// `Mesh*` 请求。只从本机 socket 上来（见 `Request::MeshStatus` 的文档）。
+///
+/// `transport` 是跟网关换令牌那一下：生产传 `login::http_transport`，测试
+/// 传假的。
+fn handle_mesh(
+    req: Request,
+    ctl: &MeshCtl,
+    secrets: &Arc<Mutex<SecretStore>>,
+    profiles_dir: &Path,
+    transport: crate::mesh::login::Transport,
+) -> Response {
+    use crate::mesh::group;
+    use crate::proto::MeshProblem;
+    let view = |ctl: &MeshCtl| Response::Mesh(mesh_view(ctl));
+    let r: Result<Response, MeshProblem> = match req {
+        Request::MeshStatus => Ok(view(ctl)),
+        Request::MeshLogin => mesh_login(ctl, secrets, profiles_dir, transport).map(|_| view(ctl)),
+        Request::MeshJoin { name } => ctl
+            .running()
+            .ok_or(MeshProblem::NotLoggedIn)
+            .and_then(|(m, n)| group::join(&m, n.as_ref(), Some(&name)))
+            .map(|_| view(ctl)),
+        Request::MeshApprove { endpoint, yes } => ctl
+            .running()
+            .ok_or(MeshProblem::NotLoggedIn)
+            .and_then(|(m, n)| group::approve(&m, n.as_ref(), &endpoint, yes))
+            .map(|_| view(ctl)),
+        Request::MeshRemove { name } => ctl
+            .running()
+            .ok_or(MeshProblem::NotLoggedIn)
+            .and_then(|(m, n)| group::remove(&m, n.as_ref(), &name))
+            .map(|_| view(ctl)),
+        other => return Response::Error(ErrorCode::BadRequest(format!("{other:?}"))),
+    };
+    r.unwrap_or_else(|p| Response::Error(ErrorCode::Mesh(p)))
+}
+
+/// 现状。没登录（槽是空的）就只看磁盘：叫什么、有没有名单——**不生成钥匙**，
+/// 问一句状态不该在磁盘上留下东西。
+fn mesh_view(ctl: &MeshCtl) -> crate::proto::MeshView {
+    if let Some((m, n)) = ctl.running() {
+        return crate::mesh::group::view(&m, n.as_ref(), true);
+    }
+    let store =
+        crate::mesh::store::Store::at(crate::mesh::store::dir_for_socket(&ctl.socket));
+    crate::proto::MeshView {
+        logged_in: false,
+        name: store.name().unwrap_or_default(),
+        endpoint: String::new(),
+        in_group: matches!(store.roster(), Ok(Some(_))),
+        members: Vec::new(),
+        pending: Vec::new(),
+        joining: Vec::new(),
+    }
+}
+
+/// `dct login`：拿 DC 账号的 `api_key` 换中转令牌、存下；连接已经在跑就
+/// 换上新令牌，没在跑就起起来；还没有组就建一个只有自己的。
+///
+/// 打网关那一下**不攥着任何锁**（secrets 的锁在读 api_key 之后就放了）。
+fn mesh_login(
+    ctl: &MeshCtl,
+    secrets: &Arc<Mutex<SecretStore>>,
+    profiles_dir: &Path,
+    transport: crate::mesh::login::Transport,
+) -> Result<(), crate::proto::MeshProblem> {
+    use crate::mesh::login::{self, DC_PROFILE, RELAY_TOKEN_EXP_KEY, RELAY_TOKEN_KEY};
+    use crate::proto::MeshProblem;
+
+    let api_key = recover(secrets.lock())
+        .get(DC_PROFILE)
+        .map(str::to_string)
+        .ok_or(MeshProblem::NoDcAccount)?;
+    let origin = pair_origin(profiles_dir, DC_PROFILE).ok_or(MeshProblem::NoDcAccount)?;
+    let endpoint = match ctl.running() {
+        Some((m, _)) => recover(m.lock()).endpoint().to_string(),
+        None => {
+            let store =
+                crate::mesh::store::Store::at(crate::mesh::store::dir_for_socket(&ctl.socket));
+            crate::mesh::Mesh::load(store)
+                .map_err(|e| MeshProblem::LoginFailed(e.to_string()))?
+                .endpoint()
+                .to_string()
+        }
+    };
+    let (token, exp) = login::fetch_token(&origin, &api_key, &endpoint, transport)
+        .map_err(MeshProblem::LoginFailed)?;
+    {
+        let mut s = recover(secrets.lock());
+        s.set(RELAY_TOKEN_KEY, &token)
+            .and_then(|_| s.set(RELAY_TOKEN_EXP_KEY, &exp.to_string()))
+            .map_err(|_| MeshProblem::NotSaved)?;
+    }
+    let mesh = {
+        let mut slot = recover(ctl.slot.lock());
+        if let Some(rt) = slot.as_ref() {
+            rt.token.set(token);
+        } else {
+            *slot = start_mesh(
+                &ctl.socket,
+                secrets,
+                profiles_dir,
+                ctl.journal_path.clone(),
+            );
+        }
+        slot.as_ref()
+            .map(|rt| rt.mesh.clone())
+            .ok_or_else(|| MeshProblem::LoginFailed("多电脑的连接起不来".into()))?
+    };
+    recover(mesh.lock())
+        .ensure_group()
+        .map_err(|_| MeshProblem::NotSaved)?;
+    Ok(())
 }
 
 /// 续期失败之后多久再试。续期在令牌剩一天时就开始，一小时一次足够在过期
@@ -346,11 +495,13 @@ fn start_mesh(
         }) as crate::link::BeforePoll
     };
 
+    let token = cfg.token.clone();
     let link = crate::link::Link::with_handler(cfg, crate::mesh::route(mesh.clone(), None))
         .before_poll(renew);
     Some(MeshRuntime {
         mesh,
         net,
+        token,
         link: crate::link::spawn(link),
     })
 }
@@ -653,6 +804,7 @@ fn serve(
     web: Arc<Mutex<Option<crate::web::Server>>>,
     pairs: Arc<Mutex<PairTable>>,
     live: Arc<crate::live::LiveState>,
+    mesh: Arc<MeshCtl>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -662,6 +814,21 @@ fn serve(
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
+            // 多电脑这几条只在这里答：从 HTTP 上来的请求走 `handle`，那边
+            // 一律拒绝（批准一台电脑进组，不能从局域网手机页上点）。
+            Ok(
+                req @ (Request::MeshStatus
+                | Request::MeshLogin
+                | Request::MeshJoin { .. }
+                | Request::MeshApprove { .. }
+                | Request::MeshRemove { .. }),
+            ) => handle_mesh(
+                req,
+                &mesh,
+                &secrets,
+                &profiles_dir,
+                &crate::mesh::login::http_transport,
+            ),
             // 本机 socket 这一路**带着** `web`：设置页要能开关那个监听口。
             // 从 HTTP 上来的请求走的是另一个调用点，那边传 `None`——手机
             // 自己开关不了它，也问不出那条带令牌的地址。
@@ -1014,6 +1181,15 @@ fn handle(
         Request::WebStrings { lang } => {
             Ok(Response::Strings(crate::web::strings::bundle_for(&lang)))
         }
+        // 只从本机 socket 上答，在 `serve` 里就分走了；走到这里的是从 HTTP
+        // 上来的。
+        Request::MeshStatus
+        | Request::MeshLogin
+        | Request::MeshJoin { .. }
+        | Request::MeshApprove { .. }
+        | Request::MeshRemove { .. } => Ok(Response::Error(ErrorCode::BadRequest(
+            "Mesh requests are local only".into(),
+        ))),
         Request::WebStatus => Ok(web_status(web, secrets)),
         Request::WebEnable => Ok(web_enable(
             WEB_BIND,
@@ -3358,6 +3534,28 @@ mod tests {
         )
     }
 
+    /// 多电脑这几条从 HTTP 上来（`web` 为 `None` 那一路）一律拒绝。
+    #[test]
+    fn mesh_requests_are_refused_off_the_local_socket() {
+        let (_, _, secrets, _) = bare_handle_deps();
+        for req in [
+            Request::MeshStatus,
+            Request::MeshLogin,
+            Request::MeshJoin { name: String::new() },
+            Request::MeshApprove {
+                endpoint: "c-x".into(),
+                yes: true,
+            },
+            Request::MeshRemove { name: "x".into() },
+        ] {
+            let resp = live_call(req, &secrets, &test_live());
+            assert!(
+                matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
+                "{resp:?}"
+            );
+        }
+    }
+
     #[test]
     fn live_publish_without_a_key_is_refused_with_a_code() {
         let (_, _, secrets, _) = bare_handle_deps();
@@ -3763,6 +3961,178 @@ mod mesh_tests {
         assert_eq!(auth.endpoint.as_str(), endpoint);
         assert_eq!(auth.token, "relay-tok");
         assert_eq!(auth.kind, dct_link::EndpointKind::Computer);
+    }
+
+    fn ctl_for(socket: &Path) -> MeshCtl {
+        // 连接线程要连的地址：一个马上拒绝的本机端口，测试不碰真网络。
+        std::fs::write(
+            crate::config::config_path_for_socket(socket),
+            "[mesh]\nrelay = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        MeshCtl {
+            socket: socket.to_path_buf(),
+            journal_path: None,
+            slot: Mutex::new(None),
+        }
+    }
+
+    fn no_network(_: &str, _: &str, _: &str) -> Result<(u16, String), String> {
+        panic!("这条路径不该打网关")
+    }
+
+    fn mesh_call(
+        req: Request,
+        ctl: &MeshCtl,
+        secrets: &Arc<Mutex<SecretStore>>,
+        profiles: &Path,
+        transport: crate::mesh::login::Transport,
+    ) -> Response {
+        handle_mesh(req, ctl, secrets, profiles, transport)
+    }
+
+    /// 没登录时问状态：如实说没登录，**不生成钥匙**。
+    #[test]
+    fn mesh_status_before_login_touches_nothing() {
+        let (t, socket, secrets) = home();
+        let ctl = ctl_for(&socket);
+        let r = mesh_call(
+            Request::MeshStatus,
+            &ctl,
+            &secrets,
+            &t.path().join("profiles"),
+            &no_network,
+        );
+        let Response::Mesh(v) = r else {
+            panic!("{r:?}")
+        };
+        assert!(!v.logged_in && !v.in_group);
+        assert!(!crate::mesh::store::dir_for_socket(&socket)
+            .join("sign.key")
+            .exists());
+        for req in [
+            Request::MeshJoin { name: String::new() },
+            Request::MeshApprove {
+                endpoint: "x".into(),
+                yes: true,
+            },
+            Request::MeshRemove { name: "x".into() },
+        ] {
+            let r = mesh_call(req, &ctl, &secrets, &t.path().join("profiles"), &no_network);
+            assert!(
+                matches!(
+                    r,
+                    Response::Error(ErrorCode::Mesh(crate::proto::MeshProblem::NotLoggedIn))
+                ),
+                "{r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_login_without_a_dc_account_says_to_pair_first() {
+        let (t, socket, secrets) = home();
+        let ctl = ctl_for(&socket);
+        let r = mesh_call(
+            Request::MeshLogin,
+            &ctl,
+            &secrets,
+            &t.path().join("profiles"),
+            &no_network,
+        );
+        assert!(
+            matches!(
+                r,
+                Response::Error(ErrorCode::Mesh(crate::proto::MeshProblem::NoDcAccount))
+            ),
+            "{r:?}"
+        );
+        assert!(recover(ctl.slot.lock()).is_none());
+    }
+
+    /// 登录：拿 DC 的 key 按本机端点换令牌、存下、起连接、建只有自己的组。
+    /// 再登录一次：连接不重起，只换令牌。
+    #[test]
+    fn mesh_login_stores_the_token_starts_the_link_and_makes_a_group() {
+        let (t, socket, secrets) = home();
+        let ctl = ctl_for(&socket);
+        secrets.lock().unwrap().set("dc", "sk-dc").unwrap();
+        let calls = Mutex::new(Vec::<(String, String, String)>::new());
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let fake = |url: &str, bearer: &str, body: &str| {
+            calls
+                .lock()
+                .unwrap()
+                .push((url.into(), bearer.into(), body.into()));
+            let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((200, format!(r#"{{"token":"tok-{i}","exp":{}}}"#, u64::MAX / 2)))
+        };
+        let r = mesh_call(
+            Request::MeshLogin,
+            &ctl,
+            &secrets,
+            &t.path().join("profiles"),
+            &fake,
+        );
+        let Response::Mesh(v) = r else {
+            panic!("{r:?}")
+        };
+        assert!(v.logged_in && v.in_group);
+        assert_eq!(v.members.len(), 1);
+        assert!(v.members[0].is_me);
+        assert!(v.endpoint.starts_with("c-"));
+        {
+            let c = calls.lock().unwrap();
+            assert_eq!(c.len(), 1);
+            assert!(c[0].0.ends_with("/admin/api/relay/token"));
+            assert_eq!(c[0].1, "sk-dc");
+            assert!(c[0].2.contains(&v.endpoint), "按本机端点换");
+        }
+        assert_eq!(
+            secrets.lock().unwrap().get(RELAY_TOKEN_KEY),
+            Some("tok-0")
+        );
+        let dir = crate::mesh::store::dir_for_socket(&socket);
+        assert!(dir.join("roster.json").exists());
+
+        let r = mesh_call(
+            Request::MeshLogin,
+            &ctl,
+            &secrets,
+            &t.path().join("profiles"),
+            &fake,
+        );
+        assert!(matches!(r, Response::Mesh(_)), "{r:?}");
+        let slot = recover(ctl.slot.lock());
+        let rt = slot.as_ref().unwrap();
+        assert_eq!(rt.token.get(), "tok-1", "在跑的连接换上了新令牌");
+        assert_eq!(rt.mesh.lock().unwrap().roster.as_ref().unwrap().roster.version, 1);
+        rt.link.stop();
+    }
+
+    #[test]
+    fn mesh_login_passes_the_gateways_reason_through() {
+        let (t, socket, secrets) = home();
+        let ctl = ctl_for(&socket);
+        secrets.lock().unwrap().set("dc", "sk-dc").unwrap();
+        let r = mesh_call(
+            Request::MeshLogin,
+            &ctl,
+            &secrets,
+            &t.path().join("profiles"),
+            &|_, _, _| Ok((404, String::new())),
+        );
+        assert_eq!(
+            format!("{r:?}"),
+            format!(
+                "{:?}",
+                Response::Error(ErrorCode::Mesh(crate::proto::MeshProblem::LoginFailed(
+                    "服务器还没开放多电脑功能".into()
+                )))
+            )
+        );
+        assert!(recover(ctl.slot.lock()).is_none());
+        assert_eq!(secrets.lock().unwrap().get(RELAY_TOKEN_KEY), None);
     }
 
     /// 重启之后还是同一台电脑：端点由落盘的钥匙决定。

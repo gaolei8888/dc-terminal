@@ -117,7 +117,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 19 = 公开直播列表：多了 `Request::LivePublish`/`LiveUnpublish`/`LivePublishGrant`、
 /// `Response::LiveGrant`、`ErrorCode::LivePublishKeyMissing`，`LiveInfo` 多了 `public`。
 /// 新增 `Request` 变体那条规矩同 14。
-pub const PROTOCOL_VERSION: u32 = 19;
+///
+/// 20 = 多电脑：多了 `Request::MeshStatus` / `MeshLogin` / `MeshJoin` /
+/// `MeshApprove` / `MeshRemove`、`Response::Mesh(MeshView)`、
+/// `ErrorCode::Mesh(MeshProblem)`。新增 `Request` 变体那条规矩同 14。
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,6 +499,28 @@ pub enum Request {
     LiveUnpublish,
     /// 给管理台一张只能切换公开状态的凭证。没在播回 `LiveStagingRejected(NotLive)`。
     LivePublishGrant,
+    /// 多电脑：这台电脑登录了没有、叫什么、组里有谁、谁在等批准。
+    ///
+    /// **`Mesh*` 这几条只从本机 socket 上答**（同 `Web*`）：批准一台电脑进组
+    /// 是这台机器主人的决定，不能从局域网手机页上点。
+    MeshStatus,
+    /// 拿 DC 账号的 `api_key` 跟网关换中转令牌、连上中转；还没有组就自己
+    /// 建一个。会打网络（网关），界面要放后台线程。
+    MeshLogin,
+    /// 在新电脑上请求加入：问一遍在线的其它电脑，回答里带着每台的 6 位数。
+    /// `name` 非空就顺手改名。
+    MeshJoin {
+        name: String,
+    },
+    /// 批准（`yes`）或拒绝一台等着加入的电脑。`endpoint` 也可以是电脑名。
+    MeshApprove {
+        endpoint: String,
+        yes: bool,
+    },
+    /// 把一台电脑移出组。不能是自己。
+    MeshRemove {
+        name: String,
+    },
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -622,6 +648,18 @@ impl std::fmt::Debug for Request {
             }
             Request::LiveUnpublish => write!(f, "LiveUnpublish"),
             Request::LivePublishGrant => write!(f, "LivePublishGrant"),
+            // 电脑名、端点都不是密钥。
+            Request::MeshStatus => write!(f, "MeshStatus"),
+            Request::MeshLogin => write!(f, "MeshLogin"),
+            Request::MeshJoin { name } => f.debug_struct("MeshJoin").field("name", name).finish(),
+            Request::MeshApprove { endpoint, yes } => f
+                .debug_struct("MeshApprove")
+                .field("endpoint", endpoint)
+                .field("yes", yes)
+                .finish(),
+            Request::MeshRemove { name } => {
+                f.debug_struct("MeshRemove").field("name", name).finish()
+            }
         }
     }
 }
@@ -717,6 +755,41 @@ pub enum Response {
     Live(LiveInfo),
     /// 对 [`Request::LivePublishGrant`] 的回答：一张只能切换公开状态的凭证。
     LiveGrant(LiveGrantToken),
+    /// `Mesh*` 几条请求的共同回答：做完之后的样子。
+    Mesh(MeshView),
+}
+
+/// 多电脑眼下的样子。**不带任何钥匙或令牌**——只有公开的名字、端点、数字。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshView {
+    /// 有没有中转令牌（`dct login` 过）。
+    pub logged_in: bool,
+    pub name: String,
+    /// 这台电脑的端点。还没生成过钥匙时是空串。
+    pub endpoint: String,
+    /// 有没有一份名单（登录之后至少是只有自己的那一份）。
+    pub in_group: bool,
+    pub members: Vec<MemberView>,
+    /// 别的电脑想加入、等这台批准的。
+    pub pending: Vec<PendingJoin>,
+    /// 这台电脑自己在请求加入：问到的每台已有电脑，和给它算的 6 位数。
+    pub joining: Vec<PendingJoin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberView {
+    pub name: String,
+    pub endpoint: String,
+    pub online: bool,
+    pub is_me: bool,
+}
+
+/// 一次加入请求，以及两边屏幕上都该出现的那个 6 位数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingJoin {
+    pub name: String,
+    pub endpoint: String,
+    pub code: String,
 }
 
 /// 一场直播眼下的样子。
@@ -962,6 +1035,38 @@ pub enum ErrorCode {
     /// 还没归类的内部错误，同样照抄原文。有它才能一步步迁移，而不是等到
     /// 每一条都归好类才敢合并。
     Internal(String),
+    /// 多电脑那一路为什么没办成。
+    Mesh(MeshProblem),
+}
+
+/// 见 [`ErrorCode::Mesh`]。句子在 `i18n::msg::error` 里组。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MeshProblem {
+    /// 还没 `dct login`。
+    NotLoggedIn,
+    /// 没有 DC 账号的 `api_key`（或者找不到网关地址）：先配对 DC。
+    NoDcAccount,
+    /// 跟网关换令牌没换成。参数是 `mesh::login::fetch_token` 给的原因
+    /// （那一层的契约就是返回给人看的中文，见它的文档）。
+    LoginFailed(String),
+    /// 已经跟别的电脑在一个组里了，不用再加入。
+    AlreadyInGroup,
+    /// 一台在线的、能回答的已有电脑都没有。
+    NoOneAnswered,
+    /// 电脑名不合规（空、带 `/`、太长）。
+    BadName,
+    /// 组里没有这台电脑。
+    NoSuchMachine(String),
+    /// 没有这台电脑的加入请求（或者已经过期）。
+    NoSuchRequest(String),
+    /// 不止一台叫这个名字的电脑在等，得用端点指明。
+    Ambiguous(String),
+    /// 组里已经有一台叫这个名字的了。
+    NameTaken(String),
+    /// 不能移除这台电脑自己。
+    CannotRemoveSelf,
+    /// 名单存不下。
+    NotSaved,
 }
 
 /// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。
@@ -1287,14 +1392,22 @@ mod tests {
             Request::LivePublish { title: "t".into() },
             Request::LiveUnpublish,
             Request::LivePublishGrant,
+            Request::MeshStatus,
+            Request::MeshLogin,
+            Request::MeshJoin { name: "n".into() },
+            Request::MeshApprove {
+                endpoint: "c-x".into(),
+                yes: true,
+            },
+            Request::MeshRemove { name: "n".into() },
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                19,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant"]"#
+                20,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","yes":true}},{"MeshRemove":{"name":"n"}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1318,7 +1431,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                19,
+                20,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1427,7 +1540,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                19,
+                20,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1530,7 +1643,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (19, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (20, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1548,7 +1661,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (19, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (20, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1625,7 +1738,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                19,
+                20,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )

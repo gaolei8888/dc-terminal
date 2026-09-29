@@ -168,6 +168,23 @@ impl Client {
         }
     }
 
+    /// 同 `call`，但这一次最多等 `timeout`。给守护进程要替你打一趟网络的
+    /// 请求用（`MeshLogin` 要去网关换令牌、`MeshJoin` 要问别的电脑）：
+    /// `READ_TIMEOUT` 是按「守护进程在本机答一句」定的，五秒不够。
+    pub fn call_within(&mut self, req: Request, timeout: Duration) -> Result<Response> {
+        if self.conn.is_none() {
+            self.reconnect()?;
+        }
+        if let Some(c) = &self.conn {
+            c.reader.get_ref().set_read_timeout(Some(timeout))?;
+        }
+        let r = self.call(req);
+        if let Some(c) = &self.conn {
+            let _ = c.reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
+        }
+        r
+    }
+
     fn try_call(&mut self, req: &Request) -> Result<Response> {
         let conn = self
             .conn

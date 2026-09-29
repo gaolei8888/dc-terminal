@@ -4,6 +4,8 @@
 //! - `login`：跟网关换中转令牌、到期前续期；
 //! - `store`：钥匙、电脑名、组名单落盘；
 //! - `net`：往外发（`Net` trait，真的 `LinkNet` 和测试用的 `FakeHub`）；
+//! - `group`：登录建组、加入、批准、移除这几个要跟别的电脑说话的流程；
+//! - `cli`：`dct login` / `dct join` / `dct peers`；
 //! - 这里：`Mesh`，守护进程里这台电脑在组里的全部状态，以及电脑信封唯一的
 //!   入口 `Mesh::on_envelope`。
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15,11 +17,13 @@ use dct_link::Envelope;
 use dct_mesh::roster::{self, Member, SignedRoster};
 use dct_mesh::seal::{self, Kind, Message, Sealed};
 use dct_mesh::wire::{self, JoinRequest, Payload};
-use dct_mesh::{id, MachineKeys};
+use dct_mesh::{id, sas, MachineKeys};
 
 use crate::journal::Journal;
 use crate::link::Handler;
 
+pub mod cli;
+pub mod group;
 pub mod login;
 pub mod net;
 pub mod store;
@@ -43,6 +47,13 @@ pub const SENT_AT_WINDOW_SECS: u64 = 10 * 60;
 
 /// 去重表记多少条。
 const SEEN_CAP: usize = 1024;
+
+/// 一条加入请求等多久没人批就作废；新电脑那边也最多等这么久。
+pub const JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// 最多同时挂几条等批准的加入请求。同账号里的一台电脑能一直发 `Join`，
+/// 不设上限的话这张表就是一个谁都能灌的口子。
+const MAX_PENDING: usize = 16;
 
 /// 还没解析到具体会话的留言放在这个键下面。会话 id 从 1 数起，0 不会撞上。
 /// Task 7 按会话名解析、投递。
@@ -108,8 +119,12 @@ pub struct Mesh {
     pub keys: MachineKeys,
     pub me: Member,
     pub roster: Option<SignedRoster>,
-    /// 等人批准的加入请求：请求、6 位核对码、收到的时间。Task 6 填。
+    /// 等人批准的加入请求：请求、6 位核对码、收到的时间。
     pub pending_joins: Vec<(JoinRequest, String, Instant)>,
+    /// 这台电脑自己在请求加入：回过我 `JoinPending` 的已有电脑，和我给它
+    /// 算的 6 位数。**只有这里面的电脑签的名单，能成为我进组的第一份**
+    /// （`roster::accept_invite`）。
+    pub invites: Vec<(Member, String)>,
     /// 按会话 id 排队的留言。Task 7 投递。
     pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
     store: Option<store::Store>,
@@ -143,6 +158,7 @@ impl Mesh {
             me,
             roster,
             pending_joins: Vec::new(),
+            invites: Vec::new(),
             queues: HashMap::new(),
             store: None,
             journal: Arc::new(Journal::new()),
@@ -207,35 +223,184 @@ impl Mesh {
         match payload {
             Payload::Roster(r) => self.take_roster(env, r),
             Payload::Sealed(s) => self.take_sealed(env, &s),
-            // 加入这一路是 Task 6 的事；在那之前收到就当没收到。
-            Payload::Join(_) | Payload::JoinPending { .. } => None,
+            Payload::Join(req) => self.take_join(env, req),
+            // `JoinPending` 只该作为 `ask` 的答复回来（`group::join` 在那里
+            // 读它），不该从轮询里进来。
+            Payload::JoinPending { .. } => self.drop(env, "unasked_join_pending"),
         }
     }
 
+    /// 这台电脑还不跟任何别的电脑同组：没有名单，或者名单上只有自己
+    /// （`dct login` 建的那一份）。只有这时候才能去加入别人的组。
+    pub fn is_alone(&self) -> bool {
+        match &self.roster {
+            None => true,
+            Some(r) => r.roster.members.iter().all(|m| m.endpoint == self.me.endpoint),
+        }
+    }
+
+    /// 还没有名单就建一个只有自己的组（`dct login` 之后）。返回有没有新建。
+    pub fn ensure_group(&mut self) -> anyhow::Result<bool> {
+        if self.roster.is_some() {
+            return Ok(false);
+        }
+        let g = roster::genesis(
+            self.me.clone(),
+            format!("mine-{}", self.me.endpoint),
+            &self.keys,
+        );
+        self.commit(g)?;
+        self.journal.mesh("group_created");
+        Ok(true)
+    }
+
+    /// 改这台电脑的名字。名单上只有自己时，那份名单也按新名字重签一遍——
+    /// 不然重启之后 `Mesh::new` 又会从名单里读回旧名字。已经跟别人同组时
+    /// 不改：名单上的名字是别人签进去的。
+    pub fn rename(&mut self, name: &str) -> Result<(), crate::proto::MeshProblem> {
+        let name = name.trim();
+        if !valid_name(name) {
+            return Err(crate::proto::MeshProblem::BadName);
+        }
+        if !self.is_alone() {
+            return Err(crate::proto::MeshProblem::AlreadyInGroup);
+        }
+        if let Some(s) = &self.store {
+            s.set_name(name)
+                .map_err(|_| crate::proto::MeshProblem::NotSaved)?;
+        }
+        self.me.name = name.to_string();
+        if let Some(r) = &self.roster {
+            let g = roster::genesis(self.me.clone(), r.roster.group.clone(), &self.keys);
+            self.commit(g)
+                .map_err(|_| crate::proto::MeshProblem::NotSaved)?;
+        }
+        Ok(())
+    }
+
+    /// 这台电脑请求加入时发出去的那一份：自己的成员记录，自己签名。
+    pub fn join_request(&self) -> JoinRequest {
+        JoinRequest {
+            member: self.me.clone(),
+            sig: wire::sign_member(&self.me, &self.keys),
+        }
+    }
+
+    /// 换上一份已经验过的名单：先落盘，再换内存。存不下就不换（理由见
+    /// `take_roster`）。已经在名单上的电脑，它的加入请求就不用再等了。
+    fn commit(&mut self, r: SignedRoster) -> anyhow::Result<()> {
+        if let Some(s) = &self.store {
+            s.save_roster(&r)?;
+        }
+        if let Some(mine) = r.roster.member(&self.me.endpoint) {
+            self.me = mine.clone();
+        }
+        self.pending_joins
+            .retain(|(j, _, _)| r.roster.member(&j.member.endpoint).is_none());
+        self.roster = Some(r);
+        Ok(())
+    }
+
+    /// 扔掉过期的加入请求。
+    pub fn prune_pending(&mut self) {
+        self.pending_joins.retain(|(_, _, t)| t.elapsed() < JOIN_TTL);
+    }
+
+    /// 一台电脑想加入：验它的自签名、确认它说的端点就是中转认证过的发件
+    /// 端点，算出 6 位数挂起来等用户批，回一份我自己的自签成员记录——对方
+    /// 拿它算同一个 6 位数。
+    ///
+    /// **这里不改名单。** 进名单只有一条路：用户看过两边的数字之后批准
+    /// （`group::approve`）。
+    fn take_join(&mut self, env: &Envelope, req: JoinRequest) -> Option<Vec<u8>> {
+        let Some(current) = self.roster.as_ref() else {
+            return self.drop(env, "join_without_group");
+        };
+        if req.member.endpoint != env.from.as_str() || !wire::verify_member(&req.member, &req.sig)
+        {
+            return self.drop(env, "join_bad_sig");
+        }
+        // 签得进名单的才挂：名字不合规、加密公钥解不出来的，批了也是白批。
+        if !valid_name(&req.member.name) || !valid_kx_pub(&req.member.kx_pub) {
+            return self.drop(env, "join_bad_member");
+        }
+        if current.roster.member(&req.member.endpoint).is_some() {
+            return self.drop(env, "join_already_member");
+        }
+        let code = sas::code(&self.me, &req.member);
+        self.prune_pending();
+        self.pending_joins
+            .retain(|(j, _, _)| j.member.endpoint != req.member.endpoint);
+        if self.pending_joins.len() >= MAX_PENDING {
+            self.pending_joins.remove(0);
+        }
+        self.journal
+            .mesh(&format!("join_pending from={}", env.from));
+        self.pending_joins.push((req, code, Instant::now()));
+        Some(wire::encode(&Payload::JoinPending {
+            member: self.me.clone(),
+            sig: wire::sign_member(&self.me, &self.keys),
+        }))
+    }
+
     fn take_roster(&mut self, env: &Envelope, incoming: SignedRoster) -> Option<Vec<u8>> {
+        // 我正在请求加入，而这份名单是我核对过数字的那台电脑签的：这是
+        // 邀请，走 `accept_invite`。
+        if self.is_alone() {
+            let inviter = self
+                .invites
+                .iter()
+                .find(|(m, _)| m.endpoint == incoming.signer)
+                .map(|(m, _)| m.clone());
+            if let Some(inviter) = inviter {
+                return self.take_invite(env, incoming, &inviter);
+            }
+        }
         // 还没在任何组里的电脑，**不从网上接一份名单当自己的第一份**：
         // `accept(None, ..)` 只查「是一份自签的创世名单」，同账号里谁都造得
-        // 出一份。加入别人的组要走 `accept_invite`（Task 6），它还要核对
-        // 签名者就是给我算过 6 位数的那台电脑。
+        // 出一份。加入别人的组走上面那条 `accept_invite`，它还要核对签名者
+        // 就是给我算过 6 位数的那台电脑。
         let Some(current) = self.roster.as_ref() else {
             return self.drop(env, "roster_without_group");
         };
         if let Err(e) = roster::accept(Some(current), &incoming) {
             return self.drop(env, &format!("roster_{e:?}"));
         }
-        if let Some(s) = &self.store {
-            if let Err(e) = s.save_roster(&incoming) {
-                // 存不下就不换：内存跟磁盘各说一套的话，重启之后会退回旧名单，
-                // 而那时候谁也不记得发生过什么。对方下一次广播会再送来。
+        if let Err(e) = self.commit(incoming) {
+            // 存不下就不换：内存跟磁盘各说一套的话，重启之后会退回旧名单，
+            // 而那时候谁也不记得发生过什么。对方下一次广播会再送来。
+            self.journal
+                .mesh(&format!("roster_not_saved from={} err={e}", env.from));
+        }
+        None
+    }
+
+    fn take_invite(
+        &mut self,
+        env: &Envelope,
+        incoming: SignedRoster,
+        inviter: &Member,
+    ) -> Option<Vec<u8>> {
+        if let Err(e) = roster::accept_invite(&incoming, &self.me.endpoint, inviter) {
+            return self.drop(env, &format!("invite_{e:?}"));
+        }
+        // `accept_invite` 只拿得到我的端点（它绑着签名公钥）；我那一条的
+        // 加密公钥对不对，只有我自己知道。换成别的，发给我的东西我就解不开，
+        // 而能解开的是别人。
+        let mine = incoming.roster.member(&self.me.endpoint);
+        if mine.map(|m| (&m.sign_pub, &m.kx_pub)) != Some((&self.me.sign_pub, &self.me.kx_pub)) {
+            return self.drop(env, "invite_not_my_keys");
+        }
+        match self.commit(incoming) {
+            Ok(()) => {
+                self.invites.clear();
                 self.journal
-                    .mesh(&format!("roster_not_saved from={} err={e}", env.from));
-                return None;
+                    .mesh(&format!("joined via={}", env.from));
             }
+            Err(e) => self
+                .journal
+                .mesh(&format!("roster_not_saved from={} err={e}", env.from)),
         }
-        if let Some(mine) = incoming.roster.member(&self.me.endpoint) {
-            self.me = mine.clone();
-        }
-        self.roster = Some(incoming);
         None
     }
 
@@ -300,6 +465,15 @@ impl Mesh {
             .mesh(&format!("dropped from={} why={why}", env.from));
         None
     }
+}
+
+/// 名单接受的名字（同 `roster` 里的规则、同 `store::set_name`）。
+pub(crate) fn valid_name(n: &str) -> bool {
+    !n.is_empty() && !n.contains('/') && n.chars().count() <= roster::MAX_NAME_LEN
+}
+
+fn valid_kx_pub(b64: &str) -> bool {
+    STANDARD.decode(b64).map(|b| b.len() == 32).unwrap_or(false)
 }
 
 /// `#12` 这种写法直接就是会话 id；会话名要等 Task 7 按看板上的名字解析。

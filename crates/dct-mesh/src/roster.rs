@@ -122,6 +122,8 @@ pub enum RosterError {
     /// 签名者在自己签的这一版里把自己从名单上删掉了——这类改动必须由别的在
     /// 任成员签，不能自己签自己退出。
     SignerRemoved,
+    /// `accept_invite`：名单里没有我——那不是给我的邀请。
+    NotForMe,
 }
 
 impl std::fmt::Display for RosterError {
@@ -140,6 +142,7 @@ impl std::fmt::Display for RosterError {
             }
             RosterError::BadName => "a member's name is empty, contains '/', or is too long",
             RosterError::SignerRemoved => "the signer cannot remove itself in the version it signs",
+            RosterError::NotForMe => "the invited roster does not list this machine",
         })
     }
 }
@@ -221,7 +224,7 @@ fn has_duplicates(members: &[Member]) -> bool {
 /// [`genesis`] 生成、还没有任何名单存过的那种情况。一台**加入**别人组的新
 /// 电脑没有旧名单，但它收到的第一份名单不能走这条路径：它必须验证签名者
 /// 就是给自己算过 6 位核对码、当面确认过的那台电脑，这条规则比「version 1
-/// 且自签」更强，属于另一个函数 `accept_invite`（后续任务）的活，不在这里。
+/// 且自签」更强，那是 [`accept_invite`] 的活，不在这里。
 ///
 /// 规则：
 /// - 名单里每个成员：名字合法、公钥能解出来、`endpoint` 跟 `sign_pub` 对得上；
@@ -279,9 +282,211 @@ pub fn accept(current: Option<&SignedRoster>, incoming: &SignedRoster) -> Result
     Ok(())
 }
 
+/// 一台**加入**别人组的电脑，接受它的第一份名单。
+///
+/// 这台电脑此刻没有（别人的）旧名单可以对照，`accept` 那条「签名者在上一版
+/// 里」用不上。取而代之的是：签名者必须就是 `inviter`——那台回过我
+/// `JoinPending`、我给它算过 6 位数、用户两边核对过的电脑，验签也只用
+/// `inviter` 自己那把 `sign_pub`（中转伪造不了：换一把钥匙，数字就对不上）。
+///
+/// 规则：
+/// - 名单里每个成员的结构性校验同 `accept`（名字、公钥、`endpoint` 绑钥匙），
+///   没有重复；
+/// - `inviter.endpoint` 真的是从 `inviter.sign_pub` 算出来的；
+/// - `signer == inviter.endpoint`，签名用 `inviter.sign_pub` 验得过；
+/// - 名单里有 `inviter`，而且那一条的两把公钥跟 `inviter` 的一模一样——
+///   6 位数核对的是这两把，名单里换成别的就等于没核对过；
+/// - 名单里有我（`me_endpoint`）。
+///
+/// 版本号和组名不看：这是我的第一份，没有东西可比。我自己那一条的加密公钥
+/// 对不对，调用方拿自己的钥匙核对（这里只拿得到我的 endpoint）。
+pub fn accept_invite(
+    incoming: &SignedRoster,
+    me_endpoint: &str,
+    inviter: &Member,
+) -> Result<(), RosterError> {
+    let sig = decode_sig(&incoming.sig).ok_or(RosterError::BadSignature)?;
+    validate_members(&incoming.roster.members)?;
+    if has_duplicates(&incoming.roster.members) {
+        return Err(RosterError::Duplicate);
+    }
+    let inviter_pub = decode_sign_pub(&inviter.sign_pub).ok_or(RosterError::BadKey)?;
+    if id::endpoint_for(&inviter_pub) != inviter.endpoint {
+        return Err(RosterError::BadKey);
+    }
+    if incoming.signer != inviter.endpoint {
+        return Err(RosterError::UnknownSigner);
+    }
+    if !keys::verify(&inviter_pub, &bytes(&incoming.roster), &sig) {
+        return Err(RosterError::BadSignature);
+    }
+    let listed = incoming
+        .roster
+        .member(&inviter.endpoint)
+        .ok_or(RosterError::SignerRemoved)?;
+    if listed.sign_pub != inviter.sign_pub || listed.kx_pub != inviter.kx_pub {
+        return Err(RosterError::BadKey);
+    }
+    if incoming.roster.member(me_endpoint).is_none() {
+        return Err(RosterError::NotForMe);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- accept_invite: a joining machine's first roster -----------------------
+
+    /// A 的组 v2 = {A, X}，A 签了一份 v3 把 B 加进来。B 手上只有 A 的
+    /// `JoinPending` 里那条成员记录（B 为它算过 6 位数）。
+    fn invite_fixture() -> (MachineKeys, Member, Member, SignedRoster) {
+        let ka = keys_for(1);
+        let kb = keys_for(2);
+        let kx = keys_for(3);
+        let a = member_from(&ka, "A");
+        let b = member_from(&kb, "B");
+        let x = member_from(&kx, "X");
+        let v3 = Roster {
+            group: "mine-a".into(),
+            version: 3,
+            members: vec![a.clone(), x, b.clone()],
+        };
+        let signed = sign(v3, &a, &ka);
+        (ka, a, b, signed)
+    }
+
+    #[test]
+    fn an_invite_signed_by_the_inviter_and_listing_me_is_accepted() {
+        let (_, a, b, signed) = invite_fixture();
+        assert_eq!(accept_invite(&signed, &b.endpoint, &a), Ok(()));
+    }
+
+    #[test]
+    fn an_invite_signed_by_someone_other_than_the_inviter_is_refused() {
+        let (_, a, b, _) = invite_fixture();
+        // X 也是组员，也真能签——但 B 核对过数字的是 A，不是 X。
+        let kx = keys_for(3);
+        let x = member_from(&kx, "X");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 3,
+            members: vec![a.clone(), x.clone(), b.clone()],
+        };
+        let by_x = sign(r, &x, &kx);
+        assert_eq!(
+            accept_invite(&by_x, &b.endpoint, &a),
+            Err(RosterError::UnknownSigner)
+        );
+    }
+
+    #[test]
+    fn an_invite_whose_signature_is_not_the_inviters_key_is_refused() {
+        let (_, a, b, signed) = invite_fixture();
+        let mut forged = signed.clone();
+        // `signer` 写着 A，签名却是另一把钥匙签的。
+        forged.sig = sign(signed.roster.clone(), &a, &keys_for(9)).sig;
+        assert_eq!(
+            accept_invite(&forged, &b.endpoint, &a),
+            Err(RosterError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn an_invite_that_does_not_list_me_is_refused() {
+        let (ka, a, _, _) = invite_fixture();
+        let kb = keys_for(2);
+        let b = member_from(&kb, "B");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 3,
+            members: vec![a.clone()],
+        };
+        let signed = sign(r, &a, &ka);
+        assert_eq!(
+            accept_invite(&signed, &b.endpoint, &a),
+            Err(RosterError::NotForMe)
+        );
+    }
+
+    #[test]
+    fn an_invite_that_drops_the_inviter_is_refused() {
+        let ka = keys_for(1);
+        let kb = keys_for(2);
+        let a = member_from(&ka, "A");
+        let b = member_from(&kb, "B");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 2,
+            members: vec![b.clone()],
+        };
+        let signed = sign(r, &a, &ka);
+        assert_eq!(
+            accept_invite(&signed, &b.endpoint, &a),
+            Err(RosterError::SignerRemoved)
+        );
+    }
+
+    /// 名单里 A 那一条的加密公钥被换了：B 核对的 6 位数是按 A 在
+    /// `JoinPending` 里给的那把算的，名单里的这把没人核对过。
+    #[test]
+    fn an_invite_that_lists_the_inviter_with_different_keys_is_refused() {
+        let (ka, a, b, _) = invite_fixture();
+        let mut a_swapped = a.clone();
+        a_swapped.kx_pub = STANDARD.encode(keys_for(9).kx_pub());
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 3,
+            members: vec![a_swapped, b.clone()],
+        };
+        let signed = sign(r, &a, &ka);
+        assert_eq!(
+            accept_invite(&signed, &b.endpoint, &a),
+            Err(RosterError::BadKey)
+        );
+    }
+
+    #[test]
+    fn an_invite_still_gets_the_structural_checks() {
+        let (ka, a, b, _) = invite_fixture();
+        let kc = keys_for(4);
+        let c_same_name = member_from(&kc, "B");
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 3,
+            members: vec![a.clone(), b.clone(), c_same_name],
+        };
+        assert_eq!(
+            accept_invite(&sign(r, &a, &ka), &b.endpoint, &a),
+            Err(RosterError::Duplicate)
+        );
+
+        let mut bad = b.clone();
+        bad.name = "a/b".into();
+        let r = Roster {
+            group: "mine-a".into(),
+            version: 3,
+            members: vec![a.clone(), bad],
+        };
+        assert_eq!(
+            accept_invite(&sign(r, &a, &ka), &b.endpoint, &a),
+            Err(RosterError::BadName)
+        );
+    }
+
+    /// 邀请人那条记录本身的 `endpoint` 跟它的 `sign_pub` 对不上：不能拿它
+    /// 去验签。
+    #[test]
+    fn an_inviter_whose_endpoint_is_not_its_key_is_refused() {
+        let (_, a, b, signed) = invite_fixture();
+        let mut liar = a.clone();
+        liar.sign_pub = STANDARD.encode(keys_for(9).sign_pub());
+        assert_eq!(
+            accept_invite(&signed, &b.endpoint, &liar),
+            Err(RosterError::BadKey)
+        );
+    }
 
     fn member_from(keys: &MachineKeys, name: &str) -> Member {
         Member {
