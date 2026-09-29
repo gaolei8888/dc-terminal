@@ -195,6 +195,27 @@ pub fn is_format_char(c: char) -> bool {
     )
 }
 
+/// 名字里不许有的字符：控制字符（`Cc`）、格式字符（`Cf`，见上），再加
+///
+/// - 行分隔符 U+2028、段分隔符 U+2029（`Zl`/`Zp`）：终端里画出来无害，
+///   但有的智能体 CLI（JS 写的）和模型本身会把它当换行，标记行就被拆开；
+/// - 看不见的填充字符（韩文填充 U+115F/U+1160/U+3164/U+FFA0、盲文空白
+///   U+2800）：占一个位置但什么都不画，能让一个名字看着像另一个。
+pub fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || is_format_char(c)
+        || matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{FFA0}'
+                | '\u{2800}'
+        )
+}
+
 /// 名单接受的电脑名：非空、不带 `/`、不超过 `MAX_NAME_LEN` 个字符，而且
 /// **没有控制字符（`Cc`）和格式字符（`Cf`）**。
 ///
@@ -207,7 +228,7 @@ pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('/')
         && name.chars().count() <= MAX_NAME_LEN
-        && !name.chars().any(|c| c.is_control() || is_format_char(c))
+        && !name.chars().any(is_hidden_char)
 }
 
 fn validate_name(name: &str) -> Result<(), RosterError> {
@@ -1017,6 +1038,13 @@ mod tests {
             "a\u{200b}b",
             "a\u{feff}b",
             "a\u{00ad}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{115f}b",
+            "a\u{1160}b",
+            "a\u{3164}b",
+            "a\u{ffa0}b",
+            "a\u{2800}b",
         ] {
             assert!(!valid_name(bad), "{bad:?}");
             let a = member_from(&ka, bad);

@@ -117,7 +117,7 @@ fn clean_text(s: &str, cap: usize) -> String {
 pub(crate) fn clean_name(s: &str) -> String {
     crate::session::sanitize(s)
         .chars()
-        .filter(|c| !is_format_char(*c))
+        .filter(|c| !dct_mesh::roster::is_hidden_char(*c))
         .collect()
 }
 
@@ -2126,6 +2126,17 @@ mod tests {
             "{head:?}"
         );
         assert!(head.contains("abcde/xy"), "{head:?}");
+
+        // 行分隔符、段分隔符（Zl/Zp）：有的智能体 CLI 当换行，会把标记行拆开；
+        // 看不见的填充字符（韩文填充、盲文空白……）让名字看着像别的名字。
+        let m = marker(
+            "a\u{2028}b\u{2029}c\u{3164}d\u{115f}\u{ffa0}\u{2800}e",
+            "x",
+            "abcd",
+            "正文",
+        );
+        assert!(m.lines().next().unwrap().contains("abcde/x"), "{m:?}");
+        assert_eq!(clean_name("p\u{2028}q"), "pq");
     }
 
     /// 走收件口的那条路：发件会话名里的方括号去掉、换行洗掉，正文里的假标记垫空格。

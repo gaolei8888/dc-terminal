@@ -269,7 +269,7 @@ fn tidy_name(raw: &str) -> String {
     let base = raw.trim().split('.').next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| *c != '/' && !c.is_control() && !dct_mesh::roster::is_format_char(*c))
+        .filter(|c| *c != '/' && !dct_mesh::roster::is_hidden_char(*c))
         .take(MAX_NAME_LEN)
         .collect();
     if cleaned.is_empty() {
