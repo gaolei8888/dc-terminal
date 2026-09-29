@@ -922,6 +922,39 @@ mod tests {
         assert!(b.view().joining.is_empty());
     }
 
+    /// 审查给的 m1：B 还没认定，A 先点了同意，A 的真名单存在 B 那里。这时
+    /// M（同账号的另一台，也回过话）送一份自称 `signer = A` 的垃圾名单——
+    /// 它不能顶掉 A 那份；B 认定 A 的时候照样进 A 的组。
+    #[test]
+    fn a_junk_roster_claiming_the_inviter_as_signer_does_not_clobber_the_held_one() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        let m = Node::new(&hub, 9, "M");
+        a.login();
+        b.login();
+        m.login();
+        assert_eq!(b.join().unwrap().len(), 2, "A 和 M 都回了话");
+        a.approve("B").unwrap();
+        assert_eq!(b.names(), ["B"], "没认定之前不进组");
+
+        // M 签的名单，但 `signer` 字段写成 A。
+        let r = Roster {
+            group: m.roster().roster.group.clone(),
+            version: 2,
+            members: vec![m.me(), b.me()],
+        };
+        let mut junk = roster::sign(r, &m.me(), &keys(9));
+        junk.signer = a.ep.clone();
+        m.net
+            .send(&b.ep, wire::encode(&Payload::Roster(junk)))
+            .unwrap();
+
+        b.confirm(&a).unwrap();
+        assert_eq!(b.names(), ["A", "B"], "A 的真名单还在，认定时进了 A 的组");
+        assert_eq!(b.roster(), a.roster());
+    }
+
     /// 邀请过了 `JOIN_TTL` 就作废：认定不了；认定过的，那台再送名单也不收。
     #[test]
     fn invites_expire_after_the_join_ttl() {
@@ -947,7 +980,8 @@ mod tests {
             }
             now.store(t0 + ttl, Ordering::SeqCst);
             if !confirm_first {
-                assert_eq!(b.confirm(&a), Err(MeshProblem::NoSuchInviter(a.ep.clone())));
+                // 报的是电脑名，不是端点：用户敲的是名字。
+                assert_eq!(b.confirm(&a), Err(MeshProblem::NoSuchInviter("A".into())));
             }
             a.approve("B").unwrap();
             assert_eq!(

@@ -2079,6 +2079,24 @@ pub mod msg {
         )
     }
 
+    /// 同名的不止一台时那一行：名字后面带端点，用户照着敲 `c-…`。
+    pub fn mesh_code_line_with_endpoint(lang: Lang, name: &str, endpoint: &str, code: &str) -> String {
+        t!(
+            lang,
+            en: format!("  {name} ({endpoint}): {code}"),
+            zh: format!("  {name} ({endpoint})：{code}"),
+        )
+    }
+
+    /// 新电脑上：用户说的名字对得上不止一台回过话的电脑。
+    pub fn mesh_ambiguous_responder(lang: Lang, name: &str) -> String {
+        t!(
+            lang,
+            en: format!("More than one computer called {name} answered. Run dct join again and type the c-… number shown next to the one whose number matches"),
+            zh: format!("不止一台叫 {name} 的电脑回应了。重新运行 dct join，输入数字对得上的那台后面括号里的 c-… 编号"),
+        )
+    }
+
     /// 新电脑上：列完数字之后，问是哪一台。
     pub fn mesh_which_computer(lang: Lang) -> String {
         t!(
@@ -2124,8 +2142,8 @@ pub mod msg {
     pub fn mesh_join_timed_out(lang: Lang) -> String {
         t!(
             lang,
-            en: "No approval within 10 minutes. Run dct join again to retry".to_string(),
-            zh: "10 分钟里没等到同意。想再试就重新运行 dct join".to_string(),
+            en: "No approval within 10 minutes. The invitation has expired, run dct join again".to_string(),
+            zh: "10 分钟里没等到同意，邀请已过期，请重新运行 dct join".to_string(),
         )
     }
 
@@ -3145,6 +3163,8 @@ mod tests {
             msg::mesh_not_a_responder(Lang::En, "pc"),
             msg::mesh_join_cancelled(Lang::En),
             msg::mesh_not_approved(Lang::En),
+            msg::mesh_code_line_with_endpoint(Lang::En, "pc", "c-x", "1"),
+            msg::mesh_ambiguous_responder(Lang::En, "pc"),
         ] {
             assert!(!has_han(&s), "英文里有汉字：{s}");
         }

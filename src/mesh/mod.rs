@@ -393,10 +393,19 @@ impl Mesh {
     }
 
     /// 用户说「是这一台，数字一样」。它先前送来过名单的话，现在验。
+    ///
+    /// 认定不了时，错误里带的是给人看的电脑名（过期之前记得住的话），不是
+    /// 端点——用户敲的就是名字。
     pub fn confirm_inviter(&mut self, endpoint: &str) -> Result<(), crate::proto::MeshProblem> {
+        let name = self
+            .invites
+            .iter()
+            .find(|i| i.member.endpoint == endpoint)
+            .map(|i| i.member.name.clone())
+            .unwrap_or_else(|| endpoint.to_string());
         self.prune_invites();
         if !self.invites.iter().any(|i| i.member.endpoint == endpoint) {
-            return Err(crate::proto::MeshProblem::NoSuchInviter(endpoint.to_string()));
+            return Err(crate::proto::MeshProblem::NoSuchInviter(name));
         }
         self.confirmed = Some(endpoint.to_string());
         if let Some(i) = self.held.iter().position(|r| r.signer == endpoint) {
@@ -416,6 +425,13 @@ impl Mesh {
                 return None;
             }
             if self.invites.iter().any(|i| i.member.endpoint == incoming.signer) {
+                // `signer` 只是名单里的一个字段，还没验过。按它存的话，同账号
+                // 里随便一台电脑送一份写着「signer = A」的垃圾，就能把 A 真正
+                // 送来的那份顶掉，用户认定 A 的那一刻什么也验不出来。所以
+                // 只存**签名者亲自送来的**：中转认证过发件端点，冒不了。
+                if env.from.as_str() != incoming.signer {
+                    return self.drop(env, "invite_not_from_signer");
+                }
                 self.journal
                     .mesh(&format!("invite_held from={}", env.from));
                 self.held.retain(|r| r.signer != incoming.signer);
