@@ -885,6 +885,13 @@ running it is going live, so check with whoever owns the servers first.**
    through the proxy.
 4. **Check**: two real computers (a Mac and a Windows) go through `dct login` →
    `dct join` → `dct peers approve` → `dct send`, and the message shows up.
+5. **Check multi-line messages in real agents** (not verified yet): on the Windows
+   box, `dct send` a two-line message into a Claude Code session and into a Codex
+   session. Each must arrive as **one** turn — the marker line and both body lines
+   together. If an agent submits at the first line break, the marker goes in alone
+   and the body arrives as an unmarked turn the agent will take as the user's own
+   words: stop the go-live and wrap the typed text in bracketed paste
+   (`ESC[200~ … ESC[201~`) for that agent first. Record the result in the ledger.
 
 To try the whole thing on one machine, no gateway, no internet:
 `cargo test --test mesh_e2e -- --ignored --nocapture` starts a real relay and two
