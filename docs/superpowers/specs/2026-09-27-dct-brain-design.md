@@ -182,7 +182,13 @@ dct 给外部的接口是**命令行 + JSON**，不让外部直接讲守护进�
 - dco 急停时，dct 读到后**自动进入暂停**（`paused_by: "dco_halt"`）。
 - **恢复两边各自解除**：dct 恢复不会顺带解除 dco 的急停，dco 恢复也不会自动解除 dct 的暂停——免得一次误操作解开两道锁。
 - 菜单上的「急停」一次按到底：dc-local 先调 dco 急停，再调 `dct auto pause`。
-- dco 的工具名和状态格式（halt / resume / status.activity / run_status）等 dco 急停做完后补进来。
+- dco 那边（第 ① 步已合并，2026-09-28）：`halt {by?, reason?}` / `resume {}`；急停状态写在 dco 磁盘上，重启后仍是急停；急停期间动手的工具、`run_procedure`、`answer_run` 报 `error.code = "halted"`，看屏幕和 `status` 照常。dct 读 dco `status` 里的 `activity.state == "halted"`（或 attention 里的 `dco.halted`）就进入 `paused_by: "dco_halt"`。
+- **菜单上只有一个「暂停 / 继续」**（用户 2026-09-28 定）：暂停 = dco `pause` + `dct auto pause`（`paused_by: "user"`）；继续 = dco `unpause` + `dct auto resume`。
+  - dco 暂停时，正在做的那一步做完收尾，在下一步之前停住；`unpause` 返回暂停中的 `run_id`。**让它们接着做是 dct 的事**：dct 恢复时，对每个暂停中的流程先核对票的执行时间窗还有效，有效就调 dco `continue_run {run_id}`，过了「最晚」的就不接，让它按作废处理、重新排。
+  - dco 暂停超过 30 分钟会自动取消那些流程（`run_status` 为 `cancelled`，note 写超时取消）；dct 据此不计入「连续失败 3 次」。
+  - dco 暂停的格式（已合进 dco main）：`pause {by?, reason?}` → `{"paused": true, …}`；`unpause {}` → `{"paused": false, "paused_runs": [...]}`，**从不解除急停**；暂停期间动手的工具、`run_procedure`、`answer_run`、`continue_run` 报 `paused`；对正在执行的流程调 `continue_run` / `answer_run` 报 `busy`。**dco 的暂停不写盘**（重启后解除、暂停中的流程报 interrupted），dct 的暂停写盘——两边可能不一致，dct 恢复时以自己的状态为准。暂停落在 `answer_run` 里时，继续后把同一个答案再发一次。
+  - `continue_run` 会阻塞到流程跑完（`done` / `needs_help` / `blocked` …）才返回，dct 要在后台调；dco 也会再核对票的时间窗，过期报 `ticket_rejected`（`expired`），和 dct 先核对是双保险。
+  - 在 dct 实现这部分之前，dc-local 先自己调 `continue_run`（过渡做法，见 dc-local 设计第六节）。
 
 这几条命令跟排程、卡片一起实现；在那之前 `dct status --json` 只能给出守护进程和会话这几项。
 
@@ -211,7 +217,7 @@ dct 给外部的接口是**命令行 + JSON**，不让外部直接讲守护进�
 - **配对手机上的 dco**：扫码，互换公钥；同时把用户的 Mac 指纹钥匙、手机 passkey 的公钥交给 dco，供它自己验签。
 - **调用**：MCP `run_procedure` / `answer_run`（dco 已实现）。dct 对接口的要求：
   - 参数里带执行票（`self` 档是自动票），dco 验签后才执行；结果回报本次用的 `steps_sha256`。
-  - 每次运行有编号，能取消，有超时。
+  - 每次运行有编号，能取消，有超时。（dco 已做：`cancel_run` 对正在跑的流程返回 `cancelling`，在下一步之前停；`run_procedure` 的 `timeout_s` 默认 600、范围 1–3600；等回答超过 30 分钟自动取消。`run_status {run_id}` 返回 run entry，`state` 取 `running | needs_help | blocked | done | already_done | failed | cancelled | halted`。）
   - 能查状态：运行中、需要帮助、被挡住、完成。dco 还没有主动推送，先由 dct 轮询。
   - `read_value` 的结果除了换算后的数，还带画面原文和位置，dct 发现异常时拿原文复核。
 - **dco 已定要做的**（用户 2026-09-28 确认，dco 路线第 ①② 步）：
