@@ -296,7 +296,7 @@ fn apply_keystrokes(out: &mut String, text: &str, cap: Option<usize>) {
 /// 和标点、不管控制字符——一段被操纵过的屏幕内容可以诱导模型把控制字符
 /// 原样吐回来。两条路落地前必须过同一道过滤，漏一条就是漏一条到用户
 /// 终端的注入路径。
-fn sanitize(text: &str) -> String {
+pub(crate) fn sanitize(text: &str) -> String {
     let mut out = String::new();
     apply_keystrokes(&mut out, text, None);
     out
@@ -427,6 +427,9 @@ pub(crate) fn collect_first_input(buf: &mut String, sealed: &mut bool, text: &st
 fn append_capped(buf: &mut String, text: &str) {
     apply_keystrokes(buf, text, Some(FIRST_INPUT_MAX));
 }
+
+/// 每个会话的子进程都带着这个环境变量，值是会话编号。
+pub const SESSION_ID_ENV: &str = "DCT_SESSION_ID";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -1015,6 +1018,10 @@ impl SessionManager {
         if let Some(home) = recover(self.pair_models_home.lock()).clone() {
             env.extend(crate::pair_apply::env_for(&home, profile_name));
         }
+
+        // 会话里的 agent 跑 `dct send` 时靠它说出「我是哪个会话」，对方收到的
+        // 标记里才写得出发件会话的名字。最后插，谁也盖不掉它。
+        env.insert(SESSION_ID_ENV.to_string(), id.to_string());
 
         // 只在恢复路径上、且这个 profile 真的声明过恢复参数时才追加——
         // 没声明的 profile（`opencode`/`qwen`/`codex`/`shell`）这里接的是
@@ -3601,6 +3608,45 @@ mod tests {
         assert!(text.contains("HOME=[/"), "把继承来的环境清过头了：{text}");
 
         std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
+    }
+
+    /// 会话里的 agent 跑 `dct send` 时，要从环境里读出自己是几号会话。
+    #[test]
+    fn a_session_child_sees_its_own_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(r#"
+            name = "fake-agent"
+            command = ["/bin/sh", "-c", "echo SID=[$DCT_SESSION_ID]; sleep 5"]
+            is_agent = false
+            "#),
+            )
+            .unwrap(),
+        );
+
+        // 两个会话，各看见各的编号。
+        let first = mgr.create(&proj, "fake-agent", None, &[]).unwrap();
+        let second = mgr.create(&proj, "fake-agent", None, &[]).unwrap();
+        assert_ne!(first, second);
+        for id in [first, second] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let text = loop {
+                let text = mgr.screen_text_for_test(id);
+                if text.contains("SID=[") {
+                    break text;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "会话没打印出东西来：{text}"
+                );
+                sleep(Duration::from_millis(50));
+            };
+            assert!(text.contains(&format!("SID=[{id}]")), "{id} 号会话看见的是：{text}");
+        }
     }
 
     #[test]

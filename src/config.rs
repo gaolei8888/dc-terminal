@@ -85,6 +85,25 @@ pub struct MenuConfig {
     pub agents: Vec<String>,
 }
 
+/// `[mesh]`：多电脑那一路。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MeshConfig {
+    /// 中转地址；没写就是 `mesh::DEFAULT_RELAY`。
+    #[serde(default)]
+    pub relay: Option<String>,
+}
+
+impl MeshConfig {
+    pub fn relay(&self) -> String {
+        self.relay
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(crate::mesh::DEFAULT_RELAY)
+            .to_string()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     /// `None` = 用户没写 `[llm]` 这一段，出错解释功能整个关着。**默认值
@@ -97,6 +116,8 @@ pub struct Config {
     /// 「没写」和「写了但空着」要的是同一件事——菜单原样显示。
     #[serde(default)]
     pub menu: MenuConfig,
+    #[serde(default)]
+    pub mesh: MeshConfig,
 }
 
 impl Config {
@@ -151,6 +172,16 @@ pub fn config_path_for_profiles_dir(profiles_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_relay_defaults_and_can_be_overridden() {
+        assert_eq!(Config::default().mesh.relay(), crate::mesh::DEFAULT_RELAY);
+        let c = Config::from_toml("[mesh]\nrelay = \"http://127.0.0.1:8787\"\n").unwrap();
+        assert_eq!(c.mesh.relay(), "http://127.0.0.1:8787");
+        let blank = Config::from_toml("[mesh]\nrelay = \"  \"\n").unwrap();
+        assert_eq!(blank.mesh.relay(), crate::mesh::DEFAULT_RELAY);
+        assert!(c.llm.is_none(), "写了 [mesh] 不该顺手打开 [llm]");
+    }
 
     #[test]
     fn parses_a_full_llm_section() {

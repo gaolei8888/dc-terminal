@@ -25,12 +25,12 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dct_link::{
-    AuthFrame, EndpointId, EndpointKind, Envelope, PollResponse, SendRequest, LINK_VERSION,
-    PATH_POLL, PATH_SEND, POLL_TIMEOUT,
+    AuthFrame, EndpointId, EndpointKind, Envelope, ErrorBody, PeersResponse, PollResponse,
+    SendRequest, LINK_VERSION, PATH_ASK, PATH_PEERS, PATH_POLL, PATH_SEND, POLL_TIMEOUT,
 };
 
 use crate::proto::{ErrorCode, Request, Response};
@@ -42,12 +42,41 @@ pub struct LinkConfig {
     pub base: String,
     /// 我这台电脑在中转上叫什么。
     pub endpoint: EndpointId,
-    /// 配对时拿到的令牌（任务 6 才有真的；任务 5 之前中转不验）。
-    pub token: String,
+    /// 中转令牌。**是一个共享的格子，不是一份拷贝**：令牌会续期，而同一张
+    /// 令牌同时被轮询线程（`Link`）和往外发东西的那一侧（`mesh::net::LinkNet`）
+    /// 用着。两边各拿一份 `String` 的话，续期只换得了其中一边，另一边拿着过期
+    /// 的令牌被中转拒掉，而它自己的日志里只有一句 `Unauthorized`。`clone()`
+    /// 一个 `LinkConfig` 得到的是同一个格子。
+    pub token: Token,
     /// 连不上之后第一次重试等多久。
     pub backoff_start: Duration,
     /// 重试间隔的上限。
     pub backoff_max: Duration,
+}
+
+/// 见 `LinkConfig::token`。`Debug` 不打印内容：`LinkConfig` 会进日志和 panic
+/// 信息，令牌不该跟着去。
+#[derive(Clone, Default)]
+pub struct Token(Arc<Mutex<String>>);
+
+impl Token {
+    pub fn new(s: impl Into<String>) -> Token {
+        Token(Arc::new(Mutex::new(s.into())))
+    }
+
+    pub fn get(&self) -> String {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, s: impl Into<String>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = s.into();
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
 }
 
 impl LinkConfig {
@@ -55,7 +84,7 @@ impl LinkConfig {
         LinkConfig {
             base: base.into(),
             endpoint,
-            token: token.into(),
+            token: Token::new(token),
             backoff_start: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
         }
@@ -79,9 +108,105 @@ impl LinkConfig {
             version: LINK_VERSION,
             kind: EndpointKind::Computer,
             endpoint: self.endpoint.clone(),
-            token: self.token.clone(),
+            token: self.token.get(),
         }
     }
+}
+
+/// 这条线收发要用的 HTTP 客户端。读超时按 `LinkConfig::read_timeout` 算，
+/// 见那边的注释。`Link` 自己用它，`peers`/`send`/`ask` 的调用方也该用它。
+pub fn agent(cfg: &LinkConfig) -> ureq::Agent {
+    crate::sys::tls::agent_builder()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(cfg.read_timeout())
+        .timeout_write(Duration::from_secs(30))
+        .build()
+}
+
+/// 往中转发东西时能出的错。
+///
+/// 中转自己说的「不」（`dct_link::LinkError`，是码）跟「根本没说上话」分开：
+/// 前者是对方的判断，该按码翻译给用户；后者是网络，该让连接线程退避重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkError {
+    /// 中转答了，答的是这个码。
+    Relay(dct_link::LinkError),
+    /// 连不上、超时、或者答回来的东西看不懂。
+    Unreachable,
+    /// 收件地址不是合法的端点 id，这一条根本没发出去。
+    BadEndpoint,
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkError::Relay(e) => write!(f, "relay said: {e}"),
+            LinkError::Unreachable => f.write_str("relay unreachable"),
+            LinkError::BadEndpoint => f.write_str("bad endpoint id"),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+/// 中转答非 2xx 时，body 里的码才是真话（见 `dct_link::ErrorBody`）；答不出
+/// 码的一律当成没连上。
+fn classify(e: ureq::Error) -> LinkError {
+    match e {
+        ureq::Error::Status(_, resp) => resp
+            .into_json::<ErrorBody>()
+            .map(|b| LinkError::Relay(b.error))
+            .unwrap_or(LinkError::Unreachable),
+        ureq::Error::Transport(_) => LinkError::Unreachable,
+    }
+}
+
+/// 跟我同账号、此刻在线的其它端点。
+pub fn peers(cfg: &LinkConfig, agent: &ureq::Agent) -> Result<Vec<EndpointId>, LinkError> {
+    let resp = agent
+        .post(&cfg.url(PATH_PEERS))
+        .send_json(cfg.auth())
+        .map_err(classify)?;
+    let body: PeersResponse = resp.into_json().map_err(|_| LinkError::Unreachable)?;
+    Ok(body.online)
+}
+
+/// 投一个信封，不等答复。
+pub fn send(cfg: &LinkConfig, agent: &ureq::Agent, env: Envelope) -> Result<(), LinkError> {
+    agent
+        .post(&cfg.url(PATH_SEND))
+        .send_json(SendRequest {
+            auth: cfg.auth(),
+            envelope: env,
+        })
+        .map(|_| ())
+        .map_err(classify)
+}
+
+/// 投一个信封，挂着等对面配对的答复。
+pub fn ask(cfg: &LinkConfig, agent: &ureq::Agent, env: Envelope) -> Result<Envelope, LinkError> {
+    ask_within(cfg, agent, env, None)
+}
+
+/// 同 `ask`，但整条请求最多等 `timeout`（`None` = 用 agent 自己的读超时）。
+/// 超时算 `Unreachable`：我们这边没等到，说不清是谁的问题。
+pub fn ask_within(
+    cfg: &LinkConfig,
+    agent: &ureq::Agent,
+    env: Envelope,
+    timeout: Option<Duration>,
+) -> Result<Envelope, LinkError> {
+    let mut req = agent.post(&cfg.url(PATH_ASK));
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    let resp = req
+        .send_json(SendRequest {
+            auth: cfg.auth(),
+            envelope: env,
+        })
+        .map_err(classify)?;
+    resp.into_json().map_err(|_| LinkError::Unreachable)
 }
 
 /// 连不上就越等越久，连上了就归零。
@@ -119,32 +244,74 @@ impl Backoff {
 /// 分派一条请求。就是 `daemon.rs` 里那个 `handle`，包成闭包传进来。
 pub type Dispatch = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 
+/// 一个信封进来，回什么 payload 出去；`None` = 什么都不回。
+///
+/// 比 `Dispatch` 低一层：它看得见整个信封（尤其是 `from`），所以能按来的是
+/// 电脑还是手机分流（见 `daemon.rs` 里 mesh 那一段），也能**选择沉默**——
+/// 验不过的电脑信封一个字都不回，免得给伪造者当探针。
+pub type Handler = Arc<dyn Fn(&Envelope) -> Option<Vec<u8>> + Send + Sync>;
+
+/// 每次轮询之前调一下，在连接线程上。给令牌续期这类「偶尔要打一次网络、
+/// 但绝不能进 tick」的活用。
+pub type BeforePoll = Arc<dyn Fn() + Send + Sync>;
+
+/// 把一个 proto 分派包成 `Handler`：解码 `Request` → 分派 → 编码 `Response`。
+/// 这就是 `Link::new` 原来的全部行为。
+pub fn proto_handler(dispatch: Dispatch) -> Handler {
+    Arc::new(move |env: &Envelope| {
+        let resp = match serde_json::from_slice::<Request>(&env.payload) {
+            Ok(req) => dispatch(req),
+            // 跟 socket 那条路一模一样的处理（见 `daemon.rs` 的读循环）：
+            // 解不出来的请求回一句 `BadRequest`，不是断线。
+            Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
+        };
+        Some(serde_json::to_vec(&resp).unwrap_or_else(|e| {
+            serde_json::to_vec(&Response::Error(ErrorCode::Internal(format!(
+                "答复序列化失败：{e}"
+            ))))
+            .unwrap_or_default()
+        }))
+    })
+}
+
 pub struct Link {
     cfg: LinkConfig,
     agent: ureq::Agent,
-    dispatch: Dispatch,
+    handler: Handler,
+    before_poll: Option<BeforePoll>,
     stop: Arc<AtomicBool>,
 }
 
 impl Link {
     pub fn new(cfg: LinkConfig, dispatch: Dispatch) -> Self {
-        let agent = crate::sys::tls::agent_builder()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(cfg.read_timeout())
-            .timeout_write(Duration::from_secs(30))
-            .build();
+        Link::with_handler(cfg, proto_handler(dispatch))
+    }
+
+    pub fn with_handler(cfg: LinkConfig, handler: Handler) -> Self {
+        let agent = agent(&cfg);
         Link {
             cfg,
             agent,
-            dispatch,
+            handler,
+            before_poll: None,
             stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 见 `BeforePoll`。
+    pub fn before_poll(mut self, f: BeforePoll) -> Self {
+        self.before_poll = Some(f);
+        self
     }
 
     /// 一直跑，直到有人叫停。
     pub fn run(&self) {
         let mut backoff = Backoff::new(self.cfg.backoff_start, self.cfg.backoff_max);
         while !self.stop.load(Ordering::Relaxed) {
+            if let Some(f) = &self.before_poll {
+                // 续期炸了不该把这条线一起带走：旧令牌还能用到它过期为止。
+                let _ = catch_unwind(AssertUnwindSafe(|| f()));
+            }
             match self.poll_once() {
                 Ok(Some(env)) => {
                     backoff.reset();
@@ -171,47 +338,27 @@ impl Link {
         Ok(body.envelope)
     }
 
-    /// 处理一个信封，把答复发回去。
+    /// 处理一个信封，把答复发回去（如果有的话）。
     fn answer(&self, env: &Envelope) {
-        let reply = self.reply_to(env);
-        // 发不回去就算了：手机那边的请求会超时，它自己会再问一次。为一条答复
+        let Some(reply) = self.reply_to(env) else {
+            return;
+        };
+        // 发不回去就算了：对面的请求会超时，它自己会再问一次。为一条答复
         // 反复重试，只会让后面积着的请求排更久。
-        let _ = self.send(&reply);
+        let _ = send(&self.cfg, &self.agent, reply);
     }
 
     /// 一个信封进来，该回什么信封出去。**不碰网络**，所以可以直接测。
-    fn reply_to(&self, env: &Envelope) -> Envelope {
-        let resp = match serde_json::from_slice::<Request>(&env.payload) {
-            Ok(req) => (self.dispatch)(req),
-            // 跟 socket 那条路一模一样的处理（见 `daemon.rs` 的读循环）：
-            // 解不出来的请求回一句 `BadRequest`，不是断线。
-            Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
-        };
-        let payload = serde_json::to_vec(&resp).unwrap_or_else(|e| {
-            serde_json::to_vec(&Response::Error(ErrorCode::Internal(format!(
-                "答复序列化失败：{e}"
-            ))))
-            .unwrap_or_default()
-        });
-        Envelope {
+    fn reply_to(&self, env: &Envelope) -> Option<Envelope> {
+        let payload = (self.handler)(env)?;
+        Some(Envelope {
             from: self.cfg.endpoint.clone(),
             to: env.from.clone(),
-            // **原样带回**：这是手机把答复和请求配起来的唯一依据。
+            // **原样带回**：这是对面把答复和请求配起来的唯一依据。
             seq: env.seq,
             payload,
             recipients: vec![],
-        }
-    }
-
-    fn send(&self, env: &Envelope) -> Result<(), ()> {
-        self.agent
-            .post(&self.cfg.url(PATH_SEND))
-            .send_json(SendRequest {
-                auth: self.cfg.auth(),
-                envelope: env.clone(),
-            })
-            .map(|_| ())
-            .map_err(|_| ())
+        })
     }
 
     /// 睡一会儿，但叫停了就别接着睡。
@@ -276,6 +423,14 @@ mod tests {
         /// 还要故意失败几次（任何路径）。
         fail: usize,
         polls: usize,
+        /// 每次轮询带来的令牌，按到达顺序。
+        poll_tokens: Vec<String>,
+        /// `/link/peers` 答什么。
+        peers: Vec<EndpointId>,
+        /// `/link/ask` 答什么：`Ok` = 把这个信封当答复，`Err` = 回这个码。
+        ask: Option<Result<Envelope, dct_link::LinkError>>,
+        /// `/link/ask` 收到的请求。
+        asked: Vec<SendRequest>,
     }
 
     impl FakeSrv {
@@ -329,6 +484,8 @@ mod tests {
 
         let (code, payload) = if path == PATH_POLL {
             st.polls += 1;
+            let auth: AuthFrame = serde_json::from_slice(&body).unwrap();
+            st.poll_tokens.push(auth.token);
             let env = if st.outbox.is_empty() {
                 None
             } else {
@@ -342,6 +499,21 @@ mod tests {
             let req: SendRequest = serde_json::from_slice(&body).unwrap();
             st.got.push(req.envelope);
             (204, String::new())
+        } else if path == PATH_PEERS {
+            (
+                200,
+                serde_json::to_string(&PeersResponse {
+                    online: st.peers.clone(),
+                })
+                .unwrap(),
+            )
+        } else if path == PATH_ASK {
+            st.asked.push(serde_json::from_slice(&body).unwrap());
+            match st.ask.clone() {
+                Some(Ok(env)) => (200, serde_json::to_string(&env).unwrap()),
+                Some(Err(e)) => (409, serde_json::to_string(&ErrorBody { error: e }).unwrap()),
+                None => (404, String::new()),
+            }
         } else {
             (404, String::new())
         };
@@ -499,6 +671,170 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "叫停之后线程该退出，不该等退避睡完"
             );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 通用的 `Handler` 那一层：回复的 `to` 是来信的 `from`，`seq` 原样带回——
+    /// 电脑之间的 `ask` 靠这两样配对，跟手机那一路是同一条规矩。
+    #[test]
+    fn with_handler_replies_with_the_same_seq_to_the_sender() {
+        let srv = FakeSrv::start();
+        srv.state.lock().unwrap().outbox.push(Envelope {
+            from: id("c-aaaa"),
+            to: id("laptop"),
+            seq: 7777,
+            payload: b"ping".to_vec(),
+            recipients: vec![],
+        });
+        let cfg = LinkConfig {
+            backoff_start: Duration::from_millis(20),
+            backoff_max: Duration::from_millis(60),
+            ..LinkConfig::new(srv.base(), id("laptop"), "t")
+        };
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let s = seen.clone();
+        let handle = spawn(Link::with_handler(
+            cfg,
+            Arc::new(move |env: &Envelope| {
+                s.lock().unwrap().push(env.payload.clone());
+                Some(b"pong".to_vec())
+            }),
+        ));
+        let reply = wait_for(|| srv.state.lock().unwrap().got.first().cloned());
+        handle.stop();
+        assert_eq!(seen.lock().unwrap().as_slice(), &[b"ping".to_vec()]);
+        assert_eq!(reply.to, id("c-aaaa"));
+        assert_eq!(reply.from, id("laptop"));
+        assert_eq!(reply.seq, 7777);
+        assert_eq!(reply.payload, b"pong");
+    }
+
+    /// handler 选择沉默时一个字节都不回——验不过的电脑信封就是走这条路。
+    #[test]
+    fn a_handler_that_returns_none_sends_nothing_back() {
+        let srv = FakeSrv::start();
+        {
+            let mut st = srv.state.lock().unwrap();
+            st.outbox.push(letter("c-aaaa", "laptop", &Request::List));
+        }
+        let cfg = LinkConfig {
+            backoff_start: Duration::from_millis(20),
+            backoff_max: Duration::from_millis(60),
+            ..LinkConfig::new(srv.base(), id("laptop"), "t")
+        };
+        let handle = spawn(Link::with_handler(cfg, Arc::new(|_: &Envelope| None)));
+        // 等到信封被取走、再多轮询几次，确保真的没有答复在路上。
+        wait_for(|| (srv.state.lock().unwrap().polls >= 3).then_some(()));
+        handle.stop();
+        assert!(srv.state.lock().unwrap().outbox.is_empty(), "信封该被取走");
+        assert!(srv.state.lock().unwrap().got.is_empty(), "不该回任何东西");
+    }
+
+    /// 令牌续期换的是共享的那一格：轮询线程下一次就带上新令牌，不用重起。
+    /// `before_poll` 也确实在连接线程上、每次轮询之前被调到。
+    #[test]
+    fn a_renewed_token_is_used_by_the_next_poll_and_before_poll_runs() {
+        let srv = FakeSrv::start();
+        let cfg = LinkConfig {
+            backoff_start: Duration::from_millis(20),
+            backoff_max: Duration::from_millis(60),
+            ..LinkConfig::new(srv.base(), id("laptop"), "old")
+        };
+        let token = cfg.token.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let link = Link::with_handler(cfg, Arc::new(|_: &Envelope| None)).before_poll(Arc::new(
+            move || {
+                if c.fetch_add(1, Ordering::SeqCst) == 1 {
+                    token.set("new");
+                }
+            },
+        ));
+        let handle = spawn(link);
+        wait_for(|| {
+            let st = srv.state.lock().unwrap();
+            st.poll_tokens.iter().any(|t| t == "new").then_some(())
+        });
+        handle.stop();
+        let st = srv.state.lock().unwrap();
+        assert_eq!(st.poll_tokens[0], "old");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn peers_returns_what_the_relay_lists() {
+        let srv = FakeSrv::start();
+        srv.state.lock().unwrap().peers = vec![id("c-bbbb"), id("c-cccc")];
+        let cfg = LinkConfig::new(srv.base(), id("c-aaaa"), "t");
+        let got = peers(&cfg, &agent(&cfg)).unwrap();
+        assert_eq!(got, vec![id("c-bbbb"), id("c-cccc")]);
+    }
+
+    #[test]
+    fn ask_returns_the_reply_envelope_and_carries_auth() {
+        let srv = FakeSrv::start();
+        let reply = Envelope {
+            from: id("c-bbbb"),
+            to: id("c-aaaa"),
+            seq: 5,
+            payload: b"answer".to_vec(),
+            recipients: vec![],
+        };
+        srv.state.lock().unwrap().ask = Some(Ok(reply.clone()));
+        let cfg = LinkConfig::new(srv.base(), id("c-aaaa"), "tok");
+        let q = Envelope {
+            from: id("c-aaaa"),
+            to: id("c-bbbb"),
+            seq: 5,
+            payload: b"question".to_vec(),
+            recipients: vec![],
+        };
+        assert_eq!(ask(&cfg, &agent(&cfg), q.clone()).unwrap(), reply);
+        let asked = srv.state.lock().unwrap().asked.clone();
+        assert_eq!(asked[0].envelope, q);
+        assert_eq!(asked[0].auth.token, "tok");
+        assert_eq!(asked[0].auth.endpoint, id("c-aaaa"));
+    }
+
+    /// 中转说「不」的时候，调用方拿到的是它说的那个码，不是笼统的「失败」。
+    #[test]
+    fn a_relay_refusal_comes_back_as_its_code() {
+        let srv = FakeSrv::start();
+        srv.state.lock().unwrap().ask = Some(Err(dct_link::LinkError::Offline));
+        let cfg = LinkConfig::new(srv.base(), id("c-aaaa"), "t");
+        let q = letter("c-aaaa", "c-bbbb", &Request::List);
+        assert_eq!(
+            ask(&cfg, &agent(&cfg), q),
+            Err(LinkError::Relay(dct_link::LinkError::Offline))
+        );
+    }
+
+    #[test]
+    fn a_relay_that_is_not_there_is_unreachable() {
+        // 绑一个口再放掉：这个地址上保证没人听。
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let cfg = LinkConfig::new(format!("http://{addr}"), id("c-aaaa"), "t");
+        let env = letter("c-aaaa", "c-bbbb", &Request::List);
+        assert_eq!(send(&cfg, &agent(&cfg), env), Err(LinkError::Unreachable));
+    }
+
+    #[test]
+    fn the_token_does_not_show_up_in_debug_output() {
+        let cfg = LinkConfig::new("http://x", id("laptop"), "sekrit-token");
+        assert!(!format!("{cfg:?}").contains("sekrit-token"));
+    }
+
+    fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(std::time::Instant::now() < deadline, "等不到");
             std::thread::sleep(Duration::from_millis(20));
         }
     }

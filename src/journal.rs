@@ -123,6 +123,12 @@ impl Journal {
         self.write(&format!("inbound  {d}"));
     }
 
+    /// 多电脑那一路的一件事：丢掉了一个验不过的信封、令牌续期失败……**只记
+    /// 发生了什么和谁发来的，不记内容**——同 `delivered` 的规矩。
+    pub fn mesh(&self, event: &str) {
+        self.write(&format!("mesh  {event}"));
+    }
+
     fn write(&self, line: &str) {
         let guard = self.path.lock().unwrap_or_else(|e| e.into_inner());
         let Some(path) = guard.as_ref() else {

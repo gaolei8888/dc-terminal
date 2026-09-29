@@ -1,6 +1,14 @@
 //! 中转（relay）上跑的消息线上形状：一台电脑发给中转的每一条 JSON 都是一个
-//! `Payload`，`t` 字段说明它是密封留言、加入请求、整份名单，还是「你的加入
-//! 申请还在等别人批」。
+//! `Payload`，`t` 字段说明它是密封留言、加入请求、整份名单、「你的加入申请
+//! 收到了，这是我的随机数」，还是加入方揭晓自己的随机数。
+//!
+//! 加入的三步（先承诺、再揭晓，见 `sas` 模块头）：
+//!
+//! 1. 加入方 → 邀请方：`Join`（自签的成员记录 + 承诺，`ask`）；
+//! 2. 邀请方 → 加入方：`JoinPending`（自签的成员记录 + 新鲜随机数，`ask` 的答复）；
+//! 3. 加入方 → 邀请方：`JoinReveal`（自己的随机数，`send`）。
+//!
+//! 两边都要到第 3 步之后才有数字可亮。
 use crate::canon::field;
 use crate::id;
 use crate::keys::{self, MachineKeys};
@@ -17,7 +25,18 @@ pub enum Payload {
     Sealed(Sealed),
     Join(JoinRequest),
     Roster(SignedRoster),
-    JoinPending { member: Member, sig: String },
+    /// 邀请方的答复：自签的成员记录，和它为这一次加入新出的随机数
+    /// （32 字节，标准 base64）。每收到一次 `Join` 就换一个。
+    JoinPending {
+        member: Member,
+        sig: String,
+        nonce: String,
+    },
+    /// 加入方揭晓 `Join` 里承诺过的随机数（32 字节，标准 base64）。发件
+    /// 端点由中转认证，邀请方按它找到那一条请求。
+    JoinReveal {
+        nonce: String,
+    },
 }
 
 /// 新电脑请求加入组：`member` 是它自己的名单条目（还没被任何人签认），
@@ -28,6 +47,20 @@ pub enum Payload {
 pub struct JoinRequest {
     pub member: Member,
     pub sig: String,
+    /// `sas::commit(member, 我的随机数)`，32 字节，标准 base64。随机数本身
+    /// 等拿到邀请方的随机数之后才在 `JoinReveal` 里给。`sig` 不覆盖它：换掉
+    /// 承诺的人拿不出能打开它的随机数，换了也只是让这一次加入对不上。
+    pub commit: String,
+}
+
+/// 32 字节（随机数、承诺）写成标准 base64。
+pub fn encode32(b: &[u8; 32]) -> String {
+    STANDARD.encode(b)
+}
+
+/// `encode32` 的反面。不是恰好 32 字节的标准 base64 就是 `None`。
+pub fn decode32(s: &str) -> Option<[u8; 32]> {
+    STANDARD.decode(s).ok()?.try_into().ok()
 }
 
 pub fn encode(p: &Payload) -> Vec<u8> {
@@ -118,6 +151,7 @@ mod tests {
         let join = Payload::Join(JoinRequest {
             member: m.clone(),
             sig: "sig".into(),
+            commit: "c".into(),
         });
         assert!(serde_json::to_string(&join)
             .unwrap()
@@ -139,10 +173,17 @@ mod tests {
         let pending = Payload::JoinPending {
             member: m,
             sig: "sig".into(),
+            nonce: "n".into(),
         };
         assert!(serde_json::to_string(&pending)
             .unwrap()
             .contains("\"t\":\"join_pending\""));
+
+        let reveal = Payload::JoinReveal { nonce: "n".into() };
+        assert_eq!(
+            serde_json::to_string(&reveal).unwrap(),
+            r#"{"t":"join_reveal","nonce":"n"}"#
+        );
     }
 
     #[test]
@@ -152,9 +193,19 @@ mod tests {
         let p = Payload::Join(JoinRequest {
             member: m,
             sig: "sig".into(),
+            commit: "c".into(),
         });
         let encoded = encode(&p);
         assert_eq!(decode(&encoded).unwrap(), p);
+    }
+
+    #[test]
+    fn thirty_two_byte_values_round_trip_and_anything_else_is_refused() {
+        let b = [7u8; 32];
+        assert_eq!(decode32(&encode32(&b)), Some(b));
+        assert_eq!(decode32(&STANDARD.encode([7u8; 31])), None);
+        assert_eq!(decode32(&STANDARD.encode([7u8; 33])), None);
+        assert_eq!(decode32("not base64!!"), None);
     }
 
     #[test]

@@ -25,6 +25,15 @@ dct —— vibe coding 终端
   dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
                    后台空着就直接起一个新的
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
+  dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
+  dct join [--name 电脑名]
+                   在新电脑上请求加入，去已有的电脑上核对 6 位数、点同意
+  dct peers        看组里有哪些电脑、开着哪些会话、谁在等批准
+  dct send <电脑名>/<会话名> \"<内容>\"
+                   给另一台电脑上的会话留一句话；会话名也可以写 #编号。
+                   那边空着就马上敲进去，忙就排队
+  dct peers approve <电脑名> [--no]   同意（或拒绝）一台电脑加入
+  dct peers remove <电脑名>           把一台电脑移出组
   dct daemon       只跑守护进程，不开界面
   dct gate         远程版那道门：守着一个端口，只放带对钥匙的人进去。
                    默认只绑环回，要给别的机器用得显式 --bind，
@@ -108,6 +117,10 @@ fn main() -> Result<()> {
         // 通路，跟会话、pty 都无关。
         Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
             std::process::exit(dct::cli::llm_check(cli_lang()))
+        }
+        // 多电脑。真正的事都在守护进程里做，这里只把话说给人听。
+        Some("login") | Some("join") | Some("peers") | Some("send") => {
+            std::process::exit(dct::mesh::cli::run(&args))
         }
         Some("--help") | Some("-h") => {
             println!("{HELP}");

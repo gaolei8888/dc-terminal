@@ -281,4 +281,29 @@ mod tests {
         // now = 0: any exp in the vector (a 2025 date) is safely in the future.
         assert_eq!(verify(token, &[issuer_pub], 0), Ok(claims));
     }
+
+    /// 网关（dc_llm，Python）用**生产**签名钥匙签的一张探针令牌，在这里用
+    /// dct-mesh 的 `verify` 验：两边各自的实现对同一份契约是否真的一致，只有
+    /// 拿对面真签出来的东西来验才算数。钥匙是公钥（`--relay-keys` 里那一行），
+    /// 不是秘密；私钥只在网关的部署环境里。换了生产钥匙，这条就该跟着换。
+    #[test]
+    fn a_probe_token_signed_by_the_production_gateway_key_verifies() {
+        let prod_pub_b64 =
+            "BNEgy8UH1Twciieycr/xRP4lYu/Ks9nRwCbLGLeoCRvcis56hMc42dLDKVgg6/iSdg2RT+az0KqAFwznrDb5Ze0=";
+        let raw = STANDARD.decode(prod_pub_b64).expect("valid base64");
+        let mut prod_pub = [0u8; 65];
+        prod_pub.copy_from_slice(&raw);
+
+        let token = "eyJhY2NvdW50IjoidXNyXzAxUFJPQkUiLCJlbmRwb2ludCI6ImMtMDAxMTIyMzM0NDU1NjY3Nzg4OWEiLCJleHAiOjQxMDI0NDQ4MDAsInNpZyI6IkZsclBJbGpkTlpPN1J3NGlSTFZHYTdkRzMwN2lmdDNkZmV6SW93ZERJM2QwZzZralBlanRXMWhtcTlrWG84VHBjKzRGckJzSE1KYm5KdmZzUG80VmZBPT0ifQ";
+        let claims = Claims {
+            account: "usr_01PROBE".into(),
+            endpoint: "c-0011223344556677889a".into(),
+            exp: 4_102_444_800,
+        };
+        assert_eq!(verify(token, &[prod_pub], 1_790_000_000), Ok(claims));
+
+        // 同一张令牌换一把别的公钥就过不了——上面那条不是「什么都放行」。
+        let (_, other) = issuer(7);
+        assert!(verify(token, &[other], 1_790_000_000).is_err());
+    }
 }

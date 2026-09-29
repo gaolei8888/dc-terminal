@@ -55,6 +55,8 @@ project `n` opens in.
   path.
 - **[No more "press `g`"](#it-never-asks-is-this-okay).** A folder that isn't a
   git repository becomes one by itself, and a machine without git is offered it.
+- **[Several computers](#several-computers).** Agents on different machines
+  leave each other messages; the relay can't read them.
 - **[Publish a live session to a fixed address](#live-to-a-room).** `p` in the
   live panel puts it on the relay's public list.
 - **[dct in a browser](#dct-in-a-browser),** for machines that can't install
@@ -814,6 +816,88 @@ your terminal.**
   allow **`/live/*` and the public listing page `/`, and nothing else**. To enable
   "publish to a fixed address," the operator also issues and installs a publish
   key with `dct-srv key add`/`--publish-keys`.
+
+## Several computers
+
+A Mac at home, a Windows box at work, a few agents on each: let them leave each
+other messages. A session on one computer can drop a line into a session on
+another, typed straight in if that session is idle.
+
+```
+dct login                       # on every computer: sign in with the DC account
+dct join --name work-pc         # on the new one: ask to join (and name it)
+dct peers                       # on an existing one: who is waiting
+dct peers approve work-pc       # compare the 6 digits, approve
+dct peers                       # who is in the group, what each has open
+dct send home-mac/#3 "run the Windows tests"
+```
+
+- **Sign in**: `dct login` trades the paired DC account for a relay token, kept on
+  that computer only. The first computer to sign in creates the group.
+- **Joining takes a look at both screens**: `dct join` on the new computer lists
+  the online ones with a 6-digit number; `dct peers` on the old one shows the same
+  number. Only if they match — confirm on the new side, approve on the old side —
+  is the new computer in. A mismatch means something in the middle is lying. The
+  board's "my computers" strip shows the same prompt and takes `y`/`n`.
+- **Messages**: `dct send <computer>/<session> "<text>"`, the session can be `#id`.
+  The other side sees a marker line (`[来自 home-mac/docs 的留言 #a1b2]`) and then
+  the text. Idle session: typed now. Busy: queued, one at a time.
+- **The relay can't read them**: sealed on your computer for the one recipient;
+  the relay forwards, never writes to disk, and sees ciphertext only.
+- The relay defaults to `https://dataclue.cn/dct-relay`; override with
+  `[mesh] relay = "…"` in `~/.dct/config.toml`.
+
+**Not yet:**
+
+- the other computer offline → not sent (you are told); nothing is held for later;
+- only agent sessions receive, not plain terminal sessions;
+- queued messages and pending join requests are lost when the daemon restarts;
+- two old computers approving different newcomers at once can fork the group list,
+  and an offline computer misses list changes;
+- two brand-new computers joining each other at the same time is undefined — one
+  at a time;
+- you can't open another computer's session yet — that's the next step.
+
+### Deploying
+
+Both the gateway and the relay have to be on. **This is the go-live checklist;
+running it is going live, so check with whoever owns the servers first.**
+
+1. **Gateway** (dc_llm): implements `POST /admin/api/relay/token` per the design
+   appendix (done). Turn the flag on — its real name in the gateway is
+   **`DC_ADMIN_RELAY_TOKENS_ENABLED`** (the design doc writes
+   `DC_RELAY_TOKENS_ENABLED`; same thing) — with the signing key in
+   `DC_ADMIN_RELAY_SIGNING_KEY`. `python -m scripts.relay_signing_key show`
+   prints the public key, one base64 line.
+2. **Reverse proxy**: add `/dct-relay` on dataclue.cn with the existing TLS cert.
+   Pass only `/dct-relay/link/*`, prefix stripped, to the relay below —
+   `--with-link` also mounts `/phone`, which this doesn't need; keep it closed.
+3. **Relay**: put the public key in `/etc/dct-srv/gateway.pub` (one key per line;
+   to rotate, add the new line first, wait for it to take effect, then switch the
+   gateway's private key) and run
+
+   ```
+   dct-srv 127.0.0.1:<port> --with-link --relay-keys /etc/dct-srv/gateway.pub
+   ```
+
+   The address is the **first argument** — there is no `serve` subcommand and no
+   `--addr`. The relay still listens on loopback only; public traffic comes in
+   through the proxy.
+4. **Check**: two real computers (a Mac and a Windows) go through `dct login` →
+   `dct join` → `dct peers approve` → `dct send`, and the message shows up.
+5. **Check multi-line messages in real agents** (not verified yet): on the Windows
+   box, `dct send` a two-line message into a Claude Code session and into a Codex
+   session. Each must arrive as **one** turn — the marker line and both body lines
+   together. If an agent submits at the first line break, the marker goes in alone
+   and the body arrives as an unmarked turn the agent will take as the user's own
+   words: stop the go-live and wrap the typed text in bracketed paste
+   (`ESC[200~ … ESC[201~`) for that agent first. Record the result in the ledger.
+
+To try the whole thing on one machine, no gateway, no internet:
+`cargo test --test mesh_e2e -- --ignored --nocapture` starts a real relay and two
+separate daemons, signs test tokens with `dct-srv token keygen`/`token mint` in
+place of the gateway, walks login → join → approve → peers → send, and checks the
+relay's output never contains the message text.
 
 ## dct in a browser
 
