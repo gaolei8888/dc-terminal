@@ -60,6 +60,32 @@ pub const JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60
 /// 核对的那条请求挤出去，再换上一条同名的冒牌货。
 const MAX_PENDING: usize = 16;
 
+/// 一段 `JOIN_TTL` 里最多亮出几个核对数字（每一次加入方揭晓随机数、承诺
+/// 验过，就亮一个）。
+///
+/// 数字是 6 位的：中转冒充一台电脑，每试一次有一百万分之一的机会让这边亮出
+/// 跟新电脑屏幕上一样的数字。不设上限，它可以一秒钟试几百次，在用户盯着
+/// 屏幕的那一两分钟里把一百万次试完。设了上限，一个加入窗口里它最多猜这么
+/// 几次；正常用一次 `dct join` 只亮一个。
+pub const MAX_CODES_PER_TTL: usize = 20;
+
+/// 这台电脑是邀请方时，一条等人批准的加入请求。
+#[derive(Debug, Clone)]
+pub struct PendingReq {
+    pub req: JoinRequest,
+    /// 加入方在 `Join` 里交的承诺（`sas::commit`），已经解出来的 32 字节。
+    commit: [u8; 32],
+    /// 我为这一次出的随机数（在 `JoinPending` 里回给了对方）。
+    nonce: sas::Nonce,
+    /// 回 `JoinPending` 时我自己的成员记录。数字按这一份算，免得中间改了
+    /// 名、换了名单之后两边算的不是同一份。
+    mine: Member,
+    /// 加入方揭晓了随机数、承诺对得上之后才有：屏幕上的 6 位数。没有之前
+    /// 这条请求不给用户看，也批不了。
+    pub code: Option<String>,
+    pub at: Instant,
+}
+
 /// 新电脑这边：一台回过我 `JoinPending` 的已有电脑。
 #[derive(Debug, Clone)]
 pub struct Invite {
@@ -132,8 +158,10 @@ pub struct Mesh {
     pub keys: MachineKeys,
     pub me: Member,
     pub roster: Option<SignedRoster>,
-    /// 等人批准的加入请求：请求、6 位核对码、收到的时间。
-    pub pending_joins: Vec<(JoinRequest, String, Instant)>,
+    /// 等人批准的加入请求。
+    pub pending_joins: Vec<PendingReq>,
+    /// 最近亮出核对数字的时刻（`MAX_CODES_PER_TTL`）。
+    codes_shown: VecDeque<Instant>,
     /// 这台电脑自己在请求加入：回过我 `JoinPending` 的已有电脑，和我给它
     /// 算的 6 位数。
     pub invites: Vec<Invite>,
@@ -186,6 +214,7 @@ impl Mesh {
             me,
             roster,
             pending_joins: Vec::new(),
+            codes_shown: VecDeque::new(),
             invites: Vec::new(),
             confirmed: None,
             held: Vec::new(),
@@ -279,6 +308,7 @@ impl Mesh {
             // `JoinPending` 只该作为 `ask` 的答复回来（`group::join` 在那里
             // 读它），不该从轮询里进来。
             Payload::JoinPending { .. } => Step::Done(self.drop(env, "unasked_join_pending")),
+            Payload::JoinReveal { nonce } => Step::Done(self.take_reveal(env, &nonce)),
         }
     }
 
@@ -346,12 +376,20 @@ impl Mesh {
         Ok(())
     }
 
-    /// 这台电脑请求加入时发出去的那一份：自己的成员记录，自己签名。
-    pub fn join_request(&self) -> JoinRequest {
+    /// 这台电脑请求加入时发出去的那一份：自己的成员记录，自己签名，外加对
+    /// `nonce` 的承诺（`sas::commit`）。`nonce` 每问一台电脑就另出一个，等
+    /// 那台回了它的随机数再揭晓。
+    pub fn join_request(&self, nonce: &sas::Nonce) -> JoinRequest {
         JoinRequest {
             member: self.me.clone(),
             sig: wire::sign_member(&self.me, &self.keys),
+            commit: wire::encode32(&sas::commit(&self.me, nonce)),
         }
+    }
+
+    /// 一个新的一次性随机数。
+    pub(crate) fn fresh_nonce(&self) -> sas::Nonce {
+        (self.rand)()
     }
 
     /// 换上一份已经验过的名单：先落盘，再换内存。存不下就不换（理由见
@@ -364,7 +402,7 @@ impl Mesh {
             self.me = mine.clone();
         }
         self.pending_joins
-            .retain(|(j, _, _)| r.roster.member(&j.member.endpoint).is_none());
+            .retain(|p| r.roster.member(&p.req.member.endpoint).is_none());
         self.roster = Some(r);
         // 被移出组的电脑，它排着队的留言也一起作废。
         self.purge_non_members();
@@ -373,12 +411,13 @@ impl Mesh {
 
     /// 扔掉过期的加入请求。
     pub fn prune_pending(&mut self) {
-        self.pending_joins.retain(|(_, _, t)| t.elapsed() < JOIN_TTL);
+        self.pending_joins.retain(|p| p.at.elapsed() < JOIN_TTL);
     }
 
     /// 一台电脑想加入：验它的自签名、确认它说的端点就是中转认证过的发件
-    /// 端点，算出 6 位数挂起来等用户批，回一份我自己的自签成员记录——对方
-    /// 拿它算同一个 6 位数。
+    /// 端点，记下它的承诺，出一个新鲜的随机数，回一份我自己的自签成员记录
+    /// 加这个随机数。**这时还没有数字**：要等它揭晓自己的随机数
+    /// （`take_reveal`）。
     ///
     /// **这里不改名单。** 进名单只有一条路：用户看过两边的数字之后批准
     /// （`group::approve`）。
@@ -397,24 +436,76 @@ impl Mesh {
         if current.roster.member(&req.member.endpoint).is_some() {
             return self.drop(env, "join_already_member");
         }
-        let code = sas::code(&self.me, &req.member);
+        let Some(commit) = wire::decode32(&req.commit) else {
+            return self.drop(env, "join_bad_commit");
+        };
         self.prune_pending();
         let again = self
             .pending_joins
             .iter()
-            .any(|(j, _, _)| j.member.endpoint == req.member.endpoint);
+            .any(|p| p.req.member.endpoint == req.member.endpoint);
         if !again && self.pending_joins.len() >= MAX_PENDING {
             return self.drop(env, "join_pending_full");
         }
+        // 同一台再问一次（重跑了 `dct join`）：旧的那条连同它的数字一起作废，
+        // 这一次换新的随机数。
         self.pending_joins
-            .retain(|(j, _, _)| j.member.endpoint != req.member.endpoint);
+            .retain(|p| p.req.member.endpoint != req.member.endpoint);
+        let nonce = self.fresh_nonce();
+        let mine = self.me.clone();
+        self.journal.mesh(&format!("join_asked from={}", env.from));
+        self.pending_joins.push(PendingReq {
+            req,
+            commit,
+            nonce,
+            mine: mine.clone(),
+            code: None,
+            at: Instant::now(),
+        });
+        Some(wire::encode(&Payload::JoinPending {
+            sig: wire::sign_member(&mine, &self.keys),
+            member: mine,
+            nonce: wire::encode32(&nonce),
+        }))
+    }
+
+    /// 加入方揭晓随机数：跟它在 `Join` 里的承诺对得上，才算出 6 位数、让
+    /// 这条请求出现在用户面前。对不上的整条扔掉——那是有人在中间换东西。
+    fn take_reveal(&mut self, env: &Envelope, nonce: &str) -> Option<Vec<u8>> {
+        self.prune_pending();
+        let Some(i) = self
+            .pending_joins
+            .iter()
+            .position(|p| p.req.member.endpoint == env.from.as_str())
+        else {
+            return self.drop(env, "reveal_without_join");
+        };
+        if self.pending_joins[i].code.is_some() {
+            return self.drop(env, "reveal_again");
+        }
+        let p = &self.pending_joins[i];
+        let Some(n) = wire::decode32(nonce).filter(|n| sas::opens(&p.commit, &p.req.member, n))
+        else {
+            self.pending_joins.remove(i);
+            return self.drop(env, "reveal_does_not_open");
+        };
+        while self
+            .codes_shown
+            .front()
+            .is_some_and(|t| t.elapsed() >= JOIN_TTL)
+        {
+            self.codes_shown.pop_front();
+        }
+        if self.codes_shown.len() >= MAX_CODES_PER_TTL {
+            self.pending_joins.remove(i);
+            return self.drop(env, "reveal_rate_limited");
+        }
+        self.codes_shown.push_back(Instant::now());
+        let code = sas::code(&p.mine, &p.req.member, &p.nonce, &n);
+        self.pending_joins[i].code = Some(code);
         self.journal
             .mesh(&format!("join_pending from={}", env.from));
-        self.pending_joins.push((req, code, Instant::now()));
-        Some(wire::encode(&Payload::JoinPending {
-            member: self.me.clone(),
-            sig: wire::sign_member(&self.me, &self.keys),
-        }))
+        None
     }
 
     /// 换一批回过话的电脑（新的一次 `dct join`）。之前认定的、存着的都作废。

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use dct_mesh::roster::{self, Roster};
 use dct_mesh::sas;
-use dct_mesh::wire::{self, Payload};
+use dct_mesh::wire::{self, JoinRequest, Payload};
 
 use super::deliver::clean_name;
 use super::net::Net;
@@ -54,13 +54,16 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
         endpoint: me,
         in_group: m.roster.is_some(),
         members,
+        // 还没揭晓随机数的不给用户看：没有数字可核对。
         pending: m
             .pending_joins
             .iter()
-            .map(|(j, code, _)| PendingJoin {
-                name: clean_name(&j.member.name),
-                endpoint: j.member.endpoint.clone(),
-                code: code.clone(),
+            .filter_map(|p| {
+                Some(PendingJoin {
+                    name: clean_name(&p.req.member.name),
+                    endpoint: p.req.member.endpoint.clone(),
+                    code: p.code.clone()?,
+                })
             })
             .collect(),
         joining: joining(&m),
@@ -82,6 +85,10 @@ fn joining(m: &Mesh) -> Vec<PendingJoin> {
 /// 新电脑请求加入：`name` 非空就先改名；问一遍每台在线的电脑，把回了
 /// `JoinPending` 的记下来（`Mesh::invites`），返回每台的 6 位数。
 ///
+/// 先承诺、再揭晓（`dct_mesh::sas` 模块头）：给每台电脑各出一个随机数，
+/// `Join` 里只带对它的承诺；那台回了自己的随机数，我这边才算得出数字，
+/// 再把我的随机数揭晓给它（`JoinReveal`），它那边也才算得出来。
+///
 /// **这一步还不认任何一台。** 回话的电脑谁都可能是中转塞进来的；要等用户
 /// 看过那边屏幕上的数字、说出是哪一台（`confirm`），那一台签的名单才收。
 ///
@@ -92,7 +99,7 @@ pub fn join(
     net: &dyn Net,
     name: Option<&str>,
 ) -> Result<Vec<PendingJoin>, MeshProblem> {
-    let req = {
+    {
         let mut m = lock(mesh);
         if !m.is_alone() {
             return Err(MeshProblem::AlreadyInGroup);
@@ -100,41 +107,90 @@ pub fn join(
         if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
             m.rename(n)?;
         }
-        m.join_request()
-    };
+    }
     let peers = net.peers().unwrap_or_default();
-    let payload = wire::encode(&Payload::Join(req));
-    // 并排问：对方回得快，但真网络上有一台卡住不该拖着别的。
-    let replies: Vec<(String, Vec<u8>)> = std::thread::scope(|s| {
-        let asks: Vec<_> = peers
+    // 每台一个随机数、一份承诺。同一个随机数给好几台用的话，揭晓给第一台
+    // 之后中转就知道了它，还没回话的那几台可以等看过它再编答复。
+    let asks: Vec<(String, sas::Nonce, JoinRequest)> = {
+        let m = lock(mesh);
+        peers
             .iter()
             .map(|p| {
-                let payload = payload.clone();
-                s.spawn(move || (p.clone(), net.ask(p, payload, JOIN_ASK_TIMEOUT)))
+                let n = m.fresh_nonce();
+                (p.clone(), n, m.join_request(&n))
+            })
+            .collect()
+    };
+    // 并排问：对方回得快，但真网络上有一台卡住不该拖着别的。
+    let replies: Vec<(String, sas::Nonce, JoinRequest, Vec<u8>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = asks
+            .into_iter()
+            .map(|(p, n, req)| {
+                s.spawn(move || {
+                    let r = net.ask(
+                        &p,
+                        wire::encode(&Payload::Join(req.clone())),
+                        JOIN_ASK_TIMEOUT,
+                    );
+                    (p, n, req, r)
+                })
             })
             .collect();
-        asks.into_iter()
+        hs.into_iter()
             .filter_map(|h| h.join().ok())
-            .filter_map(|(p, r)| r.ok().map(|b| (p, b)))
+            .filter_map(|(p, n, req, r)| r.ok().map(|b| (p, n, req, b)))
             .collect()
     });
 
-    let mut m = lock(mesh);
-    let mut found = Vec::new();
-    for (peer, bytes) in replies {
-        match wire::decode(&bytes) {
-            Ok(Payload::JoinPending { member, sig })
-                if member.endpoint == peer
-                    && wire::verify_member(&member, &sig)
-                    && super::valid_name(&member.name) =>
-            {
-                let code = sas::code(&m.me, &member);
-                found.push((member, code));
+    // 算数字、记下邀请，**然后**才揭晓：对方一收到揭晓就可能亮数字、用户
+    // 就可能点同意、名单就可能送过来——那时这边得已经认得它是回过话的。
+    let reveals: Vec<(String, Vec<u8>)> = {
+        let mut m = lock(mesh);
+        let mut found = Vec::new();
+        let mut reveals = Vec::new();
+        for (peer, mine, req, bytes) in replies {
+            match wire::decode(&bytes) {
+                Ok(Payload::JoinPending { member, sig, nonce })
+                    if member.endpoint == peer
+                        && wire::verify_member(&member, &sig)
+                        && super::valid_name(&member.name) =>
+                {
+                    let Some(theirs) = wire::decode32(&nonce) else {
+                        m.journal.mesh(&format!("join_bad_reply from={peer}"));
+                        continue;
+                    };
+                    let code = sas::code(&member, &req.member, &theirs, &mine);
+                    found.push((member, code));
+                    let reveal = Payload::JoinReveal {
+                        nonce: wire::encode32(&mine),
+                    };
+                    reveals.push((peer, wire::encode(&reveal)));
+                }
+                _ => m.journal.mesh(&format!("join_bad_reply from={peer}")),
             }
-            _ => m.journal.mesh(&format!("join_bad_reply from={peer}")),
         }
+        m.set_invites(found);
+        reveals
+    };
+
+    // 并排揭晓（`mesh::worst_case` 只算一次 `send` 的时间）。揭晓没送到的
+    // 那台，它那边永远亮不出数字：这边也别给用户看它的数字。
+    let undelivered: Vec<String> = std::thread::scope(|s| {
+        let hs: Vec<_> = reveals
+            .iter()
+            .map(|(p, payload)| s.spawn(move || (p.clone(), net.send(p, payload.clone()))))
+            .collect();
+        hs.into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter_map(|(p, r)| r.err().map(|_| p))
+            .collect()
+    });
+    let mut m = lock(mesh);
+    for p in &undelivered {
+        m.journal.mesh(&format!("join_reveal_not_delivered to={p}"));
     }
-    m.set_invites(found);
+    m.invites
+        .retain(|i| !undelivered.contains(&i.member.endpoint));
     if m.invites.is_empty() {
         return Err(MeshProblem::NoOneAnswered);
     }
@@ -164,17 +220,18 @@ pub fn approve(
     let (name, payload, to) = {
         let mut m = lock(mesh);
         m.prune_pending();
+        // 还没有数字的（加入方还没揭晓）用户根本没看到过，不算一条可批的请求。
         let Some(i) = m
             .pending_joins
             .iter()
-            .position(|(j, _, _)| j.member.endpoint == endpoint)
+            .position(|p| p.req.member.endpoint == endpoint && p.code.is_some())
         else {
             return Err(MeshProblem::NoSuchRequest(endpoint.to_string()));
         };
-        if yes && m.pending_joins[i].1 != code {
+        if yes && m.pending_joins[i].code.as_deref() != Some(code) {
             return Err(MeshProblem::CodeMismatch);
         }
-        let joiner = m.pending_joins[i].0.member.clone();
+        let joiner = m.pending_joins[i].req.member.clone();
         if !yes {
             m.pending_joins.remove(i);
             m.journal
@@ -366,6 +423,26 @@ mod tests {
         }
     }
 
+    /// 不走 `join()`，手工走完加入的三步：`Join`（带承诺）→ 对方回
+    /// `JoinPending` → 揭晓随机数。返回对方回没回话。
+    fn raw_join(from: &Node, to: &str) -> bool {
+        let n = from.mesh.lock().unwrap().fresh_nonce();
+        let req = from.mesh.lock().unwrap().join_request(&n);
+        match from
+            .net
+            .ask(to, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT)
+        {
+            Ok(_) => {
+                let reveal = Payload::JoinReveal {
+                    nonce: wire::encode32(&n),
+                };
+                from.net.send(to, wire::encode(&reveal)).unwrap();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// A 建组、B 加入、A 批准。
     fn ab(hub: &Arc<FakeHub>) -> (Node, Node) {
         let a = Node::new(hub, 1, "A");
@@ -408,8 +485,7 @@ mod tests {
         assert_eq!(codes.len(), 1);
         assert_eq!(codes[0].endpoint, a.ep);
         assert_eq!(codes[0].name, "A");
-        let expected = sas::code(&b.me(), &a.me());
-        assert_eq!(codes[0].code, expected);
+        let expected = codes[0].code.clone();
         let pending = a.view().pending;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "B");
@@ -434,7 +510,9 @@ mod tests {
         assert_eq!(codes.len(), 2);
         for code in &codes {
             let other = if code.endpoint == a.ep { &a } else { &b };
-            assert_eq!(code.code, sas::code(&c.me(), &other.me()));
+            let shown = other.view().pending;
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].code, code.code, "两边屏幕上的数字一样");
         }
         assert_eq!(a.view().pending.len(), 1);
         assert_eq!(b.view().pending.len(), 1);
@@ -527,6 +605,7 @@ mod tests {
         let forged = JoinRequest {
             member: b.me(),
             sig: wire::sign_member(&b.me(), &keys(9)),
+            commit: wire::encode32(&sas::commit(&b.me(), &[1; 32])),
         };
         let r = m.net.ask(
             &a.ep,
@@ -539,6 +618,7 @@ mod tests {
         let bad_sig = JoinRequest {
             member: b.me(),
             sig: wire::sign_member(&b.me(), &keys(9)),
+            commit: wire::encode32(&sas::commit(&b.me(), &[1; 32])),
         };
         let r = b.net.ask(
             &a.ep,
@@ -548,7 +628,7 @@ mod tests {
         assert!(r.is_err(), "签名不对，不回");
 
         // B 的真签名，但从冒充者的端点发来。
-        let replayed = b.mesh.lock().unwrap().join_request();
+        let replayed = b.mesh.lock().unwrap().join_request(&[1; 32]);
         let r = m.net.ask(
             &a.ep,
             wire::encode(&Payload::Join(replayed)),
@@ -562,7 +642,7 @@ mod tests {
     fn a_join_from_a_member_or_a_machine_without_a_group_gets_no_answer() {
         let hub = FakeHub::new();
         let (a, b) = ab(&hub);
-        let again = b.mesh.lock().unwrap().join_request();
+        let again = b.mesh.lock().unwrap().join_request(&[1; 32]);
         assert!(b
             .net
             .ask(&a.ep, wire::encode(&Payload::Join(again)), JOIN_ASK_TIMEOUT)
@@ -572,7 +652,7 @@ mod tests {
         // 没登录（没组）的电脑不回 `JoinPending`。
         let lone = Node::new(&hub, 5, "L");
         let x = Node::new(&hub, 6, "X");
-        let req = x.mesh.lock().unwrap().join_request();
+        let req = x.mesh.lock().unwrap().join_request(&[1; 32]);
         assert!(x
             .net
             .ask(
@@ -619,6 +699,7 @@ mod tests {
             reply: wire::encode(&Payload::JoinPending {
                 sig: wire::sign_member(&m_me, &keys(9)),
                 member: m_me,
+                nonce: wire::encode32(&[3; 32]),
             }),
         };
         b.login();
@@ -632,6 +713,7 @@ mod tests {
             reply: wire::encode(&Payload::JoinPending {
                 sig: wire::sign_member(&a_me, &keys(9)),
                 member: a_me,
+                nonce: wire::encode32(&[3; 32]),
             }),
         };
         assert_eq!(join(&b.mesh, &net, None), Err(MeshProblem::NoOneAnswered));
@@ -646,7 +728,7 @@ mod tests {
         let (a, b) = ab(&hub);
         let m = Node::new(&hub, 9, "M");
         m.login();
-        let code = sas::code(&b.me(), &m.me());
+        let code = "000000".to_string();
         {
             let mut bm = b.mesh.lock().unwrap();
             bm.set_invites(vec![(m.me(), code)]);
@@ -683,10 +765,7 @@ mod tests {
         a.login();
         for seed in 10..(10 + super::super::MAX_PENDING as u8 + 3) {
             let n = Node::new(&hub, seed, &format!("n{seed}"));
-            let req = n.mesh.lock().unwrap().join_request();
-            let _ = n
-                .net
-                .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT);
+            raw_join(&n, &a.ep);
         }
         assert_eq!(a.view().pending.len(), super::super::MAX_PENDING);
     }
@@ -1056,13 +1135,10 @@ mod tests {
         let cap = super::super::MAX_PENDING;
         for seed in 10..(10 + cap as u8 + 5) {
             let n = Node::new(&hub, seed, &format!("n{seed}"));
-            let req = n.mesh.lock().unwrap().join_request();
-            let _ = n
-                .net
-                .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT);
+            raw_join(&n, &a.ep);
         }
         let impostor = Node::new(&hub, 99, "B");
-        let req = impostor.mesh.lock().unwrap().join_request();
+        let req = impostor.mesh.lock().unwrap().join_request(&[1; 32]);
         assert!(
             impostor
                 .net
@@ -1076,12 +1152,22 @@ mod tests {
         assert!(!pending.iter().any(|p| p.endpoint == impostor.ep));
 
         // 已经挂着的那台再问一次（比如重跑 dct join）：表满也照样更新。
+        // 两边出的随机数都换了新的，所以数字也换了：上一次看过的那个作废。
         b.join().unwrap();
-        assert_eq!(a.view().pending.len(), cap);
+        let pending = a.view().pending;
+        assert_eq!(pending.len(), cap);
+        let now = pending.iter().find(|p| p.endpoint == b.ep).unwrap().clone();
 
         b.confirm(&a).unwrap();
+        if now.code != shown.code {
+            assert_eq!(
+                approve(&a.mesh, &a.net, &shown.endpoint, &shown.code, true),
+                Err(MeshProblem::CodeMismatch),
+                "上一次的数字批不了这一次的请求"
+            );
+        }
         assert_eq!(
-            approve(&a.mesh, &a.net, &shown.endpoint, &shown.code, true).unwrap(),
+            approve(&a.mesh, &a.net, &now.endpoint, &now.code, true).unwrap(),
             "B"
         );
         assert_eq!(b.names(), ["A", "B"]);
@@ -1194,5 +1280,207 @@ mod tests {
         let v = view(&mesh, &hub.net_for(&me.endpoint), true);
         let names: Vec<&str> = v.members.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"Bx"), "{names:?}");
+    }
+
+    // —— C1：先承诺、再揭晓 ——
+
+    /// 可预测的随机数：第 i 次给 `[seed, i, i, …]`。让「中转猜中的概率」
+    /// 这类测试每次跑出来都一样。
+    fn counter_rand(seed: u8) -> impl Fn() -> [u8; 32] + Send + 'static {
+        let i = std::sync::atomic::AtomicU8::new(0);
+        move || {
+            let k = i.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut b = [k; 32];
+            b[0] = seed;
+            b
+        }
+    }
+
+    /// 邀请方在加入方揭晓随机数、承诺验过之前不亮数字、也批不了；揭晓的
+    /// 随机数打不开承诺，整条请求作废。
+    #[test]
+    fn the_inviter_shows_no_code_until_the_reveal_opens_the_commitment() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+
+        let n = [7u8; 32];
+        let req = b.mesh.lock().unwrap().join_request(&n);
+        let reply = b
+            .net
+            .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT)
+            .unwrap();
+        assert!(matches!(
+            wire::decode(&reply),
+            Ok(Payload::JoinPending { .. })
+        ));
+        assert!(a.view().pending.is_empty(), "还没揭晓，没有数字可给人看");
+        assert_eq!(
+            approve(&a.mesh, &a.net, &b.ep, "", true),
+            Err(MeshProblem::NoSuchRequest(b.ep.clone())),
+            "没亮过数字的请求批不了"
+        );
+
+        // 揭晓一个别的随机数：打不开承诺，整条扔掉。
+        let wrong = Payload::JoinReveal {
+            nonce: wire::encode32(&[8u8; 32]),
+        };
+        b.net.send(&a.ep, wire::encode(&wrong)).unwrap();
+        assert!(a.view().pending.is_empty());
+        // 再揭晓对的也晚了：那一条已经没了。
+        let right = Payload::JoinReveal {
+            nonce: wire::encode32(&n),
+        };
+        b.net.send(&a.ep, wire::encode(&right)).unwrap();
+        assert!(a.view().pending.is_empty());
+
+        // 重新来一遍、揭晓对的：有数字了。
+        assert!(raw_join(&b, &a.ep));
+        assert_eq!(a.view().pending.len(), 1);
+    }
+
+    /// 同一个随机数揭晓两次，第二次不改数字。
+    #[test]
+    fn a_second_reveal_does_not_change_the_code() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+        b.join().unwrap();
+        let first = a.view().pending[0].code.clone();
+        let again = Payload::JoinReveal {
+            nonce: wire::encode32(&[9u8; 32]),
+        };
+        b.net.send(&a.ep, wire::encode(&again)).unwrap();
+        assert_eq!(a.view().pending[0].code, first);
+    }
+
+    /// 审查的 C1 攻击，整条走一遍：
+    ///
+    /// 1. 中转截住 B 的 `Join`，拿一份 A 以前答过别人的、真的 `JoinPending`
+    ///    回放给 B。B 屏幕上亮出 `target`。
+    /// 2. 中转自己造一台 X（名字也叫 B），一次又一次地向 A 请求加入，想让
+    ///    A 亮出跟 `target` 一样的数字。
+    ///
+    /// 每一次它都得先交承诺、才拿到 A 新出的随机数，所以每一次都只是一次
+    /// 瞎猜；而且一个加入窗口里 A 最多亮 `MAX_CODES_PER_TTL` 次。
+    #[test]
+    fn a_relay_cannot_make_the_inviter_show_the_code_the_joiner_sees() {
+        struct Replay {
+            peer: String,
+            reply: Vec<u8>,
+        }
+        impl Net for Replay {
+            fn peers(&self) -> Result<Vec<String>, crate::link::LinkError> {
+                Ok(vec![self.peer.clone()])
+            }
+            // 中转把 B 的揭晓吞掉：A 永远见不到 B。
+            fn send(&self, _: &str, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                Ok(())
+            }
+            fn ask(
+                &self,
+                _: &str,
+                _: Vec<u8>,
+                _: Duration,
+            ) -> Result<Vec<u8>, crate::link::LinkError> {
+                Ok(self.reply.clone())
+            }
+        }
+        let hub = FakeHub::new();
+        let a = Node::with_mesh(
+            &hub,
+            Mesh::new(keys(1), "A".into(), None).with_rand(counter_rand(0xA0)),
+        );
+        let b = Node::with_mesh(
+            &hub,
+            Mesh::new(keys(2), "B".into(), None).with_rand(counter_rand(0xB0)),
+        );
+        let c = Node::new(&hub, 3, "C");
+        let x = Node::with_mesh(
+            &hub,
+            Mesh::new(keys(9), "B".into(), None).with_rand(counter_rand(0xE0)),
+        );
+        a.login();
+        b.login();
+        c.login();
+        x.login();
+
+        // A 早先答过 C 的一份 `JoinPending`，被中转存下来了。
+        let n = c.mesh.lock().unwrap().fresh_nonce();
+        let req = c.mesh.lock().unwrap().join_request(&n);
+        let old_answer = c
+            .net
+            .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT)
+            .unwrap();
+
+        let replay = Replay {
+            peer: a.ep.clone(),
+            reply: old_answer,
+        };
+        let seen = join(&b.mesh, &replay, None).unwrap();
+        assert_eq!(seen.len(), 1);
+        let target = seen[0].code.clone();
+
+        let mut shown = 0;
+        for _ in 0..(super::super::MAX_CODES_PER_TTL + 10) {
+            raw_join(&x, &a.ep);
+            if let Some(p) = a.view().pending.iter().find(|p| p.endpoint == x.ep) {
+                shown += 1;
+                assert_ne!(p.code, target, "中转凑出了 B 屏幕上的数字");
+            }
+        }
+        assert_eq!(
+            shown,
+            super::super::MAX_CODES_PER_TTL,
+            "一个加入窗口里最多亮这么多次"
+        );
+    }
+
+    /// 问好几台时，每台一个随机数、一份承诺：揭晓给先回话的那台之后，中转
+    /// 就知道了那个随机数，不能让它拿去编还没回话的那几台的答复。
+    #[test]
+    fn each_computer_asked_gets_its_own_commitment() {
+        struct Recording<'a> {
+            inner: &'a FakeNet,
+            commits: Mutex<Vec<String>>,
+        }
+        impl Net for Recording<'_> {
+            fn peers(&self) -> Result<Vec<String>, crate::link::LinkError> {
+                self.inner.peers()
+            }
+            fn send(&self, to: &str, p: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                self.inner.send(to, p)
+            }
+            fn ask(
+                &self,
+                to: &str,
+                p: Vec<u8>,
+                t: Duration,
+            ) -> Result<Vec<u8>, crate::link::LinkError> {
+                if let Ok(Payload::Join(j)) = wire::decode(&p) {
+                    self.commits.lock().unwrap().push(j.commit);
+                }
+                self.inner.ask(to, p, t)
+            }
+        }
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let m = Node::new(&hub, 9, "M");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        m.login();
+        b.login();
+        let net = Recording {
+            inner: &b.net,
+            commits: Mutex::new(vec![]),
+        };
+        assert_eq!(join(&b.mesh, &net, None).unwrap().len(), 2);
+        let c = net.commits.lock().unwrap().clone();
+        assert_eq!(c.len(), 2);
+        assert_ne!(c[0], c[1]);
     }
 }
