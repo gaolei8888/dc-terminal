@@ -5,7 +5,8 @@
 //! - `store`：钥匙、电脑名、组名单落盘；
 //! - `net`：往外发（`Net` trait，真的 `LinkNet` 和测试用的 `FakeHub`）；
 //! - `group`：登录建组、加入、批准、移除这几个要跟别的电脑说话的流程；
-//! - `cli`：`dct login` / `dct join` / `dct peers`；
+//! - `deliver`：留言——`dct peers` 的详情、`dct send`、送进会话、忙时排队；
+//! - `cli`：`dct login` / `dct join` / `dct peers` / `dct send`；
 //! - 这里：`Mesh`，守护进程里这台电脑在组里的全部状态，以及电脑信封唯一的
 //!   入口 `Mesh::on_envelope`。
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -23,6 +24,7 @@ use crate::journal::Journal;
 use crate::link::Handler;
 
 pub mod cli;
+pub mod deliver;
 pub mod group;
 pub mod login;
 pub mod net;
@@ -68,14 +70,12 @@ pub struct Invite {
     pub at: u64,
 }
 
-/// 还没解析到具体会话的留言放在这个键下面。会话 id 从 1 数起，0 不会撞上。
-/// Task 7 按会话名解析、投递。
-pub const UNRESOLVED_SESSION: u32 = 0;
-
 /// 一条等着投进会话的留言。
 #[derive(Debug, Clone)]
 pub struct QueuedMsg {
     pub msg: Message,
+    /// 要敲进去的整段文字（标记加正文），收到时就算好。
+    pub text: String,
     pub received_at: Instant,
 }
 
@@ -145,8 +145,10 @@ pub struct Mesh {
     /// 这边的人还没敲名字；先存着，认定的那一刻再验。别的电脑送来的永远
     /// 用不上。每台最多一份。
     held: Vec<SignedRoster>,
-    /// 按会话 id 排队的留言。Task 7 投递。
+    /// 按会话 id 排队的留言（`deliver`）。
     pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
+    /// 会话清单和敲字的那一头。没有（测试、还没接上）就不收留言。
+    inbox: Option<Arc<dyn deliver::Inbox>>,
     store: Option<store::Store>,
     journal: Arc<Journal>,
     seen: Seen,
@@ -182,6 +184,7 @@ impl Mesh {
             confirmed: None,
             held: Vec::new(),
             queues: HashMap::new(),
+            inbox: None,
             store: None,
             journal: Arc::new(Journal::new()),
             seen: Seen::default(),
@@ -511,16 +514,15 @@ impl Mesh {
             return self.drop(env, "replay");
         }
         match m.kind {
+            // 上面的名单、签名、时间窗、去重全都过了，才走到这里：同一条
+            // 留言再来一次在 `seen` 那里就停了，不会被敲进会话两次。
             Kind::Msg => {
-                let key = session_key(&m.to_session);
-                self.queues.entry(key).or_default().push_back(QueuedMsg {
-                    msg: m.clone(),
-                    received_at: Instant::now(),
-                });
-                self.reply(&m, Kind::Receipt, "queued".to_string())
+                let r = self.receive(&m);
+                let body = serde_json::to_string(&r).unwrap_or_default();
+                self.reply(&m, Kind::Receipt, body)
             }
             Kind::StatusRequest => {
-                let body = serde_json::json!({ "os": std::env::consts::OS }).to_string();
+                let body = serde_json::to_string(&self.local_status()).unwrap_or_default();
                 self.reply(&m, Kind::Status, body)
             }
             // 回执和状态只该作为 `ask` 的答复回来，不该从轮询里进来；进来了
@@ -565,15 +567,6 @@ pub(crate) fn valid_name(n: &str) -> bool {
 
 fn valid_kx_pub(b64: &str) -> bool {
     STANDARD.decode(b64).map(|b| b.len() == 32).unwrap_or(false)
-}
-
-/// `#12` 这种写法直接就是会话 id；会话名要等 Task 7 按看板上的名字解析。
-fn session_key(to_session: &str) -> u32 {
-    to_session
-        .strip_prefix('#')
-        .and_then(|n| n.parse().ok())
-        .filter(|n| *n != UNRESOLVED_SESSION)
-        .unwrap_or(UNRESOLVED_SESSION)
 }
 
 /// `Link` 收到的信封怎么分：`c-` 开头的是电脑，交给 `Mesh`；别的交给
@@ -642,9 +635,14 @@ mod tests {
         let a = Mesh::new(ka, "A".into(), Some(v2.clone()))
             .with_clock(|| NOW)
             .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS);
+        // B 上有一个在忙的智能体会话 #7：留言进来就排队（`deliver` 的规矩），
+        // 这里的测试看的是排没排进去、排了几次。
+        let inbox = deliver::testing::FakeInbox::new();
+        inbox.add(7, "", "/w/proj", crate::session::SessionState::Working, true);
         let b = Mesh::new(kb, "B".into(), Some(v2.clone()))
             .with_clock(|| NOW)
-            .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS);
+            .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS)
+            .with_inbox(inbox);
         (a, b, v2)
     }
 
@@ -914,14 +912,6 @@ mod tests {
         let h2 = route(b.clone(), None);
         assert_eq!(h2(&env("phone:1", &b_ep, b"{}".to_vec())), None);
         let _ = a_ep;
-    }
-
-    #[test]
-    fn session_keys_parse_hash_ids_and_park_names() {
-        assert_eq!(session_key("#12"), 12);
-        assert_eq!(session_key("dc-terminal"), UNRESOLVED_SESSION);
-        assert_eq!(session_key("#0"), UNRESOLVED_SESSION);
-        assert_eq!(session_key("#x"), UNRESOLVED_SESSION);
     }
 
     /// `FakeHub` 本身：两台内存里的电脑隔着它 `ask`，拿回对方的回执；

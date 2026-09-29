@@ -2031,6 +2031,16 @@ pub mod msg {
                 en: "Could not save the group list on this computer. Nothing was changed".to_string(),
                 zh: "这台电脑上的组名单存不下，什么都没改".to_string(),
             ),
+            TooLong => t!(
+                lang,
+                en: "Too long. Shorten it, or send it as a task instead (coming next)".to_string(),
+                zh: "太长了，请缩短或者改成派活（下一步）".to_string(),
+            ),
+            BadAddress(to) => t!(
+                lang,
+                en: format!("{to} is not an address. Write it as computer/session, for example: office-pc/dc-terminal"),
+                zh: format!("{to} 不是一个地址。写成 电脑名/会话名，比如：公司Windows/dc-terminal"),
+            ),
         }
     }
 
@@ -2201,6 +2211,95 @@ pub mod msg {
             lang,
             en: "Usage: dct peers | dct peers approve <name or c-…> [--no] | dct peers remove <name>".to_string(),
             zh: "用法：dct peers | dct peers approve <电脑名或 c-…> [--no] | dct peers remove <电脑名>".to_string(),
+        )
+    }
+
+    /// `dct peers` 详情里的一台电脑：名字、在不在线、系统。
+    pub fn mesh_peer_line(lang: Lang, name: &str, online: bool, is_me: bool, os: &str) -> String {
+        let line = mesh_member_line(lang, name, online, is_me);
+        if os.is_empty() {
+            line
+        } else {
+            format!("{line}  {os}")
+        }
+    }
+
+    pub fn mesh_no_sessions(lang: Lang) -> String {
+        t!(lang, en: "    no sessions open".to_string(), zh: "    没有开着的会话".to_string())
+    }
+
+    pub fn mesh_tentacles_line(lang: Lang, tentacles: &[String]) -> String {
+        t!(
+            lang,
+            en: format!("    devices: {}", tentacles.join(", ")),
+            zh: format!("    触手：{}", tentacles.join("、")),
+        )
+    }
+
+    /// `dct send` 送到了。`to` 是用户写的地址。
+    pub fn mesh_sent(lang: Lang, to: &str) -> String {
+        t!(lang, en: format!("Delivered to {to}"), zh: format!("已送到 {to}"))
+    }
+
+    pub fn mesh_queued(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "The other side is busy. Queued; it will be delivered when it is done".to_string(),
+            zh: "对方正忙，已排队，忙完就送进去".to_string(),
+        )
+    }
+
+    /// `dct send` 没送成的几种情况（`NoSuchMachine` 走 `error`）。
+    pub fn mesh_not_sent(
+        lang: Lang,
+        machine: &str,
+        session: &str,
+        o: &crate::proto::SendOutcome,
+    ) -> String {
+        use crate::proto::SendOutcome::*;
+        match o {
+            Offline => t!(
+                lang,
+                en: format!("{machine} is not online right now, nothing was sent (messages for offline computers come in a later step)"),
+                zh: format!("{machine} 现在不在线，没送出去（离线留言下一步才做）"),
+            ),
+            NoSuchSession(c) if c.is_empty() => t!(
+                lang,
+                en: format!("{machine} has no session called {session}. dct peers shows the sessions open there"),
+                zh: format!("{machine} 上没有叫 {session} 的会话。dct peers 能看到那边开着哪些会话"),
+            ),
+            NoSuchSession(c) => {
+                let list: String = c.iter().map(|x| format!("\n  {x}")).collect();
+                t!(
+                    lang,
+                    en: format!("More than one session on {machine} is called {session}. Use its number instead, for example {machine}/#3:{list}"),
+                    zh: format!("{machine} 上叫 {session} 的会话不止一个，改用编号指明，比如 {machine}/#3：{list}"),
+                )
+            }
+            SessionStopped => t!(
+                lang,
+                en: format!("The session {machine}/{session} has stopped, nothing was typed into it"),
+                zh: format!("{machine}/{session} 这个会话已经停了，没送进去"),
+            ),
+            Refused => t!(
+                lang,
+                en: format!("{machine} did not take the message (its queue is full, or that is not an agent session)"),
+                zh: format!("{machine} 没收下这条留言（那边排队满了，或者那不是智能体会话）"),
+            ),
+            NoAnswer => t!(
+                lang,
+                en: format!("{machine} did not answer, so it is not known whether the message arrived. dct peers shows what is going on there"),
+                zh: format!("{machine} 没回话，不知道送到没有。可以用 dct peers 看看那边"),
+            ),
+            Delivered | Queued | NoSuchMachine => String::new(),
+        }
+    }
+
+    pub fn mesh_send_usage(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Usage: dct send <computer>/<session or #number> \"<message>\"".to_string(),
+            zh: "用法：dct send <电脑名>/<会话名或 #编号> \"<内容>\"".to_string(),
         )
     }
 
@@ -3091,6 +3190,8 @@ mod tests {
             Mesh(crate::proto::MeshProblem::NotSaved),
             Mesh(crate::proto::MeshProblem::NoSuchInviter("pc".into())),
             Mesh(crate::proto::MeshProblem::CodeMismatch),
+            Mesh(crate::proto::MeshProblem::TooLong),
+            Mesh(crate::proto::MeshProblem::BadAddress("pc".into())),
             // `LoginFailed` 不在这里：它带的原因是网关那层给的中文，同 `Git`
             // 照抄原文，英文里会有汉字，见下面那条单独的测试。
         ];
@@ -3164,6 +3265,12 @@ mod tests {
             msg::mesh_join_cancelled(Lang::En),
             msg::mesh_not_approved(Lang::En),
             msg::mesh_code_line_with_endpoint(Lang::En, "pc", "c-x", "1"),
+            msg::mesh_peer_line(Lang::En, "pc", true, false, "macos"),
+            msg::mesh_no_sessions(Lang::En),
+            msg::mesh_tentacles_line(Lang::En, &["cam".into()]),
+            msg::mesh_sent(Lang::En, "pc/s"),
+            msg::mesh_queued(Lang::En),
+            msg::mesh_send_usage(Lang::En),
             msg::mesh_ambiguous_responder(Lang::En, "pc"),
         ] {
             assert!(!has_han(&s), "英文里有汉字：{s}");

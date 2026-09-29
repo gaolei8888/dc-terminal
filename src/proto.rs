@@ -125,7 +125,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 21 = 加入要两边的人都认过数字：多了 `Request::MeshConfirmInviter`（新电脑
 /// 上认定是哪一台），`MeshApprove` 多了 `code`（批准的必须就是屏幕上显示的
 /// 那一条），`MeshProblem` 多了 `NoSuchInviter` / `CodeMismatch`。
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// 22 = 留言：多了 `Request::MeshPeers` / `MeshSend`、`Response::MeshPeers` /
+/// `MeshSent`，`MeshProblem` 多了 `TooLong` / `BadAddress`。新增 `Request`
+/// 变体那条规矩同 14。
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,6 +539,17 @@ pub enum Request {
     MeshRemove {
         name: String,
     },
+    /// 组里每台电脑的详情：在不在线、什么系统、开着哪些会话、接了哪些触手。
+    /// 会问每台在线的电脑，最多等 3 秒，界面要放后台线程。
+    MeshPeers,
+    /// 给 `to`（`电脑名/会话名`，会话名也可以写 `#编号`）留一句话。
+    /// `from_session` 是发件的会话编号（`dct send` 从 `DCT_SESSION_ID` 读），
+    /// 不在 dct 会话里发就是 `None`。会打网络，界面要放后台线程。
+    MeshSend {
+        to: String,
+        text: String,
+        from_session: Option<u32>,
+    },
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -683,6 +698,18 @@ impl std::fmt::Debug for Request {
             Request::MeshRemove { name } => {
                 f.debug_struct("MeshRemove").field("name", name).finish()
             }
+            Request::MeshPeers => write!(f, "MeshPeers"),
+            // 留言正文只报长度：它可能是任何东西，不该原样进日志。
+            Request::MeshSend {
+                to,
+                text,
+                from_session,
+            } => f
+                .debug_struct("MeshSend")
+                .field("to", to)
+                .field("text_chars", &text.chars().count())
+                .field("from_session", from_session)
+                .finish(),
         }
     }
 }
@@ -780,6 +807,53 @@ pub enum Response {
     LiveGrant(LiveGrantToken),
     /// `Mesh*` 几条请求的共同回答：做完之后的样子。
     Mesh(MeshView),
+    /// 对 [`Request::MeshPeers`] 的回答，按名单顺序，这台电脑自己也在里面。
+    MeshPeers(Vec<PeerView>),
+    /// 对 [`Request::MeshSend`] 的回答。
+    MeshSent(SendOutcome),
+}
+
+/// `dct peers` 里的一台电脑。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerView {
+    pub name: String,
+    /// 这一次问到了它（这台电脑自己恒为 `true`）。没回话的也算不在线。
+    pub online: bool,
+    /// `std::env::consts::OS` 的值；不在线是空串。
+    pub os: String,
+    pub sessions: Vec<SessionBrief>,
+    /// 从那台电脑的 `~/.dco/endpoint.json` 读的触手。读不到就是空。
+    pub tentacles: Vec<String>,
+}
+
+/// 一台电脑上的一个会话。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBrief {
+    /// 看板上的名字（`ui::widgets::session_label`）。
+    pub name: String,
+    /// 给人看的状态：忙 / 闲 / 等你回答 / 已停止（另有 出错了 / 不清楚）。
+    pub state: String,
+    pub dir: String,
+}
+
+/// 一条留言的下场。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendOutcome {
+    /// 已经敲进对方会话。
+    Delivered,
+    /// 对方会话正忙，排上队了，等它空下来就送。
+    Queued,
+    /// 对方电脑不在线，没送出去（第一步没有离线留言）。
+    Offline,
+    NoSuchMachine,
+    /// 没有这个会话；同名的不止一个时带着候选（`#编号 名字`）。
+    NoSuchSession(Vec<String>),
+    /// 会话已经停了或者出错了。
+    SessionStopped,
+    /// 对方收到了但没收下：排队满了、不是智能体会话、太长。
+    Refused,
+    /// 投到了，但在时限内没等到回执：不知道送进去没有。
+    NoAnswer,
 }
 
 /// 多电脑眼下的样子。**不带任何钥匙或令牌**——只有公开的名字、端点、数字。
@@ -1095,6 +1169,10 @@ pub enum MeshProblem {
     CodeMismatch,
     /// 名单存不下。
     NotSaved,
+    /// 留言洗过之后还是超过 `mesh::deliver::MAX_BODY_CHARS`。
+    TooLong,
+    /// 地址不是 `电脑名/会话名`。
+    BadAddress(String),
 }
 
 /// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。
@@ -1432,14 +1510,20 @@ mod tests {
             Request::MeshConfirmInviter {
                 endpoint: "c-x".into(),
             },
+            Request::MeshPeers,
+            Request::MeshSend {
+                to: "pc/s".into(),
+                text: "t".into(),
+                from_session: Some(1),
+            },
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                21,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","code":"123456","yes":true}},{"MeshRemove":{"name":"n"}},{"MeshConfirmInviter":{"endpoint":"c-x"}}]"#
+                22,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","code":"123456","yes":true}},{"MeshRemove":{"name":"n"}},{"MeshConfirmInviter":{"endpoint":"c-x"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1463,7 +1547,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                21,
+                22,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1572,7 +1656,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                21,
+                22,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1675,7 +1759,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (21, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (22, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1693,7 +1777,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (21, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (22, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1770,7 +1854,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                21,
+                22,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -1782,6 +1866,50 @@ mod tests {
             }),
             r#"{"Failed":{"title":"课","reason":{"Refused":401}}}"#
         );
+    }
+
+    /// 留言那两条答复的线上形状。
+    #[test]
+    fn the_mesh_send_and_peers_answers_are_pinned() {
+        let sent = [
+            SendOutcome::Delivered,
+            SendOutcome::NoSuchSession(vec!["#3 a（b）".into()]),
+        ]
+        .map(|o| serde_json::to_string(&Response::MeshSent(o)).unwrap());
+        let peers = serde_json::to_string(&Response::MeshPeers(vec![PeerView {
+            name: "A".into(),
+            online: true,
+            os: "macos".into(),
+            sessions: vec![SessionBrief {
+                name: "s".into(),
+                state: "闲".into(),
+                dir: "/d".into(),
+            }],
+            tentacles: vec!["cam".into()],
+        }]))
+        .unwrap();
+        assert_eq!(
+            (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
+            (
+                22,
+                r#"{"MeshSent":"Delivered"}"#,
+                r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
+                r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// 留言正文不进 `Debug`：只报长度。
+    #[test]
+    fn a_mesh_send_request_does_not_print_its_text() {
+        let r = Request::MeshSend {
+            to: "A/b".into(),
+            text: "机密内容".into(),
+            from_session: None,
+        };
+        let d = format!("{r:?}");
+        assert!(!d.contains("机密") && d.contains("text_chars: 4"), "{d}");
     }
 
     /// 凭证能当一次公开，不许在任何日志里原样出现。

@@ -1,4 +1,4 @@
-//! `dct login` / `dct join` / `dct peers`。
+//! `dct login` / `dct join` / `dct peers` / `dct send`。
 //!
 //! 这里只是把话说给人听：真正的事（换令牌、问别的电脑、签名单）都在守护
 //! 进程里做——它握着中转连接、钥匙和密钥仓，命令行这边一样也不碰。
@@ -13,7 +13,9 @@ use anyhow::Result;
 
 use crate::client::Client;
 use crate::i18n::{msg, text, Key, Lang};
-use crate::proto::{ErrorCode, MeshProblem, MeshView, PendingJoin, Request, Response};
+use crate::proto::{
+    ErrorCode, MeshProblem, MeshView, PeerView, PendingJoin, Request, Response, SendOutcome,
+};
 
 /// `dct join` 最多等多久有人点同意。跟对面那条请求的有效期一样长。
 const JOIN_WAIT: Duration = crate::mesh::JOIN_TTL;
@@ -65,7 +67,13 @@ pub fn run(args: &[String]) -> i32 {
     };
     let mut client = client;
     let mut call = |req: Request| {
-        let slow = matches!(req, Request::MeshLogin | Request::MeshJoin { .. });
+        let slow = matches!(
+            req,
+            Request::MeshLogin
+                | Request::MeshJoin { .. }
+                | Request::MeshPeers
+                | Request::MeshSend { .. }
+        );
         if slow {
             client.call_within(req, SLOW_CALL)
         } else {
@@ -100,6 +108,13 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         "peers" => peers(&mut call, &mut ask, &mut out, &mut err, lang, rest),
+        "send" => {
+            // 在 dct 的会话里跑的，守护进程给子进程设过这个变量（`session.rs`）。
+            let from = std::env::var(crate::session::SESSION_ID_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok());
+            send(&mut call, &mut out, &mut err, lang, rest, from)
+        }
         _ => 2,
     }
 }
@@ -337,12 +352,18 @@ pub(crate) fn peers(
                 return 1;
             }
             let _ = writeln!(out, "{}", msg::mesh_members_header(lang));
-            for m in &v.members {
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    msg::mesh_member_line(lang, &m.name, m.online, m.is_me)
-                );
+            // 详情要问每台在线的电脑；问不成就退回名单上那几行，不整个失败。
+            match call(Request::MeshPeers) {
+                Ok(Response::MeshPeers(list)) => print_peers(out, lang, &v, &list),
+                _ => {
+                    for m in &v.members {
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            msg::mesh_member_line(lang, &m.name, m.online, m.is_me)
+                        );
+                    }
+                }
             }
             for p in &v.pending {
                 // 两台同名就只能按端点批，提示里直接给端点。
@@ -415,6 +436,102 @@ pub(crate) fn peers(
         _ => {
             let _ = writeln!(err, "{}", msg::mesh_peers_usage(lang));
             2
+        }
+    }
+}
+
+/// `dct peers` 的详情：每台一行（在不在线、系统），下面是它开着的会话和触手。
+fn print_peers(out: &mut dyn Write, lang: Lang, v: &MeshView, list: &[PeerView]) {
+    for p in list {
+        let is_me = v.members.iter().any(|m| m.is_me && m.name == p.name);
+        let _ = writeln!(
+            out,
+            "{}",
+            msg::mesh_peer_line(lang, &p.name, p.online, is_me, &p.os)
+        );
+        if !p.online {
+            continue;
+        }
+        if p.sessions.is_empty() {
+            let _ = writeln!(out, "{}", msg::mesh_no_sessions(lang));
+        }
+        for s in &p.sessions {
+            let _ = writeln!(out, "    {}  {}  {}", s.name, s.state, s.dir);
+        }
+        if !p.tentacles.is_empty() {
+            let _ = writeln!(out, "{}", msg::mesh_tentacles_line(lang, &p.tentacles));
+        }
+    }
+}
+
+/// `dct send <电脑名/会话名> "<内容>"`。送到、排上队退 0，别的退 1。
+pub(crate) fn send(
+    call: Call,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    lang: Lang,
+    args: &[String],
+    from_session: Option<u32>,
+) -> i32 {
+    let Some((to, words)) = args.split_first() else {
+        let _ = writeln!(err, "{}", msg::mesh_send_usage(lang));
+        return 2;
+    };
+    let text = words.join(" ");
+    if text.trim().is_empty() {
+        let _ = writeln!(err, "{}", msg::mesh_send_usage(lang));
+        return 2;
+    }
+    let to = to.trim();
+    let (machine, session) = crate::mesh::deliver::split_address(to).unwrap_or((to, ""));
+    let req = Request::MeshSend {
+        to: to.to_string(),
+        text,
+        from_session,
+    };
+    let outcome = match call(req) {
+        Ok(Response::MeshSent(o)) => o,
+        Ok(Response::Error(e)) => {
+            say_error(err, lang, &e);
+            return 1;
+        }
+        Ok(other) => {
+            say_error(err, lang, &ErrorCode::Internal(format!("{other:?}")));
+            return 1;
+        }
+        Err(e) => {
+            let code = match e.downcast::<crate::proto::CodedError>() {
+                Ok(c) => c.0,
+                Err(e) => ErrorCode::Internal(e.to_string()),
+            };
+            say_error(err, lang, &code);
+            return 1;
+        }
+    };
+    match outcome {
+        SendOutcome::Delivered => {
+            let _ = writeln!(out, "{}", msg::mesh_sent(lang, to));
+            0
+        }
+        SendOutcome::Queued => {
+            let _ = writeln!(out, "{}", msg::mesh_queued(lang));
+            0
+        }
+        SendOutcome::NoSuchMachine => {
+            say_error(
+                err,
+                lang,
+                &ErrorCode::Mesh(MeshProblem::NoSuchMachine(machine.to_string())),
+            );
+            1
+        }
+        other => {
+            let _ = writeln!(
+                err,
+                "{}",
+                msg::mesh_not_sent(lang, machine, session, &other)
+            );
+            1
         }
     }
 }
@@ -758,7 +875,11 @@ mod tests {
             &|| {},
         );
         assert_eq!(code, 1);
-        assert!(s(&err).contains("邀请已过期，请重新运行 dct join"), "{}", s(&err));
+        assert!(
+            s(&err).contains("邀请已过期，请重新运行 dct join"),
+            "{}",
+            s(&err)
+        );
     }
 
     /// 审查给的 m2：两台同名都回了话。每行名字旁边印出端点，用户照着敲
@@ -860,7 +981,11 @@ mod tests {
     fn peers_lists_members_and_asks_about_pending_joins() {
         let mut v = view(true, &[("B", true), ("A", false)]);
         v.pending = vec![pj("公司Windows", "c-w", "123456")];
-        let sc = Script::new(vec![Response::Mesh(v)]);
+        // 详情问不成（旧守护进程、出错）：退回名单那几行。
+        let sc = Script::new(vec![
+            Response::Mesh(v),
+            Response::Error(ErrorCode::DaemonNotResponding),
+        ]);
         let (mut out, mut err) = (vec![], vec![]);
         assert_eq!(
             peers(
@@ -974,6 +1099,165 @@ mod tests {
         );
         assert!(s(&err).contains("不止一台叫 C"));
         assert_eq!(sc.seen.borrow().len(), 1);
+    }
+
+    /// `dct peers` 的详情：每台一行带系统，在线的下面列会话和触手，不在线
+    /// 的只有名字。
+    #[test]
+    fn peers_shows_sessions_and_tentacles_of_each_machine() {
+        use crate::proto::SessionBrief;
+        let v = view(
+            true,
+            &[("B", true), ("公司Windows", false), ("老笔记本", false)],
+        );
+        let list = vec![
+            PeerView {
+                name: "B".into(),
+                online: true,
+                os: "macos".into(),
+                sessions: vec![],
+                tentacles: vec![],
+            },
+            PeerView {
+                name: "公司Windows".into(),
+                online: true,
+                os: "windows".into(),
+                sessions: vec![SessionBrief {
+                    name: "dc-terminal".into(),
+                    state: "闲".into(),
+                    dir: r"C:\w\dc-terminal".into(),
+                }],
+                tentacles: vec!["iPhone 镜像".into(), "摄像头".into()],
+            },
+            PeerView {
+                name: "老笔记本".into(),
+                online: false,
+                os: String::new(),
+                sessions: vec![],
+                tentacles: vec![],
+            },
+        ];
+        let sc = Script::new(vec![Response::Mesh(v), Response::MeshPeers(list)]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = peers(
+            &mut sc.call(),
+            &mut no_ask,
+            &mut out,
+            &mut err,
+            Lang::Zh,
+            &[],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            s(&out),
+            "组里的电脑：\n  B  (这台)  macos\n    没有开着的会话\n  公司Windows  (在线)  windows\n    dc-terminal  闲  C:\\w\\dc-terminal\n    触手：iPhone 镜像、摄像头\n  老笔记本  (不在线)\n"
+        );
+        assert_eq!(sc.seen.borrow().as_slice(), ["MeshStatus", "MeshPeers"]);
+    }
+
+    fn send_with(
+        outcome: Response,
+        args: &[&str],
+        from: Option<u32>,
+    ) -> (i32, String, String, Vec<String>) {
+        let sc = Script::new(vec![outcome]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = send(
+            &mut sc.call(),
+            &mut out,
+            &mut err,
+            Lang::Zh,
+            &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            from,
+        );
+        let seen = sc.seen.borrow().clone();
+        (code, s(&out), s(&err), seen)
+    }
+
+    #[test]
+    fn send_says_what_happened_and_exits_0_only_when_delivered_or_queued() {
+        let to = "公司Windows/dc-terminal";
+        let (code, out, _, seen) = send_with(
+            Response::MeshSent(SendOutcome::Delivered),
+            &[to, "跑一下测试"],
+            Some(3),
+        );
+        assert_eq!((code, out.trim()), (0, "已送到 公司Windows/dc-terminal"));
+        assert_eq!(
+            seen,
+            [r#"MeshSend { to: "公司Windows/dc-terminal", text_chars: 5, from_session: Some(3) }"#]
+        );
+
+        let (code, out, _, _) =
+            send_with(Response::MeshSent(SendOutcome::Queued), &[to, "x"], None);
+        assert_eq!((code, out.trim()), (0, "对方正忙，已排队，忙完就送进去"));
+
+        let cases: Vec<(SendOutcome, &str)> = vec![
+            (
+                SendOutcome::Offline,
+                "公司Windows 现在不在线，没送出去（离线留言下一步才做）",
+            ),
+            (SendOutcome::NoSuchMachine, "组里没有叫 公司Windows 的电脑"),
+            (
+                SendOutcome::NoSuchSession(vec![]),
+                "公司Windows 上没有叫 dc-terminal 的会话。dct peers 能看到那边开着哪些会话",
+            ),
+            (
+                SendOutcome::NoSuchSession(vec!["#3 claude（dc-terminal）".into(), "#4 写文档（dc-terminal）".into()]),
+                "公司Windows 上叫 dc-terminal 的会话不止一个，改用编号指明，比如 公司Windows/#3：\n  #3 claude（dc-terminal）\n  #4 写文档（dc-terminal）",
+            ),
+            (
+                SendOutcome::SessionStopped,
+                "公司Windows/dc-terminal 这个会话已经停了，没送进去",
+            ),
+            (
+                SendOutcome::Refused,
+                "公司Windows 没收下这条留言（那边排队满了，或者那不是智能体会话）",
+            ),
+            (
+                SendOutcome::NoAnswer,
+                "公司Windows 没回话，不知道送到没有。可以用 dct peers 看看那边",
+            ),
+        ];
+        for (o, want) in cases {
+            let (code, out, err, _) = send_with(Response::MeshSent(o.clone()), &[to, "x"], None);
+            assert_eq!(code, 1, "{o:?}");
+            assert!(out.is_empty(), "{o:?}");
+            assert_eq!(err.trim(), want, "{o:?}");
+        }
+    }
+
+    #[test]
+    fn send_too_long_and_usage() {
+        let (code, _, err, _) = send_with(
+            Response::Error(ErrorCode::Mesh(MeshProblem::TooLong)),
+            &["A/b", "x"],
+            None,
+        );
+        assert_eq!(
+            (code, err.trim()),
+            (1, "太长了，请缩短或者改成派活（下一步）")
+        );
+
+        // 没有内容、没有地址：不问守护进程，退 2。
+        for args in [&[][..], &["A/b"][..], &["A/b", "  "][..]] {
+            let sc = Script::new(vec![]);
+            let (mut out, mut err) = (vec![], vec![]);
+            let a: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+            assert_eq!(
+                send(&mut sc.call(), &mut out, &mut err, Lang::Zh, &a, None),
+                2
+            );
+            assert!(s(&err).contains("用法：dct send"));
+        }
+
+        // 没加引号的几个词拼成一句。
+        let (_, _, _, seen) = send_with(
+            Response::MeshSent(SendOutcome::Delivered),
+            &["A/b", "跑", "一下"],
+            None,
+        );
+        assert!(seen[0].contains("text_chars: 4"), "{seen:?}");
     }
 
     #[test]

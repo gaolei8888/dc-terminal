@@ -205,16 +205,31 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
     // 放在一个槽里活到进程结束：守护进程开着的时候 `dct login`，要在这里
     // 把连接（重新）起起来，不能等下次重启。
+    let mesh_inbox: Arc<dyn crate::mesh::deliver::Inbox> =
+        Arc::new(crate::mesh::deliver::LocalInbox::new(mgr.clone()));
     let mesh_ctl = Arc::new(MeshCtl {
         socket: socket.to_path_buf(),
         journal_path: mgr.journal.path(),
+        inbox: Some(mesh_inbox.clone()),
         slot: Mutex::new(start_mesh(
             socket,
             &secrets,
             &profiles_dir,
             mgr.journal.path(),
+            Some(mesh_inbox),
         )),
     });
+    // 留言的投递线程：每秒看一眼排着队的留言，会话空下来就送一条。槽是空的
+    // （还没登录）就什么都不做；登录之后槽里换上的那一份下一拍就接上。
+    {
+        let mc = mesh_ctl.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(crate::mesh::deliver::TICK);
+            if let Some((m, _)) = mc.running() {
+                crate::mesh::deliver::tick(&m);
+            }
+        });
+    }
 
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
@@ -285,6 +300,8 @@ type MeshParts = (
 pub(crate) struct MeshCtl {
     socket: PathBuf,
     journal_path: Option<PathBuf>,
+    /// 留言送进会话用的那一头（`SessionManager`）。起 `Mesh` 时接上。
+    inbox: Option<Arc<dyn crate::mesh::deliver::Inbox>>,
     slot: Mutex<Option<MeshRuntime>>,
 }
 
@@ -338,6 +355,20 @@ fn handle_mesh(
             .ok_or(MeshProblem::NotLoggedIn)
             .and_then(|(m, n)| group::remove(&m, n.as_ref(), &name))
             .map(|_| view(ctl)),
+        Request::MeshPeers => ctl
+            .running()
+            .ok_or(MeshProblem::NotLoggedIn)
+            .and_then(|(m, n)| crate::mesh::deliver::peers(&m, n.as_ref()))
+            .map(Response::MeshPeers),
+        Request::MeshSend {
+            to,
+            text,
+            from_session,
+        } => ctl
+            .running()
+            .ok_or(MeshProblem::NotLoggedIn)
+            .and_then(|(m, n)| crate::mesh::deliver::send(&m, n.as_ref(), &to, &text, from_session))
+            .map(Response::MeshSent),
         other => return Response::Error(ErrorCode::BadRequest(format!("{other:?}"))),
     };
     r.unwrap_or_else(|p| Response::Error(ErrorCode::Mesh(p)))
@@ -419,6 +450,7 @@ fn mesh_login(
                 secrets,
                 profiles_dir,
                 ctl.journal_path.clone(),
+                ctl.inbox.clone(),
             );
         }
         slot.as_ref()
@@ -445,6 +477,7 @@ fn start_mesh(
     secrets: &Arc<Mutex<SecretStore>>,
     profiles_dir: &Path,
     journal_path: Option<PathBuf>,
+    inbox: Option<Arc<dyn crate::mesh::deliver::Inbox>>,
 ) -> Option<MeshRuntime> {
     use crate::mesh::login::{self, Renewal, DC_PROFILE, RELAY_TOKEN_KEY};
 
@@ -456,7 +489,13 @@ fn start_mesh(
     }
     let store = crate::mesh::store::Store::at(crate::mesh::store::dir_for_socket(socket));
     let mesh = match crate::mesh::Mesh::load(store) {
-        Ok(m) => m.with_journal(journal.clone()),
+        Ok(m) => {
+            let m = m.with_journal(journal.clone());
+            match inbox {
+                Some(i) => m.with_inbox(i),
+                None => m,
+            }
+        }
         Err(e) => {
             journal.mesh(&format!("not_started err={e}"));
             return None;
@@ -841,7 +880,9 @@ fn serve(
                 | Request::MeshJoin { .. }
                 | Request::MeshApprove { .. }
                 | Request::MeshConfirmInviter { .. }
-                | Request::MeshRemove { .. }),
+                | Request::MeshRemove { .. }
+                | Request::MeshPeers
+                | Request::MeshSend { .. }),
             ) => handle_mesh(
                 req,
                 &mesh,
@@ -1208,7 +1249,9 @@ fn handle(
         | Request::MeshJoin { .. }
         | Request::MeshApprove { .. }
         | Request::MeshConfirmInviter { .. }
-        | Request::MeshRemove { .. } => Ok(Response::Error(ErrorCode::BadRequest(
+        | Request::MeshRemove { .. }
+        | Request::MeshPeers
+        | Request::MeshSend { .. } => Ok(Response::Error(ErrorCode::BadRequest(
             "Mesh requests are local only".into(),
         ))),
         Request::WebStatus => Ok(web_status(web, secrets)),
@@ -3572,6 +3615,12 @@ mod tests {
                 endpoint: "c-x".into(),
             },
             Request::MeshRemove { name: "x".into() },
+            Request::MeshPeers,
+            Request::MeshSend {
+                to: "pc/s".into(),
+                text: "t".into(),
+                from_session: None,
+            },
         ] {
             let resp = live_call(req, &secrets, &test_live());
             assert!(
@@ -3943,7 +3992,7 @@ mod mesh_tests {
     #[test]
     fn no_relay_token_means_no_mesh_and_nothing_on_disk() {
         let (t, socket, secrets) = home();
-        assert!(start_mesh(&socket, &secrets, &t.path().join("profiles"), None).is_none());
+        assert!(start_mesh(&socket, &secrets, &t.path().join("profiles"), None, None).is_none());
         assert!(
             !crate::mesh::store::dir_for_socket(&socket).exists(),
             "没登录过就不该生成钥匙"
@@ -3968,7 +4017,7 @@ mod mesh_tests {
             s.set(RELAY_TOKEN_EXP_KEY, &u64::MAX.to_string()).unwrap();
         }
 
-        let rt = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).expect("该起来");
+        let rt = start_mesh(&socket, &secrets, &t.path().join("profiles"), None, None).expect("该起来");
         let endpoint = rt.mesh.lock().unwrap().endpoint().to_string();
         assert!(endpoint.starts_with("c-"));
         let dir = crate::mesh::store::dir_for_socket(&socket);
@@ -3998,6 +4047,7 @@ mod mesh_tests {
         MeshCtl {
             socket: socket.to_path_buf(),
             journal_path: None,
+            inbox: None,
             slot: Mutex::new(None),
         }
     }
@@ -4046,6 +4096,12 @@ mod mesh_tests {
                 endpoint: "x".into(),
             },
             Request::MeshRemove { name: "x".into() },
+            Request::MeshPeers,
+            Request::MeshSend {
+                to: "pc/s".into(),
+                text: "t".into(),
+                from_session: None,
+            },
         ] {
             let r = mesh_call(req, &ctl, &secrets, &t.path().join("profiles"), &no_network);
             assert!(
@@ -4174,8 +4230,8 @@ mod mesh_tests {
         )
         .unwrap();
         secrets.lock().unwrap().set(RELAY_TOKEN_KEY, "t").unwrap();
-        let a = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).unwrap();
-        let b = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).unwrap();
+        let a = start_mesh(&socket, &secrets, &t.path().join("profiles"), None, None).unwrap();
+        let b = start_mesh(&socket, &secrets, &t.path().join("profiles"), None, None).unwrap();
         a.link.stop();
         b.link.stop();
         assert_eq!(

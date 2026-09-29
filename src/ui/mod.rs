@@ -18,7 +18,7 @@ use crate::client::Client;
 use crate::proto::{ProfileEntry, Request, Response};
 use crate::theme::Theme;
 
-mod widgets;
+pub(crate) mod widgets;
 use widgets::short_path;
 pub use widgets::{status_label, status_style, Msg};
 
