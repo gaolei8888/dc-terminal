@@ -29,6 +29,7 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
     let online: HashSet<String> = net.peers().unwrap_or_default().into_iter().collect();
     let mut m = lock(mesh);
     m.prune_pending();
+    m.prune_invites();
     let me = m.me.endpoint.clone();
     let members = m
         .roster
@@ -68,16 +69,19 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
 fn joining(m: &Mesh) -> Vec<PendingJoin> {
     m.invites
         .iter()
-        .map(|(x, code)| PendingJoin {
-            name: x.name.clone(),
-            endpoint: x.endpoint.clone(),
-            code: code.clone(),
+        .map(|i| PendingJoin {
+            name: i.member.name.clone(),
+            endpoint: i.member.endpoint.clone(),
+            code: i.code.clone(),
         })
         .collect()
 }
 
 /// 新电脑请求加入：`name` 非空就先改名；问一遍每台在线的电脑，把回了
 /// `JoinPending` 的记下来（`Mesh::invites`），返回每台的 6 位数。
+///
+/// **这一步还不认任何一台。** 回话的电脑谁都可能是中转塞进来的；要等用户
+/// 看过那边屏幕上的数字、说出是哪一台（`confirm`），那一台签的名单才收。
 ///
 /// 回答必须是对方自签的成员记录，而且记录里的端点就是我问的那个端点——
 /// 中转认证过发件人，我问的是谁，答的就得是谁。
@@ -114,49 +118,58 @@ pub fn join(
     });
 
     let mut m = lock(mesh);
-    m.invites.clear();
+    let mut found = Vec::new();
     for (peer, bytes) in replies {
         match wire::decode(&bytes) {
             Ok(Payload::JoinPending { member, sig })
                 if member.endpoint == peer && wire::verify_member(&member, &sig) =>
             {
                 let code = sas::code(&m.me, &member);
-                m.invites.push((member, code));
+                found.push((member, code));
             }
             _ => m.journal.mesh(&format!("join_bad_reply from={peer}")),
         }
     }
+    m.set_invites(found);
     if m.invites.is_empty() {
         return Err(MeshProblem::NoOneAnswered);
     }
     Ok(joining(&m))
 }
 
-/// 批准（`yes`）或拒绝一条加入请求。`who` 是电脑名或端点。返回那台的名字。
+/// 新电脑上：用户认定 `endpoint` 那台的数字一样。之后只收它签的名单
+/// （它已经送来过的话，当场验、当场进组）。
+pub fn confirm(mesh: &Mutex<Mesh>, endpoint: &str) -> Result<(), MeshProblem> {
+    lock(mesh).confirm_inviter(endpoint)
+}
+
+/// 批准（`yes`）或拒绝一条加入请求。返回那台的名字。
+///
+/// `endpoint` 和 `code` 必须是界面刚给用户看过的那一条：端点定位请求，
+/// 数字再对一遍——用户点的「同意」只能落在他看过数字的那一条上。
 ///
 /// 批准：新名单 = 旧名单加上它，版本加一，我签；存下来之后发给名单上
 /// 除我以外的每一台（包括新来的那台——它靠这份名单进组）。
 pub fn approve(
     mesh: &Mutex<Mesh>,
     net: &dyn Net,
-    who: &str,
+    endpoint: &str,
+    code: &str,
     yes: bool,
 ) -> Result<String, MeshProblem> {
     let (name, payload, to) = {
         let mut m = lock(mesh);
         m.prune_pending();
-        let hits: Vec<usize> = m
+        let Some(i) = m
             .pending_joins
             .iter()
-            .enumerate()
-            .filter(|(_, (j, _, _))| j.member.endpoint == who || j.member.name == who)
-            .map(|(i, _)| i)
-            .collect();
-        let i = match hits.as_slice() {
-            [] => return Err(MeshProblem::NoSuchRequest(who.to_string())),
-            [i] => *i,
-            _ => return Err(MeshProblem::Ambiguous(who.to_string())),
+            .position(|(j, _, _)| j.member.endpoint == endpoint)
+        else {
+            return Err(MeshProblem::NoSuchRequest(endpoint.to_string()));
         };
+        if yes && m.pending_joins[i].1 != code {
+            return Err(MeshProblem::CodeMismatch);
+        }
         let joiner = m.pending_joins[i].0.member.clone();
         if !yes {
             m.pending_joins.remove(i);
@@ -270,7 +283,11 @@ mod tests {
 
     impl Node {
         fn new(hub: &Arc<FakeHub>, seed: u8, name: &str) -> Node {
-            let mesh = Arc::new(Mutex::new(Mesh::new(keys(seed), name.into(), None)));
+            Node::with_mesh(hub, Mesh::new(keys(seed), name.into(), None))
+        }
+
+        fn with_mesh(hub: &Arc<FakeHub>, mesh: Mesh) -> Node {
+            let mesh = Arc::new(Mutex::new(mesh));
             hub.register(mesh.clone());
             let ep = mesh.lock().unwrap().endpoint().to_string();
             Node {
@@ -289,8 +306,24 @@ mod tests {
             join(&self.mesh, &self.net, None)
         }
 
+        /// 跟 `dct peers approve <who>` 一样：先从现状里按名字或端点找到
+        /// 那一条，把它的端点**和数字**一起送去批。
         fn approve(&self, who: &str) -> Result<String, MeshProblem> {
-            approve(&self.mesh, &self.net, who, true)
+            let pending = self.view().pending;
+            let hits: Vec<&PendingJoin> = pending
+                .iter()
+                .filter(|p| p.endpoint == who || p.name == who)
+                .collect();
+            match hits.as_slice() {
+                [] => approve(&self.mesh, &self.net, who, "", true),
+                [p] => approve(&self.mesh, &self.net, &p.endpoint, &p.code, true),
+                _ => Err(MeshProblem::Ambiguous(who.to_string())),
+            }
+        }
+
+        /// 新电脑上的用户说「是 `inviter` 那台，数字一样」。
+        fn confirm(&self, inviter: &Node) -> Result<(), MeshProblem> {
+            confirm(&self.mesh, &inviter.ep)
         }
 
         fn view(&self) -> MeshView {
@@ -325,6 +358,7 @@ mod tests {
         assert!(a.login());
         assert!(b.login());
         b.join().unwrap();
+        b.confirm(&a).unwrap();
         assert_eq!(a.approve("B").unwrap(), "B");
         (a, b)
     }
@@ -368,6 +402,7 @@ mod tests {
         assert_eq!(pending[0].code, expected, "两边屏幕上的数字必须一样");
         assert_eq!(a.names(), ["A"], "没批之前名单不变");
 
+        b.confirm(&a).unwrap();
         assert_eq!(a.approve("B").unwrap(), "B");
         assert_eq!(a.names(), ["A", "B"]);
         assert_eq!(b.roster(), a.roster(), "B 从 A 那里拿到了同一份名单");
@@ -389,7 +424,9 @@ mod tests {
         assert_eq!(a.view().pending.len(), 1);
         assert_eq!(b.view().pending.len(), 1);
 
-        // B 批（按端点指）。A 收到 B 签的 v3，C 按邀请收下。
+        // C 的用户看过 B 屏幕上的数字，认定 B；B 批（按端点指）。A 收到
+        // B 签的 v3，C 按邀请收下。
+        c.confirm(&b).unwrap();
         assert_eq!(b.approve(&c.ep).unwrap(), "C");
         assert_eq!(b.names(), ["A", "B", "C"]);
         assert_eq!(a.roster(), b.roster(), "A 也收到了新名单");
@@ -447,8 +484,15 @@ mod tests {
             .unwrap();
         assert_eq!(a.names(), ["A"]);
 
+        // 冒牌货的端点配上 B 的数字（用户以为自己批的是 B）：数字对不上，不批。
+        assert_eq!(
+            approve(&a.mesh, &a.net, &m.ep, &b_code_for_a, true),
+            Err(MeshProblem::CodeMismatch)
+        );
+        assert_eq!(a.names(), ["A"]);
+
         // 用户看数字不对，拒绝。
-        assert_eq!(approve(&a.mesh, &a.net, &m.ep, false).unwrap(), "B");
+        assert_eq!(approve(&a.mesh, &a.net, &m.ep, "", false).unwrap(), "B");
         let pending = a.view().pending;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].endpoint, b.ep);
@@ -588,7 +632,11 @@ mod tests {
         let m = Node::new(&hub, 9, "M");
         m.login();
         let code = sas::code(&b.me(), &m.me());
-        b.mesh.lock().unwrap().invites.push((m.me(), code));
+        {
+            let mut bm = b.mesh.lock().unwrap();
+            bm.set_invites(vec![(m.me(), code)]);
+            bm.confirm_inviter(&m.ep).unwrap();
+        }
         let r = Roster {
             group: "evil".into(),
             version: 2,
@@ -621,9 +669,9 @@ mod tests {
         for seed in 10..(10 + super::super::MAX_PENDING as u8 + 3) {
             let n = Node::new(&hub, seed, &format!("n{seed}"));
             let req = n.mesh.lock().unwrap().join_request();
-            n.net
-                .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT)
-                .unwrap();
+            let _ = n
+                .net
+                .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT);
         }
         assert_eq!(a.view().pending.len(), super::super::MAX_PENDING);
     }
@@ -698,6 +746,7 @@ mod tests {
         hub.set_online(&m.ep, false);
         b.join().unwrap();
         hub.set_online(&m.ep, true);
+        b.confirm(&a).unwrap();
 
         // M 签一份把 B 加进 M 组的名单，直接发给 B。
         let mut r = Roster {
@@ -735,8 +784,10 @@ mod tests {
         let c = Node::new(&hub, 3, "C");
         c.login();
         c.join().unwrap();
+        c.confirm(&a).unwrap();
         a.approve("C").unwrap();
         assert_eq!(b.names(), ["A", "B", "C"]);
+        assert_eq!(c.names(), ["A", "B", "C"]);
 
         assert_eq!(
             remove(&a.mesh, &a.net, "A"),
@@ -809,5 +860,209 @@ mod tests {
         assert_eq!(a.names(), ["A"]);
         assert_eq!(a.view().pending.len(), 1);
         assert_eq!(b.names(), ["B"], "没存下就没发");
+    }
+
+    // —— Fix round 1：两边的人都认过数字，才进得了组 ——
+
+    /// 审查给的 PoC（C1）：中转往账号里塞一台自己的电脑 M，让它也回一句
+    /// `JoinPending`，然后推一份把 B 签进 M 组的名单。B 的用户只核对了 A
+    /// 的数字，M 的名单一律不收——认定之前、认定之后都不收。
+    #[test]
+    fn a_second_responder_that_was_never_compared_cannot_pull_the_joiner_in() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        let m = Node::new(&hub, 9, "M");
+        a.login();
+        b.login();
+        m.login();
+
+        let codes = b.join().unwrap();
+        assert_eq!(codes.len(), 2, "A 和 M 都回了话");
+        let evil = || {
+            let r = Roster {
+                group: m.roster().roster.group.clone(),
+                version: 2,
+                members: vec![m.me(), b.me()],
+            };
+            let signed = roster::sign(r, &m.me(), &keys(9));
+            m.net
+                .send(&b.ep, wire::encode(&Payload::Roster(signed)))
+                .unwrap();
+        };
+        // 用户还没认定哪一台：M 的名单不收。
+        evil();
+        assert_eq!(b.names(), ["B"]);
+        // 用户认定 A：M 先前送来的那份不会因此被收下，再送一份也不收。
+        b.confirm(&a).unwrap();
+        assert_eq!(b.names(), ["B"]);
+        evil();
+        assert_eq!(b.names(), ["B"]);
+        assert!(b.mesh.lock().unwrap().is_alone());
+
+        // A 批了：进的是 A 的组。
+        a.approve("B").unwrap();
+        assert_eq!(b.names(), ["A", "B"]);
+        assert_eq!(b.roster(), a.roster());
+    }
+
+    /// 那边先点了同意、这边后认定：名单先存着，认定那一刻验过就进组。
+    #[test]
+    fn a_roster_from_the_inviter_that_arrives_before_confirmation_is_taken_on_confirm() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+        b.join().unwrap();
+        a.approve("B").unwrap();
+        assert_eq!(b.names(), ["B"], "没认定之前不进组");
+        b.confirm(&a).unwrap();
+        assert_eq!(b.names(), ["A", "B"]);
+        assert!(b.view().joining.is_empty());
+    }
+
+    /// 邀请过了 `JOIN_TTL` 就作废：认定不了；认定过的，那台再送名单也不收。
+    #[test]
+    fn invites_expire_after_the_join_ttl() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let t0 = 1_800_000_000;
+        let ttl = super::super::JOIN_TTL.as_secs();
+
+        for confirm_first in [false, true] {
+            let hub = FakeHub::new();
+            let now = Arc::new(AtomicU64::new(t0));
+            let clock = now.clone();
+            let a = Node::new(&hub, 1, "A");
+            let b = Node::with_mesh(
+                &hub,
+                Mesh::new(keys(2), "B".into(), None)
+                    .with_clock(move || clock.load(Ordering::SeqCst)),
+            );
+            a.login();
+            b.login();
+            b.join().unwrap();
+            if confirm_first {
+                b.confirm(&a).unwrap();
+            }
+            now.store(t0 + ttl, Ordering::SeqCst);
+            if !confirm_first {
+                assert_eq!(b.confirm(&a), Err(MeshProblem::NoSuchInviter(a.ep.clone())));
+            }
+            a.approve("B").unwrap();
+            assert_eq!(
+                b.names(),
+                ["B"],
+                "过期的邀请不收（confirm_first={confirm_first}）"
+            );
+            assert!(b.view().joining.is_empty());
+        }
+
+        // 对照：期限之内一秒，照收。
+        let hub = FakeHub::new();
+        let now = Arc::new(AtomicU64::new(t0));
+        let clock = now.clone();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::with_mesh(
+            &hub,
+            Mesh::new(keys(2), "B".into(), None).with_clock(move || clock.load(Ordering::SeqCst)),
+        );
+        a.login();
+        b.login();
+        b.join().unwrap();
+        b.confirm(&a).unwrap();
+        now.store(t0 + ttl - 1, Ordering::SeqCst);
+        a.approve("B").unwrap();
+        assert_eq!(b.names(), ["A", "B"]);
+    }
+
+    #[test]
+    fn confirming_a_machine_that_never_answered_is_refused() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        let m = Node::new(&hub, 9, "M");
+        a.login();
+        b.login();
+        hub.set_online(&m.ep, false);
+        b.join().unwrap();
+        assert_eq!(b.confirm(&m), Err(MeshProblem::NoSuchInviter(m.ep.clone())));
+        assert_eq!(b.mesh.lock().unwrap().confirmed, None);
+    }
+
+    /// 审查给的 PoC（I1）：B 的请求挂着，攻击者灌一轮 `Join` 想把它挤掉，
+    /// 再换上一条同名的冒牌货。表满了就拒新的：B 那一条还在，冒牌货连
+    /// 回话都拿不到；用户按屏幕上的端点和数字批，批的就是 B。
+    #[test]
+    fn flooding_joins_cannot_evict_a_pending_request_or_slip_in_an_impostor() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+        b.join().unwrap();
+        let shown = a.view().pending[0].clone();
+        assert_eq!(shown.endpoint, b.ep);
+
+        let cap = super::super::MAX_PENDING;
+        for seed in 10..(10 + cap as u8 + 5) {
+            let n = Node::new(&hub, seed, &format!("n{seed}"));
+            let req = n.mesh.lock().unwrap().join_request();
+            let _ = n
+                .net
+                .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT);
+        }
+        let impostor = Node::new(&hub, 99, "B");
+        let req = impostor.mesh.lock().unwrap().join_request();
+        assert!(
+            impostor
+                .net
+                .ask(&a.ep, wire::encode(&Payload::Join(req)), JOIN_ASK_TIMEOUT)
+                .is_err(),
+            "满了，冒牌货拿不到回话"
+        );
+        let pending = a.view().pending;
+        assert_eq!(pending.len(), cap);
+        assert!(pending.iter().any(|p| p == &shown), "B 那一条没被挤掉");
+        assert!(!pending.iter().any(|p| p.endpoint == impostor.ep));
+
+        // 已经挂着的那台再问一次（比如重跑 dct join）：表满也照样更新。
+        b.join().unwrap();
+        assert_eq!(a.view().pending.len(), cap);
+
+        b.confirm(&a).unwrap();
+        assert_eq!(
+            approve(&a.mesh, &a.net, &shown.endpoint, &shown.code, true).unwrap(),
+            "B"
+        );
+        assert_eq!(b.names(), ["A", "B"]);
+    }
+
+    #[test]
+    fn approving_with_a_code_other_than_the_pending_one_is_refused() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "A");
+        let b = Node::new(&hub, 2, "B");
+        a.login();
+        b.login();
+        b.join().unwrap();
+        let shown = a.view().pending[0].clone();
+        let wrong: String = shown
+            .code
+            .chars()
+            .map(|c| {
+                if c == '9' {
+                    '0'
+                } else {
+                    char::from(c as u8 + 1)
+                }
+            })
+            .collect();
+        assert_eq!(
+            approve(&a.mesh, &a.net, &b.ep, &wrong, true),
+            Err(MeshProblem::CodeMismatch)
+        );
+        assert_eq!(a.names(), ["A"]);
+        assert_eq!(a.view().pending.len(), 1, "请求还挂着");
     }
 }

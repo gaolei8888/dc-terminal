@@ -3,8 +3,9 @@
 //! 这里只是把话说给人听：真正的事（换令牌、问别的电脑、签名单）都在守护
 //! 进程里做——它握着中转连接、钥匙和密钥仓，命令行这边一样也不碰。
 //!
-//! 跟守护进程说话的那一下（`call`）是参数，于是整套对话不起守护进程也能测。
-use std::io::Write;
+//! 跟守护进程说话的那一下（`call`）和问用户的那一下（`ask`）都是参数，
+//! 于是整套对话不起守护进程、不碰终端也能测。
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use anyhow::Result;
 
 use crate::client::Client;
 use crate::i18n::{msg, text, Key, Lang};
-use crate::proto::{ErrorCode, MeshProblem, MeshView, Request, Response};
+use crate::proto::{ErrorCode, MeshProblem, MeshView, PendingJoin, Request, Response};
 
 /// `dct join` 最多等多久有人点同意。跟对面那条请求的有效期一样长。
 const JOIN_WAIT: Duration = crate::mesh::JOIN_TTL;
@@ -22,6 +23,17 @@ const JOIN_POLL: Duration = Duration::from_secs(1);
 const SLOW_CALL: Duration = Duration::from_secs(40);
 
 type Call<'a> = &'a mut dyn FnMut(Request) -> Result<Response>;
+/// 把一句提示给用户看、读回他敲的一行。读不到（没有终端、EOF）是 `None`。
+type Ask<'a> = &'a mut dyn FnMut(&str) -> Option<String>;
+
+/// `dct join` 的参数。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct JoinOpts {
+    /// 顺手改名；空 = 不改。
+    pub name: String,
+    /// 不问了，直接认定这一台（脚本用）。
+    pub confirm: Option<String>,
+}
 
 pub fn run(args: &[String]) -> i32 {
     let sock = crate::proto::socket_path();
@@ -60,15 +72,25 @@ pub fn run(args: &[String]) -> i32 {
             client.call(req)
         }
     };
+    let mut ask = |prompt: &str| {
+        print!("{prompt}");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim().to_string()),
+        }
+    };
     match cmd {
         "login" => login(&mut call, &mut out, &mut err, lang),
         "join" => match parse_join(rest) {
-            Some(name) => join(
+            Some(opts) => join(
                 &mut call,
+                &mut ask,
                 &mut out,
                 &mut err,
                 lang,
-                &name,
+                &opts,
                 JOIN_WAIT,
                 &|| std::thread::sleep(JOIN_POLL),
             ),
@@ -77,7 +99,7 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
-        "peers" => peers(&mut call, &mut out, &mut err, lang, rest),
+        "peers" => peers(&mut call, &mut ask, &mut out, &mut err, lang, rest),
         _ => 2,
     }
 }
@@ -105,14 +127,41 @@ fn connect_or_start(sock: &Path) -> Option<Client> {
     None
 }
 
-/// `--name 公司Windows` / `--name=公司Windows`，或者什么都不给。`None` = 用法不对。
-fn parse_join(args: &[String]) -> Option<String> {
-    match args {
-        [] => Some(String::new()),
-        [flag, name] if flag == "--name" => Some(name.clone()),
-        [one] => one.strip_prefix("--name=").map(str::to_string),
-        _ => None,
+/// `--name X` / `--name=X`、`--confirm X` / `--confirm=X`，都可以不给。
+/// `None` = 用法不对。
+fn parse_join(args: &[String]) -> Option<JoinOpts> {
+    let mut opts = JoinOpts::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--name=") {
+            opts.name = v.to_string();
+        } else if let Some(v) = a.strip_prefix("--confirm=") {
+            opts.confirm = Some(v.to_string());
+        } else if a == "--name" {
+            opts.name = it.next()?.clone();
+        } else if a == "--confirm" {
+            opts.confirm = Some(it.next()?.clone());
+        } else {
+            return None;
+        }
     }
+    Some(opts)
+}
+
+/// 按名字或端点在一张列表里找一条。找不到、不止一条都是 `Err`。
+fn pick<'a>(list: &'a [PendingJoin], who: &str) -> Result<&'a PendingJoin, usize> {
+    let hits: Vec<&PendingJoin> = list
+        .iter()
+        .filter(|p| p.endpoint == who || p.name == who)
+        .collect();
+    match hits.as_slice() {
+        [p] => Ok(p),
+        _ => Err(hits.len()),
+    }
+}
+
+fn say_error(err: &mut dyn Write, lang: Lang, e: &ErrorCode) {
+    let _ = writeln!(err, "{}", msg::error(lang, e));
 }
 
 /// 问一次守护进程，要的是 `MeshView`。别的答复都当失败，原因印到 `err`。
@@ -120,15 +169,11 @@ fn view_of(call: Call, req: Request, err: &mut dyn Write, lang: Lang) -> Option<
     match call(req) {
         Ok(Response::Mesh(v)) => Some(v),
         Ok(Response::Error(e)) => {
-            let _ = writeln!(err, "{}", msg::error(lang, &e));
+            say_error(err, lang, &e);
             None
         }
         Ok(other) => {
-            let _ = writeln!(
-                err,
-                "{}",
-                msg::error(lang, &ErrorCode::Internal(format!("{other:?}")))
-            );
+            say_error(err, lang, &ErrorCode::Internal(format!("{other:?}")));
             None
         }
         Err(e) => {
@@ -136,7 +181,7 @@ fn view_of(call: Call, req: Request, err: &mut dyn Write, lang: Lang) -> Option<
                 Ok(c) => c.0,
                 Err(e) => ErrorCode::Internal(e.to_string()),
             };
-            let _ = writeln!(err, "{}", msg::error(lang, &code));
+            say_error(err, lang, &code);
             None
         }
     }
@@ -161,12 +206,20 @@ fn grouped(v: &MeshView) -> bool {
     v.members.iter().any(|m| !m.is_me)
 }
 
+/// 新电脑上：问一遍已有的电脑，列出每台的数字，**让用户说出是哪一台**
+/// （或者 `--confirm`），告诉守护进程只认那一台，然后等它的名单。
+///
+/// 不替用户挑：回话的电脑可能不止一台，其中哪台是中转塞进来的，只有看过
+/// 两块屏幕的人知道。只有一台回话也一样要他说一声——那一台同样可能是塞
+/// 进来的。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn join(
     call: Call,
+    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
-    name: &str,
+    opts: &JoinOpts,
     wait: Duration,
     pause: &dyn Fn(),
 ) -> i32 {
@@ -174,15 +227,11 @@ pub(crate) fn join(
         return 1;
     };
     if !now.logged_in {
-        let _ = writeln!(
-            err,
-            "{}",
-            msg::error(lang, &ErrorCode::Mesh(MeshProblem::NotLoggedIn))
-        );
+        say_error(err, lang, &ErrorCode::Mesh(MeshProblem::NotLoggedIn));
         return 1;
     }
     let req = Request::MeshJoin {
-        name: name.to_string(),
+        name: opts.name.clone(),
     };
     let Some(asked) = view_of(call, req, err, lang) else {
         return 1;
@@ -190,6 +239,7 @@ pub(crate) fn join(
     match asked.joining.as_slice() {
         [one] => {
             let _ = writeln!(out, "{}", msg::mesh_compare_codes(lang, Some(&one.code)));
+            let _ = writeln!(out, "{}", msg::mesh_code_line(lang, &one.name, &one.code));
         }
         many => {
             let _ = writeln!(out, "{}", msg::mesh_compare_codes(lang, None));
@@ -197,6 +247,39 @@ pub(crate) fn join(
                 let _ = writeln!(out, "{}", msg::mesh_code_line(lang, &j.name, &j.code));
             }
         }
+    }
+    let _ = out.flush();
+
+    let choice = match &opts.confirm {
+        Some(c) => Some(c.clone()),
+        None => ask(&msg::mesh_which_computer(lang)),
+    };
+    let choice = choice.map(|c| c.trim().to_string()).unwrap_or_default();
+    if choice.is_empty() {
+        let _ = writeln!(err, "{}", msg::mesh_join_cancelled(lang));
+        return 1;
+    }
+    let inviter = match pick(&asked.joining, &choice) {
+        Ok(p) => p.clone(),
+        Err(0) => {
+            let _ = writeln!(err, "{}", msg::mesh_not_a_responder(lang, &choice));
+            return 1;
+        }
+        Err(_) => {
+            say_error(err, lang, &ErrorCode::Mesh(MeshProblem::Ambiguous(choice)));
+            return 1;
+        }
+    };
+    let req = Request::MeshConfirmInviter {
+        endpoint: inviter.endpoint.clone(),
+    };
+    let Some(v) = view_of(call, req, err, lang) else {
+        return 1;
+    };
+    // 那边可能已经点过同意：认定的那一刻就进组了。
+    if grouped(&v) {
+        let _ = writeln!(out, "{}", msg::mesh_joined_group(lang));
+        return 0;
     }
     let _ = writeln!(out, "{}", msg::mesh_waiting_for_approval(lang));
     let _ = out.flush();
@@ -219,6 +302,7 @@ pub(crate) fn join(
 
 pub(crate) fn peers(
     call: Call,
+    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
@@ -231,11 +315,7 @@ pub(crate) fn peers(
                 return 1;
             };
             if !v.logged_in {
-                let _ = writeln!(
-                    err,
-                    "{}",
-                    msg::error(lang, &ErrorCode::Mesh(MeshProblem::NotLoggedIn))
-                );
+                say_error(err, lang, &ErrorCode::Mesh(MeshProblem::NotLoggedIn));
                 return 1;
             }
             let _ = writeln!(out, "{}", msg::mesh_members_header(lang));
@@ -257,23 +337,50 @@ pub(crate) fn peers(
         }
         ["approve", who] | ["approve", who, "--no"] => {
             let yes = args.len() == 2;
-            let req = Request::MeshApprove {
-                endpoint: who.to_string(),
-                yes,
-            };
-            let Some(v) = view_of(call, req, err, lang) else {
+            // 先看一眼挂着的是哪一条，把名字和数字再给用户看一遍；送去批的
+            // 是**这次给他看的**端点和数字，守护进程两样都对上才批。
+            let Some(v) = view_of(call, Request::MeshStatus, err, lang) else {
                 return 1;
             };
+            let p = match pick(&v.pending, who) {
+                Ok(p) => p.clone(),
+                Err(0) => {
+                    say_error(
+                        err,
+                        lang,
+                        &ErrorCode::Mesh(MeshProblem::NoSuchRequest(who.to_string())),
+                    );
+                    return 1;
+                }
+                Err(_) => {
+                    say_error(
+                        err,
+                        lang,
+                        &ErrorCode::Mesh(MeshProblem::Ambiguous(who.to_string())),
+                    );
+                    return 1;
+                }
+            };
             if yes {
-                let name = v
-                    .members
-                    .iter()
-                    .find(|m| m.endpoint == *who || m.name == *who)
-                    .map(|m| m.name.as_str())
-                    .unwrap_or(who);
-                let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, name));
+                let q = format!("{} ", msg::mesh_join_prompt(lang, &p.name, &p.code));
+                let said_yes = ask(&q).is_some_and(|a| a.trim().eq_ignore_ascii_case("y"));
+                if !said_yes {
+                    let _ = writeln!(out, "{}", msg::mesh_not_approved(lang));
+                    return 1;
+                }
+            }
+            let req = Request::MeshApprove {
+                endpoint: p.endpoint.clone(),
+                code: p.code.clone(),
+                yes,
+            };
+            if view_of(call, req, err, lang).is_none() {
+                return 1;
+            }
+            if yes {
+                let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &p.name));
             } else {
-                let _ = writeln!(out, "{}", msg::mesh_member_refused(lang, who));
+                let _ = writeln!(out, "{}", msg::mesh_member_refused(lang, &p.name));
             }
             0
         }
@@ -297,7 +404,7 @@ pub(crate) fn peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{MemberView, PendingJoin};
+    use crate::proto::MemberView;
     use std::cell::RefCell;
 
     fn view(logged_in: bool, members: &[(&str, bool)]) -> MeshView {
@@ -387,34 +494,58 @@ mod tests {
         );
     }
 
+    fn pj(name: &str, ep: &str, code: &str) -> PendingJoin {
+        PendingJoin {
+            name: name.into(),
+            endpoint: ep.into(),
+            code: code.into(),
+        }
+    }
+
+    fn no_ask(_: &str) -> Option<String> {
+        panic!("不该问用户")
+    }
+
+    fn opts(confirm: Option<&str>) -> JoinOpts {
+        JoinOpts {
+            name: String::new(),
+            confirm: confirm.map(str::to_string),
+        }
+    }
+
+    /// 两台回了话：逐台列数字，问是哪一台，用户说「家里Mac」，送去认定的
+    /// 就是它的端点；然后等到名单。
     #[test]
-    fn join_prints_one_code_per_computer_and_waits_for_the_roster() {
+    fn join_lists_codes_asks_which_computer_and_confirms_that_one() {
         let mut asked = view(true, &[("B", true)]);
         asked.joining = vec![
-            PendingJoin {
-                name: "家里Mac".into(),
-                endpoint: "c-a".into(),
-                code: "111111".into(),
-            },
-            PendingJoin {
-                name: "办公室".into(),
-                endpoint: "c-c".into(),
-                code: "222222".into(),
-            },
+            pj("家里Mac", "c-a", "111111"),
+            pj("办公室", "c-c", "222222"),
         ];
         let sc = Script::new(vec![
             Response::Mesh(view(true, &[("B", true)])),
             Response::Mesh(asked),
             Response::Mesh(view(true, &[("B", true)])),
+            Response::Mesh(view(true, &[("B", true)])),
             Response::Mesh(view(true, &[("B", true), ("家里Mac", false)])),
         ]);
+        let prompts = RefCell::new(Vec::<String>::new());
+        let mut ask = |p: &str| {
+            prompts.borrow_mut().push(p.to_string());
+            Some("办公室".to_string())
+        };
         let (mut out, mut err) = (vec![], vec![]);
+        let o = JoinOpts {
+            name: "公司Windows".into(),
+            confirm: None,
+        };
         let code = join(
             &mut sc.call(),
+            &mut ask,
             &mut out,
             &mut err,
             Lang::Zh,
-            "公司Windows",
+            &o,
             Duration::from_secs(60),
             &|| {},
         );
@@ -423,57 +554,124 @@ mod tests {
         assert!(o.contains("  家里Mac：111111"), "{o}");
         assert!(o.contains("  办公室：222222"), "{o}");
         assert!(o.trim_end().ends_with("已加入"), "{o}");
-        assert!(sc.seen.borrow()[1].contains("公司Windows"));
+        assert_eq!(prompts.borrow().len(), 1);
+        assert!(prompts.borrow()[0].contains("哪一台电脑"));
+        let seen = sc.seen.borrow();
+        assert!(seen[1].contains("公司Windows"));
+        assert_eq!(seen[2], r#"MeshConfirmInviter { endpoint: "c-c" }"#);
     }
 
     #[test]
-    fn join_with_one_computer_puts_the_code_in_the_sentence() {
+    fn join_with_one_computer_puts_the_code_in_the_sentence_and_still_asks() {
         let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![PendingJoin {
-            name: "A".into(),
-            endpoint: "c-a".into(),
-            code: "654321".into(),
-        }];
+        asked.joining = vec![pj("A", "c-a", "654321")];
+        let sc = Script::new(vec![
+            Response::Mesh(view(true, &[("B", true)])),
+            Response::Mesh(asked),
+            // 那边已经点过同意：认定那一刻就进组了，不再等。
+            Response::Mesh(view(true, &[("B", true), ("A", false)])),
+        ]);
+        let asked_user = RefCell::new(false);
+        let mut ask = |_: &str| {
+            *asked_user.borrow_mut() = true;
+            Some("A".to_string())
+        };
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = join(
+            &mut sc.call(),
+            &mut ask,
+            &mut out,
+            &mut err,
+            Lang::Zh,
+            &opts(None),
+            Duration::from_secs(60),
+            &|| panic!("不该再等"),
+        );
+        assert_eq!(code, 0);
+        assert!(*asked_user.borrow(), "只有一台也要用户说一声");
+        assert!(s(&out).contains(
+            "请在你已有的任意一台电脑上看一眼：那边会显示一个 6 位数，跟这里的 654321 一样就点同意"
+        ));
+    }
+
+    /// `--confirm` 不问用户，直接认定。
+    #[test]
+    fn join_confirm_flag_skips_the_question() {
+        let mut asked = view(true, &[("B", true)]);
+        asked.joining = vec![pj("A", "c-a", "1"), pj("M", "c-m", "2")];
         let sc = Script::new(vec![
             Response::Mesh(view(true, &[("B", true)])),
             Response::Mesh(asked),
             Response::Mesh(view(true, &[("B", true), ("A", false)])),
         ]);
         let (mut out, mut err) = (vec![], vec![]);
-        join(
+        let code = join(
             &mut sc.call(),
+            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
-            "",
+            &opts(Some("A")),
             Duration::from_secs(60),
             &|| {},
         );
-        assert!(s(&out).contains(
-            "请在你已有的任意一台电脑上看一眼：那边会显示一个 6 位数，跟这里的 654321 一样就点同意"
-        ));
+        assert_eq!(code, 0);
+        assert_eq!(
+            sc.seen.borrow()[2],
+            r#"MeshConfirmInviter { endpoint: "c-a" }"#
+        );
+    }
+
+    /// 数字都对不上（直接回车）、说了一台没回过话的：不认定任何一台，退 1。
+    #[test]
+    fn join_without_a_matching_computer_confirms_nothing() {
+        for (answer, want) in [
+            (Some(""), "没有加入"),
+            (None, "没有加入"),
+            (Some("Z"), "没有叫 Z 的电脑回应过这次加入"),
+        ] {
+            let mut asked = view(true, &[("B", true)]);
+            asked.joining = vec![pj("A", "c-a", "1")];
+            let sc = Script::new(vec![
+                Response::Mesh(view(true, &[("B", true)])),
+                Response::Mesh(asked),
+            ]);
+            let mut ask = |_: &str| answer.map(str::to_string);
+            let (mut out, mut err) = (vec![], vec![]);
+            let code = join(
+                &mut sc.call(),
+                &mut ask,
+                &mut out,
+                &mut err,
+                Lang::Zh,
+                &opts(None),
+                Duration::from_secs(60),
+                &|| {},
+            );
+            assert_eq!(code, 1);
+            assert!(s(&err).contains(want), "{answer:?}: {}", s(&err));
+            assert_eq!(sc.seen.borrow().len(), 2, "没送认定");
+        }
     }
 
     #[test]
     fn join_gives_up_after_the_wait() {
         let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![PendingJoin {
-            name: "A".into(),
-            endpoint: "c-a".into(),
-            code: "1".into(),
-        }];
+        asked.joining = vec![pj("A", "c-a", "1")];
         let sc = Script::new(vec![
             Response::Mesh(view(true, &[("B", true)])),
             Response::Mesh(asked),
+            Response::Mesh(view(true, &[("B", true)])),
             Response::Mesh(view(true, &[("B", true)])),
         ]);
         let (mut out, mut err) = (vec![], vec![]);
         let code = join(
             &mut sc.call(),
+            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
-            "",
+            &opts(Some("A")),
             Duration::ZERO,
             &|| {},
         );
@@ -487,10 +685,11 @@ mod tests {
         let (mut out, mut err) = (vec![], vec![]);
         let code = join(
             &mut sc.call(),
+            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
-            "",
+            &opts(None),
             Duration::ZERO,
             &|| {},
         );
@@ -501,24 +700,35 @@ mod tests {
     #[test]
     fn join_arguments() {
         let a = |v: &[&str]| parse_join(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(a(&[]), Some(String::new()));
-        assert_eq!(a(&["--name", "公司Windows"]), Some("公司Windows".into()));
-        assert_eq!(a(&["--name=家里"]), Some("家里".into()));
+        assert_eq!(a(&[]), Some(JoinOpts::default()));
+        assert_eq!(a(&["--name", "公司Windows"]).unwrap().name, "公司Windows");
+        assert_eq!(a(&["--name=家里"]).unwrap().name, "家里");
+        let both = a(&["--name", "N", "--confirm", "家里Mac"]).unwrap();
+        assert_eq!(both.name, "N");
+        assert_eq!(both.confirm.as_deref(), Some("家里Mac"));
+        assert_eq!(a(&["--confirm=A"]).unwrap().confirm.as_deref(), Some("A"));
         assert_eq!(a(&["--nope"]), None);
         assert_eq!(a(&["--name"]), None);
+        assert_eq!(a(&["--confirm"]), None);
     }
 
     #[test]
     fn peers_lists_members_and_asks_about_pending_joins() {
         let mut v = view(true, &[("B", true), ("A", false)]);
-        v.pending = vec![PendingJoin {
-            name: "公司Windows".into(),
-            endpoint: "c-w".into(),
-            code: "123456".into(),
-        }];
+        v.pending = vec![pj("公司Windows", "c-w", "123456")];
         let sc = Script::new(vec![Response::Mesh(v)]);
         let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(peers(&mut sc.call(), &mut out, &mut err, Lang::Zh, &[]), 0);
+        assert_eq!(
+            peers(
+                &mut sc.call(),
+                &mut no_ask,
+                &mut out,
+                &mut err,
+                Lang::Zh,
+                &[]
+            ),
+            0
+        );
         let o = s(&out);
         assert!(o.contains("  B  (这台)"), "{o}");
         assert!(o.contains(
@@ -527,18 +737,30 @@ mod tests {
         assert!(o.contains("dct peers approve 公司Windows"), "{o}");
     }
 
-    #[test]
-    fn peers_approve_refuse_and_remove_say_what_happened() {
-        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let (mut out, mut err) = (vec![], vec![]);
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
-        let sc = Script::new(vec![Response::Mesh(view(
-            true,
-            &[("B", true), ("C", false)],
-        ))]);
+    /// `approve <名字>`：再给用户看一遍名字和数字，答 y 才送；送的是这次
+    /// 给他看的那条的端点和数字。
+    #[test]
+    fn peers_approve_reshows_the_code_and_sends_endpoint_and_code() {
+        let mut v = view(true, &[("B", true)]);
+        v.pending = vec![pj("C", "c-c", "123456")];
+        let sc = Script::new(vec![
+            Response::Mesh(v.clone()),
+            Response::Mesh(view(true, &[("B", true), ("C", false)])),
+        ]);
+        let shown = RefCell::new(String::new());
+        let mut ask = |p: &str| {
+            *shown.borrow_mut() = p.to_string();
+            Some("y".to_string())
+        };
+        let (mut out, mut err) = (vec![], vec![]);
         assert_eq!(
             peers(
                 &mut sc.call(),
+                &mut ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -546,25 +768,77 @@ mod tests {
             ),
             0
         );
-        assert!(sc.seen.borrow()[0].contains("yes: true"));
+        assert!(shown.borrow().contains("一台叫 C 的电脑") && shown.borrow().contains("123456"));
+        assert_eq!(
+            sc.seen.borrow()[1],
+            r#"MeshApprove { endpoint: "c-c", code: "123456", yes: true }"#
+        );
         assert!(s(&out).contains("C 已加入"));
 
-        let sc = Script::new(vec![Response::Mesh(view(true, &[("B", true)]))]);
+        // 答 n：什么都不送。
+        let sc = Script::new(vec![Response::Mesh(v.clone())]);
+        let mut ask = |_: &str| Some("n".to_string());
+        out.clear();
+        assert_eq!(
+            peers(
+                &mut sc.call(),
+                &mut ask,
+                &mut out,
+                &mut err,
+                Lang::Zh,
+                &args(&["approve", "C"])
+            ),
+            1
+        );
+        assert_eq!(sc.seen.borrow().len(), 1);
+        assert!(s(&out).contains("没有批准"));
+
+        // --no：不问，直接拒。
+        let sc = Script::new(vec![
+            Response::Mesh(v.clone()),
+            Response::Mesh(view(true, &[("B", true)])),
+        ]);
         out.clear();
         peers(
             &mut sc.call(),
+            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
-            &args(&["approve", "C", "--no"]),
+            &args(&["approve", "c-c", "--no"]),
         );
-        assert!(sc.seen.borrow()[0].contains("yes: false"));
+        assert!(sc.seen.borrow()[1].contains("yes: false"));
         assert!(s(&out).contains("已拒绝 C"));
+    }
 
+    #[test]
+    fn peers_approve_with_two_of_the_same_name_asks_for_the_endpoint() {
+        let mut v = view(true, &[("B", true)]);
+        v.pending = vec![pj("C", "c-c", "1"), pj("C", "c-x", "2")];
+        let sc = Script::new(vec![Response::Mesh(v)]);
+        let (mut out, mut err) = (vec![], vec![]);
+        assert_eq!(
+            peers(
+                &mut sc.call(),
+                &mut no_ask,
+                &mut out,
+                &mut err,
+                Lang::Zh,
+                &args(&["approve", "C"])
+            ),
+            1
+        );
+        assert!(s(&err).contains("不止一台叫 C"));
+        assert_eq!(sc.seen.borrow().len(), 1);
+    }
+
+    #[test]
+    fn peers_remove_and_usage() {
+        let (mut out, mut err) = (vec![], vec![]);
         let sc = Script::new(vec![Response::Mesh(view(true, &[("B", true)]))]);
-        out.clear();
         peers(
             &mut sc.call(),
+            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -579,6 +853,7 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
+                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -592,6 +867,7 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
+                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,

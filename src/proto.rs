@@ -121,7 +121,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 20 = 多电脑：多了 `Request::MeshStatus` / `MeshLogin` / `MeshJoin` /
 /// `MeshApprove` / `MeshRemove`、`Response::Mesh(MeshView)`、
 /// `ErrorCode::Mesh(MeshProblem)`。新增 `Request` 变体那条规矩同 14。
-pub const PROTOCOL_VERSION: u32 = 20;
+///
+/// 21 = 加入要两边的人都认过数字：多了 `Request::MeshConfirmInviter`（新电脑
+/// 上认定是哪一台），`MeshApprove` 多了 `code`（批准的必须就是屏幕上显示的
+/// 那一条），`MeshProblem` 多了 `NoSuchInviter` / `CodeMismatch`。
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,10 +516,20 @@ pub enum Request {
     MeshJoin {
         name: String,
     },
-    /// 批准（`yes`）或拒绝一台等着加入的电脑。`endpoint` 也可以是电脑名。
+    /// 批准（`yes`）或拒绝一台等着加入的电脑。
+    ///
+    /// `endpoint` 和 `code` 都是**界面刚给用户看过的那一条**：守护进程要两样
+    /// 都跟挂着的请求对上才批。只按名字批的话，攻击者可以换上一条同名的
+    /// 请求，用户点的「同意」就落到了冒牌货身上。
     MeshApprove {
         endpoint: String,
+        code: String,
         yes: bool,
+    },
+    /// 新电脑上：用户核对过数字，认定是 `endpoint` 这一台。只有它签的名单
+    /// 能让这台电脑进组。
+    MeshConfirmInviter {
+        endpoint: String,
     },
     /// 把一台电脑移出组。不能是自己。
     MeshRemove {
@@ -652,10 +666,19 @@ impl std::fmt::Debug for Request {
             Request::MeshStatus => write!(f, "MeshStatus"),
             Request::MeshLogin => write!(f, "MeshLogin"),
             Request::MeshJoin { name } => f.debug_struct("MeshJoin").field("name", name).finish(),
-            Request::MeshApprove { endpoint, yes } => f
+            Request::MeshApprove {
+                endpoint,
+                code,
+                yes,
+            } => f
                 .debug_struct("MeshApprove")
                 .field("endpoint", endpoint)
+                .field("code", code)
                 .field("yes", yes)
+                .finish(),
+            Request::MeshConfirmInviter { endpoint } => f
+                .debug_struct("MeshConfirmInviter")
+                .field("endpoint", endpoint)
                 .finish(),
             Request::MeshRemove { name } => {
                 f.debug_struct("MeshRemove").field("name", name).finish()
@@ -1065,6 +1088,11 @@ pub enum MeshProblem {
     NameTaken(String),
     /// 不能移除这台电脑自己。
     CannotRemoveSelf,
+    /// 新电脑上认定的那台没回应过这次加入（或者已经过了 10 分钟）。
+    NoSuchInviter(String),
+    /// 要批准的那条请求的数字跟屏幕上显示的对不上——挂着的已经不是用户
+    /// 看到的那一条了。
+    CodeMismatch,
     /// 名单存不下。
     NotSaved,
 }
@@ -1397,17 +1425,21 @@ mod tests {
             Request::MeshJoin { name: "n".into() },
             Request::MeshApprove {
                 endpoint: "c-x".into(),
+                code: "123456".into(),
                 yes: true,
             },
             Request::MeshRemove { name: "n".into() },
+            Request::MeshConfirmInviter {
+                endpoint: "c-x".into(),
+            },
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                20,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","yes":true}},{"MeshRemove":{"name":"n"}}]"#
+                21,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","code":"123456","yes":true}},{"MeshRemove":{"name":"n"}},{"MeshConfirmInviter":{"endpoint":"c-x"}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1431,7 +1463,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                20,
+                21,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1540,7 +1572,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                20,
+                21,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1643,7 +1675,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (20, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (21, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1661,7 +1693,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (20, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (21, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1738,7 +1770,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                20,
+                21,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )

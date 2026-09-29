@@ -319,10 +319,19 @@ fn handle_mesh(
             .ok_or(MeshProblem::NotLoggedIn)
             .and_then(|(m, n)| group::join(&m, n.as_ref(), Some(&name)))
             .map(|_| view(ctl)),
-        Request::MeshApprove { endpoint, yes } => ctl
+        Request::MeshApprove {
+            endpoint,
+            code,
+            yes,
+        } => ctl
             .running()
             .ok_or(MeshProblem::NotLoggedIn)
-            .and_then(|(m, n)| group::approve(&m, n.as_ref(), &endpoint, yes))
+            .and_then(|(m, n)| group::approve(&m, n.as_ref(), &endpoint, &code, yes))
+            .map(|_| view(ctl)),
+        Request::MeshConfirmInviter { endpoint } => ctl
+            .running()
+            .ok_or(MeshProblem::NotLoggedIn)
+            .and_then(|(m, _)| group::confirm(&m, &endpoint))
             .map(|_| view(ctl)),
         Request::MeshRemove { name } => ctl
             .running()
@@ -391,6 +400,16 @@ fn mesh_login(
             .map_err(|_| MeshProblem::NotSaved)?;
     }
     let mesh = {
+        // `start_mesh` 在槽锁里调是安全的：
+        // - 它**不打网络**：只读磁盘（钥匙、名单、config）、建一条线程；
+        // - 它拿的锁只有两把，都不会反过来等这个槽：secrets 的锁（读一眼令牌
+        //   就放，上面换令牌时已经放掉了；持有 secrets 锁的别处——续期闭包、
+        //   密钥页——从不碰这个槽），和它自己刚新建的 `Mesh` 的锁（别人还拿
+        //   不到）；
+        // - `link::spawn` 起的线程不碰这个槽。
+        // 攥着槽锁反倒是必须的：
+        // 两个 `dct login` 同时走到这里，不锁的话会各起一条连接，其中一条
+        // 永远没人叫停。
         let mut slot = recover(ctl.slot.lock());
         if let Some(rt) = slot.as_ref() {
             rt.token.set(token);
@@ -821,6 +840,7 @@ fn serve(
                 | Request::MeshLogin
                 | Request::MeshJoin { .. }
                 | Request::MeshApprove { .. }
+                | Request::MeshConfirmInviter { .. }
                 | Request::MeshRemove { .. }),
             ) => handle_mesh(
                 req,
@@ -1187,6 +1207,7 @@ fn handle(
         | Request::MeshLogin
         | Request::MeshJoin { .. }
         | Request::MeshApprove { .. }
+        | Request::MeshConfirmInviter { .. }
         | Request::MeshRemove { .. } => Ok(Response::Error(ErrorCode::BadRequest(
             "Mesh requests are local only".into(),
         ))),
@@ -3544,7 +3565,11 @@ mod tests {
             Request::MeshJoin { name: String::new() },
             Request::MeshApprove {
                 endpoint: "c-x".into(),
+                code: "123456".into(),
                 yes: true,
+            },
+            Request::MeshConfirmInviter {
+                endpoint: "c-x".into(),
             },
             Request::MeshRemove { name: "x".into() },
         ] {
@@ -4014,7 +4039,11 @@ mod mesh_tests {
             Request::MeshJoin { name: String::new() },
             Request::MeshApprove {
                 endpoint: "x".into(),
+                code: "1".into(),
                 yes: true,
+            },
+            Request::MeshConfirmInviter {
+                endpoint: "x".into(),
             },
             Request::MeshRemove { name: "x".into() },
         ] {

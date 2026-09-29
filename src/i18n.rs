@@ -2016,6 +2016,16 @@ pub mod msg {
                 en: "A computer cannot remove itself. Remove it from one of your other computers".to_string(),
                 zh: "不能移除这台电脑自己。到你的另一台电脑上移除它".to_string(),
             ),
+            NoSuchInviter(who) => t!(
+                lang,
+                en: format!("{who} did not answer this join request, or it is more than 10 minutes old. Run dct join again"),
+                zh: format!("{who} 没回应过这次加入，或者已经过了 10 分钟。重新运行 dct join"),
+            ),
+            CodeMismatch => t!(
+                lang,
+                en: "The number does not match: the request waiting now is not the one you looked at. Run dct peers and check again".to_string(),
+                zh: "数字对不上：现在等着的已经不是你看过的那一条请求了。重新运行 dct peers 再看一眼".to_string(),
+            ),
             NotSaved => t!(
                 lang,
                 en: "Could not save the group list on this computer. Nothing was changed".to_string(),
@@ -2066,6 +2076,40 @@ pub mod msg {
             lang,
             en: format!("  {name}: {code}"),
             zh: format!("  {name}：{code}"),
+        )
+    }
+
+    /// 新电脑上：列完数字之后，问是哪一台。
+    pub fn mesh_which_computer(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Which computer shows the same number on its screen? Type its name (press Enter if none match — do not join): ".to_string(),
+            zh: "哪一台电脑屏幕上显示的是同一个数字？输入它的名字（都对不上就直接回车，不要加入）：".to_string(),
+        )
+    }
+
+    pub fn mesh_not_a_responder(lang: Lang, input: &str) -> String {
+        t!(
+            lang,
+            en: format!("No computer called {input} answered this join request"),
+            zh: format!("没有叫 {input} 的电脑回应过这次加入"),
+        )
+    }
+
+    /// `dct peers approve` 问 y/n 时没答 y。
+    pub fn mesh_not_approved(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Not approved. The request is still waiting".to_string(),
+            zh: "没有批准，请求还挂着".to_string(),
+        )
+    }
+
+    pub fn mesh_join_cancelled(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Not joined. If the numbers do not match, do not approve on the other computer".to_string(),
+            zh: "没有加入。数字对不上的话，别在那边点同意".to_string(),
         )
     }
 
@@ -2145,8 +2189,8 @@ pub mod msg {
     pub fn mesh_join_usage(lang: Lang) -> String {
         t!(
             lang,
-            en: "Usage: dct join [--name <computer name>]".to_string(),
-            zh: "用法：dct join [--name 电脑名]".to_string(),
+            en: "Usage: dct join [--name <computer name>] [--confirm <name of the computer whose number matches>]".to_string(),
+            zh: "用法：dct join [--name 电脑名] [--confirm 数字对得上的那台电脑的名字]".to_string(),
         )
     }
 
@@ -3027,6 +3071,8 @@ mod tests {
             Mesh(crate::proto::MeshProblem::NameTaken("pc".into())),
             Mesh(crate::proto::MeshProblem::CannotRemoveSelf),
             Mesh(crate::proto::MeshProblem::NotSaved),
+            Mesh(crate::proto::MeshProblem::NoSuchInviter("pc".into())),
+            Mesh(crate::proto::MeshProblem::CodeMismatch),
             // `LoginFailed` 不在这里：它带的原因是网关那层给的中文，同 `Git`
             // 照抄原文，英文里会有汉字，见下面那条单独的测试。
         ];
@@ -3095,6 +3141,10 @@ mod tests {
             msg::mesh_member_line(Lang::En, "pc", true, true),
             msg::mesh_peers_usage(Lang::En),
             msg::mesh_join_usage(Lang::En),
+            msg::mesh_which_computer(Lang::En),
+            msg::mesh_not_a_responder(Lang::En, "pc"),
+            msg::mesh_join_cancelled(Lang::En),
+            msg::mesh_not_approved(Lang::En),
         ] {
             assert!(!has_han(&s), "英文里有汉字：{s}");
         }

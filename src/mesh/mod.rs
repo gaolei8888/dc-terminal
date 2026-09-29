@@ -53,7 +53,20 @@ pub const JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60
 
 /// 最多同时挂几条等批准的加入请求。同账号里的一台电脑能一直发 `Join`，
 /// 不设上限的话这张表就是一个谁都能灌的口子。
+///
+/// **满了就拒新的，不挤掉旧的。** 挤旧的话，攻击者灌一轮就能把用户正在
+/// 核对的那条请求挤出去，再换上一条同名的冒牌货。
 const MAX_PENDING: usize = 16;
+
+/// 新电脑这边：一台回过我 `JoinPending` 的已有电脑。
+#[derive(Debug, Clone)]
+pub struct Invite {
+    pub member: Member,
+    /// 我给它算的 6 位数。
+    pub code: String,
+    /// 什么时候回的（`clock` 的 unix 秒）。过了 `JOIN_TTL` 作废。
+    pub at: u64,
+}
 
 /// 还没解析到具体会话的留言放在这个键下面。会话 id 从 1 数起，0 不会撞上。
 /// Task 7 按会话名解析、投递。
@@ -122,9 +135,16 @@ pub struct Mesh {
     /// 等人批准的加入请求：请求、6 位核对码、收到的时间。
     pub pending_joins: Vec<(JoinRequest, String, Instant)>,
     /// 这台电脑自己在请求加入：回过我 `JoinPending` 的已有电脑，和我给它
-    /// 算的 6 位数。**只有这里面的电脑签的名单，能成为我进组的第一份**
-    /// （`roster::accept_invite`）。
-    pub invites: Vec<(Member, String)>,
+    /// 算的 6 位数。
+    pub invites: Vec<Invite>,
+    /// 用户核对过数字、认定的那一台（端点）。**只有它签的名单能成为我进组
+    /// 的第一份**（`roster::accept_invite`）。回过话的电脑不止它一台时，其余
+    /// 的谁都没被人核对过——中转可以塞进来一台自己的电脑，让它也回一句。
+    pub confirmed: Option<String>,
+    /// 用户还没认定之前，回过话的电脑先送来的名单。那边的人可能先点了同意，
+    /// 这边的人还没敲名字；先存着，认定的那一刻再验。别的电脑送来的永远
+    /// 用不上。每台最多一份。
+    held: Vec<SignedRoster>,
     /// 按会话 id 排队的留言。Task 7 投递。
     pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
     store: Option<store::Store>,
@@ -159,6 +179,8 @@ impl Mesh {
             roster,
             pending_joins: Vec::new(),
             invites: Vec::new(),
+            confirmed: None,
+            held: Vec::new(),
             queues: HashMap::new(),
             store: None,
             journal: Arc::new(Journal::new()),
@@ -329,11 +351,15 @@ impl Mesh {
         }
         let code = sas::code(&self.me, &req.member);
         self.prune_pending();
+        let again = self
+            .pending_joins
+            .iter()
+            .any(|(j, _, _)| j.member.endpoint == req.member.endpoint);
+        if !again && self.pending_joins.len() >= MAX_PENDING {
+            return self.drop(env, "join_pending_full");
+        }
         self.pending_joins
             .retain(|(j, _, _)| j.member.endpoint != req.member.endpoint);
-        if self.pending_joins.len() >= MAX_PENDING {
-            self.pending_joins.remove(0);
-        }
         self.journal
             .mesh(&format!("join_pending from={}", env.from));
         self.pending_joins.push((req, code, Instant::now()));
@@ -343,17 +369,58 @@ impl Mesh {
         }))
     }
 
+    /// 换一批回过话的电脑（新的一次 `dct join`）。之前认定的、存着的都作废。
+    pub fn set_invites(&mut self, found: Vec<(Member, String)>) {
+        let at = (self.clock)();
+        self.invites = found
+            .into_iter()
+            .map(|(member, code)| Invite { member, code, at })
+            .collect();
+        self.confirmed = None;
+        self.held.clear();
+    }
+
+    /// 扔掉过期的邀请，以及跟着它们的认定。（存着的名单不用跟着清：它只在
+    /// `confirm_inviter` 里、那台的邀请还在时才会被拿出来验。）
+    pub fn prune_invites(&mut self) {
+        let now = (self.clock)();
+        self.invites
+            .retain(|i| now.saturating_sub(i.at) < JOIN_TTL.as_secs());
+        let live: Vec<String> = self.invites.iter().map(|i| i.member.endpoint.clone()).collect();
+        if self.confirmed.as_ref().is_some_and(|c| !live.contains(c)) {
+            self.confirmed = None;
+        }
+    }
+
+    /// 用户说「是这一台，数字一样」。它先前送来过名单的话，现在验。
+    pub fn confirm_inviter(&mut self, endpoint: &str) -> Result<(), crate::proto::MeshProblem> {
+        self.prune_invites();
+        if !self.invites.iter().any(|i| i.member.endpoint == endpoint) {
+            return Err(crate::proto::MeshProblem::NoSuchInviter(endpoint.to_string()));
+        }
+        self.confirmed = Some(endpoint.to_string());
+        if let Some(i) = self.held.iter().position(|r| r.signer == endpoint) {
+            let r = self.held.remove(i);
+            self.take_invite(endpoint, r);
+        }
+        Ok(())
+    }
+
     fn take_roster(&mut self, env: &Envelope, incoming: SignedRoster) -> Option<Vec<u8>> {
-        // 我正在请求加入，而这份名单是我核对过数字的那台电脑签的：这是
-        // 邀请，走 `accept_invite`。
+        // 我正在请求加入：只有用户认定的那台签的名单走 `accept_invite`；
+        // 别的回过话的电脑送来的，先存着（用户可能还没认定），永远不直接收。
         if self.is_alone() {
-            let inviter = self
-                .invites
-                .iter()
-                .find(|(m, _)| m.endpoint == incoming.signer)
-                .map(|(m, _)| m.clone());
-            if let Some(inviter) = inviter {
-                return self.take_invite(env, incoming, &inviter);
+            self.prune_invites();
+            if self.confirmed.as_deref() == Some(incoming.signer.as_str()) {
+                self.take_invite(env.from.as_str(), incoming);
+                return None;
+            }
+            if self.invites.iter().any(|i| i.member.endpoint == incoming.signer) {
+                self.journal
+                    .mesh(&format!("invite_held from={}", env.from));
+                self.held.retain(|r| r.signer != incoming.signer);
+                self.held.push(incoming);
+                return None;
             }
         }
         // 还没在任何组里的电脑，**不从网上接一份名单当自己的第一份**：
@@ -375,33 +442,38 @@ impl Mesh {
         None
     }
 
-    fn take_invite(
-        &mut self,
-        env: &Envelope,
-        incoming: SignedRoster,
-        inviter: &Member,
-    ) -> Option<Vec<u8>> {
-        if let Err(e) = roster::accept_invite(&incoming, &self.me.endpoint, inviter) {
-            return self.drop(env, &format!("invite_{e:?}"));
+    /// 验、收一份邀请名单。`incoming.signer` 必须是用户认定的那台（调用方
+    /// 已经对过）。
+    fn take_invite(&mut self, from: &str, incoming: SignedRoster) {
+        let Some(inviter) = self
+            .invites
+            .iter()
+            .find(|i| Some(&i.member.endpoint) == self.confirmed.as_ref())
+            .map(|i| i.member.clone())
+        else {
+            return self.drop_from(from, "invite_not_confirmed");
+        };
+        if let Err(e) = roster::accept_invite(&incoming, &self.me.endpoint, &inviter) {
+            return self.drop_from(from, &format!("invite_{e:?}"));
         }
         // `accept_invite` 只拿得到我的端点（它绑着签名公钥）；我那一条的
         // 加密公钥对不对，只有我自己知道。换成别的，发给我的东西我就解不开，
         // 而能解开的是别人。
         let mine = incoming.roster.member(&self.me.endpoint);
         if mine.map(|m| (&m.sign_pub, &m.kx_pub)) != Some((&self.me.sign_pub, &self.me.kx_pub)) {
-            return self.drop(env, "invite_not_my_keys");
+            return self.drop_from(from, "invite_not_my_keys");
         }
         match self.commit(incoming) {
             Ok(()) => {
                 self.invites.clear();
-                self.journal
-                    .mesh(&format!("joined via={}", env.from));
+                self.confirmed = None;
+                self.held.clear();
+                self.journal.mesh(&format!("joined via={from}"));
             }
             Err(e) => self
                 .journal
-                .mesh(&format!("roster_not_saved from={} err={e}", env.from)),
+                .mesh(&format!("roster_not_saved from={from} err={e}")),
         }
-        None
     }
 
     fn take_sealed(&mut self, env: &Envelope, s: &Sealed) -> Option<Vec<u8>> {
@@ -461,9 +533,12 @@ impl Mesh {
     }
 
     fn drop(&self, env: &Envelope, why: &str) -> Option<Vec<u8>> {
-        self.journal
-            .mesh(&format!("dropped from={} why={why}", env.from));
+        self.drop_from(env.from.as_str(), why);
         None
+    }
+
+    fn drop_from(&self, from: &str, why: &str) {
+        self.journal.mesh(&format!("dropped from={from} why={why}"));
     }
 }
 
