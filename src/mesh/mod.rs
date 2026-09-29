@@ -149,6 +149,9 @@ pub struct Mesh {
     pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
     /// 会话清单和敲字的那一头。没有（测试、还没接上）就不收留言。
     inbox: Option<Arc<dyn deliver::Inbox>>,
+    /// 此刻正在（锁外）往里敲字的会话。标着的会话，新来的留言排到队里、
+    /// 投递线程也不再给它送——一次只送一条，先来的先送。
+    in_flight: HashSet<u32>,
     store: Option<store::Store>,
     journal: Arc<Journal>,
     seen: Seen,
@@ -185,6 +188,7 @@ impl Mesh {
             held: Vec::new(),
             queues: HashMap::new(),
             inbox: None,
+            in_flight: HashSet::new(),
             store: None,
             journal: Arc::new(Journal::new()),
             seen: Seen::default(),
@@ -240,19 +244,49 @@ impl Mesh {
     ///
     /// **任何验证失败都是沉默**：丢掉、记一行 journal、不回任何东西。回一句
     /// 「签名不对」「你不在名单里」，就是在教伪造者下一次怎么改。
+    ///
+    /// 这是**攥着 `&mut self` 一口气做完**的版本（测试、没有别人抢锁的地方
+    /// 用）。守护进程和 `FakeHub` 走的是 [`handle`]：往会话里敲字（里面有
+    /// git 快照，能花好几秒）在放开 `Mesh` 锁之后才做。
     pub fn on_envelope(&mut self, env: &Envelope) -> Option<Vec<u8>> {
+        match self.step(env) {
+            Step::Done(r) => r,
+            Step::Type(t) => {
+                let r = match &self.inbox {
+                    Some(i) => i.type_into(t.session, &t.text),
+                    None => Err("no inbox".into()),
+                };
+                self.finish_incoming(&t, r)
+            }
+        }
+    }
+
+    /// 第一步，攥着锁做：验、去重、决定。要往会话里敲字的，只把「敲什么、
+    /// 敲给谁」带出来（并把那个会话标成正在敲），不在这里敲。
+    fn step(&mut self, env: &Envelope) -> Step {
         let payload = match wire::decode(&env.payload) {
             Ok(p) => p,
-            Err(_) => return self.drop(env, "undecodable"),
+            Err(_) => return Step::Done(self.drop(env, "undecodable")),
         };
         match payload {
-            Payload::Roster(r) => self.take_roster(env, r),
+            Payload::Roster(r) => Step::Done(self.take_roster(env, r)),
             Payload::Sealed(s) => self.take_sealed(env, &s),
-            Payload::Join(req) => self.take_join(env, req),
+            Payload::Join(req) => Step::Done(self.take_join(env, req)),
             // `JoinPending` 只该作为 `ask` 的答复回来（`group::join` 在那里
             // 读它），不该从轮询里进来。
-            Payload::JoinPending { .. } => self.drop(env, "unasked_join_pending"),
+            Payload::JoinPending { .. } => Step::Done(self.drop(env, "unasked_join_pending")),
         }
+    }
+
+    /// 敲完之后（锁又拿回来了）：清掉「正在敲」，回回执。
+    fn finish_incoming(
+        &mut self,
+        t: &deliver::Typing,
+        r: Result<deliver::Typed, String>,
+    ) -> Option<Vec<u8>> {
+        let receipt = self.finish_typing(t, r);
+        let body = serde_json::to_string(&receipt).unwrap_or_default();
+        self.reply(&t.msg, Kind::Receipt, body)
     }
 
     /// 这台电脑还不跟任何别的电脑同组：没有名单，或者名单上只有自己
@@ -323,6 +357,8 @@ impl Mesh {
         self.pending_joins
             .retain(|(j, _, _)| r.roster.member(&j.member.endpoint).is_none());
         self.roster = Some(r);
+        // 被移出组的电脑，它排着队的留言也一起作废。
+        self.purge_non_members();
         Ok(())
     }
 
@@ -495,39 +531,41 @@ impl Mesh {
         }
     }
 
-    fn take_sealed(&mut self, env: &Envelope, s: &Sealed) -> Option<Vec<u8>> {
+    fn take_sealed(&mut self, env: &Envelope, s: &Sealed) -> Step {
         let Some(current) = self.roster.as_ref() else {
-            return self.drop(env, "sealed_without_group");
+            return Step::Done(self.drop(env, "sealed_without_group"));
         };
         let m = match seal::open(s, &self.keys, &current.roster, env.from.as_str()) {
             Ok(m) => m,
-            Err(e) => return self.drop(env, &format!("sealed_{e:?}")),
+            Err(e) => return Step::Done(self.drop(env, &format!("sealed_{e:?}"))),
         };
         let now = (self.clock)();
         if now.abs_diff(m.sent_at) > SENT_AT_WINDOW_SECS {
-            return self.drop(env, "stale");
+            return Step::Done(self.drop(env, "stale"));
         }
         if m.sent_at < self.started_at {
-            return self.drop(env, "before_start");
+            return Step::Done(self.drop(env, "before_start"));
         }
         if !self.seen.first_time(&m.from, &m.id, m.sent_at, now) {
-            return self.drop(env, "replay");
+            return Step::Done(self.drop(env, "replay"));
         }
         match m.kind {
             // 上面的名单、签名、时间窗、去重全都过了，才走到这里：同一条
             // 留言再来一次在 `seen` 那里就停了，不会被敲进会话两次。
-            Kind::Msg => {
-                let r = self.receive(&m);
-                let body = serde_json::to_string(&r).unwrap_or_default();
-                self.reply(&m, Kind::Receipt, body)
-            }
+            Kind::Msg => match self.decide(&m) {
+                deliver::Decision::Answer(r) => {
+                    let body = serde_json::to_string(&r).unwrap_or_default();
+                    Step::Done(self.reply(&m, Kind::Receipt, body))
+                }
+                deliver::Decision::TypeNow(t) => Step::Type(t),
+            },
             Kind::StatusRequest => {
                 let body = serde_json::to_string(&self.local_status()).unwrap_or_default();
-                self.reply(&m, Kind::Status, body)
+                Step::Done(self.reply(&m, Kind::Status, body))
             }
             // 回执和状态只该作为 `ask` 的答复回来，不该从轮询里进来；进来了
             // 也不回——回的话两台电脑能互相回到天荒地老。
-            Kind::Receipt | Kind::Status => None,
+            Kind::Receipt | Kind::Status => Step::Done(None),
         }
     }
 
@@ -569,15 +607,41 @@ fn valid_kx_pub(b64: &str) -> bool {
     STANDARD.decode(b64).map(|b| b.len() == 32).unwrap_or(false)
 }
 
+/// `on_envelope` 的第一步出来的东西：直接回的答复，或者一件要放了锁再做
+/// 的「往会话里敲字」。
+enum Step {
+    Done(Option<Vec<u8>>),
+    Type(deliver::Typing),
+}
+
+/// 一个电脑信封，锁分两段拿：验、决定在锁里（`Mesh::step`）；**往会话里敲字
+/// 在锁外**——`type_into` 里有 git 快照，能花好几秒，那段时间里别的请求
+/// （`dct peers`、投递线程、下一个信封）不该跟着等；敲完再拿锁回回执。
+pub fn handle(mesh: &Mutex<Mesh>, env: &Envelope) -> Option<Vec<u8>> {
+    let lock = || mesh.lock().unwrap_or_else(|e| e.into_inner());
+    let (step, inbox) = {
+        let mut m = lock();
+        (m.step(env), m.inbox.clone())
+    };
+    match step {
+        Step::Done(r) => r,
+        Step::Type(t) => {
+            let r = match &inbox {
+                Some(i) => i.type_into(t.session, &t.text),
+                None => Err("no inbox".into()),
+            };
+            lock().finish_incoming(&t, r)
+        }
+    }
+}
+
 /// `Link` 收到的信封怎么分：`c-` 开头的是电脑，交给 `Mesh`；别的交给
 /// `proto`（手机那一路）。`proto` 是 `None` 就不回——这一步手机那一路还没
 /// 接到中转上，但路留着。
 pub fn route(mesh: Arc<Mutex<Mesh>>, proto: Option<Handler>) -> Handler {
     Arc::new(move |env: &Envelope| {
         if env.from.as_str().starts_with(COMPUTER_PREFIX) {
-            mesh.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .on_envelope(env)
+            handle(&mesh, env)
         } else {
             proto.as_ref().and_then(|h| h(env))
         }

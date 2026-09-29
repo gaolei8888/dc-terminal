@@ -152,7 +152,8 @@ pub mod testing {
                 payload,
                 recipients: vec![],
             };
-            let reply = target.lock().unwrap().on_envelope(&env);
+            // 跟 `route` 同一个入口：往会话里敲字在对方的锁外做。
+            let reply = crate::mesh::handle(&target, &env);
             Ok(reply)
         }
     }

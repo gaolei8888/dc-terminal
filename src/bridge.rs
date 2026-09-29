@@ -208,6 +208,16 @@ pub trait SessionWriter: Send + Sync {
 /// （取 `id -> tag/profile`），直接包一层就是完整的 `SessionWriter`——不用
 /// 在 `SessionManager` 里另开一条路。`list()` 每次都拷一份快照，这里只找
 /// 一个 id，代价跟 `dct ps` 刷新一次看板一样，不是热路径。
+/// 把 `text` 敲进 `id` 并按回车：`type_into` 的本体，错误保留原样（带着
+/// `ErrorCode`），多电脑的留言（`mesh::deliver::LocalInbox`）要分得清「快照
+/// 没拍上、回车已经发了」和「真的没送进去」。**敲键只有这一条路。**
+pub(crate) fn submit(mgr: &crate::session::SessionManager, id: u32, text: &str) -> anyhow::Result<()> {
+    if !text.is_empty() {
+        mgr.send_input(id, text)?;
+    }
+    mgr.send_input(id, "")
+}
+
 impl SessionWriter for crate::session::SessionManager {
     fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String> {
         // 跟 `ui/grid.rs::send_reply` 同一个两步约定，**顺序、拆分都不能
@@ -215,13 +225,10 @@ impl SessionWriter for crate::session::SessionManager {
         // 串那一步才会打检查点、才会真的让 agent 开始干这一轮。手机来的
         // 文字不会是空串（Telegram 消息本身就带着 `text`），但同样照
         // `send_reply` 的分支写全，不假设调用方永远不会传空文本。
-        if !text.is_empty() {
-            self.send_input(id, text).map_err(|e| e.to_string())?;
-        }
         // 这一步失败——文字可能已经躺在输入框里，但没有被提交——**必须
         // 让整体报错**，绝不能因为上一步成功了就在这里放行：那样回执和
-        // journal 记的 `Typed` 会撒谎。
-        self.send_input(id, "").map_err(|e| e.to_string())
+        // journal 记的 `Typed` 会撒谎。两步都在 `submit` 里。
+        submit(self, id, text).map_err(|e| e.to_string())
     }
 
     fn name_of(&self, id: u32) -> Option<String> {
