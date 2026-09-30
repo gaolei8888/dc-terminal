@@ -26,6 +26,7 @@ use crate::link::Handler;
 pub mod cli;
 pub mod deliver;
 pub mod group;
+pub mod invite;
 pub mod login;
 pub mod net;
 pub mod store;
@@ -204,6 +205,16 @@ pub struct Mesh {
     started_at: u64,
     clock: Clock,
     rand: Rand,
+    /// 这台电脑此刻发着的邀请码（`invite` 模块）。只在内存里：守护进程一重启
+    /// 就没了，要重新按 `a`。
+    pub(crate) invite: Option<invite::Invite>,
+    /// 最近一个结束了的邀请码怎么结束的（看板、`dct invite` 拿它说话）。
+    pub(crate) invite_note: Option<crate::proto::InviteNote>,
+    /// 发过几个邀请码（`InviteView::id`）。
+    invite_seq: u64,
+    /// 攥着锁的时候定下来、放了锁再发的名单广播（接收方, payload）。
+    /// `invite::flush_outbox` 发；守护进程的投递线程每拍调一次。
+    pub(crate) outbox: Vec<(Vec<String>, Vec<u8>)>,
 }
 
 impl Mesh {
@@ -241,6 +252,10 @@ impl Mesh {
             started_at: unix_now(),
             clock: Box::new(unix_now),
             rand: Box::new(os_rand),
+            invite: None,
+            invite_note: None,
+            invite_seq: 0,
+            outbox: Vec::new(),
         }
     }
 
@@ -324,15 +339,18 @@ impl Mesh {
             // 读它），不该从轮询里进来。
             Payload::JoinPending { .. } => Step::Done(self.drop(env, "unasked_join_pending")),
             Payload::JoinReveal { nonce } => Step::Done(self.take_reveal(env, &nonce)),
-            // 邀请码那一路下一步才接上；在那之前一律当没听见。
-            Payload::InviteProbe
-            | Payload::InviteOpen { .. }
+            Payload::InviteProbe => Step::Done(self.take_probe(env)),
+            Payload::InviteJoin { member, sig, spake } => {
+                Step::Done(self.take_invite_join(env, member, &sig, &spake))
+            }
+            Payload::InviteFinish { confirm } => Step::Done(self.take_invite_finish(env, &confirm)),
+            // 这几种只该作为 `ask` 的答复回来（`invite::join` 在那里读），不该
+            // 从轮询里进来。
+            Payload::InviteOpen { .. }
             | Payload::NoInvite
-            | Payload::InviteJoin { .. }
             | Payload::InviteKey { .. }
-            | Payload::InviteFinish { .. }
             | Payload::InviteDone { .. }
-            | Payload::InviteFailed => Step::Done(self.drop(env, "invite_not_ready")),
+            | Payload::InviteFailed => Step::Done(self.drop(env, "unasked_invite_reply")),
         }
     }
 

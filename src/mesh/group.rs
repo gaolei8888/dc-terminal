@@ -233,10 +233,16 @@ fn ask_all(mesh: &Mutex<Mesh>, net: &dyn Net, peers: &[String]) -> Vec<Reply> {
     })
 }
 
-/// `Mac` 撞了名就是 `Mac 2`，再撞 `Mac 3`……
-fn free_name(base: &str, taken: &[String]) -> String {
+/// `Mac` 撞了名就是 `Mac 2`，再撞 `Mac 3`……名字本来就接近上限
+/// （`roster::MAX_NAME_LEN` 个字）的，先截短再编号，编出来的还是合法名字。
+pub(super) fn free_name(base: &str, taken: &[String]) -> String {
     (2..)
-        .map(|n| format!("{base} {n}"))
+        .map(|n| {
+            let suffix = format!(" {n}");
+            let keep = dct_mesh::roster::MAX_NAME_LEN - suffix.chars().count();
+            let head: String = base.chars().take(keep).collect();
+            format!("{}{suffix}", head.trim_end())
+        })
         .find(|c| !taken.contains(c))
         .unwrap_or_default()
 }
@@ -335,7 +341,7 @@ pub fn remove(mesh: &Mutex<Mesh>, net: &dyn Net, who: &str) -> Result<String, Me
     Ok(name)
 }
 
-fn sign_next(m: &Mesh, current: &Roster, members: Vec<dct_mesh::Member>) -> dct_mesh::SignedRoster {
+pub(super) fn sign_next(m: &Mesh, current: &Roster, members: Vec<dct_mesh::Member>) -> dct_mesh::SignedRoster {
     let next = Roster {
         group: current.group.clone(),
         version: current.version + 1,
@@ -344,7 +350,7 @@ fn sign_next(m: &Mesh, current: &Roster, members: Vec<dct_mesh::Member>) -> dct_
     roster::sign(next, &m.me, &m.keys)
 }
 
-fn recipients(m: &Mesh, r: &dct_mesh::SignedRoster) -> Vec<String> {
+pub(super) fn recipients(m: &Mesh, r: &dct_mesh::SignedRoster) -> Vec<String> {
     r.roster
         .members
         .iter()
@@ -358,7 +364,7 @@ fn recipients(m: &Mesh, r: &dct_mesh::SignedRoster) -> Vec<String> {
 ///
 /// 并排发：一台卡到超时不拖着别的，整次广播只花一次 `send` 的时间
 /// （`mesh::worst_case` 按这个算命令行该等多久）。
-fn broadcast(mesh: &Mutex<Mesh>, net: &dyn Net, to: &[String], payload: &[u8]) {
+pub(super) fn broadcast(mesh: &Mutex<Mesh>, net: &dyn Net, to: &[String], payload: &[u8]) {
     let failed: Vec<(String, crate::link::LinkError)> = std::thread::scope(|s| {
         let hs: Vec<_> = to
             .iter()

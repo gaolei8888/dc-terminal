@@ -896,6 +896,49 @@ pub struct PendingJoin {
     pub code: String,
 }
 
+/// 这台电脑此刻发着的邀请码（`dct invite` / 看板上按 `a`）。
+///
+/// **`Debug` 不打出码**：码在 10 分钟里就是进组的钥匙，不该进任何日志。
+/// 线上照常带着（只在本机 socket 上走，见 `Request::MeshStatus`）。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteView {
+    /// 这台电脑上第几个邀请（守护进程这次运行期间从 1 数起）。结果（`InviteNote`）
+    /// 按它对上是哪一个。
+    pub id: u64,
+    /// 6 位数字，不带空格。
+    pub code: String,
+    /// 到这一刻（unix 秒）就作废。
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for InviteView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteView")
+            .field("id", &self.id)
+            .field("code", &"******")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// 一个邀请码怎么结束的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InviteOutcome {
+    /// 有一台用它进了组，名单上叫 `name`（撞名时已经编过号）。
+    Joined { name: String },
+    /// 有人拿它试过一次、没对上（或者试到一半不见了）：作废了。
+    Burned,
+    /// 10 分钟到了，没人用。
+    Expired,
+}
+
+/// 最近一个结束了的邀请码。`id` 同 `InviteView::id`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteNote {
+    pub id: u64,
+    pub outcome: InviteOutcome,
+}
+
 /// 一场直播眼下的样子。
 ///
 /// **老师那把推帧/停播用的钥匙（`push_secret`）不在这个类型里。**
