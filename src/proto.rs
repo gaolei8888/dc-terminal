@@ -1227,6 +1227,16 @@ pub enum MeshProblem {
     TooLong,
     /// 地址不是 `电脑名/会话名`。
     BadAddress(String),
+    /// `dct join` 后面敲的不是 6 位数字（空格、`-` 已经去掉了）。
+    BadInviteCode,
+    /// 码不对、已过期或已被用掉：发邀请的那台已经把它作废了。
+    WrongInviteCode,
+    /// 同账号在线的电脑里没有一台发着邀请码。其中 `unanswered` 台连话都没回
+    /// ——多半是 dct 太旧，不认识 `InviteProbe`。
+    NoInvite { unanswered: u32 },
+    /// 老电脑已经把这台签进了名单，但发来的那份名单这边验不过（签名、组、
+    /// 我的钥匙对不上），没进组。
+    InviteRosterRefused,
 }
 
 /// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。

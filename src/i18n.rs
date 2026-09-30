@@ -2046,6 +2046,37 @@ pub mod msg {
                 en: format!("{to} is not an address. Write it as computer/session, for example: office-pc/dc-terminal"),
                 zh: format!("{to} 不是一个地址。写成 电脑名/会话名，比如：公司Windows/dc-terminal"),
             ),
+            BadInviteCode => t!(
+                lang,
+                en: "The invite code is 6 digits, for example: dct join 482913".to_string(),
+                zh: "邀请码是 6 位数字，比如：dct join 482913".to_string(),
+            ),
+            WrongInviteCode => t!(
+                lang,
+                en: "The invite code is wrong or no longer valid. On your other computer press a to get a new one".to_string(),
+                zh: "邀请码不对或已作废，请在老电脑上按 a 重新生成".to_string(),
+            ),
+            NoInvite { unanswered } => {
+                let base = t!(
+                    lang,
+                    en: "None of your computers online is offering an invite code (it may have expired or been used). On your other computer press a (or run dct invite) to get one. If that does not help, check that both computers use the same DC account and that dct is running on the other one".to_string(),
+                    zh: "没有在线的电脑发出邀请（邀请码可能已过期或已作废）。在老电脑上按 a（或运行 dct invite）出一个码；还不行就检查两台是不是同一个 DC 账号、老电脑的 dct 开着没有".to_string(),
+                );
+                if *unanswered == 0 {
+                    base
+                } else {
+                    t!(
+                        lang,
+                        en: format!("{base}. {unanswered} computer(s) did not answer at all: their dct may be too old, update it first"),
+                        zh: format!("{base}。有 {unanswered} 台电脑没回话：它们的 dct 可能太旧，先升级"),
+                    )
+                }
+            }
+            InviteRosterRefused => t!(
+                lang,
+                en: "Your other computer has already put this one in the group, but the group list it sent does not check out here, so this computer did not join. On the other computer run dct peers remove <this computer's name>, then press a for a new code".to_string(),
+                zh: "老电脑那边已经把这台电脑记进组里了，但它发来的名单在这边验不过，没有加入。在老电脑上运行 dct peers remove <这台电脑的名字>，再按 a 重新生成".to_string(),
+            ),
         }
     }
 
@@ -3268,6 +3299,11 @@ mod tests {
             Mesh(crate::proto::MeshProblem::CodeMismatch),
             Mesh(crate::proto::MeshProblem::TooLong),
             Mesh(crate::proto::MeshProblem::BadAddress("pc".into())),
+            Mesh(crate::proto::MeshProblem::BadInviteCode),
+            Mesh(crate::proto::MeshProblem::WrongInviteCode),
+            Mesh(crate::proto::MeshProblem::NoInvite { unanswered: 0 }),
+            Mesh(crate::proto::MeshProblem::NoInvite { unanswered: 2 }),
+            Mesh(crate::proto::MeshProblem::InviteRosterRefused),
             // `LoginFailed` 不在这里：它带的原因是网关那层给的中文，同 `Git`
             // 照抄原文，英文里会有汉字，见下面那条单独的测试。
         ];
