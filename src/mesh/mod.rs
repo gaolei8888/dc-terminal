@@ -324,6 +324,15 @@ impl Mesh {
             // 读它），不该从轮询里进来。
             Payload::JoinPending { .. } => Step::Done(self.drop(env, "unasked_join_pending")),
             Payload::JoinReveal { nonce } => Step::Done(self.take_reveal(env, &nonce)),
+            // 邀请码那一路下一步才接上；在那之前一律当没听见。
+            Payload::InviteProbe
+            | Payload::InviteOpen { .. }
+            | Payload::NoInvite
+            | Payload::InviteJoin { .. }
+            | Payload::InviteKey { .. }
+            | Payload::InviteFinish { .. }
+            | Payload::InviteDone { .. }
+            | Payload::InviteFailed => Step::Done(self.drop(env, "invite_not_ready")),
         }
     }
 

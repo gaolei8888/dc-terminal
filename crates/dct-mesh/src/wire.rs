@@ -37,6 +37,43 @@ pub enum Payload {
     JoinReveal {
         nonce: String,
     },
+
+    // —— 邀请码（dct-invite-v1，见 `invite` 模块头）。全走 `ask`：B 问，A 当场答。
+
+    /// B → 每台同账号在线电脑：你手上有没有一个还有效的邀请码？不带任何东西，
+    /// 也不消耗码。
+    InviteProbe,
+    /// A 的答复：有。`member`/`sig` 是 A 自签的成员记录（`sign_member`），
+    /// `group` 是 A 的组 id——确认值 `T` 里要用，B 这时还没有 A 的名单。
+    InviteOpen {
+        member: Member,
+        sig: String,
+        group: String,
+    },
+    /// A 的答复：没有（没发过、过期了、用掉了、正有别人在用）。
+    NoInvite,
+    /// B → A：B 自签的成员记录，和 B 的 SPAKE2 消息（33 字节，标准 base64）。
+    InviteJoin {
+        member: Member,
+        sig: String,
+        spake: String,
+    },
+    /// A 的答复：A 的 SPAKE2 消息（33 字节）和确认值 `cA`（32 字节），都是标准 base64。
+    InviteKey {
+        spake: String,
+        confirm: String,
+    },
+    /// B → A：确认值 `cB`（32 字节，标准 base64）。
+    InviteFinish {
+        confirm: String,
+    },
+    /// A 的答复：把 B 签进去的新名单。
+    InviteDone {
+        roster: SignedRoster,
+    },
+    /// A 的答复：不行。**不说为什么**——码错、过期、已被用掉、签名不对，
+    /// 一律这一句（同 `Mesh::on_envelope` 的「验证失败都是沉默」）。
+    InviteFailed,
 }
 
 /// 新电脑请求加入组：`member` 是它自己的名单条目（还没被任何人签认），
@@ -61,6 +98,16 @@ pub fn encode32(b: &[u8; 32]) -> String {
 /// `encode32` 的反面。不是恰好 32 字节的标准 base64 就是 `None`。
 pub fn decode32(s: &str) -> Option<[u8; 32]> {
     STANDARD.decode(s).ok()?.try_into().ok()
+}
+
+/// 任意字节（SPAKE2 消息、确认值）写成标准 base64。
+pub fn encode_bytes(b: &[u8]) -> String {
+    STANDARD.encode(b)
+}
+
+/// `encode_bytes` 的反面，而且必须正好 `len` 字节，否则 `None`。
+pub fn decode_len(s: &str, len: usize) -> Option<Vec<u8>> {
+    STANDARD.decode(s).ok().filter(|b| b.len() == len)
 }
 
 pub fn encode(p: &Payload) -> Vec<u8> {
@@ -184,6 +231,74 @@ mod tests {
             serde_json::to_string(&reveal).unwrap(),
             r#"{"t":"join_reveal","nonce":"n"}"#
         );
+    }
+
+    /// 邀请码那 8 种的线上形状。改了就是跟别的版本的 dct 说不上话了。
+    #[test]
+    fn invite_payload_shapes_are_pinned() {
+        let k = keys_for(1);
+        let m = member_from(&k, "A");
+        let r = SignedRoster {
+            roster: Roster {
+                group: "g".into(),
+                version: 2,
+                members: vec![m.clone()],
+            },
+            signer: m.endpoint.clone(),
+            sig: "s".into(),
+        };
+        let cases = [
+            (Payload::InviteProbe, r#"{"t":"invite_probe"}"#.to_string()),
+            (Payload::NoInvite, r#"{"t":"no_invite"}"#.to_string()),
+            (Payload::InviteFailed, r#"{"t":"invite_failed"}"#.to_string()),
+            (
+                Payload::InviteKey {
+                    spake: "m".into(),
+                    confirm: "c".into(),
+                },
+                r#"{"t":"invite_key","spake":"m","confirm":"c"}"#.to_string(),
+            ),
+            (
+                Payload::InviteFinish { confirm: "c".into() },
+                r#"{"t":"invite_finish","confirm":"c"}"#.to_string(),
+            ),
+        ];
+        for (p, want) in &cases {
+            assert_eq!(&serde_json::to_string(p).unwrap(), want);
+            assert_eq!(&decode(want.as_bytes()).unwrap(), p);
+        }
+        for (p, tag) in [
+            (
+                Payload::InviteOpen {
+                    member: m.clone(),
+                    sig: "s".into(),
+                    group: "g".into(),
+                },
+                r#""t":"invite_open""#,
+            ),
+            (
+                Payload::InviteJoin {
+                    member: m.clone(),
+                    sig: "s".into(),
+                    spake: "x".into(),
+                },
+                r#""t":"invite_join""#,
+            ),
+            (Payload::InviteDone { roster: r }, r#""t":"invite_done""#),
+        ] {
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(json.contains(tag), "{json}");
+            assert_eq!(decode(json.as_bytes()).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn byte_fields_round_trip_only_at_their_exact_length() {
+        let b = [7u8; 33];
+        assert_eq!(decode_len(&encode_bytes(&b), 33), Some(b.to_vec()));
+        assert_eq!(decode_len(&encode_bytes(&b), 32), None);
+        assert_eq!(decode_len("not base64!!", 33), None);
+        assert_eq!(decode_len("", 0), Some(vec![]));
     }
 
     #[test]
