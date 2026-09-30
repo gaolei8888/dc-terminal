@@ -1,5 +1,5 @@
-//! 多电脑第一步的本机端到端：一个真的中转、两个互不相干的守护进程，走完
-//! login → join（两边核对 6 位数）→ approve → peers → send。
+//! 多电脑的本机端到端：一个真的中转、两个互不相干的守护进程，走完
+//! A login → A invite（出 6 位邀请码）→ B join <码>（自动登录）→ peers → send。
 //!
 //! 默认不跑（`#[ignore]`），手动跑：
 //!
@@ -26,7 +26,7 @@
 //!
 //! # 断言
 //!
-//! 1. 两边屏幕上的 6 位数一致（新电脑看到的、已有电脑看到的是同一个）；
+//! 1. B 用 A 的邀请码进了 A 的组，A 那边记下「电脑B 已加入」、码作废；
 //! 2. B 的智能体会话里出现 `[来自 电脑A/终端 的留言 #xxxx]` 和正文；
 //! 3. 中转进程的全部输出里找不到留言正文。
 
@@ -362,15 +362,40 @@ fn two_computers_join_and_leave_a_message_over_a_real_relay() {
     let mut a = Machine::new("电脑A", &gateway, &relay, "sk-e2e-a");
     let mut b = Machine::new("电脑B", &gateway, &relay, "sk-e2e-b");
 
-    // ---- login ----
+    // ---- A 登录、出邀请码 ----
     let va = a.view(Request::MeshLogin);
     assert!(
         va.logged_in && va.in_group,
         "A 登录后该有一个只有自己的组：{va:?}"
     );
     assert_eq!(va.name, "电脑A");
-    let vb = b.view(Request::MeshLogin);
+    let invite = match a.call(Request::MeshInvite) {
+        Response::MeshInvite(v) => v,
+        other => panic!("预期 MeshInvite，实际 {other:?}"),
+    };
+    assert_eq!(invite.code.len(), 6);
+
+    // ---- B：dct join <码>，没登录过，自动登录 ----
+    // 两条连接刚起，中转那边未必已经把 A 登记上：B 问不到发邀请的电脑就再问
+    // （只探问不消耗码）；别的失败都是真失败。码里故意带个空格，同人敲的。
+    let typed = format!("{} {}", &invite.code[..3], &invite.code[3..]);
+    let vb = wait_until("B 用邀请码进了组", Duration::from_secs(30), || {
+        match b.call(Request::MeshJoin {
+            code: typed.clone(),
+            name: String::new(),
+        }) {
+            Response::Mesh(v) => Some(v),
+            Response::Error(dct::proto::ErrorCode::Mesh(
+                dct::proto::MeshProblem::NoInvite { .. },
+            )) => None,
+            other => panic!("B 加入失败：{other:?}"),
+        }
+    });
     assert!(vb.logged_in, "{vb:?}");
+    assert!(
+        vb.members.iter().any(|m| m.endpoint == va.endpoint),
+        "B 的名单上有 A：{vb:?}"
+    );
     {
         let seen = gateway_seen.lock().unwrap();
         assert_eq!(
@@ -379,58 +404,18 @@ fn two_computers_join_and_leave_a_message_over_a_real_relay() {
                 ("Bearer sk-e2e-a".to_string(), va.endpoint.clone()),
                 ("Bearer sk-e2e-b".to_string(), vb.endpoint.clone()),
             ],
-            "api_key 只走 Bearer，端点是各自的"
+            "api_key 只走 Bearer，端点是各自的；B 的登录是 join 顺手做的"
         );
     }
-
-    // ---- join：B 问在线的电脑，拿到 A 的 6 位数 ----
-    // 两条连接刚起，中转那边未必已经把两个端点都登记上：问到有人回话为止。
-    let joining = wait_until(
-        "B 的加入请求有人回话",
-        Duration::from_secs(30),
-        || match b.call(Request::MeshJoin {
-            name: String::new(),
-        }) {
-            Response::Mesh(v) if !v.joining.is_empty() => Some(v.joining),
-            _ => None,
-        },
-    );
-    assert_eq!(joining.len(), 1, "只有 A 一台在线：{joining:?}");
-    let inviter = &joining[0];
-    assert_eq!(inviter.name, "电脑A");
-    assert_eq!(inviter.endpoint, va.endpoint);
-    assert_eq!(inviter.code.len(), 6);
-
-    // A 这边挂着 B 的请求，屏幕上的数字跟 B 看到的一样——人就是比这个。
-    let pending = wait_until(
-        "A 看到 B 的加入请求",
-        Duration::from_secs(15),
-        || {
-            let v = a.view(Request::MeshStatus);
-            v.pending.into_iter().find(|p| p.endpoint == vb.endpoint)
-        },
-    );
-    assert_eq!(pending.name, "电脑B");
-    assert_eq!(pending.code, inviter.code, "两块屏幕上的 6 位数必须一样");
-
-    // B 上的人认定是 A 这一台；A 上的人核对过数字，点同意。
-    b.view(Request::MeshConfirmInviter {
-        endpoint: inviter.endpoint.clone(),
-    });
-    let after = a.view(Request::MeshApprove {
-        endpoint: pending.endpoint.clone(),
-        code: pending.code.clone(),
-        yes: true,
-    });
+    let after = a.view(Request::MeshStatus);
     assert!(after.members.iter().any(|m| m.endpoint == vb.endpoint));
-
-    wait_until("B 收到有 A 的名单", Duration::from_secs(15), || {
-        let v = b.view(Request::MeshStatus);
-        v.members
-            .iter()
-            .any(|m| m.endpoint == va.endpoint)
-            .then_some(())
-    });
+    assert!(after.invite.is_none(), "码用过就作废");
+    assert_eq!(
+        after.invite_note.map(|n| n.outcome),
+        Some(dct::proto::InviteOutcome::Joined {
+            name: "电脑B".into()
+        })
+    );
 
     // ---- B 开一个智能体会话 ----
     let repo = b.h.git_repo("proj");

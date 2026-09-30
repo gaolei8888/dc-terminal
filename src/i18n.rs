@@ -2412,8 +2412,26 @@ pub mod msg {
     pub fn mesh_join_usage(lang: Lang) -> String {
         t!(
             lang,
-            en: "Usage: dct join [--name <computer name>] [--confirm <name of the computer whose number matches>]".to_string(),
-            zh: "用法：dct join [--name 电脑名] [--confirm 数字对得上的那台电脑的名字]".to_string(),
+            en: "Usage: dct join <invite code> [--name <computer name>]. Get the code on your other computer: press a on the board, or run dct invite".to_string(),
+            zh: "用法：dct join <邀请码> [--name 电脑名]。邀请码在老电脑上拿：看板上按 a，或者运行 dct invite".to_string(),
+        )
+    }
+
+    /// 新电脑上用邀请码进组了：组里有谁。
+    pub fn mesh_joined_with(lang: Lang, names: &[String]) -> String {
+        t!(
+            lang,
+            en: format!("Joined \"My computers\". In the group: {}", names.join(", ")),
+            zh: format!("已加入「我的电脑」，组里有：{}", names.join("、")),
+        )
+    }
+
+    /// `--name` 起的名字跟组里的撞了，老电脑编了号。
+    pub fn mesh_renamed_on_join(lang: Lang, name: &str) -> String {
+        t!(
+            lang,
+            en: format!("The group already had a computer with that name, so this one is now called {name}"),
+            zh: format!("组里已经有一台叫这个名字的了，这台电脑现在叫 {name}"),
         )
     }
 

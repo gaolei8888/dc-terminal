@@ -68,6 +68,10 @@ pub fn view(mesh: &Mutex<Mesh>, net: &dyn Net, logged_in: bool) -> MeshView {
             .collect(),
         joining: joining(&m),
         messages: m.delivered_counts(),
+        // 先 `invite_view`：它顺手把到点的码清掉、记下结果，下面读到的
+        // `invite_note` 才是新的。
+        invite: m.invite_view(),
+        invite_note: m.invite_note.clone(),
     }
 }
 

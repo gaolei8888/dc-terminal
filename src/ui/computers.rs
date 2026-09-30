@@ -390,6 +390,8 @@ pub(crate) mod tests {
                 .collect(),
             joining: Vec::new(),
             messages: Default::default(),
+            invite: None,
+            invite_note: None,
         }
     }
 

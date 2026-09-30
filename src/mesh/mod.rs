@@ -755,8 +755,17 @@ pub fn worst_case(req: &crate::proto::Request) -> Option<std::time::Duration> {
     Some(match req {
         R::MeshStatus | R::MeshConfirmInviter { .. } => call,
         R::MeshLogin => login::GATEWAY_TIMEOUT + call,
-        // 问谁在线、并排问每台、并排揭晓、再看一眼现状。
-        R::MeshJoin { .. } => call + group::JOIN_ASK_TIMEOUT + call + call,
+        R::MeshInvite | R::MeshInviteCancel => call,
+        // 可能先登录（换令牌）；问谁在线、并排探问；最多试
+        // `MAX_INVITERS_TRIED` 台、每台两次 ask；再看一眼现状。
+        R::MeshJoin { .. } => {
+            login::GATEWAY_TIMEOUT
+                + call
+                + call
+                + invite::INVITE_ASK_TIMEOUT
+                + invite::INVITE_ASK_TIMEOUT * 2 * invite::MAX_INVITERS_TRIED as u32
+                + call
+        }
         // 并排广播新名单，再看一眼现状。
         R::MeshApprove { .. } | R::MeshRemove { .. } => call + call,
         R::MeshPeers => call + deliver::STATUS_ASK_TIMEOUT,
