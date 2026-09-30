@@ -16,7 +16,7 @@ hand out one link and a roomful of people watch — read-only.
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.19](https://img.shields.io/badge/version-0.2.19-444?style=flat-square)
+![version 0.2.20](https://img.shields.io/badge/version-0.2.20-444?style=flat-square)
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
@@ -825,15 +825,17 @@ another, typed straight in if that session is idle.
 
 ```
 dct login                       # on every computer: sign in with the DC account
-dct join --name work-pc         # on the new one: ask to join (and name it)
+dct join                        # on the new one: ask to join (named Mac / Windows / Linux)
 dct peers                       # on an existing one: who is waiting
-dct peers approve work-pc       # compare the 6 digits, approve
+dct peers approve Windows       # compare the 6 digits, approve
 dct peers                       # who is in the group, what each has open
-dct send home-mac/#3 "run the Windows tests"
+dct send Mac/#3 "run the Windows tests"
 ```
 
 - **Sign in**: `dct login` trades the paired DC account for a relay token, kept on
   that computer only. The first computer to sign in creates the group.
+- **Names**: a computer is called Mac / Windows / Linux by default; a clash in the
+  group becomes "Mac 2". To pick your own: `dct join --name work-pc`.
 - **Joining takes a look at both screens**: `dct join` on the new computer lists
   the online ones with a 6-digit number; `dct peers` on the old one shows the same
   number. Only if they match — confirm on the new side, approve on the old side —

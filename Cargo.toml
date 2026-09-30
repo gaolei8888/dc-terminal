@@ -7,7 +7,7 @@ members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-b
 
 [package]
 name = "dct"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2021"
 license = "MIT"
 

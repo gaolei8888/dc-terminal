@@ -121,13 +121,19 @@ impl Store {
         Ok(None)
     }
 
-    /// 这台电脑在组里叫什么。没设过就是主机名（整理成名单接受的样子）。
+    /// 这台电脑在组里叫什么。没设过就是系统名（Mac / Windows / Linux）：
+    /// 主机名像 `DESKTOP-7F3K2QL` 这样，用户认不出是哪台。
     pub fn name(&self) -> Result<String> {
         match std::fs::read_to_string(self.dir.join(NAME)) {
             Ok(s) => Ok(s.trim().to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(tidy_name(&hostname())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default_name().to_string()),
             Err(e) => Err(e).context("读不了电脑名"),
         }
+    }
+
+    /// 用户自己起过名字没有。没起过的，加入时撞了名可以替他改成「Mac 2」。
+    pub fn has_chosen_name(&self) -> bool {
+        self.dir.join(NAME).exists()
     }
 
     /// 改名。规则跟名单的一样（`roster::accept` 会拒掉不合规的名字），在这里
@@ -265,35 +271,14 @@ fn tmp_path(path: &Path) -> PathBuf {
 
 /// 主机名整理成名单接受的样子：去掉 `.local` 这类后缀、去掉 `/`、截到上限。
 /// 整理完是空的（问不出主机名）就叫 `dct`——总比建不了组好，用户随时能改。
-fn tidy_name(raw: &str) -> String {
-    let base = raw.trim().split('.').next().unwrap_or("");
-    let cleaned: String = base
-        .chars()
-        .filter(|c| *c != '/' && !dct_mesh::roster::is_hidden_char(*c))
-        .take(MAX_NAME_LEN)
-        .collect();
-    if cleaned.is_empty() {
-        "dct".to_string()
+pub(crate) fn default_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(windows) {
+        "Windows"
     } else {
-        cleaned
+        "Linux"
     }
-}
-
-#[cfg(unix)]
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: 缓冲区够大，长度如实给出；gethostname 最多写 len 个字节。
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return String::new();
-    }
-    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
-}
-
-#[cfg(windows)]
-fn hostname() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -560,10 +545,11 @@ mod tests {
     #[test]
     fn name_defaults_to_something_the_roster_accepts_and_can_be_changed() {
         let (_t, s) = store();
-        let n = s.name().unwrap();
-        assert!(!n.is_empty() && !n.contains('/') && n.chars().count() <= MAX_NAME_LEN);
+        assert!(["Mac", "Windows", "Linux"].contains(&s.name().unwrap().as_str()));
+        assert!(!s.has_chosen_name());
         s.set_name("公司Windows").unwrap();
         assert_eq!(s.name().unwrap(), "公司Windows");
+        assert!(s.has_chosen_name());
     }
 
     #[test]
@@ -575,15 +561,6 @@ mod tests {
         assert!(s.set_name("a\x1bb").is_err());
         assert!(s.set_name("a\u{202e}b").is_err());
         assert!(s.set_name("a\u{200b}b").is_err());
-    }
-
-    #[test]
-    fn hostnames_are_tidied_into_valid_names() {
-        assert_eq!(tidy_name("Leis-MacBook.local"), "Leis-MacBook");
-        assert_eq!(tidy_name(""), "dct");
-        assert_eq!(tidy_name("a/b"), "ab");
-        assert_eq!(tidy_name(&"y".repeat(80)).chars().count(), MAX_NAME_LEN);
-        assert_eq!(tidy_name("mac\u{202e}\u{200b}\x1bbook"), "macbook");
     }
 
     #[test]

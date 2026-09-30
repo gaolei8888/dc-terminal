@@ -193,6 +193,9 @@ pub struct Mesh {
     /// 「✉ N」）。
     delivered: BTreeMap<u32, u32>,
     store: Option<store::Store>,
+    /// 名字是 dct 起的（用户没用 `--name` 起过）。加入时跟组里撞了名，
+    /// 就替他改成「Mac 2」这样，不让他为一个名字卡住。
+    pub(crate) auto_name: bool,
     journal: Arc<Journal>,
     seen: Seen,
     /// 这个进程从什么时候开始收（unix 秒）。`sent_at` 早于它的留言一律不收：
@@ -232,6 +235,7 @@ impl Mesh {
             in_flight: HashSet::new(),
             delivered: BTreeMap::new(),
             store: None,
+            auto_name: false,
             journal: Arc::new(Journal::new()),
             seen: Seen::default(),
             started_at: unix_now(),
@@ -245,7 +249,9 @@ impl Mesh {
         let keys = store.load_or_create_keys(&os_rand)?;
         let name = store.name()?;
         let roster = store.roster()?;
-        Ok(Mesh::new(keys, name, roster).with_store(store))
+        let mut m = Mesh::new(keys, name, roster);
+        m.auto_name = !store.has_chosen_name();
+        Ok(m.with_store(store))
     }
 
     /// 名单变了就存到这里。没有 store（测试）就只改内存。
@@ -377,6 +383,7 @@ impl Mesh {
                 .map_err(|_| crate::proto::MeshProblem::NotSaved)?;
         }
         self.me.name = name.to_string();
+        self.auto_name = false;
         if let Some(r) = &self.roster {
             let g = roster::genesis(self.me.clone(), r.roster.group.clone(), &self.keys);
             self.commit(g)

@@ -119,38 +119,27 @@ pub fn join(
             .mesh(&format!("join_too_many_peers n={}", peers.len()));
         return Err(MeshProblem::TooManyAnswered);
     }
-    // 每台一个随机数、一份承诺。同一个随机数给好几台用的话，揭晓给第一台
-    // 之后中转就知道了它，还没回话的那几台可以等看过它再编答复。
-    let asks: Vec<(String, sas::Nonce, JoinRequest)> = {
-        let m = lock(mesh);
-        peers
-            .iter()
-            .map(|p| {
-                let n = m.fresh_nonce();
-                (p.clone(), n, m.join_request(&n))
-            })
-            .collect()
-    };
-    // 并排问：对方回得快，但真网络上有一台卡住不该拖着别的。
-    let replies: Vec<(String, sas::Nonce, JoinRequest, Vec<u8>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = asks
-            .into_iter()
-            .map(|(p, n, req)| {
-                s.spawn(move || {
-                    let r = net.ask(
-                        &p,
-                        wire::encode(&Payload::Join(req.clone())),
-                        JOIN_ASK_TIMEOUT,
-                    );
-                    (p, n, req, r)
+    // 名字是 dct 起的、又跟回话的电脑撞了：换成「Mac 2」重问一遍。第一轮
+    // 没揭晓，那边亮不出数字；同一台再问，那边只留最新的一条请求。
+    let mut replies = ask_all(mesh, net, &peers);
+    {
+        let mut m = lock(mesh);
+        if m.auto_name {
+            let taken: Vec<String> = replies
+                .iter()
+                .filter_map(|(_, _, _, b)| match wire::decode(b) {
+                    Ok(Payload::JoinPending { member, .. }) => Some(member.name),
+                    _ => None,
                 })
-            })
-            .collect();
-        hs.into_iter()
-            .filter_map(|h| h.join().ok())
-            .filter_map(|(p, n, req, r)| r.ok().map(|b| (p, n, req, b)))
-            .collect()
-    });
+                .collect();
+            if taken.contains(&m.me.name) {
+                let free = free_name(&m.me.name, &taken);
+                m.rename(&free)?;
+                drop(m);
+                replies = ask_all(mesh, net, &peers);
+            }
+        }
+    }
 
     // 算数字、记下邀请，**然后**才揭晓：对方一收到揭晓就可能亮数字、用户
     // 就可能点同意、名单就可能送过来——那时这边得已经认得它是回过话的。
@@ -205,6 +194,51 @@ pub fn join(
         return Err(MeshProblem::NoOneAnswered);
     }
     Ok(joining(&m))
+}
+
+type Reply = (String, sas::Nonce, JoinRequest, Vec<u8>);
+
+/// 每台一个随机数、一份承诺，并排问。同一个随机数给好几台用的话，揭晓给
+/// 第一台之后中转就知道了它，还没回话的那几台可以等看过它再编答复。
+fn ask_all(mesh: &Mutex<Mesh>, net: &dyn Net, peers: &[String]) -> Vec<Reply> {
+    let asks: Vec<(String, sas::Nonce, JoinRequest)> = {
+        let m = lock(mesh);
+        peers
+            .iter()
+            .map(|p| {
+                let n = m.fresh_nonce();
+                (p.clone(), n, m.join_request(&n))
+            })
+            .collect()
+    };
+    // 真网络上有一台卡住不该拖着别的。
+    std::thread::scope(|s| {
+        let hs: Vec<_> = asks
+            .into_iter()
+            .map(|(p, n, req)| {
+                s.spawn(move || {
+                    let r = net.ask(
+                        &p,
+                        wire::encode(&Payload::Join(req.clone())),
+                        JOIN_ASK_TIMEOUT,
+                    );
+                    (p, n, req, r)
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter_map(|(p, n, req, r)| r.ok().map(|b| (p, n, req, b)))
+            .collect()
+    })
+}
+
+/// `Mac` 撞了名就是 `Mac 2`，再撞 `Mac 3`……
+fn free_name(base: &str, taken: &[String]) -> String {
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|c| !taken.contains(c))
+        .unwrap_or_default()
 }
 
 /// 新电脑上：用户认定 `endpoint` 那台的数字一样。之后只收它签的名单
@@ -797,6 +831,40 @@ mod tests {
 
     /// `dct join --name`：改名之后发出去的请求带新名字，只有自己的那份名单
     /// 也跟着改；不合规的名字当场拒掉。
+    #[test]
+    fn a_default_name_that_clashes_becomes_the_next_free_number() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "Mac");
+        let c = Node::new(&hub, 3, "Mac 2");
+        a.login();
+        c.login();
+        c.join().unwrap();
+        a.approve("Mac 2").unwrap();
+        c.confirm(&a).unwrap();
+        let mut m = Mesh::new(keys(2), "Mac".into(), None);
+        m.auto_name = true;
+        let b = Node::with_mesh(&hub, m);
+        b.login();
+        b.join().unwrap();
+        assert_eq!(b.me().name, "Mac 3");
+        assert_eq!(a.view().pending.len(), 1);
+        assert_eq!(a.view().pending[0].name, "Mac 3");
+        a.approve("Mac 3").unwrap();
+        assert_eq!(a.names(), ["Mac", "Mac 2", "Mac 3"]);
+    }
+
+    #[test]
+    fn a_name_the_user_chose_is_never_changed_behind_their_back() {
+        let hub = FakeHub::new();
+        let a = Node::new(&hub, 1, "Mac");
+        let b = Node::new(&hub, 2, "Mac");
+        a.login();
+        b.login();
+        b.join().unwrap();
+        assert_eq!(b.me().name, "Mac");
+        assert_eq!(a.approve(&b.ep), Err(MeshProblem::NameTaken("Mac".into())));
+    }
+
     #[test]
     fn join_can_rename_first() {
         let hub = FakeHub::new();

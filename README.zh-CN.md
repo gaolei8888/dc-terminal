@@ -12,7 +12,7 @@ coding agent 要你守着，是因为它每隔几分钟就问一句「这样可�
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-b7410e?style=flat-square)
 ![macOS · Linux · Windows](https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-005f87?style=flat-square)
-![version 0.2.19](https://img.shields.io/badge/version-0.2.19-444?style=flat-square)
+![version 0.2.20](https://img.shields.io/badge/version-0.2.20-444?style=flat-square)
 
 [English](README.md) · 设计记录在 [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
@@ -682,15 +682,17 @@ WiFi 下**的手机扫一下，就能看到你的会话、每个会话的实时�
 
 ```
 dct login                       # 每台电脑都要：用 DC 账号登录
-dct join --name 公司Windows      # 新电脑上：请求加入（顺手起个名）
+dct join                        # 新电脑上：请求加入（名字自动叫 Mac / Windows / Linux）
 dct peers                       # 老电脑上：看谁在等批准
-dct peers approve 公司Windows    # 核对 6 位数，同意
+dct peers approve Windows       # 核对 6 位数，同意
 dct peers                       # 组里有哪几台、各开着哪些会话
-dct send 家里Mac/#3 "跑一下 Windows 测试"
+dct send Mac/#3 "跑一下 Windows 测试"
 ```
 
 - **登录**：`dct login` 用配对过的 DC 账号换一张中转令牌，只在这台电脑上存着。
   第一台登录的电脑顺手建一个「我的电脑」组。
+- **名字**：默认叫 Mac / Windows / Linux，组里撞名了自动变成「Mac 2」。想自己起名：
+  `dct join --name 公司电脑`。
 - **加入要两边的人都看一眼**：新电脑上 `dct join`，它会列出在线的老电脑和一个
   6 位数；老电脑上 `dct peers` 显示同一个 6 位数。两块屏幕上的数字一样，在新电脑
   上说「是这一台」，在老电脑上点同意，才算进组。数字对不上就是有人在中间捣鬼，
