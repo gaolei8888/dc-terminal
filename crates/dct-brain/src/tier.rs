@@ -161,9 +161,9 @@ pub fn raise(approved: Tier, label: &str, confirmed: bool) -> Tier {
 pub fn tier_for_step(action: &str, arg: &str) -> Tier {
     match action {
         "verify_text" | "wait" | "read_value" => Tier::Read,
-        "open_app" | "navigate_by_intent" | "scroll" | "back" | "type_param" | "set_checked" => {
-            Tier::SelfOnly
-        }
+        // open_url 只是在这次运行的浏览器窗口里打开一个网址，不往外送任何东西。
+        "open_app" | "open_url" | "navigate_by_intent" | "scroll" | "back" | "type_param"
+        | "set_checked" => Tier::SelfOnly,
         // 选文件就是把本机文件交出去（dcv 会话提醒的）。
         "pick_file" => Tier::Content,
         "tap_by_intent" | "confirm_dialog" => {
@@ -249,6 +249,7 @@ mod tests {
     fn moving_around_and_filling_in_only_affect_yourself() {
         for (a, arg) in [
             ("open_app", "TikTok"),
+            ("open_url", "https://studio.youtube.com"),
             ("navigate_by_intent", "我的 → 编辑资料 → 简介"),
             ("scroll", "down"),
             ("back", ""),
