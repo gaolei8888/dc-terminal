@@ -42,7 +42,8 @@
 **出错**
 - 码不对 / 已过期 / 已被用掉：`邀请码不对或已作废，请在老电脑上按 a 重新生成`。老电脑那边码同时作废，看板提示「有人用错码试过一次，码已作废」。
 - 找不到发邀请的电脑：`没有在线的电脑发出邀请` + 提示检查两台是不是同一个 DC 账号、老电脑的 dct 开着没有。
-- 同账号有两台以上同时发了邀请：逐台试；对不上的那台码也作废，提示用户。少见。
+- 同账号有两台以上同时发了邀请：**一台都不试**，提示「只留一台，按 a 再敲新码」。（2026-09-30 终审后改：逐台试等于中转冒充几台就多几次猜码机会。）
+- 同一个码在新电脑上只送出一次：再敲同一个码（换个写法也算）直接提示码已作废，不再发 `InviteJoin`。只记在内存里。
 - 守护进程重启：码丢失，重新按 `a`。
 
 **删掉的：** `dct peers approve`、`dct join --confirm`、看板顶部 y/n 确认行、`dct peers` 里的待批准列表。`dct peers`、`dct peers remove`、`dct send` 不变。
@@ -69,7 +70,7 @@ Invite { code: [u8; 6] 十进制数字, created, expires = created + 10 分钟,
    - A 有 `Live` 码 → `InviteOpen{member: A 的成员记录, sig: A 自签}`；否则 → `NoInvite`。
    - 不消耗码。B 核对 A 的自签名、`member.endpoint == env.from`。
 2. **加入** B → A：`InviteJoin{member: B, sig: B 自签, spake: msgB}`。
-   - A 检查：码是 `Live`；B 自签有效且 `member.endpoint == env.from`；B 不在名单；名字合法。
+   - A 检查：码是 `Live`；B 自签有效且 `member.endpoint == env.from`；B 不在名单，或者在名单上且两把公钥完全一样（上一轮 `InviteDone` 丢了，重进：照常走码，对上了回现在的名单，不加一条、版本不变）；名字合法。（重进是 2026-09-30 终审后加的。）
    - 任何一项不过 → 回 `InviteFailed`，**码是否作废见下**。
    - 全过 → **先把码置为 `InFlight{peer=B}`**（此后任何人再发 `InviteJoin` 都失败），算 SPAKE2，回 `InviteKey{spake: msgA, confirm: cA}`。
 3. **确认** B → A：`InviteFinish{confirm: cB}`。

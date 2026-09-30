@@ -2045,6 +2045,11 @@ pub mod msg {
                     )
                 }
             }
+            SeveralInviters { n } => t!(
+                lang,
+                en: format!("{n} of your computers are offering an invite code at once, so none was tried. Keep just one: press a on the computer you want, then type its new code"),
+                zh: format!("同时有 {n} 台电脑在发邀请码，所以一台都没试。只留一台：在要用的那台上按 a，再敲它的新码"),
+            ),
             InviteRosterRefused => t!(
                 lang,
                 en: "Your other computer has already put this one in the group, but the group list it sent does not check out here, so this computer did not join. On the other computer run dct peers remove <this computer's name>, then press a for a new code".to_string(),
@@ -3230,6 +3235,7 @@ mod tests {
             Mesh(crate::proto::MeshProblem::NoInvite { unanswered: 0 }),
             Mesh(crate::proto::MeshProblem::NoInvite { unanswered: 2 }),
             Mesh(crate::proto::MeshProblem::InviteRosterRefused),
+            Mesh(crate::proto::MeshProblem::SeveralInviters { n: 2 }),
             // `LoginFailed` 不在这里：它带的原因是网关那层给的中文，同 `Git`
             // 照抄原文，英文里会有汉字，见下面那条单独的测试。
         ];

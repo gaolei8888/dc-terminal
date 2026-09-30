@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use sha2::Digest as _;
 use dct_link::Envelope;
 use dct_mesh::invite::{Code, Confirmed, Handshake, MSG_LEN};
 use dct_mesh::wire::{self, Payload};
@@ -32,8 +33,10 @@ pub const INVITE_TTL_SECS: u64 = 10 * 60;
 pub const FINISH_WITHIN_SECS: u64 = 30;
 /// B 问每台电脑（探问、加入、确认）等多久。A 都是当场答，这只是一次往返。
 pub const INVITE_ASK_TIMEOUT: Duration = Duration::from_secs(5);
-/// 同时有好几台发着码时，B 最多试几台（逐台试，对不上的那台码也作废）。
-pub const MAX_INVITERS_TRIED: usize = 3;
+/// B 每次 `dct join` 最多试几台发邀请的电脑。是 1：同时有好几台答 `InviteOpen`
+/// 就一台都不试（`MeshProblem::SeveralInviters`），否则中转冒充几台就多几次
+/// 猜码的机会。常数留着，守护进程按它算最坏要等多久。
+pub const MAX_INVITERS_TRIED: usize = 1;
 
 /// A 这边发着的一个码。
 pub(crate) struct Invite {
@@ -198,10 +201,14 @@ impl Mesh {
             self.drop_from(from, "invite_join_without_group");
             return failed;
         };
+        // 已经在名单上、钥匙一模一样的：上一轮 `InviteDone` 在路上丢了，B 自己
+        // 不知道进了组。照常走一遍码（码对不上一样作废），对上了就把现在的
+        // 名单再给它一份，不再加一条。钥匙不一样的还是拒。
         if self
             .roster
             .as_ref()
-            .is_some_and(|r| r.roster.member(from).is_some())
+            .and_then(|r| r.roster.member(from))
+            .is_some_and(|m| m.sign_pub != member.sign_pub || m.kx_pub != member.kx_pub)
         {
             self.drop_from(from, "invite_join_already_member");
             return failed;
@@ -293,6 +300,17 @@ impl Mesh {
         let Some(current) = self.roster.clone() else {
             return failed;
         };
+        if let Some(already) = current.roster.member(&joiner.endpoint) {
+            self.journal
+                .mesh(&format!("invite_rejoined id={id} endpoint={}", joiner.endpoint));
+            self.invite_note = Some(InviteNote {
+                id,
+                outcome: InviteOutcome::Joined {
+                    name: already.name.clone(),
+                },
+            });
+            return Some(wire::encode(&Payload::InviteDone { roster: current }));
+        }
         let taken: Vec<String> = current
             .roster
             .members
@@ -348,9 +366,10 @@ pub fn flush_outbox(mesh: &Mutex<Mesh>, net: &dyn Net) {
 /// 新电脑上 `dct join <码> [--name 名字]`。
 ///
 /// 1. 问一遍同账号在线的电脑（最多 `MAX_JOIN_ASK` 台，排序去重）：`InviteProbe`；
-/// 2. 答 `InviteOpen` 的（自签对、端点就是问的那台）按端点排好，最多试
-///    `MAX_INVITERS_TRIED` 台，逐台走 SPAKE2：`InviteJoin` → 验 `cA` →
-///    `InviteFinish` → 收 `InviteDone` 里的名单；
+/// 2. 答 `InviteOpen` 的（自签对、端点就是问的那台）只能有一台——多于一台就
+///    一台都不试（`SeveralInviters`）；跟它走 SPAKE2：`InviteJoin` → 验 `cA` →
+///    `InviteFinish` → 收 `InviteDone` 里的名单。同一个码在这台电脑上只送一次
+///    （`Mesh::spent_codes`）；
 /// 3. 名单验过（签名者就是 PAKE 里绑定的那台 A、组对得上、我那一条是我的
 ///    钥匙）才进组。
 ///
@@ -363,6 +382,10 @@ pub fn join(
     name: Option<&str>,
 ) -> Result<(), MeshProblem> {
     let code = Code::parse(code).ok_or(MeshProblem::BadInviteCode)?;
+    let spent: [u8; 32] = sha2::Sha256::digest(dct_mesh::invite::password(&code)).into();
+    if lock(mesh).spent_codes.contains(&spent) {
+        return Err(MeshProblem::WrongInviteCode);
+    }
     let chosen = name.map(str::trim).filter(|n| !n.is_empty());
     let (me, sig) = {
         let m = lock(mesh);
@@ -428,23 +451,19 @@ pub fn join(
     if inviters.is_empty() {
         return Err(MeshProblem::NoInvite { unanswered });
     }
-    inviters.sort_by(|x, y| x.0.endpoint.cmp(&y.0.endpoint));
-    inviters.truncate(MAX_INVITERS_TRIED);
-
-    let mut refused = false;
-    for (inviter, group) in &inviters {
-        match attempt(mesh, net, &code, inviter, group, &me, &sig) {
-            Ok(roster) => return settle(mesh, roster, inviter, chosen.is_some()),
-            Err(Attempt::Mismatch) => {}
-            Err(Attempt::Unreachable) => {}
-            Err(Attempt::BadRoster) => refused = true,
-        }
+    if inviters.len() > MAX_INVITERS_TRIED {
+        return Err(MeshProblem::SeveralInviters {
+            n: inviters.len() as u32,
+        });
     }
-    Err(if refused {
-        MeshProblem::InviteRosterRefused
-    } else {
-        MeshProblem::WrongInviteCode
-    })
+    let (inviter, group) = &inviters[0];
+    // 送出 `InviteJoin` 之前就记下：这一次不管成不成，都算用掉了一次猜的机会。
+    lock(mesh).spent_codes.push(spent);
+    match attempt(mesh, net, &code, inviter, group, &me, &sig) {
+        Ok(roster) => settle(mesh, roster, inviter, chosen.is_some()),
+        Err(Attempt::BadRoster) => Err(MeshProblem::InviteRosterRefused),
+        Err(Attempt::Mismatch | Attempt::Unreachable) => Err(MeshProblem::WrongInviteCode),
+    }
 }
 
 enum Attempt {
@@ -998,7 +1017,7 @@ mod tests {
             assert!(a.live(), "{what}：不该作废");
             assert_eq!(a.note(), None, "{what}");
         }
-        // 已经在组里的那一台再来：也不作废。
+        // 已经在组里、但钥匙跟名单上不一样的那一台再来：拒，也不作废。
         {
             let mut r = a.roster().roster.clone();
             r.version = 2;
@@ -1006,14 +1025,16 @@ mod tests {
             let v2 = dct_mesh::roster::sign(r, &a.me(), &keys(1));
             a.mesh.lock().unwrap().commit(v2).unwrap();
         }
-        let mm = m.me();
+        let mut mm = m.me();
+        mm.kx_pub = STANDARD.encode(keys(8).kx_pub());
+        assert_ne!(mm.kx_pub, m.me().kx_pub);
         let already = Payload::InviteJoin {
             sig: wire::sign_member(&mm, &m.mesh.lock().unwrap().keys),
             member: mm.clone(),
             spake: wire::encode_bytes(Handshake::joiner(&code, &a.me(), &mm, [2; 32]).message()),
         };
         assert_eq!(m.ask(&a, &already), Some(Payload::InviteFailed));
-        assert!(a.live(), "已经在组里：不该作废");
+        assert!(a.live(), "已经在组里、钥匙不一样：不该作废");
 
         let (_, c) = raw_join(&b, &a, &v.code);
         assert!(matches!(
@@ -1200,10 +1221,13 @@ mod tests {
         let before = a.roster();
         assert_eq!(b.ask(&a, &join), Some(Payload::InviteFailed));
         assert_eq!(b.ask(&a, &fin), None);
-        // A 又出了一个新码：重放旧的 InviteJoin，B 已经在组里，被拒，也不连累新码。
+        // A 又出了一个新码：重放旧的 InviteJoin（B 已经在组里、钥匙一样，算重进）
+        // 会把新码拖进 InFlight；旧的 InviteFinish 对不上新一轮，码作废、名单不变。
+        // 跟中转抢先用错码一样，只是捣乱，进不来。
         a.invite();
-        assert_eq!(b.ask(&a, &join), Some(Payload::InviteFailed));
-        assert!(a.live());
+        assert!(matches!(b.ask(&a, &join), Some(Payload::InviteKey { .. })));
+        assert_eq!(b.ask(&a, &fin), Some(Payload::InviteFailed));
+        assert!(!a.live());
         assert_eq!(a.roster(), before);
     }
 
@@ -1465,7 +1489,8 @@ mod tests {
 
     /// 中转在 `InviteJoin` 里把 B 的一把公钥换成自己的：B 的自签名就不成立，
     /// A 在进 `InFlight` 之前就拒——**码不作废**（这一下换不来任何关于码的
-    /// 信息）。B 重来一次，中转不捣乱，就进得来。
+    /// 信息）。但 B 分不出这一次是不是给了中转一次猜码的机会，所以同一个码
+    /// 不再送第二次；老电脑按 a 换个新码，中转不捣乱，就进得来。
     #[test]
     fn a_relay_that_edits_the_joiners_keys_is_refused_without_burning() {
         let hub = FakeHub::new();
@@ -1482,7 +1507,10 @@ mod tests {
         });
         assert_eq!(join_via(&b, &net, &v.code), Err(MeshProblem::WrongInviteCode));
         assert!(a.live(), "签名不对不作废");
-        assert_eq!(join_via(&b, &b.net, &v.code), Ok(()));
+        assert_eq!(join_via(&b, &b.net, &v.code), Err(MeshProblem::WrongInviteCode));
+        assert!(a.live(), "同一个码没再送出去");
+        let v2 = a.invite();
+        assert_eq!(join_via(&b, &b.net, &v2.code), Ok(()));
         let listed = a.roster().roster.member(&b.ep).cloned().unwrap();
         assert_eq!(listed.kx_pub, b.me().kx_pub);
     }
@@ -1576,6 +1604,29 @@ mod tests {
 
     /// 走到最后一步、`InviteDone` 没回来：本地一样也没改（名单、名字、
     /// `--name` 起的名字都没落盘）。
+    /// 老电脑已经把 B 签进去了，`InviteDone` 却在路上丢了：B 照提示在老电脑上
+    /// 按 a 换个新码再敲，就能进组；名单不多一条，版本也不变。
+    #[test]
+    fn a_joiner_whose_invite_done_was_lost_gets_in_with_a_new_code() {
+        let hub = FakeHub::new();
+        let a = Node::grouped(&hub, 1, "A");
+        let b = Node::grouped(&hub, 2, "B");
+        let v = a.invite();
+        let lossy = EvilNet::honest(hub.net_for(&b.ep)).incoming(|_, r| match wire::decode(&r) {
+            Ok(Payload::InviteDone { .. }) => Err(crate::link::LinkError::Unreachable),
+            _ => Ok(r),
+        });
+        assert_eq!(join_via(&b, &lossy, &v.code), Err(MeshProblem::WrongInviteCode));
+        assert_eq!(a.names(), ["A", "B"]);
+        let version = a.roster().roster.version;
+        let v2 = a.invite();
+        assert_eq!(join_via(&b, &b.net, &v2.code), Ok(()));
+        assert_eq!(b.roster(), a.roster());
+        assert_eq!(a.names(), ["A", "B"]);
+        assert_eq!(a.roster().roster.version, version);
+        assert!(!a.live(), "新码用掉了");
+    }
+
     #[test]
     fn nothing_changes_locally_until_invite_done_arrives() {
         let hub = FakeHub::new();
@@ -1600,7 +1651,7 @@ mod tests {
         assert_eq!(state_of(&b), before);
         assert_eq!(st.roster().unwrap(), roster_before);
         assert!(!st.has_chosen_name(), "--name 没落盘");
-        assert_eq!(a.names(), ["A", "公司电脑"], "A 那边已经签进去了（已知：要 dct peers remove）");
+        assert_eq!(a.names(), ["A", "公司电脑"], "A 那边已经签进去了；换个新码再敲就能进，见 a_joiner_whose_invite_done_was_lost_gets_in_with_a_new_code");
     }
 
     #[test]
@@ -1648,46 +1699,47 @@ mod tests {
 
     /// 两台同时发着码：B 逐台试（按端点排），对不上的那台码也作废；用的是
     /// 哪台的码就进哪台的组。
+    /// 同账号有两台以上在发邀请码（可能有一台是中转冒充的）：一台都不试——试
+    /// 一台就是给中转一次猜码的机会。两台的码都还活着。
     #[test]
-    fn with_two_inviters_the_wrong_one_is_burned_and_the_right_one_takes_b_in() {
+    fn with_several_inviters_nobody_is_tried() {
         let hub = FakeHub::new();
         let x = Node::grouped(&hub, 1, "X");
         let y = Node::grouped(&hub, 3, "Y");
         let b = Node::grouped(&hub, 2, "B");
-        let (first, second) = if x.ep < y.ep { (&x, &y) } else { (&y, &x) };
-        first.invite();
-        let v = second.invite();
-        let v_first = first.mesh.lock().unwrap().invite_view().unwrap();
-        if v_first.code == v.code {
-            return; // 百万分之一：两个码一样，这一轮测不出。
-        }
-        assert_eq!(join_via(&b, &b.net, &v.code), Ok(()));
-        assert_eq!(b.roster().signer, second.ep);
-        first.at(T0 + FINISH_WITHIN_SECS + 1);
-        assert_eq!(first.note().unwrap().outcome, InviteOutcome::Burned);
-        assert_eq!(first.names(), [first.me().name]);
+        x.invite();
+        let v = y.invite();
+        let net = EvilNet::honest(hub.net_for(&b.ep));
+        assert_eq!(
+            join_via(&b, &net, &v.code),
+            Err(MeshProblem::SeveralInviters { n: 2 })
+        );
+        assert_eq!(net.count("invite_probe"), 2);
+        assert_eq!(net.count("invite_join"), 0);
+        assert!(x.live() && y.live());
     }
 
+    /// 一个码在这台电脑上只送出去一次：送错了（或者中转冒充发邀请的那台接了
+    /// 这一次），再敲同一个码——换个写法也一样——不再发 `InviteJoin`，直接说码
+    /// 已作废。
     #[test]
-    fn at_most_three_inviters_are_tried() {
+    fn a_code_already_tried_here_is_not_sent_again() {
         let hub = FakeHub::new();
+        let a = Node::grouped(&hub, 1, "A");
         let b = Node::grouped(&hub, 2, "B");
-        let inviters: Vec<Node> = (10..14).map(|s| Node::grouped(&hub, s, &format!("I{s}"))).collect();
-        for n in &inviters {
-            n.invite();
-        }
-        let codes: Vec<String> = inviters
-            .iter()
-            .map(|n| n.mesh.lock().unwrap().invite_view().unwrap().code)
-            .collect();
-        let unused = (0..1_000_000)
-            .map(|i| format!("{i:06}"))
-            .find(|c| !codes.contains(c))
-            .unwrap();
+        let v = a.invite();
+        let wrong = other_than(&v.code);
         let net = EvilNet::honest(hub.net_for(&b.ep));
-        assert_eq!(join_via(&b, &net, &unused), Err(MeshProblem::WrongInviteCode));
-        assert_eq!(net.count("invite_probe"), 4);
-        assert_eq!(net.count("invite_join"), MAX_INVITERS_TRIED);
+        assert_eq!(join_via(&b, &net, &wrong), Err(MeshProblem::WrongInviteCode));
+        let v2 = a.invite();
+        if v2.code == wrong {
+            return; // 百万分之一：新码恰好是刚才那个错码，这一轮测不出。
+        }
+        let spaced = format!("{} {}", &wrong[..3], &wrong[3..]);
+        assert_eq!(join_via(&b, &net, &spaced), Err(MeshProblem::WrongInviteCode));
+        assert_eq!(net.count("invite_join"), 1);
+        assert!(a.live(), "第二次没送出去，A 的新码还活着");
+        assert_eq!(join_via(&b, &net, &v2.code), Ok(()));
     }
 
     /// 中转说同账号在线的有 17 台：一台都不问。

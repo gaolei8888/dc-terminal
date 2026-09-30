@@ -1213,6 +1213,9 @@ pub enum MeshProblem {
     /// 老电脑已经把这台签进了名单，但发来的那份名单这边验不过（签名、组、
     /// 我的钥匙对不上），没进组。
     InviteRosterRefused,
+    /// 同账号在线的电脑里有 `n` 台（≥2）都在发邀请码：一台都没试——试一台就
+    /// 是给中转一次猜码的机会，而其中哪台是真的，这边分不出。
+    SeveralInviters { n: u32 },
 }
 
 /// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。

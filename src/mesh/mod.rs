@@ -151,6 +151,10 @@ pub struct Mesh {
     /// 攥着锁的时候定下来、放了锁再发的名单广播（接收方, payload）。
     /// `invite::flush_outbox` 发；守护进程的投递线程每拍调一次。
     pub(crate) outbox: Vec<(Vec<String>, Vec<u8>)>,
+    /// 这台电脑当新电脑时已经送出过 `InviteJoin` 的码（存的是口令字节的
+    /// SHA-256，不存码本身）。同一个码只送一次：再敲就直接说已作废，中转
+    /// 冒充发邀请的那台，每个码也只换得到一次猜的机会。只在内存里。
+    pub(crate) spent_codes: Vec<[u8; 32]>,
 }
 
 impl Mesh {
@@ -187,6 +191,7 @@ impl Mesh {
             invite_note: None,
             invite_seq: 0,
             outbox: Vec::new(),
+            spent_codes: Vec::new(),
         }
     }
 
