@@ -2417,6 +2417,74 @@ pub mod msg {
         )
     }
 
+    /// 老电脑上 `dct invite` / 看板：码本身。`spaced` 是 `482 913` 这样。
+    pub fn mesh_invite_code(lang: Lang, spaced: &str) -> String {
+        t!(
+            lang,
+            en: format!("Invite code {spaced} · valid for 10 minutes"),
+            zh: format!("邀请码 {spaced} · 10 分钟内有效"),
+        )
+    }
+
+    /// 码下面那一行：新电脑上敲什么。
+    pub fn mesh_invite_hint(lang: Lang, code: &str) -> String {
+        t!(
+            lang,
+            en: format!("On the new computer run: dct join {code} (the code works once)"),
+            zh: format!("在新电脑上运行：dct join {code}（码只能用一次）"),
+        )
+    }
+
+    /// 倒计时：还剩几分几秒。
+    pub fn mesh_invite_countdown(lang: Lang, secs_left: u64) -> String {
+        let (m, s) = (secs_left / 60, secs_left % 60);
+        t!(
+            lang,
+            en: format!("{m}:{s:02} left"),
+            zh: format!("还剩 {m}:{s:02}"),
+        )
+    }
+
+    pub fn mesh_invite_burned(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Someone tried a wrong code once, so this code is no longer valid. To add a computer, make a new one (press a on the board, or run dct invite)".to_string(),
+            zh: "有人用错码试过一次，码已作废。要加电脑就重新生成一个（看板上按 a，或运行 dct invite）".to_string(),
+        )
+    }
+
+    pub fn mesh_invite_expired(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "The invite code expired without being used. To add a computer, make a new one (press a on the board, or run dct invite)".to_string(),
+            zh: "邀请码过期了，没人用。要加电脑就重新生成一个（看板上按 a，或运行 dct invite）".to_string(),
+        )
+    }
+
+    pub fn mesh_invite_replaced(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "This invite code has been replaced by a newer one (was a pressed on the board?). Use the new one".to_string(),
+            zh: "这个邀请码已经换成新的了（看板上又按了 a？），以新的为准".to_string(),
+        )
+    }
+
+    pub fn mesh_invite_gone(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "The invite code has been withdrawn".to_string(),
+            zh: "邀请码已经收回了".to_string(),
+        )
+    }
+
+    pub fn mesh_invite_usage(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Usage: dct invite (shows a 6-digit code; on the new computer run dct join <code>)".to_string(),
+            zh: "用法：dct invite（显示一个 6 位邀请码；在新电脑上运行 dct join <码>）".to_string(),
+        )
+    }
+
     /// 新电脑上用邀请码进组了：组里有谁。
     pub fn mesh_joined_with(lang: Lang, names: &[String]) -> String {
         t!(
@@ -3339,6 +3407,43 @@ mod tests {
         // `Internal` 是刻意的例外：它照抄原文（多半是还没归类的内部错误
         // 或 git 的 stderr），翻不动也不该翻。
         assert_eq!(msg::error(Lang::En, &Internal("原文".into())), "原文");
+    }
+
+    /// 邀请码那几句：中文照设计文档一字不差，英文里没有汉字。
+    #[test]
+    fn invite_strings_say_what_the_design_says() {
+        assert_eq!(
+            msg::mesh_invite_code(Lang::Zh, "482 913"),
+            "邀请码 482 913 · 10 分钟内有效"
+        );
+        assert_eq!(
+            msg::mesh_joined_with(Lang::Zh, &["Mac".into(), "公司电脑".into()]),
+            "已加入「我的电脑」，组里有：Mac、公司电脑"
+        );
+        assert_eq!(msg::mesh_invite_countdown(Lang::Zh, 601), "还剩 10:01");
+        assert_eq!(msg::mesh_invite_countdown(Lang::Zh, 9), "还剩 0:09");
+        assert_eq!(
+            msg::error(
+                Lang::Zh,
+                &crate::proto::ErrorCode::Mesh(crate::proto::MeshProblem::WrongInviteCode)
+            ),
+            "邀请码不对或已作废，请在老电脑上按 a 重新生成"
+        );
+        for s in [
+            msg::mesh_invite_code(Lang::En, "482 913"),
+            msg::mesh_invite_hint(Lang::En, "482913"),
+            msg::mesh_invite_countdown(Lang::En, 61),
+            msg::mesh_invite_burned(Lang::En),
+            msg::mesh_invite_expired(Lang::En),
+            msg::mesh_invite_replaced(Lang::En),
+            msg::mesh_invite_gone(Lang::En),
+            msg::mesh_invite_usage(Lang::En),
+            msg::mesh_joined_with(Lang::En, &["A".into()]),
+            msg::mesh_renamed_on_join(Lang::En, "A 2"),
+            msg::mesh_join_usage(Lang::En),
+        ] {
+            assert!(!has_han(&s), "{s}");
+        }
     }
 
     /// 多电脑那几句给人看的话：原文照 brief 一字不差，英文里没有汉字。

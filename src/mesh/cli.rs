@@ -1,11 +1,11 @@
-//! `dct login` / `dct join` / `dct peers` / `dct send`。
+//! `dct login` / `dct invite` / `dct join` / `dct peers` / `dct send`。
 //!
 //! 这里只是把话说给人听：真正的事（换令牌、问别的电脑、签名单）都在守护
 //! 进程里做——它握着中转连接、钥匙和密钥仓，命令行这边一样也不碰。
 //!
 //! 跟守护进程说话的那一下（`call`）和问用户的那一下（`ask`）都是参数，
 //! 于是整套对话不起守护进程、不碰终端也能测。
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -20,6 +20,9 @@ use crate::proto::{
 /// 守护进程替我们打网络的那几条请求（换令牌、问别的电脑、广播名单）等多久。
 /// 必须比守护进程那边最坏的情况（`mesh::worst_case`）长出一截，见 `wait_for`。
 const MESH_CALL_WAIT: Duration = Duration::from_secs(90);
+
+/// `dct invite` 等结果时多久问一次守护进程（倒计时也按这个跳）。
+const INVITE_POLL: Duration = Duration::from_secs(1);
 
 /// 这一条请求命令行等多久：多电脑的请求等 `MESH_CALL_WAIT`，别的（握手）
 /// 按本机答一句的 `READ_TIMEOUT`。
@@ -74,6 +77,13 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     };
+    // `dct invite` 被 Ctrl-C：把码收回，不留一个没人看着的码挂 10 分钟。
+    // **必须装在连上守护进程之后**：Unix 上这一下会屏蔽 SIGINT/SIGTERM，
+    // 屏蔽掩码会被子进程继承——要是在 `connect_or_start` 拉起守护进程之前
+    // 装，那个守护进程就再也收不到 `dct stop` 的 SIGTERM。
+    if cmd == "invite" {
+        crate::sys::signal::restore_terminal_when_killed(cancel_invite_on_exit);
+    }
     let mut client = client;
     let mut call = |req: Request| {
         let wait = wait_for(&req);
@@ -106,6 +116,19 @@ fn dispatch(
     }
     match cmd {
         "login" => login(call, out, err, lang),
+        "invite" if rest.is_empty() => invite(
+            call,
+            out,
+            err,
+            lang,
+            std::io::stdout().is_terminal(),
+            &unix_now,
+            &|| std::thread::sleep(INVITE_POLL),
+        ),
+        "invite" => {
+            let _ = writeln!(err, "{}", msg::mesh_invite_usage(lang));
+            2
+        }
         "join" => match parse_join(rest) {
             Some(opts) => join(call, out, err, lang, &opts),
             None => {
@@ -243,6 +266,107 @@ pub(crate) fn login(call: Call, out: &mut dyn Write, err: &mut dyn Write, lang: 
     }
     let _ = writeln!(out, "{}", msg::mesh_logged_in(lang, &c(&after.name)));
     0
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Ctrl-C 打断 `dct invite` 时跑（Unix 上在 `sigwait` 那条普通线程里，
+/// Windows 上在控制台处理线程里——都能放心开 socket）。另开一条连接，
+/// 跑完进程就退出。
+fn cancel_invite_on_exit() {
+    let sock = crate::proto::socket_path();
+    if let Ok(mut c) = Client::connect(&sock) {
+        let _ = c.call_within(Request::MeshInviteCancel, crate::client::READ_TIMEOUT);
+    }
+}
+
+/// 老电脑上 `dct invite`：出一个码，印出来，一直等到它有结果（有人用它进了
+/// 组、被试错作废、过期、被看板上新按的 `a` 换掉）。`tty` 为真时每秒刷一行
+/// 倒计时。进组退 0，别的退 1。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invite(
+    call: Call,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    lang: Lang,
+    tty: bool,
+    now: &dyn Fn() -> u64,
+    pause: &dyn Fn(),
+) -> i32 {
+    let v = match call(Request::MeshInvite) {
+        Ok(Response::MeshInvite(v)) => v,
+        Ok(Response::Error(e)) => {
+            say_error(err, lang, &e);
+            return 1;
+        }
+        Ok(other) => {
+            say_error(err, lang, &ErrorCode::Internal(format!("{other:?}")));
+            return 1;
+        }
+        Err(e) => {
+            say_error(err, lang, &ErrorCode::Internal(e.to_string()));
+            return 1;
+        }
+    };
+    let spaced = format!("{} {}", &v.code[..3], &v.code[3..]);
+    let _ = writeln!(out, "{}", msg::mesh_invite_code(lang, &spaced));
+    let _ = writeln!(out, "{}", msg::mesh_invite_hint(lang, &v.code));
+    let _ = out.flush();
+    let mut ticked = false;
+    // 倒计时那一行后面接的话要另起一行。
+    let end = |out: &mut dyn Write, ticked: bool| {
+        if ticked {
+            let _ = writeln!(out);
+        }
+    };
+    loop {
+        pause();
+        let Some(s) = view_of(call, Request::MeshStatus, err, lang) else {
+            end(out, ticked);
+            return 1;
+        };
+        if let Some(n) = s.invite_note.as_ref().filter(|n| n.id == v.id) {
+            end(out, ticked);
+            return match &n.outcome {
+                crate::proto::InviteOutcome::Joined { name } => {
+                    let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &c(name)));
+                    0
+                }
+                crate::proto::InviteOutcome::Burned => {
+                    let _ = writeln!(err, "{}", msg::mesh_invite_burned(lang));
+                    1
+                }
+                crate::proto::InviteOutcome::Expired => {
+                    let _ = writeln!(err, "{}", msg::mesh_invite_expired(lang));
+                    1
+                }
+            };
+        }
+        match &s.invite {
+            Some(cur) if cur.id == v.id => {}
+            Some(_) => {
+                end(out, ticked);
+                let _ = writeln!(err, "{}", msg::mesh_invite_replaced(lang));
+                return 1;
+            }
+            None => {
+                end(out, ticked);
+                let _ = writeln!(err, "{}", msg::mesh_invite_gone(lang));
+                return 1;
+            }
+        }
+        if tty {
+            let left = v.expires_at.saturating_sub(now());
+            let _ = write!(out, "\r{}", msg::mesh_invite_countdown(lang, left));
+            let _ = out.flush();
+            ticked = true;
+        }
+    }
 }
 
 /// 新电脑上：拿老电脑给的码加入。登录（没登录的话）、找发邀请的那台、
@@ -573,6 +697,7 @@ mod tests {
     fn every_mesh_command_stops_at_a_stale_daemon_with_the_restart_hint() {
         let cases: &[&[&str]] = &[
             &["login"],
+            &["invite"],
             &["join"],
             &["peers"],
             &["peers", "approve", "B"],
@@ -1207,5 +1332,137 @@ mod tests {
         let code = dispatch("join", &[], &mut sc.call(), &mut no_ask, &mut out, &mut err, Lang::Zh);
         assert_eq!(code, 2);
         assert!(s(&err).contains("dct join <邀请码>"), "{}", s(&err));
+    }
+
+    fn invite_view(id: u64, code: &str) -> crate::proto::InviteView {
+        crate::proto::InviteView {
+            id,
+            code: code.into(),
+            expires_at: 1_000 + 600,
+        }
+    }
+
+    /// 一份带着邀请码（或者结果）的现状。
+    fn with_invite(
+        invite: Option<crate::proto::InviteView>,
+        note: Option<(u64, crate::proto::InviteOutcome)>,
+    ) -> MeshView {
+        let mut v = view(true, &[("Mac", true)]);
+        v.invite = invite;
+        v.invite_note = note.map(|(id, outcome)| crate::proto::InviteNote { id, outcome });
+        v
+    }
+
+    fn run_invite(answers: Vec<Response>, tty: bool) -> (i32, String, String, Vec<String>) {
+        let sc = Script::new(answers);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = invite(&mut sc.call(), &mut out, &mut err, Lang::Zh, tty, &|| 1_001, &|| {});
+        let seen = sc.seen.borrow().clone();
+        (code, s(&out), s(&err), seen)
+    }
+
+    /// 印出码（带空格）和怎么用，等到有人用它进组：报名字、退 0。
+    #[test]
+    fn invite_prints_the_code_and_waits_until_someone_joins() {
+        use crate::proto::InviteOutcome::Joined;
+        let (code, out, err, seen) = run_invite(
+            vec![
+                Response::MeshInvite(invite_view(3, "012345")),
+                Response::Mesh(with_invite(Some(invite_view(3, "012345")), None)),
+                Response::Mesh(with_invite(
+                    None,
+                    Some((
+                        3,
+                        Joined {
+                            name: "公司电脑".into(),
+                        },
+                    )),
+                )),
+            ],
+            false,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            out,
+            "邀请码 012 345 · 10 分钟内有效\n在新电脑上运行：dct join 012345（码只能用一次）\n公司电脑 已加入\n"
+        );
+        assert_eq!(seen, ["MeshInvite", "MeshStatus", "MeshStatus"]);
+    }
+
+    #[test]
+    fn invite_says_when_the_code_was_burned_expired_replaced_or_withdrawn() {
+        use crate::proto::InviteOutcome::{Burned, Expired};
+        let cases: Vec<(MeshView, &str)> = vec![
+            (
+                with_invite(None, Some((3, Burned))),
+                "有人用错码试过一次，码已作废。要加电脑就重新生成一个（看板上按 a，或运行 dct invite）",
+            ),
+            (
+                with_invite(None, Some((3, Expired))),
+                "邀请码过期了，没人用。要加电脑就重新生成一个（看板上按 a，或运行 dct invite）",
+            ),
+            (
+                with_invite(Some(invite_view(4, "999999")), None),
+                "这个邀请码已经换成新的了（看板上又按了 a？），以新的为准",
+            ),
+            (with_invite(None, None), "邀请码已经收回了"),
+            // 上一个码的结果不算这一个的。
+            (
+                with_invite(None, Some((2, Burned))),
+                "邀请码已经收回了",
+            ),
+        ];
+        for (status, want) in cases {
+            let (code, _, err, _) = run_invite(
+                vec![
+                    Response::MeshInvite(invite_view(3, "482913")),
+                    Response::Mesh(status),
+                ],
+                false,
+            );
+            assert_eq!(code, 1);
+            assert_eq!(err.trim(), want);
+        }
+    }
+
+    /// 终端里每秒刷一行倒计时（`\r` 覆盖）；结果另起一行。管道里不刷。
+    #[test]
+    fn invite_counts_down_only_on_a_terminal() {
+        use crate::proto::InviteOutcome::Joined;
+        let answers = || {
+            vec![
+                Response::MeshInvite(invite_view(3, "482913")),
+                Response::Mesh(with_invite(Some(invite_view(3, "482913")), None)),
+                Response::Mesh(with_invite(None, Some((3, Joined { name: "B".into() })))),
+            ]
+        };
+        let (_, out, _, _) = run_invite(answers(), true);
+        assert!(out.contains("\r还剩 9:59"), "{out:?}");
+        assert!(out.ends_with("\nB 已加入\n"), "{out:?}");
+        let (_, out, _, _) = run_invite(answers(), false);
+        assert!(!out.contains('\r'), "{out:?}");
+    }
+
+    #[test]
+    fn invite_before_login_says_to_log_in() {
+        let (code, out, err, _) = run_invite(
+            vec![Response::Error(ErrorCode::Mesh(MeshProblem::NotLoggedIn))],
+            false,
+        );
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(err.trim(), "还没登录多电脑，先运行 dct login");
+    }
+
+    #[test]
+    fn invite_takes_no_arguments() {
+        let sc = Script::new(vec![Response::Hello {
+            protocol: crate::proto::PROTOCOL_VERSION,
+        }]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let rest = vec!["482913".to_string()];
+        let code = dispatch("invite", &rest, &mut sc.call(), &mut no_ask, &mut out, &mut err, Lang::Zh);
+        assert_eq!(code, 2);
+        assert!(s(&err).contains("用法：dct invite"), "{}", s(&err));
     }
 }

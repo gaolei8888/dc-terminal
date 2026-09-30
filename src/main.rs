@@ -26,8 +26,9 @@ dct —— vibe coding 终端
                    后台空着就直接起一个新的
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
-  dct join [--name 电脑名]
-                   在新电脑上请求加入，去已有的电脑上核对 6 位数、点同意
+  dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
+  dct join <邀请码> [--name 电脑名]
+                   新电脑上：用老电脑给的码加入（没登录会先自动登录）
   dct peers        看组里有哪些电脑、开着哪些会话、谁在等批准
   dct send <电脑名>/<会话名> \"<内容>\"
                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
@@ -119,7 +120,7 @@ fn main() -> Result<()> {
             std::process::exit(dct::cli::llm_check(cli_lang()))
         }
         // 多电脑。真正的事都在守护进程里做，这里只把话说给人听。
-        Some("login") | Some("join") | Some("peers") | Some("send") => {
+        Some("login") | Some("invite") | Some("join") | Some("peers") | Some("send") => {
             std::process::exit(dct::mesh::cli::run(&args))
         }
         Some("--help") | Some("-h") => {
