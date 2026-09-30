@@ -134,3 +134,12 @@ Ruling: fix wave covers C1 (commit-reveal SAS + name in code), I1 (name sanitisi
 Fix wave: 5883bc0 M1, 238435a I2, 7257f8c I5, 4402cf2 I1, 2991d0e C1 (dct-sas-v2 commit-reveal, KAT 204106), 6d62005 I4. Tests green. Scoped re-review next (C1 is crypto; opus).
 Fix-wave re-review: C1,I1,I2,I5,M1,I4 ADDRESSED; new: 1 Important (joiner shows unlimited codes -> N-in-a-million grind by relay-supplied peer list), 4 Minor. Details fix-wave-review.md.
 Ruling: one more small fix dispatch beyond the "one fix" guideline — the new Important is a security bound the spec promises; fix = dedupe+cap peers asked (~16) and refuse to show codes when more answer; also U+2028/2029 in name filter and short retry when token already expired. Verified by tests + my own run, no third re-review — cost if wrong: cap logic bug in a small diff.
+Merged to main (ad574a2 + earlier merge) and pushed, user OK'd ("1 要").
+Go-live (user: "可以", second relay instance): dct-srv-mesh built from ad574a2 on dataclue.cn (/usr/local/bin/dct-srv-mesh, systemd dct-srv-mesh, 127.0.0.1:8788 --with-link --relay-keys /etc/dct-srv/gateway.pub); Caddy dataclue.cn: handle_path /dct-relay/link/* -> 8788, other /dct-relay/* 404 (backup /opt/dc-terminal/deployment/before-dct-relay-20260929-073707). Verified publicly: prod probe token 200, forged 401, /phone 404, site root and live listing still 200. Existing dct-srv (8787) untouched.
+Remaining: gateway flag DC_ADMIN_RELAY_TOKENS_ENABLED (dc-llm side, asked dc-llm-e4 for deploy state; NOT flipped), then two-real-computers acceptance + LF check (README step 4/5).
+Gateway flag ON in prod (dc-llm-e4, its user approved): issuance 200 verified under prod pubkey (7d), negatives correct, regression OK, rollback = set flag false + up -d. Known trap: 3 personal accounts have keys with no created_by_user_id -> 401 -> "请重新配对" loop; dc-llm side to backfill. Remaining: user pairs DC account on this Mac, then real 2-computer acceptance (README step 4) + LF check (step 5).
+
+## 2026-09-29 acceptance, this Mac
+- DC account paired (phone 15313957725; dc-llm backfilled created_by_user_id on its key). `dc` key now in ~/.dct/secrets.toml.
+- New dct 0.2.18 (main ad574a2) installed to ~/.local/bin/dct; old one saved as dct.0.2.17.bak. Daemon restart (kills running sessions) approved by user ("装").
+- Next: dct login, join from a second computer, approve, send; then LF check in real Claude Code and Codex.
