@@ -7,6 +7,7 @@
 //! 被单元测试跑穷尽，不用起进程、不用碰真文件系统。
 pub mod canon;
 pub mod id;
+pub mod invite;
 pub mod keys;
 pub mod relay_token;
 pub mod roster;
