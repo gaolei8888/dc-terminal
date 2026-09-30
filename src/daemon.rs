@@ -352,20 +352,6 @@ fn handle_mesh(
             .ok_or(MeshProblem::NotLoggedIn)
             .map(|(m, _)| recover(m.lock()).cancel_invite())
             .map(|_| view(ctl)),
-        Request::MeshApprove {
-            endpoint,
-            code,
-            yes,
-        } => ctl
-            .running()
-            .ok_or(MeshProblem::NotLoggedIn)
-            .and_then(|(m, n)| group::approve(&m, n.as_ref(), &endpoint, &code, yes))
-            .map(|_| view(ctl)),
-        Request::MeshConfirmInviter { endpoint } => ctl
-            .running()
-            .ok_or(MeshProblem::NotLoggedIn)
-            .and_then(|(m, _)| group::confirm(&m, &endpoint))
-            .map(|_| view(ctl)),
         Request::MeshRemove { name } => ctl
             .running()
             .ok_or(MeshProblem::NotLoggedIn)
@@ -404,8 +390,6 @@ fn mesh_view(ctl: &MeshCtl) -> crate::proto::MeshView {
         endpoint: String::new(),
         in_group: matches!(store.roster(), Ok(Some(_))),
         members: Vec::new(),
-        pending: Vec::new(),
-        joining: Vec::new(),
         messages: Default::default(),
         invite: None,
         invite_note: None,
@@ -883,15 +867,13 @@ fn serve(
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             // 多电脑这几条只在这里答：从 HTTP 上来的请求走 `handle`，那边
-            // 一律拒绝（批准一台电脑进组，不能从局域网手机页上点）。
+            // 一律拒绝（出邀请码、加电脑，不能从局域网手机页上点）。
             Ok(
                 req @ (Request::MeshStatus
                 | Request::MeshLogin
                 | Request::MeshJoin { .. }
                 | Request::MeshInvite
                 | Request::MeshInviteCancel
-                | Request::MeshApprove { .. }
-                | Request::MeshConfirmInviter { .. }
                 | Request::MeshRemove { .. }
                 | Request::MeshPeers
                 | Request::MeshSend { .. }),
@@ -1261,8 +1243,6 @@ fn handle(
         | Request::MeshJoin { .. }
         | Request::MeshInvite
         | Request::MeshInviteCancel
-        | Request::MeshApprove { .. }
-        | Request::MeshConfirmInviter { .. }
         | Request::MeshRemove { .. }
         | Request::MeshPeers
         | Request::MeshSend { .. } => Ok(Response::Error(ErrorCode::BadRequest(
@@ -3625,14 +3605,6 @@ mod tests {
             },
             Request::MeshInvite,
             Request::MeshInviteCancel,
-            Request::MeshApprove {
-                endpoint: "c-x".into(),
-                code: "123456".into(),
-                yes: true,
-            },
-            Request::MeshConfirmInviter {
-                endpoint: "c-x".into(),
-            },
             Request::MeshRemove { name: "x".into() },
             Request::MeshPeers,
             Request::MeshSend {
@@ -4107,14 +4079,6 @@ mod mesh_tests {
         for req in [
             Request::MeshInvite,
             Request::MeshInviteCancel,
-            Request::MeshApprove {
-                endpoint: "x".into(),
-                code: "1".into(),
-                yes: true,
-            },
-            Request::MeshConfirmInviter {
-                endpoint: "x".into(),
-            },
             Request::MeshRemove { name: "x".into() },
             Request::MeshPeers,
             Request::MeshSend {

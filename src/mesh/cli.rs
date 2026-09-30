@@ -3,9 +3,9 @@
 //! 这里只是把话说给人听：真正的事（换令牌、问别的电脑、签名单）都在守护
 //! 进程里做——它握着中转连接、钥匙和密钥仓，命令行这边一样也不碰。
 //!
-//! 跟守护进程说话的那一下（`call`）和问用户的那一下（`ask`）都是参数，
-//! 于是整套对话不起守护进程、不碰终端也能测。
-use std::io::{BufRead, IsTerminal, Write};
+//! 跟守护进程说话的那一下（`call`）是参数，于是整套对话不起守护进程、
+//! 不碰终端也能测。
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use anyhow::Result;
 use crate::client::Client;
 use crate::i18n::{msg, text, Key, Lang};
 use crate::proto::{
-    ErrorCode, MeshProblem, MeshView, PeerView, PendingJoin, Request, Response, SendOutcome,
+    ErrorCode, MeshProblem, MeshView, PeerView, Request, Response, SendOutcome,
 };
 
 /// 守护进程替我们打网络的那几条请求（换令牌、问别的电脑、广播名单）等多久。
@@ -27,8 +27,8 @@ const INVITE_POLL: Duration = Duration::from_secs(1);
 /// 这一条请求命令行等多久：多电脑的请求等 `MESH_CALL_WAIT`，别的（握手）
 /// 按本机答一句的 `READ_TIMEOUT`。
 ///
-/// 等不够的代价不是「慢一点」：守护进程可能在命令行放弃之后才办成——批准
-/// 已经签进名单、发给了每一台，屏幕上却说失败，用户会再批一次。
+/// 等不够的代价不是「慢一点」：守护进程可能在命令行放弃之后才办成——新
+/// 电脑已经进了组，屏幕上却说失败，用户会拿一个已经作废的码再试一次。
 fn wait_for(req: &Request) -> Duration {
     match crate::mesh::worst_case(req) {
         Some(_) => MESH_CALL_WAIT,
@@ -37,8 +37,6 @@ fn wait_for(req: &Request) -> Duration {
 }
 
 type Call<'a> = &'a mut dyn FnMut(Request) -> Result<Response>;
-/// 把一句提示给用户看、读回他敲的一行。读不到（没有终端、EOF）是 `None`。
-type Ask<'a> = &'a mut dyn FnMut(&str) -> Option<String>;
 
 /// `dct join` 的参数。
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -89,16 +87,7 @@ pub fn run(args: &[String]) -> i32 {
         let wait = wait_for(&req);
         client.call_within(req, wait)
     };
-    let mut ask = |prompt: &str| {
-        print!("{prompt}");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim().to_string()),
-        }
-    };
-    dispatch(cmd, rest, &mut call, &mut ask, &mut out, &mut err, lang)
+    dispatch(cmd, rest, &mut call, &mut out, &mut err, lang)
 }
 
 /// 连上守护进程之后的全部：先握手，再按子命令办。
@@ -106,7 +95,6 @@ fn dispatch(
     cmd: &str,
     rest: &[String],
     call: Call,
-    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
@@ -136,7 +124,7 @@ fn dispatch(
                 2
             }
         },
-        "peers" => peers(call, ask, out, err, lang, rest),
+        "peers" => peers(call, out, err, lang, rest),
         "send" => {
             // 在 dct 的会话里跑的，守护进程给子进程设过这个变量（`session.rs`）。
             let from = std::env::var(crate::session::SESSION_ID_ENV)
@@ -206,18 +194,6 @@ fn parse_join(args: &[String]) -> Option<JoinOpts> {
         }
     }
     (!opts.code.is_empty()).then_some(opts)
-}
-
-/// 按名字或端点在一张列表里找一条。找不到、不止一条都是 `Err`。
-fn pick<'a>(list: &'a [PendingJoin], who: &str) -> Result<&'a PendingJoin, usize> {
-    let hits: Vec<&PendingJoin> = list
-        .iter()
-        .filter(|p| p.endpoint == who || p.name == who)
-        .collect();
-    match hits.as_slice() {
-        [p] => Ok(p),
-        _ => Err(hits.len()),
-    }
 }
 
 /// 别的电脑报来的东西（名字、系统、会话……）印到终端之前都过一遍：
@@ -396,7 +372,6 @@ pub(crate) fn join(
 
 pub(crate) fn peers(
     call: Call,
-    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
@@ -425,66 +400,6 @@ pub(crate) fn peers(
                         );
                     }
                 }
-            }
-            for p in &v.pending {
-                // 两台同名就只能按端点批，提示里直接给端点。
-                let dup = v.pending.iter().filter(|q| q.name == p.name).count() > 1;
-                let target = if dup { &p.endpoint } else { &p.name };
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    msg::mesh_join_prompt(lang, &c(&p.name), &c(&p.code))
-                );
-                let _ = writeln!(out, "{}", msg::mesh_approve_hint(lang, &c(target)));
-            }
-            0
-        }
-        ["approve", who] | ["approve", who, "--no"] => {
-            let yes = args.len() == 2;
-            // 先看一眼挂着的是哪一条，把名字和数字再给用户看一遍；送去批的
-            // 是**这次给他看的**端点和数字，守护进程两样都对上才批。
-            let Some(v) = view_of(call, Request::MeshStatus, err, lang) else {
-                return 1;
-            };
-            let p = match pick(&v.pending, who) {
-                Ok(p) => p.clone(),
-                Err(0) => {
-                    say_error(
-                        err,
-                        lang,
-                        &ErrorCode::Mesh(MeshProblem::NoSuchRequest(who.to_string())),
-                    );
-                    return 1;
-                }
-                Err(_) => {
-                    say_error(
-                        err,
-                        lang,
-                        &ErrorCode::Mesh(MeshProblem::Ambiguous(who.to_string())),
-                    );
-                    return 1;
-                }
-            };
-            if yes {
-                let q = format!("{} ", msg::mesh_join_prompt(lang, &c(&p.name), &c(&p.code)));
-                let said_yes = ask(&q).is_some_and(|a| a.trim().eq_ignore_ascii_case("y"));
-                if !said_yes {
-                    let _ = writeln!(out, "{}", msg::mesh_not_approved(lang));
-                    return 1;
-                }
-            }
-            let req = Request::MeshApprove {
-                endpoint: p.endpoint.clone(),
-                code: p.code.clone(),
-                yes,
-            };
-            if view_of(call, req, err, lang).is_none() {
-                return 1;
-            }
-            if yes {
-                let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &c(&p.name)));
-            } else {
-                let _ = writeln!(out, "{}", msg::mesh_member_refused(lang, &c(&p.name)));
             }
             0
         }
@@ -629,8 +544,6 @@ mod tests {
                     is_me: *me,
                 })
                 .collect(),
-            pending: vec![],
-            joining: vec![],
             messages: Default::default(),
             invite: None,
             invite_note: None,
@@ -700,7 +613,6 @@ mod tests {
             &["invite"],
             &["join"],
             &["peers"],
-            &["peers", "approve", "B"],
             &["peers", "remove", "B"],
             &["send", "B/x", "hi"],
         ];
@@ -715,7 +627,6 @@ mod tests {
                 cmd,
                 &rest,
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -743,14 +654,6 @@ mod tests {
             },
             Request::MeshInvite,
             Request::MeshInviteCancel,
-            Request::MeshApprove {
-                endpoint: "c-x".into(),
-                code: "123456".into(),
-                yes: true,
-            },
-            Request::MeshConfirmInviter {
-                endpoint: "c-x".into(),
-            },
             Request::MeshRemove { name: "n".into() },
             Request::MeshPeers,
             Request::MeshSend {
@@ -783,7 +686,6 @@ mod tests {
             online: false,
             is_me: false,
         });
-        v.pending = vec![pj(evil, "c-w", "123456")];
         let sc = Script::new(vec![
             Response::Mesh(v),
             Response::Error(ErrorCode::DaemonNotResponding),
@@ -792,7 +694,6 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -822,7 +723,6 @@ mod tests {
         let (mut out, mut err) = (vec![], vec![]);
         peers(
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -861,7 +761,6 @@ mod tests {
             "login",
             &[],
             &mut call,
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -884,7 +783,6 @@ mod tests {
             "login",
             &[],
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -910,140 +808,34 @@ mod tests {
         );
     }
 
-    fn pj(name: &str, ep: &str, code: &str) -> PendingJoin {
-        PendingJoin {
-            name: name.into(),
-            endpoint: ep.into(),
-            code: code.into(),
-        }
-    }
-
-    fn no_ask(_: &str) -> Option<String> {
-        panic!("不该问用户")
-    }
-
+    /// 详情问不成（旧守护进程、出错）：退回名单那几行；不再有「谁在等批准」。
     #[test]
-    fn peers_lists_members_and_asks_about_pending_joins() {
-        let mut v = view(true, &[("B", true), ("A", false)]);
-        v.pending = vec![pj("公司Windows", "c-w", "123456")];
-        // 详情问不成（旧守护进程、出错）：退回名单那几行。
+    fn peers_falls_back_to_the_member_lines() {
+        let v = view(true, &[("B", true), ("A", false)]);
         let sc = Script::new(vec![
             Response::Mesh(v),
             Response::Error(ErrorCode::DaemonNotResponding),
         ]);
         let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut no_ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &[]
-            ),
-            0
-        );
+        assert_eq!(peers(&mut sc.call(), &mut out, &mut err, Lang::Zh, &[]), 0);
         let o = s(&out);
         assert!(o.contains("  B  (这台)"), "{o}");
-        assert!(o.contains(
-            "一台叫 公司Windows 的电脑想加入「我的电脑」。它屏幕上的数字是 123456 吗？(y/n)"
-        ));
-        assert!(o.contains("dct peers approve 公司Windows"), "{o}");
+        assert!(o.contains("  A  (在线)"), "{o}");
+        assert!(!o.contains("approve"), "{o}");
+    }
+
+    /// `dct peers approve` 没有了：当成用法不对。
+    #[test]
+    fn peers_approve_is_gone() {
+        let sc = Script::new(vec![]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = peers(&mut sc.call(), &mut out, &mut err, Lang::Zh, &args(&["approve", "B"]));
+        assert_eq!(code, 2);
+        assert_eq!(s(&err).trim(), "用法：dct peers | dct peers remove <电脑名>");
     }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// `approve <名字>`：再给用户看一遍名字和数字，答 y 才送；送的是这次
-    /// 给他看的那条的端点和数字。
-    #[test]
-    fn peers_approve_reshows_the_code_and_sends_endpoint_and_code() {
-        let mut v = view(true, &[("B", true)]);
-        v.pending = vec![pj("C", "c-c", "123456")];
-        let sc = Script::new(vec![
-            Response::Mesh(v.clone()),
-            Response::Mesh(view(true, &[("B", true), ("C", false)])),
-        ]);
-        let shown = RefCell::new(String::new());
-        let mut ask = |p: &str| {
-            *shown.borrow_mut() = p.to_string();
-            Some("y".to_string())
-        };
-        let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &args(&["approve", "C"])
-            ),
-            0
-        );
-        assert!(shown.borrow().contains("一台叫 C 的电脑") && shown.borrow().contains("123456"));
-        assert_eq!(
-            sc.seen.borrow()[1],
-            r#"MeshApprove { endpoint: "c-c", code: "123456", yes: true }"#
-        );
-        assert!(s(&out).contains("C 已加入"));
-
-        // 答 n：什么都不送。
-        let sc = Script::new(vec![Response::Mesh(v.clone())]);
-        let mut ask = |_: &str| Some("n".to_string());
-        out.clear();
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &args(&["approve", "C"])
-            ),
-            1
-        );
-        assert_eq!(sc.seen.borrow().len(), 1);
-        assert!(s(&out).contains("没有批准"));
-
-        // --no：不问，直接拒。
-        let sc = Script::new(vec![
-            Response::Mesh(v.clone()),
-            Response::Mesh(view(true, &[("B", true)])),
-        ]);
-        out.clear();
-        peers(
-            &mut sc.call(),
-            &mut no_ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &args(&["approve", "c-c", "--no"]),
-        );
-        assert!(sc.seen.borrow()[1].contains("yes: false"));
-        assert!(s(&out).contains("已拒绝 C"));
-    }
-
-    #[test]
-    fn peers_approve_with_two_of_the_same_name_asks_for_the_endpoint() {
-        let mut v = view(true, &[("B", true)]);
-        v.pending = vec![pj("C", "c-c", "1"), pj("C", "c-x", "2")];
-        let sc = Script::new(vec![Response::Mesh(v)]);
-        let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut no_ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &args(&["approve", "C"])
-            ),
-            1
-        );
-        assert!(s(&err).contains("不止一台叫 C"));
-        assert_eq!(sc.seen.borrow().len(), 1);
     }
 
     /// `dct peers` 的详情：每台一行带系统，在线的下面列会话和触手，不在线
@@ -1086,7 +878,6 @@ mod tests {
         let (mut out, mut err) = (vec![], vec![]);
         let code = peers(
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -1211,7 +1002,6 @@ mod tests {
         let sc = Script::new(vec![Response::Mesh(view(true, &[("B", true)]))]);
         peers(
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -1226,7 +1016,6 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -1240,7 +1029,6 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -1329,7 +1117,7 @@ mod tests {
             protocol: crate::proto::PROTOCOL_VERSION,
         }]);
         let (mut out, mut err) = (vec![], vec![]);
-        let code = dispatch("join", &[], &mut sc.call(), &mut no_ask, &mut out, &mut err, Lang::Zh);
+        let code = dispatch("join", &[], &mut sc.call(), &mut out, &mut err, Lang::Zh);
         assert_eq!(code, 2);
         assert!(s(&err).contains("dct join <邀请码>"), "{}", s(&err));
     }
@@ -1461,7 +1249,7 @@ mod tests {
         }]);
         let (mut out, mut err) = (vec![], vec![]);
         let rest = vec!["482913".to_string()];
-        let code = dispatch("invite", &rest, &mut sc.call(), &mut no_ask, &mut out, &mut err, Lang::Zh);
+        let code = dispatch("invite", &rest, &mut sc.call(), &mut out, &mut err, Lang::Zh);
         assert_eq!(code, 2);
         assert!(s(&err).contains("用法：dct invite"), "{}", s(&err));
     }

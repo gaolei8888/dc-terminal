@@ -1984,15 +1984,10 @@ pub mod msg {
                 en: "This computer is already in a group with your other computers".to_string(),
                 zh: "这台电脑已经跟你的其它电脑在一个组里了".to_string(),
             ),
-            NoOneAnswered => t!(
-                lang,
-                en: "None of your other computers answered. Make sure dct is running and signed in on one of them, then try again".to_string(),
-                zh: "你的其它电脑一台都没回应。确认有一台已有的电脑开着 dct、登录过多电脑，再试一次".to_string(),
-            ),
             TooManyAnswered => t!(
                 lang,
-                en: "Too many computers answered at once, which should not happen. Nothing was shown to compare. Try again later".to_string(),
-                zh: "一下子回应的电脑太多了，这不正常，这次不给你核对数字。过一会儿再试一次".to_string(),
+                en: "Far too many computers are online under your account (more than 16), which should not happen. Nothing was asked. Try again later".to_string(),
+                zh: "同一个账号在线的电脑太多了（超过 16 台），这不正常，这次一台都没问。过一会儿再试一次".to_string(),
             ),
             BadName => t!(
                 lang,
@@ -2004,35 +1999,10 @@ pub mod msg {
                 en: format!("There is no computer called {name} in the group"),
                 zh: format!("组里没有叫 {name} 的电脑"),
             ),
-            NoSuchRequest(name) => t!(
-                lang,
-                en: format!("No computer called {name} is waiting to join (requests expire after 10 minutes)"),
-                zh: format!("没有叫 {name} 的电脑在等加入（请求 10 分钟后作废）"),
-            ),
-            Ambiguous(name) => t!(
-                lang,
-                en: format!("More than one computer called {name} is waiting. Use the c-… number shown by dct peers instead"),
-                zh: format!("不止一台叫 {name} 的电脑在等。改用 dct peers 里列出的 c-… 编号"),
-            ),
-            NameTaken(name) => t!(
-                lang,
-                en: format!("The group already has a computer called {name}. On the new computer run: dct join --name <another name>"),
-                zh: format!("组里已经有一台叫 {name} 的电脑了。在新电脑上换个名字重来：dct join --name 新名字"),
-            ),
             CannotRemoveSelf => t!(
                 lang,
                 en: "A computer cannot remove itself. Remove it from one of your other computers".to_string(),
                 zh: "不能移除这台电脑自己。到你的另一台电脑上移除它".to_string(),
-            ),
-            NoSuchInviter(who) => t!(
-                lang,
-                en: format!("{who} did not answer this join request, or it is more than 10 minutes old. Run dct join again"),
-                zh: format!("{who} 没回应过这次加入，或者已经过了 10 分钟。重新运行 dct join"),
-            ),
-            CodeMismatch => t!(
-                lang,
-                en: "The number does not match: the request waiting now is not the one you looked at. Run dct peers and check again".to_string(),
-                zh: "数字对不上：现在等着的已经不是你看过的那一条请求了。重新运行 dct peers 再看一眼".to_string(),
             ),
             NotSaved => t!(
                 lang,
@@ -2083,7 +2053,7 @@ pub mod msg {
         }
     }
 
-    // —— 多电脑（`dct login` / `dct join` / `dct peers`）——
+    // —— 多电脑（`dct login` / `dct invite` / `dct join` / `dct peers`）——
 
     /// 登录之后、这台电脑自己建了组。
     pub fn mesh_first_computer(lang: Lang) -> String {
@@ -2110,139 +2080,6 @@ pub mod msg {
             lang,
             en: format!("Signed in to multi-computer as {name}"),
             zh: format!("多电脑已登录，这台电脑叫 {name}"),
-        )
-    }
-
-    /// 新电脑上：去已有的电脑上核对数字。只问到一台就把数字填进句子里；
-    /// 好几台就逐台列在下面（`mesh_code_line`）。
-    pub fn mesh_compare_codes(lang: Lang, single: Option<&str>) -> String {
-        match single {
-            Some(code) => t!(
-                lang,
-                en: format!("Look at any computer you already have: it will show a 6-digit number. If it is the same as {code} here, approve it there"),
-                zh: format!("请在你已有的任意一台电脑上看一眼：那边会显示一个 6 位数，跟这里的 {code} 一样就点同意"),
-            ),
-            None => t!(
-                lang,
-                en: "Look at any computer you already have: it will show a 6-digit number. If it is the same as the one listed here for that computer, approve it there".to_string(),
-                zh: "请在你已有的任意一台电脑上看一眼：那边会显示一个 6 位数，跟这里那台电脑后面的数字一样就点同意".to_string(),
-            ),
-        }
-    }
-
-    /// 「电脑名：数字」。
-    pub fn mesh_code_line(lang: Lang, name: &str, code: &str) -> String {
-        t!(
-            lang,
-            en: format!("  {name}: {code}"),
-            zh: format!("  {name}：{code}"),
-        )
-    }
-
-    /// 同名的不止一台时那一行：名字后面带端点，用户照着敲 `c-…`。
-    pub fn mesh_code_line_with_endpoint(lang: Lang, name: &str, endpoint: &str, code: &str) -> String {
-        t!(
-            lang,
-            en: format!("  {name} ({endpoint}): {code}"),
-            zh: format!("  {name} ({endpoint})：{code}"),
-        )
-    }
-
-    /// 新电脑上：用户说的名字对得上不止一台回过话的电脑。
-    pub fn mesh_ambiguous_responder(lang: Lang, name: &str) -> String {
-        t!(
-            lang,
-            en: format!("More than one computer called {name} answered. Run dct join again and type the c-… number shown next to the one whose number matches"),
-            zh: format!("不止一台叫 {name} 的电脑回应了。重新运行 dct join，输入数字对得上的那台后面括号里的 c-… 编号"),
-        )
-    }
-
-    /// 新电脑上：列完数字之后，问是哪一台。
-    pub fn mesh_which_computer(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "Which computer shows the same number on its screen? Type its name (press Enter if none match — do not join): ".to_string(),
-            zh: "哪一台电脑屏幕上显示的是同一个数字？输入它的名字（都对不上就直接回车，不要加入）：".to_string(),
-        )
-    }
-
-    pub fn mesh_not_a_responder(lang: Lang, input: &str) -> String {
-        t!(
-            lang,
-            en: format!("No computer called {input} answered this join request"),
-            zh: format!("没有叫 {input} 的电脑回应过这次加入"),
-        )
-    }
-
-    /// `dct peers approve` 问 y/n 时没答 y。
-    pub fn mesh_not_approved(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "Not approved. The request is still waiting".to_string(),
-            zh: "没有批准，请求还挂着".to_string(),
-        )
-    }
-
-    pub fn mesh_join_cancelled(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "Not joined. If the numbers do not match, do not approve on the other computer".to_string(),
-            zh: "没有加入。数字对不上的话，别在那边点同意".to_string(),
-        )
-    }
-
-    pub fn mesh_waiting_for_approval(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "Waiting for approval (up to 10 minutes)…".to_string(),
-            zh: "等那边点同意（最多等 10 分钟）……".to_string(),
-        )
-    }
-
-    pub fn mesh_join_timed_out(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "No approval within 10 minutes. The invitation has expired, run dct join again".to_string(),
-            zh: "10 分钟里没等到同意，邀请已过期，请重新运行 dct join".to_string(),
-        )
-    }
-
-    /// 新电脑上：进组了。
-    pub fn mesh_joined_group(lang: Lang) -> String {
-        t!(lang, en: "Joined".to_string(), zh: "已加入".to_string())
-    }
-
-    /// 已有的电脑上：有一台想加入。
-    pub fn mesh_join_prompt(lang: Lang, name: &str, code: &str) -> String {
-        t!(
-            lang,
-            en: format!("A computer called {name} wants to join \"My computers\". Is the number on its screen {code}? (y/n)"),
-            zh: format!("一台叫 {name} 的电脑想加入「我的电脑」。它屏幕上的数字是 {code} 吗？(y/n)"),
-        )
-    }
-
-    /// 看板上那一行加入确认之后，还有几条排着（一次只问一条，先来的先问）。
-    pub fn mesh_more_requests(lang: Lang, n: usize) -> String {
-        t!(lang, en: format!("{n} more waiting"), zh: format!("还有 {n} 条"))
-    }
-
-    /// 看板上加入确认下面那行灰字：两台**新**电脑同时加入，会互相看到对方
-    /// 的请求、互相批准，进错组。
-    pub fn mesh_cross_join_hint(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "Add one new computer at a time: two joining at once can approve each other".to_string(),
-            zh: "一次只加一台新电脑：两台同时加入，可能互相批准进错组".to_string(),
-        )
-    }
-
-    /// 九宫格顶上：有电脑在等批准。y/n 只在看板上接，这里只说怎么过去。
-    /// `g` 切的是**保存下来的**模式（九宫格 ↔ 看板），照实说。
-    pub fn mesh_grid_notice(lang: Lang) -> String {
-        t!(
-            lang,
-            en: "A computer wants to join \"My computers\". Press g to switch to the board and confirm (g also makes the board your default view; press g again to go back to the grid)".to_string(),
-            zh: "有电脑想加入「我的电脑」。按 g 切到看板确认（g 会把默认视图也换成看板，确认完再按 g 换回九宫格）".to_string(),
         )
     }
 
@@ -2280,21 +2117,8 @@ pub mod msg {
         format!("✉ {n}")
     }
 
-    /// `dct peers` 里，一条等批准的请求下面那行：怎么批、怎么拒。
-    pub fn mesh_approve_hint(lang: Lang, target: &str) -> String {
-        t!(
-            lang,
-            en: format!("  approve: dct peers approve {target}    refuse: dct peers approve {target} --no"),
-            zh: format!("  同意：dct peers approve {target}    拒绝：dct peers approve {target} --no"),
-        )
-    }
-
     pub fn mesh_member_joined(lang: Lang, name: &str) -> String {
         t!(lang, en: format!("{name} has joined"), zh: format!("{name} 已加入"))
-    }
-
-    pub fn mesh_member_refused(lang: Lang, name: &str) -> String {
-        t!(lang, en: format!("Refused {name}"), zh: format!("已拒绝 {name}"))
     }
 
     pub fn mesh_member_removed(lang: Lang, name: &str) -> String {
@@ -2318,8 +2142,8 @@ pub mod msg {
     pub fn mesh_peers_usage(lang: Lang) -> String {
         t!(
             lang,
-            en: "Usage: dct peers | dct peers approve <name or c-…> [--no] | dct peers remove <name>".to_string(),
-            zh: "用法：dct peers | dct peers approve <电脑名或 c-…> [--no] | dct peers remove <电脑名>".to_string(),
+            en: "Usage: dct peers | dct peers remove <name>".to_string(),
+            zh: "用法：dct peers | dct peers remove <电脑名>".to_string(),
         )
     }
 
@@ -3394,17 +3218,11 @@ mod tests {
             Mesh(crate::proto::MeshProblem::NotLoggedIn),
             Mesh(crate::proto::MeshProblem::NoDcAccount),
             Mesh(crate::proto::MeshProblem::AlreadyInGroup),
-            Mesh(crate::proto::MeshProblem::NoOneAnswered),
             Mesh(crate::proto::MeshProblem::TooManyAnswered),
             Mesh(crate::proto::MeshProblem::BadName),
             Mesh(crate::proto::MeshProblem::NoSuchMachine("pc".into())),
-            Mesh(crate::proto::MeshProblem::NoSuchRequest("pc".into())),
-            Mesh(crate::proto::MeshProblem::Ambiguous("pc".into())),
-            Mesh(crate::proto::MeshProblem::NameTaken("pc".into())),
             Mesh(crate::proto::MeshProblem::CannotRemoveSelf),
             Mesh(crate::proto::MeshProblem::NotSaved),
-            Mesh(crate::proto::MeshProblem::NoSuchInviter("pc".into())),
-            Mesh(crate::proto::MeshProblem::CodeMismatch),
             Mesh(crate::proto::MeshProblem::TooLong),
             Mesh(crate::proto::MeshProblem::BadAddress("pc".into())),
             Mesh(crate::proto::MeshProblem::BadInviteCode),
@@ -3474,10 +3292,6 @@ mod tests {
     #[test]
     fn mesh_strings_say_exactly_what_the_brief_says() {
         use crate::proto::{ErrorCode, MeshProblem};
-        assert_eq!(
-            msg::mesh_join_prompt(Lang::Zh, "公司Windows", "123456"),
-            "一台叫 公司Windows 的电脑想加入「我的电脑」。它屏幕上的数字是 123456 吗？(y/n)"
-        );
         assert_eq!(msg::mesh_member_joined(Lang::Zh, "B"), "B 已加入");
         assert_eq!(msg::mesh_member_removed(Lang::Zh, "B"), "B 已移出");
         assert_eq!(
@@ -3489,12 +3303,6 @@ mod tests {
             "先在 dct 里用 DC 配对账号（进 dct 按 c 选 DC）"
         );
         assert_eq!(msg::mesh_first_computer(Lang::Zh), "这台电脑成了「我的电脑」组的第一台");
-        assert_eq!(
-            msg::mesh_compare_codes(Lang::Zh, Some("654321")),
-            "请在你已有的任意一台电脑上看一眼：那边会显示一个 6 位数，跟这里的 654321 一样就点同意"
-        );
-        assert_eq!(msg::mesh_code_line(Lang::Zh, "家里Mac", "000123"), "  家里Mac：000123");
-        assert_eq!(msg::mesh_joined_group(Lang::Zh), "已加入");
         // 看板（Task 8）
         assert_eq!(msg::mesh_board_off(Lang::Zh), "多电脑未开启 · 运行 dct login");
         assert_eq!(msg::mesh_board_more(Lang::Zh, 3), "还有 3 台");
@@ -3509,9 +3317,6 @@ mod tests {
             msg::mesh_board_state(Lang::En, true, true),
             msg::mesh_board_state(Lang::En, true, false),
             msg::mesh_board_state(Lang::En, false, false),
-            msg::mesh_more_requests(Lang::En, 2),
-            msg::mesh_cross_join_hint(Lang::En),
-            msg::mesh_grid_notice(Lang::En),
         ] {
             assert!(!has_han(&s), "{s}");
         }
@@ -3521,36 +3326,22 @@ mod tests {
         );
         assert!(login.starts_with("Could not sign in"), "{login}");
         for s in [
-            msg::mesh_join_prompt(Lang::En, "pc", "1"),
             msg::mesh_member_joined(Lang::En, "pc"),
             msg::mesh_member_removed(Lang::En, "pc"),
-            msg::mesh_member_refused(Lang::En, "pc"),
             msg::mesh_first_computer(Lang::En),
             msg::mesh_logged_in(Lang::En, "pc"),
-            msg::mesh_compare_codes(Lang::En, Some("1")),
-            msg::mesh_compare_codes(Lang::En, None),
-            msg::mesh_waiting_for_approval(Lang::En),
-            msg::mesh_join_timed_out(Lang::En),
-            msg::mesh_joined_group(Lang::En),
-            msg::mesh_approve_hint(Lang::En, "pc"),
             msg::mesh_members_header(Lang::En),
             msg::mesh_member_line(Lang::En, "pc", true, false),
             msg::mesh_member_line(Lang::En, "pc", false, false),
             msg::mesh_member_line(Lang::En, "pc", true, true),
             msg::mesh_peers_usage(Lang::En),
             msg::mesh_join_usage(Lang::En),
-            msg::mesh_which_computer(Lang::En),
-            msg::mesh_not_a_responder(Lang::En, "pc"),
-            msg::mesh_join_cancelled(Lang::En),
-            msg::mesh_not_approved(Lang::En),
-            msg::mesh_code_line_with_endpoint(Lang::En, "pc", "c-x", "1"),
             msg::mesh_peer_line(Lang::En, "pc", true, false, "macos"),
             msg::mesh_no_sessions(Lang::En),
             msg::mesh_tentacles_line(Lang::En, &["cam".into()]),
             msg::mesh_sent(Lang::En, "pc/s"),
             msg::mesh_queued(Lang::En),
             msg::mesh_send_usage(Lang::En),
-            msg::mesh_ambiguous_responder(Lang::En, "pc"),
         ] {
             assert!(!has_han(&s), "英文里有汉字：{s}");
         }

@@ -352,9 +352,9 @@ pub fn accept(current: Option<&SignedRoster>, incoming: &SignedRoster) -> Result
 /// 一台**加入**别人组的电脑，接受它的第一份名单。
 ///
 /// 这台电脑此刻没有（别人的）旧名单可以对照，`accept` 那条「签名者在上一版
-/// 里」用不上。取而代之的是：签名者必须就是 `inviter`——那台回过我
-/// `JoinPending`、我给它算过 6 位数、用户两边核对过的电脑，验签也只用
-/// `inviter` 自己那把 `sign_pub`（中转伪造不了：换一把钥匙，数字就对不上）。
+/// 里」用不上。取而代之的是：签名者必须就是 `inviter`——跟我用邀请码走完
+/// SPAKE2、身份（`invite::rec`）绑进了确认值的那台电脑，验签也只用 `inviter`
+/// 自己那把 `sign_pub`（中转伪造不了：换一把钥匙，确认值就对不上）。
 ///
 /// 规则：
 /// - 名单里每个成员的结构性校验同 `accept`（名字、公钥、`endpoint` 绑钥匙），
@@ -362,7 +362,7 @@ pub fn accept(current: Option<&SignedRoster>, incoming: &SignedRoster) -> Result
 /// - `inviter.endpoint` 真的是从 `inviter.sign_pub` 算出来的；
 /// - `signer == inviter.endpoint`，签名用 `inviter.sign_pub` 验得过；
 /// - 名单里有 `inviter`，而且那一条的两把公钥跟 `inviter` 的一模一样——
-///   6 位数核对的是这两把，名单里换成别的就等于没核对过；
+///   SPAKE2 绑定的是这两把，名单里换成别的就等于没核对过；
 /// - 名单里有我（`me_endpoint`）。
 ///
 /// 版本号和组名不看：这是我的第一份，没有东西可比。我自己那一条的加密公钥
@@ -406,8 +406,8 @@ mod tests {
 
     // -- accept_invite: a joining machine's first roster -----------------------
 
-    /// A 的组 v2 = {A, X}，A 签了一份 v3 把 B 加进来。B 手上只有 A 的
-    /// `JoinPending` 里那条成员记录（B 为它算过 6 位数）。
+    /// A 的组 v2 = {A, X}，A 签了一份 v3 把 B 加进来。B 手上只有 A 在
+    /// `InviteOpen` 里给的那条成员记录（SPAKE2 绑定的就是它）。
     fn invite_fixture() -> (MachineKeys, Member, Member, SignedRoster) {
         let ka = keys_for(1);
         let kb = keys_for(2);
@@ -495,8 +495,8 @@ mod tests {
         );
     }
 
-    /// 名单里 A 那一条的加密公钥被换了：B 核对的 6 位数是按 A 在
-    /// `JoinPending` 里给的那把算的，名单里的这把没人核对过。
+    /// 名单里 A 那一条的加密公钥被换了：SPAKE2 绑定的是 A 在 `InviteOpen`
+    /// 里给的那把，名单里的这把没人核对过。
     #[test]
     fn an_invite_that_lists_the_inviter_with_different_keys_is_refused() {
         let (ka, a, b, _) = invite_fixture();

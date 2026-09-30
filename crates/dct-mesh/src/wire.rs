@@ -1,14 +1,13 @@
 //! 中转（relay）上跑的消息线上形状：一台电脑发给中转的每一条 JSON 都是一个
-//! `Payload`，`t` 字段说明它是密封留言、加入请求、整份名单、「你的加入申请
-//! 收到了，这是我的随机数」，还是加入方揭晓自己的随机数。
+//! `Payload`，`t` 字段说明它是密封留言、整份名单，还是用邀请码加电脑的那几步。
 //!
-//! 加入的三步（先承诺、再揭晓，见 `sas` 模块头）：
+//! 用邀请码加电脑（dct-invite-v1，见 `invite` 模块头），全是新电脑 B 问、
+//! 老电脑 A 当场答的 `ask`：
 //!
-//! 1. 加入方 → 邀请方：`Join`（自签的成员记录 + 承诺，`ask`）；
-//! 2. 邀请方 → 加入方：`JoinPending`（自签的成员记录 + 新鲜随机数，`ask` 的答复）；
-//! 3. 加入方 → 邀请方：`JoinReveal`（自己的随机数，`send`）。
-//!
-//! 两边都要到第 3 步之后才有数字可亮。
+//! 1. `InviteProbe` → `InviteOpen`（A 自签的记录 + 组 id）或 `NoInvite`；
+//! 2. `InviteJoin`（B 自签的记录 + SPAKE2 消息）→ `InviteKey`（A 的 SPAKE2 消息 + `cA`）
+//!    或 `InviteFailed`；
+//! 3. `InviteFinish`（`cB`）→ `InviteDone`（新名单）或 `InviteFailed`。
 use crate::canon::field;
 use crate::id;
 use crate::keys::{self, MachineKeys};
@@ -23,20 +22,7 @@ pub const JOIN_VERSION_TAG: &str = "dct-join-v1";
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Payload {
     Sealed(Sealed),
-    Join(JoinRequest),
     Roster(SignedRoster),
-    /// 邀请方的答复：自签的成员记录，和它为这一次加入新出的随机数
-    /// （32 字节，标准 base64）。每收到一次 `Join` 就换一个。
-    JoinPending {
-        member: Member,
-        sig: String,
-        nonce: String,
-    },
-    /// 加入方揭晓 `Join` 里承诺过的随机数（32 字节，标准 base64）。发件
-    /// 端点由中转认证，邀请方按它找到那一条请求。
-    JoinReveal {
-        nonce: String,
-    },
 
     // —— 邀请码（dct-invite-v1，见 `invite` 模块头）。全走 `ask`：B 问，A 当场答。
 
@@ -76,30 +62,6 @@ pub enum Payload {
     InviteFailed,
 }
 
-/// 新电脑请求加入组：`member` 是它自己的名单条目（还没被任何人签认），
-/// `sig` 是它用自己的钥匙对 `member` 的 `dct-join-v1` 规范字节签的名——证明
-/// 它真的掌握 `member.sign_pub` 对应的私钥。ECDSA 签名可延展（见
-/// `keys::MachineKeys::sign` 的文档），`sig` 不能当 id 或去重键用。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JoinRequest {
-    pub member: Member,
-    pub sig: String,
-    /// `sas::commit(member, 我的随机数)`，32 字节，标准 base64。随机数本身
-    /// 等拿到邀请方的随机数之后才在 `JoinReveal` 里给。`sig` 不覆盖它：换掉
-    /// 承诺的人拿不出能打开它的随机数，换了也只是让这一次加入对不上。
-    pub commit: String,
-}
-
-/// 32 字节（随机数、承诺）写成标准 base64。
-pub fn encode32(b: &[u8; 32]) -> String {
-    STANDARD.encode(b)
-}
-
-/// `encode32` 的反面。不是恰好 32 字节的标准 base64 就是 `None`。
-pub fn decode32(s: &str) -> Option<[u8; 32]> {
-    STANDARD.decode(s).ok()?.try_into().ok()
-}
-
 /// 任意字节（SPAKE2 消息、确认值）写成标准 base64。
 pub fn encode_bytes(b: &[u8]) -> String {
     STANDARD.encode(b)
@@ -119,9 +81,10 @@ pub fn decode(b: &[u8]) -> Result<Payload, serde_json::Error> {
 }
 
 /// `dct-join-v1` 规范字节：依次写 `field("dct-join-v1")`、`name`、
-/// `endpoint`、`sign_pub`、`kx_pub`、`added_at`。`JoinRequest` 和
-/// `JoinPending` 都是「一台电脑对自己的 `Member` 记录自签名」，共用这一份
-/// 编码和下面这两个函数。
+/// `endpoint`、`sign_pub`、`kx_pub`、`added_at`。`InviteOpen` 和
+/// `InviteJoin` 都是「一台电脑对自己的 `Member` 记录自签名」，共用这一份
+/// 编码和下面这两个函数。ECDSA 签名可延展（见 `keys::MachineKeys::sign`），
+/// `sig` 不能当 id 或去重键用。
 fn member_bytes(m: &Member) -> Vec<u8> {
     let mut out = Vec::new();
     field(&mut out, JOIN_VERSION_TAG);
@@ -195,15 +158,6 @@ mod tests {
             .unwrap()
             .contains("\"t\":\"sealed\""));
 
-        let join = Payload::Join(JoinRequest {
-            member: m.clone(),
-            sig: "sig".into(),
-            commit: "c".into(),
-        });
-        assert!(serde_json::to_string(&join)
-            .unwrap()
-            .contains("\"t\":\"join\""));
-
         let roster = Payload::Roster(SignedRoster {
             roster: Roster {
                 group: "g".into(),
@@ -216,21 +170,6 @@ mod tests {
         assert!(serde_json::to_string(&roster)
             .unwrap()
             .contains("\"t\":\"roster\""));
-
-        let pending = Payload::JoinPending {
-            member: m,
-            sig: "sig".into(),
-            nonce: "n".into(),
-        };
-        assert!(serde_json::to_string(&pending)
-            .unwrap()
-            .contains("\"t\":\"join_pending\""));
-
-        let reveal = Payload::JoinReveal { nonce: "n".into() };
-        assert_eq!(
-            serde_json::to_string(&reveal).unwrap(),
-            r#"{"t":"join_reveal","nonce":"n"}"#
-        );
     }
 
     /// 邀请码那 8 种的线上形状。改了就是跟别的版本的 dct 说不上话了。
@@ -305,22 +244,13 @@ mod tests {
     fn payloads_round_trip_through_encode_and_decode() {
         let k = keys_for(1);
         let m = member_from(&k, "laptop");
-        let p = Payload::Join(JoinRequest {
+        let p = Payload::InviteJoin {
             member: m,
             sig: "sig".into(),
-            commit: "c".into(),
-        });
+            spake: "x".into(),
+        };
         let encoded = encode(&p);
         assert_eq!(decode(&encoded).unwrap(), p);
-    }
-
-    #[test]
-    fn thirty_two_byte_values_round_trip_and_anything_else_is_refused() {
-        let b = [7u8; 32];
-        assert_eq!(decode32(&encode32(&b)), Some(b));
-        assert_eq!(decode32(&STANDARD.encode([7u8; 31])), None);
-        assert_eq!(decode32(&STANDARD.encode([7u8; 33])), None);
-        assert_eq!(decode32("not base64!!"), None);
     }
 
     #[test]
