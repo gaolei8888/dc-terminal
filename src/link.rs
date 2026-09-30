@@ -116,10 +116,18 @@ impl LinkConfig {
 /// 这条线收发要用的 HTTP 客户端。读超时按 `LinkConfig::read_timeout` 算，
 /// 见那边的注释。`Link` 自己用它，`peers`/`send`/`ask` 的调用方也该用它。
 pub fn agent(cfg: &LinkConfig) -> ureq::Agent {
+    agent_with(cfg.read_timeout())
+}
+
+/// ureq 2 把连接放回连接池时会清掉读超时，再拿出来用时不重设：只有
+/// `timeout_read` 的话，一条睡眠或断网后半死的旧连接能让轮询永远卡住。
+/// 整个请求的期限（`timeout`）每次都会重新设到连接上，所以两个都要。
+fn agent_with(read: Duration) -> ureq::Agent {
     crate::sys::tls::agent_builder()
         .timeout_connect(Duration::from_secs(10))
-        .timeout_read(cfg.read_timeout())
+        .timeout_read(read)
         .timeout_write(Duration::from_secs(30))
+        .timeout(read + Duration::from_secs(10))
         .build()
 }
 
@@ -630,6 +638,47 @@ mod tests {
         assert_eq!(b.hit(), Duration::from_millis(400), "到上限就别再涨了");
         b.reset();
         assert_eq!(b.hit(), Duration::from_millis(100), "连上了要归零");
+    }
+
+    /// 第一次请求正常答完、连接留着复用；第二次请求走同一条连接，对面再也
+    /// 不出声（睡眠或断网后的半死连接）。第二次必须按时放弃，不能卡死。
+    #[test]
+    fn a_reused_connection_that_goes_silent_is_given_up_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (c, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut w = c;
+            let read_request = |r: &mut BufReader<TcpStream>| {
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0; len];
+                let _ = r.read_exact(&mut body);
+            };
+            read_request(&mut r);
+            let body = "{}";
+            let _ = write!(w, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            read_request(&mut r);
+            std::thread::sleep(Duration::from_secs(60));
+        });
+        let agent = agent_with(Duration::from_millis(300));
+        let url = format!("http://{addr}/x");
+        agent.post(&url).send_string("a").unwrap().into_string().unwrap();
+        let t = std::time::Instant::now();
+        assert!(agent.post(&url).send_string("b").is_err());
+        assert!(t.elapsed() < Duration::from_secs(20), "卡了 {:?}", t.elapsed());
     }
 
     /// 读超时必须**长于**中转的长轮询。反过来的话每一次轮询都会被自己掐断，
