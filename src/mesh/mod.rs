@@ -4,9 +4,10 @@
 //! - `login`：跟网关换中转令牌、到期前续期；
 //! - `store`：钥匙、电脑名、组名单落盘；
 //! - `net`：往外发（`Net` trait，真的 `LinkNet` 和测试用的 `FakeHub`）；
-//! - `group`：登录建组、加入、批准、移除这几个要跟别的电脑说话的流程；
+//! - `group`：登录建组、看现状、移除这几个要跟别的电脑说话的流程；
+//! - `invite`：用 6 位邀请码加电脑（老电脑出码、新电脑 `dct join <码>`）；
 //! - `deliver`：留言——`dct peers` 的详情、`dct send`、送进会话、忙时排队；
-//! - `cli`：`dct login` / `dct join` / `dct peers` / `dct send`；
+//! - `cli`：`dct login` / `dct invite` / `dct join` / `dct peers` / `dct send`；
 //! - 这里：`Mesh`，守护进程里这台电脑在组里的全部状态，以及电脑信封唯一的
 //!   入口 `Mesh::on_envelope`。
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -17,8 +18,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use dct_link::Envelope;
 use dct_mesh::roster::{self, Member, SignedRoster};
 use dct_mesh::seal::{self, Kind, Message, Sealed};
-use dct_mesh::wire::{self, JoinRequest, Payload};
-use dct_mesh::{id, sas, MachineKeys};
+use dct_mesh::wire::{self, Payload};
+use dct_mesh::{id, MachineKeys};
 
 use crate::journal::Journal;
 use crate::link::Handler;
@@ -26,6 +27,7 @@ use crate::link::Handler;
 pub mod cli;
 pub mod deliver;
 pub mod group;
+pub mod invite;
 pub mod login;
 pub mod net;
 pub mod store;
@@ -50,60 +52,10 @@ pub const SENT_AT_WINDOW_SECS: u64 = 10 * 60;
 /// 去重表记多少条。
 const SEEN_CAP: usize = 1024;
 
-/// 一条加入请求等多久没人批就作废；新电脑那边也最多等这么久。
-pub const JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// 最多同时挂几条等批准的加入请求。同账号里的一台电脑能一直发 `Join`，
-/// 不设上限的话这张表就是一个谁都能灌的口子。
-///
-/// **满了就拒新的，不挤掉旧的。** 挤旧的话，攻击者灌一轮就能把用户正在
-/// 核对的那条请求挤出去，再换上一条同名的冒牌货。
-const MAX_PENDING: usize = 16;
-
-/// 一段 `JOIN_TTL` 里最多亮出几个核对数字（每一次加入方揭晓随机数、承诺
-/// 验过，就亮一个）。
-///
-/// 数字是 6 位的：中转冒充一台电脑，每试一次有一百万分之一的机会让这边亮出
-/// 跟新电脑屏幕上一样的数字。不设上限，它可以一秒钟试几百次，在用户盯着
-/// 屏幕的那一两分钟里把一百万次试完。设了上限，一个加入窗口里它最多猜这么
-/// 几次；正常用一次 `dct join` 只亮一个。
-pub const MAX_CODES_PER_TTL: usize = 20;
-
-/// 新电脑加入时最多问几台已有的电脑（中转报的在线列表去重之后）。
-///
-/// 邀请方那边一个窗口最多亮 `MAX_CODES_PER_TTL` 个数字，这边也得有个数：
-/// 中转能在「谁在线」里列出任意多台假电脑，每台都回一句签得对的
-/// `JoinPending`、名字照抄用户的真电脑。每多一台，新电脑屏幕上就多一个
-/// 数字，就多一次百万分之一的「碰巧对上」。超过这个数就一台都不问
+/// 新电脑 `dct join` 时最多探问几台同账号在线的电脑（中转报的在线列表去重
+/// 之后）。中转能在「谁在线」里列出任意多台假电脑；超过这个数就一台都不问
 /// （`MeshProblem::TooManyAnswered`）——自己的电脑同时在线不会有这么多。
 pub const MAX_JOIN_ASK: usize = 16;
-
-/// 这台电脑是邀请方时，一条等人批准的加入请求。
-#[derive(Debug, Clone)]
-pub struct PendingReq {
-    pub req: JoinRequest,
-    /// 加入方在 `Join` 里交的承诺（`sas::commit`），已经解出来的 32 字节。
-    commit: [u8; 32],
-    /// 我为这一次出的随机数（在 `JoinPending` 里回给了对方）。
-    nonce: sas::Nonce,
-    /// 回 `JoinPending` 时我自己的成员记录。数字按这一份算，免得中间改了
-    /// 名、换了名单之后两边算的不是同一份。
-    mine: Member,
-    /// 加入方揭晓了随机数、承诺对得上之后才有：屏幕上的 6 位数。没有之前
-    /// 这条请求不给用户看，也批不了。
-    pub code: Option<String>,
-    pub at: Instant,
-}
-
-/// 新电脑这边：一台回过我 `JoinPending` 的已有电脑。
-#[derive(Debug, Clone)]
-pub struct Invite {
-    pub member: Member,
-    /// 我给它算的 6 位数。
-    pub code: String,
-    /// 什么时候回的（`clock` 的 unix 秒）。过了 `JOIN_TTL` 作废。
-    pub at: u64,
-}
 
 /// 一条等着投进会话的留言。
 #[derive(Debug, Clone)]
@@ -167,21 +119,6 @@ pub struct Mesh {
     pub keys: MachineKeys,
     pub me: Member,
     pub roster: Option<SignedRoster>,
-    /// 等人批准的加入请求。
-    pub pending_joins: Vec<PendingReq>,
-    /// 最近亮出核对数字的时刻（`MAX_CODES_PER_TTL`）。
-    codes_shown: VecDeque<Instant>,
-    /// 这台电脑自己在请求加入：回过我 `JoinPending` 的已有电脑，和我给它
-    /// 算的 6 位数。
-    pub invites: Vec<Invite>,
-    /// 用户核对过数字、认定的那一台（端点）。**只有它签的名单能成为我进组
-    /// 的第一份**（`roster::accept_invite`）。回过话的电脑不止它一台时，其余
-    /// 的谁都没被人核对过——中转可以塞进来一台自己的电脑，让它也回一句。
-    pub confirmed: Option<String>,
-    /// 用户还没认定之前，回过话的电脑先送来的名单。那边的人可能先点了同意，
-    /// 这边的人还没敲名字；先存着，认定的那一刻再验。别的电脑送来的永远
-    /// 用不上。每台最多一份。
-    held: Vec<SignedRoster>,
     /// 按会话 id 排队的留言（`deliver`）。
     pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
     /// 会话清单和敲字的那一头。没有（测试、还没接上）就不收留言。
@@ -204,6 +141,20 @@ pub struct Mesh {
     started_at: u64,
     clock: Clock,
     rand: Rand,
+    /// 这台电脑此刻发着的邀请码（`invite` 模块）。只在内存里：守护进程一重启
+    /// 就没了，要重新按 `a`。
+    pub(crate) invite: Option<invite::Invite>,
+    /// 最近一个结束了的邀请码怎么结束的（看板、`dct invite` 拿它说话）。
+    pub(crate) invite_note: Option<crate::proto::InviteNote>,
+    /// 发过几个邀请码（`InviteView::id`）。
+    invite_seq: u64,
+    /// 攥着锁的时候定下来、放了锁再发的名单广播（接收方, payload）。
+    /// `invite::flush_outbox` 发；守护进程的投递线程每拍调一次。
+    pub(crate) outbox: Vec<(Vec<String>, Vec<u8>)>,
+    /// 这台电脑当新电脑时已经送出过 `InviteJoin` 的码（存的是口令字节的
+    /// SHA-256，不存码本身）。同一个码只送一次：再敲就直接说已作废，中转
+    /// 冒充发邀请的那台，每个码也只换得到一次猜的机会。只在内存里。
+    pub(crate) spent_codes: Vec<[u8; 32]>,
 }
 
 impl Mesh {
@@ -225,11 +176,6 @@ impl Mesh {
             keys,
             me,
             roster,
-            pending_joins: Vec::new(),
-            codes_shown: VecDeque::new(),
-            invites: Vec::new(),
-            confirmed: None,
-            held: Vec::new(),
             queues: HashMap::new(),
             inbox: None,
             in_flight: HashSet::new(),
@@ -241,6 +187,11 @@ impl Mesh {
             started_at: unix_now(),
             clock: Box::new(unix_now),
             rand: Box::new(os_rand),
+            invite: None,
+            invite_note: None,
+            invite_seq: 0,
+            outbox: Vec::new(),
+            spent_codes: Vec::new(),
         }
     }
 
@@ -319,11 +270,18 @@ impl Mesh {
         match payload {
             Payload::Roster(r) => Step::Done(self.take_roster(env, r)),
             Payload::Sealed(s) => self.take_sealed(env, &s),
-            Payload::Join(req) => Step::Done(self.take_join(env, req)),
-            // `JoinPending` 只该作为 `ask` 的答复回来（`group::join` 在那里
-            // 读它），不该从轮询里进来。
-            Payload::JoinPending { .. } => Step::Done(self.drop(env, "unasked_join_pending")),
-            Payload::JoinReveal { nonce } => Step::Done(self.take_reveal(env, &nonce)),
+            Payload::InviteProbe => Step::Done(self.take_probe(env)),
+            Payload::InviteJoin { member, sig, spake } => {
+                Step::Done(self.take_invite_join(env, member, &sig, &spake))
+            }
+            Payload::InviteFinish { confirm } => Step::Done(self.take_invite_finish(env, &confirm)),
+            // 这几种只该作为 `ask` 的答复回来（`invite::join` 在那里读），不该
+            // 从轮询里进来。
+            Payload::InviteOpen { .. }
+            | Payload::NoInvite
+            | Payload::InviteKey { .. }
+            | Payload::InviteDone { .. }
+            | Payload::InviteFailed => Step::Done(self.drop(env, "unasked_invite_reply")),
         }
     }
 
@@ -344,7 +302,7 @@ impl Mesh {
     }
 
     /// 这台电脑还不跟任何别的电脑同组：没有名单，或者名单上只有自己
-    /// （`dct login` 建的那一份）。只有这时候才能去加入别人的组。
+    /// （`dct login` 建的那一份）。只有这时候才能 `dct join` 别人的组。
     pub fn is_alone(&self) -> bool {
         match &self.roster {
             None => true,
@@ -392,24 +350,13 @@ impl Mesh {
         Ok(())
     }
 
-    /// 这台电脑请求加入时发出去的那一份：自己的成员记录，自己签名，外加对
-    /// `nonce` 的承诺（`sas::commit`）。`nonce` 每问一台电脑就另出一个，等
-    /// 那台回了它的随机数再揭晓。
-    pub fn join_request(&self, nonce: &sas::Nonce) -> JoinRequest {
-        JoinRequest {
-            member: self.me.clone(),
-            sig: wire::sign_member(&self.me, &self.keys),
-            commit: wire::encode32(&sas::commit(&self.me, nonce)),
-        }
-    }
-
-    /// 一个新的一次性随机数。
-    pub(crate) fn fresh_nonce(&self) -> sas::Nonce {
+    /// 32 字节新鲜随机数（SPAKE2 的种子）。
+    pub(crate) fn fresh_nonce(&self) -> [u8; 32] {
         (self.rand)()
     }
 
     /// 换上一份已经验过的名单：先落盘，再换内存。存不下就不换（理由见
-    /// `take_roster`）。已经在名单上的电脑，它的加入请求就不用再等了。
+    /// `take_roster`）。
     fn commit(&mut self, r: SignedRoster) -> anyhow::Result<()> {
         if let Some(s) = &self.store {
             s.save_roster(&r)?;
@@ -417,187 +364,18 @@ impl Mesh {
         if let Some(mine) = r.roster.member(&self.me.endpoint) {
             self.me = mine.clone();
         }
-        self.pending_joins
-            .retain(|p| r.roster.member(&p.req.member.endpoint).is_none());
         self.roster = Some(r);
         // 被移出组的电脑，它排着队的留言也一起作废。
         self.purge_non_members();
         Ok(())
     }
 
-    /// 扔掉过期的加入请求。
-    pub fn prune_pending(&mut self) {
-        self.pending_joins.retain(|p| p.at.elapsed() < JOIN_TTL);
-    }
-
-    /// 一台电脑想加入：验它的自签名、确认它说的端点就是中转认证过的发件
-    /// 端点，记下它的承诺，出一个新鲜的随机数，回一份我自己的自签成员记录
-    /// 加这个随机数。**这时还没有数字**：要等它揭晓自己的随机数
-    /// （`take_reveal`）。
-    ///
-    /// **这里不改名单。** 进名单只有一条路：用户看过两边的数字之后批准
-    /// （`group::approve`）。
-    fn take_join(&mut self, env: &Envelope, req: JoinRequest) -> Option<Vec<u8>> {
-        let Some(current) = self.roster.as_ref() else {
-            return self.drop(env, "join_without_group");
-        };
-        if req.member.endpoint != env.from.as_str() || !wire::verify_member(&req.member, &req.sig)
-        {
-            return self.drop(env, "join_bad_sig");
-        }
-        // 签得进名单的才挂：名字不合规、加密公钥解不出来的，批了也是白批。
-        if !valid_name(&req.member.name) || !valid_kx_pub(&req.member.kx_pub) {
-            return self.drop(env, "join_bad_member");
-        }
-        if current.roster.member(&req.member.endpoint).is_some() {
-            return self.drop(env, "join_already_member");
-        }
-        let Some(commit) = wire::decode32(&req.commit) else {
-            return self.drop(env, "join_bad_commit");
-        };
-        self.prune_pending();
-        let again = self
-            .pending_joins
-            .iter()
-            .any(|p| p.req.member.endpoint == req.member.endpoint);
-        if !again && self.pending_joins.len() >= MAX_PENDING {
-            return self.drop(env, "join_pending_full");
-        }
-        // 同一台再问一次（重跑了 `dct join`）：旧的那条连同它的数字一起作废，
-        // 这一次换新的随机数。
-        self.pending_joins
-            .retain(|p| p.req.member.endpoint != req.member.endpoint);
-        let nonce = self.fresh_nonce();
-        let mine = self.me.clone();
-        self.journal.mesh(&format!("join_asked from={}", env.from));
-        self.pending_joins.push(PendingReq {
-            req,
-            commit,
-            nonce,
-            mine: mine.clone(),
-            code: None,
-            at: Instant::now(),
-        });
-        Some(wire::encode(&Payload::JoinPending {
-            sig: wire::sign_member(&mine, &self.keys),
-            member: mine,
-            nonce: wire::encode32(&nonce),
-        }))
-    }
-
-    /// 加入方揭晓随机数：跟它在 `Join` 里的承诺对得上，才算出 6 位数、让
-    /// 这条请求出现在用户面前。对不上的整条扔掉——那是有人在中间换东西。
-    fn take_reveal(&mut self, env: &Envelope, nonce: &str) -> Option<Vec<u8>> {
-        self.prune_pending();
-        let Some(i) = self
-            .pending_joins
-            .iter()
-            .position(|p| p.req.member.endpoint == env.from.as_str())
-        else {
-            return self.drop(env, "reveal_without_join");
-        };
-        if self.pending_joins[i].code.is_some() {
-            return self.drop(env, "reveal_again");
-        }
-        let p = &self.pending_joins[i];
-        let Some(n) = wire::decode32(nonce).filter(|n| sas::opens(&p.commit, &p.req.member, n))
-        else {
-            self.pending_joins.remove(i);
-            return self.drop(env, "reveal_does_not_open");
-        };
-        while self
-            .codes_shown
-            .front()
-            .is_some_and(|t| t.elapsed() >= JOIN_TTL)
-        {
-            self.codes_shown.pop_front();
-        }
-        if self.codes_shown.len() >= MAX_CODES_PER_TTL {
-            self.pending_joins.remove(i);
-            return self.drop(env, "reveal_rate_limited");
-        }
-        self.codes_shown.push_back(Instant::now());
-        let code = sas::code(&p.mine, &p.req.member, &p.nonce, &n);
-        self.pending_joins[i].code = Some(code);
-        self.journal
-            .mesh(&format!("join_pending from={}", env.from));
-        None
-    }
-
-    /// 换一批回过话的电脑（新的一次 `dct join`）。之前认定的、存着的都作废。
-    pub fn set_invites(&mut self, found: Vec<(Member, String)>) {
-        let at = (self.clock)();
-        self.invites = found
-            .into_iter()
-            .map(|(member, code)| Invite { member, code, at })
-            .collect();
-        self.confirmed = None;
-        self.held.clear();
-    }
-
-    /// 扔掉过期的邀请，以及跟着它们的认定。（存着的名单不用跟着清：它只在
-    /// `confirm_inviter` 里、那台的邀请还在时才会被拿出来验。）
-    pub fn prune_invites(&mut self) {
-        let now = (self.clock)();
-        self.invites
-            .retain(|i| now.saturating_sub(i.at) < JOIN_TTL.as_secs());
-        let live: Vec<String> = self.invites.iter().map(|i| i.member.endpoint.clone()).collect();
-        if self.confirmed.as_ref().is_some_and(|c| !live.contains(c)) {
-            self.confirmed = None;
-        }
-    }
-
-    /// 用户说「是这一台，数字一样」。它先前送来过名单的话，现在验。
-    ///
-    /// 认定不了时，错误里带的是给人看的电脑名（过期之前记得住的话），不是
-    /// 端点——用户敲的就是名字。
-    pub fn confirm_inviter(&mut self, endpoint: &str) -> Result<(), crate::proto::MeshProblem> {
-        let name = self
-            .invites
-            .iter()
-            .find(|i| i.member.endpoint == endpoint)
-            .map(|i| i.member.name.clone())
-            .unwrap_or_else(|| endpoint.to_string());
-        self.prune_invites();
-        if !self.invites.iter().any(|i| i.member.endpoint == endpoint) {
-            return Err(crate::proto::MeshProblem::NoSuchInviter(name));
-        }
-        self.confirmed = Some(endpoint.to_string());
-        if let Some(i) = self.held.iter().position(|r| r.signer == endpoint) {
-            let r = self.held.remove(i);
-            self.take_invite(endpoint, r);
-        }
-        Ok(())
-    }
-
     fn take_roster(&mut self, env: &Envelope, incoming: SignedRoster) -> Option<Vec<u8>> {
-        // 我正在请求加入：只有用户认定的那台签的名单走 `accept_invite`；
-        // 别的回过话的电脑送来的，先存着（用户可能还没认定），永远不直接收。
-        if self.is_alone() {
-            self.prune_invites();
-            if self.confirmed.as_deref() == Some(incoming.signer.as_str()) {
-                self.take_invite(env.from.as_str(), incoming);
-                return None;
-            }
-            if self.invites.iter().any(|i| i.member.endpoint == incoming.signer) {
-                // `signer` 只是名单里的一个字段，还没验过。按它存的话，同账号
-                // 里随便一台电脑送一份写着「signer = A」的垃圾，就能把 A 真正
-                // 送来的那份顶掉，用户认定 A 的那一刻什么也验不出来。所以
-                // 只存**签名者亲自送来的**：中转认证过发件端点，冒不了。
-                if env.from.as_str() != incoming.signer {
-                    return self.drop(env, "invite_not_from_signer");
-                }
-                self.journal
-                    .mesh(&format!("invite_held from={}", env.from));
-                self.held.retain(|r| r.signer != incoming.signer);
-                self.held.push(incoming);
-                return None;
-            }
-        }
-        // 还没在任何组里的电脑，**不从网上接一份名单当自己的第一份**：
-        // `accept(None, ..)` 只查「是一份自签的创世名单」，同账号里谁都造得
-        // 出一份。加入别人的组走上面那条 `accept_invite`，它还要核对签名者
-        // 就是给我算过 6 位数的那台电脑。
+        // **不从网上接一份名单当自己的第一份**：`accept(None, ..)` 只查「是一份
+        // 自签的创世名单」，同账号里谁都造得出一份；只有自己一台的电脑手上那
+        // 份创世名单，组 id 跟别人的也对不上（`accept` 拒掉）。加入别人的组只
+        // 有一条路：`invite::join`，名单跟着 `InviteDone` 回来，签名者就是
+        // SPAKE2 里绑定的那台。
         let Some(current) = self.roster.as_ref() else {
             return self.drop(env, "roster_without_group");
         };
@@ -611,40 +389,6 @@ impl Mesh {
                 .mesh(&format!("roster_not_saved from={} err={e}", env.from));
         }
         None
-    }
-
-    /// 验、收一份邀请名单。`incoming.signer` 必须是用户认定的那台（调用方
-    /// 已经对过）。
-    fn take_invite(&mut self, from: &str, incoming: SignedRoster) {
-        let Some(inviter) = self
-            .invites
-            .iter()
-            .find(|i| Some(&i.member.endpoint) == self.confirmed.as_ref())
-            .map(|i| i.member.clone())
-        else {
-            return self.drop_from(from, "invite_not_confirmed");
-        };
-        if let Err(e) = roster::accept_invite(&incoming, &self.me.endpoint, &inviter) {
-            return self.drop_from(from, &format!("invite_{e:?}"));
-        }
-        // `accept_invite` 只拿得到我的端点（它绑着签名公钥）；我那一条的
-        // 加密公钥对不对，只有我自己知道。换成别的，发给我的东西我就解不开，
-        // 而能解开的是别人。
-        let mine = incoming.roster.member(&self.me.endpoint);
-        if mine.map(|m| (&m.sign_pub, &m.kx_pub)) != Some((&self.me.sign_pub, &self.me.kx_pub)) {
-            return self.drop_from(from, "invite_not_my_keys");
-        }
-        match self.commit(incoming) {
-            Ok(()) => {
-                self.invites.clear();
-                self.confirmed = None;
-                self.held.clear();
-                self.journal.mesh(&format!("joined via={from}"));
-            }
-            Err(e) => self
-                .journal
-                .mesh(&format!("roster_not_saved from={from} err={e}")),
-        }
     }
 
     fn take_sealed(&mut self, env: &Envelope, s: &Sealed) -> Step {
@@ -718,7 +462,7 @@ impl Mesh {
 ///
 /// 每一次打中转都有上限：`peers`/`send` 是 `net::CALL_TIMEOUT`，`ask` 是各自
 /// 给的超时，换令牌是 `login::GATEWAY_TIMEOUT`；一次发给好几台（广播名单、
-/// 加入时揭晓随机数）是并排发的，只算一次。命令行等的比这个长（`cli::wait_for`）。
+/// 探问）是并排发的，只算一次。命令行等的比这个长（`cli::wait_for`）。
 ///
 /// 发给**这台电脑自己**的会话（`dct send 本机/…`）不经过中转，但要在本机
 /// 敲字，敲字前的 git 快照没有上限；那一条不算在这里。
@@ -726,12 +470,21 @@ pub fn worst_case(req: &crate::proto::Request) -> Option<std::time::Duration> {
     use crate::proto::Request as R;
     let call = net::CALL_TIMEOUT;
     Some(match req {
-        R::MeshStatus | R::MeshConfirmInviter { .. } => call,
+        R::MeshStatus => call,
         R::MeshLogin => login::GATEWAY_TIMEOUT + call,
-        // 问谁在线、并排问每台、并排揭晓、再看一眼现状。
-        R::MeshJoin { .. } => call + group::JOIN_ASK_TIMEOUT + call + call,
+        R::MeshInvite | R::MeshInviteCancel => call,
+        // 可能先登录（换令牌）；问谁在线、并排探问；最多试
+        // `MAX_INVITERS_TRIED` 台、每台两次 ask；再看一眼现状。
+        R::MeshJoin { .. } => {
+            login::GATEWAY_TIMEOUT
+                + call
+                + call
+                + invite::INVITE_ASK_TIMEOUT
+                + invite::INVITE_ASK_TIMEOUT * 2 * invite::MAX_INVITERS_TRIED as u32
+                + call
+        }
         // 并排广播新名单，再看一眼现状。
-        R::MeshApprove { .. } | R::MeshRemove { .. } => call + call,
+        R::MeshRemove { .. } => call + call,
         R::MeshPeers => call + deliver::STATUS_ASK_TIMEOUT,
         // 中转回 `Busy` 时换个 id 再问一次。
         R::MeshSend { .. } => deliver::SEND_ASK_TIMEOUT * 2,

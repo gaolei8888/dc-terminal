@@ -133,7 +133,16 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 23 = 看板上的「我的电脑」：`MeshView` 多了 `messages`（这次守护进程运行
 /// 期间，别的电脑送进每个会话的留言条数）。**响应**的形状变了，照 13 那次
 /// 的规矩加一。
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// 24 = 用 6 位邀请码加电脑（dct-invite-v1），**旧的核对 + 批准整个删掉**：
+/// 多了 `Request::MeshInvite` / `MeshInviteCancel`、`Response::MeshInvite(InviteView)`，
+/// `MeshJoin` 多了 `code`，`MeshView` 多了 `invite` / `invite_note`、少了
+/// `pending` / `joining`，删掉 `MeshApprove` / `MeshConfirmInviter`；
+/// `MeshProblem` 多了 `BadInviteCode` / `WrongInviteCode` / `NoInvite` /
+/// `InviteRosterRefused`，删掉 `NoOneAnswered` / `NoSuchRequest` / `Ambiguous` /
+/// `NameTaken` / `NoSuchInviter` / `CodeMismatch`。24 在一个分支里定了两回
+/// （先加后删），中间没有发过版，所以只加一次号。
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,34 +520,27 @@ pub enum Request {
     LiveUnpublish,
     /// 给管理台一张只能切换公开状态的凭证。没在播回 `LiveStagingRejected(NotLive)`。
     LivePublishGrant,
-    /// 多电脑：这台电脑登录了没有、叫什么、组里有谁、谁在等批准。
+    /// 多电脑：这台电脑登录了没有、叫什么、组里有谁、发着的邀请码。
     ///
-    /// **`Mesh*` 这几条只从本机 socket 上答**（同 `Web*`）：批准一台电脑进组
-    /// 是这台机器主人的决定，不能从局域网手机页上点。
+    /// **`Mesh*` 这几条只从本机 socket 上答**（同 `Web*`）：出邀请码、加一台
+    /// 电脑进组是这台机器主人的决定，不能从局域网手机页上点；现状里还带着码。
     MeshStatus,
     /// 拿 DC 账号的 `api_key` 跟网关换中转令牌、连上中转；还没有组就自己
     /// 建一个。会打网络（网关），界面要放后台线程。
     MeshLogin,
-    /// 在新电脑上请求加入：问一遍在线的其它电脑，回答里带着每台的 6 位数。
-    /// `name` 非空就顺手改名。
+    /// 在新电脑上用老电脑给的邀请码加入（`dct join <码>`）。还没登录就先
+    /// 登录（要已配对同一个 DC 账号）。`name` 非空就用这个名字进组。
+    ///
+    /// **`code` 不进 `Debug`**：10 分钟里它就是进组的钥匙。
     MeshJoin {
+        code: String,
         name: String,
     },
-    /// 批准（`yes`）或拒绝一台等着加入的电脑。
-    ///
-    /// `endpoint` 和 `code` 都是**界面刚给用户看过的那一条**：守护进程要两样
-    /// 都跟挂着的请求对上才批。只按名字批的话，攻击者可以换上一条同名的
-    /// 请求，用户点的「同意」就落到了冒牌货身上。
-    MeshApprove {
-        endpoint: String,
-        code: String,
-        yes: bool,
-    },
-    /// 新电脑上：用户核对过数字，认定是 `endpoint` 这一台。只有它签的名单
-    /// 能让这台电脑进组。
-    MeshConfirmInviter {
-        endpoint: String,
-    },
+    /// 出一个新的邀请码（`dct invite`、看板上按 `a`）。旧的作废。回
+    /// `Response::MeshInvite`。
+    MeshInvite,
+    /// 收回手上的邀请码（`dct invite` 被 Ctrl-C）。
+    MeshInviteCancel,
     /// 把一台电脑移出组。不能是自己。
     MeshRemove {
         name: String,
@@ -684,21 +686,14 @@ impl std::fmt::Debug for Request {
             // 电脑名、端点都不是密钥。
             Request::MeshStatus => write!(f, "MeshStatus"),
             Request::MeshLogin => write!(f, "MeshLogin"),
-            Request::MeshJoin { name } => f.debug_struct("MeshJoin").field("name", name).finish(),
-            Request::MeshApprove {
-                endpoint,
-                code,
-                yes,
-            } => f
-                .debug_struct("MeshApprove")
-                .field("endpoint", endpoint)
-                .field("code", code)
-                .field("yes", yes)
+            // 邀请码是 10 分钟有效的口令，只报有没有。
+            Request::MeshJoin { code, name } => f
+                .debug_struct("MeshJoin")
+                .field("code", &if code.is_empty() { "" } else { "******" })
+                .field("name", name)
                 .finish(),
-            Request::MeshConfirmInviter { endpoint } => f
-                .debug_struct("MeshConfirmInviter")
-                .field("endpoint", endpoint)
-                .finish(),
+            Request::MeshInvite => write!(f, "MeshInvite"),
+            Request::MeshInviteCancel => write!(f, "MeshInviteCancel"),
             Request::MeshRemove { name } => {
                 f.debug_struct("MeshRemove").field("name", name).finish()
             }
@@ -811,6 +806,8 @@ pub enum Response {
     LiveGrant(LiveGrantToken),
     /// `Mesh*` 几条请求的共同回答：做完之后的样子。
     Mesh(MeshView),
+    /// 对 [`Request::MeshInvite`] 的回答：新出的码。
+    MeshInvite(InviteView),
     /// 对 [`Request::MeshPeers`] 的回答，按名单顺序，这台电脑自己也在里面。
     MeshPeers(Vec<PeerView>),
     /// 对 [`Request::MeshSend`] 的回答。
@@ -871,13 +868,13 @@ pub struct MeshView {
     /// 有没有一份名单（登录之后至少是只有自己的那一份）。
     pub in_group: bool,
     pub members: Vec<MemberView>,
-    /// 别的电脑想加入、等这台批准的。
-    pub pending: Vec<PendingJoin>,
-    /// 这台电脑自己在请求加入：问到的每台已有电脑，和给它算的 6 位数。
-    pub joining: Vec<PendingJoin>,
     /// 会话 id → 这次守护进程运行期间送进这个会话的留言条数（看板上的
     /// 「✉ N」）。只记真的敲进去了的，排着队的不算。
     pub messages: std::collections::BTreeMap<u32, u32>,
+    /// 这台电脑此刻发着的邀请码。没有就是 `None`。
+    pub invite: Option<InviteView>,
+    /// 最近一个结束了的邀请码怎么结束的。
+    pub invite_note: Option<InviteNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,12 +885,48 @@ pub struct MemberView {
     pub is_me: bool,
 }
 
-/// 一次加入请求，以及两边屏幕上都该出现的那个 6 位数。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingJoin {
-    pub name: String,
-    pub endpoint: String,
+
+/// 这台电脑此刻发着的邀请码（`dct invite` / 看板上按 `a`）。
+///
+/// **`Debug` 不打出码**：码在 10 分钟里就是进组的钥匙，不该进任何日志。
+/// 线上照常带着（只在本机 socket 上走，见 `Request::MeshStatus`）。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteView {
+    /// 这台电脑上第几个邀请（守护进程这次运行期间从 1 数起）。结果（`InviteNote`）
+    /// 按它对上是哪一个。
+    pub id: u64,
+    /// 6 位数字，不带空格。
     pub code: String,
+    /// 到这一刻（unix 秒）就作废。
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for InviteView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteView")
+            .field("id", &self.id)
+            .field("code", &"******")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// 一个邀请码怎么结束的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InviteOutcome {
+    /// 有一台用它进了组，名单上叫 `name`（撞名时已经编过号）。
+    Joined { name: String },
+    /// 有人拿它试过一次、没对上（或者试到一半不见了）：作废了。
+    Burned,
+    /// 10 分钟到了，没人用。
+    Expired,
+}
+
+/// 最近一个结束了的邀请码。`id` 同 `InviteView::id`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteNote {
+    pub id: u64,
+    pub outcome: InviteOutcome,
 }
 
 /// 一场直播眼下的样子。
@@ -1155,35 +1188,34 @@ pub enum MeshProblem {
     LoginFailed(String),
     /// 已经跟别的电脑在一个组里了，不用再加入。
     AlreadyInGroup,
-    /// 一台在线的、能回答的已有电脑都没有。
-    NoOneAnswered,
-    /// 中转报上来的在线电脑多得不像话（超过 `mesh::MAX_JOIN_ASK` 台）：一台
-    /// 都不问、一个数字都不给看。每多一个数字，就多一次让冒充的电脑碰巧
-    /// 对上老电脑屏幕的机会。
+    /// 中转报上来的同账号在线电脑多得不像话（超过 `mesh::MAX_JOIN_ASK` 台）：
+    /// 一台都不问。自己的电脑同时在线不会有这么多。
     TooManyAnswered,
     /// 电脑名不合规（空、带 `/`、太长）。
     BadName,
     /// 组里没有这台电脑。
     NoSuchMachine(String),
-    /// 没有这台电脑的加入请求（或者已经过期）。
-    NoSuchRequest(String),
-    /// 不止一台叫这个名字的电脑在等，得用端点指明。
-    Ambiguous(String),
-    /// 组里已经有一台叫这个名字的了。
-    NameTaken(String),
     /// 不能移除这台电脑自己。
     CannotRemoveSelf,
-    /// 新电脑上认定的那台没回应过这次加入（或者已经过了 10 分钟）。
-    NoSuchInviter(String),
-    /// 要批准的那条请求的数字跟屏幕上显示的对不上——挂着的已经不是用户
-    /// 看到的那一条了。
-    CodeMismatch,
     /// 名单存不下。
     NotSaved,
     /// 留言洗过之后还是超过 `mesh::deliver::MAX_BODY_CHARS`。
     TooLong,
     /// 地址不是 `电脑名/会话名`。
     BadAddress(String),
+    /// `dct join` 后面敲的不是 6 位数字（空格、`-` 已经去掉了）。
+    BadInviteCode,
+    /// 码不对、已过期或已被用掉：发邀请的那台已经把它作废了。
+    WrongInviteCode,
+    /// 同账号在线的电脑里没有一台发着邀请码。其中 `unanswered` 台连话都没回
+    /// ——多半是 dct 太旧，不认识 `InviteProbe`。
+    NoInvite { unanswered: u32 },
+    /// 老电脑已经把这台签进了名单，但发来的那份名单这边验不过（签名、组、
+    /// 我的钥匙对不上），没进组。
+    InviteRosterRefused,
+    /// 同账号在线的电脑里有 `n` 台（≥2）都在发邀请码：一台都没试——试一台就
+    /// 是给中转一次猜码的机会，而其中哪台是真的，这边分不出。
+    SeveralInviters { n: u32 },
 }
 
 /// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。
@@ -1511,16 +1543,13 @@ mod tests {
             Request::LivePublishGrant,
             Request::MeshStatus,
             Request::MeshLogin,
-            Request::MeshJoin { name: "n".into() },
-            Request::MeshApprove {
-                endpoint: "c-x".into(),
-                code: "123456".into(),
-                yes: true,
+            Request::MeshJoin {
+                code: "482913".into(),
+                name: "n".into(),
             },
+            Request::MeshInvite,
+            Request::MeshInviteCancel,
             Request::MeshRemove { name: "n".into() },
-            Request::MeshConfirmInviter {
-                endpoint: "c-x".into(),
-            },
             Request::MeshPeers,
             Request::MeshSend {
                 to: "pc/s".into(),
@@ -1533,8 +1562,8 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                23,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"name":"n"}},{"MeshApprove":{"endpoint":"c-x","code":"123456","yes":true}},{"MeshRemove":{"name":"n"}},{"MeshConfirmInviter":{"endpoint":"c-x"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
+                24,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1558,7 +1587,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                23,
+                24,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1667,7 +1696,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                23,
+                24,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1770,7 +1799,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (23, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (24, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1788,7 +1817,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (23, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (24, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1865,7 +1894,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                23,
+                24,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -1902,7 +1931,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
             (
-                23,
+                24,
                 r#"{"MeshSent":"Delivered"}"#,
                 r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
                 r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
@@ -1925,19 +1954,24 @@ mod tests {
                 online: true,
                 is_me: true,
             }],
-            pending: vec![PendingJoin {
-                name: "B".into(),
-                endpoint: "c-b".into(),
-                code: "123456".into(),
-            }],
-            joining: Vec::new(),
             messages: [(7, 2)].into_iter().collect(),
+            invite: Some(InviteView {
+                id: 3,
+                code: "012345".into(),
+                expires_at: 1_800_000_600,
+            }),
+            invite_note: Some(InviteNote {
+                id: 2,
+                outcome: InviteOutcome::Joined {
+                    name: "公司电脑".into(),
+                },
+            }),
         });
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&v).unwrap().as_str()),
             (
-                23,
-                r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"pending":[{"name":"B","endpoint":"c-b","code":"123456"}],"joining":[],"messages":{"7":2}}}"#
+                24,
+                r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"messages":{"7":2},"invite":{"id":3,"code":"012345","expires_at":1800000600},"invite_note":{"id":2,"outcome":{"Joined":{"name":"公司电脑"}}}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1948,6 +1982,29 @@ mod tests {
             unreachable!()
         };
         assert_eq!(back, sent);
+    }
+
+    /// 邀请码不进 `Debug`：`MeshJoin` 只报有没有码，`InviteView` 打星号。
+    #[test]
+    fn invite_codes_never_show_up_in_debug() {
+        let r = Request::MeshJoin {
+            code: "482913".into(),
+            name: "公司电脑".into(),
+        };
+        let d = format!("{r:?}");
+        assert!(!d.contains("482913") && d.contains("公司电脑"), "{d}");
+        let v = Response::MeshInvite(InviteView {
+            id: 1,
+            code: "482913".into(),
+            expires_at: 9,
+        });
+        let d = format!("{v:?}");
+        assert!(!d.contains("482913") && d.contains("expires_at: 9"), "{d}");
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"MeshInvite":{"id":1,"code":"482913","expires_at":9}}"#,
+            "线上照常带着码"
+        );
     }
 
     /// 留言正文不进 `Debug`：只报长度。

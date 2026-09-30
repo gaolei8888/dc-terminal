@@ -208,6 +208,74 @@ pub mod testing {
                 .ok_or(LinkError::Relay(dct_link::LinkError::NoAnswer))
         }
     }
+
+    /// 中转可以对经过它的东西做什么：发出去之前改（或者换成别的），答复回来
+    /// 之后改（或者吞掉）。包在一台电脑自己的 `FakeNet` 外面，替它往外发。
+    type Outgoing = Box<dyn Fn(&str, Vec<u8>) -> Vec<u8> + Send + Sync>;
+    type Incoming = Box<dyn Fn(&str, Vec<u8>) -> Result<Vec<u8>, LinkError> + Send + Sync>;
+
+    pub struct EvilNet {
+        pub inner: FakeNet,
+        pub outgoing: Outgoing,
+        pub incoming: Incoming,
+        /// 真的发出去的每一条（改过之后的）：`(发给谁, payload)`。
+        pub sent: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl EvilNet {
+        /// 什么都不改，只记账。
+        pub fn honest(inner: FakeNet) -> EvilNet {
+            EvilNet {
+                inner,
+                outgoing: Box::new(|_, p| p),
+                incoming: Box::new(|_, r| Ok(r)),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn outgoing(mut self, f: impl Fn(&str, Vec<u8>) -> Vec<u8> + Send + Sync + 'static) -> EvilNet {
+            self.outgoing = Box::new(f);
+            self
+        }
+
+        pub fn incoming(
+            mut self,
+            f: impl Fn(&str, Vec<u8>) -> Result<Vec<u8>, LinkError> + Send + Sync + 'static,
+        ) -> EvilNet {
+            self.incoming = Box::new(f);
+            self
+        }
+
+        /// 发出去的 payload 里 `"t"` 是 `tag` 的有几条。
+        pub fn count(&self, tag: &str) -> usize {
+            let want = format!("\"t\":\"{tag}\"");
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, p)| String::from_utf8_lossy(p).contains(&want))
+                .count()
+        }
+    }
+
+    impl Net for EvilNet {
+        fn peers(&self) -> Result<Vec<String>, LinkError> {
+            self.inner.peers()
+        }
+
+        fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError> {
+            let p = (self.outgoing)(to, payload);
+            self.sent.lock().unwrap().push((to.to_string(), p.clone()));
+            self.inner.send(to, p)
+        }
+
+        fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+            let p = (self.outgoing)(to, payload);
+            self.sent.lock().unwrap().push((to.to_string(), p.clone()));
+            let r = self.inner.ask(to, p, timeout)?;
+            (self.incoming)(to, r)
+        }
+    }
 }
 
 #[cfg(test)]

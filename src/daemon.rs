@@ -225,9 +225,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let mc = mesh_ctl.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(crate::mesh::deliver::TICK);
-            if let Some((m, _)) = mc.running() {
+            if let Some((m, n)) = mc.running() {
                 // 一拍里敲字 panic 了，这条线不能跟着死（`tick_catching`）。
                 crate::mesh::deliver::tick_catching(&m);
+                // 有人用邀请码进了组：新名单发给组里其余的电脑（`invite::flush_outbox`）。
+                crate::mesh::invite::flush_outbox(&m, n.as_ref());
             }
         });
     }
@@ -332,24 +334,23 @@ fn handle_mesh(
     let r: Result<Response, MeshProblem> = match req {
         Request::MeshStatus => Ok(view(ctl)),
         Request::MeshLogin => mesh_login(ctl, secrets, profiles_dir, transport).map(|_| view(ctl)),
-        Request::MeshJoin { name } => ctl
+        // 还没登录就先登录（要已配对 DC 账号，同 `dct login`），再用码加入。
+        Request::MeshJoin { code, name } => (match ctl.running() {
+            Some(parts) => Ok(parts),
+            None => mesh_login(ctl, secrets, profiles_dir, transport)
+                .and_then(|_| ctl.running().ok_or(MeshProblem::NotLoggedIn)),
+        })
+        .and_then(|(m, n)| crate::mesh::invite::join(&m, n.as_ref(), &code, Some(&name)))
+        .map(|_| view(ctl)),
+        Request::MeshInvite => ctl
             .running()
             .ok_or(MeshProblem::NotLoggedIn)
-            .and_then(|(m, n)| group::join(&m, n.as_ref(), Some(&name)))
-            .map(|_| view(ctl)),
-        Request::MeshApprove {
-            endpoint,
-            code,
-            yes,
-        } => ctl
+            .and_then(|(m, _)| recover(m.lock()).start_invite())
+            .map(Response::MeshInvite),
+        Request::MeshInviteCancel => ctl
             .running()
             .ok_or(MeshProblem::NotLoggedIn)
-            .and_then(|(m, n)| group::approve(&m, n.as_ref(), &endpoint, &code, yes))
-            .map(|_| view(ctl)),
-        Request::MeshConfirmInviter { endpoint } => ctl
-            .running()
-            .ok_or(MeshProblem::NotLoggedIn)
-            .and_then(|(m, _)| group::confirm(&m, &endpoint))
+            .map(|(m, _)| recover(m.lock()).cancel_invite())
             .map(|_| view(ctl)),
         Request::MeshRemove { name } => ctl
             .running()
@@ -389,9 +390,9 @@ fn mesh_view(ctl: &MeshCtl) -> crate::proto::MeshView {
         endpoint: String::new(),
         in_group: matches!(store.roster(), Ok(Some(_))),
         members: Vec::new(),
-        pending: Vec::new(),
-        joining: Vec::new(),
         messages: Default::default(),
+        invite: None,
+        invite_note: None,
     }
 }
 
@@ -866,13 +867,13 @@ fn serve(
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             // 多电脑这几条只在这里答：从 HTTP 上来的请求走 `handle`，那边
-            // 一律拒绝（批准一台电脑进组，不能从局域网手机页上点）。
+            // 一律拒绝（出邀请码、加电脑，不能从局域网手机页上点）。
             Ok(
                 req @ (Request::MeshStatus
                 | Request::MeshLogin
                 | Request::MeshJoin { .. }
-                | Request::MeshApprove { .. }
-                | Request::MeshConfirmInviter { .. }
+                | Request::MeshInvite
+                | Request::MeshInviteCancel
                 | Request::MeshRemove { .. }
                 | Request::MeshPeers
                 | Request::MeshSend { .. }),
@@ -1240,8 +1241,8 @@ fn handle(
         Request::MeshStatus
         | Request::MeshLogin
         | Request::MeshJoin { .. }
-        | Request::MeshApprove { .. }
-        | Request::MeshConfirmInviter { .. }
+        | Request::MeshInvite
+        | Request::MeshInviteCancel
         | Request::MeshRemove { .. }
         | Request::MeshPeers
         | Request::MeshSend { .. } => Ok(Response::Error(ErrorCode::BadRequest(
@@ -3598,15 +3599,12 @@ mod tests {
         for req in [
             Request::MeshStatus,
             Request::MeshLogin,
-            Request::MeshJoin { name: String::new() },
-            Request::MeshApprove {
-                endpoint: "c-x".into(),
-                code: "123456".into(),
-                yes: true,
+            Request::MeshJoin {
+                code: "482913".into(),
+                name: String::new(),
             },
-            Request::MeshConfirmInviter {
-                endpoint: "c-x".into(),
-            },
+            Request::MeshInvite,
+            Request::MeshInviteCancel,
             Request::MeshRemove { name: "x".into() },
             Request::MeshPeers,
             Request::MeshSend {
@@ -4079,15 +4077,8 @@ mod mesh_tests {
             .join("sign.key")
             .exists());
         for req in [
-            Request::MeshJoin { name: String::new() },
-            Request::MeshApprove {
-                endpoint: "x".into(),
-                code: "1".into(),
-                yes: true,
-            },
-            Request::MeshConfirmInviter {
-                endpoint: "x".into(),
-            },
+            Request::MeshInvite,
+            Request::MeshInviteCancel,
             Request::MeshRemove { name: "x".into() },
             Request::MeshPeers,
             Request::MeshSend {
@@ -4211,6 +4202,94 @@ mod mesh_tests {
         );
         assert!(recover(ctl.slot.lock()).is_none());
         assert_eq!(secrets.lock().unwrap().get(RELAY_TOKEN_KEY), None);
+    }
+
+    /// `dct join <码>` 在还没登录的电脑上：先登录（要 DC 账号），再找发邀请
+    /// 的电脑。没配对 DC 就停在登录那一步，什么都不生成。
+    #[test]
+    fn mesh_join_logs_in_first_and_needs_a_dc_account() {
+        let (t, socket, secrets) = home();
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            "[mesh]\nrelay = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        let ctl = ctl_for(&socket);
+        let join = || Request::MeshJoin {
+            code: "482913".into(),
+            name: String::new(),
+        };
+        let r = mesh_call(join(), &ctl, &secrets, &t.path().join("profiles"), &no_network);
+        assert!(
+            matches!(
+                r,
+                Response::Error(ErrorCode::Mesh(crate::proto::MeshProblem::NoDcAccount))
+            ),
+            "{r:?}"
+        );
+        assert!(recover(ctl.slot.lock()).is_none());
+        assert!(!crate::mesh::store::dir_for_socket(&socket)
+            .join("sign.key")
+            .exists());
+
+        secrets.lock().unwrap().set("dc", "sk-dc").unwrap();
+        let fake = |_: &str, _: &str, _: &str| {
+            Ok((200, format!(r#"{{"token":"tok","exp":{}}}"#, u64::MAX / 2)))
+        };
+        let r = mesh_call(join(), &ctl, &secrets, &t.path().join("profiles"), &fake);
+        // 登录成了；中转连不上（127.0.0.1:9），问不到任何电脑。
+        assert!(
+            matches!(
+                r,
+                Response::Error(ErrorCode::Mesh(crate::proto::MeshProblem::NoInvite {
+                    unanswered: 0
+                }))
+            ),
+            "{r:?}"
+        );
+        assert_eq!(secrets.lock().unwrap().get(RELAY_TOKEN_KEY), Some("tok"));
+        let slot = recover(ctl.slot.lock());
+        slot.as_ref().expect("join 顺手登录了").link.stop();
+    }
+
+    /// 登录之后才能出码；出了码 `MeshStatus` 里看得到，收回之后就没了。
+    #[test]
+    fn mesh_invite_hands_out_a_code_that_status_shows_until_cancelled() {
+        let (t, socket, secrets) = home();
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            "[mesh]\nrelay = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        let ctl = ctl_for(&socket);
+        let profiles = t.path().join("profiles");
+        secrets.lock().unwrap().set("dc", "sk-dc").unwrap();
+        let fake = |_: &str, _: &str, _: &str| {
+            Ok((200, format!(r#"{{"token":"tok","exp":{}}}"#, u64::MAX / 2)))
+        };
+        assert!(matches!(
+            mesh_call(Request::MeshLogin, &ctl, &secrets, &profiles, &fake),
+            Response::Mesh(_)
+        ));
+        let Response::MeshInvite(v) =
+            mesh_call(Request::MeshInvite, &ctl, &secrets, &profiles, &no_network)
+        else {
+            panic!("该回 MeshInvite")
+        };
+        assert_eq!(v.code.len(), 6);
+        let Response::Mesh(status) =
+            mesh_call(Request::MeshStatus, &ctl, &secrets, &profiles, &no_network)
+        else {
+            panic!()
+        };
+        assert_eq!(status.invite, Some(v));
+        let Response::Mesh(after) =
+            mesh_call(Request::MeshInviteCancel, &ctl, &secrets, &profiles, &no_network)
+        else {
+            panic!()
+        };
+        assert_eq!(after.invite, None);
+        recover(ctl.slot.lock()).as_ref().unwrap().link.stop();
     }
 
     /// 重启之后还是同一台电脑：端点由落盘的钥匙决定。

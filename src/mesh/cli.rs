@@ -1,35 +1,34 @@
-//! `dct login` / `dct join` / `dct peers` / `dct send`。
+//! `dct login` / `dct invite` / `dct join` / `dct peers` / `dct send`。
 //!
 //! 这里只是把话说给人听：真正的事（换令牌、问别的电脑、签名单）都在守护
 //! 进程里做——它握着中转连接、钥匙和密钥仓，命令行这边一样也不碰。
 //!
-//! 跟守护进程说话的那一下（`call`）和问用户的那一下（`ask`）都是参数，
-//! 于是整套对话不起守护进程、不碰终端也能测。
-use std::io::{BufRead, Write};
+//! 跟守护进程说话的那一下（`call`）是参数，于是整套对话不起守护进程、
+//! 不碰终端也能测。
+use std::io::{IsTerminal, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::client::Client;
 use crate::i18n::{msg, text, Key, Lang};
 use crate::proto::{
-    ErrorCode, MeshProblem, MeshView, PeerView, PendingJoin, Request, Response, SendOutcome,
+    ErrorCode, MeshProblem, MeshView, PeerView, Request, Response, SendOutcome,
 };
 
-/// `dct join` 最多等多久有人点同意。跟对面那条请求的有效期一样长。
-const JOIN_WAIT: Duration = crate::mesh::JOIN_TTL;
-/// 等同意时多久问一次守护进程。
-const JOIN_POLL: Duration = Duration::from_secs(1);
 /// 守护进程替我们打网络的那几条请求（换令牌、问别的电脑、广播名单）等多久。
 /// 必须比守护进程那边最坏的情况（`mesh::worst_case`）长出一截，见 `wait_for`。
-const MESH_CALL_WAIT: Duration = Duration::from_secs(60);
+const MESH_CALL_WAIT: Duration = Duration::from_secs(90);
+
+/// `dct invite` 等结果时多久问一次守护进程（倒计时也按这个跳）。
+const INVITE_POLL: Duration = Duration::from_secs(1);
 
 /// 这一条请求命令行等多久：多电脑的请求等 `MESH_CALL_WAIT`，别的（握手）
 /// 按本机答一句的 `READ_TIMEOUT`。
 ///
-/// 等不够的代价不是「慢一点」：守护进程可能在命令行放弃之后才办成——批准
-/// 已经签进名单、发给了每一台，屏幕上却说失败，用户会再批一次。
+/// 等不够的代价不是「慢一点」：守护进程可能在命令行放弃之后才办成——新
+/// 电脑已经进了组，屏幕上却说失败，用户会拿一个已经作废的码再试一次。
 fn wait_for(req: &Request) -> Duration {
     match crate::mesh::worst_case(req) {
         Some(_) => MESH_CALL_WAIT,
@@ -38,16 +37,14 @@ fn wait_for(req: &Request) -> Duration {
 }
 
 type Call<'a> = &'a mut dyn FnMut(Request) -> Result<Response>;
-/// 把一句提示给用户看、读回他敲的一行。读不到（没有终端、EOF）是 `None`。
-type Ask<'a> = &'a mut dyn FnMut(&str) -> Option<String>;
 
 /// `dct join` 的参数。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct JoinOpts {
-    /// 顺手改名；空 = 不改。
+    /// 老电脑上显示的邀请码，照用户敲的原样（空格、`-` 由守护进程那边去掉）。
+    pub code: String,
+    /// 用这个名字进组；空 = 用现在的名字。
     pub name: String,
-    /// 不问了，直接认定这一台（脚本用）。
-    pub confirm: Option<String>,
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -78,21 +75,19 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     };
+    // `dct invite` 被 Ctrl-C：把码收回，不留一个没人看着的码挂 10 分钟。
+    // **必须装在连上守护进程之后**：Unix 上这一下会屏蔽 SIGINT/SIGTERM，
+    // 屏蔽掩码会被子进程继承——要是在 `connect_or_start` 拉起守护进程之前
+    // 装，那个守护进程就再也收不到 `dct stop` 的 SIGTERM。
+    if cmd == "invite" {
+        crate::sys::signal::restore_terminal_when_killed(cancel_invite_on_exit);
+    }
     let mut client = client;
     let mut call = |req: Request| {
         let wait = wait_for(&req);
         client.call_within(req, wait)
     };
-    let mut ask = |prompt: &str| {
-        print!("{prompt}");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim().to_string()),
-        }
-    };
-    dispatch(cmd, rest, &mut call, &mut ask, &mut out, &mut err, lang)
+    dispatch(cmd, rest, &mut call, &mut out, &mut err, lang)
 }
 
 /// 连上守护进程之后的全部：先握手，再按子命令办。
@@ -100,7 +95,6 @@ fn dispatch(
     cmd: &str,
     rest: &[String],
     call: Call,
-    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
@@ -110,16 +104,27 @@ fn dispatch(
     }
     match cmd {
         "login" => login(call, out, err, lang),
+        "invite" if rest.is_empty() => invite(
+            call,
+            out,
+            err,
+            lang,
+            std::io::stdout().is_terminal(),
+            &unix_now,
+            &|| std::thread::sleep(INVITE_POLL),
+        ),
+        "invite" => {
+            let _ = writeln!(err, "{}", msg::mesh_invite_usage(lang));
+            2
+        }
         "join" => match parse_join(rest) {
-            Some(opts) => join(call, ask, out, err, lang, &opts, JOIN_WAIT, &|| {
-                std::thread::sleep(JOIN_POLL)
-            }),
+            Some(opts) => join(call, out, err, lang, &opts),
             None => {
                 let _ = writeln!(err, "{}", msg::mesh_join_usage(lang));
                 2
             }
         },
-        "peers" => peers(call, ask, out, err, lang, rest),
+        "peers" => peers(call, out, err, lang, rest),
         "send" => {
             // 在 dct 的会话里跑的，守护进程给子进程设过这个变量（`session.rs`）。
             let from = std::env::var(crate::session::SESSION_ID_ENV)
@@ -171,37 +176,24 @@ fn connect_or_start(sock: &Path) -> Option<Client> {
     None
 }
 
-/// `--name X` / `--name=X`、`--confirm X` / `--confirm=X`，都可以不给。
-/// `None` = 用法不对。
+/// `dct join <码> [--name X]`。码可以被空格拆成几段（`dct join 482 913`
+/// 到这里是两个参数），拼回去；`--name X` / `--name=X` 可以放在哪儿都行。
+/// `None` = 用法不对（没有码、不认识的 `--` 参数）。
 fn parse_join(args: &[String]) -> Option<JoinOpts> {
     let mut opts = JoinOpts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if let Some(v) = a.strip_prefix("--name=") {
             opts.name = v.to_string();
-        } else if let Some(v) = a.strip_prefix("--confirm=") {
-            opts.confirm = Some(v.to_string());
         } else if a == "--name" {
             opts.name = it.next()?.clone();
-        } else if a == "--confirm" {
-            opts.confirm = Some(it.next()?.clone());
-        } else {
+        } else if a.starts_with("--") {
             return None;
+        } else {
+            opts.code.push_str(a);
         }
     }
-    Some(opts)
-}
-
-/// 按名字或端点在一张列表里找一条。找不到、不止一条都是 `Err`。
-fn pick<'a>(list: &'a [PendingJoin], who: &str) -> Result<&'a PendingJoin, usize> {
-    let hits: Vec<&PendingJoin> = list
-        .iter()
-        .filter(|p| p.endpoint == who || p.name == who)
-        .collect();
-    match hits.as_slice() {
-        [p] => Ok(p),
-        _ => Err(hits.len()),
-    }
+    (!opts.code.is_empty()).then_some(opts)
 }
 
 /// 别的电脑报来的东西（名字、系统、会话……）印到终端之前都过一遍：
@@ -252,130 +244,134 @@ pub(crate) fn login(call: Call, out: &mut dyn Write, err: &mut dyn Write, lang: 
     0
 }
 
-/// 已经跟别的电脑同组了吗（名单上不止我自己）。
-fn grouped(v: &MeshView) -> bool {
-    v.members.iter().any(|m| !m.is_me)
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-/// 新电脑上：问一遍已有的电脑，列出每台的数字，**让用户说出是哪一台**
-/// （或者 `--confirm`），告诉守护进程只认那一台，然后等它的名单。
-///
-/// 不替用户挑：回话的电脑可能不止一台，其中哪台是中转塞进来的，只有看过
-/// 两块屏幕的人知道。只有一台回话也一样要他说一声——那一台同样可能是塞
-/// 进来的。
+/// Ctrl-C 打断 `dct invite` 时跑（Unix 上在 `sigwait` 那条普通线程里，
+/// Windows 上在控制台处理线程里——都能放心开 socket）。另开一条连接，
+/// 跑完进程就退出。
+fn cancel_invite_on_exit() {
+    let sock = crate::proto::socket_path();
+    if let Ok(mut c) = Client::connect(&sock) {
+        let _ = c.call_within(Request::MeshInviteCancel, crate::client::READ_TIMEOUT);
+    }
+}
+
+/// 老电脑上 `dct invite`：出一个码，印出来，一直等到它有结果（有人用它进了
+/// 组、被试错作废、过期、被看板上新按的 `a` 换掉）。`tty` 为真时每秒刷一行
+/// 倒计时。进组退 0，别的退 1。
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn invite(
+    call: Call,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    lang: Lang,
+    tty: bool,
+    now: &dyn Fn() -> u64,
+    pause: &dyn Fn(),
+) -> i32 {
+    let v = match call(Request::MeshInvite) {
+        Ok(Response::MeshInvite(v)) => v,
+        Ok(Response::Error(e)) => {
+            say_error(err, lang, &e);
+            return 1;
+        }
+        Ok(other) => {
+            say_error(err, lang, &ErrorCode::Internal(format!("{other:?}")));
+            return 1;
+        }
+        Err(e) => {
+            say_error(err, lang, &ErrorCode::Internal(e.to_string()));
+            return 1;
+        }
+    };
+    let spaced = format!("{} {}", &v.code[..3], &v.code[3..]);
+    let _ = writeln!(out, "{}", msg::mesh_invite_code(lang, &spaced));
+    let _ = writeln!(out, "{}", msg::mesh_invite_hint(lang, &v.code));
+    let _ = out.flush();
+    let mut ticked = false;
+    // 倒计时那一行后面接的话要另起一行。
+    let end = |out: &mut dyn Write, ticked: bool| {
+        if ticked {
+            let _ = writeln!(out);
+        }
+    };
+    loop {
+        pause();
+        let Some(s) = view_of(call, Request::MeshStatus, err, lang) else {
+            end(out, ticked);
+            return 1;
+        };
+        if let Some(n) = s.invite_note.as_ref().filter(|n| n.id == v.id) {
+            end(out, ticked);
+            return match &n.outcome {
+                crate::proto::InviteOutcome::Joined { name } => {
+                    let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &c(name)));
+                    0
+                }
+                crate::proto::InviteOutcome::Burned => {
+                    let _ = writeln!(err, "{}", msg::mesh_invite_burned(lang));
+                    1
+                }
+                crate::proto::InviteOutcome::Expired => {
+                    let _ = writeln!(err, "{}", msg::mesh_invite_expired(lang));
+                    1
+                }
+            };
+        }
+        match &s.invite {
+            Some(cur) if cur.id == v.id => {}
+            Some(_) => {
+                end(out, ticked);
+                let _ = writeln!(err, "{}", msg::mesh_invite_replaced(lang));
+                return 1;
+            }
+            None => {
+                end(out, ticked);
+                let _ = writeln!(err, "{}", msg::mesh_invite_gone(lang));
+                return 1;
+            }
+        }
+        if tty {
+            let left = v.expires_at.saturating_sub(now());
+            let _ = write!(out, "\r{}", msg::mesh_invite_countdown(lang, left));
+            let _ = out.flush();
+            ticked = true;
+        }
+    }
+}
+
+/// 新电脑上：拿老电脑给的码加入。登录（没登录的话）、找发邀请的那台、
+/// 核对，全在守护进程里一次办完；这里只把结果说给人听。
 pub(crate) fn join(
     call: Call,
-    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
     opts: &JoinOpts,
-    wait: Duration,
-    pause: &dyn Fn(),
 ) -> i32 {
-    let Some(now) = view_of(call, Request::MeshStatus, err, lang) else {
-        return 1;
-    };
-    if !now.logged_in {
-        say_error(err, lang, &ErrorCode::Mesh(MeshProblem::NotLoggedIn));
-        return 1;
-    }
-    // 邀请的有效期从守护进程问到那几台电脑的那一刻算起（`Mesh::set_invites`），
-    // 等同意的期限也从这里算——不从认定之后才算，不然用户在提示那儿想一会儿，
-    // 这边就会接着等一段那边早已不收的时间，最后只报一句笼统的超时。
-    let deadline = Instant::now() + wait;
     let req = Request::MeshJoin {
+        code: opts.code.clone(),
         name: opts.name.clone(),
-    };
-    let Some(asked) = view_of(call, req, err, lang) else {
-        return 1;
-    };
-    // 同名的不止一台时，名字认不出是哪台：把端点印在旁边，用户照着敲。
-    let line = |j: &PendingJoin| {
-        let dup = asked.joining.iter().filter(|x| x.name == j.name).count() > 1;
-        if dup {
-            msg::mesh_code_line_with_endpoint(lang, &c(&j.name), &c(&j.endpoint), &c(&j.code))
-        } else {
-            msg::mesh_code_line(lang, &c(&j.name), &c(&j.code))
-        }
-    };
-    match asked.joining.as_slice() {
-        [one] => {
-            let _ = writeln!(
-                out,
-                "{}",
-                msg::mesh_compare_codes(lang, Some(&c(&one.code)))
-            );
-            let _ = writeln!(out, "{}", line(one));
-        }
-        many => {
-            let _ = writeln!(out, "{}", msg::mesh_compare_codes(lang, None));
-            for j in many {
-                let _ = writeln!(out, "{}", line(j));
-            }
-        }
-    }
-    let _ = out.flush();
-
-    let choice = match &opts.confirm {
-        Some(c) => Some(c.clone()),
-        None => ask(&msg::mesh_which_computer(lang)),
-    };
-    let choice = choice.map(|c| c.trim().to_string()).unwrap_or_default();
-    if choice.is_empty() {
-        let _ = writeln!(err, "{}", msg::mesh_join_cancelled(lang));
-        return 1;
-    }
-    let inviter = match pick(&asked.joining, &choice) {
-        Ok(p) => p.clone(),
-        Err(0) => {
-            let _ = writeln!(err, "{}", msg::mesh_not_a_responder(lang, &choice));
-            return 1;
-        }
-        Err(_) => {
-            let _ = writeln!(err, "{}", msg::mesh_ambiguous_responder(lang, &choice));
-            return 1;
-        }
-    };
-    let req = Request::MeshConfirmInviter {
-        endpoint: inviter.endpoint.clone(),
     };
     let Some(v) = view_of(call, req, err, lang) else {
         return 1;
     };
-    // 那边可能已经点过同意：认定的那一刻就进组了。
-    if grouped(&v) {
-        let _ = writeln!(out, "{}", msg::mesh_joined_group(lang));
-        return 0;
+    let names: Vec<String> = v.members.iter().map(|m| c(&m.name)).collect();
+    let _ = writeln!(out, "{}", msg::mesh_joined_with(lang, &names));
+    // 起的名字跟组里的撞了，老电脑给编了号：告诉他现在叫什么。
+    if !opts.name.trim().is_empty() && v.name != opts.name.trim() {
+        let _ = writeln!(out, "{}", msg::mesh_renamed_on_join(lang, &c(&v.name)));
     }
-    let _ = writeln!(out, "{}", msg::mesh_waiting_for_approval(lang));
-    let _ = out.flush();
-
-    loop {
-        pause();
-        if let Some(v) = view_of(call, Request::MeshStatus, err, lang) {
-            if grouped(&v) {
-                let _ = writeln!(out, "{}", msg::mesh_joined_group(lang));
-                return 0;
-            }
-            // 守护进程已经把这次邀请作废了（过了期限，或者别处又跑了一次
-            // `dct join`）：再等也收不到，现在就说。
-            if v.joining.is_empty() {
-                let _ = writeln!(err, "{}", msg::mesh_join_timed_out(lang));
-                return 1;
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = writeln!(err, "{}", msg::mesh_join_timed_out(lang));
-            return 1;
-        }
-    }
+    0
 }
 
 pub(crate) fn peers(
     call: Call,
-    ask: Ask,
     out: &mut dyn Write,
     err: &mut dyn Write,
     lang: Lang,
@@ -404,66 +400,6 @@ pub(crate) fn peers(
                         );
                     }
                 }
-            }
-            for p in &v.pending {
-                // 两台同名就只能按端点批，提示里直接给端点。
-                let dup = v.pending.iter().filter(|q| q.name == p.name).count() > 1;
-                let target = if dup { &p.endpoint } else { &p.name };
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    msg::mesh_join_prompt(lang, &c(&p.name), &c(&p.code))
-                );
-                let _ = writeln!(out, "{}", msg::mesh_approve_hint(lang, &c(target)));
-            }
-            0
-        }
-        ["approve", who] | ["approve", who, "--no"] => {
-            let yes = args.len() == 2;
-            // 先看一眼挂着的是哪一条，把名字和数字再给用户看一遍；送去批的
-            // 是**这次给他看的**端点和数字，守护进程两样都对上才批。
-            let Some(v) = view_of(call, Request::MeshStatus, err, lang) else {
-                return 1;
-            };
-            let p = match pick(&v.pending, who) {
-                Ok(p) => p.clone(),
-                Err(0) => {
-                    say_error(
-                        err,
-                        lang,
-                        &ErrorCode::Mesh(MeshProblem::NoSuchRequest(who.to_string())),
-                    );
-                    return 1;
-                }
-                Err(_) => {
-                    say_error(
-                        err,
-                        lang,
-                        &ErrorCode::Mesh(MeshProblem::Ambiguous(who.to_string())),
-                    );
-                    return 1;
-                }
-            };
-            if yes {
-                let q = format!("{} ", msg::mesh_join_prompt(lang, &c(&p.name), &c(&p.code)));
-                let said_yes = ask(&q).is_some_and(|a| a.trim().eq_ignore_ascii_case("y"));
-                if !said_yes {
-                    let _ = writeln!(out, "{}", msg::mesh_not_approved(lang));
-                    return 1;
-                }
-            }
-            let req = Request::MeshApprove {
-                endpoint: p.endpoint.clone(),
-                code: p.code.clone(),
-                yes,
-            };
-            if view_of(call, req, err, lang).is_none() {
-                return 1;
-            }
-            if yes {
-                let _ = writeln!(out, "{}", msg::mesh_member_joined(lang, &c(&p.name)));
-            } else {
-                let _ = writeln!(out, "{}", msg::mesh_member_refused(lang, &c(&p.name)));
             }
             0
         }
@@ -608,9 +544,9 @@ mod tests {
                     is_me: *me,
                 })
                 .collect(),
-            pending: vec![],
-            joining: vec![],
             messages: Default::default(),
+            invite: None,
+            invite_note: None,
         }
     }
 
@@ -674,9 +610,9 @@ mod tests {
     fn every_mesh_command_stops_at_a_stale_daemon_with_the_restart_hint() {
         let cases: &[&[&str]] = &[
             &["login"],
+            &["invite"],
             &["join"],
             &["peers"],
-            &["peers", "approve", "B"],
             &["peers", "remove", "B"],
             &["send", "B/x", "hi"],
         ];
@@ -691,7 +627,6 @@ mod tests {
                 cmd,
                 &rest,
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -713,15 +648,12 @@ mod tests {
         let all = [
             Request::MeshStatus,
             Request::MeshLogin,
-            Request::MeshJoin { name: "n".into() },
-            Request::MeshApprove {
-                endpoint: "c-x".into(),
-                code: "123456".into(),
-                yes: true,
+            Request::MeshJoin {
+                code: "482913".into(),
+                name: "n".into(),
             },
-            Request::MeshConfirmInviter {
-                endpoint: "c-x".into(),
-            },
+            Request::MeshInvite,
+            Request::MeshInviteCancel,
             Request::MeshRemove { name: "n".into() },
             Request::MeshPeers,
             Request::MeshSend {
@@ -754,7 +686,6 @@ mod tests {
             online: false,
             is_me: false,
         });
-        v.pending = vec![pj(evil, "c-w", "123456")];
         let sc = Script::new(vec![
             Response::Mesh(v),
             Response::Error(ErrorCode::DaemonNotResponding),
@@ -763,7 +694,6 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -793,7 +723,6 @@ mod tests {
         let (mut out, mut err) = (vec![], vec![]);
         peers(
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -802,25 +731,21 @@ mod tests {
         let o = s(&out);
         assert!(!o.contains('\x1b') && !o.contains('\u{202e}'), "{o:?}");
 
-        // `dct join` 列数字的那几行。
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![pj(evil, "c-a1", "111111")];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked),
-        ]);
-        let mut ask = |_: &str| None;
+        // `dct join` 列组里有谁的那一行。
+        let mut joined = view(true, &[("B", true)]);
+        joined.members.push(crate::proto::MemberView {
+            name: evil.into(),
+            endpoint: "c-e".into(),
+            online: true,
+            is_me: false,
+        });
+        let sc = Script::new(vec![Response::Mesh(joined)]);
         let (mut out, mut err) = (vec![], vec![]);
-        join(
-            &mut sc.call(),
-            &mut ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(None),
-            Duration::from_secs(60),
-            &|| {},
-        );
+        let o = JoinOpts {
+            code: "482913".into(),
+            name: String::new(),
+        };
+        assert_eq!(join(&mut sc.call(), &mut out, &mut err, Lang::Zh, &o), 0);
         let o = s(&out);
         assert!(!o.contains('\x1b') && !o.contains('\u{202e}'), "{o:?}");
     }
@@ -836,7 +761,6 @@ mod tests {
             "login",
             &[],
             &mut call,
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -859,7 +783,6 @@ mod tests {
             "login",
             &[],
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -885,476 +808,34 @@ mod tests {
         );
     }
 
-    fn pj(name: &str, ep: &str, code: &str) -> PendingJoin {
-        PendingJoin {
-            name: name.into(),
-            endpoint: ep.into(),
-            code: code.into(),
-        }
-    }
-
-    fn no_ask(_: &str) -> Option<String> {
-        panic!("不该问用户")
-    }
-
-    fn opts(confirm: Option<&str>) -> JoinOpts {
-        JoinOpts {
-            name: String::new(),
-            confirm: confirm.map(str::to_string),
-        }
-    }
-
-    /// 两台回了话：逐台列数字，问是哪一台，用户说「家里Mac」，送去认定的
-    /// 就是它的端点；然后等到名单。
+    /// 详情问不成（旧守护进程、出错）：退回名单那几行；不再有「谁在等批准」。
     #[test]
-    fn join_lists_codes_asks_which_computer_and_confirms_that_one() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![
-            pj("家里Mac", "c-a", "111111"),
-            pj("办公室", "c-c", "222222"),
-        ];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(asked),
-            Response::Mesh(view(true, &[("B", true), ("家里Mac", false)])),
-        ]);
-        let prompts = RefCell::new(Vec::<String>::new());
-        let mut ask = |p: &str| {
-            prompts.borrow_mut().push(p.to_string());
-            Some("办公室".to_string())
-        };
-        let (mut out, mut err) = (vec![], vec![]);
-        let o = JoinOpts {
-            name: "公司Windows".into(),
-            confirm: None,
-        };
-        let code = join(
-            &mut sc.call(),
-            &mut ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &o,
-            Duration::from_secs(60),
-            &|| {},
-        );
-        assert_eq!(code, 0, "{}", s(&err));
-        let o = s(&out);
-        assert!(o.contains("  家里Mac：111111"), "{o}");
-        assert!(o.contains("  办公室：222222"), "{o}");
-        assert!(o.trim_end().ends_with("已加入"), "{o}");
-        assert_eq!(prompts.borrow().len(), 1);
-        assert!(prompts.borrow()[0].contains("哪一台电脑"));
-        let seen = sc.seen.borrow();
-        assert!(seen[1].contains("公司Windows"));
-        assert_eq!(seen[2], r#"MeshConfirmInviter { endpoint: "c-c" }"#);
-    }
-
-    #[test]
-    fn join_with_one_computer_puts_the_code_in_the_sentence_and_still_asks() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![pj("A", "c-a", "654321")];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked),
-            // 那边已经点过同意：认定那一刻就进组了，不再等。
-            Response::Mesh(view(true, &[("B", true), ("A", false)])),
-        ]);
-        let asked_user = RefCell::new(false);
-        let mut ask = |_: &str| {
-            *asked_user.borrow_mut() = true;
-            Some("A".to_string())
-        };
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(None),
-            Duration::from_secs(60),
-            &|| panic!("不该再等"),
-        );
-        assert_eq!(code, 0);
-        assert!(*asked_user.borrow(), "只有一台也要用户说一声");
-        assert!(s(&out).contains(
-            "请在你已有的任意一台电脑上看一眼：那边会显示一个 6 位数，跟这里的 654321 一样就点同意"
-        ));
-    }
-
-    /// `--confirm` 不问用户，直接认定。
-    #[test]
-    fn join_confirm_flag_skips_the_question() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![pj("A", "c-a", "1"), pj("M", "c-m", "2")];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked),
-            Response::Mesh(view(true, &[("B", true), ("A", false)])),
-        ]);
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut no_ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(Some("A")),
-            Duration::from_secs(60),
-            &|| {},
-        );
-        assert_eq!(code, 0);
-        assert_eq!(
-            sc.seen.borrow()[2],
-            r#"MeshConfirmInviter { endpoint: "c-a" }"#
-        );
-    }
-
-    /// 数字都对不上（直接回车）、说了一台没回过话的：不认定任何一台，退 1。
-    #[test]
-    fn join_without_a_matching_computer_confirms_nothing() {
-        for (answer, want) in [
-            (Some(""), "没有加入"),
-            (None, "没有加入"),
-            (Some("Z"), "没有叫 Z 的电脑回应过这次加入"),
-        ] {
-            let mut asked = view(true, &[("B", true)]);
-            asked.joining = vec![pj("A", "c-a", "1")];
-            let sc = Script::new(vec![
-                Response::Mesh(view(true, &[("B", true)])),
-                Response::Mesh(asked),
-            ]);
-            let mut ask = |_: &str| answer.map(str::to_string);
-            let (mut out, mut err) = (vec![], vec![]);
-            let code = join(
-                &mut sc.call(),
-                &mut ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &opts(None),
-                Duration::from_secs(60),
-                &|| {},
-            );
-            assert_eq!(code, 1);
-            assert!(s(&err).contains(want), "{answer:?}: {}", s(&err));
-            assert_eq!(sc.seen.borrow().len(), 2, "没送认定");
-        }
-    }
-
-    #[test]
-    fn join_gives_up_after_the_wait() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![pj("A", "c-a", "1")];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(asked),
-        ]);
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut no_ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(Some("A")),
-            Duration::ZERO,
-            &|| {},
-        );
-        assert_eq!(code, 1);
-        assert_eq!(
-            s(&err).trim(),
-            "10 分钟里没等到同意，邀请已过期，请重新运行 dct join"
-        );
-    }
-
-    /// 审查给的 m3：等同意的期限从问到那几台电脑时算起，跟邀请的有效期
-    /// 同一个起点。用户在「哪一台」那儿想了比期限还久，认定之后只再看一眼
-    /// 就该说过期，不该再接着等一整段。
-    #[test]
-    fn the_join_wait_starts_when_the_invites_were_made_not_after_confirming() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![pj("A", "c-a", "1")];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(asked.clone()),
-            // 只准再问这一次：从认定那一刻才起算的话，这里会接着问下去。
-            Response::Mesh(asked),
-        ]);
-        let mut slow_user = |_: &str| {
-            std::thread::sleep(Duration::from_millis(60));
-            Some("A".to_string())
-        };
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut slow_user,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(None),
-            Duration::from_millis(30),
-            &|| {},
-        );
-        assert_eq!(code, 1);
-        assert!(s(&err).contains("邀请已过期"), "{}", s(&err));
-        assert_eq!(sc.seen.borrow().len(), 4);
-    }
-
-    /// 守护进程那边邀请已经作废了（`joining` 空了、也没进组）：马上说过期，
-    /// 不等到期限。
-    #[test]
-    fn join_says_expired_as_soon_as_the_daemon_drops_the_invite() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![pj("A", "c-a", "1")];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(asked),
-            Response::Mesh(view(true, &[("B", true)])),
-        ]);
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut no_ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(Some("A")),
-            Duration::from_secs(600),
-            &|| {},
-        );
-        assert_eq!(code, 1);
-        assert!(
-            s(&err).contains("邀请已过期，请重新运行 dct join"),
-            "{}",
-            s(&err)
-        );
-    }
-
-    /// 审查给的 m2：两台同名都回了话。每行名字旁边印出端点，用户照着敲
-    /// 端点就能认定；只敲名字的话，说清楚是回话的同名、该敲什么。
-    #[test]
-    fn join_with_two_responders_of_the_same_name_shows_their_endpoints() {
-        let mut asked = view(true, &[("B", true)]);
-        asked.joining = vec![
-            pj("A", "c-a1", "111111"),
-            pj("A", "c-a2", "222222"),
-            pj("C", "c-c", "333333"),
-        ];
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked.clone()),
-            Response::Mesh(view(true, &[("B", true), ("A", false)])),
-        ]);
-        let mut ask = |_: &str| Some("c-a2".to_string());
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(None),
-            Duration::from_secs(60),
-            &|| {},
-        );
-        assert_eq!(code, 0, "{}", s(&err));
-        let o = s(&out);
-        assert!(o.contains("  A (c-a1)：111111"), "{o}");
-        assert!(o.contains("  A (c-a2)：222222"), "{o}");
-        assert!(o.contains("  C：333333"), "不同名的照旧只印名字：{o}");
-        assert_eq!(
-            sc.seen.borrow()[2],
-            r#"MeshConfirmInviter { endpoint: "c-a2" }"#
-        );
-
-        // 只敲名字：不送认定，告诉他敲括号里的编号。
-        let sc = Script::new(vec![
-            Response::Mesh(view(true, &[("B", true)])),
-            Response::Mesh(asked),
-        ]);
-        let mut ask = |_: &str| Some("A".to_string());
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(None),
-            Duration::from_secs(60),
-            &|| {},
-        );
-        assert_eq!(code, 1);
-        assert_eq!(
-            s(&err).trim(),
-            "不止一台叫 A 的电脑回应了。重新运行 dct join，输入数字对得上的那台后面括号里的 c-… 编号"
-        );
-        assert_eq!(sc.seen.borrow().len(), 2);
-    }
-
-    #[test]
-    fn join_before_login_says_to_log_in() {
-        let sc = Script::new(vec![Response::Mesh(view(false, &[]))]);
-        let (mut out, mut err) = (vec![], vec![]);
-        let code = join(
-            &mut sc.call(),
-            &mut no_ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &opts(None),
-            Duration::ZERO,
-            &|| {},
-        );
-        assert_eq!(code, 1);
-        assert_eq!(s(&err).trim(), "还没登录多电脑，先运行 dct login");
-    }
-
-    #[test]
-    fn join_arguments() {
-        let a = |v: &[&str]| parse_join(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(a(&[]), Some(JoinOpts::default()));
-        assert_eq!(a(&["--name", "公司Windows"]).unwrap().name, "公司Windows");
-        assert_eq!(a(&["--name=家里"]).unwrap().name, "家里");
-        let both = a(&["--name", "N", "--confirm", "家里Mac"]).unwrap();
-        assert_eq!(both.name, "N");
-        assert_eq!(both.confirm.as_deref(), Some("家里Mac"));
-        assert_eq!(a(&["--confirm=A"]).unwrap().confirm.as_deref(), Some("A"));
-        assert_eq!(a(&["--nope"]), None);
-        assert_eq!(a(&["--name"]), None);
-        assert_eq!(a(&["--confirm"]), None);
-    }
-
-    #[test]
-    fn peers_lists_members_and_asks_about_pending_joins() {
-        let mut v = view(true, &[("B", true), ("A", false)]);
-        v.pending = vec![pj("公司Windows", "c-w", "123456")];
-        // 详情问不成（旧守护进程、出错）：退回名单那几行。
+    fn peers_falls_back_to_the_member_lines() {
+        let v = view(true, &[("B", true), ("A", false)]);
         let sc = Script::new(vec![
             Response::Mesh(v),
             Response::Error(ErrorCode::DaemonNotResponding),
         ]);
         let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut no_ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &[]
-            ),
-            0
-        );
+        assert_eq!(peers(&mut sc.call(), &mut out, &mut err, Lang::Zh, &[]), 0);
         let o = s(&out);
         assert!(o.contains("  B  (这台)"), "{o}");
-        assert!(o.contains(
-            "一台叫 公司Windows 的电脑想加入「我的电脑」。它屏幕上的数字是 123456 吗？(y/n)"
-        ));
-        assert!(o.contains("dct peers approve 公司Windows"), "{o}");
+        assert!(o.contains("  A  (在线)"), "{o}");
+        assert!(!o.contains("approve"), "{o}");
+    }
+
+    /// `dct peers approve` 没有了：当成用法不对。
+    #[test]
+    fn peers_approve_is_gone() {
+        let sc = Script::new(vec![]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = peers(&mut sc.call(), &mut out, &mut err, Lang::Zh, &args(&["approve", "B"]));
+        assert_eq!(code, 2);
+        assert_eq!(s(&err).trim(), "用法：dct peers | dct peers remove <电脑名>");
     }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// `approve <名字>`：再给用户看一遍名字和数字，答 y 才送；送的是这次
-    /// 给他看的那条的端点和数字。
-    #[test]
-    fn peers_approve_reshows_the_code_and_sends_endpoint_and_code() {
-        let mut v = view(true, &[("B", true)]);
-        v.pending = vec![pj("C", "c-c", "123456")];
-        let sc = Script::new(vec![
-            Response::Mesh(v.clone()),
-            Response::Mesh(view(true, &[("B", true), ("C", false)])),
-        ]);
-        let shown = RefCell::new(String::new());
-        let mut ask = |p: &str| {
-            *shown.borrow_mut() = p.to_string();
-            Some("y".to_string())
-        };
-        let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &args(&["approve", "C"])
-            ),
-            0
-        );
-        assert!(shown.borrow().contains("一台叫 C 的电脑") && shown.borrow().contains("123456"));
-        assert_eq!(
-            sc.seen.borrow()[1],
-            r#"MeshApprove { endpoint: "c-c", code: "123456", yes: true }"#
-        );
-        assert!(s(&out).contains("C 已加入"));
-
-        // 答 n：什么都不送。
-        let sc = Script::new(vec![Response::Mesh(v.clone())]);
-        let mut ask = |_: &str| Some("n".to_string());
-        out.clear();
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &args(&["approve", "C"])
-            ),
-            1
-        );
-        assert_eq!(sc.seen.borrow().len(), 1);
-        assert!(s(&out).contains("没有批准"));
-
-        // --no：不问，直接拒。
-        let sc = Script::new(vec![
-            Response::Mesh(v.clone()),
-            Response::Mesh(view(true, &[("B", true)])),
-        ]);
-        out.clear();
-        peers(
-            &mut sc.call(),
-            &mut no_ask,
-            &mut out,
-            &mut err,
-            Lang::Zh,
-            &args(&["approve", "c-c", "--no"]),
-        );
-        assert!(sc.seen.borrow()[1].contains("yes: false"));
-        assert!(s(&out).contains("已拒绝 C"));
-    }
-
-    #[test]
-    fn peers_approve_with_two_of_the_same_name_asks_for_the_endpoint() {
-        let mut v = view(true, &[("B", true)]);
-        v.pending = vec![pj("C", "c-c", "1"), pj("C", "c-x", "2")];
-        let sc = Script::new(vec![Response::Mesh(v)]);
-        let (mut out, mut err) = (vec![], vec![]);
-        assert_eq!(
-            peers(
-                &mut sc.call(),
-                &mut no_ask,
-                &mut out,
-                &mut err,
-                Lang::Zh,
-                &args(&["approve", "C"])
-            ),
-            1
-        );
-        assert!(s(&err).contains("不止一台叫 C"));
-        assert_eq!(sc.seen.borrow().len(), 1);
     }
 
     /// `dct peers` 的详情：每台一行带系统，在线的下面列会话和触手，不在线
@@ -1397,7 +878,6 @@ mod tests {
         let (mut out, mut err) = (vec![], vec![]);
         let code = peers(
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -1522,7 +1002,6 @@ mod tests {
         let sc = Script::new(vec![Response::Mesh(view(true, &[("B", true)]))]);
         peers(
             &mut sc.call(),
-            &mut no_ask,
             &mut out,
             &mut err,
             Lang::Zh,
@@ -1537,7 +1016,6 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -1551,7 +1029,6 @@ mod tests {
         assert_eq!(
             peers(
                 &mut sc.call(),
-                &mut no_ask,
                 &mut out,
                 &mut err,
                 Lang::Zh,
@@ -1559,5 +1036,221 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[test]
+    fn join_arguments() {
+        let a = |v: &[&str]| parse_join(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let j = |code: &str, name: &str| {
+            Some(JoinOpts {
+                code: code.into(),
+                name: name.into(),
+            })
+        };
+        assert_eq!(a(&["482913"]), j("482913", ""));
+        assert_eq!(a(&["482", "913"]), j("482913", ""), "shell 把空格拆开了");
+        assert_eq!(a(&["482-913"]), j("482-913", ""));
+        assert_eq!(a(&["012345"]), j("012345", ""), "前导 0 原样");
+        assert_eq!(a(&["482913", "--name", "公司电脑"]), j("482913", "公司电脑"));
+        assert_eq!(a(&["--name=家里", "482913"]), j("482913", "家里"));
+        assert_eq!(a(&[]), None, "没有码");
+        assert_eq!(a(&["--name", "N"]), None, "只有名字没有码");
+        assert_eq!(a(&["482913", "--confirm", "A"]), None, "--confirm 没有了");
+        assert_eq!(a(&["482913", "--name"]), None);
+    }
+
+    /// 送给守护进程的就是用户敲的码和名字；进组之后报组里有谁。
+    #[test]
+    fn join_sends_the_code_and_says_who_is_in_the_group() {
+        let mut v = view(true, &[("Mac", false), ("公司电脑", true)]);
+        v.name = "公司电脑".into();
+        let sc = Script::new(vec![Response::Mesh(v)]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let o = JoinOpts {
+            code: "482 913".into(),
+            name: "公司电脑".into(),
+        };
+        assert_eq!(join(&mut sc.call(), &mut out, &mut err, Lang::Zh, &o), 0);
+        assert_eq!(
+            sc.seen.borrow().as_slice(),
+            [r#"MeshJoin { code: "******", name: "公司电脑" }"#]
+        );
+        assert_eq!(s(&out).trim(), "已加入「我的电脑」，组里有：Mac、公司电脑");
+    }
+
+    #[test]
+    fn join_tells_the_new_name_when_the_inviter_numbered_it() {
+        let mut v = view(true, &[("Mac", false), ("Mac 2", true)]);
+        v.name = "Mac 2".into();
+        let sc = Script::new(vec![Response::Mesh(v)]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let o = JoinOpts {
+            code: "482913".into(),
+            name: "Mac".into(),
+        };
+        assert_eq!(join(&mut sc.call(), &mut out, &mut err, Lang::Zh, &o), 0);
+        assert!(s(&out).contains("组里已经有一台叫这个名字的了，这台电脑现在叫 Mac 2"), "{}", s(&out));
+    }
+
+    #[test]
+    fn join_errors_are_said_in_words_and_exit_1() {
+        for (p, want) in [
+            (MeshProblem::WrongInviteCode, "邀请码不对或已作废，请在老电脑上按 a 重新生成"),
+            (MeshProblem::BadInviteCode, "邀请码是 6 位数字，比如：dct join 482913"),
+            (MeshProblem::NoDcAccount, "先在 dct 里用 DC 配对账号（进 dct 按 c 选 DC）"),
+        ] {
+            let sc = Script::new(vec![Response::Error(ErrorCode::Mesh(p))]);
+            let (mut out, mut err) = (vec![], vec![]);
+            let o = JoinOpts {
+                code: "1".into(),
+                name: String::new(),
+            };
+            assert_eq!(join(&mut sc.call(), &mut out, &mut err, Lang::Zh, &o), 1);
+            assert_eq!(s(&err).trim(), want);
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn join_without_a_code_prints_the_usage() {
+        let sc = Script::new(vec![Response::Hello {
+            protocol: crate::proto::PROTOCOL_VERSION,
+        }]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = dispatch("join", &[], &mut sc.call(), &mut out, &mut err, Lang::Zh);
+        assert_eq!(code, 2);
+        assert!(s(&err).contains("dct join <邀请码>"), "{}", s(&err));
+    }
+
+    fn invite_view(id: u64, code: &str) -> crate::proto::InviteView {
+        crate::proto::InviteView {
+            id,
+            code: code.into(),
+            expires_at: 1_000 + 600,
+        }
+    }
+
+    /// 一份带着邀请码（或者结果）的现状。
+    fn with_invite(
+        invite: Option<crate::proto::InviteView>,
+        note: Option<(u64, crate::proto::InviteOutcome)>,
+    ) -> MeshView {
+        let mut v = view(true, &[("Mac", true)]);
+        v.invite = invite;
+        v.invite_note = note.map(|(id, outcome)| crate::proto::InviteNote { id, outcome });
+        v
+    }
+
+    fn run_invite(answers: Vec<Response>, tty: bool) -> (i32, String, String, Vec<String>) {
+        let sc = Script::new(answers);
+        let (mut out, mut err) = (vec![], vec![]);
+        let code = invite(&mut sc.call(), &mut out, &mut err, Lang::Zh, tty, &|| 1_001, &|| {});
+        let seen = sc.seen.borrow().clone();
+        (code, s(&out), s(&err), seen)
+    }
+
+    /// 印出码（带空格）和怎么用，等到有人用它进组：报名字、退 0。
+    #[test]
+    fn invite_prints_the_code_and_waits_until_someone_joins() {
+        use crate::proto::InviteOutcome::Joined;
+        let (code, out, err, seen) = run_invite(
+            vec![
+                Response::MeshInvite(invite_view(3, "012345")),
+                Response::Mesh(with_invite(Some(invite_view(3, "012345")), None)),
+                Response::Mesh(with_invite(
+                    None,
+                    Some((
+                        3,
+                        Joined {
+                            name: "公司电脑".into(),
+                        },
+                    )),
+                )),
+            ],
+            false,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            out,
+            "邀请码 012 345 · 10 分钟内有效\n在新电脑上运行：dct join 012345（码只能用一次）\n公司电脑 已加入\n"
+        );
+        assert_eq!(seen, ["MeshInvite", "MeshStatus", "MeshStatus"]);
+    }
+
+    #[test]
+    fn invite_says_when_the_code_was_burned_expired_replaced_or_withdrawn() {
+        use crate::proto::InviteOutcome::{Burned, Expired};
+        let cases: Vec<(MeshView, &str)> = vec![
+            (
+                with_invite(None, Some((3, Burned))),
+                "有人用错码试过一次，码已作废。要加电脑就重新生成一个（看板上按 a，或运行 dct invite）",
+            ),
+            (
+                with_invite(None, Some((3, Expired))),
+                "邀请码过期了，没人用。要加电脑就重新生成一个（看板上按 a，或运行 dct invite）",
+            ),
+            (
+                with_invite(Some(invite_view(4, "999999")), None),
+                "这个邀请码已经换成新的了（看板上又按了 a？），以新的为准",
+            ),
+            (with_invite(None, None), "邀请码已经收回了"),
+            // 上一个码的结果不算这一个的。
+            (
+                with_invite(None, Some((2, Burned))),
+                "邀请码已经收回了",
+            ),
+        ];
+        for (status, want) in cases {
+            let (code, _, err, _) = run_invite(
+                vec![
+                    Response::MeshInvite(invite_view(3, "482913")),
+                    Response::Mesh(status),
+                ],
+                false,
+            );
+            assert_eq!(code, 1);
+            assert_eq!(err.trim(), want);
+        }
+    }
+
+    /// 终端里每秒刷一行倒计时（`\r` 覆盖）；结果另起一行。管道里不刷。
+    #[test]
+    fn invite_counts_down_only_on_a_terminal() {
+        use crate::proto::InviteOutcome::Joined;
+        let answers = || {
+            vec![
+                Response::MeshInvite(invite_view(3, "482913")),
+                Response::Mesh(with_invite(Some(invite_view(3, "482913")), None)),
+                Response::Mesh(with_invite(None, Some((3, Joined { name: "B".into() })))),
+            ]
+        };
+        let (_, out, _, _) = run_invite(answers(), true);
+        assert!(out.contains("\r还剩 9:59"), "{out:?}");
+        assert!(out.ends_with("\nB 已加入\n"), "{out:?}");
+        let (_, out, _, _) = run_invite(answers(), false);
+        assert!(!out.contains('\r'), "{out:?}");
+    }
+
+    #[test]
+    fn invite_before_login_says_to_log_in() {
+        let (code, out, err, _) = run_invite(
+            vec![Response::Error(ErrorCode::Mesh(MeshProblem::NotLoggedIn))],
+            false,
+        );
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(err.trim(), "还没登录多电脑，先运行 dct login");
+    }
+
+    #[test]
+    fn invite_takes_no_arguments() {
+        let sc = Script::new(vec![Response::Hello {
+            protocol: crate::proto::PROTOCOL_VERSION,
+        }]);
+        let (mut out, mut err) = (vec![], vec![]);
+        let rest = vec!["482913".to_string()];
+        let code = dispatch("invite", &rest, &mut sc.call(), &mut out, &mut err, Lang::Zh);
+        assert_eq!(code, 2);
+        assert!(s(&err).contains("用法：dct invite"), "{}", s(&err));
     }
 }

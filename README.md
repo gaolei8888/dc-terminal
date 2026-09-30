@@ -824,23 +824,33 @@ other messages. A session on one computer can drop a line into a session on
 another, typed straight in if that session is idle.
 
 ```
-dct login                       # on every computer: sign in with the DC account
-dct join                        # on the new one: ask to join (named Mac / Windows / Linux)
-dct peers                       # on an existing one: who is waiting
-dct peers approve Windows       # compare the 6 digits, approve
+dct login                       # on an existing computer: sign in with the DC account
+dct invite                      # on an existing computer: show a 6-digit invite code (or press a on the board)
+dct join 482913                 # on the new one: type that code (signs in first if needed)
 dct peers                       # who is in the group, what each has open
 dct send Mac/#3 "run the Windows tests"
 ```
 
 - **Sign in**: `dct login` trades the paired DC account for a relay token, kept on
   that computer only. The first computer to sign in creates the group.
+- **Adding a computer takes one code**: press `a` on the board of a computer that is
+  already in (or run `dct invite`); it shows `Invite code 482 913 · valid for 10 minutes`.
+  On the new computer run `dct join 482913` and it is in — the old one's board says
+  "<name> has joined". Spaces, dashes and full-width digits in the code are fine. The
+  new computer must be paired with the **same** DC account: computers on other accounts
+  cannot even reach yours.
+- **A code works once**: used once (right or wrong), 10 minutes old, or replaced by
+  pressing `a` again — then it is gone. If someone tried a wrong code, the old
+  computer says so; press `a` for a new one. Restarting the daemon also drops the code.
+- **The relay can't guess it**: the code is the password of a PAKE (SPAKE2), so the
+  relay sees every message and still learns nothing; impersonating a computer is a
+  one-in-a-million shot per code.
+- **Whoever sees the code can join** (if they also hold your DC account): mind screen
+  sharing and screenshots. The code is the approval; the old computer does not ask again.
 - **Names**: a computer is called Mac / Windows / Linux by default; a clash in the
-  group becomes "Mac 2". To pick your own: `dct join --name work-pc`.
-- **Joining takes a look at both screens**: `dct join` on the new computer lists
-  the online ones with a 6-digit number; `dct peers` on the old one shows the same
-  number. Only if they match — confirm on the new side, approve on the old side —
-  is the new computer in. A mismatch means something in the middle is lying. The
-  board's "my computers" strip shows the same prompt and takes `y`/`n`.
+  group is numbered by the old computer ("Mac 2"), even for a name set with `--name` —
+  the new computer tells you what it ended up as. To pick your own:
+  `dct join 482913 --name work-pc`.
 - **Messages**: `dct send <computer>/<session> "<text>"`, the session can be `#id`.
   The other side sees a marker line (`[来自 home-mac/docs 的留言 #a1b2]`) and then
   the text. Idle session: typed now. Busy: queued, one at a time.
@@ -853,11 +863,11 @@ dct send Mac/#3 "run the Windows tests"
 
 - the other computer offline → not sent (you are told); nothing is held for later;
 - only agent sessions receive, not plain terminal sessions;
-- queued messages and pending join requests are lost when the daemon restarts;
-- two old computers approving different newcomers at once can fork the group list,
-  and an offline computer misses list changes;
-- two brand-new computers joining each other at the same time is undefined — one
-  at a time;
+- queued messages and a live invite code are lost when the daemon restarts;
+- two old computers each adding a newcomer at once can fork the group list, and an
+  offline computer misses list changes;
+- any computer on your account can keep burning your codes with wrong guesses
+  (it cannot get in, but it is annoying); this version does not stop that;
 - you can't open another computer's session yet — that's the next step.
 
 ### Deploying
@@ -886,7 +896,7 @@ running it is going live, so check with whoever owns the servers first.**
    `--addr`. The relay still listens on loopback only; public traffic comes in
    through the proxy.
 4. **Check**: two real computers (a Mac and a Windows) go through `dct login` →
-   `dct join` → `dct peers approve` → `dct send`, and the message shows up.
+   `dct invite` → `dct join <code>` → `dct send`, and the message shows up.
 5. **Check multi-line messages in real agents** (not verified yet): on the Windows
    box, `dct send` a two-line message into a Claude Code session and into a Codex
    session. Each must arrive as **one** turn — the marker line and both body lines
@@ -898,7 +908,7 @@ running it is going live, so check with whoever owns the servers first.**
 To try the whole thing on one machine, no gateway, no internet:
 `cargo test --test mesh_e2e -- --ignored --nocapture` starts a real relay and two
 separate daemons, signs test tokens with `dct-srv token keygen`/`token mint` in
-place of the gateway, walks login → join → approve → peers → send, and checks the
+place of the gateway, walks login → invite → join → peers → send, and checks the
 relay's output never contains the message text.
 
 ## dct in a browser

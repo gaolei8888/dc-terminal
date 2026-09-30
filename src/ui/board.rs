@@ -30,10 +30,6 @@ const SESSION_PREFIX_COLS: usize = 2 + 1 + 7 + 8 + 16;
 /// 用户怎么退出的行（`e0ba1ec`）。现在它是函数，`return` 是安全的，
 /// 但如果哪天又被内联回循环里，这条约束就会重新生效。
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    // 顶部挂着一条加入确认时，y / n 先归它（`n` 平时是新建会话）。
-    if super::computers::handle_key(app, &key) {
-        return Ok(());
-    }
     match key.code {
         KeyCode::Char('q') if is_plain_key(&key) => app.quit = true,
         KeyCode::Down => super::move_row(app, 1),
@@ -60,6 +56,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             let _ = super::unpin_current(app);
         }
         KeyCode::Char('c') if is_plain_key(&key) => open_secrets(app),
+        // 加电脑：要一个 6 位邀请码（不用 `i`：九宫格里 `i` 是开回复框）。
+        KeyCode::Char('a') if is_plain_key(&key) => super::computers::start_invite(app),
         // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
         // 而且跟 g 一样，两个视图共用同一个键。
         KeyCode::Char('l') if is_plain_key(&key) => super::open_settings(app),
@@ -367,11 +365,15 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     if show_version {
         block = block.title_top(Line::from(Span::styled(version, dim())).right_aligned());
     }
-    // 多电脑那两块：标题下面一行加入确认，底部一段「我的电脑」。都是现成
-    // 的数据（`App::mesh`），这里不发请求。
+    // 多电脑那两块：标题下面的邀请码，底部一段「我的电脑」。都是现成的
+    // 数据（`App::mesh`），这里不发请求。
     let inner = block.inner(area);
     let width = inner.width as usize;
-    let prompt = super::computers::prompt_lines(&app.mesh, app.lang, width);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prompt = super::computers::invite_lines(&app.mesh, app.lang, width, now);
     let section = super::computers::section_lines(&app.mesh, app.lang, width);
     let (prompt_area, list_area, section_area) = split(inner, prompt.len(), section.len());
     f.render_widget(block, area);
@@ -384,8 +386,8 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(section), section_area);
 }
 
-/// 把标题下面那块分成三截：确认行、列表、「我的电脑」。高度不够时先保
-/// 确认行（要人拍板的事），再给列表留至少一行，剩下的才给底部那一段。
+/// 把标题下面那块分成三截：邀请码、列表、「我的电脑」。高度不够时先保
+/// 邀请码（码一位都不能丢），再给列表留至少一行，剩下的才给底部那一段。
 fn split(inner: Rect, prompt: usize, section: usize) -> (Rect, Rect, Rect) {
     let h = inner.height;
     let ph = (prompt.min(u16::MAX as usize) as u16).min(h);
@@ -1320,7 +1322,7 @@ mod tests {
     /// 没登录多电脑：底部只有一行灰字，不列名单、不画标题。
     #[test]
     fn not_logged_in_shows_a_single_gray_line_at_the_bottom() {
-        let term = draw_mesh(Some(mesh_view(false, &[], &[])), 80, 12);
+        let term = draw_mesh(Some(mesh_view(false, &[])), 80, 12);
         let r = rows(&term);
         assert_eq!(r[11], "多电脑未开启·运行dctlogin");
         assert!(!r[10].contains("我的电脑"), "{r:?}");
@@ -1358,7 +1360,6 @@ mod tests {
                 ("公司Windows", true, false),
                 ("家里Mac", true, true),
             ],
-            &[],
         );
         let r = rows(&draw_mesh(Some(v), 80, 12));
         assert_eq!(
@@ -1382,7 +1383,7 @@ mod tests {
             .enumerate()
             .map(|(i, n)| (*n, true, i == 0))
             .collect();
-        let r = rows(&draw_mesh(Some(mesh_view(true, &members, &[])), 80, 14));
+        let r = rows(&draw_mesh(Some(mesh_view(true, &members)), 80, 14));
         assert_eq!(r[13], "还有2台", "{r:?}");
         assert_eq!(r[7], "我的电脑");
         assert_eq!(
@@ -1392,72 +1393,55 @@ mod tests {
         assert!(!r.iter().any(|l| l.contains("A6")));
     }
 
-    /// 有电脑在等：标题下面一行黄字确认，带名字和数字；下面一行灰字提醒
-    /// 一次只加一台。80 列放得下整句。
-    #[test]
-    fn a_pending_join_shows_the_confirm_line_under_the_title() {
-        let v = mesh_view(
-            true,
-            &[("家里Mac", true, true)],
-            &[("公司Windows", "c-w", "123456")],
-        );
-        let term = draw_mesh(Some(v), 80, 12);
-        let r = rows(&term);
-        assert_eq!(
-            r[1],
-            "一台叫公司Windows的电脑想加入「我的电脑」。它屏幕上的数字是123456吗？(y/n)"
-        );
-        assert_eq!(r[2], "一次只加一台新电脑：两台同时加入，可能互相批准进错组");
-        assert!(!r.iter().any(|l| l.contains("还有")));
-        let buf = term.backend().buffer();
-        assert_eq!(
-            buf.cell((0, 1)).unwrap().fg,
-            crate::ui::theme_now().asking().fg.unwrap(),
-            "确认行是「等你拍板」那一档暖色"
-        );
-        // 会话行还在，被挤到下面
-        assert!(r.iter().any(|l| l.contains("proj")));
-    }
-
-    /// 等着的不止一台：只问最早的那台，后面说「还有 N 条」。
-    #[test]
-    fn several_pending_joins_are_asked_one_at_a_time() {
-        let v = mesh_view(
-            true,
-            &[("家里Mac", true, true)],
-            &[
-                ("甲", "c-a", "111111"),
-                ("乙", "c-b", "222222"),
-                ("丙", "c-c", "333333"),
-            ],
-        );
-        let c: String = rows(&draw_mesh(Some(v), 80, 12)).concat();
-        assert!(c.contains("一台叫甲的电脑") && c.contains("111111"), "{c}");
-        assert!(c.contains("还有2条"), "{c}");
-        assert!(!c.contains("222222") && !c.contains("333333"), "{c}");
-    }
-
-    /// 窄终端上折行，数字和 (y/n) 一个都不能丢；再窄再矮也不 panic。
-    #[test]
-    fn narrow_and_tiny_terminals_keep_the_code_and_never_panic() {
-        let v = mesh_view(
+    /// 发着邀请码：标题下面一行黄字（码、有效期、倒计时），再一行灰字说
+    /// 新电脑上敲什么；会话行被挤到下面。
+    fn with_code() -> crate::proto::MeshView {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut v = mesh_view(
             true,
             &[
                 ("家里Mac", true, true),
                 ("一个特别特别长的电脑名字啊啊啊", false, false),
             ],
-            &[("公司Windows", "c-w", "123456")],
         );
+        v.invite = Some(crate::proto::InviteView {
+            id: 1,
+            code: "482913".into(),
+            expires_at: now + 300,
+        });
+        v
+    }
+
+    #[test]
+    fn a_live_code_shows_under_the_title_with_the_hint() {
+        let term = draw_mesh(Some(with_code()), 80, 12);
+        let r = rows(&term);
+        assert!(r[1].starts_with("邀请码482913·10分钟内有效·还剩"), "{r:?}");
+        assert_eq!(r[2], "在新电脑上运行：dctjoin482913（码只能用一次）");
+        let buf = term.backend().buffer();
+        assert_eq!(
+            buf.cell((0, 1)).unwrap().fg,
+            crate::ui::theme_now().asking().fg.unwrap(),
+            "码那一行是「等你拍板」那一档暖色"
+        );
+        assert!(r.iter().any(|l| l.contains("proj")));
+    }
+
+    /// 窄终端上折行，码一位都不能丢；矮到放不下时先保码；再窄再矮也不 panic。
+    #[test]
+    fn narrow_and_tiny_terminals_keep_the_code_and_never_panic() {
+        let v = with_code();
         let c: String = rows(&draw_mesh(Some(v.clone()), 30, 20)).concat();
-        assert!(c.contains("123456") && c.contains("(y/n)"), "{c}");
-        // 矮到放不下：确认行先保，列表至少留一行，剩下的才给「我的电脑」。
-        let r = rows(&draw_mesh(Some(v.clone()), 80, 5));
-        assert!(r[1].contains("123456"), "{r:?}");
+        assert!(c.contains("482913"), "{c}");
+        let r = rows(&draw_mesh(Some(v.clone()), 80, 6));
+        assert!(r[1].contains("482913"), "{r:?}");
         assert!(r[3].contains("proj"), "列表还剩一行：{r:?}");
-        assert_eq!(r[4], "我的电脑");
         for (w, h) in [(80, 24), (30, 10), (30, 3), (10, 5), (1, 1), (2, 2), (0, 0)] {
             draw_mesh(Some(v.clone()), w, h);
-            draw_mesh(Some(mesh_view(false, &[], &[])), w, h);
+            draw_mesh(Some(mesh_view(false, &[])), w, h);
         }
     }
 
@@ -1469,7 +1453,7 @@ mod tests {
         let mut a = sess(1, &proj);
         a.activity = "x".repeat(200);
         app.set_sessions(vec![a, sess(2, &proj)]);
-        let mut v = mesh_view(true, &[("家里Mac", true, true)], &[]);
+        let mut v = mesh_view(true, &[("家里Mac", true, true)]);
         v.messages = [(1, 3)].into_iter().collect();
         app.mesh.view = Some(v);
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
