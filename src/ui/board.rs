@@ -60,6 +60,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             let _ = super::unpin_current(app);
         }
         KeyCode::Char('c') if is_plain_key(&key) => open_secrets(app),
+        // 加电脑：要一个 6 位邀请码（不用 `i`：九宫格里 `i` 是开回复框）。
+        KeyCode::Char('a') if is_plain_key(&key) => super::computers::start_invite(app),
         // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
         // 而且跟 g 一样，两个视图共用同一个键。
         KeyCode::Char('l') if is_plain_key(&key) => super::open_settings(app),
@@ -371,7 +373,12 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 的数据（`App::mesh`），这里不发请求。
     let inner = block.inner(area);
     let width = inner.width as usize;
-    let prompt = super::computers::prompt_lines(&app.mesh, app.lang, width);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut prompt = super::computers::invite_lines(&app.mesh, app.lang, width, now);
+    prompt.extend(super::computers::prompt_lines(&app.mesh, app.lang, width));
     let section = super::computers::section_lines(&app.mesh, app.lang, width);
     let (prompt_area, list_area, section_area) = split(inner, prompt.len(), section.len());
     f.render_widget(block, area);

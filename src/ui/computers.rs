@@ -17,7 +17,7 @@ use super::view::View;
 use super::widgets::{display_width, truncate, Msg};
 use super::{dim, theme_now};
 use crate::i18n::{msg, Lang};
-use crate::proto::{MemberView, MeshView, PendingJoin, Request, Response};
+use crate::proto::{InviteOutcome, MemberView, MeshView, PendingJoin, Request, Response};
 
 /// 多久问一次 `MeshStatus`。
 pub(crate) const POLL_EVERY: Duration = Duration::from_secs(5);
@@ -49,6 +49,13 @@ pub(crate) struct MeshPanel {
     /// 正在回答的那一条（端点、数字、同意与否）。回答飞着的时候确认行不画、
     /// y/n 不再接——免得连按两下，第二下落到下一条请求上。
     answering: Option<(PendingJoin, bool)>,
+    /// 按了 `a`、`MeshInvite` 还在飞。飞着的时候再按不再发第二条。
+    invite_rx: Option<Receiver<Reply>>,
+    /// 这个界面自己要来的最近一个码（`InviteView::id`）。只有它的结果才在
+    /// 底栏说一句——别处（`dct invite`）要的码，那边自己会说。
+    created: Option<u64>,
+    /// 已经说过的那个结果（`InviteNote::id`），同一句不说两遍。
+    announced: Option<u64>,
 }
 
 impl MeshPanel {
@@ -92,6 +99,35 @@ impl MeshPanel {
     }
 }
 
+/// 看板上按 `a`：要一个新码（旧的由守护进程作废）。上一条还在飞就不再发。
+pub(crate) fn start_invite(app: &mut App) {
+    if app.mesh.invite_rx.is_some() {
+        return;
+    }
+    app.mesh.invite_rx = Some(spawn_call(
+        app.socket.clone(),
+        Request::MeshInvite,
+        crate::client::READ_TIMEOUT * 2,
+    ));
+}
+
+/// 新拿到的现状里有这个界面要来的那个码的结果，还没说过：说一句。
+fn announce(app: &mut App) {
+    let Some(n) = app.mesh.view.as_ref().and_then(|v| v.invite_note.clone()) else {
+        return;
+    };
+    if app.mesh.created != Some(n.id) || app.mesh.announced == Some(n.id) {
+        return;
+    }
+    app.mesh.announced = Some(n.id);
+    let m = match &n.outcome {
+        InviteOutcome::Joined { name } => msg::mesh_member_joined(app.lang, &clean(name)).into(),
+        InviteOutcome::Burned => Msg::err(msg::mesh_invite_burned_board(app.lang)),
+        InviteOutcome::Expired => Msg::err(msg::mesh_invite_expired_board(app.lang)),
+    };
+    say(app, m);
+}
+
 /// 在后台线程里发一条请求，结果从返回的通道里取。
 fn spawn_call(socket: PathBuf, req: Request, timeout: Duration) -> Receiver<Reply> {
     let (tx, rx) = mpsc::channel();
@@ -108,6 +144,35 @@ fn spawn_call(socket: PathBuf, req: Request, timeout: Duration) -> Receiver<Repl
 /// 只在看板和九宫格上问（九宫格上有人想加入时要提醒一句）——别的视图不画
 /// 这一块。
 pub(crate) fn poll(app: &mut App, now: Instant) {
+    if let Some(rx) = &app.mesh.invite_rx {
+        match rx.try_recv() {
+            Ok(r) => {
+                app.mesh.invite_rx = None;
+                match r {
+                    Ok(Response::MeshInvite(v)) => {
+                        app.mesh.created = Some(v.id);
+                        if let Some(view) = app.mesh.view.as_mut() {
+                            view.invite = Some(v);
+                        }
+                        // 要码之前发出去的那次状态查询，回来的是没有这个码的
+                        // 样子，扔掉；下一轮就重新问，别等 5 秒。
+                        app.mesh.status_rx = None;
+                        app.mesh.last_fetch = None;
+                    }
+                    Ok(Response::Error(e)) => say(app, Msg::err(msg::error(app.lang, &e))),
+                    _ => say(
+                        app,
+                        Msg::err(msg::error(
+                            app.lang,
+                            &crate::proto::ErrorCode::DaemonNotResponding,
+                        )),
+                    ),
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => app.mesh.invite_rx = None,
+        }
+    }
     if let Some(rx) = &app.mesh.answer_rx {
         if let Ok(r) = rx.try_recv() {
             app.mesh.answer_rx = None;
@@ -152,6 +217,7 @@ pub(crate) fn poll(app: &mut App, now: Instant) {
                 // 问不到（断线、守护进程太老不认识这条）就留着手里那份。
                 if let Ok(Response::Mesh(v)) = r {
                     app.mesh.set_view(v, now);
+                    announce(app);
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -269,6 +335,36 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+/// 顶部的邀请码：`邀请码 482 913 · 10 分钟内有效 · 还剩 9:41`（黄字，整句
+/// 折行），下面一行灰字说新电脑上敲什么。`now` 是 unix 秒；到点了就不画
+/// （现状最多晚 5 秒才知道它过期）。
+pub(crate) fn invite_lines(panel: &MeshPanel, lang: Lang, width: usize, now: u64) -> Vec<Line<'static>> {
+    let Some(v) = panel.view.as_ref().and_then(|v| v.invite.as_ref()) else {
+        return Vec::new();
+    };
+    if now >= v.expires_at || v.code.len() != 6 {
+        return Vec::new();
+    }
+    let spaced = format!("{} {}", &v.code[..3], &v.code[3..]);
+    let line = format!(
+        "{} · {}",
+        msg::mesh_invite_code(lang, &spaced),
+        msg::mesh_invite_countdown(lang, v.expires_at - now)
+    );
+    let style = theme_now().asking().add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = wrap(&line, width)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, style)))
+        .collect();
+    if width > 1 {
+        lines.push(Line::from(Span::styled(
+            truncate(&msg::mesh_invite_hint(lang, &v.code), width.saturating_sub(1)),
+            dim(),
+        )));
+    }
+    lines
 }
 
 /// 顶部那几行：黄字的加入确认（整句折行，不截——数字和 (y/n) 一个都不能
@@ -424,6 +520,20 @@ pub(crate) mod tests {
                                 v.pending.retain(|p| &p.endpoint != endpoint);
                                 Response::Mesh(v)
                             }
+                            // 第几次要码，`id` 就是几；码固定。
+                            Request::MeshInvite => {
+                                let n = got
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .filter(|r| matches!(r, Request::MeshInvite))
+                                    .count() as u64;
+                                Response::MeshInvite(crate::proto::InviteView {
+                                    id: n + 1,
+                                    code: "482913".into(),
+                                    expires_at: INVITE_EXPIRES,
+                                })
+                            }
                             _ => Response::Ok,
                         };
                         got.lock().unwrap().push(req);
@@ -436,6 +546,17 @@ pub(crate) mod tests {
             }
         });
         got
+    }
+
+    /// 假守护进程发的码在这一刻（unix 秒）过期。
+    const INVITE_EXPIRES: u64 = 1_800_000_600;
+
+    fn invites(got: &Arc<Mutex<Vec<Request>>>) -> usize {
+        got.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, Request::MeshInvite))
+            .count()
     }
 
     fn approvals(got: &Arc<Mutex<Vec<Request>>>) -> Vec<(String, String, bool)> {
@@ -895,5 +1016,110 @@ pub(crate) mod tests {
         assert_eq!(wrap("一二三abc", 4), ["一二", "三ab", "c"]);
         assert_eq!(wrap("abc", 0), Vec::<String>::new());
         assert_eq!(wrap("一", 1), ["一"], "一个字都放不下也不能死循环");
+    }
+
+    fn text_of(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 看板上按 `a`：要一个码，拿到之后顶上画出来，带倒计时和新电脑上敲什么。
+    #[test]
+    fn a_on_the_board_gets_a_code_and_shows_it_with_a_countdown() {
+        let (mut app, _d, got) = board_app(mesh_view(true, &[("家里Mac", true, true)], &[]));
+        crate::ui::dispatch_key(&mut app, key('a')).unwrap();
+        wait_until(&mut app, |a| {
+            a.mesh.view.as_ref().is_some_and(|v| v.invite.is_some())
+        });
+        assert_eq!(invites(&got), 1);
+        assert_eq!(app.mesh.created, Some(1));
+        let shown = text_of(&invite_lines(&app.mesh, Lang::Zh, 80, INVITE_EXPIRES - 599));
+        assert_eq!(
+            shown,
+            "邀请码 482 913 · 10 分钟内有效 · 还剩 9:59\n在新电脑上运行：dct join 482913（码只能用一次）"
+        );
+    }
+
+    /// 连按两下 `a`：第一条还在飞，第二下不发；回来之后再按才换新码。
+    #[test]
+    fn pressing_a_twice_quickly_asks_once() {
+        let (mut app, _d, got) = board_app(mesh_view(true, &[("家里Mac", true, true)], &[]));
+        start_invite(&mut app);
+        start_invite(&mut app);
+        wait_until(&mut app, |a| a.mesh.invite_rx.is_none());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(invites(&got), 1);
+        start_invite(&mut app);
+        wait_until(&mut app, |a| a.mesh.invite_rx.is_none());
+        assert_eq!(invites(&got), 2);
+        assert_eq!(app.mesh.created, Some(2), "以新码为准");
+    }
+
+    #[test]
+    fn an_expired_code_is_not_drawn() {
+        let mut v = mesh_view(true, &[("家里Mac", true, true)], &[]);
+        v.invite = Some(crate::proto::InviteView {
+            id: 1,
+            code: "012345".into(),
+            expires_at: 1_000,
+        });
+        let mut panel = MeshPanel::default();
+        panel.set_view(v, Instant::now());
+        assert!(!invite_lines(&panel, Lang::Zh, 80, 999).is_empty());
+        assert!(text_of(&invite_lines(&panel, Lang::Zh, 80, 999)).contains("012 345"));
+        assert!(invite_lines(&panel, Lang::Zh, 80, 1_000).is_empty());
+    }
+
+    /// 这个界面要来的码有了结果：底栏说一句，只说一次；别处要来的码的结果不说。
+    #[test]
+    fn the_outcome_of_our_own_code_is_said_once() {
+        use crate::proto::{InviteNote, InviteOutcome::*};
+        let cases = [
+            (Joined { name: "公司电脑".into() }, "公司电脑 已加入"),
+            (Burned, "有人用错码试过一次，码已作废，按 a 重新生成"),
+            (Expired, "邀请码过期了，按 a 重新生成"),
+        ];
+        for (outcome, want) in cases {
+            let mut v = mesh_view(true, &[("家里Mac", true, true)], &[]);
+            v.invite_note = Some(InviteNote { id: 7, outcome });
+            let (mut app, _d, _got) = board_app(mesh_view(true, &[("家里Mac", true, true)], &[]));
+            app.mesh.created = Some(7);
+            app.mesh.set_view(v.clone(), Instant::now());
+            announce(&mut app);
+            assert_eq!(app.message.text, want);
+            app.message = "别的".into();
+            announce(&mut app);
+            assert_eq!(app.message.text, "别的", "同一句不说两遍");
+
+            app.mesh.created = Some(8);
+            app.mesh.announced = None;
+            announce(&mut app);
+            assert_eq!(app.message.text, "别的", "不是这个界面要的码");
+        }
+    }
+
+    /// 会话视图里 `a` 归 agent：不要码。
+    #[test]
+    fn a_in_the_session_view_asks_for_no_code() {
+        let (mut app, _d, got) = board_app(mesh_view(true, &[("家里Mac", true, true)], &[]));
+        app.set_sessions(vec![crate::session::SessionInfo {
+            id: 1,
+            profile: "claude".into(),
+            dir: "/tmp/a".into(),
+            state: crate::session::SessionState::Idle,
+            activity: String::new(),
+            is_agent: true,
+            tag: String::new(),
+        }]);
+        app.client = Some(crate::client::Client::connect(&app.socket).unwrap());
+        app.view = View::Attached(1);
+        crate::ui::dispatch_key(&mut app, key('a')).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        poll(&mut app, Instant::now());
+        assert_eq!(invites(&got), 0);
+        assert!(app.mesh.invite_rx.is_none());
     }
 }

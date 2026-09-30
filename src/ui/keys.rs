@@ -135,6 +135,10 @@ fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
                 if ctx.can_remove {
                     v.extend(help_items(&[("x", Key::RemoveProject)], lang));
                 }
+                // `a` 只绑在看板上（九宫格里不接，那边不画邀请码）。
+                if !in_grid {
+                    v.extend(help_items(&[("a", Key::AddComputer)], lang));
+                }
                 v.extend(help_items(
                     &[
                         ("c", Key::Secrets),

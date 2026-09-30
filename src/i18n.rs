@@ -106,6 +106,8 @@ pub enum Key {
     /// 的换项目手段；`Tab` 出现之后再写「换项目」，用户会以为按 `p` 能一步
     /// 换过去，而实际弹出来的是一个选择器。
     AddProject,
+    /// `a` 的说明：看板上要一个 6 位邀请码，给新电脑 `dct join` 用。
+    AddComputer,
     /// `1`…`9` 的说明：组头前面印着号码，按下去一步落到那个项目上。
     /// 跟 `Tab` 是同一件事的两种走法，所以两条都得写：`Tab` 是挨个翻，
     /// 数字是看见号码直接跳。
@@ -620,6 +622,7 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         // 「换项目」放得下，不必跟着缩。
         SwitchProject => t!(lang, en: "project", zh: "换项目"),
         AddProject => t!(lang, en: "add project", zh: "加项目"),
+        AddComputer => t!(lang, en: "add computer", zh: "加电脑"),
         GotoProject => t!(lang, en: "go to project", zh: "直达项目"),
         RemoveProject => t!(lang, en: "remove", zh: "移除"),
         ToggleCollapse => t!(lang, en: "fold", zh: "折叠"),
@@ -2453,6 +2456,24 @@ pub mod msg {
         )
     }
 
+    /// 看板底栏：这个界面要来的码被试错、作废了。
+    pub fn mesh_invite_burned_board(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "Someone tried a wrong code once, so it is no longer valid. Press a for a new one".to_string(),
+            zh: "有人用错码试过一次，码已作废，按 a 重新生成".to_string(),
+        )
+    }
+
+    /// 看板底栏：这个界面要来的码过期了。
+    pub fn mesh_invite_expired_board(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "The invite code expired. Press a for a new one".to_string(),
+            zh: "邀请码过期了，按 a 重新生成".to_string(),
+        )
+    }
+
     pub fn mesh_invite_expired(lang: Lang) -> String {
         t!(
             lang,
@@ -3066,6 +3087,7 @@ mod tests {
             SwitchAgent,
             SwitchProject,
             AddProject,
+            AddComputer,
             GotoProject,
             RemoveProject,
             ToggleCollapse,
@@ -3305,7 +3327,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 211, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 212, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
@@ -3435,6 +3457,8 @@ mod tests {
             msg::mesh_invite_countdown(Lang::En, 61),
             msg::mesh_invite_burned(Lang::En),
             msg::mesh_invite_expired(Lang::En),
+            msg::mesh_invite_burned_board(Lang::En),
+            msg::mesh_invite_expired_board(Lang::En),
             msg::mesh_invite_replaced(Lang::En),
             msg::mesh_invite_gone(Lang::En),
             msg::mesh_invite_usage(Lang::En),
