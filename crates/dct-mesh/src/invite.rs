@@ -631,7 +631,8 @@ mod tests {
         let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut next = move || {
             let mut out = [0u8; 32];
-            for chunk in out.chunks_exact_mut(8) {
+            let (chunks, _) = out.as_chunks_mut::<8>();
+            for chunk in chunks {
                 state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
                 let mut z = state;
                 z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
