@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "dct"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "base64",
