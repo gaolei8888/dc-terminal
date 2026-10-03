@@ -28,19 +28,22 @@
 
 ## 画面分类（纯函数，`crates/dct-game/src/screen.rs`）
 
-输入：一次 `see`（OCR）读到的元素（id、文字、位置）。输出下面之一，**按这个顺序判**（前面的优先）：
+输入：一次 `see`（OCR）读到的元素（id、文字）。输出下面之一，**按这个顺序判**（前面的优先）：
 
-| 分类 | 怎么认 | dct 做什么 |
-|---|---|---|
-| `Money` | 任何元素的文字带价格符号（¥ ￥ $ € £ 💎）、数字加 gem/gems/金币/钻石、或含 buy / purchase / pay / checkout / 购买 / 支付 / 充值 / gold / bar(s) 这类词 | **停**，说「出现了要花钱的画面，请你自己处理」 |
-| `Ad` | 任何元素的文字里有 ad / ads / advert（整词）或 "watch" 加 ad 之类，例如 `Watch ad`、`Watch an ad for a sweet treat` | **停**，说「出现了广告，请你自己关掉」（广告右上角的 ✕ 没有字，dco 不让点） |
-| `LivesOut` | 文字里有 lives 或 life，同时有 no more / out of / 0 / ask / get more 之一；或「生命」+「用完」/「不足」 | **停**，说「生命用完了」 |
-| `Won` | 已知的通关字样（见下，从证据里补） | **停**，说「通关了，下一关要重新认棋盘」 |
-| `Failed` | 已知的失败字样：out of moves / no more moves / try again / level failed / 没有步数了 / 再试一次 | 点那个 Try again / Play 类按钮重来；如果只有叉叉，**停** |
-| `Dismiss` | 有一个元素，整条文字（去掉空白、大小写不计）正好是 Close / No thanks / Not now / Later / Maybe later / Skip / Cancel / Got it / Tap to continue / Next / 关闭 / 以后再说 / 暂不 / 跳过 / 取消 / 知道了 / 下一步 | 点它 |
-| `PlayButton` | **恰好一个**元素，整条文字正好是 Play / Start / 开始 / 开始游戏。**两个或更多个**都正好是这些字（例如开局框里的两个 Play）→ 当作 `Unknown` | 点它 |
-| `Board` | 不是上面任何一种，而且 `read_grid` 读得出（至少 3 个「大」类别、总类别不超过 16） | 进入 `play` 一局 |
-| `Unknown` | 其它 | **停**，把所有文字和截图指纹记进记录，说「出现了不认识的画面」 |
+| 顺序 | 分类 | 怎么认 | dct 做什么 |
+|---|---|---|---|
+| 1 | `LivesOut` | 文字里有 lives 或 life（整词），同时有 no more / out of / ask friends / get more / 0 lives 之一；或「生命」+「用完」/「不足」/「没有了」 | **停**，说「生命用完了」 |
+| 2 | `Won` | 有 level complete / level completed / level cleared / 通关 | **停**，说「通关了，下一关要重新认棋盘」 |
+| 3 | `Dismiss` | 有一个元素，整条文字（大小写不计、合并空白、去掉两头的标点符号）正好是 Close / No thanks / Not now / Later / Maybe later / Skip / Cancel / Got it / Tap to continue / Next / 关闭 / 以后再说 / 暂不 / 跳过 / 取消 / 知道了 / 下一步 | 点它 |
+| 4 | `Money` | 任何元素带价格符号（¥ ￥ $ € £ 💎）、金币 / 钻石 / 购买 / 支付 / 充值，或整词 buy / purchase / pay / checkout / gold / gem(s) / bar(s) | **停**，说「出现了要花钱的画面，请你自己处理」 |
+| 5 | `Ad` | 任何元素里有整词 ad / ads / advert / advertisement，例如 `Watch ad`、`Watch an ad for a sweet treat` | **停**，说「出现了广告，请你自己关掉」 |
+| 6 | `Retry` | 有一个元素整条正好是 Try again / Retry / 再试一次 / 重试 | 点它重来 |
+| 7 | `PlayButton` | **恰好一个**元素整条正好是 Play / Start / 开始 / 开始游戏；两个或更多个都正好是 → 当作 `Unknown` | 点它 |
+| 8 | `Board`/`Unknown` | 不是上面任何一种：`read_grid` 读得出（至少 3 个「大」类别）就玩，读不出就是不认识的画面 | 玩一局 / **停**，把所有文字记进记录，说「出现了我不认识的画面」 |
+
+两处和这份设计最初写的不同（2026-10-03 写原型时想清楚的，已按这个实现）：
+- **「安全的关闭」排在「价格」前面。** 失败弹窗常带价格（用金条买步数），同时有一个整条正好是 `No thanks` 的按钮：价格在屏幕上不等于这个按钮危险，点它就是拒绝。没有这样的按钮才停。价格画面里的 Play 永远不点（Play 排在价格后面）。
+- **刚玩完一局后，除非看到明确的「再来一次」（`Retry`），不点 Play**，直接停下并说「这一局结束了，我看不出是通关还是没过，要接着玩请你自己点 Play」（停下原因 `level_ended`）。因为通关后的「Daily Stamps」画面上就是一个 Play，点了会进下一关，版面不同，会乱走烧生命。这条保险在中间关掉了弹窗之后仍然有效；点过「再来一次」之后才允许点 Play（开局框里的那个）。
 
 **开局框（dc-octo 真机经验，2026-09-30）**：每一局开始前有一个框（`Level NNNN` / `Select boosters:`），里面有三个道具圆泡（默认全选上，开局就会用掉）和**两个** Play：左边粉色是正常开始，右边紫色是「看广告」（带 x2）。
 - **用户 2026-10-03 定：允许用掉默认选上的道具**（库存约 748 / 625 / 297 个，免费攒的，不花钱）。dco 不能取消它们（圆泡没有字，按「对外」拦），所以 dct 不碰道具；以后 dco 能取消时再做成可选。
@@ -81,7 +84,7 @@ dct game play --auto-next [--steps N] [--tries N]
  "texts":["Daily Stamps","Play"], "tapped":"Play"|null, "outcome":"changed|no_effect|stopped"}
 ```
 
-`texts` 就是 OCR 读到的全部文字——这是之后补白名单的证据。停下来的最后一行（`stop`）新增原因码：`won`、`lives_out`、`money`、`unknown_screen`、`no_effect`、`tries_done`。
+`texts` 就是 OCR 读到的全部文字——这是之后补白名单的证据。停下来的最后一行（`stop`）新增原因码：`won`、`level_ended`、`lives_out`、`money`、`ad`、`unknown_screen`、`no_effect`、`tries_done`、`tap_limit`（整个命令点了 40 次还没回到棋盘）。
 
 ## 对 dco 的要求
 
