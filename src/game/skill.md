@@ -1,6 +1,6 @@
 ---
 name: dct-game
-description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。运行 dct game play，按规则一步一步玩，每步不到一秒，不用截图问大模型。
+description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。运行 dct game play，按规则一步一步玩，每步很快，不用截图问大模型。
 ---
 <!-- dct-managed: dct-game-skill v1 -->
 

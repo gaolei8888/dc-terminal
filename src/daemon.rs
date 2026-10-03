@@ -54,18 +54,14 @@ struct PairSlot {
     cancel: Arc<AtomicBool>,
 }
 
+/// 只有真正的守护进程（用默认 socket）才装说明卡。单元测试和集成测试把 socket 放进临时目录，
+/// 它们绝不能去写用户真实的 `~/.claude` 等。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn should_install_skill(socket: &Path, default: &Path) -> bool {
+    socket == default
+}
+
 pub fn run(socket: &Path) -> Result<()> {
-    // 「怎么让 AI 玩三消」的说明卡：真正的守护进程里才装。单元测试和集成测试把 socket 放进临时目录，
-    // 它们绝不能去写用户真实的 `~/.claude` 等。每 30 秒看一遍，是因为 agent 第一次运行才会建出自己的
-    // 目录——用户装了 agent、开了会话，不用重启守护进程说明卡也会出现。
-    if socket == crate::proto::socket_path().as_path() {
-        let _ = std::thread::Builder::new().name("game-skill".into()).spawn(|| loop {
-            if let Some(home) = crate::sys::home() {
-                let _ = crate::game::skill::install_all(&home);
-            }
-            std::thread::sleep(Duration::from_secs(30));
-        });
-    }
     let mgr = SessionManager::new();
     // 生死簿只在真正的守护进程里落盘。单元测试自己 `new()` 一个 manager，
     // 拿到的是不记账的那种——绝不能去写用户真实的 `~/.dct/sessions.log`。
@@ -85,6 +81,20 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 「谁连得上谁就能以你的身份执行任意命令」，那道门的全部细节和它在
     // 两个平台上各能挡住什么，写在 `sys::ipc::bind_private`。
     let listener = crate::sys::ipc::bind_private(socket)?;
+
+    // 「怎么让 AI 玩三消」的说明卡：只在 Mac 上装（玩游戏要 dco，dco 只有 Mac 版），并且要等 socket
+    // 绑成功以后——被另一个守护进程占着的时候，这个进程马上就退出，不该留下一个会写文件的线程。
+    // 每 30 秒看一遍，是因为 agent 第一次运行才会建出自己的目录：用户装了 agent、开了会话，
+    // 不用重启守护进程说明卡也会出现。
+    #[cfg(target_os = "macos")]
+    if should_install_skill(socket, crate::proto::socket_path().as_path()) {
+        let _ = std::thread::Builder::new().name("game-skill".into()).spawn(|| loop {
+            if let Some(home) = crate::sys::home() {
+                let _ = crate::game::skill::install_all(&home);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+    }
 
     // 把 dct 自带的那份 Node 挂到**这个进程**的 PATH 上，第一件事就做。
     //
@@ -1878,6 +1888,13 @@ fn to_code(e: anyhow::Error) -> ErrorCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_skill_installer_only_runs_for_the_default_socket() {
+        let d = Path::new("/home/u/.dct/daemon.sock");
+        assert!(should_install_skill(d, d));
+        assert!(!should_install_skill(Path::new("/tmp/t/x.sock"), d));
+    }
+
     use super::*;
     use std::time::Instant;
 

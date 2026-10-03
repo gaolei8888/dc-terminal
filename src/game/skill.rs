@@ -33,7 +33,12 @@ fn install_one(home: &Path, agent_dir: &str) -> io::Result<Installed> {
         Err(e) => return Err(e),
     }
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&file, SKILL_MD)?;
+    // 先写同目录下的临时文件再改名：别的进程（agent）读到的要么是旧卡片，要么是完整的新卡片。
+    let tmp = dir.join(format!(".SKILL.md.tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, SKILL_MD).and_then(|_| std::fs::rename(&tmp, &file)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(Installed::Wrote)
 }
 
@@ -66,6 +71,21 @@ mod tests {
         assert_eq!(got, vec![(".claude", &Installed::Wrote), (".codex", &Installed::NoAgent), (".qwen", &Installed::Wrote)]);
         assert_eq!(std::fs::read_to_string(skill_path(h.path(), ".claude")).unwrap(), SKILL_MD);
         assert!(!h.path().join(".codex").exists(), "不替没装的 agent 建目录");
+    }
+
+    #[test]
+    fn installing_leaves_no_temp_file_behind() {
+        let h = tempfile::tempdir().unwrap();
+        std::fs::create_dir(h.path().join(".claude")).unwrap();
+        install_all(h.path());
+        let dir = skill_path(h.path(), ".claude").parent().unwrap().to_path_buf();
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["SKILL.md"]);
+    }
+
+    #[test]
+    fn the_card_does_not_promise_a_speed_we_have_not_measured() {
+        assert!(!SKILL_MD.contains("不到一秒") && SKILL_MD.contains("每步很快"));
     }
 
     #[test]
