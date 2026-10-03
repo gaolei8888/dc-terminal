@@ -1,7 +1,8 @@
 //! 连本机 dco：unix socket 上的 MCP（一行一条 JSON-RPC）。握手跟 dco 自己的 `dco call` 一样：
 //! 先写 `{"dco_token": "<~/.dco/token>"}`，读到 `{"ok":true}`，再 initialize → notifications/initialized → tools/call。
 use crate::board::GridRead;
-use crate::play::{Dco, DcoError, Profile};
+use crate::play::{Dco, DcoError, Profile, Seen};
+use crate::screen::Element;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -134,5 +135,26 @@ impl Dco for DcoClient {
             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
         }))
         .map(|_| ())
+    }
+
+    fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
+        let body = self.call("see", json!({ "window": p.window, "source": "ocr" }))?;
+        let elements = body["elements"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| Some(Element { id: e["id"].as_str()?.to_string(), text: e["text"].as_str().unwrap_or("").to_string() }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Seen {
+            snapshot_id: body["snapshot_id"].as_str().unwrap_or("").to_string(),
+            observation_id: body["observation_id"].as_str().map(String::from),
+            elements,
+        })
+    }
+
+    fn tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError> {
+        self.call("tap", json!({ "snapshot_id": snapshot_id, "element_id": element_id })).map(|_| ())
     }
 }

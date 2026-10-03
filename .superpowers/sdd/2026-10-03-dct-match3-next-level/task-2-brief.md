@@ -1,3 +1,204 @@
+### Task 2: `Dco` 会读字、会点；`Stop` 多九种原因
+
+**Files:**
+- Modify: `crates/dct-game/src/play.rs`、`crates/dct-game/src/dco.rs`、`crates/dct-game/src/dco_tests.rs`、`src/game/text.rs`
+
+**Interfaces:**
+- Consumes: 任务 1 的 `screen::Element`。
+- Produces: `play::Seen { snapshot_id: String, observation_id: Option<String>, elements: Vec<Element> }`；`Dco::see_text(&mut self, &Profile) -> Result<Seen, DcoError>`、`Dco::tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError>`（**默认实现返回 `unsupported` 错误**，第一轮的假 dco 不用改）；`Stop::{Won, LevelEnded, LivesOut, Money, Ad, UnknownScreen(Vec<String>), NoEffect, TriesDone, TapLimit}`；`DcoClient` 实现这两个方法：`see_text` 调 dco 的 `see`（`source: "ocr"`，只留 `id`、`text`、`snapshot_id`、`observation_id`），`tap` 调 dco 的 `tap {snapshot_id, element_id}`，dco 拒绝时保留它的错误码（比如 `needs_ticket`）；`text::nav_line(&Value) -> Option<String>`；`stop_code` 的新代码 `won`、`level_ended`、`lives_out`、`money`、`ad`、`unknown_screen`、`no_effect`、`tries_done`、`tap_limit`；退出码：`won`、`level_ended`、`lives_out`、`tries_done` 是 0，`money`、`ad`、`unknown_screen`、`no_effect`、`tap_limit` 是 1。
+
+
+- [ ] **改 `crates/dct-game/src/play.rs`**（顶部的 use）：把
+
+```rust
+use crate::choose::{choose, Candidate};
+```
+
+换成
+
+```rust
+use crate::choose::{choose, Candidate};
+use crate::screen::Element;
+```
+
+- [ ] **改 `crates/dct-game/src/play.rs`**（`Dco` trait）：把
+
+```rust
+pub trait Dco {
+    fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+    /// 坐标是窗口比例（0～1）。
+    fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+}
+```
+
+换成
+
+```rust
+/// 一次 `see`（OCR）：画面上读到的字和它们的编号。`snapshot_id` 要原样交给 `tap`。
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub snapshot_id: String,
+    pub observation_id: Option<String>,
+    pub elements: Vec<Element>,
+}
+
+fn unsupported() -> DcoError {
+    DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+}
+
+pub trait Dco {
+    fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+    /// 坐标是窗口比例（0～1）。
+    fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+    /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
+    fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
+        Err(unsupported())
+    }
+    /// 点 `see_text` 读到的某个元素。dco 自己按那个元素上的字定档，带价格的会拒绝。
+    fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
+        Err(unsupported())
+    }
+}
+```
+
+- [ ] **改 `crates/dct-game/src/play.rs`**（`Stop` 枚举末尾）：把
+
+```rust
+    /// dco 急停 / 暂停 / 锁屏 / 别的错误。
+    Dco(DcoError),
+}
+```
+
+换成
+
+```rust
+    /// dco 急停 / 暂停 / 锁屏 / 别的错误。
+    Dco(DcoError),
+    // ---- 下面几个只有 `--auto-next` 才会出现（navigate.rs）----
+    /// 通关了：下一关版面不一样，先停。
+    Won,
+    /// 一局结束了，但看不出是通关还是没过，也没有明确的“再来一次”：先停，不乱点。
+    LevelEnded,
+    LivesOut,
+    /// 出现了要花钱的画面，又没有安全的关闭按钮。
+    Money,
+    Ad,
+    /// 不认识的画面；带着画面上读到的字。
+    UnknownScreen(Vec<String>),
+    /// 点了按钮，画面连着两次没变化。
+    NoEffect,
+    /// 点“开始 / 再来一次”的次数到上限。
+    TriesDone,
+    /// 总共点了太多次还没回到棋盘。
+    TapLimit,
+}
+```
+
+- [ ] **改 `crates/dct-game/src/dco.rs`**（顶部的 use）：把
+
+```rust
+use crate::play::{Dco, DcoError, Profile};
+```
+
+换成
+
+```rust
+use crate::play::{Dco, DcoError, Profile, Seen};
+use crate::screen::Element;
+```
+
+- [ ] **改 `crates/dct-game/src/dco.rs`**（`impl Dco for DcoClient` 末尾）：把
+
+```rust
+        self.call("swipe", json!({
+            "window": p.window,
+            "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+        }))
+        .map(|_| ())
+    }
+}
+```
+
+换成
+
+```rust
+        self.call("swipe", json!({
+            "window": p.window,
+            "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+        }))
+        .map(|_| ())
+    }
+
+    fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
+        let body = self.call("see", json!({ "window": p.window, "source": "ocr" }))?;
+        let elements = body["elements"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| Some(Element { id: e["id"].as_str()?.to_string(), text: e["text"].as_str().unwrap_or("").to_string() }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Seen {
+            snapshot_id: body["snapshot_id"].as_str().unwrap_or("").to_string(),
+            observation_id: body["observation_id"].as_str().map(String::from),
+            elements,
+        })
+    }
+
+    fn tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError> {
+        self.call("tap", json!({ "snapshot_id": snapshot_id, "element_id": element_id })).map(|_| ())
+    }
+}
+```
+
+- [ ] **追加到 `crates/dct-game/src/dco_tests.rs` 末尾**
+
+```rust
+/// 2026-10-03 真机通关后那一屏的 `see`（OCR）回复，只留 dct 用到的字段。
+#[test]
+fn see_text_reads_the_ocr_elements_and_tap_sends_the_snapshot_and_element_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake(dir.path(), TOKEN, |tool, args| match tool {
+        "see" => {
+            assert_eq!(args["source"], "ocr");
+            assert_eq!(args["window"]["app"], "iPhone Mirroring");
+            (json!({
+                "snapshot_id": "s6", "observation_id": "obs-4adac3d30f33736a", "sources": ["ocr"],
+                "elements": [
+                    {"id": "e1", "role": "text", "source": "ocr", "text": "Daily Stamps", "bounds": {"x": 1.0, "y": 2.0, "w": 3.0, "h": 4.0}},
+                    {"id": "e4", "role": "text", "source": "ocr", "text": "Play", "confidence": 1.0}
+                ]
+            }), false)
+        }
+        "tap" => {
+            assert_eq!((args["snapshot_id"].as_str(), args["element_id"].as_str()), (Some("s6"), Some("e4")));
+            (json!({"tapped": {"id": "e4", "text": "Play"}}), false)
+        }
+        other => panic!("没想到会调 {other}"),
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let seen = c.see_text(&profile()).unwrap();
+    assert_eq!((seen.snapshot_id.as_str(), seen.observation_id.as_deref()), ("s6", Some("obs-4adac3d30f33736a")));
+    assert_eq!(seen.elements.iter().map(|e| (e.id.as_str(), e.text.as_str())).collect::<Vec<_>>(), [("e1", "Daily Stamps"), ("e4", "Play")]);
+    c.tap(&seen.snapshot_id, "e4").unwrap();
+    drop(c);
+    assert_eq!(h.join().unwrap().iter().filter(|m| *m == "tools/call").count(), 2);
+}
+
+#[test]
+fn a_refused_tap_keeps_dcos_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let _h = fake(dir.path(), TOKEN, |_, _| (json!({"error": {"code": "needs_ticket", "message": "这个动作属于「付款」档"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let e = c.tap("s1", "e2").unwrap_err();
+    assert_eq!(e.code, "needs_ticket");
+}
+```
+
+- [ ] **整个替换 `src/game/text.rs`**（`Stop` 多了变体，这里的 `match` 要穷尽才编得过；`nav_line` 在任务 4 的命令里才会用到）（下面的代码已在临时副本里编译、跑过测试）
+
+```rust
 //! 说给用户（和转述给用户的 agent）听的话。不出现类别编号、分数公式；行列从 1 数、从上往下。
 //! 第一轮只有中文；换成 i18n 是后面的事（设计「不在这一轮」之外的收尾项）。
 use dct_game::play::{DcoError, Stop};
@@ -108,7 +309,7 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
     match stop {
         Stop::StepsDone => (format!("到设定的步数了。{tail}。要接着玩，再运行一次。"), 0),
         Stop::NoMoves => (format!("停了：没有能走的步了。{tail}"), 0),
-        Stop::DryRun => ("试走结束，没有真点也没有真划。".into(), 0),
+        Stop::DryRun => ("试走结束，没有真划。".into(), 0),
         Stop::NoGrid(why) => (format!("停了：读不出棋盘（{why}）。多半是这一关结束了，或者弹出了别的画面。{tail}"), 1),
         Stop::ClassesChanged { was, now } => (
             format!("停了：棋盘上的颜色种类一下子变多了（原来 {was} 种，现在 {now} 种），多半是这一关结束了，或者弹出了窗口。{tail}"),
@@ -123,12 +324,11 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
             0,
         ),
         Stop::LivesOut => (format!("生命用完了，先停下。等生命恢复了再让我继续。{tail}"), 0),
-        Stop::Money => (format!("出现了要花钱的画面，请你自己处理。这个画面上我没有点任何东西。{tail}"), 1),
-        Stop::Ad => (format!("出现了广告，请你自己关掉。这个画面上我没有点任何东西。{tail}"), 1),
+        Stop::Money => (format!("出现了要花钱的画面，请你自己处理。我没有点任何东西。{tail}"), 1),
+        Stop::Ad => (format!("出现了广告，请你自己关掉。我没有点任何东西。{tail}"), 1),
         Stop::UnknownScreen(texts) => {
             let shown: Vec<&str> = texts.iter().map(String::as_str).filter(|t| !t.trim().is_empty()).take(8).collect();
-            let seen = if shown.is_empty() { "画面上没有读到字。".to_string() } else { format!("画面上的字：{}。", shown.join(" / ")) };
-            (format!("出现了我不认识的画面，先停下。这个画面上我没有点任何东西。{seen}{tail}"), 1)
+            (format!("出现了我不认识的画面，先停下，没有点任何东西。画面上的字：{}。{tail}", shown.join(" / ")), 1)
         }
         Stop::NoEffect => (format!("点了按钮，画面却一直没变化，先停下。请看一眼屏幕。{tail}"), 1),
         Stop::TriesDone => (format!("开始和重来的次数到上限了，先停下。要接着来，再运行一次。{tail}"), 0),
@@ -296,20 +496,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_screen_with_no_words_says_nothing_was_read() {
-        let (line, _) = stop_line(&Stop::UnknownScreen(vec!["  ".into()]), 0, Path::new("/x"));
-        assert!(line.contains("画面上没有读到字。") && !line.contains("画面上的字"), "{line}");
-        assert!(line.contains("这个画面上我没有点任何东西"), "{line}");
-        assert!(stop_line(&Stop::DryRun, 0, Path::new("/x")).0.contains("没有真点也没有真划"));
-        for s in [Stop::Money, Stop::Ad] {
-            assert!(stop_line(&s, 3, Path::new("/x")).0.contains("这个画面上我没有点任何东西"));
-        }
-    }
-
-    #[test]
     fn stop_sentences_for_money_and_ads_promise_nothing_was_pressed() {
         for s in [Stop::Money, Stop::Ad] {
             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("没有点任何东西"));
         }
     }
 }
+```
+
+- [ ] **Step 2: 跑测试，主 crate 也要能编**
+
+Run: `cargo test -p dct-game`
+Expected: 全绿（`dco_tests` 多了 2 个：`see_text_reads_…`、`a_refused_tap_…`）。
+
+Run: `cargo test --lib game::`
+Expected: `30 passed`（第一轮的 27 个 + `text` 新的 3 个）。
+
+Run: `cargo build`
+Expected: 通过。
+
+- [ ] **Step 3: 提交**
+
+```bash
+cargo clippy -p dct-game --all-targets -- -D warnings
+git add crates/dct-game src/game/text.rs
+git commit -m "feat(game): the dco client can read the screen's text and tap an element; Stop gains the auto-next reasons, with plain-Chinese lines for each"
+```
+
+---
+

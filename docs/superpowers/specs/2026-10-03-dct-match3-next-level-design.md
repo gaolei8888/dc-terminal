@@ -38,7 +38,7 @@
 | 4 | `Money` | 任何元素带价格符号（¥ ￥ $ € £ 💎）、金币 / 钻石 / 购买 / 支付 / 充值，或整词 buy / purchase / pay / checkout / gold / gem(s) / bar(s) | **停**，说「出现了要花钱的画面，请你自己处理」 |
 | 5 | `Ad` | 任何元素里有整词 ad / ads / advert / advertisement，例如 `Watch ad`、`Watch an ad for a sweet treat` | **停**，说「出现了广告，请你自己关掉」 |
 | 6 | `Retry` | 有一个元素整条正好是 Try again / Retry / 再试一次 / 重试 | 点它重来 |
-| 7 | `PlayButton` | **恰好一个**元素整条正好是 Play / Start / 开始 / 开始游戏；两个或更多个都正好是 → 当作 `Unknown` | 点它 |
+| 7 | `PlayButton` | **恰好一个**元素整条正好是 Play / Start / 开始 / 开始游戏；两个或更多个都正好是 → `Ambiguous` | 点它 |
 | 8 | `Board`/`Unknown` | 不是上面任何一种：`read_grid` 读得出（至少 3 个「大」类别）就玩，读不出就是不认识的画面 | 玩一局 / **停**，把所有文字记进记录，说「出现了我不认识的画面」 |
 
 两处和这份设计最初写的不同（2026-10-03 写原型时想清楚的，已按这个实现）：
@@ -50,6 +50,11 @@
 - 两个 Play 的识别靠「整条文字正好是 Play」：OCR 常把紫色那个读成 `B Play` / `E Play`，所以只有粉色的是正好的 `Play`。**如果两个都读成了正好的 `Play`，就按上面「恰好一个」规则停下**，不猜哪个是粉色的。
 - 不要点 `Save My Progress`（登录账号），它不在白名单里，所以不会被点。
 - 地图上的关卡按钮只有数字（`1712`），dco 不让点（没有真正的字）。所以「从地图进某一关」这一步，本设计做不到：停下，等用户点。
+
+- 两个以上整条正好是 Play 的 → `Ambiguous`，停（不去读棋盘）。
+- 刚玩完一局之后遇到不认识的画面，不再去读棋盘当棋盘划，直接停（`unknown_screen`）。弹窗可能读得出「棋盘」，划下去会划到按钮上。
+- Try again 之后只有开局框（只认文字里有 Select boosters 的画面）里的 Play 才算同一次重来；别的画面里的 Play 照样按 `level_ended` 停。
+- 步数刚好在一局结束时用完，会看一眼屏幕再停（什么都不点），不会让人「再运行一次」就按下一关的 Play。
 
 说明：
 - 「整条文字正好是」是故意的：`Play now for 💎 5` 不会被当作 Play。
@@ -69,7 +74,7 @@ dct game play --auto-next [--steps N] [--tries N]
     5. 重来次数（点 Play / Try again 的次数）到 --tries（默认 5）→ 停
 ```
 
-- `--steps`：一局里最多走几步（沿用第一轮，默认 20）。**auto-next 下它是整个命令一共最多走的步数**，不是每局，免得 agent 的命令超时（默认 60，范围 1～200）。
+- `--steps`：一局里最多走几步（沿用第一轮，默认 20）。**auto-next 下它是整个命令一共最多走的步数**，不是每局，免得 agent 的命令超时（默认 20，范围 1～200，和第一轮一样；agent 的命令有超时，一步连动画约 2.3 秒；再运行一次会接着打同一关）。
 - `--tries`：整个命令最多点几次「开始/重来」，默认 5，范围 1～20。每一次重来都会用掉一条生命，所以有上限。
 - 不带 `--auto-next` 时行为和第一轮完全一样（打完一关就停），所以现有的说明卡和用法不变。
 - 命令输出一句一句的大白话，例如：「点了 Play，开始新的一局」「关掉了一个弹窗（Not now）」「这一局没过，重来（第 2 次）」，最后一句说清为什么停。
@@ -80,8 +85,8 @@ dct game play --auto-next [--steps N] [--tries N]
 
 ```json
 {"schema":1,"kind":"nav","run_id":"…","time_ms":…,"observation_id":"obs-…",
- "screen":"dismiss|play|failed|won|lives_out|money|unknown|board",
- "texts":["Daily Stamps","Play"], "tapped":"Play"|null, "outcome":"changed|no_effect|stopped"}
+ "screen":"play|retry|dismiss|won|lives_out|money|ad|ambiguous|unknown|level_ended|board",
+ "texts":["Daily Stamps","Play"], "tapped":"Play"|null, "outcome":"changed|no_effect|stopped|dry_run|entered"}
 ```
 
 `texts` 就是 OCR 读到的全部文字——这是之后补白名单的证据。停下来的最后一行（`stop`）新增原因码：`won`、`level_ended`、`lives_out`、`money`、`ad`、`unknown_screen`、`no_effect`、`tries_done`、`tap_limit`（整个命令点了 40 次还没回到棋盘）。
@@ -106,6 +111,7 @@ dct game play --auto-next [--steps N] [--tries N]
 
 ## 已知的限制
 
+- 下一关要用户自己开：从通关画面重新运行会点那个 Play，那是用户的决定，自动认新棋盘做好之前这一步由用户负责。
 - 只认英文字（用户的 iPhone 是英文界面）；中文词表放了常见的几个，没有真机验证。
 - 打赢以后停、不进下一关：这是故意的，等自动调参。
 - 「看广告领奖励」「用金条买步数」一律不点，也不替用户点叉叉关广告；需要用户自己处理。活动弹窗里的 `Claim` / `Collect` 不放白名单（常连着「看广告再领」），遇到会停；`Got it` / `Tap to continue` / `Next` 放进去了（教程和说明，dc-octo 真机上用普通 tap 点过）。

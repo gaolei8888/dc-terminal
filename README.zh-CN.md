@@ -675,6 +675,16 @@ WiFi 下**的手机扫一下，就能看到你的会话、每个会话的实时�
   `/live/*` 和公开列表页 `/`**；要开「公开到固定地址」，运营方还得用
   `dct-srv key add`/`--publish-keys` 签发并装上发布密钥。
 
+## 让 AI 玩三消游戏（Mac）
+
+在 iPhone 镜像里打开 Candy Crush 的一关，然后在 dct 的会话里对 AI 说「帮我玩一关 Candy Crush」。
+dct 读棋盘、按规则选步、让 dco 划，每步不到一秒；每一步的棋盘、所有能走的步和选择都记在 `~/.dct/games/log/`。
+也可以自己运行：`dct game play [--steps 20] [--dry-run]`。棋盘的位置写在 `~/.dct/games/candy-crush.toml`（没有这个文件就用内置的）。
+
+加上 `--auto-next`，一局没过时它会自己点「Try again」「Play」重来；弹窗只关「Close」「Not now」「No thanks」这类安全的；
+遇到要花钱、广告、生命用完、通关、不认识的画面就停下，什么都不点（`--tries` 限制重来的次数，默认 5，每次都会用掉一条生命）。
+打赢以后不会自动进下一关：下一关的棋盘位置不一样，要等「自动认新棋盘」做好。
+
 ## 多电脑
 
 家里一台 Mac、公司一台 Windows，各开着几个 agent：让它们互相留言、派活。

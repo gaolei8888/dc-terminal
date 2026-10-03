@@ -817,6 +817,17 @@ your terminal.**
   "publish to a fixed address," the operator also issues and installs a publish
   key with `dct-srv key add`/`--publish-keys`.
 
+## Let the AI play a match-3 game (Mac)
+
+Open a Candy Crush level in iPhone Mirroring, then tell the AI in a dct session: "play a Candy Crush level for me".
+dct reads the board, picks moves by its rules and has dco swipe them, under a second per move. For every move, the board,
+every move that was possible and the choice are recorded in `~/.dct/games/log/`.
+You can also run it yourself: `dct game play [--steps 20] [--dry-run]`. Where the board is on screen is written in `~/.dct/games/candy-crush.toml` (without that file, the built-in one is used).
+
+Add `--auto-next` and, when a level is lost, it presses "Try again" and "Play" by itself to start over. For popups it only closes the safe ones, such as "Close", "Not now" and "No thanks".
+It stops and presses nothing when it meets something that costs money, an ad, no lives left, a cleared level or a screen it does not know (`--tries` limits how many times it starts over, 5 by default; each try uses up one life).
+After a win it does not go on to the next level by itself: the board sits in a different place on the next level, so that has to wait until "recognise a new board automatically" is built.
+
 ## Several computers
 
 A Mac at home, a Windows box at work, a few agents on each: let them leave each

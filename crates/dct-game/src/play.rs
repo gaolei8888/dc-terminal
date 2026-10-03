@@ -2,6 +2,7 @@
 //! 跟 dco 说话（`Dco`）和计时（`Clock`）都是传进来的，所以测试里换成假的，不碰真机也不真睡觉。
 use crate::board::{Board, GridRead};
 use crate::choose::{choose, Candidate};
+use crate::screen::Element;
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
@@ -19,10 +20,30 @@ pub struct DcoError {
     pub message: String,
 }
 
+/// 一次 `see`（OCR）：画面上读到的字和它们的编号。`snapshot_id` 要原样交给 `tap`。
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub snapshot_id: String,
+    pub observation_id: Option<String>,
+    pub elements: Vec<Element>,
+}
+
+fn unsupported() -> DcoError {
+    DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+}
+
 pub trait Dco {
     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
     /// 坐标是窗口比例（0～1）。
     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+    /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
+    fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
+        Err(unsupported())
+    }
+    /// 点 `see_text` 读到的某个元素。dco 自己按那个元素上的字定档，带价格的会拒绝。
+    fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
+        Err(unsupported())
+    }
 }
 
 pub trait Clock {
@@ -50,6 +71,23 @@ pub enum Stop {
     DryRun,
     /// dco 急停 / 暂停 / 锁屏 / 别的错误。
     Dco(DcoError),
+    // ---- 下面几个只有 `--auto-next` 才会出现（navigate.rs）----
+    /// 通关了：下一关版面不一样，先停。
+    Won,
+    /// 一局结束了，但看不出是通关还是没过，也没有明确的“再来一次”：先停，不乱点。
+    LevelEnded,
+    LivesOut,
+    /// 出现了要花钱的画面，又没有安全的关闭按钮。
+    Money,
+    Ad,
+    /// 不认识的画面；带着画面上读到的字。
+    UnknownScreen(Vec<String>),
+    /// 点了按钮，画面连着两次没变化。
+    NoEffect,
+    /// 点“开始 / 再来一次”的次数到上限。
+    TriesDone,
+    /// 总共点了太多次还没回到棋盘。
+    TapLimit,
 }
 
 pub struct Summary {

@@ -4,7 +4,9 @@ pub mod board;
 pub mod choose;
 #[cfg(unix)]
 pub mod dco;
+pub mod navigate;
 pub mod play;
+pub mod screen;
 pub mod sim;
 
 pub use board::{Board, BoardError, Cell, GridRead};

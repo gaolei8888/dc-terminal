@@ -1,3 +1,18 @@
+### Task 4: 大白话、命令行开关、说明卡
+
+**Files:**
+- Modify: `src/game/cli.rs`、`src/game/skill.md`
+
+**Interfaces:**
+- Consumes: 任务 2、3 的 `Stop` 新变体、`auto_next`、`NavOptions`。
+- Produces: `dct game play --auto-next [--tries N]`（`--tries` 1～20，默认 5；不带 `--auto-next` 行为和第一轮完全一样）；记录里 `kind:"nav"` 的行也写进日志，屏幕上用 `text::nav_line` 印一句话。
+
+下面两个文件**整个换成**给出的内容（它们是第一轮文件加上这一步的改动，已在临时副本里编译、测过）。
+
+
+- [ ] **整个替换 `src/game/cli.rs`**（下面的代码已在临时副本里编译、跑过测试）
+
+```rust
 //! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N]`。
 
 const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5]";
@@ -173,3 +188,83 @@ mod tests {
         }
     }
 }
+```
+
+- [ ] **整个替换 `src/game/skill.md`**（下面的代码已在临时副本里编译、跑过测试）
+
+```markdown
+---
+name: dct-game
+description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。运行 dct game play，按规则一步一步玩，每步很快，不用截图问大模型。
+---
+<!-- dct-managed: dct-game-skill v1 -->
+
+# 玩三消游戏
+
+用户说「帮我玩一关 Candy Crush」「帮我消几步」「玩一会儿三消」之类的话，就用这个办法。
+
+## 开始之前
+
+- 用户要先在 iPhone 镜像里把游戏打开，进到一关里。这一步你不要代劳：关卡按钮、道具、付款都不要自己去点。
+- 如果用户还没开游戏，告诉他先打开，再回来说一声。
+
+## 怎么玩
+
+运行：
+
+    dct game play
+
+它会一步一步玩，最多 20 步，每走一步就印一行，例如：
+
+    第 3 步：第 7 行第 2 列 ↔ 第 7 行第 3 列，消 4 颗，做出条纹糖（读 2 ms，选 0 ms，划 262 ms）
+
+- 把每一步的话转述给用户，用大白话，不用解释内部细节。
+- 命令结束以后，告诉用户这次走了几步、为什么停；步数到了的话问他要不要接着玩，要就再运行一次。
+- 想先看看它会怎么走、但不真的划：`dct game play --dry-run`。
+- 想一次多走几步：`dct game play --steps 50`（最多 200）。
+
+## 想让它失败了自己重来、一直玩
+
+用户说「失败了自己重来」「一直玩」「帮我多打几局」，就运行：
+
+    dct game play --auto-next
+
+可以加 `--steps 50`（一共最多走几步棋）和 `--tries 3`（最多点几次「开始」「重来」，默认 5，每一次都会用掉一条生命）。它会：
+
+- 一局没过时，自己点「Try again」「Play」重来同一关；
+- 弹窗只关「Close」「Not now」「No thanks」这一类安全的，其它一律不点；
+- 遇到要花钱的画面、广告、生命用完、通关了、不认识的画面，就停下，什么都不点；
+- 也会一边做一边印一行，例如「点了「Play」，开始新的一局」「这一局没过，点了「Try again」重来」。
+
+把这些话转述给用户。它停下以后，把最后一句话原样告诉用户（比如「生命用完了」「出现了广告，请你自己关掉」），由用户决定下一步。
+
+## 停
+
+- 用户说「停」，马上中断这条命令。
+- 命令自己停下时（没有能走的步、读不出棋盘、画面一直在动、连着两次没反应、dco 急停），把它印的最后一句话原样告诉用户。
+- 不要自己去点屏幕补救，也不要换别的办法去操作游戏；让用户决定下一步。
+
+## 不要做
+
+- 不要自己调用 dco 去点关卡按钮、道具、广告、付款。`--auto-next` 停下以后，也不要替它去点屏幕上的按钮、关广告或买东西。
+- 不要同时开两条 `dct game play`。
+```
+
+- [ ] **Step 2: 跑测试，并确认主 crate 又能编**
+
+Run: `cargo test --lib game::`
+Expected: `31 passed`（任务 2 之后的 30 个 + `cli` 新的 1 个）。
+
+Run: `cargo build`
+Expected: 通过。
+
+- [ ] **Step 3: 提交**
+
+```bash
+cargo clippy --workspace --all-targets --locked -- -D warnings
+git add src/game
+git commit -m "feat(game): dct game play --auto-next and --tries, and the skill card learns the flag"
+```
+
+---
+
