@@ -2,7 +2,7 @@
 //! 认出生命用完、价格、广告、不认识的画面就停。打赢也停：下一关的版面不一样，现在的棋盘位置读不对。
 //! 跟 dco 说话和计时都是传进来的（同 `play`），所以测试里换成假的。
 use crate::play::{play, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
-use crate::screen::{classify, Element, Screen};
+use crate::screen::{classify, is_level_start, Element, Screen};
 use serde_json::{json, Value};
 
 pub struct NavOptions {
@@ -56,8 +56,9 @@ fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Se
 
 pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions, sink: &mut dyn FnMut(Value)) -> Summary {
     let (mut steps, mut tries, mut taps, mut no_effect) = (0usize, 0usize, 0usize, 0usize);
-    // after_board：刚玩完一局，还没有被明确告知“再来一次”。这时看到的 Play 可能是通关后的下一关，不点。
-    let (mut after_board, mut retrying, mut free_play) = (false, false, false);
+    // after_board：刚玩完一局，还没有进过新棋盘。这时看到的 Play 可能是通关后的下一关，不点。
+    // free_play：刚点过“再来一次”，接下来“开局框”里的那个 Play 是同一次重来，不另算、也放行。
+    let (mut after_board, mut free_play) = (false, false);
     let stop = loop {
         let seen = match dco.see_text(p) {
             Ok(s) => s,
@@ -82,6 +83,10 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                 sink(nav_record(clock, &seen, "ad", None, "stopped"));
                 break Stop::Ad;
             }
+            Screen::Ambiguous => {
+                sink(nav_record(clock, &seen, "ambiguous", None, "stopped"));
+                break Stop::UnknownScreen(texts(&seen));
+            }
             Screen::Dismiss(el) => ("dismiss", el),
             Screen::Retry(el) => {
                 if tries >= o.tries {
@@ -91,35 +96,61 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                 ("retry", el)
             }
             Screen::PlayButton(el) => {
-                if after_board && !retrying {
-                    sink(nav_record(clock, &seen, "level_ended", None, "stopped"));
-                    break Stop::LevelEnded;
-                }
-                if !free_play && tries >= o.tries {
+                if after_board {
+                    if !(free_play && is_level_start(&seen.elements)) {
+                        sink(nav_record(clock, &seen, "level_ended", None, "stopped"));
+                        break Stop::LevelEnded;
+                    }
+                    // 重来的那个 Play：不查次数，也不另算一次。
+                } else if tries >= o.tries {
                     sink(nav_record(clock, &seen, "play", None, "stopped"));
                     break Stop::TriesDone;
                 }
                 ("play", el)
             }
             Screen::Unknown => {
+                // 刚玩完一局遇到不认识的画面：弹窗也可能读得出“棋盘”，不去读，直接停。
+                if after_board {
+                    sink(nav_record(clock, &seen, "unknown", None, "stopped"));
+                    break Stop::UnknownScreen(texts(&seen));
+                }
                 // 不是任何已知的按钮画面：看看是不是棋盘。
                 match dco.read_grid(p) {
                     Ok(g) if g.classes.iter().filter(|c| c.count >= 2).count() >= 3 => {
                         let remaining = o.max_steps.saturating_sub(steps);
-                        if remaining == 0 {
-                            break Stop::StepsDone;
-                        }
+                        // 这个画面的字是以后“像棋盘”判断的证据。
+                        sink(nav_record(clock, &seen, "board", None, "entered"));
                         let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run }, sink);
                         steps += s.steps;
                         match s.stop {
                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
                             Stop::NoGrid(_) | Stop::ClassesChanged { .. } => {
-                                // 步数刚好在一局结束时用完：别再去点“再来一次”。
+                                // 一步都没走：这个画面从来不是我们玩过的棋盘，停，免得原地打转。
+                                if s.steps == 0 {
+                                    sink(nav_record(clock, &seen, "unknown", None, "stopped"));
+                                    break Stop::UnknownScreen(texts(&seen));
+                                }
+                                // 步数刚好在一局结束时用完：看一眼是什么画面再停，什么都不点。
                                 if steps >= o.max_steps {
-                                    break Stop::StepsDone;
+                                    let end = match dco.see_text(p) {
+                                        Ok(e) => e,
+                                        Err(e) => break Stop::Dco(e),
+                                    };
+                                    let (name, stop) = match classify(&end.elements) {
+                                        Screen::Retry(_) => ("retry", Stop::StepsDone),
+                                        Screen::LivesOut => ("lives_out", Stop::LivesOut),
+                                        Screen::Won => ("won", Stop::Won),
+                                        Screen::Money => ("money", Stop::Money),
+                                        Screen::Ad => ("ad", Stop::Ad),
+                                        Screen::Dismiss(_) => ("dismiss", Stop::LevelEnded),
+                                        Screen::PlayButton(_) => ("play", Stop::LevelEnded),
+                                        Screen::Ambiguous => ("ambiguous", Stop::LevelEnded),
+                                        Screen::Unknown => ("unknown", Stop::LevelEnded),
+                                    };
+                                    sink(nav_record(clock, &end, name, None, "stopped"));
+                                    break stop;
                                 }
                                 after_board = true;
-                                retrying = false;
                                 free_play = false;
                                 no_effect = 0;
                                 continue;
@@ -148,7 +179,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             break Stop::TapLimit;
         }
         taps += 1;
-        if kind == "play" && free_play {
+        if kind == "play" && after_board {
             free_play = false;
         } else if kind != "dismiss" {
             tries += 1;
@@ -158,9 +189,11 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                 sink(nav_record(clock, &seen, kind, Some(&el.text), "changed"));
                 no_effect = 0;
                 if kind == "retry" {
-                    after_board = false;
-                    retrying = true;
                     free_play = true;
+                }
+                if kind == "play" && after_board {
+                    // 重来的 Play 点成了：现在在新的一局里，棋盘可以读、可以玩。
+                    after_board = false;
                 }
             }
             Ok(false) => {
@@ -205,6 +238,8 @@ mod tests {
     enum Frame {
         Text(Vec<&'static str>),
         Board(GridRead),
+        /// 读文字是这些字，读棋盘却读得出来（弹窗被当成棋盘的情形）。
+        TextGrid(Vec<&'static str>, GridRead),
     }
 
     /// 一个按帧往前走的假世界：点了按钮、划了一下，就换到下一帧；最后一帧停在那里。
@@ -243,7 +278,7 @@ mod tests {
     impl Dco for World {
         fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
             match &self.frames[self.at] {
-                Frame::Board(g) => Ok(g.clone()),
+                Frame::Board(g) | Frame::TextGrid(_, g) => Ok(g.clone()),
                 Frame::Text(_) => Err(DcoError { code: "not_a_grid".into(), message: "这块区域分不清类别".into() }),
             }
         }
@@ -257,7 +292,7 @@ mod tests {
                 return Err(e);
             }
             let texts: Vec<&str> = match &self.frames[self.at] {
-                Frame::Text(t) => t.clone(),
+                Frame::Text(t) | Frame::TextGrid(t, _) => t.clone(),
                 Frame::Board(_) => vec!["38", "90"],
             };
             Ok(Seen {
@@ -274,7 +309,7 @@ mod tests {
             assert_eq!(snapshot_id, format!("s{}", self.at), "点的不是刚读到的那一屏");
             let text = match &self.frames[self.at] {
                 Frame::Text(t) => t[element_id.trim_start_matches('e').parse::<usize>().unwrap() - 1].to_string(),
-                Frame::Board(_) => panic!("棋盘上不该点按钮"),
+                Frame::Board(_) | Frame::TextGrid(..) => panic!("棋盘上不该点按钮"),
             };
             self.taps.push(text);
             let stuck = if self.stuck_script.is_empty() { self.stuck } else { self.stuck_script.remove(0) };
@@ -335,7 +370,7 @@ mod tests {
         assert_eq!(w.taps, ["Try again", "Play"]);
         assert_eq!(w.swipes, 1);
         let screens: Vec<&str> = log.iter().filter(|r| r["kind"] == "nav").map(|r| r["screen"].as_str().unwrap()).collect();
-        assert_eq!(screens, ["retry", "play"]);
+        assert_eq!(screens, ["board", "retry", "play", "board"]);
         // 每条 nav 记录都带着画面上的字（以后补白名单的证据）
         assert!(log.iter().filter(|r| r["kind"] == "nav").all(|r| r["texts"].as_array().unwrap().len() >= 2));
     }
@@ -396,7 +431,7 @@ mod tests {
             board(A),
             text(&["Out of moves", "Continue for 💎 5", "No thanks"]),
             text(&["Out of moves", "Try again"]),
-            text(&["Play"]),
+            text(&["Level 1712", "Select boosters:", "Play"]),
             board(DEAD),
         ]);
         let (s, _) = run(&mut w, 5, false);
@@ -477,7 +512,7 @@ mod tests {
 
     #[test]
     fn a_spent_step_budget_stops_before_retrying_the_next_level() {
-        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Play"]), board(DEAD)]);
+        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Level 1712", "Select boosters:", "Play"]), board(DEAD)]);
         let (s, _) = run_with(&mut w, 1, 5, false);
         assert_eq!(s.stop, Stop::StepsDone);
         assert!(w.taps.is_empty());
@@ -497,7 +532,7 @@ mod tests {
         let mut w = World::new(vec![
             board(A),
             text(&["Out of moves", "Try again"]),
-            text(&["Play"]),
+            text(&["Level 1712", "Select boosters:", "Play"]),
             board(A),
             text(&["Out of moves", "Try again"]),
         ]);
@@ -521,14 +556,84 @@ mod tests {
         let mut w = World::new(vec![
             board(A),
             text(&["Out of moves", "Try again"]),
-            text(&["Play"]),
+            text(&["Level 1712", "Select boosters:", "Play"]),
             board(A),
             text(&["Out of moves", "Try again"]),
-            text(&["Play"]),
+            text(&["Level 1712", "Select boosters:", "Play"]),
             board(DEAD),
         ]);
         let (s, _) = run(&mut w, 2, false);
         assert_eq!(s.stop, Stop::NoMoves);
         assert_eq!(w.taps, ["Try again", "Play", "Try again", "Play"]);
+    }
+
+    const FIVE: &[&[u16]] = &[&[1, 1, 2, 2], &[3, 3, 4, 4], &[5, 5, 1, 2]];
+
+    #[test]
+    fn an_unknown_screen_that_reads_as_a_grid_is_not_swiped_after_a_level() {
+        let mut w = World::new(vec![board(A), Frame::TextGrid(vec!["Out of moves!", "+5", "Play on", "9"], grid(FIVE))]);
+        let (s, _) = run(&mut w, 5, false);
+        assert!(matches!(s.stop, Stop::UnknownScreen(_)), "{:?}", s.stop);
+        assert_eq!(w.swipes, 1);
+        assert!(w.taps.is_empty());
+    }
+
+    #[test]
+    fn two_plays_on_one_screen_stop_without_pressing_or_swiping() {
+        let mut w = World::new(vec![text(&["Play", "Play"]), board(A)]);
+        let (s, log) = run(&mut w, 5, false);
+        assert!(matches!(s.stop, Stop::UnknownScreen(_)), "{:?}", s.stop);
+        assert!(w.taps.is_empty());
+        assert_eq!(w.swipes, 0);
+        let last = log.last().unwrap();
+        assert_eq!((last["screen"].as_str(), last["outcome"].as_str()), (Some("ambiguous"), Some("stopped")));
+    }
+
+    #[test]
+    fn entering_a_board_from_unknown_text_records_the_screens_words() {
+        let mut w = World::new(vec![Frame::TextGrid(vec!["38", "90"], grid(DEAD))]);
+        let (_, log) = run(&mut w, 5, false);
+        let r = log.iter().find(|r| r["screen"] == "board").expect("no board record");
+        assert_eq!(r["outcome"], "entered");
+        assert_eq!(r["texts"], json!(["38", "90"]));
+    }
+
+    #[test]
+    fn play_that_makes_no_move_on_a_readable_grid_stops_instead_of_looping() {
+        // rows/cols 和 cells 对不上：Board::from_read 失败，play 一步没走
+        let bad: GridRead = serde_json::from_value(json!({
+            "rows": 2, "cols": 2, "cells": [[1, 1, 2, 2], [3, 3, 1, 2]], "odd": [[false, false], [false, false]],
+            "classes": [{"id": 1, "count": 3}, {"id": 2, "count": 3}, {"id": 3, "count": 2}]
+        }))
+        .unwrap();
+        let mut w = World::new(vec![Frame::TextGrid(vec!["38", "90"], bad)]);
+        let (s, log) = run(&mut w, 5, false);
+        assert!(matches!(s.stop, Stop::UnknownScreen(_)), "{:?}", s.stop);
+        assert_eq!(log.last().unwrap()["screen"], "unknown");
+    }
+
+    #[test]
+    fn a_step_budget_spent_at_the_end_of_a_level_looks_at_the_screen_once() {
+        for (frame, want) in [
+            (text(&["Out of moves", "Try again"]), Stop::StepsDone),
+            (text(&["Daily Stamps", "Play"]), Stop::LevelEnded),
+            (text(&["Level Complete!"]), Stop::Won),
+            (text(&["No more lives", "Ask friends"]), Stop::LivesOut),
+        ] {
+            let mut w = World::new(vec![board(A), frame]);
+            let (s, log) = run_with(&mut w, 1, 5, false);
+            assert_eq!(s.stop, want);
+            assert!(w.taps.is_empty());
+            let last = log.last().unwrap();
+            assert_eq!((last["outcome"].as_str(), last["tapped"].is_null()), (Some("stopped"), true));
+        }
+    }
+
+    #[test]
+    fn after_a_retry_a_play_that_is_not_the_level_start_box_is_refused() {
+        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Daily Stamps", "Play"])]);
+        let (s, _) = run(&mut w, 5, false);
+        assert_eq!(s.stop, Stop::LevelEnded);
+        assert_eq!(w.taps, ["Try again"]);
     }
 }

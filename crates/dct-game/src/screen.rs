@@ -23,6 +23,8 @@ pub enum Screen {
     Retry(Element),
     /// 恰好一个整条文字正好是“开始”的按钮。
     PlayButton(Element),
+    /// 两个以上整条正好是“开始”的按钮：分不清该点哪个，停。
+    Ambiguous,
     Unknown,
 }
 
@@ -99,7 +101,23 @@ pub fn classify(els: &[Element]) -> Screen {
     if plays.len() == 1 {
         return Screen::PlayButton(plays[0].clone());
     }
+    if plays.len() >= 2 {
+        return Screen::Ambiguous;
+    }
     Screen::Unknown
+}
+
+/// 像“开局框”：文字里有 Select boosters，或者某条以 Level 加数字开头。
+pub fn is_level_start(els: &[Element]) -> bool {
+    els.iter().any(|e| {
+        if e.text.to_lowercase().contains("select boosters") {
+            return true;
+        }
+        match norm(&e.text).strip_prefix("level") {
+            Some(rest) => rest.trim_start().starts_with(|c: char| c.is_ascii_digit()),
+            None => false,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -153,8 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn two_exact_play_buttons_are_unknown_but_a_garbled_one_is_ignored() {
-        assert_eq!(classify(&els(&["Level 1712", "Select boosters:", "Play", "Play"])), Screen::Unknown);
+    fn two_exact_play_buttons_are_ambiguous_but_a_garbled_one_is_ignored() {
+        assert_eq!(classify(&els(&["Level 1712", "Select boosters:", "Play", "Play"])), Screen::Ambiguous);
         let s = classify(&els(&["Level 1712", "Select boosters:", "Play", "B Play"]));
         assert_eq!((id(&s), matches!(s, Screen::PlayButton(_))), ("e3", true));
     }
@@ -198,6 +216,16 @@ mod tests {
         for t in ["Claim", "Collect", "Continue", "OK", "Collect your daily treat!"] {
             assert_eq!(classify(&els(&[t])), Screen::Unknown, "{t}");
         }
+    }
+
+    #[test]
+    fn the_level_start_box_is_told_by_its_words() {
+        assert!(is_level_start(&els(&["Level 1712", "Select boosters:", "Play"])));
+        assert!(is_level_start(&els(&["Select boosters:"])));
+        assert!(is_level_start(&els(&["level 12"])));
+        assert!(!is_level_start(&els(&["Daily Stamps", "Play"])));
+        assert!(!is_level_start(&els(&["Level Complete!"])));
+        assert!(!is_level_start(&[]));
     }
 
     #[test]
