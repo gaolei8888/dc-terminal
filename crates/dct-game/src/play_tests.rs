@@ -168,7 +168,7 @@ fn a_clock_that_goes_backwards_does_not_panic() {
     impl Clock for Back {
         fn now_ms(&self) -> u64 {
             self.0.set(self.0.get() + 1);
-            if self.0.get() % 2 == 0 { self.1 } else { self.1 + 1_000_000 }
+            if self.0.get().is_multiple_of(2) { self.1 } else { self.1 + 1_000_000 }
         }
         fn sleep_ms(&mut self, ms: u64) {
             self.1 += ms;

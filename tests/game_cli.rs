@@ -107,7 +107,7 @@ fn a_halted_dco_stops_the_game_with_a_plain_sentence_and_a_failing_exit_code() {
     assert_eq!(lines.last().unwrap()["stop"], "dco");
     assert_eq!(lines.last().unwrap()["steps"], 0);
     assert_eq!(lines[0]["swiped"], false);
-    assert_eq!(lines[0]["candidates"][0]["features"]["cleared"].as_u64().is_some(), true);
+    assert!(lines[0]["candidates"][0]["features"]["cleared"].as_u64().is_some());
     let run = lines[0]["run_id"].as_str().unwrap();
     assert_eq!(run.len(), 8);
     assert!(lines.iter().all(|l| l["run_id"] == run), "同一次运行的记录要带同一个 run_id");
