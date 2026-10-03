@@ -44,6 +44,9 @@ pub trait Dco {
     fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
         Err(unsupported())
     }
+    /// 告诉 dco 屏幕上的小章鱼现在在“想”还是“看”。只改它的样子，所以故意不返回错误：
+    /// 这里出什么事都不许影响玩。默认什么都不做，只玩一关的假 dco 不用实现。
+    fn show_status(&mut self, _state: &str) {}
 }
 
 pub trait Clock {
@@ -209,9 +212,13 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         let Ok(board) = Board::from_read(&g) else {
             break Stop::NoGrid("棋盘的行列数对不上".into());
         };
+        // 状态调用放在计时之外，timing_ms 的 choose / read 不被它拖慢；think 之后紧跟 look，
+        // 后面不管是 NoMoves / Stuck 还是真划，都已经配成对了。
+        dco.show_status("think");
         let t_choose = clock.now_ms();
         let cands: Vec<Candidate> = choose(&board);
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
+        dco.show_status("look");
         // 同一盘棋上划了没反应的步，不再重复选。
         let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
         let Some(pick) = pick else {

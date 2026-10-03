@@ -16,6 +16,8 @@ pub struct DcoClient {
     r: BufReader<UnixStream>,
     w: UnixStream,
     next_id: u64,
+    /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
+    no_show_status: bool,
 }
 
 fn err(code: &str, message: impl Into<String>) -> DcoError {
@@ -53,7 +55,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1 };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -152,6 +154,18 @@ impl Dco for DcoClient {
             observation_id: body["observation_id"].as_str().map(String::from),
             elements,
         })
+    }
+
+    fn show_status(&mut self, state: &str) {
+        if self.no_show_status {
+            return;
+        }
+        // 结果不重要。旧 dco 没这个工具、或者超时，都别再试：超时一次就是 10 秒，每步一次游戏就拖死了。
+        if let Err(e) = self.call("show_status", json!({ "state": state })) {
+            if e.code == "dco_too_old" || e.code == "dco_timeout" {
+                self.no_show_status = true;
+            }
+        }
     }
 
     fn tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError> {

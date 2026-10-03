@@ -251,3 +251,130 @@ fn a_refused_tap_keeps_dcos_reason() {
     let e = c.tap("s1", "e2").unwrap_err();
     assert_eq!(e.code, "needs_ticket");
 }
+
+/// 假 dco：每个 show_status 之外的调用都正常回；show_status 按 `status_reply` 回（None=正常 {"ok":true}，
+/// Some((code, message))=JSON-RPC 协议错误）。返回收到的每个 (工具名, 参数)。
+fn fake_status(dir: &std::path::Path, status_reply: Option<(i64, &'static str)>) -> std::thread::JoinHandle<Vec<(String, Value)>> {
+    let sock = dir.join("dco.sock");
+    std::fs::write(dir.join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut calls = vec![];
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return calls;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            let reply = if req["method"] == "tools/call" {
+                let name = req["params"]["name"].as_str().unwrap().to_string();
+                calls.push((name.clone(), req["params"]["arguments"].clone()));
+                let body = match name.as_str() {
+                    "show_status" => {
+                        if let Some((code, message)) = status_reply {
+                            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})).unwrap();
+                            continue;
+                        }
+                        json!({"ok": true})
+                    }
+                    "read_grid" => json!({"rows":2,"cols":2,"cells":[[0,0],[1,1]],"odd":[[false,false],[false,false]],
+                        "classes":[{"id":0,"rgb":[1,2,3],"count":2},{"id":1,"rgb":[4,5,6],"count":2}],"elapsed_ms":1}),
+                    _ => json!({"swiped": true}),
+                };
+                json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": body.to_string()}], "isError": false}})
+            } else {
+                json!({"jsonrpc": "2.0", "id": id, "result": {}})
+            };
+            writeln!(w, "{reply}").unwrap();
+        }
+    })
+}
+
+fn status_calls(calls: &[(String, Value)]) -> Vec<&Value> {
+    calls.iter().filter(|(n, _)| n == "show_status").map(|(_, a)| a).collect()
+}
+
+#[test]
+fn show_status_sends_exactly_the_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), None);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status("think");
+    c.show_status("look");
+    drop(c);
+    let calls = h.join().unwrap();
+    assert_eq!(status_calls(&calls), [&json!({"state": "think"}), &json!({"state": "look"})]);
+}
+
+#[test]
+fn an_old_dco_without_show_status_is_ignored_and_never_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), Some((-32602, "unknown tool: show_status")));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status("think");
+    c.show_status("look");
+    c.read_grid(&profile()).unwrap();
+    c.swipe(&profile(), (0.3, 0.4), (0.4, 0.5)).unwrap();
+    drop(c);
+    let calls = h.join().unwrap();
+    assert_eq!(status_calls(&calls).len(), 1, "第二次不该再发");
+    assert_eq!(calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["show_status", "read_grid", "swipe"]);
+}
+
+#[test]
+fn another_show_status_error_does_not_stop_later_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), Some((-32603, "boom")));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status("think");
+    c.show_status("look");
+    c.read_grid(&profile()).unwrap();
+    drop(c);
+    assert_eq!(status_calls(&h.join().unwrap()).len(), 2);
+}
+
+#[test]
+fn a_show_status_timeout_is_not_paid_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        let mut tool_calls = 0;
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return tool_calls;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            if req["method"] == "tools/call" {
+                tool_calls += 1; // 不回话：让客户端超时
+                continue;
+            }
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {}})).unwrap();
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    c.show_status("think");
+    let t = std::time::Instant::now();
+    c.show_status("look");
+    assert!(t.elapsed() < std::time::Duration::from_millis(100));
+    drop(c);
+    assert_eq!(h.join().unwrap(), 1);
+}

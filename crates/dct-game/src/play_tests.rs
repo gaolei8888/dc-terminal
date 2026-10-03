@@ -21,10 +21,12 @@ struct Fake {
     last: Option<Result<GridRead, DcoError>>,
     swipes: Vec<((f64, f64), (f64, f64))>,
     swipe_err: Option<DcoError>,
+    /// show_status 和 swipe 按先后记下来，测“先想、再看、才划”。
+    events: Vec<String>,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![] }
     }
 }
 impl Dco for Fake {
@@ -40,7 +42,11 @@ impl Dco for Fake {
             return Err(e);
         }
         self.swipes.push((f, t));
+        self.events.push("swipe".into());
         Ok(())
+    }
+    fn show_status(&mut self, state: &str) {
+        self.events.push(state.into());
     }
 }
 struct Clk(u64);
@@ -390,4 +396,44 @@ fn a_lopsided_read_later_in_a_run_is_still_played() {
     let (s, _) = run(&mut d, 3, false);
     assert!(s.steps >= 1, "{:?}", s.stop);
     assert!(!matches!(s.stop, Stop::NoGrid(_)), "{:?}", s.stop);
+}
+
+#[test]
+fn a_step_says_think_then_look_before_the_swipe() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    let (_, _) = run(&mut d, 1, false);
+    assert_eq!(d.events, ["think", "look", "swipe"]);
+}
+
+#[test]
+fn a_dry_run_still_says_think_then_look() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let (s, _) = run(&mut d, 5, true);
+    assert_eq!(s.stop, Stop::DryRun);
+    assert_eq!(d.events, ["think", "look"]);
+}
+
+#[test]
+fn every_step_gets_its_own_think_look_pair() {
+    // 第一步划完落定在 A 的上下翻转（也有能走的步），第二步在它上面选
+    let b: &[&[u16]] = &[&[3, 2, 3, 2], &[2, 3, 1, 3], &[1, 1, 2, 1]];
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let (s, _) = run(&mut d, 2, false);
+    assert_eq!(s.steps, 2);
+    assert_eq!(d.events, ["think", "look", "swipe", "think", "look", "swipe"]);
+}
+
+#[test]
+fn no_moves_still_ends_with_look_after_think() {
+    let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+    let (s, _) = run(&mut d, 5, false);
+    assert_eq!(s.stop, Stop::NoMoves);
+    assert_eq!(d.events, ["think", "look"]);
+}
+
+#[test]
+fn a_board_that_cannot_be_read_says_nothing() {
+    let mut d = Fake::new(vec![Err(err("not_a_grid"))]);
+    let (_, _) = run(&mut d, 5, false);
+    assert!(d.events.is_empty(), "{:?}", d.events);
 }
