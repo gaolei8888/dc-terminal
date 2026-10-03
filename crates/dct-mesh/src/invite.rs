@@ -86,8 +86,9 @@ impl Code {
     pub fn random(rand: &mut dyn FnMut() -> [u8; 32]) -> Code {
         loop {
             let b = rand();
-            for chunk in b.chunks_exact(4) {
-                let x = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let (chunks, _) = b.as_chunks::<4>();
+            for chunk in chunks {
+                let x = u32::from_be_bytes(*chunk);
                 if x < SAMPLE_LIMIT {
                     return Code(format!("{:06}", x % 1_000_000));
                 }
