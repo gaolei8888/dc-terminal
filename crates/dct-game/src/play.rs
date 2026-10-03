@@ -159,12 +159,14 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
             "chosen": pick, "dry_run": o.dry_run,
         });
         if o.dry_run {
+            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": 0, "settle": 0 });
             rec["outcome"] = json!("dry_run");
             sink(rec);
             break Stop::DryRun;
         }
         let t_swipe = clock.now_ms();
         if let Err(e) = dco.swipe(p, centre(p, chosen.mv.a), centre(p, chosen.mv.b)) {
+            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": clock.now_ms() - t_swipe, "settle": 0 });
             rec["outcome"] = json!("stopped");
             sink(rec);
             break Stop::Dco(e);

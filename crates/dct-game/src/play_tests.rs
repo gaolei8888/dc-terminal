@@ -205,3 +205,21 @@ fn a_move_that_works_resets_the_unmoved_counter() {
     assert_eq!(outcomes.len(), 3, "{outcomes:?}");
     assert_eq!(s.stop, Stop::StepsDone);
 }
+
+#[test]
+fn dry_run_and_swipe_error_records_also_carry_timing() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let (_, dry) = run(&mut d, 10, true);
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    d.swipe_err = Some(err("halted"));
+    let (_, bad) = run(&mut d, 10, false);
+    for rec in [&dry[0], &bad[0]] {
+        for k in ["schema", "cells", "odd", "classes", "observation_id", "candidates", "chosen", "outcome", "timing_ms", "time_ms"] {
+            assert!(rec.get(k).is_some(), "缺 {k}");
+        }
+        for k in ["read", "choose", "swipe", "settle"] {
+            assert!(rec["timing_ms"].get(k).is_some(), "timing_ms 缺 {k}");
+        }
+        assert!(rec.get("after_observation_id").is_none());
+    }
+}
