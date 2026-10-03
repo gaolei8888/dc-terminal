@@ -1,6 +1,7 @@
 //! 棋盘配置：窗口、棋盘在窗口里的位置、行列数、读棋盘的参数。第一轮手写：内置一份 Candy Crush，
 //! `~/.dct/games/<游戏>.toml` 存在就用它。棋盘位置每关不同，换关要改——自动校准是下一轮的事。
 use dct_game::play::Profile;
+use dct_game::Weights;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,18 @@ inset = 0.6
 class_de = 24
 top_div = 5
 odd_share = 0.15
+
+# 打分权重。这是过渡期的本地数据：长期要搬进 dcv，dct 的代码里不留任何游戏的数值。
+# special_swap 写 0：两颗特殊糖互换却消不掉东西的步不走（特殊糖的标记会闪，会反复选到这种空步）。
+[weights]
+cleared = 1
+cascade = 0.5
+striped = 6
+wrapped = 8
+bomb = 15
+triggered = 5
+special_swap = 0
+low_row = 1
 "#;
 
 #[derive(Deserialize)]
@@ -32,6 +45,21 @@ struct File {
     /// 可选的重复表 `[[class]]`：把读出来的颜色类别标成「不是糖」（洞、蜂蜜块、糖果机）。
     #[serde(default)]
     class: Vec<ClassEntry>,
+    /// 可选的打分权重表；没写的项保持通用的中性默认。
+    weights: Option<WeightsEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WeightsEntry {
+    cleared: Option<f64>,
+    cascade: Option<f64>,
+    striped: Option<f64>,
+    wrapped: Option<f64>,
+    bomb: Option<f64>,
+    triggered: Option<f64>,
+    special_swap: Option<f64>,
+    low_row: Option<f64>,
 }
 
 /// 一类颜色。只有 `kind = "fixed"` 的会进 Profile；`candy` 只是写给人看的备注，被接受后忽略。
@@ -105,6 +133,23 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
     let match_de = f.class_de.unwrap_or(24.0);
     let fixed_rgb: Vec<[u8; 3]> =
         f.class.iter().filter(|c| c.kind == "fixed").map(|c| [c.rgb[0] as u8, c.rgb[1] as u8, c.rgb[2] as u8]).collect();
+    let mut weights = Weights::default();
+    if let Some(w) = &f.weights {
+        for (slot, v) in [
+            (&mut weights.cleared, w.cleared),
+            (&mut weights.cascade, w.cascade),
+            (&mut weights.striped, w.striped),
+            (&mut weights.wrapped, w.wrapped),
+            (&mut weights.bomb, w.bomb),
+            (&mut weights.triggered, w.triggered),
+            (&mut weights.special_swap, w.special_swap),
+            (&mut weights.low_row, w.low_row),
+        ] {
+            if let Some(v) = v {
+                *slot = v;
+            }
+        }
+    }
     let sha256 = Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     Ok(Loaded {
         profile: Profile {
@@ -115,6 +160,7 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
             extra: Value::Object(extra),
             fixed_rgb,
             match_de,
+            weights,
         },
         sha256,
         source,
@@ -136,6 +182,24 @@ fn check(f: &File) -> Result<(), String> {
         }
         if c.rgb.iter().any(|v| !(0..=255).contains(v)) {
             return Err(format!("[[class]]「{}」的 rgb 三个数都要在 0 到 255 之间", c.name));
+        }
+    }
+    if let Some(w) = &f.weights {
+        for (name, v) in [
+            ("cleared", w.cleared),
+            ("cascade", w.cascade),
+            ("striped", w.striped),
+            ("wrapped", w.wrapped),
+            ("bomb", w.bomb),
+            ("triggered", w.triggered),
+            ("special_swap", w.special_swap),
+            ("low_row", w.low_row),
+        ] {
+            if let Some(v) = v {
+                if !(0.0..=100.0).contains(&v) {
+                    return Err(format!("[weights] 的 {name} 要在 0 到 100 之间，现在写的是 {v}"));
+                }
+            }
         }
     }
     Ok(())
@@ -236,5 +300,37 @@ mod tests {
     fn a_file_without_class_tables_has_no_fixed_colours() {
         let h = home_with("candy-crush", CANDY_CRUSH);
         assert!(load(h.path(), "candy-crush").unwrap().profile.fixed_rgb.is_empty());
+    }
+
+    #[test]
+    fn a_weights_table_loads_its_numbers_and_keeps_defaults_for_missing_keys() {
+        let text = format!("{}\n[weights]\nstriped = 3.5\nspecial_swap = 20\n", CANDY_CRUSH.split("\n# 打分权重").next().unwrap());
+        let w = load(home_with("candy-crush", &text).path(), "candy-crush").unwrap().profile.weights;
+        assert_eq!((w.striped, w.special_swap), (3.5, 20.0));
+        assert_eq!((w.cleared, w.cascade, w.wrapped, w.low_row), (1.0, 0.5, 0.0, 1.0));
+    }
+
+    #[test]
+    fn weights_out_of_range_or_unknown_are_refused_naming_the_file() {
+        let base = CANDY_CRUSH.split("\n# 打分权重").next().unwrap();
+        for body in ["striped = 101", "bomb = -1", "sparkle = 3"] {
+            let e = load(home_with("candy-crush", &format!("{base}\n[weights]\n{body}\n")).path(), "candy-crush").err().unwrap();
+            assert!(e.contains("candy-crush.toml"), "{body}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_file_without_weights_loads_neutral_weights() {
+        let base = CANDY_CRUSH.split("\n# 打分权重").next().unwrap();
+        let w = load(home_with("candy-crush", base).path(), "candy-crush").unwrap().profile.weights;
+        assert_eq!(w, Weights::default());
+        assert_eq!((w.striped, w.special_swap), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_built_in_candy_crush_carries_its_tuning_without_the_junk_special_swap() {
+        let w = load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.weights;
+        assert_eq!((w.striped, w.wrapped, w.bomb, w.triggered), (6.0, 8.0, 15.0, 5.0));
+        assert_eq!((w.special_swap, w.cleared, w.cascade, w.low_row), (0.0, 1.0, 0.5, 1.0));
     }
 }

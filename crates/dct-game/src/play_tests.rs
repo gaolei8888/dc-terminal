@@ -58,8 +58,12 @@ impl Clock for Clk {
         self.0 += ms;
     }
 }
+/// 这些测试里的选步细节（哪一步排第一）是按 Candy Crush 的那套权重写的，所以用它，不用通用默认。
+fn tuned() -> crate::choose::Weights {
+    crate::choose::Weights { striped: 6.0, wrapped: 8.0, bomb: 15.0, triggered: 5.0, ..Default::default() }
+}
 fn profile(rows: usize, cols: usize) -> Profile {
-    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0 }
+    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned() }
 }
 fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     let mut log = vec![];
@@ -552,4 +556,23 @@ fn a_refused_swipe_record_still_has_swipe_points() {
     assert_eq!(sw["started_ms"], log[0]["time_ms"]);
     assert_eq!(sw["duration_ms"], log[0]["timing_ms"]["swipe"]);
     assert_eq!(log[0]["swiped"], false);
+}
+
+#[test]
+fn a_changed_odd_flag_alone_is_not_a_changed_board() {
+    // 分组完全一样，只有 odd 标记在闪（提示光晕）：不能算「变了」，要按没反应处理。
+    let flicker = |on: bool| {
+        let mut g = grid(A);
+        g.odd[0][0] = on;
+        g
+    };
+    let mut reads = vec![Ok(grid(A))];
+    for i in 0..400 {
+        reads.push(Ok(flicker(i % 2 == 0)));
+    }
+    let mut d = Fake::new(reads);
+    let (s, log) = run(&mut d, 10, false);
+    assert_eq!(s.stop, Stop::Stuck);
+    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 2);
+    assert!(log.iter().all(|l| l["outcome"] != "moved"));
 }

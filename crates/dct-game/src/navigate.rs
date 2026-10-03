@@ -332,7 +332,7 @@ mod tests {
     }
 
     fn profile() -> Profile {
-        Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0 }
+        Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default() }
     }
 
     fn run(w: &mut World, tries: usize, dry: bool) -> (Summary, Vec<Value>) {

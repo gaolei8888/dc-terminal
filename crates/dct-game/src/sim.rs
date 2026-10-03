@@ -96,8 +96,8 @@ fn swapped(b: &Board, m: Move) -> Board {
     n
 }
 
-/// 只有两格都是糖才能换；换完要么连成线，要么两颗都是特殊糖。不合法返回 `None`。
-pub fn try_move(b: &Board, m: Move) -> Option<Outcome> {
+/// 只有两格都是糖才能换；换完要么连成线，要么（调用方允许时）两颗都是特殊糖。不合法返回 `None`。
+pub fn try_move(b: &Board, m: Move, allow_special_swap: bool) -> Option<Outcome> {
     let both_candy = matches!(b.get(m.a.0, m.a.1), Cell::Candy { .. }) && matches!(b.get(m.b.0, m.b.1), Cell::Candy { .. });
     if !both_candy {
         return None;
@@ -106,7 +106,7 @@ pub fn try_move(b: &Board, m: Move) -> Option<Outcome> {
     let mut board = swapped(b, m);
     let first = find_runs(&board);
     if first.is_empty() {
-        return special_swap.then_some(Outcome { special_swap: true, lowest_row: m.a.0.max(m.b.0), ..Outcome::default() });
+        return (special_swap && allow_special_swap).then_some(Outcome { special_swap: true, lowest_row: m.a.0.max(m.b.0), ..Outcome::default() });
     }
     let mut out = Outcome { special_swap, ..Outcome::default() };
     let mut runs = first;

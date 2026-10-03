@@ -1,7 +1,7 @@
 //! 一盘游戏怎么玩：读盘 → 选步 → 划 → 等画面停下 → 下一步，以及什么时候停。
 //! 跟 dco 说话（`Dco`）和计时（`Clock`）都是传进来的，所以测试里换成假的，不碰真机也不真睡觉。
 use crate::board::{fixed_ids, looks_like_board, Board, GridRead};
-use crate::choose::{choose, Candidate};
+use crate::choose::{choose, Candidate, Weights};
 use crate::screen::Element;
 use serde_json::{json, Value};
 
@@ -16,6 +16,8 @@ pub struct Profile {
     /// 空 = 没有这种格子（第一轮的行为）。这份数据来自用户每关的配置文件，代码里不写死任何游戏的颜色。
     pub fixed_rgb: Vec<[u8; 3]>,
     pub match_de: f64,
+    /// 打分权重，来自配置文件的 `[weights]`；不写就是通用的中性默认（特殊糖全 0）。
+    pub weights: Weights,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,8 +130,10 @@ pub(crate) fn canonical(cells: &[Vec<u16>]) -> Vec<Vec<u16>> {
         .collect()
 }
 
+/// 只比较分组。`odd`（特殊糖标记）会跟着游戏的提示光晕和掉落动画闪，
+/// 不能算成「棋盘变了」，否则没效果的一步会被当成有效，停不下来。
 fn same(a: &GridRead, b: &GridRead) -> bool {
-    canonical(&a.cells) == canonical(&b.cells) && a.odd == b.odd
+    canonical(&a.cells) == canonical(&b.cells)
 }
 
 const FIRST_WAIT_MS: u64 = 150;
@@ -219,7 +223,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。
         // show_status 留给以后慢的（模型）决策。
         let t_choose = clock.now_ms();
-        let cands: Vec<Candidate> = choose(&board);
+        let cands: Vec<Candidate> = choose(&board, &p.weights);
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
         // 同一盘棋上划了没反应的步，不再重复选。
         let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));

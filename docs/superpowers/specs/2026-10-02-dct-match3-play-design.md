@@ -51,11 +51,15 @@ AI 自动校准、dcv 的游戏资料（`dcv games`）、开关卡和道具检�
 **特征**：`cleared`（第一下消几颗）、`cascade`（连锁消几颗）、`striped` / `wrapped` / `bomb`（做出几颗）、`triggered`（引爆几颗）、
 `special_swap`（两颗特殊糖互换）、`lowest_row`（消掉的最低一行）。
 
-**打分**（常量，第一轮拍的，写明出处，以后按记录调）：
+**打分**：权重来自棋盘配置里的 `[weights]`（过渡期的本地数据；长期归属是 dcv，2026-10-03 用户定的：dct 代码保持通用，游戏相关的数值是数据，不是代码常量）。
+通用默认是 cleared 1 + cascade 0.5 + low_row 1，所有特殊糖的权重（striped / wrapped / bomb / triggered / special_swap）都是 0：
 
 ```
-score = cleared + 0.5·cascade + 6·striped + 8·wrapped + 15·bomb + 5·triggered + 20·special_swap + (lowest_row + 1) / rows
+score = cleared·w + cascade·w + striped·w + wrapped·w + bomb·w + triggered·w + special_swap·w + (lowest_row + 1) / rows · low_row
 ```
+
+两颗特殊糖互换却连不成线，只有 `special_swap > 0` 才算合法步；默认不走。`odd`（特殊糖标记）会跟着提示光晕和掉落动画闪，
+所以不拿它判断棋盘有没有变——落定只比较格子的分组。
 
 同分时按固定顺序挑：最低的行优先，再左边的列优先，再横向交换优先。同一盘每次选得一样。
 

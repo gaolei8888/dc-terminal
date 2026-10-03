@@ -11,7 +11,7 @@ pub mod screen;
 pub mod sim;
 
 pub use board::{fixed_ids, looks_like_board, Board, BoardError, Cell, GridRead};
-pub use choose::{choose, Candidate, Features};
+pub use choose::{choose, Candidate, Features, Weights};
 pub use sim::{Move, Pos};
 
 #[cfg(test)]
