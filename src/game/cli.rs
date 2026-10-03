@@ -1,22 +1,31 @@
-//! `dct game play [--game 名字] [--steps N] [--dry-run]`。
+//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N]`。
 
-const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run]";
+const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5]";
 
 pub struct Args {
     pub game: String,
     pub steps: usize,
     pub dry_run: bool,
+    /// 一局结束以后自己接着来（失败了重来、关安全的弹窗）。不带它就和以前一样：打完一关就停。
+    pub auto_next: bool,
+    /// 整个命令最多点几次“开始 / 再来一次”（每次都会用掉一条生命）。
+    pub tries: usize,
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
     if args.first().map(String::as_str) != Some("play") {
         return Err(USAGE.into());
     }
-    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false };
+    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5 };
     let mut it = args[1..].iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--dry-run" => a.dry_run = true,
+            "--auto-next" => a.auto_next = true,
+            "--tries" => {
+                let v = it.next().ok_or("--tries 后面要写次数")?;
+                a.tries = v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or("--tries 要在 1 到 20 之间")?;
+            }
             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
             "--steps" => {
                 let v = it.next().ok_or("--steps 后面要写步数")?;
@@ -62,6 +71,7 @@ fn run_parsed(_: &Args) -> i32 {
 fn run_parsed(a: &Args) -> i32 {
     use super::{log::LogFile, profile, text};
     use dct_game::dco::DcoClient;
+    use dct_game::navigate::{auto_next, NavOptions};
     use dct_game::play::{play, Clock, Options};
     use serde_json::json;
 
@@ -96,7 +106,6 @@ fn run_parsed(a: &Args) -> i32 {
     let run_id = format!("{:08x}", (clock.now_ms() ^ u64::from(std::process::id())) as u32);
     let (mut n, mut warned) = (0, false);
     let mut sink = |mut rec: serde_json::Value| {
-        n += 1;
         rec["game"] = json!(a.game);
         rec["run_id"] = json!(run_id);
         rec["profile_sha256"] = json!(loaded.sha256);
@@ -106,9 +115,20 @@ fn run_parsed(a: &Args) -> i32 {
                 warned = true;
             }
         }
-        println!("{}", text::step_line(n, &rec));
+        if rec["kind"] == "nav" {
+            if let Some(line) = text::nav_line(&rec) {
+                println!("{line}");
+            }
+        } else {
+            n += 1;
+            println!("{}", text::step_line(n, &rec));
+        }
     };
-    let summary = play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run }, &mut sink);
+    let summary = if a.auto_next {
+        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run }, &mut sink)
+    } else {
+        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run }, &mut sink)
+    };
     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
     if code == 0 {
@@ -131,6 +151,7 @@ mod tests {
     fn defaults() {
         let a = p(&["play"]).unwrap();
         assert_eq!((a.game.as_str(), a.steps, a.dry_run), ("candy-crush", 20, false));
+        assert_eq!((a.auto_next, a.tries), (false, 5));
     }
 
     #[test]
@@ -140,8 +161,14 @@ mod tests {
     }
 
     #[test]
+    fn auto_next_flags() {
+        let a = p(&["play", "--auto-next", "--tries", "3"]).unwrap();
+        assert_eq!((a.auto_next, a.tries), (true, 3));
+    }
+
+    #[test]
     fn bad_input_is_refused_with_a_reason() {
-        for bad in [&["play", "--steps", "0"][..], &["play", "--steps", "201"], &["play", "--steps", "x"], &["play", "--steps"], &["play", "--game"], &["play", "--nope"], &[], &["stop"]] {
+        for bad in [&["play", "--steps", "0"][..], &["play", "--steps", "201"], &["play", "--steps", "x"], &["play", "--steps"], &["play", "--game"], &["play", "--nope"], &["play", "--tries", "0"], &["play", "--tries", "21"], &["play", "--tries"], &[], &["stop"]] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
     }
