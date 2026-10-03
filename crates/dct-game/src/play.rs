@@ -143,6 +143,19 @@ const FIRST_WAIT_MS: u64 = 150;
 const POLL_MS: u64 = 100;
 const NO_CHANGE_MS: u64 = 3_000;
 const GIVE_UP_MS: u64 = 8_000;
+/// “没步可走”“画面变了”下结论前的停顿：出口还在一个个往下补糖，特效也会让颜色数暂时跳高，
+/// 马上读到的往往是中间状态。
+const CONFIRM_PAUSE_MS: u64 = 1_500;
+/// 连着最多确认几次“没步可走”：盘面一直在变却始终没有步，也不能无限等。
+const MAX_NO_MOVE_CONFIRMS: usize = 2;
+
+fn big_classes(g: &GridRead) -> usize {
+    g.classes.iter().filter(|c| c.count >= 2).count()
+}
+
+fn has_move(p: &Profile, g: &GridRead) -> bool {
+    Board::from_read_fixed(g, &fixed_ids(g, &p.fixed_rgb, p.match_de), !p.fixed_rgb.is_empty()).is_ok_and(|b| !choose(&b, &p.weights).is_empty())
+}
 
 fn settle(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, before: &GridRead) -> Settle {
     let t0 = clock.now_ms();
@@ -196,6 +209,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
     let mut streak = 0;
     let mut current: Option<GridRead> = None;
+    let mut no_move_confirms = 0;
     let stop = loop {
         if steps >= o.max_steps {
             break Stop::StepsDone;
@@ -215,10 +229,26 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
             break Stop::NoGrid("这块区域看着不像棋盘".into());
         }
         // 只数至少两格的类别：一格的（彩色炸弹、条纹糖被读成自己的颜色）是“不认识”，忽略
-        let big = g.classes.iter().filter(|c| c.count >= 2).count();
+        let big = big_classes(&g);
         let base = *baseline.get_or_insert(big);
         if big > base + 1 {
-            break Stop::ClassesChanged { was: base, now: big };
+            if o.dry_run {
+                break Stop::ClassesChanged { was: base, now: big };
+            }
+            // 特效清完一大片，颜色数会暂时跳高：停一下再读一遍，还高才算画面真的变了。
+            clock.sleep_ms(CONFIRM_PAUSE_MS);
+            match dco.read_grid(p) {
+                Ok(re) => {
+                    let re_big = big_classes(&re);
+                    if re_big > base + 1 {
+                        break Stop::ClassesChanged { was: base, now: re_big };
+                    }
+                    current = Some(re);
+                    continue;
+                }
+                Err(e) if e.code == "not_a_grid" => break Stop::NoGrid(e.message),
+                Err(e) => break Stop::Dco(e),
+            }
         }
         let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de), !p.fixed_rgb.is_empty()) else {
             break Stop::NoGrid("棋盘的行列数对不上".into());
@@ -230,6 +260,22 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
         // 同一盘棋上划了没反应的步，不再重复选。
         let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
+        if cands.is_empty() && !o.dry_run && no_move_confirms < MAX_NO_MOVE_CONFIRMS {
+            // 补糖还没补完时会有一瞬间没步可走：停一下再读，盘面变了或有步了就接着玩。
+            no_move_confirms += 1;
+            clock.sleep_ms(CONFIRM_PAUSE_MS);
+            match dco.read_grid(p) {
+                Ok(re) => {
+                    if same(&re, &g) && !has_move(p, &re) {
+                        break Stop::NoMoves;
+                    }
+                    current = Some(re);
+                    continue;
+                }
+                Err(e) if e.code == "not_a_grid" => break Stop::NoGrid(e.message),
+                Err(e) => break Stop::Dco(e),
+            }
+        }
         let Some(pick) = pick else {
             break if cands.is_empty() { Stop::NoMoves } else { Stop::Stuck };
         };
@@ -267,6 +313,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         }
         // 划成功了才算走了一步。
         steps += 1;
+        no_move_confirms = 0;
         rec["swiped"] = json!(true);
         let t_settle = clock.now_ms();
         let result = settle(dco, clock, p, &g);

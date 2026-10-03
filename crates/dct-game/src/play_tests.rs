@@ -23,14 +23,16 @@ struct Fake {
     swipe_err: Option<DcoError>,
     /// show_status 和 swipe 按先后记下来，测 play() 不发状态。
     events: Vec<String>,
+    reads_taken: usize,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![] }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0 }
     }
 }
 impl Dco for Fake {
     fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
+        self.reads_taken += 1;
         if let Some(r) = self.reads.pop_front() {
             self.last = Some(r.clone());
             return r;
@@ -590,4 +592,67 @@ fn a_one_cell_candy_may_move_once_the_profile_lists_the_not_candies() {
     };
     assert_ne!(go(vec![[196, 148, 101]]), Stop::NoMoves);
     assert_eq!(go(vec![]), Stop::NoMoves);
+}
+
+// ---- “没步可走”和“画面变了”要停一下再读一遍才算数 ----
+
+const DEAD2: &[&[u16]] = &[&[3, 3, 2, 2], &[2, 1, 1, 2], &[3, 1, 1, 3]]; // 另一种分组，同样没步可走
+
+#[test]
+fn no_moves_that_a_refill_fixes_is_not_the_end() {
+    // 第一次读没步（补糖补到一半），停一下再读有步了：接着划，不停
+    let mut d = Fake::new(vec![Ok(grid(DEAD)), Ok(grid(A))]);
+    let (s, log) = run(&mut d, 1, false);
+    assert_eq!(s.stop, Stop::StepsDone);
+    assert_eq!(d.swipes.len(), 1);
+    assert_eq!(log.len(), 1, "确认读不算一步，不写步骤记录");
+}
+
+#[test]
+fn no_moves_confirmed_by_an_identical_second_read_stops_after_one_confirmation() {
+    let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+    let mut clk = Clk(0);
+    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false }, &mut |_| {});
+    assert_eq!(s.stop, Stop::NoMoves);
+    assert_eq!(d.reads_taken, 2);
+    assert_eq!(clk.0, 1_500);
+}
+
+#[test]
+fn a_board_that_keeps_changing_without_a_move_stops_after_two_confirmations() {
+    let mut reads = vec![];
+    for i in 0..50 {
+        reads.push(Ok(grid(if i % 2 == 0 { DEAD } else { DEAD2 })));
+    }
+    let mut d = Fake::new(reads);
+    let (s, _) = run(&mut d, 5, false);
+    assert_eq!(s.stop, Stop::NoMoves);
+    assert_eq!(d.reads_taken, 3);
+}
+
+#[test]
+fn a_brief_colour_jump_that_is_gone_on_the_reread_keeps_playing() {
+    let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[4, 5, 3, 1]];
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(five)), Ok(grid(five)), Ok(grid(A))]);
+    let (s, _) = run(&mut d, 2, false);
+    assert!(!matches!(s.stop, Stop::ClassesChanged { .. }), "{:?}", s.stop);
+    assert_eq!(d.swipes.len(), 2);
+}
+
+#[test]
+fn a_colour_jump_that_stays_on_the_reread_is_a_changed_screen() {
+    let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[4, 5, 3, 1]];
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(five)), Ok(grid(five))]);
+    let (s, _) = run(&mut d, 10, false);
+    assert!(matches!(s.stop, Stop::ClassesChanged { was: 3, now: 5 }), "{:?}", s.stop);
+}
+
+#[test]
+fn a_dry_run_does_not_pause_or_reread() {
+    let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+    let mut clk = Clk(0);
+    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true }, &mut |_| {});
+    assert_eq!(s.stop, Stop::NoMoves);
+    assert_eq!(d.reads_taken, 1);
+    assert_eq!(clk.0, 0);
 }
