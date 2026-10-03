@@ -5,6 +5,7 @@ pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod daemon;
+pub mod game;
 pub mod gate;
 pub mod git;
 pub mod i18n;
