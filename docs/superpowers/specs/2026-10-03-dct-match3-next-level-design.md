@@ -33,13 +33,20 @@
 | 分类 | 怎么认 | dct 做什么 |
 |---|---|---|
 | `Money` | 任何元素的文字带价格符号（¥ ￥ $ € £ 💎）、数字加 gem/gems/金币/钻石、或含 buy / purchase / pay / checkout / 购买 / 支付 / 充值 / gold / bar(s) 这类词 | **停**，说「出现了要花钱的画面，请你自己处理」 |
+| `Ad` | 任何元素的文字里有 ad / ads / advert（整词）或 "watch" 加 ad 之类，例如 `Watch ad`、`Watch an ad for a sweet treat` | **停**，说「出现了广告，请你自己关掉」（广告右上角的 ✕ 没有字，dco 不让点） |
 | `LivesOut` | 文字里有 lives 或 life，同时有 no more / out of / 0 / ask / get more 之一；或「生命」+「用完」/「不足」 | **停**，说「生命用完了」 |
 | `Won` | 已知的通关字样（见下，从证据里补） | **停**，说「通关了，下一关要重新认棋盘」 |
 | `Failed` | 已知的失败字样：out of moves / no more moves / try again / level failed / 没有步数了 / 再试一次 | 点那个 Try again / Play 类按钮重来；如果只有叉叉，**停** |
-| `Dismiss` | 有一个元素，整条文字（去掉空白、大小写不计）正好是 Close / No thanks / Not now / Later / Maybe later / Skip / Cancel / 关闭 / 以后再说 / 暂不 / 跳过 / 取消 | 点它 |
-| `PlayButton` | 有一个元素，整条文字正好是 Play / Start / 开始 / 开始游戏 | 点它 |
+| `Dismiss` | 有一个元素，整条文字（去掉空白、大小写不计）正好是 Close / No thanks / Not now / Later / Maybe later / Skip / Cancel / Got it / Tap to continue / Next / 关闭 / 以后再说 / 暂不 / 跳过 / 取消 / 知道了 / 下一步 | 点它 |
+| `PlayButton` | **恰好一个**元素，整条文字正好是 Play / Start / 开始 / 开始游戏。**两个或更多个**都正好是这些字（例如开局框里的两个 Play）→ 当作 `Unknown` | 点它 |
 | `Board` | 不是上面任何一种，而且 `read_grid` 读得出（至少 3 个「大」类别、总类别不超过 16） | 进入 `play` 一局 |
 | `Unknown` | 其它 | **停**，把所有文字和截图指纹记进记录，说「出现了不认识的画面」 |
+
+**开局框（dc-octo 真机经验，2026-09-30）**：每一局开始前有一个框（`Level NNNN` / `Select boosters:`），里面有三个道具圆泡（默认全选上，开局就会用掉）和**两个** Play：左边粉色是正常开始，右边紫色是「看广告」（带 x2）。
+- **用户 2026-10-03 定：允许用掉默认选上的道具**（库存约 748 / 625 / 297 个，免费攒的，不花钱）。dco 不能取消它们（圆泡没有字，按「对外」拦），所以 dct 不碰道具；以后 dco 能取消时再做成可选。
+- 两个 Play 的识别靠「整条文字正好是 Play」：OCR 常把紫色那个读成 `B Play` / `E Play`，所以只有粉色的是正好的 `Play`。**如果两个都读成了正好的 `Play`，就按上面「恰好一个」规则停下**，不猜哪个是粉色的。
+- 不要点 `Save My Progress`（登录账号），它不在白名单里，所以不会被点。
+- 地图上的关卡按钮只有数字（`1712`），dco 不让点（没有真正的字）。所以「从地图进某一关」这一步，本设计做不到：停下，等用户点。
 
 说明：
 - 「整条文字正好是」是故意的：`Play now for 💎 5` 不会被当作 Play。
@@ -98,5 +105,5 @@ dct game play --auto-next [--steps N] [--tries N]
 
 - 只认英文字（用户的 iPhone 是英文界面）；中文词表放了常见的几个，没有真机验证。
 - 打赢以后停、不进下一关：这是故意的，等自动调参。
-- 「看广告领奖励」「用金条买步数」一律不点，也不替用户点叉叉关广告；需要用户自己处理。
+- 「看广告领奖励」「用金条买步数」一律不点，也不替用户点叉叉关广告；需要用户自己处理。活动弹窗里的 `Claim` / `Collect` 不放白名单（常连着「看广告再领」），遇到会停；`Got it` / `Tap to continue` / `Next` 放进去了（教程和说明，dc-octo 真机上用普通 tap 点过）。
 - 点按钮之前不核对「这个按钮是不是用户想要的」：Play 就是 Play。白名单之外的任何字都不点。
