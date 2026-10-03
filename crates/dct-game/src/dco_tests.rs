@@ -110,3 +110,104 @@ fn a_dead_socket_means_dco_is_not_running() {
     std::fs::write(dir.path().join("token"), TOKEN).unwrap();
     assert_eq!(DcoClient::connect(dir.path()).err().unwrap().code, "dco_down");
 }
+
+#[test]
+fn a_dco_that_never_answers_times_out_with_its_own_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let _h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        drop(s);
+    });
+    let t = std::time::Instant::now();
+    let e = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).err().unwrap();
+    assert_eq!(e.code, "dco_timeout");
+    assert!(e.message.contains("没有回应"));
+    assert!(t.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn an_unknown_tool_error_means_dco_is_too_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let _h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            let reply = match req["method"].as_str().unwrap() {
+                "tools/call" => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "unknown tool: read_grid"}}),
+                _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            };
+            writeln!(w, "{reply}").unwrap();
+        }
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.read_grid(&profile()).err().unwrap().code, "dco_too_old");
+}
+
+#[test]
+fn another_protocol_error_keeps_its_numeric_code_in_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let _h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            let reply = match req["method"].as_str().unwrap() {
+                "tools/call" => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": "boom"}}),
+                _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            };
+            writeln!(w, "{reply}").unwrap();
+        }
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let e = c.read_grid(&profile()).err().unwrap();
+    assert_eq!(e.code, "dco_error");
+    assert!(e.message.contains("boom") && e.message.contains("-32603"), "{}", e.message);
+}
+
+#[test]
+fn a_socket_we_may_not_connect_to_is_blocked_not_down() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    let _l = UnixListener::bind(&sock).unwrap();
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // root 不受文件权限限制：那种环境下连得上，这条没法测。
+    if std::fs::OpenOptions::new().read(true).open(&sock).is_ok() || std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        return;
+    }
+    assert_eq!(DcoClient::connect(dir.path()).err().unwrap().code, "dco_blocked");
+}
