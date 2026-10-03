@@ -53,7 +53,7 @@
 
 - 两个以上整条正好是 Play 的 → `Ambiguous`，停（不去读棋盘）。
 - 刚玩完一局之后遇到不认识的画面，不再去读棋盘当棋盘划，直接停（`unknown_screen`）。弹窗可能读得出「棋盘」，划下去会划到按钮上。
-- Try again 之后只有「像开局框」（文字里有 Select boosters，或 Level 加数字）的画面里的 Play 才算同一次重来；别的画面里的 Play 照样按 `level_ended` 停。
+- Try again 之后只有开局框（只认文字里有 Select boosters 的画面）里的 Play 才算同一次重来；别的画面里的 Play 照样按 `level_ended` 停。
 - 步数刚好在一局结束时用完，会看一眼屏幕再停（什么都不点），不会让人「再运行一次」就按下一关的 Play。
 
 说明：
