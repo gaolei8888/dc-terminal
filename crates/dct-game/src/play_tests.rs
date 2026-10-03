@@ -370,3 +370,24 @@ fn failed_move_memory_survives_permuted_ids() {
     assert!(d.swipes.len() >= 2);
     assert_ne!(d.swipes[0], d.swipes[1], "同分组换了号码的盘面，失败的步也得跳过");
 }
+
+const POPUP: &[&[u16]] = &[&[1, 1, 1, 1, 1], &[0, 0, 0, 0, 0], &[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2]];
+
+#[test]
+fn a_first_read_that_is_mostly_one_colour_is_not_swiped() {
+    let mut d = Fake::new(vec![Ok(grid(POPUP))]);
+    let (s, _) = run(&mut d, 10, false);
+    assert!(matches!(s.stop, Stop::NoGrid(_)), "{:?}", s.stop);
+    assert_eq!(s.steps, 0);
+    assert!(d.swipes.is_empty());
+}
+
+#[test]
+fn a_lopsided_read_later_in_a_run_is_still_played() {
+    // 第一张正常；落定后的盘大半是一个颜色（后期常见），照旧往下玩，不拦。
+    let lopsided: &[&[u16]] = &[&[1, 1, 1, 1], &[1, 1, 1, 1], &[1, 2, 3, 1], &[2, 3, 2, 3]];
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(lopsided)), Ok(grid(lopsided))]);
+    let (s, _) = run(&mut d, 3, false);
+    assert!(s.steps >= 1, "{:?}", s.stop);
+    assert!(!matches!(s.stop, Stop::NoGrid(_)), "{:?}", s.stop);
+}

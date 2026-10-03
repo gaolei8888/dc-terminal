@@ -1,6 +1,6 @@
 //! 一盘游戏怎么玩：读盘 → 选步 → 划 → 等画面停下 → 下一步，以及什么时候停。
 //! 跟 dco 说话（`Dco`）和计时（`Clock`）都是传进来的，所以测试里换成假的，不碰真机也不真睡觉。
-use crate::board::{Board, GridRead};
+use crate::board::{looks_like_board, Board, GridRead};
 use crate::choose::{choose, Candidate};
 use crate::screen::Element;
 use serde_json::{json, Value};
@@ -196,6 +196,10 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
             },
         };
         let read_ms = clock.now_ms().saturating_sub(t_read);
+        // 这一轮的第一张盘：大半是同一种平色的是弹窗不是棋盘，一步都不划。后面的读数不查（后期的盘可以很偏）。
+        if baseline.is_none() && !looks_like_board(&g) {
+            break Stop::NoGrid("这块区域看着不像棋盘".into());
+        }
         // 只数至少两格的类别：一格的（彩色炸弹、条纹糖被读成自己的颜色）是“不认识”，忽略
         let big = g.classes.iter().filter(|c| c.count >= 2).count();
         let base = *baseline.get_or_insert(big);

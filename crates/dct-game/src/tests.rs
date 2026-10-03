@@ -133,3 +133,40 @@ fn equal_scores_prefer_the_lower_row() {
     assert_eq!(c[hi].features.cleared, c[lo].features.cleared);
     assert!(lo < hi, "低的那个应该排前面");
 }
+
+fn read_with_counts(rows: usize, cols: usize, counts: &[usize]) -> GridRead {
+    GridRead {
+        rows,
+        cols,
+        cells: vec![vec![0; cols]; rows],
+        odd: vec![vec![false; cols]; rows],
+        classes: counts.iter().enumerate().map(|(i, &c)| board::ClassInfo { id: i as u16, count: c, rgb: None }).collect(),
+        observation_id: None,
+        observed_at_ms: None,
+        frame_age_ms: None,
+    }
+}
+
+#[test]
+fn a_mostly_flat_popup_read_is_not_a_board() {
+    // 2026-10-03 真机：Daily Stamps 卡片读成 9x5「棋盘」，类别 5/5/35（78%）。
+    assert!(!looks_like_board(&read_with_counts(9, 5, &[5, 5, 35])));
+}
+
+#[test]
+fn the_real_1712_board_looks_like_a_board() {
+    let g: GridRead = serde_json::from_str(include_str!("../tests/fixtures/candy-1712-live.json")).unwrap();
+    assert!(looks_like_board(&g));
+}
+
+#[test]
+fn seventy_percent_is_the_line() {
+    // 20 格：14 格 = 正好 70%，可以；15 格 = 75%，不行。
+    assert!(looks_like_board(&read_with_counts(4, 5, &[14, 3, 3])));
+    assert!(!looks_like_board(&read_with_counts(4, 5, &[15, 3, 2])));
+}
+
+#[test]
+fn fewer_than_three_big_classes_is_not_a_board() {
+    assert!(!looks_like_board(&read_with_counts(3, 4, &[6, 4, 1, 1])));
+}

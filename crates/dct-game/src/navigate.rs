@@ -1,6 +1,7 @@
 //! `--auto-next`：一局结束以后自己接着来——失败了点“再来一次”，弹窗里只点白名单里的字，
 //! 认出生命用完、价格、广告、不认识的画面就停。打赢也停：下一关的版面不一样，现在的棋盘位置读不对。
 //! 跟 dco 说话和计时都是传进来的（同 `play`），所以测试里换成假的。
+use crate::board::looks_like_board;
 use crate::play::{play, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
 use crate::screen::{classify, is_level_start, Element, Screen};
 use serde_json::{json, Value};
@@ -117,7 +118,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                 }
                 // 不是任何已知的按钮画面：看看是不是棋盘。
                 match dco.read_grid(p) {
-                    Ok(g) if g.classes.iter().filter(|c| c.count >= 2).count() >= 3 => {
+                    Ok(g) if looks_like_board(&g) => {
                         let remaining = o.max_steps.saturating_sub(steps);
                         // 这个画面的字是以后“像棋盘”判断的证据。
                         sink(nav_record(clock, &seen, "board", None, "entered"));
@@ -575,6 +576,18 @@ mod tests {
         let (s, _) = run(&mut w, 5, false);
         assert!(matches!(s.stop, Stop::UnknownScreen(_)), "{:?}", s.stop);
         assert_eq!(w.swipes, 1);
+        assert!(w.taps.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_screen_that_is_mostly_one_colour_is_not_a_board() {
+        // 2026-10-03 真机：Daily Stamps 卡片文字只有「～」，读成 9x5 的 5/5/35「棋盘」。
+        let popup: Vec<Vec<u16>> = [vec![1; 5], vec![0; 5]].into_iter().chain((0..7).map(|_| vec![2; 5])).collect();
+        let rows: Vec<&[u16]> = popup.iter().map(|r| r.as_slice()).collect();
+        let mut w = World::new(vec![Frame::TextGrid(vec!["～"], grid(&rows))]);
+        let (s, _) = run(&mut w, 5, false);
+        assert!(matches!(s.stop, Stop::UnknownScreen(_)), "{:?}", s.stop);
+        assert_eq!(w.swipes, 0);
         assert!(w.taps.is_empty());
     }
 

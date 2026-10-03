@@ -43,6 +43,16 @@ pub struct ClassInfo {
     pub rgb: Option<[u8; 3]>,
 }
 
+/// 这一读像不像一盘棋。两条都要满足：至少 3 个类别有 2 格以上；没有哪个类别占了超过 70% 的格子。
+/// 一个画面大半是同一种平色，那是弹窗（卡片底色），不是棋盘：真实的第 1712 关棋盘最大的类别占 27%，
+/// 2026-10-03 真机上被误读成棋盘的 Daily Stamps 弹窗是 78%（类别 5/5/35，共 45 格）。
+pub fn looks_like_board(g: &GridRead) -> bool {
+    let big = g.classes.iter().filter(|c| c.count >= 2).count();
+    let total = g.rows * g.cols;
+    let largest = g.classes.iter().map(|c| c.count).max().unwrap_or(0);
+    big >= 3 && total > 0 && largest * 10 <= total * 7
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BoardError {
     /// cells / odd 的行列数跟 rows / cols 对不上。

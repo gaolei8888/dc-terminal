@@ -9,7 +9,7 @@ pub mod play;
 pub mod screen;
 pub mod sim;
 
-pub use board::{Board, BoardError, Cell, GridRead};
+pub use board::{looks_like_board, Board, BoardError, Cell, GridRead};
 pub use choose::{choose, Candidate, Features};
 pub use sim::{Move, Pos};
 
