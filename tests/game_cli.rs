@@ -90,7 +90,7 @@ fn a_dry_run_prints_the_move_never_swipes_and_logs_it() {
     assert_eq!(lines[0]["profile_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(lines[0]["observation_id"], "obs-0000000000000001");
     assert_eq!(lines[0]["outcome"], "dry_run");
-    assert_eq!((lines[1]["stop"].as_str(), lines[1]["steps"].as_u64()), (Some("dry_run"), Some(1)));
+    assert_eq!((lines[1]["stop"].as_str(), lines[1]["steps"].as_u64()), (Some("dry_run"), Some(0)));
 }
 
 #[test]
@@ -101,7 +101,17 @@ fn a_halted_dco_stops_the_game_with_a_plain_sentence_and_a_failing_exit_code() {
     assert_eq!(code, 1, "{out}{err}");
     assert!(err.contains("急停"), "{err}");
     assert_eq!(h.join().unwrap(), vec!["read_grid", "swipe"]);
-    assert_eq!(log_lines(home.path()).last().unwrap()["stop"], "dco");
+    assert!(err.contains("走了 0 步"), "{err}");
+    assert!(out.contains("这一步没划成") && !out.contains("消 ") && !out.contains("第 1 步"), "{out}");
+    let lines = log_lines(home.path());
+    assert_eq!(lines.last().unwrap()["stop"], "dco");
+    assert_eq!(lines.last().unwrap()["steps"], 0);
+    assert_eq!(lines[0]["swiped"], false);
+    assert_eq!(lines[0]["candidates"][0]["features"]["cleared"].as_u64().is_some(), true);
+    let run = lines[0]["run_id"].as_str().unwrap();
+    assert_eq!(run.len(), 8);
+    assert!(lines.iter().all(|l| l["run_id"] == run), "同一次运行的记录要带同一个 run_id");
+    assert!(lines.last().unwrap()["time_ms"].as_u64().is_some());
 }
 
 #[test]
@@ -138,4 +148,31 @@ fn help_lists_the_game_command() {
     let home = tempfile::tempdir().unwrap();
     let (out, _, _) = dct(home.path(), &["--help"]);
     assert!(out.contains("dct game play"), "{out}");
+}
+
+#[test]
+fn an_unwritable_log_refuses_to_start_with_a_plain_sentence() {
+    let home = tempfile::tempdir().unwrap();
+    let h = fake_dco(home.path(), None);
+    // 今天的记录文件该在的地方放一个文件夹
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (y, m, d) = civil(secs / 86_400);
+    std::fs::create_dir_all(home.path().join(format!(".dct/games/log/{y:04}-{m:02}-{d:02}.jsonl"))).unwrap();
+    let (_, err, code) = dct(home.path(), &["game", "play", "--dry-run"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("记录文件开不了") && err.contains(".jsonl"), "{err}");
+    drop(h);
+}
+
+/// 与 `journal::civil_from_days` 同一个算法（Hinnant），测试里自备一份。
+fn civil(z: u64) -> (i64, u32, u32) {
+    let z = z as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }

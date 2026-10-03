@@ -86,16 +86,19 @@ fn run_parsed(a: &Args) -> i32 {
     let clock = SystemClock;
     let log = match LogFile::open(&home, clock.now_ms() / 1000) {
         Ok(l) => l,
-        Err(e) => {
+        Err(m) => {
             // 记录是这件事的要点（以后拿去比），写不了就不开始。
-            eprintln!("记录文件开不了（{}）：{e}", profile::games_dir(&home).join("log").display());
+            eprintln!("{m}");
             return 1;
         }
     };
+    // 这一次运行的编号：同一次里的每条记录都带它，以后才分得清哪些步属于同一盘。
+    let run_id = format!("{:08x}", (clock.now_ms() ^ u64::from(std::process::id())) as u32);
     let (mut n, mut warned) = (0, false);
     let mut sink = |mut rec: serde_json::Value| {
         n += 1;
         rec["game"] = json!(a.game);
+        rec["run_id"] = json!(run_id);
         rec["profile_sha256"] = json!(loaded.sha256);
         if let Err(e) = log.append(&rec) {
             if !warned {
@@ -107,7 +110,7 @@ fn run_parsed(a: &Args) -> i32 {
     };
     let summary = play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run }, &mut sink);
     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
-    let _ = log.append(&json!({ "schema": 1, "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
+    let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
     if code == 0 {
         println!("{line}");
     } else {

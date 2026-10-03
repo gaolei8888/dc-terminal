@@ -9,11 +9,22 @@ pub struct LogFile {
 }
 
 impl LogFile {
-    pub fn open(home: &Path, secs_since_epoch: u64) -> std::io::Result<LogFile> {
+    /// 开始时就把当天的文件建好（追加方式）：写不了就在这里说清楚，而不是玩到一半才发现没有记录。
+    /// 错误是一句人话，带着路径。
+    pub fn open(home: &Path, secs_since_epoch: u64) -> Result<LogFile, String> {
         let dir = super::profile::games_dir(home).join("log");
-        std::fs::create_dir_all(&dir)?;
         let (y, m, d) = crate::journal::civil_from_days((secs_since_epoch / 86_400) as i64);
-        Ok(LogFile { path: dir.join(format!("{y:04}-{m:02}-{d:02}.jsonl")) })
+        let path = dir.join(format!("{y:04}-{m:02}-{d:02}.jsonl"));
+        let why = |e: std::io::Error| {
+            let reason = match e.kind() {
+                std::io::ErrorKind::PermissionDenied => "没有写入的权限",
+                _ => "写不进去（可能是同名的文件夹挡着，或者磁盘满了）",
+            };
+            format!("记录文件开不了：{}，{reason}。", path.display())
+        };
+        std::fs::create_dir_all(&dir).map_err(&why)?;
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(&why)?;
+        Ok(LogFile { path })
     }
 
     pub fn path(&self) -> &Path {
@@ -44,6 +55,16 @@ mod tests {
         let text = std::fs::read_to_string(l.path()).unwrap();
         let lines: Vec<Value> = text.lines().map(|x| serde_json::from_str(x).unwrap()).collect();
         assert_eq!(lines, vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
+    }
+
+    #[test]
+    fn an_unwritable_log_file_fails_at_open_with_a_plain_sentence_naming_the_path() {
+        let h = tempfile::tempdir().unwrap();
+        let dir = h.path().join(".dct/games/log");
+        std::fs::create_dir_all(dir.join("2026-10-02.jsonl")).unwrap(); // 该是文件的地方是个文件夹
+        let e = LogFile::open(h.path(), 1_790_942_400).err().expect("应当失败");
+        assert!(e.contains("2026-10-02.jsonl") && e.starts_with("记录文件开不了"), "{e}");
+        assert!(!e.to_lowercase().contains("directory") && !e.contains("os error"), "{e}");
     }
 
     #[test]

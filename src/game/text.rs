@@ -11,19 +11,29 @@ fn n(v: &Value) -> u64 {
 pub fn step_line(step: usize, rec: &Value) -> String {
     let c = &rec["candidates"][rec["chosen"].as_u64().unwrap_or(0) as usize];
     let pos = |p: &Value| format!("第 {} 行第 {} 列", n(&p[0]) + 1, n(&p[1]) + 1);
-    let mut s = format!("第 {step} 步：{} ↔ {}，消 {} 颗", pos(&c["a"]), pos(&c["b"]), n(&c["cleared"]));
+    let outcome = rec["outcome"].as_str().unwrap_or("");
+    // 划被拒绝：没有走成这一步，不能说消了几颗，也不能叫它第几步。
+    if outcome == "stopped" && rec["swiped"].as_bool() == Some(false) {
+        return format!("想走 {} ↔ {}，这一步没划成", pos(&c["a"]), pos(&c["b"]));
+    }
+    // 划了，但画面一直没停下来：消了几颗是我们的预测，没有看到结果，不报。
+    if outcome == "stopped" {
+        return format!("第 {step} 步：{} ↔ {}，划了以后没等到画面停下", pos(&c["a"]), pos(&c["b"]));
+    }
+    let f = &c["features"];
+    let mut s = format!("第 {step} 步：{} ↔ {}，消 {} 颗", pos(&c["a"]), pos(&c["b"]), n(&f["cleared"]));
     for (key, what) in [("striped", "条纹糖"), ("wrapped", "包装糖"), ("bomb", "彩色炸弹")] {
-        if n(&c[key]) > 0 {
+        if n(&f[key]) > 0 {
             s += &format!("，做出{what}");
         }
     }
-    if n(&c["triggered"]) > 0 {
-        s += &format!("，引爆 {} 颗特殊糖", n(&c["triggered"]));
+    if n(&f["triggered"]) > 0 {
+        s += &format!("，引爆 {} 颗特殊糖", n(&f["triggered"]));
     }
-    if c["special_swap"].as_bool().unwrap_or(false) {
+    if f["special_swap"].as_bool().unwrap_or(false) {
         s += "，两颗特殊糖互换";
     }
-    match rec["outcome"].as_str().unwrap_or("") {
+    match outcome {
         "dry_run" => s += "（试走，没有真划）",
         outcome => {
             let t = &rec["timing_ms"];
@@ -54,7 +64,10 @@ pub fn stop_code(stop: &Stop) -> &'static str {
 
 pub fn dco_error(e: &DcoError) -> String {
     match e.code.as_str() {
-        "dco_down" | "dco_refused" => e.message.clone(),
+        "dco_down" | "dco_timeout" => e.message.clone(),
+        "dco_refused" => "dco 不认这把钥匙（~/.dco/token），先重启 dco。".into(),
+        "dco_too_old" => "dco 版本太旧，先更新 dco 再试。".into(),
+        "dco_blocked" => "这里不让连 dco（可能是这个 AI 的沙盒限制）。换一个能访问本机的地方再试。".into(),
         "halted" => "dco 急停了，这次停下。要接着玩，先让 dco 恢复。".into(),
         "paused" => "dco 暂停了，这次停下。".into(),
         "screen_locked" => "屏幕锁着，解锁以后再试。".into(),
@@ -75,7 +88,7 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
             format!("停了：棋盘上的颜色种类一下子变多了（原来 {was} 种，现在 {now} 种），多半是这一关结束了，或者弹出了窗口。{tail}"),
             1,
         ),
-        Stop::Stuck => (format!("停了：连着两次划了都没反应。请看一眼屏幕上是不是弹出了什么。{tail}"), 1),
+        Stop::Stuck => (format!("停了：划了几次画面都没有变化。请看一眼屏幕上是不是弹出了什么。{tail}"), 1),
         Stop::StillMoving => (format!("停了：等了 8 秒画面还在动。{tail}"), 1),
         Stop::Dco(e) => (format!("停了：{} {tail}", dco_error(e)), 1),
     }
@@ -90,8 +103,8 @@ mod tests {
         let mut r = json!({
             "chosen": 1,
             "candidates": [
-                {"a": [0, 0], "b": [0, 1], "cleared": 3, "striped": 0, "wrapped": 0, "bomb": 0, "triggered": 0, "special_swap": false},
-                {"a": [6, 1], "b": [6, 2], "cleared": 4, "striped": 1, "wrapped": 0, "bomb": 0, "triggered": 0, "special_swap": false}
+                {"a": [0, 0], "b": [0, 1], "score": 3.0, "features": {"cleared": 3, "striped": 0, "wrapped": 0, "bomb": 0, "triggered": 0, "special_swap": false}},
+                {"a": [6, 1], "b": [6, 2], "score": 9.0, "features": {"cleared": 4, "striped": 1, "wrapped": 0, "bomb": 0, "triggered": 0, "special_swap": false}}
             ],
             "outcome": "moved", "timing_ms": {"read": 2, "choose": 0, "swipe": 262, "settle": 900}
         });
@@ -114,6 +127,18 @@ mod tests {
         assert!(step_line(1, &rec(json!({"outcome": "no_change"}))).ends_with("；这一步划了没反应"));
         let d = step_line(1, &rec(json!({"outcome": "dry_run", "timing_ms": null})));
         assert!(d.ends_with("（试走，没有真划）") && !d.contains("ms"), "{d}");
+    }
+
+    #[test]
+    fn a_refused_swipe_is_not_a_step_and_claims_no_cleared_count() {
+        let s = step_line(1, &rec(json!({"outcome": "stopped", "swiped": false})));
+        assert!(s.contains("这一步没划成") && !s.contains("消 ") && !s.contains("第 1 步"), "{s}");
+    }
+
+    #[test]
+    fn a_swipe_whose_settle_never_finished_says_so_and_claims_no_cleared_count() {
+        let s = step_line(2, &rec(json!({"outcome": "stopped", "swiped": true})));
+        assert!(s.contains("划了以后没等到画面停下") && !s.contains("消 ") && !s.contains("没划成"), "{s}");
     }
 
     #[test]
@@ -151,7 +176,18 @@ mod tests {
         assert!(dco_error(&e("screen_locked")).contains("锁"));
         assert!(dco_error(&e("not_found")).contains("iPhone 镜像"));
         assert_eq!(dco_error(&e("dco_down")), "原话");
+        assert_eq!(dco_error(&e("dco_timeout")), "原话");
+        assert!(dco_error(&e("dco_too_old")).contains("版本太旧"));
+        assert!(dco_error(&e("dco_blocked")).contains("不让连 dco") && !dco_error(&e("dco_blocked")).contains("原话"));
+        let refused = DcoError { code: "dco_refused".into(), message: r#"{"ok":false}"#.into() };
+        assert_eq!(dco_error(&refused), "dco 不认这把钥匙（~/.dco/token），先重启 dco。");
         assert_eq!(dco_error(&e("weird")), "dco 说：原话");
+    }
+
+    #[test]
+    fn the_stuck_sentence_does_not_claim_two_tries() {
+        let l = stop_line(&Stop::Stuck, 1, Path::new("/x")).0;
+        assert!(l.contains("划了几次画面都没有变化") && !l.contains("两次"), "{l}");
     }
 
     #[test]
