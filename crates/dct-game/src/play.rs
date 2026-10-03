@@ -1,6 +1,6 @@
 //! 一盘游戏怎么玩：读盘 → 选步 → 划 → 等画面停下 → 下一步，以及什么时候停。
 //! 跟 dco 说话（`Dco`）和计时（`Clock`）都是传进来的，所以测试里换成假的，不碰真机也不真睡觉。
-use crate::board::{looks_like_board, Board, GridRead};
+use crate::board::{fixed_ids, looks_like_board, Board, GridRead};
 use crate::choose::{choose, Candidate};
 use crate::screen::Element;
 use serde_json::{json, Value};
@@ -12,6 +12,10 @@ pub struct Profile {
     pub rows: usize,
     pub cols: usize,
     pub extra: Value, // inset / class_de / top_div / odd_share：原样带给 read_grid
+    /// 「不是糖」的那几类（洞、蜂蜜块、糖果机……）的颜色；读到的类别颜色离其中之一不超过 match_de 就当它是。
+    /// 空 = 没有这种格子（第一轮的行为）。这份数据来自用户每关的配置文件，代码里不写死任何游戏的颜色。
+    pub fixed_rgb: Vec<[u8; 3]>,
+    pub match_de: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,7 +213,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         if big > base + 1 {
             break Stop::ClassesChanged { was: base, now: big };
         }
-        let Ok(board) = Board::from_read(&g) else {
+        let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de)) else {
             break Stop::NoGrid("棋盘的行列数对不上".into());
         };
         // 状态调用放在计时之外，timing_ms 的 choose / read 不被它拖慢；think 之后紧跟 look，

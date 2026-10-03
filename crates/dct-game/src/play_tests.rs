@@ -59,7 +59,7 @@ impl Clock for Clk {
     }
 }
 fn profile(rows: usize, cols: usize) -> Profile {
-    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}) }
+    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0 }
 }
 fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     let mut log = vec![];
@@ -436,4 +436,49 @@ fn a_board_that_cannot_be_read_says_nothing() {
     let mut d = Fake::new(vec![Err(err("not_a_grid"))]);
     let (_, _) = run(&mut d, 5, false);
     assert!(d.events.is_empty(), "{:?}", d.events);
+}
+
+// ---- 「不是糖」的格子：划的两端都不能是它 ----
+
+const HOLE: [u8; 3] = [196, 148, 101];
+// 9 是洞（3 格）。把 9 当普通颜色看，(0,2)↔(1,2) 能连出第 0 行四连；真正的糖还有别的走法（3 和 2）。
+const WITH_HOLES: &[&[u16]] = &[&[1, 1, 9, 1], &[2, 3, 1, 3], &[3, 2, 3, 2], &[9, 3, 2, 9]];
+
+fn grid_with_hole_rgb() -> GridRead {
+    let mut g = serde_json::to_value(grid(WITH_HOLES)).unwrap();
+    for c in g["classes"].as_array_mut().unwrap() {
+        if c["id"] == 9 {
+            c["rgb"] = json!(HOLE);
+        }
+    }
+    serde_json::from_value(g).unwrap()
+}
+
+type Swipe = ((f64, f64), (f64, f64));
+fn swipe_cells(p: &Profile, s: &[Swipe]) -> Vec<(usize, usize)> {
+    let [x, y, w, h] = p.region;
+    let cell = |(px, py): (f64, f64)| (((py - y) / h * p.rows as f64).floor() as usize, ((px - x) / w * p.cols as f64).floor() as usize);
+    s.iter().flat_map(|&(f, t)| [cell(f), cell(t)]).collect()
+}
+
+fn play_holes(fixed_rgb: Vec<[u8; 3]>) -> (Profile, Vec<Swipe>) {
+    let p = Profile { fixed_rgb, ..profile(4, 4) };
+    let mut d = Fake::new(vec![Ok(grid_with_hole_rgb())]);
+    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false }, &mut |_| {});
+    (p, d.swipes)
+}
+
+#[test]
+fn swipes_never_touch_a_cell_whose_colour_is_listed_as_fixed() {
+    let (p, swipes) = play_holes(vec![HOLE]);
+    assert!(!swipes.is_empty(), "除了洞还有别的走法，该划");
+    let fixed = [(0, 2), (3, 0), (3, 3)];
+    assert!(swipe_cells(&p, &swipes).iter().all(|c| !fixed.contains(c)), "{swipes:?}");
+}
+
+#[test]
+fn without_the_fixed_list_the_same_grid_swipes_a_hole() {
+    let (p, swipes) = play_holes(vec![]);
+    let fixed = [(0, 2), (3, 0), (3, 3)];
+    assert!(swipe_cells(&p, &swipes).iter().any(|c| fixed.contains(c)), "{swipes:?}");
 }

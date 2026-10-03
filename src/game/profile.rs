@@ -29,6 +29,18 @@ struct File {
     class_de: Option<f64>,
     top_div: Option<u32>,
     odd_share: Option<f64>,
+    /// 可选的重复表 `[[class]]`：把读出来的颜色类别标成「不是糖」（洞、蜂蜜块、糖果机）。
+    #[serde(default)]
+    class: Vec<ClassEntry>,
+}
+
+/// 一类颜色。只有 `kind = "fixed"` 的会进 Profile；`candy` 只是写给人看的备注，被接受后忽略。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClassEntry {
+    name: String,
+    rgb: [i64; 3],
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +101,10 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
     if let Some(v) = f.odd_share {
         extra.insert("odd_share".into(), json!(v));
     }
+    // 颜色距离的阈值沿用读盘用的 class_de：「同一类」在两边是同一个意思
+    let match_de = f.class_de.unwrap_or(24.0);
+    let fixed_rgb: Vec<[u8; 3]> =
+        f.class.iter().filter(|c| c.kind == "fixed").map(|c| [c.rgb[0] as u8, c.rgb[1] as u8, c.rgb[2] as u8]).collect();
     let sha256 = Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     Ok(Loaded {
         profile: Profile {
@@ -97,6 +113,8 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
             rows: f.rows,
             cols: f.cols,
             extra: Value::Object(extra),
+            fixed_rgb,
+            match_de,
         },
         sha256,
         source,
@@ -111,6 +129,14 @@ fn check(f: &File) -> Result<(), String> {
     }
     if !(1..=32).contains(&f.rows) || !(1..=32).contains(&f.cols) {
         return Err("rows、cols 都要在 1 到 32 之间".into());
+    }
+    for c in &f.class {
+        if c.kind != "fixed" && c.kind != "candy" {
+            return Err(format!("[[class]]「{}」的 kind 只能写 \"fixed\"（不是糖）或 \"candy\"（糖），现在写的是「{}」", c.name, c.kind));
+        }
+        if c.rgb.iter().any(|v| !(0..=255).contains(v)) {
+            return Err(format!("[[class]]「{}」的 rgb 三个数都要在 0 到 255 之间", c.name));
+        }
     }
     Ok(())
 }
@@ -169,5 +195,46 @@ mod tests {
         for bad in ["", "../x", "A", "a/b", "a.b"] {
             assert!(load(h.path(), bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn class_tables_split_into_fixed_colours_and_ignored_candies() {
+        let text = format!(
+            "{CANDY_CRUSH}\n[[class]]\nname = \"honey\"\nrgb = [196, 148, 101]\nkind = \"fixed\"\n\n[[class]]\nname = \"gap\"\nrgb = [10, 20, 30]\nkind = \"fixed\"\n\n[[class]]\nname = \"red\"\nrgb = [200, 30, 30]\nkind = \"candy\"\n"
+        );
+        let h = home_with("candy-crush", &text);
+        let l = load(h.path(), "candy-crush").unwrap();
+        assert_eq!(l.profile.fixed_rgb, vec![[196, 148, 101], [10, 20, 30]]);
+        assert_eq!(l.profile.match_de, 24.0);
+    }
+
+    #[test]
+    fn match_de_follows_class_de_when_the_file_has_one() {
+        let h = home_with("candy-crush", &CANDY_CRUSH.replace("class_de = 24", "class_de = 18"));
+        assert_eq!(load(h.path(), "candy-crush").unwrap().profile.match_de, 18.0);
+    }
+
+    #[test]
+    fn a_bad_kind_is_refused_naming_the_file() {
+        let text = format!("{CANDY_CRUSH}\n[[class]]\nname = \"x\"\nrgb = [1, 2, 3]\nkind = \"wall\"\n");
+        let h = home_with("candy-crush", &text);
+        let e = load(h.path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml") && e.contains("kind"), "{e}");
+    }
+
+    #[test]
+    fn an_rgb_out_of_range_or_a_missing_field_is_refused() {
+        let bad_rgb = format!("{CANDY_CRUSH}\n[[class]]\nname = \"x\"\nrgb = [300, 2, 3]\nkind = \"fixed\"\n");
+        let e = load(home_with("candy-crush", &bad_rgb).path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml") && e.contains("rgb"), "{e}");
+        let missing = format!("{CANDY_CRUSH}\n[[class]]\nname = \"x\"\nkind = \"fixed\"\n");
+        let e = load(home_with("candy-crush", &missing).path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml"), "{e}");
+    }
+
+    #[test]
+    fn a_file_without_class_tables_has_no_fixed_colours() {
+        let h = home_with("candy-crush", CANDY_CRUSH);
+        assert!(load(h.path(), "candy-crush").unwrap().profile.fixed_rgb.is_empty());
     }
 }
