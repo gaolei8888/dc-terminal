@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 pub struct NavOptions {
     /// 整个命令一共最多走几步棋（不是每一局）。
     pub max_steps: usize,
-    /// 整个命令最多点几次“开始 / 再来一次”；每一次都会用掉一条生命。
+    /// 整个命令最多点几次“开始 / 再来一次”；点一次「开始」或「再来一次」算一次；点了「再来一次」之后紧跟着的那个 Play 是同一次重来，不另算。
     pub tries: usize,
     pub dry_run: bool,
 }
@@ -57,7 +57,7 @@ fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Se
 pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions, sink: &mut dyn FnMut(Value)) -> Summary {
     let (mut steps, mut tries, mut taps, mut no_effect) = (0usize, 0usize, 0usize, 0usize);
     // after_board：刚玩完一局，还没有被明确告知“再来一次”。这时看到的 Play 可能是通关后的下一关，不点。
-    let (mut after_board, mut retrying) = (false, false);
+    let (mut after_board, mut retrying, mut free_play) = (false, false, false);
     let stop = loop {
         let seen = match dco.see_text(p) {
             Ok(s) => s,
@@ -85,6 +85,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             Screen::Dismiss(el) => ("dismiss", el),
             Screen::Retry(el) => {
                 if tries >= o.tries {
+                    sink(nav_record(clock, &seen, "retry", None, "stopped"));
                     break Stop::TriesDone;
                 }
                 ("retry", el)
@@ -94,7 +95,8 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                     sink(nav_record(clock, &seen, "level_ended", None, "stopped"));
                     break Stop::LevelEnded;
                 }
-                if tries >= o.tries {
+                if !free_play && tries >= o.tries {
+                    sink(nav_record(clock, &seen, "play", None, "stopped"));
                     break Stop::TriesDone;
                 }
                 ("play", el)
@@ -112,8 +114,13 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                         match s.stop {
                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
                             Stop::NoGrid(_) | Stop::ClassesChanged { .. } => {
+                                // 步数刚好在一局结束时用完：别再去点“再来一次”。
+                                if steps >= o.max_steps {
+                                    break Stop::StepsDone;
+                                }
                                 after_board = true;
                                 retrying = false;
+                                free_play = false;
                                 no_effect = 0;
                                 continue;
                             }
@@ -137,10 +144,13 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             break Stop::DryRun;
         }
         if taps >= MAX_TAPS {
+            sink(nav_record(clock, &seen, kind, None, "stopped"));
             break Stop::TapLimit;
         }
         taps += 1;
-        if kind != "dismiss" {
+        if kind == "play" && free_play {
+            free_play = false;
+        } else if kind != "dismiss" {
             tries += 1;
         }
         match tap_and_wait(dco, clock, p, &seen, &el) {
@@ -150,6 +160,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                 if kind == "retry" {
                     after_board = false;
                     retrying = true;
+                    free_play = true;
                 }
             }
             Ok(false) => {
@@ -203,6 +214,7 @@ mod tests {
         taps: Vec<String>,
         swipes: usize,
         tap_error: Option<DcoError>,
+        see_error: Option<DcoError>,
         /// 为真时，点按钮不换帧（模拟点了没反应）。
         stuck: bool,
         /// 逐次点按钮的脚本：`true` = 这一次点了没反应。用完以后看 `stuck`。
@@ -211,7 +223,7 @@ mod tests {
 
     impl World {
         fn new(frames: Vec<Frame>) -> World {
-            World { frames, at: 0, taps: vec![], swipes: 0, tap_error: None, stuck: false, stuck_script: vec![] }
+            World { frames, at: 0, taps: vec![], swipes: 0, tap_error: None, see_error: None, stuck: false, stuck_script: vec![] }
         }
         fn advance(&mut self) {
             if self.at + 1 < self.frames.len() {
@@ -241,6 +253,9 @@ mod tests {
             Ok(())
         }
         fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
+            if let Some(e) = self.see_error.clone() {
+                return Err(e);
+            }
             let texts: Vec<&str> = match &self.frames[self.at] {
                 Frame::Text(t) => t.clone(),
                 Frame::Board(_) => vec!["38", "90"],
@@ -285,9 +300,19 @@ mod tests {
     }
 
     fn run(w: &mut World, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
+        run_with(w, 50, tries, dry)
+    }
+
+    fn run_with(w: &mut World, max_steps: usize, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
         let mut log = vec![];
-        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps: 50, tries, dry_run: dry }, &mut |v| log.push(v));
+        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry }, &mut |v| log.push(v));
         (s, log)
+    }
+
+    fn assert_stopped_with_texts(log: &[Value]) {
+        let last = log.iter().rfind(|r| r["kind"] == "nav").unwrap();
+        assert_eq!(last["outcome"], "stopped");
+        assert!(!last["texts"].as_array().unwrap().is_empty());
     }
 
     fn text(t: &[&'static str]) -> Frame {
@@ -392,17 +417,19 @@ mod tests {
     #[test]
     fn the_retry_limit_counts_play_and_try_again_but_not_dismissals() {
         let mut w = World::cycling(vec!["Play", "a"], vec!["Play", "b"]);
-        let (s, _) = run(&mut w, 2, false);
+        let (s, log) = run(&mut w, 2, false);
         assert_eq!(s.stop, Stop::TriesDone);
         assert_eq!(w.taps.len(), 2);
+        assert_stopped_with_texts(&log);
     }
 
     #[test]
     fn popups_that_keep_coming_back_hit_the_tap_limit() {
         let mut w = World::cycling(vec!["Close", "a"], vec!["Close", "b"]);
-        let (s, _) = run(&mut w, 5, false);
+        let (s, log) = run(&mut w, 5, false);
         assert_eq!(s.stop, Stop::TapLimit);
         assert_eq!(w.taps.len(), MAX_TAPS);
+        assert_stopped_with_texts(&log);
     }
 
     #[test]
@@ -446,5 +473,62 @@ mod tests {
         w.stuck_script = vec![true, false, true, false, false];
         let (s, _) = run(&mut w, 5, false);
         assert_eq!(s.stop, Stop::NoMoves);
+    }
+
+    #[test]
+    fn a_spent_step_budget_stops_before_retrying_the_next_level() {
+        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Play"]), board(DEAD)]);
+        let (s, _) = run_with(&mut w, 1, 5, false);
+        assert_eq!(s.stop, Stop::StepsDone);
+        assert!(w.taps.is_empty());
+        assert_eq!(s.steps, 1);
+    }
+
+    #[test]
+    fn a_retry_through_the_start_box_is_one_try() {
+        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Level 1712", "Select boosters:", "Play", "B Play"]), board(DEAD)]);
+        let (s, _) = run(&mut w, 1, false);
+        assert_eq!(s.stop, Stop::NoMoves);
+        assert_eq!(w.taps, ["Try again", "Play"]);
+    }
+
+    #[test]
+    fn a_second_failure_after_a_retry_is_refused_when_tries_is_one() {
+        let mut w = World::new(vec![
+            board(A),
+            text(&["Out of moves", "Try again"]),
+            text(&["Play"]),
+            board(A),
+            text(&["Out of moves", "Try again"]),
+        ]);
+        let (s, log) = run(&mut w, 1, false);
+        assert_eq!(s.stop, Stop::TriesDone);
+        assert_eq!(w.taps, ["Try again", "Play"]);
+        assert_stopped_with_texts(&log);
+    }
+
+    #[test]
+    fn an_error_from_reading_the_screen_stops_with_it_and_taps_nothing() {
+        let mut w = World::new(vec![text(&["Play"])]);
+        w.see_error = Some(DcoError { code: "gone".into(), message: "y".into() });
+        let (s, _) = run(&mut w, 5, false);
+        assert_eq!(s.stop, Stop::Dco(DcoError { code: "gone".into(), message: "y".into() }));
+        assert!(w.taps.is_empty());
+    }
+
+    #[test]
+    fn two_retries_fit_in_a_budget_of_two_tries() {
+        let mut w = World::new(vec![
+            board(A),
+            text(&["Out of moves", "Try again"]),
+            text(&["Play"]),
+            board(A),
+            text(&["Out of moves", "Try again"]),
+            text(&["Play"]),
+            board(DEAD),
+        ]);
+        let (s, _) = run(&mut w, 2, false);
+        assert_eq!(s.stop, Stop::NoMoves);
+        assert_eq!(w.taps, ["Try again", "Play", "Try again", "Play"]);
     }
 }
