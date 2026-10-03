@@ -59,7 +59,33 @@ pub fn stop_code(stop: &Stop) -> &'static str {
         Stop::StepsDone => "steps_done",
         Stop::DryRun => "dry_run",
         Stop::Dco(_) => "dco",
+        Stop::Won => "won",
+        Stop::LevelEnded => "level_ended",
+        Stop::LivesOut => "lives_out",
+        Stop::Money => "money",
+        Stop::Ad => "ad",
+        Stop::UnknownScreen(_) => "unknown_screen",
+        Stop::NoEffect => "no_effect",
+        Stop::TriesDone => "tries_done",
+        Stop::TapLimit => "tap_limit",
     }
+}
+
+/// `--auto-next` 点按钮时印的一句话；停下的几种（没有点任何东西）由最后一句话说，这里返回 `None`。
+pub fn nav_line(rec: &Value) -> Option<String> {
+    let tapped = rec["tapped"].as_str()?;
+    let what = match rec["screen"].as_str().unwrap_or("") {
+        "play" => format!("点了「{tapped}」，开始新的一局"),
+        "retry" => format!("这一局没过，点了「{tapped}」重来"),
+        "dismiss" => format!("关掉了一个弹窗（{tapped}）"),
+        _ => return None,
+    };
+    Some(match rec["outcome"].as_str().unwrap_or("") {
+        "dry_run" => format!("画面上有「{tapped}」，会点它（试走，没有真点）"),
+        "no_effect" => format!("{what}；可是画面没有变化"),
+        "stopped" => format!("{what}；没点成"),
+        _ => what,
+    })
 }
 
 pub fn dco_error(e: &DcoError) -> String {
@@ -91,6 +117,21 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
         Stop::Stuck => (format!("停了：划了几次画面都没有变化。请看一眼屏幕上是不是弹出了什么。{tail}"), 1),
         Stop::StillMoving => (format!("停了：等了 8 秒画面还在动。{tail}"), 1),
         Stop::Dco(e) => (format!("停了：{} {tail}", dco_error(e)), 1),
+        Stop::Won => (format!("通关了。下一关的棋盘位置不一样，要先重新认棋盘，所以先停在这里。{tail}"), 0),
+        Stop::LevelEnded => (
+            format!("这一局结束了，我看不出是通关还是没过，为了不乱点先停在这里。要接着玩，请你自己点 Play。{tail}"),
+            0,
+        ),
+        Stop::LivesOut => (format!("生命用完了，先停下。等生命恢复了再让我继续。{tail}"), 0),
+        Stop::Money => (format!("出现了要花钱的画面，请你自己处理。我没有点任何东西。{tail}"), 1),
+        Stop::Ad => (format!("出现了广告，请你自己关掉。我没有点任何东西。{tail}"), 1),
+        Stop::UnknownScreen(texts) => {
+            let shown: Vec<&str> = texts.iter().map(String::as_str).filter(|t| !t.trim().is_empty()).take(8).collect();
+            (format!("出现了我不认识的画面，先停下，没有点任何东西。画面上的字：{}。{tail}", shown.join(" / ")), 1)
+        }
+        Stop::NoEffect => (format!("点了按钮，画面却一直没变化，先停下。请看一眼屏幕。{tail}"), 1),
+        Stop::TriesDone => (format!("开始和重来的次数到上限了，先停下。要接着来，再运行一次。{tail}"), 0),
+        Stop::TapLimit => (format!("点了很多次还没回到棋盘，先停下。请看一眼屏幕上是不是有弹窗在反复出现。{tail}"), 1),
     }
 }
 
@@ -157,6 +198,15 @@ mod tests {
             (Stop::StepsDone, 0),
             (Stop::NoMoves, 0),
             (Stop::DryRun, 0),
+            (Stop::Won, 0),
+            (Stop::LevelEnded, 0),
+            (Stop::LivesOut, 0),
+            (Stop::TriesDone, 0),
+            (Stop::Money, 1),
+            (Stop::Ad, 1),
+            (Stop::UnknownScreen(vec!["Claim".into()]), 1),
+            (Stop::NoEffect, 1),
+            (Stop::TapLimit, 1),
             (Stop::Stuck, 1),
             (Stop::StillMoving, 1),
             (Stop::NoGrid("x".into()), 1),
@@ -201,10 +251,53 @@ mod tests {
             Stop::StepsDone,
             Stop::DryRun,
             Stop::Dco(DcoError { code: "x".into(), message: "".into() }),
+            Stop::Won,
+            Stop::LevelEnded,
+            Stop::LivesOut,
+            Stop::Money,
+            Stop::Ad,
+            Stop::UnknownScreen(vec![]),
+            Stop::NoEffect,
+            Stop::TriesDone,
+            Stop::TapLimit,
         ];
         let mut codes: Vec<&str> = all.iter().map(stop_code).collect();
         codes.sort();
         codes.dedup();
         assert_eq!(codes.len(), all.len());
+    }
+
+    #[test]
+    fn nav_lines_say_what_was_pressed_and_never_use_jargon() {
+        let r = |screen: &str, outcome: &str| json!({"kind": "nav", "screen": screen, "tapped": "Play", "outcome": outcome});
+        assert_eq!(nav_line(&r("play", "changed")).unwrap(), "点了「Play」，开始新的一局");
+        assert_eq!(nav_line(&r("retry", "changed")).unwrap(), "这一局没过，点了「Play」重来");
+        assert_eq!(nav_line(&r("dismiss", "changed")).unwrap(), "关掉了一个弹窗（Play）");
+        assert!(nav_line(&r("play", "no_effect")).unwrap().ends_with("可是画面没有变化"));
+        assert!(nav_line(&r("play", "dry_run")).unwrap().contains("试走"));
+        // 没点任何东西的停下，不在这里说
+        assert_eq!(nav_line(&json!({"kind": "nav", "screen": "money", "tapped": null, "outcome": "stopped"})), None);
+        for s in ["play", "retry", "dismiss"] {
+            let line = nav_line(&r(s, "changed")).unwrap();
+            for w in ["snapshot", "element", "tap", "OCR", "daemon"] {
+                assert!(!line.to_lowercase().contains(&w.to_lowercase()), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_screen_shows_what_was_on_it_but_at_most_eight_pieces() {
+        let texts: Vec<String> = (1..=12).map(|i| format!("t{i}")).collect();
+        let (line, code) = stop_line(&Stop::UnknownScreen(texts), 0, Path::new("/x"));
+        assert_eq!(code, 1);
+        assert!(line.contains("t1 / t2") && line.contains("t8") && !line.contains("t9"), "{line}");
+        assert!(line.contains("没有点任何东西"));
+    }
+
+    #[test]
+    fn stop_sentences_for_money_and_ads_promise_nothing_was_pressed() {
+        for s in [Stop::Money, Stop::Ad] {
+            assert!(stop_line(&s, 3, Path::new("/x")).0.contains("没有点任何东西"));
+        }
     }
 }

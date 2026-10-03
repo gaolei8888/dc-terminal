@@ -211,3 +211,43 @@ fn a_socket_we_may_not_connect_to_is_blocked_not_down() {
     }
     assert_eq!(DcoClient::connect(dir.path()).err().unwrap().code, "dco_blocked");
 }
+
+/// 2026-10-03 真机通关后那一屏的 `see`（OCR）回复，只留 dct 用到的字段。
+#[test]
+fn see_text_reads_the_ocr_elements_and_tap_sends_the_snapshot_and_element_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake(dir.path(), TOKEN, |tool, args| match tool {
+        "see" => {
+            assert_eq!(args["source"], "ocr");
+            assert_eq!(args["window"]["app"], "iPhone Mirroring");
+            (json!({
+                "snapshot_id": "s6", "observation_id": "obs-4adac3d30f33736a", "sources": ["ocr"],
+                "elements": [
+                    {"id": "e1", "role": "text", "source": "ocr", "text": "Daily Stamps", "bounds": {"x": 1.0, "y": 2.0, "w": 3.0, "h": 4.0}},
+                    {"id": "e4", "role": "text", "source": "ocr", "text": "Play", "confidence": 1.0}
+                ]
+            }), false)
+        }
+        "tap" => {
+            assert_eq!((args["snapshot_id"].as_str(), args["element_id"].as_str()), (Some("s6"), Some("e4")));
+            (json!({"tapped": {"id": "e4", "text": "Play"}}), false)
+        }
+        other => panic!("没想到会调 {other}"),
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let seen = c.see_text(&profile()).unwrap();
+    assert_eq!((seen.snapshot_id.as_str(), seen.observation_id.as_deref()), ("s6", Some("obs-4adac3d30f33736a")));
+    assert_eq!(seen.elements.iter().map(|e| (e.id.as_str(), e.text.as_str())).collect::<Vec<_>>(), [("e1", "Daily Stamps"), ("e4", "Play")]);
+    c.tap(&seen.snapshot_id, "e4").unwrap();
+    drop(c);
+    assert_eq!(h.join().unwrap().iter().filter(|m| *m == "tools/call").count(), 2);
+}
+
+#[test]
+fn a_refused_tap_keeps_dcos_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let _h = fake(dir.path(), TOKEN, |_, _| (json!({"error": {"code": "needs_ticket", "message": "这个动作属于「付款」档"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let e = c.tap("s1", "e2").unwrap_err();
+    assert_eq!(e.code, "needs_ticket");
+}
