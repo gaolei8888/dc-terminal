@@ -12,6 +12,10 @@ pub enum Tier {
     Physical,
     #[serde(rename = "content")]
     Content,
+    /// 不能撤回的删除和授权：跟 `Money` 一样每次都要用户本人签，任何规则都不能
+    /// 放行（用户 2026-10-01 定）。只是新增的一档，旧的批准记录照旧有效。
+    #[serde(rename = "critical")]
+    Critical,
     #[serde(rename = "money")]
     Money,
 }
@@ -34,8 +38,14 @@ impl Tier {
             Tier::SelfOnly => "self",
             Tier::Physical => "physical",
             Tier::Content => "content",
+            Tier::Critical => "critical",
             Tier::Money => "money",
         }
+    }
+
+    /// dcv 里用户写的规则能不能放行这一档。只有比 `Critical` 低的才能。
+    pub fn rule_can_waive(self) -> bool {
+        self < Tier::Critical
     }
 
     /// `None` 表示不要票（只读）。物理动作全自动是用户定的（设计第 4 节）。
@@ -43,7 +53,7 @@ impl Tier {
         match self {
             Tier::Read => None,
             Tier::SelfOnly | Tier::Physical => Some(SignerRole::Auto),
-            Tier::Content | Tier::Money => Some(SignerRole::User),
+            Tier::Content | Tier::Critical | Tier::Money => Some(SignerRole::User),
         }
     }
 }
@@ -67,6 +77,83 @@ const NEGATION_ZH: &[&str] = &[
 ];
 const NEGATION_EN: &[&str] = &["don't", "dont", "not", "cancel", "no", "skip", "later", "discard"];
 
+// 2026-10-01 盲测（dc-octo 的 410 条标签）之后补的几类，同样只许增加。英文可以
+// 是短语（「delete account」），按整词连着比。
+// 不能撤回的删除和授权：`Critical`，任何规则都不能放行。「注销」单独不算——
+// Windows 上它是「退出登录」。
+const CRITICAL_ZH: &[&str] = &[
+    "删除账号", "删除帐号", "删除账户", "注销账号", "注销帐号", "注销账户", "抹掉", "抹除", "清空废纸篓", "恢复出厂", "格式化",
+    "授权", "信任此", "信任这", "信任该", "允许",
+];
+const CRITICAL_EN: &[&str] = &[
+    "delete account", "delete my account", "erase", "empty trash", "factory reset", "format disk", "format drive",
+    "format card", "wipe", "authorize", "authorise", "trust", "allow", "grant",
+];
+// 删除、安装、对外联络、登录：`Content`。
+const MORE_CONTENT_ZH: &[&str] = &[
+    "删除", "清空", "卸载", "移除", "重置", "安装", "立即下载", "仍要打开", "启用宏", "回复", "邀请", "投币", "登录",
+];
+const MORE_CONTENT_EN: &[&str] = &[
+    "delete", "remove", "uninstall", "reset", "install", "run anyway", "open anyway", "enable macros", "reply",
+    "invite", "forward", "sign in", "log in", "login",
+];
+// 丢掉东西的「不」：不保存、Don't save、放弃、Discard。按删除算（`Content`），
+// 不让否定把它压低。
+const DISCARD_ZH: &[&str] = &["不保存", "放弃"];
+const DISCARD_EN: &[&str] = &["don't save", "dont save", "do not save", "discard"];
+const MORE_MONEY_ZH: &[&str] = &["转账", "还款", "开通", "打赏"];
+const MORE_MONEY_EN: &[&str] = &["top up", "place bid", "reload balance", "reload card", "reload wallet"];
+/// 标签里有这些记号、又有数字，就是一个价钱：`Money`。
+const CURRENCY_MARKS: &[&str] = &["¥", "￥", "$", "€", "£", "💎", "金币", "钻石"];
+
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+/// 比词之前先把字摆正：全角变半角、去掉零宽字符、弯引号变直、去掉末尾的
+/// 省略号、去掉两个汉字之间的空格（OCR 常把「支付」认成「支 付」）、把粘在
+/// 一起的英文按大小写拆开（「SendNow」）、最后转小写。
+fn normalize(label: &str) -> String {
+    let mut chars: Vec<char> = label
+        .chars()
+        .filter_map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0),
+            '\u{3000}' => Some(' '),
+            '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' => None,
+            '\u{2018}' | '\u{2019}' => Some('\''),
+            c => Some(c),
+        })
+        .collect();
+    loop {
+        while chars.last().is_some_and(|c| c.is_whitespace()) {
+            chars.pop();
+        }
+        if chars.last() == Some(&'…') {
+            chars.pop();
+        } else if chars.ends_with(&['.', '.', '.']) {
+            chars.truncate(chars.len() - 3);
+        } else {
+            break;
+        }
+    }
+    let cjk_beside = |i: usize| {
+        let prev = chars[..i].iter().rev().find(|c| !c.is_whitespace());
+        let next = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+        prev.is_some_and(|&c| is_cjk(c)) && next.is_some_and(|&c| is_cjk(c))
+    };
+    let mut out = String::with_capacity(chars.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() && cjk_beside(i) {
+            continue;
+        }
+        if i > 0 && c.is_ascii_uppercase() && chars[i - 1].is_ascii_lowercase() {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out.trim().to_lowercase()
+}
+
 fn words(label: &str) -> Vec<String> {
     label
         .replace('\u{2019}', "'")
@@ -77,12 +164,25 @@ fn words(label: &str) -> Vec<String> {
         .collect()
 }
 
+/// 中文按子串比；英文按整词比，短语就按连着的几个整词比。
 fn hit(label: &str, zh: &[&str], en: &[&str]) -> bool {
-    zh.iter().any(|z| label.contains(z)) || words(label).iter().any(|w| en.contains(&w.as_str()))
+    if zh.iter().any(|z| label.contains(z)) {
+        return true;
+    }
+    let joined = format!(" {} ", words(label).join(" "));
+    en.iter().any(|e| joined.contains(&format!(" {e} ")))
+}
+
+fn is_price(clause: &str) -> bool {
+    CURRENCY_MARKS.iter().any(|m| clause.contains(m)) && clause.chars().any(|c| c.is_ascii_digit())
 }
 
 fn is_money_clause(clause: &str) -> bool {
-    hit(clause, MONEY_ZH, MONEY_EN)
+    hit(clause, MONEY_ZH, MONEY_EN) || hit(clause, MORE_MONEY_ZH, MORE_MONEY_EN) || is_price(clause)
+}
+
+fn is_discard(clause: &str) -> bool {
+    hit(clause, DISCARD_ZH, DISCARD_EN)
 }
 
 fn negated(label: &str) -> bool {
@@ -93,8 +193,9 @@ fn negated(label: &str) -> bool {
 
 /// A clause that names money can never be hidden by a negation word — see
 /// design ruling: 「不限量购买」/"No-fee checkout" must still read as `Money`.
+/// 丢掉东西的说法（「不保存」「Don't save」）同理：它不是拒绝，是删除。
 fn effectively_negated(clause: &str) -> bool {
-    !is_money_clause(clause) && negated(clause)
+    !is_money_clause(clause) && !is_discard(clause) && negated(clause)
 }
 
 fn split_clauses(label: &str) -> Vec<&str> {
@@ -106,9 +207,11 @@ fn split_clauses(label: &str) -> Vec<&str> {
 }
 
 fn score_clause(clause: &str) -> Tier {
-    if hit(clause, MONEY_ZH, MONEY_EN) {
+    if is_money_clause(clause) {
         Tier::Money
-    } else if hit(clause, CONTENT_ZH, CONTENT_EN) {
+    } else if hit(clause, CRITICAL_ZH, CRITICAL_EN) {
+        Tier::Critical
+    } else if hit(clause, CONTENT_ZH, CONTENT_EN) || hit(clause, MORE_CONTENT_ZH, MORE_CONTENT_EN) || is_discard(clause) {
         Tier::Content
     } else {
         Tier::Read
@@ -119,7 +222,8 @@ fn score_clause(clause: &str) -> Tier {
 /// 多意图的标签被前半句的否定完全压低。每句开头的否定说不清本意，只有非否定句
 /// 才能撑起来。
 pub fn tier_for_label(label: &str) -> Tier {
-    let label = label.trim();
+    let label = normalize(label);
+    let label = label.as_str();
     if label.is_empty() {
         return Tier::Read;
     }
@@ -167,7 +271,8 @@ pub fn tier_for_step(action: &str, arg: &str) -> Tier {
         // 选文件就是把本机文件交出去（dcv 会话提醒的）。
         "pick_file" => Tier::Content,
         "tap_by_intent" | "confirm_dialog" => {
-            let a = arg.trim();
+            let a = normalize(arg);
+            let a = a.as_str();
             let clauses = split_clauses(a);
 
             // Only return SelfOnly if EVERY clause is negated (a money clause is
@@ -210,7 +315,18 @@ mod tests {
         assert!(Tier::Read < Tier::SelfOnly);
         assert!(Tier::SelfOnly < Tier::Physical);
         assert!(Tier::Physical < Tier::Content);
-        assert!(Tier::Content < Tier::Money);
+        assert!(Tier::Content < Tier::Critical);
+        assert!(Tier::Critical < Tier::Money);
+    }
+
+    #[test]
+    fn only_tiers_below_critical_can_be_waived_by_a_rule() {
+        for t in [Tier::Read, Tier::SelfOnly, Tier::Physical, Tier::Content] {
+            assert!(t.rule_can_waive(), "{t:?}");
+        }
+        for t in [Tier::Critical, Tier::Money] {
+            assert!(!t.rule_can_waive(), "{t:?}");
+        }
     }
 
     #[test]
@@ -220,6 +336,7 @@ mod tests {
             (Tier::SelfOnly, "self"),
             (Tier::Physical, "physical"),
             (Tier::Content, "content"),
+            (Tier::Critical, "critical"),
             (Tier::Money, "money"),
         ] {
             assert_eq!(t.name(), n);
@@ -235,6 +352,7 @@ mod tests {
         // 物理动作全自动：用户定的「便利性第一位」。
         assert_eq!(Tier::Physical.required_signer(), Some(SignerRole::Auto));
         assert_eq!(Tier::Content.required_signer(), Some(SignerRole::User));
+        assert_eq!(Tier::Critical.required_signer(), Some(SignerRole::User));
         assert_eq!(Tier::Money.required_signer(), Some(SignerRole::User));
     }
 
@@ -287,7 +405,7 @@ mod tests {
 
     #[test]
     fn negations_are_not_the_thing_they_negate() {
-        for arg in ["Don't save", "Don\u{2019}t save", "不保存", "取消发布", "Not now", "Cancel", "暂不上传", "Discard post"] {
+        for arg in ["取消发布", "Not now", "Cancel", "暂不上传", "不允许", "Don't Allow", "Keep subscription", "Skip"] {
             assert_eq!(tier_for_step("tap_by_intent", arg), Tier::SelfOnly, "{arg}");
         }
         assert_eq!(tier_for_step("confirm_dialog", "Cancel"), Tier::SelfOnly);
@@ -310,7 +428,7 @@ mod tests {
         assert_eq!(tier_for_label("Pay now"), Tier::Money);
         assert_eq!(tier_for_label(""), Tier::Read);
         assert_eq!(tier_for_label("Posts"), Tier::Read);
-        assert_eq!(tier_for_label("Don't save"), Tier::Read);
+        assert_eq!(tier_for_label("Cancel"), Tier::Read);
         // 运行时的兜底不管「Next」：那是批准流程时的事，运行时再拦会重回「太严」。
         assert_eq!(tier_for_label("Next"), Tier::Read);
     }
@@ -341,6 +459,81 @@ mod tests {
         assert_eq!(raise(Tier::SelfOnly, "No, post anyway", true), Tier::Content);
         // All clauses negated still counts as negation.
         assert_eq!(tier_for_step("tap_by_intent", "Not now, maybe later"), Tier::SelfOnly);
+    }
+
+    #[test]
+    fn throwing_work_away_is_not_a_decline() {
+        // 「不保存」「Don't save」「放弃」会丢掉东西：按删除算，不按否定压低。
+        for arg in ["Don't save", "Don\u{2019}t save", "Do not save", "不保存", "放弃修改", "Discard post", "Discard"] {
+            assert_eq!(tier_for_label(arg), Tier::Content, "{arg}");
+            assert_eq!(tier_for_step("tap_by_intent", arg), Tier::Content, "{arg}");
+        }
+    }
+
+    #[test]
+    fn deleting_installing_and_reaching_out_are_content() {
+        for arg in [
+            "删除", "删除照片", "清空", "卸载", "移除", "重置", "Delete", "Remove", "Uninstall", "Reset",
+            "安装", "立即下载", "仍要打开", "启用宏", "Install", "Run anyway", "Open anyway", "Enable Macros",
+            "回复", "邀请好友", "投币", "Reply", "Invite", "Forward",
+            "登录", "Sign in", "Log in",
+        ] {
+            assert_eq!(tier_for_label(arg), Tier::Content, "{arg}");
+            assert_eq!(tier_for_step("tap_by_intent", arg), Tier::Content, "{arg}");
+        }
+    }
+
+    #[test]
+    fn irreversible_deletes_and_grants_are_critical() {
+        for arg in [
+            "删除账号", "注销账号", "抹掉", "抹掉所有内容和设置", "清空废纸篓", "恢复出厂设置", "格式化",
+            "Delete account", "Delete Account", "Erase", "Erase All Content and Settings", "Empty Trash",
+            "Factory reset", "Format disk", "Wipe",
+            "授权", "授权登录", "同意授权", "信任此设备", "允许", "允许访问", "Authorize", "Trust", "Trust this device",
+            "Allow", "Allow access", "Grant access",
+        ] {
+            assert_eq!(tier_for_label(arg), Tier::Critical, "{arg}");
+            assert_eq!(tier_for_step("tap_by_intent", arg), Tier::Critical, "{arg}");
+        }
+        // 拒绝授权就是拒绝：照常压低。
+        for arg in ["不允许", "Don't Allow", "Not now"] {
+            assert_eq!(tier_for_label(arg), Tier::Read, "{arg}");
+        }
+    }
+
+    #[test]
+    fn more_money_words_and_bare_prices_are_money() {
+        for arg in [
+            "转账", "立即还款", "开通会员", "打赏", "Top up", "Place bid", "Reload balance",
+            "$99.99", "¥ 68", "￥6", "€5", "£3.50", "💎 500", "500 金币", "100钻石", "US$ 4.99",
+        ] {
+            assert_eq!(tier_for_label(arg), Tier::Money, "{arg}");
+            assert_eq!(tier_for_step("tap_by_intent", arg), Tier::Money, "{arg}");
+        }
+        // 只有币种记号、没有数字的不算价钱。
+        assert_eq!(tier_for_label("$"), Tier::Read);
+        assert_eq!(tier_for_label("金币商城"), Tier::Read);
+    }
+
+    #[test]
+    fn spacing_width_case_and_zero_width_do_not_hide_words() {
+        for (arg, want) in [
+            ("立即支 付", Tier::Money),
+            ("发 送", Tier::Content),
+            ("SendNow", Tier::Content),
+            ("PayNow", Tier::Money),
+            ("ＰＡＹ", Tier::Money),
+            ("ｄｅｌｅｔｅ ａｃｃｏｕｎｔ", Tier::Critical),
+            ("删\u{200B}除账号", Tier::Critical),
+            ("DELETE ACCOUNT", Tier::Critical),
+            ("删除账号…", Tier::Critical),
+            ("Delete account...", Tier::Critical),
+        ] {
+            assert_eq!(tier_for_label(arg), want, "{arg:?}");
+        }
+        // 整词照旧：「Posts」标签页、「Payments」历史不因为去空格变成别的词。
+        assert_eq!(tier_for_label("Posts"), Tier::Read);
+        assert_eq!(tier_for_label("Settings"), Tier::Read);
     }
 
     #[test]

@@ -191,6 +191,7 @@ fn tier_zh(t: Tier) -> &'static str {
         Tier::SelfOnly => "只影响自己",
         Tier::Physical => "物理动作",
         Tier::Content => "对外",
+        Tier::Critical => "关键",
         Tier::Money => "动钱",
     }
 }
@@ -263,6 +264,10 @@ pub fn approve(
         // 是硬约束（控制层设计）。
         if proposed[i] == Tier::Money && *t < Tier::Money {
             bail!("第{n}步涉及付钱，不能改低");
+        }
+        // 关键档（不能撤回的删除、授权）同理：任何规则都不能放行，批准时也不能改低。
+        if proposed[i] == Tier::Critical && *t < Tier::Critical {
+            bail!("第{n}步不能撤回或授权，不能改低");
         }
         tiers[i] = *t;
     }
@@ -744,6 +749,22 @@ mod tests {
         let e = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(4, Tier::Content)], 1000).unwrap_err();
         assert!(e.to_string().contains("涉及付钱") && e.to_string().contains("不能改低"), "{e}");
         assert_eq!(w.dcv.approve_calls.get(), 0, "钱档被拒的改动不该走到 dcv 那一步");
+    }
+
+    #[test]
+    fn lowering_a_critical_step_is_refused() {
+        let w = world();
+        let mut v = edit_bio(false);
+        v["steps"][3]["arg"] = json!("删除账号");
+        *w.dcv.show.borrow_mut() = v;
+        let e = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(4, Tier::Content)], 1000).unwrap_err();
+        assert!(e.to_string().contains("不能撤回或授权") && e.to_string().contains("不能改低"), "{e}");
+        assert_eq!(w.dcv.approve_calls.get(), 0, "关键档被拒的改动不该走到 dcv 那一步");
+        let mut v = edit_bio(false);
+        v["steps"][3]["arg"] = json!("删除账号");
+        *w.dcv.show.borrow_mut() = v;
+        let sa = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(4, Tier::Money)], 1000).unwrap();
+        assert_eq!(sa.approval.step_tiers[3], Tier::Money, "改得更严照样行");
     }
 
     #[test]
