@@ -2,6 +2,8 @@
 //! 所以能直接拿存下来的真实棋盘测（设计：docs/superpowers/specs/2026-10-02-dct-match3-play-design.md）。
 pub mod board;
 pub mod choose;
+#[cfg(unix)]
+pub mod dco;
 pub mod play;
 pub mod sim;
 
@@ -13,3 +15,5 @@ pub use sim::{Move, Pos};
 mod tests;
 #[cfg(test)]
 mod play_tests;
+#[cfg(all(test, unix))]
+mod dco_tests;
