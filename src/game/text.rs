@@ -108,7 +108,7 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
     match stop {
         Stop::StepsDone => (format!("到设定的步数了。{tail}。要接着玩，再运行一次。"), 0),
         Stop::NoMoves => (format!("停了：没有能走的步了。{tail}"), 0),
-        Stop::DryRun => ("试走结束，没有真划。".into(), 0),
+        Stop::DryRun => ("试走结束，没有真点也没有真划。".into(), 0),
         Stop::NoGrid(why) => (format!("停了：读不出棋盘（{why}）。多半是这一关结束了，或者弹出了别的画面。{tail}"), 1),
         Stop::ClassesChanged { was, now } => (
             format!("停了：棋盘上的颜色种类一下子变多了（原来 {was} 种，现在 {now} 种），多半是这一关结束了，或者弹出了窗口。{tail}"),
@@ -123,11 +123,12 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
             0,
         ),
         Stop::LivesOut => (format!("生命用完了，先停下。等生命恢复了再让我继续。{tail}"), 0),
-        Stop::Money => (format!("出现了要花钱的画面，请你自己处理。我没有点任何东西。{tail}"), 1),
-        Stop::Ad => (format!("出现了广告，请你自己关掉。我没有点任何东西。{tail}"), 1),
+        Stop::Money => (format!("出现了要花钱的画面，请你自己处理。这个画面上我没有点任何东西。{tail}"), 1),
+        Stop::Ad => (format!("出现了广告，请你自己关掉。这个画面上我没有点任何东西。{tail}"), 1),
         Stop::UnknownScreen(texts) => {
             let shown: Vec<&str> = texts.iter().map(String::as_str).filter(|t| !t.trim().is_empty()).take(8).collect();
-            (format!("出现了我不认识的画面，先停下，没有点任何东西。画面上的字：{}。{tail}", shown.join(" / ")), 1)
+            let seen = if shown.is_empty() { "画面上没有读到字。".to_string() } else { format!("画面上的字：{}。", shown.join(" / ")) };
+            (format!("出现了我不认识的画面，先停下。这个画面上我没有点任何东西。{seen}{tail}"), 1)
         }
         Stop::NoEffect => (format!("点了按钮，画面却一直没变化，先停下。请看一眼屏幕。{tail}"), 1),
         Stop::TriesDone => (format!("开始和重来的次数到上限了，先停下。要接着来，再运行一次。{tail}"), 0),
@@ -292,6 +293,17 @@ mod tests {
         assert_eq!(code, 1);
         assert!(line.contains("t1 / t2") && line.contains("t8") && !line.contains("t9"), "{line}");
         assert!(line.contains("没有点任何东西"));
+    }
+
+    #[test]
+    fn an_unknown_screen_with_no_words_says_nothing_was_read() {
+        let (line, _) = stop_line(&Stop::UnknownScreen(vec!["  ".into()]), 0, Path::new("/x"));
+        assert!(line.contains("画面上没有读到字。") && !line.contains("画面上的字"), "{line}");
+        assert!(line.contains("这个画面上我没有点任何东西"), "{line}");
+        assert!(stop_line(&Stop::DryRun, 0, Path::new("/x")).0.contains("没有真点也没有真划"));
+        for s in [Stop::Money, Stop::Ad] {
+            assert!(stop_line(&s, 3, Path::new("/x")).0.contains("这个画面上我没有点任何东西"));
+        }
     }
 
     #[test]
