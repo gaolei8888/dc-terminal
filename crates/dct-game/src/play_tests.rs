@@ -21,7 +21,7 @@ struct Fake {
     last: Option<Result<GridRead, DcoError>>,
     swipes: Vec<((f64, f64), (f64, f64))>,
     swipe_err: Option<DcoError>,
-    /// show_status 和 swipe 按先后记下来，测“先想、再看、才划”。
+    /// show_status 和 swipe 按先后记下来，测 play() 不发状态。
     events: Vec<String>,
 }
 impl Fake {
@@ -399,36 +399,47 @@ fn a_lopsided_read_later_in_a_run_is_still_played() {
 }
 
 #[test]
-fn a_step_says_think_then_look_before_the_swipe() {
+fn a_step_sends_no_status_only_the_swipe() {
+    // 规则选步约 1 ms，章鱼没法“想”这么短；think/look 留给以后慢的（模型）决策。
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
     let (_, _) = run(&mut d, 1, false);
-    assert_eq!(d.events, ["think", "look", "swipe"]);
+    assert_eq!(d.events, ["swipe"]);
 }
 
 #[test]
-fn a_dry_run_still_says_think_then_look() {
+fn a_dry_run_sends_no_status() {
     let mut d = Fake::new(vec![Ok(grid(A))]);
     let (s, _) = run(&mut d, 5, true);
     assert_eq!(s.stop, Stop::DryRun);
-    assert_eq!(d.events, ["think", "look"]);
+    assert!(d.events.is_empty(), "{:?}", d.events);
 }
 
 #[test]
-fn every_step_gets_its_own_think_look_pair() {
-    // 第一步划完落定在 A 的上下翻转（也有能走的步），第二步在它上面选
+fn several_steps_send_no_status() {
     let b: &[&[u16]] = &[&[3, 2, 3, 2], &[2, 3, 1, 3], &[1, 1, 2, 1]];
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
     let (s, _) = run(&mut d, 2, false);
     assert_eq!(s.steps, 2);
-    assert_eq!(d.events, ["think", "look", "swipe", "think", "look", "swipe"]);
+    assert_eq!(d.events, ["swipe", "swipe"]);
 }
 
 #[test]
-fn no_moves_still_ends_with_look_after_think() {
+fn no_moves_sends_no_status() {
     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
     let (s, _) = run(&mut d, 5, false);
     assert_eq!(s.stop, Stop::NoMoves);
-    assert_eq!(d.events, ["think", "look"]);
+    assert!(d.events.is_empty(), "{:?}", d.events);
+}
+
+#[test]
+fn the_status_trait_method_still_exists_but_play_never_calls_it() {
+    // 方法留着给以后的慢决策；录音假件能收到直接调用，play() 却一次都不调。
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    Dco::show_status(&mut d, "think");
+    assert_eq!(d.events, ["think"]);
+    d.events.clear();
+    let (_, _) = run(&mut d, 1, false);
+    assert!(!d.events.iter().any(|e| e == "think" || e == "look"), "{:?}", d.events);
 }
 
 #[test]
@@ -481,4 +492,64 @@ fn without_the_fixed_list_the_same_grid_swipes_a_hole() {
     let (p, swipes) = play_holes(vec![]);
     let fixed = [(0, 2), (3, 0), (3, 3)];
     assert!(swipe_cells(&p, &swipes).iter().any(|c| fixed.contains(c)), "{swipes:?}");
+}
+
+// ---- 每步记录里的 swipe：真实端点和起始时刻，给章鱼的叠加层日志对账 ----
+
+fn r4(v: f64) -> f64 {
+    (v * 10000.0).round() / 10000.0
+}
+
+#[test]
+fn the_record_carries_the_real_swipe_points_start_and_duration() {
+    let p = profile(3, 4);
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    let mut log = vec![];
+    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false }, &mut |v| log.push(v));
+    let (f, t) = d.swipes[0];
+    let sw = &log[0]["swipe"];
+    assert_eq!(sw["from"], json!([r4(f.0), r4(f.1)]));
+    assert_eq!(sw["to"], json!([r4(t.0), r4(t.1)]));
+    // 端点就是选中那步两格的中心
+    let c = &log[0]["candidates"][log[0]["chosen"].as_u64().unwrap() as usize];
+    let (a, b) = (c["a"].as_array().unwrap(), c["b"].as_array().unwrap());
+    let [x, y, w, h] = p.region;
+    let ctr = |r: u64, c: u64| json!([r4(x + (c as f64 + 0.5) / 4.0 * w), r4(y + (r as f64 + 0.5) / 3.0 * h)]);
+    assert_eq!(sw["from"], ctr(a[0].as_u64().unwrap(), a[1].as_u64().unwrap()));
+    assert_eq!(sw["to"], ctr(b[0].as_u64().unwrap(), b[1].as_u64().unwrap()));
+    // 起始时刻 = 划之前一刻的时钟（记录的 time_ms 也是那一刻）
+    assert_eq!(sw["started_ms"], 1000);
+    assert_eq!(sw["started_ms"], log[0]["time_ms"]);
+    assert_eq!(sw["duration_ms"], log[0]["timing_ms"]["swipe"]);
+}
+
+#[test]
+fn a_later_step_starts_its_swipe_after_the_earlier_settle() {
+    let b: &[&[u16]] = &[&[3, 2, 3, 2], &[2, 3, 1, 3], &[1, 1, 2, 1]];
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let (_, log) = run(&mut d, 2, false);
+    let s0 = log[0]["swipe"]["started_ms"].as_u64().unwrap();
+    let s1 = log[1]["swipe"]["started_ms"].as_u64().unwrap();
+    assert!(s1 > s0, "{s0} {s1}");
+    assert_eq!(s1, log[1]["time_ms"].as_u64().unwrap());
+}
+
+#[test]
+fn a_dry_run_record_has_no_swipe() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let (_, log) = run(&mut d, 5, true);
+    assert!(log[0].get("swipe").is_none(), "{}", log[0]);
+}
+
+#[test]
+fn a_refused_swipe_record_still_has_swipe_points() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    d.swipe_err = Some(err("halted"));
+    let (_, log) = run(&mut d, 10, false);
+    let sw = &log[0]["swipe"];
+    assert_eq!(sw["from"].as_array().unwrap().len(), 2);
+    assert_eq!(sw["to"].as_array().unwrap().len(), 2);
+    assert_eq!(sw["started_ms"], log[0]["time_ms"]);
+    assert_eq!(sw["duration_ms"], log[0]["timing_ms"]["swipe"]);
+    assert_eq!(log[0]["swiped"], false);
 }

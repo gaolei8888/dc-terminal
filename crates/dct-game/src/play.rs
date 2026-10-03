@@ -216,13 +216,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de)) else {
             break Stop::NoGrid("棋盘的行列数对不上".into());
         };
-        // 状态调用放在计时之外，timing_ms 的 choose / read 不被它拖慢；think 之后紧跟 look，
-        // 后面不管是 NoMoves / Stuck 还是真划，都已经配成对了。
-        dco.show_status("think");
+        // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。
+        // show_status 留给以后慢的（模型）决策。
         let t_choose = clock.now_ms();
         let cands: Vec<Candidate> = choose(&board);
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
-        dco.show_status("look");
         // 同一盘棋上划了没反应的步，不再重复选。
         let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
         let Some(pick) = pick else {
@@ -247,9 +245,15 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
             sink(rec);
             break Stop::DryRun;
         }
+        // 端点和起始时刻原样记进记录，章鱼叠加层的事件日志靠它跟 dct 真做的对账（窗口 0–1 比例）。
+        let (from, to) = (centre(p, chosen.mv.a), centre(p, chosen.mv.b));
+        let r4 = |v: f64| (v * 10000.0).round() / 10000.0;
         let t_swipe = clock.now_ms();
-        if let Err(e) = dco.swipe(p, centre(p, chosen.mv.a), centre(p, chosen.mv.b)) {
-            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": clock.now_ms().saturating_sub(t_swipe), "settle": 0 });
+        let res = dco.swipe(p, from, to);
+        let swipe_ms = clock.now_ms().saturating_sub(t_swipe);
+        rec["swipe"] = json!({ "from": [r4(from.0), r4(from.1)], "to": [r4(to.0), r4(to.1)], "started_ms": t_swipe, "duration_ms": swipe_ms });
+        if let Err(e) = res {
+            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": 0 });
             rec["outcome"] = json!("stopped");
             sink(rec);
             break Stop::Dco(e);
@@ -257,7 +261,6 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         // 划成功了才算走了一步。
         steps += 1;
         rec["swiped"] = json!(true);
-        let swipe_ms = clock.now_ms().saturating_sub(t_swipe);
         let t_settle = clock.now_ms();
         let result = settle(dco, clock, p, &g);
         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });

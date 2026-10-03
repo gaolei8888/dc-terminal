@@ -53,7 +53,6 @@ fn fake_dco(home: &std::path::Path, swipe_error: Option<&'static str>) -> std::t
                         ("read_grid", _) => (board(), false),
                         ("swipe", Some(code)) => (json!({"error": {"code": code, "message": "x"}}), true),
                         ("swipe", None) => (json!({"swiped": true}), false),
-                        ("show_status", _) => (json!({"ok": true}), false),
                         (other, _) => panic!("没想到会调 {other}"),
                     };
                     json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
@@ -65,10 +64,6 @@ fn fake_dco(home: &std::path::Path, swipe_error: Option<&'static str>) -> std::t
     })
 }
 
-/// 状态章鱼（show_status）是 dct 顺带发的，跟这些测试要查的“划了什么、读了什么”无关，比较前先滤掉。
-fn without_status(tools: Vec<String>) -> Vec<String> {
-    tools.into_iter().filter(|t| t != "show_status").collect()
-}
 
 fn dct(home: &std::path::Path, args: &[&str]) -> (String, String, i32) {
     let o = Command::new(env!("CARGO_BIN_EXE_dct")).args(args).env("HOME", home).stdin(std::process::Stdio::null()).output().unwrap();
@@ -90,9 +85,8 @@ fn a_dry_run_prints_the_move_never_swipes_and_logs_it() {
     assert!(out.contains("第 1 步：") && out.contains("试走，没有真划"), "{out}");
     assert!(out.contains("试走结束"), "{out}");
     let tools = h.join().unwrap();
-    // 先读盘，再“想”“看”各一次（试走也发）
-    assert_eq!(tools, ["read_grid", "show_status", "show_status"]);
-    assert_eq!(without_status(tools), vec!["read_grid"], "试走不该划");
+    // 只读盘：不划，也不发 show_status（规则选步太快，不发 think/look）
+    assert_eq!(tools, ["read_grid"], "试走只该读盘");
     let lines = log_lines(home.path());
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0]["game"], "candy-crush");
@@ -109,7 +103,7 @@ fn a_halted_dco_stops_the_game_with_a_plain_sentence_and_a_failing_exit_code() {
     let (out, err, code) = dct(home.path(), &["game", "play", "--steps", "3"]);
     assert_eq!(code, 1, "{out}{err}");
     assert!(err.contains("急停"), "{err}");
-    assert_eq!(without_status(h.join().unwrap()), vec!["read_grid", "swipe"]);
+    assert_eq!(h.join().unwrap(), vec!["read_grid", "swipe"]);
     assert!(err.contains("走了 0 步"), "{err}");
     assert!(out.contains("这一步没划成") && !out.contains("消 ") && !out.contains("第 1 步"), "{out}");
     let lines = log_lines(home.path());
@@ -245,7 +239,6 @@ fn fake_dco_world(home: &std::path::Path, frames: Vec<Frame>) -> std::thread::Jo
                             Frame::Board => (board(), false),
                             Frame::Text(_) => (json!({"error": {"code": "not_a_grid", "message": "这块区域分不清类别"}}), true),
                         },
-                        "show_status" => (json!({"ok": true}), false),
                         other => panic!("没想到会调 {other}"),
                     };
                     json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
@@ -269,7 +262,7 @@ fn auto_next_dry_run_says_what_it_would_press_and_presses_nothing() {
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.contains("画面上有「Play」，会点它"), "{out}");
     let (tools, taps) = h.join().unwrap();
-    assert_eq!(without_status(tools), vec!["see"]);
+    assert_eq!(tools, vec!["see"]);
     assert!(taps.is_empty());
     let nav = nav_records(home.path());
     assert_eq!((nav[0]["screen"].as_str(), nav[0]["outcome"].as_str()), (Some("play"), Some("dry_run")));
@@ -312,7 +305,7 @@ fn without_auto_next_the_screen_is_never_read_as_text() {
     let h = fake_dco_world(home.path(), vec![Frame::Board]);
     let (out, err, code) = dct(home.path(), &["game", "play", "--dry-run"]);
     assert_eq!(code, 0, "{out}{err}");
-    assert_eq!(without_status(h.join().unwrap().0), vec!["read_grid"]);
+    assert_eq!(h.join().unwrap().0, vec!["read_grid"]);
 }
 
 #[test]
