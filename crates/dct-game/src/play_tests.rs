@@ -129,6 +129,71 @@ fn halted_on_swipe_stops_and_logs_it() {
     let (s, log) = run(&mut d, 10, false);
     assert_eq!(s.stop, Stop::Dco(err("halted")));
     assert_eq!(log[0]["outcome"], "stopped");
+    assert_eq!(s.steps, 0, "划被拒绝，不算走了一步");
+    assert_eq!(log[0]["swiped"], false);
+}
+
+#[test]
+fn a_swipe_that_happened_is_marked_swiped_and_counted() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let (s, log) = run(&mut d, 1, false);
+    assert_eq!(s.steps, 1);
+    assert_eq!(log[0]["swiped"], true);
+}
+
+#[test]
+fn settle_never_finishing_after_a_swipe_counts_the_step_and_is_marked_swiped() {
+    let mut reads = vec![Ok(grid(A))];
+    for i in 0..200u16 {
+        reads.push(Ok(grid(&[&[i, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 2]])));
+    }
+    let mut d = Fake::new(reads);
+    let (s, log) = run(&mut d, 10, false);
+    assert_eq!((s.steps, &s.stop), (1, &Stop::StillMoving));
+    assert_eq!((log[0]["outcome"].as_str(), log[0]["swiped"].as_bool()), (Some("stopped"), Some(true)));
+}
+
+#[test]
+fn nothing_readable_after_a_swipe_is_no_grid_not_still_moving() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into() })]);
+    let (s, _) = run(&mut d, 10, false);
+    assert_eq!(s.stop, Stop::NoGrid("结果页".into()));
+    assert_eq!(s.steps, 1);
+}
+
+#[test]
+fn a_clock_that_goes_backwards_does_not_panic() {
+    // 每隔一次读数就往回跳一大截。
+    struct Back(std::cell::Cell<u64>, u64);
+    impl Clock for Back {
+        fn now_ms(&self) -> u64 {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() % 2 == 0 { self.1 } else { self.1 + 1_000_000 }
+        }
+        fn sleep_ms(&mut self, ms: u64) {
+            self.1 += ms;
+        }
+    }
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let mut log = vec![];
+    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false }, &mut |v| log.push(v));
+    // 读盘到落定都过了一轮，没有 panic 就行；用一个会倒着走的钟再跑一遍无法落定的情形
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false }, &mut |_| {});
+}
+
+#[test]
+fn candidate_features_are_nested_under_features() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let (_, log) = run(&mut d, 10, true);
+    let c = &log[0]["candidates"][0];
+    for k in ["a", "b", "score", "features"] {
+        assert!(c.get(k).is_some(), "缺 {k}");
+    }
+    for k in ["cleared", "cascade", "striped", "wrapped", "bomb", "triggered", "special_swap", "lowest_row"] {
+        assert!(c["features"].get(k).is_some(), "features 缺 {k}");
+        assert!(c.get(k).is_none(), "{k} 不该在外层");
+    }
 }
 
 #[test]

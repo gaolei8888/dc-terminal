@@ -61,6 +61,8 @@ enum Settle {
     Settled(GridRead),
     NoChange(GridRead),
     StillMoving,
+    /// 划了以后一张读得出的棋盘都没见到（多半是结果页）。
+    NoGrid(String),
     Failed(DcoError),
 }
 
@@ -78,10 +80,13 @@ fn settle(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, before: &GridRe
     clock.sleep_ms(FIRST_WAIT_MS);
     let mut prev: Option<GridRead> = None;
     let mut changed = false;
+    let mut last_unreadable: Option<String> = None;
+    let mut readable = false;
     loop {
-        let waited = clock.now_ms() - t0;
+        let waited = clock.now_ms().saturating_sub(t0);
         match dco.read_grid(p) {
             Ok(g) => {
+                readable = true;
                 if !same(&g, before) {
                     changed = true;
                 }
@@ -95,11 +100,17 @@ fn settle(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, before: &GridRe
                 prev = Some(g);
             }
             // 动画中间读不出来是常事：接着等，等到时间到。别的错误（急停、锁屏）马上停。
-            Err(e) if e.code == "not_a_grid" => prev = None,
+            Err(e) if e.code == "not_a_grid" => {
+                last_unreadable = Some(e.message);
+                prev = None;
+            }
             Err(e) => return Settle::Failed(e),
         }
         if waited >= GIVE_UP_MS {
-            return Settle::StillMoving;
+            return match last_unreadable {
+                Some(m) if !readable => Settle::NoGrid(m),
+                _ => Settle::StillMoving,
+            };
         }
         clock.sleep_ms(POLL_MS);
     }
@@ -129,7 +140,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
                 Err(e) => break Stop::Dco(e),
             },
         };
-        let read_ms = clock.now_ms() - t_read;
+        let read_ms = clock.now_ms().saturating_sub(t_read);
         let base = *baseline.get_or_insert(g.classes.len());
         if g.classes.len() > base + 1 {
             break Stop::ClassesChanged { was: base, now: g.classes.len() };
@@ -139,24 +150,24 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         };
         let t_choose = clock.now_ms();
         let cands: Vec<Candidate> = choose(&board);
-        let choose_ms = clock.now_ms() - t_choose;
+        let choose_ms = clock.now_ms().saturating_sub(t_choose);
         // 同一盘棋上划了没反应的步，不再重复选。
         let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == g.cells));
         let Some(pick) = pick else {
             break if cands.is_empty() { Stop::NoMoves } else { Stop::Stuck };
         };
         let chosen = &cands[pick];
-        steps += 1;
         let mut rec = json!({
             "schema": 1, "time_ms": clock.now_ms(),
             "observation_id": g.observation_id, "observed_at_ms": g.observed_at_ms, "frame_age_ms": g.frame_age_ms,
             "rows": g.rows, "cols": g.cols, "cells": g.cells, "odd": g.odd, "classes": g.classes,
             "candidates": cands.iter().map(|c| json!({
                 "a": [c.mv.a.0, c.mv.a.1], "b": [c.mv.b.0, c.mv.b.1], "score": c.score,
-                "cleared": c.features.cleared, "cascade": c.features.cascade, "striped": c.features.striped,
-                "wrapped": c.features.wrapped, "bomb": c.features.bomb, "triggered": c.features.triggered,
-                "special_swap": c.features.special_swap, "lowest_row": c.features.lowest_row })).collect::<Vec<_>>(),
-            "chosen": pick, "dry_run": o.dry_run,
+                "features": {
+                    "cleared": c.features.cleared, "cascade": c.features.cascade, "striped": c.features.striped,
+                    "wrapped": c.features.wrapped, "bomb": c.features.bomb, "triggered": c.features.triggered,
+                    "special_swap": c.features.special_swap, "lowest_row": c.features.lowest_row } })).collect::<Vec<_>>(),
+            "chosen": pick, "dry_run": o.dry_run, "swiped": false,
         });
         if o.dry_run {
             rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": 0, "settle": 0 });
@@ -166,15 +177,18 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         }
         let t_swipe = clock.now_ms();
         if let Err(e) = dco.swipe(p, centre(p, chosen.mv.a), centre(p, chosen.mv.b)) {
-            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": clock.now_ms() - t_swipe, "settle": 0 });
+            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": clock.now_ms().saturating_sub(t_swipe), "settle": 0 });
             rec["outcome"] = json!("stopped");
             sink(rec);
             break Stop::Dco(e);
         }
-        let swipe_ms = clock.now_ms() - t_swipe;
+        // 划成功了才算走了一步。
+        steps += 1;
+        rec["swiped"] = json!(true);
+        let swipe_ms = clock.now_ms().saturating_sub(t_swipe);
         let t_settle = clock.now_ms();
         let result = settle(dco, clock, p, &g);
-        rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms() - t_settle });
+        rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
         match result {
             Settle::Settled(next) => {
                 rec["outcome"] = json!("moved");
@@ -199,6 +213,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
                 rec["outcome"] = json!("stopped");
                 sink(rec);
                 break Stop::StillMoving;
+            }
+            Settle::NoGrid(why) => {
+                rec["outcome"] = json!("stopped");
+                sink(rec);
+                break Stop::NoGrid(why);
             }
             Settle::Failed(e) => {
                 rec["outcome"] = json!("stopped");
