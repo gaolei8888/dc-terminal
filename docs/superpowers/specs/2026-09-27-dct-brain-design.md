@@ -194,6 +194,8 @@ dct 给外部的接口是**命令行 + JSON**，不让外部直接讲守护进�
 
 这几条命令跟排程、卡片一起实现；在那之前 `dct status --json` 只能给出守护进程和会话这几项。
 
+> 最小版已发布（2026-10-02）：`dct status [--json]` 只给守护进程和会话，永远退出码 0、不拉起守护进程。三种形状：`up` 带 `dct_version` 和 `sessions{busy,idle,total}`（busy=干活中，idle=空闲，total=所有没停的）；`down` 只有 `schema_version` 和 `daemon`；`stale`（协议对不上或老到答不了握手）带 `dct_version`、不带会话数。`paused` / `paused_by` / `queue` / `next_at` / `cards_pending` / `cards_expiring_soon` / `attention` 在排程和卡片做出来之前一律**缺席**（缺席 = 暂不支持，不是 0 或 null）。
+
 ## 5. 从纠正里学
 
 | 来源 | 记成什么 | 什么时候生效 |

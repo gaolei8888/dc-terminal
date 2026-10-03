@@ -13,6 +13,7 @@ dct —— vibe coding 终端
 用法：
   dct              打开会话看板（守护进程没在跑就自动拉起）
   dct ps           列出后台在跑的会话
+  dct status       看 dct 在不在运行、有几个会话在忙；加 --json 给别的程序读
   dct stop <会话号> 停掉某个会话，可以给多个
   dct stop --all   停掉全部会话
   dct kill <会话号> 强制杀掉，不给它收尾的时间；可以给多个
@@ -41,7 +42,7 @@ dct —— vibe coding 终端
   dct --version    看装的是哪一版
   dct --help       看这段
 
-ps / stop / kill / prune 都不会拉起守护进程：问「有没有东西在跑」不该把
+ps / status / stop / kill / prune 都不会拉起守护进程：问「有没有东西在跑」不该把
 「没有」变成「有」。restart 不在此列——它是一句祈使句，要的是「敲完之后
 后台跑着新的」。
 ";
@@ -64,6 +65,19 @@ fn main() -> Result<()> {
         // ps / stop 走的是**已经在跑**的守护进程，连不上就如实说没有，
         // 绝不顺手拉起一个——见 `cli` 的模块注释。
         Some("ps") => dct::cli::run_ps(&socket_path(), cli_lang()),
+        // status 同样只问不拉。不管对面是什么状态都退 0：它是给菜单栏轮询的，
+        // 「没在运行」是答案不是错误；只有参数写错才退 2。
+        Some("status") => {
+            let json = match &args[1..] {
+                [] => false,
+                [f] if f == "--json" => true,
+                _ => {
+                    eprintln!("用法：dct status [--json]");
+                    std::process::exit(2)
+                }
+            };
+            dct::cli::run_status(&socket_path(), cli_lang(), json)
+        }
         Some("stop") => {
             let target = dct::cli::parse_target_args(&args[1..], cli_lang(), "stop");
             let code = dct::cli::run_stop(&socket_path(), cli_lang(), target)?;

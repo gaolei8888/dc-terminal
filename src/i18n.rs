@@ -1337,6 +1337,27 @@ pub fn help_text(items: &[HelpItem]) -> String {
 pub mod msg {
     use super::{text, Key, Lang};
 
+    /// `dct status` 的三句人话。不说「守护进程」「协议」——读的人不写代码。
+    pub fn status_up(lang: Lang, total: usize, busy: usize) -> String {
+        t!(
+            lang,
+            en: format!("dct is running: {total} session(s), {busy} busy."),
+            zh: format!("dct 在运行：{total} 个会话，{busy} 个在忙。"),
+        )
+    }
+
+    pub fn status_down(lang: Lang) -> String {
+        t!(lang, en: "dct is not running.".to_string(), zh: "dct 没在运行。".to_string())
+    }
+
+    pub fn status_stale(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "dct is running, but it is older than the version just installed. Restart it to update.".to_string(),
+            zh: "dct 在运行，但版本比这次装的旧，需要重启一下才能更新。".to_string(),
+        )
+    }
+
     pub fn not_a_session_id(lang: Lang, arg: &str) -> String {
         t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
     }

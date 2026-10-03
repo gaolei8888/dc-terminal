@@ -186,6 +186,68 @@ mod ps_and_stop {
         );
     }
 
+    /// `dct status --json` 没有守护进程时：只有 down 那一行，退 0，
+    /// 而且不许把守护进程拉起来（跟 ps 同一条规矩，菜单栏每几秒就问一次）。
+    #[test]
+    fn status_json_without_a_daemon_is_down_and_starts_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let (out, err, code) = run_with_home(home.path(), &["status", "--json"]);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(out, "{\"daemon\":\"down\",\"schema_version\":1}\n");
+        assert!(err.is_empty(), "不许吐报错：{err}");
+        assert!(
+            !home.path().join(".dct").join("daemon.sock").exists(),
+            "status 把守护进程拉起来了——它不该有这个副作用"
+        );
+    }
+
+    #[test]
+    fn status_without_a_daemon_says_so_in_plain_words() {
+        let home = tempfile::tempdir().unwrap();
+        let (out, _, code) = run_with_home(home.path(), &["status"]);
+        assert_eq!(code, 0);
+        // 子进程按环境的 locale 选语言，测试机上是中文还是英文都有可能
+        assert!(
+            out.contains("没在运行") || out.contains("not running"),
+            "{out}"
+        );
+        assert!(!home.path().join(".dct").join("daemon.sock").exists());
+    }
+
+    #[test]
+    fn status_with_an_unknown_flag_is_a_usage_error() {
+        let home = tempfile::tempdir().unwrap();
+        let (out, err, code) = run_with_home(home.path(), &["status", "--wat"]);
+        assert_eq!(code, 2);
+        assert!(out.is_empty());
+        assert!(err.contains("dct status"), "{err}");
+    }
+
+    /// 真守护进程、零个会话：up，total 0，版本是我们自己的。
+    #[test]
+    fn status_json_with_a_real_daemon_is_up() {
+        let d = Daemon::start();
+        let (out, err, code) = d.run(&["status", "--json"]);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(out.lines().count(), 1, "一行 JSON：{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "schema_version": 1,
+                "daemon": "up",
+                "dct_version": env!("CARGO_PKG_VERSION"),
+                "sessions": {"busy": 0, "idle": 0, "total": 0},
+            })
+        );
+        let (plain, _, code) = d.run(&["status"]);
+        assert_eq!(code, 0);
+        assert!(
+            plain.contains("在运行：0 个会话") || plain.contains("running: 0 session"),
+            "{plain}"
+        );
+    }
+
     #[test]
     fn ps_lists_a_session_that_is_actually_running() {
         let d = Daemon::start();

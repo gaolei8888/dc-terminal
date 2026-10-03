@@ -109,6 +109,110 @@ pub fn render_ps(sessions: &[SessionInfo], lang: Lang) -> String {
         .join("\n")
 }
 
+/// `dct status` 看到的守护进程。
+pub enum Probe {
+    /// 连不上
+    Down,
+    /// 连上了。`protocol` 是握手的答案（`None` = 连 `Hello` 都答不上）；
+    /// `sessions` 只有协议对得上才去取，否则是空的。
+    Reached {
+        protocol: Option<u32>,
+        sessions: Vec<SessionInfo>,
+    },
+}
+
+/// 协议对不对先看握手，`stale` 的判断只在这一处，JSON 和人话共用。
+fn probe_kind(probe: &Probe) -> Option<&[SessionInfo]> {
+    match probe {
+        Probe::Reached { protocol, sessions }
+            if crate::proto::daemon_status(*protocol) == crate::proto::DaemonStatus::Same =>
+        {
+            Some(sessions)
+        }
+        _ => None,
+    }
+}
+
+/// `dct status --json` 的内容。纯函数，不碰 socket，所以三种形状都测得到。
+///
+/// 缺席的字段（paused / queue / attention …）是「这一版还不支持」，跟 0 或空
+/// 数组不是一个意思——菜单栏据此区分「没有」和「不知道」，所以连 `null` 也
+/// 不放。`stale` 不报会话数：那份数据出自一个我们读不懂的守护进程。
+pub fn status_value(probe: &Probe) -> serde_json::Value {
+    use serde_json::json;
+    let ours = env!("CARGO_PKG_VERSION");
+    match (probe, probe_kind(probe)) {
+        (Probe::Down, _) => json!({"schema_version": 1, "daemon": "down"}),
+        (_, None) => json!({"schema_version": 1, "daemon": "stale", "dct_version": ours}),
+        (_, Some(sessions)) => {
+            let count = |st: SessionState| sessions.iter().filter(|x| x.state == st).count();
+            // total 是所有没停的：Asking / Failed / Unknown 只进这里，
+            // 所以 busy + idle 可以小于 total。
+            let total = sessions
+                .iter()
+                .filter(|x| x.state != SessionState::Stopped)
+                .count();
+            json!({
+                "schema_version": 1,
+                "daemon": "up",
+                "dct_version": ours,
+                "sessions": {
+                    "busy": count(SessionState::Working),
+                    "idle": count(SessionState::Idle),
+                    "total": total,
+                },
+            })
+        }
+    }
+}
+
+/// 不带 `--json` 时的一句话，给不写代码的人看，所以没有「守护进程」「协议」。
+pub fn status_sentence(probe: &Probe, lang: Lang) -> String {
+    match (probe, probe_kind(probe)) {
+        (Probe::Down, _) => crate::i18n::msg::status_down(lang),
+        (_, None) => crate::i18n::msg::status_stale(lang),
+        (_, Some(sessions)) => {
+            let busy = sessions
+                .iter()
+                .filter(|x| x.state == SessionState::Working)
+                .count();
+            let total = sessions
+                .iter()
+                .filter(|x| x.state != SessionState::Stopped)
+                .count();
+            crate::i18n::msg::status_up(lang, total, busy)
+        }
+    }
+}
+
+/// 先握手再决定要不要问会话：旧守护进程不认识新请求，硬发 `List` 只会
+/// 得到一句原始报错（`ps` / `stop` 现在就是这样）。任何一步出错都按
+/// 「读不到」处理成 down——这条命令永远退 0、永远不吐原始错误。
+pub fn run_status(sock: &Path, lang: Lang, json: bool) -> Result<()> {
+    let probe = probe_daemon(sock).unwrap_or(Probe::Down);
+    if json {
+        println!("{}", status_value(&probe));
+    } else {
+        println!("{}", status_sentence(&probe, lang));
+    }
+    Ok(())
+}
+
+fn probe_daemon(sock: &Path) -> Option<Probe> {
+    let mut c = connect(sock)?;
+    let protocol = c.protocol();
+    if crate::proto::daemon_status(protocol) != crate::proto::DaemonStatus::Same {
+        return Some(Probe::Reached {
+            protocol,
+            sessions: vec![],
+        });
+    }
+    match c.call(Request::List).ok()? {
+        Response::Sessions(sessions) => Some(Probe::Reached { protocol, sessions }),
+        _ => None,
+    }
+}
+
 /// 连上已经在跑的守护进程。**连不上就是连不上**，不拉起新的——见模块注释。
 fn connect(sock: &Path) -> Option<Client> {
     Client::connect(sock).ok()
@@ -889,6 +993,110 @@ mod tests {
             activity: activity.into(),
             is_agent: true,
             tag: String::new(),
+        }
+    }
+
+    fn keys(v: &serde_json::Value) -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    fn up(sessions: Vec<SessionInfo>) -> Probe {
+        Probe::Reached {
+            protocol: Some(crate::proto::PROTOCOL_VERSION),
+            sessions,
+        }
+    }
+
+    /// busy 只数 Working，idle 只数 Idle，total 是所有没停的——所以
+    /// busy + idle 可以小于 total（Asking / Failed / Unknown 只进 total）。
+    /// Stopped 哪个都不进：停掉的会话留在列表里等 prune，但它没在跑。
+    #[test]
+    fn status_counts_busy_idle_and_total_from_mixed_states() {
+        let v = status_value(&up(vec![
+            s(1, SessionState::Working, ""),
+            s(2, SessionState::Working, ""),
+            s(3, SessionState::Idle, ""),
+            s(4, SessionState::Asking, ""),
+            s(5, SessionState::Failed, ""),
+            s(6, SessionState::Unknown, ""),
+            s(7, SessionState::Stopped, ""),
+        ]));
+        assert_eq!(v["daemon"], "up");
+        assert_eq!(v["sessions"]["busy"], 2);
+        assert_eq!(v["sessions"]["idle"], 1);
+        assert_eq!(v["sessions"]["total"], 6);
+    }
+
+    /// 精确钉住键集：缺席的字段（paused / queue / attention …）表示「这版还
+    /// 不支持」，跟 0 / 空数组是两回事，哪怕以 null 形式混进来也不行。
+    #[test]
+    fn status_up_has_exactly_the_agreed_keys() {
+        let v = status_value(&up(vec![]));
+        assert_eq!(
+            keys(&v),
+            ["daemon", "dct_version", "schema_version", "sessions"]
+        );
+        assert_eq!(keys(&v["sessions"]), ["busy", "idle", "total"]);
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["dct_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["sessions"]["total"], 0);
+    }
+
+    #[test]
+    fn status_down_is_only_the_schema_and_down() {
+        let v = status_value(&Probe::Down);
+        assert_eq!(
+            v,
+            serde_json::json!({"schema_version": 1, "daemon": "down"})
+        );
+    }
+
+    /// 协议对不上、或老到连握手都答不上，都是 stale：不报会话数（那份
+    /// 数据来自一个我们读不懂的守护进程），但带上我们自己的版本。
+    #[test]
+    fn status_stale_has_no_sessions_for_either_kind_of_old_daemon() {
+        for protocol in [Some(crate::proto::PROTOCOL_VERSION + 1), Some(1), None] {
+            let v = status_value(&Probe::Reached {
+                protocol,
+                // 就算调用方塞进来了会话，stale 也不许把它们报出去
+                sessions: vec![s(1, SessionState::Working, "")],
+            });
+            assert_eq!(v["daemon"], "stale", "protocol {protocol:?}");
+            assert_eq!(keys(&v), ["daemon", "dct_version", "schema_version"]);
+            assert_eq!(v["dct_version"], env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    #[test]
+    fn status_sentence_is_plain_chinese_without_jargon() {
+        let up3 = status_sentence(
+            &up(vec![
+                s(1, SessionState::Working, ""),
+                s(2, SessionState::Idle, ""),
+                s(3, SessionState::Idle, ""),
+            ]),
+            Lang::Zh,
+        );
+        assert_eq!(up3, "dct 在运行：3 个会话，1 个在忙。");
+        let down = status_sentence(&Probe::Down, Lang::Zh);
+        assert_eq!(down, "dct 没在运行。");
+        let stale = status_sentence(
+            &Probe::Reached {
+                protocol: None,
+                sessions: vec![],
+            },
+            Lang::Zh,
+        );
+        assert_eq!(
+            stale,
+            "dct 在运行，但版本比这次装的旧，需要重启一下才能更新。"
+        );
+        for t in [&up3, &down, &stale] {
+            for w in ["socket", "daemon", "protocol", "守护进程", "协议"] {
+                assert!(!t.contains(w), "{t} 里有黑话 {w}");
+            }
         }
     }
 
