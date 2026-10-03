@@ -103,10 +103,14 @@ fn headless_env(
 /// 拆成一个小函数单独测，不用绕道整个 `resolve()` 才能验证路径对不对。
 fn http_url(base: &str, wire: Wire) -> String {
     let path = match wire {
-        Wire::Anthropic => "/v1/messages",
-        Wire::Openai => "/v1/chat/completions",
+        Wire::Anthropic => "/messages",
+        Wire::Openai => "/chat/completions",
     };
-    format!("{}{path}", base.trim_end_matches('/'))
+    // base 可能已经带了 `/v1`（同一个值还要喂给 Qwen Code 的
+    // OPENAI_BASE_URL），再补一次会变成 `/v1/v1/...` 而 404。
+    let base = base.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/v1{path}")
 }
 
 /// **调用方负责先问「用户开了没有」。** 这个函数只回答「开了之后，该接
