@@ -66,8 +66,25 @@ enum Settle {
     Failed(DcoError),
 }
 
+/// 按行优先第一次出现的顺序重新编号。dco 的类别号只在一次返回里有意义，
+/// 同一张没动的画面两次读可能分组相同、号码互换，所以跨读比较只能比分组。
+pub(crate) fn canonical(cells: &[Vec<u16>]) -> Vec<Vec<u16>> {
+    let mut map: std::collections::HashMap<u16, u16> = std::collections::HashMap::new();
+    cells
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|c| {
+                    let n = map.len() as u16;
+                    *map.entry(*c).or_insert(n)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn same(a: &GridRead, b: &GridRead) -> bool {
-    a.cells == b.cells && a.odd == b.odd
+    canonical(&a.cells) == canonical(&b.cells) && a.odd == b.odd
 }
 
 const FIRST_WAIT_MS: u64 = 150;
@@ -154,7 +171,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         let cands: Vec<Candidate> = choose(&board);
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
         // 同一盘棋上划了没反应的步，不再重复选。
-        let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == g.cells));
+        let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
         let Some(pick) = pick else {
             break if cands.is_empty() { Stop::NoMoves } else { Stop::Stuck };
         };
@@ -205,7 +222,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
                 rec["after_observation_id"] = json!(same_board.observation_id);
                 sink(rec);
                 streak += 1;
-                failed.push((chosen.mv, g.cells.clone()));
+                failed.push((chosen.mv, canonical(&g.cells)));
                 if streak >= 2 {
                     break Stop::Stuck;
                 }

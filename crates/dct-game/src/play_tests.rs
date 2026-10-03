@@ -99,8 +99,9 @@ fn two_unmoved_swipes_stop_and_the_second_try_is_a_different_move() {
 fn a_screen_that_never_stops_changing_gives_up() {
     let a = grid(A);
     let mut reads = vec![Ok(a.clone())];
+    // 两种分组来回换：连续两次读永远不一样（只换号码不算在动）
     for i in 0..200u16 {
-        reads.push(Ok(grid(&[&[i, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 2]])));
+        reads.push(Ok(if i % 2 == 0 { grid(DEAD) } else { grid(&[&[1, 2, 1, 2], &[3, 1, 2, 3], &[2, 3, 1, 3]]) }));
     }
     let mut d = Fake::new(reads);
     let (s, _) = run(&mut d, 10, false);
@@ -144,8 +145,9 @@ fn a_swipe_that_happened_is_marked_swiped_and_counted() {
 #[test]
 fn settle_never_finishing_after_a_swipe_counts_the_step_and_is_marked_swiped() {
     let mut reads = vec![Ok(grid(A))];
+    // 两种分组来回换：连续两次读永远不一样（只换号码不算在动）
     for i in 0..200u16 {
-        reads.push(Ok(grid(&[&[i, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 2]])));
+        reads.push(Ok(if i % 2 == 0 { grid(DEAD) } else { grid(&[&[1, 2, 1, 2], &[3, 1, 2, 3], &[2, 3, 1, 3]]) }));
     }
     let mut d = Fake::new(reads);
     let (s, log) = run(&mut d, 10, false);
@@ -306,4 +308,65 @@ fn dry_run_and_swipe_error_records_also_carry_timing() {
         }
         assert!(rec.get("after_observation_id").is_none());
     }
+}
+
+// dco 的类别号只在一次返回里有意义：同一张没动的画面，两次读可能分组一样、号码互换。
+fn relabel(cells: &[&[u16]], f: impl Fn(u16) -> u16) -> GridRead {
+    let v: Vec<Vec<u16>> = cells.iter().map(|r| r.iter().map(|&c| f(c)).collect()).collect();
+    let refs: Vec<&[u16]> = v.iter().map(|r| r.as_slice()).collect();
+    grid(&refs)
+}
+fn swap12(c: u16) -> u16 {
+    match c {
+        1 => 2,
+        2 => 1,
+        x => x,
+    }
+}
+
+#[test]
+fn canonical_ignores_class_ids_but_not_grouping() {
+    let a = vec![vec![1u16, 1, 2], vec![2, 3, 3]];
+    let permuted = vec![vec![7u16, 7, 4], vec![4, 9, 9]];
+    let regrouped = vec![vec![1u16, 1, 2], vec![3, 2, 3]];
+    assert_eq!(canonical(&a), canonical(&permuted));
+    assert_ne!(canonical(&a), canonical(&regrouped));
+    // 两盘棋的号码多重集一样（各有两个 1、两个 2、两个 3），但分组不同
+    assert_ne!(canonical(&[vec![1, 2, 1], vec![2, 3, 3]]), canonical(&[vec![1, 1, 2], vec![3, 2, 3]]));
+}
+
+#[test]
+fn permuted_ids_on_a_changed_screen_still_settle_as_moved() {
+    let mut reads = vec![Ok(grid(A))];
+    for i in 0..200 {
+        reads.push(Ok(if i % 2 == 0 { relabel(DEAD, |c| c) } else { relabel(DEAD, swap12) }));
+    }
+    let mut d = Fake::new(reads);
+    let (s, log) = run(&mut d, 1, false);
+    assert_ne!(s.stop, Stop::StillMoving);
+    assert_eq!(log[0]["outcome"], "moved");
+}
+
+#[test]
+fn permuted_ids_on_an_unchanged_screen_settle_as_no_change() {
+    let mut reads = vec![Ok(grid(A))];
+    for i in 0..400 {
+        reads.push(Ok(if i % 2 == 0 { relabel(A, swap12) } else { relabel(A, |c| c) }));
+    }
+    let mut d = Fake::new(reads);
+    let (s, log) = run(&mut d, 10, false);
+    assert_eq!(s.stop, Stop::Stuck);
+    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 2);
+}
+
+#[test]
+fn failed_move_memory_survives_permuted_ids() {
+    let mut reads = vec![Ok(grid(A))];
+    for _ in 0..400 {
+        reads.push(Ok(relabel(A, swap12)));
+    }
+    let mut d = Fake::new(reads);
+    let (_, _) = run(&mut d, 10, false);
+    assert!(d.swipes.len() >= 2);
+    assert_ne!(d.swipes[0], d.swipes[1], "同分组换了号码的盘面，失败的步也得跳过");
 }
