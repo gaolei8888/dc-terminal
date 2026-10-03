@@ -63,7 +63,7 @@ fn tuned() -> crate::choose::Weights {
     crate::choose::Weights { striped: 6.0, wrapped: 8.0, bomb: 15.0, triggered: 5.0, ..Default::default() }
 }
 fn profile(rows: usize, cols: usize) -> Profile {
-    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned() }
+    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned(), level_pattern: None }
 }
 fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     let mut log = vec![];

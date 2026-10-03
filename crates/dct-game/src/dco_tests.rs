@@ -47,7 +47,7 @@ fn fake(dir: &std::path::Path, token: &str, handler: impl Fn(&str, &Value) -> (V
 }
 
 fn profile() -> Profile {
-    Profile { window: json!({"app": "iPhone Mirroring"}), region: [0.2, 0.3, 0.5, 0.4], rows: 2, cols: 2, extra: json!({"class_de": 20.0}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default() }
+    Profile { window: json!({"app": "iPhone Mirroring"}), region: [0.2, 0.3, 0.5, 0.4], rows: 2, cols: 2, extra: json!({"class_de": 20.0}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None }
 }
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

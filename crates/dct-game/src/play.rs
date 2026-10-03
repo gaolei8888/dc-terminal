@@ -18,6 +18,9 @@ pub struct Profile {
     pub match_de: f64,
     /// 打分权重，来自配置文件的 `[weights]`；不写就是通用的中性默认（特殊糖全 0）。
     pub weights: Weights,
+    /// 关卡号在画面上的写法（一个带恰好一个捕获组的正则），来自配置文件的 `level_pattern`。
+    /// 有它、画面上对得上、又读得出合格棋盘，就直接当棋盘，不过 OCR 分类。没写 = 不启用。
+    pub level_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -18,6 +18,10 @@ class_de = 24
 top_div = 5
 odd_share = 0.15
 
+# 关卡号在画面上的写法（一个捕获组）。有它、又读得出合格棋盘的画面就是棋盘，不看 HUD 上的符号。
+# 过渡期的本地数据：长期要搬进 dcv。
+level_pattern = '(\d{3,5})\s*/'
+
 # 打分权重。这是过渡期的本地数据：长期要搬进 dcv，dct 的代码里不留任何游戏的数值。
 # special_swap 写 0：两颗特殊糖互换却消不掉东西的步不走（特殊糖的标记会闪，会反复选到这种空步）。
 [weights]
@@ -42,6 +46,8 @@ struct File {
     class_de: Option<f64>,
     top_div: Option<u32>,
     odd_share: Option<f64>,
+    /// 关卡号在画面上的写法：恰好一个捕获组的正则。过渡期的本地数据，长期搬进 dcv。
+    level_pattern: Option<String>,
     /// 可选的重复表 `[[class]]`：把读出来的颜色类别标成「不是糖」（洞、蜂蜜块、糖果机）。
     #[serde(default)]
     class: Vec<ClassEntry>,
@@ -161,6 +167,7 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
             fixed_rgb,
             match_de,
             weights,
+            level_pattern: f.level_pattern,
         },
         sha256,
         source,
@@ -182,6 +189,16 @@ fn check(f: &File) -> Result<(), String> {
         }
         if c.rgb.iter().any(|v| !(0..=255).contains(v)) {
             return Err(format!("[[class]]「{}」的 rgb 三个数都要在 0 到 255 之间", c.name));
+        }
+    }
+    if let Some(pat) = &f.level_pattern {
+        if pat.chars().count() > 100 {
+            return Err("level_pattern 最长 100 个字符".into());
+        }
+        let re = regex::Regex::new(pat).map_err(|e| format!("level_pattern 不是合法的正则：{e}"))?;
+        // captures_len 含整体匹配那一个，所以「恰好一个捕获组」是 2
+        if re.captures_len() != 2 {
+            return Err(format!("level_pattern 要恰好有一个括号捕获组（关卡号），现在有 {} 个", re.captures_len() - 1));
         }
     }
     if let Some(w) = &f.weights {
@@ -317,6 +334,23 @@ mod tests {
             let e = load(home_with("candy-crush", &format!("{base}\n[weights]\n{body}\n")).path(), "candy-crush").err().unwrap();
             assert!(e.contains("candy-crush.toml"), "{body}: {e}");
         }
+    }
+
+    #[test]
+    fn level_pattern_loads_and_bad_ones_are_refused_naming_the_file() {
+        let base = CANDY_CRUSH.split("\nlevel_pattern").next().unwrap().to_string() + "\n";
+        let rest = format!("\n[weights]{}", CANDY_CRUSH.split("\n[weights]").nth(1).unwrap());
+        let with = |pat: &str| format!("{base}level_pattern = '{pat}'\n{rest}");
+        let l = load(home_with("candy-crush", &with(r"(\d+)/")).path(), "candy-crush").unwrap();
+        assert_eq!(l.profile.level_pattern.as_deref(), Some(r"(\d+)/"));
+        assert_eq!(load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.level_pattern.as_deref(), Some(r"(\d{3,5})\s*/"));
+        let long = format!("({})", "a".repeat(100));
+        for bad in ["(unclosed", r"\d+/", r"(\d+)/(\d+)", long.as_str()] {
+            let e = load(home_with("candy-crush", &with(bad)).path(), "candy-crush").err().unwrap();
+            assert!(e.contains("candy-crush.toml") && e.contains("level_pattern"), "{bad}: {e}");
+        }
+        let none = home_with("candy-crush", &format!("{base}{rest}"));
+        assert_eq!(load(none.path(), "candy-crush").unwrap().profile.level_pattern, None);
     }
 
     #[test]
