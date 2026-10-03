@@ -217,7 +217,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         if big > base + 1 {
             break Stop::ClassesChanged { was: base, now: big };
         }
-        let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de)) else {
+        let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de), !p.fixed_rgb.is_empty()) else {
             break Stop::NoGrid("棋盘的行列数对不上".into());
         };
         // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。

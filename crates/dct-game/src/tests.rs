@@ -114,6 +114,22 @@ fn single_cell_classes_become_unknown() {
     assert_eq!(b.get(0, 0), Cell::Candy { class: 0, special: false });
 }
 
+/// 配置列了「不是糖」的颜色之后，没列的都是糖，一格的类别也是（真机 1714：全盘只有一个红、一个橙）。
+#[test]
+fn singles_are_candies_when_the_profile_lists_the_not_candies() {
+    let g: GridRead = serde_json::from_str(
+        r#"{"rows":2,"cols":2,"cells":[[0,0],[1,2]],"odd":[[false,false],[false,false]],
+            "classes":[{"id":0,"count":2},{"id":1,"count":1},{"id":2,"count":1}]}"#,
+    )
+    .unwrap();
+    let b = Board::from_read_fixed(&g, &[2], true).unwrap();
+    assert_eq!(b.get(1, 0), Cell::Candy { class: 1, special: false });
+    // 列出来的一格类别仍然是 fixed
+    assert_eq!(b.get(1, 1), Cell::Fixed);
+    // 没列就保持旧规则
+    assert_eq!(Board::from_read_fixed(&g, &[2], false).unwrap().get(1, 0), Cell::Unknown);
+}
+
 #[test]
 fn wrong_shape_is_an_error() {
     let g = GridRead { rows: 2, cols: 2, cells: vec![vec![0, 0]], odd: vec![vec![false; 2]; 2], classes: vec![], observation_id: None, observed_at_ms: None, frame_age_ms: None };
@@ -258,7 +274,7 @@ fn from_read_fixed_marks_the_listed_classes_even_single_ones() {
             "classes":[{"id":0,"count":2},{"id":1,"count":2},{"id":2,"count":2}]}"#,
     )
     .unwrap();
-    let b = Board::from_read_fixed(&g, &[1]).unwrap();
+    let b = Board::from_read_fixed(&g, &[1], false).unwrap();
     assert_eq!((b.get(0, 2), b.get(1, 2)), (Cell::Fixed, Cell::Fixed));
     assert_eq!(b.get(0, 0), Cell::Candy { class: 0, special: false });
     // 不指定就是第一轮的行为
@@ -294,7 +310,7 @@ fn the_real_1713_board_never_moves_a_honey_block_a_gap_or_a_gumball_machine() {
     let g: GridRead = serde_json::from_str(include_str!("../tests/fixtures/candy-1713-live.json")).unwrap();
     let fixed = crate::fixed_ids(&g, &[[196, 148, 101], [161, 180, 233]], 24.0);
     assert_eq!(fixed.len(), 2, "蜂蜜块和糖果机各是一个类别");
-    let b = Board::from_read_fixed(&g, &fixed).unwrap();
+    let b = Board::from_read_fixed(&g, &fixed, false).unwrap();
     let c = choose(&b, &Weights::default());
     assert!(!c.is_empty());
     for x in &c {

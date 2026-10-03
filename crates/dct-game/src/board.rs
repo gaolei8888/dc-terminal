@@ -63,12 +63,14 @@ pub enum BoardError {
 
 impl Board {
     pub fn from_read(g: &GridRead) -> Result<Board, BoardError> {
-        Board::from_read_fixed(g, &[])
+        Board::from_read_fixed(g, &[], false)
     }
 
     /// 同 `from_read`，另外 `fixed` 里的类别号当作「不是糖」。类别号只在这一次读数里有意义，
     /// 所以调用方要用 `fixed_ids` 按颜色现算。
-    pub fn from_read_fixed(g: &GridRead, fixed: &[Class]) -> Result<Board, BoardError> {
+    /// `singles_are_candies`：配置已经列全了「不是糖」的颜色时为 true，这时没列的一格类别（全盘只有一个的红糖）
+    /// 也是糖，否则唯一能走的步会被排除；没列时为 false，一格的类别按老规则当「认不出」（可能是彩色炸弹）。
+    pub fn from_read_fixed(g: &GridRead, fixed: &[Class], singles_are_candies: bool) -> Result<Board, BoardError> {
         if g.rows == 0
             || g.cols == 0
             || g.cells.len() != g.rows
@@ -85,7 +87,7 @@ impl Board {
                 let class = g.cells[r][c];
                 cells.push(if fixed.contains(&class) {
                     Cell::Fixed
-                } else if single(class) {
+                } else if !singles_are_candies && single(class) {
                     Cell::Unknown
                 } else {
                     Cell::Candy { class, special: g.odd[r][c] }

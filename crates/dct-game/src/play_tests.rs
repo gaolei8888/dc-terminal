@@ -576,3 +576,18 @@ fn a_changed_odd_flag_alone_is_not_a_changed_board() {
     assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 2);
     assert!(log.iter().all(|l| l["outcome"] != "moved"));
 }
+
+/// 2026-10-03 真机第 1714 关的顶行：蛋 蓝 红 蓝 蓝 绿 橙 绿 蛋。红和橙全盘各只有一个，
+/// 唯一的走法是红和左边的蓝对换凑三蓝。配置列了「不是糖」的颜色就该走；没列就是旧规则，一格的类别不能换。
+#[test]
+fn a_one_cell_candy_may_move_once_the_profile_lists_the_not_candies() {
+    const ROW: &[&[u16]] = &[&[0, 1, 2, 1, 1, 3, 4, 3, 0]];
+    let go = |fixed_rgb: Vec<[u8; 3]>| {
+        let mut d = Fake::new(vec![Ok(grid(ROW))]);
+        let p = Profile { fixed_rgb, ..profile(1, 9) };
+        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true }, &mut |_| {});
+        s.stop
+    };
+    assert_ne!(go(vec![[196, 148, 101]]), Stop::NoMoves);
+    assert_eq!(go(vec![]), Stop::NoMoves);
+}
