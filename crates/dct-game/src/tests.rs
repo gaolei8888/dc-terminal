@@ -170,3 +170,112 @@ fn seventy_percent_is_the_line() {
 fn fewer_than_three_big_classes_is_not_a_board() {
     assert!(!looks_like_board(&read_with_counts(3, 4, &[6, 4, 1, 1])));
 }
+
+// ---- 「不是糖」的格子（Cell::Fixed）----
+
+#[test]
+fn a_fixed_cell_is_never_swapped() {
+    // (0,2) 是 #：左边两个 1、右边一个 1 隔着它，换不出线；挨着它的交换也不合法
+    let b = Board::parse("1 1 # 1\n2 3 4 5\n3 2 5 4");
+    assert!(try_move(&b, mv((0, 1), (0, 2))).is_none());
+    assert!(try_move(&b, mv((0, 2), (0, 3))).is_none());
+    assert!(try_move(&b, mv((0, 2), (1, 2))).is_none());
+    assert!(choose(&b).iter().all(|c| c.mv.a != (0, 2) && c.mv.b != (0, 2)));
+}
+
+#[test]
+fn a_fixed_cell_cuts_a_line_in_two() {
+    // 不是糖的格子把一排切开：左边只有 2 个、右边只有 2 个，都连不成 3
+    let b = Board::parse("1 1 # 1 1\n3 4 5 6 7\n7 6 5 4 3");
+    assert_eq!(crate::sim::all_moves(&b).iter().filter(|m| try_move(&b, **m).is_some()).count(), 0);
+    // 而同样的一排没有 # 时，换一下就是 5 连
+    let b = Board::parse("1 1 2 1 1\n3 4 1 6 7\n7 6 5 4 3");
+    assert!(try_move(&b, mv((0, 2), (1, 2))).is_some());
+}
+
+#[test]
+fn gravity_drops_candies_to_the_bottom_when_nothing_blocks_them() {
+    // 第 0 列：1 1 _ _ → _ _ 1 1
+    let mut b = Board::parse("1 5\n1 5\n_ 5\n_ 5");
+    crate::sim::gravity(&mut b);
+    assert_eq!(b, Board::parse("_ 5\n_ 5\n1 5\n1 5"));
+}
+
+#[test]
+fn a_fixed_cell_stops_candies_from_falling_through_it() {
+    // 第 0 列：1 1 # _ _ → 1 1 # _ _（# 上面的糖落不下去，# 下面的空位也没有糖补）
+    let mut b = Board::parse("1 5\n1 5\n# 5\n_ 5\n_ 5");
+    crate::sim::gravity(&mut b);
+    assert_eq!(b, Board::parse("1 5\n1 5\n# 5\n_ 5\n_ 5"));
+}
+
+#[test]
+fn candies_fall_only_inside_their_own_segment_between_fixed_cells() {
+    // 第 0 列：1 _ # 2 _ 3? → 上一段 [1 _] 里 1 落到 # 上面；下一段 [2 _] 里 2 落到底
+    let mut b = Board::parse("1 5\n_ 5\n# 5\n2 5\n_ 5");
+    crate::sim::gravity(&mut b);
+    assert_eq!(b, Board::parse("_ 5\n1 5\n# 5\n_ 5\n2 5"));
+}
+
+#[test]
+fn fixed_cells_do_not_move_and_unknown_cells_do_fall() {
+    let mut b = Board::parse("# 5\n. 5\n_ 5");
+    crate::sim::gravity(&mut b);
+    assert_eq!(b, Board::parse("# 5\n_ 5\n. 5"));
+}
+
+#[test]
+fn from_read_fixed_marks_the_listed_classes_even_single_ones() {
+    let g: GridRead = serde_json::from_str(
+        r#"{"rows":2,"cols":3,"cells":[[0,0,1],[2,2,1]],"odd":[[false,false,false],[false,false,false]],
+            "classes":[{"id":0,"count":2},{"id":1,"count":2},{"id":2,"count":2}]}"#,
+    )
+    .unwrap();
+    let b = Board::from_read_fixed(&g, &[1]).unwrap();
+    assert_eq!((b.get(0, 2), b.get(1, 2)), (Cell::Fixed, Cell::Fixed));
+    assert_eq!(b.get(0, 0), Cell::Candy { class: 0, special: false });
+    // 不指定就是第一轮的行为
+    assert_eq!(Board::from_read(&g).unwrap().get(0, 2), Cell::Candy { class: 1, special: false });
+}
+
+#[test]
+fn fixed_classes_are_found_by_colour_not_by_id() {
+    let read = |a: u16, b: u16| -> GridRead {
+        serde_json::from_value(serde_json::json!({
+            "rows": 1, "cols": 2, "cells": [[a, b]], "odd": [[false, false]],
+            "classes": [
+                {"id": a, "count": 5, "rgb": [196, 148, 101]},
+                {"id": b, "count": 5, "rgb": [66, 102, 252]}
+            ]
+        }))
+        .unwrap()
+    };
+    let honey = [[196u8, 148, 101]];
+    // 同一张画面，类别号对调：蜂蜜块的类别号变了，找出来的还是它
+    assert_eq!(crate::fixed_ids(&read(0, 1), &honey, 24.0), vec![0]);
+    assert_eq!(crate::fixed_ids(&read(1, 0), &honey, 24.0), vec![1]);
+    // 颜色有小偏差（RGB 差几个点）也认得出；差得远的不算
+    let g = read(0, 1);
+    assert_eq!(crate::fixed_ids(&g, &[[199, 150, 104]], 24.0), vec![0]);
+    assert!(crate::fixed_ids(&g, &[[10, 10, 10]], 24.0).is_empty());
+    assert!(crate::fixed_ids(&g, &[], 24.0).is_empty());
+}
+
+/// 2026-10-03 真机第 1713 关的读数（对着截图逐格核对过）：D 类（蜂蜜块和顶部缺口，41 格）和 E 类（糖果机，6 格）不是糖。
+#[test]
+fn the_real_1713_board_never_moves_a_honey_block_a_gap_or_a_gumball_machine() {
+    let g: GridRead = serde_json::from_str(include_str!("../tests/fixtures/candy-1713-live.json")).unwrap();
+    let fixed = crate::fixed_ids(&g, &[[196, 148, 101], [161, 180, 233]], 24.0);
+    assert_eq!(fixed.len(), 2, "蜂蜜块和糖果机各是一个类别");
+    let b = Board::from_read_fixed(&g, &fixed).unwrap();
+    let c = choose(&b);
+    assert!(!c.is_empty());
+    for x in &c {
+        for p in [x.mv.a, x.mv.b] {
+            assert!(!fixed.contains(&g.cells[p.0][p.1]), "选步碰到了不是糖的格子：{:?}", x.mv);
+        }
+    }
+    // 不指定 fixed（第一轮的读法）会把蜂蜜块当成糖，多出一批假的合法交换
+    let wrong = choose(&Board::from_read(&g).unwrap());
+    assert!(wrong.len() > c.len(), "第一轮的读法 {} 步，认出不是糖以后 {} 步", wrong.len(), c.len());
+}

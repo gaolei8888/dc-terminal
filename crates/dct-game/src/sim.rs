@@ -175,11 +175,24 @@ pub fn try_move(b: &Board, m: Move) -> Option<Outcome> {
 }
 
 /// 每一列里没消掉的格子落到底，上面补进来的是空（补进来的新糖是什么，谁也不知道）。
-fn gravity(b: &mut Board) {
+/// 「不是糖」的格子（缺口、蜂蜜块）不动，也挡住下落：糖只在同一列里两个这样的格子之间的一段内往下掉。
+pub(crate) fn gravity(b: &mut Board) {
     for c in 0..b.cols {
-        let kept: Vec<Cell> = (0..b.rows).rev().map(|r| b.get(r, c)).filter(|x| *x != Cell::Empty).collect();
-        for (i, r) in (0..b.rows).rev().enumerate() {
-            b.set(r, c, kept.get(i).copied().unwrap_or(Cell::Empty));
+        let mut bottom = b.rows; // 当前这一段的下边界（不含）
+        while bottom > 0 {
+            if b.get(bottom - 1, c) == Cell::Fixed {
+                bottom -= 1;
+                continue;
+            }
+            let mut top = bottom; // 这一段是 [top, bottom)
+            while top > 0 && b.get(top - 1, c) != Cell::Fixed {
+                top -= 1;
+            }
+            let kept: Vec<Cell> = (top..bottom).rev().map(|r| b.get(r, c)).filter(|x| *x != Cell::Empty).collect();
+            for (i, r) in (top..bottom).rev().enumerate() {
+                b.set(r, c, kept.get(i).copied().unwrap_or(Cell::Empty));
+            }
+            bottom = top;
         }
     }
 }

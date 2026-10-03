@@ -4,12 +4,13 @@ pub mod board;
 pub mod choose;
 #[cfg(unix)]
 pub mod dco;
+pub mod lab;
 pub mod navigate;
 pub mod play;
 pub mod screen;
 pub mod sim;
 
-pub use board::{looks_like_board, Board, BoardError, Cell, GridRead};
+pub use board::{fixed_ids, looks_like_board, Board, BoardError, Cell, GridRead};
 pub use choose::{choose, Candidate, Features};
 pub use sim::{Move, Pos};
 

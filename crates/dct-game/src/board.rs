@@ -8,6 +8,8 @@ pub enum Cell {
     Empty,
     /// 认不出是什么：只有一格的类别（比如彩色炸弹）。不参与连线，也不能被换。
     Unknown,
+    /// 不是糖：缺口、蜂蜜块、糖果机。不能被换，不参与连线（会截断一条线），挡住下落。
+    Fixed,
     Candy { class: Class, special: bool },
 }
 
@@ -61,6 +63,12 @@ pub enum BoardError {
 
 impl Board {
     pub fn from_read(g: &GridRead) -> Result<Board, BoardError> {
+        Board::from_read_fixed(g, &[])
+    }
+
+    /// 同 `from_read`，另外 `fixed` 里的类别号当作「不是糖」。类别号只在这一次读数里有意义，
+    /// 所以调用方要用 `fixed_ids` 按颜色现算。
+    pub fn from_read_fixed(g: &GridRead, fixed: &[Class]) -> Result<Board, BoardError> {
         if g.rows == 0
             || g.cols == 0
             || g.cells.len() != g.rows
@@ -75,7 +83,9 @@ impl Board {
         for r in 0..g.rows {
             for c in 0..g.cols {
                 let class = g.cells[r][c];
-                cells.push(if single(class) {
+                cells.push(if fixed.contains(&class) {
+                    Cell::Fixed
+                } else if single(class) {
                     Cell::Unknown
                 } else {
                     Cell::Candy { class, special: g.odd[r][c] }
@@ -104,6 +114,8 @@ impl Board {
                 .split_whitespace()
                 .map(|t| match t {
                     "." => Cell::Unknown,
+                    "#" => Cell::Fixed,
+                    "_" => Cell::Empty,
                     _ => match t.strip_prefix('*') {
                         Some(n) => Cell::Candy { class: n.parse().unwrap(), special: true },
                         None => Cell::Candy { class: t.parse().unwrap(), special: false },
@@ -115,4 +127,14 @@ impl Board {
         }
         Board { rows, cols, cells }
     }
+}
+
+/// 这一次读数里，哪些类别是「不是糖」：颜色和配置里某个「不是糖」的颜色距离不超过 `max_de` 的类别。
+/// 按颜色而不是按编号，因为 dco 每次返回的类别编号会变。
+pub fn fixed_ids(g: &GridRead, fixed_rgb: &[[u8; 3]], max_de: f64) -> Vec<Class> {
+    g.classes
+        .iter()
+        .filter(|c| c.rgb.is_some_and(|rgb| fixed_rgb.iter().any(|f| crate::lab::delta_e(rgb, *f) <= max_de)))
+        .map(|c| c.id)
+        .collect()
 }
