@@ -141,9 +141,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
             },
         };
         let read_ms = clock.now_ms().saturating_sub(t_read);
-        let base = *baseline.get_or_insert(g.classes.len());
-        if g.classes.len() > base + 1 {
-            break Stop::ClassesChanged { was: base, now: g.classes.len() };
+        // 只数至少两格的类别：一格的（彩色炸弹、条纹糖被读成自己的颜色）是“不认识”，忽略
+        let big = g.classes.iter().filter(|c| c.count >= 2).count();
+        let base = *baseline.get_or_insert(big);
+        if big > base + 1 {
+            break Stop::ClassesChanged { was: base, now: big };
         }
         let Ok(board) = Board::from_read(&g) else {
             break Stop::NoGrid("棋盘的行列数对不上".into());

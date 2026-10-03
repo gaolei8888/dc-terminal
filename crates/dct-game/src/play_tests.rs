@@ -206,8 +206,8 @@ fn unreadable_board_at_the_start_stops() {
 
 #[test]
 fn many_new_classes_mean_something_else_is_on_screen() {
-    // 开始 3 类；落定后变成 5 类（弹窗）
-    let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[3, 2, 3, 2]];
+    // 开始 3 类；落定后变成 5 类，而且新来的每类都不止一格（弹窗）
+    let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[4, 5, 3, 1]];
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(five)), Ok(grid(five))]);
     let (s, _) = run(&mut d, 10, false);
     assert!(matches!(s.stop, Stop::ClassesChanged { was: 3, now: 5 }), "{:?}", s.stop);
@@ -215,11 +215,30 @@ fn many_new_classes_mean_something_else_is_on_screen() {
 
 #[test]
 fn one_extra_class_is_allowed() {
-    // 多出来一个一格的类别（彩色炸弹）不算换了画面
-    let four: &[&[u16]] = &[&[1, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 4]];
+    // 多出来一个两格的类别（两个同种特殊糖果）还算同一个画面
+    let four: &[&[u16]] = &[&[1, 1, 2, 1], &[2, 3, 1, 3], &[4, 2, 3, 4]];
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(four)), Ok(grid(four))]);
-    let (s, _) = run(&mut d, 1, false);
-    assert_eq!(s.stop, Stop::StepsDone);
+    let (s, _) = run(&mut d, 3, false);
+    assert!(!matches!(s.stop, Stop::ClassesChanged { .. }), "{:?}", s.stop);
+}
+
+#[test]
+fn new_one_cell_classes_are_not_counted() {
+    // 彩色炸弹、条纹糖各自成了一格的类别：不算换了画面
+    let six: &[&[u16]] = &[&[1, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 4, 5]];
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(six)), Ok(grid(six))]);
+    let (s, _) = run(&mut d, 3, false);
+    assert!(!matches!(s.stop, Stop::ClassesChanged { .. }), "{:?}", s.stop);
+}
+
+#[test]
+fn first_board_baseline_ignores_one_cell_classes() {
+    // 第一张盘里就有一格的类别：基线只数大类（3 个），之后多出两个大类才停
+    let first: &[&[u16]] = &[&[1, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 9]];
+    let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[4, 5, 3, 1]];
+    let mut d = Fake::new(vec![Ok(grid(first)), Ok(grid(five)), Ok(grid(five))]);
+    let (s, _) = run(&mut d, 10, false);
+    assert!(matches!(s.stop, Stop::ClassesChanged { was: 3, now: 5 }), "{:?}", s.stop);
 }
 
 #[test]
