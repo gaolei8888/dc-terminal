@@ -340,6 +340,20 @@ dct 给外部的接口是**命令行 + JSON**，不让外部直接讲守护进�
 - **没解决的口子**：纯数字的关卡按钮、无字的棋盘格，dco 按「对外」拦；当天是用原地轻点的 swipe 点过去的，等于绕过了按字定档。
   正式放行规则由 dco / dcv 定，dct 签票可能要参与；在那之前这条绕路不算放行。
 
+## 10. 流程跑完的报告（dc-vault 会话提的，2026-10-02；还没动手，要等 dct↔dco 配对）
+
+dcv 的确认页想显示「上次试跑的结果是这样，对不对？」，老是失败的流程也要退回草稿，所以 dct 每跑完一次流程留一份报告。
+
+- **dcv 来拿，dct 不推**：dct 每次跑完往 `~/.dct/runs/<UTC 日期>.jsonl` 追加一行；dcv 通过 `dct runs --json [--procedure 库:名字] [--limit N]` 读。dct 不依赖 dcv 在不在。
+- **字段**：`schema:1`、`run_id`（dct 的）、`dco_run_id`、`procedure`（"库:名字"）、`body_sha256`（用户批准的那一版）、`steps_sha256`（dco 实际跑的）、
+  `started_ms` / `finished_ms`（Unix 毫秒）、`step_reached` / `steps_total`、`outcome`（`ok | failed | stopped_for_help | cancelled | halted`）、
+  `reason`（**只在不成功时有，一句大白话中文，不带代码，dcv 原样显示**）、`failure_class`（dco 给的原因分类，单独一项，没有就不写）、
+  `outward_actions`（dco 报的对外动作数）、`result_shot_sha256`（可选）、
+  `step_shots`（可选）：`[{"n": 步号, "sha256": "…", "tap": {"x": 0～1, "y": 0～1} | null}]`，每个执行过的步一张截图加 dco 点的位置（窗口比例），确认页用它在那一帧上圈出点击位置。
+- **截图留在本机**：`~/.dct/shots/<sha256>.png`，dcv 只存指纹；以后要显示再给 dcv 一个本机取图的口子。不录视频——每步一张截图，dco 本来就看着每一步，几乎不花成本。
+- **结果只跟一版绑定**：`body_sha256` 变了，旧报告不算新版本的；dcv 按版本数最近失败次数。
+- **依赖 dco**：每步截图和点击位置要 dco 的运行结果里给（现在没有这两项），要先跟 dc-octo 商量；`reason` 由 dct 自己按 `failure_class` 翻成人话，不转 dco 的原文。
+
 ## 已知的限制
 
 - **挡不住一个存心改 dct 本身的 agent**（同控制层设计）：同一个系统账号下的 agent 能改磁盘上的文件。用户签名这一关挡住的是伪造「用户批过」，挡不住有人改掉 dct 让它不去找用户。
