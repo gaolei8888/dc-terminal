@@ -187,7 +187,7 @@ pub fn status_sentence(probe: &Probe, lang: Lang) -> String {
 
 /// 先握手再决定要不要问会话：旧守护进程不认识新请求，硬发 `List` 只会
 /// 得到一句原始报错（`ps` / `stop` 现在就是这样）。任何一步出错都按
-/// 「读不到」处理成 down——这条命令永远退 0、永远不吐原始错误。
+/// 「读不到」处理成 down（连不上）或 stale（连上了但读不懂）——这条命令永远退 0、永远不吐原始错误。
 pub fn run_status(sock: &Path, lang: Lang, json: bool) -> Result<()> {
     let probe = probe_daemon(sock).unwrap_or(Probe::Down);
     if json {
@@ -207,9 +207,14 @@ fn probe_daemon(sock: &Path) -> Option<Probe> {
             sessions: vec![],
         });
     }
-    match c.call(Request::List).ok()? {
-        Response::Sessions(sessions) => Some(Probe::Reached { protocol, sessions }),
-        _ => None,
+    match c.call(Request::List) {
+        Ok(Response::Sessions(sessions)) => Some(Probe::Reached { protocol, sessions }),
+        // 握手对得上、会话列表却读不出来：它明明在跑，说 down 会让菜单栏给出
+        // 「启动 dct」。按「在跑但读不了」报，协议填 None 就是 stale。
+        _ => Some(Probe::Reached {
+            protocol: None,
+            sessions: vec![],
+        }),
     }
 }
 
