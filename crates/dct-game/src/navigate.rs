@@ -57,8 +57,9 @@ fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Se
 pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions, sink: &mut dyn FnMut(Value)) -> Summary {
     let (mut steps, mut tries, mut taps, mut no_effect) = (0usize, 0usize, 0usize, 0usize);
     // after_board：刚玩完一局，还没有进过新棋盘。这时看到的 Play 可能是通关后的下一关，不点。
+    // expect_board：开局框的 Play 点成了，接下来应该是重来那一局的棋盘（它的 OCR 读成 Unknown，不能因为 after_board 拒绝）。
     // free_play：刚点过“再来一次”，接下来“开局框”里的那个 Play 是同一次重来，不另算、也放行。
-    let (mut after_board, mut free_play) = (false, false);
+    let (mut after_board, mut free_play, mut expect_board) = (false, false, false);
     let stop = loop {
         let seen = match dco.see_text(p) {
             Ok(s) => s,
@@ -110,7 +111,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             }
             Screen::Unknown => {
                 // 刚玩完一局遇到不认识的画面：弹窗也可能读得出“棋盘”，不去读，直接停。
-                if after_board {
+                if after_board && !expect_board {
                     sink(nav_record(clock, &seen, "unknown", None, "stopped"));
                     break Stop::UnknownScreen(texts(&seen));
                 }
@@ -120,6 +121,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                         let remaining = o.max_steps.saturating_sub(steps);
                         // 这个画面的字是以后“像棋盘”判断的证据。
                         sink(nav_record(clock, &seen, "board", None, "entered"));
+                        expect_board = false;
                         let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run }, sink);
                         steps += s.steps;
                         match s.stop {
@@ -191,10 +193,8 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                 if kind == "retry" {
                     free_play = true;
                 }
-                if kind == "play" && after_board {
-                    // 重来的 Play 点成了：现在在新的一局里，棋盘可以读、可以玩。
-                    after_board = false;
-                }
+                // 只有重来的开局框 Play 点成了，才等着一个棋盘；点别的按钮就不等了。
+                expect_board = kind == "play" && after_board;
             }
             Ok(false) => {
                 sink(nav_record(clock, &seen, kind, Some(&el.text), "no_effect"));
@@ -635,5 +635,19 @@ mod tests {
         let (s, _) = run(&mut w, 5, false);
         assert_eq!(s.stop, Stop::LevelEnded);
         assert_eq!(w.taps, ["Try again"]);
+    }
+
+    #[test]
+    fn a_result_screen_after_the_start_box_play_is_not_pressed() {
+        let mut w = World::new(vec![
+            board(A),
+            text(&["Out of moves", "Try again"]),
+            text(&["Level 1712", "Select boosters:", "Play", "B Play"]),
+            text(&["Daily Stamps", "Play"]),
+        ]);
+        let (s, _) = run(&mut w, 5, false);
+        assert_eq!(s.stop, Stop::LevelEnded);
+        assert_eq!(w.taps, ["Try again", "Play"]);
+        assert_eq!(w.swipes, 1);
     }
 }

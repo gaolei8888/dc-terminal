@@ -107,17 +107,9 @@ pub fn classify(els: &[Element]) -> Screen {
     Screen::Unknown
 }
 
-/// 像“开局框”：文字里有 Select boosters，或者某条以 Level 加数字开头。
+/// 像“开局框”：只看文字里有没有 Select boosters。
 pub fn is_level_start(els: &[Element]) -> bool {
-    els.iter().any(|e| {
-        if e.text.to_lowercase().contains("select boosters") {
-            return true;
-        }
-        match norm(&e.text).strip_prefix("level") {
-            Some(rest) => rest.trim_start().starts_with(|c: char| c.is_ascii_digit()),
-            None => false,
-        }
-    })
+    els.iter().any(|e| e.text.to_lowercase().contains("select boosters"))
 }
 
 #[cfg(test)]
@@ -222,7 +214,8 @@ mod tests {
     fn the_level_start_box_is_told_by_its_words() {
         assert!(is_level_start(&els(&["Level 1712", "Select boosters:", "Play"])));
         assert!(is_level_start(&els(&["Select boosters:"])));
-        assert!(is_level_start(&els(&["level 12"])));
+        assert!(!is_level_start(&els(&["Level 12"])));
+        assert!(!is_level_start(&els(&["Level 1713", "Play"])));
         assert!(!is_level_start(&els(&["Daily Stamps", "Play"])));
         assert!(!is_level_start(&els(&["Level Complete!"])));
         assert!(!is_level_start(&[]));
