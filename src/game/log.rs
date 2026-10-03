@@ -22,8 +22,8 @@ impl LogFile {
             };
             format!("记录文件开不了：{}，{reason}。", path.display())
         };
-        std::fs::create_dir_all(&dir).map_err(&why)?;
-        std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(&why)?;
+        std::fs::create_dir_all(&dir).map_err(why)?;
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(why)?;
         Ok(LogFile { path })
     }
 
