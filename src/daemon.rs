@@ -55,6 +55,17 @@ struct PairSlot {
 }
 
 pub fn run(socket: &Path) -> Result<()> {
+    // 「怎么让 AI 玩三消」的说明卡：真正的守护进程里才装。单元测试和集成测试把 socket 放进临时目录，
+    // 它们绝不能去写用户真实的 `~/.claude` 等。每 30 秒看一遍，是因为 agent 第一次运行才会建出自己的
+    // 目录——用户装了 agent、开了会话，不用重启守护进程说明卡也会出现。
+    if socket == crate::proto::socket_path().as_path() {
+        let _ = std::thread::Builder::new().name("game-skill".into()).spawn(|| loop {
+            if let Some(home) = crate::sys::home() {
+                let _ = crate::game::skill::install_all(&home);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+    }
     let mgr = SessionManager::new();
     // 生死簿只在真正的守护进程里落盘。单元测试自己 `new()` 一个 manager，
     // 拿到的是不记账的那种——绝不能去写用户真实的 `~/.dct/sessions.log`。
