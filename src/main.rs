@@ -30,6 +30,8 @@ dct —— vibe coding 终端
   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
   dct join <邀请码> [--name 电脑名]
                    新电脑上：用老电脑给的码加入（没登录会先自动登录）
+  dct game play [--game candy-crush] [--steps 20] [--dry-run]
+                   让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
   dct peers        看组里有哪些电脑、开着哪些会话
   dct send <电脑名>/<会话名> \"<内容>\"
                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
@@ -125,6 +127,8 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // 玩三消游戏：连的是本机的 dco，不经守护进程。
+        Some("game") => std::process::exit(dct::game::cli::run(&args[1..])),
         Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),
         Some("procedure") => std::process::exit(dct::procedures::run_cli(&args[1..])),
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立

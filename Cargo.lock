@@ -410,6 +410,7 @@ dependencies = [
  "base64",
  "crossterm",
  "dct-brain",
+ "dct-game",
  "dct-link",
  "dct-mesh",
  "dct-page",
@@ -443,6 +444,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "dct-game"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
