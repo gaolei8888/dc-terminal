@@ -3,7 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
-members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh"]
+members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game"]
 
 [package]
 name = "dct"
@@ -22,6 +22,7 @@ dct-page = { path = "crates/dct-page" }
 dct-brain = { path = "crates/dct-brain" }
 # 多机之间通过中转互相认识：机器 id、6 位核对码、机器钥匙、签过名的组名单。
 dct-mesh = { path = "crates/dct-mesh" }
+dct-game = { path = "crates/dct-game" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
