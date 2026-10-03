@@ -54,7 +54,7 @@ AI 自动校准、dcv 的游戏资料（`dcv games`）、开关卡和道具检�
 **打分**（常量，第一轮拍的，写明出处，以后按记录调）：
 
 ```
-score = cleared + 0.5·cascade + 6·striped + 8·wrapped + 15·bomb + 5·triggered + 20·special_swap + lowest_row / rows
+score = cleared + 0.5·cascade + 6·striped + 8·wrapped + 15·bomb + 5·triggered + 20·special_swap + (lowest_row + 1) / rows
 ```
 
 同分时按固定顺序挑：最低的行优先，再左边的列优先，再横向交换优先。同一盘每次选得一样。
