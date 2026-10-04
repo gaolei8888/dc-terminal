@@ -5,6 +5,7 @@ pub mod board;
 pub mod choose;
 #[cfg(unix)]
 pub mod dco;
+pub mod genre;
 pub mod goal;
 pub mod lab;
 pub mod navigate;
