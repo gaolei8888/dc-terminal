@@ -45,6 +45,9 @@ pub fn step_line(step: usize, rec: &Value) -> String {
             }
         }
     }
+    if rec["decider"] == "model" {
+        s += "（大模型选的）";
+    }
     s
 }
 
@@ -154,6 +157,12 @@ mod tests {
             r[k] = v.clone();
         }
         r
+    }
+
+    #[test]
+    fn a_step_picked_by_the_model_says_so() {
+        assert!(step_line(1, &rec(json!({"decider": "model"}))).contains("大模型选的"));
+        assert!(!step_line(1, &rec(json!({"decider": "rules"}))).contains("大模型选的"));
     }
 
     #[test]

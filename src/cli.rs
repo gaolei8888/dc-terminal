@@ -505,7 +505,25 @@ fn oauth_lookup(
 ///
 /// `lang` 跟 `ps`/`stop`/`prune` 同一条路（`main::cli_lang()`）：这条命令印的
 /// 也是给人看的话，跟界面说两种语言会很怪。
-pub fn llm_check(lang: Lang) -> i32 {
+pub struct LoadedLlm {
+    pub backend: std::sync::Arc<dyn crate::llm::Backend>,
+    pub model: String,
+    pub provider: String,
+    pub http: bool,
+}
+
+pub enum LoadLlmError {
+    /// 没写 `[llm]`：正常状态。带着真正读的那个配置文件路径。
+    NotEnabled(std::path::PathBuf),
+    Problem {
+        error: crate::llm::resolve::ResolveError,
+        provider: String,
+        http: bool,
+    },
+}
+
+/// 读配置、建连接。`llm check` 和 `game play --ask-model` 共用；这里不打印任何东西。
+pub fn load_llm_backend() -> Result<LoadedLlm, LoadLlmError> {
     let socket = crate::proto::socket_path();
     let config_path = crate::config::config_path_for_socket(&socket);
     let cfg = crate::config::Config::load(&config_path);
@@ -536,34 +554,40 @@ pub fn llm_check(lang: Lang) -> i32 {
     // 见 `config.rs` 头注释：出错解释会把终端里的原始内容送给模型，必须是
     // 用户自己主动写下 `[llm]` 才算数，这里不能替他去猜一份默认配置来验。
     let Some(llm) = &cfg.llm else {
-        // 路径是真的从 socket 推出来的那一个，不是一句「设置文件」——
-        // 零编程经验的用户没法对「设置文件」这四个字采取任何行动。
-        println!("{}", crate::i18n::msg::llm_not_enabled(lang, &config_path));
-        return 1;
+        return Err(LoadLlmError::NotEnabled(config_path));
     };
+    let http = llm.transport == crate::config::Transport::Http;
+    match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
+        Ok(backend) => Ok(LoadedLlm {
+            backend,
+            model: llm.model.clone().unwrap_or_else(|| llm.provider.clone()),
+            provider: llm.provider.clone(),
+            http,
+        }),
+        Err(error) => Err(LoadLlmError::Problem { error, provider: llm.provider.clone(), http }),
+    }
+}
 
-    println!(
-        "{}",
-        crate::i18n::msg::llm_using(
-            lang,
-            &llm.provider,
-            llm.transport == crate::config::Transport::Http
-        )
-    );
-
-    let backend = match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
-        Ok(b) => b,
-        Err(e) => {
+pub fn llm_check(lang: Lang) -> i32 {
+    let loaded = match load_llm_backend() {
+        Ok(l) => l,
+        Err(LoadLlmError::NotEnabled(config_path)) => {
+            // 路径是真的从 socket 推出来的那一个，不是一句「设置文件」——
+            // 零编程经验的用户没法对「设置文件」这四个字采取任何行动。
+            println!("{}", crate::i18n::msg::llm_not_enabled(lang, &config_path));
+            return 1;
+        }
+        Err(LoadLlmError::Problem { error, provider, http }) => {
+            println!("{}", crate::i18n::msg::llm_using(lang, &provider, http));
             println!(
                 "{}",
-                crate::i18n::msg::llm_cannot_connect(
-                    lang,
-                    &crate::i18n::msg::llm_problem(lang, &e)
-                )
+                crate::i18n::msg::llm_cannot_connect(lang, &crate::i18n::msg::llm_problem(lang, &error))
             );
             return 1;
         }
     };
+    println!("{}", crate::i18n::msg::llm_using(lang, &loaded.provider, loaded.http));
+    let backend = loaded.backend;
 
     let p = crate::llm::Prompt {
         system: "你是一个只回答一个词的助手。".into(),
