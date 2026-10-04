@@ -462,9 +462,9 @@ mod unix_tests {
             self.captures += 1;
             Ok(vec![9, 9])
         }
-        fn tap_at(&mut self, _: &Profile, _: u16, _: u16, _: &[Region]) -> Result<TapAt, DcoError> {
+        fn tap_at(&mut self, _: &Profile, _: u16, _: u16, _: &[Region], _: Option<&dct_game::play::TapSettleReq>) -> Result<TapAt, DcoError> {
             self.taps += 1;
-            Ok(TapAt { kind: "no_text".into(), text: String::new() })
+            Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: None })
         }
     }
     struct Clk;

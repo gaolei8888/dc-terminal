@@ -2,7 +2,7 @@
 //! 过安全检查 → 按位置点 → 看有没有变化 → 记一条教学记录。跟 dco、模型、时钟说话都是传进来的，测试里用假的。
 //! 设计：docs/superpowers/plans/2026-10-04-dct-game-scene.md。
 use crate::mood::Mood;
-use crate::play::{numbers, Clock, Dco, DcoError, Profile, Region, Seen};
+use crate::play::{numbers, Clock, Dco, DcoError, Profile, Region, Seen, TapSettle, TapSettleReq};
 use crate::screen::Element;
 use serde_json::{json, Value};
 
@@ -154,6 +154,66 @@ pub fn mood_for_stop(stop: &SceneStop) -> Option<Mood> {
     Some(Mood { state: "wait", text: Some(text) })
 }
 
+/// 点完让 dco 等屏幕稳定：安静 0.5 秒算稳，最多等 6 秒，只看窗口上面 80%（底栏不算）。
+pub const TAP_SETTLE: TapSettleReq = TapSettleReq { quiet_ms: 500, timeout_ms: 6000, region: [0.0, 0.0, 1.0, 0.8] };
+
+/// 文字里所有连续的数字（「4/6」是 4 和 6，「5+」是 5），按出现顺序。认字抖一下（`5` 变 `5+`）不会改变它。
+fn digit_runs(s: &Seen) -> Vec<u64> {
+    let mut out = vec![];
+    for e in &s.elements {
+        let mut cur = String::new();
+        for c in e.text.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_digit() {
+                cur.push(c);
+            } else if !cur.is_empty() {
+                if let Ok(n) = cur.parse() {
+                    out.push(n);
+                }
+                cur.clear();
+            }
+        }
+    }
+    out
+}
+
+/// 「词」：至少 4 个字母数字、小写。更短的（NIE、HIN）多半是认字抖出来的碎片。
+fn words(s: &Seen) -> Vec<String> {
+    let mut out = vec![];
+    for e in &s.elements {
+        for w in e.text.split(|c: char| !c.is_alphanumeric()) {
+            if w.chars().count() >= 4 {
+                out.push(w.to_lowercase());
+            }
+        }
+    }
+    out
+}
+
+fn edit_distance_le1(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let (long, short) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let Some(i) = (0..short.len()).find(|&i| long[i] != short[i]) else { return true };
+    if long.len() == short.len() { long[i + 1..] == short[i + 1..] } else { long[i + 1..] == short[i..] }
+}
+
+/// 这次点有没有让画面变：dco 的稳定报告（稳了才信）优先；否则比文字，且不被认字抖动骗到：
+/// 数字变了，或者出现一个以前没有、也和以前任何一个词差不到一个字母的新词。
+pub fn effective(before: &Seen, after: &Seen, settle: Option<&TapSettle>) -> bool {
+    if let Some(s) = settle {
+        if s.settled && !s.timed_out {
+            return s.changed;
+        }
+    }
+    if digit_runs(before) != digit_runs(after) {
+        return true;
+    }
+    let old = words(before);
+    words(after).iter().any(|w| !old.iter().any(|o| edit_distance_le1(w, o)))
+}
+
 fn texts_of(s: &Seen) -> Vec<String> {
     s.elements.iter().map(|e| e.text.clone()).collect()
 }
@@ -231,9 +291,9 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             break SceneStop::DryRun;
         }
         dco.show_status_with("think", Some("看场景"), None);
-        let tapped = dco.tap_at(p, x, y, &o.no_tap);
+        let tapped = dco.tap_at(p, x, y, &o.no_tap, Some(&TAP_SETTLE));
         dco.show_status("look");
-        match tapped {
+        let settle: Option<TapSettle> = match tapped {
             Err(e) if e.code == "unsupported" => break 'run SceneStop::NoTapAt,
             Err(e) if e.code == "private_screen" => break 'run SceneStop::PrivateScreen,
             Err(e) if e.code == "not_allowed" => {
@@ -252,8 +312,8 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
                 emit(rec, format!("第 {n} 步：点的时候出错了"));
                 break SceneStop::Dco(e);
             }
-            Ok(_) => {}
-        }
+            Ok(t) => t.settle,
+        };
         skipped = 0;
         sum.taps += 1;
         history.push((x, y));
@@ -267,8 +327,8 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
                 break if e.code == "private_screen" { SceneStop::PrivateScreen } else { SceneStop::Dco(e) };
             }
         };
-        let changed = texts_of(&before) != texts_of(&after) || numbers(&before) != numbers(&after);
-        rec["outcome"] = json!({ "changed": changed, "texts_after": texts_of(&after) });
+        let changed = effective(&before, &after, settle.as_ref());
+        rec["outcome"] = json!({ "changed": changed, "texts_after": texts_of(&after), "by": if settle.as_ref().is_some_and(|s| s.settled && !s.timed_out) { "dco_settle" } else { "texts" } });
         rec["label"] = json!(if changed { "effective" } else { "noop" });
         emit(rec, format!("第 {n} 步：点了『{}』，画面{}", k.name, if changed { "变了" } else { "没变" }));
         noop = if changed { 0 } else { noop + 1 };

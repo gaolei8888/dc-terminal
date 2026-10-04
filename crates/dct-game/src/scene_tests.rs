@@ -1,4 +1,4 @@
-use crate::play::{Clock, Dco, DcoError, Profile, Region, Seen, TapAt};
+use crate::play::{Clock, Dco, DcoError, Profile, Region, Seen, TapAt, TapSettle, TapSettleReq};
 use crate::scene::*;
 use crate::screen::Element;
 use serde_json::json;
@@ -24,10 +24,11 @@ struct Fake {
     taps: Vec<(u16, u16, usize)>,
     tap_result: Result<TapAt, DcoError>,
     moods: Vec<(String, Option<String>)>,
+    settle_asked: Vec<Option<TapSettleReq>>,
 }
 impl Fake {
     fn new() -> Fake {
-        Fake { sees: VecDeque::new(), default_seen: seen(&["1", "MENU"]), captures: 0, taps: vec![], tap_result: Ok(TapAt { kind: "no_text".into(), text: String::new() }), moods: vec![] }
+        Fake { sees: VecDeque::new(), default_seen: seen(&["1", "MENU"]), captures: 0, taps: vec![], tap_result: Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: None }), moods: vec![], settle_asked: vec![] }
     }
 }
 impl Dco for Fake {
@@ -44,7 +45,8 @@ impl Dco for Fake {
         self.captures += 1;
         Ok(vec![1, 2, 3])
     }
-    fn tap_at(&mut self, _: &Profile, x: u16, y: u16, avoid: &[Region]) -> Result<TapAt, DcoError> {
+    fn tap_at(&mut self, _: &Profile, x: u16, y: u16, avoid: &[Region], settle: Option<&TapSettleReq>) -> Result<TapAt, DcoError> {
+        self.settle_asked.push(settle.cloned());
         self.taps.push((x, y, avoid.len()));
         self.tap_result.clone()
     }
@@ -362,4 +364,76 @@ fn dco_refusing_a_tap_is_a_skip_not_a_crash() {
     let (s, steps) = run(&mut d, &Script::new(&[(0.1, 0.1), (0.3, 0.3), (0.6, 0.6)]), &opts(10));
     assert_eq!(s.stop, SceneStop::Skipped3);
     assert!(steps.iter().all(|x| x.record["label"] == "skipped"));
+}
+
+// ---- 有没有变：稳定报告优先，其次是不怕认字抖动的文字比较 ----
+
+fn st(changed: bool, settled: bool, timed_out: bool) -> TapSettle {
+    TapSettle { changed, change: 0.0, settled, timed_out, settled_ms: Some(500) }
+}
+
+#[test]
+fn ocr_jitter_alone_is_not_an_effect() {
+    let b = seen(&["5", "4/6", "HINT", "MENU"]);
+    assert!(!effective(&b, &seen(&["5+", "4/6", "NIE", "MENU"]), None));
+    assert!(!effective(&b, &seen(&["5", "4/6", "HINI", "MENU"]), None));
+    assert!(!effective(&b, &seen(&["5", "4/6", "HIN", "MENU"]), None));
+    assert!(!effective(&b, &b, None));
+}
+
+#[test]
+fn a_number_change_is_an_effect_even_inside_a_fraction() {
+    let b = seen(&["5", "4/6", "HINT", "MENU"]);
+    assert!(effective(&b, &seen(&["5", "5/6", "HINT", "MENU"]), None));
+    assert!(effective(&b, &seen(&["6", "4/6", "HINT", "MENU"]), None));
+}
+
+#[test]
+fn a_new_real_word_is_an_effect_but_a_one_letter_variant_is_not() {
+    let b = seen(&["5", "HINT", "MENU"]);
+    assert!(effective(&b, &seen(&["5", "HINT", "MENU", "Congratulations"]), None));
+    assert!(effective(&b, &seen(&["5", "HINT", "MENU", "Found it"]), None));
+    assert!(!effective(&b, &seen(&["5", "HINT", "MEN"]), None));
+    assert!(!effective(&b, &seen(&["5", "HINT", "MENUS"]), None));
+}
+
+#[test]
+fn a_settled_report_decides_over_the_texts() {
+    let b = seen(&["5", "HINT"]);
+    let jitter = seen(&["5+", "NIE"]);
+    let real = seen(&["9", "Congratulations"]);
+    assert!(!effective(&b, &real, Some(&st(false, true, false))), "没变就是没变，文字再抖也不算");
+    assert!(effective(&b, &jitter, Some(&st(true, true, false))), "变了就是变了");
+}
+
+#[test]
+fn an_unsettled_or_timed_out_report_falls_back_to_the_text_rule() {
+    let b = seen(&["5", "HINT"]);
+    let jitter = seen(&["5+", "NIE"]);
+    let real = seen(&["6", "HINT"]);
+    assert!(!effective(&b, &jitter, Some(&st(true, true, true))));
+    assert!(effective(&b, &real, Some(&st(false, true, true))));
+    assert!(!effective(&b, &jitter, Some(&st(true, false, false))));
+    assert!(effective(&b, &real, Some(&st(false, false, false))));
+}
+
+#[test]
+fn the_loop_asks_dco_for_the_settle_and_labels_by_it() {
+    let mut d = Fake::new();
+    d.tap_result = Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: Some(st(false, true, false)) });
+    // 点前点后文字真的不同，但 dco 说没变：以 dco 为准。
+    d.sees = VecDeque::from([Ok(seen(&["1"])), Ok(seen(&["2", "Congratulations"]))]);
+    let (s, steps) = run(&mut d, &Script::new(&[(0.5, 0.5)]), &opts(1));
+    assert_eq!(s.taps, 1);
+    assert_eq!(steps[0].record["label"], "noop");
+    assert_eq!(steps[0].record["outcome"]["by"], "dco_settle");
+    assert_eq!(d.settle_asked, vec![Some(TAP_SETTLE)]);
+}
+
+#[test]
+fn the_loop_uses_dco_changed_true_as_effective() {
+    let mut d = Fake::new();
+    d.tap_result = Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: Some(st(true, true, false)) });
+    let (_, steps) = run(&mut d, &Script::new(&[(0.5, 0.5)]), &opts(1));
+    assert_eq!(steps[0].record["label"], "effective");
 }
