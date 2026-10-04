@@ -66,6 +66,8 @@ pub trait Clock {
 
 /// 最多发给模型几个候选。
 pub const ASK_SHOWN: usize = 8;
+/// 连着最多几次「划了没反应」才停。被拒绝的格子在棋盘变化前不再被选，所以多试几次不会重复同一处。
+pub const MAX_REFUSED_IN_A_ROW: usize = 5;
 
 pub struct Options<'a> {
     pub max_steps: usize,
@@ -220,6 +222,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
     let mut asked = 0usize;
     let mut streak = 0;
+    let mut locked: Vec<(usize, usize)> = Vec::new();
     let mut current: Option<GridRead> = None;
     let mut no_move_confirms = 0;
     let stop = loop {
@@ -271,7 +274,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
         let cands: Vec<Candidate> = choose(&board, &p.weights);
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
         // 同一盘棋上划了没反应的步，不再重复选。
-        let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
+        let board_key = canonical(&g.cells);
+        let blocked = |c: &Candidate| {
+            failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key) || locked.contains(&c.mv.a) || locked.contains(&c.mv.b)
+        };
+        let pick = cands.iter().position(|c| !blocked(c));
         if cands.is_empty() && !o.dry_run && no_move_confirms < MAX_NO_MOVE_CONFIRMS {
             // 补糖还没补完时会有一瞬间没步可走：停一下再读，盘面变了或有步了就接着玩。
             no_move_confirms += 1;
@@ -295,11 +302,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
         let mut ask_rec: Option<Value> = None;
         let mut decider = "rules";
         if let Some(adv) = o.advisor {
-            let board_key = canonical(&g.cells);
             // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
             let offered: Vec<usize> = {
-                let is_failed = |c: &Candidate| failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key);
-                (0..cands.len()).filter(|&i| !is_failed(&cands[i])).take(ASK_SHOWN).collect()
+                (0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()
             };
             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
             if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
@@ -379,7 +384,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 sink(rec);
                 streak += 1;
                 failed.push((chosen.mv, canonical(&g.cells)));
-                if streak >= 2 {
+                locked.push(chosen.mv.a);
+                locked.push(chosen.mv.b);
+                if streak >= MAX_REFUSED_IN_A_ROW {
                     break Stop::Stuck;
                 }
                 current = Some(next);
@@ -390,6 +397,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 sink(rec);
                 streak = 0;
                 failed.clear();
+                locked.clear();
                 current = Some(next);
             }
             Settle::NoChange(same_board) => {
@@ -398,7 +406,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 sink(rec);
                 streak += 1;
                 failed.push((chosen.mv, canonical(&g.cells)));
-                if streak >= 2 {
+                locked.push(chosen.mv.a);
+                locked.push(chosen.mv.b);
+                if streak >= MAX_REFUSED_IN_A_ROW {
                     break Stop::Stuck;
                 }
                 current = Some(same_board);

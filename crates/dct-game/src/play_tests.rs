@@ -759,15 +759,19 @@ fn without_ask_always_the_model_is_not_asked_on_a_clean_board() {
 #[test]
 fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
     // 第一划没反应（A 一直不变），第二次选步时这盘棋上已有失败的步：问模型，失败的步在 failed 里、不在候选里
+    // （用 MANY：被拒绝的步锁住两格以后，棋盘上还得有至少两个不碰这两格的候选，模型才会被问）
     let mut reads = vec![];
     for _ in 0..40 {
-        reads.push(Ok(grid(A)));
+        reads.push(Ok(grid(MANY)));
     }
-    reads.push(Ok(grid(MOVED)));
-    reads.push(Ok(grid(MOVED)));
+    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
+    reads.push(Ok(grid(moved)));
+    reads.push(Ok(grid(moved)));
     let say = Say::new(Some(0));
     let mut d = Fake::new(reads);
-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 2);
+    let mut log = vec![];
+    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰" };
+    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &o, &mut |v| log.push(v));
     assert!(say.calls.get() >= 1);
     let seen = say.seen.borrow();
     assert_eq!(seen[0].failed.len(), 1);
@@ -869,4 +873,116 @@ fn a_choice_outside_the_offered_list_falls_back_to_rules_and_is_recorded() {
     assert_eq!(d.swipes[0], d0.swipes[0]);
     assert_eq!(log[0]["decider"], "rules");
     assert!(log[0]["ask"]["choice"].is_null());
+}
+
+#[test]
+fn after_a_refused_swap_no_later_candidate_touches_its_two_cells() {
+    // 一直读到同一张盘（没变化）：第一步被拒绝以后，第二步选的步不碰第一步的两个格子
+    let mut reads = vec![];
+    for _ in 0..80 {
+        reads.push(Ok(grid(MANY)));
+    }
+    let mut d = Fake::new(reads);
+    let mut log = vec![];
+    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let pos = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
+    assert!(log.len() >= 2, "{log:?}");
+    for i in 1..log.len() {
+        let (ai, bi) = (pos(&log[i], "a"), pos(&log[i], "b"));
+        for j in 0..i {
+            let (aj, bj) = (pos(&log[j], "a"), pos(&log[j], "b"));
+            for p in [&ai, &bi] {
+                assert!(*p != aj && *p != bj, "第 {i} 步碰了被拒绝的格子（第 {j} 步）：{log:?}");
+            }
+        }
+    }
+}
+
+// 6 行 4 列，每行一个互不相干的三连换法（交替用 2/4、1/3，避免竖向连线）
+const MANY: &[&[u16]] = &[
+    &[1, 1, 2, 1],
+    &[3, 3, 4, 3],
+    &[1, 1, 2, 1],
+    &[3, 3, 4, 3],
+    &[1, 1, 2, 1],
+    &[3, 3, 4, 3],
+];
+
+#[test]
+fn five_refusals_in_a_row_stop_the_run_not_two() {
+    let mut reads = vec![];
+    for _ in 0..400 {
+        reads.push(Ok(grid(MANY)));
+    }
+    let mut d = Fake::new(reads);
+    let mut log = vec![];
+    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    assert_eq!(s.stop, Stop::Stuck);
+    assert_eq!(d.swipes.len(), 5, "应该试满 5 次才停");
+}
+
+#[test]
+fn a_move_that_works_unlocks_the_cells() {
+    // 第一步没反应（锁住它的两格），第二步（别处）成功 → 解除；第三步又可以碰第一步的格子
+    let mut reads = vec![];
+    for _ in 0..40 {
+        reads.push(Ok(grid(MANY)));
+    }
+    // 第二次划：变成另一张盘并落定
+    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
+    reads.push(Ok(grid(moved)));
+    reads.push(Ok(grid(moved)));
+    for _ in 0..400 {
+        reads.push(Ok(grid(MANY)));
+    }
+    let mut d = Fake::new(reads);
+    let mut log = vec![];
+    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
+    assert_eq!(&outcomes[..2], ["no_change", "moved"], "{outcomes:?}");
+}
+
+// 4x4：规则第一名之后，排在第一个「完全不碰」的候选前面，既有只和它共用 a 格的，也有只共用 b 格的候选
+const OVERLAP: &[&[u16]] = &[&[2, 3, 4, 2], &[3, 3, 3, 4], &[3, 4, 3, 3], &[2, 1, 4, 4]];
+
+#[test]
+fn a_refused_swap_locks_both_of_its_cells_even_when_better_candidates_share_only_one() {
+    let mut reads = vec![];
+    for _ in 0..200 {
+        reads.push(Ok(grid(OVERLAP)));
+    }
+    let mut d = Fake::new(reads);
+    let mut log = vec![];
+    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    assert!(log.len() >= 2, "{log:?}");
+    let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
+    let (a0, b0) = (cell(&log[0], "a"), cell(&log[0], "b"));
+    for k in ["a", "b"] {
+        let p = cell(&log[1], k);
+        assert!(p != a0 && p != b0, "第二步碰了被拒绝的格子：{log:?}");
+    }
+}
+
+#[test]
+fn a_move_that_works_unlocks_cells_that_the_only_remaining_move_needs() {
+    // TWO 上有两个互不相干的步，规则先选下面一行的（低行优先），划了没反应 → 锁住那两格；
+    // 第二步选上面的，成功，盘面变成 AFTER：那里只剩下面那一行的步，要碰被锁过的格子。解锁了才能继续划。
+    const TWO: &[&[u16]] = &[&[1, 1, 2, 1], &[3, 4, 3, 4], &[4, 3, 4, 3], &[5, 5, 6, 5]];
+    const AFTER: &[&[u16]] = &[&[1, 2, 1, 2], &[2, 1, 2, 1], &[3, 4, 3, 4], &[5, 5, 6, 5]];
+    let mut reads = vec![];
+    for _ in 0..40 {
+        reads.push(Ok(grid(TWO)));
+    }
+    reads.push(Ok(grid(AFTER)));
+    reads.push(Ok(grid(AFTER)));
+    let mut d = Fake::new(reads);
+    let mut log = vec![];
+    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
+    // 第三步：规则第一名就是那个碰被锁过的格子的步（没解锁的话它会被跳过）
+    let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
+    let first_cells = [cell(&log[0], "a"), cell(&log[0], "b")];
+    assert!(outcomes.len() >= 3, "{outcomes:?}");
+    assert!(first_cells.contains(&cell(&log[2], "a")) || first_cells.contains(&cell(&log[2], "b")), "第三步该碰第一步的格子：{log:?}");
+    assert!(outcomes[0] == "no_change" && outcomes[1] == "moved", "{outcomes:?}");
 }
