@@ -477,10 +477,17 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
         let r4 = |v: f64| (v * 10000.0).round() / 10000.0;
         let t_swipe = clock.now_ms();
         let outcome = dco.swipe_settle(p, from, to);
-        let swipe_ms = clock.now_ms().saturating_sub(t_swipe);
-        rec["swipe"] = json!({ "from": [r4(from.0), r4(from.1)], "to": [r4(to.0), r4(to.1)], "started_ms": t_swipe, "duration_ms": swipe_ms });
+        let call_ms = clock.now_ms().saturating_sub(t_swipe);
+        let swipe_rec = |ms: u64, includes_settle: bool| {
+            let mut v = json!({ "from": [r4(from.0), r4(from.1)], "to": [r4(to.0), r4(to.1)], "started_ms": t_swipe, "duration_ms": ms });
+            if includes_settle {
+                v["duration_ms_includes_settle"] = json!(true);
+            }
+            v
+        };
         if let SwipeOutcome::NotSwiped(e) = outcome {
-            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": 0 });
+            rec["swipe"] = swipe_rec(call_ms, false);
+            rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": call_ms, "settle": 0 });
             rec["outcome"] = json!("stopped");
             sink(rec);
             break Stop::Dco(e);
@@ -489,10 +496,12 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
         steps += 1;
         no_move_confirms = 0;
         rec["swiped"] = json!(true);
-        // dco 带稳定报告：它已经替我们等过了，「整段等待」从划动开始算；否则回退到老的轮询（绝不重划）。
-        let (result, t_settle) = match outcome {
+        // dco 带稳定报告：等待发生在 swipe_settle 里面，所以整段调用时长要拆成「划」和「等」；
+        // 拆不开时整段记在 swipe 上并打标记。回退到轮询绝不重划。
+        let (result, swipe_ms, settle_ms) = match outcome {
             SwipeOutcome::Settled(s) if s.settled && !s.timed_out => {
                 rec["settle"] = json!({ "source": "dco", "changed": s.changed, "settled_ms": s.settled_ms });
+                let t_read = clock.now_ms();
                 let r = if !s.changed {
                     Settle::NoChange(g.clone())
                 } else {
@@ -502,15 +511,29 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                         Err(e) => Settle::Failed(e),
                     }
                 };
-                (r, t_swipe)
+                let read_after = clock.now_ms().saturating_sub(t_read);
+                match s.settled_ms {
+                    Some(m) => {
+                        rec["swipe"] = swipe_rec(call_ms.saturating_sub(m), false);
+                        (r, call_ms.saturating_sub(m), m + read_after)
+                    }
+                    None => {
+                        rec["swipe"] = swipe_rec(call_ms, true);
+                        (r, call_ms, read_after)
+                    }
+                }
             }
-            _ => {
+            other => {
                 rec["settle"] = json!({ "source": "poll", "changed": null, "settled_ms": null });
+                // 老 dco 的默认实现只划了一下（unsupported），时长是纯划动；其余回退时调用里可能已经含了等待。
+                let includes = !matches!(&other, SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported");
+                rec["swipe"] = swipe_rec(call_ms, includes);
                 let t = clock.now_ms();
-                (settle(dco, clock, p, &g), t)
+                let r = settle(dco, clock, p, &g);
+                (r, call_ms, clock.now_ms().saturating_sub(t))
             }
         };
-        rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+        rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": settle_ms });
         match result {
             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
             Settle::Settled(next) if same(&next, &g) => {

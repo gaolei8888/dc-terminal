@@ -26,15 +26,21 @@ struct Fake {
     reads_taken: usize,
     texts: VecDeque<Vec<&'static str>>,
     settles: VecDeque<SwipeOutcome>,
+    clock: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    call_ms: u64,
+    read_ms: u64,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new() }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new(), clock: None, call_ms: 0, read_ms: 0 }
     }
 }
 impl Dco for Fake {
     fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
         self.reads_taken += 1;
+        if let Some(c) = &self.clock {
+            c.set(c.get() + self.read_ms);
+        }
         if let Some(r) = self.reads.pop_front() {
             self.last = Some(r.clone());
             return r;
@@ -52,6 +58,9 @@ impl Dco for Fake {
     fn swipe_settle(&mut self, p: &Profile, f: (f64, f64), t: (f64, f64)) -> SwipeOutcome {
         // 队列空时和 trait 默认实现一模一样：一次划动，然后「没拿到稳定报告」。
         let scripted = self.settles.pop_front();
+        if let Some(c) = &self.clock {
+            c.set(c.get() + self.call_ms);
+        }
         match self.swipe(p, f, t) {
             Err(e) => SwipeOutcome::NotSwiped(e),
             Ok(()) => scripted.unwrap_or_else(|| SwipeOutcome::SwipedNoSettle(DcoError { code: "unsupported".into(), message: "x".into() })),
@@ -1433,4 +1442,63 @@ fn settled_flag_with_timed_out_is_still_not_trusted() {
     assert_eq!(log[0]["settle"]["source"], "poll");
     assert_eq!(log[0]["outcome"], "moved");
     assert_eq!(d.swipes.len(), 1);
+}
+
+struct SharedClk(std::rc::Rc<std::cell::Cell<u64>>);
+impl Clock for SharedClk {
+    fn now_ms(&self) -> u64 {
+        self.0.get()
+    }
+    fn sleep_ms(&mut self, ms: u64) {
+        self.0.set(self.0.get() + ms);
+    }
+}
+fn run_timed(d: &mut Fake) -> Vec<Value> {
+    let c = std::rc::Rc::new(std::cell::Cell::new(0));
+    d.clock = Some(c.clone());
+    let mut log = vec![];
+    play(d, &mut SharedClk(c), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+    log
+}
+
+#[test]
+fn dco_path_splits_the_call_into_swipe_and_settle() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    d.settles.push_back(settled(true)); // settled_ms 420
+    d.call_ms = 500;
+    d.read_ms = 30;
+    let log = run_timed(&mut d);
+    let t = &log[0]["timing_ms"];
+    // 第一次读盘（30）在划之前，不算在内。
+    assert_eq!(t["swipe"], 80);
+    assert_eq!(t["settle"], 450);
+    assert_eq!(log[0]["swipe"]["duration_ms"], t["swipe"]);
+    assert_eq!(t["swipe"].as_u64().unwrap() + t["settle"].as_u64().unwrap(), 500 + 30);
+    assert!(log[0]["swipe"].get("duration_ms_includes_settle").is_none());
+}
+
+#[test]
+fn fallback_paths_flag_that_the_swipe_duration_includes_the_wait() {
+    for o in [
+        SwipeOutcome::SwipedNoSettle(err("stale")),
+        SwipeOutcome::Settled(SwipeSettle { changed: false, change: 0.0, settled: true, timed_out: true, settled_ms: Some(8000) }),
+        SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.1, settled: true, timed_out: false, settled_ms: None }),
+    ] {
+        let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+        d.settles.push_back(o);
+        d.call_ms = 500;
+        let log = run_timed(&mut d);
+        assert_eq!(log[0]["swipe"]["duration_ms_includes_settle"], true);
+        assert_eq!(log[0]["swipe"]["duration_ms"], 500);
+        assert_eq!(log[0]["timing_ms"]["swipe"], 500);
+    }
+}
+
+#[test]
+fn poll_path_has_no_includes_settle_flag() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    d.call_ms = 40;
+    let log = run_timed(&mut d);
+    assert!(log[0]["swipe"].get("duration_ms_includes_settle").is_none());
+    assert_eq!(log[0]["swipe"]["duration_ms"], 40);
 }
