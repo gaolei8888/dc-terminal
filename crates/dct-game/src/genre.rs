@@ -20,6 +20,7 @@ fn normalise(s: &str) -> String {
         .chars()
         .map(|c| match c {
             '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{2018}' | '\u{2019}' => '\'',
             _ => c,
         })
         .collect::<String>()
@@ -81,6 +82,13 @@ mod tests {
         assert_eq!(classify(&t(&["  Ｉｎｖｅｎｔｏｒｙ "]), None), Genre::HiddenObject);
         assert_eq!(classify(&t(&["Hidden   Object"]), None), Genre::Unknown, "中间多空格不是线索词，不乱猜");
         assert_eq!(classify(&t(&["HIDDEN OBJECT"]), None), Genre::HiddenObject);
+    }
+
+    #[test]
+    fn typographic_apostrophes_match_the_ascii_cue() {
+        assert_eq!(classify(&t(&["COLLECTOR\u{2019}S EDITION"]), None), Genre::HiddenObject);
+        assert_eq!(classify(&t(&["Collector\u{2018}s Edition"]), None), Genre::HiddenObject);
+        assert_eq!(classify(&t(&["COLLECTOR\u{FF07}S EDITION"]), None), Genre::HiddenObject);
     }
 
     #[test]
