@@ -105,8 +105,13 @@ pub(crate) fn goal_dropped(before: &[u64], after: &[u64], goal: usize) -> Option
     Some(after[goal] < before[goal])
 }
 
-fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
-    dco.see_text(p).ok().map(|s| numbers(&s))
+/// 读屏幕上的数字。`Err(())` 只有一种：dco 说这是私人画面（不读、不操作）；别的错误都当「读不到」（`Ok(None)`）。
+fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Result<Option<Vec<u64>>, ()> {
+    match dco.see_text(p) {
+        Ok(s) => Ok(Some(numbers(&s))),
+        Err(e) if e.code == "private_screen" => Err(()),
+        Err(_) => Ok(None),
+    }
 }
 
 pub trait Dco {
@@ -178,6 +183,8 @@ pub enum Stop {
     DryRun,
     /// dco 急停 / 暂停 / 锁屏 / 别的错误。
     Dco(DcoError),
+    /// dco 认出这是私人画面（微信、相册……）不给读：一步都不划，也不碰。
+    PrivateScreen,
     // ---- 下面几个只有 `--auto-next` 才会出现（navigate.rs）----
     /// 通关了：下一关版面不一样，先停。
     Won,
@@ -368,8 +375,18 @@ pub(crate) fn play_inner(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, 
     let mut no_progress = 0usize;
     let mut finder = GoalFinder::new();
     let mut moved_seen = 0usize;
-    let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
+    let (mut progress_prev, private_at_start) = if o.dry_run {
+        (None, false)
+    } else {
+        match read_numbers(dco, p) {
+            Ok(v) => (v, false),
+            Err(()) => (None, true),
+        }
+    };
     let stop = loop {
+        if private_at_start {
+            break Stop::PrivateScreen;
+        }
         if steps >= o.max_steps {
             break Stop::StepsDone;
         }
@@ -590,7 +607,14 @@ pub(crate) fn play_inner(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, 
                 rec["outcome"] = json!("no_change");
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(next.observation_id);
-                let progress_after = read_numbers(dco, p);
+                let progress_after = match read_numbers(dco, p) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        rec["outcome"] = json!("stopped");
+                        sink(rec);
+                        break Stop::PrivateScreen;
+                    }
+                };
                 let gi = o.goal_index.or(finder.index());
                 update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
@@ -609,7 +633,14 @@ pub(crate) fn play_inner(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, 
                 rec["outcome"] = json!("moved");
                 rec["observed_changed"] = json!(changed_cells(&g, &next));
                 rec["after_observation_id"] = json!(next.observation_id);
-                let progress_after = read_numbers(dco, p);
+                let progress_after = match read_numbers(dco, p) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        rec["outcome"] = json!("stopped");
+                        sink(rec);
+                        break Stop::PrivateScreen;
+                    }
+                };
                 // 只有成功走了一步才让识别器看：被拒绝的步数字不降，会把「每步刚好少 1」的步数误排除。
                 // 第一步也不看：开局前读到的数字可能带着关卡开始的弹窗，不是这一步造成的变化。
                 moved_seen += 1;
@@ -638,7 +669,14 @@ pub(crate) fn play_inner(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, 
                 rec["outcome"] = json!("no_change");
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(same_board.observation_id);
-                let progress_after = read_numbers(dco, p);
+                let progress_after = match read_numbers(dco, p) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        rec["outcome"] = json!("stopped");
+                        sink(rec);
+                        break Stop::PrivateScreen;
+                    }
+                };
                 let gi = o.goal_index.or(finder.index());
                 update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });

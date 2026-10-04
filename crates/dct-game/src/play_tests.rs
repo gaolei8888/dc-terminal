@@ -31,10 +31,12 @@ struct Fake {
     read_ms: u64,
     /// show_status_with 的完整参数（state, text, theme）。
     moods: Vec<(String, Option<String>, Option<String>)>,
+    /// 每次 see_text 先取一个：`Some(e)` 就返回这个错误，`None`/空了才走 texts。
+    see_errors: VecDeque<Option<DcoError>>,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new(), clock: None, call_ms: 0, read_ms: 0, moods: vec![] }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new(), clock: None, call_ms: 0, read_ms: 0, moods: vec![], see_errors: VecDeque::new() }
     }
 }
 impl Dco for Fake {
@@ -76,6 +78,9 @@ impl Dco for Fake {
         self.show_status(state);
     }
     fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
+        if let Some(Some(e)) = self.see_errors.pop_front() {
+            return Err(e);
+        }
         match self.texts.pop_front() {
             Some(t) => Ok(Seen {
                 snapshot_id: "s".into(),
@@ -1615,4 +1620,34 @@ fn stuck_ends_with_stuck_and_steps_done_adds_nothing() {
     let s = play(&mut d, &mut Clk(0), &profile(3, 4), &opts(1), &mut |_| {});
     assert_eq!(s.stop, Stop::StepsDone);
     assert!(d.moods.is_empty());
+}
+
+#[test]
+fn a_private_screen_at_the_start_stops_before_any_swipe() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    d.see_errors = [Some(err("private_screen"))].into();
+    let (s, log) = run(&mut d, 5, false);
+    assert_eq!((s.stop, s.steps), (Stop::PrivateScreen, 0));
+    assert!(d.swipes.is_empty() && log.is_empty());
+    assert_eq!(d.moods, [("wait".to_string(), Some("私人画面，没操作".to_string()), None)]);
+}
+
+#[test]
+fn a_screen_that_turns_private_mid_run_stops_and_records_it() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    d.see_errors = [None, Some(err("private_screen"))].into();
+    d.texts = [vec!["50"]].into();
+    let (s, log) = run(&mut d, 5, false);
+    assert_eq!((s.stop, s.steps), (Stop::PrivateScreen, 1));
+    assert_eq!(log.last().unwrap()["outcome"], "stopped");
+    assert_eq!(d.swipes.len(), 1);
+}
+
+#[test]
+fn other_see_text_errors_still_just_mean_no_progress() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    d.see_errors = [Some(err("unsupported")), Some(err("dco_timeout"))].into();
+    let (s, log) = run(&mut d, 1, false);
+    assert_eq!(s.stop, Stop::StepsDone);
+    assert!(log[0]["progress"]["after"].is_null());
 }

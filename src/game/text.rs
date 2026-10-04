@@ -68,6 +68,7 @@ pub fn stop_code(stop: &Stop) -> &'static str {
         Stop::StepsDone => "steps_done",
         Stop::DryRun => "dry_run",
         Stop::Dco(_) => "dco",
+        Stop::PrivateScreen => "private_screen",
         Stop::Won => "won",
         Stop::LevelEnded => "level_ended",
         Stop::LivesOut => "lives_out",
@@ -126,6 +127,7 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
         Stop::Stuck => (format!("停了：划了几次画面都没有变化。请看一眼屏幕上是不是弹出了什么。{tail}"), 1),
         Stop::StillMoving => (format!("停了：等了 8 秒画面还在动。{tail}"), 1),
         Stop::Dco(e) => (format!("停了：{} {tail}", dco_error(e)), 1),
+        Stop::PrivateScreen => ("这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏再运行。".into(), 0),
         Stop::Won => (format!("通关了。下一关的棋盘位置不一样，要先重新认棋盘，所以先停在这里。{tail}"), 0),
         Stop::LevelEnded => (
             format!("这一局结束了，我看不出是通关还是没过，为了不乱点先停在这里。要接着玩，请你自己点 Play。{tail}"),
@@ -308,6 +310,14 @@ mod tests {
         assert_eq!(code, 1);
         assert!(line.contains("t1 / t2") && line.contains("t8") && !line.contains("t9"), "{line}");
         assert!(line.contains("没有点任何东西"));
+    }
+
+    #[test]
+    fn a_private_screen_stop_is_plain_chinese_exit_zero() {
+        let (line, code) = stop_line(&Stop::PrivateScreen, 0, Path::new("/x"));
+        assert_eq!(line, "这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏再运行。");
+        assert_eq!(code, 0);
+        assert_eq!(stop_code(&Stop::PrivateScreen), "private_screen");
     }
 
     #[test]

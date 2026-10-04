@@ -71,6 +71,15 @@ fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Se
     }
 }
 
+/// dco 的错误变成停下的原因：私人画面单独一种（不是出错）。
+fn dco_stop(e: DcoError) -> Stop {
+    if e.code == "private_screen" {
+        Stop::PrivateScreen
+    } else {
+        Stop::Dco(e)
+    }
+}
+
 pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
     let (mut steps, mut tries, mut taps, mut no_effect) = (0usize, 0usize, 0usize, 0usize);
     // after_board：刚玩完一局，还没有进过新棋盘。这时看到的 Play 可能是通关后的下一关，不点。
@@ -80,7 +89,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
     let stop = loop {
         let seen = match dco.see_text(p) {
             Ok(s) => s,
-            Err(e) => break Stop::Dco(e),
+            Err(e) => break dco_stop(e),
         };
         // 画面上写着这个游戏的「关卡号」（profile 数据）、而且读得出合格的棋盘：它就是棋盘。
         // 不先过 OCR 分类：棋盘 HUD 上的图标会被读成 ￥ 之类的符号，被当成“带价格的画面”。
@@ -170,7 +179,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                                 if steps >= o.max_steps {
                                     let end = match dco.see_text(p) {
                                         Ok(e) => e,
-                                        Err(e) => break Stop::Dco(e),
+                                        Err(e) => break dco_stop(e),
                                     };
                                     let (name, stop) = match classify(&end.elements) {
                                         Screen::Retry(_) => ("retry", Stop::StepsDone),
@@ -239,7 +248,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             }
             Err(e) => {
                 sink(nav_record(clock, &seen, kind, Some(&el.text), "stopped"));
-                break Stop::Dco(e);
+                break dco_stop(e);
             }
         }
     };

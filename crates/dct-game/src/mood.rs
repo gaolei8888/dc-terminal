@@ -59,6 +59,7 @@ pub fn for_stop(stop: &Stop) -> Option<Mood> {
         Stop::LivesOut => mood("sad"),
         Stop::Money | Stop::Ad => mood_text("wait", "要你处理"),
         Stop::UnknownScreen(_) | Stop::LevelEnded | Stop::NoGrid(_) => mood_text("wait", "看不懂这个画面"),
+        Stop::PrivateScreen => mood_text("wait", "私人画面，没操作"),
         Stop::Stuck => mood("stuck"),
         _ => None,
     }
@@ -144,6 +145,7 @@ mod tests {
             Stop::NoEffect,
             Stop::TriesDone,
             Stop::TapLimit,
+            Stop::PrivateScreen,
         ]
     }
 
@@ -158,6 +160,7 @@ mod tests {
             assert_eq!(got(s), Some(("wait", Some("看不懂这个画面"))));
         }
         assert_eq!(got(Stop::Stuck), Some(("stuck", None)));
+        assert_eq!(got(Stop::PrivateScreen), Some(("wait", Some("私人画面，没操作"))));
         for s in [Stop::StepsDone, Stop::DryRun, Stop::NoMoves, Stop::StillMoving, Stop::NoEffect, Stop::TriesDone, Stop::TapLimit, Stop::ClassesChanged { was: 1, now: 4 }, Stop::Dco(DcoError { code: "c".into(), message: "m".into() })] {
             assert_eq!(for_stop(&s), None, "{s:?}");
         }

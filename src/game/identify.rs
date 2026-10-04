@@ -4,15 +4,22 @@ use dct_game::genre::{classify, Genre};
 use dct_game::looks_like_board;
 use dct_game::play::{Dco, Profile};
 
-pub fn identify(dco: &mut dyn Dco, p: &Profile) -> Genre {
-    let texts: Vec<String> = dco.see_text(p).map(|s| s.elements.into_iter().map(|e| e.text).collect()).unwrap_or_default();
+/// 认出类别；`None` = dco 说这是私人画面：不读棋盘、不发任何表情。
+pub fn identify(dco: &mut dyn Dco, p: &Profile) -> Option<Genre> {
+    let texts: Vec<String> = match dco.see_text(p) {
+        Ok(s) => s.elements.into_iter().map(|e| e.text).collect(),
+        Err(e) if e.code == "private_screen" => return None,
+        Err(_) => Vec::new(),
+    };
     let board_ok = Some(dco.read_grid(p).map(|g| looks_like_board(&g)).unwrap_or(false));
     let g = classify(&texts, board_ok);
     if let Some(m) = dct_game::mood::for_genre(g) {
         dco.show_status_with(m.state, m.text, None);
     }
-    g
+    Some(g)
 }
+
+const PRIVATE_LINE: &str = "这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏。";
 
 /// `dct game identify [--game 名字]`
 pub fn run(args: &[String]) -> i32 {
@@ -66,7 +73,10 @@ fn run_identify(game: &str) -> i32 {
             return 1;
         }
     };
-    println!("{}", sentence(identify(&mut dco, &loaded.profile)));
+    match identify(&mut dco, &loaded.profile) {
+        Some(g) => println!("{}", sentence(g)),
+        None => println!("{PRIVATE_LINE}"),
+    }
     0
 }
 
@@ -135,50 +145,70 @@ mod tests {
     }
 
     #[test]
+    fn a_private_screen_is_never_read_further() {
+        struct Private;
+        impl Dco for Private {
+            fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
+                panic!("a private screen must not be read");
+            }
+            fn swipe(&mut self, _: &Profile, _: (f64, f64), _: (f64, f64)) -> Result<(), DcoError> {
+                panic!("identify must never swipe");
+            }
+            fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
+                Err(DcoError { code: "private_screen".into(), message: "x".into() })
+            }
+            fn show_status_with(&mut self, _: &str, _: Option<&str>, _: Option<&str>) {
+                panic!("no mood on a private screen");
+            }
+        }
+        assert_eq!(identify(&mut Private, &profile()), None);
+    }
+
+    #[test]
     fn identify_sends_a_mood_only_for_a_hidden_object_game() {
         let mut d = Fake { texts: Some(vec!["COLLECTOR'S EDITION", "PLAY"]), grid: no_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::HiddenObject);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::HiddenObject));
         assert_eq!(d.moods, ["confused"]);
         let mut d = Fake { texts: Some(vec!["Hint"]), grid: good_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::Match3));
         assert!(d.moods.is_empty());
     }
 
     #[test]
     fn a_readable_grid_that_is_not_board_like_is_not_match3() {
         let mut d = Fake { texts: Some(vec!["PLAY", "OPTIONS"]), grid: popup_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::Unknown));
     }
 
     #[test]
     fn a_strong_cue_with_a_non_board_like_grid_is_hidden_object() {
         let mut d = Fake { texts: Some(vec!["Inventory"]), grid: popup_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::HiddenObject);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::HiddenObject));
     }
 
     #[test]
     fn a_readable_board_is_match3() {
         let mut d = Fake { texts: Some(vec!["Hint"]), grid: good_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::Match3));
     }
 
     #[test]
     fn a_strong_cue_and_no_board_is_hidden_object() {
         let mut d = Fake { texts: Some(vec!["COLLECTOR'S EDITION", "PLAY"]), grid: no_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::HiddenObject);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::HiddenObject));
     }
 
     #[test]
     fn text_unsupported_falls_back_to_the_board_only() {
         let mut d = Fake { texts: None, grid: good_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::Match3));
         let mut d = Fake { texts: None, grid: no_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::Unknown));
     }
 
     #[test]
     fn nothing_readable_is_unknown() {
         let mut d = Fake { texts: Some(vec![]), grid: no_grid(), moods: vec![] };
-        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
+        assert_eq!(identify(&mut d, &profile()), Some(Genre::Unknown));
     }
 }
