@@ -202,6 +202,7 @@ mod tests {
             params_sha256: params_sha256(&BTreeMap::new()),
             earliest: 100,
             expires: 200,
+            waiver: None,
         }
     }
 

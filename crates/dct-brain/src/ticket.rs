@@ -34,6 +34,32 @@ pub struct Ticket {
     /// 有效窗口 `[earliest, expires)`，Unix 秒。「提前批准，到点执行」靠它。
     pub earliest: u64,
     pub expires: u64,
+    /// 可选的豁免：dcv 里用户确认过的规则允许在这块区域里点「看不出字」的地方。
+    /// 没有豁免时不序列化、不进 canonical_bytes，旧票逐字节不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver: Option<Waiver>,
+}
+
+/// 屏幕区域，单位是万分比（basis points）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Region {
+    pub x_bp: u16,
+    pub y_bp: u16,
+    pub w_bp: u16,
+    pub h_bp: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiver {
+    /// 现在只有 "no_text"。
+    pub kind: String,
+    /// 库:名字
+    pub rule: String,
+    /// dcv 规则的 sha
+    pub rule_sha256: String,
+    /// dcv 的 approved_at
+    pub approved_at: String,
+    pub region: Region,
 }
 
 impl Ticket {
@@ -60,6 +86,18 @@ impl Ticket {
         field(&mut o, &self.params_sha256);
         field(&mut o, &self.earliest.to_string());
         field(&mut o, &self.expires.to_string());
+        // 只有带豁免的票才追加；没有豁免时一个字节都不加。
+        if let Some(w) = &self.waiver {
+            field(&mut o, "waiver");
+            field(&mut o, &w.kind);
+            field(&mut o, &w.rule);
+            field(&mut o, &w.rule_sha256);
+            field(&mut o, &w.approved_at);
+            field(&mut o, &w.region.x_bp.to_string());
+            field(&mut o, &w.region.y_bp.to_string());
+            field(&mut o, &w.region.w_bp.to_string());
+            field(&mut o, &w.region.h_bp.to_string());
+        }
         o
     }
 
@@ -128,6 +166,7 @@ mod tests {
             params_sha256: params_sha256(&bio_params()),
             earliest: 1_790_000_000,
             expires: 1_790_007_200,
+            waiver: None,
         }
     }
 
@@ -171,6 +210,7 @@ mod tests {
             params_sha256: params_sha256(&BTreeMap::new()),
             earliest: 1_790_000_000,
             expires: 1_790_000_300,
+            waiver: None,
         };
         assert_eq!(
             args_sha256(&args),
@@ -208,5 +248,94 @@ mod tests {
         assert_eq!(j["subject"]["kind"], "procedure");
         assert_eq!(j["tier"], "content");
         assert_eq!(serde_json::from_value::<Ticket>(j).unwrap(), t);
+    }
+
+    type Tweak = Box<dyn Fn(&mut Waiver)>;
+
+    fn base_ticket() -> Ticket {
+        Ticket {
+            v: TICKET_VERSION,
+            nonce: "a".repeat(32),
+            device: "mac".into(),
+            tier: Tier::Content,
+            subject: Subject::Action { tool: "tap_at".into(), args_sha256: "sha256:00".into() },
+            params_sha256: "sha256:11".into(),
+            earliest: 100,
+            expires: 130,
+            waiver: None,
+        }
+    }
+    fn waiver() -> Waiver {
+        Waiver {
+            kind: "no_text".into(),
+            rule: "games:darkness-and-flame-rules".into(),
+            rule_sha256: "sha256:d868".into(),
+            approved_at: "2026-10-04T13:18:12Z".into(),
+            region: Region { x_bp: 300, y_bp: 1200, w_bp: 7500, h_bp: 6600 },
+        }
+    }
+
+    #[test]
+    fn a_ticket_without_a_waiver_has_the_same_bytes_as_before() {
+        let t = base_ticket();
+        let bytes = t.canonical_bytes();
+        let mut want = Vec::new();
+        field(&mut want, "dct-ticket-v1");
+        field(&mut want, "1");
+        field(&mut want, &"a".repeat(32));
+        field(&mut want, "mac");
+        field(&mut want, "content");
+        field(&mut want, "action");
+        field(&mut want, "tap_at");
+        field(&mut want, "sha256:00");
+        field(&mut want, "sha256:11");
+        field(&mut want, "100");
+        field(&mut want, "130");
+        assert_eq!(bytes, want);
+    }
+
+    #[test]
+    fn a_waiver_is_appended_and_changes_the_digest() {
+        let plain = base_ticket();
+        let mut w = base_ticket();
+        w.waiver = Some(waiver());
+        assert!(w.canonical_bytes().starts_with(&plain.canonical_bytes()));
+        assert!(w.canonical_bytes().len() > plain.canonical_bytes().len());
+        assert_ne!(w.digest(), plain.digest());
+    }
+
+    #[test]
+    fn changing_any_waiver_field_changes_the_digest() {
+        let mut base = base_ticket();
+        base.waiver = Some(waiver());
+        let d0 = base.digest();
+        let tweaks: Vec<Tweak> = vec![
+            Box::new(|w| w.kind = "other".into()),
+            Box::new(|w| w.rule = "games:x".into()),
+            Box::new(|w| w.rule_sha256 = "sha256:beef".into()),
+            Box::new(|w| w.approved_at = "2026-10-05T00:00:00Z".into()),
+            Box::new(|w| w.region.x_bp += 1),
+            Box::new(|w| w.region.y_bp += 1),
+            Box::new(|w| w.region.w_bp -= 1),
+            Box::new(|w| w.region.h_bp -= 1),
+        ];
+        for t in tweaks {
+            let mut x = base.clone();
+            t(x.waiver.as_mut().unwrap());
+            assert_ne!(x.digest(), d0);
+        }
+    }
+
+    #[test]
+    fn json_has_no_waiver_key_when_absent_and_old_json_still_reads() {
+        let t = base_ticket();
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(!j.contains("waiver"));
+        let back: Ticket = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, t);
+        let mut w = base_ticket();
+        w.waiver = Some(waiver());
+        let back: Ticket = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert_eq!(back, w);
     }
 }

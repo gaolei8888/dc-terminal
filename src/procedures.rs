@@ -356,6 +356,7 @@ pub fn ticket(
         params_sha256: params_sha256(&params),
         earliest,
         expires,
+        waiver: None,
     };
     let role = match tier.required_signer() {
         Some(SignerRole::User) => SignerRole::User,
