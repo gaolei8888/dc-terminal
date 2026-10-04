@@ -1292,7 +1292,7 @@ pub fn options_prompt(screen: &str) -> crate::llm::Prompt {
             .into(),
         user: format!("这是屏幕上的最后一段内容：\n\n{tail}"),
         max_tokens: 200,
-        image_png_base64: None,
+        image_png_base64: None, image_mime: None,
     }
 }
 
@@ -1392,7 +1392,7 @@ fn map_answer_prompt(user: &str, opts: &[String]) -> crate::llm::Prompt {
             .into(),
         user: format!("选项：\n{}\n\n用户的回复：\n{user}", render_numbered(opts)),
         max_tokens: 16,
-        image_png_base64: None,
+        image_png_base64: None, image_mime: None,
     }
 }
 
@@ -1479,7 +1479,7 @@ fn narrow_prompt(candidates: &[u32], text: &str) -> crate::llm::Prompt {
             .into(),
         user: format!("候选编号：{list}\n\n用户刚发来的话：\n{text}"),
         max_tokens: 16,
-        image_png_base64: None,
+        image_png_base64: None, image_mime: None,
     }
 }
 

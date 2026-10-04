@@ -84,11 +84,23 @@ pub struct VisionAnswer {
     pub raw: String,
     pub model: String,
     pub tokens: Option<(u64, u64)>,
+    /// 实际发给模型的图有多大（字节），和缩图时要说的话（没缩成就写原因）。
+    pub image_bytes: Option<usize>,
+    pub image_note: Option<String>,
 }
 
-/// 给一张图，指出下一个最值得点的位置。`history` 是已经点过的位置（万分比）。没配模型 / 没回应 = `None`。
+/// 模型这一问为什么没拿到回答。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionFail {
+    /// 没配 / 没说原因。
+    Silent,
+    Timeout,
+    Error,
+}
+
+/// 给一张图，指出下一个最值得点的位置。`history` 是已经点过的位置（万分比）。没配模型 / 没回应 = `Err`。
 pub trait Vision {
-    fn pick(&self, png: &[u8], history: &[(u16, u16)]) -> Option<VisionAnswer>;
+    fn pick(&self, png: &[u8], history: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail>;
 }
 
 pub struct SceneOptions {
@@ -107,7 +119,7 @@ pub enum SceneStop {
     /// 旧 dco 没有按位置点。
     NoTapAt,
     /// 模型没回应 / 没配。
-    NoVision,
+    NoVision(VisionFail),
     Skipped3,
     Noop5,
     Dco(DcoError),
@@ -135,7 +147,7 @@ pub fn mood_for_stop(stop: &SceneStop) -> Option<Mood> {
     let text = match stop {
         SceneStop::PrivateScreen => "私人画面，没操作",
         SceneStop::NoTapAt => "要更新章鱼",
-        SceneStop::NoVision => "大模型没回应",
+        SceneStop::NoVision(_) => "大模型没回应",
         SceneStop::Skipped3 | SceneStop::Noop5 => "没把握，停了",
         _ => return None,
     };
@@ -166,7 +178,10 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             Err(e) if e.code == "private_screen" => break SceneStop::PrivateScreen,
             Err(e) => break SceneStop::Dco(e),
         };
-        let Some(ans) = vision.pick(&png, &history) else { break SceneStop::NoVision };
+        let ans = match vision.pick(&png, &history) {
+            Ok(a) => a,
+            Err(f) => break SceneStop::NoVision(f),
+        };
         sum.asks += 1;
         if let Some((i, out)) = ans.tokens {
             sum.tokens_in += i;
@@ -178,7 +193,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             "schema": 1, "game": o.game, "time_ms": clock.now_ms(),
             "screen": { "png": format!("png/{n:04}.png"), "texts": texts_of(&before), "numbers": numbers(&before) },
             "teacher": "qwen", "rationale": ans.pick.as_ref().map(|k| k.why.clone()).unwrap_or_else(|| ans.raw.chars().take(200).collect()),
-            "model": ans.model, "tokens_in": ans.tokens.map(|t| t.0), "tokens_out": ans.tokens.map(|t| t.1),
+            "model": ans.model, "image_bytes": ans.image_bytes, "image_note": ans.image_note, "tokens_in": ans.tokens.map(|t| t.0), "tokens_out": ans.tokens.map(|t| t.1),
         });
         let mut emit = |rec: Value, say: String| sink(SceneStep { record: rec, png: Some(png.clone()), say });
         // 过检查：任何一项不满足就不点。

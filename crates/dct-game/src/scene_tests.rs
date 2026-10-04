@@ -74,12 +74,12 @@ impl Script {
     }
 }
 impl Vision for Script {
-    fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Option<VisionAnswer> {
+    fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
         self.asked.set(self.asked.get() + 1);
-        let p = self.picks.borrow_mut().pop_front()?;
-        Some(match p {
-            Some((x, y)) => VisionAnswer { pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into() }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)) },
-            None => VisionAnswer { pick: None, raw: "乱码".into(), model: "m".into(), tokens: None },
+        let p = self.picks.borrow_mut().pop_front().ok_or(VisionFail::Silent)?;
+        Ok(match p {
+            Some((x, y)) => VisionAnswer { pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into() }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
+            None => VisionAnswer { pick: None, raw: "乱码".into(), model: "m".into(), tokens: None, image_bytes: None, image_note: None },
         })
     }
 }
@@ -182,6 +182,8 @@ fn a_good_step_taps_and_writes_a_full_record() {
     assert_eq!(r["action"]["kind"], "tap_at");
     assert_eq!((r["action"]["x_bp"].as_u64(), r["action"]["y_bp"].as_u64()), (Some(1800), Some(6000)));
     assert_eq!((r["model"].as_str(), r["tokens_in"].as_u64(), r["tokens_out"].as_u64()), (Some("m"), Some(10), Some(2)));
+    assert_eq!(r["image_bytes"].as_u64(), Some(3));
+    assert!(r["image_note"].is_null());
     assert_eq!(r["outcome"]["changed"], true);
     assert_eq!(r["outcome"]["texts_after"], json!(["5", "5/6", "MENU"]));
     assert_eq!(steps[0].png.as_deref(), Some(&[1u8, 2, 3][..]));
@@ -338,7 +340,7 @@ fn dry_run_never_calls_tap_at_and_writes_a_dry_run_record() {
 fn no_vision_stops_without_tapping() {
     let mut d = Fake::new();
     let (s, _) = run(&mut d, &Script::new(&[]), &opts(5));
-    assert_eq!(s.stop, SceneStop::NoVision);
+    assert_eq!(s.stop, SceneStop::NoVision(VisionFail::Silent));
     assert!(d.taps.is_empty());
 }
 
