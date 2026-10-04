@@ -1,5 +1,5 @@
 use crate::dco::DcoClient;
-use crate::play::{Dco, DcoError, Profile, Region, SwipeOutcome, SwipeSettle};
+use crate::play::{Dco, DcoError, Profile, Region, SwipeOutcome, SwipeSettle, TapSettleReq};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -755,7 +755,7 @@ fn tap_at_sends_the_window_id_the_position_and_the_avoid_list() {
     let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"at": {"x_bp": 1800, "y_bp": 6000}, "kind": "no_text", "text": ""}}), false));
     let mut c = DcoClient::connect(dir.path()).unwrap();
     let avoid = [Region { x_bp: 7800, y_bp: 0, w_bp: 2200, h_bp: 2000 }];
-    let t = c.tap_at(&profile(), 1800, 6000, &avoid).unwrap();
+    let t = c.tap_at(&profile(), 1800, 6000, &avoid, None).unwrap();
     assert_eq!((t.kind.as_str(), t.text.as_str()), ("no_text", ""));
     let calls = calls.lock().unwrap();
     assert_eq!(calls[0].0, "list_windows");
@@ -772,7 +772,7 @@ fn tap_at_truncates_the_avoid_list_to_16() {
     let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "text", "text": "x"}}), false));
     let mut c = DcoClient::connect(dir.path()).unwrap();
     let avoid = vec![Region { x_bp: 1, y_bp: 2, w_bp: 3, h_bp: 4 }; 20];
-    c.tap_at(&profile(), 5, 6, &avoid).unwrap();
+    c.tap_at(&profile(), 5, 6, &avoid, None).unwrap();
     assert_eq!(calls.lock().unwrap()[1].1["avoid"].as_array().unwrap().len(), 16);
 }
 
@@ -781,8 +781,8 @@ fn tap_at_unknown_tool_is_remembered_and_never_sent_again() {
     let dir = tempfile::tempdir().unwrap();
     let calls = tap_at_fake(dir.path(), text_result(json!({"error": {"code": "bad_request", "message": "unknown tool: tap_at"}}), true));
     let mut c = DcoClient::connect(dir.path()).unwrap();
-    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "unsupported");
-    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "unsupported");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "unsupported");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "unsupported");
     let n = calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count();
     assert_eq!(n, 1, "第二次不该再发");
 }
@@ -792,8 +792,8 @@ fn tap_at_not_allowed_is_passed_through_and_not_remembered_as_old() {
     let dir = tempfile::tempdir().unwrap();
     let calls = tap_at_fake(dir.path(), text_result(json!({"error": {"code": "not_allowed", "message": "落点在不点区域"}}), true));
     let mut c = DcoClient::connect(dir.path()).unwrap();
-    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "not_allowed");
-    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "not_allowed");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "not_allowed");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "not_allowed");
     assert_eq!(calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count(), 2);
 }
 
@@ -802,6 +802,47 @@ fn tap_at_without_a_matching_window_is_window_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let calls = raw_fake(dir.path(), |_, _| text_result(json!({"windows": [{"window_id": 11, "app": "Mail"}]}), false));
     let mut c = DcoClient::connect(dir.path()).unwrap();
-    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "window_not_found");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "window_not_found");
     assert!(calls.lock().unwrap().iter().all(|(t, _)| t != "tap_at"));
+}
+
+#[test]
+fn tap_at_sends_the_settle_request_and_parses_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "no_text", "text": ""}, "settle": {"changed": true, "change": 0.07, "settled": true, "timed_out": false, "settled_ms": 900}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let req = TapSettleReq { quiet_ms: 500, timeout_ms: 6000, region: [0.0, 0.0, 1.0, 0.8] };
+    let t = c.tap_at(&profile(), 1, 2, &[], Some(&req)).unwrap();
+    let s = t.settle.unwrap();
+    assert_eq!((s.changed, s.settled, s.timed_out, s.settled_ms), (true, true, false, Some(900)));
+    assert!((s.change - 0.07).abs() < 1e-9);
+    assert_eq!(calls.lock().unwrap()[1].1["settle"], json!({"quiet_ms": 500, "timeout_ms": 6000, "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.8}}));
+}
+
+#[test]
+fn tap_at_without_a_settle_request_sends_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "text", "text": "x"}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.tap_at(&profile(), 1, 2, &[], None).unwrap();
+    assert!(calls.lock().unwrap()[1].1.get("settle").is_none());
+}
+
+#[test]
+fn an_old_dco_that_ignores_settle_gives_no_report_and_is_not_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "no_text", "text": ""}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let req = TapSettleReq { quiet_ms: 500, timeout_ms: 6000, region: [0.0, 0.0, 1.0, 0.8] };
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], Some(&req)).unwrap().settle, None);
+    assert!(c.tap_at(&profile(), 1, 2, &[], Some(&req)).is_ok());
+    assert_eq!(calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count(), 2);
+}
+
+#[test]
+fn a_malformed_settle_report_is_no_report() {
+    let dir = tempfile::tempdir().unwrap();
+    tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "no_text", "text": ""}, "settle": {"settled": true}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap().settle, None);
 }

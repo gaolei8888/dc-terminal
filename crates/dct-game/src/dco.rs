@@ -1,7 +1,7 @@
 //! 连本机 dco：unix socket 上的 MCP（一行一条 JSON-RPC）。握手跟 dco 自己的 `dco call` 一样：
 //! 先写 `{"dco_token": "<~/.dco/token>"}`，读到 `{"ok":true}`，再 initialize → notifications/initialized → tools/call。
 use crate::board::GridRead;
-use crate::play::{Dco, DcoError, Profile, Region, Seen, SwipeOutcome, SwipeSettle, TapAt, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS, TAP_AT_MAX_AVOID};
+use crate::play::{Dco, DcoError, Profile, Region, Seen, SwipeOutcome, SwipeSettle, TapAt, TapSettleReq, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS, TAP_AT_MAX_AVOID};
 use crate::screen::Element;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -35,6 +35,17 @@ pub struct DcoClient {
     pub(crate) settle_call_timeout: Duration,
     /// 一次请求等回复的总时长；跳过别的回复也算在里面。
     timeout: Duration,
+}
+
+/// `{changed, change, settled, timed_out, settled_ms}`；缺 changed / settled 的当没有。
+fn parse_settle(s: &Value) -> Option<SwipeSettle> {
+    Some(SwipeSettle {
+        changed: s["changed"].as_bool()?,
+        change: s["change"].as_f64().unwrap_or(0.0),
+        settled: s["settled"].as_bool()?,
+        timed_out: s["timed_out"].as_bool().unwrap_or(false),
+        settled_ms: s["settled_ms"].as_u64(),
+    })
 }
 
 fn unsupported_tap_at() -> DcoError {
@@ -303,7 +314,7 @@ impl Dco for DcoClient {
         base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| err("no_image", "dco 给的截图读不懂"))
     }
 
-    fn tap_at(&mut self, p: &Profile, x_bp: u16, y_bp: u16, avoid: &[Region]) -> Result<TapAt, DcoError> {
+    fn tap_at(&mut self, p: &Profile, x_bp: u16, y_bp: u16, avoid: &[Region], settle: Option<&TapSettleReq>) -> Result<TapAt, DcoError> {
         if self.no_tap_at {
             return Err(unsupported_tap_at());
         }
@@ -320,10 +331,23 @@ impl Dco for DcoClient {
             .take(TAP_AT_MAX_AVOID)
             .map(|r| json!({ "x_bp": r.x_bp, "y_bp": r.y_bp, "w_bp": r.w_bp, "h_bp": r.h_bp }))
             .collect();
-        match self.call("tap_at", json!({ "window": { "window_id": window_id }, "x_bp": x_bp, "y_bp": y_bp, "avoid": avoid })) {
+        let mut args = json!({ "window": { "window_id": window_id }, "x_bp": x_bp, "y_bp": y_bp, "avoid": avoid });
+        let normal = self.timeout;
+        if let Some(r) = settle {
+            args["settle"] = json!({ "quiet_ms": r.quiet_ms, "timeout_ms": r.timeout_ms, "region": { "x": r.region[0], "y": r.region[1], "w": r.region[2], "h": r.region[3] } });
+            // 等屏幕稳定要花几秒：这一次的读超时放长，用完还原。
+            self.timeout = self.settle_call_timeout.max(Duration::from_millis(r.timeout_ms as u64 + 4000));
+            let _ = self.w.set_read_timeout(Some(self.timeout));
+        }
+        let res = self.call("tap_at", args);
+        self.timeout = normal;
+        let _ = self.w.set_read_timeout(Some(normal));
+        match res {
             Ok(b) => Ok(TapAt {
                 kind: b["tapped"]["kind"].as_str().unwrap_or("").to_string(),
                 text: b["tapped"]["text"].as_str().unwrap_or("").to_string(),
+                // 旧 dco 不认 settle 就没有这个对象：不是错误，也不算「不支持 tap_at」。
+                settle: parse_settle(&b["settle"]),
             }),
             Err(e) if e.code == "dco_too_old" || (e.code == "bad_request" && e.message.contains("unknown tool")) => {
                 self.no_tap_at = true;

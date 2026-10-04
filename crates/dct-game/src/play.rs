@@ -74,10 +74,23 @@ pub struct Region {
 }
 
 /// 一次按位置点（`tap_at`）的结果：落点下 dco 看到的是 `no_text` 还是 `text`，以及那条字。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TapAt {
     pub kind: String,
     pub text: String,
+    /// dco 点完等屏幕稳定后的报告；旧 dco 不认 `settle` 参数就没有。
+    pub settle: Option<TapSettle>,
+}
+
+/// 点完以后的稳定报告，和划动的一样。
+pub type TapSettle = SwipeSettle;
+
+/// 要 dco 点完替我们等屏幕稳定：安静多久算稳、最多等多久、只看窗口里的哪一块（比例 `[x, y, w, h]`）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TapSettleReq {
+    pub quiet_ms: u32,
+    pub timeout_ms: u32,
+    pub region: [f64; 4],
 }
 
 /// `tap_at` 一次最多带几块「不点」的区域；多了截断。
@@ -158,7 +171,7 @@ pub trait Dco {
         Err(unsupported())
     }
     /// 按窗口里的位置（万分比）点一下；`avoid` 里的区域 dco 会拒点。默认不支持（旧 dco 没有 `tap_at`）。
-    fn tap_at(&mut self, _p: &Profile, _x_bp: u16, _y_bp: u16, _avoid: &[Region]) -> Result<TapAt, DcoError> {
+    fn tap_at(&mut self, _p: &Profile, _x_bp: u16, _y_bp: u16, _avoid: &[Region], _settle: Option<&TapSettleReq>) -> Result<TapAt, DcoError> {
         Err(unsupported())
     }
     /// 告诉 dco 屏幕上的小章鱼现在在“想”还是“看”。只改它的样子，所以故意不返回错误：
