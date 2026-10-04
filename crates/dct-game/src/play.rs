@@ -57,6 +57,14 @@ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
         .collect()
 }
 
+/// 连着这么多步目标数字都没下降，就算停滞。
+pub const STALL_STEPS: usize = 6;
+
+/// 个数相同、且至少有一个数变小才算「下降」。个数不同（OCR 漏读了一个）一律不算，也不算「没下降」。
+pub(crate) fn decreased(before: &[u64], after: &[u64]) -> bool {
+    before.len() == after.len() && before.iter().zip(after).any(|(b, a)| a < b)
+}
+
 fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
     dco.see_text(p).ok().map(|s| numbers(&s))
 }
@@ -268,6 +276,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
     let mut locked: Vec<(usize, usize)> = Vec::new();
     let mut current: Option<GridRead> = None;
     let mut no_move_confirms = 0;
+    let mut no_progress = 0usize;
     let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
     let stop = loop {
         if steps >= o.max_steps {
@@ -351,7 +360,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 (0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()
             };
             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
-            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
+            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here || no_progress >= STALL_STEPS) {
                 asked += 1;
                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
                 let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
@@ -392,6 +401,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
             "chosen": pick, "decider": decider, "dry_run": o.dry_run, "swiped": false,
             "predicted_cleared": chosen.features.cleared + chosen.features.cascade,
         });
+        if no_progress >= STALL_STEPS {
+            rec["stalled"] = json!(true);
+        }
         if let Some(a) = ask_rec {
             rec["ask"] = a;
         }
@@ -428,6 +440,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
+                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+                    if b.len() == a.len() {
+                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
+                    }
+                }
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
                 progress_prev = progress_after;
                 sink(rec);
@@ -445,6 +462,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(changed_cells(&g, &next));
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
+                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+                    if b.len() == a.len() {
+                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
+                    }
+                }
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
                 progress_prev = progress_after;
                 sink(rec);
@@ -458,6 +480,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(same_board.observation_id);
                 let progress_after = read_numbers(dco, p);
+                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+                    if b.len() == a.len() {
+                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
+                    }
+                }
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
                 progress_prev = progress_after;
                 sink(rec);

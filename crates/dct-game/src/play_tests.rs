@@ -1079,3 +1079,60 @@ fn the_after_of_one_step_is_the_before_of_the_next() {
     assert_eq!(log[1]["progress"]["before"], json!([49]));
     assert_eq!(log[1]["progress"]["after"], json!([48]));
 }
+
+#[test]
+fn decreased_needs_same_length_and_a_smaller_number() {
+    assert!(decreased(&[50, 30], &[49, 30]));
+    assert!(!decreased(&[50, 30], &[50, 30]));
+    assert!(!decreased(&[50, 30], &[51, 30]));
+    assert!(!decreased(&[50, 30], &[49]));
+}
+
+fn progress_texts(n: usize, flat: bool) -> VecDeque<Vec<&'static str>> {
+    let mut v: Vec<Vec<&'static str>> = vec![vec!["50"]];
+    for i in 0..n {
+        v.push(if flat { vec!["50"] } else { vec![Box::leak(format!("{}", 49 - i).into_boxed_str())] });
+    }
+    v.into()
+}
+
+fn stall_reads() -> Vec<Result<GridRead, DcoError>> {
+    let mut reads = vec![Ok(grid(A))];
+    for _ in 0..40 {
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(A)));
+        reads.push(Ok(grid(A)));
+    }
+    reads
+}
+
+#[test]
+fn six_steps_without_the_number_dropping_is_a_stall_and_asks_the_model() {
+    let say = Say::new(Some(0));
+    let mut d = Fake::new(stall_reads());
+    d.texts = progress_texts(8, true);
+    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
+    assert_eq!(log[5].get("stalled"), None, "before step 7 it is not a stall");
+    assert!(say.calls.get() >= 1);
+    assert!(log.iter().any(|l| l["stalled"] == true));
+}
+
+#[test]
+fn a_dropping_number_never_stalls() {
+    let say = Say::new(Some(0));
+    let mut d = Fake::new(stall_reads());
+    d.texts = progress_texts(8, false);
+    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
+    assert_eq!(say.calls.get(), 0);
+    assert!(log.iter().all(|l| l.get("stalled").is_none()));
+}
+
+#[test]
+fn unreadable_numbers_neither_add_to_nor_clear_the_stall_count() {
+    let say = Say::new(Some(0));
+    let mut d = Fake::new(settled_script());
+    let (s, log) = run_ask(&mut d, Some(&say), false, 30, 1);
+    assert_eq!(s.stop, Stop::StepsDone);
+    assert!(log[0].get("stalled").is_none());
+}

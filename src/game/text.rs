@@ -45,6 +45,9 @@ pub fn step_line(step: usize, rec: &Value) -> String {
             }
         }
     }
+    if rec["stalled"].as_bool() == Some(true) {
+        s += "；这几步看起来没有进展";
+    }
     if rec["decider"] == "model" {
         s += "（大模型选的）";
     }
@@ -320,5 +323,13 @@ mod tests {
         for s in [Stop::Money, Stop::Ad] {
             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("没有点任何东西"));
         }
+    }
+
+    #[test]
+    fn step_line_says_so_when_stalled() {
+        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","stalled":true});
+        assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
+        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
+        assert!(!step_line(1, &rec2).contains("没有进展"));
     }
 }
