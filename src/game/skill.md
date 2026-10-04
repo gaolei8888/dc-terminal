@@ -15,6 +15,8 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
 
 ## 怎么玩
 
+不知道用户打开的是什么游戏时，先运行 `dct game identify`，它会用一句话说这是不是三消游戏；说是才继续往下玩，说是寻物类或看不出，就告诉用户我现在还不会玩这个。
+
 运行：
 
     dct game play

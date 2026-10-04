@@ -1,0 +1,143 @@
+//! `dct game identify`：看一眼屏幕，说这是哪一类游戏。只用本机能得到的东西（有没有合格棋盘、
+//! 屏幕上的字），不上传、不划、不点。
+use dct_game::genre::{classify, Genre};
+use dct_game::looks_like_board;
+use dct_game::play::{Dco, Profile};
+
+pub fn identify(dco: &mut dyn Dco, p: &Profile) -> Genre {
+    let texts: Vec<String> = dco.see_text(p).map(|s| s.elements.into_iter().map(|e| e.text).collect()).unwrap_or_default();
+    let board_ok = Some(dco.read_grid(p).map(|g| looks_like_board(&g)).unwrap_or(false));
+    classify(&texts, board_ok)
+}
+
+/// `dct game identify [--game 名字]`
+pub fn run(args: &[String]) -> i32 {
+    let mut game = "candy-crush".to_string();
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--game" => match it.next() {
+                Some(v) => game = v.clone(),
+                None => {
+                    eprintln!("--game 后面要写游戏名");
+                    return 2;
+                }
+            },
+            other => {
+                eprintln!("不认识的选项 {other}。用法：dct game identify [--game 名字]");
+                return 2;
+            }
+        }
+    }
+    run_identify(&game)
+}
+
+#[cfg(not(unix))]
+fn run_identify(_: &str) -> i32 {
+    eprintln!("这一版只支持 Mac：识别游戏要用 dco，而 dco 目前只有 Mac 版。");
+    1
+}
+
+#[cfg(unix)]
+fn run_identify(game: &str) -> i32 {
+    use super::{profile, text};
+    use dct_game::dco::DcoClient;
+    use dct_game::genre::sentence;
+
+    let Some(home) = crate::sys::home() else {
+        eprintln!("找不到家目录。");
+        return 1;
+    };
+    let loaded = match profile::load(&home, game) {
+        Ok(l) => l,
+        Err(m) => {
+            eprintln!("{m}");
+            return 1;
+        }
+    };
+    let mut dco = match DcoClient::connect(&home.join(".dco")) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", text::dco_error(&e));
+            return 1;
+        }
+    };
+    println!("{}", sentence(identify(&mut dco, &loaded.profile)));
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dct_game::board::GridRead;
+    use dct_game::genre::Genre;
+    use dct_game::play::{Dco, DcoError, Profile, Seen};
+    use dct_game::screen::Element;
+    use serde_json::json;
+
+    struct Fake {
+        texts: Option<Vec<&'static str>>,
+        grid: Result<GridRead, DcoError>,
+    }
+    impl Dco for Fake {
+        fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
+            self.grid.clone()
+        }
+        fn swipe(&mut self, _: &Profile, _: (f64, f64), _: (f64, f64)) -> Result<(), DcoError> {
+            panic!("identify must never swipe");
+        }
+        fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
+            match &self.texts {
+                Some(t) => Ok(Seen {
+                    snapshot_id: "s".into(),
+                    observation_id: None,
+                    elements: t.iter().enumerate().map(|(i, s)| Element { id: format!("e{i}"), text: (*s).into() }).collect(),
+                }),
+                None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
+            }
+        }
+    }
+
+    fn profile() -> Profile {
+        Profile { window: json!({"app": "x"}), region: [0.0, 0.0, 1.0, 1.0], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: Default::default(), level_pattern: None }
+    }
+    fn no_grid() -> Result<GridRead, DcoError> {
+        Err(DcoError { code: "not_a_grid".into(), message: "m".into() })
+    }
+    fn good_grid() -> Result<GridRead, DcoError> {
+        // 3 行 4 列，三种颜色，每种至少两格，没有一种超过 70%
+        Ok(serde_json::from_value(json!({
+            "rows": 3, "cols": 4,
+            "cells": [[1,1,2,3],[2,3,1,1],[3,2,3,2]],
+            "odd": [[false,false,false,false],[false,false,false,false],[false,false,false,false]],
+            "classes": [{"id":1,"count":4},{"id":2,"count":4},{"id":3,"count":4}]
+        }))
+        .unwrap())
+    }
+
+    #[test]
+    fn a_readable_board_is_match3() {
+        let mut d = Fake { texts: Some(vec!["Hint"]), grid: good_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
+    }
+
+    #[test]
+    fn a_strong_cue_and_no_board_is_hidden_object() {
+        let mut d = Fake { texts: Some(vec!["COLLECTOR'S EDITION", "PLAY"]), grid: no_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::HiddenObject);
+    }
+
+    #[test]
+    fn text_unsupported_falls_back_to_the_board_only() {
+        let mut d = Fake { texts: None, grid: good_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
+        let mut d = Fake { texts: None, grid: no_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
+    }
+
+    #[test]
+    fn nothing_readable_is_unknown() {
+        let mut d = Fake { texts: Some(vec![]), grid: no_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
+    }
+}

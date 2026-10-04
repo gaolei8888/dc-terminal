@@ -4,6 +4,7 @@
 pub mod advisor;
 pub mod bench;
 pub mod cli;
+pub mod identify;
 pub mod log;
 pub mod profile;
 pub mod skill;
