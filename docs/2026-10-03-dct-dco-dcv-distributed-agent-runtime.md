@@ -31,9 +31,11 @@ dct 负责：
 
 dct 不直接控制舵机、GPIO、鼠标、电机或无人机飞控细节。
 
-### dco：Distributed Capability Runtime
+### DCO：Distributed Capability Protocol / Runtime Family
 
-dco 负责：
+DCO 不是一个必须经过的中心进程，而是一套统一的 capability / execution 协议与 runtime 家族。dct 可以直接连接任意 DCO node。
+
+DCO node 负责：
 
 - observe；
 - execute；
@@ -44,7 +46,7 @@ dco 负责：
 - permission / ticket checking；
 - 设备级安全边界。
 
-dco 不做策略判断，不负责“下一步应该干什么”。
+任意 DCO node 都不做策略判断，不负责“下一步应该干什么”。
 
 ### dcv：Confirmed Knowledge / Procedures / Capability Packages
 
@@ -76,15 +78,15 @@ dc-drone = drone
 而采用：
 
 ```
-                 dct
-          decision / runtime
-                 │
-                 ▼
-                dco
-      distributed capability runtime
-        ┌────────┼─────────┬────────┐
-        ▼        ▼         ▼        ▼
-      Mac      ESP32      Pi      Robot
+                         dct
+                brain / orchestrator
+                         │
+                  DCO protocol
+                         │
+       ┌─────────────────┼─────────────────┐
+       ▼                 ▼                 ▼
+ DCO Desktop Node   DCO Edge Node     DCO Edge Node
+     Mac/PC            Pi/Linux          ESP32
 ```
 
 这样上层永远面对 capability，而不是品牌和设备 API。
@@ -158,7 +160,7 @@ capabilities:
 - 室内无人机；
 - 工业设备。
 
-设备差异由 dco adapter 层吸收。
+设备差异由各 DCO node 内部的 adapter 层吸收。
 
 ---
 
@@ -179,7 +181,7 @@ dco-edge
 └── raspberry-pi
 ```
 
-dct 不直接调用这些 target，而是通过 dco capability protocol。
+dct **直接通过 DCO capability protocol 连接这些 node**。不需要先经过 desktop dco。
 
 ---
 
@@ -322,7 +324,7 @@ dct 从 dcv 读取：
 1. 一个 ESP32-S3 节点；
 2. capability discovery；
 3. snapshot / sensor / motor / servo / stop；
-4. dct -> dco -> edge -> verify 完整闭环；
+4. dct -> DCO edge node -> verify 完整闭环；
 5. stale command / disconnect / emergency stop；
 6. 一套 dcv device profile。
 
@@ -335,7 +337,7 @@ dct 从 dcv 读取：
 固定以下边界：
 
 > **dct = brain / runtime**  
-> **dco = body / distributed capability runtime**  
+> **DCO = distributed capability & execution protocol / runtime family**  
 > **dcv = confirmed knowledge / procedures / capability packages**
 
-并把 ESP32 看作 dco 的第一个 physical edge target，而不是一个新的独立 Agent 产品。
+并把 ESP32 看作第一个 physical DCO node target，而不是一个新的独立 Agent 产品。desktop dco 与 dco-edge 是 peer implementations；dct 直接连接任意 DCO node。
