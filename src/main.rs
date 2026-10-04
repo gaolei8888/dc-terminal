@@ -30,7 +30,7 @@ dct —— vibe coding 终端
   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
   dct join <邀请码> [--name 电脑名]
                    新电脑上：用老电脑给的码加入（没登录会先自动登录）
-  dct game play [--game candy-crush] [--steps 20] [--dry-run]
+  dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5]
                    [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]
                    让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
   dct game ask-bench <记录文件>... [--limit 40]
