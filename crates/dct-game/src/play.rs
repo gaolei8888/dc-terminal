@@ -1,5 +1,6 @@
 //! 一盘游戏怎么玩：读盘 → 选步 → 划 → 等画面停下 → 下一步，以及什么时候停。
 //! 跟 dco 说话（`Dco`）和计时（`Clock`）都是传进来的，所以测试里换成假的，不碰真机也不真睡觉。
+use crate::ask::{board_text, describe, describe_move, Advisor, AskInput};
 use crate::board::{fixed_ids, looks_like_board, Board, GridRead};
 use crate::choose::{choose, Candidate, Weights};
 use crate::screen::Element;
@@ -63,9 +64,19 @@ pub trait Clock {
     fn sleep_ms(&mut self, ms: u64);
 }
 
-pub struct Options {
+/// 最多发给模型几个候选。
+pub const ASK_SHOWN: usize = 8;
+
+pub struct Options<'a> {
     pub max_steps: usize,
     pub dry_run: bool,
+    /// 规则没把握时问的那个。`None` = 不问（和以前一样）。
+    pub advisor: Option<&'a dyn Advisor>,
+    /// 每一步都问（`--ask-model`）；否则只在这盘棋上已有失败的步时才问。
+    pub ask_always: bool,
+    /// 这一次 `play()` 最多问几次。
+    pub ask_budget: usize,
+    pub goal: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,10 +214,11 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
     (x + (c as f64 + 0.5) / p.cols as f64 * w, y + (r as f64 + 0.5) / p.rows as f64 * h)
 }
 
-pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, sink: &mut dyn FnMut(Value)) -> Summary {
+pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
     let mut steps = 0;
     let mut baseline: Option<usize> = None;
     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+    let mut asked = 0usize;
     let mut streak = 0;
     let mut current: Option<GridRead> = None;
     let mut no_move_confirms = 0;
@@ -279,6 +291,42 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         let Some(pick) = pick else {
             break if cands.is_empty() { Stop::NoMoves } else { Stop::Stuck };
         };
+        let mut pick = pick;
+        let mut ask_rec: Option<Value> = None;
+        let mut decider = "rules";
+        if let Some(adv) = o.advisor {
+            let board_key = canonical(&g.cells);
+            // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
+            let offered: Vec<usize> = {
+                let is_failed = |c: &Candidate| failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key);
+                (0..cands.len()).filter(|&i| !is_failed(&cands[i])).take(ASK_SHOWN).collect()
+            };
+            let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
+            if !o.dry_run && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
+                asked += 1;
+                let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
+                let input = AskInput {
+                    board: board_text(&g, &fixed),
+                    goal: o.goal.to_string(),
+                    candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
+                    failed: failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect(),
+                };
+                dco.show_status("think");
+                let advice = adv.pick(&input);
+                dco.show_status("look");
+                if let Some(a) = advice {
+                    let chosen_idx = a.choice.filter(|&k| k < offered.len()).map(|k| offered[k]);
+                    ask_rec = Some(json!({
+                        "model": a.model, "raw": a.raw, "reason": a.reason,
+                        "asked": offered, "choice": chosen_idx,
+                    }));
+                    if let Some(i) = chosen_idx {
+                        pick = i;
+                        decider = "model";
+                    }
+                }
+            }
+        }
         let chosen = &cands[pick];
         let mut rec = json!({
             "schema": 1, "time_ms": clock.now_ms(),
@@ -290,8 +338,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
                     "cleared": c.features.cleared, "cascade": c.features.cascade, "striped": c.features.striped,
                     "wrapped": c.features.wrapped, "bomb": c.features.bomb, "triggered": c.features.triggered,
                     "special_swap": c.features.special_swap, "lowest_row": c.features.lowest_row } })).collect::<Vec<_>>(),
-            "chosen": pick, "dry_run": o.dry_run, "swiped": false,
+            "chosen": pick, "decider": decider, "dry_run": o.dry_run, "swiped": false,
         });
+        if let Some(a) = ask_rec {
+            rec["ask"] = a;
+        }
         if o.dry_run {
             rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": 0, "settle": 0 });
             rec["outcome"] = json!("dry_run");

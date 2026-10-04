@@ -69,7 +69,7 @@ fn profile(rows: usize, cols: usize) -> Profile {
 }
 fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     let mut log = vec![];
-    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry }, &mut |v| log.push(v));
+    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
     (s, log)
 }
 fn err(code: &str) -> DcoError {
@@ -190,10 +190,10 @@ fn a_clock_that_goes_backwards_does_not_panic() {
     }
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
     let mut log = vec![];
-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false }, &mut |v| log.push(v));
+    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
     // 读盘到落定都过了一轮，没有 panic 就行；用一个会倒着走的钟再跑一遍无法落定的情形
     let mut d = Fake::new(vec![Ok(grid(A))]);
-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false }, &mut |_| {});
+    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn swipe_cells(p: &Profile, s: &[Swipe]) -> Vec<(usize, usize)> {
 fn play_holes(fixed_rgb: Vec<[u8; 3]>) -> (Profile, Vec<Swipe>) {
     let p = Profile { fixed_rgb, ..profile(4, 4) };
     let mut d = Fake::new(vec![Ok(grid_with_hole_rgb())]);
-    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false }, &mut |_| {});
+    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
     (p, d.swipes)
 }
 
@@ -511,7 +511,7 @@ fn the_record_carries_the_real_swipe_points_start_and_duration() {
     let p = profile(3, 4);
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
     let mut log = vec![];
-    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false }, &mut |v| log.push(v));
+    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
     let (f, t) = d.swipes[0];
     let sw = &log[0]["swipe"];
     assert_eq!(sw["from"], json!([r4(f.0), r4(f.1)]));
@@ -587,7 +587,7 @@ fn a_one_cell_candy_may_move_once_the_profile_lists_the_not_candies() {
     let go = |fixed_rgb: Vec<[u8; 3]>| {
         let mut d = Fake::new(vec![Ok(grid(ROW))]);
         let p = Profile { fixed_rgb, ..profile(1, 9) };
-        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true }, &mut |_| {});
+        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
         s.stop
     };
     assert_ne!(go(vec![[196, 148, 101]]), Stop::NoMoves);
@@ -612,7 +612,7 @@ fn no_moves_that_a_refill_fixes_is_not_the_end() {
 fn no_moves_confirmed_by_an_identical_second_read_stops_after_one_confirmation() {
     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
     let mut clk = Clk(0);
-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false }, &mut |_| {});
+    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
     assert_eq!(s.stop, Stop::NoMoves);
     assert_eq!(d.reads_taken, 2);
     assert_eq!(clk.0, 1_500);
@@ -651,7 +651,7 @@ fn a_colour_jump_that_stays_on_the_reread_is_a_changed_screen() {
 fn a_dry_run_does_not_pause_or_reread() {
     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
     let mut clk = Clk(0);
-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true }, &mut |_| {});
+    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
     assert_eq!(s.stop, Stop::NoMoves);
     assert_eq!(d.reads_taken, 1);
     assert_eq!(clk.0, 0);
@@ -669,4 +669,173 @@ fn a_swap_the_game_bounces_back_is_no_change() {
     assert_eq!(log[0]["outcome"], "no_change", "{log:?}");
     assert_eq!(log[1]["outcome"], "no_change", "{log:?}");
     assert_eq!(s.stop, Stop::Stuck);
+}
+
+use crate::ask::{Advice, Advisor, AskInput};
+use std::cell::{Cell, RefCell};
+
+struct Say {
+    choice: Option<usize>,
+    calls: Cell<usize>,
+    seen: RefCell<Vec<AskInput>>,
+}
+impl Say {
+    fn new(choice: Option<usize>) -> Say {
+        Say { choice, calls: Cell::new(0), seen: RefCell::new(vec![]) }
+    }
+}
+impl Advisor for Say {
+    fn pick(&self, i: &AskInput) -> Option<Advice> {
+        self.calls.set(self.calls.get() + 1);
+        self.seen.borrow_mut().push(AskInput {
+            board: i.board.clone(),
+            goal: i.goal.clone(),
+            candidates: i.candidates.clone(),
+            failed: i.failed.clone(),
+        });
+        Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into() })
+    }
+}
+struct Down;
+impl Advisor for Down {
+    fn pick(&self, _: &AskInput) -> Option<Advice> {
+        None
+    }
+}
+
+fn run_ask(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize) -> (Summary, Vec<Value>) {
+    let mut log = vec![];
+    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰" };
+    let s = play(d, &mut Clk(0), &profile(3, 4), &o, &mut |v| log.push(v));
+    (s, log)
+}
+fn settled_script() -> Vec<Result<GridRead, DcoError>> {
+    vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]
+}
+
+#[test]
+fn ask_always_lets_the_model_pick_among_candidates_and_records_it() {
+    // 先看规则自己会划哪一步
+    let mut d0 = Fake::new(settled_script());
+    let _ = run_ask(&mut d0, None, false, 30, 1);
+    let rules_swipe = d0.swipes[0];
+
+    let say = Say::new(Some(1)); // 选第 2 个候选
+    let mut d = Fake::new(settled_script());
+    let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+    assert_eq!(say.calls.get(), 1);
+    assert_ne!(d.swipes[0], rules_swipe, "模型选了第 2 个候选，划的应该和规则第一名不同");
+    assert_eq!(log[0]["decider"], "model");
+    assert_eq!(log[0]["chosen"], 1);
+    assert_eq!(log[0]["ask"]["choice"], 1);
+    assert_eq!(log[0]["ask"]["model"], "fake");
+    // 发出去的提示里有目标、字母棋盘、编号候选
+    let seen = say.seen.borrow();
+    assert_eq!(seen[0].goal, "清冰");
+    assert!(seen[0].board.contains('A'));
+    assert!(seen[0].candidates.len() >= 2);
+}
+
+#[test]
+fn without_ask_always_the_model_is_not_asked_on_a_clean_board() {
+    let say = Say::new(Some(1));
+    let mut d = Fake::new(settled_script());
+    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 1);
+    assert_eq!(say.calls.get(), 0);
+    assert_eq!(log[0]["decider"], "rules");
+    assert!(log[0].get("ask").is_none());
+}
+
+#[test]
+fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
+    // 第一划没反应（A 一直不变），第二次选步时这盘棋上已有失败的步：问模型，失败的步在 failed 里、不在候选里
+    let mut reads = vec![];
+    for _ in 0..40 {
+        reads.push(Ok(grid(A)));
+    }
+    reads.push(Ok(grid(MOVED)));
+    reads.push(Ok(grid(MOVED)));
+    let say = Say::new(Some(0));
+    let mut d = Fake::new(reads);
+    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 2);
+    assert!(say.calls.get() >= 1);
+    let seen = say.seen.borrow();
+    assert_eq!(seen[0].failed.len(), 1);
+    assert!(!seen[0].candidates.iter().any(|c| *c == seen[0].failed[0]));
+    assert_eq!(log[0]["decider"], "rules");
+    assert_eq!(log[1]["decider"], "model");
+}
+
+#[test]
+fn model_that_cannot_decide_or_is_down_falls_back_to_rules() {
+    let mut d0 = Fake::new(settled_script());
+    let _ = run_ask(&mut d0, None, false, 30, 1);
+    let rules_swipe = d0.swipes[0];
+
+    for adv in [&Say::new(None) as &dyn Advisor, &Down] {
+        let mut d = Fake::new(settled_script());
+        let (s, log) = run_ask(&mut d, Some(adv), true, 30, 1);
+        assert_eq!(d.swipes[0], rules_swipe);
+        assert_eq!(log[0]["decider"], "rules");
+        assert_eq!(s.stop, Stop::StepsDone);
+    }
+}
+
+#[test]
+fn ask_budget_stops_the_questions_but_not_the_game() {
+    let say = Say::new(Some(1));
+    let mut reads = vec![Ok(grid(A))];
+    for _ in 0..6 {
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(A)));
+        reads.push(Ok(grid(A)));
+    }
+    let mut d = Fake::new(reads);
+    let (_, log) = run_ask(&mut d, Some(&say), true, 2, 3);
+    assert_eq!(say.calls.get(), 2);
+    assert_eq!(log.len(), 3);
+    assert_eq!(log[2]["decider"], "rules");
+}
+
+const ONE: &[&[u16]] = &[&[1, 3, 3, 2], &[2, 2, 1, 1], &[1, 2, 1, 1]]; // 只有一个合法交换
+
+#[test]
+fn the_octopus_thinks_only_while_the_model_is_asked() {
+    let say = Say::new(Some(1));
+    let mut d = Fake::new(settled_script());
+    let _ = run_ask(&mut d, Some(&say), true, 30, 1);
+    assert_eq!(d.events, vec!["think", "look", "swipe"]);
+
+    let mut d = Fake::new(settled_script());
+    let _ = run_ask(&mut d, Some(&say), false, 30, 1);
+    assert_eq!(d.events, vec!["swipe"]);
+
+    // 模型不可用也要回到“看”
+    let mut d = Fake::new(settled_script());
+    let _ = run_ask(&mut d, Some(&Down), true, 30, 1);
+    assert_eq!(d.events, vec!["think", "look", "swipe"]);
+}
+
+#[test]
+fn a_single_candidate_is_never_worth_asking_about() {
+    let say = Say::new(Some(0));
+    let mut d = Fake::new(vec![Ok(grid(ONE)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+    assert_eq!(log[0]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(say.calls.get(), 0);
+    assert_eq!(log[0]["decider"], "rules");
+    assert!(log[0].get("ask").is_none());
+}
+
+#[test]
+fn a_choice_outside_the_offered_list_falls_back_to_rules_and_is_recorded() {
+    let mut d0 = Fake::new(settled_script());
+    let _ = run_ask(&mut d0, None, false, 30, 1);
+    let say = Say::new(Some(99));
+    let mut d = Fake::new(settled_script());
+    let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+    assert_eq!(d.swipes[0], d0.swipes[0]);
+    assert_eq!(log[0]["decider"], "rules");
+    assert!(log[0]["ask"]["choice"].is_null());
 }

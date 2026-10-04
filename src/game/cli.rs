@@ -125,9 +125,9 @@ fn run_parsed(a: &Args) -> i32 {
         }
     };
     let summary = if a.auto_next {
-        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run }, &mut sink)
+        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut sink)
     } else {
-        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run }, &mut sink)
+        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut sink)
     };
     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));

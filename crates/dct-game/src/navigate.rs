@@ -1,17 +1,22 @@
 //! `--auto-next`：一局结束以后自己接着来——失败了点“再来一次”，弹窗里只点白名单里的字，
 //! 认出生命用完、价格、广告、不认识的画面就停。打赢也停：下一关的版面不一样，现在的棋盘位置读不对。
 //! 跟 dco 说话和计时都是传进来的（同 `play`），所以测试里换成假的。
+use crate::ask::Advisor;
 use crate::board::looks_like_board;
 use crate::play::{play, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
 use crate::screen::{classify, is_level_start, Element, Screen};
 use serde_json::{json, Value};
 
-pub struct NavOptions {
+pub struct NavOptions<'a> {
     /// 整个命令一共最多走几步棋（不是每一局）。
     pub max_steps: usize,
     /// 整个命令最多点几次“开始 / 再来一次”；点一次「开始」或「再来一次」算一次；点了「再来一次」之后紧跟着的那个 Play 是同一次重来，不另算。
     pub tries: usize,
     pub dry_run: bool,
+    pub advisor: Option<&'a dyn Advisor>,
+    pub ask_always: bool,
+    pub ask_budget: usize,
+    pub goal: &'a str,
 }
 
 const AFTER_TAP_FIRST_MS: u64 = 400;
@@ -63,7 +68,7 @@ fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Se
     }
 }
 
-pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions, sink: &mut dyn FnMut(Value)) -> Summary {
+pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
     let (mut steps, mut tries, mut taps, mut no_effect) = (0usize, 0usize, 0usize, 0usize);
     // after_board：刚玩完一局，还没有进过新棋盘。这时看到的 Play 可能是通关后的下一关，不点。
     // expect_board：开局框的 Play 点成了，接下来应该是重来那一局的棋盘（它的 OCR 读成 Unknown，不能因为 after_board 拒绝）。
@@ -148,7 +153,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                         sink(nav_record(clock, &seen, "board", None, "entered"));
                         expect_board = false;
                         // after_board 不用在这里清：play 返回后要么 break，要么马上重新置 true，中间没人读它。
-                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run }, sink);
+                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal }, sink);
                         steps += s.steps;
                         match s.stop {
                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
@@ -366,7 +371,7 @@ mod tests {
 
     fn run_with(w: &mut World, max_steps: usize, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
         let mut log = vec![];
-        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry }, &mut |v| log.push(v));
+        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
         (s, log)
     }
 
@@ -514,7 +519,7 @@ mod tests {
     fn the_step_budget_is_shared_across_levels() {
         let mut w = World::new(vec![board(A), board(A)]);
         let mut log = vec![];
-        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false }, &mut |v| log.push(v));
+        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
         assert_eq!(s.steps, 1);
         assert_eq!(s.stop, Stop::StepsDone);
     }
@@ -698,7 +703,7 @@ mod tests {
     }
 
     fn run_profile(w: &mut World, p: &Profile) -> Summary {
-        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false }, &mut |_| {})
+        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {})
     }
 
     #[test]
