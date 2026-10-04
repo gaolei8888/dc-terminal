@@ -241,6 +241,7 @@ fn fake_dco_world(home: &std::path::Path, frames: Vec<Frame>) -> std::thread::Jo
                             Frame::Board => (board(), false),
                             Frame::Text(_) => (json!({"error": {"code": "not_a_grid", "message": "这块区域分不清类别"}}), true),
                         },
+                        "show_status" => (json!({"shown": true}), false),
                         other => panic!("没想到会调 {other}"),
                     };
                     json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})

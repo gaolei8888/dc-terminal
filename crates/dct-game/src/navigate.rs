@@ -3,7 +3,8 @@
 //! 跟 dco 说话和计时都是传进来的（同 `play`），所以测试里换成假的。
 use crate::ask::Advisor;
 use crate::board::looks_like_board;
-use crate::play::{play, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
+use crate::mood;
+use crate::play::{play_inner, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
 use crate::screen::{classify, is_level_start, Element, Screen};
 use serde_json::{json, Value};
 
@@ -155,7 +156,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                         sink(nav_record(clock, &seen, "board", None, "entered"));
                         expect_board = false;
                         // after_board 不用在这里清：play 返回后要么 break，要么马上重新置 true，中间没人读它。
-                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal, goal_index: o.goal_index }, sink);
+                        let s = play_inner(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal, goal_index: o.goal_index }, sink);
                         steps += s.steps;
                         match s.stop {
                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
@@ -242,6 +243,9 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             }
         }
     };
+    if let Some(m) = mood::for_stop(&stop) {
+        dco.show_status_with(m.state, m.text, None);
+    }
     Summary { steps, stop }
 }
 
@@ -287,11 +291,12 @@ mod tests {
         stuck: bool,
         /// 逐次点按钮的脚本：`true` = 这一次点了没反应。用完以后看 `stuck`。
         stuck_script: Vec<bool>,
+        moods: Vec<(String, Option<String>)>,
     }
 
     impl World {
         fn new(frames: Vec<Frame>) -> World {
-            World { frames, at: 0, taps: vec![], swipes: 0, tap_error: None, see_error: None, stuck: false, stuck_script: vec![] }
+            World { frames, at: 0, taps: vec![], swipes: 0, tap_error: None, see_error: None, stuck: false, stuck_script: vec![], moods: vec![] }
         }
         fn advance(&mut self) {
             if self.at + 1 < self.frames.len() {
@@ -319,6 +324,9 @@ mod tests {
             self.swipes += 1;
             self.advance();
             Ok(())
+        }
+        fn show_status_with(&mut self, state: &str, text: Option<&str>, _: Option<&str>) {
+            self.moods.push((state.into(), text.map(Into::into)));
         }
         fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
             if let Some(e) = self.see_error.clone() {
@@ -364,7 +372,7 @@ mod tests {
     }
 
     fn profile() -> Profile {
-        Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None }
+        Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None, theme: None }
     }
 
     fn run(w: &mut World, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
@@ -456,6 +464,28 @@ mod tests {
             assert!(w.taps.is_empty(), "{want:?} 不该点任何东西");
             assert_eq!(log.last().unwrap()["outcome"], "stopped");
         }
+    }
+
+    #[test]
+    fn auto_next_stops_show_the_matching_mood() {
+        for (frame, want) in [
+            (text(&["Level Complete!"]), ("won", None)),
+            (text(&["No more lives", "Ask friends"]), ("sad", None)),
+            (text(&["Buy 💎 5"]), ("wait", Some("要你处理"))),
+        ] {
+            let mut w = World::new(vec![frame]);
+            let _ = run(&mut w, 5, false);
+            assert_eq!(w.moods, [(want.0.to_string(), want.1.map(String::from))]);
+        }
+    }
+
+    #[test]
+    fn a_level_ending_midway_does_not_announce_a_stop() {
+        // 一局结束（回到弹窗）只是中途：play 不发「看不懂」，最后一句由 auto_next 发。
+        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Level 1712", "Select boosters:", "Play", "B Play"]), board(DEAD)]);
+        let (s, _) = run(&mut w, 5, false);
+        assert_eq!(s.stop, Stop::NoMoves);
+        assert!(w.moods.is_empty(), "{:?}", w.moods);
     }
 
     #[test]

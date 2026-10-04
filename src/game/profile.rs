@@ -48,6 +48,8 @@ struct File {
     odd_share: Option<f64>,
     /// 关卡号在画面上的写法：恰好一个捕获组的正则。过渡期的本地数据，长期搬进 dcv。
     level_pattern: Option<String>,
+    /// 章鱼的主题名（可选，最长 20 个字符）。
+    theme: Option<String>,
     /// 可选的重复表 `[[class]]`：把读出来的颜色类别标成「不是糖」（洞、蜂蜜块、糖果机）。
     #[serde(default)]
     class: Vec<ClassEntry>,
@@ -168,6 +170,7 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
             match_de,
             weights,
             level_pattern: f.level_pattern,
+            theme: f.theme,
         },
         sha256,
         source,
@@ -190,6 +193,9 @@ fn check(f: &File) -> Result<(), String> {
         if c.rgb.iter().any(|v| !(0..=255).contains(v)) {
             return Err(format!("[[class]]「{}」的 rgb 三个数都要在 0 到 255 之间", c.name));
         }
+    }
+    if f.theme.as_ref().is_some_and(|t| t.chars().count() > 20) {
+        return Err("theme 最长 20 个字符".into());
     }
     if let Some(pat) = &f.level_pattern {
         if pat.chars().count() > 100 {
@@ -351,6 +357,19 @@ mod tests {
         }
         let none = home_with("candy-crush", &format!("{base}{rest}"));
         assert_eq!(load(none.path(), "candy-crush").unwrap().profile.level_pattern, None);
+    }
+
+    #[test]
+    fn theme_loads_and_a_too_long_one_is_refused() {
+        let base = CANDY_CRUSH.split("\nlevel_pattern").next().unwrap().to_string() + "\n";
+        let rest = format!("\nlevel_pattern{}", CANDY_CRUSH.split("\nlevel_pattern").nth(1).unwrap());
+        let with = |t: &str| format!("{base}theme = \"{t}\"\n{rest}");
+        let l = load(home_with("candy-crush", &with("candy")).path(), "candy-crush").unwrap();
+        assert_eq!(l.profile.theme.as_deref(), Some("candy"));
+        assert!(load(home_with("candy-crush", &with(&"a".repeat(20))).path(), "candy-crush").is_ok());
+        let e = load(home_with("candy-crush", &with(&"a".repeat(21))).path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml") && e.contains("theme"), "{e}");
+        assert_eq!(load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.theme, None);
     }
 
     #[test]

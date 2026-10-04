@@ -29,10 +29,12 @@ struct Fake {
     clock: Option<std::rc::Rc<std::cell::Cell<u64>>>,
     call_ms: u64,
     read_ms: u64,
+    /// show_status_with 的完整参数（state, text, theme）。
+    moods: Vec<(String, Option<String>, Option<String>)>,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new(), clock: None, call_ms: 0, read_ms: 0 }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new(), clock: None, call_ms: 0, read_ms: 0, moods: vec![] }
     }
 }
 impl Dco for Fake {
@@ -69,6 +71,10 @@ impl Dco for Fake {
     fn show_status(&mut self, state: &str) {
         self.events.push(state.into());
     }
+    fn show_status_with(&mut self, state: &str, text: Option<&str>, theme: Option<&str>) {
+        self.moods.push((state.into(), text.map(Into::into), theme.map(Into::into)));
+        self.show_status(state);
+    }
     fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
         match self.texts.pop_front() {
             Some(t) => Ok(Seen {
@@ -94,7 +100,7 @@ fn tuned() -> crate::choose::Weights {
     crate::choose::Weights { striped: 6.0, wrapped: 8.0, bomb: 15.0, triggered: 5.0, ..Default::default() }
 }
 fn profile(rows: usize, cols: usize) -> Profile {
-    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned(), level_pattern: None }
+    Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned(), level_pattern: None, theme: None }
 }
 fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     let mut log = vec![];
@@ -483,10 +489,10 @@ fn the_status_trait_method_still_exists_but_play_never_calls_it() {
 }
 
 #[test]
-fn a_board_that_cannot_be_read_says_nothing() {
+fn a_board_that_cannot_be_read_only_says_it_cannot_read_the_screen() {
     let mut d = Fake::new(vec![Err(err("not_a_grid"))]);
     let (_, _) = run(&mut d, 5, false);
-    assert!(d.events.is_empty(), "{:?}", d.events);
+    assert_eq!(d.moods, [("wait".to_string(), Some("看不懂这个画面".to_string()), None)]);
 }
 
 // ---- 「不是糖」的格子：划的两端都不能是它 ----
@@ -883,10 +889,19 @@ fn the_octopus_thinks_only_while_the_model_is_asked() {
     let _ = run_ask(&mut d, Some(&say), false, 30, 1);
     assert_eq!(d.events, vec!["swipe"]);
 
-    // 模型不可用也要回到“看”
+    // 模型不可用：说一次「大模型没回应」
     let mut d = Fake::new(settled_script());
     let _ = run_ask(&mut d, Some(&Down), true, 30, 1);
-    assert_eq!(d.events, vec!["think", "look", "swipe"]);
+    assert_eq!(d.events, vec!["think", "stall", "swipe"]);
+    assert_eq!(d.moods[0], ("think".into(), Some("问大模型中".into()), None));
+    assert_eq!(d.moods[1], ("stall".into(), Some("大模型没回应".into()), None));
+}
+
+#[test]
+fn a_down_advisor_is_announced_once_and_later_asks_go_back_to_look() {
+    let mut d = Fake::new(stall_reads());
+    let _ = run_ask(&mut d, Some(&Down), true, 30, 2);
+    assert_eq!(d.events, vec!["think", "stall", "swipe", "think", "look", "swipe"]);
 }
 
 #[test]
@@ -1508,4 +1523,96 @@ fn show_status_with_defaults_to_plain_show_status() {
     let mut d = Fake::new(vec![]);
     Dco::show_status_with(&mut d, "stall", None, None);
     assert_eq!(d.events, ["stall"]);
+}
+
+fn themed() -> Profile {
+    Profile { theme: Some("candy".into()), ..profile(3, 4) }
+}
+fn opts(steps: usize) -> Options<'static> {
+    Options { max_steps: steps, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }
+}
+fn states(d: &Fake) -> Vec<&str> {
+    d.moods.iter().map(|m| m.0.as_str()).collect()
+}
+
+#[test]
+fn a_theme_sends_one_look_with_the_theme_first_and_no_theme_sends_nothing() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    let _ = play(&mut d, &mut Clk(0), &themed(), &opts(1), &mut |_| {});
+    assert_eq!(d.moods[0], ("look".into(), None, Some("candy".into())));
+    assert_eq!(d.events, ["look", "swipe"]);
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    let _ = play(&mut d, &mut Clk(0), &profile(3, 4), &opts(1), &mut |_| {});
+    assert!(d.moods.is_empty());
+    // 试走不发
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let mut o = opts(1);
+    o.dry_run = true;
+    let _ = play(&mut d, &mut Clk(0), &themed(), &o, &mut |_| {});
+    assert!(d.moods.is_empty());
+}
+
+#[test]
+fn a_mood_is_sent_only_when_it_changes() {
+    // 第一步做出彩色炸弹（五连）→ celebrate；第二步普通 → look；第三步普通 → 不重发 look。
+    let x: &[&[u16]] = &[&[1, 1, 2, 1, 1], &[3, 3, 1, 3, 3], &[2, 2, 3, 2, 2]];
+    let y: &[&[u16]] = &[&[1, 1, 2, 3, 3], &[2, 3, 1, 2, 1], &[3, 2, 3, 1, 2]];
+    let z: &[&[u16]] = &[&[3, 2, 3, 1, 2], &[2, 3, 1, 2, 1], &[1, 1, 2, 3, 3]];
+    let w: &[&[u16]] = &[&[3, 3, 2, 1, 1], &[1, 2, 1, 3, 2], &[2, 1, 3, 2, 3]];
+    let mut d = Fake::new(vec![Ok(grid(x)), Ok(grid(y)), Ok(grid(y)), Ok(grid(z)), Ok(grid(z)), Ok(grid(w)), Ok(grid(w))]);
+    let (s, _) = {
+        let mut log = vec![];
+        let s = play(&mut d, &mut Clk(0), &profile(3, 5), &opts(3), &mut |v| log.push(v));
+        (s, log)
+    };
+    assert_eq!((s.steps, &s.stop), (3, &Stop::StepsDone));
+    assert_eq!(d.events, ["swipe", "celebrate", "swipe", "look", "swipe"]);
+}
+
+/// 每步数字 `[步数, 目标]`：开局一组，之后每步一组。
+fn goal_texts(rows: &[(u64, u64)]) -> VecDeque<Vec<&'static str>> {
+    rows.iter().map(|(a, b)| vec![&*Box::leak(a.to_string().into_boxed_str()), &*Box::leak(b.to_string().into_boxed_str())]).collect()
+}
+
+fn play_moods(texts: VecDeque<Vec<&'static str>>, steps: usize) -> Fake {
+    let mut d = Fake::new(stall_reads());
+    d.texts = texts;
+    let _ = play(&mut d, &mut Clk(0), &profile(3, 4), &opts(steps), &mut |_| {});
+    d
+}
+
+#[test]
+fn few_moves_left_is_tense_once() {
+    // 步数 12 起每步 -1，目标每步少 2（认得出）；剩 5 步起紧张，之后连着多步不重发。
+    let rows: Vec<(u64, u64)> = (0..=10).map(|i| (12 - i, 100 - 2 * i)).collect();
+    let d = play_moods(goal_texts(&rows), 10);
+    assert_eq!(states(&d).iter().filter(|s| **s == "tense").count(), 1, "{:?}", d.events);
+}
+
+#[test]
+fn a_goal_down_to_a_fifth_is_hopeful() {
+    let g = [100, 100, 90, 70, 40, 15, 12, 10];
+    let rows: Vec<(u64, u64)> = g.iter().enumerate().map(|(i, g)| (40 - i as u64, *g)).collect();
+    let d = play_moods(goal_texts(&rows), 7);
+    assert_eq!(states(&d), ["hopeful"], "{:?}", d.events);
+}
+
+#[test]
+fn six_flat_steps_make_the_octopus_stall() {
+    let mut rows = vec![(30, 50)];
+    rows.extend((1..=14).map(|i| (30 - i, if i == 1 { 50 } else { 49 })));
+    let d = play_moods(goal_texts(&rows), 14);
+    assert_eq!(states(&d), ["stall"], "{:?}", d.events);
+}
+
+#[test]
+fn stuck_ends_with_stuck_and_steps_done_adds_nothing() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    let s = play(&mut d, &mut Clk(0), &profile(3, 4), &opts(10), &mut |_| {});
+    assert_eq!(s.stop, Stop::Stuck);
+    assert_eq!(states(&d).last(), Some(&"stuck"));
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let s = play(&mut d, &mut Clk(0), &profile(3, 4), &opts(1), &mut |_| {});
+    assert_eq!(s.stop, Stop::StepsDone);
+    assert!(d.moods.is_empty());
 }

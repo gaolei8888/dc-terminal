@@ -4,6 +4,7 @@ use crate::ask::{board_text, describe, describe_move, Advisor, AskInput};
 use crate::board::{fixed_ids, looks_like_board, Board, GridRead};
 use crate::choose::{choose, Candidate, Weights};
 use crate::goal::GoalFinder;
+use crate::mood::{self, Mood};
 use crate::screen::Element;
 use serde_json::{json, Value};
 
@@ -23,6 +24,8 @@ pub struct Profile {
     /// 关卡号在画面上的写法（一个带恰好一个捕获组的正则），来自配置文件的 `level_pattern`。
     /// 有它、画面上对得上、又读得出合格棋盘，就直接当棋盘，不过 OCR 分类。没写 = 不启用。
     pub level_pattern: Option<String>,
+    /// 章鱼的主题（配置文件的可选键 `theme`），开局发一次；没写就不发。
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,8 +322,42 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
     (x + (c as f64 + 0.5) / p.cols as f64 * w, y + (r as f64 + 0.5) / p.rows as f64 * h)
 }
 
+/// 章鱼只在表情变化时才发：同一个连着不重发；没有合适的表情就回到「看」（已经是「看」就不发）。
+fn send_mood(dco: &mut dyn Dco, last: &mut &'static str, m: Option<Mood>) {
+    match m {
+        Some(m) if m.state != *last => {
+            dco.show_status_with(m.state, m.text, None);
+            *last = m.state;
+        }
+        Some(_) => {}
+        None if *last != "look" => {
+            dco.show_status_with("look", None, None);
+            *last = "look";
+        }
+        None => {}
+    }
+}
+
 pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
+    let s = play_inner(dco, clock, p, o, sink);
+    if let Some(m) = mood::for_stop(&s.stop) {
+        dco.show_status_with(m.state, m.text, None);
+    }
+    s
+}
+
+/// 同 `play`，但停下时不发章鱼表情：`auto_next` 里一局结束只是中途，由它自己在真正停下时发。
+pub(crate) fn play_inner(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
     let mut steps = 0;
+    // 章鱼现在的样子（开局算「看」）；`hold_calm`：刚说了「大模型没回应」，别马上被「看」盖掉。
+    let mut last_mood: &'static str = "look";
+    let mut hold_calm = false;
+    let mut told_advisor_down = false;
+    if !o.dry_run {
+        if let Some(t) = p.theme.as_deref() {
+            dco.show_status_with("look", None, Some(t));
+        }
+    }
     let mut baseline: Option<usize> = None;
     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
     let mut asked = 0usize;
@@ -433,9 +470,17 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
                     failed: failed_now.clone(),
                 };
-                dco.show_status("think");
+                dco.show_status_with("think", Some("问大模型中"), None);
                 let advice = adv.pick(&input);
-                dco.show_status("look");
+                if advice.is_none() && !told_advisor_down {
+                    told_advisor_down = true;
+                    hold_calm = true;
+                    dco.show_status_with("stall", Some("大模型没回应"), None);
+                    last_mood = "stall";
+                } else {
+                    dco.show_status_with("look", None, None);
+                    last_mood = "look";
+                }
                 if let Some(a) = advice {
                     let chosen_idx = a.choice.filter(|&k| k < offered.len()).map(|k| offered[k]);
                     ask_rec = Some(json!({
@@ -623,6 +668,15 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 sink(rec);
                 break Stop::Dco(e);
             }
+        }
+        let gi = o.goal_index.or(finder.index());
+        let at = |i: Option<usize>| i.and_then(|i| progress_prev.as_ref()?.get(i).copied());
+        let m = mood::for_step(&chosen.features, stalled_now, at(finder.step_index()), at(gi), finder.goal_start());
+        if m.is_some() {
+            hold_calm = false;
+        }
+        if !(m.is_none() && hold_calm) {
+            send_mood(dco, &mut last_mood, m);
         }
     };
     Summary { steps, stop }
