@@ -183,7 +183,7 @@ mod tests {
     struct First;
     impl Advisor for First {
         fn pick(&self, _: &AskInput) -> Option<Advice> {
-            Some(Advice { choice: Some(0), reason: String::new(), raw: "1".into(), model: "t".into() })
+            Some(Advice { choice: Some(0), reason: String::new(), raw: "1".into(), model: "t".into(), tokens: None })
         }
     }
 
@@ -223,7 +223,7 @@ mod tests {
     struct Pick(usize);
     impl Advisor for Pick {
         fn pick(&self, _: &AskInput) -> Option<Advice> {
-            Some(Advice { choice: Some(self.0), reason: String::new(), raw: String::new(), model: "t".into() })
+            Some(Advice { choice: Some(self.0), reason: String::new(), raw: String::new(), model: "t".into(), tokens: None })
         }
     }
 

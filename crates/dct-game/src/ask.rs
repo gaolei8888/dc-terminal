@@ -17,6 +17,8 @@ pub struct Advice {
     pub reason: String,
     pub raw: String,
     pub model: String,
+    /// 这次问用掉的输入、输出 token 数；读不到是 `None`。
+    pub tokens: Option<(u64, u64)>,
 }
 
 /// `None` = 没问成（没配、连不上、超时）：调用方当没有这个功能，退回规则。

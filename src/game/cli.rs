@@ -176,6 +176,9 @@ fn run_parsed(a: &Args) -> i32 {
     } else {
         eprintln!("{line}");
     }
+    if let Some(line) = advisor.as_ref().and_then(|a| a.summary()) {
+        println!("{line}");
+    }
     code
 }
 
