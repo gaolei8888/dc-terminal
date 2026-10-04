@@ -416,3 +416,22 @@ fn a_see_text_timeout_is_not_paid_twice() {
     drop(c);
     assert_eq!(h.join().unwrap(), 1);
 }
+
+#[test]
+fn a_late_reply_to_a_timed_out_call_is_not_taken_for_the_next_calls_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let _h = fake(dir.path(), TOKEN, |tool, _| match tool {
+        "slow" => {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            (json!({}), false)
+        }
+        "read_grid" => (json!({"rows":2,"cols":2,"cells":[[0,0],[1,1]],"odd":[[false,false],[false,false]],
+                "classes":[{"id":0,"rgb":[1,2,3],"count":2},{"id":1,"rgb":[4,5,6],"count":2}],"elapsed_ms":1}), false),
+        other => panic!("没想到会调 {other}"),
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    assert_eq!(c.call("slow", json!({})).unwrap_err().code, "dco_timeout");
+    // 慢回复在这次调用等的时候才到，必须被跳过
+    let g = c.read_grid(&profile()).unwrap();
+    assert_eq!((g.rows, g.cols, g.classes.len()), (2, 2, 2));
+}

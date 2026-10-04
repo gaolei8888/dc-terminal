@@ -20,6 +20,8 @@ pub struct DcoClient {
     no_show_status: bool,
     /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
     no_see_text: bool,
+    /// 一次请求等回复的总时长；跳过别的回复也算在里面。
+    timeout: Duration,
 }
 
 fn err(code: &str, message: impl Into<String>) -> DcoError {
@@ -57,7 +59,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, timeout };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -89,7 +91,17 @@ impl DcoClient {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-        let reply = self.read_line()?;
+        // 前面超时的调用，回复可能晚到：按 id 认回复，别人的（和没有 id 的通知）跳过。
+        let deadline = std::time::Instant::now() + self.timeout;
+        let reply = loop {
+            let r = self.read_line()?;
+            if r.get("id") == Some(&json!(id)) {
+                break r;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io_err(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
+            }
+        };
         if let Some(e) = reply.get("error") {
             let msg = e["message"].as_str().unwrap_or("dco 报错");
             let code = e["code"].as_i64();
