@@ -51,6 +51,8 @@ fn fake_dco(home: &std::path::Path, swipe_error: Option<&'static str>) -> std::t
                     tools.push(name.clone());
                     let (body, is_error) = match (name.as_str(), swipe_error) {
                         ("read_grid", _) => (board(), false),
+                        // 进度数字读不到也不影响玩：这个假 dco 不会认字。
+                        ("see", _) => (json!({"error": {"code": "unsupported", "message": "x"}}), true),
                         ("swipe", Some(code)) => (json!({"error": {"code": code, "message": "x"}}), true),
                         ("swipe", None) => (json!({"swiped": true}), false),
                         (other, _) => panic!("没想到会调 {other}"),
@@ -103,7 +105,7 @@ fn a_halted_dco_stops_the_game_with_a_plain_sentence_and_a_failing_exit_code() {
     let (out, err, code) = dct(home.path(), &["game", "play", "--steps", "3"]);
     assert_eq!(code, 1, "{out}{err}");
     assert!(err.contains("急停"), "{err}");
-    assert_eq!(h.join().unwrap(), vec!["read_grid", "swipe"]);
+    assert_eq!(h.join().unwrap(), vec!["see", "read_grid", "swipe"]);
     assert!(err.contains("走了 0 步"), "{err}");
     assert!(out.contains("这一步没划成") && !out.contains("消 ") && !out.contains("第 1 步"), "{out}");
     let lines = log_lines(home.path());

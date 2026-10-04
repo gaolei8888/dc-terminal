@@ -24,10 +24,11 @@ struct Fake {
     /// show_status 和 swipe 按先后记下来，测 play() 不发状态。
     events: Vec<String>,
     reads_taken: usize,
+    texts: VecDeque<Vec<&'static str>>,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0 }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new() }
     }
 }
 impl Dco for Fake {
@@ -49,6 +50,16 @@ impl Dco for Fake {
     }
     fn show_status(&mut self, state: &str) {
         self.events.push(state.into());
+    }
+    fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
+        match self.texts.pop_front() {
+            Some(t) => Ok(Seen {
+                snapshot_id: "s".into(),
+                observation_id: None,
+                elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into() }).collect(),
+            }),
+            None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
+        }
     }
 }
 struct Clk(u64);
@@ -1018,4 +1029,42 @@ fn records_carry_predicted_and_observed() {
     let (_, log) = run(&mut d, 1, false);
     assert!(log[0]["predicted_cleared"].as_u64().unwrap() >= 3);
     assert!(log[0].get("observed_changed").is_some());
+}
+
+#[test]
+fn numbers_keeps_only_whole_number_elements_in_order() {
+    let seen = Seen {
+        snapshot_id: "s".into(),
+        observation_id: None,
+        elements: ["1716/♥5", "38", "x", "122", " 7 "].iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
+    };
+    assert_eq!(numbers(&seen), vec![38, 122, 7]);
+}
+
+#[test]
+fn progress_is_recorded_before_and_after_each_step() {
+    let mut d = Fake::new(settled_script());
+    d.texts = vec![vec!["50", "30"], vec!["49", "30"]].into();
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["progress"]["before"], json!([50, 30]));
+    assert_eq!(log[0]["progress"]["after"], json!([49, 30]));
+}
+
+#[test]
+fn progress_is_null_when_the_dco_cannot_read_text() {
+    let mut d = Fake::new(settled_script());
+    let (s, log) = run(&mut d, 1, false);
+    assert!(log[0]["progress"]["before"].is_null());
+    assert!(log[0]["progress"]["after"].is_null());
+    assert_eq!(s.stop, Stop::StepsDone);
+}
+
+#[test]
+fn the_after_of_one_step_is_the_before_of_the_next() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED)), Ok(grid(A)), Ok(grid(A))]);
+    d.texts = vec![vec!["50"], vec!["49"], vec!["48"]].into();
+    let (_, log) = run(&mut d, 2, false);
+    assert!(log.len() >= 2);
+    assert_eq!(log[1]["progress"]["before"], json!([49]));
+    assert_eq!(log[1]["progress"]["after"], json!([48]));
 }

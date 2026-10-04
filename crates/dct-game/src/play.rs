@@ -42,6 +42,16 @@ fn unsupported() -> DcoError {
     DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
 }
 
+/// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。
+/// 「1716/♥5」这种夹着别的字的不要。哪个数是目标，这里不猜；只记下来。
+pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
+    seen.elements.iter().filter_map(|e| e.text.trim().parse::<u64>().ok()).collect()
+}
+
+fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
+    dco.see_text(p).ok().map(|s| numbers(&s))
+}
+
 pub trait Dco {
     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
     /// 坐标是窗口比例（0～1）。
@@ -249,6 +259,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
     let mut locked: Vec<(usize, usize)> = Vec::new();
     let mut current: Option<GridRead> = None;
     let mut no_move_confirms = 0;
+    let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
     let stop = loop {
         if steps >= o.max_steps {
             break Stop::StepsDone;
@@ -407,6 +418,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["outcome"] = json!("no_change");
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(next.observation_id);
+                let progress_after = read_numbers(dco, p);
+                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                progress_prev = progress_after;
                 sink(rec);
                 streak += 1;
                 failed.push((chosen.mv, canonical(&g.cells)));
@@ -421,6 +435,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["outcome"] = json!("moved");
                 rec["observed_changed"] = json!(changed_cells(&g, &next));
                 rec["after_observation_id"] = json!(next.observation_id);
+                let progress_after = read_numbers(dco, p);
+                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                progress_prev = progress_after;
                 sink(rec);
                 streak = 0;
                 failed.clear();
@@ -431,6 +448,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["outcome"] = json!("no_change");
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(same_board.observation_id);
+                let progress_after = read_numbers(dco, p);
+                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                progress_prev = progress_after;
                 sink(rec);
                 streak += 1;
                 failed.push((chosen.mv, canonical(&g.cells)));
