@@ -40,7 +40,9 @@ pub struct Region { pub x_bp: u16, pub y_bp: u16, pub w_bp: u16, pub h_bp: u16 }
 
 - `role_may_sign(tier, role, waiver)`：
   - 现有规矩不变；
-  - **新增唯一一条例外：** `tier == Content`，`tier.rule_can_waive()` 为真，且票带了 `waiver`，且 `waiver.kind == "no_text"` → 允许 `Auto` 签。
+  - **新增唯一一条例外：** `tier == Content`，`tier.rule_can_waive()` 为真，票的主体是 `Subject::Action` 且 `tool == "tap_at"`，且票带了 `waiver`、`waiver.kind == "no_text"` → 允许 `Auto` 签。
+  - **例外只适用于 `Subject::Action` 的 `tap_at`。** 流程（`Procedure`）和别的工具（`tap`、`pick_file`、打字……）带了凭据也没有例外，`Auto` 签名一律 `WrongRole`；否则一条用户批准过的 Content 流程就能不经用户签名反复执行。
+  - dco 也必须拒绝「为 `tap_at` 以外的工具带了凭据」的票（双保险，不只靠 dct 验签）。
   - `Critical`、`Money` 永远不放行（`rule_can_waive()` 本来就是假）；`Content` 但没带凭据，还是只许 `User`。
 - `verify` 对应放行：带凭据的 `Content` 票接受 `Auto` 签名，其余检查（签名、设备、有效期、nonce 一次性、角色够不够）一个都不少。
 
