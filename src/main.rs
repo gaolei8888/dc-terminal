@@ -37,6 +37,8 @@ dct —— vibe coding 终端
                    拿以前记下的局面问大模型，看它比乱选强多少（不碰手机）
   dct game identify [--game candy-crush]
                    看看现在屏幕上是哪一类游戏（只在本机识别，不上传）
+  dct game scene [--game 名字] [--steps 10] [--dry-run]
+                   寻物游戏：让大模型看场景指一个位置，dct 检查后点（要最新版 dco；只支持 Mac）
   dct peers        看组里有哪些电脑、开着哪些会话
   dct send <电脑名>/<会话名> \"<内容>\"
                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。

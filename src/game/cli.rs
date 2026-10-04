@@ -57,7 +57,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 #[cfg(unix)]
-struct SystemClock;
+pub(super) struct SystemClock;
 
 #[cfg(unix)]
 impl dct_game::play::Clock for SystemClock {
@@ -72,6 +72,9 @@ impl dct_game::play::Clock for SystemClock {
 pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("ask-bench") {
         return super::bench::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("scene") {
+        return super::scene::run(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("identify") {
         return super::identify::run(&args[1..]);

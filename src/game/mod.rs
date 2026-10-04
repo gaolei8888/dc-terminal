@@ -7,5 +7,6 @@ pub mod cli;
 pub mod identify;
 pub mod log;
 pub mod profile;
+pub mod scene;
 pub mod skill;
 pub mod text;

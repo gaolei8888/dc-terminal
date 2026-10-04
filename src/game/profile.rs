@@ -50,12 +50,26 @@ struct File {
     level_pattern: Option<String>,
     /// 章鱼的主题名（可选，最长 20 个字符）。
     theme: Option<String>,
+    /// `dct game scene` 不点的区域（窗口 0 到 1，最多 16 块）。不写 = 没有。游戏专属的数据只来自这里。
+    no_tap: Option<Vec<NoTapEntry>>,
     /// 可选的重复表 `[[class]]`：把读出来的颜色类别标成「不是糖」（洞、蜂蜜块、糖果机）。
     #[serde(default)]
     class: Vec<ClassEntry>,
     /// 可选的打分权重表；没写的项保持通用的中性默认。
     weights: Option<WeightsEntry>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoTapEntry {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// `no_tap` 最多这么多块（和 dco 的 `tap_at` 一次能带的数一样）。
+pub const NO_TAP_MAX: usize = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +114,8 @@ pub struct Loaded {
     pub sha256: String,
     /// 说给用户听的来源：「内置的」或文件路径。
     pub source: String,
+    /// 不点的区域（整数万分比），给 `dct game scene` 用。
+    pub no_tap: Vec<dct_game::play::Region>,
 }
 
 pub fn games_dir(home: &Path) -> PathBuf {
@@ -174,7 +190,12 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
         },
         sha256,
         source,
+        no_tap: f.no_tap.as_deref().unwrap_or(&[]).iter().map(|r| dct_game::play::Region { x_bp: bp(r.x), y_bp: bp(r.y), w_bp: bp(r.w), h_bp: bp(r.h) }).collect(),
     })
+}
+
+fn bp(v: f64) -> u16 {
+    dct_game::scene::to_bp(v)
 }
 
 fn check(f: &File) -> Result<(), String> {
@@ -192,6 +213,17 @@ fn check(f: &File) -> Result<(), String> {
         }
         if c.rgb.iter().any(|v| !(0..=255).contains(v)) {
             return Err(format!("[[class]]「{}」的 rgb 三个数都要在 0 到 255 之间", c.name));
+        }
+    }
+    if let Some(list) = &f.no_tap {
+        if list.len() > NO_TAP_MAX {
+            return Err(format!("no_tap 最多 {NO_TAP_MAX} 块，现在写了 {} 块", list.len()));
+        }
+        for (i, r) in list.iter().enumerate() {
+            let ok = [r.x, r.y, r.w, r.h].iter().all(|v| (0.0..=1.0).contains(v)) && r.w > 0.0 && r.h > 0.0 && r.x + r.w <= 1.0 + 1e-9 && r.y + r.h <= 1.0 + 1e-9;
+            if !ok {
+                return Err(format!("no_tap 第 {} 块要整个落在窗口里：x、y、w、h 都取 0 到 1，w 和 h 大于 0，x+w、y+h 不超过 1", i + 1));
+            }
         }
     }
     if f.theme.as_ref().is_some_and(|t| t.chars().count() > 20) {
@@ -385,5 +417,39 @@ mod tests {
         let w = load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.weights;
         assert_eq!((w.striped, w.wrapped, w.bomb, w.triggered), (6.0, 8.0, 15.0, 5.0));
         assert_eq!((w.special_swap, w.cleared, w.cascade, w.low_row), (0.0, 1.0, 0.5, 1.0));
+    }
+
+    const MIN: &str = "window = { app = \"x\" }\nregion = { x = 0.1, y = 0.1, w = 0.5, h = 0.5 }\nrows = 2\ncols = 2\n";
+
+    #[test]
+    fn no_tap_defaults_to_empty_and_never_touches_the_built_in_game() {
+        let h = tempfile::tempdir().unwrap();
+        assert!(load(h.path(), "candy-crush").unwrap().no_tap.is_empty());
+        let h = home_with("x", MIN);
+        assert!(load(h.path(), "x").unwrap().no_tap.is_empty());
+    }
+
+    #[test]
+    fn no_tap_blocks_become_basis_points() {
+        let h = home_with("x", &format!("{MIN}no_tap = [{{ x = 0.78, y = 0.0, w = 0.22, h = 0.2 }}, {{ x = 0.0, y = 0.82, w = 1.0, h = 0.18 }}]\n"));
+        let r = load(h.path(), "x").unwrap().no_tap;
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].x_bp, r[0].y_bp, r[0].w_bp, r[0].h_bp), (7800, 0, 2200, 2000));
+        assert_eq!((r[1].x_bp, r[1].y_bp, r[1].w_bp, r[1].h_bp), (0, 8200, 10000, 1800));
+    }
+
+    #[test]
+    fn no_tap_out_of_range_or_too_many_is_refused_with_a_reason() {
+        for bad in ["{ x = 0.9, y = 0.0, w = 0.2, h = 0.1 }", "{ x = -0.1, y = 0.0, w = 0.2, h = 0.1 }", "{ x = 0.1, y = 0.1, w = 0.0, h = 0.1 }", "{ x = 0.1, y = 0.1, w = 1.5, h = 0.1 }"] {
+            let h = home_with("x", &format!("{MIN}no_tap = [{bad}]\n"));
+            let e = load(h.path(), "x").err().unwrap_or_else(|| panic!("{bad} 应当被拒绝"));
+            assert!(e.contains("no_tap 第 1 块"), "{e}");
+        }
+        let many = vec!["{ x = 0.0, y = 0.0, w = 0.1, h = 0.1 }"; 17].join(", ");
+        let h = home_with("x", &format!("{MIN}no_tap = [{many}]\n"));
+        assert!(load(h.path(), "x").err().unwrap().contains("最多 16 块"));
+        let sixteen = vec!["{ x = 0.0, y = 0.0, w = 0.1, h = 0.1 }"; 16].join(", ");
+        let h = home_with("x", &format!("{MIN}no_tap = [{sixteen}]\n"));
+        assert_eq!(load(h.path(), "x").unwrap().no_tap.len(), 16);
     }
 }
