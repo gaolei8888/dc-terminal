@@ -20,7 +20,11 @@ pub struct DcoClient {
     no_show_status: bool,
     /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
     no_see_text: bool,
+    /// 这台 dco 不认 swipe 的 `settle` 参数（回复里没有 `settle`）：这条连接上不再带，免得每步白发。
+    /// 注意只有「回复里压根没有 settle」才置位；等待出错、报告读不懂都不算。
     no_swipe_settle: bool,
+    /// 带 settle 的 swipe 等回复的时长：要比 dco 自己最多等的 `SETTLE_TIMEOUT_MS` 还长，否则会把还在等的划动当成失败。
+    pub(crate) settle_call_timeout: Duration,
     /// 一次请求等回复的总时长；跳过别的回复也算在里面。
     timeout: Duration,
 }
@@ -60,7 +64,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, timeout };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -162,12 +166,21 @@ impl Dco for DcoClient {
             };
         }
         let [x, y, w, h] = p.region;
-        let body = match self.call("swipe", json!({
+        let normal = self.timeout;
+        self.timeout = self.settle_call_timeout;
+        let _ = self.w.set_read_timeout(Some(self.timeout));
+        let res = self.call("swipe", json!({
             "window": p.window,
             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
             "settle": { "quiet_ms": SETTLE_QUIET_MS, "timeout_ms": SETTLE_TIMEOUT_MS, "region": { "x": x, "y": y, "w": w, "h": h } },
-        })) {
+        }));
+        self.timeout = normal;
+        let _ = self.w.set_read_timeout(Some(normal));
+        let body = match res {
             Ok(b) => b,
+            // 请求已经写出去了，划动很可能已经发生：不能说「没划」，否则调用方会再划一次。
+            // 其他传输错误（断线等）分不清是写出前还是写出后，保持 NotSwiped。
+            Err(e) if e.code == "dco_timeout" => return SwipeOutcome::SwipedNoSettle(e),
             Err(e) => return SwipeOutcome::NotSwiped(e),
         };
         // 到这里划动已经发生；下面任何一种“没拿到报告”都不许再划。
@@ -181,10 +194,14 @@ impl Dco for DcoClient {
             let e = &s["error"];
             return SwipeOutcome::SwipedNoSettle(err(e["code"].as_str().unwrap_or("dco_error"), e["message"].as_str().unwrap_or("等屏幕稳定时出错")));
         }
+        // 缺 changed / settled 的报告不能当「弹回原样」用。
+        let (Some(changed), Some(settled)) = (s["changed"].as_bool(), s["settled"].as_bool()) else {
+            return SwipeOutcome::SwipedNoSettle(err("bad_settle", "dco 回的稳定报告读不懂"));
+        };
         SwipeOutcome::Settled(SwipeSettle {
-            changed: s["changed"].as_bool().unwrap_or(false),
+            changed,
             change: s["change"].as_f64().unwrap_or(0.0),
-            settled: s["settled"].as_bool().unwrap_or(false),
+            settled,
             timed_out: s["timed_out"].as_bool().unwrap_or(false),
             settled_ms: s["settled_ms"].as_u64(),
         })

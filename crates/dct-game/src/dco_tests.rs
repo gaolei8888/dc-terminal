@@ -534,3 +534,42 @@ fn swipe_settle_timeout_is_returned_for_the_caller_to_judge() {
     drop(c);
     h.join().unwrap();
 }
+
+#[test]
+fn swipe_settle_client_timeout_is_swiped_no_settle_and_late_reply_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let h = fake(dir.path(), TOKEN, move |tool, args| {
+        assert_eq!(tool, "swipe");
+        assert!(args.get("settle").is_some());
+        if n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            (json!({"swiped":true,"settle":{"changed":true,"settled":true}}), false)
+        } else {
+            (json!({"swiped":true,"settle":{"changed":false,"change":0.0,"settled":true,"timed_out":false,"settled_ms":5}}), false)
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    c.settle_call_timeout = std::time::Duration::from_millis(250);
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "dco_timeout"));
+    c.settle_call_timeout = std::time::Duration::from_secs(5);
+    match c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)) {
+        SwipeOutcome::Settled(s) => assert!(!s.changed && s.settled_ms == Some(5)),
+        o => panic!("{o:?}"),
+    }
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_malformed_report_is_not_a_bounce_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, args) = settle_fake(dir.path(), vec![(json!({"swiped":true,"settle":{}}), false), (json!({"swiped":true,"settle":{"changed":true}}), false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "bad_settle"));
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "bad_settle"));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert!(a[1].get("settle").is_some());
+}
