@@ -25,10 +25,11 @@ struct Fake {
     events: Vec<String>,
     reads_taken: usize,
     texts: VecDeque<Vec<&'static str>>,
+    settles: VecDeque<SwipeOutcome>,
 }
 impl Fake {
     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new() }
+        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new(), settles: VecDeque::new() }
     }
 }
 impl Dco for Fake {
@@ -47,6 +48,14 @@ impl Dco for Fake {
         self.swipes.push((f, t));
         self.events.push("swipe".into());
         Ok(())
+    }
+    fn swipe_settle(&mut self, p: &Profile, f: (f64, f64), t: (f64, f64)) -> SwipeOutcome {
+        // 队列空时和 trait 默认实现一模一样：一次划动，然后「没拿到稳定报告」。
+        let scripted = self.settles.pop_front();
+        match self.swipe(p, f, t) {
+            Err(e) => SwipeOutcome::NotSwiped(e),
+            Ok(()) => scripted.unwrap_or_else(|| SwipeOutcome::SwipedNoSettle(DcoError { code: "unsupported".into(), message: "x".into() })),
+        }
     }
     fn show_status(&mut self, state: &str) {
         self.events.push(state.into());
@@ -1324,4 +1333,104 @@ fn a_goal_that_dropped_once_then_stays_flat_stalls_and_asks_the_model() {
     assert!(log.iter().any(|l| l["goal_found"] == 2), "{log:?}");
     assert!(log.iter().any(|l| l["stalled"] == true), "{log:?}");
     assert!(say.calls.get() >= 1);
+}
+
+fn settled(changed: bool) -> SwipeOutcome {
+    SwipeOutcome::Settled(SwipeSettle { changed, change: if changed { 0.4 } else { 0.0 }, settled: true, timed_out: false, settled_ms: Some(420) })
+}
+
+#[test]
+fn dco_says_unchanged_is_no_change_without_polling_reads() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    d.settles.push_back(settled(false));
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["outcome"], "no_change");
+    assert_eq!(log[0]["settle"]["source"], "dco");
+    assert_eq!(log[0]["settle"]["changed"], false);
+    assert_eq!(log[0]["settle"]["settled_ms"], 420);
+    assert_eq!(d.reads_taken, 1, "没变就不用再读棋盘");
+}
+
+#[test]
+fn dco_says_changed_reads_once_and_is_moved() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+    d.settles.push_back(settled(true));
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["outcome"], "moved");
+    assert_eq!(log[0]["settle"]["source"], "dco");
+    assert_eq!(log[0]["settle"]["changed"], true);
+    assert_eq!(d.reads_taken, 2);
+}
+
+#[test]
+fn dco_says_changed_but_board_is_identical_is_no_change() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(A))]);
+    d.settles.push_back(settled(true));
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["outcome"], "no_change");
+}
+
+#[test]
+fn dco_changed_then_unreadable_board_is_no_grid() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into() })]);
+    d.settles.push_back(settled(true));
+    let (s, _) = run(&mut d, 5, false);
+    assert_eq!(s.stop, Stop::NoGrid("结果页".into()));
+}
+
+#[test]
+fn dco_changed_then_other_read_error_stops_with_it() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Err(err("halted"))]);
+    d.settles.push_back(settled(true));
+    let (s, _) = run(&mut d, 5, false);
+    assert_eq!(s.stop, Stop::Dco(err("halted")));
+}
+
+#[test]
+fn timed_out_settle_falls_back_to_polling_and_never_reswipes() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    d.settles.push_back(SwipeOutcome::Settled(SwipeSettle { changed: false, change: 0.0, settled: false, timed_out: true, settled_ms: None }));
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["settle"]["source"], "poll");
+    assert!(log[0]["settle"]["changed"].is_null() && log[0]["settle"]["settled_ms"].is_null());
+    assert_eq!(log[0]["outcome"], "moved");
+    assert_eq!(d.swipes.len(), 1);
+}
+
+#[test]
+fn swiped_without_settle_report_polls_and_does_not_count_as_no_change() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    d.settles.push_back(SwipeOutcome::SwipedNoSettle(err("stale")));
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["settle"]["source"], "poll");
+    assert_eq!(log[0]["outcome"], "moved");
+    assert_eq!(d.swipes.len(), 1);
+}
+
+#[test]
+fn not_swiped_stops_with_the_dco_error() {
+    let mut d = Fake::new(vec![Ok(grid(A))]);
+    d.swipe_err = Some(err("halted"));
+    d.settles.push_back(SwipeOutcome::NotSwiped(err("halted")));
+    let (s, log) = run(&mut d, 3, false);
+    assert_eq!(s.stop, Stop::Dco(err("halted")));
+    assert_eq!(log[0]["swiped"], false);
+    assert_eq!(s.steps, 0);
+}
+
+#[test]
+fn old_dco_default_path_records_poll_source() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["settle"]["source"], "poll");
+}
+
+#[test]
+fn settled_flag_with_timed_out_is_still_not_trusted() {
+    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+    d.settles.push_back(SwipeOutcome::Settled(SwipeSettle { changed: false, change: 0.0, settled: true, timed_out: true, settled_ms: Some(8000) }));
+    let (_, log) = run(&mut d, 1, false);
+    assert_eq!(log[0]["settle"]["source"], "poll");
+    assert_eq!(log[0]["outcome"], "moved");
+    assert_eq!(d.swipes.len(), 1);
 }
