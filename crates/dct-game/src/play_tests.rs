@@ -986,3 +986,36 @@ fn a_move_that_works_unlocks_cells_that_the_only_remaining_move_needs() {
     assert!(first_cells.contains(&cell(&log[2], "a")) || first_cells.contains(&cell(&log[2], "b")), "第三步该碰第一步的格子：{log:?}");
     assert!(outcomes[0] == "no_change" && outcomes[1] == "moved", "{outcomes:?}");
 }
+
+fn grid_rgb(cells: &[&[u16]], rgbs: &[(u16, [u8; 3])]) -> GridRead {
+    let rows = cells.len();
+    let cols = cells[0].len();
+    let classes: Vec<Value> = rgbs
+        .iter()
+        .map(|(i, c)| json!({"id": i, "count": cells.iter().flat_map(|r| r.iter()).filter(|&&x| x == *i).count(), "rgb": c}))
+        .collect();
+    serde_json::from_value(json!({"rows": rows, "cols": cols, "cells": cells, "odd": vec![vec![false; cols]; rows], "classes": classes})).unwrap()
+}
+
+#[test]
+fn changed_cells_compares_colours_not_class_ids() {
+    let a = grid_rgb(&[&[1, 2], &[2, 1]], &[(1, [200, 30, 30]), (2, [30, 30, 200])]);
+    let b = grid_rgb(&[&[7, 8], &[8, 7]], &[(7, [200, 30, 30]), (8, [30, 30, 200])]);
+    assert_eq!(changed_cells(&a, &b), Some(0));
+    let c = grid_rgb(&[&[7, 8], &[8, 8]], &[(7, [200, 30, 30]), (8, [30, 30, 200])]);
+    assert_eq!(changed_cells(&a, &c), Some(1));
+}
+
+#[test]
+fn changed_cells_is_none_when_colours_are_missing() {
+    let a = grid(A);
+    assert_eq!(changed_cells(&a, &a), None);
+}
+
+#[test]
+fn records_carry_predicted_and_observed() {
+    let mut d = Fake::new(settled_script());
+    let (_, log) = run(&mut d, 1, false);
+    assert!(log[0]["predicted_cleared"].as_u64().unwrap() >= 3);
+    assert!(log[0].get("observed_changed").is_some());
+}

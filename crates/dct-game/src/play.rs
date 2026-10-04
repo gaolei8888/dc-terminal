@@ -152,6 +152,30 @@ fn same(a: &GridRead, b: &GridRead) -> bool {
     canonical(&a.cells) == canonical(&b.cells)
 }
 
+/// 同一格划前划后的颜色相差不到这个就当没变（dco 的类别号每次读都会变，所以比颜色，不比编号）。
+const COLOUR_SAME_DE: f64 = 12.0;
+
+fn rgb_of(g: &GridRead, id: u16) -> Option<[u8; 3]> {
+    g.classes.iter().find(|c| c.id == id).and_then(|c| c.rgb)
+}
+
+/// 划前划后有几格颜色变了。行列数不同或任何一格拿不到颜色就是 `None`（不能当 0）。
+pub(crate) fn changed_cells(a: &GridRead, b: &GridRead) -> Option<usize> {
+    if a.rows != b.rows || a.cols != b.cols {
+        return None;
+    }
+    let mut n = 0;
+    for (ra, rb) in a.cells.iter().zip(&b.cells) {
+        for (ca, cb) in ra.iter().zip(rb) {
+            let (x, y) = (rgb_of(a, *ca)?, rgb_of(b, *cb)?);
+            if crate::lab::delta_e(x, y) > COLOUR_SAME_DE {
+                n += 1;
+            }
+        }
+    }
+    Some(n)
+}
+
 const FIRST_WAIT_MS: u64 = 150;
 const POLL_MS: u64 = 100;
 const NO_CHANGE_MS: u64 = 3_000;
@@ -346,6 +370,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                     "wrapped": c.features.wrapped, "bomb": c.features.bomb, "triggered": c.features.triggered,
                     "special_swap": c.features.special_swap, "lowest_row": c.features.lowest_row } })).collect::<Vec<_>>(),
             "chosen": pick, "decider": decider, "dry_run": o.dry_run, "swiped": false,
+            "predicted_cleared": chosen.features.cleared + chosen.features.cascade,
         });
         if let Some(a) = ask_rec {
             rec["ask"] = a;
@@ -380,6 +405,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
             Settle::Settled(next) if same(&next, &g) => {
                 rec["outcome"] = json!("no_change");
+                rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(next.observation_id);
                 sink(rec);
                 streak += 1;
@@ -393,6 +419,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
             }
             Settle::Settled(next) => {
                 rec["outcome"] = json!("moved");
+                rec["observed_changed"] = json!(changed_cells(&g, &next));
                 rec["after_observation_id"] = json!(next.observation_id);
                 sink(rec);
                 streak = 0;
@@ -402,6 +429,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
             }
             Settle::NoChange(same_board) => {
                 rec["outcome"] = json!("no_change");
+                rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(same_board.observation_id);
                 sink(rec);
                 streak += 1;
