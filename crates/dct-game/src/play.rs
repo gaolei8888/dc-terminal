@@ -295,6 +295,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
     let mut no_move_confirms = 0;
     let mut no_progress = 0usize;
     let mut finder = GoalFinder::new();
+    let mut moved_seen = 0usize;
     let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
     let stop = loop {
         if steps >= o.max_steps {
@@ -488,9 +489,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
                 // 只有成功走了一步才让识别器看：被拒绝的步数字不降，会把「每步刚好少 1」的步数误排除。
+                // 第一步也不看：开局前读到的数字可能带着关卡开始的弹窗，不是这一步造成的变化。
+                moved_seen += 1;
                 if o.goal_index.is_none() {
                     let had = finder.index();
-                    if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+                    if let (true, Some(b), Some(a)) = (moved_seen > 1, &progress_prev, &progress_after) {
                         finder.observe(b, a);
                     }
                     if had.is_none() {
