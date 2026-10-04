@@ -4,10 +4,14 @@ use crate::board::GridRead;
 use crate::play::{Dco, DcoError, Profile, Seen, SwipeOutcome, SwipeSettle, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS};
 use crate::screen::Element;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
+
+/// show_status 的说明条最多这么多个字符（不是字节）。
+const STATUS_TEXT_MAX_CHARS: usize = 16;
 
 /// dco 一次回话最多等多久。
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -18,6 +22,8 @@ pub struct DcoClient {
     next_id: u64,
     /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
     no_show_status: bool,
+    /// 这台 dco 对这些状态回了 `bad_request`（不认识这个状态或参数）：同一个状态不再发，其他状态照发。
+    unsupported_states: HashSet<String>,
     /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
     no_see_text: bool,
     /// 这台 dco 不认 swipe 的 `settle` 参数（回复里没有 `settle`）：这条连接上不再带，免得每步白发。
@@ -64,7 +70,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, unsupported_states: HashSet::new(), no_see_text: false, no_swipe_settle: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -236,13 +242,27 @@ impl Dco for DcoClient {
     }
 
     fn show_status(&mut self, state: &str) {
-        if self.no_show_status {
+        self.show_status_with(state, None, None);
+    }
+
+    fn show_status_with(&mut self, state: &str, text: Option<&str>, theme: Option<&str>) {
+        if self.no_show_status || self.unsupported_states.contains(state) {
             return;
         }
+        let mut args = json!({ "state": state });
+        if let Some(t) = text {
+            args["text"] = json!(t.chars().take(STATUS_TEXT_MAX_CHARS).collect::<String>());
+        }
+        if let Some(t) = theme {
+            args["theme"] = json!(t);
+        }
         // 结果不重要。旧 dco 没这个工具、或者超时，都别再试：超时一次就是 10 秒，每步一次游戏就拖死了。
-        if let Err(e) = self.call("show_status", json!({ "state": state })) {
+        // 只有这个状态 / 参数不被认（bad_request）：只记住这个状态，别的状态（think / look）照发。
+        if let Err(e) = self.call("show_status", args) {
             if e.code == "dco_too_old" || e.code == "dco_timeout" {
                 self.no_show_status = true;
+            } else if e.code == "bad_request" {
+                self.unsupported_states.insert(state.to_string());
             }
         }
     }

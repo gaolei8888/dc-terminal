@@ -279,6 +279,12 @@ fn fake_status(dir: &std::path::Path, status_reply: Option<(i64, &'static str)>)
                 calls.push((name.clone(), req["params"]["arguments"].clone()));
                 let body = match name.as_str() {
                     "show_status" => {
+                        if let Some((0, message)) = status_reply {
+                            // code 0 = 工具层错误：isError 回复，error.code 是 "bad_request"（旧 dco 不认识这个状态或参数）。
+                            let body = json!({"error": {"code": "bad_request", "message": message}});
+                            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": body.to_string()}], "isError": true}})).unwrap();
+                            continue;
+                        }
                         if let Some((code, message)) = status_reply {
                             writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})).unwrap();
                             continue;
@@ -572,4 +578,80 @@ fn swipe_settle_malformed_report_is_not_a_bounce_back() {
     h.join().unwrap();
     let a = args.lock().unwrap();
     assert!(a[1].get("settle").is_some());
+}
+
+#[test]
+fn show_status_with_carries_text_and_theme_and_omits_missing_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), None);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status_with("celebrate", Some("好"), Some("night"));
+    c.show_status_with("look", None, None);
+    drop(c);
+    let calls = h.join().unwrap();
+    assert_eq!(status_calls(&calls), [&json!({"state": "celebrate", "text": "好", "theme": "night"}), &json!({"state": "look"})]);
+}
+
+#[test]
+fn status_text_is_cut_to_16_characters_not_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), None);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let long = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸";
+    assert_eq!(long.chars().count(), 20);
+    c.show_status_with("wait", Some(long), None);
+    drop(c);
+    let calls = h.join().unwrap();
+    assert_eq!(status_calls(&calls), [&json!({"state": "wait", "text": "一二三四五六七八九十甲乙丙丁戊己"})]);
+}
+
+#[test]
+fn a_rejected_state_is_remembered_per_state_and_does_not_silence_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), Some((0, "unknown state")));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status_with("stall", None, None);
+    c.show_status_with("stall", None, None);
+    c.show_status("think");
+    drop(c);
+    let calls = h.join().unwrap();
+    let states: Vec<_> = status_calls(&calls).iter().map(|a| a["state"].as_str().unwrap().to_string()).collect();
+    assert_eq!(states, ["stall", "think"], "stall once, then think still goes out");
+}
+
+#[test]
+fn a_status_timeout_still_stops_show_status_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        let mut tool_calls = 0;
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return tool_calls;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            if req["method"] == "tools/call" {
+                tool_calls += 1;
+                continue;
+            }
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {}})).unwrap();
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    c.show_status_with("celebrate", None, None);
+    c.show_status_with("look", None, None);
+    c.show_status("think");
+    drop(c);
+    assert_eq!(h.join().unwrap(), 1);
 }

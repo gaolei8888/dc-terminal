@@ -129,6 +129,11 @@ pub trait Dco {
     /// 告诉 dco 屏幕上的小章鱼现在在“想”还是“看”。只改它的样子，所以故意不返回错误：
     /// 这里出什么事都不许影响玩。默认什么都不做，只玩一关的假 dco 不用实现。
     fn show_status(&mut self, _state: &str) {}
+    /// 同 `show_status`，另带一条不超过 16 个字的说明和一个主题。默认转调 `show_status`（忽略 text/theme），
+    /// 所以不关心这些的假 dco 不用改。
+    fn show_status_with(&mut self, state: &str, _text: Option<&str>, _theme: Option<&str>) {
+        self.show_status(state);
+    }
 }
 
 pub trait Clock {

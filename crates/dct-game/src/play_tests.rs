@@ -1502,3 +1502,10 @@ fn poll_path_has_no_includes_settle_flag() {
     assert!(log[0]["swipe"].get("duration_ms_includes_settle").is_none());
     assert_eq!(log[0]["swipe"]["duration_ms"], 40);
 }
+
+#[test]
+fn show_status_with_defaults_to_plain_show_status() {
+    let mut d = Fake::new(vec![]);
+    Dco::show_status_with(&mut d, "stall", None, None);
+    assert_eq!(d.events, ["stall"]);
+}
