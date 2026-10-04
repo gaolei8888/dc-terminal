@@ -12,6 +12,8 @@ pub const FORBID: &[&str] = &["hint", "buy", "purchase", "start over", "shop", "
 /// 落点附近的范围：窗口宽、高的万分比（半边）。
 const NEAR_W_BP: i32 = 700;
 const NEAR_H_BP: i32 = 900;
+/// 拖动的起点和落点至少隔这么远（窗口宽的 2%，万分比）。
+const MIN_DRAG_BP: f64 = 200.0;
 /// 去重的格子大小：2%。
 const QUANT_BP: u16 = 200;
 /// 点完等多久再读（毫秒）。
@@ -25,6 +27,8 @@ pub struct Pick {
     pub x: f64,
     pub y: f64,
     pub why: String,
+    /// 拖的起点（物品栏里的格子，0～1）；有它就是「从这里拖到 (x, y)」，没有就是点一下。
+    pub from: Option<(f64, f64)>,
 }
 
 /// 从模型回答里找出 `{"name","x","y","why"}`。去掉思考块；`x`、`y` 必须是 0～1 的数；读不懂就 `None`。
@@ -45,7 +49,18 @@ pub fn parse_pick(text: &str) -> Option<Pick> {
     if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
         return None;
     }
-    Some(Pick { name: v["name"].as_str()?.to_string(), x, y, why: v["why"].as_str().unwrap_or("").to_string() })
+    // `from` 写了就必须写对：写坏了不能悄悄变成「点一下」。
+    let from = match v.get("from") {
+        None | Some(Value::Null) => None,
+        Some(f) => {
+            let (fx, fy) = (f["x"].as_f64()?, f["y"].as_f64()?);
+            if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fy) {
+                return None;
+            }
+            Some((fx, fy))
+        }
+    };
+    Some(Pick { name: v["name"].as_str()?.to_string(), x, y, why: v["why"].as_str().unwrap_or("").to_string(), from })
 }
 
 /// 0～1 的位置变成整数万分比：四舍五入，夹在 0..=10000。
@@ -261,8 +276,14 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             None => Some("大模型没指出能用的位置".to_string()),
             Some(k) => {
                 let (x, y) = (to_bp(k.x), to_bp(k.y));
-                rec["action"] = json!({ "kind": "tap_at", "x_bp": x, "y_bp": y, "name": k.name });
-                if in_regions(x, y, &o.no_tap) {
+                rec["action"] = match k.from {
+                    None => json!({ "kind": "tap_at", "x_bp": x, "y_bp": y, "name": k.name }),
+                    Some(f) => json!({ "kind": "drag", "from_x_bp": to_bp(f.0), "from_y_bp": to_bp(f.1), "x_bp": x, "y_bp": y, "name": k.name }),
+                };
+                let too_short = k.from.is_some_and(|f| ((to_bp(f.0) as f64 - x as f64).powi(2) + (to_bp(f.1) as f64 - y as f64).powi(2)).sqrt() < MIN_DRAG_BP);
+                if too_short {
+                    Some(format!("拖的距离太短（{}）", k.name))
+                } else if in_regions(x, y, &o.no_tap) {
                     Some(format!("落点在不点的区域里（{}）", k.name))
                 } else if let Some(t) = near_forbidden(&before.elements, x, y) {
                     Some(format!("落点附近有「{t}」"))
@@ -287,11 +308,15 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
         let (x, y) = (to_bp(k.x), to_bp(k.y));
         if o.dry_run {
             rec["label"] = json!("dry_run");
-            emit(rec, format!("第 {n} 步：试走，会点『{}』，没有真点", k.name));
+            emit(rec, format!("第 {n} 步：试走，会{}『{}』，没有真{}", if k.from.is_some() { "拖到" } else { "点" }, k.name, if k.from.is_some() { "拖" } else { "点" }));
             break SceneStop::DryRun;
         }
         dco.show_status_with("think", Some("看场景"), None);
-        let tapped = dco.tap_at(p, x, y, &o.no_tap, Some(&TAP_SETTLE));
+        let tapped = match k.from {
+            None => dco.tap_at(p, x, y, &o.no_tap, Some(&TAP_SETTLE)).map(|t| t.settle),
+            // 拖：没有稳定报告，之后只比文字。
+            Some(f) => dco.swipe(p, f, (k.x, k.y)).map(|()| None),
+        };
         dco.show_status("look");
         let settle: Option<TapSettle> = match tapped {
             Err(e) if e.code == "unsupported" => break 'run SceneStop::NoTapAt,
@@ -312,7 +337,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
                 emit(rec, format!("第 {n} 步：点的时候出错了"));
                 break SceneStop::Dco(e);
             }
-            Ok(t) => t.settle,
+            Ok(t) => t,
         };
         skipped = 0;
         sum.taps += 1;
