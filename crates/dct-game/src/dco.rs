@@ -1,7 +1,7 @@
 //! 连本机 dco：unix socket 上的 MCP（一行一条 JSON-RPC）。握手跟 dco 自己的 `dco call` 一样：
 //! 先写 `{"dco_token": "<~/.dco/token>"}`，读到 `{"ok":true}`，再 initialize → notifications/initialized → tools/call。
 use crate::board::GridRead;
-use crate::play::{Dco, DcoError, Profile, Seen};
+use crate::play::{Dco, DcoError, Profile, Seen, SwipeOutcome, SwipeSettle, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS};
 use crate::screen::Element;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +20,7 @@ pub struct DcoClient {
     no_show_status: bool,
     /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
     no_see_text: bool,
+    no_swipe_settle: bool,
     /// 一次请求等回复的总时长；跳过别的回复也算在里面。
     timeout: Duration,
 }
@@ -59,7 +60,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, timeout };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, timeout };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -151,6 +152,42 @@ impl Dco for DcoClient {
             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
         }))
         .map(|_| ())
+    }
+
+    fn swipe_settle(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> SwipeOutcome {
+        if self.no_swipe_settle {
+            return match self.swipe(p, from, to) {
+                Err(e) => SwipeOutcome::NotSwiped(e),
+                Ok(()) => SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定")),
+            };
+        }
+        let [x, y, w, h] = p.region;
+        let body = match self.call("swipe", json!({
+            "window": p.window,
+            "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+            "settle": { "quiet_ms": SETTLE_QUIET_MS, "timeout_ms": SETTLE_TIMEOUT_MS, "region": { "x": x, "y": y, "w": w, "h": h } },
+        })) {
+            Ok(b) => b,
+            Err(e) => return SwipeOutcome::NotSwiped(e),
+        };
+        // 到这里划动已经发生；下面任何一种“没拿到报告”都不许再划。
+        let s = &body["settle"];
+        if !s.is_object() {
+            // 旧 dco 不认 settle 参数，只划了。以后别再带。
+            self.no_swipe_settle = true;
+            return SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定"));
+        }
+        if s["error"].is_object() {
+            let e = &s["error"];
+            return SwipeOutcome::SwipedNoSettle(err(e["code"].as_str().unwrap_or("dco_error"), e["message"].as_str().unwrap_or("等屏幕稳定时出错")));
+        }
+        SwipeOutcome::Settled(SwipeSettle {
+            changed: s["changed"].as_bool().unwrap_or(false),
+            change: s["change"].as_f64().unwrap_or(0.0),
+            settled: s["settled"].as_bool().unwrap_or(false),
+            timed_out: s["timed_out"].as_bool().unwrap_or(false),
+            settled_ms: s["settled_ms"].as_u64(),
+        })
     }
 
     fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {

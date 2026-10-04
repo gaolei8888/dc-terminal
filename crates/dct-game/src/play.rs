@@ -39,6 +39,28 @@ pub struct Seen {
     pub elements: Vec<Element>,
 }
 
+/// 划完之后让 dco 等屏幕稳定：连续安静这么久算稳定、最多等这么久（毫秒）。
+pub const SETTLE_QUIET_MS: u32 = 300;
+pub const SETTLE_TIMEOUT_MS: u32 = 8000;
+
+/// dco 替我们等屏幕稳定之后的报告。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwipeSettle {
+    pub changed: bool,
+    pub change: f64,
+    pub settled: bool,
+    pub timed_out: bool,
+    pub settled_ms: Option<u64>,
+}
+
+/// `swipe_settle` 的结果。要分清「划动没发生」和「划了但没拿到稳定报告」：后一种绝不能再划一次。
+#[derive(Clone, Debug, PartialEq)]
+pub enum SwipeOutcome {
+    NotSwiped(DcoError),
+    SwipedNoSettle(DcoError),
+    Settled(SwipeSettle),
+}
+
 fn unsupported() -> DcoError {
     DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
 }
@@ -88,6 +110,14 @@ pub trait Dco {
     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
     /// 坐标是窗口比例（0～1）。
     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+    /// 划一下，并让 dco 等屏幕稳定后报告有没有变。默认实现只会划（划动确实发生了），
+    /// 然后说「没有稳定报告」，调用方据此回退轮询、不会再划。
+    fn swipe_settle(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> SwipeOutcome {
+        match self.swipe(p, from, to) {
+            Err(e) => SwipeOutcome::NotSwiped(e),
+            Ok(()) => SwipeOutcome::SwipedNoSettle(unsupported()),
+        }
+    }
     /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
     fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
         Err(unsupported())

@@ -1,5 +1,5 @@
 use crate::dco::DcoClient;
-use crate::play::{Dco, Profile};
+use crate::play::{Dco, DcoError, Profile, SwipeOutcome, SwipeSettle};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -434,4 +434,103 @@ fn a_late_reply_to_a_timed_out_call_is_not_taken_for_the_next_calls_reply() {
     // 慢回复在这次调用等的时候才到，必须被跳过
     let g = c.read_grid(&profile()).unwrap();
     assert_eq!((g.rows, g.cols, g.classes.len()), (2, 2, 2));
+}
+
+fn settle_fake(dir: &std::path::Path, replies: Vec<(Value, bool)>) -> (std::thread::JoinHandle<Vec<String>>, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let args = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let a2 = args.clone();
+    let replies = std::sync::Mutex::new(replies.into_iter());
+    let h = fake(dir, TOKEN, move |tool, a| {
+        assert_eq!(tool, "swipe");
+        a2.lock().unwrap().push(a.clone());
+        replies.lock().unwrap().next().unwrap()
+    });
+    (h, args)
+}
+
+fn ed(code: &str, message: &str) -> DcoError {
+    DcoError { code: code.into(), message: message.into() }
+}
+
+#[test]
+fn swipe_settle_reports_what_dco_saw_and_sends_the_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let ok = json!({"swiped":true,"settle":{"changed":true,"change":0.4,"settled":true,"timed_out":false,"settled_ms":420,"region":{"x":0.2,"y":0.3,"w":0.5,"h":0.4}}});
+    let (h, args) = settle_fake(dir.path(), vec![(ok, false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let r = c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5));
+    assert_eq!(r, SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.4, settled: true, timed_out: false, settled_ms: Some(420) }));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert_eq!(a[0]["settle"]["quiet_ms"], 300);
+    assert_eq!(a[0]["settle"]["timeout_ms"], 8000);
+    assert_eq!(a[0]["settle"]["region"], json!({"x":0.2,"y":0.3,"w":0.5,"h":0.4}));
+}
+
+#[test]
+fn swipe_settle_bounce_back_is_a_settled_no_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = json!({"swiped":true,"settle":{"changed":false,"change":0.0,"settled":true,"timed_out":false,"settled_ms":310}});
+    let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    match c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)) {
+        SwipeOutcome::Settled(s) => assert!(!s.changed && s.settled),
+        o => panic!("{o:?}"),
+    }
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_old_dco_swiped_without_settle_and_is_not_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, args) = settle_fake(dir.path(), vec![(json!({"swiped":true}), false), (json!({"swiped":true}), false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported"));
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported"));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert_eq!(a.len(), 2);
+    assert!(a[0].get("settle").is_some());
+    assert!(a[1].get("settle").is_none());
+}
+
+#[test]
+fn swipe_settle_wait_error_keeps_asking_next_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = json!({"swiped":true,"settle":{"error":{"code":"stale","message":"窗口关了"}}});
+    let (h, args) = settle_fake(dir.path(), vec![(bad, false), (json!({"swiped":true}), false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(ed("stale", "窗口关了")));
+    c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert!(a[0].get("settle").is_some() && a[1].get("settle").is_some());
+}
+
+#[test]
+fn swipe_settle_swipe_failure_is_not_swiped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, _) = settle_fake(dir.path(), vec![(json!({"error":{"code":"halted","message":"急停"}}), true)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::NotSwiped(ed("halted", "急停")));
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_timeout_is_returned_for_the_caller_to_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = json!({"swiped":true,"settle":{"changed":true,"change":0.2,"settled":false,"timed_out":true}});
+    let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(
+        c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)),
+        SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.2, settled: false, timed_out: true, settled_ms: None })
+    );
+    drop(c);
+    h.join().unwrap();
 }
