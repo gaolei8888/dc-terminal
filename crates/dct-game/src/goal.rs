@@ -10,6 +10,8 @@ pub struct GoalFinder {
     all_minus_one: Vec<bool>,
     ever_increased: Vec<bool>,
     ever_decreased: Vec<bool>,
+    /// 第一个样本的 `before`：认出目标后，用它当「开局值」。
+    first_before: Vec<u64>,
     found: Option<usize>,
 }
 
@@ -27,6 +29,7 @@ impl GoalFinder {
             self.all_minus_one = vec![true; before.len()];
             self.ever_increased = vec![false; before.len()];
             self.ever_decreased = vec![false; before.len()];
+            self.first_before = before.to_vec();
         }
         if self.all_minus_one.len() != before.len() {
             return; // 列表个数和已有样本不一致：这一步不进样本
@@ -53,6 +56,25 @@ impl GoalFinder {
 
     pub fn index(&self) -> Option<usize> {
         self.found
+    }
+
+    /// 目标认出之后，步数那一列的下标：每个样本都刚好 -1 的唯一一列（恰好一个才认）。
+    pub fn step_index(&self) -> Option<usize> {
+        self.found?;
+        if self.samples < MIN_SAMPLES {
+            return None;
+        }
+        let mut it = self.all_minus_one.iter().enumerate().filter(|(_, &m)| m).map(|(i, _)| i);
+        let first = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// 目标认出时，目标那一列的开局值（第一个样本的 `before`）。
+    pub fn goal_start(&self) -> Option<u64> {
+        self.first_before.get(self.found?).copied()
     }
 }
 #[cfg(test)]
@@ -138,6 +160,48 @@ mod tests {
         assert_eq!(f.index(), None, "只有 3 个有效样本");
         feed(&mut f, &[(&[33, 80], &[32, 70])]);
         assert_eq!(f.index(), Some(1));
+    }
+
+    #[test]
+    fn step_index_is_the_one_column_that_dropped_by_one_every_time() {
+        let mut f = GoalFinder::new();
+        assert_eq!(f.step_index(), None);
+        feed(&mut f, &[
+            (&[122, 38, 0], &[110, 37, 120]),
+            (&[110, 37, 120], &[100, 36, 300]),
+            (&[100, 36, 300], &[100, 35, 340]),
+        ]);
+        assert_eq!(f.step_index(), None, "目标还没认出");
+        feed(&mut f, &[(&[100, 35, 340], &[80, 34, 600])]);
+        assert_eq!(f.index(), Some(0));
+        assert_eq!(f.step_index(), Some(1));
+    }
+
+    #[test]
+    fn step_index_is_none_when_two_columns_drop_by_one_every_time() {
+        let mut f = GoalFinder::new();
+        feed(&mut f, &[
+            (&[38, 122, 38], &[37, 110, 37]),
+            (&[37, 110, 37], &[36, 100, 36]),
+            (&[36, 100, 36], &[35, 100, 35]),
+            (&[35, 100, 35], &[34, 80, 34]),
+        ]);
+        assert_eq!(f.index(), Some(1));
+        assert_eq!(f.step_index(), None);
+    }
+
+    #[test]
+    fn goal_start_is_the_goal_number_of_the_first_sample() {
+        let mut f = GoalFinder::new();
+        assert_eq!(f.goal_start(), None);
+        feed(&mut f, &[
+            (&[38, 122, 0], &[37, 110, 120]),
+            (&[37, 110, 120], &[36, 100, 300]),
+            (&[36, 100, 300], &[35, 100, 340]),
+        ]);
+        assert_eq!(f.goal_start(), None, "还没认出");
+        feed(&mut f, &[(&[35, 100, 340], &[34, 80, 600])]);
+        assert_eq!(f.goal_start(), Some(122));
     }
 
     #[test]

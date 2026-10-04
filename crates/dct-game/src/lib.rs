@@ -8,6 +8,7 @@ pub mod dco;
 pub mod genre;
 pub mod goal;
 pub mod lab;
+pub mod mood;
 pub mod navigate;
 pub mod play;
 pub mod screen;
