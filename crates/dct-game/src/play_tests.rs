@@ -85,7 +85,7 @@ impl Dco for Fake {
             Some(t) => Ok(Seen {
                 snapshot_id: "s".into(),
                 observation_id: None,
-                elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into() }).collect(),
+                elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into() , frac: None }).collect(),
             }),
             None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
         }
@@ -1082,7 +1082,7 @@ fn numbers_keeps_only_whole_number_elements_in_order() {
     let seen = Seen {
         snapshot_id: "s".into(),
         observation_id: None,
-        elements: ["1716/♥5", "38", "x", "122", " 7 "].iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
+        elements: ["1716/♥5", "38", "x", "122", " 7 "].iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() , frac: None }).collect(),
     };
     assert_eq!(numbers(&seen), vec![38, 122, 7]);
 }
@@ -1093,7 +1093,7 @@ fn numbers_rejects_signs_separators_non_ascii_digits_and_overflow() {
     let seen = Seen {
         snapshot_id: "s".into(),
         observation_id: None,
-        elements: texts.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
+        elements: texts.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() , frac: None }).collect(),
     };
     assert_eq!(numbers(&seen), vec![7]);
 }

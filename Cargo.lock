@@ -450,6 +450,7 @@ dependencies = [
 name = "dct-game"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "regex",
  "serde",
  "serde_json",

@@ -1,5 +1,5 @@
 use crate::dco::DcoClient;
-use crate::play::{Dco, DcoError, Profile, SwipeOutcome, SwipeSettle};
+use crate::play::{Dco, DcoError, Profile, Region, SwipeOutcome, SwipeSettle};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -654,4 +654,154 @@ fn a_status_timeout_still_stops_show_status_with() {
     c.show_status("think");
     drop(c);
     assert_eq!(h.join().unwrap(), 1);
+}
+
+/// 假 dco，回整个 MCP 结果（含图片项）。`handler(tool, args)` 返回 `result`；记下每次 (工具名, 参数)。
+fn raw_fake(dir: &std::path::Path, handler: impl Fn(&str, &Value) -> Value + Send + 'static) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
+    let sock = dir.join("dco.sock");
+    std::fs::write(dir.join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let c2 = calls.clone();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            let result = if req["method"] == "tools/call" {
+                let (n, a) = (req["params"]["name"].as_str().unwrap().to_string(), req["params"]["arguments"].clone());
+                let r = handler(&n, &a);
+                c2.lock().unwrap().push((n, a));
+                r
+            } else {
+                json!({})
+            };
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).unwrap();
+        }
+    });
+    calls
+}
+
+fn text_result(body: Value, is_error: bool) -> Value {
+    json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
+}
+
+#[test]
+fn capture_decodes_the_image_item_and_asks_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = raw_fake(dir.path(), |_, _| {
+        json!({"content": [{"type": "text", "text": json!({"elements": []}).to_string()}, {"type": "image", "data": "iVBORw0K", "mimeType": "image/png"}], "isError": false})
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.capture(&profile()).unwrap(), vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].0, "see");
+    assert_eq!(calls[0].1["include_image"], true);
+    assert_eq!(calls[0].1["window"]["app"], "iPhone Mirroring");
+}
+
+#[test]
+fn capture_without_an_image_item_is_no_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let _c = raw_fake(dir.path(), |_, _| text_result(json!({"elements": []}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.capture(&profile()).unwrap_err().code, "no_image");
+}
+
+#[test]
+fn capture_keeps_the_private_screen_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let _c = raw_fake(dir.path(), |_, _| text_result(json!({"error": {"code": "private_screen", "message": "私人"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.capture(&profile()).unwrap_err().code, "private_screen");
+}
+
+#[test]
+fn see_text_reads_positions_from_frac_or_from_bounds_and_window_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let _c = raw_fake(dir.path(), |_, _| {
+        text_result(json!({"snapshot_id": "s1", "window": {"size": {"w": 400.0, "h": 800.0}}, "elements": [
+            {"id": "e1", "text": "A", "frac": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.05}},
+            {"id": "e2", "text": "B", "bounds": {"x": 100.0, "y": 400.0, "w": 200.0, "h": 80.0}},
+            {"id": "e3", "text": "C"}]}), false)
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let s = c.see_text(&profile()).unwrap();
+    assert_eq!(s.elements[0].frac, Some([1000, 2000, 3000, 500]));
+    assert_eq!(s.elements[1].frac, Some([2500, 5000, 5000, 1000]));
+    assert_eq!(s.elements[2].frac, None);
+}
+
+fn tap_at_fake(dir: &std::path::Path, tap_reply: Value) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
+    raw_fake(dir, move |tool, _| match tool {
+        "list_windows" => text_result(json!({"windows": [{"window_id": 11, "app": "Mail"}, {"window_id": 7281, "app": "iPhone Mirroring"}]}), false),
+        _ => tap_reply.clone(),
+    })
+}
+
+#[test]
+fn tap_at_sends_the_window_id_the_position_and_the_avoid_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"at": {"x_bp": 1800, "y_bp": 6000}, "kind": "no_text", "text": ""}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let avoid = [Region { x_bp: 7800, y_bp: 0, w_bp: 2200, h_bp: 2000 }];
+    let t = c.tap_at(&profile(), 1800, 6000, &avoid).unwrap();
+    assert_eq!((t.kind.as_str(), t.text.as_str()), ("no_text", ""));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].0, "list_windows");
+    assert_eq!(calls[1].0, "tap_at");
+    let a = &calls[1].1;
+    assert_eq!(a["window"], json!({"window_id": 7281}));
+    assert_eq!((a["x_bp"].as_u64(), a["y_bp"].as_u64()), (Some(1800), Some(6000)));
+    assert_eq!(a["avoid"], json!([{"x_bp": 7800, "y_bp": 0, "w_bp": 2200, "h_bp": 2000}]));
+}
+
+#[test]
+fn tap_at_truncates_the_avoid_list_to_16() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "text", "text": "x"}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let avoid = vec![Region { x_bp: 1, y_bp: 2, w_bp: 3, h_bp: 4 }; 20];
+    c.tap_at(&profile(), 5, 6, &avoid).unwrap();
+    assert_eq!(calls.lock().unwrap()[1].1["avoid"].as_array().unwrap().len(), 16);
+}
+
+#[test]
+fn tap_at_unknown_tool_is_remembered_and_never_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"error": {"code": "bad_request", "message": "unknown tool: tap_at"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "unsupported");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "unsupported");
+    let n = calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count();
+    assert_eq!(n, 1, "第二次不该再发");
+}
+
+#[test]
+fn tap_at_not_allowed_is_passed_through_and_not_remembered_as_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"error": {"code": "not_allowed", "message": "落点在不点区域"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "not_allowed");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "not_allowed");
+    assert_eq!(calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count(), 2);
+}
+
+#[test]
+fn tap_at_without_a_matching_window_is_window_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = raw_fake(dir.path(), |_, _| text_result(json!({"windows": [{"window_id": 11, "app": "Mail"}]}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[]).unwrap_err().code, "window_not_found");
+    assert!(calls.lock().unwrap().iter().all(|(t, _)| t != "tap_at"));
 }

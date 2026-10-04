@@ -64,6 +64,25 @@ pub enum SwipeOutcome {
     Settled(SwipeSettle),
 }
 
+/// 窗口里的一块（万分比），不点的区域。dct-game 自己的，不依赖 dct-brain。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub x_bp: u16,
+    pub y_bp: u16,
+    pub w_bp: u16,
+    pub h_bp: u16,
+}
+
+/// 一次按位置点（`tap_at`）的结果：落点下 dco 看到的是 `no_text` 还是 `text`，以及那条字。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapAt {
+    pub kind: String,
+    pub text: String,
+}
+
+/// `tap_at` 一次最多带几块「不点」的区域；多了截断。
+pub const TAP_AT_MAX_AVOID: usize = 16;
+
 fn unsupported() -> DcoError {
     DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
 }
@@ -132,6 +151,14 @@ pub trait Dco {
     }
     /// 点 `see_text` 读到的某个元素。dco 自己按那个元素上的字定档，带价格的会拒绝。
     fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
+        Err(unsupported())
+    }
+    /// 取当前窗口的截图（PNG 字节）。调用方必须先用 `see_text` 确认这是游戏画面：私人画面 dco 本来就不给图。
+    fn capture(&mut self, _p: &Profile) -> Result<Vec<u8>, DcoError> {
+        Err(unsupported())
+    }
+    /// 按窗口里的位置（万分比）点一下；`avoid` 里的区域 dco 会拒点。默认不支持（旧 dco 没有 `tap_at`）。
+    fn tap_at(&mut self, _p: &Profile, _x_bp: u16, _y_bp: u16, _avoid: &[Region]) -> Result<TapAt, DcoError> {
         Err(unsupported())
     }
     /// 告诉 dco 屏幕上的小章鱼现在在“想”还是“看”。只改它的样子，所以故意不返回错误：

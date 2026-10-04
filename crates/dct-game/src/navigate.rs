@@ -348,7 +348,7 @@ mod tests {
             Ok(Seen {
                 snapshot_id: format!("s{}", self.at),
                 observation_id: Some(format!("obs-{}", self.at)),
-                elements: texts.iter().enumerate().map(|(i, t)| Element { id: format!("e{}", i + 1), text: t.to_string() }).collect(),
+                elements: texts.iter().enumerate().map(|(i, t)| Element { id: format!("e{}", i + 1), text: t.to_string() , frac: None }).collect(),
             })
         }
         fn tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError> {

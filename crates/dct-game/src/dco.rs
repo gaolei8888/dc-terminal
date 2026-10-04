@@ -1,7 +1,7 @@
 //! 连本机 dco：unix socket 上的 MCP（一行一条 JSON-RPC）。握手跟 dco 自己的 `dco call` 一样：
 //! 先写 `{"dco_token": "<~/.dco/token>"}`，读到 `{"ok":true}`，再 initialize → notifications/initialized → tools/call。
 use crate::board::GridRead;
-use crate::play::{Dco, DcoError, Profile, Seen, SwipeOutcome, SwipeSettle, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS};
+use crate::play::{Dco, DcoError, Profile, Region, Seen, SwipeOutcome, SwipeSettle, TapAt, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS, TAP_AT_MAX_AVOID};
 use crate::screen::Element;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -29,10 +29,30 @@ pub struct DcoClient {
     /// 这台 dco 不认 swipe 的 `settle` 参数（回复里没有 `settle`）：这条连接上不再带，免得每步白发。
     /// 注意只有「回复里压根没有 settle」才置位；等待出错、报告读不懂都不算。
     no_swipe_settle: bool,
+    /// 这台 dco 没有 tap_at（旧版）：这条连接上不再发，直接说「不会」。
+    no_tap_at: bool,
     /// 带 settle 的 swipe 等回复的时长：要比 dco 自己最多等的 `SETTLE_TIMEOUT_MS` 还长，否则会把还在等的划动当成失败。
     pub(crate) settle_call_timeout: Duration,
     /// 一次请求等回复的总时长；跳过别的回复也算在里面。
     timeout: Duration,
+}
+
+fn unsupported_tap_at() -> DcoError {
+    err("unsupported", "这个 dco 还不会按位置点")
+}
+
+fn bp(v: f64) -> u16 {
+    (v * 10000.0).round().clamp(0.0, 10000.0) as u16
+}
+
+/// 元素在窗口里的位置（万分比）：优先用 dco 给的 `frac`（0～1），否则用 `bounds` 除以窗口大小。
+fn frac_of(e: &Value, size: &Value) -> Option<[u16; 4]> {
+    if let Some(f) = e.get("frac").filter(|f| f.is_object()) {
+        return Some([bp(f["x"].as_f64()?), bp(f["y"].as_f64()?), bp(f["w"].as_f64()?), bp(f["h"].as_f64()?)]);
+    }
+    let b = e.get("bounds").filter(|b| b.is_object())?;
+    let (w, h) = (size["w"].as_f64().filter(|w| *w > 0.0)?, size["h"].as_f64().filter(|h| *h > 0.0)?);
+    Some([bp(b["x"].as_f64()? / w), bp(b["y"].as_f64()? / h), bp(b["w"].as_f64()? / w), bp(b["h"].as_f64()? / h)])
 }
 
 fn err(code: &str, message: impl Into<String>) -> DcoError {
@@ -70,7 +90,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, unsupported_states: HashSet::new(), no_see_text: false, no_swipe_settle: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, unsupported_states: HashSet::new(), no_see_text: false, no_swipe_settle: false, no_tap_at: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -129,6 +149,11 @@ impl DcoClient {
 
     /// 调一个工具，返回它文字部分里的 JSON。工具报错时错误码取 dco 给的 `error.code`。
     pub fn call(&mut self, tool: &str, args: Value) -> Result<Value, DcoError> {
+        self.call_full(tool, args).map(|(body, _)| body)
+    }
+
+    /// 同 `call`，另外把整个 `content` 数组也交回来（图片在里面，`call` 只看第一项文字）。
+    fn call_full(&mut self, tool: &str, args: Value) -> Result<(Value, Vec<Value>), DcoError> {
         let result = self.request("tools/call", json!({ "name": tool, "arguments": args }))?;
         let text = result["content"][0]["text"].as_str().unwrap_or("{}");
         let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
@@ -136,7 +161,7 @@ impl DcoClient {
             let e = &body["error"];
             return Err(err(e["code"].as_str().unwrap_or("dco_error"), e["message"].as_str().unwrap_or(text)));
         }
-        Ok(body)
+        Ok((body, result["content"].as_array().cloned().unwrap_or_default()))
     }
 }
 
@@ -230,7 +255,7 @@ impl Dco for DcoClient {
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|e| Some(Element { id: e["id"].as_str()?.to_string(), text: e["text"].as_str().unwrap_or("").to_string() }))
+                    .filter_map(|e| Some(Element { id: e["id"].as_str()?.to_string(), text: e["text"].as_str().unwrap_or("").to_string(), frac: frac_of(e, &body["window"]["size"]) }))
                     .collect()
             })
             .unwrap_or_default();
@@ -264,6 +289,47 @@ impl Dco for DcoClient {
             } else if e.code == "bad_request" {
                 self.unsupported_states.insert(state.to_string());
             }
+        }
+    }
+
+    fn capture(&mut self, p: &Profile) -> Result<Vec<u8>, DcoError> {
+        use base64::Engine;
+        let (_, content) = self.call_full("see", json!({ "window": p.window, "source": "ocr", "include_image": true }))?;
+        let data = content
+            .iter()
+            .find(|c| c["type"] == "image")
+            .and_then(|c| c["data"].as_str())
+            .ok_or_else(|| err("no_image", "dco 没有给截图"))?;
+        base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| err("no_image", "dco 给的截图读不懂"))
+    }
+
+    fn tap_at(&mut self, p: &Profile, x_bp: u16, y_bp: u16, avoid: &[Region]) -> Result<TapAt, DcoError> {
+        if self.no_tap_at {
+            return Err(unsupported_tap_at());
+        }
+        let app = p.window["app"].as_str().unwrap_or("");
+        let windows = self.call("list_windows", json!({}))?;
+        let window_id = windows["windows"]
+            .as_array()
+            .and_then(|a| a.iter().find(|w| w["app"].as_str() == Some(app)))
+            .map(|w| w["window_id"].clone())
+            .filter(|id| !id.is_null())
+            .ok_or_else(|| err("window_not_found", "找不到要点的窗口"))?;
+        let avoid: Vec<Value> = avoid
+            .iter()
+            .take(TAP_AT_MAX_AVOID)
+            .map(|r| json!({ "x_bp": r.x_bp, "y_bp": r.y_bp, "w_bp": r.w_bp, "h_bp": r.h_bp }))
+            .collect();
+        match self.call("tap_at", json!({ "window": { "window_id": window_id }, "x_bp": x_bp, "y_bp": y_bp, "avoid": avoid })) {
+            Ok(b) => Ok(TapAt {
+                kind: b["tapped"]["kind"].as_str().unwrap_or("").to_string(),
+                text: b["tapped"]["text"].as_str().unwrap_or("").to_string(),
+            }),
+            Err(e) if e.code == "dco_too_old" || (e.code == "bad_request" && e.message.contains("unknown tool")) => {
+                self.no_tap_at = true;
+                Err(unsupported_tap_at())
+            }
+            Err(e) => Err(e),
         }
     }
 

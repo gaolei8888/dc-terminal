@@ -5,6 +5,8 @@
 pub struct Element {
     pub id: String,
     pub text: String,
+    /// 在窗口里的位置（左、上、宽、高），万分比；dco 没给就是 None。
+    pub frac: Option<[u16; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,7 +119,7 @@ mod tests {
     use super::*;
 
     fn els(texts: &[&str]) -> Vec<Element> {
-        texts.iter().enumerate().map(|(i, t)| Element { id: format!("e{}", i + 1), text: t.to_string() }).collect()
+        texts.iter().enumerate().map(|(i, t)| Element { id: format!("e{}", i + 1), text: t.to_string() , frac: None }).collect()
     }
 
     fn id(s: &Screen) -> &str {

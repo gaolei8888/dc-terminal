@@ -109,7 +109,7 @@ mod tests {
                 Some(t) => Ok(Seen {
                     snapshot_id: "s".into(),
                     observation_id: None,
-                    elements: t.iter().enumerate().map(|(i, s)| Element { id: format!("e{i}"), text: (*s).into() }).collect(),
+                    elements: t.iter().enumerate().map(|(i, s)| Element { id: format!("e{i}"), text: (*s).into() , frac: None }).collect(),
                 }),
                 None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
             }
