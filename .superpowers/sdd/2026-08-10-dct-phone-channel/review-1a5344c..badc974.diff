@@ -1,0 +1,1016 @@
+# Review package: 1a5344c..badc974
+
+## Commits
+badc974 refactor: settings is a list of settings, not a list of languages
+
+## Files changed
+ src/i18n.rs             |   8 +-
+ src/ui/mod.rs           |  54 ++++++--
+ src/ui/pick.rs          |   1 +
+ src/ui/settings_view.rs | 343 ++++++++++++++++++++++++++++++++++++++++++------
+ src/ui/view.rs          | 105 ++++++++++++++-
+ 5 files changed, 457 insertions(+), 54 deletions(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 77a9b50..7cc2c01 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -141,20 +141,24 @@ pub enum Key {
+     /// （`F4 复制` / `F4 copy`），不是那条状态提示本身，命名和用途都不能跟
+     /// 它们混：`CopyMode`/`CopyModeShort` 是「已经在复制模式里」时顶掉整条
+     /// 右段的话，这一条是「还没进去、告诉你按哪个键能进去」。
+     EnterCopyMode,
+     OtherKeysGoToAgent,
+     BackToListWord,
+     BackToSettingsWord,
+     OrPressDigit,
+     TypeToFilter,
+     Language,
++    /// 设置页第二项的名字：手机通知开关那一页的入口。跟 `Language` 挨着
++    /// 放是因为它们现在是同一层列表里的兄弟项——`Language` 是真管用的
++    /// 那个，这个要等 Task 4 才接线，但列表里的位置已经在这个任务定下来。
++    Phone,
+     // —— 全部按键浮层 ——
+     /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
+     /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
+     /// 就是「后面还有」的通用说法。
+     MoreKeys,
+     AllKeys,
+     KeysGroupMove,
+     KeysGroupSession,
+     KeysGroupConfig,
+     // —— 逃生键 ——
+@@ -328,20 +332,21 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
+         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
+         OtherKeysGoToAgent => t!(
+             lang,
+             en: "every other key goes to the agent",
+             zh: "其余按键都发给 agent",
+         ),
+         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
+         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
+         Language => t!(lang, en: "language", zh: "语言"),
++        Phone => t!(lang, en: "phone", zh: "手机通知"),
+ 
+         MoreKeys => t!(lang, en: "…", zh: "…"),
+         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
+         KeysGroupMove => t!(lang, en: "Move", zh: "走动"),
+         KeysGroupSession => t!(lang, en: "Sessions", zh: "会话"),
+         KeysGroupConfig => t!(lang, en: "Settings", zh: "设置"),
+ 
+         BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
+         BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
+         BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
+@@ -1269,20 +1274,21 @@ mod tests {
+             InterruptAgent,
+             EmptyReplyIsEnter,
+             NextSession,
+             EnterCopyMode,
+             OtherKeysGoToAgent,
+             BackToListWord,
+             BackToSettingsWord,
+             OrPressDigit,
+             TypeToFilter,
+             Language,
++            Phone,
+             BackToBoard,
+             BackToBoardWithF2,
+             BackToList,
+             BackToSettings,
+             BoardTitle,
+             Disconnected,
+             PickAgentTitle,
+             PickProjectTitle,
+             TypePathTitle,
+             SettingsTitle,
+@@ -1367,21 +1373,21 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 100, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 101, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
+     /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
+     /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
+     /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 4874504..0c3c58b 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -29,21 +29,21 @@ mod board;
+ mod grid;
+ mod keys;
+ mod pick;
+ mod secret;
+ mod settings_view;
+ 
+ mod view;
+ use view::SecretPhase;
+ use view::{
+     back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
+-    session_ended_notice, View,
++    session_ended_notice, SettingsItem, View,
+ };
+ pub use view::{
+     clean_secret, decide_delete_key, digit_index, pick_action, quick_start_target, secret_rows,
+     verify_message, verify_outcome_applies_to, PickAction, ViewMode,
+ };
+ 
+ /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
+ ///
+ /// 用全局而不是给 `DrawInput` 之类的渲染入参加字段：主题是进程级配置，
+ /// 启动后不变，塞进每帧的入参是把一个常量伪装成状态；而渲染函数散在
+@@ -1427,31 +1427,40 @@ pub(crate) fn home_view(app: &App) -> View {
+         // 由 `sync_board_cursor_from_grid` 的守卫收尾。
+         ViewMode::Grid => View::grid(
+             app.selected_session()
+                 .and_then(|s| app.grid_sessions().iter().position(|g| g.id == s.id))
+                 .or_else(|| grid::first_tile_of_current_group(app))
+                 .unwrap_or(0),
+         ),
+     }
+ }
+ 
+-/// `l` 键：打开设置页，光标预先落在当前语言上——用户进来第一眼要看到
+-/// 「现在是哪个」，而不是从头找。
++/// `l` 键：打开设置页，光标落在「语言」这一项上——它是设置页里今天唯一
++/// 真管用的一项（手机通知要等 Task 4 才接线），日常路径压成零步找。
++///
++/// **以前这里把光标预选到「当前语言在 `Lang::all()` 里的下标」**，那时候
++/// 整页就是语言列表，这样做直接就对了。现在顶层列表映射的是
++/// `SettingsItem`，一个跟语言数量没有任何关系的枚举——继续用语言下标去
++/// 选它是错的：选了不是 `Lang::all()` 第一个的语言的用户，进设置页时
++/// 光标会落在别的设置项上，而不是「语言」。今天两个枚举碰巧都是两项，
++/// 这个错误甚至不会越界 panic，只会把光标悄悄放错行——最隐蔽的那种 bug。
++/// 「进来第一眼看到现在是哪个」这份意图没有丢，它挪到了
++/// `settings_view::handle_key` 里选中「语言」按 Enter 的那一刻，只有
++/// 那时候「现在是哪个语言」才是一个有意义的问题。
+ pub(crate) fn open_settings(app: &mut App) {
+     let mut state = ListState::default();
+-    state.select(Some(
+-        crate::i18n::Lang::all()
++    state.select(
++        SettingsItem::all()
+             .iter()
+-            .position(|l| *l == app.lang)
+-            .unwrap_or(0),
+-    ));
+-    app.view = View::Settings { state };
++            .position(|i| *i == SettingsItem::Language),
++    );
++    app.view = View::Settings { state, lang: None };
+ }
+ 
+ /// 光标移动的通用版本：只认列表长度，不认列表里装的是什么。
+ /// 项目选择器和会话看板共用它。
+ fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
+     if len == 0 {
+         st.select(None);
+         return;
+     }
+     let cur = st.selected().unwrap_or(0) as i32;
+@@ -2216,20 +2225,46 @@ mod tests {
+         for d in profiles_to_fetch(&app) {
+             app.profiles_asked.insert(d);
+         }
+ 
+         assert!(
+             profiles_to_fetch(&app).is_empty(),
+             "问过就不再问，哪怕答案是「没有」"
+         );
+     }
+ 
++    /// `l` 键要把光标落在「语言」这一项上，**不管用户现在用的是哪种
++    /// 语言**。以前光标预选靠的是「当前语言在 `Lang::all()` 里的下标」，
++    /// 那个下标现在指的是别的东西（`SettingsItem::all()` 的下标）——
++    /// 选中文（`Lang::all()` 下标 1）的用户如果还吃这条老逻辑，光标会
++    /// 落在「手机通知」上而不是「语言」，这条测试专门盯这件事。
++    #[test]
++    fn opening_settings_always_selects_language_regardless_of_current_lang() {
++        for lang in crate::i18n::Lang::all() {
++            let (mut app, _d) = App::test_app();
++            app.lang = *lang;
++
++            open_settings(&mut app);
++
++            match &app.view {
++                View::Settings { state, lang: None } => {
++                    assert_eq!(
++                        state.selected().and_then(SettingsItem::at),
++                        Some(SettingsItem::Language),
++                        "语言是 {lang:?} 时,`l` 也该落在「语言」这一项上"
++                    );
++                }
++                _ => panic!("open_settings 应该产出顶层的 View::Settings"),
++            }
++        }
++    }
++
+     /// 已经知道答案的组也不再问。
+     #[test]
+     fn a_project_whose_agent_is_already_known_is_not_asked_again() {
+         let (mut app, _d) = App::test_app();
+         app.set_sessions(vec![sess_at(1, "/w/a")]);
+         let d = app.groups[0].dir.display().to_string();
+         app.profiles.insert(d, "codex".into());
+ 
+         assert!(profiles_to_fetch(&app).is_empty());
+     }
+@@ -3537,20 +3572,21 @@ mod tests {
+                 typing_path: Some(String::new()),
+                 ..crate::ui::view::ProjectPicker::new(Vec::new(), std::path::PathBuf::from("/tmp"))
+             }),
+             View::Secrets {
+                 entries: Vec::new(),
+                 state: ListState::default(),
+                 pending_delete: None,
+             },
+             View::Settings {
+                 state: ListState::default(),
++                lang: None,
+             },
+             View::Keys {
+                 from: Box::new(View::Board),
+             },
+             // 填密钥有两条退路（回设置页 / 回选择器），两条文案都要量
+             View::EnterSecret {
+                 profile: String::new(),
+                 label: String::new(),
+                 prompt: crate::proto::SecretPrompt {
+                     hint: String::new(),
+diff --git a/src/ui/pick.rs b/src/ui/pick.rs
+index 12cba6c..386b484 100644
+--- a/src/ui/pick.rs
++++ b/src/ui/pick.rs
+@@ -1355,20 +1355,21 @@ mod tests {
+     /// 它挂在第一次 `List` **成功**之后。守护进程慢上几轮的话，用户完全
+     /// 可能已经按 `N` 开了选择器、按 `l` 进了设置页——这时候把他甩回看板，
+     /// 是一次他没有按过任何键的视图切换。今天走不到只是因为第一轮几乎
+     /// 总是一次就成，那是运气不是设计。
+     #[test]
+     fn seeding_never_yanks_the_user_out_of_a_screen_they_opened() {
+         let (mut app, _d) = App::test_app();
+         app.set_sessions(vec![]);
+         app.view = View::Settings {
+             state: ListState::default(),
++            lang: None,
+         };
+ 
+         super::super::seed_start_project(&mut app);
+ 
+         assert!(
+             matches!(app.view, View::Settings { .. }),
+             "用户开的设置页必须还在"
+         );
+         assert_eq!(app.groups.len(), 1, "补位本身照做");
+     }
+diff --git a/src/ui/settings_view.rs b/src/ui/settings_view.rs
+index 023af06..6828158 100644
+--- a/src/ui/settings_view.rs
++++ b/src/ui/settings_view.rs
+@@ -1,131 +1,269 @@
+-//! 设置页：目前只有语言一项。看板按 `l` 进。
++//! 设置页：设置项列表，看板按 `l` 进。今天两项——语言（真管用）、
++//! 手机通知（Task 4 才接线，这里先占个位置，见 `handle_key` 里 `Phone`
++//! 分支的注释）。
+ //!
+ //! 跟 `secret.rs` 的密钥页分开是两码事——那边管「哪个 agent 用哪把密钥」，
+ //! 这里管界面本身怎么显示。
++//!
++//! **这一页原来就是语言列表**，`ListState` 的下标直接映射 `Lang::all()`。
++//! 加了第二项之后光标含义分成了两层：`View::Settings.state` 走顶层
++//! `SettingsItem::all()`，选中「语言」才会开出 `lang` 那个子列表、下标
++//! 才改映射 `Lang::all()`。层级语义全记在 `View::Settings.lang` 是
++//! `Some` 还是 `None` 上，见它自己的字段注释。
+ 
+ use anyhow::Result;
+ use crossterm::event::{KeyCode, KeyEvent};
+ use ratatui::prelude::*;
+-use ratatui::widgets::{Block, Borders, List, ListItem};
++use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+ 
+ use crate::i18n::{text, Key, Lang};
+ use crate::settings::{save_lang, settings_path_for_socket};
+ 
+ use super::app::App;
+-use super::view::View;
++use super::view::{SettingsItem, View};
+ use super::widgets::Msg;
+ use super::{dim, move_sel_n};
+ 
+ /// **这个函数里永远不要 `continue`。** 理由同 `board.rs`：循环末尾还有一段
+ /// 清理陈旧 `message` 的逻辑，跳过它会让一句普通反馈盖掉屏幕上唯一的出路。
+ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+-    let View::Settings { mut state } = app.view.clone() else {
++    let View::Settings { state, lang } = app.view.clone() else {
+         return Ok(());
+     };
++
++    if let Some(ls) = lang {
++        handle_language_list(app, key, state, ls);
++        return Ok(());
++    }
++
+     match key.code {
+         KeyCode::Esc => app.view = super::home_view(app),
+         KeyCode::Down | KeyCode::Up => {
++            let mut state = state;
+             let d = if key.code == KeyCode::Down { 1 } else { -1 };
+-            move_sel_n(&mut state, Lang::all().len(), d);
+-            app.view = View::Settings { state };
++            move_sel_n(&mut state, SettingsItem::all().len(), d);
++            app.view = View::Settings { state, lang: None };
++        }
++        KeyCode::Enter => match state.selected().and_then(SettingsItem::at) {
++            Some(SettingsItem::Language) => {
++                // 进语言子列表：光标预选到当前语言。这条意图以前长在
++                // `open_settings`（一开设置页就见得到「现在是哪个」）——
++                // 顶层列表现在装的是设置项，语言下标对它没有意义了，
++                // 意图本身没丢，只是挪到了这一步，真正该问「现在是哪个
++                // 语言」的地方。
++                let mut ls = ListState::default();
++                ls.select(Lang::all().iter().position(|l| *l == app.lang));
++                app.view = View::Settings {
++                    state,
++                    lang: Some(ls),
++                };
++            }
++            Some(SettingsItem::Phone) => {
++                // TODO(task-4, dct-phone-channel): 手机通知页还没接线
++                // （`View::Phone` 是 Task 4 的产物）。Task 3 是纯 UI
++                // 重构、不掺任何手机通知逻辑，这一支特意留成空操作——
++                // 光标停在原地，什么都不发生。Task 4 把这一支换成
++                // `app.view = View::Phone { .. }` 就是它要接的线。
++                app.view = View::Settings { state, lang: None };
++            }
++            // 下标越界（比如列表变短后光标停在旧位置）：什么都不做，
++            // 比默默选中第一项更诚实——见 `SettingsItem::at` 的文档。
++            None => app.view = View::Settings { state, lang: None },
++        },
++        _ => app.view = View::Settings { state, lang: None },
++    }
++    Ok(())
++}
++
++/// 语言子列表的按键——**这就是改结构之前的整页逻辑**，原样搬过来，只是
++/// 从「唯一一层」变成了「深入之后的这一层」。
++fn handle_language_list(app: &mut App, key: KeyEvent, top: ListState, mut ls: ListState) {
++    match key.code {
++        // 退一层回顶层设置项列表，不是回看板——Ctrl+Q 见
++        // `view::back_one_level` 里对应的那一条，两边必须一致，不然
++        // 同一屏里两个逃生键说的不是同一件事。
++        KeyCode::Esc => {
++            app.view = View::Settings {
++                state: top,
++                lang: None,
++            }
++        }
++        KeyCode::Down | KeyCode::Up => {
++            let d = if key.code == KeyCode::Down { 1 } else { -1 };
++            move_sel_n(&mut ls, Lang::all().len(), d);
++            app.view = View::Settings {
++                state: top,
++                lang: Some(ls),
++            };
+         }
+         KeyCode::Enter => {
+-            let chosen = state.selected().and_then(|i| Lang::all().get(i)).copied();
+-            if let Some(lang) = chosen {
+-                app.lang = lang;
++            let chosen = ls.selected().and_then(|i| Lang::all().get(i)).copied();
++            if let Some(l) = chosen {
++                app.lang = l;
+                 // 立刻写盘。不写的话用户下次开 dct 发现语言变回去了，
+                 // 而他明明记得自己选过——这正是 `save_lang` 返回 `Result`
+                 // 而不是像「最近项目」那样吞掉错误的理由。
+                 let path = settings_path_for_socket(&app.socket);
+-                match save_lang(&path, lang) {
++                match save_lang(&path, l) {
+                     // 语言已经切了，这句反馈用的就是新语言——用户按下 Enter
+                     // 之后第一眼看到的就是切换生效的证据。
+-                    Ok(()) => app.message = text(Key::SettingsTitle, lang).into(),
++                    Ok(()) => app.message = text(Key::SettingsTitle, l).into(),
+                     Err(e) => app.message = Msg::err(format!("{e}")),
+                 }
+             }
+             app.view = super::home_view(app);
+         }
+-        _ => app.view = View::Settings { state },
++        _ => {
++            app.view = View::Settings {
++                state: top,
++                lang: Some(ls),
++            }
++        }
+     }
+-    Ok(())
+ }
+ 
+ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+-    let View::Settings { state } = &app.view else {
++    let View::Settings { state, lang } = &app.view else {
+         return;
+     };
+-    let items: Vec<ListItem> = Lang::all()
++
++    let border_style = if app.connected {
++        Style::default()
++    } else {
++        Style::default().fg(Color::Red)
++    };
++
++    if let Some(ls) = lang {
++        // 语言子列表：画法跟改结构之前的整页一模一样——各语言用自己的
++        // 语言写，当前项打勾。误切到看不懂的语言之后，这个符号是跨语言
++        // 都认得的线索，这条道理没有因为多了一层而改变。
++        let items: Vec<ListItem> = Lang::all()
++            .iter()
++            .map(|l| {
++                let mark = if *l == app.lang { "✓ " } else { "  " };
++                let style = if *l == app.lang {
++                    Style::default()
++                } else {
++                    dim()
++                };
++                ListItem::new(Line::from(vec![
++                    Span::styled(mark, style),
++                    Span::styled(l.native_name(), style),
++                ]))
++            })
++            .collect();
++        let mut s = ls.clone();
++        f.render_stateful_widget(
++            List::new(items)
++                .block(
++                    Block::default()
++                        .borders(Borders::ALL)
++                        .title(format!(
++                            "{} · {}",
++                            text(Key::SettingsTitle, app.lang),
++                            text(Key::Language, app.lang)
++                        ))
++                        .border_style(border_style),
++                )
++                .highlight_symbol("▶ "),
++            area,
++            &mut s,
++        );
++        return;
++    }
++
++    let items: Vec<ListItem> = SettingsItem::all()
+         .iter()
+-        .map(|l| {
+-            // 每种语言用它自己的语言写。当前这一项用 `✓` 标出来——
+-            // 误切到看不懂的语言之后，这个符号是跨语言都认得的线索。
+-            let mark = if *l == app.lang { "✓ " } else { "  " };
+-            let style = if *l == app.lang {
+-                Style::default()
+-            } else {
+-                dim()
++        .map(|item| {
++            let label = match item {
++                SettingsItem::Language => text(Key::Language, app.lang),
++                SettingsItem::Phone => text(Key::Phone, app.lang),
+             };
+-            ListItem::new(Line::from(vec![
+-                Span::styled(mark, style),
+-                Span::styled(l.native_name(), style),
+-            ]))
++            ListItem::new(Line::from(Span::raw(label)))
+         })
+         .collect();
+ 
+     let mut s = state.clone();
+     f.render_stateful_widget(
+         List::new(items)
+             .block(
+                 Block::default()
+                     .borders(Borders::ALL)
+-                    .title(format!(
+-                        "{} · {}",
+-                        text(Key::SettingsTitle, app.lang),
+-                        text(Key::Language, app.lang)
+-                    ))
+-                    .border_style(if app.connected {
+-                        Style::default()
+-                    } else {
+-                        Style::default().fg(Color::Red)
+-                    }),
++                    .title(text(Key::SettingsTitle, app.lang))
++                    .border_style(border_style),
+             )
+             .highlight_symbol("▶ "),
+         area,
+         &mut s,
+     );
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crossterm::event::KeyModifiers;
+-    use ratatui::widgets::ListState;
+ 
+     fn key(code: KeyCode) -> KeyEvent {
+         KeyEvent::new(code, KeyModifiers::NONE)
+     }
+ 
++    /// 光标停在顶层设置项列表的第 `selected` 项上。
+     fn on_settings(app: &mut App, selected: usize) {
+         let mut st = ListState::default();
+         st.select(Some(selected));
+-        app.view = View::Settings { state: st };
++        app.view = View::Settings {
++            state: st,
++            lang: None,
++        };
++    }
++
++    /// 光标已经深入语言子列表，停在第 `selected` 种语言上——测「选中语言
++    /// 按 Enter 怎么样」不需要先测「顶层怎么钻进去」，两件事分开测，一个
++    /// 出错时另一个不会跟着一起红。
++    fn on_language_list(app: &mut App, selected: usize) {
++        let mut ls = ListState::default();
++        ls.select(Some(selected));
++        app.view = View::Settings {
++            state: ListState::default(),
++            lang: Some(ls),
++        };
++    }
++
++    /// 改结构之前，下标直接映射 Lang::all()。改完之后映射设置项。
++    /// **这条是回归测试**：语言仍然切得动比手机通知能用更重要。
++    #[test]
++    fn the_first_item_is_language() {
++        assert_eq!(SettingsItem::all()[0], SettingsItem::Language);
++    }
++
++    #[test]
++    fn phone_is_a_settings_item_too() {
++        assert!(SettingsItem::all().contains(&SettingsItem::Phone));
++    }
++
++    /// 下标越界不能 panic——`ListState` 的选中项在列表变短时会留在旧位置。
++    #[test]
++    fn an_out_of_range_index_selects_nothing() {
++        assert_eq!(SettingsItem::at(99), None);
++        assert_eq!(SettingsItem::at(0), Some(SettingsItem::Language));
+     }
+ 
+     /// 选中一种语言按 Enter：界面语言当场就变，并且落盘——下次开 dct 还是它。
++    /// 这是从改结构之前原样搬过来的回归测试，只是入口从「顶层」换成了
++    /// 「已经在语言子列表里」。
+     #[test]
+     fn choosing_a_language_applies_it_and_writes_it_to_disk() {
+         let (mut app, dir) = App::test_app();
+         app.lang = Lang::Zh;
+         let en_index = Lang::all().iter().position(|l| *l == Lang::En).unwrap();
+-        on_settings(&mut app, en_index);
++        on_language_list(&mut app, en_index);
+ 
+         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+ 
+         assert_eq!(app.lang, Lang::En, "界面语言要当场生效");
+         let saved = crate::settings::load_lang(&settings_path_for_socket(&app.socket));
+         assert_eq!(saved, Some(Lang::En), "必须落盘，否则下次开又变回去");
+         drop(dir);
+     }
+ 
+     /// Esc 不改任何东西。设置页最怕的就是「路过一下就把配置改了」。
+@@ -138,25 +276,111 @@ mod tests {
+         handle_key(&mut app, key(KeyCode::Esc)).unwrap();
+ 
+         assert_eq!(app.lang, Lang::Zh, "Esc 不该改语言");
+         assert!(matches!(app.view, View::Board));
+         assert!(
+             crate::settings::load_lang(&settings_path_for_socket(&app.socket)).is_none(),
+             "Esc 不该写盘"
+         );
+     }
+ 
++    /// 深入语言子列表之后 Esc 退一层回顶层设置项列表，不是直接回看板——
++    /// 这是这次重构本身引入的新台阶，得有测试钉住它，不然下一次改动会把
++    /// 它和顶层的 Esc 语义弄混，两个逃生键说的就不再是同一件事。
++    #[test]
++    fn escaping_the_language_list_goes_back_to_the_settings_list_not_the_board() {
++        let (mut app, _dir) = App::test_app();
++        on_language_list(&mut app, 0);
++
++        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
++
++        assert!(
++            matches!(app.view, View::Settings { lang: None, .. }),
++            "Esc 从语言子列表出来应该退回顶层设置项列表"
++        );
++    }
++
++    /// 顶层选中「语言」按 Enter 要能钻进语言子列表，并且光标预选在当前
++    /// 语言上——这份「进来第一眼看到现在是哪个」的意图以前长在
++    /// `open_settings` 里，这次重构把它挪到了这一步，得有测试接住，不然
++    /// 下一次改动会以为「预选当前项」只是巧合。
++    #[test]
++    fn entering_the_language_item_opens_the_list_preselected_on_the_current_language() {
++        let (mut app, _dir) = App::test_app();
++        app.lang = Lang::Zh;
++        let top = SettingsItem::all()
++            .iter()
++            .position(|i| *i == SettingsItem::Language)
++            .unwrap();
++        on_settings(&mut app, top);
++
++        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
++
++        match &app.view {
++            View::Settings { lang: Some(ls), .. } => {
++                let zh_index = Lang::all().iter().position(|l| *l == Lang::Zh).unwrap();
++                assert_eq!(ls.selected(), Some(zh_index), "要预选在当前语言上");
++            }
++            _ => panic!("选中「语言」按 Enter 应该钻进语言子列表"),
++        }
++    }
++
++    /// 顶层选中「手机通知」按 Enter：Task 4 才会给它接一个真视图，这里
++    /// 只保证不 panic、也不会误把用户带进语言子列表——占位归占位，行为
++    /// 不能是「什么都可能发生」。
++    #[test]
++    fn entering_the_phone_item_does_not_crash_or_open_the_language_list() {
++        let (mut app, _dir) = App::test_app();
++        let phone = SettingsItem::all()
++            .iter()
++            .position(|i| *i == SettingsItem::Phone)
++            .unwrap();
++        on_settings(&mut app, phone);
++
++        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
++
++        assert!(
++            matches!(app.view, View::Settings { lang: None, .. }),
++            "手机通知还没接线，Enter 不该把光标带进语言子列表或崩掉"
++        );
++    }
++
++    /// 方向键要能从「语言」走到「手机通知」。`move_sel_n` 的长度参数如果
++    /// 悄悄改回 `Lang::all().len()`，今天两份长度数值上都是 2，看不出
++    /// 差别——这条测试不问长度参数从哪儿来，只问「按下去到没到」，是这份
++    /// 数值巧合之外唯一还能钉住这条移动的测试（见任务报告的变异测试表）。
++    #[test]
++    fn pressing_down_from_language_selects_phone() {
++        let (mut app, _dir) = App::test_app();
++        on_settings(&mut app, 0);
++
++        handle_key(&mut app, key(KeyCode::Down)).unwrap();
++
++        match &app.view {
++            View::Settings {
++                state, lang: None, ..
++            } => {
++                assert_eq!(
++                    state.selected().and_then(SettingsItem::at),
++                    Some(SettingsItem::Phone),
++                    "↓ 应该能从语言走到手机通知"
++                );
++            }
++            _ => panic!("方向键应该还在顶层设置项列表里"),
++        }
++    }
++
+     /// 语言列表用各自的语言写，光标能走遍每一行。
+     #[test]
+     fn every_language_is_listed_in_its_own_language() {
+         let (mut app, _dir) = App::test_app();
+-        on_settings(&mut app, 0);
++        on_language_list(&mut app, 0);
+         let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+         let buf = term.backend().buffer();
+         let a = buf.area;
+         let c: String = (0..a.height)
+             .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+             .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+             .collect::<String>()
+             // ratatui 画宽字符只写首格、第二格留空，不去掉空白的话
+             // 「中文」在缓冲里是「中 文」（见 mod.rs 里同类测试的注释）
+@@ -164,11 +388,48 @@ mod tests {
+             .filter(|c| !c.is_whitespace())
+             .collect();
+         for l in Lang::all() {
+             assert!(
+                 c.contains(l.native_name()),
+                 "{:?} 要用它自己的语言列出来：{c}",
+                 l
+             );
+         }
+     }
++
++    /// 顶层列表把两个设置项都列出来，各自用界面语言写——手机通知今天还是
++    /// 占位，但它已经是一个用户看得见、选得中的行，标签不能漏。
++    #[test]
++    fn the_top_level_list_shows_both_settings_items() {
++        let (mut app, _dir) = App::test_app();
++        on_settings(&mut app, 0);
++        let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++        let buf = term.backend().buffer();
++        let a = buf.area;
++        let c: String = (0..a.height)
++            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
++            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
++            .collect::<String>()
++            .chars()
++            .filter(|c| !c.is_whitespace())
++            .collect();
++        assert!(
++            c.contains(
++                &text(Key::Language, app.lang)
++                    .chars()
++                    .filter(|c| !c.is_whitespace())
++                    .collect::<String>()
++            ),
++            "顶层列表要列出「语言」：{c}"
++        );
++        assert!(
++            c.contains(
++                &text(Key::Phone, app.lang)
++                    .chars()
++                    .filter(|c| !c.is_whitespace())
++                    .collect::<String>()
++            ),
++            "顶层列表要列出「手机通知」：{c}"
++        );
++    }
+ }
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index 6f0f2d0..c1d2c74 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -105,24 +105,39 @@ pub(crate) enum View {
+         focus: usize,
+         reply: Option<Draft>,
+     },
+     PickProfile {
+         entries: Vec<ProfileEntry>,
+         state: ListState,
+         /// 密钥文件读不了、自定义 profile 写错了。顶部红字。
+         warning: Option<String>,
+     },
+     PickProject(ProjectPicker),
+-    /// 设置页：目前只有语言一项。跟 `Secrets` 分开是两码事——那边管的是
+-    /// 「哪个 agent 用哪把密钥」，这里管的是界面本身怎么显示。
++    /// 设置页：一份设置项列表（见 [`SettingsItem`]）。跟 `Secrets` 分开是
++    /// 两码事——那边管的是「哪个 agent 用哪把密钥」，这里管的是界面本身
++    /// 怎么显示（以及以后手机通知怎么接，见 `SettingsItem::Phone`）。
++    ///
++    /// **加进第二项之前这一页是纯语言列表**，`state` 的下标直接映射
++    /// `Lang::all()`；现在它映射 `SettingsItem::all()`，语言挪到了
++    /// `lang` 这一层。
+     Settings {
++        /// 顶层列表的光标，下标映射 `SettingsItem::all()`。
+         state: ListState,
++        /// 深入语言子列表时的光标，下标映射 `Lang::all()`；`None` 表示
++        /// 还停在顶层列表上。
++        ///
++        /// **这是唯一的层级标记**——`Enter`/`Esc`/`Ctrl+Q` 该认哪一层、
++        /// 该退到哪一层，全靠这个字段是 `Some` 还是 `None` 分辨（见
++        /// `settings_view::handle_key` 和 `back_one_level` 里对应的
++        /// 那一条）。不能另开一个「当前在哪层」的旗标——两者一旦不同步，
++        /// 就是一边退不出去一边退过了头。
++        lang: Option<ListState>,
+     },
+     EnterSecret {
+         /// agent 的内部名字（比如 "kimi"），存密钥、建会话都要靠它
+         profile: String,
+         /// 界面上给用户看的名字（比如 "Kimi"）——profile 是内部标识，不能直接出现在标题里
+         label: String,
+         /// daemon 给的填写提示：一句人话 + 可能有的申领页链接
+         prompt: SecretPrompt,
+         /// 用户正在打的密钥，明文只活在这一份里，渲染时永远转成圆点
+         buf: String,
+@@ -158,20 +173,40 @@ pub(crate) enum View {
+         /// 重新排列，下标会指错行，名字不会。
+         ///
+         /// 武装状态和「光标选中哪一行」必须永远同步——除了确认删除的第二次
+         /// `d` 本身，任何按键（包括 ↑↓）都要把这里清回 `None`，不然挪开
+         /// 光标之后按下的第二次 `d` 删的会是用户已经不记得自己武装过的
+         /// 那一行。
+         pending_delete: Option<String>,
+     },
+ }
+ 
++/// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
++/// 直接映射 `Lang::all()`；现在映射这个枚举，选中语言那一项才进语言列表。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum SettingsItem {
++    Language,
++    Phone,
++}
++
++impl SettingsItem {
++    pub(crate) fn all() -> &'static [SettingsItem] {
++        &[SettingsItem::Language, SettingsItem::Phone]
++    }
++
++    /// 越界返回 `None` 而不是兜底成第一项：`ListState` 的选中项可能停在
++    /// 一个已经不存在的位置，那时候什么都不做，比默默把用户带进语言页好。
++    pub(crate) fn at(i: usize) -> Option<SettingsItem> {
++        SettingsItem::all().get(i).copied()
++    }
++}
++
+ /// 填密钥这一屏正处在哪个阶段。`Verifying` 期间输入被冻结——buf 已经发给
+ /// 后台线程了，这时候改它不会影响正在飞的那次验证，只会让用户误以为
+ /// 下一次回车用的是新值。`Failed` 带着人话版的失败原因，渲染在圆点行下面。
+ #[derive(Clone)]
+ pub enum SecretPhase {
+     Typing,
+     Verifying,
+     Failed(String),
+ }
+ 
+@@ -238,22 +273,30 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
+             state: ListState::default(),
+             warning: None,
+         }),
+         // 九宫格跟列表是**平级**的两个模式，它自己就是顶层，退无可退——
+         // 跟 `View::Board` 一样返回 `None`。以前它落在下面那条兜底里，
+         // 于是 Ctrl+Q 成了 `g` 的隐藏同义词。
+         View::Grid { .. } => None,
+         // 浮层退的是**开门之前那一屏**，不是看板：从九宫格按 `?` 再退出来，
+         // 落回列表就等于用户按一下问号顺手换了个视图。
+         View::Keys { from } => Some(*from),
++        // 深入语言子列表时 Ctrl+Q 先退回顶层设置项列表，不能一步跳回看板
++        // ——不然同一屏里 Ctrl+Q 比 Esc 少退一步（Esc 见
++        // `settings_view::handle_key`），两个逃生键说的不是同一件事。
++        View::Settings {
++            state,
++            lang: Some(_),
++        } => Some(View::Settings { state, lang: None }),
+         // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
+-        // 退一层就是看板。
++        // 退一层就是看板。顶层的 `Settings { lang: None }` 也在这条兜底里
++        // ——它也只有一层，没被上面那条特例拦下的话就是回看板。
+         _ => Some(View::Board),
+     }
+ }
+ 
+ /// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥；
+ /// 没装但有安装命令的去装；没装又没法自动装的、或者缺别的 profile 依赖的，
+ /// 只能告诉用户一句话，不切视图。
+ #[derive(Debug)]
+ pub enum PickAction {
+     Start(String),
+@@ -984,20 +1027,25 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
+         View::Board => format!("q {}", text(Key::Quit, lang)),
+         View::PickProject(p) if p.typing_path.is_some() => text(Key::BackToList, lang).to_string(),
+         // 跟 back_one_level 保持一致：从密钥设置页进来的填密钥，退出回设置页，
+         // 不是选择器，也不是看板——三条路各回各的，文案不能含糊成一句话。
+         View::EnterSecret {
+             return_to_settings: true,
+             ..
+         } => text(Key::BackToSettings, lang).to_string(),
+         // 从选择器进来的填密钥，退出回的是选择器，不是看板
+         View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
++        // 深入语言子列表时退一层是回顶层设置项列表，不是回看板——跟
++        // `back_one_level` 里那条特例是同一件事的两半。复用
++        // `BackToSettings`（"Ctrl+Q 回设置"）：这个词条已经泛指「回到某个
++        // 设置页」，不专属密钥设置页，语言子列表要说的正是这句话。
++        View::Settings { lang: Some(_), .. } => text(Key::BackToSettings, lang).to_string(),
+         // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
+         // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
+         // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
+         // 框开着时左段写 Esc：这时候 `q` 只是个字母，写「q 退出」是假的。
+         View::Grid { reply: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
+         View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
+         // 全部按键浮层：`q` 在这里只是一张表上的一个字母，写「q 退出」是假的。
+         View::Keys { .. } => format!("Esc {}", text(Key::Back, lang)),
+         // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
+         // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
+@@ -1383,20 +1431,21 @@ mod tests {
+             },
+             View::PickProfile {
+                 entries: vec![entry("claude", ProfileStatus::Ready)],
+                 state: ListState::default(),
+                 warning: None,
+             },
+             View::PickProject(ProjectPicker::new(vec![], PathBuf::from("/"))),
+             View::PickProject(typing),
+             View::Settings {
+                 state: ListState::default(),
++                lang: None,
+             },
+             secret(false, SecretPhase::Typing),
+             secret(true, SecretPhase::Typing),
+             secret(false, SecretPhase::Verifying),
+             View::Keys {
+                 from: Box::new(View::Board),
+             },
+             View::Secrets {
+                 entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
+                 state: ListState::default(),
+@@ -2110,20 +2159,51 @@ mod tests {
+         assert!(matches!(
+             back_one_level(View::PickProfile {
+                 entries: vec![],
+                 state: ListState::default(),
+                 warning: None,
+             }),
+             Some(View::Board)
+         ));
+     }
+ 
++    /// Ctrl+Q 深入语言子列表时退一层回顶层设置项列表，不是一步跳回看板
++    /// ——这条特例是这次重构新加的，`escaping_the_language_list_...`（在
++    /// `settings_view` 里）测的是 Esc 那条路，这里补 Ctrl+Q 那条路，两个
++    /// 逃生键必须落在同一个地方。
++    #[test]
++    fn ctrl_q_from_the_language_list_goes_back_to_the_settings_list() {
++        let mut ls = ListState::default();
++        ls.select(Some(1));
++        let back = back_one_level(View::Settings {
++            state: ListState::default(),
++            lang: Some(ls),
++        });
++        assert!(
++            matches!(back, Some(View::Settings { lang: None, .. })),
++            "该退回顶层设置项列表，不是看板"
++        );
++    }
++
++    /// Ctrl+Q 停在顶层设置项列表上（没有深入语言子列表）时，跟改结构之前
++    /// 一样一步退回看板——这一层只有一层深,不该被上面那条新特例误伤。
++    #[test]
++    fn ctrl_q_from_the_top_level_settings_list_goes_to_the_board() {
++        assert!(matches!(
++            back_one_level(View::Settings {
++                state: ListState::default(),
++                lang: None,
++            }),
++            Some(View::Board)
++        ));
++    }
++
+     #[test]
+     fn secrets_view_escapes_to_the_board() {
+         assert!(matches!(
+             back_one_level(View::Secrets {
+                 entries: vec![],
+                 state: ListState::default(),
+                 pending_delete: None,
+             }),
+             Some(View::Board)
+         ));
+@@ -2276,20 +2356,39 @@ mod tests {
+                 },
+                 buf: String::new(),
+                 phase: SecretPhase::Typing,
+                 return_to_settings: true,
+             },
+             Lang::Zh,
+         );
+         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+     }
+ 
++    /// 深入语言子列表时逃生键要说「回设置」，不是顶层那句默认的
++    /// 「回看板」——底栏说什么就得真能做到什么，跟
++    /// `ctrl_q_from_the_language_list_goes_back_to_the_settings_list` 是
++    /// 同一件事的两半（那条测行为，这条测文案）。
++    #[test]
++    fn escape_hint_from_the_language_list_says_back_to_settings_not_the_board() {
++        let mut ls = ListState::default();
++        ls.select(Some(0));
++        let h = escape_hint(
++            &View::Settings {
++                state: ListState::default(),
++                lang: Some(ls),
++            },
++            Lang::Zh,
++        );
++        assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
++        assert!(!h.contains("看板"), "这一层退的不是看板：{h}");
++    }
++
+     #[test]
+     fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
+         // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
+         // 一处还说着旧的「列表」。
+         let help = help_of(
+             &View::EnterSecret {
+                 profile: "kimi".into(),
+                 label: "Kimi".into(),
+                 prompt: SecretPrompt {
+                     hint: String::new(),

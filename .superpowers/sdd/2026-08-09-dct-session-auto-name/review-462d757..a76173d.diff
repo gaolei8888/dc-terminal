@@ -1,0 +1,725 @@
+# Review package: 462d757..a76173d
+
+## Commits
+a76173d style: run cargo fmt on grid_reply.rs
+2f658d8 test: stop racing the developer's real login shell in two flaky integration tests
+5195dfe fix: flag directory names that hide invisible characters in the picker
+0d0e04d fix: name the session in the failure toast, not its profile
+
+## Files changed
+ src/i18n.rs         |  15 ++++++-
+ src/ui/app.rs       |  48 +++++++++++++++++++++-
+ src/ui/mod.rs       |  69 ++++++++++++++++++++++++++------
+ src/ui/pick.rs      |  79 +++++++++++++++++++++++++++++++++++-
+ tests/grid_reply.rs | 112 +++++++++++++++++++++++++++++++++++++++++-----------
+ 5 files changed, 285 insertions(+), 38 deletions(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 9e7342f..77a9b50 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -169,20 +169,27 @@ pub enum Key {
+     PickProjectTitle,
+     TypePathTitle,
+     SettingsTitle,
+     CurrentProject,
+     ManualPath,
+     RecentProjects,
+     SwitchPane,
+     EnterFolder,
+     GoUp,
+     NoSubfolders,
++    /// 浏览栏里，目录名单靠肉眼分辨不出异常时贴的压暗提示（见 `pick.rs`
++    /// 里挑目录那一段的说明）。POSIX 目录名里只有 `/` 和 NUL 不合法，
++    /// 转义序列这类看不见的字节完全合法，`truncate` 又把它们从**显示**里
++    /// 滤掉了——不贴这个提示，用户没有任何办法在选中之前发现这一行不对劲。
++    /// 文案不许提「控制字符」「转义序列」这类编码构成，用户不需要知道
++    /// 那是什么，只需要知道这里有点不对劲。
++    HiddenCharsInName,
+     // —— 状态与提示 ——
+     NoSessionsHere,
+     /// 空项目组头上接在「还没有会话」后面的那半句：`上次用 claude`
+     LastUsedAgent,
+     /// 九宫格的整屏空态：一个格子都没有，屏幕正中就这一句话。
+     ///
+     /// 空屏和底栏说的必须是**两个不同的事实**：这一条说「这里现在什么都没有，
+     /// 下一步做这个」，底栏那边按 `s`/`i` 得到的是 `NoSessionSelected`
+     /// （「这一下按键没有作用对象」）。原来两处各有一条措辞不同、意思一样的
+     /// 词条，同屏出现时用户会以为是两件事。
+@@ -359,20 +366,25 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+         ManualPath => t!(lang, en: "Type a path…", zh: "手输路径…"),
+         RecentProjects => t!(lang, en: "Recent", zh: "最近"),
+         SwitchPane => t!(lang, en: "switch side", zh: "切换左右"),
+         EnterFolder => t!(lang, en: "open folder", zh: "进入文件夹"),
+         GoUp => t!(lang, en: "go up", zh: "上一级"),
+         NoSubfolders => t!(
+             lang,
+             en: "No folders here — press ← to go up",
+             zh: "这里没有文件夹，按 ← 回上一级",
+         ),
++        HiddenCharsInName => t!(
++            lang,
++            en: "(something invisible in this name)",
++            zh: "（这个名字里有看不见的东西）",
++        ),
+ 
+         // 组头上那一句，不是整屏空态——分组之后这句话贴在项目名后面，
+         // 屏幕上别的组还列着会话，「按 n 开一个」那半句在这里是噪音。
+         // 英文写 `no sessions` 不写 `no sessions yet`：这一格后面还要接
+         // 「上次用 <agent>」，而 80 列的看板上这一格只有 34 列（组头前缀
+         // 44 列，含 `List` 每行都预留的 `▶ `）。`yet` 那四列会把最长的
+         // 内置 agent 名（`opencode`/`deepseek`/`qwen-api`，8 列）顶出边框。
+         NoSessionsHere => t!(lang, en: "no sessions", zh: "还没有会话"),
+         // 空项目的组头上，这半句接在上面那条后面：`还没有会话 · 上次用 claude`。
+         // 「哪个项目用哪个 agent」在别处只有底栏那一条，而底栏 80 列上会把
+@@ -1269,20 +1281,21 @@ mod tests {
+             BackToList,
+             BackToSettings,
+             BoardTitle,
+             Disconnected,
+             PickAgentTitle,
+             PickProjectTitle,
+             TypePathTitle,
+             SettingsTitle,
+             CurrentProject,
+             ManualPath,
++            HiddenCharsInName,
+             NoSessionsHere,
+             LastUsedAgent,
+             NoSessionsRunningPressN,
+             ProjectDirGone,
+             // 早就在词条表里，却一直没进这份清单——于是两条守卫（两种语言都
+             // 组得出话、英文里不许有汉字）从来没查过它。顺手补上：它正是九宫格
+             // 另一种空态用的那一条，跟刚加的 NoSessionsRunningPressN 挨着。
+             AllSessionsStopped,
+             WindowTooSmall,
+             Verifying,
+@@ -1354,21 +1367,21 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 99, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 100, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
+     /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
+     /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
+     /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 69c2729..6065fe3 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -255,22 +255,28 @@ impl App {
+                 .iter()
+                 .any(|s| s.id == id && s.state == Failed)
+         };
+         let newly: Vec<&SessionInfo> = next
+             .iter()
+             .filter(|s| s.state == Failed && !was_failed(s.id))
+             .collect();
+         // 同一轮里坏了好几个时只报第一个：底栏只有两行，堆几句话反而
+         // 一个都读不清。剩下的在列表/格子里都标着红色，跑不掉。
+         if let Some(s) = newly.first() {
++            // 用户此刻正靠这句话去找是哪个会话，屏幕上别的地方（看板列表、
++            // 九宫格标题、附着标题）都已经用会话名而不是 profile 认它——
++            // 出错提示不能是仅剩的那个还叫 profile 的地方。`session_label`
++            // 是「一个会话显示成什么」的唯一决定处，不能自己另拼一遍。
+             self.message = Msg::err(crate::i18n::msg::session_failed(
+-                self.lang, s.id, &s.profile,
++                self.lang,
++                s.id,
++                super::widgets::session_label(s),
+             ));
+         }
+     }
+ 
+     /// 从 `sessions` + `pinned` 重算分组和行，并把光标钉回原来那个东西上。
+     ///
+     /// **先取锚点再重算**：顺序反了的话锚点取的是新列表里的东西，
+     /// 等于没锚。
+     pub fn refresh_rows(&mut self) {
+         let anchor = self
+@@ -679,20 +685,60 @@ mod tests {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![sess(2, "/w/b")]);
+         app.set_sessions(vec![failing(2, "/w/b")]);
+         assert!(
+             app.message.text.contains("出错"),
+             "别的项目的失败也要提示：{}",
+             app.message.text
+         );
+     }
+ 
++    /// 出错提示点名用的必须是**会话名**，不是 profile——看板列表、九宫格
++    /// 标题、回复框收件人、附着标题全都已经改叫会话名了，出错提示是用户
++    /// 这一刻唯一用来找会话的线索，不能是屏幕上仅剩的另一个称呼。
++    #[test]
++    fn failure_toast_calls_the_session_by_its_name_not_its_profile() {
++        let (mut app, _dir) = App::test_app();
++        let mut named = sess(7, "/w/a");
++        named.tag = "修登录白屏".into();
++        app.set_sessions(vec![named.clone()]);
++
++        named.state = crate::session::SessionState::Failed;
++        app.set_sessions(vec![named]);
++
++        assert!(
++            app.message.text.contains("修登录白屏"),
++            "要点名会话名：{}",
++            app.message.text
++        );
++        assert!(
++            !app.message.text.contains("claude"),
++            "已经有名字了，不该再退回 profile：{}",
++            app.message.text
++        );
++    }
++
++    /// 没有名字的会话失败时，`session_label` 本来就退回 profile——
++    /// 出错提示要跟这个规则走同一条路，不是自己另判一次。
++    #[test]
++    fn failure_toast_falls_back_to_the_profile_when_the_session_has_no_name() {
++        let (mut app, _dir) = App::test_app();
++        app.set_sessions(vec![sess(1, "/w/a")]);
++        app.set_sessions(vec![failing(1, "/w/a")]);
++
++        assert!(
++            app.message.text.contains("claude"),
++            "没名字就该看到 profile：{}",
++            app.message.text
++        );
++    }
++
+     /// 从失败态恢复不提示。「恢复了」是噪音——用户没有要做的事。
+     #[test]
+     fn recovering_from_a_failure_says_nothing() {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![failing(1, "/w/a")]);
+         app.message = "".into();
+ 
+         app.set_sessions(vec![sess(1, "/w/a")]);
+         assert!(app.message.text.is_empty(), "恢复不该说话");
+     }
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index b45809b..4874504 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -2530,72 +2530,117 @@ mod tests {
+     ///
+     /// 这条测试故意不走 `run()`、不发任何 `Resize`，只直接调
+     /// `enter_session`：起一个真守护进程，攒出足够滚屏、真的往上翻一截，
+     /// 确认 offset 确实大于零；然后单独调 `enter_session`（模拟"已经在看
+     /// 这个会话，只是重新点了一下进来"，没有任何尺寸变化可以触发
+     /// Resize），如果 offset 归零了，只能是这次改动新加的那次显式
+     /// `Request::Scroll { by: Bottom }` 干的。
+     #[test]
+     fn entering_a_session_always_lands_at_the_bottom_even_without_a_resize() {
+         use crate::client::Client;
++        use crate::profile::Profile;
+         use crate::proto::{Request, Response};
+-        use crate::session::ScrollBy;
++        use crate::session::{ScrollBy, SessionManager};
++        use std::collections::BTreeMap;
++        use std::sync::Arc;
+         use std::time::{Duration, Instant};
+ 
++        // 这条测试原来靠内置的 `shell` profile（`/bin/zsh`）攒 200 行滚屏——
++        // 那是开发者自己的登录 shell，会 source 真实的 `~/.zshrc`，起多快
++        // 全看那份 rc 文件有多重，满载并行跑 `cargo test` 时常常在「等 200
++        // 行攒够」的 5 秒期限里输掉，是一次假红，不是这条测试真的抓到了
++        // bug。改成测试自己注册的 profile：`/bin/sh --noediting`——`--noediting`
++        // 关掉 GNU Readline，shell 不会在不确定的时刻把终端切成 raw 模式；
++        // `ENV=/dev/null` 摁死 posix 模式下 sh 的启动脚本，不读任何 rc；
++        // `PS1` 钉死成固定串，等它出现就知道 shell 已经能收输入了。
++        // 详见 `.superpowers/sdd/2026-08-09-dct-session-auto-name/followup-2-brief.md`。
++        const PROMPT: &str = "dct-test$ ";
++        let mut env = BTreeMap::new();
++        env.insert("ENV".to_string(), "/dev/null".to_string());
++        env.insert("PS1".to_string(), PROMPT.to_string());
++        let test_shell = Profile {
++            name: "scroll-test-shell".into(),
++            command: vec!["/bin/sh".into(), "--noediting".into()],
++            is_agent: false,
++            idle_pattern: None,
++            busy_pattern: None,
++            error_pattern: None,
++            env,
++            secret: None,
++            install: None,
++            headless: None,
++            api: None,
++            label: Default::default(),
++            note: Default::default(),
++        };
++
+         let home = tempfile::tempdir().unwrap();
+         let sock = home.path().join("daemon.sock");
++        let mgr = Arc::new(SessionManager::new());
++        mgr.register_profile(test_shell.clone());
+         let s = sock.clone();
+         std::thread::spawn(move || {
+-            let _ = crate::daemon::run(&s);
++            let _ = crate::daemon::run_with_manager(&s, mgr);
+         });
+         let deadline = Instant::now() + Duration::from_secs(5);
+         while !sock.exists() {
+             assert!(Instant::now() < deadline, "daemon 没起来");
+             std::thread::sleep(Duration::from_millis(20));
+         }
+ 
+         let mut c = Client::connect(&sock).unwrap();
+         let workdir = tempfile::tempdir().unwrap();
+         let id = match c
+             .call(Request::Create {
+                 dir: workdir.path().display().to_string(),
+-                profile: "shell".into(),
++                profile: test_shell.name.clone(),
+                 remember: false,
+             })
+             .unwrap()
+         {
+             Response::Created { id } => id,
+             other => panic!("预期 Created，实际 {other:?}"),
+         };
+ 
+-        // 攒够滚屏内容：跟 `session.rs` 里 `scrolling_session` 用的是同一种
+-        // POSIX 循环，不挑具体 shell。
+-        c.call(Request::Input {
+-            id,
+-            text: "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done\n".into(),
+-        })
+-        .unwrap();
+-
+         let screen = |c: &mut Client| -> (String, crate::session::ScrollState) {
+             match c.call(Request::Screen { id }).unwrap() {
+                 Response::Screen { lines, scroll, .. } => {
+                     let text = lines
+                         .iter()
+                         .flat_map(|l| l.iter())
+                         .map(|s| s.text.as_str())
+                         .collect::<String>();
+                     (text, scroll)
+                 }
+                 other => panic!("预期 Screen，实际 {other:?}"),
+             }
+         };
+ 
++        // 提示符出来之前发的字会被吞掉——等它出现，再攒滚屏内容。
++        let deadline = Instant::now() + Duration::from_secs(5);
++        loop {
++            let (text, _) = screen(&mut c);
++            if text.contains(PROMPT) {
++                break;
++            }
++            assert!(Instant::now() < deadline, "测试 shell 的提示符一直没出来");
++            std::thread::sleep(Duration::from_millis(20));
++        }
++
++        // 攒够滚屏内容：跟 `session.rs` 里 `scrolling_session` 用的是同一种
++        // POSIX 循环，不挑具体 shell。
++        c.call(Request::Input {
++            id,
++            text: "i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done\n".into(),
++        })
++        .unwrap();
++
+         let deadline = Instant::now() + Duration::from_secs(5);
+         loop {
+             let (text, scroll) = screen(&mut c);
+             if text.contains("line-200") && scroll.max > 0 {
+                 break;
+             }
+             assert!(Instant::now() < deadline, "没等到滚屏内容攒够");
+             std::thread::sleep(Duration::from_millis(50));
+         }
+ 
+@@ -2611,21 +2656,21 @@ mod tests {
+         // `enter_session`：这条路径上没有任何 Resize 会发生。
+         let mut app = App::new(
+             Client::connect(&sock).unwrap(),
+             workdir.path().to_path_buf(),
+             crate::i18n::Lang::Zh,
+             sock.clone(),
+             ViewMode::List,
+         );
+         app.set_sessions(vec![SessionInfo {
+             id,
+-            profile: "shell".into(),
++            profile: test_shell.name.clone(),
+             dir: workdir.path().display().to_string(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: false,
+             tag: String::new(),
+         }]);
+         app.view = View::Board;
+ 
+         enter_session(&mut app, id);
+ 
+diff --git a/src/ui/pick.rs b/src/ui/pick.rs
+index 248bb7f..12cba6c 100644
+--- a/src/ui/pick.rs
++++ b/src/ui/pick.rs
+@@ -483,25 +483,39 @@ fn draw_pick_project(f: &mut Frame, area: Rect, app: &mut App) {
+             Paragraph::new(text(Key::NoSubfolders, lang))
+                 .centered()
+                 .block(browse_block),
+             cols[1],
+         );
+     } else {
+         let items: Vec<ListItem> = rows
+             .iter()
+             .map(|r| {
+                 let mark = if r.is_git { " ●" } else { "  " };
+-                ListItem::new(Line::from(vec![
++                let mut spans = vec![
+                     Span::raw(truncate(&r.name, 30)),
+                     // git 仓库的标记压暗：它是辅助信息，不该比目录名还抢眼
+                     Span::styled(mark, dim()),
+-                ]))
++                ];
++                // POSIX 目录名里只有 `/` 和 NUL 不合法——转义序列这类看不见
++                // 的字节完全合法，而 `truncate` 已经把它们从上面那个 span
++                // 的显示里滤掉了。不在这里补一句，这种名字选中前跟一个正常
++                // 目录长得一模一样，用户没有任何办法在选之前发现不对劲。
++                // **打开目录仍然用 `row.name` 原始值**（见 `handle_pick_project`
++                // 里的 `p.cwd.join(&row.name)`）——这一句只负责让异常在选择
++                // 的那一刻被看见，绝不能反过来去动打开逻辑。
++                if r.name.chars().any(|c| c.is_control()) {
++                    spans.push(Span::styled(
++                        format!(" {}", text(Key::HiddenCharsInName, lang)),
++                        dim(),
++                    ));
++                }
++                ListItem::new(Line::from(spans))
+             })
+             .collect();
+         f.render_stateful_widget(
+             List::new(items).block(browse_block).highlight_symbol("▶ "),
+             cols[1],
+             &mut p.browse_state.clone(),
+         );
+     }
+ }
+ 
+@@ -800,20 +814,81 @@ mod tests {
+             app.groups.iter().any(|g| g.name == "proj"),
+             "选中的项目要作为一个组出现在看板上"
+         );
+         assert_eq!(
+             app.current_group().map(|g| g.name.clone()),
+             Some("proj".to_string()),
+             "光标要落进那个组"
+         );
+     }
+ 
++    /// 选中一个名字里带看不见字符的目录之后，真正打开的必须是**磁盘上那个
++    /// 真实目录**，逐字节对得上——`truncate` 只清洗显示，`p.cwd.join` 用的
++    /// 还是 `row.name` 原始值。这是这一节的安全底线：任何把清洗后的名字
++    /// 拿去拼路径的改法都会在这里露出来（`canon` 需要目录真的存在才能
++    /// 归一化，拼错了会直接找不到这个组）。
++    #[test]
++    fn enter_opens_the_real_directory_even_when_its_name_hides_something_invisible() {
++        let weird = "weird\x1bname";
++        let (_t, _g, mut app, root) = tree(&[weird]);
++        open_picker(&mut app, vec![], root.clone());
++        press(&mut app, KeyCode::Tab);
++        press(&mut app, KeyCode::Enter);
++
++        assert_eq!(
++            app.current_group().map(|g| g.dir.clone()),
++            Some(crate::ui::view::canon(&root.join(weird))),
++            "打开的必须是原始名字对应的真实目录，不是清洗过的名字"
++        );
++    }
++
++    /// 浏览栏画目录名时，含看不见字符的目录要挂一个压暗提示；正常目录
++    /// **不能**挂——后一半同样重要，否则每一行都挂着它，提示就失去了意义。
++    #[test]
++    fn draw_marks_directories_whose_name_hides_something_invisible() {
++        let (_t, _g, mut app, root) = tree(&["normal", "weird\x1bname"]);
++        open_picker(&mut app, vec![], root);
++        press(&mut app, KeyCode::Tab);
++
++        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++        // 只挤掉半角空格，留着换行：宽字符（这里是中文提示）在 ratatui 的
++        // 单元格网格里，续格填的是一个字面空格而不是空串，逐格拼起来就会在
++        // 每个汉字中间插一格——`draw_renders_all_profile_statuses_and_the_warning_border`
++        // 那条测试也踩过同一件事，处理方式是连换行一起挤掉；这里要按行分开断言
++        // 「正常目录不挂/异常目录要挂」，换行不能丢。
++        let rendered: String = buffer_text(term.backend().buffer())
++            .chars()
++            .filter(|c| *c != ' ')
++            .collect();
++        let marker = text(Key::HiddenCharsInName, app.lang);
++
++        let normal_line = rendered
++            .lines()
++            .find(|l| l.contains("normal"))
++            .expect("normal 目录要画出来");
++        assert!(
++            !normal_line.contains(marker),
++            "正常目录不该挂这个提示：{normal_line}"
++        );
++
++        // 显示名已经被 truncate 洗掉了看不见的字节，找那一行只能靠洗过的名字。
++        let weird_line = rendered
++            .lines()
++            .find(|l| l.contains("weirdname"))
++            .expect("藏着看不见字符的目录也要画出来（显示是清洗过的名字）");
++        assert!(
++            weird_line.contains(marker),
++            "藏着看不见字符的目录要挂这个提示：{weird_line}"
++        );
++    }
++
+     /// 最近栏的 `→` 把浏览器切到那个项目所在的位置——用户想从一个熟悉的
+     /// 项目附近开始找，这是最短的一步。
+     #[test]
+     fn right_on_a_recent_project_opens_the_browser_there() {
+         let (_t, _g, mut app, root) = tree(&["proj/sub"]);
+         let proj = root.join("proj");
+         open_picker(&mut app, vec![proj.display().to_string()], root);
+         press(&mut app, KeyCode::Right);
+         assert_eq!(picker(&app).cwd, proj);
+         assert_eq!(picker(&app).focus, Pane::Browse, "焦点跟着过去");
+diff --git a/tests/grid_reply.rs b/tests/grid_reply.rs
+index b6c5a33..5f1f705 100644
+--- a/tests/grid_reply.rs
++++ b/tests/grid_reply.rs
+@@ -2,107 +2,175 @@
+ //!
+ //! 界面侧 `grid::send_reply` 把一句话拆成**两次** `Input`：先送文字，再送一个
+ //! **空串**。空串在守护进程侧就是「按回车」（`session.rs::send_input`），而且
+ //! 回车那一步还会打检查点。这个约定全靠那一处实现，界面这边没有任何东西能
+ //! 证明它成立——`send_reply` 要连守护进程，UI 单测里的 `App` 是断连的，跑不到。
+ //!
+ //! 所以这条契约只能在这里钉：**文字 + 空串真的等于「打了一行字并回车」**。
+ //! 它一旦变了（比如哪天 `Input` 自己带上换行），界面会安静地退化成「字发过去
+ //! 了但 agent 一直在等回车」——用户以为自己回过话了，其实对面还停着。
+ 
++use dct::client::Client;
++use dct::profile::Profile;
+ use dct::proto::{Request, Response};
++use dct::session::SessionManager;
++use std::collections::BTreeMap;
++use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+-mod common;
++/// 这条契约测过一遍守护进程真实的 socket 往返，所以起daemon 得走真 socket。
++/// 但它**不能**用内置的 `shell` profile（`/bin/zsh`）——那是开发者自己的
++/// 登录 shell，会 source 真实的 `~/.zshrc`，提示符画出来的时间取决于那份
++/// rc 文件有多重，满载并行跑 `cargo test` 时经常输给固定的等待期限
++/// （详见 `.superpowers/sdd/2026-08-09-dct-session-auto-name/followup-2-brief.md`）。
++///
++/// 换成一个测试自己注册的 profile：`/bin/sh --noediting`。选它是因为：
++/// - `--noediting` 关掉 GNU Readline，shell 就不会在某个不确定的时刻把
++///   终端切成 raw 模式——不然那次切换本身又是一个新的竞态窗口。
++/// - `env.ENV = "/dev/null"`：sh 以 `sh` 这个名字启动、且是交互式时，会去读
++///   `$ENV` 指向的文件当启动脚本（posix 模式下 sh 版本的「rc 文件」）。显式
++///   摁死它，不管运行测试的机器上这个变量有没有被意外设置过。
++/// - `env.PS1` 钉死成一个测试专用的固定串，`wait_for_prompt` 就不用再猜
++///   「屏幕上随便出现点什么」，可以直接等这一句话。
++///
++/// 这不是走 `Profile::register_profile`（那是进程内注册，这两条测试隔着
++/// socket 够不到），而是先把 profile 塞进 `SessionManager`、再拿它起
++/// `daemon::run_with_manager`——`concurrency.rs`、`profiles_flow.rs` 的
++/// `two_projects_each_keep_their_own_agent_over_the_wire` 已经是这个用法，
++/// 这里照抄，不是发明新机制。
++const PROMPT: &str = "dct-test$ ";
++const TEST_SHELL_PROFILE: &str = "grid-reply-test-shell";
+ 
+-fn create_shell(c: &mut dct::client::Client, dir: &std::path::Path) -> u32 {
++fn test_shell_profile() -> Profile {
++    let mut env = BTreeMap::new();
++    env.insert("ENV".to_string(), "/dev/null".to_string());
++    env.insert("PS1".to_string(), PROMPT.to_string());
++    Profile {
++        name: TEST_SHELL_PROFILE.into(),
++        command: vec!["/bin/sh".into(), "--noediting".into()],
++        is_agent: false,
++        idle_pattern: None,
++        busy_pattern: None,
++        error_pattern: None,
++        env,
++        secret: None,
++        install: None,
++        headless: None,
++        api: None,
++        label: Default::default(),
++        note: Default::default(),
++    }
++}
++
++/// 起一个只在这个测试文件里活的守护进程，`SessionManager` 里预先注册好
++/// `test_shell_profile()`。跟 `tests/common::start_daemon()` 长得像，但没有
++/// 抽到那边去——`common::mod.rs` 头上的注释说得很清楚，那个共用脚手架是
++/// 「零参数、内部自己 new 一个 manager」的形状，塞不下「起daemon 之前先
++/// register_profile」这个需求，硬塞会让共用代码长出只有一个调用方用得到的
++/// 分支。`concurrency.rs` 已经因为同样的理由自己长了一份，这里是第二份。
++fn start_daemon() -> (tempfile::TempDir, std::path::PathBuf) {
++    let home = tempfile::tempdir().unwrap();
++    let sock = home.path().join("daemon.sock");
++    let mgr = Arc::new(SessionManager::new());
++    mgr.register_profile(test_shell_profile());
++    let s = sock.clone();
++    std::thread::spawn(move || {
++        let _ = dct::daemon::run_with_manager(&s, mgr);
++    });
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while !sock.exists() {
++        assert!(
++            Instant::now() < deadline,
++            "守护进程没起来：{}",
++            sock.display()
++        );
++        std::thread::sleep(Duration::from_millis(20));
++    }
++    (home, sock)
++}
++
++fn create_shell(c: &mut Client, dir: &std::path::Path) -> u32 {
+     match c
+         .call(Request::Create {
+             dir: dir.display().to_string(),
+-            profile: "shell".into(),
++            profile: TEST_SHELL_PROFILE.into(),
+             remember: false,
+         })
+         .unwrap()
+     {
+         Response::Created { id } => id,
+         other => panic!("预期 Created，实际 {other:?}"),
+     }
+ }
+ 
+-fn screen_text(c: &mut dct::client::Client, id: u32) -> String {
++fn screen_text(c: &mut Client, id: u32) -> String {
+     match c.call(Request::Screen { id }).unwrap() {
+         Response::Screen { lines, .. } => lines
+             .iter()
+             .flat_map(|l| l.iter().map(|s| s.text.clone()))
+             .collect(),
+         other => panic!("预期 Screen，实际 {other:?}"),
+     }
+ }
+ 
+-/// 等 shell 的提示符画出来。**不认具体的提示符字符**——zsh 是 `%`、bash 是
+-/// `$`，而这里跑的是用户自己的登录 shell。等「屏幕上有了非空白内容」就够了，
+-/// 目的只是别在提示符出来之前就往里灌字（那些字会被吞掉）。
+-fn wait_for_prompt(c: &mut dct::client::Client, id: u32) {
+-    let deadline = Instant::now() + Duration::from_secs(10);
+-    loop {
+-        if !screen_text(c, id).trim().is_empty() {
+-            return;
+-        }
+-        assert!(Instant::now() < deadline, "shell 的提示符一直没出来");
+-        std::thread::sleep(Duration::from_millis(50));
+-    }
++/// 等测试 shell 的提示符画出来。跟原来那版不一样的地方是：这里不用再猜
++/// 「随便什么非空白内容」——`test_shell_profile()` 把 `PS1` 钉死成了
++/// `PROMPT`，直接等这一句话，比“非空白”更准，也不会被半行没画完的回显
++/// 骗过去。等的理由不变：提示符出来之前发的字会被吞掉。
++fn wait_for_prompt(c: &mut Client, id: u32) {
++    wait_for(c, id, PROMPT);
+ }
+ 
+ /// 等屏幕上出现某段文字。PTY 是异步的，写进去到画出来隔着几轮调度。
+-fn wait_for(c: &mut dct::client::Client, id: u32, needle: &str) -> String {
++fn wait_for(c: &mut Client, id: u32, needle: &str) -> String {
+     let deadline = Instant::now() + Duration::from_secs(10);
+     loop {
+         let s = screen_text(c, id);
+         if s.contains(needle) {
+             return s;
+         }
+         if Instant::now() >= deadline {
+             panic!("等不到「{needle}」，屏幕上是：{s}");
+         }
+         std::thread::sleep(Duration::from_millis(50));
+     }
+ }
+ 
+ /// 等某段文字出现到第 `n` 次。
+ ///
+ /// 「命令被执行了」的判据是它出现**两次**（一次是回显，一次是输出），所以
+ /// 不能用 `wait_for`——回显那一次早就在屏幕上了，`wait_for` 会当场返回一张
+ /// 回车之前的旧屏，于是这条测试无论回车送没送到都「通过」。
+-fn wait_for_count(c: &mut dct::client::Client, id: u32, needle: &str, n: usize) -> String {
++fn wait_for_count(c: &mut Client, id: u32, needle: &str, n: usize) -> String {
+     let deadline = Instant::now() + Duration::from_secs(10);
+     loop {
+         let s = screen_text(c, id);
+         if s.matches(needle).count() >= n {
+             return s;
+         }
+         if Instant::now() >= deadline {
+             panic!("「{needle}」没出现到 {n} 次，屏幕上是：{s}");
+         }
+         std::thread::sleep(Duration::from_millis(50));
+     }
+ }
+ 
+ /// 文字 + 空串 = 打了一行并回车。
+ ///
+ /// 用 `echo` 是因为它的效果**不在输入行上**：光看见自己打的字不能证明回车
+ /// 送到了——那行字在按回车之前就已经回显在屏幕上了。只有 shell 真的执行了
+ /// 命令、把结果打印出来，才说明这一行被提交了。
+ #[test]
+ fn text_then_an_empty_input_submits_the_line() {
+-    let h = common::start_daemon();
++    let (_home, sock) = start_daemon();
+     let workdir = tempfile::tempdir().unwrap();
+-    let mut c = h.client();
++    let mut c = Client::connect(&sock).unwrap();
+     let id = create_shell(&mut c, workdir.path());
+ 
+     // shell 起来、提示符画出来之前发的字会被吞掉
+     wait_for_prompt(&mut c, id);
+ 
+     // 界面侧 send_reply 的两步，顺序和内容都照抄
+     assert!(matches!(
+         c.call(Request::Input {
+             id,
+             text: "echo dct-reply-landed".into(),
+@@ -123,23 +191,23 @@ fn text_then_an_empty_input_submits_the_line() {
+     // 就说明命令回显了但没被执行——也就是回车没送到。
+     wait_for_count(&mut c, id, "dct-reply-landed", 2);
+ }
+ 
+ /// 空框直接回车（只发空串，不发文字）也得真的按下去。
+ ///
+ /// 这是九宫格里最高频的用法：批个计划、说声继续。它跟上面那条走的是不同
+ /// 分支——`send_reply` 在 `body` 为空时只发一次 `Input`，一次都不能少。
+ #[test]
+ fn an_empty_input_on_its_own_is_a_bare_enter() {
+-    let h = common::start_daemon();
++    let (_home, sock) = start_daemon();
+     let workdir = tempfile::tempdir().unwrap();
+-    let mut c = h.client();
++    let mut c = Client::connect(&sock).unwrap();
+     let id = create_shell(&mut c, workdir.path());
+     wait_for_prompt(&mut c, id);
+ 
+     // 先把命令打进去但**不**回车，模拟「agent 那边已经摆着一个待确认的东西」
+     c.call(Request::Input {
+         id,
+         text: "echo bare-enter-works".into(),
+     })
+     .unwrap();
+     // 先等回显画完再数。PTY 是异步的，写进去到画出来隔着几轮调度——

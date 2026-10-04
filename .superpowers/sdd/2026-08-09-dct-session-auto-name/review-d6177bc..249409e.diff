@@ -1,0 +1,406 @@
+# Review package: d6177bc..249409e
+
+## Commits
+249409e docs: record the fix-4 report for the naming-gate test deletion
+4987a67 test: delete two non-discriminating naming-gate tests
+
+## Files changed
+ .../fix-4-report.md                                | 191 +++++++++++++++++++++
+ src/session.rs                                     | 138 ++-------------
+ 2 files changed, 209 insertions(+), 120 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-4-report.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-4-report.md
+new file mode 100644
+index 0000000..90829b6
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-4-report.md
+@@ -0,0 +1,191 @@
++# Fix 4 report — the fourth non-discriminating test
++
++Brief: `.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-4-brief.md`
++Target: `src/session.rs::recovering_from_a_failure_does_not_count_as_finishing_a_round`,
++plus the "顺带" item `a_fresh_session_has_no_tag`.
++
++## Option chosen: A (delete), not B (rewrite)
++
++The brief's own instruction was to read the current code first, because
++the brief was written against the pre-Fix-1 tree. I did, and the ground
++had shifted in a way the brief could not have anticipated: Fix 1 replaced
++the `name_slot.is_none()` gate with a synchronous `name_attempted: bool`
++set as the *first statement* of `request_name`. That single change turns
++out to make the mutation table in the brief (and in the final review's
++Finding 7) stale, not just pessimistic.
++
++I re-ran all three mutations from the brief's table against the **current**
++tree, on just the target test, before deciding anything:
++
++| Mutation | Brief's claim (pre-Fix-1) | Actual result (current tree) |
++|---|---|---|
++| delete `!s.first_input.is_empty()` alone | passes (survives) | **passes (survives)** — confirmed |
++| delete `was == SessionState::Working` alone | passes (survives) | **passes (survives)** — confirmed |
++| delete both together | passes (survives) | **FAILS (caught)** — brief is stale here |
++
++The "both together" line no longer holds: with `name_attempted` set
++synchronously at function entry, a premature `request_name` call during
++the BOOM→Idle recovery (first_input still empty) burns the one-shot latch
++before the real Working→Idle transition ever fires, so the real name
++never lands and the test's final-state assertion (`tag == "真实名字"`)
++times out red. I verified this directly — see the mutation runs below.
++
++So the honest picture, post-Fix-1, is: **the test still provides zero
++unique coverage**, just for a different reason than the brief describes.
++Its own doc comment already conceded this before I touched anything
++(lines 1972–1982, pre-edit): both guards are individually redundant in
++this test's specific scenario (`first_input` is empty for the whole
++recovery arc, so either guard alone already blocks it), and the test's
++real target was the `name_attempted` latch, not these two guards. The
++question the brief actually asks — "if I delete this test, do the two
++named guards remain covered by *other* tests, individually and in
++combination?" — I answered by mutation, not by trusting either the
++brief's table or the test's own doc comment. All three answers are yes.
++
++I did not attempt option B. There is nothing to make "reliable" here:
++option B would mean asserting on `name_attempted`/`name_slot` at the
++moment of recovery instead of at the end, for a scenario (empty
++`first_input` recovery) whose two guards are already each pinned,
++independently and deterministically (no sleep-race), by two other tests
++already on the branch. Writing a third racy-or-not observation point for
++already-covered ground would just be the fifth non-discriminating test
++the brief warns against adding. A is correct on its own terms, not as a
++fallback from a failed B.
++
++## Verification: are the two guards still covered after deletion?
++
++Both mutations, and their combination, were re-run against the **final**
++tree (after both deletions and the doc-comment rewrite below), targeting
++the whole `session::tests::` module so any test could catch them, not
++just the deleted one.
++
++**Mutation 1 — delete `was == SessionState::Working &&`** (src/session.rs,
++the naming-gate `if` in `tick()`):
++
++```
++$ cargo test --lib session::tests:: -- --test-threads=1
++...
++failures:
++---- session::tests::recovering_from_a_failure_after_real_input_still_does_not_count stdout ----
++thread '...' panicked at src/session.rs:2102:13:
++真正干完一轮活之后应该起出真实名字，最后是 "恢复期间误触发"
++test result: FAILED. 72 passed; 1 failed
++```
++Caught by `recovering_from_a_failure_after_real_input_still_does_not_count`
++— the sibling test added in Fix 1, which isolates exactly this guard by
++sealing `first_input` *before* the BOOM→recovery arc (so the other guard
++is already satisfied) and distinguishing "which trigger fired" via the
++model prompt's screen-tail content, not sleep timing.
++
++**Mutation 2 — delete `!s.first_input.is_empty() &&`**:
++
++```
++$ cargo test --lib session::tests:: -- --test-threads=1
++...
++failures:
++---- session::tests::a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen stdout ----
++thread '...' panicked at src/session.rs:1767:13:
++assertion `left == right` failed: 没人跟它说过话，不该有名字
++  left: "启动画面误触发"
++ right: ""
++test result: FAILED. 72 passed; 1 failed
++```
++Caught by `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
++— exercises `was == Working` (the session's own initial state) with
++`first_input` empty (splash screen, nobody has typed anything), and
++distinguishes via the model prompt content rather than final tag state.
++
++**Mutation 3 — delete both together**:
++
++```
++$ cargo test --lib session::tests:: -- --test-threads=1
++...
++failures:
++    session::tests::a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen
++    session::tests::recovering_from_a_failure_after_real_input_still_does_not_count
++test result: FAILED. 71 passed; 2 failed
++```
++Both surviving tests catch it independently — no unique coverage was
++lost by deleting the third test that used to (weakly) cover this case.
++
++After each mutation the file was restored from a saved copy and `diff`
++confirmed byte-identical to the pre-mutation tree before moving to the
++next one.
++
++This directly answers what the brief's "如果选 A" test requirement asks
++for: it does **not** just accept the review report's "caught by four
++other tests" claim, it re-derives which tests catch which mutation, by
++name, with the actual panic output.
++
++## What I changed
++
++`src/session.rs`:
++
++1. Deleted `recovering_from_a_failure_does_not_count_as_finishing_a_round`
++   in full (doc comment + body, ~96 lines) — zero unique coverage per the
++   mutation runs above.
++2. Rewrote the doc comment on
++   `recovering_from_a_failure_after_real_input_still_does_not_count`
++   (the surviving sibling) so it no longer refers to a test that doesn't
++   exist anymore. The new comment explains, in its own right, which guard
++   it pins, which guard `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
++   pins, and *why* the deleted third test's job is now fully absorbed by
++   the two of them (the WHY the house style asks for, not a "what changed"
++   changelog entry).
++3. Updated one other comment (`a_freshly_created_busy_pattern_agent_...`'s
++   body, line ~1740) that referenced the deleted test by name to instead
++   reference `recovering_from_a_failure_after_real_input_still_does_not_count`,
++   since that's the sibling still using the same "observe via prompt
++   content, not final tag" idiom.
++4. Deleted `a_fresh_session_has_no_tag`.
++
++## `a_fresh_session_has_no_tag`
++
++Deleted, per the brief's "unless you can name what it guards" test. I
++looked for a code path that could initialize `name_slot` to something
++other than empty at construction time — there isn't one:
++`name_slot: Arc::new(Mutex::new(None))` (session.rs:658) is a fixed
++struct-literal initializer, not conditional logic, so there is no branch
++or guard for a mutation to remove. The property it asserts (tag is ""
++right after `create()`) is also already exercised as a precondition
++inside `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`,
++which asserts the same thing for five ticks before doing anything else.
++I could not name a regression this test would catch that the other one
++wouldn't, so it goes.
++
++## Final verification
++
++```
++$ cargo test -- --test-threads=1
++...
++Running unittests src/lib.rs ...
++test result: ok. 696 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.74s
++...
++[16 more integration-test binaries, all "test result: ok", 0 failed]
++
++$ cargo fmt --check
++(no output, exit 0)
++
++$ cargo clippy --all-targets
++    Finished `dev` profile [unoptimized + debuginfo] target(s)
++(no warnings, exit 0)
++```
++
++696 = 698 (previous total) − 2 deleted tests. No new tests were added —
++this task's job was to stop claiming coverage that didn't exist, not to
++manufacture new coverage for ground that two other tests already hold.
++
++## Diff summary
++
++`src/session.rs`: 18 insertions, 120 deletions. Two tests removed, one
++doc comment rewritten to stand on its own, one cross-reference in another
++test's body comment repointed to the surviving sibling. No production
++code touched.
++
++## Concerns
++
++None. The two guards named in the brief remain independently covered,
++by name, with mutation evidence for each — including for the combined
++deletion, which the brief predicted would survive but which the current
++(post-Fix-1) code actually catches via the two remaining tests. Full
++suite, fmt, and clippy are clean.
+diff --git a/src/session.rs b/src/session.rs
+index 0f3c144..35507b7 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -1730,21 +1730,21 @@ mod tests {
+     /// **钉死这个仓库真正会踩的坑**：所有真实 profile（claude/codex/glm/
+     /// kimi/deepseek/qwen-api）都只声明 `busy_pattern`，没有一个声明
+     /// `idle_pattern`。`classify()` 在只有 busy_pattern 时，busy 串**不在**
+     /// 屏幕上就判 Idle——刚创建、还停在启动画面上的会话，第一个 tick
+     /// 就是这个读法：`was == Working`（创建时因为有 pattern 而置的初始
+     /// 状态）→ `next == Idle`（启动画面，还没人跟它说过话）。没有
+     /// `!s.first_input.is_empty()` 这道判断，这一跳会被当成「干完一轮活」，
+     /// 用空的 first_input 把名字永久钉成空串。
+     #[test]
+     fn a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen() {
+-        // 跟 `recovering_from_a_failure_does_not_count_as_finishing_a_round`
++        // 跟 `recovering_from_a_failure_after_real_input_still_does_not_count`
+         // 同一个理由：名字跟着 prompt 里有没有真实的第一句话走，这样才能
+         // 把「是哪一次触发定下了这个名字」测出来，不受线程调度影响。
+         struct ByPrompt;
+         impl crate::llm::Backend for ByPrompt {
+             fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                 if p.user.contains("修一下登录白屏") {
+                     Ok("真实名字".into())
+                 } else {
+                     Ok("启动画面误触发".into())
+                 }
+@@ -1962,128 +1962,38 @@ mod tests {
+             Err(e) => panic!("channel 出了意外：{e:?}"),
+         }
+ 
+         assert_eq!(
+             m.list().iter().find(|s| s.id == id).unwrap().tag,
+             "",
+             "既然没有第二次 request_name，tag 也不该变"
+         );
+     }
+ 
+-    /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
+-    /// 起名。这个场景里 `was == SessionState::Working` 和
+-    /// `!s.first_input.is_empty()` 两道判断**都**能单独拦住误触发（这里
+-    /// 从没送过输入，first_input 全程是空的，跟
++    /// **钉死** `was == SessionState::Working` 这道判断：用户已经说过话
++    /// （`first_input` 非空，`!s.first_input.is_empty()` 那道判断已经放行）
++    /// 之后，agent 却报错又恢复——五个内置 profile 有 `error_pattern`
++    /// （只有 codex.toml 没有），用户说完话之后 agent 报错、错误文案又从
++    /// 屏幕上滚走，`classify()` 会把这读成 Idle。这不是「干完一轮活」，
++    /// 不该拿它起名，起了就会把一辈子只有一次的 `name_attempted` 提前
++    /// 烧掉，真正干完活也翻不了身。
++    ///
++    /// `!s.first_input.is_empty()` 那一半单独由
+     /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
+-    /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
+-    /// `name_attempted` 那道「只起一次」的门槛在误触发场景下反而是帮凶——
+-    /// 如果 Failed → Idle 被当成起名时机，它会拿这时候还空着的
+-    /// `first_input` 把 `name_attempted` 提前置成 `true`，等真正干完
+-    /// 一轮活、有真实内容可用的时候，`request_name` 已经再也不会被
+-    /// 调用第二次了。
+-    #[test]
+-    fn recovering_from_a_failure_does_not_count_as_finishing_a_round() {
+-        // 名字跟着 prompt 里有没有真实的第一句话走，而不是跟着「第几次被
+-        // 问到」走：不管 request_name 是被误触发一次还是正常触发一次，
+-        // 只要 prompt 里没有真实输入，答案就该是「提前」那句，不该是
+-        // 「真实」那句——这样才量得出「到底是哪一次触发把名字定下来的」，
+-        // 不受线程调度先后顺序影响。
+-        struct ByPrompt;
+-        impl crate::llm::Backend for ByPrompt {
+-            fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+-                if p.user.contains("修一下登录白屏") {
+-                    Ok("真实名字".into())
+-                } else {
+-                    Ok("提前起的名字".into())
+-                }
+-            }
+-        }
+-
+-        let repo = init_repo();
+-        let m = SessionManager::new();
+-        m.register_profile(Profile {
+-            name: "flaky-name".into(),
+-            // 清屏和打 READY 必须在**同一次** write 里发生，不能是 `clear;
+-            // echo READY` 那种两条命令、两次 write：pty 读端偶尔会正好落在
+-            // 两次 write 之间那个窗口，那一刻屏幕上既没有 BOOM 也没有
+-            // READY，`classify()` 会把它错判成 `Working`，下一次 tick 才
+-            // 看见 READY，就成了一次货真价实但不该发生的 `Working → Idle`
+-            // ——first_input 还是空的，这道判断本该拦住它却没机会拦，测试
+-            // 就会因为错误的原因失败（观察到的是 flake，不是这个测试真正
+-            // 要测的东西）。一次 `printf` 把 ED2（清屏）、光标归位、READY
+-            // 三样一起打出去，从根上消掉这个窗口。
+-            command: vec![
+-                "/bin/sh".into(),
+-                "-c".into(),
+-                "echo BOOM; sleep 0.2; printf '\\033[2J\\033[HREADY\\n'; sleep 30".into(),
+-            ],
+-            is_agent: true,
+-            idle_pattern: Some("READY".into()),
+-            busy_pattern: None,
+-            error_pattern: Some("BOOM".into()),
+-            env: Default::default(),
+-            secret: None,
+-            install: None,
+-            headless: None,
+-            api: None,
+-            label: Default::default(),
+-            note: Default::default(),
+-        });
+-        m.set_backend(Some(Arc::new(ByPrompt)));
+-        let id = m
+-            .create(repo.path(), "flaky-name", empty_secrets(), &[])
+-            .unwrap();
+-
+-        // 没送过任何输入，纯靠脚本自己 BOOM 再恢复——first_input 全程是空的。
+-        let deadline = Instant::now() + Duration::from_secs(5);
+-        while state_of(&m, id) != SessionState::Idle {
+-            m.tick();
+-            assert!(Instant::now() < deadline, "该从 BOOM 恢复成 Idle");
+-            sleep(Duration::from_millis(50));
+-        }
+-        // 多跑几轮，给「本不该发生的提前触发」留够时间真的发生并把答案
+-        // 写回槽里。
+-        for _ in 0..10 {
+-            m.tick();
+-            sleep(Duration::from_millis(20));
+-        }
+-
+-        // 现在才是真正干活：送真实输入，走一轮 Working → Idle。
+-        m.send_input(id, "修一下登录白屏").unwrap();
+-        m.send_input(id, "").unwrap();
+-
+-        let deadline = Instant::now() + Duration::from_secs(5);
+-        loop {
+-            m.tick();
+-            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+-            if tag == "真实名字" {
+-                break;
+-            }
+-            assert!(
+-                Instant::now() < deadline,
+-                "真正干完一轮活之后应该起出真实名字，最后是 {tag:?}"
+-            );
+-            sleep(Duration::from_millis(50));
+-        }
+-    }
+-
+-    /// **钉死** `was == SessionState::Working` 单独扛住的那一半：
+-    /// `recovering_from_a_failure_does_not_count_as_finishing_a_round`
+-    /// 测的是 `first_input` 全程为空的场景——那条测试其实是被两道判断
+-    /// 同时拦住的（`!s.first_input.is_empty()` 那道判断也在拦，见它的
+-    /// 文档注释），单独去掉 `was == Working` 拦不住它。这条要隔离的是
+-    /// `!s.first_input.is_empty()` 已经放行之后剩下的那一半：用户已经
+-    /// 说过话（`first_input` 非空），agent 却报错又恢复——五个内置
+-    /// profile 有 `error_pattern`（只有 codex.toml 没有），用户说完话
+-    /// 之后 agent 报错、错误文案又从屏幕上滚走，`classify()` 会把这读成
+-    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会把一辈子只有
+-    /// 一次的 `name_attempted` 提前烧掉，真正干完活也翻不了身。
++    /// 钉住（刚创建、first_input 全程为空的场景）；这条测的是它放行之后
++    /// 剩下那一半。曾经还有第三条测试，想在「first_input 全程为空」的
++    /// 恢复场景里同时钉两道判断——删掉了：那个场景里两道判断本来就都能
++    /// 单独拦住误触发，而测试断言的是最终状态、不是误触发那一刻的槽值，
++    /// 结果两道判断分别单独删掉都测不出来，只有两个一起删才勉强测出来
++    /// （用 mutation 验证过）。这两个「一起删」需要的分量，现在被这条和
++    /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
++    /// 分别独立覆盖了，留着那第三条纯属重复，删掉不损失任何判别力。
+     ///
+     /// 区分「误触发」和「真起名」不能靠 `first_input`——两次触发时它都
+     /// 非空、内容还一样，天生分不出谁是谁。只能靠 prompt 里屏幕尾巴那
+     /// 一段：`cat` 要等脚本走完 BOOM → 清屏 → READY 才会真正开始读、
+     /// 回显用户排在队列里的那句话，所以恢复那一刻的屏幕尾巴里还没有它，
+     /// 真正干完一轮活之后的屏幕尾巴里才有。
+     #[test]
+     fn recovering_from_a_failure_after_real_input_still_does_not_count() {
+         struct ByScreenTail;
+         impl crate::llm::Backend for ByScreenTail {
+@@ -3179,23 +3089,11 @@ mod tests {
+     /// 反序列化失败 —— 这正是本版**不升协议号**的全部依据（同 `scroll`
+     /// 字段当初的做法，见 `proto.rs` 里那条注释）。
+     #[test]
+     fn session_info_without_a_tag_field_still_parses() {
+         let old = r#"{"id":3,"profile":"claude","dir":"/w/a",
+                       "state":"Idle","activity":"","is_agent":true}"#;
+         let s: SessionInfo = serde_json::from_str(old).expect("旧 JSON 必须还能读");
+         assert_eq!(s.tag, "", "缺字段补空串");
+         assert_eq!(s.id, 3);
+     }
+-
+-    /// 新建的会话还没起过名。
+-    #[test]
+-    fn a_fresh_session_has_no_tag() {
+-        let repo = init_repo();
+-        let m = SessionManager::new();
+-        m.register_profile(fake_agent());
+-        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+-
+-        let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+-        assert_eq!(tag, "");
+-    }
+ }

@@ -1,0 +1,815 @@
+# Review package: 3827849..5beeac4
+
+## Commits
+5beeac4 fix(build): target macOS 11.0 for the Swift static library
+2f885ff fix(keys): correct the non-Mac comment and note macOS 11 minimum
+24c6975 fix(procedures): namespace approval files by procedure, name tiers accurately, show human durations
+700748c feat(brain): verify a procedure ticket bound to its approval
+11fd836 fix(brain): never let negation suppress a money clause
+
+## Files changed
+ build.rs                         |  11 ++-
+ crates/dct-brain/src/approval.rs | 109 +++++++++++++++++++++++++++++-
+ crates/dct-brain/src/sign.rs     |   3 +
+ crates/dct-brain/src/tier.rs     |  46 +++++++++++--
+ src/keys/mod.rs                  |  12 ++--
+ src/procedures.rs                | 140 +++++++++++++++++++++++++++++++++++----
+ 6 files changed, 294 insertions(+), 27 deletions(-)
+
+## Diff
+diff --git a/build.rs b/build.rs
+index 65e04b3..e36aef3 100644
+--- a/build.rs
++++ b/build.rs
+@@ -19,21 +19,30 @@ fn main() {
+         .filter(|p| p.extension().is_some_and(|e| e == "swift"))
+         .collect();
+     sources.sort();
+     println!("cargo:rerun-if-changed=swift");
+     for s in &sources {
+         println!("cargo:rerun-if-changed={}", s.display());
+     }
+     let lib = out.join("libDctMac.a");
+     let status = Command::new("xcrun")
+         .args(["swiftc", "-parse-as-library", "-emit-library", "-static", "-module-name", "DctMac", "-swift-version", "5", "-O"])
+-        .args(["-target", &format!("{arch}-apple-macos13.0"), "-o"])
++        // macOS 11.0 目标下，swiftc 默认会自动链接 Swift 5.6/并发/动态替换这几个向后
++        // 兼容库（swiftCompatibility56、swiftCompatibilityConcurrency 等）；Command
++        // Line Tools 不带这几个静态库，链接会报符号找不到。Keys.swift 没用并发、也没用
++        // 动态替换，关掉这三项自动链接就行，不需要装完整 Xcode。
++        .args([
++            "-disable-autolinking-runtime-compatibility",
++            "-disable-autolinking-runtime-compatibility-concurrency",
++            "-disable-autolinking-runtime-compatibility-dynamic-replacements",
++        ])
++        .args(["-target", &format!("{arch}-apple-macos11.0"), "-o"])
+         .arg(&lib)
+         .args(&sources)
+         .status()
+         .expect("run xcrun swiftc");
+     assert!(status.success(), "swiftc failed");
+     println!("cargo:rustc-link-search=native={}", out.display());
+     println!("cargo:rustc-link-lib=static=DctMac");
+     let sdk = Command::new("xcrun").args(["--show-sdk-path"]).output().expect("xcrun --show-sdk-path").stdout;
+     println!("cargo:rustc-link-search=native={}/usr/lib/swift", String::from_utf8(sdk).unwrap().trim());
+     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+diff --git a/crates/dct-brain/src/approval.rs b/crates/dct-brain/src/approval.rs
+index 6e6fcb5..38241c8 100644
+--- a/crates/dct-brain/src/approval.rs
++++ b/crates/dct-brain/src/approval.rs
+@@ -1,16 +1,17 @@
+ //! 流程批准记录：用户确认一条流程时，同时确认每一步的档位（设计第 4 节）。
+ //! 流程文件本身不写档位（dcv 定的），档位随这份记录保存；记录带用户签名，
+ //! 本机文件被人改过就不再认。
+ use crate::canon::field;
+-use crate::sign::{make_signature, verify_sig, SignError, Signature, Signer, TrustedKey, VerifyError};
++use crate::sign::{make_signature, verify, verify_sig, SignError, SignedTicket, Signature, Signer, TrustedKey, VerifyError};
+ use crate::tier::{SignerRole, Tier};
++use crate::ticket::Subject;
+ use serde::{Deserialize, Serialize};
+ 
+ pub const APPROVAL_VERSION: u32 = 1;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Approval {
+     pub v: u32,
+     /// `库:名字`
+     pub procedure: String,
+     pub steps_sha256: String,
+@@ -71,24 +72,54 @@ pub fn verify_approval(
+     if sa.approval.steps_sha256 != steps_sha256 {
+         return Err(VerifyError::StepsChanged);
+     }
+     let role = verify_sig(&sa.signature, &sa.approval.canonical_bytes(), trusted)?;
+     if role != SignerRole::User {
+         return Err(VerifyError::WrongRole { need: SignerRole::User });
+     }
+     Ok(())
+ }
+ 
++/// dco 拿到一张流程票要跑之前，把票和批准记录一起验：票本身要过 `sign::verify`
++/// （签名、设备、时间窗口、签名角色够不够这一档）；批准记录要是给票里写的同一条
++/// 流程、同一份步骤签的；而且**票的档位不能比批准记录算出来的档位低**——否则
++/// 拿一张自动钥匙签的自用档票，去跑一条批准记录写明要用户签的对外流程。
++///
++/// 不改任何 canonical form 或 golden 值：这只是把已有的 `verify` 和 `verify_approval`
++/// 接起来，多加一条档位比较。
++pub fn verify_procedure_ticket(
++    st: &SignedTicket,
++    sa: &SignedApproval,
++    trusted: &[TrustedKey],
++    device: &str,
++    now: u64,
++) -> Result<(), VerifyError> {
++    verify(st, trusted, device, now)?;
++    let (name, steps_sha256) = match &st.ticket.subject {
++        Subject::Procedure { name, steps_sha256, .. } => (name.as_str(), steps_sha256.as_str()),
++        // 批准记录只管流程；一张单动作票没有对应的批准记录可比。
++        Subject::Action { .. } => return Err(VerifyError::WrongProcedure),
++    };
++    verify_approval(sa, trusted, name, steps_sha256)?;
++    if st.ticket.tier < sa.approval.run_tier() {
++        return Err(VerifyError::TierBelowApproval);
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::sign::soft::SoftSigner;
++    use crate::sign::sign_one;
++    use crate::ticket::{params_sha256, Ticket, TICKET_VERSION};
++    use std::collections::BTreeMap;
+ 
+     const STEPS: &str = "sha256:4d1077af6efac1184e410d23b0b7b120fd42f29d7dade3304ef2041ca10b565c";
+ 
+     fn approval() -> Approval {
+         Approval {
+             v: APPROVAL_VERSION,
+             procedure: "social:edit-bio".into(),
+             steps_sha256: STEPS.into(),
+             body_sha256: format!("sha256:{}", "ab".repeat(32)),
+             step_tiers: vec![Tier::SelfOnly, Tier::SelfOnly, Tier::SelfOnly, Tier::Content],
+@@ -146,11 +177,87 @@ mod tests {
+     #[test]
+     fn approval_for_one_procedure_does_not_verify_for_another() {
+         let user = SoftSigner::from_seed(SignerRole::User, 2);
+         let sa = sign_approval(approval(), &user, "批准").unwrap();
+         assert_eq!(verify_approval(&sa, &[user.trusted()], "social:edit-bio", STEPS), Ok(()));
+         assert_eq!(
+             verify_approval(&sa, &[user.trusted()], "social:edit-bio-copy", STEPS),
+             Err(VerifyError::WrongProcedure)
+         );
+     }
++
++    fn ticket_for(tier: Tier) -> Ticket {
++        Ticket {
++            v: TICKET_VERSION,
++            nonce: "0123456789abcdef0123456789abcdef".into(),
++            device: "mac-lei".into(),
++            tier,
++            subject: Subject::Procedure {
++                name: "social:edit-bio".into(),
++                steps_sha256: STEPS.into(),
++                body_sha256: format!("sha256:{}", "ab".repeat(32)),
++            },
++            params_sha256: params_sha256(&BTreeMap::new()),
++            earliest: 100,
++            expires: 200,
++        }
++    }
++
++    #[test]
++    fn a_valid_ticket_and_approval_pair_verifies() {
++        let user = SoftSigner::from_seed(SignerRole::User, 2);
++        let sa = sign_approval(approval(), &user, "批准").unwrap(); // run_tier() == Content
++        let st = sign_one(ticket_for(Tier::Content), &user, "发到 TikTok").unwrap();
++        assert_eq!(verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150), Ok(()));
++    }
++
++    #[test]
++    fn a_self_tier_ticket_cannot_ride_a_content_approval() {
++        let user = SoftSigner::from_seed(SignerRole::User, 2);
++        let auto = SoftSigner::from_seed(SignerRole::Auto, 1);
++        let trusted = vec![user.trusted(), auto.trusted()];
++        let sa = sign_approval(approval(), &user, "批准").unwrap(); // run_tier() == Content
++        let st = sign_one(ticket_for(Tier::SelfOnly), &auto, "").unwrap();
++        assert_eq!(
++            verify_procedure_ticket(&st, &sa, &trusted, "mac-lei", 150),
++            Err(VerifyError::TierBelowApproval)
++        );
++    }
++
++    #[test]
++    fn ticket_for_a_different_procedure_or_steps_is_refused() {
++        let user = SoftSigner::from_seed(SignerRole::User, 2);
++        let sa = sign_approval(approval(), &user, "批准").unwrap();
++
++        let mut wrong_name = ticket_for(Tier::Content);
++        if let Subject::Procedure { name, .. } = &mut wrong_name.subject {
++            *name = "social:edit-bio-copy".into();
++        }
++        let st = sign_one(wrong_name, &user, "").unwrap();
++        assert_eq!(
++            verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150),
++            Err(VerifyError::WrongProcedure)
++        );
++
++        let mut wrong_steps = ticket_for(Tier::Content);
++        if let Subject::Procedure { steps_sha256, .. } = &mut wrong_steps.subject {
++            *steps_sha256 = "sha256:other".into();
++        }
++        let st2 = sign_one(wrong_steps, &user, "").unwrap();
++        assert_eq!(
++            verify_procedure_ticket(&st2, &sa, &[user.trusted()], "mac-lei", 150),
++            Err(VerifyError::StepsChanged)
++        );
++    }
++
++    #[test]
++    fn a_tampered_approval_fails_ticket_verification() {
++        let user = SoftSigner::from_seed(SignerRole::User, 2);
++        let mut sa = sign_approval(approval(), &user, "批准").unwrap();
++        sa.approval.step_tiers[3] = Tier::SelfOnly;
++        let st = sign_one(ticket_for(Tier::Content), &user, "").unwrap();
++        assert_eq!(
++            verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150),
++            Err(VerifyError::BadSignature)
++        );
++    }
+ }
+diff --git a/crates/dct-brain/src/sign.rs b/crates/dct-brain/src/sign.rs
+index 72b5a1c..1388962 100644
+--- a/crates/dct-brain/src/sign.rs
++++ b/crates/dct-brain/src/sign.rs
+@@ -101,36 +101,39 @@ pub enum VerifyError {
+     WrongRole { need: SignerRole },
+     BadSignature,
+     NotInBatch,
+     WrongDevice,
+     TooEarly,
+     Expired,
+     /// 批准记录对应的流程步骤已经变了（Task 6）。
+     StepsChanged,
+     /// 批准记录是给另一条流程的。
+     WrongProcedure,
++    /// 票的档位比批准记录要求的还低——批准记录写着要用户签的档，票却按自动档签的。
++    TierBelowApproval,
+ }
+ 
+ impl std::fmt::Display for VerifyError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         let s = match self {
+             VerifyError::Unsupported => "票的版本或算法不认识",
+             VerifyError::UnknownKey => "签名的钥匙没配对过",
+             VerifyError::AmbiguousKey => "同一把钥匙配对了不止一次，不认",
+             VerifyError::WrongRole { .. } => "这一档要用户本人签名",
+             VerifyError::BadSignature => "签名不对",
+             VerifyError::NotInBatch => "这张票不在签过的那一批里",
+             VerifyError::WrongDevice => "这张票不是给这台设备的",
+             VerifyError::TooEarly => "还没到可以执行的时间",
+             VerifyError::Expired => "票已经过期",
+             VerifyError::StepsChanged => "流程的步骤改过了，要重新批准",
+             VerifyError::WrongProcedure => "这份批准记录是给另一条流程的",
++            VerifyError::TierBelowApproval => "这张票的档位比批准记录还低",
+         };
+         f.write_str(s)
+     }
+ }
+ 
+ impl std::error::Error for VerifyError {}
+ 
+ pub fn batch_bytes(digests: &[String]) -> Vec<u8> {
+     let mut o = Vec::new();
+     field(&mut o, "dct-batch-v1");
+diff --git a/crates/dct-brain/src/tier.rs b/crates/dct-brain/src/tier.rs
+index c833643..bba37a0 100644
+--- a/crates/dct-brain/src/tier.rs
++++ b/crates/dct-brain/src/tier.rs
+@@ -51,45 +51,59 @@ impl Tier {
+ // 词表照抄 dco 设计第 2 节，只许增加，不许删。中文按子串比（「立即发布」），
+ // 英文按整词比（「Posts」标签页不是「post」）。
+ const CONTENT_ZH: &[&str] = &["发布", "发表", "发送", "分享", "转发", "上传", "保存", "提交", "确认", "完成"];
+ const CONTENT_EN: &[&str] = &["post", "publish", "send", "share", "repost", "upload", "save", "submit", "confirm", "done"];
+ const MONEY_ZH: &[&str] = &["支付", "购买", "下单", "充值", "付款"];
+ const MONEY_EN: &[&str] = &["pay", "buy", "order", "checkout", "purchase"];
+ // 发布流程的最后一步常常只写这些。单看字说不清是不是对外，**提议**时按对外算，
+ // 用户批准时可以改低。运行时的兜底不看这张表，否则又回到「太严」。
+ const AMBIGUOUS_ZH: &[&str] = &["下一步", "继续", "确定", "好的"];
+ const AMBIGUOUS_EN: &[&str] = &["next", "continue", "ok", "okay", "yes", "allow"];
+-// 否定：「不保存」「Don't save」不是保存。中文只认开头，免得「保存不了」被当成否定；
+-// 英文只认第一个词，免得「Save for later」被当成否定。
+-const NEGATION_ZH: &[&str] = &["不", "取消", "暂不", "以后再说", "稍后", "放弃", "别"];
++// 否定：「不保存」「Don't save」不是保存。中文只认明确的否定词开头（不是裸「不」），
++// 免得「不限量购买」「保存不了」这类词被当成否定；英文只认第一个词，免得
++// 「Save for later」被当成否定。无论怎么判否定，含钱词的子句永远不会被否定压低
++// （见 `is_money_clause` / `effectively_negated`）。
++const NEGATION_ZH: &[&str] = &[
++    "不要", "不用", "不保存", "不发", "不了", "不再", "不需要", "不同意", "不允许", "取消", "暂不", "以后再说", "稍后", "放弃", "别",
++];
+ const NEGATION_EN: &[&str] = &["don't", "dont", "not", "cancel", "no", "skip", "later", "discard"];
+ 
+ fn words(label: &str) -> Vec<String> {
+     label
+         .replace('\u{2019}', "'")
+         .to_lowercase()
+         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
+         .filter(|w| !w.is_empty())
+         .map(String::from)
+         .collect()
+ }
+ 
+ fn hit(label: &str, zh: &[&str], en: &[&str]) -> bool {
+     zh.iter().any(|z| label.contains(z)) || words(label).iter().any(|w| en.contains(&w.as_str()))
+ }
+ 
++fn is_money_clause(clause: &str) -> bool {
++    hit(clause, MONEY_ZH, MONEY_EN)
++}
++
+ fn negated(label: &str) -> bool {
+     let t = label.trim_start();
+     NEGATION_ZH.iter().any(|n| t.starts_with(n))
+         || words(t).first().is_some_and(|w| NEGATION_EN.contains(&w.as_str()))
+ }
+ 
++/// A clause that names money can never be hidden by a negation word — see
++/// design ruling: 「不限量购买」/"No-fee checkout" must still read as `Money`.
++fn effectively_negated(clause: &str) -> bool {
++    !is_money_clause(clause) && negated(clause)
++}
++
+ fn split_clauses(label: &str) -> Vec<&str> {
+     label
+         .split(['，', ',', ';', '；', '、', '。', '.', '!', '！', '?', '？'])
+         .map(|s| s.trim())
+         .filter(|s| !s.is_empty())
+         .collect()
+ }
+ 
+ fn score_clause(clause: &str) -> Tier {
+     if hit(clause, MONEY_ZH, MONEY_EN) {
+@@ -111,21 +125,21 @@ pub fn tier_for_label(label: &str) -> Tier {
+     }
+ 
+     let clauses = split_clauses(label);
+     if clauses.is_empty() {
+         return Tier::Read;
+     }
+ 
+     clauses
+         .iter()
+         .filter_map(|clause| {
+-            if negated(clause) {
++            if effectively_negated(clause) {
+                 None
+             } else {
+                 Some(score_clause(clause))
+             }
+         })
+         .max()
+         .unwrap_or(Tier::Read)
+ }
+ 
+ /// 没确认过的元素（模型第一次认出来的图标、按钮）至少按对外算（设计第 4 节）。
+@@ -149,36 +163,37 @@ pub fn tier_for_step(action: &str, arg: &str) -> Tier {
+         "verify_text" | "wait" | "read_value" => Tier::Read,
+         "open_app" | "navigate_by_intent" | "scroll" | "back" | "type_param" | "set_checked" => {
+             Tier::SelfOnly
+         }
+         // 选文件就是把本机文件交出去（dcv 会话提醒的）。
+         "pick_file" => Tier::Content,
+         "tap_by_intent" | "confirm_dialog" => {
+             let a = arg.trim();
+             let clauses = split_clauses(a);
+ 
+-            // Only return SelfOnly if EVERY clause is negated.
+-            if !clauses.is_empty() && clauses.iter().all(|c| negated(c)) {
++            // Only return SelfOnly if EVERY clause is negated (a money clause is
++            // never "effectively" negated, so its presence rules this out).
++            if !clauses.is_empty() && clauses.iter().all(|c| effectively_negated(c)) {
+                 return Tier::SelfOnly;
+             }
+ 
+             // Compute label tier using per-clause logic.
+             let label_tier = tier_for_label(a);
+ 
+             // Determine default: ambiguous words and confirm_dialog apply to non-negated clauses only.
+             let default = if action == "confirm_dialog" {
+                 Tier::Content
+             } else {
+                 // For tap_by_intent, check if any non-negated clause has ambiguous words.
+                 let has_ambiguous_in_nonnegated = clauses
+                     .iter()
+-                    .any(|c| !negated(c) && hit(c, AMBIGUOUS_ZH, AMBIGUOUS_EN));
++                    .any(|c| !effectively_negated(c) && hit(c, AMBIGUOUS_ZH, AMBIGUOUS_EN));
+                 if has_ambiguous_in_nonnegated {
+                     Tier::Content
+                 } else {
+                     Tier::SelfOnly
+                 }
+             };
+ 
+             label_tier.max(default)
+         }
+         // dcv 写入时就拒绝词表外的动作；万一漏进来，按对外算。
+@@ -319,11 +334,28 @@ mod tests {
+     fn multi_clause_labels_judge_negation_per_clause() {
+         // Negated first clause doesn't suppress content in later clause.
+         assert_eq!(tier_for_step("tap_by_intent", "放弃草稿，直接发布"), Tier::Content);
+         assert_eq!(tier_for_step("tap_by_intent", "No, post anyway"), Tier::Content);
+         assert_eq!(tier_for_label("放弃草稿，直接发布"), Tier::Content);
+         assert_eq!(tier_for_label("No, post anyway"), Tier::Content);
+         assert_eq!(raise(Tier::SelfOnly, "No, post anyway", true), Tier::Content);
+         // All clauses negated still counts as negation.
+         assert_eq!(tier_for_step("tap_by_intent", "Not now, maybe later"), Tier::SelfOnly);
+     }
++
++    #[test]
++    fn money_clauses_are_never_suppressed_by_negation() {
++        // 「不限量购买」: bare 「不」 is not one of the explicit negation words,
++        // and even if it were, a money clause can never be negated away.
++        assert_eq!(tier_for_label("不限量购买"), Tier::Money);
++        assert_eq!(tier_for_step("tap_by_intent", "不限量购买"), Tier::Money);
++
++        // Hyphenated English negation token ("no") still splits out, but the
++        // clause names money so it stays Money regardless.
++        assert_eq!(tier_for_label("No-fee checkout"), Tier::Money);
++        assert_eq!(tier_for_step("tap_by_intent", "No-fee checkout"), Tier::Money);
++
++        // An explicit negation word paired with a money word: money wins.
++        assert_eq!(tier_for_label("不要付款"), Tier::Money);
++        assert_eq!(tier_for_step("tap_by_intent", "不要付款"), Tier::Money);
++    }
+ }
+diff --git a/src/keys/mod.rs b/src/keys/mod.rs
+index 66feb1c..30cf401 100644
+--- a/src/keys/mod.rs
++++ b/src/keys/mod.rs
+@@ -1,13 +1,15 @@
+ //! dct 的两把钥匙（设计第 2 节）：自动钥匙签 `self` / `physical`，用户钥匙签
+ //! `content` / `money`，每次都要当场按 Touch ID。私钥在 Mac 安全芯片里，磁盘上只有
+-//! 安全芯片加密过的「把手」（只有这台 Mac 能用）和公钥。
++//! 安全芯片加密过的「把手」（只有这台 Mac 能用）和公钥。**需要 macOS 11 或更新**
++//! （build.rs 把 Swift 那半边编到 macOS 11.0 部署目标）；非 Mac 平台目前还没有
++//! 实现，`init` 会直接拒绝。
+ use anyhow::{anyhow, Context, Result};
+ use base64::{engine::general_purpose::STANDARD, Engine as _};
+ use dct_brain::sign::{key_id, SignError, Signer, TrustedKey};
+ use dct_brain::tier::SignerRole;
+ use serde::{Deserialize, Serialize};
+ use std::io::Write;
+ use std::path::PathBuf;
+ 
+ #[cfg(target_os = "macos")]
+ mod mac;
+@@ -29,22 +31,24 @@ impl SecureEnclave for NoEnclave {
+         false
+     }
+     fn create(&self, _: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
+         Err(SignError::Unavailable)
+     }
+     fn sign(&self, _: &[u8], _: &[u8], _: &str) -> Result<[u8; 64], SignError> {
+         Err(SignError::Unavailable)
+     }
+ }
+ 
+-/// 这台机器上的安全芯片。没有 passkey 的平台上，对外和动钱两档直接关闭，
+-/// 不退化成「点一下同意」（控制层设计）。
++/// 这台机器上的安全芯片。非 Mac 平台还没实现，`NoEnclave` 让 `create`/`sign`
++/// 一律返回 `Unavailable`，`init` 因此直接拒绝——两把钥匙一把都建不出来，
++/// 不是只关掉对外和动钱两档，是这些平台上现在**整个没有**票能被签出来，
++/// 连只影响自己的档也不行。绝不退化成「点一下同意」（控制层设计）。
+ pub fn platform_enclave() -> Box<dyn SecureEnclave> {
+     #[cfg(target_os = "macos")]
+     {
+         Box::new(mac::MacEnclave)
+     }
+     #[cfg(not(target_os = "macos"))]
+     {
+         Box::new(NoEnclave)
+     }
+ }
+@@ -210,21 +214,21 @@ impl Signer for EnclaveSigner<'_> {
+         self.role
+     }
+     fn public_key(&self) -> [u8; 65] {
+         self.public
+     }
+     fn sign(&self, msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
+         self.se.sign(&self.blob, msg, reason)
+     }
+ }
+ 
+-/// `dct keys init | show | test`。
++/// `dct keys init | show | test`。需要 macOS 11 或更新；别的平台上 `init` 会拒绝。
+ pub fn run_cli(args: &[String]) -> i32 {
+     let ks = KeyStore::at(KeyStore::default_dir());
+     let se = platform_enclave();
+     let r = match args.first().map(String::as_str) {
+         Some("init") => ks.init(se.as_ref()).map(|k| {
+             println!("两把钥匙已就绪：\n  自动钥匙 {}\n  指纹钥匙 {}", k.auto.key_id, k.user.key_id);
+         }),
+         Some("show") => ks.public_keys().and_then(|k| {
+             let k = k.ok_or_else(|| anyhow!("还没建钥匙，先运行 dct keys init"))?;
+             println!("{}", serde_json::to_string_pretty(&k)?);
+diff --git a/src/procedures.rs b/src/procedures.rs
+index a2f4cb4..9554ce2 100644
+--- a/src/procedures.rs
++++ b/src/procedures.rs
+@@ -107,48 +107,85 @@ impl Approvals {
+         Approvals { dir }
+     }
+ 
+     pub fn default_dir() -> PathBuf {
+         crate::proto::socket_path()
+             .parent()
+             .map(|p| p.join("approvals"))
+             .unwrap_or_else(|| PathBuf::from("approvals"))
+     }
+ 
+-    fn path(&self, steps_sha256: &str) -> PathBuf {
+-        self.dir.join(format!("{}.json", steps_sha256.trim_start_matches("sha256:")))
++    /// 文件名按 `sha256(流程全名 ‖ steps_sha256)` 算，两个字段各自长度前缀编码，
++    /// 不会因为字符串直接拼接而互相「串」到一起。只按 `steps_sha256` 命名会让
++    /// 两条步骤碰巧一样的流程共用同一份批准记录，互相覆盖。
++    fn path(&self, full_name: &str, steps_sha256: &str) -> PathBuf {
++        let mut bytes = Vec::new();
++        dct_brain::canon::field(&mut bytes, full_name);
++        dct_brain::canon::field(&mut bytes, steps_sha256);
++        let id = dct_brain::canon::sha256_id(&bytes);
++        self.dir.join(format!("{}.json", id.trim_start_matches("sha256:")))
+     }
+ 
+     /// 批准记录里可能带着「哪一步该改低哪一档」这种敏感判断，目录 0700、
+     /// 文件 0600，跟钥匙文件一个待遇——走仓库里现成的那套私有文件助手，
+     /// 不自己另起一套权限逻辑。
+     pub fn save(&self, sa: &SignedApproval) -> Result<()> {
+         std::fs::create_dir_all(&self.dir).with_context(|| format!("建批准记录目录 {} 失败", self.dir.display()))?;
+         crate::sys::fs::restrict_dir_to_owner(&self.dir)
+             .with_context(|| format!("批准记录目录 {} 的权限设置失败", self.dir.display()))?;
+-        let path = self.path(&sa.approval.steps_sha256);
++        let path = self.path(&sa.approval.procedure, &sa.approval.steps_sha256);
+         let mut f = crate::sys::fs::create_private(&path).with_context(|| format!("写批准记录 {} 失败", path.display()))?;
+         f.write_all(&serde_json::to_vec_pretty(sa)?)
+             .with_context(|| format!("写批准记录 {} 失败", path.display()))?;
+         Ok(())
+     }
+ 
+-    pub fn load(&self, steps_sha256: &str) -> Result<Option<SignedApproval>> {
+-        let path = self.path(steps_sha256);
++    pub fn load(&self, full_name: &str, steps_sha256: &str) -> Result<Option<SignedApproval>> {
++        let path = self.path(full_name, steps_sha256);
+         match std::fs::read(&path) {
+             Ok(b) => Ok(Some(serde_json::from_slice(&b).context("批准记录坏了")?)),
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+             Err(e) => Err(e).with_context(|| format!("读批准记录 {} 失败", path.display())),
+         }
+     }
+ }
+ 
++/// 把秒数写成人话：分钟/小时/天，不到一分钟才照实说秒数。凑得整的按单个单位说
++/// （"2 小时"），凑不整的按两级拼起来（"1 小时 30 分钟"），最多两级，够弹窗里
++/// 一眼看懂，不用心算一串裸秒数。
++fn human_duration(total_secs: u64) -> String {
++    const MINUTE: u64 = 60;
++    const HOUR: u64 = 60 * MINUTE;
++    const DAY: u64 = 24 * HOUR;
++
++    if total_secs < MINUTE {
++        return format!("{total_secs} 秒");
++    }
++    if total_secs < HOUR {
++        let m = total_secs / MINUTE;
++        let s = total_secs % MINUTE;
++        return if s == 0 { format!("{m} 分钟") } else { format!("{m} 分钟 {s} 秒") };
++    }
++    if total_secs < DAY {
++        let h = total_secs / HOUR;
++        let m = (total_secs % HOUR) / MINUTE;
++        return if m == 0 { format!("{h} 小时") } else { format!("{h} 小时 {m} 分钟") };
++    }
++    let d = total_secs / DAY;
++    let h = (total_secs % DAY) / HOUR;
++    if h == 0 {
++        format!("{d} 天")
++    } else {
++        format!("{d} 天 {h} 小时")
++    }
++}
++
+ fn tier_zh(t: Tier) -> &'static str {
+     match t {
+         Tier::Read => "只读",
+         Tier::SelfOnly => "只影响自己",
+         Tier::Physical => "物理动作",
+         Tier::Content => "对外",
+         Tier::Money => "动钱",
+     }
+ }
+ 
+@@ -282,21 +319,21 @@ pub fn ticket(
+     if !shown.executable {
+         bail!("这条流程现在不能执行：{}", shown.why_not.as_deref().unwrap_or("dcv 没说原因"));
+     }
+     let declared: BTreeSet<&str> = shown.params.iter().map(String::as_str).collect();
+     let given: BTreeSet<&str> = params.keys().map(String::as_str).collect();
+     if declared != given {
+         bail!("参数对不上：流程要的是 {}，给的是 {}", join_names(&declared), join_names(&given));
+     }
+     let steps_sha = steps_sha256(&shown.params, &shown.steps);
+     let not_approved = || anyhow!("这条流程还没批准，或者改过了，先运行 dct procedure approve {full_name}");
+-    let sa = approvals.load(&steps_sha)?.ok_or_else(not_approved)?;
++    let sa = approvals.load(full_name, &steps_sha)?.ok_or_else(not_approved)?;
+     verify_approval(&sa, &keys.trusted()?, full_name, &steps_sha).map_err(|_| not_approved())?;
+     let tier = sa.approval.run_tier();
+     // 时间只能往上加，绝不能悄悄绕回去：溢出算错误，不算「立刻生效」。
+     let earliest = now.checked_add(start_in).ok_or_else(|| anyhow!("时间算不出来了：现在时间加上提前量超出了范围"))?;
+     let expires = earliest.checked_add(window).ok_or_else(|| anyhow!("时间算不出来了：结束时间超出了范围"))?;
+     let t = Ticket {
+         v: TICKET_VERSION,
+         nonce: random_nonce()?,
+         device: device.to_string(),
+         tier,
+@@ -307,38 +344,40 @@ pub fn ticket(
+         },
+         params_sha256: params_sha256(&params),
+         earliest,
+         expires,
+     };
+     let role = match tier.required_signer() {
+         Some(SignerRole::User) => SignerRole::User,
+         _ => SignerRole::Auto,
+     };
+     let signer = keys.signer(role, se)?;
++    // 每一步点名它真实的档位——动钱的步骤要说「动钱」，不能笼统写成「对外」，
++    // 不然用户以为要签的是发布帖子，其实是在花钱。
+     let strict: Vec<String> = shown
+         .steps
+         .iter()
+         .zip(&sa.approval.step_tiers)
+         .filter(|(_, t)| **t >= Tier::Content)
+-        .map(|(s, _)| format!("第{}步", s.n))
++        .map(|(s, t)| format!("第{}步{}", s.n, tier_zh(*t)))
+         .collect();
+     // 有效期从什么时候开始、能用多久，弹窗里得说清楚，别让人瞎猜「现在按了
+-    // 是不是马上就执行」。
++    // 是不是马上就执行」；单位换算成分钟/小时/天，不糊一串裸秒数上去。
+     let period = if start_in == 0 {
+-        format!("从现在起 {window} 秒内有效")
++        format!("从现在起 {} 内有效", human_duration(window))
+     } else {
+-        format!("{start_in} 秒后开始，此后 {window} 秒内有效")
++        format!("{} 后开始，此后 {} 内有效", human_duration(start_in), human_duration(window))
+     };
+     let reason = if strict.is_empty() {
+         format!("执行流程 {full_name}：{period}")
+     } else {
+-        format!("执行流程 {full_name}（{}对外）：{period}", strict.join("、"))
++        format!("执行流程 {full_name}（{}）：{period}", strict.join("、"))
+     };
+     sign_one(t, &signer, &reason).map_err(|e| anyhow!("{e}"))
+ }
+ 
+ fn now_secs() -> u64 {
+     std::time::SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map(|d| d.as_secs())
+         .unwrap_or(0)
+ }
+@@ -522,45 +561,45 @@ mod tests {
+         let w = world();
+         let sa = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
+         assert_eq!(
+             sa.approval.step_tiers,
+             vec![Tier::SelfOnly, Tier::SelfOnly, Tier::SelfOnly, Tier::Content]
+         );
+         assert_eq!(sa.approval.steps_sha256, STEPS_A);
+         assert_eq!(w.dcv.approve_calls.get(), 1);
+         let reasons = w.se.reasons.borrow();
+         assert!(reasons[0].contains("social:edit-bio") && reasons[0].contains("保存"), "{reasons:?}");
+-        assert!(w.approvals.load(STEPS_A).unwrap().is_some());
++        assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_some());
+     }
+ 
+     #[test]
+     fn the_user_can_change_a_proposed_tier() {
+         let w = world();
+         let sa = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(4, Tier::Money)], 1000).unwrap();
+         assert_eq!(sa.approval.step_tiers[3], Tier::Money);
+     }
+ 
+     #[test]
+     fn cancelling_touch_id_approves_nothing() {
+         let w = world();
+         w.se.cancel_user.set(true);
+         assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).is_err());
+         assert_eq!(w.dcv.approve_calls.get(), 0, "没按指纹就不该去 dcv 里确认");
+-        assert!(w.approvals.load(STEPS_A).unwrap().is_none());
++        assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_none());
+     }
+ 
+     #[test]
+     fn a_procedure_changed_between_show_and_approve_is_not_saved() {
+         let w = world();
+         *w.dcv.approved_body.borrow_mut() = "sha256:changed".into();
+         assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).is_err());
+-        assert!(w.approvals.load(STEPS_A).unwrap().is_none());
++        assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_none());
+     }
+ 
+     #[test]
+     fn a_ticket_for_an_approved_outward_procedure_is_signed_by_the_user() {
+         let w = world();
+         approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
+         *w.dcv.show.borrow_mut() = edit_bio(true);
+         let params = BTreeMap::from([("bio".to_string(), "Founder, Learning Tech.".to_string())]);
+         let st = ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).unwrap();
+         assert_eq!(st.ticket.tier, Tier::Content);
+@@ -645,20 +684,47 @@ mod tests {
+     #[test]
+     fn an_approval_for_one_procedure_does_not_authorize_another_with_the_same_steps() {
+         let w = world();
+         approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
+         *w.dcv.show.borrow_mut() = edit_bio(true);
+         let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
+         let e = ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio-copy", "mac-lei", params, 0, 600, 2000).unwrap_err();
+         assert!(e.to_string().contains("先运行 dct procedure approve"), "{e}");
+     }
+ 
++    #[test]
++    fn two_procedures_with_identical_steps_keep_independent_approval_files() {
++        let d = tempfile::tempdir().unwrap();
++        let approvals = Approvals::at(d.path().to_path_buf());
++        let user = SoftSigner::from_seed(SignerRole::User, 2);
++        let mk = |procedure: &str, tiers: Vec<Tier>| Approval {
++            v: APPROVAL_VERSION,
++            procedure: procedure.to_string(),
++            steps_sha256: STEPS_A.to_string(),
++            body_sha256: format!("sha256:{}", "ab".repeat(32)),
++            step_tiers: tiers,
++            approved_at: 1000,
++        };
++        let sa1 = sign_approval(mk("social:a", vec![Tier::SelfOnly]), &user, "").unwrap();
++        let sa2 = sign_approval(mk("social:b", vec![Tier::Content]), &user, "").unwrap();
++        approvals.save(&sa1).unwrap();
++        approvals.save(&sa2).unwrap();
++
++        let loaded1 = approvals.load("social:a", STEPS_A).unwrap().expect("social:a should be saved");
++        let loaded2 = approvals.load("social:b", STEPS_A).unwrap().expect("social:b should be saved");
++        assert_eq!(loaded1.approval.step_tiers, vec![Tier::SelfOnly]);
++        assert_eq!(loaded2.approval.step_tiers, vec![Tier::Content]);
++        // 两条流程的批准文件真的是两个不同的文件，不是同一份被后写的覆盖了先写的。
++        assert!(approvals.load("social:a", STEPS_A).unwrap().is_some());
++        assert!(approvals.load("social:b", STEPS_A).unwrap().is_some());
++    }
++
+     #[test]
+     fn an_override_of_a_nonexistent_step_is_an_error() {
+         let w = world();
+         assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(99, Tier::Content)], 1000).is_err());
+     }
+ 
+     #[test]
+     fn lowering_a_money_step_is_refused() {
+         let w = world();
+         let mut v = edit_bio(false);
+@@ -716,11 +782,57 @@ mod tests {
+         v["steps"][0].as_object_mut().unwrap().remove("arg");
+         assert!(Shown::parse("social:edit-bio", &v).is_err());
+     }
+ 
+     #[test]
+     fn shown_parse_rejects_duplicate_step_numbers() {
+         let mut v = edit_bio(true);
+         v["steps"][1]["n"] = json!(1);
+         assert!(Shown::parse("social:edit-bio", &v).is_err());
+     }
++
++    #[test]
++    fn human_duration_uses_minutes_hours_and_days() {
++        assert_eq!(human_duration(0), "0 秒");
++        assert_eq!(human_duration(45), "45 秒");
++        assert_eq!(human_duration(60), "1 分钟");
++        assert_eq!(human_duration(90), "1 分钟 30 秒");
++        assert_eq!(human_duration(600), "10 分钟");
++        assert_eq!(human_duration(3600), "1 小时");
++        assert_eq!(human_duration(5400), "1 小时 30 分钟");
++        assert_eq!(human_duration(86_400), "1 天");
++        assert_eq!(human_duration(90_000), "1 天 1 小时");
++        assert_eq!(human_duration(2_592_000), "30 天");
++    }
++
++    #[test]
++    fn the_ticket_prompt_describes_money_steps_as_paying_money_not_outward() {
++        let w = world();
++        let mut v = edit_bio(false);
++        v["steps"][3]["arg"] = json!("立即支付");
++        *w.dcv.show.borrow_mut() = v;
++        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        let mut executable = edit_bio(true);
++        executable["steps"][3]["arg"] = json!("立即支付");
++        *w.dcv.show.borrow_mut() = executable;
++        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
++        ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).unwrap();
++        let reasons = w.se.reasons.borrow();
++        let reason = reasons.last().unwrap();
++        assert!(reason.contains("第4步动钱"), "{reason}");
++        assert!(!reason.contains("对外"), "{reason}");
++    }
++
++    #[test]
++    fn the_ticket_prompt_shows_the_validity_period_in_human_units() {
++        let w = world();
++        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        *w.dcv.show.borrow_mut() = edit_bio(true);
++        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
++        ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 90, 5400, 2000).unwrap();
++        let reasons = w.se.reasons.borrow();
++        let reason = reasons.last().unwrap();
++        assert!(reason.contains("1 分钟 30 秒"), "{reason}");
++        assert!(reason.contains("1 小时 30 分钟"), "{reason}");
++        assert!(!reason.contains("90 秒") && !reason.contains("5400 秒"), "{reason}");
++    }
+ }

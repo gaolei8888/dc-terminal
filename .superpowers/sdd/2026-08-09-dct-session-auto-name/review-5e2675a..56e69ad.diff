@@ -1,0 +1,261 @@
+# Review package: 5e2675a..56e69ad
+
+## Commits
+56e69ad fix: bound the name in the two display sites that could overflow
+
+## Files changed
+ src/ui/attach.rs | 61 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ src/ui/grid.rs   | 55 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 112 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/src/ui/attach.rs b/src/ui/attach.rs
+index 3383bc0..3209705 100644
+--- a/src/ui/attach.rs
++++ b/src/ui/attach.rs
+@@ -3,21 +3,21 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+ use ratatui::prelude::*;
+ use ratatui::widgets::{Block, Borders, Paragraph};
+ 
+ use crate::i18n::Lang;
+ use crate::proto::{MouseForward, MouseForwardKind, Request};
+ use crate::session::{ScrollBy, ScrollState, SessionInfo};
+ 
+ use super::app::App;
+ use super::key_to_input;
+ use super::view::View;
+-use super::widgets::{screen_to_lines, short_path, Msg};
++use super::widgets::{screen_to_lines, short_path, truncate, Msg};
+ 
+ /// 滚轮一格滚几行。3 是终端惯例，改了会跟用户在别处（浏览器、编辑器）的
+ /// 肌肉记忆打架。
+ const WHEEL_ROWS: i32 = 3;
+ 
+ /// 一次滚轮/翻页该做什么。纯函数，好测。
+ pub(crate) enum ScrollAction {
+     /// 转发给 agent，dct 自己不处理。
+     Forward,
+     /// dct 自己滚这么多行；正数往上（看历史），负数往下。
+@@ -225,21 +225,35 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+     // 句式；接在 `project` 后面是纯拼接，句式不动。
+     let here = app
+         .sessions
+         .iter()
+         .find(|s| s.id == id)
+         .map(|s| {
+             let project = short_path(&s.dir);
+             if s.tag.is_empty() {
+                 project
+             } else {
+-                format!("{project} · {}", s.tag)
++                // 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS`
++                // 给的是 24 个字符的余量，不是「不超过 12 个汉字」那句提示的
++                // 保证——真给满 24 个汉字就是 48 列。这句标题的尾巴「—— F2
++                // 返回看板」/「—— F2 goes back」是屏幕上唯一说得出怎么退出
++                // 这个会话的地方，名字不裁的话会把它顶出边框，用户连「有这个
++                // 键」这件事都看不见（这个项目已经出过一次这个形状的 bug：
++                // 键存在，但屏幕上哪儿都没写）。
++                //
++                // 16 列是量出来的：60 列（本仓库测的最窄宽度）减 2 列边框，
++                // 减前缀「Session 1 · 」（英文最长档，12 列）、减分隔符
++                // 「 · 」（3 列）、减尾巴「 —— F2 goes back」（英文最长档，
++                // 16 列），剩下给 `project` 和名字总共 27 列；`truncate`
++                // 真裁了会多出一列，所以传 15 留 1 列余量——`project` 在这个
++                // 视图里通常只是最后一段目录名，不会把这份预算吃光。
++                format!("{project} · {}", truncate(&s.tag, 15))
+             }
+         })
+         .unwrap_or_default();
+     let title = if app.connected {
+         crate::i18n::msg::session_title(app.lang, id, &here)
+     } else {
+         crate::i18n::msg::session_title_disconnected(app.lang, id, &here)
+     };
+     f.render_widget(
+         Paragraph::new(screen_to_lines(&app.screen)).block(
+@@ -376,20 +390,63 @@ mod tests {
+             tag: String::new(),
+         }
+     }
+ 
+     fn attached_app() -> (App, tempfile::TempDir) {
+         let (mut app, d) = App::test_app();
+         app.view = View::Attached(1);
+         (app, d)
+     }
+ 
++    fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
++        let buf = term.backend().buffer();
++        let a = buf.area;
++        (0..a.height)
++            .flat_map(|y| (0..a.width).map(move |x| (x, y)))
++            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
++            .collect::<String>()
++            .chars()
++            .filter(|c| !c.is_whitespace())
++            .collect()
++    }
++
++    /// 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS` 给的是
++    /// 24 个字符的余量，不是「不超过 12 个汉字」那句提示的承诺——真给满
++    /// 24 个汉字就是 48 列。标题尾巴「F2 返回看板」是屏幕上唯一说得出怎么
++    /// 退出这个会话的地方，名字不裁的话会把它顶出边框：这个项目已经出过
++    /// 一次同样形状的 bug（键存在，但屏幕上哪儿都没写），不是假设的风险。
++    ///
++    /// 两个宽度都测：60 列是仓库里既有宽度测试用的最窄档，80 列是最常见
++    /// 的终端下限。
++    #[test]
++    fn a_long_name_never_pushes_the_way_back_off_the_title() {
++        use ratatui::backend::TestBackend;
++
++        for width in [80u16, 60] {
++            let (mut app, _dir) = App::test_app();
++            let mut s = session(1, SessionState::Idle);
++            s.dir = "/w/a".into();
++            s.tag = "修".repeat(24);
++            app.set_sessions(vec![s]);
++            app.view = View::Attached(1);
++
++            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
++            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++
++            let c = screen_text(&term);
++            assert!(
++                c.contains("F2返回看板"),
++                "{width} 列下一个 48 列宽的名字把退出提示顶出了标题：{c}"
++            );
++        }
++    }
++
+     #[test]
+     fn f4_toggles_copy_mode_and_is_never_forwarded_to_the_agent() {
+         let (mut app, _d) = attached_app();
+         assert!(!app.copy_mode);
+ 
+         handle_key(&mut app, key(KeyCode::F(4))).unwrap();
+         assert!(app.copy_mode, "第一下打开");
+ 
+         handle_key(&mut app, key(KeyCode::F(4))).unwrap();
+         assert!(!app.copy_mode, "第二下关掉");
+diff --git a/src/ui/grid.rs b/src/ui/grid.rs
+index fae937a..981d0e1 100644
+--- a/src/ui/grid.rs
++++ b/src/ui/grid.rs
+@@ -352,21 +352,28 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+         Chrome {
+             connected: app.connected,
+             lang: app.lang,
+         },
+         !app.sessions.is_empty(),
+     );
+     if let Some(draft) = draft {
+         let who = visible
+             .iter()
+             .find(|s| s.id == draft.id)
+-            .map(|s| format!("{} {}", s.id, session_label(s)))
++            // 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS`
++            // 给的是 24 个字符的余量，不是「不超过 12 个汉字」这句提示的
++            // 保证——真给满 24 个汉字就是 48 列。收件人写在 `to` 前面、
++            // `body`（用户正在打的字）和光标 `▌` 跟在后面同一行，名字不裁的话
++            // 会把用户自己正在打的字连同光标一起顶出屏幕，而这正是他此刻
++            // 眼睛盯着的地方。跟格子标题用同一个上限（20），两处对「名字最多
++            // 露多宽」给同一个答案。
++            .map(|s| format!("{} {}", s.id, truncate(session_label(s), 20)))
+             // 收件人在打字途中被停掉了。仍然照实写出 id——用户得看得见
+             // 自己正在对谁说话，哪怕那个会话刚没了。
+             .unwrap_or_else(|| draft.id.to_string());
+         draw_reply(f, area, &draft.text, &who, app.lang);
+     }
+ }
+ 
+ /// 画九宫格。格子的顺序 = 当页会话的顺序；画面按 id 跟 `screens` 配对，
+ /// 一时没配上的格子只画标题和空白——下一轮 300ms 就有了，比画错内容强。
+ ///
+@@ -866,21 +873,26 @@ mod tests {
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
+             tag: String::new(),
+         }
+     }
+ 
+     fn grid_text(app: &mut App) -> String {
+-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
++        grid_text_at(app, 120, 30)
++    }
++
++    fn grid_text_at(app: &mut App, width: u16, height: u16) -> String {
++        let mut term =
++            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+         term.draw(|f| draw(f, f.area(), app)).unwrap();
+         let buf = term.backend().buffer();
+         let a = buf.area;
+         (0..a.height)
+             .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+             .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+             .collect::<String>()
+             .chars()
+             .filter(|c| !c.is_whitespace())
+             .collect()
+@@ -2364,20 +2376,59 @@ mod tests {
+         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+ 
+         let c = grid_text(&mut app);
+         assert!(
+             c.contains("2修登录白屏"),
+             "回复行要写名字，不是 profile：{c}"
+         );
+         assert!(!c.contains("claude"), "有名字就不该再露出 profile：{c}");
+     }
+ 
++    /// 名字是模型起的，宽度当对抗输入处理：`session::NAME_MAX_CHARS` 给的是
++    /// 24 个字符的余量，不是「不超过 12 个汉字」那句提示的承诺——真给满
++    /// 24 个汉字就是 48 列。收件人 `to` 画在这一行最前面，用户正在打的字
++    /// 和光标 `▌` 跟在它后面——名字不裁的话会把这两样一起顶出屏幕，而那
++    /// 正是用户按 Enter 之前唯一在看的地方，他会看不见自己正要发出去什么。
++    ///
++    /// 两个宽度都测：60 是九宫格自己的最小支持宽度（`MIN_COLS`），80 是
++    /// 最常见的终端下限。
++    #[test]
++    fn a_long_name_never_pushes_the_draft_off_the_reply_row() {
++        // 光一个短短的「继续」量不出这个 bug：收件人前缀（`→ id ：`）本来就
++        // 短，48 列的名字加上一句两个字的草稿，在 60 列上还差 1 列勉强够放
++        // 得下——真按下暂停键，这条测试会绿得毫无意义。挑一句用户真会打的
++        // 长一点的话（14 个字，28 列），未裁时连 80 列都放不下，两个宽度
++        // 才都真的在测这件事，而不是巧合地够用。
++        let draft = "继续，麻烦顺手也把这个改掉";
++        for width in [80u16, 60] {
++            let (mut app, _dir) = App::test_app();
++            let mut sessions = vec![session(1, SessionState::Idle)];
++            sessions[0].tag = "修".repeat(24);
++            app.set_sessions(sessions);
++            app.view = View::grid(0);
++            handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
++            for c in draft.chars() {
++                handle_key(&mut app, key(KeyCode::Char(c))).unwrap();
++            }
++
++            let c = grid_text_at(&mut app, width, 24);
++            assert!(
++                c.contains(draft),
++                "{width} 列下一个 48 列宽的名字把正在打的字顶出了屏幕：{c}"
++            );
++            assert!(
++                c.contains('▌'),
++                "{width} 列下一个 48 列宽的名字把光标顶出了屏幕：{c}"
++            );
++        }
++    }
++
+     /// 空框时要把「直接回车 = 同意」写出来。这是最高频的用法，不写的话
+     /// 用户会以为必须先打点什么才能回。
+     #[test]
+     fn an_empty_box_says_that_a_bare_enter_approves() {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![session(1, SessionState::Idle)]);
+         app.view = View::grid(0);
+         handle_key(&mut app, key(KeyCode::Char('i'))).unwrap();
+ 
+         let c = grid_text(&mut app);
