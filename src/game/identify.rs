@@ -115,6 +115,29 @@ mod tests {
         .unwrap())
     }
 
+    /// 读得出格子，但一种颜色占了 11/12：是弹窗不是棋盘。
+    fn popup_grid() -> Result<GridRead, DcoError> {
+        Ok(serde_json::from_value(json!({
+            "rows": 3, "cols": 4,
+            "cells": [[1,1,1,1],[1,1,1,1],[1,1,1,2]],
+            "odd": [[false,false,false,false],[false,false,false,false],[false,false,false,false]],
+            "classes": [{"id":1,"count":11},{"id":2,"count":1}]
+        }))
+        .unwrap())
+    }
+
+    #[test]
+    fn a_readable_grid_that_is_not_board_like_is_not_match3() {
+        let mut d = Fake { texts: Some(vec!["PLAY", "OPTIONS"]), grid: popup_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
+    }
+
+    #[test]
+    fn a_strong_cue_with_a_non_board_like_grid_is_hidden_object() {
+        let mut d = Fake { texts: Some(vec!["Inventory"]), grid: popup_grid() };
+        assert_eq!(identify(&mut d, &profile()), Genre::HiddenObject);
+    }
+
     #[test]
     fn a_readable_board_is_match3() {
         let mut d = Fake { texts: Some(vec!["Hint"]), grid: good_grid() };
