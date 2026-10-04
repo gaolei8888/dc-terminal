@@ -1185,3 +1185,15 @@ fn an_unreadable_list_in_a_flat_run_neither_clears_nor_advances_the_count() {
     // 不带空档要在下标 6；空档同时让这一步的前后两次都对不上，共 2 步不算数
     assert_eq!(first_stalled(&log), Some(8));
 }
+
+#[test]
+fn a_stall_asks_the_model_once_then_counts_again() {
+    let mut v = vec![&["50"][..]];
+    v.extend(flat(14));
+    let (log, asked) = run_progress(lists(&v), Some(0), 14);
+    let stalled: Vec<usize> = (0..log.len()).filter(|&i| log[i]["stalled"] == true).collect();
+    assert_eq!(stalled, vec![6, 12], "{stalled:?}");
+    assert_eq!(asked, 2);
+    let asked_at: Vec<usize> = (0..log.len()).filter(|&i| log[i].get("ask").is_some()).collect();
+    assert_eq!(asked_at, vec![6, 12]);
+}

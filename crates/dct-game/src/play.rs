@@ -359,14 +359,19 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
         let mut pick = pick;
         let mut ask_rec: Option<Value> = None;
         let mut decider = "rules";
+        let stalled_now = no_progress >= STALL_STEPS;
         if let Some(adv) = o.advisor {
             // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
             let offered: Vec<usize> = {
                 (0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()
             };
             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
-            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here || no_progress >= STALL_STEPS) {
+            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here || stalled_now) {
                 asked += 1;
+                // 只因为卡住才问的：问过一次就重新数，别每一步都问。
+                if !o.ask_always && !had_failed_here {
+                    no_progress = 0;
+                }
                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
                 let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
                 let input = AskInput {
@@ -406,7 +411,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
             "chosen": pick, "decider": decider, "dry_run": o.dry_run, "swiped": false,
             "predicted_cleared": chosen.features.cleared + chosen.features.cascade,
         });
-        if no_progress >= STALL_STEPS {
+        if stalled_now {
             rec["stalled"] = json!(true);
         }
         if let Some(a) = ask_rec {
