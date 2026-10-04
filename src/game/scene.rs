@@ -3,7 +3,7 @@
 //! 循环本身在 `crates/dct-game/src/scene.rs`；这里接命令行、模型、记录文件和给用户看的话。
 //! 设计：docs/superpowers/plans/2026-10-04-dct-game-scene.md。
 
-const USAGE: &str = "用法：dct game scene [--game 名字] [--steps 10] [--dry-run] [--brain config,claude]";
+const USAGE: &str = "用法：dct game scene [--game 名字] [--steps 10] [--dry-run] [--brain config,claude] [--goal 一句话目标]";
 
 #[derive(Debug, PartialEq)]
 pub struct Args {
@@ -12,6 +12,8 @@ pub struct Args {
     pub dry_run: bool,
     /// 大脑升级链：`config`（[llm] 里配的）、`claude`（本机登录的 Claude Code）。
     pub brain: Vec<String>,
+    /// 可选的目标，一句话（比如「找到蜂蜜」）；不写就和以前一样。
+    pub goal: Option<String>,
 }
 
 /// 用了 Claude 就得先说清楚画面会发给谁。
@@ -30,13 +32,17 @@ fn parse_brain(v: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { game: "candy-crush".into(), steps: 10, dry_run: false, brain: vec!["config".into()] };
+    let mut a = Args { game: "candy-crush".into(), steps: 10, dry_run: false, brain: vec!["config".into()], goal: None };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--dry-run" => a.dry_run = true,
             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
             "--brain" => a.brain = parse_brain(it.next().ok_or("--brain 后面要写大脑名，比如 config,claude")?)?,
+            "--goal" => {
+                let v = it.next().map(|v| v.trim()).filter(|v| !v.is_empty());
+                a.goal = Some(v.ok_or("--goal 后面要写一句话目标，比如 --goal \"找到蜂蜜\"")?.to_string());
+            }
             "--steps" => {
                 let v = it.next().ok_or("--steps 后面要写步数")?;
                 a.steps = v.parse().ok().filter(|n| (1..=100).contains(n)).ok_or("--steps 要在 1 到 100 之间")?;
@@ -108,7 +114,7 @@ fn run_parsed(a: &Args) -> i32 {
                 }
             }
         };
-        brains.push((name.clone(), Box::new(LlmVision::new(backend, model))));
+        brains.push((name.clone(), Box::new(LlmVision::new(backend, model).with_goal(a.goal.clone()))));
     }
     let vision = unix::ChainVision::new(brains);
     let clock = SystemClock;
@@ -236,11 +242,17 @@ mod unix {
         model: String,
         timeout: Duration,
         sips: Sips,
+        goal: Option<String>,
     }
 
     impl LlmVision {
         pub fn new(backend: Arc<dyn Backend>, model: String) -> LlmVision {
-            LlmVision { backend, model, timeout: Duration::from_secs(60), sips: real_sips() }
+            LlmVision { backend, model, timeout: Duration::from_secs(60), sips: real_sips(), goal: None }
+        }
+
+        pub fn with_goal(mut self, g: Option<String>) -> LlmVision {
+            self.goal = g;
+            self
         }
 
         #[cfg(test)]
@@ -250,14 +262,20 @@ mod unix {
         }
     }
 
-    fn question(history: &[(u16, u16)]) -> String {
+    pub fn question(history: &[(u16, u16)], goal: Option<&str>) -> String {
         let seen: Vec<String> = history.iter().map(|(x, y)| format!("({:.2}, {:.2})", *x as f64 / 10000.0, *y as f64 / 10000.0)).collect();
-        format!(
+        let base = format!(
             "这是一个寻物冒险手机游戏的场景截图（横屏）。我要继续玩，请选出下一步最值得点的一个场景物件\
              （门、箱子、楼梯、工具、可拾取的东西等），不要选菜单、按钮、物品栏、提示、右上的金币。\
              已经点过的位置（不要重复）：[{}]。只用 JSON 回答：{{\"name\": 物件名, \"x\": 0到1的横向位置, \"y\": 0到1的纵向位置, \"why\": 一句话}}",
             seen.join(", ")
-        )
+        );
+        match goal {
+            None => base,
+            Some(g) => format!(
+                "{base}\n这一轮的目标：{g}。如果从画面上已经能看出目标达成了，就在 JSON 里加上 \"done\": true（其他字段照常写）。"
+            ),
+        }
     }
 
     impl Vision for LlmVision {
@@ -265,7 +283,7 @@ mod unix {
             let (img, mime, image_note) = shrink(png, &self.sips);
             let p = Prompt {
                 system: SYSTEM.into(),
-                user: question(history),
+                user: question(history, self.goal.as_deref()),
                 max_tokens: 300,
                 image_png_base64: Some(base64::engine::general_purpose::STANDARD.encode(&img)),
                 image_mime: (mime != "image/png").then(|| mime.to_string()),
@@ -326,6 +344,7 @@ mod unix {
     pub fn stop_line(stop: &SceneStop, steps: usize) -> (String, i32) {
         match stop {
             SceneStop::StepsDone => (format!("走完了 {steps} 步。"), 0),
+            SceneStop::GoalReached => (format!("目标达成了，一共走了 {steps} 步。"), 0),
             SceneStop::DryRun => ("试走完成，没有真点。".into(), 0),
             SceneStop::PrivateScreen => ("这个画面看起来是私人内容，我没有读它，也没有操作。请切回游戏。".into(), 0),
             SceneStop::NoTapAt => ("这台章鱼还不会按位置点，等它更新后再试。".into(), 0),
@@ -338,9 +357,14 @@ mod unix {
         }
     }
 
+    /// 一句话：大模型一共花了多少秒、走了多少步。
+    pub fn time_line(model_ms: u64, steps: usize) -> String {
+        format!("大模型一共用了 {:.1} 秒，走了 {steps} 步。", model_ms as f64 / 1000.0)
+    }
+
     /// 整条命令（除了装配）。`dco`、`vision`、`clock` 都是传进来的，测试里换成假的。
     pub fn run_core(a: &Args, loaded: &Loaded, dco: &mut dyn Dco, clock: &mut dyn Clock, vision: &dyn Vision, rec: &Recorder) -> i32 {
-        let o = SceneOptions { max_steps: a.steps, dry_run: a.dry_run, no_tap: loaded.no_tap.clone(), game: a.game.clone() };
+        let o = SceneOptions { max_steps: a.steps, dry_run: a.dry_run, no_tap: loaded.no_tap.clone(), game: a.game.clone(), goal: a.goal.clone() };
         if let Some(n) = super::privacy_notice(&a.brain) {
             println!("{n}");
         }
@@ -361,6 +385,9 @@ mod unix {
                 println!("这次问了大模型 {} 次（没有读到用量）。", s.asks);
             }
         }
+        if s.asks > 0 {
+            println!("{}", time_line(s.model_ms, s.steps));
+        }
         println!("教学记录在 {}", rec.dir().display());
         code
     }
@@ -376,8 +403,8 @@ mod tests {
 
     #[test]
     fn parse_defaults_and_flags() {
-        assert_eq!(p(&[]).unwrap(), Args { game: "candy-crush".into(), steps: 10, dry_run: false, brain: vec!["config".into()] });
-        assert_eq!(p(&["--game", "x-1", "--steps", "100", "--dry-run"]).unwrap(), Args { game: "x-1".into(), steps: 100, dry_run: true, brain: vec!["config".into()] });
+        assert_eq!(p(&[]).unwrap(), Args { game: "candy-crush".into(), steps: 10, dry_run: false, brain: vec!["config".into()], goal: None });
+        assert_eq!(p(&["--game", "x-1", "--steps", "100", "--dry-run"]).unwrap(), Args { game: "x-1".into(), steps: 100, dry_run: true, brain: vec!["config".into()], goal: None });
     }
 
     #[test]
@@ -395,6 +422,16 @@ mod tests {
         assert!(privacy_notice(&v(&["claude"])).unwrap().contains("发给 Claude"));
         assert!(privacy_notice(&v(&["config", "claude"])).is_some());
         assert!(privacy_notice(&v(&["config"])).is_none());
+    }
+
+    #[test]
+    fn parse_goal_takes_text_and_refuses_empty_or_missing() {
+        assert_eq!(p(&["--goal", " 找到蜂蜜 "]).unwrap().goal.as_deref(), Some("找到蜂蜜"));
+        assert_eq!(p(&[]).unwrap().goal, None);
+        for bad in [&["--goal"][..], &["--goal", ""], &["--goal", "  "]] {
+            let e = p(bad).unwrap_err();
+            assert!(e.contains("--goal 后面要写"), "{e}");
+        }
     }
 
     #[test]
@@ -578,7 +615,7 @@ mod unix_tests {
     fn a_dry_run_writes_the_record_and_the_sent_image_and_taps_nothing() {
         let (_h, loaded, rec) = setup();
         let mut d = Dc { private: false, captures: 0, taps: 0 };
-        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: true, brain: vec!["config".into()] };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: true, brain: vec!["config".into()], goal: None };
         assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &One, &rec), 0);
         assert_eq!(d.taps, 0);
         let line = std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap();
@@ -591,7 +628,7 @@ mod unix_tests {
     fn a_private_screen_records_nothing_and_exits_zero_without_capturing() {
         let (_h, loaded, rec) = setup();
         let mut d = Dc { private: true, captures: 0, taps: 0 };
-        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false, brain: vec!["config".into()] };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false, brain: vec!["config".into()], goal: None };
         assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &One, &rec), 0);
         assert_eq!((d.captures, d.taps), (0, 0));
         assert!(std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap().is_empty());
@@ -612,7 +649,7 @@ mod unix_tests {
         let calls = Arc::new(Mutex::new(0));
         let chain = ChainVision::new(vec![("claude".into(), Box::new(Counting(calls.clone())))]);
         let mut d = Dc { private: true, captures: 0, taps: 0 };
-        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false, brain: vec!["claude".into()] };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false, brain: vec!["claude".into()], goal: None };
         assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &chain, &rec), 0);
         assert_eq!((*calls.lock().unwrap(), d.captures), (0, 0));
     }
@@ -624,7 +661,7 @@ mod unix_tests {
         let chain = ChainVision::new(vec![("config".into(), Box::new(Counting(c1.clone()))), ("claude".into(), Box::new(Counting(c2.clone())))]);
         // Dc 点了但文字永远没变 → 每步都是 noop → 第 3 步起该换 claude。
         let mut d = Dc { private: false, captures: 0, taps: 0 };
-        let a = Args { game: "candy-crush".into(), steps: 4, dry_run: false, brain: vec!["config".into(), "claude".into()] };
+        let a = Args { game: "candy-crush".into(), steps: 4, dry_run: false, brain: vec!["config".into(), "claude".into()], goal: None };
         run_core(&a, &loaded, &mut d, &mut Clk, &chain, &rec);
         let brains: Vec<String> = std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap().lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["brain"].as_str().unwrap().to_string()).collect();
         assert_eq!(&brains[..3], ["config", "config", "claude"], "{brains:?}");
@@ -632,8 +669,36 @@ mod unix_tests {
     }
 
     #[test]
+    fn the_prompt_names_the_goal_only_when_given_and_is_unchanged_without_it() {
+        use super::unix::question;
+        let plain = question(&[(1800, 6000)], None);
+        assert!(!plain.contains("目标") && !plain.contains("done"), "{plain}");
+        assert!(plain.ends_with("\"why\": 一句话}"), "{plain}");
+        let with = question(&[(1800, 6000)], Some("找到蜂蜜"));
+        assert!(with.starts_with(&plain) && with.contains("目标：找到蜂蜜") && with.contains("\"done\": true"), "{with}");
+        let (v, b) = vision(Ok((r#"{"name":"a","x":0.1,"y":0.1}"#.into(), None)));
+        v.with_goal(Some("找到蜂蜜".into())).pick(&[1], &[]).unwrap();
+        assert!(b.1.lock().unwrap()[0].user.contains("找到蜂蜜"));
+    }
+
+    #[test]
+    fn a_goal_run_writes_goal_in_every_record_and_the_time_line_says_seconds() {
+        let (_h, loaded, rec) = setup();
+        let mut d = Dc { private: false, captures: 0, taps: 0 };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: true, brain: vec!["config".into()], goal: Some("找到蜂蜜".into()) };
+        assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &One, &rec), 0);
+        let line = std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(v["goal"], "找到蜂蜜");
+        let t = super::unix::time_line(12_340, 3);
+        assert!(t.contains("12.3 秒") && t.contains("3 步"), "{t}");
+        assert_eq!(stop_line(&SceneStop::GoalReached, 4).1, 0);
+        assert!(stop_line(&SceneStop::GoalReached, 4).0.contains("目标达成"));
+    }
+
+    #[test]
     fn stop_lines_are_plain_and_only_dco_errors_exit_nonzero() {
-        for s in [SceneStop::StepsDone, SceneStop::DryRun, SceneStop::PrivateScreen, SceneStop::NoTapAt, SceneStop::NoVision(VisionFail::Silent), SceneStop::NoVision(VisionFail::Timeout), SceneStop::NoVision(VisionFail::Error), SceneStop::Skipped3, SceneStop::Noop5] {
+        for s in [SceneStop::StepsDone, SceneStop::GoalReached, SceneStop::DryRun, SceneStop::PrivateScreen, SceneStop::NoTapAt, SceneStop::NoVision(VisionFail::Silent), SceneStop::NoVision(VisionFail::Timeout), SceneStop::NoVision(VisionFail::Error), SceneStop::Skipped3, SceneStop::Noop5] {
             assert_eq!(stop_line(&s, 3).1, 0, "{s:?}");
         }
         assert!(stop_line(&SceneStop::NoTapAt, 0).0.contains("还不会按位置点"));

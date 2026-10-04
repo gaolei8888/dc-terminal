@@ -72,11 +72,12 @@ struct Script {
     picks: std::cell::RefCell<VecDeque<Option<(f64, f64)>>>,
     asked: std::cell::Cell<usize>,
     from: Option<(f64, f64)>,
+    done: bool,
     observed: std::cell::RefCell<Vec<bool>>,
 }
 impl Script {
     fn new(p: &[(f64, f64)]) -> Script {
-        Script { picks: std::cell::RefCell::new(p.iter().map(|x| Some(*x)).collect()), asked: 0.into(), from: None, observed: Default::default() }
+        Script { picks: std::cell::RefCell::new(p.iter().map(|x| Some(*x)).collect()), asked: 0.into(), from: None, done: false, observed: Default::default() }
     }
 }
 impl Vision for Script {
@@ -87,7 +88,7 @@ impl Vision for Script {
         self.asked.set(self.asked.get() + 1);
         let p = self.picks.borrow_mut().pop_front().ok_or(VisionFail::Silent)?;
         Ok(match p {
-            Some((x, y)) => VisionAnswer { brain: String::new(), pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into(), from: self.from }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
+            Some((x, y)) => VisionAnswer { brain: String::new(), pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into(), from: self.from, done: self.done }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
             None => VisionAnswer { brain: String::new(), pick: None, raw: "乱码".into(), model: "m".into(), tokens: None, image_bytes: None, image_note: None },
         })
     }
@@ -98,7 +99,7 @@ fn profile() -> Profile {
 }
 
 fn opts(max: usize) -> SceneOptions {
-    SceneOptions { max_steps: max, dry_run: false, no_tap: vec![], game: "g".into() }
+    SceneOptions { max_steps: max, dry_run: false, no_tap: vec![], game: "g".into(), goal: None }
 }
 
 fn run(d: &mut Fake, v: &Script, o: &SceneOptions) -> (SceneSummary, Vec<SceneStep>) {
@@ -283,7 +284,7 @@ fn three_skips_in_a_row_stop_and_a_tap_in_between_resets() {
 #[test]
 fn an_unusable_model_answer_counts_as_a_skip() {
     let mut d = Fake::new();
-    let v = Script { picks: std::cell::RefCell::new(VecDeque::from([None, None, None])), asked: 0.into(), from: None, observed: Default::default() };
+    let v = Script { picks: std::cell::RefCell::new(VecDeque::from([None, None, None])), asked: 0.into(), from: None, done: false, observed: Default::default() };
     let (s, steps) = run(&mut d, &v, &opts(10));
     assert_eq!(s.stop, SceneStop::Skipped3);
     assert!(steps.iter().all(|x| x.record["label"] == "skipped"));
@@ -549,4 +550,45 @@ fn the_scene_tells_the_vision_how_each_step_went_and_records_the_new_fields() {
     assert_eq!(*v.observed.borrow(), vec![false, false]);
     assert_eq!(steps[0].record["assisted"], "none");
     assert!(steps[0].record["model_ms"].is_u64() && steps[0].record.get("brain").is_some());
+}
+
+// ---- 目标 ----
+
+#[test]
+fn parse_pick_reads_done_and_defaults_to_false() {
+    assert!(!parse_pick(r#"{"name":"a","x":0.5,"y":0.5}"#).unwrap().done);
+    assert!(parse_pick(r#"{"name":"a","x":0.5,"y":0.5,"done":true}"#).unwrap().done);
+    assert!(!parse_pick(r#"{"name":"a","x":0.5,"y":0.5,"done":"yes"}"#).unwrap().done);
+}
+
+#[test]
+fn done_stops_with_goal_reached_only_when_a_goal_was_given() {
+    let mut d = Fake::new();
+    let mut v = Script::new(&[(0.5, 0.5)]);
+    v.done = true;
+    let o = SceneOptions { goal: Some("find it".into()), ..opts(5) };
+    let (s, steps) = run(&mut d, &v, &o);
+    assert_eq!((s.stop.clone(), s.steps, s.taps), (SceneStop::GoalReached, 1, 0));
+    assert_eq!(d.taps.len(), 0);
+    assert_eq!(steps[0].record["label"], "goal_reached");
+    assert_eq!(steps[0].record["goal"], "find it");
+
+    // 没给目标：done 被忽略，照常点。
+    let mut d = Fake::new();
+    let mut v = Script::new(&[(0.5, 0.5)]);
+    v.done = true;
+    let (s, steps) = run(&mut d, &v, &opts(1));
+    assert_eq!((s.stop, s.taps), (SceneStop::StepsDone, 1));
+    assert!(steps[0].record["goal"].is_null());
+}
+
+#[test]
+fn every_record_carries_the_goal_and_the_summary_adds_up_model_time() {
+    let mut d = Fake::new();
+    let v = Script::new(&[(0.5, 0.5), (0.2, 0.2)]);
+    let o = SceneOptions { goal: Some("g1".into()), ..opts(2) };
+    let (s, steps) = run(&mut d, &v, &o);
+    assert!(steps.iter().all(|st| st.record["goal"] == "g1"));
+    let sum: u64 = steps.iter().map(|st| st.record["model_ms"].as_u64().unwrap()).sum();
+    assert_eq!(s.model_ms, sum);
 }

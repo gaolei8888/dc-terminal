@@ -29,6 +29,8 @@ pub struct Pick {
     pub why: String,
     /// 拖的起点（物品栏里的格子，0～1）；有它就是「从这里拖到 (x, y)」，没有就是点一下。
     pub from: Option<(f64, f64)>,
+    /// 模型说目标已经达成（只在给了目标时才算数）。
+    pub done: bool,
 }
 
 /// 从模型回答里找出 `{"name","x","y","why"}`。去掉思考块；`x`、`y` 必须是 0～1 的数；读不懂就 `None`。
@@ -60,7 +62,7 @@ pub fn parse_pick(text: &str) -> Option<Pick> {
             Some((fx, fy))
         }
     };
-    Some(Pick { name: v["name"].as_str()?.to_string(), x, y, why: v["why"].as_str().unwrap_or("").to_string(), from })
+    Some(Pick { name: v["name"].as_str()?.to_string(), x, y, why: v["why"].as_str().unwrap_or("").to_string(), from, done: v["done"].as_bool().unwrap_or(false) })
 }
 
 /// 0～1 的位置变成整数万分比：四舍五入，夹在 0..=10000。
@@ -158,11 +160,15 @@ pub struct SceneOptions {
     pub no_tap: Vec<Region>,
     /// 写进记录的游戏名（只是标签）。
     pub game: String,
+    /// 可选的目标（一句话）；只写进记录，并让「done」生效。
+    pub goal: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SceneStop {
     StepsDone,
+    /// 模型说目标已经达成。
+    GoalReached,
     /// 读不了屏幕：私人画面。
     PrivateScreen,
     /// 旧 dco 没有按位置点。
@@ -188,6 +194,8 @@ pub struct SceneSummary {
     pub asks: usize,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// 所有模型调用花的时间合计（毫秒）。
+    pub model_ms: u64,
     pub stop: SceneStop,
 }
 
@@ -268,7 +276,7 @@ fn texts_of(s: &Seen) -> Vec<String> {
 }
 
 pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn Vision, o: &SceneOptions, sink: &mut dyn FnMut(SceneStep)) -> SceneSummary {
-    let mut sum = SceneSummary { steps: 0, taps: 0, asks: 0, tokens_in: 0, tokens_out: 0, stop: SceneStop::StepsDone };
+    let mut sum = SceneSummary { steps: 0, taps: 0, asks: 0, tokens_in: 0, tokens_out: 0, model_ms: 0, stop: SceneStop::StepsDone };
     let mut history: Vec<(u16, u16)> = vec![];
     let mut skipped = 0;
     let mut noop = 0;
@@ -294,6 +302,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
         };
         let model_ms = clock.now_ms().saturating_sub(asked_at);
         sum.asks += 1;
+        sum.model_ms += model_ms;
         if let Some((i, out)) = ans.tokens {
             sum.tokens_in += i;
             sum.tokens_out += out;
@@ -301,12 +310,18 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
         sum.steps += 1;
         let n = sum.steps;
         let mut rec = json!({
-            "schema": 1, "game": o.game, "time_ms": clock.now_ms(),
+            "schema": 1, "game": o.game, "goal": o.goal, "time_ms": clock.now_ms(),
             "screen": { "png": format!("png/{n:04}.png"), "texts": texts_of(&before), "numbers": numbers(&before) },
             "teacher": "qwen", "rationale": ans.pick.as_ref().map(|k| k.why.clone()).unwrap_or_else(|| ans.raw.chars().take(200).collect()),
             "model": ans.model, "brain": ans.brain, "assisted": "none", "model_ms": model_ms, "image_bytes": ans.image_bytes, "image_note": ans.image_note, "tokens_in": ans.tokens.map(|t| t.0), "tokens_out": ans.tokens.map(|t| t.1),
         });
         let mut emit = |rec: Value, say: String| sink(SceneStep { record: rec, png: Some(png.clone()), say });
+        // 给了目标、模型说已经达成：记一条，不点，结束。
+        if o.goal.is_some() && ans.pick.as_ref().is_some_and(|k| k.done) {
+            rec["label"] = json!("goal_reached");
+            emit(rec, format!("第 {n} 步：大模型说目标已经达成"));
+            break SceneStop::GoalReached;
+        }
         // 过检查：任何一项不满足就不点。
         let skip = match &ans.pick {
             None => Some("大模型没指出能用的位置".to_string()),
