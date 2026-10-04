@@ -25,18 +25,20 @@ struct Fake {
     tap_result: Result<TapAt, DcoError>,
     moods: Vec<(String, Option<String>)>,
     settle_asked: Vec<Option<TapSettleReq>>,
+    swipes: Vec<((f64, f64), (f64, f64))>,
 }
 impl Fake {
     fn new() -> Fake {
-        Fake { sees: VecDeque::new(), default_seen: seen(&["1", "MENU"]), captures: 0, taps: vec![], tap_result: Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: None }), moods: vec![], settle_asked: vec![] }
+        Fake { sees: VecDeque::new(), default_seen: seen(&["1", "MENU"]), captures: 0, taps: vec![], tap_result: Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: None }), moods: vec![], settle_asked: vec![], swipes: vec![] }
     }
 }
 impl Dco for Fake {
     fn read_grid(&mut self, _: &Profile) -> Result<crate::GridRead, DcoError> {
         panic!("scene 不读棋盘")
     }
-    fn swipe(&mut self, _: &Profile, _: (f64, f64), _: (f64, f64)) -> Result<(), DcoError> {
-        panic!("scene 不划")
+    fn swipe(&mut self, _: &Profile, f: (f64, f64), t: (f64, f64)) -> Result<(), DcoError> {
+        self.swipes.push((f, t));
+        Ok(())
     }
     fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
         self.sees.pop_front().unwrap_or_else(|| Ok(self.default_seen.clone()))
@@ -69,10 +71,11 @@ impl Clock for Clk {
 struct Script {
     picks: std::cell::RefCell<VecDeque<Option<(f64, f64)>>>,
     asked: std::cell::Cell<usize>,
+    from: Option<(f64, f64)>,
 }
 impl Script {
     fn new(p: &[(f64, f64)]) -> Script {
-        Script { picks: std::cell::RefCell::new(p.iter().map(|x| Some(*x)).collect()), asked: 0.into() }
+        Script { picks: std::cell::RefCell::new(p.iter().map(|x| Some(*x)).collect()), asked: 0.into(), from: None }
     }
 }
 impl Vision for Script {
@@ -80,7 +83,7 @@ impl Vision for Script {
         self.asked.set(self.asked.get() + 1);
         let p = self.picks.borrow_mut().pop_front().ok_or(VisionFail::Silent)?;
         Ok(match p {
-            Some((x, y)) => VisionAnswer { pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into() }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
+            Some((x, y)) => VisionAnswer { pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into(), from: self.from }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
             None => VisionAnswer { pick: None, raw: "乱码".into(), model: "m".into(), tokens: None, image_bytes: None, image_note: None },
         })
     }
@@ -276,7 +279,7 @@ fn three_skips_in_a_row_stop_and_a_tap_in_between_resets() {
 #[test]
 fn an_unusable_model_answer_counts_as_a_skip() {
     let mut d = Fake::new();
-    let v = Script { picks: std::cell::RefCell::new(VecDeque::from([None, None, None])), asked: 0.into() };
+    let v = Script { picks: std::cell::RefCell::new(VecDeque::from([None, None, None])), asked: 0.into(), from: None };
     let (s, steps) = run(&mut d, &v, &opts(10));
     assert_eq!(s.stop, SceneStop::Skipped3);
     assert!(steps.iter().all(|x| x.record["label"] == "skipped"));
@@ -436,4 +439,71 @@ fn the_loop_uses_dco_changed_true_as_effective() {
     d.tap_result = Ok(TapAt { kind: "no_text".into(), text: String::new(), settle: Some(st(true, true, false)) });
     let (_, steps) = run(&mut d, &Script::new(&[(0.5, 0.5)]), &opts(1));
     assert_eq!(steps[0].record["label"], "effective");
+}
+
+// ---- 拖物品（模型回答里可选的 from）----
+
+fn drag_script(p: &[(f64, f64)], from: (f64, f64)) -> Script {
+    Script { from: Some(from), ..Script::new(p) }
+}
+
+#[test]
+fn parse_pick_reads_an_optional_from_and_refuses_a_broken_one() {
+    let p = parse_pick(r#"{"name":"钥匙","x":0.5,"y":0.4,"why":"w","from":{"x":0.1,"y":0.9}}"#).unwrap();
+    assert_eq!(p.from, Some((0.1, 0.9)));
+    assert_eq!(parse_pick(r#"{"name":"a","x":0.5,"y":0.4}"#).unwrap().from, None);
+    assert_eq!(parse_pick(r#"{"name":"a","x":0.5,"y":0.4,"from":null}"#).unwrap().from, None);
+    for bad in [r#""from":{"x":1.5,"y":0.1}"#, r#""from":{"x":0.1}"#, r#""from":"左下""#] {
+        assert!(parse_pick(&format!(r#"{{"name":"a","x":0.5,"y":0.4,{bad}}}"#)).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn a_drag_swipes_from_to_records_both_points_and_never_taps() {
+    let mut d = Fake::new();
+    let (s, steps) = run(&mut d, &drag_script(&[(0.5, 0.4)], (0.1, 0.9)), &opts(1));
+    assert_eq!((s.taps, d.taps.len()), (1, 0));
+    assert_eq!(d.swipes, vec![((0.1, 0.9), (0.5, 0.4))]);
+    let a = &steps[0].record["action"];
+    assert_eq!(a["kind"], "drag");
+    assert_eq!((a["from_x_bp"].as_u64(), a["from_y_bp"].as_u64(), a["x_bp"].as_u64(), a["y_bp"].as_u64()), (Some(1000), Some(9000), Some(5000), Some(4000)));
+}
+
+#[test]
+fn a_drag_shorter_than_two_percent_is_skipped_with_a_reason() {
+    let mut d = Fake::new();
+    let (_, steps) = run(&mut d, &drag_script(&[(0.5, 0.4)], (0.51, 0.4)), &opts(1));
+    assert!(d.swipes.is_empty());
+    assert_eq!(steps[0].record["label"], "skipped");
+    assert!(steps[0].record["skip_reason"].as_str().unwrap().contains("太短"));
+    // 刚好 2% 可以。
+    let mut d = Fake::new();
+    run(&mut d, &drag_script(&[(0.5, 0.4)], (0.52, 0.4)), &opts(1));
+    assert_eq!(d.swipes.len(), 1);
+}
+
+#[test]
+fn a_drag_is_checked_on_the_drop_point_not_the_start() {
+    let r = Region { x_bp: 4500, y_bp: 3500, w_bp: 1000, h_bp: 1000 };
+    // 落点在不点的区域里：不拖。起点在区域里没关系。
+    let mut d = Fake::new();
+    let o = SceneOptions { no_tap: vec![r], ..opts(1) };
+    run(&mut d, &drag_script(&[(0.5, 0.4)], (0.1, 0.9)), &o);
+    assert!(d.swipes.is_empty());
+    let mut d = Fake::new();
+    run(&mut d, &drag_script(&[(0.8, 0.9)], (0.5, 0.4)), &o);
+    assert_eq!(d.swipes.len(), 1, "起点在不点区域里不影响");
+    // 落点附近有危险字：不拖。
+    let mut d = Fake::new();
+    d.default_seen = Seen { snapshot_id: "s".into(), observation_id: None, elements: vec![el("HINT", Some([4800, 3800, 400, 400]))] };
+    run(&mut d, &drag_script(&[(0.5, 0.4)], (0.1, 0.9)), &opts(1));
+    assert!(d.swipes.is_empty());
+}
+
+#[test]
+fn a_drag_to_the_same_drop_cell_as_last_time_is_deduped() {
+    let mut d = Fake::new();
+    let (_, steps) = run(&mut d, &drag_script(&[(0.5, 0.4), (0.505, 0.4)], (0.1, 0.9)), &opts(2));
+    assert_eq!(d.swipes.len(), 1);
+    assert_eq!(steps[1].record["label"], "skipped");
 }
