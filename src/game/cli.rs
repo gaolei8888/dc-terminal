@@ -1,6 +1,6 @@
-//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标]`。
+//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标] [--goal-number N]`。
 
-const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]";
+const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]";
 
 pub struct Args {
     pub game: String,
@@ -16,13 +16,15 @@ pub struct Args {
     pub ask_every_step: bool,
     /// 告诉大模型这一关要干什么。
     pub goal: Option<String>,
+    /// 目标数字是屏幕上第几个数字（从 1 数）；不写就不判断停滞。
+    pub goal_number: Option<usize>,
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
     if args.first().map(String::as_str) != Some("play") {
         return Err(USAGE.into());
     }
-    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None };
+    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None, goal_number: None };
     let mut it = args[1..].iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -38,6 +40,11 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
                 a.ask_model = true;
             }
             "--goal" => a.goal = Some(it.next().ok_or("--goal 后面要写目标，比如 --goal \"清掉冰块\"")?.clone()),
+            "--goal-number" => {
+                const BAD: &str = "--goal-number 要写一个 1 到 20 的数字，比如 --goal-number 2 表示屏幕上第 2 个数字是目标";
+                let v = it.next().ok_or(BAD)?;
+                a.goal_number = Some(v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or(BAD)?);
+            }
             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
             "--steps" => {
                 let v = it.next().ok_or("--steps 后面要写步数")?;
@@ -158,9 +165,9 @@ fn run_parsed(a: &Args) -> i32 {
         }
     };
     let summary = if a.auto_next {
-        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
+        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
     } else {
-        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
+        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
     };
     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
@@ -189,6 +196,15 @@ mod tests {
         assert!(e.ask_every_step && e.ask_model);
         assert_eq!(d.goal, None);
         assert!(parse(&["play".into(), "--goal".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_goal_number() {
+        assert_eq!(p(&["play", "--goal-number", "2"]).unwrap().goal_number, Some(2));
+        assert_eq!(p(&["play"]).unwrap().goal_number, None);
+        for bad in [&["play", "--goal-number", "0"][..], &["play", "--goal-number", "21"], &["play", "--goal-number", "x"], &["play", "--goal-number"]] {
+            assert!(p(bad).err().unwrap().contains("--goal-number 要写一个 1 到 20 的数字"));
+        }
     }
 
     fn p(v: &[&str]) -> Result<Args, String> {

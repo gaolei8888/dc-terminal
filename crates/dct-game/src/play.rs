@@ -60,9 +60,12 @@ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
 /// 连着这么多步目标数字都没下降，就算停滞。
 pub const STALL_STEPS: usize = 6;
 
-/// 个数相同、且至少有一个数变小才算「下降」。个数不同（OCR 漏读了一个）一律不算，也不算「没下降」。
-pub(crate) fn decreased(before: &[u64], after: &[u64]) -> bool {
-    before.len() == after.len() && before.iter().zip(after).any(|(b, a)| a < b)
+/// 目标那个数字下降了才算「下降」。两张清单个数不同（OCR 漏读了一个）、或者序号越界，都算「不知道」，返回 `None`。
+pub(crate) fn goal_dropped(before: &[u64], after: &[u64], goal: usize) -> Option<bool> {
+    if before.len() != after.len() || goal >= before.len() {
+        return None;
+    }
+    Some(after[goal] < before[goal])
 }
 
 fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
@@ -106,6 +109,8 @@ pub struct Options<'a> {
     /// 这一次 `play()` 最多问几次。
     pub ask_budget: usize,
     pub goal: &'a str,
+    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
+    pub goal_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -440,9 +445,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
-                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
-                    if b.len() == a.len() {
-                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
+                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
+                    match goal_dropped(b, a, gi) {
+                        Some(true) => no_progress = 0,
+                        Some(false) => no_progress += 1,
+                        None => {}
                     }
                 }
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
@@ -462,9 +469,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(changed_cells(&g, &next));
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
-                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
-                    if b.len() == a.len() {
-                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
+                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
+                    match goal_dropped(b, a, gi) {
+                        Some(true) => no_progress = 0,
+                        Some(false) => no_progress += 1,
+                        None => {}
                     }
                 }
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
@@ -480,9 +489,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(same_board.observation_id);
                 let progress_after = read_numbers(dco, p);
-                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
-                    if b.len() == a.len() {
-                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
+                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
+                    match goal_dropped(b, a, gi) {
+                        Some(true) => no_progress = 0,
+                        Some(false) => no_progress += 1,
+                        None => {}
                     }
                 }
                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });

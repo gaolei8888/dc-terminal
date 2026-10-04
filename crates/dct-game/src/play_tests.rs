@@ -80,7 +80,7 @@ fn profile(rows: usize, cols: usize) -> Profile {
 }
 fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     let mut log = vec![];
-    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     (s, log)
 }
 fn err(code: &str) -> DcoError {
@@ -201,10 +201,10 @@ fn a_clock_that_goes_backwards_does_not_panic() {
     }
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
     let mut log = vec![];
-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     // 读盘到落定都过了一轮，没有 panic 就行；用一个会倒着走的钟再跑一遍无法落定的情形
     let mut d = Fake::new(vec![Ok(grid(A))]);
-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
+    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
 }
 
 #[test]
@@ -492,7 +492,7 @@ fn swipe_cells(p: &Profile, s: &[Swipe]) -> Vec<(usize, usize)> {
 fn play_holes(fixed_rgb: Vec<[u8; 3]>) -> (Profile, Vec<Swipe>) {
     let p = Profile { fixed_rgb, ..profile(4, 4) };
     let mut d = Fake::new(vec![Ok(grid_with_hole_rgb())]);
-    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
+    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
     (p, d.swipes)
 }
 
@@ -522,7 +522,7 @@ fn the_record_carries_the_real_swipe_points_start_and_duration() {
     let p = profile(3, 4);
     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
     let mut log = vec![];
-    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     let (f, t) = d.swipes[0];
     let sw = &log[0]["swipe"];
     assert_eq!(sw["from"], json!([r4(f.0), r4(f.1)]));
@@ -598,7 +598,7 @@ fn a_one_cell_candy_may_move_once_the_profile_lists_the_not_candies() {
     let go = |fixed_rgb: Vec<[u8; 3]>| {
         let mut d = Fake::new(vec![Ok(grid(ROW))]);
         let p = Profile { fixed_rgb, ..profile(1, 9) };
-        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
+        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
         s.stop
     };
     assert_ne!(go(vec![[196, 148, 101]]), Stop::NoMoves);
@@ -623,7 +623,7 @@ fn no_moves_that_a_refill_fixes_is_not_the_end() {
 fn no_moves_confirmed_by_an_identical_second_read_stops_after_one_confirmation() {
     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
     let mut clk = Clk(0);
-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
+    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
     assert_eq!(s.stop, Stop::NoMoves);
     assert_eq!(d.reads_taken, 2);
     assert_eq!(clk.0, 1_500);
@@ -662,7 +662,7 @@ fn a_colour_jump_that_stays_on_the_reread_is_a_changed_screen() {
 fn a_dry_run_does_not_pause_or_reread() {
     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
     let mut clk = Clk(0);
-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
+    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
     assert_eq!(s.stop, Stop::NoMoves);
     assert_eq!(d.reads_taken, 1);
     assert_eq!(clk.0, 0);
@@ -725,8 +725,11 @@ impl Advisor for Down {
 }
 
 fn run_ask(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize) -> (Summary, Vec<Value>) {
+    run_ask_goal(d, adv, always, budget, steps, None)
+}
+fn run_ask_goal(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize, gi: Option<usize>) -> (Summary, Vec<Value>) {
     let mut log = vec![];
-    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰" };
+    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰", goal_index: gi };
     let s = play(d, &mut Clk(0), &profile(3, 4), &o, &mut |v| log.push(v));
     (s, log)
 }
@@ -781,7 +784,7 @@ fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
     let say = Say::new(Some(0));
     let mut d = Fake::new(reads);
     let mut log = vec![];
-    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰" };
+    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰", goal_index: None };
     let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &o, &mut |v| log.push(v));
     assert!(say.calls.get() >= 1);
     let seen = say.seen.borrow();
@@ -895,7 +898,7 @@ fn after_a_refused_swap_no_later_candidate_touches_its_two_cells() {
     }
     let mut d = Fake::new(reads);
     let mut log = vec![];
-    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     let pos = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
     assert!(log.len() >= 2, "{log:?}");
     for i in 1..log.len() {
@@ -927,7 +930,7 @@ fn five_refusals_in_a_row_stop_the_run_not_two() {
     }
     let mut d = Fake::new(reads);
     let mut log = vec![];
-    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     assert_eq!(s.stop, Stop::Stuck);
     assert_eq!(d.swipes.len(), 5, "应该试满 5 次才停");
 }
@@ -948,7 +951,7 @@ fn a_move_that_works_unlocks_the_cells() {
     }
     let mut d = Fake::new(reads);
     let mut log = vec![];
-    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
     assert_eq!(&outcomes[..2], ["no_change", "moved"], "{outcomes:?}");
 }
@@ -964,7 +967,7 @@ fn a_refused_swap_locks_both_of_its_cells_even_when_better_candidates_share_only
     }
     let mut d = Fake::new(reads);
     let mut log = vec![];
-    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     assert!(log.len() >= 2, "{log:?}");
     let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
     let (a0, b0) = (cell(&log[0], "a"), cell(&log[0], "b"));
@@ -988,7 +991,7 @@ fn a_move_that_works_unlocks_cells_that_the_only_remaining_move_needs() {
     reads.push(Ok(grid(AFTER)));
     let mut d = Fake::new(reads);
     let mut log = vec![];
-    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
     let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
     // 第三步：规则第一名就是那个碰被锁过的格子的步（没解锁的话它会被跳过）
     let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
@@ -1081,19 +1084,16 @@ fn the_after_of_one_step_is_the_before_of_the_next() {
 }
 
 #[test]
-fn decreased_needs_same_length_and_a_smaller_number() {
-    assert!(decreased(&[50, 30], &[49, 30]));
-    assert!(!decreased(&[50, 30], &[50, 30]));
-    assert!(!decreased(&[50, 30], &[51, 30]));
-    assert!(!decreased(&[50, 30], &[49]));
+fn goal_dropped_needs_same_length_and_index_in_range() {
+    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 0), Some(true));
+    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 1), Some(false));
+    assert_eq!(goal_dropped(&[50, 30], &[50, 31], 1), Some(false));
+    assert_eq!(goal_dropped(&[50, 30], &[49], 0), None);
+    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 2), None);
 }
 
-fn progress_texts(n: usize, flat: bool) -> VecDeque<Vec<&'static str>> {
-    let mut v: Vec<Vec<&'static str>> = vec![vec!["50"]];
-    for i in 0..n {
-        v.push(if flat { vec!["50"] } else { vec![Box::leak(format!("{}", 49 - i).into_boxed_str())] });
-    }
-    v.into()
+fn lists(v: &[&[&'static str]]) -> VecDeque<Vec<&'static str>> {
+    v.iter().map(|x| x.to_vec()).collect()
 }
 
 fn stall_reads() -> Vec<Result<GridRead, DcoError>> {
@@ -1107,32 +1107,81 @@ fn stall_reads() -> Vec<Result<GridRead, DcoError>> {
     reads
 }
 
-#[test]
-fn six_steps_without_the_number_dropping_is_a_stall_and_asks_the_model() {
+/// 初始读一次，之后每一步读一次。
+fn run_progress(texts: VecDeque<Vec<&'static str>>, gi: Option<usize>, steps: usize) -> (Vec<Value>, usize) {
     let say = Say::new(Some(0));
     let mut d = Fake::new(stall_reads());
-    d.texts = progress_texts(8, true);
-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
-    assert_eq!(log[5].get("stalled"), None, "before step 7 it is not a stall");
-    assert!(say.calls.get() >= 1);
-    assert!(log.iter().any(|l| l["stalled"] == true));
+    d.texts = texts;
+    let (_, log) = run_ask_goal(&mut d, Some(&say), false, 30, steps, gi);
+    (log, say.calls.get())
+}
+
+fn first_stalled(log: &[Value]) -> Option<usize> {
+    log.iter().position(|l| l["stalled"] == true)
+}
+
+fn flat(n: usize) -> Vec<&'static [&'static str]> {
+    vec![&["50"][..]; n]
 }
 
 #[test]
-fn a_dropping_number_never_stalls() {
-    let say = Say::new(Some(0));
-    let mut d = Fake::new(stall_reads());
-    d.texts = progress_texts(8, false);
-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
-    assert_eq!(say.calls.get(), 0);
+fn six_flat_steps_make_the_seventh_a_stall_and_ask_the_model() {
+    let mut v = vec![&["50"][..]];
+    v.extend(flat(8));
+    let (log, asked) = run_progress(lists(&v), Some(0), 8);
+    assert_eq!(first_stalled(&log), Some(6));
+    assert!(asked >= 1);
+}
+
+#[test]
+fn without_a_goal_index_a_flat_run_never_stalls_or_asks() {
+    let mut v = vec![&["50"][..]];
+    v.extend(flat(8));
+    let (log, asked) = run_progress(lists(&v), None, 8);
+    assert_eq!(asked, 0);
     assert!(log.iter().all(|l| l.get("stalled").is_none()));
 }
 
 #[test]
-fn unreadable_numbers_neither_add_to_nor_clear_the_stall_count() {
-    let say = Say::new(Some(0));
-    let mut d = Fake::new(settled_script());
-    let (s, log) = run_ask(&mut d, Some(&say), false, 30, 1);
-    assert_eq!(s.stop, Stop::StepsDone);
-    assert!(log[0].get("stalled").is_none());
+fn a_dropping_goal_number_never_stalls() {
+    let texts: Vec<Vec<&'static str>> = std::iter::once(vec!["50"]).chain((0..8).map(|i| vec![&*Box::leak(format!("{}", 49 - i).into_boxed_str())])).collect();
+    let (log, asked) = run_progress(texts.into(), Some(0), 8);
+    assert_eq!(asked, 0);
+    assert!(log.iter().all(|l| l.get("stalled").is_none()));
+}
+
+#[test]
+fn the_moves_left_counter_dropping_does_not_hide_a_stalled_goal() {
+    // 第 0 个数字是剩余步数（每步都降），第 1 个是目标（一直不变）
+    let ml: Vec<&'static str> = vec!["30", "29", "28", "27", "26", "25", "24", "23", "22"];
+    let v: Vec<Vec<&'static str>> = ml.iter().map(|m| vec![*m, "50"]).collect();
+    let (log, asked) = run_progress(v.clone().into(), Some(1), 8);
+    assert_eq!(first_stalled(&log), Some(6));
+    assert!(asked >= 1);
+    // 盯着剩余步数那个，就永远不停滞
+    let (log0, _) = run_progress(v.into(), Some(0), 8);
+    assert!(log0.iter().all(|l| l.get("stalled").is_none()));
+}
+
+#[test]
+fn a_drop_in_the_middle_restarts_the_count() {
+    // 初始 50；3 步不变；第 4 步降到 49；之后一直 49 不变
+    let mut v = vec![&["50"][..]];
+    v.extend(flat(3));
+    v.push(&["49"]);
+    v.extend(vec![&["49"][..]; 8]);
+    let (log, _) = run_progress(lists(&v), Some(0), 12);
+    // 降发生在第 4 步（下标 3）；之后要再连着 6 步不变，第 7 步（下标 3+6+1=10）才标停滞
+    assert_eq!(first_stalled(&log), Some(10));
+}
+
+#[test]
+fn an_unreadable_list_in_a_flat_run_neither_clears_nor_advances_the_count() {
+    let mut v = vec![&["50"][..]];
+    v.extend(flat(2));
+    v.push(&[]); // 这一步读不到（个数不同）
+    v.extend(flat(8));
+    let (log, _) = run_progress(lists(&v), Some(0), 10);
+    // 不带空档要在下标 6；空档同时让这一步的前后两次都对不上，共 2 步不算数
+    assert_eq!(first_stalled(&log), Some(8));
 }

@@ -17,6 +17,8 @@ pub struct NavOptions<'a> {
     pub ask_always: bool,
     pub ask_budget: usize,
     pub goal: &'a str,
+    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
+    pub goal_index: Option<usize>,
 }
 
 const AFTER_TAP_FIRST_MS: u64 = 400;
@@ -153,7 +155,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                         sink(nav_record(clock, &seen, "board", None, "entered"));
                         expect_board = false;
                         // after_board 不用在这里清：play 返回后要么 break，要么马上重新置 true，中间没人读它。
-                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal }, sink);
+                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal, goal_index: o.goal_index }, sink);
                         steps += s.steps;
                         match s.stop {
                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
@@ -371,7 +373,7 @@ mod tests {
 
     fn run_with(w: &mut World, max_steps: usize, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
         let mut log = vec![];
-        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
         (s, log)
     }
 
@@ -519,7 +521,7 @@ mod tests {
     fn the_step_budget_is_shared_across_levels() {
         let mut w = World::new(vec![board(A), board(A)]);
         let mut log = vec![];
-        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
+        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
         assert_eq!(s.steps, 1);
         assert_eq!(s.stop, Stop::StepsDone);
     }
@@ -703,7 +705,7 @@ mod tests {
     }
 
     fn run_profile(w: &mut World, p: &Profile) -> Summary {
-        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {})
+        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {})
     }
 
     #[test]
