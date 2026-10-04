@@ -593,6 +593,7 @@ pub fn llm_check(lang: Lang) -> i32 {
         system: "你是一个只回答一个词的助手。".into(),
         user: "回答「好」这一个字，不要别的。".into(),
         max_tokens: 16,
+        image_png_base64: None,
     };
     match crate::llm::complete_with_timeout(backend, p, std::time::Duration::from_secs(60)) {
         Ok(answer) => {

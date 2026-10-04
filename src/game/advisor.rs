@@ -55,7 +55,7 @@ impl Advisor for LlmAdvisor {
         if self.down.load(Ordering::SeqCst) {
             return None;
         }
-        let p = Prompt { system: SYSTEM.into(), user: prompt_text(i), max_tokens: 64 };
+        let p = Prompt { system: SYSTEM.into(), user: prompt_text(i), max_tokens: 64, image_png_base64: None };
         // 任何错误都是「没问成」：调用方退回规则
         let Ok((raw, usage)) = complete_counted_with_timeout(self.backend.clone(), p, self.timeout) else {
             // 只说一次，之后不再问，免得每一步都白等一轮超时

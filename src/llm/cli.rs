@@ -33,6 +33,7 @@ impl CliBackend {
 
 impl Backend for CliBackend {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
+        // 命令行后端只收文字：p.image_png_base64 被有意忽略。
         let input = format!("{}\n\n{}", p.system, p.user);
         let out = (self.runner)(&self.command, &input).map_err(|e| {
             eprintln!("LLM CLI 调用失败：{e}");
@@ -122,6 +123,7 @@ mod tests {
             system: "你是个助手".into(),
             user: "出了什么事？".into(),
             max_tokens: 64,
+            image_png_base64: None,
         }
     }
 

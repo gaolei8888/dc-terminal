@@ -20,22 +20,41 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn body_for(wire: Wire, model: &str, p: &Prompt) -> serde_json::Value {
     match wire {
-        Wire::Openai => json!({
-            "model": model,
-            "max_tokens": p.max_tokens,
-            "messages": [
-                {"role": "system", "content": p.system},
-                {"role": "user", "content": p.user},
-            ],
-        }),
+        Wire::Openai => {
+            // 没图时 content 仍是纯字符串，请求体和加图片字段之前逐字节相同。
+            let user = match &p.image_png_base64 {
+                None => json!(p.user),
+                Some(img) => json!([
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{img}")}},
+                    {"type": "text", "text": p.user},
+                ]),
+            };
+            json!({
+                "model": model,
+                "max_tokens": p.max_tokens,
+                "messages": [
+                    {"role": "system", "content": p.system},
+                    {"role": "user", "content": user},
+                ],
+            })
+        }
         // Anthropic 的 system 是**顶层字段**，不是一条 message。放错位置
         // 端点不报错，只会安静忽略——所以有一条测试专门盯着。
-        Wire::Anthropic => json!({
-            "model": model,
-            "max_tokens": p.max_tokens,
-            "system": p.system,
-            "messages": [{"role": "user", "content": p.user}],
-        }),
+        Wire::Anthropic => {
+            let user = match &p.image_png_base64 {
+                None => json!(p.user),
+                Some(img) => json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}},
+                    {"type": "text", "text": p.user},
+                ]),
+            };
+            json!({
+                "model": model,
+                "max_tokens": p.max_tokens,
+                "system": p.system,
+                "messages": [{"role": "user", "content": user}],
+            })
+        }
     }
 }
 
@@ -199,7 +218,55 @@ mod tests {
             system: "s".into(),
             user: "u".into(),
             max_tokens: 128,
+            image_png_base64: None,
         }
+    }
+
+    fn with_image() -> Prompt {
+        Prompt {
+            image_png_base64: Some("QUJD".into()),
+            ..p()
+        }
+    }
+
+    #[test]
+    fn openai_body_with_an_image_has_image_then_text_blocks() {
+        let b = body_for(Wire::Openai, "m", &with_image());
+        let c = &b["messages"][1]["content"];
+        assert_eq!(c[0]["type"], "image_url");
+        assert_eq!(c[0]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(c[1]["type"], "text");
+        assert_eq!(c[1]["text"], "u");
+        assert_eq!(b["messages"][0]["content"], "s");
+    }
+
+    #[test]
+    fn anthropic_body_with_an_image_has_image_then_text_blocks() {
+        let b = body_for(Wire::Anthropic, "m", &with_image());
+        let c = &b["messages"][0]["content"];
+        assert_eq!(c[0]["type"], "image");
+        assert_eq!(c[0]["source"]["type"], "base64");
+        assert_eq!(c[0]["source"]["media_type"], "image/png");
+        assert_eq!(c[0]["source"]["data"], "QUJD");
+        assert_eq!(c[1]["type"], "text");
+        assert_eq!(c[1]["text"], "u");
+        assert_eq!(b["system"], "s");
+    }
+
+    #[test]
+    fn without_an_image_the_request_bodies_are_unchanged() {
+        let o = body_for(Wire::Openai, "m", &p());
+        assert_eq!(
+            o,
+            json!({"model":"m","max_tokens":128,"messages":[
+                {"role":"system","content":"s"},{"role":"user","content":"u"}]})
+        );
+        let a = body_for(Wire::Anthropic, "m", &p());
+        assert_eq!(
+            a,
+            json!({"model":"m","max_tokens":128,"system":"s",
+                "messages":[{"role":"user","content":"u"}]})
+        );
     }
 
     #[test]
