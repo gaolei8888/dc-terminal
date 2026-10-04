@@ -9,7 +9,7 @@
 //! 都不保证只出低 S），同一张票能有不止一个合法签名字节串。按签名字节去重，
 //! 一次已批准的发布或付款就可能被重放第二次。
 use crate::canon::{field, sha256_id};
-use crate::ticket::{Ticket, TICKET_VERSION};
+use crate::ticket::{Ticket, Waiver, TICKET_VERSION};
 use crate::tier::{SignerRole, Tier};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::ecdsa::{signature::Verifier as _, Signature as EcSig, VerifyingKey};
@@ -110,6 +110,8 @@ pub enum VerifyError {
     WrongProcedure,
     /// 票的档位比批准记录要求的还低——批准记录写着要用户签的档，票却按自动档签的。
     TierBelowApproval,
+    /// 票带的凭据不认识（`kind` 不是 `no_text`），或者它的区域不合格。
+    BadWaiver,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -127,6 +129,7 @@ impl std::fmt::Display for VerifyError {
             VerifyError::StepsChanged => "流程的步骤改过了，要重新批准",
             VerifyError::WrongProcedure => "这份批准记录是给另一条流程的",
             VerifyError::TierBelowApproval => "这张票的档位比批准记录还低",
+            VerifyError::BadWaiver => "票上的放行凭据不合格",
         };
         f.write_str(s)
     }
@@ -190,11 +193,29 @@ pub fn verify_sig(sig: &Signature, msg: &[u8], trusted: &[TrustedKey]) -> Result
     Ok(key.role)
 }
 
-fn role_may_sign(tier: Tier, role: SignerRole) -> bool {
+/// 唯一的例外：`Content` 票带 `no_text` 凭据时，自动钥匙也能签。`Money` / `Critical`
+/// 永远只认用户钥匙（`rule_can_waive` 为假）。
+fn role_may_sign(tier: Tier, role: SignerRole, waiver: Option<&Waiver>) -> bool {
     match tier.required_signer() {
         None | Some(SignerRole::Auto) => true,
-        Some(SignerRole::User) => role == SignerRole::User,
+        Some(SignerRole::User) => {
+            role == SignerRole::User
+                || (role == SignerRole::Auto
+                    && tier == Tier::Content
+                    && tier.rule_can_waive()
+                    && waiver.is_some_and(|w| w.kind == "no_text"))
+        }
     }
+}
+
+/// 凭据本身合不合格：只认 `no_text`，区域必须非空且完全落在屏幕内（按 u32 算，不会溢出）。
+fn waiver_is_sane(w: &Waiver) -> bool {
+    let r = &w.region;
+    w.kind == "no_text"
+        && r.w_bp > 0
+        && r.h_bp > 0
+        && r.x_bp as u32 + r.w_bp as u32 <= 10000
+        && r.y_bp as u32 + r.h_bp as u32 <= 10000
 }
 
 /// 通过之后，重放要靠调用方按 `ticket.nonce`（或 `ticket.digest()`）记账，**不能**
@@ -224,7 +245,13 @@ pub fn verify(st: &SignedTicket, trusted: &[TrustedKey], device: &str, now: u64)
         }
     };
     let role = verify_sig(&st.signature, &msg, trusted)?;
-    if !role_may_sign(t.tier, role) {
+    // 凭据不合格就拒，跟谁签的无关；放在验签之后，所以被改过的凭据先报「签名不对」。
+    if let Some(w) = &t.waiver {
+        if !waiver_is_sane(w) {
+            return Err(VerifyError::BadWaiver);
+        }
+    }
+    if !role_may_sign(t.tier, role, t.waiver.as_ref()) {
         return Err(VerifyError::WrongRole { need: SignerRole::User });
     }
     Ok(())
@@ -465,5 +492,98 @@ mod tests {
         let mut twinned = st.clone();
         twinned.signature.sig = STANDARD.encode(twin.to_bytes());
         assert_eq!(verify(&twinned, &trusted, "mac-lei", 150), Ok(()));
+    }
+
+    fn wv(kind: &str, x: u16, y: u16, w: u16, h: u16) -> crate::ticket::Waiver {
+        crate::ticket::Waiver {
+            kind: kind.into(),
+            rule: "games:r".into(),
+            rule_sha256: "sha256:aa".into(),
+            approved_at: "2026-10-04T13:18:12Z".into(),
+            region: crate::ticket::Region { x_bp: x, y_bp: y, w_bp: w, h_bp: h },
+        }
+    }
+
+    fn waived(tier: Tier, n: char, w: crate::ticket::Waiver) -> Ticket {
+        let mut t = ticket(tier, n);
+        t.waiver = Some(w);
+        t
+    }
+
+    #[test]
+    fn a_no_text_waiver_lets_the_auto_key_sign_a_content_ticket() {
+        let (auto, user, trusted) = keys();
+        let a = sign_one(waived(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &auto, "").unwrap();
+        assert_eq!(verify(&a, &trusted, "mac-lei", 150), Ok(()));
+        let u = sign_one(waived(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &user, "").unwrap();
+        assert_eq!(verify(&u, &trusted, "mac-lei", 150), Ok(()));
+    }
+
+    #[test]
+    fn a_waiver_never_lets_the_auto_key_sign_money_or_critical() {
+        let (auto, _, trusted) = keys();
+        for tier in [Tier::Money, Tier::Critical] {
+            let st = sign_one(waived(tier, 'a', wv("no_text", 0, 0, 10000, 10000)), &auto, "").unwrap();
+            assert_eq!(
+                verify(&st, &trusted, "mac-lei", 150),
+                Err(VerifyError::WrongRole { need: SignerRole::User }),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_waiver_kind_is_refused_whoever_signed() {
+        let (auto, user, trusted) = keys();
+        for s in [&auto, &user] {
+            let st = sign_one(waived(Tier::Content, 'a', wv("other", 0, 0, 100, 100)), s, "").unwrap();
+            assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::BadWaiver));
+        }
+    }
+
+    #[test]
+    fn without_a_waiver_the_auto_key_still_cannot_sign_content() {
+        let (auto, _, trusted) = keys();
+        let st = sign_one(ticket(Tier::Content, 'a'), &auto, "").unwrap();
+        assert_eq!(
+            verify(&st, &trusted, "mac-lei", 150),
+            Err(VerifyError::WrongRole { need: SignerRole::User })
+        );
+    }
+
+    #[test]
+    fn an_insane_waiver_region_is_refused_whoever_signed() {
+        let (auto, user, trusted) = keys();
+        let bad = [
+            wv("no_text", 0, 0, 0, 100),
+            wv("no_text", 0, 0, 100, 0),
+            wv("no_text", 9001, 0, 1000, 100),
+            wv("no_text", 0, 9001, 100, 1000),
+            wv("no_text", 60000, 0, 60000, 100),
+            wv("no_text", 0, 60000, 100, 60000),
+        ];
+        for w in bad {
+            for s in [&auto, &user] {
+                let st = sign_one(waived(Tier::Content, 'a', w.clone()), s, "").unwrap();
+                assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::BadWaiver), "{w:?}");
+            }
+        }
+        let edge = sign_one(waived(Tier::Content, 'a', wv("no_text", 9000, 9000, 1000, 1000)), &auto, "").unwrap();
+        assert_eq!(verify(&edge, &trusted, "mac-lei", 150), Ok(()));
+    }
+
+    #[test]
+    fn editing_the_waiver_after_signing_breaks_the_signature() {
+        let (auto, _, trusted) = keys();
+        let mut st = sign_one(waived(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &auto, "").unwrap();
+        st.ticket.waiver.as_mut().unwrap().rule_sha256 = "sha256:bb".into();
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::BadSignature));
+    }
+
+    #[test]
+    fn a_physical_ticket_signed_by_auto_is_unaffected() {
+        let (auto, _, trusted) = keys();
+        let st = sign_one(ticket(Tier::Physical, 'a'), &auto, "").unwrap();
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Ok(()));
     }
 }
