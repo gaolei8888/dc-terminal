@@ -1139,10 +1139,10 @@ fn six_flat_steps_make_the_seventh_a_stall_and_ask_the_model() {
 }
 
 #[test]
-fn without_a_goal_index_a_flat_run_never_stalls_or_asks() {
+fn a_flat_only_number_is_never_picked_so_no_stall_and_no_ask() {
     let mut v = vec![&["50"][..]];
-    v.extend(flat(8));
-    let (log, asked) = run_progress(lists(&v), None, 8);
+    v.extend(flat(14));
+    let (log, asked) = run_progress(lists(&v), None, 14);
     assert_eq!(asked, 0);
     assert!(log.iter().all(|l| l.get("stalled").is_none()));
 }
@@ -1228,7 +1228,7 @@ fn the_ask_record_carries_the_token_counts() {
 
 #[test]
 fn without_goal_number_the_finder_picks_the_goal_and_stall_then_works() {
-    // 数字列表 [步数, 目标]：步数每步 -1，目标恒为 50（不动）。4 步样本后认出目标 = 下标 1，之后 6 步没降 → 停滞 → 问模型
+    // 数字列表 [步数, 目标]：步数每步 -1，目标 50 只在第 2 步降成 49 然后不动（第 1 步不进样本）。4 个样本后认出目标 = 下标 1，之后 6 步没降 → 停滞 → 问模型
     let say = Say::new(Some(0));
     let mut reads = vec![Ok(grid(A))];
     for _ in 0..60 {
@@ -1240,7 +1240,7 @@ fn without_goal_number_the_finder_picks_the_goal_and_stall_then_works() {
     let mut d = Fake::new(reads);
     let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
     for i in 0..14 {
-        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), "50"]);
+        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), if i == 0 { "50" } else { "49" }]);
     }
     d.texts = texts.into();
     // goal_index 为 None（用户没给）→ 认
@@ -1283,12 +1283,45 @@ fn a_refused_step_between_moved_steps_does_not_stop_the_finder_seeing_the_step_c
     for _ in 0..30 {
         reads.push(Ok(grid(A))); // 第 3 步一直没变：被拒绝
     }
-    reads.extend([Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))]);
+    reads.extend([Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))]);
     let mut d = Fake::new(reads);
-    d.texts = lists(&[&["30", "50"], &["29", "50"], &["28", "50"], &["28", "50"], &["27", "50"], &["26", "50"]]);
-    let (_, log) = run_ask_goal(&mut d, None, false, 0, 5, None);
+    d.texts = lists(&[&["30", "50"], &["29", "50"], &["28", "49"], &["28", "49"], &["27", "49"], &["26", "49"], &["25", "49"]]);
+    let (_, log) = run_ask_goal(&mut d, None, false, 0, 6, None);
     let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
-    assert_eq!(outcomes, ["moved", "moved", "no_change", "moved", "moved"], "{outcomes:?}");
-    assert_eq!(log[4]["goal_found"], 2, "第 4 个成功样本时认出第 2 个数字：{log:?}");
-    assert!(log[..4].iter().all(|l| l.get("goal_found").is_none()));
+    assert_eq!(outcomes, ["moved", "moved", "no_change", "moved", "moved", "moved"], "{outcomes:?}");
+    assert_eq!(log[5]["goal_found"], 2, "第 4 个有效样本（第 1 个成功步不算）时认出第 2 个数字：{log:?}");
+    assert!(log[..5].iter().all(|l| l.get("goal_found").is_none()));
+}
+
+#[test]
+fn a_junk_first_step_is_not_a_sample() {
+    // 第 1 个成功步的「之前」是开局前读的（可能是弹窗数字），不进样本；之后 4 个干净的步才认。
+    let b: &[&[u16]] = &[&[2, 1, 1, 1], &[3, 1, 2, 3], &[2, 3, 2, 3]];
+    let mut reads = vec![Ok(grid(A))];
+    for k in 0..5 {
+        let g = if k % 2 == 0 { b } else { A };
+        reads.extend([Ok(grid(g)), Ok(grid(g)), Ok(grid(if k % 2 == 0 { A } else { b }))]);
+    }
+    let mut d = Fake::new(reads);
+    // [999, 0] -> [38, 122] 是垃圾；之后 [步数 -1, 目标 122 只降一次]
+    d.texts = lists(&[&["999", "0"], &["38", "122"], &["37", "122"], &["36", "100"], &["35", "100"], &["34", "100"]]);
+    let (_, log) = run_ask_goal(&mut d, None, false, 0, 5, None);
+    assert_eq!(log.len(), 5, "{log:?}");
+    assert!(log[..4].iter().all(|l| l.get("goal_found").is_none()), "{log:?}");
+    assert_eq!(log[4]["goal_found"], 2, "{log:?}");
+}
+
+#[test]
+fn a_goal_that_dropped_once_then_stays_flat_stalls_and_asks_the_model() {
+    let say = Say::new(Some(0));
+    let mut d = Fake::new(stall_reads());
+    let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
+    for i in 0..14 {
+        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), if i < 2 { "50" } else { "49" }]);
+    }
+    d.texts = texts.into();
+    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 14);
+    assert!(log.iter().any(|l| l["goal_found"] == 2), "{log:?}");
+    assert!(log.iter().any(|l| l["stalled"] == true), "{log:?}");
+    assert!(say.calls.get() >= 1);
 }

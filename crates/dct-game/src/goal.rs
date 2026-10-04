@@ -1,6 +1,6 @@
 //! 不看数字的意思，只看数字怎么变，认出哪个是「目标」。
-//! 步数每成功一步刚好降 1；分数、连击只增不减；剩下的就是目标。
-//! 恰好剩一个才认；多于一个或没有就不认（宁可不判停滞，也不乱判）。
+//! 步数每成功一步刚好降 1；分数、连击只增不减；目标是降过至少一次、又不是上面两种的那个。
+//! 从没变过的数字永远不认。恰好剩一个才认；多于一个或没有就不认（宁可不判停滞，也不乱判）。
 
 pub const MIN_SAMPLES: usize = 4;
 
@@ -9,6 +9,7 @@ pub struct GoalFinder {
     samples: usize,
     all_minus_one: Vec<bool>,
     ever_increased: Vec<bool>,
+    ever_decreased: Vec<bool>,
     found: Option<usize>,
 }
 
@@ -25,6 +26,7 @@ impl GoalFinder {
         if self.samples == 0 {
             self.all_minus_one = vec![true; before.len()];
             self.ever_increased = vec![false; before.len()];
+            self.ever_decreased = vec![false; before.len()];
         }
         if self.all_minus_one.len() != before.len() {
             return; // 列表个数和已有样本不一致：这一步不进样本
@@ -37,9 +39,12 @@ impl GoalFinder {
             if a > b {
                 self.ever_increased[i] = true;
             }
+            if a < b {
+                self.ever_decreased[i] = true;
+            }
         }
         if self.samples >= MIN_SAMPLES {
-            let left: Vec<usize> = (0..self.all_minus_one.len()).filter(|&i| !self.all_minus_one[i] && !self.ever_increased[i]).collect();
+            let left: Vec<usize> = (0..self.all_minus_one.len()).filter(|&i| !self.all_minus_one[i] && !self.ever_increased[i] && self.ever_decreased[i]).collect();
             if left.len() == 1 {
                 self.found = Some(left[0]);
             }
@@ -74,13 +79,25 @@ mod tests {
     }
 
     #[test]
-    fn a_goal_that_never_moves_is_still_found_by_elimination() {
+    fn a_number_that_never_moves_is_never_picked_as_the_goal() {
         let mut f = GoalFinder::new();
         feed(&mut f, &[
             (&[20, 50, 0], &[19, 50, 100]),
             (&[19, 50, 100], &[18, 50, 150]),
             (&[18, 50, 150], &[17, 50, 400]),
             (&[17, 50, 400], &[16, 50, 410]),
+        ]);
+        assert_eq!(f.index(), None);
+    }
+
+    #[test]
+    fn a_goal_that_dropped_once_is_found() {
+        let mut f = GoalFinder::new();
+        feed(&mut f, &[
+            (&[20, 50, 0], &[19, 50, 100]),
+            (&[19, 50, 100], &[18, 49, 150]),
+            (&[18, 49, 150], &[17, 49, 400]),
+            (&[17, 49, 400], &[16, 49, 410]),
         ]);
         assert_eq!(f.index(), Some(1));
     }
