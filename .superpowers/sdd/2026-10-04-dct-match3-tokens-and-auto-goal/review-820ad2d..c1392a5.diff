@@ -1,0 +1,395 @@
+# Review package: 820ad2d..HEAD
+
+## Commits
+c1392a5 fix(game): a goal candidate must have dropped at least once, and the first moved step is not a sample
+
+## Files changed
+ crates/dct-game/src/goal.rs                        | 25 ++++++++--
+ crates/dct-game/src/play.rs                        |  5 +-
+ crates/dct-game/src/play_tests.rs                  | 55 +++++++++++++++++-----
+ ...10-04-dct-match3-tokens-and-auto-goal-design.md | 15 ++++--
+ src/game/skill.md                                  |  2 +-
+ 5 files changed, 81 insertions(+), 21 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/goal.rs b/crates/dct-game/src/goal.rs
+index 2849973..a7ebd7c 100644
+--- a/crates/dct-game/src/goal.rs
++++ b/crates/dct-game/src/goal.rs
+@@ -1,52 +1,57 @@
+ //! 不看数字的意思，只看数字怎么变，认出哪个是「目标」。
+-//! 步数每成功一步刚好降 1；分数、连击只增不减；剩下的就是目标。
+-//! 恰好剩一个才认；多于一个或没有就不认（宁可不判停滞，也不乱判）。
++//! 步数每成功一步刚好降 1；分数、连击只增不减；目标是降过至少一次、又不是上面两种的那个。
++//! 从没变过的数字永远不认。恰好剩一个才认；多于一个或没有就不认（宁可不判停滞，也不乱判）。
+ 
+ pub const MIN_SAMPLES: usize = 4;
+ 
+ #[derive(Default)]
+ pub struct GoalFinder {
+     samples: usize,
+     all_minus_one: Vec<bool>,
+     ever_increased: Vec<bool>,
++    ever_decreased: Vec<bool>,
+     found: Option<usize>,
+ }
+ 
+ impl GoalFinder {
+     pub fn new() -> GoalFinder {
+         GoalFinder::default()
+     }
+ 
+     /// 只在**成功走了一步**之后调用。前后个数不同的步不进样本（OCR 漏读、弹窗飘字）。
+     pub fn observe(&mut self, before: &[u64], after: &[u64]) {
+         if self.found.is_some() || before.len() != after.len() || before.is_empty() {
+             return;
+         }
+         if self.samples == 0 {
+             self.all_minus_one = vec![true; before.len()];
+             self.ever_increased = vec![false; before.len()];
++            self.ever_decreased = vec![false; before.len()];
+         }
+         if self.all_minus_one.len() != before.len() {
+             return; // 列表个数和已有样本不一致：这一步不进样本
+         }
+         self.samples += 1;
+         for (i, (b, a)) in before.iter().zip(after).enumerate() {
+             if *a != b.saturating_sub(1) || *b == 0 {
+                 self.all_minus_one[i] = false;
+             }
+             if a > b {
+                 self.ever_increased[i] = true;
+             }
++            if a < b {
++                self.ever_decreased[i] = true;
++            }
+         }
+         if self.samples >= MIN_SAMPLES {
+-            let left: Vec<usize> = (0..self.all_minus_one.len()).filter(|&i| !self.all_minus_one[i] && !self.ever_increased[i]).collect();
++            let left: Vec<usize> = (0..self.all_minus_one.len()).filter(|&i| !self.all_minus_one[i] && !self.ever_increased[i] && self.ever_decreased[i]).collect();
+             if left.len() == 1 {
+                 self.found = Some(left[0]);
+             }
+         }
+     }
+ 
+     pub fn index(&self) -> Option<usize> {
+         self.found
+     }
+ }
+@@ -67,28 +72,40 @@ mod tests {
+         feed(&mut f, &[
+             (&[38, 122, 0], &[37, 110, 120]),
+             (&[37, 110, 120], &[36, 100, 300]),
+             (&[36, 100, 300], &[35, 100, 340]),
+             (&[35, 100, 340], &[34, 80, 600]),
+         ]);
+         assert_eq!(f.index(), Some(1));
+     }
+ 
+     #[test]
+-    fn a_goal_that_never_moves_is_still_found_by_elimination() {
++    fn a_number_that_never_moves_is_never_picked_as_the_goal() {
+         let mut f = GoalFinder::new();
+         feed(&mut f, &[
+             (&[20, 50, 0], &[19, 50, 100]),
+             (&[19, 50, 100], &[18, 50, 150]),
+             (&[18, 50, 150], &[17, 50, 400]),
+             (&[17, 50, 400], &[16, 50, 410]),
+         ]);
++        assert_eq!(f.index(), None);
++    }
++
++    #[test]
++    fn a_goal_that_dropped_once_is_found() {
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[20, 50, 0], &[19, 50, 100]),
++            (&[19, 50, 100], &[18, 49, 150]),
++            (&[18, 49, 150], &[17, 49, 400]),
++            (&[17, 49, 400], &[16, 49, 410]),
++        ]);
+         assert_eq!(f.index(), Some(1));
+     }
+ 
+     #[test]
+     fn two_irregular_numbers_are_ambiguous() {
+         let mut f = GoalFinder::new();
+         feed(&mut f, &[
+             (&[38, 122, 30], &[37, 110, 25]),
+             (&[37, 110, 25], &[36, 100, 20]),
+             (&[36, 100, 20], &[35, 100, 15]),
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index 148c6ad..1e21bec 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -288,20 +288,21 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+     let mut steps = 0;
+     let mut baseline: Option<usize> = None;
+     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+     let mut asked = 0usize;
+     let mut streak = 0;
+     let mut locked: Vec<(usize, usize)> = Vec::new();
+     let mut current: Option<GridRead> = None;
+     let mut no_move_confirms = 0;
+     let mut no_progress = 0usize;
+     let mut finder = GoalFinder::new();
++    let mut moved_seen = 0usize;
+     let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
+     let stop = loop {
+         if steps >= o.max_steps {
+             break Stop::StepsDone;
+         }
+         let t_read = clock.now_ms();
+         let g = match current.take() {
+             Some(g) => g,
+             None => match dco.read_grid(p) {
+                 Ok(g) => g,
+@@ -481,23 +482,25 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
+                 rec["observed_changed"] = json!(changed_cells(&g, &next));
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
+                 // 只有成功走了一步才让识别器看：被拒绝的步数字不降，会把「每步刚好少 1」的步数误排除。
++                // 第一步也不看：开局前读到的数字可能带着关卡开始的弹窗，不是这一步造成的变化。
++                moved_seen += 1;
+                 if o.goal_index.is_none() {
+                     let had = finder.index();
+-                    if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
++                    if let (true, Some(b), Some(a)) = (moved_seen > 1, &progress_prev, &progress_after) {
+                         finder.observe(b, a);
+                     }
+                     if had.is_none() {
+                         if let Some(i) = finder.index() {
+                             rec["goal_found"] = json!(i + 1);
+                         }
+                     }
+                 }
+                 let gi = o.goal_index.or(finder.index());
+                 update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index ffd6d75..ea43f15 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -1132,24 +1132,24 @@ fn flat(n: usize) -> Vec<&'static [&'static str]> {
+ #[test]
+ fn six_flat_steps_make_the_seventh_a_stall_and_ask_the_model() {
+     let mut v = vec![&["50"][..]];
+     v.extend(flat(8));
+     let (log, asked) = run_progress(lists(&v), Some(0), 8);
+     assert_eq!(first_stalled(&log), Some(6));
+     assert!(asked >= 1);
+ }
+ 
+ #[test]
+-fn without_a_goal_index_a_flat_run_never_stalls_or_asks() {
++fn a_flat_only_number_is_never_picked_so_no_stall_and_no_ask() {
+     let mut v = vec![&["50"][..]];
+-    v.extend(flat(8));
+-    let (log, asked) = run_progress(lists(&v), None, 8);
++    v.extend(flat(14));
++    let (log, asked) = run_progress(lists(&v), None, 14);
+     assert_eq!(asked, 0);
+     assert!(log.iter().all(|l| l.get("stalled").is_none()));
+ }
+ 
+ #[test]
+ fn a_dropping_goal_number_never_stalls() {
+     let texts: Vec<Vec<&'static str>> = std::iter::once(vec!["50"]).chain((0..8).map(|i| vec![&*Box::leak(format!("{}", 49 - i).into_boxed_str())])).collect();
+     let (log, asked) = run_progress(texts.into(), Some(0), 8);
+     assert_eq!(asked, 0);
+     assert!(log.iter().all(|l| l.get("stalled").is_none()));
+@@ -1221,33 +1221,33 @@ fn a_move_blocked_only_by_a_lock_is_still_tried_and_stuck_means_all_refused() {
+ fn the_ask_record_carries_the_token_counts() {
+     let say = Say::new(Some(1));
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+     assert_eq!(log[0]["ask"]["tokens_in"], 11);
+     assert_eq!(log[0]["ask"]["tokens_out"], 2);
+ }
+ 
+ #[test]
+ fn without_goal_number_the_finder_picks_the_goal_and_stall_then_works() {
+-    // 数字列表 [步数, 目标]：步数每步 -1，目标恒为 50（不动）。4 步样本后认出目标 = 下标 1，之后 6 步没降 → 停滞 → 问模型
++    // 数字列表 [步数, 目标]：步数每步 -1，目标 50 只在第 2 步降成 49 然后不动（第 1 步不进样本）。4 个样本后认出目标 = 下标 1，之后 6 步没降 → 停滞 → 问模型
+     let say = Say::new(Some(0));
+     let mut reads = vec![Ok(grid(A))];
+     for _ in 0..60 {
+         reads.push(Ok(grid(MOVED)));
+         reads.push(Ok(grid(MOVED)));
+         reads.push(Ok(grid(A)));
+         reads.push(Ok(grid(A)));
+     }
+     let mut d = Fake::new(reads);
+     let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
+     for i in 0..14 {
+-        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), "50"]);
++        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), if i == 0 { "50" } else { "49" }]);
+     }
+     d.texts = texts.into();
+     // goal_index 为 None（用户没给）→ 认
+     let (_, log) = run_ask(&mut d, Some(&say), false, 30, 14);
+     assert!(log.iter().any(|l| l["goal_found"] == 2), "应在某一步认出第 2 个数字：{log:?}");
+     assert!(log.iter().any(|l| l["stalled"] == true));
+     assert!(say.calls.get() >= 1);
+ }
+ 
+ #[test]
+@@ -1276,19 +1276,52 @@ fn a_user_given_goal_number_is_never_overridden_by_the_finder() {
+ 
+ #[test]
+ fn a_refused_step_between_moved_steps_does_not_stop_the_finder_seeing_the_step_counter() {
+     // [步数, 目标]：步数每成功一步 -1，目标不动。中间夹一步被拒绝（数字都没变）。
+     // 被拒绝的步不能进识别器的样本，否则步数那一列会被当成「不规律」，4 个有效样本时就认不出目标。
+     let b: &[&[u16]] = &[&[2, 1, 1, 1], &[3, 1, 2, 3], &[2, 3, 2, 3]];
+     let mut reads = vec![Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))];
+     for _ in 0..30 {
+         reads.push(Ok(grid(A))); // 第 3 步一直没变：被拒绝
+     }
+-    reads.extend([Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))]);
++    reads.extend([Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))]);
+     let mut d = Fake::new(reads);
+-    d.texts = lists(&[&["30", "50"], &["29", "50"], &["28", "50"], &["28", "50"], &["27", "50"], &["26", "50"]]);
+-    let (_, log) = run_ask_goal(&mut d, None, false, 0, 5, None);
++    d.texts = lists(&[&["30", "50"], &["29", "50"], &["28", "49"], &["28", "49"], &["27", "49"], &["26", "49"], &["25", "49"]]);
++    let (_, log) = run_ask_goal(&mut d, None, false, 0, 6, None);
+     let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
+-    assert_eq!(outcomes, ["moved", "moved", "no_change", "moved", "moved"], "{outcomes:?}");
+-    assert_eq!(log[4]["goal_found"], 2, "第 4 个成功样本时认出第 2 个数字：{log:?}");
+-    assert!(log[..4].iter().all(|l| l.get("goal_found").is_none()));
++    assert_eq!(outcomes, ["moved", "moved", "no_change", "moved", "moved", "moved"], "{outcomes:?}");
++    assert_eq!(log[5]["goal_found"], 2, "第 4 个有效样本（第 1 个成功步不算）时认出第 2 个数字：{log:?}");
++    assert!(log[..5].iter().all(|l| l.get("goal_found").is_none()));
++}
++
++#[test]
++fn a_junk_first_step_is_not_a_sample() {
++    // 第 1 个成功步的「之前」是开局前读的（可能是弹窗数字），不进样本；之后 4 个干净的步才认。
++    let b: &[&[u16]] = &[&[2, 1, 1, 1], &[3, 1, 2, 3], &[2, 3, 2, 3]];
++    let mut reads = vec![Ok(grid(A))];
++    for k in 0..5 {
++        let g = if k % 2 == 0 { b } else { A };
++        reads.extend([Ok(grid(g)), Ok(grid(g)), Ok(grid(if k % 2 == 0 { A } else { b }))]);
++    }
++    let mut d = Fake::new(reads);
++    // [999, 0] -> [38, 122] 是垃圾；之后 [步数 -1, 目标 122 只降一次]
++    d.texts = lists(&[&["999", "0"], &["38", "122"], &["37", "122"], &["36", "100"], &["35", "100"], &["34", "100"]]);
++    let (_, log) = run_ask_goal(&mut d, None, false, 0, 5, None);
++    assert_eq!(log.len(), 5, "{log:?}");
++    assert!(log[..4].iter().all(|l| l.get("goal_found").is_none()), "{log:?}");
++    assert_eq!(log[4]["goal_found"], 2, "{log:?}");
++}
++
++#[test]
++fn a_goal_that_dropped_once_then_stays_flat_stalls_and_asks_the_model() {
++    let say = Say::new(Some(0));
++    let mut d = Fake::new(stall_reads());
++    let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
++    for i in 0..14 {
++        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), if i < 2 { "50" } else { "49" }]);
++    }
++    d.texts = texts.into();
++    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 14);
++    assert!(log.iter().any(|l| l["goal_found"] == 2), "{log:?}");
++    assert!(log.iter().any(|l| l["stalled"] == true), "{log:?}");
++    assert!(say.calls.get() >= 1);
+ }
+diff --git a/docs/superpowers/specs/2026-10-04-dct-match3-tokens-and-auto-goal-design.md b/docs/superpowers/specs/2026-10-04-dct-match3-tokens-and-auto-goal-design.md
+index 523bc9b..6bd7c22 100644
+--- a/docs/superpowers/specs/2026-10-04-dct-match3-tokens-and-auto-goal-design.md
++++ b/docs/superpowers/specs/2026-10-04-dct-match3-tokens-and-auto-goal-design.md
+@@ -33,51 +33,58 @@ dct 只放通用代码。本轮两件事都满足「换一个别的方格游戏
+ 
+ 第四轮的停滞检测只有在用户给了 `--goal-number N` 时才工作。屏幕顶部读出来的数字有：剩余步数（每成功一步降 1）、目标数（降得不规律）、有时还有分数（只增不减）。不给 N 时，应该由 dct 自己判断哪个是目标。
+ 
+ ### 做法（全部只看数字的变化，不看数字的意思）
+ 
+ `play()` 在每个**成功走了一步**（`moved`，不含被拒绝的）之后，已经有 `progress.before` 和 `progress.after` 两份数字列表。对「前后个数相同」的那些步，按下标记录每个数字的变化量。
+ 
+ 一个下标满足下面某一条，就被**排除**：
+ - 它是**步数**：到目前为止每次变化量都刚好是 −1，且至少 4 个样本；
+ - 它**增加过**（分数、连击这类）；
+-- 它**从未变过且样本不到 4 个**时先不下结论（不排除也不选）。
++- 它**从来没降过**（一直不变的数字永远不会被认作目标）。
+ 
+-在至少 4 个样本之后，如果**排除后恰好剩下一个下标**，它就是目标；多于一个或一个都没有，就**不判断**（和现在不给 `--goal-number` 时一样：不判停滞、不因停滞问模型）。用户给了 `--goal-number` 时，一律用用户的，不自动认。
++第 1 个成功步不进样本（开局前读到的数字可能带着关卡开始的弹窗）。
++
++在至少 4 个样本之后，如果**排除后恰好剩下一个下标**（降过至少一次、没增加过、又不是每步刚好 −1），它就是目标；多于一个或一个都没有，就**不判断**（和现在不给 `--goal-number` 时一样：不判停滞、不因停滞问模型）。用户给了 `--goal-number` 时，一律用用户的，不自动认。
+ 
+ 认出来以后：
+ - 记录里在每一步的 `progress` 里多一个字段 `goal_index`（0 起；还没认出就是 `null`），用户能从日志看到它认成了哪个；
+ - 停滞计数从认出的那一步之后开始算（不追溯）；
+ - 第一次认出时打印一句大白话：「我认为屏幕上第 N 个数字是这一关的目标。」
+ 
+ 目标认错的代价：停滞判断会不准，只会多问或少问一次模型，不会划出不合规的步。认错了用户可以用 `--goal-number` 覆盖。
+ 
+ ### 不做
+ 
+ - 不读数字旁边的文字或图标来判断它是什么（那是游戏专属，也要看图）；
+ - 不跨关卡记忆（每一次 `play()` 重新认；`--auto-next` 换关时也重新认）；
+ - 不处理「目标数字中途变成对勾」这类（数字个数变了，这一步就算「未知」，已有的规则）。
+ 
+ ## 测试
+ 
+ - Token：假后端分别返回 OpenAI 型、Anthropic 型的响应体，用量读对；缺字段/非数字/没有 `usage` → `None` 且答案照样返回；`complete_counted` 默认实现返回 `None` 且结果和 `complete` 一样；`Advice.tokens` 带到记录的 `ask.tokens_in/out`；结束语的三种说法（用量齐、没读到用量、没问过）。
+ - 自动认目标：
+   - 步数 −1 每步、目标每步降不同数 → 认出目标，步数被排除；
+   - 分数只增、目标降 → 认出目标；
+-  - 目标始终不动、步数每步 −1、分数增 → 排除步数和分数，恰剩一个（目标）→ 认出，之后判停滞；
++  - 一个数字始终不动 → 永远不认（步数 −1、不动的 50、分数增 → 不判断）；
++  - 目标降过一次之后不动、步数每步 −1、分数增 → 认出目标，之后判停滞并问模型；
++  - 第 1 个成功步是垃圾数字 → 不进样本，之后 4 个干净步照样认出；
++  - 被拒绝的步夹在中间 → 不进样本；
+   - 两个都变化不规律 → 不判断；
+   - 样本不足 4 个 → 不判断；
+   - 个数不同的步不进样本；
+   - 用户给了 `--goal-number` 时不自动认，且日志里 `goal_index` 是用户的那个。
+-- 变异测试照老规矩：步数判定的「刚好 −1」、「至少 4 个样本」、「恰剩一个」。
++- 变异测试照老规矩：步数判定的「刚好 −1」、「至少 4 个样本」、「恰剩一个」、「降过至少一次」、「第 1 步不进样本」、「被拒绝的步不进样本」。
+ 
+ ## 验收（真机，需要用户在场）
+ 
+ 1. 第 1716 关这类有步数和目标的关：不给 `--goal-number`，10 步内日志里 `goal_index` 指向目标那个数字（我对着屏幕核对）；
+ 2. 用 `--ask-every-step` 玩几步：结束时打印问了几次、用了多少 token；记录里每条 `ask` 有 `tokens_in/out`；
+ 3. 网关读不到用量时（换一个不返回 `usage` 的模型或断开）：不崩，说「没有读到用量」。
+ 
+ ## 已知的限制
+ 
++- 前几步一直不动、之后才第一次降的目标，要等它降过之后才认得出（在那之前不判停滞）。
++
+ - 只有 HTTP 后端读得到用量；走命令行的后端读不到。
+ - 目标数字自动认出需要 4 步以上的样本，开局几步判断不了。
+ - 若某一关目标数字在前几步恰好每步也降 1，会被当成步数排除（极少见）。
+diff --git a/src/game/skill.md b/src/game/skill.md
+index 8a9d4c0..fe5a4ce 100644
+--- a/src/game/skill.md
++++ b/src/game/skill.md
+@@ -40,21 +40,21 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
+ - 弹窗只关「Close」「Not now」「No thanks」这一类安全的，其它一律不点；
+ - 遇到要花钱的画面、广告、生命用完、通关了、不认识的画面，就停下，什么都不点；
+ - 也会一边做一边印一行，例如「点了「Play」，开始新的一局」「这一局没过，点了「Try again」重来」。
+ 
+ 把这些话转述给用户。它停下以后，把最后一句话原样告诉用户（比如「生命用完了」「出现了广告，请你自己关掉」），由用户决定下一步。
+ 
+ ## 玩不动的时候
+ 
+ 规则选的步没反应时，可以加 `--ask-model`：卡住了才问大模型，让它从规则列出的几步里挑一步。想让它每一步都挑，加 `--ask-every-step`：每一步都问大模型（会慢一些，用来对比）。加 `--goal "清掉冰块"` 告诉它这一关要干什么。没配大模型、或者大模型没回应，也能玩，只是这次只用规则。
+ 
+-连着好几步屏幕上的目标数字都没变小，就算「没有进展」，dct 会把它记下来、说出来；加了 `--ask-model` 的话，还会去问大模型。要用 `--goal-number 2` 告诉 dct 哪个数字是目标：它把从屏幕上读到的普通数字按出现的先后排好，第一个就是 1，`--goal-number 2` 就是第二个。读到了哪些数字，看 dct 打印的记录里的 `progress`。没写 `--goal-number` 时，dct 会在走几步以后自己认：它认的是变化不规律、又不是每步刚好少 1 的那个数字（每步刚好少 1 的是步数，只涨不降的是分数）。认出来了会说一句「我认为屏幕上第 N 个数字是这一关的目标」；认错了，就用 `--goal-number` 指明。
++连着好几步屏幕上的目标数字都没变小，就算「没有进展」，dct 会把它记下来、说出来；加了 `--ask-model` 的话，还会去问大模型。要用 `--goal-number 2` 告诉 dct 哪个数字是目标：它把从屏幕上读到的普通数字按出现的先后排好，第一个就是 1，`--goal-number 2` 就是第二个。读到了哪些数字，看 dct 打印的记录里的 `progress`。没写 `--goal-number` 时，dct 会在走几步以后自己认：它认的是变化不规律、又不是每步刚好少 1 的那个数字（每步刚好少 1 的是步数，只涨不降的是分数）。认出来了会说一句「我认为屏幕上第 N 个数字是这一关的目标」；认错了，就用 `--goal-number` 指明。认不出目标数字时不会判断有没有进展，可以用 `--goal-number` 指明。
+ 
+ ## 停
+ 
+ - 用户说「停」，马上中断这条命令。
+ - 命令自己停下时（没有能走的步、读不出棋盘、画面一直在动、连着两次没反应、dco 急停），把它印的最后一句话原样告诉用户。
+ - 不要自己去点屏幕补救，也不要换别的办法去操作游戏；让用户决定下一步。
+ 
+ ## 不要做
+ 
+ - 不要自己调用 dco 去点关卡按钮、道具、广告、付款。`--auto-next` 停下以后，也不要替它去点屏幕上的按钮、关广告或买东西。

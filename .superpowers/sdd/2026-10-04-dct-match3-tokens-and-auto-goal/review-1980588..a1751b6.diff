@@ -1,0 +1,382 @@
+# Review package: 1980588..HEAD
+
+## Commits
+a1751b6 feat(game): record token usage on every model ask and say the total when the run ends
+
+## Files changed
+ crates/dct-game/src/ask.rs        |   2 +
+ crates/dct-game/src/play.rs       |   1 +
+ crates/dct-game/src/play_tests.rs |  11 +++-
+ src/game/advisor.rs               | 104 +++++++++++++++++++++++++++++++++++---
+ src/game/bench.rs                 |   4 +-
+ src/game/cli.rs                   |   3 ++
+ 6 files changed, 114 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/ask.rs b/crates/dct-game/src/ask.rs
+index 037b04b..42646dd 100644
+--- a/crates/dct-game/src/ask.rs
++++ b/crates/dct-game/src/ask.rs
+@@ -10,20 +10,22 @@ pub struct AskInput {
+     pub candidates: Vec<String>,
+     pub failed: Vec<String>,
+ }
+ 
+ pub struct Advice {
+     /// 候选里的下标（0 起）。`None`：模型说都不合适，或没给出可用的编号。
+     pub choice: Option<usize>,
+     pub reason: String,
+     pub raw: String,
+     pub model: String,
++    /// 这次问用掉的输入、输出 token 数；读不到是 `None`。
++    pub tokens: Option<(u64, u64)>,
+ }
+ 
+ /// `None` = 没问成（没配、连不上、超时）：调用方当没有这个功能，退回规则。
+ pub trait Advisor {
+     fn pick(&self, input: &AskInput) -> Option<Advice>;
+     /// 已知问不通时返回 false：调用方不再发问（也不做「想」的动作）。
+     fn available(&self) -> bool {
+         true
+     }
+ }
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index b5f28e8..0ffc91f 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -384,20 +384,21 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
+                     failed: failed_now.clone(),
+                 };
+                 dco.show_status("think");
+                 let advice = adv.pick(&input);
+                 dco.show_status("look");
+                 if let Some(a) = advice {
+                     let chosen_idx = a.choice.filter(|&k| k < offered.len()).map(|k| offered[k]);
+                     ask_rec = Some(json!({
+                         "model": a.model, "raw": a.raw, "reason": a.reason,
++                        "tokens_in": a.tokens.map(|t| t.0), "tokens_out": a.tokens.map(|t| t.1),
+                         "asked": offered, "choice": chosen_idx,
+                         "failed": failed_now, "goal": o.goal,
+                     }));
+                     if let Some(i) = chosen_idx {
+                         pick = i;
+                         decider = "model";
+                     }
+                 }
+             }
+         }
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index 4c55c95..8be686b 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -702,21 +702,21 @@ impl Say {
+ }
+ impl Advisor for Say {
+     fn pick(&self, i: &AskInput) -> Option<Advice> {
+         self.calls.set(self.calls.get() + 1);
+         self.seen.borrow_mut().push(AskInput {
+             board: i.board.clone(),
+             goal: i.goal.clone(),
+             candidates: i.candidates.clone(),
+             failed: i.failed.clone(),
+         });
+-        Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into() })
++        Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into(), tokens: Some((11, 2)) })
+     }
+ }
+ struct Gone(Cell<usize>);
+ impl Advisor for Gone {
+     fn pick(&self, _: &AskInput) -> Option<Advice> {
+         self.0.set(self.0.get() + 1);
+         None
+     }
+     fn available(&self) -> bool {
+         false
+@@ -1209,10 +1209,19 @@ const SHARED: &[&[u16]] = &[&[1, 4, 3, 2], &[1, 3, 4, 3], &[3, 2, 4, 2]];
+ #[test]
+ fn a_move_blocked_only_by_a_lock_is_still_tried_and_stuck_means_all_refused() {
+     let mut d = Fake::new(vec![Ok(grid(SHARED))]);
+     let (s, log) = run(&mut d, 10, false);
+     assert_eq!(log[0]["candidates"].as_array().unwrap().len(), 2);
+     assert!(d.swipes.len() >= 2, "{:?}", d.swipes);
+     assert_ne!(d.swipes[0], d.swipes[1]);
+     assert_eq!(s.stop, Stop::Stuck);
+     assert_eq!(d.swipes.len(), 2, "两个走法都被原样拒绝过才算没路");
+ }
++
++#[test]
++fn the_ask_record_carries_the_token_counts() {
++    let say = Say::new(Some(1));
++    let mut d = Fake::new(settled_script());
++    let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
++    assert_eq!(log[0]["ask"]["tokens_in"], 11);
++    assert_eq!(log[0]["ask"]["tokens_out"], 2);
++}
+diff --git a/src/game/advisor.rs b/src/game/advisor.rs
+index b95cb64..01cd516 100644
+--- a/src/game/advisor.rs
++++ b/src/game/advisor.rs
+@@ -1,76 +1,114 @@
+ //! 把「问模型选哪一步」接到 dct 自己的 LLM 连接层上。
+ //! 凭据怎么取、发给哪台机器，全在 `llm::resolve`，这里不碰。
+-use crate::llm::{complete_with_timeout, Backend, Prompt};
++use crate::llm::{complete_counted_with_timeout, Backend, Prompt};
+ use dct_game::ask::{parse_reply, prompt_text, Advice, Advisor, AskInput};
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ pub struct LlmAdvisor {
+     backend: Arc<dyn Backend>,
+     model: String,
+     timeout: Duration,
+     /// 问不通以后置位：后面不再发问，只用规则。
+     down: AtomicBool,
++    asks: AtomicU64,
++    counted: AtomicU64,
++    tokens_in: AtomicU64,
++    tokens_out: AtomicU64,
+ }
+ 
+ impl LlmAdvisor {
+     pub fn new(backend: Arc<dyn Backend>, model: String) -> LlmAdvisor {
+-        LlmAdvisor { backend, model, timeout: Duration::from_secs(20), down: AtomicBool::new(false) }
++        LlmAdvisor { backend, model, timeout: Duration::from_secs(20), down: AtomicBool::new(false),
++            asks: AtomicU64::new(0),
++            counted: AtomicU64::new(0),
++            tokens_in: AtomicU64::new(0),
++            tokens_out: AtomicU64::new(0),
++        }
++    }
++
++    /// 结束语：没问过返回 `None`。用量读到几次算几次，读不到的次数明说。
++    pub fn summary(&self) -> Option<String> {
++        let asks = self.asks.load(Ordering::SeqCst);
++        if asks == 0 {
++            return None;
++        }
++        let counted = self.counted.load(Ordering::SeqCst);
++        if counted == 0 {
++            return Some(format!("这次问了大模型 {asks} 次（没有读到用量）。"));
++        }
++        let (i, o) = (self.tokens_in.load(Ordering::SeqCst), self.tokens_out.load(Ordering::SeqCst));
++        let mut s = format!("这次问了大模型 {asks} 次，一共用了约 {} 个 token（输入 {i}，输出 {o}）", i + o);
++        if counted < asks {
++            s += &format!("，其中 {} 次没读到用量", asks - counted);
++        }
++        s += "。";
++        Some(s)
+     }
+ }
+ 
+ const SYSTEM: &str = "你在帮一个三消游戏的自动玩家选下一步。只能从给出的编号里选，不要自己编走法。";
+ 
+ impl Advisor for LlmAdvisor {
+     fn pick(&self, i: &AskInput) -> Option<Advice> {
+         if self.down.load(Ordering::SeqCst) {
+             return None;
+         }
+         let p = Prompt { system: SYSTEM.into(), user: prompt_text(i), max_tokens: 64 };
+         // 任何错误都是「没问成」：调用方退回规则
+-        let Ok(raw) = complete_with_timeout(self.backend.clone(), p, self.timeout) else {
++        let Ok((raw, usage)) = complete_counted_with_timeout(self.backend.clone(), p, self.timeout) else {
+             // 只说一次，之后不再问，免得每一步都白等一轮超时
+             if !self.down.swap(true, Ordering::SeqCst) {
+                 println!("大模型没回应，后面只用规则。");
+             }
+             return None;
+         };
++        self.asks.fetch_add(1, Ordering::SeqCst);
++        let tokens = usage.map(|u| (u.input, u.output));
++        if let Some((ti, to)) = tokens {
++            self.counted.fetch_add(1, Ordering::SeqCst);
++            self.tokens_in.fetch_add(ti, Ordering::SeqCst);
++            self.tokens_out.fetch_add(to, Ordering::SeqCst);
++        }
+         let (choice, reason) = parse_reply(&raw, i.candidates.len());
+-        Some(Advice { choice, reason, raw, model: self.model.clone() })
++        Some(Advice { choice, reason, raw, model: self.model.clone(), tokens })
+     }
+ 
+     fn available(&self) -> bool {
+         !self.down.load(Ordering::SeqCst)
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::llm::{Backend, LlmError, Prompt};
++    use crate::llm::{Backend, LlmError, Prompt, Usage};
+     use dct_game::ask::{Advisor, AskInput};
+     use std::sync::{Arc, Mutex};
+ 
+-    struct Fixed(Result<String, LlmError>, Mutex<Vec<String>>);
++    struct Fixed(Result<String, LlmError>, Mutex<Vec<String>>, Option<Usage>);
+     impl Backend for Fixed {
+         fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
+             self.1.lock().unwrap().push(p.user.clone());
+             self.0.clone()
+         }
++        fn complete_counted(&self, p: &Prompt) -> Result<(String, Option<Usage>), LlmError> {
++            self.complete(p).map(|s| (s, self.2))
++        }
+     }
+     fn input() -> AskInput {
+         AskInput { board: "A A\nB B".into(), goal: "清冰".into(), candidates: vec!["甲".into(), "乙".into(), "丙".into()], failed: vec![] }
+     }
+     fn adv(r: Result<String, LlmError>) -> (LlmAdvisor, Arc<Fixed>) {
+-        let b = Arc::new(Fixed(r, Mutex::new(vec![])));
++        let b = Arc::new(Fixed(r, Mutex::new(vec![]), None));
+         (LlmAdvisor::new(b.clone(), "m1".into()), b)
+     }
+ 
+     #[test]
+     fn a_valid_reply_becomes_a_zero_based_choice_with_reason() {
+         let (a, b) = adv(Ok("2，能清冰".into()));
+         let r = a.pick(&input()).unwrap();
+         assert_eq!(r.choice, Some(1));
+         assert_eq!(r.reason, "能清冰");
+         assert_eq!(r.raw, "2，能清冰");
+@@ -94,11 +132,61 @@ mod tests {
+         assert_eq!(b.1.lock().unwrap().len(), 1);
+     }
+ 
+     #[test]
+     fn every_backend_error_means_not_asked() {
+         for e in [LlmError::Unavailable, LlmError::Timeout, LlmError::Malformed] {
+             let (a, _) = adv(Err(e));
+             assert!(a.pick(&input()).is_none(), "{e:?}");
+         }
+     }
++
++    #[test]
++    fn usage_is_carried_into_the_advice_and_summed_into_the_summary() {
++        let b = Arc::new(Fixed(Ok("1".into()), Mutex::new(vec![]), Some(Usage { input: 100, output: 4 })));
++        let a = LlmAdvisor::new(b, "m1".into());
++        let r = a.pick(&input()).unwrap();
++        assert_eq!(r.tokens, Some((100, 4)));
++        a.pick(&input()).unwrap();
++        assert_eq!(a.summary().as_deref(), Some("这次问了大模型 2 次，一共用了约 208 个 token（输入 200，输出 8）。"));
++    }
++
++    #[test]
++    fn summary_says_how_many_asks_had_no_usage() {
++        let b = Arc::new(Fixed(Ok("1".into()), Mutex::new(vec![]), None));
++        let a = LlmAdvisor::new(b, "m1".into());
++        a.pick(&input()).unwrap();
++        assert_eq!(a.summary().as_deref(), Some("这次问了大模型 1 次（没有读到用量）。"));
++    }
++
++    #[test]
++    fn summary_mixes_counted_and_uncounted_asks_honestly() {
++        struct Alt(Mutex<u32>);
++        impl Backend for Alt {
++            fn complete(&self, _: &Prompt) -> Result<String, LlmError> {
++                Ok("1".into())
++            }
++            fn complete_counted(&self, _: &Prompt) -> Result<(String, Option<Usage>), LlmError> {
++                let mut n = self.0.lock().unwrap();
++                *n += 1;
++                Ok(("1".into(), if *n == 1 { Some(Usage { input: 50, output: 1 }) } else { None }))
++            }
++        }
++        let a = LlmAdvisor::new(Arc::new(Alt(Mutex::new(0))), "m".into());
++        a.pick(&input()).unwrap();
++        a.pick(&input()).unwrap();
++        assert_eq!(a.summary().as_deref(), Some("这次问了大模型 2 次，一共用了约 51 个 token（输入 50，输出 1），其中 1 次没读到用量。"));
++    }
++
++    #[test]
++    fn no_asks_means_no_summary() {
++        let b = Arc::new(Fixed(Ok("1".into()), Mutex::new(vec![]), None));
++        assert_eq!(LlmAdvisor::new(b, "m".into()).summary(), None);
++    }
++
++    #[test]
++    fn a_failed_ask_is_not_counted_in_the_summary() {
++        let (a, _) = adv(Err(LlmError::Unavailable));
++        assert!(a.pick(&input()).is_none());
++        assert_eq!(a.summary(), None);
++    }
+ }
+diff --git a/src/game/bench.rs b/src/game/bench.rs
+index 89ef4c2..fde33f5 100644
+--- a/src/game/bench.rs
++++ b/src/game/bench.rs
+@@ -176,21 +176,21 @@ pub fn report_text(r: &Report) -> String {
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use dct_game::ask::{Advice, Advisor, AskInput};
+     use serde_json::json;
+ 
+     struct First;
+     impl Advisor for First {
+         fn pick(&self, _: &AskInput) -> Option<Advice> {
+-            Some(Advice { choice: Some(0), reason: String::new(), raw: "1".into(), model: "t".into() })
++            Some(Advice { choice: Some(0), reason: String::new(), raw: "1".into(), model: "t".into(), tokens: None })
+         }
+     }
+ 
+     fn rec(n: usize, dry: bool) -> Value {
+         let cands: Vec<Value> = (0..n).map(|k| json!({"a":[0,k],"b":[1,k],"score":1.0,
+             "features":{"cleared":3,"cascade":0,"striped":0,"wrapped":0,"bomb":0,"triggered":0,"special_swap":false,"lowest_row":1}})).collect();
+         json!({"game":"g","cells":[[1,1],[2,2]],"classes":[{"id":1,"count":2},{"id":2,"count":2}],
+                "candidates": cands, "chosen":0, "dry_run": dry, "outcome": "moved"})
+     }
+ 
+@@ -216,21 +216,21 @@ mod tests {
+     #[test]
+     fn report_text_has_the_caveat_and_numbers() {
+         let t = report_text(&Report { asked: 40, answered: 40, valid: 38, picked_rules_first: 13, chance_first: 8.2, avg_ms: 900, ..Default::default() });
+         assert!(t.contains("问了 40 个局面，回答成合法编号的 38 个，选中规则第一名的 13 个（乱选大约 8 个），平均每次 900 毫秒"));
+         assert!(t.contains("不说明它选得对不对"));
+     }
+ 
+     struct Pick(usize);
+     impl Advisor for Pick {
+         fn pick(&self, _: &AskInput) -> Option<Advice> {
+-            Some(Advice { choice: Some(self.0), reason: String::new(), raw: String::new(), model: "t".into() })
++            Some(Advice { choice: Some(self.0), reason: String::new(), raw: String::new(), model: "t".into(), tokens: None })
+         }
+     }
+ 
+     fn labelled(good: Vec<usize>, bad: Vec<usize>) -> Value {
+         let mut r = rec(5, false);
+         r["good"] = json!(good);
+         r["bad"] = json!(bad);
+         r
+     }
+ 
+diff --git a/src/game/cli.rs b/src/game/cli.rs
+index 7db5d0b..093caae 100644
+--- a/src/game/cli.rs
++++ b/src/game/cli.rs
+@@ -169,20 +169,23 @@ fn run_parsed(a: &Args) -> i32 {
+     } else {
+         play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
+     };
+     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
+     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
+     if code == 0 {
+         println!("{line}");
+     } else {
+         eprintln!("{line}");
+     }
++    if let Some(line) = advisor.as_ref().and_then(|a| a.summary()) {
++        println!("{line}");
++    }
+     code
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn parse_ask_model_and_goal() {
+         let a = parse(&["play".into(), "--ask-model".into(), "--goal".into(), "清掉冰块".into()]).unwrap();
