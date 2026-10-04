@@ -155,6 +155,7 @@
 - 行为：
   1. **开局一次**（非 dry-run）：`show_status_with("look", None, p.theme.as_deref())`（有 `theme` 才发；没有就什么都不发，和现在一样）。
   2. **每步划完、写完记录之后**：用这一步的 `chosen.features`、`stalled_now`、剩余步数（`finder.step_index()` 指的那个数字的 `progress_after`）、目标数字当前值（`gi` 指的那个数字的 `progress_after`）和 `finder.goal_start()` 算 `for_step`。结果是 `Some(m)` 且 `m.state` 和**上一次发给章鱼的状态不同** → `show_status_with(m.state, m.text, None)`；结果是 `None` 且上一次发的不是 `"look"` → 发 `look`。**同一个状态连着不重发。**
+  2b. **问大模型的那段时间**（play() 里已有的 `show_status("think")` … `show_status("look")` 之间）：把 `think` 改成 `show_status_with("think", Some("问大模型中"), None)`（说明条「问大模型中」5 个字，≤16），问完仍回 `look`。这样用户一眼看出章鱼是在等模型，不是卡住。模型没回应（`down`）时发一次 `show_status_with("stall", Some("大模型没回应"), None)`。测试：问模型的那一步，`events` 里 think 带 `text == "问大模型中"`；规则选步的步不发 think。
   3. **结束时**（`play` 的 `break` 之后、返回 `Summary` 之前；`auto_next` 结束时同理）：`for_stop(&stop)` 有就发（不受「同状态不重发」限制）。`Won`、`LivesOut`、`Money`、`Ad`、`UnknownScreen`、`LevelEnded` 是 `navigate.rs` 的停止原因，在 `auto_next` 的出口发。
   4. `dct game identify`：`for_genre` 有就发（经 `show_status_with`）。
   5. 配置文件可选键 `theme = "candy"`（字符串，≤ 20 个字符；超了拒绝并说人话）；`profile::load` 读进 `Profile.theme`。**`candy-crush` 内置配置和用户本地的 `level-17xx.toml` 不改**（本地文件由用户自己加这一行；说明卡里写一句怎么加）。
