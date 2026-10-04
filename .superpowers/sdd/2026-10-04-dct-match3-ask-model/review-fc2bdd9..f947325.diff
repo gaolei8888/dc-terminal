@@ -1,0 +1,630 @@
+# Review package: fc2bdd9..HEAD
+
+## Commits
+f947325 fix(game): ask flags split, dead model stops asking, stricter reply parsing, richer ask record
+
+## Files changed
+ crates/dct-game/src/ask.rs                         | 35 +++++++++++++++++-----
+ crates/dct-game/src/play.rs                        | 10 ++++---
+ crates/dct-game/src/play_tests.rs                  | 31 +++++++++++++++++++
+ .../2026-10-04-dct-match3-ask-model-design.md      |  4 +--
+ src/game/advisor.rs                                | 30 +++++++++++++++++--
+ src/game/cli.rs                                    | 27 ++++++++++++-----
+ src/game/skill.md                                  |  2 +-
+ src/main.rs                                        |  1 +
+ 8 files changed, 115 insertions(+), 25 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/ask.rs b/crates/dct-game/src/ask.rs
+index 6b37b68..8adffb8 100644
+--- a/crates/dct-game/src/ask.rs
++++ b/crates/dct-game/src/ask.rs
+@@ -15,20 +15,24 @@ pub struct Advice {
+     /// 候选里的下标（0 起）。`None`：模型说都不合适，或没给出可用的编号。
+     pub choice: Option<usize>,
+     pub reason: String,
+     pub raw: String,
+     pub model: String,
+ }
+ 
+ /// `None` = 没问成（没配、连不上、超时）：调用方当没有这个功能，退回规则。
+ pub trait Advisor {
+     fn pick(&self, input: &AskInput) -> Option<Advice>;
++    /// 已知问不通时返回 false：调用方不再发问（也不做「想」的动作）。
++    fn available(&self) -> bool {
++        true
++    }
+ }
+ 
+ /// 字母按先出现的先给 A（类别号每次读都会变，不能直接用）；不是糖的类别画 `#`。
+ pub fn board_text(g: &GridRead, fixed: &[Class]) -> String {
+     let mut letters: Vec<Class> = Vec::new();
+     g.cells
+         .iter()
+         .map(|row| {
+             row.iter()
+                 .map(|c| {
+@@ -83,29 +87,38 @@ pub fn prompt_text(i: &AskInput) -> String {
+         s += &format!("这些换不动：\n{}\n", i.failed.join("\n"));
+     }
+     s += "下面是可以走的几步，选对目标最有帮助的一步：\n";
+     for (k, c) in i.candidates.iter().enumerate() {
+         s += &format!("{}) {}\n", k + 1, c);
+     }
+     s += "只回答一个编号，后面可以跟一句理由；都不合适就回 0。";
+     s
+ }
+ 
+-/// 取回答里第一串数字当编号（1 起），在 1..=n 里才算；其余（0、越界、没数字、太长）都是 `None`。
++/// 先去掉所有写完的 `<think>…</think>`；还剩没关的 `<think>`（回答被截断）就当没答。
++/// 编号只认开头的那串数字（1 起），在 1..=n 里才算；其余（0、越界、开头不是数字、太长）都是 `None`。
+ /// 编号后面的话当理由，去掉开头的标点和空白。
+ pub fn parse_reply(raw: &str, n: usize) -> (Option<usize>, String) {
+-    let t = raw.trim();
+-    let start = t.find(|c: char| c.is_ascii_digit());
+-    let Some(start) = start else { return (None, String::new()) };
+-    let digits: String = t[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+-    let rest = t[start + digits.len()..]
+-        .trim_start_matches(|c: char| c.is_whitespace() || "，,。.：:、；;-—".contains(c))
++    let mut text = raw.to_string();
++    while let Some(a) = text.find("<think>") {
++        match text[a..].find("</think>") {
++            Some(e) => text.replace_range(a..a + e + "</think>".len(), ""),
++            None => return (None, String::new()),
++        }
++    }
++    let t = text.trim();
++    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
++    if digits.is_empty() {
++        return (None, String::new());
++    }
++    let rest = t[digits.len()..]
++        .trim_start_matches(|c: char| c.is_whitespace() || "，,。.：:、；;-—)）".contains(c))
+         .trim()
+         .to_string();
+     let idx = digits.parse::<usize>().ok().filter(|k| (1..=n).contains(k)).map(|k| k - 1);
+     (idx, rest)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::board::GridRead;
+@@ -158,21 +171,27 @@ mod tests {
+         assert!(p.contains("这些换不动：\n丙"));
+         // 没有失败清单时不写这一段
+         let p2 = prompt_text(&AskInput { failed: vec![], ..i });
+         assert!(!p2.contains("换不动"));
+     }
+ 
+     #[test]
+     fn parse_reply_takes_the_first_number_inside_range() {
+         assert_eq!(parse_reply("3", 5), (Some(2), String::new()));
+         assert_eq!(parse_reply("2，因为能消更多", 5), (Some(1), "因为能消更多".into()));
+-        assert_eq!(parse_reply("选 4 号：做出炸弹", 5).0, Some(3));
++        assert_eq!(parse_reply("选 4 号：做出炸弹", 5).0, None);
++        assert_eq!(parse_reply("<think>想一想</think>\n2", 5), (Some(1), String::new()));
++        assert_eq!(parse_reply("<think>a</think><think>b</think> 3）因为", 5).0, Some(2));
++        assert_eq!(parse_reply("<think>先看第 3 行", 5), (None, String::new()));
++        assert_eq!(parse_reply("2<think>没完", 5), (None, String::new()));
++        assert_eq!(parse_reply("共 5 步，选 2", 5).0, None);
++        assert_eq!(parse_reply("3)", 5).0, Some(2));
+     }
+ 
+     #[test]
+     fn parse_reply_zero_out_of_range_empty_and_noise_are_none() {
+         assert_eq!(parse_reply("0，都不合适", 5), (None, "都不合适".into()));
+         assert_eq!(parse_reply("6", 5).0, None);
+         assert_eq!(parse_reply("", 5).0, None);
+         assert_eq!(parse_reply("我觉得都可以", 5).0, None);
+         assert_eq!(parse_reply("99999999999999999999", 5).0, None);
+     }
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index c1735ad..b21ca1b 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -65,21 +65,21 @@ pub trait Clock {
+ }
+ 
+ /// 最多发给模型几个候选。
+ pub const ASK_SHOWN: usize = 8;
+ 
+ pub struct Options<'a> {
+     pub max_steps: usize,
+     pub dry_run: bool,
+     /// 规则没把握时问的那个。`None` = 不问（和以前一样）。
+     pub advisor: Option<&'a dyn Advisor>,
+-    /// 每一步都问（`--ask-model`）；否则只在这盘棋上已有失败的步时才问。
++    /// 每一步都问（`--ask-every-step`）；否则只在这盘棋上已有失败的步时才问。
+     pub ask_always: bool,
+     /// 这一次 `play()` 最多问几次。
+     pub ask_budget: usize,
+     pub goal: &'a str,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Stop {
+     /// 读不出棋盘（含：类别太多，多半是弹了窗）。
+     NoGrid(String),
+@@ -259,21 +259,21 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+                     continue;
+                 }
+                 Err(e) if e.code == "not_a_grid" => break Stop::NoGrid(e.message),
+                 Err(e) => break Stop::Dco(e),
+             }
+         }
+         let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de), !p.fixed_rgb.is_empty()) else {
+             break Stop::NoGrid("棋盘的行列数对不上".into());
+         };
+         // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。
+-        // show_status 留给以后慢的（模型）决策。
++        // 只在问模型（慢）的那段时间发 think/look。
+         let t_choose = clock.now_ms();
+         let cands: Vec<Candidate> = choose(&board, &p.weights);
+         let choose_ms = clock.now_ms().saturating_sub(t_choose);
+         // 同一盘棋上划了没反应的步，不再重复选。
+         let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
+         if cands.is_empty() && !o.dry_run && no_move_confirms < MAX_NO_MOVE_CONFIRMS {
+             // 补糖还没补完时会有一瞬间没步可走：停一下再读，盘面变了或有步了就接着玩。
+             no_move_confirms += 1;
+             clock.sleep_ms(CONFIRM_PAUSE_MS);
+             match dco.read_grid(p) {
+@@ -295,37 +295,39 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         let mut ask_rec: Option<Value> = None;
+         let mut decider = "rules";
+         if let Some(adv) = o.advisor {
+             let board_key = canonical(&g.cells);
+             // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
+             let offered: Vec<usize> = {
+                 let is_failed = |c: &Candidate| failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key);
+                 (0..cands.len()).filter(|&i| !is_failed(&cands[i])).take(ASK_SHOWN).collect()
+             };
+             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
+-            if !o.dry_run && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
++            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
+                 asked += 1;
+                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
++                let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
+                 let input = AskInput {
+                     board: board_text(&g, &fixed),
+                     goal: o.goal.to_string(),
+                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
+-                    failed: failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect(),
++                    failed: failed_now.clone(),
+                 };
+                 dco.show_status("think");
+                 let advice = adv.pick(&input);
+                 dco.show_status("look");
+                 if let Some(a) = advice {
+                     let chosen_idx = a.choice.filter(|&k| k < offered.len()).map(|k| offered[k]);
+                     ask_rec = Some(json!({
+                         "model": a.model, "raw": a.raw, "reason": a.reason,
+                         "asked": offered, "choice": chosen_idx,
++                        "failed": failed_now, "goal": o.goal,
+                     }));
+                     if let Some(i) = chosen_idx {
+                         pick = i;
+                         decider = "model";
+                     }
+                 }
+             }
+         }
+         let chosen = &cands[pick];
+         let mut rec = json!({
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index 15998fe..a32fd6e 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -689,20 +689,30 @@ impl Advisor for Say {
+         self.calls.set(self.calls.get() + 1);
+         self.seen.borrow_mut().push(AskInput {
+             board: i.board.clone(),
+             goal: i.goal.clone(),
+             candidates: i.candidates.clone(),
+             failed: i.failed.clone(),
+         });
+         Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into() })
+     }
+ }
++struct Gone(Cell<usize>);
++impl Advisor for Gone {
++    fn pick(&self, _: &AskInput) -> Option<Advice> {
++        self.0.set(self.0.get() + 1);
++        None
++    }
++    fn available(&self) -> bool {
++        false
++    }
++}
+ struct Down;
+ impl Advisor for Down {
+     fn pick(&self, _: &AskInput) -> Option<Advice> {
+         None
+     }
+ }
+ 
+ fn run_ask(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize) -> (Summary, Vec<Value>) {
+     let mut log = vec![];
+     let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰" };
+@@ -757,37 +767,58 @@ fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
+     reads.push(Ok(grid(MOVED)));
+     let say = Say::new(Some(0));
+     let mut d = Fake::new(reads);
+     let (_, log) = run_ask(&mut d, Some(&say), false, 30, 2);
+     assert!(say.calls.get() >= 1);
+     let seen = say.seen.borrow();
+     assert_eq!(seen[0].failed.len(), 1);
+     assert!(!seen[0].candidates.iter().any(|c| *c == seen[0].failed[0]));
+     assert_eq!(log[0]["decider"], "rules");
+     assert_eq!(log[1]["decider"], "model");
++    // 模型回的是「候选里的第 1 个」；要靠 offered 映射回 cands，不能直接当 cands 下标，否则又选回刚失败的那步
++    assert_ne!(log[1]["chosen"], log[0]["chosen"]);
++    assert_ne!(log[1]["swipe"]["from"], log[0]["swipe"]["from"]);
++    let refused = log[0]["chosen"].clone();
++    let asked = log[1]["ask"]["asked"].as_array().unwrap();
++    assert!(!asked.contains(&refused));
++    assert_eq!(log[1]["ask"]["choice"], asked[0]);
++    assert_eq!(log[1]["ask"]["failed"].as_array().unwrap().len(), 1);
++    assert_eq!(log[1]["ask"]["goal"], "清冰");
+ }
+ 
+ #[test]
+ fn model_that_cannot_decide_or_is_down_falls_back_to_rules() {
+     let mut d0 = Fake::new(settled_script());
+     let _ = run_ask(&mut d0, None, false, 30, 1);
+     let rules_swipe = d0.swipes[0];
+ 
+     for adv in [&Say::new(None) as &dyn Advisor, &Down] {
+         let mut d = Fake::new(settled_script());
+         let (s, log) = run_ask(&mut d, Some(adv), true, 30, 1);
+         assert_eq!(d.swipes[0], rules_swipe);
+         assert_eq!(log[0]["decider"], "rules");
+         assert_eq!(s.stop, Stop::StepsDone);
+     }
+ }
+ 
++#[test]
++fn an_unavailable_advisor_is_never_asked_and_the_octopus_never_thinks() {
++    let gone = Gone(Cell::new(0));
++    let mut d = Fake::new(settled_script());
++    let (s, log) = run_ask(&mut d, Some(&gone), true, 30, 1);
++    assert_eq!(gone.0.get(), 0);
++    assert_eq!(d.events, vec!["swipe"]);
++    assert_eq!(log[0]["decider"], "rules");
++    assert!(log[0].get("ask").is_none());
++    assert_eq!(s.stop, Stop::StepsDone);
++}
++
+ #[test]
+ fn ask_budget_stops_the_questions_but_not_the_game() {
+     let say = Say::new(Some(1));
+     let mut reads = vec![Ok(grid(A))];
+     for _ in 0..6 {
+         reads.push(Ok(grid(MOVED)));
+         reads.push(Ok(grid(MOVED)));
+         reads.push(Ok(grid(A)));
+         reads.push(Ok(grid(A)));
+     }
+diff --git a/docs/superpowers/specs/2026-10-04-dct-match3-ask-model-design.md b/docs/superpowers/specs/2026-10-04-dct-match3-ask-model-design.md
+index 767a09d..10f989e 100644
+--- a/docs/superpowers/specs/2026-10-04-dct-match3-ask-model-design.md
++++ b/docs/superpowers/specs/2026-10-04-dct-match3-ask-model-design.md
+@@ -18,23 +18,23 @@
+ - 结论：这一类「看目标、看棋盘」的判断，先不指望本机小模型。小模型留给更简单的判断（是不是弹窗、是不是通关页）。
+ - 在把任何模型接进来之前，要用同一套题测一遍网关里的大模型（`qwen3.8:27b`，上次实测它读图读得不准，但文字题没测过）。这一步写进计划的第一个任务。
+ 
+ ## 做什么
+ 
+ ### 1. 什么时候问模型（触发）
+ 
+ 只在规则「没把握」的时候问，其余照旧，保持快：
+ 
+ - **没反应**：这一步划了没反应（含弹回原样），重选时也有候选，但同一盘棋上已经有步失败；
+-- **用户要求**：`dct game play --ask-model`，每一步都问（给调试和对比用，默认关）。
++- **用户要求**：`dct game play --ask-every-step`，每一步都问（给调试和对比用，默认关；它自动启用模型）。`--ask-model` 只是启用模型，仍然只在「没反应」时问。
+ 
+-规则一步都选不出时没有候选，模型无从选择，不属于触发；这类关卡靠配置数据让规则列得出候选（例如不把彩球标成不是糖），再用 `--ask-model` 选。
++规则一步都选不出时没有候选，模型无从选择，不属于触发；这类关卡靠配置数据让规则列得出候选（例如不把彩球标成不是糖），再用 `--ask-model` 或 `--ask-every-step` 选。
+ 
+ 没有配置模型、模型连不上、超时、回的看不懂：**一律退回规则**，行为和现在完全一样（`llm` 层本来就要求每一处用法都有不依赖 LLM 的退路）。
+ 
+ ### 2. 问什么（只发文字，不发截图）
+ 
+ 用现有 `llm::Prompt`。内容：
+ 
+ - 棋盘：字母表示颜色，`#` 是配置里列的「不是糖」，行列从 1 数；
+ - 目标：一句话。来源按顺序：用户在命令行给的 `--goal "…"`；dcv 里这一关的资料；都没有就写「尽量多消」；
+ - 候选：规则列出的前 N 步（默认 8），每步一句大白话（和现有的步骤句子同一套：互换哪两格、消几颗、做出什么、引爆几颗）；
+diff --git a/src/game/advisor.rs b/src/game/advisor.rs
+index 3451e87..b95cb64 100644
+--- a/src/game/advisor.rs
++++ b/src/game/advisor.rs
+@@ -1,39 +1,55 @@
+ //! 把「问模型选哪一步」接到 dct 自己的 LLM 连接层上。
+ //! 凭据怎么取、发给哪台机器，全在 `llm::resolve`，这里不碰。
+ use crate::llm::{complete_with_timeout, Backend, Prompt};
+ use dct_game::ask::{parse_reply, prompt_text, Advice, Advisor, AskInput};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ pub struct LlmAdvisor {
+     backend: Arc<dyn Backend>,
+     model: String,
+     timeout: Duration,
++    /// 问不通以后置位：后面不再发问，只用规则。
++    down: AtomicBool,
+ }
+ 
+ impl LlmAdvisor {
+     pub fn new(backend: Arc<dyn Backend>, model: String) -> LlmAdvisor {
+-        LlmAdvisor { backend, model, timeout: Duration::from_secs(20) }
++        LlmAdvisor { backend, model, timeout: Duration::from_secs(20), down: AtomicBool::new(false) }
+     }
+ }
+ 
+ const SYSTEM: &str = "你在帮一个三消游戏的自动玩家选下一步。只能从给出的编号里选，不要自己编走法。";
+ 
+ impl Advisor for LlmAdvisor {
+     fn pick(&self, i: &AskInput) -> Option<Advice> {
++        if self.down.load(Ordering::SeqCst) {
++            return None;
++        }
+         let p = Prompt { system: SYSTEM.into(), user: prompt_text(i), max_tokens: 64 };
+         // 任何错误都是「没问成」：调用方退回规则
+-        let raw = complete_with_timeout(self.backend.clone(), p, self.timeout).ok()?;
++        let Ok(raw) = complete_with_timeout(self.backend.clone(), p, self.timeout) else {
++            // 只说一次，之后不再问，免得每一步都白等一轮超时
++            if !self.down.swap(true, Ordering::SeqCst) {
++                println!("大模型没回应，后面只用规则。");
++            }
++            return None;
++        };
+         let (choice, reason) = parse_reply(&raw, i.candidates.len());
+         Some(Advice { choice, reason, raw, model: self.model.clone() })
+     }
++
++    fn available(&self) -> bool {
++        !self.down.load(Ordering::SeqCst)
++    }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::llm::{Backend, LlmError, Prompt};
+     use dct_game::ask::{Advisor, AskInput};
+     use std::sync::{Arc, Mutex};
+ 
+     struct Fixed(Result<String, LlmError>, Mutex<Vec<String>>);
+@@ -61,18 +77,28 @@ mod tests {
+         assert_eq!(r.model, "m1");
+         assert!(b.1.lock().unwrap()[0].contains("1) 甲"));
+     }
+ 
+     #[test]
+     fn garbage_reply_is_an_answer_with_no_choice() {
+         let (a, _) = adv(Ok("随便".into()));
+         assert_eq!(a.pick(&input()).unwrap().choice, None);
+     }
+ 
++    #[test]
++    fn after_one_backend_error_the_advisor_is_down_and_never_calls_again() {
++        let (a, b) = adv(Err(LlmError::Unavailable));
++        assert!(a.available());
++        assert!(a.pick(&input()).is_none());
++        assert!(!a.available());
++        assert!(a.pick(&input()).is_none());
++        assert_eq!(b.1.lock().unwrap().len(), 1);
++    }
++
+     #[test]
+     fn every_backend_error_means_not_asked() {
+         for e in [LlmError::Unavailable, LlmError::Timeout, LlmError::Malformed] {
+             let (a, _) = adv(Err(e));
+             assert!(a.pick(&input()).is_none(), "{e:?}");
+         }
+     }
+ }
+diff --git a/src/game/cli.rs b/src/game/cli.rs
+index 73d2b9a..e4a7070 100644
+--- a/src/game/cli.rs
++++ b/src/game/cli.rs
+@@ -1,43 +1,49 @@
+-//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N]`。
++//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标]`。
+ 
+-const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--goal \"清掉冰块\"]";
++const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]";
+ 
+ pub struct Args {
+     pub game: String,
+     pub steps: usize,
+     pub dry_run: bool,
+     /// 一局结束以后自己接着来（失败了重来、关安全的弹窗）。不带它就和以前一样：打完一关就停。
+     pub auto_next: bool,
+     /// 整个命令最多点几次“开始 / 再来一次”（每次都会用掉一条生命）。
+     pub tries: usize,
+-    /// 每一步都问大模型选哪一步（没配大模型就只用规则）。
++    /// 启用大模型：划了没反应时问它选哪一步（没配大模型就只用规则）。
+     pub ask_model: bool,
++    /// 每一步都问大模型（隐含 `ask_model`）。
++    pub ask_every_step: bool,
+     /// 告诉大模型这一关要干什么。
+     pub goal: Option<String>,
+ }
+ 
+ pub fn parse(args: &[String]) -> Result<Args, String> {
+     if args.first().map(String::as_str) != Some("play") {
+         return Err(USAGE.into());
+     }
+-    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, goal: None };
++    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None };
+     let mut it = args[1..].iter();
+     while let Some(flag) = it.next() {
+         match flag.as_str() {
+             "--dry-run" => a.dry_run = true,
+             "--auto-next" => a.auto_next = true,
+             "--tries" => {
+                 let v = it.next().ok_or("--tries 后面要写次数")?;
+                 a.tries = v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or("--tries 要在 1 到 20 之间")?;
+             }
+             "--ask-model" => a.ask_model = true,
++            "--ask-every-step" => {
++                a.ask_every_step = true;
++                a.ask_model = true;
++            }
+             "--goal" => a.goal = Some(it.next().ok_or("--goal 后面要写目标，比如 --goal \"清掉冰块\"")?.clone()),
+             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
+             "--steps" => {
+                 let v = it.next().ok_or("--steps 后面要写步数")?;
+                 a.steps = v.parse().ok().filter(|n| (1..=200).contains(n)).ok_or("--steps 要在 1 到 200 之间")?;
+             }
+             other => return Err(format!("不认识 {other}。{USAGE}")),
+         }
+     }
+     Ok(a)
+@@ -96,35 +102,36 @@ fn run_parsed(a: &Args) -> i32 {
+         }
+     };
+     let mut dco = match DcoClient::connect(&home.join(".dco")) {
+         Ok(c) => c,
+         Err(e) => {
+             eprintln!("{}", text::dco_error(&e));
+             return 1;
+         }
+     };
+     let clock = SystemClock;
+-    let advisor: Option<super::advisor::LlmAdvisor> = if a.ask_model {
++    let advisor: Option<super::advisor::LlmAdvisor> = if a.ask_model || a.ask_every_step {
+         match crate::cli::load_llm_backend() {
+             Ok(l) => Some(super::advisor::LlmAdvisor::new(l.backend, l.model)),
+             Err(crate::cli::LoadLlmError::NotEnabled(_)) => {
+                 println!("没开大模型，这次只用规则玩。");
+                 None
+             }
+             Err(crate::cli::LoadLlmError::Problem { .. }) => {
+                 println!("大模型连不上，这次只用规则玩。可以先运行 dct llm check 看原因。");
+                 None
+             }
+         }
+     } else {
+         None
+     };
++    let ask_always = a.ask_every_step && advisor.is_some();
+     let goal = a.goal.clone().unwrap_or_else(|| "尽量多消".into());
+     let adv_ref: Option<&dyn dct_game::ask::Advisor> = advisor.as_ref().map(|x| x as &dyn dct_game::ask::Advisor);
+     let log = match LogFile::open(&home, clock.now_ms() / 1000) {
+         Ok(l) => l,
+         Err(m) => {
+             // 记录是这件事的要点（以后拿去比），写不了就不开始。
+             eprintln!("{m}");
+             return 1;
+         }
+     };
+@@ -144,23 +151,23 @@ fn run_parsed(a: &Args) -> i32 {
+         if rec["kind"] == "nav" {
+             if let Some(line) = text::nav_line(&rec) {
+                 println!("{line}");
+             }
+         } else {
+             n += 1;
+             println!("{}", text::step_line(n, &rec));
+         }
+     };
+     let summary = if a.auto_next {
+-        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always: a.ask_model, ask_budget: 30, goal: &goal }, &mut sink)
++        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
+     } else {
+-        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always: a.ask_model, ask_budget: 30, goal: &goal }, &mut sink)
++        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
+     };
+     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
+     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
+     if code == 0 {
+         println!("{line}");
+     } else {
+         eprintln!("{line}");
+     }
+     code
+ }
+@@ -168,21 +175,25 @@ fn run_parsed(a: &Args) -> i32 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn parse_ask_model_and_goal() {
+         let a = parse(&["play".into(), "--ask-model".into(), "--goal".into(), "清掉冰块".into()]).unwrap();
+         assert!(a.ask_model);
+         assert_eq!(a.goal.as_deref(), Some("清掉冰块"));
+         let d = parse(&["play".into()]).unwrap();
+-        assert!(!d.ask_model);
++        assert!(!d.ask_model && !d.ask_every_step);
++        // --ask-model 只在划了没反应时问；每一步都问要 --ask-every-step
++        assert!(!a.ask_every_step);
++        let e = parse(&["play".into(), "--ask-every-step".into()]).unwrap();
++        assert!(e.ask_every_step && e.ask_model);
+         assert_eq!(d.goal, None);
+         assert!(parse(&["play".into(), "--goal".into()]).is_err());
+     }
+ 
+     fn p(v: &[&str]) -> Result<Args, String> {
+         parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+     }
+ 
+     #[test]
+     fn defaults() {
+diff --git a/src/game/skill.md b/src/game/skill.md
+index 92f6c45..da2224c 100644
+--- a/src/game/skill.md
++++ b/src/game/skill.md
+@@ -38,21 +38,21 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
+ 
+ - 一局没过时，自己点「Try again」「Play」重来同一关；
+ - 弹窗只关「Close」「Not now」「No thanks」这一类安全的，其它一律不点；
+ - 遇到要花钱的画面、广告、生命用完、通关了、不认识的画面，就停下，什么都不点；
+ - 也会一边做一边印一行，例如「点了「Play」，开始新的一局」「这一局没过，点了「Try again」重来」。
+ 
+ 把这些话转述给用户。它停下以后，把最后一句话原样告诉用户（比如「生命用完了」「出现了广告，请你自己关掉」），由用户决定下一步。
+ 
+ ## 玩不动的时候
+ 
+-规则选的步连着没反应时，可以加 `--ask-model`，让大模型从规则列出的几步里挑一步；加 `--goal "清掉冰块"` 告诉它这一关要干什么。没配大模型也能玩，只是这次只用规则。
++规则选的步没反应时，可以加 `--ask-model`：卡住了才问大模型，让它从规则列出的几步里挑一步。想让它每一步都挑，加 `--ask-every-step`：每一步都问大模型（会慢一些，用来对比）。加 `--goal "清掉冰块"` 告诉它这一关要干什么。没配大模型、或者大模型没回应，也能玩，只是这次只用规则。
+ 
+ ## 停
+ 
+ - 用户说「停」，马上中断这条命令。
+ - 命令自己停下时（没有能走的步、读不出棋盘、画面一直在动、连着两次没反应、dco 急停），把它印的最后一句话原样告诉用户。
+ - 不要自己去点屏幕补救，也不要换别的办法去操作游戏；让用户决定下一步。
+ 
+ ## 不要做
+ 
+ - 不要自己调用 dco 去点关卡按钮、道具、广告、付款。`--auto-next` 停下以后，也不要替它去点屏幕上的按钮、关广告或买东西。
+diff --git a/src/main.rs b/src/main.rs
+index d29581d..8e7de4e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -24,20 +24,21 @@ dct —— vibe coding 终端
+   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
+                    靠它，没有它撤销是死的；同样只给 dct 自己用
+   dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
+                    后台空着就直接起一个新的
+   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
+   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
+   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
+   dct join <邀请码> [--name 电脑名]
+                    新电脑上：用老电脑给的码加入（没登录会先自动登录）
+   dct game play [--game candy-crush] [--steps 20] [--dry-run]
++                   [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]
+                    让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
+   dct game ask-bench <记录文件>... [--limit 40]
+                    拿以前记下的局面问大模型，看它比乱选强多少（不碰手机）
+   dct peers        看组里有哪些电脑、开着哪些会话
+   dct send <电脑名>/<会话名> \"<内容>\"
+                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
+                    那边空着就马上敲进去，忙就排队
+   dct peers remove <电脑名>           把一台电脑移出组
+   dct daemon       只跑守护进程，不开界面
+   dct gate         远程版那道门：守着一个端口，只放带对钥匙的人进去。
