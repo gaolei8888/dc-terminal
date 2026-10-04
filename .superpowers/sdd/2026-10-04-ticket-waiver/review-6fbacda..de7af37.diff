@@ -1,0 +1,320 @@
+# Review package: 6fbacda..HEAD
+
+## Commits
+de7af37 feat(brain): tickets can carry an optional waiver naming the confirmed rule, its fingerprint and the allowed region; tickets without one are byte-for-byte unchanged
+
+## Files changed
+ crates/dct-brain/src/approval.rs |   1 +
+ crates/dct-brain/src/sign.rs     |   1 +
+ crates/dct-brain/src/ticket.rs   | 129 +++++++++++++++++++++++++++++++++++++++
+ src/procedures.rs                |   1 +
+ 4 files changed, 132 insertions(+)
+
+## Diff
+diff --git a/crates/dct-brain/src/approval.rs b/crates/dct-brain/src/approval.rs
+index 1e19576..27b9f8c 100644
+--- a/crates/dct-brain/src/approval.rs
++++ b/crates/dct-brain/src/approval.rs
+@@ -195,20 +195,21 @@ mod tests {
+             device: "mac-lei".into(),
+             tier,
+             subject: Subject::Procedure {
+                 name: "social:edit-bio".into(),
+                 steps_sha256: STEPS.into(),
+                 body_sha256: format!("sha256:{}", "ab".repeat(32)),
+             },
+             params_sha256: params_sha256(&BTreeMap::new()),
+             earliest: 100,
+             expires: 200,
++            waiver: None,
+         }
+     }
+ 
+     #[test]
+     fn a_valid_ticket_and_approval_pair_verifies() {
+         let user = SoftSigner::from_seed(SignerRole::User, 2);
+         let sa = sign_approval(approval(), &user, "批准").unwrap(); // run_tier() == Content
+         let st = sign_one(ticket_for(Tier::Content), &user, "发到 TikTok").unwrap();
+         assert_eq!(verify_procedure_ticket(&st, &sa, &[user.trusted()], "mac-lei", 150), Ok(()));
+     }
+diff --git a/crates/dct-brain/src/sign.rs b/crates/dct-brain/src/sign.rs
+index 1388962..ac035c1 100644
+--- a/crates/dct-brain/src/sign.rs
++++ b/crates/dct-brain/src/sign.rs
+@@ -301,20 +301,21 @@ mod tests {
+             device: "mac-lei".into(),
+             tier,
+             subject: Subject::Procedure {
+                 name: "social:edit-bio".into(),
+                 steps_sha256: "sha256:s".into(),
+                 body_sha256: "sha256:b".into(),
+             },
+             params_sha256: params_sha256(&BTreeMap::new()),
+             earliest: 100,
+             expires: 200,
++            waiver: None,
+         }
+     }
+ 
+     fn keys() -> (SoftSigner, SoftSigner, Vec<TrustedKey>) {
+         let auto = SoftSigner::from_seed(SignerRole::Auto, 1);
+         let user = SoftSigner::from_seed(SignerRole::User, 2);
+         let trusted = vec![auto.trusted(), user.trusted()];
+         (auto, user, trusted)
+     }
+ 
+diff --git a/crates/dct-brain/src/ticket.rs b/crates/dct-brain/src/ticket.rs
+index 1f8ad42..53cc7bb 100644
+--- a/crates/dct-brain/src/ticket.rs
++++ b/crates/dct-brain/src/ticket.rs
+@@ -27,20 +27,46 @@ pub struct Ticket {
+     /// 32 位小写十六进制，一次性；dco 记住用过的，同一张票不能用第二次。
+     pub nonce: String,
+     /// 在哪台设备上执行（dco 名片里的设备名）。
+     pub device: String,
+     pub tier: Tier,
+     pub subject: Subject,
+     pub params_sha256: String,
+     /// 有效窗口 `[earliest, expires)`，Unix 秒。「提前批准，到点执行」靠它。
+     pub earliest: u64,
+     pub expires: u64,
++    /// 可选的豁免：dcv 里用户确认过的规则允许在这块区域里点「看不出字」的地方。
++    /// 没有豁免时不序列化、不进 canonical_bytes，旧票逐字节不变。
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub waiver: Option<Waiver>,
++}
++
++/// 屏幕区域，单位是万分比（basis points）。
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Region {
++    pub x_bp: u16,
++    pub y_bp: u16,
++    pub w_bp: u16,
++    pub h_bp: u16,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Waiver {
++    /// 现在只有 "no_text"。
++    pub kind: String,
++    /// 库:名字
++    pub rule: String,
++    /// dcv 规则的 sha
++    pub rule_sha256: String,
++    /// dcv 的 approved_at
++    pub approved_at: String,
++    pub region: Region,
+ }
+ 
+ impl Ticket {
+     pub fn canonical_bytes(&self) -> Vec<u8> {
+         let mut o = Vec::new();
+         field(&mut o, "dct-ticket-v1");
+         field(&mut o, &self.v.to_string());
+         field(&mut o, &self.nonce);
+         field(&mut o, &self.device);
+         field(&mut o, self.tier.name());
+@@ -53,20 +79,32 @@ impl Ticket {
+             }
+             Subject::Action { tool, args_sha256 } => {
+                 field(&mut o, "action");
+                 field(&mut o, tool);
+                 field(&mut o, args_sha256);
+             }
+         }
+         field(&mut o, &self.params_sha256);
+         field(&mut o, &self.earliest.to_string());
+         field(&mut o, &self.expires.to_string());
++        // 只有带豁免的票才追加；没有豁免时一个字节都不加。
++        if let Some(w) = &self.waiver {
++            field(&mut o, "waiver");
++            field(&mut o, &w.kind);
++            field(&mut o, &w.rule);
++            field(&mut o, &w.rule_sha256);
++            field(&mut o, &w.approved_at);
++            field(&mut o, &w.region.x_bp.to_string());
++            field(&mut o, &w.region.y_bp.to_string());
++            field(&mut o, &w.region.w_bp.to_string());
++            field(&mut o, &w.region.h_bp.to_string());
++        }
+         o
+     }
+ 
+     pub fn digest(&self) -> String {
+         sha256_id(&self.canonical_bytes())
+     }
+ }
+ 
+ /// 参数值的指纹：按键名排序，值原样。参数值只在运行时传，不写进流程，但要签进票。
+ pub fn params_sha256(params: &BTreeMap<String, String>) -> String {
+@@ -121,20 +159,21 @@ mod tests {
+             device: "mac-lei".into(),
+             tier: Tier::Content,
+             subject: Subject::Procedure {
+                 name: "social:edit-bio".into(),
+                 steps_sha256: "sha256:4d1077af6efac1184e410d23b0b7b120fd42f29d7dade3304ef2041ca10b565c".into(),
+                 body_sha256: format!("sha256:{}", "ab".repeat(32)),
+             },
+             params_sha256: params_sha256(&bio_params()),
+             earliest: 1_790_000_000,
+             expires: 1_790_007_200,
++            waiver: None,
+         }
+     }
+ 
+     // 期望值用一份独立的 Python 实现算出（计划作者核对过），dco 也按这些值验。
+ 
+     #[test]
+     fn params_fingerprint_is_stable() {
+         assert_eq!(
+             params_sha256(&bio_params()),
+             "sha256:aeaac10a352f12e708de6e82ceed0ce52da7fd089575058d734f0c0fadd6d730"
+@@ -164,20 +203,21 @@ mod tests {
+             nonce: "fedcba9876543210fedcba9876543210".into(),
+             device: "mac-lei".into(),
+             tier: Tier::SelfOnly,
+             subject: Subject::Action {
+                 tool: "tap".into(),
+                 args_sha256: args_sha256(&args),
+             },
+             params_sha256: params_sha256(&BTreeMap::new()),
+             earliest: 1_790_000_000,
+             expires: 1_790_000_300,
++            waiver: None,
+         };
+         assert_eq!(
+             args_sha256(&args),
+             "sha256:a065f016beb00a4c119463a9da8bd9b0dc87416af021de5a82e13a6d400fe573"
+         );
+         assert_eq!(
+             t.digest(),
+             "sha256:4ee473f5dececb43e8b583cf200002bfc42f8290e8701914907c033f63d14490"
+         );
+     }
+@@ -202,11 +242,100 @@ mod tests {
+     }
+ 
+     #[test]
+     fn tickets_round_trip_through_json() {
+         let t = procedure_ticket();
+         let j = serde_json::to_value(&t).unwrap();
+         assert_eq!(j["subject"]["kind"], "procedure");
+         assert_eq!(j["tier"], "content");
+         assert_eq!(serde_json::from_value::<Ticket>(j).unwrap(), t);
+     }
++
++    type Tweak = Box<dyn Fn(&mut Waiver)>;
++
++    fn base_ticket() -> Ticket {
++        Ticket {
++            v: TICKET_VERSION,
++            nonce: "a".repeat(32),
++            device: "mac".into(),
++            tier: Tier::Content,
++            subject: Subject::Action { tool: "tap_at".into(), args_sha256: "sha256:00".into() },
++            params_sha256: "sha256:11".into(),
++            earliest: 100,
++            expires: 130,
++            waiver: None,
++        }
++    }
++    fn waiver() -> Waiver {
++        Waiver {
++            kind: "no_text".into(),
++            rule: "games:darkness-and-flame-rules".into(),
++            rule_sha256: "sha256:d868".into(),
++            approved_at: "2026-10-04T13:18:12Z".into(),
++            region: Region { x_bp: 300, y_bp: 1200, w_bp: 7500, h_bp: 6600 },
++        }
++    }
++
++    #[test]
++    fn a_ticket_without_a_waiver_has_the_same_bytes_as_before() {
++        let t = base_ticket();
++        let bytes = t.canonical_bytes();
++        let mut want = Vec::new();
++        field(&mut want, "dct-ticket-v1");
++        field(&mut want, "1");
++        field(&mut want, &"a".repeat(32));
++        field(&mut want, "mac");
++        field(&mut want, "content");
++        field(&mut want, "action");
++        field(&mut want, "tap_at");
++        field(&mut want, "sha256:00");
++        field(&mut want, "sha256:11");
++        field(&mut want, "100");
++        field(&mut want, "130");
++        assert_eq!(bytes, want);
++    }
++
++    #[test]
++    fn a_waiver_is_appended_and_changes_the_digest() {
++        let plain = base_ticket();
++        let mut w = base_ticket();
++        w.waiver = Some(waiver());
++        assert!(w.canonical_bytes().starts_with(&plain.canonical_bytes()));
++        assert!(w.canonical_bytes().len() > plain.canonical_bytes().len());
++        assert_ne!(w.digest(), plain.digest());
++    }
++
++    #[test]
++    fn changing_any_waiver_field_changes_the_digest() {
++        let mut base = base_ticket();
++        base.waiver = Some(waiver());
++        let d0 = base.digest();
++        let tweaks: Vec<Tweak> = vec![
++            Box::new(|w| w.kind = "other".into()),
++            Box::new(|w| w.rule = "games:x".into()),
++            Box::new(|w| w.rule_sha256 = "sha256:beef".into()),
++            Box::new(|w| w.approved_at = "2026-10-05T00:00:00Z".into()),
++            Box::new(|w| w.region.x_bp += 1),
++            Box::new(|w| w.region.y_bp += 1),
++            Box::new(|w| w.region.w_bp -= 1),
++            Box::new(|w| w.region.h_bp -= 1),
++        ];
++        for t in tweaks {
++            let mut x = base.clone();
++            t(x.waiver.as_mut().unwrap());
++            assert_ne!(x.digest(), d0);
++        }
++    }
++
++    #[test]
++    fn json_has_no_waiver_key_when_absent_and_old_json_still_reads() {
++        let t = base_ticket();
++        let j = serde_json::to_string(&t).unwrap();
++        assert!(!j.contains("waiver"));
++        let back: Ticket = serde_json::from_str(&j).unwrap();
++        assert_eq!(back, t);
++        let mut w = base_ticket();
++        w.waiver = Some(waiver());
++        let back: Ticket = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
++        assert_eq!(back, w);
++    }
+ }
+diff --git a/src/procedures.rs b/src/procedures.rs
+index b7e3d29..bc0759c 100644
+--- a/src/procedures.rs
++++ b/src/procedures.rs
+@@ -349,20 +349,21 @@ pub fn ticket(
+         device: device.to_string(),
+         tier,
+         subject: Subject::Procedure {
+             name: full_name.to_string(),
+             steps_sha256: steps_sha,
+             body_sha256: shown.body_sha256,
+         },
+         params_sha256: params_sha256(&params),
+         earliest,
+         expires,
++        waiver: None,
+     };
+     let role = match tier.required_signer() {
+         Some(SignerRole::User) => SignerRole::User,
+         _ => SignerRole::Auto,
+     };
+     let signer = keys.signer(role, se)?;
+     // 每一步点名它真实的档位——动钱的步骤要说「动钱」，不能笼统写成「对外」，
+     // 不然用户以为要签的是发布帖子，其实是在花钱。
+     let strict: Vec<String> = shown
+         .steps
