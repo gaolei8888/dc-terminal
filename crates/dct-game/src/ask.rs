@@ -72,9 +72,6 @@ pub fn describe(c: &Candidate) -> String {
             s += &format!("，做出{what}");
         }
     }
-    if f.triggered > 0 {
-        s += &format!("，引爆 {} 颗特殊糖", f.triggered);
-    }
     s
 }
 
@@ -86,6 +83,7 @@ pub fn prompt_text(i: &AskInput) -> String {
     if !i.failed.is_empty() {
         s += &format!("这些换不动：\n{}\n", i.failed.join("\n"));
     }
+    s += "提醒：棋盘上的特殊标记不一定准，不要因为它就选某一步。\n";
     s += "下面是可以走的几步，选对目标最有帮助的一步：\n";
     for (k, c) in i.candidates.iter().enumerate() {
         s += &format!("{}) {}\n", k + 1, c);
@@ -148,12 +146,11 @@ mod tests {
     }
 
     #[test]
-    fn describe_counts_rows_and_columns_from_one_and_names_what_happens() {
+    fn describe_counts_rows_and_columns_from_one_and_names_only_what_can_be_seen() {
         let f = Outcome { cleared: 7, bomb: 1, triggered: 2, ..Default::default() };
-        assert_eq!(
-            describe(&cand((0, 3), (1, 3), f)),
-            "第 1 行第 4 列和第 2 行第 4 列互换，消 7 颗，做出彩色炸弹，引爆 2 颗特殊糖"
-        );
+        let s = describe(&cand((0, 3), (1, 3), f));
+        assert_eq!(s, "第 1 行第 4 列和第 2 行第 4 列互换，消 7 颗，做出彩色炸弹");
+        assert!(!s.contains("引爆"), "引爆靠特殊标记猜，不可靠，不能发给模型");
     }
 
     #[test]
@@ -169,6 +166,7 @@ mod tests {
         assert!(p.contains("目标：清掉冰块"));
         assert!(p.contains("1) 甲\n2) 乙"));
         assert!(p.contains("这些换不动：\n丙"));
+        assert!(p.contains("特殊标记不一定准"));
         // 没有失败清单时不写这一段
         let p2 = prompt_text(&AskInput { failed: vec![], ..i });
         assert!(!p2.contains("换不动"));
