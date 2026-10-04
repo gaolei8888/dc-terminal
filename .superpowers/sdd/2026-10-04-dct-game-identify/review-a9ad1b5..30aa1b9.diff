@@ -1,0 +1,392 @@
+# Review package: a9ad1b5..HEAD
+
+## Commits
+30aa1b9 feat(game): dct game identify says which kind of game is on screen, using only local text recognition and the board check
+2b71703 feat(game): classify the screen as match-3, hidden-object or unknown from a readable board and a small table of genre cue words
+
+## Files changed
+ crates/dct-game/src/genre.rs |  99 ++++++++++++++++++++++++++++++
+ crates/dct-game/src/lib.rs   |   1 +
+ src/game/cli.rs              |   3 +
+ src/game/identify.rs         | 143 +++++++++++++++++++++++++++++++++++++++++++
+ src/game/mod.rs              |   1 +
+ src/game/skill.md            |   2 +
+ src/main.rs                  |   2 +
+ 7 files changed, 251 insertions(+)
+
+## Diff
+diff --git a/crates/dct-game/src/genre.rs b/crates/dct-game/src/genre.rs
+new file mode 100644
+index 0000000..e4626fa
+--- /dev/null
++++ b/crates/dct-game/src/genre.rs
+@@ -0,0 +1,99 @@
++//! 快速鉴定「这是哪一类游戏」：只用本机能得到的东西（有没有合格棋盘、屏幕上的字）。
++//! 线索是游戏**类别**的通用词，不含任何具体游戏；放在下面的表里，以后可以搬去 dcv。
++//! 不确定就说看不出，绝不乱猜。
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Genre {
++    Match3,
++    HiddenObject,
++    Unknown,
++}
++
++/// 命中任一个就判寻物。
++const HIDDEN_STRONG: &[&str] = &["collector's edition", "hidden object", "inventory", "journal", "物品栏", "寻物", "收藏版"];
++/// 至少命中两个**不同**的才判寻物（消除游戏的主菜单也有 play / options / extras）。
++const HIDDEN_WEAK: &[&str] = &["hint", "map", "extras", "find", "skip", "提示", "地图", "跳过"];
++
++/// 去前后空白、转小写、把全角字母数字转成半角。中间的空白不动（「hidden   object」不是线索词）。
++fn normalise(s: &str) -> String {
++    s.trim()
++        .chars()
++        .map(|c| match c {
++            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
++            _ => c,
++        })
++        .collect::<String>()
++        .to_lowercase()
++}
++
++pub fn classify(texts: &[String], board_ok: Option<bool>) -> Genre {
++    if board_ok == Some(true) {
++        return Genre::Match3;
++    }
++    let norm: Vec<String> = texts.iter().map(|t| normalise(t)).filter(|t| !t.is_empty()).collect();
++    let hits = |table: &[&str]| table.iter().filter(|cue| norm.iter().any(|t| t.contains(**cue))).count();
++    if hits(HIDDEN_STRONG) >= 1 || hits(HIDDEN_WEAK) >= 2 {
++        Genre::HiddenObject
++    } else {
++        Genre::Unknown
++    }
++}
++
++pub fn sentence(g: Genre) -> &'static str {
++    match g {
++        Genre::Match3 => "这是方格消除类游戏，我会玩。",
++        Genre::HiddenObject => "这看起来是寻物类游戏，我现在还不会玩。",
++        Genre::Unknown => "我看不出这是哪一类游戏。",
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn t(v: &[&str]) -> Vec<String> {
++        v.iter().map(|s| s.to_string()).collect()
++    }
++
++    #[test]
++    fn a_readable_board_is_match3_even_with_hidden_object_words_on_screen() {
++        assert_eq!(classify(&t(&["Hint", "Inventory", "Journal"]), Some(true)), Genre::Match3);
++    }
++
++    #[test]
++    fn one_strong_cue_is_enough() {
++        assert_eq!(classify(&t(&["Enemy in Reflection", "COLLECTOR'S EDITION", "PLAY"]), Some(false)), Genre::HiddenObject);
++        assert_eq!(classify(&t(&["物品栏"]), None), Genre::HiddenObject);
++    }
++
++    #[test]
++    fn one_weak_cue_alone_is_not_enough_but_two_different_ones_are() {
++        // 方格消除游戏的主菜单也有 PLAY / OPTIONS / EXTRAS 这类字
++        assert_eq!(classify(&t(&["PLAY", "OPTIONS", "EXTRAS"]), Some(false)), Genre::Unknown);
++        assert_eq!(classify(&t(&["Hint"]), Some(false)), Genre::Unknown);
++        assert_eq!(classify(&t(&["Hint", "Map"]), Some(false)), Genre::HiddenObject);
++        // 同一个词出现多次只算一个
++        assert_eq!(classify(&t(&["Hint", "hint", "HINT"]), Some(false)), Genre::Unknown);
++    }
++
++    #[test]
++    fn matching_ignores_case_whitespace_and_full_width_letters() {
++        assert_eq!(classify(&t(&["  Ｉｎｖｅｎｔｏｒｙ "]), None), Genre::HiddenObject);
++        assert_eq!(classify(&t(&["Hidden   Object"]), None), Genre::Unknown, "中间多空格不是线索词，不乱猜");
++        assert_eq!(classify(&t(&["HIDDEN OBJECT"]), None), Genre::HiddenObject);
++    }
++
++    #[test]
++    fn nothing_readable_and_no_board_is_unknown_not_hidden_object() {
++        assert_eq!(classify(&[], Some(false)), Genre::Unknown);
++        assert_eq!(classify(&[], None), Genre::Unknown);
++        assert_eq!(classify(&t(&["", "  "]), Some(false)), Genre::Unknown);
++    }
++
++    #[test]
++    fn the_three_sentences_are_fixed_plain_chinese() {
++        assert_eq!(sentence(Genre::Match3), "这是方格消除类游戏，我会玩。");
++        assert_eq!(sentence(Genre::HiddenObject), "这看起来是寻物类游戏，我现在还不会玩。");
++        assert_eq!(sentence(Genre::Unknown), "我看不出这是哪一类游戏。");
++    }
++}
+diff --git a/crates/dct-game/src/lib.rs b/crates/dct-game/src/lib.rs
+index bcdc08e..e271cb4 100644
+--- a/crates/dct-game/src/lib.rs
++++ b/crates/dct-game/src/lib.rs
+@@ -1,17 +1,18 @@
+ //! 三消游戏的选步：读到的棋盘 → 合法交换 → 模拟消除 → 打分。纯算法，不碰屏幕、磁盘和网络，
+ //! 所以能直接拿存下来的真实棋盘测（设计：docs/superpowers/specs/2026-10-02-dct-match3-play-design.md）。
+ pub mod ask;
+ pub mod board;
+ pub mod choose;
+ #[cfg(unix)]
+ pub mod dco;
++pub mod genre;
+ pub mod goal;
+ pub mod lab;
+ pub mod navigate;
+ pub mod play;
+ pub mod screen;
+ pub mod sim;
+ 
+ pub use board::{fixed_ids, looks_like_board, Board, BoardError, Cell, GridRead};
+ pub use choose::{choose, Candidate, Features, Weights};
+ pub use sim::{Move, Pos};
+diff --git a/src/game/cli.rs b/src/game/cli.rs
+index 093caae..bbace94 100644
+--- a/src/game/cli.rs
++++ b/src/game/cli.rs
+@@ -66,20 +66,23 @@ impl dct_game::play::Clock for SystemClock {
+     }
+     fn sleep_ms(&mut self, ms: u64) {
+         std::thread::sleep(std::time::Duration::from_millis(ms));
+     }
+ }
+ 
+ pub fn run(args: &[String]) -> i32 {
+     if args.first().map(String::as_str) == Some("ask-bench") {
+         return super::bench::run(&args[1..]);
+     }
++    if args.first().map(String::as_str) == Some("identify") {
++        return super::identify::run(&args[1..]);
++    }
+     let a = match parse(args) {
+         Ok(a) => a,
+         Err(m) => {
+             eprintln!("{m}");
+             return 2;
+         }
+     };
+     run_parsed(&a)
+ }
+ 
+diff --git a/src/game/identify.rs b/src/game/identify.rs
+new file mode 100644
+index 0000000..1cd3606
+--- /dev/null
++++ b/src/game/identify.rs
+@@ -0,0 +1,143 @@
++//! `dct game identify`：看一眼屏幕，说这是哪一类游戏。只用本机能得到的东西（有没有合格棋盘、
++//! 屏幕上的字），不上传、不划、不点。
++use dct_game::genre::{classify, Genre};
++use dct_game::looks_like_board;
++use dct_game::play::{Dco, Profile};
++
++pub fn identify(dco: &mut dyn Dco, p: &Profile) -> Genre {
++    let texts: Vec<String> = dco.see_text(p).map(|s| s.elements.into_iter().map(|e| e.text).collect()).unwrap_or_default();
++    let board_ok = Some(dco.read_grid(p).map(|g| looks_like_board(&g)).unwrap_or(false));
++    classify(&texts, board_ok)
++}
++
++/// `dct game identify [--game 名字]`
++pub fn run(args: &[String]) -> i32 {
++    let mut game = "candy-crush".to_string();
++    let mut it = args.iter();
++    while let Some(flag) = it.next() {
++        match flag.as_str() {
++            "--game" => match it.next() {
++                Some(v) => game = v.clone(),
++                None => {
++                    eprintln!("--game 后面要写游戏名");
++                    return 2;
++                }
++            },
++            other => {
++                eprintln!("不认识的选项 {other}。用法：dct game identify [--game 名字]");
++                return 2;
++            }
++        }
++    }
++    run_identify(&game)
++}
++
++#[cfg(not(unix))]
++fn run_identify(_: &str) -> i32 {
++    eprintln!("这一版只支持 Mac：识别游戏要用 dco，而 dco 目前只有 Mac 版。");
++    1
++}
++
++#[cfg(unix)]
++fn run_identify(game: &str) -> i32 {
++    use super::{profile, text};
++    use dct_game::dco::DcoClient;
++    use dct_game::genre::sentence;
++
++    let Some(home) = crate::sys::home() else {
++        eprintln!("找不到家目录。");
++        return 1;
++    };
++    let loaded = match profile::load(&home, game) {
++        Ok(l) => l,
++        Err(m) => {
++            eprintln!("{m}");
++            return 1;
++        }
++    };
++    let mut dco = match DcoClient::connect(&home.join(".dco")) {
++        Ok(c) => c,
++        Err(e) => {
++            eprintln!("{}", text::dco_error(&e));
++            return 1;
++        }
++    };
++    println!("{}", sentence(identify(&mut dco, &loaded.profile)));
++    0
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use dct_game::board::GridRead;
++    use dct_game::genre::Genre;
++    use dct_game::play::{Dco, DcoError, Profile, Seen};
++    use dct_game::screen::Element;
++    use serde_json::json;
++
++    struct Fake {
++        texts: Option<Vec<&'static str>>,
++        grid: Result<GridRead, DcoError>,
++    }
++    impl Dco for Fake {
++        fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
++            self.grid.clone()
++        }
++        fn swipe(&mut self, _: &Profile, _: (f64, f64), _: (f64, f64)) -> Result<(), DcoError> {
++            panic!("identify must never swipe");
++        }
++        fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
++            match &self.texts {
++                Some(t) => Ok(Seen {
++                    snapshot_id: "s".into(),
++                    observation_id: None,
++                    elements: t.iter().enumerate().map(|(i, s)| Element { id: format!("e{i}"), text: (*s).into() }).collect(),
++                }),
++                None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
++            }
++        }
++    }
++
++    fn profile() -> Profile {
++        Profile { window: json!({"app": "x"}), region: [0.0, 0.0, 1.0, 1.0], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: Default::default(), level_pattern: None }
++    }
++    fn no_grid() -> Result<GridRead, DcoError> {
++        Err(DcoError { code: "not_a_grid".into(), message: "m".into() })
++    }
++    fn good_grid() -> Result<GridRead, DcoError> {
++        // 3 行 4 列，三种颜色，每种至少两格，没有一种超过 70%
++        Ok(serde_json::from_value(json!({
++            "rows": 3, "cols": 4,
++            "cells": [[1,1,2,3],[2,3,1,1],[3,2,3,2]],
++            "odd": [[false,false,false,false],[false,false,false,false],[false,false,false,false]],
++            "classes": [{"id":1,"count":4},{"id":2,"count":4},{"id":3,"count":4}]
++        }))
++        .unwrap())
++    }
++
++    #[test]
++    fn a_readable_board_is_match3() {
++        let mut d = Fake { texts: Some(vec!["Hint"]), grid: good_grid() };
++        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
++    }
++
++    #[test]
++    fn a_strong_cue_and_no_board_is_hidden_object() {
++        let mut d = Fake { texts: Some(vec!["COLLECTOR'S EDITION", "PLAY"]), grid: no_grid() };
++        assert_eq!(identify(&mut d, &profile()), Genre::HiddenObject);
++    }
++
++    #[test]
++    fn text_unsupported_falls_back_to_the_board_only() {
++        let mut d = Fake { texts: None, grid: good_grid() };
++        assert_eq!(identify(&mut d, &profile()), Genre::Match3);
++        let mut d = Fake { texts: None, grid: no_grid() };
++        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
++    }
++
++    #[test]
++    fn nothing_readable_is_unknown() {
++        let mut d = Fake { texts: Some(vec![]), grid: no_grid() };
++        assert_eq!(identify(&mut d, &profile()), Genre::Unknown);
++    }
++}
+diff --git a/src/game/mod.rs b/src/game/mod.rs
+index 58c5968..b7315da 100644
+--- a/src/game/mod.rs
++++ b/src/game/mod.rs
+@@ -1,10 +1,11 @@
+ //! `dct game`：让 dct 自己玩三消游戏。选步是纯算法（`crates/dct-game`），这里只管棋盘配置、
+ //! 记录、给用户看的话、装给 agent 的说明卡，和命令本身（设计：
+ //! docs/superpowers/specs/2026-10-02-dct-match3-play-design.md）。
+ pub mod advisor;
+ pub mod bench;
+ pub mod cli;
++pub mod identify;
+ pub mod log;
+ pub mod profile;
+ pub mod skill;
+ pub mod text;
+diff --git a/src/game/skill.md b/src/game/skill.md
+index fe5a4ce..3efb87e 100644
+--- a/src/game/skill.md
++++ b/src/game/skill.md
+@@ -8,20 +8,22 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
+ 
+ 用户说「帮我玩一关 Candy Crush」「帮我消几步」「玩一会儿三消」之类的话，就用这个办法。
+ 
+ ## 开始之前
+ 
+ - 用户要先在 iPhone 镜像里把游戏打开，进到一关里。这一步你不要代劳：关卡按钮、道具、付款都不要自己去点。
+ - 如果用户还没开游戏，告诉他先打开，再回来说一声。
+ 
+ ## 怎么玩
+ 
++不知道用户打开的是什么游戏时，先运行 `dct game identify`，它会用一句话说这是不是三消游戏；说是才继续往下玩，说是寻物类或看不出，就告诉用户我现在还不会玩这个。
++
+ 运行：
+ 
+     dct game play
+ 
+ 它会一步一步玩，最多 20 步，每走一步就印一行，例如：
+ 
+     第 3 步：第 7 行第 2 列 ↔ 第 7 行第 3 列，消 4 颗，做出条纹糖（读 2 ms，选 0 ms，划 262 ms）
+ 
+ - 把每一步的话转述给用户，用大白话，不用解释内部细节。
+ - 命令结束以后，告诉用户这次走了几步、为什么停；步数到了的话问他要不要接着玩，要就再运行一次。
+diff --git a/src/main.rs b/src/main.rs
+index c1b8d76..f5196d3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -28,20 +28,22 @@ dct —— vibe coding 终端
+   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
+   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
+   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
+   dct join <邀请码> [--name 电脑名]
+                    新电脑上：用老电脑给的码加入（没登录会先自动登录）
+   dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5]
+                    [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]
+                    让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
+   dct game ask-bench <记录文件>... [--limit 40]
+                    拿以前记下的局面问大模型，看它比乱选强多少（不碰手机）
++  dct game identify [--game candy-crush]
++                   看看现在屏幕上是哪一类游戏（只在本机识别，不上传）
+   dct peers        看组里有哪些电脑、开着哪些会话
+   dct send <电脑名>/<会话名> \"<内容>\"
+                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
+                    那边空着就马上敲进去，忙就排队
+   dct peers remove <电脑名>           把一台电脑移出组
+   dct daemon       只跑守护进程，不开界面
+   dct gate         远程版那道门：守着一个端口，只放带对钥匙的人进去。
+                    默认只绑环回，要给别的机器用得显式 --bind，
+                    而且前面必须有 TLS——它自己不加密。`--link` 只印链接
+   dct --version    看装的是哪一版
