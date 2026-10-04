@@ -11,6 +11,7 @@ pub mod lab;
 pub mod mood;
 pub mod navigate;
 pub mod play;
+pub mod scene;
 pub mod screen;
 pub mod sim;
 
@@ -22,5 +23,7 @@ pub use sim::{Move, Pos};
 mod tests;
 #[cfg(test)]
 mod play_tests;
+#[cfg(test)]
+mod scene_tests;
 #[cfg(all(test, unix))]
 mod dco_tests;
