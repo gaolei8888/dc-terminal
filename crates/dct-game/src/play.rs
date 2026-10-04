@@ -319,6 +319,18 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options, 
         let result = settle(dco, clock, p, &g);
         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
         match result {
+            // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+            Settle::Settled(next) if same(&next, &g) => {
+                rec["outcome"] = json!("no_change");
+                rec["after_observation_id"] = json!(next.observation_id);
+                sink(rec);
+                streak += 1;
+                failed.push((chosen.mv, canonical(&g.cells)));
+                if streak >= 2 {
+                    break Stop::Stuck;
+                }
+                current = Some(next);
+            }
             Settle::Settled(next) => {
                 rec["outcome"] = json!("moved");
                 rec["after_observation_id"] = json!(next.observation_id);

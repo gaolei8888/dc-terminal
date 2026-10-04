@@ -656,3 +656,17 @@ fn a_dry_run_does_not_pause_or_reread() {
     assert_eq!(d.reads_taken, 1);
     assert_eq!(clk.0, 0);
 }
+
+#[test]
+fn a_swap_the_game_bounces_back_is_no_change() {
+    // 被笼子锁住的糖：划下去先动一下（读到 MOVED），又弹回 A 并落定。落定后和划之前一样，算没反应，连着两次就停。
+    let mut reads = vec![Ok(grid(A)), Ok(grid(MOVED))];
+    for _ in 0..400 {
+        reads.push(Ok(grid(A)));
+    }
+    let mut d = Fake::new(reads);
+    let (s, log) = run(&mut d, 10, false);
+    assert_eq!(log[0]["outcome"], "no_change", "{log:?}");
+    assert_eq!(log[1]["outcome"], "no_change", "{log:?}");
+    assert_eq!(s.stop, Stop::Stuck);
+}
