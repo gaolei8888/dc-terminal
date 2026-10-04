@@ -391,6 +391,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                     let chosen_idx = a.choice.filter(|&k| k < offered.len()).map(|k| offered[k]);
                     ask_rec = Some(json!({
                         "model": a.model, "raw": a.raw, "reason": a.reason,
+                        "tokens_in": a.tokens.map(|t| t.0), "tokens_out": a.tokens.map(|t| t.1),
                         "asked": offered, "choice": chosen_idx,
                         "failed": failed_now, "goal": o.goal,
                     }));

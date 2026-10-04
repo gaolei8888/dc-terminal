@@ -709,7 +709,7 @@ impl Advisor for Say {
             candidates: i.candidates.clone(),
             failed: i.failed.clone(),
         });
-        Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into() })
+        Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into(), tokens: Some((11, 2)) })
     }
 }
 struct Gone(Cell<usize>);
@@ -1215,4 +1215,13 @@ fn a_move_blocked_only_by_a_lock_is_still_tried_and_stuck_means_all_refused() {
     assert_ne!(d.swipes[0], d.swipes[1]);
     assert_eq!(s.stop, Stop::Stuck);
     assert_eq!(d.swipes.len(), 2, "两个走法都被原样拒绝过才算没路");
+}
+
+#[test]
+fn the_ask_record_carries_the_token_counts() {
+    let say = Say::new(Some(1));
+    let mut d = Fake::new(settled_script());
+    let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+    assert_eq!(log[0]["ask"]["tokens_in"], 11);
+    assert_eq!(log[0]["ask"]["tokens_out"], 2);
 }
