@@ -96,7 +96,7 @@ pub trait Clock {
 
 /// 最多发给模型几个候选。
 pub const ASK_SHOWN: usize = 8;
-/// 连着最多几次「划了没反应」才停。被拒绝的格子在棋盘变化前不再被选，所以多试几次不会重复同一处。
+/// 连着最多几次「划了没反应」才停。被拒绝的格子在有一步成功前不再被选（除非别的步都被它们挡住了），所以多试几次不会重复同一处。
 pub const MAX_REFUSED_IN_A_ROW: usize = 5;
 
 pub struct Options<'a> {
@@ -336,7 +336,11 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
         let blocked = |c: &Candidate| {
             failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key) || locked.contains(&c.mv.a) || locked.contains(&c.mv.b)
         };
-        let pick = cands.iter().position(|c| !blocked(c));
+        let pick = cands.iter().position(|c| !blocked(c)).or_else(|| {
+            // 只是被「锁」挡住的（别的步碰到了划过没反应的格子），不能因此停下：
+            // 退一步，选第一个在这张盘上没被原样拒绝过的步，不看锁。次数仍由 MAX_REFUSED_IN_A_ROW 管着。
+            cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key))
+        });
         if cands.is_empty() && !o.dry_run && no_move_confirms < MAX_NO_MOVE_CONFIRMS {
             // 补糖还没补完时会有一瞬间没步可走：停一下再读，盘面变了或有步了就接着玩。
             no_move_confirms += 1;

@@ -109,13 +109,18 @@ fn plays_one_move_then_stops_when_nothing_is_left() {
 }
 
 #[test]
-fn two_unmoved_swipes_stop_and_the_second_try_is_a_different_move() {
+fn unmoved_swipes_try_every_different_move_once_then_stop() {
+    // A 上有 4 个走法：先试不碰锁住格子的，剩下的被锁挡住也要试（只被锁挡住不算没路），都被拒绝过才停。
     let mut d = Fake::new(vec![Ok(grid(A))]); // 一直读到 A
     let (s, log) = run(&mut d, 10, false);
     assert_eq!(s.stop, Stop::Stuck);
-    assert_eq!(d.swipes.len(), 2);
-    assert_ne!(d.swipes[0], d.swipes[1], "第二次不该重复划同一步");
-    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 2);
+    assert_eq!(d.swipes.len(), 4);
+    for i in 0..d.swipes.len() {
+        for j in 0..i {
+            assert_ne!(d.swipes[i], d.swipes[j], "第 {i} 次不该重复划第 {j} 次的步");
+        }
+    }
+    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 4);
 }
 
 #[test]
@@ -379,7 +384,7 @@ fn permuted_ids_on_an_unchanged_screen_settle_as_no_change() {
     let mut d = Fake::new(reads);
     let (s, log) = run(&mut d, 10, false);
     assert_eq!(s.stop, Stop::Stuck);
-    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 2);
+    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 4);
 }
 
 #[test]
@@ -586,7 +591,7 @@ fn a_changed_odd_flag_alone_is_not_a_changed_board() {
     let mut d = Fake::new(reads);
     let (s, log) = run(&mut d, 10, false);
     assert_eq!(s.stop, Stop::Stuck);
-    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 2);
+    assert_eq!(log.iter().filter(|l| l["outcome"] == "no_change").count(), 4);
     assert!(log.iter().all(|l| l["outcome"] != "moved"));
 }
 
@@ -1196,4 +1201,18 @@ fn a_stall_asks_the_model_once_then_counts_again() {
     assert_eq!(asked, 2);
     let asked_at: Vec<usize> = (0..log.len()).filter(|&i| log[i].get("ask").is_some()).collect();
     assert_eq!(asked_at, vec![6, 12]);
+}
+
+// 3x4，只有两个走法，而且共用一个格子：第一个被拒绝并锁住两格以后，第二个只是被「锁」挡住，不是被原样拒绝过。
+const SHARED: &[&[u16]] = &[&[1, 4, 3, 2], &[1, 3, 4, 3], &[3, 2, 4, 2]];
+
+#[test]
+fn a_move_blocked_only_by_a_lock_is_still_tried_and_stuck_means_all_refused() {
+    let mut d = Fake::new(vec![Ok(grid(SHARED))]);
+    let (s, log) = run(&mut d, 10, false);
+    assert_eq!(log[0]["candidates"].as_array().unwrap().len(), 2);
+    assert!(d.swipes.len() >= 2, "{:?}", d.swipes);
+    assert_ne!(d.swipes[0], d.swipes[1]);
+    assert_eq!(s.stop, Stop::Stuck);
+    assert_eq!(d.swipes.len(), 2, "两个走法都被原样拒绝过才算没路");
 }
