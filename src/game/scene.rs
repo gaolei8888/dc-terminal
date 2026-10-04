@@ -101,10 +101,10 @@ fn run_parsed(a: &Args) -> i32 {
 mod unix {
     use super::Args;
     use crate::game::profile::Loaded;
-    use crate::llm::{complete_counted_with_timeout, Backend, Prompt};
+    use crate::llm::{complete_counted_with_timeout, Backend, LlmError, Prompt};
     use base64::Engine;
     use dct_game::play::{Clock, Dco};
-    use dct_game::scene::{parse_pick, scene, SceneOptions, SceneStep, SceneStop, Vision, VisionAnswer};
+    use dct_game::scene::{parse_pick, scene, SceneOptions, SceneStep, SceneStop, Vision, VisionAnswer, VisionFail};
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
@@ -113,15 +113,75 @@ mod unix {
 
     const SYSTEM: &str = "你在帮一个寻物冒险手机游戏的自动玩家看场景。只用 JSON 回答，不要别的话。";
 
+    /// 跑缩图命令：`(输入 png, 输出 jpg)`，成功才算。测试里换成假的。
+    pub type Sips = Arc<dyn Fn(&Path, &Path) -> bool + Send + Sync>;
+
+    /// 真的 macOS `sips`：最宽 1000 像素、JPEG 质量 70。
+    fn real_sips() -> Sips {
+        Arc::new(|i, o| {
+            std::process::Command::new("sips")
+                .args(["-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", "1000"])
+                .arg(i)
+                .arg("--out")
+                .arg(o)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// 0700 的临时目录，丢掉时连内容一起删。
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Option<TempDir> {
+            let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let p = std::env::temp_dir().join(format!("dct-scene-{}-{n}", std::process::id()));
+            std::fs::DirBuilder::new().mode(0o700).create(&p).ok()?;
+            Some(TempDir(p))
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 发给模型的图：缩小成 JPEG（上传快、不超时）；缩不成就原样 PNG，并说明原因。
+    /// 返回 (字节, mime, 备注)。临时文件放在 0700 的临时目录里，用完就删。
+    pub fn shrink(png: &[u8], sips: &Sips) -> (Vec<u8>, &'static str, Option<String>) {
+        let orig = |note: &str| (png.to_vec(), "image/png", Some(note.to_string()));
+        let Some(dir) = TempDir::new() else { return orig("没能建临时文件夹，发的是原图") };
+        let (i, o) = (dir.0.join("in.png"), dir.0.join("out.jpg"));
+        if std::fs::write(&i, png).is_err() {
+            return orig("没能写临时文件，发的是原图");
+        }
+        if !sips(&i, &o) {
+            return orig("sips 缩图没成，发的是原图");
+        }
+        match std::fs::read(&o) {
+            Ok(b) if !b.is_empty() => (b, "image/jpeg", None),
+            _ => orig("sips 没产出图，发的是原图"),
+        }
+    }
+
     pub struct LlmVision {
         backend: Arc<dyn Backend>,
         model: String,
         timeout: Duration,
+        sips: Sips,
     }
 
     impl LlmVision {
         pub fn new(backend: Arc<dyn Backend>, model: String) -> LlmVision {
-            LlmVision { backend, model, timeout: Duration::from_secs(60) }
+            LlmVision { backend, model, timeout: Duration::from_secs(60), sips: real_sips() }
+        }
+
+        #[cfg(test)]
+        pub fn with_sips(mut self, s: Sips) -> LlmVision {
+            self.sips = s;
+            self
         }
     }
 
@@ -136,15 +196,20 @@ mod unix {
     }
 
     impl Vision for LlmVision {
-        fn pick(&self, png: &[u8], history: &[(u16, u16)]) -> Option<VisionAnswer> {
+        fn pick(&self, png: &[u8], history: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
+            let (img, mime, image_note) = shrink(png, &self.sips);
             let p = Prompt {
                 system: SYSTEM.into(),
                 user: question(history),
                 max_tokens: 300,
-                image_png_base64: Some(base64::engine::general_purpose::STANDARD.encode(png)),
+                image_png_base64: Some(base64::engine::general_purpose::STANDARD.encode(&img)),
+                image_mime: (mime != "image/png").then(|| mime.to_string()),
             };
-            let (raw, usage) = complete_counted_with_timeout(self.backend.clone(), p, self.timeout).ok()?;
-            Some(VisionAnswer { pick: parse_pick(&raw), raw, model: self.model.clone(), tokens: usage.map(|u| (u.input, u.output)) })
+            let (raw, usage) = complete_counted_with_timeout(self.backend.clone(), p, self.timeout).map_err(|e| match e {
+                LlmError::Timeout => VisionFail::Timeout,
+                _ => VisionFail::Error,
+            })?;
+            Ok(VisionAnswer { pick: parse_pick(&raw), raw, model: self.model.clone(), tokens: usage.map(|u| (u.input, u.output)), image_bytes: Some(img.len()), image_note })
         }
     }
 
@@ -199,7 +264,9 @@ mod unix {
             SceneStop::DryRun => ("试走完成，没有真点。".into(), 0),
             SceneStop::PrivateScreen => ("这个画面看起来是私人内容，我没有读它，也没有操作。请切回游戏。".into(), 0),
             SceneStop::NoTapAt => ("这台章鱼还不会按位置点，等它更新后再试。".into(), 0),
-            SceneStop::NoVision => ("大模型没回应，先停下了。".into(), 0),
+            SceneStop::NoVision(VisionFail::Timeout) => ("大模型等太久没回应（图传不上去或模型太慢），先停下了。".into(), 0),
+            SceneStop::NoVision(VisionFail::Error) => ("大模型那边出错了，先停下了。可以运行 dct llm check 看原因。".into(), 0),
+            SceneStop::NoVision(VisionFail::Silent) => ("大模型没回应，先停下了。".into(), 0),
             SceneStop::Skipped3 => ("连着 3 次没点（落点不安全或没看清），先停下，请你看看画面。".into(), 0),
             SceneStop::Noop5 => ("连着 5 次点了画面都没变化，先停下。".into(), 0),
             SceneStop::Dco(e) => (super::super::text::dco_error(e), 1),
@@ -261,7 +328,7 @@ mod unix_tests {
     use crate::game::profile;
     use crate::llm::{Backend, LlmError, Prompt, Usage};
     use dct_game::play::{Clock, Dco, DcoError, Profile, Region, Seen, TapAt};
-    use dct_game::scene::{SceneStop, Vision, VisionAnswer};
+    use dct_game::scene::{SceneStop, Vision, VisionAnswer, VisionFail};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
@@ -278,7 +345,62 @@ mod unix_tests {
 
     fn vision(r: Result<(String, Option<Usage>), LlmError>) -> (LlmVision, Arc<Fixed>) {
         let b = Arc::new(Fixed(r, Mutex::new(vec![])));
-        (LlmVision::new(b.clone(), "qwen-x".into()), b)
+        (LlmVision::new(b.clone(), "qwen-x".into()).with_sips(Arc::new(|_, _| false)), b)
+    }
+
+    /// 1x1 的真 PNG。
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0x9c, 0x63, 0xf8, 0xff, 0xff, 0x3f, 0, 5, 0xfe, 2, 0xfe, 0xa7, 0x35, 0x81, 0x84, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn a_successful_shrink_sends_the_jpeg_not_the_original_and_cleans_up() {
+        let ok = r#"{"name":"a","x":0.1,"y":0.1,"why":""}"#;
+        let seen_dir = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+        let sd = seen_dir.clone();
+        let sips: super::unix::Sips = Arc::new(move |i, o| {
+            assert_eq!(std::fs::read(i).unwrap(), TINY_PNG, "sips 拿到的是原图");
+            let dir = i.parent().unwrap();
+            assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+            *sd.lock().unwrap() = Some(dir.to_path_buf());
+            std::fs::write(o, b"JPG!").unwrap();
+            true
+        });
+        let (v, b) = vision(Ok((ok.into(), None)));
+        let a = v.with_sips(sips).pick(TINY_PNG, &[]).unwrap();
+        let sent = b.1.lock().unwrap();
+        assert_eq!(sent[0].image_mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(sent[0].image_png_base64.as_deref(), Some("SlBHIQ=="));
+        assert_eq!((a.image_bytes, a.image_note), (Some(4), None));
+        assert!(!seen_dir.lock().unwrap().as_ref().unwrap().exists(), "临时目录要删掉");
+    }
+
+    #[test]
+    fn a_failed_shrink_sends_the_original_png_and_says_so() {
+        let (v, b) = vision(Ok((r#"{"name":"a","x":0.1,"y":0.1,"why":""}"#.into(), None)));
+        let a = v.pick(TINY_PNG, &[]).unwrap();
+        assert!(b.1.lock().unwrap()[0].image_mime.is_none());
+        assert_eq!(a.image_bytes, Some(TINY_PNG.len()));
+        assert!(a.image_note.unwrap().contains("原图"));
+    }
+
+    #[test]
+    fn a_sips_that_claims_success_but_writes_nothing_falls_back() {
+        let (v, _) = vision(Ok(("x".into(), None)));
+        let a = v.with_sips(Arc::new(|_, _| true)).pick(TINY_PNG, &[]).unwrap();
+        assert_eq!(a.image_bytes, Some(TINY_PNG.len()));
+        assert!(a.image_note.is_some());
+    }
+
+    #[test]
+    fn model_failures_say_timeout_or_error() {
+        let (v, _) = vision(Err(LlmError::Timeout));
+        assert_eq!(v.pick(&[1], &[]).err(), Some(VisionFail::Timeout));
+        let (v, _) = vision(Err(LlmError::Unavailable));
+        assert_eq!(v.pick(&[1], &[]).err(), Some(VisionFail::Error));
+        assert!(stop_line(&SceneStop::NoVision(VisionFail::Timeout), 0).0.contains("等太久"));
+        assert!(stop_line(&SceneStop::NoVision(VisionFail::Error), 0).0.contains("出错"));
     }
 
     #[test]
@@ -300,7 +422,7 @@ mod unix_tests {
         let a = v.pick(&[1], &[]).unwrap();
         assert!(a.pick.is_none() && a.raw == "我看不懂");
         let (v, _) = vision(Err(LlmError::Unavailable));
-        assert!(v.pick(&[1], &[]).is_none());
+        assert!(v.pick(&[1], &[]).is_err());
     }
 
     #[test]
@@ -354,9 +476,9 @@ mod unix_tests {
     }
     struct One;
     impl Vision for One {
-        fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Option<VisionAnswer> {
+        fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
             let pick = dct_game::scene::parse_pick(r#"{"name":"木箱","x":0.5,"y":0.5,"why":"w"}"#);
-            Some(VisionAnswer { pick, raw: String::new(), model: "m".into(), tokens: Some((5, 1)) })
+            Ok(VisionAnswer { pick, raw: String::new(), model: "m".into(), tokens: Some((5, 1)), image_bytes: None, image_note: None })
         }
     }
 
@@ -393,7 +515,7 @@ mod unix_tests {
 
     #[test]
     fn stop_lines_are_plain_and_only_dco_errors_exit_nonzero() {
-        for s in [SceneStop::StepsDone, SceneStop::DryRun, SceneStop::PrivateScreen, SceneStop::NoTapAt, SceneStop::NoVision, SceneStop::Skipped3, SceneStop::Noop5] {
+        for s in [SceneStop::StepsDone, SceneStop::DryRun, SceneStop::PrivateScreen, SceneStop::NoTapAt, SceneStop::NoVision(VisionFail::Silent), SceneStop::NoVision(VisionFail::Timeout), SceneStop::NoVision(VisionFail::Error), SceneStop::Skipped3, SceneStop::Noop5] {
             assert_eq!(stop_line(&s, 3).1, 0, "{s:?}");
         }
         assert!(stop_line(&SceneStop::NoTapAt, 0).0.contains("还不会按位置点"));

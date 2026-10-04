@@ -18,6 +18,10 @@ pub type Sender =
 /// `.timeout_connect()` 都要设**，只设前者会退回 ureq 默认的 30 秒。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
+fn mime_of(p: &Prompt) -> &str {
+    p.image_mime.as_deref().unwrap_or("image/png")
+}
+
 pub fn body_for(wire: Wire, model: &str, p: &Prompt) -> serde_json::Value {
     match wire {
         Wire::Openai => {
@@ -25,7 +29,7 @@ pub fn body_for(wire: Wire, model: &str, p: &Prompt) -> serde_json::Value {
             let user = match &p.image_png_base64 {
                 None => json!(p.user),
                 Some(img) => json!([
-                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{img}")}},
+                    {"type": "image_url", "image_url": {"url": format!("data:{};base64,{img}", mime_of(p))}},
                     {"type": "text", "text": p.user},
                 ]),
             };
@@ -44,7 +48,7 @@ pub fn body_for(wire: Wire, model: &str, p: &Prompt) -> serde_json::Value {
             let user = match &p.image_png_base64 {
                 None => json!(p.user),
                 Some(img) => json!([
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}},
+                    {"type": "image", "source": {"type": "base64", "media_type": mime_of(p), "data": img}},
                     {"type": "text", "text": p.user},
                 ]),
             };
@@ -218,7 +222,7 @@ mod tests {
             system: "s".into(),
             user: "u".into(),
             max_tokens: 128,
-            image_png_base64: None,
+            image_png_base64: None, image_mime: None,
         }
     }
 
@@ -251,6 +255,15 @@ mod tests {
         assert_eq!(c[1]["type"], "text");
         assert_eq!(c[1]["text"], "u");
         assert_eq!(b["system"], "s");
+    }
+
+    #[test]
+    fn a_jpeg_mime_goes_into_both_wires() {
+        let pr = Prompt { image_mime: Some("image/jpeg".into()), ..with_image() };
+        let o = body_for(Wire::Openai, "m", &pr);
+        assert_eq!(o["messages"][1]["content"][0]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        let a = body_for(Wire::Anthropic, "m", &pr);
+        assert_eq!(a["messages"][0]["content"][0]["source"]["media_type"], "image/jpeg");
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub struct Prompt {
     pub max_tokens: u32,
     /// 可选的一张 PNG（base64）。只有 HTTP 的两种线格式会带上；命令行后端忽略它。
     pub image_png_base64: Option<String>,
+    /// 那张图的 MIME 类型；`None` 就是 `image/png`。
+    pub image_mime: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +109,7 @@ mod tests {
             system: "s".into(),
             user: "u".into(),
             max_tokens: 64,
-            image_png_base64: None,
+            image_png_base64: None, image_mime: None,
         }
     }
 
@@ -150,7 +152,7 @@ mod tests {
             system: String::new(),
             user: String::new(),
             max_tokens: 1,
-            image_png_base64: None,
+            image_png_base64: None, image_mime: None,
         };
         assert_eq!(b.complete_counted(&p), Ok(("hi".to_string(), None)));
     }
@@ -163,7 +165,7 @@ mod tests {
                 system: String::new(),
                 user: String::new(),
                 max_tokens: 1,
-                image_png_base64: None,
+                image_png_base64: None, image_mime: None,
             },
             Duration::from_millis(50),
         );

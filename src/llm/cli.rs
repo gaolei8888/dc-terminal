@@ -123,7 +123,7 @@ mod tests {
             system: "你是个助手".into(),
             user: "出了什么事？".into(),
             max_tokens: 64,
-            image_png_base64: None,
+            image_png_base64: None, image_mime: None,
         }
     }
 

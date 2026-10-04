@@ -172,7 +172,7 @@ pub fn explain_prompt(screen: &str) -> crate::llm::Prompt {
             .into(),
         user: format!("这是屏幕上的最后一段内容：\n\n{tail}"),
         max_tokens: 200,
-        image_png_base64: None,
+        image_png_base64: None, image_mime: None,
     }
 }
 
@@ -384,7 +384,7 @@ pub fn name_prompt(first_input: &str, screen: &str) -> crate::llm::Prompt {
             .into(),
         user: format!("用户说的第一句话：\n{first_input}\n\n屏幕上的最后一段内容：\n\n{tail}"),
         max_tokens: 64,
-        image_png_base64: None,
+        image_png_base64: None, image_mime: None,
     }
 }
 
