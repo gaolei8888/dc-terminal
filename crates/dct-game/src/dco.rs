@@ -18,6 +18,8 @@ pub struct DcoClient {
     next_id: u64,
     /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
     no_show_status: bool,
+    /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
+    no_see_text: bool,
 }
 
 fn err(code: &str, message: impl Into<String>) -> DcoError {
@@ -55,7 +57,7 @@ impl DcoClient {
         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false };
+        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
         if ack.get("ok") != Some(&Value::Bool(true)) {
@@ -140,7 +142,18 @@ impl Dco for DcoClient {
     }
 
     fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
-        let body = self.call("see", json!({ "window": p.window, "source": "ocr" }))?;
+        if self.no_see_text {
+            return Err(err("unsupported", "这个 dco 不会认画面上的字"));
+        }
+        let body = match self.call("see", json!({ "window": p.window, "source": "ocr" })) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.code == "dco_too_old" || e.code == "dco_timeout" {
+                    self.no_see_text = true;
+                }
+                return Err(e);
+            }
+        };
         let elements = body["elements"]
             .as_array()
             .map(|a| {

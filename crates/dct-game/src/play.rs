@@ -45,7 +45,16 @@ fn unsupported() -> DcoError {
 /// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。
 /// 「1716/♥5」这种夹着别的字的不要。哪个数是目标，这里不猜；只记下来。
 pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
-    seen.elements.iter().filter_map(|e| e.text.trim().parse::<u64>().ok()).collect()
+    seen.elements
+        .iter()
+        .filter_map(|e| {
+            let t = e.text.trim();
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            t.parse::<u64>().ok()
+        })
+        .collect()
 }
 
 fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {

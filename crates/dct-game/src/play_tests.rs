@@ -1042,6 +1042,17 @@ fn numbers_keeps_only_whole_number_elements_in_order() {
 }
 
 #[test]
+fn numbers_rejects_signs_separators_non_ascii_digits_and_overflow() {
+    let texts = ["+7", "1,234", "-5", "٣", "", "   ", "1234567890123456789012345", "007"];
+    let seen = Seen {
+        snapshot_id: "s".into(),
+        observation_id: None,
+        elements: texts.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
+    };
+    assert_eq!(numbers(&seen), vec![7]);
+}
+
+#[test]
 fn progress_is_recorded_before_and_after_each_step() {
     let mut d = Fake::new(settled_script());
     d.texts = vec![vec!["50", "30"], vec!["49", "30"]].into();

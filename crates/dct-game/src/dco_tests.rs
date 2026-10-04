@@ -378,3 +378,41 @@ fn a_show_status_timeout_is_not_paid_twice() {
     drop(c);
     assert_eq!(h.join().unwrap(), 1);
 }
+
+#[test]
+fn a_see_text_timeout_is_not_paid_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        let mut tool_calls = 0;
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return tool_calls;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            if req["method"] == "tools/call" {
+                tool_calls += 1; // 不回话：让客户端超时
+                continue;
+            }
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {}})).unwrap();
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    assert_eq!(c.see_text(&profile()).err().unwrap().code, "dco_timeout");
+    let t = std::time::Instant::now();
+    assert_eq!(c.see_text(&profile()).err().unwrap().code, "unsupported");
+    assert!(t.elapsed() < std::time::Duration::from_millis(100));
+    drop(c);
+    assert_eq!(h.join().unwrap(), 1);
+}
