@@ -22,6 +22,10 @@ pub struct Advice {
 /// `None` = 没问成（没配、连不上、超时）：调用方当没有这个功能，退回规则。
 pub trait Advisor {
     fn pick(&self, input: &AskInput) -> Option<Advice>;
+    /// 已知问不通时返回 false：调用方不再发问（也不做「想」的动作）。
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// 字母按先出现的先给 A（类别号每次读都会变，不能直接用）；不是糖的类别画 `#`。
@@ -90,15 +94,24 @@ pub fn prompt_text(i: &AskInput) -> String {
     s
 }
 
-/// 取回答里第一串数字当编号（1 起），在 1..=n 里才算；其余（0、越界、没数字、太长）都是 `None`。
+/// 先去掉所有写完的 `<think>…</think>`；还剩没关的 `<think>`（回答被截断）就当没答。
+/// 编号只认开头的那串数字（1 起），在 1..=n 里才算；其余（0、越界、开头不是数字、太长）都是 `None`。
 /// 编号后面的话当理由，去掉开头的标点和空白。
 pub fn parse_reply(raw: &str, n: usize) -> (Option<usize>, String) {
-    let t = raw.trim();
-    let start = t.find(|c: char| c.is_ascii_digit());
-    let Some(start) = start else { return (None, String::new()) };
-    let digits: String = t[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
-    let rest = t[start + digits.len()..]
-        .trim_start_matches(|c: char| c.is_whitespace() || "，,。.：:、；;-—".contains(c))
+    let mut text = raw.to_string();
+    while let Some(a) = text.find("<think>") {
+        match text[a..].find("</think>") {
+            Some(e) => text.replace_range(a..a + e + "</think>".len(), ""),
+            None => return (None, String::new()),
+        }
+    }
+    let t = text.trim();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return (None, String::new());
+    }
+    let rest = t[digits.len()..]
+        .trim_start_matches(|c: char| c.is_whitespace() || "，,。.：:、；;-—)）".contains(c))
         .trim()
         .to_string();
     let idx = digits.parse::<usize>().ok().filter(|k| (1..=n).contains(k)).map(|k| k - 1);
@@ -165,7 +178,13 @@ mod tests {
     fn parse_reply_takes_the_first_number_inside_range() {
         assert_eq!(parse_reply("3", 5), (Some(2), String::new()));
         assert_eq!(parse_reply("2，因为能消更多", 5), (Some(1), "因为能消更多".into()));
-        assert_eq!(parse_reply("选 4 号：做出炸弹", 5).0, Some(3));
+        assert_eq!(parse_reply("选 4 号：做出炸弹", 5).0, None);
+        assert_eq!(parse_reply("<think>想一想</think>\n2", 5), (Some(1), String::new()));
+        assert_eq!(parse_reply("<think>a</think><think>b</think> 3）因为", 5).0, Some(2));
+        assert_eq!(parse_reply("<think>先看第 3 行", 5), (None, String::new()));
+        assert_eq!(parse_reply("2<think>没完", 5), (None, String::new()));
+        assert_eq!(parse_reply("共 5 步，选 2", 5).0, None);
+        assert_eq!(parse_reply("3)", 5).0, Some(2));
     }
 
     #[test]

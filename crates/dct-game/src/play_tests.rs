@@ -696,6 +696,16 @@ impl Advisor for Say {
         Some(Advice { choice: self.choice, reason: "测试".into(), raw: "x".into(), model: "fake".into() })
     }
 }
+struct Gone(Cell<usize>);
+impl Advisor for Gone {
+    fn pick(&self, _: &AskInput) -> Option<Advice> {
+        self.0.set(self.0.get() + 1);
+        None
+    }
+    fn available(&self) -> bool {
+        false
+    }
+}
 struct Down;
 impl Advisor for Down {
     fn pick(&self, _: &AskInput) -> Option<Advice> {
@@ -764,6 +774,15 @@ fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
     assert!(!seen[0].candidates.iter().any(|c| *c == seen[0].failed[0]));
     assert_eq!(log[0]["decider"], "rules");
     assert_eq!(log[1]["decider"], "model");
+    // 模型回的是「候选里的第 1 个」；要靠 offered 映射回 cands，不能直接当 cands 下标，否则又选回刚失败的那步
+    assert_ne!(log[1]["chosen"], log[0]["chosen"]);
+    assert_ne!(log[1]["swipe"]["from"], log[0]["swipe"]["from"]);
+    let refused = log[0]["chosen"].clone();
+    let asked = log[1]["ask"]["asked"].as_array().unwrap();
+    assert!(!asked.contains(&refused));
+    assert_eq!(log[1]["ask"]["choice"], asked[0]);
+    assert_eq!(log[1]["ask"]["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(log[1]["ask"]["goal"], "清冰");
 }
 
 #[test]
@@ -779,6 +798,18 @@ fn model_that_cannot_decide_or_is_down_falls_back_to_rules() {
         assert_eq!(log[0]["decider"], "rules");
         assert_eq!(s.stop, Stop::StepsDone);
     }
+}
+
+#[test]
+fn an_unavailable_advisor_is_never_asked_and_the_octopus_never_thinks() {
+    let gone = Gone(Cell::new(0));
+    let mut d = Fake::new(settled_script());
+    let (s, log) = run_ask(&mut d, Some(&gone), true, 30, 1);
+    assert_eq!(gone.0.get(), 0);
+    assert_eq!(d.events, vec!["swipe"]);
+    assert_eq!(log[0]["decider"], "rules");
+    assert!(log[0].get("ask").is_none());
+    assert_eq!(s.stop, Stop::StepsDone);
 }
 
 #[test]

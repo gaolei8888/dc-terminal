@@ -72,7 +72,7 @@ pub struct Options<'a> {
     pub dry_run: bool,
     /// 规则没把握时问的那个。`None` = 不问（和以前一样）。
     pub advisor: Option<&'a dyn Advisor>,
-    /// 每一步都问（`--ask-model`）；否则只在这盘棋上已有失败的步时才问。
+    /// 每一步都问（`--ask-every-step`）；否则只在这盘棋上已有失败的步时才问。
     pub ask_always: bool,
     /// 这一次 `play()` 最多问几次。
     pub ask_budget: usize,
@@ -266,7 +266,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
             break Stop::NoGrid("棋盘的行列数对不上".into());
         };
         // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。
-        // show_status 留给以后慢的（模型）决策。
+        // 只在问模型（慢）的那段时间发 think/look。
         let t_choose = clock.now_ms();
         let cands: Vec<Candidate> = choose(&board, &p.weights);
         let choose_ms = clock.now_ms().saturating_sub(t_choose);
@@ -302,14 +302,15 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 (0..cands.len()).filter(|&i| !is_failed(&cands[i])).take(ASK_SHOWN).collect()
             };
             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
-            if !o.dry_run && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
+            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
                 asked += 1;
                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
+                let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
                 let input = AskInput {
                     board: board_text(&g, &fixed),
                     goal: o.goal.to_string(),
                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
-                    failed: failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect(),
+                    failed: failed_now.clone(),
                 };
                 dco.show_status("think");
                 let advice = adv.pick(&input);
@@ -319,6 +320,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                     ask_rec = Some(json!({
                         "model": a.model, "raw": a.raw, "reason": a.reason,
                         "asked": offered, "choice": chosen_idx,
+                        "failed": failed_now, "goal": o.goal,
                     }));
                     if let Some(i) = chosen_idx {
                         pick = i;
