@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** (1) `play()` 划动时让 dco 自己等画面稳定并报告「变了/没变」，不再每 0.1 秒读棋盘去猜，被弹回的笼子几百毫秒就知道（旧 dco 回退到现在的轮询）；(2) `play()` / `auto_next()` / `identify` 在对应时刻给章鱼发情绪（想、没进展、卡住、大招、紧张、期待、过关、失败、要人处理、困惑），不认识的新状态一律忽略。
+**Goal:** (0) 认出 dco 的「私人画面」就停下不操作；(1) `play()` 划动时让 dco 自己等画面稳定并报告「变了/没变」，不再每 0.1 秒读棋盘去猜，被弹回的笼子几百毫秒就知道（旧 dco 回退到现在的轮询）；(2) `play()` / `auto_next()` / `identify` 在对应时刻给章鱼发情绪（想、没进展、卡住、大招、紧张、期待、过关、失败、要人处理、困惑），不认识的新状态一律忽略。
 
 **Architecture:** 全在 `crates/dct-game`。`Dco` trait 加两个**有默认实现**的方法：`swipe_settle`（默认返回 `Err(unsupported)`，调用方回退轮询）和 `show_status_with`（默认转调 `show_status`）。`DcoClient` 实现它们，并各自记「这台 dco 不支持」。新增纯函数模块 `mood.rs`（什么时候发什么情绪、阈值、说明条文字），`play()` 里只负责「状态变了才发」。数据（`theme`）来自配置文件，不写进代码。
 
@@ -25,6 +25,7 @@
 
 ## Review Focus
 
+0. dco 的隐私闸回 `private_screen`（`see`/`wait_for_text`）：`play` 一步都不划、`identify` 不读棋盘，说一句人话；`read_grid` 不被拦，所以不能只靠它判断。→ Task 6。
 1. dco 返回 `settle:{error:…}`（划了，等待出错）：**不能重划**，也不能当成「没反应」；回退到现有的轮询去看结果。→ Task 1/2。
 2. `timed_out: true`（5–8 秒还没稳定）：不当作稳定，也不当作没反应；回退到轮询，轮询自己会得出 `StillMoving` 等结论。→ Task 2。
 3. 旧 dco 忽略 `settle` 参数（返回里没有 `settle` 字段）：识别成「不支持」，本次连接后面不再传，回退轮询。→ Task 1。
@@ -173,6 +174,36 @@
 - 变异：去掉「同状态不重发」→ 「再下一步不再发」变红；`Stuck` 的发送去掉 → 对应测试变红。
 
 - [ ] **Step 2–5：** 跑测试确认失败 → 实现 → 测试、clippy → 变异 → 提交：`feat(game): drive the octopus from play, auto-next and identify: send a mood only when it changes, a theme from the profile`。
+
+---
+
+### Task 6: 认出「私人画面」就停下，不操作
+
+背景（dc-octo commit 01e1f32，2026-10-04）：dco 加了隐私闸。认出明显私人的画面（微信、信息、电话、相册、邮件、通讯录、设置、备忘录、手机主屏幕）时，`see`（含图）和 `wait_for_text` 返回错误 `private_screen`，消息「这个画面看起来是私人内容，没有给出」；`read_grid`（只回颜色）、点击、划动、`wait_idle` **不拦**。所以 dct 如果只在读不到字时当「没文字」，手机停在私人画面时仍可能继续划。
+
+**Files:**
+- Modify: `crates/dct-game/src/play.rs`（`Stop::PrivateScreen`、开局检查）、`crates/dct-game/src/navigate.rs`（出口）、`src/game/text.rs`（停止语句、`stop_code`）、`src/game/identify.rs`、`crates/dct-game/src/mood.rs`（`for_stop` 里 `PrivateScreen` → `wait`+「私人画面，没操作」）
+- Test: `play_tests.rs`、`text.rs`、`identify.rs`
+
+**Interfaces:**
+- Produces: `Stop::PrivateScreen`；`DcoClient::see_text` 把 dco 的 `private_screen` 错误原样带出（`DcoError.code == "private_screen"`，现有代码本来就原样透传错误，确认即可）。
+- 行为：
+  1. `play()` 开局（非 dry-run、还没划任何一步）读到的 `see_text` 是 `Err` 且 `code == "private_screen"` → `break Stop::PrivateScreen`（一步都不划）。**之后**每步划完读 `progress` 时遇到 `private_screen` → 同样 `break Stop::PrivateScreen`（画面中途变成了私人界面）；记录该步 `outcome: "stopped"`。
+  2. `dct game identify`：`see_text` 返回 `private_screen` → 打印「这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏。」，退出码 0（这不是错误）。
+  3. 停止语句（`text::stop_line`）：`PrivateScreen` → 「这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏再运行。」，`stop_code` 为 `private_screen`，退出码 0。
+  4. `--dry-run` 不读字，行为不变。
+  5. 其他 `see_text` 错误（`unsupported`、超时等）行为不变。
+
+- [ ] **Step 1: 写失败的测试**
+- 开局 `see_text` 回 `private_screen`：`Stop::PrivateScreen`，`swipes.len() == 0`，没有任何 `read_grid` 之外的操作。
+- 划了一步之后 `see_text` 回 `private_screen`：`Stop::PrivateScreen`，记录里最后一条 `outcome == "stopped"`。
+- `unsupported` 仍然只是 `progress: null`，照常玩。
+- `stop_line(PrivateScreen)` 的文字和退出码 0、`stop_code == "private_screen"`。
+- `identify` 遇到 `private_screen`：打印那句话，不调用 `read_grid`（假 dco 对 `read_grid` panic 即可证明），退出码 0。
+- `mood::for_stop(PrivateScreen)` → `wait` 带说明条，≤16 字符。
+- 变异：把 `private_screen` 当普通错误吞掉 → 前两个测试变红。
+
+- [ ] **Step 2–5：** 跑测试确认失败 → 实现 → 全部测试、clippy → 变异 → 提交：`feat(game): stop and say so when dco withholds a private screen; never swipe on one`。
 
 ---
 
