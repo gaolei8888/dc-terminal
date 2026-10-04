@@ -25,7 +25,11 @@ pub struct Waiver {
     pub rule_sha256: String,
     /// 用户确认规矩的时间（dcv 的 `approved_at`）。
     pub approved_at: String,
+    /// 规矩里放行的那块区域，**整数万分比**（0–10000，窗口左上角为原点）。dct 把它签进票；
+    /// dco 不读 dcv，但会机械地检查「点落在票里签的区域里」，并把整个凭据写进事件记录。
+    pub region: Region,
 }
+pub struct Region { pub x_bp: u16, pub y_bp: u16, pub w_bp: u16, pub h_bp: u16 }
 // Ticket 加：pub waiver: Option<Waiver>
 ```
 
@@ -46,7 +50,9 @@ pub struct Waiver {
 - 签的票：`Subject::Action { tool: "tap_at", args_sha256 }`，`tier: Content`，`waiver: Some(...)`，**有效期 30 秒**，一次性 nonce，`device` 是目标 dco 的设备名。
 - `args` 对象（不含 ticket）：`{"window":{"window_id":N},"x_bp":0..10000,"y_bp":0..10000}`，用 `ticket::args_sha256` 算。**点击位置用整数万分比**，避免浮点两边表示不一致。
 
-### 4. dco 的底线（不被票绕过）
+### 4. dco 的底线（不被票绕过）（dc-octo 审定，2026-10-04）
+
+「落点读出任何字」的定义：dco 读落点周围一小块（窗口宽 6% × 高 3%，和 `tap` 判档一致），只有「文字框盖住落点、或离落点不到窗口宽 1.5%」的字才算「落点上有字」；置信度太低、或不足 2 个字母数字的当噪点忽略（游戏里的血条、伤害数字、HUD 不会误拒）。带放行凭据的票读到字 → `not_allowed`；不带凭据、由用户本人签的 content 票读到字 → 按字定档，票档位不低于它就点（和 `tap` 一样）。钱档字：任何票都拒绝，除非票本身是 Money 档、用户签的。换算：点 = 窗口左上角 + (x_bp/10000 × 窗口宽, y_bp/10000 × 窗口高)；`args` 必须正好只有 `window`（里面只有 `window_id`）、`x_bp`、`y_bp` 三个键，多一个键就 `bad_request`；`window_id` 会变（iPhone 镜像重连后换过），dct 每次签之前用 `list_windows` 现取。dco 的 `verify` 复用 `dct_brain` 的（同一个 crate）。点击时序和 `tap` 一样（iPhone 镜像用长按），章鱼进入「操作」。（以下是原来的内容。）
 
 dco 点之前先用本机文字识别读落点周围一小块：
 - **带放行凭据的票只放行「没有字」的落点。** 落点读出任何字，一律拒绝（`not_allowed`，说明那里写着什么字、放行凭据只管空白），**不论是什么字**。这样自动钥匙签的放行票，永远点不到「发布」「发送」「确认」这类带字按钮。
@@ -60,11 +66,15 @@ dco 点之前先用本机文字识别读落点周围一小块：
 - **放行范围极窄：** 只有 `Content` 档、只有 `no_text` 这一类、只有一次点击、30 秒有效。
 - **规矩改了票就废：** 凭据里带规矩的指纹，用户在 dcv 里改了规矩要重新确认，旧票不再被 dct 签（dct 签之前现读一次 `dcv games`）。
 - **dco 不信「区域」：** dco 不读 dcv，也不判断区域；它只做自己能独立做的事：验签名、验凭据类型、读落点有没有字。区域这一层由 dct 把关，dct 本来就持有自动钥匙（物理档的划动、点击已经由它签）。
-- **已知的残余风险：** 拿到自动钥匙的程序，可以签出带凭据的票，点任何**没有字**的位置（不管在不在用户确认的区域里），因为 dco 不查区域。这和现在自动钥匙能签物理档票（点任何带字的「自用」按钮）是同一等级的信任，不是新增的等级；但要明说。缓解：`Waiver` 里带规矩名和指纹，dco 的事件记录会写下来，事后可对账；区域本身以后可以让 dct 把它也签进票（作为 `Waiver` 的字段），让 dco 至少记下区域，仍然不由 dco 判断。
+- **残余风险（缩小后）：** 凭据里签进了区域，dco 机械地检查「点落在区域里」。拿到自动钥匙的程序要点区域外的没字位置，必须**把一个错的区域签进票**，对账时看得出来。（原来的说法：拿到自动钥匙的程序可以点任何没有字的位置。）这和现在自动钥匙能签物理档票（点任何带字的「自用」按钮）是同一等级的信任，不是新增的等级；但要明说。缓解：`Waiver` 里带规矩名和指纹，dco 的事件记录会写下来，事后可对账；区域本身以后可以让 dct 把它也签进票（作为 `Waiver` 的字段），让 dco 至少记下区域，仍然不由 dco 判断。
 
 ## 要做的事
 
-**dct 这边（`crates/dct-brain` + `crates/dct-game`）：**
+**dct 这边，分两半：**
+- **先合到 main 的一半（`crates/dct-brain`，纯函数，dco 编译要用）：** `Waiver`、`Region`、`Ticket.waiver`、`canonical_bytes` 的追加规则、`role_may_sign`/`verify` 的例外、一个纯函数 `waiver_for_tap(rule, x_bp, y_bp) -> Result<Waiver, Refusal>`（点在区域内才给出凭据）。
+- **之后（`src/`，要用密钥和 dcv）：** 读 dcv 的已确认规矩、`list_windows` 取窗口号、用自动钥匙签单动作票。
+
+**dct 这边（详细）：**
 1. `Waiver` 类型、`Ticket.waiver`、`canonical_bytes` 的追加规则（无凭据逐字节不变，用测试钉住）。
 2. `role_may_sign` / `verify` 的那一条例外，和 `Critical`/`Money`/无凭据的拒绝测试。
 3. 签票：给定点和窗口，查 dcv 的已确认规矩，在区域内才签，返回 `SignedTicket`；不在区域、规矩没确认、规矩改过，都不签。
