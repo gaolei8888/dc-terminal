@@ -2,6 +2,7 @@
 //! 记录、给用户看的话、装给 agent 的说明卡，和命令本身（设计：
 //! docs/superpowers/specs/2026-10-02-dct-match3-play-design.md）。
 pub mod advisor;
+pub mod bench;
 pub mod cli;
 pub mod log;
 pub mod profile;
