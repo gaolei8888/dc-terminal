@@ -3,22 +3,40 @@
 //! 循环本身在 `crates/dct-game/src/scene.rs`；这里接命令行、模型、记录文件和给用户看的话。
 //! 设计：docs/superpowers/plans/2026-10-04-dct-game-scene.md。
 
-const USAGE: &str = "用法：dct game scene [--game 名字] [--steps 10] [--dry-run]";
+const USAGE: &str = "用法：dct game scene [--game 名字] [--steps 10] [--dry-run] [--brain config,claude]";
 
 #[derive(Debug, PartialEq)]
 pub struct Args {
     pub game: String,
     pub steps: usize,
     pub dry_run: bool,
+    /// 大脑升级链：`config`（[llm] 里配的）、`claude`（本机登录的 Claude Code）。
+    pub brain: Vec<String>,
+}
+
+/// 用了 Claude 就得先说清楚画面会发给谁。
+pub const CLAUDE_NOTICE: &str = "这次会把确认是游戏的画面发给 Claude（先用文字识别确认不是私人画面）。";
+
+pub fn privacy_notice(brain: &[String]) -> Option<&'static str> {
+    brain.iter().any(|b| b == "claude").then_some(CLAUDE_NOTICE)
+}
+
+fn parse_brain(v: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).collect();
+    match names.iter().find(|n| !matches!(n.as_str(), "config" | "claude")) {
+        Some(bad) => Err(format!("不认识的大脑「{bad}」。只能写 config（设置里配的大模型）或 claude（本机登录的 Claude Code），用逗号隔开，比如 --brain config,claude。")),
+        None => Ok(names),
+    }
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { game: "candy-crush".into(), steps: 10, dry_run: false };
+    let mut a = Args { game: "candy-crush".into(), steps: 10, dry_run: false, brain: vec!["config".into()] };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--dry-run" => a.dry_run = true,
             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
+            "--brain" => a.brain = parse_brain(it.next().ok_or("--brain 后面要写大脑名，比如 config,claude")?)?,
             "--steps" => {
                 let v = it.next().ok_or("--steps 后面要写步数")?;
                 a.steps = v.parse().ok().filter(|n| (1..=100).contains(n)).ok_or("--steps 要在 1 到 100 之间")?;
@@ -47,7 +65,7 @@ fn run_parsed(_: &Args) -> i32 {
 }
 
 #[cfg(unix)]
-pub use unix::{LlmVision, Recorder};
+pub use unix::{ChainVision, LlmVision, Recorder};
 
 #[cfg(unix)]
 fn run_parsed(a: &Args) -> i32 {
@@ -66,19 +84,33 @@ fn run_parsed(a: &Args) -> i32 {
             return 1;
         }
     };
-    // 先问模型再连 dco：没配大模型就什么都不碰。
-    let llm = match crate::cli::load_llm_backend() {
-        Ok(l) => l,
-        Err(crate::cli::LoadLlmError::NotEnabled(_)) => {
-            println!("没开大模型，没法看场景。");
-            return 0;
-        }
-        Err(crate::cli::LoadLlmError::Problem { .. }) => {
-            println!("大模型连不上，没法看场景。可以先运行 dct llm check 看原因。");
-            return 0;
-        }
-    };
-    let vision = LlmVision::new(llm.backend, llm.model);
+    // 先建大脑再连 dco：大脑不可用就什么都不碰。
+    let mut brains: Vec<(String, Box<dyn dct_game::scene::Vision>)> = vec![];
+    for name in &a.brain {
+        let (backend, model) = if name == "claude" {
+            match crate::cli::load_claude_backend() {
+                Some(b) => (b, "claude".to_string()),
+                None => {
+                    println!("这台机器上没有可用的 Claude Code，没法看场景。");
+                    return 0;
+                }
+            }
+        } else {
+            match crate::cli::load_llm_backend() {
+                Ok(l) => (l.backend, l.model),
+                Err(crate::cli::LoadLlmError::NotEnabled(_)) => {
+                    println!("没开大模型，没法看场景。");
+                    return 0;
+                }
+                Err(crate::cli::LoadLlmError::Problem { .. }) => {
+                    println!("大模型连不上，没法看场景。可以先运行 dct llm check 看原因。");
+                    return 0;
+                }
+            }
+        };
+        brains.push((name.clone(), Box::new(LlmVision::new(backend, model))));
+    }
+    let vision = unix::ChainVision::new(brains);
     let clock = SystemClock;
     let rec = match Recorder::open(&home, &a.game, clock.now_ms() / 1000) {
         Ok(r) => r,
@@ -104,7 +136,7 @@ mod unix {
     use crate::llm::{complete_counted_with_timeout, Backend, LlmError, Prompt};
     use base64::Engine;
     use dct_game::play::{Clock, Dco};
-    use dct_game::scene::{parse_pick, scene, SceneOptions, SceneStep, SceneStop, Vision, VisionAnswer, VisionFail};
+    use dct_game::scene::{parse_pick, BrainChain, scene, SceneOptions, SceneStep, SceneStop, Vision, VisionAnswer, VisionFail};
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
@@ -166,6 +198,39 @@ mod unix {
         }
     }
 
+    /// 按升级链挑大脑的 Vision：当前大脑回答，记下是谁答的；每步的结果通过 `observe` 喂回链。
+    pub struct ChainVision {
+        brains: Vec<(String, Box<dyn Vision>)>,
+        chain: std::sync::Mutex<BrainChain>,
+    }
+
+    impl ChainVision {
+        pub fn new(brains: Vec<(String, Box<dyn Vision>)>) -> ChainVision {
+            let chain = std::sync::Mutex::new(BrainChain::new(brains.len()));
+            ChainVision { brains, chain }
+        }
+    }
+
+    impl Vision for ChainVision {
+        fn pick(&self, png: &[u8], history: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
+            let i = self.chain.lock().unwrap().current();
+            let (name, v) = &self.brains[i];
+            match v.pick(png, history) {
+                Ok(mut a) => {
+                    a.brain = name.clone();
+                    Ok(a)
+                }
+                Err(f) => {
+                    self.chain.lock().unwrap().observe(false);
+                    Err(f)
+                }
+            }
+        }
+        fn observe(&self, effective: bool) {
+            self.chain.lock().unwrap().observe(effective);
+        }
+    }
+
     pub struct LlmVision {
         backend: Arc<dyn Backend>,
         model: String,
@@ -209,7 +274,7 @@ mod unix {
                 LlmError::Timeout => VisionFail::Timeout,
                 _ => VisionFail::Error,
             })?;
-            Ok(VisionAnswer { pick: parse_pick(&raw), raw, model: self.model.clone(), tokens: usage.map(|u| (u.input, u.output)), image_bytes: Some(img.len()), image_note })
+            Ok(VisionAnswer { brain: String::new(), pick: parse_pick(&raw), raw, model: self.model.clone(), tokens: usage.map(|u| (u.input, u.output)), image_bytes: Some(img.len()), image_note })
         }
     }
 
@@ -276,6 +341,9 @@ mod unix {
     /// 整条命令（除了装配）。`dco`、`vision`、`clock` 都是传进来的，测试里换成假的。
     pub fn run_core(a: &Args, loaded: &Loaded, dco: &mut dyn Dco, clock: &mut dyn Clock, vision: &dyn Vision, rec: &Recorder) -> i32 {
         let o = SceneOptions { max_steps: a.steps, dry_run: a.dry_run, no_tap: loaded.no_tap.clone(), game: a.game.clone() };
+        if let Some(n) = super::privacy_notice(&a.brain) {
+            println!("{n}");
+        }
         let s = scene(dco, clock, &loaded.profile, vision, &o, &mut |st| {
             rec.write(&st);
             println!("{}", st.say);
@@ -308,8 +376,25 @@ mod tests {
 
     #[test]
     fn parse_defaults_and_flags() {
-        assert_eq!(p(&[]).unwrap(), Args { game: "candy-crush".into(), steps: 10, dry_run: false });
-        assert_eq!(p(&["--game", "x-1", "--steps", "100", "--dry-run"]).unwrap(), Args { game: "x-1".into(), steps: 100, dry_run: true });
+        assert_eq!(p(&[]).unwrap(), Args { game: "candy-crush".into(), steps: 10, dry_run: false, brain: vec!["config".into()] });
+        assert_eq!(p(&["--game", "x-1", "--steps", "100", "--dry-run"]).unwrap(), Args { game: "x-1".into(), steps: 100, dry_run: true, brain: vec!["config".into()] });
+    }
+
+    #[test]
+    fn parse_brain_lists_and_unknown_names() {
+        assert_eq!(p(&["--brain", "config,claude"]).unwrap().brain, ["config", "claude"]);
+        assert_eq!(p(&["--brain", "claude"]).unwrap().brain, ["claude"]);
+        let e = p(&["--brain", "config,gpt"]).unwrap_err();
+        assert!(e.contains("不认识的大脑「gpt」") && e.contains("config,claude"), "{e}");
+        assert!(p(&["--brain", ""]).is_err() && p(&["--brain"]).is_err());
+    }
+
+    #[test]
+    fn the_privacy_notice_appears_exactly_when_claude_is_in_the_chain() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(privacy_notice(&v(&["claude"])).unwrap().contains("发给 Claude"));
+        assert!(privacy_notice(&v(&["config", "claude"])).is_some());
+        assert!(privacy_notice(&v(&["config"])).is_none());
     }
 
     #[test]
@@ -478,7 +563,7 @@ mod unix_tests {
     impl Vision for One {
         fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
             let pick = dct_game::scene::parse_pick(r#"{"name":"木箱","x":0.5,"y":0.5,"why":"w"}"#);
-            Ok(VisionAnswer { pick, raw: String::new(), model: "m".into(), tokens: Some((5, 1)), image_bytes: None, image_note: None })
+            Ok(VisionAnswer { brain: String::new(), pick, raw: String::new(), model: "m".into(), tokens: Some((5, 1)), image_bytes: None, image_note: None })
         }
     }
 
@@ -493,7 +578,7 @@ mod unix_tests {
     fn a_dry_run_writes_the_record_and_the_sent_image_and_taps_nothing() {
         let (_h, loaded, rec) = setup();
         let mut d = Dc { private: false, captures: 0, taps: 0 };
-        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: true };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: true, brain: vec!["config".into()] };
         assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &One, &rec), 0);
         assert_eq!(d.taps, 0);
         let line = std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap();
@@ -506,11 +591,44 @@ mod unix_tests {
     fn a_private_screen_records_nothing_and_exits_zero_without_capturing() {
         let (_h, loaded, rec) = setup();
         let mut d = Dc { private: true, captures: 0, taps: 0 };
-        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false, brain: vec!["config".into()] };
         assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &One, &rec), 0);
         assert_eq!((d.captures, d.taps), (0, 0));
         assert!(std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap().is_empty());
         assert!(!rec.dir().join("png/0001.png").exists());
+    }
+
+    struct Counting(Arc<Mutex<usize>>);
+    impl Vision for Counting {
+        fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
+            *self.0.lock().unwrap() += 1;
+            One.pick(&[], &[])
+        }
+    }
+
+    #[test]
+    fn the_chain_vision_is_never_called_when_reading_the_screen_fails() {
+        let (_h, loaded, rec) = setup();
+        let calls = Arc::new(Mutex::new(0));
+        let chain = ChainVision::new(vec![("claude".into(), Box::new(Counting(calls.clone())))]);
+        let mut d = Dc { private: true, captures: 0, taps: 0 };
+        let a = Args { game: "candy-crush".into(), steps: 5, dry_run: false, brain: vec!["claude".into()] };
+        assert_eq!(run_core(&a, &loaded, &mut d, &mut Clk, &chain, &rec), 0);
+        assert_eq!((*calls.lock().unwrap(), d.captures), (0, 0));
+    }
+
+    #[test]
+    fn the_chain_vision_escalates_after_two_dead_steps_and_names_the_brain_in_the_record() {
+        let (_h, loaded, rec) = setup();
+        let (c1, c2) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(0)));
+        let chain = ChainVision::new(vec![("config".into(), Box::new(Counting(c1.clone()))), ("claude".into(), Box::new(Counting(c2.clone())))]);
+        // Dc 点了但文字永远没变 → 每步都是 noop → 第 3 步起该换 claude。
+        let mut d = Dc { private: false, captures: 0, taps: 0 };
+        let a = Args { game: "candy-crush".into(), steps: 4, dry_run: false, brain: vec!["config".into(), "claude".into()] };
+        run_core(&a, &loaded, &mut d, &mut Clk, &chain, &rec);
+        let brains: Vec<String> = std::fs::read_to_string(rec.dir().join("steps.jsonl")).unwrap().lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["brain"].as_str().unwrap().to_string()).collect();
+        assert_eq!(&brains[..3], ["config", "config", "claude"], "{brains:?}");
+        assert!(*c1.lock().unwrap() == 2 && *c2.lock().unwrap() >= 1);
     }
 
     #[test]

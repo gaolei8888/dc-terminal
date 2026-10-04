@@ -72,19 +72,23 @@ struct Script {
     picks: std::cell::RefCell<VecDeque<Option<(f64, f64)>>>,
     asked: std::cell::Cell<usize>,
     from: Option<(f64, f64)>,
+    observed: std::cell::RefCell<Vec<bool>>,
 }
 impl Script {
     fn new(p: &[(f64, f64)]) -> Script {
-        Script { picks: std::cell::RefCell::new(p.iter().map(|x| Some(*x)).collect()), asked: 0.into(), from: None }
+        Script { picks: std::cell::RefCell::new(p.iter().map(|x| Some(*x)).collect()), asked: 0.into(), from: None, observed: Default::default() }
     }
 }
 impl Vision for Script {
+    fn observe(&self, e: bool) {
+        self.observed.borrow_mut().push(e);
+    }
     fn pick(&self, _: &[u8], _: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail> {
         self.asked.set(self.asked.get() + 1);
         let p = self.picks.borrow_mut().pop_front().ok_or(VisionFail::Silent)?;
         Ok(match p {
-            Some((x, y)) => VisionAnswer { pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into(), from: self.from }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
-            None => VisionAnswer { pick: None, raw: "乱码".into(), model: "m".into(), tokens: None, image_bytes: None, image_note: None },
+            Some((x, y)) => VisionAnswer { brain: String::new(), pick: Some(Pick { name: "木箱".into(), x, y, why: "近".into(), from: self.from }), raw: String::new(), model: "m".into(), tokens: Some((10, 2)), image_bytes: Some(3), image_note: None },
+            None => VisionAnswer { brain: String::new(), pick: None, raw: "乱码".into(), model: "m".into(), tokens: None, image_bytes: None, image_note: None },
         })
     }
 }
@@ -279,7 +283,7 @@ fn three_skips_in_a_row_stop_and_a_tap_in_between_resets() {
 #[test]
 fn an_unusable_model_answer_counts_as_a_skip() {
     let mut d = Fake::new();
-    let v = Script { picks: std::cell::RefCell::new(VecDeque::from([None, None, None])), asked: 0.into(), from: None };
+    let v = Script { picks: std::cell::RefCell::new(VecDeque::from([None, None, None])), asked: 0.into(), from: None, observed: Default::default() };
     let (s, steps) = run(&mut d, &v, &opts(10));
     assert_eq!(s.stop, SceneStop::Skipped3);
     assert!(steps.iter().all(|x| x.record["label"] == "skipped"));
@@ -506,4 +510,43 @@ fn a_drag_to_the_same_drop_cell_as_last_time_is_deduped() {
     let (_, steps) = run(&mut d, &drag_script(&[(0.5, 0.4), (0.505, 0.4)], (0.1, 0.9)), &opts(2));
     assert_eq!(d.swipes.len(), 1);
     assert_eq!(steps[1].record["label"], "skipped");
+}
+
+// ---- 大脑升级链 ----
+
+fn chain_run(len: usize, seq: &[bool]) -> Vec<usize> {
+    let mut c = BrainChain::new(len);
+    seq.iter().map(|e| { c.observe(*e); c.current() }).collect()
+}
+
+#[test]
+fn the_chain_escalates_after_two_non_effective_steps_in_a_row() {
+    assert_eq!(chain_run(2, &[false, false, false]), vec![0, 1, 1]);
+}
+
+#[test]
+fn an_effective_step_resets_the_count() {
+    assert_eq!(chain_run(2, &[false, true, false, true, false, false]), vec![0, 0, 0, 0, 0, 1]);
+}
+
+#[test]
+fn the_chain_never_goes_back_and_stops_at_the_last_brain() {
+    assert_eq!(chain_run(3, &[false, false, true, true, false, false, false, false, true]), vec![0, 1, 1, 1, 1, 2, 2, 2, 2]);
+}
+
+#[test]
+fn a_single_brain_chain_never_escalates() {
+    assert_eq!(chain_run(1, &[false; 6]), vec![0; 6]);
+}
+
+#[test]
+fn the_scene_tells_the_vision_how_each_step_went_and_records_the_new_fields() {
+    let mut d = Fake::new();
+    // 第一步：没读懂（没效）；第二步：点了，文字没变（没效）。
+    let v = Script::new(&[]);
+    v.picks.borrow_mut().extend([None, Some((0.5, 0.5))]);
+    let (_, steps) = run(&mut d, &v, &opts(2));
+    assert_eq!(*v.observed.borrow(), vec![false, false]);
+    assert_eq!(steps[0].record["assisted"], "none");
+    assert!(steps[0].record["model_ms"].is_u64() && steps[0].record.get("brain").is_some());
 }

@@ -522,6 +522,16 @@ pub enum LoadLlmError {
     },
 }
 
+/// Claude Code 的无界面后端（本机登录态，不用密钥）。用户自定义的 `claude` profile 优先。
+/// 没有 `[headless]` 就是 `None`。
+pub fn load_claude_backend() -> Option<std::sync::Arc<dyn crate::llm::Backend>> {
+    let socket = crate::proto::socket_path();
+    let (custom, _) = crate::profile::all_profiles(&crate::profile::profiles_dir_for_socket(&socket));
+    let p = custom.into_iter().find(|p| p.name == "claude").or_else(|| crate::profile::Profile::builtin("claude"))?;
+    let h = p.headless?;
+    Some(std::sync::Arc::new(crate::llm::cli::CliBackend::new(h.command, Default::default()).with_image_args(h.image_args)))
+}
+
 /// 读配置、建连接。`llm check` 和 `game play --ask-model` 共用；这里不打印任何东西。
 pub fn load_llm_backend() -> Result<LoadedLlm, LoadLlmError> {
     let socket = crate::proto::socket_path();

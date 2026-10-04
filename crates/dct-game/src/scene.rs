@@ -94,6 +94,8 @@ pub fn quantise(x_bp: u16, y_bp: u16) -> (u16, u16) {
 }
 
 pub struct VisionAnswer {
+    /// 回答的是哪个大脑（`config` / `claude`）；由链式 Vision 填，单个 Vision 留空。
+    pub brain: String,
     /// 解析出的位置；模型回了但读不懂就是 `None`。
     pub pick: Option<Pick>,
     pub raw: String,
@@ -116,6 +118,38 @@ pub enum VisionFail {
 /// 给一张图，指出下一个最值得点的位置。`history` 是已经点过的位置（万分比）。没配模型 / 没回应 = `Err`。
 pub trait Vision {
     fn pick(&self, png: &[u8], history: &[(u16, u16)]) -> Result<VisionAnswer, VisionFail>;
+    /// 每步走完告诉它这一步有没有效（没点、没变化、没回答都算没效）。链式 Vision 靠它决定要不要换下一个大脑。
+    fn observe(&self, _effective: bool) {}
+}
+
+/// 升级链：连着这么多步没效，后面所有步都换下一个大脑。
+pub const ESCALATE_AFTER: usize = 2;
+
+/// 大脑升级链的纯逻辑：只往后走，不回头；有效的一步清零连续计数。
+pub struct BrainChain {
+    len: usize,
+    idx: usize,
+    bad: usize,
+}
+
+impl BrainChain {
+    pub fn new(len: usize) -> BrainChain {
+        BrainChain { len, idx: 0, bad: 0 }
+    }
+    pub fn current(&self) -> usize {
+        self.idx
+    }
+    pub fn observe(&mut self, effective: bool) {
+        if effective {
+            self.bad = 0;
+            return;
+        }
+        self.bad += 1;
+        if self.bad >= ESCALATE_AFTER && self.idx + 1 < self.len {
+            self.idx += 1;
+            self.bad = 0;
+        }
+    }
 }
 
 pub struct SceneOptions {
@@ -253,10 +287,12 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             Err(e) if e.code == "private_screen" => break SceneStop::PrivateScreen,
             Err(e) => break SceneStop::Dco(e),
         };
+        let asked_at = clock.now_ms();
         let ans = match vision.pick(&png, &history) {
             Ok(a) => a,
             Err(f) => break SceneStop::NoVision(f),
         };
+        let model_ms = clock.now_ms().saturating_sub(asked_at);
         sum.asks += 1;
         if let Some((i, out)) = ans.tokens {
             sum.tokens_in += i;
@@ -268,7 +304,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             "schema": 1, "game": o.game, "time_ms": clock.now_ms(),
             "screen": { "png": format!("png/{n:04}.png"), "texts": texts_of(&before), "numbers": numbers(&before) },
             "teacher": "qwen", "rationale": ans.pick.as_ref().map(|k| k.why.clone()).unwrap_or_else(|| ans.raw.chars().take(200).collect()),
-            "model": ans.model, "image_bytes": ans.image_bytes, "image_note": ans.image_note, "tokens_in": ans.tokens.map(|t| t.0), "tokens_out": ans.tokens.map(|t| t.1),
+            "model": ans.model, "brain": ans.brain, "assisted": "none", "model_ms": model_ms, "image_bytes": ans.image_bytes, "image_note": ans.image_note, "tokens_in": ans.tokens.map(|t| t.0), "tokens_out": ans.tokens.map(|t| t.1),
         });
         let mut emit = |rec: Value, say: String| sink(SceneStep { record: rec, png: Some(png.clone()), say });
         // 过检查：任何一项不满足就不点。
@@ -298,6 +334,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
             rec["label"] = json!("skipped");
             rec["skip_reason"] = json!(reason);
             emit(rec, format!("第 {n} 步：这一步没点：{reason}"));
+            vision.observe(false);
             skipped += 1;
             if skipped >= MAX_SKIPPED_IN_A_ROW {
                 break SceneStop::Skipped3;
@@ -325,6 +362,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
                 rec["label"] = json!("skipped");
                 rec["skip_reason"] = json!(format!("dco 不让点：{}", e.message));
                 emit(rec, format!("第 {n} 步：这一步没点：dco 不让点这里"));
+                vision.observe(false);
                 skipped += 1;
                 if skipped >= MAX_SKIPPED_IN_A_ROW {
                     break SceneStop::Skipped3;
@@ -356,6 +394,7 @@ pub fn scene(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, vision: &dyn
         rec["outcome"] = json!({ "changed": changed, "texts_after": texts_of(&after), "by": if settle.as_ref().is_some_and(|s| s.settled && !s.timed_out) { "dco_settle" } else { "texts" } });
         rec["label"] = json!(if changed { "effective" } else { "noop" });
         emit(rec, format!("第 {n} 步：点了『{}』，画面{}", k.name, if changed { "变了" } else { "没变" }));
+        vision.observe(changed);
         noop = if changed { 0 } else { noop + 1 };
         if noop >= MAX_NOOP_IN_A_ROW {
             break SceneStop::Noop5;
