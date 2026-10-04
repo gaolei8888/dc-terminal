@@ -45,6 +45,9 @@ pub fn step_line(step: usize, rec: &Value) -> String {
             }
         }
     }
+    if let Some(n) = rec["goal_found"].as_u64() {
+        s += &format!("；我认为屏幕上第 {n} 个数字是这一关的目标");
+    }
     if rec["stalled"].as_bool() == Some(true) {
         s += "；这几步看起来没有进展";
     }
@@ -331,5 +334,13 @@ mod tests {
         assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
         let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
         assert!(!step_line(1, &rec2).contains("没有进展"));
+    }
+
+    #[test]
+    fn step_line_says_which_number_was_taken_as_the_goal() {
+        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","goal_found":2});
+        assert!(step_line(1, &rec).contains("我认为屏幕上第 2 个数字是这一关的目标"));
+        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
+        assert!(!step_line(1, &rec2).contains("目标"));
     }
 }

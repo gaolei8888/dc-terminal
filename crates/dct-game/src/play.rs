@@ -3,6 +3,7 @@
 use crate::ask::{board_text, describe, describe_move, Advisor, AskInput};
 use crate::board::{fixed_ids, looks_like_board, Board, GridRead};
 use crate::choose::{choose, Candidate, Weights};
+use crate::goal::GoalFinder;
 use crate::screen::Element;
 use serde_json::{json, Value};
 
@@ -55,6 +56,17 @@ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
             t.parse::<u64>().ok()
         })
         .collect()
+}
+
+/// 停滞计数的一次更新；`gi` 是当前生效的目标下标（用户给的优先，否则识别器认出的），没有就不动。
+fn update_stall(no_progress: &mut usize, gi: Option<usize>, before: &Option<Vec<u64>>, after: &Option<Vec<u64>>) {
+    if let (Some(gi), Some(b), Some(a)) = (gi, before, after) {
+        match goal_dropped(b, a, gi) {
+            Some(true) => *no_progress = 0,
+            Some(false) => *no_progress += 1,
+            None => {}
+        }
+    }
 }
 
 /// 连着这么多步目标数字都没下降，就算停滞。
@@ -282,6 +294,7 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
     let mut current: Option<GridRead> = None;
     let mut no_move_confirms = 0;
     let mut no_progress = 0usize;
+    let mut finder = GoalFinder::new();
     let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
     let stop = loop {
         if steps >= o.max_steps {
@@ -455,14 +468,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
-                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
-                    match goal_dropped(b, a, gi) {
-                        Some(true) => no_progress = 0,
-                        Some(false) => no_progress += 1,
-                        None => {}
-                    }
-                }
-                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                let gi = o.goal_index.or(finder.index());
+                update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
+                rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
                 progress_prev = progress_after;
                 sink(rec);
                 streak += 1;
@@ -479,14 +487,21 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(changed_cells(&g, &next));
                 rec["after_observation_id"] = json!(next.observation_id);
                 let progress_after = read_numbers(dco, p);
-                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
-                    match goal_dropped(b, a, gi) {
-                        Some(true) => no_progress = 0,
-                        Some(false) => no_progress += 1,
-                        None => {}
+                // 只有成功走了一步才让识别器看：被拒绝的步数字不降，会把「每步刚好少 1」的步数误排除。
+                if o.goal_index.is_none() {
+                    let had = finder.index();
+                    if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+                        finder.observe(b, a);
+                    }
+                    if had.is_none() {
+                        if let Some(i) = finder.index() {
+                            rec["goal_found"] = json!(i + 1);
+                        }
                     }
                 }
-                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                let gi = o.goal_index.or(finder.index());
+                update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
+                rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
                 progress_prev = progress_after;
                 sink(rec);
                 streak = 0;
@@ -499,14 +514,9 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
                 rec["observed_changed"] = json!(0);
                 rec["after_observation_id"] = json!(same_board.observation_id);
                 let progress_after = read_numbers(dco, p);
-                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
-                    match goal_dropped(b, a, gi) {
-                        Some(true) => no_progress = 0,
-                        Some(false) => no_progress += 1,
-                        None => {}
-                    }
-                }
-                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                let gi = o.goal_index.or(finder.index());
+                update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
+                rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
                 progress_prev = progress_after;
                 sink(rec);
                 streak += 1;

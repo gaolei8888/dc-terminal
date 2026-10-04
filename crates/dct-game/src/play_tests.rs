@@ -1225,3 +1225,70 @@ fn the_ask_record_carries_the_token_counts() {
     assert_eq!(log[0]["ask"]["tokens_in"], 11);
     assert_eq!(log[0]["ask"]["tokens_out"], 2);
 }
+
+#[test]
+fn without_goal_number_the_finder_picks_the_goal_and_stall_then_works() {
+    // 数字列表 [步数, 目标]：步数每步 -1，目标恒为 50（不动）。4 步样本后认出目标 = 下标 1，之后 6 步没降 → 停滞 → 问模型
+    let say = Say::new(Some(0));
+    let mut reads = vec![Ok(grid(A))];
+    for _ in 0..60 {
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(A)));
+        reads.push(Ok(grid(A)));
+    }
+    let mut d = Fake::new(reads);
+    let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
+    for i in 0..14 {
+        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), "50"]);
+    }
+    d.texts = texts.into();
+    // goal_index 为 None（用户没给）→ 认
+    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 14);
+    assert!(log.iter().any(|l| l["goal_found"] == 2), "应在某一步认出第 2 个数字：{log:?}");
+    assert!(log.iter().any(|l| l["stalled"] == true));
+    assert!(say.calls.get() >= 1);
+}
+
+#[test]
+fn a_user_given_goal_number_is_never_overridden_by_the_finder() {
+    let mut reads = vec![Ok(grid(A))];
+    for _ in 0..60 {
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(MOVED)));
+        reads.push(Ok(grid(A)));
+        reads.push(Ok(grid(A)));
+    }
+    let mut d = Fake::new(reads);
+    let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
+    for i in 0..10 {
+        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), "50"]);
+    }
+    d.texts = texts.into();
+    let say = Say::new(Some(0));
+    let mut log = vec![];
+    // 用户指定第 1 个数（下标 0 = 步数，每步都降）
+    let o = Options { max_steps: 10, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "", goal_index: Some(0) };
+    let _ = play(&mut d, &mut Clk(0), &profile(3, 4), &o, &mut |v| log.push(v));
+    assert!(log.iter().all(|l| l.get("goal_found").is_none()), "用户给了，就不自动认");
+    assert!(log.iter().all(|l| l["progress"]["goal_index"] == 0 || l["progress"]["goal_index"].is_null()));
+}
+
+#[test]
+fn a_refused_step_between_moved_steps_does_not_stop_the_finder_seeing_the_step_counter() {
+    // [步数, 目标]：步数每成功一步 -1，目标不动。中间夹一步被拒绝（数字都没变）。
+    // 被拒绝的步不能进识别器的样本，否则步数那一列会被当成「不规律」，4 个有效样本时就认不出目标。
+    let b: &[&[u16]] = &[&[2, 1, 1, 1], &[3, 1, 2, 3], &[2, 3, 2, 3]];
+    let mut reads = vec![Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))];
+    for _ in 0..30 {
+        reads.push(Ok(grid(A))); // 第 3 步一直没变：被拒绝
+    }
+    reads.extend([Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))]);
+    let mut d = Fake::new(reads);
+    d.texts = lists(&[&["30", "50"], &["29", "50"], &["28", "50"], &["28", "50"], &["27", "50"], &["26", "50"]]);
+    let (_, log) = run_ask_goal(&mut d, None, false, 0, 5, None);
+    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
+    assert_eq!(outcomes, ["moved", "moved", "no_change", "moved", "moved"], "{outcomes:?}");
+    assert_eq!(log[4]["goal_found"], 2, "第 4 个成功样本时认出第 2 个数字：{log:?}");
+    assert!(log[..4].iter().all(|l| l.get("goal_found").is_none()));
+}
