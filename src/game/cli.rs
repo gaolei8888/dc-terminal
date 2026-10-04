@@ -73,6 +73,9 @@ pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("ask-bench") {
         return super::bench::run(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("identify") {
+        return super::identify::run(&args[1..]);
+    }
     let a = match parse(args) {
         Ok(a) => a,
         Err(m) => {

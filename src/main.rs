@@ -35,6 +35,8 @@ dct —— vibe coding 终端
                    让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
   dct game ask-bench <记录文件>... [--limit 40]
                    拿以前记下的局面问大模型，看它比乱选强多少（不碰手机）
+  dct game identify [--game candy-crush]
+                   看看现在屏幕上是哪一类游戏（只在本机识别，不上传）
   dct peers        看组里有哪些电脑、开着哪些会话
   dct send <电脑名>/<会话名> \"<内容>\"
                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
