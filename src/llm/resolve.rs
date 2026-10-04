@@ -148,7 +148,7 @@ pub fn resolve(
             // 自己去凑一个。没声明 `[secret]` 的（claude / codex 自己）行为
             // 不变——它们打的本来就是自己家的端点，登录归它们自己管。
             let env = headless_env(&p, name, secrets)?;
-            Ok(Arc::new(CliBackend::new(h.command.clone(), env)))
+            Ok(Arc::new(CliBackend::new(h.command.clone(), env).with_image_args(h.image_args.clone())))
         }
         Transport::Http => {
             let api = p

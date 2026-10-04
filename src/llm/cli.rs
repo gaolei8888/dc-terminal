@@ -13,6 +13,8 @@ pub type Runner = dyn Fn(&[String], &str) -> Result<String, String> + Send + Syn
 
 pub struct CliBackend {
     command: Vec<String>,
+    /// 只在带图时才追加的参数（比如 claude 的 `--allowedTools Read`，让它能读图片文件）。
+    image_args: Vec<String>,
     runner: Arc<Runner>,
 }
 
@@ -22,20 +24,62 @@ impl CliBackend {
     pub fn new(command: Vec<String>, env: BTreeMap<String, String>) -> CliBackend {
         CliBackend {
             command,
+            image_args: vec![],
             runner: Arc::new(move |cmd, input| run_real(cmd, input, &env)),
         }
     }
 
     pub fn with_runner(command: Vec<String>, runner: Arc<Runner>) -> CliBackend {
-        CliBackend { command, runner }
+        CliBackend { command, image_args: vec![], runner }
+    }
+
+    pub fn with_image_args(mut self, args: Vec<String>) -> CliBackend {
+        self.image_args = args;
+        self
+    }
+}
+
+/// 0700 的临时目录，丢掉时连内容一起删。
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn new() -> Option<TempDir> {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("dct-cli-img-{}-{n}", std::process::id()));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(&p).ok()?;
+        Some(TempDir(p))
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
 impl Backend for CliBackend {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
-        // 命令行后端只收文字：p.image_png_base64 被有意忽略。
-        let input = format!("{}\n\n{}", p.system, p.user);
-        let out = (self.runner)(&self.command, &input).map_err(|e| {
+        // 带图：写进 0700 临时目录，提示词里让模型去读那个文件，命令里放开 Read；
+        // 不带图时命令和提示词跟以前一字不差。`_dir` 活到调用结束，丢掉时删目录。
+        let (_dir, user, command);
+        let (user, command): (&str, &[String]) = match &p.image_png_base64 {
+            None => (&p.user, &self.command),
+            Some(b64) => {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|_| LlmError::Malformed)?;
+                let d = TempDir::new().ok_or(LlmError::Unavailable)?;
+                let ext = if p.image_mime.as_deref() == Some("image/jpeg") { "jpg" } else { "png" };
+                let file = d.0.join(format!("image.{ext}"));
+                std::fs::write(&file, bytes).map_err(|_| LlmError::Unavailable)?;
+                user = format!("{}\n\nRead the image file at {} (use the Read tool) and answer about that image.", p.user, file.display());
+                command = [self.command.clone(), self.image_args.clone()].concat();
+                _dir = d;
+                (&user, &command)
+            }
+        };
+        let input = format!("{}\n\n{}", p.system, user);
+        let out = (self.runner)(command, &input).map_err(|e| {
             eprintln!("LLM CLI 调用失败：{e}");
             LlmError::Unavailable
         })?;
@@ -153,6 +197,56 @@ mod tests {
         assert_eq!(cmd, vec!["claude".to_string(), "-p".to_string()]);
         assert!(input.contains("你是个助手"), "system 没送到");
         assert!(input.contains("出了什么事？"), "user 没送到");
+    }
+
+    fn img_prompt() -> Prompt {
+        Prompt { image_png_base64: Some("AQID".into()), image_mime: Some("image/jpeg".into()), ..p() }
+    }
+
+    type Seen = Arc<Mutex<Option<(Vec<String>, String, Option<std::path::PathBuf>)>>>;
+
+    fn backend_seeing(seen: &Seen) -> CliBackend {
+        let sink = seen.clone();
+        CliBackend::with_runner(
+            vec!["claude".into(), "-p".into()],
+            Arc::new(move |cmd: &[String], input: &str| {
+                // 路径是提示词里「at <path> (」之间的那段；趁文件还在读一下内容和权限。
+                let path = input.split("Read the image file at ").nth(1).and_then(|r| r.split(" (use").next()).map(std::path::PathBuf::from);
+                if let Some(pa) = &path {
+                    assert_eq!(std::fs::read(pa).unwrap(), vec![1, 2, 3]);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(std::fs::metadata(pa.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+                    }
+                }
+                *sink.lock().unwrap() = Some((cmd.to_vec(), input.to_string(), path));
+                Ok("ok".into())
+            }),
+        )
+        .with_image_args(vec!["--allowedTools".into(), "Read".into()])
+    }
+
+    #[test]
+    fn an_image_gets_a_temp_file_the_read_permission_and_is_cleaned_up() {
+        let seen: Seen = Default::default();
+        backend_seeing(&seen).complete(&img_prompt()).unwrap();
+        let (cmd, input, path) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, ["claude", "-p", "--allowedTools", "Read"]);
+        let path = path.expect("提示词里要有图片路径");
+        assert!(path.to_string_lossy().ends_with(".jpg"));
+        assert!(input.contains("出了什么事？"), "原来的问题要保留");
+        assert!(!path.parent().unwrap().exists(), "临时目录要删掉");
+    }
+
+    #[test]
+    fn without_an_image_the_command_and_prompt_are_unchanged() {
+        let seen: Seen = Default::default();
+        backend_seeing(&seen).complete(&p()).unwrap();
+        let (cmd, input, path) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, ["claude", "-p"]);
+        assert_eq!(input, "你是个助手\n\n出了什么事？");
+        assert!(path.is_none());
     }
 
     #[test]

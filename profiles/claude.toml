@@ -45,3 +45,5 @@ en = "Requires Node.js"
 [headless]
 # 实测：`claude -p/--print` 是官方的非交互模式，提示词作为参数追加。
 command = ["claude", "-p"]
+# 只在带图时追加：让模型能用 Read 工具读那张临时图片，别的工具一概不放开。
+image_args = ["--allowedTools", "Read"]

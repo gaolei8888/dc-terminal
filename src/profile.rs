@@ -82,6 +82,9 @@ pub struct LoginSpec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeadlessSpec {
     pub command: Vec<String>,
+    /// 只在这次调用带图片时才追加的参数（claude：放开 Read 工具去读图片文件）。
+    #[serde(default)]
+    pub image_args: Vec<String>,
 }
 
 /// HTTP 端点说的是哪种话。
