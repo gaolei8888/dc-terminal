@@ -1,0 +1,284 @@
+# Review package: 4774a97..HEAD
+
+## Commits
+89a0ed6 feat(game): record the whole-number texts on screen before and after each step as progress
+
+## Files changed
+ crates/dct-game/src/play.rs       | 20 +++++++++++++++
+ crates/dct-game/src/play_tests.rs | 51 ++++++++++++++++++++++++++++++++++++++-
+ tests/game_cli.rs                 |  4 ++-
+ 3 files changed, 73 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index 4095973..f6c4eef 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -35,20 +35,30 @@ pub struct DcoError {
+ pub struct Seen {
+     pub snapshot_id: String,
+     pub observation_id: Option<String>,
+     pub elements: Vec<Element>,
+ }
+ 
+ fn unsupported() -> DcoError {
+     DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+ }
+ 
++/// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。
++/// 「1716/♥5」这种夹着别的字的不要。哪个数是目标，这里不猜；只记下来。
++pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
++    seen.elements.iter().filter_map(|e| e.text.trim().parse::<u64>().ok()).collect()
++}
++
++fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
++    dco.see_text(p).ok().map(|s| numbers(&s))
++}
++
+ pub trait Dco {
+     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+     /// 坐标是窗口比例（0～1）。
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+     /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
+     fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
+         Err(unsupported())
+     }
+     /// 点 `see_text` 读到的某个元素。dco 自己按那个元素上的字定档，带价格的会拒绝。
+     fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
+@@ -242,20 +252,21 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
+ 
+ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
+     let mut steps = 0;
+     let mut baseline: Option<usize> = None;
+     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+     let mut asked = 0usize;
+     let mut streak = 0;
+     let mut locked: Vec<(usize, usize)> = Vec::new();
+     let mut current: Option<GridRead> = None;
+     let mut no_move_confirms = 0;
++    let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
+     let stop = loop {
+         if steps >= o.max_steps {
+             break Stop::StepsDone;
+         }
+         let t_read = clock.now_ms();
+         let g = match current.take() {
+             Some(g) => g,
+             None => match dco.read_grid(p) {
+                 Ok(g) => g,
+                 Err(e) if e.code == "not_a_grid" => break Stop::NoGrid(e.message),
+@@ -400,44 +411,53 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         rec["swiped"] = json!(true);
+         let t_settle = clock.now_ms();
+         let result = settle(dco, clock, p, &g);
+         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+         match result {
+             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+             Settle::Settled(next) if same(&next, &g) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(next.observation_id);
++                let progress_after = read_numbers(dco, p);
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
+                 rec["observed_changed"] = json!(changed_cells(&g, &next));
+                 rec["after_observation_id"] = json!(next.observation_id);
++                let progress_after = read_numbers(dco, p);
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                progress_prev = progress_after;
+                 sink(rec);
+                 streak = 0;
+                 failed.clear();
+                 locked.clear();
+                 current = Some(next);
+             }
+             Settle::NoChange(same_board) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(same_board.observation_id);
++                let progress_after = read_numbers(dco, p);
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(same_board);
+             }
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index 11ddefa..856991c 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -17,24 +17,25 @@ fn grid(cells: &[&[u16]]) -> GridRead {
+ }
+ 
+ struct Fake {
+     reads: VecDeque<Result<GridRead, DcoError>>,
+     last: Option<Result<GridRead, DcoError>>,
+     swipes: Vec<((f64, f64), (f64, f64))>,
+     swipe_err: Option<DcoError>,
+     /// show_status 和 swipe 按先后记下来，测 play() 不发状态。
+     events: Vec<String>,
+     reads_taken: usize,
++    texts: VecDeque<Vec<&'static str>>,
+ }
+ impl Fake {
+     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
+-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0 }
++        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new() }
+     }
+ }
+ impl Dco for Fake {
+     fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
+         self.reads_taken += 1;
+         if let Some(r) = self.reads.pop_front() {
+             self.last = Some(r.clone());
+             return r;
+         }
+         self.last.clone().expect("脚本里一次读盘都没有")
+@@ -43,20 +44,30 @@ impl Dco for Fake {
+         if let Some(e) = self.swipe_err.clone() {
+             return Err(e);
+         }
+         self.swipes.push((f, t));
+         self.events.push("swipe".into());
+         Ok(())
+     }
+     fn show_status(&mut self, state: &str) {
+         self.events.push(state.into());
+     }
++    fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
++        match self.texts.pop_front() {
++            Some(t) => Ok(Seen {
++                snapshot_id: "s".into(),
++                observation_id: None,
++                elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into() }).collect(),
++            }),
++            None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
++        }
++    }
+ }
+ struct Clk(u64);
+ impl Clock for Clk {
+     fn now_ms(&self) -> u64 {
+         self.0
+     }
+     fn sleep_ms(&mut self, ms: u64) {
+         self.0 += ms;
+     }
+ }
+@@ -1012,10 +1023,48 @@ fn changed_cells_is_none_when_colours_are_missing() {
+     assert_eq!(changed_cells(&a, &a), None);
+ }
+ 
+ #[test]
+ fn records_carry_predicted_and_observed() {
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run(&mut d, 1, false);
+     assert!(log[0]["predicted_cleared"].as_u64().unwrap() >= 3);
+     assert!(log[0].get("observed_changed").is_some());
+ }
++
++#[test]
++fn numbers_keeps_only_whole_number_elements_in_order() {
++    let seen = Seen {
++        snapshot_id: "s".into(),
++        observation_id: None,
++        elements: ["1716/♥5", "38", "x", "122", " 7 "].iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
++    };
++    assert_eq!(numbers(&seen), vec![38, 122, 7]);
++}
++
++#[test]
++fn progress_is_recorded_before_and_after_each_step() {
++    let mut d = Fake::new(settled_script());
++    d.texts = vec![vec!["50", "30"], vec!["49", "30"]].into();
++    let (_, log) = run(&mut d, 1, false);
++    assert_eq!(log[0]["progress"]["before"], json!([50, 30]));
++    assert_eq!(log[0]["progress"]["after"], json!([49, 30]));
++}
++
++#[test]
++fn progress_is_null_when_the_dco_cannot_read_text() {
++    let mut d = Fake::new(settled_script());
++    let (s, log) = run(&mut d, 1, false);
++    assert!(log[0]["progress"]["before"].is_null());
++    assert!(log[0]["progress"]["after"].is_null());
++    assert_eq!(s.stop, Stop::StepsDone);
++}
++
++#[test]
++fn the_after_of_one_step_is_the_before_of_the_next() {
++    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED)), Ok(grid(A)), Ok(grid(A))]);
++    d.texts = vec![vec!["50"], vec!["49"], vec!["48"]].into();
++    let (_, log) = run(&mut d, 2, false);
++    assert!(log.len() >= 2);
++    assert_eq!(log[1]["progress"]["before"], json!([49]));
++    assert_eq!(log[1]["progress"]["after"], json!([48]));
++}
+diff --git a/tests/game_cli.rs b/tests/game_cli.rs
+index 573599a..f0b2c64 100644
+--- a/tests/game_cli.rs
++++ b/tests/game_cli.rs
+@@ -44,20 +44,22 @@ fn fake_dco(home: &std::path::Path, swipe_error: Option<&'static str>) -> std::t
+                 return tools;
+             }
+             let req: Value = serde_json::from_str(line.trim()).unwrap();
+             let Some(id) = req.get("id") else { continue };
+             let result = match req["method"].as_str().unwrap() {
+                 "tools/call" => {
+                     let name = req["params"]["name"].as_str().unwrap().to_string();
+                     tools.push(name.clone());
+                     let (body, is_error) = match (name.as_str(), swipe_error) {
+                         ("read_grid", _) => (board(), false),
++                        // 进度数字读不到也不影响玩：这个假 dco 不会认字。
++                        ("see", _) => (json!({"error": {"code": "unsupported", "message": "x"}}), true),
+                         ("swipe", Some(code)) => (json!({"error": {"code": code, "message": "x"}}), true),
+                         ("swipe", None) => (json!({"swiped": true}), false),
+                         (other, _) => panic!("没想到会调 {other}"),
+                     };
+                     json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
+                 }
+                 _ => json!({"protocolVersion": "2025-06-18"}),
+             };
+             writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).unwrap();
+         }
+@@ -96,21 +98,21 @@ fn a_dry_run_prints_the_move_never_swipes_and_logs_it() {
+     assert_eq!((lines[1]["stop"].as_str(), lines[1]["steps"].as_u64()), (Some("dry_run"), Some(0)));
+ }
+ 
+ #[test]
+ fn a_halted_dco_stops_the_game_with_a_plain_sentence_and_a_failing_exit_code() {
+     let home = tempfile::tempdir().unwrap();
+     let h = fake_dco(home.path(), Some("halted"));
+     let (out, err, code) = dct(home.path(), &["game", "play", "--steps", "3"]);
+     assert_eq!(code, 1, "{out}{err}");
+     assert!(err.contains("急停"), "{err}");
+-    assert_eq!(h.join().unwrap(), vec!["read_grid", "swipe"]);
++    assert_eq!(h.join().unwrap(), vec!["see", "read_grid", "swipe"]);
+     assert!(err.contains("走了 0 步"), "{err}");
+     assert!(out.contains("这一步没划成") && !out.contains("消 ") && !out.contains("第 1 步"), "{out}");
+     let lines = log_lines(home.path());
+     assert_eq!(lines.last().unwrap()["stop"], "dco");
+     assert_eq!(lines.last().unwrap()["steps"], 0);
+     assert_eq!(lines[0]["swiped"], false);
+     assert!(lines[0]["candidates"][0]["features"]["cleared"].as_u64().is_some());
+     let run = lines[0]["run_id"].as_str().unwrap();
+     assert_eq!(run.len(), 8);
+     assert!(lines.iter().all(|l| l["run_id"] == run), "同一次运行的记录要带同一个 run_id");

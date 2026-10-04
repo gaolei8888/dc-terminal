@@ -1,0 +1,2472 @@
+# Review package: 1e2b65c..HEAD
+
+## Commits
+a4c2013 feat(game): ask-bench reads labelled question files and reports good and bad picks
+3e3f96e feat(game): stall detection watches the goal number named by --goal-number instead of any number
+629fd3d feat(game): six steps without the on-screen numbers dropping is a stall: recorded, said in plain words, and the model is asked
+42bc5d2 fix(game): stop re-reading screen text on a dco whose OCR times out; count only all-ASCII-digit texts as numbers
+89a0ed6 feat(game): record the whole-number texts on screen before and after each step as progress
+4774a97 feat(game): record predicted_cleared and observed_changed for every step (compared by colour, not class id)
+d8c0a0b fix(game): do not tell the model about triggered special candies (a guess from a marker that cages also set); warn that markers may be wrong
+37ecd4b feat(game): cells of a refused swap stay off-limits until the board changes; five refusals in a row before stopping
+6c18928 docs(game): implementation plan for game-agnostic feedback mechanisms
+
+## Files changed
+ crates/dct-game/src/ask.rs                         |  14 +-
+ crates/dct-game/src/dco.rs                         |  17 +-
+ crates/dct-game/src/dco_tests.rs                   |  38 ++
+ crates/dct-game/src/navigate.rs                    |  10 +-
+ crates/dct-game/src/play.rs                        | 119 +++-
+ crates/dct-game/src/play_tests.rs                  | 343 +++++++++-
+ .../2026-10-04-dct-match3-generic-feedback.md      | 699 +++++++++++++++++++++
+ src/game/bench.rs                                  | 100 ++-
+ src/game/cli.rs                                    |  26 +-
+ src/game/skill.md                                  |   2 +
+ src/game/text.rs                                   |  11 +
+ src/main.rs                                        |   2 +-
+ tests/game_cli.rs                                  |   4 +-
+ 13 files changed, 1337 insertions(+), 48 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/ask.rs b/crates/dct-game/src/ask.rs
+index 8adffb8..037b04b 100644
+--- a/crates/dct-game/src/ask.rs
++++ b/crates/dct-game/src/ask.rs
+@@ -65,34 +65,32 @@ pub fn describe_move(mv: &Move) -> String {
+ }
+ 
+ pub fn describe(c: &Candidate) -> String {
+     let f = &c.features;
+     let mut s = format!("{}，消 {} 颗", describe_move(&c.mv), f.cleared);
+     for (n, what) in [(f.striped, "条纹糖"), (f.wrapped, "包装糖"), (f.bomb, "彩色炸弹")] {
+         if n > 0 {
+             s += &format!("，做出{what}");
+         }
+     }
+-    if f.triggered > 0 {
+-        s += &format!("，引爆 {} 颗特殊糖", f.triggered);
+-    }
+     s
+ }
+ 
+ pub fn prompt_text(i: &AskInput) -> String {
+     let mut s = format!(
+         "三消游戏，棋盘如下（字母是不同颜色的糖，# 是不能动的格子）：\n{}\n\n目标：{}。\n",
+         i.board, i.goal
+     );
+     if !i.failed.is_empty() {
+         s += &format!("这些换不动：\n{}\n", i.failed.join("\n"));
+     }
++    s += "提醒：棋盘上的特殊标记不一定准，不要因为它就选某一步。\n";
+     s += "下面是可以走的几步，选对目标最有帮助的一步：\n";
+     for (k, c) in i.candidates.iter().enumerate() {
+         s += &format!("{}) {}\n", k + 1, c);
+     }
+     s += "只回答一个编号，后面可以跟一句理由；都不合适就回 0。";
+     s
+ }
+ 
+ /// 先去掉所有写完的 `<think>…</think>`；还剩没关的 `<think>`（回答被截断）就当没答。
+ /// 编号只认开头的那串数字（1 起），在 1..=n 里才算；其余（0、越界、开头不是数字、太长）都是 `None`。
+@@ -141,41 +139,41 @@ mod tests {
+     }
+ 
+     #[test]
+     fn board_text_uses_letters_in_reading_order_and_hash_for_fixed() {
+         // 类别号会变，所以字母按「先出现的先给 A」排；fixed 的类别画 #
+         let g = grid(&[&[7, 7, 3], &[3, 9, 7]]);
+         assert_eq!(board_text(&g, &[9]), "A A B\nB # A");
+     }
+ 
+     #[test]
+-    fn describe_counts_rows_and_columns_from_one_and_names_what_happens() {
++    fn describe_counts_rows_and_columns_from_one_and_names_only_what_can_be_seen() {
+         let f = Outcome { cleared: 7, bomb: 1, triggered: 2, ..Default::default() };
+-        assert_eq!(
+-            describe(&cand((0, 3), (1, 3), f)),
+-            "第 1 行第 4 列和第 2 行第 4 列互换，消 7 颗，做出彩色炸弹，引爆 2 颗特殊糖"
+-        );
++        let s = describe(&cand((0, 3), (1, 3), f));
++        assert_eq!(s, "第 1 行第 4 列和第 2 行第 4 列互换，消 7 颗，做出彩色炸弹");
++        assert!(!s.contains("引爆"), "引爆靠特殊标记猜，不可靠，不能发给模型");
+     }
+ 
+     #[test]
+     fn prompt_lists_numbered_candidates_goal_and_failed_swaps() {
+         let i = AskInput {
+             board: "A A\nB B".into(),
+             goal: "清掉冰块".into(),
+             candidates: vec!["甲".into(), "乙".into()],
+             failed: vec!["丙".into()],
+         };
+         let p = prompt_text(&i);
+         assert!(p.contains("A A\nB B"));
+         assert!(p.contains("目标：清掉冰块"));
+         assert!(p.contains("1) 甲\n2) 乙"));
+         assert!(p.contains("这些换不动：\n丙"));
++        assert!(p.contains("特殊标记不一定准"));
+         // 没有失败清单时不写这一段
+         let p2 = prompt_text(&AskInput { failed: vec![], ..i });
+         assert!(!p2.contains("换不动"));
+     }
+ 
+     #[test]
+     fn parse_reply_takes_the_first_number_inside_range() {
+         assert_eq!(parse_reply("3", 5), (Some(2), String::new()));
+         assert_eq!(parse_reply("2，因为能消更多", 5), (Some(1), "因为能消更多".into()));
+         assert_eq!(parse_reply("选 4 号：做出炸弹", 5).0, None);
+diff --git a/crates/dct-game/src/dco.rs b/crates/dct-game/src/dco.rs
+index 0719b2e..a495cc3 100644
+--- a/crates/dct-game/src/dco.rs
++++ b/crates/dct-game/src/dco.rs
+@@ -11,20 +11,22 @@ use std::time::Duration;
+ 
+ /// dco 一次回话最多等多久。
+ pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+ pub struct DcoClient {
+     r: BufReader<UnixStream>,
+     w: UnixStream,
+     next_id: u64,
+     /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
+     no_show_status: bool,
++    /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
++    no_see_text: bool,
+ }
+ 
+ fn err(code: &str, message: impl Into<String>) -> DcoError {
+     DcoError { code: code.into(), message: message.into() }
+ }
+ 
+ /// 读写出错：超时单独说，别的都当作 dco 断开了。
+ fn io_err(e: &std::io::Error) -> DcoError {
+     match e.kind() {
+         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+@@ -48,21 +50,21 @@ impl DcoClient {
+             .ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
+         let socket = endpoint["socket"].as_str().ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
+         let token = std::fs::read_to_string(dir.join("token")).map_err(|_| err("dco_down", "读不到 dco 的钥匙文件，dco 还没启动过？"))?;
+         let stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
+             std::io::ErrorKind::PermissionDenied => err("dco_blocked", "这里不让连 dco"),
+             _ => err("dco_down", "dco 没在运行，先打开 dco 再试"),
+         })?;
+         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
+         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
+         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
+-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false };
++        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false };
+         c.send(&json!({ "dco_token": token.trim() }))?;
+         let ack = c.read_line()?;
+         if ack.get("ok") != Some(&Value::Bool(true)) {
+             return Err(err("dco_refused", "dco 拒绝了连接"));
+         }
+         let init = c.request("initialize", json!({
+             "protocolVersion": "2025-06-18", "capabilities": {},
+             "clientInfo": { "name": "dct", "version": env!("CARGO_PKG_VERSION") }
+         }))?;
+         let _ = init;
+@@ -133,21 +135,32 @@ impl Dco for DcoClient {
+ 
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError> {
+         self.call("swipe", json!({
+             "window": p.window,
+             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+         }))
+         .map(|_| ())
+     }
+ 
+     fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
+-        let body = self.call("see", json!({ "window": p.window, "source": "ocr" }))?;
++        if self.no_see_text {
++            return Err(err("unsupported", "这个 dco 不会认画面上的字"));
++        }
++        let body = match self.call("see", json!({ "window": p.window, "source": "ocr" })) {
++            Ok(b) => b,
++            Err(e) => {
++                if e.code == "dco_too_old" || e.code == "dco_timeout" {
++                    self.no_see_text = true;
++                }
++                return Err(e);
++            }
++        };
+         let elements = body["elements"]
+             .as_array()
+             .map(|a| {
+                 a.iter()
+                     .filter_map(|e| Some(Element { id: e["id"].as_str()?.to_string(), text: e["text"].as_str().unwrap_or("").to_string() }))
+                     .collect()
+             })
+             .unwrap_or_default();
+         Ok(Seen {
+             snapshot_id: body["snapshot_id"].as_str().unwrap_or("").to_string(),
+diff --git a/crates/dct-game/src/dco_tests.rs b/crates/dct-game/src/dco_tests.rs
+index 7f0d6b4..910412f 100644
+--- a/crates/dct-game/src/dco_tests.rs
++++ b/crates/dct-game/src/dco_tests.rs
+@@ -371,10 +371,48 @@ fn a_show_status_timeout_is_not_paid_twice() {
+         }
+     });
+     let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+     c.show_status("think");
+     let t = std::time::Instant::now();
+     c.show_status("look");
+     assert!(t.elapsed() < std::time::Duration::from_millis(100));
+     drop(c);
+     assert_eq!(h.join().unwrap(), 1);
+ }
++
++#[test]
++fn a_see_text_timeout_is_not_paid_twice() {
++    let dir = tempfile::tempdir().unwrap();
++    let sock = dir.path().join("dco.sock");
++    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
++    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
++    let l = UnixListener::bind(&sock).unwrap();
++    let h = std::thread::spawn(move || {
++        let (s, _) = l.accept().unwrap();
++        let mut w = s.try_clone().unwrap();
++        let mut r = BufReader::new(s);
++        let mut line = String::new();
++        r.read_line(&mut line).unwrap();
++        writeln!(w, r#"{{"ok":true}}"#).unwrap();
++        let mut tool_calls = 0;
++        loop {
++            line.clear();
++            if r.read_line(&mut line).unwrap() == 0 {
++                return tool_calls;
++            }
++            let req: Value = serde_json::from_str(line.trim()).unwrap();
++            let Some(id) = req.get("id") else { continue };
++            if req["method"] == "tools/call" {
++                tool_calls += 1; // 不回话：让客户端超时
++                continue;
++            }
++            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {}})).unwrap();
++        }
++    });
++    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
++    assert_eq!(c.see_text(&profile()).err().unwrap().code, "dco_timeout");
++    let t = std::time::Instant::now();
++    assert_eq!(c.see_text(&profile()).err().unwrap().code, "unsupported");
++    assert!(t.elapsed() < std::time::Duration::from_millis(100));
++    drop(c);
++    assert_eq!(h.join().unwrap(), 1);
++}
+diff --git a/crates/dct-game/src/navigate.rs b/crates/dct-game/src/navigate.rs
+index 79f37d5..5c10864 100644
+--- a/crates/dct-game/src/navigate.rs
++++ b/crates/dct-game/src/navigate.rs
+@@ -10,20 +10,22 @@ use serde_json::{json, Value};
+ pub struct NavOptions<'a> {
+     /// 整个命令一共最多走几步棋（不是每一局）。
+     pub max_steps: usize,
+     /// 整个命令最多点几次“开始 / 再来一次”；点一次「开始」或「再来一次」算一次；点了「再来一次」之后紧跟着的那个 Play 是同一次重来，不另算。
+     pub tries: usize,
+     pub dry_run: bool,
+     pub advisor: Option<&'a dyn Advisor>,
+     pub ask_always: bool,
+     pub ask_budget: usize,
+     pub goal: &'a str,
++    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
++    pub goal_index: Option<usize>,
+ }
+ 
+ const AFTER_TAP_FIRST_MS: u64 = 400;
+ const POLL_MS: u64 = 300;
+ const CHANGE_GIVE_UP_MS: u64 = 8_000;
+ /// 整个命令里点按钮的总次数上限：防止两个弹窗互相弹来弹去停不下来。
+ const MAX_TAPS: usize = 40;
+ 
+ fn texts(seen: &Seen) -> Vec<String> {
+     seen.elements.iter().map(|e| e.text.clone()).collect()
+@@ -146,21 +148,21 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
+                     Some(g) => Ok(g),
+                     None => dco.read_grid(p),
+                 };
+                 match grid {
+                     Ok(g) if looks_like_board(&g) => {
+                         let remaining = o.max_steps.saturating_sub(steps);
+                         // 这个画面的字是以后“像棋盘”判断的证据。
+                         sink(nav_record(clock, &seen, "board", None, "entered"));
+                         expect_board = false;
+                         // after_board 不用在这里清：play 返回后要么 break，要么马上重新置 true，中间没人读它。
+-                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal }, sink);
++                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal, goal_index: o.goal_index }, sink);
+                         steps += s.steps;
+                         match s.stop {
+                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
+                             Stop::NoGrid(_) | Stop::ClassesChanged { .. } => {
+                                 // 一步都没走：这个画面从来不是我们玩过的棋盘，停，免得原地打转。
+                                 if s.steps == 0 {
+                                     sink(nav_record(clock, &seen, "unknown", None, "stopped"));
+                                     break Stop::UnknownScreen(texts(&seen));
+                                 }
+                                 // 步数刚好在一局结束时用完：看一眼是什么画面再停，什么都不点。
+@@ -364,21 +366,21 @@ mod tests {
+     fn profile() -> Profile {
+         Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None }
+     }
+ 
+     fn run(w: &mut World, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
+         run_with(w, 50, tries, dry)
+     }
+ 
+     fn run_with(w: &mut World, max_steps: usize, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
+         let mut log = vec![];
+-        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+         (s, log)
+     }
+ 
+     fn assert_stopped_with_texts(log: &[Value]) {
+         let last = log.iter().rfind(|r| r["kind"] == "nav").unwrap();
+         assert_eq!(last["outcome"], "stopped");
+         assert!(!last["texts"].as_array().unwrap().is_empty());
+     }
+ 
+     fn text(t: &[&'static str]) -> Frame {
+@@ -512,21 +514,21 @@ mod tests {
+         let mut w = World::new(vec![text(&["Play"]), board(DEAD)]);
+         w.tap_error = Some(DcoError { code: "needs_ticket".into(), message: "x".into() });
+         let (s, _) = run(&mut w, 5, false);
+         assert_eq!(s.stop, Stop::Dco(DcoError { code: "needs_ticket".into(), message: "x".into() }));
+     }
+ 
+     #[test]
+     fn the_step_budget_is_shared_across_levels() {
+         let mut w = World::new(vec![board(A), board(A)]);
+         let mut log = vec![];
+-        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+         assert_eq!(s.steps, 1);
+         assert_eq!(s.stop, Stop::StepsDone);
+     }
+ 
+     #[test]
+     fn dismissals_do_not_use_up_the_retry_budget() {
+         let mut w = World::new(vec![text(&["Not now"]), text(&["Got it"]), text(&["Daily Stamps", "Play"]), board(DEAD)]);
+         let (s, _) = run(&mut w, 1, false);
+         assert_eq!(s.stop, Stop::NoMoves);
+         assert_eq!(w.taps, ["Not now", "Got it", "Play"]);
+@@ -696,21 +698,21 @@ mod tests {
+ 
+     // ---- 画面上的关卡号标签 + 合格棋盘 = 棋盘（不过 OCR 分类） ----
+ 
+     const HUD: &[&str] = &["10", "1714/♥4", "39", "￥124"];
+ 
+     fn labelled() -> Profile {
+         Profile { level_pattern: Some(r"(\d{3,5})\s*/".into()), ..profile() }
+     }
+ 
+     fn run_profile(w: &mut World, p: &Profile) -> Summary {
+-        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {})
++        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {})
+     }
+ 
+     #[test]
+     fn a_hud_with_the_level_label_and_a_valid_board_is_played_even_if_an_icon_reads_as_a_price() {
+         let mut w = World::new(vec![Frame::TextGrid(HUD.to_vec(), grid(A)), board(DEAD)]);
+         let s = run_profile(&mut w, &labelled());
+         assert_eq!(s.stop, Stop::NoMoves);
+         assert_eq!(w.swipes, 1);
+         assert!(w.taps.is_empty());
+     }
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index b21ca1b..28fb009 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -35,20 +35,50 @@ pub struct DcoError {
+ pub struct Seen {
+     pub snapshot_id: String,
+     pub observation_id: Option<String>,
+     pub elements: Vec<Element>,
+ }
+ 
+ fn unsupported() -> DcoError {
+     DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+ }
+ 
++/// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。
++/// 「1716/♥5」这种夹着别的字的不要。哪个数是目标，这里不猜；只记下来。
++pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
++    seen.elements
++        .iter()
++        .filter_map(|e| {
++            let t = e.text.trim();
++            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
++                return None;
++            }
++            t.parse::<u64>().ok()
++        })
++        .collect()
++}
++
++/// 连着这么多步目标数字都没下降，就算停滞。
++pub const STALL_STEPS: usize = 6;
++
++/// 目标那个数字下降了才算「下降」。两张清单个数不同（OCR 漏读了一个）、或者序号越界，都算「不知道」，返回 `None`。
++pub(crate) fn goal_dropped(before: &[u64], after: &[u64], goal: usize) -> Option<bool> {
++    if before.len() != after.len() || goal >= before.len() {
++        return None;
++    }
++    Some(after[goal] < before[goal])
++}
++
++fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
++    dco.see_text(p).ok().map(|s| numbers(&s))
++}
++
+ pub trait Dco {
+     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+     /// 坐标是窗口比例（0～1）。
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+     /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
+     fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
+         Err(unsupported())
+     }
+     /// 点 `see_text` 读到的某个元素。dco 自己按那个元素上的字定档，带价格的会拒绝。
+     fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
+@@ -59,31 +89,35 @@ pub trait Dco {
+     fn show_status(&mut self, _state: &str) {}
+ }
+ 
+ pub trait Clock {
+     fn now_ms(&self) -> u64;
+     fn sleep_ms(&mut self, ms: u64);
+ }
+ 
+ /// 最多发给模型几个候选。
+ pub const ASK_SHOWN: usize = 8;
++/// 连着最多几次「划了没反应」才停。被拒绝的格子在棋盘变化前不再被选，所以多试几次不会重复同一处。
++pub const MAX_REFUSED_IN_A_ROW: usize = 5;
+ 
+ pub struct Options<'a> {
+     pub max_steps: usize,
+     pub dry_run: bool,
+     /// 规则没把握时问的那个。`None` = 不问（和以前一样）。
+     pub advisor: Option<&'a dyn Advisor>,
+     /// 每一步都问（`--ask-every-step`）；否则只在这盘棋上已有失败的步时才问。
+     pub ask_always: bool,
+     /// 这一次 `play()` 最多问几次。
+     pub ask_budget: usize,
+     pub goal: &'a str,
++    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
++    pub goal_index: Option<usize>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Stop {
+     /// 读不出棋盘（含：类别太多，多半是弹了窗）。
+     NoGrid(String),
+     /// 类别比开始时多出两个以上：多半这关结束了、弹了窗。
+     ClassesChanged { was: usize, now: usize },
+     NoMoves,
+     /// 连着两次划了没反应。
+@@ -143,20 +177,44 @@ pub(crate) fn canonical(cells: &[Vec<u16>]) -> Vec<Vec<u16>> {
+         })
+         .collect()
+ }
+ 
+ /// 只比较分组。`odd`（特殊糖标记）会跟着游戏的提示光晕和掉落动画闪，
+ /// 不能算成「棋盘变了」，否则没效果的一步会被当成有效，停不下来。
+ fn same(a: &GridRead, b: &GridRead) -> bool {
+     canonical(&a.cells) == canonical(&b.cells)
+ }
+ 
++/// 同一格划前划后的颜色相差不到这个就当没变（dco 的类别号每次读都会变，所以比颜色，不比编号）。
++const COLOUR_SAME_DE: f64 = 12.0;
++
++fn rgb_of(g: &GridRead, id: u16) -> Option<[u8; 3]> {
++    g.classes.iter().find(|c| c.id == id).and_then(|c| c.rgb)
++}
++
++/// 划前划后有几格颜色变了。行列数不同或任何一格拿不到颜色就是 `None`（不能当 0）。
++pub(crate) fn changed_cells(a: &GridRead, b: &GridRead) -> Option<usize> {
++    if a.rows != b.rows || a.cols != b.cols {
++        return None;
++    }
++    let mut n = 0;
++    for (ra, rb) in a.cells.iter().zip(&b.cells) {
++        for (ca, cb) in ra.iter().zip(rb) {
++            let (x, y) = (rgb_of(a, *ca)?, rgb_of(b, *cb)?);
++            if crate::lab::delta_e(x, y) > COLOUR_SAME_DE {
++                n += 1;
++            }
++        }
++    }
++    Some(n)
++}
++
+ const FIRST_WAIT_MS: u64 = 150;
+ const POLL_MS: u64 = 100;
+ const NO_CHANGE_MS: u64 = 3_000;
+ const GIVE_UP_MS: u64 = 8_000;
+ /// “没步可走”“画面变了”下结论前的停顿：出口还在一个个往下补糖，特效也会让颜色数暂时跳高，
+ /// 马上读到的往往是中间状态。
+ const CONFIRM_PAUSE_MS: u64 = 1_500;
+ /// 连着最多确认几次“没步可走”：盘面一直在变却始终没有步，也不能无限等。
+ const MAX_NO_MOVE_CONFIRMS: usize = 2;
+ 
+@@ -213,22 +271,25 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
+     let [x, y, w, h] = p.region;
+     (x + (c as f64 + 0.5) / p.cols as f64 * w, y + (r as f64 + 0.5) / p.rows as f64 * h)
+ }
+ 
+ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
+     let mut steps = 0;
+     let mut baseline: Option<usize> = None;
+     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+     let mut asked = 0usize;
+     let mut streak = 0;
++    let mut locked: Vec<(usize, usize)> = Vec::new();
+     let mut current: Option<GridRead> = None;
+     let mut no_move_confirms = 0;
++    let mut no_progress = 0usize;
++    let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
+     let stop = loop {
+         if steps >= o.max_steps {
+             break Stop::StepsDone;
+         }
+         let t_read = clock.now_ms();
+         let g = match current.take() {
+             Some(g) => g,
+             None => match dco.read_grid(p) {
+                 Ok(g) => g,
+                 Err(e) if e.code == "not_a_grid" => break Stop::NoGrid(e.message),
+@@ -264,21 +325,25 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         }
+         let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de), !p.fixed_rgb.is_empty()) else {
+             break Stop::NoGrid("棋盘的行列数对不上".into());
+         };
+         // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。
+         // 只在问模型（慢）的那段时间发 think/look。
+         let t_choose = clock.now_ms();
+         let cands: Vec<Candidate> = choose(&board, &p.weights);
+         let choose_ms = clock.now_ms().saturating_sub(t_choose);
+         // 同一盘棋上划了没反应的步，不再重复选。
+-        let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
++        let board_key = canonical(&g.cells);
++        let blocked = |c: &Candidate| {
++            failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key) || locked.contains(&c.mv.a) || locked.contains(&c.mv.b)
++        };
++        let pick = cands.iter().position(|c| !blocked(c));
+         if cands.is_empty() && !o.dry_run && no_move_confirms < MAX_NO_MOVE_CONFIRMS {
+             // 补糖还没补完时会有一瞬间没步可走：停一下再读，盘面变了或有步了就接着玩。
+             no_move_confirms += 1;
+             clock.sleep_ms(CONFIRM_PAUSE_MS);
+             match dco.read_grid(p) {
+                 Ok(re) => {
+                     if same(&re, &g) && !has_move(p, &re) {
+                         break Stop::NoMoves;
+                     }
+                     current = Some(re);
+@@ -288,28 +353,26 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+                 Err(e) => break Stop::Dco(e),
+             }
+         }
+         let Some(pick) = pick else {
+             break if cands.is_empty() { Stop::NoMoves } else { Stop::Stuck };
+         };
+         let mut pick = pick;
+         let mut ask_rec: Option<Value> = None;
+         let mut decider = "rules";
+         if let Some(adv) = o.advisor {
+-            let board_key = canonical(&g.cells);
+             // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
+             let offered: Vec<usize> = {
+-                let is_failed = |c: &Candidate| failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key);
+-                (0..cands.len()).filter(|&i| !is_failed(&cands[i])).take(ASK_SHOWN).collect()
++                (0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()
+             };
+             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
+-            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
++            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here || no_progress >= STALL_STEPS) {
+                 asked += 1;
+                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
+                 let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
+                 let input = AskInput {
+                     board: board_text(&g, &fixed),
+                     goal: o.goal.to_string(),
+                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
+                     failed: failed_now.clone(),
+                 };
+                 dco.show_status("think");
+@@ -334,21 +397,25 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+             "schema": 1, "time_ms": clock.now_ms(),
+             "observation_id": g.observation_id, "observed_at_ms": g.observed_at_ms, "frame_age_ms": g.frame_age_ms,
+             "rows": g.rows, "cols": g.cols, "cells": g.cells, "odd": g.odd, "classes": g.classes,
+             "candidates": cands.iter().map(|c| json!({
+                 "a": [c.mv.a.0, c.mv.a.1], "b": [c.mv.b.0, c.mv.b.1], "score": c.score,
+                 "features": {
+                     "cleared": c.features.cleared, "cascade": c.features.cascade, "striped": c.features.striped,
+                     "wrapped": c.features.wrapped, "bomb": c.features.bomb, "triggered": c.features.triggered,
+                     "special_swap": c.features.special_swap, "lowest_row": c.features.lowest_row } })).collect::<Vec<_>>(),
+             "chosen": pick, "decider": decider, "dry_run": o.dry_run, "swiped": false,
++            "predicted_cleared": chosen.features.cleared + chosen.features.cascade,
+         });
++        if no_progress >= STALL_STEPS {
++            rec["stalled"] = json!(true);
++        }
+         if let Some(a) = ask_rec {
+             rec["ask"] = a;
+         }
+         if o.dry_run {
+             rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": 0, "settle": 0 });
+             rec["outcome"] = json!("dry_run");
+             sink(rec);
+             break Stop::DryRun;
+         }
+         // 端点和起始时刻原样记进记录，章鱼叠加层的事件日志靠它跟 dct 真做的对账（窗口 0–1 比例）。
+@@ -368,44 +435,82 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         steps += 1;
+         no_move_confirms = 0;
+         rec["swiped"] = json!(true);
+         let t_settle = clock.now_ms();
+         let result = settle(dco, clock, p, &g);
+         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+         match result {
+             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+             Settle::Settled(next) if same(&next, &g) => {
+                 rec["outcome"] = json!("no_change");
++                rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(next.observation_id);
++                let progress_after = read_numbers(dco, p);
++                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
++                    match goal_dropped(b, a, gi) {
++                        Some(true) => no_progress = 0,
++                        Some(false) => no_progress += 1,
++                        None => {}
++                    }
++                }
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+-                if streak >= 2 {
++                locked.push(chosen.mv.a);
++                locked.push(chosen.mv.b);
++                if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
++                rec["observed_changed"] = json!(changed_cells(&g, &next));
+                 rec["after_observation_id"] = json!(next.observation_id);
++                let progress_after = read_numbers(dco, p);
++                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
++                    match goal_dropped(b, a, gi) {
++                        Some(true) => no_progress = 0,
++                        Some(false) => no_progress += 1,
++                        None => {}
++                    }
++                }
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                progress_prev = progress_after;
+                 sink(rec);
+                 streak = 0;
+                 failed.clear();
++                locked.clear();
+                 current = Some(next);
+             }
+             Settle::NoChange(same_board) => {
+                 rec["outcome"] = json!("no_change");
++                rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(same_board.observation_id);
++                let progress_after = read_numbers(dco, p);
++                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
++                    match goal_dropped(b, a, gi) {
++                        Some(true) => no_progress = 0,
++                        Some(false) => no_progress += 1,
++                        None => {}
++                    }
++                }
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+-                if streak >= 2 {
++                locked.push(chosen.mv.a);
++                locked.push(chosen.mv.b);
++                if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(same_board);
+             }
+             Settle::StillMoving => {
+                 rec["outcome"] = json!("stopped");
+                 sink(rec);
+                 break Stop::StillMoving;
+             }
+             Settle::NoGrid(why) => {
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index a32fd6e..b17d67f 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -17,24 +17,25 @@ fn grid(cells: &[&[u16]]) -> GridRead {
+ }
+ 
+ struct Fake {
+     reads: VecDeque<Result<GridRead, DcoError>>,
+     last: Option<Result<GridRead, DcoError>>,
+     swipes: Vec<((f64, f64), (f64, f64))>,
+     swipe_err: Option<DcoError>,
+     /// show_status 和 swipe 按先后记下来，测 play() 不发状态。
+     events: Vec<String>,
+     reads_taken: usize,
++    texts: VecDeque<Vec<&'static str>>,
+ }
+ impl Fake {
+     fn new(reads: Vec<Result<GridRead, DcoError>>) -> Fake {
+-        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0 }
++        Fake { reads: reads.into(), last: None, swipes: vec![], swipe_err: None, events: vec![], reads_taken: 0, texts: VecDeque::new() }
+     }
+ }
+ impl Dco for Fake {
+     fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
+         self.reads_taken += 1;
+         if let Some(r) = self.reads.pop_front() {
+             self.last = Some(r.clone());
+             return r;
+         }
+         self.last.clone().expect("脚本里一次读盘都没有")
+@@ -43,40 +44,50 @@ impl Dco for Fake {
+         if let Some(e) = self.swipe_err.clone() {
+             return Err(e);
+         }
+         self.swipes.push((f, t));
+         self.events.push("swipe".into());
+         Ok(())
+     }
+     fn show_status(&mut self, state: &str) {
+         self.events.push(state.into());
+     }
++    fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
++        match self.texts.pop_front() {
++            Some(t) => Ok(Seen {
++                snapshot_id: "s".into(),
++                observation_id: None,
++                elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into() }).collect(),
++            }),
++            None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
++        }
++    }
+ }
+ struct Clk(u64);
+ impl Clock for Clk {
+     fn now_ms(&self) -> u64 {
+         self.0
+     }
+     fn sleep_ms(&mut self, ms: u64) {
+         self.0 += ms;
+     }
+ }
+ /// 这些测试里的选步细节（哪一步排第一）是按 Candy Crush 的那套权重写的，所以用它，不用通用默认。
+ fn tuned() -> crate::choose::Weights {
+     crate::choose::Weights { striped: 6.0, wrapped: 8.0, bomb: 15.0, triggered: 5.0, ..Default::default() }
+ }
+ fn profile(rows: usize, cols: usize) -> Profile {
+     Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned(), level_pattern: None }
+ }
+ fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
+     let mut log = vec![];
+-    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     (s, log)
+ }
+ fn err(code: &str) -> DcoError {
+     DcoError { code: code.into(), message: format!("m-{code}") }
+ }
+ 
+ // 每个类别至少出现两次：只有一格的类别按设计算「认不出」，不能换。
+ const A: &[&[u16]] = &[&[1, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 2]]; // 能走：(0,2) 和 (1,2) 对换，第 0 行四连
+ const DEAD: &[&[u16]] = &[&[1, 2, 3, 1], &[3, 1, 2, 3], &[2, 3, 1, 2]]; // 没有任何能走的步（每类都不止一格）
+ const MOVED: &[&[u16]] = DEAD;
+@@ -183,24 +194,24 @@ fn a_clock_that_goes_backwards_does_not_panic() {
+         fn now_ms(&self) -> u64 {
+             self.0.set(self.0.get() + 1);
+             if self.0.get().is_multiple_of(2) { self.1 } else { self.1 + 1_000_000 }
+         }
+         fn sleep_ms(&mut self, ms: u64) {
+             self.1 += ms;
+         }
+     }
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+     let mut log = vec![];
+-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     // 读盘到落定都过了一轮，没有 panic 就行；用一个会倒着走的钟再跑一遍无法落定的情形
+     let mut d = Fake::new(vec![Ok(grid(A))]);
+-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+ }
+ 
+ #[test]
+ fn candidate_features_are_nested_under_features() {
+     let mut d = Fake::new(vec![Ok(grid(A))]);
+     let (_, log) = run(&mut d, 10, true);
+     let c = &log[0]["candidates"][0];
+     for k in ["a", "b", "score", "features"] {
+         assert!(c.get(k).is_some(), "缺 {k}");
+     }
+@@ -474,21 +485,21 @@ fn grid_with_hole_rgb() -> GridRead {
+ type Swipe = ((f64, f64), (f64, f64));
+ fn swipe_cells(p: &Profile, s: &[Swipe]) -> Vec<(usize, usize)> {
+     let [x, y, w, h] = p.region;
+     let cell = |(px, py): (f64, f64)| (((py - y) / h * p.rows as f64).floor() as usize, ((px - x) / w * p.cols as f64).floor() as usize);
+     s.iter().flat_map(|&(f, t)| [cell(f), cell(t)]).collect()
+ }
+ 
+ fn play_holes(fixed_rgb: Vec<[u8; 3]>) -> (Profile, Vec<Swipe>) {
+     let p = Profile { fixed_rgb, ..profile(4, 4) };
+     let mut d = Fake::new(vec![Ok(grid_with_hole_rgb())]);
+-    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+     (p, d.swipes)
+ }
+ 
+ #[test]
+ fn swipes_never_touch_a_cell_whose_colour_is_listed_as_fixed() {
+     let (p, swipes) = play_holes(vec![HOLE]);
+     assert!(!swipes.is_empty(), "除了洞还有别的走法，该划");
+     let fixed = [(0, 2), (3, 0), (3, 3)];
+     assert!(swipe_cells(&p, &swipes).iter().all(|c| !fixed.contains(c)), "{swipes:?}");
+ }
+@@ -504,21 +515,21 @@ fn without_the_fixed_list_the_same_grid_swipes_a_hole() {
+ 
+ fn r4(v: f64) -> f64 {
+     (v * 10000.0).round() / 10000.0
+ }
+ 
+ #[test]
+ fn the_record_carries_the_real_swipe_points_start_and_duration() {
+     let p = profile(3, 4);
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+     let mut log = vec![];
+-    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     let (f, t) = d.swipes[0];
+     let sw = &log[0]["swipe"];
+     assert_eq!(sw["from"], json!([r4(f.0), r4(f.1)]));
+     assert_eq!(sw["to"], json!([r4(t.0), r4(t.1)]));
+     // 端点就是选中那步两格的中心
+     let c = &log[0]["candidates"][log[0]["chosen"].as_u64().unwrap() as usize];
+     let (a, b) = (c["a"].as_array().unwrap(), c["b"].as_array().unwrap());
+     let [x, y, w, h] = p.region;
+     let ctr = |r: u64, c: u64| json!([r4(x + (c as f64 + 0.5) / 4.0 * w), r4(y + (r as f64 + 0.5) / 3.0 * h)]);
+     assert_eq!(sw["from"], ctr(a[0].as_u64().unwrap(), a[1].as_u64().unwrap()));
+@@ -580,21 +591,21 @@ fn a_changed_odd_flag_alone_is_not_a_changed_board() {
+ }
+ 
+ /// 2026-10-03 真机第 1714 关的顶行：蛋 蓝 红 蓝 蓝 绿 橙 绿 蛋。红和橙全盘各只有一个，
+ /// 唯一的走法是红和左边的蓝对换凑三蓝。配置列了「不是糖」的颜色就该走；没列就是旧规则，一格的类别不能换。
+ #[test]
+ fn a_one_cell_candy_may_move_once_the_profile_lists_the_not_candies() {
+     const ROW: &[&[u16]] = &[&[0, 1, 2, 1, 1, 3, 4, 3, 0]];
+     let go = |fixed_rgb: Vec<[u8; 3]>| {
+         let mut d = Fake::new(vec![Ok(grid(ROW))]);
+         let p = Profile { fixed_rgb, ..profile(1, 9) };
+-        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+         s.stop
+     };
+     assert_ne!(go(vec![[196, 148, 101]]), Stop::NoMoves);
+     assert_eq!(go(vec![]), Stop::NoMoves);
+ }
+ 
+ // ---- “没步可走”和“画面变了”要停一下再读一遍才算数 ----
+ 
+ const DEAD2: &[&[u16]] = &[&[3, 3, 2, 2], &[2, 1, 1, 2], &[3, 1, 1, 3]]; // 另一种分组，同样没步可走
+ 
+@@ -605,21 +616,21 @@ fn no_moves_that_a_refill_fixes_is_not_the_end() {
+     let (s, log) = run(&mut d, 1, false);
+     assert_eq!(s.stop, Stop::StepsDone);
+     assert_eq!(d.swipes.len(), 1);
+     assert_eq!(log.len(), 1, "确认读不算一步，不写步骤记录");
+ }
+ 
+ #[test]
+ fn no_moves_confirmed_by_an_identical_second_read_stops_after_one_confirmation() {
+     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+     let mut clk = Clk(0);
+-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+     assert_eq!(s.stop, Stop::NoMoves);
+     assert_eq!(d.reads_taken, 2);
+     assert_eq!(clk.0, 1_500);
+ }
+ 
+ #[test]
+ fn a_board_that_keeps_changing_without_a_move_stops_after_two_confirmations() {
+     let mut reads = vec![];
+     for i in 0..50 {
+         reads.push(Ok(grid(if i % 2 == 0 { DEAD } else { DEAD2 })));
+@@ -644,21 +655,21 @@ fn a_colour_jump_that_stays_on_the_reread_is_a_changed_screen() {
+     let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[4, 5, 3, 1]];
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(five)), Ok(grid(five))]);
+     let (s, _) = run(&mut d, 10, false);
+     assert!(matches!(s.stop, Stop::ClassesChanged { was: 3, now: 5 }), "{:?}", s.stop);
+ }
+ 
+ #[test]
+ fn a_dry_run_does_not_pause_or_reread() {
+     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+     let mut clk = Clk(0);
+-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+     assert_eq!(s.stop, Stop::NoMoves);
+     assert_eq!(d.reads_taken, 1);
+     assert_eq!(clk.0, 0);
+ }
+ 
+ #[test]
+ fn a_swap_the_game_bounces_back_is_no_change() {
+     // 被笼子锁住的糖：划下去先动一下（读到 MOVED），又弹回 A 并落定。落定后和划之前一样，算没反应，连着两次就停。
+     let mut reads = vec![Ok(grid(A)), Ok(grid(MOVED))];
+     for _ in 0..400 {
+@@ -707,22 +718,25 @@ impl Advisor for Gone {
+     }
+ }
+ struct Down;
+ impl Advisor for Down {
+     fn pick(&self, _: &AskInput) -> Option<Advice> {
+         None
+     }
+ }
+ 
+ fn run_ask(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize) -> (Summary, Vec<Value>) {
++    run_ask_goal(d, adv, always, budget, steps, None)
++}
++fn run_ask_goal(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize, gi: Option<usize>) -> (Summary, Vec<Value>) {
+     let mut log = vec![];
+-    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰" };
++    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰", goal_index: gi };
+     let s = play(d, &mut Clk(0), &profile(3, 4), &o, &mut |v| log.push(v));
+     (s, log)
+ }
+ fn settled_script() -> Vec<Result<GridRead, DcoError>> {
+     vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]
+ }
+ 
+ #[test]
+ fn ask_always_lets_the_model_pick_among_candidates_and_records_it() {
+     // 先看规则自己会划哪一步
+@@ -752,29 +766,33 @@ fn without_ask_always_the_model_is_not_asked_on_a_clean_board() {
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run_ask(&mut d, Some(&say), false, 30, 1);
+     assert_eq!(say.calls.get(), 0);
+     assert_eq!(log[0]["decider"], "rules");
+     assert!(log[0].get("ask").is_none());
+ }
+ 
+ #[test]
+ fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
+     // 第一划没反应（A 一直不变），第二次选步时这盘棋上已有失败的步：问模型，失败的步在 failed 里、不在候选里
++    // （用 MANY：被拒绝的步锁住两格以后，棋盘上还得有至少两个不碰这两格的候选，模型才会被问）
+     let mut reads = vec![];
+     for _ in 0..40 {
+-        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(MANY)));
+     }
+-    reads.push(Ok(grid(MOVED)));
+-    reads.push(Ok(grid(MOVED)));
++    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
++    reads.push(Ok(grid(moved)));
++    reads.push(Ok(grid(moved)));
+     let say = Say::new(Some(0));
+     let mut d = Fake::new(reads);
+-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 2);
++    let mut log = vec![];
++    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰", goal_index: None };
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &o, &mut |v| log.push(v));
+     assert!(say.calls.get() >= 1);
+     let seen = say.seen.borrow();
+     assert_eq!(seen[0].failed.len(), 1);
+     assert!(!seen[0].candidates.iter().any(|c| *c == seen[0].failed[0]));
+     assert_eq!(log[0]["decider"], "rules");
+     assert_eq!(log[1]["decider"], "model");
+     // 模型回的是「候选里的第 1 个」；要靠 offered 映射回 cands，不能直接当 cands 下标，否则又选回刚失败的那步
+     assert_ne!(log[1]["chosen"], log[0]["chosen"]);
+     assert_ne!(log[1]["swipe"]["from"], log[0]["swipe"]["from"]);
+     let refused = log[0]["chosen"].clone();
+@@ -863,10 +881,307 @@ fn a_single_candidate_is_never_worth_asking_about() {
+ fn a_choice_outside_the_offered_list_falls_back_to_rules_and_is_recorded() {
+     let mut d0 = Fake::new(settled_script());
+     let _ = run_ask(&mut d0, None, false, 30, 1);
+     let say = Say::new(Some(99));
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+     assert_eq!(d.swipes[0], d0.swipes[0]);
+     assert_eq!(log[0]["decider"], "rules");
+     assert!(log[0]["ask"]["choice"].is_null());
+ }
++
++#[test]
++fn after_a_refused_swap_no_later_candidate_touches_its_two_cells() {
++    // 一直读到同一张盘（没变化）：第一步被拒绝以后，第二步选的步不碰第一步的两个格子
++    let mut reads = vec![];
++    for _ in 0..80 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
++    let pos = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
++    assert!(log.len() >= 2, "{log:?}");
++    for i in 1..log.len() {
++        let (ai, bi) = (pos(&log[i], "a"), pos(&log[i], "b"));
++        for j in 0..i {
++            let (aj, bj) = (pos(&log[j], "a"), pos(&log[j], "b"));
++            for p in [&ai, &bi] {
++                assert!(*p != aj && *p != bj, "第 {i} 步碰了被拒绝的格子（第 {j} 步）：{log:?}");
++            }
++        }
++    }
++}
++
++// 6 行 4 列，每行一个互不相干的三连换法（交替用 2/4、1/3，避免竖向连线）
++const MANY: &[&[u16]] = &[
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++];
++
++#[test]
++fn five_refusals_in_a_row_stop_the_run_not_two() {
++    let mut reads = vec![];
++    for _ in 0..400 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
++    assert_eq!(s.stop, Stop::Stuck);
++    assert_eq!(d.swipes.len(), 5, "应该试满 5 次才停");
++}
++
++#[test]
++fn a_move_that_works_unlocks_the_cells() {
++    // 第一步没反应（锁住它的两格），第二步（别处）成功 → 解除；第三步又可以碰第一步的格子
++    let mut reads = vec![];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MANY)));
++    }
++    // 第二次划：变成另一张盘并落定
++    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
++    reads.push(Ok(grid(moved)));
++    reads.push(Ok(grid(moved)));
++    for _ in 0..400 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
++    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
++    assert_eq!(&outcomes[..2], ["no_change", "moved"], "{outcomes:?}");
++}
++
++// 4x4：规则第一名之后，排在第一个「完全不碰」的候选前面，既有只和它共用 a 格的，也有只共用 b 格的候选
++const OVERLAP: &[&[u16]] = &[&[2, 3, 4, 2], &[3, 3, 3, 4], &[3, 4, 3, 3], &[2, 1, 4, 4]];
++
++#[test]
++fn a_refused_swap_locks_both_of_its_cells_even_when_better_candidates_share_only_one() {
++    let mut reads = vec![];
++    for _ in 0..200 {
++        reads.push(Ok(grid(OVERLAP)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
++    assert!(log.len() >= 2, "{log:?}");
++    let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
++    let (a0, b0) = (cell(&log[0], "a"), cell(&log[0], "b"));
++    for k in ["a", "b"] {
++        let p = cell(&log[1], k);
++        assert!(p != a0 && p != b0, "第二步碰了被拒绝的格子：{log:?}");
++    }
++}
++
++#[test]
++fn a_move_that_works_unlocks_cells_that_the_only_remaining_move_needs() {
++    // TWO 上有两个互不相干的步，规则先选下面一行的（低行优先），划了没反应 → 锁住那两格；
++    // 第二步选上面的，成功，盘面变成 AFTER：那里只剩下面那一行的步，要碰被锁过的格子。解锁了才能继续划。
++    const TWO: &[&[u16]] = &[&[1, 1, 2, 1], &[3, 4, 3, 4], &[4, 3, 4, 3], &[5, 5, 6, 5]];
++    const AFTER: &[&[u16]] = &[&[1, 2, 1, 2], &[2, 1, 2, 1], &[3, 4, 3, 4], &[5, 5, 6, 5]];
++    let mut reads = vec![];
++    for _ in 0..40 {
++        reads.push(Ok(grid(TWO)));
++    }
++    reads.push(Ok(grid(AFTER)));
++    reads.push(Ok(grid(AFTER)));
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
++    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
++    // 第三步：规则第一名就是那个碰被锁过的格子的步（没解锁的话它会被跳过）
++    let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
++    let first_cells = [cell(&log[0], "a"), cell(&log[0], "b")];
++    assert!(outcomes.len() >= 3, "{outcomes:?}");
++    assert!(first_cells.contains(&cell(&log[2], "a")) || first_cells.contains(&cell(&log[2], "b")), "第三步该碰第一步的格子：{log:?}");
++    assert!(outcomes[0] == "no_change" && outcomes[1] == "moved", "{outcomes:?}");
++}
++
++fn grid_rgb(cells: &[&[u16]], rgbs: &[(u16, [u8; 3])]) -> GridRead {
++    let rows = cells.len();
++    let cols = cells[0].len();
++    let classes: Vec<Value> = rgbs
++        .iter()
++        .map(|(i, c)| json!({"id": i, "count": cells.iter().flat_map(|r| r.iter()).filter(|&&x| x == *i).count(), "rgb": c}))
++        .collect();
++    serde_json::from_value(json!({"rows": rows, "cols": cols, "cells": cells, "odd": vec![vec![false; cols]; rows], "classes": classes})).unwrap()
++}
++
++#[test]
++fn changed_cells_compares_colours_not_class_ids() {
++    let a = grid_rgb(&[&[1, 2], &[2, 1]], &[(1, [200, 30, 30]), (2, [30, 30, 200])]);
++    let b = grid_rgb(&[&[7, 8], &[8, 7]], &[(7, [200, 30, 30]), (8, [30, 30, 200])]);
++    assert_eq!(changed_cells(&a, &b), Some(0));
++    let c = grid_rgb(&[&[7, 8], &[8, 8]], &[(7, [200, 30, 30]), (8, [30, 30, 200])]);
++    assert_eq!(changed_cells(&a, &c), Some(1));
++}
++
++#[test]
++fn changed_cells_is_none_when_colours_are_missing() {
++    let a = grid(A);
++    assert_eq!(changed_cells(&a, &a), None);
++}
++
++#[test]
++fn records_carry_predicted_and_observed() {
++    let mut d = Fake::new(settled_script());
++    let (_, log) = run(&mut d, 1, false);
++    assert!(log[0]["predicted_cleared"].as_u64().unwrap() >= 3);
++    assert!(log[0].get("observed_changed").is_some());
++}
++
++#[test]
++fn numbers_keeps_only_whole_number_elements_in_order() {
++    let seen = Seen {
++        snapshot_id: "s".into(),
++        observation_id: None,
++        elements: ["1716/♥5", "38", "x", "122", " 7 "].iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
++    };
++    assert_eq!(numbers(&seen), vec![38, 122, 7]);
++}
++
++#[test]
++fn numbers_rejects_signs_separators_non_ascii_digits_and_overflow() {
++    let texts = ["+7", "1,234", "-5", "٣", "", "   ", "1234567890123456789012345", "007"];
++    let seen = Seen {
++        snapshot_id: "s".into(),
++        observation_id: None,
++        elements: texts.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
++    };
++    assert_eq!(numbers(&seen), vec![7]);
++}
++
++#[test]
++fn progress_is_recorded_before_and_after_each_step() {
++    let mut d = Fake::new(settled_script());
++    d.texts = vec![vec!["50", "30"], vec!["49", "30"]].into();
++    let (_, log) = run(&mut d, 1, false);
++    assert_eq!(log[0]["progress"]["before"], json!([50, 30]));
++    assert_eq!(log[0]["progress"]["after"], json!([49, 30]));
++}
++
++#[test]
++fn progress_is_null_when_the_dco_cannot_read_text() {
++    let mut d = Fake::new(settled_script());
++    let (s, log) = run(&mut d, 1, false);
++    assert!(log[0]["progress"]["before"].is_null());
++    assert!(log[0]["progress"]["after"].is_null());
++    assert_eq!(s.stop, Stop::StepsDone);
++}
++
++#[test]
++fn the_after_of_one_step_is_the_before_of_the_next() {
++    let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED)), Ok(grid(A)), Ok(grid(A))]);
++    d.texts = vec![vec!["50"], vec!["49"], vec!["48"]].into();
++    let (_, log) = run(&mut d, 2, false);
++    assert!(log.len() >= 2);
++    assert_eq!(log[1]["progress"]["before"], json!([49]));
++    assert_eq!(log[1]["progress"]["after"], json!([48]));
++}
++
++#[test]
++fn goal_dropped_needs_same_length_and_index_in_range() {
++    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 0), Some(true));
++    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 1), Some(false));
++    assert_eq!(goal_dropped(&[50, 30], &[50, 31], 1), Some(false));
++    assert_eq!(goal_dropped(&[50, 30], &[49], 0), None);
++    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 2), None);
++}
++
++fn lists(v: &[&[&'static str]]) -> VecDeque<Vec<&'static str>> {
++    v.iter().map(|x| x.to_vec()).collect()
++}
++
++fn stall_reads() -> Vec<Result<GridRead, DcoError>> {
++    let mut reads = vec![Ok(grid(A))];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(A)));
++    }
++    reads
++}
++
++/// 初始读一次，之后每一步读一次。
++fn run_progress(texts: VecDeque<Vec<&'static str>>, gi: Option<usize>, steps: usize) -> (Vec<Value>, usize) {
++    let say = Say::new(Some(0));
++    let mut d = Fake::new(stall_reads());
++    d.texts = texts;
++    let (_, log) = run_ask_goal(&mut d, Some(&say), false, 30, steps, gi);
++    (log, say.calls.get())
++}
++
++fn first_stalled(log: &[Value]) -> Option<usize> {
++    log.iter().position(|l| l["stalled"] == true)
++}
++
++fn flat(n: usize) -> Vec<&'static [&'static str]> {
++    vec![&["50"][..]; n]
++}
++
++#[test]
++fn six_flat_steps_make_the_seventh_a_stall_and_ask_the_model() {
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(8));
++    let (log, asked) = run_progress(lists(&v), Some(0), 8);
++    assert_eq!(first_stalled(&log), Some(6));
++    assert!(asked >= 1);
++}
++
++#[test]
++fn without_a_goal_index_a_flat_run_never_stalls_or_asks() {
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(8));
++    let (log, asked) = run_progress(lists(&v), None, 8);
++    assert_eq!(asked, 0);
++    assert!(log.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn a_dropping_goal_number_never_stalls() {
++    let texts: Vec<Vec<&'static str>> = std::iter::once(vec!["50"]).chain((0..8).map(|i| vec![&*Box::leak(format!("{}", 49 - i).into_boxed_str())])).collect();
++    let (log, asked) = run_progress(texts.into(), Some(0), 8);
++    assert_eq!(asked, 0);
++    assert!(log.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn the_moves_left_counter_dropping_does_not_hide_a_stalled_goal() {
++    // 第 0 个数字是剩余步数（每步都降），第 1 个是目标（一直不变）
++    let ml: Vec<&'static str> = vec!["30", "29", "28", "27", "26", "25", "24", "23", "22"];
++    let v: Vec<Vec<&'static str>> = ml.iter().map(|m| vec![*m, "50"]).collect();
++    let (log, asked) = run_progress(v.clone().into(), Some(1), 8);
++    assert_eq!(first_stalled(&log), Some(6));
++    assert!(asked >= 1);
++    // 盯着剩余步数那个，就永远不停滞
++    let (log0, _) = run_progress(v.into(), Some(0), 8);
++    assert!(log0.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn a_drop_in_the_middle_restarts_the_count() {
++    // 初始 50；3 步不变；第 4 步降到 49；之后一直 49 不变
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(3));
++    v.push(&["49"]);
++    v.extend(vec![&["49"][..]; 8]);
++    let (log, _) = run_progress(lists(&v), Some(0), 12);
++    // 降发生在第 4 步（下标 3）；之后要再连着 6 步不变，第 7 步（下标 3+6+1=10）才标停滞
++    assert_eq!(first_stalled(&log), Some(10));
++}
++
++#[test]
++fn an_unreadable_list_in_a_flat_run_neither_clears_nor_advances_the_count() {
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(2));
++    v.push(&[]); // 这一步读不到（个数不同）
++    v.extend(flat(8));
++    let (log, _) = run_progress(lists(&v), Some(0), 10);
++    // 不带空档要在下标 6；空档同时让这一步的前后两次都对不上，共 2 步不算数
++    assert_eq!(first_stalled(&log), Some(8));
++}
+diff --git a/docs/superpowers/plans/2026-10-04-dct-match3-generic-feedback.md b/docs/superpowers/plans/2026-10-04-dct-match3-generic-feedback.md
+new file mode 100644
+index 0000000..49506cd
+--- /dev/null
++++ b/docs/superpowers/plans/2026-10-04-dct-match3-generic-feedback.md
+@@ -0,0 +1,699 @@
++# dct 玩三消：通用反馈机制 Implementation Plan
++
++> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
++
++**Goal:** 让 `dct game play` 不靠任何游戏知识，也能发现自己错了：被拒绝的格子在棋盘变化前不再碰、发给模型的候选只写看得见的事实、每一步记下预测和实际、读目标数字的前后变化、连续没进展时自动问模型；并让 `ask-bench` 认带答案的题库。
++
++**Architecture:** 全部改在 `crates/dct-game`（`play.rs`、`ask.rs`、`dco.rs` 不动）和 `src/game/{bench,text}.rs`。`play()` 里新增三份循环内状态：`locked`（被拒绝的格子）、`progress_prev`（上一步后读到的数字）、`no_progress`（连着没下降的步数）。新字段全部是追加到记录里，旧记录读者不受影响。
++
++**Tech Stack:** Rust（workspace `dct` + `crates/dct-game`），`serde_json`，已有的 `lab::delta_e`、`Dco::see_text`（OCR）。
++
++**Spec:** `docs/superpowers/specs/2026-10-04-dct-match3-generic-feedback-design.md`
++
++**对 spec 的两处收窄（执行前知悉）：**
++1. spec §3 说「具体哪些字段可靠由一张小表决定」。第一版不做表：直接从发给模型的句子里去掉「引爆 N 颗特殊糖」（它靠 `odd` 标记猜，笼子会触发），并在提示里加一句「标记不一定准」。
++2. spec §6 的「经验」格式这一轮不做（没有读写它的代码，只会是空头格式）；只做题库格式和 `ask-bench` 认它。
++
++## Global Constraints
++
++- 提交信息用英文，**不加任何 AI 署名或 Co-Authored-By 行**（用户的长期规则，优先于默认的署名提示）。不推送，用户说「推吧」才推。
++- 面向用户的文字用大白话中文，不出现类别编号、分数公式、`OCR`/`LLM`/`prompt` 这类词；行列从 1 数。
++- dct 代码保持通用：任何新增逻辑都要能回答「换一个别的方格游戏还成立吗」；游戏专属内容（彩球加分、笼子是什么、各关目标、权重数值）只来自配置或 dcv，不写进代码。
++- 每一处新逻辑都不能改变「没配模型 / 没有 OCR / 假 dco 不支持 see_text」时的现有行为：读不到数字就是 `null`，不报错、不停。
++- 新增的记录字段只追加，不改已有字段的含义。
++- 推送前跑：`cargo +1.99.0 clippy --workspace --all-targets --locked -- -D warnings` 和 `cargo +1.99.0 test --workspace --locked`（`PATH` 含 `$HOME/.cargo/bin`，`CARGO_TARGET_DIR=/private/tmp/claude-502/-Users-lei-work-dc-dc-terminal/d52f1f4f-cb49-40cc-ba88-c37403102743/scratchpad/target-199`）。已知偶发失败：`daemon::web_tests::enabling_starts_a_listener_and_disabling_stops_it`、`session::tests::recovering_from_a_failure_after_real_input_still_does_not_count`，重跑。
++
++## Review Focus
++
++1. 所有候选都被「不可选格子」排除时：停下并说「划了几次画面都没有变化」，不死循环、不崩。→ Task 1。
++2. 一步成功后「不可选格子」必须全部解除，否则一次拒绝会永久封住棋盘一角。→ Task 1。
++3. `see_text` 读不到、读到的数字个数前后不一样（OCR 漏了一个）：`progress` 为 `null`，停滞计数**不动**（既不加也不清）。→ Task 4、5。
++4. 颜色信息缺失（`rgb` 为 `None`）：`observed_changed` 为 `null`，不当作 0。→ Task 3。
++5. 带答案的题库里 `good` / `bad` 的编号越界或为空：该行只统计「问了几个」，不 panic。→ Task 6。
++
++---
++
++### Task 1: 被拒绝的格子在棋盘变化前不再碰；连着没反应的上限放宽到 5
++
++**Files:**
++- Modify: `crates/dct-game/src/play.rs`
++- Test: `crates/dct-game/src/play_tests.rs`
++
++**Interfaces:**
++- Consumes: `play()` 现有的 `failed: Vec<(Move, Vec<Vec<u16>>)>`、`streak`、`cands`、`offered`、`pick`。
++- Produces: `pub const MAX_REFUSED_IN_A_ROW: usize = 5;`；循环内状态 `locked: Vec<(usize, usize)>`。
++
++- [ ] **Step 1: 写失败的测试**
++
++在 `play_tests.rs` 末尾（`Fake`、`Clk`、`profile`、`grid`、`A`、`MOVED` 已在文件里）：
++
++```rust
++#[test]
++fn after_a_refused_swap_no_later_candidate_touches_its_two_cells() {
++    // 一直读到同一张盘（没变化）：第一步被拒绝以后，第二步选的步不碰第一步的两个格子
++    let mut reads = vec![];
++    for _ in 0..80 {
++        reads.push(Ok(grid(A)));
++    }
++    let mut d = Fake::new(reads);
++    let (_, log) = run(&mut d, 3, false);
++    let pos = |l: &Value, k: &str| (l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone());
++    if log.len() >= 2 {
++        let (a0, b0) = (pos(&log[0], "a"), pos(&log[0], "b"));
++        let (a1, b1) = (pos(&log[1], "a"), pos(&log[1], "b"));
++        for p in [&a1, &b1] {
++            assert!(*p != a0 && *p != b0, "第二步碰了被拒绝的格子：{log:?}");
++        }
++    }
++}
++
++// 6 行 4 列，每行一个互不相干的三连换法（交替用 2/4、1/3，避免竖向连线）
++const MANY: &[&[u16]] = &[
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++];
++
++#[test]
++fn five_refusals_in_a_row_stop_the_run_not_two() {
++    let mut reads = vec![];
++    for _ in 0..400 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    assert_eq!(s.stop, Stop::Stuck);
++    assert_eq!(d.swipes.len(), 5, "应该试满 5 次才停");
++}
++
++#[test]
++fn a_move_that_works_unlocks_the_cells() {
++    // 第一步没反应（锁住它的两格），第二步（别处）成功 → 解除；第三步又可以碰第一步的格子
++    let mut reads = vec![];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MANY)));
++    }
++    // 第二次划：变成另一张盘并落定
++    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
++    reads.push(Ok(grid(moved)));
++    reads.push(Ok(grid(moved)));
++    for _ in 0..400 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
++    assert_eq!(&outcomes[..2], ["no_change", "moved"], "{outcomes:?}");
++}
++```
++
++测试里的脚本依赖 `Fake` 的读盘次序（`settle` 要读多次才下结论）。如果 `a_move_that_works_unlocks_the_cells` 的脚本和真实读盘次数对不上，按 `a_move_that_works_resets_the_unmoved_counter`（`play_tests.rs` 里已有）的做法调整读数条数，**断言保持不变**；若调整了请在报告里说明。
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo +1.99.0 test -p dct-game play_tests::five_refusals play_tests::after_a_refused play_tests::a_move_that_works_unlocks`
++Expected: `five_refusals…` 失败（现在 2 次就停）。
++
++- [ ] **Step 3: 写实现**
++
++`play.rs` 顶部常量区加：
++
++```rust
++/// 连着最多几次「划了没反应」才停。被拒绝的格子在棋盘变化前不再被选，所以多试几次不会重复同一处。
++pub const MAX_REFUSED_IN_A_ROW: usize = 5;
++```
++
++`play()` 里 `let mut failed ...` 旁加 `let mut locked: Vec<(usize, usize)> = Vec::new();`。
++
++把选步处的
++
++```rust
++let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
++```
++
++改成（先算 `board_key`，下面问模型那块里已有的 `let board_key` 删掉复用这个）：
++
++```rust
++let board_key = canonical(&g.cells);
++let blocked = |c: &Candidate| {
++    failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key) || locked.contains(&c.mv.a) || locked.contains(&c.mv.b)
++};
++let pick = cands.iter().position(|c| !blocked(c));
++```
++
++问模型那块里 `offered` 的计算改成 `(0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()`（`is_failed` 闭包删掉）。`had_failed_here` 保持。
++
++两个「没反应」分支（`Settle::Settled(next) if same(&next, &g)` 和 `Settle::NoChange`）里，在 `failed.push(...)` 之后各加：
++
++```rust
++locked.push(chosen.mv.a);
++locked.push(chosen.mv.b);
++```
++
++并把 `if streak >= 2 {` 改成 `if streak >= MAX_REFUSED_IN_A_ROW {`（两处）。`Settle::Settled(next)`（成功那支）里 `failed.clear();` 旁加 `locked.clear();`。
++
++借用冲突时（`blocked` 闭包借着 `failed`/`locked`，后面要 `push`）：把 `blocked` 的使用都放在 `pick` 和 `offered` 计算完成之后，闭包最后一次使用后借用自然结束；若编译器仍报错，把两处计算包进一个 `{ ... }` 块。
++
++- [ ] **Step 4: 跑全部 dct-game 测试**
++
++Run: `cargo +1.99.0 test -p dct-game`
++Expected: 全绿。已有的两个「连着两次就停」的测试（`play_tests.rs` 里断言 `Stop::Stuck` 且 `no_change` 数为 2 的那几处，例如约 107、371、578 行）会因上限改成 5 而失败：把它们的断言改成新的上限（`MAX_REFUSED_IN_A_ROW`），**不改它们要证明的事**（比如「编号被打乱的没变化画面仍判没反应」），并在报告里列出改了哪几个。
++
++- [ ] **Step 5: 变异检查，然后提交**
++
++临时把 `locked.contains(&c.mv.b)` 删掉 → `after_a_refused…` 或相关测试应变红；把 `locked.clear()` 删掉 → `a_move_that_works_unlocks…` 应变红；把常量改成 2 → `five_refusals…` 变红。每次改回。
++
++```bash
++git add crates/dct-game/src/play.rs crates/dct-game/src/play_tests.rs
++git commit -m "feat(game): cells of a refused swap stay off-limits until the board changes; five refusals in a row before stopping"
++```
++
++---
++
++### Task 2: 发给模型的候选只写看得见的事实
++
++**Files:**
++- Modify: `crates/dct-game/src/ask.rs`
++- Test: 同文件的 `tests` 模块
++
++**Interfaces:**
++- Consumes: `describe(&Candidate)`、`prompt_text(&AskInput)`。
++- Produces: `describe` 不再输出「引爆 N 颗特殊糖」；`prompt_text` 在候选之前加一句「棋盘上的特殊标记不一定准」。
++
++- [ ] **Step 1: 改测试（先写成会失败的样子）**
++
++把现有 `describe_counts_rows_and_columns_from_one_and_names_what_happens` 的期望改成不含「引爆」：
++
++```rust
++    #[test]
++    fn describe_counts_rows_and_columns_from_one_and_names_only_what_can_be_seen() {
++        let f = Outcome { cleared: 7, bomb: 1, triggered: 2, ..Default::default() };
++        let s = describe(&cand((0, 3), (1, 3), f));
++        assert_eq!(s, "第 1 行第 4 列和第 2 行第 4 列互换，消 7 颗，做出彩色炸弹");
++        assert!(!s.contains("引爆"), "引爆靠特殊标记猜，不可靠，不能发给模型");
++    }
++```
++
++并在 `prompt_lists_numbered_candidates_goal_and_failed_swaps` 里加断言：`assert!(p.contains("特殊标记不一定准"));`。
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo +1.99.0 test -p dct-game ask::`
++Expected: 这两个测试失败。
++
++- [ ] **Step 3: 写实现**
++
++`describe` 里删掉 `if f.triggered > 0 { ... }` 整段。`prompt_text` 里，在「下面是可以走的几步……」那行之前加：
++
++```rust
++    s += "提醒：棋盘上看起来像特殊糖的标记不一定准，不要因为它就选某一步。\n";
++```
++
++（要含「特殊标记不一定准」这几个字：用 `"提醒：棋盘上的特殊标记不一定准，不要因为它就选某一步。\n"`，以测试断言为准。）
++
++- [ ] **Step 4: 跑测试**
++
++Run: `cargo +1.99.0 test --workspace --locked`
++Expected: 全绿。`src/game/bench.rs` 里用 `describe` 的测试若断言了「引爆」就同步改。
++
++- [ ] **Step 5: 提交**
++
++```bash
++git add crates/dct-game/src/ask.rs src/game/bench.rs
++git commit -m "fix(game): do not tell the model about triggered special candies (a guess from a marker that cages also set); warn that markers may be wrong"
++```
++
++---
++
++### Task 3: 记录预测和实际
++
++**Files:**
++- Modify: `crates/dct-game/src/play.rs`
++- Test: `crates/dct-game/src/play_tests.rs`
++
++**Interfaces:**
++- Consumes: `GridRead.classes[].rgb: Option<[u8; 3]>`（`board.rs` 的 `ClassInfo`），`crate::lab::delta_e([u8;3],[u8;3]) -> f64`。
++- Produces: `pub(crate) fn changed_cells(a: &GridRead, b: &GridRead) -> Option<usize>`；记录字段 `predicted_cleared`（划之前，所有非 dry-run 的带候选记录都有）和 `observed_changed`（划之后，数字或 `null`）。常量 `COLOUR_SAME_DE: f64 = 12.0`。
++
++- [ ] **Step 1: 写失败的测试**
++
++```rust
++fn grid_rgb(cells: &[&[u16]], rgbs: &[(u16, [u8; 3])]) -> GridRead {
++    let rows = cells.len();
++    let cols = cells[0].len();
++    let classes: Vec<Value> = rgbs
++        .iter()
++        .map(|(i, c)| json!({"id": i, "count": cells.iter().flat_map(|r| r.iter()).filter(|&&x| x == *i).count(), "rgb": c}))
++        .collect();
++    serde_json::from_value(json!({"rows": rows, "cols": cols, "cells": cells, "odd": vec![vec![false; cols]; rows], "classes": classes})).unwrap()
++}
++
++#[test]
++fn changed_cells_compares_colours_not_class_ids() {
++    // 类别号互换但颜色没变 → 0；一格换了颜色 → 1
++    let a = grid_rgb(&[&[1, 2], &[2, 1]], &[(1, [200, 30, 30]), (2, [30, 30, 200])]);
++    let b = grid_rgb(&[&[7, 8], &[8, 7]], &[(7, [200, 30, 30]), (8, [30, 30, 200])]);
++    assert_eq!(changed_cells(&a, &b), Some(0));
++    let c = grid_rgb(&[&[7, 8], &[8, 8]], &[(7, [200, 30, 30]), (8, [30, 30, 200])]);
++    assert_eq!(changed_cells(&a, &c), Some(1));
++}
++
++#[test]
++fn changed_cells_is_none_when_colours_are_missing() {
++    let a = grid(A); // 没有 rgb
++    assert_eq!(changed_cells(&a, &a), None);
++}
++
++#[test]
++fn records_carry_predicted_and_observed() {
++    let mut d = Fake::new(settled_script());
++    let (_, log) = run(&mut d, 1, false);
++    assert!(log[0]["predicted_cleared"].as_u64().unwrap() >= 3);
++    assert!(log[0].get("observed_changed").is_some()); // 假盘没有 rgb → null，但字段在
++}
++```
++
++（`settled_script()` 是 `play_tests.rs` 里已有的辅助函数，返回 `[A, MOVED, MOVED]` 的读数。）
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo +1.99.0 test -p dct-game play_tests::changed_cells play_tests::records_carry`
++Expected: 编译失败（`changed_cells` 未定义）。
++
++- [ ] **Step 3: 写实现**
++
++`play.rs`：
++
++```rust
++/// 同一格划前划后的颜色相差不到这个就当没变（dco 的类别号每次读都会变，所以比颜色，不比编号）。
++const COLOUR_SAME_DE: f64 = 12.0;
++
++fn rgb_of(g: &GridRead, id: u16) -> Option<[u8; 3]> {
++    g.classes.iter().find(|c| c.id == id).and_then(|c| c.rgb)
++}
++
++/// 划前划后有几格颜色变了。行列数不同或任何一格拿不到颜色就是 `None`（不能当 0）。
++pub(crate) fn changed_cells(a: &GridRead, b: &GridRead) -> Option<usize> {
++    if a.rows != b.rows || a.cols != b.cols {
++        return None;
++    }
++    let mut n = 0;
++    for (ra, rb) in a.cells.iter().zip(&b.cells) {
++        for (ca, cb) in ra.iter().zip(rb) {
++            let (x, y) = (rgb_of(a, *ca)?, rgb_of(b, *cb)?);
++            if crate::lab::delta_e(x, y) > COLOUR_SAME_DE {
++                n += 1;
++            }
++        }
++    }
++    Some(n)
++}
++```
++
++记录里：构造 `rec` 时加 `"predicted_cleared": chosen.features.cleared + chosen.features.cascade,`。三处结果里写 `observed_changed`：
++- `Settle::Settled(next) if same(&next, &g)` 和 `Settle::NoChange(_)`：`rec["observed_changed"] = json!(0);`
++- `Settle::Settled(next)`（成功）：`rec["observed_changed"] = json!(changed_cells(&g, &next));`（`Option<usize>` 序列化成数字或 `null`）。
++
++`ClassInfo`、`rgb` 字段若 `board.rs` 里不是 `pub`，改成 `pub`（只改可见性）。
++
++- [ ] **Step 4: 跑测试**
++
++Run: `cargo +1.99.0 test --workspace --locked`
++Expected: 全绿。
++
++- [ ] **Step 5: 变异检查，然后提交**
++
++把 `COLOUR_SAME_DE` 改成 0.0 → `changed_cells_compares_colours…` 的第一个断言应变红；把 `?` 换成 `.unwrap_or([0,0,0])` → `…is_none_when_colours_are_missing` 变红。改回。
++
++```bash
++git add crates/dct-game/src
++git commit -m "feat(game): record predicted_cleared and observed_changed for every step (compared by colour, not class id)"
++```
++
++---
++
++### Task 4: 读进度数字
++
++**Files:**
++- Modify: `crates/dct-game/src/play.rs`
++- Test: `crates/dct-game/src/play_tests.rs`
++
++**Interfaces:**
++- Consumes: `Dco::see_text(&mut self, &Profile) -> Result<Seen, DcoError>`（默认返回 unsupported）；`Seen.elements: Vec<Element{id,text}>`。
++- Produces: `pub(crate) fn numbers(seen: &Seen) -> Vec<u64>`（只取**整条文字全是数字**的元素，按出现顺序）；记录字段 `progress`：`{"before": [..]|null, "after": [..]|null}`；循环状态 `progress_prev: Option<Vec<u64>>`。
++
++- [ ] **Step 1: 写失败的测试**
++
++`Fake` 要支持 `see_text`：给 `Fake` 加字段 `texts: VecDeque<Vec<&'static str>>`（默认空），并实现
++
++```rust
++    fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
++        match self.texts.pop_front() {
++            Some(t) => Ok(Seen {
++                snapshot_id: "s".into(),
++                observation_id: None,
++                elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into() }).collect(),
++            }),
++            None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
++        }
++    }
++```
++
++（`Fake::new` 里 `texts: VecDeque::new()`；已有测试不受影响。）测试：
++
++```rust
++#[test]
++fn numbers_keeps_only_whole_number_elements_in_order() {
++    let seen = Seen {
++        snapshot_id: "s".into(),
++        observation_id: None,
++        elements: ["1716/♥5", "38", "x", "122", " 7 "].iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{i}"), text: (*s).into() }).collect(),
++    };
++    assert_eq!(numbers(&seen), vec![38, 122, 7]);
++}
++
++#[test]
++fn progress_is_recorded_before_and_after_each_step() {
++    let mut d = Fake::new(settled_script());
++    // 一次循环前读一回（起始），每步划完读一回
++    d.texts = vec![vec!["50", "30"], vec!["49", "30"]].into();
++    let (_, log) = run(&mut d, 1, false);
++    assert_eq!(log[0]["progress"]["before"], json!([50, 30]));
++    assert_eq!(log[0]["progress"]["after"], json!([49, 30]));
++}
++
++#[test]
++fn progress_is_null_when_the_dco_cannot_read_text() {
++    let mut d = Fake::new(settled_script()); // texts 为空 → unsupported
++    let (s, log) = run(&mut d, 1, false);
++    assert!(log[0]["progress"]["before"].is_null());
++    assert!(log[0]["progress"]["after"].is_null());
++    assert_eq!(s.stop, Stop::StepsDone);
++}
++```
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo +1.99.0 test -p dct-game play_tests::numbers play_tests::progress`
++Expected: 编译失败（`numbers` 未定义）。
++
++- [ ] **Step 3: 写实现**
++
++```rust
++/// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。
++/// 「1716/♥5」这种夹着别的字的不要。哪个数是目标，这里不猜；只记下来。
++pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
++    seen.elements.iter().filter_map(|e| e.text.trim().parse::<u64>().ok()).collect()
++}
++```
++
++`play()`：循环前（`let stop = loop {` 之前）`let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { dco.see_text(p).ok().map(|s| numbers(&s)) };`。
++
++两种结果分支（成功 / 没反应）写记录前各读一次：
++
++```rust
++let progress_after = dco.see_text(p).ok().map(|s| numbers(&s));
++rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++progress_prev = progress_after.clone();
++```
++
++（放进一个小闭包或内联；`stopped` 类的分支不读。`dry_run` 分支直接 `break`，不读。）
++
++- [ ] **Step 4: 跑测试**
++
++Run: `cargo +1.99.0 test --workspace --locked`
++Expected: 全绿（其它假 dco 不支持 `see_text`，字段是 `null`，行为不变）。
++
++- [ ] **Step 5: 变异检查，然后提交**
++
++把 `numbers` 的 `trim()` 去掉 → `numbers_keeps_only…` 变红（`" 7 "`）；把 `progress_prev = progress_after.clone()` 删掉 → `progress_is_recorded…` 在多步时的 before 会错（若当前测试只有一步没抓到，加一个两步的断言）。改回。
++
++```bash
++git add crates/dct-game/src
++git commit -m "feat(game): record the whole-number texts on screen before and after each step as progress"
++```
++
++---
++
++### Task 5: 停滞检测
++
++**Files:**
++- Modify: `crates/dct-game/src/play.rs`、`src/game/text.rs`
++- Test: `crates/dct-game/src/play_tests.rs`、`src/game/text.rs` 的测试
++
++**Interfaces:**
++- Consumes: Task 4 的 `progress_prev` / `progress_after`；Task 2/3 的记录。
++- Produces: 常量 `pub const STALL_STEPS: usize = 6;`；`fn decreased(before: &[u64], after: &[u64]) -> bool`（个数相同且至少一项变小）；循环状态 `no_progress: usize`；问模型的触发条件加上「停滞」；记录字段 `stalled: true`（只在停滞时才有）；`step_line` 在 `stalled` 时加「；这几步看起来没有进展」。
++
++- [ ] **Step 1: 写失败的测试**
++
++```rust
++#[test]
++fn decreased_needs_same_length_and_a_smaller_number() {
++    assert!(decreased(&[50, 30], &[49, 30]));
++    assert!(!decreased(&[50, 30], &[50, 30]));
++    assert!(!decreased(&[50, 30], &[51, 30]));
++    assert!(!decreased(&[50, 30], &[49])); // 个数不一样（OCR 漏了）：不算下降
++}
++
++fn progress_texts(n: usize, flat: bool) -> VecDeque<Vec<&'static str>> {
++    let mut v: Vec<Vec<&'static str>> = vec![vec!["50"]];
++    for i in 0..n {
++        v.push(if flat { vec!["50"] } else { vec![Box::leak(format!("{}", 49 - i).into_boxed_str())] });
++    }
++    v.into()
++}
++
++#[test]
++fn six_steps_without_the_number_dropping_is_a_stall_and_asks_the_model() {
++    let say = Say::new(Some(0));
++    let mut reads = vec![Ok(grid(A))];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(A)));
++    }
++    let mut d = Fake::new(reads);
++    d.texts = progress_texts(8, true);
++    // 没有 --ask-model 的「每步都问」，也没有被拒绝：只有停滞会触发
++    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
++    assert_eq!(log[5].get("stalled"), None, "第 6 步之前还不算停滞");
++    assert!(say.calls.get() >= 1, "停滞以后应该问模型");
++    assert!(log.iter().any(|l| l["stalled"] == true));
++}
++
++#[test]
++fn a_dropping_number_never_stalls() {
++    let say = Say::new(Some(0));
++    let mut reads = vec![Ok(grid(A))];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(A)));
++    }
++    let mut d = Fake::new(reads);
++    d.texts = progress_texts(8, false);
++    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
++    assert_eq!(say.calls.get(), 0);
++    assert!(log.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn unreadable_numbers_neither_add_to_nor_clear_the_stall_count() {
++    // 读不到数字（unsupported）：没有「停滞」，也不报错
++    let say = Say::new(Some(0));
++    let mut d = Fake::new(settled_script());
++    let (s, log) = run_ask(&mut d, Some(&say), false, 30, 1);
++    assert_eq!(s.stop, Stop::StepsDone);
++    assert!(log[0].get("stalled").is_none());
++}
++```
++
++`run_ask`、`Say` 是第三轮已有的测试辅助（在 `play_tests.rs`）；`MOVED`、`A`、`settled_script()` 也已有。第一个停滞测试的读盘脚本依赖 `settle` 读几次，若对不上按 Task 1 的说明调整读数条数，断言不变。
++
++`text.rs` 的测试：
++
++```rust
++#[test]
++fn step_line_says_so_when_stalled() {
++    let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","stalled":true});
++    assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
++    let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
++    assert!(!step_line(1, &rec2).contains("没有进展"));
++}
++```
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo +1.99.0 test -p dct-game play_tests::decreased play_tests::six_steps && cargo +1.99.0 test --lib game::text`
++Expected: 编译失败 / 断言失败。
++
++- [ ] **Step 3: 写实现**
++
++`play.rs`：
++
++```rust
++/// 连着这么多步目标数字都没下降，就算停滞。
++pub const STALL_STEPS: usize = 6;
++
++/// 个数相同、且至少有一个数变小才算「下降」。个数不同（OCR 漏读了一个）一律不算，也不算「没下降」。
++fn decreased(before: &[u64], after: &[u64]) -> bool {
++    before.len() == after.len() && before.iter().zip(after).any(|(b, a)| a < b)
++}
++```
++
++循环状态加 `let mut no_progress = 0usize;`。问模型的条件由 `(o.ask_always || had_failed_here)` 改成 `(o.ask_always || had_failed_here || no_progress >= STALL_STEPS)`；构造 `rec` 之后加 `if no_progress >= STALL_STEPS { rec["stalled"] = json!(true); }`。
++
++Task 4 里读 `progress_after` 之后更新计数（两种结果分支都做）：
++
++```rust
++if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
++    if b.len() == a.len() {
++        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++    }
++}
++```
++
++（要放在 `progress_prev = progress_after.clone()` 之前；个数不同或读不到时 `no_progress` 不动。）
++
++`src/game/text.rs` 的 `step_line`：在 `match outcome {...}` 之后、返回前加：
++
++```rust
++    if rec["stalled"].as_bool() == Some(true) {
++        s += "；这几步看起来没有进展";
++    }
++```
++
++- [ ] **Step 4: 跑测试**
++
++Run: `cargo +1.99.0 test --workspace --locked`
++Expected: 全绿。
++
++- [ ] **Step 5: 变异检查，然后提交**
++
++把 `STALL_STEPS` 改成 1 → `…is_a_stall…` 里「第 6 步之前不算停滞」的断言变红；把 `b.len() == a.len()` 守卫去掉 → 个数不同的情形被算成「没下降」，`unreadable…`/`decreased…` 变红；把触发条件里的 `|| no_progress >= STALL_STEPS` 去掉 → `…asks_the_model` 变红。改回。
++
++```bash
++git add crates/dct-game/src src/game/text.rs
++git commit -m "feat(game): six steps without the on-screen numbers dropping is a stall: recorded, said in plain words, and the model is asked"
++```
++
++---
++
++### Task 6: `ask-bench` 认带答案的题库
++
++**Files:**
++- Modify: `src/game/bench.rs`、`src/game/cli.rs`（只改报告输出调用，若需要）
++- Test: `src/game/bench.rs`
++
++**Interfaces:**
++- Consumes: 现有 `replay(lines, adv, goal_of, limit) -> Report`；题库行 = 记录行 + `"good": [候选下标…]`、`"bad": [候选下标…]`（下标指 `candidates` 里的位置，0 起）。
++- Produces: `Report` 新增 `pub labelled: usize`（有 `good` 或 `bad` 的被问局面数）、`pub picked_good: usize`、`pub picked_bad: usize`；报告多一行。
++
++- [ ] **Step 1: 写失败的测试**
++
++```rust
++    struct Pick(usize);
++    impl Advisor for Pick {
++        fn pick(&self, _: &AskInput) -> Option<Advice> {
++            Some(Advice { choice: Some(self.0), reason: String::new(), raw: String::new(), model: "t".into() })
++        }
++    }
++
++    fn labelled(good: Vec<usize>, bad: Vec<usize>) -> Value {
++        let mut r = rec(5, false);
++        r["good"] = json!(good);
++        r["bad"] = json!(bad);
++        r
++    }
++
++    #[test]
++    fn replay_counts_good_and_bad_picks_on_labelled_lines() {
++        // 打乱后模型总选第 1 个展示项；用只标 good=[候选0] 的行，无论洗成什么样，选中 good 的次数 ∈ {0,1}
++        let lines = vec![labelled(vec![0], vec![1])];
++        let r = replay(&lines, &Pick(0), &|_| String::new(), 10);
++        assert_eq!(r.labelled, 1);
++        assert_eq!(r.picked_good + r.picked_bad <= 1, true);
++    }
++
++    #[test]
++    fn replay_good_and_bad_are_in_terms_of_original_candidate_indexes() {
++        // 把每个候选都标成 bad：模型选什么都是 bad
++        let lines = vec![labelled(vec![], vec![0, 1, 2, 3, 4])];
++        let r = replay(&lines, &Pick(2), &|_| String::new(), 10);
++        assert_eq!((r.picked_good, r.picked_bad), (0, 1));
++        // 都标成 good：选什么都是 good
++        let lines = vec![labelled(vec![0, 1, 2, 3, 4], vec![])];
++        let r = replay(&lines, &Pick(2), &|_| String::new(), 10);
++        assert_eq!((r.picked_good, r.picked_bad), (1, 0));
++    }
++
++    #[test]
++    fn replay_survives_out_of_range_or_empty_labels() {
++        let lines = vec![labelled(vec![99], vec![]), labelled(vec![], vec![]), rec(5, false)];
++        let r = replay(&lines, &Pick(0), &|_| String::new(), 10);
++        assert_eq!(r.asked, 3);
++        assert_eq!(r.picked_good, 0);
++    }
++```
++
++（`rec`、`First`、`json!`、`Value` 已在 `bench.rs` 的测试模块里；上面 `Pick` 是新增的辅助。）
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo +1.99.0 test --lib game::bench`
++Expected: 编译失败（`labelled` 字段不存在）。
++
++- [ ] **Step 3: 写实现**
++
++`Report` 加三个字段（`Default` 已 derive）。`replay` 里，问完得到 `a` 之后，算「模型选的原始候选下标」`order[k]`，若这一行有标注：
++
++```rust
++let good: Vec<usize> = rec["good"].as_array().map(|v| v.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect()).unwrap_or_default();
++let bad: Vec<usize> = rec["bad"].as_array().map(|v| v.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect()).unwrap_or_default();
++if !good.is_empty() || !bad.is_empty() {
++    r.labelled += 1;
++    if let Some(k) = chosen_original_index {
++        if good.contains(&k) { r.picked_good += 1; }
++        if bad.contains(&k) { r.picked_bad += 1; }
++    }
++}
++```
++
++（`chosen_original_index` 即现有代码里 `order[k]`。注意 `good`/`bad` 里的下标可能超出 `0..cands.len()`：用 `contains` 比较，天然安全。）
++
++报告文字（在 `cli.rs` 里打印的那段，或 `bench.rs` 里生成报告字符串的函数）末尾，当 `labelled > 0` 时多一行：
++
++`其中有标准答案的 {labelled} 个：选中好走法 {picked_good} 个，选中坏走法 {picked_bad} 个。`
++
++并把原来的说明句改成：有标准答案的行才能说「选得对不对」，没有的仍只能说比乱选强多少（保留原来的 caveat 句子，只在 `labelled == 0` 时出现）。
++
++- [ ] **Step 4: 跑测试**
++
++Run: `cargo +1.99.0 test --workspace --locked` 与 clippy。
++Expected: 全绿、无警告。
++
++- [ ] **Step 5: 变异检查，然后提交**
++
++把 `good.contains(&k)` 改成 `good.contains(&order[0])` → `replay_good_and_bad_are_in_terms_of…` 的某一断言应变红（选 2 vs 选 0）；改回。
++
++```bash
++git add src/game
++git commit -m "feat(game): ask-bench reads labelled question files and reports good and bad picks"
++```
++
++---
++
++## Self-Review
++
++1. **Spec 覆盖：** §1 预测对不对 → Task 3（预测字段）+ Task 1（被拒绝）；§2 动不了的格子 + 上限 5 → Task 1；§3 只写看得见的事实 → Task 2（收窄见开头）；§4 进度数字 → Task 4；§5 停滞 → Task 5；§6 题库格式 → Task 6（经验格式按开头说明不做）。验收第 3 条（带答案的题库放 dcv）靠 Task 6 提供格式，题目由用户/dcv 提供，不在本计划。
++2. **占位扫描：** 没有 TBD；有两处写明「按已有同类测试调整读数条数，断言不变」（Task 1、5 的假读盘脚本依赖 `settle` 读几次），这是实现时必须看现有测试才能定的数，不是占位；已要求在报告里说明。
++3. **类型一致：** `MAX_REFUSED_IN_A_ROW`（Task 1）、`COLOUR_SAME_DE`/`changed_cells`（Task 3）、`numbers`/`progress_prev`/`progress_after`（Task 4）、`STALL_STEPS`/`decreased`/`no_progress`（Task 5）在各任务里一致；Task 5 依赖 Task 4 的 `progress_after`；Task 1 的 `Options` 构造字面量沿用第三轮的六个字段。
++4. **Review Focus：** 五条分别落在 Task 1（全排除、解锁）、Task 3（rgb 缺失）、Task 4/5（读不到数字、个数不同）、Task 6（标注越界）。
+diff --git a/src/game/bench.rs b/src/game/bench.rs
+index db93a8c..89ef4c2 100644
+--- a/src/game/bench.rs
++++ b/src/game/bench.rs
+@@ -6,20 +6,24 @@ use dct_game::sim::{Move, Outcome};
+ use serde_json::Value;
+ 
+ #[derive(Debug, Default)]
+ pub struct Report {
+     pub asked: usize,
+     pub answered: usize,
+     pub valid: usize,
+     pub picked_rules_first: usize,
+     pub chance_first: f64,
+     pub avg_ms: u64,
++    /// 带标准答案（good 或 bad 非空）的被问局面数。
++    pub labelled: usize,
++    pub picked_good: usize,
++    pub picked_bad: usize,
+ }
+ 
+ fn candidate(v: &Value) -> Option<Candidate> {
+     let p = |x: &Value| Some((x[0].as_u64()? as usize, x[1].as_u64()? as usize));
+     let f = &v["features"];
+     let n = |k: &str| f[k].as_u64().unwrap_or(0) as usize;
+     Some(Candidate {
+         mv: Move { a: p(&v["a"])?, b: p(&v["b"])? },
+         score: v["score"].as_f64().unwrap_or(0.0),
+         features: Outcome {
+@@ -59,31 +63,48 @@ pub fn replay(lines: &[Value], adv: &dyn Advisor, goal_of: &dyn Fn(&str) -> Stri
+         for i in (1..order.len()).rev() {
+             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+             order.swap(i, (seed >> 33) as usize % (i + 1));
+         }
+         let input = AskInput {
+             board: board_text(&g, &[]),
+             goal: goal_of(rec["game"].as_str().unwrap_or("")),
+             candidates: order.iter().map(|&k| describe(&cands[k])).collect(),
+             failed: vec![],
+         };
++        let idx = |key: &str| -> Vec<usize> {
++            rec[key].as_array().map(|v| v.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect()).unwrap_or_default()
++        };
++        // 下标指原始 candidates（洗牌前）
++        let (good, bad) = (idx("good"), idx("bad"));
++        let is_labelled = !good.is_empty() || !bad.is_empty();
+         r.asked += 1;
++        if is_labelled {
++            r.labelled += 1;
++        }
+         r.chance_first += 1.0 / cands.len() as f64;
+         let t = std::time::Instant::now();
+         let a = adv.pick(&input);
+         total_ms += t.elapsed().as_millis();
+         if let Some(a) = a {
+             r.answered += 1;
+             if let Some(k) = a.choice {
+                 r.valid += 1;
+-                if order[k] == 0 {
+-                    r.picked_rules_first += 1;
++                if let Some(&orig) = order.get(k) {
++                    if orig == 0 {
++                        r.picked_rules_first += 1;
++                    }
++                    if good.contains(&orig) {
++                        r.picked_good += 1;
++                    }
++                    if bad.contains(&orig) {
++                        r.picked_bad += 1;
++                    }
+                 }
+             }
+         }
+     }
+     if r.asked > 0 {
+         r.avg_ms = (total_ms / r.asked as u128) as u64;
+     }
+     r
+ }
+ 
+@@ -134,24 +155,30 @@ pub fn run(args: &[String]) -> i32 {
+     };
+     let adv = super::advisor::LlmAdvisor::new(loaded.backend, loaded.model);
+     let r = replay(&lines, &adv, &|_| "尽量多消".into(), limit);
+     println!("{}", report_text(&r));
+     0
+ }
+ 
+ pub const USAGE: &str = "用法：dct game ask-bench <记录文件>... [--limit 40]";
+ 
+ pub fn report_text(r: &Report) -> String {
+-    format!(
+-        "问了 {} 个局面，回答成合法编号的 {} 个，选中规则第一名的 {} 个（乱选大约 {:.0} 个），平均每次 {} 毫秒。\n说明：回放里没有「哪些格子不是糖」和「这一关的目标」，所以这个数只说明它比乱选强多少，不说明它选得对不对。",
++    let mut t = format!(
++        "问了 {} 个局面，回答成合法编号的 {} 个，选中规则第一名的 {} 个（乱选大约 {:.0} 个），平均每次 {} 毫秒。",
+         r.asked, r.valid, r.picked_rules_first, r.chance_first, r.avg_ms
+-    )
++    );
++    if r.labelled > 0 {
++        t.push_str(&format!("\n其中有标准答案的 {} 个：选中好走法 {} 个，选中坏走法 {} 个。", r.labelled, r.picked_good, r.picked_bad));
++    } else {
++        t.push_str("\n说明：回放里没有「哪些格子不是糖」和「这一关的目标」，所以这个数只说明它比乱选强多少，不说明它选得对不对。");
++    }
++    t
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use dct_game::ask::{Advice, Advisor, AskInput};
+     use serde_json::json;
+ 
+     struct First;
+     impl Advisor for First {
+@@ -181,15 +208,76 @@ mod tests {
+     }
+ 
+     #[test]
+     fn replay_respects_the_limit() {
+         let lines: Vec<Value> = (0..10).map(|_| rec(5, false)).collect();
+         assert_eq!(replay(&lines, &First, &|_| String::new(), 3).asked, 3);
+     }
+ 
+     #[test]
+     fn report_text_has_the_caveat_and_numbers() {
+-        let t = report_text(&Report { asked: 40, answered: 40, valid: 38, picked_rules_first: 13, chance_first: 8.2, avg_ms: 900 });
++        let t = report_text(&Report { asked: 40, answered: 40, valid: 38, picked_rules_first: 13, chance_first: 8.2, avg_ms: 900, ..Default::default() });
+         assert!(t.contains("问了 40 个局面，回答成合法编号的 38 个，选中规则第一名的 13 个（乱选大约 8 个），平均每次 900 毫秒"));
+         assert!(t.contains("不说明它选得对不对"));
+     }
++
++    struct Pick(usize);
++    impl Advisor for Pick {
++        fn pick(&self, _: &AskInput) -> Option<Advice> {
++            Some(Advice { choice: Some(self.0), reason: String::new(), raw: String::new(), model: "t".into() })
++        }
++    }
++
++    fn labelled(good: Vec<usize>, bad: Vec<usize>) -> Value {
++        let mut r = rec(5, false);
++        r["good"] = json!(good);
++        r["bad"] = json!(bad);
++        r
++    }
++
++    #[test]
++    fn replay_counts_good_and_bad_picks_on_labelled_lines() {
++        let lines = vec![labelled(vec![0], vec![1])];
++        let r = replay(&lines, &Pick(0), &|_| String::new(), 10);
++        assert_eq!(r.labelled, 1);
++        assert!(r.picked_good + r.picked_bad <= 1);
++    }
++
++    #[test]
++    fn replay_good_and_bad_are_in_terms_of_original_candidate_indexes() {
++        let lines = vec![labelled(vec![], vec![0, 1, 2, 3, 4])];
++        let r = replay(&lines, &Pick(2), &|_| String::new(), 10);
++        assert_eq!((r.picked_good, r.picked_bad), (0, 1));
++        let lines = vec![labelled(vec![0, 1, 2, 3, 4], vec![])];
++        let r = replay(&lines, &Pick(2), &|_| String::new(), 10);
++        assert_eq!((r.picked_good, r.picked_bad), (1, 0));
++    }
++
++    #[test]
++    fn replay_maps_each_displayed_pick_back_to_exactly_one_original_candidate() {
++        // 展示顺序是候选的一个排列：逐个展示位去选，原始候选 0 恰好被选中一次
++        let lines = vec![labelled(vec![0], vec![1])];
++        let (mut good, mut bad) = (0, 0);
++        for k in 0..5 {
++            let r = replay(&lines, &Pick(k), &|_| String::new(), 10);
++            good += r.picked_good;
++            bad += r.picked_bad;
++        }
++        assert_eq!((good, bad), (1, 1));
++    }
++
++    #[test]
++    fn replay_survives_out_of_range_or_empty_labels() {
++        let lines = vec![labelled(vec![99], vec![]), labelled(vec![], vec![]), rec(5, false)];
++        let r = replay(&lines, &Pick(0), &|_| String::new(), 10);
++        assert_eq!(r.asked, 3);
++        assert_eq!(r.picked_good, 0);
++        assert_eq!(r.labelled, 1);
++    }
++
++    #[test]
++    fn report_text_adds_the_labelled_line_and_drops_the_caveat_only_when_labelled() {
++        let t = report_text(&Report { asked: 10, valid: 10, labelled: 4, picked_good: 3, picked_bad: 1, ..Default::default() });
++        assert!(t.contains("其中有标准答案的 4 个：选中好走法 3 个，选中坏走法 1 个。"));
++        assert!(!t.contains("不说明它选得对不对"));
++    }
+ }
+diff --git a/src/game/cli.rs b/src/game/cli.rs
+index e4a7070..7db5d0b 100644
+--- a/src/game/cli.rs
++++ b/src/game/cli.rs
+@@ -1,50 +1,57 @@
+-//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标]`。
++//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标] [--goal-number N]`。
+ 
+-const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]";
++const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]";
+ 
+ pub struct Args {
+     pub game: String,
+     pub steps: usize,
+     pub dry_run: bool,
+     /// 一局结束以后自己接着来（失败了重来、关安全的弹窗）。不带它就和以前一样：打完一关就停。
+     pub auto_next: bool,
+     /// 整个命令最多点几次“开始 / 再来一次”（每次都会用掉一条生命）。
+     pub tries: usize,
+     /// 启用大模型：划了没反应时问它选哪一步（没配大模型就只用规则）。
+     pub ask_model: bool,
+     /// 每一步都问大模型（隐含 `ask_model`）。
+     pub ask_every_step: bool,
+     /// 告诉大模型这一关要干什么。
+     pub goal: Option<String>,
++    /// 目标数字是屏幕上第几个数字（从 1 数）；不写就不判断停滞。
++    pub goal_number: Option<usize>,
+ }
+ 
+ pub fn parse(args: &[String]) -> Result<Args, String> {
+     if args.first().map(String::as_str) != Some("play") {
+         return Err(USAGE.into());
+     }
+-    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None };
++    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None, goal_number: None };
+     let mut it = args[1..].iter();
+     while let Some(flag) = it.next() {
+         match flag.as_str() {
+             "--dry-run" => a.dry_run = true,
+             "--auto-next" => a.auto_next = true,
+             "--tries" => {
+                 let v = it.next().ok_or("--tries 后面要写次数")?;
+                 a.tries = v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or("--tries 要在 1 到 20 之间")?;
+             }
+             "--ask-model" => a.ask_model = true,
+             "--ask-every-step" => {
+                 a.ask_every_step = true;
+                 a.ask_model = true;
+             }
+             "--goal" => a.goal = Some(it.next().ok_or("--goal 后面要写目标，比如 --goal \"清掉冰块\"")?.clone()),
++            "--goal-number" => {
++                const BAD: &str = "--goal-number 要写一个 1 到 20 的数字，比如 --goal-number 2 表示屏幕上第 2 个数字是目标";
++                let v = it.next().ok_or(BAD)?;
++                a.goal_number = Some(v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or(BAD)?);
++            }
+             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
+             "--steps" => {
+                 let v = it.next().ok_or("--steps 后面要写步数")?;
+                 a.steps = v.parse().ok().filter(|n| (1..=200).contains(n)).ok_or("--steps 要在 1 到 200 之间")?;
+             }
+             other => return Err(format!("不认识 {other}。{USAGE}")),
+         }
+     }
+     Ok(a)
+ }
+@@ -151,23 +158,23 @@ fn run_parsed(a: &Args) -> i32 {
+         if rec["kind"] == "nav" {
+             if let Some(line) = text::nav_line(&rec) {
+                 println!("{line}");
+             }
+         } else {
+             n += 1;
+             println!("{}", text::step_line(n, &rec));
+         }
+     };
+     let summary = if a.auto_next {
+-        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
++        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
+     } else {
+-        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
++        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
+     };
+     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
+     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
+     if code == 0 {
+         println!("{line}");
+     } else {
+         eprintln!("{line}");
+     }
+     code
+ }
+@@ -184,20 +191,29 @@ mod tests {
+         let d = parse(&["play".into()]).unwrap();
+         assert!(!d.ask_model && !d.ask_every_step);
+         // --ask-model 只在划了没反应时问；每一步都问要 --ask-every-step
+         assert!(!a.ask_every_step);
+         let e = parse(&["play".into(), "--ask-every-step".into()]).unwrap();
+         assert!(e.ask_every_step && e.ask_model);
+         assert_eq!(d.goal, None);
+         assert!(parse(&["play".into(), "--goal".into()]).is_err());
+     }
+ 
++    #[test]
++    fn parse_goal_number() {
++        assert_eq!(p(&["play", "--goal-number", "2"]).unwrap().goal_number, Some(2));
++        assert_eq!(p(&["play"]).unwrap().goal_number, None);
++        for bad in [&["play", "--goal-number", "0"][..], &["play", "--goal-number", "21"], &["play", "--goal-number", "x"], &["play", "--goal-number"]] {
++            assert!(p(bad).err().unwrap().contains("--goal-number 要写一个 1 到 20 的数字"));
++        }
++    }
++
+     fn p(v: &[&str]) -> Result<Args, String> {
+         parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+     }
+ 
+     #[test]
+     fn defaults() {
+         let a = p(&["play"]).unwrap();
+         assert_eq!((a.game.as_str(), a.steps, a.dry_run), ("candy-crush", 20, false));
+         assert_eq!((a.auto_next, a.tries), (false, 5));
+     }
+diff --git a/src/game/skill.md b/src/game/skill.md
+index da2224c..f78d8f6 100644
+--- a/src/game/skill.md
++++ b/src/game/skill.md
+@@ -40,20 +40,22 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
+ - 弹窗只关「Close」「Not now」「No thanks」这一类安全的，其它一律不点；
+ - 遇到要花钱的画面、广告、生命用完、通关了、不认识的画面，就停下，什么都不点；
+ - 也会一边做一边印一行，例如「点了「Play」，开始新的一局」「这一局没过，点了「Try again」重来」。
+ 
+ 把这些话转述给用户。它停下以后，把最后一句话原样告诉用户（比如「生命用完了」「出现了广告，请你自己关掉」），由用户决定下一步。
+ 
+ ## 玩不动的时候
+ 
+ 规则选的步没反应时，可以加 `--ask-model`：卡住了才问大模型，让它从规则列出的几步里挑一步。想让它每一步都挑，加 `--ask-every-step`：每一步都问大模型（会慢一些，用来对比）。加 `--goal "清掉冰块"` 告诉它这一关要干什么。没配大模型、或者大模型没回应，也能玩，只是这次只用规则。
+ 
++连着好几步屏幕上的目标数字都没变小，就算「没有进展」，会记下来、说出来，也会去问大模型。要用 `--goal-number 2`（表示屏幕上第 2 个数字是目标）指明哪个数字是目标；不知道目标是哪个数字时不会判断停滞；用 --goal-number 指明。
++
+ ## 停
+ 
+ - 用户说「停」，马上中断这条命令。
+ - 命令自己停下时（没有能走的步、读不出棋盘、画面一直在动、连着两次没反应、dco 急停），把它印的最后一句话原样告诉用户。
+ - 不要自己去点屏幕补救，也不要换别的办法去操作游戏；让用户决定下一步。
+ 
+ ## 不要做
+ 
+ - 不要自己调用 dco 去点关卡按钮、道具、广告、付款。`--auto-next` 停下以后，也不要替它去点屏幕上的按钮、关广告或买东西。
+ - 不要同时开两条 `dct game play`。
+diff --git a/src/game/text.rs b/src/game/text.rs
+index e1663ff..e3f0d70 100644
+--- a/src/game/text.rs
++++ b/src/game/text.rs
+@@ -38,20 +38,23 @@ pub fn step_line(step: usize, rec: &Value) -> String {
+         outcome => {
+             let t = &rec["timing_ms"];
+             if t.is_object() {
+                 s += &format!("（读 {} ms，选 {} ms，划 {} ms）", n(&t["read"]), n(&t["choose"]), n(&t["swipe"]));
+             }
+             if outcome == "no_change" {
+                 s += "；这一步划了没反应";
+             }
+         }
+     }
++    if rec["stalled"].as_bool() == Some(true) {
++        s += "；这几步看起来没有进展";
++    }
+     if rec["decider"] == "model" {
+         s += "（大模型选的）";
+     }
+     s
+ }
+ 
+ /// 写进记录文件的停下原因（给程序看的，不是给人看的）。
+ pub fn stop_code(stop: &Stop) -> &'static str {
+     match stop {
+         Stop::NoGrid(_) => "no_grid",
+@@ -314,11 +317,19 @@ mod tests {
+             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("这个画面上我没有点任何东西"));
+         }
+     }
+ 
+     #[test]
+     fn stop_sentences_for_money_and_ads_promise_nothing_was_pressed() {
+         for s in [Stop::Money, Stop::Ad] {
+             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("没有点任何东西"));
+         }
+     }
++
++    #[test]
++    fn step_line_says_so_when_stalled() {
++        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","stalled":true});
++        assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
++        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
++        assert!(!step_line(1, &rec2).contains("没有进展"));
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 8e7de4e..61246ed 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -24,21 +24,21 @@ dct —— vibe coding 终端
+   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
+                    靠它，没有它撤销是死的；同样只给 dct 自己用
+   dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
+                    后台空着就直接起一个新的
+   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
+   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
+   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
+   dct join <邀请码> [--name 电脑名]
+                    新电脑上：用老电脑给的码加入（没登录会先自动登录）
+   dct game play [--game candy-crush] [--steps 20] [--dry-run]
+-                   [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]
++                   [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]
+                    让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
+   dct game ask-bench <记录文件>... [--limit 40]
+                    拿以前记下的局面问大模型，看它比乱选强多少（不碰手机）
+   dct peers        看组里有哪些电脑、开着哪些会话
+   dct send <电脑名>/<会话名> \"<内容>\"
+                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
+                    那边空着就马上敲进去，忙就排队
+   dct peers remove <电脑名>           把一台电脑移出组
+   dct daemon       只跑守护进程，不开界面
+   dct gate         远程版那道门：守着一个端口，只放带对钥匙的人进去。
+diff --git a/tests/game_cli.rs b/tests/game_cli.rs
+index 573599a..f0b2c64 100644
+--- a/tests/game_cli.rs
++++ b/tests/game_cli.rs
+@@ -44,20 +44,22 @@ fn fake_dco(home: &std::path::Path, swipe_error: Option<&'static str>) -> std::t
+                 return tools;
+             }
+             let req: Value = serde_json::from_str(line.trim()).unwrap();
+             let Some(id) = req.get("id") else { continue };
+             let result = match req["method"].as_str().unwrap() {
+                 "tools/call" => {
+                     let name = req["params"]["name"].as_str().unwrap().to_string();
+                     tools.push(name.clone());
+                     let (body, is_error) = match (name.as_str(), swipe_error) {
+                         ("read_grid", _) => (board(), false),
++                        // 进度数字读不到也不影响玩：这个假 dco 不会认字。
++                        ("see", _) => (json!({"error": {"code": "unsupported", "message": "x"}}), true),
+                         ("swipe", Some(code)) => (json!({"error": {"code": code, "message": "x"}}), true),
+                         ("swipe", None) => (json!({"swiped": true}), false),
+                         (other, _) => panic!("没想到会调 {other}"),
+                     };
+                     json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
+                 }
+                 _ => json!({"protocolVersion": "2025-06-18"}),
+             };
+             writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).unwrap();
+         }
+@@ -96,21 +98,21 @@ fn a_dry_run_prints_the_move_never_swipes_and_logs_it() {
+     assert_eq!((lines[1]["stop"].as_str(), lines[1]["steps"].as_u64()), (Some("dry_run"), Some(0)));
+ }
+ 
+ #[test]
+ fn a_halted_dco_stops_the_game_with_a_plain_sentence_and_a_failing_exit_code() {
+     let home = tempfile::tempdir().unwrap();
+     let h = fake_dco(home.path(), Some("halted"));
+     let (out, err, code) = dct(home.path(), &["game", "play", "--steps", "3"]);
+     assert_eq!(code, 1, "{out}{err}");
+     assert!(err.contains("急停"), "{err}");
+-    assert_eq!(h.join().unwrap(), vec!["read_grid", "swipe"]);
++    assert_eq!(h.join().unwrap(), vec!["see", "read_grid", "swipe"]);
+     assert!(err.contains("走了 0 步"), "{err}");
+     assert!(out.contains("这一步没划成") && !out.contains("消 ") && !out.contains("第 1 步"), "{out}");
+     let lines = log_lines(home.path());
+     assert_eq!(lines.last().unwrap()["stop"], "dco");
+     assert_eq!(lines.last().unwrap()["steps"], 0);
+     assert_eq!(lines[0]["swiped"], false);
+     assert!(lines[0]["candidates"][0]["features"]["cleared"].as_u64().is_some());
+     let run = lines[0]["run_id"].as_str().unwrap();
+     assert_eq!(run.len(), 8);
+     assert!(lines.iter().all(|l| l["run_id"] == run), "同一次运行的记录要带同一个 run_id");

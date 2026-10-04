@@ -1,0 +1,327 @@
+# Review package: 6c18928..HEAD
+
+## Commits
+37ecd4b feat(game): cells of a refused swap stay off-limits until the board changes; five refusals in a row before stopping
+
+## Files changed
+ crates/dct-game/src/play.rs       |  22 +++++--
+ crates/dct-game/src/play_tests.rs | 124 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 136 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index b21ca1b..80f3a07 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -59,20 +59,22 @@ pub trait Dco {
+     fn show_status(&mut self, _state: &str) {}
+ }
+ 
+ pub trait Clock {
+     fn now_ms(&self) -> u64;
+     fn sleep_ms(&mut self, ms: u64);
+ }
+ 
+ /// 最多发给模型几个候选。
+ pub const ASK_SHOWN: usize = 8;
++/// 连着最多几次「划了没反应」才停。被拒绝的格子在棋盘变化前不再被选，所以多试几次不会重复同一处。
++pub const MAX_REFUSED_IN_A_ROW: usize = 5;
+ 
+ pub struct Options<'a> {
+     pub max_steps: usize,
+     pub dry_run: bool,
+     /// 规则没把握时问的那个。`None` = 不问（和以前一样）。
+     pub advisor: Option<&'a dyn Advisor>,
+     /// 每一步都问（`--ask-every-step`）；否则只在这盘棋上已有失败的步时才问。
+     pub ask_always: bool,
+     /// 这一次 `play()` 最多问几次。
+     pub ask_budget: usize,
+@@ -213,20 +215,21 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
+     let [x, y, w, h] = p.region;
+     (x + (c as f64 + 0.5) / p.cols as f64 * w, y + (r as f64 + 0.5) / p.rows as f64 * h)
+ }
+ 
+ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
+     let mut steps = 0;
+     let mut baseline: Option<usize> = None;
+     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+     let mut asked = 0usize;
+     let mut streak = 0;
++    let mut locked: Vec<(usize, usize)> = Vec::new();
+     let mut current: Option<GridRead> = None;
+     let mut no_move_confirms = 0;
+     let stop = loop {
+         if steps >= o.max_steps {
+             break Stop::StepsDone;
+         }
+         let t_read = clock.now_ms();
+         let g = match current.take() {
+             Some(g) => g,
+             None => match dco.read_grid(p) {
+@@ -264,21 +267,25 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         }
+         let Ok(board) = Board::from_read_fixed(&g, &fixed_ids(&g, &p.fixed_rgb, p.match_de), !p.fixed_rgb.is_empty()) else {
+             break Stop::NoGrid("棋盘的行列数对不上".into());
+         };
+         // 规则选步约 1 ms，不发 think/look：章鱼没法“想”这么短，停住的状态反而拖慢动画。
+         // 只在问模型（慢）的那段时间发 think/look。
+         let t_choose = clock.now_ms();
+         let cands: Vec<Candidate> = choose(&board, &p.weights);
+         let choose_ms = clock.now_ms().saturating_sub(t_choose);
+         // 同一盘棋上划了没反应的步，不再重复选。
+-        let pick = cands.iter().position(|c| !failed.iter().any(|(m, cells)| *m == c.mv && *cells == canonical(&g.cells)));
++        let board_key = canonical(&g.cells);
++        let blocked = |c: &Candidate| {
++            failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key) || locked.contains(&c.mv.a) || locked.contains(&c.mv.b)
++        };
++        let pick = cands.iter().position(|c| !blocked(c));
+         if cands.is_empty() && !o.dry_run && no_move_confirms < MAX_NO_MOVE_CONFIRMS {
+             // 补糖还没补完时会有一瞬间没步可走：停一下再读，盘面变了或有步了就接着玩。
+             no_move_confirms += 1;
+             clock.sleep_ms(CONFIRM_PAUSE_MS);
+             match dco.read_grid(p) {
+                 Ok(re) => {
+                     if same(&re, &g) && !has_move(p, &re) {
+                         break Stop::NoMoves;
+                     }
+                     current = Some(re);
+@@ -288,25 +295,23 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+                 Err(e) => break Stop::Dco(e),
+             }
+         }
+         let Some(pick) = pick else {
+             break if cands.is_empty() { Stop::NoMoves } else { Stop::Stuck };
+         };
+         let mut pick = pick;
+         let mut ask_rec: Option<Value> = None;
+         let mut decider = "rules";
+         if let Some(adv) = o.advisor {
+-            let board_key = canonical(&g.cells);
+             // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
+             let offered: Vec<usize> = {
+-                let is_failed = |c: &Candidate| failed.iter().any(|(m, cells)| *m == c.mv && *cells == board_key);
+-                (0..cands.len()).filter(|&i| !is_failed(&cands[i])).take(ASK_SHOWN).collect()
++                (0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()
+             };
+             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
+             if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
+                 asked += 1;
+                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
+                 let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
+                 let input = AskInput {
+                     board: board_text(&g, &fixed),
+                     goal: o.goal.to_string(),
+                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
+@@ -372,40 +377,45 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         let result = settle(dco, clock, p, &g);
+         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+         match result {
+             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+             Settle::Settled(next) if same(&next, &g) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+-                if streak >= 2 {
++                locked.push(chosen.mv.a);
++                locked.push(chosen.mv.b);
++                if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 sink(rec);
+                 streak = 0;
+                 failed.clear();
++                locked.clear();
+                 current = Some(next);
+             }
+             Settle::NoChange(same_board) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["after_observation_id"] = json!(same_board.observation_id);
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+-                if streak >= 2 {
++                locked.push(chosen.mv.a);
++                locked.push(chosen.mv.b);
++                if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(same_board);
+             }
+             Settle::StillMoving => {
+                 rec["outcome"] = json!("stopped");
+                 sink(rec);
+                 break Stop::StillMoving;
+             }
+             Settle::NoGrid(why) => {
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index a32fd6e..ab12281 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -752,29 +752,33 @@ fn without_ask_always_the_model_is_not_asked_on_a_clean_board() {
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run_ask(&mut d, Some(&say), false, 30, 1);
+     assert_eq!(say.calls.get(), 0);
+     assert_eq!(log[0]["decider"], "rules");
+     assert!(log[0].get("ask").is_none());
+ }
+ 
+ #[test]
+ fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
+     // 第一划没反应（A 一直不变），第二次选步时这盘棋上已有失败的步：问模型，失败的步在 failed 里、不在候选里
++    // （用 MANY：被拒绝的步锁住两格以后，棋盘上还得有至少两个不碰这两格的候选，模型才会被问）
+     let mut reads = vec![];
+     for _ in 0..40 {
+-        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(MANY)));
+     }
+-    reads.push(Ok(grid(MOVED)));
+-    reads.push(Ok(grid(MOVED)));
++    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
++    reads.push(Ok(grid(moved)));
++    reads.push(Ok(grid(moved)));
+     let say = Say::new(Some(0));
+     let mut d = Fake::new(reads);
+-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 2);
++    let mut log = vec![];
++    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰" };
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &o, &mut |v| log.push(v));
+     assert!(say.calls.get() >= 1);
+     let seen = say.seen.borrow();
+     assert_eq!(seen[0].failed.len(), 1);
+     assert!(!seen[0].candidates.iter().any(|c| *c == seen[0].failed[0]));
+     assert_eq!(log[0]["decider"], "rules");
+     assert_eq!(log[1]["decider"], "model");
+     // 模型回的是「候选里的第 1 个」；要靠 offered 映射回 cands，不能直接当 cands 下标，否则又选回刚失败的那步
+     assert_ne!(log[1]["chosen"], log[0]["chosen"]);
+     assert_ne!(log[1]["swipe"]["from"], log[0]["swipe"]["from"]);
+     let refused = log[0]["chosen"].clone();
+@@ -863,10 +867,122 @@ fn a_single_candidate_is_never_worth_asking_about() {
+ fn a_choice_outside_the_offered_list_falls_back_to_rules_and_is_recorded() {
+     let mut d0 = Fake::new(settled_script());
+     let _ = run_ask(&mut d0, None, false, 30, 1);
+     let say = Say::new(Some(99));
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+     assert_eq!(d.swipes[0], d0.swipes[0]);
+     assert_eq!(log[0]["decider"], "rules");
+     assert!(log[0]["ask"]["choice"].is_null());
+ }
++
++#[test]
++fn after_a_refused_swap_no_later_candidate_touches_its_two_cells() {
++    // 一直读到同一张盘（没变化）：第一步被拒绝以后，第二步选的步不碰第一步的两个格子
++    let mut reads = vec![];
++    for _ in 0..80 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let pos = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
++    assert!(log.len() >= 2, "{log:?}");
++    for i in 1..log.len() {
++        let (ai, bi) = (pos(&log[i], "a"), pos(&log[i], "b"));
++        for j in 0..i {
++            let (aj, bj) = (pos(&log[j], "a"), pos(&log[j], "b"));
++            for p in [&ai, &bi] {
++                assert!(*p != aj && *p != bj, "第 {i} 步碰了被拒绝的格子（第 {j} 步）：{log:?}");
++            }
++        }
++    }
++}
++
++// 6 行 4 列，每行一个互不相干的三连换法（交替用 2/4、1/3，避免竖向连线）
++const MANY: &[&[u16]] = &[
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++    &[1, 1, 2, 1],
++    &[3, 3, 4, 3],
++];
++
++#[test]
++fn five_refusals_in_a_row_stop_the_run_not_two() {
++    let mut reads = vec![];
++    for _ in 0..400 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    assert_eq!(s.stop, Stop::Stuck);
++    assert_eq!(d.swipes.len(), 5, "应该试满 5 次才停");
++}
++
++#[test]
++fn a_move_that_works_unlocks_the_cells() {
++    // 第一步没反应（锁住它的两格），第二步（别处）成功 → 解除；第三步又可以碰第一步的格子
++    let mut reads = vec![];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MANY)));
++    }
++    // 第二次划：变成另一张盘并落定
++    let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
++    reads.push(Ok(grid(moved)));
++    reads.push(Ok(grid(moved)));
++    for _ in 0..400 {
++        reads.push(Ok(grid(MANY)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
++    assert_eq!(&outcomes[..2], ["no_change", "moved"], "{outcomes:?}");
++}
++
++// 4x4：规则第一名之后，排在第一个「完全不碰」的候选前面，既有只和它共用 a 格的，也有只共用 b 格的候选
++const OVERLAP: &[&[u16]] = &[&[2, 3, 4, 2], &[3, 3, 3, 4], &[3, 4, 3, 3], &[2, 1, 4, 4]];
++
++#[test]
++fn a_refused_swap_locks_both_of_its_cells_even_when_better_candidates_share_only_one() {
++    let mut reads = vec![];
++    for _ in 0..200 {
++        reads.push(Ok(grid(OVERLAP)));
++    }
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    assert!(log.len() >= 2, "{log:?}");
++    let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
++    let (a0, b0) = (cell(&log[0], "a"), cell(&log[0], "b"));
++    for k in ["a", "b"] {
++        let p = cell(&log[1], k);
++        assert!(p != a0 && p != b0, "第二步碰了被拒绝的格子：{log:?}");
++    }
++}
++
++#[test]
++fn a_move_that_works_unlocks_cells_that_the_only_remaining_move_needs() {
++    // TWO 上有两个互不相干的步，规则先选下面一行的（低行优先），划了没反应 → 锁住那两格；
++    // 第二步选上面的，成功，盘面变成 AFTER：那里只剩下面那一行的步，要碰被锁过的格子。解锁了才能继续划。
++    const TWO: &[&[u16]] = &[&[1, 1, 2, 1], &[3, 4, 3, 4], &[4, 3, 4, 3], &[5, 5, 6, 5]];
++    const AFTER: &[&[u16]] = &[&[1, 2, 1, 2], &[2, 1, 2, 1], &[3, 4, 3, 4], &[5, 5, 6, 5]];
++    let mut reads = vec![];
++    for _ in 0..40 {
++        reads.push(Ok(grid(TWO)));
++    }
++    reads.push(Ok(grid(AFTER)));
++    reads.push(Ok(grid(AFTER)));
++    let mut d = Fake::new(reads);
++    let mut log = vec![];
++    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
++    // 第三步：规则第一名就是那个碰被锁过的格子的步（没解锁的话它会被跳过）
++    let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
++    let first_cells = [cell(&log[0], "a"), cell(&log[0], "b")];
++    assert!(outcomes.len() >= 3, "{outcomes:?}");
++    assert!(first_cells.contains(&cell(&log[2], "a")) || first_cells.contains(&cell(&log[2], "b")), "第三步该碰第一步的格子：{log:?}");
++    assert!(outcomes[0] == "no_change" && outcomes[1] == "moved", "{outcomes:?}");
++}
