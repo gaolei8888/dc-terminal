@@ -4,7 +4,7 @@
 //! 输出畸形全都能不打网络地测。
 
 use super::creds::Credential;
-use super::{Backend, LlmError, Prompt};
+use super::{Backend, LlmError, Prompt, Usage};
 use crate::profile::Wire;
 use serde_json::json;
 use std::sync::Arc;
@@ -81,6 +81,22 @@ pub struct HttpBackend {
     sender: Arc<Sender>,
 }
 
+/// 读用量：OpenAI 型 `usage.prompt_tokens / completion_tokens`，Anthropic 型 `usage.input_tokens / output_tokens`。
+/// 两个字段都必须是非负整数（JSON 里的 u64）才算读到；缺一个、是字符串、是负数、超出范围都是 `None`——
+/// 读不到用量绝不能丢掉一个好答案，所以这里只返回 `None`，从不报错。
+pub fn extract_usage(wire: Wire, body: &str) -> Option<Usage> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let u = v.get("usage")?;
+    let (a, b) = match wire {
+        Wire::Openai => ("prompt_tokens", "completion_tokens"),
+        Wire::Anthropic => ("input_tokens", "output_tokens"),
+    };
+    Some(Usage {
+        input: u.get(a)?.as_u64()?,
+        output: u.get(b)?.as_u64()?,
+    })
+}
+
 impl HttpBackend {
     pub fn new(url: String, wire: Wire, model: String, cred: Credential) -> HttpBackend {
         HttpBackend {
@@ -111,6 +127,10 @@ impl HttpBackend {
 
 impl Backend for HttpBackend {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
+        self.complete_counted(p).map(|(s, _)| s)
+    }
+
+    fn complete_counted(&self, p: &Prompt) -> Result<(String, Option<Usage>), LlmError> {
         let body = body_for(self.wire, &self.model, p);
         let (status, text) = (self.sender)(&self.url, &self.cred, &body).map_err(|e| {
             eprintln!("LLM HTTP 调用失败：{e}");
@@ -120,8 +140,9 @@ impl Backend for HttpBackend {
             eprintln!("LLM HTTP 返回 {status}");
             return Err(LlmError::Unavailable);
         }
-        // 读不懂 = 没把握。绝不猜一个答案出来。
-        extract_text(self.wire, &text).ok_or(LlmError::Malformed)
+        // 读不懂 = 没把握。绝不猜一个答案出来；用量读不到不影响答案。
+        let answer = extract_text(self.wire, &text).ok_or(LlmError::Malformed)?;
+        Ok((answer, extract_usage(self.wire, &text)))
     }
 }
 
@@ -386,5 +407,69 @@ mod tests {
         assert_eq!(cred, Credential::Key("sk-abc".into()));
         assert_eq!(body["system"], "s");
         assert!(body["messages"][0].get("system").is_none());
+    }
+
+    #[test]
+    fn usage_is_read_from_openai_and_anthropic_shapes() {
+        let o = r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":120,"completion_tokens":5,"total_tokens":125}}"#;
+        assert_eq!(
+            extract_usage(Wire::Openai, o),
+            Some(Usage {
+                input: 120,
+                output: 5
+            })
+        );
+        let a = r#"{"content":[{"type":"text","text":"2"}],"usage":{"input_tokens":77,"output_tokens":3}}"#;
+        assert_eq!(
+            extract_usage(Wire::Anthropic, a),
+            Some(Usage {
+                input: 77,
+                output: 3
+            })
+        );
+    }
+
+    #[test]
+    fn usage_is_none_when_missing_or_malformed_but_the_answer_still_comes_back() {
+        for body in [
+            r#"{"choices":[{"message":{"content":"2"}}]}"#,
+            r#"{"choices":[{"message":{"content":"2"}}],"usage":null}"#,
+            r#"{"choices":[{"message":{"content":"2"}}],"usage":"many"}"#,
+            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":"12","completion_tokens":5}}"#,
+            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":-3,"completion_tokens":5}}"#,
+            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":12}}"#,
+            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":99999999999999999999999,"completion_tokens":1}}"#,
+        ] {
+            assert_eq!(extract_usage(Wire::Openai, body), None, "{body}");
+            assert_eq!(
+                extract_text(Wire::Openai, body).as_deref(),
+                Some("2"),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_backend_complete_counted_returns_text_and_usage() {
+        let b = HttpBackend::with_sender(
+            "http://x".into(),
+            Wire::Openai,
+            "m".into(),
+            Credential::Bearer("k".into()),
+            Arc::new(|_, _, _| {
+                Ok((200, r#"{"choices":[{"message":{"content":"3"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#.to_string()))
+            }),
+        );
+        assert_eq!(
+            b.complete_counted(&p()),
+            Ok((
+                "3".to_string(),
+                Some(Usage {
+                    input: 10,
+                    output: 2
+                })
+            ))
+        );
+        assert_eq!(b.complete(&p()), Ok("3".to_string()));
     }
 }
