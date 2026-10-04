@@ -9,7 +9,7 @@
 //! 都不保证只出低 S），同一张票能有不止一个合法签名字节串。按签名字节去重，
 //! 一次已批准的发布或付款就可能被重放第二次。
 use crate::canon::{field, sha256_id};
-use crate::ticket::{Ticket, Waiver, TICKET_VERSION};
+use crate::ticket::{Subject, Ticket, Waiver, TICKET_VERSION};
 use crate::tier::{SignerRole, Tier};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::ecdsa::{signature::Verifier as _, Signature as EcSig, VerifyingKey};
@@ -193,9 +193,10 @@ pub fn verify_sig(sig: &Signature, msg: &[u8], trusted: &[TrustedKey]) -> Result
     Ok(key.role)
 }
 
-/// 唯一的例外：`Content` 票带 `no_text` 凭据时，自动钥匙也能签。`Money` / `Critical`
+/// 唯一的例外：`Content` 的 `tap_at` 票带 `no_text` 凭据时，自动钥匙也能签。`Money` / `Critical`
 /// 永远只认用户钥匙（`rule_can_waive` 为假）。
-fn role_may_sign(tier: Tier, role: SignerRole, waiver: Option<&Waiver>) -> bool {
+fn role_may_sign(t: &Ticket, role: SignerRole) -> bool {
+    let tier = t.tier;
     match tier.required_signer() {
         None | Some(SignerRole::Auto) => true,
         Some(SignerRole::User) => {
@@ -203,9 +204,16 @@ fn role_may_sign(tier: Tier, role: SignerRole, waiver: Option<&Waiver>) -> bool 
                 || (role == SignerRole::Auto
                     && tier == Tier::Content
                     && tier.rule_can_waive()
-                    && waiver.is_some_and(|w| w.kind == "no_text"))
+                    && waiver_applies(t))
         }
     }
+}
+
+/// 例外只给「按坐标点一下」：票的主体必须是 `tap_at` 这个动作，且带 `no_text` 凭据。
+/// 流程（Procedure）和别的工具（tap、pick_file、打字……）一律没有例外，凭据写什么都一样。
+fn waiver_applies(t: &Ticket) -> bool {
+    matches!(&t.subject, Subject::Action { tool, .. } if tool == "tap_at")
+        && t.waiver.as_ref().is_some_and(|w| w.kind == "no_text")
 }
 
 /// 凭据本身合不合格：只认 `no_text`，区域必须非空且完全落在屏幕内（按 u32 算，不会溢出）。
@@ -251,7 +259,7 @@ pub fn verify(st: &SignedTicket, trusted: &[TrustedKey], device: &str, now: u64)
             return Err(VerifyError::BadWaiver);
         }
     }
-    if !role_may_sign(t.tier, role, t.waiver.as_ref()) {
+    if !role_may_sign(t, role) {
         return Err(VerifyError::WrongRole { need: SignerRole::User });
     }
     Ok(())
@@ -510,10 +518,15 @@ mod tests {
         t
     }
 
+    /// 带凭据、工具是 `tap_at` 的票：唯一能享受例外的形状。
+    fn tapped(tier: Tier, n: char, w: crate::ticket::Waiver) -> Ticket {
+        action(waived(tier, n, w), "tap_at")
+    }
+
     #[test]
     fn a_no_text_waiver_lets_the_auto_key_sign_a_content_ticket() {
         let (auto, user, trusted) = keys();
-        let a = sign_one(waived(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &auto, "").unwrap();
+        let a = sign_one(tapped(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &auto, "").unwrap();
         assert_eq!(verify(&a, &trusted, "mac-lei", 150), Ok(()));
         let u = sign_one(waived(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &user, "").unwrap();
         assert_eq!(verify(&u, &trusted, "mac-lei", 150), Ok(()));
@@ -523,7 +536,7 @@ mod tests {
     fn a_waiver_never_lets_the_auto_key_sign_money_or_critical() {
         let (auto, _, trusted) = keys();
         for tier in [Tier::Money, Tier::Critical] {
-            let st = sign_one(waived(tier, 'a', wv("no_text", 0, 0, 10000, 10000)), &auto, "").unwrap();
+            let st = sign_one(tapped(tier, 'a', wv("no_text", 0, 0, 10000, 10000)), &auto, "").unwrap();
             assert_eq!(
                 verify(&st, &trusted, "mac-lei", 150),
                 Err(VerifyError::WrongRole { need: SignerRole::User }),
@@ -568,14 +581,14 @@ mod tests {
                 assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::BadWaiver), "{w:?}");
             }
         }
-        let edge = sign_one(waived(Tier::Content, 'a', wv("no_text", 9000, 9000, 1000, 1000)), &auto, "").unwrap();
+        let edge = sign_one(tapped(Tier::Content, 'a', wv("no_text", 9000, 9000, 1000, 1000)), &auto, "").unwrap();
         assert_eq!(verify(&edge, &trusted, "mac-lei", 150), Ok(()));
     }
 
     #[test]
     fn editing_the_waiver_after_signing_breaks_the_signature() {
         let (auto, _, trusted) = keys();
-        let mut st = sign_one(waived(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &auto, "").unwrap();
+        let mut st = sign_one(tapped(Tier::Content, 'a', wv("no_text", 300, 1200, 7500, 6600)), &auto, "").unwrap();
         st.ticket.waiver.as_mut().unwrap().rule_sha256 = "sha256:bb".into();
         assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::BadSignature));
     }
@@ -585,5 +598,57 @@ mod tests {
         let (auto, _, trusted) = keys();
         let st = sign_one(ticket(Tier::Physical, 'a'), &auto, "").unwrap();
         assert_eq!(verify(&st, &trusted, "mac-lei", 150), Ok(()));
+    }
+
+    fn action(mut t: Ticket, tool: &str) -> Ticket {
+        t.subject = Subject::Action { tool: tool.into(), args_sha256: "sha256:a".into() };
+        t
+    }
+
+    fn good() -> crate::ticket::Waiver {
+        wv("no_text", 300, 1200, 7500, 6600)
+    }
+
+    #[test]
+    fn the_exception_covers_only_the_tap_at_action() {
+        let (auto, user, trusted) = keys();
+        let proc_t = waived(Tier::Content, 'a', good());
+        let tap = action(waived(Tier::Content, 'b', good()), "tap");
+        let tap_at = tapped(Tier::Content, 'c', good());
+        for t in [&proc_t, &tap] {
+            let st = sign_one(t.clone(), &auto, "").unwrap();
+            assert_eq!(
+                verify(&st, &trusted, "mac-lei", 150),
+                Err(VerifyError::WrongRole { need: SignerRole::User })
+            );
+        }
+        let st = sign_one(tap_at.clone(), &auto, "").unwrap();
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Ok(()));
+        for t in [proc_t, tap, tap_at] {
+            let st = sign_one(t, &user, "").unwrap();
+            assert_eq!(verify(&st, &trusted, "mac-lei", 150), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_tap_at_ticket_with_a_non_no_text_waiver_is_refused() {
+        let (auto, _, trusted) = keys();
+        let t = tapped(Tier::Content, 'a', wv("other", 0, 0, 100, 100));
+        assert!(!role_may_sign(&t, SignerRole::Auto));
+        let st = sign_one(t, &auto, "").unwrap();
+        assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::BadWaiver));
+    }
+
+    #[test]
+    fn in_a_batch_the_exception_is_judged_ticket_by_ticket() {
+        let (auto, _, trusted) = keys();
+        let ok = tapped(Tier::Content, 'a', good());
+        let no = waived(Tier::Content, 'b', good());
+        let b = sign_batch(vec![ok, no], &auto, "").unwrap();
+        assert_eq!(verify(&b[0], &trusted, "mac-lei", 150), Ok(()));
+        assert_eq!(
+            verify(&b[1], &trusted, "mac-lei", 150),
+            Err(VerifyError::WrongRole { need: SignerRole::User })
+        );
     }
 }
