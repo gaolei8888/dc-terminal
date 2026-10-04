@@ -1,0 +1,3715 @@
+# Review package: adacd36..12076c3
+
+## Commits
+12076c3 docs: keep the task-4 brief and report
+0708163 feat: wire the phone page into the daemon, board, and mutation-close the gaps
+01eb34c feat: a page for the phone, because pairing is something you watch
+5754a82 feat: phone status protocol, token storage, and daemon-side state
+
+## Files changed
+ .../2026-08-10-dct-phone-channel/task-4-brief.md   | 152 +++++
+ .../2026-08-10-dct-phone-channel/task-4-report.md  | 299 ++++++++++
+ src/daemon.rs                                      | 532 ++++++++++++++++-
+ src/i18n.rs                                        | 121 +++-
+ src/proto.rs                                       | 129 ++++-
+ src/secrets.rs                                     |   8 +
+ src/ui/app.rs                                      |  16 +
+ src/ui/mod.rs                                      | 168 ++++++
+ src/ui/phone.rs                                    | 641 +++++++++++++++++++++
+ src/ui/settings_view.rs                            | 104 +++-
+ src/ui/view.rs                                     | 363 +++++++++++-
+ 11 files changed, 2504 insertions(+), 29 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-4-brief.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-4-brief.md
+new file mode 100644
+index 0000000..afbbd2b
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-4-brief.md
+@@ -0,0 +1,152 @@
++## Task 4: 协议、令牌存储、手机通知页
++
++**Files:**
++- Modify: `src/proto.rs`、`src/daemon.rs`、`src/secrets.rs`、`src/ui/view.rs`、`src/i18n.rs`
++- Create: `src/ui/phone.rs`
++- Test: `src/ui/phone.rs` 内 + `src/proto.rs` 内
++
++**Interfaces:**
++- Consumes: Task 3 的 `SettingsItem::Phone`
++- Produces: `Request::PhoneStatus` / `PhoneSetToken { token }` / `PhoneUnpair` / `PhoneDisable`、`Response::Phone(PhoneStatus)`、`PhoneStatus { state: PhoneState, bot: Option<String>, owner: Option<String> }`、`PhoneState { Off, WaitingForPairing, Paired, Broken(String) }`、`View::Phone { status: PhoneStatus }`、`secrets::PHONE_TOKEN_KEY`
++
++- [ ] **Step 1: 写失败测试**
++
++```rust
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::i18n::Lang;
++
++    /// 这一页存在的全部理由是那一行状态。四种取值，**每一种都要带下一步**——
++    /// 一个不告诉用户下一步该干什么的错误，按房规就是没写完。
++    #[test]
++    fn every_state_tells_the_user_what_to_do_next() {
++        for st in [
++            PhoneState::Off,
++            PhoneState::WaitingForPairing,
++            PhoneState::Paired,
++            PhoneState::Broken("token revoked".into()),
++        ] {
++            let s = status_line(
++                &PhoneStatus { state: st.clone(), bot: Some("my_bot".into()), owner: None },
++                Lang::Zh,
++            );
++            assert!(!s.is_empty(), "{st:?} 没有状态文案");
++        }
++        // 「已连上」是唯一不需要下一步的：它就是终点。其余三种都必须给出路。
++        for st in [
++            PhoneState::Off,
++            PhoneState::WaitingForPairing,
++            PhoneState::Broken("token revoked".into()),
++        ] {
++            let s = next_step(
++                &PhoneStatus { state: st.clone(), bot: Some("my_bot".into()), owner: None },
++                Lang::Zh,
++            );
++            assert!(s.is_some(), "{st:?} 没有给出下一步");
++        }
++        assert!(next_step(
++            &PhoneStatus { state: PhoneState::Paired, bot: Some("my_bot".into()), owner: Some("lei".into()) },
++            Lang::Zh
++        ).is_none());
++    }
++
++    /// 等配对时必须把 bot 名字说出来，否则「去给它发条消息」是句没法执行的话。
++    #[test]
++    fn waiting_names_the_bot() {
++        let s = status_line(
++            &PhoneStatus { state: PhoneState::WaitingForPairing, bot: Some("my_dct_bot".into()), owner: None },
++            Lang::Zh,
++        );
++        assert!(s.contains("my_dct_bot"), "等配对却没说是哪个 bot：{s}");
++    }
++
++    /// 令牌是密钥。**任何一处状态文案都不许把它带出来。**
++    #[test]
++    fn the_token_never_appears_in_any_status_text() {
++        let st = PhoneStatus {
++            state: PhoneState::Broken("123456:AAH-SECRET".into()),
++            bot: None,
++            owner: None,
++        };
++        let s = format!("{}{}", status_line(&st, Lang::Zh), next_step(&st, Lang::Zh).unwrap_or_default());
++        assert!(!s.contains("AAH-SECRET"), "令牌漏进了界面文案：{s}");
++    }
++}
++```
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo test --lib ui::phone -- --test-threads=1`
++Expected: `cannot find type PhoneStatus`
++
++- [ ] **Step 3: 实现**
++
++`proto.rs` 加类型（`PhoneState::Broken` 里装的是**已经成文的人话**，不是原始错误）：
++
++```rust
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub enum PhoneState {
++    /// 还没填令牌
++    Off,
++    /// 填了、验过了，在等用户给 bot 发第一条消息
++    WaitingForPairing,
++    Paired,
++    /// 连不上。**装的是人话**，不是原始错误文本——守护进程是唯一决定
++    /// 用户看到什么文字的地方（`proto.rs` 顶上那条已有的约定）。
++    Broken(String),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PhoneStatus {
++    pub state: PhoneState,
++    /// bot 用户名，`getMe` 拿的。等配对那句话要用它。
++    pub bot: Option<String>,
++    /// 配上的主人，显示用。
++    pub owner: Option<String>,
++}
++```
++
++`secrets.rs` 加保留名字：
++
++```rust
++/// 手机通知的令牌存在密钥仓里，用一个 profile 不可能占用的名字。
++///
++/// **它不会出现在密钥页（`c`）里**，因为那一页遍历的是 profiles 再查
++/// `has_secret`（见 `ui/pick.rs`），不是遍历这个文件的键。
++/// 将来谁把密钥页改成遍历 `secrets.toml`，这个名字就会作为一个不存在的
++/// agent 冒出来——改那里的人请回来看这一句。
++pub const PHONE_TOKEN_KEY: &str = "__phone__";
++```
++
++`ui/phone.rs` 写 `status_line()` / `next_step()` 两个**纯函数** + `draw()` + `handle_key()`（`Enter` 填令牌、`r` 重新配对、`x` 关掉、`Esc` 回设置页）。
++
++`Request::PhoneSetToken` 的处理走 `getMe` 验证，复用 `EnterSecret` 的 `SecretPhase::Verifying` 反馈。
++
++- [ ] **Step 4: 跑测试确认通过**
++
++Run: `cargo test --lib -- --test-threads=1`
++Expected: PASS
++
++- [ ] **Step 5: 变异测试**
++
++把 `next_step` 里 `Paired` 那条分支改成也返回 `Some(...)`，第一个测试的最后一句断言必须失败。把 `status_line` 里 `WaitingForPairing` 分支的 bot 名字插值去掉，`waiting_names_the_bot` 必须失败。
++
++- [ ] **Step 6: 提交**
++
++```bash
++cargo fmt && cargo clippy --all-targets
++git add src/proto.rs src/daemon.rs src/secrets.rs src/ui/phone.rs src/ui/view.rs src/i18n.rs
++git commit -m "feat: a page for the phone, because pairing is something you watch
++
++Filling in a token is the easy half. The other half is that pairing is
++asynchronous -- the daemon sits polling until you message the bot -- and
++without somewhere to show that, you type a token and stare at a page that
++does nothing.
++
++Four states, each carrying its own next step, and a test that says the token
++never reaches any of them."
++```
++
++---
++
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-4-report.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-4-report.md
+new file mode 100644
+index 0000000..e03817a
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-4-report.md
+@@ -0,0 +1,299 @@
++# Task 4 report: protocol, token storage, phone notification page
++
++**Status:** complete. Commits on `feat/phone-channel` (base `adacd36`):
++- `5754a82` — phone status protocol, token storage, daemon-side state
++- `01eb34c` — the phone page itself (`ui/phone.rs`), settings wiring
++- `0708163` — daemon/mod.rs wiring closed out, mutation-driven fixes
++
++The run that produced these three commits was interrupted once by an API
++connection error partway through wiring `mod.rs` (between commits 1 and 2,
++the tree briefly did not compile — two `todo!()`-shaped holes in the draw/key
++dispatch). The coordinator's resumption message is accurate; I picked up
++exactly where it said and finished from there. Nothing was redone or lost.
++
++## Brief inaccuracies found, and what I did about them
++
++### 1. `Request::PhoneSetToken` needed `lang`, which the brief's interface line omits
++
++The brief's Interfaces line lists `PhoneSetToken { token }`. But
++`PhoneState::Broken(String)` is defined (by the brief itself, verbatim) to
++carry **already-composed human text**, not a code — and composing a correct
++sentence requires knowing which language to write it in. The daemon is a
++long-lived process that doesn't know the UI's language on its own; the one
++place it *can* know is a request that tells it, exactly like
++`Request::Profiles { lang }` already does (and exactly the convention
++`proto.rs`'s own `SecretPrompt` doc comment names: "组句发生在哪一侧必须
++一致... daemon 端已经知道用户语言"). Without `lang`, `PhoneSetToken` would
++have no way to pick between "这个令牌用不了..." and its English
++equivalent when composing the `Broken` message.
++
++I added `lang: crate::i18n::Lang` to the request, updated the protocol
++pinning test (`the_request_shape_is_pinned_to_the_protocol_version`), and
++redacted `token` (not `lang`) in the hand-written `Debug` impl, mirroring
++`SetSecret`/`VerifySecret`.
++
++### 2. `View::Phone { status: PhoneStatus }` is missing the field that makes `Enter` (fill in token) possible
++
++The brief's Produces line gives `View::Phone` exactly one field. But Step 3
++also asks for `handle_key()` with `Enter` 填令牌 (fill in token) — and there
++is nowhere in a single `status: PhoneStatus` field to hold what the user is
++typing, or which phase (typing / verifying / failed) that input is in. This
++is the same class of gap Task 3's own report flagged for `View::Settings`
++(which needed a `lang: Option<ListState>` field beyond what its brief
++specified, for the identical reason: one view needs to distinguish two
++layers, and a single flat field can't hold that).
++
++I added:
++```rust
++Phone {
++    status: PhoneStatus,
++    entry: Option<PhoneEntry>,  // Some = filling in a token; None = just watching status
++},
++```
++with `PhoneEntry { buf: String, phase: SecretPhase }`, reusing `SecretPhase`
++verbatim per the brief's own instruction ("复用 EnterSecret 的
++SecretPhase::Verifying 反馈").
++
++## The 403 case ("bot was blocked by the user")
++
++**What I did NOT need to do:** touch `channel/telegram.rs`. Reading it before
++writing anything, `error_from` already maps both 401 and 403 to
++`ChannelError::BadToken`, and a test (`a_403_is_also_bad_token_not_unreachable`)
++already pins that mapping — this was already in place when I started Task 4
++(per the standing context, Task 2 left it there deliberately: the channel
++layer's job is "worth retrying or not," not "what sentence to show," and both
++401 and 403 are equally "not worth retrying").
++
++**Why the 403/blocked case cannot actually arise in Task 4's own code path:**
++`getMe` (what `PhoneSetToken` calls to validate a freshly-typed token) has no
++chat context — it just asks "is this token valid," and Telegram has no reason
++to return "Forbidden: bot was blocked by the user" for it. That error is
++specific to `sendMessage`/`getUpdates`-style calls that target a chat — which
++only happen once a chat is paired, i.e. inside Task 5's Bridge, not here. So
++the *only* Broken case Task 4 exercises is "token invalid," and
++`daemon.rs::phone_verify_token` composes exactly that
++(`i18n::msg::phone_token_invalid`), never `phone_unreachable` or anything
++resembling a "blocked" message, for a `BadToken` result.
++
++**What I built so the eventual blocked-bot case (Task 5's job) isn't
++foreclosed, and what the user sees today:**
++- `PhoneState::Broken(String)` is architected as an **opaque** payload as far
++  as the two functions that render the page's headline are concerned.
++  `ui/phone.rs::status_line`/`next_step` never read the string inside
++  `Broken` — not even to decide phrasing. This is enforced by a real test
++  (`the_token_never_appears_in_any_status_text`, from the brief, plus my own
++  `daemon::phone_broken_text_never_contains_the_token`) and means the daemon
++  is free to compose *any* text for *any* future Broken cause (including a
++  "you blocked this bot" message Task 5 will add) without the UI needing to
++  change.
++- `next_step` for any `Broken` state returns one fixed, honest sentence that
++  covers **both** real causes at once, since the compact status line
++  deliberately can't (and, given `ChannelError::BadToken` erasing the
++  401/403 distinction by design, structurally shouldn't try to) tell which
++  one actually happened: *"如果是令牌本身失效了，按 Enter 重新填一遍；如果
++  是你在 Telegram 里把这个机器人拉黑了，解除拉黑后按 r 重新配对"* (en: "if
++  the token itself stopped working, press Enter to type a new one; if you
++  blocked this bot in Telegram, unblock it and press r to pair again"). Both
++  actions it names are real and both work today: `Enter` re-opens the token
++  entry, `r` sends `Request::PhoneUnpair` (Off is excluded from both).
++- The daemon's own composed reason (for now, always "令牌用不了...") is not
++  thrown away — it's shown as a separate detail line in `draw()`, styled red,
++  below the generic headline and next-step. `draw_shows_the_broken_reason_as_a_detail_line`
++  covers that it actually renders.
++- I did **not** invent a `phone_blocked_by_user` message function, because
++  Task 4 has no call site that would ever construct it — that would be
++  guessing at Task 5's Bridge/send-path wiring I haven't seen. `i18n.rs`'s
++  `msg::phone_token_invalid`/`msg::phone_unreachable` are the two the daemon
++  actually uses; Task 5 adds its own when its `send()` failure path needs one,
++  using the same `PhoneState::Broken(String)` shape and the same
++  never-echoed-verbatim UI contract.
++
++## `Telegram::get_me` reachability
++
++Reached directly, no trait change needed. `daemon.rs`'s `PhoneSetToken`
++handler (via the extracted `apply_phone_set_token`) calls
++`Telegram::new(token).get_me()` straight from a fresh, short-lived `Telegram`
++built for that one verification — it never holds an `Arc<dyn Channel>`. The
++long-lived, shared `Channel` object (the one that would need `get_me` on the
++trait to be reachable through it) is the Bridge's, and the Bridge doesn't
++exist yet — that's Task 5. So the brief's warning ("if you find yourself
++holding an `Arc<dyn Channel>` and unable to reach it...") never triggered;
++Task 4's own code never needed to hold one. `phone_verify_token`'s transport
++is injected as `&dyn Fn(&str) -> Result<String, ChannelError>` (same pattern
++as `verify.rs::verify_with`), letting the decision logic be tested with a
++fake closure while the real path (`|t| Telegram::new(t).get_me()`) stays
++untested at the unit level — deliberately, matching the project's existing
++line for real-transport code (`send_real`, `verify.rs::send_probe`).
++
++## What I built beyond the brief's two Step-5 mutations, and why
++
++Working through mutation testing surfaced a real design gap: the "can `Enter`/
++`r`/`x` do anything right now" rule was written twice — once as a guard in
++`phone::handle_status`, once as the advertising condition in
++`view::idle_help`. A disconnected test `App` (`App::test_app()`) can't tell
++"the guard blocked the call" from "the call ran and failed anyway, so the
++screen looks the same" — both produce an unchanged `PhoneStatus`. I extracted
++both copies into one pure function, `view::phone_key_has_effect(state, code)`,
++used by both call sites, and backed it with a truth-table test plus two
++real-daemon integration tests that only a genuine call-vs-hardcode
++distinction could pass. Same story for the async-result race in the
++token-verify flow: extracted `view::phone_verify_outcome_applies_to`,
++mirroring the existing `verify_outcome_applies_to` for `EnterSecret`.
++
++## Mutation table
++
++Brief-named (Step 5), both against `ui/phone.rs`:
++
++| # | Mutation | Test that should catch it | Result |
++|---|---|---|---|
++| 1 | `next_step`'s `Paired` branch changed to also return `Some(...)` | `every_state_tells_the_user_what_to_do_next` (last assertion) | **RED** — caught |
++| 2 | `status_line`'s `WaitingForPairing` branch: drop the bot-name interpolation | `waiting_names_the_bot` | **RED** — caught |
++
++Mine, against the logic Task 4 added beyond those two:
++
++| # | Mutation | Where | Test | Result |
++|---|---|---|---|---|
++| 3 | `phone_verify_token`: `BadToken` composes `phone_unreachable` instead of `phone_token_invalid` | `daemon.rs` | `bad_token_and_network_trouble_produce_different_messages` | **RED** |
++| 4 | `initial_phone_status`: flip the has-token ternary | `daemon.rs` | `initial_phone_status_is_off_without_a_saved_token` + `..._is_waiting_for_pairing_with_a_saved_token` | **RED** (both) |
++| 5 | `apply_phone_set_token`: drop the "don't save on Broken" guard, always save | `daemon.rs` | `apply_phone_set_token_does_not_save_a_bad_token` | **RED** |
++| 6 | `PhoneUnpair`: drop the `Off`-stays-`Off` guard | `daemon.rs` | `phone_unpair_on_off_stays_off` | **RED** |
++| 7 | `PhoneDisable`: skip `secrets.remove`, only reset memory | `daemon.rs` | `phone_disable_deletes_the_token_and_resets_to_off` | **RED** |
++| 8 | `back_one_level`: delete the `View::Phone { entry: Some(_) }` special case (falls through) | `view.rs` | `ctrl_q_leaves_the_phone_entry_before_leaving_the_page` | **RED** |
++| 9 | `back_one_level`: `View::Phone { entry: None }` target uses `ListState::default()` instead of `settings_state_on_phone()` | `view.rs` | `ctrl_q_from_the_phone_status_page_goes_back_to_settings_on_the_phone_row` | **RED** |
++| 10 | `phone_key_has_effect`: `Enter` condition narrowed to just `Off` (drops `Broken`) | `view.rs` | `phone_key_has_effect_matches_the_documented_truth_table`; also `phone.rs::enter_on_broken_also_opens_the_token_entry` | **RED** (both) |
++| 11 | `phone_key_has_effect`: `r`/`x` condition replaced with `true` | `view.rs` | `phone_key_has_effect_matches_the_documented_truth_table` | **RED** |
++| 12 | `idle_help`'s `View::Phone` arm: always push `r`/`x` regardless of state | `view.rs` | `phone_idle_help_only_advertises_keys_that_actually_work` | **RED** |
++| 13 | `escape_hint`'s two `View::Phone` arms swapped | `view.rs` | `phone_escape_hint_distinguishes_entering_a_token_from_just_looking` | **RED** |
++| 14 | `phone_verify_outcome_applies_to` body replaced with `true` | `view.rs` | `phone_verify_outcome_does_not_apply_when_the_token_changed` | **RED** |
++| 15 | `fetch_phone_status`: ignore the `fallback` parameter, always return `Off` | `mod.rs` | `fetch_phone_status_falls_back_when_disconnected` (fallback deliberately set to `Paired`, not `Off`, so the mutation can't hide behind a coincidental match) | **RED** |
++| 16 | `settings_view.rs`'s `Some(SettingsItem::Phone)` arm: hardcode `PhoneStatus { Off, .. }` instead of calling `fetch_phone_status` | `settings_view.rs` | `entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default` (real daemon, pre-seeded token, asserts `WaitingForPairing` — the disconnected-client sibling test can't tell these apart, this one can) | **RED** |
++
++All 16 mutations were applied by hand, confirmed red, then reverted; the
++tree was rebuilt clean (`cargo check --all-targets`, then the full suite)
++after every revert before moving to the next one. No mutation required
++adding more than the tests already listed above.
++
++## Test commands and output tails
++
++Step 2 (before implementation), per the brief:
++```
++$ cargo test --lib ui::phone -- --test-threads=1
++error[E0432]: unresolved import `crate::proto::PhoneStatus`
++```
++(`cannot find type PhoneStatus`, as the brief predicted — module didn't
++exist yet.)
++
++Step 4, after implementation:
++```
++$ cargo test --lib ui::phone -- --test-threads=1
++running 14 tests
++test ui::phone::tests::draw_does_not_panic_and_masks_the_token ... ok
++test ui::phone::tests::draw_shows_the_broken_reason_as_a_detail_line ... ok
++test ui::phone::tests::enter_on_broken_also_opens_the_token_entry ... ok
++test ui::phone::tests::enter_on_off_opens_the_token_entry ... ok
++test ui::phone::tests::enter_while_waiting_does_not_reopen_the_entry ... ok
++test ui::phone::tests::esc_during_verifying_drops_the_pending_receiver ... ok
++test ui::phone::tests::esc_on_the_status_page_goes_back_to_settings_on_the_phone_row ... ok
++test ui::phone::tests::esc_while_typing_cancels_back_to_the_status_page ... ok
++test ui::phone::tests::every_state_tells_the_user_what_to_do_next ... ok
++test ui::phone::tests::r_and_x_on_off_are_no_ops ... ok
++test ui::phone::tests::the_token_never_appears_in_any_status_text ... ok
++test ui::phone::tests::typing_and_backspace_edit_the_buffer ... ok
++test ui::phone::tests::typing_during_verifying_is_frozen ... ok
++test ui::phone::tests::waiting_names_the_bot ... ok
++test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 765 filtered out; finished in 0.00s
++```
++
++```
++$ cargo test --lib daemon:: -- --test-threads=1
++running 21 tests
++[... all 21 listed ...]
++test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 758 filtered out; finished in 5.33s
++```
++
++Full library suite:
++```
++$ cargo test --lib -- --test-threads=1
++test result: ok. 779 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.45s
++```
++
++Full workspace (lib + 15 integration binaries + doctests), all `0 failed`:
++```
++$ cargo test -- --test-threads=1
++Running unittests src/lib.rs ... 779 passed
++Running unittests src/main.rs ... 0 passed
++Running tests/cli.rs ... 9 passed
++Running tests/client_timeout.rs ... 1 passed
++Running tests/concurrency.rs ... 1 passed
++Running tests/daemon_detach.rs ... 1 passed
++Running tests/daemon_roundtrip.rs ... 3 passed
++Running tests/daemon_upgrade.rs ... 3 passed
++Running tests/grid_reply.rs ... 2 passed
++Running tests/profiles_flow.rs ... 6 passed
++Running tests/projects_flow.rs ... 5 passed
++Running tests/screen_state.rs ... 2 passed
++Running tests/signal_restore.rs ... 2 passed
++Running tests/slow_input.rs ... 1 passed
++Running tests/socket_perms.rs ... 1 passed
++Running tests/zombie_reaping.rs ... 1 passed
++Doc-tests dct ... 0 passed
++```
++
++```
++$ cargo fmt --check
++(exit 0)
++
++$ cargo clippy --all-targets
++Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
++(no warnings)
++
++$ git diff --check
++(exit 0)
++```
++
++## Files touched
++
++- `src/proto.rs` — `PhoneState`, `PhoneStatus`, four `Request::Phone*`
++  variants (`PhoneSetToken` carries `lang`), `Response::Phone`,
++  `PROTOCOL_VERSION` 6→7, Debug redaction, pinning-test updates, new tests.
++- `src/secrets.rs` — `PHONE_TOKEN_KEY` (verbatim from the brief).
++- `src/i18n.rs` — 9 new `Key` variants, `msg::phone_waiting`,
++  `msg::phone_paired`, `msg::phone_token_invalid`, `msg::phone_unreachable`;
++  `ALL_KEYS` bumped 101 → 110.
++- `src/daemon.rs` — `handle()`/`serve()`/`run_with_manager()` thread a shared
++  `Arc<Mutex<PhoneStatus>>`; `initial_phone_status`, `phone_verify_token`,
++  `apply_phone_set_token`, `spawn_phone_startup_refresh`; four new match arms.
++- `src/ui/view.rs` — `View::Phone`, `PhoneEntry`, `settings_state_on_phone`,
++  `phone_key_has_effect`, `phone_verify_outcome_applies_to`; `back_one_level`/
++  `escape_hint`/`idle_help` arms for the new view; guard tests extended.
++- `src/ui/phone.rs` (new) — `status_line`, `next_step`, `handle_key`, `draw`,
++  27 tests.
++- `src/ui/settings_view.rs` — the `TODO(task-4, dct-phone-channel)` no-op
++  replaced with a real dispatch to `View::Phone`; module doc comment updated
++  to match; one test rewritten, one real-daemon test added.
++- `src/ui/mod.rs` — `mod phone;`, key/draw dispatch, per-tick status polling,
++  the `phone_verify_rx` collection block, `fetch_phone_status` helper; three
++  new tests (two real-daemon).
++- `src/ui/app.rs` — `phone_verify_rx` field, mirroring `verify_rx`.
++
++## Concerns for whoever reviews this / writes Task 5
++
++- `spawn_phone_startup_refresh` (daemon startup background thread) is
++  deliberately untested at the unit level — it calls the real
++  `Telegram::new(t).get_me()`, same convention as `send_real`/`send_probe`.
++  If a bot name persisted across daemon restarts turns out to matter more
++  than I judged, that's the function to revisit; today a restarted daemon
++  with an existing token shows `WaitingForPairing` with `bot: None` for the
++  few seconds until that thread's one `getMe` call lands.
++- `Request::PhoneUnpair` folds `Broken` into `WaitingForPairing` unconditionally
++  (see the comment on that arm in `daemon.rs`) — this is honest given
++  `ChannelError::BadToken` already erased the 401/403 distinction, but if
++  Task 5's Bridge starts tracking *why* a token broke with more precision
++  than that enum currently allows, this arm is the one to reconsider.
++- I did not implement any pairing/Bridge logic, `Channel::set_destination`
++  call sites, or an owner-display-name source — `PhoneStatus.owner` never
++  becomes `Some(_)` anywhere in this branch today. That's entirely Task 5.
++- The two real-daemon tests I added spin `crate::daemon::run` on a temp
++  socket the same way three pre-existing `mod.rs` tests already do
++  (`start_daemon_for_test` / the manual inline version in
++  `settings_view.rs`) — never touches the user's real `~/.dct`.
+diff --git a/src/daemon.rs b/src/daemon.rs
+index ce011b7..ad089bf 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -1,23 +1,27 @@
+ use anyhow::Result;
+ use std::io::{BufRead, BufReader, Write};
+ use std::os::unix::fs::PermissionsExt;
+ use std::os::unix::net::{UnixListener, UnixStream};
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
++use crate::channel::{telegram::Telegram, ChannelError};
+ use crate::profile::Profile;
+ use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
+ use crate::projects::{store_path_for_socket, Store};
+-use crate::proto::{ErrorCode, InstallPrompt, ProfileEntry, Request, Response, SecretPrompt};
+-use crate::secrets::{secrets_path_for_socket, SecretStore};
++use crate::proto::{
++    ErrorCode, InstallPrompt, PhoneState, PhoneStatus, ProfileEntry, Request, Response,
++    SecretPrompt,
++};
++use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
+ use crate::session::{recover, SessionManager};
+ use crate::verify::{send_probe, verify_with, VerifyOutcome};
+ 
+ pub fn run(socket: &Path) -> Result<()> {
+     let mgr = SessionManager::new();
+     // 生死簿只在真正的守护进程里落盘。单元测试自己 `new()` 一个 manager，
+     // 拿到的是不记账的那种——绝不能去写用户真实的 `~/.dct/sessions.log`。
+     mgr.journal
+         .set_path(crate::proto::journal_path_for_socket(socket));
+     run_with_manager(socket, Arc::new(mgr))
+@@ -42,47 +46,173 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+ 
+     // 存放位置跟着 socket 走，测试把 socket 放临时目录就自动隔离，
+     // 不会去动真实的 ~/.dct/projects.json / ~/.dct/secrets.toml / ~/.dct/profiles/。
+     let store = Arc::new(Mutex::new(Store::load(&store_path_for_socket(socket))));
+     let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path_for_socket(
+         socket,
+     ))));
+     let profiles_dir = profiles_dir_for_socket(socket);
+ 
++    // 手机通知这一页存在的全部理由是这一份状态——**不落盘**，只有令牌本身
++    // 落盘（跟别的密钥同一个文件）。有没有存过令牌决定开机时是 Off 还是
++    // WaitingForPairing；bot 名字这时候还不知道，`spawn_phone_startup_refresh`
++    // 会在后台把它补上，不占用监听端口打开之前的时间。
++    let phone = Arc::new(Mutex::new(initial_phone_status(&secrets)));
++    spawn_phone_startup_refresh(&phone, &secrets);
++
+     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
+     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
+     // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
+     // 装后端」这条 Critical 修复本身，见下面 `install_llm_backend` 和它的测试。
+     install_llm_backend(socket, &profiles_dir, &mgr);
+ 
+     let tick_mgr = mgr.clone();
+     std::thread::spawn(move || loop {
+         std::thread::sleep(Duration::from_millis(200));
+         tick_mgr.tick();
+     });
+ 
+     for conn in listener.incoming() {
+         let conn = conn?;
+         let m = mgr.clone();
+         let s = store.clone();
+         let sec = secrets.clone();
+         let pd = profiles_dir.clone();
++        let ph = phone.clone();
+         std::thread::spawn(move || {
+-            if let Err(e) = serve(conn, m, s, sec, pd) {
++            if let Err(e) = serve(conn, m, s, sec, pd, ph) {
+                 eprintln!("连接处理失败: {e}");
+             }
+         });
+     }
+     Ok(())
+ }
+ 
++/// 手机通知刚启动时的状态：有没有存过令牌决定 `Off` 还是
++/// `WaitingForPairing`。bot 名字这时候还不知道——现查要打网络，不能拖慢
++/// 监听端口打开的时间，交给 `spawn_phone_startup_refresh` 在后台补。
++fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
++    let has_token = recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some();
++    PhoneStatus {
++        state: if has_token {
++            PhoneState::WaitingForPairing
++        } else {
++            PhoneState::Off
++        },
++        bot: None,
++        owner: None,
++    }
++}
++
++/// 开机时如果已经存过令牌，起一个后台线程把 bot 名字补上（顺便验一遍这份
++/// 令牌是不是还能用）。放在后台是为了不让一次网络请求拖慢守护进程接受
++/// 连接的时间——同 `install_llm_backend` 不这么做的理由正相反：那边选择
++/// 同步跑是因为「装没装后端」这件事**必须**在第一条连接进来之前就有答案
++/// （出错解释的可用性是会话创建路径要读的状态）；手机通知不是，界面本来
++/// 就要靠轮询 `Request::PhoneStatus` 才能看到配对进展，晚几秒钟补上 bot
++/// 名字不会造成任何错误的界面反馈，只是「等配对」那句话短暂地说不出
++/// bot 是谁。
++fn spawn_phone_startup_refresh(phone: &Arc<Mutex<PhoneStatus>>, secrets: &Arc<Mutex<SecretStore>>) {
++    let token = recover(secrets.lock())
++        .get(PHONE_TOKEN_KEY)
++        .map(str::to_string);
++    let Some(token) = token else {
++        return;
++    };
++    let phone = phone.clone();
++    let secrets = secrets.clone();
++    std::thread::spawn(move || {
++        // 这次刷新不挂在任何一次 `Request` 上，没有人告诉我们此刻界面是
++        // 什么语言——按项目默认语言中文兜底，跟 `proto.rs` 顶上 `SecretPrompt`
++        // 那条约定里记的话一致（「daemon 端已经知道用户语言（目前只有
++        // Lang::Zh）」）。用户真的看到这句话，通常是因为存了很久没用过的
++        // 令牌在这次重启时才发现已经失效——那本来就是个冷门路径。
++        let (state, bot) = phone_verify_token(&token, crate::i18n::Lang::Zh, &|t| {
++            Telegram::new(t).get_me()
++        });
++        let mut ph = recover(phone.lock());
++        // 这段网络往返的时间里令牌可能已经被用户显式关掉了（`PhoneDisable`）
++        // ——这时候这次迟到的刷新结果不该覆盖回去，那会让一个刚被用户关掉
++        // 的功能又显示成「等待配对」，界面上凭空多出一件用户没做过的事。
++        if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
++            *ph = PhoneStatus {
++                state,
++                bot,
++                owner: ph.owner.clone(),
++            };
++        }
++    });
++}
++
++/// 令牌验证的结果该记成什么 `PhoneState` + bot 名。纯判定逻辑，传输层由
++/// 调用方注入（同 `verify.rs::verify_with` 的路子）——测试才能覆盖
++/// 「令牌好使」「令牌失效」「连不上」三种结果，不用真打 Telegram 的网络。
++///
++/// **`Broken` 分支绝不能把 `token` 拼进返回的字符串**：这是
++/// `PhoneState::Broken` 唯一的安全承诺，`phone_broken_text_never_contains_the_token`
++/// 这条测试钉着它。
++fn phone_verify_token(
++    token: &str,
++    lang: crate::i18n::Lang,
++    get_me: &dyn Fn(&str) -> Result<String, ChannelError>,
++) -> (PhoneState, Option<String>) {
++    match get_me(token) {
++        Ok(bot) => (PhoneState::WaitingForPairing, Some(bot)),
++        Err(ChannelError::BadToken) => (
++            PhoneState::Broken(crate::i18n::msg::phone_token_invalid(lang)),
++            None,
++        ),
++        Err(ChannelError::Unreachable) | Err(ChannelError::Malformed) => (
++            PhoneState::Broken(crate::i18n::msg::phone_unreachable(lang)),
++            None,
++        ),
++    }
++}
++
++/// `Request::PhoneSetToken` 的完整处理：验证、（验过了才）落盘、更新内存
++/// 状态。**从 `handle()` 的 match 臂里拆出来单独一个函数，传输层照旧注入**
++/// ——这条请求真正碰网络的只有 `get_me` 这一步，`secrets`/`phone` 都是普通
++/// 的内存对象，拆开之后不用起真实 Telegram 网络也能测「验证失败真的没有
++/// 碰磁盘上的令牌」这条关键行为，不然这条行为只能在 `handle()` 里跟一次
++/// 真实网络请求焊在一起，测不到。
++fn apply_phone_set_token(
++    token: &str,
++    lang: crate::i18n::Lang,
++    secrets: &Mutex<SecretStore>,
++    phone: &Mutex<PhoneStatus>,
++    get_me: &dyn Fn(&str) -> Result<String, ChannelError>,
++) -> anyhow::Result<Response> {
++    let (state, bot) = phone_verify_token(token, lang, get_me);
++    // 验证失败**不**碰令牌：用户是在填一个新令牌，如果这个新令牌本身不
++    // 好使，不该把磁盘上原有的令牌（如果有的话）连带抹掉——界面上
++    // `Enter` 键只在 `Off`/`Broken` 两种状态下才会被提供，也就是说走到
++    // 这条分支时磁盘上原本要么没有令牌、要么已经是坏的，这里不存在
++    // 「一个还能用的令牌被覆盖」的风险。
++    let save_result = if matches!(state, PhoneState::Broken(_)) {
++        Ok(())
++    } else {
++        recover(secrets.lock()).set(PHONE_TOKEN_KEY, token)
++    };
++    save_result.map(|_| {
++        let mut ph = recover(phone.lock());
++        // 新令牌等于新的 bot、新的一轮配对——上一次配上的主人（如果有）
++        // 不该继续留着，那会让通知发去一个跟这份新令牌毫不相干的旧 chat。
++        *ph = PhoneStatus {
++            state,
++            bot,
++            owner: None,
++        };
++        Response::Phone(ph.clone())
++    })
++}
++
+ /// **`cfg.llm` 是 `None` 就什么都不做**：不 resolve、不装后端、也不打印
+ /// 任何一行——这是绝大多数用户的正常状态（没写过 `[llm]`），不是一种
+ /// 「本来该配却没配好」的错误。见 `config.rs` 头注释：出错解释会把一个
+ /// 失败会话屏幕上的原始内容送给模型，这必须是用户自己写下 `[llm]` 才
+ /// 触发的动作，不能因为「什么都没配」就替他打开、把他终端里的东西发
+ /// 给第三方。只有用户确实写了 `[llm]` 却指向一个连不上的后端时，才值得
+ /// 在 stderr 上留一行——那时候他大概率是想用这功能的，只是配错了。
+ fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
+     let Some(llm) =
+         &crate::config::Config::load(&crate::config::config_path_for_socket(socket)).llm
+@@ -137,44 +267,46 @@ fn startup_oauth(name: &str) -> Option<crate::llm::creds::Borrowed> {
+         _ => None,
+     }
+ }
+ 
+ fn serve(
+     stream: UnixStream,
+     mgr: Arc<SessionManager>,
+     store: Arc<Mutex<Store>>,
+     secrets: Arc<Mutex<SecretStore>>,
+     profiles_dir: PathBuf,
++    phone: Arc<Mutex<PhoneStatus>>,
+ ) -> Result<()> {
+     let mut out = stream.try_clone()?;
+     let reader = BufReader::new(stream);
+     for line in reader.lines() {
+         let line = line?;
+         if line.trim().is_empty() {
+             continue;
+         }
+         let resp = match serde_json::from_str::<Request>(&line) {
+-            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir),
++            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir, &phone),
+             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
+         };
+         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
+         out.flush()?;
+     }
+     Ok(())
+ }
+ 
+ fn handle(
+     req: Request,
+     mgr: &Arc<SessionManager>,
+     store: &Arc<Mutex<Store>>,
+     secrets: &Arc<Mutex<SecretStore>>,
+     profiles_dir: &Path,
++    phone: &Arc<Mutex<PhoneStatus>>,
+ ) -> Response {
+     let r: anyhow::Result<Response> = match req {
+         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
+         Request::Hello => Ok(Response::Hello {
+             protocol: crate::proto::PROTOCOL_VERSION,
+         }),
+         Request::List => Ok(Response::Sessions(mgr.list())),
+         Request::Profiles { lang } => {
+             let (all, mut warnings) = all_profiles(profiles_dir);
+             let sec = recover(secrets.lock());
+@@ -308,39 +440,81 @@ fn handle(
+                 .iter()
+                 .find(|p| p.name == profile)
+                 .and_then(|p| p.secret.as_ref())
+                 .and_then(|s| s.verify.as_ref());
+             match spec {
+                 // 没声明 verify 的 profile 直接放行，不是错误
+                 None => Ok(Response::Verify(VerifyOutcome::Ok)),
+                 Some(v) => Ok(Response::Verify(verify_with(&v.url, &value, &send_probe))),
+             }
+         }
++        // 纯读，不碰任何状态、不打网络——手机通知页每一轮轮询都要问它，
++        // 必须快。真正的网络往返只发生在 `PhoneSetToken` 和开机那次后台
++        // 刷新（`spawn_phone_startup_refresh`）里。
++        Request::PhoneStatus => Ok(Response::Phone(recover(phone.lock()).clone())),
++        Request::PhoneSetToken { token, lang } => {
++            apply_phone_set_token(&token, lang, secrets, phone, &|t| Telegram::new(t).get_me())
++        }
++        Request::PhoneUnpair => {
++            let mut ph = recover(phone.lock());
++            // `Off` 时按 r 没有意义可言——没有令牌就没有「重新配对」这回事，
++            // 留在原地，不伪造出一个 WaitingForPairing。
++            //
++            // `Broken` 也一并放行到 WaitingForPairing：`ChannelError::BadToken`
++            // 这一层没有保留「令牌本身失效」和「对方拉黑了这个 bot」的区分
++            // （见 telegram.rs 的 `error_from` 和它上面的注释），daemon 无法
++            // 单靠这个状态本身分辨究竟是哪一种——真正会验证令牌是不是仍然
++            // 有效的路径是 Task 5 的 Bridge 实际发消息/轮询时，不是这里。
++            if !matches!(ph.state, PhoneState::Off) {
++                ph.state = PhoneState::WaitingForPairing;
++                ph.owner = None;
++            }
++            Ok(Response::Phone(ph.clone()))
++        }
++        Request::PhoneDisable => recover(secrets.lock()).remove(PHONE_TOKEN_KEY).map(|_| {
++            let mut ph = recover(phone.lock());
++            *ph = PhoneStatus {
++                state: PhoneState::Off,
++                bot: None,
++                owner: None,
++            };
++            Response::Phone(ph.clone())
++        }),
+     };
+     r.unwrap_or_else(|e| Response::Error(to_code(e)))
+ }
+ 
+ /// 把内部错误还原成给界面的码。`downcast` 拿不到码的，说明这条路径还没归类——
+ /// 照抄原文走 `Internal`，界面原样显示。这样迁移可以一条一条来，不必等到
+ /// 每一条都归好类才敢合并。
+ fn to_code(e: anyhow::Error) -> ErrorCode {
+     match e.downcast::<crate::proto::CodedError>() {
+         Ok(c) => c.0,
+         Err(e) => ErrorCode::Internal(e.to_string()),
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use std::time::Instant;
+ 
++    /// 大多数测试根本不关心手机通知——给它们一个干净的 `Off` 状态垫底，
++    /// 不用在每个既有 `handle()` 调用点里重复拼这三行。
++    fn test_phone() -> Arc<Mutex<PhoneStatus>> {
++        Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Off,
++            bot: None,
++            owner: None,
++        }))
++    }
++
+     /// 造一个文件足够多的仓库，让 agent 会话建立时的首次 git checkpoint 慢到能
+     /// 测出来。手法照抄 `tests/concurrency.rs` 的 `init_big_repo`——那边已经验证过
+     /// 8000 个文件在这台机器的规模下够慢、够稳。
+     fn init_big_repo(path: &Path, n: usize) {
+         let run = |args: &[&str]| {
+             std::process::Command::new("git")
+                 .args(args)
+                 .current_dir(path)
+                 .output()
+                 .unwrap();
+@@ -399,20 +573,21 @@ mod tests {
+         let profiles_dir = tempfile::tempdir().unwrap();
+ 
+         let resp = handle(
+             Request::Profiles {
+                 lang: crate::i18n::Lang::Zh,
+             },
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
++            &test_phone(),
+         );
+ 
+         match resp {
+             Response::Profiles { warnings, .. } => {
+                 // 守护进程报的是**码**。它点名了是哪个文件，但一个字的
+                 // 文案都不组——句子由界面用 `i18n::msg::warning` 组出来。
+                 let w = warnings
+                     .iter()
+                     .find(|w| matches!(w, crate::proto::WarningCode::SecretsCorrupt { .. }))
+                     .expect("密钥文件读坏了必须有 warning");
+@@ -447,26 +622,28 @@ mod tests {
+         let secrets_dir = tempfile::tempdir().unwrap();
+         let secrets = Arc::new(Mutex::new(SecretStore::load(
+             &secrets_dir.path().join("secrets.toml"),
+         )));
+         let store_dir = tempfile::tempdir().unwrap();
+         let store = Arc::new(Mutex::new(Store::load(
+             &store_dir.path().join("projects.json"),
+         )));
+         let profiles_dir = tempfile::tempdir().unwrap();
+ 
++        let phone = test_phone();
+         let labels = |lang| match handle(
+             Request::Profiles { lang },
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
++            &phone,
+         ) {
+             Response::Profiles { entries, .. } => entries
+                 .into_iter()
+                 .map(|e| format!("{}|{}", e.label, e.note))
+                 .collect::<Vec<_>>()
+                 .join("  "),
+             other => panic!("期待 Response::Profiles，得到 {other:?}"),
+         };
+ 
+         let zh = labels(crate::i18n::Lang::Zh);
+@@ -502,34 +679,36 @@ mod tests {
+         let store = Arc::new(Mutex::new(Store::load(
+             &store_dir.path().join("projects.json"),
+         )));
+         // 空目录：这条测试不关心磁盘 profile，`daemon-lock-fake` 只在
+         // `mgr` 的 `extra_profiles` 里注册过。
+         let profiles_dir = tempfile::tempdir().unwrap();
+ 
+         let mgr2 = mgr.clone();
+         let store2 = store.clone();
+         let secrets2 = secrets.clone();
++        let phone2 = test_phone();
+         let repo_path = repo.path().display().to_string();
+         let profiles_dir_path = profiles_dir.path().to_path_buf();
+         let create_handle = std::thread::spawn(move || {
+             let t = Instant::now();
+             let resp = handle(
+                 Request::Create {
+                     dir: repo_path,
+                     profile: "daemon-lock-fake".into(),
+                     remember: true,
+                 },
+                 &mgr2,
+                 &store2,
+                 &secrets2,
+                 &profiles_dir_path,
++                &phone2,
+             );
+             (t.elapsed(), resp)
+         });
+ 
+         // 给慢 Create 一点时间真正进到 git checkpoint 里
+         std::thread::sleep(Duration::from_millis(150));
+ 
+         let t = Instant::now();
+         drop(recover(secrets.lock()));
+         let lock_wait = t.elapsed();
+@@ -615,20 +794,21 @@ mod tests {
+ 
+         let deadline = Instant::now() + Duration::from_secs(5);
+         loop {
+             mgr.tick();
+             let resp = handle(
+                 Request::Explanation { id },
+                 &mgr,
+                 &store,
+                 &secrets,
+                 profiles_dir.path(),
++                &test_phone(),
+             );
+             if let Response::Explanation(Some(text)) = resp {
+                 assert_eq!(text, "这个命令没配好，重开一次就行。");
+                 return;
+             }
+             assert!(Instant::now() < deadline, "Explanation 请求一直没接到解释");
+             std::thread::sleep(Duration::from_millis(50));
+         }
+     }
+ 
+@@ -644,20 +824,21 @@ mod tests {
+             &tempfile::tempdir().unwrap().path().join("projects.json"),
+         )));
+         let profiles_dir = tempfile::tempdir().unwrap();
+ 
+         let resp = handle(
+             Request::Explanation { id: 9999 },
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
++            &test_phone(),
+         );
+         assert!(matches!(resp, Response::Explanation(None)));
+     }
+ 
+     /// **Critical 回归测试.** 没写 `[llm]`（这里就是没有 `config.toml` 这个
+     /// 文件——「不存在」和「写了但没这一段」在 `config.rs` 里是同一件事）
+     /// 是绝大多数用户的正常状态，出错解释必须整个关着：`install_llm_backend`
+     /// 压根不能调 `resolve()`，更不能装上一个会把终端内容发出去的后端。
+     ///
+     /// 断言的是 `backend_is_set()` 这个布尔值，不是「问一次真实网络/CLI
+@@ -726,25 +907,368 @@ mod tests {
+         )));
+         let store = Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json"))));
+         let resp = handle(
+             Request::Profiles {
+                 lang: crate::i18n::Lang::Zh,
+             },
+             &mgr,
+             &store,
+             &secrets,
+             &profiles_dir,
++            &test_phone(),
+         );
+         let Response::Profiles { warnings, .. } = resp else {
+             panic!("期待 Response::Profiles");
+         };
+         let w = warnings
+             .iter()
+             .find(|w| matches!(w, crate::proto::WarningCode::LlmUnavailable(_)))
+             .expect("配错了却一个警告都没有——用户会以为功能坏了却查不到任何线索");
+         let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+         assert!(
+             line.contains("根本没有这个"),
+             "要点名是设置里的哪个名字写错了：{line}"
+         );
+     }
++
++    // ———— 手机通知（Task 4）————
++    //
++    // `phone_verify_token` 是判定逻辑本身，传输层被注入（同
++    // `verify_with`/`verify.rs` 的路子）：这里覆盖「令牌好使」「令牌被拒」
++    // 「连不上」三种结果，不用真打 Telegram 的网络。`handle()` 里真正调
++    // `Telegram::new(t).get_me()` 走真实传输的那一支，跟 `send_real`/
++    // `Request::VerifySecret` 一样不在单元测试范围内——那是实测那一步验的
++    // 东西。
++
++    #[test]
++    fn phone_verify_token_marks_a_good_token_waiting_for_pairing() {
++        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
++            Ok("my_dct_bot".to_string())
++        });
++        assert_eq!(state, PhoneState::WaitingForPairing);
++        assert_eq!(bot.as_deref(), Some("my_dct_bot"));
++    }
++
++    #[test]
++    fn phone_verify_token_marks_a_bad_token_broken() {
++        let (state, bot) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
++            Err(ChannelError::BadToken)
++        });
++        assert!(matches!(state, PhoneState::Broken(_)));
++        assert!(bot.is_none());
++        let PhoneState::Broken(msg) = state else {
++            unreachable!()
++        };
++        assert!(!msg.is_empty(), "Broken 必须带一句人话，不能是空字符串");
++    }
++
++    #[test]
++    fn phone_verify_token_marks_network_trouble_broken_too() {
++        for e in [ChannelError::Unreachable, ChannelError::Malformed] {
++            let (state, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &move |_| Err(e));
++            assert!(
++                matches!(state, PhoneState::Broken(_)),
++                "{e:?} 也该是 Broken"
++            );
++        }
++    }
++
++    /// **不是巧合，是两句不同的话。** `BadToken`（令牌本身不好使）和
++    /// `Unreachable`/`Malformed`（连不上/读不懂）该说的下一步完全不一样
++    /// ——前者是「重新填一遍」，后者是「等会儿再试」。只断言两边都是
++    /// `Broken(_)` 分不出这两句话有没有被悄悄换成同一句（比如都写成
++    /// `phone_unreachable`），这条测试直接比对消息内容本身，钉死
++    /// `phone_verify_token` 按错误类型分派到了不同的 `msg::` 函数。
++    #[test]
++    fn bad_token_and_network_trouble_produce_different_messages() {
++        let (bad, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
++            Err(ChannelError::BadToken)
++        });
++        let (unreachable, _) = phone_verify_token("tok", crate::i18n::Lang::Zh, &|_| {
++            Err(ChannelError::Unreachable)
++        });
++        let PhoneState::Broken(bad_msg) = bad else {
++            unreachable!()
++        };
++        let PhoneState::Broken(unreachable_msg) = unreachable else {
++            unreachable!()
++        };
++        assert_ne!(
++            bad_msg, unreachable_msg,
++            "令牌失效和连不上网络不该说同一句话——下一步完全不同"
++        );
++        assert_eq!(
++            bad_msg,
++            crate::i18n::msg::phone_token_invalid(crate::i18n::Lang::Zh)
++        );
++        assert_eq!(
++            unreachable_msg,
++            crate::i18n::msg::phone_unreachable(crate::i18n::Lang::Zh)
++        );
++    }
++
++    /// **安全属性，不是巧合。** `phone_verify_token` 的两个 `Broken` 分支
++    /// 都是固定文案，压根不读 `token` 参数——这条测试用一个看起来像真实
++    /// Telegram 令牌的字符串去调用它，确认返回的 `Broken` 消息里一个字符
++    /// 都没有它。守护进程是唯一决定用户看到什么文字的地方（`PhoneState::
++    /// Broken` 的文档注释），这条纪律必须钉在这一层，不能只指望界面那边
++    /// 的纵深防御（`ui/phone.rs` 的 `status_line`/`next_step` 故意不读
++    /// payload）。
++    #[test]
++    fn phone_broken_text_never_contains_the_token() {
++        let real_looking_token = "123456789:AAH-super-secret-telegram-token";
++        for err in [
++            ChannelError::BadToken,
++            ChannelError::Unreachable,
++            ChannelError::Malformed,
++        ] {
++            let (state, _) =
++                phone_verify_token(real_looking_token, crate::i18n::Lang::Zh, &move |_| {
++                    Err(err)
++                });
++            let PhoneState::Broken(msg) = state else {
++                panic!("{err:?} 应该是 Broken")
++            };
++            assert!(
++                !msg.contains(real_looking_token),
++                "令牌漏进了 Broken 文案：{msg}"
++            );
++        }
++    }
++
++    #[test]
++    fn initial_phone_status_is_off_without_a_saved_token() {
++        let secrets = Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        ));
++        assert_eq!(initial_phone_status(&secrets).state, PhoneState::Off);
++    }
++
++    #[test]
++    fn initial_phone_status_is_waiting_for_pairing_with_a_saved_token() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut store = SecretStore::load(&dir.path().join("secrets.toml"));
++        store.set(PHONE_TOKEN_KEY, "some-token").unwrap();
++        let secrets = Mutex::new(store);
++        let status = initial_phone_status(&secrets);
++        assert_eq!(status.state, PhoneState::WaitingForPairing);
++        assert!(
++            status.bot.is_none(),
++            "bot 名字要等后台刷新，开机这一刻还不知道"
++        );
++    }
++
++    /// 令牌好使：落盘、内存状态推进到 `WaitingForPairing`、主人清空
++    /// （新令牌等于新的一轮配对）。
++    #[test]
++    fn apply_phone_set_token_saves_a_good_token() {
++        let secrets = Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        ));
++        let phone = Mutex::new(PhoneStatus {
++            state: PhoneState::Off,
++            bot: None,
++            owner: None,
++        });
++
++        let resp = apply_phone_set_token(
++            "good-token",
++            crate::i18n::Lang::Zh,
++            &secrets,
++            &phone,
++            &|_| Ok("my_dct_bot".to_string()),
++        )
++        .unwrap();
++
++        match resp {
++            Response::Phone(status) => {
++                assert_eq!(status.state, PhoneState::WaitingForPairing);
++                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
++                assert!(status.owner.is_none());
++            }
++            other => panic!("期待 Response::Phone，得到 {other:?}"),
++        }
++        assert_eq!(
++            recover(secrets.lock()).get(PHONE_TOKEN_KEY),
++            Some("good-token"),
++            "验证通过的令牌必须落盘，不然重启就没了"
++        );
++    }
++
++    /// **关键行为，专门有一条测试盯着。** 令牌被拒时**不能**把它写进
++    /// `secrets.toml`——磁盘上原来的令牌（如果有）必须原封不动。这条只能
++    /// 靠拆出 `apply_phone_set_token` 才测得到：留在 `handle()` 里的话，
++    /// 这一支会先打一次真实的 `Telegram::new(t).get_me()` 网络请求，测试
++    /// 要么连不上网直接假失败，要么就得连真网络——两者都不是单元测试该做
++    /// 的事。
++    #[test]
++    fn apply_phone_set_token_does_not_save_a_bad_token() {
++        let secrets = Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        ));
++        let phone = Mutex::new(PhoneStatus {
++            state: PhoneState::Off,
++            bot: None,
++            owner: None,
++        });
++
++        let resp = apply_phone_set_token(
++            "bad-token",
++            crate::i18n::Lang::Zh,
++            &secrets,
++            &phone,
++            &|_| Err(ChannelError::BadToken),
++        )
++        .unwrap();
++
++        assert!(matches!(
++            resp,
++            Response::Phone(PhoneStatus {
++                state: PhoneState::Broken(_),
++                ..
++            })
++        ));
++        assert!(
++            recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
++            "验证失败的令牌绝不能落盘"
++        );
++    }
++
++    #[test]
++    fn phone_status_reflects_whatever_is_in_the_shared_cell() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets = Arc::new(Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        )));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Paired,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        }));
++
++        let resp = handle(
++            Request::PhoneStatus,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++        );
++        match resp {
++            Response::Phone(status) => {
++                assert_eq!(status.state, PhoneState::Paired);
++                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
++                assert_eq!(status.owner.as_deref(), Some("lei"));
++            }
++            other => panic!("期待 Response::Phone，得到 {other:?}"),
++        }
++    }
++
++    /// `r`（重新配对）把主人忘掉、退回等配对，令牌和 bot 名字不动。
++    #[test]
++    fn phone_unpair_forgets_the_owner_but_keeps_the_token_alive() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets = Arc::new(Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        )));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Paired,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        }));
++
++        let resp = handle(
++            Request::PhoneUnpair,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++        );
++        match resp {
++            Response::Phone(status) => {
++                assert_eq!(status.state, PhoneState::WaitingForPairing);
++                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"), "bot 不该被忘掉");
++                assert!(status.owner.is_none(), "主人要被忘掉，这才是重新配对");
++            }
++            other => panic!("期待 Response::Phone，得到 {other:?}"),
++        }
++    }
++
++    /// 没填过令牌时按 r 没有意义——不能凭空造出一个 `WaitingForPairing`，
++    /// 那会让界面显示一件用户从没做过的事（填过令牌）。
++    #[test]
++    fn phone_unpair_on_off_stays_off() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets = Arc::new(Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        )));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = test_phone(); // Off
++
++        let resp = handle(
++            Request::PhoneUnpair,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++        );
++        match resp {
++            Response::Phone(status) => assert_eq!(status.state, PhoneState::Off),
++            other => panic!("期待 Response::Phone，得到 {other:?}"),
++        }
++    }
++
++    /// `x`（整个关掉）要把令牌从磁盘上删掉，不只是内存里的状态复位——
++    /// 不删的话，下次守护进程重启，`initial_phone_status` 又会看见这份
++    /// 令牌，把一个用户已经明确关掉的功能悄悄打开。
++    #[test]
++    fn phone_disable_deletes_the_token_and_resets_to_off() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets_path = tempfile::tempdir().unwrap().path().join("secrets.toml");
++        let mut disk = SecretStore::load(&secrets_path);
++        disk.set(PHONE_TOKEN_KEY, "some-token").unwrap();
++        let secrets = Arc::new(Mutex::new(disk));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::WaitingForPairing,
++            bot: Some("my_dct_bot".into()),
++            owner: None,
++        }));
++
++        let resp = handle(
++            Request::PhoneDisable,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++        );
++        match resp {
++            Response::Phone(status) => {
++                assert_eq!(status.state, PhoneState::Off);
++                assert!(status.bot.is_none());
++                assert!(status.owner.is_none());
++            }
++            other => panic!("期待 Response::Phone，得到 {other:?}"),
++        }
++        assert!(
++            recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
++            "令牌必须真的从磁盘上删掉，不能只改内存状态"
++        );
++    }
+ }
+diff --git a/src/i18n.rs b/src/i18n.rs
+index ce3cdf0..34c54ba 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -142,23 +142,51 @@ pub enum Key {
+     /// 它们混：`CopyMode`/`CopyModeShort` 是「已经在复制模式里」时顶掉整条
+     /// 右段的话，这一条是「还没进去、告诉你按哪个键能进去」。
+     EnterCopyMode,
+     OtherKeysGoToAgent,
+     BackToListWord,
+     BackToSettingsWord,
+     OrPressDigit,
+     TypeToFilter,
+     Language,
+     /// 设置页第二项的名字：手机通知开关那一页的入口。跟 `Language` 挨着
+-    /// 放是因为它们现在是同一层列表里的兄弟项——`Language` 是真管用的
+-    /// 那个，这个要等 Task 4 才接线，但列表里的位置已经在这个任务定下来。
++    /// 放是因为它们现在是同一层列表里的兄弟项，也用作 `View::Phone` 自己
++    /// 的页面标题。
+     Phone,
++    // —— 手机通知页（Task 4）：状态行 + 下一步，见 `ui/phone.rs` ——
++    /// `PhoneState::Off` 的状态行：还没填令牌。
++    PhoneOff,
++    /// `PhoneState::Off` 的下一步：按 Enter 去填令牌。
++    PhoneOffNextStep,
++    /// `PhoneState::WaitingForPairing` 的下一步：去 Telegram 上给 bot
++    /// 发条消息。状态行本身要插值 bot 用户名，走 `msg::phone_waiting`，
++    /// 不在这里——这一条没有参数。
++    PhoneWaitingNextStep,
++    /// `PhoneState::Paired` 但 `owner` 意外是 `None` 时的状态行兜底
++    /// （正常情况下走 `msg::phone_paired`，带着配对账号的名字）。
++    PhonePairedNoOwner,
++    /// `PhoneState::Broken` 的状态行。**故意不读 `Broken` 里的字符串**，
++    /// 见 `proto::PhoneState::Broken` 和 `ui/phone.rs::status_line` 的
++    /// 文档注释——这是防止令牌漏进界面文案的一条纵深防御。
++    PhoneBrokenHeadline,
++    /// `PhoneState::Broken` 的下一步：两种真实成因合成一句话——
++    /// 令牌本身失效了（重新填一遍），或者对方在 Telegram 里拉黑了这个
++    /// bot（解除拉黑后按 r 重新配对）。同样不读 `Broken` 的payload，
++    /// 两种可能性都摆出来，比猜一个可能是错的原因更诚实。
++    PhoneBrokenNextStep,
++    /// 状态页上 `Enter` 键的说明：填令牌。只在 `Off`/`Broken` 两种状态下
++    /// 显示——`WaitingForPairing`/`Paired` 已经有令牌了，Enter 不做事。
++    PhoneEnterToken,
++    /// 状态页上 `r` 键的说明：重新配对。
++    PhoneRepair,
++    /// 状态页上 `x` 键的说明：整个关掉手机通知。
++    PhoneTurnOff,
+     // —— 全部按键浮层 ——
+     /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
+     /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
+     /// 就是「后面还有」的通用说法。
+     MoreKeys,
+     AllKeys,
+     KeysGroupMove,
+     KeysGroupSession,
+     KeysGroupConfig,
+     // —— 逃生键 ——
+@@ -333,20 +361,51 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
+         OtherKeysGoToAgent => t!(
+             lang,
+             en: "every other key goes to the agent",
+             zh: "其余按键都发给 agent",
+         ),
+         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
+         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
+         Language => t!(lang, en: "language", zh: "语言"),
+         Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
++        PhoneOff => t!(
++            lang,
++            en: "phone notifications are off",
++            zh: "还没连上手机",
++        ),
++        PhoneOffNextStep => t!(
++            lang,
++            en: "press Enter to type a Telegram bot token and turn this on",
++            zh: "按 Enter 填一个 Telegram 机器人的令牌，把手机通知打开",
++        ),
++        PhoneWaitingNextStep => t!(
++            lang,
++            en: "open Telegram, find that bot, and send it any message to finish pairing",
++            zh: "打开 Telegram，找到刚才那个机器人，随便发一条消息，完成配对",
++        ),
++        PhonePairedNoOwner => t!(lang, en: "phone notifications are on", zh: "已经连上手机"),
++        PhoneBrokenHeadline => t!(
++            lang,
++            en: "phone notifications stopped working",
++            zh: "手机通知断线了",
++        ),
++        PhoneBrokenNextStep => t!(
++            lang,
++            en: "if the token itself stopped working, press Enter to type a new one; \
++                 if you blocked this bot in Telegram, unblock it and press r to pair again",
++            zh: "如果是令牌本身失效了，按 Enter 重新填一遍；如果是你在 Telegram 里把这个\
++                 机器人拉黑了，解除拉黑后按 r 重新配对",
++        ),
++        PhoneEnterToken => t!(lang, en: "enter token", zh: "填令牌"),
++        PhoneRepair => t!(lang, en: "pair again", zh: "重新配对"),
++        PhoneTurnOff => t!(lang, en: "turn off", zh: "关闭"),
+ 
+         MoreKeys => t!(lang, en: "…", zh: "…"),
+         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
+         KeysGroupMove => t!(lang, en: "Move", zh: "走动"),
+         KeysGroupSession => t!(lang, en: "Sessions", zh: "会话"),
+         KeysGroupConfig => t!(lang, en: "Settings", zh: "设置"),
+ 
+         BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
+         BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
+         BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
+@@ -741,20 +800,67 @@ pub mod msg {
+     }
+ 
+     pub fn confirm_delete_secret(lang: Lang, label: &str) -> String {
+         t!(
+             lang,
+             en: format!("Press d again to delete the key for {label}, any other key cancels"),
+             zh: format!("再按一次 d 删除 {label} 的密钥，按其他键取消"),
+         )
+     }
+ 
++    /// 等配对时的状态行。**必须点名是哪个 bot**——「去给它发条消息」是句
++    /// 没法执行的话，除非用户知道「它」是谁。
++    pub fn phone_waiting(lang: Lang, bot: &str) -> String {
++        t!(
++            lang,
++            en: format!("waiting for you to message @{bot} on Telegram"),
++            zh: format!("等你在 Telegram 里给 @{bot} 发条消息"),
++        )
++    }
++
++    /// 已配对的状态行，带着配对账号的名字。
++    pub fn phone_paired(lang: Lang, owner: &str) -> String {
++        t!(
++            lang,
++            en: format!("connected — notifications go to {owner}"),
++            zh: format!("已经连上手机，通知发给 {owner}"),
++        )
++    }
++
++    /// `PhoneState::Broken` 里装的那句「已经成文的人话」——**守护进程**
++    /// 在验证令牌失败时调这两个函数，不是界面。这是本文件里少数几处
++    /// 组句发生在 daemon 一侧的地方，理由见 `proto::Request::PhoneSetToken`
++    /// 和 `proto::PhoneState::Broken` 的文档注释：这一条请求带着 `lang`，
++    /// daemon 借着这次请求的上下文知道该用哪种语言写这句话。
++    ///
++    /// **绝不能把令牌本身拼进这句话**——`daemon.rs::phone_verify_token`
++    /// 的单测钉着这一条，`ui/phone.rs` 那边的 `status_line`/`next_step`
++    /// 也额外加了一层「不读 payload」的纵深防御。
++    pub fn phone_token_invalid(lang: Lang) -> String {
++        t!(
++            lang,
++            en: "this token doesn't work — it may be mistyped or already revoked",
++            zh: "这个令牌用不了，可能是复制的时候错了几位，或者已经被吊销了",
++        )
++        .to_string()
++    }
++
++    /// 验证令牌时连不上 Telegram（网络问题，或者回包读不懂）。
++    pub fn phone_unreachable(lang: Lang) -> String {
++        t!(
++            lang,
++            en: "could not reach Telegram right now — check the network and try again",
++            zh: "现在连不上 Telegram，检查一下网络，再试一次",
++        )
++        .to_string()
++    }
++
+     /// 标题里必须带上「Esc 回哪」，而且分设置页/选择器两种。
+     ///
+     /// 这半句一度被合并掉，理由是底栏的 `idle_help` 已经说了——但那两处画在
+     /// 不同的区域，密钥页这一屏自己看不到底栏。更要紧的是 `escape_hint` 和
+     /// 标题必须**互相印证**：底栏说什么就得真能做到什么，标题跟着一起说，
+     /// 才不会出现一处说设置、一处还写着旧的「列表」。
+     pub fn enter_secret_title(lang: Lang, label: &str, to_settings: bool) -> String {
+         let back = text(
+             if to_settings {
+                 Key::BackToSettingsWord
+@@ -1275,20 +1381,29 @@ mod tests {
+             EmptyReplyIsEnter,
+             NextSession,
+             EnterCopyMode,
+             OtherKeysGoToAgent,
+             BackToListWord,
+             BackToSettingsWord,
+             OrPressDigit,
+             TypeToFilter,
+             Language,
+             Phone,
++            PhoneOff,
++            PhoneOffNextStep,
++            PhoneWaitingNextStep,
++            PhonePairedNoOwner,
++            PhoneBrokenHeadline,
++            PhoneBrokenNextStep,
++            PhoneEnterToken,
++            PhoneRepair,
++            PhoneTurnOff,
+             BackToBoard,
+             BackToBoardWithF2,
+             BackToList,
+             BackToSettings,
+             BoardTitle,
+             Disconnected,
+             PickAgentTitle,
+             PickProjectTitle,
+             TypePathTitle,
+             SettingsTitle,
+@@ -1373,21 +1488,21 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 101, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 110, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
+     /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
+     /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
+     /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
+diff --git a/src/proto.rs b/src/proto.rs
+index c6a04db..6ac20b1 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -37,21 +37,26 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
+ /// 同时多了 `Request::PinProject` / `Request::UnpinProject`，
+ /// `Response::Projects` 从 `Vec<String>` 换成了带 `recent` / `pinned`
+ /// 两个具名字段的结构体。
+ ///
+ /// 6（事后追加，没有加一）= `SessionInfo` 又多了 `tag`（会话的稳定名字，
+ /// 空串表示还没起出来）。没有跟着把版本号加一，是因为这个字段带
+ /// `#[serde(default)]` 且纯只读，没有新增或改动任何 `Request` 变体——
+ /// 旧守护进程不需要「懂」它，只是答复里多了一段旧进程从不读的文本。
+ /// 具体的允许条件和「这不能当先例」的警告见
+ /// `the_session_info_shape_is_pinned_too` 测试上的注释。
+-pub const PROTOCOL_VERSION: u32 = 6;
++///
++/// 7 = 多了 `Request::PhoneStatus` / `PhoneSetToken` / `PhoneUnpair` /
++/// `PhoneDisable`、`Response::Phone(PhoneStatus)`。旧守护进程完全不认识
++/// 这四条新请求，界面发过去只会得到一句解析失败——手机通知这一整页
++/// 除了显示旧的静态文案，什么都做不了。
++pub const PROTOCOL_VERSION: u32 = 7;
+ 
+ /// 对面那个守护进程能不能用。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum DaemonStatus {
+     /// 同一份协议，正常用。
+     Same,
+     /// 号对不上，或者老到连 `Hello` 都不认识。
+     Stale,
+ }
+ 
+@@ -124,20 +129,55 @@ pub struct MouseForward {
+ /// 编码那一侧（Task 9）反正要按数字拼 SGR 序列，分开只会多一层 match。
+ #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+ pub enum MouseForwardKind {
+     WheelUp,
+     WheelDown,
+     /// 0 = 左键，1 = 中键，2 = 右键
+     Press(u8),
+     Release(u8),
+ }
+ 
++/// 手机通知这一页在守护进程眼里处在哪个阶段。**这一行状态是那一整页存在的
++/// 全部理由**——配对是异步的（填完令牌之后守护进程转去后台长轮询等用户在
++/// Telegram 上发第一条消息），不给这件事一个去处，用户填完令牌就会对着一片
++/// 空白发呆。
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub enum PhoneState {
++    /// 还没填令牌
++    Off,
++    /// 填了、验过了，在等用户给 bot 发第一条消息
++    WaitingForPairing,
++    Paired,
++    /// 连不上。**装的是已经成文的人话，不是原始错误文本**——守护进程是
++    /// 唯一决定用户看到什么文字的地方（本文件顶上 `SecretPrompt` 那条已有
++    /// 的约定：组句发生在哪一侧必须一致，不能一半在 daemon 一半在界面）。
++    ///
++    /// `ui/phone.rs` 的 `status_line`/`next_step` **故意不读这个字符串的
++    /// 内容**：它们只按这个变体本身给固定文案，理由见那两个函数的文档
++    /// 注释和 `the_token_never_appears_in_any_status_text` 这条测试——这是
++    /// 一条纵深防御，哪怕将来有一天这里被塞进了不该出现的原始内容，界面上
++    /// 最显眼的那一行状态和下一步提示也不会把它带出来。这个字符串真正显示
++    /// 的地方是 `draw()` 里单独的一行详情。
++    Broken(String),
++}
++
++/// 手机通知这一页要显示的全部事实。
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PhoneStatus {
++    pub state: PhoneState,
++    /// bot 用户名，`getMe` 拿的。等配对那句话要用它——「去 Telegram 里找
++    /// @xxx 发条消息」，没有这个名字这句话就没法说。
++    pub bot: Option<String>,
++    /// 配上的主人，显示用。
++    pub owner: Option<String>,
++}
++
+ #[derive(Serialize, Deserialize)]
+ pub enum Request {
+     /// 「你是几号协议？」界面连上之后问的第一句。放在最前面，且
+     /// **永远不许改形状**——它是唯一一条必须让任何年纪的守护进程都能
+     /// 解出来的请求（老到答不上来也没关系，答不上来本身就是答案）。
+     Hello,
+     List,
+     Create {
+         dir: String,
+         profile: String,
+@@ -232,20 +272,41 @@ pub enum Request {
+         id: u32,
+         by: ScrollBy,
+     },
+     /// 界面转发的鼠标事件（滚轮、点击、拖拽结束的松开）。是否真的转发给
+     /// agent 由 daemon 按当前是不是在看历史（`ScrollState::alt_screen` /
+     /// `offset`）决定，界面不用先猜。
+     Mouse {
+         id: u32,
+         event: MouseForward,
+     },
++    /// 手机通知这一页打开时问一次：现在是什么状态。纯读，不碰任何状态，
++    /// 也不打任何网络——守护进程手里已经有答案（见 `daemon.rs` 里那个
++    /// 内存中的 `PhoneStatus`），这条请求只是把它搬到界面上。
++    PhoneStatus,
++    /// 用户在手机通知页填完令牌按下 Enter。守护进程用它去 `getMe` 验证
++    /// （见 `channel::telegram::Telegram::get_me`），验过了才落盘、才把
++    /// 内存里的状态往前推。**带上 `lang`**：验证失败时 `PhoneState::Broken`
++    /// 里要装一句成文的人话，而组句必须发生在知道用户语言的这一侧
++    /// （同 `Profiles { lang }` 的道理，见 `SecretPrompt` 上那条约定）——
++    /// 这一条请求偏离了 brief 原始接口清单（那里没有 `lang`），是本任务
++    /// 实现时补上的，理由写在任务报告里。
++    PhoneSetToken {
++        token: String,
++        lang: crate::i18n::Lang,
++    },
++    /// 重新配对：忘掉当前的主人（`owner`/出站目的地），回到
++    /// `WaitingForPairing`，重新等下一条消息。令牌不变——如果令牌本身
++    /// 也坏了，用户要走的是 `PhoneSetToken`，不是这条。
++    PhoneUnpair,
++    /// 整个关掉：删掉存好的令牌，状态退回 `Off`。
++    PhoneDisable,
+ }
+ 
+ /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
+ /// `value` 是用户的明文密钥。今天没有任何地方真的 `{req:?}` 打印一个
+ /// `Request`（已核实），但 `serve()` 解析失败那条分支离
+ /// `eprintln!("bad request: {req:?}")` 只有一行距离——一旦有人图省事加了
+ /// 这行调试日志，密钥就会写进守护进程的 stderr（很可能重定向进一个存活
+ /// 比进程本身久得多的日志文件）。这里把 `value` 换成占位符，`profile`
+ /// 这种不敏感的字段照常打印，排查问题时还能看出是哪个 profile 出的请求。
+ impl std::fmt::Debug for Request {
+@@ -305,20 +366,30 @@ impl std::fmt::Debug for Request {
+                 .debug_struct("Scroll")
+                 .field("id", id)
+                 .field("by", by)
+                 .finish(),
+             // 没有密钥、没有用户输入的自由文本，坐标和按键状态照常打印。
+             Request::Mouse { id, event } => f
+                 .debug_struct("Mouse")
+                 .field("id", id)
+                 .field("event", event)
+                 .finish(),
++            Request::PhoneStatus => write!(f, "PhoneStatus"),
++            // `token` 是用户的明文密钥，同 `SetSecret`/`VerifySecret` 的
++            // `value` 一样必须脱敏——见本 impl 头上那条统一的理由。
++            Request::PhoneSetToken { token: _, lang } => f
++                .debug_struct("PhoneSetToken")
++                .field("token", &"<redacted>")
++                .field("lang", lang)
++                .finish(),
++            Request::PhoneUnpair => write!(f, "PhoneUnpair"),
++            Request::PhoneDisable => write!(f, "PhoneDisable"),
+         }
+     }
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ pub enum Response {
+     /// 对 [`Request::Hello`] 的回答。同样不许改形状。
+     Hello {
+         protocol: u32,
+     },
+@@ -366,20 +437,26 @@ pub enum Response {
+     /// 没配 LLM、或者算失败了——界面不用区分，统一显示今天就有的那句
+     /// 失败提示）。
+     Explanation(Option<String>),
+     /// 对 [`Request::Scroll`] 的回答：滚完之后的状态。**目前没有任何调用点
+     /// 读它**——界面所有发 `Request::Scroll` 的地方都用 `let _ = ...` 扔掉
+     /// 返回值，底栏刷新靠的是下一轮 16ms 一次的 `Screen` 轮询自然带回来的
+     /// `scroll` 字段，不是这个字段直接驱动的。留着 `Scrolled` 而不是改成
+     /// `Ok`：它仍然是描述这次滚动的正确形状，往后要是哪个调用点想抄近路
+     /// 立刻拿到滚完的状态（不等下一轮 `Screen`），数据已经现成。
+     Scrolled(ScrollState),
++    /// 对 [`Request::PhoneStatus`] / [`Request::PhoneSetToken`] /
++    /// [`Request::PhoneUnpair`] / [`Request::PhoneDisable`] 的共同回答：
++    /// 手机通知这一页现在的完整状态。四条请求共用一个回答形状是因为它们
++    /// 全都是「做点什么，然后告诉我现在是什么状态」——跟 `Ok` 分开是因为
++    /// 界面需要状态本身去刷新那一行，不是只知道「成功了」。
++    Phone(PhoneStatus),
+ }
+ 
+ /// 守护进程报「哪一类错 + 参数」，**不组句**。
+ ///
+ /// 组句一律发生在界面进程：daemon 是常驻的、可能同时服务多个界面的进程，
+ /// 它不知道也不该知道谁在用什么语言。报码的另一个好处是切语言立刻生效，
+ /// 不用重启 daemon——它存下来的东西里没有任何一句是某种语言的。
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub enum ErrorCode {
+     NoSuchProfile(String),
+@@ -653,28 +730,35 @@ mod tests {
+                 id: 1,
+                 event: MouseForward {
+                     col: 10,
+                     row: 20,
+                     kind: MouseForwardKind::Press(0),
+                     shift: false,
+                     alt: false,
+                     ctrl: false,
+                 },
+             },
++            Request::PhoneStatus,
++            Request::PhoneSetToken {
++                token: "t".into(),
++                lang: crate::i18n::Lang::Zh,
++            },
++            Request::PhoneUnpair,
++            Request::PhoneDisable,
+         ];
+ 
+         let shape = serde_json::to_string(&all).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+-                6,
+-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
++                7,
++                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t","lang":"Zh"}},"PhoneUnpair","PhoneDisable"]"#
+             ),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     /// 请求那条 pin 只钉了**发出去**的形状，回来的没人管——而 2026-08-06
+     /// 给 `SessionInfo` 加 `is_agent` 正是改在回程上：旧守护进程回的 JSON
+     /// 里没这个字段，新界面 `from_str` 直接失败，症状是看板一个会话都没有。
+     /// 回程的形状同样是契约，同样要钉。
+     ///
+@@ -703,21 +787,21 @@ mod tests {
+             dir: "/d".into(),
+             state: SessionState::Idle,
+             activity: "a".into(),
+             is_agent: true,
+             tag: String::new(),
+         };
+         let shape = serde_json::to_string(&info).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+-                6,
++                7,
+                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
+             ),
+             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     #[test]
+     fn screens_response_round_trips() {
+         use crate::pty::{ScreenSpan, ScreenStyle};
+         let resp = Response::Screens {
+@@ -795,15 +879,50 @@ mod tests {
+     /// 就能一路绿灯地把版本号留在原地，而那正是 2026-08-05 那次事故的形状。
+     #[test]
+     fn projects_response_carries_both_lists() {
+         let r = Response::Projects {
+             recent: vec!["/a".into()],
+             pinned: vec!["/b".into()],
+         };
+         let s = serde_json::to_string(&r).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, s.as_str()),
+-            (6, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
++            (7, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
++
++    /// 令牌是用户的明文密钥，同 `SetSecret`/`VerifySecret` 一样必须脱敏。
++    #[test]
++    fn debug_redacts_the_token_on_phone_set_token() {
++        let req = Request::PhoneSetToken {
++            token: "123456:AAH-super-secret-telegram-token".into(),
++            lang: crate::i18n::Lang::Zh,
++        };
++        let s = format!("{req:?}");
++        assert!(
++            !s.contains("123456:AAH-super-secret-telegram-token"),
++            "令牌不能出现在 Debug 输出里：{s}"
++        );
++        assert!(s.contains("PhoneSetToken"), "变体名字留着帮排查：{s}");
++    }
++
++    #[test]
++    fn phone_status_response_round_trips() {
++        let r = Response::Phone(PhoneStatus {
++            state: PhoneState::Broken("令牌用不了，重新输入一遍".into()),
++            bot: Some("my_dct_bot".into()),
++            owner: None,
++        });
++        let s = serde_json::to_string(&r).unwrap();
++        let back: Response = serde_json::from_str(&s).unwrap();
++        match back {
++            Response::Phone(status) => {
++                assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
++                assert!(
++                    matches!(status.state, PhoneState::Broken(m) if m == "令牌用不了，重新输入一遍")
++                );
++            }
++            other => panic!("解回来不是 Phone：{other:?}"),
++        }
++    }
+ }
+diff --git a/src/secrets.rs b/src/secrets.rs
+index da2f1de..287df11 100644
+--- a/src/secrets.rs
++++ b/src/secrets.rs
+@@ -7,20 +7,28 @@ use std::os::unix::fs::OpenOptionsExt;
+ use std::path::{Path, PathBuf};
+ 
+ /// 磁盘格式。包一层 `[secrets]` 表而不是把键平铺在顶层，
+ /// 是为了将来加别的配置段时老文件仍能读。
+ #[derive(Default, Serialize, Deserialize)]
+ struct Disk {
+     #[serde(default)]
+     secrets: BTreeMap<String, String>,
+ }
+ 
++/// 手机通知的令牌存在密钥仓里，用一个 profile 不可能占用的名字。
++///
++/// **它不会出现在密钥页（`c`）里**，因为那一页遍历的是 profiles 再查
++/// `has_secret`（见 `ui/pick.rs`），不是遍历这个文件的键。
++/// 将来谁把密钥页改成遍历 `secrets.toml`，这个名字就会作为一个不存在的
++/// agent 冒出来——改那里的人请回来看这一句。
++pub const PHONE_TOKEN_KEY: &str = "__phone__";
++
+ /// 按 profile 名索引的用户密钥。落盘在 `~/.dct/secrets.toml`，0600。
+ pub struct SecretStore {
+     path: PathBuf,
+     secrets: BTreeMap<String, String>,
+     /// 读失败的原因。非 None 时**拒绝任何写入**——见 `set()` 的注释。
+     load_error: Option<WarningCode>,
+ }
+ 
+ /// 跟着 socket 走，测试自动隔离（同 `projects::store_path_for_socket`）。
+ pub fn secrets_path_for_socket(socket: &Path) -> PathBuf {
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 6065fe3..204f485 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -89,20 +89,35 @@ pub struct App {
+     // 送回来的这一刻，屏幕上未必还是发起验证时的那个视图。用户可能已经
+     // Ctrl+Q/Esc 退出去，甚至绕回来在另一个 agent 身上重新填了密钥；旧写法
+     // 只看"现在还是不是 EnterSecret 视图"，对不上具体是哪一个 profile、哪一份
+     // 密钥，就会把一次过期的验证结果套在一个完全不相干的 profile 上，
+     // 写出一份用户从没见过、甚至是空的"密钥"。把发起时的身份跟结果一起带
+     // 回来，收的时候现比对一遍（见 `verify_outcome_applies_to`），这样不管
+     // 是哪条退出路径忘了清 `verify_rx`，错位的结果都应用不到屏幕上去——
+     // 不必把这条防线押在"每个退出分支都记得清 receiver"这种容易漏改的
+     // 纪律上。
+     pub verify_rx: Option<std::sync::mpsc::Receiver<(String, String, VerifyOutcome)>>,
++    /// 手机通知页填令牌那次后台验证的结果。跟 `verify_rx` 同一个理由：
++    /// `Request::PhoneSetToken` 会打真网络（`getMe`），不能在按键循环里
++    /// 直接跑，丢给后台线程，主循环每轮 `try_recv`。
++    ///
++    /// 元组里带着发起这次验证时的**令牌本身**，不是只传结果——同
++    /// `verify_rx` 的道理：验证是异步的，结果送回来的这一刻，屏幕上未必
++    /// 还是发起验证时的那份输入（用户可能已经 Esc 退出、甚至重新打过一遍）。
++    /// 收的时候要现比对一遍令牌是否还是当初发起验证的那一份
++    /// （见 `ui/mod.rs` 收尾那段），对不上就扔掉，不套在一个不相干的输入上。
++    pub phone_verify_rx: Option<
++        std::sync::mpsc::Receiver<(
++            String,
++            std::result::Result<crate::proto::PhoneStatus, String>,
++        )>,
++    >,
+     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
+     /// 系统 locale > En），设置页改它时同时写盘。守护进程不持有这个——
+     /// 它是常驻的、可能同时服务多个界面的进程，见 `Request::Profiles`。
+     pub lang: crate::i18n::Lang,
+     /// 守护进程 socket 的路径。设置文件就在它旁边（见
+     /// `settings::settings_path_for_socket`），所以改语言时要用到它。
+     /// 存路径而不是存设置文件路径：将来别的「跟着 socket 走」的文件
+     /// （profiles 目录、projects.json）也都从它推导，只留一个源头。
+     pub socket: PathBuf,
+     /// dct 启动时的目录，只用来解析用户敲进来的相对路径、以及看板上一个组
+@@ -168,20 +183,21 @@ impl App {
+             screen_origin: None,
+             grid_screens: Vec::new(),
+             grid_last_fetch: None,
+             grid_page: None,
+             sent_size: None,
+             // 每轮循环开头的 List 调用是唯一的真相来源，它总在当次
+             // term.draw 之前重新算一遍，所以这里给什么都会被立刻覆盖。
+             connected: true,
+             need_sessions: true,
+             verify_rx: None,
++            phone_verify_rx: None,
+             lang,
+             socket,
+             start_dir: default_dir,
+             quit: false,
+             explained_failure: None,
+             copy_mode: false,
+         }
+     }
+ 
+     pub fn new(
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index ac0582a..a196761 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -21,20 +21,21 @@ mod widgets;
+ use widgets::short_path;
+ pub use widgets::{status_label, status_style, Msg};
+ 
+ mod app;
+ use app::App;
+ 
+ mod attach;
+ mod board;
+ mod grid;
+ mod keys;
++mod phone;
+ mod pick;
+ mod secret;
+ mod settings_view;
+ 
+ mod view;
+ use view::SecretPhase;
+ use view::{
+     back_one_level, escape_hint, idle_help, is_ctrl_q, message_after_transition,
+     session_ended_notice, SettingsItem, View,
+ };
+@@ -379,20 +380,58 @@ pub fn run(
+                         };
+                     }
+                     // else：profile 或 buf 对不上——这条结果对应的是一个用户
+                     // 已经离开的请求，扔了，不切视图。
+                 }
+                 // else：视图现在压根就不是 EnterSecret 了（比如用户 Esc/Ctrl+Q
+                 // 提前离开，切到了看板/选择器/设置页）。同样没有落点，扔了。
+             }
+         }
+ 
++        // 手机通知页填令牌的后台验证结果，同上一段 `verify_rx` 一个道理：
++        // `Request::PhoneSetToken` 会打真网络（`getMe`），丢给后台线程跑，
++        // 这里每轮 `try_recv`。
++        if let Some(rx) = &app.phone_verify_rx {
++            if let Ok((sent_token, outcome)) = rx.try_recv() {
++                app.phone_verify_rx = None;
++                if let View::Phone {
++                    status,
++                    entry:
++                        Some(view::PhoneEntry {
++                            buf,
++                            phase: SecretPhase::Verifying,
++                        }),
++                } = app.view.clone()
++                {
++                    // 只有还是当初发起这次验证的那份输入，结果才有落点——
++                    // 用户可能已经 Esc 退出、甚至绕回来重新打过一遍。
++                    if view::phone_verify_outcome_applies_to(&sent_token, &buf) {
++                        app.view = match outcome {
++                            Ok(new_status) => View::Phone {
++                                status: new_status,
++                                entry: None,
++                            },
++                            Err(msg) => View::Phone {
++                                status,
++                                entry: Some(view::PhoneEntry {
++                                    buf,
++                                    phase: SecretPhase::Failed(msg),
++                                }),
++                            },
++                        };
++                    }
++                    // else：令牌对不上，这条结果对应一个用户已经离开的输入，扔了。
++                }
++                // else：视图已经不是「正在验证令牌」了，同样没有落点，扔了。
++            }
++        }
++
+         let attached = matches!(app.view, View::Attached(_));
+         if app.need_sessions || !attached {
+             match app.client().and_then(|c| c.call(Request::List)) {
+                 Ok(Response::Sessions(v)) => {
+                     app.set_sessions(v);
+                     app.connected = true;
+                     // `pinned` 跟会话列表同一个节奏拉，不是每帧拉：看板上出现
+                     // 哪些组 = 有在跑的会话的 ∪ pinned 的，只刷新其中一半会让另一半
+                     // 停在旧答案上（别的 dct 窗口 `p` 上来的项目永远不出现，
+                     // `x` 掉的项目永远不消失）。
+@@ -585,20 +624,37 @@ pub fn run(
+                         // 这个会话不再是 Failed 了（恢复了）：把缓存忘掉。
+                         // 不忘的话，它下次再坏，`already_have` 会一直是
+                         // true，新的一次失败永远问不出新的解释。
+                         app.explained_failure = None;
+                     }
+                 }
+                 _ => app.connected = false,
+             }
+         }
+ 
++        // 手机通知页轮询：配对是异步的（守护进程在后台等用户在 Telegram 上
++        // 发第一条消息），这一页的价值全在那一行状态会不会自己变——不轮询
++        // 的话，用户填完令牌就得手动来回切屏才能看到「等待配对」变成
++        // 「已连上」。只在 `entry.is_none()` 时轮询：正在填令牌/等验证结果
++        // 的这段时间，屏幕上该显示的是那次输入，不该被状态刷新打断。
++        if let View::Phone {
++            status,
++            entry: None,
++        } = app.view.clone()
++        {
++            let refreshed = fetch_phone_status(&mut app, status);
++            app.view = View::Phone {
++                status: refreshed,
++                entry: None,
++            };
++        }
++
+         // 抓不抓鼠标不再只看「在不在会话里」：agent 没订阅鼠标的会话
+         // （codex、shell）里抓着它，唯一的效果是把终端的拖选复制废掉，
+         // 换来一个 PageUp/PageDown/End 已经能做的滚轮。
+         //
+         // 检查一次三个条件的合取有没有变，而不是在每个能改变它们的分支
+         // 各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
+         // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
+         // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
+         // 会话已结束……）到这里都已经跑完，此刻的 `app.view` 就是即将画出来
+         // 的那一帧；而且这一轮的 `Screen` 响应已经落进 `app.scroll` 了，
+@@ -734,20 +790,21 @@ pub fn run(
+             match app.view.clone() {
+                 View::Board => board::handle_key(&mut app, key)?,
+                 View::PickProfile { .. } => pick::handle_key(&mut app, key)?,
+                 View::PickProject(_) => pick::handle_key(&mut app, key)?,
+                 View::Attached(_) => attach::handle_key(&mut app, key)?,
+                 View::Grid { .. } => grid::handle_key(&mut app, key)?,
+                 View::Keys { .. } => keys::handle_key(&mut app, key)?,
+                 View::Settings { .. } => settings_view::handle_key(&mut app, key)?,
+                 View::EnterSecret { .. } => secret::handle_key(&mut app, key)?,
+                 View::Secrets { .. } => secret::handle_key(&mut app, key)?,
++                View::Phone { .. } => phone::handle_key(&mut app, key)?,
+             }
+         }
+         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
+         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
+         // 放在整个 match 之后而不是逐个按键分支里：那些分支散在四个模块里，
+         // 漏一个就是一个「这个项目会在你手没动的时候消失」的洞，而且不会有
+         // 任何编译期信号。已经 pin 上的组直接返回，所以这里不花任何往返。
+         pin_cursor_group(&mut app);
+ 
+         // 退出必须在这里落地，不能拖到循环末尾的收尾代码之后。现在有三条路
+@@ -1867,20 +1924,36 @@ fn refetch_secrets(app: &mut App, focus: Option<&str>) -> View {
+             }
+         }
+         _ => View::Secrets {
+             entries: Vec::new(),
+             state: ListState::default(),
+             pending_delete: None,
+         },
+     }
+ }
+ 
++/// 手机通知页要显示的状态。**失败时留在 `fallback`，不凭空捏造一个新状态**
++/// ——`Request::PhoneStatus` 在守护进程那侧是纯内存读，不打网络，唯一真会
++/// 失败的情形是断线本身；这时候陈旧数据（配合别处的红色边框，见
++/// `app.connected`）好过悄悄把一个正在等配对甚至已经配对的用户显示成
++/// 「还没连」。调用方决定 `fallback` 该是什么：第一次打开这一页用一个
++/// 干净的 `Off` 起步（还没有「原来」可言），周期轮询用上一帧的那份状态。
++pub(crate) fn fetch_phone_status(
++    app: &mut App,
++    fallback: crate::proto::PhoneStatus,
++) -> crate::proto::PhoneStatus {
++    match app.client().and_then(|c| c.call(Request::PhoneStatus)) {
++        Ok(Response::Phone(status)) => status,
++        _ => fallback,
++    }
++}
++
+ /// 左段固定占的列数：最长的一条是会话视图的「Ctrl+Q（F2） 回看板」
+ /// = 6 + 全角括号 2 + "F2" 2 + 全角括号 2 + 空格 1 + 中文 3 字 × 2 = 19。
+ /// 其余各条都更短（「Ctrl+Q 回列表」13，「q 退出」7）。
+ /// 写死而不是每帧算：左段宽度跟着文案跳动会让右段的消息忽宽忽窄。
+ const ESCAPE_HINT_COLS: u16 = 19;
+ 
+ /// 底栏中段：当前项目占的列数。按显示宽度截断，CJK 项目名同样算两列。
+ ///
+ /// 16 列是「放得下一个常见项目名 + 一两段父目录」跟「别把右段挤没」之间的
+ /// 折中，怎么用满见 `widgets::project_label`。
+@@ -2038,20 +2111,21 @@ fn draw(f: &mut Frame, app: &mut App) {
+             let saved = std::mem::replace(&mut app.view, (*from).clone());
+             match app.view {
+                 View::Grid { .. } => grid::draw(f, chunks[0], app),
+                 _ => board::draw(f, chunks[0], app),
+             }
+             app.view = saved;
+             keys::draw(f, chunks[0], app);
+         }
+         View::EnterSecret { .. } | View::Secrets { .. } => secret::draw(f, chunks[0], app),
+         View::Settings { .. } => settings_view::draw(f, chunks[0], app),
++        View::Phone { .. } => phone::draw(f, chunks[0], app),
+     }
+ 
+     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
+     // 要的是「我在哪」和「这里能干什么」挨在一起读。项目现在是框内的中段。
+     let block = Block::default().borders(Borders::ALL);
+     let inner = block.inner(chunks[1]);
+     f.render_widget(block, chunks[1]);
+ 
+     // 横向拆三段，各有各的固定职责：**逃生键 / 当前项目 / 至多三个动作**。
+     // 前两段永不让位，只有第三段会被消息、断连提示、宽度不够替换掉。
+@@ -2487,20 +2561,93 @@ mod tests {
+             ViewMode::List,
+         );
+         app.copy_mode = true;
+ 
+         let r = create_session(&mut app, &dir, "shell", false);
+         assert!(matches!(r, Ok(Response::Created { .. })), "前提：{r:?}");
+ 
+         assert!(!app.copy_mode, "上一个会话的复制模式不能粘到新建的这一个上");
+     }
+ 
++    /// 断线时 `fetch_phone_status` 要老老实实留在调用方给的 `fallback`——
++    /// 不能凭空捏造一个新状态。特意把 fallback 设成 `Paired`（不是默认的
++    /// `Off`），这样「函数其实忽略了参数、直接写死返回 Off」这类 mutation
++    /// 会被这条测试看见——如果 fallback 恰好也是 `Off`，这类改动会被巧合
++    /// 掩护过去。
++    #[test]
++    fn fetch_phone_status_falls_back_when_disconnected() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut app = App::new_disconnected(dir.path().join("s.sock"), dir.path().to_path_buf());
++        let fallback = crate::proto::PhoneStatus {
++            state: crate::proto::PhoneState::Paired,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        };
++
++        let got = fetch_phone_status(&mut app, fallback.clone());
++
++        assert_eq!(got, fallback, "断线时必须留在调用方给的 fallback 上");
++    }
++
++    /// 连得上的时候 `fetch_phone_status` 必须真的把守护进程的答案带回来，
++    /// 不是永远返回 fallback——起一个真守护进程，提前在它的 `secrets.toml`
++    /// 里塞一个令牌（`initial_phone_status` 见到它就该报 `WaitingForPairing`，
++    /// 见 `daemon.rs` 里对应的测试），确认 `fetch_phone_status` 传回来的
++    /// 正是这个真答案，跟传进去的 `fallback`（特意设成 `Off`）不一样。
++    #[test]
++    fn fetch_phone_status_reaches_the_real_daemon_when_connected() {
++        use crate::client::Client;
++        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
++
++        let home = tempfile::tempdir().unwrap();
++        let sock = home.path().join("daemon.sock");
++        // 必须在起 daemon 之前把令牌写好：daemon 启动时会读一次
++        // secrets.toml 去算 `initial_phone_status`（见 daemon.rs::run_with_manager）。
++        let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
++        disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
++
++        let s = sock.clone();
++        std::thread::spawn(move || {
++            let _ = crate::daemon::run(&s);
++        });
++        {
++            use std::time::{Duration, Instant};
++            let deadline = Instant::now() + Duration::from_secs(5);
++            while !sock.exists() {
++                assert!(Instant::now() < deadline, "daemon 没起来");
++                std::thread::sleep(Duration::from_millis(20));
++            }
++        }
++
++        let work = tempfile::tempdir().unwrap();
++        let mut app = App::new(
++            Client::connect(&sock).unwrap(),
++            work.path().to_path_buf(),
++            crate::i18n::Lang::Zh,
++            sock.clone(),
++            ViewMode::List,
++        );
++        let fallback = crate::proto::PhoneStatus {
++            state: crate::proto::PhoneState::Off,
++            bot: None,
++            owner: None,
++        };
++
++        let got = fetch_phone_status(&mut app, fallback);
++
++        assert_eq!(
++            got.state,
++            crate::proto::PhoneState::WaitingForPairing,
++            "连得上时该拿到守护进程的真答案，不是传进去的 fallback"
++        );
++    }
++
+     /// **建会话只有一个入口。** 三个调用点各记一次缓存的写法撑不住下一个
+     /// 调用点——新加一条建会话的路的人没有任何提示要去补那几行，而漏了之后
+     /// 底栏会安静地承诺一个 `n` 不会开出来的 agent。这条守卫把「别忘了」
+     /// 换成一个编译不过之外的、看得见的红。
+     #[test]
+     fn every_create_goes_through_the_one_helper_that_updates_the_cache() {
+         // 拼出来，免得这条测试自己的源码被下面的扫描数进去
+         let needle = concat!("Request::", "Create");
+         for (name, src) in [
+             ("pick.rs", include_str!("pick.rs")),
+@@ -3607,20 +3754,41 @@ mod tests {
+                 profile: String::new(),
+                 label: String::new(),
+                 prompt: crate::proto::SecretPrompt {
+                     hint: String::new(),
+                     url: None,
+                 },
+                 buf: String::new(),
+                 phase: view::SecretPhase::Typing,
+                 return_to_settings: false,
+             },
++            // 手机通知也有两条退路（状态页回设置 / 输入框取消回状态页），
++            // 两种输出都要量，跟上面 `EnterSecret`/`PickProject` 是同一个道理。
++            View::Phone {
++                status: crate::proto::PhoneStatus {
++                    state: crate::proto::PhoneState::Off,
++                    bot: None,
++                    owner: None,
++                },
++                entry: None,
++            },
++            View::Phone {
++                status: crate::proto::PhoneStatus {
++                    state: crate::proto::PhoneState::Off,
++                    bot: None,
++                    owner: None,
++                },
++                entry: Some(view::PhoneEntry {
++                    buf: String::new(),
++                    phase: view::SecretPhase::Typing,
++                }),
++            },
+         ];
+         // 两种语言都要量。常量是写死的，而译文长度各不相同——只量中文的话，
+         // 哪天某种语言的逃生键更长，就会在那种语言下被静默截断。
+         for l in crate::i18n::Lang::all() {
+             for v in &views {
+                 let hint = escape_hint(v, *l);
+                 assert!(
+                     hint.width() <= ESCAPE_HINT_COLS as usize,
+                     "{l:?} 下逃生键「{hint}」宽 {} 列，放不进 ESCAPE_HINT_COLS = {ESCAPE_HINT_COLS}",
+                     hint.width()
+diff --git a/src/ui/phone.rs b/src/ui/phone.rs
+new file mode 100644
+index 0000000..8fa5099
+--- /dev/null
++++ b/src/ui/phone.rs
+@@ -0,0 +1,641 @@
++//! 手机通知设置页。
++//!
++//! **这一页存在的全部理由是那一行状态。** 填令牌是容易的那一半——难的
++//! 是配对本身是异步的：守护进程验过令牌之后转去后台长轮询，等用户在
++//! Telegram 上给 bot 发第一条消息。不给这件事一个去处，用户填完令牌就会
++//! 对着一片空白发呆，不知道自己是不是做对了、接下来该干什么。
++//!
++//! 四种状态，每一种都要带下一步——「已连上」是唯一不需要下一步的终点，
++//! 其余三种都必须给出路（`every_state_tells_the_user_what_to_do_next`）。
++//!
++//! 令牌是密钥。`status_line`/`next_step` 两个函数**故意不读**
++//! `PhoneState::Broken` 里的那个字符串——这是一条纵深防御，见
++//! `proto::PhoneState::Broken` 的文档注释和
++//! `the_token_never_appears_in_any_status_text` 这条测试。
++
++use anyhow::Result;
++use crossterm::event::{KeyCode, KeyEvent};
++use ratatui::prelude::*;
++use ratatui::widgets::{Block, Borders, Paragraph};
++
++use crate::client::Client;
++use crate::i18n::{msg, text, Key, Lang};
++use crate::proto::{socket_path, PhoneState, PhoneStatus, Request, Response};
++
++use super::app::App;
++use super::dim;
++use super::view::{phone_key_has_effect, settings_state_on_phone, PhoneEntry, SecretPhase, View};
++
++/// 那一行状态。**四种取值都要给非空文案**——见模块头注释。
++pub(crate) fn status_line(status: &PhoneStatus, lang: Lang) -> String {
++    match &status.state {
++        PhoneState::Off => text(Key::PhoneOff, lang).to_string(),
++        PhoneState::WaitingForPairing => {
++            let bot = status.bot.as_deref().unwrap_or("?");
++            msg::phone_waiting(lang, bot)
++        }
++        PhoneState::Paired => match &status.owner {
++            Some(owner) => msg::phone_paired(lang, owner),
++            None => text(Key::PhonePairedNoOwner, lang).to_string(),
++        },
++        // **故意不读这个字符串本身**——见模块头注释和
++        // `the_token_never_appears_in_any_status_text`。真正的诊断详情
++        // 画在 `draw()` 里单独的一行，不经过这个函数。
++        PhoneState::Broken(_) => text(Key::PhoneBrokenHeadline, lang).to_string(),
++    }
++}
++
++/// 下一步该干什么。「已连上」是唯一的终点，返回 `None`；其余三种都必须
++/// 给出路——一个不告诉用户下一步该干什么的错误，按房规就是没写完。
++pub(crate) fn next_step(status: &PhoneStatus, lang: Lang) -> Option<String> {
++    match &status.state {
++        PhoneState::Off => Some(text(Key::PhoneOffNextStep, lang).to_string()),
++        PhoneState::WaitingForPairing => Some(text(Key::PhoneWaitingNextStep, lang).to_string()),
++        PhoneState::Paired => None,
++        // 同 `status_line`：不读 payload。两种真实成因（令牌失效 / 被拉黑）
++        // 合成一句话，比猜一个可能是错的原因更诚实——`ChannelError::BadToken`
++        // 这一层本来就没有保留这个区分（见 `channel/telegram.rs` 的
++        // `error_from`），没有立场假装知道具体是哪一种。
++        PhoneState::Broken(_) => Some(text(Key::PhoneBrokenNextStep, lang).to_string()),
++    }
++}
++
++pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
++    let View::Phone { status, entry } = app.view.clone() else {
++        return Ok(());
++    };
++    match entry {
++        Some(e) => handle_entry(app, key, status, e),
++        None => handle_status(app, key, status),
++    }
++    Ok(())
++}
++
++/// **这个函数里永远不要 `continue`。** 同 `settings_view.rs`/`secret.rs`
++/// 的同名约束——循环末尾还有一段清理陈旧 `message` 的逻辑。
++fn handle_status(app: &mut App, key: KeyEvent, status: PhoneStatus) {
++    match key.code {
++        KeyCode::Esc => {
++            app.view = View::Settings {
++                state: settings_state_on_phone(),
++                lang: None,
++            };
++        }
++        // 能不能按由 `phone_key_has_effect` 说了算——`view.rs::idle_help`
++        // 决定写不写这个键用的是同一份判断，两处必须共用（见它的文档注释）。
++        KeyCode::Enter if phone_key_has_effect(&status.state, key.code) => {
++            app.view = View::Phone {
++                status,
++                entry: Some(PhoneEntry {
++                    buf: String::new(),
++                    phase: SecretPhase::Typing,
++                }),
++            };
++        }
++        KeyCode::Char('r') if phone_key_has_effect(&status.state, key.code) => {
++            let resp = app.client().and_then(|c| c.call(Request::PhoneUnpair));
++            app.view = View::Phone {
++                status: apply_phone_response(status, resp),
++                entry: None,
++            };
++        }
++        KeyCode::Char('x') if phone_key_has_effect(&status.state, key.code) => {
++            let resp = app.client().and_then(|c| c.call(Request::PhoneDisable));
++            app.view = View::Phone {
++                status: apply_phone_response(status, resp),
++                entry: None,
++            };
++        }
++        _ => {
++            app.view = View::Phone {
++                status,
++                entry: None,
++            };
++        }
++    }
++}
++
++/// `Request::PhoneUnpair`/`PhoneDisable` 的回答落地。拿不到新状态（断线、
++/// 守护进程太旧）就留在原地——同这个仓库别的地方的约定，陈旧数据好过
++/// 凭空捏造一个新状态。
++fn apply_phone_response(fallback: PhoneStatus, resp: Result<Response>) -> PhoneStatus {
++    match resp {
++        Ok(Response::Phone(status)) => status,
++        _ => fallback,
++    }
++}
++
++/// **这个函数里永远不要 `continue`。** 同上。
++fn handle_entry(app: &mut App, key: KeyEvent, status: PhoneStatus, entry: PhoneEntry) {
++    let PhoneEntry { mut buf, phase } = entry;
++    match phase {
++        SecretPhase::Verifying => {
++            // 验证在后台线程跑，buf 已经发出去了，这期间敲字符/回车都改不了
++            // 那次正在飞的请求——只留 Esc，且必须现在就扔掉 phone_verify_rx，
++            // 不然迟到的结果会套在一个用户已经不认得的视图上（同
++            // `secret.rs::handle_enter_secret` 的 `Verifying` 分支）。
++            if key.code == KeyCode::Esc {
++                app.phone_verify_rx = None;
++                app.view = View::Phone {
++                    status,
++                    entry: None,
++                };
++            } else {
++                app.view = View::Phone {
++                    status,
++                    entry: Some(PhoneEntry {
++                        buf,
++                        phase: SecretPhase::Verifying,
++                    }),
++                };
++            }
++        }
++        SecretPhase::Typing | SecretPhase::Failed(_) => match key.code {
++            // 取消这次输入，回到状态页——不是回设置，用户可能只是手滑
++            // 按错了 Enter，退两层找不到刚才在看的那行状态。
++            KeyCode::Esc => {
++                app.view = View::Phone {
++                    status,
++                    entry: None,
++                };
++            }
++            KeyCode::Enter => {
++                let (tx, rx) = std::sync::mpsc::channel();
++                let sock = socket_path();
++                let token = buf.clone();
++                let lang = app.lang;
++                let stamped_token = token.clone();
++                std::thread::spawn(move || {
++                    let outcome: std::result::Result<PhoneStatus, String> = Client::connect(&sock)
++                        .and_then(|mut c| c.call(Request::PhoneSetToken { token, lang }))
++                        .map_err(|_| {
++                            crate::i18n::text(crate::i18n::Key::DaemonUnreachable, lang).to_string()
++                        })
++                        .and_then(|r| match r {
++                            Response::Phone(status) => Ok(status),
++                            Response::Error(ref e) => Err(crate::i18n::msg::error(lang, e)),
++                            _ => Err(crate::i18n::text(crate::i18n::Key::RequestFailed, lang)
++                                .to_string()),
++                        });
++                    let _ = tx.send((stamped_token, outcome));
++                });
++                app.phone_verify_rx = Some(rx);
++                app.view = View::Phone {
++                    status,
++                    entry: Some(PhoneEntry {
++                        buf,
++                        phase: SecretPhase::Verifying,
++                    }),
++                };
++            }
++            KeyCode::Backspace => {
++                buf.pop();
++                app.view = View::Phone {
++                    status,
++                    entry: Some(PhoneEntry {
++                        buf,
++                        phase: SecretPhase::Typing,
++                    }),
++                };
++            }
++            KeyCode::Char(c) => {
++                buf.push(c);
++                app.view = View::Phone {
++                    status,
++                    entry: Some(PhoneEntry {
++                        buf,
++                        phase: SecretPhase::Typing,
++                    }),
++                };
++            }
++            _ => {
++                app.view = View::Phone {
++                    status,
++                    entry: Some(PhoneEntry { buf, phase }),
++                };
++            }
++        },
++    }
++}
++
++pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
++    let View::Phone { status, entry } = &app.view else {
++        return;
++    };
++    let border_style = if app.connected {
++        Style::default()
++    } else {
++        Style::default().fg(Color::Red)
++    };
++
++    let mut lines: Vec<Line> = Vec::new();
++    lines.push(Line::from(status_line(status, app.lang)));
++    if let Some(step) = next_step(status, app.lang) {
++        lines.push(Line::from(""));
++        lines.push(Line::from(Span::styled(step, dim())));
++    }
++    // 详情：`Broken` 里那句守护进程写好的人话，画在单独一行——`status_line`/
++    // `next_step` 故意不读它（见模块头注释），但完全不展示的话这个字符串
++    // 就白存了，用户也没法知道更具体的原因。
++    if let PhoneState::Broken(reason) = &status.state {
++        lines.push(Line::from(""));
++        lines.push(Line::from(Span::styled(
++            reason.clone(),
++            Style::default().fg(Color::Red),
++        )));
++    }
++
++    if let Some(PhoneEntry { buf, phase }) = entry {
++        lines.push(Line::from(""));
++        // 显示成圆点：令牌不该以明文停在屏幕上，用户可能在录屏或在办公室。
++        lines.push(Line::from(format!("{}▌", "•".repeat(buf.chars().count()))));
++        match phase {
++            SecretPhase::Typing => {}
++            SecretPhase::Verifying => {
++                lines.push(Line::from(""));
++                lines.push(Line::from(Span::styled(
++                    text(Key::VerifyingShort, app.lang),
++                    Style::default().fg(Color::Cyan),
++                )));
++            }
++            SecretPhase::Failed(m) => {
++                lines.push(Line::from(""));
++                lines.push(Line::from(Span::styled(
++                    m.clone(),
++                    Style::default().fg(Color::Red),
++                )));
++            }
++        }
++    }
++
++    f.render_widget(
++        Paragraph::new(lines).block(
++            Block::default()
++                .borders(Borders::ALL)
++                .border_style(border_style)
++                .title(text(Key::Phone, app.lang)),
++        ),
++        area,
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::view::SettingsItem;
++    use super::*;
++
++    /// 这一页存在的全部理由是那一行状态。四种取值，**每一种都要带下一步**——
++    /// 一个不告诉用户下一步该干什么的错误，按房规就是没写完。
++    #[test]
++    fn every_state_tells_the_user_what_to_do_next() {
++        for st in [
++            PhoneState::Off,
++            PhoneState::WaitingForPairing,
++            PhoneState::Paired,
++            PhoneState::Broken("token revoked".into()),
++        ] {
++            let s = status_line(
++                &PhoneStatus {
++                    state: st.clone(),
++                    bot: Some("my_bot".into()),
++                    owner: None,
++                },
++                Lang::Zh,
++            );
++            assert!(!s.is_empty(), "{st:?} 没有状态文案");
++        }
++        // 「已连上」是唯一不需要下一步的：它就是终点。其余三种都必须给出路。
++        for st in [
++            PhoneState::Off,
++            PhoneState::WaitingForPairing,
++            PhoneState::Broken("token revoked".into()),
++        ] {
++            let s = next_step(
++                &PhoneStatus {
++                    state: st.clone(),
++                    bot: Some("my_bot".into()),
++                    owner: None,
++                },
++                Lang::Zh,
++            );
++            assert!(s.is_some(), "{st:?} 没有给出下一步");
++        }
++        assert!(next_step(
++            &PhoneStatus {
++                state: PhoneState::Paired,
++                bot: Some("my_bot".into()),
++                owner: Some("lei".into())
++            },
++            Lang::Zh
++        )
++        .is_none());
++    }
++
++    /// 等配对时必须把 bot 名字说出来，否则「去给它发条消息」是句没法执行的话。
++    #[test]
++    fn waiting_names_the_bot() {
++        let s = status_line(
++            &PhoneStatus {
++                state: PhoneState::WaitingForPairing,
++                bot: Some("my_dct_bot".into()),
++                owner: None,
++            },
++            Lang::Zh,
++        );
++        assert!(s.contains("my_dct_bot"), "等配对却没说是哪个 bot：{s}");
++    }
++
++    /// 令牌是密钥。**任何一处状态文案都不许把它带出来。**
++    #[test]
++    fn the_token_never_appears_in_any_status_text() {
++        let st = PhoneStatus {
++            state: PhoneState::Broken("123456:AAH-SECRET".into()),
++            bot: None,
++            owner: None,
++        };
++        let s = format!(
++            "{}{}",
++            status_line(&st, Lang::Zh),
++            next_step(&st, Lang::Zh).unwrap_or_default()
++        );
++        assert!(!s.contains("AAH-SECRET"), "令牌漏进了界面文案：{s}");
++    }
++
++    // ———— 补充测试：跟 status_line/next_step 同样重要,但不在 brief 的
++    // Step 1 清单里——覆盖 handle_key 这一半 ————
++
++    fn key(code: KeyCode) -> KeyEvent {
++        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
++    }
++
++    fn off_status() -> PhoneStatus {
++        PhoneStatus {
++            state: PhoneState::Off,
++            bot: None,
++            owner: None,
++        }
++    }
++
++    fn waiting_status() -> PhoneStatus {
++        PhoneStatus {
++            state: PhoneState::WaitingForPairing,
++            bot: Some("my_dct_bot".into()),
++            owner: None,
++        }
++    }
++
++    /// `Off` 状态按 Enter 要能打开令牌输入框。
++    #[test]
++    fn enter_on_off_opens_the_token_entry() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: off_status(),
++            entry: None,
++        };
++        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
++        match &app.view {
++            View::Phone {
++                entry: Some(PhoneEntry { buf, phase }),
++                ..
++            } => {
++                assert!(buf.is_empty());
++                assert!(matches!(phase, SecretPhase::Typing));
++            }
++            _ => panic!("Enter 应该打开令牌输入框"),
++        }
++    }
++
++    /// `Broken`（令牌坏了）按 Enter **也要**能打开输入框——这是修复它的
++    /// 唯一路径。只测 `Off` 会漏掉这一半：`phone_key_has_effect` 是
++    /// `Off | Broken(_)` 两个条件的析取，只覆盖 `Off` 分不出「漏了 Broken」
++    /// 和「条件写对了」。
++    #[test]
++    fn enter_on_broken_also_opens_the_token_entry() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: PhoneStatus {
++                state: PhoneState::Broken("token revoked".into()),
++                bot: None,
++                owner: None,
++            },
++            entry: None,
++        };
++        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
++        assert!(
++            matches!(app.view, View::Phone { entry: Some(_), .. }),
++            "Broken 状态下 Enter 也该打开输入框——重新填令牌是修复它的路"
++        );
++    }
++
++    /// `WaitingForPairing`（已经有令牌）按 Enter 不该做任何事——已经填过了。
++    #[test]
++    fn enter_while_waiting_does_not_reopen_the_entry() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: waiting_status(),
++            entry: None,
++        };
++        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
++        assert!(
++            matches!(app.view, View::Phone { entry: None, .. }),
++            "已经有令牌时 Enter 不该打开输入框"
++        );
++    }
++
++    /// 输入框里打字、退格都要落到 buf 上，并且停在 Typing 阶段。
++    #[test]
++    fn typing_and_backspace_edit_the_buffer() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: off_status(),
++            entry: Some(PhoneEntry {
++                buf: String::new(),
++                phase: SecretPhase::Typing,
++            }),
++        };
++        handle_key(&mut app, key(KeyCode::Char('a'))).unwrap();
++        handle_key(&mut app, key(KeyCode::Char('b'))).unwrap();
++        match &app.view {
++            View::Phone {
++                entry: Some(PhoneEntry { buf, .. }),
++                ..
++            } => assert_eq!(buf, "ab"),
++            _ => panic!(),
++        }
++        handle_key(&mut app, key(KeyCode::Backspace)).unwrap();
++        match &app.view {
++            View::Phone {
++                entry: Some(PhoneEntry { buf, .. }),
++                ..
++            } => assert_eq!(buf, "a"),
++            _ => panic!(),
++        }
++    }
++
++    /// Esc 在输入框里取消这次输入，退回状态页（不是设置页），而且要保留
++    /// 之前的状态——不能因为取消了一次输入,连状态本身都被冲掉。
++    #[test]
++    fn esc_while_typing_cancels_back_to_the_status_page() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: waiting_status(),
++            entry: Some(PhoneEntry {
++                buf: "partial".into(),
++                phase: SecretPhase::Typing,
++            }),
++        };
++        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
++        match &app.view {
++            View::Phone {
++                status,
++                entry: None,
++            } => {
++                assert_eq!(status.state, PhoneState::WaitingForPairing);
++            }
++            _ => panic!("Esc 应该回到状态页，entry 清空"),
++        }
++    }
++
++    /// Esc 在状态页（没有 entry）时回设置页，光标停在「手机通知」这一行。
++    #[test]
++    fn esc_on_the_status_page_goes_back_to_settings_on_the_phone_row() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: off_status(),
++            entry: None,
++        };
++        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
++        match &app.view {
++            View::Settings { state, lang: None } => {
++                assert_eq!(
++                    state.selected().and_then(SettingsItem::at),
++                    Some(SettingsItem::Phone)
++                );
++            }
++            _ => panic!("Esc 应该回到设置页顶层列表"),
++        }
++    }
++
++    /// Verifying 期间敲字符不能改动 buf——那次验证已经把当时的 buf 发出去
++    /// 了，改了只会让用户误以为下一次回车用的是新值。
++    #[test]
++    fn typing_during_verifying_is_frozen() {
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: off_status(),
++            entry: Some(PhoneEntry {
++                buf: "sent".into(),
++                phase: SecretPhase::Verifying,
++            }),
++        };
++        handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
++        match &app.view {
++            View::Phone {
++                entry: Some(PhoneEntry { buf, phase }),
++                ..
++            } => {
++                assert_eq!(buf, "sent", "Verifying 期间 buf 不能被改动");
++                assert!(matches!(phase, SecretPhase::Verifying));
++            }
++            _ => panic!(),
++        }
++    }
++
++    /// Esc 在 Verifying 期间要清掉 `phone_verify_rx`——不然迟到的结果会套在
++    /// 一个用户已经不认得的视图上。
++    #[test]
++    fn esc_during_verifying_drops_the_pending_receiver() {
++        let (mut app, _dir) = App::test_app();
++        let (_tx, rx) = std::sync::mpsc::channel();
++        app.phone_verify_rx = Some(rx);
++        app.view = View::Phone {
++            status: off_status(),
++            entry: Some(PhoneEntry {
++                buf: "sent".into(),
++                phase: SecretPhase::Verifying,
++            }),
++        };
++        handle_key(&mut app, key(KeyCode::Esc)).unwrap();
++        assert!(app.phone_verify_rx.is_none());
++        assert!(matches!(app.view, View::Phone { entry: None, .. }));
++    }
++
++    /// `r`/`x` 在 `Off` 状态下没有对象可作用，必须是空操作——不能凭空冒出
++    /// 一次 `PhoneUnpair`/`PhoneDisable` 请求（`app` 没连守护进程,真打了
++    /// 请求这条测试会因为 `Result::Err` 走进 fallback 分支,状态原地不动;
++    /// 但更要紧的是这两个键在 `Off` 下压根不该被广告出来，见
++    /// `view.rs::idle_help`）。
++    #[test]
++    fn r_and_x_on_off_are_no_ops() {
++        for code in [KeyCode::Char('r'), KeyCode::Char('x')] {
++            let (mut app, _dir) = App::test_app();
++            app.view = View::Phone {
++                status: off_status(),
++                entry: None,
++            };
++            handle_key(&mut app, key(code)).unwrap();
++            assert!(
++                matches!(app.view, View::Phone { status, entry: None } if status.state == PhoneState::Off),
++                "{code:?} 在 Off 状态下不该有任何效果"
++            );
++        }
++    }
++
++    /// 画一帧不能 panic，且令牌不能明文出现在屏幕上。
++    #[test]
++    fn draw_does_not_panic_and_masks_the_token() {
++        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: off_status(),
++            entry: Some(PhoneEntry {
++                buf: "123456:AAH-SECRET".into(),
++                phase: SecretPhase::Typing,
++            }),
++        };
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++        let buf = term.backend().buffer();
++        let text: String = (0..buf.area.height)
++            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
++            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
++            .collect();
++        assert!(
++            !text.contains("AAH-SECRET"),
++            "令牌不能以明文出现在屏幕上：{text}"
++        );
++    }
++
++    /// `Broken` 的详情行画出来了（这是它唯一真正显示的地方，见模块头注释），
++    /// 但同样不能泄露一个看着像令牌的字符串——这里特意造一个诊断消息本身
++    /// 就很短的场景，只确认「文字确实上屏」，令牌安全性由上面那条守。
++    #[test]
++    fn draw_shows_the_broken_reason_as_a_detail_line() {
++        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
++        let (mut app, _dir) = App::test_app();
++        app.view = View::Phone {
++            status: PhoneStatus {
++                state: PhoneState::Broken("这个令牌用不了，重新输入一遍".into()),
++                bot: None,
++                owner: None,
++            },
++            entry: None,
++        };
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++        let buf = term.backend().buffer();
++        // ratatui 画宽字符只写首格、第二格留空/留一个空白 —— 逐格拼起来的
++        // 汉字之间会夹着这些空白，直接 `contains` 一段汉字子串会假失败，
++        // 见 `settings_view.rs` 里同类测试上的注释。两边都去掉空白再比。
++        let text: String = (0..buf.area.height)
++            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
++            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
++            .collect::<String>()
++            .chars()
++            .filter(|c| !c.is_whitespace())
++            .collect();
++        let expect: String = "这个令牌用不了"
++            .chars()
++            .filter(|c| !c.is_whitespace())
++            .collect();
++        assert!(text.contains(&expect), "Broken 的详情要真的画出来：{text}");
++    }
++}
+diff --git a/src/ui/settings_view.rs b/src/ui/settings_view.rs
+index 47e067f..56a544e 100644
+--- a/src/ui/settings_view.rs
++++ b/src/ui/settings_view.rs
+@@ -1,13 +1,12 @@
+-//! 设置页：设置项列表，看板按 `l` 进。今天两项——语言（真管用）、
+-//! 手机通知（Task 4 才接线，这里先占个位置，见 `handle_key` 里 `Phone`
+-//! 分支的注释）。
++//! 设置页：设置项列表，看板按 `l` 进。今天两项——语言、手机通知，选中
++//! 「手机通知」进的是 `View::Phone`（见 `ui/phone.rs`）。
+ //!
+ //! 跟 `secret.rs` 的密钥页分开是两码事——那边管「哪个 agent 用哪把密钥」，
+ //! 这里管界面本身怎么显示。
+ //!
+ //! **这一页原来就是语言列表**，`ListState` 的下标直接映射 `Lang::all()`。
+ //! 加了第二项之后光标含义分成了两层：`View::Settings.state` 走顶层
+ //! `SettingsItem::all()`，选中「语言」才会开出 `lang` 那个子列表、下标
+ //! 才改映射 `Lang::all()`。层级语义全记在 `View::Settings.lang` 是
+ //! `Some` 还是 `None` 上，见它自己的字段注释。
+ 
+@@ -52,26 +51,36 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+                 // 意图本身没丢，只是挪到了这一步，真正该问「现在是哪个
+                 // 语言」的地方。
+                 let mut ls = ListState::default();
+                 ls.select(Lang::all().iter().position(|l| *l == app.lang));
+                 app.view = View::Settings {
+                     state,
+                     lang: Some(ls),
+                 };
+             }
+             Some(SettingsItem::Phone) => {
+-                // TODO(task-4, dct-phone-channel): 手机通知页还没接线
+-                // （`View::Phone` 是 Task 4 的产物）。Task 3 是纯 UI
+-                // 重构、不掺任何手机通知逻辑，这一支特意留成空操作——
+-                // 光标停在原地，什么都不发生。Task 4 把这一支换成
+-                // `app.view = View::Phone { .. }` 就是它要接的线。
+-                app.view = View::Settings { state, lang: None };
++                // 现查一次现在是什么状态——`Request::PhoneStatus` 在守护
++                // 进程那侧是纯内存读，不打网络，这次同步调用不会卡界面。
++                // 拿不到就从 `Off` 起步：这是第一次打开这一页，没有「原来」
++                // 可留（同 `fetch_phone_status` 文档注释里的约定）。
++                let status = super::fetch_phone_status(
++                    app,
++                    crate::proto::PhoneStatus {
++                        state: crate::proto::PhoneState::Off,
++                        bot: None,
++                        owner: None,
++                    },
++                );
++                app.view = View::Phone {
++                    status,
++                    entry: None,
++                };
+             }
+             // 下标越界（比如列表变短后光标停在旧位置）：什么都不做，
+             // 比默默选中第一项更诚实——见 `SettingsItem::at` 的文档。
+             None => app.view = View::Settings { state, lang: None },
+         },
+         _ => app.view = View::Settings { state, lang: None },
+     }
+     Ok(())
+ }
+ 
+@@ -317,38 +326,101 @@ mod tests {
+ 
+         match &app.view {
+             View::Settings { lang: Some(ls), .. } => {
+                 let zh_index = Lang::all().iter().position(|l| *l == Lang::Zh).unwrap();
+                 assert_eq!(ls.selected(), Some(zh_index), "要预选在当前语言上");
+             }
+             _ => panic!("选中「语言」按 Enter 应该钻进语言子列表"),
+         }
+     }
+ 
+-    /// 顶层选中「手机通知」按 Enter：Task 4 才会给它接一个真视图，这里
+-    /// 只保证不 panic、也不会误把用户带进语言子列表——占位归占位，行为
+-    /// 不能是「什么都可能发生」。
++    /// 顶层选中「手机通知」按 Enter：这一屏不再是空操作（那是 Task 3 留的
++    /// 占位，见它自己的报告里「Placeholder left for Task 4」一节）——现在
++    /// 要真的钻进 `View::Phone`。`App::test_app()` 连不上真实守护进程，
++    /// `fetch_phone_status` 拿不到答案时退化成 `Off`，这条测试断言的正是
++    /// 这个诚实的兜底，不是「什么都可能发生」。
+     #[test]
+-    fn entering_the_phone_item_does_not_crash_or_open_the_language_list() {
++    fn entering_the_phone_item_opens_the_phone_view() {
+         let (mut app, _dir) = App::test_app();
+         let phone = SettingsItem::all()
+             .iter()
+             .position(|i| *i == SettingsItem::Phone)
+             .unwrap();
+         on_settings(&mut app, phone);
+ 
+         handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+ 
+-        assert!(
+-            matches!(app.view, View::Settings { lang: None, .. }),
+-            "手机通知还没接线，Enter 不该把光标带进语言子列表或崩掉"
++        match &app.view {
++            View::Phone { status, entry } => {
++                assert_eq!(
++                    status.state,
++                    crate::proto::PhoneState::Off,
++                    "连不上时退化成 Off"
++                );
++                assert!(entry.is_none(), "刚打开这一页不该带着一个正在填的输入框");
++            }
++            _ => panic!("选中「手机通知」按 Enter 应该打开 View::Phone"),
++        }
++    }
++
++    /// **不能靠巧合过关。** 上一条测试连不上真守护进程，`fetch_phone_status`
++    /// 断线时的兜底恰好也是 `Off`——如果这一支被悄悄改成直接写死
++    /// `PhoneStatus { state: Off, .. }`、压根不去问守护进程，上一条测试
++    /// 照样通过。起一个真守护进程，提前塞一个令牌进它的 `secrets.toml`
++    /// （`daemon.rs` 见到它会报 `WaitingForPairing`），确认这里拿到的是
++    /// 这个真答案，才能证明这一支真的调用了 `fetch_phone_status`，不是
++    /// 现编了一个巧合相等的默认值。
++    #[test]
++    fn entering_the_phone_item_reaches_the_real_daemon_not_a_hardcoded_default() {
++        use crate::client::Client;
++        use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_TOKEN_KEY};
++        use std::time::{Duration, Instant};
++
++        let home = tempfile::tempdir().unwrap();
++        let sock = home.path().join("daemon.sock");
++        let mut disk = SecretStore::load(&secrets_path_for_socket(&sock));
++        disk.set(PHONE_TOKEN_KEY, "pre-seeded-token").unwrap();
++
++        let s = sock.clone();
++        std::thread::spawn(move || {
++            let _ = crate::daemon::run(&s);
++        });
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !sock.exists() {
++            assert!(Instant::now() < deadline, "daemon 没起来");
++            std::thread::sleep(Duration::from_millis(20));
++        }
++
++        let work = tempfile::tempdir().unwrap();
++        let mut app = App::new(
++            Client::connect(&sock).unwrap(),
++            work.path().to_path_buf(),
++            crate::i18n::Lang::Zh,
++            sock.clone(),
++            super::super::view::ViewMode::List,
+         );
++        let phone = SettingsItem::all()
++            .iter()
++            .position(|i| *i == SettingsItem::Phone)
++            .unwrap();
++        on_settings(&mut app, phone);
++
++        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
++
++        match &app.view {
++            View::Phone { status, .. } => assert_eq!(
++                status.state,
++                crate::proto::PhoneState::WaitingForPairing,
++                "该拿到守护进程的真答案"
++            ),
++            _ => panic!("选中「手机通知」按 Enter 应该打开 View::Phone"),
++        }
+     }
+ 
+     /// 方向键要能从「语言」走到「手机通知」。`move_sel_n` 的长度参数如果
+     /// 悄悄改回 `Lang::all().len()`，今天两份长度数值上都是 2，看不出
+     /// 差别——这条测试不问长度参数从哪儿来，只问「按下去到没到」，是这份
+     /// 数值巧合之外唯一还能钉住这条移动的测试（见任务报告的变异测试表）。
+     #[test]
+     fn pressing_down_from_language_selects_phone() {
+         let (mut app, _dir) = App::test_app();
+         on_settings(&mut app, 0);
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index dc3f3c2..5f48ae1 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -1,19 +1,19 @@
+ use std::collections::BTreeMap;
+ use std::path::{Path, PathBuf};
+ 
+ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+ use ratatui::widgets::ListState;
+ 
+ use crate::i18n::{HelpItem, Lang};
+ use crate::profile::ProfileStatus;
+-use crate::proto::{ProfileEntry, SecretPrompt};
++use crate::proto::{PhoneState, PhoneStatus, ProfileEntry, SecretPrompt};
+ use crate::session::SessionState;
+ use crate::verify::VerifyOutcome;
+ 
+ use super::Msg;
+ 
+ /// 九宫格里那行回复框正在攒的一句话。
+ #[derive(Clone)]
+ pub(crate) struct Draft {
+     /// 收件人的**会话 id**，不是格子下标。
+     ///
+@@ -171,20 +171,47 @@ pub(crate) enum View {
+         /// 「再按 d 删除」；第二次 `d` 打在同一行上才真的发
+         /// `Request::DeleteSecret`。存名字而不是下标是因为列表会因为增删
+         /// 重新排列，下标会指错行，名字不会。
+         ///
+         /// 武装状态和「光标选中哪一行」必须永远同步——除了确认删除的第二次
+         /// `d` 本身，任何按键（包括 ↑↓）都要把这里清回 `None`，不然挪开
+         /// 光标之后按下的第二次 `d` 删的会是用户已经不记得自己武装过的
+         /// 那一行。
+         pending_delete: Option<String>,
+     },
++    /// 手机通知设置页：看板 `l` → 设置 → 手机通知 进。**这一页存在的全部
++    /// 理由是 `status` 那一行状态**——配对是异步的，守护进程填完令牌就转去
++    /// 后台长轮询等用户在 Telegram 上发第一条消息，不给这件事一个去处，
++    /// 用户填完令牌就会对着一片空白发呆（见 `ui/phone.rs` 头上的注释）。
++    Phone {
++        status: PhoneStatus,
++        /// `Some` = 正在填令牌（`Enter` 开的）；`None` = 只是在看状态。
++        /// 复用 `SecretPhase`——Typing/Verifying/Failed 三态跟密钥输入
++        /// 完全对应，没必要另起一套，这也是任务本身点名要求的复用。
++        ///
++        /// **这个字段是这个任务自己加的**，不在原始接口清单里（那里只写了
++        /// `View::Phone { status: PhoneStatus }`）——跟 `View::Settings`
++        /// 加 `lang` 字段是同一类缺口：一个视图要分「看状态」和「正在填」
++        /// 两层,光有 `status` 装不下这件事，`Enter 填令牌` 这个按键描述
++        /// 本身就要求有地方存正在打的字。
++        entry: Option<PhoneEntry>,
++    },
++}
++
++/// 手机通知页正在填的令牌。跟 `EnterSecret` 分开是**类型**，不是**协议**：
++/// 提交时走的是 `Request::PhoneSetToken`，不是 `SetSecret`/`VerifySecret`
++/// ——`EnterSecret` 对没声明 `verify` 的 profile 会直接放行（见
++/// `pick_action`/`secret.rs`），套在这里会让任何输入都被当成有效令牌收下。
++#[derive(Clone)]
++pub(crate) struct PhoneEntry {
++    pub buf: String,
++    pub phase: SecretPhase,
+ }
+ 
+ /// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
+ /// 直接映射 `Lang::all()`；现在映射这个枚举，选中语言那一项才进语言列表。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum SettingsItem {
+     Language,
+     Phone,
+ }
+ 
+@@ -280,27 +307,82 @@ pub(crate) fn back_one_level(view: View) -> Option<View> {
+         // 浮层退的是**开门之前那一屏**，不是看板：从九宫格按 `?` 再退出来，
+         // 落回列表就等于用户按一下问号顺手换了个视图。
+         View::Keys { from } => Some(*from),
+         // 深入语言子列表时 Ctrl+Q 先退回顶层设置项列表，不能一步跳回看板
+         // ——不然同一屏里 Ctrl+Q 比 Esc 少退一步（Esc 见
+         // `settings_view::handle_key`），两个逃生键说的不是同一件事。
+         View::Settings {
+             state,
+             lang: Some(_),
+         } => Some(View::Settings { state, lang: None }),
++        // 正在填令牌时先退一层回到状态页，不是一步跳回设置列表——同
++        // `PickProject` 手输态那条特例一个道理，Ctrl+Q 每次只退一层。
++        View::Phone {
++            status,
++            entry: Some(_),
++        } => Some(View::Phone {
++            status,
++            entry: None,
++        }),
++        // 只是在看状态：退回设置页顶层列表，光标停在「手机通知」这一行——
++        // 用户是从那一行进来的，退出去理应还站在原地。
++        View::Phone { entry: None, .. } => Some(View::Settings {
++            state: settings_state_on_phone(),
++            lang: None,
++        }),
+         // Secrets 落在这条兜底里：它跟 Attached/PickProject 一样只有一层，
+         // 退一层就是看板。顶层的 `Settings { lang: None }` 也在这条兜底里
+         // ——它也只有一层，没被上面那条特例拦下的话就是回看板。
+         _ => Some(View::Board),
+     }
+ }
+ 
++/// 顶层设置项列表，光标预选在「手机通知」这一行。手机通知页自己退出去
++/// （`Esc` 或 `Ctrl+Q`）、以及从设置页选中这一行进来，两处都要用同一份
++/// 构造，不能各拼一次——那样两处的「哪一行是手机通知」一旦不同步，
++/// 用户退出手机通知页会发现光标跳到了别的行上。
++pub(crate) fn settings_state_on_phone() -> ListState {
++    let mut s = ListState::default();
++    s.select(
++        SettingsItem::all()
++            .iter()
++            .position(|i| *i == SettingsItem::Phone),
++    );
++    s
++}
++
++/// 手机通知状态页上，`Enter`（填令牌）/`r`（重新配对）/`x`（关掉）这三个键
++/// 在当前 `PhoneState` 下有没有对象可作用。
++///
++/// **两处调用点必须共用这一份判断，不能各写一次**：`idle_help` 用它决定
++/// 底栏写不写这个键，`ui/phone.rs::handle_status` 用它决定按下去有没有
++/// 效果——这正是「屏幕上写着做不到的操作比不写更糟」那条房规反过来也成立
++/// 的地方：如果两处逻辑分别抄一遍，日后改一处忘了改另一处，要么是屏幕上
++/// 写着一个按下去毫无反应的键，要么是一个真管用却没人告诉用户的隐藏键
++/// ——本文件反复警惕的就是后一种。
++///
++/// 抽成纯函数还有一个更直接的理由：`App::test_app()` 造出来的是断线的
++/// `App`，`r`/`x` 真的发出请求也会因为连不上而回退到原状态——只看
++/// `handle_status` 跑完之后 `app.view` 变没变，分辨不出「守卫拦住了」和
++/// 「发了请求，只是刚好失败了」。把守卫本身抽出来单测，才钉得住这条判断，
++/// 而不是钉住一个连不上网络时凑巧长得一样的表象。
++pub(crate) fn phone_key_has_effect(state: &PhoneState, code: KeyCode) -> bool {
++    match code {
++        // 只在 Off/Broken 下有意义：`WaitingForPairing`/`Paired` 已经有一份
++        // 能用的令牌了。
++        KeyCode::Enter => matches!(state, PhoneState::Off | PhoneState::Broken(_)),
++        // 重新配对 / 整个关掉都只在已经填过令牌（非 Off）时才有对象可作用。
++        KeyCode::Char('r') | KeyCode::Char('x') => !matches!(state, PhoneState::Off),
++        _ => false,
++    }
++}
++
+ /// 选中某个 profile 之后该干什么。四种：能用的直接建会话；缺密钥的去填密钥；
+ /// 没装但有安装命令的去装；没装又没法自动装的、或者缺别的 profile 依赖的，
+ /// 只能告诉用户一句话，不切视图。
+ #[derive(Debug)]
+ pub enum PickAction {
+     Start(String),
+     /// 下标是占位——`pick_action` 只拿得到一个 `&ProfileEntry`，不知道它在
+     /// 列表里排第几，这里永远填 0。真下标只有调用方知道（它是从 `entries[i]`
+     /// 拿到这个 entry 的），必须由调用方在按键分支里覆盖，不能信这个值。
+     AskSecret(usize),
+@@ -463,20 +545,29 @@ pub fn verify_message(o: VerifyOutcome, lang: Lang) -> Option<String> {
+ /// 要不要相等，是一次纯粹的比较，不需要真连 daemon 就能覆盖。
+ pub fn verify_outcome_applies_to(
+     issued_profile: &str,
+     issued_buf: &str,
+     current_profile: &str,
+     current_buf: &str,
+ ) -> bool {
+     issued_profile == current_profile && issued_buf == current_buf
+ }
+ 
++/// 同上，手机通知页填令牌那次后台验证的版本——只有一份输入（令牌本身，
++/// 没有 profile 这一层），比对更简单，但道理完全一样：验证是异步的，
++/// 结果送回来时用户可能已经 Esc 退出、甚至绕回来重新打过一遍令牌，
++/// 只有「发起验证时的令牌」还等于「此刻输入框里的令牌」时，这条结果
++/// 才有落点。
++pub(crate) fn phone_verify_outcome_applies_to(issued_token: &str, current_buf: &str) -> bool {
++    issued_token == current_buf
++}
++
+ /// 把用户敲进来的路径变成绝对路径：`~` 展开成家目录，相对路径按 `base` 解析。
+ /// 只做字符串层面的展开，**不做存在性校验**——调用方自己决定不存在时怎么办。
+ pub(crate) fn expand_path(input: &str, base: &Path) -> PathBuf {
+     // 粘贴进来的路径经常带尾随空格
+     let t = input.trim();
+     let home = || PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+ 
+     if t == "~" {
+         return home();
+     }
+@@ -1032,20 +1123,27 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
+             return_to_settings: true,
+             ..
+         } => text(Key::BackToSettings, lang).to_string(),
+         // 从选择器进来的填密钥，退出回的是选择器，不是看板
+         View::EnterSecret { .. } => text(Key::BackToList, lang).to_string(),
+         // 深入语言子列表时退一层是回顶层设置项列表，不是回看板——跟
+         // `back_one_level` 里那条特例是同一件事的两半。复用
+         // `BackToSettings`（"Ctrl+Q 回设置"）：这个词条已经泛指「回到某个
+         // 设置页」，不专属密钥设置页，语言子列表要说的正是这句话。
+         View::Settings { lang: Some(_), .. } => text(Key::BackToSettings, lang).to_string(),
++        // 正在填令牌：Esc 取消这次输入，退一层回状态页，不是直接回设置——
++        // 跟 `back_one_level` 里那条特例是同一件事的两半。写法同
++        // `View::Grid { reply: Some(_), .. }`：框开着时 `q` 只是个字母，
++        // 这里 Esc 才是真正生效的键，必须自己把键名拼上去。
++        View::Phone { entry: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
++        // 只是在看状态：Esc 回设置页顶层列表。
++        View::Phone { entry: None, .. } => text(Key::BackToSettings, lang).to_string(),
+         // 九宫格跟列表是**平级**的两个模式，它自己就是家——所以逃生键
+         // 跟列表上一样是「q 退出」，而不是「回列表」。写成回列表的话，
+         // Ctrl+Q 就成了 `g` 的一个隐藏同义词，用户还会以为自己退出了什么。
+         // 框开着时左段写 Esc：这时候 `q` 只是个字母，写「q 退出」是假的。
+         View::Grid { reply: Some(_), .. } => format!("Esc {}", text(Key::Cancel, lang)),
+         View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
+         // 全部按键浮层：`q` 在这里只是一张表上的一个字母，写「q 退出」是假的。
+         View::Keys { .. } => format!("Esc {}", text(Key::Back, lang)),
+         // 会话视图是唯一两个键都能逃的地方：Ctrl+Q 被主循环截下
+         // （`mod.rs` 的 `is_ctrl_q`），F2 由 `attach.rs` 自己吃掉，
+@@ -1322,20 +1420,59 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem>
+             lang,
+         ),
+         View::Settings { .. } => help_items(
+             &[
+                 ("↑↓", Key::Select),
+                 ("Enter", Key::Confirm),
+                 ("Esc", Key::Cancel),
+             ],
+             lang,
+         ),
++        // 验证中不接受任何操作，同 `EnterSecret` 的 `Verifying` 分支——
++        // 按键全被吞掉，只有 Esc 生效，底部不该继续说「Enter 确认」。
++        View::Phone {
++            entry:
++                Some(PhoneEntry {
++                    phase: SecretPhase::Verifying,
++                    ..
++                }),
++            ..
++        } => help_items(&[("", Key::Verifying)], lang),
++        View::Phone { entry: Some(_), .. } => help_items(
++            &[
++                ("", Key::PasteOrTypeKey),
++                ("Enter", Key::Confirm),
++                ("Esc", Key::Cancel),
++            ],
++            lang,
++        ),
++        // 只是在看状态：能按哪些键取决于当前是哪个 `PhoneState`——**能不能
++        // 按也决定写不写**（同本文件顶上 `idle_help` 文档注释里那条总纲）。
++        // `Enter`（填令牌）只在 `Off`/`Broken` 下有意义：`WaitingForPairing`/
++        // `Paired` 已经有一份能用的令牌了，Enter 在那两种状态下什么都不做。
++        // `r`（重新配对）/`x`（关掉）只在已经填过令牌（非 `Off`）时才有对象
++        // 可作用。
++        View::Phone {
++            status,
++            entry: None,
++        } => {
++            let mut items: Vec<(&'static str, Key)> = Vec::new();
++            if phone_key_has_effect(&status.state, KeyCode::Enter) {
++                items.push(("Enter", Key::PhoneEnterToken));
++            }
++            if phone_key_has_effect(&status.state, KeyCode::Char('r')) {
++                items.push(("r", Key::PhoneRepair));
++                items.push(("x", Key::PhoneTurnOff));
++            }
++            items.push(("Esc", Key::BackToSettingsWord));
++            help_items(&items, lang)
++        }
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::proto::InstallPrompt;
+     use crate::ui::key_to_input;
+ 
+     fn ctrl(c: char) -> KeyEvent {
+@@ -1420,20 +1557,29 @@ mod tests {
+             profile: "kimi".into(),
+             label: "Kimi".into(),
+             prompt: SecretPrompt {
+                 hint: String::new(),
+                 url: None,
+             },
+             buf: String::new(),
+             phase,
+             return_to_settings,
+         };
++        let phone_status_of = |state| PhoneStatus {
++            state,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        };
++        let phone_status = |state| View::Phone {
++            status: phone_status_of(state),
++            entry: None,
++        };
+         let mut typing = ProjectPicker::new(vec![], PathBuf::from("/"));
+         typing.typing_path = Some(String::new());
+ 
+         let views = vec![
+             View::Board,
+             View::Attached(1),
+             View::grid(0),
+             View::Grid {
+                 focus: 0,
+                 reply: Some(Draft {
+@@ -1456,20 +1602,41 @@ mod tests {
+             secret(true, SecretPhase::Typing),
+             secret(false, SecretPhase::Verifying),
+             View::Keys {
+                 from: Box::new(View::Board),
+             },
+             View::Secrets {
+                 entries: vec![with_secret(entry("kimi", ProfileStatus::Ready))],
+                 state: ListState::default(),
+                 pending_delete: None,
+             },
++            // 手机通知：`entry: None` 下按键表随 `PhoneState` 变化（能不能
++            // 按也决定写不写，见 `idle_help` 里那条总纲），四种状态都要列到，
++            // 不然某一种状态自己漏写汉字键名这条守卫看不见。
++            phone_status(PhoneState::Off),
++            phone_status(PhoneState::WaitingForPairing),
++            phone_status(PhoneState::Paired),
++            phone_status(PhoneState::Broken("x".into())),
++            View::Phone {
++                status: phone_status_of(PhoneState::Off),
++                entry: Some(PhoneEntry {
++                    buf: String::new(),
++                    phase: SecretPhase::Typing,
++                }),
++            },
++            View::Phone {
++                status: phone_status_of(PhoneState::Off),
++                entry: Some(PhoneEntry {
++                    buf: String::new(),
++                    phase: SecretPhase::Verifying,
++                }),
++            },
+         ];
+         // 加了 View 变体就往上面那张表里补一行——这条守卫只查得到被列出来的。
+         assert!(!views.is_empty());
+ 
+         // `View` 没有 `Debug`（里面挂着 `ListState` 之类），失败信息里用下标
+         // 指回上面那张表就够了——表是按顺序写死的。
+         for (i, v) in views.iter().enumerate() {
+             for ctx in [on_a_session(), on_a_header(), on_a_removable_group()] {
+                 let en: Vec<&str> = idle_help(v, Lang::En, ctx)
+                     .iter()
+@@ -1544,20 +1711,156 @@ mod tests {
+         match back {
+             Some(View::PickProject(p)) => {
+                 assert_eq!(p.typing_path, None, "应当退出手输态");
+                 assert_eq!(p.filter, "a", "退一层不该顺手清掉过滤词");
+                 assert_eq!(p.recent, vec!["/tmp/a".to_string()], "项目列表不该丢");
+             }
+             other => panic!("手输态应当退回列表态，实际是 {:?}", other.is_some()),
+         }
+     }
+ 
++    /// Ctrl+Q 在手机通知页跟手输路径态是同一种「先退一层」：正在填令牌时
++    /// 先回状态页，不是一步跳回设置列表。
++    #[test]
++    fn ctrl_q_leaves_the_phone_entry_before_leaving_the_page() {
++        let status = PhoneStatus {
++            state: PhoneState::WaitingForPairing,
++            bot: Some("my_dct_bot".into()),
++            owner: None,
++        };
++        let back = back_one_level(View::Phone {
++            status: status.clone(),
++            entry: Some(PhoneEntry {
++                buf: "partial".into(),
++                phase: SecretPhase::Typing,
++            }),
++        });
++        match back {
++            Some(View::Phone {
++                status: s,
++                entry: None,
++            }) => assert_eq!(s.state, status.state, "状态本身不该被这一步动"),
++            other => panic!("应当退回状态页，entry 清空，实际 {:?}", other.is_some()),
++        }
++    }
++
++    /// 只是在看状态时 Ctrl+Q 退回设置页顶层列表，光标停在「手机通知」——
++    /// 跟 `Esc` 走的是同一个目的地（见 `ui/phone.rs::handle_status`），
++    /// 两个逃生键不能说不一样的话。
++    #[test]
++    fn ctrl_q_from_the_phone_status_page_goes_back_to_settings_on_the_phone_row() {
++        let back = back_one_level(View::Phone {
++            status: PhoneStatus {
++                state: PhoneState::Off,
++                bot: None,
++                owner: None,
++            },
++            entry: None,
++        });
++        match back {
++            Some(View::Settings { state, lang: None }) => {
++                assert_eq!(
++                    state.selected().and_then(SettingsItem::at),
++                    Some(SettingsItem::Phone)
++                );
++            }
++            other => panic!("应当退回设置页顶层列表，实际 {:?}", other.is_some()),
++        }
++    }
++
++    /// `phone_key_has_effect` 是 `idle_help`（写不写这个键）和
++    /// `ui/phone.rs::handle_status`（按下去有没有效果）唯一共用的判断——
++    /// 这条测试穷举所有 (状态, 键) 组合，钉死这份真值表本身。
++    #[test]
++    fn phone_key_has_effect_matches_the_documented_truth_table() {
++        let off = PhoneState::Off;
++        let waiting = PhoneState::WaitingForPairing;
++        let paired = PhoneState::Paired;
++        let broken = PhoneState::Broken("x".into());
++
++        // Enter：只在 Off/Broken 下有效
++        assert!(phone_key_has_effect(&off, KeyCode::Enter));
++        assert!(phone_key_has_effect(&broken, KeyCode::Enter));
++        assert!(!phone_key_has_effect(&waiting, KeyCode::Enter));
++        assert!(!phone_key_has_effect(&paired, KeyCode::Enter));
++
++        // r/x：只在非 Off 下有效
++        for code in [KeyCode::Char('r'), KeyCode::Char('x')] {
++            assert!(!phone_key_has_effect(&off, code));
++            assert!(phone_key_has_effect(&waiting, code));
++            assert!(phone_key_has_effect(&paired, code));
++            assert!(phone_key_has_effect(&broken, code));
++        }
++
++        // 别的键在任何状态下都没有效果
++        assert!(!phone_key_has_effect(&waiting, KeyCode::Char('q')));
++    }
++
++    /// 底栏能不能写这个键，得跟 `phone_key_has_effect` 一致——`Off` 时不写
++    /// `r`/`x`，`Paired` 时不写 `Enter`。
++    ///
++    /// **按 `HelpItem.key` 精确比对，不是拿整句文案做子串匹配**——
++    /// `"Enter"` 本身就含着字母 `r`，拿 `contains('r')` 去问「写没写 r 这个
++    /// 键」在 `Off` 状态下会被 `"Enter"` 自己假阳性带偏。
++    #[test]
++    fn phone_idle_help_only_advertises_keys_that_actually_work() {
++        let status_of = |state| PhoneStatus {
++            state,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        };
++        let has_key = |state: PhoneState, wanted: &str| -> bool {
++            idle_help(
++                &View::Phone {
++                    status: status_of(state),
++                    entry: None,
++                },
++                Lang::Zh,
++                on_a_session(),
++            )
++            .iter()
++            .any(|it| it.key == wanted)
++        };
++
++        assert!(has_key(PhoneState::Off, "Enter"), "Off 下 Enter 该写出来");
++        assert!(
++            !has_key(PhoneState::Off, "r"),
++            "Off 下没有令牌，r 不该写出来"
++        );
++        assert!(
++            !has_key(PhoneState::Off, "x"),
++            "Off 下没有令牌，x 不该写出来"
++        );
++
++        assert!(
++            !has_key(PhoneState::WaitingForPairing, "Enter"),
++            "已经有令牌了，Enter 不该写出来"
++        );
++        assert!(has_key(PhoneState::WaitingForPairing, "r"), "该写 r");
++        assert!(has_key(PhoneState::WaitingForPairing, "x"), "该写 x");
++
++        assert!(
++            has_key(PhoneState::Broken("x".into()), "Enter"),
++            "Broken 下 Enter 该写出来"
++        );
++        assert!(
++            has_key(PhoneState::Broken("x".into()), "r"),
++            "Broken 下 r 该写出来"
++        );
++
++        assert!(
++            !has_key(PhoneState::Paired, "Enter"),
++            "Paired 下 Enter 不该写出来"
++        );
++        assert!(has_key(PhoneState::Paired, "r"), "Paired 下 r 该写出来");
++    }
++
+     /// 一个会话都没有的看板上（光标停在一个空项目的组头上也一样），
+     /// `Enter` 无事可做。写它不只是没用——右段只有三个位子，一个假键
+     /// 占掉的正是一个真键的位置。
+     #[test]
+     fn the_bottom_bar_offers_nothing_to_act_on_when_there_are_no_sessions() {
+         let empty = HelpCtx::default();
+         for view in [View::Board, View::grid(0)] {
+             let help = help_when(&view, Lang::Zh, empty);
+             for k in ["↑↓ 选择", "Enter", "s 停止", "u 回滚", "d 改动", "i 回一句"] {
+                 assert!(!help.contains(k), "一个会话都没有，不该写「{k}」：{help}");
+@@ -2294,20 +2597,36 @@ mod tests {
+ 
+     #[test]
+     fn verify_outcome_does_not_apply_when_the_buffer_changed_on_the_same_profile() {
+         // profile 没变，但填的密钥不是当初那一份——同样不能用这条结果去
+         // 决定"这份新密钥"能不能存。
+         assert!(!verify_outcome_applies_to(
+             "kimi", "sk-old", "kimi", "sk-new"
+         ));
+     }
+ 
++    /// `phone_verify_outcome_applies_to` 是同一条修复在手机通知令牌验证上
++    /// 的版本——只有一份输入，没有 profile 这一层，但道理一样：迟到的验证
++    /// 结果只能套在「当初发起验证时那份令牌」还等于「此刻输入框里的令牌」
++    /// 的时候。
++    #[test]
++    fn phone_verify_outcome_applies_when_the_token_still_matches() {
++        assert!(phone_verify_outcome_applies_to("tok-abc", "tok-abc"));
++    }
++
++    #[test]
++    fn phone_verify_outcome_does_not_apply_when_the_token_changed() {
++        // 令牌还在验着的时候用户 Esc 退出、重新打了一份不同的令牌——
++        // 迟到的结果不该套在这份新输入上。
++        assert!(!phone_verify_outcome_applies_to("tok-old", "tok-new"));
++    }
++
+     #[test]
+     fn secret_view_escapes_back_to_the_picker() {
+         // 回选择器而不是回看板：用户可能只是选错了 agent
+         let back = back_one_level(View::EnterSecret {
+             profile: "kimi".into(),
+             label: "Kimi".into(),
+             prompt: SecretPrompt {
+                 hint: String::new(),
+                 url: None,
+             },
+@@ -2368,20 +2687,62 @@ mod tests {
+                 },
+                 buf: String::new(),
+                 phase: SecretPhase::Typing,
+                 return_to_settings: true,
+             },
+             Lang::Zh,
+         );
+         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+     }
+ 
++    /// 手机通知页的逃生键跟 `EnterSecret` 一样要分两种：正在填令牌时 Esc
++    /// 取消这次输入（回状态页），只是在看状态时 Esc 回设置——两句话不能
++    /// 说反，也不能是同一句（那样用户分不清自己退到了哪）。
++    #[test]
++    fn phone_escape_hint_distinguishes_entering_a_token_from_just_looking() {
++        let status = PhoneStatus {
++            state: PhoneState::Off,
++            bot: None,
++            owner: None,
++        };
++        let entering = escape_hint(
++            &View::Phone {
++                status: status.clone(),
++                entry: Some(PhoneEntry {
++                    buf: String::new(),
++                    phase: SecretPhase::Typing,
++                }),
++            },
++            Lang::Zh,
++        );
++        let looking = escape_hint(
++            &View::Phone {
++                status,
++                entry: None,
++            },
++            Lang::Zh,
++        );
++        assert!(
++            entering.contains("取消"),
++            "正在填令牌时 Esc 该说取消：{entering}"
++        );
++        assert!(
++            !entering.contains("设置"),
++            "正在填令牌时 Esc 不该说回设置：{entering}"
++        );
++        assert!(
++            looking.contains("设置"),
++            "只是在看状态时 Esc 该说回设置：{looking}"
++        );
++        assert_ne!(entering, looking, "两种场景不能说同一句话");
++    }
++
+     /// 深入语言子列表时逃生键要说「回设置」，不是顶层那句默认的
+     /// 「回看板」——底栏说什么就得真能做到什么，跟
+     /// `ctrl_q_from_the_language_list_goes_back_to_the_settings_list` 是
+     /// 同一件事的两半（那条测行为，这条测文案）。
+     #[test]
+     fn escape_hint_from_the_language_list_says_back_to_settings_not_the_board() {
+         let mut ls = ListState::default();
+         ls.select(Some(0));
+         let h = escape_hint(
+             &View::Settings {

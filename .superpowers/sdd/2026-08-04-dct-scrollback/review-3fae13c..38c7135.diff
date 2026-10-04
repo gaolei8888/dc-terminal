@@ -1,0 +1,757 @@
+# Review package: 3fae13c..38c7135
+
+## Commits
+38c7135 fix: address scrollback review findings
+
+## Files changed
+ src/i18n.rs             |   8 ++-
+ src/ui/attach.rs        | 144 +++++++++++++++++++++++++++++++++++-------------
+ src/ui/mod.rs           |  54 ++++++++++++++----
+ tests/signal_restore.rs |  71 ++++++++++++++++++++++--
+ 4 files changed, 221 insertions(+), 56 deletions(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 7ce99e2..724a868 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -702,25 +702,29 @@ pub mod msg {
+     pub fn session_title_disconnected(lang: Lang, id: u32, project: &str) -> String {
+         t!(
+             lang,
+             en: format!("Session {id} · {project} (disconnected, may be out of date) —— F2 goes back"),
+             zh: format!("会话 {id} · {project}（连接已断开，画面可能过期）—— F2 返回看板"),
+         )
+     }
+ 
+     /// 底栏「往上翻了，下面又有新东西了」。用户滚回底部之前画面不会自己跳，
+     /// 免得他正读一半的历史被新输出顶飞——这句话是唯一的提醒。
++    ///
++    /// 跟 `scrolled_up` 一样必须带上「按 End 回底部」：这半句在这个状态下
++    /// 反而最要紧——用户翻着历史、新内容还在不断堆积，正是最想马上跳回去
++    /// 看最新输出的时候，不能只说「有新东西」却不说怎么去看。
+     pub fn scroll_new_lines_below(lang: Lang, n: usize) -> String {
+         t!(
+             lang,
+-            en: format!("↓ {n} new line(s) below"),
+-            zh: format!("↓ 下面还有 {n} 行新内容"),
++            en: format!("↓ {n} new line(s) below · press End to jump back down"),
++            zh: format!("↓ 下面还有 {n} 行新内容 · 按 End 回到底部"),
+         )
+     }
+ 
+     /// 底栏「已经往上翻了多远，怎么回去」。两件事缺一不可——只说翻了多远，
+     /// 用户不知道怎么回底部；只说怎么回去，他不知道自己是不是还看得到最新的。
+     pub fn scrolled_up(lang: Lang, offset: usize) -> String {
+         t!(
+             lang,
+             en: format!("↑ Scrolled up {offset} line(s) · press End to jump back down"),
+             zh: format!("↑ 已往上翻 {offset} 行 · 按 End 回到底部"),
+diff --git a/src/ui/attach.rs b/src/ui/attach.rs
+index 76a76a6..37cfb8c 100644
+--- a/src/ui/attach.rs
++++ b/src/ui/attach.rs
+@@ -36,40 +36,45 @@ pub(crate) fn wheel_action(st: &ScrollState, up: bool) -> ScrollAction {
+     if st.agent_owns {
+         return ScrollAction::Forward;
+     }
+     if st.max == 0 {
+         return ScrollAction::Ignore;
+     }
+     ScrollAction::Scroll(if up { WHEEL_ROWS } else { -WHEEL_ROWS })
+ }
+ 
+ /// 翻页键归谁。`None` = 不归 dct 管，让它落到普通按键路径送给 agent。
++///
++/// `End` 用 `Scroll(-i32::MAX)` 而不是单独一个 `Bottom` 分支：`ScrollBy::Rows`
++/// 在守护进程侧是 `saturating_sub` 之后再钳到 `[0, max]`，结果跟
++/// `ScrollBy::Bottom` 完全一样，多一个分支只是多一处要测的东西。
+ pub(crate) fn key_scroll(st: &ScrollState, key: &KeyEvent, page: u16) -> Option<ScrollAction> {
+     if st.agent_owns {
+         return None;
+     }
+     // 一屏减 2 行：留两行重叠，翻页之后还能看到上一屏的尾巴，不然读长输出时
+     // 每翻一页都要重新找位置。窗口太小时至少滚 1 行，不能算出 0 或负数。
+     let step = i32::from(page).saturating_sub(2).max(1);
+     match key.code {
++        // 没有历史可翻时 PageUp/PageDown 也该放行给 agent，不能在这儿吃掉
++        // 变成死键——跟 `wheel_action` 的 `max == 0` 判据是同一条路由规则，
++        // 两个入口对同一个问题必须给同一个答案。一个刚建的、还没吐出一屏
++        // 内容的 inline agent 正是这种情况：PageUp 对它来说是普通的编辑键。
++        KeyCode::PageUp | KeyCode::PageDown if st.max == 0 => None,
+         KeyCode::PageUp => Some(ScrollAction::Scroll(step)),
+         KeyCode::PageDown => Some(ScrollAction::Scroll(-step)),
+         KeyCode::End if st.offset > 0 => Some(ScrollAction::Scroll(-i32::MAX)),
+         _ => None,
+     }
+ }
+ 
+ /// 底栏那一句滚动提示。`None` = 不显示，让位给平时的按键表。
+-///
+-/// `End` 用 `Scroll(-i32::MAX)` 而不是单独一个 `Bottom` 分支：`ScrollBy::Rows`
+-/// 在守护进程侧是 `saturating_sub` 之后再钳到 `[0, max]`，结果跟
+-/// `ScrollBy::Bottom` 完全一样，多一个分支只是多一处要测的东西。
+ pub(crate) fn scroll_hint(st: &ScrollState, lang: Lang) -> Option<String> {
+     if st.offset > 0 && st.new_lines > 0 {
+         return Some(crate::i18n::msg::scroll_new_lines_below(lang, st.new_lines));
+     }
+     if st.offset > 0 {
+         return Some(crate::i18n::msg::scrolled_up(lang, st.offset));
+     }
+     // agent 自己占着画面又不收鼠标：谁都滚不了。装死的话用户会以为
+     // 滚轮坏了，一直试。
+     if !st.agent_owns && st.alt_screen {
+@@ -189,90 +194,97 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+     // 把 agent 屏幕里的光标位置映射到真实终端上。没有这一步用户
+     // 看到的只是一张死截图，不知道自己打的字会落在哪。+1 是边框。
+     let (row, col) = app.screen_cursor;
+     let x = area.x + 1 + col;
+     let y = area.y + 1 + row;
+     if x < area.x + area.width.saturating_sub(1) && y < area.y + area.height.saturating_sub(1) {
+         f.set_cursor_position((x, y));
+     }
+ }
+ 
+-/// **这个函数里不许改 `app.message`。** 主循环在调用它之后直接 `continue`，
+-/// 跳过了循环末尾清理陈旧消息的那一段——在这里设一条消息，它会一直挂在
+-/// 屏幕上直到下一次按键。同理也不用 `?` 把 `app.client()` 的错误往上抛：
+-/// 鼠标事件一秒钟能来几十个，某一次因为断线送失败不该让整个界面跟着
+-/// 退出——下一帧的 `Screen` 探测自然会把 `connected` 标成假，断连提示
+-/// 走那条既有的路。
+-pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
++/// **这个函数里不许改 `app.message`。** 主循环在调用它之后可能直接
++/// `continue` 回循环顶部，跳过了循环末尾清理陈旧消息的那一段——在这里
++/// 设一条消息，它会一直挂在屏幕上直到下一次按键。同理也不用 `?` 把
++/// `app.client()` 的错误往上抛：鼠标事件一秒钟能来几十个，某一次因为
++/// 断线送失败不该让整个界面跟着退出——下一帧的 `Screen` 探测自然会把
++/// `connected` 标成假，断连提示走那条既有的路。
++///
++/// 返回这次事件有没有真的送出一次请求（滚动，或者转发点击/松开）。调用方
++/// （`run()`）靠这个判断值不值得为它触发一次完整的「取 Screen、重绘」——
++/// 纯移动这类被就地丢弃的事件占了鼠标事件的大多数，不该背上这个代价
++/// （见 `run()` 里排空鼠标事件那段的注释）。没有任何一条路径会失败到需要
++/// 报错的地步，所以是 `bool` 不是 `Result<()>`——把「这里不会出错」这件事
++/// 写进类型里，比只写在注释里更可信，调用点也就不再需要一个不会触发的 `?`。
++pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+     let View::Attached(id) = app.view else {
+-        return Ok(());
++        return false;
+     };
+     let (up, forwardable) = match m.kind {
+         MouseEventKind::ScrollUp => (true, Some(MouseForwardKind::WheelUp)),
+         MouseEventKind::ScrollDown => (false, Some(MouseForwardKind::WheelDown)),
+         MouseEventKind::Down(b) => (false, Some(MouseForwardKind::Press(button_code(b)))),
+         MouseEventKind::Up(b) => (false, Some(MouseForwardKind::Release(button_code(b)))),
+         // 纯移动（以及拖拽）不转发：Claude Code 开了 ?1003h，每动一下就是
+         // 一个事件，全部经 socket 转发过去量很大，换来的只是悬停高亮。
+         // 这是有意的部分实现，不是遗漏。
+         _ => (false, None),
+     };
+     let Some(kind) = forwardable else {
+-        return Ok(());
++        return false;
+     };
+ 
+     let is_wheel = matches!(
+         kind,
+         MouseForwardKind::WheelUp | MouseForwardKind::WheelDown
+     );
+     if is_wheel {
+         match wheel_action(&app.scroll, up) {
+-            ScrollAction::Ignore => return Ok(()),
++            ScrollAction::Ignore => return false,
+             ScrollAction::Scroll(n) => {
+                 let _ = app.client().and_then(|c| {
+                     c.call(Request::Scroll {
+                         id,
+                         by: ScrollBy::Rows(n),
+                     })
+                 });
+-                return Ok(());
++                return true;
+             }
+             ScrollAction::Forward => {}
+         }
+     } else if !app.scroll.agent_owns {
+         // 不收鼠标的 agent 收到点击/松开事件只会看到一串乱码。
+-        return Ok(());
++        return false;
+     }
+ 
+     // 终端坐标减掉内容区左上角，换算成 agent 画面里的坐标。任何一边越界
+     // （点在了边框、底栏上）就直接丢——那些地方压根不是 agent 的画面。
+     let Some((col, row)) = app
+         .screen_origin
+         .and_then(|(c0, r0)| Some((m.column.checked_sub(c0)?, m.row.checked_sub(r0)?)))
+     else {
+-        return Ok(());
++        return false;
+     };
+ 
+     let _ = app.client().and_then(|c| {
+         c.call(Request::Mouse {
+             id,
+             event: MouseForward {
+                 col,
+                 row,
+                 kind,
+                 shift: m.modifiers.contains(KeyModifiers::SHIFT),
+                 alt: m.modifiers.contains(KeyModifiers::ALT),
+                 ctrl: m.modifiers.contains(KeyModifiers::CONTROL),
+             },
+         })
+     });
+-    Ok(())
++    true
+ }
+ 
+ fn button_code(b: MouseButton) -> u8 {
+     match b {
+         MouseButton::Left => 0,
+         MouseButton::Middle => 1,
+         MouseButton::Right => 2,
+     }
+ }
+ 
+@@ -323,20 +335,53 @@ mod tests {
+         let (mut app, _dir) = App::test_app();
+         app.sessions = vec![session(1, SessionState::Working)];
+         app.current_dir = std::path::PathBuf::from("/tmp/a");
+         app.refresh_visible();
+         app.view = View::Attached(1);
+         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+         assert!(matches!(app.view, View::Attached(1)), "不能跳回自己");
+         assert!(!app.message.text.is_empty(), "得说一句，不能默不作声");
+     }
+ 
++    /// `handle_mouse` 靠 `screen_origin` 把终端坐标换算成 agent 画面里的
++    /// 坐标，自己绝不硬算边框宽度——这条测试钉住 `draw` 真的记对了那个
++    /// 坐标。少了它，`draw` 里 `app.screen_origin = Some((area.x, area.y))`
++    /// （漏掉 `+1` 的边框偏移）这种改动全量测试照样 542/0 全绿，因为没有
++    /// 别的测试断言过这个字段的值——鼠标点哪儿都会偏一格，而且偏得悄无
++    /// 声息，正是 `screen_origin` 这个字段本来要防的那类 bug。
++    #[test]
++    fn draw_records_the_bordered_content_corner_as_the_screen_origin() {
++        use ratatui::backend::TestBackend;
++
++        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
++        let (mut app, _dir) = App::test_app();
++        app.sessions = vec![session(1, SessionState::Working)];
++        app.view = View::Attached(1);
++        // 不用整块屏幕：故意给一个不是 (0, 0) 的偏移，这样如果 `draw` 悄悄
++        // 写成了直接抄 `area.x`/`area.y`（漏掉 `+1` 的边框），或者写死了
++        // 一个常数，这条测试都能抓出来，而不是恰好在 (0, 0) 时侥幸对上。
++        let area = Rect {
++            x: 3,
++            y: 2,
++            width: 40,
++            height: 12,
++        };
++
++        term.draw(|f| draw(f, area, &mut app)).unwrap();
++
++        assert_eq!(
++            app.screen_origin,
++            Some((area.x + 1, area.y + 1)),
++            "内容区左上角要算上边框（+1），不能是 area 自己的坐标"
++        );
++    }
++
+     fn own(agent_owns: bool, max: usize, offset: usize, new_lines: usize) -> ScrollState {
+         ScrollState {
+             agent_owns,
+             alt_screen: false,
+             max,
+             offset,
+             new_lines,
+         }
+     }
+ 
+@@ -368,20 +413,31 @@ mod tests {
+         ));
+     }
+ 
+     #[test]
+     fn page_keys_belong_to_the_agent_when_it_owns_the_viewport() {
+         // None 表示「不归我管」，让它落到普通按键路径送给 agent
+         assert!(key_scroll(&own(true, 0, 0, 0), &key(KeyCode::PageUp), 24).is_none());
+         assert!(key_scroll(&own(true, 0, 0, 0), &key(KeyCode::End), 24).is_none());
+     }
+ 
++    /// 跟 `wheel_action` 的 `there_is_nothing_to_scroll_when_there_is_no_history`
++    /// 是同一条路由规则的两个入口，必须给出同一个答案：没有历史时 dct 不该
++    /// 吃掉 PageUp/PageDown。不这样的话，一个刚建的、还没吐出一屏内容的
++    /// inline agent 上按 PageUp 会被 dct 悄悄吞掉、什么反应都没有——而滚轮
++    /// 在同样的状态下（`wheel_action` 的 `max == 0` 分支）老老实实转发。
++    #[test]
++    fn page_keys_are_not_scroll_keys_when_there_is_no_history() {
++        assert!(key_scroll(&own(false, 0, 0, 0), &key(KeyCode::PageUp), 24).is_none());
++        assert!(key_scroll(&own(false, 0, 0, 0), &key(KeyCode::PageDown), 24).is_none());
++    }
++
+     #[test]
+     fn page_keys_scroll_a_screen_minus_two() {
+         let up = key_scroll(&own(false, 500, 0, 0), &key(KeyCode::PageUp), 24).unwrap();
+         assert!(matches!(up, ScrollAction::Scroll(22)));
+         let down = key_scroll(&own(false, 500, 30, 0), &key(KeyCode::PageDown), 24).unwrap();
+         assert!(matches!(down, ScrollAction::Scroll(-22)));
+     }
+ 
+     #[test]
+     fn a_tiny_window_still_scrolls_at_least_one_row() {
+@@ -406,24 +462,27 @@ mod tests {
+     fn end_jumps_all_the_way_down() {
+         let a = key_scroll(&own(false, 500, 40, 0), &key(KeyCode::End), 24).unwrap();
+         assert!(matches!(a, ScrollAction::Scroll(n) if n == -i32::MAX));
+     }
+ 
+     #[test]
+     fn the_hint_says_how_much_is_waiting_below() {
+         let st = own(false, 500, 40, 12);
+         let h = scroll_hint(&st, Lang::Zh).unwrap();
+         assert!(h.contains("12"), "得说清有多少新东西: {h}");
++        // 用户正翻着历史、新内容还在堆积，是最想立刻跳回去看最新输出的
++        // 时候——光说「有新东西」不说怎么回去，等于只交代了一半。
++        assert!(h.contains("End"), "得说清怎么回去: {h}");
+         let en = scroll_hint(&st, Lang::En).unwrap();
+         assert!(
+-            !en.is_empty() && en.contains("12"),
+-            "英文版也要说清同一个数字: {en}"
++            !en.is_empty() && en.contains("12") && en.contains("End"),
++            "英文版也要说清同一个数字，以及怎么回去: {en}"
+         );
+     }
+ 
+     #[test]
+     fn the_hint_says_how_to_get_back_when_nothing_is_new() {
+         let st = own(false, 500, 40, 0);
+         let h = scroll_hint(&st, Lang::Zh).unwrap();
+         assert!(h.contains("40"), "得说清翻了多远: {h}");
+         assert!(h.contains("End"), "得说清怎么回去: {h}");
+         let en = scroll_hint(&st, Lang::En).unwrap();
+@@ -508,55 +567,66 @@ mod tests {
+     fn button_code_maps_left_middle_right_to_zero_one_two() {
+         assert_eq!(button_code(MouseButton::Left), 0);
+         assert_eq!(button_code(MouseButton::Middle), 1);
+         assert_eq!(button_code(MouseButton::Right), 2);
+     }
+ 
+     #[test]
+     fn handle_mouse_does_nothing_off_the_attached_view() {
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Board;
+-        handle_mouse(&mut app, mouse_ev(MouseEventKind::ScrollUp, 5, 5)).unwrap();
++        assert!(!handle_mouse(
++            &mut app,
++            mouse_ev(MouseEventKind::ScrollUp, 5, 5)
++        ));
+         assert!(app.message.text.is_empty());
+     }
+ 
+-    /// client 是 `None`（`App::test_app` 就是断连的），下面每种事件都会在
+-    /// 真正发请求那一步失败——这条测试盯的是那次失败不能像 `handle_key`
+-    /// 里的 `Input` 分支那样反手把错误焊进 `app.message`。这是 e0ba1ec 那类
+-    /// bug 的另一种化身：主循环在 `handle_mouse` 后面直接 `continue`，跳过
+-    /// 了收尾清理，这里设的消息会一直挂到下一次按键。
++    /// client 是 `None`（`App::test_app` 就是断连的），下面每种可转发的
++    /// 事件都会在真正发请求那一步失败——这条测试盯的是那次失败不能像
++    /// `handle_key` 里的 `Input` 分支那样反手把错误焊进 `app.message`。
++    /// 这是 e0ba1ec 那类 bug 的另一种化身：主循环在 `handle_mouse` 后面
++    /// 可能直接跳回循环顶部，跳过了收尾清理，这里设的消息会一直挂到下
++    /// 一次按键。
++    ///
++    /// `agent_owns = true` 是故意的：只有这样滚轮和点击/松开才会真的走到
++    /// 发请求那一步（而不是被 `wheel_action`/「不收鼠标的 agent」提前
++    /// 挡下），这条测试才对得上「调用失败」这四个字，而不是「压根没调用」。
++    /// 顺带验证了 `handle_mouse` 的返回值：真发了请求的返回 `true`，
++    /// 纯移动这种从不发请求的返回 `false`。
+     #[test]
+     fn handle_mouse_never_touches_the_message_even_when_the_call_fails() {
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Attached(1);
++        app.scroll.agent_owns = true;
+         app.screen_origin = Some((1, 1));
+-        for kind in [
+-            MouseEventKind::ScrollUp,
+-            MouseEventKind::ScrollDown,
+-            MouseEventKind::Down(MouseButton::Left),
+-            MouseEventKind::Up(MouseButton::Left),
+-            MouseEventKind::Moved,
++        for (kind, expect_acted) in [
++            (MouseEventKind::ScrollUp, true),
++            (MouseEventKind::ScrollDown, true),
++            (MouseEventKind::Down(MouseButton::Left), true),
++            (MouseEventKind::Up(MouseButton::Left), true),
++            (MouseEventKind::Moved, false),
+         ] {
+-            handle_mouse(&mut app, mouse_ev(kind, 5, 5)).unwrap();
++            let acted = handle_mouse(&mut app, mouse_ev(kind, 5, 5));
++            assert_eq!(acted, expect_acted, "事件是 {kind:?}");
+             assert!(
+                 app.message.text.is_empty(),
+                 "handle_mouse 不许改 message，事件是 {kind:?}"
+             );
+         }
+     }
+ 
+     #[test]
+     fn a_click_with_no_known_screen_origin_is_dropped_not_guessed() {
+         // 还没画过一帧时 `screen_origin` 是 `None`。猜一个边框宽度会在布局
+         // 改了之后悄悄点歪；不猜、直接丢，比错误的坐标安全。
+         let (mut app, _dir) = App::test_app();
+         app.view = View::Attached(1);
+         app.scroll.agent_owns = true; // 让点击走到坐标换算那一步，不要提前 return
+         app.screen_origin = None;
+-        handle_mouse(
++        assert!(!handle_mouse(
+             &mut app,
+-            mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 5),
+-        )
+-        .unwrap();
++            mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 5)
++        ));
+         assert!(app.message.text.is_empty());
+     }
+ }
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 6262f0f..f66c7ed 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -200,21 +200,25 @@ pub fn run(
+     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
+ 
+     let mut app = App::new(client, default_dir, lang, socket, view_mode);
+     // 鼠标捕获只在会话里开：看板不需要滚，而开着捕获会让终端原生的选中
+     // 复制失效——把这个代价限制在真正需要它的地方。见下面 `term.draw`
+     // 之前那段每帧检查一次的逻辑，以及它为什么不挂在某一个「进入会话」的
+     // 分支上（进 `View::Attached` 的路不止一条：`enter_session`、密钥验证
+     // 通过后直接建会话、九宫格里……挂哪个分支都会漏另一条）。
+     let mut mouse_captured = false;
+ 
+-    loop {
++    // 有标签是因为下面排空鼠标事件那段需要从一个嵌套的 `while` 里跳回
++    // 这个循环的顶部，而不是跳回 `while` 自己——普通的无标签 `continue`
++    // 已经覆盖了这个函数里所有别的 `continue`，不用因为加了一个标签
++    // 就把它们全部改成 `continue 'main`。
++    'main: loop {
+         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
+         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
+         if let Some(rx) = &app.verify_rx {
+             if let Ok((sent_profile, sent_buf, outcome)) = rx.try_recv() {
+                 // 不管接下来用不用得上这个结果，先把 Receiver 收掉：
+                 // 它已经出结果了，没有第二次可读。
+                 app.verify_rx = None;
+                 if let View::EnterSecret {
+                     profile,
+                     label,
+@@ -541,28 +545,52 @@ pub fn run(
+         }
+ 
+         term.draw(|f| draw(f, &mut app))?;
+ 
+         // 会话里要跟手：刷新慢了，你敲的字要等下一轮才显示，每次按键都像卡了一下。
+         // 看板不需要这么勤快，150ms 足够，也省得每轮都去锁一遍所有会话。
+         let tick = if attached { 16 } else { 150 };
+         if !event::poll(Duration::from_millis(tick))? {
+             continue;
+         }
+-        let ev = event::read()?;
+-        // 这个 `continue` 在按键处理**之前**，不在任何按键分支里，不违反
+-        // 房规（见 `attach::handle_key` 头上的注释）。但循环末尾清理陈旧
+-        // `message` 的那段也会被它跳过——所以 `handle_mouse` 内部**不许**
+-        // 改 `app.message`，那条约束写在它自己的文档注释上。
+-        if let Event::Mouse(m) = ev {
+-            attach::handle_mouse(&mut app, m)?;
+-            continue;
++        let mut ev = event::read()?;
++        // 鼠标事件在这里先摘出来单独处理，而且可能不止吃掉这一个：见下面
++        // 的注释。这个 `while` 结束之后，`ev` 保证不再是 `Event::Mouse`，
++        // 后面的 Paste/Key 分支照旧用它。
++        //
++        // 循环体里对 `handle_mouse` 的调用不违反房规（见 `attach::handle_key`
++        // 头上「永远不要 continue」那条）——它压根不 continue，只是被这个
++        // `while` 循环调用；`continue 'main` 才是真正跳过循环末尾清理
++        // `message` 那段的地方，而 `handle_mouse` 内部**不许**碰
++        // `app.message`，那条约束写在它自己的文档注释上，不受这里怎么
++        // 调用它影响。
++        while let Event::Mouse(m) = ev {
++            let acted = attach::handle_mouse(&mut app, m);
++            if acted {
++                // 真的送出了一次请求（滚动了、转发了点击/松开）：状态可能
++                // 变了，照旧走一次完整的循环体去重新取一遍 Screen、重绘。
++                continue 'main;
++            }
++            // 没做事的绝大多数是纯移动——`EnableMouseCapture` 打开的
++            // `?1003h` 是任意移动追踪，跟 agent 有没有订阅无关，鼠标扫一下
++            // 80 列宽的窗口就是几十个这种事件，`handle_mouse` 早就把它们
++            // 原地丢掉了（见它的文档）。问题是外层 `continue` 会把「取一次
++            // Screen、画一帧」全套重放一遍——用一个被丢弃的小事件换来一次
++            // 昂贵的守护进程往返和终端重绘，跟当初「移动事件不转发是为了
++            // 省流量」的初衷正好背道而驰。这里原地看一眼有没有紧跟着到达
++            // 的下一个事件：有就继续在这个 `while` 里处理掉，没有就老实
++            // 结束这一轮——不需要刷新时最多等到下一次自然的 16ms/150ms
++            // tick，不会更旧，只是不为每一个被丢弃的移动事件单独刷一次。
++            if !event::poll(Duration::from_millis(0))? {
++                continue 'main;
++            }
++            ev = event::read()?;
+         }
+         // 粘贴整段一次发完，不能拆成一个个字符
+         if let Event::Paste(text) = ev {
+             match &mut app.view {
+                 View::Attached(id) => {
+                     let id = *id;
+                     // 这里不走 `app.client()`：它需要 `&mut self`（整个 App），
+                     // 跟上面 `&mut app.view` 这个字段级借用同时活着会撞借用检查——
+                     // 直接查字段，`None` 归到跟真实断线一样的失败路径。
+                     let failed = match app.client.as_mut() {
+@@ -2272,23 +2300,27 @@ mod tests {
+             offset: 40,
+             new_lines: 0,
+         };
+ 
+         term.draw(|f| draw(f, &mut app)).unwrap();
+         let c = buffer_text(term.backend().buffer())
+             .chars()
+             .filter(|c| !c.is_whitespace())
+             .collect::<String>();
+ 
++        // `App::test_app()` 默认 `Lang::Zh`，所以断言实际渲染出来的整句话
++        // （`i18n::msg::scrolled_up` 的中文版，空白已被上面的 filter 去掉），
++        // 不是随便抓两个数字——数字对了但拼错了别的字、或者 offset 算错但
++        // 凑巧还是两位数，光查「有没有 4 和 0」都抓不出来。
+         assert!(
+-            c.contains('4') && c.contains('0'),
+-            "翻到哪儿了要写在底栏：{c}"
++            c.contains("已往上翻40行·按End回到底部"),
++            "翻到哪儿了、怎么回去都要原样写在底栏：{c}"
+         );
+         assert!(
+             !c.contains("F3下一个会话"),
+             "有滚动提示可显示时，不该再挤按键表：{c}"
+         );
+     }
+ 
+     /// 消息和滚动提示抢同一行时消息赢——消息是对用户刚才那个动作的回应，
+     /// 滚动提示是持续状态，盖掉前者会让用户以为自己那步操作没反应。
+     #[test]
+diff --git a/tests/signal_restore.rs b/tests/signal_restore.rs
+index 102e2b0..13bf8cd 100644
+--- a/tests/signal_restore.rs
++++ b/tests/signal_restore.rs
+@@ -2,23 +2,38 @@
+ //!
+ //! `TerminalGuard` 的 `Drop` 盖不住信号：SIGTERM/SIGHUP 直接终止进程，不展开栈。
+ //! 少了这条保障，用户「退不出去只好去别的窗口 kill」之后会拿到一个停在
+ //! raw mode 的终端——回显和行缓冲全关，看上去像第二次卡死，得知道敲 `reset`
+ //! 才救得回来。而「知道敲 reset」正是不该要求用户具备的知识。
+ 
+ use std::os::unix::io::FromRawFd;
+ use std::os::unix::process::CommandExt;
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
++use std::sync::{Arc, Mutex};
+ use std::thread::sleep;
+ use std::time::{Duration, Instant};
+ 
++/// crossterm 0.28.1 的 `DisableMouseCapture::write_ansi`（src/event.rs）真正
++/// 写出来的字节，逐条核实过，不是凭印象抄的字面量：`csi!("?1006l")` 展开成
++/// `"\x1B[?1006l"`（`csi!` 定义在 crossterm 的 `macros.rs`，把参数拼在
++/// `"\x1B["` 后面），五条 disable 序列按 `EnableMouseCapture` 的**逆序**
++/// 拼在一起，一次 `write_ansi` 调用全部写出。这是 SIGTERM/SIGHUP 之后
++/// `restore_terminal()` 必须真的送到用户终端上的那串字节——漏了它，用户
++/// 退出 dct 之后终端会在每次点击/拖选时冒出这串乱码，直到他知道敲什么
++/// 命令才能清掉，而多数用户不知道。
++const DISABLE_MOUSE_CAPTURE_SEQ: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
++
++fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
++    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
++}
++
+ /// 把测试用的二进制复制成一个独一无二的名字，收尾时按名字杀进程
+ /// 不会误伤开发机上真正在跑的 dct 守护进程。
+ fn unique_binary(dir: &Path, tag: &str) -> PathBuf {
+     let src = PathBuf::from(env!("CARGO_BIN_EXE_dct"));
+     let dst = dir.join(format!("dct-{tag}-probe-{}", std::process::id()));
+     std::fs::copy(&src, &dst).unwrap();
+     dst
+ }
+ 
+ /// 这份二进制起的守护进程还在不在。按完整路径匹配，只认这个测试自己那一份，
+@@ -56,26 +71,31 @@ fn wait_for(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+ /// 控制终端做一次 `revoke()`，之后 slave 的 fd 全部失效，`tcgetattr` 直接返回
+ /// ENOTTY——而「进程死了之后终端什么状态」恰好是这个测试唯一想问的事，
+ /// 从 slave 上根本问不出来。master 不受 revoke 影响，且 pty 会把 TIOCGETA
+ /// 转给 slave 的 termios，读到的就是用户那一端的真实状态。
+ unsafe fn is_raw(master: libc::c_int) -> bool {
+     let mut t: libc::termios = std::mem::zeroed();
+     assert_eq!(libc::tcgetattr(master, &mut t), 0, "读不到 termios");
+     (t.c_lflag & libc::ECHO) == 0 || (t.c_lflag & libc::ICANON) == 0
+ }
+ 
+-/// 在一个我们自己持有 fd 的 pty 里把 dct 跑起来，返回 (子进程, master fd)。
++/// 在一个我们自己持有 fd 的 pty 里把 dct 跑起来，返回 (子进程, master fd,
++/// dct 写给终端的全部字节)。
+ ///
+ /// 必须 `setsid` + `TIOCSCTTY`：crossterm 的 `enable_raw_mode` 优先操作
+ /// `/dev/tty`，也就是**控制终端**。不给子进程把这个 pty 设成控制终端的话，
+ /// 它动的是 cargo test 自己的终端，这个测试就测了个寂寞。
+-fn spawn_dct_in_pty(bin: &Path, home: &Path, cwd: &Path) -> (std::process::Child, libc::c_int) {
++fn spawn_dct_in_pty(
++    bin: &Path,
++    home: &Path,
++    cwd: &Path,
++) -> (std::process::Child, libc::c_int, Arc<Mutex<Vec<u8>>>) {
+     let (mut master, mut slave) = (0, 0);
+     unsafe {
+         assert_eq!(
+             libc::openpty(
+                 &mut master,
+                 &mut slave,
+                 std::ptr::null_mut(),
+                 std::ptr::null_mut(),
+                 std::ptr::null_mut()
+             ),
+@@ -121,61 +141,94 @@ fn spawn_dct_in_pty(bin: &Path, home: &Path, cwd: &Path) -> (std::process::Child
+     }
+     let child = cmd.spawn().expect("拉不起 dct");
+     // 父进程这份 slave 没用了，早点还掉：留着它，子进程死后 master 读不到 EOF，
+     // 下面那条 drain 线程就永远挂着。
+     unsafe { libc::close(slave) };
+ 
+     // 必须有人一直读 master，否则 TUI 画第一帧就把 pty 缓冲写满、卡在 write 里
+     // 出不来——实测那样连 SIGTERM 都收拾不干净，进程会停在 ps 的 `?E`
+     //「正在退出」状态上十几秒不动。真终端本来就一直在读，这条只是把它补上。
+     // 读 dup 出来的副本：收尾时主线程 close(master) 不会跟这个线程抢同一个 fd。
++    //
++    // 原来这里读完就扔——draining 只是为了不卡住子进程。现在把读到的字节
++    // 攒进一份共享缓冲区带出去：`restore_terminal()` 在 SIGTERM/SIGHUP 之后
++    // 写的 `DisableMouseCapture` 序列也在这条流里，不攒下来就只能「看代码
++    // 相信它会发生」，测不出「真的发生了」。
++    let captured = Arc::new(Mutex::new(Vec::new()));
++    let captured_for_thread = Arc::clone(&captured);
+     let drain = unsafe { libc::dup(master) };
+     std::thread::spawn(move || {
+         let mut buf = [0u8; 4096];
+-        while unsafe { libc::read(drain, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
++        loop {
++            let n = unsafe { libc::read(drain, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
++            if n <= 0 {
++                break;
++            }
++            captured_for_thread
++                .lock()
++                .unwrap()
++                .extend_from_slice(&buf[..n as usize]);
++        }
+         unsafe { libc::close(drain) };
+     });
+ 
+-    (child, master)
++    (child, master, captured)
+ }
+ 
+ /// 等 TUI 真的进了 raw mode。不等就发信号的话，测试可能在它还没设置终端时
+ /// 就把它杀了——那样即使有 bug 也会「通过」。
+ fn wait_until_raw(master: libc::c_int) -> bool {
+     wait_for(|| unsafe { is_raw(master) }, 20)
+ }
+ 
++/// 等排空线程把 `needle` 攒进 `captured` 里。子进程退出（`try_wait` 返回
++/// `Some`）不代表排空线程已经把它写的最后几个字节读完并追加到缓冲区——
++/// 两者是不同线程，中间有个真实但很短的窗口，所以要轮询，不能读一次就断言。
++fn wait_until_captured_contains(captured: &Arc<Mutex<Vec<u8>>>, needle: &[u8], secs: u64) -> bool {
++    wait_for(
++        || contains_subsequence(&captured.lock().unwrap(), needle),
++        secs,
++    )
++}
++
+ #[test]
+ fn sigterm_restores_the_terminal() {
+     let home = tempfile::tempdir().unwrap();
+     let workdir = tempfile::tempdir().unwrap();
+     let bin = unique_binary(home.path(), "sigterm");
+ 
+-    let (mut child, master) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
++    let (mut child, master, captured) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
+     assert!(
+         wait_until_raw(master),
+         "TUI 始终没进 raw mode，测试前提不成立"
+     );
+ 
+     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+     assert!(
+         wait_for(
+             || child.try_wait().map(|s| s.is_some()).unwrap_or(false),
+             10
+         ),
+         "SIGTERM 之后 TUI 应当退出"
+     );
+ 
+     assert!(
+         !unsafe { is_raw(master) },
+         "SIGTERM 之后终端仍停在 raw mode——用户会拿到一个不回显、不换行的死终端"
+     );
++    // raw mode 恢复只说明 `disable_raw_mode()` 跑了；`DisableMouseCapture`
++    // 是另一条独立的 `execute!`，漏发不会影响上面那条断言——这里直接盯着
++    // 它真的写进了终端那条流，而不是从"raw mode 好了"倒推"鼠标捕获也关了"。
++    assert!(
++        wait_until_captured_contains(&captured, DISABLE_MOUSE_CAPTURE_SEQ, 5),
++        "SIGTERM 之后没看到 DisableMouseCapture 序列——用户以后点哪儿终端都会冒乱码"
++    );
+ 
+     unsafe { libc::close(master) };
+ 
+     // TUI 一起来就会 `setsid` 拉起一个守护进程，而 setsid 的全部意义就是
+     // 「杀 TUI 杀不到我」。这两个测试只 kill TUI，守护进程就活到开发机重启
+     // 为止——实测一台机器上攒了 124 个，全是历次 `cargo test` 留下的，每个
+     // 都还锁着一份早就该被删掉的临时二进制。
+     reap_daemon(&bin);
+     assert!(
+         wait_for(|| !daemon_alive(&bin), 10),
+@@ -183,37 +236,43 @@ fn sigterm_restores_the_terminal() {
+         bin.display()
+     );
+ }
+ 
+ #[test]
+ fn sighup_restores_the_terminal() {
+     let home = tempfile::tempdir().unwrap();
+     let workdir = tempfile::tempdir().unwrap();
+     let bin = unique_binary(home.path(), "sighup");
+ 
+-    let (mut child, master) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
++    let (mut child, master, captured) = spawn_dct_in_pty(&bin, home.path(), workdir.path());
+     assert!(
+         wait_until_raw(master),
+         "TUI 始终没进 raw mode，测试前提不成立"
+     );
+ 
+     // 关终端窗口、tmux 杀 pane 走的都是这条
+     unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+     assert!(
+         wait_for(
+             || child.try_wait().map(|s| s.is_some()).unwrap_or(false),
+             10
+         ),
+         "SIGHUP 之后 TUI 应当退出"
+     );
+ 
+     assert!(!unsafe { is_raw(master) }, "SIGHUP 之后终端仍停在 raw mode");
++    // 同 SIGTERM 那条：raw mode 恢复不等于鼠标捕获也关了，两条是
++    // `restore_terminal()` 里两次独立的 `execute!`，分别断言。
++    assert!(
++        wait_until_captured_contains(&captured, DISABLE_MOUSE_CAPTURE_SEQ, 5),
++        "SIGHUP 之后没看到 DisableMouseCapture 序列——用户以后点哪儿终端都会冒乱码"
++    );
+ 
+     unsafe { libc::close(master) };
+ 
+     // TUI 一起来就会 `setsid` 拉起一个守护进程，而 setsid 的全部意义就是
+     // 「杀 TUI 杀不到我」。这两个测试只 kill TUI，守护进程就活到开发机重启
+     // 为止——实测一台机器上攒了 124 个，全是历次 `cargo test` 留下的，每个
+     // 都还锁着一份早就该被删掉的临时二进制。
+     reap_daemon(&bin);
+     assert!(
+         wait_for(|| !daemon_alive(&bin), 10),

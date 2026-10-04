@@ -1,0 +1,349 @@
+# Review package: 69b4899..12e5b0f
+
+## Commits
+12e5b0f docs: append the round-4 fix report for the two determinism fixes
+0e8577f test: make two regression tests deterministic instead of timing-based
+
+## Files changed
+ .../fix-1-report.md                                | 142 +++++++++++++++++++++
+ src/session.rs                                     |  72 +++++++++--
+ src/ui/board.rs                                    |  14 ++
+ 3 files changed, 215 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
+index f506b7d..0b6a0d4 100644
+--- a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
+@@ -500,10 +500,152 @@ $ git diff --check
+ Files touched this round: `src/ui/widgets.rs` (the `truncate` filter + 3
+ new tests), `src/ui/board.rs` (removed `#[ignore]`, updated its doc
+ comment to point at where the defense actually lives now).
+ 
+ ### Concerns
+ 
+ None. The render-path gap Important 2 identified is now closed with
+ coverage that discriminates (verified by mutation), and both dependent
+ titles (grid, attach) were confirmed covered by inspection rather than
+ assumed.
++
++## Round 4 — two Minor findings, same defect class as the branch's rejection
++
++Round 3's re-review verdicted both Important findings and both minors
++ADDRESSED and explicitly said not to revisit that work — did not. This round
++covers two new Minor findings the coordinator chose to fix now rather than
++defer, both instances of "a test that degrades to green under load," which
++is the exact defect class the branch was originally rejected for.
++
++### Minor 1 — `whitespace_only_input_is_asked_about_exactly_once_not_forever` was the false-green shape
++
++The version from round 2 (`src/session.rs`) ran ten iterations of
++`m.tick()` + `sleep(30ms)`, asserting `tag == ""` each time — a negative
++assertion on a fixed ~300ms total budget, checking for the *absence* of an
++effect from a background thread. Under load, a slow-to-schedule
++`SignalingBackend`/`FixedBackend` thread could miss that window entirely,
++and the test would pass for the wrong reason (never having actually run
++long enough to observe the bug if it were present) rather than because the
++guard held.
++
++Fixed by making the backend itself the source of truth instead of the
++clock. Added `SignalingBackend` (next to `FixedBackend`/`DeadBackend`,
++~line 1614): identical to `FixedBackend` except `complete()` also sends on
++an `mpsc::Sender<()>` before returning. Since `complete_with_timeout`
++(`src/llm/mod.rs:40-53`) always calls `Backend::complete` synchronously
++inside its own freshly-spawned thread, a signal on that channel is direct,
++unambiguous proof that `request_name` reached the model call a second
++time — not an inference from elapsed wall-clock time.
++
++The rewritten test:
++1. Ticks the (already-triggered-once) session forward synchronously — no
++   sleeping needed here, since whether `request_name` gets *invoked* again
++   is decided entirely inside `tick()`'s synchronous critical section,
++   before any thread is spawned.
++2. Calls `called_rx.recv_timeout(Duration::from_secs(5))` and asserts it
++   returns `Err(Timeout)`.
++
++This is not "a bigger sleep window" — it's structurally different from the
++pattern being rejected. The 5-second bound is not a race the test is trying
++to win; it exists only to keep a broken run from hanging forever, and it's
++symmetric with every other `Duration::from_secs(5)` deadline already used
++throughout this file for waiting on a real async completion. Verified both
++failure directions:
++
++- **Bug present** (re-ran mutation M10 — `s.name_attempted = true;` removed
++  from `request_name`): test fails in **0.29s**, because the signal arrives
++  almost immediately once `complete()` is actually called — it does not
++  wait out the 5s bound to report failure.
++- **Bug absent** (current code): test passes in ~5.3s, always waiting the
++  full bound, because there is no scenario in which the signal can arrive —
++  the guard prevents the call from ever happening, not just from happening
++  "in time."
++
++That asymmetry (fails fast, passes slow) is what makes this deterministic
++rather than a wider version of the same race: a slow/loaded test machine
++can only ever make the *passing* case marginally more certain, never
++produce a false pass in the buggy case.
++
++### Minor 2 — `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` was one-sided
++
++The round-3 version (`src/ui/board.rs`) asserted only
++`!c.chars().any(|ch| ch.is_control())` on the rendered buffer. That
++assertion is vacuously true if the session row — or the tag/label within
++it — stops being rendered at all, which round 2's `#[ignore]`d red run
++happened to rule out only by accident (the row *did* render at the time),
++not because anything pinned it.
++
++Added a second, positive assertion: `c.contains("[Afix")`. Computed by
++hand and confirmed by running the test: `truncate("\x1b[Afix\x7f", 15)`
++drops `ESC` (`\x1b`) and `DEL` (`\x7f`) — both `is_control()` — and keeps
++everything else, including the literal `[` and `A` that follow `ESC` in
++the arrow-key escape sequence (`truncate` does per-character control-byte
++filtering, not the daemon-side `sanitize`'s whole-CSI-sequence consumption
++— see `truncate`'s doc for why that asymmetry is intentional). So the
++visible, on-screen result of cleaning `"\x1b[Afix\x7f"` is `"[Afix"`, and
++that string must appear in `screen_text`'s output.
++
++Verified the discrimination two ways:
++- Introduced a mutation commenting out `board.rs:211`'s
++  `spans.push(Span::raw(pad_to(&truncate(session_label(s), 15), 16)));`
++  (simulating "the row/label stops rendering"). **With both assertions**,
++  the test fails (no `"[Afix"` on screen). **With only the old,
++  negative-only assertion** (checked by temporarily reverting to it under
++  the same mutation), the test still passes — concretely reproducing the
++  vacuous-pass the coordinator described, not just arguing it exists in
++  theory.
++
++### Mutation testing
++
++| # | Mutation | Result | Test(s) that caught it |
++|---|---|---|---|
++| M10 (re-run) | Remove `s.name_attempted = true;` from `request_name` | Caught, fails in 0.29s | `whitespace_only_input_is_asked_about_exactly_once_not_forever` |
++| M13 | Comment out `board.rs:211`'s tag/label span (row stops rendering the label) | Caught by the two-assertion version; **confirmed vacuously passes with only the old negative assertion** | `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` |
++
++### Re-verification
++
++```
++$ cargo test --lib session:: -- --test-threads=1
++test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 615 filtered out; finished in 21.06s
++
++$ cargo test --lib ui::board:: -- --test-threads=1
++test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 675 filtered out; finished in 0.01s
++
++$ cargo test -- --test-threads=1        # full workspace
++test result: ok. 690 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.74s
++... (16 more "ok" lines, one per integration test binary, all 0 failed)
++
++$ cargo fmt --check
++(clean)
++
++$ cargo clippy --all-targets
++(clean, no warnings)
++
++$ git diff --check
++(clean)
++```
++
++Files touched this round: `src/session.rs` (`SignalingBackend` +
++channel-based rewrite of the whitespace test),
++`src/ui/board.rs` (added the positive assertion + doc comment explaining
++why both are required).
++
++### Triage item for the final review (not acted on, per instruction)
++
++The coordinator's own re-review found that `truncate` is **not** the
++choke point every UI string passes through: `src/ui/grid.rs:495`,
++`src/ui/attach.rs:231`/`:241` (`short_path(&s.dir)` — the entire title in
++the disconnected branch), and `src/ui/board.rs:189` reach
++`Span::render_ref` without going through `truncate` at all, and a POSIX
++directory name may legally contain `0x1b` (only `/` and NUL are
++forbidden on POSIX filesystems). This is the same injection class as
++Finding 1/Important 2, reached through a different, pre-existing route
++that predates this branch — not something introduced by any commit in
++this task. Recording it here per instruction; not investigated further
++and no code touched for it, since scope for this item belongs to the
++final review, not this task.
++
++### Concerns
++
++None. Both minors are closed with tests confirmed to discriminate in both
++directions (fails fast on the bug, passes deterministically without it),
++not just argued to.
+diff --git a/src/session.rs b/src/session.rs
+index 689bc24..0f3c144 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -1611,20 +1611,37 @@ mod tests {
+         }
+     }
+ 
+     struct DeadBackend;
+     impl crate::llm::Backend for DeadBackend {
+         fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+             Err(crate::llm::LlmError::Unavailable)
+         }
+     }
+ 
++    /// 跟 `FixedBackend` 一样答得出名字，多做一件事：`complete()` 被调用
++    /// 的那一刻往 channel 里发一个信号。`complete_with_timeout`
++    /// （`llm/mod.rs`）会在**它自己另开的一个线程**里同步调用
++    /// `Backend::complete`，所以收到这个信号就是「`request_name` 真的
++    /// 走到了模型这一步」唯一站得住脚的证据——不是靠猜多久之后 `tag`
++    /// 应该变了没变。
++    struct SignalingBackend {
++        name: String,
++        called: std::sync::mpsc::Sender<()>,
++    }
++    impl crate::llm::Backend for SignalingBackend {
++        fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
++            let _ = self.called.send(());
++            Ok(self.name.clone())
++        }
++    }
++
+     /// 起名的正路：干完一轮活，名字就出来了。
+     #[test]
+     fn a_session_gets_named_after_its_first_round_of_work() {
+         let repo = init_repo();
+         let m = SessionManager::new();
+         m.register_profile(finishing_agent());
+         m.set_backend(Some(Arc::new(FixedBackend("「修登录白屏」。".into()))));
+         let id = m
+             .create(repo.path(), "finishing", empty_secrets(), &[])
+             .unwrap();
+@@ -1897,37 +1914,66 @@ mod tests {
+         }
+         // 这一轮的兜底是空白，`request_name` 是在这次 tick 里同步写的
+         // （见它自己的文档），所以状态一到 Idle 就已经有答案：`tag`
+         // 应该还是看不见的空串。
+         assert_eq!(
+             m.list().iter().find(|s| s.id == id).unwrap().tag,
+             "",
+             "空白兜底不该产出一个看不见但非空的 tag"
+         );
+ 
+-        // 换一个答得出名字的后端，再逼一次 Working → Idle：`send_input`
+-        // 的空串分支会无条件把状态同步置回 Working（不管屏幕内容），
+-        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。如果
+-        // `name_attempted` 没有真正挡住重复触发，这个后端会在几轮之内
+-        // 把 tag 改写成「真实名字」。
+-        m.set_backend(Some(Arc::new(FixedBackend("真实名字".into()))));
++        // 换一个答得出名字、但会在被真正调用时发信号的后端，再逼一次
++        // Working → Idle：`send_input` 的空串分支会无条件把状态同步置回
++        // Working（不管屏幕内容），"READY" 还留在屏幕上，下一次 tick 就
++        // 会再判一次 Idle。
++        let (called_tx, called_rx) = std::sync::mpsc::channel();
++        m.set_backend(Some(Arc::new(SignalingBackend {
++            name: "真实名字".into(),
++            called: called_tx,
++        })));
+         m.send_input(id, "").unwrap();
+ 
+-        for _ in 0..10 {
++        // 触发（如果 `name_attempted` 没挡住的话）第二次 Working → Idle。
++        // 这几次 `tick()` 全是同步调用——`request_name` 会不会被**触发**
++        // 在 `tick()` 内部就已经决定好了，不需要真实时间流逝，用不着
++        // sleep。
++        for _ in 0..5 {
+             m.tick();
+-            assert_eq!(
+-                m.list().iter().find(|s| s.id == id).unwrap().tag,
+-                "",
+-                "name_attempted 该挡住第二次 request_name，这个会话不该再起出名字"
+-            );
+-            sleep(Duration::from_millis(30));
+         }
++
++        // 用 channel 而不是「等一会儿再看 tag 变没变」判定：旧版本的这条
++        // 测试是十次 `tick()` + 30ms sleep 各自断言 `tag == ""`，负载重的
++        // 时候后台线程可能没能在这固定 ~300ms 的预算里落地，测试因为
++        // 错误的原因侥幸通过——那正是这一整个分支被打回的病根（真正
++        // 「判别力强」的测试要能稳定地红，不能只是偶尔红）。
++        //
++        // `recv_timeout` 反过来用：`complete()` 一旦真被调用，
++        // `SignalingBackend` 会几乎瞬间发信号（纯内存操作，没有网络
++        // 延迟），5 秒给的是巨大的余量——如果 bug 真的在，信号早就该到了；
++        // 如果 `name_attempted` 生效，信号**永远不会来**，超时本身就是
++        // 这条测试要的证据，不是「等的时间不够长」。跟其余测试等一个
++        // *会*发生的事件时用的 5 秒 deadline 是同一个量级，这里等的是
++        // 「确认它不发生」。
++        match called_rx.recv_timeout(Duration::from_secs(5)) {
++            Ok(()) => panic!(
++                "name_attempted 没有挡住第二次 request_name：\
++                 后端的 complete() 被再次调用了"
++            ),
++            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
++            Err(e) => panic!("channel 出了意外：{e:?}"),
++        }
++
++        assert_eq!(
++            m.list().iter().find(|s| s.id == id).unwrap().tag,
++            "",
++            "既然没有第二次 request_name，tag 也不该变"
++        );
+     }
+ 
+     /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
+     /// 起名。这个场景里 `was == SessionState::Working` 和
+     /// `!s.first_input.is_empty()` 两道判断**都**能单独拦住误触发（这里
+     /// 从没送过输入，first_input 全程是空的，跟
+     /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
+     /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
+     /// `name_attempted` 那道「只起一次」的门槛在误触发场景下反而是帮凶——
+     /// 如果 Failed → Idle 被当成起名时机，它会拿这时候还空着的
+diff --git a/src/ui/board.rs b/src/ui/board.rs
+index 16249b7..29bb814 100644
+--- a/src/ui/board.rs
++++ b/src/ui/board.rs
+@@ -290,38 +290,52 @@ mod tests {
+     /// 看板列表项走的是 `Span::raw` → `List`/`ListItem` → `Line` →
+     /// `Span::render_ref`（`board.rs:211`），跟 `Buffer::set_stringn`/
+     /// `Paragraph` 不是同一条路，后两者会过滤控制字符，前者不会
+     /// （细节见 `fix-1-brief.md`）。`screen_text` 只过滤空白字符，
+     /// 控制字符如果真的穿透渲染，会原样出现在它的输出里。
+     ///
+     /// **界面侧的防线在 `widgets::truncate` 里**，不在这个测试文件——
+     /// `board.rs:211` 那句 `truncate(session_label(s), 15)` 会先经过
+     /// `truncate`，控制字符在那一层就被丢弃了（细节和为什么选那一层，
+     /// 见 `truncate` 自己的文档、`fix-1-report.md` 的 Important 2）。
++    ///
++    /// **两条断言缺一不可**：只断言「控制字符不在」测不出「这一行到底
++    /// 有没有画」——如果哪天改动让这个会话整行都不渲染了、或者
++    /// `session_label`/`tag` 干脆不再画出来，控制字符自然也不在
++    /// `screen_text` 里，这条测试会**假装通过**，其实什么都没验证到。
++    /// 第二条断言钉住「标签洗完之后剩下的那部分文字确实上了屏幕」——
++    /// `truncate("\x1b[Afix\x7f", 15)` 丢掉 `ESC` 和 `DEL` 之后剩下
++    /// `"[Afix"`（`[` 和 `A` 是转义序列里的普通可打印字符，`truncate`
++    /// 不做整条转义序列的识别，只逐字符丢控制字节，见它自己的文档）。
++    /// 两条assert 合起来才是「标签画出来了，而且是干净的」。
+     #[test]
+     fn a_tag_with_control_bytes_never_reaches_the_rendered_buffer() {
+         let (mut app, dir) = App::test_app();
+         let proj = real_dir(&dir, "proj");
+         let mut s = sess(1, &proj);
+         // 上箭头的转义序列 + 一个字面的退格字节，模拟 fix-1-brief 里
+         // 描述的、一个没洗过 tag 的旧守护进程会发过来的东西。
+         s.tag = "\x1b[Afix\x7f".into();
+         app.set_sessions(vec![s]);
+ 
+         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+ 
+         let c = screen_text(&term);
+         assert!(
+             !c.chars().any(|ch| ch.is_control()),
+             "控制字符穿透渲染，落进了 buffer：{c:?}"
+         );
++        assert!(
++            c.contains("[Afix"),
++            "标签清洗剩下的可见部分应该照样画在屏幕上，不能连内容一起被吞掉：{c:?}"
++        );
+     }
+ 
+     /// 用户报的症状一：底栏写着「当前项目：dc-terminal」，看板却列着
+     /// dc_desktop 的会话。答案不再是「把别的项目藏起来」，而是**分组**：
+     /// 两个项目都在屏幕上，各自的会话待在自己的组头底下，谁属于谁一眼可见。
+     #[test]
+     fn the_board_groups_every_session_under_its_own_project() {
+         let (mut app, dir) = App::test_app();
+         // 组头上的 agent 统计只在目录真的还在时才画（不在就换成
+         // 「目录不在了」），所以这两个项目必须是磁盘上真实存在的目录。

@@ -1,0 +1,248 @@
+# Review package: 74f40d8..1e6a1b2
+
+## Commits
+1e6a1b2 fix: copy-mode hint degrades to a short form on narrow terminals
+
+## Files changed
+ src/i18n.rs   | 33 ++++++++++++++++++++++++++++++++-
+ src/ui/mod.rs | 42 ++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 72 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index f08c2a1..be3b37c 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -185,20 +185,23 @@ pub enum Key {
+     AllSessionsStopped,
+     WindowTooSmall,
+     Verifying,
+     PasteOrTypeKey,
+     NoOtherRunningSession,
+     NoSessionSelected,
+     DaemonUnreachable,
+     StaleData,
+     /// 复制模式下顶掉整条底栏右段的提示
+     CopyMode,
++    /// 同上，但给放不下长文案的窄终端用——必须放进 `ui::ACTION_MIN_COLS`，
++    /// 因为这是全屏唯一写着 F4（怎么退出复制模式）的地方，容不下被静默截断。
++    CopyModeShort,
+     // —— 会话状态（看板与九宫格的状态列）——
+     // —— dct ps / dct stop（普通终端里用，不开界面）——
+     NoDaemonRunning,
+     NoSessionsRunning,
+     NothingToPrune,
+     StatusWorking,
+     StatusAsking,
+     StatusIdle,
+     StatusStopped,
+     StatusFailed,
+@@ -527,20 +530,26 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+             lang,
+             en: "Cannot reach the dct service — what you see may be out of date",
+             zh: "守护进程连不上，界面数据可能已过期",
+         ),
+ 
+         CopyMode => t!(
+             lang,
+             en: "Copy mode · mouse released · F4 exits",
+             zh: "复制模式 · 鼠标已交还终端 · F4 退出"
+         ),
++
++        CopyModeShort => t!(
++            lang,
++            en: "Copy mode · F4 exits",
++            zh: "复制模式 · F4 退出"
++        ),
+     }
+ }
+ 
+ /// 底栏和「全部按键」浮层里的一条提示：**键名和说明分开存**。
+ ///
+ /// 分开不是为了好看：键名要加粗（加粗是 `Span` 一级的事），拼成一整个
+ /// 字符串之后再想切回来，只能靠猜哪个空格是分隔符——而 `Ctrl+C 打断`、
+ /// `方向键选格子`、`其余按键都发给 agent` 各有各的形状，猜不准就会加粗到
+ /// 说明的头一个词上去。
+ ///
+@@ -1265,20 +1274,21 @@ mod tests {
+             // 另一种空态用的那一条，跟刚加的 NoSessionsRunningPressN 挨着。
+             AllSessionsStopped,
+             WindowTooSmall,
+             Verifying,
+             PasteOrTypeKey,
+             NoOtherRunningSession,
+             NoSessionSelected,
+             DaemonUnreachable,
+             StaleData,
+             CopyMode,
++            CopyModeShort,
+             NoDaemonRunning,
+             NoSessionsRunning,
+             NothingToPrune,
+             StatusWorking,
+             StatusAsking,
+             StatusIdle,
+             StatusStopped,
+             StatusUnknown,
+             SecretsTitle,
+             SecretSet,
+@@ -1333,28 +1343,49 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 97, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
++    /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
++    /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
++    /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
++    /// 用户就会卡在一个看不见也出不去的模式里，跟 `ESCAPE_HINT_COLS` 那条
++    /// 守卫（`src/ui/mod.rs` 的 `escape_hint_cols_fits_every_view`）防的是
++    /// 同一类事故。
++    #[test]
++    fn copy_mode_short_fits_the_action_floor_in_every_language() {
++        use unicode_width::UnicodeWidthStr;
++
++        for l in Lang::all() {
++            let short = text(Key::CopyModeShort, *l);
++            assert!(
++                short.width() <= crate::ui::ACTION_MIN_COLS as usize,
++                "{l:?} 下复制模式的短文案「{short}」宽 {} 列，放不进 ACTION_MIN_COLS = {}",
++                short.width(),
++                crate::ui::ACTION_MIN_COLS
++            );
++        }
++    }
++
+     /// 每一个错误码在两种语言下都要组得出话，而且英文里不许有汉字。
+     /// 这是 daemon 侧文案唯一的落点——漏一条，用户就会在英文界面上
+     /// 看到一句中文，而且没有任何编译期信号。
+     #[test]
+     fn every_error_code_composes_in_both_languages() {
+         use crate::proto::ErrorCode::*;
+         let codes = [
+             NoSuchProfile("kimi".into()),
+             DirNotFound("/w/a".into()),
+             NotAGitRepo("/w/a".into()),
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 1d94f0b..ad34721 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -1878,21 +1878,25 @@ const ESCAPE_HINT_COLS: u16 = 19;
+ const PROJECT_COLS: u16 = 16;
+ 
+ /// 右段无论如何要留的列数。
+ ///
+ /// 28 = 英文那条滚动提示的完整宽度（`i18n::msg::scrolled_up`，
+ /// "↑ Scrolled up 40 line(s) · press End to jump back down" 缩短之后的版本）。
+ /// 它是右段里唯一「少一个字就没法用」的内容：按键表放不下的键在 `?` 后面
+ /// 找得回来，普通消息还能折行，只有这一句既折不了（整句都是单空格，
+ /// `wrap_help` 只认双空格断点）又必须读全——用户正翻在历史里，这句话是他
+ /// 回到底部的唯一说明。由 `the_way_back_survives_a_narrow_terminal` 盯着。
+-const ACTION_MIN_COLS: u16 = 28;
++///
++/// `pub(crate)`：`i18n.rs` 里 `CopyModeShort` 的守卫测试也要拿它当基准——
++/// 复制模式提示是右段另一条「少一个字就没法用」的内容（全屏唯一写着 F4
++/// 的地方），短文案必须放得进这同一条底线。
++pub(crate) const ACTION_MIN_COLS: u16 = 28;
+ 
+ /// 底栏三段各占多少列（`inner` 是去掉左右边框之后的可用宽度）。
+ ///
+ /// 抽成纯函数是因为这个数要用两遍：一遍算「右段折出几行」（底栏高度按它留），
+ /// 一遍真的切布局。两处各算一次的话，宽度算法一旦分叉，留的行和画的行就对
+ /// 不上，句尾会被静默吃掉。
+ ///
+ /// 让位顺序是**中段先让、左段永不让**：左段是用户卡住时唯一的出路，右段至少
+ /// 得留下那扇 `?` 门。注意这里让的是**终端太窄**，跟「消息/断连提示能不能盖
+ /// 掉中段」是两码事——后者的答案永远是不能，那件事由布局本身保证：消息只画
+@@ -1930,21 +1934,32 @@ fn draw(f: &mut Frame, app: &mut App) {
+         )
+     } else if app.message.text.is_empty() {
+         // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
+         // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
+         // 只在 `message` 为空这一支里问它：`message` 优先在外层 if/else
+         // 链上已经保证了（见函数头注释），这里不用重复判断。
+         // 复制模式压过滚动提示：这时候滚轮根本不归 dct 管，那条提示是错的。
+         // 压不过错误消息——外层 if/else 链已经保证了这一点。
+         let hint = match &app.view {
+             View::Attached(_) if app.copy_mode => {
+-                Some(crate::i18n::text(crate::i18n::Key::CopyMode, app.lang).to_string())
++                // 底栏右段只保证 ACTION_MIN_COLS 列，而这条提示是全屏唯一
++                // 写着 F4 的地方——截掉尾巴等于把用户关在一个看不见也出不去
++                // 的模式里。长文案说清楚「为什么」（鼠标交还给了终端），量
++                // 得下就用；量不下换成放得进 ACTION_MIN_COLS 的短文案，两种
++                // 语言都保证放得下（`copy_mode_short_fits_the_action_floor_in_every_language`）。
++                let long = crate::i18n::text(crate::i18n::Key::CopyMode, app.lang);
++                let chosen = if widgets::display_width(long) <= help_cols {
++                    long
++                } else {
++                    crate::i18n::text(crate::i18n::Key::CopyModeShort, app.lang)
++                };
++                Some(chosen.to_string())
+             }
+             View::Attached(_) => attach::scroll_hint(&app.scroll, app.lang),
+             _ => None,
+         };
+         match hint {
+             Some(h) => (BarContent::Text(h), Style::default()),
+             None => (BarContent::Keys(bar_keys(app, help_cols)), Style::default()),
+         }
+     } else if app.message.error {
+         (
+@@ -3810,20 +3825,43 @@ mod tests {
+ 
+             let bar = bar_text(&term);
+             let hint = crate::i18n::text(crate::i18n::Key::CopyMode, lang);
+             assert!(
+                 bar.contains(&hint.replace(' ', "")),
+                 "{lang:?} 在 80 列下要完整显示复制模式提示，不能被切掉尾巴：{bar}"
+             );
+         }
+     }
+ 
++    /// 60 是 `grid::MIN_COLS`，一个受支持的宽度、也是常见的 tmux 分屏宽度。
++    /// 这里右段只剩 `ACTION_MIN_COLS`（28）列，长文案放不下，必须换成短文案
++    /// ——而短文案本身也必须完整出现，不能被 `Paragraph` 悄悄切掉尾巴。
++    #[test]
++    fn copy_mode_short_hint_survives_sixty_columns_in_both_languages() {
++        use ratatui::backend::TestBackend;
++
++        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
++            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
++            app.lang = lang;
++            app.copy_mode = true;
++            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
++            term.draw(|f| draw(f, &mut app)).unwrap();
++
++            let bar = bar_text(&term);
++            let short = crate::i18n::text(crate::i18n::Key::CopyModeShort, lang);
++            assert!(
++                bar.contains(&short.replace(' ', "")),
++                "{lang:?} 在 60 列下要完整显示复制模式的短文案：{bar}"
++            );
++        }
++    }
++
+     /// F6 回归测试：英文滚动提示走的是 `BarContent::Text`，`wrap_help`
+     /// 只在连续两个空格的地方才折行，而这句提示全是单空格，放不下就不是
+     /// 折行，是被 `Paragraph`（没挂 `.wrap()`）直接从右边截断。原来的
+     /// "↑ Scrolled up 40 line(s) · press End to jump back down" 有 54 列，
+     /// 底栏右段宽度是「终端总宽 − 23」，55 列的终端只有 32 列可用——刚好
+     /// 卡在「怎么回去」那半句中间，`End` 整个词被截没了：这个宽度算出的
+     /// 切点（`old[:32]`）落在 "press " 之后、"End" 之前，用户会看到自己
+     /// 正翻着历史，却读不到任何一个字告诉他怎么回去。缩短后的新版本
+     /// （28 列）在同样的宽度下完整放得下。
+     #[test]

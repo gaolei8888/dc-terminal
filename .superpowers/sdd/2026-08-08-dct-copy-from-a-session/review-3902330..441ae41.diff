@@ -1,0 +1,202 @@
+# Review package: 3902330..441ae41
+
+## Commits
+441ae41 feat: only grab the mouse when the agent actually asked for it
+
+## Files changed
+ src/ui/app.rs |  8 +++++++
+ src/ui/mod.rs | 75 +++++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 79 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 28d35a7..729c8c9 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -116,20 +116,27 @@ pub struct App {
+     /// 视图每 16ms 跑一轮；没有这份缓存的话，`run()` 会在**每一帧**都重发
+     /// `Request::Explanation`、重写一次 `app.message`——哪怕答案没变。
+     /// 别的地方（粘贴失败、Ctrl+C 打断……）在两帧之间设的消息，下一帧就被
+     /// 这句话原样盖掉，用户永远看不见。有了缓存，`app.message` 只在**第一次
+     /// 拿到答案的那一帧**被赋值一次，之后这个会话不再触碰它。
+     ///
+     /// 离开 `Failed`（哪怕只是这一帧的 `Screen` 还没追上）就把它忘掉：
+     /// 见 `mod.rs::run` 里配对的清空分支——这样同一个会话「恢复了、又坏了」
+     /// 会被当成一次新的失败重新问一遍，不会一直顶着上一次的旧话。
+     pub(crate) explained_failure: Option<(u32, String)>,
++    /// 用户按 `F4` 打开的复制模式：**临时**把鼠标交还给终端，好让人用
++    /// 终端自己的拖选去复制。
++    ///
++    /// 它是「此刻正在复制」的临时状态，不是配置——离开会话一律复位
++    /// （见 `attach::handle_key`）。跨会话粘着的话，用户会在另一个会话里
++    /// 发现鼠标莫名其妙不归 agent 管，而屏幕上没有任何东西解释为什么。
++    pub copy_mode: bool,
+ }
+ 
+ impl App {
+     /// 两个构造函数共用的字段初值——除了 `client` 之外的每一项，`new` 和
+     /// `new_disconnected` 必须给出完全一样的答案。拆出来是因为一旦两份
+     /// 分开抄，改 `new` 忘了同步改测试用的那份，测试就会在悄悄测一个跟
+     /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
+     /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
+     fn new_inner(
+         client: Option<Client>,
+@@ -166,20 +173,21 @@ impl App {
+             // 每轮循环开头的 List 调用是唯一的真相来源，它总在当次
+             // term.draw 之前重新算一遍，所以这里给什么都会被立刻覆盖。
+             connected: true,
+             need_sessions: true,
+             verify_rx: None,
+             lang,
+             socket,
+             start_dir: default_dir,
+             quit: false,
+             explained_failure: None,
++            copy_mode: false,
+         }
+     }
+ 
+     pub fn new(
+         client: Client,
+         default_dir: PathBuf,
+         lang: crate::i18n::Lang,
+         socket: PathBuf,
+         view_mode: super::view::ViewMode,
+     ) -> App {
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 227b19a..1e3c5cc 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -102,20 +102,33 @@ fn restore_terminal() {
+ /// 走终端自己的选中逻辑而不是这套协议，漏关会让用户退回看板之后连
+ /// 拖选文字复制都做不了。
+ fn mouse_capture_transition(was_attached: bool, is_attached: bool) -> Option<bool> {
+     if was_attached == is_attached {
+         None
+     } else {
+         Some(is_attached)
+     }
+ }
+ 
++/// 这一帧该不该抓鼠标。三个条件全真才抓。
++///
++/// 抽成纯函数的理由同 `mouse_capture_transition`：副作用（往 stdout 写转义
++/// 序列）没法单测，判断能测——而且判断错了两个方向都难受：漏关，用户在会话里
++/// 连拖选复制都做不了；漏开，agent 收不到它明明订阅了的鼠标事件。
++///
++/// `agent_subscribed` 来自 `App.scroll.agent_owns`，**不新开一条判据**。
++/// 那个字段的语义就是「agent 自己攥着鼠标」，跟这里问的是同一个事实；
++/// 各读各的，迟早会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
++fn wants_mouse_capture(attached: bool, agent_subscribed: bool, copy_mode: bool) -> bool {
++    attached && agent_subscribed && !copy_mode
++}
++
+ /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
+ /// mode / alternate screen；`run()` 的主循环里到处都是 `?`，一旦某次
+ /// `client.call`/`term.draw` 出错就会直接从函数返回，跳过写在循环末尾的清理代码，
+ /// 把用户的终端卡在 raw mode（回显、行缓冲全关）。这个 guard 保证不管是提前
+ /// `return`/`?`、正常 `break`，还是 panic 展开，`Drop` 都会跑一次。
+ ///
+ /// 它盖不住的只剩信号——那条交给 `spawn_signal_restore`。
+ struct TerminalGuard;
+ 
+ impl Drop for TerminalGuard {
+@@ -545,28 +558,34 @@ pub fn run(
+                         // 这个会话不再是 Failed 了（恢复了）：把缓存忘掉。
+                         // 不忘的话，它下次再坏，`already_have` 会一直是
+                         // true，新的一次失败永远问不出新的解释。
+                         app.explained_failure = None;
+                     }
+                 }
+                 _ => app.connected = false,
+             }
+         }
+ 
+-        // 检查一次「在不在会话里」有没有变，而不是在每个能进/出 `View::Attached`
+-        // 的分支各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
++        // 抓不抓鼠标不再只看「在不在会话里」：agent 没订阅鼠标的会话
++        // （codex、shell）里抓着它，唯一的效果是把终端的拖选复制废掉，
++        // 换来一个 PageUp/PageDown/End 已经能做的滚轮。
++        //
++        // 检查一次三个条件的合取有没有变，而不是在每个能改变它们的分支
++        // 各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
+         // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
+         // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
+         // 会话已结束……）到这里都已经跑完，此刻的 `app.view` 就是即将画出来
+-        // 的那一帧。
++        // 的那一帧；而且这一轮的 `Screen` 响应已经落进 `app.scroll` 了，
++        // `agent_owns` 就是这一帧的事实。
+         let is_attached = matches!(app.view, View::Attached(_));
+-        if let Some(enable) = mouse_capture_transition(mouse_captured, is_attached) {
++        let want = wants_mouse_capture(is_attached, app.scroll.agent_owns, app.copy_mode);
++        if let Some(enable) = mouse_capture_transition(mouse_captured, want) {
+             let _ = if enable {
+                 execute!(std::io::stdout(), EnableMouseCapture)
+             } else {
+                 execute!(std::io::stdout(), DisableMouseCapture)
+             };
+             mouse_captured = enable;
+         }
+ 
+         term.draw(|f| draw(f, &mut app))?;
+ 
+@@ -3681,11 +3700,59 @@ mod tests {
+     /// 动一下捕获」这个判断能测——`run()` 每帧都靠它决定要不要发
+     /// `EnableMouseCapture`/`DisableMouseCapture`，判断错了要么漏开
+     /// （滚轮/点击走了终端自己的逻辑）要么漏关（退回看板还拖选不了文字）。
+     #[test]
+     fn mouse_capture_toggles_only_on_a_real_transition() {
+         assert_eq!(mouse_capture_transition(false, false), None);
+         assert_eq!(mouse_capture_transition(true, true), None);
+         assert_eq!(mouse_capture_transition(false, true), Some(true));
+         assert_eq!(mouse_capture_transition(true, false), Some(false));
+     }
++
++    /// 三个条件的真值表，八种组合全列。
++    ///
++    /// 穷举而不是挑几个代表：这个函数错一格的后果是「用户在会话里复制不了」
++    /// 或者「agent 收不到它订阅的鼠标」，两种都不会 panic、不会报错，只会让人
++    /// 觉得工具坏了却说不清哪儿坏。八行断言比一句「应该没问题」便宜得多。
++    #[test]
++    fn mouse_is_captured_only_when_all_three_conditions_hold() {
++        // attached, agent_subscribed, copy_mode -> want
++        assert!(wants_mouse_capture(true, true, false));
++        assert!(!wants_mouse_capture(true, true, true), "复制模式一票否决");
++        assert!(
++            !wants_mouse_capture(true, false, false),
++            "agent 不要鼠标就别抓——抓了用户就白白丢了拖选复制"
++        );
++        assert!(!wants_mouse_capture(true, false, true));
++        assert!(!wants_mouse_capture(false, true, false), "看板上永远不抓");
++        assert!(!wants_mouse_capture(false, true, true));
++        assert!(!wants_mouse_capture(false, false, false));
++        assert!(!wants_mouse_capture(false, false, true));
++    }
++
++    /// 断连时 `Screen` 拉不到，`app.scroll` 保持上一帧的值，所以捕获状态不该翻转。
++    /// 翻转要往 stdout 写转义序列，断连时反复翻转是最吵的一种失败。
++    #[test]
++    fn a_failed_screen_call_does_not_flip_the_capture_state() {
++        let (mut app, _d) = App::test_app();
++        app.view = View::Attached(1);
++        app.scroll = crate::session::ScrollState {
++            agent_owns: true,
++            ..Default::default()
++        };
++        let before = wants_mouse_capture(true, app.scroll.agent_owns, app.copy_mode);
++
++        // 一次失败的 Screen 调用不会碰 app.scroll
++        app.connected = false;
++
++        assert_eq!(
++            wants_mouse_capture(true, app.scroll.agent_owns, app.copy_mode),
++            before
++        );
++    }
++
++    #[test]
++    fn a_fresh_app_is_not_in_copy_mode() {
++        let (app, _d) = App::test_app();
++        assert!(!app.copy_mode);
++    }
+ }

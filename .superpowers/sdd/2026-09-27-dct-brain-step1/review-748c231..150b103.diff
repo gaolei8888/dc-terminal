@@ -1,0 +1,639 @@
+# Review package: 748c231..HEAD
+
+## Commits
+150b103 feat(keys): an automatic key and a Touch ID key in the Mac's Secure Enclave
+
+## Files changed
+ Cargo.lock                   |   1 +
+ Cargo.toml                   |   1 +
+ build.rs                     |  43 +++++++
+ crates/dct-brain/src/sign.rs |   6 +
+ src/keys/mac.rs              |  53 ++++++++
+ src/keys/mod.rs              | 300 +++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs                   |   1 +
+ src/main.rs                  |   1 +
+ swift/Keys.swift             |  66 ++++++++++
+ 9 files changed, 472 insertions(+)
+
+## Diff
+diff --git a/Cargo.lock b/Cargo.lock
+index d429f58..d8a3b3e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -328,20 +328,21 @@ dependencies = [
+  "darling_core",
+  "quote",
+  "syn 2.0.119",
+ ]
+ 
+ [[package]]
+ name = "dct"
+ version = "0.2.18"
+ dependencies = [
+  "anyhow",
++ "base64",
+  "crossterm",
+  "dct-brain",
+  "dct-link",
+  "dct-page",
+  "flate2",
+  "getrandom 0.2.17",
+  "libc",
+  "portable-pty",
+  "qrcode",
+  "ratatui",
+diff --git a/Cargo.toml b/Cargo.toml
+index e8cb85b..7ff02d5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,20 +6,21 @@
+ members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain"]
+ 
+ [package]
+ name = "dct"
+ version = "0.2.18"
+ edition = "2021"
+ license = "MIT"
+ 
+ [dependencies]
+ anyhow = "1"
++base64 = "0.22"
+ # 跟中转服务共用的信封。`dct` 和 `dct-srv` 谁也不依赖谁，共同依赖这个。
+ dct-link = { path = "crates/dct-link" }
+ # 手机端那一页网页。放在共享 crate 里是因为中转也要发同一份——见那边的注释。
+ dct-page = { path = "crates/dct-page" }
+ # 定档、执行票、签名核对。dct 和 dco 的安卓 App 共用，只写一份——见 crates/dct-brain 的模块说明。
+ dct-brain = { path = "crates/dct-brain" }
+ regex = "1"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ toml = "0.8"
+diff --git a/build.rs b/build.rs
+new file mode 100644
+index 0000000..65e04b3
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,43 @@
++//! 只在 macOS 上把 swift/*.swift 编成静态库链进 dct：安全芯片只能从 CryptoKit 用。
++//! 别的平台什么都不做——Windows、Linux 的构建不需要 Swift，也不该需要。
++use std::{env, path::PathBuf, process::Command};
++
++fn main() {
++    println!("cargo:rerun-if-changed=build.rs");
++    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
++        return;
++    }
++    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
++    let arch = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
++        "aarch64" => "arm64",
++        "x86_64" => "x86_64",
++        a => panic!("unsupported arch {a}"),
++    };
++    let mut sources: Vec<PathBuf> = std::fs::read_dir("swift")
++        .unwrap()
++        .map(|e| e.unwrap().path())
++        .filter(|p| p.extension().is_some_and(|e| e == "swift"))
++        .collect();
++    sources.sort();
++    println!("cargo:rerun-if-changed=swift");
++    for s in &sources {
++        println!("cargo:rerun-if-changed={}", s.display());
++    }
++    let lib = out.join("libDctMac.a");
++    let status = Command::new("xcrun")
++        .args(["swiftc", "-parse-as-library", "-emit-library", "-static", "-module-name", "DctMac", "-swift-version", "5", "-O"])
++        .args(["-target", &format!("{arch}-apple-macos13.0"), "-o"])
++        .arg(&lib)
++        .args(&sources)
++        .status()
++        .expect("run xcrun swiftc");
++    assert!(status.success(), "swiftc failed");
++    println!("cargo:rustc-link-search=native={}", out.display());
++    println!("cargo:rustc-link-lib=static=DctMac");
++    let sdk = Command::new("xcrun").args(["--show-sdk-path"]).output().expect("xcrun --show-sdk-path").stdout;
++    println!("cargo:rustc-link-search=native={}/usr/lib/swift", String::from_utf8(sdk).unwrap().trim());
++    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
++    for f in ["CryptoKit", "Foundation", "LocalAuthentication", "Security"] {
++        println!("cargo:rustc-link-lib=framework={f}");
++    }
++}
+diff --git a/crates/dct-brain/src/sign.rs b/crates/dct-brain/src/sign.rs
+index e8dd17e..0c7c07c 100644
+--- a/crates/dct-brain/src/sign.rs
++++ b/crates/dct-brain/src/sign.rs
+@@ -203,20 +203,26 @@ pub fn verify(st: &SignedTicket, trusted: &[TrustedKey], device: &str, now: u64)
+             batch_bytes(list)
+         }
+     };
+     let role = verify_sig(&st.signature, &msg, trusted)?;
+     if !role_may_sign(t.tier, role) {
+         return Err(VerifyError::WrongRole { need: SignerRole::User });
+     }
+     Ok(())
+ }
+ 
++/// 测试用：对任意消息签一个 `Signature`，好在 crate 外面验证 `Signer` 的实现。
++#[cfg(any(test, feature = "soft-signer"))]
++pub fn make_signature_for_tests(s: &dyn Signer, msg: &[u8]) -> Signature {
++    make_signature(s, msg, "").expect("sign")
++}
++
+ /// 软件钥匙：只给测试用，冒充安全芯片。正式构建里没有这个模块。
+ #[cfg(any(test, feature = "soft-signer"))]
+ pub mod soft {
+     use super::*;
+     use p256::ecdsa::{signature::Signer as _, SigningKey};
+ 
+     pub struct SoftSigner {
+         role: SignerRole,
+         key: SigningKey,
+     }
+diff --git a/src/keys/mac.rs b/src/keys/mac.rs
+new file mode 100644
+index 0000000..cc6992f
+--- /dev/null
++++ b/src/keys/mac.rs
+@@ -0,0 +1,53 @@
++//! swift/Keys.swift 的绑定。Swift 的 `Int` 是 64 位有符号，对应 `isize`。
++use dct_brain::sign::SignError;
++use std::ffi::CString;
++use std::os::raw::c_char;
++
++extern "C" {
++    fn dct_se_available() -> bool;
++    fn dct_se_create(biometric: bool, blob_out: *mut u8, blob_cap: isize, blob_len: *mut isize, pub_out: *mut u8) -> i32;
++    fn dct_se_sign(blob: *const u8, blob_len: isize, msg: *const u8, msg_len: isize, reason: *const c_char, sig_out: *mut u8) -> i32;
++}
++
++fn status(code: i32) -> SignError {
++    match code {
++        1 => SignError::Unavailable,
++        3 => SignError::Cancelled,
++        2 => SignError::Other("钥匙文件不对，可能是从别的电脑拷来的".into()),
++        4 => SignError::Other("钥匙太大".into()),
++        c => SignError::Other(format!("安全芯片返回 {c}")),
++    }
++}
++
++pub struct MacEnclave;
++
++impl super::SecureEnclave for MacEnclave {
++    fn available(&self) -> bool {
++        unsafe { dct_se_available() }
++    }
++
++    fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
++        let mut blob = vec![0u8; 1024];
++        let mut len: isize = 0;
++        let mut public = [0u8; 65];
++        let rc = unsafe { dct_se_create(biometric, blob.as_mut_ptr(), blob.len() as isize, &mut len, public.as_mut_ptr()) };
++        if rc != 0 {
++            return Err(status(rc));
++        }
++        blob.truncate(len as usize);
++        Ok((blob, public))
++    }
++
++    fn sign(&self, blob: &[u8], msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
++        // 人话里不该有 NUL；有就去掉，别让整次签名失败。
++        let reason = CString::new(reason.replace('\0', "")).unwrap();
++        let mut sig = [0u8; 64];
++        let rc = unsafe {
++            dct_se_sign(blob.as_ptr(), blob.len() as isize, msg.as_ptr(), msg.len() as isize, reason.as_ptr(), sig.as_mut_ptr())
++        };
++        if rc != 0 {
++            return Err(status(rc));
++        }
++        Ok(sig)
++    }
++}
+diff --git a/src/keys/mod.rs b/src/keys/mod.rs
+new file mode 100644
+index 0000000..e537566
+--- /dev/null
++++ b/src/keys/mod.rs
+@@ -0,0 +1,300 @@
++//! dct 的两把钥匙（设计第 2 节）：自动钥匙签 `self` / `physical`，用户钥匙签
++//! `content` / `money`，每次都要当场按 Touch ID。私钥在 Mac 安全芯片里，磁盘上只有
++//! 安全芯片加密过的「把手」（只有这台 Mac 能用）和公钥。
++use anyhow::{anyhow, Context, Result};
++use base64::{engine::general_purpose::STANDARD, Engine as _};
++use dct_brain::sign::{key_id, SignError, Signer, TrustedKey};
++use dct_brain::tier::SignerRole;
++use serde::{Deserialize, Serialize};
++use std::io::Write;
++use std::path::PathBuf;
++
++#[cfg(target_os = "macos")]
++mod mac;
++
++/// 安全芯片的三件事。抽出来是为了测试能换成假的——CI 的 Mac 是虚拟机，没有安全芯片。
++pub trait SecureEnclave {
++    fn available(&self) -> bool;
++    /// 建一把新钥匙，返回（把手，SEC1 公钥）。`biometric` 为真时每次签名都要按 Touch ID。
++    fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError>;
++    fn sign(&self, blob: &[u8], msg: &[u8], reason: &str) -> Result<[u8; 64], SignError>;
++}
++
++#[cfg(not(target_os = "macos"))]
++struct NoEnclave;
++
++#[cfg(not(target_os = "macos"))]
++impl SecureEnclave for NoEnclave {
++    fn available(&self) -> bool {
++        false
++    }
++    fn create(&self, _: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
++        Err(SignError::Unavailable)
++    }
++    fn sign(&self, _: &[u8], _: &[u8], _: &str) -> Result<[u8; 64], SignError> {
++        Err(SignError::Unavailable)
++    }
++}
++
++/// 这台机器上的安全芯片。没有 passkey 的平台上，对外和动钱两档直接关闭，
++/// 不退化成「点一下同意」（控制层设计）。
++pub fn platform_enclave() -> Box<dyn SecureEnclave> {
++    #[cfg(target_os = "macos")]
++    {
++        Box::new(mac::MacEnclave)
++    }
++    #[cfg(not(target_os = "macos"))]
++    {
++        Box::new(NoEnclave)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PublicEntry {
++    pub key_id: String,
++    /// base64 的 SEC1 未压缩公钥。
++    pub public_key: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PublicKeys {
++    pub auto: PublicEntry,
++    pub user: PublicEntry,
++}
++
++pub struct KeyStore {
++    dir: PathBuf,
++}
++
++fn entry(public: &[u8; 65]) -> PublicEntry {
++    PublicEntry { key_id: key_id(public), public_key: STANDARD.encode(public) }
++}
++
++fn decode(e: &PublicEntry) -> Result<[u8; 65]> {
++    let raw = STANDARD.decode(&e.public_key).context("公钥文件坏了")?;
++    raw.try_into().map_err(|_| anyhow!("公钥长度不对"))
++}
++
++impl KeyStore {
++    pub fn at(dir: PathBuf) -> Self {
++        KeyStore { dir }
++    }
++
++    /// `~/.dct/keys`，跟 daemon.sock 同一个目录下。
++    pub fn default_dir() -> PathBuf {
++        crate::proto::socket_path()
++            .parent()
++            .map(|p| p.join("keys"))
++            .unwrap_or_else(|| PathBuf::from("keys"))
++    }
++
++    fn blob_path(&self, role: SignerRole) -> PathBuf {
++        self.dir.join(match role {
++            SignerRole::Auto => "auto.se",
++            SignerRole::User => "user.se",
++        })
++    }
++
++    fn public_path(&self) -> PathBuf {
++        self.dir.join("public.json")
++    }
++
++    pub fn public_keys(&self) -> Result<Option<PublicKeys>> {
++        match std::fs::read(self.public_path()) {
++            Ok(b) => Ok(Some(serde_json::from_slice(&b).context("公钥文件坏了")?)),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(e) => Err(e.into()),
++        }
++    }
++
++    /// 已经有钥匙就原样返回，**不重建**：重建会换公钥，配对过的 dco 就全都不认了。
++    pub fn init(&self, se: &dyn SecureEnclave) -> Result<PublicKeys> {
++        if let Some(k) = self.public_keys()? {
++            return Ok(k);
++        }
++        if !se.available() {
++            return Err(anyhow!("这台电脑没有安全芯片，没法建钥匙"));
++        }
++        std::fs::create_dir_all(&self.dir)?;
++        let mut made = Vec::new();
++        for (role, biometric) in [(SignerRole::Auto, false), (SignerRole::User, true)] {
++            let (blob, public) = se.create(biometric).map_err(|e| anyhow!("{e}"))?;
++            let mut f = crate::sys::fs::create_private(&self.blob_path(role))?;
++            f.write_all(&blob)?;
++            made.push(entry(&public));
++        }
++        let keys = PublicKeys { user: made.pop().unwrap(), auto: made.pop().unwrap() };
++        std::fs::write(self.public_path(), serde_json::to_vec_pretty(&keys)?)?;
++        Ok(keys)
++    }
++
++    /// 两把公钥，给验签用（批准记录、执行票；以后配对 dco 时也交给它）。
++    pub fn trusted(&self) -> Result<Vec<TrustedKey>> {
++        let k = self.public_keys()?.ok_or_else(|| anyhow!("还没建钥匙，先运行 dct keys init"))?;
++        Ok(vec![
++            TrustedKey { role: SignerRole::Auto, public_key: decode(&k.auto)? },
++            TrustedKey { role: SignerRole::User, public_key: decode(&k.user)? },
++        ])
++    }
++
++    pub fn signer<'a>(&self, role: SignerRole, se: &'a dyn SecureEnclave) -> Result<EnclaveSigner<'a>> {
++        let keys = self.public_keys()?.ok_or_else(|| anyhow!("还没建钥匙，先运行 dct keys init"))?;
++        let public = decode(match role {
++            SignerRole::Auto => &keys.auto,
++            SignerRole::User => &keys.user,
++        })?;
++        let blob = std::fs::read(self.blob_path(role)).context("读不到钥匙文件")?;
++        Ok(EnclaveSigner { role, blob, public, se })
++    }
++}
++
++pub struct EnclaveSigner<'a> {
++    role: SignerRole,
++    blob: Vec<u8>,
++    public: [u8; 65],
++    se: &'a dyn SecureEnclave,
++}
++
++impl Signer for EnclaveSigner<'_> {
++    fn role(&self) -> SignerRole {
++        self.role
++    }
++    fn public_key(&self) -> [u8; 65] {
++        self.public
++    }
++    fn sign(&self, msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
++        self.se.sign(&self.blob, msg, reason)
++    }
++}
++
++/// `dct keys init | show | test`。
++pub fn run_cli(args: &[String]) -> i32 {
++    let ks = KeyStore::at(KeyStore::default_dir());
++    let se = platform_enclave();
++    let r = match args.first().map(String::as_str) {
++        Some("init") => ks.init(se.as_ref()).map(|k| {
++            println!("两把钥匙已就绪：\n  自动钥匙 {}\n  指纹钥匙 {}", k.auto.key_id, k.user.key_id);
++        }),
++        Some("show") => ks.public_keys().and_then(|k| {
++            let k = k.ok_or_else(|| anyhow!("还没建钥匙，先运行 dct keys init"))?;
++            println!("{}", serde_json::to_string_pretty(&k)?);
++            Ok(())
++        }),
++        Some("test") => (|| {
++            let s = ks.signer(SignerRole::User, se.as_ref())?;
++            let sig = s
++                .sign(b"dct keys test", "测试：dct 用指纹签一条测试消息")
++                .map_err(|e| anyhow!("{e}"))?;
++            let signature = dct_brain::sign::Signature {
++                key_id: key_id(&s.public_key()),
++                alg: dct_brain::sign::ALG.into(),
++                sig: STANDARD.encode(sig),
++            };
++            dct_brain::sign::verify_sig(&signature, b"dct keys test", &ks.trusted()?)
++                .map_err(|e| anyhow!("{e}"))?;
++            println!("指纹钥匙能用：签名已核对");
++            Ok(())
++        })(),
++        _ => {
++            eprintln!("用法：dct keys init | show | test");
++            return 2;
++        }
++    };
++    match r {
++        Ok(()) => 0,
++        Err(e) => {
++            eprintln!("{e}");
++            1
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use dct_brain::sign::soft::SoftSigner;
++    use dct_brain::sign::Signer;
++    use std::cell::RefCell;
++
++    /// 假的安全芯片：「把手」就是一个字节的种子，签名用软件钥匙。
++    struct FakeEnclave {
++        next_seed: RefCell<u8>,
++        cancel_user: bool,
++    }
++
++    impl FakeEnclave {
++        fn new() -> Self {
++            FakeEnclave { next_seed: RefCell::new(1), cancel_user: false }
++        }
++        fn soft(blob: &[u8]) -> SoftSigner {
++            let role = if blob[1] == 1 { SignerRole::User } else { SignerRole::Auto };
++            SoftSigner::from_seed(role, blob[0])
++        }
++    }
++
++    impl SecureEnclave for FakeEnclave {
++        fn available(&self) -> bool {
++            true
++        }
++        fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
++            let mut s = self.next_seed.borrow_mut();
++            let blob = vec![*s, biometric as u8];
++            *s += 1;
++            Ok((blob.clone(), Self::soft(&blob).public_key()))
++        }
++        fn sign(&self, blob: &[u8], msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
++            if blob[1] == 1 && self.cancel_user {
++                return Err(SignError::Cancelled);
++            }
++            Self::soft(blob).sign(msg, reason)
++        }
++    }
++
++    #[test]
++    fn init_creates_both_keys_once() {
++        let d = tempfile::tempdir().unwrap();
++        let ks = KeyStore::at(d.path().join("keys"));
++        let se = FakeEnclave::new();
++        let first = ks.init(&se).unwrap();
++        assert_ne!(first.auto.key_id, first.user.key_id);
++        assert!(d.path().join("keys/auto.se").exists());
++        assert!(d.path().join("keys/user.se").exists());
++        // 第二次不重建：公钥不变，否则配对过的 dco 全都不认了。
++        let second = ks.init(&se).unwrap();
++        assert_eq!(first, second);
++    }
++
++    #[test]
++    fn signers_sign_with_the_right_role_and_verify_against_the_public_file() {
++        let d = tempfile::tempdir().unwrap();
++        let ks = KeyStore::at(d.path().join("keys"));
++        let se = FakeEnclave::new();
++        ks.init(&se).unwrap();
++        let trusted = ks.trusted().unwrap();
++        for role in [SignerRole::Auto, SignerRole::User] {
++            let s = ks.signer(role, &se).unwrap();
++            assert_eq!(s.role(), role);
++            let sig = dct_brain::sign::make_signature_for_tests(&s, b"hello");
++            assert_eq!(dct_brain::sign::verify_sig(&sig, b"hello", &trusted), Ok(role));
++        }
++    }
++
++    #[test]
++    fn a_cancelled_touch_id_is_reported_as_cancelled() {
++        let d = tempfile::tempdir().unwrap();
++        let ks = KeyStore::at(d.path().join("keys"));
++        let mut se = FakeEnclave::new();
++        ks.init(&se).unwrap();
++        se.cancel_user = true;
++        let s = ks.signer(SignerRole::User, &se).unwrap();
++        assert_eq!(s.sign(b"x", "发到 TikTok"), Err(SignError::Cancelled));
++    }
++
++    #[test]
++    fn no_keys_yet_means_no_signer() {
++        let d = tempfile::tempdir().unwrap();
++        let ks = KeyStore::at(d.path().join("keys"));
++        assert!(ks.public_keys().unwrap().is_none());
++        assert!(ks.signer(SignerRole::Auto, &FakeEnclave::new()).is_err());
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 9f0b1cd..ffaa0fe 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,20 +2,21 @@ pub mod bridge;
+ pub mod channel;
+ pub mod cli;
+ pub mod client;
+ pub mod clipboard;
+ pub mod config;
+ pub mod daemon;
+ pub mod gate;
+ pub mod git;
+ pub mod i18n;
+ pub mod journal;
++pub mod keys;
+ pub mod last_sessions;
+ pub mod link;
+ pub mod live;
+ pub mod llm;
+ pub mod llm_optin;
+ pub mod pair;
+ pub mod pair_apply;
+ pub mod pair_http;
+ pub mod profile;
+ pub mod projects;
+diff --git a/src/main.rs b/src/main.rs
+index 72b6668..73343ec 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -95,20 +95,21 @@ fn main() -> Result<()> {
+                 // 那种地方开不起来，而「后台跑起来」恰恰是脚本真正想要的那半。
+                 dct::cli::Restarted::StartFresh => {
+                     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                         run_ui()
+                     } else {
+                         start_daemon_headless(&exe)
+                     }
+                 }
+             }
+         }
++        Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),
+         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
+         // 通路，跟会话、pty 都无关。
+         Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
+             std::process::exit(dct::cli::llm_check(cli_lang()))
+         }
+         Some("--help") | Some("-h") => {
+             println!("{HELP}");
+             Ok(())
+         }
+         // 装好之后能问出「我装的是哪一版」，这是排查的第一句话。在这之前
+diff --git a/swift/Keys.swift b/swift/Keys.swift
+new file mode 100644
+index 0000000..8652f70
+--- /dev/null
++++ b/swift/Keys.swift
+@@ -0,0 +1,66 @@
++// dct 的两把钥匙放在 Mac 的安全芯片里（设计：docs/superpowers/specs/2026-09-27-dct-brain-design.md 第 2 节）。
++// 私钥永远不出安全芯片；我们拿到的 dataRepresentation 是它加密过的「把手」，只有这台 Mac 能用。
++// 状态码：0 成功，1 没有安全芯片，2 把手不对，3 用户没通过指纹 / 取消，4 缓冲区太小，5 其它错误。
++import CryptoKit
++import Foundation
++import LocalAuthentication
++import Security
++
++@_cdecl("dct_se_available")
++public func dct_se_available() -> Bool {
++    SecureEnclave.isAvailable
++}
++
++@_cdecl("dct_se_create")
++public func dct_se_create(
++    _ biometric: Bool,
++    _ blobOut: UnsafeMutablePointer<UInt8>, _ blobCap: Int, _ blobLen: UnsafeMutablePointer<Int>,
++    _ pubOut: UnsafeMutablePointer<UInt8>
++) -> Int32 {
++    guard SecureEnclave.isAvailable else { return 1 }
++    var flags: SecAccessControlCreateFlags = [.privateKeyUsage]
++    if biometric { flags.insert(.biometryCurrentSet) }
++    var err: Unmanaged<CFError>?
++    guard let ac = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, flags, &err) else {
++        return 5
++    }
++    do {
++        let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: ac)
++        let blob = key.dataRepresentation
++        guard blob.count <= blobCap else { return 4 }
++        blob.copyBytes(to: blobOut, count: blob.count)
++        blobLen.pointee = blob.count
++        let pub = key.publicKey.x963Representation  // 65 字节，0x04 开头
++        guard pub.count == 65 else { return 5 }
++        pub.copyBytes(to: pubOut, count: 65)
++        return 0
++    } catch {
++        return 5
++    }
++}
++
++@_cdecl("dct_se_sign")
++public func dct_se_sign(
++    _ blob: UnsafePointer<UInt8>, _ blobLen: Int,
++    _ msg: UnsafePointer<UInt8>, _ msgLen: Int,
++    _ reason: UnsafePointer<CChar>,
++    _ sigOut: UnsafeMutablePointer<UInt8>
++) -> Int32 {
++    guard SecureEnclave.isAvailable else { return 1 }
++    let ctx = LAContext()
++    ctx.localizedReason = String(cString: reason)  // Touch ID 弹窗里显示的那句人话
++    let key: SecureEnclave.P256.Signing.PrivateKey
++    do {
++        key = try SecureEnclave.P256.Signing.PrivateKey(
++            dataRepresentation: Data(bytes: blob, count: blobLen), authenticationContext: ctx)
++    } catch {
++        return 2
++    }
++    do {
++        let sig = try key.signature(for: Data(bytes: msg, count: msgLen))
++        sig.rawRepresentation.copyBytes(to: sigOut, count: 64)  // r||s
++        return 0
++    } catch {
++        return 3
++    }
++}

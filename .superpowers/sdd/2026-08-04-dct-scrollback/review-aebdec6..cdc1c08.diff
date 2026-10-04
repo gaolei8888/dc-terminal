@@ -1,0 +1,505 @@
+# Review package: aebdec6..cdc1c08
+
+## Commits
+cdc1c08 feat: 协议加 Scroll 与 Mouse，版本升到 5
+
+## Files changed
+ src/daemon.rs  |   3 ++
+ src/proto.rs   | 133 ++++++++++++++++++++++++++++++++++++++++++++++++++++++---
+ src/pty.rs     |   6 +++
+ src/session.rs |  13 +++++-
+ src/ui/mod.rs  |   3 ++
+ 5 files changed, 152 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 7a89a5c..b7b548a 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -256,25 +256,28 @@ fn handle(
+                     st.set_last_profile(&profile);
+                 }
+             }
+             r
+         }
+         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
+         Request::Screen { id } => mgr.screen(id).map(|snap| Response::Screen {
+             lines: snap.lines,
+             cursor: snap.cursor,
+             state: snap.state,
++            scroll: snap.scroll,
+         }),
+         Request::Screens { ids } => Ok(Response::Screens {
+             screens: mgr.screens(&ids),
+         }),
+         Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
++        Request::Scroll { id, by } => mgr.scroll(id, by).map(Response::Scrolled),
++        Request::Mouse { id, event } => mgr.forward_mouse(id, event).map(|_| Response::Ok),
+         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
+         Request::Kill { id } => mgr.kill(id).map(|_| Response::Ok),
+         Request::Prune => Ok(Response::Pruned(mgr.prune())),
+         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
+         Request::Diff { id } => mgr.diff(id).map(Response::Diff),
+         Request::SetSecret { profile, value } => recover(secrets.lock())
+             .set(&profile, &value)
+             .map(|_| Response::Ok),
+         Request::DeleteSecret { profile } => recover(secrets.lock())
+             .remove(&profile)
+diff --git a/src/proto.rs b/src/proto.rs
+index a19e05a..f8d5e6a 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -1,17 +1,17 @@
+ use serde::{Deserialize, Serialize};
+ use std::path::{Path, PathBuf};
+ 
+ use crate::git::FileStat;
+ use crate::profile::ProfileStatus;
+ use crate::pty::ScreenSpan;
+-use crate::session::{SessionInfo, SessionState};
++use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
+ 
+ /// 界面和守护进程之间的线上契约版本。**改了协议就要加一。**
+ ///
+ /// 这两个东西是分开升级的：守护进程一活就是好几天（它活得久正是这个产品
+ /// 存在的理由），用户装了新版本 dct 之后，跟他说话的还是几天前那个进程。
+ /// 协议一改，新界面发的请求旧守护进程就解不出来——2026-08-05 的现场是
+ /// `Profiles` 加了 `lang` 字段之后，按 n 只弹一句「拿不到 agent 列表」，
+ /// 没有任何线索指向真正的原因。
+ ///
+ /// `the_request_shape_is_pinned_to_the_protocol_version` 和
+@@ -21,21 +21,24 @@ use crate::session::{SessionInfo, SessionState};
+ /// 写不写 `u 回滚` / `d 改动`，旧守护进程回的 JSON 里没有这个字段，新界面
+ /// 解不出来。
+ ///
+ /// 3 = 多了 `Kill` / `Prune` 两条请求。这两条旧守护进程根本不认，发过去
+ /// 只会得到一句解析失败。
+ ///
+ /// 4 = 多了 `Explanation` 请求 / `Response::Explanation`——问一个 `Failed`
+ /// 会话「出了什么事」。旧守护进程不认识这条请求，界面发过去只会得到一句
+ /// 解析失败；老实说这条不至于让界面整个用不了（不问就是了），但协议形状
+ /// 变了就要加一，理由同上面两条。
+-pub const PROTOCOL_VERSION: u32 = 4;
++///
++/// 5 = 多了 `Request::Scroll` / `Request::Mouse` / `Response::Scrolled`，
++/// `Response::Screen` 加了 `scroll`（带 `#[serde(default)]`，旧 JSON 照样能解）。
++pub const PROTOCOL_VERSION: u32 = 5;
+ 
+ /// 对面那个守护进程能不能用。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum DaemonStatus {
+     /// 同一份协议，正常用。
+     Same,
+     /// 号对不上，或者老到连 `Hello` 都不认识。
+     Stale,
+ }
+ 
+@@ -84,20 +87,44 @@ pub struct ProfileEntry {
+ }
+ 
+ /// 九宫格一格的内容。跟 `Response::Screen` 不同，不带光标——
+ /// 只读的格子画光标只会误导人去打字。
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct ScreenEntry {
+     pub id: u32,
+     pub lines: Vec<Vec<ScreenSpan>>,
+ }
+ 
++/// 界面转发的一次鼠标事件，agent 当前的编码方式（哪种协议、SGR 与否）由
++/// daemon 那一侧的 PTY 状态决定——界面只管「用户在哪个格子上做了什么」，
++/// 不掺和编码。列/行 0 起算，跟 `Response::Screen` 的 `cursor` 一致。
++#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
++pub struct MouseForward {
++    pub col: u16,
++    pub row: u16,
++    pub kind: MouseForwardKind,
++    pub shift: bool,
++    pub alt: bool,
++    pub ctrl: bool,
++}
++
++/// 鼠标事件的种类。按下/松开带按钮号而不是分成三个变体各配一份——
++/// 编码那一侧（Task 9）反正要按数字拼 SGR 序列，分开只会多一层 match。
++#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
++pub enum MouseForwardKind {
++    WheelUp,
++    WheelDown,
++    /// 0 = 左键，1 = 中键，2 = 右键
++    Press(u8),
++    Release(u8),
++}
++
+ #[derive(Serialize, Deserialize)]
+ pub enum Request {
+     /// 「你是几号协议？」界面连上之后问的第一句。放在最前面，且
+     /// **永远不许改形状**——它是唯一一条必须让任何年纪的守护进程都能
+     /// 解出来的请求（老到答不上来也没关系，答不上来本身就是答案）。
+     Hello,
+     List,
+     Create {
+         dir: String,
+         profile: String,
+@@ -166,20 +193,33 @@ pub enum Request {
+         profile: String,
+         value: String,
+     },
+     /// 「这个 `Failed` 会话到底出了什么事」，人话版。答案可能还没算出来
+     /// （问模型是异步的，见 `session.rs::request_explanation`），也可能
+     /// 压根没配 LLM——两种情况都回 `Response::Explanation(None)`，界面
+     /// 该显示今天就有的那句失败提示。
+     Explanation {
+         id: u32,
+     },
++    /// 用户主动滚动：相对滚几行，或者直接回到底部。类型是
++    /// `session::ScrollBy`——协议层不重新定义一份平行的滚动语义。
++    Scroll {
++        id: u32,
++        by: ScrollBy,
++    },
++    /// 界面转发的鼠标事件（滚轮、点击、拖拽结束的松开）。是否真的转发给
++    /// agent 由 daemon 按当前是不是在看历史（`ScrollState::alt_screen` /
++    /// `offset`）决定，界面不用先猜。
++    Mouse {
++        id: u32,
++        event: MouseForward,
++    },
+ }
+ 
+ /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
+ /// `value` 是用户的明文密钥。今天没有任何地方真的 `{req:?}` 打印一个
+ /// `Request`（已核实），但 `serve()` 解析失败那条分支离
+ /// `eprintln!("bad request: {req:?}")` 只有一行距离——一旦有人图省事加了
+ /// 这行调试日志，密钥就会写进守护进程的 stderr（很可能重定向进一个存活
+ /// 比进程本身久得多的日志文件）。这里把 `value` 换成占位符，`profile`
+ /// 这种不敏感的字段照常打印，排查问题时还能看出是哪个 profile 出的请求。
+ impl std::fmt::Debug for Request {
+@@ -226,20 +266,31 @@ impl std::fmt::Debug for Request {
+                 .debug_struct("DeleteSecret")
+                 .field("profile", profile)
+                 .finish(),
+             Request::LastProfile => write!(f, "LastProfile"),
+             Request::VerifySecret { profile, .. } => f
+                 .debug_struct("VerifySecret")
+                 .field("profile", profile)
+                 .field("value", &"<redacted>")
+                 .finish(),
+             Request::Explanation { id } => f.debug_struct("Explanation").field("id", id).finish(),
++            Request::Scroll { id, by } => f
++                .debug_struct("Scroll")
++                .field("id", id)
++                .field("by", by)
++                .finish(),
++            // 没有密钥、没有用户输入的自由文本，坐标和按键状态照常打印。
++            Request::Mouse { id, event } => f
++                .debug_struct("Mouse")
++                .field("id", id)
++                .field("event", event)
++                .finish(),
+         }
+     }
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ pub enum Response {
+     /// 对 [`Request::Hello`] 的回答。同样不许改形状。
+     Hello {
+         protocol: u32,
+     },
+@@ -248,20 +299,26 @@ pub enum Response {
+         id: u32,
+     },
+     Screen {
+         lines: Vec<Vec<ScreenSpan>>,
+         cursor: (u16, u16),
+         /// 贴在会话里时界面只调 `Screen`（`List` 太贵，见 `ui::run` 里的注释），
+         /// 所以进程死了它只能从这里知道。少了它界面会永远画那张空缓冲——
+         /// agent 退出时恢复主屏，主屏从来没被写过，所以「屏是空的」是正常的，
+         /// 判断死活只能靠状态。
+         state: SessionState,
++        /// 底栏画滚动提示要用的全部事实。`#[serde(default)]`：往后再加字段
++        /// 不用再动 `PROTOCOL_VERSION`——旧 JSON 没有这个字段时补一个
++        /// `ScrollState::default()`（没在滚、没有未读行），跟真没滚动过的
++        /// 会话是同一个状态，不会被误读成别的。
++        #[serde(default)]
++        scroll: ScrollState,
+     },
+     Screens {
+         screens: Vec<ScreenEntry>,
+     },
+     Diff(Vec<FileStat>),
+     Profiles {
+         entries: Vec<ProfileEntry>,
+         /// 密钥文件读不了、自定义 profile 写错了之类。UI 顶部红字。
+         /// 报码不报句子——理由同 `ErrorCode`。
+         warnings: Vec<WarningCode>,
+@@ -271,20 +328,23 @@ pub enum Response {
+     /// 「清掉了多少」，而「一个都没有」和「清掉了 5 个」要说两句不同的话。
+     Pruned(u32),
+     LastProfile(Option<String>),
+     Verify(crate::verify::VerifyOutcome),
+     Ok,
+     Error(ErrorCode),
+     /// 对 [`Request::Explanation`] 的回答。`None` = 没有（还没算出来、
+     /// 没配 LLM、或者算失败了——界面不用区分，统一显示今天就有的那句
+     /// 失败提示）。
+     Explanation(Option<String>),
++    /// 对 [`Request::Scroll`] 的回答：滚完之后的状态，界面拿它直接刷底栏，
++    /// 不用再补一次 `Screen` 才知道滚到哪了。
++    Scrolled(ScrollState),
+ }
+ 
+ /// 守护进程报「哪一类错 + 参数」，**不组句**。
+ ///
+ /// 组句一律发生在界面进程：daemon 是常驻的、可能同时服务多个界面的进程，
+ /// 它不知道也不该知道谁在用什么语言。报码的另一个好处是切语言立刻生效，
+ /// 不用重启 daemon——它存下来的东西里没有任何一句是某种语言的。
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub enum ErrorCode {
+     NoSuchProfile(String),
+@@ -541,28 +601,43 @@ mod tests {
+             },
+             Request::DeleteSecret {
+                 profile: "p".into(),
+             },
+             Request::LastProfile,
+             Request::VerifySecret {
+                 profile: "p".into(),
+                 value: "v".into(),
+             },
+             Request::Explanation { id: 1 },
++            Request::Scroll {
++                id: 1,
++                by: ScrollBy::Rows(3),
++            },
++            Request::Mouse {
++                id: 1,
++                event: MouseForward {
++                    col: 10,
++                    row: 20,
++                    kind: MouseForwardKind::Press(0),
++                    shift: false,
++                    alt: false,
++                    ctrl: false,
++                },
++            },
+         ];
+ 
+         let shape = serde_json::to_string(&all).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+-                4,
+-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}}]"#
++                5,
++                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},"LastProfile",{"VerifySecret":{"profile":"p","value":"v"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}}]"#
+             ),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     /// 请求那条 pin 只钉了**发出去**的形状，回来的没人管——而 2026-08-06
+     /// 给 `SessionInfo` 加 `is_agent` 正是改在回程上：旧守护进程回的 JSON
+     /// 里没这个字段，新界面 `from_str` 直接失败，症状是看板一个会话都没有。
+     /// 回程的形状同样是契约，同样要钉。
+     #[test]
+@@ -572,21 +647,21 @@ mod tests {
+             profile: "claude".into(),
+             dir: "/d".into(),
+             state: SessionState::Idle,
+             activity: "a".into(),
+             is_agent: true,
+         };
+         let shape = serde_json::to_string(&info).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+-                4,
++                5,
+                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
+             ),
+             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     #[test]
+     fn screens_response_round_trips() {
+         use crate::pty::{ScreenSpan, ScreenStyle};
+         let resp = Response::Screens {
+@@ -602,11 +677,59 @@ mod tests {
+         let back: Response = serde_json::from_str(&s).unwrap();
+         match back {
+             Response::Screens { screens } => {
+                 assert_eq!(screens.len(), 1);
+                 assert_eq!(screens[0].id, 4);
+                 assert_eq!(screens[0].lines[0][0].text, "干活中");
+             }
+             other => panic!("解回来不是 Screens：{other:?}"),
+         }
+     }
++
++    /// 新加的滚动字段必须能从「没有这个字段」的旧 JSON 里解出来。
++    /// 这是 `#[serde(default)]` 的意义所在：往后再加字段就不用再动版本号。
++    ///
++    /// `state` 带上而不是照抄 brief 原样的 `{"lines":[],"cursor":[0,0]}}`：
++    /// 那是 3 版之前的形状，`state` 早就是这个变体里不带默认值的必填字段
++    /// （见它自己的文档注释——少了它界面就没法判断进程死活）。这里只测
++    /// `scroll` 这一个新字段的向后兼容，不重新测已经钉在别处的旧字段。
++    #[test]
++    fn a_screen_response_without_scroll_still_parses() {
++        let old = r#"{"Screen":{"lines":[],"cursor":[0,0],"state":"Idle"}}"#;
++        let r: Response = serde_json::from_str(old).unwrap();
++        match r {
++            Response::Screen { scroll, .. } => {
++                assert_eq!(scroll, crate::session::ScrollState::default());
++            }
++            _ => panic!("解成了别的变体"),
++        }
++    }
++
++    #[test]
++    fn scroll_requests_survive_a_round_trip() {
++        for by in [ScrollBy::Rows(3), ScrollBy::Rows(-3), ScrollBy::Bottom] {
++            let req = Request::Scroll { id: 7, by };
++            let s = serde_json::to_string(&req).unwrap();
++            let back: Request = serde_json::from_str(&s).unwrap();
++            assert!(matches!(back, Request::Scroll { id: 7, .. }));
++        }
++    }
++
++    /// 手写的 Debug 漏一条 arm 会编译不过，但漏了密钥脱敏不会。
++    /// 顺手确认新变体没有把什么敏感东西带进 Debug。
++    #[test]
++    fn mouse_debug_has_no_surprises() {
++        let req = Request::Mouse {
++            id: 1,
++            event: MouseForward {
++                col: 10,
++                row: 20,
++                kind: MouseForwardKind::WheelUp,
++                shift: false,
++                alt: false,
++                ctrl: false,
++            },
++        };
++        let s = format!("{req:?}");
++        assert!(s.contains("Mouse"));
++    }
+ }
+diff --git a/src/pty.rs b/src/pty.rs
+index 5a7cab4..7c7d2a8 100644
+--- a/src/pty.rs
++++ b/src/pty.rs
+@@ -369,20 +369,26 @@ impl PtySession {
+         view_of(&parser, max)
+     }
+ 
+     pub fn scroll_state(&self) -> ScrollView {
+         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+         let cur = parser.screen().scrollback();
+         let max = probe_max(&mut parser);
+         parser.screen_mut().set_scrollback(cur);
+         view_of(&parser, max)
+     }
++
++    /// 把一次鼠标事件编码成 agent 期望的转义序列并写进 PTY。
++    // Task 9 实现：空壳先让 `Request::Mouse` 这条线路编译得过、跑得起来。
++    pub fn write_mouse(&self, _ev: crate::proto::MouseForward) -> Result<()> {
++        Ok(())
++    }
+ }
+ 
+ /// vt100 不公开「现在攒了多少行历史」。但 `set_scrollback` 内部会
+ /// `.min(scrollback.len())` 钳一次，所以设一个大得离谱的值再读回来，
+ /// 读到的就是真实上限。三次字段写，不分配不拷贝。
+ ///
+ /// **调用方负责把偏移放回去**——这个函数会改变它。
+ fn probe_max(parser: &mut vt100::Parser) -> usize {
+     parser.screen_mut().set_scrollback(usize::MAX);
+     parser.screen().scrollback()
+diff --git a/src/session.rs b/src/session.rs
+index ea75a0c..7dbb8d2 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -33,21 +33,23 @@ pub struct ScrollState {
+     pub alt_screen: bool,
+     #[serde(default)]
+     pub max: usize,
+     #[serde(default)]
+     pub offset: usize,
+     #[serde(default)]
+     pub new_lines: usize,
+ }
+ 
+ /// `SessionManager::scroll` 的入参：相对滚几行，或者干脆回到底部。
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++/// 派生 `Serialize`/`Deserialize`：`proto::Request::Scroll` 直接把它嵌进
++/// 线上请求，协议层不重新定义一份平行的滚动语义。
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum ScrollBy {
+     Rows(i32),
+     Bottom,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum SessionState {
+     Working,
+     /// 由后续的 Bridge 在 agent 调用 ask_human 时设置；本计划内不会出现
+     Asking,
+@@ -495,20 +497,29 @@ impl SessionManager {
+             let v = match by {
+                 ScrollBy::Rows(n) => s.pty.scroll_by(n),
+                 ScrollBy::Bottom => s.pty.scroll_to_bottom(),
+             };
+             // 用户主动滚过了，「没看过的行数」从这一刻重新算
+             s.scroll_mark = v.offset;
+             Ok(state_of(v, s.scroll_mark))
+         })
+     }
+ 
++    /// 把界面转发过来的鼠标事件按 agent 当前的编码写进 PTY。
++    ///
++    /// 占位实现：真正按 agent 是否开了鼠标报告、用的是哪种编码来决定写不写、
++    /// 写什么留给 Task 9（见 `PtySession::write_mouse` 的注释）。这里先把
++    /// 线路接通，让 `Request::Mouse` 编译得过、跑得起来。
++    pub fn forward_mouse(&self, id: u32, ev: crate::proto::MouseForward) -> Result<()> {
++        self.with_session(id, |s| s.pty.write_mouse(ev))
++    }
++
+     /// 一次取多个会话的屏幕，九宫格用。锁的纪律跟 `list()` 一致：
+     /// 逐个短暂拿锁，不跨会话持有任何东西。不存在的 id 跳过——
+     /// 会话可能在两次轮询之间被停掉，这不是错误。
+     pub fn screens(&self, ids: &[u32]) -> Vec<crate::proto::ScreenEntry> {
+         ids.iter()
+             .filter_map(|id| {
+                 let arc = self.get_arc(*id).ok()?;
+                 let s = recover(arc.lock());
+                 Some(crate::proto::ScreenEntry {
+                     id: *id,
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 4ac3ae3..5f6c76f 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -426,20 +426,23 @@ pub fn run(
+                     .and_then(|c| c.call(Request::Resize { id, rows, cols }))
+                     .is_ok()
+             {
+                 app.sent_size = Some((id, rows, cols));
+             }
+             match app.client().and_then(|c| c.call(Request::Screen { id })) {
+                 Ok(Response::Screen {
+                     lines,
+                     cursor,
+                     state,
++                    // 底栏画滚动提示、鼠标事件转发是下一个任务的活；这里先
++                    // 用 `..` 接住新字段，别让协议加字段变成这边的编译错误。
++                    ..
+                 }) => {
+                     app.screen = lines;
+                     app.screen_cursor = cursor;
+                     app.connected = true;
+                     // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
+                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
+                     // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
+                     // 每个键都掉进一个死掉的 pty 里无声消失。
+                     if let Some(notice) = session_ended_notice(id, state, app.lang) {
+                         app.view = home_view(&app);

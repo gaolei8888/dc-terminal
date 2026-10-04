@@ -1,0 +1,123 @@
+# Review package: df32dbd..10bea5f
+
+## Commits
+10bea5f docs: sessions carry a name now, and it degrades quietly
+
+## Files changed
+ README.md       | 10 ++++++++++
+ README.zh-CN.md | 10 ++++++++++
+ 2 files changed, 20 insertions(+)
+
+## Diff
+diff --git a/README.md b/README.md
+index 7e9da05..6e90000 100644
+--- a/README.md
++++ b/README.md
+@@ -137,20 +137,28 @@ The grid is read-only — arrows move focus, `F3` does the same as `→` (next t
+ `i` is the grid's own key, and the one thing the board has no equivalent for: it opens a one-line reply box on the focused tile, so you can answer an agent without leaving the overview. Type and press `Enter` to send. Press `Enter` on an empty box and it sends a bare Enter — that's how you approve a plan or say "carry on". `Ctrl+C` interrupts the agent instead. While the box is open the whole keyboard belongs to it.
+ 
+ Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
+ 
+ Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3`, `F4` and `Ctrl+Q` are the only four keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view, `F4` toggles copy mode (more on that below).
+ 
+ You can scroll back through what a session already printed, with `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. A page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. The wheel only does something when the agent itself wants the mouse: Claude Code does, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex and plain command-line tools don't want the mouse, so `dct` doesn't capture it there either — the wheel no longer scrolls `dct`'s history, and depending on your terminal it may do nothing or send arrow keys straight to the agent; use `PageUp`/`PageDown`/`End` instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
+ 
+ A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
+ 
++## Sessions get a name
++
++Three `claude` sessions in one project used to all read `3 claude`, `5 claude`, `7 claude` — the same string with a different number, in every place you'd check before deciding which one to open. Now the daemon names each agent session for you: the first time it finishes a round of work — the first `Working → Idle`/`Asking` transition after you've actually said something to it — it hands the model configured under `[llm]` what you said and what's on screen, and asks for a short name. `3 claude` becomes `3 fix the login blank screen`, and that's it for the life of the session; it's generated once and never regenerated. The name is written in whatever language you typed in, not whatever the interface happens to be showing — the two can drift apart because `l` switches the interface language at runtime, but a name, once made, doesn't move with it.
++
++It shows up everywhere a session does: the session list, the tile titles in the grid, and the reply box's recipient line. The attached session's own title carries it too, with one exception — while the connection to the daemon is down, that title's space goes to the warning and the way out instead, not the name. One shared helper decides what to draw for a session, so these places can't quietly drift the way separately-formatted strings always do.
++
++There's no way to rename a session by hand in this version.
++
+ ---
+ 
+ # Where this is going
+ 
+ **None of this is written yet.** It's here so the parts above make sense as a direction rather than a pile of features.
+ 
+ The point was never "use your terminal from anywhere." It's that **development keeps moving while you're not there**. You handle three things: state the goal, make the calls, accept the result. The understanding, writing, testing and fixing in between shouldn't need you watching.
+ 
+ - **Agents come find you instead of sitting there.** An `ask_human` tool: the agent calls it and blocks, the question goes to your phone, your answer comes back as the tool's return value, and it carries on.
+ - **Phone channels.** Telegram first, because it's the only one that doesn't need a public callback address; then Feishu, WeCom, SMS. If the primary channel fails to send, it falls back automatically and says so in the message. Fallbacks have to be chosen in advance — you can't ask someone which channel they'd like when the thing that's broken is how you ask them things.
+@@ -164,20 +172,22 @@ The point was never "use your terminal from anywhere." It's that **development k
+ # Things that will annoy you
+ 
+ **The big one: the four vendor endpoints are copied out of public documentation and have never been tested with a real account.** A key can verify fine and the session still fail to start. Until somebody runs them with real credentials, treat Kimi, GLM, DeepSeek and Qwen API as unverified.
+ 
+ `dct` only takes the mouse when **the agent itself wants it**. Claude Code does (it uses the mouse to scroll its own screen); codex and plain command-line tools don't — in those sessions the mouse stays with the terminal as long as nothing running there asks for it, so click-and-drag text selection and copying work exactly as they always do. The cost is that the wheel no longer scrolls `dct`'s own history in those sessions; use `PageUp`/`PageDown`/`End` instead.
+ 
+ To copy inside a session where the agent wants the mouse, press `F4` to enter copy mode: the mouse goes back to the terminal, the bottom bar says so, and pressing `F4` again leaves it once you're done copying. You can also use your terminal's own modifier (Option in iTerm2) without leaving the session at all.
+ 
+ `dct` has no copy of its own — copying uses whatever your terminal already gives you.
+ 
++Naming a session needs an `[llm]` backend configured in `~/.dct/config.toml`, and most people don't have one — that's the normal case, not a problem. Without it, or if the model call times out, or the answer that comes back isn't usable, naming quietly steps back: the name falls back to the first thing you typed, trimmed short. Never typed anything either? Then there's no name at all, and the display shows exactly what it always showed before this feature existed — the agent's profile name. None of that interrupts the session or shows an error; it just runs.
++
+ Permissions are auto-accepted, which means an agent can write outside the project directory. **Those writes are outside the snapshot and undo won't bring them back.**
+ 
+ Two agents in one project will fight over the same files. Different projects, no problem.
+ 
+ `opencode` and `qwen` are in the list but neither has ever actually been run, so they have no screen patterns and their sessions just show `—`.
+ 
+ Only the first nine groups get a number. From the tenth project on, `Tab` is the only way there, one step at a time.
+ 
+ The interface comes in Chinese and English. `l` switches it, `DCT_LANG=en` overrides it for one run, and with neither it follows your system locale.
+ 
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 5a29e3b..93b3236 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -135,20 +135,28 @@ macOS 上，守护进程还在执行这个文件的时候原地覆盖它，内
+ `i` 是九宫格独有的那个键，也是看板上没有对应物的一件事：它在焦点那一格上开一个单行回复框，让你不用离开总览就回 agent 一句。打完按 `Enter` 送出去。框还空着时直接按 `Enter`，送出去的就是一个光秃秃的回车——批准一份计划、或者说「接着干」，用的就是这一下。`Ctrl+C` 则是打断它。框开着的时候键盘整个归框。
+ 
+ 格子按项目排好，同一个项目的会话挨在一起，每一格标着自己属于哪个项目。格子里敲的键一个字都不会送到 agent 那边。停掉的会话格子里留一张最后的画面，不是空的。会话超过九个就翻页，带页码提示。格子里翻不了历史，想往回看得先放大进去（`Enter`）。
+ 
+ 进了会话，你敲的每个键都送给 agent，`Esc` 也一样，它们关自己的弹窗要用。`F2`、`F3`、`F4`、`Ctrl+Q` 是 `dct` 唯一留下的四个键：`F2` 和 `Ctrl+Q` 都是退回看板，`F3` 不用退出就能直接跳到下一个还在跑的会话，`F4` 切换复制模式（见下文）。
+ 
+ 会话里之前打印过的内容能往回翻，用 `PageUp`/`PageDown`/`End`。`dct` 大概留着最后 2000 行滚出屏幕的内容，这是个上限，不是承诺一行不少。翻页是一屏减两行，留出两行接上上一屏，`End` 直接跳回底部。滚轮只在 agent 自己要鼠标时才有动静：Claude Code 会要，滚轮就直接归它管，`dct` 不插手，也不提示——你滚的是它的画面，不是 `dct` 的。codex、普通命令行不要鼠标，`dct` 也就不去抓它——滚轮不再翻 `dct` 的历史，至于滚轮本身会怎样，看你用的终端：有的什么反应都没有，有的会把它当成方向键直接送给 agent，稳妥的办法还是 `PageUp`/`PageDown`/`End`。往回看的时候新内容照样在后面涨，画面不会被拽着往下跳，底栏会数有几行新的在等着，也会告诉你怎么回去。打一个字，或者改一下窗口大小，立刻弹回底部。
+ 
+ 一个会话从生到死绑定一个 agent，中途换不了。整段对话都在那个进程里面，换 agent 等于换个脑子。想换就按 `N` 另开一个。
+ 
++## 会话会自己长出名字
++
++同一个项目挂三个 `claude` 会话，以前不管是看板、九宫格还是回复框，写的都是一样的 `3 claude`、`5 claude`、`7 claude`——按 Enter 之前你唯一能凭的就是那个数字。现在守护进程自己把这件事解决了：agent 会话第一次干完一轮活——也就是你已经开口说过话之后，第一次从「干活中」变成「空闲」或「等你答」——它会把你说的话和屏幕上的内容交给 `[llm]` 那段配置的模型，问一个短名字。`3 claude` 就变成了 `3 修登录白屏`，而且只起这一次，一辈子不会再改。名字用的是**你当时打字那句话的语言**，不是界面语言——这两者是会分开的，因为 `l` 随时能切界面语言，但名字一旦起出来就不会跟着挪。
++
++它会出现在会话列表、九宫格的格子标题、回复框的收件人这几处；会话本身的标题栏也带着它，只有一种例外——跟守护进程的连接断掉的时候，标题那行的位置让给警告和「怎么退出去」，名字让位。四处画的是同一处逻辑给出的同一个答案，不会出现「列表上是名字、格子里还是 claude」这种各写各的。
++
++这一版没有手动改名的入口。
++
+ ---
+ 
+ # 方向
+ 
+ **下面这些一行代码都还没写。** 放在这儿是为了说清楚上面那些东西是冲着什么去的。
+ 
+ 真正想要的不是「在任何地方看终端」，而是**人不在，开发照样往前走**。你只管三件事：提目标、拍板、验收。中间的理解、写、测、修，不该需要你盯着。
+ 
+ - **agent 主动找你，而不是停在那儿等。** 一个 `ask_human` 工具，agent 一调就阻塞，问题送到手机上，你的回答作为工具返回值送回去，它接着干。
+ - **手机通道。** Telegram 排第一，因为它是唯一不需要公网回调地址的；然后是飞书、企业微信、SMS。主通道发不出去就自动切备用通道，并在消息里说明。备用通道必须提前定好——故障的时候没法问你想用哪个，问这件事本身就要靠通道。
+@@ -162,20 +170,22 @@ macOS 上，守护进程还在执行这个文件的时候原地覆盖它，内
+ # 会踩到的坑
+ 
+ **最要紧的一条：那四家的端点地址是照公开文档抄的，从来没拿真账号试过。** 密钥有可能验证通过、会话照样起不来。在有人拿真凭据跑通之前，Kimi、GLM、DeepSeek、Qwen API 这四个就当没验证过。
+ 
+ `dct` 只在 **agent 自己要鼠标的时候**才接管它。Claude Code 会要（它自己用鼠标滚它那一屏），codex 和普通命令行不要——只要会话里跑着的东西没自己伸手要鼠标，鼠标就归终端，拖动选中文字、复制，跟平时完全一样。代价是那些会话里滚轮不再翻 `dct` 的历史，用 `PageUp`/`PageDown`/`End`。
+ 
+ 在 agent 要鼠标的会话里想复制，按 `F4` 进复制模式：鼠标临时还给终端，底栏会写着现在是这个状态，复制完再按一次 `F4` 回去。也可以用终端自己的修饰键（iTerm2 是按住 Option），不用退出会话。
+ 
+ `dct` 自己没有复制功能——复制用的是你终端本来那一套。
+ 
++给会话起名字要靠 `~/.dct/config.toml` 里配好的 `[llm]`，多数人根本没配——这是正常状态，不是毛病。没配、或者模型答得慢到超时、或者答非所问，起名这件事会自己安静地退下去：名字退回你说的第一句话，截短了用。连第一句话都没说过？那就什么名字都没有，界面显示的还是这个功能出现之前的老样子——agent 的 profile 名。全程不报错、不打断会话，照跑。
++
+ 权限是全自动接受的，所以 agent 有可能写到项目目录外面去。**那部分改动不在快照范围内，撤销撤不回来。**
+ 
+ 同一个项目里开两个 agent，它们会抢同一批文件。跨项目就没事。
+ 
+ `opencode` 和 `qwen` 在列表里，但这两个一次都没真跑过，所以没给它们配屏幕匹配，会话状态一直是 `—`。
+ 
+ 号码只发给前九个组。第十个项目起没有号码，只能用 `Tab` 一个一个翻过去。
+ 
+ 界面有中文和英文两种。按 `l` 切，也可以用 `DCT_LANG=en` 临时压过一次；不设就跟着系统 locale 走。
+ 

@@ -1,0 +1,2043 @@
+# Review package: cd4a6cb..360f8e8
+
+## Commits
+360f8e8 docs: keep the task-5 brief and report
+488622f feat: wire the phone bridge into daemon.rs, fix a self-deadlock in PhoneUnpair
+864b9c8 test: make the fake channel's exhausted script fail closed
+cb43267 test: strengthen backoff test to catch a missing attempt reset
+0149c20 feat: pair with exactly one person and ignore everyone else
+
+## Files changed
+ .../2026-08-10-dct-phone-channel/task-5-brief.md   | 131 +++++
+ .../2026-08-10-dct-phone-channel/task-5-report.md  | 124 +++++
+ src/bridge.rs                                      | 615 +++++++++++++++++++++
+ src/daemon.rs                                      | 438 ++++++++++++++-
+ src/i18n.rs                                        |  40 +-
+ src/lib.rs                                         |   1 +
+ src/proto.rs                                       |  29 +-
+ 7 files changed, 1325 insertions(+), 53 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-5-brief.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-5-brief.md
+new file mode 100644
+index 0000000..7d0289e
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-5-brief.md
+@@ -0,0 +1,131 @@
++## Task 5: bridge 骨架 —— 长轮询、配对、只认一个 chat id
++
++**Files:**
++- Create: `src/bridge.rs`
++- Modify: `src/daemon.rs`（启动线程）、`src/lib.rs`
++- Test: `src/bridge.rs` 内
++
++**Interfaces:**
++- Consumes: Task 1 的 `Channel`/`Incoming`、Task 4 的 `PhoneState`
++- Produces: `Bridge::new(ch: Arc<dyn Channel>)`、`Bridge::accept(&self, msg: &Incoming) -> Accepted`、`Accepted { Paired(i64), FromOwner, Rejected }`
++
++- [ ] **Step 1: 写失败测试**
++
++**这是整个功能唯一真会伤到用户的地方，测试写在最前面。**
++
++```rust
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn msg(chat: i64, text: &str) -> Incoming {
++        Incoming { text: text.into(), reply_to: None, chat_id: chat }
++    }
++
++    /// 第一个发消息的人成为主人。
++    #[test]
++    fn the_first_person_to_message_becomes_the_owner() {
++        let b = Bridge::for_test();
++        assert_eq!(b.accept(&msg(111, "在吗")), Accepted::Paired(111));
++        assert_eq!(b.accept(&msg(111, "先跑完")), Accepted::FromOwner);
++    }
++
++    /// **bot 用户名是公开可搜的，任何人都能给它发消息，而这个功能会把消息
++    /// 敲进用户的终端。** 这条测试破了就等于任何人都能往用户机器上敲字。
++    #[test]
++    fn a_stranger_is_rejected_even_after_pairing() {
++        let b = Bridge::for_test();
++        assert_eq!(b.accept(&msg(111, "在吗")), Accepted::Paired(111));
++        assert_eq!(b.accept(&msg(222, "rm -rf /")), Accepted::Rejected);
++        assert_eq!(b.accept(&msg(222, "/use 1")), Accepted::Rejected);
++        // 主人还是主人，没被挤掉
++        assert_eq!(b.accept(&msg(111, "继续")), Accepted::FromOwner);
++    }
++
++    /// 陌生人抢在主人之前发消息，就成了主人——这正是为什么配对必须是
++    /// 用户填完令牌后的一次显式动作，而不是长期开着的门。
++    /// 配对完成后 `accept` 再也不会返回 `Paired`。
++    #[test]
++    fn pairing_happens_exactly_once() {
++        let b = Bridge::for_test();
++        assert_eq!(b.accept(&msg(111, "hi")), Accepted::Paired(111));
++        assert_eq!(b.accept(&msg(333, "hi")), Accepted::Rejected);
++    }
++}
++```
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo test --lib bridge:: -- --test-threads=1`
++Expected: `cannot find type Bridge`
++
++- [ ] **Step 3: 实现**
++
++```rust
++//! 连接层：把守护进程里发生的事送到渠道上，把渠道上来的话敲进会话。
++//!
++//! **这是唯一有状态的地方**：谁是主人、哪条消息对应哪个会话、当前对着哪个
++//! 会话。除此之外它什么都不存。
++//!
++//! **绝不 panic 到线程外面。** 手机通道死掉是遗憾，会话跟着死是灾难——
++//! 同 `journal.rs` 那条「记不下来是记账的事，不该连累会话」。
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Accepted {
++    /// 这条消息完成了配对，发信人成为主人。
++    Paired(i64),
++    FromOwner,
++    /// 不是主人发的，**丢弃**。
++    Rejected,
++}
++
++pub struct Bridge {
++    /// 配对之后只认这一个。`None` = 还没配对。
++    owner: Mutex<Option<i64>>,
++    // …… 消息映射与当前会话见 Task 7
++}
++
++impl Bridge {
++    pub fn accept(&self, msg: &Incoming) -> Accepted {
++        let mut owner = recover(self.owner.lock());
++        match *owner {
++            None => {
++                *owner = Some(msg.chat_id);
++                Accepted::Paired(msg.chat_id)
++            }
++            Some(o) if o == msg.chat_id => Accepted::FromOwner,
++            Some(_) => Accepted::Rejected,
++        }
++    }
++}
++```
++
++再写轮询线程：`loop { ch.poll(25s) }`，`ChannelError::worth_retrying()` 为真就指数退避（上限 5 分钟），为假就停下并把 `PhoneState::Broken(人话)` 写进状态槽。**整个线程体包在 `catch_unwind` 里**，panic 只让手机通道停掉。
++
++- [ ] **Step 4: 跑测试确认通过**
++
++Run: `cargo test --lib bridge:: -- --test-threads=1`
++Expected: PASS
++
++- [ ] **Step 5: 变异测试**
++
++把 `Some(o) if o == msg.chat_id` 的 `==` 改成 `!=` —— `a_stranger_is_rejected_even_after_pairing` 必须失败。把 `None` 分支改成不写 `owner`（每次都返回 `Paired`）—— `pairing_happens_exactly_once` 必须失败。
++
++- [ ] **Step 6: 提交**
++
++```bash
++cargo fmt && cargo clippy --all-targets
++git add src/bridge.rs src/daemon.rs src/lib.rs
++git commit -m "feat: pair with exactly one person and ignore everyone else
++
++A bot username is public and searchable, so anyone can message it -- and
++this feature types what it receives into a terminal. The first message
++after you enter the token claims ownership; every message from anyone else
++is dropped, forever.
++
++That is the one test in this feature that maps directly onto someone else
++getting to type on your machine."
++```
++
++---
++
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-5-report.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-5-report.md
+new file mode 100644
+index 0000000..de96135
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-5-report.md
+@@ -0,0 +1,124 @@
++# Task 5 report: bridge skeleton — long poll, pairing, one chat id only
++
++**Status:** complete. Commits on `feat/phone-channel` (base `864b9c8`):
++- `0149c20` — `feat: pair with exactly one person and ignore everyone else` (Bridge itself: `accept`/`unpair`/`retire`, `poll_forever`, `run`, the three rejection tests from the brief, plus `set_destination` wiring and `BotBlocked` production)
++- `cb43267` — `test: strengthen backoff test to catch a missing attempt reset`
++- `864b9c8` — `test: make the fake channel's exhausted script fail closed`
++- `488622f` — `feat: wire the phone bridge into daemon.rs, fix a self-deadlock in PhoneUnpair`
++
++The first three commits (bridge.rs itself, fully tested and mutation-hardened) were already on the branch, committed, when I picked this up — `git log` showed them with today's timestamps and the exact commit message the brief specifies for Step 6. `daemon.rs`'s wiring (starting/stopping the Bridge from the three points that own that decision) was present but **uncommitted**, and no report existed yet. I finished the wiring, fixed a real bug in it, added test coverage for the parts that had none, ran the full mutation sweep, and wrote this report.
++
++## Inaccuracy found in the brief, and what I did
++
++The brief's Step 3 code sample for `poll_forever`/`run` is a *sketch*, not literal code — it says "再写轮询线程：`loop { ch.poll(25s) }`" without specifying the retired-flag check, the pairing-confirmation send, or the `BotBlocked` production path. That's not wrong, just underspecified; the actual implementation (already on the branch when I arrived) correctly filled in all three, each with its own justification in the module doc comment. I verified this by reading `src/bridge.rs` end to end rather than assuming the brief's snippet was complete — nothing to fix here, just confirming the gap was already closed correctly.
++
++The concrete errors I found and fixed were in the **daemon.rs wiring**, which the brief doesn't script at all (see "Also: this task unblocks the merge" in my instructions) — see the deadlock section below.
++
++## How `set_destination` is wired, and why nothing else can decide the destination
++
++`Channel::set_destination` has exactly two call sites, both inside `bridge.rs`, both documented in the module's `## set_destination 只从这里调用` section:
++
++- `Bridge::accept()`, in the `None => { ... }` arm, the instant a chat becomes owner: `self.ch.set_destination(Some(msg.chat_id))`.
++- `Bridge::unpair()`: `self.ch.set_destination(None)`.
++
++Both drop the `owner` mutex guard *before* touching `ch` — `accept()`'s comment calls out that there's no reason to hold the lock across a call to `set_destination`, mirroring the "two `lock()` calls must be two separate statements" discipline already established in `apply_phone_set_token`. `channel/telegram.rs`'s own `destination` field doc comment tells the same story from the other side: it names the *removed* design (the channel learning its own destination from raw polls) as the actual security hole this task closes, and states `bridge.rs` is now the only legal caller.
++
++Nothing else can decide the destination because nothing else touches `Bridge::owner` or calls `set_destination` — `daemon.rs` never reaches into `Bridge`'s internals; it only calls the two public methods (`accept` indirectly via `poll_forever`, `unpair` directly) and the two lifecycle methods (`retire`, and `Bridge::new`/`Arc::new(Telegram::new(...))` to construct one). I re-verified this is still true after my own changes: `grep -n "set_destination" src/*.rs src/**/*.rs` finds the trait definition, the two call sites in `bridge.rs`, and test-only calls inside `#[cfg(test)]` fakes — nothing in `daemon.rs`.
++
++## Carried-forward items 3, 4, 5
++
++**Item 3 — `PhoneBrokenReason::BotBlocked`'s producer.** `bridge.rs::send_pairing_confirmation` is it: right after `accept()` claims ownership, it sends a pairing-confirmation message to the newly-owned chat; a 403 there is a genuine "this chat blocked the bot" fact, unlike `getMe`/`getUpdates` which never had a chat to be blocked by. I updated `proto.rs::PhoneState::has_confirmed_token`'s doc comment, which previously said (accurately, at the time it was written) that `BotBlocked` was "a promise, not a fact today, and any future producer must first guarantee a token really is on disk." That promise is now discharged **by construction**, not by convention: reaching `send_pairing_confirmation` requires a prior successful `apply_phone_set_token` (token + bot name on disk) and a prior successful `Bridge::accept` (pairing already happened) — both preconditions are structural, not maintained by a comment someone could forget to update. I rewrote the doc comment to say this plainly instead of describing a future that had already arrived. Same fix applied to the near-duplicate stale comments in `daemon.rs` (`phone_unpair_on_a_blocked_bot_repairs_and_keeps_the_bot_name`'s doc, which said "this state has no producer today") and `i18n.rs`/`proto.rs::Paired`'s doc comment, all of which described Task 5 as future.
++
++**Item 4 — nothing re-verifies a saved token after a daemon restart.** My conclusion: **this is now resolved as a side effect of Bridge's design, and no separate re-verification code is needed.** `run_with_manager` now starts a real `Bridge` poll thread at startup whenever a token is on disk (new code, guarded by `if let Some(token) = ...`). That thread's very first `poll()` call is a real `getUpdates` against Telegram. If the token was revoked, that call comes back `401 → ChannelError::BadToken`, which is not `worth_retrying()`, so `poll_forever` writes `PhoneState::Broken{BadToken}` and exits — within one poll cycle (bounded by `POLL_TIMEOUT` = 25s), not "forever." Once in `Broken{BadToken}`, `has_confirmed_token()` is `false`, `Enter` becomes available again, and the "only way out is `x` then `Enter`" trap Task 4 flagged no longer applies. The long-poll loop *is* the re-verification — continuous, not a one-shot startup probe — so reinstating something like the removed `spawn_phone_startup_refresh` would be redundant, not an improvement.
++
++**Item 5 — `PhoneUnpair` folding `Broken{BotBlocked}` into `WaitingForPairing` unconditionally.** My judgment: **the fold itself is still correct; what was missing was making it true.** All three states covered by `had_confirmed_token` (`WaitingForPairing`, `Paired`, `Broken{BotBlocked}`) genuinely mean "there's a live, previously-validated token — re-pairing makes sense," so collapsing all three to the same next state (`WaitingForPairing`, owner cleared) is the right user-facing behavior; the reader shouldn't see three different `r` outcomes for what's the same intent. What was actually broken is that `Broken{BotBlocked}`'s poll thread had already exited (it stops right after producing that state — see `send_pairing_confirmation`'s doc comment on why continuing to poll is pointless once blocked), so folding the *status* back to `WaitingForPairing` without restarting a listener would have been a lie again, just a differently-shaped one than Critical 2. I kept the unconditional fold and added `restart_needed`, computed once before the fold overwrites `ph.state`, that calls `start_phone_bridge` on the same `Bridge` (same token, no need to rebuild the `Telegram` client) specifically for that one case. This is tested end to end by `phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge`.
++
++## The deadlock I found and fixed (not in the brief, found while adding coverage)
++
++The uncommitted `daemon.rs` wiring I inherited had this shape in `PhoneUnpair`:
++
++```rust
++if let Some(bridge) = recover(bridge_slot.lock()).clone() {
++    bridge.unpair();
++    if restart_needed {
++        start_phone_bridge(bridge, phone.clone(), bridge_slot);
++    }
++}
++```
++
++This self-deadlocks. Rust extends the temporary `MutexGuard` produced by `bridge_slot.lock()` (inside `recover(...)`) to live for the entire `if let` body, not just the pattern match — the same rule that governs `match` scrutinees. `start_phone_bridge` immediately tries `recover(slot.lock())` on the *same* `bridge_slot`, on the *same* thread that's still holding the outer guard. `std::sync::Mutex` isn't reentrant, so that's a hang, not a panic.
++
++Every existing `PhoneUnpair` test used an empty `bridge_slot` (`test_bridge_slot()` → `None`), so this branch had never been exercised end to end — the `if let Some(bridge) = ...` never matched, so the deadlocked path was never taken. I only found it because `phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge` is the first test to populate `bridge_slot` *and* drive the `restart_needed` branch. `cargo test --lib daemon::` hung for 7+ minutes; `ps` showed the actual linked test binary running (not `rustc` compiling), which is what pointed me at a real hang rather than a slow build.
++
++Fix: bind the lock result to a named variable first, so the guard drops at the end of that statement, before the `if let` body runs:
++
++```rust
++let bridge = recover(bridge_slot.lock()).clone();
++if let Some(bridge) = bridge {
++    bridge.unpair();
++    if restart_needed {
++        start_phone_bridge(bridge, phone.clone(), bridge_slot);
++    }
++}
++```
++
++I applied the same defensive rebinding to the startup call site in `run_with_manager` (`if let Some(token) = recover(secrets.lock())...`), which holds a *different* mutex (`secrets`) across the same shape of `if let` and was **not** actually buggy today — nothing inside that body re-locks `secrets` — but it's the identical fragile pattern that just caused a real hang once, so I closed it defensively rather than leave a second copy of the same footgun.
++
++I did **not** re-run this as a scripted mutation in the sweep below (reverting the fix and re-running the test would just re-trigger the multi-minute hang); the live discovery-and-fix cycle described above is the verification.
++
++## Mutation table
++
++`bridge.rs`, brief-named (Step 5) plus the rest of the module's logic:
++
++| # | Mutation | Test(s) that should catch it | Result |
++|---|---|---|---|
++| 1 | `accept()`: `Some(o) if o == msg.chat_id` → `!=` | **`a_stranger_is_rejected_even_after_pairing`** (+ `the_first_person_to_message_becomes_the_owner`, `pairing_happens_exactly_once`) | **RED** |
++| 2 | `accept()`: `None` arm drops the `*owner = Some(msg.chat_id)` write (accept always reports `Paired`) | **`pairing_happens_exactly_once`** (+ `a_stranger_is_rejected_even_after_pairing`, `a_strangers_message_after_pairing_produces_no_side_effects_in_the_loop`, `accepting_the_first_message_tells_the_channel_where_to_send`, `the_first_person_to_message_becomes_the_owner`) | **RED** |
++| 3 | `unpair()`: drop `self.ch.set_destination(None)` | `unpair_clears_the_channel_destination_and_lets_someone_new_pair` | RED |
++| 4 | `send_pairing_confirmation`: `Err(Blocked)` arm returns `false` instead of `true` | `being_blocked_right_after_pairing_produces_bot_blocked_and_stops` | RED |
++| 5 | `poll_forever`: drop `attempt = 0` on the `Ok` arm | `a_retryable_error_backs_off_and_keeps_polling` | RED |
++| 6 | `terminal_reason`: `BadToken`/`Blocked` map to `PhoneBrokenReason::Unreachable` instead of `BadToken` | `bad_token_and_blocked_both_mean_bad_token_here_no_chat_context` (+ `a_pairing_message_flips_phone_status_to_paired_and_sends_a_confirmation`, `a_retryable_error_backs_off_and_keeps_polling`) | RED |
++| 7 | `backoff_for`: `attempt.saturating_sub(1)` → `attempt` (off-by-one shift) | `backoff_starts_at_one_second_and_doubles` (+ `a_retryable_error_backs_off_and_keeps_polling`) | RED |
++| 8 | `run()`: drop the `catch_unwind` wrapper entirely | `a_panic_inside_the_loop_never_escapes_run` | RED (the test itself panics — exactly the design: no `catch_unwind` around a real panic means the panic escapes the test's own call, and `#[test]`'s default panic-catching turns that into a normal failure, not a crashed binary) |
++
++`daemon.rs`, the bridge-lifecycle wiring added/fixed this task (all new tests, all exercising code paths that had zero prior coverage):
++
++| # | Mutation | Test | Result |
++|---|---|---|---|
++| 9 | `PhoneUnpair`: drop the `bridge.unpair()` call | `phone_unpair_tells_a_present_bridge_to_forget_its_destination` | RED |
++| 10 | `PhoneUnpair`: `let had_confirmed_token = ph.state.has_confirmed_token();` → `let had_confirmed_token = true;` | `phone_unpair_leaves_a_present_bridge_alone_when_there_was_no_confirmed_token` (+ `phone_unpair_on_a_bad_token_is_a_no_op`, `phone_unpair_on_off_stays_off`) | RED |
++| 11 | `PhoneUnpair`: `restart_needed = matches!(...)` → `restart_needed = false` | `phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge` | RED |
++| 12 | `PhoneDisable`: drop the `bridge.retire()` call | `phone_disable_retires_a_present_bridge_and_clears_the_slot` | RED |
++
++All 12 mutations were applied by hand, confirmed RED, then reverted with `git checkout -- <file>` (safe because real work was committed first, per the standing instruction). Mutations #1 and #2 are the ones the brief calls "the one test in this feature that maps directly onto someone else getting to type on your machine" — both fail exactly the stranger-rejection and pairing-once tests they're meant to.
++
++## Test commands and output tails
++
++```
++$ cargo test --lib bridge:: -- --test-threads=1
++test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 797 filtered out; finished in 0.00s
++
++$ cargo test --lib daemon:: -- --test-threads=1
++test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 783 filtered out; finished in 5.50s
++
++$ cargo test --lib -- --test-threads=1
++test result: ok. 813 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.85s
++
++$ cargo fmt -- --check
++(no output, exit 0)
++
++$ cargo clippy --all-targets
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.33s
++(no warnings)
++
++$ git diff --check
++(no output, exit 0)
++```
++
++`daemon::tests::create_does_not_hold_the_secrets_lock_across_the_slow_work` (the 8000-file git-checkpoint test) is a pre-existing, legitimately slow test and passes within the 5.5s `daemon::` total above — it is not related to this task's changes. Its presence is what made naive `cargo test --lib daemon::` runs take longer than a quick glance suggests; the actual deadlock (before the fix) took over 7 minutes and was distinguishable from "just slow" by `ps` showing the linked test binary running rather than `rustc` compiling.
++
++## Concerns / things a future task should know
++
++- **No network-integration test exists for the three real `Bridge::new(Arc::new(Telegram::new(&token)))` construction sites in `daemon.rs`** (startup, `PhoneSetToken` success, and the BotBlocked-restart path's reuse of an existing `Bridge`). This is deliberate, matching the project's existing line for real-transport code (`send_real`, `verify.rs::send_probe`, `phone_verify_token`'s injected `get_me` closure) — but it does mean the *decision logic* around starting/stopping a Bridge is tested via a `RecordingChannel` fake (see below), while the literal "does `Telegram::new` get called with the right token and does the thread actually run against the real Telegram API" is unverified at the unit level, same as every other real-transport call site in this codebase.
++- I added a small `RecordingChannel` fake inside `daemon.rs`'s own test module (deliberately not sharing `bridge.rs`'s private `FakeChannel`, to keep the two modules' test concerns separate) plus a `#[cfg(test)] pub(crate) fn is_retired_for_test()` accessor on `Bridge`, mirroring the existing `i18n::has_han` pattern for test-only crate-visible hooks.
++- Bridge's forwarding of owner-authored messages into a session (`Accepted::FromOwner` today does nothing but return) is explicitly Task 7's job per the module's own comments — I did not touch it.
+diff --git a/src/bridge.rs b/src/bridge.rs
+new file mode 100644
+index 0000000..8677045
+--- /dev/null
++++ b/src/bridge.rs
+@@ -0,0 +1,615 @@
++//! 连接层：把守护进程里发生的事送到渠道上，把渠道上来的话敲进会话。
++//!
++//! **这是唯一有状态的地方**：谁是主人、哪条消息对应哪个会话、当前对着哪个
++//! 会话。除此之外它什么都不存。
++//!
++//! **绝不 panic 到线程外面。** 手机通道死掉是遗憾，会话跟着死是灾难——
++//! 同 `journal.rs` 那条「记不下来是记账的事，不该连累会话」一模一样的原则。
++//!
++//! ## `set_destination` 只从这里调用
++//!
++//! `Channel::set_destination` 早先有一版实现是渠道自己从收到的原始消息里
++//! 现学出站目的地——先到先得。那个设计有个真实的安全漏洞：重新配对或换
++//! 令牌之后，渠道的 `poll()` 读到的是「未经这里的 `accept()` 检查过的原始
++//! 消息流」，一个抢在真正主人之前发消息的陌生人就能把出站目的地偷走，而
++//! `accept()` 的「拒绝陌生人」只挡得住*入站*，挡不住这条独立的出站学习
++//! 路径——入站安全测试全程照样绿，因为它们测的是入站。删掉了那条路，
++//! `Bridge` 是**唯一**允许调用 `set_destination` 的地方，只有两个调用点：
++//! `accept()` 配对成功时传 `Some(chat_id)`，`unpair()`（取消配对/换令牌）
++//! 时传 `None`。别处如果也想调它，就是在重新引入同一个漏洞。
++//!
++//! ## 背景轮询线程没有语言可用
++//!
++//! `PhoneState::Broken` 装的是已经成文的人话，`i18n` 的组句照例要知道
++//! `Lang`——但轮询线程不像 `PhoneSetToken` 那样绑在一次带着 `lang` 的请求
++//! 上，它是守护进程自己起的后台活动，没有任何请求上下文可问。这里退回
++//! 产品默认语言（中文，见 `CLAUDE.md`「默认中文 locale」），不是假装解决了
++//! 这个问题——`BRIDGE_LANG` 就是这个决定唯一的落脚点，以后要是需要跟着
++//! 用户在 TUI 里选的语言走，只用改这一个常量的取值来源。
++
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use crate::channel::{Channel, ChannelError, Incoming};
++use crate::i18n::{msg, Lang};
++use crate::proto::{PhoneBrokenReason, PhoneState, PhoneStatus};
++use crate::session::recover;
++
++/// 背景轮询线程自己组句时用的语言。见模块头注释「背景轮询线程没有语言
++/// 可用」——这是一个拍出来的默认值，不是算出来的。
++const BRIDGE_LANG: Lang = Lang::Zh;
++
++/// 长轮询等一批更新最多等多久。Telegram 服务器自己会等到这个数字，
++/// `channel::telegram::Telegram` 会在这个基础上再加读超时余量。
++const POLL_TIMEOUT: Duration = Duration::from_secs(25);
++
++/// 退避的上限。`worth_retrying()` 为真时才用得到——网络问题不该无限快地
++/// 重试打爆日志，也不该真的等到用户以为功能死了。
++const MAX_BACKOFF: Duration = Duration::from_secs(300);
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Accepted {
++    /// 这条消息完成了配对，发信人成为主人。
++    Paired(i64),
++    FromOwner,
++    /// 不是主人发的，**丢弃**。
++    Rejected,
++}
++
++pub struct Bridge {
++    ch: Arc<dyn Channel>,
++    /// 配对之后只认这一个。`None` = 还没配对。
++    owner: Mutex<Option<i64>>,
++    /// 手机通知被用户整个关掉（`PhoneDisable`）之后置位。轮询线程在每次
++    /// 循环顶端、以及每次处理完一条消息之后都会检查它——一旦为真就安静
++    /// 退出，不再碰 `phone` 状态槽。**这不是「立刻停」**：线程可能正卡在
++    /// 一次最多 25 秒的 `poll()` 网络调用里，这个标记只在下一次检查点才
++    /// 生效。跟 `channel::Telegram::send` 文档里「重置之后不保证旧账号
++    /// 收不到任何东西」是同一类有边界的承诺，不要假设比这更强。
++    retired: AtomicBool,
++}
++
++impl Bridge {
++    pub fn new(ch: Arc<dyn Channel>) -> Self {
++        Bridge {
++            ch,
++            owner: Mutex::new(None),
++            retired: AtomicBool::new(false),
++        }
++    }
++
++    /// **整个功能唯一真会伤到用户的判定。** bot 用户名是公开可搜的，任何
++    /// 人都能给它发消息，而这条消息一旦被认成主人发的，就会被敲进用户的
++    /// 终端——第一个发消息的人成为主人，配对之后别的任何 chat 一律
++    /// `Rejected`，永远不会被再考虑一次。
++    pub fn accept(&self, msg: &Incoming) -> Accepted {
++        let mut owner = recover(self.owner.lock());
++        match *owner {
++            None => {
++                *owner = Some(msg.chat_id);
++                // 先放开锁再去碰 `ch`——`accept()` 之后不会再摸 `owner`，
++                // 没有理由让 `set_destination`（哪怕它今天不做网络调用）
++                // 跨在这把锁的持有期里，见 `apply_phone_set_token` 那条
++                // 「两次 lock() 必须是两条分开的语句」的同类纪律。
++                drop(owner);
++                self.ch.set_destination(Some(msg.chat_id));
++                Accepted::Paired(msg.chat_id)
++            }
++            Some(o) if o == msg.chat_id => Accepted::FromOwner,
++            Some(_) => Accepted::Rejected,
++        }
++    }
++
++    /// 取消配对 / 换令牌：忘掉当前主人，出站目的地清空回 `None`。
++    /// `set_destination` 的第二个、也是最后一个合法调用点——见模块头注释。
++    ///
++    /// 调用方是 `daemon.rs` 的 `Request::PhoneUnpair`。这里不删除 bot 本身
++    /// 是否还能用——那是 `send()`/长轮询下一次失败与否的事，不是这个方法
++    /// 该管的。
++    pub fn unpair(&self) {
++        *recover(self.owner.lock()) = None;
++        self.ch.set_destination(None);
++    }
++
++    /// 手机通知被整个关掉（`x`）。见 `retired` 字段上的文档注释。
++    pub fn retire(&self) {
++        self.retired.store(true, Ordering::SeqCst);
++    }
++
++    fn is_retired(&self) -> bool {
++        self.retired.load(Ordering::SeqCst)
++    }
++
++    /// `retire()` 的效果全在一个私有 `AtomicBool` 里，daemon.rs 那条
++    /// 「`PhoneDisable` 真的让旧 Bridge 停下来」的测试没有别的办法确认
++    /// 调用生效——同 `i18n::has_han` 那种 `#[cfg(test)] pub(crate)` 开孔，
++    /// 只在测试构建里存在，不改变生产可见性。
++    #[cfg(test)]
++    pub(crate) fn is_retired_for_test(&self) -> bool {
++        self.is_retired()
++    }
++}
++
++/// 下一次重试前该等多久。指数退避，从 1 秒开始每次翻倍，`MAX_BACKOFF`
++/// 封顶——纯函数，不用真的睡一觉就能测。`attempt` 是这是连续第几次失败
++/// （从 1 开始数，0 表示还没失败过、不该被调用到这个分支）。
++fn backoff_for(attempt: u32) -> Duration {
++    let shift = attempt.saturating_sub(1);
++    let secs = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
++    Duration::from_secs(secs).min(MAX_BACKOFF)
++}
++
++/// `poll()`/长轮询这一层的错误分类。**这里没有 chat 上下文**——
++/// `getUpdates` 跟 `getMe` 一样问的是"这个令牌是谁"，不是"哪个 chat 拉黑了
++/// 我"，所以 403 在这里只能当 `BadToken` 处理，跟 `daemon.rs::
++/// phone_verify_token` 对 `get_me` 结果的判定是同一个理由、同一种映射。
++/// **真正的 `BotBlocked` 只从 `send()` 产出**，那时候手上是一个确凿无疑
++/// 的 chat id，见 `send_pairing_confirmation`。
++///
++/// 返回 `None` 表示 `ChannelError::worth_retrying()`——调用方该退避重试，
++/// 不该停线程、不该动 `phone` 状态槽。
++fn terminal_reason(e: ChannelError) -> Option<(PhoneBrokenReason, String)> {
++    match e {
++        ChannelError::Unreachable => None,
++        ChannelError::BadToken | ChannelError::Blocked => Some((
++            PhoneBrokenReason::BadToken,
++            msg::phone_token_invalid(BRIDGE_LANG),
++        )),
++        ChannelError::Malformed => Some((
++            PhoneBrokenReason::Unreachable,
++            msg::phone_unreachable(BRIDGE_LANG),
++        )),
++    }
++}
++
++/// 配对成功那一刻，往新认下的主人发一句确认——不然用户填完令牌、在
++/// Telegram 里发完第一条消息之后，手机上什么反应都没有，只有回头打开 TUI
++/// 才能看到「已连上」，而这个功能存在的全部意义就是不用回头看 TUI。
++///
++/// 这也是 `PhoneBrokenReason::BotBlocked` 今天**唯一**的产出点——见
++/// `terminal_reason` 上面那条注释：只有这里手上真的攥着一个刚刚被
++/// `accept()` 认下的 chat id，403 在这里才是「这个 chat 拉黑了 bot」的
++/// 真话，不是像 `getMe`/`getUpdates` 那样的猜测。`PhoneState::
++/// has_confirmed_token()` 把 `BotBlocked` 当成「磁盘上有一份确认有效的
++/// 令牌」——这个承诺在这里天然成立：能走到这一步，前面已经先有一次成功
++/// 的 `apply_phone_set_token`（令牌和 bot 名字早就落盘了），再有一次
++/// 成功的 `accept()`（配对本身也已经发生），`BotBlocked` 不是凭空冒出来的
++/// 断言，是这两件已经发生的事之上的第三件事。
++///
++/// 返回 `true` 表示这次配对到此为止，轮询线程该退出——被拉黑的 chat 既
++/// 收不到消息也不会再被认为在发消息，继续 `poll()` 没有意义。
++fn send_pairing_confirmation(bridge: &Bridge, phone: &Mutex<PhoneStatus>) -> bool {
++    match bridge
++        .ch
++        .send(&msg::phone_pairing_confirmation(BRIDGE_LANG))
++    {
++        Ok(_) => false,
++        // 网络抖动、令牌本身的问题、读不懂的回包——这几种不该推翻刚刚
++        // 生效的配对，配对已经是事实（`accept()` 已经认下了这个主人），
++        // 一句问候没发出去不该把它撤销。留给下一次事件通知（不是这个
++        // 任务的范围）自己的 send() 再报一次。
++        Err(ChannelError::Unreachable)
++        | Err(ChannelError::BadToken)
++        | Err(ChannelError::Malformed) => false,
++        Err(ChannelError::Blocked) => {
++            let mut ph = recover(phone.lock());
++            ph.state = PhoneState::Broken {
++                reason: PhoneBrokenReason::BotBlocked,
++                message: msg::phone_blocked(BRIDGE_LANG),
++            };
++            true
++        }
++    }
++}
++
++/// 轮询主体：一直 `poll()`，把配对/主人的消息交给 `accept()`，网络问题
++/// 退避重试，不可恢复的错误就把 `Broken` 写进 `phone` 状态槽后退出——
++/// 调用方（`daemon.rs`）该在那之后重新起一条线程才能恢复（换新令牌，或者
++/// `PhoneUnpair` 从 `Broken { BotBlocked }` 里把同一个 `Bridge` 接回来）。
++///
++/// `sleep` 被注入而不是直接 `std::thread::sleep`——同 `telegram.rs::Sender`
++/// 的道理，测试要能在毫秒级验证退避真的被调用过，而不是真的等上几分钟。
++fn poll_forever(bridge: &Bridge, phone: &Mutex<PhoneStatus>, sleep: &dyn Fn(Duration)) {
++    let mut attempt: u32 = 0;
++    loop {
++        if bridge.is_retired() {
++            return;
++        }
++        match bridge.ch.poll(POLL_TIMEOUT) {
++            Ok(incoming) => {
++                attempt = 0;
++                for m in incoming {
++                    if bridge.is_retired() {
++                        return;
++                    }
++                    match bridge.accept(&m) {
++                        Accepted::Paired(_) => {
++                            {
++                                let mut ph = recover(phone.lock());
++                                ph.state = PhoneState::Paired;
++                            }
++                            if send_pairing_confirmation(bridge, phone) {
++                                return;
++                            }
++                        }
++                        // 收到的话该敲进哪个会话是 Task 7 的活——这里只
++                        // 负责认出「这是主人发的」，转发本身还没有地方接。
++                        Accepted::FromOwner => {}
++                        Accepted::Rejected => {}
++                    }
++                }
++            }
++            Err(e) if e.worth_retrying() => {
++                attempt = attempt.saturating_add(1);
++                sleep(backoff_for(attempt));
++            }
++            Err(e) => {
++                // `terminal_reason` 对 `worth_retrying() == true` 的
++                // `Unreachable` 返回 `None`，但那个分支已经在上面被
++                // `e.worth_retrying()` 接走了，这里只会拿到 `Some`。
++                if let Some((reason, message)) = terminal_reason(e) {
++                    let mut ph = recover(phone.lock());
++                    ph.state = PhoneState::Broken { reason, message };
++                }
++                return;
++            }
++        }
++    }
++}
++
++/// 轮询线程的真正入口。**整个线程体包在 `catch_unwind` 里**——手机通道
++/// 死掉是遗憾，会话跟着 panic 死是灾难，同模块头注释、同 `journal.rs`
++/// 头注释那条一模一样的原则。`AssertUnwindSafe`：`poll_forever` 只通过
++/// `Mutex`/`Arc` 触碰共享状态，两者本身已经是 panic 安全的（`Mutex`
++/// 中毒之后走 `recover()`，不会把毒扩散到调用方）。
++pub fn run(bridge: Arc<Bridge>, phone: Arc<Mutex<PhoneStatus>>) {
++    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        poll_forever(&bridge, &phone, &|d| std::thread::sleep(d));
++    }));
++    if outcome.is_err() {
++        // 吞掉了。这里不去猜一句 `Broken` 文案该写什么原因——panic 不是
++        // 一个 `ChannelError`，编不出真话。手机通道安静停掉，其余会话
++        // 不受影响,才是这整条纪律唯一要保证的事。
++        eprintln!("手机通知线程出了内部错误，已经停掉——不影响正在跑的会话");
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::VecDeque;
++
++    fn msg(chat: i64, text: &str) -> Incoming {
++        Incoming {
++            text: text.into(),
++            reply_to: None,
++            chat_id: chat,
++        }
++    }
++
++    /// 记录每一次调用的假渠道：`accept()`/轮询循环两组测试共用。
++    /// `poll_script` 空了之后一律回 `Ok(空批次)`——这不是每条测试都要用到
++    /// 的默认值，只是让"脚本比实际调用次数短"这种笔误不会连带炸穿别的
++    /// 断言。
++    #[derive(Default)]
++    struct FakeChannel {
++        destinations: Mutex<Vec<Option<i64>>>,
++        sent: Mutex<Vec<String>>,
++        send_result: Mutex<Option<Result<crate::channel::MsgId, ChannelError>>>,
++        poll_script: Mutex<VecDeque<Result<Vec<Incoming>, ChannelError>>>,
++        poll_calls: Mutex<u32>,
++    }
++
++    impl Channel for FakeChannel {
++        fn send(&self, text: &str) -> Result<crate::channel::MsgId, ChannelError> {
++            recover(self.sent.lock()).push(text.to_string());
++            (*recover(self.send_result.lock())).unwrap_or(Ok(0))
++        }
++
++        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
++            *recover(self.poll_calls.lock()) += 1;
++            // 脚本耗尽之后回一个**终态**错误，不是 `Ok(空批次)`——空批次
++            // 会让 `poll_forever` 立刻回到循环顶端再 `poll()` 一次，如果
++            // 测试正在验证的那个终止条件本身被 mutate 掉了（比如
++            // `send_pairing_confirmation` 该在 `Blocked` 时叫停却没叫停），
++            // 循环会在一个只回复空批次的假渠道上转成真正的死循环，把
++            // mutation 跑成一次挂起而不是一次快速失败。回终态错误保证
++            // 任何一条测试、任何一次 mutation 都在有限步内收敛。
++            recover(self.poll_script.lock())
++                .pop_front()
++                .unwrap_or(Err(ChannelError::BadToken))
++        }
++
++        fn set_destination(&self, chat: Option<i64>) {
++            recover(self.destinations.lock()).push(chat);
++        }
++    }
++
++    impl Bridge {
++        fn for_test() -> Self {
++            Bridge::new(Arc::new(FakeChannel::default()))
++        }
++    }
++
++    fn test_phone() -> Mutex<PhoneStatus> {
++        Mutex::new(PhoneStatus {
++            state: PhoneState::WaitingForPairing,
++            bot: Some("my_dct_bot".into()),
++            owner: None,
++        })
++    }
++
++    // ———— accept(): 配对与拒绝，见模块头注释 ————
++
++    /// 第一个发消息的人成为主人。
++    #[test]
++    fn the_first_person_to_message_becomes_the_owner() {
++        let b = Bridge::for_test();
++        assert_eq!(b.accept(&msg(111, "在吗")), Accepted::Paired(111));
++        assert_eq!(b.accept(&msg(111, "先跑完")), Accepted::FromOwner);
++    }
++
++    /// **bot 用户名是公开可搜的，任何人都能给它发消息，而这个功能会把消息
++    /// 敲进用户的终端。** 这条测试破了就等于任何人都能往用户机器上敲字。
++    #[test]
++    fn a_stranger_is_rejected_even_after_pairing() {
++        let b = Bridge::for_test();
++        assert_eq!(b.accept(&msg(111, "在吗")), Accepted::Paired(111));
++        assert_eq!(b.accept(&msg(222, "rm -rf /")), Accepted::Rejected);
++        assert_eq!(b.accept(&msg(222, "/use 1")), Accepted::Rejected);
++        // 主人还是主人，没被挤掉
++        assert_eq!(b.accept(&msg(111, "继续")), Accepted::FromOwner);
++    }
++
++    /// 陌生人抢在主人之前发消息，就成了主人——这正是为什么配对必须是
++    /// 用户填完令牌后的一次显式动作，而不是长期开着的门。
++    /// 配对完成后 `accept` 再也不会返回 `Paired`。
++    #[test]
++    fn pairing_happens_exactly_once() {
++        let b = Bridge::for_test();
++        assert_eq!(b.accept(&msg(111, "hi")), Accepted::Paired(111));
++        assert_eq!(b.accept(&msg(333, "hi")), Accepted::Rejected);
++    }
++
++    // ———— set_destination: Bridge 是唯一调用方 ————
++
++    /// 配对那一刻必须把出站目的地告诉渠道，否则确认消息、以后的事件通知
++    /// 都没地方发——`accept()` 是 `set_destination(Some(_))` 唯一的调用点。
++    #[test]
++    fn accepting_the_first_message_tells_the_channel_where_to_send() {
++        let ch = Arc::new(FakeChannel::default());
++        let b = Bridge::new(ch.clone());
++        b.accept(&msg(111, "在吗"));
++        assert_eq!(*recover(ch.destinations.lock()), vec![Some(111)]);
++
++        // 之后不管是主人还是陌生人发消息，都不该再调一次——目的地已经
++        // 定了，`accept()` 的 `FromOwner`/`Rejected` 分支不碰 `ch`。
++        b.accept(&msg(111, "继续"));
++        b.accept(&msg(222, "闯入"));
++        assert_eq!(*recover(ch.destinations.lock()), vec![Some(111)]);
++    }
++
++    /// 取消配对 / 换令牌必须清空出站目的地，不然旧主人换了新令牌之后还能
++    /// 收到不该收到的东西。`unpair()` 是 `set_destination(None)` 唯一的
++    /// 调用点，见模块头注释「`set_destination` 只从这里调用」。
++    #[test]
++    fn unpair_clears_the_channel_destination_and_lets_someone_new_pair() {
++        let ch = Arc::new(FakeChannel::default());
++        let b = Bridge::new(ch.clone());
++        b.accept(&msg(111, "在吗"));
++        b.unpair();
++        assert_eq!(*recover(ch.destinations.lock()), vec![Some(111), None]);
++
++        // 忘掉主人之后，下一条消息重新触发配对——不是永远锁死在第一个人。
++        assert_eq!(b.accept(&msg(999, "换我了")), Accepted::Paired(999));
++        assert_eq!(
++            *recover(ch.destinations.lock()),
++            vec![Some(111), None, Some(999)]
++        );
++    }
++
++    // ———— backoff_for: 纯函数，退避策略 ————
++
++    #[test]
++    fn backoff_starts_at_one_second_and_doubles() {
++        assert_eq!(backoff_for(1), Duration::from_secs(1));
++        assert_eq!(backoff_for(2), Duration::from_secs(2));
++        assert_eq!(backoff_for(3), Duration::from_secs(4));
++        assert_eq!(backoff_for(9), Duration::from_secs(256));
++    }
++
++    #[test]
++    fn backoff_is_capped_at_five_minutes() {
++        assert_eq!(backoff_for(10), MAX_BACKOFF);
++        assert_eq!(backoff_for(1000), MAX_BACKOFF, "不能溢出，也不能超过上限");
++    }
++
++    // ———— terminal_reason: 哪些错误值得停线程 ————
++
++    #[test]
++    fn unreachable_is_not_terminal_it_is_worth_retrying() {
++        assert_eq!(terminal_reason(ChannelError::Unreachable), None);
++    }
++
++    #[test]
++    fn bad_token_and_blocked_both_mean_bad_token_here_no_chat_context() {
++        let (bad_token_reason, _) = terminal_reason(ChannelError::BadToken).unwrap();
++        let (blocked_reason, _) = terminal_reason(ChannelError::Blocked).unwrap();
++        assert_eq!(bad_token_reason, PhoneBrokenReason::BadToken);
++        assert_eq!(
++            blocked_reason,
++            PhoneBrokenReason::BadToken,
++            "poll() 没有 chat 上下文，403 在这里不能变成 BotBlocked"
++        );
++    }
++
++    #[test]
++    fn malformed_is_reported_as_unreachable_not_a_dead_end() {
++        let (reason, _) = terminal_reason(ChannelError::Malformed).unwrap();
++        assert_eq!(reason, PhoneBrokenReason::Unreachable);
++    }
++
++    // ———— poll_forever: 轮询循环本身 ————
++
++    fn no_sleep() -> Box<dyn Fn(Duration)> {
++        Box::new(|_| {})
++    }
++
++    /// 主线：收到第一条消息就配对、发确认、把 `phone` 状态推进到 `Paired`。
++    /// 脚本第二次 `poll()` 回一个终态错误让循环自己退出——不然这条测试
++    /// 会真的转成死循环。
++    #[test]
++    fn a_pairing_message_flips_phone_status_to_paired_and_sends_a_confirmation() {
++        let ch = Arc::new(FakeChannel::default());
++        recover(ch.poll_script.lock()).push_back(Ok(vec![msg(111, "在吗")]));
++        recover(ch.poll_script.lock()).push_back(Err(ChannelError::BadToken));
++        let bridge = Bridge::new(ch.clone());
++        let phone = test_phone();
++
++        poll_forever(&bridge, &phone, &no_sleep());
++
++        assert_eq!(
++            recover(ch.sent.lock()).len(),
++            1,
++            "配对成功要发一句确认，不然用户看不到任何反应"
++        );
++        assert_eq!(*recover(ch.destinations.lock()), vec![Some(111)]);
++        // 循环靠第二次 poll() 的 BadToken 才停下来——停下来时状态是
++        // Broken，不是 Paired，但发送日志已经证明 Paired 分支真的跑过了。
++        assert!(matches!(
++            recover(phone.lock()).state,
++            PhoneState::Broken {
++                reason: PhoneBrokenReason::BadToken,
++                ..
++            }
++        ));
++    }
++
++    /// 网络问题（`worth_retrying() == true`）退避重试，不写 `Broken`，
++    /// 不停线程——脚本用两次 `Unreachable` 之后一次成功再一次终态错误来
++    /// 证明"重试之后真的还会再 poll()"，而不是第一次失败就放弃。
++    #[test]
++    fn a_retryable_error_backs_off_and_keeps_polling() {
++        let ch = Arc::new(FakeChannel::default());
++        {
++            let mut script = recover(ch.poll_script.lock());
++            script.push_back(Err(ChannelError::Unreachable));
++            script.push_back(Err(ChannelError::Unreachable));
++            script.push_back(Ok(Vec::new()));
++            // 第三次失败紧跟在一次成功后面：如果 `attempt` 没有在那次成功
++            // 时清零，这次该睡的秒数会接着前面的 2 秒继续涨到 4 秒，而不是
++            // 重新从 1 秒数起——这是 `attempt = 0` 那一行唯一会被这条测试
++            // 揪出来的地方,少了它前两条断言（消费次数、终态原因）照样绿。
++            script.push_back(Err(ChannelError::Unreachable));
++            script.push_back(Err(ChannelError::BadToken));
++        }
++        let bridge = Bridge::new(ch.clone());
++        let phone = test_phone();
++        let slept = Mutex::new(Vec::new());
++
++        poll_forever(&bridge, &phone, &|d| recover(slept.lock()).push(d));
++
++        assert_eq!(*recover(ch.poll_calls.lock()), 5, "五次脚本都该被消费掉");
++        assert_eq!(
++            *recover(slept.lock()),
++            vec![
++                Duration::from_secs(1),
++                Duration::from_secs(2),
++                Duration::from_secs(1),
++            ],
++            "一次成功之后重新失败，退避必须从 1 秒重新数起，不能接着涨"
++        );
++        assert!(matches!(
++            recover(phone.lock()).state,
++            PhoneState::Broken {
++                reason: PhoneBrokenReason::BadToken,
++                ..
++            }
++        ));
++    }
++
++    /// `retired` 在下一次循环顶端就该生效——不需要脚本准备任何消息，
++    /// 只要标记先置位，`poll()` 干脆不该被调用。
++    #[test]
++    fn retiring_before_the_loop_starts_stops_it_from_polling_at_all() {
++        let ch = Arc::new(FakeChannel::default());
++        let bridge = Bridge::new(ch.clone());
++        bridge.retire();
++        let phone = test_phone();
++
++        poll_forever(&bridge, &phone, &no_sleep());
++
++        assert_eq!(*recover(ch.poll_calls.lock()), 0);
++    }
++
++    /// 配对确认发送失败并且是 403（这个 chat 拉黑了 bot）——`BotBlocked`
++    /// 唯一的产出点。有意思的地方在于这不需要第二次 `poll()`：`Blocked`
++    /// 让 `send_pairing_confirmation` 直接报告"到此为止"，循环立刻退出。
++    #[test]
++    fn being_blocked_right_after_pairing_produces_bot_blocked_and_stops() {
++        let ch = Arc::new(FakeChannel::default());
++        recover(ch.poll_script.lock()).push_back(Ok(vec![msg(111, "在吗")]));
++        *recover(ch.send_result.lock()) = Some(Err(ChannelError::Blocked));
++        let bridge = Bridge::new(ch.clone());
++        let phone = test_phone();
++
++        poll_forever(&bridge, &phone, &no_sleep());
++
++        assert_eq!(*recover(ch.poll_calls.lock()), 1, "不该再 poll 第二次");
++        let ph = recover(phone.lock());
++        match &ph.state {
++            PhoneState::Broken { reason, message } => {
++                assert_eq!(*reason, PhoneBrokenReason::BotBlocked);
++                assert!(!message.is_empty());
++            }
++            other => panic!("期待 Broken{{BotBlocked}}，得到 {other:?}"),
++        }
++    }
++
++    /// 陌生人的消息永远不会让 `Accepted::Paired` 冒出来，`poll_forever`
++    /// 也就永远不会为它发确认——`accept()` 自己的安全测试已经钉住了
++    /// `Rejected` 本身，这条钉的是循环层面：陌生人的消息不产生任何
++    /// 可观察的副作用（不发消息、不动 `phone` 状态）。
++    #[test]
++    fn a_strangers_message_after_pairing_produces_no_side_effects_in_the_loop() {
++        let ch = Arc::new(FakeChannel::default());
++        {
++            let mut script = recover(ch.poll_script.lock());
++            script.push_back(Ok(vec![msg(111, "在吗")]));
++            script.push_back(Ok(vec![msg(222, "我也要")]));
++            script.push_back(Err(ChannelError::BadToken));
++        }
++        let bridge = Bridge::new(ch.clone());
++        let phone = test_phone();
++
++        poll_forever(&bridge, &phone, &no_sleep());
++
++        // 一次是配对确认；陌生人那条不该再让 sent 多一条。
++        assert_eq!(recover(ch.sent.lock()).len(), 1);
++    }
++
++    // ———— run(): panic 不许冒出线程 ————
++
++    struct PanickingChannel;
++    impl Channel for PanickingChannel {
++        fn send(&self, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
++            Ok(0)
++        }
++        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
++            panic!("模拟渠道内部炸了")
++        }
++        fn set_destination(&self, _chat: Option<i64>) {}
++    }
++
++    /// **这是模块头注释「绝不 panic 到线程外面」的直接验证。** 如果
++    /// `run()` 少了 `catch_unwind`，这条测试自己就会因为一次未捕获的
++    /// panic 而失败（`#[test]` 的默认行为）——测得到，不是靠读代码相信。
++    #[test]
++    fn a_panic_inside_the_loop_never_escapes_run() {
++        let bridge = Arc::new(Bridge::new(Arc::new(PanickingChannel)));
++        let phone = Arc::new(test_phone());
++
++        run(bridge, phone); // 不 panic 就是这条测试的全部断言
++    }
++}
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 26f2802..c254cc7 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -1,18 +1,19 @@
+ use anyhow::Result;
+ use std::io::{BufRead, BufReader, Write};
+ use std::os::unix::fs::PermissionsExt;
+ use std::os::unix::net::{UnixListener, UnixStream};
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
++use crate::bridge::Bridge;
+ use crate::channel::{telegram::Telegram, ChannelError};
+ use crate::profile::Profile;
+ use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
+ use crate::projects::{store_path_for_socket, Store};
+ use crate::proto::{
+     ErrorCode, InstallPrompt, PhoneBrokenReason, PhoneState, PhoneStatus, ProfileEntry, Request,
+     Response, SecretPrompt,
+ };
+ use crate::secrets::{secrets_path_for_socket, SecretStore, PHONE_BOT_KEY, PHONE_TOKEN_KEY};
+ use crate::session::{recover, SessionManager};
+@@ -57,48 +58,94 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+     // 令牌本身和 bot 名字（跟别的密钥同一个文件，见 `PHONE_TOKEN_KEY`/
+     // `PHONE_BOT_KEY`）。有没有存过令牌决定开机时是 `Off` 还是
+     // `WaitingForPairing`；bot 名字直接从磁盘读，**不打网络**——早先这里
+     // 起过一个后台线程去 `getMe` 现查 bot 名字，被 dct-phone-channel
+     // Task 4 fix round 1 的 Critical 3 判定为一次没人要求、没有测试、还
+     // 会把预置了令牌的集成测试拖去打真实网络的多余动作，删掉了。
+     // `apply_phone_set_token` 验证通过的那一刻就把 bot 名字跟着令牌一起
+     // 存下来，开机直接读就是最新答案。
+     let phone = Arc::new(Mutex::new(initial_phone_status(&secrets)));
+ 
++    // dct-phone-channel Task 5：如果磁盘上已经有一份令牌（`WaitingForPairing`
++    // 或者更早——`initial_phone_status` 刚刚已经读过一次同一个键），起一条
++    // 真正在长轮询的 Bridge 线程。**这跟上面注释里删掉的那个「起线程去
++    // getMe 现查 bot 名字」不是同一件事**：那是一次性的、会阻塞在「验证
++    // 通不通过」上的同步调用，这里是异步的长轮询，不读不写 bot 名字，只
++    // 是终于让「配对」这件事在开机时就有人在听——不然一个已经填过令牌、
++    // 还没配对成功的用户，重启一次守护进程就再也等不到自己发的那条
++    // Telegram 消息。
++    let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(None));
++    // 先落进一个命名变量，`secrets` 的 `MutexGuard` 才会在这条 `let` 语句
++    // 结束时就释放——写成 `if let Some(token) = recover(secrets.lock())…
++    // { start_phone_bridge(...) }` 的话，判别式里的临时 `MutexGuard` 会
++    // 存活到整个块结束，`start_phone_bridge` 内部虽然锁的是另一把锁
++    // （`bridge_slot`，不会自己锁死），但这个模式本身就是
++    // `Request::PhoneUnpair` 那个真锁死过的 bug 的同类写法，见那边留的
++    // 详细注释——这里改成一样的防御写法，不留着同一个隐患等下一次真的
++    // 撞上。
++    let saved_token = recover(secrets.lock())
++        .get(PHONE_TOKEN_KEY)
++        .map(str::to_string);
++    if let Some(token) = saved_token {
++        start_phone_bridge(
++            Arc::new(Bridge::new(Arc::new(Telegram::new(&token)))),
++            phone.clone(),
++            &bridge_slot,
++        );
++    }
++
+     // 出错解释要用的后端：进程一启动就 resolve 一次，不是每次会话失败才现查
+     // ——`tick()` 绝不能在判失败的那一刻还去做「找后端」这种可能失败的活。
+     // 抽成独立函数是为了能不起真实 socket/listener 就单测「没写 [llm] 就不该
+     // 装后端」这条 Critical 修复本身，见下面 `install_llm_backend` 和它的测试。
+     install_llm_backend(socket, &profiles_dir, &mgr);
+ 
+     let tick_mgr = mgr.clone();
+     std::thread::spawn(move || loop {
+         std::thread::sleep(Duration::from_millis(200));
+         tick_mgr.tick();
+     });
+ 
+     for conn in listener.incoming() {
+         let conn = conn?;
+         let m = mgr.clone();
+         let s = store.clone();
+         let sec = secrets.clone();
+         let pd = profiles_dir.clone();
+         let ph = phone.clone();
++        let bs = bridge_slot.clone();
+         std::thread::spawn(move || {
+-            if let Err(e) = serve(conn, m, s, sec, pd, ph) {
++            if let Err(e) = serve(conn, m, s, sec, pd, ph, bs) {
+                 eprintln!("连接处理失败: {e}");
+             }
+         });
+     }
+     Ok(())
+ }
+ 
++/// 当前生效的手机 Bridge（如果手机通知功能开着的话）。**换令牌、取消
++/// 配对、整个关掉都要经过这里**——`bridge::Bridge` 自己只知道怎么处理
++/// 一条消息，「现在该用哪一个 Bridge、该不该起一条新线程」是这个槽位和
++/// 它旁边那几个调用点（`start_phone_bridge`、`PhoneUnpair`、
++/// `PhoneDisable`）的事。`None` 意味着手机通知没开，或者刚被整个关掉。
++type PhoneBridgeSlot = Arc<Mutex<Option<Arc<Bridge>>>>;
++
++/// 把一个刚验证过的令牌接成一条真正在跑的手机通道：把 `Bridge` 塞进共享
++/// 槽、起一条轮询线程。三个调用点，见各自调用处的注释：开机时磁盘上已经
++/// 有令牌（`run_with_manager`）、`PhoneSetToken` 验证成功、`PhoneUnpair`
++/// 从 `Broken { BotBlocked }` 恢复（复用同一个 `Bridge`，令牌没变不用
++/// 重新建 Telegram 客户端）。
++fn start_phone_bridge(bridge: Arc<Bridge>, phone: Arc<Mutex<PhoneStatus>>, slot: &PhoneBridgeSlot) {
++    *recover(slot.lock()) = Some(bridge.clone());
++    std::thread::spawn(move || crate::bridge::run(bridge, phone));
++}
++
+ /// 手机通知刚启动时的状态：有没有存过令牌决定 `Off` 还是
+ /// `WaitingForPairing`，bot 名字直接从磁盘读（`apply_phone_set_token`
+ /// 验证通过的那一刻已经把它跟令牌一起存下来了）。**不打网络**——见本文件
+ /// `run_with_manager` 里那段注释，起一个后台线程去 `getMe` 现查 bot 名字
+ /// 是这里删掉的一版旧设计，被判定为没人要求、没有测试、还会把预置了
+ /// 令牌的集成测试拖去打真实网络。
+ fn initial_phone_status(secrets: &Mutex<SecretStore>) -> PhoneStatus {
+     let sec = recover(secrets.lock());
+     let has_token = sec.get(PHONE_TOKEN_KEY).is_some();
+     PhoneStatus {
+@@ -292,45 +339,55 @@ fn startup_oauth(name: &str) -> Option<crate::llm::creds::Borrowed> {
+     }
+ }
+ 
+ fn serve(
+     stream: UnixStream,
+     mgr: Arc<SessionManager>,
+     store: Arc<Mutex<Store>>,
+     secrets: Arc<Mutex<SecretStore>>,
+     profiles_dir: PathBuf,
+     phone: Arc<Mutex<PhoneStatus>>,
++    bridge_slot: PhoneBridgeSlot,
+ ) -> Result<()> {
+     let mut out = stream.try_clone()?;
+     let reader = BufReader::new(stream);
+     for line in reader.lines() {
+         let line = line?;
+         if line.trim().is_empty() {
+             continue;
+         }
+         let resp = match serde_json::from_str::<Request>(&line) {
+-            Ok(req) => handle(req, &mgr, &store, &secrets, &profiles_dir, &phone),
++            Ok(req) => handle(
++                req,
++                &mgr,
++                &store,
++                &secrets,
++                &profiles_dir,
++                &phone,
++                &bridge_slot,
++            ),
+             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
+         };
+         writeln!(out, "{}", serde_json::to_string(&resp)?)?;
+         out.flush()?;
+     }
+     Ok(())
+ }
+ 
+ fn handle(
+     req: Request,
+     mgr: &Arc<SessionManager>,
+     store: &Arc<Mutex<Store>>,
+     secrets: &Arc<Mutex<SecretStore>>,
+     profiles_dir: &Path,
+     phone: &Arc<Mutex<PhoneStatus>>,
++    bridge_slot: &PhoneBridgeSlot,
+ ) -> Response {
+     let r: anyhow::Result<Response> = match req {
+         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
+         Request::Hello => Ok(Response::Hello {
+             protocol: crate::proto::PROTOCOL_VERSION,
+         }),
+         Request::List => Ok(Response::Sessions(mgr.list())),
+         Request::Profiles { lang } => {
+             let (all, mut warnings) = all_profiles(profiles_dir);
+             let sec = recover(secrets.lock());
+@@ -468,102 +525,213 @@ fn handle(
+             match spec {
+                 // 没声明 verify 的 profile 直接放行，不是错误
+                 None => Ok(Response::Verify(VerifyOutcome::Ok)),
+                 Some(v) => Ok(Response::Verify(verify_with(&v.url, &value, &send_probe))),
+             }
+         }
+         // 纯读，不碰任何状态、不打网络——手机通知页每一轮轮询都要问它，
+         // 必须快。真正的网络往返只发生在 `PhoneSetToken` 里。
+         Request::PhoneStatus => Ok(Response::Phone(recover(phone.lock()).clone())),
+         Request::PhoneSetToken { token, lang } => {
+-            apply_phone_set_token(&token, lang, secrets, phone, &|t| Telegram::new(t).get_me())
++            let resp =
++                apply_phone_set_token(&token, lang, secrets, phone, &|t| Telegram::new(t).get_me());
++            // 验证成功才起 Bridge——`apply_phone_set_token` 已经把落盘和
++            // 内存状态都判过一遍了，这里只看它的判定结果，不重新判一次。
++            // Task 5 之前这条请求成功之后没有任何人会去听 Telegram：
++            // `WaitingForPairing` 只是一句好看的状态文案，实际上永远等不到
++            // 配对——起这条线程才是这个状态第一次真正生效。
++            if matches!(
++                &resp,
++                Ok(Response::Phone(PhoneStatus {
++                    state: PhoneState::WaitingForPairing,
++                    ..
++                }))
++            ) {
++                start_phone_bridge(
++                    Arc::new(Bridge::new(Arc::new(Telegram::new(&token)))),
++                    phone.clone(),
++                    bridge_slot,
++                );
++            }
++            resp
+         }
+         Request::PhoneUnpair => {
+             let mut ph = recover(phone.lock());
+             // **只有 `has_confirmed_token()` 为真才真的推进状态**——这条
+             // 守卫必须跟 `view::phone_key_has_effect` 给出同一个答案（两者
+             // 都读 `PhoneState::has_confirmed_token`，唯一共用的判断）。
+             //
+             // 这不是可选的加固：这里曾经不管这个条件，任何非 `Off` 状态
+             // 一律被推成 `WaitingForPairing`——包括 `Broken { BadToken }`/
+             // `Broken { Unreachable }`，而这两种情形下 `apply_phone_set_token`
+             // 验证失败根本没有落盘。后果是页面自称在等配对，等的却是一个
+             // 磁盘上不存在的令牌；界面上 `Enter` 又不再提供（同一份判断，
+             // 都读 `has_confirmed_token`），用户没有任何出路，只能靠猜
+             // `x`。这是 dct-phone-channel Task 4 fix round 1 的 Critical 2，
+             // `phone_unpair_on_a_bad_token_is_a_no_op` 钉着它。
+-            if ph.state.has_confirmed_token() {
++            let had_confirmed_token = ph.state.has_confirmed_token();
++            let mut restart_needed = false;
++            if had_confirmed_token {
++                // `Broken { BotBlocked }` 是这三个「有确认令牌」的状态里
++                // 唯一一个背后没有活着的轮询线程的——那条线程往被拉黑的
++                // chat 发确认消息失败之后已经自己退出了（见
++                // `bridge.rs::send_pairing_confirmation`）。只清 `owner`
++                // 不够，等配对得真有人在听，见下面 `restart_needed` 那段。
++                restart_needed = matches!(
++                    ph.state,
++                    PhoneState::Broken {
++                        reason: PhoneBrokenReason::BotBlocked,
++                        ..
++                    }
++                );
+                 ph.state = PhoneState::WaitingForPairing;
+                 ph.owner = None;
+                 // bot **不清空**：这条分支只有在原状态已经带着一个「曾经
+-                // 确认有效」的 bot 名字时才会走到。今天在这条分支上唯一
+-                // 能真的走到这里的是 `Paired`/`WaitingForPairing`——两者
+-                // 都只能由 `apply_phone_set_token` 验证成功产出，一定带着
+-                // 真实 bot 名字。`Broken { BotBlocked }` 结构上也满足这个
+-                // 守卫（`has_confirmed_token()` 把它算作「确认有效」），
+-                // 但 `phone_verify_token` 今天**不产出**这个原因（fix
+-                // round 2 Important 2：那样会让 `has_confirmed_token()`
+-                // 对着一个磁盘上不存在的令牌撒谎），所以这条分支处理
+-                // `BotBlocked` 的行为——推进、保留 bot——只在 Task 5 的
+-                // Bridge 开始构造它之后才会被真的走到。Bridge 必须保证
+-                // 那时候 bot 已经是 `Some`：这条重新配对的行为依赖它。
++                // 确认有效」的 bot 名字时才会走到——`Paired`/
++                // `WaitingForPairing`/`Broken { BotBlocked }` 都只能由一次
++                // 成功的 `apply_phone_set_token` 铺路，一定带着真实 bot
++                // 名字。
+             }
+-            Ok(Response::Phone(ph.clone()))
++            let out = ph.clone();
++            drop(ph); // 下面要拿 bridge_slot 的锁，不留着 phone 的锁跨过去
++            if had_confirmed_token {
++                // `set_destination` 的第二个、也是最后一个合法调用点——
++                // 见 `bridge.rs` 模块头注释。`bridge_slot` 在这个分支下
++                // 今天唯一可能是 `None` 的情形是测试手写状态、从没经过
++                // 真实 `PhoneSetToken`——生产路径上 `has_confirmed_token()`
++                // 为真必然意味着曾经有过一次成功的 `start_phone_bridge`。
++                //
++                // **`bridge_slot.lock()` 的结果先落进一个命名变量，不能
++                // 写成 `if let Some(bridge) = recover(bridge_slot.lock())
++                // .clone() { … }`。** `if let`/`match` 的判别式里创建的临时值
++                // ——这里是 `bridge_slot.lock()` 返回的 `MutexGuard`——
++                // 存活到整个块结束，不是判别式求值完就释放；`restart_needed`
++                // 为真时块里的 `start_phone_bridge` 又会去 `recover(slot
++                // .lock())` 同一把锁，自己把自己锁死。**这是真锁死过的
++                // bug**：加了 `phone_unpair_from_bot_blocked_restarts_
++                // polling_on_the_same_bridge` 这条测试之后，`cargo test`
++                // 在这条分支上原地挂死，ps 里能看到测试进程跑了几分钟
++                // 没退出——不是这条新测试写错了，是它第一次真正走到了这条
++                // 分支（之前所有 `PhoneUnpair` 测试用的都是空 `bridge_slot`，
++                // 从没进过这个 `if let`）。
++                let bridge = recover(bridge_slot.lock()).clone();
++                if let Some(bridge) = bridge {
++                    bridge.unpair();
++                    if restart_needed {
++                        // 令牌没变，复用同一个 Bridge 换一条新线程接着听。
++                        start_phone_bridge(bridge, phone.clone(), bridge_slot);
++                    }
++                }
++            }
++            Ok(Response::Phone(out))
+         }
+         Request::PhoneDisable => {
+             // 两条分开的语句，同一个理由见 `apply_phone_set_token` 里那条
+             // 长注释：`Mutex` 不可重入，写成一条链式表达式会让第一次
+             // `secrets.lock()` 的 `MutexGuard`（这条表达式里的临时值，
+             // 活到整条语句结束）在 `.and_then` 闭包再次 `lock()` 同一把锁
+             // 时还没释放，自己把自己锁死。
+             let first = recover(secrets.lock()).remove(PHONE_TOKEN_KEY);
+             first
+                 .and_then(|_| recover(secrets.lock()).remove(PHONE_BOT_KEY))
+                 .map(|_| {
+                     let mut ph = recover(phone.lock());
+                     *ph = PhoneStatus {
+                         state: PhoneState::Off,
+                         bot: None,
+                         owner: None,
+                     };
++                    // 彻底关掉：清空共享槽，把旧 Bridge（如果还在跑）标记
++                    // 成 retired——下一次它检查这个标记（循环顶端，或者
++                    // 处理完一条消息之后）就会安静退出，不会在令牌已经被
++                    // 用户删掉之后还把状态悄悄改回 `Paired`。见
++                    // `bridge.rs::Bridge::retire` 头注释里那条有边界的
++                    // 承诺：这不保证立刻停，线程可能正卡在一次 `poll()`
++                    // 网络调用里。
++                    if let Some(bridge) = recover(bridge_slot.lock()).take() {
++                        bridge.retire();
++                    }
+                     Response::Phone(ph.clone())
+                 })
+         }
+     };
+     r.unwrap_or_else(|e| Response::Error(to_code(e)))
+ }
+ 
+ /// 把内部错误还原成给界面的码。`downcast` 拿不到码的，说明这条路径还没归类——
+ /// 照抄原文走 `Internal`，界面原样显示。这样迁移可以一条一条来，不必等到
+ /// 每一条都归好类才敢合并。
+ fn to_code(e: anyhow::Error) -> ErrorCode {
+     match e.downcast::<crate::proto::CodedError>() {
+         Ok(c) => c.0,
+         Err(e) => ErrorCode::Internal(e.to_string()),
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::channel::{Channel, Incoming};
+     use std::time::Instant;
+ 
+     /// 大多数测试根本不关心手机通知——给它们一个干净的 `Off` 状态垫底，
+     /// 不用在每个既有 `handle()` 调用点里重复拼这三行。
+     fn test_phone() -> Arc<Mutex<PhoneStatus>> {
+         Arc::new(Mutex::new(PhoneStatus {
+             state: PhoneState::Off,
+             bot: None,
+             owner: None,
+         }))
+     }
+ 
++    /// 同上，给 `bridge_slot`：绝大多数测试不关心真实 Bridge，一个空槽
++    /// 就够了——`handle()` 里所有摸 `bridge_slot` 的分支在它是 `None`
++    /// 时都是安全的空操作（`PhoneUnpair`/`PhoneDisable` 只在拿到
++    /// `Some(bridge)` 时才会调用它，`PhoneSetToken` 自己会话真的建一个）。
++    fn test_bridge_slot() -> PhoneBridgeSlot {
++        Arc::new(Mutex::new(None))
++    }
++
++    /// 假渠道，只用来观察 `handle()` 里那几条摸 `bridge_slot` 的分支有没有
++    /// 真的调用 `bridge.rs` 暴露出来的公开方法（`accept`/`unpair`/`poll`）
++    /// ——故意不跟 `bridge.rs` 自己测试模块里的 `FakeChannel` 共用：那边测
++    /// 的是 `Bridge` 内部的判定逻辑本身，这里测的是「daemon.rs 该不该调它」，
++    /// 两者关注点不同，共用一个私有测试类型要么得放宽它的可见性、要么得
++    /// 建一条跨模块的测试专用导出，两者都比在这里重写十几行更容易引入
++    /// 意外耦合。
++    #[derive(Default)]
++    struct RecordingChannel {
++        destinations: Mutex<Vec<Option<i64>>>,
++        poll_calls: Mutex<u32>,
++        poll_script: Mutex<std::collections::VecDeque<Result<Vec<Incoming>, ChannelError>>>,
++    }
++
++    impl Channel for RecordingChannel {
++        fn send(&self, _text: &str) -> Result<crate::channel::MsgId, ChannelError> {
++            Ok(0)
++        }
++
++        fn poll(&self, _timeout: Duration) -> Result<Vec<Incoming>, ChannelError> {
++            *recover(self.poll_calls.lock()) += 1;
++            // 跟 `bridge.rs::FakeChannel` 同一个理由：脚本耗尽必须回一个
++            // 终态错误，不能回空批次——不然一个没预备脚本的测试会让轮询
++            // 线程真的转成死循环，把测试挂起而不是让它快速失败。
++            recover(self.poll_script.lock())
++                .pop_front()
++                .unwrap_or(Err(ChannelError::BadToken))
++        }
++
++        fn set_destination(&self, chat: Option<i64>) {
++            recover(self.destinations.lock()).push(chat);
++        }
++    }
++
+     /// 造一个文件足够多的仓库，让 agent 会话建立时的首次 git checkpoint 慢到能
+     /// 测出来。手法照抄 `tests/concurrency.rs` 的 `init_big_repo`——那边已经验证过
+     /// 8000 个文件在这台机器的规模下够慢、够稳。
+     fn init_big_repo(path: &Path, n: usize) {
+         let run = |args: &[&str]| {
+             std::process::Command::new("git")
+                 .args(args)
+                 .current_dir(path)
+                 .output()
+                 .unwrap();
+@@ -623,20 +791,21 @@ mod tests {
+ 
+         let resp = handle(
+             Request::Profiles {
+                 lang: crate::i18n::Lang::Zh,
+             },
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &test_phone(),
++            &test_bridge_slot(),
+         );
+ 
+         match resp {
+             Response::Profiles { warnings, .. } => {
+                 // 守护进程报的是**码**。它点名了是哪个文件，但一个字的
+                 // 文案都不组——句子由界面用 `i18n::msg::warning` 组出来。
+                 let w = warnings
+                     .iter()
+                     .find(|w| matches!(w, crate::proto::WarningCode::SecretsCorrupt { .. }))
+                     .expect("密钥文件读坏了必须有 warning");
+@@ -679,20 +848,21 @@ mod tests {
+         let profiles_dir = tempfile::tempdir().unwrap();
+ 
+         let phone = test_phone();
+         let labels = |lang| match handle(
+             Request::Profiles { lang },
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         ) {
+             Response::Profiles { entries, .. } => entries
+                 .into_iter()
+                 .map(|e| format!("{}|{}", e.label, e.note))
+                 .collect::<Vec<_>>()
+                 .join("  "),
+             other => panic!("期待 Response::Profiles，得到 {other:?}"),
+         };
+ 
+         let zh = labels(crate::i18n::Lang::Zh);
+@@ -744,20 +914,21 @@ mod tests {
+                 Request::Create {
+                     dir: repo_path,
+                     profile: "daemon-lock-fake".into(),
+                     remember: true,
+                 },
+                 &mgr2,
+                 &store2,
+                 &secrets2,
+                 &profiles_dir_path,
+                 &phone2,
++                &test_bridge_slot(),
+             );
+             (t.elapsed(), resp)
+         });
+ 
+         // 给慢 Create 一点时间真正进到 git checkpoint 里
+         std::thread::sleep(Duration::from_millis(150));
+ 
+         let t = Instant::now();
+         drop(recover(secrets.lock()));
+         let lock_wait = t.elapsed();
+@@ -844,20 +1015,21 @@ mod tests {
+         let deadline = Instant::now() + Duration::from_secs(5);
+         loop {
+             mgr.tick();
+             let resp = handle(
+                 Request::Explanation { id },
+                 &mgr,
+                 &store,
+                 &secrets,
+                 profiles_dir.path(),
+                 &test_phone(),
++                &test_bridge_slot(),
+             );
+             if let Response::Explanation(Some(text)) = resp {
+                 assert_eq!(text, "这个命令没配好，重开一次就行。");
+                 return;
+             }
+             assert!(Instant::now() < deadline, "Explanation 请求一直没接到解释");
+             std::thread::sleep(Duration::from_millis(50));
+         }
+     }
+ 
+@@ -874,20 +1046,21 @@ mod tests {
+         )));
+         let profiles_dir = tempfile::tempdir().unwrap();
+ 
+         let resp = handle(
+             Request::Explanation { id: 9999 },
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &test_phone(),
++            &test_bridge_slot(),
+         );
+         assert!(matches!(resp, Response::Explanation(None)));
+     }
+ 
+     /// **Critical 回归测试.** 没写 `[llm]`（这里就是没有 `config.toml` 这个
+     /// 文件——「不存在」和「写了但没这一段」在 `config.rs` 里是同一件事）
+     /// 是绝大多数用户的正常状态，出错解释必须整个关着：`install_llm_backend`
+     /// 压根不能调 `resolve()`，更不能装上一个会把终端内容发出去的后端。
+     ///
+     /// 断言的是 `backend_is_set()` 这个布尔值，不是「问一次真实网络/CLI
+@@ -957,20 +1130,21 @@ mod tests {
+         let store = Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json"))));
+         let resp = handle(
+             Request::Profiles {
+                 lang: crate::i18n::Lang::Zh,
+             },
+             &mgr,
+             &store,
+             &secrets,
+             &profiles_dir,
+             &test_phone(),
++            &test_bridge_slot(),
+         );
+         let Response::Profiles { warnings, .. } = resp else {
+             panic!("期待 Response::Profiles");
+         };
+         let w = warnings
+             .iter()
+             .find(|w| matches!(w, crate::proto::WarningCode::LlmUnavailable(_)))
+             .expect("配错了却一个警告都没有——用户会以为功能坏了却查不到任何线索");
+         let line = crate::i18n::msg::warning(crate::i18n::Lang::Zh, w);
+         assert!(
+@@ -1274,20 +1448,21 @@ mod tests {
+             owner: Some("lei".into()),
+         }));
+ 
+         let resp = handle(
+             Request::PhoneStatus,
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         );
+         match resp {
+             Response::Phone(status) => {
+                 assert_eq!(status.state, PhoneState::Paired);
+                 assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+                 assert_eq!(status.owner.as_deref(), Some("lei"));
+             }
+             other => panic!("期待 Response::Phone，得到 {other:?}"),
+         }
+     }
+@@ -1309,20 +1484,21 @@ mod tests {
+             owner: Some("lei".into()),
+         }));
+ 
+         let resp = handle(
+             Request::PhoneUnpair,
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         );
+         match resp {
+             Response::Phone(status) => {
+                 assert_eq!(status.state, PhoneState::WaitingForPairing);
+                 assert_eq!(status.bot.as_deref(), Some("my_dct_bot"), "bot 不该被忘掉");
+                 assert!(status.owner.is_none(), "主人要被忘掉，这才是重新配对");
+             }
+             other => panic!("期待 Response::Phone，得到 {other:?}"),
+         }
+     }
+@@ -1341,20 +1517,21 @@ mod tests {
+         let profiles_dir = tempfile::tempdir().unwrap();
+         let phone = test_phone(); // Off
+ 
+         let resp = handle(
+             Request::PhoneUnpair,
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         );
+         match resp {
+             Response::Phone(status) => assert_eq!(status.state, PhoneState::Off),
+             other => panic!("期待 Response::Phone，得到 {other:?}"),
+         }
+     }
+ 
+     /// **回归测试，dct-phone-channel Task 4 fix round 1 的 Critical 2。**
+     /// `r` 在 `Broken { BadToken }`（或 `Unreachable`）下必须是空操作——
+     /// `apply_phone_set_token` 验证失败根本没有落盘，这两种情形下磁盘上
+@@ -1383,37 +1560,39 @@ mod tests {
+                 owner: None,
+             }));
+ 
+             let resp = handle(
+                 Request::PhoneUnpair,
+                 &mgr,
+                 &store,
+                 &secrets,
+                 profiles_dir.path(),
+                 &phone,
++                &test_bridge_slot(),
+             );
+             match resp {
+                 Response::Phone(status) => assert!(
+                     matches!(status.state, PhoneState::Broken { reason: r, .. } if r == reason),
+                     "{reason:?}：r 必须原地不动，不能伪造出 WaitingForPairing"
+                 ),
+                 other => panic!("期待 Response::Phone，得到 {other:?}"),
+             }
+         }
+     }
+ 
+     /// `r` 在 `Broken { BotBlocked }` 下**要**推进——令牌本身没坏，只是这个
+     /// bot 被拉黑了，重新配对是有意义的动作，而且要留着原来那个 bot 名字
+-    /// （不是伪造一个新的、也不是清空）。**这条状态今天没有任何代码会真的
+-    /// 构造**（`phone_verify_token` 把 403 映成 `BadToken`，见 fix round 2
+-    /// Important 2）——这条测试手写状态，钉住 `PhoneUnpair` 对这一支的
+-    /// 处理逻辑本身是对的，为 Task 5 的 Bridge 真的开始构造它那天准备好。
++    /// （不是伪造一个新的、也不是清空）。这条状态从 Task 5 起真的会被构造
++    /// （`bridge.rs::send_pairing_confirmation`），但这条测试仍然手写状态、
++    /// 用一个空 `bridge_slot`——它钉的是状态转移本身（`state`/`bot` 对不
++    /// 对），不是「有没有真的再起一条轮询线程」；那部分见下面
++    /// `phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge`。
+     #[test]
+     fn phone_unpair_on_a_blocked_bot_repairs_and_keeps_the_bot_name() {
+         let mgr = Arc::new(SessionManager::new());
+         let secrets = Arc::new(Mutex::new(SecretStore::load(
+             &tempfile::tempdir().unwrap().path().join("secrets.toml"),
+         )));
+         let store = Arc::new(Mutex::new(Store::load(
+             &tempfile::tempdir().unwrap().path().join("projects.json"),
+         )));
+         let profiles_dir = tempfile::tempdir().unwrap();
+@@ -1426,34 +1605,195 @@ mod tests {
+             owner: None,
+         }));
+ 
+         let resp = handle(
+             Request::PhoneUnpair,
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         );
+         match resp {
+             Response::Phone(status) => {
+                 assert_eq!(status.state, PhoneState::WaitingForPairing);
+                 assert_eq!(status.bot.as_deref(), Some("my_dct_bot"), "bot 不该被忘掉");
+             }
+             other => panic!("期待 Response::Phone，得到 {other:?}"),
+         }
+     }
+ 
++    /// `PhoneUnpair` 在「有确认令牌」的分支上必须真的碰一下 `bridge_slot`
++    /// 里那个 Bridge——只改 `phone` 状态槽、不通知 `Bridge` 自己会留下一个
++    /// 活着的旧目的地。`unpair()` 是 `Channel::set_destination` 唯一合法
++    /// 的第二个调用点（见 `bridge.rs` 模块头注释「`set_destination` 只从
++    /// 这里调用」），这条测试钉住 `daemon.rs` 真的走到了那个调用点，不是
++    /// 只钉「协议层面的状态转移对了」——上面那几条 `phone_unpair_*` 测试
++    /// 用的都是空 `bridge_slot`，看不到这一步有没有发生。
++    #[test]
++    fn phone_unpair_tells_a_present_bridge_to_forget_its_destination() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets = Arc::new(Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        )));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Paired,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        }));
++
++        let ch = Arc::new(RecordingChannel::default());
++        let bridge = Arc::new(Bridge::new(ch.clone()));
++        // 让这个 Bridge 先真的配对一次，制造出「已经有出站目的地」的现实
++        // 起点——不然测的只是「在一个从没配过对的 Bridge 上调 unpair 不
++        // 炸」，跟这条测试想钉的东西无关。
++        bridge.accept(&Incoming {
++            text: "在吗".into(),
++            reply_to: None,
++            chat_id: 111,
++        });
++        let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge)));
++
++        handle(
++            Request::PhoneUnpair,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++            &bridge_slot,
++        );
++
++        assert_eq!(
++            *recover(ch.destinations.lock()),
++            vec![Some(111), None],
++            "unpair 必须真的把出站目的地清空，不然旧配对没被真的撤销"
++        );
++    }
++
++    /// 反过来：`had_confirmed_token` 为假时（比如令牌被撤销之后自然落到的
++    /// `Broken { BadToken }`），`PhoneUnpair` 不该碰 `bridge_slot` 里的
++    /// Bridge——那个状态意味着背后的轮询线程早就因为同一个 401 自己停了，
++    /// `unpair()` 在这里没有对象可作用；真正的出路是用户重新填一遍令牌
++    /// （`Enter`），不是 `r`，见 `phone_unpair_on_a_bad_token_is_a_no_op`。
++    /// 这条测试补的是「就算 `bridge_slot` 里凑巧还留着一个 Bridge，也不能
++    /// 被误碰」——协议层面的 no-op 之外，再钉一层「渠道真的没被动」。
++    #[test]
++    fn phone_unpair_leaves_a_present_bridge_alone_when_there_was_no_confirmed_token() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets = Arc::new(Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        )));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Broken {
++                reason: PhoneBrokenReason::BadToken,
++                message: "x".into(),
++            },
++            bot: None,
++            owner: None,
++        }));
++
++        let ch = Arc::new(RecordingChannel::default());
++        let bridge = Arc::new(Bridge::new(ch.clone()));
++        bridge.accept(&Incoming {
++            text: "在吗".into(),
++            reply_to: None,
++            chat_id: 111,
++        });
++        let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge)));
++
++        handle(
++            Request::PhoneUnpair,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++            &bridge_slot,
++        );
++
++        assert_eq!(
++            *recover(ch.destinations.lock()),
++            vec![Some(111)],
++            "没有确认过的令牌，unpair 不该再碰这个 Bridge"
++        );
++    }
++
++    /// `restart_needed`（`Broken { BotBlocked }` 分支）必须真的再起一条
++    /// 轮询线程，不能只把状态改回 `WaitingForPairing` 骗界面——那条线程在
++    /// 配对确认被拒（403）时已经自己退出了（`bridge.rs::
++    /// send_pairing_confirmation`），只清 `owner`/目的地没有人在背后听，
++    /// 用户在 Telegram 里发的下一条消息会石沉大海。用一个只回一次终态
++    /// 错误的假渠道，让新线程 `poll()` 一次就自己收敛——测的是「真的又
++    /// 调用了一次 `poll()`」，不是「进程没崩」。
++    #[test]
++    fn phone_unpair_from_bot_blocked_restarts_polling_on_the_same_bridge() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets = Arc::new(Mutex::new(SecretStore::load(
++            &tempfile::tempdir().unwrap().path().join("secrets.toml"),
++        )));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Broken {
++                reason: PhoneBrokenReason::BotBlocked,
++                message: "x".into(),
++            },
++            bot: Some("my_dct_bot".into()),
++            owner: None,
++        }));
++
++        let ch = Arc::new(RecordingChannel::default());
++        recover(ch.poll_script.lock()).push_back(Err(ChannelError::BadToken));
++        let bridge = Arc::new(Bridge::new(ch.clone()));
++        let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge)));
++
++        handle(
++            Request::PhoneUnpair,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++            &bridge_slot,
++        );
++
++        // 新线程是异步起的，`handle()` 返回时不保证它已经跑完——有界等待
++        // 而不是立刻断言，同 `tests/signal_restore.rs::wait_until_*` 一个
++        // 道理：真实调度延迟是毫秒级的，两秒的上限只是不让一次真的失败
++        // 挂起整个测试跑不完。
++        let start = Instant::now();
++        while *recover(ch.poll_calls.lock()) == 0 && start.elapsed() < Duration::from_secs(2) {
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        assert_eq!(
++            *recover(ch.poll_calls.lock()),
++            1,
++            "PhoneUnpair 的 BotBlocked 分支必须真的再起一条轮询线程"
++        );
++    }
++
+     /// `phone_unpair_forgets_the_owner_but_keeps_the_token_alive`（上面那条）
+-    /// 只测了 `Paired` 起点——协议里合法，但这个分支上没有任何代码构造
+-    /// `Paired`（配对要真收到一条消息，那是 Task 5）。`WaitingForPairing`
+-    /// 才是这条分支上唯一真会被 `r` 作用到的起点，补上。
++    /// 只测了 `Paired` 起点。`WaitingForPairing` 是这条分支上另一个真实
++    /// 起点——`apply_phone_set_token` 验证成功、还没收到第一条配对消息时
++    /// 就是这个状态，补上。
+     ///
+     /// **`owner` 起点特意设成 `Some(..)`，不是原来的 `None`（fix round 2
+     /// 的 Minor 3）。** 原来那个起点本身就是 `None`，断言「还是
+     /// `WaitingForPairing`、bot 没丢」不会因为 `owner` 而红——删掉
+     /// `daemon.rs` 那个 `if` 分支的整个函数体（守卫连同它保护的赋值一起
+     /// 消失），`ph` 原地不动，这条测试照样绿：`state`/`bot` 没变过，
+     /// `owner` 本来就是 `None`。现在起点带着一个真实的 `owner`，「`r`
+     /// 必须清掉它」这条断言只有守卫真的执行了赋值才会成立。
+     #[test]
+     fn phone_unpair_from_waiting_for_pairing_stays_waiting_and_keeps_the_bot() {
+@@ -1471,20 +1811,21 @@ mod tests {
+             owner: Some("lei".into()),
+         }));
+ 
+         let resp = handle(
+             Request::PhoneUnpair,
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         );
+         match resp {
+             Response::Phone(status) => {
+                 assert_eq!(status.state, PhoneState::WaitingForPairing);
+                 assert_eq!(status.bot.as_deref(), Some("my_dct_bot"));
+                 assert!(status.owner.is_none(), "r 是重新配对，上一个主人必须被忘掉");
+             }
+             other => panic!("期待 Response::Phone，得到 {other:?}"),
+         }
+     }
+@@ -1510,29 +1851,80 @@ mod tests {
+             owner: None,
+         }));
+ 
+         let resp = handle(
+             Request::PhoneDisable,
+             &mgr,
+             &store,
+             &secrets,
+             profiles_dir.path(),
+             &phone,
++            &test_bridge_slot(),
+         );
+         match resp {
+             Response::Phone(status) => {
+                 assert_eq!(status.state, PhoneState::Off);
+                 assert!(status.bot.is_none());
+                 assert!(status.owner.is_none());
+             }
+             other => panic!("期待 Response::Phone，得到 {other:?}"),
+         }
+         assert!(
+             recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_none(),
+             "令牌必须真的从磁盘上删掉，不能只改内存状态"
+         );
+         assert!(
+             recover(secrets.lock()).get(PHONE_BOT_KEY).is_none(),
+             "bot 名字也要一起删掉，不然重新填令牌之前它还留在磁盘上"
+         );
+     }
++
++    /// `x` 必须真的让旧 Bridge 停下来，不只是把它从槽里摘掉——摘掉不等于
++    /// 停掉：如果背后那条轮询线程还活着，它迟早会再收到一条消息，把
++    /// `phone` 状态槽悄悄改回 `Paired`，而用户看到的却是自己刚刚点掉的
++    /// `Off`。`retire()` 的效果全在一个私有原子量里，靠
++    /// `is_retired_for_test()`（`bridge.rs` 里一个 `#[cfg(test)]` 开孔）
++    /// 直接确认调用生效，而不是从「槽变空了」反推「一定调用过 retire」
++    /// ——那两件事在代码里是分开写的两条语句，各自都可能被漏掉。
++    #[test]
++    fn phone_disable_retires_a_present_bridge_and_clears_the_slot() {
++        let mgr = Arc::new(SessionManager::new());
++        let secrets_path = tempfile::tempdir().unwrap().path().join("secrets.toml");
++        let mut disk = SecretStore::load(&secrets_path);
++        disk.set(PHONE_TOKEN_KEY, "some-token").unwrap();
++        disk.set(PHONE_BOT_KEY, "my_dct_bot").unwrap();
++        let secrets = Arc::new(Mutex::new(disk));
++        let store = Arc::new(Mutex::new(Store::load(
++            &tempfile::tempdir().unwrap().path().join("projects.json"),
++        )));
++        let profiles_dir = tempfile::tempdir().unwrap();
++        let phone = Arc::new(Mutex::new(PhoneStatus {
++            state: PhoneState::Paired,
++            bot: Some("my_dct_bot".into()),
++            owner: Some("lei".into()),
++        }));
++
++        let ch = Arc::new(RecordingChannel::default());
++        let bridge = Arc::new(Bridge::new(ch));
++        assert!(!bridge.is_retired_for_test(), "起点必须不是已经退休的");
++        let bridge_slot: PhoneBridgeSlot = Arc::new(Mutex::new(Some(bridge.clone())));
++
++        handle(
++            Request::PhoneDisable,
++            &mgr,
++            &store,
++            &secrets,
++            profiles_dir.path(),
++            &phone,
++            &bridge_slot,
++        );
++
++        assert!(
++            bridge.is_retired_for_test(),
++            "PhoneDisable 必须真的调用 Bridge::retire，不能只清空槽位"
++        );
++        assert!(
++            recover(bridge_slot.lock()).is_none(),
++            "槽位也要清空——不然下一次 PhoneSetToken/PhoneUnpair 会摸到一个已经退休的 Bridge"
++        );
++    }
+ }
+diff --git a/src/i18n.rs b/src/i18n.rs
+index bb41b74..e76e490 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -865,35 +865,48 @@ pub mod msg {
+     pub fn phone_unreachable(lang: Lang) -> String {
+         t!(
+             lang,
+             en: "could not reach Telegram right now — check the network and try again",
+             zh: "现在连不上 Telegram，检查一下网络，再试一次",
+         )
+         .to_string()
+     }
+ 
+     /// 令牌完好，但对方在 Telegram 里把这个 bot 拉黑了/删了对话（403）。
+-    /// **`daemon.rs::phone_verify_token` 今天没有任何路径会真的调用这个
+-    /// 函数**——`getMe` 没有 chat 上下文，Telegram 不会拿它回 403，这个
+-    /// 原因只会在 Task 5 的 Bridge 真的往一个已配对的 chat 发消息时出现。
+-    /// 留着这个分支是因为 `ChannelError` 现在有 `Blocked` 这个变体，
+-    /// `phone_verify_token` 的 match 必须穷尽；写清楚这一点是为了不让
+-    /// 未来的人以为这条路径今天被测过、被验证过。
++    /// **`daemon.rs::phone_verify_token` 仍然从不调用这个函数**——`getMe`
++    /// 没有 chat 上下文，Telegram 不会拿它回一个有意义的 403，那条路径把
++    /// `Blocked` 映成 `BadToken`（见它自己的文档注释）。真正的调用点是
++    /// `bridge.rs::send_pairing_confirmation`：配对刚成立那一刻往新认下的
++    /// chat 发确认消息，那时候手上是一个确凿无疑的 chat id，403 在那里
++    /// 才是「这个 chat 拉黑了 bot」的真话，不是猜测。
+     pub fn phone_blocked(lang: Lang) -> String {
+         t!(
+             lang,
+             en: "this bot has been blocked in Telegram — unblock it and try again",
+             zh: "这个机器人在 Telegram 里被拉黑了，解除拉黑后再试一次",
+         )
+         .to_string()
+     }
+ 
++    /// 配对刚成立那一刻，`bridge.rs` 往新认下的主人发的第一句话。**故意
++    /// 不承诺任何还没落地的功能**——这个分支落地时事件通知（agent 停下/
++    /// 出错才推一条消息）还没有任何代码，回复被敲进会话（Task 7）也还
++    /// 没有；这句话只确认"配对成功了"这一件已经真实发生的事，不多说。
++    pub fn phone_pairing_confirmation(lang: Lang) -> String {
++        t!(
++            lang,
++            en: "dct is now paired with this chat. This is its first message.",
++            zh: "dct 配对成功，这是它发来的第一条消息。",
++        )
++        .to_string()
++    }
++
+     /// 标题里必须带上「Esc 回哪」，而且分设置页/选择器两种。
+     ///
+     /// 这半句一度被合并掉，理由是底栏的 `idle_help` 已经说了——但那两处画在
+     /// 不同的区域，密钥页这一屏自己看不到底栏。更要紧的是 `escape_hint` 和
+     /// 标题必须**互相印证**：底栏说什么就得真能做到什么，标题跟着一起说，
+     /// 才不会出现一处说设置、一处还写着旧的「列表」。
+     pub fn enter_secret_title(lang: Lang, label: &str, to_settings: bool) -> String {
+         let back = text(
+             if to_settings {
+                 Key::BackToSettingsWord
+@@ -1774,28 +1787,27 @@ mod tests {
+     }
+ 
+     /// 语言名必须用它自己的语言写：用户误切到看不懂的语言之后，
+     /// 唯一能自救的线索就是在列表里认出自己那一行。
+     #[test]
+     fn each_language_is_named_in_its_own_language() {
+         assert_eq!(Lang::En.native_name(), "English");
+         assert_eq!(Lang::Zh.native_name(), "中文");
+     }
+ 
+-    /// `msg::phone_blocked` 今天没有任何生产代码调用点——
+-    /// `daemon.rs::phone_verify_token` 把 403 映成 `BadToken`，不是
+-    /// `BotBlocked`（dct-phone-channel Task 4 fix round 2 的 Important 2：
+-    /// 让这条路径产出 `BotBlocked` 会跟 `apply_phone_set_token` 从不为
+-    /// `Broken` 落盘这件事对不上）。这个函数留着是给 Task 5 的 Bridge 用
+-    /// 的——一次真正配对之后往已知 chat 发消息被拒才是它的真实调用点。
+-    /// 这条测试是它今天唯一的调用者，两种语言都要组得出话，不然它会在
+-    /// 真被用到的那天才第一次被验证。
++    /// `daemon.rs::phone_verify_token` 仍然从不调用 `msg::phone_blocked`
++    /// ——它把 403 映成 `BadToken`，不是 `BotBlocked`（dct-phone-channel
++    /// Task 4 fix round 2 的 Important 2：让那条路径产出 `BotBlocked` 会跟
++    /// `apply_phone_set_token` 从不为 `Broken` 落盘这件事对不上）。真正的
++    /// 调用点从 Task 5 起是 `bridge.rs::send_pairing_confirmation`——一次
++    /// 真正配对之后往已知 chat 发确认消息被拒。这条测试单独钉住两种语言
++    /// 都组得出话，不依赖那条集成路径真的打一次网络才能验证文案本身。
+     #[test]
+     fn phone_blocked_composes_in_both_languages() {
+         for l in Lang::all() {
+             let s = msg::phone_blocked(*l);
+             assert!(!s.trim().is_empty(), "{l:?} 下组不出话");
+         }
+         assert!(
+             !has_han(&msg::phone_blocked(Lang::En)),
+             "英文里有汉字：{}",
+             msg::phone_blocked(Lang::En)
+diff --git a/src/lib.rs b/src/lib.rs
+index 8f0ab86..05333ee 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,10 +1,11 @@
++pub mod bridge;
+ pub mod channel;
+ pub mod cli;
+ pub mod client;
+ pub mod clipboard;
+ pub mod config;
+ pub mod daemon;
+ pub mod git;
+ pub mod i18n;
+ pub mod journal;
+ pub mod llm;
+diff --git a/src/proto.rs b/src/proto.rs
+index fccf81d..d20bb77 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -162,26 +162,23 @@ pub enum PhoneBrokenReason {
+ /// 手机通知这一页在守护进程眼里处在哪个阶段。**这一行状态是那一整页存在的
+ /// 全部理由**——配对是异步的（填完令牌之后守护进程转去后台长轮询等用户在
+ /// Telegram 上发第一条消息），不给这件事一个去处，用户填完令牌就会对着一片
+ /// 空白发呆。
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum PhoneState {
+     /// 还没填令牌
+     Off,
+     /// 填了、验过了，在等用户给 bot 发第一条消息
+     WaitingForPairing,
+-    /// 配上了。**这一分支在这个分支（dct-phone-channel）上没有任何代码
+-    /// 构造它**——写这个状态需要真的收到过一条配对消息，那是 Task 5
+-    /// （Bridge）的活。它已经在这里是因为协议、i18n 文案、`idle_help`、
+-    /// 单测全都得先认识这第四种取值，Task 5 落地时不用再改一次协议形状。
+-    /// 见它自己在 `ui/phone.rs`/`view.rs` 里的用法：那些地方处理它时都是
+-    /// 「万一将来有」而不是「今天真的会出现」。
++    /// 配上了。从 Task 5 起真的会被构造——`bridge.rs::poll_forever` 收到
++    /// 第一条消息、`Bridge::accept` 认下发信人之后，把这个值写进 `phone`
++    /// 状态槽（长轮询线程自己写，不经过任何 `Request`）。
+     Paired,
+     /// 连不上。**`message` 装的是已经成文的人话，不是原始错误文本**——
+     /// 守护进程是唯一决定用户看到什么文字的地方（本文件顶上
+     /// `SecretPrompt` 那条已有的约定：组句发生在哪一侧必须一致，不能一半
+     /// 在 daemon 一半在界面）。
+     ///
+     /// `reason` 是**类型化**的，`message` 是**不透明**的——两者的角色不
+     /// 一样。`ui/phone.rs::next_step` 读 `reason`（安全：它是个封闭枚举，
+     /// 不可能夹带令牌）来决定给哪一句下一步；`status_line`/`next_step`
+     /// **都不读 `message`**，那个字符串只在 `draw()` 里单独一行显示，见
+@@ -193,30 +190,30 @@ pub enum PhoneState {
+         message: String,
+     },
+ }
+ 
+ impl PhoneState {
+     /// 磁盘上是不是存在一份「曾经被确认有效」的令牌。`WaitingForPairing`/
+     /// `Paired` 算，`Broken { reason: BotBlocked, .. }` 也算（令牌本身没
+     /// 坏，只是这个 bot 被拉黑了）；`Off` 不算，`Broken { BadToken | Unreachable, .. }`
+     /// 也不算——后两者时 `apply_phone_set_token` 验证失败根本没有落盘。
+     ///
+-    /// **`BotBlocked` 这一支是一份承诺，不是今天就有代码兑现的事实。**
+-    /// `daemon.rs::phone_verify_token`——这个分支上唯一会产出 `PhoneState`
+-    /// 的地方——今天**从不**构造 `Broken { BotBlocked }`（fix round 2 的
+-    /// Important 2：它曾经会，`apply_phone_set_token` 却对所有 `Broken`
+-    /// 一律不落盘，两边对不上，会重演下面这段 Critical 2）。所以这一支
+-    /// 今天是空过滤条件，只有测试手写状态才会用到。**任何将来构造
+-    /// `Broken { BotBlocked }` 的代码（Task 5 的 Bridge：一次真正配对
+-    /// 之后往已知 chat 发消息失败）必须先确保磁盘上真的有令牌、`bot`
+-    /// 字段真的是 `Some`，再让这一支返回 `true`**——否则就是在维护一个
+-    /// 谎言。
++    /// **`BotBlocked` 这一支从 Task 5 起是一份兑现了的承诺，不再是空过滤
++    /// 条件。** 唯一的产出点是 `bridge.rs::send_pairing_confirmation`：
++    /// 配对刚成立那一刻往新认下的 chat 发确认消息，403 就在这里落地成
++    /// `Broken { BotBlocked }`。能走到这一步，前面必然已经先有一次成功的
++    /// `apply_phone_set_token`（令牌和 `bot` 名字早就落盘了），再有一次
++    /// 成功的 `Bridge::accept`（配对本身也已经发生）——这个分支返回 `true`
++    /// 不是靠人手工守住的约定，是这两件已经发生的事的自然推论，所以是
++    /// **真** 而不是**巧**。`daemon.rs::phone_verify_token`（`getMe` 那条
++    /// 验证路径）依然从不构造它——`getMe` 没有 chat 上下文，403 在那里
++    /// 只能猜，不能像 `send()` 那样手上攥着一个确凿无疑的 chat id。
+     ///
+     /// **`r`（重新配对）/`x`（关掉）只在这里返回 `true` 时才有对象可
+     /// 作用**，`ui/phone.rs::handle_status`（按下去有没有效果）和
+     /// `daemon.rs`（`PhoneUnpair` 该不该真的把状态推到 `WaitingForPairing`）
+     /// 必须共用这同一份判断，见它们各自的调用点：任何一处独立复制一份
+     /// 都会重演 fix round 1 的 Critical 2——`PhoneUnpair` 曾经不管这条件、
+     /// 一律把状态推成 `WaitingForPairing`，磁盘上却根本没有令牌，页面停在
+     /// 一个不存在的 bot 上，`Enter` 又不再提供，用户没有任何出路。
+     pub fn has_confirmed_token(&self) -> bool {
+         matches!(

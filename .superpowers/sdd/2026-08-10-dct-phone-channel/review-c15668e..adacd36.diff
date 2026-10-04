@@ -1,0 +1,190 @@
+# Review package: c15668e..adacd36
+
+## Commits
+adacd36 fix: make idle_help level-aware in the settings sublist, close review round 1
+
+## Files changed
+ src/i18n.rs             |  2 +-
+ src/ui/mod.rs           |  7 +++++++
+ src/ui/settings_view.rs | 13 +++++++++++++
+ src/ui/view.rs          | 34 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 55 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 7cc2c01..ce3cdf0 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -332,21 +332,21 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
+         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
+         OtherKeysGoToAgent => t!(
+             lang,
+             en: "every other key goes to the agent",
+             zh: "其余按键都发给 agent",
+         ),
+         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
+         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
+         Language => t!(lang, en: "language", zh: "语言"),
+-        Phone => t!(lang, en: "phone", zh: "手机通知"),
++        Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
+ 
+         MoreKeys => t!(lang, en: "…", zh: "…"),
+         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
+         KeysGroupMove => t!(lang, en: "Move", zh: "走动"),
+         KeysGroupSession => t!(lang, en: "Sessions", zh: "会话"),
+         KeysGroupConfig => t!(lang, en: "Settings", zh: "设置"),
+ 
+         BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
+         BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
+         BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 0c3c58b..ac0582a 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -3574,20 +3574,27 @@ mod tests {
+             }),
+             View::Secrets {
+                 entries: Vec::new(),
+                 state: ListState::default(),
+                 pending_delete: None,
+             },
+             View::Settings {
+                 state: ListState::default(),
+                 lang: None,
+             },
++            // 深入语言子列表也有自己的一句提示（回顶层设置项列表，不是回
++            // 看板）——跟上面 `PickProject` 两条并列的道理一样，两种输出
++            // 都要量。
++            View::Settings {
++                state: ListState::default(),
++                lang: Some(ListState::default()),
++            },
+             View::Keys {
+                 from: Box::new(View::Board),
+             },
+             // 填密钥有两条退路（回设置页 / 回选择器），两条文案都要量
+             View::EnterSecret {
+                 profile: String::new(),
+                 label: String::new(),
+                 prompt: crate::proto::SecretPrompt {
+                     hint: String::new(),
+                     url: None,
+diff --git a/src/ui/settings_view.rs b/src/ui/settings_view.rs
+index 6828158..47e067f 100644
+--- a/src/ui/settings_view.rs
++++ b/src/ui/settings_view.rs
+@@ -362,20 +362,33 @@ mod tests {
+                 assert_eq!(
+                     state.selected().and_then(SettingsItem::at),
+                     Some(SettingsItem::Phone),
+                     "↓ 应该能从语言走到手机通知"
+                 );
+             }
+             _ => panic!("方向键应该还在顶层设置项列表里"),
+         }
+     }
+ 
++    /// 这两个长度一相等，`handle_key` 里 move_sel_n 的长度参数写错也测不出来
++    /// （见 task-3 报告的变异 #2）。哪天不相等了，这条会红——那时候补一条
++    /// 「↓ 能走到最后一个设置项」的测试，把长度来源真正钉住。
++    #[test]
++    fn the_length_coincidence_that_hides_a_wrong_move_sel_n_source() {
++        assert_eq!(
++            SettingsItem::all().len(),
++            Lang::all().len(),
++            "长度不再巧合相等了：去补一条方向键能走到最后一项设置的测试，\
++             把 move_sel_n 的长度来源钉死，不能再靠这份巧合掩护"
++        );
++    }
++
+     /// 语言列表用各自的语言写，光标能走遍每一行。
+     #[test]
+     fn every_language_is_listed_in_its_own_language() {
+         let (mut app, _dir) = App::test_app();
+         on_language_list(&mut app, 0);
+         let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+         let buf = term.backend().buffer();
+         let a = buf.area;
+         let c: String = (0..a.height)
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index c1d2c74..dc3f3c2 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -1302,20 +1302,32 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem>
+         ),
+         View::Secrets { .. } => help_items(
+             &[
+                 ("↑↓", Key::Select),
+                 ("Enter", Key::Edit),
+                 ("d", Key::Delete),
+                 ("Esc", Key::Back),
+             ],
+             lang,
+         ),
++        // 跟 escape_hint 一样要分层：深入语言子列表时 Esc 回的是顶层设置项
++        // 列表，不是「取消」整个设置页——两处文案哪怕只有半句话不一致，都是
++        // 「底栏说什么就得真能做到什么」这条原则被破坏了一半（同上面
++        // `EnterSecret { return_to_settings: true }` 那一条的道理）。
++        View::Settings { lang: Some(_), .. } => help_items(
++            &[
++                ("↑↓", Key::Select),
++                ("Enter", Key::Confirm),
++                ("Esc", Key::BackToSettingsWord),
++            ],
++            lang,
++        ),
+         View::Settings { .. } => help_items(
+             &[
+                 ("↑↓", Key::Select),
+                 ("Enter", Key::Confirm),
+                 ("Esc", Key::Cancel),
+             ],
+             lang,
+         ),
+     }
+ }
+@@ -2375,20 +2387,42 @@ mod tests {
+             &View::Settings {
+                 state: ListState::default(),
+                 lang: Some(ls),
+             },
+             Lang::Zh,
+         );
+         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+         assert!(!h.contains("看板"), "这一层退的不是看板：{h}");
+     }
+ 
++    /// `escape_hint` 和 `idle_help` 都提了「Esc 回哪」，两处不能一处说
++    /// 「回设置」、另一处还留着旧的「取消」——跟
++    /// `secret_view_from_settings_idle_help_also_says_back_to_settings` 是
++    /// 同一条原则在语言子列表上的另一半。
++    #[test]
++    fn language_list_idle_help_also_says_back_to_settings() {
++        let mut ls = ListState::default();
++        ls.select(Some(0));
++        let help = help_of(
++            &View::Settings {
++                state: ListState::default(),
++                lang: Some(ls),
++            },
++            Lang::Zh,
++        );
++        assert!(
++            help.contains("返回设置"),
++            "底栏说什么就得真能做到什么：{help}"
++        );
++        assert!(!help.contains("取消"), "这一层退的不是「取消」：{help}");
++    }
++
+     #[test]
+     fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
+         // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
+         // 一处还说着旧的「列表」。
+         let help = help_of(
+             &View::EnterSecret {
+                 profile: "kimi".into(),
+                 label: "Kimi".into(),
+                 prompt: SecretPrompt {
+                     hint: String::new(),

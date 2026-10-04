@@ -1,0 +1,312 @@
+# Review package: afe8db1..f98cefe
+
+## Commits
+f98cefe fix: give the attached view an F4 entry point, and correct stale comments
+
+## Files changed
+ src/i18n.rs      | 13 ++++++++++++-
+ src/ui/app.rs    |  2 +-
+ src/ui/attach.rs | 15 +++++++++++++++
+ src/ui/mod.rs    | 41 ++++++++++++++++++++++++++++++++++++++---
+ src/ui/view.rs   | 17 +++++++++++++----
+ 5 files changed, 79 insertions(+), 9 deletions(-)
+
+## Diff
+diff --git a/src/i18n.rs b/src/i18n.rs
+index be3b37c..9e7342f 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -128,20 +128,27 @@ pub enum Key {
+     MoveArrows,
+     /// 九宫格里打开单行回复框的那个键
+     ReplyOnce,
+     /// 回复框里的两个键
+     SendReply,
+     /// 回复框里的 Ctrl+C：打断正在干活的 agent
+     InterruptAgent,
+     /// 回复框还空着时的占位提示：直接回车 = 替用户按一下回车（批准/继续）
+     EmptyReplyIsEnter,
+     NextSession,
++    /// `F4` 在会话视图里的动作名：进复制模式。**只是这一个动词**——
++    /// 「鼠标交还终端」「按 F4 退出」这些解释已经在 `CopyMode`/`CopyModeShort`
++    /// 里说了，这里跟 `("F4", ...)` 拼起来只用来填底栏按键表那一格
++    /// （`F4 复制` / `F4 copy`），不是那条状态提示本身，命名和用途都不能跟
++    /// 它们混：`CopyMode`/`CopyModeShort` 是「已经在复制模式里」时顶掉整条
++    /// 右段的话，这一条是「还没进去、告诉你按哪个键能进去」。
++    EnterCopyMode,
+     OtherKeysGoToAgent,
+     BackToListWord,
+     BackToSettingsWord,
+     OrPressDigit,
+     TypeToFilter,
+     Language,
+     // —— 全部按键浮层 ——
+     /// 底栏最右那条常驻提示的说明。就是一个省略号：底栏只有一行，
+     /// 写成「全部按键」四个字要占掉一个真按键的位置，而 `…` 本身
+     /// 就是「后面还有」的通用说法。
+@@ -301,20 +308,23 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+         // 「打断它」而不是「中断」：用户要做的是喊停一个跑偏的 agent
+         InterruptAgent => t!(lang, en: "stop the agent", zh: "打断它"),
+         // 空框直接回车最常用（批个计划、说声继续），得写在用户眼前，
+         // 否则他会以为必须先打字才能回。
+         EmptyReplyIsEnter => t!(
+             lang,
+             en: "type a reply, or just press Enter to approve",
+             zh: "打字回复，或者直接回车表示同意"
+         ),
+         NextSession => t!(lang, en: "next session", zh: "下一个会话"),
++        // 只是动词，跟 `Undo`/`Diff` 那一档词条一个形状——句子留给
++        // `CopyMode`/`CopyModeShort`。
++        EnterCopyMode => t!(lang, en: "copy", zh: "复制"),
+         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
+         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
+         OtherKeysGoToAgent => t!(
+             lang,
+             en: "every other key goes to the agent",
+             zh: "其余按键都发给 agent",
+         ),
+         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
+         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
+         Language => t!(lang, en: "language", zh: "语言"),
+@@ -1240,20 +1250,21 @@ mod tests {
+             Cancel,
+             Back,
+             Edit,
+             Delete,
+             MoveArrows,
+             ReplyOnce,
+             SendReply,
+             InterruptAgent,
+             EmptyReplyIsEnter,
+             NextSession,
++            EnterCopyMode,
+             OtherKeysGoToAgent,
+             BackToListWord,
+             BackToSettingsWord,
+             OrPressDigit,
+             TypeToFilter,
+             Language,
+             BackToBoard,
+             BackToBoardWithF2,
+             BackToList,
+             BackToSettings,
+@@ -1343,21 +1354,21 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 99, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
+     /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
+     /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
+     /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 729c8c9..28295b2 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -122,21 +122,21 @@ pub struct App {
+     /// 离开 `Failed`（哪怕只是这一帧的 `Screen` 还没追上）就把它忘掉：
+     /// 见 `mod.rs::run` 里配对的清空分支——这样同一个会话「恢复了、又坏了」
+     /// 会被当成一次新的失败重新问一遍，不会一直顶着上一次的旧话。
+     pub(crate) explained_failure: Option<(u32, String)>,
+     /// 用户按 `F4` 打开的复制模式：**临时**把鼠标交还给终端，好让人用
+     /// 终端自己的拖选去复制。
+     ///
+     /// 它是「此刻正在复制」的临时状态，不是配置——离开会话一律复位
+     /// （见 `attach::handle_key`）。跨会话粘着的话，用户会在另一个会话里
+     /// 发现鼠标莫名其妙不归 agent 管，而屏幕上没有任何东西解释为什么。
+-    pub copy_mode: bool,
++    pub(crate) copy_mode: bool,
+ }
+ 
+ impl App {
+     /// 两个构造函数共用的字段初值——除了 `client` 之外的每一项，`new` 和
+     /// `new_disconnected` 必须给出完全一样的答案。拆出来是因为一旦两份
+     /// 分开抄，改 `new` 忘了同步改测试用的那份，测试就会在悄悄测一个跟
+     /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
+     /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
+     fn new_inner(
+         client: Option<Client>,
+diff --git a/src/ui/attach.rs b/src/ui/attach.rs
+index be56968..fe72e59 100644
+--- a/src/ui/attach.rs
++++ b/src/ui/attach.rs
+@@ -25,20 +25,35 @@ pub(crate) enum ScrollAction {
+     /// 什么都不做——没有历史可滚，滚了也白滚。
+     Ignore,
+ }
+ 
+ /// 谁拿这一格滚轮。
+ ///
+ /// 判据是「agent 有没有开鼠标上报」，不是「它在不在备用屏」——实测下来
+ /// Claude Code 备用屏 + 全套鼠标，codex 内联 + 完全不要鼠标，两个真实
+ /// agent 在这两个维度上正好相反。按鼠标分流恰好把两边都送到握着内容的
+ /// 那一方：Claude Code 自己管视口，codex 的历史在 dct 缓冲里。
++///
++/// **鼠标捕获现在跟这个判据是同一个开关**（`mod.rs::wants_mouse_capture`）：
++/// dct 只在 `app.scroll.agent_owns` 为真（且不在 `copy_mode`）时才抓住终端
++/// 鼠标。`agent_owns` 一旦是假，捕获跟着关掉，滚轮事件从此根本进不了这个
++/// 进程——终端自己接管了它（走的是它自己的原生选中/滚屏逻辑，不是 dct 这套
++/// 协议）。也就是说 codex 这类不订阅鼠标的 agent 会话，稳态下压根不会调用
++/// 到这个函数，`agent_owns` 为假这条判据在这里已经等不到真实输入了。
++///
++/// 下面这条 `ScrollAction::Scroll` 分支（连带 `handle_mouse` 里
++/// `!app.scroll.agent_owns` 那个点击挡板）如今只剩一扇一帧宽的窗口能被
++/// 走到：agent 刚放下鼠标、这一帧刚把 `agent_owns` 翻成假，但捕获的
++/// `Enable`/`DisableMouseCapture` 还没来得及把终端也切过去，恰好在这个缝隙
++/// 里冒出来的一次滚轮才会落到这条分支上。它不是「dct 平时替不要鼠标的
++/// agent 滚」的日常路径，只是这条缝隙的兜底——分支和下面的测试都不是
++/// 死代码，只是别再拿它们当常态来读。
+ pub(crate) fn wheel_action(st: &ScrollState, up: bool) -> ScrollAction {
+     if st.agent_owns {
+         return ScrollAction::Forward;
+     }
+     if st.max == 0 {
+         return ScrollAction::Ignore;
+     }
+     ScrollAction::Scroll(if up { WHEEL_ROWS } else { -WHEEL_ROWS })
+ }
+ 
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index ad34721..46a1d98 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -3802,23 +3802,25 @@ mod tests {
+         assert!(
+             bar_text(&term).contains(&hint.replace(' ', "")),
+             "复制模式压过滚动提示"
+         );
+ 
+         app.message = Msg::err("出事了".into());
+         term.draw(|f| draw(f, &mut app)).unwrap();
+         assert!(bar_text(&term).contains("出事了"), "错误消息压过复制模式");
+     }
+ 
+-    /// 80 是我们支持的最窄终端，右段只有 39 列，而 `wrap_help` 不拆单空格的
+-    /// 句子——写长了不会折行，会被 `Paragraph` 悄悄切掉尾巴。两种语言都要
+-    /// 在这个宽度下把复制模式的提示完整放出来，一个字都不能少。
++    /// 80 不是最窄的受支持宽度（那是下面 `MIN_COLS` 那条测试的 60），而是
++    /// 长文案必须仍然放得下的那道线：右段在这个宽度下只有 39 列，而
++    /// `wrap_help` 不拆单空格的句子——写长了不会折行，会被 `Paragraph`
++    /// 悄悄切掉尾巴。两种语言都要在这个宽度下把复制模式的提示完整放出来，
++    /// 一个字都不能少；再窄下去（见下面 60 列那条）才轮到短文案接手。
+     #[test]
+     fn copy_mode_hint_survives_eighty_columns_in_both_languages() {
+         use ratatui::backend::TestBackend;
+ 
+         for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+             let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
+             app.lang = lang;
+             app.copy_mode = true;
+             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+             term.draw(|f| draw(f, &mut app)).unwrap();
+@@ -3848,20 +3850,53 @@ mod tests {
+ 
+             let bar = bar_text(&term);
+             let short = crate::i18n::text(crate::i18n::Key::CopyModeShort, lang);
+             assert!(
+                 bar.contains(&short.replace(' ', "")),
+                 "{lang:?} 在 60 列下要完整显示复制模式的短文案：{bar}"
+             );
+         }
+     }
+ 
++    /// 会话视图里唯一能进复制模式的入口就是 `F4`——`?` 浮层打不开（附加
++    /// 视图里所有键都转发给 agent），提示本身要等 `copy_mode` 已经是真的
++    /// 才会画出来。`idle_help` 的 `View::Attached` 分支必须把 `F4` 写在
++    /// 底栏上，用户才有地方看到这个键存在。
++    ///
++    /// 两个宽度都要测，不能只测 80：`fit_help` 是按预算从前面**丢**的，
++    /// 60 列这一档右段落到 `ACTION_MIN_COLS`（28）——`F3`+`F4` 在这个地板上
++    /// 挤不挤得下，只有真的在这个宽度画一遍才知道；只测 80 列的话，`F4`
++    /// 在窄终端上被 `fit_help` 悄悄丢掉的回归会一路绿灯漏过去。
++    #[test]
++    fn attached_view_bar_keeps_both_f3_and_f4_at_eighty_and_sixty_columns() {
++        use ratatui::backend::TestBackend;
++
++        for width in [80u16, 60u16] {
++            for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
++                let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
++                app.lang = lang;
++                let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
++                term.draw(|f| draw(f, &mut app)).unwrap();
++
++                let bar = bar_text(&term);
++                assert!(
++                    bar.contains("F3"),
++                    "{width} 列 {lang:?} 下 F3（下一个会话）不见了：{bar}"
++                );
++                assert!(
++                    bar.contains("F4"),
++                    "{width} 列 {lang:?} 下 F4 不见了——这是这一层唯一能进复制模式的入口：{bar}"
++                );
++            }
++        }
++    }
++
+     /// F6 回归测试：英文滚动提示走的是 `BarContent::Text`，`wrap_help`
+     /// 只在连续两个空格的地方才折行，而这句提示全是单空格，放不下就不是
+     /// 折行，是被 `Paragraph`（没挂 `.wrap()`）直接从右边截断。原来的
+     /// "↑ Scrolled up 40 line(s) · press End to jump back down" 有 54 列，
+     /// 底栏右段宽度是「终端总宽 − 23」，55 列的终端只有 32 列可用——刚好
+     /// 卡在「怎么回去」那半句中间，`End` 整个词被截没了：这个宽度算出的
+     /// 切点（`old[:32]`）落在 "press " 之后、"End" 之前，用户会看到自己
+     /// 正翻着历史，却读不到任何一个字告诉他怎么回去。缩短后的新版本
+     /// （28 列）在同样的宽度下完整放得下。
+     #[test]
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index ff8cb89..07bba8f 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -1107,25 +1107,34 @@ fn board_keys(
+ /// 假键占掉的正是一个真键的位置。
+ ///
+ /// 抽成纯函数是为了能单测（同 `escape_hint`、`back_one_level`）——不用把
+ /// `draw()` 整条渲染管线跑一遍，只为了断言一句文案里有没有「↑↓」。
+ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem> {
+     use crate::i18n::{help_items, Key};
+     match view {
+         // 不再写「F2 同效」：左段的逃生键已经是「Ctrl+Q（F2） 回看板」，
+         // 两个键都点了名，右段再说一遍是拿最稀缺的一行去重复已知信息。
+         //
+-        // 只剩 `F3` 一条：中段让出去 18 列之后，80 列终端上右段只有 39 列，
++        // `F3` 和 `F4`：中段让出去 18 列之后，80 列终端上右段只有 39 列，
+         // 原来那三条（含两句整话）加起来六十多列，多出来的部分不是"折一行"
+-        // 而是被右端**静默截掉**——写三条只是让第一条也读不完整。F3 是这里
+-        // 唯一「不写就找不到」的键；另外两条是说明，不是键，去 `?` 后面。
+-        View::Attached(_) => help_items(&[("F3", Key::NextSession)], lang),
++        // 而是被右端**静默截掉**——写三条只是让第一条也读不完整。这两条是
++        // 这里唯一「不写就找不到」的键；其余的是说明，不是键，去 `?` 后面。
++        //
++        // `F4` 排在**最后**：`widgets::fit_help` 永远保留列表里的最后一项，
++        // 靠前的项放不下才被丢。这一层里唯一「不按就没法拖选复制」的键是
++        // `F4`（除了 F2/F3，附加视图里的键一律转发给 agent，见
++        // `attach::handle_key` 头上那条注释），所以它必须是最后丢的那个；
++        // `F3` 有 `Ctrl+Q`/`F2` 之类的平替，排在前面、窄到极限时先让路。
++        View::Attached(_) => help_items(
++            &[("F3", Key::NextSession), ("F4", Key::EnterCopyMode)],
++            lang,
++        ),
+         // 浮层自己就是一整屏按键表，右段再列一遍是重复；左段的
+         // 「Esc 返回」已经把这里唯一能按的键交代完了。
+         View::Keys { .. } => Vec::new(),
+         View::PickProfile { .. } => help_items(
+             &[
+                 ("↑↓", Key::Select),
+                 ("Enter", Key::Confirm),
+                 ("", Key::OrPressDigit),
+                 ("Esc", Key::Cancel),
+             ],

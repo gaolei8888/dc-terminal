@@ -1,0 +1,125 @@
+# Review package: 1e6a1b2..fed2898
+
+## Commits
+fed2898 docs: the mouse stays yours unless the agent asked for it
+
+## Files changed
+ README.md       | 10 +++++++---
+ README.zh-CN.md | 10 +++++++---
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/README.md b/README.md
+index 04f5ae6..5da3bd7 100644
+--- a/README.md
++++ b/README.md
+@@ -116,23 +116,23 @@ The board is **grouped by project**. Sessions from the same project sit together
+ **Every project remembers its own last agent.** Press `n` in project A and you get claude, press `n` in project B and you get codex — and the bottom bar names which one you're about to get before you press anything (`n new claude`). A project that has never had a session just says `n new`, and pressing it opens the agent picker; so does a window too narrow to fit the name without pushing another key off the line.
+ 
+ The bottom bar is one line, and the keys that don't fit don't flicker in and out with the window width: whatever the bar can't hold lives one keypress away behind `?`, and that door (`? …`) is always the last thing on the line. That screen lists only the keys that actually do something right now — no `Tab` when there's only one project, no `x` when the group still has sessions in it.
+ 
+ The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), `g` goes back to the list, `?` opens the same all-keys screen, and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Two differences: folding is list-only, because in the grid the left and right arrows move the focus; and the digits work with no number on screen, because tiles carry no numbering the way group headers do — `1` is still the first project.
+ 
+ `i` is the grid's own key, and the one thing the board has no equivalent for: it opens a one-line reply box on the focused tile, so you can answer an agent without leaving the overview. Type and press `Enter` to send. Press `Enter` on an empty box and it sends a bare Enter — that's how you approve a plan or say "carry on". `Ctrl+C` interrupts the agent instead. While the box is open the whole keyboard belongs to it.
+ 
+ Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
+ 
+-Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
++Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3`, `F4` and `Ctrl+Q` are the only four keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view, `F4` toggles copy mode (more on that below).
+ 
+-You can scroll back through what a session already printed — the wheel, or `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. The wheel moves 3 lines a notch, a page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. Claude Code wants the mouse for its own scrolling, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex doesn't want the mouse, so `dct` scrolls what it kept instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
++You can scroll back through what a session already printed, with `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. A page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. The wheel only does something when the agent itself wants the mouse: Claude Code does, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex and plain command-line tools don't want the mouse, so `dct` doesn't capture it there either — the wheel does nothing in those sessions, use `PageUp`/`PageDown`/`End` instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
+ 
+ A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
+ 
+ ---
+ 
+ # Where this is going
+ 
+ **None of this is written yet.** It's here so the parts above make sense as a direction rather than a pile of features.
+ 
+ The point was never "use your terminal from anywhere." It's that **development keeps moving while you're not there**. You handle three things: state the goal, make the calls, accept the result. The understanding, writing, testing and fixing in between shouldn't need you watching.
+@@ -143,21 +143,25 @@ The point was never "use your terminal from anywhere." It's that **development k
+ - **Tasks replace sessions as the thing you deal with.** You say "fix the white screen after login on mobile" instead of first picking a PTY, an agent and a directory.
+ - **`dc_llm` stays resident doing the cheap work**: reading status, compacting context, classifying your replies, turning technical detail into a decision card you can read on a phone. The expensive frontier models get called only when there's actual code to write.
+ - **Done means the tests ran.** Detect the stack and the test command, run it, let the agent fix its own failures within a bounded number of rounds, and only hand it to you for acceptance once it passes.
+ 
+ ---
+ 
+ # Things that will annoy you
+ 
+ **The big one: the four vendor endpoints are copied out of public documentation and have never been tested with a real account.** A key can verify fine and the session still fail to start. Until somebody runs them with real credentials, treat Kimi, GLM, DeepSeek and Qwen API as unverified.
+ 
+-Scrolling back works now, but it cost you something: while you're inside a session, `dct` grabs the mouse, so your terminal's own click-and-drag text selection stops working there. In iTerm2 you hold Option to get it back; most terminals have some equivalent modifier. `dct` has no copy of its own yet. Back on the board the mouse is yours again.
++`dct` only takes the mouse when **the agent itself wants it**. Claude Code does (it uses the mouse to scroll its own screen); codex and plain command-line tools don't — in those sessions the mouse stays with the terminal the whole time, so click-and-drag text selection and copying work exactly as they always do. The cost is that the wheel no longer scrolls `dct`'s own history in those sessions; use `PageUp`/`PageDown`/`End` instead.
++
++To copy inside a session where the agent wants the mouse, press `F4` to enter copy mode: the mouse goes back to the terminal, the bottom bar says so, and pressing `F4` again leaves it once you're done copying. You can also use your terminal's own modifier (Option in iTerm2) without leaving the session at all.
++
++`dct` has no copy of its own — copying uses whatever your terminal already gives you.
+ 
+ Permissions are auto-accepted, which means an agent can write outside the project directory. **Those writes are outside the snapshot and undo won't bring them back.**
+ 
+ Two agents in one project will fight over the same files. Different projects, no problem.
+ 
+ `opencode` and `qwen` are in the list but neither has ever actually been run, so they have no screen patterns and their sessions just show `—`.
+ 
+ Only the first nine groups get a number. From the tenth project on, `Tab` is the only way there, one step at a time.
+ 
+ The interface comes in Chinese and English. `l` switches it, `DCT_LANG=en` overrides it for one run, and with neither it follows your system locale.
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 611c3ba..d193b0e 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -116,23 +116,23 @@ cargo build --release
+ 每个项目**各自**记着上次用的 agent：在 A 项目按 `n` 开 claude、在 B 项目按 `n` 开 codex，底栏在你按之前就写着这一下会开哪个（`n 新建 claude`）。这个项目还一次会话都没开过，就只写 `n 新建`，按下去弹选择器；窗口窄到那个名字挤掉别的键时也只写 `n 新建`。
+ 
+ 底栏只有一行，装不下的键不会跟着窗口宽度忽隐忽现——上面这张表里挤不进去的那些，全在 `?` 后面那一屏，而 `? …` 这扇门永远在行尾。那一屏只列**此刻真的按得动**的键：只有一个项目时不写 `Tab`，组里还有会话时不写 `x`。
+ 
+ 格子只读——方向键移动焦点，`F3` 跟 `→` 效果一样（下一格，停掉的会话也算），`Enter` 放大进焦点那一格（跟看板上按 `Enter` 是同一个附加视图），`g` 回列表，`?` 打开同一张全部按键的表，`Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` 在格子里的效果跟在看板上完全一样。只有两处不同：折叠是列表独有的，因为九宫格的左右键是移动焦点；数字键在这里屏幕上看不到号码——格子不像组头那样印着序号，但按下去照样是「第 N 个项目」，`1` 还是第一个。
+ 
+ `i` 是九宫格独有的那个键，也是看板上没有对应物的一件事：它在焦点那一格上开一个单行回复框，让你不用离开总览就回 agent 一句。打完按 `Enter` 送出去。框还空着时直接按 `Enter`，送出去的就是一个光秃秃的回车——批准一份计划、或者说「接着干」，用的就是这一下。`Ctrl+C` 则是打断它。框开着的时候键盘整个归框。
+ 
+ 格子按项目排好，同一个项目的会话挨在一起，每一格标着自己属于哪个项目。格子里敲的键一个字都不会送到 agent 那边。停掉的会话格子里留一张最后的画面，不是空的。会话超过九个就翻页，带页码提示。格子里翻不了历史，想往回看得先放大进去（`Enter`）。
+ 
+-进了会话，你敲的每个键都送给 agent，`Esc` 也一样，它们关自己的弹窗要用。`F2`、`F3`、`Ctrl+Q` 是 `dct` 唯一留下的三个键：`F2` 和 `Ctrl+Q` 都是退回看板，`F3` 不用退出就能直接跳到下一个还在跑的会话。
++进了会话，你敲的每个键都送给 agent，`Esc` 也一样，它们关自己的弹窗要用。`F2`、`F3`、`F4`、`Ctrl+Q` 是 `dct` 唯一留下的四个键：`F2` 和 `Ctrl+Q` 都是退回看板，`F3` 不用退出就能直接跳到下一个还在跑的会话，`F4` 切换复制模式（见下文）。
+ 
+-会话里之前打印过的内容能往回翻了——滚轮，或者 `PageUp`/`PageDown`/`End`。`dct` 大概留着最后 2000 行滚出屏幕的内容，这是个上限，不是承诺一行不少。滚轮一格 3 行，翻页是一屏减两行，留出两行接上上一屏，`End` 直接跳回底部。Claude Code 自己要抓鼠标去滚它自己的画面，这种情况下滚轮直接归它管，`dct` 不插手，也不提示——你滚的是它的画面，不是 `dct` 的。codex 不要鼠标，`dct` 就滚自己留的那份。往回看的时候新内容照样在后面涨，画面不会被拽着往下跳，底栏会数有几行新的在等着，也会告诉你怎么回去。打一个字，或者改一下窗口大小，立刻弹回底部。
++会话里之前打印过的内容能往回翻，用 `PageUp`/`PageDown`/`End`。`dct` 大概留着最后 2000 行滚出屏幕的内容，这是个上限，不是承诺一行不少。翻页是一屏减两行，留出两行接上上一屏，`End` 直接跳回底部。滚轮只在 agent 自己要鼠标时才有动静：Claude Code 会要，滚轮就直接归它管，`dct` 不插手，也不提示——你滚的是它的画面，不是 `dct` 的。codex、普通命令行不要鼠标，`dct` 也就不去抓它，滚轮在那些会话里不起作用，翻历史用 `PageUp`/`PageDown`/`End`。往回看的时候新内容照样在后面涨，画面不会被拽着往下跳，底栏会数有几行新的在等着，也会告诉你怎么回去。打一个字，或者改一下窗口大小，立刻弹回底部。
+ 
+ 一个会话从生到死绑定一个 agent，中途换不了。整段对话都在那个进程里面，换 agent 等于换个脑子。想换就按 `N` 另开一个。
+ 
+ ---
+ 
+ # 方向
+ 
+ **下面这些一行代码都还没写。** 放在这儿是为了说清楚上面那些东西是冲着什么去的。
+ 
+ 真正想要的不是「在任何地方看终端」，而是**人不在，开发照样往前走**。你只管三件事：提目标、拍板、验收。中间的理解、写、测、修，不该需要你盯着。
+@@ -143,21 +143,25 @@ cargo build --release
+ - **任务取代会话成为主角。** 你说「修复移动端登录后白屏」，而不是先选 PTY、选 agent、选目录。
+ - **`dc_llm` 常驻干便宜的活**：判断状态、压缩上下文、归类你的回复、把技术细节写成手机上能读的决策卡片。贵的前沿模型只在真正写代码的时候才叫。
+ - **跑完测试才算完成。** 自动识别技术栈和测试命令，自动跑，失败了让 agent 在限定轮次内自己修，通过了才推给你验收。
+ 
+ ---
+ 
+ # 会踩到的坑
+ 
+ **最要紧的一条：那四家的端点地址是照公开文档抄的，从来没拿真账号试过。** 密钥有可能验证通过、会话照样起不来。在有人拿真凭据跑通之前，Kimi、GLM、DeepSeek、Qwen API 这四个就当没验证过。
+ 
+-往回滚屏能用了，但它是有代价的：进了会话之后 `dct` 会接管鼠标，终端自己那套拖动选中文字就在会话里失灵了。iTerm2 里按住 Option 能拿回来，别的终端一般也有对应的修饰键。`dct` 自己还没有复制功能。退回看板，鼠标就还给你了。
++`dct` 只在 **agent 自己要鼠标的时候**才接管它。Claude Code 会要（它自己用鼠标滚它那一屏），codex 和普通命令行不要——那些会话里鼠标一直归终端，拖动选中文字、复制，跟平时完全一样。代价是那些会话里滚轮不再翻 `dct` 的历史，用 `PageUp`/`PageDown`/`End`。
++
++在 agent 要鼠标的会话里想复制，按 `F4` 进复制模式：鼠标临时还给终端，底栏会写着现在是这个状态，复制完再按一次 `F4` 回去。也可以用终端自己的修饰键（iTerm2 是按住 Option），不用退出会话。
++
++`dct` 自己没有复制功能——复制用的是你终端本来那一套。
+ 
+ 权限是全自动接受的，所以 agent 有可能写到项目目录外面去。**那部分改动不在快照范围内，撤销撤不回来。**
+ 
+ 同一个项目里开两个 agent，它们会抢同一批文件。跨项目就没事。
+ 
+ `opencode` 和 `qwen` 在列表里，但这两个一次都没真跑过，所以没给它们配屏幕匹配，会话状态一直是 `—`。
+ 
+ 号码只发给前九个组。第十个项目起没有号码，只能用 `Tab` 一个一个翻过去。
+ 
+ 界面有中文和英文两种。按 `l` 切，也可以用 `DCT_LANG=en` 临时压过一次；不设就跟着系统 locale 走。

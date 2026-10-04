@@ -1,0 +1,796 @@
+# Review package: 3825b05..HEAD
+
+## Commits
+0354544 feat(brain): new dct-brain crate with the five tiers and who signs each
+
+## Files changed
+ Cargo.lock                   | 192 +++++++++++++++++++++++++++++++++++++++++++
+ Cargo.toml                   |   5 +-
+ crates/dct-brain/Cargo.toml  |  17 ++++
+ crates/dct-brain/src/lib.rs  |   8 ++
+ crates/dct-brain/src/tier.rs |  87 ++++++++++++++++++++
+ 5 files changed, 308 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/Cargo.lock b/Cargo.lock
+index 394d7e5..d429f58 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -88,26 +88,38 @@ dependencies = [
+  "http",
+  "http-body",
+  "http-body-util",
+  "mime",
+  "pin-project-lite",
+  "sync_wrapper",
+  "tower-layer",
+  "tower-service",
+ ]
+ 
++[[package]]
++name = "base16ct"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
++
+ [[package]]
+ name = "base64"
+ version = "0.22.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+ 
++[[package]]
++name = "base64ct"
++version = "1.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
++
+ [[package]]
+ name = "bitflags"
+ version = "1.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+ 
+ [[package]]
+ name = "bitflags"
+ version = "2.13.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -184,20 +196,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7fd622ebbb56a5b2ccb651b32b911cdeb2a9b4b11776b2473bf26a26a286244e"
+ dependencies = [
+  "castaway",
+  "cfg-if",
+  "itoa",
+  "rustversion",
+  "ryu",
+  "static_assertions",
+ ]
+ 
++[[package]]
++name = "const-oid"
++version = "0.9.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
++
+ [[package]]
+ name = "core-foundation"
+ version = "0.10.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+ dependencies = [
+  "core-foundation-sys",
+  "libc",
+ ]
+ 
+@@ -249,20 +267,32 @@ dependencies = [
+ 
+ [[package]]
+ name = "crossterm_winapi"
+ version = "0.9.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
+ dependencies = [
+  "winapi",
+ ]
+ 
++[[package]]
++name = "crypto-bigint"
++version = "0.5.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
++dependencies = [
++ "generic-array",
++ "rand_core",
++ "subtle",
++ "zeroize",
++]
++
+ [[package]]
+ name = "crypto-common"
+ version = "0.1.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+ dependencies = [
+  "generic-array",
+  "typenum",
+ ]
+ 
+@@ -299,20 +329,21 @@ dependencies = [
+  "quote",
+  "syn 2.0.119",
+ ]
+ 
+ [[package]]
+ name = "dct"
+ version = "0.2.18"
+ dependencies = [
+  "anyhow",
+  "crossterm",
++ "dct-brain",
+  "dct-link",
+  "dct-page",
+  "flate2",
+  "getrandom 0.2.17",
+  "libc",
+  "portable-pty",
+  "qrcode",
+  "ratatui",
+  "regex",
+  "rqrr",
+@@ -322,20 +353,31 @@ dependencies = [
+  "tempfile",
+  "toml",
+  "uds_windows",
+  "unicode-width 0.1.14",
+  "ureq",
+  "vt100",
+  "windows-sys 0.59.0",
+  "zip",
+ ]
+ 
++[[package]]
++name = "dct-brain"
++version = "0.1.0"
++dependencies = [
++ "base64",
++ "p256",
++ "serde",
++ "serde_json",
++ "sha2",
++]
++
+ [[package]]
+ name = "dct-link"
+ version = "0.1.0"
+ dependencies = [
+  "base64",
+  "hmac",
+  "serde",
+  "serde_json",
+  "sha2",
+ ]
+@@ -353,27 +395,38 @@ dependencies = [
+  "dct-page",
+  "getrandom 0.2.17",
+  "serde",
+  "serde_json",
+  "sha2",
+  "tempfile",
+  "tokio",
+  "tower",
+ ]
+ 
++[[package]]
++name = "der"
++version = "0.7.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
++dependencies = [
++ "const-oid",
++ "zeroize",
++]
++
+ [[package]]
+ name = "digest"
+ version = "0.10.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+ dependencies = [
+  "block-buffer",
++ "const-oid",
+  "crypto-common",
+  "subtle",
+ ]
+ 
+ [[package]]
+ name = "displaydoc"
+ version = "0.2.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
+ dependencies = [
+@@ -381,26 +434,59 @@ dependencies = [
+  "quote",
+  "syn 3.0.3",
+ ]
+ 
+ [[package]]
+ name = "downcast-rs"
+ version = "1.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+ 
++[[package]]
++name = "ecdsa"
++version = "0.16.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
++dependencies = [
++ "der",
++ "digest",
++ "elliptic-curve",
++ "rfc6979",
++ "signature",
++ "spki",
++]
++
+ [[package]]
+ name = "either"
+ version = "1.17.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+ 
++[[package]]
++name = "elliptic-curve"
++version = "0.13.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
++dependencies = [
++ "base16ct",
++ "crypto-bigint",
++ "digest",
++ "ff",
++ "generic-array",
++ "group",
++ "pkcs8",
++ "rand_core",
++ "sec1",
++ "subtle",
++ "zeroize",
++]
++
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+ 
+ [[package]]
+ name = "errno"
+ version = "0.3.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -409,20 +495,30 @@ dependencies = [
+  "libc",
+  "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+ name = "fastrand"
+ version = "2.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+ 
++[[package]]
++name = "ff"
++version = "0.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
++dependencies = [
++ "rand_core",
++ "subtle",
++]
++
+ [[package]]
+ name = "filedescriptor"
+ version = "0.8.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
+ dependencies = [
+  "libc",
+  "thiserror",
+  "winapi",
+ ]
+@@ -541,20 +637,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "312d2295c7302019c395cfb90dacd00a82a2eabd700429bba9c7a3f38dbbe11b"
+ 
+ [[package]]
+ name = "generic-array"
+ version = "0.14.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
+ dependencies = [
+  "typenum",
+  "version_check",
++ "zeroize",
+ ]
+ 
+ [[package]]
+ name = "getrandom"
+ version = "0.2.17"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+ dependencies = [
+  "cfg-if",
+  "libc",
+@@ -565,20 +662,31 @@ dependencies = [
+ name = "getrandom"
+ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+ dependencies = [
+  "cfg-if",
+  "libc",
+  "r-efi",
+ ]
+ 
++[[package]]
++name = "group"
++version = "0.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
++dependencies = [
++ "ff",
++ "rand_core",
++ "subtle",
++]
++
+ [[package]]
+ name = "hashbrown"
+ version = "0.15.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+ dependencies = [
+  "allocator-api2",
+  "equivalent",
+  "foldhash 0.1.5",
+ ]
+@@ -1085,20 +1193,32 @@ name = "openssl-sys"
+ version = "0.9.117"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
+ dependencies = [
+  "cc",
+  "libc",
+  "pkg-config",
+  "vcpkg",
+ ]
+ 
++[[package]]
++name = "p256"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
++dependencies = [
++ "ecdsa",
++ "elliptic-curve",
++ "primeorder",
++ "sha2",
++]
++
+ [[package]]
+ name = "parking_lot"
+ version = "0.12.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+ dependencies = [
+  "lock_api",
+  "parking_lot_core",
+ ]
+ 
+@@ -1132,20 +1252,30 @@ name = "pin-project-lite"
+ version = "0.2.17"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+ 
+ [[package]]
+ name = "pin-utils"
+ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+ 
++[[package]]
++name = "pkcs8"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
++dependencies = [
++ "der",
++ "spki",
++]
++
+ [[package]]
+ name = "pkg-config"
+ version = "0.3.34"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+ 
+ [[package]]
+ name = "portable-pty"
+ version = "0.8.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1168,20 +1298,29 @@ dependencies = [
+ 
+ [[package]]
+ name = "potential_utf"
+ version = "0.1.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
+ dependencies = [
+  "zerovec",
+ ]
+ 
++[[package]]
++name = "primeorder"
++version = "0.13.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
++dependencies = [
++ "elliptic-curve",
++]
++
+ [[package]]
+ name = "proc-macro2"
+ version = "1.0.107"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+ dependencies = [
+  "unicode-ident",
+ ]
+ 
+ [[package]]
+@@ -1204,20 +1343,29 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+ dependencies = [
+  "proc-macro2",
+ ]
+ 
+ [[package]]
+ name = "r-efi"
+ version = "6.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+ 
++[[package]]
++name = "rand_core"
++version = "0.6.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
++dependencies = [
++ "getrandom 0.2.17",
++]
++
+ [[package]]
+ name = "ratatui"
+ version = "0.28.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "fdef7f9be5c0122f890d58bdf4d964349ba6a6161f705907526d891efabba57d"
+ dependencies = [
+  "bitflags 2.13.1",
+  "cassowary",
+  "compact_str",
+  "crossterm",
+@@ -1263,20 +1411,30 @@ dependencies = [
+  "memchr",
+  "regex-syntax",
+ ]
+ 
+ [[package]]
+ name = "regex-syntax"
+ version = "0.8.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+ 
++[[package]]
++name = "rfc6979"
++version = "0.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
++dependencies = [
++ "hmac",
++ "subtle",
++]
++
+ [[package]]
+ name = "ring"
+ version = "0.17.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+ dependencies = [
+  "cc",
+  "cfg-if",
+  "getrandom 0.2.17",
+  "libc",
+@@ -1376,20 +1534,34 @@ checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
+ dependencies = [
+  "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+ name = "scopeguard"
+ version = "1.2.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+ 
++[[package]]
++name = "sec1"
++version = "0.7.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
++dependencies = [
++ "base16ct",
++ "der",
++ "generic-array",
++ "pkcs8",
++ "subtle",
++ "zeroize",
++]
++
+ [[package]]
+ name = "security-framework"
+ version = "3.7.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+ dependencies = [
+  "bitflags 2.13.1",
+  "core-foundation",
+  "core-foundation-sys",
+  "libc",
+@@ -1568,20 +1740,30 @@ dependencies = [
+ [[package]]
+ name = "signal-hook-registry"
+ version = "1.4.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+ dependencies = [
+  "errno",
+  "libc",
+ ]
+ 
++[[package]]
++name = "signature"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
++dependencies = [
++ "digest",
++ "rand_core",
++]
++
+ [[package]]
+ name = "simd-adler32"
+ version = "0.3.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+ 
+ [[package]]
+ name = "slab"
+ version = "0.4.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1596,20 +1778,30 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+ [[package]]
+ name = "socket2"
+ version = "0.6.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+ dependencies = [
+  "libc",
+  "windows-sys 0.61.2",
+ ]
+ 
++[[package]]
++name = "spki"
++version = "0.7.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
++dependencies = [
++ "base64ct",
++ "der",
++]
++
+ [[package]]
+ name = "stable_deref_trait"
+ version = "1.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+ 
+ [[package]]
+ name = "static_assertions"
+ version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+diff --git a/Cargo.toml b/Cargo.toml
+index a19897a..e8cb85b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,29 +1,31 @@
+ # 这个仓库从 2026-08-28 起是个 workspace。根包仍然是 `dct` 本身——**没有把
+ # `src/` 搬进 `crates/dct/`**，那会产生一个几百个文件的 rename diff，把真正
+ # 的改动淹掉，而唯一的收获是目录看起来整齐。
+ #
+ [workspace]
+-members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv"]
++members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain"]
+ 
+ [package]
+ name = "dct"
+ version = "0.2.18"
+ edition = "2021"
+ license = "MIT"
+ 
+ [dependencies]
+ anyhow = "1"
+ # 跟中转服务共用的信封。`dct` 和 `dct-srv` 谁也不依赖谁，共同依赖这个。
+ dct-link = { path = "crates/dct-link" }
+ # 手机端那一页网页。放在共享 crate 里是因为中转也要发同一份——见那边的注释。
+ dct-page = { path = "crates/dct-page" }
++# 定档、执行票、签名核对。dct 和 dco 的安卓 App 共用，只写一份——见 crates/dct-brain 的模块说明。
++dct-brain = { path = "crates/dct-brain" }
+ regex = "1"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ toml = "0.8"
+ portable-pty = "0.8"
+ # 0.15.2 有个真实 bug：滚动偏移一旦超过屏幕行数，读屏幕内容就会
+ # panic（grid.rs 里 `rows_len - scrollback_offset` 直接减，越界）。
+ # 0.16 把它改成了 saturating_sub。翻到一屏之外正是这个功能的意义
+ # 所在，所以不能留在 0.15。
+ vt100 = "0.16"
+@@ -42,20 +44,21 @@ qrcode = { version = "0.14.1", default-features = false }
+ # Build Tools 的全部理由，不能为了一个哈希把它丢掉。
+ sha2 = "0.10"
+ zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+ # 帧要压过再上网：一屏终端 30 KB，压完 3–5 KB，两百个学生就是这两个数的
+ # 差别。rust_backend 是纯 Rust（miniz_oxide），不破「一行 C 都没有」。
+ flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ 
+ [dev-dependencies]
+ rqrr = "0.10.1"
+ tempfile = "3"
++dct-brain = { path = "crates/dct-brain", features = ["soft-signer"] }
+ 
+ # TLS 后端按平台分叉。
+ #
+ # **这里曾经写着「ureq 在只开 native-tls 时会自己挑它做默认，所以三处
+ # AgentBuilder 一行都不用改」——那句话是反的**，而且反得很贵：Windows 上
+ # 每一次 HTTPS 请求都失败，报 `no TLS backend is configured`，而密钥验证、
+ # 会话起名、手机通知这三条路全都零测试覆盖（测试不碰网络），于是这个 bug
+ # 一直没人撞见。ureq 自己的注释写在 lib.rs:401：native-tls「must be
+ # configured via the AgentBuilder，it is never picked up as a default」。
+ # 现在所有 agent 都从 `sys::tls::agent_builder()` 出来，那里显式装后端，
+diff --git a/crates/dct-brain/Cargo.toml b/crates/dct-brain/Cargo.toml
+new file mode 100644
+index 0000000..0423bac
+--- /dev/null
++++ b/crates/dct-brain/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "dct-brain"
++version = "0.1.0"
++edition = "2021"
++license = "MIT"
++
++[features]
++# 软件钥匙：只给测试用，冒充安全芯片。正式构建不打开。
++soft-signer = []
++
++[dependencies]
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++sha2 = "0.10"
++base64 = "0.22"
++# 纯 Rust 的 P-256 ECDSA，没有 C。安全芯片和手机 passkey 签出来的都是这条曲线。
++p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+diff --git a/crates/dct-brain/src/lib.rs b/crates/dct-brain/src/lib.rs
+new file mode 100644
+index 0000000..8b28dbc
+--- /dev/null
++++ b/crates/dct-brain/src/lib.rs
+@@ -0,0 +1,8 @@
++//! dct 的「大脑」：定档、执行票、签名核对。dct 和 dco 的安卓 App 共用，只写一份，
++//! 手机才能在电脑关着时自己判断、自己把关（设计：docs/superpowers/specs/2026-09-27-dct-brain-design.md）。
++//!
++//! 两条约束：
++//! - 没有 C 依赖（dct 的老规矩，也方便安卓用 NDK 编）。
++//! - 不直接碰磁盘和网络：钥匙怎么存、流程从哪来，都由调用方传进来。测试不打网络，
++//!   同一份代码在手机上也能跑。
++pub mod tier;
+diff --git a/crates/dct-brain/src/tier.rs b/crates/dct-brain/src/tier.rs
+new file mode 100644
+index 0000000..9b9ad82
+--- /dev/null
++++ b/crates/dct-brain/src/tier.rs
+@@ -0,0 +1,87 @@
++use serde::{Deserialize, Serialize};
++
++/// 一个动作能影响多大范围。**顺序就是「谁更严」**：取 `max` 就是往高了调，
++/// 所有兜底都只能这么调，永远不往低了调。
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
++pub enum Tier {
++    #[serde(rename = "read")]
++    Read,
++    #[serde(rename = "self")]
++    SelfOnly,
++    #[serde(rename = "physical")]
++    Physical,
++    #[serde(rename = "content")]
++    Content,
++    #[serde(rename = "money")]
++    Money,
++}
++
++/// 这一档的票该由谁来签。
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum SignerRole {
++    /// 自动钥匙：不打扰用户。
++    #[serde(rename = "auto")]
++    Auto,
++    /// 用户本人：Touch ID 或手机 passkey。
++    #[serde(rename = "user")]
++    User,
++}
++
++impl Tier {
++    pub fn name(self) -> &'static str {
++        match self {
++            Tier::Read => "read",
++            Tier::SelfOnly => "self",
++            Tier::Physical => "physical",
++            Tier::Content => "content",
++            Tier::Money => "money",
++        }
++    }
++
++    /// `None` 表示不要票（只读）。物理动作全自动是用户定的（设计第 4 节）。
++    pub fn required_signer(self) -> Option<SignerRole> {
++        match self {
++            Tier::Read => None,
++            Tier::SelfOnly | Tier::Physical => Some(SignerRole::Auto),
++            Tier::Content | Tier::Money => Some(SignerRole::User),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn stricter_tiers_sort_higher() {
++        assert!(Tier::Read < Tier::SelfOnly);
++        assert!(Tier::SelfOnly < Tier::Physical);
++        assert!(Tier::Physical < Tier::Content);
++        assert!(Tier::Content < Tier::Money);
++    }
++
++    #[test]
++    fn names_match_dcv_and_dco() {
++        for (t, n) in [
++            (Tier::Read, "read"),
++            (Tier::SelfOnly, "self"),
++            (Tier::Physical, "physical"),
++            (Tier::Content, "content"),
++            (Tier::Money, "money"),
++        ] {
++            assert_eq!(t.name(), n);
++            assert_eq!(serde_json::to_string(&t).unwrap(), format!("\"{n}\""));
++            assert_eq!(serde_json::from_str::<Tier>(&format!("\"{n}\"")).unwrap(), t);
++        }
++    }
++
++    #[test]
++    fn who_signs_each_tier() {
++        assert_eq!(Tier::Read.required_signer(), None);
++        assert_eq!(Tier::SelfOnly.required_signer(), Some(SignerRole::Auto));
++        // 物理动作全自动：用户定的「便利性第一位」。
++        assert_eq!(Tier::Physical.required_signer(), Some(SignerRole::Auto));
++        assert_eq!(Tier::Content.required_signer(), Some(SignerRole::User));
++        assert_eq!(Tier::Money.required_signer(), Some(SignerRole::User));
++    }
++}

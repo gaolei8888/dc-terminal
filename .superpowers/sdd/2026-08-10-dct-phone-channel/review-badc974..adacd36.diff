@@ -1,0 +1,1647 @@
+# Review package: badc974..adacd36
+
+## Commits
+adacd36 fix: make idle_help level-aware in the settings sublist, close review round 1
+c15668e docs: keep the phone-channel briefs, reports and ledger
+
+## Files changed
+ .../sdd/2026-08-10-dct-phone-channel/progress.md   | 102 +++++
+ .../2026-08-10-dct-phone-channel/task-1-brief.md   | 164 ++++++++
+ .../2026-08-10-dct-phone-channel/task-1-report.md  | 140 +++++++
+ .../2026-08-10-dct-phone-channel/task-2-brief.md   | 233 +++++++++++
+ .../2026-08-10-dct-phone-channel/task-2-report.md  | 437 +++++++++++++++++++++
+ .../2026-08-10-dct-phone-channel/task-3-brief.md   | 105 +++++
+ .../2026-08-10-dct-phone-channel/task-3-report.md  | 226 +++++++++++
+ src/i18n.rs                                        |   2 +-
+ src/ui/mod.rs                                      |   7 +
+ src/ui/settings_view.rs                            |  13 +
+ src/ui/view.rs                                     |  34 ++
+ 11 files changed, 1462 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/progress.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/progress.md
+new file mode 100644
+index 0000000..90fd29f
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/progress.md
+@@ -0,0 +1,102 @@
++# SDD ledger — plan: docs/superpowers/plans/2026-08-10-dct-phone-channel.md
++
++BASE for Task 1 = d8ec739
++Task 1: complete (commit d8ec739..1ff7575, review clean — spec ✅, quality Approved).
++  Implementer caught a plan error: Step 3's reference code has `pub mod telegram;`, but
++  telegram.rs is TASK 2's deliverable — copying it verbatim makes Task 1 fail to build on its own,
++  contradicting its "no dependencies" premise. Correctly omitted.
++
++CARRY-FORWARD TO TASK 2 (this line is the authoritative channel; the doc comment in mod.rs is not):
++  Task 2 MUST add `pub mod telegram;` to src/channel/mod.rs. Its own brief never mentions touching
++  mod.rs, so without this line nothing in the plan tells it to.
++  Also: Task 2's Step 2 expects "compile error naming parse_updates". If the module is not declared
++  the actual result is "0 tests matched" — which reads like an unremarkable green, not a red flag.
++  Tell the implementer to expect that and treat it as the same signal.
++
++CARRY-FORWARD TO TASK 6 (review finding, Important/plausible — a design gap in MY plan):
++  debounce(last: Option<Duration>, now: Duration, window) works, but Task 6's real caller holds a
++  per-session Instant, not a Duration sharing an origin. The plan shows no call-site code, so the
++  conversion is undocumented. The danger: an implementer reaching for a wall-clock epoch
++  (SystemTime::now().duration_since(UNIX_EPOCH)) reintroduces a NON-MONOTONIC-CLOCK bug into the
++  debounce decision — a clock step backwards would suppress a real event, or unsuppress a burst.
++  Task 6 must derive both Durations from a single monotonic origin (an Instant captured once per
++  SessionManager, .elapsed() against it), and say so in its report.
++Task 2: initial (commits 1ff7575..80f496c). Implementer caught TWO more plan errors:
++  (a) the `Send` type alias does not compile — an explicit module item shadows the prelude, so
++      `Send` in its own bound list resolves to the alias being defined (E0404). Renamed to `Sender`
++      per llm/http.rs. Reviewer confirmed independently.
++  (b) NEITHER the brief NOR Task 1's interface list ever says how Channel::send(&str) learns its
++      destination chat_id. My interface gap. It invented first-write-wins-from-poll.
++Task 2: review 1 — spec ✅, quality NOT APPROVED. 1 Critical + 4 Important + minors.
++  CRITICAL: the invented destination tracker duplicates state Task 5's Bridge owns, and they can
++  disagree in two reachable ways:
++    - re-pair: Bridge.owner <- None but Telegram.chat_id has NO reset path (private field, no
++      setter, its only writer refuses to overwrite). Outbound keeps going to the old account while
++      send() returns Ok and the phone page reads Paired. The unpaired person keeps receiving
++      session names, project names and agent output.
++    - new token (THE SECURITY ONE): Telegram learns from the RAW poll stream, before authorisation
++      (learning is inside poll(); Bridge.accept() is a separate call on the returned Vec). A
++      stranger who found the public bot username and messaged first captures OUTBOUND permanently.
++      Bridge correctly rejects their inbound — the security test still passes — so the one check
++      the feature rests on guards one direction while its duplicate opens the other.
++  Fixed now, not deferred, for three reasons: the fix is ~15 lines and touches only Task 2; there
++  is currently a GREEN test pinning the duplicate tracker whose doc comment calls it equivalent to
++  bridge.rs's pairing_happens_exactly_once, so reconciling later means deleting a test that reads
++  like a security test; and Task 5's header already calls Bridge "唯一有状态的地方".
++Task 2: fix round 1/5 dispatched (C1 + I1-I4 + 2 minors).
++
++CARRY-FORWARD TO TASK 5: Channel gains `fn set_destination(&self, chat: Option<i64>)`. Bridge must
++  call it where it already decides ownership: Accepted::Paired(id) -> Some(id); unpair/re-pair ->
++  None. Telegram no longer learns anything from the poll stream.
++CARRY-FORWARD TO TASK 4: 403 -> BadToken is WRONG for the most common 403, `Forbidden: bot was
++  blocked by the user` (which is literally the test fixture). Telling that user to re-enter a
++  perfectly good token fixes nothing. Task 4's PhoneState::Broken needs its own string for
++  "the bot was blocked", distinct from "the token is bad". My brief mandated the bad mapping.
++Task 2: fix round 1/5 (C1 + I1-I4 + minors all ADDRESSED by scoped re-review; commits
++  80f496c..22fbe60). Reviewer verified by reading: every write to the destination field is now the
++  constructor and set_destination, nothing else; send re-reads per call so a clear really clears;
++  reinterpret can never rewrite a BadToken (that value only comes from a parsed ok:false body, so
++  it is never Malformed); &self confirmed as the only workable signature under Arc<dyn Channel>.
++Task 2: fix round 2/5 dispatched — one Important that is small but guards the Critical:
++  set_destination_can_be_cleared does NOT discriminate. Mutating set_destination back to
++  first-write-wins keeps it green, because the exhausted FakeTransport returns Err and send maps
++  ANY transport Err to Unreachable — the exact value the assertion expects. So the reset path has
++  zero real coverage, and the Critical could be resurrected under a test named for preventing it.
++  Fix is one line: assert the fake was never called.
++CARRY-FORWARD TO TASK 5: send() snapshots the destination and releases the guard before the
++  network call, so the guarantee is "no NEW sends after the reset", not "no sends to the old chat
++  after the reset". One message can still land on the old chat after unpair. Holding the mutex
++  across a 10s request would be worse; do not try to close it that way.
++CARRY-FORWARD TO TASK 4: get_me is inherent on Telegram, not on the Channel trait. If Task 4 holds
++  Arc<dyn Channel> rather than a concrete Telegram it cannot reach it, and the trait needs it.
++Task 2: fix round 2/5 (all ADDRESSED, 0 open; commit 22fbe60..1a5344c). Reviewer walked the
++  first-write-wins mutation itself: FakeTransport::sender pushes to `calls` BEFORE checking the
++  replies queue, so the mutant records a call and the new assertion goes red; under the correct
++  implementation send short-circuits before any transport call, so the assertion holds with no
++  false-red. The staleness comment states the limit accurately and explicitly disclaims the
++  stronger reading.
++Task 2: complete (commits 1ff7575..1a5344c, review clean) — 24 adapter tests, 726 lib tests.
++BASE for Task 3 = 1a5344c
++Task 3: initial (commit 1a5344c..badc974). Implementer found a bug the brief never mentioned:
++  open_settings() preselected the cursor with the LANGUAGE's index into Lang::all(), which after
++  the refactor indexes SettingsItem::all(). Lang::all() is [En, Zh], so a Chinese-locale user —
++  this repo's DOCUMENTED DEFAULT — got Some(1) = SettingsItem::Phone. Silently wrong, no panic,
++  would have shipped to the majority of users. Fixed with a mutation-verified regression test.
++  It also disclosed honestly that one brief-specified mutation is structurally uncatchable
++  (SettingsItem::all().len() == Lang::all().len() == 2 by coincidence) instead of claiming a catch.
++Task 3: review 1 — spec ✅, quality Approved. 1 Important + 3 Minor. Reviewer confirmed the
++  Option<ListState> shape matches this codebase's governing precedent (PickProject/typing_path and
++  Grid/reply, both Option-encoded second levels with guarded back_one_level + escape_hint arms).
++  EnterSecret is NOT the precedent — its return_to_settings encodes provenance, not depth.
++  MY ERROR, corrected by the reviewer: I told the implementer the length coincidence would end
++  when Task 4 lands. It will not. Task 4 adds View::Phone (a page), not a third settings row, so
++  SettingsItem::all().len() stays 2 and the blind spot outlives Task 4 unnoticed. Asked for a
++  tripwire test instead of inventing a third enum entry to serve a test.
++Task 3: fix round 1/5 dispatched (idle_help level-awareness + tripwire + i18n asymmetry + the
++  missing escape_hint_cols entry).
++
++*** MERGE GATE — DO NOT MERGE THIS BRANCH TO main WITHOUT TASK 4 ***
++  The phone row is a visible, selectable dead end: Enter does nothing at all while the bottom bar
++  advertises `Enter 确认`. view.rs:1154 states the rule it breaks —
++  「屏幕上写着做不到的操作比不写更糟」. Correct for Task 3 in isolation, fine as an intermediate
++  commit, unacceptable on main. Task 4 (View::Phone) closes it.
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-1-brief.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-1-brief.md
+new file mode 100644
+index 0000000..82156c0
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-1-brief.md
+@@ -0,0 +1,164 @@
++## Task 1: 渠道 trait 与出站事件类型
++
++**Files:**
++- Create: `src/channel/mod.rs`
++- Modify: `src/lib.rs`（加 `pub mod channel;`）
++- Test: 同文件内 `#[cfg(test)] mod tests`（本仓库惯例）
++
++**Interfaces:**
++- Consumes: 无
++- Produces: `MsgId`、`Incoming`、`ChannelError`、`Channel` trait、`EventKind`、`Event`、`debounce()`
++
++- [ ] **Step 1: 写失败测试**
++
++```rust
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    /// 防抖只压快速抖动，不压真正的第二个事件。
++    #[test]
++    fn debounce_suppresses_only_inside_the_window() {
++        let w = Duration::from_secs(30);
++        // 从没发过：一定发
++        assert!(debounce(None, Duration::from_secs(0), w));
++        // 窗口内：压掉
++        assert!(!debounce(Some(Duration::from_secs(10)), Duration::from_secs(20), w));
++        // 正好在窗口边界上：压掉（边界属于窗口内）
++        assert!(!debounce(Some(Duration::from_secs(10)), Duration::from_secs(40), w));
++        // 窗口外：发
++        assert!(debounce(Some(Duration::from_secs(10)), Duration::from_secs(41), w));
++    }
++
++    /// `ChannelError` 必须把「重试有意义」和「重试没意义」分开——
++    /// 这个区分是错误处理那一节的全部依据，合并成一个错误就没法写退避了。
++    #[test]
++    fn bad_token_is_not_retryable_but_unreachable_is() {
++        assert!(ChannelError::Unreachable.worth_retrying());
++        assert!(!ChannelError::BadToken.worth_retrying());
++        assert!(!ChannelError::Malformed.worth_retrying());
++    }
++}
++```
++
++- [ ] **Step 2: 跑测试确认它失败**
++
++Run: `cargo test --lib channel:: -- --test-threads=1`
++Expected: 编译失败，`cannot find function debounce` / `cannot find type ChannelError`
++
++- [ ] **Step 3: 写最小实现**
++
++```rust
++//! 把消息送到用户手机上、再把他的回复取回来。
++//!
++//! **这一层不认识会话，也不认识 dct 的任何状态。** 它只知道「发一段文字」
++//! 和「取回一些文字」。谁该收到、敲给谁，全在 `bridge.rs`。
++
++pub mod telegram;
++
++use std::time::Duration;
++
++/// 渠道那边的消息 id。长按回复靠它把回复关联回某个会话。
++/// Telegram 的 `message_id` 是有符号整数，这里跟着它走。
++pub type MsgId = i64;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Incoming {
++    pub text: String,
++    /// 用户长按回复的是哪一条。直接发的话是 `None`。
++    pub reply_to: Option<MsgId>,
++    /// 谁发的。**配对之后只认一个**，见 `bridge.rs`。
++    pub chat_id: i64,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ChannelError {
++    /// 网络问题。**重试有意义。**
++    Unreachable,
++    /// 令牌无效或被撤销。**重试一万次还是这个结果**，退避重试是在浪费时间，
++    /// 而且会把「该让用户去重填令牌」这件事永远拖着不说。
++    BadToken,
++    /// 回来了但读不懂。当作坏消息处理，不猜。
++    Malformed,
++}
++
++impl ChannelError {
++    pub fn worth_retrying(self) -> bool {
++        matches!(self, ChannelError::Unreachable)
++    }
++}
++
++pub trait Channel: Send + Sync {
++    /// 发一条，返回渠道那边的消息 id。
++    fn send(&self, text: &str) -> Result<MsgId, ChannelError>;
++    /// 取新消息，最多阻塞 `timeout`。没有新消息就返回空 `Vec`，不是错误。
++    fn poll(&self, timeout: Duration) -> Result<Vec<Incoming>, ChannelError>;
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum EventKind {
++    /// 干完一轮停下来了
++    Stopped,
++    /// 报错了
++    Failed,
++    /// 会话自己没了
++    Vanished,
++}
++
++/// 一个值得告诉用户的事。**字段全是已经成文的用户语言**——守护进程是
++/// 唯一决定用户看到什么文字的地方，这条沿用 `proto.rs` 里
++/// 「`ProfileEntry.label` 是 `String` 不是 `LocalizedText`」的同一个理由。
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Event {
++    pub session: u32,
++    pub kind: EventKind,
++    /// 会话名。自动命名功能早就生成好了，这里直接用。
++    pub name: String,
++    pub project: String,
++}
++
++/// 这个事件该发吗？
++///
++/// `last` 是这个会话上次发出去的时刻，`now` 是现在，都相对于同一个起点。
++/// 用 `Duration` 而不是 `Instant` 是为了让测试能给出确定的时间点——
++/// `Instant` 造不出「10 秒前」。
++///
++/// **边界算窗口内**（`<=`）：窗口是「这段时间内不再打扰」，端点上还是那段时间。
++pub fn debounce(last: Option<Duration>, now: Duration, window: Duration) -> bool {
++    match last {
++        None => true,
++        Some(last) => now.saturating_sub(last) > window,
++    }
++}
++
++/// 防抖窗口的起点值。**这个数字是拍出来的**，spec 的「未验证」一节记着它：
++/// 偏小会吵人，偏大会漏掉真正的第二个事件。实测之后回来调。
++pub const DEBOUNCE_WINDOW: Duration = Duration::from_secs(30);
++```
++
++- [ ] **Step 4: 跑测试确认通过**
++
++Run: `cargo test --lib channel:: -- --test-threads=1`
++Expected: PASS
++
++- [ ] **Step 5: 变异测试**
++
++把 `debounce` 里的 `>` 改成 `>=`，跑测试 —— `debounce_suppresses_only_inside_the_window` 里的边界那条必须失败。把 `worth_retrying` 的 `matches!` 改成 `!matches!`，第二个测试必须失败。**都改回去。任何一个没失败就是测试没写够。**
++
++- [ ] **Step 6: 提交**
++
++```bash
++cargo fmt && cargo clippy --all-targets
++git add src/channel/mod.rs src/lib.rs
++git commit -m "feat: a channel is something you can send to and poll from
++
++The trait knows nothing about sessions. It sends text and takes text back;
++who should receive it and which agent a reply belongs to lives in bridge.
++
++ChannelError splits retryable from not: retrying a revoked token forever
++would also mean never telling the user to go re-enter it."
++```
++
++---
++
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-1-report.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-1-report.md
+new file mode 100644
+index 0000000..3f87ba7
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-1-report.md
+@@ -0,0 +1,140 @@
++# Task 1 report: 渠道 trait 与出站事件类型
++
++Status: DONE
++
++## Commit
++
++`1ff7575` — feat: a channel is something you can send to and poll from
++
++Files: `src/channel/mod.rs` (new), `src/lib.rs` (+`pub mod channel;`).
++
++## Inaccuracy found in the brief
++
++Step 3's reference code opens with `pub mod telegram;`. The telegram adapter
++is `src/channel/telegram.rs`, and per the plan doc
++(`docs/superpowers/plans/2026-08-10-dct-phone-channel.md:212-215`) that file
++is Task 2's deliverable, not Task 1's. Task 1's own file list only says
++"Create: `src/channel/mod.rs`" — nothing about creating `telegram.rs`.
++
++If I had copied the reference code verbatim, `mod.rs` would declare a
++submodule whose file doesn't exist yet, and `cargo build` would fail with
++`file not found for module telegram` — on Task 1 alone, before Task 2 even
++starts. That contradicts the task's own premise ("touches no existing code
++and has no dependencies").
++
++Action taken: omitted the `pub mod telegram;` line and replaced it with a
++doc-comment note explaining why it's not there yet, so Task 2's author (or
++future me) doesn't wonder if it was forgotten:
++
++```rust
++//! `telegram` 子模块（Task 2）尚未落地，先不在这里声明——声明了但文件
++//! 不存在，这一步就编译不过去了。
++```
++
++Everything else in the reference code (types, trait, `debounce`, doc
++comments) was copied as given and matched the codebase's existing style
++(dense why-comments, Chinese, matches `src/secrets.rs` conventions checked
++beforehand).
++
++## TDD sequence
++
++1. Wrote the test module from the brief's Step 1 verbatim into
++   `src/channel/mod.rs`, added `pub mod channel;` to `src/lib.rs` (needed
++   just to make `cargo test --lib channel::` resolve the module at all).
++2. Ran `cargo test --lib channel:: -- --test-threads=1` — confirmed red:
++   7 compile errors, `cannot find function debounce` /
++   `cannot find type ChannelError` in this scope, exactly as the brief
++   predicted.
++3. Added the implementation (Step 3, minus the `telegram` line as above).
++4. Ran the same test command — 2 passed, 0 failed.
++5. Mutation testing (see table below).
++6. `cargo fmt` (reformatted the three multi-arg `debounce()` calls in the
++   test module onto multiple lines — cosmetic only), `cargo clippy
++   --all-targets` — clean, no warnings. `cargo build --lib` — clean, no
++   dead-code warnings (everything here is `pub`, so nothing to flag yet
++   even though most of it isn't wired up until later tasks).
++7. Ran the full lib test suite (`cargo test --lib`, no filter) to make sure
++   nothing pre-existing broke: 702 passed, 0 failed.
++8. `git diff --check` — no whitespace errors.
++9. Committed.
++
++## Mutation table
++
++| Mutation | Command | Result | Test that caught it |
++|---|---|---|---|
++| `debounce`: `now.saturating_sub(last) > window` → `>= window` | `cargo test --lib channel:: -- --test-threads=1` | FAILED (1 passed, 1 failed) — the boundary assertion `!debounce(Some(10s), 40s, 30s)` panicked | `debounce_suppresses_only_inside_the_window` |
++| `worth_retrying`: `matches!(self, ChannelError::Unreachable)` → `!matches!(...)` | `cargo test --lib channel:: -- --test-threads=1` | FAILED (1 passed, 1 failed) — `ChannelError::Unreachable.worth_retrying()` panicked | `bad_token_is_not_retryable_but_unreachable_is` |
++
++Both mutations were killed by the tests as written in the brief — no gaps
++found, no new tests needed. Both mutations were reverted immediately after
++observing the failure (verified via `git diff` / `grep` that the file
++matched the pre-mutation state before re-running the green suite).
++
++## Exact test commands and output tails
++
++Red (before implementation):
++
++```
++$ cargo test --lib channel:: -- --test-threads=1
++error[E0425]: cannot find function `debounce` in this scope
++  --> src/channel/mod.rs:13:18
++...
++error[E0433]: cannot find type `ChannelError` in this scope
++  --> src/channel/mod.rs:24:17
++...
++error: could not compile `dct` (lib test) due to 7 previous errors; 1 warning emitted
++```
++
++Green (after implementation):
++
++```
++$ cargo test --lib channel:: -- --test-threads=1
++running 2 tests
++test channel::tests::bad_token_is_not_retryable_but_unreachable_is ... ok
++test channel::tests::debounce_suppresses_only_inside_the_window ... ok
++
++test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 700 filtered out; finished in 0.00s
++```
++
++Mutation 1 (`>` → `>=`):
++
++```
++$ cargo test --lib channel:: -- --test-threads=1
++test channel::tests::bad_token_is_not_retryable_but_unreachable_is ... ok
++test channel::tests::debounce_suppresses_only_inside_the_window ... FAILED
++
++thread 'channel::tests::debounce_suppresses_only_inside_the_window' panicked at src/channel/mod.rs:102:9:
++assertion failed: !debounce(Some(Duration::from_secs(10)), Duration::from_secs(40), w)
++
++test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 700 filtered out; finished in 0.00s
++```
++
++Mutation 2 (`matches!` → `!matches!`):
++
++```
++$ cargo test --lib channel:: -- --test-threads=1
++test channel::tests::bad_token_is_not_retryable_but_unreachable_is ... FAILED
++test channel::tests::debounce_suppresses_only_inside_the_window ... ok
++
++thread 'channel::tests::bad_token_is_not_retryable_but_unreachable_is' panicked at src/channel/mod.rs:111:9:
++assertion failed: ChannelError::Unreachable.worth_retrying()
++
++test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 700 filtered out; finished in 0.00s
++```
++
++Final full-suite run (post-revert, pre-commit):
++
++```
++$ cargo test --lib
++test result: ok. 702 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.40s
++```
++
++`cargo clippy --all-targets`: clean, no output beyond `Finished`.
++`git diff --check`: no output (no whitespace errors).
++
++## Concerns
++
++None. Task 1 is self-contained, builds and tests clean on its own, and
++does not declare the `telegram` submodule that Task 2 will add — Task 2's
++brief/implementer should add `pub mod telegram;` to `src/channel/mod.rs`
++themselves when they create `src/channel/telegram.rs`.
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-2-brief.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-2-brief.md
+new file mode 100644
+index 0000000..bd4b5da
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-2-brief.md
+@@ -0,0 +1,233 @@
++## Task 2: Telegram 适配器
++
++**Files:**
++- Create: `src/channel/telegram.rs`
++- Test: 同文件内
++
++**Interfaces:**
++- Consumes: Task 1 的 `Channel`、`Incoming`、`ChannelError`、`MsgId`
++- Produces: `parse_updates(&str) -> Result<Vec<Incoming>, ChannelError>`、`parse_send_result(&str) -> Result<MsgId, ChannelError>`、`parse_get_me(&str) -> Result<String, ChannelError>`、`Telegram::new(token)`、`Telegram::with_transport(token, send)`
++
++- [ ] **Step 1: 写失败测试**
++
++判定逻辑与传输分离，沿用 `verify.rs::verify_with` 的套路。
++
++```rust
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 真实回包的形状。少一个字段就该是 Malformed，不该 panic、不该猜。
++    #[test]
++    fn parses_a_normal_update() {
++        let body = r#"{"ok":true,"result":[{"update_id":1,"message":{
++            "message_id":42,"chat":{"id":777},"text":"先跑完"}}]}"#;
++        let got = parse_updates(body).expect("正常回包该解得出来");
++        assert_eq!(got.len(), 1);
++        assert_eq!(got[0].text, "先跑完");
++        assert_eq!(got[0].chat_id, 777);
++        assert_eq!(got[0].reply_to, None);
++    }
++
++    #[test]
++    fn picks_up_the_message_being_replied_to() {
++        let body = r#"{"ok":true,"result":[{"update_id":2,"message":{
++            "message_id":43,"chat":{"id":777},"text":"就第二个",
++            "reply_to_message":{"message_id":42}}}]}"#;
++        let got = parse_updates(body).unwrap();
++        assert_eq!(got[0].reply_to, Some(42));
++    }
++
++    /// 没有 text 的更新（图片、贴纸、有人进群）不是错误，是「这条没什么可读的」。
++    /// 当成 Malformed 会让一张图片害得整轮轮询失败。
++    #[test]
++    fn updates_without_text_are_skipped_not_errors() {
++        let body = r#"{"ok":true,"result":[{"update_id":3,"message":{
++            "message_id":44,"chat":{"id":777}}}]}"#;
++        assert_eq!(parse_updates(body).unwrap().len(), 0);
++    }
++
++    /// 令牌被撤销时 Telegram 回 ok:false + 401。**必须区分出 BadToken**，
++    /// 否则退避重试会永远转下去，用户永远等不到「去重填令牌」这句话。
++    #[test]
++    fn a_revoked_token_is_bad_token_not_unreachable() {
++        let body = r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#;
++        assert_eq!(parse_updates(body), Err(ChannelError::BadToken));
++    }
++
++    #[test]
++    fn garbage_is_malformed() {
++        assert_eq!(parse_updates("not json at all"), Err(ChannelError::Malformed));
++    }
++
++    #[test]
++    fn reads_the_new_message_id_back() {
++        let body = r#"{"ok":true,"result":{"message_id":99,"chat":{"id":777}}}"#;
++        assert_eq!(parse_send_result(body), Ok(99));
++    }
++
++    /// getMe 用来验证令牌，同时拿到 bot 用户名——界面上要显示
++    /// 「在 Telegram 里搜 @your_bot」，没有这个名字那句话就没法写。
++    #[test]
++    fn get_me_returns_the_bot_username() {
++        let body = r#"{"ok":true,"result":{"id":1,"is_bot":true,"username":"my_dct_bot"}}"#;
++        assert_eq!(parse_get_me(body).unwrap(), "my_dct_bot");
++    }
++
++    #[test]
++    fn get_me_with_a_bad_token_says_bad_token() {
++        let body = r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#;
++        assert_eq!(parse_get_me(body), Err(ChannelError::BadToken));
++    }
++}
++```
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo test --lib channel::telegram -- --test-threads=1`
++Expected: 编译失败，`cannot find function parse_updates`
++
++- [ ] **Step 3: 写最小实现**
++
++```rust
++//! Telegram 适配器。
++//!
++//! 它被排在第一个渠道，全部理由是 `getUpdates` 长轮询让 NAT 后面的笔记本
++//! 不需要服务器、不需要公网域名、不需要隧道。**别把这条优势改掉。**
++
++use super::{Channel, ChannelError, Incoming, MsgId};
++use std::time::Duration;
++
++const API: &str = "https://api.telegram.org";
++
++/// 传输层的形状：(url, body) -> 响应正文。与 `verify.rs::send_probe` 同一个
++/// 路子——判定逻辑可以在不打网络的前提下被完整测试。
++pub type Send = dyn Fn(&str, &str) -> Result<String, String> + Send + Sync;
++
++/// 从 `ok:false` 的回包里判错误类型。401/403 是令牌的问题，其余当网络问题。
++fn error_from(v: &serde_json::Value) -> ChannelError {
++    match v.get("error_code").and_then(|c| c.as_i64()) {
++        Some(401) | Some(403) => ChannelError::BadToken,
++        _ => ChannelError::Unreachable,
++    }
++}
++
++pub fn parse_updates(body: &str) -> Result<Vec<Incoming>, ChannelError> {
++    let v: serde_json::Value =
++        serde_json::from_str(body).map_err(|_| ChannelError::Malformed)?;
++    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
++        return Err(error_from(&v));
++    }
++    let items = v
++        .get("result")
++        .and_then(|r| r.as_array())
++        .ok_or(ChannelError::Malformed)?;
++
++    let mut out = Vec::new();
++    for it in items {
++        let Some(m) = it.get("message") else { continue };
++        // 没有 text 的更新（图片、贴纸、有人进群）跳过。**不是错误**——
++        // 当成错误会让一张图片害得整轮轮询失败。
++        let Some(text) = m.get("text").and_then(|t| t.as_str()) else {
++            continue;
++        };
++        let Some(chat_id) = m.get("chat").and_then(|c| c.get("id")).and_then(|i| i.as_i64())
++        else {
++            continue;
++        };
++        out.push(Incoming {
++            text: text.to_string(),
++            reply_to: m
++                .get("reply_to_message")
++                .and_then(|r| r.get("message_id"))
++                .and_then(|i| i.as_i64()),
++            chat_id,
++        });
++    }
++    Ok(out)
++}
++
++pub fn parse_send_result(body: &str) -> Result<MsgId, ChannelError> {
++    let v: serde_json::Value =
++        serde_json::from_str(body).map_err(|_| ChannelError::Malformed)?;
++    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
++        return Err(error_from(&v));
++    }
++    v.get("result")
++        .and_then(|r| r.get("message_id"))
++        .and_then(|i| i.as_i64())
++        .ok_or(ChannelError::Malformed)
++}
++
++/// 验证令牌，顺便拿 bot 用户名——界面要显示「在 Telegram 里搜 @your_bot」。
++pub fn parse_get_me(body: &str) -> Result<String, ChannelError> {
++    let v: serde_json::Value =
++        serde_json::from_str(body).map_err(|_| ChannelError::Malformed)?;
++    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
++        return Err(error_from(&v));
++    }
++    v.get("result")
++        .and_then(|r| r.get("username"))
++        .and_then(|u| u.as_str())
++        .map(|s| s.to_string())
++        .ok_or(ChannelError::Malformed)
++}
++
++pub struct Telegram {
++    token: String,
++    /// 长轮询的游标。Telegram 只在你确认过之后才丢弃旧更新，
++    /// 不带它会把同一条消息反复取回来——那意味着同一句话被敲进 agent 好几遍。
++    offset: std::sync::Mutex<i64>,
++    send: Box<Send>,
++}
++
++impl Telegram {
++    pub fn with_transport(token: &str, send: Box<Send>) -> Telegram {
++        Telegram {
++            token: token.to_string(),
++            offset: std::sync::Mutex::new(0),
++            send,
++        }
++    }
++
++    fn url(&self, method: &str) -> String {
++        format!("{API}/bot{}/{method}", self.token)
++    }
++}
++```
++
++`Channel` 的实现与真实传输（`ureq`，超时 = 长轮询秒数 + 5 秒余量）在 Step 5 补。
++
++- [ ] **Step 4: 跑测试确认通过**
++
++Run: `cargo test --lib channel::telegram -- --test-threads=1`
++Expected: PASS
++
++- [ ] **Step 5: 补 `Channel` 实现与真实传输**
++
++`send()` 打 `sendMessage`，`poll()` 打 `getUpdates?offset={o}&timeout={s}`，成功后把 `offset` 更新为 `max(update_id) + 1`。真实传输用 `ureq`，超时取长轮询秒数 + 5 秒。
++
++**用一个假传输写一个测试盖住 offset 递进**：连续两次 `poll`，第二次的 URL 必须带上 `offset=<上次最大 update_id + 1>`。这一条不测就会有「同一句话被敲进 agent 好几遍」。
++
++- [ ] **Step 6: 变异测试**
++
++把 `error_from` 里的 `Some(401) | Some(403)` 改成只有 `Some(401)`，`get_me_with_a_bad_token_says_bad_token` 该继续过（它用的是 401）—— **说明 403 没被测到，补一条 403 的测试**。把 offset 递进的 `+ 1` 去掉，Step 5 的测试必须失败。
++
++- [ ] **Step 7: 提交**
++
++```bash
++cargo fmt && cargo clippy --all-targets
++git add src/channel/telegram.rs
++git commit -m "feat: talk to telegram without touching the network in tests
++
++Parsing is split from transport the way verify.rs already does it, so a
++revoked token, a timeout and a sticker someone sent the bot are all
++covered without a socket.
++
++The poll cursor matters more than it looks: without it telegram hands back
++the same update forever, which would mean typing one sentence into an agent
++over and over."
++```
++
++---
++
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-2-report.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-2-report.md
+new file mode 100644
+index 0000000..c4f1e46
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-2-report.md
+@@ -0,0 +1,437 @@
++# Task 2 report: Telegram adapter
++
++BASE = 1ff7575 (Task 1, `src/channel/mod.rs`)
++Commits:
++- bfccd1e — test: add failing tests for the telegram channel adapter (declares `pub mod telegram;`, adds Step 1 tests)
++- 6f27293 — feat: parse telegram updates, send results and getMe replies (Step 3/4: parsing + minimal `Telegram` scaffold)
++- 80f496c — feat: implement Channel for Telegram and its real ureq transport (Step 5: `Channel` impl, cursor, real transport)
++
++## Inaccuracies found in the brief, and what I did
++
++### 1. Reference code names the transport type alias `Send` — does not compile
++
++Step 3's reference code declares:
++
++```rust
++pub type Send = dyn Fn(&str, &str) -> Result<String, String> + Send + Sync;
++```
++
++`Send` collides with `std::marker::Send`. Inside the same bound list, `+ Send + Sync`
++resolves `Send` to the type alias being defined (types and traits share one namespace),
++not the marker trait — a type alias can't be used as a trait bound. Confirmed with a
++throwaway `rustc` compile before writing anything into the repo:
++
++```
++error[E0404]: expected trait, found type alias `Send`
++```
++
++Fixed by naming it `Sender` instead, matching the existing sibling idiom
++(`llm/http.rs::Sender`). Documented the reasoning inline as a doc comment on the type
++so a future reader doesn't reintroduce it.
++
++### 2. The interface list never says how `send()` learns its destination chat_id
++
++The brief's "Produces" list gives `Telegram::new(token)` / `Telegram::with_transport(token, send)`
++— no chat id anywhere — and Task 1's `Channel::send(&self, text: &str)` has no chat_id
++parameter either. But Telegram's real `sendMessage` API requires a `chat_id`. I checked
++both the plan (`docs/superpowers/plans/2026-08-10-dct-phone-channel.md`) and the design
++spec (`docs/superpowers/specs/2026-08-10-dct-phone-channel-design.md`); neither resolves
++this — Task 5 (`bridge.rs`, not yet built) tracks its own `owner: Option<i64>` for a
++different purpose (rejecting strangers' *incoming* messages), but that's a separate
++struct with no wiring back into `Channel::send`.
++
++Resolved it inside `Telegram` itself: it now has a `chat_id: Mutex<Option<i64>>` field
++that `poll()` sets to the first incoming message's `chat_id`, first-write-wins, and never
++overwrites once set — the same "first sender becomes the owner, permanently" model
++`bridge.rs` is planned to use for pairing, just enforced independently at the transport
++layer since `Channel::send` gives it no other way to learn a target. Before any chat is
++known, `send()` returns `ChannelError::Unreachable` (retryable — once `poll()` learns a
++chat, a retry succeeds, which is exactly what `worth_retrying()` is for).
++
++This also forced a design decision the brief didn't specify: the `Sender` transport type
++now carries an explicit `Duration` timeout parameter (`Fn(&str, &str, Duration) -> ...`),
++computed by the caller — `poll()` passes `long_poll_secs + 5s`, `send()` passes a fixed
++10s constant. The brief's Step 5 prose says "超时取长轮询秒数 + 5 秒余量" but the
++reference `Sender` shape from Step 3 has no way to carry a per-call timeout into a fixed
++transport closure; threading it through the type is the only way to satisfy that
++requirement for both a long-poll call and a quick `sendMessage` call sharing one
++`Box<Sender>`.
++
++Both of these are documented in code with WHY comments at the `chat_id` field and the
++`Sender` type alias.
++
++## Mutation table (Step 6)
++
++| Mutation | Expected | Result |
++|---|---|---|
++| `error_from`: `Some(401) \| Some(403)` → `Some(401)` only | brief predicts `get_me_with_a_bad_token_says_bad_token` still passes (it uses 401) — proving 403 uncovered | Confirmed: only `a_403_is_also_bad_token_not_unreachable` failed (added this test in Step 1, before Step 6 — brief's failure mode never actually manifested because 403 was covered from the start) |
++| `poll()` offset update: `max_id + 1` → `max_id` | `the_second_poll_carries_the_offset_past_the_last_update_id` must fail | Confirmed: failed with `第二次轮询该带上 7 + 1 = 8，实际 url: ...offset=7...` |
++| (extra, not requested by brief) `chat_id` first-write-wins guard removed (always overwrite) | `the_learned_chat_does_not_get_overwritten_by_a_later_sender` must fail | Confirmed: failed, `left: Number(222), right: 111` |
++
++All three mutations were applied one at a time to the working tree, verified to fail the
++expected test (and only that test), then reverted before the Step 5 commit — the
++committed code is the unmutated version confirmed clean by `cargo test --lib channel::telegram`
++afterward.
++
++## Cursor test
++
++`the_second_poll_carries_the_offset_past_the_last_update_id` (`src/channel/telegram.rs`):
++builds a `FakeTransport` that records every `(url, body)` it's called with and replays two
++canned responses. First response has updates with `update_id` 5 and 7. Asserts:
++- first `poll()` call's URL contains `offset=0` (nothing seen yet)
++- second `poll()` call's URL contains `offset=8` — i.e. `max(5, 7) + 1`
++
++This is the test the brief calls out as non-optional: without the cursor, Telegram
++re-sends the same update on every long-poll, which in this feature means the same
++sentence gets typed into an agent every 25 seconds forever.
++
++## Test commands and output tails
++
++```
++$ cargo test --lib channel::telegram -- --test-threads=1
++running 16 tests
++test channel::telegram::tests::a_403_is_also_bad_token_not_unreachable ... ok
++test channel::telegram::tests::a_revoked_token_is_bad_token_not_unreachable ... ok
++test channel::telegram::tests::a_transport_level_failure_is_unreachable ... ok
++test channel::telegram::tests::garbage_is_malformed ... ok
++test channel::telegram::tests::get_me_returns_the_bot_username ... ok
++test channel::telegram::tests::get_me_with_a_bad_token_says_bad_token ... ok
++test channel::telegram::tests::parses_a_normal_update ... ok
++test channel::telegram::tests::picks_up_the_message_being_replied_to ... ok
++test channel::telegram::tests::poll_puts_the_requested_seconds_in_the_url ... ok
++test channel::telegram::tests::reads_the_new_message_id_back ... ok
++test channel::telegram::tests::send_surfaces_bad_token ... ok
++test channel::telegram::tests::send_targets_the_chat_learned_from_poll ... ok
++test channel::telegram::tests::sending_before_any_chat_is_known_is_unreachable ... ok
++test channel::telegram::tests::the_learned_chat_does_not_get_overwritten_by_a_later_sender ... ok
++test channel::telegram::tests::the_second_poll_carries_the_offset_past_the_last_update_id ... ok
++test channel::telegram::tests::updates_without_text_are_skipped_not_errors ... ok
++
++test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 702 filtered out; finished in 0.00s
++```
++
++```
++$ cargo test --lib
++...
++test result: ok. 718 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.51s
++```
++
++```
++$ cargo test   # full suite incl. integration tests
++... (all integration test binaries) ...
++test result: ok. (every binary: 0 failed)
++```
++
++```
++$ cargo fmt -- --check
++(no output — clean)
++
++$ cargo clippy --all-targets
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.20s
++(no warnings)
++
++$ git diff --check
++(no output — clean)
++```
++
++### Red-step evidence (Steps 1–2)
++
++Before `pub mod telegram;` was declared in `src/channel/mod.rs`:
++
++```
++$ cargo test --lib channel::telegram -- --test-threads=1
++running 0 tests
++test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 702 filtered out; finished in 0.00s
++```
++
++This is the coordinator's flagged "reads like green, is actually red" signal — treated
++as such rather than as a pass.
++
++After declaring the module (per the carry-forward instruction: Task 1 deliberately
++omitted it since the file didn't exist yet):
++
++```
++$ cargo test --lib channel::telegram -- --test-threads=1
++error[E0425]: cannot find function `parse_updates` in this scope
++...
++error: could not compile `dct` (lib test) due to 11 previous errors
++```
++
++This matches the brief's predicted Step 2 outcome exactly.
++
++## Concerns / notes for later tasks
++
++- **Task 5 (`bridge.rs`) needs to know about `Telegram`'s own chat-id learning.** Bridge's
++  planned `owner: Mutex<Option<i64>>` and `Telegram`'s `chat_id: Mutex<Option<i64>>` are
++  two independent "first message wins" trackers fed by the same `poll()` stream. As long
++  as both consume updates in the same order (they will, since both derive from the same
++  `Vec<Incoming>` per poll batch) they stay in sync, but this duplication is worth a
++  second look when Task 5 is implemented — ideally Bridge becomes the single source of
++  truth and either Telegram's own tracking is proven redundant-but-harmless, or the two
++  are unified.
++- Telegram's real transport (`send_real`) has no unit test coverage, by design — same
++  boundary as `llm/http.rs::send_real` and `verify.rs::send_probe`. It needs a real bot
++  token run before shipping, consistent with the existing "四个 vendor base_url 从没拿真
++  key 跑过" risk already on record for this codebase.
++- `getUpdates` is called via `agent.get(url).call()`; `sendMessage` via `agent.post(url).send_string(body)`
++  keyed off whether `body` is empty. This wasn't specified anywhere and is my own choice
++  — reasonable (Telegram's Bot API accepts both GET-with-query-params and POST-with-JSON
++  for `getUpdates`), but worth a real-network smoke test before shipping, same risk noted
++  above.
++
++---
++
++## Fix round 1 (Critical + 4 Important + Minor)
++
++Commit: `22fbe60` — fix: stop learning the outbound telegram destination from raw polls
++
++### Critical — destination tracker duplicated state Bridge owns, and could disagree
++
++The coordinator identified that `Telegram.chat_id`, learned first-write-wins inside
++`poll()`, ran *before* Bridge's ownership check — a stranger who messaged the bot first
++could permanently capture the outbound destination, and neither re-pairing nor a new
++token had any reset path (the field was private, no setter existed, and the only writer
++refused to overwrite). Confirmed this analysis is correct: Bridge's planned `accept()`
++only filters what gets *typed into a session*; it was never going to be consulted before
++`Telegram` decided who to *send to*.
++
++Fix, exactly as directed:
++- Deleted the learning code that used to sit at the end of `poll()` (previously around
++  `telegram.rs:190-196`) and the `the_learned_chat_does_not_get_overwritten_by_a_later_sender`
++  test.
++- Added `fn set_destination(&self, chat: Option<i64>);` to the `Channel` trait in
++  `src/channel/mod.rs`. `Telegram` implements it as `*recover(self.destination.lock()) = chat;`
++  — the field was renamed from `chat_id` to `destination` to match.
++- Kept `send()` returning `Unreachable` before any destination is set, and kept
++  `sending_before_any_destination_is_set_is_unreachable` (renamed from
++  `sending_before_any_chat_is_known_is_unreachable` to match the new vocabulary).
++- Added the inverse test, `polling_a_strangers_message_never_sets_a_destination`: polls a
++  message from an unrecognized chat, asserts the `Incoming` is still returned (rejecting it
++  is Bridge's job, not the transport's), then asserts `send()` is still `Unreachable` and
++  no network call happened for it.
++- Added `send_targets_the_configured_destination` (destination set via `set_destination`,
++  not learned) and `set_destination_can_be_cleared` (covers the re-pair-to-a-different-account
++  path: `Some` → `None` → `send()` goes back to `Unreachable`).
++
++Task 5 (`bridge.rs`) will call `set_destination` wherever it decides ownership — not built
++here, per the coordinator's note that it's carrying that forward in the ledger.
++
++### Important 1 — the transport `Duration` was never asserted
++
++`FakeTransport::sender` previously took `_timeout: Duration` and dropped it. Changed
++`FakeTransport.calls` to `Vec<(String, String, Duration)>`, recording the third argument.
++Added `poll_and_send_each_carry_their_own_client_timeout`, asserting `30s` for `poll(25s)`
++(`POLL_TIMEOUT_MARGIN` = 5s) and `10s` for `send` (`SEND_TIMEOUT`).
++
++### Important 2 — nothing pinned "the cursor advances past a text-less update"
++
++Added `the_cursor_advances_past_a_text_less_update_too`: polls a sticker-only batch
++(`update_id: 9`, no `text`), asserts the returned `Vec<Incoming>` is empty, then polls
++again and asserts the URL carries `offset=10&` — proving the cursor moved past an update
++that never became an `Incoming`. Verified by mutation (see table below) that gating the
++cursor advance on `!incoming.is_empty()` instead of `max_update_id(&body).is_some()` now
++fails this test.
++
++### Important 3 — two tests that didn't discriminate what they claimed
++
++- `continue`-vs-`break` in the text-skip branch: added
++  `a_text_less_update_does_not_stop_the_rest_of_the_batch_from_being_read`, a two-element
++  batch (text-less update, then a real text message). Mutating the `continue` to `break`
++  now fails this test (previously all fixtures were single-element, so `break` and
++  `continue` were indistinguishable).
++- `send_real` dropping the HTTP status: changed `Sender` to
++  `Fn(&str, &str, Duration) -> Result<(u16, String), String>`, matching `llm/http.rs`'s
++  shape. Added `reinterpret(err, status)`, called at all three call sites (`send`, `poll`,
++  `get_me`), mapping `Malformed` + a 5xx status to `Unreachable`. Added
++  `a_5xx_with_an_unparseable_body_is_unreachable_not_malformed` (502 + HTML body →
++  `Unreachable`) and `a_4xx_with_an_unparseable_body_is_still_malformed` (400 + garbage
++  body → stays `Malformed`, proving the boundary is 5xx-only, not "any non-2xx").
++
++### Important 4 — `parse_get_me` had no caller and no seam
++
++Added `Telegram::get_me(&self) -> Result<String, ChannelError>`, an inherent method (not
++on the `Channel` trait — Task 4 doesn't need it there) going through `self.send` with
++`SEND_TIMEOUT`, hitting `getMe`. Added `get_me_goes_through_the_injected_transport`
++(asserts the URL ends `/getMe` and the timeout is `SEND_TIMEOUT`, not the long-poll one)
++and `get_me_surfaces_bad_token_through_the_channel`.
++
++### Minor
++
++- Replaced all production-code `.lock().unwrap()` in `telegram.rs` with `crate::session::recover`
++  (offset lock in `poll()`, destination lock in `send()`/`set_destination()`) — `Telegram`
++  is shared between the inbound and outbound threads and the daemon has no supervisor to
++  restart a poisoned mutex.
++- Fixed `calls[1].0.contains("offset=8")` → `contains("offset=8&")` (the old assertion
++  would also have passed against `offset=80`).
++
++### Not fixed here (recorded against Task 4, not this task's error)
++
++403 → `BadToken` is wrong for the most common real-world 403
++(`Forbidden: bot was blocked by the user` — literally the test fixture's own description).
++The brief mandated this mapping, so it isn't this task's bug to fix; Task 4 needs a
++distinct user-facing string for "the bot was blocked," not "re-enter your token."
++
++### Mutation table, fix round 1
++
++All mutations applied to the working tree one at a time, confirmed to fail only the
++expected test(s), then reverted before the fix-round commit.
++
++| Mutation | Expected | Result |
++|---|---|---|
++| `error_from`: `Some(401) \| Some(403)` → `Some(401)` only (re-verified after refactor) | `a_403_is_also_bad_token_not_unreachable` fails | Confirmed: FAILED (1) |
++| `poll()` offset update: `max_id + 1` → `max_id` (re-verified after refactor) | `the_second_poll_carries_the_offset_past_the_last_update_id` fails | Confirmed: FAILED (2 — this one and `the_cursor_advances_past_a_text_less_update_too` both fail) |
++| Cursor gate: `if let Some(max_id) = max_update_id(&body)` → `if !incoming.is_empty() { if let Some(max_id) = ... }` | `the_cursor_advances_past_a_text_less_update_too` fails | Confirmed: FAILED, `offset=0` instead of `offset=10&` |
++| Text-skip: `continue` → `break` in `parse_updates` | `a_text_less_update_does_not_stop_the_rest_of_the_batch_from_being_read` fails | Confirmed: FAILED, `left: 0, right: 1` |
++| `reinterpret`: `(500..600)` → `(400..600)` (over-broad) | `a_4xx_with_an_unparseable_body_is_still_malformed` fails | Confirmed: FAILED, `left: Unreachable, right: Malformed` |
++
++### Test commands and output tails, fix round 1
++
++```
++$ cargo test --lib channel::telegram -- --test-threads=1
++running 24 tests
++test channel::telegram::tests::a_403_is_also_bad_token_not_unreachable ... ok
++test channel::telegram::tests::a_4xx_with_an_unparseable_body_is_still_malformed ... ok
++test channel::telegram::tests::a_5xx_with_an_unparseable_body_is_unreachable_not_malformed ... ok
++test channel::telegram::tests::a_revoked_token_is_bad_token_not_unreachable ... ok
++test channel::telegram::tests::a_text_less_update_does_not_stop_the_rest_of_the_batch_from_being_read ... ok
++test channel::telegram::tests::a_transport_level_failure_is_unreachable ... ok
++test channel::telegram::tests::garbage_is_malformed ... ok
++test channel::telegram::tests::get_me_goes_through_the_injected_transport ... ok
++test channel::telegram::tests::get_me_returns_the_bot_username ... ok
++test channel::telegram::tests::get_me_surfaces_bad_token_through_the_channel ... ok
++test channel::telegram::tests::get_me_with_a_bad_token_says_bad_token ... ok
++test channel::telegram::tests::parses_a_normal_update ... ok
++test channel::telegram::tests::picks_up_the_message_being_replied_to ... ok
++test channel::telegram::tests::poll_and_send_each_carry_their_own_client_timeout ... ok
++test channel::telegram::tests::poll_puts_the_requested_seconds_in_the_url ... ok
++test channel::telegram::tests::polling_a_strangers_message_never_sets_a_destination ... ok
++test channel::telegram::tests::reads_the_new_message_id_back ... ok
++test channel::telegram::tests::send_surfaces_bad_token ... ok
++test channel::telegram::tests::send_targets_the_configured_destination ... ok
++test channel::telegram::tests::sending_before_any_destination_is_set_is_unreachable ... ok
++test channel::telegram::tests::set_destination_can_be_cleared ... ok
++test channel::telegram::tests::the_cursor_advances_past_a_text_less_update_too ... ok
++test channel::telegram::tests::the_second_poll_carries_the_offset_past_the_last_update_id ... ok
++test channel::telegram::tests::updates_without_text_are_skipped_not_errors ... ok
++
++test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 702 filtered out; finished in 0.00s
++```
++
++```
++$ cargo test --lib channel::
++running 26 tests (24 telegram + 2 channel::tests from mod.rs)
++test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 700 filtered out; finished in 0.01s
++```
++
++```
++$ cargo test --lib
++test result: ok. 726 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.42s
++```
++
++```
++$ cargo test   # full workspace incl. integration test binaries
++... (every binary) ...
++test result: ok. (every binary: 0 failed)
++```
++
++```
++$ cargo fmt -- --check
++(no output — clean)
++
++$ cargo clippy --all-targets
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.38s
++(no warnings)
++
++$ git diff --check
++(no output — clean)
++```
++
++---
++
++## Fix round 2 (1 Important, 2 Minor)
++
++Commit: `1a5344c` — fix: strengthen the destination-clear test and document send's staleness window
++
++The scoped re-review verdicted the Critical and all four Important findings from round 1
++ADDRESSED (verified by reading, not trusting: destination is only ever written by the
++constructor and `set_destination`; `send` re-reads the lock every call so a clear is
++visible immediately; `reinterpret` can't rewrite `BadToken` since that value only comes
++from a successfully-parsed `ok:false` body, never `Malformed`; `&self` confirmed as the
++only workable signature given `Arc<dyn Channel>`). Three small items came back.
++
++### Important — `set_destination_can_be_cleared` did not discriminate
++
++The test only asserted `send("hi")` returns `Unreachable` after `Some(777)` then `None`.
++The reviewer found that mutating `set_destination` to first-write-wins
++(`if d.is_none() { *d = chat; }`) leaves the destination at `Some(777)`: `send()` still
++builds the request and calls the (out-of-replies) fake transport, which returns `Err`,
++which `send()` maps to the same `Unreachable` the assertion expects — so the reset half
++of the round-1 Critical fix had zero real coverage. Added:
++
++```rust
++assert!(fake.calls.lock().unwrap().is_empty(), "不该打网络");
++```
++
++Applied the exact mutation described (`if d.is_none() { *d = chat; }` in `set_destination`)
++to the working tree, confirmed `set_destination_can_be_cleared` now fails with `不该打网络`
++(the network *was* called), then reverted.
++
++### Minor — `offset=0` vs. its sibling's `offset=8&`
++
++`the_second_poll_carries_the_offset_past_the_last_update_id`'s first assertion used
++`contains("offset=0")` while its second used the already-tightened `contains("offset=8&")`.
++Changed the first to `contains("offset=0&")` for consistency (no known false-positive today,
++just the two lines disagreeing).
++
++### Minor — documented `send()`'s actual staleness guarantee
++
++Added a comment at the destination snapshot in `send()` (reads the lock once, releases it
++before the up-to-10s network call — holding it across the request would block
++`set_destination` for that whole window, a worse trade). The comment states plainly what
++this buys: **no new `send()` reaches the old chat after a reset — not that an in-flight
++send started just before the reset gets recalled.** Written so Task 5's unpair path
++doesn't assume a stronger guarantee than what's actually implemented.
++
++### Not fixed here (recorded for later, not this task's error)
++
++- `get_me` is inherent, not on the `Channel` trait, exactly as the brief prescribed. If a
++  future task holds `Arc<dyn Channel>` instead of a concrete `Telegram`, it won't reach
++  `get_me` and the trait will need the method then.
++- `Option<i64>` in `set_destination`/`Incoming.chat_id` hard-codes a numeric chat id — a
++  future adapter with string handles couldn't represent its destination through this
++  trait. Pre-existing constraint from Task 1's `Incoming.chat_id: i64`; `set_destination`
++  is deliberately symmetric with it, so nothing new was introduced.
++
++### Test commands and output tails, fix round 2
++
++```
++$ cargo test --lib channel::telegram -- --test-threads=1
++running 24 tests
++...
++test channel::telegram::tests::set_destination_can_be_cleared ... ok
++...
++test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 702 filtered out; finished in 0.00s
++```
++
++```
++$ cargo test --lib
++test result: ok. 726 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.44s
++```
++
++```
++$ cargo test   # full workspace incl. integration test binaries
++... (every binary) ...
++test result: ok. (every binary: 0 failed)
++```
++
++```
++$ cargo fmt -- --check
++(no output — clean)
++
++$ cargo clippy --all-targets
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.66s
++(no warnings)
++
++$ git diff --check
++(no output — clean)
++```
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-3-brief.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-3-brief.md
+new file mode 100644
+index 0000000..1eb3974
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-3-brief.md
+@@ -0,0 +1,105 @@
++## Task 3: 设置页从「选语言」改成「选设置项」
++
++**这是既有功能的重构，独立成一个任务，不掺任何手机通知逻辑。**
++
++**Files:**
++- Modify: `src/ui/view.rs`（`View::Settings`）
++- Modify: `src/ui/settings_view.rs`
++- Modify: `src/i18n.rs`
++- Test: `src/ui/settings_view.rs` 内
++
++**Interfaces:**
++- Consumes: 无
++- Produces: `SettingsItem { Language, Phone }`、`View::Settings { state: ListState }`（下标改为映射 `SettingsItem::all()`）
++
++- [ ] **Step 1: 写失败测试**
++
++```rust
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 改结构之前，下标直接映射 Lang::all()。改完之后映射设置项。
++    /// **这条是回归测试**：语言仍然切得动比手机通知能用更重要。
++    #[test]
++    fn the_first_item_is_language() {
++        assert_eq!(SettingsItem::all()[0], SettingsItem::Language);
++    }
++
++    #[test]
++    fn phone_is_a_settings_item_too() {
++        assert!(SettingsItem::all().contains(&SettingsItem::Phone));
++    }
++
++    /// 下标越界不能 panic——`ListState` 的选中项在列表变短时会留在旧位置。
++    #[test]
++    fn an_out_of_range_index_selects_nothing() {
++        assert_eq!(SettingsItem::at(99), None);
++        assert_eq!(SettingsItem::at(0), Some(SettingsItem::Language));
++    }
++}
++```
++
++- [ ] **Step 2: 跑测试确认失败**
++
++Run: `cargo test --lib ui::settings_view -- --test-threads=1`
++Expected: `cannot find type SettingsItem`
++
++- [ ] **Step 3: 实现**
++
++```rust
++/// 设置页的条目。**加进第二项之前这一页是纯语言列表**，`ListState` 的下标
++/// 直接映射 `Lang::all()`；现在映射这个枚举，选中语言那一项才进语言列表。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum SettingsItem {
++    Language,
++    Phone,
++}
++
++impl SettingsItem {
++    pub(crate) fn all() -> &'static [SettingsItem] {
++        &[SettingsItem::Language, SettingsItem::Phone]
++    }
++
++    /// 越界返回 `None` 而不是兜底成第一项：`ListState` 的选中项可能停在
++    /// 一个已经不存在的位置，那时候什么都不做，比默默把用户带进语言页好。
++    pub(crate) fn at(i: usize) -> Option<SettingsItem> {
++        SettingsItem::all().get(i).copied()
++    }
++}
++```
++
++`handle_key` 的 `Enter` 分支改成：按选中项分派 —— `Language` 进语言列表（把今天的语言选择逻辑原样搬进去），`Phone` 进 `View::Phone`（Task 4 建）。**方向键的 `move_sel_n` 长度参数从 `Lang::all().len()` 改成 `SettingsItem::all().len()`。**
++
++- [ ] **Step 4: 跑测试确认通过**
++
++Run: `cargo test --lib ui:: -- --test-threads=1`
++Expected: PASS，且既有的语言相关测试全部仍然通过
++
++- [ ] **Step 5: 手动验证语言仍然切得动**
++
++```bash
++cargo run --release
++```
++进看板 → `l` → 选「界面语言」→ 选英文 → 界面变英文 → 退出重进，**仍然是英文**（`save_lang` 写盘生效）。
++
++- [ ] **Step 6: 变异测试**
++
++把 `at()` 的 `.get(i)` 换成 `all()[i.min(1)]`（越界兜底成最后一项），`an_out_of_range_index_selects_nothing` 必须失败。把 `move_sel_n` 的长度改回 `Lang::all().len()`，方向键会走不到第二项 —— **如果没有测试失败，补一条针对方向键能走到 `Phone` 的测试。**
++
++- [ ] **Step 7: 提交**
++
++```bash
++cargo fmt && cargo clippy --all-targets
++git add src/ui/view.rs src/ui/settings_view.rs src/i18n.rs
++git commit -m "refactor: settings is a list of settings, not a list of languages
++
++The list index mapped straight onto Lang::all(), which works right up until
++there is a second thing to configure. Language moves one level down and the
++page becomes what its name always claimed.
++
++Nothing about the language behaviour changes; the regression test says so."
++```
++
++---
++
+diff --git a/.superpowers/sdd/2026-08-10-dct-phone-channel/task-3-report.md b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-3-report.md
+new file mode 100644
+index 0000000..533404b
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-dct-phone-channel/task-3-report.md
+@@ -0,0 +1,226 @@
++# Task 3 report: settings page becomes a list of settings
++
++**Status:** complete. Commit `badc974` on `feat/phone-channel` (base `1a5344c`).
++
++## Brief inaccuracies found, and what I did about them
++
++The brief's Files list said only `src/ui/view.rs`, `src/ui/settings_view.rs`,
++`src/i18n.rs`. Two more files needed real changes, and one of them hid an
++actual behavioural bug the brief never anticipated.
++
++### 1. `open_settings()` in `src/ui/mod.rs` — not listed, and its existing logic is now wrong (real bug, not just a missing file)
++
++`open_settings()` (the `l`-key handler) pre-selected the cursor by finding
++**the current language's position in `Lang::all()`** and feeding that index
++straight into `View::Settings { state }`. That was correct when the top-level
++list *was* the language list. After the refactor, `state` indexes into
++`SettingsItem::all()` — an enum with no relationship to language count.
++
++Left unfixed: a user whose current language is not `Lang::all()`'s first
++entry (today, that's Chinese — `Lang::all() = [En, Zh]`, so `Zh` is index 1)
++presses `l` and the cursor silently lands on **"phone"** instead of
++**"language"**. It doesn't panic (both enums happen to have exactly 2 entries
++today, so the index is never out of range) — it just points at the wrong
++row. That's the quiet kind of bug the coordinator's carry-forward notes have
++flagged before as the dangerous kind.
++
++Fixed by moving the "preselect current language" intent to the moment a user
++actually *enters* the language sublist (where "which one is current" is
++still a meaningful question), and having `open_settings()` always select
++`SettingsItem::Language` regardless of `app.lang`. Regression test:
++`ui::tests::opening_settings_always_selects_language_regardless_of_current_lang`
++— loops over every `Lang` and asserts the cursor always lands on `Language`.
++Mutation-verified (see table below): reverting to the old lang-index logic
++turns this test red.
++
++### 2. `src/ui/pick.rs` — one construction site, mechanical
++
++`View::Settings { state: ListState::default() }` appears in a test
++(`seeding_never_yanks_the_user_out_of_a_screen_they_opened`) and needed the
++new `lang: None` field. No behavioural change, compile-only fix.
++
++### 3. The brief's own interface line has a structural gap it doesn't name
++
++The brief says (Interfaces): `Produces: ... View::Settings { state: ListState }
++（下标改为映射 SettingsItem::all()）` and (Step 3): "`Language` 进语言列表（把
++今天的语言选择逻辑原样搬进去）" — "enter the language list, move today's
++language-selection logic into it verbatim." Nothing in the brief says **how**
++"the language list" is represented as a distinct navigable place with its own
++Esc/Ctrl+Q behaviour, distinct from the top-level list.
++
++I extended the existing `View::Settings` struct variant (not a new top-level
++`View` variant — the plan's file-table only lists `View::Settings` restructure
+++ `View::Phone` for the whole feature, and a new sibling variant would have
++forced changes to several *other* exhaustive matches across the file that
++have nothing to do with this task):
++
++```rust
++Settings {
++    state: ListState,        // top-level cursor, indexes SettingsItem::all()
++    lang: Option<ListState>, // Some = inside the language sublist, indexes Lang::all()
++},
++```
++
++`lang: Some/None` is the single source of truth for which layer the user is
++on. Both escape routes (`Esc`, handled locally in `settings_view::handle_key`,
++and `Ctrl+Q`, handled globally via `view::back_one_level`) now agree: from
++the sublist they drop back to the top-level list; from the top-level list
++they still go to the board, unchanged. Every construction site of
++`View::Settings` needed `lang: None` or `lang: Some(_)` added — `mod.rs`
++(×2), `pick.rs` (×1), `view.rs`'s own width-fits-every-view test (×1),
++`settings_view.rs` (multiple). This is why the file footprint grew past what
++the brief listed; it's not optional scope creep, the struct literal doesn't
++compile otherwise.
++
++I did **not** touch `View::Phone` and did not add a third top-level `View`
++variant of my own — see the placeholder section below.
++
++## Placeholder left for Task 4
++
++`src/ui/settings_view.rs`, in `handle_key`'s top-level `Enter` match, the
++`Some(SettingsItem::Phone)` arm:
++
++```rust
++Some(SettingsItem::Phone) => {
++    // TODO(task-4, dct-phone-channel): 手机通知页还没接线
++    // （`View::Phone` 是 Task 4 的产物）。Task 3 是纯 UI
++    // 重构、不掺任何手机通知逻辑，这一支特意留成空操作——
++    // 光标停在原地，什么都不发生。Task 4 把这一支换成
++    // `app.view = View::Phone { .. }` 就是它要接的线。
++    app.view = View::Settings { state, lang: None };
++}
++```
++
++"Phone" is a real, visible, selectable row in the top-level settings list
++today (label from the new `Key::Phone` i18n entry, en: "phone", zh:
++"手机通知"). Pressing Enter on it is a deliberate no-op — cursor stays on
++the top-level list, nothing else happens, no crash. Task 4 replaces the body
++of this arm with a dispatch to `View::Phone { status: ... }` once that type
++exists. Covered by
++`ui::settings_view::tests::entering_the_phone_item_does_not_crash_or_open_the_language_list`.
++
++## Mutation table
++
++| # | Mutation | Where | Test that should catch it | Result |
++|---|---|---|---|---|
++| 1 | `SettingsItem::at`'s `.get(i)` → `all()[i.min(1)]` (out-of-range clamps to last item) | `view.rs` | `an_out_of_range_index_selects_nothing` | **RED** — caught |
++| 2 | Top-level `move_sel_n` length: `SettingsItem::all().len()` → `Lang::all().len()` | `settings_view.rs` | `pressing_down_from_language_selects_phone` (added per brief's explicit instruction for this case) | **GREEN — not caught**, and structurally *cannot* be caught by a black-box test today: both lengths are 2, so the mutation is behaviorally identical to the original. The brief itself anticipated this ("如果没有测试失败，补一条针对方向键能走到 Phone 的测试"); I added that test, it's real coverage for "does Down reach Phone at all," but it cannot discriminate *where* the length number came from while the two enums coincidentally have equal length. This is a genuine, disclosed limit, not a missed test. |
++| 3 | Delete `back_one_level`'s `View::Settings { lang: Some(_), .. }` arm (Ctrl+Q from sublist falls through to the generic `_ => Board` case) | `view.rs` | `ctrl_q_from_the_language_list_goes_back_to_the_settings_list` (added; not requested by brief, added because I introduced this branch) | **RED** — caught |
++| 4 | Delete `escape_hint`'s `View::Settings { lang: Some(_), .. }` arm (bottom-left hint falls through to "Ctrl+Q back to board") | `view.rs` | `escape_hint_from_the_language_list_says_back_to_settings_not_the_board` (added) | **RED** — caught |
++| 5 | Revert `open_settings()` to the old `Lang::all()`-position preselect | `mod.rs` | `opening_settings_always_selects_language_regardless_of_current_lang` (added) | **RED** — caught |
++| 6 | `Some(SettingsItem::Phone)` arm accidentally opens the language sublist (`lang: Some(ListState::default())`) instead of staying put | `settings_view.rs` | `entering_the_phone_item_does_not_crash_or_open_the_language_list` (added) | **RED** — caught |
++
++Mutations 1–2 are the ones the brief named explicitly. Mutations 3–6 are
++mutations I ran against my own additions (the nested-view design, the
++`open_settings` fix, and the Phone placeholder) since those are exactly the
++places the brief left underspecified and therefore least reviewed — all
++caught, no test gaps left after the fact.
++
++## Manual verification (Step 5, required, not optional)
++
++Built `cargo build --release --bin dct`, ran it inside `tmux` against an
++isolated `HOME` (`/tmp/dctverify-home` — had to be short: the scratchpad
++path is long enough to blow macOS's `SUN_LEN` limit on the daemon's unix
++socket path, which is a separate, unrelated discovery worth flagging for
++whoever writes fixtures under the scratchpad directory). Never touched the
++user's real `~/.dct` daemon (verified running throughout, untouched, before
++and after).
++
++Sequence and what was on screen at each step:
++
++1. `l` from the board → top-level list titled "Settings" (locale in this
++   fresh sandbox resolved to English), two rows: `language` (cursor here),
++   `phone`.
++2. `Enter` on `language` → title becomes "Settings · language", `English`
++   preselected with `✓`, `中文` below it — the preselect-current-language
++   behaviour survived the refactor.
++3. `Down`, `Enter` → language switched immediately: board redrew fully in
++   Chinese ("还没有会话，按 n 新建"), bottom bar showed "设置" as the
++   confirmation message (same feedback string as before the refactor).
++4. Checked `/tmp/dctverify-home/.dct/settings.json` on disk:
++   `{"lang":"zh","view_mode":null}` — written before the process was even
++   asked to quit.
++5. `q` to quit the UI. Killed the leftover daemon process, relaunched `dct`
++   fresh (new process, same `HOME`) → **board came up already in Chinese**
++   ("还没有会话，按 n 新建", "q 退出", "n 新建", "x 移除") — **the language
++   choice survived a full restart**, confirming `save_lang`/`resolve()`
++   round-trip through disk correctly under the new structure.
++6. Additional check beyond the brief's script: `l` → `Enter` on 语言 → `Esc`
++   → back at the top-level "设置" list (not the board) with both rows
++   visible, cursor still on 语言. Then `Down`, `Enter` on 手机通知 → no
++   crash, stayed on the top-level list, cursor on 手机通知, bottom-left hint
++   correctly read "Ctrl+Q 回看板" (top-level, unaffected by the sublist's
++   different hint). This directly exercises the Esc/Ctrl+Q nesting behaviour
++   this refactor introduces.
++
++All tmux/daemon test processes were cleaned up afterward; the user's real
++`dct` session (pid 6197/6198, running since Sunday) was confirmed
++untouched before and after.
++
++## Test commands and output tails
++
++Failing-test checkpoint (Step 2, before implementation — `cannot find type
++SettingsItem`), then green after implementation:
++
++```
++$ cargo test --lib ui::settings_view -- --test-threads=1
++running 11 tests
++test ui::settings_view::tests::an_out_of_range_index_selects_nothing ... ok
++test ui::settings_view::tests::choosing_a_language_applies_it_and_writes_it_to_disk ... ok
++test ui::settings_view::tests::entering_the_language_item_opens_the_list_preselected_on_the_current_language ... ok
++test ui::settings_view::tests::entering_the_phone_item_does_not_crash_or_open_the_language_list ... ok
++test ui::settings_view::tests::escaping_out_of_settings_changes_nothing ... ok
++test ui::settings_view::tests::escaping_the_language_list_goes_back_to_the_settings_list_not_the_board ... ok
++test ui::settings_view::tests::every_language_is_listed_in_its_own_language ... ok
++test ui::settings_view::tests::phone_is_a_settings_item_too ... ok
++test ui::settings_view::tests::pressing_down_from_language_selects_phone ... ok
++test ui::settings_view::tests::the_first_item_is_language ... ok
++test ui::settings_view::tests::the_top_level_list_shows_both_settings_items ... ok
++test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 724 filtered out
++```
++
++Full workspace suite (after all mutation reverts, final state):
++
++```
++$ cargo test -- --test-threads=1
++test result: ok. 738 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.54s
++[... 15 more integration-test binaries, each: 0 failed ...]
++```
++
++```
++$ cargo fmt --check
++(no output, exit 0)
++
++$ cargo clippy --all-targets
++Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.72s
++(no warnings)
++
++$ git diff --check
++(no output, exit 0)
++```
++
++`i18n::tests::every_key_is_listed_for_the_guards` has a hardcoded count
++(`ALL_KEYS.len() == 100`); adding `Key::Phone` required bumping it to `101`
++and adding `Phone` to the `ALL_KEYS` list — not mentioned in the brief, but
++a five-minute mechanical consequence of adding any i18n key in this file,
++caught immediately by the guard test itself.
++
++## Concerns for whoever reviews this / writes Task 4
++
++- Task 4's brief should point at `settings_view.rs`'s
++  `Some(SettingsItem::Phone)` arm (see Placeholder section) and at the
++  `Key::Phone` i18n entry I added (en: "phone", zh: "手机通知") if it wants
++  to reuse that label for the phone page's own title — I picked generic
++  wording since I don't know Task 4's exact page title yet.
++- `Key::BackToSettings` ("Ctrl+Q 回设置"/"Ctrl+Q settings") is now used by
++  two different destinations: `EnterSecret{return_to_settings: true}` (goes
++  to `View::Secrets`, the API-key page) and `View::Settings{lang: Some(_)}`
++  (goes back to the top-level settings list). Both are legitimately "back to
++  a settings screen" and the text doesn't name which one, so I reused it
++  rather than adding a near-duplicate key — flagging in case a future
++  reviewer wonders why the same key serves two views.
++- The `SUN_LEN` unix-socket-path-length crash is unrelated to this task's
++  code but cost real debugging time during manual verification; worth
++  remembering if any later task's fixtures or verification scripts spin up
++  a real daemon under a long temp path (the repo's own scratchpad path is
++  long enough to trigger it).
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 7cc2c01..ce3cdf0 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -332,21 +332,21 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+         BackToListWord => t!(lang, en: "back to the list", zh: "返回列表"),
+         BackToSettingsWord => t!(lang, en: "back to settings", zh: "返回设置"),
+         OtherKeysGoToAgent => t!(
+             lang,
+             en: "every other key goes to the agent",
+             zh: "其余按键都发给 agent",
+         ),
+         OrPressDigit => t!(lang, en: "or press a number", zh: "或直接按数字"),
+         TypeToFilter => t!(lang, en: "type to filter", zh: "直接打字过滤"),
+         Language => t!(lang, en: "language", zh: "语言"),
+-        Phone => t!(lang, en: "phone", zh: "手机通知"),
++        Phone => t!(lang, en: "phone notifications", zh: "手机通知"),
+ 
+         MoreKeys => t!(lang, en: "…", zh: "…"),
+         AllKeys => t!(lang, en: "All keys", zh: "全部按键"),
+         KeysGroupMove => t!(lang, en: "Move", zh: "走动"),
+         KeysGroupSession => t!(lang, en: "Sessions", zh: "会话"),
+         KeysGroupConfig => t!(lang, en: "Settings", zh: "设置"),
+ 
+         BackToBoard => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回看板"),
+         BackToBoardWithF2 => t!(lang, en: "Ctrl+Q (F2) back", zh: "Ctrl+Q（F2） 回看板"),
+         BackToList => t!(lang, en: "Ctrl+Q back", zh: "Ctrl+Q 回列表"),
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 0c3c58b..ac0582a 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -3574,20 +3574,27 @@ mod tests {
+             }),
+             View::Secrets {
+                 entries: Vec::new(),
+                 state: ListState::default(),
+                 pending_delete: None,
+             },
+             View::Settings {
+                 state: ListState::default(),
+                 lang: None,
+             },
++            // 深入语言子列表也有自己的一句提示（回顶层设置项列表，不是回
++            // 看板）——跟上面 `PickProject` 两条并列的道理一样，两种输出
++            // 都要量。
++            View::Settings {
++                state: ListState::default(),
++                lang: Some(ListState::default()),
++            },
+             View::Keys {
+                 from: Box::new(View::Board),
+             },
+             // 填密钥有两条退路（回设置页 / 回选择器），两条文案都要量
+             View::EnterSecret {
+                 profile: String::new(),
+                 label: String::new(),
+                 prompt: crate::proto::SecretPrompt {
+                     hint: String::new(),
+                     url: None,
+diff --git a/src/ui/settings_view.rs b/src/ui/settings_view.rs
+index 6828158..47e067f 100644
+--- a/src/ui/settings_view.rs
++++ b/src/ui/settings_view.rs
+@@ -362,20 +362,33 @@ mod tests {
+                 assert_eq!(
+                     state.selected().and_then(SettingsItem::at),
+                     Some(SettingsItem::Phone),
+                     "↓ 应该能从语言走到手机通知"
+                 );
+             }
+             _ => panic!("方向键应该还在顶层设置项列表里"),
+         }
+     }
+ 
++    /// 这两个长度一相等，`handle_key` 里 move_sel_n 的长度参数写错也测不出来
++    /// （见 task-3 报告的变异 #2）。哪天不相等了，这条会红——那时候补一条
++    /// 「↓ 能走到最后一个设置项」的测试，把长度来源真正钉住。
++    #[test]
++    fn the_length_coincidence_that_hides_a_wrong_move_sel_n_source() {
++        assert_eq!(
++            SettingsItem::all().len(),
++            Lang::all().len(),
++            "长度不再巧合相等了：去补一条方向键能走到最后一项设置的测试，\
++             把 move_sel_n 的长度来源钉死，不能再靠这份巧合掩护"
++        );
++    }
++
+     /// 语言列表用各自的语言写，光标能走遍每一行。
+     #[test]
+     fn every_language_is_listed_in_its_own_language() {
+         let (mut app, _dir) = App::test_app();
+         on_language_list(&mut app, 0);
+         let mut term = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+         let buf = term.backend().buffer();
+         let a = buf.area;
+         let c: String = (0..a.height)
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index c1d2c74..dc3f3c2 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -1302,20 +1302,32 @@ pub(crate) fn idle_help(view: &View, lang: Lang, ctx: HelpCtx) -> Vec<HelpItem>
+         ),
+         View::Secrets { .. } => help_items(
+             &[
+                 ("↑↓", Key::Select),
+                 ("Enter", Key::Edit),
+                 ("d", Key::Delete),
+                 ("Esc", Key::Back),
+             ],
+             lang,
+         ),
++        // 跟 escape_hint 一样要分层：深入语言子列表时 Esc 回的是顶层设置项
++        // 列表，不是「取消」整个设置页——两处文案哪怕只有半句话不一致，都是
++        // 「底栏说什么就得真能做到什么」这条原则被破坏了一半（同上面
++        // `EnterSecret { return_to_settings: true }` 那一条的道理）。
++        View::Settings { lang: Some(_), .. } => help_items(
++            &[
++                ("↑↓", Key::Select),
++                ("Enter", Key::Confirm),
++                ("Esc", Key::BackToSettingsWord),
++            ],
++            lang,
++        ),
+         View::Settings { .. } => help_items(
+             &[
+                 ("↑↓", Key::Select),
+                 ("Enter", Key::Confirm),
+                 ("Esc", Key::Cancel),
+             ],
+             lang,
+         ),
+     }
+ }
+@@ -2375,20 +2387,42 @@ mod tests {
+             &View::Settings {
+                 state: ListState::default(),
+                 lang: Some(ls),
+             },
+             Lang::Zh,
+         );
+         assert!(h.contains("设置"), "底栏说什么就得真能做到什么：{h}");
+         assert!(!h.contains("看板"), "这一层退的不是看板：{h}");
+     }
+ 
++    /// `escape_hint` 和 `idle_help` 都提了「Esc 回哪」，两处不能一处说
++    /// 「回设置」、另一处还留着旧的「取消」——跟
++    /// `secret_view_from_settings_idle_help_also_says_back_to_settings` 是
++    /// 同一条原则在语言子列表上的另一半。
++    #[test]
++    fn language_list_idle_help_also_says_back_to_settings() {
++        let mut ls = ListState::default();
++        ls.select(Some(0));
++        let help = help_of(
++            &View::Settings {
++                state: ListState::default(),
++                lang: Some(ls),
++            },
++            Lang::Zh,
++        );
++        assert!(
++            help.contains("返回设置"),
++            "底栏说什么就得真能做到什么：{help}"
++        );
++        assert!(!help.contains("取消"), "这一层退的不是「取消」：{help}");
++    }
++
+     #[test]
+     fn secret_view_from_settings_idle_help_also_says_back_to_settings() {
+         // escape_hint 和 idle_help 都提了「Esc 回哪」，两处不能一处说设置、
+         // 一处还说着旧的「列表」。
+         let help = help_of(
+             &View::EnterSecret {
+                 profile: "kimi".into(),
+                 label: "Kimi".into(),
+                 prompt: SecretPrompt {
+                     hint: String::new(),

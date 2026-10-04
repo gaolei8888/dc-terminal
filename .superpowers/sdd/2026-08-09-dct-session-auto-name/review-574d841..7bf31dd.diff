@@ -1,0 +1,807 @@
+# Review package: 574d841..7bf31dd
+
+## Commits
+7bf31dd feat: carry a per-session name on the wire, empty for now
+
+## Files changed
+ src/cli.rs       |  1 +
+ src/proto.rs     |  3 ++-
+ src/session.rs   | 40 ++++++++++++++++++++++++++++++++++++++++
+ src/ui/app.rs    |  3 +++
+ src/ui/attach.rs |  3 +++
+ src/ui/board.rs  |  2 ++
+ src/ui/grid.rs   |  2 ++
+ src/ui/keys.rs   |  2 ++
+ src/ui/mod.rs    | 12 ++++++++++++
+ src/ui/pick.rs   |  2 ++
+ src/ui/view.rs   |  1 +
+ 11 files changed, 70 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/cli.rs b/src/cli.rs
+index 737ae69..bf9c5e1 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -486,20 +486,21 @@ mod tests {
+     }
+ 
+     fn s(id: u32, state: SessionState, activity: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: "/w/dc-terminal".into(),
+             state,
+             activity: activity.into(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     #[test]
+     fn ps_lists_one_session_per_line_with_its_state() {
+         let out = render_ps(
+             &[
+                 s(1, SessionState::Working, "正在读 src/main.rs"),
+                 s(2, SessionState::Stopped, ""),
+             ],
+diff --git a/src/proto.rs b/src/proto.rs
+index 83ddddc..fd4282d 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -672,27 +672,28 @@ mod tests {
+     /// 回程的形状同样是契约，同样要钉。
+     #[test]
+     fn the_session_info_shape_is_pinned_too() {
+         let info = SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/d".into(),
+             state: SessionState::Idle,
+             activity: "a".into(),
+             is_agent: true,
++            tag: String::new(),
+         };
+         let shape = serde_json::to_string(&info).unwrap();
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+                 6,
+-                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true}"#
++                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
+             ),
+             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     #[test]
+     fn screens_response_round_trips() {
+         use crate::pty::{ScreenSpan, ScreenStyle};
+         let resp = Response::Screens {
+             screens: vec![ScreenEntry {
+diff --git a/src/session.rs b/src/session.rs
+index a21a419..6d070ef 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -134,20 +134,30 @@ pub struct SessionInfo {
+     ///
+     /// 界面**必须**知道这件事：`u 回滚` / `d 改动` 只对 agent 会话有效
+     /// （`checkpoint_base` 对命令行会话直接返回 `NotAnAgentSession`），
+     /// 底栏不能对着一个 shell 会话写这两个键——屏幕上写着做不到的操作
+     /// 比不写更糟。
+     ///
+     /// 从守护进程侧的 `Session::is_agent` 原样带上来，不在界面侧靠 profile
+     /// 名字猜：那是 profile.toml 里的一个声明（`profile.rs` 的 `is_agent`），
+     /// 只有守护进程读得到，猜的迟早会跟真值分叉。
+     pub is_agent: bool,
++    /// 这个会话的稳定名字，守护进程在它第一次干完活时起一次，之后不变。
++    ///
++    /// 空串 = 还没起出来（刚建、没配 LLM、不是 agent 会话，或者对面是
++    /// 认不得这个字段的旧守护进程）。**界面遇到空串一律退回 `profile`。**
++    ///
++    /// `#[serde(default)]` 是本版不升 `PROTOCOL_VERSION` 的依据：加纯读
++    /// 字段时旧 JSON 补默认值，而 serde 反序列化本来就忽略不认识的字段，
++    /// 所以新旧界面/守护进程怎么搭配都不会炸，只是没有名字。
++    #[serde(default)]
++    pub tag: String,
+ }
+ 
+ struct Session {
+     id: u32,
+     profile: Profile,
+     dir: PathBuf,
+     is_agent: bool,
+     checkpoints: Vec<String>,
+     state: SessionState,
+     idle_re: Option<regex::Regex>,
+@@ -155,20 +165,23 @@ struct Session {
+     /// 构造时编译好，profile 的正则错误在起会话这一刻就暴露，不拖到 tick。
+     busy_re: Option<regex::Regex>,
+     /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
+     /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
+     error_re: Option<regex::Regex>,
+     pty: PtySession,
+     /// 出错原因的人话解释，由后台线程写回（见 `SessionManager::request_explanation`）。
+     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
+     /// 正持着它。裸 `Option<String>` 编不过。
+     explanation_slot: Arc<Mutex<Option<String>>>,
++    /// 会话起名用的槽。跟 `explanation_slot` 平级、同一套用法。
++    /// `None` = 还没触发过起名；`Some(_)` = 已经触发过（**只触发一次**）。
++    name_slot: Arc<Mutex<Option<String>>>,
+     /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
+     /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
+     /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
+     /// 没有这道防线的话，一个卡了很久的旧回答有可能在新一轮的新回答
+     /// 写回去**之后**才姗姗来迟，把新答案覆盖成旧的。
+     explanation_gen: Arc<AtomicU64>,
+     /// 用户上次**主动**滚动时的偏移。`new_lines` 靠它算：vt100 会在新行
+     /// 推入时自动把偏移 +1（grid.rs:556-558，画面因此不动），所以
+     /// 「偏移 - 这个标记」就正好是用户没看过的行数。
+     ///
+@@ -366,20 +379,21 @@ impl SessionManager {
+             profile,
+             dir: dir.to_path_buf(),
+             is_agent,
+             checkpoints,
+             state,
+             idle_re,
+             busy_re,
+             error_re,
+             pty,
+             explanation_slot: Arc::new(Mutex::new(None)),
++            name_slot: Arc::new(Mutex::new(None)),
+             explanation_gen: Arc::new(AtomicU64::new(0)),
+             scroll_mark: 0,
+         };
+ 
+         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
+         // 它是什么时候、在哪个项目起来的，对不上「我刚才按了什么」。
+         self.journal
+             .born(id, &session.profile.name, dir, session.pty.process_id());
+ 
+         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
+@@ -411,27 +425,29 @@ impl SessionManager {
+     }
+ 
+     pub fn list(&self) -> Vec<SessionInfo> {
+         let snapshot: Vec<Arc<Mutex<Session>>> =
+             recover(self.sessions.lock()).values().cloned().collect();
+ 
+         let mut v: Vec<SessionInfo> = snapshot
+             .iter()
+             .map(|s| {
+                 let s = recover(s.lock());
++                let tag = recover(s.name_slot.lock()).clone().unwrap_or_default();
+                 SessionInfo {
+                     id: s.id,
+                     profile: s.profile.name.clone(),
+                     dir: s.dir.display().to_string(),
+                     state: s.state,
+                     activity: s.pty.last_line(),
+                     is_agent: s.is_agent,
++                    tag,
+                 }
+             })
+             .collect();
+         v.sort_by_key(|s| s.id);
+         v
+     }
+ 
+     /// 送内容给 agent。`text` 为空表示回车，也就是一轮的开始。
+     /// **只有回车才打检查点**——逐字符输入不能每敲一下就拍一次快照。
+     ///
+@@ -1868,11 +1884,35 @@ mod tests {
+         // 用户再滚一次，计数重新归零
+         let st = mgr.scroll(id, ScrollBy::Rows(1)).unwrap();
+         assert_eq!(st.new_lines, 0);
+     }
+ 
+     #[test]
+     fn scrolling_a_session_that_does_not_exist_says_so() {
+         let mgr = SessionManager::new();
+         assert!(mgr.scroll(999, ScrollBy::Rows(1)).is_err());
+     }
++
++    /// 旧守护进程发来的 JSON 没有 `tag` 这个字段。必须补成空串而不是
++    /// 反序列化失败 —— 这正是本版**不升协议号**的全部依据（同 `scroll`
++    /// 字段当初的做法，见 `proto.rs` 里那条注释）。
++    #[test]
++    fn session_info_without_a_tag_field_still_parses() {
++        let old = r#"{"id":3,"profile":"claude","dir":"/w/a",
++                      "state":"Idle","activity":"","is_agent":true}"#;
++        let s: SessionInfo = serde_json::from_str(old).expect("旧 JSON 必须还能读");
++        assert_eq!(s.tag, "", "缺字段补空串");
++        assert_eq!(s.id, 3);
++    }
++
++    /// 新建的会话还没起过名。
++    #[test]
++    fn a_fresh_session_has_no_tag() {
++        let repo = init_repo();
++        let m = SessionManager::new();
++        m.register_profile(fake_agent());
++        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
++
++        let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
++        assert_eq!(tag, "");
++    }
+ }
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index fcef227..69c2729 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -386,20 +386,21 @@ mod tests {
+     }
+ 
+     fn sess(id: u32, dir: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: crate::session::SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     /// 会话没了列表就变短，而九宫格焦点是个下标。不收拢的话，`grid.rs` 里
+     /// `move_focus` 的 `total - page_start` 在 release 下会**下溢**，
+     /// debug 下则直接撞上那条 `debug_assert!(focus < total)`。
+     #[test]
+     fn refresh_rows_clamps_the_grid_focus_into_the_new_range() {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![
+@@ -549,31 +550,33 @@ mod tests {
+     }
+ 
+     fn failing(id: u32, dir: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: crate::session::SessionState::Failed,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     fn stopped(id: u32, dir: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "opencode".into(),
+             dir: dir.into(),
+             state: crate::session::SessionState::Stopped,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     /// 九宫格是「看几个 agent 此刻在干什么」的地方——已经 kill 掉的会话
+     /// 没有「此刻」。一格停掉的会话最好的情况是一张静止截图，最坏是一片
+     /// 空白，而它占的是整整一格。
+     #[test]
+     fn the_grid_leaves_out_stopped_sessions() {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![
+diff --git a/src/ui/attach.rs b/src/ui/attach.rs
+index fe72e59..956a4ca 100644
+--- a/src/ui/attach.rs
++++ b/src/ui/attach.rs
+@@ -355,20 +355,21 @@ mod tests {
+     }
+ 
+     fn session(id: u32, state: SessionState) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: "/tmp/a".into(),
+             state,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     fn attached_app() -> (App, tempfile::TempDir) {
+         let (mut app, d) = App::test_app();
+         app.view = View::Attached(1);
+         (app, d)
+     }
+ 
+     #[test]
+@@ -433,20 +434,21 @@ mod tests {
+     #[test]
+     fn f3_into_another_project_takes_the_cursor_with_it() {
+         let (mut app, _dir) = App::test_app();
+         let in_dir = |id: u32, dir: &str| SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         };
+         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
+         // 行：[组头 a, 会话 1, 组头 b, 会话 2]——先站在 a 的会话上
+         app.list_state.select(Some(1));
+         assert_eq!(
+             app.current_group().map(|g| g.name.clone()),
+             Some("a".to_string()),
+             "前提：当前项目是 a"
+         );
+         app.view = View::Attached(1);
+@@ -469,20 +471,21 @@ mod tests {
+     #[test]
+     fn f3_into_a_collapsed_project_takes_the_cursor_with_it() {
+         let (mut app, _dir) = App::test_app();
+         let in_dir = |id: u32, dir: &str| SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         };
+         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
+         // 把 b 折起来，再回到 a 的会话上
+         app.list_state.select(Some(2));
+         super::super::toggle_collapse(&mut app);
+         assert!(app.groups[1].collapsed, "前提：b 是折叠的");
+         app.list_state.select(Some(1));
+         app.view = View::Attached(1);
+ 
+         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+diff --git a/src/ui/board.rs b/src/ui/board.rs
+index 3fa2430..d0e3d29 100644
+--- a/src/ui/board.rs
++++ b/src/ui/board.rs
+@@ -239,20 +239,21 @@ mod tests {
+     use std::path::PathBuf;
+ 
+     fn sess(id: u32, dir: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     /// 磁盘上真实存在的一个项目目录。组头上的 agent 统计只在
+     /// `dir.exists()` 时才画，所以断言统计的测试不能用凭空编的路径。
+     fn real_dir(base: &tempfile::TempDir, name: &str) -> String {
+         let p = base.path().join(name);
+         std::fs::create_dir_all(&p).unwrap();
+         p.display().to_string()
+     }
+@@ -585,20 +586,21 @@ mod tests {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(
+             (1..=4)
+                 .map(|id| SessionInfo {
+                     id,
+                     profile: "claude".into(),
+                     dir: "/tmp/a".into(),
+                     state: SessionState::Idle,
+                     activity: String::new(),
+                     is_agent: true,
++                    tag: String::new(),
+                 })
+                 .collect(),
+         );
+         // 行：[组头, 1, 2, 3, 4]，第三个会话在第 3 行
+         app.list_state.select(Some(3));
+         handle_key(
+             &mut app,
+             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+         )
+         .unwrap();
+diff --git a/src/ui/grid.rs b/src/ui/grid.rs
+index f843b41..1d98287 100644
+--- a/src/ui/grid.rs
++++ b/src/ui/grid.rs
+@@ -843,31 +843,33 @@ mod tests {
+     }
+ 
+     fn session(id: u32, state: SessionState) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: "/tmp/a".into(),
+             state,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     fn session_in(id: u32, dir: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     fn grid_text(app: &mut App) -> String {
+         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+         term.draw(|f| draw(f, f.area(), app)).unwrap();
+         let buf = term.backend().buffer();
+         let a = buf.area;
+         (0..a.height)
+             .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+diff --git a/src/ui/keys.rs b/src/ui/keys.rs
+index f7de4f2..0e3e641 100644
+--- a/src/ui/keys.rs
++++ b/src/ui/keys.rs
+@@ -451,20 +451,21 @@ mod tests {
+     #[test]
+     fn the_overlay_leaves_the_board_visible_behind_it() {
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![crate::session::SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/w/proj".into(),
+             state: crate::session::SessionState::Idle,
+             activity: "背后的看板".into(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         open(&mut app);
+ 
+         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+         term.draw(|f| super::super::draw(f, &mut app)).unwrap();
+         let c = screen(&term);
+         assert!(c.contains("全部按键"), "浮层自己要画出来：{c}");
+         assert!(c.contains("背后的看板"), "背后的看板必须还看得见：{c}");
+     }
+ 
+@@ -475,20 +476,21 @@ mod tests {
+         let (mut app, _dir) = App::test_app();
+         // `s`/`u`/`d` 现在按上下文过滤（见 `the_overlay_filters_...`），
+         // 所以要断言它们画得出来，得先真的有一个能停、能回滚的会话。
+         app.set_sessions(vec![crate::session::SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/w/proj".into(),
+             state: crate::session::SessionState::Working,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         app.list_state.select(Some(1));
+         open(&mut app);
+         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+         term.draw(|f| super::super::draw(f, &mut app)).unwrap();
+         let c = screen(&term);
+         for k in ["n新建", "N换agent", "s停止", "u回滚", "d改动", "l设置"] {
+             assert!(c.contains(k), "80×24 下「{k}」没画出来：{c}");
+         }
+     }
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 46a1d98..b45809b 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -2191,20 +2191,21 @@ mod tests {
+     }
+ 
+     fn sess_at(id: u32, dir: &str) -> SessionInfo {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     /// **一个「确实没有记录」的项目只能被问一次。** 只用 `profiles` 当缓存
+     /// 的话，它的键永远不会被写进去，于是每一轮拉取都要为它重发一次
+     /// `LastProfile`——看板 150ms 一轮，守护进程一忙界面就一顿一顿。
+     /// 负答案必须也被记住，这条测试盯的就是这件事。
+     #[test]
+     fn a_project_with_no_recorded_agent_is_only_asked_once() {
+         let (mut app, _d) = App::test_app();
+@@ -2500,20 +2501,21 @@ mod tests {
+     fn entering_a_session_forgets_any_previously_cached_explanation() {
+         let (mut app, _dir) = App::test_app();
+         let dir = app.start_dir.display().to_string();
+         app.set_sessions(vec![SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir,
+             state: SessionState::Failed,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         app.explained_failure = Some((1, "上一次贴在这里时看到的旧解释".into()));
+ 
+         enter_session(&mut app, 1);
+ 
+         assert_eq!(
+             app.explained_failure, None,
+             "进入会话必须当成一次全新的观察，不能继续顶着上一次的缓存"
+         );
+     }
+@@ -2614,20 +2616,21 @@ mod tests {
+             sock.clone(),
+             ViewMode::List,
+         );
+         app.set_sessions(vec![SessionInfo {
+             id,
+             profile: "shell".into(),
+             dir: workdir.path().display().to_string(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: false,
++            tag: String::new(),
+         }]);
+         app.view = View::Board;
+ 
+         enter_session(&mut app, id);
+ 
+         // `enter_session` 发的 Scroll 请求是异步落地的——给它一点时间，
+         // 不是靠 sleep 赌运气，是轮询到超时才认输。
+         let deadline = Instant::now() + Duration::from_secs(5);
+         loop {
+             let (_, scroll_after) = screen(&mut c);
+@@ -2721,28 +2724,30 @@ mod tests {
+         use ratatui::backend::TestBackend;
+ 
+         let sessions = vec![
+             SessionInfo {
+                 id: 1,
+                 profile: "claude".into(),
+                 dir: "/tmp/a".into(),
+                 state: SessionState::Working,
+                 activity: "正在读取 src/main.rs".into(),
+                 is_agent: true,
++                tag: String::new(),
+             },
+             SessionInfo {
+                 id: 2,
+                 profile: "shell".into(),
+                 dir: "/tmp/b".into(),
+                 state: SessionState::Asking,
+                 activity: "要用哪个方案？".into(),
+                 is_agent: true,
++                tag: String::new(),
+             },
+         ];
+ 
+         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+         let (mut app, _dir) = App::test_app();
+ 
+         // 看板视图，含空消息
+         app.view = View::Board;
+         app.set_sessions(sessions.clone());
+         app.message = Msg::from("");
+@@ -2891,20 +2896,21 @@ mod tests {
+     fn app_with_one_agent_session(view: View) -> (App, tempfile::TempDir) {
+         let (mut app, dir) = App::test_app();
+         app.connected = true;
+         app.set_sessions(vec![SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/tmp/a".into(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         // 第 0 行是组头，第 1 行才是那个会话。停在组头上等于「没选中会话」，
+         // s/u/d 也就都不该写在底栏上——那是对的行为，但不是这些测试要问的。
+         app.list_state.select(Some(1));
+         app.view = view;
+         (app, dir)
+     }
+ 
+     /// 同上，但看板上有**两个**项目，光标停在第一个项目的那个会话上。
+     ///
+@@ -2915,28 +2921,30 @@ mod tests {
+         let (mut app, dir) = App::test_app();
+         app.connected = true;
+         app.set_sessions(vec![
+             SessionInfo {
+                 id: 1,
+                 profile: "claude".into(),
+                 dir: "/tmp/a".into(),
+                 state: SessionState::Working,
+                 activity: String::new(),
+                 is_agent: true,
++                tag: String::new(),
+             },
+             SessionInfo {
+                 id: 2,
+                 profile: "claude".into(),
+                 dir: "/tmp/b".into(),
+                 state: SessionState::Working,
+                 activity: String::new(),
+                 is_agent: true,
++                tag: String::new(),
+             },
+         ]);
+         // 行序：组头 a / 会话 1 / 组头 b / 会话 2
+         app.list_state.select(Some(1));
+         app.view = view;
+         (app, dir)
+     }
+ 
+     /// 80 列（最常见的下限）下，右段那三条动作必须整整齐齐都在。
+     ///
+@@ -3051,20 +3059,21 @@ mod tests {
+ 
+         let (mut app, _d) = App::test_app();
+         app.connected = true;
+         app.set_sessions(vec![SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: typed.clone(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         app.list_state.select(Some(1));
+         app.view = View::Board;
+ 
+         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+         term.draw(|f| draw(f, &mut app)).unwrap();
+         let c = bar_text(&term);
+         assert!(
+             !c.contains("/private/"),
+             "canon 只用于比较，永不用于显示：{c}"
+@@ -3288,20 +3297,21 @@ mod tests {
+ 
+         let (mut app, _dir) = App::test_app();
+         app.connected = true;
+         app.set_sessions(vec![SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/tmp/a".into(),
+             state: SessionState::Working,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         app.view = View::grid(0);
+ 
+         // 80×24 是最常见的终端下限，这一条必须在这个尺寸上成立
+         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+         term.draw(|f| draw(f, &mut app)).unwrap();
+         let screen = bar_text(&term);
+         assert!(
+             !screen.contains("窗口太小"),
+             "80×24 下九宫格必须画得出来，底栏不能把它挤没：{screen}"
+@@ -3408,20 +3418,21 @@ mod tests {
+     fn the_project_picker_is_an_overlay_not_a_takeover() {
+         use ratatui::backend::TestBackend;
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/w/proj".into(),
+             state: SessionState::Idle,
+             activity: "背后的看板".into(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
+             vec!["/w/other".to_string()],
+             PathBuf::from("/w"),
+         ));
+ 
+         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+         term.draw(|f| draw(f, &mut app)).unwrap();
+         let c = bar_text(&term);
+ 
+@@ -3586,20 +3597,21 @@ mod tests {
+ 
+         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![SessionInfo {
+             id: 1,
+             profile: "claude".into(),
+             dir: "/Users/lei/work/dc/dc-terminal".into(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }]);
+         app.view = View::Board;
+         assert!(
+             app.current_dir().ends_with("dc-terminal"),
+             "前提：光标落在这个项目的组里"
+         );
+         term.draw(|f| draw(f, &mut app)).unwrap();
+ 
+         let content: String = buffer_text(term.backend().buffer())
+             .chars()
+diff --git a/src/ui/pick.rs b/src/ui/pick.rs
+index f320bb5..248bb7f 100644
+--- a/src/ui/pick.rs
++++ b/src/ui/pick.rs
+@@ -659,20 +659,21 @@ mod tests {
+         std::fs::create_dir(&a).unwrap();
+         std::fs::create_dir(&b).unwrap();
+ 
+         let mk = |id: u32, d: &std::path::Path| SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: d.display().to_string(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         };
+         app.set_sessions(vec![mk(1, &a), mk(2, &b)]);
+         app.list_state.select(Some(0));
+         assert!(app.current_dir().ends_with("a"), "前提：光标在 a 上");
+ 
+         let mut st = ListState::default();
+         st.select(Some(0));
+         app.view = View::PickProject(ProjectPicker {
+             filter: String::new(),
+             typing_path: None,
+@@ -933,20 +934,21 @@ mod tests {
+     }
+ 
+     fn sess_in(id: u32, dir: &str) -> crate::session::SessionInfo {
+         crate::session::SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: dir.into(),
+             state: crate::session::SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     /// `p` 选定一个项目之后，它必须以一个组的形式出现在看板上，并且光标落进去——
+     /// 否则用户按完 `p` 什么都没发生，`n` 也去不了那儿。
+     #[test]
+     fn confirming_a_project_puts_it_on_the_board_and_moves_the_cursor_there() {
+         let (mut app, d) = App::test_app();
+         let target = d.path().join("newproj");
+         std::fs::create_dir(&target).unwrap();
+diff --git a/src/ui/view.rs b/src/ui/view.rs
+index 07bba8f..6f0f2d0 100644
+--- a/src/ui/view.rs
++++ b/src/ui/view.rs
+@@ -2519,20 +2519,21 @@ mod tests {
+     }
+ 
+     fn si(id: u32, dir: &str, profile: &str) -> crate::session::SessionInfo {
+         crate::session::SessionInfo {
+             id,
+             dir: dir.into(),
+             profile: profile.into(),
+             state: SessionState::Idle,
+             activity: String::new(),
+             is_agent: true,
++            tag: String::new(),
+         }
+     }
+ 
+     #[test]
+     fn groups_are_sorted_by_path_and_sessions_by_id() {
+         let all = vec![
+             si(9, "/w/b", "claude"),
+             si(2, "/w/a", "codex"),
+             si(5, "/w/a", "claude"),
+         ];
