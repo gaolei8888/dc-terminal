@@ -467,6 +467,10 @@ pub struct SessionInfo {
     /// 所以新旧界面/守护进程怎么搭配都不会炸，只是没有名字。
     #[serde(default)]
     pub tag: String,
+    /// 这个会话上次真的被用过的时刻（毫秒，Unix 时间），就是 `Session::last_active`。
+    /// 纯读字段：刷新规则一个字没动；`#[serde(default)]` 理由同 `tag`。0 = 不知道（旧守护进程）。
+    #[serde(default)]
+    pub last_active_ms: u64,
 }
 
 struct Session {
@@ -1136,6 +1140,11 @@ impl SessionManager {
                     activity: s.pty.last_line(),
                     is_agent: s.is_agent,
                     tag,
+                    last_active_ms: s
+                        .last_active
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
                 }
             })
             .collect();

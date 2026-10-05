@@ -3333,6 +3333,7 @@ mod tests {
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }
     }
 

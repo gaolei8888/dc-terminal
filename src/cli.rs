@@ -1033,6 +1033,7 @@ mod tests {
             activity: activity.into(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }
     }
 

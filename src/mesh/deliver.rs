@@ -896,6 +896,7 @@ pub mod testing {
                 activity: String::new(),
                 is_agent,
                 tag: tag.into(),
+                last_active_ms: 0,
             });
         }
 
@@ -1101,6 +1102,7 @@ mod tests {
             activity: String::new(),
             is_agent: true,
             tag: tag.into(),
+            last_active_ms: 0,
         }
     }
 

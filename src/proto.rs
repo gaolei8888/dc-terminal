@@ -1691,6 +1691,7 @@ mod tests {
             activity: "a".into(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         };
         let shape = serde_json::to_string(&info).unwrap();
         assert_eq!(

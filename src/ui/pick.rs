@@ -1133,6 +1133,7 @@ mod tests {
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         };
         app.set_sessions(vec![mk(1, &a), mk(2, &b)]);
         app.list_state.select(Some(0));
@@ -2394,6 +2395,7 @@ mod tests {
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }
     }
 

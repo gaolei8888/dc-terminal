@@ -39,6 +39,8 @@ dct —— vibe coding 终端
                    看看现在屏幕上是哪一类游戏（只在本机识别，不上传）
   dct game scene [--game 名字] [--steps 10] [--dry-run]
                    寻物游戏：让大模型看场景指一个位置，dct 检查后点（要最新版 dco；只支持 Mac）
+  dct voice        点章鱼说一句话，dct 当成你亲手打的字送进最近用的会话（要 dco；只支持 Mac）
+                   2 秒内说「取消」可以不发；要你批准的提示和单独的「好」不会送
   dct peers        看组里有哪些电脑、开着哪些会话
   dct send <电脑名>/<会话名> \"<内容>\"
                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
@@ -136,6 +138,8 @@ fn main() -> Result<()> {
         }
         // 玩三消游戏：连的是本机的 dco，不经守护进程。
         Some("game") => std::process::exit(dct::game::cli::run(&args[1..])),
+        // 语音中继：连本机 dco 听写，再通过守护进程的 socket 把话送进会话。
+        Some("voice") => std::process::exit(dct::voice::run(&args[1..])),
         Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),
         Some("procedure") => std::process::exit(dct::procedures::run_cli(&args[1..])),
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
