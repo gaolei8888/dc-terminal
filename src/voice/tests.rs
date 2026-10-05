@@ -501,15 +501,15 @@ fn unavailable_dco_prints_a_plain_sentence_and_exits_nonzero() {
 
 #[test]
 fn error_in_the_middle_of_listening_also_exits_nonzero() {
-    struct Flaky(W, usize);
+    struct Flaky(usize);
     impl Hearer for Flaky {
         fn hear(&mut self, _: u64, _: u64) -> Result<Vec<Utterance>, HearError> {
-            self.1 += 1;
-            if self.1 >= 3 { Err(HearError { code: "dco_timeout".into(), message: "超时".into() }) } else { Ok(vec![]) }
+            self.0 += 1;
+            if self.0 >= 3 { Err(HearError { code: "dco_timeout".into(), message: "超时".into() }) } else { Ok(vec![]) }
         }
     }
     let w = world(idle_one(), vec![]);
-    let (mut h, mut d, mut c, mut o, mut l) = (Flaky(w.clone(), 0), FDaemon(w.clone()), FClock(w.clone()), FOut(w.clone()), FLog(w.clone()));
+    let (mut h, mut d, mut c, mut o, mut l) = (Flaky(0), FDaemon(w.clone()), FClock(w.clone()), FOut(w.clone()), FLog(w.clone()));
     let cfg = Config::default();
     assert_eq!(Relay::new(&mut h, &mut d, &mut c, &mut o, &mut l, &cfg).run(Some(10)), 1);
     assert_eq!(w.borrow().errors.len(), 1);

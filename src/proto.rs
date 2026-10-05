@@ -1677,6 +1677,11 @@ mod tests {
     ///    「懂」这个新字段，它甚至不知道对面在问它，`tag` 只是它答复里顺带
     ///    多出来的一段旧进程从不读的文本。
     ///
+    /// **2026-10-04 又用了一次同一条口子**：尾部多了 `,"last_active_ms":0`（会话
+    /// 上次被用过的毫秒时刻，`dct voice` 要它选「最近用的那个会话」）。两个条件
+    /// 同样都满足：`#[serde(default)]`，且没有新增或改动任何 `Request` 变体；
+    /// `last_active` 的刷新规则一个字没动，只是读出来。旧守护进程不发它时补成 0。
+    ///
     /// 这条规则**不能推广**：只要对面必须**理解**一个新字段或新变体才能
     /// 正常应答（而不是可以安全无视），版本号就要加一，不管那个字段本身
     /// 带不带 `#[serde(default)]`。下次想跳过版本号，先证明满足上面两条，
@@ -1698,7 +1703,7 @@ mod tests {
             (PROTOCOL_VERSION, shape.as_str()),
             (
                 24,
-                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":""}"#
+                r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":"","last_active_ms":0}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
