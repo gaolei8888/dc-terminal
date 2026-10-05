@@ -28,7 +28,13 @@ pub struct Utterance {
     pub seq: u64,
     pub text: String,
     pub confidence: f64,
+    /// dco 说这句话是怎么触发的。目前只认用户亲手点章鱼（`octopus_click`）；缺失当作不认。
+    pub trigger: String,
 }
+
+/// 目前唯一允许把话送进会话的触发方式：用户本人点了章鱼。
+/// 以后的唤醒词等不在这里，要单独决定，不能默认放行（人声可以被电视或别人冒充）。
+pub const ALLOWED_TRIGGER: &str = "octopus_click";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HearError {
@@ -296,7 +302,12 @@ pub fn parse_hear(v: &Value) -> Vec<Utterance> {
         .map(|a| {
             a.iter()
                 .filter_map(|u| {
-                    Some(Utterance { seq: u["seq"].as_u64()?, text: u["text"].as_str()?.to_string(), confidence: u["confidence"].as_f64().unwrap_or(0.0) })
+                    Some(Utterance {
+                        seq: u["seq"].as_u64()?,
+                        text: u["text"].as_str()?.to_string(),
+                        confidence: u["confidence"].as_f64().unwrap_or(0.0),
+                        trigger: u["trigger"].as_str().unwrap_or("").to_string(),
+                    })
                 })
                 .collect()
         })
@@ -402,6 +413,11 @@ impl<'a> Relay<'a> {
         if is_cancel(&fixed) {
             self.out.say("现在没有要取消的话。");
             self.record(&raw, &fixed, conf, None, "cancelled", "nothing_pending");
+            return Ok(());
+        }
+        if u.trigger != ALLOWED_TRIGGER {
+            self.out.say("这句话不是你点章鱼说的，我没有送进会话。");
+            self.record(&raw, &fixed, conf, None, "blocked_trigger", &u.trigger);
             return Ok(());
         }
         if conf < MIN_CONFIDENCE {

@@ -7,7 +7,7 @@ fn sess(id: u32, tag: &str, state: SessionState, last: u64) -> SessionInfo {
 }
 
 fn utt(seq: u64, text: &str, conf: f64) -> Utterance {
-    Utterance { seq, text: text.into(), confidence: conf }
+    Utterance { seq, text: text.into(), confidence: conf, trigger: ALLOWED_TRIGGER.into() }
 }
 
 // ---------- 纠错 ----------
@@ -168,9 +168,11 @@ fn shell_sessions_never_receive_voice() {
 
 #[test]
 fn hear_reply_is_parsed() {
-    let v = json!({"utterances":[{"seq":3,"text":"你好","confidence":0.9,"language":"zh","source":"voice","trigger":"octopus"},{"seq":4,"text":"没置信度"},{"nope":1}]});
+    let v = json!({"utterances":[{"seq":3,"text":"你好","confidence":0.9,"language":"zh","source":"voice","trigger":"octopus_click"},{"seq":4,"text":"没置信度"},{"nope":1}]});
     let u = parse_hear(&v);
-    assert_eq!(u, vec![utt(3, "你好", 0.9), utt(4, "没置信度", 0.0)]);
+    let mut no_trigger = utt(4, "没置信度", 0.0);
+    no_trigger.trigger = String::new();
+    assert_eq!(u, vec![utt(3, "你好", 0.9), no_trigger]);
     assert!(parse_hear(&json!({})).is_empty());
 }
 
@@ -589,4 +591,34 @@ fn log_file_is_0600() {
 #[test]
 fn args_are_refused() {
     assert_eq!(run(&["x".to_string()]), 2);
+}
+
+
+#[test]
+fn only_a_click_on_the_octopus_may_send_speech_into_a_session() {
+    let v = serde_json::json!({"utterances":[
+        {"seq":1,"text":"你好","confidence":0.9,"trigger":"octopus_click"},
+        {"seq":2,"text":"你好","confidence":0.9,"trigger":"wake_word"},
+        {"seq":3,"text":"你好","confidence":0.9}]});
+    let got = parse_hear(&v);
+    assert_eq!(got.iter().map(|u| u.trigger.as_str()).collect::<Vec<_>>(), ["octopus_click", "wake_word", ""]);
+    assert_eq!(got[0].trigger, ALLOWED_TRIGGER);
+    assert_ne!(got[1].trigger, ALLOWED_TRIGGER);
+    assert_ne!(got[2].trigger, ALLOWED_TRIGGER);
+}
+
+#[test]
+fn speech_not_started_by_a_click_on_the_octopus_is_never_sent() {
+    for trig in ["wake_word", "", "something_else"] {
+        let mut u = utt(1, "帮我看目录", 0.95);
+        u.trigger = trig.into();
+        let w = world(idle_one(), vec![(10_000, u)]);
+        go(&w, 3);
+        assert!(w.borrow().sent.is_empty(), "trigger {trig:?}");
+        assert_eq!(actions(&w), ["blocked_trigger"], "trigger {trig:?}");
+    }
+    // 对照：点章鱼触发的照常送出。
+    let w = world(idle_one(), vec![(10_000, utt(1, "帮我看目录", 0.95))]);
+    go(&w, 3);
+    assert_eq!(w.borrow().sent.len(), 1);
 }
