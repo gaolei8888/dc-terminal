@@ -267,7 +267,9 @@ mod unix {
         let base = format!(
             "这是一个寻物冒险手机游戏的场景截图（横屏）。我要继续玩，请选出下一步最值得点的一个场景物件\
              （门、箱子、楼梯、工具、可拾取的东西等），不要选菜单、按钮、物品栏、提示、右上的金币。\
-             已经点过的位置（不要重复）：[{}]。只用 JSON 回答：{{\"name\": 物件名, \"x\": 0到1的横向位置, \"y\": 0到1的纵向位置, \"why\": 一句话}}",
+             已经点过的位置（不要重复）：[{}]。只用 JSON 回答：{{\"name\": 物件名, \"x\": 0到1的横向位置, \"y\": 0到1的纵向位置, \"why\": 一句话}}。\
+             如果物品栏里有一个明显能用在某个场景物件上的东西，就改成把它拖过去：多写 \"from\": {{\"x\": 0到1, \"y\": 0到1}}（物品栏里那个物品的位置），\
+             x、y 写场景物件（落点）的位置；没有把握就别拖，照常点场景物件。",
             seen.join(", ")
         );
         match goal {
@@ -673,7 +675,8 @@ mod unix_tests {
         use super::unix::question;
         let plain = question(&[(1800, 6000)], None);
         assert!(!plain.contains("目标") && !plain.contains("done"), "{plain}");
-        assert!(plain.ends_with("\"why\": 一句话}"), "{plain}");
+        assert!(plain.contains("\"from\"") && plain.contains("没有把握就别拖"), "{plain}");
+        assert!(plain.ends_with("照常点场景物件。"), "{plain}");
         let with = question(&[(1800, 6000)], Some("找到蜂蜜"));
         assert!(with.starts_with(&plain) && with.contains("目标：找到蜂蜜") && with.contains("\"done\": true"), "{with}");
         let (v, b) = vision(Ok((r#"{"name":"a","x":0.1,"y":0.1}"#.into(), None)));
