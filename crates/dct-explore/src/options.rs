@@ -83,7 +83,7 @@ fn center(e: &El) -> (f64, f64) {
 }
 
 /// 没字的框描述成「离它最近的有字元素」的某一边。
-fn neighbour_hint(e: &El, all: &[El]) -> String {
+pub(crate) fn neighbour_hint(e: &El, all: &[El]) -> String {
     let (cx, cy) = center(e);
     let near = all
         .iter()

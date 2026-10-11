@@ -7,6 +7,7 @@ pub mod hands;
 pub mod ladder;
 pub mod options;
 pub mod platform;
+pub mod replay;
 pub mod trace;
 #[cfg(any(test, feature = "fake"))]
 pub mod testing;

@@ -26,7 +26,7 @@
 //! 10. 窗口没了（`look` 回 `stale` / `not_found`）→ `Stopped`。
 mod act;
 mod run;
-mod screen;
+pub(crate) mod screen;
 
 use crate::gate::{screen_halt, Budget, Halt, Over};
 use crate::hands::{Hands, Params, StepReq};

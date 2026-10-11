@@ -117,14 +117,14 @@ impl Fuzzy {
 
 /// 把参数值换回 `{名字}`：整段值，多行值的每一行（画面上常一行一个元素），
 /// 再按词模糊地换掉文字识别拆开、改了大小写或空格的片段。宁可多换。
-pub(super) struct Scrub {
+pub(crate) struct Scrub {
     full: Params,
     lines: Vec<Params>,
     fuzzy: Vec<Fuzzy>,
 }
 
 impl Scrub {
-    pub(super) fn new(params: &Params) -> Scrub {
+    pub(crate) fn new(params: &Params) -> Scrub {
         let mut lines = Vec::new();
         for (k, v) in params {
             for l in v.lines().map(str::trim) {
@@ -142,7 +142,7 @@ impl Scrub {
                 .collect(),
         }
     }
-    pub(super) fn text(&self, s: &str) -> String {
+    pub(crate) fn text(&self, s: &str) -> String {
         let mut out = redact(s, &self.full);
         for m in &self.lines {
             out = redact(&out, m);
@@ -154,13 +154,13 @@ impl Scrub {
     }
     /// 一行给人和模型看的字：先脱敏（多行值还能整段对上），再把换行和其他控制字符压成空格，
     /// 这样画面上的字没法在 state 里伪造出一行「[e9] …」。
-    pub(super) fn line(&self, s: &str) -> String {
+    pub(crate) fn line(&self, s: &str) -> String {
         self.text(s)
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect()
     }
-    pub(super) fn els(&self, els: &[El]) -> Vec<El> {
+    pub(crate) fn els(&self, els: &[El]) -> Vec<El> {
         els.iter()
             .map(|e| El {
                 text: self.line(&e.text),
