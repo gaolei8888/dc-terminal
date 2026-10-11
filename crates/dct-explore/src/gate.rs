@@ -207,6 +207,9 @@ mod tests {
             "登录",
             "Phone, email, or username",
             "扫码登录",
+            "二维码",
+            "QR code",
+            "Scan the code",
         ] {
             assert!(matches!(screen_halt(&[el(t)]), Some(Halt::Login(_))), "{t}");
         }
@@ -221,6 +224,13 @@ mod tests {
             "请完成安全验证",
             "Enter the code we sent",
             "Drag the slider",
+            "手机验证",
+            "Phone verification",
+            "Verification code",
+            "Security check",
+            "Are you human?",
+            "Verify you're human",
+            "Verify you\u{2019}re human",
         ] {
             assert!(
                 matches!(screen_halt(&[el("Post"), el(t)]), Some(Halt::Captcha(_))),
@@ -237,6 +247,8 @@ mod tests {
             "账号异常",
             "操作频繁",
             "Your account is restricted",
+            "Account disabled",
+            "账号被封",
         ] {
             assert!(
                 matches!(screen_halt(&[el(t)]), Some(Halt::Warning(_))),
