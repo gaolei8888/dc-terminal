@@ -16,6 +16,8 @@ coding agent 要你守着，是因为它每隔几分钟就问一句「这样可�
 
 [English](README.md) · 设计记录在 [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
+新会话先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)。
+
 </div>
 
 ```

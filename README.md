@@ -20,6 +20,8 @@ hand out one link and a roomful of people watch — read-only.
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
+New session working on this repo? Read [`docs/HANDOFF.md`](docs/HANDOFF.md) first.
+
 </div>
 
 ```
