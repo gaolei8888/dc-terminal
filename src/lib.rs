@@ -6,6 +6,7 @@ pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod daemon;
+pub mod explore_model;
 pub mod game;
 pub mod gate;
 pub mod git;
