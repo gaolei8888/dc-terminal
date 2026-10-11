@@ -83,7 +83,7 @@ const NEVER: &[&str] = &[
 ];
 
 /// 和 dct-brain 的档位同一套规整（全角、零宽、弯引号、汉字间空格、小写），不另写一份。
-fn fold(s: &str) -> String {
+pub(crate) fn fold(s: &str) -> String {
     dct_brain::tier::normalize(s)
 }
 
