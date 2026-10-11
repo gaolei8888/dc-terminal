@@ -78,10 +78,15 @@ impl Sq {
     }
 }
 
-/// 像网址 / 标签 / 账号的一整串：带 `/ . @ #`，去掉标点后 ≥ 12 个字母。
+/// 像网址 / 标签 / 账号的一整串：带 `/ @ #`，或者两个字母数字中间夹着 `.`（域名），去掉标点后
+/// ≥ 12 个字母。末尾的句号不算（「Login-required.」是标题，不是网址）。
 fn link_like(raw: &str, sq: &Sq) -> bool {
+    let t: Vec<char> = raw.trim().chars().collect();
+    let inner_dot = t
+        .windows(3)
+        .any(|w| w[1] == '.' && w[0].is_alphanumeric() && w[2].is_alphanumeric());
     raw.split_whitespace().count() == 1
-        && raw.trim().contains(['/', '.', '@', '#'])
+        && (t.iter().any(|c| matches!(c, '/' | '@' | '#')) || inner_dot)
         && sq.chars.len() >= VALUE_ASCII
 }
 
@@ -150,9 +155,16 @@ impl Fuzzy {
         let cjk_n = e.chars.iter().filter(|c| cjk(**c)).count();
         // 网址一类的长串在值里常常是一个「词」的中间一段（去掉了 https://），不要求对齐。
         let link = link_like(raw, e);
-        self.sq
-            .find(&e.chars)
-            .any(|p| link || cjk_n >= VALUE_CJK || self.sq.whole_words(p, p + n) >= 2)
+        // 英文：元素自己至少 2 个词，盖住值里至少 2 个完整的词，元素里每个词的分界都落在值的词边界上
+        // （「Login」不是「log in」拼起来的一个词）。
+        self.sq.find(&e.chars).any(|p| {
+            link || cjk_n >= VALUE_CJK
+                || (e.words.len() >= 2
+                    && self.sq.whole_words(p, p + n) >= 2
+                    && e.words[..e.words.len() - 1]
+                        .iter()
+                        .all(|&(_, b)| self.sq.boundary(p + b)))
+        })
     }
     /// 这段元素原文里含着一整段值（起止都落在元素的词边界上）。
     fn inside(&self, e: &Sq) -> bool {
@@ -407,6 +419,15 @@ mod tests {
         s.mark_typed("post_text");
         assert_eq!(s.value_of("example.com/launch-day"), Some("post_text"));
         assert_eq!(s.value_of("Login-required"), None);
+        assert_eq!(s.value_of("Login-required."), None, "末尾句号不算网址");
+        assert_eq!(s.value_of("example.com"), None, "不到 12 个字母");
+        let s = scrub("Please log in to see the demo");
+        s.mark_typed("post_text");
+        assert_eq!(s.value_of("Login"), None, "一个词不是两个词拼起来的");
+        assert_eq!(s.value_of("log in"), Some("post_text"));
+        let s = scrub("Follow @leining_tech_official for more");
+        s.mark_typed("post_text");
+        assert_eq!(s.value_of("@leining_tech_official"), Some("post_text"));
     }
 
     #[test]

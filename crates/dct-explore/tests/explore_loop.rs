@@ -1736,3 +1736,29 @@ fn a_lone_heading_that_is_one_word_of_the_post_still_halts() {
         "Login-required",
     );
 }
+
+// ---- fix round 5 ----
+
+#[test]
+fn a_login_heading_halts_when_the_post_says_log_in() {
+    halts_after_typing(
+        "Please log in to see the demo",
+        vec![
+            el("e1", "Login", "text", 0.4, 0.2),
+            el("e4", "Cancel", "button", 0.4, 0.6),
+        ],
+        "Login",
+    );
+}
+
+#[test]
+fn a_heading_with_a_trailing_dot_is_not_a_link() {
+    halts_after_typing(
+        "Early access is login-required this week",
+        vec![
+            el("e1", "Login-required.", "text", 0.4, 0.2),
+            el("e4", "Cancel", "button", 0.4, 0.6),
+        ],
+        "Login-required.",
+    );
+}
