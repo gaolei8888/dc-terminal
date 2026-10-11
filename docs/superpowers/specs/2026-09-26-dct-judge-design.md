@@ -244,8 +244,20 @@ src/cli.rs / main.rs  `dct judge` 子命令、HELP 文案
 
 - 产品规则「模型不打包进程序、用到才下载、正式版用 ONNX Runtime」：这一版只在开发机和试点机上跑，`jeff-serve` 由人手动起，dct 不自动起、不自动下载权重。
 - OpenAI 兼容 + logprobs 后端（给能出 logprobs 的大模型用）、`score` / `noul` 的服务端实现、图片附件。
-- Jeff 微调（只把纠正题存下来）。
+- Jeff 微调：这一版只把题存下来（见下面「训练题」）。dct 自己训练 Jeff 的设计另写：`2026-10-11-dct-jeff-auto-training-design.md`。
 
 没配 `[judge]` 或 Jeff 没起来：跳过 Jeff，直接大模型再到用户，每处模型用法都要有不靠模型的退路。
 
-已知小事：没开 serde_json 的 `preserve_order`，所以经 `dct judge` 文件进来、以及发给 `jeff-serve` 的 `criteria` 选项顺序是按名字排序的，不是书写顺序；答案按名字对应，不受影响。
+### 实现以后补的几件事（2026-10-11，`explore-and-learn` 分支）
+
+- **选项顺序原样送到服务端。** 请求体是按顺序手写出来的 JSON 文本，不经会排序的 `Map`（没开 serde_json 的 `preserve_order`，那会改动 dct 别处的 JSON 输出）。`dct judge [文件]` 也按文件里写的顺序读；只有同一道题里选项名写重了，才退回按名字排序。
+- 服务端回 422（题不合它的要求，例如选项比模型能接的多）→ 当「请求有误」，不重试。
+- 配了 `api_key_env` 时，明文 `http://` 只能发往本机（127.0.0.1 / localhost / ::1），别的主机必须 https，否则不发请求。
+- **接进了 `dct do` 的逐级往上**：Jeff 的 `answer_confidence` ≥ `threshold` 才算数；不够、没答、或它选的那一下没让画面变 → 同一画面上问 `[llm]` 的大模型（最多 2 次）→ 用户。危险与否永远由规则（dct 的停下规矩、禁点词、dco 的按钮分档）判断，不看任何模型的把握。
+- **训练题**：`dct do` 摸索时每答一道题（照做后到了新画面）就往 `~/.dct/explore/answers.jsonl` 追加一行（0600），参数值写盘前已换回 `{名字}`。字段：`ts_ms`、`run_id`、`platform`、`state`（题面）、`options`（这一轮全部选项的 `[key, 文字]`，可能多于发给 Jeff 的 20 个）、`jeff`（Jeff 当时的 `[key, 把握]`，没有就 `null`）、`answer`、`by`（`jeff` / `model` / `user`）、`corrects_jeff`（不是 Jeff 答的、而 Jeff 在这个画面上选过别的）。
+
+### 真跑过的数（dc-octo `docs/experiments/2026-10-11-jeff-serve-d4.md`）
+
+- 权重：Jeff **v1.2**，`jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`（全称 `d86f657f503245be5291e3c69e573bf48033aa50`），约 **1.6 GB**（不下演示视频），`/health` 的 `max_options` 是 **254**。原来的 `mstrasser/Jeff-Qwen3.5-0.8B` 已经搬到 `jeff-legacy` 名下；新的 v1.3 底座 `mstrasser/jeff-base` 要配 adapter 用，零样本仍用 v1.2。
+- 开发机 M5 Max（**不是** M2 16GB 基准机）：短题 p50 约 13 ms，上千 token 的新长度第一次一两百到三百多毫秒；GUI 题英文 71.7%、中文 58.3%；把握 ≥ 0.8 的 45 次对 44 次，所以门槛起始 0.8。M2 上还没量。
+- `dct judge --probe` 还没对着真的 `jeff-serve` 跑过（D4 是直接发 HTTP 量的）。

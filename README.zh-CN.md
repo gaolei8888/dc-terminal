@@ -50,6 +50,8 @@ q quit         ai-mania         Enter open  n new  Tab project  ? …
 - **[直播能公开到固定地址](#直播给学生看)**：直播面板里按 `p`，就上了中转的公开列表。
 - **[浏览器里的 dct](#浏览器里的-dct)**：给什么都装不了的机器用——一个容器、
   一条不用密码的链接、一个上传面板，外加一个管课堂的后台。
+- **[发到自媒体平台（Mac，早期）](#发到自媒体平台mac早期)**：`dct do` 经 dco 发批过的文字：
+  有你确认过的流程就照着重放，没有就一步步摸出来、写成流程给你确认。还没在真屏幕上跑过。
 - **[所有命令一张表](#命令)**。
 - 看板标题栏和设置页都写着现在跑的是哪一版。
 
@@ -373,9 +375,9 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 | `dct restart` | 把守护进程换成当前这个二进制（所有会话都会断；`-y` 不问） |
 | `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
 | `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
-| `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通 |
-| `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头）；各平台文字和开头句不能相同 |
-| `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索（每次最终发布前先问你），写成流程草稿，给你看确认卡片（按指纹确认）。开着好几个浏览器窗口要用 `--window` 指定；`--json` 一行一个事件给 dc.ai 读，回答从标准输入读 |
+| `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通。退出码 0 答了，1 没配或后端出错，2 题写错了 |
+| `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头；标准输入不是终端就拒绝）；各平台文字和开头句不能相同 |
+| `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（只有 Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索，写成流程草稿，给你看确认卡片（按指纹确认）。每次点发布前都先问你。详见[发到自媒体平台](#发到自媒体平台mac早期) |
 | `dct daemon` | 只跑守护进程，不开看板 |
 | `dct gate` | [浏览器里的 dct](#浏览器里的-dct) 前面那道门 |
 | `dct --version` | 看装的是哪一版 |
@@ -389,8 +391,14 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 ```toml
 [judge]
 base_url = "http://127.0.0.1:8765"
-# threshold = 0.8   # Jeff 把握低于这个数，dct do 就去问 [llm] 的大模型，再不行问你
+# model = "jeff-latest"      # jeff-serve 认的模型名
+# api_key_env = "JEFF_KEY"   # 从这个环境变量读密钥；明文 http 只发往本机
+# threshold = 0.8            # Jeff 把握低于这个数，dct do 就去问 [llm] 的大模型，再不行问你
+# timeout_ms = 5000
 ```
+
+dct 不会自己起 `jeff-serve`，也不下载权重，要你自己起。目前用的是 Jeff v1.2：
+`jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`（约 1.6 GB，最多接 254 个选项）。
 
 没写 `[judge]`，`dct do` 就跳过 Jeff；没写 `[llm]`，也跳过大模型。最后问的永远是你。
 
@@ -699,6 +707,43 @@ dct 读棋盘、按规则选步、让 dco 划，每步不到一秒；每一步�
 遇到要花钱、广告、生命用完、通关、不认识的画面就停下，什么都不点（`--tries` 限制重来的次数，默认 5，每次都会用掉一条生命）。
 打赢以后不会自动进下一关：下一关的棋盘位置不一样，要等「自动认新棋盘」做好。
 
+## 发到自媒体平台（Mac，早期）
+
+**这里的东西还没在真屏幕上跑过。** 下面说的都是对着假 dco 测的；第一次试点（先 X，再 TikTok）要你在场。
+
+**1. 文字先批一次。**
+`dct campaign approve launch --param x.post_text="…" --param tiktok.video=/path/a.mp4`
+在终端里把每个平台的文字给你看，你敲 `y` 才存（`~/.dct/campaigns/launch.json`）。各平台的文字和开头那句不能相同。
+`dct do` 只发这里批过的东西。
+
+**2. 发。** `dct do "把发布文字发出去" --platform x --campaign launch`，要 dco 开着、平台的浏览器开着。
+开着好几个浏览器窗口时它会列出来，你用 `--window <窗口号>` 指定。
+
+- dcv 里有确认过的流程 `promote-<平台>-<post|video>`：交给 dco 重放。dco 找不到按钮时，dct 按下面同样的办法替它答；
+  流程本身走不通了，dct 从那一步接着摸索，摸出来的写成新草稿，原来确认过的不动。`--preview` 停在发布那一步之前。
+- 没有：dct 自己摸索。打开平台表里写的网址，把画面变成一道选择题，依次问 Jeff（把握过门槛才算）→ `[llm]` 的大模型
+  （只发字，同一画面最多 2 次）→ 你（带一张编号图）。
+- **遇到这些就停下交给你**：登录、二维码、验证码、手机验证、账号警告；这些画面上的字不发给任何模型。
+  永远不点：关注、订阅、推广、升级、删除，动钱或撤不回的，以及平台自己列的禁点词。上限：40 步、10 分钟、连续 3 步画面没变。
+- **每次点发布前都先问你。** 平台的发布按钮还没在真屏幕上核实过的（所有国内平台和小红书），每点一下都先问。
+  `wechat_mp`（公众号）最后那下发布永远你自己点。
+- 发出去以后，dct 把步骤写成流程草稿（连同它关掉的弹窗的规则）交给 dcv，自己绝不批准。dcv 不收，就让 `[llm]` 的大模型改，
+  最多 3 轮。然后给你一张卡片，每一行都列出来；你说是 → 按指纹，批准只对卡片上那一版正文有效。
+- 退出码：0 发了或试跑停下了；1 出错了（dco、dcv、批准那一步）；2 命令、配置、活动或窗口不对；3 停下了或你说不。
+  `--json` 一行一个事件（`ask`、`confirm_publish`、`card`、`note`，最后是带 `exit` 的 `done` / `previewed` / `stopped` /
+  `declined` / `error`），回答从标准输入读：`{"key": "e3"}`、`{"stop": true}` 或 `{"verdict": "yes"}`。
+
+**它存下什么**（都是 0600，要发的文字写盘时换成 `{post_text}`，不存原文）：每次的步骤存在
+`~/.dct/explore/runs/<编号>/trace.json`，连同给你看过的图；每答一道题在 `~/.dct/explore/answers.jsonl` 追加一行，留着以后训练 Jeff。
+
+**平台表**内置 16 行：x、tiktok、youtube、facebook、instagram、xiaohongshu、weibo、bilibili、zhihu、zhihu_article、douyin、
+kuaishou、wechat_channels、toutiao、wechat_mp、baijiahao。没在真屏幕上核对过的字段都列在每行的 `unverified` 里，国内平台几乎全是。
+在 `~/.dct/platforms.toml` 里改或加；同名的整行替换内置的。
+
+**还没做的**：真屏幕试点；中间那一级换成更强的模型（等它的地址）；它依赖的 dcv、dco 改动在各自的仓库里做；
+批过的活动文件要不要也按指纹（现在谁能写 `~/.dct/campaigns/`，谁就能改要发的内容）；要点两下的发布（先「发布」、
+再在确认框里点一次）点完第一下就会报「发出去了」。
+
 ## 多电脑
 
 家里一台 Mac、公司一台 Windows，各开着几个 agent：让它们互相留言、派活。
@@ -941,6 +986,11 @@ src/journal.rs     每个会话怎么起来的、又是怎么没的（被叫停�
 src/proto.rs       线上契约
 src/config.rs      ~/.dct/config.toml；[llm] 不写就是关着
 src/llm/           [llm] 那条连接：走 CLI 还是 HTTP，哪份凭据能发到哪儿
+src/judge/         dct judge：用 HTTP 给 jeff-serve 发 Jev 选择题；把握由 dct 自己重算
+src/campaign.rs    dct campaign approve：各平台的文字一次批准
+src/explore_cli*   dct do：选窗口、重放或摸索、草稿、卡片、退出码、--json
+src/explore_model.rs  dct do 里「大模型」那一级：从清单里挑一个 key，或者改 dcv 不收的草稿
+src/learn.rs       草稿以 import:agent 写进 dcv、确认卡片、指纹绑在正文上
 src/runtime.rs     dct 自带的 Node 和 git，放在 ~/.dct/runtime
 src/pair*.rs       DC 配对：状态机、它的 HTTP、把结果写下来
 src/channel/       手机通道；目前只有 Telegram。不认识会话
@@ -950,6 +1000,8 @@ src/gate.rs        dct gate，浏览器版前面验钥匙的那道门
 src/web/           局域网手机端：一个极小的 HTTP 服务和那一页网页
 src/link.rs        主动出网连中转、长轮询（还没接上开关，见下）
 src/sys/           Unix 和 Windows 不一样的地方全在这儿
+crates/dct-dco/    dco 客户端（unix socket 上的 MCP），dct game 和 dct do 共用
+crates/dct-explore/  手、平台表、停下的规矩、选项、Jeff → 大模型 → 你、摸索、轨迹和训练题、草稿、重放
 crates/dct-link/   守护进程和中转共用的信封，不含 Request/Response
 crates/dct-page/   仅有的两页网页：手机端那一页，和直播观众那一页
 crates/dct-srv/    中转服务。默认只挂 /live/* 和公开列表页 /（--with-link 才加上没有鉴权的配对路由，只给本机开发用；
