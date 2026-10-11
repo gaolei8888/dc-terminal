@@ -4,12 +4,14 @@
 //! `answer_confidence`，dct 自己从 `probabilities` 归一化后重算。
 
 use super::{validate, ChoiceAnswer, ChoiceQuestion, JudgeBackend, JudgeError};
-use serde_json::{json, Map, Value};
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// (url, Bearer 密钥, 请求体) → (状态码, 响应体)；Err 是网络层错误文字。
-pub type Sender = dyn Fn(&str, Option<&str>, &Value) -> Result<(u16, String), String> + Send + Sync;
+/// 请求体是**已经序列化好的 JSON 文本**：`criteria` 的选项顺序要原样送到服务端
+/// （Jeff 按位置读选项，并列时也按顺序取），不能经过会排序的 `Map`。
+pub type Sender = dyn Fn(&str, Option<&str>, &str) -> Result<(u16, String), String> + Send + Sync;
 
 pub struct JevHttp {
     url: String,
@@ -31,7 +33,7 @@ impl JevHttp {
             if let Some(k) = key {
                 req = req.set("Authorization", &format!("Bearer {k}"));
             }
-            match req.send_json(body.clone()) {
+            match req.send_string(body) {
                 Ok(r) => Ok((r.status(), r.into_string().map_err(|e| e.to_string())?)),
                 Err(ureq::Error::Status(code, r)) => {
                     Ok((code, r.into_string().unwrap_or_default()))
@@ -73,21 +75,7 @@ impl JevHttp {
 impl JudgeBackend for JevHttp {
     fn choice(&self, state: &str, q: &ChoiceQuestion) -> Result<ChoiceAnswer, JudgeError> {
         validate(state, q)?;
-        let criteria: Map<String, Value> = q
-            .criteria
-            .iter()
-            .map(|(k, d)| {
-                (
-                    k.clone(),
-                    d.clone().map(Value::String).unwrap_or(Value::Null),
-                )
-            })
-            .collect();
-        let body = json!({
-            "model": self.model,
-            "state": state,
-            "questions": {"q": {"type": "choice", "instructions": q.instructions, "criteria": criteria}},
-        });
+        let body = request_body(&self.model, state, q);
         for attempt in 0..2 {
             let (code, text) = (self.send)(&self.url, self.key.as_deref(), &body).map_err(|e| {
                 if e.to_lowercase().contains("timed out") {
@@ -106,6 +94,27 @@ impl JudgeBackend for JevHttp {
         }
         Err(JudgeError::Busy)
     }
+}
+
+/// 手工拼 JSON 文本，`criteria` 的键按 `q.criteria` 的顺序写出。
+fn request_body(model: &str, state: &str, q: &ChoiceQuestion) -> String {
+    let js = |s: &str| serde_json::to_string(s).expect("string always serializes");
+    let criteria = q
+        .criteria
+        .iter()
+        .map(|(k, d)| {
+            let v = d.as_deref().map(js).unwrap_or_else(|| "null".to_string());
+            format!("{}:{}", js(k), v)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"model\":{},\"state\":{},\"questions\":{{\"q\":{{\"type\":\"choice\",\"instructions\":{},\"criteria\":{{{}}}}}}}}}",
+        js(model),
+        js(state),
+        js(&q.instructions),
+        criteria
+    )
 }
 
 /// 只认 `answers.q.probabilities`；每个选项都要有、不能多、有限且非负、总和 > 0。
@@ -171,13 +180,13 @@ mod tests {
             "http://127.0.0.1:8765".into(),
             "jeff-latest".into(),
             None,
-            Arc::new(
-                move |url: &str, _key: Option<&str>, body: &serde_json::Value| {
-                    assert_eq!(url, "http://127.0.0.1:8765/v1/systemone");
-                    seen.lock().unwrap().push(body.clone());
-                    Ok(reply.clone())
-                },
-            ),
+            Arc::new(move |url: &str, _key: Option<&str>, body: &str| {
+                assert_eq!(url, "http://127.0.0.1:8765/v1/systemone");
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(body).unwrap());
+                Ok(reply.clone())
+            }),
         )
     }
 
@@ -226,6 +235,39 @@ mod tests {
     }
 
     #[test]
+    fn option_order_reaches_the_wire_unchanged() {
+        let texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let t2 = texts.clone();
+        let b = JevHttp::with_sender(
+            "http://127.0.0.1:8765".into(),
+            "m".into(),
+            None,
+            Arc::new(move |_: &str, _: Option<&str>, body: &str| {
+                t2.lock().unwrap().push(body.to_string());
+                Ok((503, String::new()))
+            }),
+        );
+        let q = ChoiceQuestion {
+            instructions: "i".into(),
+            criteria: vec![
+                ("e10".into(), None),
+                ("e2".into(), Some("x".into())),
+                ("a".into(), None),
+                ("stuck".into(), None),
+            ],
+        };
+        let _ = b.choice("s", &q);
+        let t = texts.lock().unwrap()[0].clone();
+        let pos = |k: &str| t.find(&format!("\"{k}\":")).unwrap();
+        assert!(
+            pos("e10") < pos("e2") && pos("e2") < pos("a") && pos("a") < pos("stuck"),
+            "{t}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(v["questions"]["q"]["criteria"]["e2"], "x");
+    }
+
+    #[test]
     fn busy_is_retried_once_then_reported() {
         let n = Arc::new(Mutex::new(0));
         let n2 = n.clone();
@@ -233,7 +275,7 @@ mod tests {
             "http://127.0.0.1:8765".into(),
             "jeff-latest".into(),
             None,
-            Arc::new(move |_: &str, _: Option<&str>, _: &serde_json::Value| {
+            Arc::new(move |_: &str, _: Option<&str>, _: &str| {
                 *n2.lock().unwrap() += 1;
                 Ok((529, "busy".into()))
             }),
@@ -251,7 +293,7 @@ mod tests {
             "http://127.0.0.1:8765".into(),
             "jeff-latest".into(),
             None,
-            Arc::new(move |_: &str, _: Option<&str>, _: &serde_json::Value| {
+            Arc::new(move |_: &str, _: Option<&str>, _: &str| {
                 let mut g = n2.lock().unwrap();
                 *g += 1;
                 if *g == 1 {
@@ -282,7 +324,7 @@ mod tests {
             "http://127.0.0.1:8765/".into(),
             "m".into(),
             Some("k123".into()),
-            Arc::new(move |_: &str, key: Option<&str>, _: &serde_json::Value| {
+            Arc::new(move |_: &str, key: Option<&str>, _: &str| {
                 *g2.lock().unwrap() = key.map(String::from);
                 Ok((503, String::new()))
             }),

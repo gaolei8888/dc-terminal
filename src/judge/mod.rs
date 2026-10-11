@@ -95,17 +95,33 @@ pub fn from_config(c: &JudgeConfig) -> Result<Arc<dyn JudgeBackend>, JudgeError>
             c.base_url
         )));
     }
+    let host = crate::llm::creds::host_of(&c.base_url).unwrap_or_default();
     // 密钥只从环境变量读，只随请求发往 base_url 那台主机。
     let key = c
         .api_key_env
         .as_deref()
         .and_then(|v| std::env::var(v).ok())
         .filter(|k| !k.is_empty());
+    check_key_transport(&c.base_url, &host, key.is_some())?;
     Ok(Arc::new(jev::JevHttp::new(
         &c.base_url,
         c.model.clone(),
         key,
         Duration::from_millis(c.timeout_ms),
+    )))
+}
+
+/// 有密钥时，明文 `http://` 只能发往本机；别的主机必须 https。
+fn check_key_transport(base_url: &str, host: &str, has_key: bool) -> Result<(), JudgeError> {
+    if !has_key || !base_url.trim().to_ascii_lowercase().starts_with("http://") {
+        return Ok(());
+    }
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if matches!(h, "127.0.0.1" | "localhost" | "::1") {
+        return Ok(());
+    }
+    Err(JudgeError::BadRequest(format!(
+        "[judge] 配了 api_key_env，但 base_url 是明文 http://{host}：密钥不能明文发到别的主机，请改用 https，或指向本机（127.0.0.1 / localhost）"
     )))
 }
 
@@ -128,7 +144,49 @@ fn answer_json(a: &ChoiceAnswer) -> Value {
     })
 }
 
-fn parse_question(name: &str, v: &Value) -> Result<ChoiceQuestion, (i32, String)> {
+/// 保持文件里写的顺序的 JSON 对象。
+struct Ordered<T>(Vec<(String, T)>);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Ordered<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for V<T> {
+            type Value = Ordered<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<Ordered<T>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(kv) = m.next_entry::<String, T>()? {
+                    out.push(kv);
+                }
+                Ok(Ordered(out))
+            }
+        }
+        d.deserialize_map(V(std::marker::PhantomData))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OrderedQuestion {
+    #[serde(default)]
+    criteria: Option<Ordered<Value>>,
+}
+
+#[derive(serde::Deserialize)]
+struct OrderedRequest {
+    #[serde(default)]
+    questions: Option<Ordered<OrderedQuestion>>,
+}
+
+fn parse_question(
+    name: &str,
+    v: &Value,
+    order: Option<&Ordered<Value>>,
+) -> Result<ChoiceQuestion, (i32, String)> {
     let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
     match ty {
         "choice" => {}
@@ -142,7 +200,7 @@ fn parse_question(name: &str, v: &Value) -> Result<ChoiceQuestion, (i32, String)
         .and_then(Value::as_str)
         .ok_or_else(|| (2, format!("问题 {name}：缺 instructions")))?
         .to_string();
-    let crit = v
+    let crit_map = v
         .get("criteria")
         .and_then(Value::as_object)
         .ok_or_else(|| {
@@ -151,6 +209,11 @@ fn parse_question(name: &str, v: &Value) -> Result<ChoiceQuestion, (i32, String)
                 format!("问题 {name}：choice 的 criteria 要是 {{选项名: 说明}}"),
             )
         })?;
+    // 按文件里写的顺序；有序解析拿不到（不会发生）才退回 Map 的顺序。
+    let crit: Vec<(&String, &Value)> = match order {
+        Some(o) if o.0.len() == crit_map.len() => o.0.iter().map(|(k, v)| (k, v)).collect(),
+        _ => crit_map.iter().collect(),
+    };
     let mut criteria = Vec::new();
     for (k, d) in crit {
         let desc = match d {
@@ -183,9 +246,15 @@ pub fn handle_request(backend: &dyn JudgeBackend, input: &str) -> (i32, Result<V
     if qs.is_empty() {
         return (2, Err("questions 是空的".into()));
     }
+    let ordered: Option<OrderedRequest> = serde_json::from_str(input).ok();
+    let ordered_qs = ordered.and_then(|o| o.questions);
     let mut parsed = Vec::new();
     for (name, v) in qs {
-        match parse_question(name, v) {
+        let order = ordered_qs
+            .as_ref()
+            .and_then(|o| o.0.iter().find(|(n, _)| n == name))
+            .and_then(|(_, q)| q.criteria.as_ref());
+        match parse_question(name, v, order) {
             Ok(q) => parsed.push((name.clone(), q)),
             Err((code, m)) => return (code, Err(m)),
         }
@@ -321,6 +390,55 @@ mod tests {
             timeout_ms: 5000,
         };
         assert!(from_config(&c).is_err());
+    }
+
+    #[test]
+    fn key_is_refused_over_plain_http_to_a_remote_host() {
+        std::env::set_var("DCT_JUDGE_TEST_KEY_D3", "secret");
+        let mk = |url: &str| crate::config::JudgeConfig {
+            backend: "jev".into(),
+            base_url: url.into(),
+            model: "m".into(),
+            api_key_env: Some("DCT_JUDGE_TEST_KEY_D3".into()),
+            threshold: 0.8,
+            timeout_ms: 5000,
+        };
+        assert!(matches!(
+            from_config(&mk("http://example.com:8765")),
+            Err(JudgeError::BadRequest(_))
+        ));
+        assert!(from_config(&mk("https://example.com")).is_ok());
+        assert!(from_config(&mk("http://127.0.0.1:8765")).is_ok());
+        assert!(from_config(&mk("http://localhost:8765")).is_ok());
+        assert!(from_config(&mk("http://[::1]:8765")).is_ok());
+        // 没有密钥时明文远程不受限
+        let mut c = mk("http://example.com");
+        c.api_key_env = Some("DCT_JUDGE_TEST_KEY_D3_UNSET".into());
+        assert!(from_config(&c).is_ok());
+        std::env::remove_var("DCT_JUDGE_TEST_KEY_D3");
+    }
+
+    struct Recorder(std::sync::Mutex<Vec<Vec<String>>>);
+    impl JudgeBackend for Recorder {
+        fn choice(&self, _: &str, q: &ChoiceQuestion) -> Result<ChoiceAnswer, JudgeError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(q.criteria.iter().map(|(k, _)| k.clone()).collect());
+            Ok(ChoiceAnswer {
+                choice: q.criteria[0].0.clone(),
+                probabilities: vec![],
+                answer_confidence: 1.0,
+            })
+        }
+    }
+
+    #[test]
+    fn file_option_order_is_kept() {
+        let r = Recorder(Default::default());
+        let input = r#"{"state":"s","questions":{"q":{"type":"choice","instructions":"x","criteria":{"e10":null,"e2":"a","b":null,"stuck":null}}}}"#;
+        assert_eq!(handle_request(&r, input).0, 0);
+        assert_eq!(r.0.lock().unwrap()[0], ["e10", "e2", "b", "stuck"]);
     }
 
     struct Fixed;
