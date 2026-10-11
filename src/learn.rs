@@ -18,6 +18,8 @@ pub struct Written {
     pub procedure: String,
     pub popups: Vec<String>,
     pub rounds: u32,
+    /// dcv 最后收下的正文（可能是修过的）：确认卡片按这份显示。
+    pub final_body: String,
     /// 没写进去的弹窗草稿：(名字, dcv 的拒收原因)。不重试，不影响流程草稿。
     pub popup_failures: Vec<(String, String)>,
 }
@@ -89,6 +91,7 @@ pub fn write_drafts(
         procedure: format!("{}:{}", p.vault, name),
         popups,
         rounds,
+        final_body: body,
         popup_failures,
     })
 }
@@ -117,7 +120,9 @@ fn plain_step(n: u32, action: &str, arg: &str) -> String {
         "tap_by_intent" => format!("点「{arg}」"),
         "type_param" => {
             let name = arg.trim_matches(|c| c == '{' || c == '}');
-            if name.contains("text") {
+            let is_text = matches!(name, "text" | "title" | "description" | "caption")
+                || name.ends_with("_text");
+            if is_text {
                 "填入要发的文字".to_string()
             } else {
                 format!("填入「{name}」这一项")
@@ -167,9 +172,13 @@ pub fn render_card(
     pops: &[PopupDraft],
     learned: &[String],
 ) -> Card {
-    let steps = plain_steps(&p.body);
+    let steps = plain_steps(&w.final_body);
     let what = p.description.split('（').next().unwrap_or(&p.description);
-    let mut t = format!("学会了：{}（{}，草稿）\n", what, p.name);
+    let name = w
+        .procedure
+        .split_once(':')
+        .map_or(w.procedure.as_str(), |x| x.1);
+    let mut t = format!("学会了：{}（{}，草稿）\n", what, name);
     for (n, s) in &steps {
         t += &format!("  {n}. {s}\n");
     }
@@ -441,6 +450,7 @@ mod tests {
             popups: vec!["social-global:tiktok-turn-on-automatic-con".into()],
             rounds: 1,
             popup_failures: vec![],
+            final_body: draft_with_one_off().body,
         }
     }
 
@@ -535,7 +545,9 @@ mod tests {
         d.maybe_one_off = vec![];
         d.notes = vec![];
         d.body = "1. open_url: https://x.com\n2. pick_file: video\n3. scroll: down\n4. scroll: up\n5. wait: 1\n6. back: \n7. verify_text: 「Done」\n8. type_param: title".into();
-        let c = render_card(&written(), &d, &[], &[]);
+        let mut w = written();
+        w.final_body = d.body.clone();
+        let c = render_card(&w, &d, &[], &[]);
         for want in [
             "选文件（video）",
             "往下滚",
@@ -615,5 +627,59 @@ mod tests {
         assert!(r.is_err());
         assert!(d.approved_popups().is_empty());
         assert!(h.calls.is_empty(), "流程没批准，学到的按钮也不确认");
+    }
+
+    #[test]
+    fn the_card_shows_the_body_the_fixer_produced() {
+        struct Swap;
+        impl Fixer for Swap {
+            fn fix(&self, b: &str, _: &str) -> Option<String> {
+                Some(b.replace("Poost", "Post"))
+            }
+        }
+        let d = FakeDcv::default();
+        d.reject.borrow_mut().push("第 2 步不对".into());
+        let mut p = draft();
+        p.body = "1. open_url: https://x.com/compose/post\n2. tap_by_intent: Poost".into();
+        let w = write_drafts(&d, &Swap, &p, &[]).unwrap();
+        let c = render_card(&w, &p, &[], &[]);
+        assert!(c.text.contains("点「Post」"), "{}", c.text);
+        assert!(!c.text.contains("Poost"), "{}", c.text);
+        assert_eq!(c.json["steps"][1]["text"], "点「Post」");
+    }
+
+    #[test]
+    fn the_card_header_shows_the_renamed_procedure() {
+        let d = FakeDcv {
+            exists: vec!["social-global:promote-x-post".into()],
+            ..Default::default()
+        };
+        let p = draft();
+        let w = write_drafts(&d, &NoFix, &p, &[]).unwrap();
+        let c = render_card(&w, &p, &[], &[]);
+        assert!(c.text.contains("promote-x-post-1a2b，草稿"), "{}", c.text);
+        assert_eq!(c.json["procedure"], "social-global:promote-x-post-1a2b");
+    }
+
+    #[test]
+    fn notes_and_popup_failures_appear_on_the_card() {
+        let mut w = written();
+        w.popup_failures = vec![("tiktok-x".into(), "弹窗不收".into())];
+        let c = render_card(&w, &draft_with_one_off(), &[], &[]);
+        assert!(c.text.contains("有一次点击没能写成弹窗规则"));
+        assert!(c.text.contains("tiktok-x") && c.text.contains("弹窗不收"));
+    }
+
+    #[test]
+    fn only_real_text_params_become_the_text_to_post() {
+        let mut d = draft_with_one_off();
+        d.maybe_one_off = vec![];
+        d.body = "1. open_url: https://x.com\n2. type_param: context\n3. type_param: caption\n4. type_param: post_text".into();
+        let mut w = written();
+        w.final_body = d.body.clone();
+        let c = render_card(&w, &d, &[], &[]);
+        assert!(c.text.contains("2. 填入「context」这一项"), "{}", c.text);
+        assert!(c.text.contains("3. 填入要发的文字"));
+        assert!(c.text.contains("4. 填入要发的文字"));
     }
 }
