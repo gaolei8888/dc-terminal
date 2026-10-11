@@ -72,6 +72,41 @@ impl Default for LlmConfig {
     }
 }
 
+fn default_judge_backend() -> String {
+    "jev".to_string()
+}
+fn default_judge_model() -> String {
+    "jeff-latest".to_string()
+}
+fn default_threshold() -> f64 {
+    0.8
+}
+fn default_judge_timeout_ms() -> u64 {
+    5000
+}
+
+/// `[judge]`：给 dct 自己做决定用的「选哪个」引擎。没写 = 关。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct JudgeConfig {
+    /// 现在只有 "jev"：POST {base_url}/v1/systemone。
+    #[serde(default = "default_judge_backend")]
+    pub backend: String,
+    /// 例：http://127.0.0.1:8765
+    pub base_url: String,
+    /// jeff-serve 认 "jeff-latest"。
+    #[serde(default = "default_judge_model")]
+    pub model: String,
+    /// 有就作为 Bearer 发（只发给 base_url 那台主机）。值从这个环境变量读，
+    /// 不写进配置文件。
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Jeff 答案的门槛，起始 0.8。
+    #[serde(default = "default_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_judge_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
 /// 菜单上只留哪几项。给一个班、一个团队统一发机器的人用的。
 ///
 /// 空列表（没写这一段、写了空的、名字全填错）= 不裁，全都显示。**裁到
@@ -118,6 +153,9 @@ pub struct Config {
     pub menu: MenuConfig,
     #[serde(default)]
     pub mesh: MeshConfig,
+    /// `None` = 没写 `[judge]`，judge 关着。
+    #[serde(default)]
+    pub judge: Option<JudgeConfig>,
 }
 
 impl Config {
@@ -172,6 +210,22 @@ pub fn config_path_for_profiles_dir(profiles_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn judge_is_off_unless_written_and_has_defaults() {
+        assert!(Config::from_toml("").unwrap().judge.is_none());
+        let c = Config::from_toml("[judge]\nbase_url = \"http://127.0.0.1:8765\"\n").unwrap();
+        let j = c.judge.unwrap();
+        assert_eq!(
+            (
+                j.backend.as_str(),
+                j.model.as_str(),
+                j.threshold,
+                j.timeout_ms
+            ),
+            ("jev", "jeff-latest", 0.8, 5000)
+        );
+    }
 
     #[test]
     fn the_relay_defaults_and_can_be_overridden() {

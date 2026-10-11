@@ -217,3 +217,35 @@ src/cli.rs / main.rs  `dct judge` 子命令、HELP 文案
   要 `--probe` 之后拿几个真实例子看。
 - **图片的上限**：4 张、16 MiB 是拍的；Qwen3-VL 64k 上下文里一张图占多少，实测后再调。
 - **接到 dct 自己的决定上**（下一份设计）：哪些决定先用它、门槛多少、错了怎么撤回。
+
+## 2026-10-11 第一版后端：jeff-serve（Jev HTTP）
+
+「探索并学会流程」要一个很快的「选哪个」判断者（Jeff）。第一版的接法是：**dct 的 judge 用 HTTP 调 Jeff 自带的 `jeff-serve`（`POST /v1/systemone`，Jev 格式）**，不在 dct 进程里跑 ONNX，也不走上面的 OpenAI 兼容 + logprobs。后端本来就是可插拔的，这是第一个后端。
+
+### 为什么
+
+1. **Jeff 不是普通的「生成字」模型。** 它在 Qwen3.5-0.8B 上加了自己的输出层（`readout.safetensors` + `decision_config.json`），直接给每个选项的概率。llama.cpp、mlx_lm 那类 OpenAI 兼容服务器加载不了这个输出层，「让模型只答一个字母、读 logprobs」对 Jeff 用不上。
+2. **`jeff-serve` 已经存在，说的就是本设计要回的 Jev 格式**（`state` / `questions` / `choice` 题，回 `probabilities` + `choice`）。dct 这边只是 HTTP 客户端，几乎不用翻译。laya-serve、TypeSafe Jev 说同一种格式，同一个后端都能连。
+3. **ONNX 不是最小的一步**：Jeff 的自定义输出层加 Qwen3.5 的混合注意力能不能导出 ONNX、导出后准不准都没验证过；dct 现在整棵依赖树没有 C，进程内 ONNX 要另引 onnxruntime。这些留到「正式给用户」那一版。
+
+### 和上文的三处差别
+
+- 请求体必须带 `model`（`"jeff-latest"`）；图片字段叫 `images` 不叫 `attachments`，第一版不发图（Jeff 的 MLX 后端只收文字，`/health` 里 `modalities: ["text"]`）。
+- **回复里没有 `answer_confidence`**，`confidence` 的公式也和上文不同。dct 自己从 `probabilities` 重算：先归一化，`answer_confidence = probabilities[choice]`，`choice` 也按重算后概率最大的取，不信回复里的。门槛只看这个数。回复里选项缺一个、多一个、概率为负或总和为 0，一律当「读不懂」，不猜。
+- 服务同一时间只接一个请求，忙时回 529 + `Retry-After: 1`：dct 串行发，529 等 1 秒重试一次，仍忙就报 `Busy`，往上交给调用方当「Jeff 失败」。
+
+### 配置与命令
+
+`~/.dct/config.toml` 的 `[judge]`（不写 = 关）：`base_url`（必填，如 `http://127.0.0.1:8765`）、`backend`（只有 `"jev"`）、`model`（默认 `jeff-latest`）、`api_key_env`（有就从这个环境变量读密钥作 Bearer，只发给 `base_url` 那台主机，值不写进配置）、`threshold`（默认 0.8）、`timeout_ms`（默认 5000）。
+
+`dct judge [文件]` 只支持 `choice` 题（`score` / `noul` 报「这一版只做 choice」，退出码 2）；`dct judge --probe` 发一道固定的中文 GUI 题。没配 `[judge]` 时 stderr 给出该写的那一行，退出码 1。请求写错 2，后端错 1。选项仍是 2–20 个。
+
+### 这一版不做
+
+- 产品规则「模型不打包进程序、用到才下载、正式版用 ONNX Runtime」：这一版只在开发机和试点机上跑，`jeff-serve` 由人手动起，dct 不自动起、不自动下载权重。
+- OpenAI 兼容 + logprobs 后端（给能出 logprobs 的大模型用）、`score` / `noul` 的服务端实现、图片附件。
+- Jeff 微调（只把纠正题存下来）。
+
+没配 `[judge]` 或 Jeff 没起来：跳过 Jeff，直接大模型再到用户，每处模型用法都要有不靠模型的退路。
+
+已知小事：没开 serde_json 的 `preserve_order`，所以经 `dct judge` 文件进来、以及发给 `jeff-serve` 的 `criteria` 选项顺序是按名字排序的，不是书写顺序；答案按名字对应，不受影响。
