@@ -8,9 +8,9 @@ pub mod ladder;
 pub mod options;
 pub mod platform;
 pub mod replay;
-pub mod trace;
 #[cfg(any(test, feature = "fake"))]
 pub mod testing;
+pub mod trace;
 
 /// 给 Jeff 的一道选择题。和根包 `judge::ChoiceQuestion` 同形（顺序要保留：Jeff 按位置读选项），
 /// 这里单独定义是为了不让本 crate 依赖根包；转换在根包里写。
