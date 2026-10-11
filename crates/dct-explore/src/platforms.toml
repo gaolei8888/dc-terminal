@@ -1,0 +1,66 @@
+# dct 摸索用的平台表。是数据，不是代码：加平台只加一段。
+# unverified 里列的字段还没在真机上看过，第一次摸索时会核对（登录闸没在画面上出现就不出草稿）。
+
+[[platform]]
+name = "x"
+domain = "x.com"
+entry_url = "https://x.com/compose/post"
+browser = "Google Chrome"
+vault = "social-global"
+login_gate = "What's happening?"
+publish_words = ["Post"]
+publish_done = "Your post was sent"
+never_tap = ["Subscribe", "Get verified", "Premium", "Follow", "Boost"]
+unverified = ["login_gate", "publish_done"]
+
+[[platform]]
+name = "tiktok"
+domain = "www.tiktok.com"
+entry_url = "https://www.tiktok.com/tiktokstudio/upload"
+browser = "Google Chrome"
+vault = "social-global"
+login_gate = "Select video"
+publish_words = ["Post", "Post now"]
+never_tap = ["Promote", "Follow", "Boost"]
+unverified = ["login_gate", "publish_done"]
+
+[[platform]]
+name = "youtube"
+domain = "www.youtube.com"
+entry_url = "https://www.youtube.com/upload"
+browser = "Google Chrome"
+vault = "social-global"
+login_gate = "Select files"
+publish_words = ["Publish", "Save"]
+never_tap = ["Subscribe", "Promote", "Join"]
+unverified = ["publish_done"]
+
+[[platform]]
+name = "facebook"
+domain = "www.facebook.com"
+entry_url = "https://www.facebook.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["Post"]
+never_tap = ["Boost post", "Boost", "Follow", "Promote"]
+unverified = ["entry_url", "login_gate", "publish_done"]
+
+[[platform]]
+name = "instagram"
+domain = "www.instagram.com"
+entry_url = "https://www.instagram.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["Share"]
+never_tap = ["Boost post", "Boost", "Follow"]
+unverified = ["entry_url", "login_gate", "publish_done"]
+
+[[platform]]
+name = "xiaohongshu"
+domain = "creator.xiaohongshu.com"
+entry_url = "https://creator.xiaohongshu.com/publish/publish"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "薯条", "推广", "加热"]
+unverified = ["entry_url", "login_gate", "publish_done", "vault"]
