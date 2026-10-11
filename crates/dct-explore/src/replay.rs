@@ -4,16 +4,16 @@
 //! - `needs_help`：选项 = `help.elements` 各一项 + `not_there` + `stuck`，经同一个 `Ladder` 往上问
 //!   （Jeff / 大模型的回答发 `by: model`，用户的发 `by: user`）。先按画面**原文**过 `gate::screen_halt`
 //!   和禁点 / 档位（原文只在内存里，见 `explore/raw.rs`），出去的字才脱敏（参数值换回 `{名字}`、
-//!   换行压成空格）：登录 / 验证码 / 警告 → 取消 dco 的运行、返回 `Stopped`（那行字已脱敏），
+//!   换行压成空格）：登录 / 验证码 / 警告 → 取消 dco 的运行、返回 `Stopped`（只说是哪一类，不回显那行字），
 //!   不问任何人（选 `Stopped` 而不是另造一个 Halted：上层都是「停下交给用户」）。同一个运行最多答 5 次。
 //! - `failed`：note 里有超时 / 急停 / 锁屏 / 私人画面的固定词 → `Stopped`；否则是流程本身走不通 →
 //!   `NeedsRepair`，`prefix` 是流程第 1..卡住那步之前的每一步（`from_procedure`、`by: User`、`ok`）。
 //! - `blocked`（档位）→ `Blocked`，转给用户。
-//! - 平台 `publish_by_user_only`：永远当预览跑（`stop_before_step` = 发布那一步），结果 `Previewed`，
+//! - 平台 `publish_by_user_only`：永远当预览跑（`stop_before_step` = 第一个发布那一步），结果 `Previewed`，
 //!   由用户自己点发布；找不到发布那一步 → `Stopped`，绝不跑到底。预览时 dco 若没停就跑完了 → `Stopped`（如实说）。
 use crate::explore::raw::Raw;
 use crate::explore::screen::Scrub;
-use crate::gate::{check_icon_name, fold, tappable, IconName};
+use crate::gate::{check_icon_name, fold, tappable, Halt, IconName};
 use crate::hands::{By, El, Hands, HelpAnswer, Params, RunReply};
 use crate::ladder::{Ladder, Tries, Who};
 use crate::options::{neighbour_hint, Act, Opt};
@@ -84,13 +84,14 @@ fn step_n(i: usize, s: &Value) -> u32 {
     s["n"].as_u64().map(|n| n as u32).unwrap_or(i as u32 + 1)
 }
 
-/// 发布那一步：最后一个 `tap_by_intent`，且 arg 整句（fold 后）等于平台发布词之一；找不到 → None。
+/// 发布那一步：**第一个** `tap_by_intent`，且 arg 整句（fold 后）等于平台发布词之一；找不到 → None。
+/// 取第一个：预览和发布要用户自己点的平台都要停在任何一下发布之前（「发布」后面再跟一个
+/// 「发布」确认时，停在后一个就等于已经点过前一个）。
 pub fn publish_step(procedure: &Value, p: &Platform) -> Option<u32> {
     let words: Vec<String> = p.publish_words.iter().map(|w| fold(w)).collect();
     steps_of(procedure)
         .iter()
         .enumerate()
-        .rev()
         .find(|(_, s)| {
             s["action"].as_str() == Some("tap_by_intent")
                 && s["arg"]
@@ -213,6 +214,16 @@ fn stopped_text(r: &RunReply, scrub: &Scrub) -> String {
     )
 }
 
+/// 停下的画面只说是哪一类，不回显画面上的字（和摸索一样：那行字不交给任何模型，也不印出来）。
+fn halt_text(why: &Halt) -> String {
+    let what = match why {
+        Halt::Login(_) => "要先登录：请你在窗口里登录好，再跑一次",
+        Halt::Captcha(_) => "要验证码 / 人机验证：请你在窗口里过了验证，再跑一次",
+        Halt::Warning(_) => "出了账号警告：先去看看是怎么回事",
+    };
+    format!("重放时画面{what}；停下交给你，没有问任何模型")
+}
+
 fn not_procedures_fault(r: &RunReply) -> bool {
     // 只看这一步的 note 和错误码；早先步骤的 note 不算。
     let n = r.note.as_deref().unwrap_or("");
@@ -326,9 +337,7 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
         let raw = Raw::new(&help.elements, &scrub);
         if let Some(why) = raw.halt(&scrub) {
             let _ = h.cancel_run(&run_id);
-            return ReplayOutcome::Stopped(format!(
-                "重放时画面变成了登录 / 验证码 / 警告（{why:?}），停下交给你；没有问任何模型"
-            ));
+            return ReplayOutcome::Stopped(halt_text(&why));
         }
         let intent = scrub.line(&help.intent);
         let mut state = format!(

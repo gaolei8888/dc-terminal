@@ -517,8 +517,10 @@ fn a_login_wall_during_replay_help_halts_even_when_the_post_text_says_log_in() {
     let out = replay(&mut h, &mut lad, inp);
     match out {
         ReplayOutcome::Stopped(why) => {
-            // 界面上那行字照原样报（R14：短巧合不换），帖子本身不出现。
-            assert!(why.contains("Log in to X"), "{why}");
+            // 和摸索一样：停下的画面上的字不回显，只说是哪一类（登录）；帖子本身更不出现。
+            assert!(why.contains("登录"), "{why}");
+            assert!(!why.contains("Log in to X"), "{why}");
+            assert!(!why.contains("Login("), "不用调试格式：{why}");
             assert!(!why.to_lowercase().contains("see our"), "{why}")
         }
         other => panic!("{other:?}"),
@@ -804,4 +806,33 @@ fn a_replay_help_name_that_is_banned_or_a_publish_word_is_refused() {
             h.calls
         );
     }
+}
+
+#[test]
+fn preview_and_by_user_platforms_stop_before_the_first_publish_tap() {
+    let t = Table::seed();
+    let pr = json!({
+        "name": "promote-wechat-mp-post", "executable": true,
+        "steps": [
+            {"n": 1, "action": "open_url", "arg": "https://mp.weixin.qq.com/"},
+            {"n": 2, "action": "type_param", "arg": "post_text"},
+            {"n": 3, "action": "tap_by_intent", "arg": "发布"},
+            {"n": 4, "action": "tap_by_intent", "arg": "继续"},
+            {"n": 5, "action": "tap_by_intent", "arg": "发布"}
+        ]
+    });
+    let p = t.get("wechat_mp").unwrap();
+    assert_eq!(publish_step(&pr, p), Some(3), "第一个发布就停");
+    let mut h = FakeHands::new();
+    h.push_procedure(reply("r1", "stopped", 3));
+    let (j, mut u) = (jeff(None), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = replay(&mut h, &mut lad, input(&pr, p, false));
+    assert_eq!(out, ReplayOutcome::Previewed { at_step: 3 });
+    assert_eq!(h.sent_procedures[0].3, Some(3));
 }
