@@ -40,14 +40,19 @@
 //!      请用户自己点；轨迹里记成 `publish: true`，草稿两下都抄。填字也先问。绝不不问就点。
 //!    - 选「做完了」：规矩认不出发出去没有（比如 X 发完回到首页，左边栏还有 Post，「发出去了」那行字又没核实），
 //!      先问用户发出去了没有；说没有 → 记成这个画面上的一次失败（逐级往上），接着走。
-//!    - 用户不让点确认那一下 → `DeclinedAtPublish`（没发出去）。
+//!    - 只有点出来的新画面才按上面看（滚动、等待到了没有发布按钮的新画面不算发出去）。
+//!    - 要点的字和第一下发布是同一个字（X 发完回首页，左边栏还有 Post）：不说「还要再确认」，
+//!      提醒再点可能会再发一次。
+//!    - 填字、选文件也先问。用户不让点 / 不让做 → `DeclinedAtPublish`；`dct do` 看轨迹里已经有
+//!      起作用的发布，就说帖子可能已经发出去了，请到平台上看一眼。
+//!    - 绕回点发布以前的画面：`pending` 和等确认期间的步数一起恢复 / 清零。
 pub(crate) mod act;
 pub(crate) mod raw;
 mod run;
 pub(crate) mod screen;
 mod scrub;
 
-use crate::gate::{check_icon_name, Budget, Halt, IconName, Over};
+use crate::gate::{check_icon_name, fold, Budget, Halt, IconName, Over};
 use crate::hands::{Hands, Params, StepReq};
 use crate::ladder::{Decision, Ladder, Who};
 use crate::options::{shortlist, state_text, Act, Goal, Opt};
@@ -367,7 +372,18 @@ fn drive(
             }
             let word = word_of(&opt);
             let name = &input.platform.name;
+            // 和第一下发布同一个字（比如 X 发完回到首页，左边栏还有个 Post）：那不是确认，再点可能再发一次。
+            let again = r
+                .pending
+                .as_deref()
+                .is_some_and(|f| fold(f.trim()) == fold(word.trim()));
             let summary = match (&r.pending, by_user) {
+                (Some(first), true) if again => format!(
+                    "刚才已经点过「{first}」了，帖子可能已经发到 {name} 上了。再点「{word}」可能会再发一次；真要再点，请你自己在窗口里点，点完回答「是」。"
+                ),
+                (Some(first), false) if again => format!(
+                    "刚才已经点过「{first}」了，帖子可能已经发到 {name} 上了。画面上又是一个「{word}」：再点可能会再发一次。还要点吗？"
+                ),
                 (Some(_), true) => format!(
                     "{name} 还要再确认一下才会发出去。这个平台的发布按钮要你自己点：请在窗口里点「{word}」，点完回答「是」。"
                 ),
@@ -447,7 +463,9 @@ fn drive(
             .iter()
             .any(|u| u == "publish_words");
         let after_by_user = input.platform.publish_by_user_only && r.prog.published;
-        if !opt.publish && taps && (unverified || after_by_user || r.pending.is_some()) {
+        //  - 点过发布、还在等确认：点字以外的填字、选文件也先问（不让就是没发，`DeclinedAtPublish`）。
+        let pending_ask = r.pending.is_some() && (taps || matches!(opt.act, Act::Attach { .. }));
+        if !opt.publish && ((taps && (unverified || after_by_user)) || pending_ask) {
             if pic.is_none() {
                 pic = match act::marks_now(h, input, &scrub) {
                     Ok(p) => Some(p),
@@ -477,6 +495,9 @@ fn drive(
                 )
             };
             if !confirm.publish_ok(pic.clone().flatten().as_deref(), &summary) {
+                if r.pending.is_some() {
+                    return Outcome::DeclinedAtPublish(r.trace);
+                }
                 return r.stop(format!("你没让点「{word}」，停下"));
             }
         }
@@ -507,8 +528,9 @@ fn drive(
                 row(&dec, fj, Some(r.trace.steps.len()), true);
                 record(&mut r, &cur, &post, &opt, &dec, steps, true);
                 advance(&mut r, &opt);
-                if opt.publish || r.pending.is_some() {
-                    // 发布（或确认）那一下落到了新画面：按 11 看算不算发出去。算 → 马上 `Published`，
+                if opt.publish {
+                    // 发布（或确认）那一下落到了新画面：按 11 看算不算发出去（滚动、等待到了新画面不算：
+                    // 不是点出来的，还在等确认）。算 → 马上 `Published`，
                     // 不再走一轮去等「做完」，也不再看上限（用户想发不发的那段时间算在上限里，
                     // 不能把发出去的说成停下）。登录 / 验证码 / 警告照样停下。还有发布按钮 → 接着走。
                     match post.landed(&scrub, input.platform) {

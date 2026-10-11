@@ -371,13 +371,17 @@ pub fn drive(a: &DoArgs, p: &Platform, params: Params, env: Env) -> i32 {
             };
             learn.run(hands, p, &trace, &file_params)
         }
-        Outcome::DeclinedAtPublish(_) => fin(
-            say,
-            3,
-            "declined",
-            "你没让发，停在了发布前；这次不写草稿",
-            json!({}),
-        ),
+        Outcome::DeclinedAtPublish(trace) => {
+            // 两段式发布：第一下发布已经点了（起作用了），用户不让再点——帖子可能已经发出去了。
+            let text = match trace.steps.iter().find(|s| s.ok && s.publish) {
+                Some(s) => format!(
+                    "点过「{}」以后你没让再点；帖子可能已经发出去了，请到平台上看一眼；这次不写草稿",
+                    s.arg
+                ),
+                None => "你没让发，停在了发布前；这次不写草稿".to_string(),
+            };
+            fin(say, 3, "declined", &text, json!({}))
+        }
         Outcome::Halted { why, .. } => halted(say, p, &why),
         Outcome::Stopped { why, .. } => fin(say, 3, "stopped", &why, json!({})),
     }
@@ -1605,6 +1609,44 @@ mod tests {
         assert_eq!(r.code, 1, "{}", r.out);
         assert!(r.approved.is_empty(), "对不上就不弹 Touch ID");
         assert!(r.out.contains("不一样"), "{}", r.out);
+    }
+
+    /// 点过 Post、回到首页还剩左边栏的 Post（「发出去了」那行字没核实），用户不让再点：
+    /// 帖子可能已经发出去了，不能说「停在了发布前」。
+    #[test]
+    fn declining_after_a_first_publish_tap_does_not_say_it_stopped_before_publishing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::new();
+        chrome(&mut h);
+        let home = || {
+            look(
+                "c",
+                vec![
+                    el("e1", "Post", "button", 0.08, 0.5),
+                    el("e9", "Your post was sent", "text", 0.4, 0.9),
+                ],
+            )
+        };
+        h.push_step(reply("r0", "done", 1)); // open_url
+        h.push_look(filled("b"));
+        h.push_look(filled("b")); // 编号图（问发不发）
+        h.push_step(reply("r1", "done", 1)); // tap Post
+        h.push_look(home());
+        h.push_look(home()); // 编号图（问还点不点）
+        let jeff = SureJeff(vec!["e3", "e1"], RefCell::new(0));
+        let r = go(
+            &args(false),
+            "x",
+            &mut h,
+            &FakeDcv::default(),
+            &jeff,
+            "y\nn\n",
+            params(),
+            d.path(),
+        );
+        assert_eq!(r.code, 3, "{}", r.out);
+        assert!(!r.out.contains("停在了发布前"), "{}", r.out);
+        assert!(r.out.contains("可能已经发出去"), "{}", r.out);
     }
 
     #[test]

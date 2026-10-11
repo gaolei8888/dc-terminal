@@ -241,6 +241,11 @@ pub fn draft(
         }
         lines.push(format!("{n}. {}: {}", s.action, s.arg));
         if s.publish {
+            // 跟在前一下发布后面的发布（两段式发布的确认那一下，如 TikTok「Continue to post?」里的
+            // Post now）可能只偶尔出现：标出来给用户看。第一下发布不标。
+            if after_publish && !is_dismiss(&s.arg, dismiss) {
+                maybe_one_off.push(n);
+            }
             after_publish = true;
             if last_publish != Some(i) {
                 continue;
@@ -377,7 +382,8 @@ mod tests {
             ),
             s("tap_by_intent", "Got it", false, &["New: content checks"]),
             s("tap_by_intent", "Post", true, &[]),
-            s("tap_by_intent", "Post now", false, &["Continue to post?"]),
+            // 摸索时确认那一下记成发布（两段式发布，见 explore 第 11 条）。
+            s("tap_by_intent", "Post now", true, &["Continue to post?"]),
         ]);
         tr.platform = "tiktok".into();
         tr.first_lines = vec!["Select video".into()];
@@ -475,7 +481,11 @@ mod tests {
             "确认那一下前面不该有完成标志：{}",
             d.body
         );
-        assert_eq!(d.maybe_one_off, vec![7], "两下发布都不是偶尔出现的步骤");
+        assert_eq!(
+            d.maybe_one_off,
+            vec![6, 7],
+            "确认那一下（跟在前一下发布后面）可能只偶尔出现，要标出来；第一下发布不标"
+        );
     }
 
     #[test]

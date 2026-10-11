@@ -78,6 +78,10 @@ impl Run {
             }
             self.prog = copy_prog(&s.prog);
             self.pending = s.pending.clone();
+            if self.pending.is_none() {
+                // 回到点发布以前的画面：不再等确认，等确认期间的步数从头算。
+                self.after_publish = 0;
+            }
         }
     }
     /// 在 `key` 这个画面上选的那一下没起作用。
