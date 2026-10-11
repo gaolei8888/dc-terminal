@@ -68,6 +68,12 @@ const NOT_PROCEDURES_FAULT: &[&str] = &[
     "screen_locked",
     "私人",
     "private_screen",
+    // 窗口关了：dco 把步骤里的工具错误写成「{message}（{code}）」（run/mod.rs），窗口没了是 stale
+    "stale",
+    "窗口关了",
+    "窗口已经关了",
+    // dco 的 MAX_HELPS：求助太多次，交给用户，不是流程的错
+    "要帮忙超过",
 ];
 
 fn steps_of(p: &Value) -> &[Value] {
@@ -198,11 +204,12 @@ fn stopped_text(r: &RunReply, scrub: &Scrub) -> String {
 }
 
 fn not_procedures_fault(r: &RunReply) -> bool {
+    // 只看这一步的 note 和错误码；早先步骤的 note 不算。
     let n = r.note.as_deref().unwrap_or("");
-    let raw = r.raw.to_string();
+    let code = r.raw["code"].as_str().unwrap_or("");
     NOT_PROCEDURES_FAULT
         .iter()
-        .any(|w| n.contains(w) || raw.contains(w))
+        .any(|w| n.contains(w) || code.contains(w))
 }
 
 pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> ReplayOutcome {
@@ -256,6 +263,11 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
             }
         }
         match rep.status.as_str() {
+            "already_done" if preview => {
+                return ReplayOutcome::Stopped(
+                    "完成标志已经在画面上了，这次什么都没有跑；不用再发".into(),
+                )
+            }
             "done" | "already_done" => {
                 return if preview {
                     ReplayOutcome::Stopped(
@@ -369,11 +381,12 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
         rep = match h.answer_run(&run_id, &answer) {
             Ok(r) => r,
             Err(e) => {
+                let _ = h.cancel_run(&run_id);
                 return ReplayOutcome::Stopped(format!(
                     "dco 出错：{}（{}）",
                     scrub.line(&e.message),
                     scrub.line(&e.code)
-                ))
+                ));
             }
         };
     }

@@ -560,3 +560,161 @@ fn a_filled_composer_with_a_halt_word_does_not_stop_replay_help() {
     let st = j.1.borrow();
     assert!(!st[0].to_lowercase().contains("qr code"), "{}", st[0]);
 }
+
+fn x_setup() -> (Table, Value) {
+    (Table::seed(), x_proc(true))
+}
+
+#[test]
+fn a_closed_window_or_too_many_helps_is_a_stop_not_a_repair() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    for note in [
+        "窗口关了（stale）",
+        "窗口已经关了（stale）",
+        "要帮忙超过 8 次了，停下来交给用户",
+    ] {
+        let mut h = FakeHands::new();
+        let mut f = reply("r1", "failed", 3);
+        f.note = Some(note.into());
+        h.push_procedure(f);
+        let (j, mut u) = (jeff(None), U(None, vec![]));
+        let mut lad = Ladder {
+            jeff: &j,
+            model: &NoModel,
+            user: &mut u,
+            threshold: 0.8,
+        };
+        let out = replay(&mut h, &mut lad, input(&pr, p, false));
+        assert!(matches!(out, ReplayOutcome::Stopped(_)), "{note}: {out:?}");
+    }
+}
+
+#[test]
+fn an_earlier_steps_note_does_not_decide_the_failure_kind() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let mut h = FakeHands::new();
+    let mut f = reply("r1", "failed", 4);
+    f.note = Some("找不到「Post」".into());
+    f.raw = json!({"log": [{"n": 2, "note": "超时的弹窗已经关掉了"}]});
+    h.push_procedure(f);
+    let (j, mut u) = (jeff(None), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = replay(&mut h, &mut lad, input(&pr, p, false));
+    assert!(
+        matches!(out, ReplayOutcome::NeedsRepair { at_step: 4, .. }),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn stopped_on_a_non_preview_run_is_a_stop() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let mut h = FakeHands::new();
+    h.push_procedure(reply("r1", "stopped", 3));
+    let (j, mut u) = (jeff(None), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = replay(&mut h, &mut lad, input(&pr, p, false));
+    assert!(matches!(out, ReplayOutcome::Stopped(_)), "{out:?}");
+}
+
+#[test]
+fn an_answer_run_error_cancels_the_run() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let mut h = FakeHands::new();
+    h.push_procedure(help_reply("r1", 5, vec![el("e3", "Post", 0.1, 0.3)]));
+    h.answers.push_back(Err(dct_dco::DcoError {
+        code: "stale".into(),
+        message: "窗口关了".into(),
+    }));
+    let (j, mut u) = (jeff(Some(("e3", 0.95))), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = replay(&mut h, &mut lad, input(&pr, p, false));
+    assert!(matches!(out, ReplayOutcome::Stopped(_)), "{out:?}");
+    assert!(
+        h.calls.contains(&"cancel_run r1".to_string()),
+        "{:?}",
+        h.calls
+    );
+}
+
+#[test]
+fn already_done_on_a_preview_says_nothing_ran() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let mut h = FakeHands::new();
+    h.push_procedure(reply("r1", "already_done", 0));
+    let (j, mut u) = (jeff(None), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let ReplayOutcome::Stopped(m) = replay(&mut h, &mut lad, input(&pr, p, true)) else {
+        panic!()
+    };
+    assert!(m.contains("完成标志") && m.contains("没有跑"), "{m}");
+    assert!(!m.contains("跑到底了"), "{m}");
+}
+
+struct CapJ(RefCell<Vec<usize>>);
+impl Jeff for CapJ {
+    fn ask(&self, _: &str, q: &dct_explore::JevChoice) -> Option<JeffAnswer> {
+        self.0.borrow_mut().push(q.criteria.len());
+        assert!(q.criteria.iter().any(|(k, _)| k == "not_there"));
+        assert!(q.criteria.iter().any(|(k, _)| k == "stuck"));
+        None
+    }
+}
+struct CapU(Vec<usize>);
+impl User for CapU {
+    fn pick(&mut self, _: &str, all: &[Opt], _: Option<&str>, _: &str) -> Option<UserPick> {
+        self.0.push(all.len());
+        Some(UserPick {
+            key: "e3".into(),
+            name: None,
+        })
+    }
+}
+
+#[test]
+fn more_than_twenty_help_elements_jeff_sees_twenty_the_user_sees_all() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let els: Vec<El> = (0..25)
+        .map(|i| el(&format!("e{i}"), &format!("Item {i}"), 0.01 * i as f64, 0.5))
+        .collect();
+    let mut h = FakeHands::new();
+    h.push_procedure(help_reply("r1", 5, els));
+    h.push_answer(reply("r1", "done", 5));
+    let j = CapJ(RefCell::new(vec![]));
+    let mut u = CapU(vec![]);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    replay(&mut h, &mut lad, input(&pr, p, false));
+    assert_eq!(*j.0.borrow(), [20]);
+    assert_eq!(u.0, [27]);
+}
