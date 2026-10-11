@@ -28,6 +28,9 @@ dct —— vibe coding 终端
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct judge [文件] 给一道选择题（Jev 格式，文件或标准输入），输出每个选项的概率；
                    要先在 config.toml 写 [judge]。加 --probe 用固定题试后端通不通
+  dct campaign approve <名字> --param <平台>.<参数>=<值> ...
+                   一个活动要发的文字，各平台一次批准（要在终端里本人点头）；
+                   各平台文字和开头句不能相同。批过的存 ~/.dct/campaigns/
   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
   dct join <邀请码> [--name 电脑名]
@@ -132,6 +135,7 @@ fn main() -> Result<()> {
         // 玩三消游戏：连的是本机的 dco，不经守护进程。
         Some("game") => std::process::exit(dct::game::cli::run(&args[1..])),
         Some("judge") => std::process::exit(dct::judge::run_cli(&args[1..])),
+        Some("campaign") => std::process::exit(dct::campaign::run_cli(&args[1..])),
         Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),
         Some("procedure") => std::process::exit(dct::procedures::run_cli(&args[1..])),
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
