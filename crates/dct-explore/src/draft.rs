@@ -66,6 +66,24 @@ fn is_dismiss(arg: &str, dismiss: &[String]) -> bool {
     dismiss.iter().any(|d| fold(d) == a)
 }
 
+/// 名字里用的平台名：dcv 的名字只收小写字母、数字和 `-`（dc-vault note.rs `is_slug`），
+/// 平台名里的 `_` 换成 `-`（`--platform` 和弹窗的「应用」照旧用平台名本身）。
+fn name_part(p: &Platform) -> String {
+    p.name.replace('_', "-")
+}
+
+/// 流程名 `promote-<平台>-<post|video>`（重放时按这个名字找，写草稿也用它）。
+pub fn procedure_name(p: &Platform, video: bool) -> String {
+    let kind = if video { "video" } else { "post" };
+    format!("promote-{}-{kind}", name_part(p))
+}
+
+/// dcv 不收带网址的「看到」（dc-vault recipe.rs `has_url`）。
+fn has_url(s: &str) -> bool {
+    let low = s.to_lowercase();
+    low.contains("://") || low.contains("www.")
+}
+
 fn marker_ok(s: &str) -> bool {
     !s.contains('{') && !s.contains('}') && !s.contains('\n')
 }
@@ -115,16 +133,16 @@ pub fn draft(
                 .max_by_key(|v| v.chars().count())
                 .unwrap_or("");
             let n = seen.chars().count();
-            if (4..=200).contains(&n) && !seen.contains('\n') {
+            if (4..=200).contains(&n) && !seen.contains('\n') && !has_url(seen) {
                 // 名字 = 平台-弹窗文字的 ASCII 前缀-短哈希：中文弹窗前缀为空也不会撞名；
                 // 哈希同时算了点的字，名字相同就说明内容相同。
                 let sl: String = slug(seen).chars().take(24).collect();
                 let sl = sl.trim_matches('-');
                 let hash = short_hash(&[seen, &s.arg]);
                 let name = if sl.is_empty() {
-                    format!("{}-popup-{hash}", p.name)
+                    format!("{}-popup-{hash}", name_part(p))
                 } else {
-                    format!("{}-{sl}-{hash}", p.name)
+                    format!("{}-{sl}-{hash}", name_part(p))
                 };
                 if !pops.iter().any(|x| x.name == name) {
                     pops.push(PopupDraft {
@@ -137,12 +155,13 @@ pub fn draft(
                             s.arg.replace('"', "")
                         ),
                         learned_from: learned_from.clone(),
-                        body: format!("应用: {}\n看到: {}\n点: {}", p.browser, seen, s.arg),
+                        // 「应用」是平台名：dcv 按平台名核对、按平台名筛（dcv popups --app <平台>）。
+                        body: format!("应用: {}\n看到: {}\n点: {}", p.name, seen, s.arg),
                     });
                 }
             } else {
                 notes.push(format!(
-                    "点「{}」关掉的弹窗文字不合格（要 4 到 200 个字、一行），没能写成弹窗规则，也没进步骤",
+                    "点「{}」关掉的弹窗文字不合格（要 4 到 200 个字、一行、不带网址），没能写成弹窗规则，也没进步骤",
                     s.arg
                 ));
             }
@@ -210,7 +229,6 @@ pub fn draft(
     }
 
     let video = !file_params.is_empty();
-    let kind = if video { "video" } else { "post" };
     let what = if video {
         "一个视频"
     } else {
@@ -218,7 +236,7 @@ pub fn draft(
     };
     Ok((
         ProcedureDraft {
-            name: format!("promote-{}-{kind}", p.name),
+            name: procedure_name(p, video),
             vault: p.vault.clone(),
             description: format!("在 {} 上发{what}（dct 摸索学会，run:{}）", p.name, t.run_id),
             params: t.params.clone(),
@@ -309,7 +327,7 @@ mod tests {
         assert_eq!(pops.len(), 1);
         assert_eq!(
             pops[0].body,
-            "应用: Google Chrome\n看到: Turn on automatic content checks?\n点: Cancel"
+            "应用: tiktok\n看到: Turn on automatic content checks?\n点: Cancel"
         );
     }
 
@@ -499,6 +517,100 @@ mod tests {
         assert_eq!(pops.len(), 1);
         let (_, again) = draft(&tr, t.get("x").unwrap(), &dismiss(), &[]).unwrap();
         assert_eq!(pops[0].name, again[0].name);
+    }
+
+    // ---- 和 dcv 的契约：dct 生成的名字、弹窗正文要过 dcv 的检查（照抄 dc-vault 的规则） ----
+
+    /// dc-vault src/note.rs:302 `is_slug`
+    fn dcv_is_slug(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 80
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }
+
+    /// dc-vault src/procedure.rs:101 `check_platform`（流程的 platform、弹窗的「应用」都用它）
+    fn dcv_check_platform(v: &str) -> bool {
+        let b = v.as_bytes();
+        !b.is_empty()
+            && b.len() <= 32
+            && b[0].is_ascii_lowercase()
+            && b.iter().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_'
+            })
+    }
+
+    /// dc-vault src/popup.rs:296-400 `Popup::rule` 的开头几行：`应用`（第一行，check_platform）、
+    /// `看到`（4–200 个字、没有网址，popup.rs:20-23 / recipe.rs:137）、最后一行 `点`（最多 40 个字）。
+    /// `点` 是不是关弹窗的词由 dcv vocab 的 popup_dismiss 决定，dct 只用那张表里的词。
+    fn dcv_popup_body_ok(body: &str) -> Result<String, String> {
+        let lines: Vec<&str> = body.lines().collect();
+        let field = |l: &str| {
+            let i = l.find([':', '：'])?;
+            let c = l[i..].chars().next()?.len_utf8();
+            Some((l[..i].trim().to_string(), l[i + c..].trim().to_string()))
+        };
+        let (k, app) = field(lines.first().ok_or("空")?).ok_or("第一行看不懂")?;
+        if k != "应用" || !dcv_check_platform(&app) {
+            return Err(format!("应用 `{app}` 不过 check_platform"));
+        }
+        let (k, when) = field(lines.get(1).ok_or("缺看到")?).ok_or("看到看不懂")?;
+        let n = when.chars().count();
+        let low = when.to_lowercase();
+        if k != "看到" || !(4..=200).contains(&n) || low.contains("://") || low.contains("www.") {
+            return Err(format!("看到 `{when}` 不合格"));
+        }
+        let (k, tap) = field(lines.get(2).ok_or("缺点")?).ok_or("点看不懂")?;
+        if k != "点" || tap.chars().count() > 40 || lines.len() != 3 {
+            return Err(format!("点 `{tap}` 不合格"));
+        }
+        Ok(app)
+    }
+
+    #[test]
+    fn every_generated_name_and_popup_body_passes_dcvs_checks() {
+        let t = Table::seed();
+        for p in &t.rows {
+            let mut steps = vec![s("open_url", &p.entry_url, false, &[])];
+            steps.push(s(
+                "tap_by_intent",
+                "Cancel",
+                false,
+                &["Turn on automatic content checks?"],
+            ));
+            steps.push(s("tap_by_intent", "Not now", false, &["开启自动内容检查吗"]));
+            steps.push(s("tap_by_intent", &p.publish_words[0], true, &[]));
+            let mut tr = x_trace(steps);
+            tr.platform = p.name.clone();
+            let mut p = p.clone();
+            p.login_gate = Some("Gate".into());
+            tr.first_lines = vec!["Gate".into()];
+            for files in [&[][..], &["video".to_string()][..]] {
+                let (d, pops) = draft(&tr, &p, &dismiss(), files)
+                    .unwrap_or_else(|e| panic!("{}: {e:?}", p.name));
+                assert!(dcv_is_slug(&d.name), "流程名 {} 不是 dcv 的 slug", d.name);
+                assert!(dcv_check_platform(&d.platform), "{}", d.platform);
+                assert_eq!(pops.len(), 2, "{}", p.name);
+                for pop in &pops {
+                    assert!(dcv_is_slug(&pop.name), "弹窗名 {} 不是 dcv 的 slug", pop.name);
+                    let app = dcv_popup_body_ok(&pop.body)
+                        .unwrap_or_else(|e| panic!("{}: {e}\n{}", p.name, pop.body));
+                    // dcv popups --app <平台名> 按「应用」等于平台名筛（dc-vault popup.rs:487）
+                    assert_eq!(app, p.name, "dct 按平台名取弹窗规则");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_procedure_name_is_the_one_drive_looks_up() {
+        let t = Table::seed();
+        let p = t.get("wechat_mp").unwrap();
+        assert_eq!(procedure_name(p, false), "promote-wechat-mp-post");
+        assert_eq!(procedure_name(p, true), "promote-wechat-mp-video");
+        assert_eq!(procedure_name(t.get("x").unwrap(), false), "promote-x-post");
     }
 
     #[test]

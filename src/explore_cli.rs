@@ -291,12 +291,11 @@ pub fn drive(a: &DoArgs, p: &Platform, params: Params, env: Env) -> i32 {
         Ok(v) => v,
         Err(e) => return fin(say, 1, "error", &format!("dcv 出错：{e}"), json!({})),
     };
-    let kind = if file_params.is_empty() {
-        "post"
-    } else {
-        "video"
-    };
-    let full = format!("{}:promote-{}-{kind}", p.vault, p.name);
+    let full = format!(
+        "{}:{}",
+        p.vault,
+        dct_explore::draft::procedure_name(p, !file_params.is_empty())
+    );
     let approved = dcv
         .show(&full)
         .ok()
@@ -1151,8 +1150,8 @@ mod tests {
         h.push_procedure(reply("p1", "stopped", 2));
         let dcv = FakeDcv {
             shows: vec![(
-                "social-global:promote-wechat_mp-post".into(),
-                json!({"name": "promote-wechat_mp-post", "executable": true, "steps": [
+                "social-global:promote-wechat-mp-post".into(),
+                json!({"name": "promote-wechat-mp-post", "executable": true, "steps": [
                     {"n": 1, "action": "open_url", "arg": "https://mp.weixin.qq.com/"},
                     {"n": 2, "action": "tap_by_intent", "arg": "发布"}]}),
             )],

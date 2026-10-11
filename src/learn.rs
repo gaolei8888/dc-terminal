@@ -333,7 +333,7 @@ mod tests {
             vault: "social-global".into(),
             description: "弹窗".into(),
             learned_from: "run:x-20261011-1a2b".into(),
-            body: "应用: Chrome\n看到: Turn on notifications\n点: Not now".into(),
+            body: "应用: x\n看到: Turn on notifications\n点: Not now".into(),
         }
     }
 
@@ -468,7 +468,7 @@ mod tests {
             vault: "social-global".into(),
             description: "弹窗".into(),
             learned_from: "run:x-20261011-1a2b".into(),
-            body: "应用: Google Chrome\n看到: Turn on automatic content checks?\n点: Cancel".into(),
+            body: "应用: tiktok\n看到: Turn on automatic content checks?\n点: Cancel".into(),
         }
     }
 
