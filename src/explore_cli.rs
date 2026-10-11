@@ -566,61 +566,32 @@ impl Learn<'_, '_> {
 /// `~/.dct/config.toml`：没有这个文件 = 默认（什么都没配）；读不了、解析不了 = 错（退出码 2）。
 pub fn load_config(path: &std::path::Path) -> Result<crate::config::Config, String> {
     match std::fs::read_to_string(path) {
-        Ok(t) => {
-            toml::from_str::<crate::config::Config>(&t).map_err(|e| config_error_text(path, &t, &e))
-        }
+        Ok(t) => parse_config(&t).map_err(|(kind, at)| {
+            format!("{} 解析不了（{}{kind}）", path.display(), line_col(&t, at))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
         Err(e) => Err(format!("读不了 {}：{e}", path.display())),
     }
 }
 
-/// 配置错的提示：只给路径、行列和说明，不带原文（toml 自己的 Display 会把出错那一行抄出来，
-/// 那一行可能就是一把密钥）。说明里引号括起来的值（serde 的「invalid type: string "…"」）也换掉。
-fn config_error_text(path: &std::path::Path, text: &str, e: &toml::de::Error) -> String {
-    let at = e
-        .span()
-        .map(|sp| {
-            let before = text.get(..sp.start).unwrap_or(text);
-            let line = before.matches('\n').count() + 1;
-            let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-            format!("第 {line} 行第 {col} 列：")
-        })
-        .unwrap_or_default();
-    format!(
-        "{} 解析不了（{at}{}）",
-        path.display(),
-        scrub_toml_message(e.message())
-    )
+/// 先只按 TOML 语法读，过了再按配置的字段读：两步各自失败就知道是哪一类，不用看错误的字。
+/// 错误里只留位置（字节偏移）和固定的分类。toml / serde 的说明一律不要：里面会抄出出错那一行、
+/// 引号或反引号里的值（可能就是一把密钥）。
+fn parse_config(text: &str) -> Result<crate::config::Config, (&'static str, Option<usize>)> {
+    text.parse::<toml::Table>()
+        .map_err(|e| ("语法错误", e.span().map(|s| s.start)))?;
+    toml::from_str(text).map_err(|e| ("字段的值不对", e.span().map(|s| s.start)))
 }
 
-/// toml / serde 的说明里，引号里的一律是值（换成 `"…"`）；反引号里的是键名、词表里的词或值：
-/// 只留短的小写词（`cli`、`base_url`）和单个符号，其余换成 `` `…` ``。换行压成「；」。
-fn scrub_toml_message(m: &str) -> String {
-    let safe = |w: &str| {
-        (w.chars().count() == 1 && !w.chars().all(char::is_alphanumeric))
-            || (!w.is_empty()
-                && w.len() <= 24
-                && w.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+/// 字节偏移 → 「第 L 行第 C 列：」；不知道位置就空着。
+fn line_col(text: &str, at: Option<usize>) -> String {
+    let Some(at) = at else {
+        return String::new();
     };
-    let mut out = String::new();
-    let mut it = m.trim().chars();
-    while let Some(c) = it.next() {
-        match c {
-            '"' | '`' => {
-                let inner: String = it.by_ref().take_while(|x| *x != c).collect();
-                if c == '`' && safe(&inner) {
-                    out.push_str(&format!("`{inner}`"));
-                } else {
-                    out.push_str(&format!("{c}…{c}"));
-                }
-            }
-            '\n' => out.push('；'),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
+    let before = text.get(..at).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    format!("第 {line} 行第 {col} 列：")
 }
 
 /// 用户在 Touch ID 那一步取消了。`procedures::approve` 把 `SignError` 变成了同样的一句话
@@ -1589,38 +1560,59 @@ mod tests {
     fn a_config_error_names_the_line_but_never_echoes_the_file() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("config.toml");
-        // 语法错：toml 自己的 Display 会把这一行原样带出来
-        std::fs::write(
-            &f,
-            "[llm]\nprovider = \"claude\"\napi_key = sk-SECRET123 oops\n",
-        )
-        .unwrap();
-        let e = load_config(&f).unwrap_err();
-        assert!(e.contains(&f.display().to_string()), "{e}");
-        assert!(e.contains("第 3 行"), "{e}");
-        assert!(!e.contains("SECRET"), "{e}");
-        // 类型错：serde 的说明里会带上值
-        std::fs::write(
-            &f,
-            "[judge]\nbase_url = \"http://127.0.0.1:8765\"\nthreshold = \"sk-SECRET456\"\n",
-        )
-        .unwrap();
-        let e = load_config(&f).unwrap_err();
-        assert!(e.contains("第 3 行"), "{e}");
-        assert!(!e.contains("SECRET"), "{e}");
-        // 枚举值写错：serde 把值放在反引号里
-        std::fs::write(&f, "[llm]\ntransport = \"sk-SECRET789\"\n").unwrap();
-        let e = load_config(&f).unwrap_err();
-        assert!(e.contains("第 2 行"), "{e}");
-        assert!(!e.contains("SECRET"), "{e}");
-        assert!(e.contains("`cli`"), "词表里的短词照留：{e}");
-        // 说明一行写完，不吞掉后半句
-        std::fs::write(&f, "a = sk-SECRET000\n").unwrap();
-        let e = load_config(&f).unwrap_err();
-        assert!(
-            e.contains("expected") && !e.contains('\n') && !e.contains("SECRET"),
-            "{e}"
-        );
+        // (内容, 出错的行, 不许出现的字, 分类)
+        let cases: [(&str, usize, &[&str], &str); 5] = [
+            // 语法错：toml 自己的 Display 会把这一行原样带出来
+            (
+                "[llm]\nprovider = \"claude\"\napi_key = sk-SECRET123 oops\n",
+                3,
+                &["SECRET"],
+                "语法错误",
+            ),
+            // 类型错：serde 的说明里会带上值
+            (
+                "[judge]\nbase_url = \"http://127.0.0.1:8765\"\nthreshold = \"sk-SECRET456\"\n",
+                3,
+                &["SECRET"],
+                "字段的值不对",
+            ),
+            // 枚举值写错：值在反引号里
+            (
+                "[llm]\ntransport = \"sk-SECRET789\"\n",
+                2,
+                &["SECRET"],
+                "字段的值不对",
+            ),
+            // 值里有转义的引号
+            (
+                "[judge]\nbase_url = \"http://127.0.0.1:8765\"\nthreshold = \"ab\\\"cd\"\n",
+                3,
+                &["cd", "ab"],
+                "字段的值不对",
+            ),
+            // 数字形状的密钥写进了字符串字段
+            (
+                "[llm]\nprovider = 123456789012\n",
+                2,
+                &["123456789012", "12345"],
+                "字段的值不对",
+            ),
+        ];
+        for (text, line, banned, kind) in cases {
+            std::fs::write(&f, text).unwrap();
+            let e = load_config(&f).unwrap_err();
+            assert!(e.contains(&f.display().to_string()), "{e}");
+            assert!(e.contains(&format!("第 {line} 行")), "{e}");
+            assert!(e.contains(kind), "{e}");
+            let tail = e.strip_prefix(&f.display().to_string()).unwrap();
+            for b in banned {
+                assert!(!tail.contains(b), "{b} 漏出来了：{e}");
+            }
+            assert!(
+                !tail.contains("expected") && !tail.contains('`') && !tail.contains('"'),
+                "toml 的说明不要：{e}"
+            );
+        }
     }
 
     #[test]
