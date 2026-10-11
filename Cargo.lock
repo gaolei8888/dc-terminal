@@ -410,6 +410,7 @@ dependencies = [
  "base64",
  "crossterm",
  "dct-brain",
+ "dct-dco",
  "dct-explore",
  "dct-game",
  "dct-link",

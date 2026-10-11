@@ -373,12 +373,26 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 | `dct restart` | 把守护进程换成当前这个二进制（所有会话都会断；`-y` 不问） |
 | `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
 | `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
+| `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通 |
+| `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头）；各平台文字和开头句不能相同 |
+| `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索（每次最终发布前先问你），写成流程草稿，给你看确认卡片（按指纹确认）。开着好几个浏览器窗口要用 `--window` 指定；`--json` 一行一个事件给 dc.ai 读，回答从标准输入读 |
 | `dct daemon` | 只跑守护进程，不开看板 |
 | `dct gate` | [浏览器里的 dct](#浏览器里的-dct) 前面那道门 |
 | `dct --version` | 看装的是哪一版 |
 
 `ps`、`stop`、`kill`、`prune` 绝不拉起守护进程：问「有没有东西在跑」，不该把答案从
 「没有」变成「有」。`restart` 会拉起一个，因为你要的就是「后台跑着新的」。
+
+`dct judge` 和 `dct do` 里问 Jeff 那一级，要在 `~/.dct/config.toml` 里写 `[judge]`，
+指向一个开着的 `jeff-serve`：
+
+```toml
+[judge]
+base_url = "http://127.0.0.1:8765"
+# threshold = 0.8   # Jeff 把握低于这个数，dct do 就去问 [llm] 的大模型，再不行问你
+```
+
+没写 `[judge]`，`dct do` 就跳过 Jeff；没写 `[llm]`，也跳过大模型。最后问的永远是你。
 
 ---
 

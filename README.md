@@ -432,6 +432,9 @@ Everything else:
 | `dct restart` | swap in the current binary as the daemon (ends every session; `-y` skips the question) |
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
+| `dct judge [file]` / `--probe` | ask the `[judge]` backend (Jeff's `jeff-serve`) one multiple-choice question in Jev format and print each option's probability; `--probe` sends a fixed question to see if it answers |
+| `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you; texts (and their opening sentences) must differ per platform |
+| `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco (Mac): replay the confirmed procedure if there is one, otherwise explore (asking you before every final publish tap), write a draft procedure and show you a card to confirm with Touch ID. Several browser windows open → pass `--window`; `--json` prints one event per line for dc.ai and reads answers from stdin |
 | `dct daemon` | run only the daemon, no board |
 | `dct gate` | the door in front of [dct in a browser](#dct-in-a-browser) |
 | `dct --version` | which one you have |
@@ -439,6 +442,18 @@ Everything else:
 `ps`, `stop`, `kill` and `prune` never start a daemon: asking "is anything
 running?" shouldn't turn the answer from no into yes. `restart` does start one,
 because what you asked for is a daemon running the new binary.
+
+`dct judge` and the Jeff step of `dct do` need a `[judge]` section in
+`~/.dct/config.toml`, pointing at a running `jeff-serve`:
+
+```toml
+[judge]
+base_url = "http://127.0.0.1:8765"
+# threshold = 0.8   # below this, dct do asks the [llm] model, then you
+```
+
+Without `[judge]`, `dct do` skips Jeff; without `[llm]`, it skips the model too.
+You are always the last one asked.
 
 ---
 

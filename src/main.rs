@@ -31,6 +31,10 @@ dct —— vibe coding 终端
   dct campaign approve <名字> --param <平台>.<参数>=<值> ...
                    一个活动要发的文字，各平台一次批准（要在终端里本人点头）；
                    各平台文字和开头句不能相同。批过的存 ~/.dct/campaigns/
+  dct do \"<目标>\" --platform <平台> --campaign <活动名> [--window <窗口号>] [--preview] [--json]
+                   用批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索
+                   （每次最终发布前先问你），写成草稿给你确认（要按指纹）。
+                   开着好几个浏览器窗口时要 --window 指定；--json 一行一个事件
   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
   dct join <邀请码> [--name 电脑名]
@@ -136,6 +140,7 @@ fn main() -> Result<()> {
         Some("game") => std::process::exit(dct::game::cli::run(&args[1..])),
         Some("judge") => std::process::exit(dct::judge::run_cli(&args[1..])),
         Some("campaign") => std::process::exit(dct::campaign::run_cli(&args[1..])),
+        Some("do") => std::process::exit(dct::explore_cli::run(&args[1..])),
         Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),
         Some("procedure") => std::process::exit(dct::procedures::run_cli(&args[1..])),
         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
