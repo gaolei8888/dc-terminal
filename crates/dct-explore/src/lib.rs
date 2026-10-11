@@ -2,6 +2,7 @@
 //! 上层逻辑对着 `testing::FakeHands` 测，不碰真屏幕。
 pub mod gate;
 pub mod hands;
+pub mod ladder;
 pub mod options;
 pub mod platform;
 #[cfg(any(test, feature = "fake"))]
