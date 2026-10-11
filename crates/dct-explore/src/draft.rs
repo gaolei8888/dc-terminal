@@ -537,9 +537,8 @@ mod tests {
         !b.is_empty()
             && b.len() <= 32
             && b[0].is_ascii_lowercase()
-            && b.iter().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_'
-            })
+            && b.iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
     }
 
     /// dc-vault src/popup.rs:296-400 `Popup::rule` 的开头几行：`应用`（第一行，check_platform）、
@@ -580,7 +579,12 @@ mod tests {
                 false,
                 &["Turn on automatic content checks?"],
             ));
-            steps.push(s("tap_by_intent", "Not now", false, &["开启自动内容检查吗"]));
+            steps.push(s(
+                "tap_by_intent",
+                "Not now",
+                false,
+                &["开启自动内容检查吗"],
+            ));
             steps.push(s("tap_by_intent", &p.publish_words[0], true, &[]));
             let mut tr = x_trace(steps);
             tr.platform = p.name.clone();
@@ -594,7 +598,11 @@ mod tests {
                 assert!(dcv_check_platform(&d.platform), "{}", d.platform);
                 assert_eq!(pops.len(), 2, "{}", p.name);
                 for pop in &pops {
-                    assert!(dcv_is_slug(&pop.name), "弹窗名 {} 不是 dcv 的 slug", pop.name);
+                    assert!(
+                        dcv_is_slug(&pop.name),
+                        "弹窗名 {} 不是 dcv 的 slug",
+                        pop.name
+                    );
                     let app = dcv_popup_body_ok(&pop.body)
                         .unwrap_or_else(|e| panic!("{}: {e}\n{}", p.name, pop.body));
                     // dcv popups --app <平台名> 按「应用」等于平台名筛（dc-vault popup.rs:487）
