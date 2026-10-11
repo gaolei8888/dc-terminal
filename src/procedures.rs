@@ -679,7 +679,7 @@ mod tests {
         let made = std::process::Command::new("dcv").args(["vault", "new", "social-global"]).output().unwrap();
         assert!(made.status.success(), "临时库建不起来");
         // 正文用 D11 生成的形状手写一份（完整轨迹的生成在 dct-explore 的测试里覆盖）。
-        let body = "1. open_url: https://x.com/compose/post\n2. verify_text: Home\n3. tap_by_intent: Post\n   完成标志: 页面不再显示 Post\n";
+        let body = "1. open_url: https://x.com/compose/post\n2. verify_text: Home\n3. tap_by_intent: Post\n   完成标志: verify_text 「Your post was sent」\n";
         let params: Vec<String> = vec![];
         let r = AddReq {
             kind: AddKind::Procedure,
