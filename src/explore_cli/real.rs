@@ -101,7 +101,11 @@ mod unix {
     pub fn run(a: &DoArgs, early: &dyn Fn(i32, &str) -> i32) -> i32 {
         let socket = crate::proto::socket_path();
         let dct_dir = socket.parent().map(PathBuf::from).unwrap_or_default();
-        let cfg = Config::load(&crate::config::config_path_for_socket(&socket));
+        // 配置坏了要说出来（退出码 2），不能像 Config::load 那样悄悄当没配。
+        let cfg = match load_config(&crate::config::config_path_for_socket(&socket)) {
+            Ok(c) => c,
+            Err(m) => return early(2, &m),
+        };
         let table = match platforms(&dct_dir) {
             Ok(t) => t,
             Err(m) => return early(2, &m),

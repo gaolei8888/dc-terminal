@@ -542,6 +542,13 @@ impl Learn<'_, '_> {
                 &format!("没确认；草稿 {} 留在 dcv 里，没有生效", w.procedure),
                 json!({"procedure": w.procedure}),
             ),
+            Err(e) if touch_id_cancelled(&e) => fin(
+                say,
+                3,
+                "declined",
+                &format!("没有按指纹确认；草稿 {} 留在 dcv 里，没有生效", w.procedure),
+                json!({"procedure": w.procedure}),
+            ),
             Err(e) => fin(
                 say,
                 1,
@@ -556,19 +563,37 @@ impl Learn<'_, '_> {
     }
 }
 
+/// `~/.dct/config.toml`：没有这个文件 = 默认（什么都没配）；读不了、解析不了 = 错（退出码 2）。
+pub fn load_config(path: &std::path::Path) -> Result<crate::config::Config, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => crate::config::Config::from_toml(&t)
+            .map_err(|e| format!("{} 解析不了：{e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(format!("读不了 {}：{e}", path.display())),
+    }
+}
+
+/// 用户在 Touch ID 那一步取消了。`procedures::approve` 把 `SignError` 变成了同样的一句话
+/// （`anyhow!("{e}")`），所以按那句话认；认不出的一律当出错（退出码 1）。
+fn touch_id_cancelled(e: &anyhow::Error) -> bool {
+    let cancelled = dct_brain::sign::SignError::Cancelled.to_string();
+    e.chain().any(|c| c.to_string() == cancelled)
+}
+
 fn dco_text(e: &dct_dco::DcoError) -> String {
     crate::game::text::dco_error(e)
 }
 
 pub fn run(args: &[String]) -> i32 {
     let json_mode = args.iter().any(|a| a == "--json");
+    // 还没连上任何东西时的错：--json 照样是一行事件（stdout），终端模式写 stderr。
     let say_early = |code: i32, text: &str| -> i32 {
-        if json_mode {
-            let v = json!({"event": "error", "message": text, "exit": code});
-            println!("{v}");
+        let w: Box<dyn std::io::Write> = if json_mode {
+            Box::new(std::io::stdout())
         } else {
-            eprintln!("{text}");
-        }
+            Box::new(std::io::stderr())
+        };
+        Talk::new(std::io::empty(), w, json_mode, None).tell("error", text, json!({"exit": code}));
         code
     };
     let a = match parse(args) {
@@ -815,12 +840,8 @@ mod tests {
         }
     }
 
-    struct NoJeff;
-    impl Jeff for NoJeff {
-        fn ask(&self, _: &str, _: &dct_explore::JevChoice) -> Option<JeffAnswer> {
-            None
-        }
-    }
+    use super::{NoFix, NoJeff};
+
     struct SureJeff(Vec<&'static str>, RefCell<usize>);
     impl Jeff for SureJeff {
         fn ask(&self, _: &str, _: &dct_explore::JevChoice) -> Option<JeffAnswer> {
@@ -831,12 +852,6 @@ mod tests {
                 probabilities: vec![(k.to_string(), 0.95)],
                 answer_confidence: 0.95,
             })
-        }
-    }
-    struct NoFix;
-    impl Fixer for NoFix {
-        fn fix(&self, _: &str, _: &str) -> Option<String> {
-            None
         }
     }
     struct T0;
@@ -955,6 +970,21 @@ mod tests {
         params: Params,
         d: &std::path::Path,
     ) -> Ran {
+        go_with(a, platform, h, dcv, jeff, input, params, d, &mut |_| Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn go_with(
+        a: &DoArgs,
+        platform: &str,
+        h: &mut FakeHands,
+        dcv: &FakeDcv,
+        jeff: &dyn Jeff,
+        input: &str,
+        params: Params,
+        d: &std::path::Path,
+        approve_result: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+    ) -> Ran {
         let t = Table::seed();
         let p = t.get(platform).unwrap().clone();
         let talk = RefCell::new(Talk::new(
@@ -966,7 +996,7 @@ mod tests {
         let mut approved = Vec::new();
         let mut approve = |n: &str| {
             approved.push(n.to_string());
-            Ok(())
+            approve_result(n)
         };
         let code = drive(
             a,
@@ -1405,5 +1435,134 @@ mod tests {
         assert!(lines.last().unwrap().ends_with("[y/N]"));
         assert_eq!(c.json["publish_by_user_only"], true);
         assert!(c.json["publish_note"].as_str().unwrap().contains("自己点"));
+    }
+
+    /// 修补：已有正式流程走不通 → 接着摸索 → 新草稿（draft_of 原名）。
+    fn script_repair(h: &mut FakeHands) -> FakeDcv {
+        chrome(h);
+        let mut failed = reply("p1", "failed", 2);
+        failed.note = Some("找不到 Compose".into());
+        h.push_procedure(failed);
+        h.push_look(composer("a"));
+        h.push_step(reply("r1", "done", 1));
+        h.push_step(reply("r2", "done", 1));
+        h.push_look(filled("b"));
+        h.push_look(filled("b")); // 编号图
+        h.push_step(reply("r3", "done", 1));
+        h.push_look(sent("c"));
+        FakeDcv {
+            shows: vec![(
+                "social-global:promote-x-post".into(),
+                json!({"name": "promote-x-post", "executable": true, "steps": [
+                    {"n": 1, "action": "open_url", "arg": "https://x.com/compose/post"},
+                    {"n": 2, "action": "tap_by_intent", "arg": "Compose"},
+                    {"n": 3, "action": "tap_by_intent", "arg": "Post"}]}),
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_repaired_draft_is_approved_under_its_new_name_never_the_original() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::new();
+        let dcv = script_repair(&mut h);
+        let r = go(
+            &args(false),
+            "x",
+            &mut h,
+            &dcv,
+            &x_jeff(),
+            "y\ny\n",
+            params(),
+            d.path(),
+        );
+        assert_eq!(r.code, 0, "{}", r.out);
+        let adds = dcv.adds.borrow();
+        assert!(
+            adds[0]
+                .windows(2)
+                .any(|w| w == ["--name", "promote-x-post-0001"]),
+            "{:?}",
+            adds[0]
+        );
+        assert!(adds[0]
+            .windows(2)
+            .any(|w| w == ["--draft-of", "promote-x-post"]));
+        assert_eq!(r.approved, ["social-global:promote-x-post-0001"]);
+    }
+
+    #[test]
+    fn a_cancelled_touch_id_is_the_user_saying_no() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::new();
+        script_x_explore(&mut h);
+        // procedures::approve 把 SignError 变成同样的一句话（anyhow!("{e}")）。
+        let mut cancelled = |_: &str| -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("{}", dct_brain::sign::SignError::Cancelled))
+        };
+        let r = go_with(
+            &args(true),
+            "x",
+            &mut h,
+            &FakeDcv::default(),
+            &x_jeff(),
+            "{\"verdict\":\"yes\"}\n{\"verdict\":\"yes\"}\n",
+            params(),
+            d.path(),
+            &mut cancelled,
+        );
+        assert_eq!(r.code, 3, "{}", r.out);
+        let last: Value = serde_json::from_str(r.out.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "declined");
+
+        let mut h = FakeHands::new();
+        script_x_explore(&mut h);
+        let mut broken = |_: &str| -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("确认流程失败：dcv 挂了"))
+        };
+        let r = go_with(
+            &args(false),
+            "x",
+            &mut h,
+            &FakeDcv::default(),
+            &x_jeff(),
+            "y\ny\n",
+            params(),
+            d.path(),
+            &mut broken,
+        );
+        assert_eq!(r.code, 1, "别的错还是 1：{}", r.out);
+    }
+
+    #[test]
+    fn config_missing_is_defaults_and_unparsable_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let c = load_config(&d.path().join("config.toml")).unwrap();
+        assert!(c.judge.is_none() && c.llm.is_none());
+        let f = d.path().join("bad.toml");
+        std::fs::write(&f, "[judge\nbase_url = ").unwrap();
+        let e = load_config(&f).unwrap_err();
+        assert!(e.contains("bad.toml"), "{e}");
+        std::fs::write(&f, "[judge]\nbase_url = \"http://127.0.0.1:8765\"\n").unwrap();
+        assert!(load_config(&f).unwrap().judge.is_some());
+    }
+
+    #[test]
+    fn dct_do_writes_to_stdout_only_through_say() {
+        // --json 时 stdout 只能有事件：这几个文件里不许直接 print / println。
+        let main = include_str!("explore_cli.rs");
+        let main = &main[..main.find("#[cfg(test)]\nmod tests").unwrap()];
+        let io = include_str!("explore_cli/io.rs");
+        let io = &io[..io.find("#[cfg(test)]\nmod tests").unwrap()];
+        for (name, src) in [
+            ("explore_cli.rs", main),
+            ("io.rs", io),
+            ("real.rs", include_str!("explore_cli/real.rs")),
+        ] {
+            for bad in ["println!(", "print!(", "dbg!("] {
+                assert!(!src.contains(bad), "{name} 里有 {bad}");
+            }
+        }
     }
 }
