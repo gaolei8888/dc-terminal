@@ -13,7 +13,7 @@
 //!   由用户自己点发布；找不到发布那一步 → `Stopped`，绝不跑到底。预览时 dco 若没停就跑完了 → `Stopped`（如实说）。
 use crate::explore::raw::Raw;
 use crate::explore::screen::Scrub;
-use crate::gate::{fold, tappable};
+use crate::gate::{check_icon_name, fold, tappable, IconName};
 use crate::hands::{By, El, Hands, HelpAnswer, Params, RunReply};
 use crate::ladder::{Ladder, Tries, Who};
 use crate::options::{neighbour_hint, Act, Opt};
@@ -367,16 +367,34 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
             }
             NOT_THERE => HelpAnswer::NotThere,
             key => match pickable.iter().find(|e| e.id == key) {
-                Some(e) => HelpAnswer::Element {
-                    id: e.id.clone(),
-                    by,
-                    name: dec
+                Some(e) => {
+                    let name = dec
                         .name
                         .as_deref()
                         .map(|n| scrub.line(n))
-                        .filter(|n| !scrub.has_placeholder(n)),
-                    dismiss: false,
-                },
+                        .filter(|n| !scrub.has_placeholder(n));
+                    // 名字是 dco 以后按字去点的：禁点词、档位、坏字符不收；发布词也不收
+                    // （重放求助中途没法问发不发，发布那一步本身是流程里写好的字）。
+                    let bad =
+                        name.as_deref()
+                            .and_then(|n| match check_icon_name(n, input.platform) {
+                                IconName::Refused(why) => Some(why),
+                                IconName::Publish => Some("名字是发布词".into()),
+                                IconName::Ok => None,
+                            });
+                    if let Some(why) = bad {
+                        let _ = h.cancel_run(&run_id);
+                        return ReplayOutcome::Stopped(format!(
+                            "求助时给图标起的名字不能交给 dco（{why}），停下"
+                        ));
+                    }
+                    HelpAnswer::Element {
+                        id: e.id.clone(),
+                        by,
+                        name,
+                        dismiss: false,
+                    }
+                }
                 None => {
                     let _ = h.cancel_run(&run_id);
                     return ReplayOutcome::Stopped(format!("选的「{key}」不在求助的画面里，停下"));

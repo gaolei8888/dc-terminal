@@ -858,7 +858,8 @@ fn a_value_split_or_recased_by_ocr_never_leaves_the_process() {
         "answers.jsonl",
     );
     let states = j.states.borrow();
-    assert_eq!(states.len(), 3);
+    // 发布那一下落到新画面就算发完，不再问第三题（「做完」）。
+    assert_eq!(states.len(), 2);
     for s in states.iter() {
         assert_no_fragment(s, V, "给 Jeff 的 state");
     }
@@ -1761,4 +1762,248 @@ fn a_heading_with_a_trailing_dot_is_not_a_link() {
         ],
         "Login-required.",
     );
+}
+
+// ---- 图标的名字：名字会被 dco 当成要点的字，所以和画面上的字一样要过禁点、发布的规矩 ----
+
+/// 字已经在发帖框里，旁边一个没字的图标 e5。
+fn filled_with_icon(hash: &str) -> Look {
+    look(
+        hash,
+        vec![
+            el("e2", TEXT, "textarea", 0.45, 0.25),
+            el("e5", "", "image", 0.3, 0.35),
+        ],
+    )
+}
+
+fn named_icon_run(
+    platform: &str,
+    name: &'static str,
+    confirm: &mut dyn Confirm,
+    more_steps: Vec<RunReply>,
+    more_looks: Vec<Look>,
+) -> (Outcome, FakeHands) {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(filled_with_icon("a"));
+    h.push_look(filled_with_icon("a")); // 编号图（问用户；问发不发时用同一张）
+    for r in more_steps {
+        h.push_step(r);
+    }
+    for l in more_looks {
+        h.push_look(l);
+    }
+    let (j, m, mut u) = (NoJeff, NoModel, ScriptUser(vec![("e5", Some(name))], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        confirm,
+        &T0,
+        input_for(&t, platform, d.path()),
+    );
+    (out, h)
+}
+
+#[test]
+fn an_icon_named_with_a_publish_word_asks_before_it_is_tapped() {
+    let mut said = Answers(vec![false], 0);
+    let (out, h) = named_icon_run("x", "Post", &mut said, vec![], vec![]);
+    assert!(matches!(out, Outcome::DeclinedAtPublish(_)), "{out:?}");
+    assert_eq!(said.1, 1, "叫「Post」的图标就是发布：先问");
+    assert_eq!(
+        count(&h, "run_step tap_by_intent: Post"),
+        0,
+        "{:?}",
+        h.calls
+    );
+}
+
+#[test]
+fn an_icon_named_with_a_publish_word_is_published_after_yes() {
+    let mut yes = Yes(0);
+    let (out, h) = named_icon_run("x", "post", &mut yes, vec![done("r1")], vec![sent("b")]);
+    assert_eq!(yes.0, 1);
+    assert_eq!(
+        count(&h, "run_step tap_by_intent: post"),
+        1,
+        "{:?}",
+        h.calls
+    );
+    match out {
+        Outcome::Published(tr) => assert!(tr.steps.last().unwrap().publish),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_icon_named_with_a_publish_word_on_a_by_user_platform_is_never_tapped() {
+    let mut said = Said(vec![]);
+    let (out, h) = named_icon_run(
+        "wechat_mp",
+        "发布",
+        &mut said,
+        vec![],
+        vec![look("b", vec![el("e1", "已发布", "text", 0.4, 0.4)])],
+    );
+    assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
+    assert!(said.0.iter().any(|s| s.contains("自己")), "{:?}", said.0);
+    assert!(matches!(out, Outcome::Published(_)), "{out:?}");
+}
+
+#[test]
+fn an_icon_named_with_a_banned_word_or_a_bad_name_is_refused() {
+    for name in [
+        "Follow",
+        "Boost",
+        "关注",
+        "Delete",
+        "a name that is far too long to be the label of any icon at all",
+        "Add\u{202E}photo",
+        // 换行在脱敏时已压成空格（scrub.line），看不见的字符压不掉：拒。
+        "Add\u{200B}photo",
+    ] {
+        let (out, h) = named_icon_run("x", name, &mut Yes(0), vec![], vec![]);
+        assert!(matches!(out, Outcome::Stopped { .. }), "{name:?}: {out:?}");
+        assert_eq!(
+            h.step_calls.len(),
+            1,
+            "{name:?}: 只有 open_url：{:?}",
+            h.calls
+        );
+    }
+}
+
+#[test]
+fn an_icon_named_publish_before_the_post_is_on_screen_is_not_tapped() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e2", "What's happening?", "textarea", 0.45, 0.25),
+                el("e5", "", "image", 0.3, 0.35),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图
+    let (j, m, mut u) = (NoJeff, NoModel, ScriptUser(vec![("e5", Some("Post"))], 0));
+    let mut yes = Yes(0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut yes, &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    assert_eq!(yes.0, 0);
+    assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
+}
+
+#[test]
+fn a_help_answer_naming_an_icon_with_a_banned_or_publish_word_is_refused() {
+    for name in ["Follow", "Post"] {
+        let t = Table::seed();
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::default();
+        h.push_step(done("r0"));
+        h.push_look(composer("a"));
+        // Jeff 选 Drafts；dco 找不到，求助的画面上有个没字的图标，用户在求助时给它起名。
+        h.push_step(needs_help(
+            "r1",
+            "Drafts",
+            vec![
+                el("e11", "", "image", 0.1, 0.1),
+                el("e12", "Drafts", "button", 0.9, 0.9),
+            ],
+        ));
+        let (j, m, mut u) = (
+            sure(vec!["e5"]),
+            NoModel,
+            ScriptUser(vec![("e11", Some(name))], 0),
+        );
+        let mut lad = Ladder {
+            jeff: &j,
+            model: &m,
+            user: &mut u,
+            threshold: 0.8,
+        };
+        let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+        assert!(matches!(out, Outcome::Stopped { .. }), "{name}: {out:?}");
+        assert!(h.sent_answers.is_empty(), "{name}: {:?}", h.calls);
+        assert_eq!(count(&h, "cancel_run r1"), 1, "{name}: {:?}", h.calls);
+    }
+}
+
+// ---- 发布那一下落到新画面就算发出去了：不再走一轮、不再看上限 ----
+
+struct SlowClock(std::rc::Rc<std::cell::Cell<u64>>);
+impl Clock for SlowClock {
+    fn now_ms(&self) -> u64 {
+        self.0.get()
+    }
+}
+/// 用户想了 11 分钟才说发。
+struct SlowYes(std::rc::Rc<std::cell::Cell<u64>>);
+impl Confirm for SlowYes {
+    fn publish_ok(&mut self, _: Option<&str>, _: &str) -> bool {
+        self.0.set(self.0.get() + 11 * 60_000);
+        true
+    }
+}
+
+fn publish_lands(confirm: &mut dyn Confirm, clock: &dyn Clock) -> (Outcome, FakeHands) {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer_filled("a"));
+    h.push_look(composer_filled("a")); // 编号图（问发不发）
+    h.push_step(done("r1")); // tap Post
+    h.push_look(sent("b"));
+    // 之后没人可问：Jeff 只答一次，没有大模型、没有用户。
+    let (j, m, mut u) = (sure(vec!["e3"]), NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, confirm, clock, input(&t, d.path()));
+    (out, h)
+}
+
+#[test]
+fn a_publish_that_lands_on_a_new_screen_is_published_at_once() {
+    let (out, h) = publish_lands(&mut Yes(0), &T0);
+    match out {
+        Outcome::Published(tr) => {
+            let s = tr.steps.last().unwrap();
+            assert!(s.publish && s.ok, "{s:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(count(&h, "run_step tap_by_intent: Post"), 1);
+    assert!(h.looks.is_empty() && h.steps.is_empty());
+}
+
+#[test]
+fn a_slow_publish_confirmation_does_not_turn_a_sent_post_into_a_stop() {
+    let now = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (out, _) = publish_lands(&mut SlowYes(now.clone()), &SlowClock(now.clone()));
+    assert!(now.get() > 600_000);
+    assert!(matches!(out, Outcome::Published(_)), "{out:?}");
 }

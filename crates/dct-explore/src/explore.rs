@@ -9,14 +9,14 @@
 //! 3. `Meter::over` → `Stopped`。
 //! 4. 选项（`all_options` / `shortlist`）→ `Ladder::decide`；编号图只在真要问大模型或用户时才
 //!    `look(marks: true)` 去拿（见 `act::decide`）。用户说停 → `Stopped`；用户给的 key 不在选项里 → `Stopped`，不执行。
-//! 5. `Done` → `Published`；`Stuck` → `Stopped`。
+//! 5. `Done` → `Published`；`Stuck` → `Stopped`。发布那一下落到新画面也直接 `Published`（见 8）。
 //! 6. 选中的是发布：每一次都先 `Confirm::publish_ok`；不 → `DeclinedAtPublish`。
 //!    平台 `publish_by_user_only`：dct 不点，请用户自己点，点完说「是」，轨迹记成用户点的。
 //! 7. `steps_for` → 逐步 `run_step`（`act::execute`：求助、拦下、失败的处理都在那里；
 //!    求助的画面也先过 `screen_halt`，命中就取消 dco 的运行 → `Halted`，不给任何人选）。
 //! 8. 执行后 `look`：scene_hash 和执行前一样、或是这次运行里见过的画面 → 失败：记在**选它的那个画面**
 //!    的 `Tries` 上（每个画面一份，绕回来也还在，所以 A↔B 来回绕时第二圈就交给大模型 / 用户）。
-//!    变了（新画面）→ 记 `TraceStep`、更新 `Progress`、写一行训练题。
+//!    变了（新画面）→ 记 `TraceStep`、更新 `Progress`、写一行训练题；这一下是发布 → `Published`。
 //!
 //!    轨迹怎么记做了但没起作用的一下：照实记，`ok: false`。绕回见过的画面 S 时，轨迹里每步的 `ok`
 //!    和 `Progress` 恢复成上一次站在 S 时的样子——从 S 出发绕一圈又回到 S 的那几步一起变成
@@ -30,7 +30,7 @@ mod run;
 pub(crate) mod screen;
 mod scrub;
 
-use crate::gate::{Budget, Halt, Over};
+use crate::gate::{check_icon_name, Budget, Halt, IconName, Over};
 use crate::hands::{Hands, Params, StepReq};
 use crate::ladder::{Decision, Ladder, Who};
 use crate::options::{shortlist, state_text, Act, Goal};
@@ -82,6 +82,14 @@ fn over_text(o: Over, b: &Budget) -> String {
         Over::Steps => format!("已经走了 {} 步，到上限了", b.max_steps),
         Over::Time => format!("摸索超过 {} 分钟，到上限了", b.max_ms / 60_000),
         Over::Unchanged => format!("连续 {} 步画面没变，停下", b.max_unchanged),
+    }
+}
+
+/// 发布那一下之后的新画面：停下的画面照样 `Halted`，否则 `Published`。
+fn published_or_halted(trace: Trace, post: &screen::Screen, scrub: &Scrub) -> Outcome {
+    match post.halt(scrub) {
+        Some(why) => Outcome::Halted { trace, why },
+        None => Outcome::Published(trace),
     }
 }
 
@@ -188,8 +196,28 @@ pub fn explore_from(
                 return r.stop("图标的名字里是要发的内容，不能当名字交给 dco，停下".into());
             }
             *name = given.or(name.take()).filter(|n| !n.trim().is_empty());
-            if name.is_none() {
+            let Some(n) = name.as_deref() else {
                 return r.stop("选了一个没字的图标，但没给它起名字，没法交给 dco".into());
+            };
+            // dco 按名字去点画面上的字：名字和画面上的字守同样的规矩（不回显名字本身）。
+            match check_icon_name(n, input.platform) {
+                IconName::Refused(why) => {
+                    return r.stop(format!("给图标起的名字不能交给 dco（{why}），停下"))
+                }
+                IconName::Publish => {
+                    let ready = input.text_params.iter().all(|p| on(p))
+                        && input
+                            .file_params
+                            .iter()
+                            .all(|p| r.prog.attached.contains(p));
+                    if !ready {
+                        return r.stop(
+                            "给图标起的名字是发布词，可要发的内容还没全在画面上，不点，停下".into(),
+                        );
+                    }
+                    opt.publish = true;
+                }
+                IconName::Ok => {}
             }
         }
         // 5. 做完 / 卡住
@@ -219,6 +247,7 @@ pub fn explore_from(
             }
             let word = match &opt.act {
                 Act::Tap { intent, .. } => intent.clone(),
+                Act::TapIcon { name: Some(n), .. } => n.clone(),
                 _ => opt.text.clone(),
             };
             let summary = if by_user {
@@ -247,7 +276,9 @@ pub fn explore_from(
                     by: Who::User,
                     ..dec.clone()
                 };
-                r.meter.record(post.key != cur.key);
+                let changed = post.key != cur.key;
+                let fresh = changed && !r.seen(&post.key);
+                r.meter.record(changed);
                 row(&dec, fj);
                 record(
                     &mut r,
@@ -259,6 +290,10 @@ pub fn explore_from(
                     true,
                 );
                 advance(&mut r, &opt);
+                if fresh {
+                    // 用户点完发布、画面换了：发出去了（换成登录 / 验证码 / 警告画面的不算）。
+                    return published_or_halted(r.trace, &post, &scrub);
+                }
                 cur = post;
                 continue;
             }
@@ -287,6 +322,12 @@ pub fn explore_from(
                 row(&dec, fj);
                 record(&mut r, &cur, &post, &opt, &dec, steps, true);
                 advance(&mut r, &opt);
+                if opt.publish {
+                    // 发布那一下落到了新画面：发出去了。不再走一轮去等「做完」，也不再看上限
+                    // （用户想发不发的那段时间算在上限里，不能把发出去的说成停下）。
+                    // 新画面是登录 / 验证码 / 警告的照样停下。
+                    return published_or_halted(r.trace, &post, &scrub);
+                }
             }
             Some(steps) => {
                 // 做了，但画面没变或绕回了见过的画面：照实记成 ok: false，失败记在选它的画面上。

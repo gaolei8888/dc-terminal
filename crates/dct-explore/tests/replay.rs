@@ -761,3 +761,47 @@ fn replay_help_before_the_post_is_typed_still_offers_the_composer() {
         j.1.borrow()[0]
     );
 }
+
+/// 大模型给求助画面上没字的图标起名。
+struct Named(&'static str, &'static str);
+impl Model for Named {
+    fn pick(&self, _: &str, _: &[Opt], _: Option<&str>) -> Option<ModelPick> {
+        Some(ModelPick {
+            key: self.0.into(),
+            name: Some(self.1.into()),
+        })
+    }
+}
+
+#[test]
+fn a_replay_help_name_that_is_banned_or_a_publish_word_is_refused() {
+    for name in ["Follow", "Post", "Add\u{202E}photo"] {
+        let (t, pr) = x_setup();
+        let p = t.get("x").unwrap();
+        let mut h = FakeHands::new();
+        h.push_procedure(help_reply(
+            "r1",
+            3,
+            vec![el("e1", "", 0.1, 0.1), el("e2", "Home", 0.5, 0.5)],
+        ));
+        let (j, mut u) = (jeff(None), U(None, vec![]));
+        let m = Named("e1", name);
+        let mut lad = Ladder {
+            jeff: &j,
+            model: &m,
+            user: &mut u,
+            threshold: 0.8,
+        };
+        let out = replay(&mut h, &mut lad, input(&pr, p, false));
+        assert!(
+            matches!(out, ReplayOutcome::Stopped(_)),
+            "{name:?}: {out:?}"
+        );
+        assert!(h.sent_answers.is_empty(), "{name:?}: {:?}", h.calls);
+        assert!(
+            h.calls.iter().any(|c| c == "cancel_run r1"),
+            "{name:?}: {:?}",
+            h.calls
+        );
+    }
+}

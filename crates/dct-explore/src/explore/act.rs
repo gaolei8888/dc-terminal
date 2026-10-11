@@ -2,7 +2,7 @@
 use super::raw::Raw;
 use super::screen::{look_error, Scrub};
 use super::{Clock, ExploreInput};
-use crate::gate::{fold, Halt};
+use crate::gate::{check_icon_name, fold, Halt, IconName};
 use crate::hands::{By, El, Hands, Help, HelpAnswer, RunReply, StepReq};
 use crate::ladder::{Decision, Ladder, Model, ModelPick, Tries, User, UserPick, Who};
 use crate::options::{steps_for, Act, Opt};
@@ -188,7 +188,7 @@ fn answer_for(
     state: &str,
     scrub: &Scrub,
     p: &Platform,
-) -> Option<HelpAnswer> {
+) -> Result<HelpAnswer, String> {
     let els: Vec<El> = raw
         .shown(scrub, p)
         .into_iter()
@@ -211,7 +211,7 @@ fn answer_for(
             })
             .collect();
         if let [one] = hits[..] {
-            return Some(HelpAnswer::Element {
+            return Ok(HelpAnswer::Element {
                 id: one.id.clone(),
                 by: if by == Who::User { By::User } else { By::Model },
                 name: icon_name,
@@ -239,16 +239,32 @@ fn answer_for(
         "dco 找不到「{}」是哪一个，请在编号图上指出来",
         scrub.line(&help.intent)
     );
-    let pick = user.pick(state, &opts, help.picture_png.as_deref(), &why)?;
-    let e = els.iter().find(|e| e.id == pick.key)?;
-    Some(HelpAnswer::Element {
+    const NOBODY: &str = "dco 求助时没人指出是哪一个，停下";
+    let pick = user
+        .pick(state, &opts, help.picture_png.as_deref(), &why)
+        .ok_or(NOBODY)?;
+    let e = els.iter().find(|e| e.id == pick.key).ok_or(NOBODY)?;
+    let given = pick
+        .name
+        .map(|n| scrub.line(&n))
+        .filter(|n| !scrub.has_placeholder(n));
+    // 求助时起的名字也是 dco 以后按字去点的名字：同样的规矩。发布词只在这一下本来就是
+    // 问过用户的发布时才收（求助中途没法再问发不发）。
+    if let Some(n) = &given {
+        match check_icon_name(n, p) {
+            IconName::Refused(why) => {
+                return Err(format!("求助时给图标起的名字不能交给 dco（{why}），停下"))
+            }
+            IconName::Publish if !opt.publish => {
+                return Err("求助时给图标起的名字是发布词，这一下不是发布，停下".into())
+            }
+            _ => {}
+        }
+    }
+    Ok(HelpAnswer::Element {
         id: e.id.clone(),
         by: By::User,
-        name: pick
-            .name
-            .map(|n| scrub.line(&n))
-            .filter(|n| !scrub.has_placeholder(n))
-            .or(icon_name),
+        name: given.or(icon_name),
         dismiss: false,
     })
 }
@@ -293,12 +309,16 @@ pub(super) fn execute(
                         return Exec::Halt(why);
                     }
                     let p = input.platform;
-                    let a = help.zip(raw.as_ref()).and_then(|(help, raw)| {
-                        answer_for(help, raw, opt, by, user, state, scrub, p)
-                    });
-                    let Some(a) = a else {
-                        let _ = h.cancel_run(&rep.run_id);
-                        return Exec::Stop("dco 求助时没人指出是哪一个，停下".into());
+                    let a = match help.zip(raw.as_ref()) {
+                        Some((help, raw)) => answer_for(help, raw, opt, by, user, state, scrub, p),
+                        None => Err("dco 求助时没人指出是哪一个，停下".into()),
+                    };
+                    let a = match a {
+                        Ok(a) => a,
+                        Err(why) => {
+                            let _ = h.cancel_run(&rep.run_id);
+                            return Exec::Stop(why);
+                        }
                     };
                     rep = match h.answer_run(&rep.run_id, &a) {
                         Ok(r) => r,

@@ -4,6 +4,7 @@
 //! 进来的 state / 选项已经被循环脱敏；登录、验证码一类画面在循环里就停了，到不了这里。
 use crate::learn::Fixer;
 use crate::llm::{complete_with_timeout, Backend, Prompt};
+use dct_explore::gate::icon_name_shape;
 use dct_explore::ladder::{Model, ModelPick};
 use dct_explore::options::{Act, Opt};
 use std::sync::Arc;
@@ -50,7 +51,7 @@ pub fn prompt_for_pick(state: &str, all: &[Opt]) -> Prompt {
     }
 }
 
-/// 读回复里第一个 `{…}` JSON 对象。key 不在清单里 / `stuck` / 没字图标没名字 → None。
+/// 读回复里第一个 `{…}` JSON 对象。key 不在清单里 / `stuck` / 没字图标没名字或名字不合格 → None。
 pub fn read_pick(text: &str, all: &[Opt]) -> Option<ModelPick> {
     let start = text.find('{')?;
     let v = serde_json::Deserializer::from_str(&text[start..])
@@ -69,7 +70,9 @@ pub fn read_pick(text: &str, all: &[Opt]) -> Option<ModelPick> {
         .filter(|n| !n.is_empty())
         .map(str::to_string);
     let name = match &opt.act {
-        Act::TapIcon { .. } => Some(given?),
+        // 名字会被 dco 当成要点的字：禁点词、太长、带控制 / 看不见字符的一律当卡住
+        // （循环里还会按平台再查一次发布词和平台禁点词）。
+        Act::TapIcon { .. } => Some(given.filter(|n| icon_name_shape(n).is_ok())?),
         _ => None, // 只有没字图标才收名字
     };
     Some(ModelPick {
@@ -257,6 +260,21 @@ mod tests {
             .pick("s", &opts(), None)
             .unwrap();
         assert_eq!(p.name, None);
+    }
+
+    #[test]
+    fn an_icon_name_that_is_banned_too_long_or_hidden_is_read_as_stuck() {
+        for name in [
+            "Follow",
+            "Boost post",
+            "删除",
+            "camera\u{202E}",
+            "camera\u{0007}",
+            "a name that is far too long to be the label of any icon at all",
+        ] {
+            let reply = serde_json::json!({"key": "e5", "name": name}).to_string();
+            assert!(read_pick(&reply, &opts()).is_none(), "{name:?}");
+        }
     }
 
     #[test]
