@@ -376,7 +376,7 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 | `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
 | `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
 | `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通。退出码 0 答了，1 没配或后端出错，2 题写错了 |
-| `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头；标准输入不是终端就拒绝）；各平台文字和开头句不能相同 |
+| `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头，再按指纹，指纹签的就是这些文字；标准输入不是终端就拒绝）；各平台文字和开头句不能相同 |
 | `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（只有 Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索，写成流程草稿，给你看确认卡片（按指纹确认）。每次点发布前都先问你。详见[发到自媒体平台](#发到自媒体平台mac早期) |
 | `dct daemon` | 只跑守护进程，不开看板 |
 | `dct gate` | [浏览器里的 dct](#浏览器里的-dct) 前面那道门 |
@@ -713,7 +713,7 @@ dct 读棋盘、按规则选步、让 dco 划，每步不到一秒；每一步�
 
 **1. 文字先批一次。**
 `dct campaign approve launch --param x.post_text="…" --param tiktok.video=/path/a.mp4`
-在终端里把每个平台的文字给你看，你敲 `y` 才存（`~/.dct/campaigns/launch.json`）。各平台的文字和开头那句不能相同。
+在终端里把每个平台的文字给你看，你敲 `y`、再按指纹才存（`~/.dct/campaigns/launch.json`）。指纹签的是这些确切的文字：之后手改这个文件（或旧版本批的、没有签名的文件），`dct do` 都会拒绝（退出码 2），要重新批准。各平台的文字和开头那句不能相同。
 `dct do` 只发这里批过的东西。
 
 **2. 发。** `dct do "把发布文字发出去" --platform x --campaign launch`，要 dco 开着、平台的浏览器开着。
@@ -741,7 +741,7 @@ kuaishou、wechat_channels、toutiao、wechat_mp、baijiahao。没在真屏幕�
 在 `~/.dct/platforms.toml` 里改或加；同名的整行替换内置的。
 
 **还没做的**：真屏幕试点；中间那一级换成更强的模型（等它的地址）；它依赖的 dcv、dco 改动在各自的仓库里做；
-批过的活动文件要不要也按指纹（现在谁能写 `~/.dct/campaigns/`，谁就能改要发的内容）；要点两下的发布（先「发布」、
+要点两下的发布（先「发布」、
 再在确认框里点一次）点完第一下就会报「发出去了」。
 
 ## 多电脑

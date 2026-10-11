@@ -1,5 +1,9 @@
 //! 活动文字一次批准：同一个活动里各平台要发的文字，用户在终端里看过、点头才存。
 //! `dct do --campaign <名字>` 只用这里批过的文字，不收别人临时塞进来的内容参数。
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use dct_brain::canon::field;
+use dct_brain::sign::{key_id, verify_sig, Signature, Signer, TrustedKey, ALG};
+use dct_brain::tier::SignerRole;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +16,34 @@ pub struct Campaign {
     pub name: String,
     pub approved_at: u64,
     pub per_platform: PerPlatform,
+}
+
+/// 存在文件里的样子：活动本身 + 用户钥匙对内容的签名。没有 `signature` 的是旧版本批的，不认。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Stored {
+    #[serde(flatten)]
+    campaign: Campaign,
+    #[serde(default)]
+    signature: Option<Signature>,
+}
+
+/// 签名盖住的字节：版本串 + 活动名 + 每个平台 → 每个参数 → 值（BTreeMap，顺序固定；
+/// 每段都带长度前缀，文字挪到相邻字段碰不出同一份字节）。`approved_at` 不在里面：
+/// 它不决定会发什么。开头的版本串让这份签名不可能被当成执行票或流程批准记录。
+fn canonical_bytes(name: &str, per: &PerPlatform) -> Vec<u8> {
+    let mut out = Vec::new();
+    field(&mut out, "dct-campaign-v1");
+    field(&mut out, name);
+    field(&mut out, &per.len().to_string());
+    for (platform, params) in per {
+        field(&mut out, platform);
+        field(&mut out, &params.len().to_string());
+        for (k, v) in params {
+            field(&mut out, k);
+            field(&mut out, v);
+        }
+    }
+    out
 }
 
 /// 同平台表的名字规则：小写英文开头，只含小写、数字、`-`、`_`，最长 32。
@@ -184,12 +216,14 @@ fn file_for(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.json"))
 }
 
-/// `ask` 收到给用户看的全文，返回用户点没点头。没点头什么都不存。
+/// `ask` 收到给用户看的全文，返回用户点没点头；点了头再让 `signer`（用户钥匙，真机上是
+/// Touch ID）对全文签名。没点头、没按指纹，都什么都不存。
 pub fn approve(
     dir: &Path,
     name: &str,
     per: PerPlatform,
     ask: &mut dyn FnMut(&str) -> bool,
+    signer: &dyn Signer,
     now: u64,
 ) -> Result<Campaign, String> {
     check_campaign_name(name)?;
@@ -201,6 +235,20 @@ pub fn approve(
     if !ask(&render(name, &per)) {
         return Err("没有批准，什么都没存".into());
     }
+    if signer.role() != SignerRole::User {
+        return Err("批准活动文字必须用用户本人的钥匙".into());
+    }
+    let raw = signer
+        .sign(
+            &canonical_bytes(name, &per),
+            &format!("批准活动 {name} 要发的文字（{} 个平台）", per.len()),
+        )
+        .map_err(|e| format!("{e}，什么都没存"))?;
+    let signature = Signature {
+        key_id: key_id(&signer.public_key()),
+        alg: ALG.into(),
+        sig: STANDARD.encode(raw),
+    };
     let c = Campaign {
         name: name.to_string(),
         approved_at: now,
@@ -208,7 +256,11 @@ pub fn approve(
     };
     std::fs::create_dir_all(dir).map_err(|e| format!("建不了 {}：{e}", dir.display()))?;
     let path = file_for(dir, name);
-    let json = serde_json::to_vec_pretty(&c).map_err(|e| e.to_string())?;
+    let stored = Stored {
+        campaign: c.clone(),
+        signature: Some(signature),
+    };
+    let json = serde_json::to_vec_pretty(&stored).map_err(|e| e.to_string())?;
     write_private(&path, &json).map_err(|e| format!("写不了 {}：{e}", path.display()))?;
     Ok(c)
 }
@@ -230,15 +282,44 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
-pub fn load(dir: &Path, name: &str) -> Result<Campaign, String> {
+/// 读一份批过的活动：内容必须和批准时签的一模一样（钥匙是 `trusted` 里的用户钥匙），
+/// 没签名（旧版本批的）、签名对不上、文件被改过，都拒绝。
+pub fn load(dir: &Path, name: &str, trusted: &[TrustedKey]) -> Result<Campaign, String> {
     check_campaign_name(name)?;
     let raw = std::fs::read(file_for(dir, name))
         .map_err(|_| format!("活动 `{name}` 还没批准过（先跑 dct campaign approve {name} ...）"))?;
-    let c: Campaign =
-        serde_json::from_slice(&raw).map_err(|e| format!("活动 `{name}` 的记录坏了：{e}"))?;
+    let Stored {
+        campaign: c,
+        signature,
+    } = serde_json::from_slice(&raw).map_err(|e| format!("活动 `{name}` 的记录坏了：{e}"))?;
     // 文件可能被手改过：和 parse_params 同一套检查，不让不可见字符溜进 dct do。
     validate_per(&c.per_platform).map_err(|e| format!("活动 `{name}` 的记录被改过：{e}"))?;
-    Ok(c)
+    let reapprove =
+        format!("请重新批准：dct campaign approve {name} --param <平台>.<参数>=<值> ...");
+    let Some(signature) = signature else {
+        return Err(format!(
+            "活动 `{name}` 的记录没有指纹签名（旧版本批的）。{reapprove}"
+        ));
+    };
+    if c.name != name {
+        return Err(format!(
+            "活动 `{name}` 的记录里写的是另一个活动名（{}），被改过。{reapprove}",
+            c.name
+        ));
+    }
+    match verify_sig(
+        &signature,
+        &canonical_bytes(&c.name, &c.per_platform),
+        trusted,
+    ) {
+        Ok(SignerRole::User) => Ok(c),
+        Ok(_) => Err(format!(
+            "活动 `{name}` 的签名不是用户指纹钥匙签的。{reapprove}"
+        )),
+        Err(e) => Err(format!(
+            "活动 `{name}` 的内容和批准时签的对不上，被改过（{e}）。{reapprove}"
+        )),
+    }
 }
 
 pub fn default_dir() -> PathBuf {
@@ -277,7 +358,16 @@ pub fn run_cli(args: &[String]) -> i32 {
                 std::io::stdin().read_line(&mut line).is_ok()
                     && matches!(line.trim(), "y" | "Y" | "yes")
             };
-            match approve(&default_dir(), name, per, &mut ask, now_secs()) {
+            let keys = crate::keys::KeyStore::at(crate::keys::KeyStore::default_dir());
+            let se = crate::keys::platform_enclave();
+            let signer = match keys.signer(SignerRole::User, se.as_ref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            match approve(&default_dir(), name, per, &mut ask, &signer, now_secs()) {
                 Ok(c) => {
                     println!("已批准活动 `{}`", c.name);
                     0
@@ -299,8 +389,180 @@ pub fn run_cli(args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
+    use dct_brain::sign::soft::SoftSigner;
+    use dct_brain::sign::{SignError, Signer};
+    use dct_brain::tier::SignerRole;
+
     fn s(v: &str) -> String {
         v.to_string()
+    }
+
+    fn user() -> SoftSigner {
+        SoftSigner::from_seed(SignerRole::User, 2)
+    }
+    fn trusted() -> Vec<TrustedKey> {
+        vec![user().trusted()]
+    }
+
+    /// 按指纹那一步被取消。
+    struct Cancelled;
+    impl Signer for Cancelled {
+        fn role(&self) -> SignerRole {
+            SignerRole::User
+        }
+        fn public_key(&self) -> [u8; 65] {
+            user().public_key()
+        }
+        fn sign(&self, _: &[u8], _: &str) -> Result<[u8; 64], SignError> {
+            Err(SignError::Cancelled)
+        }
+    }
+
+    fn two_platforms() -> PerPlatform {
+        parse_params(&[
+            s("--param"),
+            s("x.post_text=Hello from X"),
+            s("--param"),
+            s("tiktok.post_text=We made a thing"),
+        ])
+        .unwrap()
+    }
+
+    fn approved(d: &Path) -> PathBuf {
+        approve(d, "c", two_platforms(), &mut |_| true, &user(), 1).unwrap();
+        d.join("c.json")
+    }
+
+    fn edit(path: &Path, f: impl FnOnce(&mut serde_json::Value)) {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        f(&mut v);
+        std::fs::write(path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn approval_is_stored_with_a_signature_and_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let path = approved(d.path());
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["signature"]["alg"], "es256");
+        assert!(v["signature"]["sig"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        let c = load(d.path(), "c", &trusted()).unwrap();
+        assert_eq!(c.per_platform, two_platforms());
+    }
+
+    #[test]
+    fn cancelled_touch_id_stores_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let e = approve(d.path(), "c", two_platforms(), &mut |_| true, &Cancelled, 1).unwrap_err();
+        assert!(e.contains(&SignError::Cancelled.to_string()), "{e}");
+        assert!(!d.path().join("c.json").exists());
+        assert!(load(d.path(), "c", &trusted()).is_err());
+    }
+
+    #[test]
+    fn a_no_means_no_touch_id_prompt() {
+        struct Boom;
+        impl Signer for Boom {
+            fn role(&self) -> SignerRole {
+                SignerRole::User
+            }
+            fn public_key(&self) -> [u8; 65] {
+                [0; 65]
+            }
+            fn sign(&self, _: &[u8], _: &str) -> Result<[u8; 64], SignError> {
+                panic!("不该走到按指纹")
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        assert!(approve(d.path(), "c", two_platforms(), &mut |_| false, &Boom, 1).is_err());
+    }
+
+    #[test]
+    fn editing_a_value_afterwards_voids_the_approval() {
+        let d = tempfile::tempdir().unwrap();
+        let path = approved(d.path());
+        edit(&path, |v| {
+            v["per_platform"]["x"]["post_text"] = "Buy my coin".into()
+        });
+        let e = load(d.path(), "c", &trusted()).unwrap_err();
+        assert!(e.contains("改过") && e.contains("重新批准"), "{e}");
+    }
+
+    #[test]
+    fn editing_the_name_or_adding_a_platform_or_param_voids_it() {
+        for f in [
+            (|v: &mut serde_json::Value| v["name"] = "other".into()) as fn(&mut serde_json::Value),
+            |v| v["per_platform"]["fb"] = serde_json::json!({"post_text": "extra"}),
+            |v| v["per_platform"]["x"]["video"] = "/v/a.mp4".into(),
+            |v| {
+                v["per_platform"].as_object_mut().unwrap().remove("tiktok");
+            },
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let path = approved(d.path());
+            edit(&path, f);
+            assert!(load(d.path(), "c", &trusted())
+                .unwrap_err()
+                .contains("改过"));
+        }
+    }
+
+    #[test]
+    fn moving_text_between_params_changes_the_hash() {
+        // 长度前缀：把一段文字挪到相邻字段不能碰出同一个哈希。
+        let a: PerPlatform = [(
+            "x".to_string(),
+            [("a".to_string(), "bc".to_string())].into(),
+        )]
+        .into();
+        let b: PerPlatform = [(
+            "x".to_string(),
+            [("ab".to_string(), "c".to_string())].into(),
+        )]
+        .into();
+        assert_ne!(canonical_bytes("n", &a), canonical_bytes("n", &b));
+    }
+
+    #[test]
+    fn an_unsigned_legacy_file_is_refused_with_a_reapprove_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let path = approved(d.path());
+        edit(&path, |v| {
+            v.as_object_mut().unwrap().remove("signature");
+        });
+        let e = load(d.path(), "c", &trusted()).unwrap_err();
+        assert!(
+            e.contains("重新批准") && e.contains("dct campaign approve c"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_signature_from_another_key_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let other = SoftSigner::from_seed(SignerRole::User, 9);
+        approve(d.path(), "c", two_platforms(), &mut |_| true, &other, 1).unwrap();
+        assert!(load(d.path(), "c", &trusted()).is_err());
+        assert!(load(d.path(), "c", &[other.trusted()]).is_ok());
+    }
+
+    #[test]
+    fn an_automatic_key_cannot_approve_text() {
+        let d = tempfile::tempdir().unwrap();
+        let auto = SoftSigner::from_seed(SignerRole::Auto, 1);
+        assert!(approve(d.path(), "c", two_platforms(), &mut |_| true, &auto, 1).is_err());
+        assert!(!d.path().join("c.json").exists());
+    }
+
+    #[test]
+    fn a_signature_cannot_be_copied_to_another_campaign_name() {
+        let d = tempfile::tempdir().unwrap();
+        let path = approved(d.path());
+        std::fs::copy(&path, d.path().join("d.json")).unwrap();
+        assert!(load(d.path(), "d", &trusted()).is_err());
     }
 
     #[test]
@@ -353,8 +615,11 @@ mod tests {
     fn approve_needs_a_yes_and_stores_privately() {
         let d = tempfile::tempdir().unwrap();
         let p = parse_params(&["--param".into(), "x.post_text=hello".into()]).unwrap();
-        assert!(approve(d.path(), "launch", p.clone(), &mut |_| false, 1).is_err());
-        assert!(load(d.path(), "launch").is_err(), "没点头就什么都不存");
+        assert!(approve(d.path(), "launch", p.clone(), &mut |_| false, &user(), 1).is_err());
+        assert!(
+            load(d.path(), "launch", &trusted()).is_err(),
+            "没点头就什么都不存"
+        );
         let mut shown = String::new();
         approve(
             d.path(),
@@ -364,12 +629,13 @@ mod tests {
                 shown = t.into();
                 true
             },
+            &user(),
             1,
         )
         .unwrap();
         assert!(shown.contains("hello"), "给用户看的是全文");
         assert_eq!(
-            load(d.path(), "launch").unwrap().per_platform["x"]["post_text"],
+            load(d.path(), "launch", &trusted()).unwrap().per_platform["x"]["post_text"],
             "hello"
         );
         #[cfg(unix)]
@@ -402,6 +668,7 @@ mod tests {
                 asked = true;
                 true
             },
+            &user(),
             1
         )
         .is_err());
@@ -424,10 +691,10 @@ mod tests {
             &"n".repeat(65),
         ] {
             assert!(
-                approve(d.path(), bad, p.clone(), &mut |_| true, 1).is_err(),
+                approve(d.path(), bad, p.clone(), &mut |_| true, &user(), 1).is_err(),
                 "{bad:?}"
             );
-            assert!(load(d.path(), bad).is_err(), "{bad:?}");
+            assert!(load(d.path(), bad, &trusted()).is_err(), "{bad:?}");
         }
         assert!(std::fs::read_dir(d.path()).unwrap().next().is_none());
         for bad in [
@@ -451,7 +718,7 @@ mod tests {
             "tiktok.post_text=hi".into(),
         ])
         .unwrap();
-        let c = approve(d.path(), "v", p, &mut |_| true, 5).unwrap();
+        let c = approve(d.path(), "v", p, &mut |_| true, &user(), 5).unwrap();
         assert_eq!(c.per_platform["tiktok"]["video"], "~/v/a.mp4");
         assert_eq!(c.approved_at, 5);
     }
@@ -543,13 +810,15 @@ mod tests {
     fn a_hand_edited_file_with_hidden_characters_is_refused_by_load() {
         let d = tempfile::tempdir().unwrap();
         let p = parse_params(&[s("--param"), s("x.post_text=hello")]).unwrap();
-        approve(d.path(), "c", p, &mut |_| true, 1).unwrap();
+        approve(d.path(), "c", p, &mut |_| true, &user(), 1).unwrap();
         let path = d.path().join("c.json");
         let raw = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, raw.replace("hello", "he\\u202Ello")).unwrap();
-        assert!(load(d.path(), "c").unwrap_err().contains("202E"));
+        assert!(load(d.path(), "c", &trusted())
+            .unwrap_err()
+            .contains("202E"));
         std::fs::write(&path, raw.replace("\"x\"", "\"../x\"")).unwrap();
-        assert!(load(d.path(), "c").is_err());
+        assert!(load(d.path(), "c", &trusted()).is_err());
     }
 
     #[test]
@@ -598,6 +867,7 @@ mod tests {
                         asked = true;
                         true
                     },
+                    &user(),
                     1
                 )
                 .is_err(),
@@ -605,6 +875,6 @@ mod tests {
             );
             assert!(!asked);
         }
-        assert!(load(d.path(), "c").is_err());
+        assert!(load(d.path(), "c", &trusted()).is_err());
     }
 }

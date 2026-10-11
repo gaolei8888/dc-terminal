@@ -117,10 +117,17 @@ mod unix {
                 &format!("平台表里没有 {}（有：{}）", a.platform, names.join("、")),
             );
         };
-        let campaign = match crate::campaign::load(&crate::campaign::default_dir(), &a.campaign) {
-            Ok(c) => c,
-            Err(m) => return early(2, &m),
-        };
+        // 只用批准时按过指纹签的文字：没签、签名对不上、文件被改过，都在碰 dco 之前拒绝。
+        let trusted =
+            match crate::keys::KeyStore::at(crate::keys::KeyStore::default_dir()).trusted() {
+                Ok(t) => t,
+                Err(e) => return early(2, &format!("核对活动文字的指纹签名要用配对过的钥匙：{e}")),
+            };
+        let campaign =
+            match crate::campaign::load(&crate::campaign::default_dir(), &a.campaign, &trusted) {
+                Ok(c) => c,
+                Err(m) => return early(2, &m),
+            };
         let params = match params_for(&campaign, &p.name) {
             Ok(v) => v,
             Err(m) => return early(2, &m),

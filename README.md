@@ -437,7 +437,7 @@ Everything else:
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
 | `dct judge [file]` / `--probe` | ask the `[judge]` backend (Jeff's `jeff-serve`) one multiple-choice question in Jev format and print each option's probability; `--probe` sends a fixed question to see if it answers. Exit 0 answered, 1 not configured or backend error, 2 the question is wrong |
-| `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you (refuses when stdin isn't a terminal); texts (and their opening sentences) must differ per platform |
+| `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you (refuses when stdin isn't a terminal), then confirm with Touch ID, which signs the exact texts; texts (and their opening sentences) must differ per platform |
 | `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco (Mac only): replay the confirmed procedure if there is one, otherwise work the page out, write a draft procedure and show you a card to confirm with Touch ID. Asks before every publish tap. See [Post to a social platform](#post-to-a-social-platform-mac-early) |
 | `dct daemon` | run only the daemon, no board |
 | `dct gate` | the door in front of [dct in a browser](#dct-in-a-browser) |
@@ -862,7 +862,10 @@ against a fake dco; the first pilots (X, then TikTok) need you there.
 **1. Approve the text once.**
 `dct campaign approve launch --param x.post_text="…" --param tiktok.video=/path/a.mp4`
 shows every platform's text in the terminal and saves it only when you type
-`y` (`~/.dct/campaigns/launch.json`). Each platform's text, and its opening
+`y` and then confirm with Touch ID (`~/.dct/campaigns/launch.json`). The
+fingerprint signs the exact texts, so editing the file afterwards (or a file
+from an older version, which has no signature) makes `dct do` refuse with exit 2
+until you approve again. Each platform's text, and its opening
 sentence, must differ from the others. `dct do` posts nothing else.
 
 **2. Post it.** `dct do "post the launch text" --platform x --campaign launch`,
@@ -913,8 +916,7 @@ same name replaces the built-in one.
 
 **Not done yet:** the real-screen pilots; a stronger model for the middle step
 (waiting for its address); dcv and dco changes it depends on, built in their own
-repositories; whether an approved campaign file needs Touch ID too (today
-anyone who can write `~/.dct/campaigns/` can change what gets posted); and a
+repositories; and a
 publish that takes two taps (Post, then a confirm dialog) is reported as posted
 after the first.
 
