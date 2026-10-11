@@ -2184,3 +2184,471 @@ fn a_private_screen_on_open_url_cancels_the_parked_run() {
     assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
     assert_eq!(count(&h, "cancel_run r0"), 1, "{:?}", h.calls);
 }
+
+// ---- 两段式发布（R17）：发布那一下落到新画面，画面上还有发布按钮（确认框）就还没发出去 ----
+//
+// 算发出去 = 新画面上没有能点的发布词按钮了，或者有平台表里核实过的「发出去了」那行字。
+// 否则接着走：上限（时间、步数）不再算；这时点什么都算发布那一类，先问用户。
+
+fn platform_like(
+    t: &Table,
+    name: &str,
+    edit: impl FnOnce(&mut dct_explore::platform::Platform),
+) -> &'static dct_explore::platform::Platform {
+    let mut p = t.get(name).unwrap().clone();
+    edit(&mut p);
+    Box::leak(Box::new(p))
+}
+
+fn two_stage_input(
+    t: &Table,
+    d: &std::path::Path,
+    p: &'static dct_explore::platform::Platform,
+) -> ExploreInput<'static> {
+    let mut inp = input_for(t, "x", d);
+    inp.platform = p;
+    inp
+}
+
+fn draft_of(
+    tr: &dct_explore::trace::Trace,
+    p: &dct_explore::platform::Platform,
+) -> dct_explore::draft::ProcedureDraft {
+    dct_explore::draft::draft(tr, p, &["Cancel".into(), "取消".into()], &[])
+        .unwrap()
+        .0
+}
+
+fn publish_steps(tr: &dct_explore::trace::Trace) -> Vec<String> {
+    tr.steps
+        .iter()
+        .filter(|s| s.ok && s.publish)
+        .map(|s| s.arg.clone())
+        .collect()
+}
+
+/// X：一下就发。发帖框（带登录闸的字）→ 点 Post → 没有 Post 按钮的新画面。
+#[test]
+fn x_single_tap_publish_ends_published_with_one_publish_step() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e0", "What's happening?", "text", 0.45, 0.2),
+                el("e2", TEXT, "textarea", 0.45, 0.25),
+                el("e3", "Post", "button", 0.8, 0.35),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图（问发不发）
+    h.push_step(done("r1"));
+    h.push_look(look("b", vec![el("e1", "Home", "text", 0.1, 0.1)]));
+    let (j, m, mut u) = (sure(vec!["e3"]), NoModel, ScriptUser(vec![], 0));
+    let mut yes = Yes(0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut yes, &T0, input(&t, d.path()));
+    let Outcome::Published(tr) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(yes.0, 1);
+    assert_eq!(publish_steps(&tr), ["Post"]);
+    let dr = draft_of(&tr, t.get("x").unwrap());
+    assert_eq!(
+        dr.body.matches("tap_by_intent: Post").count(),
+        1,
+        "{}",
+        dr.body
+    );
+    assert!(h.looks.is_empty() && h.steps.is_empty());
+}
+
+fn tiktok_composer() -> Look {
+    look(
+        "a",
+        vec![
+            el("e0", "Select video", "text", 0.45, 0.1),
+            el("e2", TEXT, "textarea", 0.45, 0.25),
+            el("e3", "Post", "button", 0.8, 0.8),
+        ],
+    )
+}
+fn tiktok_dialog() -> Look {
+    look(
+        "b",
+        vec![
+            el("e6", "Continue to post?", "text", 0.5, 0.4),
+            el("e7", "Post now", "button", 0.6, 0.55),
+            el("e8", "Cancel", "button", 0.4, 0.55),
+        ],
+    )
+}
+fn tiktok_posted() -> Look {
+    look(
+        "c",
+        vec![el("e1", "Your video is being uploaded", "text", 0.5, 0.5)],
+    )
+}
+
+/// TikTok：Post → 「Continue to post?」框里的 Post now → 再问一次 → 点 → 发出去了。
+fn tiktok_run(confirm: &mut dyn Confirm, clock: &dyn Clock) -> (Outcome, FakeHands) {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(tiktok_composer());
+    h.push_look(tiktok_composer()); // 编号图（问发不发）
+    h.push_step(done("r1")); // tap Post
+    h.push_look(tiktok_dialog());
+    h.push_look(tiktok_dialog()); // 编号图（再问一次）
+    h.push_step(done("r2")); // tap Post now
+    h.push_look(tiktok_posted());
+    let (j, m, mut u) = (sure(vec!["e3", "e7"]), NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        confirm,
+        clock,
+        input_for(&t, "tiktok", d.path()),
+    );
+    (out, h)
+}
+
+#[test]
+fn tiktok_two_stage_publish_asks_again_and_learns_both_taps() {
+    let mut said = Said(vec![]);
+    let (out, h) = tiktok_run(&mut said, &T0);
+    let Outcome::Published(tr) = out else {
+        panic!("{out:?} {:?}", h.calls)
+    };
+    assert_eq!(said.0.len(), 2, "确认那一下也先问：{:?}", said.0);
+    assert!(said.0[1].contains("Post now"), "{}", said.0[1]);
+    assert_eq!(count(&h, "run_step tap_by_intent: Post"), 1);
+    assert_eq!(count(&h, "run_step tap_by_intent: Post now"), 1);
+    assert_eq!(publish_steps(&tr), ["Post", "Post now"]);
+    let t = Table::seed();
+    let dr = draft_of(&tr, t.get("tiktok").unwrap());
+    assert!(
+        dr.body
+            .ends_with("3. tap_by_intent: Post\n4. tap_by_intent: Post now"),
+        "{}",
+        dr.body
+    );
+    assert!(dr.maybe_one_off.is_empty(), "{:?}", dr.maybe_one_off);
+    assert!(h.looks.is_empty() && h.steps.is_empty());
+}
+
+#[test]
+fn declining_the_second_confirmation_is_declined_not_published() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(tiktok_composer());
+    h.push_look(tiktok_composer()); // 编号图
+    h.push_step(done("r1"));
+    h.push_look(tiktok_dialog());
+    h.push_look(tiktok_dialog()); // 编号图
+    let (j, m, mut u) = (sure(vec!["e3", "e7"]), NoModel, ScriptUser(vec![], 0));
+    let mut ans = Answers(vec![true, false], 0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut ans,
+        &T0,
+        input_for(&t, "tiktok", d.path()),
+    );
+    assert!(matches!(out, Outcome::DeclinedAtPublish(_)), "{out:?}");
+    assert_eq!(ans.1, 2);
+    assert_eq!(count(&h, "run_step tap_by_intent: Post now"), 0);
+}
+
+#[test]
+fn the_ten_minute_budget_passing_during_confirmations_does_not_stop_a_two_stage_publish() {
+    let now = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (out, h) = tiktok_run(&mut SlowYes(now.clone()), &SlowClock(now.clone()));
+    assert!(now.get() > 600_000);
+    assert!(
+        matches!(out, Outcome::Published(_)),
+        "{out:?} {:?}",
+        h.calls
+    );
+}
+
+/// 中文两段式：发布 → 「确认发布这条笔记吗」框（继续 / 取消，后面的发布按钮还看得见）→
+/// 「继续」不是发布词，但发布还没落地，所以它算发布那一类：先问，点了才算发出去。
+#[test]
+fn a_chinese_confirm_dialog_with_continue_is_asked_and_learned() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let p = platform_like(&t, "xiaohongshu", |p| {
+        p.unverified.clear();
+        p.login_gate = Some("发布笔记".into());
+    });
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e0", "发布笔记", "text", 0.1, 0.1),
+                el("e2", TEXT, "textarea", 0.45, 0.25),
+                el("e3", "发布", "button", 0.8, 0.8),
+            ],
+        )
+    };
+    let dialog = || {
+        look(
+            "b",
+            vec![
+                el("e3", "发布", "button", 0.8, 0.8),
+                el("e6", "确认发布这条笔记吗", "text", 0.5, 0.4),
+                el("e7", "继续", "button", 0.6, 0.55),
+                el("e8", "取消", "button", 0.4, 0.55),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图
+    h.push_step(done("r1")); // 发布
+    h.push_look(dialog());
+    h.push_look(dialog()); // 编号图（问「继续」）
+    h.push_step(done("r2")); // 继续
+    h.push_look(look("c", vec![el("e1", "发布成功", "text", 0.5, 0.5)]));
+    let (j, m, mut u) = (sure(vec!["e3", "e7"]), NoModel, ScriptUser(vec![], 0));
+    let mut said = Said(vec![]);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut said,
+        &T0,
+        two_stage_input(&t, d.path(), p),
+    );
+    let Outcome::Published(tr) = out else {
+        panic!("{out:?} {:?}", h.calls)
+    };
+    assert_eq!(said.0.len(), 2, "{:?}", said.0);
+    assert!(said.0[1].contains("继续"), "{}", said.0[1]);
+    assert_eq!(count(&h, "run_step tap_by_intent: 继续"), 1);
+    assert_eq!(publish_steps(&tr), ["发布", "继续"]);
+    let dr = draft_of(&tr, p);
+    assert!(
+        dr.body
+            .ends_with("3. tap_by_intent: 发布\n4. tap_by_intent: 继续"),
+        "{}",
+        dr.body
+    );
+    assert!(dr.maybe_one_off.is_empty(), "{:?}", dr.maybe_one_off);
+}
+
+/// 平台表里核实过的「发出去了」那行字在新画面上：马上算发出去，哪怕左边栏还有个 Post。
+#[test]
+fn a_verified_publish_done_ends_at_once_even_with_a_post_button_left() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let p = platform_like(&t, "x", |p| p.unverified.retain(|u| u != "publish_done"));
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer_filled("a"));
+    h.push_look(composer_filled("a")); // 编号图
+    h.push_step(done("r1"));
+    h.push_look(look(
+        "b",
+        vec![
+            el("e1", "Post", "button", 0.08, 0.5),
+            el("e9", "Your post was sent.", "text", 0.4, 0.9),
+        ],
+    ));
+    let (j, m, mut u) = (sure(vec!["e3"]), NoModel, ScriptUser(vec![], 0));
+    let mut yes = Yes(0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut yes,
+        &T0,
+        two_stage_input(&t, d.path(), p),
+    );
+    assert!(matches!(out, Outcome::Published(_)), "{out:?}");
+    assert_eq!(yes.0, 1);
+    assert!(h.looks.is_empty() && h.steps.is_empty());
+}
+
+/// 「发出去了」那行字没核实（X 的种子表）、左边栏还剩 Post：规矩认不出发没发出去，不直接算发出去；
+/// 选「做完了」时先问用户发出去没有。
+#[test]
+fn an_unverified_done_line_with_a_post_button_left_asks_before_counting_it_sent() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let home = || {
+        look(
+            "b",
+            vec![
+                el("e1", "Post", "button", 0.08, 0.5),
+                el("e9", "Your post was sent", "text", 0.4, 0.9),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer_filled("a"));
+    h.push_look(composer_filled("a")); // 编号图
+    h.push_step(done("r1"));
+    h.push_look(home());
+    h.push_look(home()); // 编号图（问发出去没有）
+    let (j, m, mut u) = (sure(vec!["e3", "done"]), NoModel, ScriptUser(vec![], 0));
+    let mut said = Said(vec![]);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut said, &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Published(_)), "{out:?}");
+    assert_eq!(said.0.len(), 2, "{:?}", said.0);
+    assert!(said.0[1].contains("发出去"), "{}", said.0[1]);
+    assert_eq!(count(&h, "run_step tap_by_intent: Post"), 1);
+}
+
+/// 发布要用户自己点的平台，两段式：确认那一下也交给用户点。
+#[test]
+fn on_a_by_user_platform_the_confirm_tap_is_left_to_the_user_too() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let p = platform_like(&t, "wechat_mp", |p| {
+        p.unverified.retain(|u| u != "publish_words")
+    });
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e2", TEXT, "textarea", 0.45, 0.25),
+                el("e3", "发布", "button", 0.8, 0.1),
+            ],
+        )
+    };
+    let dialog = || {
+        look(
+            "b",
+            vec![
+                el("e3", "发布", "button", 0.8, 0.1),
+                el("e7", "继续", "button", 0.6, 0.55),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图
+    h.push_look(dialog()); // 用户点完发布
+    h.push_look(dialog()); // 编号图（请用户点继续）
+    h.push_look(look("c", vec![el("e1", "已发布", "text", 0.4, 0.4)]));
+    let (j, m, mut u) = (sure(vec!["e3", "e7"]), NoModel, ScriptUser(vec![], 0));
+    let mut said = Said(vec![]);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut said,
+        &T0,
+        two_stage_input(&t, d.path(), p),
+    );
+    let Outcome::Published(tr) = out else {
+        panic!("{out:?} {:?}", h.calls)
+    };
+    assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
+    assert_eq!(said.0.len(), 2, "{:?}", said.0);
+    assert!(
+        said.0[1].contains("自己") && said.0[1].contains("继续"),
+        "{}",
+        said.0[1]
+    );
+    assert_eq!(publish_steps(&tr), ["发布", "继续"]);
+    assert!(tr
+        .steps
+        .iter()
+        .filter(|s| s.publish)
+        .all(|s| s.by == Who::User));
+}
+
+/// 点过发布、确认框一直在：上限不算，但连续没变照样停，而且说清楚帖子可能没发出去。
+#[test]
+fn a_confirm_dialog_that_never_goes_away_stops_without_claiming_it_was_sent() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(tiktok_composer());
+    h.push_look(tiktok_composer()); // 编号图
+    h.push_step(done("r1")); // tap Post
+    h.push_look(tiktok_dialog());
+    for i in 0..3 {
+        h.push_step(done(&format!("w{i}"))); // wait
+        h.push_look(tiktok_dialog());
+    }
+    let (j, m, mut u) = (
+        sure(vec!["e3", "wait", "wait", "wait"]),
+        NoModel,
+        ScriptUser(vec![], 0),
+    );
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut Yes(0),
+        &T0,
+        input_for(&t, "tiktok", d.path()),
+    );
+    match out {
+        Outcome::Stopped { why, .. } => {
+            assert!(
+                why.contains("还没看到发出去") && why.contains("Post"),
+                "{why}"
+            )
+        }
+        other => panic!("{other:?} {:?}", h.calls),
+    }
+}

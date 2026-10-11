@@ -135,7 +135,8 @@ fn fixed(key: &str, text: &str, act: Act) -> Opt {
 /// 规则：
 /// - 有字 -> `Tap`；没字的检测框 -> `TapIcon`；`gate::tappable` 为假的不进。
 /// - 发布词（整句相等，fold 后比）-> `publish: true`，只有所有文字参数都已在画面上、
-///   所有文件参数都已附上，才进选项（发布前画面上必须看得到要发的字）。
+///   所有文件参数都已附上，才进选项（发布前画面上必须看得到要发的字）；已经点过一次发布
+///   （`prog.published`，两段式发布的确认框上）不再要求。
 /// - `Fill`：每个还没填的文字参数 × 每个像输入框的元素；有文件参数没附上时一项都不出（文件先于文字）。
 /// - `Attach`：每个还没附上的文件参数一项。
 /// - 固定动作 scroll_down / scroll_up / wait / stuck；done 只在已发布后出。
@@ -152,8 +153,10 @@ pub fn all_options(
         .iter()
         .map(|w| fold(w))
         .collect();
-    let ready = goal.text_params.iter().all(|p| values_on_screen(p))
-        && goal.file_params.iter().all(|p| prog.attached.contains(p));
+    // 已经点过一次发布（两段式发布的确认框上）：内容在第一下之前已经核对过，确认框上看不到帖子也照样给发布词。
+    let ready = prog.published
+        || (goal.text_params.iter().all(|p| values_on_screen(p))
+            && goal.file_params.iter().all(|p| prog.attached.contains(p)));
     let files_pending = goal.file_params.iter().any(|p| !prog.attached.contains(p));
 
     for e in &look.elements {

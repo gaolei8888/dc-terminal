@@ -228,7 +228,10 @@ pub fn draft(
     let mut n: u32 = 2;
     let mut maybe_one_off = Vec::new();
     let mut after_publish = false;
-    for s in kept {
+    // 两段式发布（「发布」→ 确认框里的「继续」）两下都是发布；「发出去了」的完成标志只跟在最后一下后面
+    // ——第一下之后平台还在等确认，那行字还没出来。
+    let last_publish = kept.iter().rposition(|s| s.publish);
+    for (i, s) in kept.into_iter().enumerate() {
         n += 1;
         if s.action != "back" && (s.arg.trim().is_empty() || s.arg.contains('\n')) {
             return Err(DraftError::BadStepArg(format!(
@@ -239,6 +242,9 @@ pub fn draft(
         lines.push(format!("{n}. {}: {}", s.action, s.arg));
         if s.publish {
             after_publish = true;
+            if last_publish != Some(i) {
+                continue;
+            }
             if let Some(done) = p.publish_done.as_deref().map(str::trim) {
                 if !done.is_empty()
                     && marker_ok(done)
@@ -445,6 +451,30 @@ mod tests {
             "{}",
             d.body
         );
+    }
+
+    #[test]
+    fn a_two_stage_publish_keeps_both_taps_and_marks_only_the_last() {
+        let t = Table::seed();
+        let mut p = t.get("x").unwrap().clone();
+        p.unverified.retain(|u| u != "publish_done");
+        let tr = x_trace(vec![
+            s("open_url", "https://x.com/compose/post", false, &[]),
+            s("tap_by_intent", "What's happening?", false, &[]),
+            s("type_param", "post_text", false, &[]),
+            s("tap_by_intent", "Post", true, &["What's happening?"]),
+            s("tap_by_intent", "Post now", true, &["Continue to post?"]),
+            s("tap_by_intent", "View post", false, &["Your post was sent"]),
+        ]);
+        let (d, _) = draft(&tr, &p, &dismiss(), &[]).unwrap();
+        assert!(
+            d.body.ends_with(
+                "5. tap_by_intent: Post\n6. tap_by_intent: Post now\n   完成标志: verify_text 「Your post was sent」\n7. tap_by_intent: View post"
+            ),
+            "确认那一下前面不该有完成标志：{}",
+            d.body
+        );
+        assert_eq!(d.maybe_one_off, vec![7], "两下发布都不是偶尔出现的步骤");
     }
 
     #[test]

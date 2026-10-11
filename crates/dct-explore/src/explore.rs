@@ -6,10 +6,12 @@
 //!    换回 `{名字}`（整段、整行，以及文字识别拆开 / 改了大小写空格的片段，见 `screen::Scrub`），
 //!    再把换行等控制字符压成空格，之后才交给任何人。`gate::screen_halt` → `Halted`（不调 Jeff、不调大模型、
 //!    不问用户选项，只把命中的那行字交给上层）。第一次看到的画面记进 `trace.first_lines`。
-//! 3. `Meter::over` → `Stopped`。
+//! 3. `Meter::over` → `Stopped`。点过发布、还在等确认（见 11）时时间和步数不算，只看连续没变，
+//!    另有 `MAX_AFTER_PUBLISH` 兜底。
 //! 4. 选项（`all_options` / `shortlist`）→ `Ladder::decide`；编号图只在真要问大模型或用户时才
 //!    `look(marks: true)` 去拿（见 `act::decide`）。用户说停 → `Stopped`；用户给的 key 不在选项里 → `Stopped`，不执行。
-//! 5. `Done` → `Published`；`Stuck` → `Stopped`。发布那一下落到新画面也直接 `Published`（见 8）。
+//! 5. `Done` → `Published`（还在等确认时先问用户发出去没有，见 11）；`Stuck` → `Stopped`。
+//!    发布那一下落到新画面、算得上发出去时也直接 `Published`（见 8、11）。
 //! 6. 选中的是发布：每一次都先 `Confirm::publish_ok`；不 → `DeclinedAtPublish`。
 //!    平台 `publish_by_user_only`：dct 不点，请用户自己点，点完说「是」，轨迹记成用户点的。
 //!    平台的发布词没核实（`unverified` 里有 `publish_words`）：每一下点击（点字、点图标、点输入框）
@@ -18,7 +20,8 @@
 //!    求助的画面也先过 `screen_halt`，命中就取消 dco 的运行 → `Halted`，不给任何人选）。
 //! 8. 执行后 `look`：scene_hash 和执行前一样、或是这次运行里见过的画面 → 失败：记在**选它的那个画面**
 //!    的 `Tries` 上（每个画面一份，绕回来也还在，所以 A↔B 来回绕时第二圈就交给大模型 / 用户）。
-//!    变了（新画面）→ 记 `TraceStep`、更新 `Progress`、写一行训练题；这一下是发布 → `Published`。
+//!    变了（新画面）→ 记 `TraceStep`、更新 `Progress`、写一行训练题；这一下是发布（或者还在等确认）
+//!    → 按 11 看新画面：发出去了 → `Published`；停下的画面 → `Halted`；还在等确认 → 接着走。
 //!
 //!    轨迹怎么记做了但没起作用的一下：照实记，`ok: false`。绕回见过的画面 S 时，轨迹里每步的 `ok`
 //!    和 `Progress` 恢复成上一次站在 S 时的样子——从 S 出发绕一圈又回到 S 的那几步一起变成
@@ -26,6 +29,18 @@
 //!    而做过的每一下都还在轨迹里。dco 回 failed 的那一下没有步骤可记，只记一笔失败。
 //! 9. 填过的参数下一轮在画面上看不到了 → 从 `filled` 里拿掉（会再填一次，发布按钮也会先消失）。
 //! 10. 窗口没了（`look` 回 `stale` / `not_found`）→ `Stopped`。
+//! 11. 两段式发布（「发布」→ 确认框「继续 / 发布」，TikTok「Post」→「Continue to post?」→「Post now」）：
+//!     点过发布落到的新画面，只有**没有能点的发布词按钮了**、或者**有平台表里核实过的「发出去了」那行字**
+//!     （`publish_done` 有、不在 `unverified` 里）才算发出去（`Screen::landed`）。否则记下 `pending`
+//!     （第一下发布的字），接着走：
+//!    - 时间、步数上限不再算（想发不发的那段时间不能把发出去的说成停下），连续没变照样停；
+//!      `pending` 期间最多再走 `MAX_AFTER_PUBLISH` 下。停下时说清楚帖子可能没发出去。
+//!    - 确认框上的「继续」「确定」不在平台表的发布词里，所以靠这条认：`pending` 期间**点什么（点字、
+//!      点图标）都算发布那一类**——照 6 先问用户（话里写明要点哪个字），`publish_by_user_only` 的平台
+//!      请用户自己点；轨迹里记成 `publish: true`，草稿两下都抄。填字也先问。绝不不问就点。
+//!    - 选「做完了」：规矩认不出发出去没有（比如 X 发完回到首页，左边栏还有 Post，「发出去了」那行字又没核实），
+//!      先问用户发出去了没有；说没有 → 记成这个画面上的一次失败（逐级往上），接着走。
+//!    - 用户不让点确认那一下 → `DeclinedAtPublish`（没发出去）。
 pub(crate) mod act;
 pub(crate) mod raw;
 mod run;
@@ -35,13 +50,13 @@ mod scrub;
 use crate::gate::{check_icon_name, Budget, Halt, IconName, Over};
 use crate::hands::{Hands, Params, StepReq};
 use crate::ladder::{Decision, Ladder, Who};
-use crate::options::{shortlist, state_text, Act, Goal};
+use crate::options::{shortlist, state_text, Act, Goal, Opt};
 use crate::platform::Platform;
 use crate::trace::{Trace, TraceStep};
 use act::write_row;
 use run::{advance, new_run, plain_step, record};
 pub use screen::values_on_screen;
-use screen::{look_error, see, Scrub};
+use screen::{look_error, see, Landed, Scrub};
 
 pub struct ExploreInput<'a> {
     pub platform: &'a Platform,
@@ -87,11 +102,15 @@ fn over_text(o: Over, b: &Budget) -> String {
     }
 }
 
-/// 发布那一下之后的新画面：停下的画面照样 `Halted`，否则 `Published`。
-fn published_or_halted(trace: Trace, post: &screen::Screen, scrub: &Scrub) -> Outcome {
-    match post.halt(scrub) {
-        Some(why) => Outcome::Halted { trace, why },
-        None => Outcome::Published(trace),
+/// 点过发布、还在等确认时最多再走几下（每一下点击都先问过用户；这条只防滚动 / 等待绕个没完）。
+pub const MAX_AFTER_PUBLISH: u32 = 10;
+
+/// 给用户看的「这一下要点的字」。
+fn word_of(opt: &Opt) -> String {
+    match &opt.act {
+        Act::Tap { intent, .. } | Act::Fill { intent, .. } => intent.clone(),
+        Act::TapIcon { name: Some(n), .. } => n.clone(),
+        _ => opt.text.clone(),
     }
 }
 
@@ -169,7 +188,15 @@ pub fn explore_from(
         r.arrive(&cur.key);
         // 3. 上限
         if let Some(o) = r.meter.over(&input.budget, clock.now_ms()) {
-            return r.stop(over_text(o, &input.budget));
+            // 11. 点过发布、还在等确认：时间和步数不算，连续没变照样停。
+            if r.pending.is_none() || o == Over::Unchanged {
+                return r.stop(over_text(o, &input.budget));
+            }
+        }
+        if r.pending.is_some() && r.after_publish >= MAX_AFTER_PUBLISH {
+            return r.stop(format!(
+                "点过发布以后又走了 {MAX_AFTER_PUBLISH} 下，还没看到发出去，停下"
+            ));
         }
         let fj = r.failed_jeff(&cur.key);
         // 4. 选项 → 逐级往上
@@ -210,11 +237,13 @@ pub fn explore_from(
                     return r.stop(format!("给图标起的名字不能交给 dco（{why}），停下"))
                 }
                 IconName::Publish => {
-                    let ready = input.text_params.iter().all(|p| on(p))
-                        && input
-                            .file_params
-                            .iter()
-                            .all(|p| r.prog.attached.contains(p));
+                    // 已经点过一次发布（确认框上）：内容在第一下之前核对过了。
+                    let ready = r.prog.published
+                        || (input.text_params.iter().all(|p| on(p))
+                            && input
+                                .file_params
+                                .iter()
+                                .all(|p| r.prog.attached.contains(p)));
                     if !ready {
                         return r.stop(
                             "给图标起的名字是发布词，可要发的内容还没全在画面上，不点，停下".into(),
@@ -225,9 +254,38 @@ pub fn explore_from(
                 IconName::Ok => {}
             }
         }
+        // 11. 点过发布、还在等确认：点什么都算发布那一类（确认框上的「继续」「确定」不是发布词）。
+        if r.pending.is_some() && matches!(opt.act, Act::Tap { .. } | Act::TapIcon { .. }) {
+            opt.publish = true;
+        }
         // 5. 做完 / 卡住
         match opt.act {
             Act::Done if r.prog.published => {
+                if let Some(first) = r.pending.clone() {
+                    // 11. 画面上还有发布按钮、「发出去了」那行字也没核实：规矩认不出，问用户。
+                    if pic.is_none() {
+                        pic = match act::marks_now(h, &input, &scrub) {
+                            Ok(p) => Some(p),
+                            Err(why) => {
+                                return Outcome::Halted {
+                                    trace: r.trace,
+                                    why,
+                                }
+                            }
+                        };
+                    }
+                    let summary = format!(
+                        "点过「{first}」了，可画面上还有发布按钮，dct 看不出 {} 上发出去了没有。发出去了吗？",
+                        input.platform.name
+                    );
+                    if !confirm.publish_ok(pic.clone().flatten().as_deref(), &summary) {
+                        // 没发出去：「做完了」算这个画面上的一次失败（逐级往上），连续没变照样记。
+                        r.meter.record(false);
+                        r.after_publish += 1;
+                        r.charge(&cur.key, &dec);
+                        continue;
+                    }
+                }
                 row(&dec, fj);
                 return Outcome::Published(r.trace);
             }
@@ -250,18 +308,19 @@ pub fn explore_from(
                     }
                 };
             }
-            let word = match &opt.act {
-                Act::Tap { intent, .. } => intent.clone(),
-                Act::TapIcon { name: Some(n), .. } => n.clone(),
-                _ => opt.text.clone(),
-            };
-            let summary = if by_user {
-                format!(
-                    "要发到 {} 了，内容已经填好。这个平台的发布按钮要你自己点：请在窗口里点「{word}」，点完回答「是」。",
-                    input.platform.name
-                )
-            } else {
-                format!("要发到 {} 了，内容已经填好，看一眼？", input.platform.name)
+            let word = word_of(&opt);
+            let name = &input.platform.name;
+            let summary = match (&r.pending, by_user) {
+                (Some(_), true) => format!(
+                    "{name} 还要再确认一下才会发出去。这个平台的发布按钮要你自己点：请在窗口里点「{word}」，点完回答「是」。"
+                ),
+                (Some(first), false) => format!(
+                    "已经点了「{first}」，{name} 还要再确认一下：下一下要点「{word}」把它发出去，可以吗？"
+                ),
+                (None, true) => format!(
+                    "要发到 {name} 了，内容已经填好。这个平台的发布按钮要你自己点：请在窗口里点「{word}」，点完回答「是」。"
+                ),
+                (None, false) => format!("要发到 {name} 了，内容已经填好，看一眼？"),
             };
             if !confirm.publish_ok(pic.clone().flatten().as_deref(), &summary) {
                 return Outcome::DeclinedAtPublish(r.trace);
@@ -270,7 +329,7 @@ pub fn explore_from(
                 // R11：不调 run_step，轨迹记成用户点的发布，再看一眼画面接着走。
                 let step = StepReq {
                     action: "tap_by_intent".into(),
-                    arg: word,
+                    arg: word.clone(),
                     done_when: None,
                 };
                 let post = match see(h, &input, &scrub) {
@@ -284,6 +343,9 @@ pub fn explore_from(
                 let changed = post.key != cur.key;
                 let fresh = changed && !r.seen(&post.key);
                 r.meter.record(changed);
+                if r.pending.is_some() {
+                    r.after_publish += 1;
+                }
                 row(&dec, fj);
                 record(
                     &mut r,
@@ -296,8 +358,19 @@ pub fn explore_from(
                 );
                 advance(&mut r, &opt);
                 if fresh {
-                    // 用户点完发布、画面换了：发出去了（换成登录 / 验证码 / 警告画面的不算）。
-                    return published_or_halted(r.trace, &post, &scrub);
+                    // 用户点完发布、画面换了：按 11 看算不算发出去（登录 / 验证码 / 警告画面照样停下）。
+                    match post.landed(&scrub, input.platform) {
+                        Landed::Halt(why) => {
+                            return Outcome::Halted {
+                                trace: r.trace,
+                                why,
+                            }
+                        }
+                        Landed::Sent => return Outcome::Published(r.trace),
+                        Landed::Pending => {
+                            r.pending.get_or_insert(word);
+                        }
+                    }
                 }
                 cur = post;
                 continue;
@@ -316,7 +389,7 @@ pub fn explore_from(
             .iter()
             .any(|u| u == "publish_words");
         let after_by_user = input.platform.publish_by_user_only && r.prog.published;
-        if !opt.publish && taps && (unverified || after_by_user) {
+        if !opt.publish && taps && (unverified || after_by_user || r.pending.is_some()) {
             if pic.is_none() {
                 pic = match act::marks_now(h, &input, &scrub) {
                     Ok(p) => Some(p),
@@ -328,14 +401,15 @@ pub fn explore_from(
                     }
                 };
             }
-            let word = match &opt.act {
-                Act::Tap { intent, .. } | Act::Fill { intent, .. } => intent.clone(),
-                Act::TapIcon { name: Some(n), .. } => n.clone(),
-                _ => opt.text.clone(),
-            };
+            let word = word_of(&opt);
             let summary = if unverified {
                 format!(
                     "{} 的发布按钮叫什么还没核实，dct 认不准哪一个是发布，所以每点一下都先问你：下一下要点「{word}」，可以吗？",
+                    input.platform.name
+                )
+            } else if let Some(first) = &r.pending {
+                format!(
+                    "点过「{first}」了，{} 可能还在等确认，这时做什么都先问你：下一下要点「{word}」，可以吗？",
                     input.platform.name
                 )
             } else {
@@ -367,16 +441,30 @@ pub fn explore_from(
             Err(why) => return r.stop(why),
         };
         r.meter.record(post.key != cur.key);
+        if r.pending.is_some() {
+            r.after_publish += 1;
+        }
         match done {
             Some(steps) if !r.seen(&post.key) => {
                 row(&dec, fj);
                 record(&mut r, &cur, &post, &opt, &dec, steps, true);
                 advance(&mut r, &opt);
-                if opt.publish {
-                    // 发布那一下落到了新画面：发出去了。不再走一轮去等「做完」，也不再看上限
-                    // （用户想发不发的那段时间算在上限里，不能把发出去的说成停下）。
-                    // 新画面是登录 / 验证码 / 警告的照样停下。
-                    return published_or_halted(r.trace, &post, &scrub);
+                if opt.publish || r.pending.is_some() {
+                    // 发布（或确认）那一下落到了新画面：按 11 看算不算发出去。算 → 马上 `Published`，
+                    // 不再走一轮去等「做完」，也不再看上限（用户想发不发的那段时间算在上限里，
+                    // 不能把发出去的说成停下）。登录 / 验证码 / 警告照样停下。还有发布按钮 → 接着走。
+                    match post.landed(&scrub, input.platform) {
+                        Landed::Halt(why) => {
+                            return Outcome::Halted {
+                                trace: r.trace,
+                                why,
+                            }
+                        }
+                        Landed::Sent => return Outcome::Published(r.trace),
+                        Landed::Pending => {
+                            r.pending.get_or_insert_with(|| word_of(&opt));
+                        }
+                    }
                 }
             }
             Some(steps) => {

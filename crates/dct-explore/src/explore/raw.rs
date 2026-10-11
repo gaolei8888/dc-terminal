@@ -69,6 +69,29 @@ impl Raw {
         })
     }
 
+    /// 画面上还有能点的发布按钮：界面元素的原文（fold 后）整句等于平台的发布词，且能点（同 `all_options` 认发布的规矩）。
+    pub(crate) fn has_publish_button(&self, p: &Platform) -> bool {
+        let words: Vec<String> = p.publish_words.iter().map(|w| fold(w)).collect();
+        self.ui().any(|e| {
+            let t = e.text.trim();
+            let f = fold(t);
+            !f.is_empty() && words.contains(&f) && tappable(t, p)
+        })
+    }
+
+    /// 画面上有平台表里核实过的「发出去了」那行字（`publish_done` 有、且不在 `unverified` 里）。
+    /// 只看界面元素：帖子里写着同样的字不算。
+    pub(crate) fn shows_publish_done(&self, p: &Platform) -> bool {
+        if p.unverified.iter().any(|u| u == "publish_done") {
+            return false;
+        }
+        let Some(done) = p.publish_done.as_deref().map(fold) else {
+            return false;
+        };
+        let done = done.trim().to_string();
+        !done.is_empty() && self.ui().any(|e| fold(&e.text).contains(&done))
+    }
+
     /// 脱敏后的元素，给外面看（值元素是 `{名字}`）。界面元素的原文正好是平台的发布词时保留原字（那是平台的词，不是用户的内容），
     /// 这样发布按钮不会因为帖子里也有这个词而认不出来。
     pub(crate) fn shown(&self, scrub: &Scrub, p: &Platform) -> Vec<El> {

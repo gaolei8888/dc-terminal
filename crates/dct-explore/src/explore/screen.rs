@@ -6,6 +6,7 @@ use super::ExploreInput;
 use crate::gate::{fold, Halt};
 use crate::hands::{El, Hands, Look};
 use crate::options::{all_options, Act, Goal, Opt, Progress};
+use crate::platform::Platform;
 use std::collections::{BTreeMap, HashMap};
 
 /// 参数值第一行，fold 后按空白切词；≥ 80% 的词出现在本画面所有元素字的 fold 拼接里
@@ -74,10 +75,31 @@ pub(super) fn see(h: &mut dyn Hands, inp: &ExploreInput, scrub: &Scrub) -> Resul
     })
 }
 
+/// 点过发布以后落到的新画面算什么。
+pub(super) enum Landed {
+    /// 登录 / 验证码 / 警告：照样停下
+    Halt(Halt),
+    /// 发出去了：没有能点的发布按钮了，或者有核实过的「发出去了」那行字
+    Sent,
+    /// 还有发布按钮、也没有核实过的那行字：平台可能还在等确认（两段式发布），接着走
+    Pending,
+}
+
 impl Screen {
     /// 登录 / 验证码 / 警告：按原文判断，报上去的那行字已脱敏。
     pub(super) fn halt(&self, scrub: &Scrub) -> Option<Halt> {
         self.raw.halt(scrub)
+    }
+
+    /// 点过发布（或确认）以后落到这个新画面：停下 / 发出去了 / 还在等确认。
+    pub(super) fn landed(&self, scrub: &Scrub, p: &Platform) -> Landed {
+        if let Some(why) = self.halt(scrub) {
+            Landed::Halt(why)
+        } else if self.raw.shows_publish_done(p) || !self.raw.has_publish_button(p) {
+            Landed::Sent
+        } else {
+            Landed::Pending
+        }
     }
 
     /// 选项：显示用脱敏后的字，能不能点按原文判断（值元素、禁点词、档位）；意图名里带参数占位符的

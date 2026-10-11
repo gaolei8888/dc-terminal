@@ -20,6 +20,7 @@ struct ScreenTries {
 struct Snap {
     ok: Vec<bool>,
     prog: Progress,
+    pending: Option<String>,
 }
 
 fn copy_prog(p: &Progress) -> Progress {
@@ -43,6 +44,11 @@ pub(super) struct Run {
     /// 字被清掉要再填时，用打字前的提示字当意图名）。执行前先记（打字失败也还能再填），
     /// 起作用的那个覆盖；修补时从开头的 `tap_by_intent` → `type_param` 记。
     pub(super) fills: HashMap<String, Opt>,
+    /// 点过发布、落到的新画面上还有发布按钮（平台可能还在等确认，见 `Landed::Pending`）：
+    /// 第一下发布的字。这时上限（时间、步数）不算，点什么都算发布那一类，先问用户。
+    pub(super) pending: Option<String>,
+    /// `pending` 期间做过的动作数（防止绕个没完，见 `MAX_AFTER_PUBLISH`）。
+    pub(super) after_publish: u32,
 }
 
 impl Run {
@@ -60,7 +66,9 @@ impl Run {
     pub(super) fn arrive(&mut self, key: &str) {
         let ok = self.trace.steps.iter().map(|s| s.ok).collect();
         let prog = copy_prog(&self.prog);
-        self.snaps.insert(key.to_string(), Snap { ok, prog });
+        let pending = self.pending.clone();
+        self.snaps
+            .insert(key.to_string(), Snap { ok, prog, pending });
     }
     /// 绕回见过的画面：轨迹的 `ok` 和进度恢复成上一次站在那儿时的样子。
     pub(super) fn back_to(&mut self, key: &str) {
@@ -69,6 +77,7 @@ impl Run {
                 t.ok = s.ok.get(i).copied().unwrap_or(false);
             }
             self.prog = copy_prog(&s.prog);
+            self.pending = s.pending.clone();
         }
     }
     /// 在 `key` 这个画面上选的那一下没起作用。
@@ -94,7 +103,12 @@ impl Run {
     pub(super) fn failed_jeff(&self, key: &str) -> Option<(String, f64)> {
         self.tries.get(key).and_then(|t| t.failed_jeff.clone())
     }
+    /// 停下。点过发布、还没看到发出去时说清楚：帖子可能没发出去。
     pub(super) fn stop(self, why: String) -> Outcome {
+        let why = match &self.pending {
+            Some(w) => format!("点过「{w}」，但还没看到发出去（平台可能还在等确认）：{why}"),
+            None => why,
+        };
         Outcome::Stopped {
             trace: self.trace,
             why,
@@ -155,6 +169,8 @@ pub(super) fn new_run(input: &ExploreInput, clock: &dyn Clock, prefix: Vec<Trace
         snaps: HashMap::new(),
         tries: HashMap::new(),
         fills: HashMap::new(),
+        pending: None,
+        after_publish: 0,
     }
 }
 
