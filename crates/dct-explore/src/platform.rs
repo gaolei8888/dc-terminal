@@ -227,7 +227,14 @@ never_tap = ["Subscribe"]
         for n in NEW_ROWS {
             let p = t.get(n).unwrap_or_else(|| panic!("缺 {n}"));
             validate(p).unwrap();
-            for f in ["entry_url", "publish_words"] {
+            for f in [
+                "entry_url",
+                "login_gate",
+                "publish_words",
+                "publish_done",
+                "vault",
+                "never_tap",
+            ] {
                 assert!(p.unverified.iter().any(|u| u == f), "{n} 应标 {f} 未核实");
             }
             assert!(p.login_gate.is_none() && p.publish_done.is_none(), "{n}");

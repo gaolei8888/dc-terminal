@@ -68,7 +68,7 @@ never_tap = ["关注", "薯条", "推广", "加热"]
 login_qr = true
 unverified = ["entry_url", "login_gate", "publish_done", "vault"]
 
-# 微博；首页直接发；登录有时是扫码
+# 微博；据说首页直接发，未核实；登录有时是扫码
 [[platform]]
 name = "weibo"
 domain = "weibo.com"
@@ -78,7 +78,7 @@ vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
 login_qr = true
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # B站投稿；登录常是手机扫码
 [[platform]]
@@ -90,7 +90,7 @@ vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
 login_qr = true
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 知乎想法
 [[platform]]
@@ -101,7 +101,7 @@ browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 知乎专栏文章（一个域名一行，所以和想法分开）
 [[platform]]
@@ -112,7 +112,7 @@ browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 抖音创作者；登录常是手机扫码
 [[platform]]
@@ -124,7 +124,7 @@ vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
 login_qr = true
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 快手创作者
 [[platform]]
@@ -135,7 +135,7 @@ browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 视频号；登录常是手机扫码
 [[platform]]
@@ -147,7 +147,7 @@ vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
 login_qr = true
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 头条 / 西瓜
 [[platform]]
@@ -158,9 +158,9 @@ browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
-# 公众号；登录扫码；编辑器难驱动，最后发布永远由用户点
+# 公众号；登录扫码；推广设计第 3 批说编辑器难驱动，最后发布由用户点（未在本机核实）
 [[platform]]
 name = "wechat_mp"
 domain = "mp.weixin.qq.com"
@@ -171,7 +171,7 @@ publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
 login_qr = true
 publish_by_user_only = true
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 百家号
 [[platform]]
@@ -182,4 +182,4 @@ browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "推广", "付费"]
-unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
