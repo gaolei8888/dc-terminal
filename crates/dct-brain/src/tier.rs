@@ -113,7 +113,7 @@ fn is_cjk(c: char) -> bool {
 /// 比词之前先把字摆正：全角变半角、去掉零宽字符、弯引号变直、去掉末尾的
 /// 省略号、去掉两个汉字之间的空格（OCR 常把「支付」认成「支 付」）、把粘在
 /// 一起的英文按大小写拆开（「SendNow」）、最后转小写。
-fn normalize(label: &str) -> String {
+pub fn normalize(label: &str) -> String {
     let mut chars: Vec<char> = label
         .chars()
         .filter_map(|c| match c {
