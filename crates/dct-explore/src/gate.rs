@@ -22,6 +22,9 @@ const LOGIN: &[&str] = &[
     "forgot password",
     "忘记密码",
     "create account",
+    "二维码",
+    "qr code",
+    "scan the code",
 ];
 const CAPTCHA: &[&str] = &[
     "captcha",
@@ -38,6 +41,13 @@ const CAPTCHA: &[&str] = &[
     "confirm it's you",
     "确认是你本人",
     "手机号验证",
+    "手机验证",
+    "phone verification",
+    "verification code",
+    "security check",
+    "are you human",
+    // normalize 已把弯引号变直，所以只写直引号一种
+    "verify you're human",
 ];
 const WARNING: &[&str] = &[
     "unusual activity",
@@ -49,6 +59,8 @@ const WARNING: &[&str] = &[
     "too many requests",
     "内容被限制",
     "violat",
+    "account disabled",
+    "账号被封",
 ];
 /// 通用禁点词；平台自己的在 `Platform::never_tap`。
 const NEVER: &[&str] = &[
@@ -273,6 +285,37 @@ mod tests {
         assert!(tappable("Cancel", x));
         assert!(!tappable("Pay $8", x), "动钱的按 dct-brain 的档位拦");
         assert!(!tappable("Delete", x), "不可撤回的也拦");
+    }
+
+    #[test]
+    fn platform_never_tap_is_enforced_on_its_own() {
+        let t = Table::seed()
+            .with_override(
+                "[[platform]]\nname = \"bsky\"\ndomain = \"bsky.app\"\nentry_url = \"https://bsky.app/\"\nbrowser = \"b\"\nvault = \"v\"\npublish_words = [\"Post\"]\nnever_tap = [\"Sponsor\"]\n",
+            )
+            .unwrap();
+        let bsky = t.get("bsky").unwrap();
+        let x = t.get("x").unwrap();
+        assert!(!tappable("Sponsor this", bsky));
+        assert!(!tappable("SPONSOR", bsky));
+        assert!(tappable("Sponsor this", x));
+    }
+
+    #[test]
+    fn default_budget_is_40_steps_10_minutes_3_unchanged() {
+        let b = Budget::default();
+        assert_eq!((b.max_steps, b.max_ms, b.max_unchanged), (40, 600_000, 3));
+    }
+
+    #[test]
+    fn time_limit_boundary_is_strictly_after_600_000_ms() {
+        let b = Budget::default();
+        let m = Meter::new(1_000);
+        assert!(
+            m.over(&b, 601_000).is_none(),
+            "exactly 10 minutes is still fine"
+        );
+        assert!(matches!(m.over(&b, 601_001), Some(Over::Time)));
     }
 
     #[test]
