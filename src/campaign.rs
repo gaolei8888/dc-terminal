@@ -75,8 +75,9 @@ pub fn parse_params(args: &[String]) -> Result<PerPlatform, String> {
     Ok(out)
 }
 
-/// 看不见或会改变显示顺序的字符：控制字符（换行、制表符除外）、格式字符（Cf）、
-/// 行/段分隔符（Zl、Zp）。std 没有字符类别接口，这里按范围列。
+/// 看不见或会改变显示顺序的字符：控制字符（换行、制表符除外），加上按 Unicode 15
+/// 手工列出的格式字符（Cf）和行/段分隔符（Zl、Zp）范围。std 没有字符类别接口，
+/// 所以这是一张写死的表，不是「凡 Cf 都拒」：以后 Unicode 新增的 Cf 要回来补。
 /// 放行 U+200D（ZWJ），不然组合 emoji 会坏；变体选择符不是 Cf，本来就放行。
 /// 标签字符 U+E0000–E007F 也拒（能藏字，只是旗帜 emoji 的子区域旗用它）。
 fn is_hidden_or_control(c: char) -> bool {
@@ -86,10 +87,26 @@ fn is_hidden_or_control(c: char) -> bool {
     let u = c as u32;
     c.is_control()
         || matches!(u,
-            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
             | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x206F
-            | 0xFEFF | 0xFFF9..=0xFFFB | 0x1BCA0..=0x1BCA3
+            | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
             | 0x1D173..=0x1D17A | 0xE0000..=0xE007F)
+}
+
+/// 平台名、参数名、值都过一遍：approve 存之前和 load 读之后用同一套。
+fn validate_per(per: &PerPlatform) -> Result<(), String> {
+    for (platform, params) in per {
+        if !valid_ident(platform) {
+            return Err(format!("平台名 `{platform}` 不合规"));
+        }
+        for (k, v) in params {
+            if !valid_ident(k) {
+                return Err(format!("参数名 `{k}` 不合规"));
+            }
+            check_value(&format!("{platform}.{k}"), v)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_value(key: &str, value: &str) -> Result<(), String> {
@@ -179,6 +196,7 @@ pub fn approve(
     if per.is_empty() || per.values().any(|m| m.is_empty()) {
         return Err("没有要批准的内容：至少一个 --param <平台>.<参数>=<值>".into());
     }
+    validate_per(&per)?;
     check_distinct(&per)?;
     if !ask(&render(name, &per)) {
         return Err("没有批准，什么都没存".into());
@@ -219,18 +237,7 @@ pub fn load(dir: &Path, name: &str) -> Result<Campaign, String> {
     let c: Campaign =
         serde_json::from_slice(&raw).map_err(|e| format!("活动 `{name}` 的记录坏了：{e}"))?;
     // 文件可能被手改过：和 parse_params 同一套检查，不让不可见字符溜进 dct do。
-    for (platform, params) in &c.per_platform {
-        if !valid_ident(platform) {
-            return Err(format!("活动 `{name}` 的记录里平台名 `{platform}` 不合规"));
-        }
-        for (k, v) in params {
-            if !valid_ident(k) {
-                return Err(format!("活动 `{name}` 的记录里参数名 `{k}` 不合规"));
-            }
-            check_value(&format!("{platform}.{k}"), v)
-                .map_err(|e| format!("活动 `{name}` 的记录被改过：{e}"))?;
-        }
-    }
+    validate_per(&c.per_platform).map_err(|e| format!("活动 `{name}` 的记录被改过：{e}"))?;
     Ok(c)
 }
 
@@ -542,6 +549,62 @@ mod tests {
         std::fs::write(&path, raw.replace("hello", "he\\u202Ello")).unwrap();
         assert!(load(d.path(), "c").unwrap_err().contains("202E"));
         std::fs::write(&path, raw.replace("\"x\"", "\"../x\"")).unwrap();
+        assert!(load(d.path(), "c").is_err());
+    }
+
+    #[test]
+    fn more_format_characters_are_refused() {
+        for bad in [
+            "\u{890}",
+            "\u{891}",
+            "\u{8E2}",
+            "\u{110BD}",
+            "\u{110CD}",
+            "\u{13430}",
+            "\u{1343F}",
+            "\u{600}",
+            "\u{61C}",
+            "\u{6DD}",
+            "\u{70F}",
+            "\u{180E}",
+            "\u{1BCA0}",
+            "\u{1D173}",
+        ] {
+            let arg = format!("x.post_text=a{bad}b");
+            assert!(parse_params(&[s("--param"), arg]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn approve_refuses_what_load_would_refuse() {
+        let d = tempfile::tempdir().unwrap();
+        for (plat, param, val) in [
+            ("x", "post_text", "a\u{202E}b"),
+            ("X", "post_text", "ok"),
+            ("x", "Post Text", "ok"),
+            ("x", "post_text", "a\u{110BD}b"),
+        ] {
+            let mut per = PerPlatform::new();
+            per.entry(plat.into())
+                .or_default()
+                .insert(param.into(), val.into());
+            let mut asked = false;
+            assert!(
+                approve(
+                    d.path(),
+                    "c",
+                    per,
+                    &mut |_| {
+                        asked = true;
+                        true
+                    },
+                    1
+                )
+                .is_err(),
+                "{plat} {param} {val:?}"
+            );
+            assert!(!asked);
+        }
         assert!(load(d.path(), "c").is_err());
     }
 }
