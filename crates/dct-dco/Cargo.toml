@@ -1,0 +1,15 @@
+[package]
+name = "dct-dco"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+# 测试用的假 dco（按 dco 真实的握手和回复形状说话）。只给 dev-dependencies 打开。
+fake = []
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

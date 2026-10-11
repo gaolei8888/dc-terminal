@@ -14,11 +14,7 @@ pub struct Profile {
     pub extra: Value, // inset / class_de / top_div / odd_share：原样带给 read_grid
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DcoError {
-    pub code: String,
-    pub message: String,
-}
+pub use dct_dco::DcoError;
 
 /// 一次 `see`（OCR）：画面上读到的字和它们的编号。`snapshot_id` 要原样交给 `tap`。
 #[derive(Clone, Debug)]

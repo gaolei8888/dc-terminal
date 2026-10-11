@@ -3,7 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
-members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game"]
+members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game", "crates/dct-dco"]
 
 [package]
 name = "dct"

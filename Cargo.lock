@@ -447,9 +447,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dct-dco"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dct-game"
 version = "0.1.0"
 dependencies = [
+ "dct-dco",
  "serde",
  "serde_json",
  "tempfile",
