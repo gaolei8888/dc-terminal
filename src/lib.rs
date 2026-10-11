@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod campaign;
 pub mod channel;
 pub mod cli;
 pub mod client;
@@ -10,7 +11,6 @@ pub mod gate;
 pub mod git;
 pub mod i18n;
 pub mod journal;
-pub mod campaign;
 pub mod judge;
 pub mod keys;
 pub mod last_sessions;

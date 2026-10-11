@@ -67,6 +67,15 @@ pub fn parse_params(args: &[String]) -> Result<PerPlatform, String> {
         if !valid_ident(param) {
             return Err(format!("参数名要写小写英文短名，这里是 `{param}`"));
         }
+        if let Some(c) = value
+            .chars()
+            .find(|c| c.is_control() && *c != '\n' && *c != '\t')
+        {
+            return Err(format!(
+                "`{key}` 的值里有控制字符（U+{:04X}）：只许普通文字、换行和制表符",
+                c as u32
+            ));
+        }
         out.entry(platform.to_string())
             .or_default()
             .insert(param.to_string(), value.to_string());
@@ -74,12 +83,27 @@ pub fn parse_params(args: &[String]) -> Result<PerPlatform, String> {
     Ok(out)
 }
 
-/// 开头句：到第一个句末标点或换行为止，去掉首尾空白、统一小写。
+/// 开头句：到第一个句末标点或换行为止（`.` 只在后面是空白或结尾时才算，
+/// `v1.2`、`e.g.`、网址不会被截断），内部空白合成一个空格、统一小写。
 fn opening_sentence(text: &str) -> String {
-    let end = text
-        .find(['.', '!', '?', '。', '！', '？', '\n'])
-        .unwrap_or(text.len());
-    text[..end].trim().to_lowercase()
+    let chars: Vec<char> = text.chars().collect();
+    let mut end = chars.len();
+    for (i, c) in chars.iter().enumerate() {
+        let stop = match c {
+            '!' | '?' | '。' | '！' | '？' | '\n' => true,
+            '.' => chars.get(i + 1).is_none_or(|n| n.is_whitespace()),
+            _ => false,
+        };
+        if stop {
+            end = i;
+            break;
+        }
+    }
+    let head: String = chars[..end].iter().collect();
+    head.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// 同一活动里各平台的 `post_text` 不能相同，开头句也不能相同。
@@ -109,7 +133,12 @@ fn render(name: &str, per: &PerPlatform) -> String {
     for (platform, params) in per {
         s.push_str(&format!("\n[{platform}]\n"));
         for (k, v) in params {
-            s.push_str(&format!("  {k}: {v}\n"));
+            // 多行的值：续行统一缩进并加 `| `，值里的 `[x]` 不会像小节标题。
+            let mut lines = v.split('\n');
+            s.push_str(&format!("  {k}: {}\n", lines.next().unwrap_or("")));
+            for l in lines {
+                s.push_str(&format!("      | {l}\n"));
+            }
         }
     }
     s
@@ -384,5 +413,64 @@ mod tests {
         let c = approve(d.path(), "v", p, &mut |_| true, 5).unwrap();
         assert_eq!(c.per_platform["tiktok"]["video"], "~/v/a.mp4");
         assert_eq!(c.approved_at, 5);
+    }
+
+    #[test]
+    fn control_characters_in_values_are_refused() {
+        for bad in [
+            "x.post_text=a\x1b[2Kb",
+            "x.post_text=a\rb",
+            "x.post_text=a\x07b",
+            "x.post_text=a\u{85}b",
+        ] {
+            assert!(parse_params(&[s("--param"), s(bad)]).is_err(), "{bad:?}");
+        }
+        let ok = parse_params(&[s("--param"), s("x.post_text=line1\nline2\tend")]).unwrap();
+        assert_eq!(ok["x"]["post_text"], "line1\nline2\tend");
+    }
+
+    #[test]
+    fn a_multiline_value_cannot_forge_a_section_header() {
+        let p = parse_params(&[
+            s("--param"),
+            s("x.post_text=hello\n[tiktok]\n  post_text: evil"),
+        ])
+        .unwrap();
+        let shown = render("c", &p);
+        let headers: Vec<&str> = shown.lines().filter(|l| l.starts_with('[')).collect();
+        assert_eq!(headers, vec!["[x]"], "{shown}");
+        assert!(
+            shown
+                .lines()
+                .filter(|l| l.starts_with("  post_text:"))
+                .count()
+                == 1,
+            "{shown}"
+        );
+        assert!(shown.contains("evil"));
+    }
+
+    #[test]
+    fn opening_sentence_ignores_inner_dots_and_extra_whitespace() {
+        assert_eq!(
+            opening_sentence("Version v1.2 is out. More"),
+            "version v1.2 is out"
+        );
+        assert_eq!(
+            opening_sentence("See https://a.b/c now! x"),
+            "see https://a.b/c now"
+        );
+        assert_eq!(
+            opening_sentence("Use e.g.cats   and\tv1.2 now. x"),
+            "use e.g.cats and v1.2 now"
+        );
+        let p = parse_params(&[
+            s("--param"),
+            s("x.post_text=New   video  out. a"),
+            s("--param"),
+            s("fb.post_text=new video out. b"),
+        ])
+        .unwrap();
+        assert!(check_distinct(&p).is_err());
     }
 }
