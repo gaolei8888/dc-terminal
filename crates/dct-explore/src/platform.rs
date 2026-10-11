@@ -18,6 +18,12 @@ pub struct Platform {
     pub publish_words: Vec<String>,
     pub publish_done: Option<String>,
     pub never_tap: Vec<String>,
+    /// 登录常是手机扫码。只是信息：登录/二维码画面本来就会停下交给用户，字不发给任何模型。
+    #[serde(default)]
+    pub login_qr: bool,
+    /// 最后的发布一下永远留给用户点（重放和 `dct do` 照此办理）。
+    #[serde(default)]
+    pub publish_by_user_only: bool,
     /// 哪些字段还没在真机上看过
     #[serde(default)]
     pub unverified: Vec<String>,
@@ -178,11 +184,15 @@ never_tap = ["Subscribe"]
             )
             .unwrap();
         assert_eq!(t.get("x").unwrap().browser, "Microsoft Edge");
-        assert_eq!(t.rows.len(), 6, "same name replaces, not appends");
+        assert_eq!(
+            t.rows.len(),
+            Table::seed().rows.len(),
+            "same name replaces, not appends"
+        );
         let t2 = Table::seed()
             .with_override("[[platform]]\nname = \"bsky\"\ndomain = \"bsky.app\"\nentry_url = \"https://bsky.app/\"\nbrowser = \"b\"\nvault = \"v\"\npublish_words = [\"Post\"]\nnever_tap = []\n")
             .unwrap();
-        assert_eq!(t2.rows.len(), 7);
+        assert_eq!(t2.rows.len(), Table::seed().rows.len() + 1);
         assert!(Table::seed().with_override("[[platform]]\nname = \"Bad Name\"\ndomain = \"a.com\"\nentry_url = \"https://a.com\"\nbrowser = \"b\"\nvault = \"v\"\npublish_words = [\"Go\"]\nnever_tap = []\n").is_err());
         assert!(Table::seed().with_override("not toml [[").is_err());
     }
@@ -195,5 +205,63 @@ never_tap = ["Subscribe"]
             validate(&p).is_err(),
             "没有发布词就认不出最后那一下，不能摸索"
         );
+    }
+
+    const NEW_ROWS: [&str; 10] = [
+        "weibo",
+        "bilibili",
+        "zhihu",
+        "zhihu_article",
+        "douyin",
+        "kuaishou",
+        "wechat_channels",
+        "toutiao",
+        "wechat_mp",
+        "baijiahao",
+    ];
+
+    #[test]
+    fn chinese_platforms_are_seeded_and_valid() {
+        let t = Table::seed();
+        assert_eq!(t.rows.len(), 16);
+        for n in NEW_ROWS {
+            let p = t.get(n).unwrap_or_else(|| panic!("缺 {n}"));
+            validate(p).unwrap();
+            for f in ["entry_url", "publish_words"] {
+                assert!(p.unverified.iter().any(|u| u == f), "{n} 应标 {f} 未核实");
+            }
+            assert!(p.login_gate.is_none() && p.publish_done.is_none(), "{n}");
+        }
+    }
+
+    #[test]
+    fn qr_login_and_publish_by_user_flags() {
+        let t = Table::seed();
+        for n in [
+            "douyin",
+            "xiaohongshu",
+            "wechat_channels",
+            "wechat_mp",
+            "weibo",
+            "bilibili",
+        ] {
+            assert!(t.get(n).unwrap().login_qr, "{n} login_qr");
+        }
+        let by_user: Vec<&str> = t
+            .rows
+            .iter()
+            .filter(|p| p.publish_by_user_only)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(by_user, ["wechat_mp"]);
+    }
+
+    #[test]
+    fn override_without_the_new_fields_defaults_both_to_false() {
+        let t = Table::seed()
+            .with_override("[[platform]]\nname = \"bsky\"\ndomain = \"bsky.app\"\nentry_url = \"https://bsky.app/\"\nbrowser = \"b\"\nvault = \"v\"\npublish_words = [\"Post\"]\nnever_tap = []\n")
+            .unwrap();
+        let p = t.get("bsky").unwrap();
+        assert!(!p.login_qr && !p.publish_by_user_only);
     }
 }
