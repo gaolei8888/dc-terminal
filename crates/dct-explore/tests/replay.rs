@@ -487,3 +487,42 @@ fn help_is_answered_at_most_five_times() {
     assert_eq!(h.sent_answers.len(), 5);
     assert!(h.calls.contains(&"cancel_run r1".to_string()));
 }
+
+#[test]
+fn a_login_wall_during_replay_help_halts_even_when_the_post_text_says_log_in() {
+    let t = Table::seed();
+    let p = t.get("x").unwrap();
+    let pr = x_proc(true);
+    let mut h = FakeHands::new();
+    h.push_procedure(help_reply(
+        "r1",
+        5,
+        vec![
+            el("e1", "Log in to X", 0.1, 0.1),
+            el("e2", "Log in", 0.3, 0.3),
+            el("e3", "Post", 0.5, 0.5),
+        ],
+    ));
+    let (j, mut u) = (jeff(Some(("e3", 0.99))), U(Some("e3"), vec![]));
+    let m = M("e3", RefCell::new(0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let mut inp = input(&pr, p, false);
+    inp.params
+        .insert("post_text".into(), "Log in to see our new robot kit".into());
+    let out = replay(&mut h, &mut lad, inp);
+    match out {
+        ReplayOutcome::Stopped(why) => {
+            assert!(!why.to_lowercase().contains("log in to"), "{why}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(h.calls.contains(&"cancel_run r1".to_string()));
+    assert!(j.1.borrow().is_empty() && u.1.is_empty());
+    assert_eq!(*m.1.borrow(), 0);
+    assert!(h.sent_answers.is_empty());
+}

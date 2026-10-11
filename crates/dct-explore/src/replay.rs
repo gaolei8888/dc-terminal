@@ -2,16 +2,18 @@
 //!
 //! - 只重放 `executable == true` 的流程；草稿一律不碰（`Stopped`，不调 dco）。dct 绝不自己改这个字段。
 //! - `needs_help`：选项 = `help.elements` 各一项 + `not_there` + `stuck`，经同一个 `Ladder` 往上问
-//!   （Jeff / 大模型的回答发 `by: model`，用户的发 `by: user`）。画面上的字先脱敏（参数值换回 `{名字}`、
-//!   换行压成空格），再过 `gate::screen_halt`：登录 / 验证码 / 警告 → 取消 dco 的运行、返回 `Stopped`，
+//!   （Jeff / 大模型的回答发 `by: model`，用户的发 `by: user`）。先按画面**原文**过 `gate::screen_halt`
+//!   和禁点 / 档位（原文只在内存里，见 `explore/raw.rs`），出去的字才脱敏（参数值换回 `{名字}`、
+//!   换行压成空格）：登录 / 验证码 / 警告 → 取消 dco 的运行、返回 `Stopped`（那行字已脱敏），
 //!   不问任何人（选 `Stopped` 而不是另造一个 Halted：上层都是「停下交给用户」）。同一个运行最多答 5 次。
 //! - `failed`：note 里有超时 / 急停 / 锁屏 / 私人画面的固定词 → `Stopped`；否则是流程本身走不通 →
 //!   `NeedsRepair`，`prefix` 是流程第 1..卡住那步之前的每一步（`from_procedure`、`by: User`、`ok`）。
 //! - `blocked`（档位）→ `Blocked`，转给用户。
 //! - 平台 `publish_by_user_only`：永远当预览跑（`stop_before_step` = 发布那一步），结果 `Previewed`，
 //!   由用户自己点发布；找不到发布那一步 → `Stopped`，绝不跑到底。预览时 dco 若没停就跑完了 → `Stopped`（如实说）。
+use crate::explore::raw::Raw;
 use crate::explore::screen::Scrub;
-use crate::gate::{fold, screen_halt, tappable};
+use crate::gate::{fold, tappable};
 use crate::hands::{By, El, Hands, HelpAnswer, Params, RunReply};
 use crate::ladder::{Ladder, Tries, Who};
 use crate::options::{neighbour_hint, Act, Opt};
@@ -293,8 +295,9 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
                 "同一次重放已经答了 {MAX_ANSWERS} 次求助，停下"
             ));
         }
-        let els = scrub.els(&help.elements);
-        if let Some(why) = screen_halt(&els) {
+        // 规矩看原文（停下、禁点词、档位），出去的字看脱敏后的（见 explore/raw.rs）。
+        let raw = Raw::new(&help.elements);
+        if let Some(why) = raw.halt(&scrub) {
             let _ = h.cancel_run(&run_id);
             return ReplayOutcome::Stopped(format!(
                 "重放时画面变成了登录 / 验证码 / 警告（{why:?}），停下交给你；没有问任何模型"
@@ -308,12 +311,18 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
             intent,
             scrub.line(&help.question)
         );
+        let els = raw.shown(&scrub, input.platform);
         for e in els.iter().take(200) {
             let t = e.text.trim();
             let t = if t.is_empty() { "（没有字）" } else { t };
             state.push_str(&format!("[{}] {}\n", e.id, t));
         }
-        let (short, all) = options(&els, &intent, input.platform);
+        let pickable: Vec<El> = els
+            .iter()
+            .filter(|e| raw.tappable(&e.id, input.platform))
+            .cloned()
+            .collect();
+        let (short, all) = options(&pickable, &intent, input.platform);
         let Some(dec) = lad.decide(&state, &short, &all, help.picture_png.as_deref(), &tries)
         else {
             let _ = h.cancel_run(&run_id);
@@ -330,11 +339,15 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
                 return ReplayOutcome::Stopped("求助时没人认得出是哪一个，停下".into());
             }
             NOT_THERE => HelpAnswer::NotThere,
-            key => match els.iter().find(|e| e.id == key) {
+            key => match pickable.iter().find(|e| e.id == key) {
                 Some(e) => HelpAnswer::Element {
                     id: e.id.clone(),
                     by,
-                    name: dec.name.as_deref().map(|n| scrub.line(n)),
+                    name: dec
+                        .name
+                        .as_deref()
+                        .map(|n| scrub.line(n))
+                        .filter(|n| !scrub.has_placeholder(n)),
                     dismiss: false,
                 },
                 None => {

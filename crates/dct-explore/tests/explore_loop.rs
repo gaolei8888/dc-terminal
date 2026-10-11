@@ -1103,7 +1103,7 @@ fn declining_under_publish_by_user_only_stops_before_publish() {
 }
 
 #[test]
-fn an_icon_name_or_dco_error_that_repeats_the_value_is_redacted() {
+fn a_dco_error_that_repeats_the_value_is_redacted() {
     let t = Table::seed();
     let d = tempfile::tempdir().unwrap();
     let a = || {
@@ -1119,9 +1119,6 @@ fn an_icon_name_or_dco_error_that_repeats_the_value_is_redacted() {
     h.push_step(done("r0"));
     h.push_look(a());
     h.push_look(a()); // 编号图
-    h.push_step(done("r1"));
-    h.push_look(look("b", vec![el("e8", "Media", "text", 0.4, 0.3)]));
-    h.push_look(look("b", vec![el("e8", "Media", "text", 0.4, 0.3)])); // 编号图
     h.steps.push_back(Err(dct_dco::DcoError {
         code: "boom".into(),
         message: format!("could not use {TEXT}"),
@@ -1129,7 +1126,7 @@ fn an_icon_name_or_dco_error_that_repeats_the_value_is_redacted() {
     let (j, m, mut u) = (
         NoJeff,
         NoModel,
-        ScriptUser(vec![("e5", Some(TEXT)), ("scroll_down", None)], 0),
+        ScriptUser(vec![("e5", Some("add media"))], 0),
     );
     let mut lad = Ladder {
         jeff: &j,
@@ -1139,10 +1136,200 @@ fn an_icon_name_or_dco_error_that_repeats_the_value_is_redacted() {
     };
     let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
     match out {
-        Outcome::Stopped { trace, why } => {
-            assert!(!why.contains(TEXT), "{why}");
-            assert_eq!(trace.steps[1].arg, "{post_text}");
+        Outcome::Stopped { why, .. } => assert!(!why.contains(TEXT), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// ---- fix round 2 ----
+
+#[test]
+fn an_icon_name_that_is_only_a_placeholder_is_never_sent_to_dco() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e2", "What's happening?", "textarea", 0.45, 0.25),
+                el("e5", "", "image", 0.3, 0.35),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图
+    let (j, m, mut u) = (NoJeff, NoModel, ScriptUser(vec![("e5", Some(TEXT))], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
+}
+
+fn login_screen_halts_for(value: &str, screen: Vec<El>) {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut inp = input(&t, d.path());
+    inp.params.insert("post_text".into(), value.into());
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(look("a", screen));
+    let j = rec(vec!["e1"]);
+    let (m, mut u) = (NoModel, ScriptUser(vec![("e1", None)], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, inp);
+    match out {
+        Outcome::Halted {
+            why: Halt::Login(line),
+            ..
+        } => {
+            assert_no_fragment(&line, value, "报上去的那行字");
+            if value.is_ascii() {
+                assert!(line.contains("{post_text}"), "{line}");
+            }
         }
         other => panic!("{other:?}"),
     }
+    assert!(j.states.borrow().is_empty(), "登录画面没发给 Jeff");
+    assert_eq!(u.1, 0);
+}
+
+#[test]
+fn a_login_screen_halts_even_when_the_post_text_says_log_in() {
+    login_screen_halts_for(
+        "Log in to see our new robot kit",
+        vec![
+            el("e1", "Log in to X", "text", 0.4, 0.2),
+            el("e2", "Log in", "button", 0.4, 0.5),
+        ],
+    );
+}
+
+#[test]
+fn a_login_screen_halts_even_when_the_post_text_says_scan_to_log_in() {
+    login_screen_halts_for(
+        "扫码登录就能看到我们的新机器人",
+        vec![
+            el("e1", "扫码登录", "text", 0.4, 0.2),
+            el("e2", "帮助", "button", 0.4, 0.5),
+        ],
+    );
+}
+
+#[test]
+fn a_post_saying_follow_us_does_not_make_a_follow_button_tappable() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut inp = input(&t, d.path());
+    inp.params.insert(
+        "post_text".into(),
+        "Please follow us for more robots".into(),
+    );
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e2", "What's happening?", "textarea", 0.45, 0.25),
+                el("e7", "Follow us", "button", 0.7, 0.1),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图（用户说停）
+    let j = rec(vec![]);
+    let (m, mut u) = (NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let _ = explore(&mut h, &mut lad, &mut Yes(0), &T0, inp);
+    let q = &j.questions.borrow()[0];
+    assert!(
+        q.criteria.iter().all(|(k, _)| k != "e7"),
+        "{:?}",
+        q.criteria
+    );
+}
+
+/// 按脚本答「发不发」，记下问了几次。
+struct Answers(Vec<bool>, usize);
+impl Confirm for Answers {
+    fn publish_ok(&mut self, _: Option<&str>, _: &str) -> bool {
+        self.1 += 1;
+        self.0.get(self.1 - 1).copied().unwrap_or(false)
+    }
+}
+
+#[test]
+fn every_publish_tap_asks_first_even_after_a_publish_that_did_nothing() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer_filled("a"));
+    h.push_look(composer_filled("a")); // 编号图（问发不发）
+    h.push_step(done("r1")); // tap_by_intent: Post
+    h.push_look(composer_filled("a")); // 画面没变
+    h.push_look(composer_filled("a")); // 编号图（问用户）
+    let (j, m, mut u) = (sure(vec!["e3"]), NoModel, ScriptUser(vec![("e3", None)], 0));
+    let mut ans = Answers(vec![true, false], 0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut ans, &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::DeclinedAtPublish(_)), "{out:?}");
+    assert_eq!(ans.1, 2, "第二次点发布前又问了一次");
+    assert_eq!(count(&h, "run_step tap_by_intent: Post"), 1);
+}
+
+#[test]
+fn a_publish_word_inside_the_post_text_is_still_recognised_as_publish() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut inp = input_for(&t, "tiktok", d.path());
+    let v = "Post now and see the robot kit";
+    inp.params.insert("post_text".into(), v.into());
+    let a = || {
+        look(
+            "a",
+            vec![
+                el("e2", v, "textarea", 0.45, 0.25),
+                el("e3", "Post now", "button", 0.8, 0.35),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图（问发不发）
+    let (j, m, mut u) = (sure(vec!["e3"]), NoModel, ScriptUser(vec![], 0));
+    let mut ans = Answers(vec![false], 0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut ans, &T0, inp);
+    assert!(matches!(out, Outcome::DeclinedAtPublish(_)), "{out:?}");
+    assert_eq!(ans.1, 1);
+    assert_eq!(h.step_calls.len(), 1);
 }

@@ -37,7 +37,6 @@ pub(super) struct Run {
     pub(super) meter: Meter,
     /// 这次运行里看到过的画面指纹 → 上一次站在那儿时的样子
     snaps: HashMap<String, Snap>,
-    pub(super) asked_publish: bool,
     /// 画面指纹 → 在那个画面上选的、没起作用的次数
     tries: HashMap<String, ScreenTries>,
 }
@@ -150,7 +149,6 @@ pub(super) fn new_run(input: &ExploreInput, clock: &dyn Clock, prefix: Vec<Trace
         },
         meter: Meter::new(clock.now_ms()),
         snaps: HashMap::new(),
-        asked_publish: false,
         tries: HashMap::new(),
     }
 }

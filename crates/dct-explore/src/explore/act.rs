@@ -1,10 +1,12 @@
 //! 摸索循环里的两件事：问谁（编号图按需才拿）和执行一个选项（求助、拦下、失败）。
+use super::raw::Raw;
 use super::screen::{look_error, Scrub};
 use super::{Clock, ExploreInput};
-use crate::gate::{fold, screen_halt, Halt};
+use crate::gate::{fold, Halt};
 use crate::hands::{By, El, Hands, Help, HelpAnswer, RunReply, StepReq};
 use crate::ladder::{Decision, Ladder, Model, ModelPick, Tries, User, UserPick, Who};
 use crate::options::{steps_for, Act, Opt};
+use crate::platform::Platform;
 use crate::trace::{append_question, QuestionRow};
 use std::cell::RefCell;
 
@@ -47,7 +49,7 @@ impl Pics<'_> {
     fn get(&mut self) -> Option<String> {
         if self.got.is_none() {
             let p = match self.h.look(self.window, true) {
-                Ok(l) => match screen_halt(&self.scrub.els(&l.elements)) {
+                Ok(l) => match Raw::new(&l.elements).halt(self.scrub) {
                     Some(h) => {
                         self.halt = Some(h);
                         None
@@ -175,15 +177,23 @@ fn center(e: &El) -> (f64, f64) {
 
 /// dco 求助时怎么答：在 `help.elements` 里找和选中元素同字、中心点很近的那一个；
 /// 正好一个就直接答（Jeff 和大模型发 model，用户发 user），否则把编号图交给用户选。
+/// 候选只有原文能点的元素（禁点词、档位按原文判断）；显示的字已脱敏。
+#[allow(clippy::too_many_arguments)]
 fn answer_for(
     help: &Help,
+    raw: &Raw,
     opt: &Opt,
     by: Who,
     user: &mut dyn User,
     state: &str,
     scrub: &Scrub,
+    p: &Platform,
 ) -> Option<HelpAnswer> {
-    let els = scrub.els(&help.elements);
+    let els: Vec<El> = raw
+        .shown(scrub, p)
+        .into_iter()
+        .filter(|e| raw.tappable(&e.id, p))
+        .collect();
     let (target, icon_name) = match &opt.act {
         Act::Tap { el, .. } => (Some(el), None),
         Act::TapIcon { el, name } => (Some(el), name.clone()),
@@ -229,12 +239,16 @@ fn answer_for(
         "dco 找不到「{}」是哪一个，请在编号图上指出来",
         scrub.line(&help.intent)
     );
-    let p = user.pick(state, &opts, help.picture_png.as_deref(), &why)?;
-    let e = els.iter().find(|e| e.id == p.key)?;
+    let pick = user.pick(state, &opts, help.picture_png.as_deref(), &why)?;
+    let e = els.iter().find(|e| e.id == pick.key)?;
     Some(HelpAnswer::Element {
         id: e.id.clone(),
         by: By::User,
-        name: p.name.map(|n| scrub.line(&n)).or(icon_name),
+        name: pick
+            .name
+            .map(|n| scrub.line(&n))
+            .filter(|n| !scrub.has_placeholder(n))
+            .or(icon_name),
         dismiss: false,
     })
 }
@@ -268,12 +282,16 @@ pub(super) fn execute(
                 "needs_help" if rounds < MAX_HELP_ROUNDS => {
                     rounds += 1;
                     let help = rep.help.as_ref();
-                    // 求助的画面也先过停下的规矩：命中就取消，不交给任何人去选。
-                    if let Some(why) = help.and_then(|hp| screen_halt(&scrub.els(&hp.elements))) {
+                    let raw = help.map(|hp| Raw::new(&hp.elements));
+                    // 求助的画面也先过停下的规矩（按原文）：命中就取消，不交给任何人去选。
+                    if let Some(why) = raw.as_ref().and_then(|r| r.halt(scrub)) {
                         let _ = h.cancel_run(&rep.run_id);
                         return Exec::Halt(why);
                     }
-                    let a = help.and_then(|help| answer_for(help, opt, by, user, state, scrub));
+                    let p = input.platform;
+                    let a = help.zip(raw.as_ref()).and_then(|(help, raw)| {
+                        answer_for(help, raw, opt, by, user, state, scrub, p)
+                    });
                     let Some(a) = a else {
                         let _ = h.cancel_run(&rep.run_id);
                         return Exec::Stop("dco 求助时没人指出是哪一个，停下".into());

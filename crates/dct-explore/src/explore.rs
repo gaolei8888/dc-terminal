@@ -10,7 +10,7 @@
 //! 4. 选项（`all_options` / `shortlist`）→ `Ladder::decide`；编号图只在真要问大模型或用户时才
 //!    `look(marks: true)` 去拿（见 `act::decide`）。用户说停 → `Stopped`；用户给的 key 不在选项里 → `Stopped`，不执行。
 //! 5. `Done` → `Published`；`Stuck` → `Stopped`。
-//! 6. 选中的是发布：这次还没问过 → `Confirm::publish_ok`；不 → `DeclinedAtPublish`。
+//! 6. 选中的是发布：每一次都先 `Confirm::publish_ok`；不 → `DeclinedAtPublish`。
 //!    平台 `publish_by_user_only`：dct 不点，请用户自己点，点完说「是」，轨迹记成用户点的。
 //! 7. `steps_for` → 逐步 `run_step`（`act::execute`：求助、拦下、失败的处理都在那里；
 //!    求助的画面也先过 `screen_halt`，命中就取消 dco 的运行 → `Halted`，不给任何人选）。
@@ -25,13 +25,14 @@
 //! 9. 填过的参数下一轮在画面上看不到了 → 从 `filled` 里拿掉（会再填一次，发布按钮也会先消失）。
 //! 10. 窗口没了（`look` 回 `stale` / `not_found`）→ `Stopped`。
 mod act;
+pub(crate) mod raw;
 mod run;
 pub(crate) mod screen;
 
-use crate::gate::{screen_halt, Budget, Halt, Over};
+use crate::gate::{Budget, Halt, Over};
 use crate::hands::{Hands, Params, StepReq};
 use crate::ladder::{Decision, Ladder, Who};
-use crate::options::{all_options, shortlist, state_text, Act, Goal};
+use crate::options::{shortlist, state_text, Act, Goal};
 use crate::platform::Platform;
 use crate::trace::{Trace, TraceStep};
 use act::write_row;
@@ -136,7 +137,7 @@ pub fn explore_from(
     };
     loop {
         // 2. 停下的画面：什么都不问
-        if let Some(why) = screen_halt(&cur.look.elements) {
+        if let Some(why) = cur.halt(&scrub) {
             return Outcome::Halted {
                 trace: r.trace,
                 why,
@@ -157,7 +158,7 @@ pub fn explore_from(
         let fj = r.failed_jeff(&cur.key);
         // 4. 选项 → 逐级往上
         let on = |p: &str| cur.on_screen.get(p).copied().unwrap_or(false);
-        let all = all_options(&cur.look, &goal, &r.prog, &on);
+        let all = cur.options(&goal, &r.prog, &scrub, &on);
         let short = shortlist(&all, &goal);
         let state = state_text(&goal, &r.trail(), &cur.look);
         let row = |d: &Decision, fj| write_row(&answers, clock, &input, &state, &all, d, fj);
@@ -178,13 +179,12 @@ pub fn explore_from(
         };
         let mut opt = base.clone();
         if let Act::TapIcon { name, .. } = &mut opt.act {
-            // 名字会进轨迹、交给 dco：参数值一样换回 `{名字}`。
-            *name = dec
-                .name
-                .as_deref()
-                .map(|n| scrub.line(n))
-                .or(name.take())
-                .filter(|n| !n.trim().is_empty());
+            // 名字会进轨迹、交给 dco：参数值一样换回 `{名字}`；换完只剩占位符的名字不能用。
+            let given = dec.name.as_deref().map(|n| scrub.line(n));
+            if given.as_deref().is_some_and(|n| scrub.has_placeholder(n)) {
+                return r.stop("图标的名字里是要发的内容，不能当名字交给 dco，停下".into());
+            }
+            *name = given.or(name.take()).filter(|n| !n.trim().is_empty());
             if name.is_none() {
                 return r.stop("选了一个没字的图标，但没给它起名字，没法交给 dco".into());
             }
@@ -201,7 +201,8 @@ pub fn explore_from(
         }
         // 6. 最终发布先问用户
         let by_user = opt.publish && input.platform.publish_by_user_only;
-        if opt.publish && (by_user || !r.asked_publish) {
+        // 每一次点「最终发布」都先问（不只第一次）：上一次点了没反应、又要点时也问，绝不悄悄发第二次。
+        if opt.publish {
             if pic.is_none() {
                 pic = match act::marks_now(h, &input, &scrub) {
                     Ok(p) => Some(p),
@@ -228,7 +229,6 @@ pub fn explore_from(
             if !confirm.publish_ok(pic.flatten().as_deref(), &summary) {
                 return Outcome::DeclinedAtPublish(r.trace);
             }
-            r.asked_publish = true;
             if by_user {
                 // R11：不调 run_step，轨迹记成用户点的发布，再看一眼画面接着走。
                 let step = StepReq {

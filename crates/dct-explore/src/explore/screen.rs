@@ -1,8 +1,10 @@
 //! 看一眼画面：参数值换回 `{名字}`（整段、整行、以及被文字识别拆开 / 改了大小写空格的片段），
 //! 控制字符压成空格，算画面指纹和参数在不在画面上。
+use super::raw::Raw;
 use super::ExploreInput;
-use crate::gate::fold;
+use crate::gate::{fold, Halt};
 use crate::hands::{El, Hands, Look, Params};
+use crate::options::{all_options, Act, Goal, Opt, Progress};
 use crate::trace::redact;
 use std::collections::BTreeMap;
 
@@ -160,6 +162,10 @@ impl Scrub {
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect()
     }
+    /// 这段字里有参数占位符（`{post_text}` 之类）：说明它带着要发的内容，不能当意图名 / 图标名交给 dco。
+    pub(crate) fn has_placeholder(&self, s: &str) -> bool {
+        self.full.keys().any(|k| s.contains(&format!("{{{k}}}")))
+    }
     pub(crate) fn els(&self, els: &[El]) -> Vec<El> {
         els.iter()
             .map(|e| El {
@@ -194,8 +200,10 @@ pub fn values_on_screen(value: &str, elements: &[El]) -> bool {
 }
 
 /// 看过一次的画面：已脱敏的元素 + 这次运行用来比较的画面指纹 + 参数在不在画面上。
+/// 原文只留在 `raw` 里给规矩用（见 `raw.rs`）。
 pub(super) struct Screen {
     pub(super) look: Look,
+    raw: Raw,
     pub(super) key: String,
     pub(super) on_screen: BTreeMap<String, bool>,
     pub(super) lines: Vec<String>,
@@ -213,7 +221,8 @@ pub(super) fn see(h: &mut dyn Hands, inp: &ExploreInput, scrub: &Scrub) -> Resul
             (p.clone(), values_on_screen(v, &raw.elements))
         })
         .collect();
-    let elements = scrub.els(&raw.elements);
+    let raw_els = Raw::new(&raw.elements);
+    let elements = raw_els.shown(scrub, inp.platform);
     let lines: Vec<String> = elements
         .iter()
         .map(|e| e.text.trim().to_string())
@@ -226,10 +235,41 @@ pub(super) fn see(h: &mut dyn Hands, inp: &ExploreInput, scrub: &Scrub) -> Resul
     };
     Ok(Screen {
         look: Look { elements, ..raw },
+        raw: raw_els,
         key,
         on_screen,
         lines,
     })
+}
+
+impl Screen {
+    /// 登录 / 验证码 / 警告：按原文判断，报上去的那行字已脱敏。
+    pub(super) fn halt(&self, scrub: &Scrub) -> Option<Halt> {
+        self.raw.halt(scrub)
+    }
+
+    /// 选项：显示用脱敏后的字，能不能点按原文判断（禁点词、档位）；意图名里带参数占位符的点击
+    /// 不进选项（那等于把要发的内容当按钮名交给 dco、写进流程）。
+    pub(super) fn options(
+        &self,
+        goal: &Goal,
+        prog: &Progress,
+        scrub: &Scrub,
+        on: &dyn Fn(&str) -> bool,
+    ) -> Vec<Opt> {
+        let mut all = all_options(&self.look, goal, prog, on);
+        all.retain(|o| match &o.act {
+            Act::Tap { el, intent } => {
+                self.raw.tappable(&el.id, goal.platform) && !scrub.has_placeholder(intent)
+            }
+            Act::Fill { field, intent, .. } => {
+                self.raw.tappable(&field.id, goal.platform) && !scrub.has_placeholder(intent)
+            }
+            Act::TapIcon { el, .. } => self.raw.tappable(&el.id, goal.platform),
+            _ => true,
+        });
+        all
+    }
 }
 
 /// dco 出错时给用户看的话；dco 的原话也脱敏。
