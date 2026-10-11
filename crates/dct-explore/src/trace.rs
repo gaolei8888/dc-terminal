@@ -13,7 +13,9 @@ pub struct TraceStep {
     pub obs_after: Option<String>,
     pub scene_before: Option<String>,
     pub scene_after: Option<String>,
-    pub ok: bool,      // dco 回 done
+    /// dco 回 done。摸索轨迹里另有一层意思：这一步在通往当前画面的路上（做了但画面没变、
+    /// 或绕回了见过的画面，那几步记成 false；见 `explore` 第 8 条）。草稿只抄 ok 的步骤。
+    pub ok: bool,
     pub publish: bool, // 这一下是「最终发布」
     /// 这一下之前在、之后不在的那几行字（判断是不是关弹窗用）
     pub vanished: Vec<String>,
