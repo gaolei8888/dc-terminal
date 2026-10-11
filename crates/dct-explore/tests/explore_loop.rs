@@ -1172,7 +1172,9 @@ fn an_icon_name_that_is_only_a_placeholder_is_never_sent_to_dco() {
     assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
 }
 
-fn login_screen_halts_for(value: &str, screen: Vec<El>) {
+/// 帖子没打进去时，登录墙上的字是界面字：照原文判断要停；报上去的那行字只换整段值和长片段
+/// （裁决 R14：两三个词的巧合不换），所以这里就是界面上那行原字。
+fn login_screen_halts_for(value: &str, screen: Vec<El>, line_shown: &str) {
     let t = Table::seed();
     let d = tempfile::tempdir().unwrap();
     let mut inp = input(&t, d.path());
@@ -1193,12 +1195,7 @@ fn login_screen_halts_for(value: &str, screen: Vec<El>) {
         Outcome::Halted {
             why: Halt::Login(line),
             ..
-        } => {
-            assert_no_fragment(&line, value, "报上去的那行字");
-            if value.is_ascii() {
-                assert!(line.contains("{post_text}"), "{line}");
-            }
-        }
+        } => assert_eq!(line, line_shown),
         other => panic!("{other:?}"),
     }
     assert!(j.states.borrow().is_empty(), "登录画面没发给 Jeff");
@@ -1213,6 +1210,7 @@ fn a_login_screen_halts_even_when_the_post_text_says_log_in() {
             el("e1", "Log in to X", "text", 0.4, 0.2),
             el("e2", "Log in", "button", 0.4, 0.5),
         ],
+        "Log in to X",
     );
 }
 
@@ -1224,6 +1222,7 @@ fn a_login_screen_halts_even_when_the_post_text_says_scan_to_log_in() {
             el("e1", "扫码登录", "text", 0.4, 0.2),
             el("e2", "帮助", "button", 0.4, 0.5),
         ],
+        "扫码登录",
     );
 }
 
@@ -1332,4 +1331,161 @@ fn a_publish_word_inside_the_post_text_is_still_recognised_as_publish() {
     assert!(matches!(out, Outcome::DeclinedAtPublish(_)), "{out:?}");
     assert_eq!(ans.1, 1);
     assert_eq!(h.step_calls.len(), 1);
+}
+
+// ---- fix round 3 ----
+
+fn with_text(t: &Table, d: &std::path::Path, v: &str) -> ExploreInput<'static> {
+    let mut inp = input(t, d);
+    inp.params.insert("post_text".into(), v.into());
+    inp
+}
+fn criterion<'a>(q: &'a dct_explore::JevChoice, key: &str) -> Option<&'a str> {
+    q.criteria
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, t)| t.as_deref())
+}
+
+#[test]
+fn a_typed_post_with_a_halt_word_does_not_halt_but_a_real_login_wall_does() {
+    const V: &str = "Scan the QR code at booth 12";
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let filled = || {
+        look(
+            "b",
+            vec![
+                el("e2", V, "textarea", 0.45, 0.25),
+                el("e3", "Post", "button", 0.8, 0.35),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1")); // tap_by_intent: What's happening?
+    h.push_step(done("r2")); // type_param: post_text
+    h.push_look(filled());
+    h.push_look(filled()); // 编号图（问发不发）
+    h.push_step(done("r3")); // tap_by_intent: Post
+    h.push_look(look("c", vec![el("e1", "Log in to X", "text", 0.4, 0.2)]));
+    let j = rec(vec!["fill_post_text_e2", "e3", "done"]);
+    let (m, mut u) = (NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut Yes(0),
+        &T0,
+        with_text(&t, d.path(), V),
+    );
+    match out {
+        Outcome::Halted { why, .. } => assert_eq!(why, Halt::Login("Log in to X".into())),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(j.states.borrow().len(), 2, "填好的发帖框照常问了 Jeff");
+    assert_eq!(count(&h, "run_step tap_by_intent: Post"), 1);
+}
+
+#[test]
+fn a_post_that_starts_like_the_placeholder_still_gets_the_composer() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1"));
+    h.push_step(done("r2"));
+    h.push_look_err("stale");
+    let j = rec(vec!["fill_post_text_e2"]);
+    let (m, mut u) = (NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let inp = with_text(&t, d.path(), "What's happening at booth 12, come by");
+    let _ = explore(&mut h, &mut lad, &mut Yes(0), &T0, inp);
+    let q = &j.questions.borrow()[0];
+    let fill = criterion(q, "fill_post_text_e2").expect("还有填字的选项");
+    assert!(fill.contains("What's happening?"), "{fill}");
+    assert_eq!(h.calls[2], "run_step tap_by_intent: What's happening?");
+}
+
+#[test]
+fn a_chinese_placeholder_inside_the_post_still_offers_fill() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(look(
+        "a",
+        vec![el("e2", "有什么新鲜事", "textarea", 0.45, 0.25)],
+    ));
+    h.push_look_err("stale"); // 编号图拿不到；用户说停
+    let j = rec(vec![]);
+    let (m, mut u) = (NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let inp = with_text(&t, d.path(), "有什么新鲜事？我们的小机器人今天上线了");
+    let _ = explore(&mut h, &mut lad, &mut Yes(0), &T0, inp);
+    let q = &j.questions.borrow()[0];
+    let fill = criterion(q, "fill_post_text_e2").expect("还有填字的选项");
+    assert!(fill.contains("有什么新鲜事"), "{fill}");
+}
+
+#[test]
+fn a_post_saying_follow_us_keeps_the_composer_for_typing_again() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1")); // tap_by_intent: What's happening?
+    h.push_step(done("r2")); // type_param
+    h.push_look(look(
+        "b",
+        vec![
+            el("e2", "Please follow us", "textarea", 0.45, 0.25), // 只剩一半
+            el("e5", "Drafts", "button", 0.6, 0.1),
+        ],
+    ));
+    h.push_step(done("r3")); // tap_by_intent: What's happening?
+    h.push_step(done("r4")); // type_param
+    h.push_look_err("stale");
+    let j = rec(vec!["fill_post_text_e2", "fill_post_text_e2"]);
+    let (m, mut u) = (NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let inp = with_text(&t, d.path(), "Please follow us for more robots");
+    let _ = explore(&mut h, &mut lad, &mut Yes(0), &T0, inp);
+    let q = &j.questions.borrow()[1];
+    let fill = criterion(q, "fill_post_text_e2").expect("还能再填一次");
+    assert!(fill.contains("What's happening?"), "{fill}");
+    assert!(
+        !j.states.borrow()[1].contains("follow us"),
+        "{}",
+        j.states.borrow()[1]
+    );
+    assert_eq!(
+        count(&h, "run_step type_param: post_text"),
+        2,
+        "{:?}",
+        h.calls
+    );
 }

@@ -211,6 +211,8 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
     }
     let name = input.procedure["name"].as_str().unwrap_or("").to_string();
     let scrub = Scrub::new(&input.params);
+    // 重放跑的是流程，帖子可能已经打进去了：参数全部当打过（片段也算帖子）。
+    scrub.mark_all_typed();
     // 发布交给用户的平台：一律预览。
     let preview = input.preview || input.platform.publish_by_user_only;
     let stop_before = if preview {
@@ -296,7 +298,7 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
             ));
         }
         // 规矩看原文（停下、禁点词、档位），出去的字看脱敏后的（见 explore/raw.rs）。
-        let raw = Raw::new(&help.elements);
+        let raw = Raw::new(&help.elements, &scrub);
         if let Some(why) = raw.halt(&scrub) {
             let _ = h.cancel_run(&run_id);
             return ReplayOutcome::Stopped(format!(

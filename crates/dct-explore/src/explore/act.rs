@@ -49,7 +49,7 @@ impl Pics<'_> {
     fn get(&mut self) -> Option<String> {
         if self.got.is_none() {
             let p = match self.h.look(self.window, true) {
-                Ok(l) => match Raw::new(&l.elements).halt(self.scrub) {
+                Ok(l) => match Raw::new(&l.elements, self.scrub).halt(self.scrub) {
                     Some(h) => {
                         self.halt = Some(h);
                         None
@@ -271,6 +271,10 @@ pub(super) fn execute(
     }
     let mut out = Vec::with_capacity(steps.len());
     for s in steps {
+        if s.action == "type_param" {
+            // 从这一下起，帖子的片段可能出现在画面上（见 scrub.rs 的值元素）。
+            scrub.mark_typed(&s.arg);
+        }
         let mut rep = match h.run_step(input.window_id, &s, &input.params, &input.popups) {
             Ok(r) => r,
             Err(e) => return Exec::Stop(look_error(&e, scrub)),
@@ -282,7 +286,7 @@ pub(super) fn execute(
                 "needs_help" if rounds < MAX_HELP_ROUNDS => {
                     rounds += 1;
                     let help = rep.help.as_ref();
-                    let raw = help.map(|hp| Raw::new(&hp.elements));
+                    let raw = help.map(|hp| Raw::new(&hp.elements, scrub));
                     // 求助的画面也先过停下的规矩（按原文）：命中就取消，不交给任何人去选。
                     if let Some(why) = raw.as_ref().and_then(|r| r.halt(scrub)) {
                         let _ = h.cancel_run(&rep.run_id);

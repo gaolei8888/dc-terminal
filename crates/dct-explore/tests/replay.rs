@@ -517,7 +517,9 @@ fn a_login_wall_during_replay_help_halts_even_when_the_post_text_says_log_in() {
     let out = replay(&mut h, &mut lad, inp);
     match out {
         ReplayOutcome::Stopped(why) => {
-            assert!(!why.to_lowercase().contains("log in to"), "{why}")
+            // 界面上那行字照原样报（R14：短巧合不换），帖子本身不出现。
+            assert!(why.contains("Log in to X"), "{why}");
+            assert!(!why.to_lowercase().contains("see our"), "{why}")
         }
         other => panic!("{other:?}"),
     }
@@ -525,4 +527,36 @@ fn a_login_wall_during_replay_help_halts_even_when_the_post_text_says_log_in() {
     assert!(j.1.borrow().is_empty() && u.1.is_empty());
     assert_eq!(*m.1.borrow(), 0);
     assert!(h.sent_answers.is_empty());
+}
+
+#[test]
+fn a_filled_composer_with_a_halt_word_does_not_stop_replay_help() {
+    let t = Table::seed();
+    let p = t.get("x").unwrap();
+    let pr = x_proc(true);
+    let mut h = FakeHands::new();
+    h.push_procedure(help_reply(
+        "r1",
+        5,
+        vec![
+            el("e1", "Scan the QR code at booth 12", 0.1, 0.3),
+            el("e2", "Post", 0.08, 0.5),
+            el("e3", "Post", 0.7, 0.4),
+        ],
+    ));
+    h.push_answer(reply("r1", "done", 5));
+    let (j, mut u) = (jeff(Some(("e3", 0.95))), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let mut inp = input(&pr, p, false);
+    inp.params
+        .insert("post_text".into(), "Scan the QR code at booth 12".into());
+    let _ = replay(&mut h, &mut lad, inp);
+    assert_eq!(h.sent_answers.len(), 1, "{:?}", h.calls);
+    let st = j.1.borrow();
+    assert!(!st[0].to_lowercase().contains("qr code"), "{}", st[0]);
 }

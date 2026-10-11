@@ -28,6 +28,7 @@ mod act;
 pub(crate) mod raw;
 mod run;
 pub(crate) mod screen;
+mod scrub;
 
 use crate::gate::{Budget, Halt, Over};
 use crate::hands::{Hands, Params, StepReq};
@@ -123,6 +124,10 @@ pub fn explore_from(
 ) -> Outcome {
     let mut r = new_run(&input, clock, prefix);
     let scrub = Scrub::new(&input.params);
+    // 修补：开头已经打过的字可能还在画面上。
+    for t in r.trace.steps.iter().filter(|t| t.action == "type_param") {
+        scrub.mark_typed(&t.arg);
+    }
     let goal_text = scrub.text(input.goal_text);
     let goal = Goal {
         text: &goal_text,
@@ -158,7 +163,7 @@ pub fn explore_from(
         let fj = r.failed_jeff(&cur.key);
         // 4. 选项 → 逐级往上
         let on = |p: &str| cur.on_screen.get(p).copied().unwrap_or(false);
-        let all = cur.options(&goal, &r.prog, &scrub, &on);
+        let all = cur.options(&goal, &r.prog, &scrub, &on, &r.fills);
         let short = shortlist(&all, &goal);
         let state = state_text(&goal, &r.trail(), &cur.look);
         let row = |d: &Decision, fj| write_row(&answers, clock, &input, &state, &all, d, fj);

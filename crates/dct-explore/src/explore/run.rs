@@ -39,6 +39,9 @@ pub(super) struct Run {
     snaps: HashMap<String, Snap>,
     /// 画面指纹 → 在那个画面上选的、没起作用的次数
     tries: HashMap<String, ScreenTries>,
+    /// 参数 → 上一次起作用的「填字」选项（字打进去以后发帖框变成值元素，不能再按它的字去点；
+    /// 字被清掉要再填时，用打字前的提示字当意图名）
+    pub(super) fills: HashMap<String, Opt>,
 }
 
 impl Run {
@@ -150,6 +153,7 @@ pub(super) fn new_run(input: &ExploreInput, clock: &dyn Clock, prefix: Vec<Trace
         meter: Meter::new(clock.now_ms()),
         snaps: HashMap::new(),
         tries: HashMap::new(),
+        fills: HashMap::new(),
     }
 }
 
@@ -194,6 +198,9 @@ pub(super) fn record(
 
 /// 一个选项起作用了：更新进度。
 pub(super) fn advance(r: &mut Run, opt: &Opt) {
+    if let Act::Fill { param, .. } = &opt.act {
+        r.fills.insert(param.clone(), opt.clone());
+    }
     match &opt.act {
         Act::Fill { param, .. } if !r.prog.filled.contains(param) => {
             r.prog.filled.push(param.clone())
