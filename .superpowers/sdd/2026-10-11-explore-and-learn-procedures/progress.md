@@ -188,3 +188,32 @@ Final re-review: items 1–13 + 2 deferred ADDRESSED; fixer's item-4 claim verif
 Final: minor (deferred): approval record saved under the draft name after a repair (dct run/tickets for the original name need a second approval; fails closed); per-tap confirmations reuse confirm_publish events in --json; repair open_url taken from the procedure not the table; "Posts" icon name not caught by whole-word publish detection.
 Final controller check at 360d010: 2391 passed, 0 failed, 5 ignored; clippy 0; Windows only pre-existing warning; all new .rs files rustfmt-clean.
 Docs request (user via coordinator): fd77f28 README/README.zh-CN/judge design; 8c31176 new spec 2026-10-11-dct-jeff-auto-training-design.md. Stale mstrasser/Jeff-Qwen name did not occur in this repo. E1 numbers in brief (226/15/178s, 67.5%) conflict with the E1 doc on disk (242/16/164s, 86.7%/85.0%) — flagged in spec as open question.
+
+## Follow-up (user decisions via coordinator, base 2ee2bee)
+Task A (fix R17 two-stage publish, must-fix before merge): dispatched (opus)
+Task B (campaign approval requires Touch ID, bound to text hash): dispatched in parallel (sonnet; root files only)
+Task C (training rows: source + outcome; spec update; E1 numbers per E1 doc as single smoke run, conflicting with 226-row run): after A
+Task B: implemented d4da649 (2405 passed); review dispatched
+Task A: implemented 67d358c (2415 passed); review dispatched
+Task C: dispatched (base 67d358c)
+Task B: complete (commit d4da649, review clean) — length-prefixed canonical bytes with "dct-campaign-v1" tag (domain-separated from approvals/tickets), user-role signer only, name bound.
+Task B: minor (deferred): older signed copies can be restored (rollback to once-approved text; revocation needs an anchor outside ~/.dct) — document; no explicit cross-domain/auto-key tests
+Task A: review ❌ — Important: (1) confirm tap marked publish:true so never flagged maybe_one_off (Review Focus #2: TikTok "Continue to post?" must be flagged); (2) X: left-nav Post while pending → question claims "还要再确认一下"; decline → "停在了发布前" though post may have gone out. Minors: hidden-button dialog counts as sent (user's rule; platform-table fix); decline-a-Fill-while-pending gives Stopped; scroll/wait reaching new screen goes through landed; back_to doesn't reset after_publish; Attach not asked while pending. Fix round 1 held until Task C (also editing explore loop) commits.
+Handoff doc request (docs/HANDOFF.md + pointer in README): after A–C.
+Task C: implemented 202fab9 (rows v2) + 64ac16b (spec/E1 numbers); review dispatched
+Task A: fix round 1 sent (resume implementer)
+Task C: review ✅ approved with one Important doc fix — spec baseline table puts the conflicting run's v1.2 75.8% next to the E1 doc's adapter 86.7/85.0 (E1 doc's own v1.2 is 71.7 EN / 58.3 ZH).
+- Ruling R18: Declined runs give model rows outcome "unknown" (not labels) — conservative; run_outcome is kept so a trainer can relabel; state it in the spec — cost if wrong: fewer model labels from declined runs.
+Task C: fix round 1 (after A's fix lands): baseline table per source; R18 sentence; jeff_asked field; log row-write failures; spec notes (user label even if outcome bad; no "did nothing" negatives).
+Task C: minor (deferred): rows lost if dct is killed mid-run (sidecar for user answers if it happens)
+Task A: fix round 1 implemented c871fda (2429 passed); re-review dispatched
+Task C: fix round 1 sent (resume implementer)
+Task A: fix round 1/5 (all addressed; commit c871fda)
+Task A: complete (commits 67d358c + c871fda, review clean) — R17 resolved
+Task A: minor (deferred): decline message may quote a Cancel tap recorded publish:true; same-word warning also fires where the real confirm button shares the label; dialog hiding the original button counts as sent (platform-table item); real X stays pending until X publish_done verified on hardware
+Task C: fix round 1 implemented d356e8d; re-review dispatched
+Task C: fix round 1/5 (all addressed; commit d356e8d)
+Task C: complete (commits 202fab9, 64ac16b, d356e8d; review clean) — v2 rows: by, outcome, label, jeff_asked, shown, step, run_outcome; written at run end
+Controller full check at d356e8d: 2429 passed, 0 failed, 5 ignored; clippy 0; Windows only pre-existing warning; new files rustfmt-clean.
+HANDOFF doc: dispatched (opus)
+HANDOFF: 0d09111 docs/HANDOFF.md + README pointers; README two-tap line fixed in 313892e
