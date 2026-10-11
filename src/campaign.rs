@@ -67,20 +67,39 @@ pub fn parse_params(args: &[String]) -> Result<PerPlatform, String> {
         if !valid_ident(param) {
             return Err(format!("参数名要写小写英文短名，这里是 `{param}`"));
         }
-        if let Some(c) = value
-            .chars()
-            .find(|c| c.is_control() && *c != '\n' && *c != '\t')
-        {
-            return Err(format!(
-                "`{key}` 的值里有控制字符（U+{:04X}）：只许普通文字、换行和制表符",
-                c as u32
-            ));
-        }
+        check_value(key, value)?;
         out.entry(platform.to_string())
             .or_default()
             .insert(param.to_string(), value.to_string());
     }
     Ok(out)
+}
+
+/// 看不见或会改变显示顺序的字符：控制字符（换行、制表符除外）、格式字符（Cf）、
+/// 行/段分隔符（Zl、Zp）。std 没有字符类别接口，这里按范围列。
+/// 放行 U+200D（ZWJ），不然组合 emoji 会坏；变体选择符不是 Cf，本来就放行。
+/// 标签字符 U+E0000–E007F 也拒（能藏字，只是旗帜 emoji 的子区域旗用它）。
+fn is_hidden_or_control(c: char) -> bool {
+    if c == '\n' || c == '\t' || c == '\u{200D}' {
+        return false;
+    }
+    let u = c as u32;
+    c.is_control()
+        || matches!(u,
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E
+            | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x206F
+            | 0xFEFF | 0xFFF9..=0xFFFB | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A | 0xE0000..=0xE007F)
+}
+
+fn check_value(key: &str, value: &str) -> Result<(), String> {
+    match value.chars().find(|c| is_hidden_or_control(*c)) {
+        Some(c) => Err(format!(
+            "`{key}` 的值里有看不见的或控制用的字符（U+{:04X}）：只许普通文字、换行和制表符",
+            c as u32
+        )),
+        None => Ok(()),
+    }
 }
 
 /// 开头句：到第一个句末标点或换行为止（`.` 只在后面是空白或结尾时才算，
@@ -197,7 +216,22 @@ pub fn load(dir: &Path, name: &str) -> Result<Campaign, String> {
     check_campaign_name(name)?;
     let raw = std::fs::read(file_for(dir, name))
         .map_err(|_| format!("活动 `{name}` 还没批准过（先跑 dct campaign approve {name} ...）"))?;
-    serde_json::from_slice(&raw).map_err(|e| format!("活动 `{name}` 的记录坏了：{e}"))
+    let c: Campaign =
+        serde_json::from_slice(&raw).map_err(|e| format!("活动 `{name}` 的记录坏了：{e}"))?;
+    // 文件可能被手改过：和 parse_params 同一套检查，不让不可见字符溜进 dct do。
+    for (platform, params) in &c.per_platform {
+        if !valid_ident(platform) {
+            return Err(format!("活动 `{name}` 的记录里平台名 `{platform}` 不合规"));
+        }
+        for (k, v) in params {
+            if !valid_ident(k) {
+                return Err(format!("活动 `{name}` 的记录里参数名 `{k}` 不合规"));
+            }
+            check_value(&format!("{platform}.{k}"), v)
+                .map_err(|e| format!("活动 `{name}` 的记录被改过：{e}"))?;
+        }
+    }
+    Ok(c)
 }
 
 pub fn default_dir() -> PathBuf {
@@ -472,5 +506,42 @@ mod tests {
         ])
         .unwrap();
         assert!(check_distinct(&p).is_err());
+    }
+
+    #[test]
+    fn invisible_and_bidi_characters_are_refused() {
+        for bad in [
+            "\u{202E}",
+            "\u{2066}",
+            "\u{200B}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{FEFF}",
+            "\u{2060}",
+            "\u{200F}",
+            "\u{E0041}",
+        ] {
+            let arg = format!("x.post_text=a{bad}b");
+            assert!(parse_params(&[s("--param"), arg]).is_err(), "{bad:?}");
+        }
+        // emoji with ZWJ and variation selectors keep working
+        let ok = parse_params(&[
+            s("--param"),
+            s("x.post_text=hi \u{1F468}\u{200D}\u{1F4BB} \u{2764}\u{FE0F}"),
+        ]);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn a_hand_edited_file_with_hidden_characters_is_refused_by_load() {
+        let d = tempfile::tempdir().unwrap();
+        let p = parse_params(&[s("--param"), s("x.post_text=hello")]).unwrap();
+        approve(d.path(), "c", p, &mut |_| true, 1).unwrap();
+        let path = d.path().join("c.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("hello", "he\\u202Ello")).unwrap();
+        assert!(load(d.path(), "c").unwrap_err().contains("202E"));
+        std::fs::write(&path, raw.replace("\"x\"", "\"../x\"")).unwrap();
+        assert!(load(d.path(), "c").is_err());
     }
 }
