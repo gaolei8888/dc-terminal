@@ -361,6 +361,7 @@ pub(super) struct PendingRow {
     state: String,
     options: Vec<(String, String)>,
     shown: Vec<String>,
+    jeff_asked: bool,
     jeff: Option<(String, f64)>,
     answer: String,
     by: Who,
@@ -370,18 +371,19 @@ pub(super) struct PendingRow {
 }
 
 /// 记下一道答过的题。`step`：照做的第一步在轨迹里的序号（`done` 为 None）；
-/// `moved`：dco 回 done、到了这次运行没见过的新画面。
+/// `moved`：dco 回 done、到了这次运行没见过的新画面；`shown`：候选单和这一轮问没问 Jeff。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pending_row(
     clock: &dyn Clock,
     state: &str,
     all: &[Opt],
-    short: &[Opt],
+    shown: (&[Opt], bool),
     dec: &crate::ladder::Decision,
     failed_jeff: Option<(String, f64)>,
     step: Option<usize>,
     moved: bool,
 ) -> PendingRow {
+    let (short, jeff_asked) = shown;
     let jeff = dec.jeff.clone().or(failed_jeff);
     let corrects_jeff = dec.by != Who::Jeff && jeff.as_ref().is_some_and(|(k, _)| *k != dec.key);
     PendingRow {
@@ -392,6 +394,7 @@ pub(super) fn pending_row(
             .map(|o| (o.key.clone(), o.text.clone()))
             .collect(),
         shown: short.iter().map(|o| o.key.clone()).collect(),
+        jeff_asked,
         jeff,
         answer: dec.key.clone(),
         by: dec.by,
@@ -425,11 +428,15 @@ pub(super) fn write_rows(
             by: p.by,
             corrects_jeff: p.corrects_jeff,
             shown: p.shown.clone(),
+            jeff_asked: p.jeff_asked,
             step: p.step,
             run_outcome: run,
             outcome,
             label,
         };
-        let _ = append_question(file, &row);
+        if let Err(e) = append_question(file, &row) {
+            // 不影响这次摸索，但要让人知道少了题。只说出错原因，不带题面（没有参数值）。
+            eprintln!("dct: 训练题没写下（{}）：{e}", input.run_id);
+        }
     }
 }

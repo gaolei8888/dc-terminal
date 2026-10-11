@@ -2738,6 +2738,7 @@ fn model_answers_on_the_path_of_a_published_run_are_labels_with_outcome_good() {
         assert_eq!(r["run_outcome"], "published");
         assert_eq!(r["outcome"], "good", "{r}");
         assert_eq!(r["label"], true, "{r}");
+        assert_eq!(r["jeff_asked"], true, "问过 Jeff（它没答）：{r}");
         let i = r["step"].as_u64().unwrap() as usize;
         assert!(trace.steps[i].ok);
     }
@@ -2861,6 +2862,10 @@ fn user_answers_are_labels_and_jeff_answers_never_are() {
     }
     let user = rows.iter().find(|r| r["by"] == "user").unwrap();
     assert_eq!(user["label"], true);
+    assert_eq!(
+        user["jeff_asked"], false,
+        "Jeff 在这个画面上失败过，这一轮没问它：{user}"
+    );
     assert_eq!(user["corrects_jeff"], true, "纠正 Jeff 的题照样认得出");
     assert_eq!(user["outcome"], "good");
     let jeff: Vec<_> = rows.iter().filter(|r| r["by"] == "jeff").collect();
@@ -2868,6 +2873,7 @@ fn user_answers_are_labels_and_jeff_answers_never_are() {
     for r in jeff {
         assert_eq!(r["label"], false, "Jeff 的答案自己不算标准答案：{r}");
         assert_eq!(r["outcome"], "good", "结局照记，只是不当标签：{r}");
+        assert_eq!(r["jeff_asked"], true, "{r}");
     }
 }
 

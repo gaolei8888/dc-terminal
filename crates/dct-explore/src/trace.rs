@@ -182,6 +182,8 @@ pub struct QuestionRow<'a> {
     /// 这一轮的候选单（`options::shortlist`，最多 20 个）的 key，按发给 Jeff 的顺序。
     /// 就是 Jeff 这一轮被问到的题；Jeff 在这个画面上失败过、这轮没问它时，也是会发给它的那份。
     pub shown: Vec<String>,
+    /// 这一轮真的问了 Jeff（它答没答都算问了）；Jeff 在这个画面上失败过、这轮跳过它时为 false。
+    pub jeff_asked: bool,
     /// 照这个答案做的第一步在 `runs/<run_id>/trace.json` 的 `steps` 里的序号；`done` 为空。
     pub step: Option<usize>,
     pub run_outcome: RunOutcome,
@@ -312,6 +314,7 @@ mod tests {
                 by: Who::Model,
                 corrects_jeff: true,
                 shown: vec!["e3".into()],
+                jeff_asked: true,
                 step: Some(1),
                 run_outcome: RunOutcome::Published,
                 outcome: StepOutcome::Good,
@@ -351,6 +354,7 @@ mod tests {
                     by: Who::Jeff,
                     corrects_jeff: false,
                     shown: vec![],
+                    jeff_asked: true,
                     step: None,
                     run_outcome: RunOutcome::Stopped,
                     outcome: StepOutcome::Unknown,

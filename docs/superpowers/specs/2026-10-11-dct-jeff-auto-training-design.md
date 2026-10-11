@@ -39,6 +39,7 @@ Jeff（0.8B 的「选哪个」小模型）现在零样本用，GUI 题英文七�
 | `corrects_jeff` | 不是 Jeff 答的、而 Jeff 在这个画面上选过别的（Jeff 错了、被纠正） |
 | `v` | 格式版本，现在是 `2`（`trace::QUESTION_ROW_V`） |
 | `shown` | 这一轮候选单（`options::shortlist`，最多 20 个）的 key，按发给 Jeff 的顺序，是 `options` 的子集。Jeff 在这个画面上失败过、这一轮没问它时，记的是会发给它的那一份。训练时用 `state` + `shown` 就能原样拼出 Jeff 当时那道题 |
+| `jeff_asked` | 这一轮真的问了 Jeff（它答没答都算）；Jeff 在这个画面上失败过、这一轮跳过它时为 `false`（这时 `shown` 是会发给它的那一份） |
 | `step` | 照这个答案做的**第一步**在同一 `run_id` 的 `trace.json` 里 `steps` 的序号（轨迹只追加不删，序号不变）；选「做完了」（`done`）的那道题为 `null` |
 | `run_outcome` | 这次运行的结局，和轨迹的 `outcome` 一样 |
 | `outcome` | 这一下是不是**确认离目标更近**：`good` / `bad` / `unknown`，定义见下 |
@@ -60,16 +61,21 @@ key 的样子：元素是 `e<编号>`（如 `e17`），填字是 `fill_<参数�
 - **good**：dco 回 done（或 `already_done`）、照做后到了**这次运行没见过的新画面**（dco 的画面指纹核对）、这一步在**最终**轨迹里还是 `ok: true`（没被后来的绕圈改成 `ok: false`，即还在「从头走到最后那个画面」的路上），**而且这次运行发出去了**（`run_outcome: published`）。`done` 那道题只在发出去时才会记，所以总是 `good`。
 - **bad**：确认没起作用——照做后没到新画面（只有用户自己点发布那一种行会这样），或这一步后来因为绕回见过的画面在轨迹里变成了 `ok: false`。不管运行结局如何。
 - **unknown**：这一步一直在路上，但这次运行没发出去（`stopped` / `halted` / `declined`）：说不清它有没有帮上忙。
+- **用户不让发（`declined`）的运行，大模型的题也是 `unknown`、不算标签**（裁定 R18）。用户说不发多半和路走得对不对无关（内容、时机），这些步骤很可能是对的；但故意保守，宁可少几道题。`run_outcome` 照记，训练的人以后想放宽，可以把 `run_outcome: declined` 且最终 `ok` 的题重新标。
 
 ### 哪些题算标准答案（`label`）
 
 | 题 | `label` |
 |---|---|
-| `by: user` | `true`，不看 `outcome`。用户选的就是答案 |
+| `by: user` | `true`，**`outcome` 是 `bad` 也算**。用户选的就是答案；用户选了却没到新画面（比如自己点发布没反应），照样是他认为该点的那个。训练的人想更严，可以自己滤掉 `outcome == bad` 的用户题 |
 | `by: model`，`outcome: good` | `true` |
 | `by: model`，`bad` 或 `unknown` | `false`（绕了圈的一步、没到新画面、或整次没成） |
 | `by: jeff` | 永远 `false`，`outcome` 照记。拿自己的答案练自己只会更自信，不会更对 |
 | 旧格式的行（没有 `v`） | 只有 `by: user` 算 |
+
+「做了没起作用」的答案（画面没变、绕回见过的画面、dco 回 failed）**不记成反例**，一行都不写：没起作用的原因常常不是选错了（页面还没加载完、弹窗挡了一下、dco 那一下没点中），当成「这个选项是错的」去练会教坏 Jeff；而且同一画面接下来谁答对了，那道题本身就有正确答案。唯一的例外是用户自己点发布那一行：已经记了，没到新画面就标 `bad`。
+
+dct 写不进 `answers.jsonl`（磁盘满、权限）时不影响这次摸索，在标准错误里说一句「训练题没写下（<run_id>）：<原因>」，不带题面。
 
 读的人用 `trace::is_label(&行)`：v2 看 `label`（`by: jeff` 的行写着 `true` 也不算），没有 `v` 的旧行只认 `by: user`。不写盘的字段不变：参数值写盘前换回 `{名字}`，停下的画面（登录 / 验证码 / 警告）上的字不进任何一行（停下的画面不出题），文件 0600。
 
@@ -187,11 +193,14 @@ python mps_train.py \
 
 | 模型 | 考题 | 选对率 |
 |---|---|---|
-| v1.2 零样本（现役） | E1 的 60 道题 | 75.8% |
-| v1.2 零样本 | D4 的题法 | 英 71.7% / 中 58.3%；把握 ≥ 0.8 的 45 次对 44 次 |
-| E1 冒烟练的 v1.3 adapter | E1 的 60 道题 | 英 86.7% / 中 85.0%（dc-octo E1 文档记的结果；**只是一次小冒烟**，见下） |
+两次小冒烟，同一套 60 道 GUI 题，各自量了 v1.2 零样本和自己练的 adapter。每个数只和**同一次**的数比：
 
-（记下来的结果是 dc-octo `docs/experiments/2026-10-11-jeff-v13-adapter-e1.md`：242 道手工标的 GUI 题、16 步、164 秒，adapter 英 86.7% / 中 85.0%。那次训练题和考题是同一批人手编的，**只是一次小冒烟，不是正式结论**。另一次冒烟用 226 道大模型写的题训练，同一套 60 题只有 67.5%，比 v1.2 零样本的 75.8% 还低——两次冒烟的结论互相冲突。一次控制变量的重跑正在做；出结果之前，两个数都不当「adapter 比现役好」的依据，也不提换。）
+| 出处 | 训练题 | v1.2 零样本（现役） | v1.3 + 练出的 adapter |
+|---|---|---|---|
+| dc-octo E1 文档那一次（`docs/experiments/2026-10-11-jeff-v13-adapter-e1.md`，D4 的题法） | 242 道手工标的 GUI 题、16 步、164 秒 | 英 71.7% / 中 58.3%；把握 ≥ 0.8 的 45 次对 44 次 | 英 86.7% / 中 85.0% |
+| 另一次冒烟（原始记录不在 E1 文档里） | 226 道大模型写的题、15 步、178 秒 | 75.8% | 67.5% |
+
+**两次都只是小冒烟，结论互相冲突**：E1 文档那次训练题和考题是同一批人手编的（涨了十几到二十多个点不能当真）；另一次 adapter 反而比现役低。一次控制变量的重跑正在做；出结果之前，两个数都不当「adapter 比现役好」的依据，也不提换。
 
 ## 5. 换版本
 
@@ -229,7 +238,7 @@ python mps_train.py \
 
 | # | 文件 | 做什么 | 怎么测 |
 |---|---|---|---|
-| 1 ✅ 已做（`202fab9`） | `crates/dct-explore/src/trace.rs`、`explore/act.rs`、`explore.rs`（`src/explore_cli.rs` 不用改：它存的轨迹已经带 `outcome`） | 照第 1 节实现：另加了 `run_outcome`、`outcome`（good / bad / unknown）、`label`、`trace::grade` / `trace::is_label`，题在运行结束后一次写下。原计划：`QuestionRow` 加 `v: 2`、`shown`（发给 Jeff 的 key，按顺序）、`step`（这一下在 `trace.steps` 里的第一个序号，`done` 为空）；`Trace` 加 `outcome`（`published` / `declined` / `halted` / `stopped`），`drive` 存轨迹前填上 | 假 dco 跑一次：每行 `shown` ≤ 20 且是 `options` 的子集；绕回见过的画面后，那一步在轨迹里 `ok: false`、题的 `step` 指着它；轨迹 `outcome` 和返回的 `Outcome` 一致；旧行（没有 `v`）照样能读 |
+| 1 ✅ 已做（`202fab9`） | `crates/dct-explore/src/trace.rs`、`explore/act.rs`、`explore.rs`（`src/explore_cli.rs` 不用改：它存的轨迹已经带 `outcome`） | 照第 1 节实现：另加了 `run_outcome`、`outcome`（good / bad / unknown）、`label`、`jeff_asked`（修正一轮加的）、`trace::grade` / `trace::is_label`，题在运行结束后一次写下。原计划：`QuestionRow` 加 `v: 2`、`shown`（发给 Jeff 的 key，按顺序）、`step`（这一下在 `trace.steps` 里的第一个序号，`done` 为空）；`Trace` 加 `outcome`（`published` / `declined` / `halted` / `stopped`），`drive` 存轨迹前填上 | 假 dco 跑一次：每行 `shown` ≤ 20 且是 `options` 的子集；绕回见过的画面后，那一步在轨迹里 `ok: false`、题的 `step` 指着它；轨迹 `outcome` 和返回的 `Outcome` 一致；旧行（没有 `v`）照样能读 |
 | 2 | `src/explore_cli/real.rs`、`src/game/cli.rs`、新 `src/jeff_train/lock.rs` | `dct do`、`dct game play` 运行期间拿 `~/.dct/explore/running.lock`（flock）；看到训练锁就先叫停训练 | 第二个拿锁的人得到「忙」；进程退出后锁放开；`dct do` 启动时训练锁里的进程收到停止信号 |
 | 3 | 新 `src/jeff_train/rows.rs` | 读题和轨迹，按第 1 节的表挑标准答案；分出考试平台；去重；转成 kit 行；`corrects_jeff` 加一份换顺序副本；补干扰项凑满 20 个（≥ 10% 的题）；dev / calibration 按 `run_id` 各留约 10% | 夹具：绕了圈的 `by: model` 题不选；`by: jeff` 不选；Instagram / 小红书的题一道都不进训练；训练集里有 20 个选项的题；没有纯数字 key；所有字段里找不到任何参数值，只有 `{名字}`；和考题重复的训练题被删掉 |
 | 4 | 新 `src/jeff_train/exam.rs`，`tests/fixtures/jeff-gui-60.jsonl` | `dct jeff exam freeze`：平台考试集凑够 60 道才冻结，写 manifest（sha256）；以后文件 sha256 对不上就拒绝考试；副考 60 题抄进仓库 | 不到 60 道拒绝冻结；冻结后改一个字节 → 拒绝；manifest 里的 sha256 和文件一致 |

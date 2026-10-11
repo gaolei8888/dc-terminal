@@ -264,11 +264,14 @@ fn drive(
         let all = cur.options(&goal, &r.prog, &scrub, &on, &r.fills);
         let short = shortlist(&all, &goal);
         let state = state_text(&goal, &r.trail(), &cur.look);
+        let tries = r.tries_at(&cur.key);
+        // `Ladder::decide` 只在这个画面上 Jeff 没失败过时才问它。
+        let jeff_asked = !tries.jeff_failed;
         // 题先记在内存里，运行结束才写（见 `explore_from`）。
         let mut row = |d: &Decision, fj, step: Option<usize>, moved: bool| {
-            rows.push(pending_row(clock, &state, &all, &short, d, fj, step, moved))
+            let shown = (short.as_slice(), jeff_asked);
+            rows.push(pending_row(clock, &state, &all, shown, d, fj, step, moved))
         };
-        let tries = r.tries_at(&cur.key);
         let (dec, mut pic) = match act::decide(h, lad, input, &scrub, &state, &short, &all, tries) {
             act::Decided::Pick(d, pic) => (d, pic),
             act::Decided::Halt(why) => {
