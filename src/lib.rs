@@ -13,6 +13,7 @@ pub mod journal;
 pub mod judge;
 pub mod keys;
 pub mod last_sessions;
+pub mod learn;
 pub mod link;
 pub mod live;
 pub mod llm;
