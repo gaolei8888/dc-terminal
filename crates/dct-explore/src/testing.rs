@@ -4,6 +4,15 @@ use dct_dco::DcoError;
 use serde_json::Value;
 use std::collections::VecDeque;
 
+/// 一次 run_step 发出去的全部内容。
+#[derive(Debug, Clone)]
+pub struct SentStep {
+    pub window_id: u64,
+    pub step: StepReq,
+    pub params: Params,
+    pub popups: Vec<Value>,
+}
+
 #[derive(Default)]
 pub struct FakeHands {
     pub windows: Vec<WindowRow>,
@@ -15,6 +24,12 @@ pub struct FakeHands {
     /// 每次调用一行可读的字符串。
     pub calls: Vec<String>,
     pub sent_steps: Vec<StepReq>,
+    /// 同上，另带窗口、参数、弹窗规则。
+    pub step_calls: Vec<SentStep>,
+    /// 每次 look 的窗口。
+    pub look_windows: Vec<u64>,
+    /// 每次 run_procedure 的窗口。
+    pub procedure_windows: Vec<u64>,
     pub sent_answers: Vec<(String, HelpAnswer)>,
     pub sent_procedures: Vec<(Value, Params, Vec<Value>, Option<u32>)>,
 }
@@ -65,7 +80,8 @@ impl Hands for FakeHands {
         self.calls.push("list_windows".into());
         Ok(self.windows.clone())
     }
-    fn look(&mut self, _window_id: u64, marks: bool) -> Result<Look, DcoError> {
+    fn look(&mut self, window_id: u64, marks: bool) -> Result<Look, DcoError> {
+        self.look_windows.push(window_id);
         self.calls.push(format!("look marks={marks}"));
         self.looks
             .pop_front()
@@ -73,21 +89,27 @@ impl Hands for FakeHands {
     }
     fn run_step(
         &mut self,
-        _window_id: u64,
+        window_id: u64,
         step: &StepReq,
-        _params: &Params,
-        _popups: &[Value],
+        params: &Params,
+        popups: &[Value],
     ) -> Result<RunReply, DcoError> {
         self.calls
             .push(format!("run_step {}: {}", step.action, step.arg));
         self.sent_steps.push(step.clone());
+        self.step_calls.push(SentStep {
+            window_id,
+            step: step.clone(),
+            params: params.clone(),
+            popups: popups.to_vec(),
+        });
         self.steps
             .pop_front()
             .expect("FakeHands: run_step 被调用的次数比脚本里排的 steps 多")
     }
     fn run_procedure(
         &mut self,
-        _window_id: u64,
+        window_id: u64,
         procedure: &Value,
         params: &Params,
         popups: &[Value],
@@ -97,6 +119,7 @@ impl Hands for FakeHands {
             Some(n) => format!("run_procedure stop_before={n}"),
             None => "run_procedure".into(),
         });
+        self.procedure_windows.push(window_id);
         self.sent_procedures.push((
             procedure.clone(),
             params.clone(),

@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use dct_explore::hands::{By, Hands, HelpAnswer, Params, StepReq};
+use dct_explore::hands::{By, DcoHands, Hands, HelpAnswer, Params, StepReq};
 use serde_json::json;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -15,13 +15,19 @@ fn run_step_sends_the_closed_vocabulary_step_and_reads_help() {
             (
                 json!({"run_id": "r9", "status": "needs_help", "at_step": 1, "learned": [],
                     "help": {"snapshot_id": "s2", "intent": "Post", "question": "两个 Post",
-                             "elements": [{"id": "e1", "text": "Post", "role": "button", "source": "ocr",
-                                           "frac": {"x": 0.1, "y": 0.5, "w": 0.05, "h": 0.03}}]}}),
+                             "elements": [{"id": "e1", "text": "Post", "role": "button", "source": "ocr", "confidence": 0.9,
+                                           "bounds": {"x": 100.0, "y": 300.0, "w": 50.0, "h": 18.0}}]}}),
                 false,
                 Some("AAAA".into()),
             )
         }
+        "list_windows" => (
+            json!({"windows": [{"window_id": 4100, "app": "Chrome", "title": "X", "size": {"w": 1000.0, "h": 600.0}}]}),
+            false,
+            None,
+        ),
         "answer_run" => {
+            assert_eq!(args["run_id"], "r9");
             assert_eq!(args["element_id"], "e1");
             assert_eq!(args["by"], "model");
             (
@@ -32,7 +38,9 @@ fn run_step_sends_the_closed_vocabulary_step_and_reads_help() {
         }
         t => panic!("没想到会调 {t}"),
     });
-    let mut c = dct_dco::DcoClient::connect_with_timeout(dir.path(), dct_dco::RUN_TIMEOUT).unwrap();
+    let mut c = DcoHands::new(
+        dct_dco::DcoClient::connect_with_timeout(dir.path(), dct_dco::RUN_TIMEOUT).unwrap(),
+    );
     let r = c
         .run_step(
             4100,
@@ -47,7 +55,15 @@ fn run_step_sends_the_closed_vocabulary_step_and_reads_help() {
         .unwrap();
     assert_eq!(r.status, "needs_help");
     let help = r.help.unwrap();
-    assert_eq!(help.elements[0].frac.x, 0.1);
+    assert_eq!(
+        help.elements[0].frac,
+        dct_explore::hands::Frac {
+            x: 0.1,
+            y: 0.5,
+            w: 0.05,
+            h: 0.03
+        }
+    );
     assert_eq!(help.picture_png.as_deref(), Some("AAAA"));
     let done = c
         .answer_run(
@@ -78,7 +94,7 @@ fn look_asks_for_the_scene_hash() {
             None,
         )
     });
-    let mut c = dct_dco::DcoClient::connect(dir.path()).unwrap();
+    let mut c = DcoHands::new(dct_dco::DcoClient::connect(dir.path()).unwrap());
     let l = c.look(4100, false).unwrap();
     assert_eq!(l.scene_hash.as_deref(), Some("abcd"));
     assert_eq!(l.elements[0].text, "What's happening?");
@@ -123,7 +139,7 @@ fn procedure_windows_and_confirm_calls_have_the_expected_shape() {
         }
         t => panic!("没想到会调 {t}"),
     });
-    let mut c = dct_dco::DcoClient::connect(dir.path()).unwrap();
+    let mut c = DcoHands::new(dct_dco::DcoClient::connect(dir.path()).unwrap());
     let w = c.list_windows().unwrap();
     assert_eq!((w[0].window_id, w[0].app.as_str()), (7, "Google Chrome"));
     let mut p = Params::new();
