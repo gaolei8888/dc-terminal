@@ -164,6 +164,7 @@ pub(super) fn new_run(input: &ExploreInput, clock: &dyn Clock, prefix: Vec<Trace
                 .collect(),
             steps: prefix,
             first_lines: vec![],
+            outcome: None,
         },
         meter: Meter::new(clock.now_ms()),
         snaps: HashMap::new(),

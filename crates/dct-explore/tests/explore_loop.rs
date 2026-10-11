@@ -2652,3 +2652,287 @@ fn a_confirm_dialog_that_never_goes_away_stops_without_claiming_it_was_sent() {
         other => panic!("{other:?} {:?}", h.calls),
     }
 }
+
+// ---- 训练题 v2：谁答的 + 这一下是不是确认离目标更近（task 1 of the auto-training spec） ----
+
+fn rows_in(d: &std::path::Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(d.join("answers.jsonl")).unwrap();
+    assert!(!text.contains(TEXT), "参数值不能写盘：{text}");
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn trace_of(out: &Outcome) -> &dct_explore::trace::Trace {
+    match out {
+        Outcome::Published(t)
+        | Outcome::DeclinedAtPublish(t)
+        | Outcome::Halted { trace: t, .. }
+        | Outcome::Stopped { trace: t, .. } => t,
+    }
+}
+
+/// 每行都带 v2 的字段：shown 是 options 的子集、≤ 20；step 指着轨迹里的步骤（done 为空）。
+fn assert_v2_shape(r: &serde_json::Value, trace: &dct_explore::trace::Trace) {
+    assert_eq!(r["v"], 2, "{r}");
+    let opts: Vec<&str> = r["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o[0].as_str().unwrap())
+        .collect();
+    let shown = r["shown"].as_array().expect("shown");
+    assert!(!shown.is_empty() && shown.len() <= 20, "{r}");
+    for k in shown {
+        assert!(opts.contains(&k.as_str().unwrap()), "shown ⊆ options：{r}");
+    }
+    match r["step"].as_u64() {
+        Some(i) => assert!((i as usize) < trace.steps.len(), "step 指着轨迹：{r}"),
+        None => assert_eq!(r["answer"], "done", "{r}"),
+    }
+    assert!(r["run_outcome"].is_string() && r["outcome"].is_string() && r["label"].is_boolean());
+}
+
+#[test]
+fn model_answers_on_the_path_of_a_published_run_are_labels_with_outcome_good() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_look(composer("a")); // 编号图（问大模型）
+    h.push_step(done("r1")); // tap_by_intent: What's happening?
+    h.push_step(done("r2")); // type_param
+    h.push_look(composer_filled("b"));
+    h.push_look(composer_filled("b")); // 编号图（问大模型；问发不发时复用）
+    h.push_step(done("r3")); // tap_by_intent: Post
+    h.push_look(sent("c"));
+    let m = ScriptModel(vec!["fill_post_text_e2", "e3"], std::cell::RefCell::new(0));
+    let (j, mut u) = (NoJeff, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Published(_)), "{out:?}");
+    let trace = trace_of(&out);
+    assert_eq!(
+        trace.outcome,
+        Some(dct_explore::trace::RunOutcome::Published)
+    );
+    let rows = rows_in(d.path());
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for r in &rows {
+        assert_v2_shape(r, trace);
+        assert_eq!(r["by"], "model");
+        assert_eq!(r["run_outcome"], "published");
+        assert_eq!(r["outcome"], "good", "{r}");
+        assert_eq!(r["label"], true, "{r}");
+        let i = r["step"].as_u64().unwrap() as usize;
+        assert!(trace.steps[i].ok);
+    }
+    assert_eq!(rows[0]["step"], 1, "open_url 是第 0 步");
+    assert_eq!(rows[1]["step"], 3, "填字占了 1、2 两步");
+}
+
+#[test]
+fn a_model_answer_that_later_loops_back_is_not_a_label() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let b = || {
+        look(
+            "b",
+            vec![
+                el("e7", "Back", "button", 0.05, 0.05),
+                el("e8", "Your drafts", "text", 0.4, 0.3),
+            ],
+        )
+    };
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_look(composer("a")); // 编号图（问大模型）
+    h.push_step(done("r1")); // 大模型 @A：Drafts → 新画面 B（写一行）
+    h.push_look(b());
+    h.push_look(b()); // 编号图
+    h.push_step(done("r2")); // 大模型 @B：Back → 绕回 A（Drafts 那一步变成 ok: false）
+    h.push_look(composer("a"));
+    h.push_look(composer("a")); // 编号图；大模型、用户都不答 → 停
+    let m = ScriptModel(vec!["e5", "e7"], std::cell::RefCell::new(0));
+    let (j, mut u) = (NoJeff, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    let trace = trace_of(&out);
+    assert_eq!(trace.outcome, Some(dct_explore::trace::RunOutcome::Stopped));
+    let rows = rows_in(d.path());
+    assert_eq!(rows.len(), 1, "绕回见过的画面那一下不写题：{rows:?}");
+    let r = &rows[0];
+    assert_v2_shape(r, trace);
+    assert_eq!(
+        (r["by"].as_str(), r["answer"].as_str()),
+        (Some("model"), Some("e5"))
+    );
+    assert_eq!(r["step"], 1);
+    assert!(!trace.steps[1].ok, "绕回后那一步在轨迹里 ok: false");
+    assert_eq!(r["run_outcome"], "stopped");
+    assert_eq!(r["outcome"], "bad", "{r}");
+    assert_eq!(r["label"], false, "{r}");
+}
+
+#[test]
+fn a_model_answer_still_on_the_path_of_a_stopped_run_is_unknown_and_not_a_label() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_look(composer("a")); // 编号图（问大模型）
+    h.push_step(done("r1")); // Drafts → 新画面
+    h.push_look(look("b", vec![el("e8", "Your drafts", "text", 0.4, 0.3)]));
+    h.push_look_err("stale"); // 编号图拿不到；大模型、用户不答 → 停
+    let m = ScriptModel(vec!["e5"], std::cell::RefCell::new(0));
+    let (j, mut u) = (NoJeff, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    let rows = rows_in(d.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_v2_shape(r, trace_of(&out));
+    assert_eq!(r["by"], "model");
+    assert_eq!(r["run_outcome"], "stopped");
+    assert_eq!(r["outcome"], "unknown", "{r}");
+    assert_eq!(r["label"], false, "{r}");
+}
+
+#[test]
+fn user_answers_are_labels_and_jeff_answers_never_are() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1")); // Jeff: tap_by_intent: Drafts
+    h.push_look(composer("a")); // 没变 -> Jeff 失败
+    h.push_look(composer("a")); // 编号图
+    h.push_step(done("r2")); // 用户：tap_by_intent: What's happening?
+    h.push_step(done("r3")); // type_param
+    h.push_look(composer_filled("b"));
+    h.push_look(composer_filled("b")); // 编号图（问发不发）
+    h.push_step(done("r4")); // tap_by_intent: Post
+    h.push_look(sent("c"));
+    let (j, m, mut u) = (
+        sure(vec!["e5", "e3", "done"]),
+        NoModel,
+        ScriptUser(vec![("fill_post_text_e2", None)], 0),
+    );
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Published(_)), "{out:?}");
+    let rows = rows_in(d.path());
+    for r in &rows {
+        assert_v2_shape(r, trace_of(&out));
+    }
+    let user = rows.iter().find(|r| r["by"] == "user").unwrap();
+    assert_eq!(user["label"], true);
+    assert_eq!(user["corrects_jeff"], true, "纠正 Jeff 的题照样认得出");
+    assert_eq!(user["outcome"], "good");
+    let jeff: Vec<_> = rows.iter().filter(|r| r["by"] == "jeff").collect();
+    assert!(!jeff.is_empty());
+    for r in jeff {
+        assert_eq!(r["label"], false, "Jeff 的答案自己不算标准答案：{r}");
+        assert_eq!(r["outcome"], "good", "结局照记，只是不当标签：{r}");
+    }
+}
+
+#[test]
+fn a_halted_run_records_its_outcome_on_the_trace_and_the_rows() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_look(composer("a")); // 编号图（问大模型）
+    h.push_step(done("r1")); // Drafts → 登录墙（新画面，写一行）
+    h.push_look(look(
+        "w",
+        vec![el("e9", "Verify you are human", "text", 0.4, 0.5)],
+    ));
+    let m = ScriptModel(vec!["e5"], std::cell::RefCell::new(0));
+    let (j, mut u) = (NoJeff, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Halted { .. }), "{out:?}");
+    assert_eq!(
+        trace_of(&out).outcome,
+        Some(dct_explore::trace::RunOutcome::Halted)
+    );
+    let rows = rows_in(d.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r["run_outcome"], "halted");
+    assert_eq!(r["outcome"], "unknown");
+    assert_eq!(r["label"], false);
+    let text = std::fs::read_to_string(d.path().join("answers.jsonl")).unwrap();
+    assert!(
+        !text.contains("Verify you are human"),
+        "停下的画面上的字不写进题：{text}"
+    );
+}
+
+#[test]
+fn a_declined_publish_records_declined() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1"));
+    h.push_step(done("r2"));
+    h.push_look(composer_filled("b"));
+    h.push_look(composer_filled("b")); // 编号图（问发不发）
+    let (j, m, mut u) = (
+        sure(vec!["fill_post_text_e2", "e3"]),
+        NoModel,
+        ScriptUser(vec![], 0),
+    );
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut No, &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::DeclinedAtPublish(_)), "{out:?}");
+    assert_eq!(
+        trace_of(&out).outcome,
+        Some(dct_explore::trace::RunOutcome::Declined)
+    );
+    let rows = rows_in(d.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["run_outcome"], "declined");
+    assert_eq!(rows[0]["label"], false);
+}

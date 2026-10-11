@@ -32,6 +32,32 @@ pub struct Trace {
     pub params: Vec<String>,
     pub steps: Vec<TraceStep>,
     pub first_lines: Vec<String>,
+    /// 这次运行的结局；摸索循环返回前填上。旧轨迹没有这个字段（读出来是 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunOutcome>,
+}
+
+/// 一次运行的结局（和 `explore::Outcome` 一一对应）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOutcome {
+    Published,
+    Declined,
+    Halted,
+    Stopped,
+}
+
+/// 照这道题的答案做了以后，是不是确认离目标更近了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StepOutcome {
+    /// dco 回 done、到了这次运行没见过的新画面、这一步在**最终**轨迹里还是 `ok: true`
+    /// （没被后来的绕圈改掉），而且这次运行发出去了。`done` 那道题：运行发出去了。
+    Good,
+    /// 确认没起作用：画面没到新画面，或这一步后来被绕圈改成了 `ok: false`。
+    Bad,
+    /// 这一步一直在路上，但这次运行没发出去（停下 / 拦下 / 用户不让发）：说不清。
+    Unknown,
 }
 
 fn id_char_ok(b: u8) -> bool {
@@ -136,8 +162,14 @@ pub fn save(dir: &Path, t: &Trace) -> std::io::Result<PathBuf> {
     Ok(p)
 }
 
+/// 训练题行的格式版本。没有 `v` 的旧行（v1）只有下面到 `corrects_jeff` 为止的字段。
+pub const QUESTION_ROW_V: u32 = 2;
+
+/// 一行训练题。v2 在运行**结束以后**才写（结局定了，`outcome` 不会再变），见 `grade`。
 #[derive(serde::Serialize)]
 pub struct QuestionRow<'a> {
+    /// 格式版本，`QUESTION_ROW_V`。
+    pub v: u32,
     pub ts_ms: u64,
     pub run_id: &'a str,
     pub platform: &'a str,
@@ -147,6 +179,44 @@ pub struct QuestionRow<'a> {
     pub answer: &'a str,
     pub by: Who,
     pub corrects_jeff: bool,
+    /// 这一轮的候选单（`options::shortlist`，最多 20 个）的 key，按发给 Jeff 的顺序。
+    /// 就是 Jeff 这一轮被问到的题；Jeff 在这个画面上失败过、这轮没问它时，也是会发给它的那份。
+    pub shown: Vec<String>,
+    /// 照这个答案做的第一步在 `runs/<run_id>/trace.json` 的 `steps` 里的序号；`done` 为空。
+    pub step: Option<usize>,
+    pub run_outcome: RunOutcome,
+    pub outcome: StepOutcome,
+    /// 能不能当标准答案（`grade`）。
+    pub label: bool,
+}
+
+/// 标签规矩。`step_ok`：这道题的步骤在最终轨迹里的 `ok`（`done` 那道题为 None）；
+/// `moved`：照做后 dco 回 done、而且到了这次运行没见过的新画面。
+/// 用户的答案永远算；大模型的只有 `Good` 才算；Jeff 的永远不算（拿自己的答案练自己）。
+pub fn grade(by: Who, step_ok: Option<bool>, moved: bool, run: RunOutcome) -> (StepOutcome, bool) {
+    let outcome = if !moved || step_ok == Some(false) {
+        StepOutcome::Bad
+    } else if run == RunOutcome::Published {
+        StepOutcome::Good
+    } else {
+        StepOutcome::Unknown
+    };
+    let label = match by {
+        Who::User => true,
+        Who::Model => outcome == StepOutcome::Good,
+        Who::Jeff => false,
+    };
+    (outcome, label)
+}
+
+/// 读一行训练题（任何版本）判断是不是标准答案：v2 看 `label`（`by: jeff` 一律不算）；
+/// 没有 `v` 的旧行没有结局可查，只有 `by: user` 算。
+pub fn is_label(row: &serde_json::Value) -> bool {
+    let by = row["by"].as_str();
+    match row["v"].as_u64() {
+        None => by == Some("user"),
+        Some(_) => by != Some("jeff") && row["label"].as_bool() == Some(true),
+    }
 }
 
 /// 追加一行 JSON，0600。调用方要先对 `state` 和选项文字做 `redact`。
@@ -231,6 +301,7 @@ mod tests {
         append_question(
             &f,
             &QuestionRow {
+                v: QUESTION_ROW_V,
                 ts_ms: 1,
                 run_id: "x-1",
                 platform: "x",
@@ -240,6 +311,11 @@ mod tests {
                 answer: "e3",
                 by: Who::Model,
                 corrects_jeff: true,
+                shown: vec!["e3".into()],
+                step: Some(1),
+                run_outcome: RunOutcome::Published,
+                outcome: StepOutcome::Good,
+                label: true,
             },
         )
         .unwrap();
@@ -264,6 +340,7 @@ mod tests {
             append_question(
                 &f,
                 &QuestionRow {
+                    v: QUESTION_ROW_V,
                     ts_ms: i,
                     run_id: "x-1",
                     platform: "x",
@@ -273,11 +350,65 @@ mod tests {
                     answer: "e1",
                     by: Who::Jeff,
                     corrects_jeff: false,
+                    shown: vec![],
+                    step: None,
+                    run_outcome: RunOutcome::Stopped,
+                    outcome: StepOutcome::Unknown,
+                    label: false,
                 },
             )
             .unwrap();
         }
         assert_eq!(std::fs::read_to_string(&f).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn the_label_rule_counts_users_and_confirmed_model_steps_only() {
+        use RunOutcome::*;
+        use StepOutcome::*;
+        // 用户：永远算；结局照记。
+        assert_eq!(grade(Who::User, Some(false), true, Stopped), (Bad, true));
+        // 大模型：在发出去那条路上、到了新画面 → good，算。
+        assert_eq!(grade(Who::Model, Some(true), true, Published), (Good, true));
+        assert_eq!(grade(Who::Model, None, true, Published), (Good, true)); // done
+                                                                            // 绕回（最终 ok: false）、画面没到新画面 → bad，不算。
+        assert_eq!(
+            grade(Who::Model, Some(false), true, Published),
+            (Bad, false)
+        );
+        assert_eq!(
+            grade(Who::Model, Some(true), false, Published),
+            (Bad, false)
+        );
+        assert_eq!(grade(Who::Model, Some(false), true, Halted), (Bad, false));
+        // 还在路上、可这次没发出去：说不清，不算。
+        for run in [Stopped, Halted, Declined] {
+            assert_eq!(grade(Who::Model, Some(true), true, run), (Unknown, false));
+        }
+        // Jeff：结局照记，自己永远不算。
+        assert_eq!(grade(Who::Jeff, Some(true), true, Published), (Good, false));
+    }
+
+    #[test]
+    fn old_rows_without_v_only_count_user_answers() {
+        let old_user: serde_json::Value =
+            serde_json::from_str(r#"{"ts_ms":1,"run_id":"x-1","platform":"x","state":"s","options":[["e1","a"]],"jeff":null,"answer":"e1","by":"user","corrects_jeff":false}"#).unwrap();
+        let old_model: serde_json::Value =
+            serde_json::from_str(r#"{"ts_ms":1,"run_id":"x-1","platform":"x","state":"s","options":[["e1","a"]],"jeff":null,"answer":"e1","by":"model","corrects_jeff":false}"#).unwrap();
+        assert!(is_label(&old_user));
+        assert!(!is_label(&old_model));
+        let v2 = |by: &str, label: bool| serde_json::json!({"v": 2, "by": by, "label": label});
+        assert!(is_label(&v2("model", true)));
+        assert!(!is_label(&v2("model", false)));
+        // 一行 v2 写着 jeff 的 label: true 也不算（规矩不靠写盘的那一位）。
+        assert!(!is_label(&v2("jeff", true)));
+    }
+
+    #[test]
+    fn old_traces_without_outcome_still_load() {
+        let json = r#"{"run_id":"x-1","platform":"x","params":[],"steps":[],"first_lines":[]}"#;
+        let t: Trace = serde_json::from_str(json).unwrap();
+        assert_eq!(t.outcome, None);
     }
 
     #[test]
@@ -289,6 +420,7 @@ mod tests {
             params: vec!["post_text".into()],
             first_lines: vec!["What's happening?".into()],
             steps: vec![],
+            outcome: None,
         };
         let p = save(d.path(), &t).unwrap();
         let back: Trace = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -312,6 +444,7 @@ mod tests {
             params: vec![],
             first_lines: vec![],
             steps: vec![],
+            outcome: None,
         };
         assert!(save(d.path(), &t).is_err());
     }

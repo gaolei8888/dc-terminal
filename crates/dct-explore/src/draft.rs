@@ -316,6 +316,7 @@ mod tests {
             params: vec!["post_text".into()],
             first_lines: vec!["What's happening?".into()],
             steps,
+            outcome: None,
         }
     }
 

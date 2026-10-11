@@ -7,7 +7,7 @@ use crate::hands::{By, El, Hands, Help, HelpAnswer, RunReply, StepReq};
 use crate::ladder::{Decision, Ladder, Model, ModelPick, Tries, User, UserPick, Who};
 use crate::options::{steps_for, Act, Opt};
 use crate::platform::Platform;
-use crate::trace::{append_question, QuestionRow};
+use crate::trace::{append_question, grade, QuestionRow, RunOutcome, QUESTION_ROW_V};
 use std::cell::RefCell;
 
 /// 求助时「同一个元素」的中心点距离上限（窗口比例）。
@@ -354,32 +354,82 @@ pub(super) fn execute(
     Exec::Ok(out)
 }
 
-/// 一道题写一行（题面和选项字都已脱敏）。写不进去不影响这次摸索。
+/// 答过的一道题，先留在内存里，运行结束、结局定了才写盘（`write_rows`）。
+/// 题面和选项字在这之前都已脱敏。
+pub(super) struct PendingRow {
+    ts_ms: u64,
+    state: String,
+    options: Vec<(String, String)>,
+    shown: Vec<String>,
+    jeff: Option<(String, f64)>,
+    answer: String,
+    by: Who,
+    corrects_jeff: bool,
+    step: Option<usize>,
+    moved: bool,
+}
+
+/// 记下一道答过的题。`step`：照做的第一步在轨迹里的序号（`done` 为 None）；
+/// `moved`：dco 回 done、到了这次运行没见过的新画面。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn write_row(
-    file: &std::path::Path,
+pub(super) fn pending_row(
     clock: &dyn Clock,
-    input: &ExploreInput,
     state: &str,
     all: &[Opt],
+    short: &[Opt],
     dec: &crate::ladder::Decision,
     failed_jeff: Option<(String, f64)>,
-) {
+    step: Option<usize>,
+    moved: bool,
+) -> PendingRow {
     let jeff = dec.jeff.clone().or(failed_jeff);
     let corrects_jeff = dec.by != Who::Jeff && jeff.as_ref().is_some_and(|(k, _)| *k != dec.key);
-    let row = QuestionRow {
+    PendingRow {
         ts_ms: clock.now_ms(),
-        run_id: &input.run_id,
-        platform: &input.platform.name,
         state: state.to_string(),
         options: all
             .iter()
             .map(|o| (o.key.clone(), o.text.clone()))
             .collect(),
+        shown: short.iter().map(|o| o.key.clone()).collect(),
         jeff,
-        answer: &dec.key,
+        answer: dec.key.clone(),
         by: dec.by,
         corrects_jeff,
-    };
-    let _ = append_question(file, &row);
+        step,
+        moved,
+    }
+}
+
+/// 运行结束：按最终轨迹和结局给每道题定 `outcome` / `label`（`trace::grade`），一道题写一行。
+/// 写不进去不影响这次摸索。
+pub(super) fn write_rows(
+    file: &std::path::Path,
+    input: &ExploreInput,
+    rows: &[PendingRow],
+    trace: &crate::trace::Trace,
+    run: RunOutcome,
+) {
+    for p in rows {
+        let step_ok = p.step.map(|i| trace.steps.get(i).is_some_and(|s| s.ok));
+        let (outcome, label) = grade(p.by, step_ok, p.moved, run);
+        let row = QuestionRow {
+            v: QUESTION_ROW_V,
+            ts_ms: p.ts_ms,
+            run_id: &input.run_id,
+            platform: &input.platform.name,
+            state: p.state.clone(),
+            options: p.options.clone(),
+            jeff: p.jeff.clone(),
+            answer: &p.answer,
+            by: p.by,
+            corrects_jeff: p.corrects_jeff,
+            shown: p.shown.clone(),
+            step: p.step,
+            run_outcome: run,
+            outcome,
+            label,
+        };
+        let _ = append_question(file, &row);
+    }
 }

@@ -20,7 +20,7 @@
 //!    求助的画面也先过 `screen_halt`，命中就取消 dco 的运行 → `Halted`，不给任何人选）。
 //! 8. 执行后 `look`：scene_hash 和执行前一样、或是这次运行里见过的画面 → 失败：记在**选它的那个画面**
 //!    的 `Tries` 上（每个画面一份，绕回来也还在，所以 A↔B 来回绕时第二圈就交给大模型 / 用户）。
-//!    变了（新画面）→ 记 `TraceStep`、更新 `Progress`、写一行训练题；这一下是发布（或者还在等确认）
+//!    变了（新画面）→ 记 `TraceStep`、更新 `Progress`、记一道训练题（运行结束才写盘，见 `explore_from`）；这一下是发布（或者还在等确认）
 //!    → 按 11 看新画面：发出去了 → `Published`；停下的画面 → `Halted`；还在等确认 → 接着走。
 //!
 //!    轨迹怎么记做了但没起作用的一下：照实记，`ok: false`。绕回见过的画面 S 时，轨迹里每步的 `ok`
@@ -52,8 +52,8 @@ use crate::hands::{Hands, Params, StepReq};
 use crate::ladder::{Decision, Ladder, Who};
 use crate::options::{shortlist, state_text, Act, Goal, Opt};
 use crate::platform::Platform;
-use crate::trace::{Trace, TraceStep};
-use act::write_row;
+use crate::trace::{RunOutcome, Trace, TraceStep};
+use act::{pending_row, write_rows, PendingRow};
 use run::{advance, new_run, plain_step, record};
 pub use screen::values_on_screen;
 use screen::{look_error, see, Landed, Scrub};
@@ -92,6 +92,39 @@ pub enum Outcome {
     Halted { trace: Trace, why: Halt },
     /// 上限、用户说停、dco blocked / private_screen / 窗口没了
     Stopped { trace: Trace, why: String },
+}
+
+impl Outcome {
+    pub fn trace(&self) -> &Trace {
+        match self {
+            Outcome::Published(t)
+            | Outcome::DeclinedAtPublish(t)
+            | Outcome::Halted { trace: t, .. }
+            | Outcome::Stopped { trace: t, .. } => t,
+        }
+    }
+    fn trace_mut(&mut self) -> &mut Trace {
+        match self {
+            Outcome::Published(t)
+            | Outcome::DeclinedAtPublish(t)
+            | Outcome::Halted { trace: t, .. }
+            | Outcome::Stopped { trace: t, .. } => t,
+        }
+    }
+    pub fn kind(&self) -> RunOutcome {
+        match self {
+            Outcome::Published(_) => RunOutcome::Published,
+            Outcome::DeclinedAtPublish(_) => RunOutcome::Declined,
+            Outcome::Halted { .. } => RunOutcome::Halted,
+            Outcome::Stopped { .. } => RunOutcome::Stopped,
+        }
+    }
+    /// 把结局记进轨迹（存 `trace.json` 时一起存下）。
+    fn settled(mut self) -> Outcome {
+        let k = self.kind();
+        self.trace_mut().outcome = Some(k);
+        self
+    }
 }
 
 fn over_text(o: Over, b: &Budget) -> String {
@@ -135,17 +168,23 @@ pub fn explore(
         }
         Ok(r) => {
             let why = format!("打不开 {}：{}", open.arg, act::describe(&r, &scrub));
-            return new_run(&input, clock, vec![]).stop(why);
+            return new_run(&input, clock, vec![]).stop(why).settled();
         }
         Err(e) => {
             act::cancel_parked(h, &e);
-            return new_run(&input, clock, vec![]).stop(look_error(&e, &scrub));
+            return new_run(&input, clock, vec![])
+                .stop(look_error(&e, &scrub))
+                .settled();
         }
     }
     explore_from(h, lad, confirm, clock, input, first)
 }
 
 /// 修补用：从当前画面接着摸索，已有的步骤作为轨迹开头（不再 open_url）。
+///
+/// 训练题（`answers.jsonl`）在运行**结束以后**一次写下：轨迹的 `ok` 会因为后来绕回见过的画面
+/// 而改掉（见第 8 条），结局也要到最后才知道，等到最后写，每行的 `outcome` / `label` 就是定了的，
+/// 不用回头改文件。代价：进程半路被杀掉，这次的题就没了（轨迹本来也只在结束时存）。
 pub fn explore_from(
     h: &mut dyn Hands,
     lad: &mut Ladder,
@@ -154,10 +193,27 @@ pub fn explore_from(
     input: ExploreInput,
     prefix: Vec<TraceStep>,
 ) -> Outcome {
-    let mut r = new_run(&input, clock, prefix);
+    let mut rows = Vec::new();
+    let out = drive(h, lad, confirm, clock, &input, prefix, &mut rows).settled();
+    let answers = input.data_dir.join("answers.jsonl");
+    write_rows(&answers, &input, &rows, out.trace(), out.kind());
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive(
+    h: &mut dyn Hands,
+    lad: &mut Ladder,
+    confirm: &mut dyn Confirm,
+    clock: &dyn Clock,
+    input: &ExploreInput,
+    prefix: Vec<TraceStep>,
+    rows: &mut Vec<PendingRow>,
+) -> Outcome {
+    let mut r = new_run(input, clock, prefix);
     let scrub = Scrub::new(&input.params);
     // 修补：开头已经打过的字可能还在画面上；字被清掉时用开头点的那个意图再填。
-    run::seed_from_prefix(&mut r, &input, &scrub);
+    run::seed_from_prefix(&mut r, input, &scrub);
     let goal_text = scrub.text(input.goal_text);
     let goal = Goal {
         text: &goal_text,
@@ -165,8 +221,7 @@ pub fn explore_from(
         text_params: &input.text_params,
         file_params: &input.file_params,
     };
-    let answers = input.data_dir.join("answers.jsonl");
-    let mut cur = match see(h, &input, &scrub) {
+    let mut cur = match see(h, input, &scrub) {
         Ok(s) => s,
         Err(why) => return r.stop(why),
     };
@@ -204,10 +259,12 @@ pub fn explore_from(
         let all = cur.options(&goal, &r.prog, &scrub, &on, &r.fills);
         let short = shortlist(&all, &goal);
         let state = state_text(&goal, &r.trail(), &cur.look);
-        let row = |d: &Decision, fj| write_row(&answers, clock, &input, &state, &all, d, fj);
+        // 题先记在内存里，运行结束才写（见 `explore_from`）。
+        let mut row = |d: &Decision, fj, step: Option<usize>, moved: bool| {
+            rows.push(pending_row(clock, &state, &all, &short, d, fj, step, moved))
+        };
         let tries = r.tries_at(&cur.key);
-        let (dec, mut pic) = match act::decide(h, lad, &input, &scrub, &state, &short, &all, tries)
-        {
+        let (dec, mut pic) = match act::decide(h, lad, input, &scrub, &state, &short, &all, tries) {
             act::Decided::Pick(d, pic) => (d, pic),
             act::Decided::Halt(why) => {
                 return Outcome::Halted {
@@ -264,7 +321,7 @@ pub fn explore_from(
                 if let Some(first) = r.pending.clone() {
                     // 11. 画面上还有发布按钮、「发出去了」那行字也没核实：规矩认不出，问用户。
                     if pic.is_none() {
-                        pic = match act::marks_now(h, &input, &scrub) {
+                        pic = match act::marks_now(h, input, &scrub) {
                             Ok(p) => Some(p),
                             Err(why) => {
                                 return Outcome::Halted {
@@ -286,7 +343,7 @@ pub fn explore_from(
                         continue;
                     }
                 }
-                row(&dec, fj);
+                row(&dec, fj, None, true);
                 return Outcome::Published(r.trace);
             }
             Act::Done => return r.stop("还没发布就说做完了".into()),
@@ -298,7 +355,7 @@ pub fn explore_from(
         // 每一次点「最终发布」都先问（不只第一次）：上一次点了没反应、又要点时也问，绝不悄悄发第二次。
         if opt.publish {
             if pic.is_none() {
-                pic = match act::marks_now(h, &input, &scrub) {
+                pic = match act::marks_now(h, input, &scrub) {
                     Ok(p) => Some(p),
                     Err(why) => {
                         return Outcome::Halted {
@@ -332,7 +389,7 @@ pub fn explore_from(
                     arg: word.clone(),
                     done_when: None,
                 };
-                let post = match see(h, &input, &scrub) {
+                let post = match see(h, input, &scrub) {
                     Ok(s) => s,
                     Err(why) => return r.stop(why),
                 };
@@ -346,7 +403,8 @@ pub fn explore_from(
                 if r.pending.is_some() {
                     r.after_publish += 1;
                 }
-                row(&dec, fj);
+                // 用户点的发布：不管画面变没变都记（画面没变 → 这道题 `outcome: bad`）。
+                row(&dec, fj, Some(r.trace.steps.len()), fresh);
                 record(
                     &mut r,
                     &cur,
@@ -391,7 +449,7 @@ pub fn explore_from(
         let after_by_user = input.platform.publish_by_user_only && r.prog.published;
         if !opt.publish && taps && (unverified || after_by_user || r.pending.is_some()) {
             if pic.is_none() {
-                pic = match act::marks_now(h, &input, &scrub) {
+                pic = match act::marks_now(h, input, &scrub) {
                     Ok(p) => Some(p),
                     Err(why) => {
                         return Outcome::Halted {
@@ -424,7 +482,7 @@ pub fn explore_from(
         }
         // 7. 执行（填字先记下：打字失败后发帖框可能变成值元素，还要能再填）
         run::remember_fill(&mut r, &opt);
-        let done = match act::execute(h, &mut *lad.user, &input, &scrub, &state, &opt, dec.by) {
+        let done = match act::execute(h, &mut *lad.user, input, &scrub, &state, &opt, dec.by) {
             act::Exec::Stop(why) => return r.stop(why),
             act::Exec::Halt(why) => {
                 return Outcome::Halted {
@@ -436,7 +494,7 @@ pub fn explore_from(
             act::Exec::Ok(steps) => Some(steps),
         };
         // 8. 核对画面
-        let post = match see(h, &input, &scrub) {
+        let post = match see(h, input, &scrub) {
             Ok(s) => s,
             Err(why) => return r.stop(why),
         };
@@ -446,7 +504,7 @@ pub fn explore_from(
         }
         match done {
             Some(steps) if !r.seen(&post.key) => {
-                row(&dec, fj);
+                row(&dec, fj, Some(r.trace.steps.len()), true);
                 record(&mut r, &cur, &post, &opt, &dec, steps, true);
                 advance(&mut r, &opt);
                 if opt.publish || r.pending.is_some() {
