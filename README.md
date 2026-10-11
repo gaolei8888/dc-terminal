@@ -925,8 +925,11 @@ same name replaces the built-in one.
 **Not done yet:** the real-screen pilots; a stronger model for the middle step
 (waiting for its address); dcv and dco changes it depends on, built in their own
 repositories; and a
-publish that takes two taps (Post, then a confirm dialog) is reported as posted
-after the first.
+publish that takes two taps (Post, then a confirm dialog) counts as posted only
+once the new screen has no publish button left or shows a verified "posted" text.
+On X that text is still unverified and the home page keeps a Post button, so a
+real X run stays pending after the first tap until the text is verified on a real
+machine.
 
 ## Several computers
 
