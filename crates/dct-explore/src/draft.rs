@@ -98,24 +98,54 @@ pub fn draft(
     if steps.is_empty() {
         return Err(DraftError::Empty);
     }
-    // 登录闸：必须是第一屏上真看到过的字。
-    let gate = match p.login_gate.as_deref().map(str::trim) {
-        Some(g) if !g.is_empty() && marker_ok(g) => g,
-        other => {
-            return Err(DraftError::LoginGateNotSeen(
-                other.unwrap_or("").to_string(),
-            ))
+    // 修补：轨迹开头是原流程（用户确认过的）的第 1、2 步（open_url + 登录闸 verify_text）。
+    // 这两步原样留着，不再加一遍，也不拿接着摸索的第一屏去核对登录闸——那一屏可能早就过了闸
+    // （比如 X 打完字以后发帖框的提示字没了）。
+    let repair = steps.len() >= 2
+        && steps[0].from_procedure
+        && steps[0].action == "open_url"
+        && steps[1].from_procedure
+        && steps[1].action == "verify_text";
+    let head = if repair {
+        for (i, st) in steps[..2].iter().enumerate() {
+            if st.arg.trim().is_empty() || st.arg.contains('\n') {
+                return Err(DraftError::BadStepArg(format!(
+                    "第 {} 步 {} 的内容为空或含换行",
+                    i + 1,
+                    st.action
+                )));
+            }
         }
+        vec![
+            format!("1. open_url: {}", steps[0].arg),
+            format!("2. verify_text: {}", steps[1].arg),
+        ]
+    } else {
+        // 登录闸：必须是第一屏上真看到过的字。
+        let gate = match p.login_gate.as_deref().map(str::trim) {
+            Some(g) if !g.is_empty() && marker_ok(g) => g,
+            other => {
+                return Err(DraftError::LoginGateNotSeen(
+                    other.unwrap_or("").to_string(),
+                ))
+            }
+        };
+        let fg = fold(gate);
+        if !t.first_lines.iter().any(|l| fold(l).contains(&fg)) {
+            return Err(DraftError::LoginGateNotSeen(gate.to_string()));
+        }
+        vec![
+            format!("1. open_url: {}", p.entry_url),
+            format!("2. verify_text: 「{gate}」"),
+        ]
     };
-    let fg = fold(gate);
-    if !t.first_lines.iter().any(|l| fold(l).contains(&fg)) {
-        return Err(DraftError::LoginGateNotSeen(gate.to_string()));
-    }
     if !steps.iter().any(|s| s.publish) {
         return Err(DraftError::NoPublish);
     }
-    // 开头的 open_url 由平台表的入口网址代替（域名写死）。
-    if steps[0].action == "open_url" {
+    if repair {
+        steps.drain(..2);
+    } else if steps[0].action == "open_url" {
+        // 开头的 open_url 由平台表的入口网址代替（域名写死）。
         steps.remove(0);
     }
 
@@ -194,10 +224,7 @@ pub fn draft(
         .collect();
 
     // 拼正文：1 open_url，2 verify_text，然后抄。
-    let mut lines = vec![
-        format!("1. open_url: {}", p.entry_url),
-        format!("2. verify_text: 「{gate}」"),
-    ];
+    let mut lines = head;
     let mut n: u32 = 2;
     let mut maybe_one_off = Vec::new();
     let mut after_publish = false;
@@ -517,6 +544,46 @@ mod tests {
         assert_eq!(pops.len(), 1);
         let (_, again) = draft(&tr, t.get("x").unwrap(), &dismiss(), &[]).unwrap();
         assert_eq!(pops[0].name, again[0].name);
+    }
+
+    fn fp(mut st: TraceStep) -> TraceStep {
+        st.from_procedure = true;
+        st.by = Who::User;
+        st
+    }
+
+    #[test]
+    fn a_repair_keeps_the_procedures_gate_step_once_without_the_gate_on_the_stuck_screen() {
+        let t = Table::seed();
+        let mut tr = x_trace(vec![
+            fp(s("open_url", "https://x.com/compose/post", false, &[])),
+            fp(s("verify_text", "「What's happening?」", false, &[])),
+            fp(s("tap_by_intent", "What's happening?", false, &[])),
+            fp(s("type_param", "post_text", false, &[])),
+            s("tap_by_intent", "Post", true, &[]),
+        ]);
+        // 修补是从打完字的画面接着走的：发帖框的提示字早没了。
+        tr.first_lines = vec!["{post_text}".into(), "Post".into()];
+        let (d, _) = draft(&tr, t.get("x").unwrap(), &dismiss(), &[]).unwrap();
+        assert_eq!(
+            d.body,
+            "1. open_url: https://x.com/compose/post\n2. verify_text: 「What's happening?」\n3. tap_by_intent: What's happening?\n4. type_param: post_text\n5. tap_by_intent: Post"
+        );
+        assert_eq!(d.body.matches("verify_text").count(), 1);
+    }
+
+    #[test]
+    fn a_repair_whose_prefix_lacks_the_gate_step_still_needs_the_gate_on_screen() {
+        let t = Table::seed();
+        let mut tr = x_trace(vec![
+            fp(s("open_url", "https://x.com/compose/post", false, &[])),
+            s("tap_by_intent", "Post", true, &[]),
+        ]);
+        tr.first_lines = vec!["Home".into()];
+        assert!(matches!(
+            draft(&tr, t.get("x").unwrap(), &dismiss(), &[]),
+            Err(DraftError::LoginGateNotSeen(_))
+        ));
     }
 
     // ---- 和 dcv 的契约：dct 生成的名字、弹窗正文要过 dcv 的检查（照抄 dc-vault 的规则） ----

@@ -1386,7 +1386,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut h = FakeHands::new();
         chrome(&mut h);
-        let mut failed = reply("p1", "failed", 2);
+        let mut failed = reply("p1", "failed", 3);
         failed.note = Some("找不到 Compose".into());
         h.push_procedure(failed);
         // 从当前画面接着摸索（不再 open_url）
@@ -1402,8 +1402,9 @@ mod tests {
                 "social-global:promote-x-post".into(),
                 json!({"name": "promote-x-post", "executable": true, "steps": [
                     {"n": 1, "action": "open_url", "arg": "https://x.com/compose/post"},
-                    {"n": 2, "action": "tap_by_intent", "arg": "Compose"},
-                    {"n": 3, "action": "tap_by_intent", "arg": "Post"}]}),
+                    {"n": 2, "action": "verify_text", "arg": "「What's happening?」"},
+                    {"n": 3, "action": "tap_by_intent", "arg": "Compose"},
+                    {"n": 4, "action": "tap_by_intent", "arg": "Post"}]}),
             )],
             ..Default::default()
         };
@@ -1460,7 +1461,7 @@ mod tests {
     /// 修补：已有正式流程走不通 → 接着摸索 → 新草稿（draft_of 原名）。
     fn script_repair(h: &mut FakeHands) -> FakeDcv {
         chrome(h);
-        let mut failed = reply("p1", "failed", 2);
+        let mut failed = reply("p1", "failed", 3);
         failed.note = Some("找不到 Compose".into());
         h.push_procedure(failed);
         h.push_look(composer("a"));
@@ -1475,8 +1476,9 @@ mod tests {
                 "social-global:promote-x-post".into(),
                 json!({"name": "promote-x-post", "executable": true, "steps": [
                     {"n": 1, "action": "open_url", "arg": "https://x.com/compose/post"},
-                    {"n": 2, "action": "tap_by_intent", "arg": "Compose"},
-                    {"n": 3, "action": "tap_by_intent", "arg": "Post"}]}),
+                    {"n": 2, "action": "verify_text", "arg": "「What's happening?」"},
+                    {"n": 3, "action": "tap_by_intent", "arg": "Compose"},
+                    {"n": 4, "action": "tap_by_intent", "arg": "Post"}]}),
             )],
             ..Default::default()
         }
@@ -1510,6 +1512,55 @@ mod tests {
             .windows(2)
             .any(|w| w == ["--draft-of", "promote-x-post"]));
         assert_eq!(r.approved, ["social-global:promote-x-post-0001"]);
+        let body = &adds[0][adds[0].iter().position(|a| a == "--body").unwrap() + 1];
+        assert_eq!(body.matches("verify_text").count(), 1, "{body}");
+        assert!(body.starts_with("1. open_url: https://x.com/compose/post\n2. verify_text: 「What's happening?」\n3. "), "{body}");
+    }
+
+    /// 晚一点的修补：流程打完字才走不通，接着摸索的第一屏上已经没有登录闸文字（发帖框的提示字没了）。
+    #[test]
+    fn a_late_repair_after_typing_still_writes_a_draft_with_one_gate_step() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::new();
+        chrome(&mut h);
+        let mut failed = reply("p1", "failed", 5);
+        failed.note = Some("找不到 Postt".into());
+        h.push_procedure(failed);
+        h.push_look(filled("b"));
+        h.push_look(filled("b")); // 编号图（问发不发）
+        h.push_step(reply("r3", "done", 1));
+        h.push_look(sent("c"));
+        let dcv = FakeDcv {
+            shows: vec![(
+                "social-global:promote-x-post".into(),
+                json!({"name": "promote-x-post", "executable": true, "steps": [
+                    {"n": 1, "action": "open_url", "arg": "https://x.com/compose/post"},
+                    {"n": 2, "action": "verify_text", "arg": "「What's happening?」"},
+                    {"n": 3, "action": "tap_by_intent", "arg": "What's happening?"},
+                    {"n": 4, "action": "type_param", "arg": "post_text"},
+                    {"n": 5, "action": "tap_by_intent", "arg": "Postt"}]}),
+            )],
+            ..Default::default()
+        };
+        let jeff = SureJeff(vec!["e3", "done"], RefCell::new(0));
+        let r = go(
+            &args(false),
+            "x",
+            &mut h,
+            &dcv,
+            &jeff,
+            "y\ny\n",
+            params(),
+            d.path(),
+        );
+        assert_eq!(r.code, 0, "{}", r.out);
+        let adds = dcv.adds.borrow();
+        assert_eq!(adds.len(), 1, "{}", r.out);
+        let body = &adds[0][adds[0].iter().position(|a| a == "--body").unwrap() + 1];
+        assert_eq!(
+            body,
+            "1. open_url: https://x.com/compose/post\n2. verify_text: 「What's happening?」\n3. tap_by_intent: What's happening?\n4. type_param: post_text\n5. tap_by_intent: Post"
+        );
     }
 
     #[test]
