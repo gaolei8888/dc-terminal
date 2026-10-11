@@ -1489,3 +1489,250 @@ fn a_post_saying_follow_us_keeps_the_composer_for_typing_again() {
         h.calls
     );
 }
+
+// ---- fix round 4 ----
+
+const BOOTH: &str = "What's happening at booth 12, come by";
+
+fn failed(id: &str) -> RunReply {
+    RunReply {
+        status: "failed".into(),
+        ..done(id)
+    }
+}
+/// 用户：记下每次看到的全部选项（key, text, 意图），然后说停。
+struct SeeUser(Vec<Vec<(String, String, Option<String>)>>);
+impl User for SeeUser {
+    fn pick(
+        &mut self,
+        _: &str,
+        all: &[dct_explore::options::Opt],
+        _: Option<&str>,
+        _: &str,
+    ) -> Option<UserPick> {
+        self.0.push(
+            all.iter()
+                .map(|o| {
+                    let intent = match &o.act {
+                        dct_explore::options::Act::Fill { intent, .. } => Some(intent.clone()),
+                        _ => None,
+                    };
+                    (o.key.clone(), o.text.clone(), intent)
+                })
+                .collect(),
+        );
+        None
+    }
+}
+/// Jeff：每次都选第一个以 `fill_post_text` 开头的选项；没有就不答。
+struct FillJeff(std::cell::RefCell<Vec<dct_explore::JevChoice>>);
+impl Jeff for FillJeff {
+    fn ask(&self, _: &str, q: &dct_explore::JevChoice) -> Option<JeffAnswer> {
+        self.0.borrow_mut().push(q.clone());
+        let k = q
+            .criteria
+            .iter()
+            .map(|(k, _)| k.clone())
+            .find(|k| k.starts_with("fill_post_text"))?;
+        Some(JeffAnswer {
+            key: k.clone(),
+            probabilities: vec![(k, 0.95)],
+            answer_confidence: 0.95,
+        })
+    }
+}
+
+#[test]
+fn a_failed_type_then_retry_still_offers_the_composer() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1")); // tap_by_intent: What's happening?
+    h.push_step(failed("r2")); // type_param: post_text 没打进去
+    h.push_look(composer("a")); // 还是空的发帖框
+    h.push_look_err("stale"); // 编号图拿不到
+    let j = rec(vec!["fill_post_text_e2"]);
+    let mut u = SeeUser(vec![]);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let _ = explore(
+        &mut h,
+        &mut lad,
+        &mut Yes(0),
+        &T0,
+        with_text(&t, d.path(), BOOTH),
+    );
+    assert_eq!(u.0.len(), 1, "第二轮交给了用户：{:?}", h.calls);
+    let fill = u.0[0]
+        .iter()
+        .find(|(k, _, _)| k.starts_with("fill_post_text"))
+        .unwrap_or_else(|| panic!("打字失败后还能再填：{:?}", u.0[0]));
+    assert_eq!(fill.2.as_deref(), Some("What's happening?"), "{fill:?}");
+}
+
+#[test]
+fn explore_from_after_a_prefix_that_typed_offers_fill_again_with_the_prefix_intent() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let step = |action: &str, arg: &str| dct_explore::trace::TraceStep {
+        action: action.into(),
+        arg: arg.into(),
+        by: Who::User,
+        obs_before: None,
+        obs_after: None,
+        scene_before: None,
+        scene_after: None,
+        ok: true,
+        publish: false,
+        vanished: vec![],
+        learned_keys: vec![],
+        from_procedure: true,
+    };
+    let prefix = vec![
+        step("open_url", "https://x.com/compose/post"),
+        step("tap_by_intent", "What's happening?"),
+        step("type_param", "post_text"),
+    ];
+    let mut h = FakeHands::default();
+    h.push_look(composer("a")); // 字被清掉了，提示字回来了
+    h.push_step(done("r1"));
+    h.push_step(done("r2"));
+    h.push_look_err("stale");
+    let j = FillJeff(Default::default());
+    let mut u = ScriptUser(vec![], 0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let _ = explore_from(
+        &mut h,
+        &mut lad,
+        &mut Yes(0),
+        &T0,
+        with_text(&t, d.path(), BOOTH),
+        prefix,
+    );
+    let qs = j.0.borrow();
+    let fill = qs[0]
+        .criteria
+        .iter()
+        .find(|(k, _)| k.starts_with("fill_post_text"))
+        .unwrap_or_else(|| panic!("开头打过的字被清掉后还能再填：{:?}", qs[0].criteria));
+    assert!(
+        fill.1
+            .as_deref()
+            .unwrap_or("")
+            .contains("What's happening?"),
+        "{fill:?}"
+    );
+    assert_eq!(h.calls[1], "run_step tap_by_intent: What's happening?");
+    assert_eq!(h.calls[2], "run_step type_param: post_text");
+}
+
+#[test]
+fn the_remembered_fill_is_not_offered_on_a_screen_without_the_composer() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1")); // tap_by_intent: What's happening?
+    h.push_step(done("r2")); // type_param
+    h.push_look(look(
+        "b",
+        vec![
+            el("e2", TEXT, "textarea", 0.45, 0.25),
+            el("e5", "Drafts", "button", 0.6, 0.1),
+        ],
+    ));
+    h.push_step(done("r3")); // tap_by_intent: Drafts
+    h.push_look(look(
+        "c",
+        vec![
+            el("e1", "Your drafts", "text", 0.4, 0.2),
+            el("e6", "Back", "button", 0.1, 0.1),
+        ],
+    ));
+    h.push_look_err("stale");
+    let j = rec(vec!["fill_post_text_e2", "e5"]);
+    let mut u = ScriptUser(vec![], 0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let _ = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    let qs = j.questions.borrow();
+    assert_eq!(qs.len(), 3, "{:?}", h.calls);
+    assert!(
+        !qs[2].criteria.iter().any(|(k, _)| k.starts_with("fill_")),
+        "草稿列表上没有发帖框，不该给填字：{:?}",
+        qs[2].criteria
+    );
+}
+
+/// 帖子打进去以后，画面变成登录墙。
+fn halts_after_typing(value: &str, wall: Vec<El>, line: &str) {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(done("r1"));
+    h.push_step(done("r2"));
+    h.push_look(look("b", wall));
+    h.push_look_err("stale");
+    let j = rec(vec!["fill_post_text_e2"]);
+    let mut u = ScriptUser(vec![], 0);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(
+        &mut h,
+        &mut lad,
+        &mut Yes(0),
+        &T0,
+        with_text(&t, d.path(), value),
+    );
+    match out {
+        Outcome::Halted { why, .. } => assert_eq!(why, Halt::Login(line.into())),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(j.states.borrow().len(), 1, "登录墙没交给 Jeff");
+}
+
+#[test]
+fn a_log_in_button_halts_when_the_post_says_blog_in_paris() {
+    halts_after_typing(
+        "Blog in Paris this weekend",
+        vec![
+            el("e1", "Log in", "button", 0.4, 0.5),
+            el("e4", "Cancel", "button", 0.4, 0.6),
+        ],
+        "Log in",
+    );
+}
+
+#[test]
+fn a_lone_heading_that_is_one_word_of_the_post_still_halts() {
+    halts_after_typing(
+        "Early access is login-required this week",
+        vec![
+            el("e1", "Login-required", "text", 0.4, 0.2),
+            el("e4", "Cancel", "button", 0.4, 0.6),
+        ],
+        "Login-required",
+    );
+}

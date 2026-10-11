@@ -82,7 +82,8 @@ impl Screen {
 
     /// 选项：显示用脱敏后的字，能不能点按原文判断（值元素、禁点词、档位）；意图名里带参数占位符的
     /// 点击不进选项（那等于把要发的内容当按钮名交给 dco、写进流程）。还没填好的文字参数要是这一屏
-    /// 没有填字选项（发帖框里还剩半截帖子，是值元素），就用 `fills` 里上一次起作用的那个。
+    /// 没有填字选项（发帖框里还剩半截帖子，是值元素），就用 `fills` 里记下的那个——只在这一屏
+    /// 真有那个发帖框时（见 `Raw::has_field`）。
     pub(super) fn options(
         &self,
         goal: &Goal,
@@ -108,7 +109,13 @@ impl Screen {
                 .any(|o| matches!(&o.act, Act::Fill { param, .. } if param == p))
         };
         for p in goal.text_params.iter().filter(|p| !prog.filled.contains(p)) {
-            if let Some(f) = fills.get(p).filter(|_| files_done && !has_fill(&all, p)) {
+            let usable = |f: &&Opt| match &f.act {
+                Act::Fill { intent, .. } => {
+                    files_done && !has_fill(&all, p) && self.raw.has_field(intent, p)
+                }
+                _ => false,
+            };
+            if let Some(f) = fills.get(p).filter(usable) {
                 let at = all
                     .iter()
                     .position(|o| {

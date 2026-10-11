@@ -1,8 +1,12 @@
 //! 参数值换回 `{名字}`。画面上的每个元素先分两类（裁决 R14）：
 //!
-//! - **值元素**：整段就是参数值的一部分（≥ 2 个词、≥ 4 个中文字或一整段 ≥ 12 个字母的长串，
-//!   且这个参数这次已经打过字），或者里面含着一整段参数值（值本身也要够长）。它整段显示成 `{名字}`，
-//!   不参加任何规矩（停下、禁点、档位、发布词），也不能按它自己的字去点。
+//! - **值元素**：整段就是参数值的一部分（且这个参数这次已经打过字），或者里面含着一整段参数值
+//!   （值本身也要够长）。它整段显示成 `{名字}`，不参加任何规矩（停下、禁点、档位、发布词），
+//!   也不能按它自己的字去点。
+//!   「一部分」按词对齐：英文要盖住值里至少 2 个完整的词（两头可以是被文字识别切开的半个词，
+//!   但「Log in」不算「Blog in Paris」的一部分），中文按字算、至少 4 个字；只有一个词的元素
+//!   只有像网址 / 标签（带 `/ . @ #`、去掉标点后 ≥ 12 个字母）才算，所以界面上单独一个标题词
+//!   （「Verification」）永远是界面元素。
 //! - **界面元素**：规矩照原文判断；显示时只换掉整段值、值的整行，以及和值连着相同的**长**片段
 //!   （≥ 4 个词，或 ≥ 8 个中文字）——两个词的巧合（「What's happening」）不换。
 //!
@@ -27,6 +31,60 @@ fn squash(s: &str) -> String {
     fold(s).chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
+/// 中日文字：一个字就是一个单位（不靠空格分词）。
+fn cjk(c: char) -> bool {
+    matches!(c as u32, 0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF66..=0xFF9F | 0x20000..=0x3FFFF)
+}
+
+/// 去掉空白和标点后的字，外加每个（按空白切的）词在里面的起止位置：用来做按词对齐的比较，
+/// 文字识别多出 / 少了空格也对得上。
+struct Sq {
+    chars: Vec<char>,
+    words: Vec<(usize, usize)>,
+}
+
+impl Sq {
+    fn new(s: &str) -> Sq {
+        let (mut chars, mut words) = (Vec::new(), Vec::new());
+        for w in fold(s).split_whitespace() {
+            let a = chars.len();
+            chars.extend(w.chars().filter(|c| c.is_alphanumeric()));
+            if chars.len() > a {
+                words.push((a, chars.len()));
+            }
+        }
+        Sq { chars, words }
+    }
+    /// 第 i 个字前面是不是词的边界（两头、词的起止、挨着中文字）。
+    fn boundary(&self, i: usize) -> bool {
+        i == 0
+            || i == self.chars.len()
+            || self.words.iter().any(|&(a, b)| a == i || b == i)
+            || cjk(self.chars[i - 1])
+            || cjk(self.chars[i])
+    }
+    /// `needle` 在这里出现的每个起点。
+    fn find<'a>(&'a self, needle: &'a [char]) -> impl Iterator<Item = usize> + 'a {
+        let n = needle.len();
+        (0..(self.chars.len() + 1).saturating_sub(n))
+            .filter(move |&p| n > 0 && self.chars[p..p + n] == *needle)
+    }
+    /// `[p, end)` 完整盖住的、不全是中文的词有几个。
+    fn whole_words(&self, p: usize, end: usize) -> usize {
+        self.words
+            .iter()
+            .filter(|&&(a, b)| a >= p && b <= end && self.chars[a..b].iter().any(|c| !cjk(*c)))
+            .count()
+    }
+}
+
+/// 像网址 / 标签 / 账号的一整串：带 `/ . @ #`，去掉标点后 ≥ 12 个字母。
+fn link_like(raw: &str, sq: &Sq) -> bool {
+    raw.split_whitespace().count() == 1
+        && raw.trim().contains(['/', '.', '@', '#'])
+        && sq.chars.len() >= VALUE_ASCII
+}
+
 /// 一个词 fold 后去掉两头的标点。
 fn word(w: &str) -> String {
     fold(w)
@@ -43,7 +101,7 @@ fn nc(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-/// 够不够得上「一段值」：≥ 2 个词，或 ≥ 4 个中文字，或一整段 ≥ 12 个字母的长串。
+/// 值本身够不够长（「含着一整段值」才算数）：≥ 2 个词，或 ≥ 4 个中文字，或一整段 ≥ 12 个字母的长串。
 fn substantial(raw: &str, sq: &str) -> bool {
     let words = raw
         .split_whitespace()
@@ -58,7 +116,7 @@ struct Fuzzy {
     name: String,
     words: Vec<String>,
     chars: Vec<char>,
-    squashed: String,
+    sq: Sq,
     /// 值本身够长，「含着一整段值」才算数（太短的值会撞上普通界面字）。
     whole_ok: bool,
 }
@@ -82,8 +140,26 @@ impl Fuzzy {
                 .filter(|c| c.is_alphanumeric())
                 .collect(),
             whole_ok: substantial(value, &squashed),
-            squashed,
+            sq: Sq::new(value),
         })
+    }
+
+    /// 这段元素原文是不是值的一部分（按词对齐，见文件开头）。
+    fn has_piece(&self, raw: &str, e: &Sq) -> bool {
+        let n = e.chars.len();
+        let cjk_n = e.chars.iter().filter(|c| cjk(**c)).count();
+        // 网址一类的长串在值里常常是一个「词」的中间一段（去掉了 https://），不要求对齐。
+        let link = link_like(raw, e);
+        self.sq
+            .find(&e.chars)
+            .any(|p| link || cjk_n >= VALUE_CJK || self.sq.whole_words(p, p + n) >= 2)
+    }
+    /// 这段元素原文里含着一整段值（起止都落在元素的词边界上）。
+    fn inside(&self, e: &Sq) -> bool {
+        let n = self.sq.chars.len();
+        self.whole_ok
+            && e.find(&self.sq.chars)
+                .any(|p| e.boundary(p) && e.boundary(p + n))
     }
 
     /// 从 `toks[i]` 起和值里某处连着相同的最多几个词。
@@ -202,29 +278,20 @@ impl Scrub {
             typed: RefCell::new(BTreeSet::new()),
         }
     }
-    /// 要往画面上打这个参数了（在 `type_param` 之前调）。
+    /// 要往画面上打这个参数了（在 `type_param` 之前调；重放 / 修补时是流程里已经走过的 `type_param`）。
     pub(crate) fn mark_typed(&self, name: &str) {
         self.typed.borrow_mut().insert(name.to_string());
     }
-    /// 重放：流程里的字可能已经打上去了，全部当打过。
-    pub(crate) fn mark_all_typed(&self) {
-        self.typed.borrow_mut().extend(self.full.keys().cloned());
-    }
     /// 这段画面原文是不是「值元素」，是的话回参数名。
     pub(crate) fn value_of(&self, raw: &str) -> Option<&str> {
-        let sq = squash(raw);
-        if sq.is_empty() {
+        let e = Sq::new(raw);
+        if e.chars.is_empty() {
             return None;
         }
         let typed = self.typed.borrow();
         self.fuzzy
             .iter()
-            .find(|f| {
-                (f.whole_ok && sq.contains(&f.squashed))
-                    || (typed.contains(&f.name)
-                        && f.squashed.contains(&sq)
-                        && substantial(raw, &sq))
-            })
+            .find(|f| f.inside(&e) || (typed.contains(&f.name) && f.has_piece(raw, &e)))
             .map(|f| f.name.as_str())
     }
     /// 界面字的脱敏：整段值、值的整行、和值连着相同的长片段。
@@ -312,6 +379,43 @@ mod tests {
         c.mark_typed("post_text");
         assert_eq!(c.value_of("今天发布我们"), Some("post_text"));
         assert_eq!(c.value_of("发布"), None);
+    }
+
+    #[test]
+    fn pieces_are_matched_on_word_boundaries() {
+        let s = scrub("Blog in Paris this weekend");
+        s.mark_typed("post_text");
+        assert_eq!(s.value_of("Log in"), None, "log 不是 blog 的一部分");
+        assert_eq!(s.value_of("in Paris"), Some("post_text"));
+        let s = scrub("Complete the verification at our booth");
+        s.mark_typed("post_text");
+        assert_eq!(s.value_of("Verification"), None, "单独一个标题词是界面字");
+        let s = scrub("Launch day for our tiny robot kit");
+        s.mark_typed("post_text");
+        assert_eq!(
+            s.value_of("y for our"),
+            Some("post_text"),
+            "切开的半个词也算"
+        );
+        assert_eq!(
+            s.value_of("Launch dayfor our"),
+            Some("post_text"),
+            "少了空格"
+        );
+        assert_eq!(s.value_of("ay f"), None, "盖不住两个完整的词");
+        let s = scrub("See https://example.com/launch-day today");
+        s.mark_typed("post_text");
+        assert_eq!(s.value_of("example.com/launch-day"), Some("post_text"));
+        assert_eq!(s.value_of("Login-required"), None);
+    }
+
+    #[test]
+    fn a_whole_value_counts_only_on_word_boundaries() {
+        let s = scrub("is here");
+        assert_eq!(s.value_of("It is here now"), Some("post_text"));
+        assert_eq!(s.value_of("This here"), None, "this 里的 is 不算");
+        let c = scrub("我们的小机器人");
+        assert_eq!(c.value_of("看看我们的小机器人吧"), Some("post_text"));
     }
 
     #[test]

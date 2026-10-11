@@ -718,3 +718,46 @@ fn more_than_twenty_help_elements_jeff_sees_twenty_the_user_sees_all() {
     assert_eq!(*j.0.borrow(), [20]);
     assert_eq!(u.0, [27]);
 }
+
+#[test]
+fn replay_help_before_the_post_is_typed_still_offers_the_composer() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let mut h = FakeHands::new();
+    let mut r = help_reply(
+        "r1",
+        3,
+        vec![
+            el("e1", "What is happening?", 0.45, 0.25),
+            el("e2", "What is happening?", 0.45, 0.75),
+        ],
+    );
+    r.help.as_mut().unwrap().intent = "What is happening?".into();
+    h.push_procedure(r);
+    h.push_answer(reply("r1", "done", 5));
+    let (j, mut u) = (jeff(Some(("e1", 0.95))), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let mut inp = input(&pr, p, false);
+    inp.params.insert(
+        "post_text".into(),
+        "What is happening at booth 12, come by".into(),
+    );
+    let out = replay(&mut h, &mut lad, inp);
+    assert_eq!(out, ReplayOutcome::Done { learned: vec![] });
+    assert_eq!(h.sent_answers.len(), 1, "{:?}", h.calls);
+    assert!(
+        matches!(&h.sent_answers[0].1, HelpAnswer::Element { id, .. } if id == "e1"),
+        "{:?}",
+        h.sent_answers
+    );
+    assert!(
+        j.1.borrow()[0].contains("What is happening?"),
+        "{}",
+        j.1.borrow()[0]
+    );
+}

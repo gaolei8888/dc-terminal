@@ -59,6 +59,16 @@ impl Raw {
         self.value[i].is_none() && (t.is_empty() || tappable(t, p))
     }
 
+    /// 记下的「填字」选项在这一屏还用得上：有个界面元素的原文就是它的意图（发帖框的提示字），
+    /// 或者这个参数的值元素在画面上（发帖框里还剩半截帖子 / 提示字和帖子开头一样）。
+    pub(crate) fn has_field(&self, intent: &str, param: &str) -> bool {
+        let want = fold(intent.trim());
+        self.els.iter().zip(&self.value).any(|(e, v)| match v {
+            Some(p) => p == param,
+            None => !want.is_empty() && fold(e.text.trim()) == want,
+        })
+    }
+
     /// 脱敏后的元素，给外面看（值元素是 `{名字}`）。界面元素的原文正好是平台的发布词时保留原字（那是平台的词，不是用户的内容），
     /// 这样发布按钮不会因为帖子里也有这个词而认不出来。
     pub(crate) fn shown(&self, scrub: &Scrub, p: &Platform) -> Vec<El> {

@@ -1,8 +1,8 @@
 //! 一次摸索的账本：轨迹、进度、每个画面的失败次数、上一次站在某个画面时的样子。
-use super::screen::Screen;
+use super::screen::{Screen, Scrub};
 use super::{Clock, ExploreInput, Outcome};
 use crate::gate::Meter;
-use crate::hands::StepReq;
+use crate::hands::{El, Frac, StepReq};
 use crate::ladder::{Decision, Tries, Who};
 use crate::options::{Act, Opt, Progress};
 use crate::trace::{Trace, TraceStep};
@@ -39,8 +39,9 @@ pub(super) struct Run {
     snaps: HashMap<String, Snap>,
     /// 画面指纹 → 在那个画面上选的、没起作用的次数
     tries: HashMap<String, ScreenTries>,
-    /// 参数 → 上一次起作用的「填字」选项（字打进去以后发帖框变成值元素，不能再按它的字去点；
-    /// 字被清掉要再填时，用打字前的提示字当意图名）
+    /// 参数 → 记下的「填字」选项（字打进去以后发帖框变成值元素，不能再按它的字去点；
+    /// 字被清掉要再填时，用打字前的提示字当意图名）。执行前先记（打字失败也还能再填），
+    /// 起作用的那个覆盖；修补时从开头的 `tap_by_intent` → `type_param` 记。
     pub(super) fills: HashMap<String, Opt>,
 }
 
@@ -193,6 +194,64 @@ pub(super) fn record(
             t.vanished = vanished.clone();
         }
         r.trace.steps.push(t);
+    }
+}
+
+/// 要执行一个「填字」选项了：先记下（还没记过时），打字失败、发帖框变成值元素后也还能再填。
+pub(super) fn remember_fill(r: &mut Run, opt: &Opt) {
+    if let Act::Fill { param, .. } = &opt.act {
+        r.fills.entry(param.clone()).or_insert_with(|| opt.clone());
+    }
+}
+
+/// 修补：开头打过字的参数算打过（字可能还在画面上），打字前点的那个意图记成这个参数的「填字」选项。
+pub(super) fn seed_from_prefix(r: &mut Run, input: &ExploreInput, scrub: &Scrub) {
+    let steps = &r.trace.steps;
+    for (i, t) in steps.iter().enumerate() {
+        if t.action != "type_param" {
+            continue;
+        }
+        scrub.mark_typed(&t.arg);
+        if !input.text_params.contains(&t.arg) {
+            continue;
+        }
+        let Some(tap) = i
+            .checked_sub(1)
+            .map(|j| &steps[j])
+            .filter(|s| s.action == "tap_by_intent")
+        else {
+            continue;
+        };
+        let intent = scrub.line(&tap.arg).trim().to_string();
+        if intent.is_empty() || scrub.has_placeholder(&intent) {
+            continue;
+        }
+        let param = t.arg.clone();
+        let field = El {
+            id: format!("prefix_{param}"),
+            text: intent.clone(),
+            role: "textarea".into(),
+            frac: Frac {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            source: "procedure".into(),
+        };
+        r.fills.insert(
+            param.clone(),
+            Opt {
+                key: format!("fill_{param}_again"),
+                text: format!("在「{intent}」里填 {{{param}}}"),
+                act: Act::Fill {
+                    param,
+                    field,
+                    intent,
+                },
+                publish: false,
+            },
+        );
     }
 }
 

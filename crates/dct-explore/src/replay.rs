@@ -122,6 +122,16 @@ fn prefix_before(procedure: &Value, at_step: u32) -> Vec<TraceStep> {
         .collect()
 }
 
+/// 第 `at_step` 步之前已经打过字的参数（`type_param` 的步号 < `at_step`）。
+fn typed_before(procedure: &Value, at_step: u32) -> Vec<String> {
+    steps_of(procedure)
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| s["action"].as_str() == Some("type_param") && step_n(*i, s) < at_step)
+        .filter_map(|(_, s)| s["arg"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn text_of(e: &El, all: &[El]) -> (String, Act) {
     let label = e.text.trim();
     if label.is_empty() {
@@ -218,8 +228,6 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
     }
     let name = input.procedure["name"].as_str().unwrap_or("").to_string();
     let scrub = Scrub::new(&input.params);
-    // 重放跑的是流程，帖子可能已经打进去了：参数全部当打过（片段也算帖子）。
-    scrub.mark_all_typed();
     // 发布交给用户的平台：一律预览。
     let preview = input.preview || input.platform.publish_by_user_only;
     let stop_before = if preview {
@@ -308,6 +316,11 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
             return ReplayOutcome::Stopped(format!(
                 "同一次重放已经答了 {MAX_ANSWERS} 次求助，停下"
             ));
+        }
+        // 流程已经走过某个参数的 `type_param`：从这儿起它的片段才可能在画面上（片段也算帖子）。
+        // 还没打字时发帖框的提示字和帖子开头一样，也照样是发帖框。
+        for p in typed_before(input.procedure, rep.at_step) {
+            scrub.mark_typed(&p);
         }
         // 规矩看原文（停下、禁点词、档位），出去的字看脱敏后的（见 explore/raw.rs）。
         let raw = Raw::new(&help.elements, &scrub);

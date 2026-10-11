@@ -124,10 +124,8 @@ pub fn explore_from(
 ) -> Outcome {
     let mut r = new_run(&input, clock, prefix);
     let scrub = Scrub::new(&input.params);
-    // 修补：开头已经打过的字可能还在画面上。
-    for t in r.trace.steps.iter().filter(|t| t.action == "type_param") {
-        scrub.mark_typed(&t.arg);
-    }
+    // 修补：开头已经打过的字可能还在画面上；字被清掉时用开头点的那个意图再填。
+    run::seed_from_prefix(&mut r, &input, &scrub);
     let goal_text = scrub.text(input.goal_text);
     let goal = Goal {
         text: &goal_text,
@@ -265,7 +263,8 @@ pub fn explore_from(
                 continue;
             }
         }
-        // 7. 执行
+        // 7. 执行（填字先记下：打字失败后发帖框可能变成值元素，还要能再填）
+        run::remember_fill(&mut r, &opt);
         let done = match act::execute(h, &mut *lad.user, &input, &scrub, &state, &opt, dec.by) {
             act::Exec::Stop(why) => return r.stop(why),
             act::Exec::Halt(why) => {
