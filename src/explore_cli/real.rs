@@ -170,10 +170,20 @@ mod unix {
         let keys = crate::keys::KeyStore::at(crate::keys::KeyStore::default_dir());
         let se = crate::keys::platform_enclave();
         let approvals = Approvals::at(Approvals::default_dir());
-        let mut approve_proc = |name: &str| -> anyhow::Result<()> {
+        // 只批准卡片上给用户看的那一版（正文指纹对得上才弹 Touch ID）。
+        let mut approve_proc = |name: &str, shown_sha: &str| -> anyhow::Result<()> {
             let now = clock.now_ms() / 1000;
-            crate::procedures::approve(&RealDcv, &keys, se.as_ref(), &approvals, name, &[], now)
-                .map(|_| ())
+            crate::procedures::approve_expecting(
+                &RealDcv,
+                &keys,
+                se.as_ref(),
+                &approvals,
+                name,
+                &[],
+                now,
+                shown_sha,
+            )
+            .map(|_| ())
         };
         drive(
             a,

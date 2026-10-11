@@ -80,7 +80,7 @@ pub fn parse_params(args: &[String]) -> Result<PerPlatform, String> {
 /// 所以这是一张写死的表，不是「凡 Cf 都拒」：以后 Unicode 新增的 Cf 要回来补。
 /// 放行 U+200D（ZWJ），不然组合 emoji 会坏；变体选择符不是 Cf，本来就放行。
 /// 标签字符 U+E0000–E007F 也拒（能藏字，只是旗帜 emoji 的子区域旗用它）。
-fn is_hidden_or_control(c: char) -> bool {
+pub(crate) fn is_hidden_or_control(c: char) -> bool {
     if c == '\n' || c == '\t' || c == '\u{200D}' {
         return false;
     }

@@ -161,7 +161,8 @@ pub struct Env<'a> {
     pub model: &'a dyn Model,
     pub fixer: &'a dyn Fixer,
     pub threshold: f64,
-    pub approve_proc: &'a mut dyn FnMut(&str) -> anyhow::Result<()>,
+    /// (流程全名, 卡片上给用户看的正文指纹) → 按指纹批准；dcv 里的正文和这个指纹对不上就拒。
+    pub approve_proc: &'a mut dyn FnMut(&str, &str) -> anyhow::Result<()>,
     pub clock: &'a dyn Clock,
     /// ~/.dct/explore
     pub data_dir: PathBuf,
@@ -470,7 +471,7 @@ fn replayed(say: &RefCell<dyn Say + '_>, p: &Platform, full: &str, r: ReplayOutc
 struct Learn<'e, 'a> {
     dcv: &'e dyn Dcv,
     fixer: &'e dyn Fixer,
-    approve_proc: &'e mut dyn FnMut(&str) -> anyhow::Result<()>,
+    approve_proc: &'e mut dyn FnMut(&str, &str) -> anyhow::Result<()>,
     say: &'e RefCell<dyn Say + 'a>,
 }
 
@@ -523,7 +524,16 @@ impl Learn<'_, '_> {
                 learned.push(k.clone());
             }
         }
-        let card = with_platform_notes(render_card(&w, &pd, &pops, &learned), p);
+        let card = match render_card(&w, &pd, &pops, &learned) {
+            Ok(c) => with_platform_notes(c, p),
+            Err(why) => {
+                let text = format!(
+                    "发出去了，草稿 {} 也写进了 dcv，但没法给你确认：{why}；什么都没批准",
+                    w.procedure
+                );
+                return fin(say, 1, "error", &text, json!({"procedure": w.procedure}));
+            }
+        };
         let ok = say.borrow_mut().yes("card", &card.text, card.json, None);
         let v = if ok { Verdict::Yes } else { Verdict::No };
         match apply_confirmation(v, self.dcv, &mut *self.approve_proc, hands, &w, &learned) {
@@ -825,20 +835,28 @@ mod tests {
         adds: RefCell<Vec<Vec<String>>>,
         approved: RefCell<Vec<String>>,
         no_popups: bool,
+        tampered: bool,
     }
     impl Dcv for FakeDcv {
         fn show(&self, n: &str) -> anyhow::Result<Value> {
             if let Some((_, v)) = self.shows.iter().find(|(k, _)| k == n) {
                 return Ok(v.clone());
             }
-            let added = self.adds.borrow().iter().any(|a| {
+            // 写进来的草稿：回 dcv 算的正文指纹（tampered：有人在卡片之后改了 dcv 里的正文）。
+            let adds = self.adds.borrow();
+            let added = adds.iter().find(|a| {
                 a.windows(2)
                     .any(|w| w[0] == "--name" && n.ends_with(&format!(":{}", w[1])))
             });
-            if added {
-                Ok(json!({"body_sha256": "sha-of-popup"}))
-            } else {
-                anyhow::bail!("没有 {n}")
+            match added {
+                Some(a) => {
+                    let mut body = a[a.iter().position(|x| x == "--body").unwrap() + 1].clone();
+                    if self.tampered {
+                        body += "\n9. tap_by_intent: Delete account";
+                    }
+                    Ok(json!({"body": body, "body_sha256": crate::learn::body_sha256(&body)}))
+                }
+                None => anyhow::bail!("没有 {n}"),
             }
         }
         fn approve(&self, n: &str, sha: &str) -> anyhow::Result<String> {
@@ -990,7 +1008,9 @@ mod tests {
         params: Params,
         d: &std::path::Path,
     ) -> Ran {
-        go_with(a, platform, h, dcv, jeff, input, params, d, &mut |_| Ok(()))
+        go_with(a, platform, h, dcv, jeff, input, params, d, &mut |_, _| {
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1003,7 +1023,7 @@ mod tests {
         input: &str,
         params: Params,
         d: &std::path::Path,
-        approve_result: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+        approve_result: &mut dyn FnMut(&str, &str) -> anyhow::Result<()>,
     ) -> Ran {
         let t = Table::seed();
         let p = t.get(platform).unwrap().clone();
@@ -1014,9 +1034,9 @@ mod tests {
             Some(d.join("runs").join("x-20261011-0001")),
         ));
         let mut approved = Vec::new();
-        let mut approve = |n: &str| {
+        let mut approve = |n: &str, sha: &str| {
             approved.push(n.to_string());
-            approve_result(n)
+            approve_result(n, sha)
         };
         let code = drive(
             a,
@@ -1564,12 +1584,36 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_changed_in_dcv_after_the_card_is_never_approved() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::new();
+        script_x_explore(&mut h);
+        let dcv = FakeDcv {
+            tampered: true,
+            ..Default::default()
+        };
+        let r = go(
+            &args(false),
+            "x",
+            &mut h,
+            &dcv,
+            &x_jeff(),
+            "y\ny\n",
+            params(),
+            d.path(),
+        );
+        assert_eq!(r.code, 1, "{}", r.out);
+        assert!(r.approved.is_empty(), "对不上就不弹 Touch ID");
+        assert!(r.out.contains("不一样"), "{}", r.out);
+    }
+
+    #[test]
     fn a_cancelled_touch_id_is_the_user_saying_no() {
         let d = tempfile::tempdir().unwrap();
         let mut h = FakeHands::new();
         script_x_explore(&mut h);
         // procedures::approve 把 SignError 变成同样的一句话（anyhow!("{e}")）。
-        let mut cancelled = |_: &str| -> anyhow::Result<()> {
+        let mut cancelled = |_: &str, _: &str| -> anyhow::Result<()> {
             Err(anyhow::anyhow!("{}", dct_brain::sign::SignError::Cancelled))
         };
         let r = go_with(
@@ -1589,7 +1633,7 @@ mod tests {
 
         let mut h = FakeHands::new();
         script_x_explore(&mut h);
-        let mut broken = |_: &str| -> anyhow::Result<()> {
+        let mut broken = |_: &str, _: &str| -> anyhow::Result<()> {
             Err(anyhow::anyhow!("确认流程失败：dcv 挂了"))
         };
         let r = go_with(

@@ -20,8 +20,17 @@ pub struct Written {
     pub rounds: u32,
     /// dcv 最后收下的正文（可能是修过的）：确认卡片按这份显示。
     pub final_body: String,
+    /// 和 `popups` 一一对应：写进 dcv 的弹窗正文（确认时按它核对 dcv 里的那一份）。
+    pub popup_bodies: Vec<String>,
     /// 没写进去的弹窗草稿：(名字, dcv 的拒收原因)。不重试，不影响流程草稿。
     pub popup_failures: Vec<(String, String)>,
+}
+
+/// dcv 的正文指纹（dc-vault procedure.rs `normalize_body` + `body_sha_of`：`\r\n` 折成 `\n`、
+/// 去掉首尾换行，再算 sha256，写成 `sha256:<hex>`）。流程、弹窗规则同一种算法。
+pub fn body_sha256(body: &str) -> String {
+    let normalized = body.replace("\r\n", "\n");
+    dct_brain::canon::sha256_id(normalized.trim_matches('\n').as_bytes())
 }
 
 /// Err = (最后一版正文, 最后的拒收原因)。
@@ -69,6 +78,7 @@ pub fn write_drafts(
         }
     }
     let mut popups = Vec::new();
+    let mut popup_bodies = Vec::new();
     let mut popup_failures = Vec::new();
     for d in pops {
         let req = AddReq {
@@ -83,7 +93,10 @@ pub fn write_drafts(
             body: &d.body,
         };
         match dcv.add(&req) {
-            Ok(_) => popups.push(format!("{}:{}", d.vault, d.name)),
+            Ok(_) => {
+                popups.push(format!("{}:{}", d.vault, d.name));
+                popup_bodies.push(d.body.clone());
+            }
             Err(e) => popup_failures.push((d.name.clone(), e.to_string())),
         }
     }
@@ -92,6 +105,7 @@ pub fn write_drafts(
         popups,
         rounds,
         final_body: body,
+        popup_bodies,
         popup_failures,
     })
 }
@@ -110,7 +124,7 @@ fn unquote(s: &str) -> &str {
         .unwrap_or(t)
 }
 
-/// dcv 正文里的一步（`N. 动作: 内容`）翻成人话。标记行（3 个空格开头）跳过。
+/// dcv 正文里的一步（`N. 动作: 内容`）翻成人话。标记行（3 个空格开头）见 `body_lines`。
 fn plain_step(n: u32, action: &str, arg: &str) -> String {
     let arg = arg.trim();
     match action {
@@ -133,27 +147,80 @@ fn plain_step(n: u32, action: &str, arg: &str) -> String {
         "scroll" => "往下滚".to_string(),
         "wait" => "等一下".to_string(),
         "back" => "返回".to_string(),
-        // 词表以外的不该出现（dcv 已验过）；退而求其次照抄内容，不露动作词。
-        _ => arg.to_string(),
+        // 没有人话翻译的动作：整行照抄（动作词也露出来），不能只给内容把动作藏起来。
+        _ => format!("（原文）{action}: {arg}"),
     }
 }
 
-fn plain_steps(body: &str) -> Vec<(u32, String)> {
+/// 正文的一行：步骤（`N. 动作: 内容`）翻成人话；别的行（完成标志、缩进的、看不懂的）原样
+/// 显示出来，一行都不跳过——正文里有什么，卡片上就有什么。
+enum Line {
+    Step(u32, String),
+    Other(String),
+}
+
+fn body_lines(body: &str) -> Vec<Line> {
     let mut out = Vec::new();
     for line in body.lines() {
-        if line.starts_with("   ") {
+        if line.trim().is_empty() {
             continue;
         }
-        let Some((num, rest)) = line.split_once(". ") else {
+        if let Some(m) = line.strip_prefix("   ") {
+            let m = m.trim();
+            let shown = match m
+                .strip_prefix("完成标志:")
+                .map(str::trim)
+                .and_then(|v| v.strip_prefix("verify_text"))
+            {
+                Some(t) => format!("（做完后确认看得到「{}」）", unquote(t)),
+                _ => format!("（原文）{m}"),
+            };
+            out.push(Line::Other(shown));
             continue;
-        };
-        let Ok(n) = num.trim().parse::<u32>() else {
-            continue;
-        };
-        let (action, arg) = rest.split_once(':').unwrap_or((rest, ""));
-        out.push((n, plain_step(n, action.trim(), arg)));
+        }
+        let step = line.split_once(". ").and_then(|(num, rest)| {
+            let n = num.trim().parse::<u32>().ok()?;
+            let (action, arg) = rest.split_once(':').unwrap_or((rest, ""));
+            Some(Line::Step(n, plain_step(n, action.trim(), arg)))
+        });
+        out.push(step.unwrap_or_else(|| Line::Other(format!("（原文）{}", line.trim()))));
     }
     out
+}
+
+/// 看不见或会改显示顺序的字符（同 campaign 的那张表），再加上换行以外的控制字符（含制表符）：
+/// 这种字能让卡片上看到的和 dcv 里存的不是一回事。
+fn hidden_char(s: &str) -> Option<char> {
+    s.chars()
+        .find(|&c| c != '\n' && (c == '\t' || crate::campaign::is_hidden_or_control(c)))
+}
+
+/// 草稿里标出的「可能只偶尔出现」的步号是按原来的正文算的；修过的正文按同一行内容
+/// （`动作: 内容`）重新找步号，有一个找不到或对上不止一行 → None（不标步号）。
+fn one_off_in_final(p: &ProcedureDraft, final_body: &str) -> Option<Vec<u32>> {
+    if final_body == p.body {
+        return Some(p.maybe_one_off.clone());
+    }
+    let steps = |body: &str| -> Vec<(u32, String)> {
+        body.lines()
+            .filter(|l| !l.starts_with("   "))
+            .filter_map(|l| {
+                let (num, rest) = l.split_once(". ")?;
+                Some((num.trim().parse::<u32>().ok()?, rest.trim().to_string()))
+            })
+            .collect()
+    };
+    let (old, new) = (steps(&p.body), steps(final_body));
+    p.maybe_one_off
+        .iter()
+        .map(|n| {
+            let (_, content) = old.iter().find(|(m, _)| m == n)?;
+            match new.iter().filter(|(_, c)| c == content).collect::<Vec<_>>()[..] {
+                [(m, _)] => Some(*m),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn popup_line(d: &PopupDraft) -> String {
@@ -171,16 +238,37 @@ pub fn render_card(
     p: &ProcedureDraft,
     pops: &[PopupDraft],
     learned: &[String],
-) -> Card {
-    let steps = plain_steps(&w.final_body);
+) -> Result<Card, String> {
+    for (what, text) in std::iter::once(("流程正文", w.final_body.as_str()))
+        .chain(pops.iter().map(|d| ("弹窗规则", d.body.as_str())))
+    {
+        if let Some(c) = hidden_char(text) {
+            return Err(format!(
+                "{what}里有看不见的字符或控制字符（U+{:04X}），卡片上看到的可能不是 dcv 里存的",
+                c as u32
+            ));
+        }
+    }
+    let lines = body_lines(&w.final_body);
+    let steps: Vec<(u32, &str)> = lines
+        .iter()
+        .filter_map(|l| match l {
+            Line::Step(n, s) => Some((*n, s.as_str())),
+            Line::Other(_) => None,
+        })
+        .collect();
+    let one_off = one_off_in_final(p, &w.final_body);
     let what = p.description.split('（').next().unwrap_or(&p.description);
     let name = w
         .procedure
         .split_once(':')
         .map_or(w.procedure.as_str(), |x| x.1);
     let mut t = format!("学会了：{}（{}，草稿）\n", what, name);
-    for (n, s) in &steps {
-        t += &format!("  {n}. {s}\n");
+    for l in &lines {
+        match l {
+            Line::Step(n, s) => t += &format!("  {n}. {s}\n"),
+            Line::Other(s) => t += &format!("       {s}\n"),
+        }
     }
     if !pops.is_empty() {
         t += &format!("另外记下 {} 条弹窗规则：\n", pops.len());
@@ -194,12 +282,18 @@ pub fn render_card(
             learned.len()
         );
     }
-    if !p.maybe_one_off.is_empty() {
-        let ns: Vec<String> = p.maybe_one_off.iter().map(|n| n.to_string()).collect();
-        t += &format!(
-            "⚠ 第 {} 步可能只偶尔出现（弹窗里的按钮），下次没弹出来会卡住，到时会再补。\n",
-            ns.join("、")
-        );
+    match &one_off {
+        Some(v) if !v.is_empty() => {
+            let ns: Vec<String> = v.iter().map(|n| n.to_string()).collect();
+            t += &format!(
+                "⚠ 第 {} 步可能只偶尔出现（弹窗里的按钮），下次没弹出来会卡住，到时会再补。\n",
+                ns.join("、")
+            );
+        }
+        Some(_) => {}
+        None => {
+            t += "⚠ 正文被修过，原来标出的「可能只偶尔出现」的步骤在修过的正文里对不上了，这次没有标步号。\n";
+        }
     }
     for n in &p.notes {
         t += &format!("⚠ {n}\n");
@@ -214,10 +308,32 @@ pub fn render_card(
         "popups": w.popups,
         "popup_rules": pops.iter().map(popup_line).collect::<Vec<_>>(),
         "learned": learned,
-        "maybe_one_off": p.maybe_one_off,
+        "maybe_one_off": one_off.clone().unwrap_or_default(),
+        "body_lines": lines.iter().map(|l| match l {
+            Line::Step(n, s) => format!("{n}. {s}"),
+            Line::Other(s) => s.clone(),
+        }).collect::<Vec<_>>(),
         "notes": p.notes,
     });
-    Card { text: t, json }
+    if let Some(c) = hidden_char(&t) {
+        return Err(format!(
+            "卡片里有看不见的字符或控制字符（U+{:04X}），不给你确认",
+            c as u32
+        ));
+    }
+    Ok(Card { text: t, json })
+}
+
+/// dcv 里现在的这一份和卡片上给用户看的是不是同一版（按 dcv 的正文指纹比）。
+fn check_shown(dcv: &dyn Dcv, name: &str, want: &str, what: &str) -> anyhow::Result<()> {
+    let shown = dcv.show(name)?;
+    let got = shown["body_sha256"].as_str().unwrap_or("");
+    if got != want {
+        anyhow::bail!(
+            "dcv 里的{what} {name} 和卡片上给你看的不一样（卡片是 {want}，dcv 里是 {got}），这次什么都没批准；请重新跑一次再看"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -226,13 +342,14 @@ pub enum Verdict {
     No,
 }
 
-/// Yes：先批准流程（`approve_proc`，会弹 Touch ID），成功后才批准弹窗草稿、确认学到的按钮；
-/// 流程这一步失败就整个返回 Err，什么都不生效。
+/// Yes：先核对 dcv 里的流程和弹窗草稿就是卡片上给用户看的那一版（正文指纹）、里面没有看不见的
+/// 字符，再批准流程（`approve_proc`，带着那个指纹，会弹 Touch ID），成功后才批准弹窗草稿、
+/// 确认学到的按钮；任何一步失败就整个返回 Err，什么都不生效。
 /// No：只把学到的按钮标成拒绝，草稿留在 dcv 里不动。
 pub fn apply_confirmation(
     v: Verdict,
     dcv: &dyn Dcv,
-    approve_proc: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+    approve_proc: &mut dyn FnMut(&str, &str) -> anyhow::Result<()>,
     hands: &mut dyn Hands,
     w: &Written,
     learned: &[String],
@@ -246,12 +363,31 @@ pub fn apply_confirmation(
             }
         }
         Verdict::Yes => {
-            approve_proc(&w.procedure)?;
-            for name in &w.popups {
-                let shown = dcv.show(name)?;
-                let sha = shown["body_sha256"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("dcv 回复缺 body_sha256"))?;
+            // 先全部核对（不弹指纹）：看不见的字符、dcv 里的流程和弹窗是不是卡片上那一版。
+            let bodies = std::iter::once(&w.final_body).chain(&w.popup_bodies);
+            if let Some(c) = bodies.filter_map(|b| hidden_char(b)).next() {
+                anyhow::bail!(
+                    "草稿里有看不见的字符或控制字符（U+{:04X}），不批准",
+                    c as u32
+                );
+            }
+            if w.popup_bodies.len() != w.popups.len() {
+                anyhow::bail!("弹窗规则和它们的正文对不上，不批准");
+            }
+            let want = body_sha256(&w.final_body);
+            check_shown(dcv, &w.procedure, &want, "流程")?;
+            let pops: Vec<(&String, String)> = w
+                .popups
+                .iter()
+                .zip(&w.popup_bodies)
+                .map(|(n, b)| (n, body_sha256(b)))
+                .collect();
+            for (name, sha) in &pops {
+                check_shown(dcv, name, sha, "弹窗规则")?;
+            }
+            // Touch ID 绑在这个指纹上（approve_proc 再让 dcv 在锁里核一遍）。
+            approve_proc(&w.procedure, &want)?;
+            for (name, sha) in &pops {
                 dcv.approve(name, sha)?;
             }
             if !learned.is_empty() {
@@ -450,6 +586,7 @@ mod tests {
             popups: vec!["social-global:tiktok-turn-on-automatic-con".into()],
             rounds: 1,
             popup_failures: vec![],
+            popup_bodies: vec![card_popup().body],
             final_body: draft_with_one_off().body,
         }
     }
@@ -486,11 +623,16 @@ mod tests {
         }
     }
     impl crate::procedures::Dcv for FakeDcvWithShow {
-        fn show(&self, _: &str) -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::json!({"kind": "popup", "body_sha256": "sha256:aa"}))
+        fn show(&self, n: &str) -> anyhow::Result<serde_json::Value> {
+            let body = if n.ends_with(":promote-x-post") {
+                written().final_body
+            } else {
+                card_popup().body
+            };
+            Ok(serde_json::json!({"body_sha256": body_sha256(&body)}))
         }
         fn approve(&self, n: &str, s: &str) -> anyhow::Result<String> {
-            assert_eq!(s, "sha256:aa");
+            assert_eq!(s, body_sha256(&card_popup().body));
             self.approved.borrow_mut().push(n.into());
             Ok(s.into())
         }
@@ -512,7 +654,8 @@ mod tests {
             &draft_with_one_off(),
             &[card_popup()],
             &["k1".into()],
-        );
+        )
+        .unwrap();
         assert!(c.text.contains("1. 打开 https://x.com/compose/post"));
         assert!(c
             .text
@@ -547,7 +690,7 @@ mod tests {
         d.body = "1. open_url: https://x.com\n2. pick_file: video\n3. scroll: down\n4. scroll: up\n5. wait: 1\n6. back: \n7. verify_text: 「Done」\n8. type_param: title".into();
         let mut w = written();
         w.final_body = d.body.clone();
-        let c = render_card(&w, &d, &[], &[]);
+        let c = render_card(&w, &d, &[], &[]).unwrap();
         for want in [
             "选文件（video）",
             "往下滚",
@@ -573,7 +716,7 @@ mod tests {
         apply_confirmation(
             Verdict::Yes,
             &d,
-            &mut |n| {
+            &mut |n, _| {
                 approved.push(n.to_string());
                 Ok(())
             },
@@ -598,7 +741,7 @@ mod tests {
         apply_confirmation(
             Verdict::No,
             &d,
-            &mut |n| {
+            &mut |n, _| {
                 approved.push(n.into());
                 Ok(())
             },
@@ -619,7 +762,7 @@ mod tests {
         let r = apply_confirmation(
             Verdict::Yes,
             &d,
-            &mut |_| anyhow::bail!("用户取消了指纹"),
+            &mut |_, _| anyhow::bail!("用户取消了指纹"),
             &mut h,
             &written(),
             &["k1".into()],
@@ -642,7 +785,7 @@ mod tests {
         let mut p = draft();
         p.body = "1. open_url: https://x.com/compose/post\n2. tap_by_intent: Poost".into();
         let w = write_drafts(&d, &Swap, &p, &[]).unwrap();
-        let c = render_card(&w, &p, &[], &[]);
+        let c = render_card(&w, &p, &[], &[]).unwrap();
         assert!(c.text.contains("点「Post」"), "{}", c.text);
         assert!(!c.text.contains("Poost"), "{}", c.text);
         assert_eq!(c.json["steps"][1]["text"], "点「Post」");
@@ -656,7 +799,7 @@ mod tests {
         };
         let p = draft();
         let w = write_drafts(&d, &NoFix, &p, &[]).unwrap();
-        let c = render_card(&w, &p, &[], &[]);
+        let c = render_card(&w, &p, &[], &[]).unwrap();
         assert!(c.text.contains("promote-x-post-1a2b，草稿"), "{}", c.text);
         assert_eq!(c.json["procedure"], "social-global:promote-x-post-1a2b");
     }
@@ -665,7 +808,7 @@ mod tests {
     fn notes_and_popup_failures_appear_on_the_card() {
         let mut w = written();
         w.popup_failures = vec![("tiktok-x".into(), "弹窗不收".into())];
-        let c = render_card(&w, &draft_with_one_off(), &[], &[]);
+        let c = render_card(&w, &draft_with_one_off(), &[], &[]).unwrap();
         assert!(c.text.contains("有一次点击没能写成弹窗规则"));
         assert!(c.text.contains("tiktok-x") && c.text.contains("弹窗不收"));
     }
@@ -677,9 +820,209 @@ mod tests {
         d.body = "1. open_url: https://x.com\n2. type_param: context\n3. type_param: caption\n4. type_param: post_text".into();
         let mut w = written();
         w.final_body = d.body.clone();
-        let c = render_card(&w, &d, &[], &[]);
+        let c = render_card(&w, &d, &[], &[]).unwrap();
         assert!(c.text.contains("2. 填入「context」这一项"), "{}", c.text);
         assert!(c.text.contains("3. 填入要发的文字"));
         assert!(c.text.contains("4. 填入要发的文字"));
+    }
+
+    // ---- 确认只批准卡片上给用户看的那一版；卡片上不许有看不见的字 ----
+
+    /// dcv 里每个名字对应的正文（show 回 dcv 算的指纹）。
+    struct BodiesDcv {
+        bodies: Vec<(String, String)>,
+        approved: RefCell<Vec<(String, String)>>,
+    }
+    impl crate::procedures::Dcv for BodiesDcv {
+        fn show(&self, n: &str) -> anyhow::Result<serde_json::Value> {
+            let (_, b) = self
+                .bodies
+                .iter()
+                .find(|(k, _)| k == n)
+                .ok_or_else(|| anyhow::anyhow!("没有 {n}"))?;
+            Ok(serde_json::json!({"body": b, "body_sha256": body_sha256(b)}))
+        }
+        fn approve(&self, n: &str, s: &str) -> anyhow::Result<String> {
+            self.approved.borrow_mut().push((n.into(), s.into()));
+            Ok(s.into())
+        }
+        fn add(&self, _: &crate::procedures::AddReq) -> anyhow::Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn vocab(&self) -> anyhow::Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn popups(&self, _: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+            unreachable!()
+        }
+    }
+    fn bodies(proc_body: &str, popup_body: &str) -> BodiesDcv {
+        BodiesDcv {
+            bodies: vec![
+                ("social-global:promote-x-post".into(), proc_body.into()),
+                (
+                    "social-global:tiktok-turn-on-automatic-con".into(),
+                    popup_body.into(),
+                ),
+            ],
+            approved: RefCell::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn the_body_fingerprint_is_dcvs() {
+        // sha256("abc")；dcv 先把 \r\n 折成 \n、去掉首尾换行再算。
+        let abc = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(body_sha256("abc"), abc);
+        assert_eq!(body_sha256("\n\nabc\r\n\n"), abc);
+        assert_ne!(body_sha256(" abc"), abc);
+    }
+
+    #[test]
+    fn touch_id_is_bound_to_the_body_the_card_showed() {
+        let w = written();
+        let d = bodies(&w.final_body, &card_popup().body);
+        let mut seen: Vec<(String, String)> = vec![];
+        let mut h = dct_explore::testing::FakeHands::default();
+        apply_confirmation(
+            Verdict::Yes,
+            &d,
+            &mut |n, sha| {
+                seen.push((n.into(), sha.into()));
+                Ok(())
+            },
+            &mut h,
+            &w,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![(w.procedure.clone(), body_sha256(&w.final_body))]
+        );
+        assert_eq!(
+            d.approved.borrow().as_slice(),
+            [(w.popups[0].clone(), body_sha256(&card_popup().body))]
+        );
+    }
+
+    #[test]
+    fn a_procedure_changed_in_dcv_after_the_card_is_not_approved() {
+        let w = written();
+        let d = bodies(
+            &w.final_body.replace("Post", "Delete account"),
+            &card_popup().body,
+        );
+        let mut called = false;
+        let mut h = dct_explore::testing::FakeHands::default();
+        let r = apply_confirmation(
+            Verdict::Yes,
+            &d,
+            &mut |_, _| {
+                called = true;
+                Ok(())
+            },
+            &mut h,
+            &w,
+            &["k1".into()],
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("不一样"), "{e}");
+        assert!(!called, "对不上就不弹指纹");
+        assert!(d.approved.borrow().is_empty());
+        assert!(h.calls.is_empty());
+    }
+
+    #[test]
+    fn a_popup_changed_in_dcv_after_the_card_is_not_approved() {
+        let w = written();
+        let d = bodies(&w.final_body, &card_popup().body.replace("Cancel", "Allow"));
+        let mut called = false;
+        let mut h = dct_explore::testing::FakeHands::default();
+        let r = apply_confirmation(
+            Verdict::Yes,
+            &d,
+            &mut |_, _| {
+                called = true;
+                Ok(())
+            },
+            &mut h,
+            &w,
+            &[],
+        );
+        assert!(r.is_err());
+        assert!(!called, "弹窗也先核对，再弹指纹");
+        assert!(d.approved.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_body_with_hidden_or_control_characters_is_neither_shown_nor_approved() {
+        for bad in ["\u{202E}", "\u{1b}[2K", "\r", "\t", "\u{200B}", "\u{2028}"] {
+            let mut w = written();
+            w.final_body = format!("{}\n6. tap_by_intent: Po{bad}st", w.final_body);
+            assert!(
+                render_card(&w, &draft_with_one_off(), &[], &[]).is_err(),
+                "{bad:?}"
+            );
+            let d = bodies(&w.final_body, &card_popup().body);
+            let mut called = false;
+            let mut h = dct_explore::testing::FakeHands::default();
+            let r = apply_confirmation(
+                Verdict::Yes,
+                &d,
+                &mut |_, _| {
+                    called = true;
+                    Ok(())
+                },
+                &mut h,
+                &w,
+                &[],
+            );
+            assert!(r.is_err() && !called, "{bad:?}");
+        }
+        let mut pop = card_popup();
+        pop.body = pop.body.replace("Cancel", "Can\u{202E}cel");
+        assert!(render_card(&written(), &draft_with_one_off(), &[pop], &[]).is_err());
+    }
+
+    #[test]
+    fn every_line_of_the_body_is_on_the_card_even_indented_or_unknown_ones() {
+        let mut d = draft_with_one_off();
+        d.maybe_one_off = vec![];
+        d.notes = vec![];
+        d.body = "1. open_url: https://x.com\n2. tap_by_intent: Post\n   完成标志: verify_text 「Your post was sent」\n   3. tap_by_intent: Buy coins\nsomething else\n4. confirm_dialog: OK".into();
+        let mut w = written();
+        w.final_body = d.body.clone();
+        let c = render_card(&w, &d, &[], &[]).unwrap();
+        assert!(
+            c.text.contains("看得到「Your post was sent」"),
+            "{}",
+            c.text
+        );
+        assert!(c.text.contains("3. tap_by_intent: Buy coins"), "{}", c.text);
+        assert!(c.text.contains("something else"), "{}", c.text);
+        assert!(
+            c.text.contains("4. （原文）confirm_dialog: OK"),
+            "{}",
+            c.text
+        );
+    }
+
+    #[test]
+    fn one_off_step_numbers_follow_the_fixed_body() {
+        // 修过的正文在前面多了一步：原来的第 3 步变成第 4 步。
+        let mut w = written();
+        w.final_body = "1. open_url: https://x.com/compose/post\n2. verify_text: 「What's happening?」\n3. wait: 2\n4. tap_by_intent: What's happening?\n5. type_param: post_text\n6. tap_by_intent: Post".into();
+        w.rounds = 2;
+        let c = render_card(&w, &draft_with_one_off(), &[], &[]).unwrap();
+        assert!(c.text.contains("第 4、6 步"), "{}", c.text);
+        assert_eq!(c.json["maybe_one_off"], serde_json::json!([4, 6]));
+
+        // 对不上（修过的正文里那一步没了）：不标步号，说一句。
+        w.final_body = "1. open_url: https://x.com/compose/post\n2. verify_text: 「What's happening?」\n3. type_param: post_text".into();
+        let c = render_card(&w, &draft_with_one_off(), &[], &[]).unwrap();
+        assert!(!c.text.contains("第 3、5 步"), "{}", c.text);
+        assert!(c.text.contains("修过"), "{}", c.text);
+        assert_eq!(c.json["maybe_one_off"], serde_json::json!([]));
     }
 }

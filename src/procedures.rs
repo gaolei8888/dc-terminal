@@ -312,7 +312,26 @@ pub fn approve(
     overrides: &[(u32, Tier)],
     now: u64,
 ) -> Result<SignedApproval> {
+    approve_inner(dcv, keys, se, approvals, full_name, overrides, now, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approve_inner(
+    dcv: &dyn Dcv,
+    keys: &KeyStore,
+    se: &dyn SecureEnclave,
+    approvals: &Approvals,
+    full_name: &str,
+    overrides: &[(u32, Tier)],
+    now: u64,
+    expected_body_sha256: Option<&str>,
+) -> Result<SignedApproval> {
     let shown = Shown::parse(full_name, &dcv.show(full_name).with_context(|| format!("读流程 {full_name} 失败"))?)?;
+    if let Some(want) = expected_body_sha256 {
+        if shown.body_sha256 != want {
+            bail!("dcv 里的 {full_name} 和给你看的那一版不一样（看到的是 {want}，dcv 现在是 {}），这次不批准，请重新看一遍", shown.body_sha256);
+        }
+    }
     let steps_sha = steps_sha256(&shown.params, &shown.steps);
     let proposed: Vec<Tier> = shown.steps.iter().map(|s| tier_for_step(&s.action, &s.arg)).collect();
     let mut tiers = proposed.clone();
@@ -351,6 +370,32 @@ pub fn approve(
     }
     approvals.save(&signed)?;
     Ok(signed)
+}
+
+/// 同 `approve`，另外要求 dcv 现在给的正文指纹就是 `expected_body_sha256`（用户在确认卡片上
+/// 看到的那一版）：对不上就在按指纹之前拒绝，什么都不签、不写。之后 dcv approve 带的也是这个
+/// 指纹，dcv 在锁里再核一遍，所以按下去的指纹只落在用户看过的那一版上。
+#[allow(clippy::too_many_arguments)]
+pub fn approve_expecting(
+    dcv: &dyn Dcv,
+    keys: &KeyStore,
+    se: &dyn SecureEnclave,
+    approvals: &Approvals,
+    full_name: &str,
+    overrides: &[(u32, Tier)],
+    now: u64,
+    expected_body_sha256: &str,
+) -> Result<SignedApproval> {
+    approve_inner(
+        dcv,
+        keys,
+        se,
+        approvals,
+        full_name,
+        overrides,
+        now,
+        Some(expected_body_sha256),
+    )
 }
 
 fn random_nonce() -> Result<String> {
@@ -717,6 +762,38 @@ mod tests {
         let reasons = w.se.reasons.borrow();
         assert!(reasons[0].contains("social:edit-bio") && reasons[0].contains("保存"), "{reasons:?}");
         assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_some());
+    }
+
+    #[test]
+    fn approving_a_body_other_than_the_one_shown_is_refused_before_touch_id() {
+        let w = world();
+        let wrong = format!("sha256:{}", "cd".repeat(32));
+        assert!(approve_expecting(
+            &w.dcv,
+            &w.keys,
+            &w.se,
+            &w.approvals,
+            "social:edit-bio",
+            &[],
+            1000,
+            &wrong
+        )
+        .is_err());
+        assert!(w.se.reasons.borrow().is_empty(), "对不上就不弹指纹");
+        assert_eq!(w.dcv.approve_calls.get(), 0);
+        let right = format!("sha256:{}", "ab".repeat(32));
+        approve_expecting(
+            &w.dcv,
+            &w.keys,
+            &w.se,
+            &w.approvals,
+            "social:edit-bio",
+            &[],
+            1000,
+            &right,
+        )
+        .unwrap();
+        assert_eq!(w.dcv.approve_calls.get(), 1);
     }
 
     #[test]
