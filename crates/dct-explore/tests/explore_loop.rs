@@ -2007,3 +2007,106 @@ fn a_slow_publish_confirmation_does_not_turn_a_sent_post_into_a_stop() {
     assert!(now.get() > 600_000);
     assert!(matches!(out, Outcome::Published(_)), "{out:?}");
 }
+
+// ---- 发布词没核实的平台：每点一下都先问；发布要用户点的平台：发出去以后再点什么都先问 ----
+
+/// 记下给用户看的话，按脚本回答。
+struct SaidThen(Vec<bool>, Vec<String>);
+impl Confirm for SaidThen {
+    fn publish_ok(&mut self, _: Option<&str>, summary: &str) -> bool {
+        self.1.push(summary.to_string());
+        self.0.get(self.1.len() - 1).copied().unwrap_or(false)
+    }
+}
+
+fn weibo_screen() -> Look {
+    look(
+        "a",
+        vec![
+            el("e2", TEXT, "textarea", 0.45, 0.25),
+            el("e3", "发布", "button", 0.8, 0.1),
+            el("e4", "话题", "button", 0.3, 0.6),
+        ],
+    )
+}
+
+#[test]
+fn with_unverified_publish_words_every_tap_asks_first() {
+    let t = Table::seed();
+    assert!(t
+        .get("weibo")
+        .unwrap()
+        .unverified
+        .iter()
+        .any(|u| u == "publish_words"));
+    for yes in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = FakeHands::default();
+        h.push_step(done("r0"));
+        h.push_look(weibo_screen());
+        h.push_look(weibo_screen()); // 编号图（问能不能点）
+        if yes {
+            h.push_step(done("r1"));
+            h.push_look_err("stale");
+        }
+        let (j, m, mut u) = (sure(vec!["e4"]), NoModel, ScriptUser(vec![], 0));
+        let mut said = SaidThen(vec![yes], vec![]);
+        let mut lad = Ladder {
+            jeff: &j,
+            model: &m,
+            user: &mut u,
+            threshold: 0.8,
+        };
+        let out = explore(
+            &mut h,
+            &mut lad,
+            &mut said,
+            &T0,
+            input_for(&t, "weibo", d.path()),
+        );
+        assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+        assert_eq!(said.1.len(), 1, "「话题」不是发布词，也先问");
+        assert!(
+            said.1[0].contains("核实") && said.1[0].contains("话题"),
+            "{}",
+            said.1[0]
+        );
+        assert_eq!(
+            count(&h, "run_step tap_by_intent: 话题"),
+            usize::from(yes),
+            "{:?}",
+            h.calls
+        );
+    }
+}
+
+#[test]
+fn on_a_by_user_platform_every_tap_after_publishing_asks_first() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut inp = input_for(&t, "wechat_mp", d.path());
+    // 只看「发布要用户点」这一条：假设发布词已经核实过。
+    let mut p = inp.platform.clone();
+    p.unverified.retain(|u| u != "publish_words");
+    inp.platform = Box::leak(Box::new(p));
+    let a = || weibo_screen();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(a());
+    h.push_look(a()); // 编号图（问用户点发布）
+    h.push_look(a()); // 用户说点了，可画面没变
+    h.push_look(a()); // 编号图（问能不能点「话题」）
+    let (j, m, mut u) = (sure(vec!["e3", "e4"]), NoModel, ScriptUser(vec![], 0));
+    let mut said = SaidThen(vec![true, false], vec![]);
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut said, &T0, inp);
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    assert_eq!(said.1.len(), 2, "{:?}", said.1);
+    assert!(said.1[1].contains("话题"), "{}", said.1[1]);
+    assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
+}

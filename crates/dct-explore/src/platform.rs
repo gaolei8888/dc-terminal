@@ -242,6 +242,22 @@ never_tap = ["Subscribe"]
     }
 
     #[test]
+    fn every_chinese_rows_placeholder_publish_word_is_marked_unverified() {
+        let t = Table::seed();
+        for p in t
+            .rows
+            .iter()
+            .filter(|p| p.publish_words.iter().any(|w| w == "发布"))
+        {
+            assert!(
+                p.unverified.iter().any(|u| u == "publish_words"),
+                "{} 的「发布」是凑数的占位，要标 publish_words 未核实",
+                p.name
+            );
+        }
+    }
+
+    #[test]
     fn qr_login_and_publish_by_user_flags() {
         let t = Table::seed();
         for n in [

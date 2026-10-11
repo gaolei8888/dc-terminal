@@ -12,6 +12,8 @@
 //! 5. `Done` → `Published`；`Stuck` → `Stopped`。发布那一下落到新画面也直接 `Published`（见 8）。
 //! 6. 选中的是发布：每一次都先 `Confirm::publish_ok`；不 → `DeclinedAtPublish`。
 //!    平台 `publish_by_user_only`：dct 不点，请用户自己点，点完说「是」，轨迹记成用户点的。
+//!    平台的发布词没核实（`unverified` 里有 `publish_words`）：每一下点击（点字、点图标、点输入框）
+//!    都先问；`publish_by_user_only` 的平台发出去以后，再点什么也都先问。不让点 → `Stopped`。
 //! 7. `steps_for` → 逐步 `run_step`（`act::execute`：求助、拦下、失败的处理都在那里；
 //!    求助的画面也先过 `screen_halt`，命中就取消 dco 的运行 → `Halted`，不给任何人选）。
 //! 8. 执行后 `look`：scene_hash 和执行前一样、或是这次运行里见过的画面 → 失败：记在**选它的那个画面**
@@ -258,7 +260,7 @@ pub fn explore_from(
             } else {
                 format!("要发到 {} 了，内容已经填好，看一眼？", input.platform.name)
             };
-            if !confirm.publish_ok(pic.flatten().as_deref(), &summary) {
+            if !confirm.publish_ok(pic.clone().flatten().as_deref(), &summary) {
                 return Outcome::DeclinedAtPublish(r.trace);
             }
             if by_user {
@@ -296,6 +298,51 @@ pub fn explore_from(
                 }
                 cur = post;
                 continue;
+            }
+        }
+        // 6b. 认不准哪个是发布按钮时，每点一下都先问：
+        //  - 平台的发布词还没核实（unverified 里有 publish_words）：画面上叫什么都可能是发布；
+        //  - 发布要用户自己点的平台，已经发出去以后：再点什么都不该是 dct 自己决定的。
+        let taps = matches!(
+            opt.act,
+            Act::Tap { .. } | Act::TapIcon { .. } | Act::Fill { .. }
+        );
+        let unverified = input
+            .platform
+            .unverified
+            .iter()
+            .any(|u| u == "publish_words");
+        let after_by_user = input.platform.publish_by_user_only && r.prog.published;
+        if !opt.publish && taps && (unverified || after_by_user) {
+            if pic.is_none() {
+                pic = match act::marks_now(h, &input, &scrub) {
+                    Ok(p) => Some(p),
+                    Err(why) => {
+                        return Outcome::Halted {
+                            trace: r.trace,
+                            why,
+                        }
+                    }
+                };
+            }
+            let word = match &opt.act {
+                Act::Tap { intent, .. } | Act::Fill { intent, .. } => intent.clone(),
+                Act::TapIcon { name: Some(n), .. } => n.clone(),
+                _ => opt.text.clone(),
+            };
+            let summary = if unverified {
+                format!(
+                    "{} 的发布按钮叫什么还没核实，dct 认不准哪一个是发布，所以每点一下都先问你：下一下要点「{word}」，可以吗？",
+                    input.platform.name
+                )
+            } else {
+                format!(
+                    "已经发到 {} 了，之后再点什么都先问你：下一下要点「{word}」，可以吗？",
+                    input.platform.name
+                )
+            };
+            if !confirm.publish_ok(pic.clone().flatten().as_deref(), &summary) {
+                return r.stop(format!("你没让点「{word}」，停下"));
             }
         }
         // 7. 执行（填字先记下：打字失败后发帖框可能变成值元素，还要能再填）

@@ -2,6 +2,7 @@
 # 中文平台的登录闸文字和发布词都是未知的占位（publish_words 的 "发布" 只是凑数），
 # 全部标在 unverified 里，真机核对前不要当真。
 # unverified 里列的字段还没在真机上看过，第一次摸索时会核对（登录闸没在画面上出现就不出草稿）。
+# publish_words 没核实的平台：认不准哪个是发布按钮，摸索时每点一下都先问用户。
 
 [[platform]]
 name = "x"
@@ -66,7 +67,7 @@ vault = "social-global"
 publish_words = ["发布"]
 never_tap = ["关注", "薯条", "推广", "加热"]
 login_qr = true
-unverified = ["entry_url", "login_gate", "publish_done", "vault"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
 
 # 微博；据说首页直接发，未核实；登录有时是扫码
 [[platform]]
