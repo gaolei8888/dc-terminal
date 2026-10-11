@@ -254,7 +254,7 @@ src/cli.rs / main.rs  `dct judge` 子命令、HELP 文案
 - 服务端回 422（题不合它的要求，例如选项比模型能接的多）→ 当「请求有误」，不重试。
 - 配了 `api_key_env` 时，明文 `http://` 只能发往本机（127.0.0.1 / localhost / ::1），别的主机必须 https，否则不发请求。
 - **接进了 `dct do` 的逐级往上**：Jeff 的 `answer_confidence` ≥ `threshold` 才算数；不够、没答、或它选的那一下没让画面变 → 同一画面上问 `[llm]` 的大模型（最多 2 次）→ 用户。危险与否永远由规则（dct 的停下规矩、禁点词、dco 的按钮分档）判断，不看任何模型的把握。
-- **训练题**：`dct do` 摸索时每答一道题（照做后到了新画面）就往 `~/.dct/explore/answers.jsonl` 追加一行（0600），参数值写盘前已换回 `{名字}`。字段：`ts_ms`、`run_id`、`platform`、`state`（题面）、`options`（这一轮全部选项的 `[key, 文字]`，可能多于发给 Jeff 的 20 个）、`jeff`（Jeff 当时的 `[key, 把握]`，没有就 `null`）、`answer`、`by`（`jeff` / `model` / `user`）、`corrects_jeff`（不是 Jeff 答的、而 Jeff 在这个画面上选过别的）。
+- **训练题**：`dct do` 摸索时每答一道题（照做后到了新画面）就往 `~/.dct/explore/answers.jsonl` 追加一行（0600），参数值写盘前已换回 `{名字}`。字段：`ts_ms`、`run_id`、`platform`、`state`（题面）、`options`（这一轮全部选项的 `[key, 文字]`，可能多于发给 Jeff 的 20 个）、`jeff`（Jeff 当时的 `[key, 把握]`，没有就 `null`）、`answer`、`by`（`jeff` / `model` / `user`）、`corrects_jeff`（不是 Jeff 答的、而 Jeff 在这个画面上选过别的）。v2（`v: 2`）起题在运行结束后才写，另有 `shown`、`step`、`run_outcome`、`outcome`、`label`，标签规矩见 `2026-10-11-dct-jeff-auto-training-design.md` 第 1 节。
 
 ### 真跑过的数（dc-octo `docs/experiments/2026-10-11-jeff-serve-d4.md`）
 

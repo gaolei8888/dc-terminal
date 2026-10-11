@@ -734,7 +734,7 @@ dct 读棋盘、按规则选步、让 dco 划，每步不到一秒；每一步�
   `declined` / `error`），回答从标准输入读：`{"key": "e3"}`、`{"stop": true}` 或 `{"verdict": "yes"}`。
 
 **它存下什么**（都是 0600，要发的文字写盘时换成 `{post_text}`，不存原文）：每次的步骤存在
-`~/.dct/explore/runs/<编号>/trace.json`，连同给你看过的图；每答一道题在 `~/.dct/explore/answers.jsonl` 追加一行，留着以后训练 Jeff。
+`~/.dct/explore/runs/<编号>/trace.json`，连同给你看过的图（轨迹里也记下这次的结局）；每答一道题在 `~/.dct/explore/answers.jsonl` 留一行，留着以后训练 Jeff。这些行在运行结束时写下，每行记着谁答的（`by`：user / model / jeff）、发给 Jeff 的是哪几个选项（`shown`）、对应轨迹里哪一步（`step`）、这次的结局、这一下是不是确认离目标更近（`outcome`：good / bad / unknown），以及能不能当标准答案（`label`：用户的答案，和 `outcome` 为 good 的大模型答案；Jeff 自己的永远不算）。
 
 **平台表**内置 16 行：x、tiktok、youtube、facebook、instagram、xiaohongshu、weibo、bilibili、zhihu、zhihu_article、douyin、
 kuaishou、wechat_channels、toutiao、wechat_mp、baijiahao。没在真屏幕上核对过的字段都列在每行的 `unverified` 里，国内平台几乎全是。

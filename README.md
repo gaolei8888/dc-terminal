@@ -904,8 +904,14 @@ it lists them and you pass `--window <id>`.
 
 **What it keeps** (all 0600, and the post text is written as `{post_text}`,
 never the words): each run's steps in `~/.dct/explore/runs/<run>/trace.json`
-with the pictures it showed you, and one line per answered question in
-`~/.dct/explore/answers.jsonl`, saved to train Jeff later.
+with the pictures it showed you (the trace also records how the run ended),
+and one line per answered question in `~/.dct/explore/answers.jsonl`, saved to
+train Jeff later. The lines are written when the run ends; each says who
+answered (`by`: user / model / jeff), which options Jeff was shown (`shown`),
+which trace step it led to (`step`), how the run ended, whether the step was
+confirmed to move closer to the goal (`outcome`: good / bad / unknown) and
+whether it counts as a training label (`label`: user answers, and model
+answers with outcome good; never Jeff's own).
 
 **The platform table** has 16 built-in rows: x, tiktok, youtube, facebook,
 instagram, xiaohongshu, weibo, bilibili, zhihu, zhihu_article, douyin, kuaishou,
