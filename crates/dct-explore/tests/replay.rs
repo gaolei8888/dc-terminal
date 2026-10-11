@@ -641,6 +641,7 @@ fn an_answer_run_error_cancels_the_run() {
     h.answers.push_back(Err(dct_dco::DcoError {
         code: "stale".into(),
         message: "窗口关了".into(),
+        run_id: None,
     }));
     let (j, mut u) = (jeff(Some(("e3", 0.95))), U(None, vec![]));
     let mut lad = Ladder {
@@ -835,4 +836,30 @@ fn preview_and_by_user_platforms_stop_before_the_first_publish_tap() {
     let out = replay(&mut h, &mut lad, input(&pr, p, false));
     assert_eq!(out, ReplayOutcome::Previewed { at_step: 3 });
     assert_eq!(h.sent_procedures[0].3, Some(3));
+}
+
+#[test]
+fn a_private_screen_error_from_run_procedure_cancels_the_parked_run() {
+    let (t, pr) = x_setup();
+    let p = t.get("x").unwrap();
+    let mut h = FakeHands::new();
+    h.procedures.push_back(Err(dct_dco::DcoError {
+        code: "private_screen".into(),
+        message: "私人画面".into(),
+        run_id: Some("r1".into()),
+    }));
+    let (j, mut u) = (jeff(None), U(None, vec![]));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &NoModel,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = replay(&mut h, &mut lad, input(&pr, p, false));
+    assert!(matches!(out, ReplayOutcome::Stopped(_)), "{out:?}");
+    assert!(
+        h.calls.iter().any(|c| c == "cancel_run r1"),
+        "{:?}",
+        h.calls
+    );
 }

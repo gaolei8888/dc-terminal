@@ -68,6 +68,7 @@ fn err(code: &str) -> DcoError {
     DcoError {
         code: code.into(),
         message: format!("fake {code}"),
+        run_id: None,
     }
 }
 

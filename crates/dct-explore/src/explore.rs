@@ -26,7 +26,7 @@
 //!    而做过的每一下都还在轨迹里。dco 回 failed 的那一下没有步骤可记，只记一笔失败。
 //! 9. 填过的参数下一轮在画面上看不到了 → 从 `filled` 里拿掉（会再填一次，发布按钮也会先消失）。
 //! 10. 窗口没了（`look` 回 `stale` / `not_found`）→ `Stopped`。
-mod act;
+pub(crate) mod act;
 pub(crate) mod raw;
 mod run;
 pub(crate) mod screen;
@@ -118,7 +118,10 @@ pub fn explore(
             let why = format!("打不开 {}：{}", open.arg, act::describe(&r, &scrub));
             return new_run(&input, clock, vec![]).stop(why);
         }
-        Err(e) => return new_run(&input, clock, vec![]).stop(look_error(&e, &scrub)),
+        Err(e) => {
+            act::cancel_parked(h, &e);
+            return new_run(&input, clock, vec![]).stop(look_error(&e, &scrub));
+        }
     }
     explore_from(h, lad, confirm, clock, input, first)
 }

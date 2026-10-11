@@ -15,6 +15,14 @@ const SAME_PLACE: f64 = 0.03;
 /// 同一步最多答几次 dco 的求助。
 const MAX_HELP_ROUNDS: u32 = 3;
 
+/// dco 报错时还带着运行号（私人画面：运行停在那里等答复，dco tools/runs.rs）→ 取消它，
+/// 不把一个停着的运行留在 dco 里。
+pub(crate) fn cancel_parked(h: &mut dyn Hands, e: &dct_dco::DcoError) {
+    if let Some(id) = &e.run_id {
+        let _ = h.cancel_run(id);
+    }
+}
+
 pub(super) fn is_done(status: &str) -> bool {
     matches!(status, "done" | "already_done")
 }
@@ -293,7 +301,10 @@ pub(super) fn execute(
         }
         let mut rep = match h.run_step(input.window_id, &s, &input.params, &input.popups) {
             Ok(r) => r,
-            Err(e) => return Exec::Stop(look_error(&e, scrub)),
+            Err(e) => {
+                cancel_parked(h, &e);
+                return Exec::Stop(look_error(&e, scrub));
+            }
         };
         let mut rounds = 0;
         loop {
@@ -322,7 +333,12 @@ pub(super) fn execute(
                     };
                     rep = match h.answer_run(&rep.run_id, &a) {
                         Ok(r) => r,
-                        Err(e) => return Exec::Stop(look_error(&e, scrub)),
+                        Err(e) => {
+                            // 答不进去（私人画面等）：这个运行还停着，取消掉。
+                            let id = e.run_id.clone().unwrap_or_else(|| rep.run_id.clone());
+                            let _ = h.cancel_run(&id);
+                            return Exec::Stop(look_error(&e, scrub));
+                        }
                     };
                 }
                 "needs_help" => {

@@ -25,7 +25,7 @@ pub struct Seen {
 }
 
 fn unsupported() -> DcoError {
-    DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+    DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into(), run_id: None }
 }
 
 pub trait Dco {

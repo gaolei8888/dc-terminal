@@ -113,6 +113,7 @@ fn bad(msg: impl Into<String>) -> DcoError {
     DcoError {
         code: "dco_error".into(),
         message: msg.into(),
+        run_id: None,
     }
 }
 

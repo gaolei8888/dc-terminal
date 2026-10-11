@@ -25,6 +25,9 @@ pub const RUN_TIMEOUT: Duration = Duration::from_secs(660);
 pub struct DcoError {
     pub code: String,
     pub message: String,
+    /// 工具报错时 dco 还带着的运行号：私人画面（`private_screen`）时运行停在那里等答复，
+    /// 调用方要拿它去 `cancel_run`（dco tools/runs.rs `with_help_image`）。别的错一般是 None。
+    pub run_id: Option<String>,
 }
 
 /// 一次工具回复：文字部分的 JSON，加上回复里带的图片（编号图、截图）。
@@ -75,6 +78,28 @@ mod tests {
         let mut c = DcoClient::connect(dir.path()).unwrap();
         let e = c.call("see", json!({})).unwrap_err();
         assert_eq!(e.code, "private_screen");
+        drop(c);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_private_screen_error_keeps_the_parked_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = fake::serve(dir.path(), TOKEN, |_, _| {
+            // dco tools/runs.rs with_help_image：私人画面只给错误、run_id 和 status。
+            (
+                json!({"error": {"code": "private_screen", "message": "私人画面"},
+                       "run_id": "run-7", "status": "needs_help"}),
+                true,
+                None,
+            )
+        });
+        let mut c = DcoClient::connect(dir.path()).unwrap();
+        let e = c.call("answer_run", json!({})).unwrap_err();
+        assert_eq!(e.code, "private_screen");
+        assert_eq!(e.run_id.as_deref(), Some("run-7"));
+        let e2 = c.call("see", json!({})).unwrap_err();
+        assert_eq!(e2.run_id.as_deref(), Some("run-7"));
         drop(c);
         h.join().unwrap();
     }

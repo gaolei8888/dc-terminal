@@ -18,7 +18,7 @@ impl Dco for DcoClient {
             }
         }
         let body = self.call("read_grid", args)?;
-        serde_json::from_value(body).map_err(|e| DcoError { code: "dco_error".into(), message: format!("dco 的棋盘回复读不懂：{e}") })
+        serde_json::from_value(body).map_err(|e| DcoError { code: "dco_error".into(), message: format!("dco 的棋盘回复读不懂：{e}"), run_id: None })
     }
 
     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError> {

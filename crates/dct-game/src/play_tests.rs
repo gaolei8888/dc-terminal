@@ -67,7 +67,7 @@ fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     (s, log)
 }
 fn err(code: &str) -> DcoError {
-    DcoError { code: code.into(), message: format!("m-{code}") }
+    DcoError { code: code.into(), message: format!("m-{code}"), run_id: None }
 }
 
 // 每个类别至少出现两次：只有一格的类别按设计算「认不出」，不能换。
@@ -163,7 +163,7 @@ fn settle_never_finishing_after_a_swipe_counts_the_step_and_is_marked_swiped() {
 
 #[test]
 fn nothing_readable_after_a_swipe_is_no_grid_not_still_moving() {
-    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into() })]);
+    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into(), run_id: None })]);
     let (s, _) = run(&mut d, 10, false);
     assert_eq!(s.stop, Stop::NoGrid("结果页".into()));
     assert_eq!(s.steps, 1);

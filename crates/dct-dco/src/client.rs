@@ -21,6 +21,7 @@ fn err(code: &str, message: impl Into<String>) -> DcoError {
     DcoError {
         code: code.into(),
         message: message.into(),
+        run_id: None,
     }
 }
 
@@ -165,10 +166,13 @@ impl DcoClient {
         let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
         if result["isError"].as_bool().unwrap_or(false) {
             let e = &body["error"];
-            return Err(err(
+            let mut out = err(
                 e["code"].as_str().unwrap_or("dco_error"),
                 e["message"].as_str().unwrap_or(text),
-            ));
+            );
+            // 私人画面：运行还停着，run_id 在错误旁边（不在 error 里）。
+            out.run_id = body["run_id"].as_str().map(str::to_string);
+            return Err(out);
         }
         Ok(body)
     }

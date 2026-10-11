@@ -1123,6 +1123,7 @@ fn a_dco_error_that_repeats_the_value_is_redacted() {
     h.steps.push_back(Err(dct_dco::DcoError {
         code: "boom".into(),
         message: format!("could not use {TEXT}"),
+        run_id: None,
     }));
     let (j, m, mut u) = (
         NoJeff,
@@ -2109,4 +2110,77 @@ fn on_a_by_user_platform_every_tap_after_publishing_asks_first() {
     assert_eq!(said.1.len(), 2, "{:?}", said.1);
     assert!(said.1[1].contains("话题"), "{}", said.1[1]);
     assert_eq!(h.step_calls.len(), 1, "只有 open_url：{:?}", h.calls);
+}
+
+// ---- dco 的隐私闸：错误里带着停着的运行号，要取消掉 ----
+
+fn private_err(run: &str) -> dct_dco::DcoError {
+    dct_dco::DcoError {
+        code: "private_screen".into(),
+        message: "私人画面".into(),
+        run_id: Some(run.into()),
+    }
+}
+
+#[test]
+fn a_private_screen_on_a_step_cancels_the_parked_run() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.steps.push_back(Err(private_err("r1")));
+    let (j, m, mut u) = (sure(vec!["e5"]), NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    assert_eq!(count(&h, "cancel_run r1"), 1, "{:?}", h.calls);
+}
+
+#[test]
+fn a_private_screen_on_an_answer_cancels_the_parked_run() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.push_step(done("r0"));
+    h.push_look(composer("a"));
+    h.push_step(needs_help(
+        "r1",
+        "Drafts",
+        vec![el("e11", "Drafts", "button", 0.6, 0.1)],
+    ));
+    h.answers.push_back(Err(private_err("r1")));
+    let (j, m, mut u) = (sure(vec!["e5"]), NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    assert_eq!(count(&h, "cancel_run r1"), 1, "{:?}", h.calls);
+}
+
+#[test]
+fn a_private_screen_on_open_url_cancels_the_parked_run() {
+    let t = Table::seed();
+    let d = tempfile::tempdir().unwrap();
+    let mut h = FakeHands::default();
+    h.steps.push_back(Err(private_err("r0")));
+    let (j, m, mut u) = (NoJeff, NoModel, ScriptUser(vec![], 0));
+    let mut lad = Ladder {
+        jeff: &j,
+        model: &m,
+        user: &mut u,
+        threshold: 0.8,
+    };
+    let out = explore(&mut h, &mut lad, &mut Yes(0), &T0, input(&t, d.path()));
+    assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+    assert_eq!(count(&h, "cancel_run r0"), 1, "{:?}", h.calls);
 }

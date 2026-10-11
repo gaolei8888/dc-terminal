@@ -280,7 +280,7 @@ mod tests {
         fn read_grid(&mut self, _: &Profile) -> Result<GridRead, DcoError> {
             match &self.frames[self.at] {
                 Frame::Board(g) | Frame::TextGrid(_, g) => Ok(g.clone()),
-                Frame::Text(_) => Err(DcoError { code: "not_a_grid".into(), message: "这块区域分不清类别".into() }),
+                Frame::Text(_) => Err(DcoError { code: "not_a_grid".into(), message: "这块区域分不清类别".into(), run_id: None }),
             }
         }
         fn swipe(&mut self, _: &Profile, _: (f64, f64), _: (f64, f64)) -> Result<(), DcoError> {
@@ -480,9 +480,9 @@ mod tests {
     #[test]
     fn a_dco_refusal_to_tap_is_passed_on() {
         let mut w = World::new(vec![text(&["Play"]), board(DEAD)]);
-        w.tap_error = Some(DcoError { code: "needs_ticket".into(), message: "x".into() });
+        w.tap_error = Some(DcoError { code: "needs_ticket".into(), message: "x".into(), run_id: None });
         let (s, _) = run(&mut w, 5, false);
-        assert_eq!(s.stop, Stop::Dco(DcoError { code: "needs_ticket".into(), message: "x".into() }));
+        assert_eq!(s.stop, Stop::Dco(DcoError { code: "needs_ticket".into(), message: "x".into(), run_id: None }));
     }
 
     #[test]
@@ -546,9 +546,9 @@ mod tests {
     #[test]
     fn an_error_from_reading_the_screen_stops_with_it_and_taps_nothing() {
         let mut w = World::new(vec![text(&["Play"])]);
-        w.see_error = Some(DcoError { code: "gone".into(), message: "y".into() });
+        w.see_error = Some(DcoError { code: "gone".into(), message: "y".into(), run_id: None });
         let (s, _) = run(&mut w, 5, false);
-        assert_eq!(s.stop, Stop::Dco(DcoError { code: "gone".into(), message: "y".into() }));
+        assert_eq!(s.stop, Stop::Dco(DcoError { code: "gone".into(), message: "y".into(), run_id: None }));
         assert!(w.taps.is_empty());
     }
 

@@ -264,11 +264,13 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
     ) {
         Ok(r) => r,
         Err(e) => {
+            // 私人画面：dco 把运行停着等答复，错误里带着运行号——取消掉。
+            crate::explore::act::cancel_parked(h, &e);
             return ReplayOutcome::Stopped(format!(
                 "dco 出错：{}（{}）",
                 scrub.line(&e.message),
                 scrub.line(&e.code)
-            ))
+            ));
         }
     };
     let mut learned: Vec<String> = Vec::new();
@@ -421,7 +423,7 @@ pub fn replay(h: &mut dyn Hands, lad: &mut Ladder, input: ReplayInput) -> Replay
         rep = match h.answer_run(&run_id, &answer) {
             Ok(r) => r,
             Err(e) => {
-                let _ = h.cancel_run(&run_id);
+                let _ = h.cancel_run(e.run_id.as_deref().unwrap_or(&run_id));
                 return ReplayOutcome::Stopped(format!(
                     "dco 出错：{}（{}）",
                     scrub.line(&e.message),
