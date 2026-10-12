@@ -10,9 +10,9 @@
 //! `Raw` 不实现 Debug / Clone / Serialize，原文拿不出这个类型：对外只回答「停不停」（那行字已脱敏）、
 //! 「能不能点」「是不是发布词」。
 use super::screen::Scrub;
+use crate::app_profile::AppProfile;
 use crate::gate::{fold, screen_halt, tappable, Halt};
 use crate::hands::El;
-use crate::platform::Platform;
 
 pub(crate) struct Raw {
     els: Vec<El>,
@@ -51,7 +51,7 @@ impl Raw {
 
     /// 这个元素（按 id，取第一个）的原文能不能点：值元素不行；禁点词（通用 + 平台）、档位 >= Critical
     /// 一律不行。没字的元素照常（图标的名字另外管）；找不到这个 id 的当不能点。
-    pub(crate) fn tappable(&self, id: &str, p: &Platform) -> bool {
+    pub(crate) fn tappable(&self, id: &str, p: &AppProfile) -> bool {
         let Some(i) = self.els.iter().position(|e| e.id == id) else {
             return false;
         };
@@ -70,7 +70,7 @@ impl Raw {
     }
 
     /// 画面上还有能点的发布按钮：界面元素的原文（fold 后）整句等于平台的发布词，且能点（同 `all_options` 认发布的规矩）。
-    pub(crate) fn has_publish_button(&self, p: &Platform) -> bool {
+    pub(crate) fn has_publish_button(&self, p: &AppProfile) -> bool {
         let words: Vec<String> = p.publish_words.iter().map(|w| fold(w)).collect();
         self.ui().any(|e| {
             let t = e.text.trim();
@@ -81,7 +81,7 @@ impl Raw {
 
     /// 画面上有平台表里核实过的「发出去了」那行字（`publish_done` 有、且不在 `unverified` 里）。
     /// 只看界面元素：帖子里写着同样的字不算。
-    pub(crate) fn shows_publish_done(&self, p: &Platform) -> bool {
+    pub(crate) fn shows_publish_done(&self, p: &AppProfile) -> bool {
         if p.unverified.iter().any(|u| u == "publish_done") {
             return false;
         }
@@ -94,7 +94,7 @@ impl Raw {
 
     /// 脱敏后的元素，给外面看（值元素是 `{名字}`）。界面元素的原文正好是平台的发布词时保留原字（那是平台的词，不是用户的内容），
     /// 这样发布按钮不会因为帖子里也有这个词而认不出来。
-    pub(crate) fn shown(&self, scrub: &Scrub, p: &Platform) -> Vec<El> {
+    pub(crate) fn shown(&self, scrub: &Scrub, p: &AppProfile) -> Vec<El> {
         let words: Vec<String> = p.publish_words.iter().map(|w| fold(w)).collect();
         let mut out = scrub.els(&self.els);
         for ((o, e), v) in out.iter_mut().zip(&self.els).zip(&self.value) {

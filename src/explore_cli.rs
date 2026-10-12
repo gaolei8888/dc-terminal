@@ -9,13 +9,13 @@ pub use io::{Say, Talk};
 use crate::judge::{ChoiceQuestion, JudgeBackend};
 use crate::learn::{apply_confirmation, render_card, write_drafts, Card, Fixer, Verdict};
 use crate::procedures::Dcv;
+use dct_explore::app_profile::AppProfile;
 use dct_explore::draft::{draft, DraftError};
 use dct_explore::explore::{explore, explore_from, Clock, Confirm, ExploreInput, Outcome};
 use dct_explore::gate::{Budget, Halt};
 use dct_explore::hands::{Hands, Params, WindowRow};
 use dct_explore::ladder::{Jeff, JeffAnswer, Ladder, Model, User, UserPick};
 use dct_explore::options::Opt;
-use dct_explore::platform::Platform;
 use dct_explore::replay::{replay, ReplayInput, ReplayOutcome};
 use dct_explore::trace::{redact, Trace};
 use serde_json::{json, Value};
@@ -137,6 +137,9 @@ impl Jeff for JudgeJeff {
     }
 }
 
+/// 没配 `[judge]` 时的门槛（和 `[judge] threshold` 的默认值一样）；没有 Jeff 时其实用不到。
+pub const DEFAULT_THRESHOLD: f64 = 0.8;
+
 /// 没配 `[judge]`：跳过 Jeff。
 pub struct NoJeff;
 impl Jeff for NoJeff {
@@ -204,11 +207,11 @@ fn fin(say: &RefCell<dyn Say + '_>, code: i32, event: &str, text: &str, extra: V
     code
 }
 
-fn publish_words(p: &Platform) -> String {
+fn publish_words(p: &AppProfile) -> String {
     p.publish_words.join("」或「")
 }
 
-fn by_user_note(p: &Platform) -> String {
+fn by_user_note(p: &AppProfile) -> String {
     format!(
         "{} 的最后发布一下要你自己点：dct 只做到发布前，请在窗口里点「{}」。",
         p.name,
@@ -217,7 +220,7 @@ fn by_user_note(p: &Platform) -> String {
 }
 
 /// 发布要用户自己点的平台：卡片上多说一句（render_card 看不到平台）。
-pub fn with_platform_notes(card: Card, p: &Platform) -> Card {
+pub fn with_platform_notes(card: Card, p: &AppProfile) -> Card {
     if !p.publish_by_user_only {
         return card;
     }
@@ -245,7 +248,7 @@ fn window_list(rows: &[WindowRow], params: &Params) -> (String, Value) {
 }
 
 /// 选窗口之后的一切。返回退出码。
-pub fn drive(a: &DoArgs, p: &Platform, params: Params, env: Env) -> i32 {
+pub fn drive(a: &DoArgs, p: &AppProfile, params: Params, env: Env) -> i32 {
     let Env {
         hands,
         dcv,
@@ -388,7 +391,7 @@ pub fn drive(a: &DoArgs, p: &Platform, params: Params, env: Env) -> i32 {
 }
 
 /// 停在登录 / 验证码 / 警告画面。画面上的字不发给任何模型，这里也不回显。
-fn halted(say: &RefCell<dyn Say + '_>, p: &Platform, why: &Halt) -> i32 {
+fn halted(say: &RefCell<dyn Say + '_>, p: &AppProfile, why: &Halt) -> i32 {
     let (reason, text) = match why {
         Halt::Login(_) if p.login_qr => (
             "login",
@@ -420,7 +423,7 @@ fn halted(say: &RefCell<dyn Say + '_>, p: &Platform, why: &Halt) -> i32 {
 }
 
 /// 重放的结果（走不通的已经交给摸索了）。
-fn replayed(say: &RefCell<dyn Say + '_>, p: &Platform, full: &str, r: ReplayOutcome) -> i32 {
+fn replayed(say: &RefCell<dyn Say + '_>, p: &AppProfile, full: &str, r: ReplayOutcome) -> i32 {
     match r {
         ReplayOutcome::Done { learned } => {
             let mut text = format!("照 {full} 发好了");
@@ -492,7 +495,13 @@ fn draft_error_text(e: &DraftError) -> String {
 }
 
 impl Learn<'_, '_> {
-    fn run(&mut self, hands: &mut dyn Hands, p: &Platform, trace: &Trace, files: &[String]) -> i32 {
+    fn run(
+        &mut self,
+        hands: &mut dyn Hands,
+        p: &AppProfile,
+        trace: &Trace,
+        files: &[String],
+    ) -> i32 {
         let say = self.say;
         let dismiss: Vec<String> = self
             .dcv
@@ -642,9 +651,9 @@ mod tests {
     use super::*;
     use crate::judge::{ChoiceAnswer, JudgeError};
     use crate::procedures::AddReq;
+    use dct_explore::app_profile::Table;
     use dct_explore::hands::{El, Frac, Look, RunReply};
     use dct_explore::ladder::NoModel;
-    use dct_explore::platform::Table;
     use dct_explore::testing::FakeHands;
     use serde_json::{json, Value};
     use std::io::Cursor;

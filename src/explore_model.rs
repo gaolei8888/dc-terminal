@@ -18,14 +18,55 @@ const FIX_MAX_TOKENS: u32 = 3000;
 /// 单次请求最多等多久。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `[llm]` → 后端（`dct do` 和 `dct answer` 共用，一处接线）。凭据顺序、借来的登录态只发回自己家的主机，
+/// 都在 `resolve` 里；这里只把配置、密钥仓、档案和登录态接给它。
+pub fn backend_from_config(
+    llm: &crate::config::LlmConfig,
+    socket: &std::path::Path,
+) -> Result<Arc<dyn Backend>, crate::llm::resolve::ResolveError> {
+    let secrets =
+        crate::secrets::SecretStore::load(&crate::secrets::secrets_path_for_socket(socket));
+    let (custom, _) =
+        crate::profile::all_profiles(&crate::profile::profiles_dir_for_socket(socket));
+    let lookup = |n: &str| {
+        custom
+            .iter()
+            .find(|p| p.name == n)
+            .cloned()
+            .or_else(|| crate::profile::Profile::builtin(n))
+    };
+    // 同 cli.rs::oauth_lookup：一个 CLI 的登录态只给它自己家的端点用（resolve 再按主机核一次）。
+    let oauth = |n: &str| {
+        use crate::llm::creds::{BorrowedFrom, Credential};
+        match n {
+            "claude" => crate::llm::creds::read_claude_oauth()
+                .map(|t| (BorrowedFrom::ClaudeCli, Credential::Bearer(t))),
+            "codex" => crate::llm::creds::read_codex_auth().map(|c| (BorrowedFrom::CodexCli, c)),
+            _ => None,
+        }
+    };
+    crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth)
+}
+
 pub struct LlmModel {
     backend: Arc<dyn Backend>,
     timeout: Duration,
+    /// 调用方的禁点词（一串字）：模型起的图标名字不能含它们。这里不认识任何档案。
+    never: Vec<String>,
 }
 
 impl LlmModel {
     pub fn new(backend: Arc<dyn Backend>, timeout: Duration) -> Self {
-        Self { backend, timeout }
+        Self {
+            backend,
+            timeout,
+            never: Vec::new(),
+        }
+    }
+
+    pub fn with_never(mut self, words: Vec<String>) -> Self {
+        self.never = words;
+        self
     }
 }
 
@@ -52,7 +93,7 @@ pub fn prompt_for_pick(state: &str, all: &[Opt]) -> Prompt {
 }
 
 /// 读回复里第一个 `{…}` JSON 对象。key 不在清单里 / `stuck` / 没字图标没名字或名字不合格 → None。
-pub fn read_pick(text: &str, all: &[Opt]) -> Option<ModelPick> {
+pub fn read_pick(text: &str, all: &[Opt], never: &[String]) -> Option<ModelPick> {
     let start = text.find('{')?;
     let v = serde_json::Deserializer::from_str(&text[start..])
         .into_iter::<serde_json::Value>()
@@ -71,8 +112,8 @@ pub fn read_pick(text: &str, all: &[Opt]) -> Option<ModelPick> {
         .map(str::to_string);
     let name = match &opt.act {
         // 名字会被 dco 当成要点的字：禁点词、太长、带控制 / 看不见字符的一律当卡住
-        // （循环里还会按平台再查一次发布词和平台禁点词）。
-        Act::TapIcon { .. } => Some(given.filter(|n| icon_name_shape(n).is_ok())?),
+        // （循环里还会再查一次发布词和档案的禁点词）。
+        Act::TapIcon { .. } => Some(given.filter(|n| icon_name_shape(n, never).is_ok())?),
         _ => None, // 只有没字图标才收名字
     };
     Some(ModelPick {
@@ -85,7 +126,7 @@ impl Model for LlmModel {
     fn pick(&self, state: &str, all: &[Opt], _picture_png: Option<&str>) -> Option<ModelPick> {
         let p = prompt_for_pick(state, all);
         let text = complete_with_timeout(self.backend.clone(), p, self.timeout).ok()?;
-        read_pick(&text, all)
+        read_pick(&text, all, &self.never)
     }
 }
 
@@ -273,8 +314,18 @@ mod tests {
             "a name that is far too long to be the label of any icon at all",
         ] {
             let reply = serde_json::json!({"key": "e5", "name": name}).to_string();
-            assert!(read_pick(&reply, &opts()).is_none(), "{name:?}");
+            let never = ["follow".to_string(), "boost".to_string()];
+            assert!(read_pick(&reply, &opts(), &never).is_none(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn a_banned_word_only_counts_when_the_caller_hands_it_over() {
+        let reply = "{\"key\": \"e5\", \"name\": \"Follow\"}";
+        assert!(read_pick(reply, &opts(), &[]).is_some());
+        assert!(read_pick(reply, &opts(), &["follow".to_string()]).is_none());
+        let m = model(reply).with_never(vec!["follow".to_string()]);
+        assert!(m.pick("s", &opts(), None).is_none());
     }
 
     #[test]

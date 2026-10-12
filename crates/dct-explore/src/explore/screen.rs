@@ -3,10 +3,10 @@
 use super::raw::Raw;
 pub(crate) use super::scrub::Scrub;
 use super::ExploreInput;
+use crate::app_profile::AppProfile;
 use crate::gate::{fold, Halt};
 use crate::hands::{El, Hands, Look};
 use crate::options::{all_options, Act, Goal, Opt, Progress};
-use crate::platform::Platform;
 use std::collections::{BTreeMap, HashMap};
 
 /// 参数值第一行，fold 后按空白切词；≥ 80% 的词出现在本画面所有元素字的 fold 拼接里
@@ -92,7 +92,7 @@ impl Screen {
     }
 
     /// 点过发布（或确认）以后落到这个新画面：停下 / 发出去了 / 还在等确认。
-    pub(super) fn landed(&self, scrub: &Scrub, p: &Platform) -> Landed {
+    pub(super) fn landed(&self, scrub: &Scrub, p: &AppProfile) -> Landed {
         if let Some(why) = self.halt(scrub) {
             Landed::Halt(why)
         } else if self.raw.shows_publish_done(p) || !self.raw.has_publish_button(p) {

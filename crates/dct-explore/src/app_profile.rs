@@ -2,7 +2,7 @@
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Platform {
+pub struct AppProfile {
     /// 小写短名，同 dcv check_platform：x、tiktok
     pub name: String,
     /// 写死的主机名
@@ -31,17 +31,17 @@ pub struct Platform {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
-    pub rows: Vec<Platform>,
+    pub rows: Vec<AppProfile>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default)]
-    platform: Vec<Platform>,
+    platform: Vec<AppProfile>,
 }
 
-fn parse(text: &str) -> Result<Vec<Platform>, String> {
+fn parse(text: &str) -> Result<Vec<AppProfile>, String> {
     let f: File = toml::from_str(text).map_err(|e| format!("平台表读不懂：{e}"))?;
     for p in &f.platform {
         validate(p).map_err(|e| format!("平台 `{}`：{e}", p.name))?;
@@ -67,7 +67,7 @@ impl Table {
         Ok(self)
     }
 
-    pub fn get(&self, name: &str) -> Option<&Platform> {
+    pub fn get(&self, name: &str) -> Option<&AppProfile> {
         self.rows.iter().find(|r| r.name == name)
     }
 }
@@ -89,7 +89,7 @@ fn check_name(v: &str) -> Result<(), String> {
     }
 }
 
-pub fn validate(p: &Platform) -> Result<(), String> {
+pub fn validate(p: &AppProfile) -> Result<(), String> {
     check_name(&p.name)?;
     if p.domain.is_empty() {
         return Err("`domain` 不能为空".into());

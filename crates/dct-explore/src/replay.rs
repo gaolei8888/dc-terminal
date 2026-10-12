@@ -11,13 +11,13 @@
 //! - `blocked`（档位）→ `Blocked`，转给用户。
 //! - 平台 `publish_by_user_only`：永远当预览跑（`stop_before_step` = 第一个发布那一步），结果 `Previewed`，
 //!   由用户自己点发布；找不到发布那一步 → `Stopped`，绝不跑到底。预览时 dco 若没停就跑完了 → `Stopped`（如实说）。
+use crate::app_profile::AppProfile;
 use crate::explore::raw::Raw;
 use crate::explore::screen::Scrub;
 use crate::gate::{check_icon_name, fold, tappable, Halt, IconName};
 use crate::hands::{By, El, Hands, HelpAnswer, Params, RunReply};
 use crate::ladder::{Ladder, Tries, Who};
 use crate::options::{neighbour_hint, Act, Opt};
-use crate::platform::Platform;
 use crate::trace::TraceStep;
 use serde_json::Value;
 
@@ -29,7 +29,7 @@ pub struct ReplayInput<'a> {
     pub window_id: u64,
     /// true → `stop_before_step` = 发布那一步
     pub preview: bool,
-    pub platform: &'a Platform,
+    pub platform: &'a AppProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +87,7 @@ fn step_n(i: usize, s: &Value) -> u32 {
 /// 发布那一步：**第一个** `tap_by_intent`，且 arg 整句（fold 后）等于平台发布词之一；找不到 → None。
 /// 取第一个：预览和发布要用户自己点的平台都要停在任何一下发布之前（「发布」后面再跟一个
 /// 「发布」确认时，停在后一个就等于已经点过前一个）。
-pub fn publish_step(procedure: &Value, p: &Platform) -> Option<u32> {
+pub fn publish_step(procedure: &Value, p: &AppProfile) -> Option<u32> {
     let words: Vec<String> = p.publish_words.iter().map(|w| fold(w)).collect();
     steps_of(procedure)
         .iter()
@@ -161,7 +161,7 @@ fn text_of(e: &El, all: &[El]) -> (String, Act) {
 
 /// 选项：求助里每个能点的元素 + not_there + stuck。返回 (给 Jeff 的前 20 个, 全部)。
 /// 超过 20 个时，字和 dco 要找的意图对得上的元素排在前面。
-fn options(els: &[El], intent: &str, p: &Platform) -> (Vec<Opt>, Vec<Opt>) {
+fn options(els: &[El], intent: &str, p: &AppProfile) -> (Vec<Opt>, Vec<Opt>) {
     let fi = fold(intent);
     let mut els: Vec<&El> = els
         .iter()

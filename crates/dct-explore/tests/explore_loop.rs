@@ -2,11 +2,11 @@
 //!
 //! 脚本约定：每次要问大模型或用户时，循环会多看一次（`look marks=true`）拿编号图；
 //! 要问用户「发不发」而编号图还没拿过时也会多看一次。脚本里这些都标了「编号图」。
+use dct_explore::app_profile::Table;
 use dct_explore::explore::{explore, explore_from, Clock, Confirm, ExploreInput, Outcome};
 use dct_explore::gate::{Budget, Halt};
 use dct_explore::hands::*;
 use dct_explore::ladder::*;
-use dct_explore::platform::Table;
 use dct_explore::testing::FakeHands;
 
 struct NoJeff;
@@ -127,7 +127,7 @@ fn needs_help(id: &str, intent: &str, els: Vec<El>) -> RunReply {
     }
 }
 fn input_for(t: &Table, name: &str, d: &std::path::Path) -> ExploreInput<'static> {
-    let p: &'static dct_explore::platform::Platform =
+    let p: &'static dct_explore::app_profile::AppProfile =
         Box::leak(Box::new(t.get(name).unwrap().clone()));
     ExploreInput {
         platform: p,
@@ -2193,8 +2193,8 @@ fn a_private_screen_on_open_url_cancels_the_parked_run() {
 fn platform_like(
     t: &Table,
     name: &str,
-    edit: impl FnOnce(&mut dct_explore::platform::Platform),
-) -> &'static dct_explore::platform::Platform {
+    edit: impl FnOnce(&mut dct_explore::app_profile::AppProfile),
+) -> &'static dct_explore::app_profile::AppProfile {
     let mut p = t.get(name).unwrap().clone();
     edit(&mut p);
     Box::leak(Box::new(p))
@@ -2203,7 +2203,7 @@ fn platform_like(
 fn two_stage_input(
     t: &Table,
     d: &std::path::Path,
-    p: &'static dct_explore::platform::Platform,
+    p: &'static dct_explore::app_profile::AppProfile,
 ) -> ExploreInput<'static> {
     let mut inp = input_for(t, "x", d);
     inp.platform = p;
@@ -2212,7 +2212,7 @@ fn two_stage_input(
 
 fn draft_of(
     tr: &dct_explore::trace::Trace,
-    p: &dct_explore::platform::Platform,
+    p: &dct_explore::app_profile::AppProfile,
 ) -> dct_explore::draft::ProcedureDraft {
     dct_explore::draft::draft(tr, p, &["Cancel".into(), "取消".into()], &[])
         .unwrap()

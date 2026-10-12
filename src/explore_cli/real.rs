@@ -22,11 +22,8 @@ mod unix {
     use crate::explore_cli::*;
     use crate::explore_model::{LlmModel, DEFAULT_TIMEOUT};
     use crate::procedures::{Approvals, RealDcv};
+    use dct_explore::app_profile::Table;
     use dct_explore::ladder::NoModel;
-    use dct_explore::platform::Table;
-
-    /// 没配 `[judge]` 时的门槛（和 `[judge] threshold` 的默认值一样）；没有 Jeff 时其实用不到。
-    const DEFAULT_THRESHOLD: f64 = 0.8;
 
     struct SystemClock;
     impl Clock for SystemClock {
@@ -56,30 +53,7 @@ mod unix {
         say: &RefCell<dyn Say + '_>,
     ) -> Option<Arc<dyn crate::llm::Backend>> {
         let llm = cfg.llm.as_ref()?;
-        let secrets =
-            crate::secrets::SecretStore::load(&crate::secrets::secrets_path_for_socket(socket));
-        let (custom, _) =
-            crate::profile::all_profiles(&crate::profile::profiles_dir_for_socket(socket));
-        let lookup = |n: &str| {
-            custom
-                .iter()
-                .find(|p| p.name == n)
-                .cloned()
-                .or_else(|| crate::profile::Profile::builtin(n))
-        };
-        // 同 cli.rs::oauth_lookup：一个 CLI 的登录态只给它自己家的端点用（resolve 再按主机核一次）。
-        let oauth = |n: &str| {
-            use crate::llm::creds::{BorrowedFrom, Credential};
-            match n {
-                "claude" => crate::llm::creds::read_claude_oauth()
-                    .map(|t| (BorrowedFrom::ClaudeCli, Credential::Bearer(t))),
-                "codex" => {
-                    crate::llm::creds::read_codex_auth().map(|c| (BorrowedFrom::CodexCli, c))
-                }
-                _ => None,
-            }
-        };
-        match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
+        match crate::explore_model::backend_from_config(llm, socket) {
             Ok(b) => Some(b),
             Err(e) => {
                 say.borrow_mut().tell(
@@ -169,7 +143,8 @@ mod unix {
             },
             None => (Box::new(NoJeff), DEFAULT_THRESHOLD),
         };
-        let llm_model = llm(&cfg, &socket, say).map(|b| LlmModel::new(b, DEFAULT_TIMEOUT));
+        let llm_model = llm(&cfg, &socket, say)
+            .map(|b| LlmModel::new(b, DEFAULT_TIMEOUT).with_never(p.never_tap.clone()));
         let (model, fixer): (&dyn Model, &dyn Fixer) = match &llm_model {
             Some(m) => (m, m),
             None => (&NoModel, &NoFix),

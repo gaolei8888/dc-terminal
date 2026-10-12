@@ -2,11 +2,11 @@
 use super::raw::Raw;
 use super::screen::{look_error, Scrub};
 use super::{Clock, ExploreInput};
+use crate::app_profile::AppProfile;
 use crate::gate::{check_icon_name, fold, Halt, IconName};
 use crate::hands::{By, El, Hands, Help, HelpAnswer, RunReply, StepReq};
 use crate::ladder::{Decision, Ladder, Model, ModelPick, Tries, User, UserPick, Who};
 use crate::options::{steps_for, Act, Opt};
-use crate::platform::Platform;
 use crate::trace::{append_question, grade, QuestionRow, RunOutcome, QUESTION_ROW_V};
 use std::cell::RefCell;
 
@@ -195,7 +195,7 @@ fn answer_for(
     user: &mut dyn User,
     state: &str,
     scrub: &Scrub,
-    p: &Platform,
+    p: &AppProfile,
 ) -> Result<HelpAnswer, String> {
     let els: Vec<El> = raw
         .shown(scrub, p)

@@ -1,7 +1,7 @@
 //! 停下的规矩：登录 / 验证码 / 账号警告画面、禁点按钮、步数 / 时间 / 没变化上限。
 //! 全是代码，探索循环在问任何模型之前先过这里。词表命中一律「宁可多停」。
+use crate::app_profile::AppProfile;
 use crate::hands::El;
-use crate::platform::Platform;
 use dct_brain::tier::{tier_for_label, Tier};
 
 /// 带上命中的那行字，给用户看。
@@ -62,25 +62,11 @@ const WARNING: &[&str] = &[
     "account disabled",
     "账号被封",
 ];
-/// 通用禁点词；平台自己的在 `Platform::never_tap`。
-const NEVER: &[&str] = &[
-    "follow",
-    "subscribe",
-    "boost",
-    "promote",
-    "关注",
-    "订阅",
-    "推广",
-    "付费",
-    "get verified",
-    "premium",
-    "upgrade",
-    "升级",
-    // brief 的测试要求「Delete」也拦，但 dct-brain 把单独的「删除」算 Content（不到 Critical），
-    // 所以不可撤回的删除在这里补进禁点词。
-    "delete",
-    "删除",
-];
+/// 不看档案的通用禁点词：不可撤回的删除。
+/// brief 的测试要求「Delete」也拦，但 dct-brain 把单独的「删除」算 Content（不到 Critical），
+/// 所以这里补进禁点词。关注、订阅、推广一类跟具体应用有关的词不在代码里：
+/// 它们是每个档案自己的数据（`AppProfile::never_tap`）。
+const NEVER_ANYWHERE: &[&str] = &["delete", "删除"];
 
 /// 和 dct-brain 的档位同一套规整（全角、零宽、弯引号、汉字间空格、小写），不另写一份。
 pub(crate) fn fold(s: &str) -> String {
@@ -102,23 +88,24 @@ pub fn screen_halt(elements: &[El]) -> Option<Halt> {
         .or_else(|| first_hit(elements, WARNING).map(Halt::Warning))
 }
 
-/// 这个元素能不能进选项：禁点词（通用 + 平台）、tier >= Critical 一律不行。
-pub fn tappable(label: &str, p: &Platform) -> bool {
+/// `label` 里有 `words` 中的任一项（两边都先规整；空词不算）。
+fn hits_never(label: &str, words: &[String]) -> bool {
     let f = fold(label);
-    if p.never_tap
+    words
         .iter()
         .map(|w| fold(w))
         .any(|w| !w.is_empty() && f.contains(&w))
-    {
-        return false;
-    }
-    tappable_anywhere(label)
 }
 
-/// 不看平台的那一半：通用禁点词、tier >= Critical。
-fn tappable_anywhere(label: &str) -> bool {
+/// 这个元素能不能进选项：档案自己的禁点词、通用禁点词、tier >= Critical 一律不行。
+pub fn tappable(label: &str, p: &AppProfile) -> bool {
+    !hits_never(label, &p.never_tap) && tappable_with(label, &[])
+}
+
+/// 通用那一半，再加调用方给的禁点词（不认识档案的一侧——比如模型回复的读取——只拿到词，不拿档案）。
+fn tappable_with(label: &str, never: &[String]) -> bool {
     let f = fold(label);
-    if NEVER.iter().any(|w| f.contains(w)) {
+    if NEVER_ANYWHERE.iter().any(|w| f.contains(w)) || hits_never(label, never) {
         return false;
     }
     tier_for_label(label) < Tier::Critical
@@ -134,8 +121,9 @@ fn name_char_ok(c: char) -> bool {
 }
 
 /// 名字的样子：不空、不太长、只有正常的字，而且不是通用禁点词 / 关键档位。
-/// 大模型的回答在读进来时就先过这一道（还不知道平台）；`check_icon_name` 在这之上再看平台。
-pub fn icon_name_shape(name: &str) -> Result<(), String> {
+/// 大模型的回答在读进来时就先过这一道：调用方把档案的禁点词当一串字给进来，
+/// 这里不认识档案本身；`check_icon_name` 在这之上再看发布词。
+pub fn icon_name_shape(name: &str, never: &[String]) -> Result<(), String> {
     let n = name.trim();
     if n.is_empty() {
         return Err("名字是空的".into());
@@ -146,8 +134,8 @@ pub fn icon_name_shape(name: &str) -> Result<(), String> {
     if !n.chars().all(name_char_ok) {
         return Err("名字里有控制字符或看不见的字符".into());
     }
-    if !tappable_anywhere(n) {
-        return Err("名字是不能点的按钮（关注、推广、付费、删除一类）".into());
+    if !tappable_with(n, never) {
+        return Err("名字是不能点的按钮（禁点词、删除、付费一类）".into());
     }
     Ok(())
 }
@@ -171,8 +159,8 @@ fn contains_word(hay: &str, w: &str) -> bool {
 /// 大模型或用户给没字图标起的名字。dco 会按这个名字去点画面上的字，所以名字和画面上的字
 /// 守同样的规矩：禁点词（通用 + 平台）、档位、长度和字符不合格的拒；含平台发布词的当发布
 /// （先问用户；发布要用户自己点的平台交给用户）。
-pub fn check_icon_name(name: &str, p: &Platform) -> IconName {
-    if let Err(why) = icon_name_shape(name) {
+pub fn check_icon_name(name: &str, p: &AppProfile) -> IconName {
+    if let Err(why) = icon_name_shape(name, &p.never_tap) {
         return IconName::Refused(why);
     }
     if !tappable(name, p) {
@@ -256,8 +244,8 @@ impl Meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_profile::Table;
     use crate::hands::{El, Frac};
-    use crate::platform::Table;
 
     fn el(t: &str) -> El {
         El {
@@ -374,6 +362,74 @@ mod tests {
         assert!(!tappable("Delete", x), "不可撤回的也拦");
     }
 
+    /// 拆出去以前写死在 gate.rs 里的那批词。现在是每个档案自己的数据，
+    /// 内置档案要逐行带着它们，行为才和以前一样。
+    const FORMER_BUILTIN_NEVER: [&str; 12] = [
+        "follow",
+        "subscribe",
+        "boost",
+        "promote",
+        "关注",
+        "订阅",
+        "推广",
+        "付费",
+        "get verified",
+        "premium",
+        "upgrade",
+        "升级",
+    ];
+
+    #[test]
+    fn every_builtin_profile_still_blocks_the_former_builtin_never_words() {
+        let t = Table::seed();
+        for p in &t.rows {
+            for w in FORMER_BUILTIN_NEVER {
+                assert!(!tappable(w, p), "{}：{w}", p.name);
+                assert!(!tappable(&w.to_uppercase(), p), "{}：{w} 大写", p.name);
+                assert!(
+                    !tappable(&format!("  {w} now"), p),
+                    "{}：{w} 夹在话里",
+                    p.name
+                );
+                assert!(
+                    matches!(check_icon_name(w, p), IconName::Refused(_)),
+                    "{}：图标名 {w}",
+                    p.name
+                );
+            }
+        }
+    }
+
+    fn bare_profile() -> crate::app_profile::AppProfile {
+        let t = Table::seed()
+            .with_override(
+                "[[platform]]\nname = \"bare\"\ndomain = \"b.example\"\nentry_url = \"https://b.example/\"\nbrowser = \"b\"\nvault = \"v\"\npublish_words = [\"Go\"]\nnever_tap = []\n",
+            )
+            .unwrap();
+        t.get("bare").unwrap().clone()
+    }
+
+    #[test]
+    fn a_profile_with_no_never_words_blocks_nothing_beyond_the_generic_rules() {
+        let b = bare_profile();
+        // 档案没写词，gate 自己就不拦：剩下被拦的只是 dct-brain 的档位认得的（动钱的）。
+        for w in FORMER_BUILTIN_NEVER {
+            assert_eq!(
+                tappable(w, &b),
+                tier_for_label(w) < Tier::Critical,
+                "{w}：除了档位，没写禁点词的档案不该多拦"
+            );
+        }
+        for w in ["follow", "boost", "promote", "关注", "推广", "get verified"] {
+            assert!(tappable(w, &b), "{w}");
+            assert_eq!(check_icon_name(w, &b), IconName::Ok, "{w}");
+        }
+        // 通用的两条仍在：不可撤回的删除、dct-brain 的档位。
+        assert!(!tappable("Delete", &b));
+        assert!(!tappable("删除", &b));
+        assert!(!tappable("Pay $8", &b));
+    }
+
     #[test]
     fn platform_never_tap_is_enforced_on_its_own() {
         let t = Table::seed()
@@ -458,7 +514,12 @@ mod tests {
                 "{bad:?}"
             );
         }
-        assert!(icon_name_shape(&"字".repeat(40)).is_ok());
-        assert!(icon_name_shape("Boost").is_err(), "通用禁点词不看平台");
+        assert!(icon_name_shape(&"字".repeat(40), &[]).is_ok());
+        assert!(
+            icon_name_shape("Delete", &[]).is_err(),
+            "通用禁点词不看档案"
+        );
+        assert!(icon_name_shape("Boost", &[]).is_ok(), "没给词就不拦");
+        assert!(icon_name_shape("Boost", &["boost".to_string()]).is_err());
     }
 }

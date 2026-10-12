@@ -192,9 +192,19 @@ pub struct QuestionRow<'a> {
     pub label: bool,
 }
 
+/// 标签规矩里「谁的、结局如何才算」那一半，只此一处：用户的答案永远算；大模型的只有 `Good` 才算；
+/// Jeff 的永远不算（拿自己的答案练自己）。`grade` 和外面直接给了结局的记录（`dct train record`）都走它。
+pub fn label_for(by: Who, outcome: StepOutcome) -> bool {
+    match by {
+        Who::User => true,
+        Who::Model => outcome == StepOutcome::Good,
+        Who::Jeff => false,
+    }
+}
+
 /// 标签规矩。`step_ok`：这道题的步骤在最终轨迹里的 `ok`（`done` 那道题为 None）；
 /// `moved`：照做后 dco 回 done、而且到了这次运行没见过的新画面。
-/// 用户的答案永远算；大模型的只有 `Good` 才算；Jeff 的永远不算（拿自己的答案练自己）。
+/// 谁的答案算标签见 `label_for`。
 pub fn grade(by: Who, step_ok: Option<bool>, moved: bool, run: RunOutcome) -> (StepOutcome, bool) {
     let outcome = if !moved || step_ok == Some(false) {
         StepOutcome::Bad
@@ -203,11 +213,7 @@ pub fn grade(by: Who, step_ok: Option<bool>, moved: bool, run: RunOutcome) -> (S
     } else {
         StepOutcome::Unknown
     };
-    let label = match by {
-        Who::User => true,
-        Who::Model => outcome == StepOutcome::Good,
-        Who::Jeff => false,
-    };
+    let label = label_for(by, outcome);
     (outcome, label)
 }
 
@@ -451,5 +457,30 @@ mod tests {
             outcome: None,
         };
         assert!(save(d.path(), &t).is_err());
+    }
+
+    #[test]
+    fn label_for_is_the_one_place_that_decides_who_counts() {
+        use StepOutcome::*;
+        for o in [Good, Bad, Unknown] {
+            assert!(label_for(Who::User, o), "用户的答案永远算：{o:?}");
+            assert!(!label_for(Who::Jeff, o), "Jeff 的永远不算：{o:?}");
+            assert_eq!(label_for(Who::Model, o), o == Good, "{o:?}");
+        }
+    }
+
+    #[test]
+    fn grade_agrees_with_label_for() {
+        for by in [Who::User, Who::Model, Who::Jeff] {
+            for (ok, moved, run) in [
+                (Some(true), true, RunOutcome::Published),
+                (Some(false), true, RunOutcome::Published),
+                (None, false, RunOutcome::Published),
+                (Some(true), true, RunOutcome::Stopped),
+            ] {
+                let (o, l) = grade(by, ok, moved, run);
+                assert_eq!(l, label_for(by, o));
+            }
+        }
     }
 }

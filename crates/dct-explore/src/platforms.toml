@@ -13,7 +13,7 @@ vault = "social-global"
 login_gate = "What's happening?"
 publish_words = ["Post"]
 publish_done = "Your post was sent"
-never_tap = ["Subscribe", "Get verified", "Premium", "Follow", "Boost"]
+never_tap = ["Subscribe", "Get verified", "Premium", "Follow", "Boost", "promote", "关注", "订阅", "推广", "付费", "upgrade", "升级"]
 unverified = ["login_gate", "publish_done"]
 
 [[platform]]
@@ -24,7 +24,7 @@ browser = "Google Chrome"
 vault = "social-global"
 login_gate = "Select video"
 publish_words = ["Post", "Post now"]
-never_tap = ["Promote", "Follow", "Boost"]
+never_tap = ["Promote", "Follow", "Boost", "subscribe", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
 unverified = ["login_gate", "publish_done"]
 
 [[platform]]
@@ -35,7 +35,7 @@ browser = "Google Chrome"
 vault = "social-global"
 login_gate = "Select files"
 publish_words = ["Publish", "Save"]
-never_tap = ["Subscribe", "Promote", "Join"]
+never_tap = ["Subscribe", "Promote", "Join", "follow", "boost", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
 unverified = ["publish_done"]
 
 [[platform]]
@@ -45,7 +45,7 @@ entry_url = "https://www.facebook.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["Post"]
-never_tap = ["Boost post", "Boost", "Follow", "Promote"]
+never_tap = ["Boost post", "Boost", "Follow", "Promote", "subscribe", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_done"]
 
 [[platform]]
@@ -55,7 +55,7 @@ entry_url = "https://www.instagram.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["Share"]
-never_tap = ["Boost post", "Boost", "Follow"]
+never_tap = ["Boost post", "Boost", "Follow", "subscribe", "promote", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_done"]
 
 [[platform]]
@@ -65,7 +65,7 @@ entry_url = "https://creator.xiaohongshu.com/publish/publish"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "薯条", "推广", "加热"]
+never_tap = ["关注", "薯条", "推广", "加热", "follow", "subscribe", "boost", "promote", "订阅", "付费", "get verified", "premium", "upgrade", "升级"]
 login_qr = true
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
 
@@ -77,7 +77,7 @@ entry_url = "https://weibo.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 login_qr = true
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
@@ -89,7 +89,7 @@ entry_url = "https://member.bilibili.com/platform/upload/video/frame"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 login_qr = true
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
@@ -101,7 +101,7 @@ entry_url = "https://www.zhihu.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 知乎专栏文章（一个域名一行，所以和想法分开）
@@ -112,7 +112,7 @@ entry_url = "https://zhuanlan.zhihu.com/write"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 抖音创作者；登录常是手机扫码
@@ -123,7 +123,7 @@ entry_url = "https://creator.douyin.com/creator-micro/content/upload"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 login_qr = true
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
@@ -135,7 +135,7 @@ entry_url = "https://cp.kuaishou.com/article/publish/video"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 视频号；登录常是手机扫码
@@ -146,7 +146,7 @@ entry_url = "https://channels.weixin.qq.com/platform/post/create"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 login_qr = true
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
@@ -158,7 +158,7 @@ entry_url = "https://mp.toutiao.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
 
 # 公众号；登录扫码；推广设计第 3 批说编辑器难驱动，最后发布由用户点（未在本机核实）
@@ -169,7 +169,7 @@ entry_url = "https://mp.weixin.qq.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 login_qr = true
 publish_by_user_only = true
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
@@ -182,5 +182,5 @@ entry_url = "https://baijiahao.baidu.com/"
 browser = "Google Chrome"
 vault = "social-global"
 publish_words = ["发布"]
-never_tap = ["关注", "推广", "付费"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
 unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]

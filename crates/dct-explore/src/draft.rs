@@ -1,7 +1,7 @@
 //! 轨迹 → dcv 流程正文（和弹窗规则草稿）。纯代码照抄，不经模型。
 //! 正文格式照 dc-vault 的解析器：`N. 动作: 内容`，完成标志行缩进 3 个空格。
+use crate::app_profile::AppProfile;
 use crate::gate::fold;
-use crate::platform::Platform;
 use crate::trace::{Trace, TraceStep};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,12 +68,12 @@ fn is_dismiss(arg: &str, dismiss: &[String]) -> bool {
 
 /// 名字里用的平台名：dcv 的名字只收小写字母、数字和 `-`（dc-vault note.rs `is_slug`），
 /// 平台名里的 `_` 换成 `-`（`--platform` 和弹窗的「应用」照旧用平台名本身）。
-fn name_part(p: &Platform) -> String {
+fn name_part(p: &AppProfile) -> String {
     p.name.replace('_', "-")
 }
 
 /// 流程名 `promote-<平台>-<post|video>`（重放时按这个名字找，写草稿也用它）。
-pub fn procedure_name(p: &Platform, video: bool) -> String {
+pub fn procedure_name(p: &AppProfile, video: bool) -> String {
     let kind = if video { "video" } else { "post" };
     format!("promote-{}-{kind}", name_part(p))
 }
@@ -90,7 +90,7 @@ fn marker_ok(s: &str) -> bool {
 
 pub fn draft(
     t: &Trace,
-    p: &Platform,
+    p: &AppProfile,
     dismiss: &[String],
     file_params: &[String],
 ) -> Result<(ProcedureDraft, Vec<PopupDraft>), DraftError> {
@@ -291,8 +291,8 @@ pub fn draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_profile::Table;
     use crate::ladder::Who;
-    use crate::platform::Table;
     use crate::trace::{Trace, TraceStep};
 
     fn s(action: &str, arg: &str, publish: bool, vanished: &[&str]) -> TraceStep {

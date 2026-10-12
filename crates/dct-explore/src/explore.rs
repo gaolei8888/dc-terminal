@@ -52,11 +52,11 @@ mod run;
 pub(crate) mod screen;
 mod scrub;
 
+use crate::app_profile::AppProfile;
 use crate::gate::{check_icon_name, fold, Budget, Halt, IconName, Over};
 use crate::hands::{Hands, Params, StepReq};
 use crate::ladder::{Decision, Ladder, Who};
 use crate::options::{shortlist, state_text, Act, Goal, Opt};
-use crate::platform::Platform;
 use crate::trace::{RunOutcome, Trace, TraceStep};
 use act::{pending_row, write_rows, PendingRow};
 use run::{advance, new_run, plain_step, record};
@@ -64,7 +64,7 @@ pub use screen::values_on_screen;
 use screen::{look_error, see, Landed, Scrub};
 
 pub struct ExploreInput<'a> {
-    pub platform: &'a Platform,
+    pub platform: &'a AppProfile,
     pub goal_text: &'a str,
     /// 本次的值（只在内存里）
     pub params: Params,

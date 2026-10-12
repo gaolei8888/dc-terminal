@@ -1,3 +1,4 @@
+pub mod answer;
 pub mod bridge;
 pub mod campaign;
 pub mod channel;
@@ -38,6 +39,7 @@ pub mod settings;
 pub mod student_projects;
 pub mod sys;
 pub mod theme;
+pub mod train_record;
 pub mod ui;
 pub mod verify;
 pub mod web;

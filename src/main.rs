@@ -28,6 +28,12 @@ dct —— vibe coding 终端
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct judge [文件] 给一道选择题（Jev 格式，文件或标准输入），输出每个选项的概率；
                    要先在 config.toml 写 [judge]。加 --probe 用固定题试后端通不通
+  dct answer --json 从标准输入读一道选择题（JSON：state、options、可选 allow / forbid / picture），
+                   按 Jeff → 大模型 逐级答，写一行 JSON；要问用户时不弹，回 by=none、reason=needs_user。
+                   用现有的 [judge] / [llm] 配置
+  dct train record --json
+                   从标准输入读一道别处答过的题（JSON），记成一行 v2 训练题到 ~/.dct/explore/answers.jsonl，
+                   回 {\"recorded\":true,\"label\":…}
   dct campaign approve <名字> --param <平台>.<参数>=<值> ...
                    一个活动要发的文字，各平台一次批准（要在终端里本人点头）；
                    各平台文字和开头句不能相同。批过的存 ~/.dct/campaigns/
@@ -139,6 +145,8 @@ fn main() -> Result<()> {
         // 玩三消游戏：连的是本机的 dco，不经守护进程。
         Some("game") => std::process::exit(dct::game::cli::run(&args[1..])),
         Some("judge") => std::process::exit(dct::judge::run_cli(&args[1..])),
+        Some("answer") => std::process::exit(dct::answer::run_cli(&args[1..])),
+        Some("train") => std::process::exit(dct::train_record::run_cli(&args[1..])),
         Some("campaign") => std::process::exit(dct::campaign::run_cli(&args[1..])),
         Some("do") => std::process::exit(dct::explore_cli::run(&args[1..])),
         Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),

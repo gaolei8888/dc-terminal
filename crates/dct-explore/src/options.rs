@@ -1,8 +1,8 @@
 //! 每一轮把画面变成一道选择题：能点的元素各一项 + 固定动作；每个选项对应一串封闭词表步骤。
 //! 题面里没有参数值（调用方在 look 进来前已把值换成 `{名字}`）。
+use crate::app_profile::AppProfile;
 use crate::gate::{fold, tappable};
 use crate::hands::{El, Look, StepReq};
-use crate::platform::Platform;
 use crate::JevChoice;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +46,7 @@ pub struct Opt {
 pub struct Goal<'a> {
     /// 用户的目标（「把这段文字发到 X」），已脱敏
     pub text: &'a str,
-    pub platform: &'a Platform,
+    pub platform: &'a AppProfile,
     /// post_text、title…
     pub text_params: &'a [String],
     /// video、image…
@@ -410,8 +410,8 @@ pub fn steps_for(o: &Opt) -> Vec<StepReq> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_profile::Table;
     use crate::hands::{El, Frac, Look};
-    use crate::platform::Table;
 
     fn el(id: &str, t: &str, role: &str, x: f64, y: f64) -> El {
         El {

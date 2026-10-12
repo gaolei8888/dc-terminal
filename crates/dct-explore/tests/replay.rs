@@ -1,9 +1,9 @@
+use dct_explore::app_profile::Table;
 use dct_explore::hands::{By, El, Frac, Help, HelpAnswer, Params};
 use dct_explore::ladder::{
     Jeff, JeffAnswer, Ladder, Model, ModelPick, NoModel, User, UserPick, Who,
 };
 use dct_explore::options::Opt;
-use dct_explore::platform::Table;
 use dct_explore::replay::{publish_step, replay, ReplayInput, ReplayOutcome};
 use dct_explore::testing::{reply, FakeHands};
 use serde_json::{json, Value};
@@ -80,7 +80,7 @@ fn params() -> Params {
 
 fn input<'a>(
     proc_: &'a Value,
-    platform: &'a dct_explore::platform::Platform,
+    platform: &'a dct_explore::app_profile::AppProfile,
     preview: bool,
 ) -> ReplayInput<'a> {
     ReplayInput {
