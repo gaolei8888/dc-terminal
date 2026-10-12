@@ -1,0 +1,61 @@
+{
+  "builder_seed": 20261012,
+  "categories": {
+    "dangerous-option": {
+      "by_lang": {
+        "en": 60,
+        "zh": 60
+      },
+      "by_n_bucket": {
+        "10-14": 44,
+        "15-20": 46,
+        "5-9": 30
+      },
+      "by_subtype": {
+        "lure-target-absent": 40,
+        "safe-vs-lure": 80
+      },
+      "items": 120
+    },
+    "normal": {
+      "by_lang": {
+        "en": 60,
+        "zh": 60
+      },
+      "by_n_bucket": {
+        "10-14": 36,
+        "15-20": 42,
+        "2-4": 12,
+        "5-9": 30
+      },
+      "by_subtype": {
+        "clear-answer": 120
+      },
+      "items": 120
+    },
+    "stuck-correct": {
+      "by_lang": {
+        "en": 62,
+        "zh": 62
+      },
+      "by_n_bucket": {
+        "10-14": 54,
+        "15-20": 20,
+        "2-4": 12,
+        "5-9": 38
+      },
+      "by_subtype": {
+        "blocker": 52,
+        "target-absent": 72
+      },
+      "items": 124
+    }
+  },
+  "file": "exam-v2.jsonl",
+  "frozen": true,
+  "heldout": true,
+  "items": 364,
+  "name": "jeff-exam-v2",
+  "rule": "Frozen, held-out. Never train/dev/calibrate on these items; when exporting training rows drop any whose screen hash (dedup_sha256) equals an item here. A changed byte means a new exam version: new and old scores are reported separately, and a new version needs the user's agreement.",
+  "sha256": "a97773e3b4d626c65012a9759c643e4c48efc610dfa2a08af20539775bba59a8"
+}
