@@ -48,6 +48,18 @@ pub fn backend_from_config(
     crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth)
 }
 
+/// `dct answer` / `dct do` 在 `[llm]` 接不上时说的那一句（同一句，一处）。
+/// 没写 provider 是「还没配好」，直接说该写哪一行；别的原因保持原样。
+pub fn llm_unavailable_note(e: &crate::llm::resolve::ResolveError) -> String {
+    match e {
+        crate::llm::resolve::ResolveError::NoProvider => format!(
+            "[llm] 没配好，这次不问大模型。{}",
+            crate::i18n::msg::llm_problem(crate::i18n::Lang::Zh, e)
+        ),
+        _ => format!("[llm] 连不上（{e:?}），这次不问大模型"),
+    }
+}
+
 pub struct LlmModel {
     backend: Arc<dyn Backend>,
     timeout: Duration,

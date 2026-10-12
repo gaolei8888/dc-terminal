@@ -71,7 +71,11 @@ fn a_full_pairing_writes_both_secrets_and_both_model_names() {
     let cfg_raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
     let cfg = dct::config::Config::from_toml(&cfg_raw).unwrap();
     let llm = cfg.llm.expect("勾了 opt_in_llm，[llm] 应该被写出来");
-    assert_eq!(llm.provider, "qwen", "免费账号只有 openai 那一路能用来自举");
+    assert_eq!(
+        llm.provider.as_deref(),
+        Some("qwen"),
+        "免费账号只有 openai 那一路能用来自举"
+    );
     assert_eq!(llm.model.as_deref(), Some("qwen3.5:35b"));
 }
 

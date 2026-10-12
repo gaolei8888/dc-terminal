@@ -299,3 +299,94 @@ fn a_broken_config_file_is_exit_one_not_a_silent_skip() {
     assert_eq!(o.code, Some(1));
     assert!(o.stdout.is_empty());
 }
+
+/// 放一个假 `claude` 在 PATH 最前面：被执行就在记号文件里留一行。
+/// 用来证明「没写 provider」时 dct 绝不会去拉起一个 `claude` 进程。
+#[cfg(unix)]
+fn fake_claude_on_path(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let marker = home.join("claude-spawned");
+    let script = bin.join("claude");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\necho spawned >> '{}'\necho '{{\"key\":\"b\"}}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, marker)
+}
+
+#[cfg(unix)]
+fn answer_with_path(home: &Path, bin: &Path, stdin: &str) -> Out {
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dct"))
+        .args(["answer", "--json"])
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+    let o = child.wait_with_output().unwrap();
+    Out {
+        code: o.status.code(),
+        stdout: String::from_utf8_lossy(&o.stdout).into(),
+        stderr: String::from_utf8_lossy(&o.stderr).into(),
+    }
+}
+
+/// `[llm]` 没写 provider：大模型这一级是「没配」——不拉起 `claude`，
+/// 不影响别的（退回用户），并且 stderr 上有一句能照着做的提示。
+#[cfg(unix)]
+#[test]
+fn an_llm_section_without_a_provider_never_spawns_claude_and_says_what_to_write() {
+    let home = tempfile::tempdir().unwrap();
+    let (bin, marker) = fake_claude_on_path(home.path());
+    let (url, hits) = fake_jeff("a", 0.55);
+    write_config(
+        home.path(),
+        &format!("[judge]\nbase_url = \"{url}\"\n[llm]\n"),
+    );
+    let o = answer_with_path(home.path(), &bin, REQ);
+    assert_eq!(o.code, Some(0), "{}", o.stderr);
+    let v = json(&o);
+    assert_eq!(v["reason"], "needs_user");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "Jeff 照常被问");
+    assert_eq!(llm_calls(&marker), 0, "没写 provider，绝不能拉起 claude");
+    assert!(
+        o.stderr.contains("provider = \""),
+        "要告诉用户写哪一行：{}",
+        o.stderr
+    );
+}
+
+/// 对照：显式写 `provider = "claude"` 跟以前完全一样——真的去叫 `claude`。
+#[cfg(unix)]
+#[test]
+fn an_explicit_claude_provider_still_spawns_claude() {
+    let home = tempfile::tempdir().unwrap();
+    let (bin, marker) = fake_claude_on_path(home.path());
+    let (url, _hits) = fake_jeff("a", 0.55);
+    write_config(
+        home.path(),
+        &format!(
+            "[judge]\nbase_url = \"{url}\"\n[llm]\nprovider = \"claude\"\ntransport = \"cli\"\n"
+        ),
+    );
+    let o = answer_with_path(home.path(), &bin, REQ);
+    assert_eq!(o.code, Some(0), "{}", o.stderr);
+    let v = json(&o);
+    assert_eq!(
+        (v["key"].as_str(), v["by"].as_str()),
+        (Some("b"), Some("model"))
+    );
+    assert_eq!(llm_calls(&marker), 1);
+}

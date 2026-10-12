@@ -613,6 +613,30 @@ profile 就跳过；万一一个都对不上，回到完整清单，而不是给
 出现的地方。DC 的配对屏会提出帮你加上这一段，是一个勾好的框，按 `l` 取消；它只往你的
 `config.toml` 后面追加、不重写，已经有 `[llm]` 的话就不动。
 
+`[llm]` 必须写明用哪个后端：**`provider` 没有默认值**，dct 不会替你挑一家厂商。不写的话
+功能保持关着，只会给你一句该加什么的提示。`provider` 是一个 profile 的名字（内置的，或你
+自己放在 `~/.dct/profiles/` 里的）。`transport = "cli"`（默认）会跑那个 profile 自己的无界面
+命令。想接任何 OpenAI 兼容的服务，写一个带 `[api]` 段的 profile（这里是
+`~/.dct/profiles/gateway.toml`）再直连。下面的地址只是示例，不是真实端点：
+
+```toml
+# ~/.dct/profiles/gateway.toml
+name    = "gateway"
+command = ["true"]                     # 不是交互式 agent，只用到 [api]
+[api]
+base_url = "http://127.0.0.1:11435"
+wire     = "openai"                    # "openai" = /v1/chat/completions
+```
+
+```toml
+# ~/.dct/config.toml
+[llm]
+provider  = "gateway"                  # 上面那个 profile 的名字
+transport = "http"
+model     = "<模型名>"                 # http 必填，dct 不会替你猜
+# base_url = "..."                     # 可选；覆盖 profile [api] 里的 base_url
+```
+
 `dct llm check` 会真的通过这条连接打一次，告诉你通不通——现在就知道，而不是等下一次出错。
 
 ---

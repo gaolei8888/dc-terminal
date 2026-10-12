@@ -542,14 +542,17 @@ pub fn llm_check(lang: Lang) -> i32 {
         return 1;
     };
 
-    println!(
-        "{}",
-        crate::i18n::msg::llm_using(
-            lang,
-            &llm.provider,
-            llm.transport == crate::config::Transport::Http
-        )
-    );
+    // 没写 provider 就没有「用的是谁」可说：直接落到下面 resolve 的 NoProvider 提示。
+    if let Some(provider) = &llm.provider {
+        println!(
+            "{}",
+            crate::i18n::msg::llm_using(
+                lang,
+                provider,
+                llm.transport == crate::config::Transport::Http
+            )
+        );
+    }
 
     let backend = match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
         Ok(b) => b,

@@ -12,9 +12,21 @@
 //! 发给第三方。文件里没有 `[llm]` 这一段（不存在、内容为空、这一段没写、
 //! 甚至整份文件解析坏了）一律落在 `None` 上——功能整个关着，`daemon.rs`
 //! 连 `resolve()` 都不会调用。用户显式写下 `[llm]`（哪怕后面什么都不填）
-//! 才算「我要开」，那一刻开始，段内每个字段该有什么默认值（`provider`
-//! 默认 `claude`、`transport` 默认 `Cli`）还是照旧——那些默认值只回答
-//! 「开了之后怎么配」，不回答「要不要开」。
+//! 才算「我要开」。**但「我要开」不等于「我选好了哪一家」**：`provider`
+//! 没有默认值（以前默认 `claude`——那是替用户挑了一家厂商）。`[llm]` 里没写
+//! `provider` 就是还没配好：解析照常成功，连接那一层报 `NoProvider`，功能关着，
+//! 界面警告栏 / `dct llm check` / `dct answer` / `dct do` 各给一句同样的提示，
+//! 教用户写 `provider = "<profile 名>"`。`transport` 默认仍是 `Cli`——它不是
+//! 厂商相关的（cli 走的是被点名那个 profile 自己的 `[headless]` 命令）。
+//!
+//! 一个不点任何厂商名的 OpenAI 兼容端点这样写（地址只是例子）：
+//! ```toml
+//! [llm]
+//! provider  = "gateway"             # ~/.dct/profiles/gateway.toml 的 name，里面有 [api] 段
+//! transport = "http"                # [api] 里写 base_url（例：http://127.0.0.1:11435）和 wire = "openai"
+//! model     = "<模型名>"            # http 必填
+//! ```
+//! 完整例子见 README；`llm::resolve` 的测试钉着这套写法能走通。
 //!
 //! **2026-09-02 起多了第二条打开它的路**：配对屏上那个勾选框
 //! （`ui::pair_view` 画它、`ui::view::LlmOptIn` 存它、`llm_optin::enable`
@@ -41,18 +53,17 @@ pub enum Transport {
     Http,
 }
 
-fn default_provider() -> String {
-    "claude".to_string()
-}
-
 fn default_transport() -> Transport {
     Transport::Cli
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
-    #[serde(default = "default_provider")]
-    pub provider: String,
+    /// 用哪个 profile 的名字（内置的或 `~/.dct/profiles/` 里自己写的）。
+    /// **没有默认值**：不写 = 没配，`resolve` 报 `ResolveError::NoProvider`，
+    /// 功能保持关着，dct 其余部分不受影响。dct 不替用户选一家厂商。
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -64,7 +75,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         LlmConfig {
-            provider: default_provider(),
+            provider: None,
             model: None,
             base_url: None,
             transport: default_transport(),
@@ -250,7 +261,7 @@ mod tests {
         )
         .unwrap();
         let llm = c.llm.expect("写了 [llm] 就该是 Some");
-        assert_eq!(llm.provider, "kimi");
+        assert_eq!(llm.provider.as_deref(), Some("kimi"));
         assert_eq!(llm.model.as_deref(), Some("kimi-k2"));
         assert_eq!(llm.base_url.as_deref(), Some("https://example.test/v1"));
         assert_eq!(llm.transport, Transport::Http);
@@ -275,25 +286,45 @@ mod tests {
         assert!(c.llm.is_none(), "空文件等于什么都没配，功能该是关着的");
     }
 
-    /// 用户显式写下 `[llm]`（哪怕一个字段都不填）就是「我要开」——这一刻
-    /// 开始，段内默认值（provider claude、transport Cli）照旧生效。
-    /// 「要不要开」和「开了怎么配」是两件事，这条测试钉住第二件事没有
-    /// 因为第一件事变成 Option 而跟着跑偏。
+    /// 写了 `[llm]` 却没写 `provider`：解析照常成功（不能因此让整份配置读不了），
+    /// 但**不替用户挑一家厂商**——provider 是 `None`，连接那一层据此报「没写」。
+    /// `transport` 不是厂商相关的（cli 走的是被点名那个 profile 自己的 `[headless]`
+    /// 命令），默认值照旧。
     #[test]
-    fn a_bare_llm_section_opts_in_with_the_usual_defaults() {
+    fn a_bare_llm_section_does_not_pick_a_vendor() {
         let c = Config::from_toml("[llm]\n").unwrap();
         let llm = c.llm.expect("写了 [llm]，哪怕是空的，也该是 Some");
-        assert_eq!(llm.provider, "claude", "默认用最可能已登录的 CLI");
-        assert_eq!(llm.transport, Transport::Cli, "默认走不需要凭据的那条路");
+        assert!(llm.provider.is_none(), "没写 provider 就不能替他选一个");
+        assert_eq!(llm.transport, Transport::Cli);
         assert!(llm.model.is_none());
         assert!(llm.base_url.is_none());
+    }
+
+    /// 只写了别的字段（这里是一个 OpenAI 兼容端点的整套）也一样：没有 provider
+    /// 就是没有，不会因为别的字段齐了就补上一个。
+    #[test]
+    fn other_fields_do_not_imply_a_provider() {
+        let c = Config::from_toml(
+            "[llm]\ntransport = \"http\"\nbase_url = \"http://127.0.0.1:11435\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        assert!(c.llm.unwrap().provider.is_none());
+    }
+
+    /// 显式写下 provider（包括 claude）：跟以前一模一样。
+    #[test]
+    fn an_explicit_provider_is_kept_verbatim() {
+        let c = Config::from_toml("[llm]\nprovider = \"claude\"\ntransport = \"cli\"\n").unwrap();
+        let llm = c.llm.unwrap();
+        assert_eq!(llm.provider.as_deref(), Some("claude"));
+        assert_eq!(llm.transport, Transport::Cli);
     }
 
     #[test]
     fn a_partial_llm_section_keeps_the_other_defaults() {
         let c = Config::from_toml("[llm]\nprovider = \"codex\"\n").unwrap();
         let llm = c.llm.unwrap();
-        assert_eq!(llm.provider, "codex");
+        assert_eq!(llm.provider.as_deref(), Some("codex"));
         assert_eq!(llm.transport, Transport::Cli);
     }
 

@@ -58,7 +58,7 @@ mod unix {
             Err(e) => {
                 say.borrow_mut().tell(
                     "note",
-                    &format!("[llm] 连不上（{e:?}），这次不问大模型"),
+                    &crate::explore_model::llm_unavailable_note(&e),
                     json!({}),
                 );
                 None

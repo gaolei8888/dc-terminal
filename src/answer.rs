@@ -309,7 +309,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     let model: Box<dyn Model> = match cfg.llm.as_ref().map(|l| backend_from_config(l, &socket)) {
         Some(Ok(b)) => Box::new(LlmModel::new(b, DEFAULT_TIMEOUT)),
         Some(Err(e)) => {
-            eprintln!("[llm] 连不上（{e:?}），这次不问大模型");
+            eprintln!("{}", crate::explore_model::llm_unavailable_note(&e));
             Box::new(NoModel)
         }
         None => Box::new(NoModel),

@@ -69,7 +69,7 @@ mod tests {
         enable(&f, "qwen", "qwen3.8:27b").unwrap();
         let c = crate::config::Config::load(&f);
         let llm = c.llm.expect("写完就该是 Some");
-        assert_eq!(llm.provider, "qwen");
+        assert_eq!(llm.provider.as_deref(), Some("qwen"));
         assert_eq!(llm.model.as_deref(), Some("qwen3.8:27b"));
     }
 }

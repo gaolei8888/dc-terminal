@@ -730,6 +730,33 @@ where `Invalid API key: sk-…`, `Authorization: Bearer …` and the contents of
 a box you untick with `l`; it adds to your `config.toml` without rewriting it,
 and leaves an existing `[llm]` alone.
 
+An `[llm]` section has to say which backend to use: **`provider` has no default**,
+and dct never picks a vendor for you. Without it, the feature stays off and you
+get one line telling you what to add. `provider` is the name of a profile (a
+built-in one, or your own in `~/.dct/profiles/`). `transport = "cli"` (the
+default) runs that profile's own headless command. For any OpenAI-compatible
+server, write a profile with an `[api]` section (here
+`~/.dct/profiles/gateway.toml`) and connect directly. The address below is only
+an example, not a real endpoint:
+
+```toml
+# ~/.dct/profiles/gateway.toml
+name    = "gateway"
+command = ["true"]                     # not an interactive agent; only [api] is used
+[api]
+base_url = "http://127.0.0.1:11435"
+wire     = "openai"                    # "openai" = /v1/chat/completions
+```
+
+```toml
+# ~/.dct/config.toml
+[llm]
+provider  = "gateway"                  # the profile name above
+transport = "http"
+model     = "<model name>"             # required for http; dct will not guess one
+# base_url = "..."                     # optional; overrides the profile's [api] base_url
+```
+
 `dct llm check` makes one real call through that connection and says whether it
 worked, so you find out now rather than on the next failure.
 

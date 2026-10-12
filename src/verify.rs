@@ -124,6 +124,25 @@ mod tests {
         assert_eq!(*seen.borrow(), "sk-abc");
     }
 
+    /// 探测请求本身就是 Anthropic 线格式（`/v1/messages` + Anthropic 体），
+    /// 所以带 Anthropic 的头；同时也发 `Authorization: Bearer`。核对真发出去的头。
+    #[test]
+    fn the_probe_sends_the_anthropic_wire_headers() {
+        let h = crate::llm::http::tests::capture_headers(|url| {
+            assert_eq!(send_probe(url, "k-test"), Ok(200));
+        });
+        for want in [
+            ("x-api-key", "k-test"),
+            ("authorization", "Bearer k-test"),
+            ("anthropic-version", "2023-06-01"),
+        ] {
+            assert!(
+                h.contains(&(want.0.into(), want.1.into())),
+                "{want:?} 缺：{h:?}"
+            );
+        }
+    }
+
     /// 建 `Agent` 不发请求，不碰网络——`ureq::Agent` 派生了 `Debug`，
     /// 内部的 `AgentConfig` 字段虽是 `pub(crate)`，但会原样进 `Debug`
     /// 输出，所以能在不打真网络的前提下核实 `timeout_connect` 真的被

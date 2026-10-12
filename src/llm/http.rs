@@ -88,7 +88,9 @@ impl HttpBackend {
             wire,
             model,
             cred,
-            sender: Arc::new(send_real),
+            sender: Arc::new(move |u: &str, c: &Credential, b: &serde_json::Value| {
+                send_real(wire, u, c, b)
+            }),
         }
     }
 
@@ -136,8 +138,10 @@ fn build_http_agent() -> ureq::Agent {
         .build()
 }
 
-/// 真实传输。**没有单元测试覆盖**，在实测那一步验。
+/// 真实传输。头部由本机回环上的单测核对（见 tests 里的 `headers_sent_by_send_real`），
+/// 真网络那一步在实测里验。
 fn send_real(
+    wire: Wire,
     url: &str,
     cred: &Credential,
     body: &serde_json::Value,
@@ -146,9 +150,12 @@ fn send_real(
     let mut req = agent.post(url).set("content-type", "application/json");
     match cred {
         Credential::Key(k) => {
-            req = req
-                .set("x-api-key", k)
-                .set("authorization", &format!("Bearer {k}"));
+            req = req.set("authorization", &format!("Bearer {k}"));
+            // `x-api-key` 和版本头一样是 Anthropic 线格式的头，OpenAI 兼容端点
+            // 只认 `Authorization: Bearer`，不该收到别家的头。
+            if wire == Wire::Anthropic {
+                req = req.set("x-api-key", k);
+            }
         }
         Credential::Bearer(t) => {
             req = req.set("authorization", &format!("Bearer {t}"));
@@ -156,7 +163,9 @@ fn send_real(
         // 直连没有凭据可继承。resolve 那一层不会走到这里，兜底也不猜。
         Credential::Inherit => return Err("HTTP 直连需要凭据".into()),
     }
-    req = req.set("anthropic-version", "2023-06-01");
+    if wire == Wire::Anthropic {
+        req = req.set("anthropic-version", "2023-06-01");
+    }
     match req.send_json(body.clone()) {
         Ok(r) => {
             let s = r.status();
@@ -169,7 +178,7 @@ fn send_real(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
@@ -178,6 +187,89 @@ mod tests {
             system: "s".into(),
             user: "u".into(),
             max_tokens: 128,
+        }
+    }
+
+    /// 起一个只接一次连接的本机回环服务，把收到的请求头（小写名 → 值）交出来。
+    /// 走的是 `send_real` 本身，所以测的是真正发出去的头，不是我们以为发出去的。
+    fn headers_sent_by_send_real(wire: Wire, cred: &Credential) -> Vec<(String, String)> {
+        capture_headers(|url| {
+            let (status, _) = send_real(wire, url, cred, &json!({})).unwrap();
+            assert_eq!(status, 200);
+        })
+    }
+
+    /// 回环服务本体：`call` 拿到 URL 去发一次请求，返回对面收到的头。
+    /// `verify.rs` 的探测也用它。
+    pub(crate) fn capture_headers(call: impl FnOnce(&str)) -> Vec<(String, String)> {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x", l.local_addr().unwrap());
+        let srv = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = c.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(i) = text.find("\r\n\r\n") {
+                    let len = text[..i]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if text.len() >= i + 4 + len {
+                        break;
+                    }
+                }
+                assert!(n > 0, "对面在请求头读完前就断了");
+            }
+            let _ =
+                c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        call(&url);
+        let raw = srv.join().unwrap();
+        raw.split("\r\n\r\n")
+            .next()
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+            .collect()
+    }
+
+    /// `anthropic-version` / `x-api-key` 是 Anthropic 线格式的头：只发给 `/v1/messages`，
+    /// OpenAI 兼容那一路（`/v1/chat/completions`）不该看到它——那是把一家厂商
+    /// 的细节漏给了不相干的网关。
+    #[test]
+    fn vendor_headers_are_sent_on_the_anthropic_wire_only() {
+        let cred = Credential::Key("k-test".into());
+        let a = headers_sent_by_send_real(Wire::Anthropic, &cred);
+        assert!(
+            a.contains(&("anthropic-version".into(), "2023-06-01".into())),
+            "Anthropic 线格式要带版本头：{a:?}"
+        );
+        let o = headers_sent_by_send_real(Wire::Openai, &cred);
+        assert!(
+            !o.iter().any(|(k, _)| k == "anthropic-version"),
+            "OpenAI 兼容线格式不该带 anthropic-version：{o:?}"
+        );
+        // `x-api-key` 同理：Anthropic 线格式才有，OpenAI 兼容只发 Authorization。
+        assert!(a.contains(&("x-api-key".into(), "k-test".into())), "{a:?}");
+        assert!(
+            !o.iter().any(|(k, _)| k == "x-api-key"),
+            "OpenAI 兼容线格式不该带 x-api-key：{o:?}"
+        );
+        // 其余的头两边都还在，没被这次改动误伤。
+        for h in [&a, &o] {
+            assert!(h.contains(&("authorization".into(), "Bearer k-test".into())));
+            assert!(h.contains(&("content-type".into(), "application/json".into())));
         }
     }
 
