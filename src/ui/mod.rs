@@ -5071,6 +5071,20 @@ is_agent = true
         // 落进 key_to_input 的通配臂本来就返回 None——这条测试钉住这件事，
         // 免得以后有人改这个函数时不小心让它开始转发。
         assert_eq!(key_to_input(&key(KeyCode::F(3))), None);
+        // 「上一个」那几个键同理：带修饰键的 F3 和 F8 绝不能漏给 agent
+        for m in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                key_to_input(&KeyEvent::new(KeyCode::F(3), m)),
+                None,
+                "{m:?}"
+            );
+        }
+        assert_eq!(key_to_input(&key(KeyCode::F(8))), None);
     }
 
     #[test]

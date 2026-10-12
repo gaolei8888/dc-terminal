@@ -138,19 +138,25 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::F(2) {
         app.view = super::home_view(app);
         app.need_sessions = true;
-    } else if key.code == KeyCode::F(3) {
-        // F3 = 直接切到下一个在跑的会话，不用先退回看板。选 F3 沿用
+    } else if let Some(dir) = super::grid::session_jump(&key) {
+        // F3 = 直接切到下一个在跑的会话，不用先退回看板；Shift/Ctrl+F3 和
+        // F8 = 上一个（修饰键规则见 `grid::session_jump`）。选 F 键沿用
         // F2 的理由：没有 CLI agent 用 F 功能键，偷它不踩任何人。
         // 按**看板上的顺序**（项目、id）轮转，不是守护进程返回的顺序——
         // 用户眼睛里的顺序就是看板那一份。已停止的会话留在这份列表里：
-        // `next_running` 自己会跳过它们，而正贴着的这一个必须在列表里，
-        // 否则轮转的起点就落空了（从一个已停止的会话按 F3 会一动不动）。
+        // `next_running`/`prev_running` 自己会跳过它们，而正贴着的这一个必须
+        // 在列表里，否则轮转的起点就落空了（从一个已停止的会话按键会一动不动）。
         let board: Vec<SessionInfo> = app
             .groups
             .iter()
             .flat_map(|g| g.sessions.iter().cloned())
             .collect();
-        match super::grid::next_running(&board, id) {
+        let target = if dir == super::grid::Dir::Left {
+            super::grid::prev_running(&board, id)
+        } else {
+            super::grid::next_running(&board, id)
+        };
+        match target {
             Some(next) => {
                 // 光标必须跟着人走。F3 会跨过项目边界（那是用户按的键，
                 // 跨得理直气壮），而分组之后**光标就是「当前项目」**——
@@ -1122,6 +1128,97 @@ mod tests {
             "折叠不该把当前项目冻在 a 上"
         );
         assert_eq!(app.selected_session().map(|s| s.id), Some(2));
+    }
+
+    fn mod_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// 每个「上一个」键都走同一条路：往回跳、跳过已停止的、到头回绕。
+    #[test]
+    fn previous_keys_jump_back_skipping_stopped_and_wrapping() {
+        let prev_keys = [
+            mod_key(KeyCode::F(3), KeyModifiers::CONTROL),
+            mod_key(KeyCode::F(3), KeyModifiers::SHIFT),
+            key(KeyCode::F(8)),
+        ];
+        for k in prev_keys {
+            let (mut app, _dir) = App::test_app();
+            app.set_sessions(vec![
+                session(1, SessionState::Working),
+                session(2, SessionState::Stopped),
+                session(3, SessionState::Idle),
+            ]);
+            app.view = View::Attached(3);
+            handle_key(&mut app, k).unwrap();
+            assert!(matches!(app.view, View::Attached(1)), "{k:?}：跳过停掉的 2");
+            handle_key(&mut app, k).unwrap();
+            assert!(matches!(app.view, View::Attached(3)), "{k:?}：到头回绕");
+            assert!(app.need_sessions);
+        }
+    }
+
+    #[test]
+    fn plain_and_alt_f3_still_mean_next() {
+        for k in [
+            key(KeyCode::F(3)),
+            mod_key(KeyCode::F(3), KeyModifiers::ALT),
+        ] {
+            let (mut app, _dir) = App::test_app();
+            app.set_sessions(vec![
+                session(1, SessionState::Working),
+                session(2, SessionState::Idle),
+                session(3, SessionState::Idle),
+            ]);
+            app.view = View::Attached(1);
+            handle_key(&mut app, k).unwrap();
+            assert!(matches!(app.view, View::Attached(2)), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn previous_key_into_another_project_takes_the_cursor_with_it() {
+        let (mut app, _dir) = App::test_app();
+        let in_dir = |id: u32, dir: &str| SessionInfo {
+            dir: dir.into(),
+            ..session(id, SessionState::Working)
+        };
+        app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
+        app.list_state.select(Some(3)); // [组头 a, 1, 组头 b, 2]
+        app.view = View::Attached(2);
+
+        handle_key(&mut app, mod_key(KeyCode::F(3), KeyModifiers::SHIFT)).unwrap();
+
+        assert!(matches!(app.view, View::Attached(1)));
+        assert_eq!(
+            app.current_group().map(|g| g.name.clone()),
+            Some("a".to_string()),
+            "光标跟着人走回 a"
+        );
+        assert_eq!(app.selected_session().map(|s| s.id), Some(1));
+    }
+
+    #[test]
+    fn previous_keys_say_so_when_this_is_the_only_running_session() {
+        for k in [
+            mod_key(KeyCode::F(3), KeyModifiers::CONTROL),
+            mod_key(KeyCode::F(3), KeyModifiers::SHIFT),
+            key(KeyCode::F(8)),
+        ] {
+            let (mut app, _dir) = App::test_app();
+            app.set_sessions(vec![
+                session(1, SessionState::Working),
+                session(2, SessionState::Stopped),
+            ]);
+            app.view = View::Attached(1);
+            handle_key(&mut app, k).unwrap();
+            assert!(matches!(app.view, View::Attached(1)), "{k:?} 不能跳回自己");
+            assert_eq!(
+                app.message.text,
+                crate::i18n::text(crate::i18n::Key::NoOtherRunningSession, app.lang),
+                "{k:?}"
+            );
+        }
     }
 
     #[test]

@@ -628,7 +628,7 @@ The middle of the bar is the current project, reversed out of the bar's own
 colours so it can't be mistaken for one more key name.
 
 The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile,
-stopped sessions included), `Enter` zooms into the focused tile, `g` goes back to
+stopped sessions included) and `Shift+F3` / `Ctrl+F3` / `F8` do the same as `←`, `Enter` zooms into the focused tile, `g` goes back to
 the list, and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly
 what they do on the board. Two differences: folding is list-only, because in the
 grid the left and right arrows move the focus; and the digits work with no number
@@ -648,10 +648,20 @@ More than nine sessions get more pages, with a page indicator.
 
 Inside a session every keystroke goes to the agent, `Esc` included — agents need
 it for their own popups. `F2`…`F6` are the only keys `dct` keeps: `F2` backs out
-to the board, `F3` jumps straight to the next running session, `F4` toggles copy
+to the board, `F3` jumps straight to the next running session, `Shift+F3`,
+`Ctrl+F3` or `F8` jumps to the previous one, `F4` toggles copy
 mode, `F5` pastes an image, `F6` opens the colour picker. The bottom-left hint
 (`F2 back`) is always there — a disconnect, an error, or a long message can't
 push it off the line, because it's the only way out of a session.
+
+Next/previous follow the board's order (project, then id), wrap around at the
+ends and skip stopped sessions. The previous key is not on the hint bar (there
+is no room); `Alt+F3` still means next. macOS may claim `Ctrl+F3` for the Dock, so
+`Shift+F3` and `F8` are the safe ones; some terminals strip modifiers from
+function keys, and then `F3` simply means next. To see what your terminal
+actually sends, run `cat -v` and press the key: `^[[1;2R` is `Shift+F3`, `^[OR`
+or `^[[13~` is plain `F3`, `^[[19~` is `F8`. (Before this, any modifier + `F3`
+meant next; now `Shift`/`Ctrl` + `F3` means previous.)
 
 You can scroll back through what a session already printed, with
 `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled

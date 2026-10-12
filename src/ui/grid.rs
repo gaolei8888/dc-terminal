@@ -87,12 +87,48 @@ pub fn move_focus(focus: usize, total: usize, dir: Dir) -> usize {
 /// 当前会话直接跳到下一个能看的会话，不用先退回看板。当前会话是唯一
 /// 在跑的（或者 `current` 压根不在 `sessions` 里）→ `None`，调用方原地不动。
 pub fn next_running(sessions: &[SessionInfo], current: u32) -> Option<u32> {
+    running_neighbour(sessions, current, true)
+}
+
+/// `next_running` 的镜像：往回走，到头回绕，跳过已停止的。「上一个」按
+/// 看板上的顺序，不是最近用过的——跟「下一个」互为逆操作，按一次 F3 再按一次
+/// Shift+F3 回到原地。
+pub fn prev_running(sessions: &[SessionInfo], current: u32) -> Option<u32> {
+    running_neighbour(sessions, current, false)
+}
+
+/// 两个方向共用一份，免得回绕和跳过已停止的规则抄两遍后各自漂移。
+fn running_neighbour(sessions: &[SessionInfo], current: u32, forward: bool) -> Option<u32> {
     let cur = sessions.iter().position(|s| s.id == current)?;
     let n = sessions.len();
     (1..n)
-        .map(|off| &sessions[(cur + off) % n])
+        .map(|off| {
+            &sessions[if forward {
+                (cur + off) % n
+            } else {
+                (cur + n - off) % n
+            }]
+        })
         .find(|s| !matches!(s.state, SessionState::Stopped))
         .map(|s| s.id)
+}
+
+/// 这个按键是「切到相邻会话」吗？是 → 往哪边。附加视图和九宫格共用，
+/// 免得两处各写一份修饰键规则。
+///
+/// - `F8`：「上一个」，给发不出带修饰键 F3 的终端用。
+/// - `F3` 带 Ctrl 或 Shift：「上一个」。macOS 会把 Ctrl+F3 抢给 Dock，
+///   所以 Shift+F3 才是实际能用的那个。
+/// - 其余的 `F3`（含单独的 Alt+F3，以及修饰键被终端剥掉的情况）：「下一个」，
+///   跟加这条之前一样。
+pub fn session_jump(key: &KeyEvent) -> Option<Dir> {
+    use crossterm::event::KeyModifiers as M;
+    match key.code {
+        KeyCode::F(8) => Some(Dir::Left),
+        KeyCode::F(3) if key.modifiers.intersects(M::CONTROL | M::SHIFT) => Some(Dir::Left),
+        KeyCode::F(3) => Some(Dir::Right),
+        _ => None,
+    }
 }
 
 /// 按显示宽度裁一行。宽字符（CJK 占两列）跨过边界就整个丢掉——
@@ -204,8 +240,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Up => move_grid_focus(app, focus, total, Dir::Up),
         KeyCode::Down => move_grid_focus(app, focus, total, Dir::Down),
         KeyCode::Left => move_grid_focus(app, focus, total, Dir::Left),
-        // F3 = 「下一个」，跟会话视图里的 F3 是同一个动作，肌肉记忆只练一次
-        KeyCode::Right | KeyCode::F(3) => move_grid_focus(app, focus, total, Dir::Right),
+        KeyCode::Right => move_grid_focus(app, focus, total, Dir::Right),
+        // F3 = 「下一个」，Shift/Ctrl+F3 和 F8 = 「上一个」：跟会话视图里
+        // 是同一组键、同一个判定（`session_jump`），肌肉记忆只练一次
+        KeyCode::F(3) | KeyCode::F(8) => {
+            if let Some(dir) = session_jump(&key) {
+                move_grid_focus(app, focus, total, dir)
+            }
+        }
         // 换项目跟看板同一批键、同一个语义（共用 `jump_project`/`goto_project`，
         // 不各抄一份）。九宫格没有组头可停，所以「换项目」= 焦点跳到那个项目的
         // 第一个格子，同时看板那边的光标也跟着走——两个模式共用一个光标。
@@ -918,6 +960,58 @@ mod tests {
             None,
             "没有别的会话就别跳，跳回自己是噪音"
         );
+    }
+
+    #[test]
+    fn prev_running_wraps_and_skips_stopped() {
+        let sessions = vec![
+            session(1, SessionState::Working),
+            session(2, SessionState::Stopped),
+            session(3, SessionState::Idle),
+        ];
+        assert_eq!(prev_running(&sessions, 3), Some(1), "2 停了要跳过");
+        assert_eq!(prev_running(&sessions, 1), Some(3), "到头回绕");
+        let only = vec![session(1, SessionState::Working)];
+        assert_eq!(prev_running(&only, 1), None, "没有别的会话就别跳");
+        assert_eq!(prev_running(&sessions, 99), None, "起点不在列表里");
+        // 从已停止的会话出发也要能走
+        assert_eq!(prev_running(&sessions, 2), Some(1));
+    }
+
+    #[test]
+    fn prev_running_undoes_next_running_in_board_order() {
+        // 看板顺序（跨项目）：a 的 1、2，b 的 3、4；4 停了
+        let sessions = vec![
+            session(1, SessionState::Idle),
+            session(2, SessionState::Working),
+            session(3, SessionState::Idle),
+            session(4, SessionState::Stopped),
+        ];
+        for id in [1, 2, 3] {
+            let next = next_running(&sessions, id).unwrap();
+            assert_eq!(prev_running(&sessions, next), Some(id), "{id} 往返");
+        }
+        assert_eq!(prev_running(&sessions, 3), Some(2), "跨过项目边界");
+    }
+
+    #[test]
+    fn session_jump_maps_keys_to_directions() {
+        use crossterm::event::KeyModifiers as M;
+        let k = |c, m| KeyEvent::new(c, m);
+        assert_eq!(session_jump(&k(KeyCode::F(3), M::NONE)), Some(Dir::Right));
+        assert_eq!(session_jump(&k(KeyCode::F(3), M::SHIFT)), Some(Dir::Left));
+        assert_eq!(session_jump(&k(KeyCode::F(3), M::CONTROL)), Some(Dir::Left));
+        assert_eq!(
+            session_jump(&k(KeyCode::F(3), M::CONTROL | M::SHIFT)),
+            Some(Dir::Left)
+        );
+        assert_eq!(
+            session_jump(&k(KeyCode::F(3), M::ALT)),
+            Some(Dir::Right),
+            "Alt 保持原样"
+        );
+        assert_eq!(session_jump(&k(KeyCode::F(8), M::NONE)), Some(Dir::Left));
+        assert_eq!(session_jump(&k(KeyCode::F(4), M::NONE)), None);
     }
 
     #[test]
@@ -1705,6 +1799,30 @@ mod tests {
         app.view = View::grid(2);
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
         assert!(matches!(app.view, View::Grid { focus: 0, .. }), "到头回绕");
+    }
+
+    #[test]
+    fn shift_ctrl_f3_and_f8_move_to_the_previous_tile_like_the_left_arrow() {
+        use crossterm::event::KeyModifiers as M;
+        for k in [
+            KeyEvent::new(KeyCode::F(3), M::SHIFT),
+            KeyEvent::new(KeyCode::F(3), M::CONTROL),
+            key(KeyCode::F(8)),
+        ] {
+            let (mut app, _dir) = App::test_app();
+            app.set_sessions((1..=3).map(|i| session(i, SessionState::Idle)).collect());
+            app.view = View::grid(1);
+            handle_key(&mut app, k).unwrap();
+            assert!(
+                matches!(app.view, View::Grid { focus: 0, .. }),
+                "{k:?} 退一格"
+            );
+            handle_key(&mut app, k).unwrap();
+            assert!(
+                matches!(app.view, View::Grid { focus: 2, .. }),
+                "{k:?} 到头回绕"
+            );
+        }
     }
 
     #[test]
