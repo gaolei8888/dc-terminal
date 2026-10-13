@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exam_lib import ABSTAIN_KEY, FIXED, load_items, pick_of, render, sha256_file  # noqa: E402
 
 SETS = {"exam": ("jeff-exam", "exam-v2.jsonl"), "dev": ("jeff-dev", "dev-v2.jsonl")}
-SWEEP = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
+SWEEP = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.98, 0.99]
 SCROLL_WAIT = ("scroll_down", "scroll_up", "wait")
 BUCKETS = ["2-4", "5-9", "10-14", "15-20"]
 CATS = ["normal", "stuck-correct", "dangerous-option"]
