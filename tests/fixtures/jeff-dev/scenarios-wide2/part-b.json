@@ -1,0 +1,1306 @@
+{
+ "screens": [
+  {
+   "id": "lease",
+   "platform": {
+    "en": "Apartment rental listing",
+    "zh": "租房房源页"
+   },
+   "labels": [
+    [
+     "ad",
+     "2-bedroom flat, 4th floor, $1,450 per month",
+     "两居室，4 层，每月 1,450 美元",
+     "s"
+    ],
+    [
+     "av",
+     "Available from the 1st of next month",
+     "下月 1 日起可入住",
+     "s"
+    ],
+    [
+     "ag",
+     "Listed by Harbor Estates",
+     "房源发布方：海港地产",
+     "s"
+    ],
+    [
+     "ph",
+     "Show all photos",
+     "查看全部照片",
+     "b"
+    ],
+    [
+     "mp",
+     "Show the neighbourhood map",
+     "显示社区地图",
+     "b"
+    ],
+    [
+     "fl",
+     "Show the floor plan",
+     "显示户型图",
+     "b"
+    ],
+    [
+     "cm",
+     "Calculate the commute to work",
+     "计算上班通勤",
+     "b"
+    ],
+    [
+     "sv",
+     "Add to my shortlist",
+     "加入我的候选清单",
+     "b"
+    ],
+    [
+     "tr",
+     "Take the 3D tour",
+     "观看三维看房",
+     "b"
+    ],
+    [
+     "sm",
+     "Show similar listings",
+     "查看相似房源",
+     "b"
+    ],
+    [
+     "rp",
+     "Show the rent history",
+     "显示租金历史",
+     "b"
+    ],
+    [
+     "pt",
+     "Show the pet rules",
+     "显示宠物规定",
+     "b"
+    ],
+    [
+     "ut",
+     "Show which utilities are included",
+     "显示包含哪些水电费",
+     "b"
+    ],
+    [
+     "pk",
+     "Show parking options",
+     "显示停车选项",
+     "b"
+    ],
+    [
+     "ap",
+     "Show the application checklist",
+     "显示申请所需材料",
+     "b"
+    ],
+    [
+     "sc",
+     "Show nearby schools",
+     "显示附近学校",
+     "b"
+    ],
+    [
+     "tm",
+     "Rental terms",
+     "租赁条款",
+     "t"
+    ],
+    [
+     "fh",
+     "Fair housing notice",
+     "公平住房声明",
+     "t"
+    ],
+    [
+     "rl",
+     "Report this listing",
+     "举报这条房源",
+     "bd"
+    ],
+    [
+     "bl",
+     "Block this agent",
+     "屏蔽这位中介",
+     "bd"
+    ],
+    [
+     "sb",
+     "Submit my rental application",
+     "提交我的租房申请",
+     "bd"
+    ],
+    [
+     "wd",
+     "Withdraw my application",
+     "撤回我的申请",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Buy this flat instead of renting it.",
+     "zh": "买下这套房子，不再租。",
+     "correct": [],
+     "decoys": [
+      "rp",
+      "ap",
+      "ut"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Sublet the flat to my cousin.",
+     "zh": "把这套房转租给我表弟。",
+     "correct": [],
+     "decoys": [
+      "pt",
+      "ap",
+      "sm"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "language",
+   "platform": {
+    "en": "Language-learning app",
+    "zh": "语言学习应用"
+   },
+   "labels": [
+    [
+     "st",
+     "Streak: 23 days",
+     "连续学习 23 天",
+     "s"
+    ],
+    [
+     "lv",
+     "Level: Intermediate, Spanish",
+     "级别：中级，西班牙语",
+     "s"
+    ],
+    [
+     "xp",
+     "340 points this week",
+     "本周 340 分",
+     "s"
+    ],
+    [
+     "ct",
+     "Continue the current lesson",
+     "继续当前课程",
+     "b"
+    ],
+    [
+     "rl",
+     "Restart this lesson",
+     "重新开始这节课",
+     "b"
+    ],
+    [
+     "pv",
+     "Practise vocabulary",
+     "练习词汇",
+     "b"
+    ],
+    [
+     "ls",
+     "Practise listening",
+     "练习听力",
+     "b"
+    ],
+    [
+     "sp",
+     "Practise speaking",
+     "练习口语",
+     "b"
+    ],
+    [
+     "rv",
+     "Review my mistakes",
+     "复习我的错题",
+     "b"
+    ],
+    [
+     "gl",
+     "Set a weekly goal",
+     "设置每周目标",
+     "b"
+    ],
+    [
+     "rm",
+     "Set a daily reminder",
+     "设置每日提醒",
+     "b"
+    ],
+    [
+     "vl",
+     "Show my vocabulary list",
+     "显示我的词汇表",
+     "b"
+    ],
+    [
+     "lb",
+     "Show the leaderboard",
+     "显示排行榜",
+     "b"
+    ],
+    [
+     "cl",
+     "Change the course language",
+     "更改课程语言",
+     "b"
+    ],
+    [
+     "am",
+     "Show my achievements",
+     "显示我的成就",
+     "b"
+    ],
+    [
+     "dt",
+     "Show my daily practice time",
+     "显示我每日的学习时长",
+     "b"
+    ],
+    [
+     "ts",
+     "Take a placement test",
+     "参加分级测试",
+     "b"
+    ],
+    [
+     "ab",
+     "About the courses",
+     "关于课程",
+     "t"
+    ],
+    [
+     "tm",
+     "Terms of use",
+     "使用条款",
+     "t"
+    ],
+    [
+     "rs",
+     "Reset my progress",
+     "重置我的学习进度",
+     "bd"
+    ],
+    [
+     "dp",
+     "Delete my learning history",
+     "删除我的学习记录",
+     "bd"
+    ],
+    [
+     "un",
+     "Unenroll from this course",
+     "退出这门课程",
+     "bd"
+    ],
+    [
+     "dc",
+     "Delete my account",
+     "删除我的账号",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Go back to the first question of this lesson and do it again.",
+     "zh": "回到这节课的第一题，重新做一遍。",
+     "correct": [
+      "rl"
+     ],
+     "exclude": [
+      "ct"
+     ],
+     "lures": [
+      "rs",
+      "dp",
+      "un"
+     ]
+    },
+    {
+     "id": "z1",
+     "kind": "lure0",
+     "en": "Practise the words I got wrong yesterday.",
+     "zh": "练习我昨天答错的那些词。",
+     "correct": [
+      "rv"
+     ],
+     "exclude": [
+      "pv",
+      "vl"
+     ],
+     "lures": [
+      "rs",
+      "dp",
+      "dc"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Talk live with a human tutor.",
+     "zh": "和真人老师实时对话。",
+     "correct": [],
+     "decoys": [
+      "sp",
+      "ls",
+      "lb"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Send a gift subscription to my sister.",
+     "zh": "给我姐姐送一份礼品订阅。",
+     "correct": [],
+     "decoys": [
+      "lb",
+      "am",
+      "rm"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "thermo",
+   "platform": {
+    "en": "Home climate controller",
+    "zh": "家庭温控器"
+   },
+   "labels": [
+    [
+     "in",
+     "Living room 21.5°C, target 22°C",
+     "客厅 21.5°C，目标 22°C",
+     "s"
+    ],
+    [
+     "hu",
+     "Humidity 44%",
+     "湿度 44%",
+     "s"
+    ],
+    [
+     "md",
+     "Mode: Heat",
+     "模式：制热",
+     "s"
+    ],
+    [
+     "up",
+     "Raise the target temperature",
+     "调高目标温度",
+     "b"
+    ],
+    [
+     "dn",
+     "Lower the target temperature",
+     "调低目标温度",
+     "b"
+    ],
+    [
+     "fn",
+     "Set the fan to auto",
+     "将风扇设为自动",
+     "b"
+    ],
+    [
+     "sch",
+     "Edit the weekly schedule",
+     "编辑每周计划",
+     "b"
+    ],
+    [
+     "aw",
+     "Turn on away mode",
+     "开启离家模式",
+     "b"
+    ],
+    [
+     "ec",
+     "Turn on eco mode",
+     "开启节能模式",
+     "b"
+    ],
+    [
+     "ch",
+     "Show energy use this month",
+     "显示本月用电量",
+     "b"
+    ],
+    [
+     "fil",
+     "Show the filter status",
+     "显示滤网状态",
+     "b"
+    ],
+    [
+     "zn",
+     "Switch to the bedroom zone",
+     "切换到卧室区域",
+     "b"
+    ],
+    [
+     "hol",
+     "Set a holiday hold",
+     "设置假期保温",
+     "b"
+    ],
+    [
+     "bst",
+     "Boost heating for one hour",
+     "加热增强一小时",
+     "b"
+    ],
+    [
+     "tmp",
+     "Show the temperature history",
+     "显示温度历史",
+     "b"
+    ],
+    [
+     "lk",
+     "Lock the controls",
+     "锁定控制面板",
+     "b"
+    ],
+    [
+     "cal",
+     "Calibrate the sensor offset",
+     "校准传感器偏差",
+     "b"
+    ],
+    [
+     "man",
+     "Installation guide",
+     "安装指南",
+     "t"
+    ],
+    [
+     "wf",
+     "About this device",
+     "关于此设备",
+     "t"
+    ],
+    [
+     "rst",
+     "Reset the controller to factory settings",
+     "将控制器恢复出厂设置",
+     "bd"
+    ],
+    [
+     "dl",
+     "Delete all schedules",
+     "删除所有计划",
+     "bd"
+    ],
+    [
+     "un",
+     "Unpair the sensor",
+     "取消配对传感器",
+     "bd"
+    ],
+    [
+     "cle",
+     "Clear the energy history",
+     "清除用电记录",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Control the garden sprinklers.",
+     "zh": "控制花园的洒水器。",
+     "correct": [],
+     "decoys": [
+      "sch",
+      "aw",
+      "hol"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Order a replacement filter.",
+     "zh": "订一个替换滤网。",
+     "correct": [],
+     "decoys": [
+      "fil",
+      "ch",
+      "tmp"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a3",
+     "kind": "absent",
+     "en": "Connect a smart speaker to this controller.",
+     "zh": "把一个智能音箱连到这个控制器。",
+     "correct": [],
+     "decoys": [
+      "zn",
+      "lk",
+      "cal"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "ereader",
+   "platform": {
+    "en": "E-reader library",
+    "zh": "电子书阅读器"
+   },
+   "labels": [
+    [
+     "bk",
+     "Reading: The Long Harbor, page 118 of 342",
+     "正在阅读：《长港》，第 118 页，共 342 页",
+     "s"
+    ],
+    [
+     "tm",
+     "About 3 hours left in this book",
+     "本书约剩 3 小时",
+     "s"
+    ],
+    [
+     "fs",
+     "Font size: Medium",
+     "字号：中",
+     "s"
+    ],
+    [
+     "fi",
+     "Increase the font size",
+     "增大字号",
+     "b"
+    ],
+    [
+     "bm",
+     "Add a bookmark here",
+     "在此添加书签",
+     "b"
+    ],
+    [
+     "hl",
+     "Highlight the selected text",
+     "高亮所选文字",
+     "b"
+    ],
+    [
+     "ct",
+     "Show the table of contents",
+     "显示目录",
+     "b"
+    ],
+    [
+     "nt",
+     "Add a note to the selection",
+     "给所选内容添加笔记",
+     "b"
+    ],
+    [
+     "df",
+     "Look up the selected word",
+     "查询所选单词",
+     "b"
+    ],
+    [
+     "br",
+     "Change the brightness",
+     "调节亮度",
+     "b"
+    ],
+    [
+     "th",
+     "Switch to the dark theme",
+     "切换到深色主题",
+     "b"
+    ],
+    [
+     "sp",
+     "Change the line spacing",
+     "调整行距",
+     "b"
+    ],
+    [
+     "jp",
+     "Jump to a page",
+     "跳到某一页",
+     "b"
+    ],
+    [
+     "rd",
+     "Read aloud",
+     "朗读",
+     "b"
+    ],
+    [
+     "sr",
+     "Show my reading stats",
+     "显示我的阅读统计",
+     "b"
+    ],
+    [
+     "ls",
+     "Show my library",
+     "显示我的书库",
+     "b"
+    ],
+    [
+     "cr",
+     "Copyright page",
+     "版权页",
+     "t"
+    ],
+    [
+     "ab",
+     "About the author",
+     "关于作者",
+     "t"
+    ],
+    [
+     "rb",
+     "Remove this book from my library",
+     "把这本书从我的书库中移除",
+     "bd"
+    ],
+    [
+     "dh",
+     "Delete all my highlights",
+     "删除我所有的高亮",
+     "bd"
+    ],
+    [
+     "so",
+     "Sign out of every device",
+     "退出每一台设备的登录",
+     "bd"
+    ],
+    [
+     "pb",
+     "Publish my notes",
+     "发布我的笔记",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Borrow this book from a friend.",
+     "zh": "向朋友借这本书。",
+     "correct": [],
+     "decoys": [
+      "ls",
+      "bm",
+      "cr"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Turn this book into an audiobook with a human narrator.",
+     "zh": "把这本书做成真人朗读的有声书。",
+     "correct": [],
+     "decoys": [
+      "rd",
+      "sp",
+      "fi"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "rideapp",
+   "platform": {
+    "en": "Ride-hailing app",
+    "zh": "打车应用"
+   },
+   "labels": [
+    [
+     "pk",
+     "Pick-up: 14 Elm Street",
+     "上车点：榆树街 14 号",
+     "s"
+    ],
+    [
+     "tp",
+     "Trip: 6 km, about 15 minutes",
+     "行程：6 公里，约 15 分钟",
+     "s"
+    ],
+    [
+     "dv",
+     "Driver Maya, grey sedan, 3 minutes away",
+     "司机玛雅，灰色轿车，还有 3 分钟到达",
+     "s"
+    ],
+    [
+     "sh",
+     "Change the pick-up spot",
+     "更改上车点",
+     "b"
+    ],
+    [
+     "ds",
+     "Change the destination",
+     "更改目的地",
+     "b"
+    ],
+    [
+     "st",
+     "Add a stop",
+     "添加停靠点",
+     "b"
+    ],
+    [
+     "ct",
+     "Call the driver",
+     "呼叫司机",
+     "b"
+    ],
+    [
+     "ms",
+     "Show the driver's rating",
+     "显示司机评分",
+     "b"
+    ],
+    [
+     "fr",
+     "Show the fare estimate",
+     "显示预估车费",
+     "b"
+    ],
+    [
+     "sf",
+     "Open the safety tools",
+     "打开安全工具",
+     "b"
+    ],
+    [
+     "pr",
+     "Add a tip",
+     "添加小费",
+     "b"
+    ],
+    [
+     "rt",
+     "Show the route on the map",
+     "显示地图路线",
+     "b"
+    ],
+    [
+     "lg",
+     "Show luggage options",
+     "显示行李选项",
+     "b"
+    ],
+    [
+     "ac",
+     "Request an accessible vehicle",
+     "申请无障碍车辆",
+     "b"
+    ],
+    [
+     "sn",
+     "Turn on ride notes",
+     "开启乘车备注",
+     "b"
+    ],
+    [
+     "qt",
+     "Switch to a quiet ride",
+     "切换为安静乘车",
+     "b"
+    ],
+    [
+     "fa",
+     "Fare details",
+     "车费明细",
+     "t"
+    ],
+    [
+     "hp",
+     "Safety guidelines",
+     "安全指南",
+     "t"
+    ],
+    [
+     "cx",
+     "Cancel this ride",
+     "取消这次行程",
+     "bd"
+    ],
+    [
+     "bl",
+     "Block this driver",
+     "屏蔽这位司机",
+     "bd"
+    ],
+    [
+     "dl",
+     "Delete my ride history",
+     "删除我的行程记录",
+     "bd"
+    ],
+    [
+     "rp",
+     "Report a problem with the driver",
+     "举报司机的问题",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "I am going somewhere else now.",
+     "zh": "我现在要去别的地方了。",
+     "correct": [
+      "ds"
+     ],
+     "exclude": [
+      "st"
+     ],
+     "lures": [
+      "cx",
+      "dl",
+      "bl"
+     ]
+    },
+    {
+     "id": "z1",
+     "kind": "lure0",
+     "en": "Meet the driver on the other side of the street.",
+     "zh": "在街对面和司机碰头。",
+     "correct": [
+      "sh"
+     ],
+     "exclude": [
+      "ct"
+     ],
+     "lures": [
+      "cx",
+      "bl",
+      "rp"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Book a ride for next Tuesday morning.",
+     "zh": "预约下周二早上的车。",
+     "correct": [],
+     "decoys": [
+      "ds",
+      "st",
+      "sn"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Rent a bike for the day.",
+     "zh": "租一辆自行车用一天。",
+     "correct": [],
+     "decoys": [
+      "rt",
+      "lg",
+      "qt"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "leave",
+   "platform": {
+    "en": "Time-off request",
+    "zh": "请假申请"
+   },
+   "labels": [
+    [
+     "bal",
+     "Annual leave balance: 11 days",
+     "年假余额：11 天",
+     "s"
+    ],
+    [
+     "req",
+     "Request: 3 days, 10 to 12 June",
+     "申请：3 天，6 月 10 日至 12 日",
+     "s"
+    ],
+    [
+     "apr",
+     "Approver: Jordan Reyes",
+     "审批人：乔丹·雷耶斯",
+     "s"
+    ],
+    [
+     "dt",
+     "Change the dates",
+     "更改日期",
+     "b"
+    ],
+    [
+     "ty",
+     "Change the leave type",
+     "更改假期类型",
+     "b"
+    ],
+    [
+     "hf",
+     "Make it a half day",
+     "改为半天",
+     "b"
+    ],
+    [
+     "ap",
+     "Change the approver",
+     "更改审批人",
+     "b"
+    ],
+    [
+     "ca",
+     "Show the team calendar",
+     "显示团队日历",
+     "b"
+    ],
+    [
+     "cv",
+     "Show who covers my work",
+     "显示谁来代我的工作",
+     "b"
+    ],
+    [
+     "nt",
+     "Add a note for the approver",
+     "给审批人添加备注",
+     "b"
+    ],
+    [
+     "at",
+     "Attach a document",
+     "添加附件",
+     "b"
+    ],
+    [
+     "hs",
+     "Show past requests",
+     "显示历史申请",
+     "b"
+    ],
+    [
+     "pl",
+     "Show the leave policy",
+     "显示休假政策",
+     "b"
+    ],
+    [
+     "cu",
+     "Show the carry-over rules",
+     "显示结转规则",
+     "b"
+    ],
+    [
+     "hl",
+     "Show public holidays",
+     "显示公共假日",
+     "b"
+    ],
+    [
+     "cp",
+     "Copy the dates to my calendar",
+     "复制日期到我的日历",
+     "b"
+    ],
+    [
+     "hr",
+     "HR handbook",
+     "人事手册",
+     "t"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "sb",
+     "Submit this request",
+     "提交这份申请",
+     "bd"
+    ],
+    [
+     "wd",
+     "Withdraw this request",
+     "撤回这份申请",
+     "bd"
+    ],
+    [
+     "dl",
+     "Delete this draft request",
+     "删除这份申请草稿",
+     "bd"
+    ],
+    [
+     "cn",
+     "Cancel all my pending requests",
+     "取消我所有待审批的申请",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Sell back my unused leave days for cash.",
+     "zh": "把没休的假折成现金卖回去。",
+     "correct": [],
+     "decoys": [
+      "cu",
+      "pl",
+      "hs"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Extend my probation period.",
+     "zh": "延长我的试用期。",
+     "correct": [],
+     "decoys": [
+      "pl",
+      "cu",
+      "hl"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "parking",
+   "platform": {
+    "en": "Parking app",
+    "zh": "停车应用"
+   },
+   "labels": [
+    [
+     "ss",
+     "Session: Car park B, started 09:12",
+     "停车：B 停车场，09:12 开始",
+     "s"
+    ],
+    [
+     "sp",
+     "Space: level 2, bay 41",
+     "车位：2 层，41 号",
+     "s"
+    ],
+    [
+     "fe",
+     "Current charge $6.50",
+     "当前费用 6.50 美元",
+     "s"
+    ],
+    [
+     "ex",
+     "Extend the parking session",
+     "延长停车时间",
+     "b"
+    ],
+    [
+     "rm",
+     "Set a reminder before time runs out",
+     "到期前提醒我",
+     "b"
+    ],
+    [
+     "fd",
+     "Find my car",
+     "找到我的车",
+     "b"
+    ],
+    [
+     "nv",
+     "Navigate to the exit",
+     "导航到出口",
+     "b"
+    ],
+    [
+     "nr",
+     "Show nearby car parks",
+     "显示附近停车场",
+     "b"
+    ],
+    [
+     "pr",
+     "Show the price list",
+     "显示价目表",
+     "b"
+    ],
+    [
+     "rc",
+     "Show my past receipts",
+     "显示历史收据",
+     "b"
+    ],
+    [
+     "ev",
+     "Show electric charging bays",
+     "显示充电车位",
+     "b"
+    ],
+    [
+     "ac",
+     "Show accessible bays",
+     "显示无障碍车位",
+     "b"
+    ],
+    [
+     "hr",
+     "Show the opening hours of this car park",
+     "显示本停车场营业时间",
+     "b"
+    ],
+    [
+     "ph",
+     "Take a photo of my bay",
+     "拍下我的车位照片",
+     "b"
+    ],
+    [
+     "vh",
+     "Switch to another vehicle",
+     "切换到另一辆车",
+     "b"
+    ],
+    [
+     "av",
+     "Add a vehicle",
+     "添加车辆",
+     "b"
+    ],
+    [
+     "fa",
+     "Show all bays (clear the filters)",
+     "显示全部车位（清空筛选）",
+     "b"
+    ],
+    [
+     "tc",
+     "Parking terms",
+     "停车条款",
+     "t"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "en",
+     "End the parking session and pay",
+     "结束停车并付费",
+     "bd"
+    ],
+    [
+     "dv",
+     "Delete my saved vehicle",
+     "删除我保存的车辆",
+     "bd"
+    ],
+    [
+     "pf",
+     "Pay the parking fine",
+     "缴纳停车罚款",
+     "bd"
+    ],
+    [
+     "rg",
+     "Revoke my guest pass",
+     "撤销我的访客通行证",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Reserve a space for next week.",
+     "zh": "预订下周的一个车位。",
+     "correct": [],
+     "decoys": [
+      "nr",
+      "ex",
+      "rm"
+     ],
+     "exclude": [
+      "fa"
+     ]
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Dispute a parking ticket I received.",
+     "zh": "对我收到的一张停车罚单提出异议。",
+     "correct": [],
+     "decoys": [
+      "rc",
+      "pr",
+      "hr"
+     ],
+     "exclude": [
+      "fa"
+     ]
+    },
+    {
+     "id": "a3",
+     "kind": "absent",
+     "en": "Get a monthly parking permit.",
+     "zh": "办一张月度停车许可证。",
+     "correct": [],
+     "decoys": [
+      "pr",
+      "nr",
+      "rc"
+     ],
+     "exclude": [
+      "fa"
+     ]
+    }
+   ]
+  }
+ ]
+}

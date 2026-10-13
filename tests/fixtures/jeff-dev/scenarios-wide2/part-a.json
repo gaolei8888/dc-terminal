@@ -1,0 +1,1298 @@
+{
+ "screens": [
+  {
+   "id": "carrental",
+   "platform": {
+    "en": "Car rental booking",
+    "zh": "租车预订"
+   },
+   "labels": [
+    [
+     "bk",
+     "Booking: compact car, Friday to Sunday",
+     "预订：紧凑型轿车，周五至周日",
+     "s"
+    ],
+    [
+     "pu",
+     "Pick-up: Airport terminal 2",
+     "取车：机场 2 号航站楼",
+     "s"
+    ],
+    [
+     "tot",
+     "Total $96.40, due at pick-up",
+     "总价 96.40 美元，取车时支付",
+     "s"
+    ],
+    [
+     "pt",
+     "Change the pick-up time",
+     "更改取车时间",
+     "b"
+    ],
+    [
+     "pd",
+     "Change the pick-up date",
+     "更改取车日期",
+     "b"
+    ],
+    [
+     "cs",
+     "Add a child seat",
+     "添加儿童座椅",
+     "b"
+    ],
+    [
+     "sd",
+     "Add a second driver",
+     "添加第二位驾驶员",
+     "b"
+    ],
+    [
+     "cc",
+     "Choose a different car class",
+     "选择其他车型级别",
+     "b"
+    ],
+    [
+     "mp",
+     "Show the pick-up location on a map",
+     "在地图上显示取车地点",
+     "b"
+    ],
+    [
+     "dc",
+     "Download the booking confirmation",
+     "下载预订确认单",
+     "b"
+    ],
+    [
+     "fl",
+     "Add your flight number",
+     "填写你的航班号",
+     "b"
+    ],
+    [
+     "fp",
+     "Show the fuel policy",
+     "显示燃油政策",
+     "b"
+    ],
+    [
+     "cmp",
+     "Compare with similar cars",
+     "与相似车型比较",
+     "b"
+    ],
+    [
+     "tp",
+     "Add a toll pass",
+     "添加通行费卡",
+     "b"
+    ],
+    [
+     "mi",
+     "Show the included mileage",
+     "显示包含的里程",
+     "b"
+    ],
+    [
+     "tc",
+     "Rental terms summary",
+     "租车条款摘要",
+     "t"
+    ],
+    [
+     "ab",
+     "About this rental company",
+     "关于这家租车公司",
+     "t"
+    ],
+    [
+     "cx",
+     "Cancel this rental booking",
+     "取消这笔租车预订",
+     "bd"
+    ],
+    [
+     "pay",
+     "Pay the deposit now",
+     "现在支付押金",
+     "bd"
+    ],
+    [
+     "dd",
+     "Delete my saved driver details",
+     "删除我保存的驾驶员信息",
+     "bd"
+    ],
+    [
+     "rsd",
+     "Remove the second driver",
+     "移除第二位驾驶员",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "I still want the car, but I need to get it a day later.",
+     "zh": "车我还是要，但我想晚一天取。",
+     "correct": [
+      "pd"
+     ],
+     "exclude": [
+      "pt"
+     ],
+     "lures": [
+      "cx",
+      "dd",
+      "rsd"
+     ]
+    },
+    {
+     "id": "z1",
+     "kind": "lure0",
+     "en": "Let my partner drive the car too.",
+     "zh": "让我的伴侣也能开这辆车。",
+     "correct": [
+      "sd"
+     ],
+     "exclude": [],
+     "lures": [
+      "rsd",
+      "dd",
+      "cx"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Switch this booking into my friend's name.",
+     "zh": "把这个预订改成我朋友的名字。",
+     "correct": [],
+     "decoys": [
+      "sd",
+      "pt",
+      "cc"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Rent a motorbike instead of a car.",
+     "zh": "改租摩托车而不是汽车。",
+     "correct": [],
+     "decoys": [
+      "cc",
+      "cmp",
+      "mi"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "vet",
+   "platform": {
+    "en": "Pet clinic appointments",
+    "zh": "宠物诊所预约"
+   },
+   "labels": [
+    [
+     "ap",
+     "Next visit: Biscuit the dog, Thursday 10:30",
+     "下次就诊：小饼干（狗），周四 10:30",
+     "s"
+    ],
+    [
+     "vc",
+     "Vaccinations: up to date",
+     "疫苗：已接种齐全",
+     "s"
+    ],
+    [
+     "wt",
+     "Last recorded weight 12.4 kg",
+     "上次记录体重 12.4 公斤",
+     "s"
+    ],
+    [
+     "rs",
+     "Pick a different time slot",
+     "选择其他时间段",
+     "b"
+    ],
+    [
+     "vr",
+     "Show vaccination records",
+     "显示疫苗记录",
+     "b"
+    ],
+    [
+     "rm",
+     "Set an appointment reminder",
+     "设置预约提醒",
+     "b"
+    ],
+    [
+     "ph",
+     "Show the clinic phone number",
+     "显示诊所电话",
+     "b"
+    ],
+    [
+     "dir",
+     "Get directions to the clinic",
+     "获取去诊所的路线",
+     "b"
+    ],
+    [
+     "wl",
+     "Add Biscuit's weight",
+     "记录小饼干的体重",
+     "b"
+    ],
+    [
+     "rx",
+     "Show current prescriptions",
+     "显示当前处方",
+     "b"
+    ],
+    [
+     "nt",
+     "Add a note for the vet",
+     "给兽医添加备注",
+     "b"
+    ],
+    [
+     "ins",
+     "Show insurance details",
+     "显示保险详情",
+     "b"
+    ],
+    [
+     "fe",
+     "Show the estimated fee",
+     "显示预估费用",
+     "b"
+    ],
+    [
+     "pet",
+     "Switch to another pet",
+     "切换到另一只宠物",
+     "b"
+    ],
+    [
+     "hist",
+     "Show past visits",
+     "显示历史就诊",
+     "b"
+    ],
+    [
+     "dl",
+     "Download the health summary",
+     "下载健康摘要",
+     "b"
+    ],
+    [
+     "pol",
+     "Clinic opening hours",
+     "诊所营业时间",
+     "t"
+    ],
+    [
+     "priv",
+     "Privacy policy",
+     "隐私政策",
+     "t"
+    ],
+    [
+     "cxa",
+     "Cancel this appointment",
+     "取消这次预约",
+     "bd"
+    ],
+    [
+     "dp",
+     "Delete Biscuit's profile",
+     "删除小饼干的档案",
+     "bd"
+    ],
+    [
+     "rma",
+     "Remove all reminders",
+     "移除所有提醒",
+     "bd"
+    ],
+    [
+     "sub",
+     "Submit the health form",
+     "提交健康表单",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Book a home visit by the vet.",
+     "zh": "预约兽医上门看诊。",
+     "correct": [],
+     "decoys": [
+      "rs",
+      "ph",
+      "dir"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Order Biscuit's food online.",
+     "zh": "在网上订小饼干的粮食。",
+     "correct": [],
+     "decoys": [
+      "rx",
+      "fe",
+      "wl"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a3",
+     "kind": "absent",
+     "en": "Change the clinic I am registered with.",
+     "zh": "更换我登记的诊所。",
+     "correct": [],
+     "decoys": [
+      "pet",
+      "dir",
+      "ph"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "library",
+   "platform": {
+    "en": "Library account",
+    "zh": "图书馆账户"
+   },
+   "labels": [
+    [
+     "ln",
+     "3 books on loan, 1 due Monday",
+     "借阅 3 本书，其中 1 本周一到期",
+     "s"
+    ],
+    [
+     "hd",
+     "2 holds waiting",
+     "2 个预约待取",
+     "s"
+    ],
+    [
+     "fn",
+     "Fine balance $0.00",
+     "罚款余额 0.00 美元",
+     "s"
+    ],
+    [
+     "rn",
+     "Renew the book due Monday",
+     "续借周一到期的书",
+     "b"
+    ],
+    [
+     "hl",
+     "Show my holds",
+     "显示我的预约",
+     "b"
+    ],
+    [
+     "na",
+     "Show new arrivals",
+     "查看新书",
+     "b"
+    ],
+    [
+     "al",
+     "Add a book to my to-read list",
+     "把书加入我的待读书单",
+     "b"
+    ],
+    [
+     "pr",
+     "Print my loan receipt",
+     "打印借阅凭单",
+     "b"
+    ],
+    [
+     "ec",
+     "Switch to e-books",
+     "切换到电子书",
+     "b"
+    ],
+    [
+     "rt",
+     "Show how to return a book by mail",
+     "显示邮寄还书说明",
+     "b"
+    ],
+    [
+     "nt",
+     "Turn on due-date notifications",
+     "开启到期提醒",
+     "b"
+    ],
+    [
+     "ph",
+     "Update my phone number",
+     "更新我的手机号",
+     "b"
+    ],
+    [
+     "bc",
+     "Show my library card barcode",
+     "显示我的借书证条码",
+     "b"
+    ],
+    [
+     "fs",
+     "Show fines and fees",
+     "显示罚款明细",
+     "b"
+    ],
+    [
+     "sl",
+     "Show my reading statistics",
+     "显示阅读统计",
+     "b"
+    ],
+    [
+     "kh",
+     "Keep my history, don't delete it",
+     "保留历史记录，不删除",
+     "b"
+    ],
+    [
+     "op",
+     "Opening hours",
+     "开放时间",
+     "t"
+    ],
+    [
+     "ab",
+     "About the library",
+     "关于图书馆",
+     "t"
+    ],
+    [
+     "rb",
+     "Remove the book due Monday from my account",
+     "把周一到期的书从我的账户中移除",
+     "bd"
+    ],
+    [
+     "dh",
+     "Delete my borrowing history",
+     "删除我的借阅历史",
+     "bd"
+    ],
+    [
+     "ch",
+     "Clear my to-read list",
+     "清空我的待读书单",
+     "bd"
+    ],
+    [
+     "cl",
+     "Close my library account",
+     "关闭我的图书馆账户",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Keep the book that is due Monday for a few more weeks.",
+     "zh": "周一到期的那本书我想再留几周。",
+     "correct": [
+      "rn"
+     ],
+     "exclude": [],
+     "lures": [
+      "rb",
+      "dh",
+      "cl"
+     ]
+    },
+    {
+     "id": "z1",
+     "kind": "lure0",
+     "en": "Put a new book on my to-read list.",
+     "zh": "把一本新书放进我的待读书单。",
+     "correct": [
+      "al"
+     ],
+     "exclude": [
+      "kh"
+     ],
+     "lures": [
+      "ch",
+      "dh",
+      "rb"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Borrow a book from a library in another city.",
+     "zh": "向另一个城市的图书馆借一本书。",
+     "correct": [],
+     "decoys": [
+      "na",
+      "ec",
+      "hl"
+     ],
+     "exclude": [
+      "kh"
+     ]
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Volunteer to read to children on Saturdays.",
+     "zh": "报名周六给孩子们读书。",
+     "correct": [],
+     "decoys": [
+      "na",
+      "sl",
+      "ab"
+     ],
+     "exclude": [
+      "kh"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "tax",
+   "platform": {
+    "en": "Tax filing summary",
+    "zh": "报税概览"
+   },
+   "labels": [
+    [
+     "yr",
+     "Tax year 2025, status: draft",
+     "2025 税务年度，状态：草稿",
+     "s"
+    ],
+    [
+     "rf",
+     "Estimated refund: $1,240",
+     "预计退税：1,240 美元",
+     "s"
+    ],
+    [
+     "dd",
+     "Filing deadline: April 15",
+     "申报截止日：4 月 15 日",
+     "s"
+    ],
+    [
+     "im",
+     "Import last year's data",
+     "导入去年的数据",
+     "b"
+    ],
+    [
+     "di",
+     "Show deductions found",
+     "显示已找到的扣除项",
+     "b"
+    ],
+    [
+     "er",
+     "Review the entered income",
+     "检查已填写的收入",
+     "b"
+    ],
+    [
+     "ad",
+     "Add a dependent",
+     "添加受抚养人",
+     "b"
+    ],
+    [
+     "rc",
+     "Attach a receipt photo",
+     "附上收据照片",
+     "b"
+    ],
+    [
+     "pv",
+     "Preview the full return",
+     "预览完整申报表",
+     "b"
+    ],
+    [
+     "dl",
+     "Download a draft PDF",
+     "下载草稿 PDF",
+     "b"
+    ],
+    [
+     "chk",
+     "Run the error check",
+     "运行错误检查",
+     "b"
+    ],
+    [
+     "nt",
+     "Add a note to the accountant",
+     "给会计添加备注",
+     "b"
+    ],
+    [
+     "cm",
+     "Compare with last year",
+     "与去年比较",
+     "b"
+    ],
+    [
+     "bk",
+     "Show bank details for the refund",
+     "显示退税银行账户",
+     "b"
+    ],
+    [
+     "tp",
+     "Show tax tips",
+     "显示报税提示",
+     "b"
+    ],
+    [
+     "sm",
+     "Show a summary by category",
+     "按类别显示摘要",
+     "b"
+    ],
+    [
+     "gl",
+     "Glossary",
+     "术语表",
+     "t"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "fl",
+     "Submit my return to the tax office",
+     "向税务局提交我的申报表",
+     "bd"
+    ],
+    [
+     "dr",
+     "Delete this draft return",
+     "删除这份申报草稿",
+     "bd"
+    ],
+    [
+     "pay",
+     "Pay my estimated tax now",
+     "立即支付我的预缴税款",
+     "bd"
+    ],
+    [
+     "rs",
+     "Reset all entries",
+     "重置所有已填内容",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Ask the tax office for a payment plan.",
+     "zh": "向税务局申请分期缴税。",
+     "correct": [],
+     "decoys": [
+      "bk",
+      "di",
+      "chk"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Amend a return I filed three years ago.",
+     "zh": "修改我三年前提交的申报表。",
+     "correct": [],
+     "decoys": [
+      "im",
+      "pv",
+      "cm"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "watch",
+   "platform": {
+    "en": "Smartwatch companion app",
+    "zh": "智能手表配套应用"
+   },
+   "labels": [
+    [
+     "bt",
+     "Watch battery 62%",
+     "手表电量 62%",
+     "s"
+    ],
+    [
+     "sy",
+     "Last synced 5 minutes ago",
+     "5 分钟前同步",
+     "s"
+    ],
+    [
+     "fw",
+     "Software version 4.2",
+     "软件版本 4.2",
+     "s"
+    ],
+    [
+     "fa",
+     "Find my watch",
+     "查找我的手表",
+     "b"
+    ],
+    [
+     "wf",
+     "Change the watch face",
+     "更换表盘",
+     "b"
+    ],
+    [
+     "ng",
+     "Turn on night mode",
+     "开启夜间模式",
+     "b"
+    ],
+    [
+     "ws",
+     "Show the workout summary",
+     "显示运动总结",
+     "b"
+    ],
+    [
+     "hr",
+     "Set heart-rate alerts",
+     "设置心率提醒",
+     "b"
+    ],
+    [
+     "sl",
+     "Set a sleep schedule",
+     "设置睡眠计划",
+     "b"
+    ],
+    [
+     "nf",
+     "Choose which notifications to show",
+     "选择显示哪些通知",
+     "b"
+    ],
+    [
+     "br",
+     "Adjust the brightness",
+     "调节亮度",
+     "b"
+    ],
+    [
+     "sn",
+     "Sync now",
+     "立即同步",
+     "b"
+    ],
+    [
+     "gl",
+     "Set a daily step goal",
+     "设置每日步数目标",
+     "b"
+    ],
+    [
+     "rw",
+     "Turn on raise-to-wake",
+     "开启抬腕亮屏",
+     "b"
+    ],
+    [
+     "wl",
+     "Turn on water lock",
+     "开启防水锁定",
+     "b"
+    ],
+    [
+     "ap",
+     "Rearrange the apps",
+     "调整应用顺序",
+     "b"
+    ],
+    [
+     "hp",
+     "Watch manual",
+     "手表说明书",
+     "t"
+    ],
+    [
+     "wr",
+     "Warranty details",
+     "保修详情",
+     "t"
+    ],
+    [
+     "um",
+     "Unpair this watch",
+     "取消配对这块手表",
+     "bd"
+    ],
+    [
+     "fr",
+     "Factory reset the watch",
+     "恢复手表出厂设置",
+     "bd"
+    ],
+    [
+     "dh",
+     "Delete all workout data",
+     "删除所有运动数据",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Change how the watch looks without touching any of my data.",
+     "zh": "改变手表的样子，但不要动我的任何数据。",
+     "correct": [
+      "wf"
+     ],
+     "exclude": [
+      "ap"
+     ],
+     "lures": [
+      "fr",
+      "um",
+      "dh"
+     ]
+    },
+    {
+     "id": "z1",
+     "kind": "lure0",
+     "en": "Keep the watch quiet while I sleep.",
+     "zh": "我睡觉时让手表保持安静。",
+     "correct": [
+      "ng"
+     ],
+     "exclude": [
+      "nf",
+      "sl"
+     ],
+     "lures": [
+      "um",
+      "fr",
+      "dh"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Pay for my coffee with the watch.",
+     "zh": "用手表付我的咖啡钱。",
+     "correct": [],
+     "decoys": [
+      "wl",
+      "nf",
+      "fa"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Answer a phone call on the watch speaker.",
+     "zh": "用手表扬声器接听电话。",
+     "correct": [],
+     "decoys": [
+      "nf",
+      "br",
+      "rw"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "videoedit",
+   "platform": {
+    "en": "Video editor timeline",
+    "zh": "视频剪辑时间线"
+   },
+   "labels": [
+    [
+     "pr",
+     "Project: Beach Day, 02:48",
+     "项目：海滩日，02:48",
+     "s"
+    ],
+    [
+     "sel",
+     "Selected clip: Clip 5, 12 seconds",
+     "已选片段：片段 5，12 秒",
+     "s"
+    ],
+    [
+     "tr",
+     "3 video tracks, 2 audio tracks",
+     "3 条视频轨道，2 条音频轨道",
+     "s"
+    ],
+    [
+     "sp",
+     "Split at the playhead",
+     "在播放头处分割",
+     "b"
+    ],
+    [
+     "tm",
+     "Trim the start of the clip",
+     "裁剪片段开头",
+     "b"
+    ],
+    [
+     "sd",
+     "Change the clip speed",
+     "更改片段速度",
+     "b"
+    ],
+    [
+     "vo",
+     "Lower the clip volume",
+     "降低片段音量",
+     "b"
+    ],
+    [
+     "tt",
+     "Add a title",
+     "添加标题",
+     "b"
+    ],
+    [
+     "tx",
+     "Add a transition",
+     "添加转场",
+     "b"
+    ],
+    [
+     "cl",
+     "Change the colour grade",
+     "调整调色",
+     "b"
+    ],
+    [
+     "rv",
+     "Reverse the clip",
+     "倒放片段",
+     "b"
+    ],
+    [
+     "fr",
+     "Freeze this frame",
+     "定格当前帧",
+     "b"
+    ],
+    [
+     "zm",
+     "Zoom the timeline in",
+     "放大时间线",
+     "b"
+    ],
+    [
+     "dp",
+     "Duplicate the clip",
+     "复制片段",
+     "b"
+    ],
+    [
+     "ms",
+     "Mute this track",
+     "将这条轨道静音",
+     "b"
+    ],
+    [
+     "ex",
+     "Export a preview",
+     "导出预览",
+     "b"
+    ],
+    [
+     "mk",
+     "Add a marker here",
+     "在这里添加标记",
+     "b"
+    ],
+    [
+     "sh",
+     "Keyboard shortcuts",
+     "键盘快捷键",
+     "t"
+    ],
+    [
+     "ab",
+     "About this editor",
+     "关于这个编辑器",
+     "t"
+    ],
+    [
+     "dl",
+     "Delete the selected clip",
+     "删除所选片段",
+     "bd"
+    ],
+    [
+     "rm",
+     "Remove all clips from the timeline",
+     "移除时间线上所有片段",
+     "bd"
+    ],
+    [
+     "ov",
+     "Overwrite the project file",
+     "覆盖项目文件",
+     "bd"
+    ],
+    [
+     "dc",
+     "Discard all edits since the last save",
+     "放弃上次保存以来的所有修改",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Remove the background noise with AI.",
+     "zh": "用 AI 去掉背景噪音。",
+     "correct": [],
+     "decoys": [
+      "vo",
+      "ms",
+      "cl"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Stabilize the shaky footage.",
+     "zh": "把抖动的画面稳定下来。",
+     "correct": [],
+     "decoys": [
+      "zm",
+      "tm",
+      "sd"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a3",
+     "kind": "absent",
+     "en": "Put the finished video on a streaming site.",
+     "zh": "把成片发到视频网站上。",
+     "correct": [],
+     "decoys": [
+      "ex",
+      "mk",
+      "pr"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "payroll",
+   "platform": {
+    "en": "Payroll portal",
+    "zh": "薪资门户"
+   },
+   "labels": [
+    [
+     "nx",
+     "Next payday: Friday",
+     "下次发薪日：周五",
+     "s"
+    ],
+    [
+     "nt",
+     "Net pay this period: $2,380",
+     "本期实发工资：2,380 美元",
+     "s"
+    ],
+    [
+     "ytd",
+     "Year to date: $21,420",
+     "年累计：21,420 美元",
+     "s"
+    ],
+    [
+     "ps",
+     "View my latest payslip",
+     "查看我最新的工资单",
+     "b"
+    ],
+    [
+     "pd",
+     "Download payslips as a zip file",
+     "把工资单下载为压缩包",
+     "b"
+    ],
+    [
+     "tx",
+     "Show tax withholding",
+     "显示预扣税",
+     "b"
+    ],
+    [
+     "dd",
+     "Show direct deposit details",
+     "显示直接存款详情",
+     "b"
+    ],
+    [
+     "bn",
+     "Show my benefits",
+     "显示我的福利",
+     "b"
+    ],
+    [
+     "ov",
+     "Show overtime hours",
+     "显示加班时长",
+     "b"
+    ],
+    [
+     "yr",
+     "Show the year-end summary",
+     "显示年度汇总",
+     "b"
+    ],
+    [
+     "ex",
+     "Show expense claims",
+     "显示报销记录",
+     "b"
+    ],
+    [
+     "ld",
+     "Show my leave balance",
+     "显示我的假期余额",
+     "b"
+    ],
+    [
+     "cmp",
+     "Show how net pay is calculated",
+     "显示实发工资的计算方式",
+     "b"
+    ],
+    [
+     "sal",
+     "Show salary history",
+     "显示薪资历史",
+     "b"
+    ],
+    [
+     "cal",
+     "Show the payroll calendar",
+     "显示发薪日历",
+     "b"
+    ],
+    [
+     "pol",
+     "Payroll policy",
+     "薪资政策",
+     "t"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "dsl",
+     "Delete my saved tax form",
+     "删除我保存的税表",
+     "bd"
+    ],
+    [
+     "sub",
+     "Submit my expense claim",
+     "提交我的报销单",
+     "bd"
+    ],
+    [
+     "wd",
+     "Withdraw my overtime request",
+     "撤回我的加班申请",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Get an advance on next month's pay.",
+     "zh": "预支下个月的工资。",
+     "correct": [],
+     "decoys": [
+      "ps",
+      "sal",
+      "cmp"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Swap shifts with a colleague.",
+     "zh": "和同事调班。",
+     "correct": [],
+     "decoys": [
+      "ov",
+      "cal",
+      "ld"
+     ],
+     "exclude": []
+    }
+   ]
+  }
+ ]
+}

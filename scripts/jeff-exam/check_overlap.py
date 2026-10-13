@@ -1,4 +1,4 @@
-"""Dev/exam leak check: no dev item may share a screen or a goal with the frozen exam, and no wide-dev item with a base-dev item.
+"""Dev/exam leak check: no dev item may share a screen or a goal with the frozen exam, and no wide item with a base item, no wide2 item with a base or wide item.
 
     python3 -I scripts/jeff-exam/check_overlap.py [--max 0.5]
 
@@ -65,12 +65,14 @@ def main():
     ap.add_argument("--max", type=float, default=0.5)
     a = ap.parse_args()
     exam = load_items(os.path.join(ROOT, "jeff-exam", "exam-v2.jsonl"))
-    dev = load_items(os.path.join(ROOT, "jeff-dev", "dev-v2.jsonl"))
-    base = [d for d in dev if d["part"] == "base"]
-    wide = [d for d in dev if d["part"] == "wide"]
+    dev = load_items(os.path.join(ROOT, "jeff-dev", "dev-v3.jsonl"))
+    part = {p: [d for d in dev if d["part"] == p] for p in ("base", "wide", "wide2")}
     bad = check("dev (all) vs exam", dev, exam, a.max)
-    bad |= check("wide vs exam", wide, exam, a.max)
-    bad |= check("wide vs base dev items", wide, base, a.max)
+    bad |= check("wide vs exam", part["wide"], exam, a.max)
+    bad |= check("wide2 vs exam", part["wide2"], exam, a.max)
+    bad |= check("wide vs base dev items", part["wide"], part["base"], a.max)
+    bad |= check("wide2 vs base dev items", part["wide2"], part["base"], a.max)
+    bad |= check("wide2 vs wide dev items", part["wide2"], part["wide"], a.max)
     print("FAIL" if bad else f"OK (max allowed {a.max})")
     sys.exit(1 if bad else 0)
 

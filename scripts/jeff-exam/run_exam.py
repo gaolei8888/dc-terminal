@@ -4,7 +4,7 @@ confidence (coverage, confident-wrong, threshold sweep) / latency / variance.
     python3 -I scripts/jeff-exam/run_exam.py --label v1.2 --out DIR [--set exam|dev] [--url http://127.0.0.1:8796] [--seeds 5]
                                               [--threshold 0.8]
 
---set dev runs tests/fixtures/jeff-dev/dev-v2.jsonl: the set the threshold is CHOSEN on. The frozen exam is then evaluated once at
+--set dev runs tests/fixtures/jeff-dev/dev-v3.jsonl: the set the threshold is CHOSEN on. The frozen exam is then evaluated once at
 that threshold; never pick a threshold from the exam's own sweep. The set that ran is printed first and written into the report.
 
 Seed 0 is the natural reading order; seeds >= 1 lay the same screen out in another order (jeff-serve is deterministic,
@@ -25,7 +25,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exam_lib import ABSTAIN_KEY, FIXED, load_items, pick_of, render, sha256_file  # noqa: E402
 
-SETS = {"exam": ("jeff-exam", "exam-v2.jsonl"), "dev": ("jeff-dev", "dev-v2.jsonl")}
+SETS = {"exam": ("jeff-exam", "exam-v2.jsonl"), "dev": ("jeff-dev", "dev-v3.jsonl")}
 SWEEP = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.98, 0.99]
 SCROLL_WAIT = ("scroll_down", "scroll_up", "wait")
 BUCKETS = ["2-4", "5-9", "10-14", "15-20"]

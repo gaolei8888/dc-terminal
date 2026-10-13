@@ -1177,16 +1177,15 @@
      ]
     },
     {
-     "id": "a1",
+     "id": "a2",
      "kind": "absent",
-     "en": "Switch from monthly to yearly billing.",
-     "zh": "把按月付费改成按年付费。",
+     "en": "Print a shipping label for my parcel.",
+     "zh": "打印我包裹的快递单。",
      "correct": [],
      "decoys": [
-      "cmp",
-      "pz",
-      "cpm",
-      "seat"
+      "dli",
+      "addr",
+      "inv"
      ],
      "exclude": []
     }

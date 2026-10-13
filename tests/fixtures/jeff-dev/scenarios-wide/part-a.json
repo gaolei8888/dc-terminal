@@ -1848,15 +1848,15 @@
      ]
     },
     {
-     "id": "a1",
+     "id": "a2",
      "kind": "absent",
-     "en": "Add more memory without changing the server type.",
-     "zh": "在不更换服务器类型的情况下增加内存。",
+     "en": "Add a second network card to this server.",
+     "zh": "给这台服务器增加第二块网卡。",
      "correct": [],
      "decoys": [
-      "rsz",
-      "tag",
-      "fw"
+      "ip",
+      "fw",
+      "mon"
      ],
      "exclude": []
     }

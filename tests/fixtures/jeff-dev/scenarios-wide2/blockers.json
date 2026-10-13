@@ -1,0 +1,626 @@
+{
+ "blockers": [
+  {
+   "id": "mailedcode",
+   "platform": {
+    "en": "Verification letter",
+    "zh": "核验信函"
+   },
+   "why": "a code arrives by post in days",
+   "labels": [
+    [
+     "h",
+     "We posted a letter with your code to your home address",
+     "我们已把含验证码的信寄到你的家庭住址",
+     "s"
+    ],
+    [
+     "q",
+     "It usually arrives in 5 to 7 days",
+     "通常 5 至 7 天送达",
+     "s"
+    ],
+    [
+     "w",
+     "Your account stays limited until you enter the code",
+     "输入验证码之前账户功能受限",
+     "s"
+    ],
+    [
+     "rs",
+     "Resend the letter",
+     "重新寄一封信",
+     "b"
+    ],
+    [
+     "ca",
+     "Change the mailing address",
+     "更改邮寄地址",
+     "b"
+    ],
+    [
+     "tr",
+     "Show the letter's tracking status",
+     "显示信件追踪状态",
+     "b"
+    ],
+    [
+     "sa",
+     "Show a sample of the letter",
+     "查看信件样例",
+     "b"
+    ],
+    [
+     "fq",
+     "Why do you need to verify me?",
+     "为什么需要验证我？",
+     "t"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Show the balance of my savings account.",
+     "zh": "显示我储蓄账户的余额。"
+    },
+    {
+     "id": "b2",
+     "en": "Add a payee to my account.",
+     "zh": "给我的账户添加一位收款人。"
+    },
+    {
+     "id": "b3",
+     "en": "Show my transaction history.",
+     "zh": "显示我的交易记录。"
+    }
+   ]
+  },
+  {
+   "id": "inperson",
+   "platform": {
+    "en": "Branch visit required",
+    "zh": "需到网点办理"
+   },
+   "why": "must be done in person with photo ID",
+   "labels": [
+    [
+     "h",
+     "For your security this step must be done in person",
+     "出于安全考虑，这一步必须本人到场办理",
+     "s"
+    ],
+    [
+     "q",
+     "Bring a photo ID and this reference: 48-2291",
+     "请携带带照片的证件和此编号：48-2291",
+     "s"
+    ],
+    [
+     "o",
+     "Open Monday to Friday, 9 to 5",
+     "周一至周五 9 点至 17 点营业",
+     "s"
+    ],
+    [
+     "fb",
+     "Find the nearest branch",
+     "查找最近的网点",
+     "b"
+    ],
+    [
+     "oh",
+     "Show the branch opening hours",
+     "显示网点营业时间",
+     "b"
+    ],
+    [
+     "wb",
+     "Show what to bring",
+     "显示需要携带的材料",
+     "b"
+    ],
+    [
+     "gd",
+     "Get directions",
+     "获取路线",
+     "b"
+    ],
+    [
+     "wt",
+     "Show the expected waiting time",
+     "显示预计等待时间",
+     "b"
+    ],
+    [
+     "tm",
+     "Branch services",
+     "网点服务",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Raise my daily transfer limit.",
+     "zh": "提高我的每日转账限额。"
+    },
+    {
+     "id": "b2",
+     "en": "Replace my lost card.",
+     "zh": "补办我丢失的银行卡。"
+    }
+   ]
+  },
+  {
+   "id": "paywall",
+   "platform": {
+    "en": "Upgrade required",
+    "zh": "需要升级"
+   },
+   "why": "the feature needs a paid plan, which only the person may buy",
+   "labels": [
+    [
+     "h",
+     "This feature is part of the Pro plan",
+     "这个功能属于专业版套餐",
+     "s"
+    ],
+    [
+     "q",
+     "Pro costs $9 per month",
+     "专业版每月 9 美元",
+     "s"
+    ],
+    [
+     "c",
+     "Your current plan: Free",
+     "你当前的套餐：免费版",
+     "s"
+    ],
+    [
+     "wi",
+     "See what Pro includes",
+     "查看专业版包含什么",
+     "b"
+    ],
+    [
+     "cp",
+     "Compare plans",
+     "比较套餐",
+     "b"
+    ],
+    [
+     "ft",
+     "Start a 7-day free trial",
+     "开始 7 天免费试用",
+     "b"
+    ],
+    [
+     "rp",
+     "Restore a previous purchase",
+     "恢复以前的购买",
+     "b"
+    ],
+    [
+     "gc",
+     "Enter a gift code",
+     "输入礼品码",
+     "b"
+    ],
+    [
+     "tt",
+     "Free trial terms",
+     "免费试用条款",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Create a shared team workspace.",
+     "zh": "创建一个共享的团队空间。"
+    },
+    {
+     "id": "b2",
+     "en": "Remove the watermark from my photo.",
+     "zh": "去掉我照片上的水印。"
+    },
+    {
+     "id": "b3",
+     "en": "Set up automatic backups.",
+     "zh": "设置自动备份。"
+    }
+   ]
+  },
+  {
+   "id": "nosim",
+   "platform": {
+    "en": "No SIM card",
+    "zh": "没有 SIM 卡"
+   },
+   "why": "needs a SIM card physically inserted",
+   "labels": [
+    [
+     "h",
+     "No SIM card detected",
+     "未检测到 SIM 卡",
+     "s"
+    ],
+    [
+     "q",
+     "Insert a SIM card and restart the phone",
+     "请插入 SIM 卡并重启手机",
+     "s"
+    ],
+    [
+     "d",
+     "Mobile data is unavailable",
+     "移动数据不可用",
+     "s"
+    ],
+    [
+     "ch",
+     "Check again",
+     "再检查一次",
+     "b"
+    ],
+    [
+     "sh",
+     "Show how to insert a SIM card",
+     "显示如何插入 SIM 卡",
+     "b"
+    ],
+    [
+     "ns",
+     "Open the network settings",
+     "打开网络设置",
+     "b"
+    ],
+    [
+     "am",
+     "Show the airplane mode status",
+     "显示飞行模式状态",
+     "b"
+    ],
+    [
+     "em",
+     "Show the emergency call options",
+     "显示紧急呼叫选项",
+     "b"
+    ],
+    [
+     "hp",
+     "Phone help",
+     "手机帮助",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Call the dentist.",
+     "zh": "给牙医打电话。"
+    },
+    {
+     "id": "b2",
+     "en": "Receive a verification text message.",
+     "zh": "接收一条验证短信。"
+    },
+    {
+     "id": "b3",
+     "en": "Text my brother that I am running late.",
+     "zh": "给我哥哥发短信说我要迟到了。"
+    }
+   ]
+  },
+  {
+   "id": "wifiportal",
+   "platform": {
+    "en": "Hotel Wi-Fi sign-in",
+    "zh": "酒店 Wi-Fi 登录"
+   },
+   "why": "needs a code printed on the key card, from the front desk",
+   "labels": [
+    [
+     "h",
+     "Welcome to Grand Lake Hotel Wi-Fi",
+     "欢迎使用大湖酒店 Wi-Fi",
+     "s"
+    ],
+    [
+     "q",
+     "Enter your room number and the code printed on your key card",
+     "请输入房号和房卡上印的代码",
+     "s"
+    ],
+    [
+     "f",
+     "Ask the front desk if you do not have a code",
+     "没有代码请询问前台",
+     "s"
+    ],
+    [
+     "rc",
+     "Check the connection again",
+     "再检查一次连接",
+     "b"
+    ],
+    [
+     "nd",
+     "Show the network details",
+     "显示网络详情",
+     "b"
+    ],
+    [
+     "sp",
+     "Run a speed test",
+     "运行网速测试",
+     "b"
+    ],
+    [
+     "fg",
+     "Forget this network",
+     "忘记这个网络",
+     "b"
+    ],
+    [
+     "tm",
+     "Hotel Wi-Fi terms",
+     "酒店 Wi-Fi 条款",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Stream the live football match.",
+     "zh": "观看足球比赛直播。"
+    },
+    {
+     "id": "b2",
+     "en": "Join the video call at 3 pm.",
+     "zh": "参加下午 3 点的视频通话。"
+    },
+    {
+     "id": "b3",
+     "en": "Sync my photos to the cloud.",
+     "zh": "把我的照片同步到云端。"
+    }
+   ]
+  },
+  {
+   "id": "devicepower",
+   "platform": {
+    "en": "Battery too low",
+    "zh": "电量太低"
+   },
+   "why": "needs the charger plugged in",
+   "labels": [
+    [
+     "h",
+     "Battery 4%, firmware update paused",
+     "电量 4%，固件更新已暂停",
+     "s"
+    ],
+    [
+     "q",
+     "Connect the charger to continue",
+     "请连接充电器以继续",
+     "s"
+    ],
+    [
+     "w",
+     "The update resumes when charging starts",
+     "开始充电后更新会继续",
+     "s"
+    ],
+    [
+     "bh",
+     "Show the battery health",
+     "显示电池健康",
+     "b"
+    ],
+    [
+     "ct",
+     "Show charging tips",
+     "显示充电提示",
+     "b"
+    ],
+    [
+     "ud",
+     "Show the update details",
+     "显示更新详情",
+     "b"
+    ],
+    [
+     "rl",
+     "Show the release notes",
+     "查看更新说明",
+     "b"
+    ],
+    [
+     "ch",
+     "Check again",
+     "再检查一次",
+     "b"
+    ],
+    [
+     "hp",
+     "Device help",
+     "设备帮助",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Open the camera.",
+     "zh": "打开相机。"
+    },
+    {
+     "id": "b2",
+     "en": "Play my workout playlist.",
+     "zh": "播放我的健身歌单。"
+    }
+   ]
+  },
+  {
+   "id": "signedform",
+   "platform": {
+    "en": "Print and sign",
+    "zh": "打印并签字"
+   },
+   "why": "must be signed by hand on paper",
+   "labels": [
+    [
+     "h",
+     "Print this form, sign it by hand, then scan it back",
+     "请打印这份表格，手写签字后扫描回传",
+     "s"
+    ],
+    [
+     "q",
+     "Unsigned forms are rejected",
+     "未签字的表格会被拒收",
+     "s"
+    ],
+    [
+     "p",
+     "Page 1 of 2",
+     "第 1 页，共 2 页",
+     "s"
+    ],
+    [
+     "dl",
+     "Download the form as a PDF",
+     "下载表格 PDF",
+     "b"
+    ],
+    [
+     "sc",
+     "Show how to scan a document",
+     "显示如何扫描文件",
+     "b"
+    ],
+    [
+     "ex",
+     "Show a filled-in example",
+     "查看填写示例",
+     "b"
+    ],
+    [
+     "ma",
+     "Show the mailing address instead",
+     "改为查看邮寄地址",
+     "b"
+    ],
+    [
+     "pp",
+     "Print preview",
+     "打印预览",
+     "b"
+    ],
+    [
+     "fq",
+     "Form questions",
+     "表格常见问题",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Check my appointment time.",
+     "zh": "查看我的预约时间。"
+    },
+    {
+     "id": "b2",
+     "en": "Change my notification sound.",
+     "zh": "更换我的通知铃声。"
+    }
+   ]
+  },
+  {
+   "id": "kiosklock",
+   "platform": {
+    "en": "Kiosk locked",
+    "zh": "自助机已锁定"
+   },
+   "why": "only a staff member with a staff card can unlock it",
+   "labels": [
+    [
+     "h",
+     "This kiosk is locked",
+     "这台自助机已锁定",
+     "s"
+    ],
+    [
+     "q",
+     "A staff member must unlock it with a staff card",
+     "需要工作人员刷员工卡解锁",
+     "s"
+    ],
+    [
+     "w",
+     "Please wait for assistance",
+     "请等待工作人员协助",
+     "s"
+    ],
+    [
+     "lg",
+     "Switch the language",
+     "切换语言",
+     "b"
+    ],
+    [
+     "ac",
+     "Show the accessibility options",
+     "显示无障碍选项",
+     "b"
+    ],
+    [
+     "hv",
+     "Watch the help video",
+     "观看帮助视频",
+     "b"
+    ],
+    [
+     "ts",
+     "Increase the text size",
+     "增大字号",
+     "b"
+    ],
+    [
+     "mp",
+     "Show the map of this building",
+     "显示本楼地图",
+     "b"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Print my boarding pass.",
+     "zh": "打印我的登机牌。"
+    },
+    {
+     "id": "b2",
+     "en": "Collect my parcel.",
+     "zh": "领取我的包裹。"
+    }
+   ]
+  }
+ ]
+}
