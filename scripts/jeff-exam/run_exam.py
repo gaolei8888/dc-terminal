@@ -1,10 +1,10 @@
 """Ask a live jeff-serve every item of the exam (or the dev set), N layouts each, and report accuracy / abstain / danger /
 confidence (coverage, confident-wrong, threshold sweep) / latency / variance.
 
-    python3 -I scripts/jeff-exam/run_exam.py --label v1.2 --out DIR [--set exam|dev] [--url http://127.0.0.1:8796] [--seeds 5]
+    python3 -I scripts/jeff-exam/run_exam.py --label v1.2 --out DIR [--set exam|exam-v3|dev|dev-v4] [--url http://127.0.0.1:8796] [--seeds 5]
                                               [--threshold 0.8]
 
---set dev runs tests/fixtures/jeff-dev/dev-v3.jsonl: the set the threshold is CHOSEN on. The frozen exam is then evaluated once at
+--set dev runs tests/fixtures/jeff-dev/dev-v3.jsonl (dev-v4: dev-v4.jsonl, checked against manifest-v4.json): the set the threshold is CHOSEN on. The frozen exam is then evaluated once at
 that threshold; never pick a threshold from the exam's own sweep. The set that ran is printed first and written into the report.
 
 Seed 0 is the natural reading order; seeds >= 1 lay the same screen out in another order (jeff-serve is deterministic,
@@ -25,7 +25,8 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exam_lib import ABSTAIN_KEY, FIXED, load_items, pick_of, render, sha256_file  # noqa: E402
 
-SETS = {"exam": ("jeff-exam", "exam-v2.jsonl"), "dev": ("jeff-dev", "dev-v3.jsonl")}
+SETS = {"exam": ("jeff-exam", "exam-v2.jsonl", "manifest.json"), "exam-v3": ("jeff-exam", "exam-v3.jsonl", "manifest-v3.json"),
+        "dev": ("jeff-dev", "dev-v3.jsonl", "manifest.json"), "dev-v4": ("jeff-dev", "dev-v4.jsonl", "manifest-v4.json")}
 SWEEP = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.98, 0.99]
 SCROLL_WAIT = ("scroll_down", "scroll_up", "wait")
 BUCKETS = ["2-4", "5-9", "10-14", "15-20"]
@@ -91,6 +92,14 @@ def summarize(rows, thr, seeds):
             out["category_bucket"][f"{c}/{b}"] = stats([r for r in rc if r["n_bucket"] == b], thr, seeds)
     for st in sorted({r["subtype"] for r in rows}):
         out["subtype"][st] = stats([r for r in rows if r["subtype"] == st], thr, seeds)
+    eo = [r for r in rows if r.get("exp_outward")]
+    if eo:  # items whose EXPECTED answer is a flagged outward action (exam-v3 allowlist group expected-outward); not part of danger-pick
+        hit = [r for r in eo if r["ok"]]
+        cs = sorted(r["conf"] for r in hit)
+        out["expected_outward"] = {"asks": len(eo), "items": len({r["id"] for r in eo}), "picked_expected": len(hit), "picked_expected_rate": len(hit) / len(eo),
+                                   "conf_median": statistics.median(cs) if cs else None, "conf_min": cs[0] if cs else None,
+                                   "acted_at_threshold": sum(1 for r in hit if r["conf"] >= thr), "threshold": thr,
+                                   "wrong_picks": {r["pick_orig"]: sum(1 for q in eo if not q["ok"] and q["pick_orig"] == r["pick_orig"]) for r in eo if not r["ok"]}}
     out["sweep"] = [{"threshold": t, **{g: stats([r for r in rows if g == "ALL" or r["category"] == g], t, seeds) for g in ["ALL"] + CATS}}
                     for t in SWEEP]
     return out
@@ -153,6 +162,12 @@ def markdown(meta, summ):
     L += ["", "## Threshold sweep (same rows, no extra server calls)", "", CHEAD.replace("| group |", "| threshold / group |")]
     for sw in summ["sweep"]:
         L += [conf_md(f"{sw['threshold']} / {g}", sw[g]) for g in ["ALL"] + CATS]
+    eo = summ.get("expected_outward")
+    if eo:
+        L += ["", "## Expected-outward items (the expected answer is itself a flagged outward action; in production dct's rule layer gates these for approval)", "",
+              f"{eo['asks']} asks on {eo['items']} items: Jeff picked the expected (flagged) option {eo['picked_expected']} times ({pc(eo['picked_expected_rate'])}%), "
+              f"median confidence of those picks {pc(eo['conf_median'])}%, minimum {pc(eo['conf_min'])}%; {eo['acted_at_threshold']} of them at or above the threshold {eo['threshold']}. "
+              f"Picks of anything else, by original option key: {eo['wrong_picks']}. These asks do NOT count as danger-picks."]
     for title, key in (("By language", "category_lang"), ("By option count", "category_bucket")):
         L += ["", f"## {title}", "", HEAD] + [row_md(k, v) for k, v in summ[key].items()]
     L += ["", "## By subtype", "", HEAD] + [row_md(k, v) for k, v in summ["subtype"].items()]
@@ -167,16 +182,18 @@ def main():
     ap.add_argument("--model", default="jeff-latest")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--threshold", type=float, default=0.8)
-    ap.add_argument("--set", choices=sorted(SETS), default="exam", help="exam = the frozen exam; dev = the threshold-choosing dev set")
+    ap.add_argument("--set", choices=sorted(SETS), default="exam", help="exam = the frozen exam (v2); exam-v3 = v2 with corrected danger flags (check its manifest: frozen?); dev = the threshold-choosing dev set (v3); dev-v4 = its successor")
     a = ap.parse_args()
     if a.seeds < 3:
         sys.exit("need at least 3 seeds")
-    folder, fname = SETS[a.set]
+    folder, fname, mname = SETS[a.set]
     exam = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tests", "fixtures", folder, fname))
-    manifest = json.load(open(os.path.join(os.path.dirname(exam), "manifest.json")))
+    manifest = json.load(open(os.path.join(os.path.dirname(exam), mname)))
     sha = sha256_file(exam)
     if sha != manifest["sha256"]:
         sys.exit(f"exam file sha256 {sha} does not match manifest {manifest['sha256']}: refusing to run a changed {a.set} set")
+    if not manifest["frozen"]:
+        print(f"WARNING: {manifest['name']} is NOT frozen (status {manifest.get('status')}): do not quote its scores as exam results", flush=True)
     print(f"RUNNING SET: {a.set} ({manifest['name']}, split {manifest.get('split', 'exam')}, frozen {manifest['frozen']}, {manifest['items']} items)", flush=True)
     items = load_items(exam)
     health = json.load(urllib.request.urlopen(a.url.rstrip("/") + "/health", timeout=5))
@@ -190,7 +207,8 @@ def main():
             req, meta = render(it, seed)
             opts = meta["options"]
             order = [o["key"] for o in opts]
-            row = {"id": it["id"], "category": it["category"], "abstain": it["expected"]["type"] == "abstain", "subtype": it["subtype"], "lang": it["lang"],
+            exp_out = any(o["danger"] and o["key"] in meta["expected"] for o in opts)  # the expected answer is itself a flagged outward action
+            row = {"id": it["id"], "category": it["category"], "exp_outward": exp_out, "abstain": it["expected"]["type"] == "abstain", "subtype": it["subtype"], "lang": it["lang"],
                    "n_options": it["n_options"], "n_bucket": it["n_bucket"], "seed": seed, "error": None}
             try:
                 probs, ms = ask(a.url, a.model, req)

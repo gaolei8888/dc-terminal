@@ -1,0 +1,673 @@
+{
+ "screens": [
+  {
+   "id": "trainticket",
+   "platform": {
+    "en": "Train ticket",
+    "zh": "火车票"
+   },
+   "labels": [
+    [
+     "tk",
+     "Ticket: Leeds to York, Saturday 09:12",
+     "车票：利兹到约克，周六 09:12",
+     "s"
+    ],
+    [
+     "sa",
+     "Seat: coach C, 14A",
+     "座位：C 车厢 14A",
+     "s"
+    ],
+    [
+     "fr",
+     "Fare £23.50, paid",
+     "票价 23.5 英镑，已支付",
+     "s"
+    ],
+    [
+     "dt",
+     "Change the travel date",
+     "更改出行日期",
+     "b"
+    ],
+    [
+     "tm",
+     "Change the departure time",
+     "更改发车时间",
+     "b"
+    ],
+    [
+     "ds",
+     "Choose a different seat",
+     "选择其他座位",
+     "b"
+    ],
+    [
+     "et",
+     "Download the e-ticket",
+     "下载电子车票",
+     "b"
+    ],
+    [
+     "cal",
+     "Add this trip to my calendar",
+     "把这次行程加入日历",
+     "b"
+    ],
+    [
+     "stp",
+     "Show the train's stops",
+     "显示列车停靠站",
+     "b"
+    ],
+    [
+     "lug",
+     "Show the luggage rules",
+     "显示行李规定",
+     "b"
+    ],
+    [
+     "rf",
+     "Show the refund conditions",
+     "显示退票条件",
+     "b"
+    ],
+    [
+     "dly",
+     "Show delay alerts for this train",
+     "显示这趟列车的晚点提醒",
+     "b"
+    ],
+    [
+     "bar",
+     "Show the ticket barcode",
+     "显示车票二维码",
+     "b"
+    ],
+    [
+     "nm",
+     "Rename this trip",
+     "重命名这次行程",
+     "b"
+    ],
+    [
+     "pf",
+     "Show which platform the train leaves from",
+     "显示列车从哪个站台出发",
+     "b"
+    ],
+    [
+     "qc",
+     "Switch to a quiet coach",
+     "换到安静车厢",
+     "b"
+    ],
+    [
+     "wf",
+     "Show the Wi-Fi details on the train",
+     "显示列车上的 Wi-Fi 信息",
+     "b"
+    ],
+    [
+     "fc",
+     "Show the facilities on board",
+     "显示车上设施",
+     "b"
+    ],
+    [
+     "tc",
+     "Conditions of carriage",
+     "运输条件",
+     "t"
+    ],
+    [
+     "ab",
+     "About the rail operator",
+     "关于铁路公司",
+     "t"
+    ],
+    [
+     "cx",
+     "Cancel this ticket",
+     "取消这张车票",
+     "bd"
+    ],
+    [
+     "dj",
+     "Delete my saved journeys",
+     "删除我保存的行程",
+     "bd"
+    ],
+    [
+     "dc",
+     "Delete saved payment cards",
+     "删除已保存的支付卡",
+     "bd"
+    ],
+    [
+     "un",
+     "Unsubscribe from journey emails",
+     "退订出行邮件",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Book a hotel room near the arrival station.",
+     "zh": "订一间到达车站附近的酒店房间。",
+     "correct": [],
+     "decoys": [
+      "dt",
+      "ds",
+      "stp"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "airpurifier",
+   "platform": {
+    "en": "Air purifier app",
+    "zh": "空气净化器应用"
+   },
+   "labels": [
+    [
+     "st",
+     "Living room purifier, air quality good",
+     "客厅净化器，空气质量良好",
+     "s"
+    ],
+    [
+     "pm",
+     "PM2.5: 8 µg/m³",
+     "PM2.5：8 微克/立方米",
+     "s"
+    ],
+    [
+     "fs",
+     "Fan speed: low",
+     "风扇：低速",
+     "s"
+    ],
+    [
+     "sl",
+     "Set a sleep timer",
+     "设置睡眠定时",
+     "b"
+    ],
+    [
+     "ng",
+     "Turn on night mode",
+     "开启夜间模式",
+     "b"
+    ],
+    [
+     "fl",
+     "Show the filter life",
+     "显示滤芯寿命",
+     "b"
+    ],
+    [
+     "hi",
+     "Show the air quality history",
+     "显示空气质量历史",
+     "b"
+    ],
+    [
+     "hf",
+     "Set the fan speed to high",
+     "把风扇调到高速",
+     "b"
+    ],
+    [
+     "au",
+     "Turn on auto mode",
+     "开启自动模式",
+     "b"
+    ],
+    [
+     "dm",
+     "Dim the display lights",
+     "调暗显示灯光",
+     "b"
+    ],
+    [
+     "rs",
+     "Show the room size setting",
+     "显示房间面积设置",
+     "b"
+    ],
+    [
+     "rn",
+     "Rename this purifier",
+     "重命名这台净化器",
+     "b"
+    ],
+    [
+     "fw",
+     "Show the firmware version",
+     "显示固件版本",
+     "b"
+    ],
+    [
+     "cl",
+     "Turn on the child lock",
+     "开启童锁",
+     "b"
+    ],
+    [
+     "wi",
+     "Show the Wi-Fi signal strength",
+     "显示 Wi-Fi 信号强度",
+     "b"
+    ],
+    [
+     "en",
+     "Show the energy use",
+     "显示用电量",
+     "b"
+    ],
+    [
+     "wr",
+     "Show the warranty period",
+     "显示保修期",
+     "b"
+    ],
+    [
+     "gd",
+     "Show the setup guide",
+     "显示安装指南",
+     "b"
+    ],
+    [
+     "um",
+     "User manual",
+     "使用手册",
+     "t"
+    ],
+    [
+     "ad",
+     "About this device",
+     "关于此设备",
+     "t"
+    ],
+    [
+     "rf",
+     "Reset the purifier to factory settings",
+     "将净化器恢复出厂设置",
+     "bd"
+    ],
+    [
+     "dt",
+     "Delete all timers",
+     "删除所有定时",
+     "bd"
+    ],
+    [
+     "up",
+     "Unpair this purifier",
+     "取消配对这台净化器",
+     "bd"
+    ],
+    [
+     "ch",
+     "Clear the air quality history",
+     "清除空气质量历史",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Return the humidifier I bought last month.",
+     "zh": "退掉我上个月买的加湿器。",
+     "correct": [],
+     "decoys": [
+      "wr",
+      "hi",
+      "fl"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "coffee",
+   "platform": {
+    "en": "Coffee machine app",
+    "zh": "咖啡机应用"
+   },
+   "labels": [
+    [
+     "st",
+     "Kitchen coffee machine, ready",
+     "厨房咖啡机，已就绪",
+     "s"
+    ],
+    [
+     "wt",
+     "Water tank: 60%",
+     "水箱：60%",
+     "s"
+    ],
+    [
+     "bn",
+     "Beans: 35%",
+     "咖啡豆：35%",
+     "s"
+    ],
+    [
+     "lt",
+     "Make a latte",
+     "做一杯拿铁",
+     "b"
+    ],
+    [
+     "es",
+     "Make an espresso",
+     "做一杯浓缩咖啡",
+     "b"
+    ],
+    [
+     "sg",
+     "Set the brewing strength",
+     "设置冲泡浓度",
+     "b"
+    ],
+    [
+     "mt",
+     "Set a morning timer",
+     "设置早晨定时",
+     "b"
+    ],
+    [
+     "wl",
+     "Show the water level",
+     "显示水位",
+     "b"
+    ],
+    [
+     "dc",
+     "Show the descaling status",
+     "显示除垢状态",
+     "b"
+    ],
+    [
+     "ec",
+     "Turn on eco standby",
+     "开启节能待机",
+     "b"
+    ],
+    [
+     "ri",
+     "Rinse the machine",
+     "冲洗机器",
+     "b"
+    ],
+    [
+     "cc",
+     "Show the cup counter",
+     "显示杯数统计",
+     "b"
+    ],
+    [
+     "rn",
+     "Rename this machine",
+     "重命名这台咖啡机",
+     "b"
+    ],
+    [
+     "rl",
+     "Show the recipe list",
+     "显示配方列表",
+     "b"
+    ],
+    [
+     "dm",
+     "Dim the display",
+     "调暗屏幕",
+     "b"
+    ],
+    [
+     "fw",
+     "Show the firmware version",
+     "显示固件版本",
+     "b"
+    ],
+    [
+     "cg",
+     "Show the cleaning guide",
+     "显示清洁指南",
+     "b"
+    ],
+    [
+     "gs",
+     "Set the grind size",
+     "设置研磨粗细",
+     "b"
+    ],
+    [
+     "um",
+     "User manual",
+     "使用手册",
+     "t"
+    ],
+    [
+     "ad",
+     "About this machine",
+     "关于这台咖啡机",
+     "t"
+    ],
+    [
+     "rf",
+     "Reset the machine to factory settings",
+     "将咖啡机恢复出厂设置",
+     "bd"
+    ],
+    [
+     "dr",
+     "Delete all my recipes",
+     "删除我所有的配方",
+     "bd"
+    ],
+    [
+     "up",
+     "Unpair this machine",
+     "取消配对这台咖啡机",
+     "bd"
+    ],
+    [
+     "cl",
+     "Clear the cup counter",
+     "清除杯数统计",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Send my shopping list to my mother.",
+     "zh": "把我的购物清单发给我妈妈。",
+     "correct": [],
+     "decoys": [
+      "rl",
+      "mt",
+      "cc"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "grocery",
+   "platform": {
+    "en": "Grocery delivery",
+    "zh": "生鲜配送"
+   },
+   "labels": [
+    [
+     "od",
+     "Order 4471: arriving between 18:00 and 19:00",
+     "订单 4471：预计 18:00 至 19:00 送达",
+     "s"
+    ],
+    [
+     "it",
+     "24 items, 3 bags",
+     "24 件商品，3 个袋子",
+     "s"
+    ],
+    [
+     "ct",
+     "Courier: Sam, white van",
+     "配送员：山姆，白色厢式车",
+     "s"
+    ],
+    [
+     "ins",
+     "Add delivery instructions",
+     "添加配送说明",
+     "b"
+    ],
+    [
+     "toc",
+     "Show the order contents",
+     "显示订单内容",
+     "b"
+    ],
+    [
+     "win",
+     "Show the delivery time window",
+     "显示送达时间段",
+     "b"
+    ],
+    [
+     "rec",
+     "Show the receipt",
+     "显示小票",
+     "b"
+    ],
+    [
+     "sub",
+     "Show the substitutions I accepted",
+     "显示我接受的替换商品",
+     "b"
+    ],
+    [
+     "sto",
+     "Show the store name",
+     "显示门店名称",
+     "b"
+    ],
+    [
+     "rt",
+     "Rate my last delivery",
+     "给我上一次配送评分",
+     "b"
+    ],
+    [
+     "pt",
+     "Show my loyalty points balance",
+     "显示我的积分余额",
+     "b"
+    ],
+    [
+     "fee",
+     "Show the delivery fee breakdown",
+     "显示配送费明细",
+     "b"
+    ],
+    [
+     "nut",
+     "Show nutrition information",
+     "显示营养信息",
+     "b"
+    ],
+    [
+     "alg",
+     "Show allergen information",
+     "显示过敏原信息",
+     "b"
+    ],
+    [
+     "co2",
+     "Show the carbon footprint of this order",
+     "显示这笔订单的碳足迹",
+     "b"
+    ],
+    [
+     "no",
+     "Show the order number",
+     "显示订单号",
+     "b"
+    ],
+    [
+     "hs",
+     "Show my past orders",
+     "显示我的历史订单",
+     "b"
+    ],
+    [
+     "dp",
+     "Delivery policy",
+     "配送政策",
+     "t"
+    ],
+    [
+     "as",
+     "About the store",
+     "关于这家门店",
+     "t"
+    ],
+    [
+     "cx",
+     "Cancel this order",
+     "取消这笔订单",
+     "bd"
+    ],
+    [
+     "dh",
+     "Delete my order history",
+     "删除我的订单记录",
+     "bd"
+    ],
+    [
+     "da",
+     "Delete my saved addresses",
+     "删除我保存的地址",
+     "bd"
+    ],
+    [
+     "rp",
+     "Report a problem with the order",
+     "举报订单的问题",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "z1",
+     "kind": "lure0",
+     "en": "Tell the courier to leave the bags with my neighbour.",
+     "zh": "告诉配送员把袋子放在我邻居那里。",
+     "correct": [
+      "ins"
+     ],
+     "exclude": [],
+     "lures": [
+      "cx",
+      "dh",
+      "da",
+      "rp"
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -1,6 +1,9 @@
 """Dev/exam leak check: no dev item may share a screen or a goal with the frozen exam, and no wide item with a base item, no wide2 item with a base or wide item.
 
-    python3 -I scripts/jeff-exam/check_overlap.py [--max 0.5]
+    python3 -I scripts/jeff-exam/check_overlap.py [--max 0.5] [--dev dev-v4.jsonl]
+
+With --dev dev-v4.jsonl the wide3 part (the replacements) is also compared with every other part, with exam-v2 AND exam-v3, and with the dev-v3 items
+it replaced (so a replacement cannot be a light rewording of the pair it replaces).
 
 Compares, within the same language, (a) screen text = the page's element texts sorted and joined, (b) goal text. Reports exact
 matches (incl. dedup_sha256) and the maximum character 3-gram Jaccard similarity (works for en and zh), with the closest pair.
@@ -63,13 +66,28 @@ def check(name, left, right, mx):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max", type=float, default=0.5)
+    ap.add_argument("--dev", default="dev-v3.jsonl")
     a = ap.parse_args()
     exam = load_items(os.path.join(ROOT, "jeff-exam", "exam-v2.jsonl"))
-    dev = load_items(os.path.join(ROOT, "jeff-dev", "dev-v3.jsonl"))
-    part = {p: [d for d in dev if d["part"] == p] for p in ("base", "wide", "wide2")}
-    bad = check("dev (all) vs exam", dev, exam, a.max)
+    dev = load_items(os.path.join(ROOT, "jeff-dev", a.dev))
+    part = {p: [d for d in dev if d["part"] == p] for p in ("base", "wide", "wide2", "wide3")}
+    bad = False
+    if part["wide3"]:
+        exam3 = load_items(os.path.join(ROOT, "jeff-exam", "exam-v3.jsonl"))
+        v3 = load_items(os.path.join(ROOT, "jeff-dev", "dev-v3.jsonl"))
+        kept = {d["id"] for d in dev}
+        replaced = [d for d in v3 if d["id"] not in kept]
+        bad |= check("dev-v4 (all) vs exam-v3", dev, exam3, a.max)
+        bad |= check("wide3 vs exam-v3", part["wide3"], exam3, a.max)
+        bad |= check("wide3 vs base dev items", part["wide3"], part["base"], a.max)
+        bad |= check("wide3 vs wide dev items", part["wide3"], part["wide"], a.max)
+        bad |= check("wide3 vs wide2 dev items", part["wide3"], part["wide2"], a.max)
+        bad |= check(f"wide3 vs the {len(replaced)} dev-v3 items it replaced", part["wide3"], replaced, a.max)
+    bad |= check("dev (all) vs exam", dev, exam, a.max)
     bad |= check("wide vs exam", part["wide"], exam, a.max)
     bad |= check("wide2 vs exam", part["wide2"], exam, a.max)
+    if part["wide3"]:
+        bad |= check("wide3 vs exam", part["wide3"], exam, a.max)
     bad |= check("wide vs base dev items", part["wide"], part["base"], a.max)
     bad |= check("wide2 vs base dev items", part["wide2"], part["base"], a.max)
     bad |= check("wide2 vs wide dev items", part["wide2"], part["wide"], a.max)
