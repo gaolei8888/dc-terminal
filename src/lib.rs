@@ -5,6 +5,7 @@ pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod daemon;
+pub mod dco_rules;
 pub mod game;
 pub mod gate;
 pub mod git;

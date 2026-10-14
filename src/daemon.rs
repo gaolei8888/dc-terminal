@@ -56,7 +56,6 @@ struct PairSlot {
 
 /// 只有真正的守护进程（用默认 socket）才装说明卡。单元测试和集成测试把 socket 放进临时目录，
 /// 它们绝不能去写用户真实的 `~/.claude` 等。
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn should_install_skill(socket: &Path, default: &Path) -> bool {
     socket == default
 }
@@ -94,6 +93,13 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
             }
             std::thread::sleep(Duration::from_secs(30));
         });
+    }
+
+    // 给 dc-vault「规矩总表」页面写 `~/.dct/dco-rules.json`：起来先写一次，以后 dco 换版本就重写。
+    // 在后台线程里跑（dco 没装、卡住、出错都不挡启动），也只在真正的守护进程里跑——
+    // 测试的 socket 在临时目录，不该去问本机的 dco。不分平台：没装 dco 就什么都不做。
+    if should_install_skill(socket, crate::proto::socket_path().as_path()) {
+        crate::dco_rules::spawn_watcher(crate::dco_rules::path_for_socket(socket));
     }
 
     // 把 dct 自带的那份 Node 挂到**这个进程**的 PATH 上，第一件事就做。
