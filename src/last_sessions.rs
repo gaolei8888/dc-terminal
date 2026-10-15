@@ -32,10 +32,13 @@ use std::path::{Path, PathBuf};
 
 /// 一条记下来的、当时还活着的会话。
 ///
-/// **不记 agent 自己的对话 id**——那条路（`claude --resume <id>`）在设计
-/// 阶段就被明确划出了范围：能记的只有「哪个目录、哪个 profile、起了个
-/// 什么名字、什么时候还活着」，接不接得回**同一个**对话，交给
-/// `--continue` 自己按目录去猜。
+/// **2026-10-14 起也记 agent 自己的对话 id**（profile 声明了
+/// `session_id_args` / `resume_id_args` 才有）。以前只记「哪个目录、哪个
+/// profile、起了个什么名字、什么时候还活着」，接回哪段对话交给
+/// `--continue` 按目录去猜——同一个目录下开着好几个会话时，只有一个能
+/// 接回原来的对话，其余的只能从头开。有了 id 就各接各的，见
+/// `docs/superpowers/specs/2026-10-14-graceful-restart-design.md` 第 1 节。
+/// 没有 id 的旧记录照旧走 `--continue` 分组（[`continue_flags`]）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedSession {
     pub dir: PathBuf,
@@ -49,6 +52,15 @@ pub struct RecordedSession {
     /// 跨进程重启之后
     /// 的绝对值没有意义——见 `group_for_resume` 的文档。
     pub last_active: u64,
+    /// agent 自己的对话 id（profile 声明了 `session_id_args` 才有）。
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// 平稳重启时这个会话是被打断的（没干完就被叫停或硬停）。
+    #[serde(default)]
+    pub interrupted: bool,
+    /// 接不回对话的会话，重启前写的交接文件。
+    #[serde(default)]
+    pub handoff: Option<PathBuf>,
 }
 
 /// 磁盘格式。跟 `secrets.rs` 一样包一层表，留出将来加别的段的余地。
@@ -168,6 +180,22 @@ pub fn group_for_resume(sessions: &[RecordedSession]) -> Vec<bool> {
     out
 }
 
+/// 有对话 id 的记录各接各的，不进 `--continue` 的分组；没有的照旧分组。
+/// 返回值跟输入逐位对应，语义同 [`group_for_resume`]：`true` = 这一条该带
+/// `resume_args`。有 id 的那些一律是 `false`——它们按 id 接回，用不着猜。
+pub fn continue_flags(sessions: &[RecordedSession]) -> Vec<bool> {
+    let idx: Vec<usize> = (0..sessions.len())
+        .filter(|&i| sessions[i].conversation_id.is_none())
+        .collect();
+    let sub: Vec<RecordedSession> = idx.iter().map(|&i| sessions[i].clone()).collect();
+    let flags = group_for_resume(&sub);
+    let mut out = vec![false; sessions.len()];
+    for (k, &i) in idx.iter().enumerate() {
+        out[i] = flags[k];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +206,53 @@ mod tests {
             profile: profile.to_string(),
             tag: String::new(),
             last_active,
+            conversation_id: None,
+            interrupted: false,
+            handoff: None,
         }
+    }
+
+    #[test]
+    fn old_file_without_new_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("last-sessions.toml");
+        std::fs::write(
+            &p,
+            "[[sessions]]\ndir = \"/tmp\"\nprofile = \"claude\"\ntag = \"\"\nlast_active = 5\n",
+        )
+        .unwrap();
+        let v = load(&p);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].conversation_id, None);
+        assert!(!v[0].interrupted);
+        assert_eq!(v[0].handoff, None);
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("last-sessions.toml");
+        let r = RecordedSession {
+            dir: "/tmp".into(),
+            profile: "claude".into(),
+            tag: "t".into(),
+            last_active: 1,
+            conversation_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            interrupted: true,
+            handoff: Some("/tmp/h.md".into()),
+        };
+        save(&p, std::slice::from_ref(&r)).unwrap();
+        assert_eq!(load(&p), vec![r]);
+    }
+
+    /// 有对话 id 的那条各接各的，不占 `--continue` 的位子；剩下没 id 的
+    /// 照旧按 `last_active` 挑一条继续。
+    #[test]
+    fn continue_flags_skips_records_with_ids() {
+        let mut with_id = rec("/w/x", "claude", 9);
+        with_id.conversation_id = Some("abc".into());
+        let sessions = vec![rec("/w/x", "claude", 5), with_id, rec("/w/x", "claude", 1)];
+        assert_eq!(continue_flags(&sessions), vec![true, false, false]);
     }
 
     #[test]

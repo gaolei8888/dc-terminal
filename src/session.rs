@@ -1,7 +1,7 @@
 use crate::proto::{coded, ErrorCode, Operation};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -476,6 +476,11 @@ pub struct SessionInfo {
 struct Session {
     id: u32,
     profile: Profile,
+    /// agent 自己的对话 id：dct 开会话时定下（或恢复时带回来）的那个，
+    /// 写进 `last-sessions.toml`，重启后按它接回同一段对话。profile 没声明
+    /// `session_id_args`/`resume_id_args`，或者这一回走的是 `--continue`，
+    /// 就是 `None`。
+    conversation_id: Option<String>,
     dir: PathBuf,
     is_agent: bool,
     checkpoints: Vec<String>,
@@ -820,6 +825,17 @@ impl SessionManager {
     /// 跟 `journal` 一样，这是一份可以随时重建的状态缓存，不是用户数据，
     /// 没必要因为一次写盘失败就让 `create`/`stop` 这些请求本身也报错。
     fn persist_last_sessions(&self) {
+        self.persist_last_sessions_with(&HashSet::new(), &HashMap::new());
+    }
+
+    /// 同 `persist_last_sessions`，多带两样平稳重启才有的东西：哪些会话是
+    /// 被打断的（`interrupted`），哪些写了交接文件（`handoffs`）。不在这两个
+    /// 集合里的会话照常记，标记为空。
+    pub fn persist_last_sessions_with(
+        &self,
+        interrupted: &HashSet<u32>,
+        handoffs: &HashMap<u32, PathBuf>,
+    ) {
         let Some(path) = recover(self.last_sessions_path.lock()).clone() else {
             return;
         };
@@ -844,6 +860,9 @@ impl SessionManager {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64,
+                    conversation_id: s.conversation_id.clone(),
+                    interrupted: interrupted.contains(&s.id),
+                    handoff: handoffs.get(&s.id).cloned(),
                 })
             })
             .collect();
@@ -882,7 +901,7 @@ impl SessionManager {
         secret: Option<&str>,
         profiles: &[Profile],
     ) -> Result<u32> {
-        self.create_inner(dir, profile_name, secret, profiles, false, None)
+        self.create_inner(dir, profile_name, secret, profiles, false, None, None)
     }
 
     /// `create()` 的姐妹方法：多一个 `resume` 开关，守护进程重启后恢复
@@ -912,6 +931,11 @@ impl SessionManager {
     /// `true`：这个名字是恢复出来的、不是这一轮新对话起的，`tick()`
     /// 不该在它干完第一轮活的时候又去问模型要一个新名字、把刚恢复回来的
     /// 名字覆盖掉。
+    ///
+    /// `conversation`：记录里存的 agent 对话 id。profile 能按 id 接回
+    /// （`Profile::resumes_by_id`）时，带着它就用 `resume_id_args` 接回
+    /// 那一段对话，`resume` 不再起作用；profile 不支持就当没传。
+    #[allow(clippy::too_many_arguments)]
     pub fn create_resuming(
         &self,
         dir: &Path,
@@ -920,10 +944,27 @@ impl SessionManager {
         profiles: &[Profile],
         resume: bool,
         restore_tag: Option<&str>,
+        conversation: Option<&str>,
     ) -> Result<u32> {
-        self.create_inner(dir, profile_name, secret, profiles, resume, restore_tag)
+        self.create_inner(
+            dir,
+            profile_name,
+            secret,
+            profiles,
+            resume,
+            restore_tag,
+            conversation,
+        )
     }
 
+    /// 这个会话此刻记着的 agent 对话 id（没有就是 `None`）。
+    pub fn conversation_of(&self, id: u32) -> Option<String> {
+        self.with_session(id, |s| Ok(s.conversation_id.clone()))
+            .ok()
+            .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_inner(
         &self,
         dir: &Path,
@@ -932,6 +973,7 @@ impl SessionManager {
         profiles: &[Profile],
         resume: bool,
         restore_tag: Option<&str>,
+        conversation: Option<&str>,
     ) -> Result<u32> {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
@@ -1029,13 +1071,33 @@ impl SessionManager {
         // 标记里才写得出发件会话的名字。最后插，谁也盖不掉它。
         env.insert(SESSION_ID_ENV.to_string(), id.to_string());
 
-        // 只在恢复路径上、且这个 profile 真的声明过恢复参数时才追加——
-        // 没声明的 profile（`opencode`/`qwen`/`codex`/`shell`）这里接的是
-        // 空切片，`command` 原样不变。
+        // 对话 id：恢复时带着旧的就按 id 接回；否则 profile 声明了就新起一个。
+        // 都没有才退回 `resume_args`（`--continue` 按目录猜）。
+        //
+        // 走 `--continue` 的那一条**不能**再加 `--session-id`（claude 不让
+        // 两个一起给），所以那一条这回没有 id，下次重启照旧按目录猜——只此
+        // 一次，之后新开的会话都有 id。没声明 `resume_args` 的 profile 接的
+        // 是空切片，等于没走 `--continue`，照常新起一个 id。
         let mut command = profile.command.clone();
-        if resume {
-            command.extend(profile.resume_args.iter().cloned());
-        }
+        let conversation_id = match conversation {
+            Some(c) if profile.resumes_by_id() => {
+                command.extend(crate::profile::fill_id(&profile.resume_id_args, c));
+                Some(c.to_string())
+            }
+            _ => {
+                let continuing = resume && !profile.resume_args.is_empty();
+                if continuing {
+                    command.extend(profile.resume_args.iter().cloned());
+                }
+                if profile.resumes_by_id() && !continuing {
+                    let c = crate::conversation_id::new();
+                    command.extend(crate::profile::fill_id(&profile.session_id_args, &c));
+                    Some(c)
+                } else {
+                    None
+                }
+            }
+        };
 
         let pty = PtySession::spawn(&command, &env, dir, 40, 120)?;
 
@@ -1067,6 +1129,7 @@ impl SessionManager {
         let session = Session {
             id,
             profile,
+            conversation_id,
             dir: dir.to_path_buf(),
             is_agent,
             checkpoints,
@@ -3813,7 +3876,7 @@ mod tests {
         mgr.register_profile(resume_probe_profile());
 
         let id = mgr
-            .create_resuming(tmp.path(), "resume-probe", None, &[], true, None)
+            .create_resuming(tmp.path(), "resume-probe", None, &[], true, None, None)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3834,7 +3897,7 @@ mod tests {
         mgr.register_profile(resume_probe_profile());
 
         let id = mgr
-            .create_resuming(tmp.path(), "resume-probe", None, &[], false, None)
+            .create_resuming(tmp.path(), "resume-probe", None, &[], false, None, None)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3852,6 +3915,127 @@ mod tests {
         }
     }
 
+    /// 回显参数的探针 profile，同时声明了按 id 指定和按 id 接回两组参数，
+    /// 外加一组 `--continue` 式的 `resume_args`——好在屏幕上看清到底接了哪一组。
+    fn echo_id_profile() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "echo-id"
+            command = ["/bin/sh", "-c", "echo \"ARGS $*\"; sleep 30", "sh"]
+            is_agent = false
+            resume_args = ["--continue"]
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn new_session_gets_a_conversation_id_and_passes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(echo_id_profile());
+
+        let id = mgr.create(tmp.path(), "echo-id", None, &[]).unwrap();
+        let conv = mgr.conversation_of(id).expect("应当分配 id");
+        assert_eq!(conv.len(), 36, "该是一个 UUID：{conv}");
+        wait_for_screen(&mgr, id, &format!("ARGS --session-id {conv}"));
+    }
+
+    #[test]
+    fn resuming_with_a_conversation_uses_resume_id_args_and_keeps_the_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(echo_id_profile());
+
+        let id = mgr
+            .create_resuming(tmp.path(), "echo-id", None, &[], false, None, Some("abc"))
+            .unwrap();
+        wait_for_screen(&mgr, id, "ARGS --resume abc");
+        assert_eq!(mgr.conversation_of(id).as_deref(), Some("abc"));
+        let text = mgr.screen_text_for_test(id);
+        assert!(
+            !text.contains("--session-id"),
+            "接回时不该再新起 id：{text}"
+        );
+        assert!(!text.contains("--continue"), "有 id 就不该按目录猜：{text}");
+    }
+
+    /// 没记下 id 的旧会话走 `--continue`：这一条**不能**同时带
+    /// `--session-id`（claude 不让两个一起给），所以它这回没有 id。
+    #[test]
+    fn resuming_without_a_conversation_continues_and_has_no_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(echo_id_profile());
+
+        let id = mgr
+            .create_resuming(tmp.path(), "echo-id", None, &[], true, None, None)
+            .unwrap();
+        wait_for_screen(&mgr, id, "ARGS --continue");
+        assert_eq!(mgr.conversation_of(id), None);
+        let text = mgr.screen_text_for_test(id);
+        assert!(!text.contains("--session-id"), "{text}");
+    }
+
+    #[test]
+    fn profile_without_id_args_has_no_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(resume_probe_profile());
+
+        let id = mgr.create(tmp.path(), "resume-probe", None, &[]).unwrap();
+        assert_eq!(mgr.conversation_of(id), None);
+        // 不声明 id 参数的 profile，就算硬塞一个 id 也不接——没处放。
+        let id2 = mgr
+            .create_resuming(
+                tmp.path(),
+                "resume-probe",
+                None,
+                &[],
+                false,
+                None,
+                Some("abc"),
+            )
+            .unwrap();
+        assert_eq!(mgr.conversation_of(id2), None);
+        wait_for_screen(&mgr, id2, "ARGS=[]");
+    }
+
+    #[test]
+    fn persisted_record_carries_conversation_and_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_profile());
+
+        let proj = tempfile::tempdir().unwrap();
+        let id = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+        let conv = mgr.conversation_of(id).unwrap();
+
+        // 普通落盘：带 id，不带标记。
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
+        assert!(!recs[0].interrupted);
+        assert_eq!(recs[0].handoff, None);
+
+        let interrupted: std::collections::HashSet<u32> = [id].into_iter().collect();
+        let handoffs: HashMap<u32, PathBuf> =
+            [(id, PathBuf::from("/tmp/h.md"))].into_iter().collect();
+        mgr.persist_last_sessions_with(&interrupted, &handoffs);
+
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
+        assert!(recs[0].interrupted);
+        assert_eq!(recs[0].handoff, Some(PathBuf::from("/tmp/h.md")));
+    }
+
     /// 一个没声明 `resume_args` 的 profile，`resume = true` 也不该凭空
     /// 长出参数来——`create()`（走的是 `resume = false`）和这条路唯一的
     /// 差别只在于「这个 profile 自己声明过什么」。
@@ -3862,7 +4046,7 @@ mod tests {
         mgr.register_profile(fake_agent());
 
         let id = mgr
-            .create_resuming(proj.path(), "fake", None, &[], true, None)
+            .create_resuming(proj.path(), "fake", None, &[], true, None, None)
             .unwrap();
         // `fake_agent()` 的 command 就是 `["cat"]`：如果 resume_args 被
         // 凭空加上了什么，`cat` 会因为收到一个不存在的文件名参数而报错

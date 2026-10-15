@@ -723,7 +723,8 @@ fn start_phone_bridge(
 /// 留一句解释，绝不能因为一条坏记录就让其它本来接得回来的会话也一起
 /// 泡汤。
 ///
-/// 谁真的该带 `--continue`（谁不该）由 `last_sessions::group_for_resume`
+/// 记着对话 id 的记录各接各的（`resume_id_args`），不参与分组；没 id 的
+/// 旧记录里谁真的该带 `--continue`（谁不该）由 `last_sessions::continue_flags`
 /// 这个纯函数决定——这里只管照着它的判定去调
 /// `SessionManager::create_resuming`，不重新做一遍分组判断。
 ///
@@ -744,7 +745,7 @@ fn restore_last_sessions(
 ) -> Vec<crate::proto::WarningCode> {
     use crate::proto::{SessionResumeSkipReason, WarningCode};
 
-    let resume_flags = crate::last_sessions::group_for_resume(records);
+    let resume_flags = crate::last_sessions::continue_flags(records);
     let mut skips = Vec::new();
     let total = records.len();
 
@@ -797,8 +798,15 @@ fn restore_last_sessions(
         } else {
             Some(record.tag.as_str())
         };
-        if let Err(e) = mgr.create_resuming(&record.dir, &record.profile, secret, all, resume, tag)
-        {
+        if let Err(e) = mgr.create_resuming(
+            &record.dir,
+            &record.profile,
+            secret,
+            all,
+            resume,
+            tag,
+            record.conversation_id.as_deref(),
+        ) {
             eprintln!(
                 "跳过恢复：{}（{}）没能重新起来：{e}",
                 record.dir.display(),
@@ -2175,6 +2183,9 @@ mod tests {
             profile: profile.to_string(),
             tag: String::new(),
             last_active: 1,
+            conversation_id: None,
+            interrupted: false,
+            handoff: None,
         }
     }
 
@@ -2324,6 +2335,115 @@ mod tests {
         }
         assert_eq!(with_marker, 1, "只能有一个真的接上了 --continue 式的参数");
         assert_eq!(without_marker, 1, "另一个必须老老实实开一个新的");
+    }
+
+    fn echo_id_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "echo-id"
+            command = ["/bin/sh", "-c", "echo \"ARGS $*\"; sleep 30", "sh"]
+            is_agent = false
+            resume_args = ["--continue"]
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 等到每个会话屏幕上都出现了 `ARGS` 那一行，返回各自的屏幕文本。
+    fn wait_for_args(mgr: &SessionManager, ids: &[u32]) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let texts: Vec<String> = ids.iter().map(|&id| mgr.screen_text_for_test(id)).collect();
+            if texts.iter().all(|t| t.contains("ARGS")) {
+                return texts;
+            }
+            assert!(Instant::now() < deadline, "探针没全出来：{texts:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 同目录同 profile 的两条记录，各自带着对话 id：各接各的，谁都不走
+    /// `--continue`——这正是「同目录多会话只接得回一个」那个老毛病的解法。
+    #[test]
+    fn restore_prefers_conversation_id_over_continue_grouping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut a = rec(&proj, "echo-id");
+        a.last_active = 100;
+        a.conversation_id = Some("a".into());
+        let mut b = rec(&proj, "echo-id");
+        b.last_active = 200;
+        b.conversation_id = Some("b".into());
+
+        let mgr = SessionManager::new();
+        let skips = restore_last_sessions(&[a, b], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2);
+        let texts = wait_for_args(&mgr, &ids);
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("ARGS --resume a"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("ARGS --resume b"))
+                .count(),
+            1
+        );
+        assert!(texts.iter().all(|t| !t.contains("--continue")), "{texts:?}");
+        let mut convs: Vec<Option<String>> =
+            ids.iter().map(|&id| mgr.conversation_of(id)).collect();
+        convs.sort();
+        assert_eq!(convs, vec![Some("a".to_string()), Some("b".to_string())]);
+    }
+
+    /// 旧清单（没记 id）：照旧只让最近用过的那条带 `--continue`；另一条
+    /// 老老实实开新对话，而且这回就领到一个 id，下次重启能按 id 接回。
+    #[test]
+    fn restore_without_conversation_id_falls_back_to_continue_grouping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut older = rec(&proj, "echo-id");
+        older.last_active = 100;
+        let mut newer = rec(&proj, "echo-id");
+        newer.last_active = 200;
+
+        let mgr = SessionManager::new();
+        let skips = restore_last_sessions(&[older, newer], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2);
+        let texts = wait_for_args(&mgr, &ids);
+        let continued: Vec<usize> = (0..2)
+            .filter(|&i| texts[i].contains("ARGS --continue"))
+            .collect();
+        assert_eq!(continued.len(), 1, "只能有一条带 --continue：{texts:?}");
+        let fresh = 1 - continued[0];
+        assert_eq!(mgr.conversation_of(ids[continued[0]]), None);
+        let conv = mgr
+            .conversation_of(ids[fresh])
+            .expect("新开的那条该领到 id");
+        assert!(
+            texts[fresh].contains(&format!("ARGS --session-id {conv}")),
+            "{texts:?}"
+        );
     }
 
     // 用 cat 冒充 agent：能收输入、不会自己退出，is_agent = true 才会触发

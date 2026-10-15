@@ -4,6 +4,7 @@ pub mod cli;
 pub mod client;
 pub mod clipboard;
 pub mod config;
+pub mod conversation_id;
 pub mod daemon;
 pub mod dco_rules;
 pub mod game;

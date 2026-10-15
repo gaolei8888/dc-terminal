@@ -279,7 +279,7 @@ fn start_daemon_headless(exe: &Path) -> Result<()> {
 /// 稍后读到的就是一份空清单，什么都不会恢复——这正是「拒绝恢复要清掉
 /// 记录」这条规矩落地的地方。按 `y`：清单原样留着不动，交给守护进程
 /// 启动时自己去读、自己去按 `(dir, profile)` 分组决定谁真的带上恢复参数
-/// （`daemon::restore_last_sessions` / `last_sessions::group_for_resume`）——
+/// （`daemon::restore_last_sessions` / `last_sessions::continue_flags`）——
 /// 这里不重复算一遍分组，只是为了把状态词（继续/新开）显示给用户看。
 ///
 /// 读不到 stdin（没有终端、被脚本调用……）**什么都不做**：不清空、也不
@@ -294,7 +294,7 @@ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
 
     let profiles_dir = dct::profile::profiles_dir_for_socket(sock);
     let (all, _) = dct::profile::all_profiles(&profiles_dir);
-    let resume_flags = dct::last_sessions::group_for_resume(&records);
+    let resume_flags = dct::last_sessions::continue_flags(&records);
 
     println!("{}", text(Key::ResumeSessionsExplain, lang));
     for (rec, &resume) in records.iter().zip(resume_flags.iter()) {
@@ -304,7 +304,8 @@ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
             .map(|p| p.display_label(lang))
             .unwrap_or_else(|| rec.profile.clone());
         let marker = text(
-            if resume {
+            // 记着对话 id 的按 id 接回，也算「继续」。
+            if resume || rec.conversation_id.is_some() {
                 Key::ResumeSessionsWillContinue
             } else {
                 Key::ResumeSessionsWillStartFresh
