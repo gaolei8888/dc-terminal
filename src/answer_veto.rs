@@ -59,6 +59,8 @@ fn prompt(label: &str) -> Prompt {
         system: SYSTEM.to_string(),
         user: serde_json::json!({ "option": label }).to_string(),
         max_tokens: VETO_MAX_TOKENS,
+        image_png_base64: None,
+        image_mime: None,
     }
 }
 
