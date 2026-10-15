@@ -173,6 +173,28 @@ pub struct Profile {
     /// 那一份对话，所以一组里只有最近活跃的那一个才会真的带上这些参数。
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// 开会话时交给 agent 的「用这个对话 id」参数，`{id}` 由 dct 换成它
+    /// 生成的 UUID。**只给实测过的 profile 写**，理由同 `resume_args`。
+    /// 声明了它，dct 才记得住这个会话是哪一段对话，重启后才能各接各的——
+    /// 不再靠 `--continue` 按目录去猜（同目录多个会话时只接得回一个）。
+    #[serde(default)]
+    pub session_id_args: Vec<String>,
+    /// 重启后按 id 接回那段对话的参数，`{id}` 同上。
+    #[serde(default)]
+    pub resume_id_args: Vec<String>,
+}
+
+/// 把参数里的 `{id}` 换成真正的 id。
+pub fn fill_id(args: &[String], id: &str) -> Vec<String> {
+    args.iter().map(|a| a.replace("{id}", id)).collect()
+}
+
+impl Profile {
+    /// 两个都声明了才算「能按 id 接回」：只会指定不会接回，或者反过来，
+    /// 都接不回同一段对话。
+    pub fn resumes_by_id(&self) -> bool {
+        !self.session_id_args.is_empty() && !self.resume_id_args.is_empty()
+    }
 }
 
 const DC: &str = include_str!("../profiles/dc.toml");
@@ -1540,6 +1562,45 @@ mod tests {
                 "{name}: 恢复方式没实测过，不该编 resume_args"
             );
         }
+    }
+
+    #[test]
+    fn fill_id_replaces_placeholder_only() {
+        let args = vec![
+            "--session-id".to_string(),
+            "{id}".to_string(),
+            "x{id}y".to_string(),
+        ];
+        assert_eq!(fill_id(&args, "abc"), vec!["--session-id", "abc", "xabcy"]);
+    }
+
+    #[test]
+    fn claude_based_profiles_resume_by_id() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.session_id_args, vec!["--session-id", "{id}"], "{name}");
+            assert_eq!(p.resume_id_args, vec!["--resume", "{id}"], "{name}");
+            assert!(p.resumes_by_id(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unverified_profiles_do_not_resume_by_id() {
+        // qwen、dc 要等 Task 3 实测；codex、opencode 开会话时没法指定 id。
+        for name in ["codex", "opencode", "qwen", "dc", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.session_id_args.is_empty() && p.resume_id_args.is_empty(),
+                "{name}"
+            );
+            assert!(!p.resumes_by_id(), "{name}");
+        }
+    }
+
+    #[test]
+    fn profile_without_new_fields_still_parses() {
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.session_id_args.is_empty() && p.resume_id_args.is_empty());
     }
 
     /// `pairable` 的默认值必须是 `false`：用户自己写的 profile 没提这个

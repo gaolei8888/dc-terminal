@@ -3717,6 +3717,8 @@ is_agent = true
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
             pairable: false,
             backend_only: false,
         };
