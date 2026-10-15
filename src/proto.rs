@@ -859,12 +859,15 @@ pub enum Response {
     MeshPeers(Vec<PeerView>),
     /// 对 [`Request::MeshSend`] 的回答。
     MeshSent(SendOutcome),
-    /// 对 [`Request::Drain`] / [`Request::DrainStatus`] 的回答。没在排空时是
-    /// `done: false` + 空进度——CLI 据此知道被取消了。`done: true` = 已经
+    /// 对 [`Request::Drain`] / [`Request::DrainStatus`] 的回答。
+    /// `active` = 有一场排空在进行（包括没有会话可等、正在落盘交接的那一段）；
+    /// `false` = 没在排空 / 已被取消，CLI 据此知道被取消了——**不能**拿
+    /// 「`waiting` 为空」来判断，收尾那一段它也是空的。`done: true` = 已经
     /// 落盘、小进程已起，后台马上退出。
     DrainProgress {
         progress: crate::drain::Progress,
         done: bool,
+        active: bool,
     },
 }
 
@@ -1635,6 +1638,29 @@ mod tests {
             (
                 25,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3}},{"DrainStatus":{"renew":true}},"DrainCancel"]"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// 排空进度的线上形状。CLI（`dct restart`）靠 `active` 分辨「被取消了」
+    /// 和「已经没有会话可等、正在收尾」，改了它就得一起加协议号。
+    #[test]
+    fn the_drain_progress_shape_is_pinned() {
+        let r = Response::DrainProgress {
+            progress: crate::drain::Progress {
+                waiting: vec![2],
+                remaining_s: 9,
+                nudged: true,
+            },
+            done: false,
+            active: true,
+        };
+        assert_eq!(
+            (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
+            (
+                25,
+                r#"{"DrainProgress":{"progress":{"waiting":[2],"remaining_s":9,"nudged":true},"done":false,"active":true}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );

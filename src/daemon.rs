@@ -410,6 +410,7 @@ impl DrainCtl {
         Response::DrainProgress {
             progress: run.drain.progress(std::time::Instant::now()),
             done: run.done,
+            active: true,
         }
     }
 
@@ -470,6 +471,7 @@ impl DrainCtl {
             None => Response::DrainProgress {
                 progress: idle_progress(),
                 done: false,
+                active: false,
             },
             Some(run) => {
                 if renew {
@@ -5057,6 +5059,8 @@ mod drain_tests {
     struct Calls {
         swaps: AtomicUsize,
         exits: AtomicUsize,
+        /// 为 true 时假的 `swap` 卡住不返回，好看清「正在落盘交接」那一段。
+        hold_swap: AtomicBool,
     }
 
     fn fake_hooks(lease: Duration, swap_ok: bool) -> (DrainHooks, Arc<Calls>) {
@@ -5068,6 +5072,9 @@ mod drain_tests {
             linger: Duration::ZERO,
             swap: Box::new(move |_socket: &Path| {
                 c1.swaps.fetch_add(1, Ordering::SeqCst);
+                while c1.hold_swap.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 if swap_ok {
                     Ok(())
                 } else {
@@ -5190,7 +5197,11 @@ mod drain_tests {
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
                 match self.call(Request::DrainStatus { renew: true }) {
-                    Response::DrainProgress { progress, done: true } => return progress,
+                    Response::DrainProgress {
+                        progress,
+                        done: true,
+                        active: true,
+                    } => return progress,
                     Response::DrainProgress { .. } => {}
                     other => panic!("答得不对：{other:?}"),
                 }
@@ -5207,7 +5218,7 @@ mod drain_tests {
     }
 
     fn not_running(r: Response) -> bool {
-        matches!(r, Response::DrainProgress { progress, done: false } if progress.waiting.is_empty())
+        matches!(r, Response::DrainProgress { progress, done: false, active: false } if progress.waiting.is_empty())
     }
 
     #[test]
@@ -5220,7 +5231,6 @@ mod drain_tests {
             r.mgr.send_input(id, "hi").unwrap();
             r.mgr.send_input(id, "").unwrap();
         }
-        std::thread::sleep(Duration::from_millis(300));
         r.wait_state(a, SessionState::Idle);
         r.wait_state(b, SessionState::Idle);
 
@@ -5229,7 +5239,10 @@ mod drain_tests {
             nudge_wait_s: 2,
             initiator: None,
         });
-        assert!(matches!(resp, Response::DrainProgress { .. }), "{resp:?}");
+        assert!(
+            matches!(resp, Response::DrainProgress { active: true, .. }),
+            "全空闲时排空也在进行：{resp:?}"
+        );
         r.poll_until_done();
 
         let recs = r.last_sessions();
@@ -5416,5 +5429,42 @@ mod drain_tests {
         // 清单不再冻着：照常落盘会把 `interrupted` 写回 false。
         r.mgr.persist_last_sessions();
         assert!(!r.last_sessions()[0].interrupted);
+    }
+
+    #[test]
+    fn nothing_started_means_not_active() {
+        let r = rig(Duration::from_secs(10), true);
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+        assert!(not_running(r.call(Request::DrainStatus { renew: true })));
+    }
+
+    /// 已经在落盘、交给小进程那一段：没有会话可等，但排空还在进行。
+    #[test]
+    fn the_finishing_window_is_still_active() {
+        let r = rig(Duration::from_secs(10), true);
+        r.calls.hold_swap.store(true, Ordering::SeqCst);
+        let resp = r.call(Request::Drain {
+            wait_s: 5,
+            nudge_wait_s: 5,
+            initiator: None,
+        });
+        assert!(matches!(resp, Response::DrainProgress { active: true, .. }), "{resp:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.calls.swaps.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "一直没去起 __swap");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mid = r.call(Request::DrainStatus { renew: true });
+        assert!(
+            matches!(&mid, Response::DrainProgress { active: true, done: false, progress } if progress.waiting.is_empty()),
+            "{mid:?}"
+        );
+        // 这时候取消不了。
+        assert!(matches!(
+            r.call(Request::DrainCancel),
+            Response::DrainProgress { active: true, .. }
+        ));
+        r.calls.hold_swap.store(false, Ordering::SeqCst);
+        r.poll_until_done();
     }
 }

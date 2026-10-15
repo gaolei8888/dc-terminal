@@ -2584,13 +2584,16 @@ fn poll_drain(app: &mut App, now: std::time::Instant) {
     );
 }
 
-/// 后台的回答 → 要不要画横幅。还有会话在等才画；旧后台不认这条请求
-/// （回一个错误）、连不上，都安静地不画。
+/// 后台的回答 → 要不要画横幅。有一场排空在进行（`active`）就画，包括
+/// 没有会话可等、正在收尾的那一段；旧后台不认这条请求（回一个错误）、
+/// 连不上，都安静地不画。
 fn drain_banner_from(r: anyhow::Result<Response>) -> Option<crate::drain::Progress> {
     match r {
-        Ok(Response::DrainProgress { progress, .. }) if !progress.waiting.is_empty() => {
-            Some(progress)
-        }
+        Ok(Response::DrainProgress {
+            progress,
+            active: true,
+            ..
+        }) => Some(progress),
         _ => None,
     }
 }
@@ -2804,10 +2807,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         };
         f.render_widget(ratatui::widgets::Clear, top);
         f.render_widget(
-            Paragraph::new(crate::i18n::msg::restart_pending_banner(
-                app.lang,
-                p.waiting.len(),
-            ))
+            Paragraph::new(if p.waiting.is_empty() {
+                crate::i18n::msg::restart_now_banner(app.lang)
+            } else {
+                crate::i18n::msg::restart_pending_banner(app.lang, p.waiting.len())
+            })
             .style(bar_danger(app.bar)),
             top,
         );
@@ -5325,19 +5329,40 @@ is_agent = true
             remaining_s: 5,
             nudged: false,
         };
-        let running = Response::DrainProgress {
-            progress: p(vec![3]),
-            done: false,
+        let reply = |w: Vec<u32>, active: bool| {
+            Ok(Response::DrainProgress {
+                progress: p(w),
+                done: false,
+                active,
+            })
         };
-        assert_eq!(drain_banner_from(Ok(running)), Some(p(vec![3])));
-        let idle = Response::DrainProgress {
-            progress: p(vec![]),
-            done: false,
-        };
-        assert_eq!(drain_banner_from(Ok(idle)), None);
+        assert_eq!(drain_banner_from(reply(vec![3], true)), Some(p(vec![3])));
+        // 没有会话可等了、正在收尾：照样画（说「正在重启」）。
+        assert_eq!(drain_banner_from(reply(vec![], true)), Some(p(vec![])));
+        assert_eq!(drain_banner_from(reply(vec![], false)), None);
         let old_daemon = Response::Error(crate::proto::ErrorCode::BadRequest("unknown variant".into()));
         assert_eq!(drain_banner_from(Ok(old_daemon)), None);
         assert_eq!(drain_banner_from(Err(anyhow::anyhow!("断了"))), None);
+    }
+
+    /// 排空在收尾、没有会话可等的时候，顶上说「正在重启」，不说「还在等 0 个」。
+    #[test]
+    fn the_finishing_window_says_restarting() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.drain = Some(crate::drain::Progress {
+            waiting: vec![],
+            remaining_s: 0,
+            nudged: false,
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(text.contains("dct正在重启"), "{text}");
+        assert!(!text.contains("还在等0"), "{text}");
     }
 
     #[test]

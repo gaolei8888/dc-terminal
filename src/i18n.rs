@@ -1362,6 +1362,15 @@ pub mod msg {
         t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
     }
 
+    /// 会话都停好了、正在记下状态交给新后台的那一小段，顶上那一行。
+    pub fn restart_now_banner(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "dct is restarting…".to_string(),
+            zh: "dct 正在重启……".to_string(),
+        )
+    }
+
     /// dct 准备重启时顶上那一行：还在等几个会话停下。
     pub fn restart_pending_banner(lang: Lang, waiting: usize) -> String {
         t!(
