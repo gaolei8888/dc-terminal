@@ -375,6 +375,7 @@ mod tests {
             api_key_env: None,
             threshold: 0.8,
             timeout_ms: 5000,
+            gate_tiers: None,
         };
         assert!(from_config(&c).is_err());
     }
@@ -388,6 +389,7 @@ mod tests {
             api_key_env: None,
             threshold: 0.8,
             timeout_ms: 5000,
+            gate_tiers: None,
         };
         assert!(from_config(&c).is_err());
     }
@@ -402,6 +404,7 @@ mod tests {
             api_key_env: Some("DCT_JUDGE_TEST_KEY_D3".into()),
             threshold: 0.8,
             timeout_ms: 5000,
+            gate_tiers: None,
         };
         assert!(matches!(
             from_config(&mk("http://example.com:8765")),

@@ -390,3 +390,151 @@ fn an_explicit_claude_provider_still_spawns_claude() {
     );
     assert_eq!(llm_calls(&marker), 1);
 }
+
+const DANGER_REQ: &str = r#"{"state":"delete my account","options":[{"key":"a","text":"Settings"},{"key":"b","text":"Delete account permanently"}]}"#;
+
+#[test]
+fn a_confident_jeff_pick_of_a_critical_option_becomes_danger() {
+    let home = tempfile::tempdir().unwrap();
+    let (url, hits) = fake_jeff("b", 0.991);
+    write_config(home.path(), &format!("[judge]\nbase_url = \"{url}\"\n"));
+    let o = answer(home.path(), DANGER_REQ);
+    assert_eq!(o.code, Some(0), "{}", o.stderr);
+    let v = json(&o);
+    assert!(v["key"].is_null());
+    assert_eq!(
+        (v["by"].as_str(), v["reason"].as_str()),
+        (Some("none"), Some("danger"))
+    );
+    assert_eq!(
+        v["gated"],
+        serde_json::json!({"key": "b", "tier": "critical"})
+    );
+    assert!((v["confidence"].as_f64().unwrap() - 0.991).abs() < 1e-6);
+    assert!(
+        !o.stdout.to_lowercase().contains("delete"),
+        "答案里不带选项的字：{}",
+        o.stdout
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gated_tiers_by_default_and_the_narrowed_list() {
+    let cases = [
+        ("Buy now", "money"),
+        ("Delete", "content"),
+        ("Send", "content"),
+        ("Save draft", "content"),
+        ("删除账号", "critical"),
+        ("立即购买", "money"),
+        ("保存草稿", "content"),
+    ];
+    for (label, tier) in cases {
+        let req = serde_json::json!({"state":"s","options":[{"key":"a","text":"Settings"},{"key":"b","text":label}]}).to_string();
+        let home = tempfile::tempdir().unwrap();
+        let (url, _) = fake_jeff("b", 0.95);
+        write_config(home.path(), &format!("[judge]\nbase_url = \"{url}\"\n"));
+        let v = json(&answer(home.path(), &req));
+        assert_eq!(
+            (v["reason"].as_str(), v["gated"]["tier"].as_str()),
+            (Some("danger"), Some(tier)),
+            "{label}"
+        );
+
+        // 只留 critical + money：content 放行，其余照拦。
+        let home = tempfile::tempdir().unwrap();
+        let (url, _) = fake_jeff("b", 0.95);
+        write_config(
+            home.path(),
+            &format!("[judge]\nbase_url = \"{url}\"\ngate_tiers = [\"Critical\", \"money\"]\n"),
+        );
+        let v = json(&answer(home.path(), &req));
+        if tier == "content" {
+            assert_eq!(
+                (v["by"].as_str(), v["key"].as_str()),
+                (Some("jeff"), Some("b")),
+                "{label}"
+            );
+        } else {
+            assert_eq!(v["gated"]["tier"], tier, "{label}");
+        }
+    }
+}
+
+#[test]
+fn read_tier_picks_and_fixed_actions_pass() {
+    for (label, key) in [("Open", "b"), ("English", "b"), ("向下滚动", "scroll_down")] {
+        let req = serde_json::json!({"state":"s","options":[{"key":"a","text":"Alpha"},{"key":key,"text":label}]}).to_string();
+        let home = tempfile::tempdir().unwrap();
+        let (url, _) = fake_jeff(key, 0.95);
+        write_config(home.path(), &format!("[judge]\nbase_url = \"{url}\"\n"));
+        let v = json(&answer(home.path(), &req));
+        assert_eq!(
+            (v["by"].as_str(), v["key"].as_str()),
+            (Some("jeff"), Some(key)),
+            "{label}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_llm_rungs_gated_pick_is_blocked_and_allow_does_not_bypass() {
+    for allow in ["", r#","allow":["llm"]"#] {
+        let home = tempfile::tempdir().unwrap();
+        let marker = fake_llm(home.path(), r#"{"key":"b"}"#);
+        write_config(home.path(), LLM_CONFIG);
+        let req = format!(
+            r#"{{"state":"s","options":[{{"key":"a","text":"Settings"}},{{"key":"b","text":"Buy now"}}]{allow}}}"#
+        );
+        let v = json(&answer(home.path(), &req));
+        assert_eq!(llm_calls(&marker), 1);
+        assert_eq!(
+            (v["by"].as_str(), v["reason"].as_str()),
+            (Some("none"), Some("danger")),
+            "{allow}"
+        );
+        assert_eq!(v["gated"], serde_json::json!({"key": "b", "tier": "money"}));
+    }
+}
+
+#[test]
+fn a_gate_tiers_list_without_critical_or_money_or_with_an_unknown_name_is_rejected() {
+    for list in [
+        r#"["content","critical"]"#,
+        r#"["content","money"]"#,
+        r#"["content"]"#,
+        r#"[]"#,
+        r#"["critical","money","physical"]"#,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let (url, hits) = fake_jeff("a", 0.95);
+        write_config(
+            home.path(),
+            &format!("[judge]\nbase_url = \"{url}\"\ngate_tiers = {list}\n"),
+        );
+        let o = answer(home.path(), REQ);
+        assert_eq!(o.code, Some(1), "{list}: {}", o.stderr);
+        assert!(o.stdout.is_empty(), "{list}");
+        assert!(
+            o.stderr.contains("gate_tiers")
+                && o.stderr.contains("闸") == o.stderr.contains("闸")
+                && (o.stderr.contains("必须") || o.stderr.contains("不认识")),
+            "{list}: {}",
+            o.stderr
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "坏配置不问任何人");
+    }
+}
+
+#[test]
+fn other_commands_that_read_judge_do_not_choke_on_a_bad_gate_tiers() {
+    let home = tempfile::tempdir().unwrap();
+    write_config(
+        home.path(),
+        "[judge]\nbase_url = \"http://127.0.0.1:9\"\ngate_tiers = [\"nonsense\"]\n",
+    );
+    let o = run(home.path(), &["judge", "--probe"], "");
+    assert!(!o.stderr.contains("解析不了"), "{}", o.stderr);
+}

@@ -439,6 +439,7 @@ Everything else:
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
 | `dct judge [file]` / `--probe` | ask the `[judge]` backend (Jeff's `jeff-serve`) one multiple-choice question in Jev format and print each option's probability; `--probe` sends a fixed question to see if it answers. Exit 0 answered, 1 not configured or backend error, 2 the question is wrong |
+| `dct answer --json` | read one multiple-choice request (JSON: `state`, `options`, optional `allow` / `forbid` / `picture`) on stdin and write one JSON line: Jeff, then the `[llm]` model, then "needs you" (nothing pops up). A **danger gate** stops a pick whose label is outward, irreversible or money (see [The danger gate](#the-danger-gate-dct-answer)). Exit 0 answered or needs you, 1 config unreadable or invalid, 2 bad request |
 | `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you (refuses when stdin isn't a terminal), then confirm with Touch ID, which signs the exact texts; texts (and their opening sentences) must differ per platform |
 | `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco (Mac only): replay the confirmed procedure if there is one, otherwise work the page out, write a draft procedure and show you a card to confirm with Touch ID. Asks before every publish tap. See [Post to a social platform](#post-to-a-social-platform-mac-early) |
 | `dct daemon` | run only the daemon, no board |
@@ -467,6 +468,46 @@ used so far are Jeff v1.2, `jeff-legacy/Jeff-Qwen3.5-0.8B` at revision
 
 Without `[judge]`, `dct do` skips Jeff; without `[llm]`, it skips the model too.
 You are always the last one asked.
+
+### The danger gate (`dct answer`)
+
+Whoever picks an option (Jeff, the `[llm]` model), `dct answer` looks at the
+picked option's label with `dct-brain`'s tier rules before it lets the pick
+out. This is rule-based and never reads confidence: Jeff at 0.99 on "Delete
+account permanently" is stopped the same as Jeff at 0.5. Jeff still sees every
+option; the gate only acts on the answer. Role prefixes (`按钮 `, `文字 `) are
+stripped first, so the label is judged the way the exam scripts judge it.
+
+Default gated tiers: **content** (sends, posts, saves, deletes content),
+**critical** (irreversible: delete account, …) and **money** (buy, pay, …). A
+gated pick comes back as:
+
+```json
+{"key": null, "by": "none", "confidence": 0.991, "reason": "danger",
+ "gated": {"key": "b", "tier": "critical"}}
+```
+
+`reason` is `danger` (alongside `needs_user` / `no_answer`), the exit code is 0
+like any other "needs you" answer, and `gated.key` is the key that was picked.
+The JSON never carries label text. Fixed actions such as scroll and wait have
+Read-tier text and pass. The request's `allow` only narrows which rungs may
+answer; it cannot switch the gate off, and there is no per-request override.
+
+```toml
+[judge]
+# gate_tiers = ["content", "critical", "money"]   # the default
+# gate_tiers = ["critical", "money"]              # allowed: let content picks through
+```
+
+Names are case-insensitive. `critical` and `money` can never be removed; a
+list that leaves either out, or names an unknown tier, makes `dct answer` print
+the reason and exit 1. Only `content` is optional.
+
+**Limit, stated plainly: the gate only knows dct-brain's word list; words it
+does not know are not stopped; callers should still filter options they know
+are destructive.** (Examples it misses today: "Cancel subscription", "Clear
+all", "Block", "Deactivate"; it also over-stops some harmless ones, e.g.
+"Save", "Done", "Share", "Sign in", "Upload".)
 
 ---
 

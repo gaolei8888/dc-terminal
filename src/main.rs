@@ -30,7 +30,9 @@ dct —— vibe coding 终端
                    要先在 config.toml 写 [judge]。加 --probe 用固定题试后端通不通
   dct answer --json 从标准输入读一道选择题（JSON：state、options、可选 allow / forbid / picture），
                    按 Jeff → 大模型 逐级答，写一行 JSON；要问用户时不弹，回 by=none、reason=needs_user。
-                   用现有的 [judge] / [llm] 配置
+                   用现有的 [judge] / [llm] 配置。危险闸：被选中的选项的字属于 dct-brain 的 content / critical / money 档
+                   就不放行，回 by=none、reason=danger、gated={key,tier}（按规则，不看把握；allow 绕不过）。
+                   [judge] gate_tiers 默认三档全拦，只有 content 能去掉。闸只认 dct-brain 的词表，不认识的词拦不住
   dct train record --json
                    从标准输入读一道别处答过的题（JSON），记成一行 v2 训练题到 ~/.dct/explore/answers.jsonl，
                    回 {\"recorded\":true,\"label\":…}
