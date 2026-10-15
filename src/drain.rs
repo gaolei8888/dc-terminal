@@ -1,0 +1,434 @@
+//! 排空状态机：优雅重启时决定「继续等 / 催一句 / 请它写交接 / 结束」。
+//! 纯逻辑，不碰 IO；守护线程每拍调 `step`，把返回的 `Action` 去执行。
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::journal::civil_from_days;
+use crate::session::SessionState;
+
+/// 请它写交接后，至少过这么久还没见它忙起来，就当它不打算写了。
+const HANDOFF_GRACE: Duration = Duration::from_secs(10);
+
+pub struct DrainConfig {
+    pub wait: Duration,
+    pub nudge_wait: Duration,
+}
+
+impl Default for DrainConfig {
+    fn default() -> Self {
+        DrainConfig {
+            wait: Duration::from_secs(15 * 60),
+            nudge_wait: Duration::from_secs(3 * 60),
+        }
+    }
+}
+
+/// 排空开始那一刻对每个会话的认识。
+pub struct Member {
+    pub id: u32,
+    /// 能按 id 接回对话（`Profile::resumes_by_id`）。
+    pub resumable: bool,
+    /// 是 agent。非 agent（shell）不等、不发话。
+    pub is_agent: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    /// 接不回的会话：请它写交接到这个文件。
+    AskHandoff { id: u32, path: PathBuf },
+    /// 到点还在忙：请它在安全处停下。
+    Nudge { id: u32 },
+    /// 排空结束，可以落盘重启了。
+    Finish {
+        interrupted: HashSet<u32>,
+        handoffs: HashMap<u32, PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// 还在等的会话 id（从小到大）。
+    pub waiting: Vec<u32>,
+    /// 距离下一个时限还剩多少秒。
+    pub remaining_s: u64,
+    /// 已经进入兜底阶段。
+    pub nudged: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Slot {
+    Waiting,
+    /// 已请它写交接；见过它忙起来（或过了宽限）再停下才算写完。
+    HandoffAsked {
+        asked_at: Instant,
+        seen_busy: bool,
+    },
+    Done,
+}
+
+pub struct Drain {
+    /// 按 id 从小到大排好，保证输出顺序确定。
+    slots: Vec<(Member, Slot)>,
+    cfg: DrainConfig,
+    handoff_dir: PathBuf,
+    deadline: Instant,
+    nudged_at: Option<Instant>,
+    interrupted: HashSet<u32>,
+    handoffs: HashMap<u32, PathBuf>,
+    finished: bool,
+}
+
+fn stopped(states: &HashMap<u32, SessionState>, id: u32) -> bool {
+    match states.get(&id) {
+        None => true,
+        Some(s) => matches!(
+            s,
+            SessionState::Idle | SessionState::Stopped | SessionState::Failed
+        ),
+    }
+}
+
+impl Drain {
+    pub fn new(
+        mut members: Vec<Member>,
+        initiator: Option<u32>,
+        cfg: DrainConfig,
+        handoff_dir: PathBuf,
+        now: Instant,
+    ) -> Drain {
+        members.sort_by_key(|m| m.id);
+        let mut interrupted = HashSet::new();
+        let slots = members
+            .into_iter()
+            .map(|m| {
+                let slot = if Some(m.id) == initiator {
+                    // 发起者在等命令跑完，永远不会空闲：不等、不发话，重启后叫它继续
+                    interrupted.insert(m.id);
+                    Slot::Done
+                } else if !m.is_agent {
+                    Slot::Done
+                } else {
+                    Slot::Waiting
+                };
+                (m, slot)
+            })
+            .collect();
+        Drain {
+            slots,
+            deadline: now + cfg.wait,
+            cfg,
+            handoff_dir,
+            nudged_at: None,
+            interrupted,
+            handoffs: HashMap::new(),
+            finished: false,
+        }
+    }
+
+    /// 每拍调一次。`states` 是此刻各会话状态（不在表里 = 会话已经没了，算停下）。
+    pub fn step(&mut self, now: Instant, states: &HashMap<u32, SessionState>) -> Vec<Action> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (m, slot) in self.slots.iter_mut() {
+            let is_stopped = stopped(states, m.id);
+            match *slot {
+                Slot::Done => {}
+                Slot::Waiting if is_stopped => {
+                    if m.resumable {
+                        *slot = Slot::Done;
+                    } else {
+                        let path = handoff_path(&self.handoff_dir, m.id, &file_stamp());
+                        self.handoffs.insert(m.id, path.clone());
+                        out.push(Action::AskHandoff { id: m.id, path });
+                        *slot = Slot::HandoffAsked {
+                            asked_at: now,
+                            seen_busy: false,
+                        };
+                    }
+                }
+                Slot::Waiting => {}
+                Slot::HandoffAsked {
+                    asked_at,
+                    seen_busy,
+                } => {
+                    if !is_stopped {
+                        *slot = Slot::HandoffAsked {
+                            asked_at,
+                            seen_busy: true,
+                        };
+                    } else if seen_busy || now.saturating_duration_since(asked_at) >= HANDOFF_GRACE
+                    {
+                        *slot = Slot::Done;
+                    }
+                }
+            }
+        }
+
+        // 到点还没停的：催一句，进入兜底阶段
+        if self.nudged_at.is_none()
+            && now >= self.deadline
+            && self.slots.iter().any(|(_, s)| !matches!(s, Slot::Done))
+        {
+            self.nudged_at = Some(now);
+            for (m, slot) in &self.slots {
+                if matches!(slot, Slot::Waiting) {
+                    out.push(Action::Nudge { id: m.id });
+                }
+                if !matches!(slot, Slot::Done) {
+                    // 被催过就算打断，不管之后停没停
+                    self.interrupted.insert(m.id);
+                }
+            }
+        }
+
+        let all_done = self.slots.iter().all(|(_, s)| matches!(s, Slot::Done));
+        let hard = self
+            .nudged_at
+            .is_some_and(|t| now >= t + self.cfg.nudge_wait);
+        if all_done || hard {
+            for (m, slot) in &self.slots {
+                if !matches!(slot, Slot::Done) {
+                    self.interrupted.insert(m.id);
+                }
+            }
+            self.finished = true;
+            out.push(Action::Finish {
+                interrupted: self.interrupted.clone(),
+                handoffs: self.handoffs.clone(),
+            });
+        }
+        out
+    }
+
+    pub fn progress(&self, now: Instant) -> Progress {
+        let limit = match self.nudged_at {
+            Some(t) => t + self.cfg.nudge_wait,
+            None => self.deadline,
+        };
+        Progress {
+            waiting: self
+                .slots
+                .iter()
+                .filter(|(_, s)| !matches!(s, Slot::Done))
+                .map(|(m, _)| m.id)
+                .collect(),
+            remaining_s: limit.saturating_duration_since(now).as_secs(),
+            nudged: self.nudged_at.is_some(),
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// 交接文件名：`<handoff_dir>/<id>-<YYYYmmdd-HHMMSS>.md`（时间由调用方给，便于测试）。
+pub fn handoff_path(dir: &Path, id: u32, stamp: &str) -> PathBuf {
+    dir.join(format!("{id}-{stamp}.md"))
+}
+
+/// 现在的 UTC 时间，`YYYYmmdd-HHMMSS`。
+fn file_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d) = civil_from_days((secs / 86_400) as i64);
+    let rem = secs % 86_400;
+    format!(
+        "{y:04}{mo:02}{d:02}-{:02}{:02}{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+pub const NUDGE_TEXT: &str =
+    "dct 马上要重启。请在安全的地方停下手上的事，然后用一句话写下你做到哪了、下一步是什么。";
+
+pub fn handoff_text(path: &Path) -> String {
+    format!(
+        "dct 马上要重启，这个会话的对话接不回来。请把要接着做的事写进 `{}`：在做什么、做到哪了、下一步、要注意的坑。写完就停下。",
+        path.display()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use SessionState::*;
+
+    fn cfg() -> DrainConfig {
+        DrainConfig {
+            wait: Duration::from_secs(900),
+            nudge_wait: Duration::from_secs(180),
+        }
+    }
+    fn m(id: u32, resumable: bool) -> Member {
+        Member {
+            id,
+            resumable,
+            is_agent: true,
+        }
+    }
+    fn st(v: &[(u32, SessionState)]) -> HashMap<u32, SessionState> {
+        v.iter().cloned().collect()
+    }
+    fn finish(a: &[Action]) -> Option<(&HashSet<u32>, &HashMap<u32, PathBuf>)> {
+        a.iter().find_map(|x| match x {
+            Action::Finish {
+                interrupted,
+                handoffs,
+            } => Some((interrupted, handoffs)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn all_idle_finishes_immediately_with_no_interruptions() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(1, true), m(2, true)], None, cfg(), "/h".into(), t0);
+        let a = d.step(t0, &st(&[(1, Idle), (2, Idle)]));
+        let (i, h) = finish(&a).unwrap();
+        assert!(i.is_empty() && h.is_empty());
+        assert!(d.finished());
+        assert!(d.step(t0, &st(&[])).is_empty());
+    }
+
+    #[test]
+    fn waits_for_working_then_finishes_when_it_stops() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(1, true)], None, cfg(), "/h".into(), t0);
+        assert!(d.step(t0, &st(&[(1, Working)])).is_empty());
+        assert_eq!(d.progress(t0).waiting, vec![1]);
+        let a = d.step(t0 + Duration::from_secs(60), &st(&[(1, Idle)]));
+        assert!(finish(&a).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn nudges_at_deadline_and_marks_interrupted_even_if_it_then_stops() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(1, true), m(2, true)], None, cfg(), "/h".into(), t0);
+        d.step(t0, &st(&[(1, Working), (2, Idle)]));
+        let a = d.step(
+            t0 + Duration::from_secs(900),
+            &st(&[(1, Working), (2, Idle)]),
+        );
+        assert_eq!(a, vec![Action::Nudge { id: 1 }]);
+        assert!(d.progress(t0 + Duration::from_secs(900)).nudged);
+        // 兜底话发出去后它先变 Working 再变 Idle（Review Focus 5）
+        d.step(
+            t0 + Duration::from_secs(910),
+            &st(&[(1, Working), (2, Idle)]),
+        );
+        let a = d.step(t0 + Duration::from_secs(950), &st(&[(1, Idle), (2, Idle)]));
+        let (i, _) = finish(&a).unwrap();
+        assert_eq!(i, &HashSet::from([1]));
+    }
+
+    #[test]
+    fn hard_deadline_after_nudge_finishes_anyway() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(1, true)], None, cfg(), "/h".into(), t0);
+        d.step(t0 + Duration::from_secs(900), &st(&[(1, Working)]));
+        assert!(d
+            .step(t0 + Duration::from_secs(1079), &st(&[(1, Working)]))
+            .is_empty());
+        let a = d.step(t0 + Duration::from_secs(1080), &st(&[(1, Working)]));
+        assert_eq!(finish(&a).unwrap().0, &HashSet::from([1]));
+    }
+
+    #[test]
+    fn initiator_is_not_waited_for_and_counts_as_interrupted() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(7, true)], Some(7), cfg(), "/h".into(), t0);
+        let a = d.step(t0, &st(&[(7, Working)]));
+        assert_eq!(finish(&a).unwrap().0, &HashSet::from([7]));
+        assert!(!a.iter().any(|x| matches!(x, Action::Nudge { .. })));
+    }
+
+    #[test]
+    fn unresumable_idle_session_is_asked_for_handoff_then_waited_again() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        let a = d.step(t0, &st(&[(3, Idle)]));
+        assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
+        // 它开始写交接
+        assert!(d
+            .step(t0 + Duration::from_secs(1), &st(&[(3, Working)]))
+            .is_empty());
+        let a = d.step(t0 + Duration::from_secs(30), &st(&[(3, Idle)]));
+        let (i, h) = finish(&a).unwrap();
+        assert!(i.is_empty());
+        assert!(h.contains_key(&3));
+    }
+
+    #[test]
+    fn unresumable_busy_session_is_asked_only_after_it_stops() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        assert!(d.step(t0, &st(&[(3, Working)])).is_empty());
+        let a = d.step(t0 + Duration::from_secs(5), &st(&[(3, Idle)]));
+        assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
+    }
+
+    #[test]
+    fn vanished_or_failed_sessions_count_as_stopped_and_non_agents_are_ignored() {
+        let t0 = Instant::now();
+        let shell = Member {
+            id: 9,
+            resumable: false,
+            is_agent: false,
+        };
+        let mut d = Drain::new(
+            vec![m(1, true), m(2, true), shell],
+            None,
+            cfg(),
+            "/h".into(),
+            t0,
+        );
+        let a = d.step(t0, &st(&[(2, Failed), (9, Working)]));
+        assert!(finish(&a).is_some());
+        assert!(!a
+            .iter()
+            .any(|x| matches!(x, Action::AskHandoff { id: 9, .. })));
+    }
+
+    #[test]
+    fn handoff_path_is_under_dir() {
+        assert_eq!(
+            handoff_path(Path::new("/h"), 3, "20261014-120000"),
+            PathBuf::from("/h/3-20261014-120000.md")
+        );
+    }
+
+    #[test]
+    fn handoff_not_considered_written_in_the_same_breath() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        d.step(t0, &st(&[(3, Idle)]));
+        // 屏幕还没来得及变忙
+        assert!(d
+            .step(t0 + Duration::from_millis(500), &st(&[(3, Idle)]))
+            .is_empty());
+        // 10 秒还没变忙，当它不打算写了，算完
+        assert!(finish(&d.step(t0 + Duration::from_secs(10), &st(&[(3, Idle)]))).is_some());
+    }
+
+    #[test]
+    fn file_stamp_has_the_documented_shape() {
+        let s = file_stamp();
+        assert_eq!(s.len(), 15);
+        assert_eq!(s.as_bytes()[8], b'-');
+        assert!(s
+            .chars()
+            .enumerate()
+            .all(|(i, c)| i == 8 || c.is_ascii_digit()));
+    }
+}

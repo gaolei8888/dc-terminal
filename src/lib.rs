@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod config;
 pub mod conversation_id;
 pub mod daemon;
+pub mod drain;
 pub mod dco_rules;
 pub mod game;
 pub mod gate;
