@@ -1576,7 +1576,7 @@ mod tests {
 
     #[test]
     fn claude_based_profiles_resume_by_id() {
-        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api", "qwen", "dc"] {
             let p = Profile::builtin(name).unwrap();
             assert_eq!(p.session_id_args, vec!["--session-id", "{id}"], "{name}");
             assert_eq!(p.resume_id_args, vec!["--resume", "{id}"], "{name}");
@@ -1586,8 +1586,8 @@ mod tests {
 
     #[test]
     fn unverified_profiles_do_not_resume_by_id() {
-        // qwen、dc 要等 Task 3 实测；codex、opencode 开会话时没法指定 id。
-        for name in ["codex", "opencode", "qwen", "dc", "shell"] {
+        // codex、opencode 开会话时没法指定 id；qwen、dc 已实测，在上面的正向测试里。
+        for name in ["codex", "opencode", "shell"] {
             let p = Profile::builtin(name).unwrap();
             assert!(
                 p.session_id_args.is_empty() && p.resume_id_args.is_empty(),
