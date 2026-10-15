@@ -28,9 +28,9 @@ const USAGE: &str = "用法：dct answer --json    从标准输入读一个请�
       \"allow\": [\"jeff\",\"llm\",\"user\"] (默认全部), \"forbid\": [\"不许发给大模型的字\"] (可选)}
 答案：{\"key\": \"a\"|null, \"by\": \"jeff\"|\"model\"|\"none\", \"confidence\": 数|null, \"reason\": \"…\"(可选)}
 走到用户这一级时不弹任何东西，回 by=none、reason=needs_user。
-危险闸（按规则，不看把握）：不管哪一级选的，选项的字在 dct-brain 里属于 content / critical / money 档
-就不放行，回 by=none、key=null、reason=danger、gated={key, tier}（不带字）。[judge] gate_tiers 默认三档全开，
-只有 content 能去掉（critical 和 money 去不掉）；请求里的 allow 绕不过它。闸只认 dct-brain 的词表，
+危险闸（按规则，不看把握）：不管哪一级选的，选项的字在 dct-brain 里属于 critical / money 档（开了 content 再加 content 档）
+就不放行，回 by=none、key=null、reason=danger、gated={key, tier}（不带字）。[judge] gate_tiers 默认只拦 critical 和 money
+（content 要在 gate_tiers 里加上才拦；critical 和 money 去不掉）；请求里的 allow 绕不过它。闸只认 dct-brain 的词表，
 它不认识的词不会被拦，调用方知道有害的选项仍应自己先筛掉。
 退出码：0 有答案或要用户；1 配置读不了 / 写不出；2 请求不对";
 
@@ -67,16 +67,10 @@ struct Request {
     forbid: Vec<String>,
 }
 
-/// 危险闸要拦的档位。`critical`（不可逆）和 `money`（花钱）永远在；只有 `content`（对外 / 丢内容）可以去掉。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 危险闸要拦的档位。`critical`（不可逆、授权）和 `money`（花钱）永远在；`content`（对外 / 丢内容）默认不拦，要 opt-in。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GateTiers {
     pub content: bool,
-}
-
-impl Default for GateTiers {
-    fn default() -> Self {
-        GateTiers { content: true }
-    }
 }
 
 impl GateTiers {
@@ -108,7 +102,7 @@ fn strip_role(text: &str) -> &str {
     t
 }
 
-/// `[judge] gate_tiers` 的检查。没写 = 默认三档全开。`critical` 和 `money` 不能去掉；
+/// `[judge] gate_tiers` 的检查。没写 = 只拦 critical 和 money。列表里必须有 `critical` 和 `money`，`content` 可以另加；
 /// 名字不认识也是错。错误信息中英各一句（命令行没有界面语言，直接并排）。
 pub fn gate_tiers_from_config(list: Option<&[String]>) -> Result<GateTiers, String> {
     let Some(list) = list else {
@@ -129,8 +123,8 @@ pub fn gate_tiers_from_config(list: Option<&[String]>) -> Result<GateTiers, Stri
         }
     }
     if !(critical && money) {
-        return Err("[judge] gate_tiers must always include \"critical\" and \"money\"; only \"content\" may be left out. / \
-                    [judge] gate_tiers 里必须一直有 \"critical\" 和 \"money\"，只有 \"content\" 可以不写。"
+        return Err("[judge] gate_tiers must always include \"critical\" and \"money\"; \"content\" is optional. / \
+                    [judge] gate_tiers 里必须一直有 \"critical\" 和 \"money\"，\"content\" 可选。"
             .into());
     }
     Ok(GateTiers { content })
@@ -662,6 +656,8 @@ mod tests {
         assert_eq!(v["by"], "model");
     }
 
+    const WITH_CONTENT: GateTiers = GateTiers { content: true };
+
     fn two(a: &str, b: &str, extra: &str) -> String {
         format!(
             r#"{{"state":"goal","options":[{{"key":"a","text":{}}},{{"key":"b","text":{}}}]{extra}}}"#,
@@ -692,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn tiers_by_label_en_and_zh_with_the_default_gate() {
+    fn tiers_by_label_en_and_zh_with_content_opted_in() {
         let cases = [
             ("Delete account permanently", "critical"),
             ("Buy now", "money"),
@@ -707,7 +703,7 @@ mod tests {
             ("文字 立即购买", "money"),
         ];
         for (label, tier) in cases {
-            let v = gated(&two("Settings", label, ""), GateTiers::default(), Some("b"));
+            let v = gated(&two("Settings", label, ""), WITH_CONTENT, Some("b"));
             assert_eq!(v["reason"], "danger", "{label}");
             assert_eq!(v["gated"]["tier"], tier, "{label}");
             assert_eq!(v["gated"]["key"], "b", "{label}");
@@ -746,9 +742,9 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_to_critical_and_money_lets_content_through_but_nothing_else() {
-        let narrow = GateTiers { content: false };
-        for label in ["Delete", "Send", "Save draft", "发布", "保存草稿"] {
+    fn by_default_content_passes_and_only_critical_and_money_are_stopped() {
+        let narrow = GateTiers::default();
+        for label in ["Delete", "Send", "Save draft", "Publish", "发布", "保存草稿"] {
             let v = gated(&two("Alpha", label, ""), narrow, Some("b"));
             assert_eq!(v["by"], "jeff", "{label}");
         }
@@ -831,11 +827,11 @@ mod tests {
         let l = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         assert_eq!(
             gate_tiers_from_config(None).unwrap(),
-            GateTiers { content: true }
+            GateTiers { content: false }
         );
         assert_eq!(
             gate_tiers_from_config(Some(&l(&["Content", "CRITICAL", "money"]))).unwrap(),
-            GateTiers { content: true }
+            WITH_CONTENT
         );
         assert_eq!(
             gate_tiers_from_config(Some(&l(&["critical", "money"]))).unwrap(),

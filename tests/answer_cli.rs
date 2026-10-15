@@ -420,45 +420,62 @@ fn a_confident_jeff_pick_of_a_critical_option_becomes_danger() {
 }
 
 #[test]
-fn gated_tiers_by_default_and_the_narrowed_list() {
+fn by_default_only_critical_and_money_are_stopped_and_content_is_opt_in() {
     let cases = [
+        ("Delete account permanently", "critical"),
+        ("Allow", "critical"),
         ("Buy now", "money"),
         ("Delete", "content"),
         ("Send", "content"),
         ("Save draft", "content"),
+        ("Publish", "content"),
         ("删除账号", "critical"),
         ("立即购买", "money"),
         ("保存草稿", "content"),
     ];
     for (label, tier) in cases {
         let req = serde_json::json!({"state":"s","options":[{"key":"a","text":"Settings"},{"key":"b","text":label}]}).to_string();
-        let home = tempfile::tempdir().unwrap();
-        let (url, _) = fake_jeff("b", 0.95);
-        write_config(home.path(), &format!("[judge]\nbase_url = \"{url}\"\n"));
-        let v = json(&answer(home.path(), &req));
-        assert_eq!(
-            (v["reason"].as_str(), v["gated"]["tier"].as_str()),
-            (Some("danger"), Some(tier)),
-            "{label}"
-        );
+        // 没写 gate_tiers，以及只写 critical + money：content 放行，其余照拦。
+        for config in [
+            |url: &str| format!("[judge]\nbase_url = \"{url}\"\n"),
+            |url: &str| {
+                format!("[judge]\nbase_url = \"{url}\"\ngate_tiers = [\"Critical\", \"money\"]\n")
+            },
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let (url, _) = fake_jeff("b", 0.95);
+            write_config(home.path(), &config(&url));
+            let v = json(&answer(home.path(), &req));
+            if tier == "content" {
+                assert_eq!(
+                    (v["by"].as_str(), v["key"].as_str()),
+                    (Some("jeff"), Some("b")),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(
+                    (v["reason"].as_str(), v["gated"]["tier"].as_str()),
+                    (Some("danger"), Some(tier)),
+                    "{label}"
+                );
+            }
+        }
 
-        // 只留 critical + money：content 放行，其余照拦。
+        // 显式加上 content：三档都拦。
         let home = tempfile::tempdir().unwrap();
         let (url, _) = fake_jeff("b", 0.95);
         write_config(
             home.path(),
-            &format!("[judge]\nbase_url = \"{url}\"\ngate_tiers = [\"Critical\", \"money\"]\n"),
+            &format!(
+                "[judge]\nbase_url = \"{url}\"\ngate_tiers = [\"content\", \"critical\", \"money\"]\n"
+            ),
         );
         let v = json(&answer(home.path(), &req));
-        if tier == "content" {
-            assert_eq!(
-                (v["by"].as_str(), v["key"].as_str()),
-                (Some("jeff"), Some("b")),
-                "{label}"
-            );
-        } else {
-            assert_eq!(v["gated"]["tier"], tier, "{label}");
-        }
+        assert_eq!(
+            (v["reason"].as_str(), v["gated"]["tier"].as_str()),
+            (Some("danger"), Some(tier)),
+            "{label} with content opted in"
+        );
     }
 }
 

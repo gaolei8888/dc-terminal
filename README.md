@@ -478,9 +478,12 @@ account permanently" is stopped the same as Jeff at 0.5. Jeff still sees every
 option; the gate only acts on the answer. Role prefixes (`按钮 `, `文字 `) are
 stripped first, so the label is judged the way the exam scripts judge it.
 
-Default gated tiers: **content** (sends, posts, saves, deletes content),
-**critical** (irreversible: delete account, …) and **money** (buy, pay, …). A
-gated pick comes back as:
+**By default only money and critical (permanent deletion, erasing, factory
+reset, authorisation) are stopped; ordinary delete/remove/send/publish/save
+pass; add `"content"` to `gate_tiers` to stop those too.** The tiers are
+**critical** (irreversible or authorising: delete account permanently, erase,
+factory reset, Allow, …), **money** (buy, pay, …) and the opt-in **content**
+(sends, posts, saves, deletes content). A gated pick comes back as:
 
 ```json
 {"key": null, "by": "none", "confidence": 0.991, "reason": "danger",
@@ -495,19 +498,20 @@ answer; it cannot switch the gate off, and there is no per-request override.
 
 ```toml
 [judge]
-# gate_tiers = ["content", "critical", "money"]   # the default
-# gate_tiers = ["critical", "money"]              # allowed: let content picks through
+# gate_tiers = ["critical", "money"]              # the default when the key is absent
+# gate_tiers = ["content", "critical", "money"]   # opt in: stop content picks too
 ```
 
 Names are case-insensitive. `critical` and `money` can never be removed; a
 list that leaves either out, or names an unknown tier, makes `dct answer` print
-the reason and exit 1. Only `content` is optional.
+the reason and exit 1. Only `content` is optional, and it is off unless you
+list it.
 
 **Limit, stated plainly: the gate only knows dct-brain's word list; words it
 does not know are not stopped; callers should still filter options they know
 are destructive.** (Examples it misses today: "Cancel subscription", "Clear
-all", "Block", "Deactivate"; it also over-stops some harmless ones, e.g.
-"Save", "Done", "Share", "Sign in", "Upload".)
+all", "Block", "Deactivate". With `"content"` opted in it also over-stops some
+harmless ones, e.g. "Save", "Done", "Share", "Sign in", "Upload".)
 
 ---
 

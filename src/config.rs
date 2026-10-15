@@ -116,8 +116,8 @@ pub struct JudgeConfig {
     pub threshold: f64,
     #[serde(default = "default_judge_timeout_ms")]
     pub timeout_ms: u64,
-    /// `dct answer` 的危险闸拦哪几档：content / critical / money（不分大小写），没写 = 三档全拦。
-    /// critical 和 money 必须在，只有 content 可以不写；检查在 `answer::gate_tiers_from_config`。
+    /// `dct answer` 的危险闸拦哪几档：content / critical / money（不分大小写），没写 = 只拦 critical 和 money。
+    /// 写了就必须有 critical 和 money，content 可另加（opt-in）；检查在 `answer::gate_tiers_from_config`。
     /// 这里只收字符串：写错不会让别的读 `[judge]` 的命令跟着读不了配置。
     #[serde(default)]
     pub gate_tiers: Option<Vec<String>>,
