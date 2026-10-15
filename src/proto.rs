@@ -324,6 +324,14 @@ pub enum Request {
         id: u32,
         text: String,
     },
+    /// 自动来源（语音）要敲的字：跟 `Input` 的区别是守护进程一次做完
+    /// 「写字 + 按回车」（`bridge::submit`），并且在准备重启时拒绝
+    /// （`ErrorCode::RestartPending`）。用户自己在界面上敲的字走 `Input`，
+    /// 不受影响。
+    Submit {
+        id: u32,
+        text: String,
+    },
     Screen {
         id: u32,
     },
@@ -582,6 +590,11 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::Input { id, text } => f
                 .debug_struct("Input")
+                .field("id", id)
+                .field("text", text)
+                .finish(),
+            Request::Submit { id, text } => f
+                .debug_struct("Submit")
                 .field("id", id)
                 .field("text", text)
                 .finish(),
@@ -1174,6 +1187,9 @@ pub enum ErrorCode {
     Internal(String),
     /// 多电脑那一路为什么没办成。
     Mesh(MeshProblem),
+    /// dct 正在准备重启，手机、语音这些自动来源这会儿不往会话里打字。
+    /// 对方当场就该知道「稍后再发」，而不是悄悄被吞掉。
+    RestartPending,
 }
 
 /// 见 [`ErrorCode::Mesh`]。句子在 `i18n::msg::error` 里组。
@@ -1460,6 +1476,10 @@ mod tests {
                 id: 1,
                 text: "t".into(),
             },
+            Request::Submit {
+                id: 1,
+                text: "t".into(),
+            },
             Request::Screen { id: 1 },
             Request::Screens { ids: vec![1] },
             Request::Resize {
@@ -1566,7 +1586,7 @@ mod tests {
             (PROTOCOL_VERSION, shape.as_str()),
             (
                 24,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );

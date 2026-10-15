@@ -617,15 +617,16 @@ mod unix {
         }
 
         fn type_into(&mut self, id: u32, text: &str) -> Result<(), String> {
-            // 跟 `bridge::submit` 同一个两步约定：先写字，再单独送空串按回车。
-            for t in [text, ""] {
-                match self.call(Request::Input { id, text: t.to_string() })? {
-                    Response::Ok => {}
-                    Response::Error(e) => return Err(format!("{e:?}")),
-                    _ => return Err("后台的回答读不懂".into()),
+            // 守护进程里一次做完「写字 + 按回车」（`bridge::submit`），并且
+            // 准备重启时会拒绝。语音是自动来源，不能走用户自己用的 `Input`。
+            match self.call(Request::Submit { id, text: text.to_string() })? {
+                Response::Ok => Ok(()),
+                Response::Error(crate::proto::ErrorCode::RestartPending) => {
+                    Err(crate::bridge::RESTART_PENDING_MSG.to_string())
                 }
+                Response::Error(e) => Err(format!("{e:?}")),
+                _ => Err("后台的回答读不懂".into()),
             }
-            Ok(())
         }
     }
 

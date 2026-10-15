@@ -1217,6 +1217,10 @@ fn handle(
             r
         }
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
+        // 自动来源（语音）：排空期间会被 `bridge::submit` 拒绝。
+        Request::Submit { id, text } => {
+            crate::bridge::submit(mgr, id, &text).map(|_| Response::Ok)
+        }
         // 键名 → 字节的翻译在这儿做，不在网页里也不在中转里：那张表只有
         // 一份（`ui::key_to_input`），而这是唯一同时够得着它和会话的地方。
         Request::Key { id, name } => match crate::web::keys::bytes_for(&name) {

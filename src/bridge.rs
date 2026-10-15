@@ -191,6 +191,10 @@ pub trait SessionWriter: Send + Sync {
     /// 绝不能因为「文字这一半成功了」就报 `Ok`：那样回执和 journal 记的
     /// `Typed` 依然是一句谎言。
     fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String>;
+    /// dct 正在准备重启吗？是的话 `type_into` 会失败，回执要说清原因。
+    fn draining(&self) -> bool {
+        false
+    }
     /// 这个会话给用户看该叫什么名字。跟 `SessionInfo::tag` 同一条规则：
     /// 起过名字用名字，没起过退回 profile。会话已经不在了（比如决定敲给
     /// 它之后、真的敲之前那一小段时间窗口里没掉了）返回 `None`——调用方
@@ -208,10 +212,28 @@ pub trait SessionWriter: Send + Sync {
 /// （取 `id -> tag/profile`），直接包一层就是完整的 `SessionWriter`——不用
 /// 在 `SessionManager` 里另开一条路。`list()` 每次都拷一份快照，这里只找
 /// 一个 id，代价跟 `dct ps` 刷新一次看板一样，不是热路径。
+/// 准备重启期间，手机、语音收到的拒绝。跟 `ErrorCode::RestartPending` 的中文
+/// 说法是同一句（这两路没有 i18n，回执固定中文）。
+pub(crate) const RESTART_PENDING_MSG: &str = "dct 正在准备重启，稍后再发";
+
 /// 把 `text` 敲进 `id` 并按回车：`type_into` 的本体，错误保留原样（带着
 /// `ErrorCode`），多电脑的留言（`mesh::deliver::LocalInbox`）要分得清「快照
 /// 没拍上、回车已经发了」和「真的没送进去」。**敲键只有这一条路。**
 pub(crate) fn submit(mgr: &crate::session::SessionManager, id: u32, text: &str) -> anyhow::Result<()> {
+    // 准备重启时，手机、语音这些自动来源一律不打：它们没有队列，当场
+    // 告诉对方「稍后再发」比悄悄吞掉强。排空自己要说的话走 `submit_unchecked`。
+    if mgr.is_draining() {
+        return Err(crate::proto::coded(crate::proto::ErrorCode::RestartPending));
+    }
+    submit_unchecked(mgr, id, text)
+}
+
+/// `submit` 的本体，不看「准备重启」。排空自己发话、重启后补投递用。
+pub(crate) fn submit_unchecked(
+    mgr: &crate::session::SessionManager,
+    id: u32,
+    text: &str,
+) -> anyhow::Result<()> {
     if !text.is_empty() {
         mgr.send_input(id, text)?;
     }
@@ -229,6 +251,10 @@ impl SessionWriter for crate::session::SessionManager {
         // 让整体报错**，绝不能因为上一步成功了就在这里放行：那样回执和
         // journal 记的 `Typed` 会撒谎。两步都在 `submit` 里。
         submit(self, id, text).map_err(|e| e.to_string())
+    }
+
+    fn draining(&self) -> bool {
+        self.is_draining()
     }
 
     fn name_of(&self, id: u32) -> Option<String> {
@@ -937,7 +963,12 @@ impl Bridge {
                 // 只是把 `anyhow::Error` 转成了 `to_string()`）。用户只需要
                 // 知道"没进去"和"该敲给谁"，不需要知道底层是哪种失败。
                 let name = writer.name_of(id).unwrap_or_else(|| fallback_name(id));
-                let msg = format!("这句话没能敲进「{name}」，稍后再试一次");
+                // 准备重启是已知的、对用户有意义的原因，直说；别的失败才笼统。
+                let msg = if writer.draining() {
+                    RESTART_PENDING_MSG.to_string()
+                } else {
+                    format!("这句话没能敲进「{name}」，稍后再试一次")
+                };
                 self.reply(&msg);
                 self.journal.delivered(Delivery::Failed(id));
                 Delivered::Failed(msg)
@@ -2795,9 +2826,15 @@ mod tests {
         /// `waiting()` 该答什么——`route_and_deliver`/`/ls` 的测试用
         /// `set_waiting` 摆好这份候选集合，不碰真的 `SessionManager`。
         waiting: Mutex<Vec<u32>>,
+        /// 模拟「dct 正在准备重启」。
+        draining: std::sync::atomic::AtomicBool,
     }
 
     impl Spy {
+        pub(super) fn set_draining(&self, on: bool) {
+            self.draining.store(on, Ordering::SeqCst);
+        }
+
         /// 敲进了哪些会话、敲了什么，按发生顺序。
         pub(super) fn written(&self) -> Vec<(u32, String)> {
             self.written.lock().unwrap().clone()
@@ -2857,6 +2894,9 @@ mod tests {
             }
             self.written.lock().unwrap().push((id, text.to_string()));
             Ok(())
+        }
+        fn draining(&self) -> bool {
+            self.draining.load(Ordering::SeqCst)
         }
         fn name_of(&self, id: u32) -> Option<String> {
             self.names.lock().unwrap().get(&id).cloned()
@@ -3013,6 +3053,18 @@ mod tests {
             1,
             "失败也要回一句话，不能假装什么都没发生"
         );
+    }
+
+    /// 准备重启时手机用户拿到的回执，必须是那句直说的话。
+    #[test]
+    fn the_phone_reply_says_dct_is_preparing_to_restart() {
+        let (b, spy) = Bridge::for_test_with_writer();
+        spy.fail_on(7);
+        spy.set_draining(true);
+        let d = b.deliver(Route::To(7), "先跑完");
+        assert_eq!(d, Delivered::Failed("dct 正在准备重启，稍后再发".into()));
+        assert_eq!(spy.last_reply(), "dct 正在准备重启，稍后再发");
+        assert!(spy.written().is_empty());
     }
 
     /// 没接线（`set_writer` 没被调用过）：`To` 分支绝不能假装敲成功了。
@@ -3737,6 +3789,79 @@ mod tests {
     /// 文字写进输入框——用 `cat` 起一个真会话，敲一句话之后确认
     /// `SessionState` 真的推进到了 `Working`（`session.rs::send_input`
     /// 空字符串分支才会改这个状态），而不是仅仅看屏幕上有没有字。
+    fn draining_cat_manager() -> (crate::session::SessionManager, u32, tempfile::TempDir) {
+        let mgr = crate::session::SessionManager::new();
+        mgr.register_profile(crate::profile::Profile {
+            name: "bridge-drain-fake".into(),
+            command: vec![crate::sys::testing::tool("cat")],
+            is_agent: false,
+            idle_pattern: None,
+            busy_pattern: None,
+            error_pattern: None,
+            env: Default::default(),
+            secret: None,
+            install: None,
+            login: None,
+            headless: None,
+            api: None,
+            label: Default::default(),
+            note: Default::default(),
+            resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
+            pairable: false,
+            backend_only: false,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let id = mgr.create(dir.path(), "bridge-drain-fake", None, &[]).unwrap();
+        (mgr, id, dir)
+    }
+
+    fn screen_text(mgr: &crate::session::SessionManager, id: u32) -> String {
+        mgr.screen(id)
+            .map(|s| {
+                s.lines
+                    .iter()
+                    .flatten()
+                    .map(|sp| sp.text.as_str())
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn submit_refuses_while_draining_and_writes_nothing() {
+        use crate::proto::{CodedError, ErrorCode};
+        let (mgr, id, _d) = draining_cat_manager();
+        mgr.set_draining(true);
+        let e = submit(&mgr, id, "hello-drain").unwrap_err();
+        assert!(matches!(
+            e.downcast_ref::<CodedError>(),
+            Some(CodedError(ErrorCode::RestartPending))
+        ));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!screen_text(&mgr, id).contains("hello-drain"), "什么都不该写进去");
+        mgr.set_draining(false);
+        submit(&mgr, id, "echo-ok").unwrap();
+    }
+
+    #[test]
+    fn submit_unchecked_ignores_draining() {
+        let (mgr, id, _d) = draining_cat_manager();
+        mgr.set_draining(true);
+        submit_unchecked(&mgr, id, "echo-ok").unwrap();
+    }
+
+    /// 真的 `SessionManager` 作为手机的写入器：准备重启时拒绝，并且能说出原因。
+    #[test]
+    fn the_real_writer_reports_draining_and_refuses() {
+        let (mgr, id, _d) = draining_cat_manager();
+        mgr.set_draining(true);
+        let w: &dyn SessionWriter = &mgr;
+        assert!(w.type_into(id, "x").is_err());
+        assert!(w.draining());
+    }
+
     #[test]
     fn session_manager_type_into_submits_not_just_types() {
         let mgr = crate::session::SessionManager::new();

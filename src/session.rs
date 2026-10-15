@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -670,6 +670,10 @@ pub struct SessionManager {
     /// 测试需要确定的时间点）；这里只需要一个单调、进程存活期内不变的
     /// 参照系，`Instant` 正合适。
     started: Instant,
+    /// dct 正在准备重启（排空）。开着的时候，手机、语音这些自动来源不许往
+    /// 会话里打字（见 `bridge::submit`），多电脑留言留在队列里不送。
+    /// 用户自己在界面上敲的字不受影响（走 `send_input`，不看这个）。
+    draining: AtomicBool,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -686,9 +690,19 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
+    /// 开/关「准备重启」状态，见 `draining` 字段。
+    pub fn set_draining(&self, on: bool) {
+        self.draining.store(on, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
     pub fn new() -> Self {
         SessionManager {
             next_id: AtomicU32::new(1),
+            draining: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),

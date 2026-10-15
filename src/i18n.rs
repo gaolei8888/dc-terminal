@@ -1959,6 +1959,11 @@ pub mod msg {
                 en: format!("{cmd} would not start — it may be installed incorrectly"),
                 zh: format!("启动不了 {cmd}，它可能装坏了"),
             ),
+            RestartPending => t!(
+                lang,
+                en: "dct is getting ready to restart, please send that again in a moment".to_string(),
+                zh: "dct 正在准备重启，稍后再发".to_string(),
+            ),
             DaemonNotResponding => t!(
                 lang,
                 en: "The dct service is not responding".to_string(),
@@ -3246,6 +3251,7 @@ mod tests {
             OperationFailed(crate::proto::Operation::ReadClipboard),
             CannotStart("claude".into()),
             DaemonNotResponding,
+            RestartPending,
             Mesh(crate::proto::MeshProblem::NotLoggedIn),
             Mesh(crate::proto::MeshProblem::NoDcAccount),
             Mesh(crate::proto::MeshProblem::AlreadyInGroup),
