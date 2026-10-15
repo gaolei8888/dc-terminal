@@ -5,6 +5,7 @@ pub mod board;
 pub mod choose;
 #[cfg(unix)]
 pub mod dco;
+pub mod dco_status;
 pub mod genre;
 pub mod goal;
 pub mod lab;
@@ -27,3 +28,5 @@ mod play_tests;
 mod scene_tests;
 #[cfg(all(test, unix))]
 mod dco_tests;
+#[cfg(all(test, unix))]
+mod dco_status_tests;

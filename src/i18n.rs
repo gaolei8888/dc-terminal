@@ -338,6 +338,16 @@ pub enum Key {
     /// 自己在哪的那个人。名词只在放得下时才写（`bar_chip`），让位的顺序是
     /// 父目录、名词、名字里的字符，牌子自己永远在场。
     ProjectChipLabel,
+    /// 看板标题行右侧那一小格：本机 dco 现在的状态（只读）。
+    DcoIdle,
+    DcoRunning,
+    DcoWaiting,
+    DcoPaused,
+    DcoHalted,
+    DcoPermission,
+    DcoLocked,
+    DcoDown,
+    DcoUnknown,
     Disconnected,
     PickAgentTitle,
     /// 选 agent 那一屏的标题后半句：当前项目不是 git 仓库。
@@ -832,6 +842,15 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         BoardTitle => t!(lang, en: "dct sessions", zh: "dct 会话看板"),
         // 英文 7 列、中文 4 列：中文因此比英文多留一档父目录的余地
         ProjectChipLabel => t!(lang, en: "project", zh: "项目"),
+        DcoIdle => t!(lang, en: "dco idle", zh: "dco 空闲"),
+        DcoRunning => t!(lang, en: "dco running", zh: "dco 运行中"),
+        DcoWaiting => t!(lang, en: "dco needs you", zh: "dco 等你处理"),
+        DcoPaused => t!(lang, en: "dco paused", zh: "dco 已暂停"),
+        DcoHalted => t!(lang, en: "dco halted", zh: "dco 已急停"),
+        DcoPermission => t!(lang, en: "dco missing permission", zh: "dco 缺权限"),
+        DcoLocked => t!(lang, en: "dco screen locked", zh: "dco 屏幕已锁"),
+        DcoDown => t!(lang, en: "dco offline", zh: "dco 未连接"),
+        DcoUnknown => t!(lang, en: "dco ?", zh: "dco 状态未知"),
         Disconnected => t!(
             lang,
             en: "disconnected, this may be out of date",
@@ -3036,6 +3055,15 @@ mod tests {
             BackToSettings,
             BoardTitle,
             ProjectChipLabel,
+            DcoIdle,
+            DcoRunning,
+            DcoWaiting,
+            DcoPaused,
+            DcoHalted,
+            DcoPermission,
+            DcoLocked,
+            DcoDown,
+            DcoUnknown,
             Disconnected,
             PickAgentTitle,
             NotAGitRepoHint,
@@ -3185,7 +3213,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 212, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 221, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

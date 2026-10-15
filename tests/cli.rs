@@ -531,3 +531,125 @@ mod restart {
         assert!(pid.is_some(), "restart 没把守护进程拉起来：{out}");
     }
 }
+
+/// `dct status --json` 的可选 `dco` 块：只读 dco 的 `status`，总期限很短，永远退 0，
+/// 不起守护进程（HOME 是临时目录，不碰真实的 ~/.dct 和 ~/.dco）。
+#[cfg(unix)]
+mod status_dco {
+    use super::run_with_home;
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// 假 dco：只接一条连接；`status` 先睡 `delay` 再回 `body`。
+    fn fake(home: &std::path::Path, body: Value, delay: Duration) {
+        let dir = home.join(".dco");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("dco.sock");
+        std::fs::write(dir.join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+        std::fs::write(dir.join("token"), TOKEN).unwrap();
+        let l = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let _ = writeln!(w, r#"{{"ok":true}}"#);
+            loop {
+                line.clear();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap();
+                let Some(id) = req.get("id") else { continue };
+                let result = if req["method"] == "tools/call" {
+                    std::thread::sleep(delay);
+                    json!({"content": [{"type": "text", "text": body.to_string()}], "isError": false})
+                } else {
+                    json!({"protocolVersion": "2025-06-18"})
+                };
+                if writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn status(home: &std::path::Path) -> (Value, Duration) {
+        let t = Instant::now();
+        let (out, err, code) = run_with_home(home, &["status", "--json"]);
+        let took = t.elapsed();
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.is_empty(), "{err}");
+        assert!(!home.join(".dct").join("daemon.sock").exists(), "status 把守护进程拉起来了");
+        (serde_json::from_str(&out).unwrap(), took)
+    }
+
+    #[test]
+    fn no_endpoint_file_means_no_dco_key() {
+        let home = tempfile::tempdir().unwrap();
+        let (v, _) = status(home.path());
+        assert!(v.get("dco").is_none(), "{v}");
+        assert_eq!(v["schema_version"], 1);
+    }
+
+    #[test]
+    fn an_endpoint_with_nothing_listening_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".dco");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("endpoint.json"), json!({"socket": dir.join("gone.sock")}).to_string()).unwrap();
+        std::fs::write(dir.join("token"), TOKEN).unwrap();
+        let (v, took) = status(home.path());
+        assert_eq!(v["dco"], json!({"state": "down"}));
+        assert_eq!(v["daemon"], "down");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn a_reachable_dco_reports_its_state_next_to_the_daemon_fields() {
+        let home = tempfile::tempdir().unwrap();
+        fake(home.path(), json!({"activity": {"schema_version": 1, "state": "running", "runs": [{"intent": "private"}], "attention": [{"level": "yellow", "kind": "dco.needs_help", "text": "need you"}]}}), Duration::ZERO);
+        let (v, _) = status(home.path());
+        assert_eq!(v["dco"], json!({"state": "waiting_user", "activity": "need you", "runs": 1, "attention": ["needs_help"]}));
+        assert_eq!(v["daemon"], "down");
+        assert_eq!(v["schema_version"], 1);
+    }
+
+    #[test]
+    fn halted_wins_over_needs_help_and_unknown_kinds_are_never_idle() {
+        for (reply, state, att) in [
+            (json!({"schema_version": 1, "state": "halted", "runs": [], "attention": [{"kind": "dco.needs_help", "text": "x"}]}), "halted", json!(["needs_help"])),
+            (json!({"schema_version": 1, "state": "idle", "runs": [], "attention": [{"kind": "dco.screen_locked"}]}), "screen_locked", json!(["screen_locked"])),
+            (json!({"schema_version": 1, "state": "idle", "runs": [], "attention": [{"kind": "dco.from_the_future"}]}), "unknown", json!([])),
+            (json!({"schema_version": 1, "state": "idle", "runs": [], "attention": "garbage"}), "unknown", json!([])),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            fake(home.path(), json!({"activity": reply}), Duration::ZERO);
+            let (v, _) = status(home.path());
+            assert_eq!(v["dco"]["state"], state, "{reply}");
+            assert_eq!(v["dco"]["attention"], att, "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_slow_dco_is_unknown_and_status_still_returns_quickly() {
+        let home = tempfile::tempdir().unwrap();
+        fake(home.path(), json!({"activity": {"schema_version": 1, "state": "idle"}}), Duration::from_secs(6));
+        let (v, took) = status(home.path());
+        assert_eq!(v["dco"], json!({"state": "unknown"}));
+        assert!(took < Duration::from_millis(1800), "总期限 ~800ms，实际 {took:?}");
+    }
+
+    #[test]
+    fn a_malformed_reply_is_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        fake(home.path(), json!({"hello": "there"}), Duration::ZERO);
+        let (v, _) = status(home.path());
+        assert_eq!(v["dco"], json!({"state": "unknown"}));
+    }
+}

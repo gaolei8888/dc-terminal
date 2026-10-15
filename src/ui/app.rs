@@ -184,6 +184,8 @@ pub struct App {
     /// 看板上「我的电脑」那一块：多电脑现状、加入确认、留言计数。后台线程
     /// 每 5 秒问一次，见 `computers::poll`。
     pub(crate) mesh: super::computers::MeshPanel,
+    /// 看板标题右侧那一格：本机 dco 的状态。后台读，见 `dco_cell`。
+    pub(crate) dco: super::dco_cell::DcoPanel,
     /// 上次公开时用过的标题，按 `p` 时预填。
     pub last_public_title: String,
     /// 界面语言。启动时由 `i18n::resolve` 定一次（DCT_LANG > 存过的设置 >
@@ -290,6 +292,7 @@ impl App {
             pair_last_fetch: None,
             live_last_fetch: None,
             mesh: Default::default(),
+            dco: Default::default(),
             last_public_title: String::new(),
             lang,
             socket,

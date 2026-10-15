@@ -166,6 +166,15 @@ pub fn status_value(probe: &Probe) -> serde_json::Value {
     }
 }
 
+/// 给 `status --json` 补上可选的 `dco` 块：没装 dco 就不加这个键（= 没问到 / 不支持），
+/// 装了但连不上是 `{"state":"down"}`。只读 `status`，总期限 `dco_status::BUDGET`，不起 dco 也不起守护进程。
+fn with_dco(mut v: serde_json::Value, home: Option<&Path>) -> serde_json::Value {
+    if let Some(d) = home.and_then(|h| dct_game::dco_status::probe(h, dct_game::dco_status::BUDGET)) {
+        v["dco"] = d.to_json();
+    }
+    v
+}
+
 /// 不带 `--json` 时的一句话，给不写代码的人看，所以没有「守护进程」「协议」。
 pub fn status_sentence(probe: &Probe, lang: Lang) -> String {
     match (probe, probe_kind(probe)) {
@@ -191,7 +200,7 @@ pub fn status_sentence(probe: &Probe, lang: Lang) -> String {
 pub fn run_status(sock: &Path, lang: Lang, json: bool) -> Result<()> {
     let probe = probe_daemon(sock).unwrap_or(Probe::Down);
     if json {
-        println!("{}", status_value(&probe));
+        println!("{}", with_dco(status_value(&probe), crate::sys::home().as_deref()));
     } else {
         println!("{}", status_sentence(&probe, lang));
     }
