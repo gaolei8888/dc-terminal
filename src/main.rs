@@ -67,6 +67,18 @@ fn main() -> Result<()> {
         None => run_ui(),
         // 第二个参数是 socket 路径，重启守护进程时由界面显式传进来
         // （见 `client::spawn_daemon`）。不传就还是从 HOME 推。
+        // 平稳重启的最后一步，由旧后台起、脱离任何会话。不给用户敲，不进帮助。
+        Some("__swap") => {
+            let pid: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let sock = args.get(2).map(PathBuf::from).unwrap_or_else(socket_path);
+            let exe = std::env::current_exe()?;
+            std::process::exit(
+                match dct::client::swap_daemon(pid, &sock, &exe, Duration::from_secs(10)) {
+                    Ok(()) => 0,
+                    Err(_) => 1,
+                },
+            )
+        }
         Some("daemon") => {
             let sock = args.get(1).map(PathBuf::from).unwrap_or_else(socket_path);
             dct::daemon::run(&sock)

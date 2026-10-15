@@ -79,6 +79,74 @@ pub fn spawn_daemon(exe: &Path, socket: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 平稳重启的最后一步：起一个脱离任何会话的小进程 `exe __swap <旧后台pid> <socket>`。
+/// 旧后台自己马上就要退出，而重启可能是在 dct 会话里敲的——会话一断，
+/// 「等旧的走、再起新的」这件事不能跟着没。脱离的办法同 `spawn_daemon`。
+pub fn spawn_swap(old_pid: u32, socket: &Path, exe: &Path) -> Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__swap")
+        .arg(old_pid.to_string())
+        .arg(socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::sys::proc::spawn_detached(&mut cmd)?;
+    Ok(())
+}
+
+/// 等旧后台退出，最多 `grace`。返回 true = 自己走了；false = 超时，已被硬杀。
+fn wait_old_gone(pid: u32, grace: Duration) -> bool {
+    if wait_up_to(grace, || !process_alive(pid)) {
+        return true;
+    }
+    crate::sys::proc::hard_kill(pid);
+    wait_up_to(Duration::from_secs(2), || !process_alive(pid));
+    false
+}
+
+/// 失败原因追加一行到 `<socket 所在目录>/daemon.log`。写不进去就算了。
+fn log_swap_failure(socket: &Path, reason: &str) {
+    let Some(dir) = socket.parent() else { return };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{secs}] 平稳重启失败：{reason}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// `dct __swap` 的本体：等旧后台走（最多 `grace`，超时硬杀），起新后台，
+/// 等它真能应答且协议号对上（最多 10 秒——比 `restart_daemon` 的 5 秒长，
+/// 因为新后台要先把所有会话接回来才开始应答）。失败写 daemon.log。
+pub fn swap_daemon(old_pid: u32, socket: &Path, exe: &Path, grace: Duration) -> Result<()> {
+    if old_pid != 0 {
+        wait_old_gone(old_pid, grace);
+    }
+    if let Err(e) = spawn_daemon(exe, socket) {
+        log_swap_failure(socket, "新的后台没能启动，请手动再启动一次 dct。");
+        return Err(e);
+    }
+    let up = wait_up_to(Duration::from_secs(10), || {
+        Client::connect(socket)
+            .ok()
+            .and_then(|mut c| c.protocol())
+            .is_some_and(|v| v == crate::proto::PROTOCOL_VERSION)
+    });
+    if !up {
+        log_swap_failure(socket, "新的后台起来后一直没有应答，请手动再启动一次 dct。");
+        return Err(crate::proto::coded(
+            crate::proto::ErrorCode::DaemonNotResponding,
+        ));
+    }
+    Ok(())
+}
+
 fn process_alive(pid: u32) -> bool {
     crate::sys::proc::alive(pid)
 }
@@ -204,5 +272,34 @@ impl Client {
             ));
         }
         Ok(serde_json::from_str(&line)?)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod swap_tests {
+    use super::*;
+
+    /// 起一个子进程，并在后台线程里 wait 它——否则被杀后留下僵尸，
+    /// `kill(pid, 0)` 仍然成功，测不出「已不在」。
+    fn spawn_reaped(secs: &str) -> u32 {
+        let mut child = std::process::Command::new("sleep")
+            .arg(secs)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        pid
+    }
+
+    #[test]
+    fn swap_waits_for_old_process_then_hard_kills_it() {
+        let pid = spawn_reaped("30");
+        assert!(!wait_old_gone(pid, Duration::from_millis(200)));
+        assert!(!process_alive(pid));
+
+        let pid = spawn_reaped("0.1");
+        assert!(wait_old_gone(pid, Duration::from_secs(5)));
     }
 }
