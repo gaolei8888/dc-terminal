@@ -426,6 +426,7 @@ Everything else:
 | | |
 |---|---|
 | `dct ps` | list the sessions running in the background |
+| `dct status [--json]` | is dct running, how many sessions are busy; `--json` is for other programs to read |
 | `dct stop <n>…` / `--all` | stop sessions, giving them time to wind down |
 | `dct kill <n>…` / `--all` | kill sessions outright |
 | `dct prune` | clear stopped sessions off the list |
@@ -439,6 +440,37 @@ Everything else:
 `ps`, `stop`, `kill` and `prune` never start a daemon: asking "is anything
 running?" shouldn't turn the answer from no into yes. `restart` does start one,
 because what you asked for is a daemon running the new binary.
+
+`dct status --json` always exits 0 and keeps `schema_version` at 1. If a local
+dco is installed (`~/.dco/endpoint.json` exists), it adds an optional `dco`
+block, read-only, from dco's `status` tool and never starting dco or the daemon:
+
+```json
+"dco": {"state": "waiting_user", "activity": "…", "runs": 1, "attention": ["needs_help"]}
+```
+
+`state` is one of `idle`, `running`, `waiting_user`, `paused`, `halted`,
+`permission_missing`, `screen_locked`, `down` (dco is installed but can't be
+reached) or `unknown` (it answered something we can't read, took longer than the
+~0.8 s the whole read is allowed, or reported something we don't recognise). No
+`dco` key means dco isn't installed.
+
+`state` combines dco's own activity state with its attention list. Highest wins:
+`halted` > `permission_missing` > `screen_locked` > `paused` > `waiting_user`
+(an attention item of kind `dco.needs_help` exists, even while dco is running) >
+`running` > `idle`. `waiting_user` is shown only for `dco.needs_help`, never for
+the other kinds. Anything unrecognised (an unknown activity state or attention
+kind, an odd-shaped attention list) never makes the state look healthier: it
+turns `idle`/`running` into `unknown` and leaves the alert states as they are.
+
+`attention` lists the recognised kinds with the `dco.` prefix removed
+(`halted`, `permission_missing`, `screen_locked`, `paused`, `needs_help`),
+deduplicated, most severe first, at most 8; unknown kinds are left out. It is
+absent when nothing could be read. `runs` is the number of runs, never their
+contents. `activity` is the text of the first `dco.needs_help` item only, capped
+at 40 characters. **Only `idle` (with an empty attention list) has been seen on a
+real dco.** Everything else, including the kind names and their priority, comes
+from dco's own source as relayed by its session, and is unverified.
 
 ---
 
@@ -598,6 +630,11 @@ which agent and opens the session. `Tab` and the digits only move the cursor.
 
 The title line ends with the version that's running, and so does the settings
 page — it's the first thing anyone helping you will ask.
+
+If dco is installed, a small read-only label just left of the version shows what
+it's doing (`dco idle`, `dco needs you`, `dco paused`, `dco halted`, `dco missing permission`, `dco screen locked` …). It's refreshed every few seconds in
+the background, hidden when dco isn't installed, and drops out before anything
+else on a narrow screen.
 
 ### Picking a project
 

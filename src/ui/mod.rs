@@ -40,6 +40,7 @@ mod settings_view;
 mod web;
 
 mod computers;
+mod dco_cell;
 mod view;
 use view::SecretPhase;
 pub use view::{
@@ -825,6 +826,8 @@ pub fn run(
         live::poll_status(&mut app, std::time::Instant::now());
         // 多电脑现状：后台线程问、这里收，绘制路径上不发请求（见 `computers`）。
         computers::poll(&mut app, std::time::Instant::now());
+        // 本机 dco 的状态（看板标题右侧一小格）：同样是后台线程读、这里收。
+        dco_cell::poll(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {

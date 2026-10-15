@@ -12,6 +12,7 @@ use super::{
     accent, danger, dim, open_new_session, open_project_picker, open_secrets, session_action,
 };
 use crate::i18n::{msg, text, Key};
+use dct_game::dco_status::DcoState;
 
 /// 组头上，最后一格（「还没有会话 …」/ agent 统计）之前的所有东西占几列。
 ///
@@ -168,6 +169,20 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // 贴边显示。
     const MIN_GAP_BEFORE_VERSION: usize = 1;
     const MIN_RULE_AFTER_VERSION: usize = 2;
+    // dco 状态那一格（只读）：排在版本号**左边**，也得先给别人让路——放不下就整格不画，
+    // 然后才轮到版本号按剩下的宽度自己决定。没装 dco 时 `cell` 是 `None`，这一段什么都不改。
+    let dco = app.dco.cell(std::time::Instant::now()).map(|s| {
+        let label = super::dco_cell::label(s.state, app.lang);
+        let style = match s.state {
+            DcoState::WaitingUser | DcoState::Halted | DcoState::Paused | DcoState::PermissionMissing | DcoState::ScreenLocked => accent(),
+            _ => dim(),
+        };
+        (label, style)
+    });
+    let dco = dco.filter(|(l, _)| {
+        (area.width as usize) >= used + MIN_GAP_BEFORE_VERSION + display_width(l) + MIN_RULE_AFTER_VERSION
+    });
+    let used = used + dco.as_ref().map_or(0, |(l, _)| MIN_GAP_BEFORE_VERSION + display_width(l));
     let show_version = (area.width as usize)
         >= used + MIN_GAP_BEFORE_VERSION + version_width + MIN_RULE_AFTER_VERSION;
 
@@ -362,8 +377,18 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::TOP)
         .border_style(border_style)
         .title(title);
-    if show_version {
-        block = block.title_top(Line::from(Span::styled(version, dim())).right_aligned());
+    if dco.is_some() || show_version {
+        let mut right = Vec::new();
+        if let Some((label, style)) = dco {
+            right.push(Span::styled(label, style));
+            if show_version {
+                right.push(Span::raw(" "));
+            }
+        }
+        if show_version {
+            right.push(Span::styled(version, dim()));
+        }
+        block = block.title_top(Line::from(right).right_aligned());
     }
     // 多电脑那两块：标题下面的邀请码，底部一段「我的电脑」。都是现成的
     // 数据（`App::mesh`），这里不发请求。
@@ -897,6 +922,82 @@ mod tests {
             title.contains("连接已断开"),
             "断连提示不许被版本号挤掉：{title}"
         );
+    }
+
+    fn dco_status(state: DcoState) -> Option<dct_game::dco_status::DcoStatus> {
+        Some(dct_game::dco_status::DcoStatus::bare(state))
+    }
+
+    /// **dco 那一格：有状态就画在版本号左边，没装 dco 就一个字都不多。**
+    #[test]
+    fn the_title_shows_a_small_dco_cell_only_when_dco_is_there() {
+        let (mut app, dir) = App::test_app();
+        app.set_sessions(vec![sess(1, &real_dir(&dir, "dc-terminal"))]);
+        let draw_title = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+            term.draw(|f| draw(f, f.area(), app)).unwrap();
+            title_text(&term)
+        };
+        let bare = draw_title(&mut app);
+        assert!(!bare.contains("dco"), "没装 dco 不该画：{bare}");
+
+        for (state, want_zh) in [
+            (DcoState::Idle, "dco空闲"),
+            (DcoState::Running, "dco运行中"),
+            (DcoState::WaitingUser, "dco等你处理"),
+            (DcoState::Paused, "dco已暂停"),
+            (DcoState::Halted, "dco已急停"),
+            (DcoState::PermissionMissing, "dco缺权限"),
+            (DcoState::ScreenLocked, "dco屏幕已锁"),
+            (DcoState::Unknown, "dco状态未知"),
+        ] {
+            app.dco.shown = dco_status(state);
+            let t = draw_title(&mut app);
+            assert!(t.contains(want_zh), "{state:?}：{t}");
+            assert!(t.contains(env!("CARGO_PKG_VERSION")), "宽屏版本号还得在：{t}");
+            assert!(t.find(want_zh) < t.find(env!("CARGO_PKG_VERSION")), "dco 在版本号左边：{t}");
+        }
+        app.lang = crate::i18n::Lang::En;
+        app.dco.shown = dco_status(DcoState::WaitingUser);
+        assert!(draw_title(&mut app).contains("dconeedsyou"));
+        for (state, want) in [(DcoState::PermissionMissing, "dcomissingpermission"), (DcoState::ScreenLocked, "dcoscreenlocked")] {
+            app.dco.shown = dco_status(state);
+            assert!(draw_title(&mut app).contains(want), "{state:?}");
+        }
+        app.dco.shown = dco_status(DcoState::WaitingUser);
+
+        // 连不上：只在刚连得上之后一小会儿内画
+        app.dco.shown = dco_status(DcoState::Down);
+        assert!(!draw_title(&mut app).contains("dco"), "从没连上过，不画");
+        app.dco.last_up = Some(std::time::Instant::now());
+        assert!(draw_title(&mut app).contains("dcooffline"));
+    }
+
+    /// 窄屏：dco 那一格比版本号更值钱（先于版本号保留），但也得给项目名和断连提示让路。
+    #[test]
+    fn a_narrow_title_drops_the_version_then_the_dco_cell_before_anything_else() {
+        let (mut app, dir) = App::test_app();
+        app.set_sessions(vec![sess(1, &real_dir(&dir, "app"))]);
+        app.connected = false;
+        app.dco.shown = dco_status(DcoState::Idle);
+        let draw_at = |app: &mut App, w: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, 12)).unwrap();
+            term.draw(|f| draw(f, f.area(), app)).unwrap();
+            title_text(&term)
+        };
+        let t = draw_at(&mut app, 60);
+        assert!(!t.contains(env!("CARGO_PKG_VERSION")), "{t}");
+        // 够宽：项目名、断连提示都在，dco 那一格也在
+        let t = draw_at(&mut app, 80);
+        assert!(t.contains("app") && t.contains("连接已断开") && t.contains("dco空闲"), "{t}");
+        // 再窄：dco 那一格自己退场，标题跟没装 dco 时一模一样（不许挤掉牌子和断连提示）
+        for w in [50u16, 44, 40, 30] {
+            let with = draw_at(&mut app, w);
+            let shown = app.dco.shown.take();
+            let without = draw_at(&mut app, w);
+            app.dco.shown = shown;
+            assert_eq!(with, without, "{w} 列上 dco 格不该改动标题");
+        }
     }
 
     /// **戴上牌子之后，80 列的中文项目名仍然挤不掉行尾那句红字。**

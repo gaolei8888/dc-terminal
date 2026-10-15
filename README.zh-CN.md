@@ -367,6 +367,7 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 | | |
 |---|---|
 | `dct ps` | 列出后台在跑的会话 |
+| `dct status [--json]` | dct 在不在运行、有几个会话在忙；`--json` 给别的程序读 |
 | `dct stop <会话号>…` / `--all` | 停掉会话，给它收尾的时间 |
 | `dct kill <会话号>…` / `--all` | 直接杀掉 |
 | `dct prune` | 把已经停掉的会话从列表里清掉 |
@@ -379,6 +380,28 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 
 `ps`、`stop`、`kill`、`prune` 绝不拉起守护进程：问「有没有东西在跑」，不该把答案从
 「没有」变成「有」。`restart` 会拉起一个，因为你要的就是「后台跑着新的」。
+
+`dct status --json` 永远退 0，`schema_version` 仍是 1。本机装了 dco（有 `~/.dco/endpoint.json`）时，
+多一个可选的 `dco` 块：只读，取自 dco 的 `status` 工具，不会拉起 dco，也不会拉起守护进程：
+
+```json
+"dco": {"state": "waiting_user", "activity": "…", "runs": 1, "attention": ["needs_help"]}
+```
+
+`state` 取 `idle`、`running`、`waiting_user`、`paused`、`halted`、`permission_missing`、`screen_locked`、
+`down`（装了但连不上）、`unknown`（回的话读不懂、超过整个读取允许的约 0.8 秒，或报了我们不认识的东西）之一。
+没有 `dco` 这个键 = 没装 dco。
+
+`state` 把 dco 自己的活动状态和它的待处理列表合在一起看，取最高的：
+`halted` > `permission_missing` > `screen_locked` > `paused` > `waiting_user`
+（待处理里有 `dco.needs_help`，哪怕 dco 正在 running）> `running` > `idle`。
+`waiting_user` 只认 `dco.needs_help`，别的种类不算。不认识的东西（不认识的活动状态或待处理种类、形状奇怪的列表）
+绝不会让状态看起来更健康：本来会是 `idle`/`running` 的变成 `unknown`，已有的告警态保持不变。
+
+`attention` 列出认得的种类，去掉 `dco.` 前缀（`halted`、`permission_missing`、`screen_locked`、`paused`、`needs_help`），
+去重、最严重的在前、最多 8 项；不认识的种类不列。什么都没读到时没有这个键。`runs` 只是流程个数，不含内容。
+`activity` 只取第一条 `dco.needs_help` 的文字，最多 40 个字符。
+**只有 `idle`（待处理为空）在真实的 dco 上见过。** 其余全部——包括种类名和优先级——来自 dco 会话读 dco 源码后的转述，**未验证**。
 
 ---
 
@@ -515,6 +538,9 @@ profile 就跳过；万一一个都对不上，回到完整清单，而不是给
 `Tab` 和数字键只是把光标挪过去。
 
 标题栏最右边写着现在跑的版本，设置页也有——来帮你排查的人第一句就会问这个。
+
+装了 dco 的话，版本号左边多一小格只读的标签，写着它在干什么（`dco 空闲`、`dco 等你处理`、`dco 已暂停`、`dco 已急停`、`dco 缺权限`、`dco 屏幕已锁` ……）。
+后台每隔几秒刷新一次；没装 dco 就不显示；屏幕窄的时候它比别的内容先让出位置。
 
 ### 选项目
 
