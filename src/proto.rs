@@ -1380,6 +1380,9 @@ pub enum WarningCode {
         profile: String,
         reason: SessionResumeSkipReason,
     },
+    /// 平稳重启后要对某个会话说的话（「继续」或「先读交接」），等了 2 分钟它
+    /// 都没进入空闲，没打。只带目录：用户要的是「去哪个会话手动说一声」。
+    ResumeNoteDropped { dir: String },
 }
 
 /// 恢复上次会话时，某一条为什么被跳过。

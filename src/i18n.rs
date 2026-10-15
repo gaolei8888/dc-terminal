@@ -2681,6 +2681,15 @@ pub mod msg {
                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
                 )
             }
+            ResumeNoteDropped { dir } => t!(
+                lang,
+                en: format!(
+                    "The session in {dir} was not ready after the restart, so it could not be told to carry on. Please tell it to continue yourself."
+                ),
+                zh: format!(
+                    "{dir} 的会话重启后一直没准备好，没能叫它继续，请手动告诉它接着做。"
+                ),
+            ),
         }
     }
 
@@ -3626,6 +3635,9 @@ mod tests {
                 dir: "/w/dc-terminal".into(),
                 profile: "claude".into(),
                 reason: crate::proto::SessionResumeSkipReason::ConversationGone,
+            },
+            ResumeNoteDropped {
+                dir: "/w/dc-terminal".into(),
             },
         ];
         for c in &codes {
