@@ -180,12 +180,27 @@ pub fn group_for_resume(sessions: &[RecordedSession]) -> Vec<bool> {
     out
 }
 
-/// 有对话 id 的记录各接各的，不进 `--continue` 的分组；没有的照旧分组。
+/// 这一条重启后会不会按对话 id 接回：记录里有 id，**而且**它的 profile
+/// 此刻还声明着按 id 接回的参数（`Profile::resumes_by_id`）。profile 后来
+/// 去掉了那两组参数的话，id 就没处用，这一条照旧走 `--continue` 分组。
+pub fn will_resume_by_id(r: &RecordedSession, profiles: &[crate::profile::Profile]) -> bool {
+    r.conversation_id.is_some()
+        && profiles
+            .iter()
+            .find(|p| p.name == r.profile)
+            .is_some_and(|p| p.resumes_by_id())
+}
+
+/// 按 id 接回的记录各接各的，不进 `--continue` 的分组；其余的照旧分组。
 /// 返回值跟输入逐位对应，语义同 [`group_for_resume`]：`true` = 这一条该带
-/// `resume_args`。有 id 的那些一律是 `false`——它们按 id 接回，用不着猜。
-pub fn continue_flags(sessions: &[RecordedSession]) -> Vec<bool> {
+/// `resume_args`。按 id 接回的那些一律是 `false`——用不着猜。判定「按不按
+/// id 接回」见 [`will_resume_by_id`]。
+pub fn continue_flags(
+    sessions: &[RecordedSession],
+    profiles: &[crate::profile::Profile],
+) -> Vec<bool> {
     let idx: Vec<usize> = (0..sessions.len())
-        .filter(|&i| sessions[i].conversation_id.is_none())
+        .filter(|&i| !will_resume_by_id(&sessions[i], profiles))
         .collect();
     let sub: Vec<RecordedSession> = idx.iter().map(|&i| sessions[i].clone()).collect();
     let flags = group_for_resume(&sub);
@@ -252,7 +267,30 @@ mod tests {
         let mut with_id = rec("/w/x", "claude", 9);
         with_id.conversation_id = Some("abc".into());
         let sessions = vec![rec("/w/x", "claude", 5), with_id, rec("/w/x", "claude", 1)];
-        assert_eq!(continue_flags(&sessions), vec![true, false, false]);
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        assert_eq!(
+            continue_flags(&sessions, &profiles),
+            vec![true, false, false]
+        );
+    }
+
+    /// 记录里有 id，但 profile 已经不声明按 id 接回的参数了：id 没处用，
+    /// 这一条要回到 `--continue` 分组里去抢位，不能被晾在外面。
+    #[test]
+    fn an_id_whose_profile_no_longer_resumes_by_id_joins_continue_grouping() {
+        let mut with_id = rec("/w/x", "claude", 9);
+        with_id.conversation_id = Some("abc".into());
+        let sessions = vec![rec("/w/x", "claude", 5), with_id.clone()];
+
+        let mut no_ids = crate::profile::Profile::builtin("claude").unwrap();
+        no_ids.session_id_args.clear();
+        no_ids.resume_id_args.clear();
+        let profiles = vec![no_ids];
+
+        assert!(!will_resume_by_id(&with_id, &profiles));
+        assert_eq!(continue_flags(&sessions, &profiles), vec![false, true]);
+        // profile 都不认识了也一样：不算按 id 接回。
+        assert!(!will_resume_by_id(&with_id, &[]));
     }
 
     #[test]

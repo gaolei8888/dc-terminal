@@ -152,7 +152,7 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         );
         let (all, _) = all_profiles(&profiles_dir);
         let secrets_guard = recover(secrets.lock());
-        let skips = restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
+        let (skips, by_id) = restore_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
         drop(secrets_guard);
         eprintln!("dct：会话接回完成。");
         // review 之后补上：真正被 TUI 拉起来的守护进程 stdio 全接到
@@ -161,6 +161,11 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         // 记下来，交给 `Request::Profiles` 顶给界面，跟 `LlmUnavailable`
         // 走的是同一条路。
         mgr.set_resume_skips(skips);
+        // 按 id 接回的那些在后台盯一小会儿：接回失败（对话没了）的会马上
+        // 退出，换一个新开的顶上，再补一句警告。**必须排在
+        // `set_resume_skips` 之后**——那个是整份覆盖，后台补的警告要追加在
+        // 它后面，不能被它冲掉。不等这个线程：守护进程照常开始接请求。
+        watch_resumed_by_id(mgr.clone(), all, by_id, RESUME_WATCH_WINDOW);
     }
 
     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
@@ -737,16 +742,41 @@ fn start_phone_bridge(
 /// `dct daemon` 或者截获 stderr 的测试看得见，跟 `install_llm_backend`
 /// 那条注释是同一条限制），那条narration 不需要多语言、也不需要被测试
 /// 断言内容，所以没有走返回值。
+#[cfg(test)]
 fn restore_last_sessions(
     records: &[crate::last_sessions::RecordedSession],
     all: &[Profile],
     secrets: &SecretStore,
     mgr: &SessionManager,
 ) -> Vec<crate::proto::WarningCode> {
+    restore_sessions(records, all, secrets, mgr).0
+}
+
+/// 按对话 id 接回的会话，接回之后要在后台盯多久：这段时间里自己退出了
+/// 就算「接回失败」（对话文件没了、agent 报错退出），换一个新开的顶上。
+/// 再晚退出的不算——那是用户在接回来的对话里正常用着用着退出的。
+const RESUME_WATCH_WINDOW: Duration = Duration::from_secs(20);
+
+/// 一个按对话 id 接回、需要后台盯着的会话。
+struct ResumedById {
+    id: u32,
+    record: crate::last_sessions::RecordedSession,
+    secret: Option<String>,
+}
+
+/// 同 `restore_last_sessions`，另外交出按 id 接回的那些，给
+/// [`watch_resumed_by_id`] 盯着。
+fn restore_sessions(
+    records: &[crate::last_sessions::RecordedSession],
+    all: &[Profile],
+    secrets: &SecretStore,
+    mgr: &SessionManager,
+) -> (Vec<crate::proto::WarningCode>, Vec<ResumedById>) {
     use crate::proto::{SessionResumeSkipReason, WarningCode};
 
-    let resume_flags = crate::last_sessions::continue_flags(records);
+    let resume_flags = crate::last_sessions::continue_flags(records, all);
     let mut skips = Vec::new();
+    let mut by_id = Vec::new();
     let total = records.len();
 
     for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
@@ -798,7 +828,7 @@ fn restore_last_sessions(
         } else {
             Some(record.tag.as_str())
         };
-        if let Err(e) = mgr.create_resuming(
+        let resumed = mgr.create_resuming(
             &record.dir,
             &record.profile,
             secret,
@@ -806,7 +836,17 @@ fn restore_last_sessions(
             resume,
             tag,
             record.conversation_id.as_deref(),
-        ) {
+        );
+        if let Ok(id) = resumed {
+            if crate::last_sessions::will_resume_by_id(record, all) {
+                by_id.push(ResumedById {
+                    id,
+                    record: record.clone(),
+                    secret: secret.map(str::to_string),
+                });
+            }
+        }
+        if let Err(e) = resumed {
             eprintln!(
                 "跳过恢复：{}（{}）没能重新起来：{e}",
                 record.dir.display(),
@@ -820,7 +860,81 @@ fn restore_last_sessions(
         }
     }
 
-    skips
+    (skips, by_id)
+}
+
+/// 在后台盯着按 id 接回的会话，最多盯 `window` 这么久。哪个在这段时间里
+/// **自己**退出了（被叫停的不算），就当接回失败：把那个死格子拿掉，在同一个
+/// 目录、同一个 profile 下新开一个（新的对话 id、原来的名字），再经
+/// `push_resume_skip` 告诉用户「没能接回原来的对话」。
+///
+/// 跑在单独的线程上，不挡守护进程开始接请求。没东西要盯就不起线程。
+/// 返回线程句柄只是给测试 `join` 用。
+fn watch_resumed_by_id(
+    mgr: Arc<SessionManager>,
+    all: Vec<Profile>,
+    mut pending: Vec<ResumedById>,
+    window: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    use crate::proto::{SessionResumeSkipReason, WarningCode};
+
+    if pending.is_empty() {
+        return None;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("resume-watch".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + window;
+            loop {
+                pending.retain(|w| match mgr.exited_on_its_own(w.id) {
+                    // 会话已经不在名册上了（被清理掉了）：没什么可盯的。
+                    None => false,
+                    Some(false) => true,
+                    Some(true) => {
+                        let r = &w.record;
+                        eprintln!(
+                            "{}（{}）没能接回原来的对话，重新开一个",
+                            r.dir.display(),
+                            r.profile
+                        );
+                        mgr.discard(w.id);
+                        let tag = Some(r.tag.as_str()).filter(|t| !t.is_empty());
+                        let reason = match mgr.create_resuming(
+                            &r.dir,
+                            &r.profile,
+                            w.secret.as_deref(),
+                            &all,
+                            false,
+                            tag,
+                            None,
+                        ) {
+                            Ok(_) => SessionResumeSkipReason::ConversationGone,
+                            Err(e) => {
+                                eprintln!("重新开也失败了：{e}");
+                                SessionResumeSkipReason::StartFailed
+                            }
+                        };
+                        mgr.push_resume_skip(WarningCode::SessionResumeSkipped {
+                            dir: r.dir.display().to_string(),
+                            profile: r.profile.clone(),
+                            reason,
+                        });
+                        false
+                    }
+                });
+                if pending.is_empty() || std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    match spawned {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("没能起接回看守线程：{e}");
+            None
+        }
+    }
 }
 
 fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
@@ -2444,6 +2558,126 @@ mod tests {
             texts[fresh].contains(&format!("ARGS --session-id {conv}")),
             "{texts:?}"
         );
+    }
+
+    /// 按 id 接回就立刻退出的探针（模拟 claude「找不到这段对话」）；
+    /// 新开（`--session-id`）则正常活着。
+    fn gone_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "gone-probe"
+            command = ["/bin/sh", "-c", "if [ \"$1\" = --resume ]; then echo gone; exit 1; fi; echo \"ARGS $*\"; sleep 30", "sh"]
+            is_agent = false
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 接回失败（agent 一起来就退出）：死格子拿掉，原处新开一个（新 id、
+    /// 原来的名字），并且有一条「没能接回原来的对话」的警告递到界面上。
+    #[test]
+    fn a_session_whose_conversation_is_gone_is_restarted_fresh_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![gone_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "gone-probe");
+        r.conversation_id = Some("old".into());
+        r.tag = "修登录白屏".into();
+
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+        assert_eq!(by_id.len(), 1);
+        mgr.set_resume_skips(skips);
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_secs(5))
+            .expect("该起看守线程")
+            .join()
+            .unwrap();
+
+        let list = mgr.list();
+        assert_eq!(list.len(), 1, "死格子要拿掉，只剩新开的那个：{list:?}");
+        assert_eq!(list[0].tag, "修登录白屏", "名字要留着");
+        let id = list[0].id;
+        let conv = mgr.conversation_of(id).expect("新开的要有新 id");
+        assert_ne!(conv, "old");
+        let texts = wait_for_args(&mgr, &[id]);
+        assert!(
+            texts[0].contains(&format!("ARGS --session-id {conv}")),
+            "{texts:?}"
+        );
+
+        let warnings = mgr.resume_skips();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        match &warnings[0] {
+            crate::proto::WarningCode::SessionResumeSkipped {
+                reason, profile, ..
+            } => {
+                assert_eq!(
+                    *reason,
+                    crate::proto::SessionResumeSkipReason::ConversationGone
+                );
+                assert_eq!(profile, "gone-probe");
+            }
+            other => panic!("应当是 SessionResumeSkipped：{other:?}"),
+        }
+    }
+
+    /// 接回成功、一直活着的会话：盯满时间也不动它，不报警告。
+    #[test]
+    fn a_session_resumed_by_id_that_stays_up_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("keep".into());
+
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty());
+        let before: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        let after: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(before, after);
+        assert_eq!(mgr.conversation_of(after[0]).as_deref(), Some("keep"));
+        assert!(mgr.resume_skips().is_empty());
+    }
+
+    /// 刚接回就被用户停掉：那是用户的意思，不是接回失败，不能再开一个。
+    #[test]
+    fn a_resumed_session_stopped_on_purpose_is_not_restarted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("keep".into());
+
+        let mgr = Arc::new(SessionManager::new());
+        let (_, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
+        let id = by_id[0].id;
+        mgr.stop(id).unwrap();
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![id], "不该多出一个新开的");
+        assert!(mgr.resume_skips().is_empty());
     }
 
     // 用 cat 冒充 agent：能收输入、不会自己退出，is_agent = true 才会触发

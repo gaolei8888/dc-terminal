@@ -1331,6 +1331,9 @@ pub enum SessionResumeSkipReason {
     ProfileGone,
     /// 目录和 profile 都还在，但重新起这个会话本身失败了
     StartFailed,
+    /// 按对话 id 接回时 agent 马上退出了（对话找不到了），已经在原处
+    /// 新开了一个——会话还在，只是原来的对话没接上
+    ConversationGone,
 }
 
 pub fn socket_path() -> PathBuf {

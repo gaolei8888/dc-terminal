@@ -481,6 +481,18 @@ struct Session {
     /// `session_id_args`/`resume_id_args`，或者这一回走的是 `--continue`，
     /// 就是 `None`。
     conversation_id: Option<String>,
+    /// 这个会话有没有真的提交过一句话（`send_input` 收到过回车）。
+    ///
+    /// 没提交过的话 agent 那边根本没有这段对话的记录——claude 只在收到
+    /// 第一条消息时才建对话文件，这时去 `--resume <id>` 只会报「找不到
+    /// 对话」然后退出。所以落盘时只有提交过的会话才记 `conversation_id`，
+    /// 没提交过的记 `None`，重启后老老实实新开（反正本来也没东西可接）。
+    /// 按 id 接回来的会话一出生就是 `true`：它的对话早就有了。
+    submitted: bool,
+    /// 是不是被叫停的：`stop()`/`kill()` 置上。恢复后的看守线程靠它分清
+    /// 「接回失败、自己退出了」和「刚接回就被人停掉了」，后者不该被当成
+    /// 接回失败再重开一个。
+    stopped_by_request: bool,
     dir: PathBuf,
     is_agent: bool,
     checkpoints: Vec<String>,
@@ -860,7 +872,13 @@ impl SessionManager {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64,
-                    conversation_id: s.conversation_id.clone(),
+                    // 没提交过一句话的会话，agent 那边没有这段对话，记了
+                    // 也接不回——见 `Session::submitted`。
+                    conversation_id: if s.submitted {
+                        s.conversation_id.clone()
+                    } else {
+                        None
+                    },
                     interrupted: interrupted.contains(&s.id),
                     handoff: handoffs.get(&s.id).cloned(),
                 })
@@ -919,7 +937,7 @@ impl SessionManager {
     /// 后面（`opencode`/`qwen`/`codex`/`shell` 这类没声明 `resume_args`
     /// 的 profile，接的是一个空切片，等于什么都没变——调用方不用先检查
     /// 「这个 profile 支不支持恢复」再决定要不要传 `true`）。判定「这一条
-    /// 该不该真的传 `true`」是 `last_sessions::group_for_resume` 的事，
+    /// 该不该真的传 `true`」是 `last_sessions::continue_flags` 的事，
     /// 不是这里。
     ///
     /// `restore_tag`：从 `last-sessions.toml` 里记下来的名字（`None` 或者
@@ -962,6 +980,33 @@ impl SessionManager {
         self.with_session(id, |s| Ok(s.conversation_id.clone()))
             .ok()
             .flatten()
+    }
+
+    /// 会话是不是**自己**退出了（进程没了，又不是被 `stop()`/`kill()` 叫停的）。
+    /// 会话不在了返回 `None`。只看不改：状态翻成 `Stopped`、回收子进程
+    /// 仍归 `tick()` 管。
+    pub fn exited_on_its_own(&self, id: u32) -> Option<bool> {
+        self.with_session(id, |s| {
+            Ok(!s.stopped_by_request && (s.state == SessionState::Stopped || !s.pty.is_alive()))
+        })
+        .ok()
+    }
+
+    /// 把一个会话彻底从名册上拿掉（先杀进程），清单跟着重写。恢复时
+    /// 「接回失败、换一个新开的顶上」用：留着那个死格子只会让用户以为
+    /// 有两个会话。不存在就什么都不做。
+    pub fn discard(&self, id: u32) {
+        let removed = recover(self.sessions.lock()).remove(&id);
+        if let Some(arc) = removed {
+            let _ = recover(arc.lock()).pty.kill();
+            self.persist_last_sessions();
+        }
+    }
+
+    /// 往 `resume_skips` 后面再追加一条。恢复后台线程晚到的警告用——
+    /// `set_resume_skips` 是整份覆盖，会把启动时那批冲掉。
+    pub fn push_resume_skip(&self, w: crate::proto::WarningCode) {
+        recover(self.resume_skips.lock()).push(w);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1079,6 +1124,7 @@ impl SessionManager {
         // 一次，之后新开的会话都有 id。没声明 `resume_args` 的 profile 接的
         // 是空切片，等于没走 `--continue`，照常新起一个 id。
         let mut command = profile.command.clone();
+        let resumed_by_id = conversation.is_some() && profile.resumes_by_id();
         let conversation_id = match conversation {
             Some(c) if profile.resumes_by_id() => {
                 command.extend(crate::profile::fill_id(&profile.resume_id_args, c));
@@ -1130,6 +1176,8 @@ impl SessionManager {
             id,
             profile,
             conversation_id,
+            submitted: resumed_by_id,
+            stopped_by_request: false,
             dir: dir.to_path_buf(),
             is_agent,
             checkpoints,
@@ -1243,7 +1291,9 @@ impl SessionManager {
 
         if text.is_empty() {
             let (dir, sid, seq, is_agent) = {
-                let s = recover(arc.lock());
+                let mut s = recover(arc.lock());
+                // 回车 = 真的提交了一句话，agent 那边从此有这段对话了。
+                s.submitted = true;
                 (s.dir.clone(), s.id, s.checkpoints.len(), s.is_agent)
             };
 
@@ -1376,6 +1426,7 @@ impl SessionManager {
             let pid = s.pty.process_id();
             s.pty.kill()?;
             s.state = SessionState::Stopped;
+            s.stopped_by_request = true;
             // `requested` 和 `tick()` 里那条 `vanished` 是这本日志唯一
             // 分得开的两件事——见 `journal` 的模块注释。
             self.journal.died(id, crate::journal::Death::Requested, pid);
@@ -1399,6 +1450,7 @@ impl SessionManager {
         let r = self.with_session(id, |s| {
             s.pty.kill_now()?;
             s.state = SessionState::Stopped;
+            s.stopped_by_request = true;
             Ok(())
         });
         // 理由同 `stop()`：不能在 `with_session` 的闭包里调，会跟它手上
@@ -4016,6 +4068,9 @@ mod tests {
         let proj = tempfile::tempdir().unwrap();
         let id = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
         let conv = mgr.conversation_of(id).unwrap();
+        // 提交过一句话才记 id（见 `unsubmitted_session_records_no_conversation_id`）。
+        mgr.send_input(id, "").unwrap();
+        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
 
         // 普通落盘：带 id，不带标记。
         let recs = crate::last_sessions::load(&record_path);
@@ -4034,6 +4089,53 @@ mod tests {
         assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
         assert!(recs[0].interrupted);
         assert_eq!(recs[0].handoff, Some(PathBuf::from("/tmp/h.md")));
+    }
+
+    /// 开了会话却一句话都没提交过：agent 那边没有这段对话，记下 id 重启后
+    /// `--resume` 只会扑空。所以没提交过的记 `None`，按过回车之后才记。
+    #[test]
+    fn unsubmitted_session_records_no_conversation_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_profile());
+
+        let proj = tempfile::tempdir().unwrap();
+        let id = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+        let conv = mgr.conversation_of(id).unwrap();
+
+        // 只打字不回车也不算提交。
+        mgr.send_input(id, "hello").unwrap();
+        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs[0].conversation_id, None, "没提交过不该记 id");
+
+        mgr.send_input(id, "").unwrap();
+        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
+    }
+
+    /// 按 id 接回的会话，对话本来就有：不用再提交一句，id 照记不误——
+    /// 不然接回来没碰过的会话，下次重启就接不回了。
+    #[test]
+    fn a_session_resumed_by_id_records_its_id_without_new_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_profile());
+
+        let proj = tempfile::tempdir().unwrap();
+        mgr.create_resuming(proj.path(), "echo-id", None, &[], false, None, Some("abc"))
+            .unwrap();
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs[0].conversation_id.as_deref(), Some("abc"));
     }
 
     /// 一个没声明 `resume_args` 的 profile，`resume = true` 也不该凭空

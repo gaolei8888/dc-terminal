@@ -294,7 +294,7 @@ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
 
     let profiles_dir = dct::profile::profiles_dir_for_socket(sock);
     let (all, _) = dct::profile::all_profiles(&profiles_dir);
-    let resume_flags = dct::last_sessions::continue_flags(&records);
+    let resume_flags = dct::last_sessions::continue_flags(&records, &all);
 
     println!("{}", text(Key::ResumeSessionsExplain, lang));
     for (rec, &resume) in records.iter().zip(resume_flags.iter()) {
@@ -304,8 +304,8 @@ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
             .map(|p| p.display_label(lang))
             .unwrap_or_else(|| rec.profile.clone());
         let marker = text(
-            // 记着对话 id 的按 id 接回，也算「继续」。
-            if resume || rec.conversation_id.is_some() {
+            // 按对话 id 接回的也算「继续」——跟 `continue_flags` 同一条判定。
+            if resume || dct::last_sessions::will_resume_by_id(rec, &all) {
                 Key::ResumeSessionsWillContinue
             } else {
                 Key::ResumeSessionsWillStartFresh

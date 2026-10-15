@@ -2523,6 +2523,11 @@ pub mod msg {
                         en: "it could not be started again",
                         zh: "没能重新启动",
                     ),
+                    crate::proto::SessionResumeSkipReason::ConversationGone => t!(
+                        lang,
+                        en: "its earlier conversation could not be found, so a fresh one was started in its place",
+                        zh: "原来的对话找不到了，已经在原处重新开了一个",
+                    ),
                 };
                 t!(
                     lang,
@@ -3462,6 +3467,11 @@ mod tests {
                 dir: "/w/dc-terminal".into(),
                 profile: "claude".into(),
                 reason: crate::proto::SessionResumeSkipReason::StartFailed,
+            },
+            SessionResumeSkipped {
+                dir: "/w/dc-terminal".into(),
+                profile: "claude".into(),
+                reason: crate::proto::SessionResumeSkipReason::ConversationGone,
             },
         ];
         for c in &codes {
