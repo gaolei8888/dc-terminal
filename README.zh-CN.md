@@ -378,6 +378,7 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 | `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
 | `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
 | `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通。退出码 0 答了，1 没配或后端出错，2 题写错了 |
+| `dct answer --json` | 从标准输入读一道选择题（JSON：`state`、`options`，可选 `allow` / `forbid` / `picture`），写一行 JSON：先 Jeff，再 `[llm]` 大模型，最后「要你来」（不弹任何东西）。**危险闸**会拦下字面是对外、不可逆或花钱的选择（见[危险闸](#危险闸dct-answer)）。退出码 0 有答案或要你来，1 配置读不了或不合规，2 请求不对 |
 | `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头，再按指纹，指纹签的就是这些文字；标准输入不是终端就拒绝）；各平台文字和开头句不能相同 |
 | `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（只有 Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索，写成流程草稿，给你看确认卡片（按指纹确认）。每次点发布前都先问你。详见[发到自媒体平台](#发到自媒体平台mac早期) |
 | `dct daemon` | 只跑守护进程，不开看板 |
@@ -403,6 +404,40 @@ dct 不会自己起 `jeff-serve`，也不下载权重，要你自己起。目前
 `jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`（约 1.6 GB，最多接 254 个选项）。
 
 没写 `[judge]`，`dct do` 就跳过 Jeff；没写 `[llm]`，也跳过大模型。最后问的永远是你。
+
+### 危险闸（`dct answer`）
+
+不管是谁选的（Jeff、`[llm]` 大模型），`dct answer` 放行之前都会用 `dct-brain` 的档位规则
+看一眼被选中那个选项的字。这是按规则拦，从不看把握：Jeff 对「Delete account permanently」
+有 0.99 的把握，和只有 0.5 一样被拦。Jeff 仍然看到全部选项，闸只管答案。选项开头的角色前缀
+（`按钮 `、`文字 `）先剥掉，和考试脚本判档的方式一致。
+
+**默认只拦 money 和 critical（永久删除、清除、恢复出厂、授权）；普通的删除/移除/发送/发布/保存照常放行；
+要连这些也拦，在 `gate_tiers` 里加上 `"content"`。** 档位有：**critical**（不可逆或授权：永久删账号、
+抹掉、恢复出厂、Allow……）、**money**（购买、支付……），以及要自己打开的 **content**（发出去、发布、保存、删内容）。
+被拦的答案长这样：
+
+```json
+{"key": null, "by": "none", "confidence": 0.991, "reason": "danger",
+ "gated": {"key": "b", "tier": "critical"}}
+```
+
+`reason` 多了一个值 `danger`（和 `needs_user` / `no_answer` 并列），退出码和别的「要你来」一样是 0，
+`gated.key` 是被选中的那个 key。JSON 里永远不带选项的字。滚动、等一会儿这类固定动作的字属于 Read 档，照常放行。
+请求里的 `allow` 只决定哪几级可以答，关不掉闸，也没有逐次关闭的办法。
+
+```toml
+[judge]
+# gate_tiers = ["critical", "money"]              # 没写这一项时的默认
+# gate_tiers = ["content", "critical", "money"]   # 自己打开：content 档的选择也拦
+```
+
+名字不分大小写。`critical` 和 `money` 永远去不掉：少了任何一个，或者写了不认识的档位，
+`dct answer` 会说明原因并以 1 退出。只有 `content` 是可选的，不写就不拦。
+
+**说在前面：闸只认 dct-brain 的词表，它不认识的词不会被拦；调用方知道有害的选项，仍应自己先筛掉。**
+（目前认不出的例子：「取消订阅」「清空全部」「拉黑」「停用」；开了 content 档以后，也会多拦一些无害的，比如
+「保存」「完成」「分享」「登录」「上传」。）
 
 ---
 
