@@ -101,15 +101,12 @@ impl Drain {
         now: Instant,
     ) -> Drain {
         members.sort_by_key(|m| m.id);
-        let mut interrupted = HashSet::new();
+        // 发起者在等命令跑完，永远不会空闲：不等、不发话，无条件记为打断，重启后叫它继续
+        let interrupted: HashSet<u32> = initiator.into_iter().collect();
         let slots = members
             .into_iter()
             .map(|m| {
-                let slot = if Some(m.id) == initiator {
-                    // 发起者在等命令跑完，永远不会空闲：不等、不发话，重启后叫它继续
-                    interrupted.insert(m.id);
-                    Slot::Done
-                } else if !m.is_agent {
+                let slot = if Some(m.id) == initiator || !m.is_agent {
                     Slot::Done
                 } else {
                     Slot::Waiting
@@ -140,7 +137,9 @@ impl Drain {
             match *slot {
                 Slot::Done => {}
                 Slot::Waiting if is_stopped => {
-                    if m.resumable {
+                    // 能接回的不用交接；已经死了/没了/报错的没法再往里打字，也不用等
+                    let idle = matches!(states.get(&m.id), Some(SessionState::Idle));
+                    if m.resumable || !idle {
                         *slot = Slot::Done;
                     } else {
                         let path = handoff_path(&self.handoff_dir, m.id, &file_stamp());
@@ -177,11 +176,10 @@ impl Drain {
         {
             self.nudged_at = Some(now);
             for (m, slot) in &self.slots {
+                // 只有被催的（到点还在干活的）才算打断，不管之后停没停。
+                // 正在写交接的不催：它本来是空闲的，没被打断。
                 if matches!(slot, Slot::Waiting) {
                     out.push(Action::Nudge { id: m.id });
-                }
-                if !matches!(slot, Slot::Done) {
-                    // 被催过就算打断，不管之后停没停
                     self.interrupted.insert(m.id);
                 }
             }
@@ -322,7 +320,7 @@ mod tests {
         );
         assert_eq!(a, vec![Action::Nudge { id: 1 }]);
         assert!(d.progress(t0 + Duration::from_secs(900)).nudged);
-        // 兜底话发出去后它先变 Working 再变 Idle（Review Focus 5）
+        // 兜底话发出去后，会话会先变忙、处理完再变空闲；即使最后停了，也已经被打断过
         d.step(
             t0 + Duration::from_secs(910),
             &st(&[(1, Working), (2, Idle)]),
@@ -430,5 +428,66 @@ mod tests {
             .chars()
             .enumerate()
             .all(|(i, c)| i == 8 || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn initiator_is_interrupted_even_if_not_a_member() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(1, true)], Some(7), cfg(), "/h".into(), t0);
+        let a = d.step(t0, &st(&[(1, Idle)]));
+        assert_eq!(finish(&a).unwrap().0, &HashSet::from([7]));
+    }
+
+    #[test]
+    fn unresumable_dead_sessions_get_no_handoff_request() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(
+            vec![m(1, false), m(2, false), m(3, false)],
+            None,
+            cfg(),
+            "/h".into(),
+            t0,
+        );
+        let a = d.step(t0, &st(&[(1, Stopped), (2, Failed)]));
+        assert_eq!(a.len(), 1);
+        let (i, h) = finish(&a).unwrap();
+        assert!(i.is_empty() && h.is_empty());
+    }
+
+    #[test]
+    fn handoff_writer_is_not_nudged_and_only_interrupted_at_the_hard_deadline() {
+        let t0 = Instant::now();
+        let mk = || {
+            let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+            d.step(t0, &st(&[(3, Idle)]));
+            d.step(t0 + Duration::from_secs(1), &st(&[(3, Working)]));
+            d
+        };
+        // 到点还在写：不催
+        let mut d = mk();
+        assert!(d
+            .step(t0 + Duration::from_secs(900), &st(&[(3, Working)]))
+            .is_empty());
+        assert!(d.progress(t0 + Duration::from_secs(900)).nudged);
+        // 硬时限前写完：正常结束，没被打断
+        let a = d.step(t0 + Duration::from_secs(1000), &st(&[(3, Idle)]));
+        let (i, h) = finish(&a).unwrap();
+        assert!(i.is_empty() && h.contains_key(&3));
+        // 硬时限到了还没写完：算打断
+        let mut d = mk();
+        d.step(t0 + Duration::from_secs(900), &st(&[(3, Working)]));
+        let a = d.step(t0 + Duration::from_secs(1080), &st(&[(3, Working)]));
+        assert_eq!(finish(&a).unwrap().0, &HashSet::from([3]));
+    }
+
+    #[test]
+    fn idle_session_asked_for_handoff_at_the_deadline_is_not_interrupted() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        let a = d.step(t0 + Duration::from_secs(900), &st(&[(3, Idle)]));
+        assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
+        d.step(t0 + Duration::from_secs(901), &st(&[(3, Working)]));
+        let a = d.step(t0 + Duration::from_secs(950), &st(&[(3, Idle)]));
+        assert!(finish(&a).unwrap().0.is_empty());
     }
 }
