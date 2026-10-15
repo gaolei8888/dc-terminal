@@ -376,6 +376,7 @@ mod tests {
             threshold: 0.8,
             timeout_ms: 5000,
             gate_tiers: None,
+            model_veto: None,
         };
         assert!(from_config(&c).is_err());
     }
@@ -390,6 +391,7 @@ mod tests {
             threshold: 0.8,
             timeout_ms: 5000,
             gate_tiers: None,
+            model_veto: None,
         };
         assert!(from_config(&c).is_err());
     }
@@ -405,6 +407,7 @@ mod tests {
             threshold: 0.8,
             timeout_ms: 5000,
             gate_tiers: None,
+            model_veto: None,
         };
         assert!(matches!(
             from_config(&mk("http://example.com:8765")),

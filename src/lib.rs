@@ -1,4 +1,5 @@
 pub mod answer;
+pub mod answer_veto;
 pub mod bridge;
 pub mod campaign;
 pub mod channel;

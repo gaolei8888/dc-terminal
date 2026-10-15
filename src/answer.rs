@@ -4,6 +4,7 @@
 //! 和 `[judge]` / `[llm]` 配置接成一条标准输入 → 标准输出的 JSON 命令；不新增任何模型调用，
 //! 门槛、次数上限、「Jeff 的把握由 dct 从概率重算」都和 `dct do` 里一样。
 //! 走到用户这一级时不弹任何东西，回 `{"by":"none","reason":"needs_user"}`（问人的服务是以后的事）。
+use crate::answer_veto::{LlmVeto, NoVeto, Verdict, Veto, VETO_TIMEOUT};
 use crate::explore_cli::{JudgeJeff, NoJeff, DEFAULT_THRESHOLD};
 use crate::explore_model::{backend_from_config, LlmModel, DEFAULT_TIMEOUT};
 use dct_brain::tier::{tier_for_label, Tier};
@@ -245,6 +246,7 @@ fn run_ladder(
     model: &dyn Model,
     threshold: f64,
     gate: GateTiers,
+    veto: &dyn Veto,
 ) -> Value {
     let has = |r: Rung| req.allow.contains(&r);
     // 禁词命中：不发给大模型（它可能在别人的机器上）。Jeff 跑在本机，照问。
@@ -291,7 +293,49 @@ fn run_ladder(
             .max()
             .map(|t| (d.key.clone(), t, d.jeff.as_ref().map(|(_, c)| *c)))
     });
+    // 大模型否决：只在规则闸放行、且没禁用大模型这一级时问；只发选项的字（命中禁词的不发）。只能加否决。
+    let verdict = match (&decided, &stopped) {
+        (Some(d), None) if has(Rung::Llm) => req
+            .options
+            .iter()
+            .find(|o| o.key == d.key)
+            .map(|o| strip_role(&o.text))
+            .filter(|t| !t.trim().is_empty())
+            .or(d.name.as_deref())
+            .filter(|l| !hits_forbid(&req.forbid, [*l]))
+            .map_or(Verdict::Allow, |l| veto.check(l)),
+        _ => Verdict::Allow,
+    };
     match decided {
+        Some(d) if matches!(verdict, Verdict::Money | Verdict::Delete) => {
+            let tier = if verdict == Verdict::Money {
+                "money"
+            } else {
+                "critical"
+            };
+            out.insert("key".into(), Value::Null);
+            out.insert("by".into(), json!("none"));
+            out.insert("confidence".into(), json!(d.jeff.as_ref().map(|(_, c)| *c)));
+            out.insert(
+                "gated".into(),
+                json!({"key": d.key, "tier": tier, "source": "model"}),
+            );
+            reason = Some("danger".into());
+        }
+        Some(d) if verdict == Verdict::Unsure => {
+            out.insert("key".into(), Value::Null);
+            out.insert("by".into(), json!("none"));
+            out.insert("confidence".into(), json!(d.jeff.as_ref().map(|(_, c)| *c)));
+            out.insert("veto".into(), json!("unsure"));
+            reason = Some(
+                if has(Rung::User) {
+                    "needs_user"
+                } else {
+                    "no_answer"
+                }
+                .into(),
+            );
+        }
         Some(_) if stopped.is_some() => {
             let (key, tier, conf) = stopped.expect("guarded by is_some");
             out.insert("key".into(), Value::Null);
@@ -349,9 +393,10 @@ pub fn handle(
     model: &dyn Model,
     threshold: f64,
     gate: GateTiers,
+    veto: &dyn Veto,
 ) -> (i32, Result<Value, String>) {
     match parse(input) {
-        Ok(req) => (0, Ok(run_ladder(&req, jeff, model, threshold, gate))),
+        Ok(req) => (0, Ok(run_ladder(&req, jeff, model, threshold, gate, veto))),
         Err(m) => (2, Err(m)),
     }
 }
@@ -404,24 +449,48 @@ pub fn run_cli(args: &[String]) -> i32 {
         };
     // 每一级都有退路：没配 / 用不了就跳过，用户（这里是「要用户」）永远是最后一级。
     let (jeff, threshold): (Box<dyn Jeff>, f64) = match &cfg.judge {
-        Some(jc) => match crate::judge::from_config(jc) {
+        Some(jc) if jc.has_jeff() => match crate::judge::from_config(jc) {
             Ok(b) => (Box::new(JudgeJeff(b)), jc.threshold),
             Err(e) => {
                 eprintln!("[judge] 用不了（{e}），这次不问 Jeff");
                 (Box::new(NoJeff), jc.threshold)
             }
         },
-        None => (Box::new(NoJeff), DEFAULT_THRESHOLD),
+        _ => (Box::new(NoJeff), DEFAULT_THRESHOLD),
     };
-    let model: Box<dyn Model> = match cfg.llm.as_ref().map(|l| backend_from_config(l, &socket)) {
-        Some(Ok(b)) => Box::new(LlmModel::new(b, DEFAULT_TIMEOUT)),
+    let backend = match cfg.llm.as_ref().map(|l| backend_from_config(l, &socket)) {
+        Some(Ok(b)) => Some(b),
         Some(Err(e)) => {
             eprintln!("{}", crate::explore_model::llm_unavailable_note(&e));
-            Box::new(NoModel)
+            None
         }
+        None => None,
+    };
+    let model: Box<dyn Model> = match &backend {
+        Some(b) => Box::new(LlmModel::new(b.clone(), DEFAULT_TIMEOUT)),
         None => Box::new(NoModel),
     };
-    let (code, out) = handle(&input, jeff.as_ref(), model.as_ref(), threshold, gate);
+    // `[judge] model_veto`：没写 = 开（有 `[llm]` 才有得问）；写 false 关掉。
+    let veto: Box<dyn Veto> = match &backend {
+        Some(b)
+            if cfg
+                .judge
+                .as_ref()
+                .and_then(|j| j.model_veto)
+                .unwrap_or(true) =>
+        {
+            Box::new(LlmVeto::new(b.clone(), VETO_TIMEOUT))
+        }
+        _ => Box::new(NoVeto),
+    };
+    let (code, out) = handle(
+        &input,
+        jeff.as_ref(),
+        model.as_ref(),
+        threshold,
+        gate,
+        veto.as_ref(),
+    );
     match out {
         Ok(v) => {
             if v["reason"]
@@ -487,7 +556,7 @@ mod tests {
         )
     }
     fn run(input: &str, j: &FakeJeff, m: &FakeModel) -> (i32, Result<Value, String>) {
-        handle(input, j, m, 0.8, GateTiers::default())
+        handle(input, j, m, 0.8, GateTiers::default(), &NoVeto)
     }
     fn ok(r: (i32, Result<Value, String>)) -> Value {
         assert_eq!(r.0, 0, "{:?}", r.1);
@@ -667,7 +736,7 @@ mod tests {
     }
     fn gated(req: &str, gate: GateTiers, jeff_pick: Option<&'static str>) -> Value {
         let (j, m) = (jeff(jeff_pick.map(|k| (k, 0.991))), model(None));
-        ok(handle(req, &j, &m, 0.8, gate))
+        ok(handle(req, &j, &m, 0.8, gate, &NoVeto))
     }
 
     #[test]
@@ -744,7 +813,14 @@ mod tests {
     #[test]
     fn by_default_content_passes_and_only_critical_and_money_are_stopped() {
         let narrow = GateTiers::default();
-        for label in ["Delete", "Send", "Save draft", "Publish", "发布", "保存草稿"] {
+        for label in [
+            "Delete",
+            "Send",
+            "Save draft",
+            "Publish",
+            "发布",
+            "保存草稿",
+        ] {
             let v = gated(&two("Alpha", label, ""), narrow, Some("b"));
             assert_eq!(v["by"], "jeff", "{label}");
         }
@@ -861,5 +937,86 @@ mod tests {
         assert_eq!(strip_role("文字  发布"), "发布");
         assert_eq!(strip_role("文字处理"), "文字处理");
         assert_eq!(strip_role("Post"), "Post");
+    }
+
+    /// 假否决：固定回一个裁决，数被问了几次、问了什么字。
+    struct FakeVeto(Verdict, RefCell<Vec<String>>);
+    impl Veto for FakeVeto {
+        fn check(&self, label: &str) -> Verdict {
+            self.1.borrow_mut().push(label.to_string());
+            self.0
+        }
+    }
+    fn vetoed(req: &str, v: Verdict, extra_jeff: (&'static str, f64)) -> (Value, Vec<String>) {
+        let (j, m, fv) = (
+            jeff(Some(extra_jeff)),
+            model(None),
+            FakeVeto(v, Default::default()),
+        );
+        let out = ok(handle(req, &j, &m, 0.8, GateTiers::default(), &fv));
+        (out, fv.1.into_inner())
+    }
+
+    #[test]
+    fn the_model_can_add_a_veto_after_the_rules_pass() {
+        for (v, tier) in [(Verdict::Money, "money"), (Verdict::Delete, "critical")] {
+            let (out, asked) = vetoed(&two("Alpha", "Continue", ""), v, ("b", 0.95));
+            assert_eq!(asked, ["Continue"], "只发选项的字");
+            assert_eq!(
+                (out["by"].as_str(), out["reason"].as_str()),
+                (Some("none"), Some("danger"))
+            );
+            assert!(out["key"].is_null());
+            assert_eq!(
+                out["gated"],
+                json!({"key": "b", "tier": tier, "source": "model"})
+            );
+        }
+    }
+
+    #[test]
+    fn an_allow_leaves_the_answer_untouched() {
+        let (out, asked) = vetoed(&two("Alpha", "Continue", ""), Verdict::Allow, ("b", 0.95));
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            (out["key"].as_str(), out["by"].as_str()),
+            (Some("b"), Some("jeff"))
+        );
+        assert!(out.get("gated").is_none() && out.get("veto").is_none());
+    }
+
+    #[test]
+    fn an_unsure_model_hands_the_pick_to_the_human() {
+        let (out, _) = vetoed(&two("Alpha", "Continue", ""), Verdict::Unsure, ("b", 0.95));
+        assert!(out["key"].is_null());
+        assert_eq!(
+            (out["by"].as_str(), out["reason"].as_str()),
+            (Some("none"), Some("needs_user"))
+        );
+        assert_eq!(out["veto"], "unsure");
+    }
+
+    #[test]
+    fn a_rule_block_stays_a_block_and_the_model_is_never_asked() {
+        // 假否决说「放行」也没用：规则拦下的东西它根本看不到。
+        let (out, asked) = vetoed(&two("Alpha", "Buy now", ""), Verdict::Allow, ("b", 0.95));
+        assert!(asked.is_empty());
+        assert_eq!(out["gated"], json!({"key": "b", "tier": "money"}));
+    }
+
+    #[test]
+    fn no_llm_rung_or_a_forbidden_label_means_the_model_is_not_asked() {
+        let (out, asked) = vetoed(
+            &two("Alpha", "Continue", r#","allow":["jeff"]"#),
+            Verdict::Money,
+            ("b", 0.95),
+        );
+        assert!(asked.is_empty() && out["key"] == "b");
+        let req = two("Alpha", "Continue Acme", r#","forbid":["acme"]"#);
+        let (out, asked) = vetoed(&req, Verdict::Money, ("b", 0.95));
+        assert!(
+            asked.is_empty() && out["key"] == "b",
+            "命中禁词的字不发给模型"
+        );
     }
 }
