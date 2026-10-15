@@ -439,6 +439,7 @@ Everything else:
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
 | `dct judge [file]` / `--probe` | ask the `[judge]` backend (Jeff's `jeff-serve`) one multiple-choice question in Jev format and print each option's probability; `--probe` sends a fixed question to see if it answers. Exit 0 answered, 1 not configured or backend error, 2 the question is wrong |
+| `dct judge up` / `down` / `status [--json]` | start, stop (only what dct started) or inspect the local judge server; see [Running the local judge](#running-the-local-judge) |
 | `dct answer --json` | read one multiple-choice request (JSON: `state`, `options`, optional `allow` / `forbid` / `picture`) on stdin and write one JSON line: Jeff, then the `[llm]` model, then "needs you" (nothing pops up). A **danger gate** stops a pick whose label is outward, irreversible or money (see [The danger gate](#the-danger-gate-dct-answer)). Exit 0 answered or needs you, 1 config unreadable or invalid, 2 bad request |
 | `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you (refuses when stdin isn't a terminal), then confirm with Touch ID, which signs the exact texts; texts (and their opening sentences) must differ per platform |
 | `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco (Mac only): replay the confirmed procedure if there is one, otherwise work the page out, write a draft procedure and show you a card to confirm with Touch ID. Asks before every publish tap. See [Post to a social platform](#post-to-a-social-platform-mac-early) |
@@ -462,12 +463,58 @@ base_url = "http://127.0.0.1:8765"
 # timeout_ms = 5000
 ```
 
-dct does not start `jeff-serve` or download weights; you start it. The weights
+dct does not download weights. By default you start `jeff-serve` yourself (or
+let dct do it, see [Running the local judge](#running-the-local-judge)). The weights
 used so far are Jeff v1.2, `jeff-legacy/Jeff-Qwen3.5-0.8B` at revision
 `d86f657` (about 1.6 GB, up to 254 options).
 
 Without `[judge]`, `dct do` skips Jeff; without `[llm]`, it skips the model too.
 You are always the last one asked.
+
+### Running the local judge
+
+Add `[judge.serve]` and dct starts and stops the judge server for you. Everything
+about *how* comes from this section; dct has no built-in path or program name.
+Leave it out and dct never starts or stops anything.
+
+```toml
+[judge]
+base_url = "http://127.0.0.1:8796"        # must be this machine
+
+[judge.serve]
+command = ["<path to the judge server program>"]   # argv array, no shell
+env = { PORT = "8796" }                   # extra environment, strings only
+# ready_timeout_secs = 60                 # how long to wait for GET <base_url>/health
+# autostart = false                       # true: `dct answer` starts it when unreachable
+# min_free_percent = 15                   # refuse to start below this much free memory
+```
+
+| Command | What it does |
+|---|---|
+| `dct judge up` | start it unless `/health` already answers (then it says so and starts nothing); waits up to `ready_timeout_secs`. Exit 0 ready, 1 not |
+| `dct judge down` | stop **only the process dct started**: SIGTERM, then SIGKILL after 5 s. Exit 0 stopped or nothing to stop, 1 refused |
+| `dct judge status [--json]` | healthy or not, whether dct started it, pid, uptime, memory, log path, last start error. Exit 0 healthy, 1 not |
+
+With `autostart = true`, the first time `dct answer` finds the judge unreachable
+it starts it once (one line on stderr, can take up to `ready_timeout_secs`) and
+retries once. If that fails or times out, `dct answer` carries on as before:
+next rung, then "needs you". Nothing ever starts while `autostart` is not `true`.
+
+Safety:
+
+- **Loopback only.** If `base_url` is not `127.0.0.1` / `localhost` / `::1`, dct
+  refuses to start or stop anything.
+- **Only its own process.** `up` records the pid, start time and the process's
+  command line in `~/.dct/judge-serve.pid`. `down` checks the pid is alive and the
+  command line still matches; if not, it does not signal it. A server dct did not
+  start is never stopped. Two `dct` calls starting at once spawn one server.
+- **Memory.** Below `min_free_percent` free memory (macOS `memory_pressure`, Linux
+  `/proc/meminfo`) it refuses to start and says why. On other systems the free
+  memory cannot be read and the check is skipped; `down` cannot verify the command
+  line there either, so it refuses to stop anything (Windows: not supported yet).
+- **No secrets in `command` or `env`.** Any user on the machine can read them with `ps`.
+- **Log:** `~/.dct/judge-serve.log` (mode 0600, replaced on each start).
+- Not yet: `idle_stop_minutes` (stop after a quiet period) is not implemented and is ignored.
 
 ### The danger gate (`dct answer`)
 

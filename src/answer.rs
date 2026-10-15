@@ -450,7 +450,10 @@ pub fn run_cli(args: &[String]) -> i32 {
     // 每一级都有退路：没配 / 用不了就跳过，用户（这里是「要用户」）永远是最后一级。
     let (jeff, threshold): (Box<dyn Jeff>, f64) = match &cfg.judge {
         Some(jc) if jc.has_jeff() => match crate::judge::from_config(jc) {
-            Ok(b) => (Box::new(JudgeJeff(b)), jc.threshold),
+            Ok(b) => (
+                Box::new(JudgeJeff(crate::judge::serve::wrap_system(jc, b))),
+                jc.threshold,
+            ),
             Err(e) => {
                 eprintln!("[judge] 用不了（{e}），这次不问 Jeff");
                 (Box::new(NoJeff), jc.threshold)
