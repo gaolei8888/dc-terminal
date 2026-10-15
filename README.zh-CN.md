@@ -378,6 +378,7 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 | `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
 | `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
 | `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通。退出码 0 答了，1 没配或后端出错，2 题写错了 |
+| `dct judge up` / `down` / `status [--json]` | 启动、停止（只停 dct 自己起的）、查看本机 judge 服务；见[运行本机 judge](#运行本机-judge) |
 | `dct answer --json` | 从标准输入读一道选择题（JSON：`state`、`options`，可选 `allow` / `forbid` / `picture`），写一行 JSON：先 Jeff，再 `[llm]` 大模型，最后「要你来」（不弹任何东西）。**危险闸**会拦下字面是对外、不可逆或花钱的选择（见[危险闸](#危险闸dct-answer)）。退出码 0 有答案或要你来，1 配置读不了或不合规，2 请求不对 |
 | `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头，再按指纹，指纹签的就是这些文字；标准输入不是终端就拒绝）；各平台文字和开头句不能相同 |
 | `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（只有 Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索，写成流程草稿，给你看确认卡片（按指纹确认）。每次点发布前都先问你。详见[发到自媒体平台](#发到自媒体平台mac早期) |
@@ -400,10 +401,51 @@ base_url = "http://127.0.0.1:8765"
 # timeout_ms = 5000
 ```
 
-dct 不会自己起 `jeff-serve`，也不下载权重，要你自己起。目前用的是 Jeff v1.2：
+dct 不下载权重。`jeff-serve` 默认要你自己起（也可以让 dct 起，见
+[运行本机 judge](#运行本机-judge)）。目前用的是 Jeff v1.2：
 `jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`（约 1.6 GB，最多接 254 个选项）。
 
 没写 `[judge]`，`dct do` 就跳过 Jeff；没写 `[llm]`，也跳过大模型。最后问的永远是你。
+
+### 运行本机 judge
+
+写上 `[judge.serve]`，dct 就替你启动、停止 judge 服务。「怎么起」全部来自这一段，
+dct 里没有内置任何路径或程序名。不写这一段，dct 永远不会启动或停止任何东西。
+
+```toml
+[judge]
+base_url = "http://127.0.0.1:8796"        # 必须是本机
+
+[judge.serve]
+command = ["<judge 服务程序的路径>"]        # argv 数组，不经 shell
+env = { PORT = "8796" }                   # 额外的环境变量，只能是字符串
+# ready_timeout_secs = 60                 # 等 GET <base_url>/health 的上限
+# autostart = false                       # true：连不上时 `dct answer` 自动起
+# min_free_percent = 15                   # 空闲内存低于这个百分比就不起
+```
+
+| 命令 | 做什么 |
+|---|---|
+| `dct judge up` | `/health` 已经在答就只说一声、不起；否则起，最多等 `ready_timeout_secs`。退出码 0 就绪，1 没起来 |
+| `dct judge down` | **只停 dct 自己起的那个进程**：先 SIGTERM，5 秒后 SIGKILL。退出码 0 已停或没有要停的，1 拒绝 |
+| `dct judge status [--json]` | 健不健康、是不是 dct 起的、进程号、已运行时间、内存、日志位置、上次启动的错误。退出码 0 健康，1 不健康 |
+
+`autostart = true` 时，`dct answer` 第一次发现 judge 连不上，会起一次（stderr 一行提示，
+最多等 `ready_timeout_secs`），然后重试一次。起不来或超时，`dct answer` 照旧往下走：
+下一级，再不行「要你」。`autostart` 不是 `true` 时绝不起任何东西。
+
+安全：
+
+- **只认本机。** `base_url` 不是 `127.0.0.1` / `localhost` / `::1`，dct 拒绝启动和停止。
+- **只动自己的进程。** `up` 把进程号、启动时间和该进程的命令行记在 `~/.dct/judge-serve.pid`。
+  `down` 先核对这个进程还活着、命令行还对得上，对不上就不发信号。不是 dct 起的服务永远不会被停。
+  两个 `dct` 同时要起，只会起一个。
+- **内存。** 空闲内存低于 `min_free_percent`（macOS 用 `memory_pressure`，Linux 读
+  `/proc/meminfo`）就不起，并说明原因。别的系统读不到内存，这道检查跳过；那里 `down` 也读不到命令行，
+  于是什么都不停（Windows 暂不支持）。
+- **`command` 和 `env` 里不要放密钥。** 本机任何用户用 `ps` 都能看到。
+- **日志：** `~/.dct/judge-serve.log`（权限 0600，每次启动重新写）。
+- 还没做：`idle_stop_minutes`（空闲一段时间后自动停）没有实现，写了会被忽略。
 
 ### 危险闸（`dct answer`）
 

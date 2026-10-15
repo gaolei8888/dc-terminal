@@ -5,6 +5,7 @@
 //! 不信服务端的 `confidence`。
 
 pub mod jev;
+pub mod serve;
 
 use crate::config::JudgeConfig;
 use serde_json::{json, Map, Value};
@@ -111,13 +112,18 @@ pub fn from_config(c: &JudgeConfig) -> Result<Arc<dyn JudgeBackend>, JudgeError>
     )))
 }
 
+/// 127.0.0.1 / localhost / ::1（方括号可有可无）。
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(h, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// 有密钥时，明文 `http://` 只能发往本机；别的主机必须 https。
 fn check_key_transport(base_url: &str, host: &str, has_key: bool) -> Result<(), JudgeError> {
     if !has_key || !base_url.trim().to_ascii_lowercase().starts_with("http://") {
         return Ok(());
     }
-    let h = host.trim_start_matches('[').trim_end_matches(']');
-    if matches!(h, "127.0.0.1" | "localhost" | "::1") {
+    if is_loopback_host(host) {
         return Ok(());
     }
     Err(JudgeError::BadRequest(format!(
@@ -125,10 +131,11 @@ fn check_key_transport(base_url: &str, host: &str, has_key: bool) -> Result<(), 
     )))
 }
 
-const NO_CONFIG_HINT: &str = "judge 要先在 ~/.dct/config.toml 里写 [judge] base_url = \"http://127.0.0.1:8765\"（jeff-serve 的地址）";
+pub(crate) const NO_CONFIG_HINT: &str = "judge 要先在 ~/.dct/config.toml 里写 [judge] base_url = \"http://127.0.0.1:8765\"（jeff-serve 的地址）";
 
 const USAGE: &str = "用法：dct judge [文件]    从文件或标准输入读一个 Jev 请求
-      dct judge --probe  发一道固定的题，看后端通不通";
+      dct judge --probe  发一道固定的题，看后端通不通
+      dct judge up | down | status [--json]  启动 / 停止（只停 dct 自己起的）/ 查看本机 judge 服务，要先写 [judge.serve]";
 
 fn answer_json(a: &ChoiceAnswer) -> Value {
     let probs: Map<String, Value> = a
@@ -288,6 +295,12 @@ fn probe_input() -> String {
 }
 
 pub fn run_cli(args: &[String]) -> i32 {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("up" | "down" | "status")
+    ) {
+        return serve::run_cli(args);
+    }
     let probe = args.iter().any(|a| a == "--probe");
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if args.iter().any(|a| a.starts_with("--") && a != "--probe") || files.len() > 1 {
@@ -376,6 +389,7 @@ mod tests {
             threshold: 0.8,
             timeout_ms: 5000,
             gate_tiers: None,
+            serve: None,
         };
         assert!(from_config(&c).is_err());
     }
@@ -390,6 +404,7 @@ mod tests {
             threshold: 0.8,
             timeout_ms: 5000,
             gate_tiers: None,
+            serve: None,
         };
         assert!(from_config(&c).is_err());
     }
@@ -405,6 +420,7 @@ mod tests {
             threshold: 0.8,
             timeout_ms: 5000,
             gate_tiers: None,
+            serve: None,
         };
         assert!(matches!(
             from_config(&mk("http://example.com:8765")),

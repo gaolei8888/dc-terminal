@@ -121,6 +121,38 @@ pub struct JudgeConfig {
     /// 这里只收字符串：写错不会让别的读 `[judge]` 的命令跟着读不了配置。
     #[serde(default)]
     pub gate_tiers: Option<Vec<String>>,
+    /// `[judge.serve]`：怎么在本机把 judge 服务拉起来。没写 = dct 什么都不启动、不停止。
+    #[serde(default)]
+    pub serve: Option<ServeConfig>,
+}
+
+fn default_ready_timeout_secs() -> u64 {
+    60
+}
+fn default_min_free_percent() -> u8 {
+    15
+}
+
+/// `[judge.serve]`：dct 替你启停本机 judge 服务。全部可选；`command` 不写就什么都不做。
+/// **这里不要放密钥**：argv 和 env 其他用户用 `ps` 就能看见。
+/// `idle_stop_minutes` 还没做：写了会被忽略。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ServeConfig {
+    /// argv 数组，不经 shell：`["<可执行文件>", "参数"...]`。
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// 额外的环境变量（字符串）。
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// 等服务答 `GET {base_url}/health` 的上限（秒）。
+    #[serde(default = "default_ready_timeout_secs")]
+    pub ready_timeout_secs: u64,
+    /// true = `dct answer` 发现 judge 连不上时自动启动一次。默认 false。
+    #[serde(default)]
+    pub autostart: bool,
+    /// 空闲内存低于这个百分比就不启动（服务要占几 GB）。
+    #[serde(default = "default_min_free_percent")]
+    pub min_free_percent: u8,
 }
 
 /// 菜单上只留哪几项。给一个班、一个团队统一发机器的人用的。

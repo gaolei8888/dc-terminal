@@ -28,6 +28,9 @@ dct —— vibe coding 终端
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct judge [文件] 给一道选择题（Jev 格式，文件或标准输入），输出每个选项的概率；
                    要先在 config.toml 写 [judge]。加 --probe 用固定题试后端通不通
+  dct judge up | down | status [--json]
+                   启动 / 停止 / 查看本机 judge 服务（Jeff）。怎么启动写在 config.toml 的 [judge.serve]；
+                   down 只停 dct 自己起的那个进程。[judge.serve] autostart = true 时 dct answer 连不上会自动起一次
   dct answer --json 从标准输入读一道选择题（JSON：state、options、可选 allow / forbid / picture），
                    按 Jeff → 大模型 逐级答，写一行 JSON；要问用户时不弹，回 by=none、reason=needs_user。
                    用现有的 [judge] / [llm] 配置。危险闸：被选中的选项的字属于 dct-brain 的 content / critical / money 档
