@@ -130,7 +130,7 @@ mod unix {
         let say: &RefCell<dyn Say + '_> = &talk;
         // 每处模型都有退路：没配 [judge] → 不问 Jeff；没配 [llm] → 不问大模型、草稿不修。用户永远是最后一级。
         let (jeff, threshold): (Box<dyn Jeff>, f64) = match &cfg.judge {
-            Some(jc) => match crate::judge::from_config(jc) {
+            Some(jc) if jc.has_jeff() => match crate::judge::from_config(jc) {
                 Ok(b) => (Box::new(JudgeJeff(b)), jc.threshold),
                 Err(e) => {
                     say.borrow_mut().tell(
@@ -141,7 +141,7 @@ mod unix {
                     (Box::new(NoJeff), jc.threshold)
                 }
             },
-            None => (Box::new(NoJeff), DEFAULT_THRESHOLD),
+            _ => (Box::new(NoJeff), DEFAULT_THRESHOLD),
         };
         let llm_model = llm(&cfg, &socket, say)
             .map(|b| LlmModel::new(b, DEFAULT_TIMEOUT).with_never(p.never_tap.clone()));

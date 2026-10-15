@@ -507,6 +507,22 @@ list that leaves either out, or names an unknown tier, makes `dct answer` print
 the reason and exit 1. Only `content` is optional, and it is off unless you
 list it.
 
+**Model veto (on when `[llm]` is configured).** After the rules let a pick
+through, `dct answer` asks the `[llm]` model one fixed question about the
+picked option's text only (no screen, no goal): does it spend or move money, or
+permanently delete data? The model can only add a veto (`gated.source` is
+`"model"`, tier `money` or `critical`); it never releases what the rules
+stopped. If the model is unreachable, times out or errors, the pick is allowed
+and one line goes to stderr; if its answer is unsure or unreadable the pick is
+handed to you (`needs_user`, `"veto": "unsure"`). A request that leaves out
+`"llm"` from `allow`, or whose text hits `forbid`, is never sent to the model.
+Turn it off with:
+
+```toml
+[judge]
+model_veto = false   # this section needs no Jeff address
+```
+
 **Limit, stated plainly: the gate only knows dct-brain's word list; words it
 does not know are not stopped; callers should still filter options they know
 are destructive.** (Examples it misses today: "Cancel subscription", "Clear

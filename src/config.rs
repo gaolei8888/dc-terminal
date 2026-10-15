@@ -102,7 +102,8 @@ pub struct JudgeConfig {
     /// 现在只有 "jev"：POST {base_url}/v1/systemone。
     #[serde(default = "default_judge_backend")]
     pub backend: String,
-    /// 例：http://127.0.0.1:8765
+    /// 例：http://127.0.0.1:8765。可以不写：只想写 `model_veto` 的人不必有 Jeff（没写 = 不问 Jeff）。
+    #[serde(default)]
     pub base_url: String,
     /// jeff-serve 认 "jeff-latest"。
     #[serde(default = "default_judge_model")]
@@ -121,6 +122,17 @@ pub struct JudgeConfig {
     /// 这里只收字符串：写错不会让别的读 `[judge]` 的命令跟着读不了配置。
     #[serde(default)]
     pub gate_tiers: Option<Vec<String>>,
+    /// `dct answer`：规则闸放行后，再让 `[llm]` 问一次「是不是花钱 / 永久删除」，只能加否决。
+    /// 没写 = 开（前提是配了 `[llm]`）；`false` = 关。
+    #[serde(default)]
+    pub model_veto: Option<bool>,
+}
+
+impl JudgeConfig {
+    /// 有没有写 Jeff 的地址（只写了 `model_veto` / `gate_tiers` 的 `[judge]` 没有）。
+    pub fn has_jeff(&self) -> bool {
+        !self.base_url.trim().is_empty()
+    }
 }
 
 /// 菜单上只留哪几项。给一个班、一个团队统一发机器的人用的。
@@ -226,6 +238,24 @@ pub fn config_path_for_profiles_dir(profiles_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_judge_section_may_hold_only_model_veto() {
+        let j = Config::from_toml("[judge]\nmodel_veto = false\n")
+            .unwrap()
+            .judge
+            .unwrap();
+        assert_eq!(j.model_veto, Some(false));
+        assert!(!j.has_jeff());
+        assert_eq!(
+            Config::from_toml("[judge]\nbase_url = \"http://x:1\"\n")
+                .unwrap()
+                .judge
+                .unwrap()
+                .model_veto,
+            None
+        );
+    }
 
     #[test]
     fn judge_is_off_unless_written_and_has_defaults() {

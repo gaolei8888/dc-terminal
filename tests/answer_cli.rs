@@ -56,6 +56,33 @@ fn write_config(home: &Path, text: &str) {
 const REQ: &str =
     r#"{"state":"pick one","options":[{"key":"a","text":"Alpha"},{"key":"b","text":"Beta"}]}"#;
 
+/// 读一个 HTTP 请求的正文（按 Content-Length）。
+fn read_body(c: &mut std::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = c.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            return String::new();
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        if let Some(i) = text.find("\r\n\r\n") {
+            let len = text[..i]
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if text.len() >= i + 4 + len {
+                return text[i + 4..i + 4 + len].to_string();
+            }
+        }
+    }
+}
+
 /// 假 Jeff：本机回环上说 Jev 的小服务，`winner` 拿 `p`，其余平分。数一数被问了几次。
 fn fake_jeff(winner: &'static str, p: f64) -> (String, Arc<AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -65,29 +92,7 @@ fn fake_jeff(winner: &'static str, p: f64) -> (String, Arc<AtomicUsize>) {
     std::thread::spawn(move || {
         for conn in l.incoming() {
             let Ok(mut c) = conn else { return };
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let body = loop {
-                let n = c.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break String::new();
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&buf).to_string();
-                if let Some(i) = text.find("\r\n\r\n") {
-                    let len = text[..i]
-                        .lines()
-                        .find_map(|l| {
-                            l.to_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if text.len() >= i + 4 + len {
-                        break text[i + 4..i + 4 + len].to_string();
-                    }
-                }
-            };
+            let body = read_body(&mut c);
             h.fetch_add(1, Ordering::SeqCst);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             let keys: Vec<String> = v["questions"]["q"]["criteria"]
@@ -191,7 +196,7 @@ fn a_hesitant_jeff_hands_over_to_the_model() {
     let marker = fake_llm(home.path(), r#"{"key":"b"}"#);
     write_config(
         home.path(),
-        &format!("[judge]\nbase_url = \"{url}\"\n{LLM_CONFIG}"),
+        &format!("[judge]\nbase_url = \"{url}\"\nmodel_veto = false\n{LLM_CONFIG}"),
     );
     let o = answer(home.path(), REQ);
     assert_eq!(o.code, Some(0), "{}", o.stderr);
@@ -378,7 +383,7 @@ fn an_explicit_claude_provider_still_spawns_claude() {
     write_config(
         home.path(),
         &format!(
-            "[judge]\nbase_url = \"{url}\"\n[llm]\nprovider = \"claude\"\ntransport = \"cli\"\n"
+            "[judge]\nbase_url = \"{url}\"\nmodel_veto = false\n[llm]\nprovider = \"claude\"\ntransport = \"cli\"\n"
         ),
     );
     let o = answer_with_path(home.path(), &bin, REQ);
@@ -554,4 +559,161 @@ fn other_commands_that_read_judge_do_not_choke_on_a_bad_gate_tiers() {
     );
     let o = run(home.path(), &["judge", "--probe"], "");
     assert!(!o.stderr.contains("解析不了"), "{}", o.stderr);
+}
+
+// ---- 大模型否决（`[judge] model_veto`）：假的 OpenAI 兼容服务 + 假 Jeff 选 b ----
+
+/// 本机回环上的 OpenAI 兼容假服务：每个请求回 `reply` 当模型的话；记下每个请求的正文。
+fn fake_openai(reply: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = seen.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            let Ok(mut c) = conn else { return };
+            s.lock().unwrap().push(read_body(&mut c));
+            let body =
+                serde_json::json!({"choices": [{"message": {"content": reply}}]}).to_string();
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    (url, seen)
+}
+
+/// 沙箱里配好：假 Jeff 稳稳选 b、`[llm]` 走 http 指向 `llm_url`、`judge_extra` 加在 `[judge]` 下。
+fn veto_home(llm_url: &str, judge_extra: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    let (jeff_url, _) = fake_jeff("b", 0.95);
+    let d = home.path().join(".dct");
+    std::fs::create_dir_all(d.join("profiles")).unwrap();
+    std::fs::write(
+        d.join("profiles").join("gw.toml"),
+        format!("name = \"gw\"\ncommand = [\"true\"]\n[api]\nbase_url = \"{llm_url}\"\nwire = \"openai\"\n"),
+    )
+    .unwrap();
+    std::fs::write(d.join("secrets.toml"), "[secrets]\ngw = \"k\"\n").unwrap();
+    write_config(
+        home.path(),
+        &format!(
+            "[judge]\nbase_url = \"{jeff_url}\"\n{judge_extra}\n[llm]\nprovider = \"gw\"\nmodel = \"m\"\ntransport = \"http\"\n"
+        ),
+    );
+    home
+}
+
+const VETO_REQ: &str =
+    r#"{"state":"goal","options":[{"key":"a","text":"Settings"},{"key":"b","text":"Continue"}]}"#;
+
+#[test]
+fn the_model_can_veto_a_pick_the_rules_let_through() {
+    for (reply, tier) in [
+        (r#"{"risk":"money"}"#, "money"),
+        (r#"{"risk":"delete"}"#, "critical"),
+    ] {
+        let (url, seen) = fake_openai(reply);
+        let home = veto_home(&url, "");
+        let o = answer(home.path(), VETO_REQ);
+        assert_eq!(o.code, Some(0), "{}", o.stderr);
+        let v = json(&o);
+        assert!(v["key"].is_null(), "{v}");
+        assert_eq!(v["reason"], "danger");
+        assert_eq!(
+            v["gated"],
+            serde_json::json!({"key": "b", "tier": tier, "source": "model"})
+        );
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].contains("Continue")
+                && !bodies[0].contains("Settings")
+                && !bodies[0].contains("goal")
+        );
+    }
+}
+
+#[test]
+fn a_model_that_says_none_lets_the_pick_through() {
+    let (url, seen) = fake_openai(r#"{"risk":"none"}"#);
+    let home = veto_home(&url, "");
+    let v = json(&answer(home.path(), VETO_REQ));
+    assert_eq!(
+        (v["key"].as_str(), v["by"].as_str()),
+        (Some("b"), Some("jeff"))
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_unreachable_model_allows_the_pick_and_says_so_on_stderr() {
+    let dead = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let home = veto_home(&dead, "");
+    let o = answer(home.path(), VETO_REQ);
+    assert_eq!(o.code, Some(0), "{}", o.stderr);
+    assert_eq!(json(&o)["key"], "b");
+    assert!(o.stderr.contains("model veto unavailable"), "{}", o.stderr);
+}
+
+#[test]
+fn an_uncertain_or_unreadable_model_answer_goes_to_the_human() {
+    for reply in [
+        r#"{"risk":"unsure"}"#,
+        "I would rather not say",
+        r#"{"risk":"maybe"}"#,
+    ] {
+        let (url, _) = fake_openai(reply);
+        let home = veto_home(&url, "");
+        let v = json(&answer(home.path(), VETO_REQ));
+        assert!(v["key"].is_null(), "{reply}: {v}");
+        assert_eq!(
+            (v["by"].as_str(), v["reason"].as_str()),
+            (Some("none"), Some("needs_user"))
+        );
+        assert_eq!(v["veto"], "unsure");
+    }
+}
+
+#[test]
+fn a_rule_block_stays_a_block_and_the_model_is_not_even_asked() {
+    let (url, seen) = fake_openai(r#"{"risk":"none"}"#);
+    let home = veto_home(&url, "");
+    let req = r#"{"state":"goal","options":[{"key":"a","text":"Settings"},{"key":"b","text":"Buy now"}]}"#;
+    let v = json(&answer(home.path(), req));
+    assert_eq!(v["gated"], serde_json::json!({"key": "b", "tier": "money"}));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn model_veto_false_turns_it_off_and_a_judge_section_needs_no_jeff_address() {
+    let (url, seen) = fake_openai(r#"{"risk":"money"}"#);
+    let home = veto_home(&url, "model_veto = false");
+    assert_eq!(json(&answer(home.path(), VETO_REQ))["key"], "b");
+    // 只写 model_veto、没有 Jeff 地址的 [judge]：配置读得了，只是不问 Jeff；大模型挑 b 后不再否决。
+    let home = tempfile::tempdir().unwrap();
+    let d = home.path().join(".dct");
+    std::fs::create_dir_all(d.join("profiles")).unwrap();
+    std::fs::write(
+        d.join("profiles").join("gw.toml"),
+        format!(
+            "name = \"gw\"\ncommand = [\"true\"]\n[api]\nbase_url = \"{url}\"\nwire = \"openai\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(d.join("secrets.toml"), "[secrets]\ngw = \"k\"\n").unwrap();
+    write_config(
+        home.path(),
+        "[judge]\nmodel_veto = false\n[llm]\nprovider = \"gw\"\nmodel = \"m\"\ntransport = \"http\"\n",
+    );
+    let o = answer(home.path(), VETO_REQ);
+    assert_eq!(o.code, Some(0), "{}", o.stderr);
+    assert!(!o.stderr.contains("[judge]"), "{}", o.stderr);
+    assert_eq!(seen.lock().unwrap().len(), 1, "只有挑选项那一次，没有否决");
 }
