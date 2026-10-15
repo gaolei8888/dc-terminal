@@ -325,34 +325,201 @@ fn run_on_targets(sock: &Path, lang: Lang, target: Target, force: Force) -> Resu
     Ok(if bad > 0 { 1 } else { 0 })
 }
 
+/// `dct restart` 默认先等会话停下多久：15 分钟。
+pub const DEFAULT_WAIT_S: u64 = 15 * 60;
+/// 到点还在忙的会话，催过之后再等多久：3 分钟。
+pub const DEFAULT_NUDGE_WAIT_S: u64 = 3 * 60;
+/// 从这一号协议起后台认得 `Request::Drain`。
+pub const DRAIN_PROTOCOL: u32 = 25;
+
 /// `dct restart` 的参数解析结果。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Restart {
-    /// 先问一句再动手
-    Ask,
-    /// `-y`：不问，直接换
-    Yes,
+    Run {
+        /// 先问一句再动手（`-y` 免问）
+        ask: bool,
+        /// `--now`：不等会话停下，直接记状态、重启
+        now: bool,
+        /// 等会话停下最多多少秒（`--wait <分钟>`）
+        wait_s: u64,
+        /// 催过之后再等多少秒（`--nudge-wait <分钟>`）
+        nudge_wait_s: u64,
+    },
     /// 参数不对
     Usage(String),
 }
 
-/// 解析 `dct restart` 后面的参数。认的只有 `-y` / `--yes`。
+/// 解析 `dct restart` 后面的参数：`-y` / `--yes`、`--now`、`--wait <分钟>`、
+/// `--nudge-wait <分钟>`。`--now` 时两段等待一律归零，不管写没写 `--wait`。
 ///
 /// 不认识的参数一律是用法错误，**不是「当没看见」**——理由写在
-/// `i18n::msg::restart_takes_no_args` 上。
+/// `i18n::msg::restart_bad_arg` 上。
 pub fn parse_restart_args(args: &[String], lang: Lang) -> Restart {
-    let mut yes = false;
-    for a in args {
+    let mut ask = true;
+    let mut now = false;
+    let mut wait_s = DEFAULT_WAIT_S;
+    let mut nudge_wait_s = DEFAULT_NUDGE_WAIT_S;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
-            "-y" | "--yes" => yes = true,
-            other => return Restart::Usage(crate::i18n::msg::restart_takes_no_args(lang, other)),
+            "-y" | "--yes" => ask = false,
+            "--now" => now = true,
+            flag @ ("--wait" | "--nudge-wait") => {
+                let secs = it
+                    .next()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .and_then(|m| m.checked_mul(60));
+                let Some(secs) = secs else {
+                    return Restart::Usage(crate::i18n::msg::restart_needs_minutes(lang, flag));
+                };
+                if flag == "--wait" {
+                    wait_s = secs;
+                } else {
+                    nudge_wait_s = secs;
+                }
+            }
+            other => return Restart::Usage(crate::i18n::msg::restart_bad_arg(lang, other)),
         }
     }
-    if yes {
-        Restart::Yes
-    } else {
-        Restart::Ask
+    if now {
+        wait_s = 0;
+        nudge_wait_s = 0;
     }
+    Restart::Run {
+        ask,
+        now,
+        wait_s,
+        nudge_wait_s,
+    }
+}
+
+/// 这一次怎么重启。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// 后台认得 `Drain`：先等会话停下、记下状态，再交给小进程换。
+    Graceful,
+    /// 后台太旧（或者连 `Hello` 都答不上）：走原来那条直接重启的路。
+    Plain,
+}
+
+/// 按后台的协议号挑重启的走法。`protocol` 是 `Client::protocol()` 的答案。
+pub fn plan_for(protocol: Option<u32>) -> Plan {
+    match protocol {
+        Some(v) if v >= DRAIN_PROTOCOL => Plan::Graceful,
+        _ => Plan::Plain,
+    }
+}
+
+/// `DCT_SESSION_ID` 的值 → 敲命令的那个会话。认不出来就当不在会话里。
+pub fn initiator_from(env: Option<String>) -> Option<u32> {
+    env.and_then(|v| v.trim().parse().ok())
+}
+
+/// 排空进度那一行，例如「还在等 2 个会话（dc-octo、9 号），剩 9 分 12 秒」。
+/// `names` 是会话编号 → 名字；没有名字的用编号。
+pub fn progress_line(
+    p: &crate::drain::Progress,
+    names: &std::collections::HashMap<u32, String>,
+    lang: Lang,
+) -> String {
+    if p.waiting.is_empty() {
+        return text(Key::RestartDrainFinishing, lang).to_string();
+    }
+    let who: Vec<String> = p
+        .waiting
+        .iter()
+        .map(|id| match names.get(id) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => crate::i18n::msg::session_number(lang, *id),
+        })
+        .collect();
+    crate::i18n::msg::drain_waiting(lang, &who, p.remaining_s, p.nudged)
+}
+
+/// 把进度印出来。终端上原地刷同一行；不是终端（管道、日志）时只在要等的
+/// 会话或阶段变了时另起一行——秒数每秒都在变，按字面比较会一秒一行。
+pub struct ProgressOut<W: std::io::Write> {
+    out: W,
+    tty: bool,
+    /// 终端上：当前这一行占了多宽（下次刷新要用空格盖掉多出来的部分）。
+    /// `None` = 这一行还没开始。
+    shown_width: Option<usize>,
+    /// 不是终端时：上一次印出来的那一行对应的状态。
+    last_key: Option<(Vec<u32>, bool)>,
+}
+
+impl<W: std::io::Write> ProgressOut<W> {
+    pub fn new(out: W, tty: bool) -> Self {
+        ProgressOut {
+            out,
+            tty,
+            shown_width: None,
+            last_key: None,
+        }
+    }
+
+    pub fn show(
+        &mut self,
+        p: &crate::drain::Progress,
+        names: &std::collections::HashMap<u32, String>,
+        lang: Lang,
+    ) {
+        use unicode_width::UnicodeWidthStr;
+        let line = progress_line(p, names, lang);
+        if self.tty {
+            // 宽过终端的话会折到下一行，`\r` 就只能回到最后那一截，旧字残留。
+            // 所以截到终端宽度以内。不用「清行」的转义序列：Windows 老控制台
+            // 不一定认，用空格盖住旧字到处都一样。
+            let cols = crossterm::terminal::size()
+                .map(|(c, _)| c as usize)
+                .unwrap_or(80);
+            let line = clip_to_width(&line, cols.saturating_sub(1).max(10));
+            let w = line.width();
+            let pad = self.shown_width.unwrap_or(0).saturating_sub(w);
+            let _ = write!(self.out, "\r{line}{}", " ".repeat(pad));
+            let _ = self.out.flush();
+            self.shown_width = Some(w);
+        } else {
+            let key = (p.waiting.clone(), p.nudged);
+            if self.last_key.as_ref() != Some(&key) {
+                let _ = writeln!(self.out, "{line}");
+                let _ = self.out.flush();
+                self.last_key = Some(key);
+            }
+        }
+    }
+
+    /// 进度告一段落：终端上补一个换行，后面的话不接在进度后头。可以多调。
+    pub fn finish(&mut self) {
+        if self.shown_width.take().is_some() {
+            let _ = writeln!(self.out);
+            let _ = self.out.flush();
+        }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.out
+    }
+}
+
+/// 截到 `max` 列以内，截掉了就在末尾补「…」。
+fn clip_to_width(s: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw + 1 > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 /// `run_restart` 干完之后，还剩什么要 `main` 接着做。
@@ -384,13 +551,17 @@ pub enum Restarted {
 /// 返回 `StartFresh` 的时候**这里一句话都还没干**：连守护进程都没拉，因为
 /// 拉起之前还有一句「要不要接回上次的会话」要问（`main::run_ui`）。
 pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result<Restarted> {
-    let ask = match args {
+    let (ask, now, wait_s, nudge_wait_s) = match args {
         Restart::Usage(msg) => {
             eprintln!("{msg}");
             return Ok(Restarted::Exit(2));
         }
-        Restart::Ask => true,
-        Restart::Yes => false,
+        Restart::Run {
+            ask,
+            now,
+            wait_s,
+            nudge_wait_s,
+        } => (ask, now, wait_s, nudge_wait_s),
     };
 
     let Some(mut c) = connect(sock) else {
@@ -401,25 +572,41 @@ pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result
         return Ok(Restarted::StartFresh);
     };
 
+    // 先问协议号：太旧的后台不认识 `Drain`，发过去只会换来一句解析失败。
+    let plan = plan_for(c.protocol());
+    if plan == Plan::Plain {
+        println!("{}", text(Key::RestartOldDaemonPlain, lang));
+    }
+
+    let live: Vec<SessionInfo> = match c.call(Request::List) {
+        Ok(Response::Sessions(v)) => v
+            .into_iter()
+            .filter(|s| s.state != SessionState::Stopped)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     if ask {
         // 先把要被断掉的东西摆出来再问。「会断掉正在跑的会话」是一句抽象的
         // 话，而「3 号 claude 正在 ~/proj 里干活」是用户真正要衡量的代价。
-        if let Ok(Response::Sessions(v)) = c.call(Request::List) {
-            let live: Vec<SessionInfo> = v
-                .into_iter()
-                .filter(|s| s.state != SessionState::Stopped)
-                .collect();
-            if !live.is_empty() {
-                println!("{}", render_ps(&live, lang));
-            }
+        if !live.is_empty() {
+            println!("{}", render_ps(&live, lang));
         }
-        println!("{}", text(Key::RestartExplain, lang));
+        if plan == Plan::Graceful && !now {
+            let minutes = (wait_s + nudge_wait_s).div_ceil(60);
+            println!(
+                "{}",
+                crate::i18n::msg::restart_graceful_explain(lang, minutes)
+            );
+        } else {
+            println!("{}", text(Key::RestartExplain, lang));
+        }
         print!("{} ", text(Key::RestartAsk, lang));
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         // stdin 读不到（脚本、cron、`< /dev/null`）就当没答应。这条命令会
-        // 杀掉所有正在跑的 agent，没人在场的时候**默认不动**才是对的——
-        // 无人值守要重启，请明写 `-y`。
+        // 换掉整个后台，没人在场的时候**默认不动**才是对的——无人值守要
+        // 重启，请明写 `-y`。
         let mut answer = String::new();
         let said_yes = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)
             .is_ok()
@@ -430,18 +617,214 @@ pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result
         }
     }
 
-    // 手里这条连接连着的正是马上要被杀掉的那个进程，先丢掉。
+    if plan == Plan::Plain {
+        // 手里这条连接连着的正是马上要被杀掉的那个进程，先丢掉。
+        drop(c);
+        println!("{}", text(Key::StaleDaemonRestarting, lang));
+        return match crate::client::restart_daemon(sock, exe) {
+            Ok(()) => {
+                println!("{}", text(Key::RestartDone, lang));
+                Ok(Restarted::Exit(0))
+            }
+            Err(_) => {
+                eprintln!("{}", text(Key::RestartFailed, lang));
+                Ok(Restarted::Exit(1))
+            }
+        };
+    }
+
+    let names: std::collections::HashMap<u32, String> = live
+        .iter()
+        .filter(|s| !s.tag.trim().is_empty())
+        .map(|s| (s.id, s.tag.clone()))
+        .collect();
+    let initiator = initiator_from(std::env::var(crate::session::SESSION_ID_ENV).ok());
+    Ok(Restarted::Exit(drain_and_swap(
+        c,
+        sock,
+        lang,
+        Request::Drain {
+            wait_s,
+            nudge_wait_s,
+            initiator,
+        },
+        &names,
+    )))
+}
+
+/// 新后台最多等多久：小进程自己最多等旧后台 10 秒、等新后台 10 秒。
+const NEW_DAEMON_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// 后台连着几次答不上话（又确认它还活着），就不再干等。
+const MAX_SILENT_POLLS: u32 = 3;
+
+/// 等会话停下那一段是怎么结束的。
+#[derive(Debug, PartialEq, Eq)]
+enum DrainEnd {
+    /// 后台已经交给小进程（或者已经换掉了），该等新后台了。
+    Swapping,
+    /// 用户按了 Ctrl+C，后台已经回到正常。
+    Cancelled,
+    /// 没进行下去，话已经说过了。
+    Failed,
+}
+
+/// 等会话停下那一段的本体：发 `Drain`，每隔 `tick` 续一次约、印进度，
+/// `cancel` 被置上就发 `DrainCancel`。跟 socket、信号、真时钟都无关，
+/// 所以能拿假的后台测。
+///
+/// `old_gone`：能确认旧后台已经退出时为 `true`。认不出 pid 的平台上传
+/// 「恒为 `true`」——连不上的时候也只能当它换掉了。
+#[allow(clippy::too_many_arguments)]
+fn drain_loop<W: std::io::Write>(
+    call: &mut dyn FnMut(Request) -> Result<Response>,
+    drain: Request,
+    cancel: &std::sync::atomic::AtomicBool,
+    old_gone: &dyn Fn() -> bool,
+    tick: std::time::Duration,
+    out: &mut ProgressOut<W>,
+    names: &std::collections::HashMap<u32, String>,
+    lang: Lang,
+) -> DrainEnd {
+    use std::sync::atomic::Ordering;
+
+    let mut resp = call(drain);
+    let mut silent = 0;
+    loop {
+        match resp {
+            Ok(Response::DrainProgress { done: true, .. }) => return DrainEnd::Swapping,
+            Ok(Response::DrainProgress {
+                progress,
+                active: true,
+                ..
+            }) => {
+                silent = 0;
+                out.show(&progress, names, lang);
+            }
+            // 不在排空了，却不是我们取消的：要么旧后台已经换掉（错过了
+            // `done` 那一下，答话的是新后台），要么后台自己撤了（租约过期、
+            // 小进程起不来）。
+            Ok(Response::DrainProgress { active: false, .. }) => {
+                if old_gone() {
+                    return DrainEnd::Swapping;
+                }
+                out.finish();
+                eprintln!("{}", text(Key::RestartDrainAborted, lang));
+                return DrainEnd::Failed;
+            }
+            Ok(Response::Error(ref e)) => {
+                out.finish();
+                eprintln!("{}", crate::i18n::msg::error(lang, e));
+                return DrainEnd::Failed;
+            }
+            Ok(other) => {
+                out.finish();
+                eprintln!("守护进程答非所问：{other:?}");
+                return DrainEnd::Failed;
+            }
+            Err(_) => {
+                // 连不上 / 答不上：后台多半已经退出去换新的了。
+                if old_gone() {
+                    return DrainEnd::Swapping;
+                }
+                silent += 1;
+                if silent >= MAX_SILENT_POLLS {
+                    out.finish();
+                    eprintln!("{}", text(Key::RestartDrainAborted, lang));
+                    return DrainEnd::Failed;
+                }
+            }
+        }
+
+        // 按拍问一次，但 Ctrl+C 要立刻有反应，所以切成小段睡。
+        let slice = tick / 10;
+        for _ in 0..10 {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(slice);
+        }
+        if cancel.swap(false, Ordering::SeqCst) {
+            match call(Request::DrainCancel) {
+                Ok(Response::Ok) => {
+                    out.finish();
+                    println!("{}", text(Key::RestartDrainCancelled, lang));
+                    return DrainEnd::Cancelled;
+                }
+                // 已经开始落盘，取消不了：说一声，接着等它换完。
+                Ok(r @ Response::DrainProgress { .. }) => {
+                    out.finish();
+                    println!("{}", text(Key::RestartCancelTooLate, lang));
+                    resp = Ok(r);
+                }
+                other => resp = other,
+            }
+            continue;
+        }
+        resp = call(Request::DrainStatus { renew: true });
+    }
+}
+
+/// 平稳重启的后半截：等会话停下（`drain_loop`），然后等新后台起来。
+/// 返回退出码。
+///
+/// 要是这条命令是在某个 dct 会话里敲的，旧后台一退出这个进程多半也跟着
+/// 没了——那是预期的，剩下的事脱离出去的 `dct __swap` 会做完。
+fn drain_and_swap(
+    mut c: Client,
+    sock: &Path,
+    lang: Lang,
+    drain: Request,
+    names: &std::collections::HashMap<u32, String>,
+) -> i32 {
+    // 旧后台的 pid：确认「答话的是新的」靠它——旧后台在退出前还会留两秒，
+    // 那时它答 `Hello` 的协议号也对得上。两种情况都算旧的走了：进程没了，
+    // 或者 socket 那头已经换成了别的 pid（旧进程可能还没被回收，比如它是
+    // 某个还没 `wait` 的父进程的子进程，探活会一直说它在）。
+    let old_pid = c.peer_pid();
+    let old_gone = move || {
+        old_pid.is_none_or(|p| {
+            !crate::sys::proc::alive(p)
+                || Client::connect(sock)
+                    .ok()
+                    .and_then(|c| c.peer_pid())
+                    .is_some_and(|now| now != p)
+        })
+    };
+    let ctrl_c = crate::sys::signal::catch_ctrl_c();
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut out = ProgressOut::new(std::io::stdout(), tty);
+
+    let end = drain_loop(
+        &mut |req| c.call(req),
+        drain,
+        ctrl_c,
+        &old_gone,
+        std::time::Duration::from_secs(1),
+        &mut out,
+        names,
+        lang,
+    );
+    out.finish();
+    match end {
+        DrainEnd::Cancelled => return 0,
+        DrainEnd::Failed => return 1,
+        DrainEnd::Swapping => {}
+    }
     drop(c);
-    println!("{}", text(Key::StaleDaemonRestarting, lang));
-    match crate::client::restart_daemon(sock, exe) {
-        Ok(()) => {
-            println!("{}", text(Key::RestartDone, lang));
-            Ok(Restarted::Exit(0))
-        }
-        Err(_) => {
-            eprintln!("{}", text(Key::RestartFailed, lang));
-            Ok(Restarted::Exit(1))
-        }
+    println!("{}", text(Key::RestartSwapping, lang));
+    let up = crate::client::wait_up_to(NEW_DAEMON_WAIT, || {
+        old_gone()
+            && Client::connect(sock)
+                .ok()
+                .and_then(|mut c| c.protocol())
+                .is_some_and(|v| v == crate::proto::PROTOCOL_VERSION)
+    });
+    if up {
+        println!("{}", text(Key::RestartDone, lang));
+        0
+    } else {
+        eprintln!("{}", text(Key::RestartNewDaemonNotUp, lang));
+        1
     }
 }
 
@@ -874,30 +1257,324 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// `dct restart` 的参数：只认 `-y` / `--yes`，别的一律用法错误。
+    /// `dct restart` 的参数：`-y` / `--now` / `--wait <分钟>` / `--nudge-wait <分钟>`，
+    /// 别的一律用法错误。
     ///
     /// 钉死「不认识的参数不等于没参数」：`dct restart --all` 要是被当成裸
     /// `dct restart` 跑，用户以为自己限定了范围，实际连所有会话一起换掉。
     #[test]
-    fn restart_only_accepts_the_yes_flag() {
+    fn parse_restart_args_reads_flags_and_minutes() {
         let lang = Lang::Zh;
-        assert_eq!(parse_restart_args(&args(&[]), lang), Restart::Ask);
-        assert_eq!(parse_restart_args(&args(&["-y"]), lang), Restart::Yes);
-        assert_eq!(parse_restart_args(&args(&["--yes"]), lang), Restart::Yes);
-        assert!(matches!(
-            parse_restart_args(&args(&["--all"]), lang),
-            Restart::Usage(_)
-        ));
-        assert!(matches!(
-            parse_restart_args(&args(&["3"]), lang),
-            Restart::Usage(_)
-        ));
-        // `-y` 混着不认识的参数也是用法错误：不许因为看见了 `-y` 就把
-        // 后面那个看不懂的东西忽略掉。
-        assert!(matches!(
-            parse_restart_args(&args(&["-y", "--all"]), lang),
-            Restart::Usage(_)
-        ));
+        let run = |ask, now, wait_s, nudge_wait_s| Restart::Run {
+            ask,
+            now,
+            wait_s,
+            nudge_wait_s,
+        };
+        assert_eq!(
+            parse_restart_args(&args(&[]), lang),
+            run(true, false, 900, 180)
+        );
+        assert_eq!(
+            parse_restart_args(&args(&["-y"]), lang),
+            run(false, false, 900, 180)
+        );
+        assert_eq!(
+            parse_restart_args(&args(&["--yes"]), lang),
+            run(false, false, 900, 180)
+        );
+        assert_eq!(
+            parse_restart_args(&args(&["-y", "--wait", "5"]), lang),
+            run(false, false, 300, 180)
+        );
+        assert_eq!(
+            parse_restart_args(&args(&["--nudge-wait", "1", "--wait", "0"]), lang),
+            run(true, false, 0, 60)
+        );
+        // `--now` 不等：两段等待一律归零，跟写在它前后的 `--wait` 无关。
+        assert_eq!(
+            parse_restart_args(&args(&["--now"]), lang),
+            run(true, true, 0, 0)
+        );
+        assert_eq!(
+            parse_restart_args(&args(&["--wait", "5", "--now", "-y"]), lang),
+            run(false, true, 0, 0)
+        );
+        for bad in [
+            &["--wait", "abc"][..],
+            &["--wait"],
+            &["--nudge-wait", "-1"],
+            &["--wait", "99999999999999999999"],
+            &["--all"],
+            &["3"],
+            // `-y` 混着不认识的参数也是用法错误：不许因为看见了 `-y` 就把
+            // 后面那个看不懂的东西忽略掉。
+            &["-y", "--all"],
+        ] {
+            assert!(
+                matches!(parse_restart_args(&args(bad), lang), Restart::Usage(_)),
+                "{bad:?} 应该是用法错误"
+            );
+        }
+    }
+
+    /// 进度那一行：名字从 `List` 里取，取不到用编号；时间写成「几分几秒」。
+    #[test]
+    fn progress_line_names_sessions_and_time() {
+        use crate::drain::Progress;
+        use std::collections::HashMap;
+        let names = HashMap::from([(2, "dc-octo".to_string())]);
+        let p = Progress {
+            waiting: vec![2, 9],
+            remaining_s: 552,
+            nudged: false,
+        };
+        assert_eq!(
+            progress_line(&p, &names, Lang::Zh),
+            "还在等 2 个会话（dc-octo、9 号），剩 9 分 12 秒"
+        );
+        assert_eq!(
+            progress_line(&p, &names, Lang::En),
+            "Waiting for 2 sessions (dc-octo, #9), 9m 12s left"
+        );
+        let nudged = Progress {
+            waiting: vec![9],
+            remaining_s: 160,
+            nudged: true,
+        };
+        assert_eq!(
+            progress_line(&nudged, &names, Lang::Zh),
+            "还在等 1 个会话（9 号），已请它们停下，最多再等 2 分 40 秒"
+        );
+        let short = Progress {
+            waiting: vec![2],
+            remaining_s: 40,
+            nudged: false,
+        };
+        assert_eq!(
+            progress_line(&short, &names, Lang::Zh),
+            "还在等 1 个会话（dc-octo），剩 40 秒"
+        );
+        // 收尾那一段：没有要等的了，但还没换完。
+        let finishing = Progress {
+            waiting: vec![],
+            remaining_s: 0,
+            nudged: false,
+        };
+        assert_eq!(
+            progress_line(&finishing, &names, Lang::Zh),
+            text(Key::RestartDrainFinishing, Lang::Zh)
+        );
+    }
+
+    /// 后台老到不认识 `Drain`（协议 < 25，或者连 `Hello` 都答不上）就走原来
+    /// 那条直接重启的路——给它发 `Drain` 只会换来一句解析失败。
+    #[test]
+    fn old_daemon_falls_back_to_plain_restart() {
+        assert_eq!(plan_for(None), Plan::Plain);
+        assert_eq!(plan_for(Some(1)), Plan::Plain);
+        assert_eq!(plan_for(Some(24)), Plan::Plain);
+        assert_eq!(plan_for(Some(25)), Plan::Graceful);
+        assert_eq!(
+            plan_for(Some(crate::proto::PROTOCOL_VERSION)),
+            Plan::Graceful
+        );
+    }
+
+    /// 敲命令的那个会话：`DCT_SESSION_ID` 认得出就带上，认不出就当不在会话里。
+    #[test]
+    fn initiator_comes_from_the_session_env() {
+        assert_eq!(initiator_from(Some("7".into())), Some(7));
+        assert_eq!(initiator_from(Some(" 12 ".into())), Some(12));
+        assert_eq!(initiator_from(Some("abc".into())), None);
+        assert_eq!(initiator_from(None), None);
+    }
+
+    /// 不是终端（管道、日志）时不能用 `\r` 刷同一行：那只会变成一堆粘在一起
+    /// 的字。只在要等的会话或阶段变了时才另起一行——秒数每秒都在变，按
+    /// 字面比较的话日志里会一秒一行。
+    #[test]
+    fn progress_out_without_a_terminal_prints_a_line_only_on_change() {
+        use crate::drain::Progress;
+        use std::collections::HashMap;
+        let names = HashMap::new();
+        let mut out = ProgressOut::new(Vec::new(), false);
+        let p = |waiting: Vec<u32>, remaining_s, nudged| Progress {
+            waiting,
+            remaining_s,
+            nudged,
+        };
+        out.show(&p(vec![1, 2], 100, false), &names, Lang::Zh);
+        out.show(&p(vec![1, 2], 99, false), &names, Lang::Zh);
+        out.show(&p(vec![2], 98, false), &names, Lang::Zh);
+        out.show(&p(vec![2], 60, true), &names, Lang::Zh);
+        out.finish();
+        let s = String::from_utf8(out.into_inner()).unwrap();
+        assert_eq!(
+            s,
+            "还在等 2 个会话（1 号、2 号），剩 1 分 40 秒\n\
+             还在等 1 个会话（2 号），剩 1 分 38 秒\n\
+             还在等 1 个会话（2 号），已请它们停下，最多再等 1 分钟\n"
+        );
+    }
+
+    /// 终端上同一行原地刷新；收尾时补一个换行，后面的话不会接在进度后头。
+    #[test]
+    fn progress_out_on_a_terminal_rewrites_one_line() {
+        use crate::drain::Progress;
+        use std::collections::HashMap;
+        let names = HashMap::new();
+        let mut out = ProgressOut::new(Vec::new(), true);
+        let p = |remaining_s| Progress {
+            waiting: vec![3],
+            remaining_s,
+            nudged: false,
+        };
+        out.show(&p(5), &names, Lang::Zh);
+        out.show(&p(4), &names, Lang::Zh);
+        out.finish();
+        out.finish();
+        let s = String::from_utf8(out.into_inner()).unwrap();
+        assert_eq!(s.matches('\r').count(), 2, "{s:?}");
+        assert!(s.ends_with("剩 4 秒\n"), "{s:?}");
+        assert_eq!(s.matches('\n').count(), 1, "finish 两次只该换一次行：{s:?}");
+    }
+
+    /// 假后台：按顺序吐 `replies`，记下收到的请求名。
+    fn run_drain_loop(
+        replies: Vec<Result<Response>>,
+        cancel_before: &[usize],
+        old_gone: bool,
+    ) -> (DrainEnd, Vec<String>, String) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = AtomicBool::new(false);
+        let mut replies = replies.into_iter();
+        let mut seen: Vec<String> = Vec::new();
+        let mut out = ProgressOut::new(Vec::new(), false);
+        let names = std::collections::HashMap::from([(2, "dc-octo".to_string())]);
+        let end = {
+            let mut call = |req: Request| {
+                seen.push(
+                    format!("{req:?}")
+                        .split([' ', '{'])
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                );
+                // 第 n 个请求发出之后按下 Ctrl+C。
+                if cancel_before.contains(&seen.len()) {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                replies.next().expect("假后台没话可答了")
+            };
+            drain_loop(
+                &mut call,
+                Request::Drain {
+                    wait_s: 900,
+                    nudge_wait_s: 180,
+                    initiator: Some(4),
+                },
+                &cancel,
+                &|| old_gone,
+                std::time::Duration::from_millis(10),
+                &mut out,
+                &names,
+                Lang::Zh,
+            )
+        };
+        out.finish();
+        (end, seen, String::from_utf8(out.into_inner()).unwrap())
+    }
+
+    fn progress(waiting: Vec<u32>, done: bool, active: bool) -> Result<Response> {
+        Ok(Response::DrainProgress {
+            progress: crate::drain::Progress {
+                waiting,
+                remaining_s: 60,
+                nudged: false,
+            },
+            done,
+            active,
+        })
+    }
+
+    /// 正常走完：每拍续一次约，进度印出来，`done` 之后去等新后台。
+    #[test]
+    fn drain_loop_renews_until_done() {
+        let (end, seen, out) = run_drain_loop(
+            vec![
+                progress(vec![2], false, true),
+                progress(vec![], false, true),
+                progress(vec![], true, true),
+            ],
+            &[],
+            false,
+        );
+        assert_eq!(end, DrainEnd::Swapping);
+        assert_eq!(seen, ["Drain", "DrainStatus", "DrainStatus"]);
+        assert_eq!(
+            out,
+            "还在等 1 个会话（dc-octo），剩 1 分钟\n会话都停好了，正在记下各会话的状态……\n"
+        );
+    }
+
+    /// Ctrl+C：发 `DrainCancel`，后台答 `Ok` 就收手。
+    #[test]
+    fn drain_loop_ctrl_c_cancels() {
+        let (end, seen, _) = run_drain_loop(
+            vec![progress(vec![2], false, true), Ok(Response::Ok)],
+            &[1],
+            false,
+        );
+        assert_eq!(end, DrainEnd::Cancelled);
+        assert_eq!(seen, ["Drain", "DrainCancel"]);
+    }
+
+    /// 已经在落盘时按 Ctrl+C：后台回进度、不取消，接着等到 `done`。
+    #[test]
+    fn drain_loop_cancel_too_late_keeps_waiting() {
+        let (end, seen, _) = run_drain_loop(
+            vec![
+                progress(vec![], false, true),
+                progress(vec![], false, true),
+                progress(vec![], true, true),
+            ],
+            &[1],
+            false,
+        );
+        assert_eq!(end, DrainEnd::Swapping);
+        assert_eq!(seen, ["Drain", "DrainCancel", "DrainStatus"]);
+    }
+
+    /// 后台说「没在排空」：旧后台还活着 = 被撤了；旧后台已经走了 = 错过了
+    /// `done`，答话的是新后台，照样去等新后台。
+    #[test]
+    fn drain_loop_inactive_means_aborted_unless_the_old_daemon_is_gone() {
+        let replies = || {
+            vec![
+                progress(vec![2], false, true),
+                progress(vec![], false, false),
+            ]
+        };
+        assert_eq!(run_drain_loop(replies(), &[], false).0, DrainEnd::Failed);
+        assert_eq!(run_drain_loop(replies(), &[], true).0, DrainEnd::Swapping);
+    }
+
+    /// 连不上：旧后台已经走了就去等新的；还活着却连着答不上，就别干等。
+    #[test]
+    fn drain_loop_connection_loss() {
+        let lost = || Err(anyhow::anyhow!("gone"));
+        assert_eq!(
+            run_drain_loop(vec![progress(vec![2], false, true), lost()], &[], true).0,
+            DrainEnd::Swapping
+        );
+        let (end, seen, _) = run_drain_loop(
+            vec![progress(vec![2], false, true), lost(), lost(), lost()],
+            &[],
+            false,
+        );
+        assert_eq!(end, DrainEnd::Failed);
+        assert_eq!(seen.len(), 4);
     }
 
     /// CRITICAL fix pin: `oauth_lookup` 曾经把 kimi/glm/deepseek/qwen-api

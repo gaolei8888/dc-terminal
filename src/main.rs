@@ -23,7 +23,9 @@ dct —— vibe coding 终端
                    缺 Node 运行时会自己补上一份，只给 dct 自己用
   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
                    靠它，没有它撤销是死的；同样只给 dct 自己用
-  dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
+  dct restart      换掉在跑的守护进程：先等在忙的会话停下，重启后各自接回
+                   原来的对话；Ctrl+C 取消。-y 免问，--now 不等，
+                   --wait <分钟>（默认 15）、--nudge-wait <分钟>（默认 3）调等待；
                    后台空着就直接起一个新的
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
@@ -127,7 +129,7 @@ fn main() -> Result<()> {
                 std::process::exit(2)
             }
         },
-        // restart 换掉的是**整个**守护进程，所有会话跟着断，所以默认要问一句
+        // restart 换掉的是**整个**守护进程，会先等会话停下再换，所以默认要问一句
         // （`-y` 免问）。后台空着的时候它不拦着，直接当「启动」办——理由在
         // `cli::run_restart` 上。
         Some("restart") => {

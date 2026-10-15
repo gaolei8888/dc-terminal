@@ -151,7 +151,7 @@ fn process_alive(pid: u32) -> bool {
     crate::sys::proc::alive(pid)
 }
 
-fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + limit;
     while std::time::Instant::now() < deadline {
         if cond() {

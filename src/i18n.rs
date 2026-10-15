@@ -500,6 +500,20 @@ pub enum Key {
     RestartStartedDaemonOnly,
     /// 连守护进程都没拉起来。
     RestartStartFailed,
+    /// 平稳重启：会话都停好了，后台正在记状态、准备交给小进程。
+    RestartDrainFinishing,
+    /// 后台老到不认识平稳重启，只能直接重启。
+    RestartOldDaemonPlain,
+    /// 等待期间按了 Ctrl+C：已取消。
+    RestartDrainCancelled,
+    /// 按 Ctrl+C 时后台已经开始落盘，取消不了。
+    RestartCancelTooLate,
+    /// 排空被后台自己撤了（不是用户取消的）。
+    RestartDrainAborted,
+    /// 排空完了，正在等新的后台起来。
+    RestartSwapping,
+    /// 旧后台已经走了，新的却没起来。
+    RestartNewDaemonNotUp,
     // —— 守护进程重启后，问要不要接回上次的会话 ——
     ResumeSessionsExplain,
     ResumeSessionsAsk,
@@ -1131,6 +1145,42 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Could not start the background service.",
             zh: "没能启动后台服务",
         ),
+        RestartDrainFinishing => t!(
+            lang,
+            en: "All sessions have stopped. Saving where each one was…",
+            zh: "会话都停好了，正在记下各会话的状态……",
+        ),
+        RestartOldDaemonPlain => t!(
+            lang,
+            en: "The background service running now is too old to wait for sessions to stop — it will be restarted right away.",
+            zh: "这次后台太旧，不会等会话停下，直接重启",
+        ),
+        RestartDrainCancelled => {
+            t!(lang, en: "Cancelled. Nothing changed.", zh: "已取消，一切照旧")
+        }
+        RestartCancelTooLate => t!(
+            lang,
+            en: "Already switching over — too late to cancel. Almost done.",
+            zh: "已经在换了，取消不了，马上就好",
+        ),
+        RestartDrainAborted => t!(
+            lang,
+            en: "The restart did not go ahead. Nothing changed.",
+            zh: "重启没进行下去，一切照旧",
+        ),
+        RestartSwapping => t!(
+            lang,
+            en: "Switching to the new background service…",
+            zh: "正在换新的后台……",
+        ),
+        // 旧的已经走了，所以不能用 `RestartFailed`（那句说「旧的还在跑」）。
+        RestartNewDaemonNotUp => t!(
+            lang,
+            en: "The new background service did not come up. See ~/.dct/daemon.log for why;\n\
+                 running `dct` again starts it as usual and brings the sessions back.",
+            zh: "新的后台没起来，原因看 ~/.dct/daemon.log；\n\
+                 再敲一次 `dct` 会照常起后台、接回会话。",
+        ),
         ResumeSessionsExplain => t!(
             lang,
             en: "The background service was not running. Before, it had these sessions open:",
@@ -1512,12 +1562,85 @@ pub mod msg {
     /// **不把不认识的参数当成「没参数」忽略掉**：`dct restart --all` 这种手滑
     /// 如果被当成裸 `dct restart` 执行，用户以为自己限定了范围，实际把整个
     /// 守护进程连所有会话一起换掉了。
-    pub fn restart_takes_no_args(lang: Lang, arg: &str) -> String {
+    pub fn restart_bad_arg(lang: Lang, arg: &str) -> String {
         t!(
             lang,
-            en: format!("`dct restart` takes no arguments (`{arg}`) — only `-y` to skip the question."),
-            zh: format!("`dct restart` 不接参数（`{arg}`），只认 `-y`（不问直接重启）。"),
+            en: format!(
+                "`dct restart` does not know `{arg}`. It takes: -y (don't ask), --now (don't wait for sessions), \
+                 --wait <minutes>, --nudge-wait <minutes>."
+            ),
+            zh: format!(
+                "`dct restart` 不认识 `{arg}`。能用的：-y（不问）、--now（不等会话停下）、\
+                 --wait <分钟>、--nudge-wait <分钟>。"
+            ),
         )
+    }
+
+    /// `--wait` / `--nudge-wait` 后面没跟分钟数，或者跟的不是数。
+    pub fn restart_needs_minutes(lang: Lang, flag: &str) -> String {
+        t!(
+            lang,
+            en: format!("`{flag}` needs a number of minutes, e.g. `{flag} 5`."),
+            zh: format!("`{flag}` 后面要跟分钟数，比如 `{flag} 5`。"),
+        )
+    }
+
+    /// 问 y/n 之前的说明：平稳重启会先等，最多等 `minutes` 分钟。
+    pub fn restart_graceful_explain(lang: Lang, minutes: u64) -> String {
+        t!(
+            lang,
+            en: format!(
+                "dct will first wait for busy sessions to stop (up to {minutes} min), then restart;\n\
+                 afterwards every session picks up its conversation where it left off."
+            ),
+            zh: format!(
+                "会先等正在干活的会话停下（最多 {minutes} 分钟），再重启；\n\
+                 重启后每个会话接回原来的对话。"
+            ),
+        )
+    }
+
+    /// 没有名字的会话怎么称呼。
+    pub fn session_number(lang: Lang, id: u32) -> String {
+        t!(lang, en: format!("#{id}"), zh: format!("{id} 号"))
+    }
+
+    /// 平稳重启的进度一行。`who` 是还在等的会话（名字或编号），`nudged` =
+    /// 已经催过它们停下，`remaining_s` 是离下一个时限还剩几秒。
+    pub fn drain_waiting(lang: Lang, who: &[String], remaining_s: u64, nudged: bool) -> String {
+        let n = who.len();
+        let (m, sec) = (remaining_s / 60, remaining_s % 60);
+        match lang {
+            Lang::Zh => {
+                let names = who.join("、");
+                let left = match (m, sec) {
+                    (0, s) => format!("{s} 秒"),
+                    (m, 0) => format!("{m} 分钟"),
+                    (m, s) => format!("{m} 分 {s} 秒"),
+                };
+                if nudged {
+                    format!("还在等 {n} 个会话（{names}），已请它们停下，最多再等 {left}")
+                } else {
+                    format!("还在等 {n} 个会话（{names}），剩 {left}")
+                }
+            }
+            Lang::En => {
+                let names = who.join(", ");
+                let noun = if n == 1 { "session" } else { "sessions" };
+                let left = match (m, sec) {
+                    (0, s) => format!("{s}s"),
+                    (m, 0) => format!("{m}m"),
+                    (m, s) => format!("{m}m {s}s"),
+                };
+                if nudged {
+                    format!(
+                        "Waiting for {n} {noun} ({names}); asked them to stop, at most {left} more"
+                    )
+                } else {
+                    format!("Waiting for {n} {noun} ({names}), {left} left")
+                }
+            }
+        }
     }
 
     pub fn all_takes_no_ids(lang: Lang, cmd: &str) -> String {
@@ -3144,6 +3267,13 @@ mod tests {
             RestartNothingToRestart,
             RestartStartedDaemonOnly,
             RestartStartFailed,
+            RestartDrainFinishing,
+            RestartOldDaemonPlain,
+            RestartDrainCancelled,
+            RestartCancelTooLate,
+            RestartDrainAborted,
+            RestartSwapping,
+            RestartNewDaemonNotUp,
             ResumeSessionsExplain,
             ResumeSessionsAsk,
             ResumeSessionsWillContinue,
@@ -3205,7 +3335,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 212, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 219, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

@@ -24,6 +24,69 @@ pub fn restore_terminal_when_killed(restore: fn()) {
     imp::install(restore)
 }
 
+/// 不在 raw mode 的命令行（`dct restart` 等会话停下那一段）用：Ctrl+C 不再
+/// 直接结束进程，只把返回的标志置上，由调用方自己收尾（比如先告诉后台
+/// 「取消」）。跟上面那个钩子不能同时装——两个都要接管 Ctrl+C。
+///
+/// 处理函数里只做一次原子写，Unix 上是 async-signal-safe 的；Windows 上
+/// 系统在新线程里调它，同样只写这一个标志。
+pub fn catch_ctrl_c() -> &'static std::sync::atomic::AtomicBool {
+    ctrl_c::install();
+    &ctrl_c::PRESSED
+}
+
+#[cfg(unix)]
+mod ctrl_c {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub static PRESSED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_sigint(_: libc::c_int) {
+        PRESSED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install() {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            let f: extern "C" fn(libc::c_int) = on_sigint;
+            sa.sa_sigaction = f as *const () as libc::sighandler_t;
+            // SA_RESTART：读写 socket 时被 Ctrl+C 打断不报错，接着读，
+            // 标志由主循环下一拍去看。
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(windows)]
+mod ctrl_c {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+    };
+
+    pub static PRESSED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn handler(event: u32) -> BOOL {
+        match event {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                PRESSED.store(true, Ordering::SeqCst);
+                1
+            }
+            // 关窗口、注销、关机：交回系统默认处置。
+            _ => 0,
+        }
+    }
+
+    pub fn install() {
+        // 装不上就是 Ctrl+C 照旧直接结束进程：后台等不到续约，10 秒后自己
+        // 取消，结果一样，只是慢一点。
+        unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     /// 屏蔽掩码会被子进程继承（`execve` 之后仍保留），但这里不用担心：TUI
