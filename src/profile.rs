@@ -1144,6 +1144,19 @@ mod tests {
         }
     }
 
+    /// codex v0.162.1 起默认走备用屏，自己管翻页，历史不交给 dct——dct 里
+    /// 整页滚动就此失灵（2026-10-15 用户报的）。`--no-alt-screen` 让它回到
+    /// 内联模式，这条测试防止哪天「清理参数」又把它删掉。
+    #[test]
+    fn codex_runs_inline_so_dct_keeps_its_history() {
+        let p = Profile::builtin("codex").unwrap();
+        assert!(
+            p.command.iter().any(|a| a == "--no-alt-screen"),
+            "codex 必须带 --no-alt-screen，否则 dct 翻不到它的历史：{:?}",
+            p.command
+        );
+    }
+
     /// opencode 是同一条规矩的另一个形状：它的权限**不在命令行参数上**，
     /// 而在 `OPENCODE_PERMISSION` 这个环境变量里，值是一段 JSON。
     ///

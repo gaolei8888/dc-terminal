@@ -3,6 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
+exclude = ["vendor/vt100"]
 members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game"]
 
 [package]
@@ -96,3 +97,9 @@ features = [
 # `std::os::unix::net` 一样。理由见 `sys::ipc`。
 [target.'cfg(windows)'.dependencies.uds_windows]
 version = "1.1"
+
+# 自带一份打过补丁的 vt100 0.16.2（见 vendor/vt100/src/grid.rs 的 `dct patch`）：
+# 上游在设了滚动区时把滚出屏顶的行全扔掉，真实终端只要滚动区从第一行开始就照样
+# 留进历史。codex 的内联模式正是靠这个往上推历史，不补的话 dct 里翻不到它的输出。
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
