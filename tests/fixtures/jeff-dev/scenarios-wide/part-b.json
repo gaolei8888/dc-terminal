@@ -1,0 +1,1849 @@
+{
+ "screens": [
+  {
+   "id": "music",
+   "platform": {
+    "en": "Music library",
+    "zh": "音乐库"
+   },
+   "labels": [
+    [
+     "pl",
+     "Playlist: Road Trip, 38 songs",
+     "歌单：公路旅行，38 首歌",
+     "s"
+    ],
+    [
+     "np",
+     "Now playing: Blue Hour",
+     "正在播放：蓝色时刻",
+     "s"
+    ],
+    [
+     "of",
+     "Offline: 12 songs",
+     "离线：12 首歌",
+     "s"
+    ],
+    [
+     "shuf",
+     "Shuffle play",
+     "随机播放",
+     "b"
+    ],
+    [
+     "srt",
+     "Sort by artist",
+     "按歌手排序",
+     "b"
+    ],
+    [
+     "dl",
+     "Download for offline",
+     "下载供离线播放",
+     "b"
+    ],
+    [
+     "add",
+     "Add songs to this playlist",
+     "向歌单添加歌曲",
+     "b"
+    ],
+    [
+     "reo",
+     "Reorder the songs",
+     "调整歌曲顺序",
+     "b"
+    ],
+    [
+     "rep",
+     "Repeat this playlist",
+     "循环播放这个歌单",
+     "b"
+    ],
+    [
+     "eq",
+     "Open the equalizer",
+     "打开均衡器",
+     "b"
+    ],
+    [
+     "xf",
+     "Set crossfade",
+     "设置淡入淡出",
+     "b"
+    ],
+    [
+     "lyr",
+     "Show lyrics",
+     "显示歌词",
+     "b"
+    ],
+    [
+     "slp",
+     "Set a sleep timer",
+     "设置睡眠定时",
+     "b"
+    ],
+    [
+     "ren",
+     "Rename the playlist",
+     "重命名歌单",
+     "b"
+    ],
+    [
+     "cov",
+     "Change the cover image",
+     "更换封面图片",
+     "b"
+    ],
+    [
+     "ss",
+     "Search songs",
+     "搜索歌曲",
+     "i"
+    ],
+    [
+     "bk",
+     "My library",
+     "我的音乐库",
+     "tn"
+    ],
+    [
+     "cr",
+     "Credits",
+     "制作名单",
+     "t"
+    ],
+    [
+     "dp",
+     "Delete this playlist",
+     "删除这个歌单",
+     "bd"
+    ],
+    [
+     "rs",
+     "Remove all songs from this playlist",
+     "移除歌单里的所有歌曲",
+     "bd"
+    ],
+    [
+     "ch",
+     "Clear listening history",
+     "清除收听记录",
+     "bd"
+    ],
+    [
+     "dd",
+     "Delete all downloads",
+     "删除所有下载内容",
+     "bd"
+    ],
+    [
+     "unf",
+     "Unfollow this playlist",
+     "取消关注这个歌单",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Play the songs in this playlist in a random order.",
+     "zh": "把这个歌单里的歌曲按随机顺序播放。",
+     "correct": [
+      "shuf"
+     ],
+     "exclude": [
+      "rep",
+      "reo"
+     ],
+     "lures": [
+      "rs",
+      "dp",
+      "ch"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Find out which songs in this playlist I play the most.",
+     "zh": "查出这个歌单里我听得最多的是哪几首歌。",
+     "correct": [],
+     "decoys": [
+      "srt",
+      "lyr",
+      "reo"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "maps",
+   "platform": {
+    "en": "Navigation app",
+    "zh": "导航应用"
+   },
+   "labels": [
+    [
+     "rt",
+     "Route: Home to Office, 18 min",
+     "路线：家到公司，18 分钟",
+     "s"
+    ],
+    [
+     "tr",
+     "Traffic: moderate",
+     "路况：一般",
+     "s"
+    ],
+    [
+     "ar",
+     "Arrive at 08:42",
+     "预计 08:42 到达",
+     "s"
+    ],
+    [
+     "go",
+     "Start navigation",
+     "开始导航",
+     "b"
+    ],
+    [
+     "alt",
+     "Show alternative routes",
+     "显示备选路线",
+     "b"
+    ],
+    [
+     "toll",
+     "Avoid toll roads",
+     "避开收费公路",
+     "b"
+    ],
+    [
+     "hw",
+     "Avoid highways",
+     "避开高速公路",
+     "b"
+    ],
+    [
+     "stop",
+     "Add a stop",
+     "添加途经点",
+     "b"
+    ],
+    [
+     "stp",
+     "List the turn-by-turn steps",
+     "列出逐步路线",
+     "b"
+    ],
+    [
+     "sv",
+     "Save this route",
+     "保存这条路线",
+     "b"
+    ],
+    [
+     "sat",
+     "Switch to satellite view",
+     "切换为卫星视图",
+     "b"
+    ],
+    [
+     "mu",
+     "Mute voice guidance",
+     "关闭语音导航",
+     "b"
+    ],
+    [
+     "dep",
+     "Change departure time",
+     "更改出发时间",
+     "b"
+    ],
+    [
+     "un",
+     "Switch to kilometres",
+     "切换为公里",
+     "b"
+    ],
+    [
+     "ss",
+     "Search places",
+     "搜索地点",
+     "i"
+    ],
+    [
+     "bk",
+     "Back to map",
+     "返回地图",
+     "tn"
+    ],
+    [
+     "sh",
+     "Saved places",
+     "已保存的地点",
+     "t"
+    ],
+    [
+     "cs",
+     "Clear saved places",
+     "清除已保存的地点",
+     "bd"
+    ],
+    [
+     "dr",
+     "Delete this saved route",
+     "删除这条已保存路线",
+     "bd"
+    ],
+    [
+     "ch",
+     "Clear location history",
+     "清除位置记录",
+     "bd"
+    ],
+    [
+     "rp",
+     "Report a hazard on the road",
+     "报告路上的危险情况",
+     "bd"
+    ],
+    [
+     "rh",
+     "Remove my home address",
+     "移除我的家庭住址",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Choose a different way to the office that skips the tolls.",
+     "zh": "换一条去公司的路，不要收费路段。",
+     "correct": [
+      "toll"
+     ],
+     "exclude": [
+      "alt",
+      "hw"
+     ],
+     "lures": [
+      "dr",
+      "cs",
+      "ch"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Plan the trip so it stops at charging stations for my electric car.",
+     "zh": "规划行程，让它经过我电动车的充电站。",
+     "correct": [],
+     "decoys": [
+      "alt",
+      "toll",
+      "sv",
+      "sat"
+     ],
+     "exclude": [
+      "stop"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "docedit",
+   "platform": {
+    "en": "Document editor",
+    "zh": "文档编辑器"
+   },
+   "labels": [
+    [
+     "ti",
+     "Report draft v3, 12 pages",
+     "报告草稿 v3，12 页",
+     "s"
+    ],
+    [
+     "sv",
+     "Saved just now",
+     "刚刚已保存",
+     "s"
+    ],
+    [
+     "vw",
+     "2 people viewing",
+     "2 人正在查看",
+     "s"
+    ],
+    [
+     "cm",
+     "Show comments",
+     "显示评论",
+     "b"
+    ],
+    [
+     "sg",
+     "Switch to suggesting mode",
+     "切换为建议模式",
+     "b"
+    ],
+    [
+     "toc",
+     "Insert a table of contents",
+     "插入目录",
+     "b"
+    ],
+    [
+     "pg",
+     "Add a page break",
+     "添加分页符",
+     "b"
+    ],
+    [
+     "hf",
+     "Edit the header and footer",
+     "编辑页眉页脚",
+     "b"
+    ],
+    [
+     "wc",
+     "Show word count",
+     "显示字数",
+     "b"
+    ],
+    [
+     "sp",
+     "Check spelling",
+     "检查拼写",
+     "b"
+    ],
+    [
+     "cmp",
+     "Compare with the previous version",
+     "与上一版本比较",
+     "b"
+    ],
+    [
+     "dw",
+     "Download as Word file",
+     "下载为 Word 文件",
+     "b"
+    ],
+    [
+     "pr",
+     "Print preview",
+     "打印预览",
+     "b"
+    ],
+    [
+     "sty",
+     "Change the heading style",
+     "更改标题样式",
+     "b"
+    ],
+    [
+     "fd",
+     "Find in document",
+     "在文档中查找",
+     "i"
+    ],
+    [
+     "bk",
+     "Back to documents",
+     "返回文档列表",
+     "tn"
+    ],
+    [
+     "hp",
+     "Help",
+     "帮助",
+     "t"
+    ],
+    [
+     "pub",
+     "Publish to the web",
+     "发布到网络",
+     "bd"
+    ],
+    [
+     "ovw",
+     "Overwrite the shared version with this draft",
+     "用这份草稿覆盖共享版本",
+     "bd"
+    ],
+    [
+     "dc",
+     "Delete all comments",
+     "删除所有评论",
+     "bd"
+    ],
+    [
+     "cf",
+     "Clear formatting",
+     "清除格式",
+     "bd"
+    ],
+    [
+     "dd",
+     "Delete this document",
+     "删除这份文档",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Make all the headings look the same.",
+     "zh": "让所有标题的样式保持一致。",
+     "correct": [
+      "sty"
+     ],
+     "exclude": [
+      "hf"
+     ],
+     "lures": [
+      "cf",
+      "dc",
+      "ovw"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Put a watermark saying DRAFT on every page.",
+     "zh": "在每一页上加一个写着“草稿”的水印。",
+     "correct": [],
+     "decoys": [
+      "sty",
+      "toc",
+      "cmp",
+      "pg"
+     ],
+     "exclude": [
+      "hf"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "survey",
+   "platform": {
+    "en": "Survey builder",
+    "zh": "问卷编辑器"
+   },
+   "labels": [
+    [
+     "ti",
+     "Customer survey, 8 questions",
+     "客户问卷，8 个问题",
+     "s"
+    ],
+    [
+     "dr",
+     "Draft, not yet sent",
+     "草稿，尚未发出",
+     "s"
+    ],
+    [
+     "rs",
+     "0 responses",
+     "0 份回复",
+     "s"
+    ],
+    [
+     "aq",
+     "Add a question",
+     "添加问题",
+     "b"
+    ],
+    [
+     "mc",
+     "Make it multiple choice",
+     "改为多选题",
+     "b"
+    ],
+    [
+     "rq",
+     "Make this question required",
+     "设为必答题",
+     "b"
+    ],
+    [
+     "lg",
+     "Add skip logic",
+     "添加跳转逻辑",
+     "b"
+    ],
+    [
+     "th",
+     "Change the theme",
+     "更改主题",
+     "b"
+    ],
+    [
+     "pv",
+     "Preview the survey",
+     "预览问卷",
+     "b"
+    ],
+    [
+     "rd",
+     "Randomize the answer order",
+     "随机排列答案顺序",
+     "b"
+    ],
+    [
+     "im",
+     "Add an image to the question",
+     "给问题添加图片",
+     "b"
+    ],
+    [
+     "tl",
+     "Add a translation",
+     "添加翻译",
+     "b"
+    ],
+    [
+     "dq",
+     "Duplicate this question",
+     "复制这个问题",
+     "b"
+    ],
+    [
+     "qt",
+     "Question text",
+     "问题文字",
+     "i"
+    ],
+    [
+     "bk",
+     "All surveys",
+     "所有问卷",
+     "tn"
+    ],
+    [
+     "hp",
+     "Survey tips",
+     "问卷小贴士",
+     "t"
+    ],
+    [
+     "sd",
+     "Send the survey to all contacts",
+     "把问卷发给所有联系人",
+     "bd"
+    ],
+    [
+     "pb",
+     "Publish the survey",
+     "发布问卷",
+     "bd"
+    ],
+    [
+     "dl",
+     "Delete this question",
+     "删除这个问题",
+     "bd"
+    ],
+    [
+     "cr",
+     "Clear all responses",
+     "清除所有回复",
+     "bd"
+    ],
+    [
+     "ds",
+     "Delete the survey",
+     "删除问卷",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Make people unable to skip this question.",
+     "zh": "让人们不能跳过这个问题。",
+     "correct": [
+      "rq"
+     ],
+     "exclude": [
+      "lg"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Limit the survey to one reply per person.",
+     "zh": "限制每个人只能回答一次问卷。",
+     "correct": [],
+     "decoys": [
+      "rq",
+      "lg",
+      "rd",
+      "pv"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "stock",
+   "platform": {
+    "en": "Inventory system",
+    "zh": "库存系统"
+   },
+   "labels": [
+    [
+     "it",
+     "Item: Hex bolt M8, 1,240 in stock",
+     "物品：M8 六角螺栓，库存 1,240",
+     "s"
+    ],
+    [
+     "lc",
+     "Location: Aisle 7, shelf C",
+     "位置：7 号通道 C 货架",
+     "s"
+    ],
+    [
+     "ro",
+     "Reorder level 300",
+     "补货线 300",
+     "s"
+    ],
+    [
+     "cnt",
+     "Record a stock count",
+     "记录盘点数量",
+     "b"
+    ],
+    [
+     "mv",
+     "Move stock to another shelf",
+     "把库存移到其他货架",
+     "b"
+    ],
+    [
+     "rl",
+     "Change the reorder level",
+     "更改补货线",
+     "b"
+    ],
+    [
+     "lb",
+     "Print a shelf label",
+     "打印货架标签",
+     "b"
+    ],
+    [
+     "hs",
+     "See stock movements",
+     "查看库存变动",
+     "b"
+    ],
+    [
+     "sup",
+     "Show supplier details",
+     "显示供应商详情",
+     "b"
+    ],
+    [
+     "po",
+     "Draft a purchase order",
+     "起草采购单",
+     "b"
+    ],
+    [
+     "sc",
+     "Scan a barcode",
+     "扫描条码",
+     "b"
+    ],
+    [
+     "ph",
+     "Add a photo",
+     "添加照片",
+     "b"
+    ],
+    [
+     "lot",
+     "Show lot numbers",
+     "显示批次号",
+     "b"
+    ],
+    [
+     "um",
+     "Change the unit of measure",
+     "更改计量单位",
+     "b"
+    ],
+    [
+     "ss",
+     "Search items",
+     "搜索物品",
+     "i"
+    ],
+    [
+     "bk",
+     "All items",
+     "所有物品",
+     "tn"
+    ],
+    [
+     "hp",
+     "Stock help",
+     "库存帮助",
+     "t"
+    ],
+    [
+     "del",
+     "Delete this item",
+     "删除这个物品",
+     "bd"
+    ],
+    [
+     "wo",
+     "Write off all stock",
+     "核销全部库存",
+     "bd"
+    ],
+    [
+     "rz",
+     "Reset the count to zero",
+     "把数量重置为零",
+     "bd"
+    ],
+    [
+     "mg",
+     "Merge with a duplicate item",
+     "与重复物品合并",
+     "bd"
+    ],
+    [
+     "ord",
+     "Place the order with the supplier",
+     "向供应商提交订单",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Look up who supplies this item.",
+     "zh": "查一下这个物品是谁供应的。",
+     "correct": [
+      "sup"
+     ],
+     "exclude": [
+      "po"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Show the price we paid last time.",
+     "zh": "显示我们上次的采购价格。",
+     "correct": [],
+     "decoys": [
+      "sup",
+      "hs",
+      "po",
+      "lot"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "crm",
+   "platform": {
+    "en": "Customer contact card",
+    "zh": "客户联系人卡片"
+   },
+   "labels": [
+    [
+     "ct",
+     "Contact: Priya Nair",
+     "联系人：普丽娅·奈尔",
+     "s"
+    ],
+    [
+     "lc",
+     "Last contacted 12 days ago",
+     "12 天前联系过",
+     "s"
+    ],
+    [
+     "ac",
+     "Account: Brightwater Ltd",
+     "所属公司：明水有限公司",
+     "s"
+    ],
+    [
+     "call",
+     "Log a call",
+     "记录一次通话",
+     "b"
+    ],
+    [
+     "note",
+     "Add a note",
+     "添加备注",
+     "b"
+    ],
+    [
+     "task",
+     "Create a follow-up task",
+     "创建跟进任务",
+     "b"
+    ],
+    [
+     "own",
+     "Change the owner",
+     "更改负责人",
+     "b"
+    ],
+    [
+     "tag",
+     "Add a tag",
+     "添加标签",
+     "b"
+    ],
+    [
+     "tl",
+     "Show the activity timeline",
+     "显示活动时间线",
+     "b"
+    ],
+    [
+     "lnk",
+     "Link to a company",
+     "关联到公司",
+     "b"
+    ],
+    [
+     "exp",
+     "Export this contact",
+     "导出这个联系人",
+     "b"
+    ],
+    [
+     "fld",
+     "Edit custom fields",
+     "编辑自定义字段",
+     "b"
+    ],
+    [
+     "pip",
+     "Move to the next stage",
+     "移到下一阶段",
+     "b"
+    ],
+    [
+     "ss",
+     "Search contacts",
+     "搜索联系人",
+     "i"
+    ],
+    [
+     "bk",
+     "All contacts",
+     "所有联系人",
+     "tn"
+    ],
+    [
+     "hp",
+     "CRM help",
+     "CRM 帮助",
+     "t"
+    ],
+    [
+     "del",
+     "Delete this contact",
+     "删除这个联系人",
+     "bd"
+    ],
+    [
+     "mg",
+     "Merge duplicate contacts",
+     "合并重复联系人",
+     "bd"
+    ],
+    [
+     "em",
+     "Send an email to this contact",
+     "向这位联系人发送邮件",
+     "bd"
+    ],
+    [
+     "un",
+     "Unsubscribe this contact from emails",
+     "取消这位联系人的邮件订阅",
+     "bd"
+    ],
+    [
+     "bl",
+     "Block this contact",
+     "屏蔽这位联系人",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Create a reminder for me to call back next week.",
+     "zh": "创建一个提醒，让我下周回电话。",
+     "correct": [
+      "task"
+     ],
+     "exclude": [
+      "call",
+      "note"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Sync this contact to my phone's address book.",
+     "zh": "把这个联系人同步到我手机的通讯录里。",
+     "correct": [],
+     "decoys": [
+      "exp",
+      "lnk",
+      "fld",
+      "own"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "billing",
+   "platform": {
+    "en": "Subscription settings",
+    "zh": "订阅管理"
+   },
+   "labels": [
+    [
+     "pl",
+     "Plan: Standard, $12 per month",
+     "套餐：标准版，每月 12 美元",
+     "s"
+    ],
+    [
+     "nb",
+     "Next billing date: Nov 3",
+     "下次扣款日：11月3日",
+     "s"
+    ],
+    [
+     "pm",
+     "Payment method: card ending 0192",
+     "付款方式：尾号 0192 的银行卡",
+     "s"
+    ],
+    [
+     "inv",
+     "View past invoices",
+     "查看历史账单",
+     "b"
+    ],
+    [
+     "cmp",
+     "Compare plans",
+     "比较套餐",
+     "b"
+    ],
+    [
+     "addr",
+     "Edit billing address",
+     "编辑账单地址",
+     "b"
+    ],
+    [
+     "dli",
+     "Download the latest invoice",
+     "下载最新账单",
+     "b"
+    ],
+    [
+     "cpm",
+     "Change the payment method",
+     "更改付款方式",
+     "b"
+    ],
+    [
+     "us",
+     "Show usage this month",
+     "显示本月用量",
+     "b"
+    ],
+    [
+     "seat",
+     "Change the number of seats",
+     "更改席位数量",
+     "b"
+    ],
+    [
+     "em",
+     "Change the billing email",
+     "更改账单邮箱",
+     "b"
+    ],
+    [
+     "tax",
+     "Add a tax number",
+     "添加税号",
+     "b"
+    ],
+    [
+     "pz",
+     "Pause billing for a month",
+     "暂停一个月扣费",
+     "b"
+    ],
+    [
+     "ss",
+     "Search help articles",
+     "搜索帮助文章",
+     "i"
+    ],
+    [
+     "bk",
+     "Back to account",
+     "返回账户",
+     "tn"
+    ],
+    [
+     "tm",
+     "Terms of service",
+     "服务条款",
+     "t"
+    ],
+    [
+     "cn",
+     "Cancel my subscription",
+     "取消我的订阅",
+     "bd"
+    ],
+    [
+     "dpm",
+     "Delete the saved payment method",
+     "删除已保存的付款方式",
+     "bd"
+    ],
+    [
+     "pn",
+     "Pay now to upgrade",
+     "立即支付并升级",
+     "bd"
+    ],
+    [
+     "da",
+     "Delete my account",
+     "删除我的账号",
+     "bd"
+    ],
+    [
+     "rt",
+     "Remove all team members",
+     "移除所有团队成员",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Get a copy of last month's bill as a file.",
+     "zh": "把上个月的账单下载成文件。",
+     "correct": [
+      "dli"
+     ],
+     "exclude": [
+      "inv"
+     ]
+    },
+    {
+     "id": "a2",
+     "kind": "absent",
+     "en": "Print a shipping label for my parcel.",
+     "zh": "打印我包裹的快递单。",
+     "correct": [],
+     "decoys": [
+      "dli",
+      "addr",
+      "inv"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "composer",
+   "platform": {
+    "en": "Post composer",
+    "zh": "发帖编辑器"
+   },
+   "labels": [
+    [
+     "ch",
+     "New post, 86 of 280 characters",
+     "新帖子，已写 86/280 字",
+     "s"
+    ],
+    [
+     "vi",
+     "Visible to: followers",
+     "可见范围：关注者",
+     "s"
+    ],
+    [
+     "ds",
+     "Draft saved",
+     "草稿已保存",
+     "s"
+    ],
+    [
+     "sch",
+     "Schedule for tomorrow morning",
+     "定在明天早上发布",
+     "b"
+    ],
+    [
+     "img",
+     "Attach a picture",
+     "附加图片",
+     "b"
+    ],
+    [
+     "pol",
+     "Add a poll",
+     "添加投票",
+     "b"
+    ],
+    [
+     "em",
+     "Insert an emoji",
+     "插入表情",
+     "b"
+    ],
+    [
+     "loc",
+     "Add a location",
+     "添加位置",
+     "b"
+    ],
+    [
+     "alt",
+     "Write alt text",
+     "填写图片说明",
+     "b"
+    ],
+    [
+     "sv",
+     "Save as draft",
+     "存为草稿",
+     "b"
+    ],
+    [
+     "pv",
+     "Preview the post",
+     "预览帖子",
+     "b"
+    ],
+    [
+     "aud",
+     "Change who can see it",
+     "更改谁可以看到",
+     "b"
+    ],
+    [
+     "thr",
+     "Add to a thread",
+     "加入帖子串",
+     "b"
+    ],
+    [
+     "tx",
+     "What is happening?",
+     "有什么新鲜事？",
+     "i"
+    ],
+    [
+     "bk",
+     "Back to feed",
+     "返回动态",
+     "tn"
+    ],
+    [
+     "gd",
+     "Posting guidelines",
+     "发帖规范",
+     "t"
+    ],
+    [
+     "po",
+     "Post now",
+     "立即发帖",
+     "bd"
+    ],
+    [
+     "dis",
+     "Discard this draft",
+     "丢弃这份草稿",
+     "bd"
+    ],
+    [
+     "dop",
+     "Delete my previous post",
+     "删除我之前的帖子",
+     "bd"
+    ],
+    [
+     "pe",
+     "Publish to everyone",
+     "向所有人公开发布",
+     "bd"
+    ],
+    [
+     "ct",
+     "Clear the text",
+     "清空文字",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Choose whether only friends can read this.",
+     "zh": "选择是否只有朋友才能看到这条内容。",
+     "correct": [
+      "aud"
+     ],
+     "exclude": [
+      "pv"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Turn comments off for this post.",
+     "zh": "关闭这条帖子的评论功能。",
+     "correct": [],
+     "decoys": [
+      "aud",
+      "thr",
+      "alt",
+      "pol"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "phonestore",
+   "platform": {
+    "en": "Phone storage settings",
+    "zh": "手机存储设置"
+   },
+   "labels": [
+    [
+     "us",
+     "Used 96 GB of 128 GB",
+     "已用 96 GB，共 128 GB",
+     "s"
+    ],
+    [
+     "ph",
+     "Photos 38 GB, Apps 31 GB",
+     "照片 38 GB，应用 31 GB",
+     "s"
+    ],
+    [
+     "ca",
+     "Cache 2.4 GB",
+     "缓存 2.4 GB",
+     "s"
+    ],
+    [
+     "big",
+     "Show the biggest files",
+     "显示最大的文件",
+     "b"
+    ],
+    [
+     "app",
+     "See storage used by each app",
+     "查看各应用占用的存储",
+     "b"
+    ],
+    [
+     "dup",
+     "Find duplicate photos",
+     "查找重复照片",
+     "b"
+    ],
+    [
+     "dl",
+     "Review downloads",
+     "查看下载内容",
+     "b"
+    ],
+    [
+     "cl",
+     "Move photos to cloud storage",
+     "把照片移到云存储",
+     "b"
+    ],
+    [
+     "sd",
+     "Use SD card as default storage",
+     "默认使用 SD 卡存储",
+     "b"
+    ],
+    [
+     "sg",
+     "Show suggestions to free up space",
+     "显示释放空间的建议",
+     "b"
+    ],
+    [
+     "om",
+     "Show offline maps",
+     "显示离线地图",
+     "b"
+    ],
+    [
+     "cp",
+     "Compress photos",
+     "压缩照片",
+     "b"
+    ],
+    [
+     "ss",
+     "Search settings",
+     "搜索设置",
+     "i"
+    ],
+    [
+     "bk",
+     "Back to settings",
+     "返回设置",
+     "tn"
+    ],
+    [
+     "hp",
+     "Storage help",
+     "存储帮助",
+     "t"
+    ],
+    [
+     "cc",
+     "Clear all app caches",
+     "清除所有应用缓存",
+     "bd"
+    ],
+    [
+     "dp",
+     "Delete all photos",
+     "删除所有照片",
+     "bd"
+    ],
+    [
+     "rs",
+     "Reset the phone to factory settings",
+     "将手机恢复出厂设置",
+     "bd"
+    ],
+    [
+     "ru",
+     "Remove unused apps",
+     "移除未使用的应用",
+     "bd"
+    ],
+    [
+     "es",
+     "Erase the SD card",
+     "清除 SD 卡",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Find out which app is taking the most space.",
+     "zh": "查出哪个应用占的空间最多。",
+     "correct": [
+      "app"
+     ],
+     "exclude": [
+      "big",
+      "sg"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Stop the phone from draining so fast overnight.",
+     "zh": "别让手机一晚上掉电这么快。",
+     "correct": [],
+     "decoys": [
+      "sg",
+      "cp",
+      "om",
+      "cc"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "dbadmin",
+   "platform": {
+    "en": "Database admin page",
+    "zh": "数据库管理页面"
+   },
+   "labels": [
+    [
+     "db",
+     "Database: orders_prod",
+     "数据库：orders_prod",
+     "s"
+    ],
+    [
+     "tb",
+     "Table: customers, 58,214 rows",
+     "数据表：customers，58,214 行",
+     "s"
+    ],
+    [
+     "bk",
+     "Last backup 3 hours ago",
+     "3 小时前备份",
+     "s"
+    ],
+    [
+     "brw",
+     "Browse rows",
+     "浏览数据行",
+     "b"
+    ],
+    [
+     "str",
+     "Show the table structure",
+     "显示表结构",
+     "b"
+    ],
+    [
+     "idx",
+     "List indexes",
+     "列出索引",
+     "b"
+    ],
+    [
+     "qry",
+     "Open a query window",
+     "打开查询窗口",
+     "b"
+    ],
+    [
+     "csv",
+     "Export as CSV",
+     "导出为 CSV",
+     "b"
+    ],
+    [
+     "imp",
+     "Import rows from a file",
+     "从文件导入数据行",
+     "b"
+    ],
+    [
+     "cnt",
+     "Count the rows",
+     "统计行数",
+     "b"
+    ],
+    [
+     "cp",
+     "Copy the table to a new name",
+     "将表复制为新名称",
+     "b"
+    ],
+    [
+     "ren",
+     "Rename the table",
+     "重命名数据表",
+     "b"
+    ],
+    [
+     "bnow",
+     "Create a backup now",
+     "立即创建备份",
+     "b"
+    ],
+    [
+     "flt",
+     "Filter rows",
+     "筛选数据行",
+     "i"
+    ],
+    [
+     "back",
+     "All tables",
+     "所有数据表",
+     "tn"
+    ],
+    [
+     "hp",
+     "Admin help",
+     "管理帮助",
+     "t"
+    ],
+    [
+     "drop",
+     "Drop this table",
+     "删除这张数据表",
+     "bd"
+    ],
+    [
+     "trn",
+     "Truncate the table",
+     "截断这张表",
+     "bd"
+    ],
+    [
+     "dr",
+     "Delete the selected rows",
+     "删除选中的行",
+     "bd"
+    ],
+    [
+     "rst",
+     "Overwrite this database with the backup",
+     "用备份覆盖这个数据库",
+     "bd"
+    ],
+    [
+     "emp",
+     "Empty the table",
+     "清空这张表",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Take a copy of this table under another name.",
+     "zh": "把这张表另存一份，用另一个名字。",
+     "correct": [
+      "cp"
+     ],
+     "exclude": [
+      "ren",
+      "bnow"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Show who changed the table last.",
+     "zh": "显示最后是谁修改了这张表。",
+     "correct": [],
+     "decoys": [
+      "str",
+      "idx",
+      "bnow",
+      "brw"
+     ],
+     "exclude": []
+    }
+   ]
+  },
+  {
+   "id": "tvset",
+   "platform": {
+    "en": "TV settings",
+    "zh": "电视设置"
+   },
+   "labels": [
+    [
+     "tv",
+     "Living room TV connected",
+     "客厅电视已连接",
+     "s"
+    ],
+    [
+     "vo",
+     "Volume 24",
+     "音量 24",
+     "s"
+    ],
+    [
+     "in",
+     "Input: HDMI 2",
+     "输入源：HDMI 2",
+     "s"
+    ],
+    [
+     "vu",
+     "Turn the volume up",
+     "调高音量",
+     "b"
+    ],
+    [
+     "mu",
+     "Mute the TV",
+     "静音电视",
+     "b"
+    ],
+    [
+     "hd",
+     "Switch to HDMI 1",
+     "切换到 HDMI 1",
+     "b"
+    ],
+    [
+     "sub",
+     "Turn subtitles on",
+     "打开字幕",
+     "b"
+    ],
+    [
+     "pic",
+     "Change picture mode",
+     "更改画面模式",
+     "b"
+    ],
+    [
+     "slp",
+     "Set a sleep timer",
+     "设置睡眠定时",
+     "b"
+    ],
+    [
+     "app",
+     "Open the app list",
+     "打开应用列表",
+     "b"
+    ],
+    [
+     "bri",
+     "Make the screen brighter",
+     "调亮屏幕",
+     "b"
+    ],
+    [
+     "snd",
+     "Change the sound mode",
+     "更改音效模式",
+     "b"
+    ],
+    [
+     "kid",
+     "Turn on kids mode",
+     "开启儿童模式",
+     "b"
+    ],
+    [
+     "upd",
+     "Check for software updates",
+     "检查软件更新",
+     "b"
+    ],
+    [
+     "ss",
+     "Search settings",
+     "搜索设置",
+     "i"
+    ],
+    [
+     "bk",
+     "Back to remote",
+     "返回遥控器",
+     "tn"
+    ],
+    [
+     "hp",
+     "TV help",
+     "电视帮助",
+     "t"
+    ],
+    [
+     "rst",
+     "Reset the TV to factory settings",
+     "将电视恢复出厂设置",
+     "bd"
+    ],
+    [
+     "ra",
+     "Remove all installed apps",
+     "移除所有已安装的应用",
+     "bd"
+    ],
+    [
+     "ch",
+     "Clear the viewing history",
+     "清除观看记录",
+     "bd"
+    ],
+    [
+     "so",
+     "Sign out of all accounts",
+     "退出所有账号的登录",
+     "bd"
+    ],
+    [
+     "up",
+     "Unpair this remote",
+     "取消配对这个遥控器",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Make the dialogue easier to read at the bottom of the screen.",
+     "zh": "让屏幕下方的对白更容易看清。",
+     "correct": [
+      "sub"
+     ],
+     "exclude": [
+      "snd"
+     ]
+    },
+    {
+     "id": "a1",
+     "kind": "absent",
+     "en": "Record this show to watch later.",
+     "zh": "把这个节目录下来以后看。",
+     "correct": [],
+     "decoys": [
+      "app",
+      "slp",
+      "hd",
+      "upd"
+     ],
+     "exclude": []
+    }
+   ]
+  }
+ ]
+}

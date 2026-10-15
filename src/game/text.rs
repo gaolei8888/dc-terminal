@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn exit_codes_separate_normal_ends_from_trouble() {
         let p = Path::new("/x/log.jsonl");
-        let e = |code: &str| Stop::Dco(DcoError { code: code.into(), message: "m".into() });
+        let e = |code: &str| Stop::Dco(DcoError { code: code.into(), message: "m".into(), run_id: None });
         for (s, want) in [
             (Stop::StepsDone, 0),
             (Stop::NoMoves, 0),
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn dco_errors_are_translated() {
-        let e = |c: &str| DcoError { code: c.into(), message: "原话".into() };
+        let e = |c: &str| DcoError { code: c.into(), message: "原话".into(), run_id: None };
         assert!(dco_error(&e("halted")).contains("急停"));
         assert!(dco_error(&e("paused")).contains("暂停"));
         assert!(dco_error(&e("screen_locked")).contains("锁"));
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(dco_error(&e("dco_timeout")), "原话");
         assert!(dco_error(&e("dco_too_old")).contains("版本太旧"));
         assert!(dco_error(&e("dco_blocked")).contains("不让连 dco") && !dco_error(&e("dco_blocked")).contains("原话"));
-        let refused = DcoError { code: "dco_refused".into(), message: r#"{"ok":false}"#.into() };
+        let refused = DcoError { code: "dco_refused".into(), message: r#"{"ok":false}"#.into(), run_id: None };
         assert_eq!(dco_error(&refused), "dco 不认这把钥匙（~/.dco/token），先重启 dco。");
         assert_eq!(dco_error(&e("weird")), "dco 说：原话");
     }
@@ -268,7 +268,7 @@ mod tests {
             Stop::StillMoving,
             Stop::StepsDone,
             Stop::DryRun,
-            Stop::Dco(DcoError { code: "x".into(), message: "".into() }),
+            Stop::Dco(DcoError { code: "x".into(), message: "".into(), run_id: None }),
             Stop::Won,
             Stop::LevelEnded,
             Stop::LivesOut,

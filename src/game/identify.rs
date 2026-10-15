@@ -111,7 +111,7 @@ mod tests {
                     observation_id: None,
                     elements: t.iter().enumerate().map(|(i, s)| Element { id: format!("e{i}"), text: (*s).into() , frac: None }).collect(),
                 }),
-                None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
+                None => Err(DcoError { code: "unsupported".into(), message: "x".into(), run_id: None }),
             }
         }
     }
@@ -120,7 +120,7 @@ mod tests {
         Profile { window: json!({"app": "x"}), region: [0.0, 0.0, 1.0, 1.0], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: Default::default(), level_pattern: None, theme: None }
     }
     fn no_grid() -> Result<GridRead, DcoError> {
-        Err(DcoError { code: "not_a_grid".into(), message: "m".into() })
+        Err(DcoError { code: "not_a_grid".into(), message: "m".into(), run_id: None })
     }
     fn good_grid() -> Result<GridRead, DcoError> {
         // 3 行 4 列，三种颜色，每种至少两格，没有一种超过 70%
@@ -155,7 +155,7 @@ mod tests {
                 panic!("identify must never swipe");
             }
             fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
-                Err(DcoError { code: "private_screen".into(), message: "x".into() })
+                Err(DcoError { code: "private_screen".into(), message: "x".into(), run_id: None })
             }
             fn show_status_with(&mut self, _: &str, _: Option<&str>, _: Option<&str>) {
                 panic!("no mood on a private screen");

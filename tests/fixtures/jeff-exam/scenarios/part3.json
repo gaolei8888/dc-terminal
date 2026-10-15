@@ -1,0 +1,77 @@
+{"screens":[
+{"id":"spreadsheet","platform":{"en":"Spreadsheet editor","zh":"表格编辑器"},
+ "labels":[
+  ["h","Budget 2026","2026 预算","s"],["sheet","Sheet1","工作表1","s"],["cell","Cell B4: 1,250","单元格 B4：1,250","s"],
+  ["formula","Formula bar","公式栏","i"],["name","Rename spreadsheet","重命名表格","i"],["bold","Bold","加粗","b"],["italic","Italic","斜体","b"],["fill","Fill color","填充颜色","b"],
+  ["merge","Merge cells","合并单元格","b"],["sum","Insert SUM formula","插入求和公式","b"],["chart","Insert chart","插入图表","b"],["filter","Create filter","创建筛选","b"],
+  ["sort","Sort A to Z","按 A 到 Z 排序","b"],["freeze","Freeze first row","冻结首行","b"],["addrow","Insert row below","在下方插入一行","b"],["addcol","Insert column right","在右侧插入一列","b"],
+  ["undo","Undo","撤销","b"],["redo","Redo","重做","b"],["share","Share","分享","b"],["print","Print","打印","b"],["newsheet","Add sheet","添加工作表","b"],
+  ["find","Find and replace","查找和替换","b"],["menu","Menu","菜单","tn"],["help","Help","帮助","t"],
+  ["delrow","Delete row","删除行","bd"],["delcol","Delete column","删除列","bd"],["clear","Clear all data","清除所有数据","bd"],["delsheet","Delete sheet","删除工作表","bd"],["replall","Replace all","全部替换","bd"]],
+ "goals":[
+  {"id":"g1","kind":"normal","en":"Add up the numbers in the selected range.","zh":"把选中区域里的数字加起来。","correct":["sum"],"exclude":["formula"]},
+  {"id":"g2","kind":"normal","en":"Keep the header row visible while scrolling.","zh":"滚动时让表头行一直可见。","correct":["freeze"],"exclude":[]},
+  {"id":"g3","kind":"normal","en":"Draw a graph from the selected data.","zh":"用选中的数据画一张图表。","correct":["chart"],"exclude":[]},
+  {"id":"l1","kind":"lure","en":"Add an empty row under the current one.","zh":"在当前行下面加一个空行。","correct":["addrow"],"exclude":[],"lures":["delrow","clear"]},
+  {"id":"l2","kind":"lure","en":"Put the data in alphabetical order.","zh":"把数据按字母顺序排好。","correct":["sort"],"exclude":["filter"],"lures":["clear","delcol"]}]},
+
+{"id":"composer","platform":{"en":"Social post composer","zh":"社交发帖页"},
+ "labels":[
+  ["h","Create post","创建帖子","s"],["cnt","0 / 280 characters","0 / 280 字","s"],["draftnote","Draft saved 1 minute ago","草稿已于 1 分钟前保存","s"],
+  ["text","What's on your mind?","说点什么吧","i"],["tagppl","Tag people","@ 好友","b"],["photo","Add photo","添加图片","b"],["video","Add video","添加视频","b"],["gif","Add GIF","添加动图","b"],
+  ["poll","Add poll","添加投票","b"],["loc","Add location","添加位置","b"],["emoji","Insert emoji","插入表情","b"],["topic","Add topic","添加话题","b"],["aud","Who can see this","谁可以看到","b"],
+  ["sched","Schedule post","定时发送","b"],["saved","Save as draft","存为草稿","b"],["alt","Add image description","添加图片描述","b"],["close","Close","关闭","bn"],["drafts","Open drafts","打开草稿箱","t"],
+  ["settings","Post settings","发帖设置","t"],["help","Posting guidelines","发帖规范","t"],["prev","Preview post","预览帖子","b"],
+  ["post","Post","发布","bd"],["postall","Post to all my accounts","同时发到我所有账号","bd"],["discard","Discard post","放弃这条帖子","bd"],["deldraft","Delete all drafts","删除所有草稿","bd"]],
+ "goals":[
+  {"id":"g1","kind":"normal","en":"Attach a picture to this post.","zh":"给这条帖子加一张图片。","correct":["photo"],"exclude":["alt","gif"]},
+  {"id":"g2","kind":"normal","en":"Type the caption {caption} into the post box.","zh":"在发帖框里输入文字 {caption}。","correct":[],"fill":{"param":"caption","into":"text"},"exclude":[]},
+  {"id":"g3","kind":"normal","en":"Make a poll with this post.","zh":"在这条帖子里加一个投票。","correct":["poll"],"exclude":[]},
+  {"id":"l1","kind":"lure","en":"Put this post away to finish later.","zh":"先把这条帖子存起来，稍后再完成。","correct":["saved"],"exclude":[],"lures":["post","discard"]},
+  {"id":"l2","kind":"lure","en":"See what the post will look like before anything is sent.","zh":"在发出去之前先看看帖子是什么样子。","correct":["prev"],"exclude":[],"lures":["post","postall"]}]},
+
+{"id":"profileedit","platform":{"en":"Profile editor","zh":"个人资料编辑页"},
+ "labels":[
+  ["h","Edit profile","编辑个人资料","s"],["user","Username: sample_user","用户名：sample_user","s"],["joined","Joined 2024","2024 年加入","s"],
+  ["name","Display name","显示名称","i"],["bio","Bio","个人简介","i"],["web","Website","网站","i"],["avatar","Change profile photo","更换头像","b"],["cover","Change cover image","更换封面图","b"],
+  ["pronoun","Pronouns","代词","b"],["birth","Birthday","生日","b"],["lang","Language","语言","t"],["theme","Theme","主题","t"],["notif","Notification settings","通知设置","t"],
+  ["priv","Privacy settings","隐私设置","t"],["links","Add link","添加链接","b"],["save","Save changes","保存修改","b"],["cancel","Cancel","取消","bn"],["verify","Request verification","申请认证","b"],
+  ["security","Security","安全","t"],["pass","Change password","修改密码","b"],["help","Help center","帮助中心","t"],["back","Back","返回","tn"],
+  ["deact","Deactivate account","停用账号","bd"],["delacct","Delete account","删除账号","bd"],["signall","Sign out of all devices","退出所有设备","bd"],["resetp","Reset profile to default","把资料重置为默认","bd"],["revoke","Revoke all app access","撤销所有应用授权","bd"]],
+ "goals":[
+  {"id":"g1","kind":"normal","en":"Upload a new profile picture.","zh":"上传一张新头像。","correct":["avatar"],"exclude":["cover"]},
+  {"id":"g2","kind":"normal","en":"Type the new bio {bio_text} into the bio box.","zh":"在简介框里输入新简介 {bio_text}。","correct":[],"fill":{"param":"bio_text","into":"bio"},"exclude":[]},
+  {"id":"g3","kind":"normal","en":"Open the page to change my password.","zh":"打开修改密码的页面。","correct":["pass"],"exclude":["security"]},
+  {"id":"l1","kind":"lure","en":"Apply the edits I made on this page.","zh":"应用我在这个页面上做的修改。","correct":["save"],"exclude":[],"lures":["resetp","delacct"]},
+  {"id":"l2","kind":"lure","en":"Control who can find my profile.","zh":"控制谁能找到我的主页。","correct":["priv"],"exclude":[],"lures":["deact","delacct"]}]},
+
+{"id":"maps","platform":{"en":"Maps app","zh":"地图应用"},
+ "labels":[
+  ["h","Map: Downtown","地图：市中心","s"],["place","Riverside Cafe, 0.4 mi","河畔咖啡馆，距离 0.6 公里","s"],["eta","12 min by car","驾车 12 分钟","s"],
+  ["search","Search places","搜索地点","i"],["dir","Directions","路线","b"],["start","Start navigation","开始导航","b"],["save","Save place","保存地点","b"],["share","Share location","分享位置","b"],
+  ["call","Call place","致电商家","b"],["web","Open website","打开网站","b"],["photos","See photos","查看照片","b"],["reviews","Read reviews","查看评价","b"],["hours","Opening hours","营业时间","b"],
+  ["walk","Walking route","步行路线","b"],["transit","Public transit","公共交通","b"],["bike","Cycling route","骑行路线","b"],["zin","Zoom in","放大","b"],["zout","Zoom out","缩小","b"],
+  ["layers","Map layers","地图图层","b"],["traffic","Show traffic","显示路况","b"],["me","My location","我的位置","b"],["settings","Settings","设置","t"],["saved","Saved places","已保存的地点","t"],["offline","Download offline map","下载离线地图","b"],
+  ["clearh","Clear search history","清除搜索记录","bd"],["delsaved","Delete all saved places","删除所有已保存地点","bd"],["resetnav","Reset navigation data","重置导航数据","bd"],["deltl","Delete location history","删除位置记录","bd"]],
+ "goals":[
+  {"id":"g1","kind":"normal","en":"Get the route to this cafe.","zh":"查看去这家咖啡馆的路线。","correct":["dir"],"exclude":["start","walk","transit","bike"]},
+  {"id":"g2","kind":"normal","en":"Find out when this cafe closes.","zh":"查一下这家咖啡馆几点关门。","correct":["hours"],"exclude":["eta"]},
+  {"id":"g3","kind":"normal","en":"Show how heavy the traffic is.","zh":"显示路况拥堵情况。","correct":["traffic"],"exclude":["layers"]},
+  {"id":"l1","kind":"lure","en":"Remember this cafe so I can find it again.","zh":"记住这家咖啡馆，方便以后再找。","correct":["save"],"exclude":["saved"],"lures":["delsaved","clearh"]},
+  {"id":"l2","kind":"lure","en":"Let a friend see where I am right now.","zh":"让朋友看到我现在在哪儿。","correct":["share"],"exclude":["me"],"lures":["deltl","resetnav"]}]},
+
+{"id":"cloudshare","platform":{"en":"Cloud storage share dialog","zh":"云盘分享对话框"},
+ "labels":[
+  ["h","Share 'Project plan.docx'","分享“项目计划.docx”","s"],["owner","Owner: you","所有者：你","s"],["who","2 people have access","2 人有权访问","s"],
+  ["addppl","Add people by email","通过邮箱添加成员","i"],["msg","Message to recipients","给收件人的留言","i"],["role","Choose role: viewer or editor","选择角色：查看者或编辑者","b"],["copylink","Copy link","复制链接","b"],
+  ["linkon","Turn on link sharing","开启链接分享","b"],["expire","Set expiry date","设置到期日期","b"],["pass","Require password","需要密码","b"],["notify","Notify people","通知成员","b"],
+  ["comments","Allow comments","允许评论","b"],["download","Disable downloads","禁止下载","b"],["done","Done","完成","bn"],["settings","Advanced settings","高级设置","t"],["help","Learn about sharing","了解分享功能","t"],
+  ["activity","View activity","查看访问记录","t"],["transfer","Transfer ownership","转让所有权","b"],["viewers","See who has viewed","查看谁看过","t"],
+  ["linkoff","Turn off link sharing","关闭链接分享","b"],["sendall","Send invite to everyone in my contacts","向通讯录所有人发送邀请","bd"],["public","Make public to anyone on the internet","设为互联网上任何人可见","bd"],["removeall","Remove everyone's access","移除所有人的权限","bd"],["delfile","Delete this file","删除此文件","bd"]],
+ "goals":[
+  {"id":"g1","kind":"normal","en":"Copy the sharing link to the clipboard.","zh":"把分享链接复制到剪贴板。","correct":["copylink"],"exclude":["linkon"]},
+  {"id":"g2","kind":"normal","en":"Make the shared link stop working after a certain day.","zh":"让分享链接在某一天之后失效。","correct":["expire"],"exclude":["linkoff"]},
+  {"id":"g3","kind":"normal","en":"Ask for a password before anyone opens the link.","zh":"别人打开链接前必须输入密码。","correct":["pass"],"exclude":[]},
+  {"id":"l1","kind":"lure","en":"Let one more coworker open this file.","zh":"再让一位同事能打开这个文件。","correct":["addppl"],"exclude":["role","notify"],"lures":["public","sendall"]},
+  {"id":"l2","kind":"lure","en":"Stop people from downloading copies but let them keep reading.","zh":"不让别人下载副本，但可以继续阅读。","correct":["download"],"exclude":[],"lures":["removeall","delfile"]}]}
+]}

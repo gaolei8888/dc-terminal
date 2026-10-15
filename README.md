@@ -20,6 +20,8 @@ hand out one link and a roomful of people watch — read-only.
 
 [中文](README.zh-CN.md) · design notes in [`docs/superpowers/specs/`](docs/superpowers/specs/)
 
+New session working on this repo? Read [`docs/HANDOFF.md`](docs/HANDOFF.md) first.
+
 </div>
 
 ```
@@ -62,6 +64,10 @@ project `n` opens in.
 - **[dct in a browser](#dct-in-a-browser),** for machines that can't install
   anything: a container, a link instead of a password, an upload panel, and a
   classroom console.
+- **[Post to a social platform (Mac, early)](#post-to-a-social-platform-mac-early).**
+  `dct do` posts an approved text through dco: it replays a procedure you
+  confirmed, or works the page out step by step and writes one for you to
+  confirm. Not tried on a real screen yet.
 - **[Every command on one list](#commands).**
 - The running version is on the board's title line and on the settings page.
 
@@ -432,6 +438,9 @@ Everything else:
 | `dct restart` | swap in the current binary as the daemon (ends every session; `-y` skips the question) |
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
+| `dct judge [file]` / `--probe` | ask the `[judge]` backend (Jeff's `jeff-serve`) one multiple-choice question in Jev format and print each option's probability; `--probe` sends a fixed question to see if it answers. Exit 0 answered, 1 not configured or backend error, 2 the question is wrong |
+| `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you (refuses when stdin isn't a terminal), then confirm with Touch ID, which signs the exact texts; texts (and their opening sentences) must differ per platform |
+| `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco (Mac only): replay the confirmed procedure if there is one, otherwise work the page out, write a draft procedure and show you a card to confirm with Touch ID. Asks before every publish tap. See [Post to a social platform](#post-to-a-social-platform-mac-early) |
 | `dct daemon` | run only the daemon, no board |
 | `dct gate` | the door in front of [dct in a browser](#dct-in-a-browser) |
 | `dct --version` | which one you have |
@@ -439,6 +448,25 @@ Everything else:
 `ps`, `stop`, `kill` and `prune` never start a daemon: asking "is anything
 running?" shouldn't turn the answer from no into yes. `restart` does start one,
 because what you asked for is a daemon running the new binary.
+
+`dct judge` and the Jeff step of `dct do` need a `[judge]` section in
+`~/.dct/config.toml`, pointing at a running `jeff-serve`:
+
+```toml
+[judge]
+base_url = "http://127.0.0.1:8765"
+# model = "jeff-latest"      # the name jeff-serve answers to
+# api_key_env = "JEFF_KEY"   # read a key from this variable; plain http only to this machine
+# threshold = 0.8            # below this, dct do asks the [llm] model, then you
+# timeout_ms = 5000
+```
+
+dct does not start `jeff-serve` or download weights; you start it. The weights
+used so far are Jeff v1.2, `jeff-legacy/Jeff-Qwen3.5-0.8B` at revision
+`d86f657` (about 1.6 GB, up to 254 options).
+
+Without `[judge]`, `dct do` skips Jeff; without `[llm]`, it skips the model too.
+You are always the last one asked.
 
 ---
 
@@ -712,6 +740,33 @@ where `Invalid API key: sk-…`, `Authorization: Bearer …` and the contents of
 a box you untick with `l`; it adds to your `config.toml` without rewriting it,
 and leaves an existing `[llm]` alone.
 
+An `[llm]` section has to say which backend to use: **`provider` has no default**,
+and dct never picks a vendor for you. Without it, the feature stays off and you
+get one line telling you what to add. `provider` is the name of a profile (a
+built-in one, or your own in `~/.dct/profiles/`). `transport = "cli"` (the
+default) runs that profile's own headless command. For any OpenAI-compatible
+server, write a profile with an `[api]` section (here
+`~/.dct/profiles/gateway.toml`) and connect directly. The address below is only
+an example, not a real endpoint:
+
+```toml
+# ~/.dct/profiles/gateway.toml
+name    = "gateway"
+command = ["true"]                     # not an interactive agent; only [api] is used
+[api]
+base_url = "http://127.0.0.1:11435"
+wire     = "openai"                    # "openai" = /v1/chat/completions
+```
+
+```toml
+# ~/.dct/config.toml
+[llm]
+provider  = "gateway"                  # the profile name above
+transport = "http"
+model     = "<model name>"             # required for http; dct will not guess one
+# base_url = "..."                     # optional; overrides the profile's [api] base_url
+```
+
 `dct llm check` makes one real call through that connection and says whether it
 worked, so you find out now rather than on the next failure.
 
@@ -837,6 +892,81 @@ You can also run it yourself: `dct game play [--steps 20] [--dry-run]`. Where th
 Add `--auto-next` and, when a level is lost, it presses "Try again" and "Play" by itself to start over. For popups it only closes the safe ones, such as "Close", "Not now" and "No thanks".
 It stops and presses nothing when it meets something that costs money, an ad, no lives left, a cleared level or a screen it does not know (`--tries` limits how many times it starts over, 5 by default; each try uses up one life).
 After a win it does not go on to the next level by itself: the board sits in a different place on the next level, so that has to wait until "recognise a new board automatically" is built.
+
+## Post to a social platform (Mac, early)
+
+**Nothing here has run on a real screen yet.** Everything below is tested
+against a fake dco; the first pilots (X, then TikTok) need you there.
+
+**1. Approve the text once.**
+`dct campaign approve launch --param x.post_text="…" --param tiktok.video=/path/a.mp4`
+shows every platform's text in the terminal and saves it only when you type
+`y` and then confirm with Touch ID (`~/.dct/campaigns/launch.json`). The
+fingerprint signs the exact texts, so editing the file afterwards (or a file
+from an older version, which has no signature) makes `dct do` refuse with exit 2
+until you approve again. Each platform's text, and its opening
+sentence, must differ from the others. `dct do` posts nothing else.
+
+**2. Post it.** `dct do "post the launch text" --platform x --campaign launch`,
+with dco running and the platform's browser open. Several browser windows open →
+it lists them and you pass `--window <id>`.
+
+- If dcv holds a confirmed procedure `promote-<platform>-<post|video>`, dco
+  replays it. When dco can't find a button, dct answers for it the same way as
+  below. When the procedure itself no longer works, dct carries on from that step
+  and writes what it finds as a new draft; the confirmed one is left alone.
+  `--preview` stops before the publish step.
+- Otherwise dct works the page out: it opens the address in the platform table,
+  turns the screen into a multiple-choice question, and asks Jeff (counted only
+  above the threshold) → the `[llm]` model (text only, at most twice per screen)
+  → you, with a numbered picture.
+- **It stops and hands over** on login, QR-code, captcha, phone-verification and
+  account-warning screens; that text goes to no model. It never taps follow,
+  subscribe, promote, upgrade or delete, nothing that moves money or can't be
+  undone, and nothing on the platform's own list. Limits: 40 steps, 10 minutes, 3 unchanged screens
+  in a row.
+- **It asks you before every publish tap.** Where a platform's publish button
+  hasn't been checked on a real screen (all the Chinese platforms and
+  xiaohongshu), it asks before every tap. On `wechat_mp` you always tap publish
+  yourself.
+- After a post goes out, dct writes the steps as a draft procedure (and rules
+  for the popups it closed) into dcv, never approved by itself. If dcv refuses
+  it, the `[llm]` model gets up to 3 tries to fix it. Then a card shows every
+  line; yes → Touch ID, and the approval only holds for the exact text the card
+  showed.
+- Exit codes: 0 posted or previewed, 1 something broke (dco, dcv, the
+  approval), 2 a wrong command, config, campaign or window, 3 stopped or you
+  said no.
+  `--json` prints one event per line (`ask`, `confirm_publish`, `card`, `note`,
+  then `done` / `previewed` / `stopped` / `declined` / `error` with `exit`) and
+  reads `{"key": "e3"}`, `{"stop": true}` or `{"verdict": "yes"}` from stdin.
+
+**What it keeps** (all 0600, and the post text is written as `{post_text}`,
+never the words): each run's steps in `~/.dct/explore/runs/<run>/trace.json`
+with the pictures it showed you (the trace also records how the run ended),
+and one line per answered question in `~/.dct/explore/answers.jsonl`, saved to
+train Jeff later. The lines are written when the run ends; each says who
+answered (`by`: user / model / jeff), which options Jeff was shown (`shown`),
+which trace step it led to (`step`), how the run ended, whether the step was
+confirmed to move closer to the goal (`outcome`: good / bad / unknown) and
+whether it counts as a training label (`label`: user answers, and model
+answers with outcome good; never Jeff's own).
+
+**The platform table** has 16 built-in rows: x, tiktok, youtube, facebook,
+instagram, xiaohongshu, weibo, bilibili, zhihu, zhihu_article, douyin, kuaishou,
+wechat_channels, toutiao, wechat_mp, baijiahao. Fields nobody has checked on a
+real screen are listed in each row's `unverified`; for the Chinese rows that is
+nearly everything. Fix or add rows in `~/.dct/platforms.toml`; a row with the
+same name replaces the built-in one.
+
+**Not done yet:** the real-screen pilots; a stronger model for the middle step
+(waiting for its address); dcv and dco changes it depends on, built in their own
+repositories; and a
+publish that takes two taps (Post, then a confirm dialog) counts as posted only
+once the new screen has no publish button left or shows a verified "posted" text.
+On X that text is still unverified and the home page keeps a Post button, so a
+real X run stays pending after the first tap until the text is verified on a real
+machine.
 
 ## Several computers
 
@@ -1124,6 +1254,11 @@ src/journal.rs     how each session started and how it ended (asked to stop, or 
 src/proto.rs       the wire contract
 src/config.rs      ~/.dct/config.toml; [llm] is off unless written
 src/llm/           the [llm] connection: CLI or HTTP, and which credential may go where
+src/judge/         dct judge: Jev choice questions over HTTP to jeff-serve; confidence recomputed here
+src/campaign.rs    dct campaign approve: one approval for every platform's text
+src/explore_cli*   dct do: window, replay or explore, draft, card, exit codes, --json
+src/explore_model.rs  the [llm] step of dct do: pick a key from the list, or fix a refused draft
+src/learn.rs       drafts into dcv as import:agent, the confirmation card, Touch ID bound to the body
 src/runtime.rs     dct's own Node and git, under ~/.dct/runtime
 src/pair*.rs       DC pairing: the state machine, its HTTP, writing the result
 src/channel/       phone channels; only Telegram so far. Knows nothing of sessions
@@ -1133,6 +1268,9 @@ src/gate.rs        dct gate, the key-checking door for the browser version
 src/web/           the LAN phone client: a tiny HTTP server and one page
 src/link.rs        dials out to a relay and long-polls it (no switch yet)
 src/sys/           everything that differs between Unix and Windows
+crates/dct-dco/    the dco client (unix socket MCP), shared by dct game and dct do
+crates/dct-explore/  hands, platform table, stop rules, options, the Jeff → model → you ladder,
+                   explore, trace and training rows, drafts, replay
 crates/dct-link/   the envelope the daemon and the relay share; no Request
 crates/dct-page/   the only two web pages: the phone client and the live viewer's
 crates/dct-srv/    the relay. Only /live/* and the public listing page / by default (--with-link adds

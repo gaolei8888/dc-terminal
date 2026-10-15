@@ -2665,7 +2665,7 @@ mod tests {
     /// 压根不能调 `resolve()`，更不能装上一个会把终端内容发出去的后端。
     ///
     /// 断言的是 `backend_is_set()` 这个布尔值，不是「问一次真实网络/CLI
-    /// 会不会成功」——默认 provider 是 `claude` + `Transport::Cli`，如果
+    /// 会不会成功」——就算 provider 显式写成 `claude` + `Transport::Cli`，如果
     /// Critical 那个 bug 还在，这条路径的 `resolve()` 本来就会成功（`Cli`
     /// 传输不需要凭据），间接测法（等一个 explanation 出现）反而会被「这台
     /// 机器上到底装没装 claude CLI」这种环境噪音污染，钉不住真正的问题。
@@ -2684,11 +2684,32 @@ mod tests {
     }
 
     /// 反过来钉住「写了就真的开」：不能为了堵上面那条回归，把功能焊死关掉。
-    /// `[llm]` 段里什么字段都不填，靠的是 `LlmConfig` 自己的默认值
-    /// （provider claude、transport Cli），这条路径不需要任何真实凭据就该
-    /// 成功——`Transport::Cli` 只是记下命令，不在这一步真的起子进程。
+    /// 显式写了 provider（这里借一个内置 profile 的名字，`Transport::Cli` 只是
+    /// 记下命令，不在这一步真的起子进程）就该接上。
     #[test]
-    fn a_bare_llm_section_does_install_a_backend() {
+    fn an_llm_section_with_a_provider_does_install_a_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(
+            crate::config::config_path_for_socket(&socket),
+            "[llm]\nprovider = \"claude\"\ntransport = \"cli\"\n",
+        )
+        .unwrap();
+        let mgr = SessionManager::new();
+
+        install_llm_backend(&socket, &dir.path().join("profiles"), &mgr);
+
+        assert!(
+            mgr.backend_is_set(),
+            "写了 provider 就该是一次显式的开——这条不能被上一条回归测试误伤"
+        );
+        assert!(mgr.llm_problem().is_none(), "接上了就不该留着一条抱怨");
+    }
+
+    /// `[llm]` 没写 provider = 没配：不装后端，原因记成 `NoProvider`，
+    /// 这样界面警告栏会带着那一句「请写 provider = ...」去找用户。
+    #[test]
+    fn a_bare_llm_section_installs_nothing_and_leaves_the_hint() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         std::fs::write(crate::config::config_path_for_socket(&socket), "[llm]\n").unwrap();
@@ -2696,11 +2717,11 @@ mod tests {
 
         install_llm_backend(&socket, &dir.path().join("profiles"), &mgr);
 
-        assert!(
-            mgr.backend_is_set(),
-            "写了 [llm]（哪怕是空的）就该是一次显式的开——这条不能被上一条回归测试误伤"
+        assert!(!mgr.backend_is_set(), "没写 provider 不该装任何后端");
+        assert_eq!(
+            mgr.llm_problem(),
+            Some(crate::llm::resolve::ResolveError::NoProvider)
         );
-        assert!(mgr.llm_problem().is_none(), "接上了就不该留着一条抱怨");
     }
 
     /// 用户开了出错解释、却配错了，**这件事必须走得到他眼前**。

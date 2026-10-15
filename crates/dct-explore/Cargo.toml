@@ -1,0 +1,21 @@
+[package]
+name = "dct-explore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+# 测试用的假手（FakeHands）。本 crate 自己的集成测试通过自引用的 dev-dependency 打开它。
+fake = []
+
+[dependencies]
+dct-dco = { path = "../dct-dco" }
+dct-brain = { path = "../dct-brain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+dct-dco = { path = "../dct-dco", features = ["fake"] }
+dct-explore = { path = ".", features = ["fake"] }
+tempfile = "3"

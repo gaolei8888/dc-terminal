@@ -18,6 +18,9 @@ use std::sync::Arc;
 /// 会跟着 `WarningCode::LlmUnavailable` 走 socket 到界面那边去）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveError {
+    /// `[llm]` 里没写 `provider`。dct 不替用户挑一家，所以这不是「接不上」
+    /// 而是「还没配好」：功能保持关着，只留一句教他写哪一行的提示。
+    NoProvider,
     NoSuchProvider(String),
     NoHeadlessCommand(String),
     NoApiEndpoint(String),
@@ -126,7 +129,7 @@ pub fn resolve(
     secrets: &SecretStore,
     oauth: &dyn Fn(&str) -> Option<Borrowed>,
 ) -> Result<Arc<dyn Backend>, ResolveError> {
-    let name = llm.provider.as_str();
+    let name = llm.provider.as_deref().ok_or(ResolveError::NoProvider)?;
     let p = lookup(name).ok_or_else(|| ResolveError::NoSuchProvider(name.to_string()))?;
 
     match llm.transport {
@@ -186,7 +189,7 @@ mod tests {
     // `Config`/`Option` 那一层了。
     fn cfg(provider: &str, transport: Transport) -> LlmConfig {
         LlmConfig {
-            provider: provider.into(),
+            provider: Some(provider.into()),
             model: Some("m".into()),
             base_url: None,
             transport,
@@ -220,6 +223,27 @@ mod tests {
         let mut s = SecretStore::load(&dir.path().join("secrets.toml"));
         s.set(name, key).unwrap();
         (dir, s)
+    }
+
+    /// README 里那套「不带任何厂商名的 OpenAI 兼容端点」写法真的能走通：
+    /// 自己的 profile（只有 `[api]`）+ `[llm]` 点它的名字 + http + 显式 model。
+    /// 地址只是示例（本机回环），这里不发任何请求。
+    #[test]
+    fn the_documented_openai_compatible_setup_resolves_without_any_vendor_name() {
+        let gateway = Profile::from_toml(
+            "name = \"gateway\"\ncommand = [\"true\"]\n\
+             [api]\nbase_url = \"http://127.0.0.1:11435\"\nwire = \"openai\"\n",
+        )
+        .unwrap();
+        let llm = LlmConfig {
+            provider: Some("gateway".into()),
+            model: Some("some-model".into()),
+            base_url: None,
+            transport: Transport::Http,
+        };
+        let (_d, secrets) = secrets_with("gateway", "k");
+        let lookup = |n: &str| (n == "gateway").then(|| gateway.clone());
+        assert!(resolve(&llm, &lookup, &secrets, &no_oauth).is_ok());
     }
 
     #[test]
@@ -333,6 +357,25 @@ mod tests {
             &no_oauth,
         );
         assert!(matches!(r, Err(ResolveError::NoSuchProvider(ref n)) if n == "nope"));
+    }
+
+    /// `[llm]` 没写 provider：不替用户挑一家，也**不去查任何 profile**
+    /// （`lookup` 一旦被调用就 panic）、不起任何子进程。
+    #[test]
+    fn a_missing_provider_is_reported_and_nothing_is_looked_up() {
+        let none = LlmConfig {
+            provider: None,
+            model: Some("m".into()),
+            base_url: Some("http://127.0.0.1:11435".into()),
+            transport: Transport::Http,
+        };
+        let r = resolve(
+            &none,
+            &|n: &str| panic!("没写 provider 不该去查 profile {n}"),
+            &empty_secrets(),
+            &|n: &str| panic!("没写 provider 不该去翻登录态 {n}"),
+        );
+        assert!(matches!(r, Err(ResolveError::NoProvider)));
     }
 
     #[test]
@@ -577,7 +620,13 @@ mod tests {
                 let s = llm_problem(lang, e);
                 assert!(s.contains('x'), "要点名是哪个厂商: {s}");
                 assert!(s.chars().count() > 8, "太短，说不清楚: {s}");
+                // `provider = "..."` 是要原样敲进设置文件的字，不算内部词（见
+                // `NoProvider`）；只有「纯说明」的句子才不许夹带它。
+                let typed_line = s.contains("provider = \"<profile");
                 for jargon in ["provider", "transport", "cli", "agent", "error"] {
+                    if jargon == "provider" && typed_line {
+                        continue;
+                    }
                     assert!(
                         !s.to_lowercase().contains(jargon),
                         "不能夹带内部字段名/类型名「{jargon}」，那是代码里的词不是用户的词: {s}"
@@ -620,5 +669,39 @@ mod tests {
         );
         assert!(refused.contains("api.moonshot.cn"), "要点名是发给哪台机器");
         assert!(refused.contains("按 c"), "要给出他做得到的下一步");
+    }
+
+    /// `NoProvider` 不在上面那条守卫里：它没有「哪个厂商」可点名（问题正是没点名），
+    /// 而且它的下一步就是让用户**敲一行字**——那一行里的 `provider` 是用户要
+    /// 原样写进文件的字，不是内部词。所以单独钉：两种语言都要给出真实路径、
+    /// 逐字的那一行，并且**不替用户推荐任何一家厂商**。
+    #[test]
+    fn a_missing_provider_says_exactly_what_line_to_write_and_names_no_vendor() {
+        use crate::i18n::msg::llm_problem;
+        use crate::i18n::Lang;
+        for lang in [Lang::Zh, Lang::En] {
+            let s = llm_problem(lang, &ResolveError::NoProvider);
+            assert!(
+                s.contains(crate::i18n::msg::CONFIG_PATH),
+                "要给出真实路径: {s}"
+            );
+            assert!(s.contains("provider = \""), "要给出要写的那一行: {s}");
+            assert!(s.contains("[llm]"), "{s}");
+            assert!(
+                s.contains("transport = \"http\""),
+                "要提 OpenAI 兼容端点这条路: {s}"
+            );
+            // 「OpenAI 兼容」说的是线格式（协议），不是推荐一家厂商，先抠掉再查。
+            let s_lc = s
+                .to_lowercase()
+                .replace("openai-compatible", "")
+                .replace("openai 兼容", "");
+            for vendor in ["claude", "anthropic", "openai", "codex", "kimi", "qwen"] {
+                assert!(
+                    !s_lc.contains(vendor),
+                    "默认提示不许带厂商名「{vendor}」: {s}"
+                );
+            }
+        }
     }
 }

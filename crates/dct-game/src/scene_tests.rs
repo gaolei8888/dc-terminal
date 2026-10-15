@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::VecDeque;
 
 fn er(code: &str) -> DcoError {
-    DcoError { code: code.into(), message: format!("msg-{code}") }
+    DcoError { code: code.into(), message: format!("msg-{code}"), run_id: None }
 }
 
 fn el(text: &str, frac: Option<[u16; 4]>) -> Element {

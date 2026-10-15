@@ -67,7 +67,7 @@ impl Dco for Fake {
         }
         match self.swipe(p, f, t) {
             Err(e) => SwipeOutcome::NotSwiped(e),
-            Ok(()) => scripted.unwrap_or_else(|| SwipeOutcome::SwipedNoSettle(DcoError { code: "unsupported".into(), message: "x".into() })),
+            Ok(()) => scripted.unwrap_or_else(|| SwipeOutcome::SwipedNoSettle(DcoError { code: "unsupported".into(), message: "x".into(), run_id: None })),
         }
     }
     fn show_status(&mut self, state: &str) {
@@ -87,7 +87,7 @@ impl Dco for Fake {
                 observation_id: None,
                 elements: t.iter().enumerate().map(|(i, s)| crate::screen::Element { id: format!("e{}", i + 1), text: (*s).into(), frac: None }).collect(),
             }),
-            None => Err(DcoError { code: "unsupported".into(), message: "x".into() }),
+            None => Err(DcoError { code: "unsupported".into(), message: "x".into(), run_id: None }),
         }
     }
 }
@@ -113,7 +113,7 @@ fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
     (s, log)
 }
 fn err(code: &str) -> DcoError {
-    DcoError { code: code.into(), message: format!("m-{code}") }
+    DcoError { code: code.into(), message: format!("m-{code}"), run_id: None }
 }
 
 // 每个类别至少出现两次：只有一格的类别按设计算「认不出」，不能换。
@@ -214,7 +214,7 @@ fn settle_never_finishing_after_a_swipe_counts_the_step_and_is_marked_swiped() {
 
 #[test]
 fn nothing_readable_after_a_swipe_is_no_grid_not_still_moving() {
-    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into() })]);
+    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into(), run_id: None })]);
     let (s, _) = run(&mut d, 10, false);
     assert_eq!(s.stop, Stop::NoGrid("结果页".into()));
     assert_eq!(s.steps, 1);
@@ -1401,7 +1401,7 @@ fn dco_says_changed_but_board_is_identical_is_no_change() {
 
 #[test]
 fn dco_changed_then_unreadable_board_is_no_grid() {
-    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into() })]);
+    let mut d = Fake::new(vec![Ok(grid(A)), Err(DcoError { code: "not_a_grid".into(), message: "结果页".into(), run_id: None })]);
     d.settles.push_back(settled(true));
     let (s, _) = run(&mut d, 5, false);
     assert_eq!(s.stop, Stop::NoGrid("结果页".into()));

@@ -9,6 +9,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 base64 = "0.22"
+dct-dco = { path = "../dct-dco" }
 
 [dev-dependencies]
 tempfile = "3"
+dct-dco = { path = "../dct-dco", features = ["fake"] }

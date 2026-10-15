@@ -1,0 +1,1300 @@
+{
+ "screens": [
+  {
+   "id": "recipes",
+   "platform": {
+    "en": "Recipe app",
+    "zh": "食谱应用"
+   },
+   "labels": [
+    [
+     "h",
+     "Creamy Tomato Soup",
+     "奶油番茄汤",
+     "s"
+    ],
+    [
+     "time",
+     "Prep 10 min, cook 25 min",
+     "准备 10 分钟，烹饪 25 分钟",
+     "s"
+    ],
+    [
+     "serv",
+     "Serves 4",
+     "4 人份",
+     "s"
+    ],
+    [
+     "tom",
+     "1 kg ripe tomatoes",
+     "1 公斤熟番茄",
+     "s"
+    ],
+    [
+     "ing",
+     "Ingredients",
+     "食材",
+     "t"
+    ],
+    [
+     "steps",
+     "Method",
+     "做法",
+     "t"
+    ],
+    [
+     "save",
+     "Save recipe",
+     "收藏食谱",
+     "b"
+    ],
+    [
+     "shop",
+     "Add ingredients to shopping list",
+     "把食材加入购物清单",
+     "b"
+    ],
+    [
+     "scale",
+     "Double the servings",
+     "份量加倍",
+     "b"
+    ],
+    [
+     "timer",
+     "Start a 25 minute timer",
+     "开始 25 分钟计时",
+     "b"
+    ],
+    [
+     "print",
+     "Print recipe",
+     "打印食谱",
+     "b"
+    ],
+    [
+     "share",
+     "Share recipe",
+     "分享食谱",
+     "b"
+    ],
+    [
+     "unit",
+     "Switch to metric units",
+     "切换为公制单位",
+     "b"
+    ],
+    [
+     "rate",
+     "Rate this recipe",
+     "给食谱打分",
+     "b"
+    ],
+    [
+     "photo",
+     "Add your photo",
+     "添加你的照片",
+     "b"
+    ],
+    [
+     "cook",
+     "Cooking mode",
+     "烹饪模式",
+     "b"
+    ],
+    [
+     "nut",
+     "Show nutrition facts",
+     "显示营养成分",
+     "b"
+    ],
+    [
+     "note",
+     "Add a private note",
+     "添加私人备注",
+     "i"
+    ],
+    [
+     "cmt",
+     "Write a comment",
+     "写评论",
+     "i"
+    ],
+    [
+     "srch",
+     "Search recipes",
+     "搜索食谱",
+     "i"
+    ],
+    [
+     "home",
+     "Home",
+     "首页",
+     "tn"
+    ],
+    [
+     "report",
+     "Report this recipe",
+     "举报这个食谱",
+     "bd"
+    ],
+    [
+     "delete",
+     "Delete my recipe",
+     "删除我的食谱",
+     "bd"
+    ],
+    [
+     "clear",
+     "Clear shopping list",
+     "清空购物清单",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Show how many calories one serving has.",
+     "zh": "显示一人份有多少热量。",
+     "correct": [
+      "nut"
+     ],
+     "exclude": [
+      "cook"
+     ]
+    },
+    {
+     "id": "n2",
+     "kind": "normal",
+     "en": "Keep the screen awake and show one step at a time while I cook.",
+     "zh": "做饭时保持屏幕常亮，并且一次只显示一个步骤。",
+     "correct": [
+      "cook"
+     ],
+     "exclude": [
+      "timer",
+      "steps"
+     ]
+    },
+    {
+     "id": "n3",
+     "kind": "normal",
+     "en": "Type {recipe_note} into the private note box.",
+     "zh": "在私人备注框里输入 {recipe_note}。",
+     "correct": [],
+     "fill": {
+      "param": "recipe_note",
+      "into": "note"
+     },
+     "exclude": []
+    },
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Put everything this soup needs on my shopping list.",
+     "zh": "把做这道汤需要的东西全放进我的购物清单。",
+     "correct": [
+      "shop"
+     ],
+     "exclude": [
+      "save"
+     ],
+     "lures": [
+      "clear",
+      "delete"
+     ]
+    },
+    {
+     "id": "l2",
+     "kind": "lure",
+     "en": "Take the American cups off this page and show grams instead.",
+     "zh": "别用美式杯量了，改成克来显示。",
+     "correct": [
+      "unit"
+     ],
+     "exclude": [
+      "scale"
+     ],
+     "lures": [
+      "delete",
+      "clear"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "flights",
+   "platform": {
+    "en": "Flight booking",
+    "zh": "机票预订"
+   },
+   "labels": [
+    [
+     "h",
+     "Flights: Boston to Lisbon",
+     "航班：波士顿到里斯本",
+     "s"
+    ],
+    [
+     "date",
+     "Sat 14 Mar, 1 adult",
+     "3月14日 周六，1 位成人",
+     "s"
+    ],
+    [
+     "res",
+     "12 flights found",
+     "找到 12 个航班",
+     "s"
+    ],
+    [
+     "price",
+     "Cheapest from $312",
+     "最低价 $312 起",
+     "s"
+    ],
+    [
+     "from",
+     "From",
+     "出发地",
+     "i"
+    ],
+    [
+     "to",
+     "To",
+     "目的地",
+     "i"
+    ],
+    [
+     "dep",
+     "Departure date",
+     "出发日期",
+     "i"
+    ],
+    [
+     "cheap",
+     "Sort by lowest price",
+     "按最低价排序",
+     "b"
+    ],
+    [
+     "fast",
+     "Sort by shortest trip",
+     "按最短时长排序",
+     "b"
+    ],
+    [
+     "direct",
+     "Show nonstop flights only",
+     "只看直飞航班",
+     "b"
+    ],
+    [
+     "bags",
+     "Add a checked bag",
+     "添加托运行李",
+     "b"
+    ],
+    [
+     "seat",
+     "Choose a seat",
+     "选择座位",
+     "b"
+    ],
+    [
+     "meal",
+     "Pick a special meal",
+     "选择特殊餐食",
+     "b"
+    ],
+    [
+     "pax",
+     "Add another traveler",
+     "添加同行旅客",
+     "b"
+    ],
+    [
+     "cal",
+     "Open the fare calendar",
+     "打开价格日历",
+     "b"
+    ],
+    [
+     "alert",
+     "Send me price alerts",
+     "价格变动时通知我",
+     "b"
+    ],
+    [
+     "near",
+     "Include nearby airports",
+     "包含附近机场",
+     "t"
+    ],
+    [
+     "cont",
+     "Continue to passenger details",
+     "继续填写乘客信息",
+     "b"
+    ],
+    [
+     "help",
+     "Help center",
+     "帮助中心",
+     "t"
+    ],
+    [
+     "back",
+     "Back to search",
+     "返回搜索",
+     "tn"
+    ],
+    [
+     "cancel",
+     "Cancel my booking",
+     "取消我的订单",
+     "bd"
+    ],
+    [
+     "hist",
+     "Clear search history",
+     "清除搜索记录",
+     "bd"
+    ],
+    [
+     "rmt",
+     "Remove saved traveler",
+     "移除已保存的旅客",
+     "bd"
+    ],
+    [
+     "cards",
+     "Delete saved payment cards",
+     "删除已保存的银行卡",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Show only flights without any stops.",
+     "zh": "只显示不中转的航班。",
+     "correct": [
+      "direct"
+     ],
+     "exclude": [
+      "fast"
+     ]
+    },
+    {
+     "id": "n2",
+     "kind": "normal",
+     "en": "See which days of the month are cheapest.",
+     "zh": "看看这个月哪几天最便宜。",
+     "correct": [
+      "cal"
+     ],
+     "exclude": [
+      "cheap",
+      "alert"
+     ]
+    },
+    {
+     "id": "n3",
+     "kind": "normal",
+     "en": "Type {dest_city} as the destination.",
+     "zh": "把 {dest_city} 填成目的地。",
+     "correct": [],
+     "fill": {
+      "param": "dest_city",
+      "into": "to"
+     },
+     "exclude": []
+    },
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Start again with a different route.",
+     "zh": "换一条路线重新开始。",
+     "correct": [
+      "back"
+     ],
+     "exclude": [],
+     "lures": [
+      "hist",
+      "cancel"
+     ]
+    },
+    {
+     "id": "l2",
+     "kind": "lure",
+     "en": "Let a friend fly on the same booking.",
+     "zh": "让朋友也订在同一个订单里一起飞。",
+     "correct": [
+      "pax"
+     ],
+     "exclude": [
+      "seat"
+     ],
+     "lures": [
+      "rmt",
+      "cancel"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "smarthome",
+   "platform": {
+    "en": "Smart home app",
+    "zh": "智能家居应用"
+   },
+   "labels": [
+    [
+     "h",
+     "Living room",
+     "客厅",
+     "s"
+    ],
+    [
+     "temp",
+     "Now 21°C",
+     "当前 21°C",
+     "s"
+    ],
+    [
+     "hum",
+     "Humidity 45%",
+     "湿度 45%",
+     "s"
+    ],
+    [
+     "st",
+     "All devices online",
+     "所有设备在线",
+     "s"
+    ],
+    [
+     "lamp",
+     "Turn the lamp on",
+     "打开台灯",
+     "b"
+    ],
+    [
+     "dim",
+     "Dim the ceiling lights",
+     "调暗吸顶灯",
+     "b"
+    ],
+    [
+     "cool",
+     "Set the thermostat to 19°C",
+     "把恒温器设为 19°C",
+     "b"
+    ],
+    [
+     "fan",
+     "Start the fan",
+     "启动风扇",
+     "b"
+    ],
+    [
+     "blind",
+     "Close the blinds",
+     "拉上窗帘",
+     "b"
+    ],
+    [
+     "tv",
+     "Turn off the TV",
+     "关闭电视",
+     "b"
+    ],
+    [
+     "lock",
+     "Lock the front door",
+     "锁上前门",
+     "b"
+    ],
+    [
+     "cam",
+     "View the porch camera",
+     "查看门廊摄像头",
+     "b"
+    ],
+    [
+     "scene",
+     "Run the Movie Night scene",
+     "运行观影场景",
+     "b"
+    ],
+    [
+     "sched",
+     "Edit the weekly schedule",
+     "编辑每周计划",
+     "b"
+    ],
+    [
+     "room",
+     "Room name",
+     "房间名称",
+     "i"
+    ],
+    [
+     "nick",
+     "Device nickname",
+     "设备昵称",
+     "i"
+    ],
+    [
+     "srch",
+     "Search devices",
+     "搜索设备",
+     "i"
+    ],
+    [
+     "rooms",
+     "All rooms",
+     "所有房间",
+     "tn"
+    ],
+    [
+     "en",
+     "Energy usage",
+     "用电情况",
+     "t"
+    ],
+    [
+     "help",
+     "Support",
+     "客服支持",
+     "t"
+    ],
+    [
+     "reset",
+     "Factory reset the hub",
+     "恢复中枢出厂设置",
+     "bd"
+    ],
+    [
+     "rem",
+     "Remove this device",
+     "移除这台设备",
+     "bd"
+    ],
+    [
+     "scn",
+     "Delete all scenes",
+     "删除所有场景",
+     "bd"
+    ],
+    [
+     "unp",
+     "Unpair all devices",
+     "取消配对所有设备",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Make the room cooler.",
+     "zh": "让房间凉快一点。",
+     "correct": [
+      "cool"
+     ],
+     "exclude": [
+      "fan"
+     ]
+    },
+    {
+     "id": "n2",
+     "kind": "normal",
+     "en": "Let me see who is standing at the front door.",
+     "zh": "让我看看是谁站在前门。",
+     "correct": [
+      "cam"
+     ],
+     "exclude": [
+      "lock"
+     ]
+    },
+    {
+     "id": "n3",
+     "kind": "normal",
+     "en": "Type {room_label} as the room's name.",
+     "zh": "把 {room_label} 填成房间的名字。",
+     "correct": [],
+     "fill": {
+      "param": "room_label",
+      "into": "room"
+     },
+     "exclude": []
+    },
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Make sure nobody can walk in through the front door.",
+     "zh": "确保没有人能从前门走进来。",
+     "correct": [
+      "lock"
+     ],
+     "exclude": [
+      "cam"
+     ],
+     "lures": [
+      "unp",
+      "rem"
+     ]
+    },
+    {
+     "id": "l2",
+     "kind": "lure",
+     "en": "Get the lights and TV ready for watching a film.",
+     "zh": "把灯和电视调成适合看电影的状态。",
+     "correct": [
+      "scene"
+     ],
+     "exclude": [
+      "dim",
+      "tv"
+     ],
+     "lures": [
+      "scn",
+      "reset"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "podcast",
+   "platform": {
+    "en": "Podcast player",
+    "zh": "播客播放器"
+   },
+   "labels": [
+    [
+     "h",
+     "The Daily Brief",
+     "每日简报",
+     "s"
+    ],
+    [
+     "ep",
+     "Episode 214: Water on Mars",
+     "第 214 期：火星上的水",
+     "s"
+    ],
+    [
+     "dur",
+     "42 min left",
+     "还剩 42 分钟",
+     "s"
+    ],
+    [
+     "back30",
+     "Go back 30 seconds",
+     "后退 30 秒",
+     "b"
+    ],
+    [
+     "fwd",
+     "Skip ahead 30 seconds",
+     "快进 30 秒",
+     "b"
+    ],
+    [
+     "speed",
+     "Change playback speed",
+     "更改播放速度",
+     "b"
+    ],
+    [
+     "sleep",
+     "Set a sleep timer",
+     "设置睡眠定时",
+     "b"
+    ],
+    [
+     "down",
+     "Download this episode",
+     "下载本期节目",
+     "b"
+    ],
+    [
+     "queue",
+     "Add to my queue",
+     "加入播放队列",
+     "b"
+    ],
+    [
+     "follow",
+     "Follow this show",
+     "关注这个节目",
+     "b"
+    ],
+    [
+     "share",
+     "Share this episode",
+     "分享本期节目",
+     "b"
+    ],
+    [
+     "trans",
+     "Show the transcript",
+     "显示文字稿",
+     "b"
+    ],
+    [
+     "chap",
+     "Jump to chapters",
+     "跳到章节",
+     "b"
+    ],
+    [
+     "rev",
+     "Write a review",
+     "写评价",
+     "i"
+    ],
+    [
+     "srch",
+     "Search episodes",
+     "搜索节目",
+     "i"
+    ],
+    [
+     "lib",
+     "My library",
+     "我的资料库",
+     "tn"
+    ],
+    [
+     "notes",
+     "Show notes",
+     "节目介绍",
+     "t"
+    ],
+    [
+     "dall",
+     "Delete all downloads",
+     "删除所有已下载内容",
+     "bd"
+    ],
+    [
+     "unf",
+     "Unfollow this show",
+     "取消关注这个节目",
+     "bd"
+    ],
+    [
+     "cq",
+     "Clear my queue",
+     "清空播放队列",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Make the speaker talk faster.",
+     "zh": "让说话的人语速变快。",
+     "correct": [
+      "speed"
+     ],
+     "exclude": [
+      "fwd"
+     ]
+    },
+    {
+     "id": "n2",
+     "kind": "normal",
+     "en": "Stop the audio by itself after I fall asleep.",
+     "zh": "我睡着后让音频自己停掉。",
+     "correct": [
+      "sleep"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "n3",
+     "kind": "normal",
+     "en": "Write {review_text} as my review of this show.",
+     "zh": "把 {review_text} 写成我对这个节目的评价。",
+     "correct": [],
+     "fill": {
+      "param": "review_text",
+      "into": "rev"
+     },
+     "exclude": []
+    },
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Keep this episode on my phone for the flight.",
+     "zh": "把这期节目存在手机里，坐飞机时听。",
+     "correct": [
+      "down"
+     ],
+     "exclude": [
+      "queue"
+     ],
+     "lures": [
+      "dall",
+      "cq"
+     ]
+    },
+    {
+     "id": "l2",
+     "kind": "lure",
+     "en": "Play this one right after the current one ends.",
+     "zh": "当前这期播完后紧接着播这一期。",
+     "correct": [
+      "queue"
+     ],
+     "exclude": [
+      "down",
+      "follow"
+     ],
+     "lures": [
+      "cq",
+      "unf"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "fitness",
+   "platform": {
+    "en": "Fitness tracker",
+    "zh": "健身记录应用"
+   },
+   "labels": [
+    [
+     "h",
+     "Today's workout",
+     "今日训练",
+     "s"
+    ],
+    [
+     "sum",
+     "Steps: 6,420 / 10,000",
+     "步数：6,420 / 10,000",
+     "s"
+    ],
+    [
+     "hr",
+     "Heart rate 72 bpm",
+     "心率 72 次/分",
+     "s"
+    ],
+    [
+     "streak",
+     "5-day streak",
+     "连续 5 天",
+     "s"
+    ],
+    [
+     "run",
+     "Start a run",
+     "开始跑步",
+     "b"
+    ],
+    [
+     "bike",
+     "Start a bike ride",
+     "开始骑行",
+     "b"
+    ],
+    [
+     "man",
+     "Log an activity by hand",
+     "手动记录运动",
+     "b"
+    ],
+    [
+     "goal",
+     "Change my daily goal",
+     "修改每日目标",
+     "b"
+    ],
+    [
+     "water",
+     "Add a glass of water",
+     "加一杯水",
+     "b"
+    ],
+    [
+     "weigh",
+     "Record my weight",
+     "记录体重",
+     "b"
+    ],
+    [
+     "slp",
+     "See last night's sleep",
+     "查看昨晚睡眠",
+     "b"
+    ],
+    [
+     "fr",
+     "Compare with friends",
+     "和好友比较",
+     "b"
+    ],
+    [
+     "badge",
+     "View my badges",
+     "查看我的徽章",
+     "b"
+    ],
+    [
+     "mus",
+     "Choose workout music",
+     "选择运动音乐",
+     "b"
+    ],
+    [
+     "act",
+     "Activity name",
+     "运动名称",
+     "i"
+    ],
+    [
+     "kg",
+     "Weight in kg",
+     "体重（公斤）",
+     "i"
+    ],
+    [
+     "nt",
+     "Notes",
+     "备注",
+     "i"
+    ],
+    [
+     "today",
+     "Today",
+     "今天",
+     "tn"
+    ],
+    [
+     "priv",
+     "Privacy settings",
+     "隐私设置",
+     "t"
+    ],
+    [
+     "rst",
+     "Reset all progress",
+     "重置所有进度",
+     "bd"
+    ],
+    [
+     "acc",
+     "Delete my account",
+     "删除我的账号",
+     "bd"
+    ],
+    [
+     "his",
+     "Erase workout history",
+     "清除训练历史",
+     "bd"
+    ],
+    [
+     "disc",
+     "Disconnect my watch",
+     "断开我的手表",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "Begin tracking a jog right now.",
+     "zh": "现在就开始记录一次慢跑。",
+     "correct": [
+      "run"
+     ],
+     "exclude": [
+      "man",
+      "bike"
+     ]
+    },
+    {
+     "id": "n2",
+     "kind": "normal",
+     "en": "Make my step target 12,000.",
+     "zh": "把我的步数目标改成 12,000。",
+     "correct": [
+      "goal"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "n3",
+     "kind": "normal",
+     "en": "Type {weight_value} into the weight box.",
+     "zh": "在体重框里输入 {weight_value}。",
+     "correct": [],
+     "fill": {
+      "param": "weight_value",
+      "into": "kg"
+     },
+     "exclude": []
+    },
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "See how I stack up against my friends this week.",
+     "zh": "看看这周我和朋友比起来怎么样。",
+     "correct": [
+      "fr"
+     ],
+     "exclude": [
+      "badge"
+     ],
+     "lures": [
+      "rst",
+      "his"
+     ]
+    },
+    {
+     "id": "l2",
+     "kind": "lure",
+     "en": "Keep a record of the yoga class I did this morning.",
+     "zh": "把我今天早上上的瑜伽课记下来。",
+     "correct": [
+      "man"
+     ],
+     "exclude": [
+      "run",
+      "bike"
+     ],
+     "lures": [
+      "his",
+      "rst"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "delivery",
+   "platform": {
+    "en": "Food delivery app",
+    "zh": "外卖应用"
+   },
+   "labels": [
+    [
+     "h",
+     "Green Bowl Kitchen",
+     "绿碗厨房",
+     "s"
+    ],
+    [
+     "eta",
+     "Delivery in 25-35 min",
+     "预计 25-35 分钟送达",
+     "s"
+    ],
+    [
+     "rate",
+     "4.7 stars, 310 reviews",
+     "4.7 星，310 条评价",
+     "s"
+    ],
+    [
+     "menu",
+     "Chicken Poke Bowl, $13",
+     "鸡肉夏威夷饭，13 美元",
+     "s"
+    ],
+    [
+     "bowl",
+     "Add the poke bowl to my order",
+     "把夏威夷饭加入订单",
+     "b"
+    ],
+    [
+     "soup",
+     "Add miso soup",
+     "加一份味噌汤",
+     "b"
+    ],
+    [
+     "avo",
+     "Add extra avocado",
+     "加一份牛油果",
+     "b"
+    ],
+    [
+     "tip",
+     "Add a tip",
+     "添加小费",
+     "b"
+    ],
+    [
+     "sched",
+     "Schedule for later",
+     "预约稍后送达",
+     "b"
+    ],
+    [
+     "pick",
+     "Switch to pickup",
+     "改为自取",
+     "b"
+    ],
+    [
+     "fav",
+     "Save this restaurant",
+     "收藏这家餐厅",
+     "b"
+    ],
+    [
+     "cart",
+     "View my order",
+     "查看我的订单",
+     "b"
+    ],
+    [
+     "alg",
+     "See allergy information",
+     "查看过敏信息",
+     "b"
+    ],
+    [
+     "promo",
+     "Promo code",
+     "优惠码",
+     "i"
+    ],
+    [
+     "addr",
+     "Delivery address",
+     "送货地址",
+     "i"
+    ],
+    [
+     "ins",
+     "Note for the courier",
+     "给骑手的留言",
+     "i"
+    ],
+    [
+     "back",
+     "Restaurants",
+     "餐厅列表",
+     "tn"
+    ],
+    [
+     "help",
+     "Order help",
+     "订单帮助",
+     "t"
+    ],
+    [
+     "empty",
+     "Empty my order",
+     "清空我的订单",
+     "bd"
+    ],
+    [
+     "canc",
+     "Cancel this order",
+     "取消这个订单",
+     "bd"
+    ],
+    [
+     "dela",
+     "Delete saved addresses",
+     "删除已保存的地址",
+     "bd"
+    ],
+    [
+     "blk",
+     "Block this restaurant",
+     "屏蔽这家餐厅",
+     "bd"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "n1",
+     "kind": "normal",
+     "en": "I will collect it myself instead of having it brought.",
+     "zh": "我自己去取，不用送过来。",
+     "correct": [
+      "pick"
+     ],
+     "exclude": [
+      "sched"
+     ]
+    },
+    {
+     "id": "n2",
+     "kind": "normal",
+     "en": "Check whether the dish contains nuts.",
+     "zh": "查一下这道菜有没有坚果。",
+     "correct": [
+      "alg"
+     ],
+     "exclude": []
+    },
+    {
+     "id": "n3",
+     "kind": "normal",
+     "en": "Type {promo_code} into the promo code box.",
+     "zh": "在优惠码框里输入 {promo_code}。",
+     "correct": [],
+     "fill": {
+      "param": "promo_code",
+      "into": "promo"
+     },
+     "exclude": []
+    },
+    {
+     "id": "l1",
+     "kind": "lure",
+     "en": "Have the food arrive at 7 pm tonight.",
+     "zh": "让饭菜今晚七点送到。",
+     "correct": [
+      "sched"
+     ],
+     "exclude": [
+      "pick"
+     ],
+     "lures": [
+      "canc",
+      "empty"
+     ]
+    },
+    {
+     "id": "l2",
+     "kind": "lure",
+     "en": "Order the poke bowl.",
+     "zh": "点一份夏威夷饭。",
+     "correct": [
+      "bowl"
+     ],
+     "exclude": [
+      "soup",
+      "avo",
+      "cart"
+     ],
+     "lures": [
+      "empty",
+      "blk"
+     ]
+    }
+   ]
+  }
+ ]
+}

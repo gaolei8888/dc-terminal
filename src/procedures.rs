@@ -21,6 +21,56 @@ pub trait Dcv {
     /// `body_sha256` 是 show 时看到的版本：dcv 会拒绝确认一个已经被改过的文件。
     /// 返回 dcv 记下的 `approved_body`。
     fn approve(&self, full_name: &str, body_sha256: &str) -> Result<String>;
+    /// 永远带 --source import:agent --json。Err 里是 dcv 的拒收原文。
+    fn add(&self, r: &AddReq) -> Result<serde_json::Value>;
+    /// dcv vocab --json
+    fn vocab(&self) -> Result<serde_json::Value>;
+    /// dcv popups --app <app> --json：已生效的规则（dco 要的 {when, tap} 形状）。
+    fn popups(&self, app: &str) -> Result<Vec<serde_json::Value>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AddKind {
+    Procedure,
+    Popup,
+}
+
+pub struct AddReq<'a> {
+    pub kind: AddKind,
+    pub vault: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub params: &'a [String],
+    pub platform: Option<&'a str>,
+    pub learned_from: &'a str,
+    pub draft_of: Option<&'a str>,
+    pub body: &'a str,
+}
+
+/// `dcv add` 的参数。来源写死 `import:agent`（dcv 默认是 manual，不带就成了「你自己写的」）。
+pub fn add_args(r: &AddReq) -> Vec<String> {
+    let kind = match r.kind {
+        AddKind::Procedure => "procedure",
+        AddKind::Popup => "popup",
+    };
+    let mut a: Vec<String> = ["add", "--kind", kind, "--vault", r.vault, "--name", r.name]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    a.extend(["--description".into(), r.description.into()]);
+    a.extend(["--source".into(), "import:agent".into()]);
+    a.extend(["--learned-from".into(), r.learned_from.into()]);
+    if !r.params.is_empty() {
+        a.extend(["--params".into(), r.params.join(",")]);
+    }
+    if let Some(p) = r.platform {
+        a.extend(["--platform".into(), p.into()]);
+    }
+    if let Some(d) = r.draft_of {
+        a.extend(["--draft-of".into(), d.into()]);
+    }
+    a.extend(["--body".into(), r.body.into(), "--json".into()]);
+    a
 }
 
 pub struct RealDcv;
@@ -48,6 +98,18 @@ impl Dcv for RealDcv {
     fn approve(&self, full_name: &str, body_sha256: &str) -> Result<String> {
         let v = run_dcv(&["approve", full_name, "--sha", body_sha256, "--json"])?;
         v["approved_body"].as_str().map(String::from).ok_or_else(|| anyhow!("dcv 没有回 approved_body"))
+    }
+    fn add(&self, r: &AddReq) -> Result<serde_json::Value> {
+        let args = add_args(r);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_dcv(&refs)
+    }
+    fn vocab(&self) -> Result<serde_json::Value> {
+        run_dcv(&["vocab", "--json"])
+    }
+    fn popups(&self, app: &str) -> Result<Vec<serde_json::Value>> {
+        let v = run_dcv(&["popups", "--app", app, "--json"])?;
+        Ok(v["popups"].as_array().cloned().unwrap_or_default())
     }
 }
 
@@ -250,7 +312,26 @@ pub fn approve(
     overrides: &[(u32, Tier)],
     now: u64,
 ) -> Result<SignedApproval> {
+    approve_inner(dcv, keys, se, approvals, full_name, overrides, now, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approve_inner(
+    dcv: &dyn Dcv,
+    keys: &KeyStore,
+    se: &dyn SecureEnclave,
+    approvals: &Approvals,
+    full_name: &str,
+    overrides: &[(u32, Tier)],
+    now: u64,
+    expected_body_sha256: Option<&str>,
+) -> Result<SignedApproval> {
     let shown = Shown::parse(full_name, &dcv.show(full_name).with_context(|| format!("读流程 {full_name} 失败"))?)?;
+    if let Some(want) = expected_body_sha256 {
+        if shown.body_sha256 != want {
+            bail!("dcv 里的 {full_name} 和给你看的那一版不一样（看到的是 {want}，dcv 现在是 {}），这次不批准，请重新看一遍", shown.body_sha256);
+        }
+    }
     let steps_sha = steps_sha256(&shown.params, &shown.steps);
     let proposed: Vec<Tier> = shown.steps.iter().map(|s| tier_for_step(&s.action, &s.arg)).collect();
     let mut tiers = proposed.clone();
@@ -289,6 +370,32 @@ pub fn approve(
     }
     approvals.save(&signed)?;
     Ok(signed)
+}
+
+/// 同 `approve`，另外要求 dcv 现在给的正文指纹就是 `expected_body_sha256`（用户在确认卡片上
+/// 看到的那一版）：对不上就在按指纹之前拒绝，什么都不签、不写。之后 dcv approve 带的也是这个
+/// 指纹，dcv 在锁里再核一遍，所以按下去的指纹只落在用户看过的那一版上。
+#[allow(clippy::too_many_arguments)]
+pub fn approve_expecting(
+    dcv: &dyn Dcv,
+    keys: &KeyStore,
+    se: &dyn SecureEnclave,
+    approvals: &Approvals,
+    full_name: &str,
+    overrides: &[(u32, Tier)],
+    now: u64,
+    expected_body_sha256: &str,
+) -> Result<SignedApproval> {
+    approve_inner(
+        dcv,
+        keys,
+        se,
+        approvals,
+        full_name,
+        overrides,
+        now,
+        Some(expected_body_sha256),
+    )
 }
 
 fn random_nonce() -> Result<String> {
@@ -517,6 +624,76 @@ mod tests {
             *self.approve_sha.borrow_mut() = body_sha256.to_string();
             Ok(self.approved_body.borrow().clone())
         }
+        fn add(&self, _: &AddReq) -> Result<serde_json::Value> {
+            bail!("测试里不写 dcv")
+        }
+        fn vocab(&self) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+        fn popups(&self, _: &str) -> Result<Vec<serde_json::Value>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn add_args_always_carry_import_agent_and_json() {
+        let params = vec!["a".to_string(), "b".to_string()];
+        let r = AddReq {
+            kind: AddKind::Procedure,
+            vault: "v",
+            name: "n",
+            description: "d",
+            params: &params,
+            platform: Some("x"),
+            learned_from: "run:1",
+            draft_of: Some("old"),
+            body: "1. open_app: X",
+        };
+        let a = add_args(&r);
+        let at = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].clone();
+        assert_eq!(a[0], "add");
+        assert_eq!(at("--kind"), "procedure");
+        assert_eq!(at("--source"), "import:agent");
+        assert_eq!(at("--learned-from"), "run:1");
+        assert_eq!(at("--params"), "a,b");
+        assert_eq!(at("--platform"), "x");
+        assert_eq!(at("--draft-of"), "old");
+        assert_eq!(a.last().unwrap(), "--json");
+        let p = AddReq { kind: AddKind::Popup, params: &[], platform: None, draft_of: None, ..r };
+        let a = add_args(&p);
+        assert_eq!(a[a.iter().position(|x| x == "--kind").unwrap() + 1], "popup");
+        assert!(!a.contains(&"--params".to_string()) && !a.contains(&"--draft-of".to_string()));
+        assert!(a.windows(2).any(|w| w == ["--source", "import:agent"]));
+    }
+
+    /// 真 dcv 格式回归：需要本机装了带 `learned_from: run:<id>` 支持的 dcv（V1）。
+    /// 用临时 DC_VAULT 和 HOME，碰不到真库。运行：cargo test -- --ignored real_dcv
+    #[test]
+    #[ignore]
+    fn real_dcv_accepts_the_x_body_from_the_drafter() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("DC_VAULT", d.path().join("vault"));
+        std::env::set_var("HOME", &home);
+        let made = std::process::Command::new("dcv").args(["vault", "new", "social-global"]).output().unwrap();
+        assert!(made.status.success(), "临时库建不起来");
+        // 正文用 D11 生成的形状手写一份（完整轨迹的生成在 dct-explore 的测试里覆盖）。
+        let body = "1. open_url: https://x.com/compose/post\n2. verify_text: Home\n3. tap_by_intent: Post\n   完成标志: verify_text 「Your post was sent」\n";
+        let params: Vec<String> = vec![];
+        let r = AddReq {
+            kind: AddKind::Procedure,
+            vault: "social-global",
+            name: "promote-x-post",
+            description: "测试",
+            params: &params,
+            platform: Some("x"),
+            learned_from: "run:x-20261011-1a2b",
+            draft_of: None,
+            body,
+        };
+        let v = RealDcv.add(&r).expect("dcv 应当收下");
+        assert_eq!(v["ok"], json!(true));
     }
 
     fn edit_bio(executable: bool) -> serde_json::Value {
@@ -585,6 +762,38 @@ mod tests {
         let reasons = w.se.reasons.borrow();
         assert!(reasons[0].contains("social:edit-bio") && reasons[0].contains("保存"), "{reasons:?}");
         assert!(w.approvals.load("social:edit-bio", STEPS_A).unwrap().is_some());
+    }
+
+    #[test]
+    fn approving_a_body_other_than_the_one_shown_is_refused_before_touch_id() {
+        let w = world();
+        let wrong = format!("sha256:{}", "cd".repeat(32));
+        assert!(approve_expecting(
+            &w.dcv,
+            &w.keys,
+            &w.se,
+            &w.approvals,
+            "social:edit-bio",
+            &[],
+            1000,
+            &wrong
+        )
+        .is_err());
+        assert!(w.se.reasons.borrow().is_empty(), "对不上就不弹指纹");
+        assert_eq!(w.dcv.approve_calls.get(), 0);
+        let right = format!("sha256:{}", "ab".repeat(32));
+        approve_expecting(
+            &w.dcv,
+            &w.keys,
+            &w.se,
+            &w.approvals,
+            "social:edit-bio",
+            &[],
+            1000,
+            &right,
+        )
+        .unwrap();
+        assert_eq!(w.dcv.approve_calls.get(), 1);
     }
 
     #[test]

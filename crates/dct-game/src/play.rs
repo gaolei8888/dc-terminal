@@ -28,11 +28,7 @@ pub struct Profile {
     pub theme: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DcoError {
-    pub code: String,
-    pub message: String,
-}
+pub use dct_dco::DcoError;
 
 /// 一次 `see`（OCR）：画面上读到的字和它们的编号。`snapshot_id` 要原样交给 `tap`。
 #[derive(Clone, Debug)]
@@ -44,7 +40,7 @@ pub struct Seen {
 
 /// 划完之后让 dco 等屏幕稳定：连续安静这么久算稳定、最多等这么久（毫秒）。
 pub const SETTLE_QUIET_MS: u32 = 300;
-pub const SETTLE_TIMEOUT_MS: u32 = 8000;
+pub use dct_dco::SETTLE_TIMEOUT_MS;
 
 /// dco 替我们等屏幕稳定之后的报告。
 #[derive(Clone, Debug, PartialEq)]
@@ -97,7 +93,7 @@ pub struct TapSettleReq {
 pub const TAP_AT_MAX_AVOID: usize = 16;
 
 fn unsupported() -> DcoError {
-    DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+    DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into(), run_id: None }
 }
 
 /// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。

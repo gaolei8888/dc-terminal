@@ -1,0 +1,186 @@
+# dct 摸索用的平台表。是数据，不是代码：加平台只加一段。
+# 中文平台的登录闸文字和发布词都是未知的占位（publish_words 的 "发布" 只是凑数），
+# 全部标在 unverified 里，真机核对前不要当真。
+# unverified 里列的字段还没在真机上看过，第一次摸索时会核对（登录闸没在画面上出现就不出草稿）。
+# publish_words 没核实的平台：认不准哪个是发布按钮，摸索时每点一下都先问用户。
+
+[[platform]]
+name = "x"
+domain = "x.com"
+entry_url = "https://x.com/compose/post"
+browser = "Google Chrome"
+vault = "social-global"
+login_gate = "What's happening?"
+publish_words = ["Post"]
+publish_done = "Your post was sent"
+never_tap = ["Subscribe", "Get verified", "Premium", "Follow", "Boost", "promote", "关注", "订阅", "推广", "付费", "upgrade", "升级"]
+unverified = ["login_gate", "publish_done"]
+
+[[platform]]
+name = "tiktok"
+domain = "www.tiktok.com"
+entry_url = "https://www.tiktok.com/tiktokstudio/upload"
+browser = "Google Chrome"
+vault = "social-global"
+login_gate = "Select video"
+publish_words = ["Post", "Post now"]
+never_tap = ["Promote", "Follow", "Boost", "subscribe", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
+unverified = ["login_gate", "publish_done"]
+
+[[platform]]
+name = "youtube"
+domain = "www.youtube.com"
+entry_url = "https://www.youtube.com/upload"
+browser = "Google Chrome"
+vault = "social-global"
+login_gate = "Select files"
+publish_words = ["Publish", "Save"]
+never_tap = ["Subscribe", "Promote", "Join", "follow", "boost", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
+unverified = ["publish_done"]
+
+[[platform]]
+name = "facebook"
+domain = "www.facebook.com"
+entry_url = "https://www.facebook.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["Post"]
+never_tap = ["Boost post", "Boost", "Follow", "Promote", "subscribe", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_done"]
+
+[[platform]]
+name = "instagram"
+domain = "www.instagram.com"
+entry_url = "https://www.instagram.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["Share"]
+never_tap = ["Boost post", "Boost", "Follow", "subscribe", "promote", "关注", "订阅", "推广", "付费", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_done"]
+
+[[platform]]
+name = "xiaohongshu"
+domain = "creator.xiaohongshu.com"
+entry_url = "https://creator.xiaohongshu.com/publish/publish"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "薯条", "推广", "加热", "follow", "subscribe", "boost", "promote", "订阅", "付费", "get verified", "premium", "upgrade", "升级"]
+login_qr = true
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault"]
+
+# 微博；据说首页直接发，未核实；登录有时是扫码
+[[platform]]
+name = "weibo"
+domain = "weibo.com"
+entry_url = "https://weibo.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+login_qr = true
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# B站投稿；登录常是手机扫码
+[[platform]]
+name = "bilibili"
+domain = "member.bilibili.com"
+entry_url = "https://member.bilibili.com/platform/upload/video/frame"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+login_qr = true
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 知乎想法
+[[platform]]
+name = "zhihu"
+domain = "www.zhihu.com"
+entry_url = "https://www.zhihu.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 知乎专栏文章（一个域名一行，所以和想法分开）
+[[platform]]
+name = "zhihu_article"
+domain = "zhuanlan.zhihu.com"
+entry_url = "https://zhuanlan.zhihu.com/write"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 抖音创作者；登录常是手机扫码
+[[platform]]
+name = "douyin"
+domain = "creator.douyin.com"
+entry_url = "https://creator.douyin.com/creator-micro/content/upload"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+login_qr = true
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 快手创作者
+[[platform]]
+name = "kuaishou"
+domain = "cp.kuaishou.com"
+entry_url = "https://cp.kuaishou.com/article/publish/video"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 视频号；登录常是手机扫码
+[[platform]]
+name = "wechat_channels"
+domain = "channels.weixin.qq.com"
+entry_url = "https://channels.weixin.qq.com/platform/post/create"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+login_qr = true
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 头条 / 西瓜
+[[platform]]
+name = "toutiao"
+domain = "mp.toutiao.com"
+entry_url = "https://mp.toutiao.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 公众号；登录扫码；推广设计第 3 批说编辑器难驱动，最后发布由用户点（未在本机核实）
+[[platform]]
+name = "wechat_mp"
+domain = "mp.weixin.qq.com"
+entry_url = "https://mp.weixin.qq.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+login_qr = true
+publish_by_user_only = true
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]
+
+# 百家号
+[[platform]]
+name = "baijiahao"
+domain = "baijiahao.baidu.com"
+entry_url = "https://baijiahao.baidu.com/"
+browser = "Google Chrome"
+vault = "social-global"
+publish_words = ["发布"]
+never_tap = ["关注", "推广", "付费", "follow", "subscribe", "boost", "promote", "订阅", "get verified", "premium", "upgrade", "升级"]
+unverified = ["entry_url", "login_gate", "publish_words", "publish_done", "vault", "never_tap"]

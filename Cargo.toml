@@ -3,7 +3,7 @@
 # 的改动淹掉，而唯一的收获是目录看起来整齐。
 #
 [workspace]
-members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game"]
+members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game", "crates/dct-dco", "crates/dct-explore"]
 
 [package]
 name = "dct"
@@ -23,6 +23,10 @@ dct-brain = { path = "crates/dct-brain" }
 # 多机之间通过中转互相认识：机器 id、6 位核对码、机器钥匙、签过名的组名单。
 dct-mesh = { path = "crates/dct-mesh" }
 dct-game = { path = "crates/dct-game" }
+# 摸索 / 重放：对 dco 的强类型调用（Hands）和后面的摸索循环。
+dct-explore = { path = "crates/dct-explore" }
+# dct do 直接连 dco（DcoClient、RUN_TIMEOUT）。
+dct-dco = { path = "crates/dct-dco" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -56,6 +60,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 rqrr = "0.10.1"
 tempfile = "3"
 dct-brain = { path = "crates/dct-brain", features = ["soft-signer"] }
+dct-explore = { path = "crates/dct-explore", features = ["fake"] }
 
 # TLS 后端按平台分叉。
 #

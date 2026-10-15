@@ -578,7 +578,7 @@ mod unix_tests {
         }
         fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
             if self.private {
-                return Err(DcoError { code: "private_screen".into(), message: "私人".into() });
+                return Err(DcoError { code: "private_screen".into(), message: "私人".into(), run_id: None });
             }
             Ok(Seen { snapshot_id: "s".into(), observation_id: None, elements: vec![] })
         }
@@ -705,6 +705,6 @@ mod unix_tests {
             assert_eq!(stop_line(&s, 3).1, 0, "{s:?}");
         }
         assert!(stop_line(&SceneStop::NoTapAt, 0).0.contains("还不会按位置点"));
-        assert_eq!(stop_line(&SceneStop::Dco(DcoError { code: "halted".into(), message: "x".into() }), 0).1, 1);
+        assert_eq!(stop_line(&SceneStop::Dco(DcoError { code: "halted".into(), message: "x".into(), run_id: None }), 0).1, 1);
     }
 }

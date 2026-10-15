@@ -1,0 +1,297 @@
+{
+ "blockers": [
+  {
+   "id": "townhall",
+   "platform": {
+    "en": "Licensing office service",
+    "zh": "发证中心服务"
+   },
+   "why": "the step can only be done in person, and the page offers nothing that advances it",
+   "labels": [
+    [
+     "h",
+     "This must be done in person at the licensing office",
+     "这一步必须本人到发证中心办理",
+     "s"
+    ],
+    [
+     "q",
+     "Bring your original documents; copies are not accepted",
+     "请携带证件原件，不接受复印件",
+     "s"
+    ],
+    [
+     "o",
+     "Online and phone requests cannot be accepted",
+     "不受理线上和电话申请",
+     "s"
+    ],
+    [
+     "lg",
+     "Switch the language",
+     "切换语言",
+     "b"
+    ],
+    [
+     "ts",
+     "Increase the text size",
+     "增大字号",
+     "b"
+    ],
+    [
+     "ac",
+     "Show the accessibility options",
+     "显示无障碍选项",
+     "b"
+    ],
+    [
+     "dm",
+     "Turn on dark mode",
+     "开启深色模式",
+     "b"
+    ],
+    [
+     "av",
+     "Show the app version",
+     "显示应用版本",
+     "b"
+    ],
+    [
+     "kb",
+     "Show the keyboard shortcuts",
+     "显示键盘快捷键",
+     "b"
+    ],
+    [
+     "nw",
+     "Show the latest news",
+     "显示最新资讯",
+     "b"
+    ],
+    [
+     "ck",
+     "Show the cookie settings",
+     "显示 Cookie 设置",
+     "b"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "tu",
+     "Terms of use",
+     "使用条款",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Collect my new residence permit.",
+     "zh": "领取我的新居留许可证。"
+    },
+    {
+     "id": "b2",
+     "en": "Change the name on my driving licence.",
+     "zh": "更改我驾驶证上的姓名。"
+    }
+   ]
+  },
+  {
+   "id": "licence",
+   "platform": {
+    "en": "Feature not available",
+    "zh": "功能不可用"
+   },
+   "why": "only the school administrator can add the feature; nothing on the page buys or requests it",
+   "labels": [
+    [
+     "h",
+     "This feature is not included in your school's licence",
+     "你们学校的授权不包含这个功能",
+     "s"
+    ],
+    [
+     "q",
+     "Only your school administrator can add it",
+     "只有学校管理员才能添加",
+     "s"
+    ],
+    [
+     "c",
+     "Your account type: student",
+     "你的账号类型：学生",
+     "s"
+    ],
+    [
+     "lg",
+     "Switch the language",
+     "切换语言",
+     "b"
+    ],
+    [
+     "ts",
+     "Increase the text size",
+     "增大字号",
+     "b"
+    ],
+    [
+     "hc",
+     "Turn on high contrast",
+     "开启高对比度",
+     "b"
+    ],
+    [
+     "sh",
+     "Show the keyboard shortcuts",
+     "显示键盘快捷键",
+     "b"
+    ],
+    [
+     "av",
+     "Show the app version",
+     "显示应用版本",
+     "b"
+    ],
+    [
+     "wn",
+     "Show what is new in this version",
+     "显示此版本的新内容",
+     "b"
+    ],
+    [
+     "rt",
+     "Rate this app",
+     "给这个应用评分",
+     "b"
+    ],
+    [
+     "ck",
+     "Show the cookie settings",
+     "显示 Cookie 设置",
+     "b"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "tu",
+     "Terms of use",
+     "使用条款",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Add a collaborator to my project.",
+     "zh": "给我的项目添加一位协作者。"
+    },
+    {
+     "id": "b2",
+     "en": "Export my notes as a PDF.",
+     "zh": "把我的笔记导出为 PDF。"
+    },
+    {
+     "id": "b3",
+     "en": "Turn on version history.",
+     "zh": "开启版本历史。"
+    }
+   ]
+  },
+  {
+   "id": "outofservice",
+   "platform": {
+    "en": "Ticket machine",
+    "zh": "售票机"
+   },
+   "why": "the machine is out of service; waiting does not help and nothing on it can complete the task",
+   "labels": [
+    [
+     "h",
+     "This ticket machine is out of service",
+     "这台售票机暂停服务",
+     "s"
+    ],
+    [
+     "q",
+     "Please use another machine or the staffed counter",
+     "请使用其他售票机或人工窗口",
+     "s"
+    ],
+    [
+     "w",
+     "We apologise for the inconvenience",
+     "给您带来不便，敬请谅解",
+     "s"
+    ],
+    [
+     "lg",
+     "Switch the language",
+     "切换语言",
+     "b"
+    ],
+    [
+     "ts",
+     "Increase the text size",
+     "增大字号",
+     "b"
+    ],
+    [
+     "hc",
+     "Turn on high contrast",
+     "开启高对比度",
+     "b"
+    ],
+    [
+     "ka",
+     "Show the machine number",
+     "显示机器编号",
+     "b"
+    ],
+    [
+     "sv",
+     "Show the software version",
+     "显示软件版本",
+     "b"
+    ],
+    [
+     "vo",
+     "Turn up the volume",
+     "调大音量",
+     "b"
+    ],
+    [
+     "pn",
+     "Privacy notice",
+     "隐私声明",
+     "t"
+    ],
+    [
+     "tu",
+     "Terms of use",
+     "使用条款",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Buy a day pass for the ferry.",
+     "zh": "买一张渡轮一日通票。"
+    },
+    {
+     "id": "b2",
+     "en": "Top up my travel card.",
+     "zh": "给我的交通卡充值。"
+    }
+   ]
+  }
+ ]
+}

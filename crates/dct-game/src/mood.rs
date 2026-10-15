@@ -135,7 +135,7 @@ mod tests {
             Stop::StillMoving,
             Stop::StepsDone,
             Stop::DryRun,
-            Stop::Dco(DcoError { code: "dco_down".into(), message: "x".into() }),
+            Stop::Dco(DcoError { code: "dco_down".into(), message: "x".into(), run_id: None }),
             Stop::Won,
             Stop::LevelEnded,
             Stop::LivesOut,
@@ -161,7 +161,7 @@ mod tests {
         }
         assert_eq!(got(Stop::Stuck), Some(("stuck", None)));
         assert_eq!(got(Stop::PrivateScreen), Some(("wait", Some("私人画面，没操作"))));
-        for s in [Stop::StepsDone, Stop::DryRun, Stop::NoMoves, Stop::StillMoving, Stop::NoEffect, Stop::TriesDone, Stop::TapLimit, Stop::ClassesChanged { was: 1, now: 4 }, Stop::Dco(DcoError { code: "c".into(), message: "m".into() })] {
+        for s in [Stop::StepsDone, Stop::DryRun, Stop::NoMoves, Stop::StillMoving, Stop::NoEffect, Stop::TriesDone, Stop::TapLimit, Stop::ClassesChanged { was: 1, now: 4 }, Stop::Dco(DcoError { code: "c".into(), message: "m".into(), run_id: None })] {
             assert_eq!(for_stop(&s), None, "{s:?}");
         }
     }

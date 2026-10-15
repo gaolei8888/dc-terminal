@@ -517,7 +517,8 @@ pub enum LoadLlmError {
     NotEnabled(std::path::PathBuf),
     Problem {
         error: crate::llm::resolve::ResolveError,
-        provider: String,
+        /// 没写 provider 就是 `None`：没有「用的是谁」可说，直接落到 resolve 的 NoProvider 提示。
+        provider: Option<String>,
         http: bool,
     },
 }
@@ -568,12 +569,11 @@ pub fn load_llm_backend() -> Result<LoadedLlm, LoadLlmError> {
     };
     let http = llm.transport == crate::config::Transport::Http;
     match crate::llm::resolve::resolve(llm, &lookup, &secrets, &oauth) {
-        Ok(backend) => Ok(LoadedLlm {
-            backend,
-            model: llm.model.clone().unwrap_or_else(|| llm.provider.clone()),
-            provider: llm.provider.clone(),
-            http,
-        }),
+        Ok(backend) => {
+            // resolve 成功就一定写了 provider（否则是 NoProvider）。
+            let provider = llm.provider.clone().unwrap_or_default();
+            Ok(LoadedLlm { backend, model: llm.model.clone().unwrap_or_else(|| provider.clone()), provider, http })
+        }
         Err(error) => Err(LoadLlmError::Problem { error, provider: llm.provider.clone(), http }),
     }
 }
@@ -588,7 +588,9 @@ pub fn llm_check(lang: Lang) -> i32 {
             return 1;
         }
         Err(LoadLlmError::Problem { error, provider, http }) => {
-            println!("{}", crate::i18n::msg::llm_using(lang, &provider, http));
+            if let Some(provider) = &provider {
+                println!("{}", crate::i18n::msg::llm_using(lang, provider, http));
+            }
             println!(
                 "{}",
                 crate::i18n::msg::llm_cannot_connect(lang, &crate::i18n::msg::llm_problem(lang, &error))

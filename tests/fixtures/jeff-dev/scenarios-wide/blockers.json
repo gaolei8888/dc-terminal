@@ -1,0 +1,496 @@
+{
+ "blockers": [
+  {
+   "id": "magiclink",
+   "platform": {
+    "en": "Email link sign-in",
+    "zh": "邮件链接登录"
+   },
+   "why": "needs the person to open an emailed link",
+   "labels": [
+    [
+     "h",
+     "We emailed you a sign-in link",
+     "我们已给你发了一封登录链接邮件",
+     "s"
+    ],
+    [
+     "q",
+     "Open the email on any device and tap the link",
+     "在任意设备上打开邮件并点击里面的链接",
+     "s"
+    ],
+    [
+     "x",
+     "The link expires in 15 minutes",
+     "链接 15 分钟后失效",
+     "s"
+    ],
+    [
+     "re",
+     "Resend the email",
+     "重新发送邮件",
+     "b"
+    ],
+    [
+     "ch",
+     "Use a different email address",
+     "换一个邮箱地址",
+     "b"
+    ],
+    [
+     "pw",
+     "Sign in with a password instead",
+     "改用密码登录",
+     "b"
+    ],
+    [
+     "sp",
+     "Check your spam folder",
+     "检查垃圾邮件文件夹",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Rename the folder Photos 2024.",
+     "zh": "把照片 2024 文件夹重命名。"
+    },
+    {
+     "id": "b2",
+     "en": "Turn the screen brightness down.",
+     "zh": "把屏幕亮度调低。"
+    }
+   ]
+  },
+  {
+   "id": "paperjam",
+   "platform": {
+    "en": "Printer paper jam",
+    "zh": "打印机卡纸"
+   },
+   "why": "needs a person to clear a physical paper jam",
+   "labels": [
+    [
+     "h",
+     "Paper jam in the rear tray",
+     "后纸盒卡纸",
+     "s"
+    ],
+    [
+     "q",
+     "Open the rear cover and pull out the stuck sheet",
+     "打开后盖，把卡住的纸抽出来",
+     "s"
+    ],
+    [
+     "x",
+     "Printing will resume when the cover is closed",
+     "盖上后盖后会继续打印",
+     "s"
+    ],
+    [
+     "rt",
+     "Retry printing",
+     "重试打印",
+     "b"
+    ],
+    [
+     "pic",
+     "Show a picture of the rear cover",
+     "显示后盖示意图",
+     "b"
+    ],
+    [
+     "tp",
+     "Print a test page",
+     "打印测试页",
+     "b"
+    ],
+    [
+     "cj",
+     "Cancel this print job",
+     "取消这个打印任务",
+     "bd"
+    ],
+    [
+     "hp",
+     "Printer help",
+     "打印机帮助",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Look up the capital of Canada.",
+     "zh": "查一下加拿大的首都。"
+    },
+    {
+     "id": "b2",
+     "en": "Add milk to the shopping list.",
+     "zh": "把牛奶加到购物清单里。"
+    }
+   ]
+  },
+  {
+   "id": "cardtap",
+   "platform": {
+    "en": "Card reader tap",
+    "zh": "读卡器刷卡"
+   },
+   "why": "needs a physical card tapped on a reader",
+   "labels": [
+    [
+     "h",
+     "Tap your card on the reader",
+     "请把银行卡贴近读卡器",
+     "s"
+    ],
+    [
+     "q",
+     "Hold the card flat against the back of the terminal",
+     "把卡平放在终端背面",
+     "s"
+    ],
+    [
+     "w",
+     "Waiting for card...",
+     "等待刷卡……",
+     "s"
+    ],
+    [
+     "oth",
+     "Use a different payment method",
+     "使用其他付款方式",
+     "b"
+    ],
+    [
+     "cn",
+     "Cancel the payment",
+     "取消付款",
+     "bd"
+    ],
+    [
+     "ins",
+     "Show instructions",
+     "查看操作说明",
+     "b"
+    ],
+    [
+     "try",
+     "Try again",
+     "重试",
+     "b"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Change the language to Spanish.",
+     "zh": "把语言改成西班牙语。"
+    },
+    {
+     "id": "b2",
+     "en": "Show last week's sales chart.",
+     "zh": "显示上周的销售图表。"
+    }
+   ]
+  },
+  {
+   "id": "voicephrase",
+   "platform": {
+    "en": "Voice phrase check",
+    "zh": "语音短语验证"
+   },
+   "why": "needs the person to speak aloud",
+   "labels": [
+    [
+     "h",
+     "Say the phrase out loud",
+     "请大声说出这句话",
+     "s"
+    ],
+    [
+     "q",
+     "\"My voice is my password\"",
+     "“我的声音就是我的密码”",
+     "s"
+    ],
+    [
+     "mic",
+     "Microphone is listening",
+     "麦克风正在收听",
+     "s"
+    ],
+    [
+     "ty",
+     "Type the phrase instead",
+     "改为输入这句话",
+     "b"
+    ],
+    [
+     "pl",
+     "Play the phrase again",
+     "再播放一遍这句话",
+     "b"
+    ],
+    [
+     "cm",
+     "Change microphone",
+     "更换麦克风",
+     "b"
+    ],
+    [
+     "so",
+     "Start over",
+     "重新开始",
+     "b"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Archive the finished tasks.",
+     "zh": "归档已完成的任务。"
+    },
+    {
+     "id": "b2",
+     "en": "Set an alarm for 7 am.",
+     "zh": "设一个早上 7 点的闹钟。"
+    }
+   ]
+  },
+  {
+   "id": "parentok",
+   "platform": {
+    "en": "Parent approval needed",
+    "zh": "需要家长批准"
+   },
+   "why": "needs a parent to approve on another device",
+   "labels": [
+    [
+     "h",
+     "Ask a parent to approve this on their device",
+     "请家长在他们的设备上批准这一步",
+     "s"
+    ],
+    [
+     "w",
+     "Waiting for approval from your family manager",
+     "正在等待家庭管理员批准",
+     "s"
+    ],
+    [
+     "r",
+     "Request sent 2 minutes ago",
+     "请求已于 2 分钟前发出",
+     "s"
+    ],
+    [
+     "rs",
+     "Send the request again",
+     "再次发送请求",
+     "bd"
+    ],
+    [
+     "fm",
+     "Choose a different family member",
+     "选择其他家庭成员",
+     "b"
+    ],
+    [
+     "lm",
+     "Learn how approvals work",
+     "了解批准流程",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Save last month's invoice to my laptop.",
+     "zh": "把上个月的发票存到我的笔记本电脑上。"
+    }
+   ]
+  },
+  {
+   "id": "tvcode",
+   "platform": {
+    "en": "Confirm code on TV",
+    "zh": "电视上确认代码"
+   },
+   "why": "needs a code read off another screen",
+   "labels": [
+    [
+     "h",
+     "Enter the code shown on your TV",
+     "请输入电视上显示的代码",
+     "s"
+    ],
+    [
+     "q",
+     "The code on screen changes every 30 seconds",
+     "屏幕上的代码每 30 秒变化一次",
+     "s"
+    ],
+    [
+     "l",
+     "Linking Living room TV",
+     "正在关联客厅电视",
+     "s"
+    ],
+    [
+     "nc",
+     "Show a new code",
+     "显示新代码",
+     "b"
+    ],
+    [
+     "ld",
+     "Link a different device",
+     "关联其他设备",
+     "b"
+    ],
+    [
+     "cs",
+     "I can't see a code",
+     "我看不到代码",
+     "b"
+    ],
+    [
+     "cl",
+     "Cancel linking",
+     "取消关联",
+     "b"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Sort my contacts by last name.",
+     "zh": "把联系人按姓排序。"
+    }
+   ]
+  },
+  {
+   "id": "routerbtn",
+   "platform": {
+    "en": "Router button press",
+    "zh": "路由器按钮"
+   },
+   "why": "needs a physical button pressed on a router",
+   "labels": [
+    [
+     "h",
+     "Press the button on the back of your router",
+     "请按一下路由器背面的按钮",
+     "s"
+    ],
+    [
+     "q",
+     "Hold it for 3 seconds until the light blinks",
+     "按住 3 秒直到指示灯闪烁",
+     "s"
+    ],
+    [
+     "w",
+     "Searching for the router...",
+     "正在搜索路由器……",
+     "s"
+    ],
+    [
+     "rs",
+     "Rescan",
+     "重新搜索",
+     "b"
+    ],
+    [
+     "pw",
+     "Enter the Wi-Fi password manually",
+     "改为手动输入 Wi-Fi 密码",
+     "b"
+    ],
+    [
+     "rr",
+     "Reset the router settings",
+     "重置路由器设置",
+     "bd"
+    ],
+    [
+     "hp",
+     "Router help",
+     "路由器帮助",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Show my steps for today.",
+     "zh": "显示我今天的步数。"
+    }
+   ]
+  },
+  {
+   "id": "approval",
+   "platform": {
+    "en": "Manager approval pending",
+    "zh": "主管审批中"
+   },
+   "why": "needs a manager to approve",
+   "labels": [
+    [
+     "h",
+     "Your request needs manager approval",
+     "你的申请需要主管批准",
+     "s"
+    ],
+    [
+     "w",
+     "Status: waiting for Morgan Lee",
+     "状态：等待李摩根",
+     "s"
+    ],
+    [
+     "q",
+     "You cannot continue until it is approved",
+     "批准之前你无法继续",
+     "s"
+    ],
+    [
+     "rm",
+     "Send a reminder to the approver",
+     "向审批人发送提醒",
+     "bd"
+    ],
+    [
+     "wd",
+     "Withdraw my request",
+     "撤回我的申请",
+     "bd"
+    ],
+    [
+     "vd",
+     "View request details",
+     "查看申请详情",
+     "b"
+    ],
+    [
+     "po",
+     "Approval policy",
+     "审批政策",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Change my profile picture.",
+     "zh": "更换我的头像。"
+    }
+   ]
+  }
+ ]
+}

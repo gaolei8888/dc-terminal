@@ -2550,21 +2550,29 @@ pub mod msg {
         use crate::llm::resolve::ResolveError::*;
         let cfg = CONFIG_PATH;
         match e {
+            // 没有厂商可点名，也不推荐任何一家：这一句只说「写哪一行」。
+            // `provider = "..."` 是用户要原样敲进文件的字，所以这里的 provider
+            // 不算内部词。`<名字>` 指一个 profile 的名字（内置的或自己写的）。
+            NoProvider => t!(
+                lang,
+                en: format!("The [llm] section in {cfg} does not say which backend to use, so explaining failures stays off. Add a line provider = \"<profile name>\" under [llm]. For an OpenAI-compatible server, also add transport = \"http\", base_url and model."),
+                zh: format!("设置文件 {cfg} 的 [llm] 里没写用哪个后端，所以「出错解释」保持关着。在 [llm] 下加一行 provider = \"<profile 名>\"。如果是 OpenAI 兼容的服务，再加上 transport = \"http\"、base_url 和 model。"),
+            ),
             NoSuchProvider(n) => t!(
                 lang,
-                en: format!("The settings file {cfg} asks for “{n}”, which dct does not know. Change it to claude."),
-                zh: format!("设置文件 {cfg} 里写的「{n}」不是 dct 认识的名字，把它换成 claude 试试。"),
+                en: format!("The settings file {cfg} asks for “{n}”, which dct does not know. Under [llm], set provider = \"<profile name>\" to the name of a profile you have (built-in or your own)."),
+                zh: format!("设置文件 {cfg} 里写的「{n}」不是 dct 认识的名字。在 [llm] 下把 provider = \"<profile 名>\" 改成你已有的某个 profile 的名字（内置的或自己写的）。"),
             ),
             // kimi/glm/deepseek/qwen-api 走到这里是常事（它们没有、也不该有
             // 无界面命令，见 `profile.rs` 的
             // `unverified_clis_declare_no_headless_command`），所以这句话必须
-            // 把**它们那条正路**也说出来——只说「换成 claude」等于让一个
+            // 把**它们那条正路**也说出来——只说「换一家」等于让一个
             // 已经付过钱、填好密钥的用户去换一家。「直连」是本项目对这件事的
             // 统一说法，见下面 `NoApiEndpoint`。
             NoHeadlessCommand(n) => t!(
                 lang,
-                en: format!("“{n}” cannot answer questions on its own in the background. Open the settings file {cfg} and either change that line to claude, or switch “{n}” to a direct connection and fill in the model name."),
-                zh: format!("「{n}」还没法自己在后台回答问题。打开设置文件 {cfg}，要么把这一项换成 claude，要么给「{n}」打开「直连」并填上型号名。"),
+                en: format!("“{n}” cannot answer questions on its own in the background. Open the settings file {cfg} and either point provider = \"<profile name>\" at a profile that can run in the background, or switch “{n}” to a direct connection and fill in the model name."),
+                zh: format!("「{n}」还没法自己在后台回答问题。打开设置文件 {cfg}，要么把 provider = \"<profile 名>\" 指向一个能在后台运行的 profile，要么给「{n}」打开「直连」并填上型号名。"),
             ),
             NoApiEndpoint(n) => t!(
                 lang,
@@ -2605,13 +2613,13 @@ pub mod msg {
             en: format!(
                 "Explaining failures is switched off right now.\n\
                  To switch it on, put these two lines in {p}\n\n\
-                 [llm]\nprovider = \"claude\"\n\n\
+                 [llm]\nprovider = \"<profile name>\"\n\n\
                  Then run `dct llm check` again to test it."
             ),
             zh: format!(
                 "「出错解释」这个功能现在是关着的。\n\
                  要打开的话，在 {p} 里加上这两行：\n\n\
-                 [llm]\nprovider = \"claude\"\n\n\
+                 [llm]\nprovider = \"<profile 名>\"\n\n\
                  加完再跑一次 `dct llm check` 就能验。"
             ),
         )
@@ -3438,6 +3446,7 @@ mod tests {
                 "claude".into(),
             )),
             LlmUnavailable(crate::llm::resolve::ResolveError::NoModel("kimi".into())),
+            LlmUnavailable(crate::llm::resolve::ResolveError::NoProvider),
             LlmUnavailable(
                 crate::llm::resolve::ResolveError::BorrowedCredentialRefused {
                     name: "kimi".into(),

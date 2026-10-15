@@ -1,0 +1,361 @@
+{
+ "blockers": [
+  {
+   "id": "fingerprint",
+   "platform": {
+    "en": "Biometric prompt",
+    "zh": "生物识别提示"
+   },
+   "why": "needs a physical fingerprint",
+   "labels": [
+    [
+     "h",
+     "Confirm with your fingerprint",
+     "请用指纹确认",
+     "s"
+    ],
+    [
+     "q",
+     "Touch the sensor on the back of your phone",
+     "请触摸手机背面的指纹传感器",
+     "s"
+    ],
+    [
+     "ic",
+     "[fingerprint icon]",
+     "[指纹图标]",
+     "s"
+    ],
+    [
+     "pin",
+     "Use PIN instead",
+     "改用 PIN 码",
+     "b"
+    ],
+    [
+     "can",
+     "Cancel",
+     "取消",
+     "b"
+    ],
+    [
+     "why",
+     "Why is this needed?",
+     "为什么需要这一步？",
+     "t"
+    ],
+    [
+     "pr",
+     "Privacy",
+     "隐私",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Check tomorrow's weather.",
+     "zh": "查看明天的天气。"
+    },
+    {
+     "id": "b2",
+     "en": "Archive the old emails.",
+     "zh": "归档旧邮件。"
+    },
+    {
+     "id": "b3",
+     "en": "Zoom the map in.",
+     "zh": "放大地图。"
+    }
+   ]
+  },
+  {
+   "id": "phonecall",
+   "platform": {
+    "en": "Call verification",
+    "zh": "来电验证"
+   },
+   "why": "needs a person to answer a phone call",
+   "labels": [
+    [
+     "h",
+     "We are calling you now",
+     "我们正在给你打电话",
+     "s"
+    ],
+    [
+     "q",
+     "Answer the call and say the 4-digit number you hear",
+     "接听电话，并说出你听到的四位数字",
+     "s"
+    ],
+    [
+     "n",
+     "Calling the number ending in 07",
+     "正在呼叫尾号 07 的号码",
+     "s"
+    ],
+    [
+     "again",
+     "Call me again",
+     "再打一次",
+     "b"
+    ],
+    [
+     "txt",
+     "Send a text message instead",
+     "改发短信",
+     "b"
+    ],
+    [
+     "chg",
+     "Use a different number",
+     "换一个号码",
+     "b"
+    ],
+    [
+     "help",
+     "Need help?",
+     "需要帮助？",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Order my usual lunch.",
+     "zh": "点我常吃的午餐。"
+    },
+    {
+     "id": "b2",
+     "en": "Mute all notifications.",
+     "zh": "把所有通知静音。"
+    },
+    {
+     "id": "b3",
+     "en": "Open my wish list.",
+     "zh": "打开我的心愿单。"
+    }
+   ]
+  },
+  {
+   "id": "securitykey",
+   "platform": {
+    "en": "Security key prompt",
+    "zh": "安全密钥提示"
+   },
+   "why": "needs a physical security key",
+   "labels": [
+    [
+     "h",
+     "Use your security key",
+     "请使用你的安全密钥",
+     "s"
+    ],
+    [
+     "q",
+     "Insert the key into a USB port and tap its button",
+     "把密钥插入 USB 接口，并按一下它的按钮",
+     "s"
+    ],
+    [
+     "ic",
+     "[USB key icon]",
+     "[USB 密钥图标]",
+     "s"
+    ],
+    [
+     "try",
+     "Try again",
+     "重试",
+     "b"
+    ],
+    [
+     "oth",
+     "Choose another way to sign in",
+     "选择其他登录方式",
+     "b"
+    ],
+    [
+     "rec",
+     "Use a recovery code",
+     "使用恢复码",
+     "b"
+    ],
+    [
+     "lm",
+     "Learn more about security keys",
+     "了解更多关于安全密钥的信息",
+     "t"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Share the album with Kim.",
+     "zh": "把相册分享给小金。"
+    },
+    {
+     "id": "b2",
+     "en": "Save the draft.",
+     "zh": "保存草稿。"
+    },
+    {
+     "id": "b3",
+     "en": "Turn on airplane mode.",
+     "zh": "打开飞行模式。"
+    }
+   ]
+  },
+  {
+   "id": "signature",
+   "platform": {
+    "en": "Signature page",
+    "zh": "签名页面"
+   },
+   "why": "needs a handwritten signature",
+   "labels": [
+    [
+     "h",
+     "Sign the lease agreement",
+     "请在租赁协议上签字",
+     "s"
+    ],
+    [
+     "q",
+     "Draw your signature in the box below using your finger or mouse",
+     "请用手指或鼠标在下面的框里手写签名",
+     "s"
+    ],
+    [
+     "box",
+     "[signature box]",
+     "[签名框]",
+     "s"
+    ],
+    [
+     "clr",
+     "Clear signature",
+     "清除签名",
+     "b"
+    ],
+    [
+     "typ",
+     "Type my name instead",
+     "改为输入姓名",
+     "b"
+    ],
+    [
+     "sub",
+     "Submit signature",
+     "提交签名",
+     "b"
+    ],
+    [
+     "pdf",
+     "View the full agreement",
+     "查看完整协议",
+     "t"
+    ],
+    [
+     "dec",
+     "Decline to sign",
+     "拒绝签署",
+     "b"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Turn the picture so it is wide instead of tall.",
+     "zh": "把图片转成宽的，不要高的。"
+    },
+    {
+     "id": "b2",
+     "en": "Find Kim's phone number in my contacts.",
+     "zh": "在通讯录里找小金的电话号码。"
+    },
+    {
+     "id": "b3",
+     "en": "Show the tasks due today.",
+     "zh": "显示今天到期的任务。"
+    }
+   ]
+  },
+  {
+   "id": "idcheck",
+   "platform": {
+    "en": "Identity check",
+    "zh": "身份核验"
+   },
+   "why": "needs the person to hold up their ID to a camera",
+   "labels": [
+    [
+     "h",
+     "Verify your identity",
+     "请核验你的身份",
+     "s"
+    ],
+    [
+     "q",
+     "Hold your passport next to your face and look at the camera",
+     "请把护照举在脸旁边，看着摄像头",
+     "s"
+    ],
+    [
+     "cam",
+     "[live camera preview]",
+     "[摄像头实时画面]",
+     "s"
+    ],
+    [
+     "take",
+     "Take photo",
+     "拍照",
+     "b"
+    ],
+    [
+     "up",
+     "Upload a photo instead",
+     "改为上传照片",
+     "b"
+    ],
+    [
+     "sw",
+     "Switch camera",
+     "切换摄像头",
+     "b"
+    ],
+    [
+     "tips",
+     "Photo tips",
+     "拍照提示",
+     "t"
+    ],
+    [
+     "later",
+     "Do this later",
+     "稍后再做",
+     "b"
+    ]
+   ],
+   "goals": [
+    {
+     "id": "b1",
+     "en": "Create a new calendar event.",
+     "zh": "新建一个日历事件。"
+    },
+    {
+     "id": "b2",
+     "en": "Change the font size.",
+     "zh": "更改字号。"
+    },
+    {
+     "id": "b3",
+     "en": "Sort the downloads by size.",
+     "zh": "把下载内容按大小排序。"
+    }
+   ]
+  }
+ ]
+}

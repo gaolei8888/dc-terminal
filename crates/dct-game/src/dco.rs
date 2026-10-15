@@ -1,41 +1,13 @@
-//! 连本机 dco：unix socket 上的 MCP（一行一条 JSON-RPC）。握手跟 dco 自己的 `dco call` 一样：
-//! 先写 `{"dco_token": "<~/.dco/token>"}`，读到 `{"ok":true}`，再 initialize → notifications/initialized → tools/call。
+//! 连本机 dco 的客户端在 `dct-dco`；这里只把它接到三消要的 `Dco` 上。
 use crate::board::GridRead;
 use crate::play::{Dco, DcoError, Profile, Region, Seen, SwipeOutcome, SwipeSettle, TapAt, TapSettleReq, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS, TAP_AT_MAX_AVOID};
 use crate::screen::Element;
+pub use dct_dco::{DcoClient, IO_TIMEOUT};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::time::Duration;
 
 /// show_status 的说明条最多这么多个字符（不是字节）。
 const STATUS_TEXT_MAX_CHARS: usize = 16;
-
-/// dco 一次回话最多等多久。
-pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
-
-pub struct DcoClient {
-    r: BufReader<UnixStream>,
-    w: UnixStream,
-    next_id: u64,
-    /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
-    no_show_status: bool,
-    /// 这台 dco 对这些状态回了 `bad_request`（不认识这个状态或参数）：同一个状态不再发，其他状态照发。
-    unsupported_states: HashSet<String>,
-    /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
-    no_see_text: bool,
-    /// 这台 dco 不认 swipe 的 `settle` 参数（回复里没有 `settle`）：这条连接上不再带，免得每步白发。
-    /// 注意只有「回复里压根没有 settle」才置位；等待出错、报告读不懂都不算。
-    no_swipe_settle: bool,
-    /// 这台 dco 没有 tap_at（旧版）：这条连接上不再发，直接说「不会」。
-    no_tap_at: bool,
-    /// 带 settle 的 swipe 等回复的时长：要比 dco 自己最多等的 `SETTLE_TIMEOUT_MS` 还长，否则会把还在等的划动当成失败。
-    pub(crate) settle_call_timeout: Duration,
-    /// 一次请求等回复的总时长；跳过别的回复也算在里面。
-    timeout: Duration,
-}
 
 /// `{changed, change, settled, timed_out, settled_ms}`；缺 changed / settled 的当没有。
 fn parse_settle(s: &Value) -> Option<SwipeSettle> {
@@ -67,113 +39,7 @@ fn frac_of(e: &Value, size: &Value) -> Option<[u16; 4]> {
 }
 
 fn err(code: &str, message: impl Into<String>) -> DcoError {
-    DcoError { code: code.into(), message: message.into() }
-}
-
-/// 读写出错：超时单独说，别的都当作 dco 断开了。
-fn io_err(e: &std::io::Error) -> DcoError {
-    match e.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-            err("dco_timeout", "dco 没有回应，等了 10 秒。先看看 dco 是不是卡住了。")
-        }
-        _ => err("dco_down", "dco 断开了连接"),
-    }
-}
-
-impl DcoClient {
-    /// `dir` 是 `~/.dco`。
-    pub fn connect(dir: &Path) -> Result<DcoClient, DcoError> {
-        Self::connect_with_timeout(dir, IO_TIMEOUT)
-    }
-
-    /// 同 `connect`，读写的等待时间可以自己定（测试用短的）。
-    pub fn connect_with_timeout(dir: &Path, timeout: Duration) -> Result<DcoClient, DcoError> {
-        let endpoint: Value = std::fs::read_to_string(dir.join("endpoint.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
-        let socket = endpoint["socket"].as_str().ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
-        let token = std::fs::read_to_string(dir.join("token")).map_err(|_| err("dco_down", "读不到 dco 的钥匙文件，dco 还没启动过？"))?;
-        let stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
-            std::io::ErrorKind::PermissionDenied => err("dco_blocked", "这里不让连 dco"),
-            _ => err("dco_down", "dco 没在运行，先打开 dco 再试"),
-        })?;
-        stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
-        stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
-        let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, unsupported_states: HashSet::new(), no_see_text: false, no_swipe_settle: false, no_tap_at: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
-        c.send(&json!({ "dco_token": token.trim() }))?;
-        let ack = c.read_line()?;
-        if ack.get("ok") != Some(&Value::Bool(true)) {
-            return Err(err("dco_refused", "dco 拒绝了连接"));
-        }
-        let init = c.request("initialize", json!({
-            "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": { "name": "dct", "version": env!("CARGO_PKG_VERSION") }
-        }))?;
-        let _ = init;
-        c.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
-        Ok(c)
-    }
-
-    fn send(&mut self, v: &Value) -> Result<(), DcoError> {
-        writeln!(self.w, "{v}").map_err(|e| io_err(&e))
-    }
-
-    fn read_line(&mut self) -> Result<Value, DcoError> {
-        let mut line = String::new();
-        match self.r.read_line(&mut line) {
-            Ok(0) => Err(err("dco_down", "dco 断开了连接")),
-            Err(e) => Err(io_err(&e)),
-            Ok(_) => serde_json::from_str(line.trim()).map_err(|_| err("dco_down", "dco 回了看不懂的话")),
-        }
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, DcoError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-        // 前面超时的调用，回复可能晚到：按 id 认回复，别人的（和没有 id 的通知）跳过。
-        let deadline = std::time::Instant::now() + self.timeout;
-        let reply = loop {
-            let r = self.read_line()?;
-            if r.get("id") == Some(&json!(id)) {
-                break r;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(io_err(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
-            }
-        };
-        if let Some(e) = reply.get("error") {
-            let msg = e["message"].as_str().unwrap_or("dco 报错");
-            let code = e["code"].as_i64();
-            if code == Some(-32602) && msg.contains("unknown tool") {
-                return Err(err("dco_too_old", msg));
-            }
-            return Err(err("dco_error", match code {
-                Some(c) => format!("{msg}（协议错误码 {c}）"),
-                None => msg.to_string(),
-            }));
-        }
-        Ok(reply["result"].clone())
-    }
-
-    /// 调一个工具，返回它文字部分里的 JSON。工具报错时错误码取 dco 给的 `error.code`。
-    pub fn call(&mut self, tool: &str, args: Value) -> Result<Value, DcoError> {
-        self.call_full(tool, args).map(|(body, _)| body)
-    }
-
-    /// 同 `call`，另外把整个 `content` 数组也交回来（图片在里面，`call` 只看第一项文字）。
-    fn call_full(&mut self, tool: &str, args: Value) -> Result<(Value, Vec<Value>), DcoError> {
-        let result = self.request("tools/call", json!({ "name": tool, "arguments": args }))?;
-        let text = result["content"][0]["text"].as_str().unwrap_or("{}");
-        let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-        if result["isError"].as_bool().unwrap_or(false) {
-            let e = &body["error"];
-            return Err(err(e["code"].as_str().unwrap_or("dco_error"), e["message"].as_str().unwrap_or(text)));
-        }
-        Ok((body, result["content"].as_array().cloned().unwrap_or_default()))
-    }
+    DcoError { code: code.into(), message: message.into(), run_id: None }
 }
 
 impl Dco for DcoClient {
@@ -189,7 +55,7 @@ impl Dco for DcoClient {
             }
         }
         let body = self.call("read_grid", args)?;
-        serde_json::from_value(body).map_err(|e| err("dco_error", format!("dco 的棋盘回复读不懂：{e}")))
+        serde_json::from_value(body).map_err(|e| DcoError { code: "dco_error".into(), message: format!("dco 的棋盘回复读不懂：{e}"), run_id: None })
     }
 
     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError> {
@@ -208,16 +74,11 @@ impl Dco for DcoClient {
             };
         }
         let [x, y, w, h] = p.region;
-        let normal = self.timeout;
-        self.timeout = self.settle_call_timeout;
-        let _ = self.w.set_read_timeout(Some(self.timeout));
-        let res = self.call("swipe", json!({
+        let res = self.call_timed("swipe", json!({
             "window": p.window,
             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
             "settle": { "quiet_ms": SETTLE_QUIET_MS, "timeout_ms": SETTLE_TIMEOUT_MS, "region": { "x": x, "y": y, "w": w, "h": h } },
-        }));
-        self.timeout = normal;
-        let _ = self.w.set_read_timeout(Some(normal));
+        }), self.settle_call_timeout);
         let body = match res {
             Ok(b) => b,
             // 请求已经写出去了，划动很可能已经发生：不能说「没划」，否则调用方会再划一次。
@@ -305,13 +166,9 @@ impl Dco for DcoClient {
 
     fn capture(&mut self, p: &Profile) -> Result<Vec<u8>, DcoError> {
         use base64::Engine;
-        let (_, content) = self.call_full("see", json!({ "window": p.window, "source": "ocr", "include_image": true }))?;
-        let data = content
-            .iter()
-            .find(|c| c["type"] == "image")
-            .and_then(|c| c["data"].as_str())
-            .ok_or_else(|| err("no_image", "dco 没有给截图"))?;
-        base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| err("no_image", "dco 给的截图读不懂"))
+        let reply = self.call_full("see", json!({ "window": p.window, "source": "ocr", "include_image": true }))?;
+        let data = reply.image_png_base64.ok_or_else(|| err("no_image", "dco 没有给截图"))?;
+        base64::engine::general_purpose::STANDARD.decode(&data).map_err(|_| err("no_image", "dco 给的截图读不懂"))
     }
 
     fn tap_at(&mut self, p: &Profile, x_bp: u16, y_bp: u16, avoid: &[Region], settle: Option<&TapSettleReq>) -> Result<TapAt, DcoError> {
@@ -332,16 +189,14 @@ impl Dco for DcoClient {
             .map(|r| json!({ "x_bp": r.x_bp, "y_bp": r.y_bp, "w_bp": r.w_bp, "h_bp": r.h_bp }))
             .collect();
         let mut args = json!({ "window": { "window_id": window_id }, "x_bp": x_bp, "y_bp": y_bp, "avoid": avoid });
-        let normal = self.timeout;
-        if let Some(r) = settle {
-            args["settle"] = json!({ "quiet_ms": r.quiet_ms, "timeout_ms": r.timeout_ms, "region": { "x": r.region[0], "y": r.region[1], "w": r.region[2], "h": r.region[3] } });
-            // 等屏幕稳定要花几秒：这一次的读超时放长，用完还原。
-            self.timeout = self.settle_call_timeout.max(Duration::from_millis(r.timeout_ms as u64 + 4000));
-            let _ = self.w.set_read_timeout(Some(self.timeout));
-        }
-        let res = self.call("tap_at", args);
-        self.timeout = normal;
-        let _ = self.w.set_read_timeout(Some(normal));
+        // 等屏幕稳定要花几秒：这一次的读超时放长，用完还原。
+        let res = match settle {
+            Some(r) => {
+                args["settle"] = json!({ "quiet_ms": r.quiet_ms, "timeout_ms": r.timeout_ms, "region": { "x": r.region[0], "y": r.region[1], "w": r.region[2], "h": r.region[3] } });
+                self.call_timed("tap_at", args, self.settle_call_timeout.max(Duration::from_millis(r.timeout_ms as u64 + 4000)))
+            }
+            None => self.call("tap_at", args),
+        };
         match res {
             Ok(b) => Ok(TapAt {
                 kind: b["tapped"]["kind"].as_str().unwrap_or("").to_string(),
