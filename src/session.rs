@@ -674,6 +674,12 @@ pub struct SessionManager {
     /// 会话里打字（见 `bridge::submit`），多电脑留言留在队列里不送。
     /// 用户自己在界面上敲的字不受影响（走 `send_input`，不看这个）。
     draining: AtomicBool,
+    /// 平稳重启最后一步写完 `last-sessions.toml` 之后为 `true`：从那一刻到
+    /// 进程退出，谁都不许再重写这份清单——会话在退出时被挂断、`tick` 看到它
+    /// 停了照常落盘的话，会把刚记下的 `interrupted` 冲掉。用 `Mutex` 而不是
+    /// 原子量：普通落盘要**拿着这把锁写完**，最后一次落盘才不会被一次早一步
+    /// 开始、晚一步写完的普通落盘盖掉。
+    last_sessions_frozen: Mutex<bool>,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -703,6 +709,7 @@ impl SessionManager {
         SessionManager {
             next_id: AtomicU32::new(1),
             draining: AtomicBool::new(false),
+            last_sessions_frozen: Mutex::new(false),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),
@@ -850,18 +857,51 @@ impl SessionManager {
     /// 见 `last_sessions` 模块文档开头那段。落盘失败只吞掉、写 stderr：
     /// 跟 `journal` 一样，这是一份可以随时重建的状态缓存，不是用户数据，
     /// 没必要因为一次写盘失败就让 `create`/`stop` 这些请求本身也报错。
-    fn persist_last_sessions(&self) {
+    pub(crate) fn persist_last_sessions(&self) {
         self.persist_last_sessions_with(&HashSet::new(), &HashMap::new());
     }
 
     /// 同 `persist_last_sessions`，多带两样平稳重启才有的东西：哪些会话是
     /// 被打断的（`interrupted`），哪些写了交接文件（`handoffs`）。不在这两个
-    /// 集合里的会话照常记，标记为空。
+    /// 集合里的会话照常记，标记为空。清单冻着（见 `last_sessions_frozen`）
+    /// 时什么都不做。
     pub fn persist_last_sessions_with(
         &self,
         interrupted: &HashSet<u32>,
         handoffs: &HashMap<u32, PathBuf>,
     ) {
+        let frozen = recover(self.last_sessions_frozen.lock());
+        if *frozen {
+            return;
+        }
+        self.write_last_sessions(interrupted, handoffs);
+    }
+
+    /// 平稳重启的最后一次落盘：写完就把清单冻住，直到进程退出（或交接
+    /// 失败、`unfreeze_last_sessions` 解冻）。
+    pub fn persist_final_last_sessions(
+        &self,
+        interrupted: &HashSet<u32>,
+        handoffs: &HashMap<u32, PathBuf>,
+    ) {
+        let mut frozen = recover(self.last_sessions_frozen.lock());
+        self.write_last_sessions(interrupted, handoffs);
+        *frozen = true;
+    }
+
+    /// 重启没交出去、照常运行下去：清单恢复正常落盘。
+    pub fn unfreeze_last_sessions(&self) {
+        *recover(self.last_sessions_frozen.lock()) = false;
+    }
+
+    /// 这个会话的 profile 能不能按对话 id 接回（`Profile::resumes_by_id`）。
+    /// 会话不在了算不能。
+    pub fn resumes_by_id(&self, id: u32) -> bool {
+        self.with_session(id, |s| Ok(s.profile.resumes_by_id()))
+            .unwrap_or(false)
+    }
+
+    fn write_last_sessions(&self, interrupted: &HashSet<u32>, handoffs: &HashMap<u32, PathBuf>) {
         let Some(path) = recover(self.last_sessions_path.lock()).clone() else {
             return;
         };

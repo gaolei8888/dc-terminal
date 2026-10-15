@@ -76,6 +76,16 @@ pub fn run(socket: &Path) -> Result<()> {
 /// （见 `session.rs` 的注释），各方法自己负责该锁多细的粒度。如果外面再套一把大锁，
 /// 就白做了那些细粒度设计——一个连接处理慢请求时又会把其它连接一起卡住。
 pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+    run_with_hooks(socket, mgr, DrainHooks::real())
+}
+
+/// 同 `run_with_manager`，平稳重启最后那一步（起 `__swap`、退出进程）可以
+/// 换成假的——测试不能真的起小进程、更不能把测试进程退掉。
+pub(crate) fn run_with_hooks(
+    socket: &Path,
+    mgr: Arc<SessionManager>,
+    hooks: DrainHooks,
+) -> Result<()> {
     // 建 socket、收紧权限、（Windows 上）留下 pid 文件，都在这一步里——
     // 「谁连得上谁就能以你的身份执行任意命令」，那道门的全部细节和它在
     // 两个平台上各能挡住什么，写在 `sys::ipc::bind_private`。
@@ -293,6 +303,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 自己的线程——绝不能让这条线的网络 IO 混进上面那个 200ms 的 tick。
     crate::live::spawn_pusher(live.clone(), mgr.clone());
 
+    // 平稳重启（`Request::Drain`）：同一时刻最多一场排空，所有连接共用。
+    let drain = Arc::new(DrainCtl::new(socket, mgr.clone(), hooks));
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -306,13 +319,276 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let pr = pairs.clone();
         let lv = live.clone();
         let mc = mesh_ctl.clone();
+        let dr = drain.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc, dr) {
                 eprintln!("连接处理失败: {e}");
             }
         });
     }
     Ok(())
+}
+
+/// 起脱离的 `dct __swap`，参数是 socket。
+pub(crate) type SwapFn = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
+
+/// 平稳重启最后那一步怎么做、租约多长。生产用 `DrainHooks::real()`，
+/// 测试换成只记账的假货。
+pub(crate) struct DrainHooks {
+    /// 多久没收到 `DrainStatus { renew: true }` 就当 CLI 走了、取消排空。
+    pub lease: Duration,
+    /// 排空线程多久看一次各会话。
+    pub tick: Duration,
+    /// 小进程起好之后，最多再等多久让 CLI 问到 `done: true` 再退出。
+    pub linger: Duration,
+    /// 起脱离的 `dct __swap`。参数是 socket。
+    pub swap: SwapFn,
+    /// 退出进程。真的那个不返回。
+    pub exit: Box<dyn Fn() + Send + Sync>,
+}
+
+impl DrainHooks {
+    pub(crate) fn real() -> DrainHooks {
+        DrainHooks {
+            lease: Duration::from_secs(10),
+            tick: Duration::from_millis(500),
+            linger: Duration::from_secs(2),
+            swap: Box::new(|socket: &Path| {
+                let exe = std::env::current_exe()?;
+                crate::client::spawn_swap(std::process::id(), socket, &exe)
+            }),
+            exit: Box::new(|| std::process::exit(0)),
+        }
+    }
+}
+
+/// 正在进行的那一场排空。
+struct DrainRun {
+    drain: crate::drain::Drain,
+    /// 最后一次 `DrainStatus { renew: true }`（或者 `Drain` 本身）的时刻。
+    last_poll: std::time::Instant,
+    /// 已经进入落盘那一步：从这里开始取消不了，租约也不再管。
+    finishing: bool,
+    /// 已经落盘、小进程已起，马上退出。
+    done: bool,
+    /// 哪一场。线程靠它认出「我那一场已经被取消、又开了新的一场」。
+    generation: u64,
+}
+
+/// 平稳重启在后台这一侧的全部状态。见 `Request::Drain`。
+pub(crate) struct DrainCtl {
+    socket: PathBuf,
+    mgr: Arc<SessionManager>,
+    hooks: DrainHooks,
+    run: Mutex<Option<DrainRun>>,
+    generation: std::sync::atomic::AtomicU64,
+    /// CLI 已经问到 `done: true` 了，可以退出。
+    done_seen: AtomicBool,
+}
+
+fn idle_progress() -> crate::drain::Progress {
+    crate::drain::Progress {
+        waiting: Vec::new(),
+        remaining_s: 0,
+        nudged: false,
+    }
+}
+
+impl DrainCtl {
+    pub(crate) fn new(socket: &Path, mgr: Arc<SessionManager>, hooks: DrainHooks) -> DrainCtl {
+        DrainCtl {
+            socket: socket.to_path_buf(),
+            mgr,
+            hooks,
+            run: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            done_seen: AtomicBool::new(false),
+        }
+    }
+
+    fn progress_of(run: &DrainRun) -> Response {
+        Response::DrainProgress {
+            progress: run.drain.progress(std::time::Instant::now()),
+            done: run.done,
+        }
+    }
+
+    /// `Request::Drain`。已经在排空就只回进度。
+    fn start(self: &Arc<Self>, cfg: crate::drain::DrainConfig, initiator: Option<u32>) -> Response {
+        let mut slot = recover(self.run.lock());
+        if let Some(run) = slot.as_ref() {
+            return Self::progress_of(run);
+        }
+        let handoff_dir = self
+            .socket
+            .parent()
+            .map(|d| d.join("handoffs"))
+            .unwrap_or_else(|| PathBuf::from("handoffs"));
+        if let Err(e) = std::fs::create_dir_all(&handoff_dir) {
+            eprintln!("交接目录建不了（{}）：{e}", handoff_dir.display());
+        }
+        let members = self
+            .mgr
+            .list()
+            .into_iter()
+            .map(|s| crate::drain::Member {
+                id: s.id,
+                resumable: self.mgr.resumes_by_id(s.id),
+                is_agent: s.is_agent,
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let run = DrainRun {
+            drain: crate::drain::Drain::new(members, initiator, cfg, handoff_dir, now),
+            last_poll: now,
+            finishing: false,
+            done: false,
+            generation,
+        };
+        let resp = Self::progress_of(&run);
+        *slot = Some(run);
+        self.done_seen.store(false, Ordering::SeqCst);
+        self.mgr.set_draining(true);
+        drop(slot);
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("drain".into())
+            .spawn(move || me.drive(generation))
+            .map(|_| resp)
+            .unwrap_or_else(|e| {
+                eprintln!("排空线程起不来：{e}");
+                self.abandon(generation);
+                Response::Error(ErrorCode::Internal(e.to_string()))
+            })
+    }
+
+    /// `Request::DrainStatus`。
+    fn status(&self, renew: bool) -> Response {
+        let mut slot = recover(self.run.lock());
+        match slot.as_mut() {
+            None => Response::DrainProgress {
+                progress: idle_progress(),
+                done: false,
+            },
+            Some(run) => {
+                if renew {
+                    run.last_poll = std::time::Instant::now();
+                }
+                if run.done {
+                    self.done_seen.store(true, Ordering::SeqCst);
+                }
+                Self::progress_of(run)
+            }
+        }
+    }
+
+    /// `Request::DrainCancel`。已经开始落盘就取消不了，回当前进度。
+    fn cancel(&self) -> Response {
+        let mut slot = recover(self.run.lock());
+        match slot.as_ref() {
+            Some(run) if run.finishing => Self::progress_of(run),
+            _ => {
+                *slot = None;
+                self.mgr.set_draining(false);
+                Response::Ok
+            }
+        }
+    }
+
+    /// 撤掉第 `generation` 场（还是它的话），回到正常。
+    fn abandon(&self, generation: u64) {
+        let mut slot = recover(self.run.lock());
+        if slot.as_ref().is_some_and(|r| r.generation == generation) {
+            *slot = None;
+            self.mgr.set_draining(false);
+        }
+    }
+
+    /// 排空线程本体：每拍看一眼各会话，执行状态机给的动作。
+    fn drive(&self, generation: u64) {
+        loop {
+            std::thread::sleep(self.hooks.tick);
+            let states: std::collections::HashMap<u32, crate::session::SessionState> = self
+                .mgr
+                .list()
+                .into_iter()
+                .map(|s| (s.id, s.state))
+                .collect();
+            let now = std::time::Instant::now();
+            let actions = {
+                let mut slot = recover(self.run.lock());
+                let Some(run) = slot.as_mut().filter(|r| r.generation == generation) else {
+                    // 被取消了（或者已经换了一场），这条线程的事办完了。
+                    return;
+                };
+                if now.saturating_duration_since(run.last_poll) > self.hooks.lease {
+                    eprintln!("dct restart 那边不再问进度了，取消重启。");
+                    *slot = None;
+                    self.mgr.set_draining(false);
+                    return;
+                }
+                let actions = run.drain.step(now, &states);
+                if actions
+                    .iter()
+                    .any(|a| matches!(a, crate::drain::Action::Finish { .. }))
+                {
+                    run.finishing = true;
+                }
+                actions
+            };
+            for a in actions {
+                match a {
+                    crate::drain::Action::AskHandoff { id, path } => {
+                        let text = crate::drain::handoff_text(&path);
+                        if let Err(e) = crate::bridge::submit_unchecked(&self.mgr, id, &text) {
+                            eprintln!("请会话 {id} 写交接没打进去：{e}");
+                        }
+                    }
+                    crate::drain::Action::Nudge { id } => {
+                        if let Err(e) =
+                            crate::bridge::submit_unchecked(&self.mgr, id, crate::drain::NUDGE_TEXT)
+                        {
+                            eprintln!("催会话 {id} 停下没打进去：{e}");
+                        }
+                    }
+                    crate::drain::Action::Finish {
+                        interrupted,
+                        handoffs,
+                    } => {
+                        self.finish(generation, &interrupted, &handoffs);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 记状态、交给小进程、退出。小进程起不来就撤回排空、照常运行：
+    /// 宁可不重启，也不能把所有会话杀了却起不来新的。
+    fn finish(
+        &self,
+        generation: u64,
+        interrupted: &std::collections::HashSet<u32>,
+        handoffs: &std::collections::HashMap<u32, PathBuf>,
+    ) {
+        self.mgr.persist_final_last_sessions(interrupted, handoffs);
+        if let Err(e) = (self.hooks.swap)(&self.socket) {
+            eprintln!("平稳重启没交出去，照常运行：{e}");
+            self.mgr.unfreeze_last_sessions();
+            self.abandon(generation);
+            return;
+        }
+        if let Some(run) = recover(self.run.lock()).as_mut() {
+            run.done = true;
+        }
+        // 给 CLI 一点时间问到 `done: true`，它才知道该去等新后台了。
+        let deadline = std::time::Instant::now() + self.hooks.linger;
+        while !self.done_seen.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (self.hooks.exit)();
+    }
 }
 
 /// 守护进程里多电脑那一路还活着的东西。
@@ -1006,6 +1282,7 @@ fn serve(
     pairs: Arc<Mutex<PairTable>>,
     live: Arc<crate::live::LiveState>,
     mesh: Arc<MeshCtl>,
+    drain: Arc<DrainCtl>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -1033,6 +1310,20 @@ fn serve(
                 &profiles_dir,
                 &crate::mesh::login::http_transport,
             ),
+            // 平稳重启同样只从本机 socket 上来：局域网手机页不能让这台电脑重启。
+            Ok(Request::Drain {
+                wait_s,
+                nudge_wait_s,
+                initiator,
+            }) => drain.start(
+                crate::drain::DrainConfig {
+                    wait: Duration::from_secs(wait_s),
+                    nudge_wait: Duration::from_secs(nudge_wait_s),
+                },
+                initiator,
+            ),
+            Ok(Request::DrainStatus { renew }) => drain.status(renew),
+            Ok(Request::DrainCancel) => drain.cancel(),
             // 本机 socket 这一路**带着** `web`：设置页要能开关那个监听口。
             // 从 HTTP 上来的请求走的是另一个调用点，那边传 `None`——手机
             // 自己开关不了它，也问不出那条带令牌的地址。
@@ -1401,6 +1692,10 @@ fn handle(
         | Request::MeshSend { .. } => Ok(Response::Error(ErrorCode::BadRequest(
             "Mesh requests are local only".into(),
         ))),
+        // 同上：排空只从本机 socket 上答。
+        Request::Drain { .. } | Request::DrainStatus { .. } | Request::DrainCancel => Ok(
+            Response::Error(ErrorCode::BadRequest("Drain requests are local only".into())),
+        ),
         Request::WebStatus => Ok(web_status(web, secrets)),
         Request::WebEnable => Ok(web_enable(
             WEB_BIND,
@@ -3192,6 +3487,41 @@ mod tests {
         (mgr, store, secrets, profiles_dir)
     }
 
+    /// 排空只从本机 socket 上发起（在 `serve` 里分走）；从局域网手机页那一路
+    /// 进 `handle` 的一律拒绝。
+    #[test]
+    fn drain_requests_are_refused_off_the_local_socket() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        for req in [
+            Request::Drain {
+                wait_s: 1,
+                nudge_wait_s: 1,
+                initiator: None,
+            },
+            Request::DrainStatus { renew: true },
+            Request::DrainCancel,
+        ] {
+            let resp = handle(
+                req,
+                &mgr,
+                &store,
+                &secrets,
+                profiles_dir.path(),
+                &test_phone(),
+                &test_bridge(),
+                &test_event_tx(),
+                None,
+                &test_pairs(),
+                &test_live(),
+            );
+            assert!(
+                matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
+                "{resp:?}"
+            );
+        }
+        assert!(!mgr.is_draining());
+    }
+
     /// Ruling 3：`Request::PhoneStatus` 读的是共享状态槽，不是它自己现算的
     /// 东西——外面把槽里的值改了，请求立刻看到新值。
     #[test]
@@ -4708,5 +5038,383 @@ mod mesh_tests {
             a.mesh.lock().unwrap().endpoint(),
             b.mesh.lock().unwrap().endpoint()
         );
+    }
+}
+
+// 只在 Unix 上跑：靠清屏转义切 BUSY/IDLE，Windows 的伪终端会重画屏幕，
+// 时序不稳；排空本身的逻辑跟平台无关（`drain.rs` 的纯测试两边都跑）。
+#[cfg(all(test, unix))]
+mod drain_tests {
+    use super::*;
+    use crate::client::Client;
+    use crate::drain::{Progress, NUDGE_TEXT};
+    use crate::session::SessionState;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    /// 假的收尾：记一下被调了几次，不起 `__swap`、不退出进程。
+    #[derive(Default)]
+    struct Calls {
+        swaps: AtomicUsize,
+        exits: AtomicUsize,
+    }
+
+    fn fake_hooks(lease: Duration, swap_ok: bool) -> (DrainHooks, Arc<Calls>) {
+        let calls = Arc::new(Calls::default());
+        let (c1, c2) = (calls.clone(), calls.clone());
+        let hooks = DrainHooks {
+            lease,
+            tick: Duration::from_millis(50),
+            linger: Duration::ZERO,
+            swap: Box::new(move |_socket: &Path| {
+                c1.swaps.fetch_add(1, Ordering::SeqCst);
+                if swap_ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("起不来"))
+                }
+            }),
+            exit: Box::new(move || {
+                c2.exits.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        (hooks, calls)
+    }
+
+    /// 会按 id 接回的 agent：读一行输入就 BUSY、睡 1 秒、再 IDLE。
+    fn idle_agent() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "drain-idle"
+            command = ["/bin/sh", "-c", 'printf "\033[2J\033[HIDLE"; while read l; do printf "\033[2J\033[HBUSY"; sleep 1; printf "\033[2J\033[HIDLE"; done', "sh"]
+            is_agent = true
+            busy_pattern = "BUSY"
+            idle_pattern = "IDLE"
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 一直忙的 agent：屏幕顶上永远是 BUSY，打进去的字原样回显。
+    fn busy_agent() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "drain-busy"
+            command = ["/bin/sh", "-c", 'printf "\033[2J\033[HBUSY"; cat', "sh"]
+            is_agent = true
+            busy_pattern = "BUSY"
+            idle_pattern = "IDLE"
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    fn git_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    struct Rig {
+        home: tempfile::TempDir,
+        sock: PathBuf,
+        mgr: Arc<SessionManager>,
+        calls: Arc<Calls>,
+    }
+
+    fn rig(lease: Duration, swap_ok: bool) -> Rig {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        let mgr = Arc::new(SessionManager::new());
+        mgr.register_profile(idle_agent());
+        mgr.register_profile(busy_agent());
+        let (hooks, calls) = fake_hooks(lease, swap_ok);
+        let (s, m) = (sock.clone(), mgr.clone());
+        std::thread::spawn(move || {
+            let _ = run_with_hooks(&s, m, hooks);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Client::connect(&sock).is_err() {
+            assert!(Instant::now() < deadline, "后台没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Rig {
+            home,
+            sock,
+            mgr,
+            calls,
+        }
+    }
+
+    impl Rig {
+        fn call(&self, req: Request) -> Response {
+            Client::connect(&self.sock).unwrap().call(req).unwrap()
+        }
+
+        fn create(&self, profile: &str, name: &str) -> u32 {
+            let dir = git_dir(self.home.path(), name);
+            self.mgr.create(&dir, profile, None, &[]).unwrap()
+        }
+
+        fn wait_state(&self, id: u32, want: SessionState) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let st = self.mgr.list().into_iter().find(|s| s.id == id).map(|s| s.state);
+                if st == Some(want) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "会话 {id} 停在 {st:?}，等的是 {want:?}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// 一直续租约地问进度，直到 `done`。
+        fn poll_until_done(&self) -> Progress {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match self.call(Request::DrainStatus { renew: true }) {
+                    Response::DrainProgress { progress, done: true } => return progress,
+                    Response::DrainProgress { .. } => {}
+                    other => panic!("答得不对：{other:?}"),
+                }
+                assert!(Instant::now() < deadline, "排空一直没结束");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn last_sessions(&self) -> Vec<crate::last_sessions::RecordedSession> {
+            crate::last_sessions::load(&crate::last_sessions::last_sessions_path_for_socket(
+                &self.sock,
+            ))
+        }
+    }
+
+    fn not_running(r: Response) -> bool {
+        matches!(r, Response::DrainProgress { progress, done: false } if progress.waiting.is_empty())
+    }
+
+    #[test]
+    fn drain_with_all_idle_persists_ids_and_reports_done() {
+        let r = rig(Duration::from_secs(10), true);
+        let a = r.create("drain-idle", "a");
+        let b = r.create("drain-idle", "b");
+        // 各提交一句，对话 id 才会被记下来（没说过话的会话没有可接回的对话）。
+        for id in [a, b] {
+            r.mgr.send_input(id, "hi").unwrap();
+            r.mgr.send_input(id, "").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        r.wait_state(a, SessionState::Idle);
+        r.wait_state(b, SessionState::Idle);
+
+        let resp = r.call(Request::Drain {
+            wait_s: 5,
+            nudge_wait_s: 2,
+            initiator: None,
+        });
+        assert!(matches!(resp, Response::DrainProgress { .. }), "{resp:?}");
+        r.poll_until_done();
+
+        let recs = r.last_sessions();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs.iter().all(|s| s.conversation_id.is_some()), "{recs:?}");
+        assert!(recs.iter().all(|s| !s.interrupted), "{recs:?}");
+        // 能按 id 接回的会话不用写交接（`resumes_by_id` 接上了）。
+        assert!(recs.iter().all(|s| s.handoff.is_none()), "{recs:?}");
+        assert_eq!(r.calls.swaps.load(Ordering::SeqCst), 1);
+        assert_eq!(r.calls.exits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_second_drain_reports_progress_instead_of_restarting() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        let first = r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+        });
+        let Response::DrainProgress { progress: p1, .. } = first else {
+            panic!("{first:?}")
+        };
+        assert_eq!(p1.waiting, vec![id]);
+        let again = r.call(Request::Drain {
+            wait_s: 1,
+            nudge_wait_s: 1,
+            initiator: None,
+        });
+        let Response::DrainProgress { progress: p2, .. } = again else {
+            panic!("{again:?}")
+        };
+        assert_eq!(p2.waiting, vec![id]);
+        assert!(p2.remaining_s > 30, "第二次 Drain 不该按新参数重新开始：{p2:?}");
+        assert!(matches!(r.call(Request::DrainCancel), Response::Ok));
+    }
+
+    #[test]
+    fn drain_cancel_restores_normal_input() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+        });
+        assert!(r.mgr.is_draining());
+        assert!(matches!(r.call(Request::DrainCancel), Response::Ok));
+        assert!(!r.mgr.is_draining());
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+        assert_eq!(r.calls.swaps.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drain_lease_expires_without_status_polls() {
+        let r = rig(Duration::from_millis(200), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+        });
+        assert!(r.mgr.is_draining());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!r.mgr.is_draining(), "CLI 不来问了，排空该自己撤掉");
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+    }
+
+    /// 界面画横幅时问的 `renew: false` 不算「CLI 还在」。
+    #[test]
+    fn status_polls_without_renew_do_not_extend_the_lease() {
+        let r = rig(Duration::from_millis(200), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+        });
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            r.call(Request::DrainStatus { renew: false });
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!r.mgr.is_draining(), "renew:false 的轮询不该续租约");
+    }
+
+    #[test]
+    fn status_polls_with_renew_keep_the_drain_alive() {
+        let r = rig(Duration::from_millis(200), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+        });
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            r.call(Request::DrainStatus { renew: true });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(r.mgr.is_draining(), "CLI 一直在问，排空不该被撤掉");
+        r.call(Request::DrainCancel);
+    }
+
+    #[test]
+    fn drain_nudges_busy_session_and_marks_it_interrupted() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 1,
+            nudge_wait_s: 1,
+            initiator: None,
+        });
+        r.poll_until_done();
+
+        let head: String = NUDGE_TEXT.chars().take(8).collect();
+        assert!(
+            r.mgr.screen_text_for_test(id).contains(&head),
+            "屏幕上没出现催促的话：{}",
+            r.mgr.screen_text_for_test(id)
+        );
+        let recs = r.last_sessions();
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert!(recs[0].interrupted, "{recs:?}");
+
+        // 落盘之后、退出之前，别的地方再落盘也不许把 `interrupted` 冲掉。
+        let path = crate::last_sessions::last_sessions_path_for_socket(&r.sock);
+        let before = std::fs::read_to_string(&path).unwrap();
+        r.mgr.persist_last_sessions();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// 发起重启的那个会话不等、直接记成被打断。
+    #[test]
+    fn the_initiator_is_not_waited_for_and_is_interrupted() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: Some(id),
+        });
+        r.poll_until_done();
+        let recs = r.last_sessions();
+        assert!(recs[0].interrupted, "{recs:?}");
+        assert!(
+            !r.mgr.screen_text_for_test(id).contains(&NUDGE_TEXT.chars().take(8).collect::<String>()),
+            "发起者不该被催"
+        );
+    }
+
+    /// 起不了 `__swap`：宁可不重启，也不能把会话都杀了却起不来新的。
+    #[test]
+    fn a_failed_swap_cancels_the_drain_and_keeps_running() {
+        let r = rig(Duration::from_secs(10), false);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: Some(id),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.calls.swaps.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "一直没去起 __swap");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.mgr.is_draining() {
+            assert!(Instant::now() < deadline, "起不来之后该撤掉排空");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(r.calls.exits.load(Ordering::SeqCst), 0, "不许退出");
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+
+        // 清单不再冻着：照常落盘会把 `interrupted` 写回 false。
+        r.mgr.persist_last_sessions();
+        assert!(!r.last_sessions()[0].interrupted);
     }
 }

@@ -825,6 +825,8 @@ pub fn run(
         live::poll_status(&mut app, std::time::Instant::now());
         // 多电脑现状：后台线程问、这里收，绘制路径上不发请求（见 `computers`）。
         computers::poll(&mut app, std::time::Instant::now());
+        // dct 是不是正在准备重启——每一屏都要，同 `live::poll_status`。
+        poll_drain(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
@@ -2560,6 +2562,39 @@ fn bar_widths(inner: u16) -> (u16, u16, u16) {
     (escape, project, rest - project)
 }
 
+/// 多久问一次「是不是在准备重启」。
+const DRAIN_POLL_EVERY: Duration = Duration::from_secs(1);
+
+/// 一秒问一次 `DrainStatus { renew: false }`（只看不续——续租约是发起重启的
+/// CLI 的事），有排空在跑就让顶上画一行。连不上的时候不问。
+fn poll_drain(app: &mut App, now: std::time::Instant) {
+    if !app.connected {
+        return;
+    }
+    if app
+        .drain_last_fetch
+        .is_some_and(|t| now.saturating_duration_since(t) < DRAIN_POLL_EVERY)
+    {
+        return;
+    }
+    app.drain_last_fetch = Some(now);
+    app.drain = drain_banner_from(
+        app.client()
+            .and_then(|c| c.call(Request::DrainStatus { renew: false })),
+    );
+}
+
+/// 后台的回答 → 要不要画横幅。还有会话在等才画；旧后台不认这条请求
+/// （回一个错误）、连不上，都安静地不画。
+fn drain_banner_from(r: anyhow::Result<Response>) -> Option<crate::drain::Progress> {
+    match r {
+        Ok(Response::DrainProgress { progress, .. }) if !progress.waiting.is_empty() => {
+            Some(progress)
+        }
+        _ => None,
+    }
+}
+
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw_with_theme(f: &mut Frame, app: &mut App, theme: Option<Theme>) {
@@ -2758,6 +2793,24 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Web => web::draw(f, chunks[0], app),
         View::Live { .. } => live::draw(f, chunks[0], app),
         View::Pair { .. } => pair_view::draw(f, chunks[0], app),
+    }
+
+    // dct 准备重启：在内容区顶上**盖**一行，不挤内容区——同底栏盖在会话
+    // 画面上的道理，改尺寸会让 agent 整屏重绘。
+    if let Some(p) = &app.drain {
+        let top = Rect {
+            height: 1,
+            ..chunks[0]
+        };
+        f.render_widget(ratatui::widgets::Clear, top);
+        f.render_widget(
+            Paragraph::new(crate::i18n::msg::restart_pending_banner(
+                app.lang,
+                p.waiting.len(),
+            ))
+            .style(bar_danger(app.bar)),
+            top,
+        );
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
@@ -5229,6 +5282,64 @@ is_agent = true
     /// 「你在播」——这个功能最危险的失败模式不是链接泄露，是老师忘了
     /// 自己在播、切去处理一件私事。所以这一档必须压过消息，甚至压过
     /// 错误消息，见 `ui::mod::draw` 里那段注释。
+    /// dct 准备重启的时候，不管在哪一屏，顶上第一行都要说着「在等几个会话」。
+    #[test]
+    fn a_pending_restart_is_announced_on_the_top_row() {
+        use ratatui::backend::TestBackend;
+        for view in [View::Board, View::Attached(1)] {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = app_with_one_agent_session(view);
+            app.drain = Some(crate::drain::Progress {
+                waiting: vec![1, 2],
+                remaining_s: 60,
+                nudged: false,
+            });
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let top: String = (0..buf.area.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect::<String>()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(top.contains("dct准备重启"), "顶上没说要重启：{top}");
+            assert!(top.contains('2'), "没说在等几个：{top}");
+        }
+    }
+
+    /// 没在排空（或旧后台不认这条请求）就什么都不画。
+    #[test]
+    fn no_pending_restart_draws_no_banner() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.drain = None;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(term.backend().buffer()).contains("准备重启"));
+    }
+
+    #[test]
+    fn drain_banner_state_follows_the_daemon_answer() {
+        let p = |w: Vec<u32>| crate::drain::Progress {
+            waiting: w,
+            remaining_s: 5,
+            nudged: false,
+        };
+        let running = Response::DrainProgress {
+            progress: p(vec![3]),
+            done: false,
+        };
+        assert_eq!(drain_banner_from(Ok(running)), Some(p(vec![3])));
+        let idle = Response::DrainProgress {
+            progress: p(vec![]),
+            done: false,
+        };
+        assert_eq!(drain_banner_from(Ok(idle)), None);
+        let old_daemon = Response::Error(crate::proto::ErrorCode::BadRequest("unknown variant".into()));
+        assert_eq!(drain_banner_from(Ok(old_daemon)), None);
+        assert_eq!(drain_banner_from(Err(anyhow::anyhow!("断了"))), None);
+    }
+
     #[test]
     fn the_live_banner_beats_every_other_bar_content() {
         use ratatui::backend::TestBackend;

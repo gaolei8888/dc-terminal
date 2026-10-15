@@ -1362,6 +1362,15 @@ pub mod msg {
         t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
     }
 
+    /// dct 准备重启时顶上那一行：还在等几个会话停下。
+    pub fn restart_pending_banner(lang: Lang, waiting: usize) -> String {
+        t!(
+            lang,
+            en: format!("dct is about to restart: still waiting for {waiting} session(s)"),
+            zh: format!("dct 准备重启：还在等 {waiting} 个会话"),
+        )
+    }
+
     /// 顶栏那行常驻提示的正文：「正在直播 · N 路 · M 人在看」。**这一句
     /// 是整个功能最重要的一块文案**——不带人数的话，老师看不出这行字是
     /// 「活的」还是昨天就一直挂在那儿的死文案（见 `ui::live` 的文档注释）。
