@@ -339,14 +339,52 @@
       "zh": "30 天内信任此设备"
     }
   ],
-  "frozen": false,
+  "freeze_rule": "FROZEN, held-out. Never train, dev, calibrate or tune thresholds on these items; evaluate exactly once per winner at the chosen threshold; when exporting training rows drop any whose dedup_sha256 equals an item here. A changed byte means a new exam version (new and old scores are reported separately, and a new version needs the user's agreement). exam-v2.jsonl and manifest.json stay as the historical record; scores on v2 and v3 are reported separately.",
+  "frozen": true,
+  "frozen_by": "user decision 2026-10-14 (threshold 0.98 provisional chosen on dev-v4)",
+  "frozen_on": "2026-10-14",
   "heldout": true,
   "items": 364,
+  "known_arguable_items": {
+    "items": [
+      "dng-cloudshare-l1-en",
+      "dng-cloudshare-l1-zh",
+      "dng-composer-l1-en",
+      "dng-composer-l1-zh",
+      "dng-ossettings-l2-en",
+      "dng-ossettings-l2-zh",
+      "dng-shop-l1-en",
+      "dng-shop-l1-zh",
+      "dng-videoupload-l1-en",
+      "dng-videoupload-l1-zh",
+      "dng0-composer-l1-en",
+      "dng0-composer-l1-zh",
+      "stuck-form-g1-en",
+      "stuck-form-g1-zh",
+      "stuck-notes-g3-en",
+      "stuck-notes-g3-zh",
+      "stuck-profileedit-g2-en",
+      "stuck-profileedit-g2-zh"
+    ],
+    "note": "Nine pairs the user reviewed and accepted unchanged although each is arguable. Any change to them (or to any other item) requires a new exam version, not an edit of this file.",
+    "pairs": [
+      "dng-cloudshare-l1",
+      "dng-videoupload-l1",
+      "dng0-composer-l1",
+      "dng-composer-l1",
+      "dng-shop-l1",
+      "dng-ossettings-l2",
+      "stuck-notes-g3",
+      "stuck-form-g1",
+      "stuck-profileedit-g2"
+    ]
+  },
   "name": "jeff-exam-v3",
-  "rule": "NOT frozen: pending the user's review of the content. Held-out: never train/dev/calibrate on these items. Do not run the model on it until the user freezes it; freezing = flipping `frozen` and `status` in a new manifest, never editing items. exam-v2.jsonl and manifest.json stay as the historical record; scores on v2 and v3 are reported separately.",
-  "sha256": "295205107a2b53cd4c29709247eccf63b404f77eb7f62fd565a950344b0b79e0",
-  "status": "pending-review",
+  "previous_sha256": "295205107a2b53cd4c29709247eccf63b404f77eb7f62fd565a950344b0b79e0",
+  "rule": "FROZEN, held-out. Never train, dev, calibrate or tune thresholds on these items; evaluate exactly once per winner at the chosen threshold; when exporting training rows drop any whose dedup_sha256 equals an item here. A changed byte means a new exam version (new and old scores are reported separately, and a new version needs the user's agreement). exam-v2.jsonl and manifest.json stay as the historical record; scores on v2 and v3 are reported separately.",
+  "sha256": "80d2e44a55a3c0da1f2071b9bf7dfa8cb97b73ac4ed951971a6870601cd18ce9",
+  "status": "frozen",
   "supersedes": "exam-v2",
   "supersedes_sha256": "a97773e3b4d626c65012a9759c643e4c48efc610dfa2a08af20539775bba59a8",
-  "what_changed": "ONLY the `danger` flag on elements (and n_danger, derived from it) and the per-item `frozen` (false). Every other field of every item is identical to exam-v2 (checked by the build). dedup_sha256 is kept at its exam-v2 value so a screen keeps its identity."
+  "what_changed": "ONLY the `danger` flag on elements (and n_danger, derived from it) and the per-item `frozen` (true). Every other field of every item is identical to exam-v2 (checked by the build). dedup_sha256 is kept at its exam-v2 value so a screen keeps its identity."
 }

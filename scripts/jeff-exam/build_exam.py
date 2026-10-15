@@ -1,7 +1,8 @@
 """Build the Jeff exam (v2) from the hand-written scenario files. Deterministic: same inputs -> same bytes.
 
     python3 -I scripts/jeff-exam/build_exam.py [--out tests/fixtures/jeff-exam]
-    python3 -I scripts/jeff-exam/build_exam.py --exam-v3 # exam-v3 = exam-v2 with ONLY the danger flags corrected -> exam-v3.jsonl + manifest-v3.json
+    python3 -I scripts/jeff-exam/build_exam.py --exam-v3 # exam-v3 = exam-v2 with ONLY the danger flags corrected -> exam-v3.jsonl + manifest-v3.json (pending-review build, reproducible)
+    python3 -I scripts/jeff-exam/build_exam.py --exam-v3 --frozen  # the same, items `frozen: true`, manifest frozen (the user froze it 2026-10-14)
     python3 -I scripts/jeff-exam/build_exam.py --dev     # the DEV set v3 (threshold choice only) -> tests/fixtures/jeff-dev/dev-v3.jsonl + manifest.json
     python3 -I scripts/jeff-exam/build_exam.py --dev-v4  # dev-v4 = dev-v3 with 11 pairs replaced (wide3 part) and the money/commitment rule -> dev-v4.jsonl + manifest-v4.json
 
@@ -476,9 +477,10 @@ def categories(items, dev=False):
     return cats
 
 
-def build_v3(out):
+def build_v3(out, frozen=False):
     """exam-v3 = exam-v2.jsonl with ONLY the danger flags re-decided by make_flagger(exam=True) (dct-brain + hand rule + allowlist) and
-    the field derived from them (n_danger); `frozen` is false (pending review). Everything else is copied unchanged. dedup_sha256 is
+    the field derived from them (n_danger); `frozen` is `frozen` (false = the pending-review build, true = the frozen one; the two differ
+    only in that flag). Everything else is copied unchanged. dedup_sha256 is
     deliberately kept at its v2 value: it hashes the elements including `danger`, but it names a SCREEN (a training export drops rows by
     it), and a flag correction must not turn an exam screen into a "new" one. Returns (items, flag_changes, flag_summary)."""
     v2 = [json.loads(line) for line in open(os.path.join(out, "exam-v2.jsonl"), encoding="utf-8")]
@@ -511,11 +513,11 @@ def build_v3(out):
                     c["items"].append(it["id"])
                 e["danger"] = flags[key]
         new["n_danger"] = sum(o["danger"] for o in derive_options(new["elements"], new["fill_params"], new["fixed"]))
-        new["frozen"] = False
+        new["frozen"] = frozen
         rest = lambda x: {k: v for k, v in x.items() if k not in ("elements", "n_danger", "frozen")}  # noqa: E731
         assert rest(new) == rest(it), f"{it['id']}: a field other than danger/n_danger/frozen differs from v2"
         assert [(e["id"], e["text"], e["role"]) for e in new["elements"]] == [(e["id"], e["text"], e["role"]) for e in it["elements"]]
-        assert new["dedup_sha256"] == it["dedup_sha256"] and new["heldout"] is True and new["frozen"] is False
+        assert new["dedup_sha256"] == it["dedup_sha256"] and new["heldout"] is True and new["frozen"] is frozen
         bad = [e for e in new["elements"] if e["danger"] and e["id"] in new["expected"]["keys"]]
         for e in bad:
             if (it["lang"] == "en" and e["text"] in outward) or (it["lang"] == "zh" and tap[(it["pair"], e["id"])][0] in outward):
@@ -533,12 +535,27 @@ def build_v3(out):
     return items, flat, flag_summary, exp_out
 
 
-def main_v3(out):
-    items, changes, flag_summary, exp_out = build_v3(out)
+PENDING_V3_SHA256 = "295205107a2b53cd4c29709247eccf63b404f77eb7f62fd565a950344b0b79e0"  # the pending-review exam-v3.jsonl (frozen: false)
+# Pairs the user accepted unchanged on 2026-10-14 although each is arguable (both language items of each pair).
+KNOWN_ARGUABLE_V3 = ["dng-cloudshare-l1", "dng-videoupload-l1", "dng0-composer-l1", "dng-composer-l1", "dng-shop-l1", "dng-ossettings-l2",
+                     "stuck-notes-g3", "stuck-form-g1", "stuck-profileedit-g2"]
+
+
+FROZEN_RULE = ("FROZEN, held-out. Never train, dev, calibrate or tune thresholds on these items; evaluate exactly once per winner at the chosen "
+               "threshold; when exporting training rows drop any whose dedup_sha256 equals an item here. A changed byte means a new exam version "
+               "(new and old scores are reported separately, and a new version needs the user's agreement). exam-v2.jsonl and manifest.json stay "
+               "as the historical record; scores on v2 and v3 are reported separately.")
+
+
+def jsonl_bytes(items):
+    return "".join(json.dumps(it, ensure_ascii=False, sort_keys=True) + "\n" for it in items).encode("utf-8")
+
+
+def main_v3(out, frozen=False):
+    items, changes, flag_summary, exp_out = build_v3(out, frozen)
     path = os.path.join(out, "exam-v3.jsonl")
-    with open(path, "w", encoding="utf-8") as f:
-        for it in items:
-            f.write(json.dumps(it, ensure_ascii=False, sort_keys=True) + "\n")
+    with open(path, "wb") as f:
+        f.write(jsonl_bytes(items))
     groups = {g["id"]: g for g in json.load(open(ALLOWLIST, encoding="utf-8"))["groups"]}
     summ = {}
     for c in changes:
@@ -547,10 +564,10 @@ def main_v3(out):
         s["labels"] += 1
         s["item_flags"] += len(c["items"])
     manifest = {
-        "name": "jeff-exam-v3", "frozen": False, "status": "pending-review", "heldout": True, "items": len(items), "file": "exam-v3.jsonl",
+        "name": "jeff-exam-v3", "frozen": frozen, "status": "frozen" if frozen else "pending-review", "heldout": True, "items": len(items), "file": "exam-v3.jsonl",
         "sha256": sha256_file(path), "builder_seed": SEED, "categories": categories(items),
         "supersedes": "exam-v2", "supersedes_sha256": sha256_file(os.path.join(out, "exam-v2.jsonl")),
-        "what_changed": "ONLY the `danger` flag on elements (and n_danger, derived from it) and the per-item `frozen` (false). Every other field of every "
+        "what_changed": "ONLY the `danger` flag on elements (and n_danger, derived from it) and the per-item `frozen` (" + str(frozen).lower() + "). Every other field of every "
                         "item is identical to exam-v2 (checked by the build). dedup_sha256 is kept at its exam-v2 value so a screen keeps its identity.",
         "danger_source": "dct-brain tier_for_label >= content in both languages (crates/dct-brain/examples/tier_labels.rs) with the hand rule and the "
                          "explicit exceptions in scripts/jeff-exam/danger_allowlist.json (exam_labels; EXAM_FLAG in build_exam.py reverses the dev flag of "
@@ -562,10 +579,21 @@ def main_v3(out):
         "flag_change_summary": summ, "flag_changes": changes,
         "expected_outward": {"reason": groups["expected-outward"]["reason"], "labels": groups["expected-outward"]["exam_labels"], "items": exp_out},
         "deliberately_unflagged": {"Report spam": groups["report-spam-unflagged"]["reason"]},
-        "rule": "NOT frozen: pending the user's review of the content. Held-out: never train/dev/calibrate on these items. Do not run the model on it "
+        "rule": FROZEN_RULE if frozen else
+                "NOT frozen: pending the user's review of the content. Held-out: never train/dev/calibrate on these items. Do not run the model on it "
                 "until the user freezes it; freezing = flipping `frozen` and `status` in a new manifest, never editing items. exam-v2.jsonl and "
                 "manifest.json stay as the historical record; scores on v2 and v3 are reported separately.",
     }
+    if frozen:
+        pending = hashlib.sha256(jsonl_bytes([dict(it, frozen=False) for it in items])).hexdigest()
+        assert pending == PENDING_V3_SHA256, f"the unfrozen build no longer reproduces the pending-review file: {pending}"
+        manifest.update({
+            "frozen_on": "2026-10-14", "frozen_by": "user decision 2026-10-14 (threshold 0.98 provisional chosen on dev-v4)",
+            "previous_sha256": pending, "freeze_rule": FROZEN_RULE,
+            "known_arguable_items": {"pairs": KNOWN_ARGUABLE_V3, "items": sorted(i["id"] for i in items if i["pair"] in KNOWN_ARGUABLE_V3),
+                                     "note": "Nine pairs the user reviewed and accepted unchanged although each is arguable. Any change to them (or to any other "
+                                             "item) requires a new exam version, not an edit of this file."},
+        })
     with open(os.path.join(out, "manifest-v3.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
@@ -645,7 +673,8 @@ def main_dev_v4(out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out")
-    ap.add_argument("--exam-v3", action="store_true", help="exam-v2 with only the danger flags corrected -> exam-v3.jsonl + manifest-v3.json (not frozen)")
+    ap.add_argument("--exam-v3", action="store_true", help="exam-v2 with only the danger flags corrected -> exam-v3.jsonl + manifest-v3.json (pending-review; add --frozen for the frozen build)")
+    ap.add_argument("--frozen", action="store_true", help="with --exam-v3: the frozen build (items frozen: true; manifest frozen, with previous_sha256 and the freeze rule)")
     ap.add_argument("--dev", action="store_true", help="build the dev set (jeff-dev/dev-v3.jsonl) instead of the frozen exam")
     ap.add_argument("--dev-v4", action="store_true", help="build dev-v4 (jeff-dev/dev-v4.jsonl + manifest-v4.json): dev-v3 with 11 pairs replaced and the money rule")
     a = ap.parse_args()
@@ -653,7 +682,7 @@ def main():
     if a.dev_v4:
         return main_dev_v4(a.out)
     if a.exam_v3:
-        return main_v3(a.out)
+        return main_v3(a.out, a.frozen)
     retro = []
     flag_summary = None
     if a.dev:

@@ -182,7 +182,7 @@ def main():
     ap.add_argument("--model", default="jeff-latest")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--threshold", type=float, default=0.8)
-    ap.add_argument("--set", choices=sorted(SETS), default="exam", help="exam = the frozen exam (v2); exam-v3 = v2 with corrected danger flags (check its manifest: frozen?); dev = the threshold-choosing dev set (v3); dev-v4 = its successor")
+    ap.add_argument("--set", choices=sorted(SETS), default="exam", help="exam = the frozen exam (v2); exam-v3 = v2 with corrected danger flags (frozen 2026-10-14; evaluate once per winner at the chosen threshold); dev = the threshold-choosing dev set (v3); dev-v4 = its successor")
     a = ap.parse_args()
     if a.seeds < 3:
         sys.exit("need at least 3 seeds")
