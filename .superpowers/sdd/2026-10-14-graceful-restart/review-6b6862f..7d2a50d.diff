@@ -1,0 +1,233 @@
+# Review package: 6b6862f..7d2a50d
+
+## Commits
+7d2a50d docs(restart): explain graceful restart in the READMEs
+
+## Files changed
+ README.md       | 55 +++++++++++++++++++++++++++++++++++++++++++++++++------
+ README.zh-CN.md | 41 +++++++++++++++++++++++++++++++++++------
+ 2 files changed, 84 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/README.md b/README.md
+index e52a329..1e08d8d 100644
+--- a/README.md
++++ b/README.md
+@@ -360,24 +360,26 @@ actual `~/.dct` either — every data path is derived from the socket path, and
+ tests point that at a temp directory.
+ 
+ If you rebuild `dct` while the daemon from before the rebuild is still running,
+ the next start notices, explains that restarting it will end whatever sessions
+ are currently running (file changes stay, the agents don't), and asks before
+ touching anything. Say yes and it swaps the daemon in and reconnects; say no and
+ it carries on with the old one.
+ 
+ `dct restart` does that swap on demand, without opening the board — for when the
+ rebuild produced the same version number and nothing notices anything is stale.
+-It asks the same question first, listing what will die; `dct restart -y` skips
+-the question. With nothing running there is no old daemon to swap and nothing to
+-ask about, so it just starts a fresh one — the board, or in a script (no
+-terminal) the background service alone.
++Unlike the question above, it doesn't cut sessions off mid-task: it waits for
++them to finish first, then brings them back (see
++[Restarting without losing work](#restarting-without-losing-work)). With nothing
++running there is no old daemon to swap and nothing to ask about, so it just
++starts a fresh one — the board, or in a script (no terminal) the background
++service alone.
+ 
+ </details>
+ 
+ ---
+ 
+ ## It never asks "is this okay?"
+ 
+ **Precisely because you can always take it back.** Before every turn, `dct`
+ takes a hidden snapshot of the project. That is what makes it safe to turn
+ permission prompts off entirely: agents don't stall waiting for you to say yes,
+@@ -403,40 +405,81 @@ command to run. Pick the agent again once it's done.
+ 
+ ## Sessions outlive the terminal
+ 
+ The first run starts a background daemon. **The daemon is the product.** Close
+ the window, shut the lid, come back tomorrow — the sessions are still running
+ exactly where they were. `dct` itself is just the window you reattach with.
+ 
+ The board holds several agents at once, each in its own project directory, out
+ of each other's way.
+ 
+-**If the daemon itself goes away** — a reboot, a crash, `dct restart` — the next
++**If the daemon itself goes away** — a reboot, a crash — the next
+ `dct` lists what was open last time and asks whether to bring it back. Each line
+ says what you'll get: `continues` means the agent reopens the same conversation
+ (Claude, and the four agents that run through it, can), `starts fresh` means a
+ new session in the same folder with the same agent. Press Enter instead and you start with an empty board.
+ 
++### Restarting without losing work
++
++`dct restart` replaces the background service without throwing away what your
++agents were doing. You don't have to stop anything first.
++
++1. **It waits.** It lists what is running and asks once (`-y` skips the
++   question). Then it waits for every busy session to finish what it is doing,
++   and keeps telling you how many it is still waiting for and how much time is
++   left. Sessions that are already waiting for you don't hold anything up.
++2. **It asks the slow ones to pause.** If a session is still busy after 15
++   minutes, dct asks it to stop at a safe point and write one line about where
++   it got to and what comes next. After at most 3 more minutes it restarts
++   anyway.
++3. **Everything comes back by itself.** Each session reopens in its own folder.
++   Claude, the four agents that run through it, and Qwen Code each pick up
++   their own conversation, even when several sit in the same folder. A session
++   that was cut off in the middle of a job is told to check where it got to and
++   carry on.
++4. **Codex and OpenCode leave a note.** These two can't reopen an exact
++   conversation, so before the restart dct asks them to write down what they
++   were doing, how far they got and what's next. The note is kept in
++   `~/.dct/handoffs/`, never in your project. After the restart the new session
++   is told where the note is and to read it first.
++
++While it waits, you can still type into any session yourself. Messages from
++other computers are held back and delivered afterwards; messages from your
++phone or by voice get a short reply saying dct is about to restart, so nothing
++looks sent when it wasn't.
++
++| | |
++|---|---|
++| `dct restart` | wait for sessions to finish, then restart and bring them back |
++| `dct restart --wait 5` | wait at most 5 minutes before asking busy sessions to pause (default 15) |
++| `dct restart --nudge-wait 1` | after asking, wait at most 1 more minute (default 3) |
++| `dct restart --now` | don't wait — restart right away and bring sessions back |
++| Ctrl+C while it waits | call it off; everything carries on as before |
++
++It also works when an agent runs `dct restart` from inside one of its own
++sessions: dct doesn't wait for that session (it is busy running the command),
++and tells it to carry on once the new service is up.
++
+ ---
+ 
+ ## Commands
+ 
+ `dct` on its own opens the board and starts the daemon if it isn't running.
+ Everything else:
+ 
+ | | |
+ |---|---|
+ | `dct ps` | list the sessions running in the background |
+ | `dct stop <n>…` / `--all` | stop sessions, giving them time to wind down |
+ | `dct kill <n>…` / `--all` | kill sessions outright |
+ | `dct prune` | clear stopped sessions off the list |
+-| `dct restart` | swap in the current binary as the daemon (ends every session; `-y` skips the question) |
++| `dct restart` | swap in the current binary as the daemon — waits for sessions to finish, then brings them back (`-y` skips the question; see [above](#restarting-without-losing-work)) |
+ | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
+ | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
+ | `dct daemon` | run only the daemon, no board |
+ | `dct gate` | the door in front of [dct in a browser](#dct-in-a-browser) |
+ | `dct --version` | which one you have |
+ 
+ `ps`, `stop`, `kill` and `prune` never start a daemon: asking "is anything
+ running?" shouldn't turn the answer from no into yes. `restart` does start one,
+ because what you asked for is a daemon running the new binary.
+ 
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index c272636..ed7ba9a 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -310,24 +310,24 @@ cargo clippy --all-targets
+ 
+ 测试会真的建 git 仓库、真的起子进程、真的绑 socket，所以一个一个跑更稳。没有一个测试碰网络，
+ 也没有一个测试碰你真实的 `~/.dct`，所有数据文件的路径都是从 socket 路径推出来的，
+ 而测试把它指向临时目录。
+ 
+ 重新编译过 `dct` 之后，如果旧编译版本的守护进程还在跑，下次启动会发现这一点，跟你说清楚
+ 重启会让正在跑的会话全部结束（文件改动都还在，只是 agent 得重新开），问过你才动手。
+ 答 y 就换掉旧的重连上去；直接回车就还用旧的接着跑。
+ 
+ 想主动换、又不想开界面，敲 `dct restart`——版本号没变（同一个 commit 改个字符串
+-又编了一遍）的时候没人会发现旧的在跑，这条命令就是为那种情况准备的。它同样先问一句，
+-并且把要被断掉的会话列出来给你看；`dct restart -y` 是不问直接换。本来没东西在跑的话
+-没有旧的要换、也就没什么要问，它直接给你起一个新的——开看板；在脚本里（没有终端）
+-就只把后台服务拉起来。
++又编了一遍）的时候没人会发现旧的在跑，这条命令就是为那种情况准备的。跟上面那句问话
++不一样，它不会把干到一半的会话掐断：先等它们干完，换好以后再把它们接回来（见
++[重启不丢活](#重启不丢活)）。本来没东西在跑的话没有旧的要换、也就没什么要问，它直接
++给你起一个新的——开看板；在脚本里（没有终端）就只把后台服务拉起来。
+ 
+ </details>
+ 
+ ---
+ 
+ ## 它从来不问「这样可以吗」
+ 
+ **正因为你随时能反悔。** 每轮开始前 `dct` 给项目拍一张隐藏快照。正是这一点让「把所有权限
+ 确认关掉」变得安全：agent 不会干到一半停下来等你点头，而它闯的祸，一个键就没了。
+ 
+@@ -346,38 +346,67 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不
+ 
+ ---
+ 
+ ## 会话活得比终端久
+ 
+ 第一次跑 `dct` 会拉起一个后台守护进程。**这个守护进程才是产品本体。** 关掉终端窗口、
+ 合上电脑、第二天回来，会话都还在原地跑，`dct` 本身只是重新连上去看一眼。
+ 
+ 看板上可以同时挂好几个 agent，各自待在自己的项目目录里，互不打扰。
+ 
+-**要是守护进程自己没了**——重启电脑、崩了、`dct restart`——下一次敲 `dct` 会列出上次
++**要是守护进程自己没了**——重启电脑、崩了——下一次敲 `dct` 会列出上次
+ 开着的会话，问你要不要接回来。每一条后面写着会得到什么：`继续` 是 agent 接着原来那段
+ 对话（Claude，以及借它跑的那四家都能），`新开` 是在同一个文件夹、用同一个 agent 开一个
+ 新会话。直接回车就从空白看板开始。
+ 
++### 重启不丢活
++
++`dct restart` 换掉后台服务，但不会把 agent 手上的活扔掉。你不用先去一个个停。
++
++1. **先等。** 它把在跑的会话列出来问你一句（`-y` 不问）。然后等每个在忙的会话把手上
++   这一段干完，一直告诉你还在等几个、还剩多久。本来就在等你说话的会话不用等。
++2. **太久的请它先停。** 等了 15 分钟还在忙的，dct 会请它在安全的地方停下，并用一句话
++   写下做到哪了、下一步是什么。最多再等 3 分钟，到点照样重启。
++3. **换完自己接回来。** 每个会话回到原来的文件夹。Claude、借它跑的那四家、还有
++   Qwen Code，都接着各自原来那段对话——同一个文件夹里开着好几个也不会串。干到一半被
++   打断的会话，会被提醒先看看自己做到哪了，再接着干。
++4. **Codex 和 OpenCode 会先写交接。** 这两家没法接回原来那段对话，所以重启前 dct 会请
++   它们写下：在做什么、做到哪了、下一步。交接放在 `~/.dct/handoffs/` 里，不往你的项目
++   里丢文件。重启后新开的会话会被告知交接在哪、先读它。
++
++等的这段时间里，你自己照样可以往任何会话里打字。别的电脑发来的留言先存着，换完再送到；
++手机或语音发来的话会收到一句「dct 正在准备重启，稍后再发」，免得你以为发出去了。
++
++| | |
++|---|---|
++| `dct restart` | 等会话干完，再重启、再接回来 |
++| `dct restart --wait 5` | 最多等 5 分钟，就请还在忙的先停（默认 15） |
++| `dct restart --nudge-wait 1` | 请它停下之后，最多再等 1 分钟（默认 3） |
++| `dct restart --now` | 不等，马上重启，换完照样接回来 |
++| 等的时候按 Ctrl+C | 不换了，一切照旧 |
++
++让 agent 在它自己的会话里敲 `dct restart` 也行：dct 不会傻等这个会话（它正忙着跑这条
++命令），新的后台起来以后会叫它接着干。
++
+ ---
+ 
+ ## 命令
+ 
+ 光敲 `dct` 就是打开看板，守护进程没在跑就顺手拉起来。其余的：
+ 
+ | | |
+ |---|---|
+ | `dct ps` | 列出后台在跑的会话 |
+ | `dct stop <会话号>…` / `--all` | 停掉会话，给它收尾的时间 |
+ | `dct kill <会话号>…` / `--all` | 直接杀掉 |
+ | `dct prune` | 把已经停掉的会话从列表里清掉 |
+-| `dct restart` | 把守护进程换成当前这个二进制（所有会话都会断；`-y` 不问） |
++| `dct restart` | 把守护进程换成当前这个二进制——先等会话干完，换完再接回来（`-y` 不问；见[上面](#重启不丢活)） |
+ | `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
+ | `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
+ | `dct daemon` | 只跑守护进程，不开看板 |
+ | `dct gate` | [浏览器里的 dct](#浏览器里的-dct) 前面那道门 |
+ | `dct --version` | 看装的是哪一版 |
+ 
+ `ps`、`stop`、`kill`、`prune` 绝不拉起守护进程：问「有没有东西在跑」，不该把答案从
+ 「没有」变成「有」。`restart` 会拉起一个，因为你要的就是「后台跑着新的」。
+ 
+ ---

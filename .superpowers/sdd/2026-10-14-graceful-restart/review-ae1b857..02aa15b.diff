@@ -1,0 +1,946 @@
+# Review package: ae1b857..HEAD
+
+## Commits
+02aa15b fix(restore): record a conversation id only after a submitted turn, restart sessions whose conversation is gone with a warning, and keep id records in --continue grouping when their profile no longer resumes by id
+
+## Files changed
+ src/daemon.rs        | 244 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ src/i18n.rs          |  10 +++
+ src/last_sessions.rs |  48 ++++++++--
+ src/main.rs          |   6 +-
+ src/proto.rs         |   3 +
+ src/session.rs       | 108 ++++++++++++++++++++++-
+ 6 files changed, 403 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 53bc108..6cc6d8f 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -145,29 +145,34 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+     let last_sessions_path = crate::last_sessions::last_sessions_path_for_socket(socket);
+     let last_sessions_records = crate::last_sessions::load(&last_sessions_path);
+     mgr.set_last_sessions_path(last_sessions_path);
+     if !last_sessions_records.is_empty() {
+         eprintln!(
+             "dct：正在接回上次的 {} 个会话……",
+             last_sessions_records.len()
+         );
+         let (all, _) = all_profiles(&profiles_dir);
+         let secrets_guard = recover(secrets.lock());
+-        let skips = restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
++        let (skips, by_id) = restore_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
+         drop(secrets_guard);
+         eprintln!("dct：会话接回完成。");
+         // review 之后补上：真正被 TUI 拉起来的守护进程 stdio 全接到
+         // `/dev/null`，上面几行 `eprintln!` 谁都看不见——用户按了 y
+         // 同意恢复，一个格子却悄无声息地没出现，没有任何地方告诉他为什么。
+         // 记下来，交给 `Request::Profiles` 顶给界面，跟 `LlmUnavailable`
+         // 走的是同一条路。
+         mgr.set_resume_skips(skips);
++        // 按 id 接回的那些在后台盯一小会儿：接回失败（对话没了）的会马上
++        // 退出，换一个新开的顶上，再补一句警告。**必须排在
++        // `set_resume_skips` 之后**——那个是整份覆盖，后台补的警告要追加在
++        // 它后面，不能被它冲掉。不等这个线程：守护进程照常开始接请求。
++        watch_resumed_by_id(mgr.clone(), all, by_id, RESUME_WATCH_WINDOW);
+     }
+ 
+     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
+     // Task 5 的 bridge 线程要写的那个地方——两边共用同一把 `Mutex`，谁先谁后
+     // 都不会看到半份数据。启动时只看密钥仓里有没有令牌：**不**在这里打一次
+     // `getMe`（daemon 启动不该依赖网络才能起来，况且这条路径没法在单测里
+     // 避开真实网络）。bot 用户名和是否已经配上人，都要等 bridge 真的跑起来
+     // 之后才补全——这是 Task 5 的范围，这里先给一个诚实但不完整的初值。
+     let phone = {
+         let s = recover(secrets.lock());
+@@ -730,30 +735,55 @@ fn start_phone_bridge(
+ ///
+ /// 返回值是**结构化的**跳过原因（`WarningCode`），不是拼好的句子——跟
+ /// `LlmUnavailable` 同一个理由：这份清单最终要经 `mgr.set_resume_skips`
+ /// 存起来、`Request::Profiles` 顶给界面（review 之后补上的路，
+ /// 见 `SessionManager::resume_skips` 的文档），界面按用户选的语言组句，
+ /// 守护进程自己不猜。**这不是它唯一的出口**：函数内部仍然直接
+ /// `eprintln!` 进度和跳过的原始信息（Chinese，纯诊断用，只有前台
+ /// `dct daemon` 或者截获 stderr 的测试看得见，跟 `install_llm_backend`
+ /// 那条注释是同一条限制），那条narration 不需要多语言、也不需要被测试
+ /// 断言内容，所以没有走返回值。
++#[cfg(test)]
+ fn restore_last_sessions(
+     records: &[crate::last_sessions::RecordedSession],
+     all: &[Profile],
+     secrets: &SecretStore,
+     mgr: &SessionManager,
+ ) -> Vec<crate::proto::WarningCode> {
++    restore_sessions(records, all, secrets, mgr).0
++}
++
++/// 按对话 id 接回的会话，接回之后要在后台盯多久：这段时间里自己退出了
++/// 就算「接回失败」（对话文件没了、agent 报错退出），换一个新开的顶上。
++/// 再晚退出的不算——那是用户在接回来的对话里正常用着用着退出的。
++const RESUME_WATCH_WINDOW: Duration = Duration::from_secs(20);
++
++/// 一个按对话 id 接回、需要后台盯着的会话。
++struct ResumedById {
++    id: u32,
++    record: crate::last_sessions::RecordedSession,
++    secret: Option<String>,
++}
++
++/// 同 `restore_last_sessions`，另外交出按 id 接回的那些，给
++/// [`watch_resumed_by_id`] 盯着。
++fn restore_sessions(
++    records: &[crate::last_sessions::RecordedSession],
++    all: &[Profile],
++    secrets: &SecretStore,
++    mgr: &SessionManager,
++) -> (Vec<crate::proto::WarningCode>, Vec<ResumedById>) {
+     use crate::proto::{SessionResumeSkipReason, WarningCode};
+ 
+-    let resume_flags = crate::last_sessions::continue_flags(records);
++    let resume_flags = crate::last_sessions::continue_flags(records, all);
+     let mut skips = Vec::new();
++    let mut by_id = Vec::new();
+     let total = records.len();
+ 
+     for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
+         // 一条会话的恢复可能要跑真正的子进程 spawn + 首次 git checkpoint
+         // （agent profile 都要），仓库大的话这一步单独就要小半秒。这整段
+         // 恢复是同步跑在守护进程真正开始接请求之前的（见调用点的注释），
+         // 慢仓库、几个会话叠起来能拖出好几秒的静默——静默的等待在这个
+         // 项目里是不被允许的（见 CLAUDE.md「一个不给下一步的等待就是没
+         // 做完」那条同一精神：这里没有错误，但用户看到的现象是一样的，
+         // 「怎么卡住了」）。只印到 stderr——只有前台 `dct daemon` 或者
+@@ -791,43 +821,127 @@ fn restore_last_sessions(
+             });
+             continue;
+         }
+ 
+         let secret = secrets.get(&record.profile);
+         let tag = if record.tag.is_empty() {
+             None
+         } else {
+             Some(record.tag.as_str())
+         };
+-        if let Err(e) = mgr.create_resuming(
++        let resumed = mgr.create_resuming(
+             &record.dir,
+             &record.profile,
+             secret,
+             all,
+             resume,
+             tag,
+             record.conversation_id.as_deref(),
+-        ) {
++        );
++        if let Ok(id) = resumed {
++            if crate::last_sessions::will_resume_by_id(record, all) {
++                by_id.push(ResumedById {
++                    id,
++                    record: record.clone(),
++                    secret: secret.map(str::to_string),
++                });
++            }
++        }
++        if let Err(e) = resumed {
+             eprintln!(
+                 "跳过恢复：{}（{}）没能重新起来：{e}",
+                 record.dir.display(),
+                 record.profile
+             );
+             skips.push(WarningCode::SessionResumeSkipped {
+                 dir: record.dir.display().to_string(),
+                 profile: record.profile.clone(),
+                 reason: SessionResumeSkipReason::StartFailed,
+             });
+         }
+     }
+ 
+-    skips
++    (skips, by_id)
++}
++
++/// 在后台盯着按 id 接回的会话，最多盯 `window` 这么久。哪个在这段时间里
++/// **自己**退出了（被叫停的不算），就当接回失败：把那个死格子拿掉，在同一个
++/// 目录、同一个 profile 下新开一个（新的对话 id、原来的名字），再经
++/// `push_resume_skip` 告诉用户「没能接回原来的对话」。
++///
++/// 跑在单独的线程上，不挡守护进程开始接请求。没东西要盯就不起线程。
++/// 返回线程句柄只是给测试 `join` 用。
++fn watch_resumed_by_id(
++    mgr: Arc<SessionManager>,
++    all: Vec<Profile>,
++    mut pending: Vec<ResumedById>,
++    window: Duration,
++) -> Option<std::thread::JoinHandle<()>> {
++    use crate::proto::{SessionResumeSkipReason, WarningCode};
++
++    if pending.is_empty() {
++        return None;
++    }
++    let spawned = std::thread::Builder::new()
++        .name("resume-watch".into())
++        .spawn(move || {
++            let deadline = std::time::Instant::now() + window;
++            loop {
++                pending.retain(|w| match mgr.exited_on_its_own(w.id) {
++                    // 会话已经不在名册上了（被清理掉了）：没什么可盯的。
++                    None => false,
++                    Some(false) => true,
++                    Some(true) => {
++                        let r = &w.record;
++                        eprintln!(
++                            "{}（{}）没能接回原来的对话，重新开一个",
++                            r.dir.display(),
++                            r.profile
++                        );
++                        mgr.discard(w.id);
++                        let tag = Some(r.tag.as_str()).filter(|t| !t.is_empty());
++                        let reason = match mgr.create_resuming(
++                            &r.dir,
++                            &r.profile,
++                            w.secret.as_deref(),
++                            &all,
++                            false,
++                            tag,
++                            None,
++                        ) {
++                            Ok(_) => SessionResumeSkipReason::ConversationGone,
++                            Err(e) => {
++                                eprintln!("重新开也失败了：{e}");
++                                SessionResumeSkipReason::StartFailed
++                            }
++                        };
++                        mgr.push_resume_skip(WarningCode::SessionResumeSkipped {
++                            dir: r.dir.display().to_string(),
++                            profile: r.profile.clone(),
++                            reason,
++                        });
++                        false
++                    }
++                });
++                if pending.is_empty() || std::time::Instant::now() >= deadline {
++                    return;
++                }
++                std::thread::sleep(Duration::from_millis(100));
++            }
++        });
++    match spawned {
++        Ok(h) => Some(h),
++        Err(e) => {
++            eprintln!("没能起接回看守线程：{e}");
++            None
++        }
++    }
+ }
+ 
+ fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
+     let Some(llm) =
+         &crate::config::Config::load(&crate::config::config_path_for_socket(socket)).llm
+     else {
+         return;
+     };
+     let llm_secrets = SecretStore::load(&secrets_path_for_socket(socket));
+     let (custom, _) = all_profiles(profiles_dir);
+@@ -2439,20 +2553,140 @@ mod tests {
+         assert_eq!(mgr.conversation_of(ids[continued[0]]), None);
+         let conv = mgr
+             .conversation_of(ids[fresh])
+             .expect("新开的那条该领到 id");
+         assert!(
+             texts[fresh].contains(&format!("ARGS --session-id {conv}")),
+             "{texts:?}"
+         );
+     }
+ 
++    /// 按 id 接回就立刻退出的探针（模拟 claude「找不到这段对话」）；
++    /// 新开（`--session-id`）则正常活着。
++    fn gone_probe() -> Profile {
++        Profile::from_toml(&crate::sys::testing::toml_with_sh(
++            r#"
++            name = "gone-probe"
++            command = ["/bin/sh", "-c", "if [ \"$1\" = --resume ]; then echo gone; exit 1; fi; echo \"ARGS $*\"; sleep 30", "sh"]
++            is_agent = false
++            session_id_args = ["--session-id", "{id}"]
++            resume_id_args = ["--resume", "{id}"]
++            "#,
++        ))
++        .unwrap()
++    }
++
++    /// 接回失败（agent 一起来就退出）：死格子拿掉，原处新开一个（新 id、
++    /// 原来的名字），并且有一条「没能接回原来的对话」的警告递到界面上。
++    #[test]
++    fn a_session_whose_conversation_is_gone_is_restarted_fresh_and_reported() {
++        let tmp = tempfile::tempdir().unwrap();
++        let proj = tmp.path().join("proj");
++        std::fs::create_dir(&proj).unwrap();
++        let all = vec![gone_probe()];
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++
++        let mut r = rec(&proj, "gone-probe");
++        r.conversation_id = Some("old".into());
++        r.tag = "修登录白屏".into();
++
++        let mgr = Arc::new(SessionManager::new());
++        let (skips, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
++        assert!(skips.is_empty(), "{skips:?}");
++        assert_eq!(by_id.len(), 1);
++        mgr.set_resume_skips(skips);
++        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_secs(5))
++            .expect("该起看守线程")
++            .join()
++            .unwrap();
++
++        let list = mgr.list();
++        assert_eq!(list.len(), 1, "死格子要拿掉，只剩新开的那个：{list:?}");
++        assert_eq!(list[0].tag, "修登录白屏", "名字要留着");
++        let id = list[0].id;
++        let conv = mgr.conversation_of(id).expect("新开的要有新 id");
++        assert_ne!(conv, "old");
++        let texts = wait_for_args(&mgr, &[id]);
++        assert!(
++            texts[0].contains(&format!("ARGS --session-id {conv}")),
++            "{texts:?}"
++        );
++
++        let warnings = mgr.resume_skips();
++        assert_eq!(warnings.len(), 1, "{warnings:?}");
++        match &warnings[0] {
++            crate::proto::WarningCode::SessionResumeSkipped {
++                reason, profile, ..
++            } => {
++                assert_eq!(
++                    *reason,
++                    crate::proto::SessionResumeSkipReason::ConversationGone
++                );
++                assert_eq!(profile, "gone-probe");
++            }
++            other => panic!("应当是 SessionResumeSkipped：{other:?}"),
++        }
++    }
++
++    /// 接回成功、一直活着的会话：盯满时间也不动它，不报警告。
++    #[test]
++    fn a_session_resumed_by_id_that_stays_up_is_left_alone() {
++        let tmp = tempfile::tempdir().unwrap();
++        let proj = tmp.path().join("proj");
++        std::fs::create_dir(&proj).unwrap();
++        let all = vec![echo_id_probe()];
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++
++        let mut r = rec(&proj, "echo-id");
++        r.conversation_id = Some("keep".into());
++
++        let mgr = Arc::new(SessionManager::new());
++        let (skips, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
++        assert!(skips.is_empty());
++        let before: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
++        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
++            .unwrap()
++            .join()
++            .unwrap();
++
++        let after: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
++        assert_eq!(before, after);
++        assert_eq!(mgr.conversation_of(after[0]).as_deref(), Some("keep"));
++        assert!(mgr.resume_skips().is_empty());
++    }
++
++    /// 刚接回就被用户停掉：那是用户的意思，不是接回失败，不能再开一个。
++    #[test]
++    fn a_resumed_session_stopped_on_purpose_is_not_restarted() {
++        let tmp = tempfile::tempdir().unwrap();
++        let proj = tmp.path().join("proj");
++        std::fs::create_dir(&proj).unwrap();
++        let all = vec![echo_id_probe()];
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++
++        let mut r = rec(&proj, "echo-id");
++        r.conversation_id = Some("keep".into());
++
++        let mgr = Arc::new(SessionManager::new());
++        let (_, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
++        let id = by_id[0].id;
++        mgr.stop(id).unwrap();
++        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
++            .unwrap()
++            .join()
++            .unwrap();
++
++        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
++        assert_eq!(ids, vec![id], "不该多出一个新开的");
++        assert!(mgr.resume_skips().is_empty());
++    }
++
+     // 用 cat 冒充 agent：能收输入、不会自己退出，is_agent = true 才会触发
+     // create() 里的 git checkpoint。
+     fn fake_agent() -> Profile {
+         Profile {
+             name: "daemon-lock-fake".into(),
+             command: vec![crate::sys::testing::tool("cat")],
+             is_agent: true,
+             idle_pattern: None,
+             busy_pattern: None,
+             error_pattern: None,
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 27aba93..65ad428 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -2516,20 +2516,25 @@ pub mod msg {
+                     crate::proto::SessionResumeSkipReason::ProfileGone => t!(
+                         lang,
+                         en: "that agent is no longer available",
+                         zh: "那个 agent 已经不在了",
+                     ),
+                     crate::proto::SessionResumeSkipReason::StartFailed => t!(
+                         lang,
+                         en: "it could not be started again",
+                         zh: "没能重新启动",
+                     ),
++                    crate::proto::SessionResumeSkipReason::ConversationGone => t!(
++                        lang,
++                        en: "its earlier conversation could not be found, so a fresh one was started in its place",
++                        zh: "原来的对话找不到了，已经在原处重新开了一个",
++                    ),
+                 };
+                 t!(
+                     lang,
+                     en: format!("Could not bring back the “{profile}” session in {dir}: {why}."),
+                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
+                 )
+             }
+         }
+     }
+ 
+@@ -3456,20 +3461,25 @@ mod tests {
+             SessionResumeSkipped {
+                 dir: "/w/dc-terminal".into(),
+                 profile: "claude".into(),
+                 reason: crate::proto::SessionResumeSkipReason::ProfileGone,
+             },
+             SessionResumeSkipped {
+                 dir: "/w/dc-terminal".into(),
+                 profile: "claude".into(),
+                 reason: crate::proto::SessionResumeSkipReason::StartFailed,
+             },
++            SessionResumeSkipped {
++                dir: "/w/dc-terminal".into(),
++                profile: "claude".into(),
++                reason: crate::proto::SessionResumeSkipReason::ConversationGone,
++            },
+         ];
+         for c in &codes {
+             for l in Lang::all() {
+                 let s = msg::warning(*l, c);
+                 assert!(!s.trim().is_empty(), "{c:?} 在 {l:?} 下组不出话");
+                 // 底栏只有一行，警告绝不能带换行——带了会在等宽终端上
+                 // 错位换行，看着像一份栈追踪。
+                 assert!(!s.contains('\n'), "{c:?} 在 {l:?} 下带了换行：{s}");
+             }
+             let en = msg::warning(Lang::En, c);
+diff --git a/src/last_sessions.rs b/src/last_sessions.rs
+index d0082d6..b0aa49d 100644
+--- a/src/last_sessions.rs
++++ b/src/last_sessions.rs
+@@ -173,26 +173,41 @@ pub fn group_for_resume(sessions: &[RecordedSession]) -> Vec<bool> {
+         // 确定、可重复，不依赖 HashMap 的迭代顺序（`idxs` 本身是按
+         // 输入顺序 push 进去的，跟 HashMap 的桶序无关）。
+         if let Some(&best) = idxs.iter().max_by_key(|&&i| sessions[i].last_active) {
+             out[best] = true;
+         }
+     }
+ 
+     out
+ }
+ 
+-/// 有对话 id 的记录各接各的，不进 `--continue` 的分组；没有的照旧分组。
++/// 这一条重启后会不会按对话 id 接回：记录里有 id，**而且**它的 profile
++/// 此刻还声明着按 id 接回的参数（`Profile::resumes_by_id`）。profile 后来
++/// 去掉了那两组参数的话，id 就没处用，这一条照旧走 `--continue` 分组。
++pub fn will_resume_by_id(r: &RecordedSession, profiles: &[crate::profile::Profile]) -> bool {
++    r.conversation_id.is_some()
++        && profiles
++            .iter()
++            .find(|p| p.name == r.profile)
++            .is_some_and(|p| p.resumes_by_id())
++}
++
++/// 按 id 接回的记录各接各的，不进 `--continue` 的分组；其余的照旧分组。
+ /// 返回值跟输入逐位对应，语义同 [`group_for_resume`]：`true` = 这一条该带
+-/// `resume_args`。有 id 的那些一律是 `false`——它们按 id 接回，用不着猜。
+-pub fn continue_flags(sessions: &[RecordedSession]) -> Vec<bool> {
++/// `resume_args`。按 id 接回的那些一律是 `false`——用不着猜。判定「按不按
++/// id 接回」见 [`will_resume_by_id`]。
++pub fn continue_flags(
++    sessions: &[RecordedSession],
++    profiles: &[crate::profile::Profile],
++) -> Vec<bool> {
+     let idx: Vec<usize> = (0..sessions.len())
+-        .filter(|&i| sessions[i].conversation_id.is_none())
++        .filter(|&i| !will_resume_by_id(&sessions[i], profiles))
+         .collect();
+     let sub: Vec<RecordedSession> = idx.iter().map(|&i| sessions[i].clone()).collect();
+     let flags = group_for_resume(&sub);
+     let mut out = vec![false; sessions.len()];
+     for (k, &i) in idx.iter().enumerate() {
+         out[i] = flags[k];
+     }
+     out
+ }
+ 
+@@ -245,21 +260,44 @@ mod tests {
+         assert_eq!(load(&p), vec![r]);
+     }
+ 
+     /// 有对话 id 的那条各接各的，不占 `--continue` 的位子；剩下没 id 的
+     /// 照旧按 `last_active` 挑一条继续。
+     #[test]
+     fn continue_flags_skips_records_with_ids() {
+         let mut with_id = rec("/w/x", "claude", 9);
+         with_id.conversation_id = Some("abc".into());
+         let sessions = vec![rec("/w/x", "claude", 5), with_id, rec("/w/x", "claude", 1)];
+-        assert_eq!(continue_flags(&sessions), vec![true, false, false]);
++        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
++        assert_eq!(
++            continue_flags(&sessions, &profiles),
++            vec![true, false, false]
++        );
++    }
++
++    /// 记录里有 id，但 profile 已经不声明按 id 接回的参数了：id 没处用，
++    /// 这一条要回到 `--continue` 分组里去抢位，不能被晾在外面。
++    #[test]
++    fn an_id_whose_profile_no_longer_resumes_by_id_joins_continue_grouping() {
++        let mut with_id = rec("/w/x", "claude", 9);
++        with_id.conversation_id = Some("abc".into());
++        let sessions = vec![rec("/w/x", "claude", 5), with_id.clone()];
++
++        let mut no_ids = crate::profile::Profile::builtin("claude").unwrap();
++        no_ids.session_id_args.clear();
++        no_ids.resume_id_args.clear();
++        let profiles = vec![no_ids];
++
++        assert!(!will_resume_by_id(&with_id, &profiles));
++        assert_eq!(continue_flags(&sessions, &profiles), vec![false, true]);
++        // profile 都不认识了也一样：不算按 id 接回。
++        assert!(!will_resume_by_id(&with_id, &[]));
+     }
+ 
+     #[test]
+     fn last_sessions_path_sits_next_to_socket() {
+         let p = last_sessions_path_for_socket(Path::new("/home/x/.dct/daemon.sock"));
+         assert_eq!(p, PathBuf::from("/home/x/.dct/last-sessions.toml"));
+     }
+ 
+     #[test]
+     fn missing_file_is_empty_and_not_an_error() {
+diff --git a/src/main.rs b/src/main.rs
+index bd998df..99c697b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -287,32 +287,32 @@ fn start_daemon_headless(exe: &Path) -> Result<()> {
+ /// 模块的文档），保持原样比乱猜一个答案更安全。
+ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
+     let path = dct::last_sessions::last_sessions_path_for_socket(sock);
+     let records = dct::last_sessions::load(&path);
+     if records.is_empty() {
+         return;
+     }
+ 
+     let profiles_dir = dct::profile::profiles_dir_for_socket(sock);
+     let (all, _) = dct::profile::all_profiles(&profiles_dir);
+-    let resume_flags = dct::last_sessions::continue_flags(&records);
++    let resume_flags = dct::last_sessions::continue_flags(&records, &all);
+ 
+     println!("{}", text(Key::ResumeSessionsExplain, lang));
+     for (rec, &resume) in records.iter().zip(resume_flags.iter()) {
+         let label = all
+             .iter()
+             .find(|p| p.name == rec.profile)
+             .map(|p| p.display_label(lang))
+             .unwrap_or_else(|| rec.profile.clone());
+         let marker = text(
+-            // 记着对话 id 的按 id 接回，也算「继续」。
+-            if resume || rec.conversation_id.is_some() {
++            // 按对话 id 接回的也算「继续」——跟 `continue_flags` 同一条判定。
++            if resume || dct::last_sessions::will_resume_by_id(rec, &all) {
+                 Key::ResumeSessionsWillContinue
+             } else {
+                 Key::ResumeSessionsWillStartFresh
+             },
+             lang,
+         );
+         let name = if rec.tag.is_empty() {
+             rec.dir.display().to_string()
+         } else {
+             format!("{}  ({})", rec.tag, rec.dir.display())
+diff --git a/src/proto.rs b/src/proto.rs
+index b632990..93c6376 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -1324,20 +1324,23 @@ pub enum WarningCode {
+ 
+ /// 恢复上次会话时，某一条为什么被跳过。
+ #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+ pub enum SessionResumeSkipReason {
+     /// 记录的目录已经不存在了
+     DirGone,
+     /// 记录的 profile 已经不认识了（被删掉、改了名……）
+     ProfileGone,
+     /// 目录和 profile 都还在，但重新起这个会话本身失败了
+     StartFailed,
++    /// 按对话 id 接回时 agent 马上退出了（对话找不到了），已经在原处
++    /// 新开了一个——会话还在，只是原来的对话没接上
++    ConversationGone,
+ }
+ 
+ pub fn socket_path() -> PathBuf {
+     // 问不出家目录就退到临时目录。这不是一个能用的长期位置（临时目录会被
+     // 清理），但它保证 dct 还能起来——而问不出家目录本身已经是这台机器
+     // 出了别的问题。
+     let home = crate::sys::home().unwrap_or_else(std::env::temp_dir);
+     home.join(".dct").join("daemon.sock")
+ }
+ 
+diff --git a/src/session.rs b/src/session.rs
+index 3b2e052..717f82e 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -474,20 +474,32 @@ pub struct SessionInfo {
+ }
+ 
+ struct Session {
+     id: u32,
+     profile: Profile,
+     /// agent 自己的对话 id：dct 开会话时定下（或恢复时带回来）的那个，
+     /// 写进 `last-sessions.toml`，重启后按它接回同一段对话。profile 没声明
+     /// `session_id_args`/`resume_id_args`，或者这一回走的是 `--continue`，
+     /// 就是 `None`。
+     conversation_id: Option<String>,
++    /// 这个会话有没有真的提交过一句话（`send_input` 收到过回车）。
++    ///
++    /// 没提交过的话 agent 那边根本没有这段对话的记录——claude 只在收到
++    /// 第一条消息时才建对话文件，这时去 `--resume <id>` 只会报「找不到
++    /// 对话」然后退出。所以落盘时只有提交过的会话才记 `conversation_id`，
++    /// 没提交过的记 `None`，重启后老老实实新开（反正本来也没东西可接）。
++    /// 按 id 接回来的会话一出生就是 `true`：它的对话早就有了。
++    submitted: bool,
++    /// 是不是被叫停的：`stop()`/`kill()` 置上。恢复后的看守线程靠它分清
++    /// 「接回失败、自己退出了」和「刚接回就被人停掉了」，后者不该被当成
++    /// 接回失败再重开一个。
++    stopped_by_request: bool,
+     dir: PathBuf,
+     is_agent: bool,
+     checkpoints: Vec<String>,
+     state: SessionState,
+     idle_re: Option<regex::Regex>,
+     /// 干活时屏幕上一定有的串，tick() 里判定状态用。跟 idle_re 一起在
+     /// 构造时编译好，profile 的正则错误在起会话这一刻就暴露，不拖到 tick。
+     busy_re: Option<regex::Regex>,
+     /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
+     /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
+@@ -853,21 +865,27 @@ impl SessionManager {
+                     dir: s.dir.clone(),
+                     profile: s.profile.name.clone(),
+                     tag,
+                     // 毫秒不是秒——理由见 `RecordedSession::last_active` 的文档：
+                     // 按秒算的话，同一秒内先后被用过的两个会话会看着一样新。
+                     last_active: s
+                         .last_active
+                         .duration_since(std::time::UNIX_EPOCH)
+                         .unwrap_or_default()
+                         .as_millis() as u64,
+-                    conversation_id: s.conversation_id.clone(),
++                    // 没提交过一句话的会话，agent 那边没有这段对话，记了
++                    // 也接不回——见 `Session::submitted`。
++                    conversation_id: if s.submitted {
++                        s.conversation_id.clone()
++                    } else {
++                        None
++                    },
+                     interrupted: interrupted.contains(&s.id),
+                     handoff: handoffs.get(&s.id).cloned(),
+                 })
+             })
+             .collect();
+         if let Err(e) = crate::last_sessions::save(&path, &records) {
+             eprintln!("上次会话清单写入失败（{}）：{e}", path.display());
+         }
+     }
+ 
+@@ -912,21 +930,21 @@ impl SessionManager {
+     /// 一大批测试），那条路上根本不存在「要不要接上恢复参数」这个问题——
+     /// 硬塞一个恒为 `false` 的参数进每一个调用点，是在让所有跟恢复无关的
+     /// 调用方替一个只有守护进程启动那一刻才用得上的功能背默认值。加一个
+     /// 姐妹方法，正常路径原封不动，恢复路径（目前只有 `daemon.rs` 启动时
+     /// 读 `last-sessions.toml` 那一段）单独走这条。
+     ///
+     /// `resume = true` 时把 `profile.resume_args` 接到 `profile.command`
+     /// 后面（`opencode`/`qwen`/`codex`/`shell` 这类没声明 `resume_args`
+     /// 的 profile，接的是一个空切片，等于什么都没变——调用方不用先检查
+     /// 「这个 profile 支不支持恢复」再决定要不要传 `true`）。判定「这一条
+-    /// 该不该真的传 `true`」是 `last_sessions::group_for_resume` 的事，
++    /// 该不该真的传 `true`」是 `last_sessions::continue_flags` 的事，
+     /// 不是这里。
+     ///
+     /// `restore_tag`：从 `last-sessions.toml` 里记下来的名字（`None` 或者
+     /// 空串 = 那条记录当时还没起出名字，恢复出来的会话就照旧走一遍正常的
+     /// 起名流程，不用特殊处理）。**review 之后补上**：用户在开局提示里
+     /// 已经被明确告知「这个会话会叫这个名字」，`create_resuming` 之前没有
+     /// 把这个名字真的接回去，会话建出来是一个没名字的空槽——提示里的话
+     /// 立刻穿帮。带了名字的话，这里同时把 `name_attempted` 标成
+     /// `true`：这个名字是恢复出来的、不是这一轮新对话起的，`tick()`
+     /// 不该在它干完第一轮活的时候又去问模型要一个新名字、把刚恢复回来的
+@@ -957,20 +975,47 @@ impl SessionManager {
+         )
+     }
+ 
+     /// 这个会话此刻记着的 agent 对话 id（没有就是 `None`）。
+     pub fn conversation_of(&self, id: u32) -> Option<String> {
+         self.with_session(id, |s| Ok(s.conversation_id.clone()))
+             .ok()
+             .flatten()
+     }
+ 
++    /// 会话是不是**自己**退出了（进程没了，又不是被 `stop()`/`kill()` 叫停的）。
++    /// 会话不在了返回 `None`。只看不改：状态翻成 `Stopped`、回收子进程
++    /// 仍归 `tick()` 管。
++    pub fn exited_on_its_own(&self, id: u32) -> Option<bool> {
++        self.with_session(id, |s| {
++            Ok(!s.stopped_by_request && (s.state == SessionState::Stopped || !s.pty.is_alive()))
++        })
++        .ok()
++    }
++
++    /// 把一个会话彻底从名册上拿掉（先杀进程），清单跟着重写。恢复时
++    /// 「接回失败、换一个新开的顶上」用：留着那个死格子只会让用户以为
++    /// 有两个会话。不存在就什么都不做。
++    pub fn discard(&self, id: u32) {
++        let removed = recover(self.sessions.lock()).remove(&id);
++        if let Some(arc) = removed {
++            let _ = recover(arc.lock()).pty.kill();
++            self.persist_last_sessions();
++        }
++    }
++
++    /// 往 `resume_skips` 后面再追加一条。恢复后台线程晚到的警告用——
++    /// `set_resume_skips` 是整份覆盖，会把启动时那批冲掉。
++    pub fn push_resume_skip(&self, w: crate::proto::WarningCode) {
++        recover(self.resume_skips.lock()).push(w);
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn create_inner(
+         &self,
+         dir: &Path,
+         profile_name: &str,
+         secret: Option<&str>,
+         profiles: &[Profile],
+         resume: bool,
+         restore_tag: Option<&str>,
+         conversation: Option<&str>,
+@@ -1072,20 +1117,21 @@ impl SessionManager {
+         env.insert(SESSION_ID_ENV.to_string(), id.to_string());
+ 
+         // 对话 id：恢复时带着旧的就按 id 接回；否则 profile 声明了就新起一个。
+         // 都没有才退回 `resume_args`（`--continue` 按目录猜）。
+         //
+         // 走 `--continue` 的那一条**不能**再加 `--session-id`（claude 不让
+         // 两个一起给），所以那一条这回没有 id，下次重启照旧按目录猜——只此
+         // 一次，之后新开的会话都有 id。没声明 `resume_args` 的 profile 接的
+         // 是空切片，等于没走 `--continue`，照常新起一个 id。
+         let mut command = profile.command.clone();
++        let resumed_by_id = conversation.is_some() && profile.resumes_by_id();
+         let conversation_id = match conversation {
+             Some(c) if profile.resumes_by_id() => {
+                 command.extend(crate::profile::fill_id(&profile.resume_id_args, c));
+                 Some(c.to_string())
+             }
+             _ => {
+                 let continuing = resume && !profile.resume_args.is_empty();
+                 if continuing {
+                     command.extend(profile.resume_args.iter().cloned());
+                 }
+@@ -1123,20 +1169,22 @@ impl SessionManager {
+             .map(str::to_string);
+         // 带了名字就算「已经问过」，见 `create_resuming` 上 `restore_tag`
+         // 那段文档：这个名字是恢复出来的，不该被 `tick()` 干完第一轮活
+         // 之后又问模型要一个新的盖掉。
+         let name_attempted = restored_name.is_some();
+ 
+         let session = Session {
+             id,
+             profile,
+             conversation_id,
++            submitted: resumed_by_id,
++            stopped_by_request: false,
+             dir: dir.to_path_buf(),
+             is_agent,
+             checkpoints,
+             state,
+             idle_re,
+             busy_re,
+             error_re,
+             pty,
+             explanation_slot: Arc::new(Mutex::new(None)),
+             name_slot: Arc::new(Mutex::new(restored_name)),
+@@ -1236,21 +1284,23 @@ impl SessionManager {
+             // **只更新内存，不落盘**：这个方法在正常使用下每一次按键都会
+             // 被调用一次，`last_sessions::save` 的磁盘 IO 绝不能挂在这条
+             // 路径上（跟 `tick()` 不能写盘是同一条纪律，只是触发频率更高）。
+             // 落盘只在会话集合变化（create/stop/kill/prune）或者下面
+             // `tick()` 里 Working → Idle 那一刻发生——见那两处的注释。
+             s.last_active = std::time::SystemTime::now();
+         }
+ 
+         if text.is_empty() {
+             let (dir, sid, seq, is_agent) = {
+-                let s = recover(arc.lock());
++                let mut s = recover(arc.lock());
++                // 回车 = 真的提交了一句话，agent 那边从此有这段对话了。
++                s.submitted = true;
+                 (s.dir.clone(), s.id, s.checkpoints.len(), s.is_agent)
+             };
+ 
+             // **快照拍不上也一定要把回车发出去。** 这里曾经是 `?` 早退：
+             // `git::checkpoint` 一失败就 return，下面写回车那句永远走不到——
+             // 而别的键走的是本函数最后那条不碰 git 的路，照发不误。现场表现
+             // 是「字打得进去，回车按了没反应，而且再也不会有反应」：会话目录
+             // 被搬走或删掉（`rev-parse --git-dir` 直接 fatal）、机器上没有
+             // git、上一次 git 被硬杀留下 `.git/dct-index-N.lock`——这几种都是
+             // **一旦发生就永远失败**，于是那个会话的回车就此死掉，而用户没有
+@@ -1369,20 +1419,21 @@ impl SessionManager {
+             Ok(())
+         })
+     }
+ 
+     pub fn stop(&self, id: u32) -> Result<()> {
+         let r = self.with_session(id, |s| {
+             // pid 要在 kill 之前取：杀完再问就已经被回收了。
+             let pid = s.pty.process_id();
+             s.pty.kill()?;
+             s.state = SessionState::Stopped;
++            s.stopped_by_request = true;
+             // `requested` 和 `tick()` 里那条 `vanished` 是这本日志唯一
+             // 分得开的两件事——见 `journal` 的模块注释。
+             self.journal.died(id, crate::journal::Death::Requested, pid);
+             Ok(())
+         });
+         // **必须在 `with_session` 返回之后调用**：`persist_last_sessions`
+         // 会重新去锁这同一个会话的 `Mutex`（拿它此刻的状态），锁是非重入的，
+         // 挂在上面那个闭包里面调会死锁——`with_session` 这一刻还攥着它。
+         if r.is_ok() {
+             self.persist_last_sessions();
+@@ -1392,20 +1443,21 @@ impl SessionManager {
+ 
+     /// 强杀：跟 `stop` 同一个落点（`state` 置 `Stopped`），只是不给那 200ms。
+     ///
+     /// 状态必须跟 `stop` 一致，不能另立一个「被强杀的」状态：对用户来说
+     /// 这两条命令的结果是同一件事——这个会话不跑了。多一个状态就要在看板、
+     /// 九宫格、`dct ps` 三处各给它一种画法，而它们要表达的话是同一句。
+     pub fn kill(&self, id: u32) -> Result<()> {
+         let r = self.with_session(id, |s| {
+             s.pty.kill_now()?;
+             s.state = SessionState::Stopped;
++            s.stopped_by_request = true;
+             Ok(())
+         });
+         // 理由同 `stop()`：不能在 `with_session` 的闭包里调，会跟它手上
+         // 那把还没放开的会话锁死锁。
+         if r.is_ok() {
+             self.persist_last_sessions();
+         }
+         r
+     }
+ 
+@@ -4009,40 +4061,90 @@ mod tests {
+         let sock = tmp.path().join("daemon.sock");
+         let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
+ 
+         let mgr = SessionManager::new();
+         mgr.set_last_sessions_path(record_path.clone());
+         mgr.register_profile(echo_id_profile());
+ 
+         let proj = tempfile::tempdir().unwrap();
+         let id = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+         let conv = mgr.conversation_of(id).unwrap();
++        // 提交过一句话才记 id（见 `unsubmitted_session_records_no_conversation_id`）。
++        mgr.send_input(id, "").unwrap();
++        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
+ 
+         // 普通落盘：带 id，不带标记。
+         let recs = crate::last_sessions::load(&record_path);
+         assert_eq!(recs.len(), 1);
+         assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
+         assert!(!recs[0].interrupted);
+         assert_eq!(recs[0].handoff, None);
+ 
+         let interrupted: std::collections::HashSet<u32> = [id].into_iter().collect();
+         let handoffs: HashMap<u32, PathBuf> =
+             [(id, PathBuf::from("/tmp/h.md"))].into_iter().collect();
+         mgr.persist_last_sessions_with(&interrupted, &handoffs);
+ 
+         let recs = crate::last_sessions::load(&record_path);
+         assert_eq!(recs.len(), 1);
+         assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
+         assert!(recs[0].interrupted);
+         assert_eq!(recs[0].handoff, Some(PathBuf::from("/tmp/h.md")));
+     }
+ 
++    /// 开了会话却一句话都没提交过：agent 那边没有这段对话，记下 id 重启后
++    /// `--resume` 只会扑空。所以没提交过的记 `None`，按过回车之后才记。
++    #[test]
++    fn unsubmitted_session_records_no_conversation_id() {
++        let tmp = tempfile::tempdir().unwrap();
++        let sock = tmp.path().join("daemon.sock");
++        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
++
++        let mgr = SessionManager::new();
++        mgr.set_last_sessions_path(record_path.clone());
++        mgr.register_profile(echo_id_profile());
++
++        let proj = tempfile::tempdir().unwrap();
++        let id = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
++        let conv = mgr.conversation_of(id).unwrap();
++
++        // 只打字不回车也不算提交。
++        mgr.send_input(id, "hello").unwrap();
++        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
++        let recs = crate::last_sessions::load(&record_path);
++        assert_eq!(recs[0].conversation_id, None, "没提交过不该记 id");
++
++        mgr.send_input(id, "").unwrap();
++        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
++        let recs = crate::last_sessions::load(&record_path);
++        assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
++    }
++
++    /// 按 id 接回的会话，对话本来就有：不用再提交一句，id 照记不误——
++    /// 不然接回来没碰过的会话，下次重启就接不回了。
++    #[test]
++    fn a_session_resumed_by_id_records_its_id_without_new_input() {
++        let tmp = tempfile::tempdir().unwrap();
++        let sock = tmp.path().join("daemon.sock");
++        let record_path = crate::last_sessions::last_sessions_path_for_socket(&sock);
++
++        let mgr = SessionManager::new();
++        mgr.set_last_sessions_path(record_path.clone());
++        mgr.register_profile(echo_id_profile());
++
++        let proj = tempfile::tempdir().unwrap();
++        mgr.create_resuming(proj.path(), "echo-id", None, &[], false, None, Some("abc"))
++            .unwrap();
++        let recs = crate::last_sessions::load(&record_path);
++        assert_eq!(recs[0].conversation_id.as_deref(), Some("abc"));
++    }
++
+     /// 一个没声明 `resume_args` 的 profile，`resume = true` 也不该凭空
+     /// 长出参数来——`create()`（走的是 `resume = false`）和这条路唯一的
+     /// 差别只在于「这个 profile 自己声明过什么」。
+     #[test]
+     fn a_profile_without_resume_args_is_unaffected_by_the_resume_flag() {
+         let proj = init_repo();
+         let mgr = SessionManager::new();
+         mgr.register_profile(fake_agent());
+ 
+         let id = mgr
