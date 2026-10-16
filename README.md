@@ -430,12 +430,16 @@ agents were doing. You don't have to stop anything first.
 2. **It asks the slow ones to pause.** If a session is still busy after 15
    minutes, dct asks it to stop at a safe point and write one line about where
    it got to and what comes next. After at most 3 more minutes it restarts
-   anyway.
-3. **Everything comes back by itself.** Each session reopens in its own folder.
-   Claude, the four agents that run through it, and Qwen Code each pick up
-   their own conversation, even when several sit in the same folder. A session
-   that was cut off in the middle of a job is told to check where it got to and
-   carry on.
+   anyway. (A session whose agent doesn't show dct whether it is busy — Qwen
+   Code, for instance — isn't waited for at all; it is told to check its work
+   and carry on after the restart.)
+3. **Everything comes back by itself.** Each session reopens in its own folder,
+   under the same number it had before. Claude, the four agents that run through
+   it, and Qwen Code each pick up their own conversation, even when several sit
+   in the same folder. A session that was cut off in the middle of a job is told
+   to check where it got to and carry on. If you had the board open, it goes
+   back to the board and says dct restarted, so nothing you type lands in the
+   wrong session.
 4. **Codex and OpenCode leave a note.** These two can't reopen an exact
    conversation, so before the restart dct asks them to write down what they
    were doing, how far they got and what's next. The note is kept in
@@ -443,21 +447,43 @@ agents were doing. You don't have to stop anything first.
    is told where the note is and to read it first.
 
 While it waits, you can still type into any session yourself. Messages from
-other computers are held back and delivered afterwards; messages from your
-phone or by voice get a short reply saying dct is about to restart, so nothing
-looks sent when it wasn't.
+other computers are held back and delivered afterwards — after a cancel, or after
+the restart. Messages from your phone or by voice get the reply
+“dct 正在准备重启，稍后再发” ("dct is getting ready to restart, send it again in a
+moment"), so nothing looks sent when it wasn't.
 
 | | |
 |---|---|
 | `dct restart` | wait for sessions to finish, then restart and bring them back |
+| `dct restart -y` | the same, without asking first |
 | `dct restart --wait 5` | wait at most 5 minutes before asking busy sessions to pause (default 15) |
 | `dct restart --nudge-wait 1` | after asking, wait at most 1 more minute (default 3) |
-| `dct restart --now` | don't wait — restart right away and bring sessions back |
+| `dct restart --now` | don't wait and don't ask for notes — restart right away and bring sessions back |
+| `dct restart --cancel` | call off a restart that is still waiting, from any terminal |
 | Ctrl+C while it waits | call it off; everything carries on as before |
 
+If dct had already asked some sessions to pause or write a note and you call the
+restart off, it names them and tells each one that dct is not restarting after
+all, so it can carry on.
+
 It also works when an agent runs `dct restart` from inside one of its own
-sessions: dct doesn't wait for that session (it is busy running the command),
-and tells it to carry on once the new service is up.
+sessions. The command hands the restart over and returns straight away — agents
+cut long commands off, and that must not cancel the restart. dct doesn't wait
+for that session, and once the new service is up it tells it the restart it
+asked for is done, so it doesn't run it again. If that agent is one whose
+conversation can't come back (Codex, OpenCode), the command says so first, so it
+can write its own note. `dct restart --cancel` still calls it off.
+
+Good to know:
+
+- **The very first time** you run `dct restart` with a new build while an older
+  dct (from before this feature) is still running, that older one doesn't know
+  how to wait. dct says so and does the old, immediate restart: sessions are
+  cut off and you are asked about bringing them back, as after a crash. Every
+  restart after that waits.
+- If you use `/clear` or `/resume` inside Claude, dct doesn't notice. A restart
+  brings back the conversation that dct started the session with, not the one
+  you switched to.
 
 ---
 
@@ -472,7 +498,7 @@ Everything else:
 | `dct stop <n>…` / `--all` | stop sessions, giving them time to wind down |
 | `dct kill <n>…` / `--all` | kill sessions outright |
 | `dct prune` | clear stopped sessions off the list |
-| `dct restart` | swap in the current binary as the daemon — waits for sessions to finish, then brings them back (`-y` skips the question; see [above](#restarting-without-losing-work)) |
+| `dct restart` | swap in the current binary as the daemon — waits for sessions to finish, then brings them back (`-y` skips the question, `--cancel` calls it off; see [above](#restarting-without-losing-work)) |
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
 | `dct daemon` | run only the daemon, no board |
@@ -927,7 +953,8 @@ dct send Mac/#3 "run the Windows tests"
 
 - the other computer offline → not sent (you are told); nothing is held for later;
 - only agent sessions receive, not plain terminal sessions;
-- queued messages and a live invite code are lost when the daemon restarts;
+- a live invite code is lost when the daemon restarts, and so are queued messages
+  if it stops any other way than `dct restart` (a crash, the computer restarting);
 - two old computers each adding a newcomer at once can fork the group list, and an
   offline computer misses list changes;
 - any computer on your account can keep burning your codes with wrong guesses
