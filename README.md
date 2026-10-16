@@ -1013,12 +1013,13 @@ only way there, one step at a time.
 
 <br>
 
-`dct` only takes the mouse when **the agent itself wants it**. Claude Code does
-(it uses the mouse to scroll its own screen); codex and plain command-line tools
-don't — in those sessions the mouse stays with the terminal as long as nothing
-running there asks for it, so click-and-drag text selection and copying work
-exactly as they always do. The cost is that the wheel no longer scrolls `dct`'s
-own history in those sessions; use `PageUp`/`PageDown`/`End` instead.
+Inside a session `dct` takes the mouse so the wheel always does something
+useful. Claude Code wants the mouse itself (it scrolls its own screen), so the
+wheel goes to it. In codex and plain command-line sessions the wheel scrolls the
+whole page through `dct`'s history, the same as `PageUp`/`PageDown`; `End` jumps
+back to the bottom. The only programs left alone are full-screen ones that don't
+use the mouse (`less`, `vim`): your terminal turns the wheel into arrow keys for
+them, as usual.
 
 Visible `http://` and `https://` addresses within a screen row are emitted as terminal
 hyperlinks. Use your terminal's open-link gesture (usually Cmd-click or Ctrl-click).
@@ -1026,8 +1027,7 @@ If the agent captures the mouse, press `F4` first. This also works in browser
 terminals that support OSC 8. Links hidden behind labels and URLs split across
 rows are not recovered from the current text-only screen snapshots.
 
-To copy inside a session where the agent wants the mouse, press `F4` to enter
-copy mode: the mouse goes back to the terminal, the bottom bar says so, and
+To copy inside a session, press `F4` to enter copy mode: the mouse goes back to the terminal, the bottom bar says so, and
 pressing `F4` again leaves it once you're done. You can also use your terminal's
 own modifier (Option in iTerm2) without leaving the session at all. `dct` has no
 copy of its own — copying uses whatever your terminal already gives you.
