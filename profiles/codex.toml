@@ -1,5 +1,9 @@
 name = "codex"
-command = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+# `--no-alt-screen`：实测 codex v0.162.1 起默认改走备用屏、自己管翻页，
+# 历史不再落进 dct 的缓冲——dct 的整页滚动（PageUp / 滚轮）就没东西可翻，
+# 而终端把滚轮转成的上方向键在 codex 里翻的是输入历史。加上它，codex 回到
+# 内联模式，把历史推到画面上方，dct 照常接住（要配合 vendor/vt100 的补丁）。
+command = ["codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"]
 is_agent = true
 # 实测自 codex v0.146.0：干活时底部一定有「(12s • esc to interrupt)」。
 # 空闲时只有输入框占位符，用户一打字就没了，不能拿来当 idle_pattern。
