@@ -622,3 +622,25 @@ fn speech_not_started_by_a_click_on_the_octopus_is_never_sent() {
     go(&w, 3);
     assert_eq!(w.borrow().sent.len(), 1);
 }
+
+/// 装好新二进制、后台还没重启的那段时间，跑着的是 24 号协议的旧后台，
+/// 它不认 `Submit`：那时退回旧的「写字 + 回车」两条 `Input`。
+#[test]
+fn submit_falls_back_to_two_inputs_for_an_old_daemon() {
+    let shape = |p: Option<u32>, text: &str| -> String {
+        serde_json::to_string(&submit_requests(p, 7, text)).unwrap()
+    };
+    assert_eq!(shape(Some(25), "hi"), r#"[{"Submit":{"id":7,"text":"hi"}}]"#);
+    assert_eq!(
+        shape(Some(crate::proto::PROTOCOL_VERSION), "hi"),
+        r#"[{"Submit":{"id":7,"text":"hi"}}]"#
+    );
+    let old = r#"[{"Input":{"id":7,"text":"hi"}},{"Input":{"id":7,"text":""}}]"#;
+    assert_eq!(shape(Some(24), "hi"), old);
+    assert_eq!(shape(None, "hi"), old, "答不上 Hello 的更老的后台也走旧路");
+    assert_eq!(
+        shape(Some(24), ""),
+        r#"[{"Input":{"id":7,"text":""}}]"#,
+        "空话只按回车，跟 submit_unchecked 一样"
+    );
+}

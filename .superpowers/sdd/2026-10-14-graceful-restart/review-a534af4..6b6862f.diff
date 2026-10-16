@@ -1,0 +1,741 @@
+# Review package: a534af4..6b6862f
+
+## Commits
+6b6862f feat(restart): after a graceful restart, interrupted sessions are told to continue and unresumable ones to read their handoff; undeliverable notes become a warning
+
+## Files changed
+ src/daemon.rs       | 256 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+ src/i18n.rs         |  12 +++
+ src/lib.rs          |   1 +
+ src/proto.rs        |   3 +
+ src/resume_notes.rs | 169 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 434 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 205910b..568050c 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -155,34 +155,37 @@ pub(crate) fn run_with_hooks(
+     let last_sessions_path = crate::last_sessions::last_sessions_path_for_socket(socket);
+     let last_sessions_records = crate::last_sessions::load(&last_sessions_path);
+     mgr.set_last_sessions_path(last_sessions_path);
+     if !last_sessions_records.is_empty() {
+         eprintln!(
+             "dct：正在接回上次的 {} 个会话……",
+             last_sessions_records.len()
+         );
+         let (all, _) = all_profiles(&profiles_dir);
+         let secrets_guard = recover(secrets.lock());
+-        let (skips, by_id) = restore_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
++        let (skips, by_id, notes) =
++            restore_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
+         drop(secrets_guard);
+         eprintln!("dct：会话接回完成。");
+         // review 之后补上：真正被 TUI 拉起来的守护进程 stdio 全接到
+         // `/dev/null`，上面几行 `eprintln!` 谁都看不见——用户按了 y
+         // 同意恢复，一个格子却悄无声息地没出现，没有任何地方告诉他为什么。
+         // 记下来，交给 `Request::Profiles` 顶给界面，跟 `LlmUnavailable`
+         // 走的是同一条路。
+         mgr.set_resume_skips(skips);
+         // 按 id 接回的那些在后台盯一小会儿：接回失败（对话没了）的会马上
+         // 退出，换一个新开的顶上，再补一句警告。**必须排在
+         // `set_resume_skips` 之后**——那个是整份覆盖，后台补的警告要追加在
+         // 它后面，不能被它冲掉。不等这个线程：守护进程照常开始接请求。
+         watch_resumed_by_id(mgr.clone(), all, by_id, RESUME_WATCH_WINDOW);
++        // 「继续」/「先读交接」：等各自第一次空闲再打，最多等 2 分钟。
++        deliver_resume_notes(mgr.clone(), notes, RESUME_NOTE_TICK);
+     }
+ 
+     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
+     // Task 5 的 bridge 线程要写的那个地方——两边共用同一把 `Mutex`，谁先谁后
+     // 都不会看到半份数据。启动时只看密钥仓里有没有令牌：**不**在这里打一次
+     // `getMe`（daemon 启动不该依赖网络才能起来，况且这条路径没法在单测里
+     // 避开真实网络）。bot 用户名和是否已经配上人，都要等 bridge 真的跑起来
+     // 之后才补全——这是 Task 5 的范围，这里先给一个诚实但不完整的初值。
+     let phone = {
+         let s = recover(secrets.lock());
+@@ -1042,26 +1045,31 @@ struct ResumedById {
+     secret: Option<String>,
+ }
+ 
+ /// 同 `restore_last_sessions`，另外交出按 id 接回的那些，给
+ /// [`watch_resumed_by_id`] 盯着。
+ fn restore_sessions(
+     records: &[crate::last_sessions::RecordedSession],
+     all: &[Profile],
+     secrets: &SecretStore,
+     mgr: &SessionManager,
+-) -> (Vec<crate::proto::WarningCode>, Vec<ResumedById>) {
++) -> (
++    Vec<crate::proto::WarningCode>,
++    Vec<ResumedById>,
++    Vec<crate::resume_notes::Note>,
++) {
+     use crate::proto::{SessionResumeSkipReason, WarningCode};
+ 
+     let resume_flags = crate::last_sessions::continue_flags(records, all);
+     let mut skips = Vec::new();
+     let mut by_id = Vec::new();
++    let mut notes = Vec::new();
+     let total = records.len();
+ 
+     for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
+         // 一条会话的恢复可能要跑真正的子进程 spawn + 首次 git checkpoint
+         // （agent profile 都要），仓库大的话这一步单独就要小半秒。这整段
+         // 恢复是同步跑在守护进程真正开始接请求之前的（见调用点的注释），
+         // 慢仓库、几个会话叠起来能拖出好几秒的静默——静默的等待在这个
+         // 项目里是不被允许的（见 CLAUDE.md「一个不给下一步的等待就是没
+         // 做完」那条同一精神：这里没有错误，但用户看到的现象是一样的，
+         // 「怎么卡住了」）。只印到 stderr——只有前台 `dct daemon` 或者
+@@ -1109,21 +1117,30 @@ fn restore_sessions(
+         let resumed = mgr.create_resuming(
+             &record.dir,
+             &record.profile,
+             secret,
+             all,
+             resume,
+             tag,
+             record.conversation_id.as_deref(),
+         );
+         if let Ok(id) = resumed {
+-            if crate::last_sessions::will_resume_by_id(record, all) {
++            let resumed_by_id = crate::last_sessions::will_resume_by_id(record, all);
++            if let Some(text) = crate::resume_notes::note_for(record, resumed_by_id) {
++                notes.push(crate::resume_notes::Note {
++                    id,
++                    text,
++                    deadline: std::time::Instant::now() + crate::resume_notes::NOTE_WAIT,
++                    dir: record.dir.display().to_string(),
++                });
++            }
++            if resumed_by_id {
+                 by_id.push(ResumedById {
+                     id,
+                     record: record.clone(),
+                     secret: secret.map(str::to_string),
+                 });
+             }
+         }
+         if let Err(e) = resumed {
+             eprintln!(
+                 "跳过恢复：{}（{}）没能重新起来：{e}",
+@@ -1131,21 +1148,67 @@ fn restore_sessions(
+                 record.profile
+             );
+             skips.push(WarningCode::SessionResumeSkipped {
+                 dir: record.dir.display().to_string(),
+                 profile: record.profile.clone(),
+                 reason: SessionResumeSkipReason::StartFailed,
+             });
+         }
+     }
+ 
+-    (skips, by_id)
++    (skips, by_id, notes)
++}
++
++/// 投递线程每隔多久看一次。
++const RESUME_NOTE_TICK: Duration = Duration::from_millis(500);
++
++/// 在后台把重启后的话投递给各会话：等空闲再打（绕过「准备重启」的闸，
++/// 此刻本来就不在排空），一次一条；等不到的变成一条界面警告。
++/// 没东西要投递就不起线程。返回句柄只给测试 `join`。
++fn deliver_resume_notes(
++    mgr: Arc<SessionManager>,
++    mut notes: Vec<crate::resume_notes::Note>,
++    tick: Duration,
++) -> Option<std::thread::JoinHandle<()>> {
++    if notes.is_empty() {
++        return None;
++    }
++    let spawned = std::thread::Builder::new()
++        .name("resume-notes".into())
++        .spawn(move || {
++            while !notes.is_empty() {
++                let states: std::collections::HashMap<u32, crate::session::SessionState> =
++                    mgr.list().into_iter().map(|s| (s.id, s.state)).collect();
++                let mut send = |id: u32, text: &str| {
++                    crate::bridge::submit_unchecked(&mgr, id, text).is_ok()
++                };
++                let dropped =
++                    crate::resume_notes::step(&mut notes, std::time::Instant::now(), &states, &mut send);
++                for n in dropped {
++                    eprintln!("{} 的会话重启后一直没准备好，没能叫它继续", n.dir);
++                    mgr.push_resume_skip(crate::proto::WarningCode::ResumeNoteDropped {
++                        dir: n.dir,
++                    });
++                }
++                if notes.is_empty() {
++                    return;
++                }
++                std::thread::sleep(tick);
++            }
++        });
++    match spawned {
++        Ok(h) => Some(h),
++        Err(e) => {
++            eprintln!("没能起重启后投递线程：{e}");
++            None
++        }
++    }
+ }
+ 
+ /// 在后台盯着按 id 接回的会话，最多盯 `window` 这么久。哪个在这段时间里
+ /// **自己**退出了（被叫停的不算），就当接回失败：把那个死格子拿掉，在同一个
+ /// 目录、同一个 profile 下新开一个（新的对话 id、原来的名字），再经
+ /// `push_resume_skip` 告诉用户「没能接回原来的对话」。
+ ///
+ /// 跑在单独的线程上，不挡守护进程开始接请求。没东西要盯就不起线程。
+ /// 返回线程句柄只是给测试 `join` 用。
+ fn watch_resumed_by_id(
+@@ -2869,36 +2932,215 @@ mod tests {
+             name = "gone-probe"
+             command = ["/bin/sh", "-c", "if [ \"$1\" = --resume ]; then echo gone; exit 1; fi; echo \"ARGS $*\"; sleep 30", "sh"]
+             is_agent = false
+             session_id_args = ["--session-id", "{id}"]
+             resume_id_args = ["--resume", "{id}"]
+             "#,
+         ))
+         .unwrap()
+     }
+ 
++    /// 起来就显示 IDLE、之后原样回显输入的探针（能按 id 接回）。
++    fn idle_echo_probe() -> Profile {
++        Profile::from_toml(&crate::sys::testing::toml_with_sh(
++            r#"
++            name = "idle-echo"
++            command = ["/bin/sh", "-c", 'printf "IDLE\n"; cat', "sh"]
++            is_agent = false
++            idle_pattern = "IDLE"
++            session_id_args = ["--session-id", "{id}"]
++            resume_id_args = ["--resume", "{id}"]
++            "#,
++        ))
++        .unwrap()
++    }
++
++    /// 接回时马上退出（对话没了）、新开时显示 IDLE 的探针。
++    fn gone_idle_probe() -> Profile {
++        Profile::from_toml(&crate::sys::testing::toml_with_sh(
++            r#"
++            name = "gone-idle"
++            command = ["/bin/sh", "-c", 'if [ "$1" = --resume ]; then echo gone; exit 1; fi; printf "IDLE\n"; cat', "sh"]
++            is_agent = false
++            idle_pattern = "IDLE"
++            session_id_args = ["--session-id", "{id}"]
++            resume_id_args = ["--resume", "{id}"]
++            "#,
++        ))
++        .unwrap()
++    }
++
++    /// 测试里没有主循环替我们 `tick()`，起一个临时的。
++    struct Ticker(Arc<std::sync::atomic::AtomicBool>);
++    impl Ticker {
++        fn start(mgr: &Arc<SessionManager>) -> Ticker {
++            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
++            let (m, s) = (mgr.clone(), stop.clone());
++            std::thread::spawn(move || {
++                while !s.load(std::sync::atomic::Ordering::SeqCst) {
++                    m.tick();
++                    std::thread::sleep(Duration::from_millis(30));
++                }
++            });
++            Ticker(stop)
++        }
++    }
++    impl Drop for Ticker {
++        fn drop(&mut self) {
++            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
++        }
++    }
++
++    #[test]
++    fn restore_queues_continue_for_interrupted_sessions_only() {
++        let tmp = tempfile::tempdir().unwrap();
++        let (pa, pb) = (tmp.path().join("a"), tmp.path().join("b"));
++        std::fs::create_dir(&pa).unwrap();
++        std::fs::create_dir(&pb).unwrap();
++        let all = vec![idle_echo_probe()];
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++        let mut a = rec(&pa, "idle-echo");
++        a.conversation_id = Some("a".into());
++        a.interrupted = true;
++        let mut b = rec(&pb, "idle-echo");
++        b.conversation_id = Some("b".into());
++
++        let mgr = Arc::new(SessionManager::new());
++        let (skips, _, notes) = restore_sessions(&[a, b], &all, &secrets, &mgr);
++        assert!(skips.is_empty(), "{skips:?}");
++        assert_eq!(notes.len(), 1, "只有被打断的那条要投递");
++        let _tick = Ticker::start(&mgr);
++        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
++            .unwrap()
++            .join()
++            .unwrap();
++
++        let mut got = 0;
++        for info in mgr.list() {
++            let text = mgr.screen_text_for_test(info.id);
++            if info.dir.ends_with("/a") {
++                assert!(text.contains("dct 重启完了"), "{text:?}");
++                got += 1;
++            } else {
++                assert!(!text.contains("dct 重启完了"), "{text:?}");
++            }
++        }
++        assert_eq!(got, 1);
++        assert!(mgr.resume_skips().is_empty(), "{:?}", mgr.resume_skips());
++    }
++
++    /// 接回失败、被换成新开的会话时，那句「继续」不能落到新对话上，
++    /// 也不该再报一条「没叫上」——换新会话的警告已经由看守线程报过了。
++    #[test]
++    fn continue_note_is_not_delivered_to_a_replacement_session() {
++        let tmp = tempfile::tempdir().unwrap();
++        let proj = tmp.path().join("proj");
++        std::fs::create_dir(&proj).unwrap();
++        let all = vec![gone_idle_probe()];
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++        let mut r = rec(&proj, "gone-idle");
++        r.conversation_id = Some("old".into());
++        r.interrupted = true;
++
++        let mgr = Arc::new(SessionManager::new());
++        let (skips, by_id, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
++        assert_eq!(notes.len(), 1);
++        mgr.set_resume_skips(skips);
++        let _tick = Ticker::start(&mgr);
++        let deliver = deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50)).unwrap();
++        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_secs(5))
++            .unwrap()
++            .join()
++            .unwrap();
++        deliver.join().unwrap();
++
++        // 新开的会话显示 IDLE 之后再多等几拍，确认什么都没打进去。
++        let list = mgr.list();
++        assert_eq!(list.len(), 1);
++        std::thread::sleep(Duration::from_millis(500));
++        let text = mgr.screen_text_for_test(list[0].id);
++        assert!(text.contains("IDLE"), "{text:?}");
++        assert!(!text.contains("dct 重启完了"), "{text:?}");
++        let warnings = mgr.resume_skips();
++        assert_eq!(warnings.len(), 1, "{warnings:?}");
++        assert!(matches!(
++            warnings[0],
++            crate::proto::WarningCode::SessionResumeSkipped { .. }
++        ));
++    }
++
++    /// 一直没空闲的会话：到期后变成一条界面警告。
++    #[test]
++    fn an_undeliverable_note_becomes_a_warning() {
++        let tmp = tempfile::tempdir().unwrap();
++        let proj = tmp.path().join("proj");
++        std::fs::create_dir(&proj).unwrap();
++        let all = vec![echo_id_probe()]; // 没有 idle_pattern，永远不会 Idle
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++        let mut r = rec(&proj, "echo-id");
++        r.conversation_id = Some("a".into());
++        r.interrupted = true;
++        let mgr = Arc::new(SessionManager::new());
++        let (_, _, mut notes) = restore_sessions(&[r], &all, &secrets, &mgr);
++        notes[0].deadline = std::time::Instant::now() + Duration::from_millis(200);
++        let _tick = Ticker::start(&mgr);
++        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
++            .unwrap()
++            .join()
++            .unwrap();
++        let warnings = mgr.resume_skips();
++        assert_eq!(warnings.len(), 1, "{warnings:?}");
++        assert!(matches!(
++            &warnings[0],
++            crate::proto::WarningCode::ResumeNoteDropped { dir } if dir.ends_with("proj")
++        ));
++    }
++
++    /// 恢复完以后落盘的清单里不再带 `interrupted` / `handoff`，下次重启
++    /// 不会再叫一遍。
++    #[test]
++    fn restore_clears_interrupted_and_handoff_flags_on_disk() {
++        let tmp = tempfile::tempdir().unwrap();
++        let proj = tmp.path().join("proj");
++        std::fs::create_dir(&proj).unwrap();
++        let all = vec![idle_echo_probe()];
++        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
++        let mut r = rec(&proj, "idle-echo");
++        r.conversation_id = Some("a".into());
++        r.interrupted = true;
++        r.handoff = Some(tmp.path().join("h.md"));
++        let path = tmp.path().join("last.toml");
++        let mgr = SessionManager::new();
++        mgr.set_last_sessions_path(path.clone());
++        let _ = restore_sessions(&[r], &all, &secrets, &mgr);
++        let recs = crate::last_sessions::load(&path);
++        assert_eq!(recs.len(), 1);
++        assert!(!recs[0].interrupted);
++        assert_eq!(recs[0].handoff, None);
++    }
++
+     /// 接回失败（agent 一起来就退出）：死格子拿掉，原处新开一个（新 id、
+     /// 原来的名字），并且有一条「没能接回原来的对话」的警告递到界面上。
+     #[test]
+     fn a_session_whose_conversation_is_gone_is_restarted_fresh_and_reported() {
+         let tmp = tempfile::tempdir().unwrap();
+         let proj = tmp.path().join("proj");
+         std::fs::create_dir(&proj).unwrap();
+         let all = vec![gone_probe()];
+         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+ 
+         let mut r = rec(&proj, "gone-probe");
+         r.conversation_id = Some("old".into());
+         r.tag = "修登录白屏".into();
+ 
+         let mgr = Arc::new(SessionManager::new());
+-        let (skips, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
++        let (skips, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+         assert!(skips.is_empty(), "{skips:?}");
+         assert_eq!(by_id.len(), 1);
+         mgr.set_resume_skips(skips);
+         watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_secs(5))
+             .expect("该起看守线程")
+             .join()
+             .unwrap();
+ 
+         let list = mgr.list();
+         assert_eq!(list.len(), 1, "死格子要拿掉，只剩新开的那个：{list:?}");
+@@ -2934,21 +3176,21 @@ mod tests {
+         let tmp = tempfile::tempdir().unwrap();
+         let proj = tmp.path().join("proj");
+         std::fs::create_dir(&proj).unwrap();
+         let all = vec![echo_id_probe()];
+         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+ 
+         let mut r = rec(&proj, "echo-id");
+         r.conversation_id = Some("keep".into());
+ 
+         let mgr = Arc::new(SessionManager::new());
+-        let (skips, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
++        let (skips, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+         assert!(skips.is_empty());
+         let before: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+         watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+             .unwrap()
+             .join()
+             .unwrap();
+ 
+         let after: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+         assert_eq!(before, after);
+         assert_eq!(mgr.conversation_of(after[0]).as_deref(), Some("keep"));
+@@ -2961,21 +3203,21 @@ mod tests {
+         let tmp = tempfile::tempdir().unwrap();
+         let proj = tmp.path().join("proj");
+         std::fs::create_dir(&proj).unwrap();
+         let all = vec![echo_id_probe()];
+         let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+ 
+         let mut r = rec(&proj, "echo-id");
+         r.conversation_id = Some("keep".into());
+ 
+         let mgr = Arc::new(SessionManager::new());
+-        let (_, by_id) = restore_sessions(&[r], &all, &secrets, &mgr);
++        let (_, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+         let id = by_id[0].id;
+         mgr.stop(id).unwrap();
+         watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+             .unwrap()
+             .join()
+             .unwrap();
+ 
+         let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+         assert_eq!(ids, vec![id], "不该多出一个新开的");
+         assert!(mgr.resume_skips().is_empty());
+diff --git a/src/i18n.rs b/src/i18n.rs
+index b02fde5..5ead93e 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -2674,20 +2674,29 @@ pub mod msg {
+                         en: "its earlier conversation could not be found, so a fresh one was started in its place",
+                         zh: "原来的对话找不到了，已经在原处重新开了一个",
+                     ),
+                 };
+                 t!(
+                     lang,
+                     en: format!("Could not bring back the “{profile}” session in {dir}: {why}."),
+                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
+                 )
+             }
++            ResumeNoteDropped { dir } => t!(
++                lang,
++                en: format!(
++                    "The session in {dir} was not ready after the restart, so it could not be told to carry on. Please tell it to continue yourself."
++                ),
++                zh: format!(
++                    "{dir} 的会话重启后一直没准备好，没能叫它继续，请手动告诉它接着做。"
++                ),
++            ),
+         }
+     }
+ 
+     /// 设置文件的位置。**每一句「去改设置」都必须带上它**——「设置文件」
+     /// 四个字对一个零编程经验的人不是一个可执行的下一步，一个路径才是。
+     /// 写成常量而不是把真实路径一路传进来：这些句子会跟着 `WarningCode`
+     /// 从守护进程走到界面进程，中间那条 socket 上没有「谁的 socket 旁边的
+     /// config」这个概念，而真实用户的它就是这个路径（见 `proto::socket_path`
+     /// 和 `config::config_path_for_socket`）。
+     pub const CONFIG_PATH: &str = "~/.dct/config.toml";
+@@ -3620,20 +3629,23 @@ mod tests {
+             SessionResumeSkipped {
+                 dir: "/w/dc-terminal".into(),
+                 profile: "claude".into(),
+                 reason: crate::proto::SessionResumeSkipReason::StartFailed,
+             },
+             SessionResumeSkipped {
+                 dir: "/w/dc-terminal".into(),
+                 profile: "claude".into(),
+                 reason: crate::proto::SessionResumeSkipReason::ConversationGone,
+             },
++            ResumeNoteDropped {
++                dir: "/w/dc-terminal".into(),
++            },
+         ];
+         for c in &codes {
+             for l in Lang::all() {
+                 let s = msg::warning(*l, c);
+                 assert!(!s.trim().is_empty(), "{c:?} 在 {l:?} 下组不出话");
+                 // 底栏只有一行，警告绝不能带换行——带了会在等宽终端上
+                 // 错位换行，看着像一份栈追踪。
+                 assert!(!s.contains('\n'), "{c:?} 在 {l:?} 下带了换行：{s}");
+             }
+             let en = msg::warning(Lang::En, c);
+diff --git a/src/lib.rs b/src/lib.rs
+index e0db412..eb3932d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,20 +22,21 @@ pub mod llm_optin;
+ pub mod mesh;
+ pub mod pair;
+ pub mod pair_apply;
+ pub mod pair_http;
+ pub mod procedures;
+ pub mod profile;
+ pub mod projects;
+ pub mod proto;
+ pub mod pty;
+ pub mod qr;
++pub mod resume_notes;
+ pub mod runtime;
+ pub mod secrets;
+ pub mod session;
+ pub mod settings;
+ pub mod student_projects;
+ pub mod sys;
+ pub mod theme;
+ pub mod ui;
+ pub mod verify;
+ pub mod voice;
+diff --git a/src/proto.rs b/src/proto.rs
+index d9cc34a..c0c8f94 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -1373,20 +1373,23 @@ pub enum WarningCode {
+     /// stdio 全被接到 `/dev/null`（`client::spawn_daemon`），用户按了 y
+     /// 同意恢复，一个格子却悄无声息地没出现，没有任何地方告诉他是目录没了
+     /// 还是 profile 被卸载了。跟 `LlmUnavailable` 同一个理由：守护进程的
+     /// stderr 到不了用户眼前，唯一能到的路是这里，经 `Request::Profiles`
+     /// 顶成一条警告。
+     SessionResumeSkipped {
+         dir: String,
+         profile: String,
+         reason: SessionResumeSkipReason,
+     },
++    /// 平稳重启后要对某个会话说的话（「继续」或「先读交接」），等了 2 分钟它
++    /// 都没进入空闲，没打。只带目录：用户要的是「去哪个会话手动说一声」。
++    ResumeNoteDropped { dir: String },
+ }
+ 
+ /// 恢复上次会话时，某一条为什么被跳过。
+ #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+ pub enum SessionResumeSkipReason {
+     /// 记录的目录已经不存在了
+     DirGone,
+     /// 记录的 profile 已经不认识了（被删掉、改了名……）
+     ProfileGone,
+     /// 目录和 profile 都还在，但重新起这个会话本身失败了
+diff --git a/src/resume_notes.rs b/src/resume_notes.rs
+new file mode 100644
+index 0000000..438fba9
+--- /dev/null
++++ b/src/resume_notes.rs
+@@ -0,0 +1,169 @@
++//! 平稳重启之后补投递的话：被打断且按 id 接回的会话收到「继续」，
++//! 接不回但留了交接文件的会话收到「先读交接」。
++//! 逻辑是纯的（`note_for` / `step`），线程和敲键由 `daemon.rs` 接上。
++//! 设计见 `docs/superpowers/specs/2026-10-14-graceful-restart-design.md` 第 5、6 节。
++
++use std::collections::HashMap;
++use std::path::Path;
++use std::time::{Duration, Instant};
++
++use crate::last_sessions::RecordedSession;
++use crate::session::SessionState;
++
++pub const CONTINUE_TEXT: &str =
++    "dct 重启完了。请先检查一下你做到哪了（看看文件和改动的状态），再接着做重启前没做完的事。";
++
++/// 等会话第一次空闲，最多等这么久；过了就不打了，改成提示用户。
++pub const NOTE_WAIT: Duration = Duration::from_secs(120);
++
++pub fn read_handoff_text(path: &Path) -> String {
++    format!(
++        "dct 刚重启。你上次的交接在 {}，先读它，再接着做。",
++        path.display()
++    )
++}
++
++/// 一条等着投递的话。
++#[derive(Debug, Clone)]
++pub struct Note {
++    pub id: u32,
++    pub text: String,
++    pub deadline: Instant,
++    pub dir: String,
++}
++
++/// 一条恢复出来的会话该收到什么话：
++/// - interrupted 且按 id 接回了 → `CONTINUE_TEXT`
++/// - 有 handoff 且文件存在 → `read_handoff_text`
++/// - 其余 → `None`
++///
++/// 被打断但没接回原对话的，叫它「继续」它也不知道继续什么，所以不打。
++pub fn note_for(record: &RecordedSession, resumed_by_id: bool) -> Option<String> {
++    if record.interrupted && resumed_by_id {
++        return Some(CONTINUE_TEXT.to_string());
++    }
++    let h = record.handoff.as_ref()?;
++    h.is_file().then(|| read_handoff_text(h))
++}
++
++/// 每拍：空闲的投递并移除；过了期限的移除并返回它们（给警告用）。
++/// 会话已经不在名册里、或已经停了的，静默丢掉——比如按 id 接回失败后被
++/// 换成了新开的会话（新 id），这句「继续」不能落到那个全新的对话上。
++/// `send` 返回 false 表示没打进去，留着下拍再试。
++pub fn step(
++    notes: &mut Vec<Note>,
++    now: Instant,
++    states: &HashMap<u32, SessionState>,
++    send: &mut dyn FnMut(u32, &str) -> bool,
++) -> Vec<Note> {
++    let mut dropped = Vec::new();
++    let mut keep = Vec::new();
++    for n in notes.drain(..) {
++        match states.get(&n.id) {
++            None | Some(SessionState::Stopped) => continue,
++            Some(SessionState::Idle) if send(n.id, &n.text) => continue,
++            _ => {}
++        }
++        if now >= n.deadline {
++            dropped.push(n);
++        } else {
++            keep.push(n);
++        }
++    }
++    *notes = keep;
++    dropped
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn record() -> RecordedSession {
++        RecordedSession {
++            dir: "/x".into(),
++            profile: "p".into(),
++            tag: String::new(),
++            last_active: 1,
++            conversation_id: Some("a".into()),
++            interrupted: false,
++            handoff: None,
++        }
++    }
++
++    #[test]
++    fn note_for_rules() {
++        let dir = tempfile::tempdir().unwrap();
++        let h = dir.path().join("h.md");
++        let mut r = record();
++        assert_eq!(note_for(&r, true), None);
++        r.interrupted = true;
++        assert_eq!(note_for(&r, true).as_deref(), Some(CONTINUE_TEXT));
++        assert_eq!(note_for(&r, false), None);
++        r.interrupted = false;
++        r.handoff = Some(h.clone());
++        assert_eq!(note_for(&r, false), None, "文件不存在");
++        std::fs::write(&h, "x").unwrap();
++        assert_eq!(note_for(&r, false), Some(read_handoff_text(&h)));
++    }
++
++    fn note(id: u32, t0: Instant) -> Note {
++        Note {
++            id,
++            text: format!("t{id}"),
++            deadline: t0 + Duration::from_secs(120),
++            dir: format!("/d{id}"),
++        }
++    }
++
++    #[test]
++    fn step_waits_for_idle_and_drops_after_deadline() {
++        let t0 = Instant::now();
++        let mut notes = vec![note(1, t0), note(2, t0)];
++        let mut sent = vec![];
++        let mut send = |id: u32, t: &str| {
++            sent.push((id, t.to_string()));
++            true
++        };
++        let states = HashMap::from([(1, SessionState::Working), (2, SessionState::Idle)]);
++        assert!(step(&mut notes, t0, &states, &mut send).is_empty());
++        let dropped = step(
++            &mut notes,
++            t0 + Duration::from_secs(120),
++            &states,
++            &mut send,
++        );
++        assert_eq!(dropped.len(), 1);
++        assert_eq!(dropped[0].id, 1);
++        assert!(notes.is_empty());
++        assert_eq!(sent, vec![(2, "t2".to_string())]);
++    }
++
++    #[test]
++    fn failed_send_keeps_note_for_next_tick() {
++        let t0 = Instant::now();
++        let mut notes = vec![note(1, t0)];
++        let states = HashMap::from([(1, SessionState::Idle)]);
++        let mut send = |_: u32, _: &str| false;
++        assert!(step(&mut notes, t0, &states, &mut send).is_empty());
++        assert_eq!(notes.len(), 1);
++        let mut send2 = |_: u32, _: &str| true;
++        assert!(step(&mut notes, t0, &states, &mut send2).is_empty());
++        assert!(notes.is_empty());
++    }
++
++    #[test]
++    fn vanished_or_stopped_sessions_are_dropped_silently() {
++        let t0 = Instant::now();
++        let mut notes = vec![note(1, t0), note(2, t0)];
++        let states = HashMap::from([(2, SessionState::Stopped)]);
++        let mut send = |_: u32, _: &str| panic!("不该打");
++        assert!(step(
++            &mut notes,
++            t0 + Duration::from_secs(500),
++            &states,
++            &mut send
++        )
++        .is_empty());
++        assert!(notes.is_empty());
++    }
++}

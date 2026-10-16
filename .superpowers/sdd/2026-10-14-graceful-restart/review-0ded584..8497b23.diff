@@ -1,0 +1,468 @@
+# Review package: 0ded584..8497b23
+
+## Commits
+8497b23 fix(drain): DrainProgress carries an explicit active flag so the CLI can tell a cancelled drain from one that is finishing; the UI banner covers the finishing window
+
+## Files changed
+ src/daemon.rs | 58 ++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ src/i18n.rs   |  9 +++++++++
+ src/proto.rs  | 30 +++++++++++++++++++++++++++--
+ src/ui/mod.rs | 61 +++++++++++++++++++++++++++++++++++++++++------------------
+ 4 files changed, 134 insertions(+), 24 deletions(-)
+
+## Diff
+diff --git a/src/daemon.rs b/src/daemon.rs
+index bf52902..205910b 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -403,20 +403,21 @@ impl DrainCtl {
+             run: Mutex::new(None),
+             generation: std::sync::atomic::AtomicU64::new(0),
+             done_seen: AtomicBool::new(false),
+         }
+     }
+ 
+     fn progress_of(run: &DrainRun) -> Response {
+         Response::DrainProgress {
+             progress: run.drain.progress(std::time::Instant::now()),
+             done: run.done,
++            active: true,
+         }
+     }
+ 
+     /// `Request::Drain`。已经在排空就只回进度。
+     fn start(self: &Arc<Self>, cfg: crate::drain::DrainConfig, initiator: Option<u32>) -> Response {
+         let mut slot = recover(self.run.lock());
+         if let Some(run) = slot.as_ref() {
+             return Self::progress_of(run);
+         }
+         let handoff_dir = self
+@@ -463,20 +464,21 @@ impl DrainCtl {
+             })
+     }
+ 
+     /// `Request::DrainStatus`。
+     fn status(&self, renew: bool) -> Response {
+         let mut slot = recover(self.run.lock());
+         match slot.as_mut() {
+             None => Response::DrainProgress {
+                 progress: idle_progress(),
+                 done: false,
++                active: false,
+             },
+             Some(run) => {
+                 if renew {
+                     run.last_poll = std::time::Instant::now();
+                 }
+                 if run.done {
+                     self.done_seen.store(true, Ordering::SeqCst);
+                 }
+                 Self::progress_of(run)
+             }
+@@ -5050,31 +5052,36 @@ mod drain_tests {
+     use crate::drain::{Progress, NUDGE_TEXT};
+     use crate::session::SessionState;
+     use std::sync::atomic::AtomicUsize;
+     use std::time::Instant;
+ 
+     /// 假的收尾：记一下被调了几次，不起 `__swap`、不退出进程。
+     #[derive(Default)]
+     struct Calls {
+         swaps: AtomicUsize,
+         exits: AtomicUsize,
++        /// 为 true 时假的 `swap` 卡住不返回，好看清「正在落盘交接」那一段。
++        hold_swap: AtomicBool,
+     }
+ 
+     fn fake_hooks(lease: Duration, swap_ok: bool) -> (DrainHooks, Arc<Calls>) {
+         let calls = Arc::new(Calls::default());
+         let (c1, c2) = (calls.clone(), calls.clone());
+         let hooks = DrainHooks {
+             lease,
+             tick: Duration::from_millis(50),
+             linger: Duration::ZERO,
+             swap: Box::new(move |_socket: &Path| {
+                 c1.swaps.fetch_add(1, Ordering::SeqCst);
++                while c1.hold_swap.load(Ordering::SeqCst) {
++                    std::thread::sleep(Duration::from_millis(10));
++                }
+                 if swap_ok {
+                     Ok(())
+                 } else {
+                     Err(anyhow::anyhow!("起不来"))
+                 }
+             }),
+             exit: Box::new(move || {
+                 c2.exits.fetch_add(1, Ordering::SeqCst);
+             }),
+         };
+@@ -5183,60 +5190,66 @@ mod drain_tests {
+                 assert!(Instant::now() < deadline, "会话 {id} 停在 {st:?}，等的是 {want:?}");
+                 std::thread::sleep(Duration::from_millis(50));
+             }
+         }
+ 
+         /// 一直续租约地问进度，直到 `done`。
+         fn poll_until_done(&self) -> Progress {
+             let deadline = Instant::now() + Duration::from_secs(15);
+             loop {
+                 match self.call(Request::DrainStatus { renew: true }) {
+-                    Response::DrainProgress { progress, done: true } => return progress,
++                    Response::DrainProgress {
++                        progress,
++                        done: true,
++                        active: true,
++                    } => return progress,
+                     Response::DrainProgress { .. } => {}
+                     other => panic!("答得不对：{other:?}"),
+                 }
+                 assert!(Instant::now() < deadline, "排空一直没结束");
+                 std::thread::sleep(Duration::from_millis(100));
+             }
+         }
+ 
+         fn last_sessions(&self) -> Vec<crate::last_sessions::RecordedSession> {
+             crate::last_sessions::load(&crate::last_sessions::last_sessions_path_for_socket(
+                 &self.sock,
+             ))
+         }
+     }
+ 
+     fn not_running(r: Response) -> bool {
+-        matches!(r, Response::DrainProgress { progress, done: false } if progress.waiting.is_empty())
++        matches!(r, Response::DrainProgress { progress, done: false, active: false } if progress.waiting.is_empty())
+     }
+ 
+     #[test]
+     fn drain_with_all_idle_persists_ids_and_reports_done() {
+         let r = rig(Duration::from_secs(10), true);
+         let a = r.create("drain-idle", "a");
+         let b = r.create("drain-idle", "b");
+         // 各提交一句，对话 id 才会被记下来（没说过话的会话没有可接回的对话）。
+         for id in [a, b] {
+             r.mgr.send_input(id, "hi").unwrap();
+             r.mgr.send_input(id, "").unwrap();
+         }
+-        std::thread::sleep(Duration::from_millis(300));
+         r.wait_state(a, SessionState::Idle);
+         r.wait_state(b, SessionState::Idle);
+ 
+         let resp = r.call(Request::Drain {
+             wait_s: 5,
+             nudge_wait_s: 2,
+             initiator: None,
+         });
+-        assert!(matches!(resp, Response::DrainProgress { .. }), "{resp:?}");
++        assert!(
++            matches!(resp, Response::DrainProgress { active: true, .. }),
++            "全空闲时排空也在进行：{resp:?}"
++        );
+         r.poll_until_done();
+ 
+         let recs = r.last_sessions();
+         assert_eq!(recs.len(), 2, "{recs:?}");
+         assert!(recs.iter().all(|s| s.conversation_id.is_some()), "{recs:?}");
+         assert!(recs.iter().all(|s| !s.interrupted), "{recs:?}");
+         // 能按 id 接回的会话不用写交接（`resumes_by_id` 接上了）。
+         assert!(recs.iter().all(|s| s.handoff.is_none()), "{recs:?}");
+         assert_eq!(r.calls.swaps.load(Ordering::SeqCst), 1);
+         assert_eq!(r.calls.exits.load(Ordering::SeqCst), 1);
+@@ -5410,11 +5423,48 @@ mod drain_tests {
+             assert!(Instant::now() < deadline, "起不来之后该撤掉排空");
+             std::thread::sleep(Duration::from_millis(20));
+         }
+         assert_eq!(r.calls.exits.load(Ordering::SeqCst), 0, "不许退出");
+         assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+ 
+         // 清单不再冻着：照常落盘会把 `interrupted` 写回 false。
+         r.mgr.persist_last_sessions();
+         assert!(!r.last_sessions()[0].interrupted);
+     }
++
++    #[test]
++    fn nothing_started_means_not_active() {
++        let r = rig(Duration::from_secs(10), true);
++        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
++        assert!(not_running(r.call(Request::DrainStatus { renew: true })));
++    }
++
++    /// 已经在落盘、交给小进程那一段：没有会话可等，但排空还在进行。
++    #[test]
++    fn the_finishing_window_is_still_active() {
++        let r = rig(Duration::from_secs(10), true);
++        r.calls.hold_swap.store(true, Ordering::SeqCst);
++        let resp = r.call(Request::Drain {
++            wait_s: 5,
++            nudge_wait_s: 5,
++            initiator: None,
++        });
++        assert!(matches!(resp, Response::DrainProgress { active: true, .. }), "{resp:?}");
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while r.calls.swaps.load(Ordering::SeqCst) == 0 {
++            assert!(Instant::now() < deadline, "一直没去起 __swap");
++            std::thread::sleep(Duration::from_millis(20));
++        }
++        let mid = r.call(Request::DrainStatus { renew: true });
++        assert!(
++            matches!(&mid, Response::DrainProgress { active: true, done: false, progress } if progress.waiting.is_empty()),
++            "{mid:?}"
++        );
++        // 这时候取消不了。
++        assert!(matches!(
++            r.call(Request::DrainCancel),
++            Response::DrainProgress { active: true, .. }
++        ));
++        r.calls.hold_swap.store(false, Ordering::SeqCst);
++        r.poll_until_done();
++    }
+ }
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 336039c..a451ab7 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -1355,20 +1355,29 @@ pub mod msg {
+             lang,
+             en: "dct is running, but it is older than the version just installed. Restart it to update.".to_string(),
+             zh: "dct 在运行，但版本比这次装的旧，需要重启一下才能更新。".to_string(),
+         )
+     }
+ 
+     pub fn not_a_session_id(lang: Lang, arg: &str) -> String {
+         t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
+     }
+ 
++    /// 会话都停好了、正在记下状态交给新后台的那一小段，顶上那一行。
++    pub fn restart_now_banner(lang: Lang) -> String {
++        t!(
++            lang,
++            en: "dct is restarting…".to_string(),
++            zh: "dct 正在重启……".to_string(),
++        )
++    }
++
+     /// dct 准备重启时顶上那一行：还在等几个会话停下。
+     pub fn restart_pending_banner(lang: Lang, waiting: usize) -> String {
+         t!(
+             lang,
+             en: format!("dct is about to restart: still waiting for {waiting} session(s)"),
+             zh: format!("dct 准备重启：还在等 {waiting} 个会话"),
+         )
+     }
+ 
+     /// 顶栏那行常驻提示的正文：「正在直播 · N 路 · M 人在看」。**这一句
+diff --git a/src/proto.rs b/src/proto.rs
+index 2712e0c..d9cc34a 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -852,26 +852,29 @@ pub enum Response {
+     /// 对 [`Request::LivePublishGrant`] 的回答：一张只能切换公开状态的凭证。
+     LiveGrant(LiveGrantToken),
+     /// `Mesh*` 几条请求的共同回答：做完之后的样子。
+     Mesh(MeshView),
+     /// 对 [`Request::MeshInvite`] 的回答：新出的码。
+     MeshInvite(InviteView),
+     /// 对 [`Request::MeshPeers`] 的回答，按名单顺序，这台电脑自己也在里面。
+     MeshPeers(Vec<PeerView>),
+     /// 对 [`Request::MeshSend`] 的回答。
+     MeshSent(SendOutcome),
+-    /// 对 [`Request::Drain`] / [`Request::DrainStatus`] 的回答。没在排空时是
+-    /// `done: false` + 空进度——CLI 据此知道被取消了。`done: true` = 已经
++    /// 对 [`Request::Drain`] / [`Request::DrainStatus`] 的回答。
++    /// `active` = 有一场排空在进行（包括没有会话可等、正在落盘交接的那一段）；
++    /// `false` = 没在排空 / 已被取消，CLI 据此知道被取消了——**不能**拿
++    /// 「`waiting` 为空」来判断，收尾那一段它也是空的。`done: true` = 已经
+     /// 落盘、小进程已起，后台马上退出。
+     DrainProgress {
+         progress: crate::drain::Progress,
+         done: bool,
++        active: bool,
+     },
+ }
+ 
+ /// `dct peers` 里的一台电脑。
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct PeerView {
+     pub name: String,
+     /// 这一次问到了它（这台电脑自己恒为 `true`）。没回话的也算不在线。
+     pub online: bool,
+     /// `std::env::consts::OS` 的值；不在线是空串。
+@@ -1633,20 +1636,43 @@ mod tests {
+         assert_eq!(
+             (PROTOCOL_VERSION, shape.as_str()),
+             (
+                 25,
+                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3}},{"DrainStatus":{"renew":true}},"DrainCancel"]"#
+             ),
+             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
++    /// 排空进度的线上形状。CLI（`dct restart`）靠 `active` 分辨「被取消了」
++    /// 和「已经没有会话可等、正在收尾」，改了它就得一起加协议号。
++    #[test]
++    fn the_drain_progress_shape_is_pinned() {
++        let r = Response::DrainProgress {
++            progress: crate::drain::Progress {
++                waiting: vec![2],
++                remaining_s: 9,
++                nudged: true,
++            },
++            done: false,
++            active: true,
++        };
++        assert_eq!(
++            (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
++            (
++                25,
++                r#"{"DrainProgress":{"progress":{"waiting":[2],"remaining_s":9,"nudged":true},"done":false,"active":true}}"#
++            ),
++            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
++        );
++    }
++
+     /// **配对的响应里绝不许出现钥匙。** UI 不需要它——落盘在 daemon 那边做完了。
+     /// 一旦它过一次 socket，它就会出现在任何一个手滑加上的 `{resp:?}` 里。
+     #[test]
+     fn a_pair_tick_never_carries_the_key() {
+         let t = PairTick::Done {
+             anthropic_ready: true,
+             openai_ready: true,
+             llm_written: true,
+         };
+         let json = serde_json::to_string(&t).unwrap();
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index f7efdbe..aaa77bc 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -2577,27 +2577,30 @@ fn poll_drain(app: &mut App, now: std::time::Instant) {
+     {
+         return;
+     }
+     app.drain_last_fetch = Some(now);
+     app.drain = drain_banner_from(
+         app.client()
+             .and_then(|c| c.call(Request::DrainStatus { renew: false })),
+     );
+ }
+ 
+-/// 后台的回答 → 要不要画横幅。还有会话在等才画；旧后台不认这条请求
+-/// （回一个错误）、连不上，都安静地不画。
++/// 后台的回答 → 要不要画横幅。有一场排空在进行（`active`）就画，包括
++/// 没有会话可等、正在收尾的那一段；旧后台不认这条请求（回一个错误）、
++/// 连不上，都安静地不画。
+ fn drain_banner_from(r: anyhow::Result<Response>) -> Option<crate::drain::Progress> {
+     match r {
+-        Ok(Response::DrainProgress { progress, .. }) if !progress.waiting.is_empty() => {
+-            Some(progress)
+-        }
++        Ok(Response::DrainProgress {
++            progress,
++            active: true,
++            ..
++        }) => Some(progress),
+         _ => None,
+     }
+ }
+ 
+ /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
+ /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
+ fn draw_with_theme(f: &mut Frame, app: &mut App, theme: Option<Theme>) {
+     let _scope = agent_theme::Scope::new(theme);
+     draw(f, app);
+     if let Some(theme) = theme {
+@@ -2797,24 +2800,25 @@ fn draw(f: &mut Frame, app: &mut App) {
+ 
+     // dct 准备重启：在内容区顶上**盖**一行，不挤内容区——同底栏盖在会话
+     // 画面上的道理，改尺寸会让 agent 整屏重绘。
+     if let Some(p) = &app.drain {
+         let top = Rect {
+             height: 1,
+             ..chunks[0]
+         };
+         f.render_widget(ratatui::widgets::Clear, top);
+         f.render_widget(
+-            Paragraph::new(crate::i18n::msg::restart_pending_banner(
+-                app.lang,
+-                p.waiting.len(),
+-            ))
++            Paragraph::new(if p.waiting.is_empty() {
++                crate::i18n::msg::restart_now_banner(app.lang)
++            } else {
++                crate::i18n::msg::restart_pending_banner(app.lang, p.waiting.len())
++            })
+             .style(bar_danger(app.bar)),
+             top,
+         );
+     }
+ 
+     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
+     // 要的是「我在哪」和「这里能干什么」挨在一起读。项目现在是框内的中段。
+     // 实色档：整条底栏铺一层背景，不画边框。铺的是 `chunks[1]` 整块而不是
+     // 逐段刷——三段之间的间隔列也得有底色，否则色条会被切成三截。
+     // 底栏这一块先擦干净再画。平时是空操作（每帧的缓冲本来就是干净的），
+@@ -5318,35 +5322,56 @@ is_agent = true
+         assert!(!buffer_text(term.backend().buffer()).contains("准备重启"));
+     }
+ 
+     #[test]
+     fn drain_banner_state_follows_the_daemon_answer() {
+         let p = |w: Vec<u32>| crate::drain::Progress {
+             waiting: w,
+             remaining_s: 5,
+             nudged: false,
+         };
+-        let running = Response::DrainProgress {
+-            progress: p(vec![3]),
+-            done: false,
+-        };
+-        assert_eq!(drain_banner_from(Ok(running)), Some(p(vec![3])));
+-        let idle = Response::DrainProgress {
+-            progress: p(vec![]),
+-            done: false,
++        let reply = |w: Vec<u32>, active: bool| {
++            Ok(Response::DrainProgress {
++                progress: p(w),
++                done: false,
++                active,
++            })
+         };
+-        assert_eq!(drain_banner_from(Ok(idle)), None);
++        assert_eq!(drain_banner_from(reply(vec![3], true)), Some(p(vec![3])));
++        // 没有会话可等了、正在收尾：照样画（说「正在重启」）。
++        assert_eq!(drain_banner_from(reply(vec![], true)), Some(p(vec![])));
++        assert_eq!(drain_banner_from(reply(vec![], false)), None);
+         let old_daemon = Response::Error(crate::proto::ErrorCode::BadRequest("unknown variant".into()));
+         assert_eq!(drain_banner_from(Ok(old_daemon)), None);
+         assert_eq!(drain_banner_from(Err(anyhow::anyhow!("断了"))), None);
+     }
+ 
++    /// 排空在收尾、没有会话可等的时候，顶上说「正在重启」，不说「还在等 0 个」。
++    #[test]
++    fn the_finishing_window_says_restarting() {
++        use ratatui::backend::TestBackend;
++        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
++        let (mut app, _dir) = app_with_one_agent_session(View::Board);
++        app.drain = Some(crate::drain::Progress {
++            waiting: vec![],
++            remaining_s: 0,
++            nudged: false,
++        });
++        term.draw(|f| draw(f, &mut app)).unwrap();
++        let text: String = buffer_text(term.backend().buffer())
++            .chars()
++            .filter(|c| !c.is_whitespace())
++            .collect();
++        assert!(text.contains("dct正在重启"), "{text}");
++        assert!(!text.contains("还在等0"), "{text}");
++    }
++
+     #[test]
+     fn the_live_banner_beats_every_other_bar_content() {
+         use ratatui::backend::TestBackend;
+ 
+         fn live_info() -> crate::proto::LiveInfo {
+             crate::proto::LiveInfo {
+                 id: "abc".into(),
+                 token: "t".repeat(64),
+                 url: "https://x/live/abc#t=deadbeef".into(),
+                 staged: vec![(1, "claude".into())],

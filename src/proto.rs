@@ -142,7 +142,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// `InviteRosterRefused`，删掉 `NoOneAnswered` / `NoSuchRequest` / `Ambiguous` /
 /// `NameTaken` / `NoSuchInviter` / `CodeMismatch`。24 在一个分支里定了两回
 /// （先加后删），中间没有发过版，所以只加一次号。
-pub const PROTOCOL_VERSION: u32 = 24;
+///
+/// 25 = 平稳重启（Drain/DrainStatus/DrainCancel）：多了 `Request::Drain` /
+/// `DrainStatus` / `DrainCancel`、`Response::DrainProgress`。同一个分支里
+/// 先加的 `Request::Submit`（语音的「写字 + 回车」）也算在这一号里。
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +325,14 @@ pub enum Request {
         remember: bool,
     },
     Input {
+        id: u32,
+        text: String,
+    },
+    /// 自动来源（语音）要敲的字：跟 `Input` 的区别是守护进程一次做完
+    /// 「写字 + 按回车」（`bridge::submit`），并且在准备重启时拒绝
+    /// （`ErrorCode::RestartPending`）。用户自己在界面上敲的字走 `Input`，
+    /// 不受影响。
+    Submit {
         id: u32,
         text: String,
     },
@@ -556,6 +568,34 @@ pub enum Request {
         text: String,
         from_session: Option<u32>,
     },
+    /// `dct restart`：进入「准备重启」，等会话停下、到点催一句，然后记下
+    /// 状态、交给脱离的小进程重启。已经在排空时再发一次只回当前进度，
+    /// 不重新开始。`initiator` 是敲 `dct restart` 的那个会话（不等它）。
+    /// 只从本机 socket 上答。
+    Drain {
+        wait_s: u64,
+        nudge_wait_s: u64,
+        initiator: Option<u32>,
+        /// `--now`：不等、不请写交接、不催，直接记状态重启。
+        #[serde(default)]
+        now: bool,
+        /// 敲 `dct restart` 的那个二进制。新后台用它起——用户要的是「换成
+        /// 我手上这个」，不是旧后台当初从哪儿起的（那个文件可能已经被新版
+        /// 本替换掉了）。不给就用旧后台自己的路径。
+        #[serde(default)]
+        exe: Option<String>,
+    },
+    /// 问排空进度。`renew = true` 只有发起重启的 CLI 发（续租约）；界面画
+    /// 横幅时发 `false`，不续。超过 10 秒没收到 `renew: true` 就取消。
+    DrainStatus {
+        renew: bool,
+    },
+    /// 取消排空，回到正常。已经开始落盘之后取消不了。
+    DrainCancel,
+    /// 「你是这次开机起来的哪一个后台？」答一个每次启动都不同的数。界面
+    /// 重连上之后拿它判断后台是不是换过了——换过的话，手里的会话编号
+    /// 指的已经不是原来那些会话了。
+    Instance,
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -582,6 +622,11 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::Input { id, text } => f
                 .debug_struct("Input")
+                .field("id", id)
+                .field("text", text)
+                .finish(),
+            Request::Submit { id, text } => f
+                .debug_struct("Submit")
                 .field("id", id)
                 .field("text", text)
                 .finish(),
@@ -709,6 +754,25 @@ impl std::fmt::Debug for Request {
                 .field("text_chars", &text.chars().count())
                 .field("from_session", from_session)
                 .finish(),
+            Request::Drain {
+                wait_s,
+                nudge_wait_s,
+                initiator,
+                now,
+                exe,
+            } => f
+                .debug_struct("Drain")
+                .field("wait_s", wait_s)
+                .field("nudge_wait_s", nudge_wait_s)
+                .field("initiator", initiator)
+                .field("now", now)
+                .field("exe", exe)
+                .finish(),
+            Request::DrainStatus { renew } => {
+                f.debug_struct("DrainStatus").field("renew", renew).finish()
+            }
+            Request::DrainCancel => write!(f, "DrainCancel"),
+            Request::Instance => write!(f, "Instance"),
         }
     }
 }
@@ -812,6 +876,25 @@ pub enum Response {
     MeshPeers(Vec<PeerView>),
     /// 对 [`Request::MeshSend`] 的回答。
     MeshSent(SendOutcome),
+    /// 对 [`Request::Drain`] / [`Request::DrainStatus`] 的回答。
+    /// `active` = 有一场排空在进行（包括没有会话可等、正在落盘交接的那一段）；
+    /// `false` = 没在排空 / 已被取消，CLI 据此知道被取消了——**不能**拿
+    /// 「`waiting` 为空」来判断，收尾那一段它也是空的。`done: true` = 已经
+    /// 落盘、小进程已起，后台马上退出。
+    DrainProgress {
+        progress: crate::drain::Progress,
+        done: bool,
+        active: bool,
+    },
+    /// 对 [`Request::DrainCancel`] 的回答：取消了。`told` 是已经被请去写交接
+    /// 或者催过停下的会话，dct 会再告诉它们「不重启了，接着做」。
+    DrainCancelled {
+        told: Vec<u32>,
+    },
+    /// 对 [`Request::Instance`] 的回答。
+    Instance {
+        id: u64,
+    },
 }
 
 /// `dct peers` 里的一台电脑。
@@ -1174,6 +1257,11 @@ pub enum ErrorCode {
     Internal(String),
     /// 多电脑那一路为什么没办成。
     Mesh(MeshProblem),
+    /// dct 刚重启、还在接回会话，这会儿还不能再重启。
+    StillRestoring,
+    /// dct 正在准备重启，手机、语音这些自动来源这会儿不往会话里打字。
+    /// 对方当场就该知道「稍后再发」，而不是悄悄被吞掉。
+    RestartPending,
 }
 
 /// 见 [`ErrorCode::Mesh`]。句子在 `i18n::msg::error` 里组。
@@ -1320,6 +1408,19 @@ pub enum WarningCode {
         profile: String,
         reason: SessionResumeSkipReason,
     },
+    /// 平稳重启后要对某个会话说的话（「继续」或「先读交接」），等了 2 分钟它
+    /// 都没进入空闲，没打。只带目录：用户要的是「去哪个会话手动说一声」。
+    ResumeNoteDropped { dir: String },
+    /// 准备重启期间别的电脑发来的留言，重启后没送进去：那个会话等了很久
+    /// 都没准备好，或者根本没接回来。
+    HeldMessageDropped { dir: String },
+    /// 取消重启之后要告诉会话「dct 不重启了」，等了 2 分钟它都没准备好，没打。
+    /// 跟 `ResumeNoteDropped` 分开：这时候根本没重启。
+    CancelNoteDropped { dir: String },
+    /// 这个会话被打断了、对话接不回来，又没写成交接（没请成、请了没写，或者
+    /// 交接文件到期限都没出现）。重启后它是一段新对话，得用户告诉它之前在
+    /// 做什么。
+    HandoffMissing { dir: String },
 }
 
 /// 恢复上次会话时，某一条为什么被跳过。
@@ -1331,6 +1432,9 @@ pub enum SessionResumeSkipReason {
     ProfileGone,
     /// 目录和 profile 都还在，但重新起这个会话本身失败了
     StartFailed,
+    /// 按对话 id 接回时 agent 马上退出了（对话找不到了），已经在原处
+    /// 新开了一个——会话还在，只是原来的对话没接上
+    ConversationGone,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -1457,6 +1561,10 @@ mod tests {
                 id: 1,
                 text: "t".into(),
             },
+            Request::Submit {
+                id: 1,
+                text: "t".into(),
+            },
             Request::Screen { id: 1 },
             Request::Screens { ids: vec![1] },
             Request::Resize {
@@ -1556,14 +1664,81 @@ mod tests {
                 text: "t".into(),
                 from_session: Some(1),
             },
+            Request::Drain {
+                wait_s: 1,
+                nudge_wait_s: 2,
+                initiator: Some(3),
+                now: true,
+                exe: Some("/x/dct".into()),
+            },
+            Request::DrainStatus { renew: true },
+            Request::DrainCancel,
+            Request::Instance,
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                24,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}}]"#
+                25,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3,"now":true,"exe":"/x/dct"}},{"DrainStatus":{"renew":true}},"DrainCancel","Instance"]"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// 取消排空的回答、后台开机号的回答，线上形状同样钉死。
+    #[test]
+    fn the_drain_cancelled_and_instance_shapes_are_pinned() {
+        let r = [
+            Response::DrainCancelled { told: vec![2, 5] },
+            Response::Instance { id: 7 },
+        ];
+        assert_eq!(
+            (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
+            (
+                25,
+                r#"[{"DrainCancelled":{"told":[2,5]}},{"Instance":{"id":7}}]"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
+        );
+    }
+
+    /// 早一点的 CLI 发的 `Drain` 没有 `now` / `exe`：照样认，按「不是 --now、
+    /// 用后台自己的路径」处理。
+    #[test]
+    fn drain_without_new_fields_still_parses() {
+        let r: Request =
+            serde_json::from_str(r#"{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":null}}"#)
+                .unwrap();
+        assert!(matches!(
+            r,
+            Request::Drain {
+                now: false,
+                exe: None,
+                ..
+            }
+        ));
+    }
+
+    /// 排空进度的线上形状。CLI（`dct restart`）靠 `active` 分辨「被取消了」
+    /// 和「已经没有会话可等、正在收尾」，改了它就得一起加协议号。
+    #[test]
+    fn the_drain_progress_shape_is_pinned() {
+        let r = Response::DrainProgress {
+            progress: crate::drain::Progress {
+                waiting: vec![2],
+                remaining_s: 9,
+                nudged: true,
+            },
+            done: false,
+            active: true,
+        };
+        assert_eq!(
+            (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
+            (
+                25,
+                r#"{"DrainProgress":{"progress":{"waiting":[2],"remaining_s":9,"nudged":true},"done":false,"active":true}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1587,7 +1762,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                24,
+                25,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1702,7 +1877,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                24,
+                25,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":"","last_active_ms":0}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1805,7 +1980,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (24, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (25, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -1823,7 +1998,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (24, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (25, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -1900,7 +2075,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                24,
+                25,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -1937,7 +2112,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
             (
-                24,
+                25,
                 r#"{"MeshSent":"Delivered"}"#,
                 r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
                 r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
@@ -1976,7 +2151,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&v).unwrap().as_str()),
             (
-                24,
+                25,
                 r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"messages":{"7":2},"invite":{"id":3,"code":"012345","expires_at":1800000600},"invite_note":{"id":2,"outcome":{"Joined":{"name":"公司电脑"}}}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"

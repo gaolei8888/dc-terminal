@@ -181,6 +181,11 @@ pub struct App {
     pub pair_last_fetch: Option<std::time::Instant>,
     /// 上次问守护进程「在不在播」的时刻，见 `live::poll_status`。
     pub live_last_fetch: Option<std::time::Instant>,
+    /// dct 正在准备重启（排空）时的进度，顶上那行横幅画它；没在排空、或者
+    /// 后台是不认 `DrainStatus` 的旧版本时是 `None`。见 `ui::poll_drain`。
+    pub drain: Option<crate::drain::Progress>,
+    /// 上次问 `DrainStatus` 的时刻，压到一秒一次。
+    pub drain_last_fetch: Option<std::time::Instant>,
     /// 看板上「我的电脑」那一块：多电脑现状、加入确认、留言计数。后台线程
     /// 每 5 秒问一次，见 `computers::poll`。
     pub(crate) mesh: super::computers::MeshPanel,
@@ -289,6 +294,8 @@ impl App {
             pair_start_rx: None,
             pair_last_fetch: None,
             live_last_fetch: None,
+            drain: None,
+            drain_last_fetch: None,
             mesh: Default::default(),
             last_public_title: String::new(),
             lang,

@@ -23,8 +23,13 @@ dct —— vibe coding 终端
                    缺 Node 运行时会自己补上一份，只给 dct 自己用
   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
                    靠它，没有它撤销是死的；同样只给 dct 自己用
-  dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
-                   后台空着就直接起一个新的
+  dct restart      换掉在跑的守护进程：先等在忙的会话停下，重启后各自接回
+                   原来的对话；Ctrl+C 取消。-y 免问，--now 不等，
+                   --wait <分钟>（默认 15）、--nudge-wait <分钟>（默认 3）调等待；
+                   后台空着就直接起一个新的。在会话里敲的（比如 agent 替你敲）
+                   交给后台就返回，重启完会告诉那个会话
+  dct restart --cancel
+                   取消正在准备的重启（在哪个终端里敲都行）
   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
@@ -67,6 +72,18 @@ fn main() -> Result<()> {
         None => run_ui(),
         // 第二个参数是 socket 路径，重启守护进程时由界面显式传进来
         // （见 `client::spawn_daemon`）。不传就还是从 HOME 推。
+        // 平稳重启的最后一步，由旧后台起、脱离任何会话。不给用户敲，不进帮助。
+        Some("__swap") => {
+            let pid: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let sock = args.get(2).map(PathBuf::from).unwrap_or_else(socket_path);
+            let exe = std::env::current_exe()?;
+            std::process::exit(
+                match dct::client::swap_daemon(pid, &sock, &exe, Duration::from_secs(10)) {
+                    Ok(()) => 0,
+                    Err(_) => 1,
+                },
+            )
+        }
         Some("daemon") => {
             let sock = args.get(1).map(PathBuf::from).unwrap_or_else(socket_path);
             dct::daemon::run(&sock)
@@ -115,7 +132,7 @@ fn main() -> Result<()> {
                 std::process::exit(2)
             }
         },
-        // restart 换掉的是**整个**守护进程，所有会话跟着断，所以默认要问一句
+        // restart 换掉的是**整个**守护进程，会先等会话停下再换，所以默认要问一句
         // （`-y` 免问）。后台空着的时候它不拦着，直接当「启动」办——理由在
         // `cli::run_restart` 上。
         Some("restart") => {
@@ -279,7 +296,7 @@ fn start_daemon_headless(exe: &Path) -> Result<()> {
 /// 稍后读到的就是一份空清单，什么都不会恢复——这正是「拒绝恢复要清掉
 /// 记录」这条规矩落地的地方。按 `y`：清单原样留着不动，交给守护进程
 /// 启动时自己去读、自己去按 `(dir, profile)` 分组决定谁真的带上恢复参数
-/// （`daemon::restore_last_sessions` / `last_sessions::group_for_resume`）——
+/// （`daemon::restore_last_sessions` / `last_sessions::continue_flags`）——
 /// 这里不重复算一遍分组，只是为了把状态词（继续/新开）显示给用户看。
 ///
 /// 读不到 stdin（没有终端、被脚本调用……）**什么都不做**：不清空、也不
@@ -294,7 +311,7 @@ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
 
     let profiles_dir = dct::profile::profiles_dir_for_socket(sock);
     let (all, _) = dct::profile::all_profiles(&profiles_dir);
-    let resume_flags = dct::last_sessions::group_for_resume(&records);
+    let resume_flags = dct::last_sessions::continue_flags(&records, &all);
 
     println!("{}", text(Key::ResumeSessionsExplain, lang));
     for (rec, &resume) in records.iter().zip(resume_flags.iter()) {
@@ -304,7 +321,8 @@ fn offer_to_resume_last_sessions(sock: &Path, lang: Lang) {
             .map(|p| p.display_label(lang))
             .unwrap_or_else(|| rec.profile.clone());
         let marker = text(
-            if resume {
+            // 按对话 id 接回的也算「继续」——跟 `continue_flags` 同一条判定。
+            if resume || dct::last_sessions::will_resume_by_id(rec, &all) {
                 Key::ResumeSessionsWillContinue
             } else {
                 Key::ResumeSessionsWillStartFresh

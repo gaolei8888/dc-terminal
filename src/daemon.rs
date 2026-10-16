@@ -76,6 +76,16 @@ pub fn run(socket: &Path) -> Result<()> {
 /// （见 `session.rs` 的注释），各方法自己负责该锁多细的粒度。如果外面再套一把大锁，
 /// 就白做了那些细粒度设计——一个连接处理慢请求时又会把其它连接一起卡住。
 pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+    run_with_hooks(socket, mgr, DrainHooks::real())
+}
+
+/// 同 `run_with_manager`，平稳重启最后那一步（起 `__swap`、退出进程）可以
+/// 换成假的——测试不能真的起小进程、更不能把测试进程退掉。
+pub(crate) fn run_with_hooks(
+    socket: &Path,
+    mgr: Arc<SessionManager>,
+    hooks: DrainHooks,
+) -> Result<()> {
     // 建 socket、收紧权限、（Windows 上）留下 pid 文件，都在这一步里——
     // 「谁连得上谁就能以你的身份执行任意命令」，那道门的全部细节和它在
     // 两个平台上各能挡住什么，写在 `sys::ipc::bind_private`。
@@ -145,22 +155,55 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     let last_sessions_path = crate::last_sessions::last_sessions_path_for_socket(socket);
     let last_sessions_records = crate::last_sessions::load(&last_sessions_path);
     mgr.set_last_sessions_path(last_sessions_path);
+    // 交接文件只在重启后头一回有用：30 天以前的删掉（取消掉的重启也会留几份）。
+    prune_old_handoffs(
+        &handoff_dir_for_socket(socket),
+        HANDOFF_KEEP,
+        std::time::SystemTime::now(),
+    );
     if !last_sessions_records.is_empty() {
-        eprintln!(
-            "dct：正在接回上次的 {} 个会话……",
-            last_sessions_records.len()
-        );
+        // 记下来的会话编号先让出来：恢复期间用户新开的会话从更大的号开始，
+        // 不抢马上要接回来的「3 号」。
+        let max_id = last_sessions_records
+            .iter()
+            .filter_map(|r| r.id)
+            .max()
+            .unwrap_or(0);
+        mgr.reserve_ids_up_to(max_id);
+        mgr.set_restoring(true);
         let (all, _) = all_profiles(&profiles_dir);
-        let secrets_guard = recover(secrets.lock());
-        let skips = restore_last_sessions(&last_sessions_records, &all, &secrets_guard, &mgr);
-        drop(secrets_guard);
-        eprintln!("dct：会话接回完成。");
-        // review 之后补上：真正被 TUI 拉起来的守护进程 stdio 全接到
-        // `/dev/null`，上面几行 `eprintln!` 谁都看不见——用户按了 y
-        // 同意恢复，一个格子却悄无声息地没出现，没有任何地方告诉他为什么。
-        // 记下来，交给 `Request::Profiles` 顶给界面，跟 `LlmUnavailable`
-        // 走的是同一条路。
-        mgr.set_resume_skips(skips);
+        let (m, sec) = (mgr.clone(), secrets.clone());
+        let lang = crate::drain::agent_lang(socket);
+        // **在后台线程里接回，后台先开始应答。** 18 个会话、每个都要起进程
+        // 再拍一张快照，大仓库里加起来能到几十秒；同步接回的话这段时间
+        // 谁连上来都没人答，`dct restart` 和小进程会以为新后台没起来。
+        // 接回期间界面照样能连、看板上的会话一个个出现；只有再一次重启
+        // 会被挡回去（名册不全时落盘会丢会话，见 `DrainCtl::start`）。
+        let spawned = std::thread::Builder::new()
+            .name("restore".into())
+            .spawn(move || {
+                eprintln!("dct：正在接回上次的 {} 个会话……", last_sessions_records.len());
+                let secret_of = |p: &str| recover(sec.lock()).get(p).map(str::to_string);
+                let (skips, by_id, notes) =
+                    restore_sessions_with(&last_sessions_records, &all, &secret_of, &m, lang);
+                eprintln!("dct：会话接回完成。");
+                // 真正被 TUI 拉起来的守护进程 stdio 全接到 `/dev/null`，上面几行
+                // `eprintln!` 谁都看不见——记下来，交给 `Request::Profiles` 顶给
+                // 界面，跟 `LlmUnavailable` 走的是同一条路。
+                m.set_resume_skips(skips);
+                m.set_restoring(false);
+                // 按 id 接回的那些在后台盯一小会儿：接回失败（对话没了）的会马上
+                // 退出，换一个新开的顶上，再补一句警告。**必须排在
+                // `set_resume_skips` 之后**——那个是整份覆盖，后台补的警告要追加在
+                // 它后面，不能被它冲掉。
+                watch_resumed_by_id(m.clone(), all, by_id, RESUME_WATCH_WINDOW);
+                // 「继续」/「先读交接」/存着的留言：等各自准备好再打。
+                deliver_resume_notes(m.clone(), notes, RESUME_NOTE_TICK);
+            });
+        if let Err(e) = spawned {
+            eprintln!("没能起接回会话的线程：{e}");
+            mgr.set_restoring(false);
+        }
     }
 
     // Ruling 3：这份状态槽是 `Request::PhoneStatus` 唯一的答案来源，也是
@@ -288,6 +331,17 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 自己的线程——绝不能让这条线的网络 IO 混进上面那个 200ms 的 tick。
     crate::live::spawn_pusher(live.clone(), mgr.clone());
 
+    // 平稳重启（`Request::Drain`）：同一时刻最多一场排空，所有连接共用。
+    let drain = Arc::new(DrainCtl::new(socket, mgr.clone(), hooks));
+    {
+        let mc = mesh_ctl.clone();
+        drain.set_held_source(Box::new(move || {
+            mc.running()
+                .map(|(m, _)| recover(m.lock()).held_texts())
+                .unwrap_or_default()
+        }));
+    }
+
     for conn in listener.incoming() {
         let conn = conn?;
         let m = mgr.clone();
@@ -301,13 +355,425 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let pr = pairs.clone();
         let lv = live.clone();
         let mc = mesh_ctl.clone();
+        let dr = drain.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc, dr) {
                 eprintln!("连接处理失败: {e}");
             }
         });
     }
     Ok(())
+}
+
+/// 起脱离的 `dct __swap`。参数是 socket 和要起的那个 dct（`None` = 用旧后台
+/// 自己的路径）。
+pub(crate) type SwapFn = Box<dyn Fn(&Path, Option<&Path>) -> Result<()> + Send + Sync>;
+
+/// 准备重启期间还没送进去的多电脑留言，按会话。最后一次落盘时记下来，
+/// 重启后照常送（见 `RecordedSession::held_messages`）。
+pub(crate) type HeldFn = Box<dyn Fn() -> std::collections::HashMap<u32, Vec<String>> + Send + Sync>;
+
+/// 平稳重启最后那一步怎么做、租约多长。生产用 `DrainHooks::real()`，
+/// 测试换成只记账的假货。
+pub(crate) struct DrainHooks {
+    /// 多久没收到 `DrainStatus { renew: true }` 就当 CLI 走了、取消排空。
+    /// 在会话里敲的 `dct restart`（带着发起者）不看这一条，见 `drive`。
+    pub lease: Duration,
+    /// 排空线程多久看一次各会话。
+    pub tick: Duration,
+    /// 小进程起好之后，最多再等多久让 CLI 问到 `done: true` 再退出。
+    pub linger: Duration,
+    /// 起脱离的 `dct __swap`。
+    pub swap: SwapFn,
+    /// 退出进程。真的那个不返回。
+    pub exit: Box<dyn Fn() + Send + Sync>,
+}
+
+/// 后台自己的路径。Linux 上二进制被就地换掉（先删再改名，`cargo install`
+/// 和大多数安装器都这么做）之后，`/proc/self/exe` 读出来是
+/// `…/dct (deleted)`——那个文件已经不在了，同一个路径上现在是新版本，正是
+/// 要起的那个。
+fn own_exe() -> Result<PathBuf> {
+    Ok(strip_deleted(std::env::current_exe()?))
+}
+
+fn strip_deleted(p: PathBuf) -> PathBuf {
+    match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    }
+}
+
+impl DrainHooks {
+    pub(crate) fn real() -> DrainHooks {
+        DrainHooks {
+            lease: Duration::from_secs(10),
+            tick: Duration::from_millis(500),
+            linger: Duration::from_secs(2),
+            swap: Box::new(|socket: &Path, exe: Option<&Path>| {
+                let exe = match exe {
+                    Some(e) => e.to_path_buf(),
+                    None => own_exe()?,
+                };
+                crate::client::spawn_swap(std::process::id(), socket, &exe)
+            }),
+            exit: Box::new(|| std::process::exit(0)),
+        }
+    }
+}
+
+/// 正在进行的那一场排空。
+struct DrainRun {
+    drain: crate::drain::Drain,
+    /// 最后一次 `DrainStatus { renew: true }`（或者 `Drain` 本身）的时刻。
+    last_poll: std::time::Instant,
+    /// 已经进入落盘那一步：从这里开始取消不了，租约也不再管。
+    finishing: bool,
+    /// 已经落盘、小进程已起，马上退出。
+    done: bool,
+    /// 哪一场。线程靠它认出「我那一场已经被取消、又开了新的一场」。
+    generation: u64,
+    /// 敲 `dct restart` 的那个会话。有它就不看租约：agent 跑命令有时限，
+    /// 时限一到 CLI 被掐掉，不能因此把重启也一起取消了。
+    initiator: Option<u32>,
+    /// 新后台用哪个 dct 起（CLI 带来的）。
+    exe: Option<PathBuf>,
+    /// 已经被请去写交接、或者被催过停下的会话。取消的时候要告诉它们
+    /// 「不重启了，接着做」——不然它们会一直停在那儿等。
+    told: Vec<u32>,
+}
+
+/// 平稳重启在后台这一侧的全部状态。见 `Request::Drain`。
+pub(crate) struct DrainCtl {
+    socket: PathBuf,
+    mgr: Arc<SessionManager>,
+    hooks: DrainHooks,
+    run: Mutex<Option<DrainRun>>,
+    generation: std::sync::atomic::AtomicU64,
+    /// CLI 已经问到 `done: true` 了，可以退出。
+    done_seen: AtomicBool,
+    /// dct 打给 agent 的那几句话用哪种语言（`drain::agent_lang`）。
+    lang: crate::i18n::Lang,
+    /// 还没送进去的多电脑留言从哪儿拿。没装就是没有。
+    held: Mutex<Option<HeldFn>>,
+}
+
+fn idle_progress() -> crate::drain::Progress {
+    crate::drain::Progress {
+        waiting: Vec::new(),
+        remaining_s: 0,
+        nudged: false,
+    }
+}
+
+impl DrainCtl {
+    pub(crate) fn new(socket: &Path, mgr: Arc<SessionManager>, hooks: DrainHooks) -> DrainCtl {
+        DrainCtl {
+            socket: socket.to_path_buf(),
+            mgr,
+            hooks,
+            run: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            done_seen: AtomicBool::new(false),
+            lang: crate::drain::agent_lang(socket),
+            held: Mutex::new(None),
+        }
+    }
+
+    /// 装上「还没送进去的留言从哪儿拿」。
+    pub(crate) fn set_held_source(&self, f: HeldFn) {
+        *recover(self.held.lock()) = Some(f);
+    }
+
+    fn progress_of(run: &DrainRun) -> Response {
+        Response::DrainProgress {
+            progress: run.drain.progress(std::time::Instant::now()),
+            done: run.done,
+            active: true,
+        }
+    }
+
+    /// `Request::Drain`。已经在排空就只回进度。刚重启、还在接回会话的时候
+    /// 不接：那时候名册还不全，落盘会把还没接回来的会话丢掉。
+    fn start(
+        self: &Arc<Self>,
+        cfg: crate::drain::DrainConfig,
+        initiator: Option<u32>,
+        exe: Option<PathBuf>,
+    ) -> Response {
+        let mut slot = recover(self.run.lock());
+        if let Some(run) = slot.as_ref() {
+            return Self::progress_of(run);
+        }
+        if self.mgr.is_restoring() {
+            return Response::Error(ErrorCode::StillRestoring);
+        }
+        let handoff_dir = handoff_dir_for_socket(&self.socket);
+        if let Err(e) = std::fs::create_dir_all(&handoff_dir) {
+            eprintln!("交接目录建不了（{}）：{e}", handoff_dir.display());
+        }
+        let members = self
+            .mgr
+            .list()
+            .into_iter()
+            .map(|s| crate::drain::Member {
+                id: s.id,
+                resumable: self.mgr.drain_resumable(s.id),
+                is_agent: s.is_agent,
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let run = DrainRun {
+            drain: crate::drain::Drain::new(members, initiator, cfg, handoff_dir, now),
+            last_poll: now,
+            finishing: false,
+            done: false,
+            generation,
+            initiator,
+            exe,
+            told: Vec::new(),
+        };
+        let resp = Self::progress_of(&run);
+        *slot = Some(run);
+        self.done_seen.store(false, Ordering::SeqCst);
+        self.mgr.set_draining(true);
+        drop(slot);
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("drain".into())
+            .spawn(move || me.drive(generation))
+            .map(|_| resp)
+            .unwrap_or_else(|e| {
+                eprintln!("排空线程起不来：{e}");
+                self.abandon(generation);
+                Response::Error(ErrorCode::Internal(e.to_string()))
+            })
+    }
+
+    /// `Request::DrainStatus`。
+    fn status(&self, renew: bool) -> Response {
+        let mut slot = recover(self.run.lock());
+        match slot.as_mut() {
+            None => Response::DrainProgress {
+                progress: idle_progress(),
+                done: false,
+                active: false,
+            },
+            Some(run) => {
+                if renew {
+                    run.last_poll = std::time::Instant::now();
+                }
+                if run.done {
+                    self.done_seen.store(true, Ordering::SeqCst);
+                }
+                Self::progress_of(run)
+            }
+        }
+    }
+
+    /// `Request::DrainCancel`。已经开始落盘就取消不了，回当前进度。
+    fn cancel(&self) -> Response {
+        let mut slot = recover(self.run.lock());
+        if slot.as_ref().is_some_and(|run| run.finishing) {
+            return Self::progress_of(slot.as_ref().expect("刚看过是 Some"));
+        }
+        let told = slot.take().map(|run| run.told).unwrap_or_default();
+        self.mgr.set_draining(false);
+        drop(slot);
+        self.tell_called_off(&told);
+        Response::DrainCancelled { told }
+    }
+
+    /// 撤掉第 `generation` 场（还是它的话），回到正常。
+    fn abandon(&self, generation: u64) {
+        let mut slot = recover(self.run.lock());
+        if slot.as_ref().is_some_and(|r| r.generation == generation) {
+            let told = slot.take().map(|run| run.told).unwrap_or_default();
+            self.mgr.set_draining(false);
+            drop(slot);
+            self.tell_called_off(&told);
+        }
+    }
+
+    /// 重启不做了：被请去写交接、被催过停下的会话，等它们准备好再告诉
+    /// 一声「不重启了，接着做」。走重启后补投递的同一条路（等准备好、一次
+    /// 一条、不重打）。
+    fn tell_called_off(&self, told: &[u32]) {
+        if told.is_empty() {
+            return;
+        }
+        let dirs: std::collections::HashMap<u32, String> =
+            self.mgr.list().into_iter().map(|s| (s.id, s.dir)).collect();
+        let deadline = std::time::Instant::now() + crate::resume_notes::NOTE_WAIT;
+        let notes = told
+            .iter()
+            .map(|&id| crate::resume_notes::Note {
+                id,
+                text: crate::drain::cancel_text(self.lang).to_string(),
+                deadline,
+                dir: dirs.get(&id).cloned().unwrap_or_default(),
+                kind: crate::resume_notes::NoteKind::Cancel,
+                needs_file: None,
+            })
+            .collect();
+        deliver_resume_notes(self.mgr.clone(), notes, RESUME_NOTE_TICK);
+    }
+
+    /// 替第 `generation` 场往会话里打一句话。**拿着排空的锁打**：取消要么
+    /// 发生在打之前（那就不打），要么发生在打完之后（那它已经记在 `told`
+    /// 里，会被告知「不重启了」），不会有「已经取消了却还打进去一句」的缝。
+    fn type_for_run(&self, generation: u64, id: u32, text: &str) {
+        let mut slot = recover(self.run.lock());
+        let Some(run) = slot.as_mut().filter(|r| r.generation == generation) else {
+            return;
+        };
+        match crate::bridge::submit_once(&self.mgr, id, text) {
+            crate::resume_notes::Sent::No => {
+                eprintln!("往会话 {id} 打的话没打进去");
+            }
+            crate::resume_notes::Sent::Yes | crate::resume_notes::Sent::Partial => {
+                if !run.told.contains(&id) {
+                    run.told.push(id);
+                }
+            }
+        }
+    }
+
+    /// 排空线程本体：每拍看一眼各会话，执行状态机给的动作。
+    fn drive(&self, generation: u64) {
+        loop {
+            std::thread::sleep(self.hooks.tick);
+            let states: std::collections::HashMap<u32, crate::session::SessionState> = self
+                .mgr
+                .list()
+                .into_iter()
+                .map(|s| (s.id, s.state))
+                .collect();
+            let now = std::time::Instant::now();
+            let actions = {
+                let mut slot = recover(self.run.lock());
+                let Some(run) = slot.as_mut().filter(|r| r.generation == generation) else {
+                    // 被取消了（或者已经换了一场），这条线程的事办完了。
+                    return;
+                };
+                if run.initiator.is_none()
+                    && now.saturating_duration_since(run.last_poll) > self.hooks.lease
+                {
+                    eprintln!("dct restart 那边不再问进度了，取消重启。");
+                    drop(slot);
+                    self.abandon(generation);
+                    return;
+                }
+                let ready = |id: u32| self.mgr.ready_for_keys(id);
+                let written = |p: &Path| p.is_file();
+                let actions = run.drain.step(now, &states, &ready, &written);
+                if actions
+                    .iter()
+                    .any(|a| matches!(a, crate::drain::Action::Finish { .. }))
+                {
+                    run.finishing = true;
+                }
+                actions
+            };
+            for a in actions {
+                match a {
+                    crate::drain::Action::AskHandoff { id, path } => {
+                        let text = crate::drain::handoff_text_in(&path, self.lang);
+                        self.type_for_run(generation, id, &text);
+                    }
+                    crate::drain::Action::Nudge { id } => {
+                        self.type_for_run(generation, id, crate::drain::nudge_text(self.lang));
+                    }
+                    crate::drain::Action::Finish {
+                        interrupted,
+                        handoffs,
+                        initiator,
+                    } => {
+                        self.finish(generation, interrupted, handoffs, initiator);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 记状态、交给小进程、退出。小进程起不来就撤回排空、照常运行：
+    /// 宁可不重启，也不能把所有会话杀了却起不来新的。
+    fn finish(
+        &self,
+        generation: u64,
+        interrupted: std::collections::HashSet<u32>,
+        handoffs: std::collections::HashMap<u32, PathBuf>,
+        initiator: Option<u32>,
+    ) {
+        // 留言是抄一份，不是取走：交接失败、照常运行下去的话，它们还在队列里
+        // 照常送。落盘到退出之间这两秒新来的留言会丢——窗口很小，接受。
+        let held = recover(self.held.lock())
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default();
+        let marks = crate::session::RestartMarks {
+            interrupted,
+            handoffs,
+            initiator,
+            held,
+        };
+        self.mgr.persist_final_last_sessions(&marks);
+        let exe = recover(self.run.lock())
+            .as_ref()
+            .and_then(|r| r.exe.clone());
+        if let Err(e) = (self.hooks.swap)(&self.socket, exe.as_deref()) {
+            eprintln!("平稳重启没交出去，照常运行：{e}");
+            self.mgr.unfreeze_last_sessions();
+            self.abandon(generation);
+            return;
+        }
+        if let Some(run) = recover(self.run.lock()).as_mut() {
+            run.done = true;
+        }
+        // 给 CLI 一点时间问到 `done: true`，它才知道该去等新后台了。
+        let deadline = std::time::Instant::now() + self.hooks.linger;
+        while !self.done_seen.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 走之前把会话一个个停掉，不靠退出时的挂断信号，见 `kill_all_now`。
+        self.mgr.kill_all_now();
+        (self.hooks.exit)();
+    }
+}
+
+/// 交接文件放哪：socket 旁边的 `handoffs/`（真实环境里是 `~/.dct/handoffs`）。
+fn handoff_dir_for_socket(socket: &Path) -> PathBuf {
+    socket
+        .parent()
+        .map(|d| d.join("handoffs"))
+        .unwrap_or_else(|| PathBuf::from("handoffs"))
+}
+
+/// 交接文件留多久：30 天。后台启动时把更老的删掉——它们只在重启后头一回
+/// 有用，取消掉的重启也会留下几份。
+const HANDOFF_KEEP: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// 删掉 `dir` 里改动时间早于 `now - keep` 的文件。目录不在、读不了都不算错。
+fn prune_old_handoffs(dir: &Path, keep: Duration, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > keep);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// 守护进程里多电脑那一路还活着的东西。
@@ -723,7 +1189,8 @@ fn start_phone_bridge(
 /// 留一句解释，绝不能因为一条坏记录就让其它本来接得回来的会话也一起
 /// 泡汤。
 ///
-/// 谁真的该带 `--continue`（谁不该）由 `last_sessions::group_for_resume`
+/// 记着对话 id 的记录各接各的（`resume_id_args`），不参与分组；没 id 的
+/// 旧记录里谁真的该带 `--continue`（谁不该）由 `last_sessions::continue_flags`
 /// 这个纯函数决定——这里只管照着它的判定去调
 /// `SessionManager::create_resuming`，不重新做一遍分组判断。
 ///
@@ -736,18 +1203,82 @@ fn start_phone_bridge(
 /// `dct daemon` 或者截获 stderr 的测试看得见，跟 `install_llm_backend`
 /// 那条注释是同一条限制），那条narration 不需要多语言、也不需要被测试
 /// 断言内容，所以没有走返回值。
+#[cfg(test)]
 fn restore_last_sessions(
     records: &[crate::last_sessions::RecordedSession],
     all: &[Profile],
     secrets: &SecretStore,
     mgr: &SessionManager,
 ) -> Vec<crate::proto::WarningCode> {
+    restore_sessions(records, all, secrets, mgr).0
+}
+
+/// 按对话 id 接回的会话，接回之后要在后台盯多久：这段时间里自己退出了
+/// 就算「接回失败」（对话文件没了、agent 报错退出），换一个新开的顶上。
+/// 再晚退出的不算——那是用户在接回来的对话里正常用着用着退出的。
+const RESUME_WATCH_WINDOW: Duration = Duration::from_secs(20);
+
+/// 一个按对话 id 接回、需要后台盯着的会话。
+struct ResumedById {
+    id: u32,
+    record: crate::last_sessions::RecordedSession,
+    secret: Option<String>,
+}
+
+/// 同 `restore_last_sessions`，另外交出按 id 接回的那些，给
+/// [`watch_resumed_by_id`] 盯着。测试用：密钥直接从一份 `SecretStore` 里查，
+/// 打给 agent 的话用中文。
+#[cfg(test)]
+fn restore_sessions(
+    records: &[crate::last_sessions::RecordedSession],
+    all: &[Profile],
+    secrets: &SecretStore,
+    mgr: &SessionManager,
+) -> (
+    Vec<crate::proto::WarningCode>,
+    Vec<ResumedById>,
+    Vec<crate::resume_notes::Note>,
+) {
+    restore_sessions_with(
+        records,
+        all,
+        &|p| secrets.get(p).map(str::to_string),
+        mgr,
+        crate::i18n::Lang::Zh,
+    )
+}
+
+/// 恢复的本体。`secret_of` 每条现查一次——恢复在后台线程里慢慢跑，不能
+/// 一直攥着密钥仓的锁（界面要 `Profiles` 时也要那把锁）。
+fn restore_sessions_with(
+    records: &[crate::last_sessions::RecordedSession],
+    all: &[Profile],
+    secret_of: &dyn Fn(&str) -> Option<String>,
+    mgr: &SessionManager,
+    lang: crate::i18n::Lang,
+) -> (
+    Vec<crate::proto::WarningCode>,
+    Vec<ResumedById>,
+    Vec<crate::resume_notes::Note>,
+) {
     use crate::proto::{SessionResumeSkipReason, WarningCode};
 
-    let resume_flags = crate::last_sessions::group_for_resume(records);
+    let resume_flags = crate::last_sessions::continue_flags(records, all);
     let mut skips = Vec::new();
+    let mut by_id = Vec::new();
+    let mut notes = Vec::new();
     let total = records.len();
 
+    // 没接回来的会话，替它存着的留言送不到了：每条都告诉用户一声。
+    let held_dropped = |record: &crate::last_sessions::RecordedSession| {
+        record
+            .held_messages
+            .iter()
+            .map(|_| WarningCode::HeldMessageDropped {
+                dir: record.dir.display().to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
     for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
         // 一条会话的恢复可能要跑真正的子进程 spawn + 首次 git checkpoint
         // （agent profile 都要），仓库大的话这一步单独就要小半秒。这整段
@@ -775,6 +1306,7 @@ fn restore_last_sessions(
                 profile: record.profile.clone(),
                 reason: SessionResumeSkipReason::DirGone,
             });
+            skips.extend(held_dropped(record));
             continue;
         }
         if !all.iter().any(|p| p.name == record.profile) {
@@ -788,17 +1320,68 @@ fn restore_last_sessions(
                 profile: record.profile.clone(),
                 reason: SessionResumeSkipReason::ProfileGone,
             });
+            skips.extend(held_dropped(record));
             continue;
         }
 
-        let secret = secrets.get(&record.profile);
+        let secret = secret_of(&record.profile);
         let tag = if record.tag.is_empty() {
             None
         } else {
             Some(record.tag.as_str())
         };
-        if let Err(e) = mgr.create_resuming(&record.dir, &record.profile, secret, all, resume, tag)
-        {
+        let resumed = mgr.restore(
+            &record.dir,
+            &record.profile,
+            secret.as_deref(),
+            all,
+            resume,
+            tag,
+            record.conversation_id.as_deref(),
+            record.id,
+        );
+        if let Ok(id) = resumed {
+            let resumed_by_id = crate::last_sessions::will_resume_by_id(record, all);
+            let now = std::time::Instant::now();
+            let dir = record.dir.display().to_string();
+            if let Some(p) = crate::resume_notes::note_for(record, resumed_by_id, lang) {
+                notes.push(crate::resume_notes::Note {
+                    id,
+                    text: p.text,
+                    deadline: now + crate::resume_notes::NOTE_WAIT,
+                    dir: dir.clone(),
+                    kind: crate::resume_notes::NoteKind::Note,
+                    needs_file: p.needs_file,
+                });
+            }
+            // 带了 `--continue` 才算接回了点什么；profile 根本没有那个参数的不算。
+            let continued = resume
+                && all
+                    .iter()
+                    .any(|p| p.name == record.profile && !p.resume_args.is_empty());
+            if crate::resume_notes::lost_without_handoff(record, resumed_by_id, continued) {
+                skips.push(WarningCode::HandoffMissing { dir: dir.clone() });
+            }
+            // 准备重启期间替它存着的留言，排在「继续」后面，一条条照常送。
+            for m in &record.held_messages {
+                notes.push(crate::resume_notes::Note {
+                    id,
+                    text: m.clone(),
+                    deadline: now + crate::resume_notes::MESSAGE_WAIT,
+                    dir: dir.clone(),
+                    kind: crate::resume_notes::NoteKind::Message,
+                    needs_file: None,
+                });
+            }
+            if resumed_by_id {
+                by_id.push(ResumedById {
+                    id,
+                    record: record.clone(),
+                    secret,
+                });
+            }
+        }
+        if let Err(e) = resumed {
             eprintln!(
                 "跳过恢复：{}（{}）没能重新起来：{e}",
                 record.dir.display(),
@@ -809,10 +1392,158 @@ fn restore_last_sessions(
                 profile: record.profile.clone(),
                 reason: SessionResumeSkipReason::StartFailed,
             });
+            skips.extend(held_dropped(record));
         }
     }
 
-    skips
+    (skips, by_id, notes)
+}
+
+/// 投递线程每隔多久看一次。
+const RESUME_NOTE_TICK: Duration = Duration::from_millis(500);
+
+/// 一句没送进去的话该给用户什么提示。「先读交接」没送进去、是因为交接
+/// 文件到期限都没出现的，说的是「它没写成交接」，不是「它没准备好」。
+fn dropped_warning(
+    n: crate::resume_notes::Note,
+    written: &dyn Fn(&Path) -> bool,
+) -> crate::proto::WarningCode {
+    use crate::proto::WarningCode;
+    use crate::resume_notes::NoteKind;
+    let dir = n.dir;
+    match n.kind {
+        NoteKind::Note if n.needs_file.as_deref().is_some_and(|p| !written(p)) => {
+            WarningCode::HandoffMissing { dir }
+        }
+        NoteKind::Note => WarningCode::ResumeNoteDropped { dir },
+        NoteKind::Cancel => WarningCode::CancelNoteDropped { dir },
+        NoteKind::Message => WarningCode::HeldMessageDropped { dir },
+    }
+}
+
+/// 在后台把重启后的话投递给各会话：等空闲再打（绕过「准备重启」的闸，
+/// 此刻本来就不在排空），一次一条；等不到的变成一条界面警告。
+/// 没东西要投递就不起线程。返回句柄只给测试 `join`。
+fn deliver_resume_notes(
+    mgr: Arc<SessionManager>,
+    mut notes: Vec<crate::resume_notes::Note>,
+    tick: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    if notes.is_empty() {
+        return None;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("resume-notes".into())
+        .spawn(move || {
+            while !notes.is_empty() {
+                let states: std::collections::HashMap<u32, crate::session::SessionState> =
+                    mgr.list().into_iter().map(|s| (s.id, s.state)).collect();
+                let mut send =
+                    |id: u32, text: &str| crate::bridge::submit_once(&mgr, id, text);
+                let ready = |id: u32| mgr.ready_for_keys(id);
+                let written = |p: &Path| p.is_file();
+                let dropped = crate::resume_notes::step(
+                    &mut notes,
+                    std::time::Instant::now(),
+                    &states,
+                    &ready,
+                    &written,
+                    &mut send,
+                );
+                for n in dropped {
+                    let w = dropped_warning(n, &written);
+                    eprintln!("有一句话没送进去：{w:?}");
+                    mgr.push_resume_skip(w);
+                }
+                if notes.is_empty() {
+                    return;
+                }
+                std::thread::sleep(tick);
+            }
+        });
+    match spawned {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("没能起重启后投递线程：{e}");
+            None
+        }
+    }
+}
+
+/// 在后台盯着按 id 接回的会话，最多盯 `window` 这么久。哪个在这段时间里
+/// **自己**退出了（被叫停的不算），就当接回失败：把那个死格子拿掉，在同一个
+/// 目录、同一个 profile 下新开一个（新的对话 id、原来的名字），再经
+/// `push_resume_skip` 告诉用户「没能接回原来的对话」。
+///
+/// 跑在单独的线程上，不挡守护进程开始接请求。没东西要盯就不起线程。
+/// 返回线程句柄只是给测试 `join` 用。
+fn watch_resumed_by_id(
+    mgr: Arc<SessionManager>,
+    all: Vec<Profile>,
+    mut pending: Vec<ResumedById>,
+    window: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    use crate::proto::{SessionResumeSkipReason, WarningCode};
+
+    if pending.is_empty() {
+        return None;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("resume-watch".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + window;
+            loop {
+                pending.retain(|w| match mgr.exited_on_its_own(w.id) {
+                    // 会话已经不在名册上了（被清理掉了）：没什么可盯的。
+                    None => false,
+                    Some(false) => true,
+                    Some(true) => {
+                        let r = &w.record;
+                        eprintln!(
+                            "{}（{}）没能接回原来的对话，重新开一个",
+                            r.dir.display(),
+                            r.profile
+                        );
+                        mgr.discard(w.id);
+                        let tag = Some(r.tag.as_str()).filter(|t| !t.is_empty());
+                        // 换一个新编号：重启后补投递的「继续」是按旧编号排的队，
+                        // 新开的对话不该收到它（见 `resume_notes::step`）。
+                        let reason = match mgr.create_resuming(
+                            &r.dir,
+                            &r.profile,
+                            w.secret.as_deref(),
+                            &all,
+                            false,
+                            tag,
+                            None,
+                        ) {
+                            Ok(_) => SessionResumeSkipReason::ConversationGone,
+                            Err(e) => {
+                                eprintln!("重新开也失败了：{e}");
+                                SessionResumeSkipReason::StartFailed
+                            }
+                        };
+                        mgr.push_resume_skip(WarningCode::SessionResumeSkipped {
+                            dir: r.dir.display().to_string(),
+                            profile: r.profile.clone(),
+                            reason,
+                        });
+                        false
+                    }
+                });
+                if pending.is_empty() || std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    match spawned {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("没能起接回看守线程：{e}");
+            None
+        }
+    }
 }
 
 fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
@@ -884,6 +1615,7 @@ fn serve(
     pairs: Arc<Mutex<PairTable>>,
     live: Arc<crate::live::LiveState>,
     mesh: Arc<MeshCtl>,
+    drain: Arc<DrainCtl>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -911,6 +1643,24 @@ fn serve(
                 &profiles_dir,
                 &crate::mesh::login::http_transport,
             ),
+            // 平稳重启同样只从本机 socket 上来：局域网手机页不能让这台电脑重启。
+            Ok(Request::Drain {
+                wait_s,
+                nudge_wait_s,
+                initiator,
+                now,
+                exe,
+            }) => drain.start(
+                crate::drain::DrainConfig {
+                    wait: Duration::from_secs(wait_s),
+                    nudge_wait: Duration::from_secs(nudge_wait_s),
+                    now,
+                },
+                initiator,
+                exe.map(PathBuf::from),
+            ),
+            Ok(Request::DrainStatus { renew }) => drain.status(renew),
+            Ok(Request::DrainCancel) => drain.cancel(),
             // 本机 socket 这一路**带着** `web`：设置页要能开关那个监听口。
             // 从 HTTP 上来的请求走的是另一个调用点，那边传 `None`——手机
             // 自己开关不了它，也问不出那条带令牌的地址。
@@ -964,6 +1714,9 @@ fn handle(
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
         Request::Hello => Ok(Response::Hello {
             protocol: crate::proto::PROTOCOL_VERSION,
+        }),
+        Request::Instance => Ok(Response::Instance {
+            id: mgr.instance_id(),
         }),
         Request::List => Ok(Response::Sessions(mgr.list())),
         Request::Profiles { lang } => {
@@ -1095,6 +1848,10 @@ fn handle(
             r
         }
         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
+        // 自动来源（语音）：排空期间会被 `bridge::submit` 拒绝。
+        Request::Submit { id, text } => {
+            crate::bridge::submit(mgr, id, &text).map(|_| Response::Ok)
+        }
         // 键名 → 字节的翻译在这儿做，不在网页里也不在中转里：那张表只有
         // 一份（`ui::key_to_input`），而这是唯一同时够得着它和会话的地方。
         Request::Key { id, name } => match crate::web::keys::bytes_for(&name) {
@@ -1275,6 +2032,10 @@ fn handle(
         | Request::MeshSend { .. } => Ok(Response::Error(ErrorCode::BadRequest(
             "Mesh requests are local only".into(),
         ))),
+        // 同上：排空只从本机 socket 上答。
+        Request::Drain { .. } | Request::DrainStatus { .. } | Request::DrainCancel => Ok(
+            Response::Error(ErrorCode::BadRequest("Drain requests are local only".into())),
+        ),
         Request::WebStatus => Ok(web_status(web, secrets)),
         Request::WebEnable => Ok(web_enable(
             WEB_BIND,
@@ -2173,8 +2934,8 @@ mod tests {
         crate::last_sessions::RecordedSession {
             dir: dir.to_path_buf(),
             profile: profile.to_string(),
-            tag: String::new(),
             last_active: 1,
+            ..Default::default()
         }
     }
 
@@ -2326,6 +3087,752 @@ mod tests {
         assert_eq!(without_marker, 1, "另一个必须老老实实开一个新的");
     }
 
+    fn echo_id_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "echo-id"
+            command = ["/bin/sh", "-c", "echo \"ARGS $*\"; sleep 30", "sh"]
+            is_agent = false
+            resume_args = ["--continue"]
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 等到每个会话屏幕上都出现了 `ARGS` 那一行，返回各自的屏幕文本。
+    fn wait_for_args(mgr: &SessionManager, ids: &[u32]) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let texts: Vec<String> = ids.iter().map(|&id| mgr.screen_text_for_test(id)).collect();
+            if texts.iter().all(|t| t.contains("ARGS")) {
+                return texts;
+            }
+            assert!(Instant::now() < deadline, "探针没全出来：{texts:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 同目录同 profile 的两条记录，各自带着对话 id：各接各的，谁都不走
+    /// `--continue`——这正是「同目录多会话只接得回一个」那个老毛病的解法。
+    #[test]
+    fn restore_prefers_conversation_id_over_continue_grouping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut a = rec(&proj, "echo-id");
+        a.last_active = 100;
+        a.conversation_id = Some("a".into());
+        let mut b = rec(&proj, "echo-id");
+        b.last_active = 200;
+        b.conversation_id = Some("b".into());
+
+        let mgr = SessionManager::new();
+        let skips = restore_last_sessions(&[a, b], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2);
+        let texts = wait_for_args(&mgr, &ids);
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("ARGS --resume a"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("ARGS --resume b"))
+                .count(),
+            1
+        );
+        assert!(texts.iter().all(|t| !t.contains("--continue")), "{texts:?}");
+        let mut convs: Vec<Option<String>> =
+            ids.iter().map(|&id| mgr.conversation_of(id)).collect();
+        convs.sort();
+        assert_eq!(convs, vec![Some("a".to_string()), Some("b".to_string())]);
+    }
+
+    /// 旧清单（没记 id）：照旧只让最近用过的那条带 `--continue`；另一条
+    /// 老老实实开新对话，而且这回就领到一个 id，下次重启能按 id 接回。
+    #[test]
+    fn restore_without_conversation_id_falls_back_to_continue_grouping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut older = rec(&proj, "echo-id");
+        older.last_active = 100;
+        let mut newer = rec(&proj, "echo-id");
+        newer.last_active = 200;
+
+        let mgr = SessionManager::new();
+        let skips = restore_last_sessions(&[older, newer], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2);
+        let texts = wait_for_args(&mgr, &ids);
+        let continued: Vec<usize> = (0..2)
+            .filter(|&i| texts[i].contains("ARGS --continue"))
+            .collect();
+        assert_eq!(continued.len(), 1, "只能有一条带 --continue：{texts:?}");
+        let fresh = 1 - continued[0];
+        assert_eq!(mgr.conversation_of(ids[continued[0]]), None);
+        let conv = mgr
+            .conversation_of(ids[fresh])
+            .expect("新开的那条该领到 id");
+        assert!(
+            texts[fresh].contains(&format!("ARGS --session-id {conv}")),
+            "{texts:?}"
+        );
+    }
+
+    /// 按 id 接回就立刻退出的探针（模拟 claude「找不到这段对话」）；
+    /// 新开（`--session-id`）则正常活着。
+    fn gone_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "gone-probe"
+            command = ["/bin/sh", "-c", "if [ \"$1\" = --resume ]; then echo gone; exit 1; fi; echo \"ARGS $*\"; sleep 30", "sh"]
+            is_agent = false
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 起来就显示 IDLE、之后原样回显输入的探针（能按 id 接回）。
+    fn idle_echo_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "idle-echo"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "IDLE\n"; cat', "sh"]
+            is_agent = false
+            idle_pattern = "IDLE"
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 接回时马上退出（对话没了）、新开时显示 IDLE 的探针。
+    fn gone_idle_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "gone-idle"
+            command = ["/bin/sh", "-c", 'if [ "$1" = --resume ]; then echo gone; exit 1; fi; stty -icanon; printf "IDLE\n"; cat', "sh"]
+            is_agent = false
+            idle_pattern = "IDLE"
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 测试里没有主循环替我们 `tick()`，起一个临时的。
+    struct Ticker(Arc<std::sync::atomic::AtomicBool>);
+    impl Ticker {
+        fn start(mgr: &Arc<SessionManager>) -> Ticker {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (m, s) = (mgr.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !s.load(std::sync::atomic::Ordering::SeqCst) {
+                    m.tick();
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            });
+            Ticker(stop)
+        }
+    }
+    impl Drop for Ticker {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn restore_queues_continue_for_interrupted_sessions_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pa, pb) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&pa).unwrap();
+        std::fs::create_dir(&pb).unwrap();
+        let all = vec![idle_echo_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut a = rec(&pa, "idle-echo");
+        a.conversation_id = Some("a".into());
+        a.interrupted = true;
+        let mut b = rec(&pb, "idle-echo");
+        b.conversation_id = Some("b".into());
+
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (skips, _, notes) = restore_sessions(&[a, b], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+        assert_eq!(notes.len(), 1, "只有被打断的那条要投递");
+        let _tick = Ticker::start(&mgr);
+        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        let mut got = 0;
+        for info in mgr.list() {
+            let text = mgr.screen_text_for_test(info.id);
+            if info.dir.ends_with("/a") {
+                assert!(text.contains("dct 重启完了"), "{text:?}");
+                got += 1;
+            } else {
+                assert!(!text.contains("dct 重启完了"), "{text:?}");
+            }
+        }
+        assert_eq!(got, 1);
+        assert!(mgr.resume_skips().is_empty(), "{:?}", mgr.resume_skips());
+    }
+
+    /// 接回失败、被换成新开的会话时，那句「继续」不能落到新对话上，
+    /// 也不该再报一条「没叫上」——换新会话的警告已经由看守线程报过了。
+    #[test]
+    fn continue_note_is_not_delivered_to_a_replacement_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![gone_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "gone-idle");
+        r.conversation_id = Some("old".into());
+        r.interrupted = true;
+
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (skips, by_id, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert_eq!(notes.len(), 1);
+        mgr.set_resume_skips(skips);
+        let _tick = Ticker::start(&mgr);
+        let deliver = deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50)).unwrap();
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_secs(5))
+            .unwrap()
+            .join()
+            .unwrap();
+        deliver.join().unwrap();
+
+        // 新开的会话显示 IDLE 之后再多等几拍，确认什么都没打进去。
+        let list = mgr.list();
+        assert_eq!(list.len(), 1);
+        std::thread::sleep(Duration::from_millis(500));
+        let text = mgr.screen_text_for_test(list[0].id);
+        assert!(text.contains("IDLE"), "{text:?}");
+        assert!(!text.contains("dct 重启完了"), "{text:?}");
+        let warnings = mgr.resume_skips();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(matches!(
+            warnings[0],
+            crate::proto::WarningCode::SessionResumeSkipped { .. }
+        ));
+    }
+
+    /// 分不出忙闲的会话（profile 没有忙/闲标记，状态一直是 Unknown）：屏幕
+    /// 安静下来、键盘交给它之后照样收到「继续」，不会被当成「一直没空闲」丢掉。
+    #[test]
+    fn an_unknown_state_session_gets_its_note_once_its_screen_settles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let quiet = Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "quiet"
+            command = ["/bin/sh", "-c", 'stty -icanon; echo READY; cat', "sh"]
+            is_agent = false
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap();
+        let all = vec![quiet];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "quiet");
+        r.conversation_id = Some("a".into());
+        r.interrupted = true;
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_millis(300),
+        );
+        let (_, _, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        let _tick = Ticker::start(&mgr);
+        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
+            .unwrap()
+            .join()
+            .unwrap();
+        let id = mgr.list()[0].id;
+        assert_eq!(mgr.list()[0].state, crate::session::SessionState::Unknown);
+        let text = mgr.screen_text_for_test(id);
+        assert!(text.contains("dct 重启完了"), "{text:?}");
+        assert!(mgr.resume_skips().is_empty(), "{:?}", mgr.resume_skips());
+    }
+
+    /// I7：新后台先开始应答，再在后台线程里一个个接回会话。接回 12 个要拍
+    /// 12 张快照，同步接回的话这段时间谁连上来都没人答。
+    #[test]
+    fn the_daemon_answers_while_it_is_still_restoring_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        let profiles = crate::profile::profiles_dir_for_socket(&sock);
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("slowrest.toml"),
+            crate::sys::testing::toml_with_sh(
+                r#"
+                name = "slowrest"
+                command = ["/bin/sh", "-c", "sleep 3", "sh"]
+                is_agent = true
+                "#,
+            ),
+        )
+        .unwrap();
+        let proj = home.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        init_repo(&proj);
+        let records: Vec<_> = (1..=12)
+            .map(|i| {
+                let mut r = rec(&proj, "slowrest");
+                r.id = Some(i * 2);
+                r
+            })
+            .collect();
+        crate::last_sessions::save(
+            &crate::last_sessions::last_sessions_path_for_socket(&sock),
+            &records,
+        )
+        .unwrap();
+
+        let mgr = Arc::new(SessionManager::new());
+        let (s, m) = (sock.clone(), mgr.clone());
+        std::thread::spawn(move || {
+            let _ = run_with_manager(&s, m);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let answered = loop {
+            if let Some(v) = crate::client::Client::connect(&sock)
+                .ok()
+                .and_then(|mut c| c.protocol())
+            {
+                break v;
+            }
+            assert!(Instant::now() < deadline, "后台一直没应答");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(answered, crate::proto::PROTOCOL_VERSION);
+        assert!(
+            mgr.is_restoring() && mgr.list().len() < 12,
+            "应答的时候会话还该在接回中（已接回 {}）",
+            mgr.list().len()
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while mgr.is_restoring() {
+            assert!(Instant::now() < deadline, "接回一直没完");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        ids.sort();
+        assert_eq!(ids, (1..=12).map(|i| i * 2).collect::<Vec<u32>>(), "编号照旧");
+    }
+
+    /// I6：Linux 上二进制被就地换掉之后，自己的路径读出来带着「 (deleted)」。
+    /// 同一个路径上现在是新版本，正是要起的那个。
+    #[test]
+    fn a_deleted_exe_path_points_at_the_replacement() {
+        assert_eq!(
+            strip_deleted(PathBuf::from("/home/u/.local/bin/dct (deleted)")),
+            PathBuf::from("/home/u/.local/bin/dct")
+        );
+        assert_eq!(
+            strip_deleted(PathBuf::from("/home/u/.local/bin/dct")),
+            PathBuf::from("/home/u/.local/bin/dct")
+        );
+    }
+
+    /// M7：交接文件留 30 天，更老的启动时删掉；新的不动。
+    #[test]
+    fn old_handoffs_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("1-old.md");
+        let new = dir.path().join("2-new.md");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&new, "x").unwrap();
+        let now = std::time::SystemTime::now();
+        let f = std::fs::File::options().write(true).open(&old).unwrap();
+        f.set_modified(now - Duration::from_secs(31 * 24 * 3600)).unwrap();
+        drop(f);
+        prune_old_handoffs(dir.path(), HANDOFF_KEEP, now);
+        assert!(!old.exists(), "31 天前的该删掉");
+        assert!(new.exists(), "新的不能动");
+        // 目录不在也不出事。
+        prune_old_handoffs(&dir.path().join("没有"), HANDOFF_KEEP, now);
+    }
+
+    /// I8：记下来的留言，重启后排在「继续」后面一条条送。
+    #[test]
+    fn held_messages_are_queued_after_the_continue_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![idle_echo_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "idle-echo");
+        r.conversation_id = Some("a".into());
+        r.interrupted = true;
+        r.held_messages = vec!["MSG-ONE".into(), "MSG-TWO".into()];
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (_, _, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        let kinds: Vec<_> = notes.iter().map(|n| (n.kind, n.text.clone())).collect();
+        assert_eq!(kinds.len(), 3, "{kinds:?}");
+        assert_eq!(kinds[0].0, crate::resume_notes::NoteKind::Note);
+        assert_eq!(
+            kinds[1],
+            (crate::resume_notes::NoteKind::Message, "MSG-ONE".to_string())
+        );
+        assert_eq!(
+            kinds[2],
+            (crate::resume_notes::NoteKind::Message, "MSG-TWO".to_string())
+        );
+        let _tick = Ticker::start(&mgr);
+        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
+            .unwrap()
+            .join()
+            .unwrap();
+        let text = mgr.screen_text_for_test(mgr.list()[0].id);
+        assert!(text.contains("MSG-ONE") && text.contains("MSG-TWO"), "{text:?}");
+    }
+
+    /// 一直没空闲的会话：到期后变成一条界面警告。
+    #[test]
+    fn an_undeliverable_note_becomes_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()]; // 没有 idle_pattern，永远不会 Idle
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("a".into());
+        r.interrupted = true;
+        let mgr = Arc::new(SessionManager::new());
+        let (_, _, mut notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        notes[0].deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let _tick = Ticker::start(&mgr);
+        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
+            .unwrap()
+            .join()
+            .unwrap();
+        let warnings = mgr.resume_skips();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(matches!(
+            &warnings[0],
+            crate::proto::WarningCode::ResumeNoteDropped { dir } if dir.ends_with("proj")
+        ));
+    }
+
+    /// 接不回、开在那儿显示 IDLE 的探针：没有任何接回参数。
+    fn plain_idle_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "plain-idle"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "IDLE\n"; cat', "sh"]
+            is_agent = false
+            idle_pattern = "IDLE"
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 「先读交接」等交接文件出现了再打：重启时 agent 还没写完（codex 的
+    /// TUI 被关了，背后的 app-server 还在写），过一会儿文件才出现，照样送到。
+    #[test]
+    fn a_read_handoff_note_waits_for_a_file_written_after_the_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![plain_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let h = tmp.path().join("1-late.md");
+        let mut r = rec(&proj, "plain-idle");
+        r.handoff = Some(h.clone());
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (skips, _, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+        assert_eq!(notes.len(), 1, "文件还没有也要排上");
+        let _tick = Ticker::start(&mgr);
+        let deliver = deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50)).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let id = mgr.list()[0].id;
+        assert!(
+            !mgr.screen_text_for_test(id).contains("dct 刚重启"),
+            "文件没出现就不该打"
+        );
+        std::fs::write(&h, "x").unwrap();
+        deliver.join().unwrap();
+        let text = mgr.screen_text_for_test(id);
+        assert!(text.contains("dct 刚重启"), "{text:?}");
+        assert!(mgr.resume_skips().is_empty(), "{:?}", mgr.resume_skips());
+    }
+
+    /// 交接文件到期限都没出现：提示用户「它没写成交接」，不是「它没准备好」。
+    #[test]
+    fn a_handoff_that_never_appears_becomes_a_handoff_missing_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![plain_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "plain-idle");
+        r.handoff = Some(tmp.path().join("never.md"));
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (_, _, mut notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        notes[0].deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let _tick = Ticker::start(&mgr);
+        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
+            .unwrap()
+            .join()
+            .unwrap();
+        let warnings = mgr.resume_skips();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(matches!(
+            &warnings[0],
+            crate::proto::WarningCode::HandoffMissing { dir } if dir.ends_with("proj")
+        ));
+    }
+
+    /// N3：被打断、接不回、又没留交接的会话（比如一直不能接按键、被放弃了
+    /// 的那个），重启后什么都收不到：当场提示用户。
+    #[test]
+    fn an_interrupted_unresumable_session_without_a_handoff_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![plain_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "plain-idle");
+        r.interrupted = true;
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, _, notes) = restore_sessions(&[r.clone()], &all, &secrets, &mgr);
+        assert!(notes.is_empty());
+        assert!(
+            matches!(&skips[..], [crate::proto::WarningCode::HandoffMissing { dir }] if dir.ends_with("proj")),
+            "{skips:?}"
+        );
+        // 没被打断的不提示
+        r.interrupted = false;
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, _, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+
+    /// N6：会话没接回来（目录没了），替它存着的留言送不到了，每条都要提示。
+    #[test]
+    fn held_messages_of_a_skipped_session_are_reported_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all = vec![idle_echo_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&tmp.path().join("gone"), "idle-echo");
+        r.held_messages = vec!["A".into(), "B".into()];
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, _, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(notes.is_empty());
+        let held = skips
+            .iter()
+            .filter(|w| matches!(w, crate::proto::WarningCode::HeldMessageDropped { .. }))
+            .count();
+        assert_eq!(held, 2, "{skips:?}");
+    }
+
+    /// N5：取消重启后「dct 不重启了」没送进去，提示里不能说「重启后」。
+    #[test]
+    fn a_dropped_cancel_note_has_its_own_warning() {
+        use crate::proto::WarningCode;
+        use crate::resume_notes::{Note, NoteKind};
+        let n = |kind, needs_file: Option<PathBuf>| Note {
+            id: 1,
+            text: String::new(),
+            deadline: std::time::Instant::now(),
+            dir: "/p".into(),
+            kind,
+            needs_file,
+        };
+        let yes = |_: &Path| true;
+        let no = |_: &Path| false;
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Cancel, None), &yes),
+            WarningCode::CancelNoteDropped { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Note, None), &no),
+            WarningCode::ResumeNoteDropped { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Note, Some("/h.md".into())), &yes),
+            WarningCode::ResumeNoteDropped { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Note, Some("/h.md".into())), &no),
+            WarningCode::HandoffMissing { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Message, None), &yes),
+            WarningCode::HeldMessageDropped { .. }
+        ));
+        for l in crate::i18n::Lang::all() {
+            let s =
+                crate::i18n::msg::warning(*l, &WarningCode::CancelNoteDropped { dir: "/p".into() });
+            assert!(
+                !s.contains("重启后") && !s.contains("after the restart"),
+                "{s}"
+            );
+        }
+    }
+
+    /// 恢复完以后落盘的清单里不再带 `interrupted` / `handoff`，下次重启
+    /// 不会再叫一遍。
+    #[test]
+    fn restore_clears_interrupted_and_handoff_flags_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![idle_echo_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "idle-echo");
+        r.conversation_id = Some("a".into());
+        r.interrupted = true;
+        r.handoff = Some(tmp.path().join("h.md"));
+        let path = tmp.path().join("last.toml");
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(path.clone());
+        let _ = restore_sessions(&[r], &all, &secrets, &mgr);
+        let recs = crate::last_sessions::load(&path);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].interrupted);
+        assert_eq!(recs[0].handoff, None);
+    }
+
+    /// 接回失败（agent 一起来就退出）：死格子拿掉，原处新开一个（新 id、
+    /// 原来的名字），并且有一条「没能接回原来的对话」的警告递到界面上。
+    #[test]
+    fn a_session_whose_conversation_is_gone_is_restarted_fresh_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![gone_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "gone-probe");
+        r.conversation_id = Some("old".into());
+        r.tag = "修登录白屏".into();
+
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+        assert_eq!(by_id.len(), 1);
+        mgr.set_resume_skips(skips);
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_secs(5))
+            .expect("该起看守线程")
+            .join()
+            .unwrap();
+
+        let list = mgr.list();
+        assert_eq!(list.len(), 1, "死格子要拿掉，只剩新开的那个：{list:?}");
+        assert_eq!(list[0].tag, "修登录白屏", "名字要留着");
+        let id = list[0].id;
+        let conv = mgr.conversation_of(id).expect("新开的要有新 id");
+        assert_ne!(conv, "old");
+        let texts = wait_for_args(&mgr, &[id]);
+        assert!(
+            texts[0].contains(&format!("ARGS --session-id {conv}")),
+            "{texts:?}"
+        );
+
+        let warnings = mgr.resume_skips();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        match &warnings[0] {
+            crate::proto::WarningCode::SessionResumeSkipped {
+                reason, profile, ..
+            } => {
+                assert_eq!(
+                    *reason,
+                    crate::proto::SessionResumeSkipReason::ConversationGone
+                );
+                assert_eq!(profile, "gone-probe");
+            }
+            other => panic!("应当是 SessionResumeSkipped：{other:?}"),
+        }
+    }
+
+    /// 接回成功、一直活着的会话：盯满时间也不动它，不报警告。
+    #[test]
+    fn a_session_resumed_by_id_that_stays_up_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("keep".into());
+
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty());
+        let before: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        let after: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(before, after);
+        assert_eq!(mgr.conversation_of(after[0]).as_deref(), Some("keep"));
+        assert!(mgr.resume_skips().is_empty());
+    }
+
+    /// 刚接回就被用户停掉：那是用户的意思，不是接回失败，不能再开一个。
+    #[test]
+    fn a_resumed_session_stopped_on_purpose_is_not_restarted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("keep".into());
+
+        let mgr = Arc::new(SessionManager::new());
+        let (_, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        let id = by_id[0].id;
+        mgr.stop(id).unwrap();
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![id], "不该多出一个新开的");
+        assert!(mgr.resume_skips().is_empty());
+    }
+
     // 用 cat 冒充 agent：能收输入、不会自己退出，is_agent = true 才会触发
     // create() 里的 git checkpoint。
     fn fake_agent() -> Profile {
@@ -2345,6 +3852,8 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -2557,6 +4066,8 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -2828,6 +4339,43 @@ mod tests {
         )));
         let profiles_dir = tempfile::tempdir().unwrap();
         (mgr, store, secrets, profiles_dir)
+    }
+
+    /// 排空只从本机 socket 上发起（在 `serve` 里分走）；从局域网手机页那一路
+    /// 进 `handle` 的一律拒绝。
+    #[test]
+    fn drain_requests_are_refused_off_the_local_socket() {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        for req in [
+            Request::Drain {
+                wait_s: 1,
+                nudge_wait_s: 1,
+                initiator: None,
+                now: false,
+                exe: None,
+            },
+            Request::DrainStatus { renew: true },
+            Request::DrainCancel,
+        ] {
+            let resp = handle(
+                req,
+                &mgr,
+                &store,
+                &secrets,
+                profiles_dir.path(),
+                &test_phone(),
+                &test_bridge(),
+                &test_event_tx(),
+                None,
+                &test_pairs(),
+                &test_live(),
+            );
+            assert!(
+                matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
+                "{resp:?}"
+            );
+        }
+        assert!(!mgr.is_draining());
     }
 
     /// Ruling 3：`Request::PhoneStatus` 读的是共享状态槽，不是它自己现算的
@@ -3208,6 +4756,8 @@ mod tests {
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -3271,20 +4821,20 @@ mod tests {
         // 提交了——`send_input` 把「写字符」和「按回车」拆成了两次调用
         // （`session.rs` 的注释），只做第一步的话文字会原样停在输入框里，
         // 屏幕上一样看得见，但 agent 根本没有开始跑这一轮。`plain_shell`
-        // 这个 profile 没有任何 pattern，`create()` 之后状态是
-        // `Unknown`；只有真的按了回车（`send_input(id, "")`）才会把状态
-        // 推成 `Working`（`session.rs::send_input` 空字符串分支，非
-        // agent 会话也一样）。这里等的是这个状态迁移本身，不是屏幕文字。
+        // 这个 profile 是 `cat`：终端在行模式里先回显一遍敲进去的字，
+        // 只有真的按了回车，`cat` 才读到这一行、再原样印一遍。所以「你好」
+        // 出现两次 = 回车真的发出去了。（以前这里看的是状态翻成 Working；
+        // 没有忙/闲标记的会话现在按回车之后一直是 Unknown，见
+        // `session.rs::send_input`。）
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let state = mgr.list().into_iter().find(|s| s.id == id).map(|s| s.state);
-            if state == Some(crate::session::SessionState::Working) {
+            let text = mgr.screen_text_for_test(id);
+            if text.matches("你好").count() >= 2 {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "手机来的这句话必须被真的提交（按回车），不能只是敲进输入框——\
-                 会话此刻的状态是 {state:?}，一直没有推进到 Working"
+                "手机来的这句话必须被真的提交（按回车），不能只是敲进输入框：{text:?}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -4344,5 +5894,716 @@ mod mesh_tests {
             a.mesh.lock().unwrap().endpoint(),
             b.mesh.lock().unwrap().endpoint()
         );
+    }
+}
+
+// 只在 Unix 上跑：靠清屏转义切 BUSY/IDLE，Windows 的伪终端会重画屏幕，
+// 时序不稳；排空本身的逻辑跟平台无关（`drain.rs` 的纯测试两边都跑）。
+#[cfg(all(test, unix))]
+mod drain_tests {
+    use super::*;
+    use crate::client::Client;
+    use crate::drain::{Progress, NUDGE_TEXT};
+    use crate::session::SessionState;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    /// 假的收尾：记一下被调了几次，不起 `__swap`、不退出进程。
+    #[derive(Default)]
+    struct Calls {
+        swaps: AtomicUsize,
+        exits: AtomicUsize,
+        /// 为 true 时假的 `swap` 卡住不返回，好看清「正在落盘交接」那一段。
+        hold_swap: AtomicBool,
+        /// 最后一次 `swap` 拿到的 dct 路径。
+        exe: Mutex<Option<PathBuf>>,
+    }
+
+    fn fake_hooks(lease: Duration, swap_ok: bool) -> (DrainHooks, Arc<Calls>) {
+        let calls = Arc::new(Calls::default());
+        let (c1, c2) = (calls.clone(), calls.clone());
+        let hooks = DrainHooks {
+            lease,
+            tick: Duration::from_millis(50),
+            linger: Duration::ZERO,
+            swap: Box::new(move |_socket: &Path, exe: Option<&Path>| {
+                *c1.exe.lock().unwrap() = exe.map(Path::to_path_buf);
+                c1.swaps.fetch_add(1, Ordering::SeqCst);
+                while c1.hold_swap.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if swap_ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("起不来"))
+                }
+            }),
+            exit: Box::new(move || {
+                c2.exits.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        (hooks, calls)
+    }
+
+    /// 会按 id 接回的 agent：读一行输入就 BUSY、睡 1 秒、再 IDLE。
+    fn idle_agent() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "drain-idle"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "\033[2J\033[HIDLE"; while read l; do printf "\033[2J\033[HBUSY"; sleep 1; printf "\033[2J\033[HIDLE"; done', "sh"]
+            is_agent = true
+            busy_pattern = "BUSY"
+            idle_pattern = "IDLE"
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 一直忙的 agent：屏幕顶上永远是 BUSY，打进去的字原样回显。
+    fn busy_agent() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "drain-busy"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "\033[2J\033[HBUSY"; cat', "sh"]
+            is_agent = true
+            busy_pattern = "BUSY"
+            idle_pattern = "IDLE"
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 接不回对话的 agent：空闲时屏幕上写着上一句收到的话（`IDLE last=…`），
+    /// 收到一句就忙一秒。
+    fn logging_agent() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "drain-log"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "\033[2J\033[HIDLE"; while read l; do printf "\033[2J\033[HBUSY"; sleep 1; printf "\033[2J\033[HIDLE last=%s" "$l"; done', "sh"]
+            is_agent = true
+            busy_pattern = "BUSY"
+            idle_pattern = "IDLE"
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 同 `logging_agent`，但声明了按 id 接回（还有 `--continue`）。
+    fn logging_agent_with_ids() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "drain-log-id"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "\033[2J\033[HIDLE"; while read l; do printf "\033[2J\033[HBUSY"; sleep 1; printf "\033[2J\033[HIDLE last=%s" "$l"; done', "sh"]
+            is_agent = true
+            busy_pattern = "BUSY"
+            idle_pattern = "IDLE"
+            resume_args = ["--continue"]
+            session_id_args = ["--session-id", "{id}"]
+            resume_id_args = ["--resume", "{id}"]
+            "#,
+        ))
+        .unwrap()
+    }
+
+    fn git_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    struct Rig {
+        home: tempfile::TempDir,
+        sock: PathBuf,
+        mgr: Arc<SessionManager>,
+        calls: Arc<Calls>,
+    }
+
+    fn rig(lease: Duration, swap_ok: bool) -> Rig {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        let mgr = Arc::new(SessionManager::new());
+        // 打字前要等的那几秒在这些测试里不是重点（`ready_for_keys` 自己有测试）。
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        mgr.register_profile(idle_agent());
+        mgr.register_profile(busy_agent());
+        mgr.register_profile(logging_agent());
+        mgr.register_profile(logging_agent_with_ids());
+        let (hooks, calls) = fake_hooks(lease, swap_ok);
+        let (s, m) = (sock.clone(), mgr.clone());
+        std::thread::spawn(move || {
+            let _ = run_with_hooks(&s, m, hooks);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Client::connect(&sock).is_err() {
+            assert!(Instant::now() < deadline, "后台没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Rig {
+            home,
+            sock,
+            mgr,
+            calls,
+        }
+    }
+
+    impl Rig {
+        fn call(&self, req: Request) -> Response {
+            Client::connect(&self.sock).unwrap().call(req).unwrap()
+        }
+
+        fn create(&self, profile: &str, name: &str) -> u32 {
+            let dir = git_dir(self.home.path(), name);
+            self.mgr.create(&dir, profile, None, &[]).unwrap()
+        }
+
+        fn wait_state(&self, id: u32, want: SessionState) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let st = self.mgr.list().into_iter().find(|s| s.id == id).map(|s| s.state);
+                if st == Some(want) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "会话 {id} 停在 {st:?}，等的是 {want:?}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// 一直续租约地问进度，直到 `done`。
+        fn poll_until_done(&self) -> Progress {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match self.call(Request::DrainStatus { renew: true }) {
+                    Response::DrainProgress {
+                        progress,
+                        done: true,
+                        active: true,
+                    } => return progress,
+                    Response::DrainProgress { .. } => {}
+                    other => panic!("答得不对：{other:?}"),
+                }
+                assert!(Instant::now() < deadline, "排空一直没结束");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn last_sessions(&self) -> Vec<crate::last_sessions::RecordedSession> {
+            crate::last_sessions::load(&crate::last_sessions::last_sessions_path_for_socket(
+                &self.sock,
+            ))
+        }
+    }
+
+    fn not_running(r: Response) -> bool {
+        matches!(r, Response::DrainProgress { progress, done: false, active: false } if progress.waiting.is_empty())
+    }
+
+    #[test]
+    fn drain_with_all_idle_persists_ids_and_reports_done() {
+        let r = rig(Duration::from_secs(10), true);
+        let a = r.create("drain-idle", "a");
+        let b = r.create("drain-idle", "b");
+        // 各提交一句，对话 id 才会被记下来（没说过话的会话没有可接回的对话）。
+        for id in [a, b] {
+            r.mgr.send_input(id, "hi").unwrap();
+            r.mgr.send_input(id, "").unwrap();
+        }
+        r.wait_state(a, SessionState::Idle);
+        r.wait_state(b, SessionState::Idle);
+
+        let resp = r.call(Request::Drain {
+            wait_s: 5,
+            nudge_wait_s: 2,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        assert!(
+            matches!(resp, Response::DrainProgress { active: true, .. }),
+            "全空闲时排空也在进行：{resp:?}"
+        );
+        r.poll_until_done();
+
+        let recs = r.last_sessions();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs.iter().all(|s| s.conversation_id.is_some()), "{recs:?}");
+        assert!(recs.iter().all(|s| !s.interrupted), "{recs:?}");
+        // 能按 id 接回的会话不用写交接（`resumes_by_id` 接上了）。
+        assert!(recs.iter().all(|s| s.handoff.is_none()), "{recs:?}");
+        assert_eq!(r.calls.swaps.load(Ordering::SeqCst), 1);
+        assert_eq!(r.calls.exits.load(Ordering::SeqCst), 1);
+        // M4：退出之前会话已经一个个停掉了，不靠退出时的挂断信号。
+        assert!(
+            r.mgr.list().iter().all(|s| s.state == SessionState::Stopped),
+            "{:?}",
+            r.mgr.list()
+        );
+    }
+
+    #[test]
+    fn a_second_drain_reports_progress_instead_of_restarting() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        let first = r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        let Response::DrainProgress { progress: p1, .. } = first else {
+            panic!("{first:?}")
+        };
+        assert_eq!(p1.waiting, vec![id]);
+        let again = r.call(Request::Drain {
+            wait_s: 1,
+            nudge_wait_s: 1,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        let Response::DrainProgress { progress: p2, .. } = again else {
+            panic!("{again:?}")
+        };
+        assert_eq!(p2.waiting, vec![id]);
+        assert!(p2.remaining_s > 30, "第二次 Drain 不该按新参数重新开始：{p2:?}");
+        assert!(matches!(
+            r.call(Request::DrainCancel),
+            Response::DrainCancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn drain_cancel_restores_normal_input() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        assert!(r.mgr.is_draining());
+        assert!(matches!(
+            r.call(Request::DrainCancel),
+            Response::DrainCancelled { .. }
+        ));
+        assert!(!r.mgr.is_draining());
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+        assert_eq!(r.calls.swaps.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drain_lease_expires_without_status_polls() {
+        let r = rig(Duration::from_millis(200), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        assert!(r.mgr.is_draining());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!r.mgr.is_draining(), "CLI 不来问了，排空该自己撤掉");
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+    }
+
+    /// 界面画横幅时问的 `renew: false` 不算「CLI 还在」。
+    #[test]
+    fn status_polls_without_renew_do_not_extend_the_lease() {
+        let r = rig(Duration::from_millis(200), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            r.call(Request::DrainStatus { renew: false });
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!r.mgr.is_draining(), "renew:false 的轮询不该续租约");
+    }
+
+    #[test]
+    fn status_polls_with_renew_keep_the_drain_alive() {
+        let r = rig(Duration::from_millis(200), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            r.call(Request::DrainStatus { renew: true });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(r.mgr.is_draining(), "CLI 一直在问，排空不该被撤掉");
+        r.call(Request::DrainCancel);
+    }
+
+    #[test]
+    fn drain_nudges_busy_session_and_marks_it_interrupted() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 1,
+            nudge_wait_s: 1,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        r.poll_until_done();
+
+        let head: String = NUDGE_TEXT.chars().take(8).collect();
+        assert!(
+            r.mgr.screen_text_for_test(id).contains(&head),
+            "屏幕上没出现催促的话：{}",
+            r.mgr.screen_text_for_test(id)
+        );
+        let recs = r.last_sessions();
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert!(recs[0].interrupted, "{recs:?}");
+
+        // 落盘之后、退出之前，别的地方再落盘也不许把 `interrupted` 冲掉。
+        let path = crate::last_sessions::last_sessions_path_for_socket(&r.sock);
+        let before = std::fs::read_to_string(&path).unwrap();
+        r.mgr.persist_last_sessions();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// 发起重启的那个会话不等、直接记成被打断。
+    #[test]
+    fn the_initiator_is_not_waited_for_and_is_interrupted() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: Some(id),
+            now: false,
+            exe: None,
+        });
+        r.poll_until_done();
+        let recs = r.last_sessions();
+        assert!(recs[0].interrupted, "{recs:?}");
+        // I5：记下它就是发起者，重启后它收到「重启已经完成」而不是「继续」。
+        assert!(recs[0].restart_initiator, "{recs:?}");
+        assert!(
+            !r.mgr.screen_text_for_test(id).contains(&NUDGE_TEXT.chars().take(8).collect::<String>()),
+            "发起者不该被催"
+        );
+    }
+
+    /// 起不了 `__swap`：宁可不重启，也不能把会话都杀了却起不来新的。
+    #[test]
+    fn a_failed_swap_cancels_the_drain_and_keeps_running() {
+        let r = rig(Duration::from_secs(10), false);
+        let id = r.create("drain-busy", "a");
+        r.wait_state(id, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: Some(id),
+            now: false,
+            exe: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.calls.swaps.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "一直没去起 __swap");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.mgr.is_draining() {
+            assert!(Instant::now() < deadline, "起不来之后该撤掉排空");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(r.calls.exits.load(Ordering::SeqCst), 0, "不许退出");
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+
+        // 清单不再冻着：照常落盘会把 `interrupted` 写回 false。
+        r.mgr.persist_last_sessions();
+        assert!(!r.last_sessions()[0].interrupted);
+    }
+
+    #[test]
+    fn nothing_started_means_not_active() {
+        let r = rig(Duration::from_secs(10), true);
+        assert!(not_running(r.call(Request::DrainStatus { renew: false })));
+        assert!(not_running(r.call(Request::DrainStatus { renew: true })));
+    }
+
+    /// 已经在落盘、交给小进程那一段：没有会话可等，但排空还在进行。
+    #[test]
+    fn the_finishing_window_is_still_active() {
+        let r = rig(Duration::from_secs(10), true);
+        r.calls.hold_swap.store(true, Ordering::SeqCst);
+        let resp = r.call(Request::Drain {
+            wait_s: 5,
+            nudge_wait_s: 5,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        assert!(matches!(resp, Response::DrainProgress { active: true, .. }), "{resp:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.calls.swaps.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "一直没去起 __swap");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mid = r.call(Request::DrainStatus { renew: true });
+        assert!(
+            matches!(&mid, Response::DrainProgress { active: true, done: false, progress } if progress.waiting.is_empty()),
+            "{mid:?}"
+        );
+        // 这时候取消不了。
+        assert!(matches!(
+            r.call(Request::DrainCancel),
+            Response::DrainProgress { active: true, .. }
+        ));
+        r.calls.hold_swap.store(false, Ordering::SeqCst);
+        r.poll_until_done();
+    }
+
+    /// I4：在会话里敲的重启（带着发起者）不看租约——agent 跑命令有时限，CLI
+    /// 被掐掉之后重启照样进行。
+    #[test]
+    fn a_drain_with_an_initiator_survives_the_cli_going_away() {
+        let r = rig(Duration::from_millis(200), true);
+        let me = r.create("drain-busy", "me");
+        let other = r.create("drain-busy", "other");
+        r.wait_state(other, SessionState::Working);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: Some(me),
+            now: false,
+            exe: None,
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(r.mgr.is_draining(), "CLI 不来问了，但发起者在会话里：照样等");
+        assert!(matches!(
+            r.call(Request::DrainCancel),
+            Response::DrainCancelled { .. }
+        ));
+    }
+
+    /// I6：新后台用 CLI 带来的那个 dct 起。
+    #[test]
+    fn the_swap_uses_the_cli_binary() {
+        let r = rig(Duration::from_secs(10), true);
+        r.call(Request::Drain {
+            wait_s: 5,
+            nudge_wait_s: 5,
+            initiator: None,
+            now: false,
+            exe: Some("/where/the/user/ran/dct".into()),
+        });
+        r.poll_until_done();
+        assert_eq!(
+            r.calls.exe.lock().unwrap().as_deref(),
+            Some(Path::new("/where/the/user/ran/dct"))
+        );
+    }
+
+    /// M1：请过写交接之后又取消了：回答里点名它，并且等它空下来告诉它
+    /// 「不重启了，接着做」——不然它会一直停在那儿。
+    #[test]
+    fn cancel_after_a_handoff_request_tells_the_session_to_carry_on() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-log", "a");
+        r.mgr.send_input(id, "hi").unwrap();
+        r.mgr.send_input(id, "").unwrap();
+        r.wait_state(id, SessionState::Idle);
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        // 等交接请求打进去（它会忙一秒再停下，屏幕上写着收到的那句）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !r.mgr.screen_text_for_test(id).contains("last=dct") {
+            assert!(Instant::now() < deadline, "交接请求一直没打进去");
+            r.call(Request::DrainStatus { renew: true });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let resp = r.call(Request::DrainCancel);
+        assert!(
+            matches!(&resp, Response::DrainCancelled { told } if told == &vec![id]),
+            "{resp:?}"
+        );
+        let head: String = crate::drain::CANCEL_TEXT.chars().take(6).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !r.mgr.screen_text_for_test(id).contains(&head) {
+            assert!(
+                Instant::now() < deadline,
+                "取消之后没告诉它接着做：{}",
+                r.mgr.screen_text_for_test(id)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// M2：取消落在「状态机决定要打」和「真的打」之间，也不许再打进去：
+    /// 打字前拿着锁再认一遍是不是还是这一场。
+    #[test]
+    fn nothing_is_typed_for_a_run_that_is_no_longer_current() {
+        let r = rig(Duration::from_secs(10), true);
+        // 一直忙、原样回显的会话：打进去什么屏幕上就有什么。
+        let id = r.create("drain-busy", "busy");
+        r.wait_state(id, SessionState::Working);
+        let (hooks, _calls) = fake_hooks(Duration::from_secs(10), true);
+        let ctl = Arc::new(DrainCtl::new(&r.sock, r.mgr.clone(), hooks));
+        ctl.start(
+            crate::drain::DrainConfig {
+                wait: Duration::from_secs(60),
+                nudge_wait: Duration::from_secs(60),
+                now: false,
+            },
+            None,
+            None,
+        );
+        // 这一场是第 1 场；第 0 场（已经被取消的那一场）想打的话一律作罢。
+        ctl.type_for_run(0, id, "不该出现的话");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !r.mgr.screen_text_for_test(id).contains("不该出现"),
+            "{}",
+            r.mgr.screen_text_for_test(id)
+        );
+        ctl.cancel();
+    }
+
+    /// I8：准备重启期间替会话存着的多电脑留言，最后一次落盘时一起记下来。
+    #[test]
+    fn held_messages_are_saved_with_the_final_state() {
+        let r = rig(Duration::from_secs(10), true);
+        let id = r.create("drain-idle", "a");
+        r.wait_state(id, SessionState::Idle);
+        let (hooks, calls) = fake_hooks(Duration::from_secs(10), true);
+        let ctl = Arc::new(DrainCtl::new(&r.sock, r.mgr.clone(), hooks));
+        ctl.set_held_source(Box::new(move || {
+            std::collections::HashMap::from([(id, vec!["[来自 pc] 你好".to_string()])])
+        }));
+        ctl.start(crate::drain::DrainConfig::default(), None, None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.exits.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "排空一直没结束");
+            ctl.status(true);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let recs = r.last_sessions();
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].held_messages, vec!["[来自 pc] 你好".to_string()]);
+        assert_eq!(recs[0].id, Some(id));
+    }
+
+    /// I7：刚重启、还在接回会话的时候不接再一次重启（名册不全，落盘会丢会话）。
+    #[test]
+    fn a_drain_is_refused_while_sessions_are_being_restored() {
+        let r = rig(Duration::from_secs(10), true);
+        r.mgr.set_restoring(true);
+        let resp = r.call(Request::Drain {
+            wait_s: 5,
+            nudge_wait_s: 5,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::StillRestoring)),
+            "{resp:?}"
+        );
+        assert!(!r.mgr.is_draining());
+    }
+
+    /// 每次启动的后台开机号都不一样，同一个后台问几次都一样。
+    #[test]
+    fn instance_ids_tell_daemons_apart() {
+        let a = rig(Duration::from_secs(10), true);
+        let b = rig(Duration::from_secs(10), true);
+        let id = |r: &Rig| match r.call(Request::Instance) {
+            Response::Instance { id } => id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(id(&a), id(&a));
+        assert_ne!(id(&a), id(&b));
+    }
+
+    /// I2：上次靠 `--continue` 接回来、没有 id 的会话 A，同目录里有带 id、用过
+    /// 的兄弟 B：重启后 A 会从空白开始，所以准备重启时要请 A 写交接；B 不用。
+    #[test]
+    fn an_id_less_session_with_an_id_sibling_is_asked_for_a_handoff() {
+        let r = rig(Duration::from_secs(10), true);
+        let dir = git_dir(r.home.path(), "same");
+        let a = r
+            .mgr
+            .create_resuming(&dir, "drain-log-id", None, &[], true, None, None)
+            .unwrap();
+        let b = r.mgr.create(&dir, "drain-log-id", None, &[]).unwrap();
+        assert_eq!(r.mgr.conversation_of(a), None);
+        for id in [a, b] {
+            r.mgr.send_input(id, "hi").unwrap();
+            r.mgr.send_input(id, "").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(r.mgr.screen_text_for_test(a).contains("last=hi")
+            && r.mgr.screen_text_for_test(b).contains("last=hi"))
+        {
+            assert!(Instant::now() < deadline, "两个会话都该先处理完 hi");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        r.call(Request::Drain {
+            wait_s: 60,
+            nudge_wait_s: 60,
+            initiator: None,
+            now: false,
+            exe: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !r.mgr.screen_text_for_test(a).contains("last=dct") {
+            assert!(Instant::now() < deadline, "A 该被请去写交接");
+            r.call(Request::DrainStatus { renew: true });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !r.mgr.screen_text_for_test(b).contains("last=dct"),
+            "B 能按 id 接回，不用写交接"
+        );
+        r.call(Request::DrainCancel);
     }
 }

@@ -552,6 +552,10 @@ pub fn run(
     let browser = std::env::var_os("DCW_PUBLIC_URL").is_some();
     let mut previous_theme = None;
     let follow_agent_theme = std::env::var_os("NO_COLOR").is_none();
+    let mut client = client;
+    // 看着「后台是不是换了一个」：重启之后会话编号指的是另一批会话了，
+    // 见 `back_to_board_after_restart`。
+    client.guard_instance();
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
     // 用户存过的配色。没存过就留在 `App::new` 给的默认档，跟 `load_view_mode`
     // 那边一样：「盘上没有可用的选择」由调用方定默认，settings 只管读写。
@@ -576,6 +580,11 @@ pub fn run(
     // 已经覆盖了这个函数里所有别的 `continue`，不用因为加了一个标签
     // 就把它们全部改成 `continue 'main`。
     'main: loop {
+        // 重连上的是一个新起的后台（dct 重启过了）：手里的会话编号已经不算数，
+        // 先回看板。这之前那一次请求已经被 `Client` 拦下、没有发出去。
+        if app.client.as_mut().is_some_and(|c| c.take_new_daemon()) {
+            back_to_board_after_restart(&mut app);
+        }
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
         if let Some(rx) = &app.verify_rx {
@@ -825,6 +834,8 @@ pub fn run(
         live::poll_status(&mut app, std::time::Instant::now());
         // 多电脑现状：后台线程问、这里收，绘制路径上不发请求（见 `computers`）。
         computers::poll(&mut app, std::time::Instant::now());
+        // dct 是不是正在准备重启——每一屏都要，同 `live::poll_status`。
+        poll_drain(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
@@ -2044,6 +2055,25 @@ pub(crate) fn toggle_view_mode(app: &mut App) {
     }
 }
 
+/// dct 重启过了，界面连上的是新后台：回到看板，说一句人话。
+///
+/// 新后台尽量沿用原来的会话编号，但不保证（旧清单、编号撞了）。界面手里的
+/// 「7 号」要是已经换成了另一个项目里的另一个 agent，接着打的字和回车就会
+/// 落到那里去——所以不管停在哪一屏，都回看板重新拉一遍名单，让用户自己再
+/// 点进去。
+fn back_to_board_after_restart(app: &mut App) {
+    app.view = home_view(app);
+    app.need_sessions = true;
+    app.sent_size = None;
+    app.screen.clear();
+    app.grid_screens.clear();
+    app.grid_page = None;
+    app.explained_failure = None;
+    app.drain = None;
+    app.message =
+        crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang).into();
+}
+
 /// 用户选的那个模式对应的视图。**所有「回看板」的地方都必须走这里。**
 ///
 /// 硬编码 `View::Board` 的每一处都是一个「明明在九宫格里，某次操作完却被
@@ -2560,6 +2590,42 @@ fn bar_widths(inner: u16) -> (u16, u16, u16) {
     (escape, project, rest - project)
 }
 
+/// 多久问一次「是不是在准备重启」。
+const DRAIN_POLL_EVERY: Duration = Duration::from_secs(1);
+
+/// 一秒问一次 `DrainStatus { renew: false }`（只看不续——续租约是发起重启的
+/// CLI 的事），有排空在跑就让顶上画一行。连不上的时候不问。
+fn poll_drain(app: &mut App, now: std::time::Instant) {
+    if !app.connected {
+        return;
+    }
+    if app
+        .drain_last_fetch
+        .is_some_and(|t| now.saturating_duration_since(t) < DRAIN_POLL_EVERY)
+    {
+        return;
+    }
+    app.drain_last_fetch = Some(now);
+    app.drain = drain_banner_from(
+        app.client()
+            .and_then(|c| c.call(Request::DrainStatus { renew: false })),
+    );
+}
+
+/// 后台的回答 → 要不要画横幅。有一场排空在进行（`active`）就画，包括
+/// 没有会话可等、正在收尾的那一段；旧后台不认这条请求（回一个错误）、
+/// 连不上，都安静地不画。
+fn drain_banner_from(r: anyhow::Result<Response>) -> Option<crate::drain::Progress> {
+    match r {
+        Ok(Response::DrainProgress {
+            progress,
+            active: true,
+            ..
+        }) => Some(progress),
+        _ => None,
+    }
+}
+
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw_with_theme(f: &mut Frame, app: &mut App, theme: Option<Theme>) {
@@ -2758,6 +2824,25 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Web => web::draw(f, chunks[0], app),
         View::Live { .. } => live::draw(f, chunks[0], app),
         View::Pair { .. } => pair_view::draw(f, chunks[0], app),
+    }
+
+    // dct 准备重启：在内容区顶上**盖**一行，不挤内容区——同底栏盖在会话
+    // 画面上的道理，改尺寸会让 agent 整屏重绘。
+    if let Some(p) = &app.drain {
+        let top = Rect {
+            height: 1,
+            ..chunks[0]
+        };
+        f.render_widget(ratatui::widgets::Clear, top);
+        f.render_widget(
+            Paragraph::new(if p.waiting.is_empty() {
+                crate::i18n::msg::restart_now_banner(app.lang)
+            } else {
+                crate::i18n::msg::restart_pending_banner(app.lang, p.waiting.len())
+            })
+            .style(bar_danger(app.bar)),
+            top,
+        );
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
@@ -3717,6 +3802,8 @@ is_agent = true
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
             pairable: false,
             backend_only: false,
         };
@@ -4006,6 +4093,24 @@ is_agent = true
             };
             term.draw(|f| draw(f, &mut app)).unwrap();
         }
+    }
+
+    /// C1：dct 重启过了，界面连上的是新后台——停在会话里的界面要回看板、
+    /// 说一句人话、把跟旧会话有关的东西都放掉（尺寸要重新协商）。
+    #[test]
+    fn a_new_daemon_sends_the_ui_back_to_the_board() {
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.sent_size = Some((1, 24, 80));
+        app.need_sessions = false;
+        back_to_board_after_restart(&mut app);
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(app.sent_size, None);
+        assert!(app.need_sessions);
+        assert_eq!(
+            app.message.text,
+            crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang)
+        );
+        assert!(!app.message.error);
     }
 
     /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
@@ -5227,6 +5332,85 @@ is_agent = true
     /// 「你在播」——这个功能最危险的失败模式不是链接泄露，是老师忘了
     /// 自己在播、切去处理一件私事。所以这一档必须压过消息，甚至压过
     /// 错误消息，见 `ui::mod::draw` 里那段注释。
+    /// dct 准备重启的时候，不管在哪一屏，顶上第一行都要说着「在等几个会话」。
+    #[test]
+    fn a_pending_restart_is_announced_on_the_top_row() {
+        use ratatui::backend::TestBackend;
+        for view in [View::Board, View::Attached(1)] {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = app_with_one_agent_session(view);
+            app.drain = Some(crate::drain::Progress {
+                waiting: vec![1, 2],
+                remaining_s: 60,
+                nudged: false,
+            });
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let top: String = (0..buf.area.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect::<String>()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(top.contains("dct准备重启"), "顶上没说要重启：{top}");
+            assert!(top.contains('2'), "没说在等几个：{top}");
+        }
+    }
+
+    /// 没在排空（或旧后台不认这条请求）就什么都不画。
+    #[test]
+    fn no_pending_restart_draws_no_banner() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.drain = None;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(term.backend().buffer()).contains("准备重启"));
+    }
+
+    #[test]
+    fn drain_banner_state_follows_the_daemon_answer() {
+        let p = |w: Vec<u32>| crate::drain::Progress {
+            waiting: w,
+            remaining_s: 5,
+            nudged: false,
+        };
+        let reply = |w: Vec<u32>, active: bool| {
+            Ok(Response::DrainProgress {
+                progress: p(w),
+                done: false,
+                active,
+            })
+        };
+        assert_eq!(drain_banner_from(reply(vec![3], true)), Some(p(vec![3])));
+        // 没有会话可等了、正在收尾：照样画（说「正在重启」）。
+        assert_eq!(drain_banner_from(reply(vec![], true)), Some(p(vec![])));
+        assert_eq!(drain_banner_from(reply(vec![], false)), None);
+        let old_daemon = Response::Error(crate::proto::ErrorCode::BadRequest("unknown variant".into()));
+        assert_eq!(drain_banner_from(Ok(old_daemon)), None);
+        assert_eq!(drain_banner_from(Err(anyhow::anyhow!("断了"))), None);
+    }
+
+    /// 排空在收尾、没有会话可等的时候，顶上说「正在重启」，不说「还在等 0 个」。
+    #[test]
+    fn the_finishing_window_says_restarting() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.drain = Some(crate::drain::Progress {
+            waiting: vec![],
+            remaining_s: 0,
+            nudged: false,
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(text.contains("dct正在重启"), "{text}");
+        assert!(!text.contains("还在等0"), "{text}");
+    }
+
     #[test]
     fn the_live_banner_beats_every_other_bar_content() {
         use ratatui::backend::TestBackend;

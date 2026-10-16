@@ -173,6 +173,28 @@ pub struct Profile {
     /// 那一份对话，所以一组里只有最近活跃的那一个才会真的带上这些参数。
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// 开会话时交给 agent 的「用这个对话 id」参数，`{id}` 由 dct 换成它
+    /// 生成的 UUID。**只给实测过的 profile 写**，理由同 `resume_args`。
+    /// 声明了它，dct 才记得住这个会话是哪一段对话，重启后才能各接各的——
+    /// 不再靠 `--continue` 按目录去猜（同目录多个会话时只接得回一个）。
+    #[serde(default)]
+    pub session_id_args: Vec<String>,
+    /// 重启后按 id 接回那段对话的参数，`{id}` 同上。
+    #[serde(default)]
+    pub resume_id_args: Vec<String>,
+}
+
+/// 把参数里的 `{id}` 换成真正的 id。
+pub fn fill_id(args: &[String], id: &str) -> Vec<String> {
+    args.iter().map(|a| a.replace("{id}", id)).collect()
+}
+
+impl Profile {
+    /// 两个都声明了才算「能按 id 接回」：只会指定不会接回，或者反过来，
+    /// 都接不回同一段对话。
+    pub fn resumes_by_id(&self) -> bool {
+        !self.session_id_args.is_empty() && !self.resume_id_args.is_empty()
+    }
 }
 
 const DC: &str = include_str!("../profiles/dc.toml");
@@ -1115,6 +1137,69 @@ mod tests {
             .is_match("(12s • esc to interrupt)"));
     }
 
+    /// codex v0.163.0 真截屏（2026-10-15，默认全屏和 `--no-alt-screen` 两种）：
+    /// 干活时的几种样子都要认成忙，空闲时（含启动 logo、输入框里有字）都不能。
+    #[test]
+    fn codex_busy_pattern_matches_real_v0_163_screens() {
+        let re = Profile::builtin("codex")
+            .unwrap()
+            .busy_regex()
+            .unwrap()
+            .unwrap();
+        let busy = [
+            (
+                "default-busy",
+                include_str!("../tests/fixtures/codex-0.163/default-busy.txt"),
+            ),
+            (
+                "default-busy-spinner-only",
+                include_str!("../tests/fixtures/codex-0.163/default-busy-spinner-only.txt"),
+            ),
+            (
+                "default-busy-typed",
+                include_str!("../tests/fixtures/codex-0.163/default-busy-typed.txt"),
+            ),
+            (
+                "inline-busy",
+                include_str!("../tests/fixtures/codex-0.163/inline-busy.txt"),
+            ),
+            (
+                "inline-busy-typed",
+                include_str!("../tests/fixtures/codex-0.163/inline-busy-typed.txt"),
+            ),
+        ];
+        let idle = [
+            (
+                "default-idle-start",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-start.txt"),
+            ),
+            (
+                "default-idle-done",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-done.txt"),
+            ),
+            (
+                "default-idle-typed",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-typed.txt"),
+            ),
+            (
+                "inline-idle-done",
+                include_str!("../tests/fixtures/codex-0.163/inline-idle-done.txt"),
+            ),
+            (
+                "inline-idle-typed",
+                include_str!("../tests/fixtures/codex-0.163/inline-idle-typed.txt"),
+            ),
+        ];
+        for (name, screen) in busy {
+            assert!(re.is_match(screen), "{name} 该认成忙");
+        }
+        for (name, screen) in idle {
+            assert!(!re.is_match(screen), "{name} 该认成空闲");
+        }
+        // 只剩「tab to queue message」那一行（esc 那行被顶掉的那一下）也算忙。
+        assert!(re.is_match("› half typed\n\n  tab to queue message"));
+    }
+
     /// **每个我们知道绕过参数的 agent，profile 里必须真的带着它。**
     ///
     /// 这不是风格问题。dct 敢让 agent 关掉所有权限确认，靠的是每轮之前那张
@@ -1540,6 +1625,45 @@ mod tests {
                 "{name}: 恢复方式没实测过，不该编 resume_args"
             );
         }
+    }
+
+    #[test]
+    fn fill_id_replaces_placeholder_only() {
+        let args = vec![
+            "--session-id".to_string(),
+            "{id}".to_string(),
+            "x{id}y".to_string(),
+        ];
+        assert_eq!(fill_id(&args, "abc"), vec!["--session-id", "abc", "xabcy"]);
+    }
+
+    #[test]
+    fn claude_based_profiles_resume_by_id() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api", "qwen", "dc"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.session_id_args, vec!["--session-id", "{id}"], "{name}");
+            assert_eq!(p.resume_id_args, vec!["--resume", "{id}"], "{name}");
+            assert!(p.resumes_by_id(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unverified_profiles_do_not_resume_by_id() {
+        // codex、opencode 开会话时没法指定 id；qwen、dc 已实测，在上面的正向测试里。
+        for name in ["codex", "opencode", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.session_id_args.is_empty() && p.resume_id_args.is_empty(),
+                "{name}"
+            );
+            assert!(!p.resumes_by_id(), "{name}");
+        }
+    }
+
+    #[test]
+    fn profile_without_new_fields_still_parses() {
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.session_id_args.is_empty() && p.resume_id_args.is_empty());
     }
 
     /// `pairable` 的默认值必须是 `false`：用户自己写的 profile 没提这个

@@ -320,6 +320,10 @@ pub trait Inbox: Send + Sync {
     /// 敲进去**并按回车**。跟手机那一路是同一条路（`bridge::submit`）。
     fn type_into(&self, id: u32, text: &str) -> Result<Typed, String>;
     fn tentacles(&self) -> Vec<String>;
+    /// dct 正在准备重启：留言先排着，不往会话里敲。
+    fn draining(&self) -> bool {
+        false
+    }
 }
 
 /// `bridge::submit` 的结果分成「送进去了」和「没送进去」。只有快照没拍上
@@ -360,6 +364,10 @@ impl Inbox for LocalInbox {
 
     fn type_into(&self, id: u32, text: &str) -> Result<Typed, String> {
         typed_from(crate::bridge::submit(&self.mgr, id, text))
+    }
+
+    fn draining(&self) -> bool {
+        self.mgr.is_draining()
     }
 
     fn tentacles(&self) -> Vec<String> {
@@ -459,7 +467,8 @@ impl Mesh {
         let queued = self.queues.get(&s.id).map_or(0, |q| q.len());
         // 前面还有排着的、或者正有一条在敲，就排在后面，哪怕会话此刻看着
         // 空着：先来的先送，一次一条。
-        if queued == 0 && !self.in_flight.contains(&s.id) && ready(s.state) {
+        // 准备重启时不当场敲，一律排队：重启之后或取消之后照常送。
+        if queued == 0 && !self.in_flight.contains(&s.id) && ready(s.state) && !inbox.draining() {
             self.in_flight.insert(s.id);
             return Decision::TypeNow(Typing {
                 session: s.id,
@@ -832,6 +841,10 @@ fn outcome(r: Receipt) -> SendOutcome {
 /// 投递线程的一拍：锁里取出要送的（每个会话最多一条），放锁，一条条敲，
 /// 每敲完一条再拿锁记账。敲字里有 git 快照，不能攥着锁做。
 pub fn tick(mesh: &Mutex<Mesh>) {
+    // 准备重启时不取队列：留言原样留着，取消或者重启之后照常送。
+    if lock(mesh).inbox.as_ref().is_some_and(|i| i.draining()) {
+        return;
+    }
     let (jobs, inbox) = {
         let mut m = lock(mesh);
         (m.take_queued(), m.inbox.clone())
@@ -880,6 +893,8 @@ pub mod testing {
         /// 设了就不敲，直接回这个结果（`Ok(NoCheckpoint)` 表示字和回车
         /// 都送了、只是快照没拍上，这时照样记进 `typed`）。
         pub fail: Mutex<Option<Result<Typed, String>>>,
+        /// 模拟「dct 正在准备重启」。
+        pub draining: std::sync::atomic::AtomicBool,
     }
 
     impl FakeInbox {
@@ -942,6 +957,10 @@ pub mod testing {
 
         fn tentacles(&self) -> Vec<String> {
             self.tentacles.clone()
+        }
+
+        fn draining(&self) -> bool {
+            self.draining.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 }
@@ -1446,6 +1465,44 @@ mod tests {
             b.inbox.typed(),
             [(4, marker("A", "终端", &hex_id(1), "有空看一下"))]
         );
+    }
+
+    #[test]
+    fn tick_keeps_queue_while_draining_and_delivers_after() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let hub = FakeHub::new();
+        let r = roster3();
+        let a = node(&hub, 1, "A", &r);
+        let b = node(&hub, 2, "B", &r);
+        b.inbox.add(4, "修登录白屏", "/w/dc-terminal", Working, true);
+        let out = send(&a.mesh, &a.net, "B/修登录白屏", "有空看一下", None);
+        assert_eq!(out, Ok(SendOutcome::Queued));
+
+        b.inbox.set_state(4, Idle);
+        b.inbox.draining.store(true, SeqCst);
+        tick(&b.mesh);
+        assert!(b.inbox.typed().is_empty(), "准备重启时不送");
+
+        b.inbox.draining.store(false, SeqCst);
+        tick(&b.mesh);
+        assert_eq!(b.inbox.typed().len(), 1, "不排空了就照常送");
+    }
+
+    #[test]
+    fn a_message_to_an_idle_session_is_queued_not_typed_while_draining() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let hub = FakeHub::new();
+        let r = roster3();
+        let a = node(&hub, 1, "A", &r);
+        let b = node(&hub, 2, "B", &r);
+        b.inbox.add(4, "写文档", "/w/x", Idle, true);
+        b.inbox.draining.store(true, SeqCst);
+        let out = send(&a.mesh, &a.net, "B/写文档", "hi", Some(1));
+        assert_eq!(out, Ok(SendOutcome::Queued));
+        assert!(b.inbox.typed().is_empty());
+        b.inbox.draining.store(false, SeqCst);
+        tick(&b.mesh);
+        assert_eq!(b.inbox.typed().len(), 1);
     }
 
     #[test]

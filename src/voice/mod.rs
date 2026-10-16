@@ -550,6 +550,27 @@ impl<'a> Relay<'a> {
     }
 }
 
+/// 从这一号协议起，后台认 `Request::Submit`。
+const SUBMIT_SINCE_PROTOCOL: u32 = 25;
+
+/// 把一句话送进会话要发哪几条请求。新后台一条 `Submit`（准备重启时会被
+/// 拒绝）；装好新二进制、后台还没重启的那段时间跑的是旧后台，它不认
+/// `Submit`，退回旧的「写字 + 回车」两条 `Input`。空话只按回车，跟
+/// `bridge::submit_unchecked` 一样。
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn submit_requests(protocol: Option<u32>, id: u32, text: &str) -> Vec<crate::proto::Request> {
+    use crate::proto::Request;
+    if protocol.is_some_and(|v| v >= SUBMIT_SINCE_PROTOCOL) {
+        return vec![Request::Submit { id, text: text.to_string() }];
+    }
+    let mut out = Vec::new();
+    if !text.is_empty() {
+        out.push(Request::Input { id, text: text.to_string() });
+    }
+    out.push(Request::Input { id, text: String::new() });
+    out
+}
+
 // ---------- 命令行 ----------
 
 pub fn run(args: &[String]) -> i32 {
@@ -617,10 +638,18 @@ mod unix {
         }
 
         fn type_into(&mut self, id: u32, text: &str) -> Result<(), String> {
-            // 跟 `bridge::submit` 同一个两步约定：先写字，再单独送空串按回车。
-            for t in [text, ""] {
-                match self.call(Request::Input { id, text: t.to_string() })? {
+            // 新后台在守护进程里一次做完「写字 + 按回车」（`bridge::submit`），
+            // 并且准备重启时会拒绝。语音是自动来源，不能走用户自己用的 `Input`。
+            // 旧后台不认 `Submit`：同一条连接上先问一句协议号，再决定怎么发
+            // （见 `submit_requests`）。每次都问，因为后台可能刚重启换了版本。
+            let mut c = Client::connect(&self.0).map_err(|_| "后台没在运行".to_string())?;
+            let protocol = c.protocol();
+            for req in super::submit_requests(protocol, id, text) {
+                match c.call(req).map_err(|e| e.to_string())? {
                     Response::Ok => {}
+                    Response::Error(crate::proto::ErrorCode::RestartPending) => {
+                        return Err(crate::bridge::RESTART_PENDING_MSG.to_string())
+                    }
                     Response::Error(e) => return Err(format!("{e:?}")),
                     _ => return Err("后台的回答读不懂".into()),
                 }

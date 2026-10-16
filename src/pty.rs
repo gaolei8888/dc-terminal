@@ -431,6 +431,36 @@ impl PtySession {
         Ok(())
     }
 
+    /// 这个终端此刻是不是「按一个键收一个键」的样子（agent 已经接管了键盘）。
+    ///
+    /// agent 刚起来、还没把终端切到它自己的模式之前，终端还是「一行一行收」的：
+    /// 这时打进去的回车会被换成换行，字攒在终端里等 agent 来读——读到时
+    /// 回车已经变了样（codex 把它当成「换行」而不是「发送」），或者干脆被
+    /// agent 启动时清掉。所以 dct 替用户打字之前要先看这一眼。
+    ///
+    /// Unix 上看终端的 ICANON 位（主端查到的就是从端的设置，macOS、Linux 都
+    /// 实测过，见下面的测试）。问不到（没有 fd、调用失败）和 Windows（ConPTY
+    /// 没有这回事）一律答「是」：只剩时间那条规矩兜着，不会因此永远不打。
+    pub fn accepts_keys(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(fd) = self._master.as_raw_fd() else {
+                return true;
+            };
+            // SAFETY: `termios` 是纯数据结构，全零是合法初值；`fd` 来自我们
+            // 自己持有的主端，活得比这次调用长。
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+                return true;
+            }
+            t.c_lflag & libc::ICANON == 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         self.child
             .lock()
@@ -908,6 +938,33 @@ mod tests {
     use super::*;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
+
+    /// 主端上查到的 ICANON 跟着从端走：agent 把终端切成 raw 之后才算
+    /// 「接得住按键」，一直停在行模式的进程不算。macOS 上实测过。
+    #[test]
+    #[cfg(unix)]
+    fn accepts_keys_follows_the_programs_terminal_mode() {
+        let env = std::collections::BTreeMap::new();
+        let cwd = std::env::temp_dir();
+        let line = PtySession::spawn(&["sleep".to_string(), "5".to_string()], &env, &cwd, 24, 80)
+            .unwrap();
+        let raw = PtySession::spawn(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "stty raw -echo; echo READY; sleep 5".to_string(),
+            ],
+            &env,
+            &cwd,
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&raw, "READY"));
+        sleep(Duration::from_millis(100));
+        assert!(!line.accepts_keys(), "还在行模式的终端不该算接得住按键");
+        assert!(raw.accepts_keys(), "切成 raw 之后应该算接得住按键");
+    }
 
     fn wait_for(p: &PtySession, needle: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -500,6 +500,26 @@ pub enum Key {
     RestartStartedDaemonOnly,
     /// 连守护进程都没拉起来。
     RestartStartFailed,
+    /// 平稳重启：会话都停好了，后台正在记状态、准备交给小进程。
+    RestartDrainFinishing,
+    /// 后台老到不认识平稳重启，只能直接重启。
+    RestartOldDaemonPlain,
+    /// 等待期间按了 Ctrl+C：已取消。
+    RestartDrainCancelled,
+    /// 按 Ctrl+C 时后台已经开始落盘，取消不了。
+    RestartCancelTooLate,
+    /// 排空被后台自己撤了（不是用户取消的）。
+    RestartDrainAborted,
+    /// 排空完了，正在等新的后台起来。
+    RestartSwapping,
+    /// 旧后台已经走了，新的却没起来。
+    RestartNewDaemonNotUp,
+    /// 在会话里敲的 `dct restart`：这个会话的对话重启后接不回来，先自己写交接。
+    RestartInitiatorUnresumable,
+    /// `dct restart --cancel`：现在没在准备重启。
+    RestartNothingToCancel,
+    /// 界面重连上的是一个新起的后台：回到看板。
+    DaemonRestartedBackToBoard,
     // —— 守护进程重启后，问要不要接回上次的会话 ——
     ResumeSessionsExplain,
     ResumeSessionsAsk,
@@ -1131,6 +1151,59 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Could not start the background service.",
             zh: "没能启动后台服务",
         ),
+        RestartDrainFinishing => t!(
+            lang,
+            en: "All sessions have stopped. Saving where each one was…",
+            zh: "会话都停好了，正在记下各会话的状态……",
+        ),
+        RestartOldDaemonPlain => t!(
+            lang,
+            en: "The background service running now is too old to wait for sessions to stop — it will be restarted right away, and the sessions come back on their own with new numbers. Close every open dct window before you confirm and open them again afterwards, or what you type may land in a different session.",
+            zh: "这次后台太旧，不会等会话停下，直接重启；会话会自己接回来，但编号会变。先关掉所有开着的 dct 窗口，重启完再打开，不然打的字可能落进别的会话。",
+        ),
+        RestartDrainCancelled => {
+            t!(lang, en: "Cancelled. Nothing changed.", zh: "已取消，一切照旧")
+        }
+        RestartCancelTooLate => t!(
+            lang,
+            en: "Already switching over — too late to cancel. Almost done.",
+            zh: "已经在换了，取消不了，马上就好",
+        ),
+        RestartDrainAborted => t!(
+            lang,
+            en: "The restart did not go ahead. Nothing changed.",
+            zh: "重启没进行下去，一切照旧",
+        ),
+        RestartSwapping => t!(
+            lang,
+            en: "Switching to the new background service…",
+            zh: "正在换新的后台……",
+        ),
+        // 旧的已经走了，所以不能用 `RestartFailed`（那句说「旧的还在跑」）。
+        RestartNewDaemonNotUp => t!(
+            lang,
+            en: "The new background service did not come up. See ~/.dct/daemon.log for why;\n\
+                 running `dct` again starts it as usual and brings the sessions back.",
+            zh: "新的后台没起来，原因看 ~/.dct/daemon.log；\n\
+                 再敲一次 `dct` 会照常起后台、接回会话。",
+        ),
+        RestartInitiatorUnresumable => t!(
+            lang,
+            en: "Note: this session's conversation will not come back after the restart. If you have unfinished work, \
+                 write yourself a handoff first (what you are doing, how far you got, the next step), then restart.",
+            zh: "注意：这个会话的对话重启后接不回来。要是手上还有没做完的事，先自己写一份交接\
+                 （在做什么、做到哪了、下一步）再重启。",
+        ),
+        RestartNothingToCancel => t!(
+            lang,
+            en: "dct is not getting ready to restart, so there is nothing to cancel.",
+            zh: "dct 现在没在准备重启，不用取消",
+        ),
+        DaemonRestartedBackToBoard => t!(
+            lang,
+            en: "dct restarted, so session numbers may have changed. You are back on the board.",
+            zh: "dct 重启过了，会话编号可能变了，已经回到看板",
+        ),
         ResumeSessionsExplain => t!(
             lang,
             en: "The background service was not running. Before, it had these sessions open:",
@@ -1362,6 +1435,24 @@ pub mod msg {
         t!(lang, en: format!("`{arg}` is not a session number. `dct ps` lists them."), zh: format!("`{arg}` 不是会话号。`dct ps` 能看到有哪些。"))
     }
 
+    /// 会话都停好了、正在记下状态交给新后台的那一小段，顶上那一行。
+    pub fn restart_now_banner(lang: Lang) -> String {
+        t!(
+            lang,
+            en: "dct is restarting…".to_string(),
+            zh: "dct 正在重启……".to_string(),
+        )
+    }
+
+    /// dct 准备重启时顶上那一行：还在等几个会话停下。
+    pub fn restart_pending_banner(lang: Lang, waiting: usize) -> String {
+        t!(
+            lang,
+            en: format!("dct is about to restart: still waiting for {waiting} session(s)"),
+            zh: format!("dct 准备重启：还在等 {waiting} 个会话"),
+        )
+    }
+
     /// 顶栏那行常驻提示的正文：「正在直播 · N 路 · M 人在看」。**这一句
     /// 是整个功能最重要的一块文案**——不带人数的话，老师看不出这行字是
     /// 「活的」还是昨天就一直挂在那儿的死文案（见 `ui::live` 的文档注释）。
@@ -1494,12 +1585,131 @@ pub mod msg {
     /// **不把不认识的参数当成「没参数」忽略掉**：`dct restart --all` 这种手滑
     /// 如果被当成裸 `dct restart` 执行，用户以为自己限定了范围，实际把整个
     /// 守护进程连所有会话一起换掉了。
-    pub fn restart_takes_no_args(lang: Lang, arg: &str) -> String {
+    pub fn restart_bad_arg(lang: Lang, arg: &str) -> String {
         t!(
             lang,
-            en: format!("`dct restart` takes no arguments (`{arg}`) — only `-y` to skip the question."),
-            zh: format!("`dct restart` 不接参数（`{arg}`），只认 `-y`（不问直接重启）。"),
+            en: format!(
+                "`dct restart` does not know `{arg}`. It takes: -y (don't ask), --now (don't wait for sessions), \
+                 --wait <minutes>, --nudge-wait <minutes>."
+            ),
+            zh: format!(
+                "`dct restart` 不认识 `{arg}`。能用的：-y（不问）、--now（不等会话停下）、\
+                 --wait <分钟>、--nudge-wait <分钟>。"
+            ),
         )
+    }
+
+    /// `--wait` / `--nudge-wait` 后面没跟分钟数，或者跟的不是数。
+    pub fn restart_needs_minutes(lang: Lang, flag: &str) -> String {
+        t!(
+            lang,
+            en: format!("`{flag}` needs a number of minutes, e.g. `{flag} 5`."),
+            zh: format!("`{flag}` 后面要跟分钟数，比如 `{flag} 5`。"),
+        )
+    }
+
+    /// 问 y/n 之前的说明：平稳重启会先等，最多等 `minutes` 分钟。
+    pub fn restart_graceful_explain(lang: Lang, minutes: u64) -> String {
+        t!(
+            lang,
+            en: format!(
+                "dct will first wait for busy sessions to stop (up to {minutes} min), then restart;\n\
+                 afterwards every session picks up its conversation where it left off."
+            ),
+            zh: format!(
+                "会先等正在干活的会话停下（最多 {minutes} 分钟），再重启；\n\
+                 重启后每个会话接回原来的对话。"
+            ),
+        )
+    }
+
+    /// 在会话里敲的 `dct restart`：命令交给后台就退出，不在这里干等——agent
+    /// 跑命令有时限，等久了会被它自己掐掉。
+    pub fn restart_handed_off(lang: Lang, minutes: u64) -> String {
+        if minutes == 0 {
+            return t!(
+                lang,
+                en: "dct will restart right away. This session will be told when the restart is done; \
+                     you don't need to run it again."
+                    .to_string(),
+                zh: "重启已经交给 dct 了，马上就重启；重启完会告诉这个会话，不用再敲一次。".to_string(),
+            );
+        }
+        t!(
+            lang,
+            en: format!(
+                "dct will restart once the other sessions have stopped (up to {minutes} min). \
+                 This session will be told when the restart is done; you don't need to wait or run it again.\n\
+                 To call it off: dct restart --cancel"
+            ),
+            zh: format!(
+                "重启已经交给 dct 了：等别的会话停下（最多 {minutes} 分钟）就重启，\
+                 重启完会告诉这个会话，不用在这里等，也不用再敲一次。\n\
+                 要取消：dct restart --cancel"
+            ),
+        )
+    }
+
+    /// 取消了重启。`who` 是已经被请去写交接或者催过停下的会话（名字或编号），
+    /// dct 会再告诉它们接着做。
+    pub fn restart_cancelled_told(lang: Lang, who: &[String]) -> String {
+        if who.is_empty() {
+            return text(Key::RestartDrainCancelled, lang).to_string();
+        }
+        t!(
+            lang,
+            en: format!(
+                "Cancelled. Nothing changed. {} had already been asked to stop or write a handoff; dct will tell them to carry on.",
+                who.join(", ")
+            ),
+            zh: format!(
+                "已取消，一切照旧。{} 已经被请去停下或写交接，dct 会告诉它们接着做。",
+                who.join("、")
+            ),
+        )
+    }
+
+    /// 没有名字的会话怎么称呼。
+    pub fn session_number(lang: Lang, id: u32) -> String {
+        t!(lang, en: format!("#{id}"), zh: format!("{id} 号"))
+    }
+
+    /// 平稳重启的进度一行。`who` 是还在等的会话（名字或编号），`nudged` =
+    /// 已经催过它们停下，`remaining_s` 是离下一个时限还剩几秒。
+    pub fn drain_waiting(lang: Lang, who: &[String], remaining_s: u64, nudged: bool) -> String {
+        let n = who.len();
+        let (m, sec) = (remaining_s / 60, remaining_s % 60);
+        match lang {
+            Lang::Zh => {
+                let names = who.join("、");
+                let left = match (m, sec) {
+                    (0, s) => format!("{s} 秒"),
+                    (m, 0) => format!("{m} 分钟"),
+                    (m, s) => format!("{m} 分 {s} 秒"),
+                };
+                if nudged {
+                    format!("还在等 {n} 个会话（{names}），已请它们停下，最多再等 {left}")
+                } else {
+                    format!("还在等 {n} 个会话（{names}），剩 {left}")
+                }
+            }
+            Lang::En => {
+                let names = who.join(", ");
+                let noun = if n == 1 { "session" } else { "sessions" };
+                let left = match (m, sec) {
+                    (0, s) => format!("{s}s"),
+                    (m, 0) => format!("{m}m"),
+                    (m, s) => format!("{m}m {s}s"),
+                };
+                if nudged {
+                    format!(
+                        "Waiting for {n} {noun} ({names}); asked them to stop, at most {left} more"
+                    )
+                } else {
+                    format!("Waiting for {n} {noun} ({names}), {left} left")
+                }
+            }
+        }
     }
 
     pub fn all_takes_no_ids(lang: Lang, cmd: &str) -> String {
@@ -1958,6 +2168,16 @@ pub mod msg {
                 lang,
                 en: format!("{cmd} would not start — it may be installed incorrectly"),
                 zh: format!("启动不了 {cmd}，它可能装坏了"),
+            ),
+            StillRestoring => t!(
+                lang,
+                en: "dct has just restarted and is still bringing sessions back. Try again in a moment".to_string(),
+                zh: "dct 刚重启，还在接回会话，过一会儿再试".to_string(),
+            ),
+            RestartPending => t!(
+                lang,
+                en: "dct is getting ready to restart, please send that again in a moment".to_string(),
+                zh: "dct 正在准备重启，稍后再发".to_string(),
             ),
             DaemonNotResponding => t!(
                 lang,
@@ -2523,6 +2743,11 @@ pub mod msg {
                         en: "it could not be started again",
                         zh: "没能重新启动",
                     ),
+                    crate::proto::SessionResumeSkipReason::ConversationGone => t!(
+                        lang,
+                        en: "its earlier conversation could not be found, so a fresh one was started in its place",
+                        zh: "原来的对话找不到了，已经在原处重新开了一个",
+                    ),
                 };
                 t!(
                     lang,
@@ -2530,6 +2755,43 @@ pub mod msg {
                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
                 )
             }
+            HeldMessageDropped { dir } => t!(
+                lang,
+                en: format!(
+                    "A message from another computer for the session in {dir} was held during the restart, \
+                     but it could not be delivered afterwards."
+                ),
+                zh: format!(
+                    "重启时替 {dir} 的会话存着一条别的电脑发来的留言，重启后没能送进去。"
+                ),
+            ),
+            CancelNoteDropped { dir } => t!(
+                lang,
+                en: format!(
+                    "The session in {dir} could not be told that dct is not restarting after all. Please tell it to carry on yourself."
+                ),
+                zh: format!(
+                    "没能告诉 {dir} 的会话「dct 不重启了」，请手动告诉它接着做。"
+                ),
+            ),
+            HandoffMissing { dir } => t!(
+                lang,
+                en: format!(
+                    "The session in {dir} did not leave a handoff before the restart and its conversation could not be brought back, so it starts fresh. Please tell it what it was doing."
+                ),
+                zh: format!(
+                    "{dir} 的会话重启前没写成交接，原来的对话也接不回来，现在是新的对话。请告诉它之前在做什么。"
+                ),
+            ),
+            ResumeNoteDropped { dir } => t!(
+                lang,
+                en: format!(
+                    "The session in {dir} was not ready after the restart, so it could not be told to carry on. Please tell it to continue yourself."
+                ),
+                zh: format!(
+                    "{dir} 的会话重启后一直没准备好，没能叫它继续，请手动告诉它接着做。"
+                ),
+            ),
         }
     }
 
@@ -3116,6 +3378,16 @@ mod tests {
             RestartNothingToRestart,
             RestartStartedDaemonOnly,
             RestartStartFailed,
+            RestartDrainFinishing,
+            RestartOldDaemonPlain,
+            RestartDrainCancelled,
+            RestartCancelTooLate,
+            RestartDrainAborted,
+            RestartSwapping,
+            RestartNewDaemonNotUp,
+            RestartInitiatorUnresumable,
+            RestartNothingToCancel,
+            DaemonRestartedBackToBoard,
             ResumeSessionsExplain,
             ResumeSessionsAsk,
             ResumeSessionsWillContinue,
@@ -3177,7 +3449,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 212, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 222, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
@@ -3241,6 +3513,8 @@ mod tests {
             OperationFailed(crate::proto::Operation::ReadClipboard),
             CannotStart("claude".into()),
             DaemonNotResponding,
+            StillRestoring,
+            RestartPending,
             Mesh(crate::proto::MeshProblem::NotLoggedIn),
             Mesh(crate::proto::MeshProblem::NoDcAccount),
             Mesh(crate::proto::MeshProblem::AlreadyInGroup),
@@ -3462,6 +3736,23 @@ mod tests {
                 dir: "/w/dc-terminal".into(),
                 profile: "claude".into(),
                 reason: crate::proto::SessionResumeSkipReason::StartFailed,
+            },
+            SessionResumeSkipped {
+                dir: "/w/dc-terminal".into(),
+                profile: "claude".into(),
+                reason: crate::proto::SessionResumeSkipReason::ConversationGone,
+            },
+            ResumeNoteDropped {
+                dir: "/w/dc-terminal".into(),
+            },
+            HeldMessageDropped {
+                dir: "/w/dc-terminal".into(),
+            },
+            CancelNoteDropped {
+                dir: "/w/dc-terminal".into(),
+            },
+            HandoffMissing {
+                dir: "/w/dc-terminal".into(),
             },
         ];
         for c in &codes {

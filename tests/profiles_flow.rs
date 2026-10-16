@@ -147,6 +147,8 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
         label: Default::default(),
         note: Default::default(),
         resume_args: Default::default(),
+        session_id_args: Default::default(),
+        resume_id_args: Default::default(),
         pairable: false,
         backend_only: false,
     };
