@@ -613,7 +613,8 @@ impl DrainCtl {
                 text: crate::drain::cancel_text(self.lang).to_string(),
                 deadline,
                 dir: dirs.get(&id).cloned().unwrap_or_default(),
-                kind: crate::resume_notes::NoteKind::Note,
+                kind: crate::resume_notes::NoteKind::Cancel,
+                needs_file: None,
             })
             .collect();
         deliver_resume_notes(self.mgr.clone(), notes, RESUME_NOTE_TICK);
@@ -665,7 +666,8 @@ impl DrainCtl {
                     return;
                 }
                 let ready = |id: u32| self.mgr.ready_for_keys(id);
-                let actions = run.drain.step(now, &states, &ready);
+                let written = |p: &Path| p.is_file();
+                let actions = run.drain.step(now, &states, &ready, &written);
                 if actions
                     .iter()
                     .any(|a| matches!(a, crate::drain::Action::Finish { .. }))
@@ -1267,6 +1269,16 @@ fn restore_sessions_with(
     let mut notes = Vec::new();
     let total = records.len();
 
+    // 没接回来的会话，替它存着的留言送不到了：每条都告诉用户一声。
+    let held_dropped = |record: &crate::last_sessions::RecordedSession| {
+        record
+            .held_messages
+            .iter()
+            .map(|_| WarningCode::HeldMessageDropped {
+                dir: record.dir.display().to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
     for (i, (record, &resume)) in records.iter().zip(resume_flags.iter()).enumerate() {
         // 一条会话的恢复可能要跑真正的子进程 spawn + 首次 git checkpoint
         // （agent profile 都要），仓库大的话这一步单独就要小半秒。这整段
@@ -1294,6 +1306,7 @@ fn restore_sessions_with(
                 profile: record.profile.clone(),
                 reason: SessionResumeSkipReason::DirGone,
             });
+            skips.extend(held_dropped(record));
             continue;
         }
         if !all.iter().any(|p| p.name == record.profile) {
@@ -1307,6 +1320,7 @@ fn restore_sessions_with(
                 profile: record.profile.clone(),
                 reason: SessionResumeSkipReason::ProfileGone,
             });
+            skips.extend(held_dropped(record));
             continue;
         }
 
@@ -1330,14 +1344,23 @@ fn restore_sessions_with(
             let resumed_by_id = crate::last_sessions::will_resume_by_id(record, all);
             let now = std::time::Instant::now();
             let dir = record.dir.display().to_string();
-            if let Some(text) = crate::resume_notes::note_for(record, resumed_by_id, lang) {
+            if let Some(p) = crate::resume_notes::note_for(record, resumed_by_id, lang) {
                 notes.push(crate::resume_notes::Note {
                     id,
-                    text,
+                    text: p.text,
                     deadline: now + crate::resume_notes::NOTE_WAIT,
                     dir: dir.clone(),
                     kind: crate::resume_notes::NoteKind::Note,
+                    needs_file: p.needs_file,
                 });
+            }
+            // 带了 `--continue` 才算接回了点什么；profile 根本没有那个参数的不算。
+            let continued = resume
+                && all
+                    .iter()
+                    .any(|p| p.name == record.profile && !p.resume_args.is_empty());
+            if crate::resume_notes::lost_without_handoff(record, resumed_by_id, continued) {
+                skips.push(WarningCode::HandoffMissing { dir: dir.clone() });
             }
             // 准备重启期间替它存着的留言，排在「继续」后面，一条条照常送。
             for m in &record.held_messages {
@@ -1347,6 +1370,7 @@ fn restore_sessions_with(
                     deadline: now + crate::resume_notes::MESSAGE_WAIT,
                     dir: dir.clone(),
                     kind: crate::resume_notes::NoteKind::Message,
+                    needs_file: None,
                 });
             }
             if resumed_by_id {
@@ -1368,6 +1392,7 @@ fn restore_sessions_with(
                 profile: record.profile.clone(),
                 reason: SessionResumeSkipReason::StartFailed,
             });
+            skips.extend(held_dropped(record));
         }
     }
 
@@ -1376,6 +1401,25 @@ fn restore_sessions_with(
 
 /// 投递线程每隔多久看一次。
 const RESUME_NOTE_TICK: Duration = Duration::from_millis(500);
+
+/// 一句没送进去的话该给用户什么提示。「先读交接」没送进去、是因为交接
+/// 文件到期限都没出现的，说的是「它没写成交接」，不是「它没准备好」。
+fn dropped_warning(
+    n: crate::resume_notes::Note,
+    written: &dyn Fn(&Path) -> bool,
+) -> crate::proto::WarningCode {
+    use crate::proto::WarningCode;
+    use crate::resume_notes::NoteKind;
+    let dir = n.dir;
+    match n.kind {
+        NoteKind::Note if n.needs_file.as_deref().is_some_and(|p| !written(p)) => {
+            WarningCode::HandoffMissing { dir }
+        }
+        NoteKind::Note => WarningCode::ResumeNoteDropped { dir },
+        NoteKind::Cancel => WarningCode::CancelNoteDropped { dir },
+        NoteKind::Message => WarningCode::HeldMessageDropped { dir },
+    }
+}
 
 /// 在后台把重启后的话投递给各会话：等空闲再打（绕过「准备重启」的闸，
 /// 此刻本来就不在排空），一次一条；等不到的变成一条界面警告。
@@ -1397,23 +1441,19 @@ fn deliver_resume_notes(
                 let mut send =
                     |id: u32, text: &str| crate::bridge::submit_once(&mgr, id, text);
                 let ready = |id: u32| mgr.ready_for_keys(id);
+                let written = |p: &Path| p.is_file();
                 let dropped = crate::resume_notes::step(
                     &mut notes,
                     std::time::Instant::now(),
                     &states,
                     &ready,
+                    &written,
                     &mut send,
                 );
                 for n in dropped {
-                    eprintln!("{} 的会话重启后一直没准备好，有一句话没送进去", n.dir);
-                    mgr.push_resume_skip(match n.kind {
-                        crate::resume_notes::NoteKind::Note => {
-                            crate::proto::WarningCode::ResumeNoteDropped { dir: n.dir }
-                        }
-                        crate::resume_notes::NoteKind::Message => {
-                            crate::proto::WarningCode::HeldMessageDropped { dir: n.dir }
-                        }
-                    });
+                    let w = dropped_warning(n, &written);
+                    eprintln!("有一句话没送进去：{w:?}");
+                    mgr.push_resume_skip(w);
                 }
                 if notes.is_empty() {
                     return;
@@ -3503,6 +3543,166 @@ mod tests {
             &warnings[0],
             crate::proto::WarningCode::ResumeNoteDropped { dir } if dir.ends_with("proj")
         ));
+    }
+
+    /// 接不回、开在那儿显示 IDLE 的探针：没有任何接回参数。
+    fn plain_idle_probe() -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(
+            r#"
+            name = "plain-idle"
+            command = ["/bin/sh", "-c", 'stty -icanon; printf "IDLE\n"; cat', "sh"]
+            is_agent = false
+            idle_pattern = "IDLE"
+            "#,
+        ))
+        .unwrap()
+    }
+
+    /// 「先读交接」等交接文件出现了再打：重启时 agent 还没写完（codex 的
+    /// TUI 被关了，背后的 app-server 还在写），过一会儿文件才出现，照样送到。
+    #[test]
+    fn a_read_handoff_note_waits_for_a_file_written_after_the_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![plain_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let h = tmp.path().join("1-late.md");
+        let mut r = rec(&proj, "plain-idle");
+        r.handoff = Some(h.clone());
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (skips, _, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+        assert_eq!(notes.len(), 1, "文件还没有也要排上");
+        let _tick = Ticker::start(&mgr);
+        let deliver = deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50)).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let id = mgr.list()[0].id;
+        assert!(
+            !mgr.screen_text_for_test(id).contains("dct 刚重启"),
+            "文件没出现就不该打"
+        );
+        std::fs::write(&h, "x").unwrap();
+        deliver.join().unwrap();
+        let text = mgr.screen_text_for_test(id);
+        assert!(text.contains("dct 刚重启"), "{text:?}");
+        assert!(mgr.resume_skips().is_empty(), "{:?}", mgr.resume_skips());
+    }
+
+    /// 交接文件到期限都没出现：提示用户「它没写成交接」，不是「它没准备好」。
+    #[test]
+    fn a_handoff_that_never_appears_becomes_a_handoff_missing_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![plain_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "plain-idle");
+        r.handoff = Some(tmp.path().join("never.md"));
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_type_waits_for_test(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (_, _, mut notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        notes[0].deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let _tick = Ticker::start(&mgr);
+        deliver_resume_notes(mgr.clone(), notes, Duration::from_millis(50))
+            .unwrap()
+            .join()
+            .unwrap();
+        let warnings = mgr.resume_skips();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(matches!(
+            &warnings[0],
+            crate::proto::WarningCode::HandoffMissing { dir } if dir.ends_with("proj")
+        ));
+    }
+
+    /// N3：被打断、接不回、又没留交接的会话（比如一直不能接按键、被放弃了
+    /// 的那个），重启后什么都收不到：当场提示用户。
+    #[test]
+    fn an_interrupted_unresumable_session_without_a_handoff_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![plain_idle_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "plain-idle");
+        r.interrupted = true;
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, _, notes) = restore_sessions(&[r.clone()], &all, &secrets, &mgr);
+        assert!(notes.is_empty());
+        assert!(
+            matches!(&skips[..], [crate::proto::WarningCode::HandoffMissing { dir }] if dir.ends_with("proj")),
+            "{skips:?}"
+        );
+        // 没被打断的不提示
+        r.interrupted = false;
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, _, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+
+    /// N6：会话没接回来（目录没了），替它存着的留言送不到了，每条都要提示。
+    #[test]
+    fn held_messages_of_a_skipped_session_are_reported_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all = vec![idle_echo_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&tmp.path().join("gone"), "idle-echo");
+        r.held_messages = vec!["A".into(), "B".into()];
+        let mgr = Arc::new(SessionManager::new());
+        let (skips, _, notes) = restore_sessions(&[r], &all, &secrets, &mgr);
+        assert!(notes.is_empty());
+        let held = skips
+            .iter()
+            .filter(|w| matches!(w, crate::proto::WarningCode::HeldMessageDropped { .. }))
+            .count();
+        assert_eq!(held, 2, "{skips:?}");
+    }
+
+    /// N5：取消重启后「dct 不重启了」没送进去，提示里不能说「重启后」。
+    #[test]
+    fn a_dropped_cancel_note_has_its_own_warning() {
+        use crate::proto::WarningCode;
+        use crate::resume_notes::{Note, NoteKind};
+        let n = |kind, needs_file: Option<PathBuf>| Note {
+            id: 1,
+            text: String::new(),
+            deadline: std::time::Instant::now(),
+            dir: "/p".into(),
+            kind,
+            needs_file,
+        };
+        let yes = |_: &Path| true;
+        let no = |_: &Path| false;
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Cancel, None), &yes),
+            WarningCode::CancelNoteDropped { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Note, None), &no),
+            WarningCode::ResumeNoteDropped { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Note, Some("/h.md".into())), &yes),
+            WarningCode::ResumeNoteDropped { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Note, Some("/h.md".into())), &no),
+            WarningCode::HandoffMissing { .. }
+        ));
+        assert!(matches!(
+            dropped_warning(n(NoteKind::Message, None), &yes),
+            WarningCode::HeldMessageDropped { .. }
+        ));
+        for l in crate::i18n::Lang::all() {
+            let s =
+                crate::i18n::msg::warning(*l, &WarningCode::CancelNoteDropped { dir: "/p".into() });
+            assert!(
+                !s.contains("重启后") && !s.contains("after the restart"),
+                "{s}"
+            );
+        }
     }
 
     /// 恢复完以后落盘的清单里不再带 `interrupted` / `handoff`，下次重启

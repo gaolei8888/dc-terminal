@@ -11,8 +11,15 @@ use crate::i18n::Lang;
 use crate::journal::civil_from_days;
 use crate::session::SessionState;
 
-/// 请它写交接后，至少过这么久还没见它忙起来，就当它不打算写了。
-const HANDOFF_GRACE: Duration = Duration::from_secs(10);
+/// 忙过的会话要连续空闲这么久才算真停下。codex v0.163 一轮活中间会有
+/// 一两秒看着像空闲（「esc to interrupt」那行没了），见
+/// `final-acceptance.md`（2026-10-15）。
+const IDLE_SETTLE: Duration = Duration::from_secs(3);
+
+/// 接不回的会话看着空闲、却一直不能接按键（比如它的提示符一直在行模式），
+/// 最多等这么久就不请它写交接了：记成被打断、照常重启，重启后提示用户。
+/// 不封顶的话它会把整个重启拖到兜底时限（默认 18 分钟）。
+const UNREADY_CAP: Duration = Duration::from_secs(60);
 
 pub struct DrainConfig {
     pub wait: Duration,
@@ -68,14 +75,30 @@ pub struct Progress {
 
 #[derive(Clone, Copy)]
 enum Slot {
-    Waiting,
-    /// 已请它写交接；见过它忙起来（或过了宽限）再停下才算写完。
-    HandoffAsked {
-        asked_at: Instant,
+    Waiting {
+        /// 排空开始以后见它忙过。忙过的要空闲够 `IDLE_SETTLE` 才算停下；
+        /// 一开始就空着的不用等。
         seen_busy: bool,
+        /// 这一段连续空闲从什么时候开始。
+        idle_since: Option<Instant>,
+        /// 接不回、看着空闲、却还不能接按键，从什么时候开始（见 `UNREADY_CAP`）。
+        /// 见它忙起来就清掉。
+        unready_since: Option<Instant>,
+    },
+    /// 已请它写交接。**交接文件出现了、并且连续空闲够 `IDLE_SETTLE`** 才算
+    /// 写完；光看它忙过又闲下来不算——codex 的忙闲标记不可靠，会在写之前
+    /// 就显示空闲。一直写不出来的，等到兜底时限记成被打断。
+    HandoffAsked {
+        idle_since: Option<Instant>,
     },
     Done,
 }
+
+const WAITING: Slot = Slot::Waiting {
+    seen_busy: false,
+    idle_since: None,
+    unready_since: None,
+};
 
 pub struct Drain {
     /// 按 id 从小到大排好，保证输出顺序确定。
@@ -119,7 +142,7 @@ impl Drain {
                 let slot = if Some(m.id) == initiator || !m.is_agent {
                     Slot::Done
                 } else {
-                    Slot::Waiting
+                    WAITING
                 };
                 (m, slot)
             })
@@ -141,60 +164,95 @@ impl Drain {
     /// 每拍调一次。`states` 是此刻各会话状态（不在表里 = 会话已经没了，算停下）。
     /// `ready(id)`：现在能不能往这个会话里打字（`SessionManager::ready_for_keys`）。
     /// 请写交接、催停下这两句都要等它答「能」才发；没准备好就下一拍再看。
+    /// `written(path)`：交接文件已经在了。
     pub fn step(
         &mut self,
         now: Instant,
         states: &HashMap<u32, SessionState>,
         ready: &dyn Fn(u32) -> bool,
+        written: &dyn Fn(&Path) -> bool,
     ) -> Vec<Action> {
         if self.finished {
             return Vec::new();
         }
         let mut out = Vec::new();
         for (m, slot) in self.slots.iter_mut() {
-            let is_stopped = stopped(states, m.id);
+            let state = states.get(&m.id).copied();
+            // 已经死了/没了/报错的没法再往里打字，也不用等。
+            let gone = matches!(
+                state,
+                None | Some(SessionState::Stopped | SessionState::Failed)
+            );
+            let idle = state == Some(SessionState::Idle);
             match *slot {
                 Slot::Done => {}
-                Slot::Waiting if is_stopped => {
-                    // 能接回的不用交接；已经死了/没了/报错的没法再往里打字，也不用等。
-                    // `--now` 不请谁写交接。
-                    let idle = matches!(states.get(&m.id), Some(SessionState::Idle));
-                    if m.resumable || !idle || self.cfg.now {
+                Slot::Waiting { .. } if gone => *slot = Slot::Done,
+                // 分不出忙闲的会话（profile 没给忙/闲的标记，比如 qwen）：dct 看
+                // 不出它什么时候停下，等多久都白等，也不该对着可能空闲的它说
+                // 「请停下」。不等、不催，记成被打断——重启后叫它检查一下再继续。
+                Slot::Waiting { .. } if state == Some(SessionState::Unknown) => {
+                    *slot = Slot::Done;
+                    self.interrupted.insert(m.id);
+                }
+                Slot::Waiting { .. } if !idle => {
+                    *slot = Slot::Waiting {
+                        seen_busy: true,
+                        idle_since: None,
+                        unready_since: None,
+                    };
+                }
+                Slot::Waiting {
+                    seen_busy,
+                    idle_since,
+                    unready_since,
+                } => {
+                    let idle_since = idle_since.unwrap_or(now);
+                    // 忙过的要连续空闲够久才算停下：一轮活中间短暂的「空闲」不算。
+                    if seen_busy && now.saturating_duration_since(idle_since) < IDLE_SETTLE {
+                        *slot = Slot::Waiting {
+                            seen_busy,
+                            idle_since: Some(idle_since),
+                            unready_since,
+                        };
+                    } else if m.resumable || self.cfg.now {
+                        // 能接回的不用交接；`--now` 不请谁写交接。
                         *slot = Slot::Done;
                     } else if !ready(m.id) {
                         // 看着空闲，但还没准备好接按键（刚起来、空闲不够久）：
-                        // 这一拍先不打，接着等。
+                        // 这一拍先不打，接着等——最多等 `UNREADY_CAP`。
+                        let unready_since = unready_since.unwrap_or(now);
+                        if now.saturating_duration_since(unready_since) >= UNREADY_CAP {
+                            *slot = Slot::Done;
+                            self.interrupted.insert(m.id);
+                        } else {
+                            *slot = Slot::Waiting {
+                                seen_busy,
+                                idle_since: Some(idle_since),
+                                unready_since: Some(unready_since),
+                            };
+                        }
                     } else {
                         let path = handoff_path(&self.handoff_dir, m.id, &file_stamp());
                         self.handoffs.insert(m.id, path.clone());
                         out.push(Action::AskHandoff { id: m.id, path });
-                        *slot = Slot::HandoffAsked {
-                            asked_at: now,
-                            seen_busy: false,
-                        };
+                        *slot = Slot::HandoffAsked { idle_since: None };
                     }
                 }
-                // 分不出忙闲的会话（profile 没给忙/闲的标记，比如 qwen）：dct 看
-                // 不出它什么时候停下，等多久都白等，也不该对着可能空闲的它说
-                // 「请停下」。不等、不催，记成被打断——重启后叫它检查一下再继续。
-                Slot::Waiting if matches!(states.get(&m.id), Some(SessionState::Unknown)) => {
-                    *slot = Slot::Done;
-                    self.interrupted.insert(m.id);
+                Slot::HandoffAsked { .. } if gone => *slot = Slot::Done,
+                Slot::HandoffAsked { .. } if !idle => {
+                    *slot = Slot::HandoffAsked { idle_since: None };
                 }
-                Slot::Waiting => {}
-                Slot::HandoffAsked {
-                    asked_at,
-                    seen_busy,
-                } => {
-                    if !is_stopped {
-                        *slot = Slot::HandoffAsked {
-                            asked_at,
-                            seen_busy: true,
+                Slot::HandoffAsked { idle_since } => {
+                    let idle_since = idle_since.unwrap_or(now);
+                    let file_there = self.handoffs.get(&m.id).is_some_and(|p| written(p));
+                    *slot =
+                        if file_there && now.saturating_duration_since(idle_since) >= IDLE_SETTLE {
+                            Slot::Done
+                        } else {
+                            Slot::HandoffAsked {
+                                idle_since: Some(idle_since),
+                            }
                         };
-                    } else if seen_busy || now.saturating_duration_since(asked_at) >= HANDOFF_GRACE
-                    {
-                        *slot = Slot::Done;
-                    }
                 }
             }
         }
@@ -209,7 +267,7 @@ impl Drain {
                 // 只有被催的（到点还在干活的）才算打断，不管之后停没停。
                 // 正在写交接的不催：它本来是空闲的，没被打断。空闲着、还在等
                 // 准备好再请它写交接的也不催。`--now` 谁都不催。
-                if matches!(slot, Slot::Waiting) && !stopped(states, m.id) {
+                if matches!(slot, Slot::Waiting { .. }) && !stopped(states, m.id) {
                     self.interrupted.insert(m.id);
                     if !self.cfg.now {
                         self.nudge_due.push(m.id);
@@ -407,7 +465,7 @@ mod tests {
             now: Instant,
             states: &HashMap<u32, SessionState>,
         ) -> Vec<Action> {
-            self.step(now, states, &|_| true)
+            self.step(now, states, &|_| true, &|_| true)
         }
     }
 
@@ -428,7 +486,10 @@ mod tests {
         let mut d = Drain::new(vec![m(1, true)], None, cfg(), "/h".into(), t0);
         assert!(d.step_all_ready(t0, &st(&[(1, Working)])).is_empty());
         assert_eq!(d.progress(t0).waiting, vec![1]);
-        let a = d.step_all_ready(t0 + Duration::from_secs(60), &st(&[(1, Idle)]));
+        assert!(d
+            .step_all_ready(t0 + Duration::from_secs(60), &st(&[(1, Idle)]))
+            .is_empty());
+        let a = d.step_all_ready(t0 + Duration::from_secs(63), &st(&[(1, Idle)]));
         assert!(finish(&a).unwrap().0.is_empty());
     }
 
@@ -448,7 +509,8 @@ mod tests {
             t0 + Duration::from_secs(910),
             &st(&[(1, Working), (2, Idle)]),
         );
-        let a = d.step_all_ready(t0 + Duration::from_secs(950), &st(&[(1, Idle), (2, Idle)]));
+        d.step_all_ready(t0 + Duration::from_secs(950), &st(&[(1, Idle), (2, Idle)]));
+        let a = d.step_all_ready(t0 + Duration::from_secs(953), &st(&[(1, Idle), (2, Idle)]));
         let (i, _) = finish(&a).unwrap();
         assert_eq!(i, &HashSet::from([1]));
     }
@@ -484,7 +546,8 @@ mod tests {
         assert!(d
             .step_all_ready(t0 + Duration::from_secs(1), &st(&[(3, Working)]))
             .is_empty());
-        let a = d.step_all_ready(t0 + Duration::from_secs(30), &st(&[(3, Idle)]));
+        d.step_all_ready(t0 + Duration::from_secs(30), &st(&[(3, Idle)]));
+        let a = d.step_all_ready(t0 + Duration::from_secs(33), &st(&[(3, Idle)]));
         let (i, h) = finish(&a).unwrap();
         assert!(i.is_empty());
         assert!(h.contains_key(&3));
@@ -495,7 +558,10 @@ mod tests {
         let t0 = Instant::now();
         let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
         assert!(d.step_all_ready(t0, &st(&[(3, Working)])).is_empty());
-        let a = d.step_all_ready(t0 + Duration::from_secs(5), &st(&[(3, Idle)]));
+        assert!(d
+            .step_all_ready(t0 + Duration::from_secs(5), &st(&[(3, Idle)]))
+            .is_empty());
+        let a = d.step_all_ready(t0 + Duration::from_secs(8), &st(&[(3, Idle)]));
         assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
     }
 
@@ -529,17 +595,85 @@ mod tests {
         );
     }
 
+    /// codex 实测（2026-10-15）：请它写交接后，它会先说一句话、空闲一两秒、
+    /// 再去写；也会整轮都不显示「在忙」。所以光看忙闲不算写完：**交接文件
+    /// 出现了、并且连续空闲够 3 秒**才算。一直没写的等到兜底时限，记成被打断。
     #[test]
-    fn handoff_not_considered_written_in_the_same_breath() {
+    fn handoff_counts_as_written_only_once_the_file_exists_and_idle_settles() {
         let t0 = Instant::now();
+        let s = |secs: u64| t0 + Duration::from_secs(secs);
         let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
-        d.step_all_ready(t0, &st(&[(3, Idle)]));
-        // 屏幕还没来得及变忙
+        let no = |_: &Path| false;
+        let yes = |_: &Path| true;
+        let ready = |_: u32| true;
+        let a = d.step(t0, &st(&[(3, Idle)]), &ready, &no);
+        assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
+        // 忙了一下又闲下来、闲了很久，文件还没有：不算写完（以前 10 秒宽限后就算完）
+        d.step(s(1), &st(&[(3, Working)]), &ready, &no);
+        assert!(d.step(s(2), &st(&[(3, Idle)]), &ready, &no).is_empty());
+        assert!(d.step(s(30), &st(&[(3, Idle)]), &ready, &no).is_empty());
+        // 文件出现了，但它又在忙：不算
+        assert!(d.step(s(31), &st(&[(3, Working)]), &ready, &yes).is_empty());
+        // 文件在、刚闲下来：还要连续空闲 3 秒
+        assert!(d.step(s(32), &st(&[(3, Idle)]), &ready, &yes).is_empty());
+        assert!(d.step(s(34), &st(&[(3, Idle)]), &ready, &yes).is_empty());
+        let a = d.step(s(35), &st(&[(3, Idle)]), &ready, &yes);
+        let (i, h) = finish(&a).unwrap();
+        assert!(i.is_empty() && h.contains_key(&3));
+
+        // 从头到尾没写：等到兜底时限（15 + 3 分钟），记成被打断。
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        d.step(t0, &st(&[(3, Idle)]), &ready, &no);
+        assert!(d.step(s(900), &st(&[(3, Idle)]), &ready, &no).is_empty());
+        assert!(d.step(s(1079), &st(&[(3, Idle)]), &ready, &no).is_empty());
+        let a = d.step(s(1080), &st(&[(3, Idle)]), &ready, &no);
+        assert_eq!(finish(&a).unwrap().0, &HashSet::from([3]));
+    }
+
+    /// 一轮活中间短短一两秒的「空闲」不算停下：要连续空闲 3 秒。
+    #[test]
+    fn a_busy_session_must_stay_idle_for_three_seconds_to_count_as_stopped() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut d = Drain::new(vec![m(1, true)], None, cfg(), "/h".into(), t0);
+        d.step_all_ready(t0, &st(&[(1, Working)]));
+        assert!(d.step_all_ready(ms(1000), &st(&[(1, Idle)])).is_empty());
+        assert!(d.step_all_ready(ms(2500), &st(&[(1, Idle)])).is_empty());
+        // 又忙起来：重新计时
+        d.step_all_ready(ms(3000), &st(&[(1, Working)]));
+        assert!(d.step_all_ready(ms(3500), &st(&[(1, Idle)])).is_empty());
+        assert!(d.step_all_ready(ms(6000), &st(&[(1, Idle)])).is_empty());
+        assert!(finish(&d.step_all_ready(ms(6500), &st(&[(1, Idle)]))).is_some());
+    }
+
+    /// N3：接不回、空闲、却一直不能接按键的会话，不能把重启拖到兜底时限。
+    /// 等 60 秒就不请它写了：记成被打断，照常往下走。
+    #[test]
+    fn an_idle_session_that_never_gets_ready_is_given_up_after_a_minute() {
+        let t0 = Instant::now();
+        let s = |secs: u64| t0 + Duration::from_secs(secs);
+        let never = |_: u32| false;
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        assert!(d.step(t0, &st(&[(3, Idle)]), &never, &|_| true).is_empty());
         assert!(d
-            .step_all_ready(t0 + Duration::from_millis(500), &st(&[(3, Idle)]))
+            .step(s(59), &st(&[(3, Idle)]), &never, &|_| true)
             .is_empty());
-        // 10 秒还没变忙，当它不打算写了，算完
-        assert!(finish(&d.step_all_ready(t0 + Duration::from_secs(10), &st(&[(3, Idle)]))).is_some());
+        let a = d.step(s(60), &st(&[(3, Idle)]), &never, &|_| true);
+        assert!(!a.iter().any(|x| matches!(x, Action::AskHandoff { .. })));
+        let (i, h) = finish(&a).unwrap();
+        assert_eq!(i, &HashSet::from([3]));
+        assert!(h.is_empty());
+
+        // 中间忙起来过，就重新算：忙完才闲下来的不会立刻被放弃。
+        let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
+        d.step(t0, &st(&[(3, Idle)]), &never, &|_| true);
+        d.step(s(30), &st(&[(3, Working)]), &never, &|_| true);
+        d.step(s(70), &st(&[(3, Idle)]), &never, &|_| true);
+        assert!(d
+            .step(s(100), &st(&[(3, Idle)]), &never, &|_| true)
+            .is_empty());
+        let a = d.step(s(101), &st(&[(3, Idle)]), &|_| true, &|_| true);
+        assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
     }
 
     #[test]
@@ -618,7 +752,8 @@ mod tests {
             .is_empty());
         assert!(d.progress(t0 + Duration::from_secs(900)).nudged);
         // 硬时限前写完：正常结束，没被打断
-        let a = d.step_all_ready(t0 + Duration::from_secs(1000), &st(&[(3, Idle)]));
+        d.step_all_ready(t0 + Duration::from_secs(1000), &st(&[(3, Idle)]));
+        let a = d.step_all_ready(t0 + Duration::from_secs(1003), &st(&[(3, Idle)]));
         let (i, h) = finish(&a).unwrap();
         assert!(i.is_empty() && h.contains_key(&3));
         // 硬时限到了还没写完：算打断
@@ -635,7 +770,8 @@ mod tests {
         let a = d.step_all_ready(t0 + Duration::from_secs(900), &st(&[(3, Idle)]));
         assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
         d.step_all_ready(t0 + Duration::from_secs(901), &st(&[(3, Working)]));
-        let a = d.step_all_ready(t0 + Duration::from_secs(950), &st(&[(3, Idle)]));
+        d.step_all_ready(t0 + Duration::from_secs(950), &st(&[(3, Idle)]));
+        let a = d.step_all_ready(t0 + Duration::from_secs(953), &st(&[(3, Idle)]));
         assert!(finish(&a).unwrap().0.is_empty());
     }
 
@@ -654,9 +790,16 @@ mod tests {
     fn handoff_request_waits_until_the_session_is_ready() {
         let t0 = Instant::now();
         let mut d = Drain::new(vec![m(3, false)], None, cfg(), "/h".into(), t0);
-        assert!(d.step(t0, &st(&[(3, Idle)]), &|_| false).is_empty());
+        assert!(d
+            .step(t0, &st(&[(3, Idle)]), &|_| false, &|_| true)
+            .is_empty());
         assert_eq!(d.progress(t0).waiting, vec![3]);
-        let a = d.step(t0 + Duration::from_secs(4), &st(&[(3, Idle)]), &|_| true);
+        let a = d.step(
+            t0 + Duration::from_secs(4),
+            &st(&[(3, Idle)]),
+            &|_| true,
+            &|_| true,
+        );
         assert!(matches!(&a[..], [Action::AskHandoff { id: 3, .. }]));
     }
 
@@ -666,14 +809,31 @@ mod tests {
         let t0 = Instant::now();
         let mut d = Drain::new(vec![m(1, true)], None, cfg(), "/h".into(), t0);
         let t = t0 + Duration::from_secs(900);
-        assert!(d.step(t, &st(&[(1, Working)]), &|_| false).is_empty());
-        let a = d.step(t + Duration::from_secs(1), &st(&[(1, Working)]), &|_| true);
+        assert!(d
+            .step(t, &st(&[(1, Working)]), &|_| false, &|_| true)
+            .is_empty());
+        let a = d.step(
+            t + Duration::from_secs(1),
+            &st(&[(1, Working)]),
+            &|_| true,
+            &|_| true,
+        );
         assert_eq!(a, vec![Action::Nudge { id: 1 }]);
         // 只催一次
         assert!(d
-            .step(t + Duration::from_secs(2), &st(&[(1, Working)]), &|_| true)
+            .step(
+                t + Duration::from_secs(2),
+                &st(&[(1, Working)]),
+                &|_| true,
+                &|_| true
+            )
             .is_empty());
-        let a = d.step(t + Duration::from_secs(180), &st(&[(1, Working)]), &|_| true);
+        let a = d.step(
+            t + Duration::from_secs(180),
+            &st(&[(1, Working)]),
+            &|_| true,
+            &|_| true,
+        );
         assert_eq!(finish(&a).unwrap().0, &HashSet::from([1]));
     }
 

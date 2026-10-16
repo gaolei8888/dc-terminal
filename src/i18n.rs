@@ -2759,10 +2759,28 @@ pub mod msg {
                 lang,
                 en: format!(
                     "A message from another computer for the session in {dir} was held during the restart, \
-                     but the session never got ready to take it afterwards, so it was not delivered."
+                     but it could not be delivered afterwards."
                 ),
                 zh: format!(
-                    "重启时替 {dir} 的会话存着一条别的电脑发来的留言，重启后它一直没准备好，没送进去。"
+                    "重启时替 {dir} 的会话存着一条别的电脑发来的留言，重启后没能送进去。"
+                ),
+            ),
+            CancelNoteDropped { dir } => t!(
+                lang,
+                en: format!(
+                    "The session in {dir} could not be told that dct is not restarting after all. Please tell it to carry on yourself."
+                ),
+                zh: format!(
+                    "没能告诉 {dir} 的会话「dct 不重启了」，请手动告诉它接着做。"
+                ),
+            ),
+            HandoffMissing { dir } => t!(
+                lang,
+                en: format!(
+                    "The session in {dir} did not leave a handoff before the restart and its conversation could not be brought back, so it starts fresh. Please tell it what it was doing."
+                ),
+                zh: format!(
+                    "{dir} 的会话重启前没写成交接，原来的对话也接不回来，现在是新的对话。请告诉它之前在做什么。"
                 ),
             ),
             ResumeNoteDropped { dir } => t!(
@@ -3728,6 +3746,12 @@ mod tests {
                 dir: "/w/dc-terminal".into(),
             },
             HeldMessageDropped {
+                dir: "/w/dc-terminal".into(),
+            },
+            CancelNoteDropped {
+                dir: "/w/dc-terminal".into(),
+            },
+            HandoffMissing {
                 dir: "/w/dc-terminal".into(),
             },
         ];

@@ -3,7 +3,19 @@ command = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
 is_agent = true
 # 实测自 codex v0.146.0：干活时底部一定有「(12s • esc to interrupt)」。
 # 空闲时只有输入框占位符，用户一打字就没了，不能拿来当 idle_pattern。
-busy_pattern = "esc to interrupt"
+#
+# 2026-10-15 重测 codex v0.163.0（默认全屏模式和 `--no-alt-screen` 行内模式
+# 都测了，一轮活里每 0.4 秒截一次屏，截屏存在 tests/fixtures/codex-0.163/）：
+# - 「Working (…s • esc to interrupt)」大部分时间都在，但 agent 往屏幕上
+#   吐字的时候那一行会被正在吐的字顶掉，一次 0.4～1.2 秒；
+# - 刚开始干活的头两秒，底部那行（模型名 · 目录 · …）末尾有一个转圈的
+#   盲文点「· ⠸」，有时 esc 那行已经没了它还在；
+# - 干活时用户往输入框里打了字，底部那行变成「tab to queue message」。
+# 三个都算忙。转圈的点要连着前面的「· 」一起认：codex 启动画面的大 logo
+# 也是盲文点拼的，单认一个 ⠸ 会把空闲认成忙。
+# 剩下那 1 秒左右的空当没有任何标记，靠平稳重启那边「连续空闲 3 秒才算
+# 停下」兜住（`drain::IDLE_SETTLE`）。
+busy_pattern = "esc to interrupt|tab to queue|· [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
 
 [label]
 zh = "Codex"

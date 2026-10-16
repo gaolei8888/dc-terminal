@@ -1137,6 +1137,69 @@ mod tests {
             .is_match("(12s • esc to interrupt)"));
     }
 
+    /// codex v0.163.0 真截屏（2026-10-15，默认全屏和 `--no-alt-screen` 两种）：
+    /// 干活时的几种样子都要认成忙，空闲时（含启动 logo、输入框里有字）都不能。
+    #[test]
+    fn codex_busy_pattern_matches_real_v0_163_screens() {
+        let re = Profile::builtin("codex")
+            .unwrap()
+            .busy_regex()
+            .unwrap()
+            .unwrap();
+        let busy = [
+            (
+                "default-busy",
+                include_str!("../tests/fixtures/codex-0.163/default-busy.txt"),
+            ),
+            (
+                "default-busy-spinner-only",
+                include_str!("../tests/fixtures/codex-0.163/default-busy-spinner-only.txt"),
+            ),
+            (
+                "default-busy-typed",
+                include_str!("../tests/fixtures/codex-0.163/default-busy-typed.txt"),
+            ),
+            (
+                "inline-busy",
+                include_str!("../tests/fixtures/codex-0.163/inline-busy.txt"),
+            ),
+            (
+                "inline-busy-typed",
+                include_str!("../tests/fixtures/codex-0.163/inline-busy-typed.txt"),
+            ),
+        ];
+        let idle = [
+            (
+                "default-idle-start",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-start.txt"),
+            ),
+            (
+                "default-idle-done",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-done.txt"),
+            ),
+            (
+                "default-idle-typed",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-typed.txt"),
+            ),
+            (
+                "inline-idle-done",
+                include_str!("../tests/fixtures/codex-0.163/inline-idle-done.txt"),
+            ),
+            (
+                "inline-idle-typed",
+                include_str!("../tests/fixtures/codex-0.163/inline-idle-typed.txt"),
+            ),
+        ];
+        for (name, screen) in busy {
+            assert!(re.is_match(screen), "{name} 该认成忙");
+        }
+        for (name, screen) in idle {
+            assert!(!re.is_match(screen), "{name} 该认成空闲");
+        }
+        // 只剩「tab to queue message」那一行（esc 那行被顶掉的那一下）也算忙。
+        assert!(re.is_match("› half typed\n\n  tab to queue message"));
+    }
+
     /// **每个我们知道绕过参数的 agent，profile 里必须真的带着它。**
     ///
     /// 这不是风格问题。dct 敢让 agent 关掉所有权限确认，靠的是每轮之前那张
