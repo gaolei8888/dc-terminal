@@ -383,17 +383,28 @@ fn mouse_capture_transition(was_attached: bool, is_attached: bool) -> Option<boo
     }
 }
 
-/// 这一帧该不该抓鼠标。三个条件全真才抓。
+/// 这一帧该不该抓鼠标：在会话里、不在复制模式，而且滚轮有人接——
+/// agent 自己订阅了鼠标，或者它是内联的（不在备用屏上），历史在 dct 的
+/// 缓冲里、滚轮该由 dct 来翻。
+///
+/// 只剩「备用屏 + 不要鼠标」（less、vim 这类）不抓：终端会把滚轮转成上下
+/// 方向键送过去，它们正好拿方向键翻页；dct 抓了反而没东西可翻。
+///
+/// 2026-10-15 之前内联的会话也不抓，为的是保住终端原生的拖选复制；代价是
+/// 滚轮在 codex、shell 里被终端转成方向键，翻的是输入历史而不是整页。用户
+/// 选了「跟 Claude 会话一样：滚轮翻整页，复制先按 F4」（F4 一直写在底栏）。
 ///
 /// 抽成纯函数的理由同 `mouse_capture_transition`：副作用（往 stdout 写转义
-/// 序列）没法单测，判断能测——而且判断错了两个方向都难受：漏关，用户在会话里
-/// 连拖选复制都做不了；漏开，agent 收不到它明明订阅了的鼠标事件。
-///
-/// `agent_subscribed` 来自 `App.scroll.agent_owns`，**不新开一条判据**。
-/// 那个字段的语义就是「agent 自己攥着鼠标」，跟这里问的是同一个事实；
-/// 各读各的，迟早会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
-fn wants_mouse_capture(attached: bool, agent_subscribed: bool, copy_mode: bool) -> bool {
-    attached && agent_subscribed && !copy_mode
+/// 序列）没法单测，判断能测。`agent_subscribed` / `alt_screen` 都来自
+/// `App.scroll`，**不新开判据**——跟 `attach::wheel_action` 读同一份事实，
+/// 才不会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
+fn wants_mouse_capture(
+    attached: bool,
+    agent_subscribed: bool,
+    alt_screen: bool,
+    copy_mode: bool,
+) -> bool {
+    attached && !copy_mode && (agent_subscribed || !alt_screen)
 }
 
 /// 这一轮 `Screen` 请求的结果决定下一帧的 `app.scroll`：拿到新画面就用
@@ -1052,11 +1063,9 @@ pub fn run(
             }
         }
 
-        // 抓不抓鼠标不再只看「在不在会话里」：agent 没订阅鼠标的会话
-        // （codex、shell）里抓着它，唯一的效果是把终端的拖选复制废掉，
-        // 换来一个 PageUp/PageDown/End 已经能做的滚轮。
+        // 抓不抓鼠标不只看「在不在会话里」，判据见 `wants_mouse_capture`。
         //
-        // 检查一次三个条件的合取有没有变，而不是在每个能改变它们的分支
+        // 检查一次几个条件的合取有没有变，而不是在每个能改变它们的分支
         // 各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
         // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
         // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
@@ -1064,7 +1073,12 @@ pub fn run(
         // 的那一帧；而且这一轮的 `Screen` 响应已经落进 `app.scroll` 了，
         // `agent_owns` 就是这一帧的事实。
         let is_attached = matches!(app.view, View::Attached(_));
-        let want = wants_mouse_capture(is_attached, app.scroll.agent_owns, app.copy_mode);
+        let want = wants_mouse_capture(
+            is_attached,
+            app.scroll.agent_owns,
+            app.scroll.alt_screen,
+            app.copy_mode,
+        );
         if let Some(enable) = mouse_capture_transition(mouse_captured, want) {
             let _ = if enable {
                 execute!(std::io::stdout(), EnableMouseCapture)
@@ -5479,25 +5493,49 @@ is_agent = true
         assert_eq!(mouse_capture_transition(true, false), Some(false));
     }
 
-    /// 三个条件的真值表，八种组合全列。
+    /// 四个条件的真值表，十六种组合全列（逐行手写，不是拿同一个布尔式
+    /// 再算一遍——那样的测试永远不会红）。
     ///
-    /// 穷举而不是挑几个代表：这个函数错一格的后果是「用户在会话里复制不了」
-    /// 或者「agent 收不到它订阅的鼠标」，两种都不会 panic、不会报错，只会让人
-    /// 觉得工具坏了却说不清哪儿坏。八行断言比一句「应该没问题」便宜得多。
+    /// 错一格的后果是「用户在会话里复制不了」「滚轮翻不了整页」或者「agent
+    /// 收不到它订阅的鼠标」，都不会 panic、不会报错，只会让人觉得工具坏了。
     #[test]
-    fn mouse_is_captured_only_when_all_three_conditions_hold() {
-        // attached, agent_subscribed, copy_mode -> want
-        assert!(wants_mouse_capture(true, true, false));
-        assert!(!wants_mouse_capture(true, true, true), "复制模式一票否决");
+    fn mouse_capture_truth_table() {
+        // attached, agent_subscribed, alt_screen, copy_mode, want
+        let table = [
+            (true, true, true, false, true),
+            (true, true, true, true, false),
+            (true, true, false, false, true),
+            (true, true, false, true, false),
+            (true, false, true, false, false),
+            (true, false, true, true, false),
+            (true, false, false, false, true),
+            (true, false, false, true, false),
+            (false, true, true, false, false),
+            (false, true, true, true, false),
+            (false, true, false, false, false),
+            (false, true, false, true, false),
+            (false, false, true, false, false),
+            (false, false, true, true, false),
+            (false, false, false, false, false),
+            (false, false, false, true, false),
+        ];
+        for (attached, subscribed, alt, copy, want) in table {
+            assert_eq!(
+                wants_mouse_capture(attached, subscribed, alt, copy),
+                want,
+                "attached={attached} subscribed={subscribed} alt={alt} copy={copy}"
+            );
+        }
+        // 真实场景点名，读的人不用自己解布尔式：
+        assert!(wants_mouse_capture(true, true, true, false), "Claude Code");
         assert!(
-            !wants_mouse_capture(true, false, false),
-            "agent 不要鼠标就别抓——抓了用户就白白丢了拖选复制"
+            wants_mouse_capture(true, false, false, false),
+            "codex、shell：内联、不要鼠标——滚轮归 dct 翻整页"
         );
-        assert!(!wants_mouse_capture(true, false, true));
-        assert!(!wants_mouse_capture(false, true, false), "看板上永远不抓");
-        assert!(!wants_mouse_capture(false, true, true));
-        assert!(!wants_mouse_capture(false, false, false));
-        assert!(!wants_mouse_capture(false, false, true));
+        assert!(
+            !wants_mouse_capture(true, false, true, false),
+            "less、vim：备用屏、不要鼠标——终端把滚轮转成方向键给它们"
+        );
     }
 
     /// 断连（或者这一轮压根没拿到 `Response::Screen`）时，`app.scroll`
