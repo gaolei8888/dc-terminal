@@ -215,6 +215,12 @@ pub fn will_resume_by_id(r: &RecordedSession, profiles: &[crate::profile::Profil
 /// `--continue` 接到的就是兄弟的对话——两个格子写同一份对话，自己那段
 /// 反而丢了。没有 id 又用过的会话在准备重启时会被请去写交接（见
 /// `SessionManager::drain_resumable`），所以从空白开始也能接着干。
+///
+/// **例外：它比组里每一个兄弟都更晚被用过**（`last_active` 严格最大）。
+/// 那 `--continue` 接到的最近那段对话就是它自己的，照样带上。这一条是给
+/// 没经过排空的重启用的（崩溃、被杀、直接重启）：没人请它写过交接，从
+/// 空白开始就真丢了。`drain_resumable` 不跟着放宽：
+/// 排空时请它写一份交接，最坏只是重启后多收一句「先读交接」。
 pub fn continue_flags(
     sessions: &[RecordedSession],
     profiles: &[crate::profile::Profile],
@@ -228,6 +234,14 @@ pub fn continue_flags(
             by_id[j] && sessions[j].dir == sessions[i].dir && sessions[j].profile == sessions[i].profile
         })
     };
+    let newest_in_group = |i: usize| {
+        (0..sessions.len()).all(|j| {
+            j == i
+                || sessions[j].dir != sessions[i].dir
+                || sessions[j].profile != sessions[i].profile
+                || sessions[j].last_active < sessions[i].last_active
+        })
+    };
     let idx: Vec<usize> = (0..sessions.len())
         .filter(|&i| !by_id[i] && !sibling_has_id(i))
         .collect();
@@ -236,6 +250,11 @@ pub fn continue_flags(
     let mut out = vec![false; sessions.len()];
     for (k, &i) in idx.iter().enumerate() {
         out[i] = flags[k];
+    }
+    for i in 0..sessions.len() {
+        if !by_id[i] && sibling_has_id(i) && newest_in_group(i) {
+            out[i] = true;
+        }
     }
     out
 }
@@ -320,6 +339,37 @@ mod tests {
         assert_eq!(continue_flags(&[a.clone(), b], &profiles), vec![false, false]);
         // 没有兄弟时照旧接回
         assert_eq!(continue_flags(&[a], &profiles), vec![true]);
+    }
+
+    /// N8：没 id 的那条比组里每个兄弟（有 id 的、没 id 的）都更晚被用过，
+    /// `--continue` 接到的最近那段对话就是它自己的，照样带上。打平不算。
+    #[test]
+    fn the_newest_id_less_record_keeps_continue_even_beside_an_id_sibling() {
+        let mut b = rec("/w/x", "claude", 5);
+        b.conversation_id = Some("b".into());
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        let newest = rec("/w/x", "claude", 9);
+        let older = rec("/w/x", "claude", 3);
+        let elsewhere = rec("/w/y", "claude", 100);
+        assert_eq!(
+            continue_flags(
+                &[older.clone(), b.clone(), newest, elsewhere.clone()],
+                &profiles
+            ),
+            vec![false, false, true, true]
+        );
+        // 有 id 的兄弟更新：都不带
+        let mut b2 = b.clone();
+        b2.last_active = 10;
+        assert_eq!(
+            continue_flags(&[older.clone(), b2, rec("/w/x", "claude", 9)], &profiles),
+            vec![false, false, false]
+        );
+        // 跟兄弟打平：不算更新
+        assert_eq!(
+            continue_flags(&[rec("/w/x", "claude", 5), b], &profiles),
+            vec![false, false]
+        );
     }
 
     /// 记录里有 id，但 profile 已经不声明按 id 接回的参数了：id 没处用，

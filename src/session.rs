@@ -981,8 +981,9 @@ impl SessionManager {
 
     /// 准备重启时，这个会话算不算「重启后能接回自己的对话」——算的不用写交接。
     ///
+    /// - 一句话都没提交过：算，不管 profile 能不能按 id 接回。没有对话可丢，
+    ///   请它写交接是白打扰（一个开着没用过的 codex 也一样）。
     /// - profile 不能按 id 接回：不算（codex、opencode……）。
-    /// - 一句话都没提交过：算。没有对话可丢，请它写交接是白打扰。
     /// - 有对话 id：算。
     /// - 没 id（上次是靠 `--continue` 按目录接回来的）：只有同一个目录、同一个
     ///   profile 里没有带 id 的兄弟时才算——有的话重启后它从空白开始（见
@@ -999,10 +1000,13 @@ impl SessionManager {
         }) else {
             return false;
         };
+        if !submitted {
+            return true;
+        }
         if !by_id {
             return false;
         }
-        if !submitted || has_id {
+        if has_id {
             return true;
         }
         let snapshot: Vec<Arc<Mutex<Session>>> =
@@ -5339,6 +5343,29 @@ mod tests {
         mgr.send_input(b, "").unwrap();
         assert!(mgr.drain_resumable(b));
         assert!(!mgr.drain_resumable(a), "有带 id 的兄弟，A 重启后从空白开始");
+    }
+
+    /// N4：接不回对话的 profile（codex 这种）开着、一句话都没提交过：没有
+    /// 对话可丢，准备重启时不该请它写交接。提交过了才要。
+    #[test]
+    fn an_unused_session_of_an_unresumable_profile_needs_no_handoff() {
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
+                r#"
+                name = "no-resume"
+                command = ["/bin/sh", "-c", "sleep 30"]
+                is_agent = true
+                "#,
+            ))
+            .unwrap(),
+        );
+        let proj = init_repo();
+        let id = mgr.create(proj.path(), "no-resume", None, &[]).unwrap();
+        assert!(!mgr.resumes_by_id(id));
+        assert!(mgr.drain_resumable(id), "没提交过：不用写交接");
+        mgr.send_input(id, "").unwrap();
+        assert!(!mgr.drain_resumable(id), "提交过：接不回，要写交接");
     }
 
     /// C1：恢复时沿用记下来的编号；号被占了就发新号，之后新开的会话不会撞上。

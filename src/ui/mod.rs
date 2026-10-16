@@ -2055,13 +2055,6 @@ pub(crate) fn toggle_view_mode(app: &mut App) {
     }
 }
 
-/// 用户选的那个模式对应的视图。**所有「回看板」的地方都必须走这里。**
-///
-/// 硬编码 `View::Board` 的每一处都是一个「明明在九宫格里，某次操作完却被
-/// 甩回列表」的 bug——而且是偶发、复现不了的那种。
-///
-/// 顺带让两个模式对「当前是哪个会话」的认知保持一致：进九宫格时焦点落在
-/// 列表光标那一行。反方向由 `sync_board_cursor_from_grid` 负责。
 /// dct 重启过了，界面连上的是新后台：回到看板，说一句人话。
 ///
 /// 新后台尽量沿用原来的会话编号，但不保证（旧清单、编号撞了）。界面手里的
@@ -2081,6 +2074,13 @@ fn back_to_board_after_restart(app: &mut App) {
         crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang).into();
 }
 
+/// 用户选的那个模式对应的视图。**所有「回看板」的地方都必须走这里。**
+///
+/// 硬编码 `View::Board` 的每一处都是一个「明明在九宫格里，某次操作完却被
+/// 甩回列表」的 bug——而且是偶发、复现不了的那种。
+///
+/// 顺带让两个模式对「当前是哪个会话」的认知保持一致：进九宫格时焦点落在
+/// 列表光标那一行。反方向由 `sync_board_cursor_from_grid` 负责。
 pub(crate) fn home_view(app: &App) -> View {
     match app.view_mode {
         ViewMode::List => View::Board,
@@ -4095,8 +4095,6 @@ is_agent = true
         }
     }
 
-    /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
-    /// 一句“完成”或按键提示看，误以为守护进程还活着。这里不渲染像素，只检查
     /// C1：dct 重启过了，界面连上的是新后台——停在会话里的界面要回看板、
     /// 说一句人话、把跟旧会话有关的东西都放掉（尺寸要重新协商）。
     #[test]
@@ -4115,6 +4113,8 @@ is_agent = true
         assert!(!app.message.error);
     }
 
+    /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
+    /// 一句“完成”或按键提示看，误以为守护进程还活着。这里不渲染像素，只检查
     /// `draw()` 写进 buffer 的文字内容确实包含断连提示。
     #[test]
     fn disconnected_state_shows_warning_in_bottom_bar() {
