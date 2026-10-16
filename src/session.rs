@@ -584,7 +584,25 @@ struct Session {
     /// 影响「谁更该继续」判断准确性的地步——这条防抖只是为了压住毫无
     /// 实际工作的抖动帧，窗口要短得多。
     last_persisted: Option<Duration>,
+    /// 会话起来的时刻。dct 替用户打字（重启前后那几句话）至少要等它起来
+    /// 这么久，见 `SessionManager::ready_for_keys`。
+    spawned_at: Instant,
+    /// `tick()` 每一轮开头看到的状态，和它从什么时候起一直是这个状态。
+    /// 「连续空闲了多久」靠它算。
+    seen_state: SessionState,
+    state_since: Instant,
+    /// 状态说不清（`Unknown`）的会话：屏幕上次变化的时刻和那一屏的指纹。
+    /// 屏幕一段时间没动，才当它停下来了。
+    quiet_since: Instant,
+    screen_hash: u64,
 }
+
+/// 刚起来的会话，至少等这么久才替用户往里打字。
+const TYPE_AFTER_SPAWN: Duration = Duration::from_secs(5);
+/// 空闲至少连续这么久，才算真的停下来等人。
+const TYPE_AFTER_IDLE: Duration = Duration::from_secs(3);
+/// 状态说不清的会话：屏幕至少这么久没动，才当它停下来了。
+const TYPE_AFTER_QUIET: Duration = Duration::from_secs(5);
 
 /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
 /// 的形式在多个连接线程之间共享，而不需要一把包住整个 manager 的外层大锁。
@@ -680,6 +698,40 @@ pub struct SessionManager {
     /// 原子量：普通落盘要**拿着这把锁写完**，最后一次落盘才不会被一次早一步
     /// 开始、晚一步写完的普通落盘盖掉。
     last_sessions_frozen: Mutex<bool>,
+    /// 替用户打字前要等的那三段时间（起来多久、连续空闲多久、屏幕多久没动），
+    /// 见 `ready_for_keys`。只有测试会改它。
+    type_waits: Mutex<(Duration, Duration, Duration)>,
+    /// 这一次开机的编号，每次启动都不同（`Request::Instance`）。
+    instance: u64,
+    /// 刚重启、还在后台一个个接回上次的会话。这期间不接受再一次重启。
+    restoring: AtomicBool,
+}
+
+/// 每次启动都不同的一个数。拿不到系统随机数就退回「时间 × pid」，
+/// 同样足以分清前后两个后台。
+fn new_instance_id() -> u64 {
+    let mut b = [0u8; 8];
+    if getrandom::getrandom(&mut b).is_ok() {
+        return u64::from_le_bytes(b);
+    }
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    t ^ ((std::process::id() as u64) << 32)
+}
+
+/// 平稳重启最后一次落盘要带上的标记。普通落盘全是空的。
+#[derive(Debug, Default)]
+pub struct RestartMarks {
+    /// 被打断的会话。
+    pub interrupted: HashSet<u32>,
+    /// 写了交接文件的会话 → 文件。
+    pub handoffs: HashMap<u32, PathBuf>,
+    /// 敲 `dct restart` 的那个会话。
+    pub initiator: Option<u32>,
+    /// 还没送进去的多电脑留言，按会话。
+    pub held: HashMap<u32, Vec<String>>,
 }
 
 /// 统一处理锁中毒：某个持锁线程如果 panic 过一次，我们选择拿到里面的数据继续跑，
@@ -705,11 +757,34 @@ impl SessionManager {
         self.draining.load(Ordering::SeqCst)
     }
 
+    /// 这一次开机的编号，见 `instance` 字段。
+    pub fn instance_id(&self) -> u64 {
+        self.instance
+    }
+
+    /// 开/关「还在接回上次的会话」，见 `restoring` 字段。
+    pub fn set_restoring(&self, on: bool) {
+        self.restoring.store(on, Ordering::SeqCst);
+    }
+
+    pub fn is_restoring(&self) -> bool {
+        self.restoring.load(Ordering::SeqCst)
+    }
+
+    /// 测试用：把 `ready_for_keys` 要等的三段时间改短，不用每条测试干等五秒。
+    #[cfg(test)]
+    pub fn set_type_waits_for_test(&self, spawn: Duration, idle: Duration, quiet: Duration) {
+        *recover(self.type_waits.lock()) = (spawn, idle, quiet);
+    }
+
     pub fn new() -> Self {
         SessionManager {
             next_id: AtomicU32::new(1),
             draining: AtomicBool::new(false),
             last_sessions_frozen: Mutex::new(false),
+            type_waits: Mutex::new((TYPE_AFTER_SPAWN, TYPE_AFTER_IDLE, TYPE_AFTER_QUIET)),
+            instance: new_instance_id(),
+            restoring: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),
@@ -858,40 +933,126 @@ impl SessionManager {
     /// 跟 `journal` 一样，这是一份可以随时重建的状态缓存，不是用户数据，
     /// 没必要因为一次写盘失败就让 `create`/`stop` 这些请求本身也报错。
     pub(crate) fn persist_last_sessions(&self) {
-        self.persist_last_sessions_with(&HashSet::new(), &HashMap::new());
+        self.persist_last_sessions_with(&RestartMarks::default());
     }
 
-    /// 同 `persist_last_sessions`，多带两样平稳重启才有的东西：哪些会话是
-    /// 被打断的（`interrupted`），哪些写了交接文件（`handoffs`）。不在这两个
-    /// 集合里的会话照常记，标记为空。清单冻着（见 `last_sessions_frozen`）
+    /// 同 `persist_last_sessions`，多带平稳重启才有的标记（见 `RestartMarks`）。
+    /// 不在标记里的会话照常记，标记为空。清单冻着（见 `last_sessions_frozen`）
     /// 时什么都不做。
-    pub fn persist_last_sessions_with(
-        &self,
-        interrupted: &HashSet<u32>,
-        handoffs: &HashMap<u32, PathBuf>,
-    ) {
+    pub fn persist_last_sessions_with(&self, marks: &RestartMarks) {
         let frozen = recover(self.last_sessions_frozen.lock());
         if *frozen {
             return;
         }
-        self.write_last_sessions(interrupted, handoffs);
+        self.write_last_sessions(marks);
     }
 
     /// 平稳重启的最后一次落盘：写完就把清单冻住，直到进程退出（或交接
     /// 失败、`unfreeze_last_sessions` 解冻）。
-    pub fn persist_final_last_sessions(
-        &self,
-        interrupted: &HashSet<u32>,
-        handoffs: &HashMap<u32, PathBuf>,
-    ) {
+    pub fn persist_final_last_sessions(&self, marks: &RestartMarks) {
         let mut frozen = recover(self.last_sessions_frozen.lock());
-        self.write_last_sessions(interrupted, handoffs);
+        self.write_last_sessions(marks);
         *frozen = true;
+    }
+
+    /// 平稳重启最后一步：清单写完之后，把还活着的会话一个个立刻停掉，
+    /// 再让旧后台退出。不靠进程退出时的挂断信号：新后台会按**同一个对话
+    /// id** 接回，侥幸没死的旧 agent（或者它起的子进程）会跟新的一起往同一
+    /// 份对话里写。清单已经冻住，这里停掉的会话不会再改写它。
+    pub fn kill_all_now(&self) {
+        let snapshot: Vec<Arc<Mutex<Session>>> =
+            recover(self.sessions.lock()).values().cloned().collect();
+        for arc in snapshot {
+            let mut s = recover(arc.lock());
+            if s.state != SessionState::Stopped {
+                s.stopped_by_request = true;
+                let _ = s.pty.kill_now();
+                s.state = SessionState::Stopped;
+            }
+        }
+    }
+
+    /// 恢复会话之前先把记下来的编号都让出来：恢复期间用户新开的会话从
+    /// `max + 1` 往上发号，不跟马上要接回来的会话撞号。
+    pub fn reserve_ids_up_to(&self, max: u32) {
+        self.next_id
+            .fetch_max(max.saturating_add(1), Ordering::SeqCst);
+    }
+
+    /// 准备重启时，这个会话算不算「重启后能接回自己的对话」——算的不用写交接。
+    ///
+    /// - profile 不能按 id 接回：不算（codex、opencode……）。
+    /// - 一句话都没提交过：算。没有对话可丢，请它写交接是白打扰。
+    /// - 有对话 id：算。
+    /// - 没 id（上次是靠 `--continue` 按目录接回来的）：只有同一个目录、同一个
+    ///   profile 里没有带 id 的兄弟时才算——有的话重启后它从空白开始（见
+    ///   `last_sessions::continue_flags`），所以要请它写交接。
+    pub fn drain_resumable(&self, id: u32) -> bool {
+        let Ok((by_id, submitted, has_id, dir, profile)) = self.with_session(id, |s| {
+            Ok((
+                s.profile.resumes_by_id(),
+                s.submitted,
+                s.conversation_id.is_some(),
+                s.dir.clone(),
+                s.profile.name.clone(),
+            ))
+        }) else {
+            return false;
+        };
+        if !by_id {
+            return false;
+        }
+        if !submitted || has_id {
+            return true;
+        }
+        let snapshot: Vec<Arc<Mutex<Session>>> =
+            recover(self.sessions.lock()).values().cloned().collect();
+        !snapshot.iter().any(|arc| {
+            let o = recover(arc.lock());
+            o.id != id
+                && o.state != SessionState::Stopped
+                && o.dir == dir
+                && o.profile.name == profile
+                && o.submitted
+                && o.conversation_id.is_some()
+        })
     }
 
     /// 重启没交出去、照常运行下去：清单恢复正常落盘。
     pub fn unfreeze_last_sessions(&self) {
         *recover(self.last_sessions_frozen.lock()) = false;
+    }
+
+    /// 现在能不能替用户往这个会话里打字（重启前后 dct 自己要说的那几句）。
+    ///
+    /// agent 刚起来的那几秒，屏幕可能已经像在等人了，键盘却还没被它接管：
+    /// 这时打进去的字和回车会被终端攒着、变样，或者被 agent 启动时清掉
+    /// （codex 上实测过：字躺在输入框里没发出去，或者干脆没了）。所以要同时满足：
+    /// - 起来至少 5 秒；
+    /// - 终端已经交给 agent 了（`PtySession::accepts_keys`）；
+    /// - 空闲的，要连续空闲至少 3 秒；状态说不清的，要屏幕至少 5 秒没动。
+    ///   在忙的不看这一条——催它停下那句本来就是打给在忙的会话的。
+    ///
+    /// 会话不在了答「不能」。
+    pub fn ready_for_keys(&self, id: u32) -> bool {
+        let (after_spawn, after_idle, after_quiet) = *recover(self.type_waits.lock());
+        self.with_session(id, |s| {
+            let now = Instant::now();
+            if now.saturating_duration_since(s.spawned_at) < after_spawn || !s.pty.accepts_keys() {
+                return Ok(false);
+            }
+            Ok(match s.state {
+                SessionState::Idle => {
+                    s.seen_state == SessionState::Idle
+                        && now.saturating_duration_since(s.state_since) >= after_idle
+                }
+                SessionState::Unknown => {
+                    now.saturating_duration_since(s.quiet_since) >= after_quiet
+                }
+                _ => true,
+            })
+        })
+        .unwrap_or(false)
     }
 
     /// 这个会话的 profile 能不能按对话 id 接回（`Profile::resumes_by_id`）。
@@ -901,15 +1062,20 @@ impl SessionManager {
             .unwrap_or(false)
     }
 
-    fn write_last_sessions(&self, interrupted: &HashSet<u32>, handoffs: &HashMap<u32, PathBuf>) {
+    fn write_last_sessions(&self, marks: &RestartMarks) {
         let Some(path) = recover(self.last_sessions_path.lock()).clone() else {
             return;
         };
-        let snapshot: Vec<Arc<Mutex<Session>>> =
-            recover(self.sessions.lock()).values().cloned().collect();
+        // 按编号排好：文件里的顺序就是重启后发号的兜底顺序，不能跟着
+        // HashMap 的桶序乱跳。
+        let mut snapshot: Vec<(u32, Arc<Mutex<Session>>)> = recover(self.sessions.lock())
+            .iter()
+            .map(|(id, a)| (*id, a.clone()))
+            .collect();
+        snapshot.sort_by_key(|(id, _)| *id);
         let records: Vec<crate::last_sessions::RecordedSession> = snapshot
             .iter()
-            .filter_map(|arc| {
+            .filter_map(|(_, arc)| {
                 let s = recover(arc.lock());
                 if s.state == SessionState::Stopped {
                     return None;
@@ -933,8 +1099,11 @@ impl SessionManager {
                     } else {
                         None
                     },
-                    interrupted: interrupted.contains(&s.id),
-                    handoff: handoffs.get(&s.id).cloned(),
+                    interrupted: marks.interrupted.contains(&s.id),
+                    handoff: marks.handoffs.get(&s.id).cloned(),
+                    id: Some(s.id),
+                    restart_initiator: marks.initiator == Some(s.id),
+                    held_messages: marks.held.get(&s.id).cloned().unwrap_or_default(),
                 })
             })
             .collect();
@@ -973,7 +1142,7 @@ impl SessionManager {
         secret: Option<&str>,
         profiles: &[Profile],
     ) -> Result<u32> {
-        self.create_inner(dir, profile_name, secret, profiles, false, None, None)
+        self.create_inner(dir, profile_name, secret, profiles, false, None, None, None)
     }
 
     /// `create()` 的姐妹方法：多一个 `resume` 开关，守护进程重启后恢复
@@ -1026,6 +1195,35 @@ impl SessionManager {
             resume,
             restore_tag,
             conversation,
+            None,
+        )
+    }
+
+    /// 同 `create_resuming`，另外尽量沿用记下来的会话编号 `want_id`（重启前
+    /// 的「3 号」重启后还是 3 号）。号已经被占了、或者是 0，就照常发新号。
+    /// 调用方先用 `reserve_ids_up_to` 把记下来的号都让出来，恢复期间新开的
+    /// 会话才不会抢走它们。
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        &self,
+        dir: &Path,
+        profile_name: &str,
+        secret: Option<&str>,
+        profiles: &[Profile],
+        resume: bool,
+        restore_tag: Option<&str>,
+        conversation: Option<&str>,
+        want_id: Option<u32>,
+    ) -> Result<u32> {
+        self.create_inner(
+            dir,
+            profile_name,
+            secret,
+            profiles,
+            resume,
+            restore_tag,
+            conversation,
+            want_id,
         )
     }
 
@@ -1073,6 +1271,7 @@ impl SessionManager {
         resume: bool,
         restore_tag: Option<&str>,
         conversation: Option<&str>,
+        want_id: Option<u32>,
     ) -> Result<u32> {
         let profile = self.resolve_profile(profile_name, profiles)?;
 
@@ -1094,7 +1293,16 @@ impl SessionManager {
 
         // 原子分配 id：即便后面的慢操作失败，这个 id 也不会被复用给另一次并发的
         // create() ——避免两个同时进行的 create() 撞到同一个 worktree 分支名。
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        //
+        // 恢复时想沿用旧编号：号没被占才用，并且把 `next_id` 推到它后面，
+        // 以后发的新号不会再撞上它。
+        let id = match want_id {
+            Some(w) if w > 0 && !recover(self.sessions.lock()).contains_key(&w) => {
+                self.next_id.fetch_max(w.saturating_add(1), Ordering::SeqCst);
+                w
+            }
+            _ => self.next_id.fetch_add(1, Ordering::SeqCst),
+        };
 
         // 以下全是慢操作（可能牵扯好几个 git 子进程），刻意不持有任何锁：
         // 这个新会话在插入 `sessions` 之前，对其它请求完全不可见，
@@ -1250,6 +1458,11 @@ impl SessionManager {
             last_notified: None,
             last_active: std::time::SystemTime::now(),
             last_persisted: None,
+            spawned_at: Instant::now(),
+            seen_state: state,
+            state_since: Instant::now(),
+            quiet_since: Instant::now(),
+            screen_hash: 0,
         };
 
         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
@@ -1383,7 +1596,16 @@ impl SessionManager {
                     Err(_) => checkpoint_failed = true,
                 }
             }
-            recover(arc.lock()).state = SessionState::Working;
+            {
+                // 有忙/闲标记的才翻成「干活中」，之后由 `tick()` 按屏幕翻回来。
+                // 没有标记的会话（qwen 这种）`tick()` 永远不碰它的状态——在这里
+                // 翻成 Working 就再也翻不回来了，看板会一直说它在忙，平稳重启
+                // 也会把它当成在忙的会话干等、再催一句。它该一直是 Unknown。
+                let mut g = recover(arc.lock());
+                if g.idle_re.is_some() || g.busy_re.is_some() {
+                    g.state = SessionState::Working;
+                }
+            }
 
             {
                 let mut g = recover(arc.lock());
@@ -1595,6 +1817,24 @@ impl SessionManager {
             let mut s = recover(s.lock());
             if s.state == SessionState::Stopped {
                 continue;
+            }
+            // 上一轮定下的状态在这里记一笔：状态只在 `tick()` 里变，所以每轮
+            // 开头看一眼就不会漏掉任何一次变化（最多晚 200ms，只会让「连续
+            // 空闲多久」算得更保守）。
+            let now = Instant::now();
+            if s.state != s.seen_state {
+                s.seen_state = s.state;
+                s.state_since = now;
+            }
+            if s.state == SessionState::Unknown {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                s.pty.screen_text().hash(&mut h);
+                let h = h.finish();
+                if h != s.screen_hash {
+                    s.screen_hash = h;
+                    s.quiet_since = now;
+                }
             }
             if !s.pty.is_alive() {
                 // **这一轮是回收子进程的最后机会。** 下一轮 tick 会在上面那个
@@ -4124,7 +4364,7 @@ mod tests {
         let conv = mgr.conversation_of(id).unwrap();
         // 提交过一句话才记 id（见 `unsubmitted_session_records_no_conversation_id`）。
         mgr.send_input(id, "").unwrap();
-        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
+        mgr.persist_last_sessions_with(&RestartMarks::default());
 
         // 普通落盘：带 id，不带标记。
         let recs = crate::last_sessions::load(&record_path);
@@ -4133,10 +4373,12 @@ mod tests {
         assert!(!recs[0].interrupted);
         assert_eq!(recs[0].handoff, None);
 
-        let interrupted: std::collections::HashSet<u32> = [id].into_iter().collect();
-        let handoffs: HashMap<u32, PathBuf> =
-            [(id, PathBuf::from("/tmp/h.md"))].into_iter().collect();
-        mgr.persist_last_sessions_with(&interrupted, &handoffs);
+        let marks = RestartMarks {
+            interrupted: [id].into_iter().collect(),
+            handoffs: [(id, PathBuf::from("/tmp/h.md"))].into_iter().collect(),
+            ..Default::default()
+        };
+        mgr.persist_last_sessions_with(&marks);
 
         let recs = crate::last_sessions::load(&record_path);
         assert_eq!(recs.len(), 1);
@@ -4163,12 +4405,12 @@ mod tests {
 
         // 只打字不回车也不算提交。
         mgr.send_input(id, "hello").unwrap();
-        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
+        mgr.persist_last_sessions_with(&RestartMarks::default());
         let recs = crate::last_sessions::load(&record_path);
         assert_eq!(recs[0].conversation_id, None, "没提交过不该记 id");
 
         mgr.send_input(id, "").unwrap();
-        mgr.persist_last_sessions_with(&Default::default(), &HashMap::new());
+        mgr.persist_last_sessions_with(&RestartMarks::default());
         let recs = crate::last_sessions::load(&record_path);
         assert_eq!(recs[0].conversation_id.as_deref(), Some(conv.as_str()));
     }
@@ -4992,5 +5234,177 @@ mod tests {
             assert!(Instant::now() < deadline, "真正干完一轮活该震一次手机");
             sleep(Duration::from_millis(20));
         }
+    }
+
+    /// I1：dct 替用户打字之前，会话要起来够久、终端已经交给 agent（不在行
+    /// 模式）、并且连续空闲够久。codex 刚起来时屏幕看着空闲、键盘却还没被它
+    /// 接管，那时打进去的回车会变成「换行」或者被吞掉。
+    #[test]
+    #[cfg(unix)]
+    fn ready_for_keys_waits_for_settle_raw_mode_and_steady_idle() {
+        let mk = |name: &str, script: &str| {
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(&format!(
+                r#"
+                name = "{name}"
+                command = ["/bin/sh", "-c", '{script}', "sh"]
+                is_agent = false
+                idle_pattern = "IDLE"
+                "#
+            )))
+            .unwrap()
+        };
+        let mgr = SessionManager::new();
+        mgr.set_type_waits_for_test(
+            Duration::from_millis(400),
+            Duration::from_millis(400),
+            Duration::from_millis(400),
+        );
+        mgr.register_profile(mk("raw-idle", "stty -icanon; printf IDLE; cat"));
+        mgr.register_profile(mk("line-idle", "printf IDLE; cat"));
+        let dir = tempfile::tempdir().unwrap();
+        let raw = mgr.create(dir.path(), "raw-idle", None, &[]).unwrap();
+        let line = mgr.create(dir.path(), "line-idle", None, &[]).unwrap();
+
+        // 刚起来：谁都不行。
+        mgr.tick();
+        assert!(!mgr.ready_for_keys(raw));
+        assert!(!mgr.ready_for_keys(line));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr.ready_for_keys(raw) {
+            assert!(Instant::now() < deadline, "切成按键模式、空闲够久之后该能打字");
+            mgr.tick();
+            sleep(Duration::from_millis(50));
+        }
+        assert_eq!(state_of(&mgr, raw), SessionState::Idle);
+        assert_eq!(state_of(&mgr, line), SessionState::Idle);
+        assert!(
+            !mgr.ready_for_keys(line),
+            "一直停在行模式的终端，屏幕再像空闲也不能打"
+        );
+
+        // 忙起来又停下：空闲要重新攒够。
+        mgr.with_session(raw, |s| {
+            s.state = SessionState::Working;
+            Ok(())
+        })
+        .unwrap();
+        mgr.tick();
+        mgr.with_session(raw, |s| {
+            s.state = SessionState::Idle;
+            Ok(())
+        })
+        .unwrap();
+        mgr.tick();
+        assert!(!mgr.ready_for_keys(raw), "刚从忙变闲，还不够久");
+    }
+
+    /// 没有忙/闲标记的会话按回车之后还是「说不清」，不会被永远钉在「干活中」。
+    #[test]
+    fn enter_keeps_a_pattern_less_session_unknown() {
+        let mgr = SessionManager::new();
+        let mut p = fake_agent();
+        p.name = "plain".into();
+        p.idle_pattern = None;
+        mgr.register_profile(p);
+        let dir = init_repo();
+        let id = mgr.create(dir.path(), "plain", None, &[]).unwrap();
+        assert_eq!(state_of(&mgr, id), SessionState::Unknown);
+        mgr.send_input(id, "hi").unwrap();
+        let _ = mgr.send_input(id, "");
+        assert_eq!(state_of(&mgr, id), SessionState::Unknown);
+    }
+
+    /// I2：上次靠 `--continue` 接回来、没有 id 的会话，同目录里有带 id 的兄弟
+    /// 时，重启后会从空白开始——准备重启时要请它写交接。
+    #[test]
+    fn drain_resumable_follows_what_the_next_restart_can_bring_back() {
+        let mgr = SessionManager::new();
+        mgr.register_profile(echo_id_profile());
+        let proj = tempfile::tempdir().unwrap();
+        // A：靠 --continue 接回来的，没有 id
+        let a = mgr
+            .create_resuming(proj.path(), "echo-id", None, &[], true, None, None)
+            .unwrap();
+        assert_eq!(mgr.conversation_of(a), None);
+        // 没提交过：没东西可丢
+        assert!(mgr.drain_resumable(a));
+        mgr.send_input(a, "").unwrap();
+        // 用过、没兄弟：下次照样 --continue
+        assert!(mgr.drain_resumable(a));
+        // B：同目录、有 id、用过
+        let b = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+        assert!(mgr.drain_resumable(b), "没提交过的 B 本身没东西可丢");
+        assert!(mgr.drain_resumable(a), "B 还没提交过，不记 id，不挡 A");
+        mgr.send_input(b, "").unwrap();
+        assert!(mgr.drain_resumable(b));
+        assert!(!mgr.drain_resumable(a), "有带 id 的兄弟，A 重启后从空白开始");
+    }
+
+    /// C1：恢复时沿用记下来的编号；号被占了就发新号，之后新开的会话不会撞上。
+    #[test]
+    fn restore_reuses_saved_ids_and_falls_back_on_collision() {
+        let mgr = SessionManager::new();
+        mgr.register_profile(echo_id_profile());
+        let proj = tempfile::tempdir().unwrap();
+        mgr.reserve_ids_up_to(7);
+        let a = mgr
+            .restore(proj.path(), "echo-id", None, &[], false, None, None, Some(7))
+            .unwrap();
+        assert_eq!(a, 7);
+        let b = mgr
+            .restore(proj.path(), "echo-id", None, &[], false, None, None, Some(3))
+            .unwrap();
+        assert_eq!(b, 3);
+        let c = mgr
+            .restore(proj.path(), "echo-id", None, &[], false, None, None, Some(7))
+            .unwrap();
+        assert_eq!(c, 8, "7 号已经有了：发新号");
+        let d = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+        assert_eq!(d, 9);
+
+        // 恢复期间用户新开的会话：从让出来的号后面发，不抢马上要接回来的号。
+        let mgr = SessionManager::new();
+        mgr.register_profile(echo_id_profile());
+        mgr.reserve_ids_up_to(3);
+        let user = mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+        assert_eq!(user, 4);
+        let back = mgr
+            .restore(proj.path(), "echo-id", None, &[], false, None, None, Some(1))
+            .unwrap();
+        assert_eq!(back, 1);
+    }
+
+    /// C1：落盘按编号排好、带着编号；同一个后台里落两次，顺序不变。
+    #[test]
+    fn persisted_records_carry_ids_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("last-sessions.toml");
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(path.clone());
+        mgr.register_profile(echo_id_profile());
+        let proj = tempfile::tempdir().unwrap();
+        for _ in 0..5 {
+            mgr.create(proj.path(), "echo-id", None, &[]).unwrap();
+        }
+        let ids: Vec<Option<u32>> = crate::last_sessions::load(&path)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+    }
+
+    /// M4：最后一步把所有会话立刻停掉。
+    #[test]
+    fn kill_all_now_stops_every_session() {
+        let mgr = SessionManager::new();
+        mgr.register_profile(fake_agent());
+        let dir = init_repo();
+        let a = mgr.create(dir.path(), "fake", None, &[]).unwrap();
+        let b = mgr.create(dir.path(), "fake", None, &[]).unwrap();
+        mgr.kill_all_now();
+        assert_eq!(state_of(&mgr, a), SessionState::Stopped);
+        assert_eq!(state_of(&mgr, b), SessionState::Stopped);
+        assert_eq!(mgr.exited_on_its_own(a), Some(false));
     }
 }

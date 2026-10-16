@@ -121,9 +121,12 @@ fn log_swap_failure(socket: &Path, reason: &str) {
     }
 }
 
+/// 平稳重启后新后台最多等它多久开始应答。新后台一起来就应答（会话在它
+/// 后台慢慢接回），这里留足余量给慢机器。
+pub const NEW_DAEMON_HELLO_WAIT: Duration = Duration::from_secs(30);
+
 /// `dct __swap` 的本体：等旧后台走（最多 `grace`，超时硬杀），起新后台，
-/// 等它真能应答且协议号对上（最多 10 秒——比 `restart_daemon` 的 5 秒长，
-/// 因为新后台要先把所有会话接回来才开始应答）。失败写 daemon.log。
+/// 等它真能应答且协议号对上（最多 `NEW_DAEMON_HELLO_WAIT`）。失败写 daemon.log。
 pub fn swap_daemon(old_pid: u32, socket: &Path, exe: &Path, grace: Duration) -> Result<()> {
     if old_pid != 0 {
         wait_old_gone(old_pid, grace);
@@ -132,7 +135,7 @@ pub fn swap_daemon(old_pid: u32, socket: &Path, exe: &Path, grace: Duration) -> 
         log_swap_failure(socket, "新的后台没能启动，请手动再启动一次 dct。");
         return Err(e);
     }
-    let up = wait_up_to(Duration::from_secs(10), || {
+    let up = wait_up_to_every(NEW_DAEMON_HELLO_WAIT, Duration::from_millis(250), || {
         Client::connect(socket)
             .ok()
             .and_then(|mut c| c.protocol())
@@ -151,13 +154,22 @@ fn process_alive(pid: u32) -> bool {
     crate::sys::proc::alive(pid)
 }
 
-pub(crate) fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait_up_to(limit: Duration, cond: impl FnMut() -> bool) -> bool {
+    wait_up_to_every(limit, Duration::from_millis(50), cond)
+}
+
+/// 同 `wait_up_to`，自己定多久问一次。
+pub(crate) fn wait_up_to_every(
+    limit: Duration,
+    every: Duration,
+    mut cond: impl FnMut() -> bool,
+) -> bool {
     let deadline = std::time::Instant::now() + limit;
     while std::time::Instant::now() < deadline {
         if cond() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(every);
     }
     cond()
 }
@@ -171,6 +183,13 @@ pub(crate) fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> boo
 pub struct Client {
     socket: PathBuf,
     conn: Option<Conn>,
+    /// 守着「后台是不是换了一个」（`guard_instance` 打开）：记着连上的那个
+    /// 后台的开机编号。
+    instance: Option<u64>,
+    guard: bool,
+    /// 重连上的是另一个后台了，还没被 `take_new_daemon` 取走。这期间所有
+    /// 请求一律不发：手里的会话编号指的已经不是原来那些会话了。
+    new_daemon: bool,
 }
 
 struct Conn {
@@ -183,9 +202,38 @@ impl Client {
         let mut c = Client {
             socket: socket.to_path_buf(),
             conn: None,
+            instance: None,
+            guard: false,
+            new_daemon: false,
         };
         c.reconnect()?;
         Ok(c)
+    }
+
+    /// 打开「后台换没换」的看守（界面用）。之后每次断线重连，都先问一句
+    /// 开机编号；跟原来的不一样，就不发这次请求、报错，直到调用方用
+    /// `take_new_daemon` 认领这件事。
+    ///
+    /// 为什么要它：重启之后新后台按自己的顺序给会话编号，界面手里的「7 号」
+    /// 可能已经是另一个项目里的另一个 agent——用户接着打的字和回车会落到
+    /// 那里去。
+    pub fn guard_instance(&mut self) {
+        self.guard = true;
+        if self.instance.is_none() {
+            self.instance = self.ask_instance();
+        }
+    }
+
+    /// 重连上的是不是另一个后台（问一次就清掉）。
+    pub fn take_new_daemon(&mut self) -> bool {
+        std::mem::take(&mut self.new_daemon)
+    }
+
+    fn ask_instance(&mut self) -> Option<u64> {
+        match self.try_call(&Request::Instance) {
+            Ok(Response::Instance { id }) => Some(id),
+            _ => None,
+        }
     }
 
     fn reconnect(&mut self) -> Result<()> {
@@ -221,10 +269,30 @@ impl Client {
         crate::sys::ipc::peer_pid_of(stream, &self.socket)
     }
 
-    pub fn call(&mut self, req: Request) -> Result<Response> {
-        if self.conn.is_none() {
-            self.reconnect()?;
+    /// 手里没有连接就重连；开着看守的话，重连上之后先认一认是不是同一个后台。
+    fn ensure_conn(&mut self) -> Result<()> {
+        let refused = || crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding);
+        if self.new_daemon {
+            return Err(refused());
         }
+        if self.conn.is_some() {
+            return Ok(());
+        }
+        self.reconnect()?;
+        if self.guard {
+            let now = self.ask_instance();
+            if self.instance.is_some() && now != self.instance {
+                self.instance = now;
+                self.new_daemon = true;
+                return Err(refused());
+            }
+            self.instance = self.instance.or(now);
+        }
+        Ok(())
+    }
+
+    pub fn call(&mut self, req: Request) -> Result<Response> {
+        self.ensure_conn()?;
         match self.try_call(&req) {
             Ok(resp) => Ok(resp),
             Err(e) => {
@@ -240,9 +308,7 @@ impl Client {
     /// 请求用（`MeshLogin` 要去网关换令牌、`MeshJoin` 要问别的电脑）：
     /// `READ_TIMEOUT` 是按「守护进程在本机答一句」定的，五秒不够。
     pub fn call_within(&mut self, req: Request, timeout: Duration) -> Result<Response> {
-        if self.conn.is_none() {
-            self.reconnect()?;
-        }
+        self.ensure_conn()?;
         if let Some(c) = &self.conn {
             c.reader.get_ref().set_read_timeout(Some(timeout))?;
         }
@@ -301,5 +367,67 @@ mod swap_tests {
 
         let pid = spawn_reaped("0.1");
         assert!(wait_old_gone(pid, Duration::from_secs(5)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod instance_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn start_daemon(sock: &Path) {
+        let (s, m) = (
+            sock.to_path_buf(),
+            Arc::new(crate::session::SessionManager::new()),
+        );
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run_with_manager(&s, m);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Client::connect(sock).is_err() {
+            assert!(std::time::Instant::now() < deadline, "后台没起来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// C1：重启之后界面自己重连上的是另一个后台，手里的「7 号」已经不是原来
+    /// 那个会话。看守打开时，重连上新后台的那次请求**不发出去**、报错，等
+    /// 界面认领（`take_new_daemon`）之后才照常发。
+    #[test]
+    fn a_reconnect_to_a_new_daemon_is_refused_until_acknowledged() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        start_daemon(&sock);
+        let mut c = Client::connect(&sock).unwrap();
+        c.guard_instance();
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
+
+        // 同一个后台，断了重连：照常。
+        c.conn = None;
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
+        assert!(!c.take_new_daemon());
+
+        // 换一个后台占住同一个 socket，再断一次。
+        std::fs::remove_file(&sock).unwrap();
+        start_daemon(&sock);
+        c.conn = None;
+        assert!(c.call(Request::List).is_err(), "新后台上的第一句不能发出去");
+        assert!(c.call(Request::List).is_err(), "认领之前一直不发");
+        assert!(c.take_new_daemon());
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
+        assert!(!c.take_new_daemon());
+    }
+
+    /// 没打开看守的连接（CLI 用的）照旧：重连上谁就跟谁说话。
+    #[test]
+    fn without_the_guard_reconnects_are_transparent() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        start_daemon(&sock);
+        let mut c = Client::connect(&sock).unwrap();
+        std::fs::remove_file(&sock).unwrap();
+        start_daemon(&sock);
+        c.conn = None;
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
     }
 }

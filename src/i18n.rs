@@ -514,6 +514,12 @@ pub enum Key {
     RestartSwapping,
     /// 旧后台已经走了，新的却没起来。
     RestartNewDaemonNotUp,
+    /// 在会话里敲的 `dct restart`：这个会话的对话重启后接不回来，先自己写交接。
+    RestartInitiatorUnresumable,
+    /// `dct restart --cancel`：现在没在准备重启。
+    RestartNothingToCancel,
+    /// 界面重连上的是一个新起的后台：回到看板。
+    DaemonRestartedBackToBoard,
     // —— 守护进程重启后，问要不要接回上次的会话 ——
     ResumeSessionsExplain,
     ResumeSessionsAsk,
@@ -1181,6 +1187,23 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             zh: "新的后台没起来，原因看 ~/.dct/daemon.log；\n\
                  再敲一次 `dct` 会照常起后台、接回会话。",
         ),
+        RestartInitiatorUnresumable => t!(
+            lang,
+            en: "Note: this session's conversation will not come back after the restart. If you have unfinished work, \
+                 write yourself a handoff first (what you are doing, how far you got, the next step), then restart.",
+            zh: "注意：这个会话的对话重启后接不回来。要是手上还有没做完的事，先自己写一份交接\
+                 （在做什么、做到哪了、下一步）再重启。",
+        ),
+        RestartNothingToCancel => t!(
+            lang,
+            en: "dct is not getting ready to restart, so there is nothing to cancel.",
+            zh: "dct 现在没在准备重启，不用取消",
+        ),
+        DaemonRestartedBackToBoard => t!(
+            lang,
+            en: "dct restarted, so session numbers may have changed. You are back on the board.",
+            zh: "dct 重启过了，会话编号可能变了，已经回到看板",
+        ),
         ResumeSessionsExplain => t!(
             lang,
             en: "The background service was not running. Before, it had these sessions open:",
@@ -1596,6 +1619,52 @@ pub mod msg {
             zh: format!(
                 "会先等正在干活的会话停下（最多 {minutes} 分钟），再重启；\n\
                  重启后每个会话接回原来的对话。"
+            ),
+        )
+    }
+
+    /// 在会话里敲的 `dct restart`：命令交给后台就退出，不在这里干等——agent
+    /// 跑命令有时限，等久了会被它自己掐掉。
+    pub fn restart_handed_off(lang: Lang, minutes: u64) -> String {
+        if minutes == 0 {
+            return t!(
+                lang,
+                en: "dct will restart right away. This session will be told when the restart is done; \
+                     you don't need to run it again."
+                    .to_string(),
+                zh: "重启已经交给 dct 了，马上就重启；重启完会告诉这个会话，不用再敲一次。".to_string(),
+            );
+        }
+        t!(
+            lang,
+            en: format!(
+                "dct will restart once the other sessions have stopped (up to {minutes} min). \
+                 This session will be told when the restart is done; you don't need to wait or run it again.\n\
+                 To call it off: dct restart --cancel"
+            ),
+            zh: format!(
+                "重启已经交给 dct 了：等别的会话停下（最多 {minutes} 分钟）就重启，\
+                 重启完会告诉这个会话，不用在这里等，也不用再敲一次。\n\
+                 要取消：dct restart --cancel"
+            ),
+        )
+    }
+
+    /// 取消了重启。`who` 是已经被请去写交接或者催过停下的会话（名字或编号），
+    /// dct 会再告诉它们接着做。
+    pub fn restart_cancelled_told(lang: Lang, who: &[String]) -> String {
+        if who.is_empty() {
+            return text(Key::RestartDrainCancelled, lang).to_string();
+        }
+        t!(
+            lang,
+            en: format!(
+                "Cancelled. Nothing changed. {} had already been asked to stop or write a handoff; dct will tell them to carry on.",
+                who.join(", ")
+            ),
+            zh: format!(
+                "已取消，一切照旧。{} 已经被请去停下或写交接，dct 会告诉它们接着做。",
+                who.join("、")
             ),
         )
     }
@@ -2099,6 +2168,11 @@ pub mod msg {
                 lang,
                 en: format!("{cmd} would not start — it may be installed incorrectly"),
                 zh: format!("启动不了 {cmd}，它可能装坏了"),
+            ),
+            StillRestoring => t!(
+                lang,
+                en: "dct has just restarted and is still bringing sessions back. Try again in a moment".to_string(),
+                zh: "dct 刚重启，还在接回会话，过一会儿再试".to_string(),
             ),
             RestartPending => t!(
                 lang,
@@ -2681,6 +2755,16 @@ pub mod msg {
                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
                 )
             }
+            HeldMessageDropped { dir } => t!(
+                lang,
+                en: format!(
+                    "A message from another computer for the session in {dir} was held during the restart, \
+                     but the session never got ready to take it afterwards, so it was not delivered."
+                ),
+                zh: format!(
+                    "重启时替 {dir} 的会话存着一条别的电脑发来的留言，重启后它一直没准备好，没送进去。"
+                ),
+            ),
             ResumeNoteDropped { dir } => t!(
                 lang,
                 en: format!(
@@ -3283,6 +3367,9 @@ mod tests {
             RestartDrainAborted,
             RestartSwapping,
             RestartNewDaemonNotUp,
+            RestartInitiatorUnresumable,
+            RestartNothingToCancel,
+            DaemonRestartedBackToBoard,
             ResumeSessionsExplain,
             ResumeSessionsAsk,
             ResumeSessionsWillContinue,
@@ -3344,7 +3431,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 219, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 222, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
@@ -3408,6 +3495,7 @@ mod tests {
             OperationFailed(crate::proto::Operation::ReadClipboard),
             CannotStart("claude".into()),
             DaemonNotResponding,
+            StillRestoring,
             RestartPending,
             Mesh(crate::proto::MeshProblem::NotLoggedIn),
             Mesh(crate::proto::MeshProblem::NoDcAccount),
@@ -3637,6 +3725,9 @@ mod tests {
                 reason: crate::proto::SessionResumeSkipReason::ConversationGone,
             },
             ResumeNoteDropped {
+                dir: "/w/dc-terminal".into(),
+            },
+            HeldMessageDropped {
                 dir: "/w/dc-terminal".into(),
             },
         ];

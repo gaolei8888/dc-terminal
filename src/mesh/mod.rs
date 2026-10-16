@@ -158,6 +158,16 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    /// 排着队、还没送进去的留言（整句，带来源标记），按会话。平稳重启最后
+    /// 一次落盘时抄一份记下来，重启后照常送。
+    pub fn held_texts(&self) -> HashMap<u32, Vec<String>> {
+        self.queues
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(id, q)| (*id, q.iter().map(|m| m.text.clone()).collect()))
+            .collect()
+    }
+
     /// `name` 是这台电脑想叫的名字；名单里已经有我，就以名单里那条记录为准
     /// （`added_at` 之类的字段是签进名单里的，自己另编一份就对不上了）。
     pub fn new(keys: MachineKeys, name: String, roster: Option<SignedRoster>) -> Mesh {
@@ -680,6 +690,19 @@ mod tests {
         let q = &b.queues[&7];
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].msg, m);
+    }
+
+    /// I8：平稳重启最后一次落盘时抄一份排着的留言（整句、按会话），
+    /// 队列本身不动——重启没交出去的话还得照常送。
+    #[test]
+    fn held_texts_copies_the_queues_without_taking_them() {
+        let (a, mut b, _) = pair_ab();
+        b.on_envelope(&sealed_env(&a, &b, &msg(&a, &b, Kind::Msg, "m1", NOW)))
+            .unwrap();
+        let held = b.held_texts();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[&7], vec![b.queues[&7][0].text.clone()]);
+        assert_eq!(b.queues[&7].len(), 1, "只抄不取");
     }
 
     #[test]

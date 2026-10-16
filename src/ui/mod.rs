@@ -552,6 +552,10 @@ pub fn run(
     let browser = std::env::var_os("DCW_PUBLIC_URL").is_some();
     let mut previous_theme = None;
     let follow_agent_theme = std::env::var_os("NO_COLOR").is_none();
+    let mut client = client;
+    // 看着「后台是不是换了一个」：重启之后会话编号指的是另一批会话了，
+    // 见 `back_to_board_after_restart`。
+    client.guard_instance();
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
     // 用户存过的配色。没存过就留在 `App::new` 给的默认档，跟 `load_view_mode`
     // 那边一样：「盘上没有可用的选择」由调用方定默认，settings 只管读写。
@@ -576,6 +580,11 @@ pub fn run(
     // 已经覆盖了这个函数里所有别的 `continue`，不用因为加了一个标签
     // 就把它们全部改成 `continue 'main`。
     'main: loop {
+        // 重连上的是一个新起的后台（dct 重启过了）：手里的会话编号已经不算数，
+        // 先回看板。这之前那一次请求已经被 `Client` 拦下、没有发出去。
+        if app.client.as_mut().is_some_and(|c| c.take_new_daemon()) {
+            back_to_board_after_restart(&mut app);
+        }
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
         if let Some(rx) = &app.verify_rx {
@@ -2053,6 +2062,25 @@ pub(crate) fn toggle_view_mode(app: &mut App) {
 ///
 /// 顺带让两个模式对「当前是哪个会话」的认知保持一致：进九宫格时焦点落在
 /// 列表光标那一行。反方向由 `sync_board_cursor_from_grid` 负责。
+/// dct 重启过了，界面连上的是新后台：回到看板，说一句人话。
+///
+/// 新后台尽量沿用原来的会话编号，但不保证（旧清单、编号撞了）。界面手里的
+/// 「7 号」要是已经换成了另一个项目里的另一个 agent，接着打的字和回车就会
+/// 落到那里去——所以不管停在哪一屏，都回看板重新拉一遍名单，让用户自己再
+/// 点进去。
+fn back_to_board_after_restart(app: &mut App) {
+    app.view = home_view(app);
+    app.need_sessions = true;
+    app.sent_size = None;
+    app.screen.clear();
+    app.grid_screens.clear();
+    app.grid_page = None;
+    app.explained_failure = None;
+    app.drain = None;
+    app.message =
+        crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang).into();
+}
+
 pub(crate) fn home_view(app: &App) -> View {
     match app.view_mode {
         ViewMode::List => View::Board,
@@ -4069,6 +4097,24 @@ is_agent = true
 
     /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
     /// 一句“完成”或按键提示看，误以为守护进程还活着。这里不渲染像素，只检查
+    /// C1：dct 重启过了，界面连上的是新后台——停在会话里的界面要回看板、
+    /// 说一句人话、把跟旧会话有关的东西都放掉（尺寸要重新协商）。
+    #[test]
+    fn a_new_daemon_sends_the_ui_back_to_the_board() {
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.sent_size = Some((1, 24, 80));
+        app.need_sessions = false;
+        back_to_board_after_restart(&mut app);
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(app.sent_size, None);
+        assert!(app.need_sessions);
+        assert_eq!(
+            app.message.text,
+            crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang)
+        );
+        assert!(!app.message.error);
+    }
+
     /// `draw()` 写进 buffer 的文字内容确实包含断连提示。
     #[test]
     fn disconnected_state_shows_warning_in_bottom_bar() {

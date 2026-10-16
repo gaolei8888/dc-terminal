@@ -240,6 +240,37 @@ pub(crate) fn submit_unchecked(
     mgr.send_input(id, "")
 }
 
+/// dct 自己要说的话（重启前后那几句）打一次：只打一次，**绝不重打**。
+/// 字进去了、回车没成，就是 `Sent::Partial`——再打一遍字会叠在输入框里
+/// 已经躺着的那一份后面，所以调用方不许再试。
+pub(crate) fn submit_once(
+    mgr: &crate::session::SessionManager,
+    id: u32,
+    text: &str,
+) -> crate::resume_notes::Sent {
+    if !text.is_empty() && mgr.send_input(id, text).is_err() {
+        return crate::resume_notes::Sent::No;
+    }
+    // 只有快照没拍上的那一种错，回车已经发出去了，算送到（同 `mesh::deliver::typed_from`）。
+    sent_after_enter(
+        !text.is_empty(),
+        crate::mesh::deliver::typed_from(mgr.send_input(id, "")),
+    )
+}
+
+/// 字已经打进去（`typed_text`）之后，回车那一下的结果算成哪一种。
+fn sent_after_enter(
+    typed_text: bool,
+    enter: std::result::Result<crate::mesh::deliver::Typed, String>,
+) -> crate::resume_notes::Sent {
+    use crate::resume_notes::Sent;
+    match enter {
+        Ok(_) => Sent::Yes,
+        Err(_) if typed_text => Sent::Partial,
+        Err(_) => Sent::No,
+    }
+}
+
 impl SessionWriter for crate::session::SessionManager {
     fn type_into(&self, id: u32, text: &str) -> std::result::Result<(), String> {
         // 跟 `ui/grid.rs::send_reply` 同一个两步约定，**顺序、拆分都不能
@@ -3892,18 +3923,32 @@ mod tests {
         let writer: &dyn SessionWriter = &mgr;
         writer.type_into(id, "你好").unwrap();
 
+        // `cat` 在行模式里：终端先回显一遍，按了回车 `cat` 才读到这一行、
+        // 再印一遍。出现两次 = 回车真的发出去了。
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let state = mgr.list().into_iter().find(|s| s.id == id).map(|s| s.state);
-            if state == Some(crate::session::SessionState::Working) {
+            let text = mgr.screen_text_for_test(id);
+            if text.matches("你好").count() >= 2 {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "type_into 必须真的按回车，状态该推进到 Working，实际 {state:?}"
+                "type_into 必须真的按回车，不能只是敲进输入框：{text:?}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// 字进去了、回车没成 = Partial（不许重打）；什么都没进去 = No（可以再试）；
+    /// 只是快照没拍上 = 送到了。
+    #[test]
+    fn sent_after_enter_never_calls_a_half_send_retryable() {
+        use crate::mesh::deliver::Typed;
+        use crate::resume_notes::Sent;
+        assert_eq!(sent_after_enter(true, Ok(Typed::Submitted)), Sent::Yes);
+        assert_eq!(sent_after_enter(true, Ok(Typed::NoCheckpoint)), Sent::Yes);
+        assert_eq!(sent_after_enter(true, Err("x".into())), Sent::Partial);
+        assert_eq!(sent_after_enter(false, Err("x".into())), Sent::No);
     }
 
     /// `/ls`：报一遍此刻在等的会话，没名字的退回编号。

@@ -14,12 +14,24 @@ use std::process::Command;
 ///
 /// 所以进程退出有死线，读输出也有死线，超了就带着诊断 panic。
 fn run_with_home(home: &std::path::Path, args: &[&str]) -> (String, String, i32) {
+    run_with_home_env(home, args, &[])
+}
+
+/// 同 `run_with_home`，多带几个环境变量。`DCT_SESSION_ID` 一律先摘掉：跑测试的
+/// 人自己可能就在一个 dct 会话里，那个编号不该漏进被测的命令。
+fn run_with_home_env(
+    home: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, i32) {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_dct"))
         .args(args)
         .env("HOME", home)
+        .env_remove("DCT_SESSION_ID")
+        .envs(envs.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -470,6 +482,88 @@ mod restart {
 
         let after = current_pid(&d.sock()).expect("重启之后连不上守护进程");
         assert_ne!(before, after, "pid 没变，等于什么都没换");
+    }
+
+    /// `dct restart --cancel` 在没准备重启的时候：说一句「不用取消」，什么都不动。
+    #[test]
+    fn restart_cancel_without_a_drain_changes_nothing() {
+        let d = Guard::start();
+        let before = current_pid(&d.sock()).unwrap();
+        let (out, err, code) = d.run(&["restart", "--cancel"]);
+        assert_eq!(code, 0, "stdout：{out} stderr：{err}");
+        assert!(!out.trim().is_empty(), "得说一句话");
+        assert_eq!(current_pid(&d.sock()).unwrap(), before);
+    }
+
+    /// I4 + I6 + C1：在会话里敲的 `dct restart`（带着 `DCT_SESSION_ID`）把重启
+    /// 交给后台就走，不在那里等；后台用 CLI 自己这个二进制起新后台；新后台
+    /// 把会话接回来时还用原来的编号。
+    #[test]
+    fn restart_from_inside_a_session_hands_off_and_keeps_session_numbers() {
+        use dct::proto::{Request, Response};
+        let d = Guard::start();
+        let before = current_pid(&d.sock()).unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let mut c = dct::client::Client::connect(&d.sock()).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            match c
+                .call(Request::Create {
+                    dir: proj.path().display().to_string(),
+                    profile: "shell".into(),
+                    remember: false,
+                })
+                .unwrap()
+            {
+                Response::Created { id } => ids.push(id),
+                other => panic!("开不了会话：{other:?}"),
+            }
+        }
+        // 停掉中间那个：剩下的是 1 号和 3 号，按顺序重新发号的话 3 号会变成 2 号。
+        c.call(Request::Stop { id: ids[1] }).unwrap();
+        c.call(Request::Prune).unwrap();
+        drop(c);
+        let me = ids[0].to_string();
+
+        let started = Instant::now();
+        let (out, err, code) = super::run_with_home_env(
+            d.home.path(),
+            &["restart", "-y"],
+            &[("DCT_SESSION_ID", me.as_str())],
+        );
+        assert_eq!(code, 0, "stdout：{out} stderr：{err}");
+        assert!(
+            out.contains("dct restart --cancel"),
+            "要说清楚怎么取消：{out}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "交给后台就该走，不在这里等"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let after = loop {
+            if let Some(p) = current_pid(&d.sock()).filter(|p| *p != before) {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "新后台一直没起来");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_ne!(after, before);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut c = dct::client::Client::connect(&d.sock()).unwrap();
+            if let Ok(Response::Sessions(v)) = c.call(Request::List) {
+                let mut got: Vec<u32> = v.iter().map(|s| s.id).collect();
+                got.sort();
+                if got.len() == 2 {
+                    assert_eq!(got, vec![ids[0], ids[2]], "编号该跟重启前一样");
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "会话没接回来");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// **没人在场的时候默认不动。** stdin 是空的（`output()` 给的就是关掉的

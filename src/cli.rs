@@ -345,6 +345,8 @@ pub enum Restart {
         /// 催过之后再等多少秒（`--nudge-wait <分钟>`）
         nudge_wait_s: u64,
     },
+    /// `--cancel`：取消正在准备的重启
+    Cancel,
     /// 参数不对
     Usage(String),
 }
@@ -364,6 +366,8 @@ pub fn parse_restart_args(args: &[String], lang: Lang) -> Restart {
         match a.as_str() {
             "-y" | "--yes" => ask = false,
             "--now" => now = true,
+            // 只认单独一个 `--cancel`：跟别的参数混着写说明没想清楚要干什么。
+            "--cancel" if args.len() == 1 => return Restart::Cancel,
             flag @ ("--wait" | "--nudge-wait") => {
                 let secs = it
                     .next()
@@ -556,6 +560,7 @@ pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result
             eprintln!("{msg}");
             return Ok(Restarted::Exit(2));
         }
+        Restart::Cancel => return Ok(Restarted::Exit(cancel_restart(sock, lang))),
         Restart::Run {
             ask,
             now,
@@ -633,27 +638,135 @@ pub fn run_restart(sock: &Path, exe: &Path, lang: Lang, args: Restart) -> Result
         };
     }
 
-    let names: std::collections::HashMap<u32, String> = live
-        .iter()
-        .filter(|s| !s.tag.trim().is_empty())
-        .map(|s| (s.id, s.tag.clone()))
-        .collect();
-    let initiator = initiator_from(std::env::var(crate::session::SESSION_ID_ENV).ok());
-    Ok(Restarted::Exit(drain_and_swap(
-        c,
-        sock,
-        lang,
-        Request::Drain {
-            wait_s,
-            nudge_wait_s,
-            initiator,
-        },
-        &names,
-    )))
+    let names = session_names(&live);
+    // 只认这个后台里真有的会话：从别处带进来的 `DCT_SESSION_ID`（比如在会话
+    // 里开的编辑器、另一个家目录的测试）不算发起者。
+    let initiator = initiator_from(std::env::var(crate::session::SESSION_ID_ENV).ok())
+        .filter(|me| live.iter().any(|s| s.id == *me));
+    let drain = Request::Drain {
+        wait_s,
+        nudge_wait_s,
+        initiator,
+        now,
+        exe: Some(exe.display().to_string()),
+    };
+    if let Some(me) = initiator {
+        // 在会话里敲的：这个会话的对话要是接不回来，现在就说一声，让它先自己
+        // 写交接。只看 profile 声明的能力，不认名字。
+        if initiator_unresumable(sock, &live, me) {
+            println!("{}", text(Key::RestartInitiatorUnresumable, lang));
+        }
+        return Ok(Restarted::Exit(hand_off(c, lang, drain, wait_s + nudge_wait_s)));
+    }
+    Ok(Restarted::Exit(drain_and_swap(c, sock, lang, drain, &names, now)))
 }
 
-/// 新后台最多等多久：小进程自己最多等旧后台 10 秒、等新后台 10 秒。
-const NEW_DAEMON_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// 会话编号 → 名字（起过名字的）。进度和取消的话里用它称呼会话。
+fn session_names(live: &[SessionInfo]) -> std::collections::HashMap<u32, String> {
+    live.iter()
+        .filter(|s| !s.tag.trim().is_empty())
+        .map(|s| (s.id, s.tag.clone()))
+        .collect()
+}
+
+/// 敲命令的会话（`me`）的 profile 声明不了「按 id 接回对话」：重启后它的
+/// 对话回不来。认不出来就当能接回，不吓人。
+fn initiator_unresumable(sock: &Path, live: &[SessionInfo], me: u32) -> bool {
+    let Some(profile) = live.iter().find(|s| s.id == me).map(|s| s.profile.clone()) else {
+        return false;
+    };
+    let (all, _) = crate::profile::all_profiles(&crate::profile::profiles_dir_for_socket(sock));
+    all.iter()
+        .find(|p| p.name == profile)
+        .or(crate::profile::Profile::builtin(&profile).as_ref())
+        .is_some_and(|p| p.is_agent && !p.resumes_by_id())
+}
+
+/// 在会话里敲的 `dct restart`：把重启交给后台就走，不在这里等。
+///
+/// 这个命令多半是 agent 替用户跑的，而 agent 跑命令有时限（常见是 2 分钟）：
+/// 守在这里等别的会话停下，时限一到 CLI 被掐掉。后台对带着发起者的重启
+/// 不看租约（`DrainCtl::drive`），所以 CLI 走了重启照样进行，重启完这个会话会
+/// 收到一句「重启已经完成了」。
+fn hand_off(mut c: Client, lang: Lang, drain: Request, wait_s: u64) -> i32 {
+    match c.call(drain) {
+        Ok(Response::DrainProgress { active: true, .. }) => {
+            println!(
+                "{}",
+                crate::i18n::msg::restart_handed_off(lang, wait_s.div_ceil(60))
+            );
+            0
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("{}", crate::i18n::msg::error(lang, &e));
+            1
+        }
+        _ => {
+            eprintln!("{}", text(Key::RestartDrainAborted, lang));
+            1
+        }
+    }
+}
+
+/// `dct restart --cancel`：取消正在准备的重启。返回退出码。
+fn cancel_restart(sock: &Path, lang: Lang) -> i32 {
+    let Some(mut c) = connect(sock) else {
+        println!("{}", text(Key::RestartNothingToCancel, lang));
+        return 0;
+    };
+    if plan_for(c.protocol()) == Plan::Plain {
+        println!("{}", text(Key::RestartNothingToCancel, lang));
+        return 0;
+    }
+    match c.call(Request::DrainStatus { renew: false }) {
+        Ok(Response::DrainProgress { active: true, .. }) => {}
+        _ => {
+            println!("{}", text(Key::RestartNothingToCancel, lang));
+            return 0;
+        }
+    }
+    let live: Vec<SessionInfo> = match c.call(Request::List) {
+        Ok(Response::Sessions(v)) => v,
+        _ => Vec::new(),
+    };
+    match c.call(Request::DrainCancel) {
+        Ok(Response::DrainCancelled { told }) => {
+            println!("{}", cancelled_line(&told, &session_names(&live), lang));
+            0
+        }
+        Ok(Response::DrainProgress { .. }) => {
+            println!("{}", text(Key::RestartCancelTooLate, lang));
+            1
+        }
+        _ => {
+            eprintln!("{}", text(Key::RequestFailed, lang));
+            1
+        }
+    }
+}
+
+/// 「已取消」那一句，点名已经被请去停下或写交接的会话。
+fn cancelled_line(
+    told: &[u32],
+    names: &std::collections::HashMap<u32, String>,
+    lang: Lang,
+) -> String {
+    let who: Vec<String> = told
+        .iter()
+        .map(|id| match names.get(id) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => crate::i18n::msg::session_number(lang, *id),
+        })
+        .collect();
+    crate::i18n::msg::restart_cancelled_told(lang, &who)
+}
+
+/// 新后台最多等多久：小进程自己最多等旧后台 10 秒（再加 2 秒硬杀），等新
+/// 后台应答 30 秒（`client::NEW_DAEMON_HELLO_WAIT`）。新后台一起来就应答，
+/// 会话在它后台慢慢接回，所以这个数跟会话多少无关。
+const NEW_DAEMON_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+/// 等新后台时多久问一次。每问一次要连两回 socket，不用问得太勤。
+const SWAP_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// 后台连着几次答不上话（又确认它还活着），就不再干等。
 const MAX_SILENT_POLLS: u32 = 3;
 
@@ -674,6 +787,9 @@ enum DrainEnd {
 ///
 /// `old_gone`：能确认旧后台已经退出时为 `true`。认不出 pid 的平台上传
 /// 「恒为 `true`」——连不上的时候也只能当它换掉了。
+///
+/// `quiet`（`--now`）：不印进度——什么都不等，「还在等 N 个会话，剩 0 秒」
+/// 只会让人以为它在等。
 #[allow(clippy::too_many_arguments)]
 fn drain_loop<W: std::io::Write>(
     call: &mut dyn FnMut(Request) -> Result<Response>,
@@ -684,6 +800,7 @@ fn drain_loop<W: std::io::Write>(
     out: &mut ProgressOut<W>,
     names: &std::collections::HashMap<u32, String>,
     lang: Lang,
+    quiet: bool,
 ) -> DrainEnd {
     use std::sync::atomic::Ordering;
 
@@ -698,7 +815,9 @@ fn drain_loop<W: std::io::Write>(
                 ..
             }) => {
                 silent = 0;
-                out.show(&progress, names, lang);
+                if !quiet {
+                    out.show(&progress, names, lang);
+                }
             }
             // 不在排空了，却不是我们取消的：要么旧后台已经换掉（错过了
             // `done` 那一下，答话的是新后台），要么后台自己撤了（租约过期、
@@ -745,9 +864,9 @@ fn drain_loop<W: std::io::Write>(
         }
         if cancel.swap(false, Ordering::SeqCst) {
             match call(Request::DrainCancel) {
-                Ok(Response::Ok) => {
+                Ok(Response::DrainCancelled { told }) => {
                     out.finish();
-                    println!("{}", text(Key::RestartDrainCancelled, lang));
+                    println!("{}", cancelled_line(&told, names, lang));
                     return DrainEnd::Cancelled;
                 }
                 // 已经开始落盘，取消不了：说一声，接着等它换完。
@@ -766,30 +885,21 @@ fn drain_loop<W: std::io::Write>(
 
 /// 平稳重启的后半截：等会话停下（`drain_loop`），然后等新后台起来。
 /// 返回退出码。
-///
-/// 要是这条命令是在某个 dct 会话里敲的，旧后台一退出这个进程多半也跟着
-/// 没了——那是预期的，剩下的事脱离出去的 `dct __swap` 会做完。
 fn drain_and_swap(
     mut c: Client,
     sock: &Path,
     lang: Lang,
     drain: Request,
     names: &std::collections::HashMap<u32, String>,
+    quiet: bool,
 ) -> i32 {
-    // 旧后台的 pid：确认「答话的是新的」靠它——旧后台在退出前还会留两秒，
-    // 那时它答 `Hello` 的协议号也对得上。两种情况都算旧的走了：进程没了，
-    // 或者 socket 那头已经换成了别的 pid（旧进程可能还没被回收，比如它是
-    // 某个还没 `wait` 的父进程的子进程，探活会一直说它在）。
-    let old_pid = c.peer_pid();
-    let old_gone = move || {
-        old_pid.is_none_or(|p| {
-            !crate::sys::proc::alive(p)
-                || Client::connect(sock)
-                    .ok()
-                    .and_then(|c| c.peer_pid())
-                    .is_some_and(|now| now != p)
-        })
+    // 认出「答话的已经是新后台了」：旧后台在退出前还会留两秒，那时它答
+    // `Hello` 的协议号也对得上。认法见 `OldDaemon::gone`。
+    let old = OldDaemon {
+        pid: c.peer_pid(),
+        instance: instance_of(&mut c),
     };
+    let old_gone = || old.gone(sock);
     let ctrl_c = crate::sys::signal::catch_ctrl_c();
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let mut out = ProgressOut::new(std::io::stdout(), tty);
@@ -803,6 +913,7 @@ fn drain_and_swap(
         &mut out,
         names,
         lang,
+        quiet,
     );
     out.finish();
     match end {
@@ -812,7 +923,13 @@ fn drain_and_swap(
     }
     drop(c);
     println!("{}", text(Key::RestartSwapping, lang));
-    let up = crate::client::wait_up_to(NEW_DAEMON_WAIT, || {
+    // 这时候已经取消不了：按 Ctrl+C 说一声（只说一次），接着等。
+    let mut told_too_late = false;
+    let up = crate::client::wait_up_to_every(NEW_DAEMON_WAIT, SWAP_POLL, || {
+        if ctrl_c.swap(false, std::sync::atomic::Ordering::SeqCst) && !told_too_late {
+            told_too_late = true;
+            println!("{}", text(Key::RestartCancelTooLate, lang));
+        }
         old_gone()
             && Client::connect(sock)
                 .ok()
@@ -825,6 +942,47 @@ fn drain_and_swap(
     } else {
         eprintln!("{}", text(Key::RestartNewDaemonNotUp, lang));
         1
+    }
+}
+
+/// 后台这次开机的编号（`Request::Instance`）。答不上就是 `None`。
+fn instance_of(c: &mut Client) -> Option<u64> {
+    match c.call(Request::Instance) {
+        Ok(Response::Instance { id }) => Some(id),
+        _ => None,
+    }
+}
+
+/// 要被换掉的那个旧后台。
+struct OldDaemon {
+    pid: Option<u32>,
+    instance: Option<u64>,
+}
+
+impl OldDaemon {
+    /// 旧后台走了没有。
+    ///
+    /// - 认得出 pid：进程没了，或者 socket 那头已经换成了别的 pid（旧进程可能
+    ///   还没被回收，探活会一直说它在）。
+    /// - 认不出 pid（有的平台问不到）：只认「答话的那个开机编号变了」。以前
+    ///   这里一律当「已经走了」，旧后台退出前那两秒还在答 `Hello`，CLI 就会
+    ///   抢先说「已重启」。
+    /// - 两样都认不出：只能当它走了。
+    fn gone(&self, sock: &Path) -> bool {
+        if let Some(p) = self.pid {
+            return !crate::sys::proc::alive(p)
+                || Client::connect(sock)
+                    .ok()
+                    .and_then(|c| c.peer_pid())
+                    .is_some_and(|now| now != p);
+        }
+        let Some(old) = self.instance else {
+            return true;
+        };
+        Client::connect(sock)
+            .ok()
+            .and_then(|mut c| instance_of(&mut c))
+            .is_some_and(|now| now != old)
     }
 }
 
@@ -1473,6 +1631,8 @@ mod tests {
                     wait_s: 900,
                     nudge_wait_s: 180,
                     initiator: Some(4),
+                    now: false,
+                    exe: None,
                 },
                 &cancel,
                 &|| old_gone,
@@ -1480,6 +1640,7 @@ mod tests {
                 &mut out,
                 &names,
                 Lang::Zh,
+                false,
             )
         };
         out.finish();
@@ -1518,16 +1679,124 @@ mod tests {
         );
     }
 
-    /// Ctrl+C：发 `DrainCancel`，后台答 `Ok` 就收手。
+    /// Ctrl+C：发 `DrainCancel`，后台答「取消了」就收手。
     #[test]
     fn drain_loop_ctrl_c_cancels() {
         let (end, seen, _) = run_drain_loop(
-            vec![progress(vec![2], false, true), Ok(Response::Ok)],
+            vec![
+                progress(vec![2], false, true),
+                Ok(Response::DrainCancelled { told: vec![2] }),
+            ],
             &[1],
             false,
         );
         assert_eq!(end, DrainEnd::Cancelled);
         assert_eq!(seen, ["Drain", "DrainCancel"]);
+    }
+
+    /// M1：取消时点名已经被请去停下或写交接的会话——它们正停在那儿等，
+    /// dct 会告诉它们接着做。
+    #[test]
+    fn the_cancel_line_names_sessions_that_were_already_asked() {
+        let names = std::collections::HashMap::from([(2, "dc-octo".to_string())]);
+        let line = cancelled_line(&[2, 5], &names, Lang::Zh);
+        assert!(line.contains("dc-octo") && line.contains("5 号"), "{line}");
+        assert_eq!(
+            cancelled_line(&[], &names, Lang::Zh),
+            text(Key::RestartDrainCancelled, Lang::Zh)
+        );
+    }
+
+    /// `--now`：什么都不等，不印「还在等 N 个会话，剩 0 秒」。
+    #[test]
+    fn drain_loop_quiet_prints_no_progress() {
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(false);
+        let mut replies = vec![progress(vec![2], false, true), progress(vec![], true, true)].into_iter();
+        let mut out = ProgressOut::new(Vec::new(), false);
+        let end = drain_loop(
+            &mut |_req| replies.next().unwrap(),
+            Request::DrainCancel,
+            &cancel,
+            &|| false,
+            std::time::Duration::from_millis(10),
+            &mut out,
+            &std::collections::HashMap::new(),
+            Lang::Zh,
+            true,
+        );
+        assert_eq!(end, DrainEnd::Swapping);
+        assert_eq!(String::from_utf8(out.into_inner()).unwrap(), "");
+    }
+
+    /// M6：敲 `dct restart` 的会话，profile 声明不了按 id 接回，就提醒它先写交接。
+    /// 认不出的会话、能接回的 profile 都不吓人。
+    #[test]
+    fn initiator_unresumable_reads_the_profile_capability() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        let info = |id: u32, profile: &str| SessionInfo {
+            id,
+            profile: profile.into(),
+            dir: "/x".into(),
+            state: SessionState::Working,
+            activity: String::new(),
+            is_agent: true,
+            tag: String::new(),
+            last_active_ms: 0,
+        };
+        let live = vec![info(3, "codex"), info(4, "claude")];
+        assert!(initiator_unresumable(&sock, &live, 3));
+        assert!(!initiator_unresumable(&sock, &live, 4));
+        assert!(!initiator_unresumable(&sock, &live, 9));
+    }
+
+    /// 认不出旧后台 pid 的平台上，「旧后台走了」只认开机编号变了——以前
+    /// 一律当「走了」，旧后台退出前那两秒还在答 `Hello`，CLI 抢先说「已重启」。
+    #[test]
+    #[cfg(unix)]
+    fn without_a_pid_the_old_daemon_is_gone_only_when_the_instance_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        let s = sock.clone();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::run_with_manager(
+                &s,
+                std::sync::Arc::new(crate::session::SessionManager::new()),
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut c = loop {
+            if let Ok(c) = Client::connect(&sock) {
+                break c;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let now = instance_of(&mut c).expect("新后台答得上开机编号");
+        let same = OldDaemon {
+            pid: None,
+            instance: Some(now),
+        };
+        assert!(!same.gone(&sock), "还是同一个后台，不能当它走了");
+        let other = OldDaemon {
+            pid: None,
+            instance: Some(now.wrapping_add(1)),
+        };
+        assert!(other.gone(&sock));
+    }
+
+    /// `--cancel` 只能单独用。
+    #[test]
+    fn parse_restart_cancel() {
+        assert_eq!(
+            parse_restart_args(&args(&["--cancel"]), Lang::Zh),
+            Restart::Cancel
+        );
+        assert!(matches!(
+            parse_restart_args(&args(&["--cancel", "-y"]), Lang::Zh),
+            Restart::Usage(_)
+        ));
     }
 
     /// 已经在落盘时按 Ctrl+C：后台回进度、不取消，接着等到 `done`。

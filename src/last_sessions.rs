@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 /// 接回原来的对话，其余的只能从头开。有了 id 就各接各的，见
 /// `docs/superpowers/specs/2026-10-14-graceful-restart-design.md` 第 1 节。
 /// 没有 id 的旧记录照旧走 `--continue` 分组（[`continue_flags`]）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedSession {
     pub dir: PathBuf,
     pub profile: String,
@@ -61,6 +61,19 @@ pub struct RecordedSession {
     /// 接不回对话的会话，重启前写的交接文件。
     #[serde(default)]
     pub handoff: Option<PathBuf>,
+    /// 会话编号（看板上的「3 号」）。重启后尽量还用这个号——开着的界面、
+    /// 用户脑子里的「3 号」都还指着它。旧文件没有，或者号已经被占了，就
+    /// 发一个新号。
+    #[serde(default)]
+    pub id: Option<u32>,
+    /// 这个会话就是敲 `dct restart` 的那个。重启后它收到的是「重启已经
+    /// 完成了，不用再重启」，不是「继续」——它没做完的事正是那条命令。
+    #[serde(default)]
+    pub restart_initiator: bool,
+    /// 准备重启期间别的电脑发来、还没送进去的留言（已经加好来源标记的
+    /// 整句）。重启后等会话空下来照常送。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_messages: Vec<String>,
 }
 
 /// 磁盘格式。跟 `secrets.rs` 一样包一层表，留出将来加别的段的余地。
@@ -195,12 +208,28 @@ pub fn will_resume_by_id(r: &RecordedSession, profiles: &[crate::profile::Profil
 /// 返回值跟输入逐位对应，语义同 [`group_for_resume`]：`true` = 这一条该带
 /// `resume_args`。按 id 接回的那些一律是 `false`——用不着猜。判定「按不按
 /// id 接回」见 [`will_resume_by_id`]。
+///
+/// **同一个 (目录, profile) 里已经有按 id 接回的记录时，没有 id 的那几条
+/// 一律不带 `--continue`，从空白开始。** `--continue` 接的是这个目录下最近
+/// 写过的那段对话；兄弟会话有自己的 id、又常常是最近用过的那个，这时
+/// `--continue` 接到的就是兄弟的对话——两个格子写同一份对话，自己那段
+/// 反而丢了。没有 id 又用过的会话在准备重启时会被请去写交接（见
+/// `SessionManager::drain_resumable`），所以从空白开始也能接着干。
 pub fn continue_flags(
     sessions: &[RecordedSession],
     profiles: &[crate::profile::Profile],
 ) -> Vec<bool> {
+    let by_id: Vec<bool> = sessions
+        .iter()
+        .map(|r| will_resume_by_id(r, profiles))
+        .collect();
+    let sibling_has_id = |i: usize| {
+        (0..sessions.len()).any(|j| {
+            by_id[j] && sessions[j].dir == sessions[i].dir && sessions[j].profile == sessions[i].profile
+        })
+    };
     let idx: Vec<usize> = (0..sessions.len())
-        .filter(|&i| !will_resume_by_id(&sessions[i], profiles))
+        .filter(|&i| !by_id[i] && !sibling_has_id(i))
         .collect();
     let sub: Vec<RecordedSession> = idx.iter().map(|&i| sessions[i].clone()).collect();
     let flags = group_for_resume(&sub);
@@ -219,11 +248,8 @@ mod tests {
         RecordedSession {
             dir: PathBuf::from(dir),
             profile: profile.to_string(),
-            tag: String::new(),
             last_active,
-            conversation_id: None,
-            interrupted: false,
-            handoff: None,
+            ..Default::default()
         }
     }
 
@@ -255,23 +281,45 @@ mod tests {
             conversation_id: Some("11111111-1111-4111-8111-111111111111".into()),
             interrupted: true,
             handoff: Some("/tmp/h.md".into()),
+            id: Some(7),
+            restart_initiator: true,
+            held_messages: vec!["[来自 pc] 你好".into()],
         };
         save(&p, std::slice::from_ref(&r)).unwrap();
         assert_eq!(load(&p), vec![r]);
     }
 
-    /// 有对话 id 的那条各接各的，不占 `--continue` 的位子；剩下没 id 的
-    /// 照旧按 `last_active` 挑一条继续。
+    /// 有对话 id 的那条各接各的，不占 `--continue` 的位子；没 id 的照旧按
+    /// `last_active` 挑一条继续——**只在同组没有按 id 接回的兄弟时**。
     #[test]
     fn continue_flags_skips_records_with_ids() {
         let mut with_id = rec("/w/x", "claude", 9);
         with_id.conversation_id = Some("abc".into());
-        let sessions = vec![rec("/w/x", "claude", 5), with_id, rec("/w/x", "claude", 1)];
+        let sessions = vec![
+            rec("/w/x", "claude", 5),
+            with_id,
+            rec("/w/x", "claude", 1),
+            rec("/w/y", "claude", 3),
+            rec("/w/y", "claude", 4),
+        ];
         let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
         assert_eq!(
             continue_flags(&sessions, &profiles),
-            vec![true, false, false]
+            vec![false, false, false, false, true]
         );
+    }
+
+    /// I2：没 id 的会话（上次是 `--continue` 接回来的）跟有 id 的兄弟在同一个
+    /// 目录里时，`--continue` 会接到兄弟最近写的那段对话上。这种一律从空白开始。
+    #[test]
+    fn no_continue_when_a_sibling_resumes_by_id() {
+        let mut b = rec("/w/x", "claude", 9);
+        b.conversation_id = Some("b".into());
+        let a = rec("/w/x", "claude", 5);
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        assert_eq!(continue_flags(&[a.clone(), b], &profiles), vec![false, false]);
+        // 没有兄弟时照旧接回
+        assert_eq!(continue_flags(&[a], &profiles), vec![true]);
     }
 
     /// 记录里有 id，但 profile 已经不声明按 id 接回的参数了：id 没处用，
