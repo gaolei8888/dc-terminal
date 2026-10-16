@@ -479,8 +479,11 @@ Good to know:
 - **The very first time** you run `dct restart` with a new build while an older
   dct (from before this feature) is still running, that older one doesn't know
   how to wait. dct says so and does the old, immediate restart: sessions are
-  cut off and you are asked about bringing them back, as after a crash. Every
-  restart after that waits.
+  cut off and come back by themselves (no question), but with new numbers.
+  **Close every open dct window before you confirm, and open them again
+  afterwards** — a window left open from before may still point at the old
+  number, and what you type could land in a different session. Every restart
+  after that waits and keeps the numbers.
 - If you use `/clear` or `/resume` inside Claude, dct doesn't notice. A restart
   brings back the conversation that dct started the session with, not the one
   you switched to.

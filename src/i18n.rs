@@ -1158,8 +1158,8 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
         ),
         RestartOldDaemonPlain => t!(
             lang,
-            en: "The background service running now is too old to wait for sessions to stop — it will be restarted right away.",
-            zh: "这次后台太旧，不会等会话停下，直接重启",
+            en: "The background service running now is too old to wait for sessions to stop — it will be restarted right away, and the sessions come back on their own with new numbers. Close every open dct window before you confirm and open them again afterwards, or what you type may land in a different session.",
+            zh: "这次后台太旧，不会等会话停下，直接重启；会话会自己接回来，但编号会变。先关掉所有开着的 dct 窗口，重启完再打开，不然打的字可能落进别的会话。",
         ),
         RestartDrainCancelled => {
             t!(lang, en: "Cancelled. Nothing changed.", zh: "已取消，一切照旧")

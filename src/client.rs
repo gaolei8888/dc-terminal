@@ -186,6 +186,10 @@ pub struct Client {
     /// 守着「后台是不是换了一个」（`guard_instance` 打开）：记着连上的那个
     /// 后台的开机编号。
     instance: Option<u64>,
+    /// 已经问过一次开机编号了（不管答没答上来）。之后编号**有任何变化**都
+    /// 算换了后台，包括「上次答不上来、这次答上了」：从这个功能之前的旧后台
+    /// 重启到新后台，正是这一种。
+    asked: bool,
     guard: bool,
     /// 重连上的是另一个后台了，还没被 `take_new_daemon` 取走。这期间所有
     /// 请求一律不发：手里的会话编号指的已经不是原来那些会话了。
@@ -203,6 +207,7 @@ impl Client {
             socket: socket.to_path_buf(),
             conn: None,
             instance: None,
+            asked: false,
             guard: false,
             new_daemon: false,
         };
@@ -219,8 +224,9 @@ impl Client {
     /// 那里去。
     pub fn guard_instance(&mut self) {
         self.guard = true;
-        if self.instance.is_none() {
+        if !self.asked {
             self.instance = self.ask_instance();
+            self.asked = true;
         }
     }
 
@@ -281,12 +287,13 @@ impl Client {
         self.reconnect()?;
         if self.guard {
             let now = self.ask_instance();
-            if self.instance.is_some() && now != self.instance {
+            if self.asked && now != self.instance {
                 self.instance = now;
                 self.new_daemon = true;
                 return Err(refused());
             }
-            self.instance = self.instance.or(now);
+            self.instance = now;
+            self.asked = true;
         }
         Ok(())
     }
@@ -416,6 +423,53 @@ mod instance_tests {
         assert!(c.take_new_daemon());
         assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
         assert!(!c.take_new_daemon());
+    }
+
+    /// 一个只会答 `List` 的「旧后台」：不认识 `Instance`，跟这个功能之前的
+    /// 旧 dct 一样回一句错。
+    fn start_old_daemon(sock: &Path) {
+        use std::io::{BufRead, Write};
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                std::thread::spawn(move || {
+                    let mut w = conn.try_clone().unwrap();
+                    for line in std::io::BufReader::new(conn).lines() {
+                        let Ok(line) = line else { return };
+                        let resp = if line.contains("Instance") {
+                            Response::Error(crate::proto::ErrorCode::BadRequest("unknown".into()))
+                        } else {
+                            Response::Sessions(Vec::new())
+                        };
+                        let _ = writeln!(w, "{}", serde_json::to_string(&resp).unwrap());
+                    }
+                });
+            }
+        });
+    }
+
+    /// N1：用户第一次重启时，开着的界面连的是这个功能之前的旧后台，问开机
+    /// 编号答不上来。重启后重连上新后台、答上来了——这也是换了后台，必须拦下。
+    #[test]
+    fn a_reconnect_from_an_old_daemon_to_a_new_one_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = home.path().join("d.sock");
+        start_old_daemon(&sock);
+        let mut c = Client::connect(&sock).unwrap();
+        c.guard_instance();
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
+        // 同一个旧后台，断了重连：两次都答不上来，算没变，照常。
+        c.conn = None;
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
+        assert!(!c.take_new_daemon());
+
+        std::fs::remove_file(&sock).unwrap();
+        start_daemon(&sock);
+        c.conn = None;
+        assert!(c.call(Request::List).is_err(), "新后台上的第一句不能发出去");
+        assert!(c.take_new_daemon());
+        assert!(matches!(c.call(Request::List), Ok(Response::Sessions(_))));
     }
 
     /// 没打开看守的连接（CLI 用的）照旧：重连上谁就跟谁说话。
