@@ -1590,11 +1590,11 @@ pub mod msg {
             lang,
             en: format!(
                 "`dct restart` does not know `{arg}`. It takes: -y (don't ask), --now (don't wait for sessions), \
-                 --wait <minutes>, --nudge-wait <minutes>."
+                 --wait <minutes>, --nudge-wait <minutes>, --cancel (call off a waiting restart)."
             ),
             zh: format!(
                 "`dct restart` 不认识 `{arg}`。能用的：-y（不问）、--now（不等会话停下）、\
-                 --wait <分钟>、--nudge-wait <分钟>。"
+                 --wait <分钟>、--nudge-wait <分钟>、--cancel（取消还在等的重启）。"
             ),
         )
     }
