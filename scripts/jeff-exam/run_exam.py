@@ -137,7 +137,7 @@ def markdown(meta, summ):
     L = [f"# Jeff {meta['set']} report: {meta['label']}", "",
          f"**SET RUN: {meta['set']}** ({meta['manifest_name']}, split `{meta['split']}`, frozen {meta['frozen']}). "
          + ("Threshold protocol: the threshold is chosen on the dev set; the frozen exam is evaluated once at that threshold. "
-            "Do not pick a threshold from this sweep." if meta["set"] == "exam" else
+            "This is the frozen exam: evaluate once, never tune. Do not pick a threshold from this sweep." if meta["set"].startswith("exam") else
             "This is the DEV set: it is the one to choose the threshold on. Its scores are never quoted as exam results."), "",
          f"- model `{meta['model']}` at {meta['url']}, checkpoint `{meta['health'].get('checkpoint')}`",
          f"- set file `{meta['exam_file']}` sha256 `{meta['exam_sha256']}` ({meta['items']} items), seeds {meta['seeds']} "
