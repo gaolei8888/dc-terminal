@@ -182,16 +182,13 @@ fn build_http_agent() -> ureq::Agent {
         .build()
 }
 
-/// 真实传输。头部由本机回环上的单测核对（见 tests 里的 `headers_sent_by_send_real`），
-/// 真网络那一步在实测里验。
-fn send_real(
+/// 通用头 + 凭据头。流式那条路（`stream.rs`）和整段这条路发一模一样的头。
+pub(crate) fn authed(
     wire: Wire,
-    url: &str,
+    req: ureq::Request,
     cred: &Credential,
-    body: &serde_json::Value,
-) -> Result<(u16, String), String> {
-    let agent = build_http_agent();
-    let mut req = agent.post(url).set("content-type", "application/json");
+) -> Result<ureq::Request, String> {
+    let mut req = req.set("content-type", "application/json");
     match cred {
         Credential::Key(k) => {
             req = req.set("authorization", &format!("Bearer {k}"));
@@ -210,6 +207,19 @@ fn send_real(
     if wire == Wire::Anthropic {
         req = req.set("anthropic-version", "2023-06-01");
     }
+    Ok(req)
+}
+
+/// 真实传输。头部由本机回环上的单测核对（见 tests 里的 `headers_sent_by_send_real`），
+/// 真网络那一步在实测里验。
+fn send_real(
+    wire: Wire,
+    url: &str,
+    cred: &Credential,
+    body: &serde_json::Value,
+) -> Result<(u16, String), String> {
+    let agent = build_http_agent();
+    let req = authed(wire, agent.post(url), cred)?;
     match req.send_json(body.clone()) {
         Ok(r) => {
             let s = r.status();

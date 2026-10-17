@@ -7,6 +7,7 @@ pub mod cli;
 pub mod creds;
 pub mod http;
 pub mod resolve;
+pub mod stream;
 
 use std::sync::mpsc;
 use std::sync::Arc;
