@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 超过这个大小就从头写。守护进程一活好几天，日志不能无限长；
 /// 而这是排查用的近况，旧的没有保留价值。
-const MAX_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_BYTES: u64 = 256 * 1024;
 
 /// 会话为什么变成 `Stopped`。**这个区分就是整个模块存在的理由**，
 /// 别把两者合并成一句「stopped」。

@@ -1353,8 +1353,19 @@ pub fn help_text(items: &[HelpItem]) -> String {
 /// 带参文案。**每条一个函数，不是带 `{}` 的模板**：模板要靠调用方按顺序填参，
 /// 漏填、错序、类型不对，编译器一概不管，而各语言的语序本来就不同。
 /// 写成函数，这些全归签名管。
+/// `dct ask --enable` 的结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AskEnableNote {
+    Enabled,
+    AlreadyOn,
+    Declined,
+    SectionExists,
+    NeedTerminal,
+    WriteFailed,
+}
+
 pub mod msg {
-    use super::{text, Key, Lang};
+    use super::{text, AskEnableNote, Key, Lang};
 
     /// `dct status` 的三句人话。不说「守护进程」「协议」——读的人不写代码。
     pub fn status_up(lang: Lang, total: usize, busy: usize) -> String {
@@ -2619,6 +2630,84 @@ pub mod msg {
                 lang,
                 en: format!("The address for “{name}” ({url}) does not look like a web address, and dct will not send a key somewhere it cannot read. Fix that line in the settings file {cfg}."),
                 zh: format!("「{name}」要连的地址（{url}）不像一个网址，而 dct 不会把密钥发到看不懂的地方。改一下设置文件 {cfg} 里的那一行。"),
+            ),
+        }
+    }
+
+    /// `dct ask --enable` 的同意文案。**说清楚什么会离开这台机器、去哪、什么不会**——
+    /// 这份同意不同于「报错看不懂时让 AI 解释」那一勾（那一勾只涵盖终端报错原文）。
+    pub fn ask_consent(lang: Lang, host: &str) -> String {
+        t!(
+            lang,
+            en: format!(
+                "Turn on chat?\n\
+                 What gets sent to {host}: the words you say or type to the octopus, your last few turns of chat, a fixed prompt, and the persona it supplies.\n\
+                 What is NOT sent: your terminal screens, files, session list, or anything about other users.\n\
+                 The chat is kept only in the memory of the dct background process (gone after 30 idle minutes or a restart); nothing is written to disk. The log keeps only counts and timings, never text.\n\
+                 This is a separate consent from \"explain errors\", which only covers terminal error text.\n\
+                 Type y and Enter to turn it on; anything else leaves it off: "
+            ),
+            zh: format!(
+                "要开启「对话」吗？\n\
+                 会发送到 {host} 的：你对章鱼说的话 / 打的字、最近几轮对话、一段固定的提示、以及它带来的人设。\n\
+                 不会发送的：终端屏幕、文件、会话列表、别的用户的任何信息。\n\
+                 对话只记在 dct 后台进程的内存里（空闲 30 分钟或重启就没了），不写盘；日志只记字数和耗时，不记文字。\n\
+                 这和「报错看不懂时让 AI 解释」不是同一份同意——那一勾只涵盖终端报错原文。\n\
+                 输入 y 回车开启，其他任何输入都不开启："
+            ),
+        )
+    }
+
+    pub fn ask_enable_note(lang: Lang, note: AskEnableNote, path: &std::path::Path) -> String {
+        let p = path.display();
+        match note {
+            AskEnableNote::Enabled => t!(
+                lang,
+                en: format!("Chat is on (written to {p}). dco can use it now; to turn it off, set enabled = false there."),
+                zh: format!("「对话」已开启（写进了 {p}）。dco 现在可以用了；要关，把那里的 enabled 改成 false。"),
+            ),
+            AskEnableNote::AlreadyOn => t!(lang, en: "Chat is already on.".to_string(), zh: "「对话」已经是开着的。".to_string()),
+            AskEnableNote::Declined => t!(lang, en: "Left off.".to_string(), zh: "没有开启。".to_string()),
+            AskEnableNote::SectionExists => t!(
+                lang,
+                en: format!("{p} already has an [ask] section, so dct will not touch it. To turn chat on, set enabled = true there yourself."),
+                zh: format!("{p} 里已经有 [ask] 这一段，dct 不会去改它。要开启，请自己把那里的 enabled 改成 true。"),
+            ),
+            AskEnableNote::NeedTerminal => t!(
+                lang,
+                en: "Turning chat on needs you at a terminal: run `dct ask --enable` yourself.".to_string(),
+                zh: "开启「对话」要本人在终端里确认：请自己在终端里运行 `dct ask --enable`。".to_string(),
+            ),
+            AskEnableNote::WriteFailed => t!(
+                lang,
+                en: format!("Could not write {p}."),
+                zh: format!("写不进 {p}。"),
+            ),
+        }
+    }
+
+    /// 对话用不了的原因（固定原因词 → 一句人话）。
+    pub fn ask_cannot(lang: Lang, reason: &str) -> String {
+        match reason {
+            "llm_missing" => t!(
+                lang,
+                en: "Chat has no model to talk to: [llm] is not set up yet (see `dct llm check`).".to_string(),
+                zh: "「对话」没有可连的大模型：还没配 [llm]（见 `dct llm check`）。".to_string(),
+            ),
+            "llm_not_http" => t!(
+                lang,
+                en: "[llm] uses the command-line transport; chat only goes through an http gateway and will not hand your words to another command.".to_string(),
+                zh: "[llm] 用的是命令行传输；「对话」只走 http 网关，不会把你的话交给别的命令。".to_string(),
+            ),
+            "host_not_allowed" => t!(
+                lang,
+                en: "The [llm] host is not in [ask].allowed_hosts. If you really want chat there, write an [ask] section with enabled = true and allowed_hosts = [\"<host>\"] in config.toml yourself.".to_string(),
+                zh: "[llm] 的主机不在 [ask].allowed_hosts 里。真要用它，请自己在 config.toml 里写 [ask]：enabled = true 和 allowed_hosts = [\"<主机>\"]。".to_string(),
+            ),
+            _ => t!(
+                lang,
+                en: "[llm] is not set up properly; run `dct llm check` first.".to_string(),
+                zh: "[llm] 没配好，先跑一次 `dct llm check`。".to_string(),
             ),
         }
     }

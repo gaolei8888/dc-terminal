@@ -59,6 +59,12 @@ dct —— vibe coding 终端
                    看看现在屏幕上是哪一类游戏（只在本机识别，不上传）
   dct game scene [--game 名字] [--steps 10] [--dry-run]
                    寻物游戏：让大模型看场景指一个位置，dct 检查后点（要最新版 dco；只支持 Mac）
+  dct ask          给 dco 对话用：标准输入一行 JSON（{\"text\",\"source\",\"conversation_id\"，可选 \"persona\"}），
+                   标准输出一行一个事件（start / sentence / end / error），退出码见设计文档。话不进命令行参数。
+                   要先在 config.toml 写 [llm] 和 [ask]（默认关）。连不上守护进程就是 daemon_down，不会拉起它
+  dct ask --enable 开 [ask]：看完会发去哪、输入 y（要本人在终端里，没有 --yes）
+  dct ask --forget <对话 id>
+                   忘掉一个对话的记忆（记忆只在守护进程的内存里，不写盘）
   dct voice        点章鱼说一句话，dct 当成你亲手打的字送进最近用的会话（要 dco；只支持 Mac）
                    2 秒内说「取消」可以不发；要你批准的提示和单独的「好」不会送
   dct dco-rules    马上刷新一次 dc-vault 规矩总表要读的 ~/.dct/dco-rules.json
@@ -160,6 +166,8 @@ fn main() -> Result<()> {
         }
         // 玩三消游戏：连的是本机的 dco，不经守护进程。
         Some("game") => std::process::exit(dct::game::cli::run(&args[1..])),
+        // 对话：话走 stdin 和守护进程的 socket（流式），不连 dco、不碰会话。
+        Some("ask") => std::process::exit(dct::ask::cli::run(&args[1..], cli_lang())),
         // 语音中继：连本机 dco 听写，再通过守护进程的 socket 把话送进会话。
         Some("voice") => std::process::exit(dct::voice::run(&args[1..])),
         // 手动刷新规矩总表：直接跑本机的 dco，不经守护进程。

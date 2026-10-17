@@ -418,6 +418,11 @@ pub fn all_profiles(dir: &Path) -> (Vec<Profile>, Vec<WarningCode>) {
     (out, errs)
 }
 
+/// 先找用户自己写的 profile，再找内置的。
+pub fn lookup_in(custom: &[Profile]) -> impl Fn(&str) -> Option<Profile> + '_ {
+    move |n| custom.iter().find(|p| p.name == n).cloned().or_else(|| Profile::builtin(n))
+}
+
 /// 按 `[menu] agents` 把菜单裁短，顺序照那份清单写的来。
 ///
 /// 谁需要这个：给一个班、一个团队统一发机器的人。十项摆在零基础的人面前，

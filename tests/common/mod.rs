@@ -16,6 +16,8 @@
 // `git_repo()`）。逐个文件加 `#[allow(dead_code)]` 太啰嗦，这里整体放开。
 #![allow(dead_code)]
 
+pub mod gateway;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

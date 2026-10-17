@@ -1,4 +1,4 @@
-//! `~/.dct/config.toml`。目前只有 `[llm]` 一段。
+//! `~/.dct/config.toml`。`[llm]`、`[ask]` 等几段。
 //!
 //! **配置坏了绝不能让 dct 起不来。** LLM 是增强，不是地基——解析失败
 //! 一律退回默认值，只往 stderr 留一行痕迹。
@@ -167,6 +167,36 @@ pub struct ServeConfig {
     pub min_free_percent: u8,
 }
 
+/// `dct ask` 默认只肯把话发给的主机。
+pub const ASK_DEFAULT_HOST: &str = "dc-llm.tzspace.cn";
+
+fn default_ask_hosts() -> Vec<String> {
+    vec![ASK_DEFAULT_HOST.to_string()]
+}
+
+/// `[ask]`：dco 对话（`dct ask`）。**默认关**：`[llm]` 那份同意只涵盖终端报错原文，
+/// 不涵盖用户说的话（设计 §8）——所以单独一个开关，写下它才算同意，没写 = 关。
+/// 外部大模型的开关位置第 1 期不做：只认 `[llm]` 的 http 端点，且主机必须在 `allowed_hosts` 里。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AskConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ask_hosts")]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for AskConfig {
+    fn default() -> Self {
+        AskConfig { enabled: false, allowed_hosts: default_ask_hosts() }
+    }
+}
+
+impl AskConfig {
+    pub fn allows(&self, host: &str) -> bool {
+        self.allowed_hosts.iter().any(|h| h.trim().eq_ignore_ascii_case(host))
+    }
+}
+
 /// 菜单上只留哪几项。给一个班、一个团队统一发机器的人用的。
 ///
 /// 空列表（没写这一段、写了空的、名字全填错）= 不裁，全都显示。**裁到
@@ -216,6 +246,9 @@ pub struct Config {
     /// `None` = 没写 `[judge]`，judge 关着。
     #[serde(default)]
     pub judge: Option<JudgeConfig>,
+    /// 不是 `Option`：「没写」和「写了 enabled = false」是同一件事——关。
+    #[serde(default)]
+    pub ask: AskConfig,
 }
 
 impl Config {
@@ -270,6 +303,19 @@ pub fn config_path_for_profiles_dir(profiles_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_is_off_unless_written_and_only_trusts_the_listed_hosts() {
+        let off = Config::from_toml("[llm]\nprovider = \"dc\"\n").unwrap().ask;
+        assert!(!off.enabled && off.allows("dc-llm.tzspace.cn") && !off.allows("evil.test"));
+        // 只写 enabled：名单落回默认，不会变成「任何主机」。
+        let on = Config::from_toml("[ask]\nenabled = true\n").unwrap().ask;
+        assert!(on.enabled && on.allowed_hosts == [ASK_DEFAULT_HOST]);
+        let mine = Config::from_toml("[ask]\nenabled = true\nallowed_hosts = [\"GW.test\"]\n").unwrap().ask;
+        assert!(mine.allows("gw.test") && !mine.allows(ASK_DEFAULT_HOST));
+        // 写 [ask] 不会顺手打开 [llm]。
+        assert!(Config::from_toml("[ask]\nenabled = true\n").unwrap().llm.is_none());
+    }
 
     #[test]
     fn a_judge_section_may_hold_only_model_veto() {

@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::channel::telegram::Telegram;
 use crate::channel::{ChannelError, Event};
 use crate::profile::Profile;
-use crate::profile::{all_profiles, command_exists, profiles_dir_for_socket, status_of};
+use crate::profile::{all_profiles, command_exists, lookup_in, profiles_dir_for_socket, status_of};
 use crate::projects::{store_path_for_socket, Store};
 use crate::proto::{
     ErrorCode, InstallPrompt, LiveStagingProblem, LoginPrompt, PairStartedInfo, PairTick, PhoneState,
@@ -195,6 +195,13 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
     // 才不会让重启这条路径上的 `Bridge` 永远拿到一个「本该有、却还没来
     // 得及装」的 `None`。
     install_llm_backend(socket, &profiles_dir, &mgr);
+    // `dct ask` 的服务和记忆（只在这个进程的内存里）。别的用同一网关的功能（出错解释、会话起名、
+    // 手机端）包一层，ask 在途时让路（设计 §6.4）。`ask.log` 跟 socket 放一起，测试的 socket
+    // 在临时目录，所以不会去写真实的 `~/.dct`。
+    let ask = Arc::new(crate::ask::service::Service::new(Some(
+        socket.parent().unwrap_or(Path::new("")).join("ask.log"),
+    )));
+    yield_to_ask(&mgr, ask.gate());
 
     start_phone_bridge(&secrets, &phone, &bridge, &mgr, &|token| {
         Arc::new(Telegram::new(token)) as Arc<dyn crate::channel::Channel>
@@ -301,8 +308,9 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
         let pr = pairs.clone();
         let lv = live.clone();
         let mc = mesh_ctl.clone();
+        let ak = ask.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc) {
+            if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv, mc, ak) {
                 eprintln!("连接处理失败: {e}");
             }
         });
@@ -815,6 +823,28 @@ fn restore_last_sessions(
     skips
 }
 
+/// 守护进程里别的用同一网关的功能（出错解释、会话起名、手机端）都从 `mgr.backend()` 拿后端：
+/// 包一层，ask 在途时它们让路（设计 §6.4，机制见 `ask::service::Yielding`）。要在
+/// `install_llm_backend` 之后、`start_phone_bridge` 之前调，bridge 才拿到包好的那份。
+fn yield_to_ask(mgr: &SessionManager, gate: &crate::ask::Gate) {
+    if let Some(b) = mgr.backend() {
+        mgr.set_backend(Some(Arc::new(crate::ask::service::Yielding::new(b, gate.clone()))));
+    }
+}
+
+/// `dct ask` 这一次要把话发去哪。每次现读配置（开 / 关 `[ask]` 不用重启守护进程），
+/// 密钥用守护进程内存里那份；不同意（`[ask]` 没开）、没配好都是 `not_enabled`，不会有任何网络请求。
+fn ask_target(
+    profiles_dir: &Path,
+    secrets: &Mutex<SecretStore>,
+) -> Result<crate::ask::service::Target, &'static str> {
+    let cfg = crate::config::Config::load(&crate::config::config_path_for_profiles_dir(profiles_dir));
+    let (custom, _) = all_profiles(profiles_dir);
+    let secrets = recover(secrets.lock());
+    let lookup = lookup_in(&custom);
+    crate::ask::service::Target::from_config(&cfg, &lookup, &secrets, &startup_oauth)
+}
+
 fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager) {
     let Some(llm) =
         &crate::config::Config::load(&crate::config::config_path_for_socket(socket)).llm
@@ -823,13 +853,7 @@ fn install_llm_backend(socket: &Path, profiles_dir: &Path, mgr: &SessionManager)
     };
     let llm_secrets = SecretStore::load(&secrets_path_for_socket(socket));
     let (custom, _) = all_profiles(profiles_dir);
-    let lookup = |n: &str| {
-        custom
-            .iter()
-            .find(|p| p.name == n)
-            .cloned()
-            .or_else(|| Profile::builtin(n))
-    };
+    let lookup = lookup_in(&custom);
     match crate::llm::resolve::resolve(llm, &lookup, &llm_secrets, &startup_oauth) {
         Ok(b) => {
             mgr.set_backend(Some(b));
@@ -884,6 +908,7 @@ fn serve(
     pairs: Arc<Mutex<PairTable>>,
     live: Arc<crate::live::LiveState>,
     mesh: Arc<MeshCtl>,
+    ask: Arc<crate::ask::service::Service>,
 ) -> Result<()> {
     let mut out = stream.try_clone()?;
     let reader = BufReader::new(stream);
@@ -911,6 +936,21 @@ fn serve(
                 &profiles_dir,
                 &crate::mesh::login::http_transport,
             ),
+            // `dct ask`：一问多答，在这条连接上连续写 `AskEvent`，只在这里答（HTTP 来的走
+            // `handle`，一律拒绝）。对面关连接 = 取消，`ask.ask` 里靠 `peer` 发现。
+            Ok(Request::Ask(r)) => {
+                let mut peer = out.try_clone()?;
+                let resolve = || ask_target(&profiles_dir, &secrets);
+                ask.ask(&r, &resolve, &mut peer, &mut |event, exit| {
+                    writeln!(out, "{}", serde_json::to_string(&Response::AskEvent { event, exit })?)?;
+                    out.flush()
+                });
+                continue;
+            }
+            Ok(Request::AskForget { conversation_id }) => {
+                ask.forget(&conversation_id);
+                Response::Ok
+            }
             // 本机 socket 这一路**带着** `web`：设置页要能开关那个监听口。
             // 从 HTTP 上来的请求走的是另一个调用点，那边传 `None`——手机
             // 自己开关不了它，也问不出那条带令牌的地址。
@@ -1274,6 +1314,9 @@ fn handle(
         | Request::MeshPeers
         | Request::MeshSend { .. } => Ok(Response::Error(ErrorCode::BadRequest(
             "Mesh requests are local only".into(),
+        ))),
+        Request::Ask(_) | Request::AskForget { .. } => Ok(Response::Error(ErrorCode::BadRequest(
+            "Ask requests are local only".into(),
         ))),
         Request::WebStatus => Ok(web_status(web, secrets)),
         Request::WebEnable => Ok(web_enable(
@@ -2657,6 +2700,70 @@ mod tests {
             &test_live(),
         );
         assert!(matches!(resp, Response::Explanation(None)));
+    }
+
+    /// 对话只从本机 socket 上答：HTTP（局域网手机端 / 中转）来的 `Ask` / `AskForget`
+    /// 一律拒绝，不会碰网关，也不会碰记忆。
+    #[test]
+    fn ask_requests_from_http_are_refused() {
+        let mgr = Arc::new(SessionManager::new());
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Mutex::new(SecretStore::load(&dir.path().join("secrets.toml"))));
+        let store = Arc::new(Mutex::new(Store::load(&dir.path().join("projects.json"))));
+        let ask = Request::Ask(crate::ask::input::AskRequest {
+            v: Some(1),
+            text: "话".into(),
+            source: "typed".into(),
+            conversation_id: "c".into(),
+            ..Default::default()
+        });
+        for req in [ask, Request::AskForget { conversation_id: "c".into() }] {
+            let resp = handle(
+                req,
+                &mgr,
+                &store,
+                &secrets,
+                &dir.path().join("profiles"),
+                &test_phone(),
+                &test_bridge(),
+                &test_event_tx(),
+                None,
+                &test_pairs(),
+                &test_live(),
+            );
+            assert!(matches!(resp, Response::Error(ErrorCode::BadRequest(_))), "{resp:?}");
+        }
+    }
+
+    /// 接线：包好之后，ask 在途时 `mgr.backend()` 的调用不碰网关，ask 结束才放行；
+    /// 没装后端（没写 `[llm]`）就什么都不包——功能整个关着的状态不变。
+    #[test]
+    fn the_manager_backend_yields_to_an_ask_in_flight() {
+        struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::llm::Backend for Counting {
+            fn complete(&self, _p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("ok".into())
+            }
+        }
+        let p = || crate::llm::Prompt { system: "s".into(), user: "u".into(), max_tokens: 1, image_png_base64: None, image_mime: None };
+        let gate = crate::ask::Gate::default();
+        let none = SessionManager::new();
+        yield_to_ask(&none, &gate);
+        assert!(!none.backend_is_set());
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = SessionManager::new();
+        mgr.set_backend(Some(Arc::new(Counting(calls.clone()))));
+        yield_to_ask(&mgr, &gate);
+        let ticket = gate.begin("c").unwrap();
+        let b = mgr.backend().unwrap();
+        let waiter = std::thread::spawn(move || b.complete(&p()));
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "ask 在途，别的调用不该放行");
+        drop(ticket);
+        assert_eq!(waiter.join().unwrap(), Ok("ok".into()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// **Critical 回归测试.** 没写 `[llm]`（这里就是没有 `config.toml` 这个

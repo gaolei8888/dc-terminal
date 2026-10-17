@@ -4,11 +4,20 @@
 //! 可注入的流式传输和一条客户端连接，回复出口只有 `on_sentence` 回调。回复在
 //! 类型上没有地方被当命令用（设计 §2.3、§5）。
 //!
-//! 这一层还**没有**配置 / opt-in、对话记忆、守护进程协议和 CLI（A2）。记忆用
-//! `run_turn` 的 `commit` 回调表达：只在这一轮没被取消时、在门锁里调一次。
+//! 一轮怎么跑在这里（`run_turn`）；一轮之外的东西各有各的文件：`input` 校验、
+//! `memory` 对话记忆（只在内存）、`prompt` 固定提示、`service` 把这些接起来
+//! （守护进程里的 ask 服务）、`log` 只写元数据的 `ask.log`、`cli` 是 `dct ask`。
+//! 记忆用 `run_turn` 的 `commit` 回调表达：只在这一轮没被取消时、在门锁里调一次。
 //!
-//! 日志：这里不打印任何对话文字，也不写任何东西。
+//! 结构性约束（`tests/ask_service.rs` 钉着）：整个 `src/ask/` 不碰会话、`Request::Input`、
+//! 守护进程；只有 `log.rs` 写盘、只有 `cli.rs` 往 stdout 打字。其余文件不打印、不写任何东西。
 
+pub mod cli;
+pub mod input;
+pub mod log;
+pub mod memory;
+pub mod prompt;
+pub mod service;
 pub mod split;
 
 use crate::llm::stream::{parse_frame, Frame, SseParser, StreamError, StreamOpen};
@@ -97,6 +106,15 @@ pub enum Terminal {
 }
 
 impl Terminal {
+    /// `dct ask` 的退出码（设计 §6.2）。`Gone` 没有人在读，也没有人看退出码。
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Terminal::End { .. } => 0,
+            Terminal::Error { code, .. } => code.exit_code(),
+            Terminal::Gone => ErrorCode::Cancelled.exit_code(),
+        }
+    }
+
     /// NDJSON 终止事件；`Gone` 没有。
     pub fn event(&self) -> Option<Value> {
         match self {
@@ -111,6 +129,14 @@ impl Terminal {
             Terminal::Gone => None,
         }
     }
+}
+
+/// 还没受理就被拒（输入不合法、没开、忙）：只有一个 `error` 事件，没有 `start`；
+/// `reason` 是固定的原因词，不含任何输入文字。服务端和 CLI 共用。
+pub fn refusal(code: ErrorCode, reason: &str) -> Value {
+    let mut ev = Terminal::Error { code, after_ms: 0 }.event().unwrap_or_default();
+    ev["reason"] = json!(reason);
+    ev
 }
 
 /// 交给 `commit` 的：这一轮实际说出去的句子。超时 / 断流截断的那一轮，是已说出的那几句。
@@ -155,6 +181,11 @@ impl Gate {
         let cancelled = Arc::new(AtomicBool::new(false));
         g.cur = Some((id, conversation_id.to_string(), cancelled.clone()));
         Ok(Ticket { gate: self.0.clone(), id, cancelled })
+    }
+
+    /// 有没有一轮在途。别的用同一网关的功能（出错解释）靠它给 ask 让路（`service::Yielding`）。
+    pub fn busy(&self) -> bool {
+        lock(&self.0).cur.is_some()
     }
 }
 
@@ -234,8 +265,12 @@ impl ClientGone for crate::sys::ipc::Stream {
     }
 }
 
-/// Windows 的 uds_windows 没有 peek：发现只能靠写失败（`on_sentence` 返回 Err）。
-/// 句子之间的空档里发现不了——比 Unix 弱，A2 接守护进程时要补。
+/// **Windows 上这一条做不到，如实写在这里：** uds_windows 的 socket 没有 peek，
+/// 这里恒返回 false，对面关了只能靠写失败发现（`on_sentence` 返回 Err）。所以在 Windows 上，
+/// 「关连接 = 取消」在句子之间和出第一句之前**要等到下一次写才生效**，比设计 §6.5 弱：
+/// 取消后同一对话的重发在旧一轮还没写失败之前会被当成「取代」（正常处理），
+/// 但网关那一路会多生成一会儿。dco 目前只有 Mac 版，所以没有为它补一条没法验证的
+/// Windows 路径；要补的话得有 Windows 机器能测。
 #[cfg(not(unix))]
 impl ClientGone for crate::sys::ipc::Stream {
     fn gone(&mut self) -> bool {

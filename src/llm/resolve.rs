@@ -154,28 +154,67 @@ pub fn resolve(
             Ok(Arc::new(CliBackend::new(h.command.clone(), env).with_image_args(h.image_args.clone())))
         }
         Transport::Http => {
-            let api = p
-                .api
-                .as_ref()
-                .ok_or_else(|| ResolveError::NoApiEndpoint(name.to_string()))?;
-            let base = llm.base_url.clone().unwrap_or_else(|| api.base_url.clone());
-            // 先把「凭据会发给哪台机器」算出来，再决定给不给凭据。
-            // 抠不出主机名就一个字节都不发——看不懂的地址不是「大概没事」。
-            let host = host_of(&base).ok_or_else(|| ResolveError::BadBaseUrl {
-                name: name.to_string(),
-                url: base.clone(),
-            })?;
-            let cred = select_credential(name, &host, secrets, oauth)?;
-            // 猜一个默认模型（比如写死 claude-3-5-sonnet）会在非 Anthropic
-            // 端点上稳定换来 404——这是要用户自己拍板的事，不是能替他猜的。
-            let model = llm
-                .model
-                .clone()
-                .ok_or_else(|| ResolveError::NoModel(name.to_string()))?;
-            let url = http_url(&base, api.wire);
-            Ok(Arc::new(HttpBackend::new(url, api.wire, model, cred)))
+            let t = http_target(llm, name, &p, secrets, oauth)?;
+            Ok(Arc::new(HttpBackend::new(t.url, t.wire, t.model, t.cred)))
         }
     }
+}
+
+/// 直连端点的目的地：整段式后端和 `ask` 的流式传输共用这一份，凭据只在这里挑。
+pub struct HttpTarget {
+    pub url: String,
+    pub wire: Wire,
+    pub model: String,
+    pub cred: Credential,
+    /// 凭据会发去的那台机器。
+    pub host: String,
+}
+
+/// base 地址、主机、线格式。**不碰凭据**：只想知道「话会发去哪」的调用方（`dct ask --enable`）用它。
+fn endpoint_of(llm: &LlmConfig, name: &str, p: &Profile) -> Result<(String, String, Wire), ResolveError> {
+    let api = p.api.as_ref().ok_or_else(|| ResolveError::NoApiEndpoint(name.to_string()))?;
+    let base = llm.base_url.clone().unwrap_or_else(|| api.base_url.clone());
+    // 抠不出主机名就一个字节都不发——看不懂的地址不是「大概没事」。
+    let host = host_of(&base).ok_or_else(|| ResolveError::BadBaseUrl { name: name.to_string(), url: base.clone() })?;
+    Ok((base, host, api.wire))
+}
+
+/// `[llm]` 指向的 HTTP 端点的主机和线格式，不查凭据。
+pub fn http_endpoint(
+    llm: &LlmConfig,
+    lookup: &dyn Fn(&str) -> Option<Profile>,
+) -> Result<(String, Wire), ResolveError> {
+    let name = llm.provider.as_deref().ok_or(ResolveError::NoProvider)?;
+    let p = lookup(name).ok_or_else(|| ResolveError::NoSuchProvider(name.to_string()))?;
+    endpoint_of(llm, name, &p).map(|(_, host, wire)| (host, wire))
+}
+
+/// `resolve` 的 HTTP 分支，但把目的地原样交出来（调用方自己建后端）。
+pub fn resolve_http(
+    llm: &LlmConfig,
+    lookup: &dyn Fn(&str) -> Option<Profile>,
+    secrets: &SecretStore,
+    oauth: &dyn Fn(&str) -> Option<Borrowed>,
+) -> Result<HttpTarget, ResolveError> {
+    let name = llm.provider.as_deref().ok_or(ResolveError::NoProvider)?;
+    let p = lookup(name).ok_or_else(|| ResolveError::NoSuchProvider(name.to_string()))?;
+    http_target(llm, name, &p, secrets, oauth)
+}
+
+fn http_target(
+    llm: &LlmConfig,
+    name: &str,
+    p: &Profile,
+    secrets: &SecretStore,
+    oauth: &dyn Fn(&str) -> Option<Borrowed>,
+) -> Result<HttpTarget, ResolveError> {
+    let (base, host, wire) = endpoint_of(llm, name, p)?;
+    // 先把「凭据会发给哪台机器」算出来，再决定给不给凭据。
+    let cred = select_credential(name, &host, secrets, oauth)?;
+    // 猜一个默认模型（比如写死 claude-3-5-sonnet）会在非 Anthropic
+    // 端点上稳定换来 404——这是要用户自己拍板的事，不是能替他猜的。
+    let model = llm.model.clone().ok_or_else(|| ResolveError::NoModel(name.to_string()))?;
+    Ok(HttpTarget { url: http_url(&base, wire), wire, model, cred, host })
 }
 
 #[cfg(test)]
