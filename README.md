@@ -484,9 +484,11 @@ Good to know:
   afterwards** — a window left open from before may still point at the old
   number, and what you type could land in a different session. Every restart
   after that waits and keeps the numbers.
-- If you use `/clear` or `/resume` inside Claude, dct doesn't notice. A restart
-  brings back the conversation that dct started the session with, not the one
-  you switched to.
+- Used `/clear` or `/resume` inside Claude? A restart brings back the
+  conversation you're in now, not the one the session started with. dct reads
+  the small file Claude keeps for each open window to see which conversation it's
+  on. If that file can't be read, dct falls back to asking Claude for the latest
+  conversation in that folder (`--continue`).
 
 ---
 
