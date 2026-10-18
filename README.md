@@ -41,7 +41,104 @@ project `n` opens in.
 
 ---
 
+**Contents:** [What dct is](#what-dct-is) · [Which build has what](#which-build-has-what) ·
+[Install](#install) · [Daily use](#it-never-asks-is-this-okay) ·
+[Commands](#commands) · [`dct status --json`](#dct-status---json) ·
+[Deciding for other programs](#deciding-for-other-programs) ·
+[The `[llm]` connection](#the-llm-connection) · [`dct ask`](#dct-ask-the-read-only-chat-entry) ·
+[Voice](#voice-dct-voice) · [Config reference](#config-reference) ·
+[Files](#files-under-dct) · [Security and privacy](#security-and-privacy) ·
+[Troubleshooting](#troubleshooting) · [Development](#development)
+
+## What dct is
+
+dct is a terminal session daemon with a terminal UI in front of it. In the code:
+
+| Part | Where | What it does |
+|---|---|---|
+| pty | `src/pty.rs` | one pseudo-terminal per session, with a vt100 screen buffer |
+| session | `src/session.rs`, `src/git.rs` | the session lifecycle, the 200 ms screen read that works out working / idle / stopped / failed, the hidden git snapshots |
+| daemon | `src/daemon.rs`, `src/proto.rs` | owns every session. The UI and every `dct …` command are clients of it over a local socket (`~/.dct/daemon.sock`, one JSON object per line) |
+| ui | `src/ui/` | the board, the tile grid and the full-screen session view |
+
+**The boundary.** This is the line the project owner drew; no code enforces it.
+dct is the entry point between a person and a model: it starts sessions, keeps
+them alive, shows them, and carries what the person says to the model and what
+the model asks back. It carries **no business- or application-specific
+content**. **dcv** holds the rules and decisions; **dco** does the concrete
+operation (looking at the screen, doing the input, output and UI actions). dct
+calls them; their logic is not in dct.
+
+- **dcv** is a separate program that stores what the user has confirmed (rules,
+  procedures). dct reads and writes it: `dct do` drafts procedures into it, and
+  approval goes through it.
+- **dco** is a separate program on the same machine. dct talks to it over a
+  local socket for `dct voice`, `dct game`, `dct do`, `dct dco-rules`, the
+  board's `dco` label and the `dco` block in `dct status --json`. The commands
+  that need it are Mac-only according to `dct --help`. Without dco those stop
+  working and everything else keeps working.
+
+Some commands in this tree **conflict with that boundary**: `dct do` and
+`dct campaign` carry a table of social platforms, and `dct game` carries a
+Candy Crush profile. They are documented below because they are in the code.
+Nothing in this README says where they will end up.
+
+---
+
+## Which build has what
+
+Two things are easy to mix up here: what the code in this branch does, and what
+is on the published `origin/main`. This README describes the branch `dct-ask`
+at `2c194da`. The comparison below is `git ls-tree origin/main` against that
+commit, using the local `origin/main` ref (`542c53e`, version 0.2.24, socket
+protocol 24); it was not fetched when this was written.
+
+| | `origin/main` | branch `dct-ask` |
+|---|---|---|
+| Board, grid, attach, install, phone page, Telegram, live, several computers, `dct gate`, `dct game`, `dct dco-rules`, `dct llm check` | yes | yes |
+| Session-switch keys: `F3` = next works; `F8` = previous is the reliable key; `Shift+F3` reported NOT working by the user in their terminal; `Ctrl+F3` is grabbed by macOS | yes | yes |
+| `dct voice` (basic relay) | yes | yes |
+| `[llm]` has no default `provider` | no (the default is `claude`) | yes |
+| `dct judge`, `[judge]`, `dct judge up / down / status`, `[judge.serve]` | no | yes |
+| `dct answer`, the danger gate, the model veto, `dct train record` | no | yes |
+| `dco` label on the board and the `dco` block in `dct status --json` | no | yes |
+| `dct campaign`, `dct do`, the platform table | no | yes |
+| `scripts/jeff-exam`, `tests/fixtures/jeff-exam`, `tests/fixtures/jeff-dev` | no | yes |
+| **`dct ask`, `[ask]`, socket protocol 25** | no | **yes, only on this branch** (not in `integration` either) |
+| **`dct voice` reads dco's voice route, `voice.log` without transcripts, `voice.toml` `log_text`** | no | **yes, only on this branch** |
+
+The rows between `[llm]` and `scripts/jeff-exam` are also on the local branch
+`integration` (`14326d6`); none of them is on `origin/main`. Check it yourself
+with `git log --oneline origin/main..HEAD`. Because the socket protocol is 25
+here and 24 on `origin/main`, a daemon started from one build is "stale" for
+the other: see [Troubleshooting](#troubleshooting).
+
+---
+
 ## What's new
+
+On this branch only (see [Which build has what](#which-build-has-what)):
+
+- **[`dct ask`](#dct-ask-the-read-only-chat-entry).** One line of JSON in on
+  stdin, one JSON event per line out, for dco's conversation feature. Off until
+  you run `dct ask --enable`; memory lives in the daemon's RAM only; closing the
+  connection cancels.
+- **[Voice no longer logs what you said](#voice-dct-voice).** `voice.log` keeps
+  counts and decisions by default; `log_text = true` in `voice.toml` turns the
+  text back on. `dct voice` also reads dco's voice route and stays quiet while
+  voice is going to chat.
+- **[`dct answer`](#dct-answer-one-question-one-line-of-json).** One
+  multiple-choice question in, one JSON answer out: Jeff, then the `[llm]`
+  model, then "needs you". A rule-based danger gate stops money and permanent
+  deletion whoever picked, and an optional model veto can add to it.
+- **[dct runs Jeff for you](#running-the-local-judge).** `dct judge up | down |
+  status` start and stop the local judge server from `[judge.serve]`.
+- **[dco on the board and in `dct status --json`](#dct-status---json).**
+- **[`dct train record`](#dct-train-record-saving-an-answer-someone-else-gave).**
+- **[Post to a social platform (Mac, early)](#post-to-a-social-platform-mac-early).**
+  `dct do` posts an approved text through dco. Not tried on a real screen yet.
+
+On `origin/main` too:
 
 - **[Telegram tells you when it's done](#telegram-tells-you-when-its-done).** A
   session that stops, fails or dies sends you a message; reply to it and your
@@ -64,10 +161,8 @@ project `n` opens in.
 - **[dct in a browser](#dct-in-a-browser),** for machines that can't install
   anything: a container, a link instead of a password, an upload panel, and a
   classroom console.
-- **[Post to a social platform (Mac, early)](#post-to-a-social-platform-mac-early).**
-  `dct do` posts an approved text through dco: it replays a procedure you
-  confirmed, or works the page out step by step and writes one for you to
-  confirm. Not tried on a real screen yet.
+- **[Previous session key](#the-board).** `F8` jumps to the previous
+  session and `F3` to the next (`Shift+F3` / `Ctrl+F3` are not reliable, see below).
 - **[Every command on one list](#commands).**
 - The running version is on the board's title line and on the settings page.
 
@@ -429,32 +524,105 @@ new session in the same folder with the same agent. Press Enter instead and you 
 `dct` on its own opens the board and starts the daemon if it isn't running.
 Everything else:
 
+**Sessions and the daemon**
+
 | | |
 |---|---|
 | `dct ps` | list the sessions running in the background |
-| `dct status [--json]` | is dct running, how many sessions are busy; `--json` is for other programs to read |
+| `dct status [--json]` | is dct running, how many sessions are busy; `--json` is for other programs, see [`dct status --json`](#dct-status---json) |
 | `dct stop <n>…` / `--all` | stop sessions, giving them time to wind down |
 | `dct kill <n>…` / `--all` | kill sessions outright |
 | `dct prune` | clear stopped sessions off the list |
 | `dct restart` | swap in the current binary as the daemon (ends every session; `-y` skips the question) |
+| `dct daemon` | run only the daemon, no board |
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
-| `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
+| `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works; see [The `[llm]` connection](#the-llm-connection) |
+| `dct --version` / `dct --help` | which build you have / the command list |
+
+**Deciding for other programs** (this branch only)
+
+| | |
+|---|---|
 | `dct judge [file]` / `--probe` | ask the `[judge]` backend (Jeff's `jeff-serve`) one multiple-choice question in Jev format and print each option's probability; `--probe` sends a fixed question to see if it answers. Exit 0 answered, 1 not configured or backend error, 2 the question is wrong |
 | `dct judge up` / `down` / `status [--json]` | start, stop (only what dct started) or inspect the local judge server; see [Running the local judge](#running-the-local-judge) |
-| `dct answer --json` | read one multiple-choice request (JSON: `state`, `options`, optional `allow` / `forbid` / `picture`) on stdin and write one JSON line: Jeff, then the `[llm]` model, then "needs you" (nothing pops up). A **danger gate** stops a pick whose label is outward, irreversible or money (see [The danger gate](#the-danger-gate-dct-answer)). Exit 0 answered or needs you, 1 config unreadable or invalid, 2 bad request |
-| `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once, in the terminal, by you (refuses when stdin isn't a terminal), then confirm with Touch ID, which signs the exact texts; texts (and their opening sentences) must differ per platform |
-| `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco (Mac only): replay the confirmed procedure if there is one, otherwise work the page out, write a draft procedure and show you a card to confirm with Touch ID. Asks before every publish tap. See [Post to a social platform](#post-to-a-social-platform-mac-early) |
-| `dct daemon` | run only the daemon, no board |
-| `dct gate` | the door in front of [dct in a browser](#dct-in-a-browser) |
-| `dct --version` | which one you have |
+| `dct answer --json` | read one multiple-choice request on stdin, write one JSON line; see [`dct answer`](#dct-answer-one-question-one-line-of-json). Exit 0 answered or needs you, 1 config unreadable or invalid, 2 bad request |
+| `dct train record --json` | record one question someone else answered as a training row; see [`dct train record`](#dct-train-record-saving-an-answer-someone-else-gave). Exit 0 recorded, 1 can't write, 2 bad request |
+
+**Talking** (this branch only unless noted)
+
+| | |
+|---|---|
+| `dct ask` | for dco's conversation: one JSON line on stdin, one JSON event per line on stdout; see [`dct ask`](#dct-ask-the-read-only-chat-entry) |
+| `dct ask --enable` | turn on `[ask]` after you read where your words will go and type `y` |
+| `dct ask --forget <conversation id>` | forget one conversation's memory |
+| `dct voice` | click the dco octopus and speak; dct types it into your latest agent session as if you had. Mac only, needs dco. On `origin/main` too, without the route and log changes; see [Voice](#voice-dct-voice) |
+| `dct dco-rules` | refresh `~/.dct/dco-rules.json` (the file the dc-vault rules page reads) right now; the daemon also does it at start and when dco changes version. On `origin/main` too |
+
+**Several computers** (on `origin/main` too; see [Several computers](#several-computers))
+
+| | |
+|---|---|
+| `dct login` | sign in with the DC account; the first computer to sign in creates the group |
+| `dct invite` | on an old computer: a 6-digit code, valid 10 minutes, usable once |
+| `dct join <code> [--name <computer name>]` | on the new computer: join with that code |
+| `dct peers` | which computers are in the group and what sessions each has open |
+| `dct peers remove <computer name>` | take a computer out of the group |
+| `dct send <computer>/<session> "<text>"` | leave a line in a session on another computer (`#id` works as the session); typed now if it is idle, queued if busy |
+
+**Application-specific** (Mac only; they conflict with [the boundary](#what-dct-is))
+
+| | |
+|---|---|
+| `dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal "…"] [--goal-number 2]` | let dct play a match-3 level shown in iPhone Mirroring; see [Let the AI play a match-3 game](#let-the-ai-play-a-match-3-game-mac) |
+| `dct game ask-bench <record file>… [--limit 40]` | ask the model about recorded positions to see how much better than random it is (touches no phone) |
+| `dct game identify [--game candy-crush]` | say which kind of game is on screen now (recognised locally, nothing uploaded) |
+| `dct game scene [--game <name>] [--steps 10] [--dry-run]` | hidden-object games: the model points at a place, dct checks it and taps (needs a recent dco) |
+| `dct campaign approve <name> --param <platform>.<param>=<value>…` | approve one campaign's text for every platform at once; see [Post to a social platform](#post-to-a-social-platform-mac-early). This branch only |
+| `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | post a campaign's approved text to one platform through dco. This branch only |
+
+**The browser version** (on `origin/main` too)
+
+| | |
+|---|---|
+| `dct gate [--bind <address>] [--port <port>] [--upstream <host:port>] [--url <public address>] [--link]` | the door in front of [dct in a browser](#dct-in-a-browser); `--link` only prints the link |
 
 `ps`, `stop`, `kill` and `prune` never start a daemon: asking "is anything
 running?" shouldn't turn the answer from no into yes. `restart` does start one,
-because what you asked for is a daemon running the new binary.
+because what you asked for is a daemon running the new binary. `status` and
+`dct ask` don't start one either.
 
-`dct status --json` always exits 0 and keeps `schema_version` at 1. If a local
-dco is installed (`~/.dco/endpoint.json` exists), it adds an optional `dco`
-block, read-only, from dco's `status` tool and never starting dco or the daemon:
+`dct --help` prints Chinese only, whatever `DCT_LANG` says. This README is the
+English reference for it. The code also accepts `dct keys` (dct's two signing
+keys, held in the Mac's secure enclave) and `dct procedure` (approving
+procedures and issuing tickets); neither is in `dct --help` and neither is
+described here.
+
+---
+
+## `dct status --json`
+
+For other programs to poll (it is meant for a menu-bar helper). It always exits 0,
+whatever state dct is in; only a wrong argument exits 2. It never starts the
+daemon.
+
+```json
+{"schema_version": 1, "daemon": "up", "dct_version": "0.2.24",
+ "sessions": {"busy": 1, "idle": 2, "total": 3}}
+```
+
+- `daemon` is `up`, `down` (no daemon answering) or `stale` (a daemon is
+  running but speaks a different socket protocol, so dct will not read it).
+  `down` carries only `schema_version` and `daemon`; `stale` adds
+  `dct_version`; neither has `sessions`.
+- `sessions.total` counts every session that has not stopped, so `busy` +
+  `idle` can be smaller than `total` (sessions waiting for you, failed, or not
+  readable are only in `total`).
+- A key that is absent means "this version doesn't know", not zero.
+
+`schema_version` stays 1. **This branch only:** if a local dco is installed
+(`~/.dco/endpoint.json` exists), `dct status --json` adds an optional `dco`
+block to all three shapes above, read-only, from dco's `status` tool and never
+starting dco or the daemon:
 
 ```json
 "dco": {"state": "waiting_user", "activity": "…", "runs": 1, "attention": ["needs_help"]}
@@ -483,7 +651,19 @@ at 40 characters. **Only `idle` (with an empty attention list) has been seen on 
 real dco.** Everything else, including the kind names and their priority, comes
 from dco's own source as relayed by its session, and is unverified.
 
-`dct judge` and the Jeff step of `dct do` need a `[judge]` section in
+---
+
+## Deciding for other programs
+
+Everything in this section is **on this branch only**. It exists so another
+program (dco, a script) can hand dct a multiple-choice question and get an
+answer back without a window popping up.
+
+The local small model is called **Jeff**. It is served by `jeff-serve`, which
+answers Jev-format choice questions over HTTP and returns a probability per
+option.
+
+`dct judge`, `dct answer` and the Jeff step of `dct do` need a `[judge]` section in
 `~/.dct/config.toml`, pointing at a running `jeff-serve`:
 
 ```toml
@@ -491,17 +671,74 @@ from dco's own source as relayed by its session, and is unverified.
 base_url = "http://127.0.0.1:8765"
 # model = "jeff-latest"      # the name jeff-serve answers to
 # api_key_env = "JEFF_KEY"   # read a key from this variable; plain http only to this machine
-# threshold = 0.8            # below this, dct do asks the [llm] model, then you
+# threshold = 0.8            # below this, dct answer / dct do go on to the [llm] model, then you
 # timeout_ms = 5000
 ```
 
 dct does not download weights. By default you start `jeff-serve` yourself (or
 let dct do it, see [Running the local judge](#running-the-local-judge)). The weights
 used so far are Jeff v1.2, `jeff-legacy/Jeff-Qwen3.5-0.8B` at revision
-`d86f657` (about 1.6 GB, up to 254 options).
+`d86f657` (about 1.6 GB). The server reports it accepts up to 254 options, but
+dct itself sends 2 to 20 to `dct judge` and 1 to 20 to `dct answer`.
 
-Without `[judge]`, `dct do` skips Jeff; without `[llm]`, it skips the model too.
-You are always the last one asked.
+Without `[judge]` (or without a `base_url` in it), `dct answer` and `dct do`
+skip Jeff; without `[llm]` they skip the model too. You are always the last
+one asked.
+
+### `dct answer`: one question, one line of JSON
+
+`dct answer --json` reads one request from stdin (at most 1 MiB, one JSON
+object, unknown fields refused) and writes one JSON line.
+
+```json
+{"state": "What the screen shows and what the goal is",
+ "options": [{"key": "a", "text": "Post"}, {"key": "b", "text": "Delete account permanently"}],
+ "allow": ["jeff", "llm", "user"],
+ "forbid": ["a string that must never be sent to the model"]}
+```
+
+- `state`: at most 50 000 characters.
+- `options`: 1 to 20 entries. `key` is non-empty, at most 64 characters,
+  unique, and not `stuck`; `text` is at most 2 000 characters.
+- `picture` (optional): a path of at most 4 096 characters. It is never sent
+  to the `[llm]` model.
+- `allow` (optional, default all three): which rungs may answer. It can only
+  remove rungs, and it cannot switch the danger gate off.
+- `forbid` (optional, at most 100 non-empty strings of at most 200
+  characters): if any appears in `state` or an option's text, the request is
+  never sent to the `[llm]` model (Jeff runs on your machine and is still asked);
+  `reason` then ends with `llm_withheld: forbidden string in the request`.
+
+It asks, in this order, and skips any rung that is not configured or cannot
+answer:
+
+1. **Jeff** (`[judge]`). The pick counts only when its confidence is at least
+   `threshold` (default 0.8). dct recomputes the confidence from the returned
+   probabilities and ignores the server's own number.
+2. **The `[llm]` model**, with the text only. The same `[llm]` rules as
+   everywhere apply: no `[llm]`, no rung.
+3. **You.** dct does not ask anyone itself and shows nothing. It answers
+   `by: "none"`, `reason: "needs_user"` and exits 0; the caller decides how to
+   ask. With `"user"` left out of `allow` the reason is `no_answer`.
+
+Whatever rung picked, the pick then goes through the [danger
+gate](#the-danger-gate-dct-answer) and the model veto before it leaves.
+
+Answers:
+
+```json
+{"key": "a", "by": "jeff", "confidence": 0.97}
+{"key": "a", "by": "model", "confidence": null}
+{"key": null, "by": "none", "confidence": null, "reason": "needs_user"}
+{"key": null, "by": "none", "confidence": 0.991, "reason": "danger", "gated": {"key": "b", "tier": "critical"}}
+```
+
+`by` is `jeff`, `model` or `none`. `confidence` is Jeff's, or `null`. A pick the
+model gave for an icon without text may also carry a `name`. Exit codes: 0
+answered or needs you (including `danger`), 1 the config can't be read or is
+invalid (a broken `[judge] gate_tiers` included), 2 the request is wrong. A
+rung that is configured but can't answer (unreachable, too slow, unreadable
+reply) is skipped; it never fails the command.
 
 ### Running the local judge
 
@@ -607,6 +844,250 @@ does not know are not stopped; callers should still filter options they know
 are destructive.** (Examples it misses today: "Cancel subscription", "Clear
 all", "Block", "Deactivate". With `"content"` opted in it also over-stops some
 harmless ones, e.g. "Save", "Done", "Share", "Sign in", "Upload".)
+
+### `dct train record`: saving an answer someone else gave
+
+`dct train record --json` reads one request on stdin and appends one training
+row (version 2) to `~/.dct/explore/answers.jsonl` (mode 0600). It is for
+callers that asked someone else a question, so the answer can train Jeff
+later. Nothing else is written.
+
+```json
+{"question_id": "q-17", "by": "user", "key": "b", "outcome": "good",
+ "run_outcome": "published",
+ "corrects_jeff": false, "jeff_asked": true,
+ "shown": [{"key": "a", "text": "…"}, {"key": "b", "text": "…"}],
+ "step": 3, "state": "…", "forbid": ["a string that must not be recorded"]}
+```
+
+- Required: `question_id`, `by` (`jeff` | `model` | `user`), `key`, `outcome`
+  (`good` | `bad` | `unknown`) and `run_outcome` (`published` | `declined` |
+  `halted` | `stopped`). The rest is optional: `corrects_jeff`, `jeff_asked`,
+  `shown` (up to 254), `step`, `state`, `forbid`.
+- **The caller must replace the user's own values with `{name}` placeholders
+  first.** A request whose `state`, `key` or `shown` texts contain any `forbid`
+  string is refused, not stored.
+- `label` in the reply says whether the row counts as a training label: a
+  user's answer always does; a model's answer only when `outcome` is `good`; a
+  Jeff answer never does.
+- Answer `{"recorded": true, "label": true|false}`. Exit 0 recorded, 1 the
+  file can't be written, 2 the request is wrong.
+
+---
+
+## The `[llm]` connection
+
+`[llm]` in `~/.dct/config.toml` is the one general-purpose model connection
+dct itself uses. **It is off until you write the section.** With no `[llm]`
+(or a config file that can't be parsed) nothing is ever sent anywhere; a
+broken config never stops dct from starting.
+
+Things that use it: naming sessions, [explaining a
+failure](#a-failure-in-one-sentence), the second rung of `dct answer` and its
+model veto, `dct do`, `dct game play --ask-model`, and (through `[ask]`) `dct ask`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `provider` | none | the name of a profile (built in, or yours in `~/.dct/profiles/`). **No default**: dct never picks a vendor; without it the feature stays off and you get a one-line hint |
+| `transport` | `"cli"` | `"cli"` runs that profile's own headless command; `"http"` calls the endpoint in the profile's `[api]` section directly |
+| `model` | none | required for `http`; dct will not guess one |
+| `base_url` | the profile's `[api].base_url` | optional override |
+
+An example with an OpenAI-compatible server is under [A failure, in one
+sentence](#a-failure-in-one-sentence). `dct llm check` makes one real call and
+says whether it worked.
+
+- **The DC profile.** The built-in `dc` profile points at the camp gateway,
+  `https://dc-llm.tzspace.cn/v1` (OpenAI wire format). Pairing writes the key
+  to `secrets.toml` and the model names to `pair-models.toml`. The ask design
+  document records that chat on that gateway is answered by `qwen3.8:27b` on an
+  Ollama server (its section 3.7, measured on 2026-10-16/17 and not re-checked
+  since). If your old `[llm]` used `provider = "dc"` with a Claude model,
+  change it to `provider = "qwen"`, `transport = "http"` and a model your
+  account has. dct never rewrites an existing `[llm]`.
+- **Only your own gateway, unless you write something else.** Nothing in the
+  code sends to an external frontier model by itself, and there is no switch
+  for one. `dct ask` accepts only an `http` `[llm]` whose host is in `[ask]
+  allowed_hosts` (default `dc-llm.tzspace.cn`). `[llm]` itself also accepts a
+  vendor CLI as provider (`claude`, `codex`, …), which talks to that vendor;
+  that happens only if you write it.
+- **Credentials.** A key you saved in dct is used for the provider you saved it
+  for. A login borrowed from another program (Claude Code, Codex) is only ever
+  sent back to that program's own vendor hosts, whatever the profile or
+  `base_url` says.
+- Pairing's tick box ("let AI explain errors you can't read") appends `[llm]`
+  only if you leave it ticked and approve in the browser, and never touches an
+  existing `[llm]`.
+
+---
+
+## `dct ask`: the read-only chat entry
+
+**This branch only (`dct-ask`, not even on `integration`).** `dct ask` lets dco
+hold a spoken or typed conversation with the model behind `[llm]`. It is a
+chat: the reply is shown or spoken, never run. The ask service cannot see your
+sessions, cannot type into them and has no tools.
+
+**Turn it on once, yourself:**
+
+1. Have a working `[llm]` with `transport = "http"` and an OpenAI-compatible
+   endpoint (see [the `[llm]` connection](#the-llm-connection)).
+2. Run `dct ask --enable` in a terminal. It tells you which host your words
+   will go to, what is sent and what is not, and writes nothing unless you type
+   `y`. It has no `--yes`, and refuses when stdin or stdout isn't a terminal
+   (exit 2). It appends this to `config.toml` (it does not rewrite the file,
+   and an existing `[ask]` section, on or off, is left alone):
+
+   ```toml
+   [ask]
+   enabled = true
+   allowed_hosts = ["dc-llm.tzspace.cn"]
+   ```
+
+   Exit codes of `dct ask --enable`: 0 turned on (or already on), 1 not
+   turned on (you didn't say `y`, an `[ask]` section already exists, or the
+   file can't be written), 2 not a terminal, 11 `[llm]` isn't usable for `ask`.
+
+3. After installing this build, run `dct restart` once. A daemon from an older
+   build doesn't know the `Ask` request (protocol 25) and `dct ask` answers
+   `daemon_down` with `reason: "protocol"`. `dct restart` ends every running
+   session, so pick a moment.
+
+The `[llm]` consent only covers terminal error text; what you say needs its own
+switch, which is why `[ask]` exists. `[ask]` is read on every request, so
+turning it on or off needs no restart.
+
+**Calling it.** The text goes on stdin, never on the command line (arguments
+are visible to every user through `ps`):
+
+```sh
+echo '{"v":1,"text":"What is the weather like?","source":"voice","conversation_id":"c-7f3a"}' | dct ask
+```
+
+| Field | Rules |
+|---|---|
+| `v` | optional; if present it must be `1` |
+| `text` | required, at most 500 characters after control characters become spaces; longer is refused, not cut |
+| `source` | `"voice"` or `"typed"`; only a hint to the model (speech may be misheard, replies get read aloud). **It is never an authorization** |
+| `conversation_id` | `[A-Za-z0-9_-]`, 1 to 64 characters; memory is kept per id |
+| `persona` | optional, at most 300 characters, goes under the fixed rules and can't override them |
+| `timeout_ms` | optional, default 8000, clamped to 1000–30000 |
+
+stdin is read up to 16 KiB. One event per line comes back on stdout, every
+event has `"v": 1`:
+
+```jsonl
+{"v":1,"type":"start","conversation_id":"c-7f3a","turn":3}
+{"v":1,"type":"sentence","i":0,"text":"It is sunny."}
+{"v":1,"type":"end","sentences":1,"truncated":false,"first_ms":1840,"total_ms":2100}
+```
+
+Every call ends with exactly one `end` or `error` (nothing if you closed the
+connection). A request that is refused (bad input, not enabled, busy) has an
+`error` and no `start`. If sentences were already sent when the model dies or
+times out, you get `end` with `"truncated": true`, not an `error`. An `error`
+carries `code`, `stage`, `retryable`, `after_ms` and a fixed `reason` word
+(never any of your text). `dct ask` writes nothing to stderr.
+
+| Exit | `code` | Meaning |
+|---|---|---|
+| 0 | (`end`) | finished, including `truncated` |
+| 2 | `bad_request` | bad input; `reason` is one of `not_json`, `bad_version`, `empty_input`, `too_long`, `bad_source`, `bad_conversation_id`, `persona_too_long`, `usage` |
+| 10 | `daemon_down` | no daemon answering (it is **not** started for you), or an old daemon: `reason` is `socket`, `closed` or `protocol` |
+| 11 | `not_enabled` | `reason` is `ask_off`, `llm_missing`, `llm_not_http`, `llm_unusable` or `host_not_allowed` |
+| 12 | `unreachable` | the gateway can't be reached (DNS, refused, TLS, connect timeout) |
+| 13 | `auth` | the gateway said 401/403; retrying doesn't help |
+| 14 | `busy` | the gateway said 429/503, or another conversation is already in flight (`reason` `in_flight`; only one at a time) |
+| 15 | `slow` | no sentence by the deadline |
+| 16 | `empty` | the stream ended with nothing visible to say |
+| 17 | `bad_reply` | the response couldn't be understood |
+| 18 | `cancelled` | a newer ask in the same conversation replaced this one |
+
+**Cancelling is closing the connection.** dco kills the `dct ask` process; the
+socket closes; the daemon stops generating and frees the in-flight slot at
+once (the gateway may keep generating for a moment, at most `timeout_ms`). On
+Windows the daemon can only notice by a failed write, which is weaker; dco is
+Mac-only today.
+
+**What it remembers.** The last 6 turns per conversation, at most 3 000
+characters, 4 conversations at a time, dropped after 30 idle minutes. It lives
+in the daemon's memory and is **never written to disk**. `dct ask --forget
+<conversation id>` drops one. Restarting the daemon drops everything.
+
+**What leaves the machine.** This turn's text, up to 6 turns of history, a
+fixed system prompt and your optional `persona`, to the host of your `[llm]`
+only. No screen content, no files, no session list. No tools in the request,
+`max_tokens` 200, no thinking field.
+
+**What it writes.** One metadata line per ask in `~/.dct/ask.log` (mode 0600,
+replaced when it passes 256 KiB): `t`, `source`, `conv` (the first 4 hex
+characters of a hash of the conversation id, not the id), `chars_in`,
+`chars_out`, `first_ms`, `total_ms`, `outcome`. No text of what you or the
+model said. Requests refused as `bad_request` are not logged.
+
+Other uses of the same gateway inside the daemon (error explanations, session
+names, the phone page) wait up to 20 seconds while an ask is in flight and then
+give up; `dct answer`, `dct do`, `dct game` and `dct llm check` run in other
+processes and don't wait.
+
+Design, measurements and the open list: [`docs/2026-10-16-dct-ask-design.md`](docs/2026-10-16-dct-ask-design.md).
+Not verified: cancelling while the gateway is still pre-filling, TLS close
+behaviour, behaviour under load, and a run against the real gateway
+(section 16 of that document says the real-gateway smoke test was not done).
+
+---
+
+## Voice: `dct voice`
+
+Needs dco on a Mac. `dct voice` runs in the foreground (`Ctrl-C` quits) and
+listens to what dco hears. Each sentence you speak after clicking the dco
+octopus is typed into your most recently active agent session, as if you had
+typed it and pressed Enter. Anything said before you started is skipped.
+
+**Voice never counts as authorization.** A sentence is sent only if all of
+these hold:
+
+- dco says it was triggered by a click on the octopus (`octopus_click`, the
+  only trigger accepted: a voice that sounds like you could be a television);
+- confidence is at least 0.5;
+- it is not just a bare confirmation ("好", "嗯", "ok", "yes", …);
+- the target session is not waiting for an approval prompt (voice can't answer
+  those) and is not a plain shell session;
+- at least 2 seconds since the previous one;
+- you don't say "取消", "算了", "别发" or "cancel" within the 2-second window
+  after dct announces it. The state of the session is checked again when the
+  window ends.
+
+The text sent is prefixed with `（语音输入，可能有识别错误）` so the agent knows
+to be forgiving. Say "给 X 说…", "对 X 说…" or "告诉 X…" (X is a session's
+name or `#id`) to pick a session; two matches stop the send.
+
+**Voice route** (this branch only). Before each sentence dct reads
+`converse.voice_route` from dco's `status`, fresh every time. `chat`: dct
+sends nothing and says so once (dco's own conversation, which calls `dct ask`,
+handles the sentence). `agent`, or an old dco with no `converse` block: it
+sends as before. A route that can't be read, or has an unknown value: it sends
+as before and says so once; the cost is that words meant for chat can land in
+an agent's terminal if the route is unreadable.
+
+**`~/.dct/voice.toml`** (optional):
+
+```toml
+log_text = false          # true: also keep the words in voice.log
+[alias]
+章鱼 = ["张瑜", "张宇"]   # the right word = what the recogniser often writes instead
+```
+
+Without a file the alias table is the built-in one for 章鱼. A wrong type for
+`log_text` is an error, never silently "on" or "off".
+
+**`~/.dct/voice.log`** (mode 0600, one JSON per line) holds metadata only by
+default: `t`, `trigger`, `session` (the number, not the name), `chars_raw`,
+`chars_fixed`, `confidence`, `route`, `action`, `reason`. With `log_text =
+true` it also has `text_raw` and `text_fixed`, **except** for sentences that
+were skipped because the route was `chat`, which never carry text. Lines
+written by an older build may contain your words; this build does not clean
+them up.
 
 ---
 
@@ -801,7 +1282,7 @@ The middle of the bar is the current project, reversed out of the bar's own
 colours so it can't be mistaken for one more key name.
 
 The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile,
-stopped sessions included) and `Shift+F3` / `Ctrl+F3` / `F8` do the same as `←`, `Enter` zooms into the focused tile, `g` goes back to
+stopped sessions included) and `F8` (also `Shift+F3` / `Ctrl+F3`, but `Shift+F3` was reported not working in the user's terminal and `Ctrl+F3` is grabbed by macOS; see below) does the same as `←`, `Enter` zooms into the focused tile, `g` goes back to
 the list, and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly
 what they do on the board. Two differences: folding is list-only, because in the
 grid the left and right arrows move the focus; and the digits work with no number
@@ -821,20 +1302,25 @@ More than nine sessions get more pages, with a page indicator.
 
 Inside a session every keystroke goes to the agent, `Esc` included — agents need
 it for their own popups. `F2`…`F6` are the only keys `dct` keeps: `F2` backs out
-to the board, `F3` jumps straight to the next running session, `Shift+F3`,
-`Ctrl+F3` or `F8` jumps to the previous one, `F4` toggles copy
+to the board, `F3` jumps straight to the next running session, `F8` jumps to
+the previous one (so do `Shift+F3` and `Ctrl+F3`, but see below), `F4` toggles copy
 mode, `F5` pastes an image, `F6` opens the colour picker. The bottom-left hint
 (`F2 back`) is always there — a disconnect, an error, or a long message can't
 push it off the line, because it's the only way out of a session.
 
 Next/previous follow the board's order (project, then id), wrap around at the
 ends and skip stopped sessions. The previous key is not on the hint bar (there
-is no room); `Alt+F3` still means next. macOS may claim `Ctrl+F3` for the Dock, so
-`Shift+F3` and `F8` are the safe ones; some terminals strip modifiers from
-function keys, and then `F3` simply means next. To see what your terminal
-actually sends, run `cat -v` and press the key: `^[[1;2R` is `Shift+F3`, `^[OR`
-or `^[[13~` is plain `F3`, `^[[19~` is `F8`. (Before this, any modifier + `F3`
-meant next; now `Shift`/`Ctrl` + `F3` means previous.)
+is no room); `Alt+F3` still means next.
+
+**`F8` is the reliable previous key.** `Ctrl+F3` is claimed by macOS (the Dock)
+before it reaches the terminal. `Shift+F3` is in the code and covered by unit
+tests, but **it has been reported not to work in at least one real terminal,
+and why is still being diagnosed**: don't count on it. Some terminals also
+strip modifiers from function keys, and then `F3` simply means next. To see
+what your terminal sends, run `cat -v` and press the key: `^[[1;2R` is
+`Shift+F3`, `^[OR` or `^[[13~` is plain `F3`, `^[[19~` is `F8`. (Before this
+change any modifier + `F3` meant next; now `Shift`/`Ctrl` + `F3` means
+previous.)
 
 You can scroll back through what a session already printed, with
 `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled
@@ -1039,6 +1525,9 @@ It stops and presses nothing when it meets something that costs money, an ad, no
 After a win it does not go on to the next level by itself: the board sits in a different place on the next level, so that has to wait until "recognise a new board automatically" is built.
 
 ## Post to a social platform (Mac, early)
+
+**This branch only, and it carries application-specific content that [the
+boundary](#what-dct-is) says dct shouldn't hold.**
 
 **Nothing here has run on a real screen yet.** Everything below is tested
 against a fake dco; the first pilots (X, then TikTok) need you there.
@@ -1326,6 +1815,218 @@ overrides it for one run, and with neither it follows your system locale.
 
 ---
 
+## Config reference
+
+Everything lives under `~/.dct/` (see [Files](#files-under-dct)). A config that
+can't be read or parsed never stops dct from starting; dct falls back to the
+defaults below (every optional feature off) and prints one line on stderr.
+
+**`~/.dct/config.toml`**
+
+| Key | Default | What it does |
+|---|---|---|
+| `[llm]` `provider` | none (feature off) | profile name that serves the model; no vendor is ever chosen for you |
+| `[llm]` `transport` | `"cli"` | `"cli"` or `"http"` |
+| `[llm]` `model` | none | required for `http` |
+| `[llm]` `base_url` | the profile's `[api].base_url` | override |
+| `[judge]` `backend` | `"jev"` | the only value accepted |
+| `[judge]` `base_url` | none | address of `jeff-serve`; without it Jeff is never asked (a `[judge]` with only `gate_tiers` / `model_veto` is fine) |
+| `[judge]` `model` | `"jeff-latest"` | the model name `jeff-serve` answers to |
+| `[judge]` `api_key_env` | none | name of an environment variable holding a key; sent as Bearer only to the `base_url` host; plain `http://` only to this machine |
+| `[judge]` `threshold` | `0.8` | Jeff's answer counts only at or above this confidence |
+| `[judge]` `timeout_ms` | `5000` | per request |
+| `[judge]` `gate_tiers` | `["critical", "money"]` | which tiers `dct answer` stops; may add `"content"`; `critical` and `money` can't be removed |
+| `[judge]` `model_veto` | on when `[llm]` is set | `false` turns the model veto off |
+| `[judge.serve]` `command` | none | argv array (no shell) that starts the judge server; without it dct never starts or stops anything |
+| `[judge.serve]` `env` | `{}` | extra environment, strings only |
+| `[judge.serve]` `ready_timeout_secs` | `60` | how long to wait for `GET <base_url>/health` |
+| `[judge.serve]` `autostart` | `false` | `true`: `dct answer` starts the server once when it is unreachable |
+| `[judge.serve]` `min_free_percent` | `15` | refuse to start below this much free memory |
+| `[ask]` `enabled` | `false` | `dct ask` works only when `true`; `dct ask --enable` writes it |
+| `[ask]` `allowed_hosts` | `["dc-llm.tzspace.cn"]` | the only hosts `dct ask` will send to |
+| `[menu]` `agents` | `[]` (show all) | which agent profiles the picker shows, in this order |
+| `[mesh]` `relay` | `https://dataclue.cn/dct-relay` | the relay for several computers |
+
+**`~/.dct/voice.toml`** (optional): `log_text` (default `false`), and an
+`[alias]` table of `right word = ["what the recogniser writes", …]`.
+
+**`~/.dct/profiles/*.toml`**: one agent per file. Keys read by dct: `name`,
+`command`, `is_agent`, `pairable`, `idle_pattern`, `busy_pattern`,
+`error_pattern`, `env`, `secret`, `install`, `login`, `headless`, `api`,
+`label`, `note`, `resume_args`, `backend_only`. See [Your own
+agents](#ten-agents-one-door).
+
+**`~/.dct/platforms.toml`** (optional, for `dct do`): rows that replace or add to
+the built-in platform table. **`~/.dct/games/candy-crush.toml`** (optional): where
+the board is on screen for `dct game`.
+
+**Environment variables** used by dct itself: `DCT_LANG` (`en` or `zh`; beats
+the saved choice and the system locale), `NO_COLOR`, `DCT_RELAY` (the live relay; no default), `DCT_RELEASE_BASE`,
+`DCT_INSTALL_DIR`, `DCT_MINGIT_URL`, `DCT_NODE_BASE`, `DCT_NPM_REGISTRY` (see
+[Install](#install)).
+
+---
+
+## Files under `~/.dct`
+
+All paths are derived from the daemon socket's folder, which is why tests can
+move them to a temporary directory without touching yours.
+
+| File | What it is |
+|---|---|
+| `daemon.sock` | the daemon's local socket (owner only) |
+| `config.toml` | the config above; appended to (never rewritten) by pairing and `dct ask --enable` |
+| `secrets.toml` | API keys and the `dct gate` key; **mode 0600**; never inside a profile file |
+| `settings.json` | language, view mode, bar colour |
+| `projects.json` | recent projects and each one's last agent |
+| `last-sessions.toml` | what was running, so a restarted daemon can offer it back |
+| `sessions.log` | how each session started and how it ended |
+| `pair-models.toml` | the model names pairing wrote |
+| `profiles/` | your own agent profiles |
+| `runtime/` | dct's own Node and portable git, for dct's use only |
+| `ask.log` | one **metadata** line per `dct ask` (mode 0600); no text |
+| `voice.toml`, `voice.log` | voice settings; the voice log (mode 0600), metadata only by default |
+| `judge-serve.pid`, `judge-serve.log` | the pid record of the judge server dct started, and its log (mode 0600, replaced on each start); `judge-serve.lock` and `judge-serve.err` are also written next to them |
+| `dco-rules.json` | written verbatim from `dco rules --json` for the dc-vault rules page |
+| `explore/answers.jsonl` | training rows from `dct do` and `dct train record` (mode 0600) |
+| `explore/runs/<run>/trace.json` | each `dct do` run's steps and the pictures it showed you |
+| `campaigns/<name>.json` | approved campaign texts with their fingerprint |
+| `platforms.toml` | your platform rows for `dct do` |
+| `games/log/<date>.jsonl` | one line per `dct game` move |
+
+---
+
+## Security and privacy
+
+- **What was heard is not authorization.** `dct voice` sends nothing unless a
+  click on the dco octopus triggered it, never answers an approval prompt and
+  never sends a bare "yes". The `source` field of `dct ask` is a hint to the
+  model and nothing else.
+- **No transcripts by default.** `voice.log` and `ask.log` keep counts, timings
+  and decisions, not words (`voice.toml` `log_text = true` is the only way to
+  put words in `voice.log`). `dct ask` memory is in the daemon's RAM and is
+  never written. Lines an older build wrote to `voice.log` may still contain
+  words.
+- **Off until you turn it on.** No `[llm]`, no model call. No `[ask]
+  enabled = true`, no chat. Consent can't be given by another program:
+  `dct ask --enable` and `dct campaign approve` refuse when they aren't on a
+  terminal.
+- **Only your own gateway.** `dct ask` sends only to hosts in `[ask]
+  allowed_hosts` (default `dc-llm.tzspace.cn`), over the `http` transport; a
+  vendor CLI as `[llm]` provider is refused for `ask`. A login borrowed from
+  Claude Code or Codex is never sent anywhere but that vendor's own hosts.
+- **What a failure explanation sends.** With `[llm]` set, the end of a failed
+  session's screen (the last 2 000 characters) goes to your model. That is
+  where keys and tokens tend to appear, which is why `[llm]` is opt-in.
+- **Secrets.** `secrets.toml` is mode 0600 and profile files never hold keys. Don't
+  put a secret in `[judge.serve]` `command` or `env`: any user on the machine
+  can read them with `ps`. `[judge] api_key_env` names a variable; it never
+  holds the key.
+- **The danger gate is rules.** It stops money and permanent deletion by word
+  list, not by confidence, but only the words `dct-brain` knows
+  ([limits](#the-danger-gate-dct-answer)). Callers should still filter options
+  they know are destructive.
+- **Undo has a boundary.** Snapshots cover the project directory; an agent
+  that writes outside it can't be undone ([Things that will
+  annoy you](#things-that-will-annoy-you)).
+- The phone page, the live link and the browser door each have their own
+  token rules, described in their sections.
+
+---
+
+## Jeff's exam and dev sets
+
+Training and evaluating Jeff is held to one rule: **the exam is never used to
+choose anything.** Files in this branch:
+
+- `tests/fixtures/jeff-exam/exam-v3.jsonl` (364 items) with `manifest-v3.json`.
+  **Frozen** on 2026-10-14 by the owner and held out: never train, develop,
+  calibrate or tune a threshold on it; evaluate once per candidate at the
+  threshold already chosen; when exporting training rows, drop any whose
+  `dedup_sha256` equals an exam item. A changed byte is a new exam version
+  that needs the owner's agreement, and old and new scores are reported
+  separately. `exam-v2.jsonl` and `manifest.json` stay as the historical
+  record.
+- `tests/fixtures/jeff-dev/` (`dev-v3.jsonl`, `dev-v4.jsonl`, their manifests
+  and scenario files): the set a threshold is **chosen** on. The v3 manifest
+  records `0.98` as the provisional threshold chosen on `dev-v4`; the code's
+  default `[judge] threshold` is still `0.8`.
+- `scripts/jeff-exam/`: `build_exam.py`, `check_overlap.py`, `diff_danger.py`,
+  `exam_lib.py`, `danger_allowlist.json`, and `run_exam.py`, which asks a live
+  `jeff-serve` every item (`python3 -I scripts/jeff-exam/run_exam.py --label
+  v1.2 --out DIR [--set exam|exam-v3|dev|dev-v4] [--url …] [--seeds 5]
+  [--threshold 0.8]`) and refuses to run when a set no longer matches its
+  manifest.
+
+Jeff v1.2 (`jeff-legacy/Jeff-Qwen3.5-0.8B`, revision `d86f657`) is the model in
+use. The training design (`docs/superpowers/specs/2026-10-11-dct-jeff-auto-training-design.md`)
+keeps it until a retrained one is approved by the owner. `docs/HANDOFF.md` says
+that when it was written only the training-row format (`dct train record`,
+`explore/answers.jsonl`) was built; the rest of that design has not been checked
+against the code.
+
+---
+
+## Troubleshooting
+
+- **Both builds say `dct 0.2.24`.** The version number can't tell `origin/main`
+  from this branch. If `dct --help` has no `dct ask`, `dct answer`, `dct judge`
+  or `dct do`, you are running the published build.
+- **A daemon that is "stale".** Tell-tales: the board asks whether to restart
+  the daemon, `dct status` says the daemon is stale, `dct ask` exits 10 with
+  `reason: "protocol"`. The daemon was started from a build with a different
+  socket protocol. `dct restart` swaps it, and **ends every running session**
+  (file changes stay, the agents don't); `dct restart -y` skips the question.
+  After rebuilding with the same version number nothing notices the difference,
+  so run `dct restart` yourself.
+- **`Shift+F3` doesn't go to the previous session.** Use **`F8`**, which is
+  the reliable one. `Shift+F3` is implemented and unit-tested, but one user has
+  reported it does nothing in their terminal. `Ctrl+F3` is taken by macOS. See
+  the next entry for the suspected cause and [The board](#the-board) for how to
+  see what your terminal sends.
+- **Known issue: the `Shift+F3` previous-session key may never arrive as a key
+  event.** *Diagnosis from reading code, not yet confirmed on a live terminal.*
+  `dct` reads input through crossterm 0.28.1, which treats any `CSI … R` as a
+  cursor-position reply and drops it, and xterm-style terminals (and tmux with
+  `xterm-keys` on, `extended-keys` off) send `Shift+F3` as `ESC[1;2R`. `Ctrl+F3`
+  (`ESC[1;5R`) is dropped the same way. The unit tests build `KeyEvent`s
+  directly, so they don't cover decoding. Workaround: use `F8`. To check what
+  your terminal sends, run `cat -v` and press the key (`^[[1;2R` confirms it).
+- **`zsh: killed` right after copying a new `dct` over the old one.** Don't
+  `cp` over an installed binary; see the **Don't `cp` over an installed binary** paragraph under [Install](#install).
+- **`dct voice` says dco is missing or too old.** Start dco, or update it; the
+  command needs dco's `hear` tool.
+- **`dct judge up` refuses.** `[judge] base_url` must be `127.0.0.1`,
+  `localhost` or `::1`; free memory must be above `min_free_percent`; `down`
+  only stops a server dct started itself.
+- **`dct answer` exits 1.** The config couldn't be read, or `[judge] gate_tiers`
+  names an unknown tier or leaves out `critical` or `money`. The reason is on
+  stderr.
+- **A pty test fails once and passes on a rerun.** Tests that open real
+  pseudo-terminals have failed intermittently when the suite runs in parallel,
+  and the cause has not been pinned down. Run them one at a time:
+  `cargo test -- --test-threads=1`.
+
+---
+
+## More documentation
+
+- [`docs/HANDOFF.md`](docs/HANDOFF.md): where the explore-and-learn branch
+  stands, and research notes on a local decision model. Read it first in a new
+  session on this repo.
+- [`docs/2026-10-16-dct-ask-design.md`](docs/2026-10-16-dct-ask-design.md): `dct ask`, with the
+  measurements and the honest "not done" list.
+- [`docs/2026-10-03-dct-dco-dcv-distributed-agent-runtime.md`](docs/2026-10-03-dct-dco-dcv-distributed-agent-runtime.md):
+  the earlier architecture note on how dct, dco and dcv relate.
+- [`docs/superpowers/specs/`](docs/superpowers/specs/): one design per feature (judge, brain,
+  control layer, pairing, multi-machine, invite code, voice relay, match-3,
+  Jeff auto-training, …), and [`docs/superpowers/plans/`](docs/superpowers/plans/) next to it.
+- [`docs/deploy-live-relay.md`](docs/deploy-live-relay.md): putting the live relay on the public internet.
+- [`container/README.md`](container/README.md): dct in a browser.
+- [`docs/2026-09-04-gateway-findings.md`](docs/2026-09-04-gateway-findings.md): what was learned about the gateway.
+
+---
+
 <details>
 <summary><b>Where this is going</b> — what isn't written yet</summary>
 
@@ -1365,8 +2066,32 @@ in between shouldn't need you watching.
 
 </details>
 
+## Development
+
+```sh
+cargo build --release          # ./target/release/dct
+cargo install --path . --root ~/.local   # puts the binary where scripts/install.sh does
+cargo test -- --test-threads=1 # see Troubleshooting for why one at a time
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+The repository is a Cargo workspace; the root package is `dct` itself and
+`crates/` holds `dct-brain`, `dct-dco`, `dct-explore`, `dct-game`, `dct-link`,
+`dct-mesh`, `dct-page` and `dct-srv`. Tests make real git repos, spawn real
+processes and bind real sockets, but nothing touches your own `~/.dct` and
+nothing hits the network. Tests that need a real dcv or a real relay are
+`#[ignore]`d (for example `cargo test --test mesh_e2e -- --ignored`).
+`cargo fmt --check` already fails on files that predate this branch
+(`docs/HANDOFF.md` records 55 files, written 2026-10-11 and not re-checked
+since), so don't fold a whole-repository format into a feature commit.
+
+When a change touches the daemon socket, bump `PROTOCOL_VERSION` in
+`src/proto.rs` (a test pins the wire shape to it); this branch is at 25. After
+it changes, every running daemon is stale until `dct restart`.
+
 <details>
-<summary><b>For anyone working on the code</b></summary>
+<summary><b>For anyone working on the code</b> — the source layout and the house rules</summary>
 
 <br>
 
@@ -1399,7 +2124,19 @@ src/journal.rs     how each session started and how it ended (asked to stop, or 
 src/proto.rs       the wire contract
 src/config.rs      ~/.dct/config.toml; [llm] is off unless written
 src/llm/           the [llm] connection: CLI or HTTP, and which credential may go where
-src/judge/         dct judge: Jev choice questions over HTTP to jeff-serve; confidence recomputed here
+src/judge/         dct judge: Jev choice questions over HTTP to jeff-serve; confidence recomputed here;
+                   serve.rs starts and stops the local judge server (dct judge up / down / status)
+src/answer.rs      dct answer: the ladder, the request/answer JSON, the rule-based danger gate
+src/answer_veto.rs the model veto after the gate (it can only add a veto)
+src/train_record.rs  dct train record: one v2 training row per answered question
+src/ask/           dct ask: input checks, the streaming turn, memory (RAM only), fixed prompt,
+                   the daemon-side service, ask.log (metadata only). Never touches sessions
+src/voice/         dct voice: gates, routing to a session, the dco voice route, voice.log
+src/dco_rules.rs   dct dco-rules and the daemon's watcher that keeps ~/.dct/dco-rules.json fresh
+src/mesh/          several computers: login, invite, join, peers, send
+src/game/          dct game: match-3 and hidden-object play through dco
+src/keys/, src/procedures.rs  dct keys and dct procedure (Touch ID signing keys, approvals, tickets)
+src/ui/dco_cell.rs the board's read-only dco label
 src/campaign.rs    dct campaign approve: one approval for every platform's text
 src/explore_cli*   dct do: window, replay or explore, draft, card, exit codes, --json
 src/explore_model.rs  the [llm] step of dct do: pick a key from the list, or fix a refused draft
@@ -1413,6 +2150,9 @@ src/gate.rs        dct gate, the key-checking door for the browser version
 src/web/           the LAN phone client: a tiny HTTP server and one page
 src/link.rs        dials out to a relay and long-polls it (no switch yet)
 src/sys/           everything that differs between Unix and Windows
+crates/dct-brain/  tiers for the danger gate, execution tickets, signature checks; no disk, no network
+crates/dct-mesh/   machine ids, the 6-digit invite code (SPAKE2), key pairs, signed group lists
+crates/dct-game/   match-3 move choice (pure), the dco status probe behind `dct status --json`
 crates/dct-dco/    the dco client (unix socket MCP), shared by dct game and dct do
 crates/dct-explore/  hands, platform table, stop rules, options, the Jeff → model → you ladder,
                    explore, trace and training rows, drafts, replay
@@ -1463,3 +2203,4 @@ on screen telling the user how to quit.
 ## License
 
 [MIT](LICENSE)
+

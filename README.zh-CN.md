@@ -36,7 +36,92 @@ q quit         ai-mania         Enter open  n new  Tab project  ? …
 
 ---
 
+**目录：** [dct 是什么](#dct-是什么) · [哪个版本有什么](#哪个版本有什么) ·
+[装上它](#装上它) · [日常使用](#它从来不问这样可以吗) ·
+[命令](#命令) · [`dct status --json`](#dct-status---json) ·
+[替别的程序做决定](#替别的程序做决定) ·
+[`[llm]` 连接](#llm-连接) · [`dct ask`](#dct-ask只读的聊天入口) ·
+[语音](#语音dct-voice) · [配置参考](#配置参考) ·
+[文件](#dct-下的文件) · [安全与隐私](#安全与隐私) ·
+[排错](#排错) · [开发](#开发)
+
+## dct 是什么
+
+dct 是一个终端会话守护进程，前面套了一层终端界面。在代码里：
+
+| 部分 | 位置 | 做什么 |
+|---|---|---|
+| pty | `src/pty.rs` | 每个会话一个伪终端，带一块 vt100 屏幕缓冲 |
+| session | `src/session.rs`、`src/git.rs` | 会话生命周期；每 200 ms 读一次屏幕，判断是在干活 / 空闲 / 已停止 / 出错；隐藏的 git 快照 |
+| daemon | `src/daemon.rs`、`src/proto.rs` | 拥有全部会话。界面和每一条 `dct …` 命令都是它的客户端，走本机 socket（`~/.dct/daemon.sock`，一行一个 JSON 对象） |
+| ui | `src/ui/` | 看板、格子视图和整屏的会话视图 |
+
+**边界。** 这条线是项目负责人划的，没有任何代码在强制执行。
+dct 是人和模型之间的入口：它开会话、让会话活着、把会话展示出来，并把人说的话带给模型、
+把模型的追问带回来。它**不带任何业务或应用相关的内容**。**dcv** 管规则和决定；
+**dco** 做具体操作（看屏幕、做输入、输出和界面动作）。dct 去调用它们；它们的逻辑不在 dct 里。
+
+- **dcv** 是一个单独的程序，存着用户确认过的东西（规则、流程）。dct 读写它：
+  `dct do` 把流程草稿写进去，批准也经由它。
+- **dco** 是同一台机器上的另一个单独的程序。dct 通过本机 socket 跟它说话，用于 `dct voice`、
+  `dct game`、`dct do`、`dct dco-rules`、看板上的 `dco` 标签，以及 `dct status --json` 里的
+  `dco` 块。按 `dct --help` 的说法，需要它的命令只支持 Mac。没有 dco 的话，这些命令不能用，
+  其余一切照常。
+
+这棵树里有些命令**跟这条边界冲突**：`dct do` 和 `dct campaign` 带着一张社交平台表，
+`dct game` 带着一份 Candy Crush 的配置。因为它们在代码里，所以下面照样写了。
+这份 README 没有说它们以后会去哪儿。
+
+---
+
+## 哪个版本有什么
+
+这里有两件事容易混：这个分支的代码做什么，和已发布的 `origin/main` 上有什么。
+这份 README 描述的是分支 `dct-ask`，位于 `2c194da`。下面的对比是拿 `git ls-tree origin/main`
+跟那个提交比，用的是本地的 `origin/main` 引用（`542c53e`，版本 0.2.24，socket 协议 24）；
+写这份文档时没有执行 fetch。
+
+| | `origin/main` | 分支 `dct-ask` |
+|---|---|---|
+| 看板、格子、attach、install、手机页、Telegram、直播、多电脑、`dct gate`、`dct game`、`dct dco-rules`、`dct llm check` | 有 | 有 |
+| 切换会话的键：`F3` = 下一个可用；`F8` = 上一个，是靠得住的键；`Shift+F3` 用户报告在他的终端里**不起作用**；`Ctrl+F3` 被 macOS 抢走 | 有 | 有 |
+| `dct voice`（基本转发） | 有 | 有 |
+| `[llm]` 没有默认的 `provider` | 没有（默认是 `claude`） | 有 |
+| `dct judge`、`[judge]`、`dct judge up / down / status`、`[judge.serve]` | 没有 | 有 |
+| `dct answer`、危险闸、模型否决、`dct train record` | 没有 | 有 |
+| 看板上的 `dco` 标签和 `dct status --json` 里的 `dco` 块 | 没有 | 有 |
+| `dct campaign`、`dct do`、平台表 | 没有 | 有 |
+| `scripts/jeff-exam`、`tests/fixtures/jeff-exam`、`tests/fixtures/jeff-dev` | 没有 | 有 |
+| **`dct ask`、`[ask]`、socket 协议 25** | 没有 | **有，只在这个分支上**（`integration` 里也没有） |
+| **`dct voice` 读 dco 的语音路由、不带转写文字的 `voice.log`、`voice.toml` 的 `log_text`** | 没有 | **有，只在这个分支上** |
+
+从 `[llm]` 到 `scripts/jeff-exam` 之间的几行，本地分支 `integration`（`14326d6`）上也有；
+它们没有一条在 `origin/main` 上。自己核对：`git log --oneline origin/main..HEAD`。因为这里的
+socket 协议是 25、`origin/main` 是 24，用其中一个版本起的守护进程，对另一个版本来说就是
+「过期」的：见[排错](#排错)。
+
+---
+
 ## 新东西
+
+只在这个分支上有（见[哪个版本有什么](#哪个版本有什么)）：
+
+- **[`dct ask`](#dct-ask只读的聊天入口)**：stdin 进一行 JSON，stdout 出一行一个 JSON
+  事件，给 dco 的对话功能用。你运行 `dct ask --enable` 之前一直是关的；记忆只在守护进程的内存里；
+  关掉连接就是取消。
+- **[语音不再记你说了什么](#语音dct-voice)**：`voice.log` 默认只留次数和决定；`voice.toml` 里写
+  `log_text = true` 才把文字记回来。`dct voice` 还会读 dco 的语音路由，语音走聊天时保持安静。
+- **[`dct answer`](#dct-answer一个问题一行-json)**：进一道选择题，出一个 JSON 答案：
+  先 Jeff，再 `[llm]` 大模型，最后「要你来」。基于规则的危险闸不管是谁选的，都拦钱和永久删除；
+  还可以再加一道可选的模型否决。
+- **[dct 替你跑 Jeff](#运行本机-judge)**：`dct judge up | down | status` 按
+  `[judge.serve]` 启动和停止本机 judge 服务。
+- **[看板上和 `dct status --json` 里的 dco](#dct-status---json)**。
+- **[`dct train record`](#dct-train-record存下别人给的答案)**。
+- **[发到自媒体平台（Mac，早期）](#发到自媒体平台mac早期)**：`dct do` 经 dco
+  发一条批过的文字。还没在真屏幕上试过。
+
+`origin/main` 上也有：
 
 - **[Telegram 会告诉你干完了](#telegram-会告诉你干完了)**：会话停了、出错了、没了，
   都会发一条消息过来；直接回复那条，你说的话就进那个会话。
@@ -52,8 +137,8 @@ q quit         ai-mania         Enter open  n new  Tab project  ? …
 - **[直播能公开到固定地址](#直播给学生看)**：直播面板里按 `p`，就上了中转的公开列表。
 - **[浏览器里的 dct](#浏览器里的-dct)**：给什么都装不了的机器用——一个容器、
   一条不用密码的链接、一个上传面板，外加一个管课堂的后台。
-- **[发到自媒体平台（Mac，早期）](#发到自媒体平台mac早期)**：`dct do` 经 dco 发批过的文字：
-  有你确认过的流程就照着重放，没有就一步步摸出来、写成流程给你确认。还没在真屏幕上跑过。
+- **[上一个会话的键](#看板)**：`F8` 跳到上一个会话，
+  `F3` 跳到下一个（`Shift+F3` / `Ctrl+F3` 靠不住，见下）。
 - **[所有命令一张表](#命令)**。
 - 看板标题栏和设置页都写着现在跑的是哪一版。
 
@@ -368,30 +453,98 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 
 光敲 `dct` 就是打开看板，守护进程没在跑就顺手拉起来。其余的：
 
+**会话和守护进程**
+
 | | |
 |---|---|
 | `dct ps` | 列出后台在跑的会话 |
-| `dct status [--json]` | dct 在不在运行、有几个会话在忙；`--json` 给别的程序读 |
-| `dct stop <会话号>…` / `--all` | 停掉会话，给它收尾的时间 |
-| `dct kill <会话号>…` / `--all` | 直接杀掉 |
-| `dct prune` | 把已经停掉的会话从列表里清掉 |
-| `dct restart` | 把守护进程换成当前这个二进制（所有会话都会断；`-y` 不问） |
-| `dct install <名字>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
-| `dct llm check` | 把配置里那条 `[llm]` 连接真的跑一次，说通不通 |
-| `dct judge [文件]` / `--probe` | 给 `[judge]` 后端（Jeff 的 `jeff-serve`）一道 Jev 格式的选择题，输出每个选项的概率；`--probe` 用固定题试通不通。退出码 0 答了，1 没配或后端出错，2 题写错了 |
-| `dct judge up` / `down` / `status [--json]` | 启动、停止（只停 dct 自己起的）、查看本机 judge 服务；见[运行本机 judge](#运行本机-judge) |
-| `dct answer --json` | 从标准输入读一道选择题（JSON：`state`、`options`，可选 `allow` / `forbid` / `picture`），写一行 JSON：先 Jeff，再 `[llm]` 大模型，最后「要你来」（不弹任何东西）。**危险闸**会拦下字面是对外、不可逆或花钱的选择（见[危险闸](#危险闸dct-answer)）。退出码 0 有答案或要你来，1 配置读不了或不合规，2 请求不对 |
-| `dct campaign approve <名字> --param <平台>.<参数>=<值>…` | 一个活动要发的文字，各平台一次批准（在终端里本人点头，再按指纹，指纹签的就是这些文字；标准输入不是终端就拒绝）；各平台文字和开头句不能相同 |
-| `dct do "<目标>" --platform <平台> --campaign <名字> [--window <窗口号>] [--preview] [--json]` | 经 dco（只有 Mac）把活动里批过的文字发到一个平台：有确认过的流程就照着重放；没有就摸索，写成流程草稿，给你看确认卡片（按指纹确认）。每次点发布前都先问你。详见[发到自媒体平台](#发到自媒体平台mac早期) |
+| `dct status [--json]` | dct 有没有在跑、有几个会话在忙；`--json` 给别的程序用，见 [`dct status --json`](#dct-status---json) |
+| `dct stop <n>…` / `--all` | 停掉会话，留时间让它们收尾 |
+| `dct kill <n>…` / `--all` | 直接杀掉会话 |
+| `dct prune` | 把已停止的会话从列表里清掉 |
+| `dct restart` | 换成当前的二进制作为守护进程（所有会话都会结束；`-y` 跳过确认） |
 | `dct daemon` | 只跑守护进程，不开看板 |
-| `dct gate` | [浏览器里的 dct](#浏览器里的-dct) 前面那道门 |
-| `dct --version` | 看装的是哪一版 |
+| `dct install <name>` | 装一个 agent——`claude`、`codex`、`qwen`、`opencode`——或者 `git` |
+| `dct llm check` | 真去调一次你配置里的 `[llm]` 连接，告诉你通不通；见 [`[llm]` 连接](#llm-连接) |
+| `dct --version` / `dct --help` | 你装的是哪个版本 / 命令列表 |
+
+**替别的程序做决定**（只在这个分支上）
+
+| | |
+|---|---|
+| `dct judge [file]` / `--probe` | 用 Jev 格式问 `[judge]` 后端（Jeff 的 `jeff-serve`）一道选择题，打印每个选项的概率；`--probe` 发一道固定的题，看它答不答。退出码 0 答了，1 没配置或后端出错，2 题目有问题 |
+| `dct judge up` / `down` / `status [--json]` | 启动、停止（只停 dct 自己起的）或查看本机 judge 服务；见[运行本机 judge](#运行本机-judge) |
+| `dct answer --json` | 从 stdin 读一道选择题请求，写一行 JSON；见 [`dct answer`](#dct-answer一个问题一行-json)。退出码 0 答了或要你来，1 配置读不了或无效，2 请求有问题 |
+| `dct train record --json` | 把别人答过的一道题记成一行训练数据；见 [`dct train record`](#dct-train-record存下别人给的答案)。退出码 0 记下了，1 写不了，2 请求有问题 |
+
+**对话**（除非另有说明，只在这个分支上）
+
+| | |
+|---|---|
+| `dct ask` | 给 dco 的对话用：stdin 一行 JSON，stdout 一行一个 JSON 事件；见 [`dct ask`](#dct-ask只读的聊天入口) |
+| `dct ask --enable` | 读完你的话会发到哪儿之后，输入 `y`，打开 `[ask]` |
+| `dct ask --forget <conversation id>` | 忘掉某一段对话的记忆 |
+| `dct voice` | 点 dco 章鱼说话；dct 把它当成你亲手敲的，打进你最近用的那个 agent 会话。只支持 Mac，需要 dco。`origin/main` 上也有，但没有路由和日志的改动；见[语音](#语音dct-voice) |
+| `dct dco-rules` | 马上刷新 `~/.dct/dco-rules.json`（dc-vault 规则页读的那个文件）；守护进程启动时、dco 换版本时也会刷新。`origin/main` 上也有 |
+
+**多电脑**（`origin/main` 上也有；见[多电脑](#多电脑)）
+
+| | |
+|---|---|
+| `dct login` | 用 DC 账号登录；第一台登录的电脑创建组 |
+| `dct invite` | 在老电脑上：出一个 6 位数的码，10 分钟内有效，只能用一次 |
+| `dct join <code> [--name <computer name>]` | 在新电脑上：用那个码加入 |
+| `dct peers` | 组里有哪几台电脑、各开着哪些会话 |
+| `dct peers remove <computer name>` | 把一台电脑移出组 |
+| `dct send <computer>/<session> "<text>"` | 给另一台电脑上的会话留一句话（会话可以写 `#id`）；会话空着就马上敲进去，忙着就排队 |
+
+**应用相关**（只支持 Mac；它们跟[边界](#dct-是什么)冲突）
+
+| | |
+|---|---|
+| `dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal "…"] [--goal-number 2]` | 让 dct 玩 iPhone 镜像里显示的一关三消；见[让 AI 玩三消游戏](#让-ai-玩三消游戏mac) |
+| `dct game ask-bench <record file>… [--limit 40]` | 拿录下来的局面问大模型，看它比随机好多少（不碰手机） |
+| `dct game identify [--game candy-crush]` | 说出屏幕上现在是哪一类游戏（在本机识别，什么都不上传） |
+| `dct game scene [--game <name>] [--steps 10] [--dry-run]` | 找东西类游戏：大模型指一个位置，dct 核对后点下去（需要较新的 dco） |
+| `dct campaign approve <name> --param <platform>.<param>=<value>…` | 一次批准某个 campaign 给所有平台用的文字；见[发到自媒体平台](#发到自媒体平台mac早期)。只在这个分支上 |
+| `dct do "<goal>" --platform <p> --campaign <name> [--window <id>] [--preview] [--json]` | 经 dco 把某个 campaign 批过的文字发到一个平台。只在这个分支上 |
+
+**浏览器版**（`origin/main` 上也有）
+
+| | |
+|---|---|
+| `dct gate [--bind <address>] [--port <port>] [--upstream <host:port>] [--url <public address>] [--link]` | [浏览器里的 dct](#浏览器里的-dct) 前面的那道门；`--link` 只打印链接 |
 
 `ps`、`stop`、`kill`、`prune` 绝不拉起守护进程：问「有没有东西在跑」，不该把答案从
-「没有」变成「有」。`restart` 会拉起一个，因为你要的就是「后台跑着新的」。
+「没有」变成「有」。`restart` 会拉起一个，因为你要的就是「后台跑着新的」。`status` 和
+`dct ask` 也不会拉起守护进程。
 
-`dct status --json` 永远退 0，`schema_version` 仍是 1。本机装了 dco（有 `~/.dco/endpoint.json`）时，
-多一个可选的 `dco` 块：只读，取自 dco 的 `status` 工具，不会拉起 dco，也不会拉起守护进程：
+`dct --help` 只打印中文，不管 `DCT_LANG` 是什么。这份 README 是它的英文参考。代码里还认
+`dct keys`（dct 的两把签名密钥，存在 Mac 的安全隔区里）和 `dct procedure`（批准流程、签发票据）；
+这两个都不在 `dct --help` 里，这里也没有说明。
+
+---
+
+## `dct status --json`
+
+给别的程序轮询用（本来是给菜单栏小工具用的）。不管 dct 处在什么状态，它都退出 0；
+只有参数写错才退 2。它从不拉起守护进程。
+
+```json
+{"schema_version": 1, "daemon": "up", "dct_version": "0.2.24",
+ "sessions": {"busy": 1, "idle": 2, "total": 3}}
+```
+
+- `daemon` 是 `up`、`down`（没有守护进程应答）或 `stale`（有守护进程在跑，但说的是另一个
+  socket 协议，所以 dct 不去读它）。`down` 只带 `schema_version` 和 `daemon`；`stale` 再加
+  `dct_version`；两种都没有 `sessions`。
+- `sessions.total` 数的是所有还没停的会话，所以 `busy` + `idle` 可能比 `total` 小
+  （在等你的、出错的、读不出来的会话只算在 `total` 里）。
+- 缺这个键，意思是「这个版本不知道」，不是零。
+
+`schema_version` 仍是 1。**只在这个分支上：** 本机装了 dco（有 `~/.dco/endpoint.json`）时，
+`dct status --json` 会给上面三种形状都多加一个可选的 `dco` 块：只读，取自 dco 的 `status` 工具，
+不会拉起 dco，也不会拉起守护进程：
 
 ```json
 "dco": {"state": "waiting_user", "activity": "…", "runs": 1, "attention": ["needs_help"]}
@@ -412,23 +565,80 @@ agent 只在 git 仓库里跑——撤销就是从那儿来的。**这件事不�
 `activity` 只取第一条 `dco.needs_help` 的文字，最多 40 个字符。
 **只有 `idle`（待处理为空）在真实的 dco 上见过。** 其余全部——包括种类名和优先级——来自 dco 会话读 dco 源码后的转述，**未验证**。
 
-`dct judge` 和 `dct do` 里问 Jeff 那一级，要在 `~/.dct/config.toml` 里写 `[judge]`，
-指向一个开着的 `jeff-serve`：
+---
+
+## 替别的程序做决定
+
+这一节的所有内容都**只在这个分支上**。它的作用是让另一个程序（dco、某个脚本）能把一道选择题
+交给 dct，拿回一个答案，而不用弹出任何窗口。
+
+本机的小模型叫 **Jeff**。它由 `jeff-serve` 提供，`jeff-serve` 通过 HTTP 回答 Jev 格式的选择题，
+并给每个选项返回一个概率。
+
+`dct judge`、`dct answer`，以及 `dct do` 里问 Jeff 那一级，要在 `~/.dct/config.toml` 里写
+`[judge]`，指向一个开着的 `jeff-serve`：
 
 ```toml
 [judge]
 base_url = "http://127.0.0.1:8765"
 # model = "jeff-latest"      # jeff-serve 认的模型名
 # api_key_env = "JEFF_KEY"   # 从这个环境变量读密钥；明文 http 只发往本机
-# threshold = 0.8            # Jeff 把握低于这个数，dct do 就去问 [llm] 的大模型，再不行问你
+# threshold = 0.8            # Jeff 把握低于这个数，dct answer / dct do 就去问 [llm] 的大模型，再不行问你
 # timeout_ms = 5000
 ```
 
 dct 不下载权重。`jeff-serve` 默认要你自己起（也可以让 dct 起，见
 [运行本机 judge](#运行本机-judge)）。目前用的是 Jeff v1.2：
-`jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`（约 1.6 GB，最多接 254 个选项）。
+`jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`（约 1.6 GB）。服务端说它最多接 254 个选项，
+但 dct 自己给 `dct judge` 发 2 到 20 个，给 `dct answer` 发 1 到 20 个。
 
-没写 `[judge]`，`dct do` 就跳过 Jeff；没写 `[llm]`，也跳过大模型。最后问的永远是你。
+没写 `[judge]`（或者里面没有 `base_url`），`dct answer` 和 `dct do` 就跳过 Jeff；没写 `[llm]`，
+也跳过大模型。最后问的永远是你。
+
+### `dct answer`：一个问题，一行 JSON
+
+`dct answer --json` 从 stdin 读一个请求（最多 1 MiB，一个 JSON 对象，不认识的字段会被拒绝），
+写出一行 JSON。
+
+```json
+{"state": "屏幕上显示什么、目标是什么",
+ "options": [{"key": "a", "text": "发布"}, {"key": "b", "text": "永久删除账号"}],
+ "allow": ["jeff", "llm", "user"],
+ "forbid": ["一个绝不能发给大模型的字符串"]}
+```
+
+- `state`：最多 50 000 个字符。
+- `options`：1 到 20 项。`key` 不能为空，最多 64 个字符，不能重复，也不能是 `stuck`；
+  `text` 最多 2 000 个字符。
+- `picture`（可选）：一个路径，最多 4 096 个字符。它永远不会发给 `[llm]` 大模型。
+- `allow`（可选，默认三级都开）：哪几级可以答。它只能去掉某几级，关不掉危险闸。
+- `forbid`（可选，最多 100 个非空字符串，每个最多 200 个字符）：只要其中任何一个出现在
+  `state` 或某个选项的文字里，这个请求就绝不会发给 `[llm]` 大模型（Jeff 在你本机上跑，
+  仍然会被问）；此时 `reason` 以 `llm_withheld: forbidden string in the request` 结尾。
+
+它按这个顺序问，跳过没配置或答不了的那一级：
+
+1. **Jeff**（`[judge]`）。只有把握至少达到 `threshold`（默认 0.8）时，这个选择才算数。dct 用返回
+   的概率自己重算把握，不用服务端给的数。
+2. **`[llm]` 大模型**，只发文字。跟别处一样适用 `[llm]` 的规矩：没有 `[llm]`，就没有这一级。
+3. **你。** dct 自己不去问任何人，也不显示任何东西。它回答 `by: "none"`、`reason: "needs_user"`
+   并退出 0；怎么去问由调用方决定。如果 `allow` 里去掉了 `"user"`，原因是 `no_answer`。
+
+不管哪一级选的，这个选择在发出去之前还要过[危险闸](#危险闸dct-answer)和模型否决。
+
+答案：
+
+```json
+{"key": "a", "by": "jeff", "confidence": 0.97}
+{"key": "a", "by": "model", "confidence": null}
+{"key": null, "by": "none", "confidence": null, "reason": "needs_user"}
+{"key": null, "by": "none", "confidence": 0.991, "reason": "danger", "gated": {"key": "b", "tier": "critical"}}
+```
+
+`by` 是 `jeff`、`model` 或 `none`。`confidence` 是 Jeff 的，或者 `null`。大模型对一个没有文字的
+图标给出的选择，可能还带一个 `name`。退出码：0 答了或要你来（包括 `danger`），1 配置读不了或
+无效（`[judge] gate_tiers` 写坏了也算），2 请求有问题。某一级配置了但答不了（连不上、太慢、
+回复读不懂）会被跳过，绝不会让命令失败。
 
 ### 运行本机 judge
 
@@ -500,9 +710,224 @@ env = { PORT = "8796" }                   # 额外的环境变量，只能是字
 名字不分大小写。`critical` 和 `money` 永远去不掉：少了任何一个，或者写了不认识的档位，
 `dct answer` 会说明原因并以 1 退出。只有 `content` 是可选的，不写就不拦。
 
+**模型否决（配了 `[llm]` 就开）。** 规则放行一个选择之后，`dct answer` 会就被选中那个选项的文字
+（不带屏幕，不带目标）问 `[llm]` 大模型一个固定的问题：它是不是要花钱、转钱，或者永久删除数据？
+大模型只能加一票否决（`gated.source` 是 `"model"`，档位 `money` 或 `critical`）；规则拦下的东西，
+它绝不会放行。大模型连不上、超时或出错时，这个选择放行，并往 stderr 写一行；如果它的回答
+拿不准或读不懂，这个选择就交给你（`needs_user`，`"veto": "unsure"`）。`allow` 里去掉了 `"llm"`
+的请求，或者文字命中 `forbid` 的请求，绝不会发给大模型。关掉它：
+
+```toml
+[judge]
+model_veto = false   # 这一段不需要写 Jeff 的地址
+```
+
 **说在前面：闸只认 dct-brain 的词表，它不认识的词不会被拦；调用方知道有害的选项，仍应自己先筛掉。**
-（目前认不出的例子：「取消订阅」「清空全部」「拉黑」「停用」；开了 content 档以后，也会多拦一些无害的，比如
-「保存」「完成」「分享」「登录」「上传」。）
+（目前认不出的例子：「Cancel subscription」「Clear all」「Block」「Deactivate」；开了 content 档以后，也会多拦一些无害的，比如
+「Save」「Done」「Share」「Sign in」「Upload」。）
+
+### `dct train record`：存下别人给的答案
+
+`dct train record --json` 从 stdin 读一个请求，往 `~/.dct/explore/answers.jsonl`（权限 0600）追加
+一行训练数据（版本 2）。它给那些问过别人一个问题的调用方用，好让这个答案以后能训练 Jeff。
+别的什么都不写。
+
+```json
+{"question_id": "q-17", "by": "user", "key": "b", "outcome": "good",
+ "run_outcome": "published",
+ "corrects_jeff": false, "jeff_asked": true,
+ "shown": [{"key": "a", "text": "…"}, {"key": "b", "text": "…"}],
+ "step": 3, "state": "…", "forbid": ["a string that must not be recorded"]}
+```
+
+- 必填：`question_id`、`by`（`jeff` | `model` | `user`）、`key`、`outcome`
+  （`good` | `bad` | `unknown`）和 `run_outcome`（`published` | `declined` |
+  `halted` | `stopped`）。其余可选：`corrects_jeff`、`jeff_asked`、
+  `shown`（最多 254 项）、`step`、`state`、`forbid`。
+- **调用方必须先把用户自己的值换成 `{name}` 占位符。** `state`、`key` 或 `shown` 的文字里
+  只要含有任何一个 `forbid` 字符串，请求就会被拒绝，不存。
+- 回复里的 `label` 说明这一行算不算训练标签：用户的答案一定算；大模型的答案只有在
+  `outcome` 是 `good` 时才算；Jeff 的答案从不算。
+- 回答 `{"recorded": true, "label": true|false}`。退出码 0 记下了，1 文件写不了，
+  2 请求有问题。
+
+---
+
+## `[llm]` 连接
+
+`~/.dct/config.toml` 里的 `[llm]` 是 dct 自己用的那条通用大模型连接。**你不写这一段，它就是关着的。**
+没有 `[llm]`（或者配置文件解析不了）时，什么都不会发到任何地方；配置写坏了，也不会让 dct 起不来。
+
+用到它的地方：给会话起名、[解释失败](#出错了一句话说清)、`dct answer` 的第二级和它的模型否决、
+`dct do`、`dct game play --ask-model`，以及（通过 `[ask]`）`dct ask`。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `provider` | 无 | 一个 profile 的名字（内置的，或者你在 `~/.dct/profiles/` 里写的）。**没有默认值**：dct 从不替你挑厂商；不写它，这些功能就保持关闭，并给你一行提示 |
+| `transport` | `"cli"` | `"cli"` 运行那个 profile 自己的无界面命令；`"http"` 直接调 profile 的 `[api]` 段里的端点 |
+| `model` | 无 | `http` 必填；dct 不会替你猜一个 |
+| `base_url` | profile 的 `[api].base_url` | 可选的覆盖 |
+
+用 OpenAI 兼容服务器的例子在[出错了，一句话说清](#出错了一句话说清)那一节。
+`dct llm check` 真的调一次，告诉你通不通。
+
+- **DC profile。** 内置的 `dc` profile 指向营地网关 `https://dc-llm.tzspace.cn/v1`（OpenAI 的
+  传输格式）。配对会把密钥写进 `secrets.toml`，把模型名写进 `pair-models.toml`。ask 的设计文档
+  记录说，那个网关上的聊天由一台 Ollama 服务器上的 `qwen3.8:27b` 回答（见其 3.7 节，
+  2026-10-16/17 测的，之后没有重新核对）。如果你原来的 `[llm]` 写的是 `provider = "dc"` 加一个
+  Claude 模型，请改成 `provider = "qwen"`、`transport = "http"` 和一个你账号有的模型。
+  dct 从不改写已有的 `[llm]`。
+- **除非你另写，只用你自己的网关。** 代码里没有任何一处会自己往外部顶级大模型发东西，也没有
+  这样的开关。`dct ask` 只接受 host 在 `[ask] allowed_hosts`（默认 `dc-llm.tzspace.cn`）里的
+  `http` 型 `[llm]`。`[llm]` 本身也允许把厂商的命令行当 provider（`claude`、`codex`……），
+  那会跟那家厂商通信；只有你自己这么写了才会发生。
+- **凭据。** 你在 dct 里保存的密钥，只用于你保存时对应的那个 provider。从别的程序借来的登录
+  （Claude Code、Codex），不管 profile 或 `base_url` 怎么写，都只会发回那个程序自己的厂商域名。
+- 配对页的勾选框（「让 AI 解释你看不懂的报错」）只有你保持勾选、并在浏览器里批准之后才会追加
+  `[llm]`，而且从不改动已有的 `[llm]`。
+
+---
+
+## `dct ask`：只读的聊天入口
+
+**只在这个分支上（`dct-ask`，连 `integration` 上都没有）。** `dct ask` 让 dco 能跟 `[llm]` 背后的大模型
+进行一段语音或文字对话。它只是聊天：回复会被显示或念出来，绝不会被执行。ask 服务看不到你的会话，
+不能往会话里打字，也没有任何工具。
+
+**自己动手打开一次：**
+
+1. 先有一个能用的 `[llm]`，`transport = "http"`，端点是 OpenAI 兼容的
+   （见 [`[llm]` 连接](#llm-连接)）。
+2. 在终端里运行 `dct ask --enable`。它会告诉你你的话会发到哪个 host、发什么、不发什么，
+   你不输入 `y` 就什么都不写。它没有 `--yes`，stdin 或 stdout 不是终端时会拒绝（退出码 2）。
+   它把下面这段追加到 `config.toml`（不会重写这个文件，已有的 `[ask]` 段，不管开着还是关着，
+   都原样不动）：
+
+   ```toml
+   [ask]
+   enabled = true
+   allowed_hosts = ["dc-llm.tzspace.cn"]
+   ```
+
+   `dct ask --enable` 的退出码：0 已打开（或本来就开着），1 没打开（你没输入 `y`、已经有 `[ask]`
+   段，或者文件写不了），2 不是终端，11 `[llm]` 不能用于 `ask`。
+
+3. 装上这个版本之后，运行一次 `dct restart`。旧版本起的守护进程不认识 `Ask` 请求（协议 25），
+   `dct ask` 会回答 `daemon_down`，带 `reason: "protocol"`。`dct restart` 会结束所有在跑的会话，
+   所以挑个合适的时候。
+
+`[llm]` 的同意只覆盖终端报错的文字；你说的话需要它自己的开关，这就是 `[ask]` 存在的原因。
+`[ask]` 每次请求都重新读，所以打开或关掉都不用重启。
+
+**怎么调用。** 文字走 stdin，绝不走命令行（命令行参数通过 `ps` 对每个用户都可见）：
+
+```sh
+echo '{"v":1,"text":"What is the weather like?","source":"voice","conversation_id":"c-7f3a"}' | dct ask
+```
+
+| 字段 | 规则 |
+|---|---|
+| `v` | 可选；如果写了，必须是 `1` |
+| `text` | 必填，控制字符换成空格后最多 500 个字符；更长的会被拒绝，不会被截断 |
+| `source` | `"voice"` 或 `"typed"`；只是给大模型的提示（语音可能听错，回复会被念出来）。**它绝不算授权** |
+| `conversation_id` | `[A-Za-z0-9_-]`，1 到 64 个字符；记忆按 id 分开存 |
+| `persona` | 可选，最多 300 个字符，放在固定规则之下，不能覆盖它们 |
+| `timeout_ms` | 可选，默认 8000，限制在 1000–30000 之间 |
+
+stdin 最多读 16 KiB。stdout 上一行回一个事件，每个事件都带 `"v": 1`：
+
+```jsonl
+{"v":1,"type":"start","conversation_id":"c-7f3a","turn":3}
+{"v":1,"type":"sentence","i":0,"text":"It is sunny."}
+{"v":1,"type":"end","sentences":1,"truncated":false,"first_ms":1840,"total_ms":2100}
+```
+
+每次调用都恰好以一个 `end` 或 `error` 结束（如果你把连接关了，就什么都没有）。被拒绝的请求
+（输入有问题、没开启、忙）只有一个 `error`，没有 `start`。如果大模型挂了或超时的时候已经发出了
+一些句子，你收到的是带 `"truncated": true` 的 `end`，不是 `error`。`error` 带着 `code`、`stage`、
+`retryable`、`after_ms` 和一个固定的 `reason` 词（绝不含你的任何文字）。`dct ask` 不往 stderr 写任何东西。
+
+| 退出码 | `code` | 含义 |
+|---|---|---|
+| 0 | （`end`） | 完成，包括 `truncated` |
+| 2 | `bad_request` | 输入有问题；`reason` 是 `not_json`、`bad_version`、`empty_input`、`too_long`、`bad_source`、`bad_conversation_id`、`persona_too_long`、`usage` 之一 |
+| 10 | `daemon_down` | 没有守护进程应答（**不会**替你拉起），或者是旧的守护进程：`reason` 是 `socket`、`closed` 或 `protocol` |
+| 11 | `not_enabled` | `reason` 是 `ask_off`、`llm_missing`、`llm_not_http`、`llm_unusable` 或 `host_not_allowed` |
+| 12 | `unreachable` | 连不上网关（DNS、被拒绝、TLS、连接超时） |
+| 13 | `auth` | 网关回了 401/403；重试没用 |
+| 14 | `busy` | 网关回了 429/503，或者已经有另一段对话在进行（`reason` 是 `in_flight`；一次只能一个） |
+| 15 | `slow` | 到期限都没有一个句子 |
+| 16 | `empty` | 流结束了，却没有任何可说的内容 |
+| 17 | `bad_reply` | 回复读不懂 |
+| 18 | `cancelled` | 同一段对话里更新的一次 ask 取代了这一次 |
+
+**取消就是关掉连接。** dco 杀掉 `dct ask` 进程；socket 关闭；守护进程马上停止生成，并释放
+进行中的那个名额（网关可能还会再生成一会儿，最多 `timeout_ms`）。在 Windows 上，守护进程只能靠
+写入失败来察觉，这比较弱；dco 目前只支持 Mac。
+
+**它记住什么。** 每段对话最近 6 轮，最多 3 000 个字符，同时 4 段对话，闲置 30 分钟后丢掉。
+它存在守护进程的内存里，**从不写到磁盘上**。`dct ask --forget <conversation id>` 丢掉一段。
+重启守护进程会丢掉全部。
+
+**什么会离开这台机器。** 这一轮的文字、最多 6 轮历史、一段固定的系统提示和你可选的 `persona`，
+只发给你 `[llm]` 的那个 host。没有屏幕内容，没有文件，没有会话列表。请求里没有工具，
+`max_tokens` 是 200，没有 thinking 字段。
+
+**它写什么。** 每次 ask 在 `~/.dct/ask.log`（权限 0600，超过 256 KiB 就整个换掉）里写一行元数据：
+`t`、`source`、`conv`（对话 id 的哈希的前 4 个十六进制字符，不是 id 本身）、`chars_in`、
+`chars_out`、`first_ms`、`total_ms`、`outcome`。没有你或大模型说的话的文字。被当作 `bad_request`
+拒绝的请求不记录。
+
+守护进程里对同一个网关的其他用法（错误解释、会话起名、手机页），在 ask 进行时最多等 20 秒，
+然后放弃；`dct answer`、`dct do`、`dct game` 和 `dct llm check` 跑在别的进程里，不用等。
+
+设计、测量数据和未完成清单：[`docs/2026-10-16-dct-ask-design.md`](docs/2026-10-16-dct-ask-design.md)。
+没有验证过：网关还在预填充时取消、TLS 关闭时的行为、负载下的行为，以及对着真网关跑一遍
+（那份文档的第 16 节说，真网关的冒烟测试没有做）。
+
+---
+
+## 语音：`dct voice`
+
+需要 Mac 上有 dco。`dct voice` 在前台运行（`Ctrl-C` 退出），听 dco 听到的东西。你点了 dco 章鱼之后
+说的每一句话，会被打进你最近用的那个 agent 会话，就像你自己敲进去再按了回车一样。
+你启动它之前说的话会被跳过。
+
+**语音从来不算授权。** 只有下面这些条件全部满足，一句话才会被发出去：
+
+- dco 说它是由点击章鱼触发的（`octopus_click`，唯一接受的触发方式：一个听起来像你的声音，
+  也可能是电视）；
+- 把握至少 0.5；
+- 不只是一句光秃秃的确认（「好」「嗯」「ok」「yes」……）；
+- 目标会话不是在等一个批准提示（语音答不了这些），也不是普通的 shell 会话；
+- 距离上一句至少 2 秒；
+- dct 宣布要发之后的 2 秒窗口里，你没有说「取消」「算了」「别发」或 "cancel"。
+  窗口结束时会再检查一次会话的状态。
+
+发出去的文字前面会加上 `（语音输入，可能有识别错误）`，好让 agent 宽容一点。说「给 X 说…」「对 X 说…」
+或「告诉 X…」（X 是某个会话的名字或 `#id`）来指定一个会话；匹配到两个，就不发。
+
+**语音路由**（只在这个分支上）。每句话之前，dct 都从 dco 的 `status` 里读
+`converse.voice_route`，每次都重新读。`chat`：dct 什么都不发，并且只说一次（由 dco 自己的对话来
+处理这句话，它会调用 `dct ask`）。`agent`，或者旧版 dco 没有 `converse` 块：照旧发送。读不出来的
+路由，或者值不认识：照旧发送，并且只说一次；代价是，路由读不出来时，本来要说给聊天的话可能
+会落进某个 agent 的终端。
+
+**`~/.dct/voice.toml`**（可选）：
+
+```toml
+log_text = false          # true：也把说的话记进 voice.log
+[alias]
+章鱼 = ["张瑜", "张宇"]   # 左边是对的词 = 右边是识别器常常写成的错词
+```
+
+没有这个文件时，别名表用的是内置的那份（给「章鱼」的）。`log_text` 类型写错是个错误，
+绝不会悄悄当成「开」或「关」。
+
+**`~/.dct/voice.log`**（权限 0600，一行一个 JSON）默认只存元数据：`t`、`trigger`、
+`session`（编号，不是名字）、`chars_raw`、`chars_fixed`、`confidence`、`route`、`action`、
+`reason`。`log_text = true` 时还有 `text_raw` 和 `text_fixed`，**除了**因为路由是 `chat` 而被跳过的
+句子，那些从不带文字。旧版本写下的行可能含有你说的话；这个版本不会去清理它们。
 
 ---
 
@@ -664,7 +1089,7 @@ profile 就跳过；万一一个都对不上，回到完整清单，而不是给
 
 底栏中段是当前项目，从底栏自己的配色里反白出来，所以它不会被当成又一个键名。
 
-格子只读——方向键移动焦点，`F3` 跟 `→` 效果一样（下一格，停掉的会话也算），`Shift+F3` / `Ctrl+F3` / `F8` 跟 `←` 一样，`Enter` 放大进
+格子只读——方向键移动焦点，`F3` 跟 `→` 效果一样（下一格，停掉的会话也算），`F8`（还有 `Shift+F3` / `Ctrl+F3`，但 `Shift+F3` 用户报告在他的终端里不起作用，`Ctrl+F3` 被 macOS 抢走，见下）跟 `←` 一样，`Enter` 放大进
 焦点那一格，`g` 回列表，`Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` 在格子里的
 效果跟在看板上完全一样。只有两处不同：折叠是列表独有的，因为九宫格的左右键是移动焦点；
 数字键在这里屏幕上看不到号码——格子不像组头那样印着序号，但按下去照样是「第 N 个项目」。
@@ -678,14 +1103,17 @@ profile 就跳过；万一一个都对不上，回到完整清单，而不是给
 都不会送到 agent 那边。停掉的会话格子里留一张最后的画面，不是空的。会话超过九个就翻页。
 
 进了会话，你敲的每个键都送给 agent，`Esc` 也一样，它们关自己的弹窗要用。`F2`…`F6` 是 `dct`
-唯一留下的几个键：`F2` 退回看板，`F3` 直接跳到下一个还在跑的会话，`Shift+F3`、`Ctrl+F3` 或 `F8` 跳到上一个，`F4` 切换复制模式，
+唯一留下的几个键：`F2` 退回看板，`F3` 直接跳到下一个还在跑的会话，`F8` 跳到上一个（`Shift+F3` 和 `Ctrl+F3` 也一样，但见下），`F4` 切换复制模式，
 `F5` 粘贴图片，`F6` 挑配色。底栏左边那句「F2 回看板」一直在，断连、报错、消息再长都挤不掉
 它——那是会话里唯一的出口。
 
 上一个/下一个按看板上的顺序（先项目、再 id），到头回绕，跳过已停止的会话。「上一个」没写在底栏
-（放不下）；`Alt+F3` 仍然是下一个。macOS 可能把 `Ctrl+F3` 抢去给 Dock，所以 `Shift+F3` 和 `F8`
-最稳；有的终端会把功能键的修饰键剥掉，那时 `F3` 就只是下一个。想知道你的终端到底发了什么，运行
-`cat -v` 再按那个键：`^[[1;2R` 是 `Shift+F3`，`^[OR` 或 `^[[13~` 是单按 `F3`，`^[[19~` 是 `F8`。
+（放不下）；`Alt+F3` 仍然是下一个。
+
+**`F8` 是靠得住的「上一个」键。** `Ctrl+F3` 在到达终端之前就被 macOS（Dock）抢走了。`Shift+F3`
+在代码里、也有单元测试覆盖，但**有人报告说它在至少一个真实终端里不起作用，原因还在诊断中**：
+别指望它。有的终端还会把功能键的修饰键剥掉，那时 `F3` 就只是下一个。想知道你的终端到底发了什么，
+运行 `cat -v` 再按那个键：`^[[1;2R` 是 `Shift+F3`，`^[OR` 或 `^[[13~` 是单按 `F3`，`^[[19~` 是 `F8`。
 （以前任何修饰键 + `F3` 都是下一个，现在 `Shift`/`Ctrl` + `F3` 是上一个。）
 
 会话里之前打印过的内容能往回翻，用 `PageUp`/`PageDown`/`End`。`dct` 大概留着最后 2000 行
@@ -779,17 +1207,16 @@ WiFi 下**的手机扫一下，就能看到你的会话、每个会话的实时�
 
 ## Telegram 会告诉你干完了
 
-**先说限制：国内直接连不上 Telegram。** 这一节只对连得上的人有用。
-
-手机网页要同一个 WiFi，这个不用。在 Telegram 里找 BotFather 建一个 bot，然后到设置页
-打开「手机通知」，把它给你的令牌粘进去。给这个 bot 随便发一条消息，就配对好了。
+手机网页要同一个 Wi-Fi，这个不用——不过它需要 Telegram，而中国大陆不用 VPN 连不上 Telegram。
+在 Telegram 里找 BotFather 建一个 bot，然后到设置页打开「手机通知」，把它给你的令牌粘进去。
+给这个 bot 随便发一条消息，就配对好了。
 
 - **会话停了、出错了、没了，都会来一条消息**，带着会话名和项目。同时发生好几件，会合成
   一条，不会让你兜里连着震。
 - **回复那条消息**，你打的字就进那个会话——不用选、不用猜。配了 `[llm]` 的话，一个等你
   做选择的会话发过来时，选项已经列好了。
 - 不是回复的消息，给那个唯一在等的会话。好几个都在等，bot 会反问你是哪个，不猜：敲错
-  agent 的代价远大于多问一句。`/ls` 列出会话，`/use <会话号>` 把之后的话指给其中一个。
+  agent 的代价远大于多问一句。`/ls` 列出会话，`/use <n>` 把之后的话指给其中一个。
 - **填完令牌之后第一个给 bot 发消息的人成为主人，其余所有人的消息永远丢弃。** bot 的名字
   是公开的，谁都能给它发消息，这一条就是「我的手机」和「陌生人往我终端里敲字」之间的那条线。
   主人会存下来，所以重启不会重新打开配对；设置里的「重新配对」才会。
@@ -844,6 +1271,8 @@ dct 读棋盘、按规则选步、让 dco 划，每步不到一秒；每一步�
 
 ## 发到自媒体平台（Mac，早期）
 
+**只在这个分支上，而且它带着应用相关的内容，[边界](#dct-是什么)说 dct 不该持有这些。**
+
 **这里的东西还没在真屏幕上跑过。** 下面说的都是对着假 dco 测的；第一次试点（先 X，再 TikTok）要你在场。
 
 **1. 文字先批一次。**
@@ -851,7 +1280,7 @@ dct 读棋盘、按规则选步、让 dco 划，每步不到一秒；每一步�
 在终端里把每个平台的文字给你看，你敲 `y`、再按指纹才存（`~/.dct/campaigns/launch.json`）。指纹签的是这些确切的文字：之后手改这个文件（或旧版本批的、没有签名的文件），`dct do` 都会拒绝（退出码 2），要重新批准。各平台的文字和开头那句不能相同。
 `dct do` 只发这里批过的东西。
 
-**2. 发。** `dct do "把发布文字发出去" --platform x --campaign launch`，要 dco 开着、平台的浏览器开着。
+**2. 发。** `dct do "post the launch text" --platform x --campaign launch`，要 dco 开着、平台的浏览器开着。
 开着好几个浏览器窗口时它会列出来，你用 `--window <窗口号>` 指定。
 
 - dcv 里有确认过的流程 `promote-<平台>-<post|video>`：交给 dco 重放。dco 找不到按钮时，dct 按下面同样的办法替它答；
@@ -882,98 +1311,84 @@ X 的「发出去了」字样还没核实，它的首页也一直有「Post」�
 
 ## 多电脑
 
-家里一台 Mac、公司一台 Windows，各开着几个 agent：让它们互相留言、派活。
-一台电脑上的会话可以给另一台电脑上的会话留一句话，那边空着就直接敲进去。
+家里一台 Mac、公司一台 Windows，各开着几个 agent：让它们互相留言。
+一台电脑上的会话可以给另一台电脑上的会话留一句话，那个会话空着就直接敲进去。
 
 ```
-dct login                       # 老电脑上：用 DC 账号登录；第一台顺手建「我的电脑」组
+dct login                       # 老电脑上：用 DC 账号登录
 dct invite                      # 老电脑上：出一个 6 位邀请码（看板上按 a 也一样）
 dct join 482913                 # 新电脑上：敲那个码（没登录会先自动登录）
 dct peers                       # 组里有哪几台、各开着哪些会话
-dct send Mac/#3 "跑一下 Windows 测试"
+dct send Mac/#3 "run the Windows tests"
 ```
 
 - **登录**：`dct login` 用配对过的 DC 账号换一张中转令牌，只在这台电脑上存着。
-  第一台登录的电脑顺手建一个「我的电脑」组。
+  第一台登录的电脑创建组。
 - **加电脑只要一个码**：老电脑的看板上按 `a`（或者运行 `dct invite`），屏幕上出现
-  `邀请码 482 913 · 10 分钟内有效`；新电脑上 `dct join 482913`，就进组了——
-  `已加入「我的电脑」，组里有：Mac、公司电脑`，老电脑的看板上提示「公司电脑 已加入」。
-  码里的空格、`-` 随便敲，全角数字也认。新电脑必须已经配对了**同一个** DC 账号：别的
-  账号的电脑连问都问不到你的电脑。
+  `Invite code 482 913 · valid for 10 minutes`；新电脑上 `dct join 482913`，就进组了——
+  老电脑的看板上提示「<name> has joined」。码里的空格、`-` 随便敲，全角数字也认。新电脑必须
+  已经配对了**同一个** DC 账号：别的账号的电脑连问都问不到你的电脑。
 - **码只能用一次**：用过一次（成不成都算）、过了 10 分钟、或者再按一次 `a` 换了新码，
-  旧码就作废。有人拿错码试过一次，老电脑上会提示「有人用错码试过一次，码已作废」，
-  重新按 `a` 就行。守护进程重启之后码也没了，重新按 `a`。
-- **中转猜不出码**：码是一次 PAKE（SPAKE2）的口令，中转看得见来往的每一条消息也算不出
-  它；冒充一台电脑，每个码只有一次百万分之一的机会。
+  旧码就作废。有人拿错码试过，老电脑会告诉你；重新按 `a` 拿个新的。
+  守护进程重启之后码也没了。
+- **中转猜不出码**：码是一次 PAKE（SPAKE2）的口令，中转看得见来往的每一条消息也什么都
+  学不到；冒充一台电脑，每个码只有百万分之一的机会。
 - **看到码的人就能进来**（只要他也有你这个 DC 账号）：投屏、截图的时候留意。码就是
   同意，老电脑上不会再问一遍。
-- **名字**：默认叫 Mac / Windows / Linux；组里撞名了，老电脑自动编成「Mac 2」（用
-  `--name` 起的名字也一样，新电脑会告诉你最后叫什么）。想自己起名：
-  `dct join 482913 --name 公司电脑`。
-- **留言**：`dct send <电脑名>/<会话名> "<内容>"`，会话名也可以写 `#编号`。对方
-  看到的是这样一段：
+- **名字**：默认叫 Mac / Windows / Linux；组里撞名了，由老电脑编号（「Mac 2」），用 `--name`
+  起的名字也一样——新电脑会告诉你最后叫什么。想自己起名：
+  `dct join 482913 --name work-pc`。
+- **留言**：`dct send <computer>/<session> "<text>"`，会话可以写 `#id`。
+  对方看到一行标记（`[来自 home-mac/docs 的留言 #a1b2]`），然后是正文。会话空着：马上敲进去。
+  忙着：排队，一次一条。
+- **中转看不到内容**：留言在你的电脑上就为唯一的收件人加密好；中转只管转发，从不落盘，
+  看到的只有密文。
+- 中转默认是 `https://dataclue.cn/dct-relay`；要换，在 `~/.dct/config.toml` 里写
+  `[mesh] relay = "…"`。
 
-  ```
-  [来自 家里Mac/写文档 的留言 #a1b2]
-  跑一下 Windows 测试
-  ```
+**还做不到的：**
 
-  那个会话空着就马上敲进去；正在干活就排队，空下来再送，一次一条。
-- **中转看不到内容**：留言在你的电脑上就加密好，只有组里那台收件的电脑解得开；
-  中转只管转发，不落盘，也读不出一个字。
-- **中转地址**默认是 `https://dataclue.cn/dct-relay`，要换在 `~/.dct/config.toml`
-  里写 `[mesh] relay = "…"`。
-
-**现在还做不到的：**
-
-- 对方电脑不在线，留言就没送出去（会告诉你），不会替你存着等它上线；
-- 只能送进 agent 会话，送不进普通的命令行会话；
-- 排着队的留言、发着的邀请码，守护进程一重启就没了；
+- 对方电脑不在线 → 没送出去（会告诉你）；不会替你存着等它上线；
+- 只有 agent 会话能收，普通的终端会话不行；
+- 排着队的留言和还有效的邀请码，守护进程一重启就没了；
 - 两台老电脑同时各拉一台新电脑进组，名单可能分叉；不在线的电脑会错过名单变化；
-- 同账号里谁都能不停拿错码去试、把你的码一个个烧掉（进不来，但烦人），这一版不防；
-- 还不能「进入」别的电脑上的会话看屏幕、打字，这是下一步。
+- 同账号里的任何一台电脑都可以不停拿错码去试、把你的码烧掉
+  （进不来，但烦人）；这一版不防；
+- 还不能进入另一台电脑的会话——那是下一步。
 
 ### 部署
 
-多电脑要网关和中转两边都开起来。**下面是上线清单，照着做之前先跟负责人确认——
-这一步就是上线。**
+网关和中转两边都要开起来。**下面是上线清单；照着做就是上线，所以先跟管服务器的人确认。**
 
-1. **网关**（dc_llm）：按设计文档附录「网关签中转令牌」实现
-   `POST /admin/api/relay/token`（已实现），打开开关，导出签名公钥。开关在网关
-   里的实际名字是 **`DC_ADMIN_RELAY_TOKENS_ENABLED`**（设计文档里写作
-   `DC_RELAY_TOKENS_ENABLED`，是同一个东西），签名私钥放在
-   `DC_ADMIN_RELAY_SIGNING_KEY`；公钥用 `python -m scripts.relay_signing_key show`
-   打出来，是一行 base64。
-2. **反向代理**：在 dataclue.cn 上加一条 `/dct-relay`，TLS 用现有证书。只放行
-   `/dct-relay/link/*`，去掉 `/dct-relay` 前缀转给下面这个中转——`--with-link`
-   还会挂一个 `/phone`，多电脑用不上，别放出去。
-3. **中转**：把第 1 步的公钥写进 `/etc/dct-srv/gateway.pub`（一行一把，换钥匙时
-   先加新的一行、等生效了再换网关的私钥），然后跑
+1. **网关**（dc_llm）：按设计文档附录实现 `POST /admin/api/relay/token`（已完成）。打开开关——它在网关里的
+   实际名字是 **`DC_ADMIN_RELAY_TOKENS_ENABLED`**（设计文档写作
+   `DC_RELAY_TOKENS_ENABLED`，是同一个东西）——签名密钥放在
+   `DC_ADMIN_RELAY_SIGNING_KEY`。`python -m scripts.relay_signing_key show`
+   会打印公钥，一行 base64。
+2. **反向代理**：在 dataclue.cn 上加一条 `/dct-relay`，TLS 用现有证书。
+   只把 `/dct-relay/link/*`（去掉前缀）转给下面的中转——
+   `--with-link` 还会挂一个 `/phone`，这里用不上；保持关闭。
+3. **中转**：把公钥放进 `/etc/dct-srv/gateway.pub`（一行一把；
+   要轮换，先加新的一行，等它生效，再换网关的私钥），然后运行
 
    ```
    dct-srv 127.0.0.1:<port> --with-link --relay-keys /etc/dct-srv/gateway.pub
    ```
 
-   地址是**第一个参数**，没有 `serve` 子命令，也没有 `--addr`。中转仍然只监听本机，
-   公网流量由反向代理转进来。
+   地址是**第一个参数**——没有 `serve` 子命令，也没有
+   `--addr`。中转仍然只监听本机；公网流量由反向代理转进来。
 4. **验收**：两台真电脑（一台 Mac、一台 Windows）走一遍 `dct login` →
-   `dct invite` → `dct join <码>` → `dct send`，看留言出现在对面的会话里。
-5. **验多行留言进真的智能体**（还没验过）：在 Windows 那台上，用 `dct send` 往一个
-   Claude Code 会话、一个 Codex 会话各发一条两行的留言。每条都必须作为**一轮**进去
-   ——标记行和两行正文在一起。要是哪个智能体在第一个换行就提交了，标记行会单独
-   进去，正文变成一条没有标记的输入，智能体会当成用户本人说的话：先停下上线，给
-   那个智能体改成用 bracketed paste（`ESC[200~ … ESC[201~`）包住整段再敲。结果记进
-   台账。
+   `dct invite` → `dct join <code>` → `dct send`，看留言出现。
+5. **验多行留言进真的 agent**（还没验过）：在 Windows 那台上，用 `dct send` 往一个
+   Claude Code 会话和一个 Codex 会话各发一条两行的留言。每条都必须作为**一轮**进去——
+   标记行和两行正文在一起。要是哪个 agent 在第一个换行就提交了，标记行会单独进去，
+   正文变成一条没有标记的输入，agent 会当成用户本人说的话：先停下上线，给那个 agent
+   改成用 bracketed paste（`ESC[200~ … ESC[201~`）包住打进去的文字。结果记进台账。
 
-本机想先跑一遍，不用网关也不用公网：
-
-```
-cargo test --test mesh_e2e -- --ignored --nocapture
-```
-
-它起一个真的中转、两个互不相干的守护进程，用 `dct-srv token keygen`/`token mint`
-签的测试令牌代替网关，走完 login → join → approve → peers → send，并检查中转的
-输出里没有留言原文。
+想在一台机器上把整件事试一遍，不用网关，不用公网：
+`cargo test --test mesh_e2e -- --ignored --nocapture` 会起一个真的中转和两个
+互不相干的守护进程，用 `dct-srv token keygen`/`token mint` 签的测试令牌代替网关，
+走完 login → invite → join → peers → send，并检查中转的输出里从不出现留言原文。
 
 ## 浏览器里的 dct
 
@@ -1063,6 +1478,181 @@ codex 和普通命令行不要——只要会话里跑着的东西没自己伸�
 
 ---
 
+## 配置参考
+
+所有东西都在 `~/.dct/` 下（见[文件](#dct-下的文件)）。配置读不了或解析不了，从不会让 dct 起不来；
+dct 退回下面的默认值（所有可选功能都关着），并往 stderr 打一行。
+
+**`~/.dct/config.toml`**
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `[llm]` `provider` | 无（功能关闭） | 提供大模型的 profile 名；绝不替你挑厂商 |
+| `[llm]` `transport` | `"cli"` | `"cli"` 或 `"http"` |
+| `[llm]` `model` | 无 | `http` 必填 |
+| `[llm]` `base_url` | profile 的 `[api].base_url` | 覆盖 |
+| `[judge]` `backend` | `"jev"` | 唯一接受的值 |
+| `[judge]` `base_url` | 无 | `jeff-serve` 的地址；没有它就从不问 Jeff（只写了 `gate_tiers` / `model_veto` 的 `[judge]` 也可以） |
+| `[judge]` `model` | `"jeff-latest"` | `jeff-serve` 认的模型名 |
+| `[judge]` `api_key_env` | 无 | 存着密钥的环境变量名；只作为 Bearer 发给 `base_url` 的 host；明文 `http://` 只发往本机 |
+| `[judge]` `threshold` | `0.8` | Jeff 的答案只有把握达到或超过这个值才算数 |
+| `[judge]` `timeout_ms` | `5000` | 每个请求 |
+| `[judge]` `gate_tiers` | `["critical", "money"]` | `dct answer` 拦哪几档；可以加 `"content"`；`critical` 和 `money` 去不掉 |
+| `[judge]` `model_veto` | 配了 `[llm]` 就开 | `false` 关掉模型否决 |
+| `[judge.serve]` `command` | 无 | 启动 judge 服务的 argv 数组（不经 shell）；没有它，dct 从不启动或停止任何东西 |
+| `[judge.serve]` `env` | `{}` | 额外的环境变量，只能是字符串 |
+| `[judge.serve]` `ready_timeout_secs` | `60` | 等 `GET <base_url>/health` 的上限 |
+| `[judge.serve]` `autostart` | `false` | `true`：连不上时 `dct answer` 自动启动服务一次 |
+| `[judge.serve]` `min_free_percent` | `15` | 空闲内存低于这个百分比就不启动 |
+| `[ask]` `enabled` | `false` | 只有为 `true` 时 `dct ask` 才工作；`dct ask --enable` 会写它 |
+| `[ask]` `allowed_hosts` | `["dc-llm.tzspace.cn"]` | `dct ask` 唯一会发往的 host |
+| `[menu]` `agents` | `[]`（全部显示） | 选择器显示哪些 agent profile，按这个顺序 |
+| `[mesh]` `relay` | `https://dataclue.cn/dct-relay` | 多电脑用的中转 |
+
+**`~/.dct/voice.toml`**（可选）：`log_text`（默认 `false`），以及一个 `[alias]` 表，
+形如 `对的词 = ["识别器写成的词", …]`。
+
+**`~/.dct/profiles/*.toml`**：一个文件一个 agent。dct 读的键：`name`、
+`command`、`is_agent`、`pairable`、`idle_pattern`、`busy_pattern`、
+`error_pattern`、`env`、`secret`、`install`、`login`、`headless`、`api`、
+`label`、`note`、`resume_args`、`backend_only`。见[自己的 agent](#十个-agent一个入口)。
+
+**`~/.dct/platforms.toml`**（可选，给 `dct do` 用）：替换或补充内置平台表的行。
+**`~/.dct/games/candy-crush.toml`**（可选）：`dct game` 用的棋盘在屏幕上的位置。
+
+dct 自己用的**环境变量**：`DCT_LANG`（`en` 或 `zh`；优先于保存的选择和系统语言环境）、`NO_COLOR`、
+`DCT_RELAY`（直播中转；没有默认值）、`DCT_RELEASE_BASE`、
+`DCT_INSTALL_DIR`、`DCT_MINGIT_URL`、`DCT_NODE_BASE`、`DCT_NPM_REGISTRY`（见
+[装上它](#装上它)）。
+
+---
+
+## `~/.dct` 下的文件
+
+所有路径都是从守护进程 socket 所在的文件夹推出来的，所以测试能把它们挪到临时目录，
+而不碰你自己的。
+
+| 文件 | 是什么 |
+|---|---|
+| `daemon.sock` | 守护进程的本机 socket（仅所有者可访问） |
+| `config.toml` | 上面那份配置；配对和 `dct ask --enable` 只往里追加（从不重写） |
+| `secrets.toml` | API 密钥和 `dct gate` 的密钥；**权限 0600**；绝不放进 profile 文件 |
+| `settings.json` | 语言、看板画法、底栏颜色 |
+| `projects.json` | 最近的项目，以及每个项目上次用的 agent |
+| `last-sessions.toml` | 上次开着哪些会话，好让重启后的守护进程提议接回来 |
+| `sessions.log` | 每个会话怎么起来的、又是怎么没的 |
+| `pair-models.toml` | 配对写下的模型名 |
+| `profiles/` | 你自己的 agent profile |
+| `runtime/` | dct 自带的 Node 和便携 git，只给 dct 自己用 |
+| `ask.log` | 每次 `dct ask` 一行**元数据**（权限 0600）；没有文字 |
+| `voice.toml`、`voice.log` | 语音设置；语音日志（权限 0600），默认只有元数据 |
+| `judge-serve.pid`、`judge-serve.log` | dct 启动的 judge 服务的 pid 记录和它的日志（权限 0600，每次启动重新写）；`judge-serve.lock` 和 `judge-serve.err` 也写在它们旁边 |
+| `dco-rules.json` | 原样写自 `dco rules --json`，给 dc-vault 规则页用 |
+| `explore/answers.jsonl` | 来自 `dct do` 和 `dct train record` 的训练数据（权限 0600） |
+| `explore/runs/<run>/trace.json` | 每次 `dct do` 运行的步骤，和它给你看过的图片 |
+| `campaigns/<name>.json` | 批过的 campaign 文字，连同它们的指纹 |
+| `platforms.toml` | 你给 `dct do` 写的平台行 |
+| `games/log/<date>.jsonl` | `dct game` 每走一步一行 |
+
+---
+
+## 安全与隐私
+
+- **听到的不算授权。** 除非是点击 dco 章鱼触发的，`dct voice` 什么都不发，从不回答批准提示，
+  也从不发一个光秃秃的「yes」。`dct ask` 的 `source` 字段只是给大模型的提示，别无其他。
+- **默认不留转写。** `voice.log` 和 `ask.log` 只存次数、耗时和决定，不存话
+  （`voice.toml` 的 `log_text = true` 是让 `voice.log` 里出现话的唯一办法）。`dct ask` 的记忆在
+  守护进程的内存里，从不写盘。旧版本写进 `voice.log` 的行可能仍然含有话。
+- **你不打开，它就是关的。** 没有 `[llm]`，就不调大模型。没有 `[ask] enabled = true`，就没有聊天。
+  同意不能由别的程序代给：`dct ask --enable` 和 `dct campaign approve` 不在终端里时会拒绝。
+- **只用你自己的网关。** `dct ask` 只发往 `[ask] allowed_hosts`（默认 `dc-llm.tzspace.cn`）里的
+  host，走 `http` 传输；把厂商命令行当 `[llm]` provider 用于 `ask` 会被拒绝。从 Claude Code 或
+  Codex 借来的登录，只会发给那家厂商自己的域名，绝不会发到别处。
+- **失败解释会发什么。** 配了 `[llm]` 时，出错会话的屏幕末尾（最后 2 000 个字符）会发给你的大模型。
+  密钥和令牌往往就出现在那里，这就是 `[llm]` 要自己打开的原因。
+- **密钥。** `secrets.toml` 权限是 0600，profile 文件从不存密钥。别把密钥放进 `[judge.serve]` 的
+  `command` 或 `env`：机器上任何用户都能用 `ps` 读到。`[judge] api_key_env` 写的是变量名，
+  从不存密钥本身。
+- **危险闸是规则。** 它按词表而不是按把握来拦钱和永久删除，但只认 `dct-brain` 认识的词
+  （[局限](#危险闸dct-answer)）。调用方仍应自己筛掉知道有害的选项。
+- **撤销有边界。** 快照覆盖项目目录；agent 写到目录之外的东西撤销不了
+  （[会踩到的坑](#会踩到的坑)）。
+- 手机页、直播链接和浏览器那道门各有自己的令牌规矩，写在各自的章节里。
+
+---
+
+## Jeff 的考试集和开发集
+
+训练和评估 Jeff 只守一条规矩：**考试集从不用来选任何东西。** 这个分支里的文件：
+
+- `tests/fixtures/jeff-exam/exam-v3.jsonl`（364 题）和 `manifest-v3.json`。
+  2026-10-14 由负责人**冻结**并留出：绝不能拿它来训练、开发、校准或调阈值；每个候选只在已经选定
+  的阈值上评估一次；导出训练数据时，丢掉所有 `dedup_sha256` 等于某道考题的行。改动哪怕一个字节，
+  就是一个新的考试版本，需要负责人同意，新旧分数分开报告。`exam-v2.jsonl` 和 `manifest.json`
+  留作历史记录。
+- `tests/fixtures/jeff-dev/`（`dev-v3.jsonl`、`dev-v4.jsonl`、它们的 manifest 和场景文件）：
+  阈值就是在这个集合上**选**的。v3 的 manifest 把 `0.98` 记作在 `dev-v4` 上选出的暂定阈值；
+  代码里 `[judge] threshold` 的默认值仍然是 `0.8`。
+- `scripts/jeff-exam/`：`build_exam.py`、`check_overlap.py`、`diff_danger.py`、
+  `exam_lib.py`、`danger_allowlist.json`，以及 `run_exam.py`——它把每一题都问一遍运行中的
+  `jeff-serve`（`python3 -I scripts/jeff-exam/run_exam.py --label
+  v1.2 --out DIR [--set exam|exam-v3|dev|dev-v4] [--url …] [--seeds 5]
+  [--threshold 0.8]`），而且一个集合跟它的 manifest 对不上时就拒绝运行。
+
+在用的模型是 Jeff v1.2（`jeff-legacy/Jeff-Qwen3.5-0.8B`，revision `d86f657`）。训练设计
+（`docs/superpowers/specs/2026-10-11-dct-jeff-auto-training-design.md`）在负责人批准重训出来的
+新模型之前，一直保留它。`docs/HANDOFF.md` 说，它写成的时候只做了训练数据的格式
+（`dct train record`、`explore/answers.jsonl`）；那份设计的其余部分没有对照代码核对过。
+
+---
+
+## 排错
+
+- **两个版本都显示 `dct 0.2.24`。** 版本号区分不了 `origin/main` 和这个分支。如果 `dct --help` 里
+  没有 `dct ask`、`dct answer`、`dct judge` 或 `dct do`，你跑的就是已发布的版本。
+- **守护进程「过期」了。** 表现：看板问要不要重启守护进程，`dct status` 说守护进程已过期，
+  `dct ask` 以 10 退出并带 `reason: "protocol"`。这个守护进程是用 socket 协议不同的版本起的。
+  `dct restart` 把它换掉，并且**结束所有在跑的会话**（文件改动还在，agent 没了）；
+  `dct restart -y` 跳过确认。版本号不变地重新编译之后，没有任何东西会注意到区别，
+  所以自己运行 `dct restart`。
+- **`Shift+F3` 没有跳到上一个会话。** 用 **`F8`**，它是靠得住的那个。`Shift+F3` 已经实现、也有
+  单元测试，但有一位用户报告说它在他的终端里没有任何反应。
+  `Ctrl+F3` 被 macOS 占了。猜测的原因见下一条，怎么看你的终端发了什么，见[看板](#看板)。
+- **已知问题：`Shift+F3`（上一个会话）可能根本不会作为按键事件到达。** *这是读代码得出的诊断，
+  还没有在真实终端里确认。* `dct` 通过 crossterm 0.28.1 读输入，它把任何 `CSI … R` 都当成光标位置
+  回复而丢掉，而 xterm 风格的终端（以及开了 `xterm-keys`、没开 `extended-keys` 的 tmux）把
+  `Shift+F3` 发成 `ESC[1;2R`。`Ctrl+F3`（`ESC[1;5R`）同样被丢掉。单元测试是直接构造 `KeyEvent`
+  的，所以覆盖不到解码这一步。变通办法：用 `F8`。想知道你的终端发了什么，运行 `cat -v` 再按那个键
+  （出现 `^[[1;2R` 就坐实了）。
+- **把新的 `dct` 复制到旧的上面之后马上 `zsh: killed`。** 别拿 `cp` 去覆盖已经装好的二进制；
+  见[装上它](#装上它)里「别自己拿 `cp` 往装好的那个文件上覆盖」那一段。
+- **`dct voice` 说 dco 缺失或太旧。** 启动 dco，或者更新它；这条命令需要 dco 的 `hear` 工具。
+- **`dct judge up` 拒绝。** `[judge] base_url` 必须是 `127.0.0.1`、`localhost` 或 `::1`；
+  空闲内存必须高于 `min_free_percent`；`down` 只停 dct 自己起的服务。
+- **`dct answer` 退出 1。** 配置读不了，或者 `[judge] gate_tiers` 写了不认识的档位、或者
+  漏了 `critical` 或 `money`。原因在 stderr。
+- **有个 pty 测试失败一次，重跑又过了。** 打开真伪终端的测试，在整套测试并行运行时出现过
+  间歇性失败，原因还没查清。一个一个跑：`cargo test -- --test-threads=1`。
+
+---
+
+## 更多文档
+
+- [`docs/HANDOFF.md`](docs/HANDOFF.md)：explore-and-learn 分支做到哪儿了，以及关于本机决策
+  模型的研究笔记。在这个仓库开新会话，先读它。
+- [`docs/2026-10-16-dct-ask-design.md`](docs/2026-10-16-dct-ask-design.md)：`dct ask`，
+  带测量数据和老实的「没做」清单。
+- [`docs/2026-10-03-dct-dco-dcv-distributed-agent-runtime.md`](docs/2026-10-03-dct-dco-dcv-distributed-agent-runtime.md)：
+  更早的一份架构笔记，讲 dct、dco 和 dcv 的关系。
+- [`docs/superpowers/specs/`](docs/superpowers/specs/)：每个功能一份设计（judge、brain、
+  控制层、配对、多机、邀请码、语音中转、三消、Jeff 自动训练……），旁边是
+  [`docs/superpowers/plans/`](docs/superpowers/plans/)。
+- [`docs/deploy-live-relay.md`](docs/deploy-live-relay.md)：把直播中转放到公网上。
+- [`container/README.md`](container/README.md)：浏览器里的 dct。
+- [`docs/2026-09-04-gateway-findings.md`](docs/2026-09-04-gateway-findings.md)：对网关了解到的东西。
+
+---
+
 <details>
 <summary><b>方向</b> —— 还没写的那些</summary>
 
@@ -1089,8 +1679,29 @@ codex 和普通命令行不要——只要会话里跑着的东西没自己伸�
 
 </details>
 
+## 开发
+
+```sh
+cargo build --release          # ./target/release/dct
+cargo install --path . --root ~/.local   # 把二进制放到 scripts/install.sh 放的地方
+cargo test -- --test-threads=1 # 为什么一个一个跑，见「排错」
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+这个仓库是一个 Cargo workspace；根包就是 `dct` 本身，`crates/` 里有 `dct-brain`、`dct-dco`、
+`dct-explore`、`dct-game`、`dct-link`、`dct-mesh`、`dct-page` 和 `dct-srv`。测试会建真的 git 仓库、
+起真的进程、绑真的 socket，但没有任何东西碰你自己的 `~/.dct`，也没有任何东西联网。需要真 dcv
+或真中转的测试都标了 `#[ignore]`（例如 `cargo test --test mesh_e2e -- --ignored`）。
+`cargo fmt --check` 在早于这个分支的文件上就已经失败
+（`docs/HANDOFF.md` 记录的是 55 个文件，写于 2026-10-11，之后没有重新核对），
+所以别把整个仓库的格式化折进一次功能提交里。
+
+改动涉及守护进程 socket 时，要提升 `src/proto.rs` 里的 `PROTOCOL_VERSION`（有个测试把线上格式
+钉在它上面）；这个分支是 25。改了之后，每个在跑的守护进程都是过期的，直到 `dct restart`。
+
 <details>
-<summary><b>给改代码的人</b></summary>
+<summary><b>给改代码的人</b>——源码布局和这儿的规矩</summary>
 
 <br>
 
@@ -1123,6 +1734,18 @@ src/proto.rs       线上契约
 src/config.rs      ~/.dct/config.toml；[llm] 不写就是关着
 src/llm/           [llm] 那条连接：走 CLI 还是 HTTP，哪份凭据能发到哪儿
 src/judge/         dct judge：用 HTTP 给 jeff-serve 发 Jev 选择题；把握由 dct 自己重算
+                   serve.rs 启动和停止本机 judge 服务（dct judge up / down / status）
+src/answer.rs      dct answer：问答的几级、请求/答案的 JSON、基于规则的危险闸
+src/answer_veto.rs 闸之后的模型否决（它只能加否决）
+src/train_record.rs  dct train record：每个回答过的问题一行 v2 训练数据
+src/ask/           dct ask：输入检查、流式的一轮、记忆（只在内存）、固定提示、
+                   守护进程一侧的服务、ask.log（只有元数据）。从不碰会话
+src/voice/         dct voice：各道关卡、路由到某个会话、dco 的语音路由、voice.log
+src/dco_rules.rs   dct dco-rules，以及让 ~/.dct/dco-rules.json 保持新鲜的守护进程监视器
+src/mesh/          多电脑：login、invite、join、peers、send
+src/game/          dct game：通过 dco 玩三消和找东西类游戏
+src/keys/, src/procedures.rs  dct keys 和 dct procedure（Touch ID 签名密钥、批准、票据）
+src/ui/dco_cell.rs 看板上只读的 dco 标签
 src/campaign.rs    dct campaign approve：各平台的文字一次批准
 src/explore_cli*   dct do：选窗口、重放或摸索、草稿、卡片、退出码、--json
 src/explore_model.rs  dct do 里「大模型」那一级：从清单里挑一个 key，或者改 dcv 不收的草稿
@@ -1136,6 +1759,9 @@ src/gate.rs        dct gate，浏览器版前面验钥匙的那道门
 src/web/           局域网手机端：一个极小的 HTTP 服务和那一页网页
 src/link.rs        主动出网连中转、长轮询（还没接上开关，见下）
 src/sys/           Unix 和 Windows 不一样的地方全在这儿
+crates/dct-brain/  危险闸的档位、执行票据、签名校验；不碰磁盘，不碰网络
+crates/dct-mesh/   机器 id、6 位邀请码（SPAKE2）、密钥对、签过名的组名单
+crates/dct-game/   三消的走法选择（纯函数）、`dct status --json` 背后的 dco 状态探测
 crates/dct-dco/    dco 客户端（unix socket 上的 MCP），dct game 和 dct do 共用
 crates/dct-explore/  手、平台表、停下的规矩、选项、Jeff → 大模型 → 你、摸索、轨迹和训练题、草稿、重放
 crates/dct-link/   守护进程和中转共用的信封，不含 Request/Response
