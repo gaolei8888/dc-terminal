@@ -473,13 +473,47 @@ pub struct SessionInfo {
     pub last_active_ms: u64,
 }
 
+impl Session {
+    /// 去 agent 自己为这个进程写的小文件里读它此刻的对话 id（见
+    /// `Profile::conversation_file`），读到像样的就换上。只在写
+    /// `last-sessions.toml` 时调：那份清单只在会话集合变了、或者一轮活干完时
+    /// 才写，每个会话一次小文件读，不在按键、`tick()` 这类热路径上。
+    ///
+    /// profile 没声明、进程不在了、文件读不到或对不上，都什么都不做，悄悄
+    /// 留着手上的 id——这份文件不是公开约定，不能让它坏了今天的行为。
+    fn learn_conversation_from_file(&mut self) {
+        if !self.profile.learns_conversation_from_file() || !self.pty.is_alive() {
+            return;
+        }
+        let Some(pid) = self.pty.process_id() else {
+            return;
+        };
+        let home = crate::sys::home();
+        let Some(path) =
+            crate::conversation_id::file_path(&self.profile.conversation_file, pid, home.as_deref())
+        else {
+            return;
+        };
+        if let Some(id) = crate::conversation_id::read_from_file(
+            &path,
+            &self.profile.conversation_file_key,
+            &self.dir,
+            pid,
+        ) {
+            self.conversation_id = Some(id);
+        }
+    }
+}
+
 struct Session {
     id: u32,
     profile: Profile,
     /// agent 自己的对话 id：dct 开会话时定下（或恢复时带回来）的那个，
     /// 写进 `last-sessions.toml`，重启后按它接回同一段对话。profile 没声明
     /// `session_id_args`/`resume_id_args`，或者这一回走的是 `--continue`，
-    /// 就是 `None`。
+    /// 起来时就是 `None`。profile 声明了 `conversation_file` 的，每次写清单时
+    /// 都从 agent 自己的文件里读一遍、换成它此刻真正在用的那个（`/clear`、
+    /// `/resume` 之后也跟得上），见 `learn_conversation_from_file`。
     conversation_id: Option<String>,
     /// 这个会话有没有真的提交过一句话（`send_input` 收到过回车）。
     ///
@@ -487,7 +521,9 @@ struct Session {
     /// 第一条消息时才建对话文件，这时去 `--resume <id>` 只会报「找不到
     /// 对话」然后退出。所以落盘时只有提交过的会话才记 `conversation_id`，
     /// 没提交过的记 `None`，重启后老老实实新开（反正本来也没东西可接）。
-    /// 按 id 接回来的会话一出生就是 `true`：它的对话早就有了。
+    /// 按 id 接回来的会话一出生就是 `true`：它的对话早就有了。profile 能按 id
+    /// 接回、这回却走 `--continue` 接回的也一样（id 落盘时从 agent 自己的文件
+    /// 里读，见 `learn_conversation_from_file`）。
     submitted: bool,
     /// 是不是被叫停的：`stop()`/`kill()` 置上。恢复后的看守线程靠它分清
     /// 「接回失败、自己退出了」和「刚接回就被人停掉了」，后者不该被当成
@@ -1080,10 +1116,11 @@ impl SessionManager {
         let records: Vec<crate::last_sessions::RecordedSession> = snapshot
             .iter()
             .filter_map(|(_, arc)| {
-                let s = recover(arc.lock());
+                let mut s = recover(arc.lock());
                 if s.state == SessionState::Stopped {
                     return None;
                 }
+                s.learn_conversation_from_file();
                 let tag = recover(s.name_slot.lock()).clone().unwrap_or_default();
                 Some(crate::last_sessions::RecordedSession {
                     dir: s.dir.clone(),
@@ -1386,18 +1423,23 @@ impl SessionManager {
         // 都没有才退回 `resume_args`（`--continue` 按目录猜）。
         //
         // 走 `--continue` 的那一条**不能**再加 `--session-id`（claude 不让
-        // 两个一起给），所以那一条这回没有 id，下次重启照旧按目录猜——只此
-        // 一次，之后新开的会话都有 id。没声明 `resume_args` 的 profile 接的
+        // 两个一起给），所以那一条起来时没有 id；profile 声明了
+        // `conversation_file` 的，落盘时从 agent 自己的文件里读回来，没声明
+        // 或读不到的，下次重启照旧按目录猜。没声明 `resume_args` 的 profile 接的
         // 是空切片，等于没走 `--continue`，照常新起一个 id。
         let mut command = profile.command.clone();
-        let resumed_by_id = conversation.is_some() && profile.resumes_by_id();
+        // 接回的是一段早就有的对话：按 id 接回的，或者按 id 记得住、这回走
+        // `--continue` 接回的（id 等落盘时从 agent 自己的文件里读，见
+        // `Session::learn_conversation_from_file`）。都不用等用户再提交一句。
+        let continuing = resume && !profile.resume_args.is_empty();
+        let existing_conversation =
+            profile.resumes_by_id() && (conversation.is_some() || continuing);
         let conversation_id = match conversation {
             Some(c) if profile.resumes_by_id() => {
                 command.extend(crate::profile::fill_id(&profile.resume_id_args, c));
                 Some(c.to_string())
             }
             _ => {
-                let continuing = resume && !profile.resume_args.is_empty();
                 if continuing {
                     command.extend(profile.resume_args.iter().cloned());
                 }
@@ -1442,7 +1484,7 @@ impl SessionManager {
             id,
             profile,
             conversation_id,
-            submitted: resumed_by_id,
+            submitted: existing_conversation,
             stopped_by_request: false,
             dir: dir.to_path_buf(),
             is_agent,
@@ -1480,6 +1522,12 @@ impl SessionManager {
         // 四处之一，绝不能从 `tick()` 调，见 `persist_last_sessions` 文档。
         self.persist_last_sessions();
         Ok(id)
+    }
+
+    /// 测试专用：会话 agent 的进程号。
+    #[cfg(test)]
+    pub fn pid_for_test(&self, id: u32) -> Option<u32> {
+        self.with_session(id, |s| Ok(s.pty.process_id())).ok().flatten()
     }
 
     /// 测试专用：直接读一个会话此刻的整屏文本。不走协议、不用等 `screen()`
@@ -4446,6 +4494,191 @@ mod tests {
             .unwrap();
         let recs = crate::last_sessions::load(&record_path);
         assert_eq!(recs[0].conversation_id.as_deref(), Some("abc"));
+    }
+
+    /// 同 `echo_id_profile`，另外声明了 agent 自己的对话文件，放在 `files` 下。
+    fn echo_id_file_profile(files: &Path) -> Profile {
+        let tmpl = files.join("{pid}.json");
+        let toml = format!(
+            r#"
+            name = "echo-id-file"
+            command = ["/bin/sh", "-c", "echo \"ARGS $*\"; sleep 30", "sh"]
+            is_agent = false
+            resume_args = ["--continue"]
+            session_id_args = ["--session-id", "{{id}}"]
+            resume_id_args = ["--resume", "{{id}}"]
+            conversation_file = '{}'
+            conversation_file_key = "sessionId"
+            "#,
+            tmpl.display()
+        );
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(&toml)).unwrap()
+    }
+
+    /// 替 agent 写它那份对话文件。
+    fn write_agent_file(mgr: &SessionManager, id: u32, files: &Path, dir: &Path, conv: &str) {
+        let pid = mgr.pid_for_test(id).expect("要有进程号");
+        let body = serde_json::json!({
+            "pid": pid,
+            "sessionId": conv,
+            "cwd": dir.display().to_string(),
+            "kind": "interactive",
+        });
+        std::fs::write(files.join(format!("{pid}.json")), body.to_string()).unwrap();
+    }
+
+    /// `--continue` 接回来的会话，dct 起它时不知道 id；agent 自己的文件里有，
+    /// 落盘时就该读回来、记下——下次重启才能按 id 接回，不再按目录猜。
+    /// 它接的是一段早就有的对话，不用等用户再提交一句。
+    #[test]
+    fn a_continued_session_records_the_id_learned_from_the_agent_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let record_path =
+            crate::last_sessions::last_sessions_path_for_socket(&tmp.path().join("daemon.sock"));
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_file_profile(files.path()));
+
+        let proj = tempfile::tempdir().unwrap();
+        let id = mgr
+            .create_resuming(proj.path(), "echo-id-file", None, &[], true, None, None)
+            .unwrap();
+        wait_for_screen(&mgr, id, "ARGS --continue");
+        assert_eq!(mgr.conversation_of(id), None);
+
+        // 文件还没写：照旧没有 id，也不报错。
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        assert_eq!(crate::last_sessions::load(&record_path)[0].conversation_id, None);
+
+        write_agent_file(&mgr, id, files.path(), proj.path(), "learned-1");
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        let recs = crate::last_sessions::load(&record_path);
+        assert_eq!(recs[0].conversation_id.as_deref(), Some("learned-1"));
+        assert_eq!(mgr.conversation_of(id).as_deref(), Some("learned-1"));
+    }
+
+    /// 在 agent 里换了对话（`/clear`、`/resume`），它的文件跟着变；下一次落盘
+    /// 要换成新的 id，不能还抱着 dct 起会话时给的那个。
+    #[test]
+    fn an_id_change_in_the_agent_file_replaces_the_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let record_path =
+            crate::last_sessions::last_sessions_path_for_socket(&tmp.path().join("daemon.sock"));
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_file_profile(files.path()));
+
+        let proj = tempfile::tempdir().unwrap();
+        let id = mgr.create(proj.path(), "echo-id-file", None, &[]).unwrap();
+        let first = mgr.conversation_of(id).unwrap();
+        wait_for_screen(&mgr, id, &format!("ARGS --session-id {first}"));
+        mgr.send_input(id, "").unwrap();
+        write_agent_file(&mgr, id, files.path(), proj.path(), &first);
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        assert_eq!(
+            crate::last_sessions::load(&record_path)[0].conversation_id.as_deref(),
+            Some(first.as_str())
+        );
+
+        write_agent_file(&mgr, id, files.path(), proj.path(), "after-clear");
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        assert_eq!(
+            crate::last_sessions::load(&record_path)[0].conversation_id.as_deref(),
+            Some("after-clear")
+        );
+    }
+
+    /// 文件对不上（别的目录的窗口）就不信它，手上的 id 照旧。
+    #[test]
+    fn an_agent_file_for_another_directory_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let record_path =
+            crate::last_sessions::last_sessions_path_for_socket(&tmp.path().join("daemon.sock"));
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_file_profile(files.path()));
+
+        let proj = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let id = mgr.create(proj.path(), "echo-id-file", None, &[]).unwrap();
+        let first = mgr.conversation_of(id).unwrap();
+        wait_for_screen(&mgr, id, &format!("ARGS --session-id {first}"));
+        mgr.send_input(id, "").unwrap();
+        write_agent_file(&mgr, id, files.path(), elsewhere.path(), "not-mine");
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        assert_eq!(
+            crate::last_sessions::load(&record_path)[0].conversation_id.as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    /// `--continue` 接不回（claude 拒绝、马上退出）：进程已经不在了，就算
+    /// 留着一份它的文件也不读——不能把一个死掉的进程的 id 记成可以接回的。
+    /// 万一进程活着那一瞬间写下了一个接不回的 id，重启时按 id 接回会马上
+    /// 退出，由 `daemon::tests::a_session_whose_conversation_is_gone_is_restarted_fresh_and_reported`
+    /// 那条路换成新开的会话。
+    #[test]
+    fn a_failed_continue_learns_nothing_from_a_leftover_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let record_path =
+            crate::last_sessions::last_sessions_path_for_socket(&tmp.path().join("daemon.sock"));
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        let tmpl = files.path().join("{pid}.json");
+        let toml = format!(
+            r#"
+            name = "continue-fails"
+            command = ["/bin/sh", "-c", "echo refused; exit 1", "sh"]
+            is_agent = false
+            resume_args = ["--continue"]
+            session_id_args = ["--session-id", "{{id}}"]
+            resume_id_args = ["--resume", "{{id}}"]
+            conversation_file = '{}'
+            conversation_file_key = "sessionId"
+            "#,
+            tmpl.display()
+        );
+        mgr.register_profile(Profile::from_toml(&crate::sys::testing::toml_with_sh(&toml)).unwrap());
+
+        let proj = tempfile::tempdir().unwrap();
+        let id = mgr
+            .create_resuming(proj.path(), "continue-fails", None, &[], true, None, None)
+            .unwrap();
+        write_agent_file(&mgr, id, files.path(), proj.path(), "dead-one");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mgr.exited_on_its_own(id) != Some(true) {
+            assert!(Instant::now() < deadline, "探针没退出");
+            sleep(Duration::from_millis(20));
+        }
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        assert_eq!(mgr.conversation_of(id), None);
+        for r in crate::last_sessions::load(&record_path) {
+            assert_eq!(r.conversation_id, None);
+        }
+    }
+
+    /// 能按 id 接回、却没声明对话文件的 profile：`--continue` 接回的会话
+    /// 照旧没 id（以前就是这样），不受影响。
+    #[test]
+    fn a_continued_session_without_an_agent_file_still_has_no_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record_path =
+            crate::last_sessions::last_sessions_path_for_socket(&tmp.path().join("daemon.sock"));
+        let mgr = SessionManager::new();
+        mgr.set_last_sessions_path(record_path.clone());
+        mgr.register_profile(echo_id_profile());
+
+        let proj = tempfile::tempdir().unwrap();
+        let id = mgr
+            .create_resuming(proj.path(), "echo-id", None, &[], true, None, None)
+            .unwrap();
+        wait_for_screen(&mgr, id, "ARGS --continue");
+        mgr.persist_last_sessions_with(&RestartMarks::default());
+        assert_eq!(crate::last_sessions::load(&record_path)[0].conversation_id, None);
     }
 
     /// 一个没声明 `resume_args` 的 profile，`resume = true` 也不该凭空
