@@ -61,6 +61,7 @@ rqrr = "0.10.1"
 tempfile = "3"
 dct-brain = { path = "crates/dct-brain", features = ["soft-signer"] }
 dct-explore = { path = "crates/dct-explore", features = ["fake"] }
+dct-dco = { path = "crates/dct-dco", features = ["fake"] }
 
 # TLS 后端按平台分叉。
 #

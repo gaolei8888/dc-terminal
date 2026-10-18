@@ -26,7 +26,7 @@ fn alias_does_not_replace_substrings() {
     let cfg = Config::default();
     assert_eq!(fix_aliases("我在练张瑜伽", &cfg), "我在练张瑜伽");
     assert_eq!(fix_aliases("大张瑜", &cfg), "大张瑜");
-    let mut c = Config { alias: BTreeMap::new() };
+    let mut c = Config { alias: BTreeMap::new(), ..Config::default() };
     c.alias.insert("octo".into(), vec!["ok to".into()]);
     assert_eq!(fix_aliases("ok to, hi", &c), "octo, hi");
     assert_eq!(fix_aliases("book to read", &c), "book to read");
@@ -36,7 +36,7 @@ fn alias_does_not_replace_substrings() {
 #[test]
 fn text_without_alias_is_untouched() {
     assert_eq!(fix_aliases("你好，请帮我看一下现在的目录", &Config::default()), "你好，请帮我看一下现在的目录");
-    assert_eq!(fix_aliases("anything", &Config { alias: BTreeMap::new() }), "anything");
+    assert_eq!(fix_aliases("anything", &Config { alias: BTreeMap::new(), ..Config::default() }), "anything");
 }
 
 #[test]
@@ -201,6 +201,9 @@ struct World {
     /// 第一次 hear（取启动前积压）交出的话。
     backlog: Vec<Utterance>,
     first: bool,
+    /// 每次读 dco `status` 依次交出的路由；用完后一直重复最后一个。空 = 一直是 `Agent`。
+    routes: Vec<RouteRead>,
+    route_reads: usize,
 }
 
 type W = Rc<RefCell<World>>;
@@ -282,6 +285,15 @@ impl Out for FOut {
         self.0.borrow_mut().errors.push(l.into());
     }
 }
+struct FRoute(W);
+impl RouteReader for FRoute {
+    fn read(&mut self) -> RouteRead {
+        let mut w = self.0.borrow_mut();
+        let i = w.route_reads.min(w.routes.len().saturating_sub(1));
+        w.route_reads += 1;
+        w.routes.get(i).cloned().unwrap_or_default()
+    }
+}
 struct FLog(W);
 impl Log for FLog {
     fn append(&mut self, r: &Value) {
@@ -294,9 +306,17 @@ fn world(sessions: Vec<SessionInfo>, script: Vec<(u64, Utterance)>) -> W {
 }
 
 fn go(w: &W, hears: usize) -> i32 {
+    go_cfg(w, hears, &Config::default())
+}
+
+fn go_cfg(w: &W, hears: usize, cfg: &Config) -> i32 {
     let (mut h, mut d, mut c, mut o, mut l) = (FHearer(w.clone()), FDaemon(w.clone()), FClock(w.clone()), FOut(w.clone()), FLog(w.clone()));
-    let cfg = Config::default();
-    Relay::new(&mut h, &mut d, &mut c, &mut o, &mut l, &cfg).run(Some(hears))
+    let code = Relay::new(&mut h, &mut d, &mut c, &mut o, &mut l, cfg).with_route(Box::new(FRoute(w.clone()))).run(Some(hears));
+    code
+}
+
+fn with_text() -> Config {
+    Config { log_text: true, ..Config::default() }
 }
 
 fn actions(w: &W) -> Vec<String> {
@@ -318,7 +338,7 @@ fn happy_path_sends_after_window_with_prefix() {
     assert_eq!((b.sent[0].1, b.sent[0].2.as_str()), (1, "（语音输入，可能有识别错误）你好，请帮我看一下现在的目录"));
     assert!(b.said.iter().any(|s| s.contains("听到：「你好，请帮我看一下现在的目录」 → 发给：dc-octo")));
     assert_eq!(b.log.last().unwrap()["action"], "sent");
-    assert_eq!(b.log.last().unwrap()["target"], "dc-octo");
+    assert_eq!(b.log.last().unwrap()["session"], 1);
 }
 
 #[test]
@@ -406,7 +426,7 @@ fn no_session_and_ambiguous_are_reported() {
 fn alias_is_fixed_before_routing_and_both_texts_are_logged() {
     let v = vec![sess(1, "章鱼", SessionState::Idle, 100), sess(2, "other", SessionState::Idle, 900)];
     let w = world(v, vec![(10_000, utt(1, "给张瑜说看一下目录", 0.9))]);
-    go(&w, 3);
+    go_cfg(&w, 3, &with_text());
     let b = w.borrow();
     assert_eq!(b.sent[0].1, 1);
     assert_eq!(b.log[0]["text_raw"], "给张瑜说看一下目录");
@@ -563,15 +583,214 @@ fn backlog_from_before_start_is_dropped_not_replayed() {
 }
 
 #[test]
-fn log_lines_have_the_documented_fields_and_only_text() {
+fn log_lines_are_metadata_only_by_default() {
     let w = world(idle_one(), vec![(10_000, utt(1, "看目录", 0.9))]);
     go(&w, 3);
     let b = w.borrow();
     let r = b.log[0].as_object().unwrap();
-    for k in ["t", "text_raw", "text_fixed", "confidence", "target", "action", "reason"] {
-        assert!(r.contains_key(k), "{k}");
+    let mut keys: Vec<&str> = r.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["action", "chars_fixed", "chars_raw", "confidence", "reason", "route", "session", "t", "trigger"]);
+    assert_eq!((r["chars_raw"].as_u64(), r["chars_fixed"].as_u64(), r["session"].as_u64()), (Some(3), Some(3), Some(1)));
+    assert_eq!((r["trigger"].as_str(), r["route"].as_str(), r["action"].as_str()), (Some(ALLOWED_TRIGGER), Some("agent"), Some("sent")));
+}
+
+#[test]
+fn no_log_line_carries_the_spoken_text_in_any_outcome() {
+    // 每一种去向各说一句带标记的话，整份日志里一个标记字都不能出现（包括会话名、纠错前后的字）。
+    let v = vec![sess(1, "秘密会话名", SessionState::Idle, 100), sess(2, "asking", SessionState::Asking, 50)];
+    let mut script = vec![];
+    let mut wrong = utt(2, "标记乙", 0.1);
+    wrong.trigger = "wake_word".into();
+    script.push((10_000, utt(1, "标记甲", 0.9)));
+    script.push((20_000, wrong));
+    script.push((30_000, utt(3, "标记丙", 0.2)));
+    script.push((40_000, utt(4, "给张瑜说标记丁", 0.9)));
+    script.push((50_000, utt(5, "给asking说标记戊", 0.9)));
+    script.push((60_000, utt(6, "好的", 0.9)));
+    let w = world(v, script);
+    go(&w, 12);
+    let b = w.borrow();
+    assert!(b.log.len() >= 6, "{:?}", b.log);
+    let all = serde_json::to_string(&b.log).unwrap();
+    for needle in ["标记", "秘密", "张瑜", "好的", "text_raw", "text_fixed"] {
+        assert!(!all.contains(needle), "{needle} in {all}");
     }
-    assert_eq!(r.len(), 7);
+}
+
+#[test]
+fn log_text_opt_in_keeps_both_texts_and_the_session_number() {
+    let w = world(idle_one(), vec![(10_000, utt(1, "看目录", 0.9))]);
+    go_cfg(&w, 3, &with_text());
+    let b = w.borrow();
+    let r = b.log[0].as_object().unwrap();
+    assert_eq!((r["text_raw"].as_str(), r["text_fixed"].as_str(), r["session"].as_u64()), (Some("看目录"), Some("看目录"), Some(1)));
+    assert!(r.contains_key("chars_raw") && r.contains_key("route"));
+}
+
+#[test]
+fn log_text_is_off_unless_the_user_writes_true() {
+    assert!(!Config::default().log_text);
+    assert!(!parse_config("").unwrap().log_text);
+    assert!(!parse_config("[alias]\n章鱼 = [\"张瑜\"]\n").unwrap().log_text);
+    assert!(parse_config("log_text = true\n").unwrap().log_text);
+    assert!(!parse_config("log_text = false\n").unwrap().log_text);
+    assert!(parse_config("log_text = \"yes\"\n").is_err(), "写成别的类型要报错，不能悄悄当成关或开");
+}
+
+// ---------- 语音路由（dco status 的 converse.voice_route） ----------
+
+#[test]
+fn route_is_read_from_the_status_body() {
+    use RouteRead::*;
+    let t = |v: Value| parse_route(&v);
+    assert_eq!(t(json!({"converse": {"voice_route": "agent"}})), Agent);
+    assert_eq!(t(json!({"converse": {"voice_route": "chat"}})), Chat);
+    assert_eq!(t(json!({"voice": true})), NoConverse, "旧 dco：没有 converse 这一块");
+    assert_eq!(t(json!({})), NoConverse);
+    assert_eq!(t(Value::Null), NoConverse);
+    assert_eq!(t(json!({"converse": {}})), Fallback("missing"));
+    assert_eq!(t(json!({"converse": {"voice_route": null}})), Fallback("missing"));
+    assert_eq!(t(json!({"converse": null})), Fallback("missing"));
+    assert_eq!(t(json!({"converse": {"voice_route": 3}})), Fallback("missing"));
+    assert_eq!(t(json!({"converse": {"voice_route": "Chat"}})), Fallback("unknown"));
+    assert_eq!(t(json!({"converse": {"voice_route": ""}})), Fallback("unknown"));
+    assert_eq!(t(json!({"converse": {"voice_route": "both"}})), Fallback("unknown"));
+}
+
+#[test]
+fn chat_route_sends_nothing_announces_nothing_and_says_so_once() {
+    let w = world(idle_one(), vec![(10_000, utt(1, "你好呀", 0.9)), (20_000, utt(2, "今天天气", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Chat];
+    go(&w, 4);
+    let b = w.borrow();
+    assert!(b.sent.is_empty());
+    assert_eq!(b.said, ["语音现在走聊天，dct voice 没送。"], "只在进入聊天时说一次，不预告、不报「没听清」之类");
+    assert_eq!(b.log.iter().map(|r| r["action"].as_str().unwrap()).collect::<Vec<_>>(), ["route_chat", "route_chat"]);
+    assert!(b.log.iter().all(|r| r["route"] == "chat" && r["session"].is_null()));
+}
+
+#[test]
+fn chat_route_never_logs_text_even_with_the_text_opt_in() {
+    let w = world(idle_one(), vec![(10_000, utt(1, "聊天里的悄悄话", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Chat];
+    go_cfg(&w, 3, &with_text());
+    let all = serde_json::to_string(&w.borrow().log).unwrap();
+    assert!(all.contains("route_chat") && !all.contains("悄悄话") && !all.contains("text_raw"), "{all}");
+}
+
+#[test]
+fn chat_route_skips_before_the_gates_so_nothing_is_blocked_or_announced() {
+    // 不是点章鱼触发的、低置信度、纯确认词：聊天模式下都不该走闸的话术（那些话是对「要送进会话」说的）。
+    let mut wake = utt(1, "你好", 0.9);
+    wake.trigger = "wake_word".into();
+    let w = world(idle_one(), vec![(10_000, wake), (20_000, utt(2, "你好", 0.1)), (30_000, utt(3, "好的", 0.9)), (40_000, utt(4, "取消", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Chat];
+    go(&w, 6);
+    let b = w.borrow();
+    assert_eq!(b.said, ["语音现在走聊天，dct voice 没送。"]);
+    assert_eq!(b.log.len(), 4);
+    assert!(b.log.iter().all(|r| r["action"] == "route_chat"));
+}
+
+#[test]
+fn chat_route_still_advances_since_seq_so_switching_back_does_not_replay() {
+    let w = world(idle_one(), vec![(10_000, utt(5, "聊天时说的", 0.9)), (30_000, utt(9, "回到会话后说的", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Chat, RouteRead::Agent];
+    go(&w, 6);
+    let b = w.borrow();
+    assert_eq!(b.sent.len(), 1, "{:?}", b.sent);
+    assert!(b.sent[0].2.contains("回到会话后说的") && !b.sent[0].2.contains("聊天时说的"));
+    let seqs: Vec<u64> = b.hear_calls.iter().map(|c| c.0).collect();
+    assert!(seqs.windows(2).all(|p| p[0] <= p[1]) && seqs.contains(&5), "{seqs:?}");
+    assert!(b.said.iter().any(|s| s.contains("语音现在走聊天")));
+}
+
+#[test]
+fn route_is_read_once_per_heard_sentence_with_no_cache() {
+    let w = world(idle_one(), vec![(10_000, utt(1, "甲", 0.9)), (20_000, utt(2, "乙", 0.9)), (30_000, utt(3, "丙", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Agent, RouteRead::Chat, RouteRead::Agent];
+    go(&w, 6);
+    let b = w.borrow();
+    assert_eq!(b.route_reads, 3);
+    let sent: Vec<&str> = b.sent.iter().map(|s| s.2.as_str()).collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].ends_with('甲') && sent[1].ends_with('丙'), "{sent:?}");
+    assert_eq!(actions(&w), ["sent", "route_chat", "sent"]);
+}
+
+#[test]
+fn agent_and_old_dco_keep_the_old_behaviour_without_noise() {
+    for r in [RouteRead::Agent, RouteRead::NoConverse] {
+        let w = world(idle_one(), vec![(10_000, utt(1, "看目录", 0.9))]);
+        w.borrow_mut().routes = vec![r.clone()];
+        go(&w, 3);
+        let b = w.borrow();
+        assert_eq!(b.sent.len(), 1, "{r:?}");
+        assert!(b.said.iter().all(|s| !s.contains("路由") && !s.contains("聊天")), "{r:?} {:?}", b.said);
+        assert_eq!(b.log[0]["action"], "sent");
+    }
+}
+
+#[test]
+fn unreadable_route_keeps_the_old_behaviour_and_says_so_once_per_change() {
+    let w = world(idle_one(), vec![(10_000, utt(1, "甲", 0.9)), (20_000, utt(2, "乙", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Fallback("status_failed")];
+    go(&w, 5);
+    let b = w.borrow();
+    assert_eq!(b.sent.len(), 2, "读不到按旧行为：照常送");
+    assert_eq!(b.said.iter().filter(|s| s.contains("语音路由")).count(), 1, "{:?}", b.said);
+    assert_eq!(b.log[0]["route"], "agent_fallback_status_failed");
+    assert_eq!(b.log[0]["action"], "sent");
+}
+
+#[test]
+fn route_reader_failure_never_breaks_the_loop() {
+    // 路由读取每次都失败，其余照常：既不 panic 也不退出，送出的话数量不变。
+    let w = world(idle_one(), vec![(10_000, utt(1, "甲", 0.9)), (30_000, utt(2, "乙", 0.9))]);
+    w.borrow_mut().routes = vec![RouteRead::Fallback("status_failed")];
+    assert_eq!(go(&w, 6), 0);
+    assert_eq!(w.borrow().sent.len(), 2);
+}
+
+#[cfg(unix)]
+mod real_status {
+    use super::*;
+    use dct_dco::fake;
+    use dct_dco::DcoClient;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn read_with(handler: impl Fn(&str, &Value) -> (Value, bool, Option<String>) + Send + 'static) -> (RouteRead, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let h = fake::serve(dir.path(), TOKEN, handler);
+        let shared = Rc::new(RefCell::new(DcoClient::connect(dir.path()).unwrap()));
+        let r = unix::DcoRoute(shared.clone()).read();
+        drop(shared);
+        (r, h.join().unwrap())
+    }
+
+    #[test]
+    fn it_calls_only_status_and_reads_the_route() {
+        let (r, seen) = read_with(|tool, _| {
+            assert_eq!(tool, "status");
+            (json!({"converse": {"voice_route": "chat"}}), false, None)
+        });
+        assert_eq!(r, RouteRead::Chat);
+        assert_eq!(seen.last().map(String::as_str), Some("tools/call"));
+        let (r, _) = read_with(|_, _| (json!({"converse": {"voice_route": "agent"}}), false, None));
+        assert_eq!(r, RouteRead::Agent);
+    }
+
+    #[test]
+    fn an_older_dco_without_converse_or_with_a_failing_status_is_not_an_error() {
+        let (r, _) = read_with(|_, _| (json!({"voice": true}), false, None));
+        assert_eq!(r, RouteRead::NoConverse);
+        let (r, _) = read_with(|_, _| (json!({"error": {"code": "boom", "message": "x"}}), true, None));
+        assert_eq!(r, RouteRead::Fallback("status_failed"));
+        let (r, _) = read_with(|_, _| (json!({"converse": {"voice_route": "zzz"}}), false, None));
+        assert_eq!(r, RouteRead::Fallback("unknown"));
+    }
 }
 
 #[cfg(unix)]

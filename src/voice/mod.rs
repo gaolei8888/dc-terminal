@@ -68,19 +68,77 @@ pub trait Log {
     fn append(&mut self, rec: &Value);
 }
 
+/// dco `status` 里 `converse.voice_route` 读出来的结果。每听到一句话读一次，不缓存（用户随时能在菜单里换）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum RouteRead {
+    /// 语音送进 agent 会话（现有行为）。
+    #[default]
+    Agent,
+    /// 语音走 dco 的聊天：`dct voice` 一句也不送。
+    Chat,
+    /// 旧 dco，`status` 里没有 `converse` 这一块：按旧行为，不出声。
+    NoConverse,
+    /// 有 `converse` 但读不到 / 不认识 / `status` 调用失败：按旧行为，说一句。理由是固定词，不含任何听写文字。
+    Fallback(&'static str),
+}
+
+impl RouteRead {
+    fn is_chat(&self) -> bool {
+        *self == RouteRead::Chat
+    }
+
+    /// 日志里的路由决定。
+    fn label(&self) -> String {
+        match self {
+            RouteRead::Agent => "agent".into(),
+            RouteRead::Chat => "chat".into(),
+            RouteRead::NoConverse => "agent_no_converse".into(),
+            RouteRead::Fallback(why) => format!("agent_fallback_{why}"),
+        }
+    }
+}
+
+pub trait RouteReader {
+    /// 读不到不是错误：永远给一个答案，失败按旧行为（`Fallback`）。
+    fn read(&mut self) -> RouteRead;
+}
+
+/// 没接 dco 的默认读法：永远是旧行为。
+struct AgentOnly;
+impl RouteReader for AgentOnly {
+    fn read(&mut self) -> RouteRead {
+        RouteRead::Agent
+    }
+}
+
+/// 解析 dco `status` 的回复里的 `converse.voice_route`。
+pub fn parse_route(status: &Value) -> RouteRead {
+    match status.get("converse") {
+        None => RouteRead::NoConverse,
+        Some(c) => match c["voice_route"].as_str() {
+            Some("agent") => RouteRead::Agent,
+            Some("chat") => RouteRead::Chat,
+            Some(_) => RouteRead::Fallback("unknown"),
+            None => RouteRead::Fallback("missing"),
+        },
+    }
+}
+
 // ---------- 配置与纠错 ----------
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// 写对的词 -> 识别器常写成的别的样子。
     pub alias: BTreeMap<String, Vec<String>>,
+    /// `voice.log` 里是否记转写文字（`text_raw` / `text_fixed`）。默认不记，只有用户在 `voice.toml` 里写 `log_text = true` 才记。
+    pub log_text: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut alias = BTreeMap::new();
         alias.insert("章鱼".to_string(), ["张瑜", "张宇", "章玉", "张羽"].iter().map(|s| s.to_string()).collect());
-        Config { alias }
+        Config { alias, log_text: false }
     }
 }
 
@@ -109,7 +167,11 @@ pub fn parse_config(src: &str) -> Result<Config, String> {
             alias.insert(k.clone(), arr.iter().filter_map(|a| a.as_str().map(String::from)).collect());
         }
     }
-    Ok(Config { alias })
+    let log_text = match v.get("log_text") {
+        None => false,
+        Some(t) => t.as_bool().ok_or("~/.dct/voice.toml 里的 log_text 要写成 true 或 false")?,
+    };
+    Ok(Config { alias, log_text })
 }
 
 /// 别名紧挨着的汉字里，这些算「词的边界」（「给张瑜说」「张瑜你好」）；别的汉字紧挨着就是更长的词的一部分（「张瑜伽」）。
@@ -328,6 +390,8 @@ pub struct Relay<'a> {
     pub out: &'a mut dyn Out,
     pub log: &'a mut dyn Log,
     pub cfg: &'a Config,
+    route: Box<dyn RouteReader + 'a>,
+    last_route: Option<RouteRead>,
     since_seq: u64,
     last_sent_ms: Option<u64>,
     pending: VecDeque<Utterance>,
@@ -343,12 +407,40 @@ fn hear_message(e: &HearError) -> String {
 
 impl<'a> Relay<'a> {
     pub fn new(hearer: &'a mut dyn Hearer, daemon: &'a mut dyn Daemon, clock: &'a mut dyn Clock, out: &'a mut dyn Out, log: &'a mut dyn Log, cfg: &'a Config) -> Self {
-        Relay { hearer, daemon, clock, out, log, cfg, since_seq: 0, last_sent_ms: None, pending: VecDeque::new() }
+        Relay { hearer, daemon, clock, out, log, cfg, route: Box::new(AgentOnly), last_route: None, since_seq: 0, last_sent_ms: None, pending: VecDeque::new() }
     }
 
-    fn record(&mut self, raw: &str, fixed: &str, conf: f64, target: Option<&str>, action: &str, reason: &str) {
+    /// 接上读 dco 路由的那一路；不接就永远是旧行为。
+    pub fn with_route(mut self, route: Box<dyn RouteReader + 'a>) -> Self {
+        self.route = route;
+        self
+    }
+
+    /// 一行日志，只有元数据：时间、触发方式、会话编号、字数、置信度、路由决定。
+    /// 转写文字默认不进（`Config::log_text` 才加），聊天路由那几行永远不带文字。
+    fn record(&mut self, u: &Utterance, raw: &str, fixed: &str, session: Option<u32>, action: &str, reason: &str) {
         let t = self.clock.now_ms();
-        self.log.append(&json!({ "t": t, "text_raw": raw, "text_fixed": fixed, "confidence": conf, "target": target, "action": action, "reason": reason }));
+        let route = self.last_route.as_ref().map(RouteRead::label);
+        let mut rec = json!({ "t": t, "trigger": u.trigger, "session": session, "chars_raw": raw.chars().count(), "chars_fixed": fixed.chars().count(), "confidence": u.confidence, "route": route, "action": action, "reason": reason });
+        if self.cfg.log_text && !self.last_route.as_ref().is_some_and(RouteRead::is_chat) {
+            rec["text_raw"] = json!(raw);
+            rec["text_fixed"] = json!(fixed);
+        }
+        self.log.append(&rec);
+    }
+
+    /// 读这一句话的路由；状态变了才说话（进聊天、或读不到时各一句）。
+    fn read_route(&mut self) -> RouteRead {
+        let r = self.route.read();
+        if self.last_route.as_ref() != Some(&r) {
+            match &r {
+                RouteRead::Chat => self.out.say("语音现在走聊天，dct voice 没送。"),
+                RouteRead::Fallback(why) => self.out.say(&format!("读不到 dco 的语音路由（{why}），按旧办法送进会话。")),
+                _ => {}
+            }
+            self.last_route = Some(r.clone());
+        }
+        r
     }
 
     /// 只取 seq 比已见过的更新的，并推进 `since_seq`。
@@ -409,45 +501,49 @@ impl<'a> Relay<'a> {
     pub fn handle(&mut self, u: Utterance) -> Result<(), HearError> {
         let raw = u.text.trim().to_string();
         let fixed = fix_aliases(&raw, self.cfg);
-        let conf = u.confidence;
+        // 路由在所有闸之前：聊天时这句话不归 dct voice 管，闸的话术（「没听清」「要在键盘上确认」）都不该对它说。
+        if self.read_route().is_chat() {
+            self.record(&u, &raw, &fixed, None, "route_chat", "voice_route_chat");
+            return Ok(());
+        }
         if is_cancel(&fixed) {
             self.out.say("现在没有要取消的话。");
-            self.record(&raw, &fixed, conf, None, "cancelled", "nothing_pending");
+            self.record(&u, &raw, &fixed, None, "cancelled", "nothing_pending");
             return Ok(());
         }
         if u.trigger != ALLOWED_TRIGGER {
             self.out.say("这句话不是你点章鱼说的，我没有送进会话。");
-            self.record(&raw, &fixed, conf, None, "blocked_trigger", &u.trigger);
+            self.record(&u, &raw, &fixed, None, "blocked_trigger", &u.trigger);
             return Ok(());
         }
-        if conf < MIN_CONFIDENCE {
+        if u.confidence < MIN_CONFIDENCE {
             self.out.say("没听清，再说一遍？");
-            self.record(&raw, &fixed, conf, None, "low_confidence", "below_threshold");
+            self.record(&u, &raw, &fixed, None, "low_confidence", "below_threshold");
             return Ok(());
         }
         let confirm_msg = "这一步要你在键盘上确认（单独的「好」「是」「确认」这类话我不会送进会话）。";
         if is_bare_confirmation(&fixed) {
             self.out.say(confirm_msg);
-            self.record(&raw, &fixed, conf, None, "blocked_confirm", "bare_confirmation");
+            self.record(&u, &raw, &fixed, None, "blocked_confirm", "bare_confirmation");
             return Ok(());
         }
         let sessions = match self.daemon.sessions() {
             Ok(s) => s,
             Err(m) => {
                 self.out.say(&format!("连不上 dct 的后台（{m}），这句没发。"));
-                self.record(&raw, &fixed, conf, None, "no_session", "daemon_unreachable");
+                self.record(&u, &raw, &fixed, None, "no_session", "daemon_unreachable");
                 return Ok(());
             }
         };
         let (id, name, body) = match route(&fixed, &sessions) {
             Route::NoSession => {
                 self.out.say("现在没有开着的会话");
-                self.record(&raw, &fixed, conf, None, "no_session", "no_agent_session");
+                self.record(&u, &raw, &fixed, None, "no_session", "no_agent_session");
                 return Ok(());
             }
             Route::Ambiguous => {
                 self.out.say("有几个叫这个名字的会话，说编号");
-                self.record(&raw, &fixed, conf, None, "ambiguous", "name_matches_many");
+                self.record(&u, &raw, &fixed, None, "ambiguous", "name_matches_many");
                 return Ok(());
             }
             Route::To { id, name, text } => (id, name, text),
@@ -455,23 +551,23 @@ impl<'a> Relay<'a> {
         if body.is_empty() || is_bare_confirmation(&body) {
             let (action, reason) = if body.is_empty() { ("low_confidence", "empty_after_route") } else { ("blocked_confirm", "bare_confirmation_after_route") };
             self.out.say(if body.is_empty() { "没听清要说什么，再说一遍？" } else { confirm_msg });
-            self.record(&raw, &fixed, conf, Some(&name), action, reason);
+            self.record(&u, &raw, &fixed, Some(id), action, reason);
             return Ok(());
         }
         let target = sessions.iter().find(|s| s.id == id);
         if target.is_none_or(|s| s.state == SessionState::Stopped) {
             self.out.say(&format!("{name} 已经停了，这句没发。"));
-            self.record(&raw, &fixed, conf, Some(&name), "no_session", "target_stopped");
+            self.record(&u, &raw, &fixed, Some(id), "no_session", "target_stopped");
             return Ok(());
         }
         if target.is_some_and(waiting_for_approval) {
-            self.block_prompt(&raw, &fixed, conf, &name, "waiting_for_approval");
+            self.block_prompt(&u, &raw, &fixed, id, &name, "waiting_for_approval");
             return Ok(());
         }
         if let Some(last) = self.last_sent_ms {
             if self.clock.now_ms().saturating_sub(last) < MIN_GAP_MS {
                 self.out.say("说得太快了，这句先不发。");
-                self.record(&raw, &fixed, conf, Some(&name), "blocked_confirm", "rate_limited");
+                self.record(&u, &raw, &fixed, Some(id), "blocked_confirm", "rate_limited");
                 return Ok(());
             }
         }
@@ -480,7 +576,7 @@ impl<'a> Relay<'a> {
         self.out.banner(&body);
         if self.wait_cancel()? {
             self.out.say("已取消");
-            self.record(&raw, &fixed, conf, Some(&name), "cancelled", "user_cancelled");
+            self.record(&u, &raw, &fixed, Some(id), "cancelled", "user_cancelled");
             return Ok(());
         }
         // 窗口里会话的状态可能变了：送之前再看一次。
@@ -488,20 +584,20 @@ impl<'a> Relay<'a> {
             Ok(s) => s,
             Err(m) => {
                 self.out.say(&format!("连不上 dct 的后台（{m}），这句没发。"));
-                self.record(&raw, &fixed, conf, Some(&name), "no_session", "daemon_unreachable");
+                self.record(&u, &raw, &fixed, Some(id), "no_session", "daemon_unreachable");
                 return Ok(());
             }
         };
         match sessions.iter().find(|s| s.id == id) {
             Some(s) if s.state != SessionState::Stopped => {
                 if waiting_for_approval(s) {
-                    self.block_prompt(&raw, &fixed, conf, &name, "waiting_for_approval_at_send");
+                    self.block_prompt(&u, &raw, &fixed, id, &name, "waiting_for_approval_at_send");
                     return Ok(());
                 }
             }
             _ => {
                 self.out.say(&format!("{name} 已经停了，这句没发。"));
-                self.record(&raw, &fixed, conf, Some(&name), "no_session", "target_gone_at_send");
+                self.record(&u, &raw, &fixed, Some(id), "no_session", "target_gone_at_send");
                 return Ok(());
             }
         }
@@ -509,19 +605,19 @@ impl<'a> Relay<'a> {
             Ok(()) => {
                 self.last_sent_ms = Some(self.clock.now_ms());
                 self.out.say(&format!("已发给：{name}"));
-                self.record(&raw, &fixed, conf, Some(&name), "sent", "");
+                self.record(&u, &raw, &fixed, Some(id), "sent", "");
             }
             Err(m) => {
                 self.out.say(&format!("没送进去：{m}"));
-                self.record(&raw, &fixed, conf, Some(&name), "no_session", "send_failed");
+                self.record(&u, &raw, &fixed, Some(id), "no_session", "send_failed");
             }
         }
         Ok(())
     }
 
-    fn block_prompt(&mut self, raw: &str, fixed: &str, conf: f64, name: &str, reason: &str) {
+    fn block_prompt(&mut self, u: &Utterance, raw: &str, fixed: &str, id: u32, name: &str, reason: &str) {
         self.out.say(&format!("这一步要你在键盘上确认：{name} 正在等你批准，语音不能代替。"));
-        self.record(raw, fixed, conf, Some(name), "blocked_prompt", reason);
+        self.record(u, raw, fixed, Some(id), "blocked_prompt", reason);
     }
 
     /// 等取消窗口走完；期间继续取话：整句是「取消」就丢掉这一句。别的话先排着，不丢也不影响。
@@ -599,6 +695,18 @@ mod unix {
         }
     }
 
+    /// 读 dco `status` 的 `converse.voice_route`（同一条 dco 连接，只调 `status`）。任何失败都是 `Fallback`，不会弄坏循环。
+    pub struct DcoRoute(pub Shared);
+
+    impl RouteReader for DcoRoute {
+        fn read(&mut self) -> RouteRead {
+            match self.0.borrow_mut().call("status", json!({})) {
+                Ok(body) => parse_route(&body),
+                Err(_) => RouteRead::Fallback("status_failed"),
+            }
+        }
+    }
+
     pub struct SocketDaemon(pub PathBuf);
 
     impl SocketDaemon {
@@ -656,7 +764,7 @@ mod unix {
         }
     }
 
-    /// 一行一条 JSON，0600。只有文字。
+    /// 一行一条 JSON，0600。默认只有元数据，没有转写文字（见 `Relay::record`）。
     pub struct FileLog(pub PathBuf);
 
     impl FileLog {
@@ -715,9 +823,11 @@ mod unix {
         let mut hearer = DcoHearer(shared.clone());
         let mut daemon = SocketDaemon(crate::proto::socket_path());
         let mut clock = SystemClock;
+        let route = Box::new(DcoRoute(shared.clone()));
         let mut out = Console(shared);
         println!("在听了：点章鱼说话，说完 2 秒后送进最近用的会话。Ctrl-C 退出。");
-        Relay::new(&mut hearer, &mut daemon, &mut clock, &mut out, &mut log, &cfg).run(None)
+        let code = Relay::new(&mut hearer, &mut daemon, &mut clock, &mut out, &mut log, &cfg).with_route(route).run(None);
+        code
     }
 
     fn dct_game_error_text(e: &dct_game::play::DcoError) -> String {

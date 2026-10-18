@@ -210,7 +210,7 @@ dco 识别收尾（dco 量，未知）
 - **失败的那一轮**：整轮没有任何句子发出（联不上/超时/空回复）→ 用户那句**不入记忆**（否则重试会重复）；已发出部分句子后超时 → 入记忆的是**已发出的那几句**，标记被截断。
 - **被取消的那一轮（客户端关连接）**：**整轮丢弃**——用户那句和已生成的部分回复都不入记忆（dct 的默认，dco 把「怎么记」交给 dct 定；理由见 §6.5）。注意与上一条的区别：超时是 dct 自己到点收尾，已说出的话有人听到了；取消是对面不要这一轮了。
 - **日志**：ask **默认不记任何对话文字**，stderr 和日志里都没有。只允许一行元数据到 `~/.dct/ask.log`（0600）：`{t, source, chars_in, chars_out, first_ms, total_ms, outcome}`，`conversation_id` 只记前 4 位的哈希。`http.rs` 现有的 `eprintln!("LLM HTTP 调用失败：{e}")` 不带响应体，但 ask 路径不能新增任何打印请求/响应内容的地方（测试钉住，§10）。
-- **顺带发现（不在本设计范围，需要用户知道）**：现有 `dct voice` 的 `voice.log` 会写 `text_raw` 和 `text_fixed`（`src/voice/mod.rs` `record()`），即**转写文字落盘**。这与「语音日志默认不记文字」的规矩不一致。**已定：`voice.log` 默认不再记转写文字**（§13 Q6）；这是对现有 `dct voice` 代码的一处改动，随 A3 一起做，尚未改。
+- **顺带发现（不在本设计范围，需要用户知道）**：现有 `dct voice` 的 `voice.log` 会写 `text_raw` 和 `text_fixed`（`src/voice/mod.rs` `record()`），即**转写文字落盘**。这与「语音日志默认不记文字」的规矩不一致。**已定：`voice.log` 默认不再记转写文字**（§13 Q6）；这是对现有 `dct voice` 代码的一处改动，随 A3 一起做（已做，见 §15）。
 
 ## 5. 回复只显示/说，不当命令（对应需求 5）
 
@@ -420,7 +420,7 @@ A1 起要用户先批准本设计（M0 和 M0b 已做完，下一步是用户对
 | 3 | 6 轮 / 3000 字符 / 空闲 30 分钟 / 最多 4 个对话；永不落盘 |
 | 4 | 用 `end` 事件，不用句上 `last`（dco 同意） |
 | 5 | 思考模式默认关，保首句时间；先测，质量取舍测完再回头定 |
-| 6 | `voice.log` 默认不再记转写文字（改动随 A3，未做） |
+| 6 | `voice.log` 默认不再记转写文字（A3 已做，未提交，见 §15） |
 | 7 | **与原建议不同**：`voice_route` 读不到或无 `converse` 块 → `dct voice` 保持旧行为（原建议是读不到就跳过，见 §7 决定变更记录） |
 | 8 | 人设由 dco 提供，dct 不存 |
 | 9 | 全局 1 个在途 ask；`ask` 优先于 dct 其他用网关的功能 |
@@ -448,7 +448,7 @@ dco 转达、已同意的另外几条：语音发到远端网关需单独 opt-in
 11. **闲聊短路**（「你好」「谢谢」用固定回复不调模型，能把这类首句压到几十毫秒）：要不要做？它是一张固定话术表，接近「内容」，我默认**不做**，除非你要。
 12. 网关到底几路（2 还是 4）——这影响自我限流的数字，请确认或让我去问 dc_llm 那边。
 
-## 14. A2 实现记录（2026-10-17，分支 `dct-ask`，未提交）
+## 14. A2 实现记录（2026-10-17，分支 `dct-ask`，已提交 d7353c2）
 
 实现时才能定的几处，以及相对本文有出入的地方。其余照本文。
 
@@ -462,3 +462,14 @@ dco 转达、已同意的另外几条：语音发到远端网关需单独 opt-in
 - **Windows**：`ClientGone` 仍无法 peek（见 `ask/mod.rs` 注释），关连接 = 取消在 Windows 上只靠写失败发现，比 §6.5 弱；dco 目前只有 Mac 版，没有补一条没法验证的 Windows 路径。
 - **仍是 A1 的已知限制**：网关沉默时（预填、或两个 token 之间隔很久）到网关的连接要等到下一个字节或期限才真关（ureq 2.x 的阻塞读没法从别的线程打断）。**dct 这一侧立刻释放**（在途标记、记忆、`busy`），所以重发不受影响；网关那边可能多生成一会儿，最长到 `timeout_ms`（≤ 30 秒）。
 - **思考模式**：请求里没有任何思考字段（M0：网关默认就不思考，三种开法都没生效），所以没有开关；`max_tokens` 固定 200。
+
+## 15. A3 实现记录（2026-10-17，分支 `dct-ask`，未提交）
+
+照 §7，没有出入的不重复；有出入或本文没写死的几处：
+
+- **每句话读一次 `status`，不缓存**，读在所有闸之前（含「取消」「不是点章鱼触发」「低置信度」「纯确认词」）。`chat` 时这些闸的话术一律不说（它们是对「要送进会话」说的）。取消窗口里等「取消」那一段不读路由（那一句已经决定要送了）。
+- **新增 `RouteRead`**：`Agent` / `Chat` / `NoConverse`（旧 dco，不出声）/ `Fallback(理由)`（有 `converse` 但 `voice_route` 缺失、不认识〔含大小写不对〕，或 `status` 调用失败：按旧行为，说一句，理由是固定词 `missing` / `unknown` / `status_failed`）。**说话的规则**：路由读数相对上一句变了才说（进 `chat`、进 `Fallback` 各一句），不是每句都说；`Agent` 与 `NoConverse` 不出声。
+- **`voice.log` 现在是元数据**：`{t, trigger, session, chars_raw, chars_fixed, confidence, route, action, reason}`。**`target`（会话名）换成了 `session`（编号）**——会话名可以是用户起的标签，不算必要的元数据。`chat` 跳过的那几行 `action = "route_chat"`、`session = null`。`route` 取值：`chat` / `agent` / `agent_no_converse` / `agent_fallback_<理由>`。
+- **留文字的开关**（本文只写了「默认不再记」，没写键名，这里定一个）：`~/.dct/voice.toml` 顶层 `log_text = true`；缺省/`false` 不记；写成别的类型报错。开了之后非聊天的行多带 `text_raw` / `text_fixed`；**`chat` 跳过的行永远不带文字**（§7）。
+- 已有的 `~/.dct/voice.log` 不动：A3 之前写的行里有 `text_raw` / `text_fixed` 明文，是否清掉由用户决定。`docs/superpowers/specs/2026-10-04-dct-voice-relay-design.md` 里对日志字段的描述已过时，没改。
+- 接线：`Relay::with_route(Box<dyn RouteReader>)`；不接就永远旧行为（`AgentOnly`）。真读法 `unix::DcoRoute` 用同一条 dco 连接只调 `status`；测试用 `crates/dct-dco` 的假 dco（根 crate 的 dev-dependencies 加了 `dct-dco` 的 `fake` 特性）。
