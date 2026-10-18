@@ -182,6 +182,20 @@ pub struct Profile {
     /// 重启后按 id 接回那段对话的参数，`{id}` 同上。
     #[serde(default)]
     pub resume_id_args: Vec<String>,
+    /// agent 自己为每个在跑的进程写的那份小文件，里面记着它此刻的对话 id。
+    /// 开头的 `~/` 是家目录，`{pid}` 换成 agent 的进程号（claude 是
+    /// `~/.claude/sessions/{pid}.json`）。dct 每次写 `last-sessions.toml`
+    /// 时去读一下，记住 agent 此刻真正在用的那段对话：走 `--continue` 接回的
+    /// 会话由此也有了 id，在 agent 里换了对话（`/clear`、`/resume`）也跟得上。
+    ///
+    /// 这类文件多半不是公开约定，读不到、对不上就照旧用手上的 id，见
+    /// `conversation_id::read_from_file`。**只给实测过的 profile 写**。
+    #[serde(default)]
+    pub conversation_file: String,
+    /// 上面那份文件里装对话 id 的 JSON 键（claude 是 `sessionId`）。
+    /// 跟 `conversation_file` 两个都写了才读，见 `learns_conversation_from_file`。
+    #[serde(default)]
+    pub conversation_file_key: String,
 }
 
 /// 把参数里的 `{id}` 换成真正的 id。
@@ -194,6 +208,15 @@ impl Profile {
     /// 都接不回同一段对话。
     pub fn resumes_by_id(&self) -> bool {
         !self.session_id_args.is_empty() && !self.resume_id_args.is_empty()
+    }
+
+    /// 要不要去 agent 自己的文件里读对话 id：`conversation_file` 和
+    /// `conversation_file_key` 都写了，而且能按 id 接回——接不回的话读回来
+    /// 也没处用。
+    pub fn learns_conversation_from_file(&self) -> bool {
+        self.resumes_by_id()
+            && !self.conversation_file.is_empty()
+            && !self.conversation_file_key.is_empty()
     }
 }
 
@@ -1671,6 +1694,39 @@ mod tests {
             );
             assert!(!p.resumes_by_id(), "{name}");
         }
+    }
+
+    /// 跑 claude 二进制、又能按 id 接回的 profile 都去读 claude 自己的
+    /// `~/.claude/sessions/<pid>.json`；跑 qwen 的（qwen、dc）不读——那是别家的文件。
+    #[test]
+    fn claude_binary_profiles_learn_the_conversation_from_its_file() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.command[0], "claude", "{name}");
+            assert_eq!(p.conversation_file, "~/.claude/sessions/{pid}.json", "{name}");
+            assert_eq!(p.conversation_file_key, "sessionId", "{name}");
+            assert!(p.learns_conversation_from_file(), "{name}");
+        }
+        for name in ["dc", "qwen", "codex", "opencode", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(!p.learns_conversation_from_file(), "{name}");
+        }
+    }
+
+    /// 两个字段缺一个都不算；不能按 id 接回的也不算——读回来也没处用。
+    #[test]
+    fn learning_from_the_file_needs_both_fields_and_resume_by_id() {
+        let base = "name = \"x\"\ncommand = [\"x\"]\n";
+        let ids = "session_id_args = [\"--s\", \"{id}\"]\nresume_id_args = [\"--r\", \"{id}\"]\n";
+        let file = "conversation_file = \"/t/{pid}.json\"\n";
+        let key = "conversation_file_key = \"sessionId\"\n";
+        let p = |s: String| Profile::from_toml(&s).unwrap();
+        assert!(p(format!("{base}{ids}{file}{key}")).learns_conversation_from_file());
+        assert!(!p(format!("{base}{ids}{file}")).learns_conversation_from_file());
+        assert!(!p(format!("{base}{ids}{key}")).learns_conversation_from_file());
+        assert!(!p(format!("{base}{file}{key}")).learns_conversation_from_file());
+        let bare = p(base.to_string());
+        assert!(bare.conversation_file.is_empty() && bare.conversation_file_key.is_empty());
     }
 
     #[test]

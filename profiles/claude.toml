@@ -30,6 +30,11 @@ resume_args = ["--continue"]
 # `claude --help`（2026-10-14）：`--session-id <uuid>`、`-r, --resume [value]`。
 session_id_args = ["--session-id", "{id}"]
 resume_id_args = ["--resume", "{id}"]
+# claude 给每个在跑的窗口写一份 `~/.claude/sessions/<pid>.json`，`sessionId`
+# 就是它此刻的对话（`--continue` 接回的、`/clear` 换过的也对）。不是公开约定，
+# 读不到就照旧。实测：claude 2.1.302（2026-10-18）。
+conversation_file = "~/.claude/sessions/{pid}.json"
+conversation_file_key = "sessionId"
 
 [label]
 zh = "Claude"
