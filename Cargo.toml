@@ -5,6 +5,10 @@
 [workspace]
 members = ["crates/dct-link", "crates/dct-page", "crates/dct-srv", "crates/dct-brain", "crates/dct-mesh", "crates/dct-game", "crates/dct-dco", "crates/dct-explore"]
 
+# crossterm 0.28.1 + a 6-line patch: see vendor/README.md.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
+
 [package]
 name = "dct"
 version = "0.2.24"
