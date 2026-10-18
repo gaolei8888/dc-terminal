@@ -473,3 +473,14 @@ dco 转达、已同意的另外几条：语音发到远端网关需单独 opt-in
 - **留文字的开关**（本文只写了「默认不再记」，没写键名，这里定一个）：`~/.dct/voice.toml` 顶层 `log_text = true`；缺省/`false` 不记；写成别的类型报错。开了之后非聊天的行多带 `text_raw` / `text_fixed`；**`chat` 跳过的行永远不带文字**（§7）。
 - 已有的 `~/.dct/voice.log` 不动：A3 之前写的行里有 `text_raw` / `text_fixed` 明文，是否清掉由用户决定。`docs/superpowers/specs/2026-10-04-dct-voice-relay-design.md` 里对日志字段的描述已过时，没改。
 - 接线：`Relay::with_route(Box<dyn RouteReader>)`；不接就永远旧行为（`AgentOnly`）。真读法 `unix::DcoRoute` 用同一条 dco 连接只调 `status`；测试用 `crates/dct-dco` 的假 dco（根 crate 的 dev-dependencies 加了 `dct-dco` 的 `fake` 特性）。
+
+## 16. A4 联调结果（2026-10-18，未提交；只跑了第 1 步）
+
+真二进制 `~/.local/bin/dct`（f5614ade，0.2.24）+ 沙箱 HOME 里的真守护进程 + 本机 python 假 SSE 网关（脚本在 scratchpad `a4/`：`gw.py` `drive.py`）。沙箱 HOME 用短符号链接（socket 路径 ≤104 字符）。
+- 通过：stdin→NDJSON、stderr 空；`not_enabled`（ask_off / host_not_allowed）11；`bad_request` 六种 2，且不碰网关；多轮记忆（第二轮带第一轮 user+assistant；别的对话看不到）；`--forget` 后回到 2 条消息、turn=1；请求体 `stream:true`、无 tools；429→14、401→13、响应头后沉默 1.5 s→15（连接在期限被关）、网关停→12、之后立刻正常；同对话关连接后立刻重发 0 ms 间隔成功、重发体不含被取消那轮；同对话新请求取代旧请求，旧的得 18；`busy`(in_flight) 并发第二个对话 14。
+- 隐私：沙箱树内（含 daemon.out/err、ask.log）找不到听写文字；ask.log 只有元数据（chars_in/out、conv 哈希、outcome、source、毫秒）。
+- 开销：假网关即时回复时，`first_ms`≈1，进程总墙钟 ≈ 70–90 ms，其中起进程+连守护进程 ≈ 16 ms。
+- 观察：取消后「另一个对话」在 0 ms 内仍 `busy`，≥100 ms 后正常（§6.5 只要求同对话重发不 busy，符合）。被取代的旧调用的 `cancelled` 事件 `stage` 写 `before_first_sentence`，其实已有句子发出（小瑕疵）。
+- 协议不匹配：对用户在跑的旧守护进程（10-15 起）`dct ask` → `daemon_down` / `reason:"protocol"`，退出 10。
+- **没做**：第 2 步（假 dco）；第 3 步真网关冒烟——用户的 `~/.dct/config.toml` 仍无 `[ask]`，且活守护进程仍是旧的（`status` = stale），要先 `dct restart` 再 `dct ask --enable`。
+- **仍未验证**：预填阶段取消、TLS 关闭、负载。
