@@ -1992,6 +1992,8 @@ against the code.
   (`ESC[1;5R`) is dropped the same way. The unit tests build `KeyEvent`s
   directly, so they don't cover decoding. Workaround: use `F8`. To check what
   your terminal sends, run `cat -v` and press the key (`^[[1;2R` confirms it).
+  **Fixed in the `fix-shift-f3` branch (vendored crossterm maps `ESC[1;2R`..`ESC[1;8R`
+  to F3 with modifiers); needs live confirmation after installing.**
 - **`zsh: killed` right after copying a new `dct` over the old one.** Don't
   `cp` over an installed binary; see the **Don't `cp` over an installed binary** paragraph under [Install](#install).
 - **`dct voice` says dco is missing or too old.** Start dco, or update it; the
