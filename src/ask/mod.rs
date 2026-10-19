@@ -13,6 +13,7 @@
 //! 守护进程；只有 `log.rs` 写盘、只有 `cli.rs` 往 stdout 打字。其余文件不打印、不写任何东西。
 
 pub mod cli;
+pub mod early;
 pub mod input;
 pub mod log;
 pub mod memory;
