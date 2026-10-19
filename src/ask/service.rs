@@ -107,7 +107,7 @@ impl Service {
             Ok(i) => i,
             Err(reason) => return refuse(emit, ErrorCode::BadRequest, reason),
         };
-        let note = |chars_out: usize, first_ms: u64, outcome: &str| {
+        let note = |chars_out: usize, (first_ms, hdr_ms, delta_ms): (u64, u64, u64), outcome: &str| {
             if let Some(path) = &self.log {
                 let m = Meta {
                     source: input.source.as_str(),
@@ -115,6 +115,8 @@ impl Service {
                     chars_in: input.text.chars().count(),
                     chars_out,
                     first_ms,
+                    hdr_ms,
+                    delta_ms,
                     total_ms: started.elapsed().as_millis() as u64,
                     outcome,
                 };
@@ -125,14 +127,14 @@ impl Service {
         let target = match resolve() {
             Ok(t) => t,
             Err(reason) => {
-                note(0, 0, ErrorCode::NotEnabled.as_str());
+                note(0, (0, 0, 0), ErrorCode::NotEnabled.as_str());
                 return refuse(emit, ErrorCode::NotEnabled, reason);
             }
         };
         let ticket = match self.gate.begin(conv) {
             Ok(t) => t,
             Err(_) => {
-                note(0, 0, ErrorCode::Busy.as_str());
+                note(0, (0, 0, 0), ErrorCode::Busy.as_str());
                 return refuse(emit, ErrorCode::Busy, "in_flight");
             }
         };
@@ -140,7 +142,7 @@ impl Service {
         let history = self.memory().history(conv, Instant::now());
         let start = json!({"v": 1, "type": "start", "conversation_id": conv, "turn": history.len() + 1});
         if emit(start, None).is_err() {
-            return note(0, 0, "cancelled"); // 票随之丢掉，标记清除
+            return note(0, (0, 0, 0), "cancelled"); // 票随之丢掉，标记清除
         }
         let body = stream_body(&target.model, &prompt::messages(input.source, input.persona.as_deref(), &history, &input.text), prompt::MAX_TOKENS);
         let turn = Turn { opener: target.opener, body, started, deadline: input.timeout, poll: POLL };
@@ -159,9 +161,9 @@ impl Service {
             },
         );
         match &term {
-            Terminal::End { truncated, first_ms, .. } => note(chars_out, *first_ms, if *truncated { "truncated" } else { "end" }),
-            Terminal::Error { code, .. } => note(chars_out, 0, code.as_str()),
-            Terminal::Gone => note(chars_out, 0, "cancelled"),
+            Terminal::End { truncated, first_ms, hdr_ms, delta_ms, .. } => note(chars_out, (*first_ms, *hdr_ms, *delta_ms), if *truncated { "truncated" } else { "end" }),
+            Terminal::Error { code, .. } => note(chars_out, (0, 0, 0), code.as_str()),
+            Terminal::Gone => note(chars_out, (0, 0, 0), "cancelled"),
         }
         if let Some(ev) = term.event() {
             let _ = emit(ev, Some(term.exit_code()));

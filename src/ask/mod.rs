@@ -99,7 +99,8 @@ impl From<StreamError> for ErrorCode {
 /// 一轮的结果。**恰好一个**（设计 §6.1：`end` 或 `error`；对面已经关了就没有事件）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminal {
-    End { sentences: usize, truncated: bool, first_ms: u64, total_ms: u64 },
+    /// `hdr_ms` / `delta_ms`：分段计时（请求→响应头、响应头→第一个有字的增量），起点同 `first_ms`。
+    End { sentences: usize, truncated: bool, first_ms: u64, hdr_ms: u64, delta_ms: u64, total_ms: u64 },
     Error { code: ErrorCode, after_ms: u64 },
     /// 客户端关了连接：没人在读，不发任何事件。
     Gone,
@@ -118,9 +119,9 @@ impl Terminal {
     /// NDJSON 终止事件；`Gone` 没有。
     pub fn event(&self) -> Option<Value> {
         match self {
-            Terminal::End { sentences, truncated, first_ms, total_ms } => Some(json!({
+            Terminal::End { sentences, truncated, first_ms, hdr_ms, delta_ms, total_ms } => Some(json!({
                 "v": 1, "type": "end", "sentences": sentences, "truncated": truncated,
-                "first_ms": first_ms, "total_ms": total_ms,
+                "first_ms": first_ms, "hdr_ms": hdr_ms, "delta_ms": delta_ms, "total_ms": total_ms,
             })),
             Terminal::Error { code, after_ms } => Some(json!({
                 "v": 1, "type": "error", "code": code.as_str(),
@@ -291,6 +292,8 @@ pub struct Turn {
 }
 
 enum Msg {
+    /// 响应头到了（`open` 返回的那一刻，在工作线程上取的时刻）。
+    Opened(Instant),
     Bytes(Vec<u8>),
     /// 干净的 EOF。
     Eof,
@@ -309,6 +312,9 @@ fn pump(opener: Arc<dyn StreamOpen>, body: Value, left: Duration, abandon: Arc<A
             return;
         }
     };
+    if tx.send(Msg::Opened(Instant::now())).is_err() {
+        return;
+    }
     let mut buf = [0u8; 4096];
     while !abandon.load(Ordering::SeqCst) {
         let m = match r.read(&mut buf) {
@@ -345,6 +351,8 @@ pub fn run_turn(
     let ms = |t: Instant| t.duration_since(started).as_millis() as u64;
     let mut sent: Vec<String> = Vec::new();
     let mut first: Option<u64> = None;
+    // 分段计时：响应头到达、第一个有字的增量到达的时刻。
+    let (mut opened, mut first_delta): (Option<Instant>, Option<Instant>) = (None, None);
     let (mut sse, mut split) = (SseParser::default(), SentenceSplitter::new());
 
     // 收尾：只有这里和下面的 `Gone` 返回。`natural` = 流以 `[DONE]` 结束。
@@ -359,7 +367,9 @@ pub fn run_turn(
             let truncated = !$natural;
             let done = ticket.complete(|| commit(&TurnDone { sentences: &sent, truncated }));
             return if done {
-                Terminal::End { sentences: sent.len(), truncated, first_ms: first.unwrap_or(0), total_ms: after_ms }
+                let hdr_ms = opened.map_or(0, ms);
+                let delta_ms = opened.zip(first_delta).map_or(0, |(o, d)| d.saturating_duration_since(o).as_millis() as u64);
+                Terminal::End { sentences: sent.len(), truncated, first_ms: first.unwrap_or(0), hdr_ms, delta_ms, total_ms: after_ms }
             } else {
                 Terminal::Error { code: ErrorCode::Cancelled, after_ms }
             };
@@ -400,6 +410,7 @@ pub fn run_turn(
             Err(RecvTimeoutError::Disconnected) => conclude!(false, ErrorCode::BadReply),
         };
         match msg {
+            Msg::Opened(t) => opened = Some(t),
             Msg::Failed(e) => conclude!(false, e.into()),
             Msg::ReadErr(timed_out) => {
                 conclude!(false, if timed_out { ErrorCode::Slow } else { ErrorCode::BadReply })
@@ -412,6 +423,9 @@ pub fn run_turn(
                     match parse_frame(&p) {
                         Err(_) => conclude!(false, ErrorCode::BadReply),
                         Ok(Frame::Delta(t)) => {
+                            if !t.is_empty() {
+                                first_delta.get_or_insert_with(Instant::now);
+                            }
                             for s in split.push(&t) {
                                 say!(s);
                             }
@@ -456,8 +470,11 @@ mod tests {
 
     #[test]
     fn terminal_events_have_the_documented_shape() {
-        let end = Terminal::End { sentences: 2, truncated: false, first_ms: 1840, total_ms: 3320 };
-        assert_eq!(end.event().unwrap(), json!({"v":1,"type":"end","sentences":2,"truncated":false,"first_ms":1840,"total_ms":3320}));
+        let end = Terminal::End { sentences: 2, truncated: false, first_ms: 1840, hdr_ms: 600, delta_ms: 900, total_ms: 3320 };
+        assert_eq!(
+            end.event().unwrap(),
+            json!({"v":1,"type":"end","sentences":2,"truncated":false,"first_ms":1840,"hdr_ms":600,"delta_ms":900,"total_ms":3320})
+        );
         let err = Terminal::Error { code: ErrorCode::Slow, after_ms: 8000 };
         assert_eq!(err.event().unwrap(), json!({"v":1,"type":"error","code":"slow","stage":"before_first_sentence","retryable":true,"after_ms":8000}));
         assert_eq!(Terminal::Gone.event(), None);

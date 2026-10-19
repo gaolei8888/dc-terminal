@@ -1,6 +1,7 @@
 //! `~/.dct/ask.log`：每次 ask 一行**元数据**（设计 §4），没有任何对话文字、没有模型回复。
 //! 字段固定：`t`（unix 秒）、`source`、`conv`（对话 id 的哈希前 4 位，不是 id 本身）、
-//! `chars_in` / `chars_out`（只有字数）、`first_ms` / `total_ms`、`outcome`。
+//! `chars_in` / `chars_out`（只有字数）、`first_ms` / `hdr_ms` / `delta_ms` / `total_ms`（全是毫秒，
+//! 同一个起点；`hdr_ms` = 请求→响应头，`delta_ms` = 响应头→第一个有字的增量）、`outcome`。
 //! 这是整个 `src/ask/` 里**唯一**写盘的文件。记不下来不影响 ask：IO 错误一律吞掉。
 
 use serde_json::json;
@@ -15,6 +16,10 @@ pub struct Meta<'a> {
     pub chars_in: usize,
     pub chars_out: usize,
     pub first_ms: u64,
+    /// 请求 → 响应头；`delta_ms`：响应头 → 第一个有字的增量。只有成功收尾（`end` / `truncated`）的行
+    /// 才有，错误行是 0（同 `first_ms`）。
+    pub hdr_ms: u64,
+    pub delta_ms: u64,
     pub total_ms: u64,
     pub outcome: &'a str,
 }
@@ -28,7 +33,7 @@ pub fn append(path: &Path, m: &Meta) {
         "t": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         "source": m.source, "conv": conv_tag(m.conversation_id),
         "chars_in": m.chars_in, "chars_out": m.chars_out,
-        "first_ms": m.first_ms, "total_ms": m.total_ms, "outcome": m.outcome,
+        "first_ms": m.first_ms, "hdr_ms": m.hdr_ms, "delta_ms": m.delta_ms, "total_ms": m.total_ms, "outcome": m.outcome,
     });
     // 超长就整份换掉，同 `journal`：排查看的是近况。
     let truncate = std::fs::metadata(path).is_ok_and(|md| md.len() > crate::journal::MAX_BYTES);
@@ -47,7 +52,7 @@ mod tests {
     use super::*;
 
     fn meta(id: &str) -> Meta<'_> {
-        Meta { source: "voice", conversation_id: id, chars_in: 7, chars_out: 12, first_ms: 1800, total_ms: 3300, outcome: "end" }
+        Meta { source: "voice", conversation_id: id, chars_in: 7, chars_out: 12, first_ms: 1800, hdr_ms: 600, delta_ms: 900, total_ms: 3300, outcome: "end" }
     }
 
     #[test]
@@ -61,10 +66,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["chars_in", "chars_out", "conv", "first_ms", "outcome", "source", "t", "total_ms"]);
+        assert_eq!(keys, ["chars_in", "chars_out", "conv", "delta_ms", "first_ms", "hdr_ms", "outcome", "source", "t", "total_ms"]);
         assert_eq!(v["conv"].as_str().unwrap().len(), 4);
         assert!(!text.contains("secret-id") && !text.contains("7f3a"), "{text}");
         assert_eq!((v["chars_in"].as_u64(), v["outcome"].as_str()), (Some(7), Some("end")));
+        assert_eq!((v["hdr_ms"].as_u64(), v["delta_ms"].as_u64()), (Some(600), Some(900)));
     }
 
     #[cfg(unix)]

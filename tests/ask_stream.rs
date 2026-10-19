@@ -79,11 +79,34 @@ fn sentences_stream_out_as_they_complete_and_the_turn_ends_with_end() {
 
     assert_eq!(texts(&out), ["第一句。", "第二句没标点"]);
     assert_eq!(out.sentences.iter().map(|s| s.0).collect::<Vec<_>>(), [0, 1]);
-    let Terminal::End { sentences: 2, truncated: false, first_ms, total_ms } = r else { panic!("{r:?}") };
+    let Terminal::End { sentences: 2, truncated: false, first_ms, total_ms, .. } = r else { panic!("{r:?}") };
     assert!(first_ms < 400 && total_ms >= 500, "first={first_ms} total={total_ms}");
     // 真流：第一句在网关写出第二块**之前**就已经交出来了。
     assert!(out.sentences[0].2 < gw.conn(0).lock().unwrap().sent_at[1], "第一句等到了后面的数据才出来");
     assert_eq!(out.commits, [(vec!["第一句。".to_string(), "第二句没标点".to_string()], false)]);
+}
+
+/// 分段计时：假网关把响应头压后 300 ms，头之后先发一个空增量（角色帧，不算 token）、
+/// 再等 2×150 ms 才给第一个有字的增量。`hdr_ms` 从 `started` 量到响应头，`delta_ms` 从响应头
+/// 量到第一个**有字**的增量。下限卡死（睡了就是睡了），上限留余量给慢机器。
+#[test]
+fn per_stage_timing_splits_request_to_headers_and_headers_to_first_delta() {
+    let gw = spawn_gw(vec![vec![
+        Step::Sleep(300),
+        Step::Headers,
+        Step::Sleep(150),
+        delta(""),
+        Step::Sleep(150),
+        delta("好的。"),
+        done(),
+        Step::EndChunks,
+    ]]);
+    let mut out = Out::default();
+    let r = go(turn(&gw.url, "你好", 5000), &Gate::default(), "c1", &mut Alive, &mut out);
+    let Terminal::End { hdr_ms, delta_ms, first_ms, .. } = r else { panic!("{r:?}") };
+    assert!((290..=700).contains(&hdr_ms), "hdr_ms={hdr_ms}");
+    assert!((290..=700).contains(&delta_ms), "delta_ms={delta_ms}（空的角色帧不该算第一个 token）");
+    assert!(first_ms >= hdr_ms + delta_ms, "同一个基线：first={first_ms} hdr={hdr_ms} delta={delta_ms}");
 }
 
 #[test]

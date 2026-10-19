@@ -352,6 +352,59 @@ fn nothing_but_sentence_events_carries_text_and_the_log_is_metadata_only() {
     assert_eq!(second["outcome"], "auth");
 }
 
+/// 分段计时进 `ask.log` 和 `end` 事件；日志行除 `source` / `conv` / `outcome` 外全是数字，
+/// 错误行的分段时间是 0（同 `first_ms` 的既有约定）。
+#[test]
+fn stage_times_land_in_the_log_row_and_the_end_event_as_numbers_only() {
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("ask.log");
+    let slow = vec![Step::Sleep(250), Step::Headers, Step::Sleep(200), delta("绝密回复。"), done(), Step::EndChunks];
+    let gw = spawn_gw(vec![slow, vec![Step::Sleep(100), Step::Status(401)]]);
+    let svc = Service::new(Some(log.clone()));
+    let ev = ask_at(&svc, &req("绝密听写内容", "c-stage"), &gw.url);
+    let (end, _) = terminal(&ev);
+    let (h, dl) = (end["hdr_ms"].as_u64().unwrap(), end["delta_ms"].as_u64().unwrap());
+    assert!((240..=700).contains(&h) && (190..=700).contains(&dl), "end={end}");
+    // 旧字段一个没少、一个没变名。
+    for k in ["v", "type", "sentences", "truncated", "first_ms", "total_ms"] {
+        assert!(end.get(k).is_some(), "end 事件丢了 {k}：{end}");
+    }
+    ask_at(&svc, &req("绝密听写内容", "c-stage"), &gw.url);
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["chars_in", "chars_out", "conv", "delta_ms", "first_ms", "hdr_ms", "outcome", "source", "t", "total_ms"]);
+        for (k, v) in row.as_object().unwrap() {
+            assert!(matches!(k.as_str(), "source" | "conv" | "outcome") || v.is_u64(), "{k} 该是数字：{v}");
+        }
+    }
+    assert_eq!((rows[0]["hdr_ms"].as_u64(), rows[0]["delta_ms"].as_u64()), (Some(h), Some(dl)));
+    assert!(rows[0]["first_ms"].as_u64().unwrap() >= h + dl);
+    assert_eq!((rows[1]["outcome"].as_str(), rows[1]["hdr_ms"].as_u64(), rows[1]["delta_ms"].as_u64()), (Some("auth"), Some(0), Some(0)));
+    for bad in ["绝密", "c-stage"] {
+        assert!(!text.contains(bad), "ask.log 里不该有 {bad}：{text}");
+    }
+}
+
+#[test]
+fn a_truncated_turn_keeps_its_stage_times_in_the_log() {
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("ask.log");
+    let gw = spawn_gw(vec![vec![Step::Sleep(150), Step::Headers, Step::Sleep(150), delta("说出口的。"), delta("没说完"), Step::Sleep(5000)]]);
+    let svc = Service::new(Some(log.clone()));
+    let mut r = req("长问题", "c1");
+    r.timeout_ms = Some(1200);
+    let ev = ask_at(&svc, &r, &gw.url);
+    assert_eq!(terminal(&ev).0["truncated"], true);
+    let row: Value = serde_json::from_str(std::fs::read_to_string(&log).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(row["outcome"], "truncated");
+    assert!(row["hdr_ms"].as_u64().unwrap() >= 140 && row["delta_ms"].as_u64().unwrap() >= 140, "{row}");
+}
+
 #[test]
 fn a_cancelled_turn_is_logged_as_cancelled_with_no_text() {
     let d = tempfile::tempdir().unwrap();
