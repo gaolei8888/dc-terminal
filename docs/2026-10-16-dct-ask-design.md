@@ -209,7 +209,7 @@ dco 识别收尾（dco 量，未知）
 - **清掉**：`dct ask --forget <conversation_id>`；守护进程退出；`dct restart` 一并清（注意：记忆的 dc-terminal 笔记里 restart 会杀所有会话，ask 记忆随之没，这是预期）。
 - **失败的那一轮**：整轮没有任何句子发出（联不上/超时/空回复）→ 用户那句**不入记忆**（否则重试会重复）；已发出部分句子后超时 → 入记忆的是**已发出的那几句**，标记被截断。
 - **被取消的那一轮（客户端关连接）**：**整轮丢弃**——用户那句和已生成的部分回复都不入记忆（dct 的默认，dco 把「怎么记」交给 dct 定；理由见 §6.5）。注意与上一条的区别：超时是 dct 自己到点收尾，已说出的话有人听到了；取消是对面不要这一轮了。
-- **日志**：ask **默认不记任何对话文字**，stderr 和日志里都没有。只允许一行元数据到 `~/.dct/ask.log`（0600）：`{t, source, chars_in, chars_out, first_ms, total_ms, outcome}`，`conversation_id` 只记前 4 位的哈希。`http.rs` 现有的 `eprintln!("LLM HTTP 调用失败：{e}")` 不带响应体，但 ask 路径不能新增任何打印请求/响应内容的地方（测试钉住，§10）。
+- **日志**：ask **默认不记任何对话文字**，stderr 和日志里都没有。只允许一行元数据到 `~/.dct/ask.log`（0600）：`{t, source, conv, chars_in, chars_out, first_ms, hdr_ms, delta_ms, total_ms, outcome}`（`hdr_ms` / `delta_ms` 见 §6.1；全是数字或固定词，没有任何文字），`conversation_id` 只记前 4 位的哈希。`http.rs` 现有的 `eprintln!("LLM HTTP 调用失败：{e}")` 不带响应体，但 ask 路径不能新增任何打印请求/响应内容的地方（测试钉住，§10）。
 - **顺带发现（不在本设计范围，需要用户知道）**：现有 `dct voice` 的 `voice.log` 会写 `text_raw` 和 `text_fixed`（`src/voice/mod.rs` `record()`），即**转写文字落盘**。这与「语音日志默认不记文字」的规矩不一致。**已定：`voice.log` 默认不再记转写文字**（§13 Q6）；这是对现有 `dct voice` 代码的一处改动，随 A3 一起做（已做，见 §15）。
 
 ## 5. 回复只显示/说，不当命令（对应需求 5）
@@ -243,6 +243,7 @@ dco 识别收尾（dco 量，未知）
 ```
 - **每次调用恰好一个终止事件**：`end` 或 `error`。`error` 前面可能已有 `sentence`（已说出去的收不回）；这时发 `end` 且 `truncated:true`，**不发 error**，因为对 dco 来说那是「说了半截」，要的是闭嘴收尾，不是再报错。
 - `first_ms` / `total_ms` 是 dct 切片内的计时，给 dco 对账，不含对话文字。
+- **分段计时（2026-10-19 加，只增不改）**：`end` 事件多两个可选字段 `hdr_ms`（请求 → 响应头）和 `delta_ms`（响应头 → 第一个**有字**的增量；空的角色帧不算）。起点和 `first_ms` 同一个（守护进程收到请求的那一刻），所以 `first_ms ≥ hdr_ms + delta_ms`。只在 `end`（含 `truncated:true`）里有；`error` 和 `ask.log` 的错误行里是 0（同 `first_ms` 的既有约定）。旧 dco 按「未知字段忽略」不受影响。`ask.log` 每行同样多这两列，仍然全是数字。测试：`tests/ask_stream.rs::per_stage_timing_splits_request_to_headers_and_headers_to_first_delta`、`tests/ask_service.rs::stage_times_land_in_the_log_row_and_the_end_event_as_numbers_only` / `a_truncated_turn_keeps_its_stage_times_in_the_log`。
 - 未知字段 dco 要忽略；`v` 变了才是不兼容。
 
 ### 6.2 退出码
@@ -484,3 +485,115 @@ dco 转达、已同意的另外几条：语音发到远端网关需单独 opt-in
 - 协议不匹配：对用户在跑的旧守护进程（10-15 起）`dct ask` → `daemon_down` / `reason:"protocol"`，退出 10。
 - **没做**：第 2 步（假 dco）；第 3 步真网关冒烟——用户的 `~/.dct/config.toml` 仍无 `[ask]`，且活守护进程仍是旧的（`status` = stale），要先 `dct restart` 再 `dct ask --enable`。
 - **仍未验证**：预填阶段取消、TLS 关闭、负载。
+
+## 17. 早出首段（设计 + 离线重放，2026-10-19；**原型未接线，默认关，未提交**）
+
+用户要的是：第一句还没写完，就把前半截先交出去念，首声更早。这改变了 `sentence` 事件的含义，所以先定一个**向后兼容**的契约。本节只有设计、纯函数原型（`src/ask/early.rs`）和离线数字；`run_turn` / `Service` 一行没改，不开 `early_pieces` 时输出和今天逐字节一样。
+
+### 17.1 线上契约
+
+**请求**（`AskRequest` 加一个可选字段，**默认 false**）：`"early_pieces": true`。dct 对未知请求字段本来就忽略（`AskRequest` 没有 `deny_unknown_fields`，§2.2），所以**老 dct 收到它什么也不会发生**。
+
+**握手**：dct 同意时，`start` 事件多一个 `"early_pieces": true`；没有这个字段 = 没开。dco 必须以 `start` 为准，不能「发了就当开了」。
+
+**句事件**（开了且这一句被切开时）：
+
+```jsonl
+{"v":1,"type":"start","conversation_id":"c-7f3a","turn":3,"early_pieces":true}
+{"v":1,"type":"sentence","i":0,"piece":0,"cont":true,"text":"今天天气真的很不错，"}
+{"v":1,"type":"sentence","i":0,"piece":1,"text":"适合出门走走。"}
+{"v":1,"type":"sentence","i":1,"text":"带把伞吧。"}
+{"v":1,"type":"end","sentences":2,"pieces":3,"truncated":false,"first_ms":1500,"hdr_ms":600,"delta_ms":900,"total_ms":3320}
+```
+
+- **没切开的句子**和今天**一模一样**：没有 `piece`、没有 `cont`。dco 只要认得 `cont` 就行；`piece` 只是给对账看的。
+- `i` 还是「第几句」：同一句的几段 `i` 相同，`piece` 从 0 数。`cont:true` = 「这一句的后半截可能紧跟在后面」；同一 `i` 里第一个没带 `cont` 的事件就是这句的结尾。
+- 同一句的各段**背靠背**，中间不会插别的事件。**拼接规则：同一 `i` 的 `text` 直接首尾相连（不加分隔）就是整句**——切点后面的空白留在前一段末尾，所以英文也无损（`"Sure, "` + `"I can help."`）。
+- `cont:true` **不是承诺**：流中途断了 / 超时 / 被取消时，后半截不会来。这时照旧：已经交出去的算说出口的，发 `end` 且 `truncated:true`（不发 `error`），dco 看到 `end` 就把这句收尾、不要等。切点优先放在子句边界，就是为了让「只说了前半截」听起来是个完整的小停顿。
+- `end.sentences` = 不同 `i` 的个数（含义不变）；`end.pieces` = 句事件总数，**只在开了的时候出现**；`first_ms` = 第一个句事件（可能是第一段）的时刻。
+
+**dco 要改的三件事**（我没法替它定，列在 §17.7）：① `cont` 的段**背靠背**念，两段之间不套 2 s 限速（限速只管不同 `i` 之间）；② 字幕**追加**不是替换；③ `cont` 的段念完后如果下一个事件不是同一 `i`，就当这句结束。
+
+**版本**：`v` 仍是 1，只增字段、只在请求显式开启时才出现新形状，所以不是不兼容改动。
+
+| 组合 | 行为 |
+|---|---|
+| 老 dco + 新 dct | 不发 `early_pieces` → 默认 false → 整句，和今天逐字节一致 |
+| 新 dco + 老 dct | 发了 `early_pieces`，老 dct 忽略；`start` 里没有回显 → dco 当没开，收整句 |
+| 新 + 新 | `start` 回显 `early_pieces:true`，之后可能有 `piece`/`cont` |
+| 老 dco 误开 | 不可能（它不认识这个字段）；万一发生，把 `cont` 当没看见，每段会被当成一句念——所以才要 opt-in |
+
+### 17.2 切分规则（`ask::early::first_cut`，纯函数）
+
+只处理**这一轮的第一句**，且**最多切成 2 段**。理由：后面的句子是在前面的在念的时候生成的（生成约 20 字/秒（M0 实测约 15 token/秒折算），念约 4–5 字/秒（常识估计，没测）），再切没有收益；只有首声延迟有用。
+
+输入是第一句已到的原始文字（`SentenceSplitter` 的 `pending`），输出切点的字节偏移或 `None`。**结果只取决于已到的前缀，和 token 怎么分块无关**（`the_cut_does_not_depend_on_how_the_text_was_chunked`）；切点后面至少要有一个字已经到了（回看一个字，不是猜）。
+
+- **宽度**：汉字 = 1，ASCII 字母 = 0.3，数字 = 0.5，空白标点 = 0（英文不会因为字母多就被当成长句）。`n_min` = 8、`n_max` = 14（汉字当量）。
+- **找法**：在 `[n_min, n_max]` 窗口里，① 第一个**子句边界**（`，、：` 之后；英文 `,` `;` 后跟空白或汉字）就切；② 没有，等窗口关了，取窗口里最后一个**安全点**——短语头（`但并把被` 之前，前面不是「不合归兼…」）、ASCII 词与汉字交界、英文词间；③ 窗口外再多等 10 个字的当量找第一个安全点；④ 还没有就**放弃，整句照旧**。两个汉字之间的「硬切」（`Plain`）默认**不用**，要 `plain_fallback: true` 才用。
+- **永不切**：ASCII 词、数字（`1,000`、`3.5`、`15|分钟`、`23.5|摄氏度`、`二十|五`）、网址 / 邮箱、成对的括号 / 引号 / 反引号代码里面、单个字母 + 汉字（`A型`、`U盘`）、第一句以列表符开头、含 ESC 或 `<`（think 残片 / ANSI）。
+- **不切在**：虚词后面（`的了着过地得和与在把被将对比跟同给让向从及并或但而就也都还又很太最更不没别要会能可为以用往朝靠按经于由第共约每各近超仅`）和助词前面（`的了着过地得吗呢吧啊呀么嘛哦啦们子儿性化`）；后半截必须以字母数字开头（不会以收括号 / 标点开头，清洗后不会变空）。
+- **最短**：第一段至少 `n_min` 当量，所以不会出 1–2 个字。
+- **与 120 字上限**：上限**按事件算**——切开后后半截从零开始数，所以一句的总长可以超过 120，但每个事件仍 ≤ 120（dco 的 `speak` 上限是按次的）。如果你要「整句 ≤ 120」，见 §17.7。
+- **与记忆**：同一 `i` 的各段无分隔拼回成一句，再按今天的 `join_sentences` 拼；只说了前半截就断的，记入的就是前半截 + 截断标记（它确实被念出来了）。取消 / 被取代：不入记忆，不变。
+- **与 `error`**：已经交出过任何一段 = 说过话了，失败时发 `end truncated:true`，不发 `error`（今天的规则，没变）。`error.stage` 的 `before_first_sentence` 现在意思是「在第一个事件之前」。
+
+**接线时要加的东西**（这次没做）：`SentenceSplitter` 暴露 `pending()` 和「切走前缀」两个 crate 内方法；`run_turn` 的 `on_sentence(i, text)` 变成能带 `piece` / `cont`；一个小状态机——第一句、同一个 delta 喂完后这句**仍**没完成、`first_cut` 给出切点 → 交出前半截（`cont:true`），之后分句器吐出的下一段就是后半截。如果这个 delta 里整句已经完成就不切（前后半截同时到，没有收益）。
+
+### 17.3 离线重放一：M0 录音（只有字数）
+
+M0 的每个 chunk 只记了 `(时刻, 本 chunk 的字数)`。**注意它是增量不是累计**（求和 = `visible_chars`）。**没有文字**：所以**看不出逗号在哪、会不会切开半个词**，只能回答「如果切点恰好落在第 N 个字，首段最早什么时候能出」，是**乐观的上界**，不是预测。M0 里一共只有 5 个问题、9 条流式记录（q2 只有非流式，没有）；块时刻只有约 0.125 s 的分辨率（网关成批发）。脚本：`.../scratchpad/early_replay.py`。
+
+| 流 | 问题 | 首句字数 | 首个 delta | 首句 | 切在第 8 字后 | 第 10 | 第 12 | 第 14 |
+|---|---|---|---|---|---|---|---|---|
+| B1 | q3 | 12 | 1.71 | 2.20 | 2.08（早 0.12） | 2.20（0） | — | — |
+| B2 | q4 | 14 | 1.98 | 2.73 | 2.48（0.25） | 2.73（0） | 2.73（0） | — |
+| B3 | q5 | 31 | 1.58 | 3.33 | 1.96（**1.38**） | 2.20（1.13） | 2.46（0.88） | 2.46（0.88） |
+| C1 | q5 | 25 | 1.62 | 2.99 | 2.12（0.87） | 2.12 | 2.12 | 2.12 |
+| C2 | q5 | 20 | 1.31 | 2.55 | 1.80（0.76） | 1.92（0.63） | 2.17（0.38） | 2.30（0.25） |
+| C3 | q5 | 16 | 1.67 | 2.42 | 2.04（0.38） | 2.04（0.38） | 2.17（0.25） | 2.30（0.12） |
+| D1 | q1 | 14 | 2.01 | 2.75 | 2.37（0.38） | 2.50（0.25） | 2.62（0.13） | — |
+| D2 | q3 | 11 | 1.66 | 2.28 | 2.15（0.13） | — | — | — |
+| D3 | q4 | 8 | 1.66 | 2.15 | — | — | — | — |
+
+「—」= 这句本身不够长，切不出来。**适用的流 / 平均早多少秒**：第 8 字 8/9、0.53 s；第 10 字 7/9、0.47 s；第 12 字 6/9、0.42 s；第 14 字 4/9、0.53 s。
+
+读法：① 最好的情况（B3，首句 31 字）早 1.4 秒；常见情况（首句 11–16 字）早 0.1–0.4 秒；首句 ≤ 10 字的**一点用也没有**。② 首个 delta 就占了 1.3–2.0 秒（响应头之后的预填 + 排队），这部分早出首段**碰不到**；§3.6 说首句 P50 是 2.55 秒，平均最多省 0.5 秒，到不了让 3 秒预算变得稳。③ 要真正拉低首声，更大的杠杆在别处（提示里要求「先用一小句回应」让首句本身就短；或降首 token 延迟）——这是判断，没测。
+
+### 17.4 离线重放二：手写语料（切点质量）
+
+`tests/fixtures/ask_early_corpus.txt`：**我自己写的** 68 条短回复（问候、回答、数字、英文名、列表 / markdown、网址邮箱）+ 16 条专挑会咬人的词写的「对抗」句，词边界是我手标的。**这是自测，不是验收**：`tune` 44 条调参时反复看过；`heldout` 24 条是调参前写好、调参时没看过结果的；`adversarial` 16 条是第一轮之后才写的，它抓出了一个真问题（`温|和` 被「和」当短语头切开），已修（短语头从 10 个字缩到 4 个，并排除「不合归兼…」后面）。判官的「虚词后 / 助词前 / ASCII 里」三项用的字表和切分器的是同一族，所以**这三项为 0 基本是构造出来的**；有独立信息的只有「切开了词」那一项（靠我手标的 `|`）。
+
+| 配置（n_min/n_max） | 回退 | 能切出的 | 首段字数均值（最小） | 丑切点 |
+|---|---|---|---|---|
+| 8/14（**默认**） | 关 | tune 61%（27/44）、heldout 67%（16/24）、对抗 56%（9/16） | 11.6（8） | **0**（三组都是 0） |
+| 8/14 | 开 | 全部 68 条 76% | 11.8 | **6 / 52（12%）** |
+| 6/10 | 关 | 81% | 9.7（6） | 0 |
+| 8/12 | 关 / 开 | 63% / 82% | 11.4 / 11.1 | 0 / 10 |
+| 10/14 | 关 / 开 | 44% / 71% | 12.6 / 12.9 | 0 / 11 |
+| 12/18 | 关 / 开 | 24% / 35% | 13.4 / 14.8 | 0 / 3 |
+
+没切出的里面，只有 4 条是因为第一句本来就不够 8 字当量；其余是窗口里没有安全点（没逗号、也没有短语头 / 词交界），所以**放弃**。切出来的，后半截平均还有约 8 个字，按生成约 20 字/秒算大约省 0.4 秒——和 §17.3 的数一致。
+
+**回退开着时的丑切点（默认 8/14，全部语料）**：`**注意**，保存之前最好先检查一遍文｜件名。`、`从北京到上海坐高铁大约需｜要四个半小时。`、`地球围着太阳转，一圈大｜约要三百六十五天。`、`记得每隔一小时站起来活动五分｜钟，对颈椎很好。`、`月亮绕着地球转，同时也在慢慢远｜离地球。`、`先做个深呼吸，然后告诉我你现｜在最担心的是什么。`。对抗句里回退开着还多一个：`他们正在讨论合并两个部门的事｜情，…`。
+
+**还剩下的丑（诚实清单）**：① 严格模式的 0 只说明**我写的这 84 条里**没有；短语头（`但并把被`）和「ASCII 词与汉字交界」仍是启发式，没有分词器，遇到我没想到的复合词（比如「被」打头的词、`并` 在词中间）会切开。② 没有测试过真实模型的输出长什么样（长度、标点习惯），语料偏短偏口语。③ 切点在「子句边界」时，前后半截语调上是不是自然，我没法在这里听。④ 英文只用「逗号 / 词间 / ASCII 与汉字交界」，没有语法判断（`Sure, I can` → 在 `Sure,` 前 8 当量不切）。
+
+### 17.5 默认值建议
+
+`n_min=8、n_max=14、plain_fallback=false`：丑切点 0、约 60–65% 的首句能提前，首段平均 ~11.6 字当量。要更高覆盖就得接受硬切（`plain_fallback`，约 12% 的切点会切开词）。我的建议是**严格模式**，并且**默认关**（`early_pieces` 不开就一切照旧）。
+
+### 17.6 测试（都已跑过，见各自文件）
+
+- `src/ask/early.rs`（17 个单元测试）：`the_first_clause_boundary_after_n_min_is_taken_and_the_rest_starts_with_a_letter`、`a_comma_before_n_min_is_skipped_for_the_next_one`、`a_sentence_that_ends_before_n_min_is_never_split`、`nothing_is_cut_until_the_char_after_the_cut_has_arrived`、`the_cut_does_not_depend_on_how_the_text_was_chunked`、`with_no_clause_in_the_window_a_safe_phrase_start_wins_over_a_plain_cut`、`a_plain_cut_between_two_hanzi_needs_the_fallback_switch`、`an_ascii_word_is_never_cut_the_cut_goes_after_it`、`a_number_stays_whole_with_its_unit_decimal_point_and_thousands_comma`、`urls_and_emails_are_never_cut_the_cut_goes_after_them`、`markdown_stars_have_no_width_and_code_spans_are_not_cut`、`a_list_marker_an_ansi_escape_or_a_stray_angle_bracket_means_no_early_cut`、`nothing_is_cut_inside_quotes_or_brackets`、`not_after_a_function_character_and_not_before_a_particle`、`boundary_kinds_are_ranked_clause_phrase_script_plain`、`english_is_measured_by_width_not_letters_and_cut_at_a_comma`、`the_two_pieces_join_back_to_the_original_text`。
+- `tests/ask_early_corpus.rs`：`the_corpus_is_big_enough_and_split_into_tune_and_heldout`、`grid_report`（只打印，`-- --nocapture`）、`the_default_config_has_no_ugly_cut_on_either_set_and_cuts_a_useful_share`、`every_cut_piece_joins_back_to_the_sentence_and_the_rest_is_not_empty_after_cleaning`。
+- **接线时要补的**（现在没有，因为没接线）：开关关闭时 `tests/ask_stream.rs` / `ask_service.rs` 全部原样通过；开了之后 `cont` 的段后面紧跟同一 `i`；流在 `cont` 段之后断掉 → `end truncated:true`、记忆里只有前半截；取消 → 不入记忆；老客户端（不发 `early_pieces`）事件逐字节不变；`start` 回显；假网关把第一句拆成两个 delta、中间睡 300 ms，断言前半截在后半截**之前**交出。
+
+### 17.7 要 dco / 用户定的
+
+1. dco 愿不愿意做 §17.1 的三件事（背靠背、限速只管不同 `i`、字幕追加）？不愿意就这个功能不开，dct 这边不用做任何事。
+2. 值不值得做：§17.3 说平均最多省 0.5 秒、首句 ≤ 10 字的没有收益；首个 delta 的 1.3–2.0 秒碰不到。是否先试「提示里要求先用一小句回应」这个更便宜的办法？
+3. 默认严格模式（丑切点 0、约 60–65% 的首句可提前）还是开 `plain_fallback`（覆盖更高、约 12% 切开词）？
+4. 120 字上限按**事件**（现在的原型）还是按**整句**（要在切分器里记已交出的字数）？
+5. 只切第一句、最多 2 段，够不够？
+6. 接线前要不要在真网关上量一次真实回复（语料是我写的，不是模型输出）？
