@@ -1,9 +1,14 @@
 #!/bin/bash
-# dc-workspace 的 PID 1 下面那一层。**它现在起三个东西**：
+# dc-workspace 的 PID 1 下面那一层。**它现在起四个东西**：
 #
 #   dct daemon  —— 会话都挂在它底下，容器活着就是它活着
 #   ttyd        —— 把 dct 的终端搬进浏览器，**只绑容器内环回**
 #   dct gate    —— 唯一对外的那个端口，只放带对钥匙的人进去（`src/gate.rs`）
+#   云端创作服务 —— 平板做应用用的 Node 旁车，**只绑容器内环回**，经门的
+#                  /_dct/authoring/ 进来。它是附加的：挂了就过两秒重起，
+#                  **不算进下面的「谁先死容器就结束」**——旁车起不来（比如
+#                  work/apps 被弄成了一个文件）不能把学生的终端一起带走。
+#                  那时候门对 /_dct/authoring/ 回 502，终端照常用。
 #
 # 任务 1 那会儿只有一个，是 `exec dct daemon`。
 #
@@ -115,6 +120,20 @@ ttyd \
   env DCT_BROWSER_TERMINAL=1 dct &
 ttyd_pid=$!
 
+# 云端创作服务：纯 Node，只绑容器内环回，外面只能经门的 /_dct/authoring/ 够到。
+#
+# 放在一个循环里：服务自己起不来会记一行、非零退出，这里过两秒再起。
+# ⛔ 这个循环**不进** `wait -n`（见文件头）。关容器时下面会连循环带服务一起杀。
+AUTHORING_PORT="${DCW_AUTHORING_PORT:-7683}"
+AUTHORING_ROOT="${DCW_AUTHORING_ROOT:-$HOME/work/apps}"
+mkdir -p "$AUTHORING_ROOT" 2>/dev/null || echo "[entrypoint] 创作目录建不了：$AUTHORING_ROOT（创作服务会一直重试）" >&2
+export DCW_AUTHORING_PORT="$AUTHORING_PORT" DCW_AUTHORING_ROOT="$AUTHORING_ROOT"
+while :; do
+  node /usr/local/lib/dct/cloud-authoring.mjs
+  sleep 2
+done &
+authoring_pid=$!
+
 # 那道门。**它是这个容器里唯一绑 0.0.0.0 的进程**，前面就是宿主的端口映射。
 #
 # `--bind 0.0.0.0` 必须显式写：`dct gate` 默认只绑环回，因为它自己不加密，
@@ -124,13 +143,6 @@ ttyd_pid=$!
 # `--url`：外面看到的地址。容器不知道自己被映射到哪儿，所以只能由起它的人
 # 告诉它（`DCW_PUBLIC_URL`）。不给的话门会印一条按容器网桥地址猜的链接，
 # 并且明说那是猜的。
-# 云端创作服务：纯 Node，只绑容器内环回，外面只能经门的 /_dct/authoring/ 够到。
-AUTHORING_PORT="${DCW_AUTHORING_PORT:-7683}"
-mkdir -p "$HOME/work/apps"
-DCW_AUTHORING_PORT="$AUTHORING_PORT" DCW_AUTHORING_ROOT="${DCW_AUTHORING_ROOT:-$HOME/work/apps}" \
-  node /usr/local/lib/dct/cloud-authoring.mjs &
-authoring_pid=$!
-
 gate_args=(--bind 0.0.0.0 --port "$PORT" --upstream "127.0.0.1:$TTYD_PORT" --authoring "127.0.0.1:$AUTHORING_PORT")
 [ -n "${DCW_PUBLIC_URL:-}" ] && gate_args+=(--url "$DCW_PUBLIC_URL")
 dct gate "${gate_args[@]}" &
@@ -139,8 +151,11 @@ gate_pid=$!
 # 谁先死，容器就跟着结束。**不能只 wait 守护进程**：ttyd 或者门悄悄挂掉的话
 # 容器还「健康」着，学生打不开页面，而 `docker ps` 说一切正常——那是最难查的
 # 一种坏法。
-wait -n
+wait -n "$daemon_pid" "$ttyd_pid" "$gate_pid"
 status=$?
+# 重起循环是个子 shell：先记下它正在跑的那个 node，停掉循环（不再重起），再停 node。
+authoring_children=$(pgrep -P "$authoring_pid" 2>/dev/null)
 kill -TERM "$daemon_pid" "$ttyd_pid" "$authoring_pid" "$gate_pid" 2>/dev/null
+[ -n "$authoring_children" ] && kill -TERM $authoring_children 2>/dev/null
 wait
 exit "$status"

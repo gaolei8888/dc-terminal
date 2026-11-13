@@ -14382,7 +14382,7 @@ import os from "node:os";
 import path10 from "node:path";
 
 // services/cloud-authoring/src/server.ts
-import { readFile as readFile8 } from "node:fs/promises";
+import { readFile as readFile8, stat as stat3 } from "node:fs/promises";
 import { createServer } from "node:http";
 import path9 from "node:path";
 
@@ -18755,8 +18755,8 @@ var UNDONE_NOTE = "\uFF08\u8BF4\u660E\uFF1A\u6211\u521A\u628A\u9879\u76EE\u64A4\
 var saidClosed = () => tr("main.engines.sessionClosed");
 function createAuthoringSessions(deps) {
   const idleMs = deps.idleMs ?? 3e5;
-  const schedule = deps.schedule ?? ((run2, ms) => {
-    const timer = setTimeout(run2, ms);
+  const schedule = deps.schedule ?? ((run3, ms) => {
+    const timer = setTimeout(run3, ms);
     timer.unref?.();
     return () => clearTimeout(timer);
   });
@@ -34473,6 +34473,19 @@ function esbuildOptions(entry) {
 function escapeHtml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
+var INLINE_ASSET_LOADERS = {
+  ".png": "dataurl",
+  ".jpg": "dataurl",
+  ".jpeg": "dataurl",
+  ".gif": "dataurl",
+  ".webp": "dataurl",
+  ".svg": "dataurl",
+  ".woff": "dataurl",
+  ".woff2": "dataurl"
+};
+function escapeInlineCode(code) {
+  return code.replace(/<\/(script|style)/gi, "<\\/$1");
+}
 async function bundleAppPage(projectRoot) {
   const project = await loadSmartAppProject(projectRoot);
   const entry = resolveWebEntry(projectRoot, project.app.clients, "mobile");
@@ -34482,14 +34495,18 @@ async function bundleAppPage(projectRoot) {
     outdir: path4.join(path4.resolve(projectRoot), ".dc-bundle-out"),
     write: false,
     sourcemap: false,
+    // 错误照样抛给调用方（由它决定记什么）；esbuild 自己往 stderr 打的诊断会带上源码行。
+    logLevel: "silent",
     // esbuild 默认把非 ASCII 转成 \uXXXX；页面是 UTF-8，保留原文。
-    charset: "utf8"
+    charset: "utf8",
+    // 单页没有别的文件可放：图片、字体都内联成 data: 地址（平板上离线也能显示）。
+    loader: INLINE_ASSET_LOADERS
   });
-  const js = built.outputFiles.filter((file2) => file2.path.endsWith(".js")).map((file2) => file2.text).join("\n").replaceAll("</script", "<\\/script");
-  const css = built.outputFiles.filter((file2) => file2.path.endsWith(".css")).map((file2) => file2.text).join("\n").replaceAll("</style", "<\\/style");
-  const style = css === "" ? "" : `<style>${css}</style>`;
+  const js = built.outputFiles.filter((file2) => file2.path.endsWith(".js")).map((file2) => file2.text).join("\n");
+  const css = built.outputFiles.filter((file2) => file2.path.endsWith(".css")).map((file2) => file2.text).join("\n");
+  const style = css === "" ? "" : `<style>${escapeInlineCode(css)}</style>`;
   const name = project.app.metadata.name;
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(name)}</title>${style}</head><body><div id="app"></div><script type="module">${js}</script></body></html>`;
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(name)}</title>${style}</head><body><div id="app"></div><script type="module">${escapeInlineCode(js)}</script></body></html>`;
   return {
     appId: project.app.metadata.id,
     name,
@@ -35424,9 +35441,11 @@ async function clearSavedSession(projectPath) {
 }
 
 // services/cloud-authoring/src/engine.ts
+import { execFile as execFile3 } from "node:child_process";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { mkdir as mkdir6, rename as rename4, writeFile as writeFile5 } from "node:fs/promises";
 import path7 from "node:path";
+import { promisify as promisify3 } from "node:util";
 
 // services/cloud-authoring/src/instructions.ts
 var TABLET_INSTRUCTIONS = `HOW THIS APP IS BUILT AND WHERE IT RUNS
@@ -35445,12 +35464,28 @@ talk to them in simple Chinese and never show code, file paths or error traces u
   address, no CDN scripts, no web fonts, no remote images. Everything must be in the project.
 - To use an AI model, call ONLY window.dc.generate(...) and window.dc.chat(...), which the tablet
   provides. Never call any model API directly and never put API keys in the app.
+- app.yaml must stay valid, or the app cannot be opened on the tablet:
+  - metadata is strict: only id, name and version. Do not add description, author, icon or any
+    other key there (or anywhere else the format does not define).
+  - metadata.id must match ^[a-z][a-z0-9-]{1,62}$ (lowercase letters, digits, dashes; starts
+    with a letter). Do not change the id once it is set.
+  - Keep clients: at least one client with kind: web (or kind: mobile) whose entry is a file
+    inside this project folder.
+  - Keep runtime.entryAgent pointing at an agent that exists in agents/. If agents/*.yaml files
+    are present, keep every one of them valid; do not delete the entry agent.
+- Before you say you are done, check that the page builds:
+    /usr/local/lib/dct/node_modules/.bin/esbuild <entry> --bundle --outfile=/tmp/check.js
+  (<entry> is the client entry from app.yaml, e.g. src/index.ts). Fix every error it reports.
+  Images (.png .jpg .jpeg .gif .webp .svg) and fonts (.woff .woff2) imported from the code are
+  inlined automatically on the tablet; keep them small. When the code imports such files, add
+  --loader:.png=dataurl (and the same for each of those extensions you use) to the check.
 - All visible text in the app is Chinese. Design for touch: large tap targets, no hover-only
   controls, no keyboard shortcuts as the only way to do something, layouts that fit a tablet screen
   in both orientations.
 `;
 
 // services/cloud-authoring/src/engine.ts
+var run2 = promisify3(execFile3);
 function cloudOpenDriver(input) {
   return createAuthoringEngineLauncher({
     preferred: async () => "claude-cli",
@@ -35474,9 +35509,28 @@ function cloudEnv() {
   for (const [key, value] of Object.entries(process.env)) if (value !== void 0) env[key] = value;
   return { ...env, USER: "dc", DISABLE_AUTOUPDATER: "1" };
 }
-async function claudeLoggedInDefault(executable) {
-  return (await readClaudeAuth({ executable })).loggedIn === true;
+async function askClaudeLoggedIn(executable) {
+  const report = await readClaudeAuth({
+    executable,
+    ask: async (exe) => (await run2(exe, ["auth", "status"], { timeout: 2e4, env: cloudEnv() })).stdout
+  });
+  return report.loggedIn === true;
 }
+var LOGIN_TTL_MS = 1e4;
+function createClaudeLoginCheck(options = {}) {
+  const ttl = options.ttlMs ?? LOGIN_TTL_MS;
+  const now = options.now ?? Date.now;
+  const ask = options.ask ?? askClaudeLoggedIn;
+  const cache = /* @__PURE__ */ new Map();
+  return (executable) => {
+    const hit = cache.get(executable);
+    if (hit !== void 0 && now() - hit.at < ttl) return hit.answer;
+    const answer = ask(executable).catch(() => false);
+    cache.set(executable, { at: now(), answer });
+    return answer;
+  };
+}
+var claudeLoggedInDefault = createClaudeLoginCheck();
 var KEPT = [...SESSION_METADATA_FILES, "requests.json", "turns.json"];
 var checkpointDeps = {
   ...createCheckpointDeps({ kept: KEPT }),
@@ -35492,7 +35546,9 @@ async function writeJsonAtomic(target, value) {
 }
 
 // services/cloud-authoring/src/events.ts
+import { randomBytes as randomBytes4 } from "node:crypto";
 function createEventLog(capacity = 500) {
+  const boot = randomBytes4(4).toString("hex");
   const buffers = /* @__PURE__ */ new Map();
   const listeners = /* @__PURE__ */ new Map();
   return {
@@ -35503,7 +35559,7 @@ function createEventLog(capacity = 500) {
         buffers.set(event.projectId, buffer);
       }
       buffer.last += 1;
-      const numbered = { seq: buffer.last, event };
+      const numbered = { id: `${boot}-${buffer.last}`, seq: buffer.last, event };
       buffer.items.push(numbered);
       if (buffer.items.length > capacity) buffer.items.splice(0, buffer.items.length - capacity);
       for (const listener of listeners.get(event.projectId) ?? []) listener(numbered);
@@ -35512,9 +35568,17 @@ function createEventLog(capacity = 500) {
     since(projectId, lastId) {
       if (lastId === void 0) return { reset: false, events: [] };
       const buffer = buffers.get(projectId) ?? { last: 0, items: [] };
+      const trimmed = lastId.trim();
+      let seq;
+      if (trimmed === "0") seq = 0;
+      else {
+        const match = /^([0-9a-f]{1,16})-(\d{1,15})$/.exec(trimmed);
+        if (match === null || match[1] !== boot) return { reset: true, events: [...buffer.items] };
+        seq = Number(match[2]);
+      }
       const earliest = buffer.items[0]?.seq ?? buffer.last + 1;
-      if (lastId > buffer.last || lastId < earliest - 1) return { reset: true, events: [] };
-      return { reset: false, events: buffer.items.filter((one) => one.seq > lastId) };
+      if (seq > buffer.last || seq < earliest - 1) return { reset: true, events: [] };
+      return { reset: false, events: buffer.items.filter((one) => one.seq > seq) };
     },
     subscribe(projectId, listener) {
       let set2 = listeners.get(projectId);
@@ -35522,10 +35586,11 @@ function createEventLog(capacity = 500) {
         set2 = /* @__PURE__ */ new Set();
         listeners.set(projectId, set2);
       }
-      set2.add(listener);
+      const mine = set2;
+      mine.add(listener);
       return () => {
-        set2.delete(listener);
-        if (set2.size === 0) listeners.delete(projectId);
+        mine.delete(listener);
+        if (mine.size === 0 && listeners.get(projectId) === mine) listeners.delete(projectId);
       };
     }
   };
@@ -35593,9 +35658,9 @@ async function createProjectRoom(root2, deps = {}) {
   }
   let queue = Promise.resolve();
   function serial(task) {
-    const run2 = queue.then(task, task);
-    queue = run2.catch(() => void 0);
-    return run2;
+    const run3 = queue.then(task, task);
+    queue = run3.catch(() => void 0);
+    return run3;
   }
   async function createLocked(input) {
     const records = await readRequests();
@@ -35670,6 +35735,7 @@ var BUSY = () => new HttpError(409, "busy", "\u4E0A\u4E00\u53E5\u8FD8\u5728\u505
 var NOT_READY_AI = () => new HttpError(409, "ai_not_ready", "\u8BF7\u8001\u5E08\u5E2E\u4F60\u5F00\u901A AI");
 var NO_PROJECT = () => new HttpError(404, "no_project", "\u6CA1\u6709\u627E\u5230\u8FD9\u4E2A\u5E94\u7528");
 var NOT_READY = () => new HttpError(422, "not_ready", "\u5E94\u7528\u8FD8\u6CA1\u505A\u597D\uFF0C\u7B49\u8FD9\u4E00\u8F6E\u505A\u5B8C\u518D\u770B");
+var BUILD_FAILED = () => new HttpError(422, "build_failed", "\u8FD9\u4E2A\u5E94\u7528\u6253\u5305\u51FA\u4E86\u95EE\u9898\uFF0C\u8DDF AI \u8BF4\u201C\u4FEE\u4E00\u4E0B\u201D\u5C31\u597D");
 var BAD = () => new HttpError(400, "bad_request", "\u8FD9\u6B21\u53D1\u6765\u7684\u5185\u5BB9\u4E0D\u5BF9\uFF0C\u518D\u8BD5\u4E00\u6B21");
 var RECEIVED = () => new HttpError(409, "interrupted", "\u8FD9\u53E5\u8BDD\u5DF2\u7ECF\u6536\u5230\u4E86\uFF0C\u770B\u770B\u4E0A\u9762\u505A\u5230\u54EA\u4E86");
 var NOT_FOUND = () => new HttpError(404, "not_found", "\u6CA1\u6709\u8FD9\u4E2A\u5730\u5740");
@@ -35690,28 +35756,42 @@ async function createCloudAuthoringServer(opts) {
   const locks = /* @__PURE__ */ new Map();
   function serial(projectId, task) {
     const previous = locks.get(projectId) ?? Promise.resolve();
-    const run2 = previous.then(task, task);
-    const tail = run2.catch(() => void 0);
+    const run3 = previous.then(task, task);
+    const tail = run3.catch(() => void 0);
     locks.set(projectId, tail);
     void tail.then(() => {
       if (locks.get(projectId) === tail) locks.delete(projectId);
     });
-    return run2;
+    return run3;
   }
-  function recordOutcome(event) {
-    if (closing) return;
+  function updateTurnRecord(projectId, at, patch) {
+    const projectPath = projectPaths.get(projectId);
+    if (projectPath === void 0) return;
+    void serial(projectId, async () => {
+      const list = await readList(projectPath, "turns.json");
+      const index = list.findIndex((one) => one.at === at);
+      const next = index === -1 ? [...list, { at, ...patch }] : list.map((one, i) => i === index ? { ...one, ...patch } : one);
+      await writeJsonAtomic(path9.join(projectPath, ".dc", "turns.json"), next.slice(-MAX_OUTCOMES));
+    }).catch(() => void 0);
+  }
+  function recordTurn(event) {
+    const at = currentUserAt.get(event.projectId);
+    if (event.type === "turn_started") {
+      if (at === void 0) return;
+      updateTurnRecord(event.projectId, at, {
+        started: true,
+        ...event.checkpointId === void 0 ? {} : { checkpointId: event.checkpointId }
+      });
+      return;
+    }
     let outcome;
     if (event.type === "turn_failed") outcome = "failed";
     else if (event.type === "turn_done") outcome = event.interrupted === true ? "interrupted" : "done";
     else return;
-    const at = currentUserAt.get(event.projectId);
-    const projectPath = projectPaths.get(event.projectId);
     currentUserAt.delete(event.projectId);
-    if (at === void 0 || projectPath === void 0) return;
-    void serial(event.projectId, async () => {
-      const list = await readList(projectPath, "turns.json");
-      await writeJsonAtomic(path9.join(projectPath, ".dc", "turns.json"), [...list, { at, outcome }].slice(-MAX_OUTCOMES));
-    }).catch(() => void 0);
+    if (closing) return;
+    if (at === void 0) return;
+    updateTurnRecord(event.projectId, at, { outcome });
   }
   const sessions = createAuthoringSessions({
     project: async (projectId) => {
@@ -35736,7 +35816,7 @@ async function createCloudAuthoringServer(opts) {
     },
     emit: (event) => {
       events.append(event);
-      recordOutcome(event);
+      recordTurn(event);
     },
     ...opts.sessionsDeps
   });
@@ -35779,43 +35859,40 @@ async function createCloudAuthoringServer(opts) {
     await serial(projectId, async () => void 0);
     const state = sessions.state(projectId);
     const conversation = await readConversation(project.path);
-    const outcomes = new Map(
-      (await readList(project.path, "turns.json")).map((one) => [one.at, one.outcome])
-    );
+    const records = new Map((await readList(project.path, "turns.json")).map((one) => [one.at, one]));
     const turns = [];
     for (const turn of conversation) {
       if (turn.kind === "user") {
+        const checkpointId = records.get(turn.at)?.checkpointId;
         turns.push({
           kind: "user",
           text: turn.text,
           at: turn.at,
-          ...turn.imageCount === void 0 ? {} : { imageCount: turn.imageCount }
+          ...turn.imageCount === void 0 ? {} : { imageCount: turn.imageCount },
+          ...typeof checkpointId === "string" ? { checkpointId } : {}
         });
       } else if (turn.kind === "answer") {
         turns.push({ kind: "answer", text: turn.text, at: turn.at });
       }
     }
+    const lastUser = turns.findLastIndex((one) => one.kind === "user");
     for (let index = 0; index < turns.length; index += 1) {
       const turn = turns[index];
       if (turn.kind !== "user") continue;
       const end = turns[index + 1]?.kind === "answer" ? turns[index + 1] : turn;
-      const outcome = outcomes.get(turn.at);
+      const record2 = records.get(turn.at);
+      const outcome = record2?.outcome;
+      const running = state.busy && index === lastUser;
       if (outcome === "interrupted") end.interrupted = true;
       else if (outcome === "failed") end.failed = true;
-      else if (outcome === void 0 && index === turns.length - 1 && !state.busy) {
+      else if (outcome === void 0 && !running && (record2?.started === true || index === turns.length - 1)) {
         end.interrupted = true;
       }
     }
     return { busy: state.busy, ...state.turnId === void 0 ? {} : { turnId: state.turnId }, turns };
   }
-  const streams = /* @__PURE__ */ new Set();
-  function openEvents(request, response, projectId, header) {
-    let lastId;
-    let forceReset = false;
-    if (header !== void 0) {
-      if (/^\d{1,15}$/.test(header.trim())) lastId = Number(header.trim());
-      else forceReset = true;
-    }
+  const streams = /* @__PURE__ */ new Map();
+  function openEvents(request, response, projectId, lastId) {
     response.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
@@ -35823,25 +35900,29 @@ async function createCloudAuthoringServer(opts) {
       "x-accel-buffering": "no"
     });
     response.write(": open\n\n");
+    const open2 = () => !response.writableEnded && !response.destroyed;
     const write = (numbered) => {
-      response.write(`id: ${numbered.seq}
+      if (!open2()) return;
+      response.write(`id: ${numbered.id}
 event: ${numbered.event.type}
 data: ${JSON.stringify(numbered.event)}
 
 `);
     };
     const backlog = events.since(projectId, lastId);
-    if (forceReset || backlog.reset) response.write("event: reset\ndata: {}\n\n");
-    else for (const numbered of backlog.events) write(numbered);
+    if (backlog.reset) response.write("event: reset\ndata: {}\n\n");
+    for (const numbered of backlog.events) write(numbered);
     const unsubscribe = events.subscribe(projectId, write);
-    const ping = setInterval(() => response.write(": ping\n\n"), PING_MS);
+    const ping = setInterval(() => {
+      if (open2()) response.write(": ping\n\n");
+    }, PING_MS);
     ping.unref();
-    streams.add(response);
     const stop2 = () => {
       clearInterval(ping);
       unsubscribe();
       streams.delete(response);
     };
+    streams.set(response, stop2);
     request.on("close", stop2);
     response.on("close", stop2);
   }
@@ -35922,10 +36003,14 @@ data: ${JSON.stringify(numbered.event)}
     if (method === "GET" && action === "bundle") {
       const project = await room.get(projectId);
       if (project === void 0) throw NO_PROJECT();
+      if (!await exists(path9.join(project.path, "app.yaml"))) throw NOT_READY();
       try {
         return send(response, 200, await bundleAppPage(project.path));
-      } catch {
-        throw NOT_READY();
+      } catch (error43) {
+        const name = error43?.name ?? "Error";
+        const first = String(error43?.message ?? "").split("\n")[0].slice(0, 200);
+        console.error(`[cloud-authoring] bundle failed: ${name}: ${first}`);
+        throw BUILD_FAILED();
       }
     }
     throw NOT_FOUND();
@@ -35959,9 +36044,11 @@ data: ${JSON.stringify(numbered.event)}
     url: `http://127.0.0.1:${port2}`,
     async close() {
       closing = true;
-      for (const stream of streams) stream.end();
-      streams.clear();
       await sessions.closeAll();
+      for (const [stream, stop2] of [...streams]) {
+        stop2();
+        if (!stream.writableEnded) stream.end();
+      }
       await new Promise((resolve) => {
         server2.close(() => resolve());
         server2.closeAllConnections();
@@ -36035,6 +36122,14 @@ function imagesOf(value) {
   });
   return images.length === 0 ? void 0 : images;
 }
+async function exists(file2) {
+  try {
+    await stat3(file2);
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function readList(projectPath, file2) {
   try {
     const parsed = JSON.parse(await readFile8(path9.join(projectPath, ".dc", file2), "utf8"));
@@ -36052,7 +36147,15 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
 }
 var root = process.env.DCW_AUTHORING_ROOT ?? path10.join(process.env.HOME ?? os.homedir(), "work", "apps");
 var claudePath = process.env.DCW_CLAUDE ?? "claude";
-var server = await createCloudAuthoringServer({ root, claudePath, port });
+var server;
+try {
+  server = await createCloudAuthoringServer({ root, claudePath, port });
+} catch (error43) {
+  const name = error43?.name ?? "Error";
+  const code = error43?.code;
+  console.error(`[cloud-authoring] could not start: ${name}${typeof code === "string" ? ` ${code}` : ""}`);
+  process.exit(1);
+}
 console.log(`[cloud-authoring] listening on ${server.url}`);
 var stopping = false;
 var stop = () => {

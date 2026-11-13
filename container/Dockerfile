@@ -258,6 +258,12 @@ COPY container/bin/dct-install-skills /usr/local/bin/dct-install-skills
 RUN chmod 0755 /usr/local/bin/dct-install-skills
 COPY container/skills/ai-pub/SKILL.md /usr/local/share/dct-skills/ai-pub/SKILL.md
 
+# 云端创作服务（任务 5 vendored）。ESM 不从全局目录解析模块，所以 esbuild 装在
+# 与 .mjs 同目录的 node_modules 里。
+COPY container/vendor/cloud-authoring.mjs /usr/local/lib/dct/cloud-authoring.mjs
+RUN npm i --prefix /usr/local/lib/dct esbuild@0.25.12 \
+ && npm cache clean --force
+
 # 把上传栏拼进 ttyd 自己那份 index.html，`entrypoint.sh` 用 `ttyd -I` 发这一份。
 #
 # **为什么要在构建时起一次 ttyd 才能拿到那一页**：ttyd 把整个前端编进了二进制
@@ -272,12 +278,6 @@ COPY container/skills/ai-pub/SKILL.md /usr/local/share/dct-skills/ai-pub/SKILL.m
 # 这一份烧死在镜像里，所以它跟 ttyd 的版本绑在一起。ttyd 一升版，这一步会自动
 # 用新的那一页重新拼——**除非它改了 `</body>` 的形状**，那时候下面那个
 # `grep -c dcw-panel` 会当场失败，而不是建出一个没有上传栏的镜像。
-# 云端创作服务（任务 5 vendored）。ESM 不从全局目录解析模块，所以 esbuild 装在
-# 与 .mjs 同目录的 node_modules 里。
-COPY container/vendor/cloud-authoring.mjs /usr/local/lib/dct/cloud-authoring.mjs
-RUN npm i --prefix /usr/local/lib/dct esbuild@0.25.12 \
- && npm cache clean --force
-
 COPY container/upload-panel.html /tmp/upload-panel.html
 RUN set -eu; \
     mkdir -p /usr/local/share/dcw; \
