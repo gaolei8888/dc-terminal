@@ -187,6 +187,20 @@ pub fn serve_with_library(
     upload_dir: PathBuf,
     library: Option<Arc<crate::student_projects::Library>>,
 ) -> Gate {
+    serve_with_authoring(listener, token, upstream, None, lang, upload_dir, library)
+}
+
+/// 同 `serve_with_library`，外加云端创作服务那个上游：认证通过后
+/// `/_dct/authoring` 与 `/_dct/authoring/...` 连它，其余照旧。
+pub fn serve_with_authoring(
+    listener: TcpListener,
+    token: String,
+    upstream: SocketAddr,
+    authoring: Option<SocketAddr>,
+    lang: Lang,
+    upload_dir: PathBuf,
+    library: Option<Arc<crate::student_projects::Library>>,
+) -> Gate {
     let addr = listener.local_addr().expect("监听器必须已经绑好");
     let stopping = Arc::new(AtomicBool::new(false));
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -221,6 +235,7 @@ pub fn serve_with_library(
                             stream,
                             &token,
                             upstream,
+                            authoring,
                             lang,
                             &upload_dir,
                             library.as_deref(),
@@ -244,6 +259,7 @@ fn handle_conn(
     mut down: TcpStream,
     token: &str,
     upstream: SocketAddr,
+    authoring: Option<SocketAddr>,
     lang: Lang,
     upload_dir: &Path,
     library: Option<&crate::student_projects::Library>,
@@ -303,7 +319,21 @@ fn handle_conn(
         return;
     }
 
-    let Ok(mut up) = TcpStream::connect(upstream) else {
+    // 云端创作服务（SSE 可能静默开几分钟）：认证之后、与 ttyd 同一套管道。
+    // `pump_both` 一进来就摘掉读写超时，所以握手那 10 秒不会切断长连接。
+    // 精确匹配 `/_dct/authoring` 或带 `/` 的前缀，`/_dct/authoringx` 不算。
+    let target = if head.path == "/_dct/authoring" || head.path.starts_with("/_dct/authoring/") {
+        match authoring {
+            Some(a) => a,
+            None => {
+                let _ = write_status(&mut down, 404);
+                return;
+            }
+        }
+    } else {
+        upstream
+    };
+    let Ok(mut up) = TcpStream::connect(target) else {
         // 502 而不是 500：错在上游没起来，不在这条请求。body 照样是空的——
         // 上游的地址和状态一个字都不往外写。
         let _ = write_status(&mut down, 502);
@@ -1087,6 +1117,8 @@ pub struct GateArgs {
     pub port: u16,
     /// 上游。默认是容器里 ttyd 监听的那个环回地址。
     pub upstream: String,
+    /// 云端创作服务的上游（`--authoring 主机:端口`）。不给则 `/_dct/authoring*` 回 404。
+    pub authoring: Option<String>,
     /// 外面看到的地址前缀，用来拼那条能发出去的链接。
     /// 不给就只能按 `bind` 猜一个，并且明说是猜的。
     pub public_url: Option<String>,
@@ -1100,6 +1132,7 @@ pub fn parse_gate_args(args: &[String]) -> Result<GateArgs, String> {
         bind: "127.0.0.1".to_string(),
         port: 7681,
         upstream: "127.0.0.1:7682".to_string(),
+        authoring: None,
         public_url: None,
         link_only: false,
     };
@@ -1122,6 +1155,10 @@ pub fn parse_gate_args(args: &[String]) -> Result<GateArgs, String> {
             }
             "--upstream" => {
                 out.upstream = need(i)?.clone();
+                i += 2;
+            }
+            "--authoring" => {
+                out.authoring = Some(need(i)?.clone());
                 i += 2;
             }
             "--url" => {
@@ -1149,7 +1186,7 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
             eprintln!(
                 "{msg}
 
-用法：dct gate [--bind 地址] [--port 端口] [--upstream 主机:端口] [--url 外面看到的地址] [--link]"
+用法：dct gate [--bind 地址] [--port 端口] [--upstream 主机:端口] [--authoring 主机:端口] [--url 外面看到的地址] [--link]"
             );
             return 2;
         }
@@ -1198,6 +1235,16 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
             return 1;
         }
     };
+    let authoring: Option<SocketAddr> = match args.authoring.as_deref() {
+        None => None,
+        Some(a) => match resolve_one(a) {
+            Some(x) => Some(x),
+            None => {
+                eprintln!("--authoring 解析不了：{a}");
+                return 1;
+            }
+        },
+    };
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1232,7 +1279,7 @@ pub fn run_cli(args: &[String], lang: Lang) -> i32 {
             }
         }
     });
-    let mut gate = serve_with_library(listener, token, upstream, lang, upload_dir, library);
+    let mut gate = serve_with_authoring(listener, token, upstream, authoring, lang, upload_dir, library);
     eprintln!("门开在 {}，上游 {upstream}。", gate.addr());
     // accept 线程就是这个进程的全部工作，join 到它自己结束为止。
     //
@@ -1451,6 +1498,92 @@ mod tests {
             let msg = text(Key::GateNeedsLink, *lang);
             assert!(html.contains(msg), "{lang:?} 下页面里没有那句话");
         }
+    }
+
+    // ---- 云端创作服务：/_dct/authoring 转给第二个上游 ----
+
+    fn gate_with_authoring(
+        authoring: Option<SocketAddr>,
+    ) -> (Gate, FakeUpstream, tempfile::TempDir) {
+        let up = fake_upstream();
+        let dir = tempfile::tempdir().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let g = serve_with_authoring(
+            l,
+            "aaaa".into(),
+            up.addr,
+            authoring,
+            Lang::Zh,
+            dir.path().join("uploads"),
+            None,
+        );
+        (g, up, dir)
+    }
+
+    #[test]
+    fn authoring_paths_reach_the_authoring_upstream_not_ttyd() {
+        let auth = fake_upstream();
+        let (g, ttyd, _d) = gate_with_authoring(Some(auth.addr));
+        for path in ["/_dct/authoring", "/_dct/authoring/v1/health"] {
+            let r = get(g.addr(), path, Some("dct_gate=aaaa"));
+            assert!(r.contains("hi"), "{path}: {r}");
+        }
+        let seen = String::from_utf8_lossy(&auth.seen.lock().unwrap().clone()).into_owned();
+        assert!(seen.contains("GET /_dct/authoring/v1/health HTTP/1.1"), "{seen}");
+        assert!(seen.contains("Cookie: dct_gate=aaaa"), "{seen}");
+        assert!(ttyd.seen.lock().unwrap().is_empty(), "ttyd 不该收到");
+        g.stop();
+    }
+
+    #[test]
+    fn authoring_without_the_key_is_401_and_touches_nothing() {
+        let auth = fake_upstream();
+        let (g, ttyd, _d) = gate_with_authoring(Some(auth.addr));
+        let r = get(g.addr(), "/_dct/authoring/v1/health", None);
+        assert!(r.starts_with("HTTP/1.1 401 "), "{r}");
+        assert!(auth.seen.lock().unwrap().is_empty());
+        assert!(ttyd.seen.lock().unwrap().is_empty());
+        g.stop();
+    }
+
+    #[test]
+    fn authoring_not_configured_is_404() {
+        let (g, ttyd, _d) = gate_with_authoring(None);
+        let r = get(g.addr(), "/_dct/authoring/v1/health", Some("dct_gate=aaaa"));
+        assert!(r.starts_with("HTTP/1.1 404 "), "{r}");
+        assert!(ttyd.seen.lock().unwrap().is_empty());
+        g.stop();
+    }
+
+    #[test]
+    fn a_dead_authoring_upstream_is_502_with_empty_body() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let (g, _ttyd, _d) = gate_with_authoring(Some(dead));
+        let r = get(g.addr(), "/_dct/authoring/v1/health", Some("dct_gate=aaaa"));
+        assert!(r.starts_with("HTTP/1.1 502 "), "{r}");
+        assert!(r.ends_with("\r\n\r\n"), "502 不许带 body：{r}");
+        g.stop();
+    }
+
+    #[test]
+    fn authoringx_is_not_authoring() {
+        let auth = fake_upstream();
+        let (g, ttyd, _d) = gate_with_authoring(Some(auth.addr));
+        let r = get(g.addr(), "/_dct/authoringx", Some("dct_gate=aaaa"));
+        assert!(r.contains("hi"), "{r}");
+        assert!(auth.seen.lock().unwrap().is_empty(), "不该进 authoring");
+        assert!(!ttyd.seen.lock().unwrap().is_empty(), "该走 ttyd");
+        g.stop();
+    }
+
+    #[test]
+    fn authoring_args_are_parsed() {
+        assert!(parse_gate_args(&[]).unwrap().authoring.is_none());
+        let v: Vec<String> = ["--authoring", "127.0.0.1:7683"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_gate_args(&v).unwrap().authoring.as_deref(), Some("127.0.0.1:7683"));
     }
 
     #[test]

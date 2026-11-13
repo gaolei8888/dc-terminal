@@ -124,7 +124,14 @@ ttyd_pid=$!
 # `--url`：外面看到的地址。容器不知道自己被映射到哪儿，所以只能由起它的人
 # 告诉它（`DCW_PUBLIC_URL`）。不给的话门会印一条按容器网桥地址猜的链接，
 # 并且明说那是猜的。
-gate_args=(--bind 0.0.0.0 --port "$PORT" --upstream "127.0.0.1:$TTYD_PORT")
+# 云端创作服务：纯 Node，只绑容器内环回，外面只能经门的 /_dct/authoring/ 够到。
+AUTHORING_PORT="${DCW_AUTHORING_PORT:-7683}"
+mkdir -p "$HOME/work/apps"
+DCW_AUTHORING_PORT="$AUTHORING_PORT" DCW_AUTHORING_ROOT="${DCW_AUTHORING_ROOT:-$HOME/work/apps}" \
+  node /usr/local/lib/dct/cloud-authoring.mjs &
+authoring_pid=$!
+
+gate_args=(--bind 0.0.0.0 --port "$PORT" --upstream "127.0.0.1:$TTYD_PORT" --authoring "127.0.0.1:$AUTHORING_PORT")
 [ -n "${DCW_PUBLIC_URL:-}" ] && gate_args+=(--url "$DCW_PUBLIC_URL")
 dct gate "${gate_args[@]}" &
 gate_pid=$!
@@ -134,6 +141,6 @@ gate_pid=$!
 # 一种坏法。
 wait -n
 status=$?
-kill -TERM "$daemon_pid" "$ttyd_pid" "$gate_pid" 2>/dev/null
+kill -TERM "$daemon_pid" "$ttyd_pid" "$authoring_pid" "$gate_pid" 2>/dev/null
 wait
 exit "$status"
