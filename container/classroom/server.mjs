@@ -489,7 +489,8 @@ export class Classroom {
     const port = p.startsWith('/_dct/projects') ? backend.apiPort : backend.port;
     return new Promise((resolve, reject) => {
       const upstream = http.request({host: '127.0.0.1', port, path: target, method: req.method, headers}, response => {
-        if (authoring && /^text\/event-stream\b/i.test(String(response.headers['content-type'] || '')) && response.statusCode === 200) {
+        // 只有事件流那一个路由透传；别的创作路由回什么都当 JSON，受 16 MiB 上限。
+        if (authoring && p === '/_dct/authoring/v1/events' && /^text\/event-stream\b/i.test(String(response.headers['content-type'] || '')) && response.statusCode === 200) {
           res.writeHead(200, {'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox", 'content-type': 'text/event-stream; charset=utf-8', 'x-accel-buffering': 'no'});
           res.flushHeaders?.();
           upstream.setTimeout(0); response.socket?.setTimeout(0);

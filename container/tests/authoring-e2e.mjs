@@ -131,18 +131,23 @@ async function main() {
   assert.ok(types.indexOf('turn_started') < types.indexOf('turn_done'), 'turn_started 在 turn_done 之前');
   assert.equal(types.filter(t => t === 'turn_done').length, 1);
   assert.ok(!types.includes('turn_failed'), 'no turn_failed');
-  const ids = events.map(e => Number(e.id));
-  assert.ok(ids.every(Number.isFinite) && ids.every((v, i) => i === 0 || v > ids[i - 1]), '事件 id 递增: ' + ids);
+  // 事件 id 是 <boot>-<seq>：同一次起服务 boot 相同，seq 递增
+  const ids = events.map(e => String(e.id));
+  const boots = new Set(ids.map(id => id.split('-')[0]));
+  const seqs = ids.map(id => Number(id.split('-')[1]));
+  assert.ok(ids.every(id => /^[0-9a-f]+-\d+$/.test(id)) && boots.size === 1, '事件 id 形如 <boot>-<seq>: ' + ids);
+  assert.ok(seqs.every((v, i) => i === 0 || v > seqs[i - 1]), '事件 id 递增: ' + ids);
 
   // 断线续传：从第一条之后继续，不会重复第一条
-  const resumed = await readEvents(`${base}/events?project=${encodeURIComponent(projectId)}`, {...H, 'last-event-id': String(ids[0])}, evs => evs.length >= events.length - 1);
-  assert.equal(resumed[0].id, String(ids[1]), 'Last-Event-ID 续传');
+  const resumed = await readEvents(`${base}/events?project=${encodeURIComponent(projectId)}`, {...H, 'last-event-id': ids[0]}, evs => evs.length >= events.length - 1);
+  assert.equal(resumed[0].id, ids[1], 'Last-Event-ID 续传');
 
   const detail = await fetch(`${base}/projects/${encodeURIComponent(projectId)}`, {headers: H});
   assert.equal(detail.status, 200);
   const dj = await detail.json();
   assert.equal(dj.busy, false);
   assert.ok(Array.isArray(dj.turns) && dj.turns.length >= 1);
+  assert.equal(typeof dj.turns[0].checkpointId, 'string', '用户那句带撤销点');
 
   // 假 claude 不写文件；服务建项目时给了脚手架，这里按「AI 做完了」的样子
   // 经 docker exec 把最小 app.yaml + 入口写进项目目录（覆盖脚手架）。

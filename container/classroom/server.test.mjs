@@ -596,6 +596,11 @@ test('云端创作接口：事件流边到边转、不截断、断开即销毁�
     } else if (url.pathname === '/_dct/authoring/v1/projects/x/bundle') {
       const body = Buffer.from(JSON.stringify({data: 'y'.repeat(12 * 1024 ** 2)}));
       res.writeHead(200, {'content-type': 'application/json', 'content-length': body.length}); res.end(body);
+    } else if (url.pathname === '/_dct/authoring/v1/projects/sse') {
+      // 不是事件流路由却回 text/event-stream：只能当 JSON 转，照样受 16 MiB 上限
+      res.writeHead(200, {'content-type': 'text/event-stream'});
+      if (url.searchParams.get('big')) { const chunk = Buffer.alloc(1024 * 1024, 'x'); let n = 0; const pump = () => { while (n < 17) { n++; if (!res.write(chunk)) return res.once('drain', pump); } res.end(); }; pump(); }
+      else res.end('data: x\n\n');
     } else if (url.pathname === '/_dct/authoring/v1/projects/busy') {
       res.writeHead(409, {'content-type': 'application/json'}); res.end(JSON.stringify({code: 'busy'}));
     } else { res.writeHead(200, {'content-type': 'application/json'}); res.end('{}'); }
@@ -632,6 +637,16 @@ test('云端创作接口：事件流边到边转、不截断、断开即销毁�
     // 请求正文超 12 MiB 被拒
     const tooBig = await fetch(origin + base + '/projects', {method: 'POST', headers: {cookie, 'Content-Type': 'application/json'}, body: Buffer.alloc(13 * 1024 ** 2, 'a')});
     assert.equal(tooBig.status, 413);
+
+    // 只有 /events 走事件流透传；别的路由回 text/event-stream 也当 JSON、受上限
+    const fake = await fetch(origin + base + '/projects/sse', {headers: {cookie}});
+    assert.equal(fake.status, 200);
+    assert.match(fake.headers.get('content-type'), /^application\/json/);
+    await fake.text();
+    const fakeBig = await fetch(origin + base + '/projects/sse?big=1', {headers: {cookie}});
+    let got = 0;
+    try { for await (const c of fakeBig.body) got += c.length; } catch {}
+    assert.ok(got <= 16 * 1024 ** 2, `capped at 16 MiB, got ${got}`);
 
     // 分段：第一条在后端写完之前就到达
     const staged = await fetch(origin + base + '/events?project=p&mode=staged', {headers: {cookie, accept: 'text/event-stream', 'last-event-id': '41'}});
