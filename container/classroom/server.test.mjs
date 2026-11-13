@@ -572,3 +572,96 @@ test('自愈：老版本写的记录没有房间号，认领当前房间而不�
     assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播', id: 'room01'}, '应该认领当前房间，不是清掉');
   } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
 });
+
+test('云端创作接口：事件流边到边转、不截断、断开即销毁上游；大 JSON 放行；未登录与未知路径被拒；管理员不放行', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-classroom-authoring-'));
+  const seen = {headers: null, closed: null, release: null};
+  const gate = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    if (url.pathname === '/_dct/authoring/v1/events') {
+      seen.headers = req.headers;
+      const mode = url.searchParams.get('mode');
+      res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'content-length-hint': 'ignored'});
+      if (mode === 'staged') {
+        res.write('id: 1\ndata: one\n\n');
+        seen.release = () => { res.write('id: 2\ndata: two\n\n'); res.end('id: 3\ndata: three\n\n'); };
+      } else if (mode === 'big') {
+        const chunk = Buffer.alloc(1024 * 1024, 'x'); let n = 0;
+        const pump = () => { while (n < 10) { n++; if (!res.write(`data: ${chunk.toString()}\n\n`)) return res.once('drain', pump); } res.end(); };
+        pump();
+      } else {
+        res.write(': ping\n\n');
+        req.on('close', () => seen.closed?.());
+      }
+    } else if (url.pathname === '/_dct/authoring/v1/projects/x/bundle') {
+      const body = Buffer.from(JSON.stringify({data: 'y'.repeat(12 * 1024 ** 2)}));
+      res.writeHead(200, {'content-type': 'application/json', 'content-length': body.length}); res.end(body);
+    } else if (url.pathname === '/_dct/authoring/v1/projects/busy') {
+      res.writeHead(409, {'content-type': 'application/json'}); res.end(JSON.stringify({code: 'busy'}));
+    } else { res.writeHead(200, {'content-type': 'application/json'}); res.end('{}'); }
+  });
+  await new Promise(r => gate.listen(0, '127.0.0.1', r));
+  const gatePort = gate.address().port;
+  const store = new Store(dir, {password: 'test-admin'});
+  const [alice] = store.add(['Alice']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), start: async () => {}, backend: async () => ({port: gatePort, apiPort: 1, token: 'GATE'}), rpc: async () => ({})};
+  const terminalFile = path.join(dir, 'trusted.html'); fs.writeFileSync(terminalFile, '<html><head></head></html>');
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, terminalFile});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const base = `/w/${alice.id}/_dct/authoring/v1`;
+  try {
+    const login = await fetch(`${origin}/w/${alice.id}/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: alice.token})});
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const adminLogin = await fetch(`${origin}/admin/api/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: 'test-admin'})});
+    const admin = adminLogin.headers.get('set-cookie').split(';')[0];
+
+    assert.equal((await fetch(origin + base + '/health')).status, 401);
+    assert.equal((await fetch(origin + `/w/${alice.id}/_dct/authoring/other`, {headers: {cookie}})).status, 404);
+    assert.equal((await fetch(origin + base + '/secret', {headers: {cookie}})).status, 404);
+    const health = await fetch(origin + base + '/health', {headers: {cookie}});
+    assert.equal(health.status, 200); assert.match(health.headers.get('content-type'), /^application\/json/);
+    const busy = await fetch(origin + base + '/projects/busy', {headers: {cookie}});
+    assert.equal(busy.status, 409); assert.deepEqual(await busy.json(), {code: 'busy'});
+
+    // 12 MB JSON 成功（超过普通 8 MB 上限）
+    const bundle = await fetch(origin + base + '/projects/x/bundle', {headers: {cookie}});
+    assert.equal(bundle.status, 200);
+    assert.equal((await bundle.text()).length > 12 * 1024 ** 2, true);
+
+    // 请求正文超 12 MiB 被拒
+    const tooBig = await fetch(origin + base + '/projects', {method: 'POST', headers: {cookie, 'Content-Type': 'application/json'}, body: Buffer.alloc(13 * 1024 ** 2, 'a')});
+    assert.equal(tooBig.status, 413);
+
+    // 分段：第一条在后端写完之前就到达
+    const staged = await fetch(origin + base + '/events?project=p&mode=staged', {headers: {cookie, accept: 'text/event-stream', 'last-event-id': '41'}});
+    assert.equal(staged.status, 200);
+    assert.match(staged.headers.get('content-type'), /^text\/event-stream/);
+    assert.equal(staged.headers.get('x-accel-buffering'), 'no');
+    assert.equal(staged.headers.get('content-length'), null);
+    assert.equal(seen.headers['last-event-id'], '41'); assert.equal(seen.headers.accept, 'text/event-stream');
+    const reader = staged.body.getReader(), dec = new TextDecoder(); let text = '';
+    while (!text.includes('data: one')) { const {value, done} = await reader.read(); assert.ok(!done, 'stream ended before first event'); text += dec.decode(value); }
+    assert.ok(!text.includes('data: two'));
+    seen.release();
+    for (;;) { const {value, done} = await reader.read(); if (done) break; text += dec.decode(value); }
+    assert.ok(text.indexOf('data: one') < text.indexOf('data: two') && text.indexOf('data: two') < text.indexOf('data: three'));
+
+    // 超过 8 MB 的事件流不截断
+    const big = await fetch(origin + base + '/events?project=p&mode=big', {headers: {cookie}});
+    assert.equal(big.status, 200);
+    assert.ok((await big.arrayBuffer()).byteLength > 10 * 1024 ** 2);
+
+    // 学生断开 → 后端看到连接关闭
+    const closed = new Promise(r => { seen.closed = r; });
+    const ctl = new AbortController();
+    const live = await fetch(origin + base + '/events?project=p&mode=idle', {headers: {cookie}, signal: ctl.signal});
+    await live.body.getReader().read();
+    ctl.abort();
+    await closed;
+
+    // 管理员查看/协助不放行
+    await fetch(`${origin}/admin/api/students/${alice.id}/assist`, {method: 'POST', headers: {'Content-Type': 'application/json', cookie: admin}, body: '{}'});
+    assert.equal((await fetch(`${origin}/admin/workspaces/${alice.id}/view/_dct/authoring/v1/health`, {headers: {cookie: admin}})).status, 404);
+  } finally { await app.close(); await new Promise(r => gate.closeAllConnections?.() || r()); await new Promise(r => gate.close(r)); fs.rmSync(dir, {recursive: true, force: true}); }
+});

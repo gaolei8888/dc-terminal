@@ -51,6 +51,7 @@ function finishedPage(prefix) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学习已结束</title><body style="font:16px/1.7 system-ui;padding:8vh 8vw;background:#f5f7fa"><h1>本次学习已结束</h1><p>你的作品已保留，下次可以继续。</p><button style="font:inherit;padding:10px 20px" id="continue">继续学习</button><p id="error"></p><script>document.querySelector('#continue').onclick=async function(){this.disabled=true;try{const r=await fetch(${js(prefix + '/start')},{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error((await r.json()).error);location.href=${js(prefix + '/')};}catch(e){document.querySelector('#error').textContent=e.message;this.disabled=false;}};</script></body></html>`;
 }
 
+const AUTHORING = /^\/_dct\/authoring\/v1\/(health|projects|events)(?:\/|$|\?)/;
 export class Classroom {
   constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, live, stt = {}} = {}) {
     // 语音转写的上游。**没配也要能正常开课**——按钮那边会说「还没配」，
@@ -460,12 +461,15 @@ export class Classroom {
       throw fail(404, '接口不存在');
     });
   }
-  allowed(path) { return path === '/' || path === '/token' || path === '/ws' || /^\/_dct\/projects(?:\/|$)/.test(path); }
+  allowed(path) { return path === '/' || path === '/token' || path === '/ws' || /^\/_dct\/projects(?:\/|$)/.test(path) || AUTHORING.test(path); }
   async proxy(req, res, w, target, prefix, session, adminDownload = false) {
     const p = new URL(target, this.origin).pathname;
     if (p.startsWith('/_dct/publish/')) { if (!this.publishing) throw fail(503, '作品发布尚未配置'); return this.publishing.browser(req, res, w, target, prefix, session); }
     if (p === '/_dct/presence' && req.method === 'GET') return json(res, 200, {assisting: !!this.lease(w)});
     if (!this.allowed(p)) throw fail(404, '接口不存在');
+    const authoring = AUTHORING.test(p);
+    // 云端创作只属于学生自己的路由；管理员查看/协助走的是同一个 proxy，不放行。
+    if (authoring && session.role !== 'student') throw fail(404, '接口不存在');
     if (req.method !== 'GET') this.writeOrigin(req);
     if (w.disabled && session.role === 'student') throw fail(403, '链接已停用');
     const backend = await this.driver.backend(w);
@@ -479,14 +483,25 @@ export class Classroom {
       return html(res, fs.readFileSync(this.terminalFile, 'utf8').replace('</head>', config + '</head>'));
     }
     const headers = {host: new URL(this.origin).host, cookie: `dct_gate=${backend.token}`, connection: 'close'};
-    for (const key of ['content-type', 'content-length', 'origin', 'sec-fetch-site']) if (req.headers[key]) headers[key] = req.headers[key];
+    for (const key of ['content-type', 'content-length', 'origin', 'sec-fetch-site', ...(authoring ? ['last-event-id', 'accept'] : [])]) if (req.headers[key]) headers[key] = req.headers[key];
+    const requestMax = 12 * 1024 ** 2;
+    if (authoring && Number(req.headers['content-length']) > requestMax) throw fail(413, '请求内容过大');
     const port = p.startsWith('/_dct/projects') ? backend.apiPort : backend.port;
     return new Promise((resolve, reject) => {
       const upstream = http.request({host: '127.0.0.1', port, path: target, method: req.method, headers}, response => {
+        if (authoring && /^text\/event-stream\b/i.test(String(response.headers['content-type'] || '')) && response.statusCode === 200) {
+          res.writeHead(200, {'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox", 'content-type': 'text/event-stream; charset=utf-8', 'x-accel-buffering': 'no'});
+          res.flushHeaders?.();
+          upstream.setTimeout(0); response.socket?.setTimeout(0);
+          const stop = () => { response.destroy(); upstream.destroy(); };
+          res.on('close', stop); response.on('error', () => res.destroy()); response.on('end', () => { res.end(); resolve(); });
+          response.pipe(res, {end: false});
+          return;
+        }
         const download = /\/(file|download)$/.test(p) && response.statusCode === 200;
         const responseHeaders = {'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox", 'content-type': download ? 'application/octet-stream' : 'application/json; charset=utf-8'};
         if (download) responseHeaders['content-disposition'] = 'attachment; filename="download"';
-        const max = download ? 136 * 1024 ** 2 : 8 * 1024 ** 2;
+        const max = download ? 136 * 1024 ** 2 : authoring ? 16 * 1024 ** 2 : 8 * 1024 ** 2;
         const length = Number(response.headers['content-length']);
         if (Number.isFinite(length) && length > max) { response.destroy(); return reject(fail(502, '工作区响应过大')); }
         if (Number.isFinite(length) && length >= 0) responseHeaders['content-length'] = length;
@@ -499,7 +514,9 @@ export class Classroom {
         response.on('error', reject);
       });
       upstream.setTimeout(120000, () => upstream.destroy(new Error('工作区响应超时')));
-      upstream.on('error', reject); req.on('aborted', () => upstream.destroy()); req.pipe(upstream);
+      upstream.on('error', reject); req.on('aborted', () => upstream.destroy());
+      if (authoring) { let n = 0; req.on('data', c => { n += c.length; if (n > requestMax) { upstream.destroy(); reject(fail(413, '请求内容过大')); } }); }
+      req.pipe(upstream);
     });
   }
   async upgrade(req, socket, head) {
