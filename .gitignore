@@ -8,3 +8,6 @@ container/work/
 # Python 字节码：跟源文件不同步的时候最难查，而且每台机器的都不一样。
 __pycache__/
 *.pyc
+
+# cloud-authoring 的运行时依赖（镜像里装），不入库
+container/vendor/node_modules/
