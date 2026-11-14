@@ -35463,27 +35463,16 @@ talk to them in simple Chinese and never show code, file paths or error traces u
 - The page runs offline on the tablet. Never use the network: no fetch/XHR/WebSocket to any
   address, no CDN scripts, no web fonts, no remote images. Everything must be in the project.
 - Never call any model API directly and never put API keys in the app. AI and the camera are
-  available ONLY through the window.dc API described next.
-
-AI and camera on the tablet (window.dc, provided by the tablet; every call returns a result, never throws):
-
-    await window.dc.generate({ instruction: string, schema?: object })   // { ok: true, data } | { ok: false, message }
-    const c = await window.dc.chat.start()                               // { ok: true, conversationId } | { ok: false, message }
-    await window.dc.chat.send(conversationId, text, { onText?(full) })   // { ok: true, text } | { ok: false, message }
-    await window.dc.camera.takePhoto()                                   // { ok: true, image: "data:image/jpeg;base64,..." } | { ok: false, message }
-
-- Failures look like { ok: false, message }. Always check result.ok on every call, and when it is
-  false show result.message to the user (it is already Chinese). Never assume success.
-- AI needs the network. While waiting, show Chinese text such as "\u6B63\u5728\u60F3\u2026" so the child knows it is working.
-- chat takes text only: never pass images to chat.
-- A photo is a data URL, so it can go straight into <img src>. The child confirms taking it on the tablet.
-- Not supported: video recording, reading web pages, drawing images, or linking to other services.
+  available ONLY through the window.dc API described at the end.
 
 - app.yaml must stay valid, or the app cannot be opened on the tablet:
   - metadata is strict: only id, name and version. Do not add description, author, icon or any
     other key there (or anywhere else the format does not define).
   - metadata.id must match ^[a-z][a-z0-9-]{1,62}$ (lowercase letters, digits, dashes; starts
     with a letter). Do not change the id once it is set.
+  - As soon as you know what the app is, set app.yaml metadata.name to the app's short Chinese name
+    (at most 8 characters, e.g. \u7B11\u8BDD\u5927\u738B): it becomes the name on the tablet desktop. Change only
+    the name; keep metadata.id unchanged.
   - Keep clients: at least one client with kind: web (or kind: mobile) whose entry is a file
     inside this project folder.
   - Keep runtime.entryAgent pointing at an agent that exists in agents/. If agents/*.yaml files
@@ -35497,6 +35486,40 @@ AI and camera on the tablet (window.dc, provided by the tablet; every call retur
 - All visible text in the app is Chinese. Design for touch: large tap targets, no hover-only
   controls, no keyboard shortcuts as the only way to do something, layouts that fit a tablet screen
   in both orientations.
+
+AI AND CAMERA ON THE TABLET
+
+AI and camera on the tablet come ONLY from window.dc, which the tablet provides. Every call returns
+a result and never throws:
+
+    await window.dc.generate({ instruction: string, schema?: object })   // { ok: true, data } | { ok: false, message }
+    const c = await window.dc.chat.start()                               // { ok: true, conversationId } | { ok: false, message }
+    await window.dc.chat.send(conversationId, text, { onText?(full) })   // { ok: true, text } | { ok: false, message }
+    await window.dc.camera.takePhoto()                                   // { ok: true, image: "data:image/jpeg;base64,..." } | { ok: false, message }
+
+For example:
+
+    const r = await window.dc.generate({ instruction: "\u51FA\u4E00\u9053 10 \u4EE5\u5185\u7684\u52A0\u6CD5\u9898", schema: { type: "object" } });
+    if (!r.ok) { showMessage(r.message); return; }   // showMessage: your own code that puts the text on the page
+
+- Failures look like { ok: false, message }. Always check result.ok on every call, and when it is
+  false show result.message to the user (it is already Chinese). Never assume success.
+- AI needs the network. While waiting, show Chinese text such as "\u6B63\u5728\u60F3\u2026" so the child knows it is working.
+- generate: data is the parsed JSON (an object or array) matching the schema if you gave one; ask
+  for an object or array, never a bare string or number. The instruction is at most 8000 characters.
+- chat: Start ONE chat conversation when the page loads and reuse its conversationId for every send
+  (also for "one more joke" buttons). Do not send again while the previous send is still unanswered:
+  disable the button until the answer comes. The chat text is at most 8000 characters.
+  onText is called once with the full answer (no streaming).
+  chat takes text only: never pass images to chat.
+- There are at most 60 AI calls each time the app is opened (generate and chat.send together);
+  after that every AI call returns { ok: false, message }.
+- camera: Call takePhoto only from a button the child taps (inside its click handler), never when
+  the page loads and never again by itself after a failure.
+  A cancelled photo returns { ok: false, message }. A photo is a data URL, so it can go straight
+  into <img src>. The child confirms taking it on the tablet.
+- Do not assign to window.dc and do not mock it; it is always there on the tablet.
+- Not supported: video recording, reading web pages, drawing images, or linking to other services.
 `;
 
 // services/cloud-authoring/src/engine.ts
