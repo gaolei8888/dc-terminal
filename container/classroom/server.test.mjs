@@ -929,3 +929,31 @@ test('转写：按录音格式给上游文件名，其他格式 415', async () =
     assert.equal(names.length, 3, '不支持的格式不转给上游');
   } finally { await app.close(); gateway.close(); fs.rmSync(dir, {recursive: true, force: true}); }
 });
+
+test('reapIdle 正在停的时候：请求得到 workspace_stopped，/start 等停完再正常启动', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    let release; const gate = new Promise(r => { release = r; });
+    let entered; const inStop = new Promise(r => { entered = r; });
+    f.driver.stop = async () => { f.driver.stops++; entered(); await gate; f.driver.state = 'stopped'; };
+    const reaping = f.app.reapIdle(t0 + 30 * MIN);
+    await inStop;
+    for (const p of ['/_dct/authoring/v1/projects/p/messages', '/_dct/transcribe']) {
+      const r = await f.call(p, 'POST', {Origin: 'http://localhost'});
+      assert.equal(r.status, 409, p);
+      assert.deepEqual(await r.json(), {error: '工作区在休息', code: 'workspace_stopped'});
+    }
+    let started = false;
+    const start = f.call('/start', 'POST').then(r => { started = true; return r; });
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(started, false, '/start 在停完之前不会返回');
+    release();
+    assert.deepEqual(await reaping, [f.ming.id]);
+    assert.equal((await start).status, 200);
+    assert.equal(f.driver.starts, 1);
+    assert.equal(f.app.stopping.size, 0);
+  } finally { await f.close(); }
+});

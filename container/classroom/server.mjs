@@ -84,7 +84,7 @@ export class Classroom {
     };
     // 学生工作区空闲多久自动停（分钟）。
     this.idleMs = (Number(idleMinutes ?? process.env.CLASSROOM_IDLE_MINUTES) || 20) * 60000;
-    this.activity = new Map(); this.reaping = false;
+    this.activity = new Map(); this.reaping = false; this.stopping = new Set();
     this.store = store;
     this.driver = driver;
     this.origin = new URL(origin).origin;
@@ -130,12 +130,17 @@ export class Classroom {
           const did = await this.store.mutate(async () => {
             // 读 health 的这段时间里有人来过，就算了。
             if (this.activity.get(w.id) !== seen || busy()) return false;
-            await this.driver.stop(w);
-            this.endAssistance(w.id);
-            for (const c of this.connections) if (c.student === w.id) c.socket.destroy();
-            this.activity.delete(w.id);
-            this.store.audit('空闲自动停止', w);
-            return true;
+            // 停的这十几秒里容器还显示在跑；先挂牌，进来的请求直接得到
+            // workspace_stopped，不会被转进一个正在被杀的容器。
+            this.stopping.add(w.id);
+            try {
+              await this.driver.stop(w);
+              this.endAssistance(w.id);
+              for (const c of this.connections) if (c.student === w.id) c.socket.destroy();
+              this.activity.delete(w.id);
+              this.store.audit('空闲自动停止', w);
+              return true;
+            } finally { this.stopping.delete(w.id); }
           });
           if (did) stopped.push(w.id);
         } catch { /* 这一个出错不影响别的工作区；下一轮再看 */ }
@@ -425,6 +430,7 @@ export class Classroom {
     if (!session) { if (sub === '/' && req.method === 'GET') return html(res, studentPage(prefix)); throw fail(401, '请重新打开老师发给你的完整链接'); }
     await this.sso.ensure(session);
     if (!(req.method === 'GET' && PASSIVE.test(sub.split('?')[0]))) this.activity.set(w.id, Date.now());
+    if (this.stopping.has(w.id) && sub.startsWith('/_dct/')) throw Object.assign(new Error('工作区在休息'), {code: 'workspace_stopped'});
     if (sub === '/finish' && req.method === 'POST' && !w.shared) {
       await body(req);
       return this.store.mutate(async () => {
