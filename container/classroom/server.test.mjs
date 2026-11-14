@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import {createHash} from 'node:crypto';
 import {Store} from './store.mjs';
 import {Classroom} from './server.mjs';
 
@@ -679,4 +680,69 @@ test('云端创作接口：事件流边到边转、不截断、断开即销毁�
     await fetch(`${origin}/admin/api/students/${alice.id}/assist`, {method: 'POST', headers: {'Content-Type': 'application/json', cookie: admin}, body: '{}'});
     assert.equal((await fetch(`${origin}/admin/workspaces/${alice.id}/view/_dct/authoring/v1/health`, {headers: {cookie: admin}})).status, 404);
   } finally { await app.close(); await new Promise(r => gate.closeAllConnections?.() || r()); await new Promise(r => gate.close(r)); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('device session: one login, 180 day sliding session, still revocable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-device-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [alice, bob] = store.add(['Alice', 'Bob']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), start: async () => {}, backend: async () => { throw new Error('no backend'); }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  let active = true;
+  app.sso.permissions = async () => { if (!active) { const e = new Error('账号权限已失效'); e.status = 401; throw e; } return {role: 'student', students: [], allowed: new Set()}; };
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const DAY = 86400000, call = (url, body, cookie, extra = {}) => fetch(origin + url, {method: 'POST', headers: {'Content-Type': 'application/json', ...(cookie ? {Cookie: cookie} : {}), ...extra}, body: JSON.stringify(body)});
+  const ssoLogin = w => { const res = {headers: {}, setHeader(k, v) { this.headers[k] = v; }}; app.login(res, 'student', w, {issuer: 'classroom', tenant: 't', subject: w.id}); return res.headers['Set-Cookie']; };
+  const tokenOf = c => c.match(/dcw_student=([a-f0-9]+)/)[1];
+  const sessionOf = c => app.sessions.get(createHash('sha256').update(tokenOf(c)).digest('hex'));
+  const dev = id => `/w/${id}/_device/session`, probe = (id, cookie) => fetch(origin + `/w/${id}/_dct/presence`, {headers: {Cookie: cookie}});
+  try {
+    const old = ssoLogin(alice), oldCookie = old.split(';')[0];
+    assert.ok(Math.abs(sessionOf(old).expires - (Date.now() + 8 * 3600000)) < 5000);
+    assert.ok(!sessionOf(old).device);
+    // 1. upgrade
+    const r = await call(dev(alice.id), {client: 'dc-android'}, oldCookie);
+    assert.equal(r.status, 200);
+    const sc = r.headers.get('set-cookie'), body = await r.json();
+    assert.match(sc, /Max-Age=15552000/); assert.match(sc, /Path=\/w\/[a-f0-9]+\//); assert.match(sc, /HttpOnly/); assert.match(sc, /SameSite=Strict/);
+    const newCookie = sc.split(';')[0];
+    assert.notEqual(newCookie, oldCookie);
+    assert.ok(!JSON.stringify(body).includes(tokenOf(sc)));
+    assert.equal(body.ok, true); assert.ok(Math.abs(body.expiresAt - (Date.now() + 180 * DAY)) < 5000);
+    const s = sessionOf(sc); assert.equal(s.device, true); assert.ok(s.external); assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
+    assert.equal((await probe(alice.id, oldCookie)).status, 401);
+    assert.equal((await probe(alice.id, newCookie)).status, 200);
+    // 2. already device: same token, expires renewed
+    s.expires = Date.now() + 100 * DAY;
+    const r2 = await call(dev(alice.id), {client: 'dc-android'}, newCookie);
+    assert.equal(r2.status, 200); assert.equal(r2.headers.get('set-cookie').split(';')[0], newCookie); assert.match(r2.headers.get('set-cookie'), /Max-Age=15552000/);
+    assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
+    // 3. rejects
+    assert.equal((await call(dev(alice.id), {client: 'dc-android'})).status, 401);
+    const bobCookie = ssoLogin(bob).split(';')[0];
+    assert.equal((await call(dev(alice.id), {client: 'dc-android'}, bobCookie)).status, 401);
+    assert.equal((await call(dev(alice.id), {client: 'other'}, newCookie)).status, 400);
+    assert.equal((await call(dev(alice.id), {client: 'dc-android'}, newCookie, {Origin: 'https://evil.example'})).status, 403);
+    // 4. sliding renewal on ordinary request
+    s.expires = Date.now() + 10 * DAY;
+    assert.equal((await probe(alice.id, newCookie)).status, 200);
+    assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
+    // persistence throttled to once a day
+    let saves = 0; const save = store.save.bind(store); store.save = () => { saves++; save(); };
+    s.expires = Date.now() + 10 * DAY; await probe(alice.id, newCookie); await probe(alice.id, newCookie);
+    assert.ok(saves <= 1);
+    // 5. revocation
+    active = false;
+    assert.ok((await probe(alice.id, newCookie)).status >= 401);
+    active = true;
+    assert.equal((await probe(alice.id, newCookie)).status, 200);
+    app.revoke(alice);
+    assert.equal((await probe(alice.id, newCookie)).status, 401);
+    const c3 = (await (await call(dev(bob.id), {client: 'dc-android'}, bobCookie)).headers).get('set-cookie').split(';')[0];
+    bob.disabled = true;
+    assert.ok((await probe(bob.id, c3)).status >= 401);
+    bob.disabled = false; bob.generation++;
+    assert.equal((await probe(bob.id, c3)).status, 401);
+  } finally { await app.close(); fs.rmSync(dir, {recursive: true, force: true}); }
 });

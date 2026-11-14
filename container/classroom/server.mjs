@@ -8,6 +8,7 @@ import {Publishing} from './publishing.mjs';
 import {DockerDriver, localRequest} from './docker.mjs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
+const DEVICE_DAYS = 180;
 const json = (res, status, value) => { const body = JSON.stringify(value); res.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'}); res.end(body); };
 const html = (res, body) => { res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "frame-ancestors 'self'"}); res.end(body); };
 const fail = (status, message) => Object.assign(new Error(message), {status});
@@ -69,6 +70,7 @@ export class Classroom {
     this.terminalFile = terminalFile;
     this.sso = new Federation(this, issuers, ssoAllowHttp);
     this.publishing = publishing ? new Publishing(this, publishing) : null;
+    this.persistedAt = new Map();
     this.sessions = new Map((store.data.sessions || []).filter(s => s.expires > Date.now()).map(s => [s.key, s]));
     this.assistance = new Map(); this.connections = new Set(); this.rates = new Map(); this.stats = null;
     // 公开直播：管理台自己的发布密钥 + 中转地址。缺一样就不开这个功能。
@@ -101,8 +103,15 @@ export class Classroom {
     const session = this.sessions.get(digest(token));
     if (!session || session.role !== role || session.expires < Date.now()) return null;
     if (role === 'student' && (!w || w.disabled || session.student !== w.id || session.generation !== w.generation)) return null;
+    if (session.device) { const now = Date.now(); if (session.expires - now < (DEVICE_DAYS - 1) * 86400000) this.renewDevice(session, now); }
     return session;
   }
+  // 设备会话：平板登录一次，滑动续期到 180 天；仍然每次请求按 stu 权限复查。持久化一天最多一次。
+  renewDevice(session, now = Date.now()) {
+    session.expires = now + DEVICE_DAYS * 86400000;
+    if (now - (this.persistedAt.get(session.key) || 0) > 86400000) { this.persistedAt.set(session.key, now); this.persistSessions(); }
+  }
+  deviceCookie(res, w, token) { res.setHeader('Set-Cookie', `dcw_student=${token}; Path=/w/${w.id}/; HttpOnly; SameSite=Strict; Max-Age=${DEVICE_DAYS * 86400}${this.secure ? '; Secure' : ''}`); }
   login(res, role, w, external) {
     const token = secret(), key = digest(token);
     const session = {key, role, student: w?.id, generation: w?.generation, expires: Date.now() + (role === 'admin' || external ? 8 * 3600000 : 7 * 86400000), ...(external ? {external} : {})};
@@ -335,6 +344,20 @@ export class Classroom {
     if (w.disabled) throw fail(403, '此链接已停用，请联系老师');
     if (sub === '') { res.writeHead(302, {Location: prefix + '/' + u.search}); return res.end(); }
     if (sub === '/login' && req.method === 'POST') { this.rate(req, w.id); const data = await body(req); if (typeof data.token !== 'string' || data.token.length !== 64 || !equal(data.token, w.token)) throw fail(401, '链接已失效，请向老师获取新链接'); this.login(res, 'student', w); return json(res, 200, {ok: true}); }
+    if (sub === '/_device/session' && req.method === 'POST') {
+      this.rate(req, 'device');
+      const current = this.authenticate(req, 'student', w); if (!current) throw fail(401, '请重新登录');
+      await this.sso.ensure(current);
+      const data = await body(req); if (data.client !== 'dc-android') throw fail(400, '请求无效');
+      let session = current, token = cookie(req, 'dcw_student');
+      if (current.device) this.renewDevice(current);
+      else {
+        token = secret(); session = {...current, key: digest(token), device: true, expires: Date.now() + DEVICE_DAYS * 86400000};
+        this.sessions.set(session.key, session); this.sessions.delete(current.key); this.persistedAt.set(session.key, Date.now()); this.persistSessions();
+      }
+      this.deviceCookie(res, w, token);
+      return json(res, 200, {ok: true, expiresAt: session.expires});
+    }
     const session = this.authenticate(req, 'student', w) || (w.shared ? this.legacyAuth(req, w) : null);
     if (!session) { if (sub === '/' && req.method === 'GET') return html(res, studentPage(prefix)); throw fail(401, '请重新打开老师发给你的完整链接'); }
     await this.sso.ensure(session);
