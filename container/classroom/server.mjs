@@ -82,8 +82,11 @@ export class Classroom {
       model: stt.model ?? process.env.CLASSROOM_STT_MODEL ?? 'whisper-1',
       language: stt.language ?? process.env.CLASSROOM_STT_LANGUAGE ?? 'zh',
     };
-    // 学生工作区空闲多久自动停（分钟）。
-    this.idleMs = (Number(idleMinutes ?? process.env.CLASSROOM_IDLE_MINUTES) || 20) * 60000;
+    // 学生工作区空闲多久自动停（分钟）。不是数字按 20；最少 5 分钟——
+    // 配成 1 的话学生起身倒杯水回来工作区就没了。
+    const rawMinutes = idleMinutes ?? process.env.CLASSROOM_IDLE_MINUTES;
+    const minutes = typeof rawMinutes === 'string' && !rawMinutes.trim() ? NaN : Number(rawMinutes);
+    this.idleMs = (Number.isFinite(minutes) ? Math.max(5, minutes) : 20) * 60000;
     this.activity = new Map(); this.reaping = false; this.stopping = new Set();
     this.store = store;
     this.driver = driver;
@@ -127,6 +130,13 @@ export class Classroom {
           const health = await this.readHealth(await this.driver.backend(w));
           if (!health || typeof health.activeTurns !== 'number' || typeof health.lastActivityAt !== 'number') continue;
           if (health.activeTurns > 0 || now - health.lastActivityAt < this.idleMs) continue;
+          // 网页终端里跑着的 agent（学生起了 claude 就关了页）和直播，云端 health
+          // 都看不见，要问容器里的 dct 守护进程。问不出来（抛错）就落到下面的
+          // catch，不停。
+          if (w.livePublic) continue;
+          const list = await this.driver.rpc(w, 'List');
+          if (!Array.isArray(list?.Sessions) || list.Sessions.some(x => x.state === 'Working' || x.state === 'Asking')) continue;
+          if (await this.liveStatus(w)) continue;
           const did = await this.store.mutate(async () => {
             // 读 health 的这段时间里有人来过，就算了。
             if (this.activity.get(w.id) !== seen || busy()) return false;
@@ -430,7 +440,9 @@ export class Classroom {
     if (!session) { if (sub === '/' && req.method === 'GET') return html(res, studentPage(prefix)); throw fail(401, '请重新打开老师发给你的完整链接'); }
     await this.sso.ensure(session);
     if (!(req.method === 'GET' && PASSIVE.test(sub.split('?')[0]))) this.activity.set(w.id, Date.now());
-    if (this.stopping.has(w.id) && sub.startsWith('/_dct/')) throw Object.assign(new Error('工作区在休息'), {code: 'workspace_stopped'});
+    // 转写由课堂服务自己接住、不进容器，停的时候也照样能用——孩子说的
+    // 那句话不该因为工作区在停就丢了。
+    if (this.stopping.has(w.id) && sub.startsWith('/_dct/') && sub !== '/_dct/transcribe') throw Object.assign(new Error('工作区在休息'), {code: 'workspace_stopped'});
     if (sub === '/finish' && req.method === 'POST' && !w.shared) {
       await body(req);
       return this.store.mutate(async () => {
@@ -641,7 +653,8 @@ export class Classroom {
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${lines.join('\r\n')}\r\n\r\n`);
       if (upHead.length) socket.write(upHead); if (head.length) up.write(head);
       const connection = {student: w.id, session, socket}; this.connections.add(connection);
-      socket.on('close', () => { this.connections.delete(connection); up.destroy(); });
+      // 关掉终端页算一次活动：从这一刻起再给满空闲时长，而不是按打开它的那次请求算。
+      socket.on('close', () => { this.connections.delete(connection); this.activity.set(w.id, Date.now()); up.destroy(); });
       socket.on('error', () => up.destroy()); up.on('error', () => socket.destroy()); up.on('close', () => socket.destroy());
       socket.pipe(up); up.pipe(socket);
     });

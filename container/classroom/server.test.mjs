@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import {createHash} from 'node:crypto';
 import {Store} from './store.mjs';
 import {Classroom} from './server.mjs';
@@ -791,6 +792,8 @@ async function idleFixture({status = 'running', shared = false} = {}) {
     }
     res.setHeader('Content-Type', 'application/json'); res.end('{}');
   });
+  // 终端 websocket：只回 101，够让课堂服务把连接接上。
+  backend.on('upgrade', (req, socket) => { socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'); socket.on('error', () => {}); socket.on('end', () => socket.end()); });
   await new Promise(r => backend.listen(0, '127.0.0.1', r));
   const port = backend.address().port;
   const store = new Store(dir, {password: 'test-admin'});
@@ -798,6 +801,14 @@ async function idleFixture({status = 'running', shared = false} = {}) {
   if (shared) ming.shared = true;
   const driver = {maxRunning: 2, status: async () => ({status: driver.state}), state: status, stops: 0, starts: 0,
     start: async () => { driver.starts++; }, stop: async () => { driver.stops++; },
+    // 容器里 dct 守护进程的会话和直播。默认：一个闲着的 claude，没在播。
+    sessions: [{id: 1, profile: 'claude', state: 'Idle'}], live: null, rpcFail: false,
+    rpc: async (_, request) => {
+      if (driver.rpcFail) throw new Error('无法读取运行会话，请稍后重试');
+      if (request === 'List') return {Sessions: driver.sessions};
+      if (request === 'LiveStatus') return {Live: driver.live};
+      return {};
+    },
     backend: async () => { if (driver.state !== 'running') throw Object.assign(new Error('工作区尚未启动'), {code: 'workspace_stopped'}); return {port, apiPort: port, token: 'GATE'}; }};
   const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
   await new Promise(r => app.server.listen(0, '127.0.0.1', r));
@@ -941,7 +952,7 @@ test('reapIdle 正在停的时候：请求得到 workspace_stopped，/start 等�
     f.driver.stop = async () => { f.driver.stops++; entered(); await gate; f.driver.state = 'stopped'; };
     const reaping = f.app.reapIdle(t0 + 30 * MIN);
     await inStop;
-    for (const p of ['/_dct/authoring/v1/projects/p/messages', '/_dct/transcribe']) {
+    for (const p of ['/_dct/authoring/v1/projects/p/messages']) {
       const r = await f.call(p, 'POST', {Origin: 'http://localhost'});
       assert.equal(r.status, 409, p);
       assert.deepEqual(await r.json(), {error: '工作区在休息', code: 'workspace_stopped'});
@@ -956,4 +967,94 @@ test('reapIdle 正在停的时候：请求得到 workspace_stopped，/start 等�
     assert.equal(f.driver.starts, 1);
     assert.equal(f.app.stopping.size, 0);
   } finally { await f.close(); }
+});
+
+test('reapIdle：终端里的 agent 在干活/在问、问不出会话、在直播、公开直播，都不停', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now(), later = t0 + 30 * MIN;
+    await f.app.reapIdle(t0);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const notStopped = async why => { assert.deepEqual(await f.app.reapIdle(later), [], why); assert.equal(f.driver.stops, 0, why); };
+    const idle = f.driver.sessions;
+    f.driver.sessions = [...idle, {id: 2, profile: 'claude', state: 'Working'}]; await notStopped('终端里的 claude 在干活');
+    f.driver.sessions = [{id: 2, profile: 'codex', state: 'Asking'}]; await notStopped('终端里的 agent 在等回答');
+    f.driver.sessions = idle;
+    f.driver.rpcFail = true; await notStopped('问不出会话'); f.driver.rpcFail = false;
+    f.driver.sessions = undefined; await notStopped('会话列表格式不对'); f.driver.sessions = idle;
+    f.driver.live = {id: 'room1', url: 'https://live.example/live/room1', viewers: 3}; await notStopped('正在直播'); f.driver.live = null;
+    f.ming.livePublic = {title: '我的作品', id: 'room1'}; await notStopped('公开直播'); delete f.ming.livePublic;
+    // 基线：全都闲着，停一次。
+    assert.deepEqual(await f.app.reapIdle(later), [f.ming.id]);
+    assert.equal(f.driver.stops, 1);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：关掉终端页算一次活动', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const {port} = f.app.server.address();
+    const socket = net.connect(port, '127.0.0.1');
+    const opened = new Promise((resolve, reject) => { let got = ''; socket.on('data', d => { got += d; if (got.includes('\r\n\r\n')) resolve(got); }); socket.on('error', reject); });
+    socket.write(`GET /w/${f.ming.id}/ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nCookie: ${f.cookie}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`);
+    assert.match(await opened, /^HTTP\/1.1 101/);
+    assert.equal(f.app.connections.size, 1);
+    const closedAt = Date.now();
+    socket.destroy();
+    for (let i = 0; i < 50 && f.app.connections.size; i++) await new Promise(r => setTimeout(r, 10));
+    assert.equal(f.app.connections.size, 0);
+    assert.ok(f.app.activity.get(f.ming.id) >= closedAt, '关掉终端刷新活动时间');
+    assert.deepEqual(await f.app.reapIdle(Date.now() + 10 * MIN), [], '刚关掉终端不停');
+    assert.equal(f.driver.stops, 0);
+  } finally { await f.close(); }
+});
+
+test('空闲分钟数：小于 5 按 5，不是数字按 20', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-idle-min-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const make = idleMinutes => new Classroom({store, driver: {status: async () => ({status: 'running'})}, origin: 'http://localhost', secure: false, idleMinutes});
+  const prev = process.env.CLASSROOM_IDLE_MINUTES;
+  const apps = [];
+  try {
+    for (const [given, want] of [[1, 5], [0, 5], [-3, 5], ['2', 5], [4.9, 5], [5, 5], [30, 30], ['abc', 20], [NaN, 20], ['', 20], [' ', 20]]) {
+      const app = make(given); apps.push(app);
+      assert.equal(app.idleMs, want * MIN, String(given));
+    }
+    process.env.CLASSROOM_IDLE_MINUTES = '2';
+    const env2 = make(undefined); apps.push(env2); assert.equal(env2.idleMs, 5 * MIN, 'env 2');
+    process.env.CLASSROOM_IDLE_MINUTES = 'soon';
+    const envBad = make(undefined); apps.push(envBad); assert.equal(envBad.idleMs, 20 * MIN, 'env 不是数字');
+  } finally {
+    if (prev === undefined) delete process.env.CLASSROOM_IDLE_MINUTES; else process.env.CLASSROOM_IDLE_MINUTES = prev;
+    for (const app of apps) await app.close();
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('reapIdle 正在停的时候：语音转写照样由课堂服务接住，发话仍然 workspace_stopped', async () => {
+  const gateway = http.createServer(async (req, res) => { for await (const _ of req); res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({text: '画一只猫'})); });
+  await new Promise(r => gateway.listen(0, '127.0.0.1', r));
+  const f = await idleFixture();
+  try {
+    f.app.stt = {...f.app.stt, url: `http://127.0.0.1:${gateway.address().port}`, key: 'K'};
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    let release; const gate = new Promise(r => { release = r; });
+    let entered; const inStop = new Promise(r => { entered = r; });
+    f.driver.stop = async () => { f.driver.stops++; entered(); await gate; f.driver.state = 'stopped'; };
+    const reaping = f.app.reapIdle(t0 + 30 * MIN);
+    await inStop;
+    const said = await fetch(`${f.origin}/w/${f.ming.id}/_dct/transcribe`, {method: 'POST', headers: {Cookie: f.cookie, 'Content-Type': 'audio/mp4'}, body: Buffer.alloc(64, 1)});
+    assert.equal(said.status, 200);
+    assert.deepEqual(await said.json(), {text: '画一只猫'});
+    const msg = await f.call('/_dct/authoring/v1/projects/p/messages', 'POST', {Origin: 'http://localhost'});
+    assert.equal(msg.status, 409);
+    assert.deepEqual(await msg.json(), {error: '工作区在休息', code: 'workspace_stopped'});
+    release();
+    assert.deepEqual(await reaping, [f.ming.id]);
+  } finally { await f.close(); gateway.close(); }
 });
