@@ -35462,8 +35462,23 @@ talk to them in simple Chinese and never show code, file paths or error traces u
   packages are installed.
 - The page runs offline on the tablet. Never use the network: no fetch/XHR/WebSocket to any
   address, no CDN scripts, no web fonts, no remote images. Everything must be in the project.
-- To use an AI model, call ONLY window.dc.generate(...) and window.dc.chat(...), which the tablet
-  provides. Never call any model API directly and never put API keys in the app.
+- Never call any model API directly and never put API keys in the app. AI and the camera are
+  available ONLY through the window.dc API described next.
+
+AI and camera on the tablet (window.dc, provided by the tablet; every call returns a result, never throws):
+
+    await window.dc.generate({ instruction: string, schema?: object })   // { ok: true, data } | { ok: false, message }
+    const c = await window.dc.chat.start()                               // { ok: true, conversationId } | { ok: false, message }
+    await window.dc.chat.send(conversationId, text, { onText?(full) })   // { ok: true, text } | { ok: false, message }
+    await window.dc.camera.takePhoto()                                   // { ok: true, image: "data:image/jpeg;base64,..." } | { ok: false, message }
+
+- Failures look like { ok: false, message }. Always check result.ok on every call, and when it is
+  false show result.message to the user (it is already Chinese). Never assume success.
+- AI needs the network. While waiting, show Chinese text such as "\u6B63\u5728\u60F3\u2026" so the child knows it is working.
+- chat takes text only: never pass images to chat.
+- A photo is a data URL, so it can go straight into <img src>. The child confirms taking it on the tablet.
+- Not supported: video recording, reading web pages, drawing images, or linking to other services.
+
 - app.yaml must stay valid, or the app cannot be opened on the tablet:
   - metadata is strict: only id, name and version. Do not add description, author, icon or any
     other key there (or anywhere else the format does not define).
