@@ -730,19 +730,51 @@ test('device session: one login, 180 day sliding session, still revocable', asyn
     assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
     // persistence throttled to once a day
     let saves = 0; const save = store.save.bind(store); store.save = () => { saves++; save(); };
-    s.expires = Date.now() + 10 * DAY; await probe(alice.id, newCookie); await probe(alice.id, newCookie);
-    assert.ok(saves <= 1);
+    app.persistedAt.set(s.key, Date.now()); s.expires = Date.now() + 10 * DAY; await probe(alice.id, newCookie); await probe(alice.id, newCookie);
+    assert.equal(saves, 0);
+    app.persistedAt.set(s.key, Date.now() - 2 * DAY); s.expires = Date.now() + 10 * DAY; await probe(alice.id, newCookie); await probe(alice.id, newCookie);
+    assert.equal(saves, 1);
+    assert.ok(store.data.sessions.find(x => x.key === s.key).expires > Date.now() + 179 * DAY);
+    store.save = save;
     // 5. revocation
     active = false;
-    assert.ok((await probe(alice.id, newCookie)).status >= 401);
+    assert.equal((await probe(alice.id, newCookie)).status, 401);
     active = true;
     assert.equal((await probe(alice.id, newCookie)).status, 200);
     app.revoke(alice);
     assert.equal((await probe(alice.id, newCookie)).status, 401);
     const c3 = (await (await call(dev(bob.id), {client: 'dc-android'}, bobCookie)).headers).get('set-cookie').split(';')[0];
     bob.disabled = true;
-    assert.ok((await probe(bob.id, c3)).status >= 401);
+    assert.equal((await probe(bob.id, c3)).status, 403);
     bob.disabled = false; bob.generation++;
     assert.equal((await probe(bob.id, c3)).status, 401);
+  } finally { await app.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('device session: per-workspace rate limit, SSO only, eviction keeps device sessions, persistedAt pruned', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-device2-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const ws = store.add(Array.from({length: 25}, (_, i) => 'S' + i));
+  const app = new Classroom({store, driver: {maxRunning: 2, status: async () => ({status: 'running'})}, origin: 'http://localhost', secure: false});
+  app.sso.permissions = async () => ({role: 'student', students: [], allowed: new Set()});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const call = (id, cookie) => fetch(`${origin}/w/${id}/_device/session`, {method: 'POST', headers: {'Content-Type': 'application/json', Cookie: cookie}, body: JSON.stringify({client: 'dc-android'})});
+  const login = (w, external) => { const res = {headers: {}, setHeader(k, v) { this.headers[k] = v; }}; app.login(res, 'student', w, external); return res.headers['Set-Cookie'].split(';')[0]; };
+  try {
+    for (const w of ws) assert.equal((await call(w.id, login(w, {issuer: 'classroom', tenant: 't', subject: w.id}))).status, 200);
+    const local = await call(ws[0].id, login(ws[0]));
+    assert.equal(local.status, 403); assert.equal((await local.json()).error, '请用学校账号登录后再试');
+    // eviction: non-device first, device last
+    const devKeys = [...app.sessions.values()].filter(x => x.device).map(x => x.key);
+    assert.equal(devKeys.length, 25);
+    for (let i = 0; i < 10000; i++) app.sessions.set('n' + i, {key: 'n' + i, role: 'student', student: 'x', generation: 1, expires: Date.now() + 1e9});
+    app.persistSessions();
+    assert.equal(app.sessions.size, 10000);
+    for (const k of devKeys) assert.ok(app.sessions.has(k));
+    assert.ok(!app.sessions.has('n0'));
+    // persistedAt pruned with deleted sessions
+    app.revoke(ws[0]);
+    for (const k of app.persistedAt.keys()) assert.ok(app.sessions.has(k));
   } finally { await app.close(); fs.rmSync(dir, {recursive: true, force: true}); }
 });

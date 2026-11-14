@@ -121,7 +121,10 @@ export class Classroom {
   }
   persistSessions() {
     const now = Date.now(); for (const [key, s] of this.sessions) if (s.expires < now) this.sessions.delete(key);
+    // 超限时先淘汰最老的非设备会话，设备会话只在没有别的可淘汰时才动。
+    if (this.sessions.size > 10000) for (const [key, s] of this.sessions) { if (this.sessions.size <= 10000) break; if (!s.device) this.sessions.delete(key); }
     while (this.sessions.size > 10000) this.sessions.delete(this.sessions.keys().next().value);
+    for (const key of this.persistedAt.keys()) if (!this.sessions.has(key)) this.persistedAt.delete(key);
     this.store.data.sessions = [...this.sessions.values()].slice(-10000); this.store.save();
   }
   revoke(w) {
@@ -345,11 +348,13 @@ export class Classroom {
     if (sub === '') { res.writeHead(302, {Location: prefix + '/' + u.search}); return res.end(); }
     if (sub === '/login' && req.method === 'POST') { this.rate(req, w.id); const data = await body(req); if (typeof data.token !== 'string' || data.token.length !== 64 || !equal(data.token, w.token)) throw fail(401, '链接已失效，请向老师获取新链接'); this.login(res, 'student', w); return json(res, 200, {ok: true}); }
     if (sub === '/_device/session' && req.method === 'POST') {
-      this.rate(req, 'device');
+      this.rate(req, 'device:' + w.id);
       const current = this.authenticate(req, 'student', w); if (!current) throw fail(401, '请重新登录');
+      if (!current.external) throw fail(403, '请用学校账号登录后再试');
       await this.sso.ensure(current);
       const data = await body(req); if (data.client !== 'dc-android') throw fail(400, '请求无效');
       let session = current, token = cookie(req, 'dcw_student');
+      // 续期发生在 ensure 之后；authenticate() 里的滑动续期先于 ensure，但每个请求仍会被 ensure 拒绝，不削弱撤销。
       if (current.device) this.renewDevice(current);
       else {
         token = secret(); session = {...current, key: digest(token), device: true, expires: Date.now() + DEVICE_DAYS * 86400000};
