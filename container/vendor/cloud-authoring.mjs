@@ -115,17 +115,17 @@ var require_visit = __commonJS({
     visit.BREAK = BREAK;
     visit.SKIP = SKIP;
     visit.REMOVE = REMOVE;
-    function visit_(key, node, visitor, path11) {
-      const ctrl = callVisitor(key, node, visitor, path11);
+    function visit_(key, node, visitor, path12) {
+      const ctrl = callVisitor(key, node, visitor, path12);
       if (identity.isNode(ctrl) || identity.isPair(ctrl)) {
-        replaceNode(key, path11, ctrl);
-        return visit_(key, ctrl, visitor, path11);
+        replaceNode(key, path12, ctrl);
+        return visit_(key, ctrl, visitor, path12);
       }
       if (typeof ctrl !== "symbol") {
         if (identity.isCollection(node)) {
-          path11 = Object.freeze(path11.concat(node));
+          path12 = Object.freeze(path12.concat(node));
           for (let i = 0; i < node.items.length; ++i) {
-            const ci = visit_(i, node.items[i], visitor, path11);
+            const ci = visit_(i, node.items[i], visitor, path12);
             if (typeof ci === "number")
               i = ci - 1;
             else if (ci === BREAK)
@@ -136,13 +136,13 @@ var require_visit = __commonJS({
             }
           }
         } else if (identity.isPair(node)) {
-          path11 = Object.freeze(path11.concat(node));
-          const ck = visit_("key", node.key, visitor, path11);
+          path12 = Object.freeze(path12.concat(node));
+          const ck = visit_("key", node.key, visitor, path12);
           if (ck === BREAK)
             return BREAK;
           else if (ck === REMOVE)
             node.key = null;
-          const cv = visit_("value", node.value, visitor, path11);
+          const cv = visit_("value", node.value, visitor, path12);
           if (cv === BREAK)
             return BREAK;
           else if (cv === REMOVE)
@@ -163,17 +163,17 @@ var require_visit = __commonJS({
     visitAsync.BREAK = BREAK;
     visitAsync.SKIP = SKIP;
     visitAsync.REMOVE = REMOVE;
-    async function visitAsync_(key, node, visitor, path11) {
-      const ctrl = await callVisitor(key, node, visitor, path11);
+    async function visitAsync_(key, node, visitor, path12) {
+      const ctrl = await callVisitor(key, node, visitor, path12);
       if (identity.isNode(ctrl) || identity.isPair(ctrl)) {
-        replaceNode(key, path11, ctrl);
-        return visitAsync_(key, ctrl, visitor, path11);
+        replaceNode(key, path12, ctrl);
+        return visitAsync_(key, ctrl, visitor, path12);
       }
       if (typeof ctrl !== "symbol") {
         if (identity.isCollection(node)) {
-          path11 = Object.freeze(path11.concat(node));
+          path12 = Object.freeze(path12.concat(node));
           for (let i = 0; i < node.items.length; ++i) {
-            const ci = await visitAsync_(i, node.items[i], visitor, path11);
+            const ci = await visitAsync_(i, node.items[i], visitor, path12);
             if (typeof ci === "number")
               i = ci - 1;
             else if (ci === BREAK)
@@ -184,13 +184,13 @@ var require_visit = __commonJS({
             }
           }
         } else if (identity.isPair(node)) {
-          path11 = Object.freeze(path11.concat(node));
-          const ck = await visitAsync_("key", node.key, visitor, path11);
+          path12 = Object.freeze(path12.concat(node));
+          const ck = await visitAsync_("key", node.key, visitor, path12);
           if (ck === BREAK)
             return BREAK;
           else if (ck === REMOVE)
             node.key = null;
-          const cv = await visitAsync_("value", node.value, visitor, path11);
+          const cv = await visitAsync_("value", node.value, visitor, path12);
           if (cv === BREAK)
             return BREAK;
           else if (cv === REMOVE)
@@ -217,23 +217,23 @@ var require_visit = __commonJS({
       }
       return visitor;
     }
-    function callVisitor(key, node, visitor, path11) {
+    function callVisitor(key, node, visitor, path12) {
       if (typeof visitor === "function")
-        return visitor(key, node, path11);
+        return visitor(key, node, path12);
       if (identity.isMap(node))
-        return visitor.Map?.(key, node, path11);
+        return visitor.Map?.(key, node, path12);
       if (identity.isSeq(node))
-        return visitor.Seq?.(key, node, path11);
+        return visitor.Seq?.(key, node, path12);
       if (identity.isPair(node))
-        return visitor.Pair?.(key, node, path11);
+        return visitor.Pair?.(key, node, path12);
       if (identity.isScalar(node))
-        return visitor.Scalar?.(key, node, path11);
+        return visitor.Scalar?.(key, node, path12);
       if (identity.isAlias(node))
-        return visitor.Alias?.(key, node, path11);
+        return visitor.Alias?.(key, node, path12);
       return void 0;
     }
-    function replaceNode(key, path11, node) {
-      const parent = path11[path11.length - 1];
+    function replaceNode(key, path12, node) {
+      const parent = path12[path12.length - 1];
       if (identity.isCollection(parent)) {
         parent.items[key] = node;
       } else if (identity.isPair(parent)) {
@@ -841,10 +841,10 @@ var require_Collection = __commonJS({
     var createNode = require_createNode();
     var identity = require_identity();
     var Node = require_Node();
-    function collectionFromPath(schema, path11, value) {
+    function collectionFromPath(schema, path12, value) {
       let v = value;
-      for (let i = path11.length - 1; i >= 0; --i) {
-        const k = path11[i];
+      for (let i = path12.length - 1; i >= 0; --i) {
+        const k = path12[i];
         if (typeof k === "number" && Number.isInteger(k) && k >= 0) {
           const a = [];
           a[k] = v;
@@ -863,7 +863,7 @@ var require_Collection = __commonJS({
         sourceObjects: /* @__PURE__ */ new Map()
       });
     }
-    var isEmptyPath = (path11) => path11 == null || typeof path11 === "object" && !!path11[Symbol.iterator]().next().done;
+    var isEmptyPath = (path12) => path12 == null || typeof path12 === "object" && !!path12[Symbol.iterator]().next().done;
     var Collection = class extends Node.NodeBase {
       constructor(type, schema) {
         super(type);
@@ -893,11 +893,11 @@ var require_Collection = __commonJS({
        * be a Pair instance or a `{ key, value }` object, which may not have a key
        * that already exists in the map.
        */
-      addIn(path11, value) {
-        if (isEmptyPath(path11))
+      addIn(path12, value) {
+        if (isEmptyPath(path12))
           this.add(value);
         else {
-          const [key, ...rest] = path11;
+          const [key, ...rest] = path12;
           const node = this.get(key, true);
           if (identity.isCollection(node))
             node.addIn(rest, value);
@@ -911,8 +911,8 @@ var require_Collection = __commonJS({
        * Removes a value from the collection.
        * @returns `true` if the item was found and removed.
        */
-      deleteIn(path11) {
-        const [key, ...rest] = path11;
+      deleteIn(path12) {
+        const [key, ...rest] = path12;
         if (rest.length === 0)
           return this.delete(key);
         const node = this.get(key, true);
@@ -926,8 +926,8 @@ var require_Collection = __commonJS({
        * scalar values from their surrounding node; to disable set `keepScalar` to
        * `true` (collections are always returned intact).
        */
-      getIn(path11, keepScalar) {
-        const [key, ...rest] = path11;
+      getIn(path12, keepScalar) {
+        const [key, ...rest] = path12;
         const node = this.get(key, true);
         if (rest.length === 0)
           return !keepScalar && identity.isScalar(node) ? node.value : node;
@@ -945,8 +945,8 @@ var require_Collection = __commonJS({
       /**
        * Checks if the collection includes a value with the key `key`.
        */
-      hasIn(path11) {
-        const [key, ...rest] = path11;
+      hasIn(path12) {
+        const [key, ...rest] = path12;
         if (rest.length === 0)
           return this.has(key);
         const node = this.get(key, true);
@@ -956,8 +956,8 @@ var require_Collection = __commonJS({
        * Sets a value in this collection. For `!!set`, `value` needs to be a
        * boolean to add/remove the item from the set.
        */
-      setIn(path11, value) {
-        const [key, ...rest] = path11;
+      setIn(path12, value) {
+        const [key, ...rest] = path12;
         if (rest.length === 0) {
           this.set(key, value);
         } else {
@@ -3461,9 +3461,9 @@ var require_Document = __commonJS({
           this.contents.add(value);
       }
       /** Adds a value to the document. */
-      addIn(path11, value) {
+      addIn(path12, value) {
         if (assertCollection(this.contents))
-          this.contents.addIn(path11, value);
+          this.contents.addIn(path12, value);
       }
       /**
        * Create a new `Alias` node, ensuring that the target `node` has the required anchor.
@@ -3538,14 +3538,14 @@ var require_Document = __commonJS({
        * Removes a value from the document.
        * @returns `true` if the item was found and removed.
        */
-      deleteIn(path11) {
-        if (Collection.isEmptyPath(path11)) {
+      deleteIn(path12) {
+        if (Collection.isEmptyPath(path12)) {
           if (this.contents == null)
             return false;
           this.contents = null;
           return true;
         }
-        return assertCollection(this.contents) ? this.contents.deleteIn(path11) : false;
+        return assertCollection(this.contents) ? this.contents.deleteIn(path12) : false;
       }
       /**
        * Returns item at `key`, or `undefined` if not found. By default unwraps
@@ -3560,10 +3560,10 @@ var require_Document = __commonJS({
        * scalar values from their surrounding node; to disable set `keepScalar` to
        * `true` (collections are always returned intact).
        */
-      getIn(path11, keepScalar) {
-        if (Collection.isEmptyPath(path11))
+      getIn(path12, keepScalar) {
+        if (Collection.isEmptyPath(path12))
           return !keepScalar && identity.isScalar(this.contents) ? this.contents.value : this.contents;
-        return identity.isCollection(this.contents) ? this.contents.getIn(path11, keepScalar) : void 0;
+        return identity.isCollection(this.contents) ? this.contents.getIn(path12, keepScalar) : void 0;
       }
       /**
        * Checks if the document includes a value with the key `key`.
@@ -3574,10 +3574,10 @@ var require_Document = __commonJS({
       /**
        * Checks if the document includes a value at `path`.
        */
-      hasIn(path11) {
-        if (Collection.isEmptyPath(path11))
+      hasIn(path12) {
+        if (Collection.isEmptyPath(path12))
           return this.contents !== void 0;
-        return identity.isCollection(this.contents) ? this.contents.hasIn(path11) : false;
+        return identity.isCollection(this.contents) ? this.contents.hasIn(path12) : false;
       }
       /**
        * Sets a value in this document. For `!!set`, `value` needs to be a
@@ -3594,13 +3594,13 @@ var require_Document = __commonJS({
        * Sets a value in this document. For `!!set`, `value` needs to be a
        * boolean to add/remove the item from the set.
        */
-      setIn(path11, value) {
-        if (Collection.isEmptyPath(path11)) {
+      setIn(path12, value) {
+        if (Collection.isEmptyPath(path12)) {
           this.contents = value;
         } else if (this.contents == null) {
-          this.contents = Collection.collectionFromPath(this.schema, Array.from(path11), value);
+          this.contents = Collection.collectionFromPath(this.schema, Array.from(path12), value);
         } else if (assertCollection(this.contents)) {
-          this.contents.setIn(path11, value);
+          this.contents.setIn(path12, value);
         }
       }
       /**
@@ -5552,9 +5552,9 @@ var require_cst_visit = __commonJS({
     visit.BREAK = BREAK;
     visit.SKIP = SKIP;
     visit.REMOVE = REMOVE;
-    visit.itemAtPath = (cst, path11) => {
+    visit.itemAtPath = (cst, path12) => {
       let item = cst;
-      for (const [field, index] of path11) {
+      for (const [field, index] of path12) {
         const tok = item?.[field];
         if (tok && "items" in tok) {
           item = tok.items[index];
@@ -5563,23 +5563,23 @@ var require_cst_visit = __commonJS({
       }
       return item;
     };
-    visit.parentCollection = (cst, path11) => {
-      const parent = visit.itemAtPath(cst, path11.slice(0, -1));
-      const field = path11[path11.length - 1][0];
+    visit.parentCollection = (cst, path12) => {
+      const parent = visit.itemAtPath(cst, path12.slice(0, -1));
+      const field = path12[path12.length - 1][0];
       const coll = parent?.[field];
       if (coll && "items" in coll)
         return coll;
       throw new Error("Parent collection not found");
     };
-    function _visit(path11, item, visitor) {
-      let ctrl = visitor(item, path11);
+    function _visit(path12, item, visitor) {
+      let ctrl = visitor(item, path12);
       if (typeof ctrl === "symbol")
         return ctrl;
       for (const field of ["key", "value"]) {
         const token = item[field];
         if (token && "items" in token) {
           for (let i = 0; i < token.items.length; ++i) {
-            const ci = _visit(Object.freeze(path11.concat([[field, i]])), token.items[i], visitor);
+            const ci = _visit(Object.freeze(path12.concat([[field, i]])), token.items[i], visitor);
             if (typeof ci === "number")
               i = ci - 1;
             else if (ci === BREAK)
@@ -5590,10 +5590,10 @@ var require_cst_visit = __commonJS({
             }
           }
           if (typeof ctrl === "function" && field === "key")
-            ctrl = ctrl(item, path11);
+            ctrl = ctrl(item, path12);
         }
       }
-      return typeof ctrl === "function" ? ctrl(item, path11) : ctrl;
+      return typeof ctrl === "function" ? ctrl(item, path12) : ctrl;
     }
     exports.visit = visit;
   }
@@ -10600,8 +10600,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path11) {
-      let input = path11;
+    function removeDotSegments(path12) {
+      let input = path12;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -10853,8 +10853,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path11, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path11 && path11 !== "/" ? path11 : void 0;
+        const [path12, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path12 && path12 !== "/" ? path12 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -14379,12 +14379,12 @@ var init_codex_home = __esm({
 
 // services/cloud-authoring/src/main.ts
 import os from "node:os";
-import path10 from "node:path";
+import path11 from "node:path";
 
 // services/cloud-authoring/src/server.ts
-import { readFile as readFile8, stat as stat3 } from "node:fs/promises";
+import { readFile as readFile9, stat as stat4 } from "node:fs/promises";
 import { createServer } from "node:http";
-import path9 from "node:path";
+import path10 from "node:path";
 
 // packages/authoring-session/src/authoring-session.ts
 import { randomBytes } from "node:crypto";
@@ -19716,10 +19716,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path11) {
-  if (!path11)
+function getElementAtPath(obj, path12) {
+  if (!path12)
     return obj;
-  return path11.reduce((acc, key) => acc?.[key], obj);
+  return path12.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -20056,11 +20056,11 @@ function aborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path11, issues) {
+function prefixIssues(path12, issues) {
   return issues.map((iss) => {
     var _a;
     (_a = iss).path ?? (_a.path = []);
-    iss.path.unshift(path11);
+    iss.path.unshift(path12);
     return iss;
   });
 }
@@ -20191,7 +20191,7 @@ function treeifyError(error43, _mapper) {
     return issue2.message;
   };
   const result = { errors: [] };
-  const processError = (error44, path11 = []) => {
+  const processError = (error44, path12 = []) => {
     var _a, _b;
     for (const issue2 of error44.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
@@ -20201,7 +20201,7 @@ function treeifyError(error43, _mapper) {
       } else if (issue2.code === "invalid_element") {
         processError({ issues: issue2.issues }, issue2.path);
       } else {
-        const fullpath = [...path11, ...issue2.path];
+        const fullpath = [...path12, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -20233,8 +20233,8 @@ function treeifyError(error43, _mapper) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path11 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path11) {
+  const path12 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path12) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -30750,6 +30750,8 @@ var smartAppSchema = external_exports.object({
       version: external_exports.string().trim().min(1).max(64)
     }).strict()
   ).optional(),
+  /** 平板上这个 App 可以用摄像头做什么：拍照、录像。没写就按老规矩（只能拍照）。 */
+  camera: external_exports.array(external_exports.enum(["photo", "video"])).min(1).optional(),
   intelligence: intelligenceSchema.optional()
 }).strict().superRefine((app, ctx) => {
   const roles = /* @__PURE__ */ new Set();
@@ -30791,6 +30793,13 @@ var smartAppSchema = external_exports.object({
       ctx.addIssue({ code: "custom", path: ["plugins", index], message: `Duplicate plugin: ${plugin.name}` });
     }
     pluginNames.add(plugin.name);
+  }
+  const cameraKinds = /* @__PURE__ */ new Set();
+  for (const [index, kind] of (app.camera ?? []).entries()) {
+    if (cameraKinds.has(kind)) {
+      ctx.addIssue({ code: "custom", path: ["camera", index], message: `Duplicate camera kind: ${kind}` });
+    }
+    cameraKinds.add(kind);
   }
 });
 var agentSchema = external_exports.object({
@@ -31601,6 +31610,7 @@ function isExcluded(relativePath, directory) {
   if (parts[0] === ".dc" && (parts[1] === "checkpoints" || parts[1]?.startsWith("checkpoints."))) {
     return true;
   }
+  if (parts[0] === ".dc" && parts[1] === "materials") return true;
   if (parts.some((part) => EXCLUDED_DIRECTORY_NAMES.has(part))) return true;
   if (directory) return false;
   const name = parts.at(-1)?.toLowerCase() ?? "";
@@ -34401,12 +34411,12 @@ import path4 from "node:path";
 import { readFile as readFile4, readdir as readdir3 } from "node:fs/promises";
 import { join } from "node:path";
 var import_yaml2 = __toESM(require_dist(), 1);
-async function readYaml(path11) {
+async function readYaml(path12) {
   try {
-    return (0, import_yaml2.parse)(await readFile4(path11, "utf8"));
+    return (0, import_yaml2.parse)(await readFile4(path12, "utf8"));
   } catch (error43) {
     if (error43.code === "ENOENT") {
-      throw new Error(`Smart App declaration not found: ${path11}`);
+      throw new Error(`Smart App declaration not found: ${path12}`);
     }
     throw error43;
   }
@@ -34423,7 +34433,7 @@ async function loadSmartAppProject(root2) {
   const app = parseSmartApp(await readYaml(join(root2, "app.yaml")));
   const agents = await Promise.all(
     (await yamlFiles(join(root2, "agents"))).map(
-      async (path11) => parseAgent(await readYaml(path11))
+      async (path12) => parseAgent(await readYaml(path12))
     )
   );
   const agent = agents.find(
@@ -34434,12 +34444,12 @@ async function loadSmartAppProject(root2) {
   }
   const tools = await Promise.all(
     (await yamlFiles(join(root2, "tools"))).map(
-      async (path11) => parseTool(await readYaml(path11))
+      async (path12) => parseTool(await readYaml(path12))
     )
   );
   const policies = await Promise.all(
     (await yamlFiles(join(root2, "policies"))).map(
-      async (path11) => parsePolicy(await readYaml(path11))
+      async (path12) => parsePolicy(await readYaml(path12))
     )
   );
   return { root: root2, app, agent, tools, policies };
@@ -34512,7 +34522,8 @@ async function bundleAppPage(projectRoot) {
     name,
     version: project.app.metadata.version,
     html,
-    bytes: Buffer.byteLength(html)
+    bytes: Buffer.byteLength(html),
+    ...project.app.camera ? { camera: [...project.app.camera] } : {}
   };
 }
 
@@ -35496,6 +35507,8 @@ a result and never throws:
     const c = await window.dc.chat.start()                               // { ok: true, conversationId } | { ok: false, message }
     await window.dc.chat.send(conversationId, text, { onText?(full) })   // { ok: true, text } | { ok: false, message }
     await window.dc.camera.takePhoto()                                   // { ok: true, image: "data:image/jpeg;base64,..." } | { ok: false, message }
+    await window.dc.camera.recordVideo()                                 // { ok: true, video: "https://\u2026/dc-media/<id>.mp4", seconds } | { ok: false, message }
+    await window.dc.camera.deleteVideo(url)                              // { ok: true } | { ok: false, message }
 
 For example:
 
@@ -35518,8 +35531,22 @@ For example:
   the page loads and never again by itself after a failure.
   A cancelled photo returns { ok: false, message }. A photo is a data URL, so it can go straight
   into <img src>. The child confirms taking it on the tablet.
+- An app that uses the camera MUST declare it at the top level of app.yaml: camera: [photo] to
+  take photos, camera: [video] to record video, camera: [photo, video] for both. Without the
+  declaration the app can only take photos, never record video.
+- recordVideo, like takePhoto, may only be called from a button the child taps. It returns an
+  address that can go straight into <video src="..." controls playsinline></video>, or be kept in
+  localStorage and shown later. Delete a video the app no longer wants with deleteVideo(url).
+  One app keeps at most 20 videos. Chat still takes text only.
 - Do not assign to window.dc and do not mock it; it is always there on the tablet.
-- Not supported: video recording, reading web pages, drawing images, or linking to other services.
+- Not supported: reading web pages, drawing images, or linking to other services.
+
+THE CHILD'S PICTURES AND VIDEOS
+
+The pictures and the notes about videos the child gave in each round are saved in
+.dc/materials/<round>/ (notes.json and the images). When the child mentions "that picture" or
+"that video from just now", look there. To use the child's picture inside the app, copy it into
+the project's source folder and reference it from there; never reference .dc/materials from the app.
 `;
 
 // services/cloud-authoring/src/engine.ts
@@ -35634,10 +35661,112 @@ function createEventLog(capacity = 500) {
   };
 }
 
+// services/cloud-authoring/src/materials.ts
+import { createHash as createHash2 } from "node:crypto";
+import { mkdir as mkdir7, readdir as readdir5, readFile as readFile7, rm as rm5, stat as stat2, writeFile as writeFile6 } from "node:fs/promises";
+import path8 from "node:path";
+var DEFAULT_MATERIALS_LIMIT = 200 * 1024 * 1024;
+var MAX_TRANSCRIPT = 4e3;
+var MAX_KEPT = 48;
+var EXTENSION = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif"
+};
+function parseVideo(value, imageCount) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "bad";
+  const raw = value;
+  for (const key of Object.keys(raw)) if (!["seconds", "frames", "heard", "transcript"].includes(key)) return "bad";
+  const { seconds, frames, heard, transcript } = raw;
+  if (typeof seconds !== "number" || !Number.isInteger(seconds) || seconds < 1 || seconds > 600) return "bad";
+  if (typeof frames !== "number" || !Number.isInteger(frames) || frames < 1 || frames > 6 || frames > imageCount) return "bad";
+  if (heard !== "ok" && heard !== "none" && heard !== "failed") return "bad";
+  if (transcript !== void 0 && (typeof transcript !== "string" || transcript.length > MAX_TRANSCRIPT)) return "bad";
+  if (heard === "ok") {
+    if (typeof transcript !== "string" || transcript.trim() === "") return "bad";
+    return { seconds, frames, heard, transcript };
+  }
+  return { seconds, frames, heard };
+}
+function materialsFolder(requestId) {
+  const hash = createHash2("sha256").update(requestId).digest("hex").slice(0, 8);
+  const kept = requestId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, MAX_KEPT);
+  return kept === "" ? hash : `${kept}-${hash}`;
+}
+function videoNote(video, imageCount, materialsDir) {
+  const times = Array.from({ length: video.frames }, (_, i) => `${Math.round((i + 0.5) * video.seconds / video.frames)}s`);
+  const first = imageCount - video.frames + 1;
+  const where = video.frames === imageCount ? `the last ${video.frames} images` : `the last ${video.frames} images (images ${first}-${imageCount})`;
+  const lines = [
+    `[Note from the app: the child attached a ${video.seconds}-second video. It reaches you as ${where}, frames taken at ${times.join(", ")} into the video, in order.`
+  ];
+  if (video.heard === "ok") lines.push(`What was said in the video (transcribed): "${video.transcript ?? ""}"`);
+  else if (video.heard === "none") lines.push("No one spoke in the video.");
+  else lines.push("What was said in the video could not be made out.");
+  lines.push(`This turn's materials are saved in ${materialsDir} (notes.json and the images).]`);
+  return `${lines.join("\n")}
+
+`;
+}
+async function saveMaterials(input) {
+  const dir = path8.join(input.projectPath, ".dc", "materials", input.folder);
+  try {
+    await stat2(path8.join(dir, "notes.json"));
+    return;
+  } catch {
+  }
+  await mkdir7(dir, { recursive: true });
+  const names = [];
+  for (const [index, image] of (input.images ?? []).entries()) {
+    const name = `image-${index + 1}.${EXTENSION[image.mime] ?? "bin"}`;
+    await writeFile6(path8.join(dir, name), Buffer.from(image.base64, "base64"));
+    names.push(name);
+  }
+  await writeJsonAtomic(path8.join(dir, "notes.json"), {
+    at: input.at,
+    text: input.text,
+    images: names,
+    ...input.video === void 0 ? {} : { video: input.video }
+  });
+}
+async function sizeOf(dir) {
+  let total = 0;
+  for (const entry of await readdir5(dir, { withFileTypes: true }).catch(() => [])) {
+    const full = path8.join(dir, entry.name);
+    if (entry.isDirectory()) total += await sizeOf(full);
+    else total += (await stat2(full).catch(() => void 0))?.size ?? 0;
+  }
+  return total;
+}
+async function pruneMaterials(projectPath, keep, limitBytes) {
+  const root2 = path8.join(projectPath, ".dc", "materials");
+  const rounds = [];
+  for (const entry of await readdir5(root2, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory()) continue;
+    const dir = path8.join(root2, entry.name);
+    let at = 0;
+    try {
+      const parsed = Date.parse(String(JSON.parse(await readFile7(path8.join(dir, "notes.json"), "utf8")).at));
+      if (Number.isFinite(parsed)) at = parsed;
+    } catch {
+    }
+    rounds.push({ name: entry.name, at, size: await sizeOf(dir) });
+  }
+  let total = rounds.reduce((sum, one) => sum + one.size, 0);
+  for (const round of rounds.sort((a, b) => a.at - b.at || a.name.localeCompare(b.name))) {
+    if (total <= limitBytes) return;
+    if (round.name === keep) continue;
+    await rm5(path8.join(root2, round.name), { recursive: true, force: true });
+    total -= round.size;
+  }
+}
+
 // services/cloud-authoring/src/projects.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdir as mkdir7, readdir as readdir5, readFile as readFile7, realpath as realpath3, rename as rename5, rm as rm5, stat as stat2, writeFile as writeFile6 } from "node:fs/promises";
-import path8 from "node:path";
+import { mkdir as mkdir8, readdir as readdir6, readFile as readFile8, realpath as realpath3, rename as rename5, rm as rm6, stat as stat3, writeFile as writeFile7 } from "node:fs/promises";
+import path9 from "node:path";
 var import_yaml3 = __toESM(require_dist(), 1);
 var ID_PATTERN = /^[a-z0-9-]{1,64}$/;
 var MAX_REQUESTS = 200;
@@ -35645,13 +35774,13 @@ var REQUESTS_FILE = ".requests.json";
 async function createProjectRoom(root2, deps = {}) {
   const now = deps.now ?? (() => /* @__PURE__ */ new Date());
   const newId2 = deps.newId ?? (() => `p-${randomUUID3().replaceAll("-", "").slice(0, 16)}`);
-  await mkdir7(root2, { recursive: true });
+  await mkdir8(root2, { recursive: true });
   const realRoot = await realpath3(root2);
-  const requestsPath = path8.join(realRoot, REQUESTS_FILE);
+  const requestsPath = path9.join(realRoot, REQUESTS_FILE);
   async function readRequests() {
     let text;
     try {
-      text = await readFile7(requestsPath, "utf8");
+      text = await readFile8(requestsPath, "utf8");
     } catch (error43) {
       if (error43.code === "ENOENT") return [];
       throw error43;
@@ -35666,15 +35795,15 @@ async function createProjectRoom(root2, deps = {}) {
   }
   async function writeRequests(records) {
     const tmp = `${requestsPath}.tmp`;
-    await writeFile6(tmp, JSON.stringify(records.slice(-MAX_REQUESTS)), "utf8");
+    await writeFile7(tmp, JSON.stringify(records.slice(-MAX_REQUESTS)), "utf8");
     await rename5(tmp, requestsPath);
   }
   async function resolveDir(id) {
     if (!ID_PATTERN.test(id)) return void 0;
     try {
-      const real = await realpath3(path8.join(realRoot, id));
-      if (path8.dirname(real) !== realRoot) return void 0;
-      if (!(await stat2(real)).isDirectory()) return void 0;
+      const real = await realpath3(path9.join(realRoot, id));
+      if (path9.dirname(real) !== realRoot) return void 0;
+      if (!(await stat3(real)).isDirectory()) return void 0;
       return real;
     } catch {
       return void 0;
@@ -35682,7 +35811,7 @@ async function createProjectRoom(root2, deps = {}) {
   }
   async function nameOf2(dir, fallback) {
     try {
-      const manifest = (0, import_yaml3.parse)(await readFile7(path8.join(dir, "app.yaml"), "utf8"));
+      const manifest = (0, import_yaml3.parse)(await readFile8(path9.join(dir, "app.yaml"), "utf8"));
       const name = manifest?.metadata?.name;
       return typeof name === "string" && name !== "" ? name : fallback;
     } catch {
@@ -35714,13 +35843,13 @@ async function createProjectRoom(root2, deps = {}) {
       while (await resolveDir(id)) id = newId2();
       await writeRequests([...records, { requestId: input.requestId, id, name: input.name.trim() }]);
     }
-    const staging = path8.join(realRoot, `.tmp-${randomUUID3()}`);
-    await mkdir7(staging);
+    const staging = path9.join(realRoot, `.tmp-${randomUUID3()}`);
+    await mkdir8(staging);
     try {
       await scaffoldBlankProject(staging, input.name, "zh-CN");
-      await rename5(staging, path8.join(realRoot, id));
+      await rename5(staging, path9.join(realRoot, id));
     } catch (error43) {
-      await rm5(staging, { recursive: true, force: true });
+      await rm6(staging, { recursive: true, force: true });
       throw error43;
     }
     const name = prior?.name ?? input.name.trim();
@@ -35731,13 +35860,13 @@ async function createProjectRoom(root2, deps = {}) {
     get,
     async list() {
       const out = [];
-      for (const entry of await readdir5(realRoot, { withFileTypes: true })) {
+      for (const entry of await readdir6(realRoot, { withFileTypes: true })) {
         if (!ID_PATTERN.test(entry.name)) continue;
         const dir = await resolveDir(entry.name);
         if (dir === void 0) continue;
-        let mtime = (await stat2(dir)).mtimeMs;
+        let mtime = (await stat3(dir)).mtimeMs;
         try {
-          mtime = Math.max(mtime, (await stat2(path8.join(dir, "app.yaml"))).mtimeMs);
+          mtime = Math.max(mtime, (await stat3(path9.join(dir, "app.yaml"))).mtimeMs);
         } catch {
         }
         out.push({ id: entry.name, name: await nameOf2(dir, entry.name), updatedAt: new Date(mtime).toISOString() });
@@ -35791,6 +35920,9 @@ async function createCloudAuthoringServer(opts) {
   const currentUserAt = /* @__PURE__ */ new Map();
   const projectPaths = /* @__PURE__ */ new Map();
   let closing = false;
+  let lastActivityAt = Date.now();
+  const shown = /* @__PURE__ */ new Map();
+  const materialsLimit = opts.materialsLimitBytes ?? DEFAULT_MATERIALS_LIMIT;
   const locks = /* @__PURE__ */ new Map();
   function serial(projectId, task) {
     const previous = locks.get(projectId) ?? Promise.resolve();
@@ -35809,7 +35941,7 @@ async function createCloudAuthoringServer(opts) {
       const list = await readList(projectPath, "turns.json");
       const index = list.findIndex((one) => one.at === at);
       const next = index === -1 ? [...list, { at, ...patch }] : list.map((one, i) => i === index ? { ...one, ...patch } : one);
-      await writeJsonAtomic(path9.join(projectPath, ".dc", "turns.json"), next.slice(-MAX_OUTCOMES));
+      await writeJsonAtomic(path10.join(projectPath, ".dc", "turns.json"), next.slice(-MAX_OUTCOMES));
     }).catch(() => void 0);
   }
   function recordTurn(event) {
@@ -35843,8 +35975,12 @@ async function createCloudAuthoringServer(opts) {
     said: async (project, turn) => {
       if (turn.kind === "user") {
         currentUserAt.set(project.id, turn.at);
+        const pending = shown.get(project.id);
+        const own = pending !== void 0 && pending.full === turn.text ? pending : void 0;
+        if (own !== void 0) shown.delete(project.id);
+        if (own?.video !== void 0) updateTurnRecord(project.id, turn.at, { video: own.video });
         await recordUserTurn(project.path, {
-          text: turn.text,
+          text: own?.text ?? turn.text,
           at: turn.at,
           ...turn.imageCount === void 0 ? {} : { imageCount: turn.imageCount }
         });
@@ -35853,6 +35989,7 @@ async function createCloudAuthoringServer(opts) {
       }
     },
     emit: (event) => {
+      if (event.type === "turn_started" || event.type === "turn_done" || event.type === "turn_failed") lastActivityAt = Date.now();
       events.append(event);
       recordTurn(event);
     },
@@ -35863,7 +36000,7 @@ async function createCloudAuthoringServer(opts) {
     return serial(input.projectId, async () => {
       const project = await room.get(input.projectId);
       if (project === void 0) throw NO_PROJECT();
-      const file2 = path9.join(project.path, ".dc", "requests.json");
+      const file2 = path10.join(project.path, ".dc", "requests.json");
       const records = await readList(project.path, "requests.json");
       const prior = records.find((one) => one.requestId === input.requestId);
       if (prior !== void 0) {
@@ -35875,15 +36012,33 @@ async function createCloudAuthoringServer(opts) {
       if (sessions.state(input.projectId).busy) throw BUSY();
       if (input.checkLogin && !await aiReady()) throw NOT_READY_AI();
       const others = records.filter((one) => one.requestId !== input.requestId);
+      const folder = materialsFolder(input.requestId);
+      await saveMaterials({
+        projectPath: project.path,
+        folder,
+        text: input.text,
+        at: (/* @__PURE__ */ new Date()).toISOString(),
+        images: input.images,
+        video: input.video
+      }).then(() => pruneMaterials(project.path, folder, materialsLimit)).catch(() => void 0);
+      const full = input.video === void 0 ? input.text : videoNote(input.video, input.images?.length ?? 0, `.dc/materials/${folder}/`) + input.text;
+      if (full !== input.text) {
+        shown.set(input.projectId, {
+          full,
+          text: input.text,
+          ...input.video === void 0 ? {} : { video: { seconds: input.video.seconds } }
+        });
+      }
       await writeRecords(file2, [...others, { requestId: input.requestId, pending: true }].slice(-MAX_REQUESTS2));
       let turnId;
       try {
         ({ turnId } = await sessions.send({
           projectId: input.projectId,
-          text: input.text,
+          text: full,
           ...input.images === void 0 ? {} : { images: input.images }
         }));
       } catch (error43) {
+        shown.delete(input.projectId);
         await writeRecords(file2, others.slice(-MAX_REQUESTS2)).catch(() => void 0);
         throw error43;
       }
@@ -35907,7 +36062,8 @@ async function createCloudAuthoringServer(opts) {
           text: turn.text,
           at: turn.at,
           ...turn.imageCount === void 0 ? {} : { imageCount: turn.imageCount },
-          ...typeof checkpointId === "string" ? { checkpointId } : {}
+          ...typeof checkpointId === "string" ? { checkpointId } : {},
+          ...records.get(turn.at)?.video === void 0 ? {} : { video: records.get(turn.at).video }
         });
       } else if (turn.kind === "answer") {
         turns.push({ kind: "answer", text: turn.text, at: turn.at });
@@ -35970,9 +36126,12 @@ data: ${JSON.stringify(numbered.event)}
     const parts = url2.pathname.slice(PREFIX2.length + 1).split("/");
     if (parts[0] !== "v1") throw NOT_FOUND();
     const method = request.method ?? "GET";
+    if (method !== "GET") lastActivityAt = Date.now();
     const route = parts.slice(1);
     if (method === "GET" && route.length === 1 && route[0] === "health") {
-      return send(response, 200, { ai: { loggedIn: await aiReady() }, version: SERVICE_VERSION });
+      let activeTurns = 0;
+      for (const id of projectPaths.keys()) if (sessions.state(id).busy) activeTurns += 1;
+      return send(response, 200, { ai: { loggedIn: await aiReady() }, version: SERVICE_VERSION, activeTurns, lastActivityAt });
     }
     if (method === "GET" && route.length === 1 && route[0] === "events") {
       const projectId2 = url2.searchParams.get("project") ?? "";
@@ -35990,6 +36149,7 @@ data: ${JSON.stringify(numbered.event)}
         const requestId = idOf(body.requestId);
         const goal = textOf(body.goal);
         const images = imagesOf(body.images);
+        const video = videoOf(body.video, images?.length ?? 0);
         const name = nameOf(body.name, goal);
         if (!await aiReady()) throw NOT_READY_AI();
         const made = await room.create({ requestId, name });
@@ -35998,6 +36158,7 @@ data: ${JSON.stringify(numbered.event)}
           requestId,
           text: goal,
           ...images === void 0 ? {} : { images },
+          ...video === void 0 ? {} : { video },
           checkLogin: false
         });
         return send(response, made.created || sent.fresh ? 201 : 200, { projectId: made.id, turnId: sent.turnId });
@@ -36018,7 +36179,15 @@ data: ${JSON.stringify(numbered.event)}
       const requestId = idOf(body.requestId);
       const text = textOf(body.text);
       const images = imagesOf(body.images);
-      const sent = await sendOnce({ projectId, requestId, text, ...images === void 0 ? {} : { images }, checkLogin: true });
+      const video = videoOf(body.video, images?.length ?? 0);
+      const sent = await sendOnce({
+        projectId,
+        requestId,
+        text,
+        ...images === void 0 ? {} : { images },
+        ...video === void 0 ? {} : { video },
+        checkLogin: true
+      });
       return send(response, 202, { turnId: sent.turnId });
     }
     if (method === "POST" && action === "cancel") {
@@ -36041,7 +36210,7 @@ data: ${JSON.stringify(numbered.event)}
     if (method === "GET" && action === "bundle") {
       const project = await room.get(projectId);
       if (project === void 0) throw NO_PROJECT();
-      if (!await exists(path9.join(project.path, "app.yaml"))) throw NOT_READY();
+      if (!await exists(path10.join(project.path, "app.yaml"))) throw NOT_READY();
       try {
         return send(response, 200, await bundleAppPage(project.path));
       } catch (error43) {
@@ -36160,9 +36329,14 @@ function imagesOf(value) {
   });
   return images.length === 0 ? void 0 : images;
 }
+function videoOf(value, imageCount) {
+  const video = parseVideo(value, imageCount);
+  if (video === "bad") throw BAD();
+  return video;
+}
 async function exists(file2) {
   try {
-    await stat3(file2);
+    await stat4(file2);
     return true;
   } catch {
     return false;
@@ -36170,7 +36344,7 @@ async function exists(file2) {
 }
 async function readList(projectPath, file2) {
   try {
-    const parsed = JSON.parse(await readFile8(path9.join(projectPath, ".dc", file2), "utf8"));
+    const parsed = JSON.parse(await readFile9(path10.join(projectPath, ".dc", file2), "utf8"));
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
@@ -36183,7 +36357,7 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
   console.error("[cloud-authoring] DCW_AUTHORING_PORT is not a valid port");
   process.exit(2);
 }
-var root = process.env.DCW_AUTHORING_ROOT ?? path10.join(process.env.HOME ?? os.homedir(), "work", "apps");
+var root = process.env.DCW_AUTHORING_ROOT ?? path11.join(process.env.HOME ?? os.homedir(), "work", "apps");
 var claudePath = process.env.DCW_CLAUDE ?? "claude";
 var server;
 try {
