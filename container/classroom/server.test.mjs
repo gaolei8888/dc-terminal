@@ -778,3 +778,154 @@ test('device session: per-workspace rate limit, SSO only, eviction keeps device 
     for (const k of app.persistedAt.keys()) assert.ok(app.sessions.has(k));
   } finally { await app.close(); fs.rmSync(dir, {recursive: true, force: true}); }
 });
+
+// ---- 平板视频与空闲：工作区停着的明确回答、空闲自动停、按格式转写 ----
+async function idleFixture({status = 'running', shared = false} = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-idle-test-'));
+  const state = {health: {activeTurns: 0, lastActivityAt: 0}, healthStatus: 200, healthSeen: 0, gate: null};
+  const backend = http.createServer((req, res) => {
+    if (req.url.startsWith('/_dct/authoring/v1/health')) {
+      state.healthSeen++; state.gate = req.headers.cookie;
+      res.writeHead(state.healthStatus, {'Content-Type': 'application/json'});
+      return res.end(JSON.stringify(state.health));
+    }
+    res.setHeader('Content-Type', 'application/json'); res.end('{}');
+  });
+  await new Promise(r => backend.listen(0, '127.0.0.1', r));
+  const port = backend.address().port;
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  if (shared) ming.shared = true;
+  const driver = {maxRunning: 2, status: async () => ({status: driver.state}), state: status, stops: 0, starts: 0,
+    start: async () => { driver.starts++; }, stop: async () => { driver.stops++; },
+    backend: async () => { if (driver.state !== 'running') throw Object.assign(new Error('工作区尚未启动'), {code: 'workspace_stopped'}); return {port, apiPort: port, token: 'GATE'}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const login = await fetch(`${origin}/w/${ming.id}/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: ming.token})});
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const call = (p, method = 'GET', extra = {}) => fetch(`${origin}/w/${ming.id}${p}`, {method, headers: {Cookie: cookie, 'Content-Type': 'application/json', ...extra}, body: method === 'POST' ? '{}' : undefined});
+  const close = async () => { await app.close(); backend.close(); fs.rmSync(dir, {recursive: true, force: true}); };
+  return {app, driver, store, ming, state, call, cookie, close, origin};
+}
+const MIN = 60000;
+
+test('工作区停着：经代理访问一律 409 workspace_stopped，其他 409 不变', async () => {
+  const f = await idleFixture({status: 'stopped'});
+  try {
+    const r = await f.call('/_dct/authoring/v1/health');
+    assert.equal(r.status, 409);
+    assert.deepEqual(await r.json(), {error: '工作区在休息', code: 'workspace_stopped'});
+    // 名额已满之类的 /start 失败，body 不带 code。
+    f.driver.start = async () => { throw new Error('当前运行名额已满，请联系老师结束其他工作区后再试'); };
+    const full = await f.call('/start', 'POST');
+    assert.equal(full.status, 409);
+    assert.deepEqual(await full.json(), {error: '当前运行名额已满，请联系老师结束其他工作区后再试'});
+  } finally { await f.close(); }
+});
+
+test('reapIdle：空闲 20 分钟停，不吊销会话，记审计', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    assert.deepEqual(await f.app.reapIdle(t0), [], '刚见到的工作区把活动时间记为现在');
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    assert.deepEqual(await f.app.reapIdle(t0 + 30 * MIN), [f.ming.id]);
+    assert.equal(f.driver.stops, 1);
+    assert.equal(f.state.gate, 'dct_gate=GATE');
+    assert.equal(f.store.data.audit[0].action, '空闲自动停止');
+    // 会话还在：同一个 cookie 还能叫醒。
+    const again = await f.call('/start', 'POST');
+    assert.equal(again.status, 200); assert.equal(f.driver.starts, 1);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：拿不准就不停', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now(), later = t0 + 30 * MIN;
+    await f.app.reapIdle(t0);
+    const idle = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const notStopped = async why => { assert.deepEqual(await f.app.reapIdle(later), [], why); assert.equal(f.driver.stops, 0, why); };
+    f.state.health = {...idle, activeTurns: 1}; await notStopped('进行中的一轮');
+    f.state.health = {...idle, lastActivityAt: later - 5 * MIN}; await notStopped('云端 5 分钟前还有活动');
+    f.state.health = idle; f.state.healthStatus = 500; await notStopped('health 500');
+    f.state.healthStatus = 200;
+    f.state.health = {activeTurns: 0}; await notStopped('缺 lastActivityAt');
+    f.state.health = {lastActivityAt: t0 - 30 * MIN}; await notStopped('缺 activeTurns');
+    f.state.health = idle;
+    // 终端连接
+    const conn = {student: f.ming.id, session: {role: 'student', key: 'k'}, socket: {destroy() {}}};
+    f.app.connections.add(conn); await notStopped('有终端连接'); f.app.connections.delete(conn);
+    // 协助租约
+    f.app.assistance.set(f.ming.id, {owner: 'x', expires: later + MIN}); await notStopped('有协助'); f.app.assistance.delete(f.ming.id);
+    // 共享的旧容器
+    f.ming.shared = true; await notStopped('共享容器'); f.ming.shared = false;
+    // 能停的基线确认：以上都撤掉就停。
+    assert.deepEqual(await f.app.reapIdle(later), [f.ming.id]);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：10 分钟前发过一句话就不停；events 和 health 的 GET 不算活动', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    // 只有 events 和 health 的 GET：仍然是空闲。
+    await f.call('/_dct/authoring/v1/events'); await f.call('/_dct/authoring/v1/health');
+    assert.deepEqual(await f.app.reapIdle(t0 - 10 * MIN), [f.ming.id], '那两种 GET 不刷新活动时间');
+    f.driver.stops = 0;
+    // 一次 POST messages 算活动。
+    const post = await f.call('/_dct/authoring/v1/projects/p1/messages', 'POST', {Origin: 'http://localhost'});
+    assert.equal(post.status, 200);
+    assert.deepEqual(await f.app.reapIdle(Date.now() + 10 * MIN), []);
+    assert.equal(f.driver.stops, 0);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：读 health 期间有新请求就不停；同时只跑一次', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const orig = f.app.activity.get(f.ming.id);
+    assert.ok(orig, '活动时间已记录');
+    // 在 health 返回前塞一次活动。
+    const prev = f.app.readHealth;
+    f.app.readHealth = async (...a) => { const h = await prev.apply(f.app, a); f.app.activity.set(f.ming.id, Date.now()); return h; };
+    const first = f.app.reapIdle(t0 + 30 * MIN);
+    const second = await f.app.reapIdle(t0 + 30 * MIN);
+    assert.deepEqual(second, [], '上一次还没跑完就跳过');
+    assert.deepEqual(await first, []);
+    assert.equal(f.driver.stops, 0);
+  } finally { await f.close(); }
+});
+
+test('转写：按录音格式给上游文件名，其他格式 415', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-stt-name-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  const names = [];
+  const gateway = http.createServer(async (req, res) => {
+    const chunks = []; for await (const c of req) chunks.push(c);
+    names.push(Buffer.concat(chunks).toString('latin1').match(/filename="([^"]*)"/)?.[1]);
+    res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({text: '好'}));
+  });
+  await new Promise(r => gateway.listen(0, '127.0.0.1', r));
+  const app = new Classroom({store, driver: {status: async () => ({status: 'running'})}, origin: 'http://localhost', secure: false, stt: {url: `http://127.0.0.1:${gateway.address().port}`, key: 'K'}});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${app.server.address().port}/w/${ming.id}`;
+  try {
+    const login = await fetch(base + '/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: ming.token})});
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const speak = type => fetch(base + '/_dct/transcribe', {method: 'POST', headers: {'Content-Type': type, Cookie: cookie}, body: Buffer.alloc(64, 1)});
+    for (const type of ['audio/mp4', 'audio/webm;codecs=opus', 'audio/ogg']) assert.equal((await speak(type)).status, 200, type);
+    assert.deepEqual(names, ['speech.m4a', 'speech.webm', 'speech.ogg']);
+    const bad = await speak('video/x-flv');
+    assert.equal(bad.status, 415);
+    assert.deepEqual(await bad.json(), {error: '这种录音格式用不了'});
+    assert.equal(names.length, 3, '不支持的格式不转给上游');
+  } finally { await app.close(); gateway.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});

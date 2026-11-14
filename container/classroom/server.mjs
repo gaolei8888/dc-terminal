@@ -52,9 +52,28 @@ function finishedPage(prefix) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学习已结束</title><body style="font:16px/1.7 system-ui;padding:8vh 8vw;background:#f5f7fa"><h1>本次学习已结束</h1><p>你的作品已保留，下次可以继续。</p><button style="font:inherit;padding:10px 20px" id="continue">继续学习</button><p id="error"></p><script>document.querySelector('#continue').onclick=async function(){this.disabled=true;try{const r=await fetch(${js(prefix + '/start')},{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error((await r.json()).error);location.href=${js(prefix + '/')};}catch(e){document.querySelector('#error').textContent=e.message;this.disabled=false;}};</script></body></html>`;
 }
 
+// 这两种 GET 是平板/页面在后台也会一直发的（断线重连、心跳），不能算「有人在用」。
+const PASSIVE = /^\/_dct\/authoring\/v1\/(?:events|health)\/?$/;
+const AUDIO_NAMES = {'audio/webm': 'speech.webm', 'audio/mp4': 'speech.m4a', 'audio/ogg': 'speech.ogg'};
+// 读容器里创作服务的 health（忙闲）。任何失败都返回 null——调用方把「问不出来」当成「不能停」。
+function readHealth(backend) {
+  return new Promise(resolve => {
+    const req = http.request({host: '127.0.0.1', port: backend.port, path: '/_dct/authoring/v1/health', method: 'GET', headers: {cookie: `dct_gate=${backend.token}`, connection: 'close'}}, res => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', c => { text += c; if (text.length > 65536) { res.destroy(); resolve(null); } });
+      res.on('end', () => { try { resolve(JSON.parse(text)); } catch { resolve(null); } });
+      res.on('error', () => resolve(null));
+    });
+    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
 const AUTHORING = /^\/_dct\/authoring\/v1\/(health|projects|events)(?:\/|$|\?)/;
 export class Classroom {
-  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, live, stt = {}} = {}) {
+  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, live, stt = {}, idleMinutes} = {}) {
     // 语音转写的上游。**没配也要能正常开课**——按钮那边会说「还没配」，
     // 而不是每按一次就抛一个看不懂的错。
     this.stt = {
@@ -63,6 +82,9 @@ export class Classroom {
       model: stt.model ?? process.env.CLASSROOM_STT_MODEL ?? 'whisper-1',
       language: stt.language ?? process.env.CLASSROOM_STT_LANGUAGE ?? 'zh',
     };
+    // 学生工作区空闲多久自动停（分钟）。
+    this.idleMs = (Number(idleMinutes ?? process.env.CLASSROOM_IDLE_MINUTES) || 20) * 60000;
+    this.activity = new Map(); this.reaping = false;
     this.store = store;
     this.driver = driver;
     this.origin = new URL(origin).origin;
@@ -76,7 +98,7 @@ export class Classroom {
     // 公开直播：管理台自己的发布密钥 + 中转地址。缺一样就不开这个功能。
     this.publicLive = live && live.relay && live.publishKey ? {relay: live.relay.replace(/\/+$/, ''), key: live.publishKey} : null;
     if (this.publicLive) this.healTimer = setInterval(() => this.healPublic().catch(() => {}), 30000).unref();
-    this.server = http.createServer((req, res) => this.handle(req, res).catch(e => { if (!res.headersSent) json(res, e.status || 409, {error: e.publicMessage || (e.status ? e.message : '操作未完成，请稍后重试；学生文件已保留')}); else res.destroy(); }));
+    this.server = http.createServer((req, res) => this.handle(req, res).catch(e => { if (!res.headersSent) json(res, e.status || 409, e.code === 'workspace_stopped' ? {error: '工作区在休息', code: 'workspace_stopped'} : {error: e.publicMessage || (e.status ? e.message : '操作未完成，请稍后重试；学生文件已保留')}); else res.destroy(); }));
     this.server.on('upgrade', (req, socket, head) => this.upgrade(req, socket, head).catch(() => socket.destroy()));
     this.timer = setInterval(() => {
       for (const [id, lease] of this.assistance) if (lease.expires < Date.now()) this.endAssistance(id);
@@ -84,8 +106,44 @@ export class Classroom {
       const active = new Map([...this.connections].map(c => [c.session.key, c.session]));
       for (const session of active.values()) if (session.external) this.sso.ensure(session).catch(() => {});
     }, 5000).unref();
+    this.idleTimer = setInterval(() => this.reapIdle().catch(() => {}), 60000).unref();
   }
-  close() { clearInterval(this.timer); clearInterval(this.healTimer); for (const c of this.connections) c.socket.destroy(); this.publishing?.server.close(); return new Promise(r => this.server.close(r)); }
+  readHealth(backend) { return readHealth(backend); }
+  // 停掉空闲的学生工作区。**拿不准就不停**：进行中的一轮、问不出忙闲、
+  // 有人连着/协助、最近有请求，都不停。停法同 /finish：不 revoke，设备会话照样有效。
+  async reapIdle(now = Date.now()) {
+    if (this.reaping) return [];
+    this.reaping = true;
+    const stopped = [];
+    try {
+      for (const w of [...this.store.data.students]) {
+        if (w.shared || w.id === 'shared') continue;
+        try {
+          if ((await this.driver.status(w)).status !== 'running') { this.activity.delete(w.id); continue; }
+          if (!this.activity.has(w.id)) { this.activity.set(w.id, now); continue; }
+          const busy = () => [...this.connections].some(c => c.student === w.id) || this.lease(w) || now - this.activity.get(w.id) < this.idleMs;
+          if (busy()) continue;
+          const seen = this.activity.get(w.id);
+          const health = await this.readHealth(await this.driver.backend(w));
+          if (!health || typeof health.activeTurns !== 'number' || typeof health.lastActivityAt !== 'number') continue;
+          if (health.activeTurns > 0 || now - health.lastActivityAt < this.idleMs) continue;
+          const did = await this.store.mutate(async () => {
+            // 读 health 的这段时间里有人来过，就算了。
+            if (this.activity.get(w.id) !== seen || busy()) return false;
+            await this.driver.stop(w);
+            this.endAssistance(w.id);
+            for (const c of this.connections) if (c.student === w.id) c.socket.destroy();
+            this.activity.delete(w.id);
+            this.store.audit('空闲自动停止', w);
+            return true;
+          });
+          if (did) stopped.push(w.id);
+        } catch { /* 这一个出错不影响别的工作区；下一轮再看 */ }
+      }
+    } finally { this.reaping = false; }
+    return stopped;
+  }
+  close() { clearInterval(this.timer); clearInterval(this.idleTimer); clearInterval(this.healTimer); for (const c of this.connections) c.socket.destroy(); this.publishing?.server.close(); return new Promise(r => this.server.close(r)); }
   writeOrigin(req) {
     if (req.headers.origin && req.headers.origin !== this.origin) throw fail(403, '请从当前管理台或工作区操作');
     if (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(req.headers['sec-fetch-site'])) throw fail(403, '请从当前工作区操作');
@@ -366,6 +424,7 @@ export class Classroom {
     const session = this.authenticate(req, 'student', w) || (w.shared ? this.legacyAuth(req, w) : null);
     if (!session) { if (sub === '/' && req.method === 'GET') return html(res, studentPage(prefix)); throw fail(401, '请重新打开老师发给你的完整链接'); }
     await this.sso.ensure(session);
+    if (!(req.method === 'GET' && PASSIVE.test(sub.split('?')[0]))) this.activity.set(w.id, Date.now());
     if (sub === '/finish' && req.method === 'POST' && !w.shared) {
       await body(req);
       return this.store.mutate(async () => {
@@ -386,9 +445,11 @@ export class Classroom {
       this.rate(req, 'stt:' + w.id);
       if (!this.stt.url || !this.stt.key) throw fail(503, '还没配语音转写，请联系老师');
       const audio = await rawBody(req, STT_MAX_BYTES);
-      const type = String(req.headers['content-type'] || 'audio/webm').split(';')[0];
+      const type = String(req.headers['content-type'] || 'audio/webm').split(';')[0].trim().toLowerCase();
+      const filename = AUDIO_NAMES[type];
+      if (!filename) throw fail(415, '这种录音格式用不了');
       const form = new FormData();
-      form.append('file', new Blob([audio], {type}), 'speech.webm');
+      form.append('file', new Blob([audio], {type}), filename);
       form.append('model', this.stt.model);
       // 说中文的学生里夹着英文术语（「import 那个包」），不写死语言的话
       // 整句会被猜成英文。

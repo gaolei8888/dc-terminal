@@ -80,7 +80,7 @@ export class DockerDriver {
   }
   async backend(w) {
     const s = await this.status(w);
-    if (s.status !== 'running') throw new Error('工作区尚未启动');
+    if (s.status !== 'running') throw Object.assign(new Error('工作区尚未启动'), {code: 'workspace_stopped'});
     let token = w.backendToken;
     if (!token) {
       const out = await this.docker(['exec', this.name(w), 'dct', 'gate', '--link', '--url', 'http://localhost']);
