@@ -4039,9 +4039,12 @@ mod tests {
             matches!(create_resp, Response::Created { .. }),
             "Create 应该最终成功，实际 {create_resp:?}"
         );
+        // 第一次快照挪进了后台线程之后，Create 本身就不许慢（同
+        // tests/concurrency.rs `list_is_not_blocked_by_slow_create`）：慢了界面
+        // 5 秒超时、用户再点一次，攒出重复会话。锁当然更不会被攥过慢活。
         assert!(
-            create_elapsed > Duration::from_millis(300),
-            "场景失真：Create 耗时应显著大于 300ms 才能验证不阻塞，实际 {create_elapsed:?}"
+            create_elapsed < Duration::from_millis(300),
+            "Create 又开始等慢活了：{create_elapsed:?}"
         );
         assert!(
             lock_wait < Duration::from_millis(100),

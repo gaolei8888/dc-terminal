@@ -1455,19 +1455,18 @@ impl SessionManager {
 
         let pty = PtySession::spawn(&command, &env, dir, 40, 120)?;
 
-        let mut checkpoints = Vec::new();
-        if is_agent {
-            // IMPORTANT 5（最终整分支 code review）：`git::checkpoint` 失败时
-            // 甩出来的是 git 命令行的原始英文 stderr——`git.rs` 的注释说
-            // 「调用方负责给出中文的上下文」，这里补上，别让一句
-            // 「fatal: detected dubious ownership in repository at …」
-            // 原样飘到选择器/密钥失败提示上（后者尤其误导，会被用户读成
-            // 「我的密钥不对」）。
-            checkpoints.push(
-                git::checkpoint(dir, id, 0)
-                    .map_err(|_| coded(ErrorCode::OperationFailed(Operation::FirstCheckpoint)))?,
-            );
-        }
+        // **第一次快照不在这条路上拍。** 它挪到了下面——会话插进 map
+        // 之后，丢给一个后台线程。理由见
+        // `creating_a_session_is_not_held_up_by_the_first_checkpoint`：
+        // 拍快照的耗时跟工作树大小走，22GB 的项目实测 43.77 秒，而界面
+        // 那条连接只等 5 秒（`client::READ_TIMEOUT`）。同步拍的结果不是
+        // 「慢一点」，是**界面超时、守护进程却照样把会话建出来了**——
+        // 用户看到「选了没反应」，再选一次，攒出一串重复会话。
+        //
+        // 空的 `checkpoints` 不是新状态：`checkpoint_base` 本来就有
+        // `NoCheckpoint` 这条路（用户在快照到位之前按 `u` 会得到一句
+        // 明确的话），不需要为「还没拍好」新造一种错误。
+        let checkpoints = Vec::new();
 
         // 恢复出来的名字（有的话）。空串等同于「没有」——那条记录当时
         // 就没起出名字，跟从没恢复过没有区别，让它照旧走一遍正常流程。
@@ -1517,7 +1516,27 @@ impl SessionManager {
             .born(id, &session.profile.name, dir, session.pty.process_id());
 
         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
-        recover(self.sessions.lock()).insert(id, Arc::new(Mutex::new(session)));
+        let arc = Arc::new(Mutex::new(session));
+        recover(self.sessions.lock()).insert(id, arc.clone());
+
+        // 第一次快照：拍不上就算了，拍得慢也不耽误人开始干活。
+        //
+        // `is_empty()` 那道闸是给 `tick()` 让路的——它也会往
+        // `checkpoints` 里推（见那边的代码）。这个线程慢到那之后才回来
+        // 时，推进去的是一个**更旧**的 sha，`checkpoint_base` 取
+        // `last()` 就会回滚到错误的位置。先到先得，后到的丢掉。
+        if is_agent {
+            let dir = dir.to_path_buf();
+            std::thread::spawn(move || {
+                let Ok(sha) = git::checkpoint(&dir, id, 0) else {
+                    return;
+                };
+                let mut s = recover(arc.lock());
+                if s.checkpoints.is_empty() {
+                    s.checkpoints.push(sha);
+                }
+            });
+        }
         // 会话集合变了，把清单重写一份——`create`/`stop`/`kill`/`prune`
         // 四处之一，绝不能从 `tick()` 调，见 `persist_last_sessions` 文档。
         self.persist_last_sessions();
@@ -2381,6 +2400,20 @@ mod tests {
 
         // 一条都没有：本来就说明不了任何事
         assert_eq!(call("随便什么", None, None), None);
+    }
+
+    /// 等第一次快照落地。
+    ///
+    /// 它现在是后台拍的（见
+    /// `creating_a_session_is_not_held_up_by_the_first_checkpoint`），
+    /// 所以任何要测 `undo`/`diff` 的用例都得先等这个**前提**到位——
+    /// 等的不是被测行为本身。`diff` 是只读的，拿它当就绪信号最省事。
+    fn wait_for_first_checkpoint(m: &SessionManager, id: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while m.diff(id).is_err() {
+            assert!(Instant::now() < deadline, "第一次快照一直没拍好");
+            sleep(Duration::from_millis(20));
+        }
     }
 
     fn init_repo() -> tempfile::TempDir {
@@ -3611,6 +3644,46 @@ mod tests {
         assert!(!dir.contains("dct-worktrees"), "不该再建副本了：{dir}");
     }
 
+    /// **建会话不许被第一次快照挡住，也不许等它。**
+    ///
+    /// 现场：`video-projs/leining-2` 的工作树 22GB，拍一次快照实测 43.77 秒，
+    /// 而界面那条连接只等 5 秒（`client::READ_TIMEOUT`）。同步拍的后果是
+    /// 守护进程照样把会话建出来了，界面却超时、停在选择器上报一句
+    /// 「建不起来」——用户看到的是「选了没反应」，于是再选一次，同一个
+    /// 项目里攒出一串一模一样的会话（实测一次攒了六个）。
+    ///
+    /// 快照的用途是「能回滚」，不是「会话必须先有快照才能开」。拍不上、
+    /// 拍得慢，都不该拦着人开始干活——`checkpoint_base` 本来就有
+    /// `NoCheckpoint` 这条路，用户按 `u` 时会得到一句明确的话。
+    #[test]
+    fn creating_a_session_is_not_held_up_by_the_first_checkpoint() {
+        let repo = init_repo();
+        // `.git` 只读：`is_repo` 是只读操作照样为真，但快照要往
+        // `.git/dct-index-<id>` 写，必然失败。这是「拍不上」最省事的模拟；
+        // 「拍得慢」没法在单测里可靠地造出来，而两者走的是同一条路。
+        let git_dir = repo.path().join(".git");
+        let mut perm = fs::metadata(&git_dir).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(&git_dir, perm).unwrap();
+
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let made = m.create(repo.path(), "fake", empty_secrets(), &[]);
+
+        // 先把权限放回去，否则 TempDir 清理不掉，失败信息会被一堆
+        // 「删不掉」淹没。
+        let mut perm = fs::metadata(&git_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        fs::set_permissions(&git_dir, perm).unwrap();
+
+        assert!(
+            made.is_ok(),
+            "第一次快照拍不上不该挡住建会话：{:?}",
+            made.err()
+        );
+    }
+
     /// **回车不许被快照吃掉。**
     ///
     /// 现场：项目目录被搬走（会话的 cwd 还在，`.git` 没了），从那一刻起
@@ -3947,6 +4020,8 @@ mod tests {
             .clone()
             .into();
 
+        wait_for_first_checkpoint(&m, id);
+
         // 模拟 agent 干活：改文件
         fs::write(wt_dir.join("a.txt"), "agent wrote this\n").unwrap();
         m.undo(id).unwrap();
@@ -3968,6 +4043,8 @@ mod tests {
             .dir
             .clone()
             .into();
+
+        wait_for_first_checkpoint(&m, id);
 
         fs::write(wt_dir.join("a.txt"), "hello\nmore\n").unwrap();
         let stats = m.diff(id).unwrap();

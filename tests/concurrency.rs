@@ -109,8 +109,8 @@ fn list_is_not_blocked_by_slow_create() {
         (start.elapsed(), resp)
     });
 
-    // 给慢 Create 一点时间真正进到耗时的 git 操作里
-    sleep(Duration::from_millis(150));
+    // 让 Create 那个线程先跑起来，再发 List。
+    sleep(Duration::from_millis(5));
 
     let mut list_client = Client::connect(&sock).unwrap();
     let list_start = Instant::now();
@@ -125,9 +125,15 @@ fn list_is_not_blocked_by_slow_create() {
         matches!(list_resp, Response::Sessions(_)),
         "List 应该正常返回，实际 {list_resp:?}"
     );
+    // 这个仓库大到「同步拍快照」一定超过 300ms——原来的写法正是靠这一点
+    // 造出慢 Create。2026-09-26 之后快照挪进了后台线程，这里反过来钉：
+    // **Create 就是不许慢**。慢了的后果不是「等久一点」，是界面 5 秒超时
+    // （`client::READ_TIMEOUT`）之后停在选择器上报「建不起来」，而守护进程
+    // 那边会话照样建出来了——用户看到「选了没反应」，再选一次，攒出一串
+    // 重复会话。
     assert!(
-        create_elapsed > Duration::from_millis(300),
-        "场景失真：Create 耗时应显著大于 300ms 才能验证不阻塞其它客户端，实际 {create_elapsed:?}"
+        create_elapsed < Duration::from_millis(300),
+        "Create 又开始等慢活了：{create_elapsed:?}"
     );
     assert!(
         list_elapsed < Duration::from_millis(100),
