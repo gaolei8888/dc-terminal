@@ -1,4 +1,4 @@
-use crate::proto::{coded, ErrorCode, Operation};
+use crate::proto::{coded, EndedHow, ErrorCode, Operation};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -525,10 +525,11 @@ struct Session {
     /// 接回、这回却走 `--continue` 接回的也一样（id 落盘时从 agent 自己的文件
     /// 里读，见 `learn_conversation_from_file`）。
     submitted: bool,
-    /// 是不是被叫停的：`stop()`/`kill()` 置上。恢复后的看守线程靠它分清
-    /// 「接回失败、自己退出了」和「刚接回就被人停掉了」，后者不该被当成
-    /// 接回失败再重开一个。
-    stopped_by_request: bool,
+    /// 是不是被叫停的、怎么叫停的：`stop()` 置 `StoppedByUser`，`kill()`/
+    /// `kill_all_now()` 置 `Killed`；`None` = 没人叫停。恢复后的看守线程靠它
+    /// 分清「接回失败、自己退出了」和「刚接回就被人停掉了」，后者不该被当成
+    /// 接回失败再重开一个；`prune()` 抹掉会话时按它记下是怎么结束的。
+    requested_end: Option<EndedHow>,
     dir: PathBuf,
     is_agent: bool,
     checkpoints: Vec<String>,
@@ -741,6 +742,19 @@ pub struct SessionManager {
     instance: u64,
     /// 刚重启、还在后台一个个接回上次的会话。这期间不接受再一次重启。
     restoring: AtomicBool,
+    /// 最近结束、已经从名册上抹掉的会话，见 `ended` 模块。只在内存里。
+    recently_ended: Mutex<crate::ended::RecentlyEnded>,
+}
+
+/// 见 `SessionManager::liveness`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// 名册上有、进程活着。
+    Running,
+    /// 结束了，怎么结束的。
+    Ended(EndedHow),
+    /// 没听说过：从没有过、早就过期了，或者被 `discard()` 拿掉了。
+    Unknown,
 }
 
 /// 每次启动都不同的一个数。拿不到系统随机数就退回「时间 × pid」，
@@ -821,6 +835,7 @@ impl SessionManager {
             type_waits: Mutex::new((TYPE_AFTER_SPAWN, TYPE_AFTER_IDLE, TYPE_AFTER_QUIET)),
             instance: new_instance_id(),
             restoring: AtomicBool::new(false),
+            recently_ended: Mutex::new(crate::ended::RecentlyEnded::default()),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),
@@ -1001,7 +1016,7 @@ impl SessionManager {
         for arc in snapshot {
             let mut s = recover(arc.lock());
             if s.state != SessionState::Stopped {
-                s.stopped_by_request = true;
+                s.requested_end = Some(EndedHow::Killed);
                 let _ = s.pty.kill_now();
                 s.state = SessionState::Stopped;
             }
@@ -1275,19 +1290,43 @@ impl SessionManager {
             .flatten()
     }
 
-    /// 会话是不是**自己**退出了（进程没了，又不是被 `stop()`/`kill()` 叫停的）。
-    /// 会话不在了返回 `None`。只看不改：状态翻成 `Stopped`、回收子进程
-    /// 仍归 `tick()` 管。
-    pub fn exited_on_its_own(&self, id: u32) -> Option<bool> {
-        self.with_session(id, |s| {
-            Ok(!s.stopped_by_request && (s.state == SessionState::Stopped || !s.pty.is_alive()))
-        })
-        .ok()
+    /// 会话此刻是死是活、死了是怎么死的。先看名册，名册上没有再看最近
+    /// 结束的记录（会话一停就从名册上抹掉，见 `prune()`）。只看不改：状态
+    /// 翻成 `Stopped`、回收子进程、抹掉仍归 `tick()` 管——所以名册上还在、
+    /// 进程却已经没了的，同样算「自己退出了」。
+    pub fn liveness(&self, id: u32) -> Liveness {
+        let here = self.with_session(id, |s| {
+            Ok(match s.requested_end {
+                Some(how) => Liveness::Ended(how),
+                None if s.state == SessionState::Stopped || !s.pty.is_alive() => {
+                    Liveness::Ended(EndedHow::ExitedOnItsOwn)
+                }
+                None => Liveness::Running,
+            })
+        });
+        match here {
+            Ok(l) => l,
+            Err(_) => self
+                .ended_how(id)
+                .map_or(Liveness::Unknown, Liveness::Ended),
+        }
+    }
+
+    /// 最近结束的会话里有没有这个编号，有就说是怎么结束的。
+    fn ended_how(&self, id: u32) -> Option<EndedHow> {
+        recover(self.recently_ended.lock())
+            .get(id, Instant::now())
+            .map(|e| e.how)
     }
 
     /// 把一个会话彻底从名册上拿掉（先杀进程），清单跟着重写。恢复时
     /// 「接回失败、换一个新开的顶上」用：留着那个死格子只会让用户以为
     /// 有两个会话。不存在就什么都不做。
+    ///
+    /// **不记进最近结束的会话**：这不是用户眼里的一次「结束」，是看守线程
+    /// 拿新开的会话顶替一次失败的接回，用户看到的是同一个格子换了个编号。
+    /// 记成「agent 自己退出了」反倒会让旧编号对外报一句容易误读的话；它要是
+    /// 先被 `tick()` 抹掉过，那时已经如实记成 `ExitedOnItsOwn` 了。
     pub fn discard(&self, id: u32) {
         let removed = recover(self.sessions.lock()).remove(&id);
         if let Some(arc) = removed {
@@ -1484,7 +1523,7 @@ impl SessionManager {
             profile,
             conversation_id,
             submitted: existing_conversation,
-            stopped_by_request: false,
+            requested_end: None,
             dir: dir.to_path_buf(),
             is_agent,
             checkpoints,
@@ -1558,10 +1597,14 @@ impl SessionManager {
     }
 
     fn get_arc(&self, id: u32) -> Result<Arc<Mutex<Session>>> {
-        recover(self.sessions.lock())
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| coded(ErrorCode::NoSuchSession(id)))
+        let found = recover(self.sessions.lock()).get(&id).cloned();
+        found.ok_or_else(|| {
+            // 刚结束的会话不说「没有」：用户会以为编号敲错了。
+            coded(match self.ended_how(id) {
+                Some(how) => ErrorCode::SessionEnded { id, how },
+                None => ErrorCode::NoSuchSession(id),
+            })
+        })
     }
 
     /// 找到会话、拿到它自己的锁、跑 `f`——`sessions` 这个总表的锁只用来查一次
@@ -1773,7 +1816,7 @@ impl SessionManager {
             let pid = s.pty.process_id();
             s.pty.kill()?;
             s.state = SessionState::Stopped;
-            s.stopped_by_request = true;
+            s.requested_end = Some(EndedHow::StoppedByUser);
             // `requested` 和 `tick()` 里那条 `vanished` 是这本日志唯一
             // 分得开的两件事——见 `journal` 的模块注释。
             self.journal.died(id, crate::journal::Death::Requested, pid);
@@ -1801,7 +1844,7 @@ impl SessionManager {
         let r = self.with_session(id, |s| {
             s.pty.kill_now()?;
             s.state = SessionState::Stopped;
-            s.stopped_by_request = true;
+            s.requested_end = Some(EndedHow::Killed);
             Ok(())
         });
         // 理由同 `stop()`：停了就抹掉；不能在 `with_session` 的闭包里调，
@@ -1827,20 +1870,40 @@ impl SessionManager {
         // 看板卡在某个正在做慢活的会话上。
         let snapshot: Vec<Arc<Mutex<Session>>> =
             recover(self.sessions.lock()).values().cloned().collect();
-        let dead: Vec<u32> = snapshot
+        let now = Instant::now();
+        let dead: Vec<(u32, crate::ended::Ended)> = snapshot
             .iter()
             .filter_map(|arc| {
                 let s = recover(arc.lock());
-                (s.state == SessionState::Stopped).then_some(s.id)
+                (s.state == SessionState::Stopped).then(|| {
+                    let e = crate::ended::Ended {
+                        dir: s.dir.clone(),
+                        profile: s.profile.name.clone(),
+                        how: s.requested_end.unwrap_or(EndedHow::ExitedOnItsOwn),
+                        ended_at: now,
+                    };
+                    (s.id, e)
+                })
             })
             .collect();
 
         // 第二趟：只做 HashMap 删除，不碰任何会话锁。
         // 用 `remove().is_some()` 数，不用 `dead.len()`：两趟之间没有锁，
         // 中途可能有别人删了同一个 id，报一个虚高的数字等于骗用户。
+        // 抹掉的同一刻记进最近结束的会话：先记后删的话，中间有一瞬间
+        // 名册上和记录里都有它，无害；反过来就会有一瞬间两边都没有，问到它
+        // 的人会听到一句「没有这个会话」。所以记录跟删除在同一把 map 锁下做。
         let removed = {
             let mut map = recover(self.sessions.lock());
-            dead.iter().filter(|id| map.remove(id).is_some()).count() as u32
+            let mut ended = recover(self.recently_ended.lock());
+            let mut n = 0;
+            for (id, e) in dead {
+                if map.remove(&id).is_some() {
+                    ended.record(id, e);
+                    n += 1;
+                }
+            }
+            n
         };
         // 真删掉了才重写清单。`stop()`/`kill()`/`tick()` 的 vanished
         // 分支都靠这一步落盘：它们把会话标成 Stopped 后立刻调这里。
@@ -2455,6 +2518,15 @@ mod tests {
     /// 会话停了就从名册上消失（不留墓碑），「停了」在名册上的样子就是「没了」。
     fn is_gone(mgr: &SessionManager, id: u32) -> bool {
         !mgr.list().iter().any(|s| s.id == id)
+    }
+
+    /// 名册上没了，问到它时报的是「已结束、怎么结束的」，不是「没有这个会话」。
+    fn ended_as(mgr: &SessionManager, id: u32) -> Option<EndedHow> {
+        let err = mgr.screen(id).err()?;
+        match err.downcast::<crate::proto::CodedError>().ok()?.0 {
+            ErrorCode::SessionEnded { id: got, how } if got == id => Some(how),
+            _ => None,
+        }
     }
 
     // 用 cat 冒充 agent：能收输入、不会自己退出
@@ -3632,6 +3704,8 @@ mod tests {
         // 跟 stop 一视同仁：杀完当场从名册上抹掉，不留墓碑
         assert!(is_gone(&m, id), "杀掉的会话不该还挂在名册上");
         assert_eq!(m.prune(), 0);
+        assert_eq!(ended_as(&m, id), Some(EndedHow::Killed));
+        assert_eq!(m.liveness(id), Liveness::Ended(EndedHow::Killed));
     }
 
     #[test]
@@ -4099,6 +4173,8 @@ mod tests {
             m.tick();
             let Ok(screen) = m.screen(id) else {
                 assert!(is_gone(&m, id));
+                assert_eq!(ended_as(&m, id), Some(EndedHow::ExitedOnItsOwn));
+                assert_eq!(m.liveness(id), Liveness::Ended(EndedHow::ExitedOnItsOwn));
                 break;
             };
             assert_ne!(screen.state, SessionState::Stopped, "停了就不该还查得到");
@@ -4132,6 +4208,44 @@ mod tests {
         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
         m.stop(id).unwrap();
         assert!(is_gone(&m, id));
+        assert_eq!(ended_as(&m, id), Some(EndedHow::StoppedByUser));
+        assert_eq!(m.liveness(id), Liveness::Ended(EndedHow::StoppedByUser));
+        // 再停一次（`dct stop 3` 敲了两遍）：说它已经结束了，不说「没有」。
+        let again = m.stop(id).unwrap_err();
+        assert!(matches!(
+            again.downcast::<crate::proto::CodedError>().unwrap().0,
+            ErrorCode::SessionEnded {
+                how: EndedHow::StoppedByUser,
+                ..
+            }
+        ));
+    }
+
+    /// 从没有过的编号照旧报「没有这个会话」。
+    #[test]
+    fn an_id_that_never_existed_is_still_no_such_session() {
+        let m = SessionManager::new();
+        let Err(err) = m.screen(4242) else {
+            panic!("4242 号从没有过");
+        };
+        assert_eq!(
+            err.downcast::<crate::proto::CodedError>().unwrap().0,
+            ErrorCode::NoSuchSession(4242)
+        );
+        assert_eq!(m.liveness(4242), Liveness::Unknown);
+    }
+
+    /// `discard()`（看守线程拿新会话顶替一次失败的接回）不记成「结束」，
+    /// 理由见它的文档。
+    #[test]
+    fn a_discarded_session_is_not_recorded_as_ended() {
+        let repo = init_repo();
+        let m = SessionManager::new();
+        m.register_profile(fake_agent());
+        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+        m.discard(id);
+        assert!(is_gone(&m, id));
+        assert_eq!(m.liveness(id), Liveness::Unknown);
     }
 
     /// 守护进程常常是从某个 agent 自己的会话里被拉起来的——用户在 Claude Code
@@ -4736,7 +4850,7 @@ mod tests {
             .unwrap();
         write_agent_file(&mgr, id, files.path(), proj.path(), "dead-one");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mgr.exited_on_its_own(id) != Some(true) {
+        while mgr.liveness(id) != Liveness::Ended(EndedHow::ExitedOnItsOwn) {
             assert!(Instant::now() < deadline, "探针没退出");
             sleep(Duration::from_millis(20));
         }
@@ -5761,6 +5875,6 @@ mod tests {
         mgr.kill_all_now();
         assert_eq!(state_of(&mgr, a), SessionState::Stopped);
         assert_eq!(state_of(&mgr, b), SessionState::Stopped);
-        assert_eq!(mgr.exited_on_its_own(a), Some(false));
+        assert_eq!(mgr.liveness(a), Liveness::Ended(EndedHow::Killed));
     }
 }

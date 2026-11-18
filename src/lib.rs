@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod explore_cli;
 pub mod explore_model;
 pub mod drain;
+pub mod ended;
 pub mod dco_rules;
 pub mod game;
 pub mod gate;

@@ -13,7 +13,7 @@
 //!
 //! 这条测试问的是操作系统，不是我们自己的状态字段：拿到子进程真实 pid，
 //! 直接看 `ps` 报的进程状态里有没有 `Z`。断言我们自己的 `SessionState` 是没用的
-//! ——它在出 bug 的那一版里同样是 `Stopped`，一切看起来都对。
+//! ——它在出 bug 的那一版里同样是「停了」，一切看起来都对。
 
 //! **这一整个文件只在 Unix 上有意义**：僵尸进程是 Unix 特有的东西。父进程
 //! 不 `wait()` 就留一个尸体占着进程表项——而 Windows 上进程退出后留下的是
@@ -23,8 +23,7 @@
 
 use std::time::{Duration, Instant};
 
-use dct::proto::{Request, Response};
-use dct::session::SessionState;
+use dct::proto::{EndedHow, ErrorCode, Request, Response};
 
 mod common;
 
@@ -134,14 +133,15 @@ fn an_agent_that_exits_on_its_own_does_not_become_a_zombie() {
     })
     .unwrap();
 
-    // 等守护进程的 tick 把它判成停止。回收就发生在那一轮里。
+    // 等守护进程的 tick 发现它没了、把它从名册上抹掉（之后再问，守护进程
+    // 说它是自己退出的）。回收就发生在那一轮里。
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match c.call(Request::Screen { id }).unwrap() {
-            Response::Screen {
-                state: SessionState::Stopped,
-                ..
-            } => break,
+            Response::Error(ErrorCode::SessionEnded { how, .. }) => {
+                assert_eq!(how, EndedHow::ExitedOnItsOwn);
+                break;
+            }
             Response::Screen { .. } => {}
             other => panic!("预期 Screen，实际 {other:?}"),
         }

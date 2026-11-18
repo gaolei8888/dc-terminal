@@ -1483,7 +1483,8 @@ fn watch_resumed_by_id(
     mut pending: Vec<ResumedById>,
     window: Duration,
 ) -> Option<std::thread::JoinHandle<()>> {
-    use crate::proto::{SessionResumeSkipReason, WarningCode};
+    use crate::proto::{EndedHow, SessionResumeSkipReason, WarningCode};
+    use crate::session::Liveness;
 
     if pending.is_empty() {
         return None;
@@ -1493,11 +1494,16 @@ fn watch_resumed_by_id(
         .spawn(move || {
             let deadline = std::time::Instant::now() + window;
             loop {
-                pending.retain(|w| match mgr.exited_on_its_own(w.id) {
-                    // 会话已经不在名册上了（被清理掉了）：没什么可盯的。
-                    None => false,
-                    Some(false) => true,
-                    Some(true) => {
+                pending.retain(|w| match mgr.liveness(w.id) {
+                    Liveness::Running => true,
+                    // 被人停掉的（`stop`/`kill`）是用户的意思，不是接回失败：
+                    // 不重开、不报警告。没听说过的（早被别处拿掉了）也没什么可盯。
+                    Liveness::Ended(EndedHow::StoppedByUser | EndedHow::Killed)
+                    | Liveness::Unknown => false,
+                    // 自己退出了 = 接回失败。会话一停就从名册上抹掉，这里多半
+                    // 是从最近结束的记录里认出来的；`discard` 对已经不在名册上
+                    // 的会话什么都不做。
+                    Liveness::Ended(EndedHow::ExitedOnItsOwn) => {
                         let r = &w.record;
                         eprintln!(
                             "{}（{}）没能接回原来的对话，重新开一个",
@@ -3828,8 +3834,38 @@ mod tests {
             .join()
             .unwrap();
 
+        // 停掉的当场离开名册，看守线程也不能当成接回失败再开一个。
         let ids: Vec<u32> = mgr.list().iter().map(|s| s.id).collect();
-        assert_eq!(ids, vec![id], "不该多出一个新开的");
+        assert!(ids.is_empty(), "不该多出一个新开的：{ids:?}");
+        assert_eq!(
+            mgr.liveness(id),
+            crate::session::Liveness::Ended(crate::proto::EndedHow::StoppedByUser)
+        );
+        assert!(mgr.resume_skips().is_empty());
+    }
+
+    /// 接回之后被用户强行停掉（kill）：同上，不重开、不报警告。
+    #[test]
+    fn a_resumed_session_killed_on_purpose_is_not_restarted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("keep".into());
+
+        let mgr = Arc::new(SessionManager::new());
+        let (_, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        mgr.kill(by_id[0].id).unwrap();
+        let _tick = Ticker::start(&mgr);
+        watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(mgr.list().is_empty(), "{:?}", mgr.list());
         assert!(mgr.resume_skips().is_empty());
     }
 

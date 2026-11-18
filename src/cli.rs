@@ -1998,7 +1998,8 @@ mod tests {
 
     /// busy 只数 Working，idle 只数 Idle，total 是所有没停的——所以
     /// busy + idle 可以小于 total（Asking / Failed / Unknown 只进 total）。
-    /// Stopped 哪个都不进：停掉的会话留在列表里等 prune，但它没在跑。
+    /// Stopped 哪个都不进：停掉的会话一般当场就离开名册了，但守护进程平稳
+    /// 重启的最后一步（`kill_all_now`）会留下一瞬间的 Stopped，它没在跑。
     #[test]
     fn status_counts_busy_idle_and_total_from_mixed_states() {
         let v = status_value(&up(vec![

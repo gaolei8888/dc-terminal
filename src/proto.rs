@@ -146,7 +146,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 25 = 平稳重启（Drain/DrainStatus/DrainCancel）：多了 `Request::Drain` /
 /// `DrainStatus` / `DrainCancel`、`Response::DrainProgress`。同一个分支里
 /// 先加的 `Request::Submit`（语音的「写字 + 回车」）也算在这一号里。
-pub const PROTOCOL_VERSION: u32 = 25;
+///
+/// 26 = 会话一停就从名册上消失，问一个刚结束的会话不再只说「没有这个会话」：
+/// 多了 `ErrorCode::SessionEnded { id, how }`。**响应**里多了一个旧界面解不出
+/// 的变体，照 18 那次的规矩加一。
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,9 +367,9 @@ pub enum Request {
     },
     /// 把已经停掉的会话从名册上抹掉。
     ///
-    /// `Stop` 只把状态改成 `Stopped`，不删——守护进程活得很久，于是
-    /// `dct ps` 会越积越多的墓碑。删是一个**用户显式发起**的动作，不是
-    /// 守护进程定时干的：定时清会让「刚才那个会话去哪了」变成新问题。
+    /// 会话一停（`Stop`/`Kill`/agent 自己退出）就当场从名册上抹掉，所以这条
+    /// 通常什么都找不到；留着是因为老脚本会调 `dct prune`。「刚才那个会话
+    /// 去哪了」由最近结束的记录回答（`ErrorCode::SessionEnded`）。
     Prune,
     Undo {
         id: u32,
@@ -1209,6 +1213,10 @@ pub enum ErrorCode {
     DirNotFound(String),
     NotAGitRepo(String),
     NoSuchSession(u32),
+    /// 这个会话刚结束（守护进程还记得它是怎么结束的，见
+    /// `ended::RecentlyEnded`）。停了的会话当场就从名册上抹掉，所以「没有
+    /// 这个会话」对刚停掉的那个说不清——用户会以为编号敲错了。
+    SessionEnded { id: u32, how: EndedHow },
     NoCheckpoint,
     /// 「这个会话没有检查点」和「没有改动记录」成因其实是同一个：不是 agent
     /// 会话。措辞交给界面——它知道用户刚按的是 `u` 还是 `d`，比守护进程更有
@@ -1304,6 +1312,17 @@ pub enum MeshProblem {
     /// 同账号在线的电脑里有 `n` 台（≥2）都在发邀请码：一台都没试——试一台就
     /// 是给中转一次猜码的机会，而其中哪台是真的，这边分不出。
     SeveralInviters { n: u32 },
+}
+
+/// 一个会话是怎么结束的。见 [`ErrorCode::SessionEnded`]。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EndedHow {
+    /// `stop`（界面上的 `x`、`dct stop`）。
+    StoppedByUser,
+    /// `kill`（`dct kill`）。
+    Killed,
+    /// agent 自己退出了（`/exit`、崩溃、shell 里 `exit`）。
+    ExitedOnItsOwn,
 }
 
 /// 把一个 `ErrorCode` 塞进 `anyhow::Error` 里带出去。
@@ -1680,7 +1699,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                25,
+                26,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3,"now":true,"exe":"/x/dct"}},{"DrainStatus":{"renew":true}},"DrainCancel","Instance"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1697,7 +1716,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                25,
+                26,
                 r#"[{"DrainCancelled":{"told":[2,5]}},{"Instance":{"id":7}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1737,7 +1756,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                25,
+                26,
                 r#"{"DrainProgress":{"progress":{"waiting":[2],"remaining_s":9,"nudged":true},"done":false,"active":true}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1762,7 +1781,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                25,
+                26,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1877,7 +1896,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                25,
+                26,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":"","last_active_ms":0}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1980,8 +1999,26 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (25, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (26, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
+        );
+    }
+
+    /// 「会话已结束」的线上形状。网页端和旧脚本按字面认 `NoSuchSession`，
+    /// 这一条是 26 新加的，形状钉住，免得有人改了字段却不加版本号。
+    #[test]
+    fn the_session_ended_error_shape_is_pinned() {
+        let r = Response::Error(ErrorCode::SessionEnded {
+            id: 3,
+            how: EndedHow::ExitedOnItsOwn,
+        });
+        assert_eq!(
+            (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
+            (
+                26,
+                r#"{"Error":{"SessionEnded":{"id":3,"how":"ExitedOnItsOwn"}}}"#
+            ),
+            "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
 
@@ -1998,7 +2035,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (25, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (26, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -2075,7 +2112,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                25,
+                26,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -2112,7 +2149,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
             (
-                25,
+                26,
                 r#"{"MeshSent":"Delivered"}"#,
                 r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
                 r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
@@ -2151,7 +2188,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&v).unwrap().as_str()),
             (
-                25,
+                26,
                 r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"messages":{"7":2},"invite":{"id":3,"code":"012345","expires_at":1800000600},"invite_note":{"id":2,"outcome":{"Joined":{"name":"公司电脑"}}}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"

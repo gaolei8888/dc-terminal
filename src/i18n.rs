@@ -2091,6 +2091,28 @@ pub mod msg {
                 en: format!("Session {id} no longer exists"),
                 zh: format!("没有这个会话：{id}"),
             ),
+            // 会话一停就从名册上抹掉，所以刚停掉的那个也会走到这里。
+            // 说清「结束了、怎么结束的」，用户才不会以为编号敲错了。
+            SessionEnded { id, how } => {
+                use crate::proto::EndedHow::*;
+                match how {
+                    StoppedByUser => t!(
+                        lang,
+                        en: format!("Session {id} has ended (you stopped it)"),
+                        zh: format!("会话 {id} 已结束（你停掉的）"),
+                    ),
+                    Killed => t!(
+                        lang,
+                        en: format!("Session {id} has ended (it was killed)"),
+                        zh: format!("会话 {id} 已结束（被强行停掉）"),
+                    ),
+                    ExitedOnItsOwn => t!(
+                        lang,
+                        en: format!("Session {id} has ended (the agent exited)"),
+                        zh: format!("会话 {id} 已结束（agent 自己退出了）"),
+                    ),
+                }
+            }
             NoCheckpoint => t!(
                 lang,
                 en: "There is no checkpoint yet".to_string(),
@@ -3489,6 +3511,18 @@ mod tests {
             DirNotFound("/w/a".into()),
             NotAGitRepo("/w/a".into()),
             NoSuchSession(7),
+            SessionEnded {
+                id: 7,
+                how: crate::proto::EndedHow::StoppedByUser,
+            },
+            SessionEnded {
+                id: 7,
+                how: crate::proto::EndedHow::Killed,
+            },
+            SessionEnded {
+                id: 7,
+                how: crate::proto::EndedHow::ExitedOnItsOwn,
+            },
             NoCheckpoint,
             NotAnAgentSession,
             BadRequest("bad json".into()),

@@ -308,11 +308,26 @@ mod ps_and_stop {
         let (_, err, code) = d.run(&["stop", &id.to_string()]);
         assert_eq!(code, 0, "停成功该是 0，stderr：{err}");
 
+        // 停了就离开名册；再问它，守护进程说它是被你停掉的
+        assert_ended(&mut c, id, dct::proto::EndedHow::StoppedByUser);
+        let (out, _, _) = d.run(&["ps"]);
+        assert!(
+            !out.lines().any(|l| l.starts_with(&format!("{id} "))),
+            "停掉的不该还在 ps 里：{out}"
+        );
+
+        // 再停一次：说它已经结束了，而不是「没有这个会话」
+        let (_, err, _) = d.run(&["stop", &id.to_string()]);
+        assert!(err.contains("已结束") || err.contains("has ended"), "{err}");
+    }
+
+    /// 问一个已经结束的会话，守护进程要说它是怎么结束的。
+    fn assert_ended(c: &mut dct::client::Client, id: u32, want: dct::proto::EndedHow) {
         match c.call(dct::proto::Request::Screen { id }).unwrap() {
-            dct::proto::Response::Screen { state, .. } => {
-                assert_eq!(state, dct::session::SessionState::Stopped, "会话没真停")
+            dct::proto::Response::Error(dct::proto::ErrorCode::SessionEnded { id: got, how }) => {
+                assert_eq!((got, how), (id, want), "会话没真停")
             }
-            other => panic!("预期 Screen，实际 {other:?}"),
+            other => panic!("预期 SessionEnded，实际 {other:?}"),
         }
     }
 
@@ -387,14 +402,7 @@ mod ps_and_stop {
         assert_eq!(code, 0, "stderr：{err}");
 
         for id in ids {
-            match c.call(dct::proto::Request::Screen { id }).unwrap() {
-                dct::proto::Response::Screen { state, .. } => assert_eq!(
-                    state,
-                    dct::session::SessionState::Stopped,
-                    "{id} 号没被 --all 停掉"
-                ),
-                other => panic!("预期 Screen，实际 {other:?}"),
-            }
+            assert_ended(&mut c, id, dct::proto::EndedHow::StoppedByUser);
         }
     }
 
