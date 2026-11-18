@@ -48,7 +48,7 @@ pub use view::{
 };
 use view::{
     escape_hint, idle_help, is_plain_key, message_after_transition, session_ended_notice,
-    LiveInput, PairPhase, View,
+    session_gone_notice, LiveInput, PairPhase, View,
 };
 
 /// 启动时探测出来的终端背景。`run()` 设一次，之后只读。
@@ -1068,15 +1068,18 @@ pub fn run(
                 }
                 // 会话一停，守护进程就把它从名册上抹掉（不留墓碑，见
                 // `session::stop`），所以「会话结束了」更常见的样子是这一条：
-                // Screen 直接报没有这个会话。跟上面 Stopped 那支一样回看板——
-                // 落到 `_` 分支的话，用户会被晾在一张「连不上」的死页上。
-                Ok(Response::Error(crate::proto::ErrorCode::NoSuchSession(_))) => {
-                    app.connected = true;
-                    app.view = home_view(&app);
-                    app.need_sessions = true;
-                    app.message = crate::i18n::msg::session_ended(app.lang, id).into();
-                    app.sent_size = None;
-                }
+                // Screen 报这个会话已结束（或者早已没有）。跟上面 Stopped 那支
+                // 一样回看板——当成连不上的话，用户会被晾在一张死页上。
+                Ok(Response::Error(code)) => match session_gone_notice(id, &code, app.lang) {
+                    Some(notice) => {
+                        app.connected = true;
+                        app.view = home_view(&app);
+                        app.need_sessions = true;
+                        app.message = notice.into();
+                        app.sent_size = None;
+                    }
+                    None => app.connected = false,
+                },
                 _ => app.connected = false,
             }
         }

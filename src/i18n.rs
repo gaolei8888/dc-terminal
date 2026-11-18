@@ -1791,8 +1791,8 @@ pub mod msg {
     pub fn session_ended(lang: Lang, id: u32) -> String {
         t!(
             lang,
-            en: format!("Session {id} ended. Back to the board — press n to start another."),
-            zh: format!("会话 {id} 已结束，回到看板。按 n 再建一个"),
+            en: format!("Session {id} has ended"),
+            zh: format!("会话 {id} 已结束"),
         )
     }
 

@@ -1340,6 +1340,24 @@ pub(crate) fn session_ended_notice(id: u32, state: SessionState, lang: Lang) -> 
     }
 }
 
+/// 贴在会话里、`Screen` 报错之后：是不是这个会话已经没了，该回看板？
+/// 返回 `Some(提示语)` 的意思同 `session_ended_notice`。
+///
+/// 会话一停就从名册上抹掉，所以「结束了」在这里多半是 `SessionEnded`；
+/// `NoSuchSession` 也一样回看板（结束得太久、记录已经过期）。别的错误
+/// 不算——那是请求本身出了问题，会话可能好好的。
+pub(crate) fn session_gone_notice(
+    id: u32,
+    code: &crate::proto::ErrorCode,
+    lang: Lang,
+) -> Option<String> {
+    use crate::proto::ErrorCode::{NoSuchSession, SessionEnded};
+    match code {
+        NoSuchSession(_) | SessionEnded { .. } => Some(crate::i18n::msg::session_ended(lang, id)),
+        _ => None,
+    }
+}
+
 /// 底栏左段：逃生键提示。
 ///
 /// 这是唯一一条「不管出什么事都必须还在」的信息——用户找不到它就只能去
@@ -2643,6 +2661,29 @@ mod tests {
         let notice =
             session_ended_notice(4, SessionState::Stopped, Lang::Zh).expect("Stopped 必须回看板");
         assert!(notice.contains('4'), "提示要说清是哪个会话结束了：{notice}");
+    }
+
+    /// 贴着的会话结束后 `Screen` 报「已结束」：回看板，底栏一行「会话 N 已结束」。
+    #[test]
+    fn an_ended_session_sends_the_user_back_to_the_board_with_a_notice() {
+        use crate::proto::{EndedHow, ErrorCode};
+        for how in [EndedHow::StoppedByUser, EndedHow::Killed, EndedHow::ExitedOnItsOwn] {
+            let code = ErrorCode::SessionEnded { id: 4, how };
+            assert_eq!(
+                session_gone_notice(4, &code, Lang::Zh).as_deref(),
+                Some("会话 4 已结束")
+            );
+            assert_eq!(
+                session_gone_notice(4, &code, Lang::En).as_deref(),
+                Some("Session 4 has ended")
+            );
+        }
+        assert!(session_gone_notice(4, &ErrorCode::NoSuchSession(4), Lang::Zh).is_some());
+        // 别的错误不是会话没了，不能把用户踢出去。
+        assert_eq!(
+            session_gone_notice(4, &ErrorCode::NotAnAgentSession, Lang::Zh),
+            None
+        );
     }
 
     /// 活着的会话一个都不能被判成结束——把用户从正在用的 agent 里踢出去，
