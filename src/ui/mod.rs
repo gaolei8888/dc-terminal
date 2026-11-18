@@ -866,13 +866,9 @@ pub fn run(
                     // 只在 `List` 成功这一支里问 `LastProfile`：守护进程连不上
                     // 的时候连问都不问，断线期间不会每轮空转一遍。
                     refresh_project_profiles(&mut app);
-                    // 开机第一次拉完（而且是**成功**拉完）才补启动目录。放在
-                    // 失败路径上的话，第一轮连不上就会本地摆一个组上去，等到
-                    // 真连上、守护进程报回一份空的 `pinned`，它又被同步掉——
-                    // 看板重新变空，而这个一次性的补位已经用掉了。
+                    // 第一次成功拉取后，学生浏览器可直接进入唯一的活会话。
                     if !seeded {
                         seeded = true;
-                        seed_start_project(&mut app);
                         // A prepared student workspace usually has one running
                         // agent. Reopening its browser should resume typing there.
                         // Multiple live sessions keep the existing selection UI.
@@ -1070,6 +1066,17 @@ pub fn run(
                         app.explained_failure = None;
                     }
                 }
+                // 会话一停，守护进程就把它从名册上抹掉（不留墓碑，见
+                // `session::stop`），所以「会话结束了」更常见的样子是这一条：
+                // Screen 直接报没有这个会话。跟上面 Stopped 那支一样回看板——
+                // 落到 `_` 分支的话，用户会被晾在一张「连不上」的死页上。
+                Ok(Response::Error(crate::proto::ErrorCode::NoSuchSession(_))) => {
+                    app.connected = true;
+                    app.view = home_view(&app);
+                    app.need_sessions = true;
+                    app.message = crate::i18n::msg::session_ended(app.lang, id).into();
+                    app.sent_size = None;
+                }
                 _ => app.connected = false,
             }
         }
@@ -1228,6 +1235,12 @@ pub fn run(
         let message_error_before = app.message.error;
 
         dispatch_key(&mut app, key)?;
+        if matches!(
+            app.view,
+            View::Board | View::Grid { .. } | View::Attached(_)
+        ) {
+            app.pending_project = None;
+        }
         // 按键**可能**把光标挪到了另一个项目上（方向键、Tab、数字键、F3、
         // 九宫格里的方向键……）。挪到哪就 pin 哪，理由见 `pin_cursor_group`。
         // 放在整个 match 之后而不是逐个按键分支里：那些分支散在四个模块里，
@@ -1486,29 +1499,8 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
     }
 }
 
-/// `p` 选定之后：告诉守护进程记下来、更新本地 `pinned`、重算行、把光标
-/// 送到那个组上、回家视图，再为它开一个新终端。
-///
-/// **`p` 不是「把光标挪过去」。** 那件事是 `Tab`（零弹窗、一个键）。`p` 是
-/// 「我要去那个项目干活」：把它摆上看板、光标落进去，然后直接问「用哪个
-/// agent」。「当前项目」是光标动了的后果，不是 `p` 自己另有一套写法。
-///
-/// 抽成一个函数是因为选择器有两条确认路径（列表选中、手输路径），而这五步
-/// 必须整套发生。分开写的话，漏掉重算的那条路会让屏幕停在旧的一屏，而用户
-/// 刚刚明确选了一个项目——那正是上一版被判为「混乱」的手感。
-///
-/// **摆上来之后紧接着开一个新终端。** `p` 是用户唯一一次明确说出「我要去
-/// 那个项目」的地方（`Tab`/`1`…`9` 只是把光标挪过去看一眼，不在这条路上），
-/// 而他去那儿几乎总是为了在那儿干活。停在看板上等他再按一次 `N` 是白让人
-/// 走一步：他刚刚才做完「选哪个项目」这个决定，接着要做的「用哪个 agent」
-/// 是同一件事的下半句。
-///
-/// 走 `N` 那一支（选择器）而不是 `n`（直开上次那个）：新摆上来的项目多半
-/// 压根没有「上次那个 agent」，而**已有的项目也未必想再用同一个**——换项目
-/// 常常正是换了一件事。让他看一眼列表，代价是一次 `Enter`。
-///
-/// Esc 从选择器退出去落在看板上（见 `pick::handle_pick_profile`），项目已经
-/// 切好了——「只想换个项目看看」这条老路还在，只是多按一个键。
+/// `p` 选定项目后保存目录并选择 agent。没有会话的项目不占看板的一行，
+/// 创建目标由 `pending_project` 保存，取消选择后丢弃。
 pub(crate) fn pin_project(app: &mut App, dir: std::path::PathBuf) {
     add_project(app, dir);
     // 先回家视图再开选择器，顺序不能反：`open_new_session` 拉不到 agent
@@ -1589,7 +1581,7 @@ pub(crate) fn adopt_pinned(app: &mut App, fresh: Vec<String>) {
 /// 特例意味着「看板上有哪些组」要看光标在哪，两个本该独立的东西缠在一起）。
 ///
 /// 顺带把升级路径关上：`pinned` 是这条分支才有的东西，升级后第一次运行时
-/// 每个既有项目都是没 pin 的，而 `seed_start_project` 因为看板不空而不动手。
+/// 每个既有项目最初都可能还没 pin。
 /// 光标第一次落下就把自己那个项目 pin 上了。
 ///
 /// **按「组变了没有」发请求，不是按「光标动了没有」**：判据就是这个组自己
@@ -1617,9 +1609,7 @@ pub(crate) fn pin_cursor_group(app: &mut App) {
 
 /// 上面那五步里**不动视图**的前四步。
 ///
-/// 拆出来只为一个调用方：`seed_start_project`。它跑在后台路径上（主循环
-/// 第一次 `List` 成功之后），而 `pin_project` 最后那一行是「用户刚在选择器
-/// 里选定了一个项目，把他送回家」——这两件事只是碰巧共用前四步。
+/// 记住项目并选定新会话目录；有会话时也把光标移到对应组。
 pub(crate) fn add_project(app: &mut App, dir: std::path::PathBuf) {
     let d = dir.display().to_string();
     // 落盘失败不拦路：pinned 是便利性状态，本地先摆上，用户这一次照样能用。
@@ -1639,6 +1629,7 @@ pub(crate) fn add_project(app: &mut App, dir: std::path::PathBuf) {
     if let Some(gi) = app.groups.iter().position(|g| g.dir == key) {
         goto_project(app, gi);
     }
+    app.pending_project = Some(dir);
 }
 
 /// `x`：把光标所在的组从看板上拿掉。
@@ -1687,35 +1678,6 @@ pub(crate) fn unpin_current(app: &mut App) -> bool {
     app.pinned.retain(|p| view::canon(Path::new(p)) != key);
     app.refresh_rows();
     true
-}
-
-/// 开机兜底：看板上一个组都没有时，把启动目录摆上去。
-///
-/// 全新安装、或者第一次跑这一版时 `pinned` 是空的、也还没有任何会话。
-/// 没有这一步，用户第一眼看到的是一个连光标都落不下去的空盒子。摆上启动
-/// 目录之后，「看板上一个组都没有」这个状态在开机路径上就不存在了——光标
-/// 永远有地方落，`n` 永远有目标。
-///
-/// 已经有组了就不碰：启动目录跟用户手头这些项目未必有关系，硬塞一行进去
-/// 只是噪音。
-///
-/// **这是一条后台路径，不许换用户正看着的那一屏。** 它挂在主循环第一次
-/// `List` **成功**之后——守护进程要是慢上几轮（或者头几轮压根连不上），
-/// 这中间用户完全可能已经按 `N` 开了选择器、按 `l` 进了设置页。那时候
-/// 走 `pin_project`（它最后一行无条件 `app.view = home_view(app)`）会把人
-/// 从他自己打开的那一屏拽回看板，而他没有按过任何键。今天走不到只是因为
-/// 第一轮 `List` 几乎总是一次就成——那是运气，不是设计。
-///
-/// 本来就在看板/九宫格上才重算落点：那时候「回家」是恒等式，唯一的作用
-/// 是让刚摆上去的组在九宫格里也有个合理的焦点。
-pub(crate) fn seed_start_project(app: &mut App) {
-    if !app.groups.is_empty() {
-        return;
-    }
-    add_project(app, app.start_dir.clone());
-    if matches!(app.view, View::Board | View::Grid { .. }) {
-        app.view = home_view(app);
-    }
 }
 
 /// 守护进程报回来的 `pinned` 跟手里这份**指的是不是同一组项目**。
@@ -1852,14 +1814,18 @@ pub(crate) fn create_session(
         // `remember: false` —— 这不是用户选的 agent，记了下次按 `n` 会掉进
         // 一个命令行。同「帮你装 CLI」那条路。
         if let Ok(Response::Created { id }) = ask_to_create(app, dir, "shell", false) {
-            let line = format!("{}
-", command.join(" "));
+            let line = format!(
+                "{}
+",
+                command.join(" ")
+            );
             let _ = app
                 .client()
                 .and_then(|c| c.call(Request::Input { id, text: line }));
             app.message = crate::i18n::msg::logging_in(app.lang, profile).into();
             app.need_sessions = true;
             app.copy_mode = false;
+            app.pending_project = None;
             return Ok(Response::Created { id });
         }
         // 连登录窗口都开不出来时，把守护进程原来那句留在返回值里——`i18n::error`
@@ -1882,6 +1848,7 @@ pub(crate) fn create_session(
             // 建起来，下面那笔「这个项目上次用的是谁」不能记，记了他下次
             // 按 `n` 会掉进一个装 git 的命令行。
             pick::RepoPrep::Ready2Install(View::Attached(id)) => {
+                app.pending_project = None;
                 app.copy_mode = false;
                 return Ok(Response::Created { id });
             }
@@ -1913,6 +1880,9 @@ pub(crate) fn create_session(
     // 一个字不说是另一种毛病——他哪天自己发现，会不知道那是谁干的、能不能
     // 删。（选择器那条路自己已经说过一次，那条路不会走到这里：它在发请求
     // 之前就把仓库建好了，守护进程根本不会回 `NotAGitRepo`。）
+    if matches!(r, Ok(Response::Created { .. })) {
+        app.pending_project = None;
+    }
     if made_repo && matches!(r, Ok(Response::Created { .. })) {
         app.message = crate::i18n::msg::git_repo_created_for_you(app.lang).into();
     }
@@ -1937,7 +1907,9 @@ fn ask_to_create(app: &mut App, dir: &str, profile: &str, remember: bool) -> Res
 /// 那个组。从别的组进一个会话时，光标本来就已经在那个组里了（不然那一行
 /// 根本不会被选中），所以既没有什么可改，也没有什么可报告。
 fn sole_live_session(sessions: &[crate::session::SessionInfo]) -> Option<u32> {
-    let mut live = sessions.iter().filter(|s| s.state != crate::session::SessionState::Stopped);
+    let mut live = sessions
+        .iter()
+        .filter(|s| s.state != crate::session::SessionState::Stopped);
     let first = live.next()?.id;
     live.next().is_none().then_some(first)
 }
@@ -1945,6 +1917,7 @@ fn sole_live_session(sessions: &[crate::session::SessionInfo]) -> Option<u32> {
 pub(crate) fn enter_session(app: &mut App, id: u32) {
     // 会话标题要显示项目名
     app.need_sessions = true;
+    app.pending_project = None;
     app.view = View::Attached(id);
     // 每次「进入」都当成一次全新的观察：`explained_failure` 缓存的是
     // 「上一次贴在这个会话里时看到的解释」，如果这个会话在用户离开、
@@ -2145,6 +2118,7 @@ fn move_sel_n(st: &mut ListState, len: usize, delta: i32) {
 /// 上下走一行。行里既有组头也有会话行，两种都能停——空组只有组头，
 /// 停不上去的话那个项目就永远选不中，`n` 也就去不了。
 pub(crate) fn move_row(app: &mut App, delta: i32) {
+    app.pending_project = None;
     move_sel_n(&mut app.list_state, app.rows.len(), delta);
 }
 
@@ -2170,6 +2144,7 @@ pub(crate) fn goto_project(app: &mut App, gi: usize) {
     if gi >= app.groups.len() {
         return;
     }
+    app.pending_project = None;
     if let Some(i) = app.rows.iter().position(|r| *r == view::Row::Header(gi)) {
         app.list_state.select(Some(i));
     }
@@ -2426,8 +2401,17 @@ pub(crate) fn open_project_picker(app: &mut App) {
     // 自己从来没开过项目。
     match app.client().and_then(|c| c.call(Request::Projects)) {
         Ok(Response::Projects {
-            recent: mut all, ..
+            recent: mut all,
+            pinned,
+            ..
         }) => {
+            // 看板隐藏的保存项目仍可从这里搜索，包括已掉出最近使用列表的项目。
+            for dir in pinned {
+                let key = view::canon(Path::new(&dir));
+                if !all.iter().any(|p| view::canon(Path::new(p)) == key) {
+                    all.push(dir);
+                }
+            }
             // 全新守护进程列表是空的，补上启动目录，
             // 保证第一次用也不会看到空列表。
             let start = app.start_dir.display().to_string();
@@ -3487,8 +3471,15 @@ is_agent = true
             ("attach.rs", include_str!("attach.rs")),
             ("secret.rs", include_str!("secret.rs")),
         ] {
+            // **只扫生产部分**，跟下面 mod.rs 那段同一个道理：这些文件的
+            // `#[cfg(test)]` 里可能有一个假守护进程，它得 `match` 到
+            // `Request::Create` 才能答一个真的 `Created`（`pick.rs` 里那个
+            // `fake_daemon` 就是）。那是在**接收**这个请求，不是发它，
+            // 跟这条守卫要挡的事正好相反。整份文件一起扫的话，凡是给这些
+            // 文件补一条端到端测试的人都会撞上一条指不到真问题的红。
+            let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
             assert!(
-                !src.contains(needle),
+                !prod.contains(needle),
                 "{name} 自己发了 Create，绕过了 create_session 的缓存更新"
             );
         }
@@ -3638,7 +3629,9 @@ is_agent = true
                 (app, dir)
             }),
             ("正在直播", || live(crate::proto::LiveReadiness::Ready)),
-            ("正在连接中转", || live(crate::proto::LiveReadiness::Pending)),
+            ("正在连接中转", || {
+                live(crate::proto::LiveReadiness::Pending)
+            }),
             ("开播失败", || {
                 live(crate::proto::LiveReadiness::Failed(
                     crate::proto::LiveFailure::Unreachable,
@@ -3646,7 +3639,9 @@ is_agent = true
             }),
             ("正在公开直播", || {
                 let (mut app, dir) = live(crate::proto::LiveReadiness::Ready);
-                app.live.public = crate::proto::LivePublic::Listed { title: "第3课".into() };
+                app.live.public = crate::proto::LivePublic::Listed {
+                    title: "第3课".into(),
+                };
                 (app, dir)
             }),
             ("公开失败", || {
@@ -5453,8 +5448,14 @@ is_agent = true
             term.draw(|f| draw(f, &mut app)).unwrap();
             let bar = bar_text(&term);
 
-            assert!(bar.contains("正在直播"), "有消息时底栏没说「正在直播」：{bar}");
-            assert!(!bar.contains("出了点问题"), "错误消息不该压过直播提示：{bar}");
+            assert!(
+                bar.contains("正在直播"),
+                "有消息时底栏没说「正在直播」：{bar}"
+            );
+            assert!(
+                !bar.contains("出了点问题"),
+                "错误消息不该压过直播提示：{bar}"
+            );
         }
 
         // 档二：附着视图里正显示着滚动提示（`attach::scroll_hint`）。
@@ -5473,8 +5474,14 @@ is_agent = true
             term.draw(|f| draw(f, &mut app)).unwrap();
             let bar = bar_text(&term);
 
-            assert!(bar.contains("正在直播"), "滚动提示时底栏没说「正在直播」：{bar}");
-            assert!(!bar.contains("按End回到底部"), "滚动提示不该压过直播提示：{bar}");
+            assert!(
+                bar.contains("正在直播"),
+                "滚动提示时底栏没说「正在直播」：{bar}"
+            );
+            assert!(
+                !bar.contains("按End回到底部"),
+                "滚动提示不该压过直播提示：{bar}"
+            );
         }
 
         // 档三：看板上平时会画按键表（`n`/`p`/`c`……）的那一档。
@@ -5486,7 +5493,10 @@ is_agent = true
             term.draw(|f| draw(f, &mut app)).unwrap();
             let bar = bar_text(&term);
 
-            assert!(bar.contains("正在直播"), "按键表那一档底栏没说「正在直播」：{bar}");
+            assert!(
+                bar.contains("正在直播"),
+                "按键表那一档底栏没说「正在直播」：{bar}"
+            );
             assert!(
                 !bar.contains(&crate::i18n::text(crate::i18n::Key::New, app.lang).replace(' ', "")),
                 "按键表不该压过直播提示：{bar}"

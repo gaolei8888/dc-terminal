@@ -29,9 +29,10 @@ pub struct App {
     pub groups: Vec<super::view::ProjectGroup>,
     /// `groups` 展平成的行（组头 + 会话），`list_state` 选的是它的下标。
     pub rows: Vec<super::view::Row>,
-    /// 用户 pin 上看板的项目（守护进程给的）。跟 `sessions` 一起决定
-    /// 看板上出现哪些组——规则 1：有会话的 ∪ pinned 的。
+    /// 保存过的项目（守护进程给的）；没有会话的项目只在项目选择器里出现。
     pub pinned: Vec<String>,
+    /// 从项目选择器选定、正在为其创建会话的目录，不占看板的一行。
+    pub pending_project: Option<PathBuf>,
     /// 项目目录 → 上次用的 agent（守护进程给的），组头和底栏 `n` 要用。
     pub profiles: std::collections::BTreeMap<String, String>,
     /// 已经问过守护进程「上次用的是哪个 agent」的项目目录（canon 后的）。
@@ -253,6 +254,7 @@ impl App {
             groups: Vec::new(),
             rows: Vec::new(),
             pinned: Vec::new(),
+            pending_project: None,
             profiles: std::collections::BTreeMap::new(),
             profiles_asked: std::collections::BTreeSet::new(),
             view_mode,
@@ -397,7 +399,7 @@ impl App {
         }
     }
 
-    /// 从 `sessions` + `pinned` 重算分组和行，并把光标钉回原来那个东西上。
+    /// 从会话重算看板分组和行；保存过但没有会话的项目只留在选择器。
     ///
     /// **先取锚点再重算**：顺序反了的话锚点取的是新列表里的东西，
     /// 等于没锚。
@@ -421,6 +423,7 @@ impl App {
             .collect();
 
         self.groups = super::view::group_sessions(&self.sessions, &self.pinned, &self.profiles);
+        self.groups.retain(|g| !g.sessions.is_empty());
         for g in &mut self.groups {
             g.collapsed = collapsed.contains(&g.dir);
         }
@@ -460,18 +463,18 @@ impl App {
             .collect()
     }
 
-    /// 光标所在的组。**这是「当前项目」唯一的答案处。**
+    /// 看板光标所在的项目；创建中的目标目录另由 pending_project 保存。
     pub fn current_group(&self) -> Option<&super::view::ProjectGroup> {
         let i = self.list_state.selected()?;
         let gi = super::view::group_of(&self.rows, i)?;
         self.groups.get(gi)
     }
 
-    /// 新会话开在哪。没有任何组时（只可能发生在还没拉到列表的第一帧）
-    /// 退回启动目录。
+    /// 创建中的会话使用明确选定的目录，否则使用光标所在项目或启动目录。
     pub fn current_dir(&self) -> PathBuf {
-        self.current_group()
-            .map(|g| g.dir.clone())
+        self.pending_project
+            .clone()
+            .or_else(|| self.current_group().map(|g| g.dir.clone()))
             .unwrap_or_else(|| self.start_dir.clone())
     }
 
@@ -614,6 +617,19 @@ mod tests {
         assert!(matches!(app.view, View::Grid { focus: 0, .. }));
     }
 
+    #[test]
+    fn saved_projects_without_sessions_are_not_board_destinations() {
+        let (mut app, _d) = App::test_app();
+        app.pinned = vec!["/w/empty".into(), "/w/work".into()];
+        app.set_sessions(vec![sess(1, "/w/work")]);
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].name, "work");
+        assert_eq!(app.pinned.len(), 2, "项目选择器仍能使用保存的项目");
+        app.set_sessions(vec![]);
+        assert!(app.groups.is_empty());
+        assert!(app.list_state.selected().is_none());
+    }
+
     /// 主循环每轮拿到新的会话列表时走这条路。存在的理由是「赋值 + 重算」
     /// 必须成对发生 —— 直接写 `app.sessions = v` 的话，屏幕会拿旧的
     /// `rows` 再画一帧，刚开的会话要等下一轮才出现。
@@ -641,9 +657,9 @@ mod tests {
         assert_eq!(app.selected_session().map(|s| s.id), Some(7));
     }
 
-    /// 组不塌陷：最后一个会话没了，组变空留在原地，光标落到它自己的组头上。
+    /// 最后一个会话删除后，光标回落到仍有会话的项目。
     #[test]
-    fn a_group_that_loses_its_last_session_keeps_the_cursor() {
+    fn a_group_that_loses_its_last_session_leaves_the_board() {
         let (mut app, _d) = App::test_app();
         app.pinned = vec!["/w/b".to_string()];
         app.set_sessions(vec![sess(1, "/w/a"), sess(7, "/w/b")]);
@@ -651,12 +667,8 @@ mod tests {
 
         app.set_sessions(vec![sess(1, "/w/a")]);
 
-        assert_eq!(app.groups.len(), 2, "pinned 的空组留在看板上");
-        assert_eq!(
-            app.current_group().map(|g| g.name.clone()),
-            Some("b".to_string()),
-            "光标还在 b 上，没有滑回 a"
-        );
+        assert_eq!(app.groups.len(), 1, "没有会话的项目退出看板");
+        assert_eq!(app.current_group().map(|g| g.name.as_str()), Some("a"));
     }
 
     #[test]

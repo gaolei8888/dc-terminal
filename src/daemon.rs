@@ -3971,14 +3971,24 @@ mod tests {
         assert_ne!(zh, en, "换了语言，菜单文案必须真的跟着变");
     }
 
-    /// 回归测试，对应审查发现「密钥仓的锁被握过了整个 create()」：以前 `handle()`
-    /// 会在建会话的整段慢流程（PTY 起进程、agent 场景下的 git checkpoint）期间
-    /// 一直攥着 secrets 锁。Task 8 加了 SetSecret/DeleteSecret，这两个本该极快的
-    /// 操作绝不能被一个正在建的慢会话堵住排队。
+    /// **建会话必须快，而且不许攥着密钥仓的锁。** 两件事一条测试。
     ///
-    /// 直接调用 `handle()` 而不是走真实 socket，是为了最直接地量最本质的东西：
-    /// 慢 `Create` 跑在一个线程时，另一个线程单纯去锁 `secrets` 这把 `Mutex`
-    /// 本身，应该几乎立即拿到，不必等 `Create` 收工。
+    /// 「快」是 2026-09-26 那次事故的成文版：第一次 git checkpoint 原来是
+    /// 同步拍的，耗时跟工作树大小走——22GB 的项目实测 43.77 秒，而界面那条
+    /// 连接只等 5 秒（`client::READ_TIMEOUT`）。于是守护进程把会话建出来了，
+    /// 界面却超时、停在选择器上报一句「建不起来」；用户看到「选了没反应」，
+    /// 再选一次，同一个项目里攒出一串重复会话（实测一次攒了六个）。快照
+    /// 已经挪进后台线程（见
+    /// `session::tests::creating_a_session_is_not_held_up_by_the_first_checkpoint`），
+    /// 这里用一个**故意造大的仓库**钉住它不许挪回来。
+    ///
+    /// 「不许持锁」是更早一次审查的回归：`handle()` 曾经在建会话的整段流程里
+    /// 一直攥着 secrets 锁，而 `SetSecret`/`DeleteSecret` 这两个本该极快的
+    /// 操作绝不能被堵住排队。慢活挪走之后这条已经不容易踩中，但断言留着——
+    /// 哪天又有人往 `Create` 里塞同步慢活，上面那条先红，这条随后。
+    ///
+    /// 直接调用 `handle()` 而不是走真实 socket，是为了最直接地量最本质的
+    /// 东西，不掺网络往返的噪音。
     #[test]
     fn create_does_not_hold_the_secrets_lock_across_the_slow_work() {
         let repo = tempfile::tempdir().unwrap();
@@ -4026,8 +4036,8 @@ mod tests {
             (t.elapsed(), resp)
         });
 
-        // 给慢 Create 一点时间真正进到 git checkpoint 里
-        std::thread::sleep(Duration::from_millis(150));
+        // 让 Create 那个线程先跑起来，再去抢锁。
+        std::thread::sleep(Duration::from_millis(5));
 
         let t = Instant::now();
         drop(recover(secrets.lock()));

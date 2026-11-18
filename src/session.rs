@@ -1779,11 +1779,15 @@ impl SessionManager {
             self.journal.died(id, crate::journal::Death::Requested, pid);
             Ok(())
         });
-        // **必须在 `with_session` 返回之后调用**：`persist_last_sessions`
-        // 会重新去锁这同一个会话的 `Mutex`（拿它此刻的状态），锁是非重入的，
-        // 挂在上面那个闭包里面调会死锁——`with_session` 这一刻还攥着它。
+        // **停了就从名册上抹掉，不留墓碑。** 已停止的会话没有进程、不能
+        // 再用（对话在 agent 自己那边，要接着聊是新开一个会话去 resume），
+        // 留在看板上只会越积越多。`prune()` 顺带重写清单。
+        //
+        // **必须在 `with_session` 返回之后调用**：`prune` 会重新去锁这同一个
+        // 会话的 `Mutex`，锁是非重入的，挂在上面那个闭包里面调会死锁——
+        // `with_session` 这一刻还攥着它。
         if r.is_ok() {
-            self.persist_last_sessions();
+            self.prune();
         }
         r
     }
@@ -1800,10 +1804,10 @@ impl SessionManager {
             s.stopped_by_request = true;
             Ok(())
         });
-        // 理由同 `stop()`：不能在 `with_session` 的闭包里调，会跟它手上
-        // 那把还没放开的会话锁死锁。
+        // 理由同 `stop()`：停了就抹掉；不能在 `with_session` 的闭包里调，
+        // 会跟它手上那把还没放开的会话锁死锁。
         if r.is_ok() {
-            self.persist_last_sessions();
+            self.prune();
         }
         r
     }
@@ -1838,9 +1842,8 @@ impl SessionManager {
             let mut map = recover(self.sessions.lock());
             dead.iter().filter(|id| map.remove(id).is_some()).count() as u32
         };
-        // 真删掉了才重写清单——这也是「进程自己崩了」（tick() 的
-        // vanished 分支不写清单）唯一被清单追上的地方：那条分支只把
-        // 状态标成 Stopped，`prune()` 才真正把它从活着的集合里摘掉。
+        // 真删掉了才重写清单。`stop()`/`kill()`/`tick()` 的 vanished
+        // 分支都靠这一步落盘：它们把会话标成 Stopped 后立刻调这里。
         if removed > 0 {
             self.persist_last_sessions();
         }
@@ -1943,8 +1946,11 @@ impl SessionManager {
                 // 在这里调用是安全的：`s` 是这个会话自己的锁，`drop(s)` 先
                 // 松开、`persist_last_sessions` 再重新逐个上锁，跟
                 // Working → Idle 那条路径是同一套顺序。
+                //
+                // 自己退出的会话同样不留墓碑，理由见 `stop()`：`prune()` 把它
+                // 从名册上抹掉，并顺带重写清单。
                 drop(s);
-                self.persist_last_sessions();
+                self.prune();
                 continue;
             }
             if s.state == SessionState::Asking {
@@ -2444,6 +2450,11 @@ mod tests {
     /// 省得每条断言都重新拼一遍 `list().iter().find(...)`。
     fn state_of(mgr: &SessionManager, id: u32) -> SessionState {
         mgr.list().into_iter().find(|s| s.id == id).unwrap().state
+    }
+
+    /// 会话停了就从名册上消失（不留墓碑），「停了」在名册上的样子就是「没了」。
+    fn is_gone(mgr: &SessionManager, id: u32) -> bool {
+        !mgr.list().iter().any(|s| s.id == id)
     }
 
     // 用 cat 冒充 agent：能收输入、不会自己退出
@@ -3576,12 +3587,12 @@ mod tests {
         );
     }
 
-    /// `stop()` 只把状态改成 `Stopped`，从不删——守护进程活得很久，于是
-    /// `dct ps` 会越积越多的墓碑。`prune()` 是把它们抹掉的那一步，而且
-    /// **只抹已经停了的**：还在跑的会话被顺手删掉，用户就再也够不着它了
-    /// （pty 还在守护进程里活着，但名册上没有它，停都停不掉）。
+    /// 停掉的会话不能再用（进程没了，对话在 agent 自己那边），留着只是
+    /// 墓碑：守护进程活得很久，看板会越积越多。所以 `stop()` 当场就抹掉，
+    /// 而且**只抹它停掉的那个**：还在跑的会话被顺手删掉，用户就再也够不着
+    /// 它了（pty 还在守护进程里活着，但名册上没有它，停都停不掉）。
     #[test]
-    fn prune_removes_stopped_sessions_and_leaves_the_rest() {
+    fn stop_removes_the_session_and_leaves_the_rest() {
         let plain = tempfile::tempdir().unwrap();
         let m = SessionManager::new();
         let dead = m
@@ -3592,11 +3603,10 @@ mod tests {
             .unwrap();
         m.stop(dead).unwrap();
 
-        assert_eq!(m.prune(), 1, "只该抹掉那个已经停了的");
         let left: Vec<u32> = m.list().iter().map(|s| s.id).collect();
-        assert_eq!(left, vec![alive], "还在跑的必须留着");
+        assert_eq!(left, vec![alive], "停掉的当场就该没了，还在跑的必须留着");
 
-        // 再来一次没东西可抹了——已经抹过的不该被数第二遍
+        // `dct prune` 还在（老脚本会调），但已经没有墓碑可抹了
         assert_eq!(m.prune(), 0);
     }
 
@@ -3619,10 +3629,9 @@ mod tests {
 
         m.kill(id).unwrap();
 
-        let s = m.list().into_iter().find(|s| s.id == id).unwrap();
-        assert_eq!(s.state, SessionState::Stopped);
-        // 杀完就该能被 prune 掉，跟 stop 出来的墓碑一视同仁
-        assert_eq!(m.prune(), 1);
+        // 跟 stop 一视同仁：杀完当场从名册上抹掉，不留墓碑
+        assert!(is_gone(&m, id), "杀掉的会话不该还挂在名册上");
+        assert_eq!(m.prune(), 0);
     }
 
     #[test]
@@ -3976,10 +3985,8 @@ mod tests {
         m.stop(id).unwrap();
         m.tick();
 
-        assert_eq!(
-            m.list().iter().find(|s| s.id == id).unwrap().state,
-            SessionState::Stopped
-        );
+        // 停掉就没了；tick() 也不能把它以 Failed 之类的状态捡回名册
+        assert!(is_gone(&m, id));
     }
 
     #[test]
@@ -4069,13 +4076,14 @@ mod tests {
     }
 
     /// agent 自己退出（用户在 Claude Code 里敲 /exit、或 shell 里敲 exit）之后，
-    /// `screen()` 必须把 `Stopped` 捎回去。界面贴在会话里时只调 `Screen`，这是它
-    /// 唯一能知道进程已经没了的途径；捎不回来就会一直画那张空缓冲。
+    /// 会话要从名册上消失，`screen()` 报「没有这个会话」。界面贴在会话里时只调
+    /// `Screen`，这是它唯一能知道进程已经没了的途径（界面收到这个错就回看板）；
+    /// 一直给一张空缓冲的话，用户会被晾在一张死页上。
     ///
     /// 空缓冲本身是正常的：agent 在 alternate screen 里画，退出时恢复主屏，
-    /// 而主屏从来没被写过。所以「屏是空的」不能用来判断会话死活，只有状态能。
+    /// 而主屏从来没被写过。所以「屏是空的」不能用来判断会话死活。
     #[test]
-    fn screen_reports_stopped_after_the_process_exits() {
+    fn a_session_whose_process_exits_leaves_the_roster() {
         let repo = init_repo();
         let m = SessionManager::new();
         let mut exits = fake_agent();
@@ -4085,17 +4093,19 @@ mod tests {
         m.register_profile(exits);
         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
 
-        // 进程退出要一点时间，tick() 是把 is_alive() 落成 Stopped 的那一步
+        // 进程退出要一点时间，tick() 是发现 is_alive() 为假、把它抹掉的那一步
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             m.tick();
-            let state = m.screen(id).unwrap().state;
-            if state == SessionState::Stopped {
+            let Ok(screen) = m.screen(id) else {
+                assert!(is_gone(&m, id));
                 break;
-            }
+            };
+            assert_ne!(screen.state, SessionState::Stopped, "停了就不该还查得到");
             assert!(
                 std::time::Instant::now() < deadline,
-                "进程早该退出了，screen() 却一直报 {state:?}"
+                "进程早该退出了，screen() 却一直报 {:?}",
+                screen.state
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -4115,14 +4125,13 @@ mod tests {
     }
 
     #[test]
-    fn stop_marks_stopped() {
+    fn stop_removes_the_session() {
         let repo = init_repo();
         let m = SessionManager::new();
         m.register_profile(fake_agent());
         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
         m.stop(id).unwrap();
-        let st = m.list().iter().find(|s| s.id == id).unwrap().state;
-        assert_eq!(st, SessionState::Stopped);
+        assert!(is_gone(&m, id));
     }
 
     /// 守护进程常常是从某个 agent 自己的会话里被拉起来的——用户在 Claude Code
@@ -5076,7 +5085,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             mgr.tick();
-            if state_of(&mgr, id_b) == SessionState::Stopped {
+            if is_gone(&mgr, id_b) {
                 break;
             }
             assert!(Instant::now() < deadline, "B 应该已经自己退出了");

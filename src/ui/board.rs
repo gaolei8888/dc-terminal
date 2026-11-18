@@ -13,16 +13,9 @@ use super::{
 };
 use crate::i18n::{msg, text, Key};
 
-/// 组头上，最后一格（「还没有会话 …」/ agent 统计）之前的所有东西占几列。
-///
-/// `2` 是 `List` 为 `highlight_symbol("▶ ")` 在**每一行**预留的宽度——不是
-/// 只给选中那一行，这是最容易在算宽度时漏掉的一段。其余依次是：项目色条 1、
-/// 序号 3、折叠箭头 2、项目名 18、父目录 18。
-const HEADER_PREFIX_COLS: usize = 2 + 1 + 3 + 2 + 18 + 18;
-
 /// 会话行上 activity 之前占几列：`highlight_symbol` 2、项目色条 1、
-/// `  {id:>3}  ` 7、状态 8、名字 16。
-const SESSION_PREFIX_COLS: usize = 2 + 1 + 7 + 8 + 16;
+/// `  {id:>3}  ` 7、状态 8、智能体 10、名字 16。
+const SESSION_PREFIX_COLS: usize = 2 + 1 + 7 + 8 + 10 + 16;
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -249,46 +242,6 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     spans.push(Span::styled(pad_to(&truncate(&g.parent, 16), 18), dim()));
                     if gone {
                         spans.push(Span::styled(text(Key::ProjectDirGone, app.lang), dim()));
-                    } else if g.sessions.is_empty() {
-                        // 空项目的组头上补一句「上次用的是谁」。
-                        //
-                        // 「哪个项目用哪个 agent」本来只有底栏那一条 `n 新建
-                        // <agent>` 答得出，而底栏在 80 列上会把 agent 名让掉
-                        // （`bar_keys` 里那条「让的是半句说明、不是一个键」），
-                        // 于是一个还没有会话的项目在整个屏幕上无处可查——而
-                        // 这正是这次改造被提出来时的那句话。
-                        //
-                        // 接在这一格后面而不是另开一列：这一格本来就只有
-                        // 「还没有会话」这半句，右边全是空白。从没记过 agent
-                        // 的项目照旧只写原来那句，不编一个名字出来。
-                        //
-                        // 宽度：这一格拿到的是**整行减去前缀**，而前缀里有一段
-                        // 容易漏掉的——`List` 给 `highlight_symbol("▶ ")` 在
-                        // **每一行**都预留两列，不只是选中那行。算漏它的话
-                        // 80 列上这句会正好被右边框切掉尾巴（最长的内置 agent
-                        // 名是 8 列：`opencode`/`deepseek`/`qwen-api`）。
-                        // 自建 profile 的名字要多长有多长，所以除了把文案收短，
-                        // 还得真按剩下的宽度裁一次。
-                        //
-                        // 传给 `truncate` 的是 `room - 1`，不是 `room`：它**真的
-                        // 裁了**的时候返回的是 `max + 1` 列——那个 `…` 是在长度
-                        // 判断之后才追加的（`widgets::truncate`，同 `:134` 那行
-                        // 父目录为什么写 16 填 18）。照 `room` 传的话，省略号
-                        // 自己正好落在边框那一列上被 ratatui 剪掉，屏幕上留下一个
-                        // 齐齐整整、看不出被截过的名字——正是这段代码要防的那件事，
-                        // 只是换了个更隐蔽的样子。
-                        let hint = text(Key::NoSessionsHere, app.lang);
-                        let line = match &g.last_profile {
-                            Some(p) => {
-                                format!("{hint} · {} {p}", text(Key::LastUsedAgent, app.lang))
-                            }
-                            None => hint.to_string(),
-                        };
-                        // 列表这个块只画上下边框（`Borders::TOP | Borders::BOTTOM`），
-                        // 左右不再吃掉列——复制文字不该带上边框字符——所以
-                        // 这里不用再像改动前那样先减 2 补偿左右边框。
-                        let room = (area.width as usize).saturating_sub(HEADER_PREFIX_COLS);
-                        spans.push(Span::styled(truncate(&line, room.saturating_sub(1)), dim()));
                     } else {
                         let agents: Vec<String> = g
                             .agent_counts()
@@ -314,7 +267,9 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     // 整行总宽不变。传 15 给 truncate 而不是 16 —— 它真裁了的
                     // 时候返回的是 max + 1 列（那个 `…` 是长度判断之后才追加的），
                     // 照 16 传的话省略号会把列宽顶宽一格。
-                    spans.push(Span::raw(pad_to(&truncate(session_label(s), 15), 16)));
+                    spans.push(Span::styled(pad_to(&truncate(&s.profile, 9), 10), dim()));
+                    let name = if s.tag.is_empty() { "" } else { session_label(s) };
+                    spans.push(Span::raw(pad_to(&truncate(name, 15), 16)));
                     // 行尾的标记：上架（在播）和别的电脑送来的留言条数。
                     let mut marks: Vec<String> = Vec::new();
                     // 上架标记接在最末尾，不抢前面任何一列的宽度：老师切到
@@ -378,11 +333,18 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let (prompt_area, list_area, section_area) = split(inner, prompt.len(), section.len());
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(prompt), prompt_area);
-    f.render_stateful_widget(
-        List::new(items).highlight_symbol("▶ "),
-        list_area,
-        &mut app.list_state,
-    );
+    if app.rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(text(Key::NoSessionsChooseProject, app.lang)).centered(),
+            list_area,
+        );
+    } else {
+        f.render_stateful_widget(
+            List::new(items).highlight_symbol("▶ "),
+            list_area,
+            &mut app.list_state,
+        );
+    }
     f.render_widget(Paragraph::new(section), section_area);
 }
 
@@ -582,7 +544,7 @@ mod tests {
     /// 几次**：名字列如果也被换成 profile，`claude` 就会在组头之外再多冒
     /// 一次。
     #[test]
-    fn the_session_row_shows_the_name_not_the_profile() {
+    fn the_session_row_shows_the_name_and_profile() {
         let (mut app, dir) = App::test_app();
         let proj = real_dir(&dir, "proj");
         let mut s = sess(1, &proj);
@@ -594,12 +556,23 @@ mod tests {
 
         let c = screen_text(&term);
         assert!(c.contains("改登录页文案"), "会话行必须画出名字：{c}");
-        assert_eq!(
-            c.matches("claude").count(),
-            1,
-            "claude 只该在组头的 agent 统计里出现一次；如果名字列被换回 s.profile，\
-             这里会变成 2：{c}"
-        );
+        assert_eq!(c.matches("claude").count(), 2, "组头和会话行都应显示智能体：{c}");
+    }
+
+    #[test]
+    fn each_session_row_shows_its_own_agent() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut first = sess(1, &proj);
+        first.tag = "FIRST_TASK".into();
+        let mut second = sess(2, &proj);
+        second.profile = "codex".into();
+        second.tag = "SECOND_TASK".into();
+        app.set_sessions(vec![first, second]);
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        assert!(row_with(&term, "FIRST_TASK").contains("claude"));
+        assert!(row_with(&term, "SECOND_TASK").contains("codex"));
     }
 
     /// **杀变异③**：`pad_to(…, 16)` 被删掉。
@@ -1040,125 +1013,20 @@ mod tests {
         );
     }
 
-    /// **还没有会话的项目，组头上要写出它上次用的是哪个 agent。**
-    ///
-    /// 「哪个项目用哪个 agent」在别处只有底栏那一条 `n 新建 <agent>` 答得出，
-    /// 而底栏在 80 列上放不下时会把 agent 名让掉——于是一个空项目在整个屏幕
-    /// 上没有一处答得出这个问题，而那正是这次改造被提出来时的那句话。
-    ///
-    /// **两种语言都在 80 列上验一遍**：中文双宽字少、英文单宽词长，谁先撞到
-    /// 右边界不是想当然的。
-    ///
-    /// **用最长的那个 agent 名，不是最短的。** 内置 profile 里最长的是 8 列
-    /// （`opencode`/`deepseek`/`qwen-api`，`profiles/` 里数出来的），而
-    /// `claude` 只有 6 列——拿 `claude` 测出来的「放得下」在真实的 8 列名字
-    /// 上会被右边框静默切掉两列。这个 fixture 把最长的那个也过一遍。
     #[test]
-    fn an_empty_project_names_the_agent_it_last_used() {
-        // 键名列宽度无关，测的是最短和最长两档都完整
-        for agent in ["claude", "opencode"] {
-            for (lang, want) in [
-                (crate::i18n::Lang::Zh, format!("上次用{agent}")),
-                (crate::i18n::Lang::En, format!("lastused{agent}")),
-            ] {
-                let (mut app, dir) = App::test_app();
-                app.lang = lang;
-                let proj = real_dir(&dir, "我的项目");
-                app.pinned = vec![proj.clone()];
-                app.profiles.insert(
-                    super::super::view::canon(std::path::Path::new(&proj))
-                        .display()
-                        .to_string(),
-                    agent.into(),
-                );
-                app.set_sessions(vec![]);
-                assert!(app.groups[0].sessions.is_empty(), "前提：一个会话都没有");
-
-                let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-                term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
-
-                let c = screen_text(&term);
-                assert!(c.contains(&want), "{lang:?}/80 列下少了「{want}」：{c}");
-            }
+    fn saved_empty_projects_leave_a_start_hint_instead_of_rows() {
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let (mut app, _dir) = App::test_app();
+            app.lang = lang;
+            app.pinned = vec!["/w/unused-project".into()];
+            app.set_sessions(vec![]);
+            let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+            let c = screen_text(&term);
+            assert!(!c.contains("unused-project"));
+            let hint = text(Key::NoSessionsChooseProject, lang).replace(' ', "");
+            assert!(c.contains(&hint), "空看板必须说明如何开始：{c}");
         }
-    }
-
-    /// 自建 profile 的名字要多长有多长。放不下时要看得见一个 `…`——被这一行
-    /// 的右边缘无声吃掉的话，用户根本不知道后面还有字。
-    ///
-    /// **断言必须钉到那个省略号出现在哪一个字之后**，不能只问「这一屏上有没有
-    /// `…`」：父目录那一列自己就会裁出一个（临时目录的路径很长），于是
-    /// `contains('…')` 无论截断代码在不在都是真的。这条测试第一版就是那么写的，
-    /// 删掉整段截断照样绿——评审抓到了，这里记下来。
-    ///
-    /// 这一条同时从**两个**方向钉住 `HEADER_PREFIX_COLS` 和那次
-    /// `saturating_sub(1)`：
-    ///
-    /// - 截断整个删掉 → 这一格铺到 36 列被 `List` 按区域宽度剪断，屏幕上
-    ///   没有省略号；
-    /// - 常量小了（`room` 变大）→ 裁得更靠后，`truncate` 返回 `max+1` 列，
-    ///   省略号越过这一行的宽度被剪掉，屏幕上同样没有它；
-    /// - 常量大了 → 裁得更靠前，省略号在别的字后面。
-    ///
-    /// 三种都对不上下面那个字面量。
-    #[test]
-    fn an_over_long_agent_name_is_cut_visibly_not_by_the_border() {
-        let (mut app, dir) = App::test_app();
-        app.lang = crate::i18n::Lang::En;
-        let proj = real_dir(&dir, "我的项目");
-        app.pinned = vec![proj.clone()];
-        app.profiles.insert(
-            super::super::view::canon(std::path::Path::new(&proj))
-                .display()
-                .to_string(),
-            "an-absurdly-long-locally-defined-agent".into(),
-        );
-        app.set_sessions(vec![]);
-
-        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
-
-        // 80 列：这个块只画上下边框，不再吃列，前缀 44，这一格 36 列。
-        // `no sessions · last used ` 占 24，`truncate` 拿到 35，于是名字
-        // 露出 11 个字符再补一个 `…`——一共 36 列，一列不多一列不少。
-        let c = screen_text(&term);
-        assert!(
-            c.contains("lastusedan-absurdly…"),
-            "省略号必须自己也画得出来，而不是被截断悄悄吃掉：{c}"
-        );
-    }
-
-    /// 内置 profile 名字最长 8 列——`an_empty_project_names_the_agent_it_last_used`
-    /// 里那个 `opencode` 是照着 `profiles/` 挑的，不是随手写的。哪天加进来一个
-    /// 更长的，这条会红，提醒去看那个宽度还够不够。
-    #[test]
-    fn no_builtin_agent_name_is_wider_than_the_header_budget_allows() {
-        let longest = crate::profile::Profile::builtin_names()
-            .into_iter()
-            .max_by_key(|n| super::super::widgets::display_width(n))
-            .unwrap();
-        assert_eq!(
-            super::super::widgets::display_width(longest),
-            8,
-            "内置 agent 名最长 8 列（{longest}）；变了就去复核组头那一格的宽度"
-        );
-    }
-
-    /// 从没记过 agent 的项目照旧只写原来那句——不编一个名字出来，
-    /// 也不留一个「上次用 」的空尾巴。
-    #[test]
-    fn an_empty_project_with_no_recorded_agent_says_only_what_it_knows() {
-        let (mut app, dir) = App::test_app();
-        let proj = real_dir(&dir, "崭新项目");
-        app.pinned = vec![proj];
-        app.set_sessions(vec![]);
-
-        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
-
-        let c = screen_text(&term);
-        assert!(c.contains("还没有会话"), "原来那句还在：{c}");
-        assert!(!c.contains("上次用"), "没有记录就别起头说一半：{c}");
     }
 
     /// 「当前项目 = 光标所在的组」，所以进一个别的组的会话既不需要改写

@@ -37,14 +37,7 @@ struct Group {
 /// 拿到的是 `NotAnAgentSession`。
 fn groups(from: &View, ctx: HelpCtx, lang: Lang) -> Vec<Group> {
     let in_grid = matches!(from, View::Grid { .. });
-    // 方向键这一条不设前提，跟下面那些键不同。理由不是「看板上总有一个组」——
-    // 那句话是假的：`App::new` 的 `pinned` 是空的，开机补启动目录那一下
-    // （`seed_start_project`）要等守护进程第一次 `List` 回来才发生，中间那几十
-    // 毫秒看板真的一行都没有。写在这里的理由是**代价**：其余的键按不动时会
-    // 弹一句错（`u` 拿到 `NotAnAgentSession`）或者悄悄什么都不发生，用户会
-    // 以为自己按错了；空列表上按方向键则是所有人对列表的既有预期，没有任何
-    // 需要解释的后果。而且这一条是这一组的**锚**——把它也去掉，那半秒里
-    // 「走动」组会是个空标题。
+    // 空看板也保留方向键说明；在空列表上移动是安全的无操作。
     let mut move_keys: Vec<HelpItem> = help_items(
         &[if in_grid {
             ("", Key::MoveArrows)

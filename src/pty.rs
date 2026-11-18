@@ -152,18 +152,34 @@ impl PtySession {
         // 认得出的 agent 一个都起不来（见 `sys::shell::launch_argv`）。
         let cmd = crate::sys::shell::launch_argv(cmd);
 
-        let pty = NativePtySystem::default()
-            .openpty(PtySize {
+        // `openpty` 在 macOS 上不能并发调。多线程同时调，底层那条
+        // `posix_openpt`/`grantpt`/`ptsname` 链里有非线程安全的一环，偶发
+        // 返回失败——实测 portable-pty 0.8.1、18 线程各 200 次共 3600 次调用
+        // 失败 2 次；同样次数套上这把锁是 0 次。
+        //
+        // 这不是测试才碰得到的东西：daemon 起来时 `restore_last_sessions`
+        // 一次恢复多个会话，走的就是并发 `openpty`。用户看到的是某个会话
+        // 莫名其妙没起来，而下面那个 `map_err` 把底层原因丢了，报出去只有
+        // 一句没头没尾的 `SpawnPty`。
+        //
+        // 锁的粒度就是 `openpty` 这一次调用本身，微秒级，不影响并发起会话。
+        // 中毒了也照用（`into_inner`）：持锁的线程 panic 不会让这个 pty
+        // 变得不能开，为它把整个进程的会话创建卡死才是更糟的结果。
+        static OPENPTY: Mutex<()> = Mutex::new(());
+        let pty = {
+            let _guard = OPENPTY.lock().unwrap_or_else(|e| e.into_inner());
+            NativePtySystem::default().openpty(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|_| {
-                crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
-                    crate::proto::Operation::SpawnPty,
-                ))
-            })?;
+        }
+        .map_err(|_| {
+            crate::proto::coded(crate::proto::ErrorCode::OperationFailed(
+                crate::proto::Operation::SpawnPty,
+            ))
+        })?;
 
         let mut builder = CommandBuilder::new(&cmd[0]);
         for a in &cmd[1..] {

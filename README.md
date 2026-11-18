@@ -508,7 +508,7 @@ Everything else:
 | `dct ps` | list the sessions running in the background |
 | `dct stop <n>…` / `--all` | stop sessions, giving them time to wind down |
 | `dct kill <n>…` / `--all` | kill sessions outright |
-| `dct prune` | clear stopped sessions off the list |
+| `dct prune` | clear stopped sessions off the list (rarely needed: a session that stops, or whose agent exits, leaves the list on its own) |
 | `dct restart` | swap in the current binary as the daemon — waits for sessions to finish, then brings them back (`-y` skips the question, `--cancel` calls it off; see [above](#restarting-without-losing-work)) |
 | `dct install <name>` | install an agent — `claude`, `codex`, `qwen`, `opencode` — or `git` |
 | `dct llm check` | actually call the `[llm]` connection in your config once, and say whether it works |
@@ -672,6 +672,8 @@ restart, and nobody has to lose their running sessions over a menu change.
 
 ## The board
 
+The board shows projects with sessions. Find saved projects without sessions in the `p` project picker. When the board is empty, press `p` to choose a project and start.
+
 Sessions from the same project sit together under a header that names the agents
 that project is running (`claude×2 codex×1`) and whether any of them failed.
 
@@ -682,7 +684,7 @@ that project is running (`claude×2 codex×1`) and whether any of them failed.
 | `n` | new session, this project's last agent |
 | `N` | new session, pick the agent |
 | `p` | put another project on the board — and start work in it |
-| `x` | take a project with no sessions off the board |
+| `x` | take a project whose sessions have all stopped off the board |
 | `←` `→` `Space` | fold / unfold the current project |
 | `Enter` | open a session |
 | `g` | tile grid: every session's live screen at once |
@@ -745,7 +747,7 @@ keyboard belongs to it.
 
 Tiles are ordered by project, so one project's sessions stay next to each other,
 and every tile says which project it belongs to. Nothing you type there ever
-reaches an agent. Stopped sessions show a frozen last screen instead of nothing.
+reaches an agent.
 More than nine sessions get more pages, with a page indicator.
 
 Inside a session every keystroke goes to the agent, `Esc` included — agents need

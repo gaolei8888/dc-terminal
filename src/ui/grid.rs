@@ -509,13 +509,9 @@ fn draw_grid(
             );
             return;
         }
-        // `n` 在九宫格里跟在列表里是同一个键，直接说怎么开，别让用户
-        // 先绕回列表。分组之后九宫格画的是**所有**项目的会话，所以
-        // 「一个都没有」就是字面意思，不再需要「别的项目里可能还有」那半句。
-        // 「一个项目组都没有」也不可能走到这儿——开机时 `seed_start_project`
-        // 会把启动目录摆上去。
+        // 空看板统一引导到项目选择器。
         f.render_widget(
-            Paragraph::new(text(Key::NoSessionsRunningPressN, lang)).centered(),
+            Paragraph::new(text(Key::NoSessionsChooseProject, lang)).centered(),
             centered_line(area),
         );
         return;
@@ -1418,10 +1414,12 @@ mod tests {
     /// 已经把它挪过去了，用户看得见自己换到了哪个项目，接着按 `n` 就开在那儿、
     /// 按 `x` 就把它拿掉。
     #[test]
-    fn tab_onto_an_empty_project_switches_project_without_moving_the_focus() {
+    fn tab_onto_an_stopped_project_switches_project_without_moving_the_focus() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a")]);
+        let mut stopped = session_in(99, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
         app.view = View::grid(0);
 
         handle_key(&mut app, key(KeyCode::Tab)).unwrap();
@@ -1449,10 +1447,12 @@ mod tests {
     /// `p` 摆上 z、`Tab` 过去、底栏明明写着 z，一按 `g` 就回到了 a，接着
     /// 按 `n` 会把新会话开进 a。`Enter` 放大走的是同一条同步，同一个洞。
     #[test]
-    fn tab_onto_an_empty_project_then_g_still_lands_on_that_project() {
+    fn tab_onto_an_stopped_project_then_g_still_lands_on_that_project() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a")]);
+        let mut stopped = session_in(99, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
         app.view_mode = crate::ui::ViewMode::Grid;
         app.view = View::grid(0);
 
@@ -1507,7 +1507,9 @@ mod tests {
     fn removing_a_project_realigns_the_cursor_even_into_a_collapsed_group() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
+        let mut stopped = session_in(99, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b"), stopped]);
         // 行：[组头 a, 1, 组头 b, 2, 组头 z]——把 b 折起来
         app.list_state.select(Some(2));
         super::super::toggle_collapse(&mut app);
@@ -1546,7 +1548,9 @@ mod tests {
     fn a_refused_x_changes_nothing_at_all() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a")]);
+        let mut stopped = session_in(99, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
         app.view = View::grid(0);
 
         // 换到空项目 z：它在九宫格里没有格子，焦点故意留旧，指着 a 的格子
@@ -1629,10 +1633,12 @@ mod tests {
     /// 拿「这个组有没有活格子」当判据的话，守卫会在这一刻打开，而焦点仍然是
     /// 旧的，`g` 照样把用户送回 a。
     #[test]
-    fn a_stale_focus_stays_stale_after_the_empty_project_gains_a_session() {
+    fn a_stale_focus_stays_stale_after_the_stopped_project_gains_a_session() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a")]);
+        let mut stopped = session_in(99, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
         app.view_mode = crate::ui::ViewMode::Grid;
         app.view = View::grid(0);
 
@@ -1662,10 +1668,12 @@ mod tests {
     /// 在那儿，这一步不算意外），但它不该顺手把当前项目也改回去——
     /// 从会话里退出来时，用户应当回到自己刚换过去的那个项目。
     #[test]
-    fn zooming_from_an_empty_project_does_not_change_the_project_back() {
+    fn zooming_from_an_stopped_project_does_not_change_the_project_back() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/z".into()];
-        app.set_sessions(vec![session_in(1, "/w/a")]);
+        let mut stopped = session_in(99, "/w/z");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), stopped]);
         app.view = View::grid(0);
 
         handle_key(&mut app, key(KeyCode::Tab)).unwrap();
@@ -1690,13 +1698,15 @@ mod tests {
     /// 这条断言会因为巧合而通过，什么都没测到。这里让焦点停在**最后**一个
     /// 项目 `z` 上，删掉中间的空组 `m`，第 0 行是 `a`——错了就看得见。
     #[test]
-    fn x_removes_an_empty_project_and_leaves_the_cursor_where_the_focus_is() {
+    fn x_removes_an_stopped_project_and_leaves_the_cursor_where_the_focus_is() {
         let (mut app, _dir) = App::test_app();
         app.pinned = vec!["/w/m".into()];
-        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/z")]);
+        let mut stopped = session_in(99, "/w/m");
+        stopped.state = SessionState::Stopped;
+        app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/z"), stopped]);
         // 组序是 a / m / z，焦点落在 z 的格子上
         app.view = View::grid(1);
-        app.list_state.select(Some(3));
+        app.list_state.select(Some(4));
         assert_eq!(
             app.current_group().map(|g| g.name.clone()),
             Some("z".to_string()),
@@ -1770,8 +1780,8 @@ mod tests {
         app.view = View::grid(0);
 
         let c = grid_text(&mut app);
-        assert!(c.contains("还没有会话"), "空状态要说人话：{c}");
-        assert!(c.contains("按n新建"), "并指出下一步怎么做：{c}");
+        assert!(c.contains("没有会话"), "空状态要说人话：{c}");
+        assert!(c.contains("按p选项目开始"), "并指出下一步怎么做：{c}");
     }
 
     /// 焦点从 0 一路走到 2 再走回来，视图始终留在九宫格里。
@@ -1994,10 +2004,10 @@ mod tests {
 
         let centre = grid_text(&mut app);
         assert!(
-            centre.contains("还没有会话"),
+            centre.contains("没有会话"),
             "正中说的是「这里空的」：{centre}"
         );
-        assert!(centre.contains("按n新建"), "并指出下一步：{centre}");
+        assert!(centre.contains("按p选项目开始"), "并指出下一步：{centre}");
         assert_eq!(
             app.message.text, "没有选中会话",
             "底栏说的是另一件事：这一下按键没有作用对象"
@@ -2499,10 +2509,10 @@ mod tests {
         .unwrap();
         let c = squashed(&term);
         assert!(
-            c.contains("还没有会话"),
+            c.contains("没有会话"),
             "空看板要说话，不能只画一个空框：{c}"
         );
-        assert!(c.contains("按n新建"), "n 在这一屏就能按，直接说：{c}");
+        assert!(c.contains("按p选项目开始"), "n 在这一屏就能按，直接说：{c}");
         assert!(
             !c.contains("回列表"),
             "别让用户先绕回列表——n 在这儿就管用：{c}"

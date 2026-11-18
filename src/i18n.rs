@@ -430,7 +430,7 @@ pub enum Key {
     /// 下一步做这个」，底栏那边按 `s`/`i` 得到的是 `NoSessionSelected`
     /// （「这一下按键没有作用对象」）。原来两处各有一条措辞不同、意思一样的
     /// 词条，同屏出现时用户会以为是两件事。
-    NoSessionsRunningPressN,
+    NoSessionsChooseProject,
     /// 组头上：这个项目的目录已经不在了
     ProjectDirGone,
     AllSessionsStopped,
@@ -972,10 +972,10 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             en: "Every session here has stopped. Press g for the list to see them, or n to start one.",
             zh: "这里的会话都停了。按 g 回列表能看到它们，按 n 开一个新的",
         ),
-        NoSessionsRunningPressN => t!(
+        NoSessionsChooseProject => t!(
             lang,
-            en: "No sessions yet — press n to start one",
-            zh: "还没有会话，按 n 新建",
+            en: "No sessions — press p to choose a project and start",
+            zh: "没有会话，按 p 选项目开始",
         ),
         WindowTooSmall => t!(
             lang,
@@ -3321,11 +3321,11 @@ mod tests {
             PhoneComputerGone,
             PhoneComputerSilent,
             LastUsedAgent,
-            NoSessionsRunningPressN,
+            NoSessionsChooseProject,
             ProjectDirGone,
             // 早就在词条表里，却一直没进这份清单——于是两条守卫（两种语言都
             // 组得出话、英文里不许有汉字）从来没查过它。顺手补上：它正是九宫格
-            // 另一种空态用的那一条，跟刚加的 NoSessionsRunningPressN 挨着。
+            // 另一种空态用的那一条，跟刚加的 NoSessionsChooseProject 挨着。
             AllSessionsStopped,
             WindowTooSmall,
             Verifying,
@@ -3495,7 +3495,9 @@ mod tests {
             LiveStagingRejected(crate::proto::LiveStagingProblem::NamesMismatch),
             LiveStagingRejected(crate::proto::LiveStagingProblem::Empty),
             LiveStagingRejected(crate::proto::LiveStagingProblem::TooMany { max: 4, got: 5 }),
-            LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![7, 9])),
+            LiveStagingRejected(crate::proto::LiveStagingProblem::UnknownSessions(vec![
+                7, 9,
+            ])),
             LiveStagingRejected(crate::proto::LiveStagingProblem::NotLive),
             LiveRelayNotConfigured,
             LivePublishKeyMissing,
@@ -3603,9 +3605,15 @@ mod tests {
             msg::error(Lang::Zh, &ErrorCode::Mesh(MeshProblem::NoDcAccount)),
             "先在 dct 里用 DC 配对账号（进 dct 按 c 选 DC）"
         );
-        assert_eq!(msg::mesh_first_computer(Lang::Zh), "这台电脑成了「我的电脑」组的第一台");
+        assert_eq!(
+            msg::mesh_first_computer(Lang::Zh),
+            "这台电脑成了「我的电脑」组的第一台"
+        );
         // 看板（Task 8）
-        assert_eq!(msg::mesh_board_off(Lang::Zh), "多电脑未开启 · 运行 dct login");
+        assert_eq!(
+            msg::mesh_board_off(Lang::Zh),
+            "多电脑未开启 · 运行 dct login"
+        );
         assert_eq!(msg::mesh_board_more(Lang::Zh, 3), "还有 3 台");
         assert_eq!(msg::mesh_board_state(Lang::Zh, true, true), "本机");
         assert_eq!(msg::mesh_board_state(Lang::Zh, true, false), "在线");

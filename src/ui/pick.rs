@@ -143,6 +143,7 @@ fn handle_pick_profile(app: &mut App, key: KeyEvent) -> Result<()> {
         no_git,
     };
     if key.code == KeyCode::Esc {
+        app.pending_project = None;
         app.view = super::home_view(app);
     } else if key.code == KeyCode::Char('g') && no_git {
         // `g` 现在是一条**捷径**，不再是唯一的路：按 Enter 选 agent 时
@@ -936,7 +937,11 @@ fn row_item<'a>(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| parent.display().to_string());
-            action_item(format!("{} · {}", text(Key::GoUp, lang), truncate(&name, 24)))
+            action_item(format!(
+                "{} · {}",
+                text(Key::GoUp, lang),
+                truncate(&name, 24)
+            ))
         }
         // 「就用这个文件夹」把目录名再说一遍：翻了几层之后，屏幕上离这一行
         // 最近的路径在表头上，而用户按下去的后果是整个项目切过去。
@@ -1587,15 +1592,7 @@ mod tests {
             app.current_dir().display()
         );
         assert!(matches!(app.view, View::Board), "选完就回家");
-        assert!(
-            app.groups.iter().any(|g| g.name == "proj"),
-            "选中的项目要作为一个组出现在看板上"
-        );
-        assert_eq!(
-            app.current_group().map(|g| g.name.clone()),
-            Some("proj".to_string()),
-            "光标要落进那个组"
-        );
+        assert!(app.groups.is_empty(), "选中目录不创建空项目行");
     }
 
     /// 一路 `←` 走到根目录不能 panic，也不能变成一个按下去没反应的死键：
@@ -1633,8 +1630,8 @@ mod tests {
         press(&mut app, KeyCode::Enter); // 就用这个文件夹
 
         assert_eq!(
-            app.current_group().map(|g| g.dir.clone()),
-            Some(crate::ui::view::canon(&root.join(weird))),
+            app.current_dir(),
+            root.join(weird),
             "打开的必须是原始名字对应的真实目录，不是清洗过的名字"
         );
     }
@@ -1996,6 +1993,154 @@ mod tests {
             content.contains("ai-mania"),
             "标题要写明会开在哪个项目里：{content}"
         );
+    }
+
+    /// 一个只会答话的假守护进程。`Request::Create` 必须回一个真的
+    /// `Created`——回 `Ok` 的话建会话看起来就是失败的，测不到「用户真的
+    /// 被送进了会话」这件事（同 `pair_view::tests::fake_daemon` 的理由）。
+    ///
+    /// 走 `sys::ipc::bind_private` 而不是 `UnixListener`：后者只在 Unix 上
+    /// 存在，整个测试二进制会在 Windows 上编译不过。
+    fn fake_daemon() -> (
+        std::path::PathBuf,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let listener = crate::sys::ipc::bind_private(&sock).unwrap();
+        let received: std::sync::Arc<std::sync::Mutex<Vec<Request>>> = Default::default();
+        let recv2 = received.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let Ok(req) = serde_json::from_str::<Request>(&line) else {
+                        break;
+                    };
+                    let answer = match &req {
+                        Request::Create { .. } => Response::Created { id: 7 },
+                        Request::Projects => Response::Projects {
+                            recent: vec!["/w/recent".into()],
+                            pinned: vec!["/w/recent".into(), "/w/saved-only".into()],
+                        },
+                        _ => Response::Ok,
+                    };
+                    recv2.lock().unwrap().push(req);
+                    let resp = serde_json::to_string(&answer).unwrap();
+                    if writeln!(writer, "{resp}").is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (sock, dir, received)
+    }
+
+    /// **选中一个装好的 agent，人必须落在那个会话里。**
+    ///
+    /// 这条路原本一个断言都没有：`View::Attached(id)` 在这个文件里被设置
+    /// 四次（选 agent / 装 agent / 登录 / 装 git），却没有任何测试确认它
+    /// 真的生效过。而它坏掉的样子恰好是最难报的那一种——会话在守护进程
+    /// 那边建出来了、活着、状态正常，用户眼里却是「选了没反应」，于是
+    /// 再选一次，攒出一堆一模一样的会话。
+    #[test]
+    fn choosing_a_ready_agent_lands_you_inside_the_new_session() {
+        let (sock, _fake_dir, received) = fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state,
+            no_git: false,
+            warning: None,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, Request::Create { .. })),
+            "前提：得真的发出了建会话的请求"
+        );
+        assert!(
+            matches!(app.view, View::Attached(7)),
+            "建完会话必须落在它里面，不能留在选择器上"
+        );
+    }
+
+    #[test]
+    fn choosing_an_agent_for_a_hidden_project_uses_that_directory() {
+        let (sock, _fake_dir, received) = fake_daemon();
+        let (mut app, dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        let target = dir.path().join("selected-project");
+        std::fs::create_dir(&target).unwrap();
+        app.set_sessions(vec![sess_in(1, "/w/other-project")]);
+        super::super::add_project(&mut app, target.clone());
+        assert_eq!(app.groups.len(), 1, "目标目录还没有会话，不出现在看板上");
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state,
+            no_git: false,
+            warning: None,
+        };
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.view, View::Attached(7)));
+        let requests = received.lock().unwrap();
+        let created_dir = requests.iter().find_map(|r| match r {
+            Request::Create { dir, .. } => Some(dir.as_str()),
+            _ => None,
+        });
+        assert_eq!(created_dir, target.to_str());
+    }
+
+    #[test]
+    fn cancelling_agent_selection_restores_the_board_project() {
+        let (mut app, dir) = App::test_app();
+        app.set_sessions(vec![sess_in(1, "/w/original")]);
+        super::super::add_project(&mut app, dir.path().join("cancelled-project"));
+        app.view = View::PickProfile {
+            entries: one_ready_entry(),
+            state: ListState::default(),
+            no_git: false,
+            warning: None,
+        };
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/original"));
+        assert!(app.groups.iter().all(|g| g.name != "cancelled-project"));
+    }
+
+    #[test]
+    fn project_picker_keeps_saved_projects_that_are_not_recent() {
+        let (sock, _fake_dir, _received) = fake_daemon();
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        super::super::open_project_picker(&mut app);
+        let View::PickProject(picker) = &app.view else {
+            panic!("项目选择器没有打开")
+        };
+        assert_eq!(
+            picker.recent.iter().filter(|p| *p == "/w/recent").count(),
+            1
+        );
+        assert!(picker.recent.iter().any(|p| p == "/w/saved-only"));
+        assert!(app.groups.is_empty());
     }
 
     fn one_ready_entry() -> Vec<crate::proto::ProfileEntry> {
@@ -2402,7 +2547,7 @@ mod tests {
     /// `p` 选定一个项目之后，它必须以一个组的形式出现在看板上，并且光标落进去——
     /// 否则用户按完 `p` 什么都没发生，`n` 也去不了那儿。
     #[test]
-    fn confirming_a_project_puts_it_on_the_board_and_moves_the_cursor_there() {
+    fn confirming_an_empty_project_keeps_its_creation_directory_off_the_board() {
         let (mut app, d) = App::test_app();
         let target = d.path().join("newproj");
         std::fs::create_dir(&target).unwrap();
@@ -2414,11 +2559,8 @@ mod tests {
             app.pinned.iter().any(|p| p.ends_with("newproj")),
             "要进 pinned"
         );
-        assert_eq!(
-            app.current_group().map(|g| g.name.clone()),
-            Some("newproj".to_string()),
-            "光标要落在新组上"
-        );
+        assert!(app.groups.is_empty(), "创建会话前不占看板的一行");
+        assert_eq!(app.current_dir(), target, "新会话仍然开在选中的目录");
     }
 
     /// 选完项目紧接着要问「用哪个 agent」——用户按 `p` 是为了去那儿干活，
@@ -2469,12 +2611,14 @@ mod tests {
     /// `x` 落在一个空组上就真的把它拿掉——本地 `pinned` 和看板上的组
     /// 必须一起消失，不能只改一半让下一次重算把它又变回来。
     #[test]
-    fn removing_an_empty_group_takes_it_off_the_board() {
+    fn removing_a_stopped_group_takes_it_off_the_board() {
         let (mut app, d) = App::test_app();
         let gone = d.path().join("空项目");
         std::fs::create_dir(&gone).unwrap();
         app.pinned = vec![gone.display().to_string()];
-        app.set_sessions(vec![sess_in(1, "/w/a")]);
+        let mut stopped = sess_in(2, &gone.display().to_string());
+        stopped.state = crate::session::SessionState::Stopped;
+        app.set_sessions(vec![sess_in(1, "/w/a"), stopped]);
         let gi = app
             .groups
             .iter()
@@ -2507,7 +2651,9 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         // 用户当初 pin 的是软链那条拼写，分组键却是 canon 之后的真实路径
         app.pinned = vec![link.display().to_string()];
-        app.set_sessions(vec![]);
+        let mut stopped = sess_in(1, &link.display().to_string());
+        stopped.state = crate::session::SessionState::Stopped;
+        app.set_sessions(vec![stopped]);
         app.list_state.select(Some(0));
 
         let removed = super::super::unpin_current(&mut app);
@@ -2515,34 +2661,6 @@ mod tests {
         assert!(removed, "真拿掉了就得如实报告");
         assert!(app.pinned.is_empty(), "按归一化后的路径比对才删得掉");
         assert!(app.groups.is_empty(), "组也要跟着消失");
-    }
-
-    /// 开机兜底：一个组都没有时把启动目录摆上去。没有它，全新安装的第一屏
-    /// 是一个连光标都落不下去的空盒子，`n` 也没有目标。
-    #[test]
-    fn a_board_with_nothing_on_it_gets_the_start_dir() {
-        let (mut app, _d) = App::test_app();
-        app.set_sessions(vec![]);
-        assert!(app.groups.is_empty(), "前提：全新守护进程，什么都没有");
-
-        super::super::seed_start_project(&mut app);
-
-        assert_eq!(app.groups.len(), 1, "看板上永远至少有一个组");
-        assert!(app.current_group().is_some(), "光标有地方落");
-        assert_eq!(app.current_dir(), super::super::view::canon(&app.start_dir));
-    }
-
-    /// 已经有组了就不补——启动目录跟用户手头这些项目未必有关系，
-    /// 硬塞一行进去只是噪音。
-    #[test]
-    fn seeding_leaves_a_board_that_already_has_a_group_alone() {
-        let (mut app, _d) = App::test_app();
-        app.set_sessions(vec![sess_in(1, "/w/a")]);
-
-        super::super::seed_start_project(&mut app);
-
-        assert_eq!(app.groups.len(), 1, "不该多出启动目录那一行");
-        assert!(app.pinned.is_empty());
     }
 
     /// **后台事件不许换掉当前项目——哪怕那个组是「有会话」才在看板上的。**
@@ -2660,8 +2778,8 @@ mod tests {
             "x 掉的要消失：{names:?}"
         );
         assert!(
-            names.contains(&"new".to_string()),
-            "p 上来的要出现：{names:?}"
+            !names.contains(&"new".to_string()),
+            "没有会话的新项目留在选择器里：{names:?}"
         );
     }
 
@@ -2757,47 +2875,6 @@ mod tests {
         assert!(
             !super::super::help_ctx_for(&app, &View::Board).can_remove,
             "拿不掉就不许写"
-        );
-    }
-
-    /// **开机补位是后台路径，不许换用户正看着的那一屏。**
-    ///
-    /// 它挂在第一次 `List` **成功**之后。守护进程慢上几轮的话，用户完全
-    /// 可能已经按 `N` 开了选择器、按 `l` 进了设置页——这时候把他甩回看板，
-    /// 是一次他没有按过任何键的视图切换。今天走不到只是因为第一轮几乎
-    /// 总是一次就成，那是运气不是设计。
-    #[test]
-    fn seeding_never_yanks_the_user_out_of_a_screen_they_opened() {
-        let (mut app, _d) = App::test_app();
-        app.set_sessions(vec![]);
-        app.view = View::Settings {
-            state: ListState::default(),
-            sub: None,
-        };
-
-        super::super::seed_start_project(&mut app);
-
-        assert!(
-            matches!(app.view, View::Settings { .. }),
-            "用户开的设置页必须还在"
-        );
-        assert_eq!(app.groups.len(), 1, "补位本身照做");
-    }
-
-    /// 反过来：本来就在看板上时照常重算落点——那时候「回家」是恒等式，
-    /// 唯一的作用是让刚摆上去的组在九宫格里也有个合理的焦点。
-    #[test]
-    fn seeding_still_lands_home_when_the_user_is_already_on_the_board() {
-        let (mut app, _d) = App::test_app();
-        app.set_sessions(vec![]);
-        app.view_mode = crate::ui::ViewMode::Grid;
-        app.view = View::grid(7);
-
-        super::super::seed_start_project(&mut app);
-
-        assert!(
-            matches!(app.view, View::Grid { focus: 0, .. }),
-            "还在九宫格里，焦点收拢到一个真实存在的格子"
         );
     }
 }
